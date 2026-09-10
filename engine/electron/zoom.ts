@@ -25,8 +25,10 @@ const clamp = (level: number): number => Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, l
 
 let currentLevel = 0;
 
-/** Where `ui-prefs.json` lives. Defaults to userData; main overrides it to the CLONE-level
- *  profile when this editor is running in a `MODOKI_MULTI` sub-profile — see `setUiPrefsDir`. */
+/** Where `ui-prefs.json` lives. Defaults to userData; main overrides it to the EDITOR-IDENTITY
+ *  dir — the clone in dev, the install when packaged — on EVERY launch since #1036, not just a
+ *  `MODOKI_MULTI` one. userData is keyed on the project now, so without the override a zoom level
+ *  would follow the game. See `setUiPrefsDir` and userDataDir.ts. */
 let uiPrefsDir: string | null = null;
 
 /** Point UI prefs at `dir` instead of userData.

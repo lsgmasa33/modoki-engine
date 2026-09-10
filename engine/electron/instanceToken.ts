@@ -9,7 +9,7 @@
 // So the config carries a token that names WHICH editor+project it was written for, and
 // the backend rejects a request whose token doesn't match.
 //
-// The token keys on (userData dir, project root):
+// The token keys on (the dir main hands us, project root):
 //   - NOT per-launch — that would invalidate the config on every restart and defeat C5's
 //     whole point (Claude Code bakes env at MCP-spawn time; a change costs a `claude`
 //     restart).
@@ -21,10 +21,11 @@
 // userDataDir.ts changed: it described the pre-fix world as "MEASURED" truth. Duplicated
 // facts rot; a pointer doesn't.)
 //
-// The only property THIS file depends on: one userData dir can be shared by editors running
-// CONCURRENTLY (e.g. MODOKI_MULTI within one clone), so `instance-tokens.json` has multiple
-// writers. That is why ensureToken re-reads before its read-modify-write (see readAll) — a
-// stale snapshot would erase a sibling's entry.
+// The only property THIS file depends on: the dir main hands us is shared by editors running
+// CONCURRENTLY, so `instance-tokens.json` has multiple writers. That is why ensureToken re-reads
+// before its read-modify-write (see readAll) — a stale snapshot would erase a sibling's entry.
+// ⚠️ #1036 made that property STRONGER, not weaker: concurrent editors used to need MODOKI_MULTI,
+// and now every project's editor of one identity writes this one file.
 //
 // HONEST SCOPE: this is CORRECTNESS, not security. Validation is "if present" (see
 // checkToken), so an attacker simply omits the header. Requiring a token would break the
@@ -46,7 +47,7 @@ export const TOKEN_HEADER = 'x-modoki-token';
 /** The env var baked into `.mcp.json`, read by the MCP at spawn. */
 export const TOKEN_ENV = 'MODOKI_TOKEN';
 
-/** userData filename for the (projectRoot → token) map. */
+/** Filename for the (projectRoot → token) map, inside whatever dir main hands us. */
 export const TOKEN_FILE = 'instance-tokens.json';
 
 /** Mint a fresh token. UUIDv4 — we need unguessable-ENOUGH-to-not-collide, not secrecy. */
@@ -97,12 +98,12 @@ export function legacyRootKey(projectRoot: string): string {
 }
 
 // The token gate runs on EVERY backend request, so an fs read per request would be a silly
-// tax — hence a cache, keyed by userData dir.
+// tax — hence a cache, keyed by that dir.
 //
-// But the file can have MULTIPLE CONCURRENT WRITERS: editors that share a userData dir
-// share this file, and several run at once by design (MODOKI_MULTI within one clone; and
-// before userDataDir.ts scoped them, EVERY dev clone shared one dir — which is how this bug
-// was found). So the cache is valid for READS only, and every write MUST re-read first:
+// But the file can have MULTIPLE CONCURRENT WRITERS: editors sharing that dir share this file,
+// and several run at once by design (since #1036, one per project of a given editor identity;
+// before it, only under MODOKI_MULTI — and before userDataDir.ts scoped anything, EVERY dev clone
+// shared one dir, which is how this bug was found). So the cache is valid for READS only, and every write MUST re-read first:
 // `ensureToken` is a read-modify-write over the whole map, and merging onto a stale
 // snapshot would erase whatever a sibling added since we last looked.
 let _cache: { dir: string; map: Record<string, string> } | null = null;

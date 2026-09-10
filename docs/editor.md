@@ -2806,7 +2806,9 @@ App-wide UI zoom via Electron `webContents` zoom (`engine/electron/zoom.ts`) —
 anywhere in the editor, Cmd/Ctrl+`=`/`-`/`0`, and native **View → Zoom In/Out/Actual Size** menu
 items (`projects.ts`'s `viewRoleTail`), all routed through one controller so wheel/menu/accelerator
 stay in sync. `factor = 1.2^level`, step 0.5, clamped to level ∈ [−3, +4] (matches VS Code). The
-level persists per editor identity (`userData/ui-prefs.json`) and restores on `did-finish-load`. A
+level persists per editor identity (`ui-prefs.json`, at the editor-identity dir — ⚠️ **NOT under
+`userData`**, which since #1036 is keyed on the PROJECT; see `setUiPrefsDir` and
+[connect-claude-code.md](connect-claude-code.md)) and restores on `did-finish-load`. A
 capture-phase Ctrl/Cmd+wheel forwarder in `EditorApp.tsx` (`editor/input/zoomWheel.ts`) pre-empts
 panels that also consume modified wheel (SceneView camera dolly, the Animation Curve Editor's
 value-axis zoom) via a `data-modki-wheel-zoom` opt-out marker, so UI zoom and panel-local zoom don't

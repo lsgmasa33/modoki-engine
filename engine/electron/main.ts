@@ -46,32 +46,148 @@ const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : a
 // the first reader, not merely "before ready". Adding any userData read above this line
 // re-breaks it silently. See userDataDir.ts.
 //
-// REPO_ROOT is inlined rather than reused from below because DEV keys its profile off the
-// CLONE PATH and this must run before that declaration. (Same expression; see there.)
 // …but NEVER override an explicit `--user-data-dir`: that switch exists to isolate a
 // profile, and clobbering it is the same class of bug in reverse. (The CSP smoke launches
 // the packaged app with one.)
+//
+// ⚠️ #1036 MOVED `REPO_ROOT`, `editorIdentity()` and `setRecentsScope()` up here from ~line 400.
+// They used to sit below, and this block inlined a duplicate of REPO_ROOT's expression with a
+// comment apologising for it. The decision now needs the PROJECT, which needs recents, which
+// needs the scope — so the three moved rather than being copied. All are pure path arithmetic
+// or a string store; none reads userData, which is the property that makes the move legal and
+// the property a test now guards.
+// Repo root (the npm/vite root) — owns the Vite dev-server process (dev AND
+// packaged, per C4c-3b "run Vite in prod") and resolves engine source + node_modules.
+//   • dev: engine/electron/dist/main.cjs → three levels up = the repo.
+//   • packaged: electron-builder asarUnpack's engine/** + node_modules/** into
+//     <Resources>/app.asar.unpacked (a REAL dir). __dirname would resolve to
+//     …/app.asar/… (inside the archive — Vite can't read/exec there), so point at
+//     the unpacked tree instead. See electron-builder.yml.
+const REPO_ROOT = app.isPackaged
+  ? path.join(process.resourcesPath, 'app.asar.unpacked')
+  : path.resolve(__dirname, '..', '..', '..');
+
+// Scope the recent-projects history to THIS editor instance so a packaged DMG never
+// inherits a dev clone's last project (the cross-branch skew that white-screened the
+// editor when a work-ai build auto-opened main's project). Identity = the install .app
+// path (packaged, stable across in-place upgrades) or the repo root (dev clone). The
+// toolchain stays machine-shared and layout stays per-project — only recents are scoped.
+function editorIdentity(): string {
+  if (!app.isPackaged) return REPO_ROOT;
+  const exe = app.getPath('exe');
+  const i = exe.indexOf('.app/');
+  return i >= 0 ? exe.slice(0, i + 4) : exe; // the .app bundle path
+}
+setRecentsScope(editorIdentity());
+
+// ⚠️ **Everything above this line must stay free of `app.getPath('userData')`, TRANSITIVELY.**
+// `REPO_ROOT` and `editorIdentity()` are pure path arithmetic, and `setRecentsScope` only
+// stores a string — but the recents lookup below reaches into projects.ts, which is where a
+// future `getPath('userData')` would hide. That is not hypothetical prudence: it is exactly
+// how `app.setName` was demoted to a no-op by an earlier reader (ff364b47) and went unnoticed
+// for weeks. `userDataDir.test.ts` guards main.ts's own source order; `recentsAreNotKeyedOnUserData`
+// there guards the transitive half.
+/** Where the editor's OWN state files live — `ui-prefs.json`, `instance-tokens.json`.
+ *
+ *  ⚠️ **The EDITOR-IDENTITY level, deliberately NOT `app.getPath('userData')`** (#1036). Since the
+ *  profile is keyed on the project, `getPath('userData')` now points INSIDE one project's Chromium
+ *  profile — and these files do not belong to a project. Two concrete failures if they follow it:
+ *
+ *   - `instance-tokens.json` would be minted fresh per project, so every existing `.mcp.json`
+ *     `MODOKI_TOKEN` stops matching and every MCP call 403s with `tokenMismatchError`'s
+ *     "WRONG EDITOR: this .mcp.json was written for a different editor or project" — for the SAME
+ *     editor and the SAME project. Measured during #1036: a live launch wrote a second
+ *     `instance-tokens.json` inside the project profile.
+ *   - `ui-prefs.json` (zoom) would reset per project — testboard q1k7p2hGZB9lGvYi11go, again.
+ *
+ *  The token file is DESIGNED to be shared and keyed by project root internally
+ *  (`instanceToken.ts`: "the token keys on (userData dir, project root)"), so splitting it per
+ *  project defeats a design that was already right.
+ *
+ *  Null only when `--user-data-dir` was passed and we deliberately did not decide the profile;
+ *  the accessor then falls back to whatever Chromium was told. Lazy on purpose — reading
+ *  `getPath('userData')` eagerly here is the very thing this file's header forbids. */
+let profileBaseDir: string | null = null;
+
+/** WHICH PROJECT this launch opens — decided ONCE, at module load, and reused by whenReady.
+ *
+ *  ⚠️ **Memoised on purpose, and it is not an optimisation** (#1036 review F3/F5). Two things go
+ *  wrong if this is recomputed instead:
+ *
+ *  1. **The inputs get hand-copied.** They were, briefly: two six-field option objects including a
+ *     literal `path.join(REPO_ROOT, 'games', '3d-test')`. Change the default game at one site and
+ *     the profile keys on the old one while the editor opens the new one — prefs reset, gate
+ *     green. That is the shadowing-constant class CLAUDE.md names.
+ *  2. **`recents` can CHANGE underneath us.** The file is machine-wide and shared by every editor
+ *     of one identity, and `addRecentProject` is a concurrent writer from sibling processes. With
+ *     recents `[A]`, this editor keys its profile on A at module load; if the user opens B in an
+ *     already-running editor of the same clone during our startup (module load → whenReady is
+ *     hundreds of ms), a recomputed `resolveInitialProject()` reads `[B, A]` and opens **B inside
+ *     A's profile**. The next launch keys on B, whose Local Storage is empty: "my prefs reset".
+ *     Only a launch that does not hard-set `MODOKI_PROJECT` is exposed — `npm run dev` is, and
+ *     `launch-editor.sh <project>` is not.
+ *
+ *  So the profile key and the project actually opened are the SAME decision by construction,
+ *  rather than two computations that are expected to agree. */
+let initialChoice: ReturnType<typeof chooseInitialProject> | null = null;
+function initialProjectChoice(): ReturnType<typeof chooseInitialProject> {
+  initialChoice ??= chooseInitialProject({
+    envProject: process.env.MODOKI_PROJECT,
+    envDefault: process.env.MODOKI_PROJECT_DEFAULT,
+    recents: getRecentProjects(),
+    repoRoot: REPO_ROOT,
+    packaged: app.isPackaged,
+    devFallback: path.join(REPO_ROOT, 'games', '3d-test'),
+  });
+  return initialChoice;
+}
+
 if (shouldOverrideUserData(process.argv)) {
-  // §14.4: several editors run inside ONE clone under MODOKI_MULTI and would otherwise
-  // share this clone's profile → LevelDB single-writer fight. Give each its own
-  // sub-profile keyed on the project it opened (stable across relaunch, distinct between
-  // co-running editors). Only under MULTI, so the normal single-editor case is unchanged.
-  const profileSubKey = process.env.MODOKI_MULTI ? multiProfileKey(process.env.MODOKI_PROJECT) : null;
+  // §14.4, generalised (#1036): the profile is keyed on the PROJECT, always — not only under
+  // MODOKI_MULTI, and not only in dev. Two editors on two games never share a Chromium profile,
+  // whichever flavour they are, and the MULTI special case is gone.
+  //
+  // ⚠️ **The project is decided by `chooseInitialProject` — the SAME function whenReady uses**
+  // (`resolveInitialProject`), with the same inputs. Do not re-implement the priority order here.
+  // If these two ever disagree, the profile is keyed on project A while the editor opens project
+  // B, which presents as "my prefs reset" and is worse than not splitting at all.
+  //
+  // Reading recents this early is safe and deliberate: they live OUTSIDE userData on purpose
+  // (projects.ts §"All recents live under a FIXED modoki-app dir"), so they need only `appData`.
+  // `migrateLegacyRecents()` runs later, in whenReady, and cannot change this answer — it writes
+  // the GLOBAL file, while a scoped `recentsFile()` reads the per-identity one.
+  //
+  // `{ kind: 'pick' }` — a packaged first run with no recents — has no project to key on, so this
+  // launch uses the bare editor-identity profile. Nothing is stranded: a first run has no
+  // accumulated state, and the NEXT launch has a recent and lands in the project profile.
+  const profileSubKey = initialProjectChoice().kind === 'path'
+    ? multiProfileKey((initialProjectChoice() as { kind: 'path'; path: string }).path)
+    : null;
   const base = resolveUserDataDir({
     appData: app.getPath('appData'),
     isPackaged: app.isPackaged,
-    repoRoot: app.isPackaged
-      ? path.join(process.resourcesPath, 'app.asar.unpacked')
-      : path.resolve(__dirname, '..', '..', '..'),
+    repoRoot: REPO_ROOT,
     subKey: null,
   });
   app.setPath('userData', profileSubKey ? path.join(base, profileSubKey) : base);
-  // …but the UI PREFS follow the clone, not the sub-profile. The split exists for Chromium's
-  // single-writer LevelDB; a zoom level is our own atomically-written file and belongs to the
-  // human, so letting a MULTI launch strand it in a sibling directory just looks like "the
-  // persisted zoom is never restored" (testboard q1k7p2hGZB9lGvYi11go). See setUiPrefsDir.
+  // …but the UI PREFS follow the EDITOR IDENTITY, not the project sub-profile — `base` is
+  // deliberately the subKey-less path. The split exists for Chromium's single-writer LevelDB;
+  // a zoom level is our own atomically-written file and belongs to the human, so letting one
+  // project's launch strand it in a sibling directory just looks like "the persisted zoom is
+  // never restored" (testboard q1k7p2hGZB9lGvYi11go). This mattered for a MULTI launch before
+  // #1036 and matters for EVERY launch now. See setUiPrefsDir.
   setUiPrefsDir(base);
+  profileBaseDir = base;
 }
+
+// ⚠️ **Declared BELOW the setPath on purpose.** It mentions `app.getPath('userData')`, and
+// `userDataDir.test.ts`'s ordering guard reads this file's SOURCE ORDER — it cannot tell a lazy
+// call inside a function from an eager read, and it must not be taught to. The guard fired on the
+// first draft of this accessor, which is the guard doing its job: that textual rule is the only
+// thing standing between this file and ff364b47, where an earlier reader silently demoted
+// `app.setName` and moved the shipped editor's whole profile for weeks. Function declarations
+// hoist, so the call site further down is unaffected.
+function editorStateDir(): string { return profileBaseDir ?? app.getPath('userData'); }
 
 // Adopt a pre-existing toolchain instead of re-fetching ~1.2GB. Pinning the toolchain dir
 // moved where we LOOK, not the data — without this the shipped editor silently re-downloads
@@ -396,16 +512,6 @@ const PROD = app.isPackaged || process.env.MODOKI_PROD === '1';
 // through three call sites — see the default in vendorPlugins.ts for what that cost.
 if (app.isPackaged) process.env.MODOKI_PACKAGED = '1';
 
-// Repo root (the npm/vite root) — owns the Vite dev-server process (dev AND
-// packaged, per C4c-3b "run Vite in prod") and resolves engine source + node_modules.
-//   • dev: engine/electron/dist/main.cjs → three levels up = the repo.
-//   • packaged: electron-builder asarUnpack's engine/** + node_modules/** into
-//     <Resources>/app.asar.unpacked (a REAL dir). __dirname would resolve to
-//     …/app.asar/… (inside the archive — Vite can't read/exec there), so point at
-//     the unpacked tree instead. See electron-builder.yml.
-const REPO_ROOT = app.isPackaged
-  ? path.join(process.resourcesPath, 'app.asar.unpacked')
-  : path.resolve(__dirname, '..', '..', '..');
 
 // CDP (renderer remote-debugging) for "Connect Claude Code". Chromium requires the
 // switch BEFORE app.ready, so decide it here at module load. Packaged: ON BY DEFAULT
@@ -416,11 +522,17 @@ const REPO_ROOT = app.isPackaged
 // CLI arg, so we only report the port. See cdp.ts. Read by the status/connect handlers (C2).
 const CDP = resolveCdpConfig({
   isPackaged: app.isPackaged,
-  // userData is set just above, so this reads the RIGHT dir (valid before ready).
-  prefEnabled: app.isPackaged ? readCdpEnabled(app.getPath('userData')) : false,
+  // ⚠️ `editorStateDir()`, NOT `getPath('userData')` (#1036 review F1). This is an EDITOR
+  // preference, and userData is now keyed on the PROJECT — so a write under project A and a read
+  // under project B are different files. `readCdpEnabled` defaults to ON when the file is absent
+  // (opt-out model, cdp.ts:76), so the miss does not fail safe: a user who switched the
+  // remote-debugging port OFF gets it back ON at the next launch that keys differently, with the
+  // checkbox still showing their choice. Deterministic on a fresh packaged install, whose FIRST
+  // launch has no recents and so no sub-key at all.
+  prefEnabled: app.isPackaged ? readCdpEnabled(editorStateDir()) : false,
   // Sticky ladder (§12.2 item 5): last launch's port + whether it bound ours, so a 9222
   // collision advances instead of dead-ending. Packaged only (dev's port is launcher-pinned).
-  memo: app.isPackaged ? readCdpPortMemo(app.getPath('userData')) : null,
+  memo: app.isPackaged ? readCdpPortMemo(editorStateDir()) : null,   // editor-level (F1)
   // What Chromium ACTUALLY got, read from its own command line rather than from our env
   // (#356). This is read BEFORE the appendSwitch below, so in the packaged app it sees only
   // a switch that came from the OS/CLI — never our own. `getSwitchValue` returns '' when
@@ -449,18 +561,6 @@ app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
 // Minted once per process; loadURL uses it and cdpStatus() matches it.
 const CDP_NONCE = newCdpNonce();
 
-// Scope the recent-projects history to THIS editor instance so a packaged DMG never
-// inherits a dev clone's last project (the cross-branch skew that white-screened the
-// editor when a work-ai build auto-opened main's project). Identity = the install .app
-// path (packaged, stable across in-place upgrades) or the repo root (dev clone). The
-// toolchain stays machine-shared and layout stays per-project — only recents are scoped.
-function editorIdentity(): string {
-  if (!app.isPackaged) return REPO_ROOT;
-  const exe = app.getPath('exe');
-  const i = exe.indexOf('.app/');
-  return i >= 0 ? exe.slice(0, i + 4) : exe; // the .app bundle path
-}
-setRecentsScope(editorIdentity());
 
 /** The backend's real port, filled in once it binds. Read by `/api/identity`, whose whole
  *  job is to let a client confirm it is talking to the editor it meant to. */
@@ -507,14 +607,9 @@ function gitBranch(root: string): string | null {
  * Runs inside whenReady (needs app.getPath for the recents file).
  */
 async function resolveInitialProject(): Promise<string | null> {
-  const choice = chooseInitialProject({
-    envProject: process.env.MODOKI_PROJECT,
-    envDefault: process.env.MODOKI_PROJECT_DEFAULT,
-    recents: getRecentProjects(),
-    repoRoot: REPO_ROOT,
-    packaged: app.isPackaged,
-    devFallback: path.join(REPO_ROOT, 'games', '3d-test'),
-  });
+  // The SAME decision the profile was keyed on — see `initialProjectChoice`. Never recompute:
+  // the profile key and the project opened must be one decision, not two that agree.
+  const choice = initialProjectChoice();
   if (choice.kind === 'path') return choice.path;
 
   // First-run pick (packaged, no recents): the user has NO project to reopen, so the
@@ -951,7 +1046,7 @@ const onSceneChanged = (urlPath: string, kind: LiveReloadKind, viaSibling: boole
 let instanceToken: string | null = null;
 function refreshInstanceToken(): void {
   try {
-    instanceToken = state.root ? ensureToken(app.getPath('userData'), state.root) : null;
+    instanceToken = state.root ? ensureToken(editorStateDir(), state.root) : null;
   } catch (e) {
     // An unwritable userData must not break the editor — it just means no token gate.
     console.warn('[modoki-electron] could not mint an instance token:', e instanceof Error ? e.message : e);
@@ -1005,7 +1100,7 @@ function rememberCdpPort(probe: CdpProbe): void {
   const verdict = cdpMemoVerdict(probe);
   if (verdict === null || _cdpMemoWrittenOurs === verdict) return;
   _cdpMemoWrittenOurs = verdict;
-  writeCdpPortMemo(app.getPath('userData'), { port: CDP.port, ours: verdict });
+  writeCdpPortMemo(editorStateDir(), { port: CDP.port, ours: verdict });  // pairs with the read (F1)
 }
 
 /** Auto-heal the open project's `.mcp.json` when the editor's backend port changed under
@@ -1612,7 +1707,10 @@ app.whenReady().then(async () => {
   const pinnedBackend = pinned != null;
   const candidates = portCandidates({
     pinned,
-    lastPort: pinnedBackend ? null : readLastPort(app.getPath('userData')),
+    // Editor-level (#1036 review F1): C5 relies on this surviving a relaunch so a baked-in
+    // MODOKI_BACKEND keeps working. Per-project, a project switch drops the memo and an
+    // unpinned editor can re-drift to a different port.
+    lastPort: pinnedBackend ? null : readLastPort(editorStateDir()),
   });
 
   // Bind by ACTUALLY LISTENING on each candidate — never probe-then-rebind. A
@@ -1664,7 +1762,7 @@ app.whenReady().then(async () => {
   // Remember it so the NEXT launch prefers the same port and the user's baked
   // .mcp.json keeps working without a Claude restart (C5). Pinned ports aren't
   // remembered — the env is already the source of truth for those.
-  if (!pinnedBackend) writeLastPort(app.getPath('userData'), backendHandle.port);
+  if (!pinnedBackend) writeLastPort(editorStateDir(), backendHandle.port);  // pairs with the read (F1)
   // If this launch DID land on a different port than the open project's .mcp.json bakes,
   // rewrite it now and tell the user to restart Claude (C5).
   void healConnectedMcp();
@@ -1903,7 +2001,7 @@ app.whenReady().then(async () => {
     // The remote-debugging switch is applied at STARTUP only (cdp.ts), so a change
     // needs a relaunch. Packaged only — in dev the launcher owns the port via env.
     if (!app.isPackaged) return { ok: false, error: 'In dev, CDP is controlled by MODOKI_CDP_PORT in launch-editor.sh.' };
-    writeCdpEnabled(app.getPath('userData'), !!enabled);
+    writeCdpEnabled(editorStateDir(), !!enabled);   // editor-level — pairs with the read (F1)
     app.relaunch();
     app.exit(0);
     return { ok: true };

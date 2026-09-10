@@ -366,13 +366,49 @@ must catch).
 >
 > | Editor | userData |
 > |---|---|
-> | Dev, **per clone** | `appData/Modoki Editor (dev)/<clone-id>` |
-> | Packaged (DMG) | `appData/Modoki Editor` |
+> | Dev | `appData/Modoki Editor (dev)/<clone-id>/<project-key>` |
+> | Packaged (DMG) | `appData/Modoki Editor/<install-id>/<project-key>` |
 >
-> **Consequence for C6: the token distinguishes dev from the DMG and clone from clone**,
-> because each has its own store. Editors sharing ONE userData still share one
-> `instance-tokens.json` — `MODOKI_MULTI` inside a single clone is that case — which is why
-> `ensureToken` re-reads before its read-modify-write.
+> Both flavours obey ONE rule since #1036 — `<flavour>/<editor-id>/<project-key>`. The
+> `<project-key>` is absent only on a packaged FIRST run, which has no recents to key on.
+>
+> ⚠️ **The key is fixed at LAUNCH, and two accepted costs follow.** `setProject` re-roots a running
+> editor without touching `userData`, so an editor launched on A and switched to B is running B
+> **inside A's profile** — and each such switch strands one project's Local Storage. So the
+> guarantee is "no two editors *launched* on different projects share a profile", not "whatever
+> they opened". And on a packaged FIRST run there is no project to key on at all, because the
+> folder dialog needs `whenReady` while `userData` must be decided above the first reader.
+>
+> ⚠️ **Upgrading to #1036 costs every packaged install one re-Connect.** `userData` moves from
+> `<appData>/Modoki Editor` to `<appData>/Modoki Editor/<install-id>`, and `instance-tokens.json`
+> moves with it, so an existing `.mcp.json` `MODOKI_TOKEN` stops matching on the first launch after
+> this ships: every call 403s with `tokenMismatchError`, whose text blames "a different editor or
+> project" when nothing of the sort happened. Fix is AI → Connect Claude Code, once. Deliberate, and
+> the same no-migration call already made for `cloneId` — but it must be *said*, because the error
+> message points at the wrong cause. Zoom, last scene, `sceneViewMode` and `buildSupportDismissed`
+> reset once for the same reason.
+>
+> ⚠️ **One reset has a SECURITY consequence, and it is the only one a user cannot notice by looking:
+> `cdp.json`.** An existing packaged install where the user unchecked remote debugging has
+> `<appData>/Modoki Editor/cdp.json` = `{"enabled":false}`. After the upgrade `readCdpEnabled` looks
+> in `…/<install-id>/cdp.json`, misses, and returns **`true`** — the model is opt-OUT, so an absent
+> file means ON (`cdp.ts`). `--remote-debugging-port` is therefore appended on a machine where the
+> user turned it off, with the checkbox still showing their choice. The port memos (`readLastPort`,
+> the sticky CDP port) move the same way, costing C5's "the port survives a relaunch" guarantee for
+> exactly one launch. This is the same "the miss does not fail safe" argument #1036 makes for the
+> cross-project axis, on the upgrade axis instead. **A one-time adopt is FILED, not fixed here.**
+>
+> ⚠️ **`instance-tokens.json` does NOT live in that dir**, and the distinction is load-bearing for
+> C6. It sits one level up, at `<flavour>/<editor-id>` (`editorStateDir()` in `main.ts`, alongside
+> `ui-prefs.json`), because the token belongs to the EDITOR, not to one project. Put it inside the
+> project profile and it is minted fresh per project, so every existing `.mcp.json` `MODOKI_TOKEN`
+> stops matching and every call 403s with `tokenMismatchError` — naming the wrong cause, since it is
+> the same editor and the same project. That regression was introduced and caught during #1036.
+>
+> **Consequence for C6: the token distinguishes dev from the DMG and clone from clone**, because
+> each editor identity has its own store. That store is SHARED by every project of one identity —
+> which is why it is keyed on project root internally, and why `ensureToken` re-reads before its
+> read-modify-write: co-running editors of one clone are concurrent writers to it.
 >
 > *(Pre-the userData section this read: dev → `appData/Electron` shared by ALL clones; packaged →
 > `appData/modoki-app`. If you are reading an older comment that says so, it is describing
@@ -850,9 +886,14 @@ unit test of a resolver could have caught:
 
 - **`setPath`, not `setName`** (it overrides the resolved entry), placed **above
   `initFileLog()`** — above the first reader, not merely "before ready".
-- **packaged → `appData/Modoki Editor`**; **dev → `appData/Modoki Editor (dev)/<clone-id>`**
-  (keyed on the clone PATH, so branch switches keep the profile — matching how `projects.ts`
-  scopes recents).
+- **`<appData>/<flavour>/<editor-id>/<project-key>`**, one rule for both flavours (#1036) —
+  `Modoki Editor (dev)/<clone-id>/…` and `Modoki Editor/<install-id>/…`. Keyed on PATH, so branch
+  switches and in-place upgrades keep the profile, matching how `projects.ts` scopes recents.
+  ⚠️ Packaged used to be a flat `appData/Modoki Editor` with `repoRoot` and the sub-key both
+  discarded, justified as "one shipped app, one profile" — but nothing calls
+  `requestSingleInstanceLock`, and a machine carries one packaged build per clone
+  (`modoki-pkg-smoke-$CLONE`). It was §14.2's fix never reaching that branch, invisible because a
+  real end user has exactly one install.
 - **Toolchain pinned to `appData/Modoki/toolchain`** — MACHINE-level, outside userData. This
   makes `projects.ts`'s comment on `recentsScope` ("the toolchain is machine-shared") true
   and de-dupes it (`npm-tools` was duplicated across dev and packaged).

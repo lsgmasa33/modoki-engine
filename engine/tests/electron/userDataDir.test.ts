@@ -37,14 +37,42 @@ describe('resolveUserDataDir', () => {
   const packaged = () => resolveUserDataDir({ appData: APPDATA, isPackaged: true, repoRoot: '/Applications/Modoki Editor.app/…/app.asar.unpacked' });
   const dev = (repoRoot: string) => resolveUserDataDir({ appData: APPDATA, isPackaged: false, repoRoot });
 
-  it('packaged → the PRODUCT dir (what setName was supposed to give us)', () => {
-    expect(packaged()).toBe(path.join(APPDATA, PACKAGED_DIR));
+  it('packaged → a PER-INSTALL dir UNDER the product dir', () => {
+    expect(path.dirname(packaged())).toBe(path.join(APPDATA, PACKAGED_DIR));
+    expect(path.basename(packaged())).toMatch(/^[0-9a-f]{8}$/);
   });
 
-  it('packaged is INDEPENDENT of the install path — one shipped app, one profile', () => {
+  /** ⚠️ **DELIBERATE REVERSAL (#1036).** This assertion used to be `expect(a).toBe(b)`, titled
+   *  "packaged is INDEPENDENT of the install path — one shipped app, one profile". Both halves of
+   *  that justification were false. Nothing calls `requestSingleInstanceLock`, so "one shipped app"
+   *  is a macOS Finder convention rather than a property of this app — every packaged launch path
+   *  in this repo starts the binary directly. And a machine really does carry several packaged
+   *  builds: each clone's `smoke-packaged.sh` writes one under `modoki-pkg-smoke-$CLONE`.
+   *
+   *  The flat dir was never a decision about shipped apps; it was §14.2's per-clone fix never being
+   *  applied to this branch, and it stayed invisible because a real end user has exactly ONE
+   *  install — for whom "all installs share one dir" and "each install gets its own dir" name the
+   *  same directory. Do not "restore" the old assertion on the strength of its old title. */
+  it('packaged DEPENDS on the install path — two installs must not share one profile', () => {
     const a = resolveUserDataDir({ appData: APPDATA, isPackaged: true, repoRoot: '/Applications/x' });
     const b = resolveUserDataDir({ appData: APPDATA, isPackaged: true, repoRoot: '/Users/me/Desktop/y' });
-    expect(a).toBe(b);
+    expect(a).not.toBe(b);
+    expect(path.dirname(a)).toBe(path.join(APPDATA, PACKAGED_DIR));
+    expect(path.dirname(b)).toBe(path.join(APPDATA, PACKAGED_DIR));
+  });
+
+  /** ⚠️ Two DIFFERENT spellings of one install, not one spelling compared to itself. The first
+   *  draft of this was `at(X) === at(X)` — same pure function, same literal argument — which
+   *  passes if the resolver returns a constant, ignores `appData`, ignores `subKey`, or is
+   *  deleted and rewritten. The only mutation it could catch was genuine nondeterminism. Its
+   *  title also claimed "an in-place upgrade keeps its profile", a property the resolver cannot
+   *  exercise: it takes no version input at all. (#1036 review F4.) */
+  it('packaged is STABLE across spellings of one install — a re-launch keeps its profile', () => {
+    const at = (r: string) => resolveUserDataDir({ appData: APPDATA, isPackaged: true, repoRoot: r });
+    const canonical = '/Applications/Modoki Editor.app/Contents/Resources/app.asar.unpacked';
+    expect(at(canonical + '/')).toBe(at(canonical));
+    expect(at('/Applications/Modoki Editor.app/Contents/Resources/foo/../app.asar.unpacked'))
+      .toBe(at(canonical));
   });
 
   it('dev → a PER-CLONE dir, so RULE 2 clones stop sharing one Chromium profile', () => {
@@ -112,9 +140,39 @@ describe('resolveUserDataDir', () => {
     expect(withSub('/Users/me/Projects/modoki', null)).toBe(dev('/Users/me/Projects/modoki'));
   });
 
-  it('the subKey is ignored when packaged (single-instance never needs sub-profiles)', () => {
+  /** ⚠️ **DELIBERATE REVERSAL (#1036)** — see the packaged/install-path note above for why
+   *  "single-instance" was never true of this app. A packaged editor nests exactly like dev. */
+  it('the subKey nests when packaged too — the flavours obey ONE rule', () => {
+    const base = resolveUserDataDir({ appData: APPDATA, isPackaged: true, repoRoot: '/x' });
     const a = resolveUserDataDir({ appData: APPDATA, isPackaged: true, repoRoot: '/x', subKey: 'game-a' });
-    expect(a).toBe(path.join(APPDATA, PACKAGED_DIR)); // no nesting
+    const b = resolveUserDataDir({ appData: APPDATA, isPackaged: true, repoRoot: '/x', subKey: 'game-b' });
+    expect(path.dirname(a)).toBe(base);
+    expect(a).not.toBe(b);
+  });
+
+  /** ⚠️ **The property every editor-level file depends on** (#1036 review F2). `main.ts` computes
+   *  `base` with `subKey: null` and hands THAT to `setUiPrefsDir` and `profileBaseDir` (→
+   *  `editorStateDir()` → `instance-tokens.json`, `cdp.json`, the port memos). If `base` ever
+   *  became the joined path, every one of those files would move inside one project's profile —
+   *  which is the regression 2b7351a23 exists to fix, and it would not red a single test that
+   *  existed before this one. Pinning the VALUE, not the spelling of the call. */
+  it('a subKey result is strictly UNDER the subKey-less base — never equal to it', () => {
+    for (const isPackaged of [true, false]) {
+      const base = resolveUserDataDir({ appData: APPDATA, isPackaged, repoRoot: '/r', subKey: null });
+      const sub = resolveUserDataDir({ appData: APPDATA, isPackaged, repoRoot: '/r', subKey: 'game-a' });
+      expect(sub).not.toBe(base);
+      expect(path.dirname(sub)).toBe(base);
+    }
+  });
+
+  it('no flavour branch survives: dev and packaged differ ONLY by the flavour dir', () => {
+    // The point of #1036 is that the special case is gone, not that it moved. If a future edit
+    // reintroduces a branch, these two stop being the same shape and this reds.
+    const shape = (isPackaged: boolean) => {
+      const p = resolveUserDataDir({ appData: APPDATA, isPackaged, repoRoot: '/r', subKey: 'game-a' });
+      return path.relative(path.join(APPDATA, isPackaged ? PACKAGED_DIR : DEV_DIR), p);
+    };
+    expect(shape(true)).toBe(shape(false));
   });
 });
 
@@ -297,12 +355,179 @@ describe('main.ts must fix userData before anything reads it', () => {
     expect(src.slice(0, at)).not.toMatch(/app\.getPath\(\s*'userData'\s*\)/);
   });
 
+  /** ⚠️ **The accessor must not LAUNDER the read past the rule above** (#1036 §2d review F1).
+   *
+   *  `editorStateDir()` is `profileBaseDir ?? app.getPath('userData')`, and it was moved below the
+   *  setPath precisely because the guard above fired on it. That answered the guard's COMPLAINT
+   *  without answering what the guard is FOR: function declarations hoist and `profileBaseDir` is
+   *  null until the block runs, so a call placed anywhere above the setPath returns Electron's
+   *  DEFAULT userData — silently, and with the literal `app.getPath('userData')` nowhere near the
+   *  call site, so the assertion above cannot see it.
+   *
+   *  Driven, not argued: adding `readCdpEnabled(editorStateDir())` inside the project-decision
+   *  block makes the packaged app read `<appData>/modoki-app/cdp.json`, miss, and return `true`
+   *  (opt-out model) — re-enabling a remote-debugging port the user turned off, with all 59 tests
+   *  in this file green. That is the `app.setName`/ff364b47 shape exactly. */
+  it('NO editorStateDir() call appears above the setPath either', () => {
+    const at = src.indexOf("app.setPath('userData'");
+    const above = src.slice(0, at);
+    // the DECLARATION is below the setPath; any *call* above it reads the wrong dir
+    expect(above).not.toMatch(/editorStateDir\(\)/);
+  });
+
+  /** ⚠️ The same ordering hazard one level up (#1036 §2d review F1, second half). The memoised
+   *  project decision reads recents, and `getRecentProjects()` resolves to the SCOPED file only
+   *  once `setRecentsScope` has run. Move that call below the profile block — a plausible tidy-up,
+   *  since it reads as "recents setup" next to "profile setup" — and the memo silently reads
+   *  `globalRecentsFile()`, the pre-scoping junk drawer that mixes every clone's projects. The
+   *  `getRecentProjects()` count-of-one guard below still passes. */
+  it('setRecentsScope runs BEFORE the project decision that reads recents', () => {
+    const scope = src.indexOf('setRecentsScope(');
+    const choice = src.indexOf('chooseInitialProject(');
+    expect(scope).toBeGreaterThan(-1);
+    expect(choice).toBeGreaterThan(-1);
+    expect(scope).toBeLessThan(choice);
+  });
+
   it('the dead app.setName rename is gone from the CODE (comments may still explain it)', () => {
     expect(src).not.toMatch(/app\.setName\(/);
   });
 
   it('the toolchain is never hung off userData again (that duplicated it per flavour)', () => {
     expect(src).not.toMatch(/getPath\(\s*'userData'\s*\)\s*,\s*'toolchain'/);
+  });
+
+  // ── #1036: the profile is keyed on the PROJECT, decided above the setPath ──
+
+  it('decides the project ABOVE the setPath — otherwise there is nothing to key on', () => {
+    const at = src.indexOf("app.setPath('userData'");
+    expect(src.indexOf('chooseInitialProject(')).toBeGreaterThan(-1);
+    expect(src.indexOf('chooseInitialProject(')).toBeLessThan(at);
+  });
+
+  /** ⚠️ **ONE decision, computed once — not two that are expected to agree** (#1036 review F3/F5).
+   *
+   *  This test used to assert `toHaveLength(2)`: the profile block and `resolveInitialProject()`
+   *  each called `chooseInitialProject` with a hand-copied six-field option object. Two ways that
+   *  breaks, neither of which any other test can see:
+   *   - edit `devFallback` at one site (a renamed default game) and the profile keys on the old
+   *     project while the editor opens the new one;
+   *   - `recents` is a machine-wide file with concurrent writers (`addRecentProject` from a
+   *     sibling editor), so the two reads can differ across the module-load → whenReady window
+   *     even with identical code.
+   *  Both present as "my prefs reset". The fix is memoisation, so this now pins ONE call site. */
+  it('calls chooseInitialProject exactly ONCE — both consumers share the memoised decision', () => {
+    expect(src.match(/chooseInitialProject\(/g) ?? []).toHaveLength(1);
+    // …and that one call is inside the memo, which both consumers go through.
+    expect(src).toMatch(/initialChoice \?\?= chooseInitialProject\(/);
+    // ⚠️ 4, not 3: the regex matches the DECLARATION too (`function initialProjectChoice()`), so a
+    // floor of 3 was satisfied by declaration + the two profile-block calls alone, with
+    // `resolveInitialProject` free to recompute. (#1036 §2d review F4.)
+    expect((src.match(/initialProjectChoice\(\)/g) ?? []).length).toBeGreaterThanOrEqual(4);
+    // …and the profile block must not hand-roll the env/recents precedence beside it.
+    const at = src.indexOf("app.setPath('userData'");
+    const above = src.slice(0, at);
+    expect(above).not.toMatch(/MODOKI_PROJECT\s*(\|\||\?\?)/);
+    expect(above).not.toMatch(/recents\s*\[\s*0\s*\]/);
+  });
+
+  /** ⚠️ **The guard for the CLASS, not the two call sites I happened to fix** (#1036 review F1).
+   *
+   *  `getPath('userData')` is now the PROJECT profile. Every consumer must therefore make a
+   *  decision — project-level or editor-level — and the first pass through this file got 2 of 7
+   *  right by hand. The one that mattered: `readCdpEnabled`/`writeCdpEnabled` are an EDITOR
+   *  preference, and `readCdpEnabled` defaults to ON when the file is absent (`cdp.ts:76`,
+   *  opt-out model). Written under project A and read under project B, a user's decision to turn
+   *  the remote-debugging port OFF silently reverts to ON, with the checkbox still showing OFF —
+   *  deterministic on a fresh packaged install, whose first launch has no recents and so no
+   *  sub-key. The port memos and `readLastPort`/`writeLastPort` are the same class.
+   *
+   *  So: an allowlist. A new `getPath('userData')` must either go through `editorStateDir()` or
+   *  be added here WITH a reason — which is the point at which someone has to think about it.
+   *
+   *  ⚠️ **Reach: main.ts ONLY.** This scans one file, so it cannot see `fileLog.ts:244` or
+   *  `zoom.ts:47`, both of which read `getPath('userData')` too. Both were audited by hand and
+   *  are deliberate (logs follow the project so two editors stop interleaving one `main.log`;
+   *  zoom's is the `--user-data-dir` fallback) — but do not read this guard as covering the
+   *  whole class, because its docblock used to imply that. (#1036 §2d review F3.) */
+  it('getPath("userData") appears ONLY at sanctioned sites — editor-level files use editorStateDir()', () => {
+    const allowed: [RegExp, string][] = [
+      [/function editorStateDir\(\)/, 'the accessor itself — its fallback when --user-data-dir was passed'],
+      [/'vite-cache'/, "per-PROJECT dep-optimizer cache — correctly scoped to the project profile"],
+      [/'\.vite-cache-build'/, 'the signature file pairing with vite-cache, same scope'],
+      [/mkdirSync\(app\.getPath\('userData'\)/, 'creating that same vite-cache parent'],
+    ];
+    const offenders = src.split('\n')
+      .map((line, i) => ({ line: line.trim(), n: i + 1 }))
+      .filter((x) => /getPath\(\s*'userData'\s*\)/.test(x.line))
+      .filter((x) => !allowed.some(([re]) => re.test(x.line)))
+      .map((x) => `main.ts:${x.n}  ${x.line}`);
+    expect(offenders, 'a new userData consumer: use editorStateDir(), or allowlist it with a reason')
+      .toEqual([]);
+  });
+
+  /** ⚠️ The subKey-less `base` is what makes `editorStateDir()` and `setUiPrefsDir()` mean
+   *  "editor level" at all (#1036 review F2). The resolver-level test above pins the VALUE
+   *  relationship; this pins that main.ts actually takes the un-joined one. */
+  it('the editor-level dir is the subKey-LESS base, and only setPath gets the joined path', () => {
+    expect(src).toMatch(/subKey:\s*null/);
+    expect(src).toMatch(/setUiPrefsDir\(base\)/);
+    expect(src).toMatch(/profileBaseDir = base/);
+    // the joined path is built inline at the setPath and nowhere else
+    expect(src.match(/path\.join\(base, profileSubKey\)/g) ?? []).toHaveLength(1);
+  });
+
+  /** ⚠️ The editor's OWN files must NOT follow the project sub-profile (#1036). Found by running
+   *  it: a live launch wrote a SECOND `instance-tokens.json` inside the project profile, which
+   *  mints a fresh token per project — so every existing `.mcp.json` `MODOKI_TOKEN` stops matching
+   *  and every MCP call 403s with "WRONG EDITOR: this .mcp.json was written for a different editor
+   *  or project", for the same editor and the same project. `ui-prefs.json` is the same shape
+   *  (testboard q1k7p2hGZB9lGvYi11go). Both go through `editorStateDir()`. */
+  it('the token store does NOT follow the project profile — it uses editorStateDir()', () => {
+    expect(src).toMatch(/ensureToken\(\s*editorStateDir\(\)/);
+    expect(src).not.toMatch(/ensureToken\(\s*app\.getPath\(\s*'userData'\s*\)/);
+  });
+
+  /** ⚠️ Bans the NAME, not one spelling of it (#1036 review F8). The first version was
+   *  `not.toMatch(/MODOKI_MULTI\s*\?/)`, which a plain `if (process.env.MODOKI_MULTI) …` — the most
+   *  natural way anyone would reintroduce the gate — walks straight past. `src` is comment-stripped
+   *  (`readScannedSource`), so the surviving explanatory mention at main.ts:147 does not count. */
+  it('MODOKI_MULTI appears nowhere in main.ts CODE — the special case is GONE, not moved', () => {
+    // A reintroduced gate means packaged (and a plain dev launch) silently stop being
+    // project-keyed, which is invisible in every unit test of the resolvers.
+    expect(src).not.toMatch(/MODOKI_MULTI/);
+  });
+
+  it('recents are read in exactly ONE place — the memo', () => {
+    // The precedence bans below are spelling-based and a determined author routes around them;
+    // this is the structural version. A second `getRecentProjects()` is the shape every
+    // re-implementation of the decision must take.
+    expect(src.match(/getRecentProjects\(\)/g) ?? []).toHaveLength(1);
+  });
+});
+
+/** ⚠️ **The TRANSITIVE half of the ordering guard (#1036).**
+ *
+ *  The guard above reads main.ts's own source, so it can only see a `getPath('userData')`
+ *  written THERE. #1036 put a recents lookup above the setPath, and that lookup reaches into
+ *  `projects.ts` — which is where such a read would now hide, invisible to the source-order
+ *  check and to every unit test.
+ *
+ *  Recents live outside userData ON PURPOSE (projects.ts: "All recents live under a FIXED
+ *  modoki-app dir … NOT app.getPath('userData')"). That comment is the intent; this is the
+ *  enforcement. If it ever becomes false, `app.setName`/`setPath` is silently demoted exactly
+ *  as it was in ff364b47 — no throw, no log, the profile just moves. */
+describe('recents must not be keyed on userData — the transitive ordering invariant (#1036)', () => {
+  const src = readScannedSource(path.join(__dirname, '..', '..', 'electron', 'projects.ts')).code;
+
+  it('projects.ts never reads app.getPath("userData")', () => {
+    expect(src).not.toMatch(/getPath\(\s*['"]userData['"]\s*\)/);
+  });
+
+  it('…and derives the recents dir from appData instead', () => {
+    // Pins the positive too: a guard that only bans something passes just as well on an empty
+    // file, or on one that stopped deriving the path here at all.
+    expect(src).toMatch(/getPath\(\s*['"]appData['"]\s*\)/);
   });
 });
 

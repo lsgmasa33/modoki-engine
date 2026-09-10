@@ -96,18 +96,32 @@ export function multiProfileKey(project: string | undefined | null): string | nu
 }
 
 /**
- * The userData dir for THIS editor.
- *  - packaged → `<appData>/Modoki Editor` — one shipped app, one profile.
+ * The userData dir for THIS editor: `<appData>/<flavour>/<editor-id>[/<subKey>]`.
+ *
  *  - dev      → `<appData>/Modoki Editor (dev)/<clone-id>` — per CLONE, because clones are
  *               independent checkouts that run SIMULTANEOUSLY (RULE 2) and a shared
  *               Chromium profile makes them fight over one LevelDB lock.
- *  - dev + `subKey` → `…/<clone-id>/<subKey>` — a `MODOKI_MULTI` editor's own sub-profile,
- *               so co-running editors in ONE clone stop fighting over the LevelDB lock (§14.4).
+ *  - packaged → `<appData>/Modoki Editor/<install-id>` — per INSTALL, for the same reason.
+ *  - either, + `subKey` → `…/<editor-id>/<subKey>` — one project's own sub-profile, so
+ *               co-running editors stop fighting over the LevelDB lock (§14.4).
  *
- * Keyed by the clone's PATH (not branch/version), so switching branches or rebuilding keeps
- * a clone's profile — matching how projects.ts scopes recents. `subKey` is applied ONLY for
- * dev (the packaged app is single-instance, so it never needs sub-profiles) and only when the
- * caller passes one (MULTI + a known project), so the common single-editor case is unchanged.
+ * ⚠️ **The packaged branch used to be `<appData>/Modoki Editor` flat, with `repoRoot` and
+ * `subKey` both thrown away** — the comment justified it as *"one shipped app, one profile"*
+ * and *"the packaged app is single-instance, so it never needs sub-profiles"*. Neither held
+ * (#1036). Nothing calls `requestSingleInstanceLock`, so the app is single-instance only by
+ * macOS convention for a Finder launch — every packaged launch path in this repo starts the
+ * binary directly. And a machine can carry several packaged builds: each clone's
+ * `smoke-packaged.sh` produces its own under `modoki-pkg-smoke-$CLONE`. The flat dir was not
+ * a decision about shipped apps, it was §14.2's fix never being applied to this branch — and
+ * it was invisible because a real end user has exactly one install, for whom "all installs
+ * share one dir" and "each install gets its own dir" name the same directory.
+ *
+ * So there is no flavour branch left: both are `<flavour>/<id-of-what-varies>`, where the id
+ * hashes `repoRoot` — the clone path in dev, the unpacked bundle dir when packaged. Deleting
+ * the special case is the point; this file's history is a list of special cases going wrong.
+ *
+ * Keyed by PATH (not branch/version), so switching branches or rebuilding keeps a profile —
+ * matching how projects.ts scopes recents.
  */
 /* ⚠️ #899 made this (and `multiProfileKey`) do FILESYSTEM I/O where they were pure string ops —
  * `canonicalPath` calls `fs.realpathSync.native`. `main.ts` calls both at module load, ABOVE
@@ -117,8 +131,7 @@ export function multiProfileKey(project: string | undefined | null): string | nu
  * time. Accepted (the ordering constraint is not negotiable and a timeout here would need its own
  * fallback identity), recorded so it is not re-diagnosed as a hang of unknown origin. */
 export function resolveUserDataDir(opts: { appData: string; isPackaged: boolean; repoRoot: string; subKey?: string | null }): string {
-  if (opts.isPackaged) return path.join(opts.appData, PACKAGED_DIR);
-  const base = path.join(opts.appData, DEV_DIR, cloneId(opts.repoRoot));
+  const base = path.join(opts.appData, opts.isPackaged ? PACKAGED_DIR : DEV_DIR, cloneId(opts.repoRoot));
   return opts.subKey ? path.join(base, opts.subKey) : base;
 }
 
