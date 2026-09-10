@@ -1972,6 +1972,76 @@ coordinates (the system converts, since it is what resolves entry size); the dec
 `games/scroll-demo`'s strip scene — two authored buttons, one `instant` and one `smooth` — and,
 since #316, by Court's level-selector arrows, which is the first caller in a SHIPPING game.
 
+### Stepping counts from the REQUEST; snapping counts from the POSITION
+
+A stepping API (`scrollByEntry`) and a snapping one (`snapToNearest`) ask different questions, and
+answering both from live scroll is one defect that has now been found three times — #672
+(wordweave's dictionary arrows), #768 (Court's level-select and daily-month arrows) and #1010 (the
+engine helper both of them route through).
+
+**A request outlives the scroll, in two stages**, and live scroll lags both:
+
+| stage | state | cleared by |
+|---|---|---|
+| 1. entry-space | `UIEntries.scrollToEntry*` ≥ 0 | `consumeEntryRequest`, on the next system tick |
+| 2. px-space | `UIScrollView.scrollTo*` ≠ -1 | `clearScrollRequest`, once `UINode` has applied it |
+
+So two steps issued inside one frame both read the same offset, both compute "I am on entry N",
+and the second overwrites the first with an identical request: **two notches, one entry moved** —
+and `scrollByEntry` returns `true` for the one that did nothing. Measured on Court's level
+selector (2026-09-09): 0 ms gap deterministic, 30 ms a coin flip, 60 ms and up always fine —
+⚠️ **in the editor GameView on desktop Chromium and nowhere else.** No device has been measured,
+and `games/court/menu.md` records the figure as UNRESOLVED against the ~86-frame smooth-scroll
+number below: the two count different things (when the offset crosses the halfway point that flips
+the rounding, vs how long the animation runs). Do not repeat either without that qualifier.
+
+`scrollByEntry` therefore counts from stage 1, then stage 2, then live. **`snapToNearest`
+deliberately keeps reading live** — "which entry am I nearest" is a question about where the view
+IS, and honouring a pending request would re-issue a jump the viewer has already been carried most
+of the way through. Do not "make these consistent"; a test pins the difference.
+
+⚠️ **What this does NOT cover: the glide.** Once `UINode` has issued the DOM `scrollTo` with
+`behavior: 'smooth'`, both stages are clear and `scrollX` eases to the target over ~86 frames, so a
+step landing mid-glide still counts from an intermediate position. Nothing in trait state separates
+"gliding toward entry N" from "the viewer is dragging", and inventing that state buys a new
+staleness bug. The only shipping caller — `UINode`'s wheel handler — is covered by its
+`WHEEL_GESTURE_GAP_MS = 140` latch, which is a **latch, not a guarantee**: the next caller inherits
+the gap with no protection at all. Known and left open.
+
+### `UIEntries.strideX/strideY` — the resolved stride, published
+
+`entriesSystem` publishes the stride it actually used (`entrySize + gap`, per axis, px) alongside
+the rest of the window readback. **0 means "not resolved yet"** — no viewport, or a prefab root
+whose size is still uncached — and a caller must refuse rather than treat it as a usable window.
+
+⚠️ It is published because `scrollApi` was **recovering** it as `viewport / (visible - 1)`, a second
+derivation of a number the system already had. That is the shadowing-constant class from
+[CLAUDE.md](../CLAUDE.md)'s single-source-of-truth table, and it is exact only when the viewport is
+a whole number of entries: at a 600px viewport with a 250px entry, `visible` is `ceil(2.4) + 1 = 4`,
+so the recovery yields **200 against a true 250** — and a stepping API divides by it precisely at
+the entry boundary it is deciding. Read the field; do not re-derive it.
+
+Retiring the recovery also removed an accidental guard — **two of them, and the first fix restored
+only one.** `visible` is bounded by the entry count, so `visible <= 1` was silently refusing both a
+step on an axis the view does not scroll AND a step on an axis with fewer than two entries. Each is
+now an explicit test in `scrollByEntry` (`axis`, and `count > 1`). What the second one buys is not
+a request for a nonexistent entry — the step clamp below makes that impossible — but the fact that
+entry 0 is still a *request*: on a single entry taller than its viewport it yanks a viewer reading
+the bottom back to the top, and the `true` latches the wheel handler for 140 ms.
+
+⚠️ **A step is also clamped at the TOP now** (`count - 1`), which the old live-scroll read did not
+need: re-reading the live offset every time meant repeated steps at the end of a list kept
+computing the same index. Counting from the request removes that self-limit, and five in-frame
+steps on a ten-entry list walked the request one past the end. `count - 1` is the last entry that
+EXISTS, not the furthest the view can scroll — on a list the two differ, and the DOM clamps the
+remainder. **A step the clamp absorbs returns `false`**, so a caller at the end of a list gets the
+signal that nothing moved instead of latching its gesture on a `true`.
+
+`snapToNearest` carries the same clamp for a different reason: `Math.round(scroll / stride)` rounds
+UP past the last entry whenever the viewport is shorter than one entry, so a `countY: 1` view with a
+600px entry in a 300px viewport used to snap to entry 1. It clamps rather than refusing — unlike a
+step, a single entry is a legitimate snap target.
+
 ⚠️ **The per-request `behavior` and the authored default are TWO fields, and must stay two**
 (#409). `UIScrollView.scrollBehavior` is authored; the request rides the `runtimeOnly`
 `scrollToBehavior` and is consumed with the rest of the request by `clearScrollRequest`.
@@ -2078,12 +2148,15 @@ rebuild and is never per-frame.
   which is a separately-computed quantity. This is deliberate, not an oversight: they are also the
   intended source for the extent-derived features a pooled view cannot supply — a scrollbar thumb
   (`viewport / content`), edge fades, a "can this scroll?" affordance, scroll-to-end, near-the-end
-  prefetch, and the upper clamp `scrollByEntry` still lacks — it clamps at `0` only, so a wheel past
-  the last entry arms a request off the end, `consumeEntryRequest` hands that target back, and
-  **this frame's pooled window is planned for a place the view never reaches** before the DOM clamps
-  the offset. The view lands right; the pool spent a frame elsewhere, and nothing in the engine can
-  answer "already at the end" for a caller wanting to grey the arrow out (Court's `level-page`
-  handler clamps for itself with `clampPage`). All of those are `content − viewport`, and on a
+  prefetch, and a true "already at the end" signal. ⚠️ **This used to say `scrollByEntry` lacked an
+  upper clamp and that an over-range request cost the pool a frame — both are now false** (#1010).
+  It clamps to `count - 1`, and even before that the window could not be planned somewhere the view
+  never reaches: `entriesLayout` bounds `first` at `count - pooled`, and `entriesSystem` measures
+  travel from LIVE scroll rather than from the request target, so an over-range target produces a
+  byte-identical window. What is still missing is the END signal itself — `scrollByEntry`'s `false`
+  means "armed nothing", which also covers a view that is merely not ready yet, so a caller greying
+  an arrow out on it would grey it during scene load (Court's `level-page` handler clamps for itself
+  with `clampPage`). All of those are `content − viewport`, and on a
   `UIScrollView` carrying **no** `UIEntries` there is no other source for it.
   ⚠️ **Scope the measurement to one owning tree before building behaviour on them** — they come from
   whichever of the two editor mounts fired, which is exactly the mixed-measurement hazard above.
@@ -2190,9 +2263,14 @@ frame budget are different questions and the Air answers only the first.
   let a trackpad's continuous stream re-fire and reintroduce the runaway. Default is `'native'`
   because a long LIST wants the raw delta; capping a 5,000-row strip to one row per gesture would
   be unusable. **Touch is unaffected either way** — a swipe is not a wheel event.
-- `scrollByEntry(viewGuid, {x|y}, {behavior})` is what backs it: "move one entry from wherever I
-  am", the same window arithmetic `snapToNearest` does plus a delta. A caller cannot compute it
-  itself — the engine publishes no resolved entry stride, and `firstX` is the first POOLED entry.
+- `scrollByEntry(viewGuid, {x|y}, {behavior})` is what backs it: "move one entry from where I was
+  last SENT". A caller cannot compute it itself — `firstX` is the first POOLED entry, which
+  overscan puts an entry before the visible one. It is gated on `UIScrollView.axis`, so a step on
+  an axis the view does not scroll refuses rather than arming a request for entry 0 — which is
+  clearable, but cancels an in-flight smooth scroll on the axis that does move.
+
+  ⚠️ **It does NOT do the same arithmetic as `snapToNearest`, and the split is the point** — see
+  "Stepping counts from the request, snapping counts from the position" below.
 - ⚠️ **`scrollbar: 'hidden'` when the box is sized to fit its content exactly.** A classic
   scrollbar takes ~15px off the CROSS axis, and mobile's overlay scrollbars take none — so
   authoring the box bigger to compensate leaves a gap on the platform that ships. Court's page

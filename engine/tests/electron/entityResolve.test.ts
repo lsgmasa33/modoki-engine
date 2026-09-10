@@ -20,10 +20,29 @@ const collectScreenBounds = vi.fn();
 // exercising the old `occlusionScope:'canvas'` fallback unchanged — only the tests that opt in by
 // setting a return value exercise the new `'entity'` scope.
 const pickAt = vi.fn();
+// ⚠️ **The tap-zone veto is imported for REAL, not stubbed** (#1016). `resolveTapZoneVeto` is
+// `pressOrigin.ts`'s own banner-described "part with the decisions in it" — the ancestor rule, the
+// owner rule, the first-non-zone rule — and a fake would make every case below assert this file's
+// idea of press routing rather than the router's. That is precisely the failure
+// `docs/falsifiable-tests.md` names, and the three mutations these tests exist to catch all live
+// INSIDE that function, so stubbing it would make all three survive by construction.
+//
+// ⚠️ The explicit list is also why this mock needed editing at all: a new import into
+// `domResolve.ts` fails as "No X export is defined on the mock" rather than falling back to the
+// real module. That is the mock shape working as intended — it makes a new dependency visible.
+const { resolveTapZoneVeto, UI_TAP_ZONE_ATTR, UI_PRESS_ORIGIN_ATTR }
+  = await vi.importActual<typeof import('@modoki/engine/runtime')>('@modoki/engine/runtime');
+
 vi.mock('@modoki/engine/runtime', () => ({
   getAllEntities: (...a: unknown[]) => getAllEntities(...a),
   collectScreenBounds: (...a: unknown[]) => collectScreenBounds(...a),
   pickAt: (...a: unknown[]) => pickAt(...a),
+  resolveTapZoneVeto: (...a: unknown[]) => (resolveTapZoneVeto as (...x: unknown[]) => unknown)(...a),
+  // The REAL constants, not string copies: this file already has them in scope from the
+  // `importActual` above, and a hand-synced duplicate of a value you are holding is the
+  // shadowing-constant class in miniature.
+  UI_TAP_ZONE_ATTR,
+  UI_PRESS_ORIGIN_ATTR,
 }));
 
 const { resolveEntityPointReport } = await import('../../app/debug/entityResolve');
@@ -221,6 +240,172 @@ describe('UI entities (element scope)', () => {
     stubTopmost(el);
     expect(resolveEntityPointReport({ guid: 'g-start' })).toMatchObject({
       ok: false, error: expect.stringContaining('zero-size rect'),
+    });
+  });
+
+  /** #1016 — the aim surface must model #977's tap-zone redirect, and ONLY for a click.
+   *
+   *  ⚠️ **The fixture is the load-bearing part of this whole block.** Review mutation-tested the
+   *  reverted `75ba25601` and found THREE shapes surviving all three of its tests — including
+   *  deleting `resolveTapZoneVeto`'s ancestor rule outright — because its fixture's root carried no
+   *  `data-press-origin`. That is the identical flaw `pressOrigin.ts`'s own comment documents two
+   *  files away: *"both test layers modelled a neighbour with no interactive ancestor, a shape no
+   *  shipping scene has"*. Every one of Court's 16 authored zones sits inside a `swallowClicks`
+   *  panel, so this fixture puts one there too — otherwise the guard cannot fail. */
+  describe('#1016 — a minTapSize tap zone, and the gesture that decides whether it vetoes', () => {
+    // The REAL constants, so a rename in the runtime breaks this fixture instead of silently
+    // leaving it stamping an attribute nothing reads any more.
+    const PRESS_ORIGIN = UI_PRESS_ORIGIN_ATTR;
+    const TAP_ZONE = UI_TAP_ZONE_ATTR;
+
+    /** A shipping-shaped overlap: a panel that swallows clicks, holding two sibling controls —
+     *  the neighbour we aim at, and another control whose tap zone overhangs it. */
+    function mountOverlap() {
+      const panel = document.createElement('div');
+      panel.setAttribute(PRESS_ORIGIN, '');       // the swallowClicks panel every Court zone sits in
+      panel.className = 'panel';
+      document.body.appendChild(panel);
+
+      const neighbour = document.createElement('div');
+      neighbour.setAttribute('data-entity-id', '9');
+      neighbour.setAttribute(PRESS_ORIGIN, '');   // a real control: it would have handled the press
+      neighbour.id = 'start';
+      panel.appendChild(neighbour);
+      stubRect(neighbour, { left: 100, top: 60, width: 40, height: 40 });
+
+      // ⚠️ **Shipping shape: NO `id`, NO `className` — `data-entity-id` is all a UINode host has.**
+      // This carried `sibling.id = 'pager-next'` and that single line hid a real defect: the
+      // refusal names the host via `describeElement`, which looks for `id`/`class`/`data-ui-id` and
+      // finds none of them on a game UI node, so production got "the minTapSize tap zone of div"
+      // while the test read a reassuring "#pager-next". The fixture was shipping-shaped for the
+      // press-origin ancestor and not for naming.
+      const sibling = document.createElement('div');
+      sibling.setAttribute(PRESS_ORIGIN, '');
+      sibling.setAttribute('data-entity-id', '31');
+      panel.appendChild(sibling);
+
+      const zone = document.createElement('div');   // the expander, overhanging the neighbour
+      zone.setAttribute(TAP_ZONE, '');
+      sibling.appendChild(zone);
+
+      // Topmost at the aim point is the ZONE; the full stack has the neighbour under it.
+      document.elementFromPoint = () => zone;
+      document.elementsFromPoint = () => [zone, neighbour, panel, document.body];
+      return { panel, neighbour, sibling, zone };
+    }
+
+    it('a TAP is not occluded by a zone that would lose the press to the target', () => {
+      const { neighbour } = mountOverlap();
+      const r = resolveEntityPointReport({ guid: 'g-start', gesture: 'tap' });
+      expect(r, 'a human tapping here reaches the neighbour, so the agent must too')
+        .toMatchObject({ ok: true, occluded: false });
+      expect(neighbour.id).toBe('start');
+    });
+
+    /** ⚠️ The accept side, and the reason `75ba25601` was reverted: making the tap case right by
+     *  itself buys a §0 rank-1 FALSE SUCCESS on drag. #977's redirect needs the release in the same
+     *  zone, which a drag never satisfies, so the zone really does take the gesture — a
+     *  `modoki_drag {from:{entity:'DailyClose'}}` under a neighbour's expander must stay refused
+     *  rather than silently begin on the zone's host. */
+    it.each(['drag', 'press', 'hover', 'scroll'] as const)(
+      'a %s is STILL occluded by the same zone — the redirect is click-only', (gesture) => {
+        mountOverlap();
+        expect(resolveEntityPointReport({ guid: 'g-start', gesture }))
+          .toMatchObject({ occluded: true });
+      });
+
+    /** ⚠️ **This case asserted the OPPOSITE and was wrong**, which driving the change live is what
+     *  showed. The redirect can only turn `occluded: true` into `false` — it hands the press PAST
+     *  the zone — so reading an absent gesture as `'tap'` is the PERMISSIVE default, not the strict
+     *  one the first comment here claimed. A caller that named no intent reaching a newer renderer
+     *  (a stale main over HMR, an `eval` body calling the op directly, a packaged main against a
+     *  dev renderer) would have had its DRAG waved through and begun on the zone's host: §0's
+     *  rank-1 false success, arriving by the back door the gesture split exists to close. */
+    it('an aim that names NO gesture gets the STRICT answer — no redirect, so still occluded', () => {
+      mountOverlap();
+      expect(resolveEntityPointReport({ guid: 'g-start' })).toMatchObject({ occluded: true });
+    });
+
+    it('an unrecognized gesture value is also treated as not-a-tap, rather than accepted as one', () => {
+      // Reachable from an `eval` body or a caller newer/older than this renderer. Falling to the
+      // strict side means a junk value costs a refusal the caller can override with
+      // `allowOccluded`, never a press that silently lands on the wrong element.
+      mountOverlap();
+      expect(resolveEntityPointReport({ guid: 'g-start', gesture: 'not-a-gesture' as never }))
+        .toMatchObject({ occluded: true });
+    });
+
+    /** ⚠️ Mutation target 1 of 3: deleting `resolveTapZoneVeto`'s ancestor rule
+     *  (`owner.contains(host)`) survived every test of the reverted fix. It inverts the whole rule
+     *  — every zone vetoes to its own panel root, whose handler is `stopPropagation(); return;` —
+     *  so the courtesy area is deleted rather than narrowed. This case fails when it goes. */
+    it('a zone does NOT lose the press to an interactive ANCESTOR of its own host', () => {
+      const { zone, sibling, panel } = mountOverlap();
+      // Nothing of the neighbour under the point: the stack is the zone, its host, then the panel.
+      document.elementsFromPoint = () => [zone, sibling, panel, document.body];
+      expect(resolveEntityPointReport({ guid: 'g-start', gesture: 'tap' }),
+        'the panel is an ancestor, not "someone else" — the zone keeps the press')
+        .toMatchObject({ occluded: true });
+    });
+
+    /** ⚠️ Mutation target 2 of 3: a DECORATIVE neighbour is not a handler, so the zone keeps the
+     *  press. Deleting the owner check entirely makes the zone lose to anything at all. */
+    it('a zone keeps the press over a decorative neighbour with no interactive ancestor', () => {
+      const { zone, panel } = mountOverlap();
+      const decoration = document.createElement('span');   // no data-press-origin anywhere above it
+      document.body.appendChild(decoration);
+      document.elementsFromPoint = () => [zone, decoration, document.body];
+      void panel;
+      const r = resolveEntityPointReport({ guid: 'g-start', gesture: 'tap' });
+      expect(r).toMatchObject({ occluded: true });
+      // ⚠️ **Asserting the VERDICT alone is not enough here, and that is measured, not assumed.**
+      // Deleting the owner check (`if (!owner) return null`) makes the veto hand the press to the
+      // decoration instead of leaving it with the zone — and since the decoration is no more the
+      // target than the zone was, `occluded` stays `true` either way. The mutation survived until
+      // this line existed. What separates the two is WHO is reported as holding the press: the
+      // zone kept it, so the refusal must name the zone.
+      expect(String(r.hitTarget), 'the ZONE kept the press — a decoration is not a handler')
+        .toContain('minTapSize tap zone');
+    });
+
+    /** The other half of the complaint: a refusal that is CORRECT and still unactionable. The
+     *  expander is a style-only div, so the caller used to be told `div in the "Game" panel`. */
+    it('names the tap zone in a refusal, instead of an anonymous div', () => {
+      const { zone, sibling, panel } = mountOverlap();
+      document.elementsFromPoint = () => [zone, sibling, panel, document.body];
+      const r = resolveEntityPointReport({ guid: 'g-start', gesture: 'tap' });
+      expect(String(r.hitTarget)).toContain('minTapSize tap zone');
+      // ⚠️ Named by `data-entity-id` — the handle an agent already aims by, and the only thing a
+      // shipping UINode host carries. `toContain('pager-next')` used to pass here only because the
+      // fixture gave the host an `id` that no real node has.
+      expect(String(r.hitTarget), 'and says WHOSE, in a form the caller can aim at')
+        .toContain('entity 31');
+    });
+
+    it('falls back to the panel context when the zone\'s host names nothing at all', () => {
+      // The other half of F2: returning "of div" is worse than the `div in the "Game" panel` this
+      // branch replaced, so an anonymous host must not short-circuit the ancestor walk.
+      const { zone, sibling, panel } = mountOverlap();
+      sibling.removeAttribute('data-entity-id');
+      panel.setAttribute('data-editor-panel', 'Game');
+      document.elementsFromPoint = () => [zone, sibling, panel, document.body];
+      const r = resolveEntityPointReport({ guid: 'g-start', gesture: 'tap' });
+      expect(String(r.hitTarget), 'still says it is a tap zone').toContain('minTapSize tap zone');
+      expect(String(r.hitTarget), 'and keeps the context it used to have').toContain('"Game" panel');
+    });
+
+    /** ⚠️ jsdom implements neither hit-test. `pressOrigin.ts` guards its own call with
+     *  `?.() ?? []`; this path did not, so a jsdom test that mounted a UINode tree and called
+     *  `resolveEntityPointReport` got a TypeError out of a function whose callers treat the result
+     *  as data. */
+    it('survives a DOM with no elementsFromPoint at all', () => {
+      const { zone } = mountOverlap();
+      // @ts-expect-error — modelling a DOM that does not implement it, which jsdom's really is.
+      document.elementsFromPoint = undefined;
+      expect(() => resolveEntityPointReport({ guid: 'g-start', gesture: 'tap' })).not.toThrow();
+      expect(resolveEntityPointReport({ guid: 'g-start', gesture: 'tap' }))
+        .toMatchObject({ occluded: true });   // no stack to veto with, so the zone keeps it
+      void zone;
     });
   });
 

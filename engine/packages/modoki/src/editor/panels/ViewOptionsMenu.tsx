@@ -15,6 +15,27 @@ export interface ViewOption {
   onToggle: () => void;
   title?: string;
   uiId: string;
+  /** This option REMOVES content from the surface below when on (rather than adding an overlay), so
+   *  it must survive {@link viewBadgeLabel}'s two-name cap. Without it the cap works in items order,
+   *  and `colliders` is last in both menus — so FX + Focus + Colliders rendered `View: FX, Focus +1`,
+   *  hiding the one option the badge exists to surface. */
+  notable?: boolean;
+}
+
+/** The trigger's label: names the checked options instead of counting them (#1003).
+ *
+ *  `View` when nothing is on, `View: Colliders` for one, `View: Grid, Colliders` for two, and
+ *  `View: Grid, Colliders +2` beyond that — so at least one option is always NAMED however many are
+ *  active, and the width stays bounded. Exported (and pure) so the rule is testable without mounting
+ *  the menu, per docs/editor.md's "a panel's DECISIONS belong in a plain module" convention. */
+export function viewBadgeLabel(items: readonly ViewOption[]): string {
+  // `notable` first, order otherwise preserved — so a content-removing option is never the one the
+  // cap drops. A stable partition rather than a sort, so the menu's own ordering still reads through.
+  const checked = items.filter((i) => i.checked);
+  const on = [...checked.filter((i) => i.notable), ...checked.filter((i) => !i.notable)];
+  if (on.length === 0) return 'View';
+  if (on.length <= 2) return `View: ${on.map((i) => i.label).join(', ')}`;
+  return `View: ${on[0].label}, ${on[1].label} +${on.length - 2}`;
 }
 
 /** One checkable row inside {@link ViewOptionsMenu}. */
@@ -46,6 +67,11 @@ export function ViewOptionsMenu({ items, uiId }: { items: ViewOption[]; uiId: st
   useOverlayEscape(open, () => setOpen(false), 'sceneview-view-options');
 
   const activeCount = items.filter((i) => i.checked).length;
+  // NAME the active options rather than counting them (#1003). `View (1)` could not answer "which
+  // one?", and worse, in 3D it is the DEFAULT resting state because Grid is checked by default —
+  // so the badge read the same whether the content-hiding Colliders mode was on or off, and carried
+  // no signal at all. Capped at two names so the toolbar cannot grow without bound.
+  const activeLabel = viewBadgeLabel(items);
   return (
     <>
       <div style={{ width: 1, height: 18, background: '#444', margin: '0 6px' }} />
@@ -57,7 +83,7 @@ export function ViewOptionsMenu({ items, uiId }: { items: ViewOption[]; uiId: st
             border: `1px solid ${activeCount ? '#5a9fd4' : '#444'}`,
             borderRadius: 3, color: activeCount ? '#5a9fd4' : '#666', fontSize: '10px',
             cursor: 'pointer', fontWeight: 'bold', fontFamily: 'monospace', lineHeight: 1,
-          }}>View{activeCount ? ` (${activeCount})` : ''} <span style={{ fontSize: 8, opacity: 0.7 }}>▾</span></button>
+          }}>{activeLabel} <span style={{ fontSize: 8, opacity: 0.7 }}>▾</span></button>
         {open && (
           <div style={{
             position: 'absolute', top: '100%', right: 0, marginTop: 3, zIndex: 1000,

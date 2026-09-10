@@ -166,6 +166,38 @@ const ENTRYPOINT_IDIOM = /import\.meta\.url|process\.argv\[1\]/;
  *  a spelling, that pins the result — do not delete either as redundant.** */
 const BANNED_REALPATH = /\brealpathSync\s*\(/;
 
+/** ⚠️ `new URL(import.meta.url).pathname` — a module deriving its OWN directory the one way that
+ *  does not survive leaving a Mac. `URL.pathname` is the URL's path COMPONENT: still percent-encoded
+ *  and still carrying the leading slash. So on Windows `file:///C:/repo/engine/scripts/x.mjs` gives
+ *  `/C:/repo/engine/scripts/x.mjs`, which `path.resolve` reads as drive-RELATIVE (`C:\C:\repo\…`),
+ *  and any clone path containing a space gives `My%20Projects`. `fileURLToPath` exists precisely to
+ *  undo both, and is what all ~30 sibling scripts already use.
+ *
+ *  This is not hypothetical and not new: #904/#910 are the same signature in the same file this
+ *  guard was written for — `generate-icons.mjs`, where the derived root fed an `existsSync` that
+ *  went false, so the icon/splash step "did nothing at all and reported success" on Windows
+ *  (docs/windows.md). The failure is SILENT AND EXIT-ZERO, which is why a guard is worth more here
+ *  than a code review: nothing this repo runs on a Mac can see it, and #1011's close-out found the
+ *  recipe reintroduced by hand in that very file within a day of the doc being written.
+ *
+ *  Deliberately NOT matched: `.pathname` on any other URL. A `new URL(req.url).pathname` in a server
+ *  route is reading an HTTP path, which is exactly what `.pathname` is for. The tie to
+ *  `import.meta.url` is what makes it a filesystem-path bug.
+ *
+ *  ⚠️ `[^;)]*` before `import.meta.url`, NOT an anchored `\(\s*`. This repo's house style for a
+ *  module's own directory is `fileURLToPath(new URL('.', import.meta.url))` — four scripts write it
+ *  that way (`typecheck-projects.mjs`, `migrate-legacy-scenes.mjs`, `editorPorts.mjs`,
+ *  `install-git-hooks.mjs`). Dropping the `fileURLToPath` wrapper off any of them is a ONE-TOKEN
+ *  edit that reproduces #904/#910 exactly, and the anchored form this guard shipped with could not
+ *  see it — so the guard missed the spelling it was most likely to be needed for.
+ *
+ *  ⚠️ **FLOOR, stated plainly** (house standard in this file): per-LINE, so a `new URL(` split
+ *  across lines before `.pathname` escapes, as does binding the URL to a variable first
+ *  (`const u = new URL(import.meta.url); u.pathname`). Both were measured as escaping. Widening to
+ *  catch them means tracking values across lines, which a line regex cannot do; this guard is a
+ *  tripwire for the idiom as it is actually written, not a proof. */
+const BANNED_URL_PATHNAME = /new\s+URL\s*\([^;)]*import\.meta\.url\s*\)\s*\.pathname/;
+
 /** `canonicalPath(...)` on either side of a `===`/`!==` (#892).
  *
  *  The third shape, and the one the first two guards were structurally unable to see. #869 banned
@@ -401,6 +433,43 @@ describe('same-directory comparisons go through pathIdentity (#869)', () => {
     ['the async twin — an accepted gap, not an endorsement', 'await fs.promises.realpath(p);', false],
   ])('realpath regex: %s', (_label, line, shouldMatch) => {
     expect(BANNED_REALPATH.test(line)).toBe(shouldMatch);
+  });
+
+  it.each([
+    ['the exact recipe', "const R = path.dirname(new URL(import.meta.url).pathname);", true],
+    ['spaced out', "path.resolve(path.dirname(new URL( import.meta.url ).pathname), '..');", true],
+    ['no dirname around it', "const self = new URL(import.meta.url).pathname;", true],
+    // ⚠️ The two rows this regex was WIDENED for. The guard's first version anchored on
+    // `\(\s*import\.meta\.url` and missed both — which is the repo's own dominant spelling.
+    ['the house style, wrapper dropped', "const R = new URL('.', import.meta.url).pathname;", true],
+    ['the house style with a climb', "const R = new URL('../..', import.meta.url).pathname;", true],
+    // …and what it must NOT claim. An HTTP path is what `.pathname` is FOR; banning that spelling
+    // outright would push the fix the wrong way, since the cheapest way to green a route is to
+    // hand-slice the string instead.
+    ['an HTTP request path', "const route = new URL(req.url, base).pathname;", false],
+    ['the correct idiom', "const R = path.dirname(fileURLToPath(import.meta.url));", false],
+    ['a URL built from something else', "const p = new URL(href).pathname;", false],
+  ])('import.meta.url .pathname regex: %s', (_label, line, shouldMatch) => {
+    expect(BANNED_URL_PATHNAME.test(line)).toBe(shouldMatch);
+  });
+
+  it('no file derives its own path from new URL(import.meta.url).pathname (#904/#910, #1011)', () => {
+    const offenders: string[] = [];
+    for (const rel of files) {
+      const src = stripComments(fs.readFileSync(path.join(repoRoot, rel), 'utf8'));
+      src.split('\n').forEach((line, i) => {
+        if (BANNED_URL_PATHNAME.test(line)) offenders.push(`  ${rel}:${i + 1}  ${line.trim()}`);
+      });
+    }
+    expect(
+      offenders,
+      '`new URL(import.meta.url).pathname` keeps the leading slash and percent-encoding, so it\n'
+      + 'yields `/C:/...` on Windows (drive-RELATIVE to path.resolve) and `My%20Projects` for any\n'
+      + 'clone path with a space. The lookups built on it then miss SILENTLY, exit 0, and no Mac\n'
+      + 'gate can see it — #904/#910 in generate-icons.mjs, reintroduced by hand during #1011.\n'
+      + 'Use `fileURLToPath(import.meta.url)` from node:url:\n'
+      + offenders.join('\n'),
+    ).toHaveLength(0);
   });
 
   it('no file canonicalises with the bare fs.realpathSync walk (#881)', () => {

@@ -101,6 +101,48 @@ persistent editor-only toggle: follow that convention (a small `load*`/`save*` p
 component, or an inline `localStorage.getItem`/`setItem` in a Zustand setter) rather than
 folding it into layout JSON — layout is FlexLayout's `Model`, not a general prefs bag.
 
+#### A View option that REMOVES content must announce itself (#1003)
+
+**The rule: of SceneView's view options, three families remove viewport content rather than adding an
+overlay — the 2D `colliders2DOnly` flag, the 3D `showColliders` flag, and the 3D/2D/UI layer chips.**
+Two surfaces carry that for the **two collider flags**:
+
+- **The `View ▾` badge NAMES what is on** — `View: Colliders`, not `View (1)` — via the pure
+  `viewBadgeLabel()` in `editor/panels/ViewOptionsMenu.tsx` (two names, then `+N`).
+- **A corner notice in the viewport** while content is hidden, from `hiddenContentNotice()` in
+  `editor/scene/sceneViewMath.ts`. It is keyed to the SAME predicate the renderer gates on
+  (`shouldHideMeshesForColliderMode`) so it can never claim content is hidden when it is not, and it
+  names the shortcut, because that is what somebody staring at a blank viewport needs. When the scene
+  has no colliders at all it says so outright, and a warn TOAST fires on the OFF→ON transition — that
+  is the case where the viewport goes completely empty with nothing to inspect.
+
+⚠️ **The LAYER CHIPS are NOT covered by either surface, and this section previously implied they
+were.** `hiddenContentNotice` never fires for `show2D`/`show3D`/`showUI`, so turning the 2D layer off
+empties the viewport with only the chip's own colour as the signal. They are milder — each chip is
+individually labelled and lit, and none has a shortcut — but the gap is real and is stated here rather
+than papered over. Extending the notice to them is unclaimed work.
+
+⚠️ The badge names at most two options before collapsing to `+N`, so a `ViewOption` that removes
+content sets **`notable: true`** and is named FIRST. Without it the cap ran in items order and
+`colliders` is last in both menus — `View: FX, Focus +1` elided the one option the badge exists for.
+
+⚠️ **Why a count was not merely unhelpful but empty:** in 3D, `View (1)` is the DEFAULT resting state,
+because Grid is checked by default (`sceneViewPrefs.ts`). So the badge read identically whether the
+content-hiding Colliders mode was on or off. And Grid-only vs Colliders-only are both "one option
+active" — one viewport showing everything, one showing nothing, same string.
+
+⚠️ **Collider-only mode is one unmodified keypress away (`C`) and it PERSISTS**, and both are
+deliberate — the persistence is #399's, above. `C` is not gated on a scene HAVING colliders, on
+purpose: a key that silently does nothing is its own trap, and with the notice on screen the mode
+explains itself even in a scene with no colliders at all (the case where the viewport is completely
+empty). Note the binding is armed by PANEL focus, not viewport focus — clicking the Scene tab is
+enough (`input/keymap.ts`).
+
+**What this cost, which is why it is a rule and not a nicety:** an empty authoring viewport is
+indistinguishable from a broken one. It cost the owner a debugging session, and it cost the tracker a
+wrong issue — #1000 was filed with *"one `Scene2DRenderer` dies permanently"* as its headline, because
+the flag was on and nothing on screen said so.
+
 #### Remembering an ASSET PATH is not the same as remembering a toggle (#473)
 
 A toggle is a value. A remembered **path** is a reference into a project, and the editor's

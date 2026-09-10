@@ -1163,12 +1163,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       if (Number.isNaN(n)) return json({ error: `invalid id (not a number): ${id}` }, 400);
       params.id = n;
     }
-    try {
-      const result = await ctx.requestBrowser('scene-state', params);
-      return json(result);
-    } catch (e) {
-      return json({ error: String(e instanceof Error ? e.message : e) }, 504);
-    }
+    return relayJson(ctx, 'scene-state', params);
   }
 
   // ── GET /api/console-logs[?level=&limit=&since=] (M→R) ── dump the renderer's
@@ -1188,12 +1183,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     // `ts > NaN` is false, so it returns zero logs and hides real errors.
     if (limit != null && limit !== '' && !Number.isNaN(Number(limit))) params.limit = Number(limit);
     if (since != null && since !== '' && !Number.isNaN(Number(since))) params.since = Number(since);
-    try {
-      const result = await ctx.requestBrowser('console-logs', params);
-      return json(result);
-    } catch (e) {
-      return json({ error: String(e instanceof Error ? e.message : e) }, 504);
-    }
+    return relayJson(ctx, 'console-logs', params);
   }
 
   // ── GET /api/journal[?type=&clear=1] (M→R) ── the tick-stamped game-event trace
@@ -1209,8 +1199,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     if (query.get('clear') === '1' || query.get('clear') === 'true') params.clear = true;
     const jLimit = query.get('limit');
     if (jLimit != null && jLimit !== '' && !Number.isNaN(Number(jLimit))) params.limit = Number(jLimit);
-    try { return json(await ctx.requestBrowser('journal-events', params)); }
-    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+    return relayJson(ctx, 'journal-events', params);
   }
 
   // ── GET /api/resolve-refs?refs=a,b,244 (M→R) ── resolve journal/contact refs (GUIDs
@@ -1218,15 +1207,13 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   // names OUT of the journal stream. Resolves despawned entities too (emit-time side-table).
   if (urlPath === '/api/resolve-refs' && method === 'GET') {
     const refs = (query.get('refs') ?? '').split(',').map((s) => s.trim()).filter(Boolean);
-    try { return json(await ctx.requestBrowser('resolve-refs', { refs })); }
-    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+    return relayJson(ctx, 'resolve-refs', { refs });
   }
 
   // ── GET /api/game-introspect (M→R) ── discoverable dispatchable actions (+ param
   // schemas) and live named read-values, so an agent knows what it can trigger/read.
   if (urlPath === '/api/game-introspect' && method === 'GET') {
-    try { return json(await ctx.requestBrowser('game-introspect', {})); }
-    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+    return relayJson(ctx, 'game-introspect', {});
   }
 
   // ── GET /api/game-tools (M→R) ── the GAME's own MCP tool declarations (#270). The MCP server
@@ -1235,16 +1222,14 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   // An empty list is a normal answer (most projects register none, and a release build with the
   // debug menu off reports none by design) — never an error.
   if (urlPath === '/api/game-tools' && method === 'GET') {
-    try { return json(await ctx.requestBrowser('game-tools', {})); }
-    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+    return relayJson(ctx, 'game-tools', {});
   }
 
   // ── POST /api/game-tool-call {name, args} (M→R) ── invoke one game tool. POST because a game
   // tool may mutate (it declares which); the reply is the handler's OWN answer, passed through.
   if (urlPath === '/api/game-tool-call' && method === 'POST') {
     const b = (body ?? {}) as { name?: string; args?: Record<string, unknown> };
-    try { return json(await ctx.requestBrowser('game-tool-call', { name: b.name, args: b.args ?? {} })); }
-    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+    return relayJson(ctx, 'game-tool-call', { name: b.name, args: b.args ?? {} });
   }
 
   // ── GET /api/layout-bounds[?layer=&ids=&guids=&name=&entities=&overlaps=] (M→R) ── numeric screen-space
@@ -1270,8 +1255,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     if (lbLimit != null && lbLimit !== '' && !Number.isNaN(Number(lbLimit))) params.limit = Number(lbLimit);
     const lbPrec = query.get('precision');
     if (lbPrec != null && lbPrec !== '' && !Number.isNaN(Number(lbPrec))) params.precision = Number(lbPrec);
-    try { return json(await ctx.requestBrowser('layout-bounds', params)); }
-    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+    return relayJson(ctx, 'layout-bounds', params);
   }
 
   // ── GET /api/enact-handles[?editor=&kind=&ids=] (M→R) ── numeric handle geometry
@@ -1286,7 +1270,18 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     if (kind) params.kind = kind;
     if (ids) params.ids = ids.split(',').map((s) => s.trim()).filter(Boolean);
     try {
-      const res = await ctx.requestBrowser('enact-handles', params) as HandlesResponse;
+      const raw = await ctx.requestBrowser('enact-handles', params);
+      // ⚠️ A §5 refusal travels as itself rather than as a 200 (#1013).
+      //
+      // ⚠️ **It is the STATUS that was wrong here, not the body — an earlier version of this
+      // comment claimed the envelope would be reshaped into a decorated summary, and it could not
+      // be.** Both decoration branches below are gated on `Array.isArray(res.handles)`, which
+      // `{ok:false, code}` cannot pass, so without this check the envelope came back intact at
+      // HTTP 200. Worth stating precisely, because the reshaping story would justify a check
+      // BEFORE the guard and the real reason justifies one anywhere before the return.
+      const refusal = opRefusal(raw);
+      if (refusal) return json(raw as Record<string, unknown>, refusalStatus(refusal.code));
+      const res = raw as HandlesResponse;
       // Summarize HERE, not at the `enact-handles` op: `inputRoutes.ts` calls that op
       // directly (`requestRenderer('enact-handles', {ids:[id]})`) to resolve tap_handle /
       // drag_handle coordinates, so an op-level summary would break trusted input. The
@@ -1342,7 +1337,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
         });
       }
       return json(res);
-    } catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+    } catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, relayFailureStatus(e)); }
   }
 
   // ── GET /api/diagnose (M→R) ── structured render/scene health report (Phase F). ──
@@ -1351,8 +1346,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     // a swept read tool and §6 is summary-first — a per-clip index would grow every caller's
     // payload to answer a question almost none of them asked.
     const wantVideo = query.get('video') === '1' || query.get('video') === 'true';
-    try { return json(await ctx.requestBrowser('diagnose', wantVideo ? { video: true } : {})); }
-    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+    return relayJson(ctx, 'diagnose', wantVideo ? { video: true } : {});
   }
 
   // ── Device connection (M) — the Modoki-owned lease to a physical device. ──
@@ -1854,22 +1848,37 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       ? Math.max(50, Math.min(25_000, Math.floor(b.timeoutMs as number)))
       : 5000;
     const relayTimeoutMs = opTimeout + 10_000; // headroom over the op's own deadline
+    // ⚠️ **#1013 names this route as its anchor "with the widest blast radius", and that is FALSE.**
+    // The issue reasons that an eval body calls agent ops via `modoki.call(...)`, most of which
+    // refuse by THROWING, so the refusal rejects the eval and lands in this catch. It does not:
+    // `handleEval` (`app/debug/bridgeHelpers.ts`) wraps the whole body — the awaited `withTimeout`
+    // included — in ONE `try` and returns `` `Error: ${msg}` `` as the RESULT. Driven against a
+    // live editor, 2026-09-10:
+    //     {"code":"throw new Error('boom')"}             -> 200 {"result":"Error: boom"}
+    //     {"code":"return await modoki.call('…bad…')"}   -> 200 {"result":"Error: …"}
+    // So this catch is reachable only by a genuine RELAY failure, where the literal 504 was already
+    // correct. The route is swept for CONSISTENCY, not for a bug; the defect is real at the other
+    // 25, which relay an op directly and do see its rejection. Corrected on the issue too.
+    //
+    // ⚠️ **No `opRefusal` check here, deliberately, and this is the one route where that would be
+    // WRONG.** The reply is the eval's own return value: a body ending `return {ok:false,
+    // code:'NOT_FOUND'}` is legitimate agent DATA, and treating it as a §5 refusal would turn a
+    // successful eval into a 400. It is wrapped in `{result: …}` for the same reason, so no
+    // envelope reaches the top level of the response body where a client would read it as one.
     try { return json({ result: await ctx.requestBrowser('eval', { code: b.code, timeoutMs: opTimeout }, relayTimeoutMs) }); }
-    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, relayFailureStatus(e)); }
   }
 
   // ── GET /api/eval-api (M→R) ── discovery: the generated `modoki` scripting surface eval code
   // gets (op list + camelCase method names + api()/composite()/call() usage), so an agent never
   // has to read source to find what modoki_eval can call.
   if (urlPath === '/api/eval-api' && method === 'GET') {
-    try { return json(await ctx.requestBrowser('eval-api', {})); }
-    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+    return relayJson(ctx, 'eval-api', {});
   }
 
   // ── Percept Watch (M→R) ── standing numeric time-series over the live world. ──
   if (urlPath === '/api/watch/start' && method === 'POST') {
-    try { return json(await ctx.requestBrowser('watch-start', body ?? {})); }
-    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+    return relayJson(ctx, 'watch-start', body ?? {});
   }
   if (urlPath === '/api/watch/read' && method === 'GET') {
     const readLimit = query.get('limit');
@@ -1889,6 +1898,11 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     };
     try {
       const result = await ctx.requestBrowser('watch-read', params);
+      // ⚠️ A CODED §5 refusal goes first and travels on its own status (#1013). The 404 below is
+      // for the uncoded `{ok:false, error}` this op actually emits today — `opRefusal` requires a
+      // `code` from the closed set, so the two do not overlap and the 404 keeps its meaning.
+      const wRefusal = opRefusal(result);
+      if (wRefusal) return json(result as Record<string, unknown>, refusalStatus(wRefusal.code));
       // A read of an unknown / auto-expired watch answers {ok:false,error} — return it at 404 so
       // the MCP GET path (getJson, which only fails on status>=400 and does NOT run isFailureBody)
       // surfaces it as a tool failure instead of a "successful" empty result an agent misreads as
@@ -1896,15 +1910,13 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       if (result && typeof result === 'object' && (result as { ok?: unknown }).ok === false) return json(result, 404);
       return json(result);
     }
-    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, relayFailureStatus(e)); }
   }
   if (urlPath === '/api/watch/list' && method === 'GET') {
-    try { return json(await ctx.requestBrowser('watch-list', {})); }
-    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+    return relayJson(ctx, 'watch-list', {});
   }
   if (urlPath === '/api/watch/clear' && method === 'POST') {
-    try { return json(await ctx.requestBrowser('watch-clear', body ?? {})); }
-    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+    return relayJson(ctx, 'watch-clear', body ?? {});
   }
 
   // ── Profiler (#166 P6) ── "where did the frame go?" for the EDITOR surface.
@@ -1937,18 +1949,15 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       // the default, so a stray `?all=0` cannot flip it on by being truthy-as-a-string.
       ...(query.get('all') === 'true' ? { all: true } : {}),
     };
-    try { return json(await ctx.requestBrowser('profiler', params)); }
-    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+    return relayJson(ctx, 'profiler', params);
   }
   if (urlPath === '/api/profiler' && method === 'POST') {
-    try { return json(await ctx.requestBrowser('profiler', body ?? {})); }
-    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+    return relayJson(ctx, 'profiler', body ?? {});
   }
 
   // ── Input WATCH (#134, M→R) ── what the pointer actually did, and what it resolved to. ──
   if (urlPath === '/api/input-watch/start' && method === 'POST') {
-    try { return json(await ctx.requestBrowser('input-watch-start', body ?? {})); }
-    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+    return relayJson(ctx, 'input-watch-start', body ?? {});
   }
   if (urlPath === '/api/input-watch/read' && method === 'GET') {
     const limit = query.get('limit');
@@ -1958,16 +1967,13 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       ...(limit != null && limit !== '' && !Number.isNaN(Number(limit)) ? { limit: Number(limit) } : {}),
       ...(precision != null && precision !== '' && !Number.isNaN(Number(precision)) ? { precision: Number(precision) } : {}),
     };
-    try { return json(await ctx.requestBrowser('input-watch-read', params)); }
-    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+    return relayJson(ctx, 'input-watch-read', params);
   }
   if (urlPath === '/api/input-watch/stop' && method === 'POST') {
-    try { return json(await ctx.requestBrowser('input-watch-stop', {})); }
-    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+    return relayJson(ctx, 'input-watch-stop', {});
   }
   if (urlPath === '/api/input-watch/clear' && method === 'POST') {
-    try { return json(await ctx.requestBrowser('input-watch-clear', {})); }
-    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+    return relayJson(ctx, 'input-watch-clear', {});
   }
 
   // ── Hit REGIONS (#139, M→R) ── the shapes a game's hitTest uses, which are authored nowhere. ──
@@ -1988,8 +1994,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       // Both or neither — a half-specified point would silently probe (x, 0).
       ...(atX !== undefined && atY !== undefined ? { at: { x: atX, y: atY } } : {}),
     };
-    try { return json(await ctx.requestBrowser('hit-regions', params)); }
-    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+    return relayJson(ctx, 'hit-regions', params);
   }
 
   // ── POST /api/render-scene (M→R) ── deterministic offscreen render of the live
@@ -4525,6 +4530,10 @@ async function describeUnresolvedAgainstLiveWorld(
       // `persistenceMode` is. Present only when the host can answer (Electron); omitted entirely
       // on a backend with no input routes, so its absence never reads as "nothing is held".
       const held = ctx.getHeldPointer?.();
+      // ⚠️ Envelope check AFTER the merges are prepared but before they are applied (#1013):
+      // spreading `obj` would hand back a 200 whose body is a refusal wearing `persistenceMode`.
+      const esRefusal = opRefusal(obj);
+      if (esRefusal) return json(obj as Record<string, unknown>, refusalStatus(esRefusal.code));
       return json({
         ...obj,
         ...(ref ? { scenePathRef: ref } : {}),
@@ -4532,7 +4541,7 @@ async function describeUnresolvedAgainstLiveWorld(
         persistenceMode: getPersistenceMode(),
       });
     } catch (e) {
-      return json({ error: String(e instanceof Error ? e.message : e) }, 504);
+      return json({ error: String(e instanceof Error ? e.message : e) }, relayFailureStatus(e));
     }
   }
 
@@ -4580,8 +4589,7 @@ async function describeUnresolvedAgainstLiveWorld(
     if (sinceCap != null && sinceCap !== '' && !Number.isNaN(Number(sinceCap))) params.sinceCap = Number(sinceCap);
     if (query.get('merged') === '1' || query.get('merged') === 'true') params.merged = true;
     if (query.get('clear') === '1' || query.get('clear') === 'true') params.clear = true;
-    try { return json(await ctx.requestBrowser('editor-journal', params)); }
-    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+    return relayJson(ctx, 'editor-journal', params);
   }
 
   // ── GET /api/wait-for-edit[?type=&source=&since=&timeoutMs=] (M→R) ── #28: the long-poll
@@ -4608,8 +4616,7 @@ async function describeUnresolvedAgainstLiveWorld(
     if (timeoutMsQ != null && timeoutMsQ !== '' && !Number.isNaN(Number(timeoutMsQ))) params.timeoutMs = Number(timeoutMsQ);
     const clampedOpTimeout = Math.max(50, Math.min(120_000, params.timeoutMs ?? 30_000));
     const relayTimeoutMs = clampedOpTimeout + 10_000; // headroom over the op's own deadline
-    try { return json(await ctx.requestBrowser('wait-for-edit', params, relayTimeoutMs)); }
-    catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 504); }
+    return relayJson(ctx, 'wait-for-edit', params, relayTimeoutMs);
   }
 
   // ── GET /api/asset-def?path=[&type=] (M→R) ── read an asset DEFINITION back from the LIVE
@@ -5065,13 +5072,62 @@ function opRefusal(result: unknown): { code: ErrorCode; error?: string; options?
  *  503 for `NO_RENDERER` matches every envelope this router already emits for it — one in the
  *  unsaved-work probe and two in `/api/scene-mutate` (grep `code: 'NO_RENDERER'`; all three are
  *  503). ⚠️ That count was wrong on the first attempt too, in the very comment written to stop
- *  citing stale line numbers — so grep it, do not trust this sentence's arithmetic either. One code, one status, so the mapping is a rule rather than a per-site choice.
+ *  citing stale line numbers — so grep it, do not trust this sentence's arithmetic either.
+ *
+ *  One code, one status, so the mapping is a rule rather than a per-site choice. Anything the ops
+ *  start naming beyond `NO_RENDERER` is still the op ANSWERING, which `relayFailureStatus` (below)
+ *  already argues is a 400 rather than a gateway failure.
+ *
  *  ⚠️ Deliberately NOT citing line numbers: they were `:1028`/`:2372` when written and one of
  *  them already pointed at nothing two commits later. A line number in a comment is the
- *  shadowing-constant class — it has to be kept in sync by hand and silently goes stale. Anything else the ops start naming is the op ANSWERING, which `relayFailureStatus`
- *  above already argues is a 400 rather than a gateway failure. */
+ *  shadowing-constant class — it has to be kept in sync by hand and silently goes stale. */
 function refusalStatus(code: ErrorCode): number {
   return code === 'NO_RENDERER' ? 503 : 400;
+}
+
+/** **Relay one M→R op and turn its answer into a response.** The single place the three rules
+ *  about a relayed reply live, rather than 26 copies of them (#1013).
+ *
+ *  ⚠️ **Why this exists: a hard-coded `504` in the catch tells the agent "the editor is not
+ *  reachable" when the editor answered perfectly well and said no.** `requestBrowser` rejects
+ *  identically whether the RELAY died or the OP threw, so every route that caught with a literal
+ *  504 reported its own op's refusal as `NOT_AVAILABLE_HERE` — "could not look" for a case that was
+ *  "it said no". #994 fixed three sites (`render-scene`, `render-sequence`, `capture-viewport`) and
+ *  established the shape; this is that shape applied to the rest, and made hard to omit.
+ *
+ *  The three rules, in order:
+ *  ① A §5 envelope the op RETURNED (`{ok:false, code}`) travels as itself, on the status its code
+ *    maps to — not as a 200 with a failure body, which is what a bare `json(raw)` produced.
+ *  ② Anything the op THREW is the op answering: `relayFailureStatus` classifies it, which is a 400
+ *    unless the message matches a known transport signature.
+ *  ③ Only the relay's OWN failure keeps the 504.
+ *
+ *  ⚠️ Adopting this at a route costs a genuine transport failure NOTHING — `relayFailureStatus`
+ *  still returns 504 for one. That was the argument for leaving the remaining routes alone
+ *  (#1012 § "Not in scope"), and it does not hold: the classifier is what preserves the 504, so
+ *  using it is strictly better than hard-coding it. What #1012 is actually about — an op throwing a
+ *  plain `Error` so the route can only pick the GENERIC `REFUSED_BY_OP` — is untouched here and is
+ *  op-side work.
+ *
+ *  For a route that post-processes the reply (writes a temp file, trims a tail, re-codes a 404),
+ *  call `opRefusal`/`relayFailureStatus` directly instead — the classifier is the contract, this
+ *  wrapper is just the common case. `tests/plugins/relayRefusalStatus.test.ts` fails on a new
+ *  literal 504 in THIS file either way. ⚠️ It guards this file only: the Electron host's own
+ *  routes (`electron/main.ts` — `capture-viewport`, `capture-gesture`, `input/*`) relay too, but
+ *  fail through `backendServer.ts`'s catch-all 500 rather than a literal 504, so they are a
+ *  different shape and are not covered by that scan. */
+async function relayJson(
+  ctx: { requestBrowser(op: string, params: unknown, timeoutMs?: number): Promise<unknown> },
+  op: string, params: unknown, timeoutMs?: number,
+): Promise<BackendResult> {
+  try {
+    const raw = await ctx.requestBrowser(op, params, timeoutMs);
+    const refusal = opRefusal(raw);
+    if (refusal) return json(raw as Record<string, unknown>, refusalStatus(refusal.code));
+    return json(raw);
+  } catch (e) {
+    return json({ error: String(e instanceof Error ? e.message : e) }, relayFailureStatus(e));
+  }
 }
 
 /** Which status a thrown relay error deserves.
@@ -5101,6 +5157,14 @@ function relayFailureStatus(e: unknown): number {
   // fix, in the opposite direction. (`'editor window closed'` was already covered by `window
   // closed`.) A teardown is retryable once the renderer is back; a refusal is not, so telling the
   // two apart changes what the agent does next.
+  // ⚠️ **`unknown agent op` is here because the op being ABSENT is "could not look", not "it said
+  // no"** (#1013 close-out F5). `runAgentOp` throws it when the bridge is connected from a game
+  // page rather than `#/editor`, or in the window before `registerEditorAgentOps()` has run — so
+  // every editor-only route (`eval`, `eval-api`, `editor-journal`, `wait-for-edit`) hits it during
+  // a normal launch race. Adopting `relayFailureStatus` at those routes moved them from 504 →
+  // `NOT_AVAILABLE_HERE` to 400 → `REFUSED_BY_OP`, and `ERROR_CODES` defines the latter as "the
+  // operation itself declined" — a claim about an operation that does not exist. Subject-named, per
+  // the scar below: `unknown agent op`, never a bare `unknown`.
   // ⚠️ **`destroyed` WAS A BARE ALTERNATIVE, AND IT MATCHED THE REFUSALS THIS FUNCTION EXISTS TO
   // PROTECT** (bug BHdZZ52JIu4afJmoX7O6). It is here for Electron's own `Object has been
   // destroyed`, thrown when a BrowserWindow/webContents dies mid-request — a genuine transport
@@ -5133,7 +5197,7 @@ function relayFailureStatus(e: unknown): number {
  *  editor surface. This list has now been found incomplete three times by review; a copy of it is
  *  the wrong shape of thing to own. Read the history above before touching the pattern. */
 export function isRelayTransportFailure(msg: string): boolean {
-  return /no (editor )?renderer|timed out waiting for the (renderer|browser)|renderer went away|renderer reloading|project changed|window (is )?closed|object has been destroyed|\b(renderer|window|webcontents|view)\b (has been |was |is )?destroyed|websocket not ready/i.test(msg);
+  return /no (editor )?renderer|unknown agent op|timed out waiting for the (renderer|browser)|renderer went away|renderer reloading|project changed|window (is )?closed|object has been destroyed|\b(renderer|window|webcontents|view)\b (has been |was |is )?destroyed|websocket not ready/i.test(msg);
 }
 
 /** Was the relay failure specifically a TIMEOUT — the renderer never answered in the window?

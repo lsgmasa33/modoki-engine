@@ -103,8 +103,13 @@ export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions):
   // why this warns instead of refusing — and it has to happen here because the gesture itself
   // moves the DOM (a drop indicator, a panel that re-lays-out), so provenance read afterwards
   // would describe a page that no longer resembles the one aimed at.
-  const fromAim = aimProvenance(src.el, src.x, src.y, !!params.from.selector);
-  const toAim = aimProvenance(dst.el, dst.x, dst.y, !!params.to.selector);
+  // ⚠️ **`'drag'`, explicitly, and this is the call site the required parameter exists for**
+  // (#1016). A DnD is press-move-release across two points, so #977's click-time tap-zone redirect
+  // never applies — and letting it apply would let a drop whose target is covered by a neighbour's
+  // expander report SUCCESS while the gesture actually began on the zone's host. That is §0's
+  // rank-1 false success, and it is what `75ba25601` traded a stale refusal for.
+  const fromAim = aimProvenance(src.el, src.x, src.y, !!params.from.selector, 'drag');
+  const toAim = aimProvenance(dst.el, dst.x, dst.y, !!params.to.selector, 'drag');
   const dt = new DataTransfer();
   const before = opts?.editVersion?.();
 

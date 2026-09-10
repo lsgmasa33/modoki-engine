@@ -638,7 +638,7 @@ export async function tryDeviceCdpInput(method: string, params: Record<string, u
   try {
     switch (method) {
       case 'tap': {
-        const r = await resolveAimViaDevice(deps, params, 'selector', 'x', 'y');
+        const r = await resolveAimViaDevice(deps, params, 'selector', 'x', 'y', false, 'tap');
         if (r.kind === 'unsupported') return { handled: false, reason: STALE_APP_REASON };
         if (r.kind === 'refusal') return { handled: true, reply: r.error };
         // After the aim resolves (a refused aim dispatches nothing, so it must steal nothing).
@@ -647,10 +647,10 @@ export async function tryDeviceCdpInput(method: string, params: Record<string, u
         return { handled: true, reply: `ok (cdp touch) css(${Math.round(r.aim.x)},${Math.round(r.aim.y)}) @ ${aimAsResolved(r.aim.label)} [input:${TRUSTED_CDP_MECHANISM}]${supersededTap}` };
       }
       case 'drag': {
-        const from = await resolveAimViaDevice(deps, params, 'fromSelector', 'fromX', 'fromY');
+        const from = await resolveAimViaDevice(deps, params, 'fromSelector', 'fromX', 'fromY', false, 'drag');
         if (from.kind === 'unsupported') return { handled: false, reason: STALE_APP_REASON };
         if (from.kind === 'refusal') return { handled: true, reply: from.error };
-        const to = await resolveAimViaDevice(deps, params, 'toSelector', 'toX', 'toY');
+        const to = await resolveAimViaDevice(deps, params, 'toSelector', 'toX', 'toY', false, 'drag');
         if (to.kind === 'unsupported') return { handled: false, reason: STALE_APP_REASON };
         if (to.kind === 'refusal') return { handled: true, reply: to.error };
         const steps = (params.steps as number) || 5;
@@ -667,14 +667,14 @@ export async function tryDeviceCdpInput(method: string, params: Record<string, u
         return { handled: true, reply: `ok (cdp key ${key}${modifiers.length ? ' +' + modifiers.join('+') : ''}) [input:${TRUSTED_CDP_MECHANISM}]` };
       }
       case 'hover': {
-        const r = await resolveAimViaDevice(deps, params, 'selector', 'x', 'y');
+        const r = await resolveAimViaDevice(deps, params, 'selector', 'x', 'y', false, 'hover');
         if (r.kind === 'unsupported') return { handled: false, reason: STALE_APP_REASON };
         if (r.kind === 'refusal') return { handled: true, reply: r.error };
         await cdpHover(counting, r.aim.x, r.aim.y);
         return { handled: true, reply: `ok (cdp hover) @ ${aimAsResolved(r.aim.label)} [input:${TRUSTED_CDP_MECHANISM}]` };
       }
       case 'scroll': {
-        const r = await resolveAimViaDevice(deps, params, 'selector', 'x', 'y', true);
+        const r = await resolveAimViaDevice(deps, params, 'selector', 'x', 'y', true, 'scroll');
         if (r.kind === 'unsupported') return { handled: false, reason: STALE_APP_REASON };
         if (r.kind === 'refusal') return { handled: true, reply: r.error };
         const dx = (params.dx as number) ?? 0;

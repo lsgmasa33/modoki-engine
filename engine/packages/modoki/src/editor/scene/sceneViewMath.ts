@@ -394,6 +394,49 @@ export function shouldHideMeshesForColliderMode(mode: '3d' | 'ui', showColliders
   return mode !== 'ui' && showColliders;
 }
 
+/** The notice a viewport must show while a view option is HIDING content, or `null` (#1003).
+ *
+ *  The whole cost recorded in that issue is that an empty authoring viewport is indistinguishable
+ *  from a broken one: collider-only mode hides every sprite (or mesh), it survives an editor restart,
+ *  and in a scene with no colliders at all it leaves literally nothing on screen. It cost the owner a
+ *  debugging session, and it cost the tracker a wrong issue — #1000 was filed with "one
+ *  Scene2DRenderer dies permanently" as its headline because of exactly this.
+ *
+ *  ⚠️ Deliberately keyed to the SAME rule the renderer uses ({@link shouldHideMeshesForColliderMode})
+ *  rather than re-deriving "is Colliders on", so the notice cannot drift out of step with the actual
+ *  hiding — a label that says content is hidden when it is not is worse than no label.
+ *
+ *  Names the key, because that is the question someone stares at a blank viewport asking. */
+export function hiddenContentNotice(
+  mode: '3d' | 'ui',
+  showColliders: boolean,
+  colliders2DOnly: boolean,
+  colliderCount?: number,
+): string | null {
+  const hiding = shouldHideMeshesForColliderMode(mode, showColliders) || (mode === 'ui' && colliders2DOnly);
+  if (!hiding) return null;
+  // The worst case, and the one that reads as a crash: the mode is on AND there is nothing for it to
+  // draw, so the viewport is completely empty. Say that, rather than only saying what was hidden.
+  if (colliderCount === 0) return 'Colliders only — this scene has NO colliders to draw (C)';
+  // `undefined` means not measured yet. Fall back to the generic wording rather than guessing zero:
+  // claiming "no colliders" about a scene that has some is the exact false-notice this must not become.
+  return shouldHideMeshesForColliderMode(mode, showColliders)
+    ? 'Colliders only — meshes hidden (C)'
+    : 'Colliders only — sprites hidden (C)';
+}
+
+/** The toast to raise when collider-only mode is TURNED ON with nothing to draw, or `null` (#1003).
+ *
+ *  Separate from {@link hiddenContentNotice} because it is evaluated once per OFF→ON TRANSITION rather
+ *  than per frame — a toast must not repeat itself every frame the mode stays on. Returns null when
+ *  turning the mode OFF, and when the scene has colliders to show, so the caller has no condition of
+ *  its own to get wrong. (The caller drives it from an effect over derived state, so a mode switch
+ *  that brings a restored flag into effect is a transition too — it is not literally a click.) */
+export function colliderModeToast(turningOn: boolean, colliderCount: number): string | null {
+  if (!turningOn || colliderCount > 0) return null;
+  return 'Colliders only: this scene has no colliders, so the viewport will be empty. Press C again to restore.';
+}
+
 /** What the F-key frames for one entity, in priority order:
  *
  *   1. **Meshes** — the union world-AABB of the entity's own renderable AND every

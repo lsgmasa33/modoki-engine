@@ -17,10 +17,15 @@
  *  the topmost element at the point turns that silent miss into data: `occluded: true`
  *  plus the name of whatever covered it, with no screenshot. */
 
-import type { DomPointSpec, DomPointResolution, DomRect } from './domPointContract';
+import type { DomPointSpec, DomPointResolution, DomRect, AimGesture } from './domPointContract';
+import { isClickShaped } from './domPointContract';
+// ⚠️ The RUNTIME's own veto, not a copy of the rule (#1016). `resolveTapZoneVeto` is what
+// `pressOrigin.ts` uses to route a real press, so the aim surface and the router cannot disagree
+// about who gets the click — §9: a rule implemented twice diverges, and this pair already had.
+import { resolveTapZoneVeto, UI_TAP_ZONE_ATTR } from '@modoki/engine/runtime';
 
 // Re-exported so existing importers (domDnd, agentBridge) keep one import site.
-export type { DomPointSpec, DomPointResolution, DomRect } from './domPointContract';
+export type { DomPointSpec, DomPointResolution, DomRect, AimGesture } from './domPointContract';
 // The "nothing is at this point" sentinel lives in the DOM-free contract so the Electron main
 // process can import it as a value too — see its declaration there.
 export { NOTHING_AT_POINT } from './domPointContract';
@@ -164,10 +169,42 @@ export function withinClip(el: Element, x: number, y: number, cache?: Map<Elemen
  *  Otherwise a NON-NULL descriptor of the covering element, because a falsy value would slip
  *  past every `if (occludedBy)` a caller writes. `null` from `elementFromPoint` means the
  *  point is outside the window or clipped away, which is still un-clickable. */
-export function occlusionAt(owner: Element, x: number, y: number): string | null {
-  const top = document.elementFromPoint(x, y);
+export function occlusionAt(owner: Element, x: number, y: number, gesture: AimGesture | undefined): string | null {
+  const top = effectiveHit(x, y, gesture);
   if (!isOccluded(owner, top)) return null;
   return describeOccluder(top) ?? NOTHING_AT_POINT;
+}
+
+/** The element the gesture would REALLY reach — `elementFromPoint`, then the runtime's tap-zone
+ *  redirect where it applies.
+ *
+ *  ⚠️ **Why the raw topmost element stopped being the right answer** (#1016). #977 made a
+ *  `minTapSize` expander LOSE the press to real content underneath it: the expander is stamped
+ *  `data-tap-zone`, and `pressOrigin.ts` hands the click to whatever would have handled it. The aim
+ *  surface did not follow, so `isOccluded` still counted the zone as a cover and `modoki_tap`
+ *  refused an aim a human's finger now reaches — naming a bare anonymous `div` the caller cannot
+ *  act on.
+ *
+ *  ⚠️ **And why it is gated on the gesture.** The redirect is a CLICK-time mechanism and needs the
+ *  release in the same zone, which a drag never satisfies — both `pressOrigin.ts` and
+ *  `docs/ui-system.md` say so. Applying it to `modoki_drag {from:{entity:'DailyClose'}}` under a
+ *  neighbour's expander would stop the refusal, dispatch the gesture, begin it on the ZONE'S HOST,
+ *  and report success: `docs/mcp-tool-conventions.md` §0 ranks that false success first among
+ *  failure modes, above the refusal it replaces. That trade is what got `75ba25601` reverted, and
+ *  `isClickShaped` is the line that refuses to make it.
+ *
+ *  ⚠️ `elementsFromPoint` is called through `?.() ?? []`, matching the guard `pressOrigin.ts`
+ *  already has two files away. jsdom implements neither hit-test, so an unguarded call is a
+ *  `TypeError` out of a function whose callers treat the result as data. */
+function effectiveHit(x: number, y: number, gesture: AimGesture | undefined): Element | null {
+  const top = document.elementFromPoint(x, y);
+  if (!top || !isClickShaped(gesture)) return top;
+  const zone = top.closest(`[${UI_TAP_ZONE_ATTR}]`);
+  if (!zone) return top;
+  const stack = document.elementsFromPoint?.(x, y) ?? [];
+  // `null` means the zone legitimately KEEPS the press — the refusal is correct, and
+  // `describeOccluder` now names it well enough to act on.
+  return resolveTapZoneVeto(stack, zone) ?? top;
 }
 
 /** Name the covering element WELL ENOUGH TO ACT ON. `describeElement` falls back to the bare tag
@@ -177,15 +214,56 @@ export function occlusionAt(owner: Element, x: number, y: number): string | null
  *  covered a 2D gizmo handle (testboard 5jE5Tip6Qwp7s7YVAYoH) is a style-only div. So when the top
  *  element names nothing, walk up for the nearest ancestor that does and say which panel it is in. */
 export function describeOccluder(el: Element | null | undefined): string | null {
+  // ⚠️ A tap zone that legitimately KEEPS the press is a correct refusal and was still useless:
+  // the expander is a style-only div, so the caller was told `div in the "Game" panel` — true,
+  // and not a thing anyone can move out of the way (#1016). Name what it belongs to instead.
+  //
+  // ⚠️ **By `data-entity-id`, NOT by `describeElement`, and the first version got this wrong in the
+  // one shape it was written for.** `UINode.tsx` stamps a game UI host as
+  // `<div data-entity-id={n} data-press-origin style={…}>` — no `id`, no `className`, no `title`,
+  // and `data-entity-id` is not the `data-ui-id` `describeElement` looks for. So it returned a bare
+  // `'div'` and the promised *"the minTapSize tap zone of #pager-next"* was
+  // *"the minTapSize tap zone of div"* on every shipping node — a NET LOSS against the
+  // `div in the "Game" panel` it replaced, since this branch also skips the panel walk below.
+  // Caught because the test fixture set an `id` no UINode has.
+  //
+  // `data-entity-id` is the handle an agent aims at anyway (`bridge.ts`'s `describeEl` names the
+  // same audience the same way), so a caller can act on it directly: it is the `entity` id.
+  const zone = el?.closest?.(`[${UI_TAP_ZONE_ATTR}]`);
+  if (zone) {
+    const host = zone.parentElement;
+    const entityId = host?.getAttribute('data-entity-id');
+    const named = entityId ? `entity ${entityId}` : (host ? describeElement(host) : null);
+    // Falls through to the ancestor walk when the host names nothing at all, rather than
+    // announcing an anonymous owner — "of div" tells the caller strictly less than the panel does.
+    // ⚠️ `/[.#[]/` — "did `describeElement` find a real name, or fall back to a bare tag?" — NOT
+    // `named !== 'div'`. The literal test is right only while `UINode.tsx` gates tap zones to
+    // `elementType === 'div'`; the day a `<span>` or `<button>` may host one, it would announce
+    // "the minTapSize tap zone of span", the anonymous-owner shape this branch exists to avoid.
+    // Same predicate the non-zone path two functions down already uses.
+    if (named && /[.#[]|^entity /.test(named)) return `the minTapSize tap zone of ${named}`;
+    const anon = describeElement(el);
+    return anon ? `the minTapSize tap zone in ${describeOccluderContext(el!) ?? anon}` : null;
+  }
   const own = describeElement(el);
   if (!own || /[.#[]/.test(own)) return own; // already identifiable
-  for (let p = el!.parentElement, hops = 0; p && hops < 8; p = p.parentElement, hops++) {
+  return describeOccluderContext(el!) ?? own;
+}
+
+/** Walk up for the nearest ancestor that names something, and say where the element sits. Split out
+ *  of `describeOccluder` so the tap-zone branch can fall back to it (#1016 close-out F2) instead of
+ *  returning early with an anonymous owner — losing the context the pre-#1016 message had. */
+function describeOccluderContext(el: Element): string | null {
+  // Both callers guard on a truthy `describeElement(el)`, so no `??` fallback here — a defensive
+  // branch nothing can reach reads as evidence that a case exists.
+  const own = describeElement(el)!;
+  for (let p = el.parentElement, hops = 0; p && hops < 8; p = p.parentElement, hops++) {
     const panel = p.getAttribute('data-editor-panel');
     if (panel) return `${own} in the "${panel}" panel`;
     const named = describeElement(p);
     if (named && /[.#[]/.test(named)) return `${own} inside ${named}`;
   }
-  return own;
+  return null;
 }
 
 /** The single place a spec becomes an element + a point. Both public resolvers wrap this,
@@ -229,7 +307,7 @@ export function resolveDomPointReport(spec: DomPointSpec): DomPointResolution {
   if ('error' in r) {
     return { ok: false, error: r.error, ...(r.matched ? { matched: describeElement(r.matched) } : {}) };
   }
-  return { ok: true, x: r.x, y: r.y, ...aimProvenance(r.el, r.x, r.y, !!spec.selector) };
+  return { ok: true, x: r.x, y: r.y, ...aimProvenance(r.el, r.x, r.y, !!spec.selector, spec.gesture) };
 }
 
 /** The PROVENANCE half of a resolution: what the aim matched, and what is actually on top of it.
@@ -245,10 +323,15 @@ export function resolveDomPointReport(spec: DomPointSpec): DomPointResolution {
  *  the point simply is the target. Reporting `occluded` there would be a category error, not a
  *  stricter check. */
 export function aimProvenance(
-  el: Element, x: number, y: number, bySelector: boolean,
+  el: Element, x: number, y: number, bySelector: boolean, gesture: AimGesture | undefined,
 ): Pick<DomPointResolution, 'matched' | 'hitTarget' | 'occluded' | 'clipped'> {
   if (!bySelector) return { hitTarget: describeElement(el) };
-  const top = document.elementFromPoint(x, y);
+  // ⚠️ **The selector path reaches GAME UI, so it needs the redirect too** (#1016). The reverted
+  // `75ba25601` excused this path as "editor chrome only", which is false: `UINode.tsx` stamps
+  // `data-entity-id` on every game UI node, so `modoki_tap {selector:'[data-entity-id="42"]'}`
+  // resolves through here and kept the stale verdict. `docs/enact.md` states `entity` and
+  // `selector` are ONE category — the split was the bug, not the design.
+  const top = effectiveHit(x, y, gesture);
   const occluded = isOccluded(el, top);
   // SCROLLED OUT is a different diagnosis from COVERED, and until now the selector path could only
   // say the latter. `getBoundingClientRect()` on a row scrolled past its list's `overflow` clip

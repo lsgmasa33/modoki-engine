@@ -345,6 +345,32 @@ Rules:
     `CaptureUnavailableError` CLASS for exactly this reason; `relayFailureStatus`'s scar is what
     string-matching an error costs — a bare word in one op's prose eventually collides with
     another's.
+- **A relayed route never HARD-CODES its catch status** (#1013). This is the receive-side half of
+  the rule above, and the two are not the same fix: the emit side stops an op from *losing* its
+  code, this side stops the route from *inventing* one. `ctx.requestBrowser` rejects identically
+  whether the relay died or the op threw, so a literal `504` in the catch reports every refusal the
+  op raised as `NOT_AVAILABLE_HERE` — the editor declared unreachable while it is answering. Twenty-
+  six routes did that; `relayJson` in `editorBackendRouter.ts` now states the recipe once, and a
+  guard (`tests/plugins/relayRefusalStatus.test.ts`) fails on a new literal.
+  - **The classifier is what PRESERVES the 504**, so adopting it costs a genuine transport failure
+    nothing. The argument for leaving a route on a hard-coded 504 — *"a route SHOULD 504 on a real
+    transport failure"* — is true and is an argument FOR `relayFailureStatus`, not against it.
+  - ⚠️ **The accept side is the half to test.** `relayFailureStatus` decides by matching the
+    message, and that list has been found incomplete three times. A change that made every relay
+    error a 400 would pass every refusal test and be worse than the bug it replaced, so a
+    genuinely-dead renderer must be pinned by signature, with the strings the host actually sends.
+  - ⚠️ **`/api/eval` is the one route that must NOT read a returned envelope as a refusal.** The
+    reply is the eval's own return value, so a body ending `return {ok:false, code:'NOT_FOUND'}` is
+    agent DATA; it is wrapped in `{result: …}` so no envelope reaches the top level. Every other
+    relayed route relays one.
+  - ⚠️ **A route that post-processes its reply must check the envelope before it returns.** Only one
+    of the six spreads unconditionally (`/api/editor-state`, which merges main-process facts into
+    the relayed object) — there an envelope really would come back as a 200 whose body is a refusal
+    wearing `persistenceMode`. `enact-handles` gates its decoration on `Array.isArray(handles)`,
+    which an envelope cannot pass, so its bug was the STATUS alone. Worth separating: the
+    reshaped-into-a-plausible-answer failure (§0's rank 1) and a merely wrong status are different
+    severities, and an earlier draft of this bullet claimed the first for a route that only had the
+    second.
 
 ## 6. Response budget: summary-first
 

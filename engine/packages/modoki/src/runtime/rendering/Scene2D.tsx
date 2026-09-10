@@ -32,6 +32,7 @@ import type { World } from 'koota';
 import { Graphics, Sprite, Mesh, MeshGeometry, Texture, Rectangle, Matrix, Assets, Container, Buffer, BufferUsage, type Shader, type Geometry } from 'pixi.js';
 import { deactivatedEntities } from '../core/ecs/transformPropagationSystem';
 import { getCurrentWorld, onWorldSwap } from '../core/ecs/world';
+import { onAssetInvalidated } from '../core/assetInvalidation';
 import { getAllTraits } from '../core/ecs/traitRegistry';
 import { Transform, Renderable2D, Collider2D, SkinnedSprite2D, Billboard3D, FlatSprite3D, Text2D, TextAnimation, GroupAlpha, Mask2D } from '../traits';
 import { MaterialInstance } from '../traits/MaterialInstance';
@@ -183,6 +184,84 @@ const spriteTextureRefs = new Map<string, number>();
 // a genuine last release still frees the VRAM one tick later.
 const pendingTextureUnloads = new Map<string, ReturnType<typeof setTimeout>>();
 
+// Urls whose ALREADY-ARMED unload must retain rather than destroy (#1000). `deferUnload` early-returns
+// when a url is already pending, so a swap teardown re-releasing a url that an ORDINARY mid-scene
+// release armed a moment earlier cannot re-arm it — and would silently keep that arm's destroy
+// semantics. MEASURED: `games/court` hits exactly this on every stop, because its board overlay
+// despawns/respawns during play (see `pendingTextureUnloads`' note above), so its textures are
+// typically already armed by the time the stop swap arrives. wordweave does not, which is why the
+// first cut of this fix appeared to work there and did nothing in Court.
+const pendingRetainUpgrade = new Set<string>();
+
+// The scene as of the PREVIOUS world swap, so a play/stop swap (same scene) can be told from a genuine
+// scene change. `onWorldSwap` fires AFTER the swap, so a handler already reads the INCOMING scene —
+// recording it per swap is the only way to see the outgoing one. `undefined` means "no swap seen yet".
+//
+// ⚠️ Uses `getCurrent()?.path`, NOT `getCurrentBaseScene()`. The first version of this guard used the
+// latter and was ALWAYS TRUE, so the sweep it gates never actually became conditional and the churn
+// survived three attempted fixes. MEASURED live in games/court: `getCurrentBaseScene()` is `undefined`
+// (it names a CHAIN's base scene, which an ordinary single-scene project never sets) while
+// `getCurrent()?.path` is populated and stable across a play/stop. Absent must not be read as
+// "different" — that is the fail-open shape this comment exists to stop coming back.
+let lastSwapScenePath: string | null | undefined;
+/** Did THIS swap change the scene? Answered once per swap: the first renderer's handler updates the
+ *  record, so later handlers in the same swap see "unchanged" — which is correct, because when the
+ *  scene DID change the first handler has already run the wholesale sweep.
+ *  A first-ever swap reports `false`; nothing is tracked yet, so the net it gates is a no-op anyway. */
+/** The scene-identity key both the swap guard and the park purge compare on (#1000).
+ *
+ *  ⚠️ Exists as ONE function on purpose. These were two call sites reading the scene two different
+ *  ways, and that is exactly how this bug shipped twice: the guard was fixed to `getCurrent()?.path`
+ *  while `parkRetainedSpriteTexture` was left on `getCurrentBaseScene()` — which is `undefined` for any
+ *  project that is not a scene CHAIN, so its purge condition (`retainedForScene !== undefined`) could
+ *  never be true and the parked set was never evicted by a scene change at all. Derive, do not
+ *  duplicate. Found by the close-out sweep, one function away from the fix it mirrors. */
+function currentSceneKey(): string | null {
+  return sceneManager.getCurrent()?.path ?? null;
+}
+
+function swapChangedScene(): boolean {
+  const path = currentSceneKey();
+  // ⚠️ No identifiable scene → report CHANGED, i.e. sweep, i.e. exactly today's behaviour. Retention
+  // is an optimisation and must never be the reason a texture outlives its scene, so the unknown case
+  // fails toward the old behaviour rather than toward keeping things alive. (This is also what keeps
+  // the two F3 clear-on-swap tests honest: they swap worlds with no scene loaded at all.)
+  if (path === null) { lastSwapScenePath = null; return true; }
+  const changed = lastSwapScenePath !== undefined && lastSwapScenePath !== path;
+  lastSwapScenePath = path;
+  return changed;
+}
+
+// ── RETAINED sprite textures — refcount 0 means EVICTABLE, not destroyed (#1000) ──
+// A refcount reaching 0 across a play/stop transition does NOT mean the texture is finished with.
+// MEASURED on `games/court` and `games/wordweave` (dev editor, WebGPU, pixi 8.20.1): every play/stop
+// cycle destroyed each runtime-spawned sprite's TextureSource and RE-DECODED it on the next play —
+// `king.png` uid 5 -> 11, `count-banner.png` 7 -> 12, wordweave's UASTC `cell-washi.ktx2` 13 -> 16
+// (a GPU transcode, not just an image decode). Each destroy also emitted ~2 `[BindGroup] … destroyed
+// while still bound` warnings PER LIVE RENDERER, because Pixi's process-global batch bind-group cache
+// (`getTextureBatchBindGroup`'s `cachedGroups`) is never evicted and offers no public API to evict.
+//
+// ⚠️ Why the DEFERRAL above cannot fix this, and a longer one is a false fix: `deferUnload` cancels on
+// a re-retain, but after `stop` the reverted world genuinely does NOT hold the board's textures — the
+// board is spawned at runtime, so nothing re-retains and any timeout expires. The gap being bridged is
+// "a human decides to press Play", which is unbounded. Only RETENTION closes it.
+//
+// So the per-slot release path parks the url here instead of unloading, and the real release happens at
+// the coarse boundary the rest of the engine already uses — a change of SCENE, or the last renderer
+// stopping (docs/scene-loading.md: "the scene is the unit of memory management"). That bounds the set by
+// one scene's working set, which is the same bound every other GPU resource already has; sprite textures
+// were the exception to that rule, which is why they alone churned.
+const retainedSpriteTextures = new Set<string>();
+// Which base scene `retainedSpriteTextures` belongs to, so a genuine scene change can be told from a
+// play/stop swap (both are world swaps). `undefined` until the first retention.
+let retainedForScene: string | null | undefined;
+// >0 while a world-swap teardown is releasing slots, which is the ONLY release that may retain.
+// ⚠️ Scoped this narrowly on purpose: retaining on every release also retained every mid-scene one —
+// an entity deleted, a sprite ref repointed — so an authoring session that cycled through sprites
+// would pin each one until the scene changed. 11 existing tests in Scene2D.test.ts pin that
+// mid-scene release, and they were right to; a counter is what keeps both behaviours.
+let swapTeardownDepth = 0;
+
 // ── EDITOR-PANEL holds on a sprite url (#701) ──
 // Deliberately a SECOND map rather than more entries in `spriteTextureRefs`, because that one is
 // SCENE-scoped by design (F3: "no texture accounting survives a scene") and `unloadAllSpriteTextures`
@@ -197,6 +276,8 @@ export function retainPanelTexture(url: string): void {
   if (!url) return;
   const pending = pendingTextureUnloads.get(url);
   if (pending !== undefined) { clearTimeout(pending); pendingTextureUnloads.delete(url); }
+  retainedSpriteTextures.delete(url);   // live again (#1000) — same reason as retainSpriteTexture
+  pendingRetainUpgrade.delete(url);
   panelTextureRefs.set(url, (panelTextureRefs.get(url) ?? 0) + 1);
 }
 
@@ -217,11 +298,19 @@ export function releasePanelTexture(url: string): void {
  *  refcount trough on a shared url would otherwise destroy the source out from under the rebuild
  *  about to re-retain it. Cancels itself if EITHER a scene slot or a panel re-retains meanwhile. */
 function deferUnload(url: string): void {
+  // BEFORE the early return, deliberately — see `pendingRetainUpgrade`.
+  if (swapTeardownDepth > 0) pendingRetainUpgrade.add(url);
   if (pendingTextureUnloads.has(url)) return;
   const handle = setTimeout(() => {
     pendingTextureUnloads.delete(url);
+    // Consume-and-read: only a release performed BY a world-swap teardown may retain. An ordinary
+    // mid-scene release — an entity removed, a sprite ref repointed — must still FREE the texture, or
+    // an authoring session that cycles through sprites would pin every one it ever touched (11 tests
+    // in Scene2D.test.ts pin that, correctly).
+    const retain = pendingRetainUpgrade.delete(url);
     if ((spriteTextureRefs.get(url) ?? 0) > 0 || panelTextureRefs.has(url)) return;
-    unloadSpriteTextureNow(url);
+    if (retain) parkRetainedSpriteTexture(url);
+    else unloadSpriteTextureNow(url);
   }, 0);
   pendingTextureUnloads.set(url, handle);
 }
@@ -234,9 +323,65 @@ function unloadSpriteTextureNow(url: string) {
   if (Assets.cache.has(url)) Assets.unload(url).catch(() => { /* ignore */ });
 }
 
+/** Park an unreferenced url instead of destroying it (#1000). The texture stays in the Assets cache,
+ *  so a later `retainSpriteTexture` is FREE — no re-decode, no destroy, and hence no `[BindGroup]`
+ *  warning. This is the line that turns a play/stop cycle from destroy+re-decode into a no-op.
+ *
+ *  The scene check is here, at PARK time, rather than in the swap handler, for a sequencing reason:
+ *  `onWorldSwap` fires AFTER the world is swapped, so a release performed there already reads the
+ *  INCOMING scene — a swap-time comparison would see "unchanged" for every scene change and never
+ *  purge. Comparing at park time instead means the first park under a new scene is what evicts the
+ *  previous scene's set, which is both correct and self-healing.
+ *
+ *  ⚠️ Known, bounded overshoot: the textures released BY a scene change get parked under the incoming
+ *  scene's label, so they live until the NEXT scene change. That overshoot exists only where two or
+ *  more renderers are live — i.e. the EDITOR, which is exactly where retention is wanted. A shipped
+ *  game has one renderer, so `unloadAllSpriteTextures` runs on its every swap (see the `liveRenderers
+ *  <= 1` gate in the swap handler) and purges this set with it, preserving F3 exactly. */
+function parkRetainedSpriteTexture(url: string) {
+  const scene = currentSceneKey();
+  if (retainedForScene !== undefined && retainedForScene !== scene) releaseRetainedSpriteTextures();
+  retainedSpriteTextures.add(url);
+  retainedForScene = scene;
+}
+
+/** Actually free every parked texture. The real release point for the retention above — reached on a
+ *  scene change (via {@link parkRetainedSpriteTexture}) and from `unloadAllSpriteTextures`, which is
+ *  the swap/last-stop net. Routes through `unloadSpriteTextureNow`, so a panel hold still vetoes. */
+function releaseRetainedSpriteTextures() {
+  for (const url of retainedSpriteTextures) unloadSpriteTextureNow(url);
+  retainedSpriteTextures.clear();
+  retainedForScene = undefined;
+}
+
+// ⚠️ A re-imported texture must not keep being served from the PARKED set (#1000).
+// Before retention, a single-renderer play/stop ran `unloadAllSpriteTextures` and the next Play
+// re-fetched; parking removed that flush, so re-importing a sprite PNG and pressing Play would keep
+// showing the OLD bytes until a genuine scene change. `withCacheBust` cannot save it — it returns the
+// url unchanged unless `PROD && hash` (`loaders/assetUrl.ts`), i.e. it is a no-op in dev, which is
+// exactly where re-import happens.
+//
+// Purges the WHOLE parked set rather than the one url, deliberately: everything parked is BY
+// DEFINITION unreferenced, so dropping all of it is free, and it avoids mapping an asset PATH back to
+// the resolved variant URL(s) the set is keyed by — a mapping that would be a second place to get the
+// texture-variant scheme wrong.
+//
+// ⚠️ This restores the pre-retention behaviour; it does NOT close the wider hole. Nothing on the Pixi
+// side listens for texture invalidation at all (every `onAssetInvalidated` subscriber is in
+// `meshTemplateCache.ts`, i.e. 3D), so a re-import of a texture a LIVE sprite is still holding is
+// unaffected by this and was equally unaffected before. Pre-existing, filed separately.
+onAssetInvalidated((kind) => {
+  if (kind !== 'texture') return;
+  releaseRetainedSpriteTextures();
+});
+
 function retainSpriteTexture(url: string) {
   const pending = pendingTextureUnloads.get(url);
   if (pending !== undefined) { clearTimeout(pending); pendingTextureUnloads.delete(url); }
+  // Live again — drop the parked hold. This is the line that makes the retention PAY: the texture was
+  // never destroyed, so the respawned sprite binds the same loaded source (#1000).
+  retainedSpriteTextures.delete(url);
+  pendingRetainUpgrade.delete(url);
   spriteTextureRefs.set(url, (spriteTextureRefs.get(url) ?? 0) + 1);
 }
 function releaseSpriteTexture(url: string) {
@@ -249,10 +394,11 @@ function releaseSpriteTexture(url: string) {
   }
 }
 
-/** Unload every tracked sprite texture and clear the refcount map. Called on world
- *  swap + stop AFTER all slots are disposed, and ONLY by the PRIMARY renderer: a
- *  non-primary (editor) renderer stopping alone must NOT nuke textures GameView still
- *  shows. A balanced run leaves the map empty (each disposeSlot already released its
+/** Unload every tracked sprite texture and clear the refcount map. Called AFTER all slots are
+ *  disposed, from two places: the world-swap handler — gated on `liveRenderers <= 1` AND on the swap
+ *  having actually CHANGED SCENE (#1000) — and `stop()` when the last renderer goes. Neither clause is
+ *  "primary": the gate is a renderer COUNT, so a non-primary (editor) renderer stopping alone must NOT
+ *  nuke textures GameView still shows, and the last one out may. A balanced run leaves the map empty (each disposeSlot already released its
  *  texture), so this is a defensive net that also enforces the "no texture accounting
  *  survives a scene" invariant (F3) — without it any drift would pin VRAM across scenes. */
 function unloadAllSpriteTextures() {
@@ -264,6 +410,10 @@ function unloadAllSpriteTextures() {
   // keeps the "no texture accounting survives a scene" invariant (F3) exact.
   for (const [url, handle] of pendingTextureUnloads) { clearTimeout(handle); unloadSpriteTextureNow(url); }
   pendingTextureUnloads.clear();
+  pendingRetainUpgrade.clear();   // its timers are gone; a stale record would upgrade a future arm
+  // The parked set is scene-scoped accounting like the refcount above, so the F3 net must clear it too
+  // — otherwise retention (#1000) would pin a scene's VRAM past the swap that ends it.
+  releaseRetainedSpriteTextures();
 }
 
 /** SCANNED frames a visible 2D entity may go undrawn for want of a Canvas2D ancestor before the
@@ -2695,6 +2845,12 @@ export class Scene2DRenderer {
     this.unsub2DMat = register2DMaterialShaderMap(this.entityShaders);
 
     this.unsubSwap = onWorldSwap(() => {
+      // Mark this teardown as a SWAP teardown so the releases below retain rather than destroy
+      // (#1000). play/stop are world swaps that keep the same scene, so the textures the outgoing
+      // world held are overwhelmingly the ones the incoming world is about to ask for again.
+      // A counter (not a boolean) because every live renderer runs its own handler.
+      swapTeardownDepth++;
+      try {
       // Before the slots go: release() restores each Sprite's previous texture, and a
       // destroyed Sprite can't take one back.
       if (__MODOKI_MODULE_VIDEO__) disposeVideoTextures2D(this);
@@ -2755,8 +2911,26 @@ export class Scene2DRenderer {
       // (run in the disposeSlot loop above, in EVERY instance's swap handler) unloads a texture
       // correctly once BOTH viewports have released it — a blanket nuke here would destroy textures
       // the other viewport still shows (adversarial-review finding).
-      if (liveRenderers <= 1) unloadAllSpriteTextures();
+      // ⚠️ AND only when the swap actually CHANGED SCENE (#1000). A play/stop swap keeps the same
+      // scene, so this net's own invariant ("no texture accounting survives a SCENE") does not apply
+      // to it — yet it fired anyway and destroyed every tracked texture, defeating the per-slot
+      // retention entirely whenever only ONE renderer was live. MEASURED: that is a SceneView panel
+      // being closed, not a property of the game — games/court reproduced with 1 renderer while
+      // games/wordweave (SceneView mounted, 2 renderers) did not. Skipping it here is safe because
+      // this is a defensive net, as the comment on `unloadAllSpriteTextures` says: a balanced run has
+      // already released every texture through the per-slot path above.
+      // ⚠️ Evaluated BEFORE the `&&`, deliberately. `swapChangedScene()` is the ONLY writer of
+      // `lastSwapScenePath`, so short-circuiting it left the record un-maintained on every swap that
+      // happened while a second renderer was live — and `liveRenderers` flips between 1 and 2 on a
+      // SceneView mode-dropdown click. That produced both wrong answers: a spurious wholesale sweep on
+      // a same-scene swap (destroying and re-decoding every sprite texture — #1000's exact symptom,
+      // back for one cycle), and a MISSED net on a genuine scene change, because the first call after
+      // the gap sees `undefined` and reports "unchanged" while the refcount map is fully populated.
+      // The same blind spot as the getCurrentBaseScene() bug: a guard whose state updates on one branch.
+      const sceneChanged = swapChangedScene();
+      if (liveRenderers <= 1 && sceneChanged) unloadAllSpriteTextures();
       this._externalDirty = true;  // redraw the incoming scene
+      } finally { swapTeardownDepth = Math.max(0, swapTeardownDepth - 1); }
     });
 
     if (this.primary) sceneManager.registerBeforeSwap(prewarmHook);

@@ -10,7 +10,7 @@
  *
  *  Full cross-game coverage still lives in `npm run typecheck` (tsc -b engine). */
 
-import { execSync } from 'node:child_process';
+import { execSync, spawnSync } from 'node:child_process';
 import { writeFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { isProjectDir } from './projectRoots.mjs';
@@ -233,6 +233,69 @@ async function validateProjectConfig() {
  *  ⚠️ npm ships `README.md` regardless of the `files` field, so editing a plugin's DOCS re-hashes
  *  its tarball too. Nothing to do differently here — just don't be surprised by a re-vendor after
  *  a docs-only plugin edit. */
+/** Generate app icons + splash art for a native build — the CLI half of #1011 facet A.
+ *
+ *  ⚠️ Before this, icon generation ran from EXACTLY ONE place: `iconStep` in
+ *  `engine/plugins/vite-asset-scanner.ts`, i.e. the editor's Build menu. So the CLI native recipe that
+ *  CLAUDE.md documents — `npm run build -- --target native`, then `cap sync`, then
+ *  xcodebuild/gradle — regenerated NOTHING, and a project whose art or `iconSource` had changed
+ *  shipped the previously committed icons with every gate green. There was no guard either: the
+ *  freshness stamp lives under a gitignored `.cache/`, so nothing committed records what the shipped
+ *  artifacts were built from, and it is a per-MACHINE fact.
+ *
+ *  ⚠️ Deliberately NOT part of `healNativeProject`: a heal repairs machine/identity config, and burying
+ *  a required step inside an optional one is the failure `electron/main.ts:271-274` argues against and
+ *  #150 actually shipped. It is its own call, in the main flow, where a reader can see it.
+ *
+ *  Every input comes from `project.config.json` now, so this passes only the project and the platform —
+ *  the script owns resolution AND the freshness check, which is what keeps this from being a second
+ *  copy of `iconStep`'s fourteen-flag command line. A non-zero exit FAILS the build: the script only
+ *  exits non-zero when something asked for an icon that cannot be read, which is a broken config rather
+ *  than an absent one, and shipping stale art over it is the defect this closes. Verified against every
+ *  project in the repo: none has an `iconSource` pointing at a missing file. */
+async function generateNativeIcons() {
+  if (target !== 'native' || !proj) return;
+  // ⚠️ The EDITOR's native plan runs this script as its first step and then runs its OWN `iconStep`,
+  // so without this the editor build generates every icon twice — two `@capacitor/assets` runs, two
+  // sharp splash passes, two collateral snapshots of both native trees, and two windows in which the
+  // restore can fail. It is not merely waste: this function does BOTH platforms whenever both dirs
+  // exist, so an iOS-only editor build would also rewrite tracked Android art, which is #162/#236's
+  // complaint by name. `iconStep` is the more capable of the two (it falls back to the bundled icon
+  // for a project that authors none, and it is per-platform), so the editor's copy wins and this one
+  // stands down. Set only by that plan's own build-web step — a plain CLI build never carries it.
+  if (process.env.MODOKI_ICONS_HANDLED === '1') {
+    console.log('[build-web] icon generation left to the caller (MODOKI_ICONS_HANDLED=1).');
+    return;
+  }
+  const projectRoot = path.resolve(repoRoot, proj);
+  const platforms = ['ios', 'android'].filter((p) => existsSync(path.join(projectRoot, p)));
+  if (!platforms.length) return;
+
+  const script = path.join(repoRoot, 'engine', 'scripts', 'generate-icons.mjs');
+  for (const platform of platforms) {
+    const res = spawnSync(process.execPath, [script, '--project', projectRoot, '--platform', platform], {
+      cwd: repoRoot,
+      stdio: 'inherit',
+    });
+    // ⚠️ Two different failures, and telling the operator the wrong one costs them the hunt. A
+    // non-zero STATUS is the script's own verdict — it named the bad path already. A NULL status is
+    // the child never running or dying on a signal (no node on PATH, OOM, an abort), where "fix the
+    // icon source" points at a file that is perfectly fine.
+    if (res.error || res.status === null) {
+      console.error(`[build-web] could not RUN icon generation for ${platform} — not building. `
+        + `${res.error?.message ?? `killed by ${res.signal ?? 'an unknown signal'}`}. `
+        + 'This is the generator failing to start, not a problem with the icon source.');
+      process.exit(1);
+    }
+    if (res.status !== 0) {
+      console.error(`[build-web] icon generation failed for ${platform} — not building. `
+        + 'Fix the icon/splash source it named above (or clear the field in Project Settings); '
+        + 'building on would ship the previously committed art.');
+      process.exit(1);
+    }
+  }
+}
+
 async function healNativeProject() {
   if (target !== 'native' || !proj) return;
   const projectRoot = path.resolve(repoRoot, proj);
@@ -361,6 +424,10 @@ try {
   // Before the typecheck, which resolves the plugin's TS types out of the project's node_modules.
   // A heal that lands after it would be typechecked against the old copy.
   await healNativeProject();
+  // AFTER the heal: `ensureCapacitorDeps` may have just created the platform directory this writes
+  // into, and the icon step is a native-artifact concern like every heal above it. Before the web
+  // build, so a failure costs nothing already built.
+  await generateNativeIcons();
   // Typecheck gate — DEV only. typescript is a devDependency, so the packaged editor
   // doesn't ship it; there the typecheck is also redundant (the engine ships pre-built,
   // and an EXTERNAL project's game code isn't in the tsc scope anyway — see `include`

@@ -1261,6 +1261,10 @@ export function registerAllTraits() {
       firstX: { type: 'number', hidden: true, runtimeOnly: true }, firstY: { type: 'number', hidden: true, runtimeOnly: true },
       visibleX: { type: 'number', hidden: true, runtimeOnly: true }, visibleY: { type: 'number', hidden: true, runtimeOnly: true },
       poolSize: { type: 'number', hidden: true, runtimeOnly: true },
+      // The resolved px stride per axis (#1010) — the one place `entrySize + gap` is stated, read
+      // by `scrollApi` instead of being recovered from the window. Same hidden/runtimeOnly
+      // treatment as the rest of the readback: authoring it would be overwritten next frame.
+      strideX: { type: 'number', hidden: true, runtimeOnly: true }, strideY: { type: 'number', hidden: true, runtimeOnly: true },
     },
   });
 

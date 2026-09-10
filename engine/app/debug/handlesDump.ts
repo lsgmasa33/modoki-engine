@@ -81,7 +81,17 @@ export function computeHandles(params: HandlesDumpParams = {}): HandlesDumpResul
     // of anything addressed by coordinate, which is what a handle IS. `owner` is a live
     // DOM node, so it must never reach the JSON that crosses the agent bridge.
     const { owner, ...rest } = h;
-    const occludedBy = isElement(owner) ? occlusionAt(owner, h.x, h.y) : undefined;
+    // `'press'` — not click-shaped, so the tap-zone redirect is not consulted (#1016). Stated as a
+    // choice rather than inherited from a default.
+    //
+    // ⚠️ The reason is NOT "these are canvas handles" — an earlier version said that and it is
+    // wrong: `computeHandles` also carries `chromeHandles`' DOM `[data-ui-id]` handles. The
+    // conclusion survives on a narrower fact, checked rather than assumed: the chrome handles are
+    // editor toolbar/panel controls that paint ABOVE the game viewport, and a game's `minTapSize`
+    // expander is inside it, so no zone can cover one. ⚠️ `/api/input/tap-handle` refuses on this
+    // very field and IS click-shaped, so if a chrome handle ever moves under game UI this line is
+    // where a stale refusal would come from.
+    const occludedBy = isElement(owner) ? occlusionAt(owner, h.x, h.y, 'press') : undefined;
     const inWindow = h.x >= 0 && h.y >= 0 && h.x <= vw && h.y <= vh;
     const clipped = inWindow && isElement(owner) && !withinClip(owner, h.x, h.y, clipCache);
     return {

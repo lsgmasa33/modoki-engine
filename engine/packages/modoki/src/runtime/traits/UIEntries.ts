@@ -93,6 +93,31 @@ export const UIEntries = trait({
   visibleX: 0,
   visibleY: 0,
   poolSize: 0,
+  /** The RESOLVED stride the system used on its last RE-DRIVE — `entrySize + gap`, per axis, in px.
+   *
+   *  ⚠️ "Last re-drive", not "this tick", and the distinction is the one that bit: `writeWindowState`
+   *  sits behind the cheap early-out, so a tick that changes nothing republishes nothing. Every
+   *  input to the stride is therefore in that early-out's invalidation test (`resized`) — entry
+   *  size AND both gaps. The gap half was missing when this field was introduced, so an authored
+   *  `gapY` edit left the stride published at its pre-edit value and a step rounded off it.
+   *  **0 means "not resolved yet"** (no viewport, or a prefab whose root size is still uncached),
+   *  which is the same "no usable window" state `visibleX`/`visibleY` report as 0.
+   *
+   *  ⚠️ **Published because `scrollApi` was RECOVERING it and the two did not agree** (#1010).
+   *  `entryStride` reconstructed `viewport / (visible - 1)` from the published window, because the
+   *  system resolves entry size (the `%` case and the `0` = "read it from the prefab" case) and the
+   *  API could not. That is the shadowing-constant class from `CLAUDE.md`'s single-source-of-truth
+   *  table — a second derivation of a number this system already knows, kept in sync by nothing —
+   *  and it rounds differently near an entry boundary, which is exactly where a stepping API
+   *  decides which entry it is on. It also made `visible <= 1` the de-facto readiness test, which
+   *  silently guarded TWO things — a step on a non-scrolling axis, and a step on an axis with
+   *  fewer than two entries — since `visible` is bounded by the count. Both are now explicit tests
+   *  in `scrollByEntry`; the first attempt restored only one of them. (What the second guard buys
+   *  is spelled out there, and is NOT the "request for an entry that does not exist" the first
+   *  version of that comment claimed — the step clamp makes that impossible.) Read this field; do
+   *  not re-derive it. */
+  strideX: 0,
+  strideY: 0,
 });
 
 /** The bank's type and parser live in `entryPrefabBank.ts` and are re-exported here so every

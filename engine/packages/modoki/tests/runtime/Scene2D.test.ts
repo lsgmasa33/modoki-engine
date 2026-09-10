@@ -2321,6 +2321,298 @@ describe('Scene2DRenderer instancing', () => {
     await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
     expect(pixi.Assets.__unloaded).toContain('/a.png');
   });
+
+  // #1000 — sprite-texture RETENTION across a play/stop swap.
+  // MEASURED before the fix (dev editor, WebGPU, pixi 8.20.1): every play/stop cycle destroyed each
+  // runtime-spawned sprite's TextureSource and re-decoded it on the next play — games/court's
+  // `king.png` uid 5 -> 11, games/wordweave's UASTC `cell-washi.ktx2` uid 13 -> 16 — each destroy
+  // emitting ~2 `[BindGroup] … destroyed while still bound` warnings per live renderer.
+  //
+  // ⚠️ Both tests need TWO live renderers, and that is the point rather than set-dressing: with one
+  // renderer the swap runs `unloadAllSpriteTextures` (the `liveRenderers <= 1` gate) and unloads
+  // wholesale, so a single-renderer version of this test would pass against the unfixed code too.
+  // That is the axis this pair separates — see docs/falsifiable-tests.md.
+  it('a same-scene world swap (play/stop) RETAINS the sprite texture instead of destroying it (#1000)', async () => {
+    const { pixi, traits, scene2d, pool, world, worldReg, newWorld } = await setup({ start: true }); // live=1
+    pixi.Assets.__seed('/board.png', { width: 64, height: 64, source: { style: {} } });
+    const editorPool = new pool.Canvas2DPool();
+    const editorRenderer = new scene2d.Scene2DRenderer({ pool: editorPool, primary: false });
+    editorRenderer.start(); // live=2 → the wholesale sweep is skipped, so the per-slot path decides
+
+    const canvas = spawnCanvas(world, traits);
+    spawnChild(world, traits, canvas.id(), { sprite: 'img:/board.png' });
+    scene2d.renderFrame();        // primary retains (count 1)
+    editorRenderer.renderFrame(); // editor retains (count 2)
+
+    // play/stop is a world swap that KEEPS the same scene: every renderer tears down every slot, so
+    // the refcount reaches 0 with nothing holding it. Pre-fix that destroyed the source.
+    worldReg.setCurrentWorld(newWorld());
+    await new Promise((r) => setTimeout(r, 0)); // let the deferred release fire
+
+    expect(pixi.Assets.__unloaded).not.toContain('/board.png');
+    // Still decoded is the half that MATTERS — it is what makes the next play free rather than a
+    // re-decode. Asserting only "not unloaded" would pass on a texture that was evicted some other way.
+    expect(pixi.Assets.cache.has('/board.png')).toBe(true);
+
+    editorRenderer.stop();
+    scene2d.stopScene2D();
+  });
+
+  it('a retained texture IS freed once the last renderer stops — retention is not a leak (#1000)', async () => {
+    // The other side of the trade: #1000 must not buy a quieter console with a pinned allocation.
+    const { pixi, traits, scene2d, pool, world, worldReg, newWorld } = await setup({ start: true }); // live=1
+    pixi.Assets.__seed('/board2.png', { width: 64, height: 64, source: { style: {} } });
+    const editorPool = new pool.Canvas2DPool();
+    const editorRenderer = new scene2d.Scene2DRenderer({ pool: editorPool, primary: false });
+    editorRenderer.start(); // live=2
+
+    const canvas = spawnCanvas(world, traits);
+    spawnChild(world, traits, canvas.id(), { sprite: 'img:/board2.png' });
+    scene2d.renderFrame();
+    editorRenderer.renderFrame();
+
+    worldReg.setCurrentWorld(newWorld());          // parked, not destroyed
+    await new Promise((r) => setTimeout(r, 0));
+    expect(pixi.Assets.__unloaded).not.toContain('/board2.png');
+
+    editorRenderer.stop();   // live=1 — still not the last one out
+    await new Promise((r) => setTimeout(r, 0));
+    expect(pixi.Assets.__unloaded).not.toContain('/board2.png');
+
+    scene2d.stopScene2D();   // live=0 → the F3 net purges the parked set
+    await new Promise((r) => setTimeout(r, 0));
+    expect(pixi.Assets.__unloaded).toContain('/board2.png');
+  });
+
+  // ⚠️ THE CASE THE TWO TESTS ABOVE CANNOT SEE, and the reason #1000 survived three attempted fixes.
+  // Both of those run TWO renderers, which skips the `liveRenderers <= 1` wholesale sweep — so they
+  // were green while a ONE-renderer session still destroyed everything on stop. And one renderer is
+  // not exotic: it is simply a session with the SceneView panel closed, which is how games/court was
+  // set up. Measured: court 3 destroys + 12 warnings, wordweave (SceneView open, 2 renderers) 0 + 0
+  // on the SAME build. The axis here is the renderer count, so this test pins it directly.
+  //
+  // A scene must be identifiable for retention to apply at all — an unknown scene deliberately falls
+  // back to sweeping — so `getCurrent` is spied, narrowly, to model "a project with a scene open".
+  // Spying one method rather than mocking the module keeps the real onWorldSwap wiring intact; a
+  // wholesale mock of the scene manager would make this test unable to fail (docs/falsifiable-tests.md).
+  it('a same-scene swap with ONE live renderer also retains — the wholesale sweep must not fire (#1000)', async () => {
+    const { pixi, traits, scene2d, world, worldReg, newWorld } = await setup({ start: true }); // live=1, alone
+    const { sceneManager } = await import('../../src/runtime/scene/SceneManager');
+    const spy = vi.spyOn(sceneManager, 'getCurrent')
+      .mockReturnValue({ id: 's1' as never, path: '/assets/scenes/main.scene.json', state: 'loaded' as never });
+    try {
+      pixi.Assets.__seed('/solo.png', { width: 32, height: 32, source: { style: {} } });
+      const canvas = spawnCanvas(world, traits);
+      spawnChild(world, traits, canvas.id(), { sprite: 'img:/solo.png' });
+      scene2d.renderFrame();
+
+      // First swap records the scene; the retention decision is made from the SECOND onwards.
+      worldReg.setCurrentWorld(newWorld());
+      await new Promise((r) => setTimeout(r, 0));
+
+      const canvas2 = spawnCanvas(world, traits);
+      spawnChild(world, traits, canvas2.id(), { sprite: 'img:/solo.png' });
+      scene2d.renderFrame();
+      const unloadsBefore = pixi.Assets.__unloaded.filter((u: string) => u === '/solo.png').length;
+
+      // Same scene, one renderer: pre-fix the sweep fired here and destroyed it.
+      worldReg.setCurrentWorld(newWorld());
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(pixi.Assets.__unloaded.filter((u: string) => u === '/solo.png').length).toBe(unloadsBefore);
+      expect(pixi.Assets.cache.has('/solo.png')).toBe(true);
+    } finally {
+      spy.mockRestore();
+      scene2d.stopScene2D();
+    }
+  });
+
+  it('a swap that CHANGES scene still sweeps, one renderer — retention must not outlive its scene (#1000)', async () => {
+    // The other half: the guard must actually discriminate. Without this, a guard stuck on "never
+    // changed" would pass the test above and silently pin every scene's textures for the session —
+    // which is the mirror of the real defect, where it was stuck on "always changed".
+    const { pixi, traits, scene2d, world, worldReg, newWorld } = await setup({ start: true }); // live=1
+    const { sceneManager } = await import('../../src/runtime/scene/SceneManager');
+    let path = '/assets/scenes/a.scene.json';
+    const spy = vi.spyOn(sceneManager, 'getCurrent')
+      .mockImplementation(() => ({ id: 's' as never, path, state: 'loaded' as never }));
+    try {
+      pixi.Assets.__seed('/sceneA.png', { width: 32, height: 32, source: { style: {} } });
+      const canvas = spawnCanvas(world, traits);
+      spawnChild(world, traits, canvas.id(), { sprite: 'img:/sceneA.png' });
+      scene2d.renderFrame();
+
+      worldReg.setCurrentWorld(newWorld());   // records scene A
+      await new Promise((r) => setTimeout(r, 0));
+
+      const canvas2 = spawnCanvas(world, traits);
+      spawnChild(world, traits, canvas2.id(), { sprite: 'img:/sceneA.png' });
+      scene2d.renderFrame();
+
+      path = '/assets/scenes/b.scene.json';   // a GENUINE scene change
+      worldReg.setCurrentWorld(newWorld());
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(pixi.Assets.__unloaded).toContain('/sceneA.png');
+    } finally {
+      spy.mockRestore();
+      scene2d.stopScene2D();
+    }
+  });
+
+  // ⚠️ The gap that let #1000's own fix ship the same bug twice. With TWO renderers the
+  // `liveRenderers <= 1` wholesale sweep is skipped, so the ONLY thing that can free a parked texture
+  // on a scene change is `parkRetainedSpriteTexture`'s own purge — and that purge read the scene via a
+  // different accessor than the swap guard did (`getCurrentBaseScene()`, undefined outside a scene
+  // chain), so it could never fire. Every other test here passed throughout. This one is the axis:
+  // multi-renderer AND a scene change.
+  it('a scene change frees the parked set even with TWO renderers, where the sweep does not run (#1000)', async () => {
+    const { pixi, traits, scene2d, pool, world, worldReg, newWorld } = await setup({ start: true }); // live=1
+    const { sceneManager } = await import('../../src/runtime/scene/SceneManager');
+    let path = '/assets/scenes/a.scene.json';
+    const spy = vi.spyOn(sceneManager, 'getCurrent')
+      .mockImplementation(() => ({ id: 's' as never, path, state: 'loaded' as never }));
+    const editorPool = new pool.Canvas2DPool();
+    const editorRenderer = new scene2d.Scene2DRenderer({ pool: editorPool, primary: false });
+    editorRenderer.start(); // live=2 → the wholesale sweep is skipped from here on
+    try {
+      pixi.Assets.__seed('/parked.png', { width: 32, height: 32, source: { style: {} } });
+      const canvas = spawnCanvas(world, traits);
+      spawnChild(world, traits, canvas.id(), { sprite: 'img:/parked.png' });
+      scene2d.renderFrame();
+      editorRenderer.renderFrame();
+
+      // Same-scene swap → parked, not destroyed (the retention working as intended).
+      // ⚠️ Spawn into the world that is CURRENT after each swap, not the original `world` — a swap
+      // promotes a NEW world, so spawning into the old one renders nothing and the test would pass
+      // vacuously by never parking anything under the second scene at all.
+      const w2 = newWorld();
+      worldReg.setCurrentWorld(w2);
+      await new Promise((r) => setTimeout(r, 0));
+      expect(pixi.Assets.__unloaded).not.toContain('/parked.png');
+
+      // Now a GENUINE scene change. Nothing re-retains /parked.png, and the sweep is skipped at
+      // liveRenderers=2, so the parked set's own purge is the ONLY mechanism left — and it must fire.
+      path = '/assets/scenes/b.scene.json';
+      pixi.Assets.__seed('/other.png', { width: 8, height: 8, source: { style: {} } });
+      const canvas2 = spawnCanvas(w2, traits);
+      spawnChild(w2, traits, canvas2.id(), { sprite: 'img:/other.png' });
+      scene2d.renderFrame();
+      editorRenderer.renderFrame();
+      worldReg.setCurrentWorld(newWorld());   // releasing /other.png parks under scene B, evicting A's set
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(pixi.Assets.__unloaded).toContain('/parked.png');
+    } finally {
+      spy.mockRestore();
+      editorRenderer.stop();
+      scene2d.stopScene2D();
+    }
+  });
+
+  // ⚠️ A RENDERER-COUNT TRANSITION, which nothing else here exercises — every other test holds the
+  // count fixed. `swapChangedScene()` is the only writer of the scene record, and it used to sit behind
+  // `liveRenderers <= 1 &&`, so JS short-circuited it away for every swap that happened while a second
+  // renderer was live. `liveRenderers` flips 1<->2 on a SceneView mode-dropdown click, so the gap is
+  // ordinary usage, and the record came back stale on the other side of it.
+  it('keeps the scene record maintained across a renderer-count change, so the F3 net still fires (#1000)', async () => {
+    const { pixi, traits, scene2d, pool, world, worldReg, newWorld } = await setup({ start: true }); // live=1
+    const { sceneManager } = await import('../../src/runtime/scene/SceneManager');
+    let path = '/assets/scenes/a.scene.json';
+    const spy = vi.spyOn(sceneManager, 'getCurrent')
+      .mockImplementation(() => ({ id: 's' as never, path, state: 'loaded' as never }));
+    const editorPool = new pool.Canvas2DPool();
+    const editorRenderer = new scene2d.Scene2DRenderer({ pool: editorPool, primary: false });
+    try {
+      pixi.Assets.__seed('/gap.png', { width: 16, height: 16, source: { style: {} } });
+
+      // Phase 1 — TWO renderers live. Pre-fix every swap here recorded nothing.
+      editorRenderer.start(); // live=2
+      const w2 = newWorld();
+      worldReg.setCurrentWorld(w2);
+      await new Promise((r) => setTimeout(r, 0));
+
+      // Phase 2 — back to ONE renderer, holding a texture under scene A.
+      editorRenderer.stop(); // live=1
+      const canvas = spawnCanvas(w2, traits);
+      spawnChild(w2, traits, canvas.id(), { sprite: 'img:/gap.png' });
+      scene2d.renderFrame();
+
+      // Phase 3 — a GENUINE scene change with one renderer, which is exactly when the F3 net must run.
+      // Pre-fix the record was `undefined` (never written during phase 1), so the guard reported
+      // "unchanged" and the net was skipped while the refcount map was fully populated.
+      path = '/assets/scenes/b.scene.json';
+      worldReg.setCurrentWorld(newWorld());
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(pixi.Assets.__unloaded).toContain('/gap.png');
+    } finally {
+      spy.mockRestore();
+      scene2d.stopScene2D();
+    }
+  });
+
+  // Retention must not make a RE-IMPORT invisible (#1000). Before parking, a single-renderer play/stop
+  // ran the wholesale sweep and the next Play re-fetched; parking removed that flush, so re-importing a
+  // sprite and pressing Play would keep showing the old bytes. `withCacheBust` cannot cover it — it is
+  // a no-op unless PROD, i.e. inert exactly where re-import happens.
+  it('a texture invalidation purges the parked set, so a re-import is not served stale (#1000)', async () => {
+    const { pixi, traits, scene2d, pool, world, worldReg, newWorld } = await setup({ start: true }); // live=1
+    const { emitAssetInvalidated } = await import('../../src/runtime/core/assetInvalidation');
+    const { sceneManager } = await import('../../src/runtime/scene/SceneManager');
+    const spy = vi.spyOn(sceneManager, 'getCurrent')
+      .mockReturnValue({ id: 's' as never, path: '/assets/scenes/main.scene.json', state: 'loaded' as never });
+    const editorPool = new pool.Canvas2DPool();
+    const editorRenderer = new scene2d.Scene2DRenderer({ pool: editorPool, primary: false });
+    editorRenderer.start(); // live=2 → the wholesale sweep is skipped, so the texture really is PARKED
+    try {
+      pixi.Assets.__seed('/reimported.png', { width: 32, height: 32, source: { style: {} } });
+      const canvas = spawnCanvas(world, traits);
+      spawnChild(world, traits, canvas.id(), { sprite: 'img:/reimported.png' });
+      scene2d.renderFrame();
+      editorRenderer.renderFrame();
+
+      worldReg.setCurrentWorld(newWorld());          // same scene → parked, not destroyed
+      await new Promise((r) => setTimeout(r, 0));
+      expect(pixi.Assets.__unloaded).not.toContain('/reimported.png');
+
+      emitAssetInvalidated('texture', '/assets/textures/reimported.png');
+      expect(pixi.Assets.__unloaded).toContain('/reimported.png');
+    } finally {
+      spy.mockRestore();
+      editorRenderer.stop();
+      scene2d.stopScene2D();
+    }
+  });
+
+  it('an invalidation of a NON-texture kind leaves the parked set alone (#1000)', async () => {
+    // The listener filters on kind; without that filter a model or audio re-import would throw away
+    // every parked sprite texture, quietly undoing the retention this change exists to provide.
+    const { pixi, traits, scene2d, pool, world, worldReg, newWorld } = await setup({ start: true });
+    const { emitAssetInvalidated } = await import('../../src/runtime/core/assetInvalidation');
+    const { sceneManager } = await import('../../src/runtime/scene/SceneManager');
+    const spy = vi.spyOn(sceneManager, 'getCurrent')
+      .mockReturnValue({ id: 's' as never, path: '/assets/scenes/main.scene.json', state: 'loaded' as never });
+    const editorPool = new pool.Canvas2DPool();
+    const editorRenderer = new scene2d.Scene2DRenderer({ pool: editorPool, primary: false });
+    editorRenderer.start();
+    try {
+      pixi.Assets.__seed('/kept.png', { width: 32, height: 32, source: { style: {} } });
+      const canvas = spawnCanvas(world, traits);
+      spawnChild(world, traits, canvas.id(), { sprite: 'img:/kept.png' });
+      scene2d.renderFrame();
+      editorRenderer.renderFrame();
+      worldReg.setCurrentWorld(newWorld());
+      await new Promise((r) => setTimeout(r, 0));
+
+      emitAssetInvalidated('model', '/assets/models/thing.glb');
+      expect(pixi.Assets.__unloaded).not.toContain('/kept.png');
+    } finally {
+      spy.mockRestore();
+      editorRenderer.stop();
+      scene2d.stopScene2D();
+    }
+  });
 });
 
 // Phase 4 (2D particle preview): the editor passes a per-frame particleDt PROVIDER. While it returns a

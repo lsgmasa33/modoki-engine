@@ -4570,6 +4570,76 @@ end. ⚠️ **Residual:** one request per episode means a rebuild that *complete
 wedge is the end of the road — nothing tries again and nothing reports. A rebuild that FAILS still
 reports through `onError`.
 
+#### Sprite textures are SCENE-scoped, so a play/stop swap must not free them (#1000)
+
+**The rule: a sprite texture whose refcount reaches 0 *during a world-swap teardown* is PARKED, not
+destroyed. It is freed when the SCENE changes, or when the last 2D renderer stops.** An ordinary
+mid-scene release — an entity deleted, a `Renderable2D.sprite` repointed — still frees it immediately;
+retaining those would pin every sprite an authoring session ever touched.
+
+This brings sprite textures in line with the rule
+[docs/scene-loading.md](scene-loading.md) already states for every other GPU resource — *the scene is
+the unit of memory management*. They were the one exception, which is why they alone churned.
+
+⚠️ **The editor bound is ≤2 scenes' sprite working set, not 1.** The textures released BY a scene
+change are parked under the INCOMING scene's label, so they live until the next change. That overshoot
+exists only where 2+ renderers are live (i.e. the editor, where retention is wanted); a shipped game
+has one renderer, so `unloadAllSpriteTextures` runs on its every scene swap and the bound is exact.
+
+⚠️ **A texture invalidation purges the parked set**, or a re-imported sprite would keep being served
+from it — `withCacheBust` is a **no-op in dev** (`loaders/assetUrl.ts`), so the cache key does not
+change on re-import. That restores the pre-retention behaviour and no more: nothing Pixi-side listens
+for texture invalidation at all, so a re-import of a texture a LIVE sprite still holds is unaffected
+(pre-existing, #1022).
+
+**What it fixes, measured** (dev editor, WebGPU, pixi 8.20.1, 2026-09-10). Every play/stop cycle
+destroyed each runtime-spawned sprite's `TextureSource` and re-created it on the next play:
+
+| project | before | after |
+|---|---|---|
+| `games/court` | 3 destroys, 12 `[BindGroup]` warnings | **0, 0** |
+| `games/wordweave` | 2 destroys, 4 warnings (`cell-washi.ktx2` — a UASTC **transcode**) | **0, 0** |
+
+Proof it was a re-create and not a one-way free: Pixi `uid`s across two cycles — `king.png` 5 → 11,
+`count-banner.png` 7 → 12, `cell-washi.ktx2` 13 → 16. A new uid is a new `TextureSource`.
+
+⚠️ **The `[BindGroup] … destroyed while still bound` warning is the SYMPTOM, not the defect.** It is
+emitted by Pixi's process-global batch bind-group cache (`getTextureBatchBindGroup`'s `cachedGroups`),
+which is never evicted and exposes **no public API to evict** — so it cannot be silenced directly, and
+an attempt to do so is wasted effort. It goes quiet only when nothing is wrongly destroyed. Warning
+count scales with LIVE RENDERERS, not textures (~2 per renderer per destroyed source), which is why
+Court showed 12 for 3 textures and wordweave 4 for 2.
+
+##### Four things that cost three failed fixes here — do not re-derive them
+
+1. **A longer deferral cannot work.** `deferUnload` already defers a macrotask and cancels on
+   re-retain, but after `stop` the reverted world genuinely does not hold a runtime-spawned board's
+   textures, so nothing re-retains and any timeout expires. The gap is *"a human decides to press
+   Play"* — unbounded. Only retention closes it. A fix judged by "the warnings dropped on a fast
+   double-click" is measuring the timer, not the mechanism.
+2. **`liveRenderers` is a property of the SESSION, not the game.** It counts `Scene2DRenderer`
+   instances, so it is 1 when the **SceneView panel is closed** and 2 when it is open. Court
+   reproduced and wordweave did not *on the same build* purely because of that, and a plausible
+   "runtime-spawned vs authored board" story was invented to explain the difference. Check
+   `get_editor_state.surfaces` for `scene-view` before attributing a 2D difference to a project.
+3. **`sceneManager.getCurrentBaseScene()` is `undefined` in an ordinary project** — it names a scene
+   CHAIN's base. A guard written as `base === undefined || base !== last` is therefore **always
+   true**, which is how a guard added to fix this bug silently gated nothing through three
+   iterations. Use `getCurrent()?.path`. Absent is not "different".
+4. **`play` does not fire a world swap — only `stop` does.** One swap per play+stop pair, which is
+   why every destroy lands on the stop side. Measured with an app-side `onWorldSwap` listener.
+
+##### The technique that actually settled it
+
+Source reading produced three wrong diagnoses in a row. What worked was patching
+`_TextureSource.prototype.destroy` and `console.warn` **through the app's own module instance** —
+reached by walking the prototype chain from a live sprite off `window.__2d.getApp(i).stage` — and
+registering an `onWorldSwap` listener from
+`window.__MODOKI_SHARED__.modules['@modoki/engine/runtime']`, giving an ordered timeline of swap
+vs destroy. ⚠️ **Do not reach for a `/@fs` import here**: it yields a SECOND copy of the module, whose
+prototypes the app never touches, and the probe then measures nothing while looking healthy. Note the
+bundled class is `_TextureSource`, not `TextureSource`.
+
 #### Incident: the engine destroying its own GPU context (#213, closed 2026-08-13)
 
 Court rendered no gameboard on an iPhone 8 (A11 / iOS 16) while the ECS, the DOM, the canvas size

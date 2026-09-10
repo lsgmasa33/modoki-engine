@@ -11,7 +11,7 @@ import * as THREE from 'three';
 import { WebGPURenderer } from 'three/webgpu';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js';
-import { getCurrentWorld, onWorldSwap } from '../../runtime/core/ecs/world';
+import { getCurrentWorld, peekCurrentWorld, onWorldSwap } from '../../runtime/core/ecs/world';
 import { isSimRunning, onPlayStateChange, inPreviewSession } from '../../runtime/core/playState';
 import { setSkeletalPreview } from '../../runtime/core/skeletalPreview';
 import { clearSkeletalSeeks } from '../../runtime/core/skeletalSeek';
@@ -20,7 +20,7 @@ import { worldTransforms, deactivatedEntities } from '../../runtime/core/ecs/tra
 import { decomposeTrs } from '../../runtime/core/ecs/decomposeTrs';
 import { findEntity, fireDirtyListeners, addDirtyListener, onStructureDirty, getAllEntities, subtreeIds } from '../../runtime/core/ecs/entityUtils';
 import { markOverrideIfInstance } from '../undo/entityActions';
-import { Transform, EntityAttributes, Collider3D, clampAngle, Bone2D, Billboard3D, CameraFrame, Zone3D } from '../../runtime/traits';
+import { Transform, EntityAttributes, Collider2D, Collider3D, clampAngle, Bone2D, Billboard3D, CameraFrame, Zone3D } from '../../runtime/traits';
 import { colliderWireframeGeometry, colliderOutlineSig3D, colliderWorldScale3D, type ColliderOutline3DParams } from '../../runtime/rendering/colliderOutline3D';
 import {
   syncEnvironment, syncFog, syncLights, syncSceneRenderables3D, orientBillboards, reconcileToneExposure,
@@ -79,7 +79,7 @@ import { boneRelToProxyLocal, proxyLocalToBoneLocal } from '../scene/billboardBo
 import { setEditorViewportCamera, setFocusEntityHandler, focusEntityInSceneView, canFrameSelected, setViewportController, setEcsObjectsRegistry } from '../scene/sceneViewBus';
 import { withWarnFilter } from '../scene/warnFilter';
 import { mintEditor3DFrameKey, editor2DChromeFrameKey } from '../scene/frameKeys';
-import { computeUIModeNDC, computeFullNDC, computeCamFrustumPositions, computeLetterbox, frameCameraToBox, gameAspectFromRect, createSelectGesture, outlineSourceGeometry, resolveFocusTarget, axisSnapCameraPosition, slerpCameraOffset, perspHalfHeightAtDistance, perspDistanceForHalfHeight, orthoFrustumForHalfHeight, shouldHideMeshesForColliderMode } from '../scene/sceneViewMath';
+import { computeUIModeNDC, computeFullNDC, computeCamFrustumPositions, computeLetterbox, frameCameraToBox, gameAspectFromRect, createSelectGesture, outlineSourceGeometry, resolveFocusTarget, axisSnapCameraPosition, slerpCameraOffset, perspHalfHeightAtDistance, perspDistanceForHalfHeight, orthoFrustumForHalfHeight, shouldHideMeshesForColliderMode, hiddenContentNotice, colliderModeToast } from '../scene/sceneViewMath';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { PREFAB_EDIT_SCENE_PREFIX, PREFAB_EDIT_ROOT_GUID, exitPrefabEditing } from '../scene/prefabEdit';
 import { pushAction, subscribeUndo } from '../undo/undoManager';
@@ -434,6 +434,50 @@ export default function SceneView() {
   const [showGrid, setShowGridState] = useState(initialViewPrefsRef.current.showGrid);
   const [showColliders, setShowCollidersState] = useState(initialViewPrefsRef.current.showColliders);
   const [colliders2DOnly, setColliders2DOnlyState] = useState(initialViewPrefsRef.current.colliders2DOnly);
+  // `undefined` = not measured. Deliberately NOT defaulted to 0: `hiddenContentNotice` words the
+  // zero case as "this scene has NO colliders", and asserting that about an unmeasured scene is the
+  // false-notice this feature exists to avoid.
+  const [colliderCount, setColliderCount] = useState<number | undefined>(undefined);
+
+  // ── #1003: is there anything for collider-only mode to DRAW? ──
+  // Counted from the live world rather than assumed, because the whole complaint is a viewport that
+  // is empty with no explanation, and "empty because the scene has no colliders" is a different
+  // message from "empty because sprites are hidden".
+  // ⚠️ `peekCurrentWorld`, NOT `getCurrentWorld` — the latter LAZILY CREATES a world
+  // (`worldRegistry.ts:28-35`), and this runs from a 500ms poll that can start before any scene has
+  // loaded, because the flag PERSISTS (#399) and is restored at mount. Allocating a world there and
+  // then reporting 0 would put "this scene has NO colliders" on screen about a scene that has not
+  // loaded yet — the exact false notice this feature exists to prevent. `undefined` = unmeasured.
+  //
+  // ⚠️ `.length`, NOT `updateEach` — koota's `updateEach` WRITES every trait value back, so using it
+  // as a read is a 2 Hz write storm waiting for the first tracker registered on either Collider trait.
+  // Inert today (nothing in engine/ registers one) which is why this is a latent hazard, not a bug.
+  //
+  // ⚠️ KNOWN BOUND, stated rather than over-engineered: this counts trait PRESENCE, not what either
+  // renderer actually draws. The 2D overlay additionally needs a live Canvas2D ancestor and skips
+  // deactivated entities; the 3D path skips deactivated ones and bails when the wireframe geometry is
+  // empty. So a scene whose colliders are all deactivated reports a non-zero count and gets the GENERIC
+  // notice instead of the sharper zero one. That degrades the signal; it never makes it false, which is
+  // the property that matters — and narrowing it properly means reimplementing both draw predicates.
+  const countColliders = useCallback((): number | undefined => {
+    const w = peekCurrentWorld();
+    if (!w) return undefined;
+    return (mode === 'ui' ? w.query(Collider2D) : w.query(Collider3D)).length;
+  }, [mode]);
+
+  // Raised on the OFF→ON TRANSITION, not per frame — that is what makes a toast usable at all, and
+  // what makes its count worth trusting. ⚠️ Not strictly "on the user action": it fires from an effect
+  // over derived state, so a MODE SWITCH that brings a restored `showColliders` into effect (2D→3D)
+  // also counts as a transition. That is correct — the viewport does empty at that moment — but it is
+  // not a click on the collider option, and an earlier version of this comment claimed it was.
+  // The decision lives in `colliderModeToast` so the rule is unit-testable.
+  const toastIfNothingToDraw = useCallback((turningOn: boolean) => {
+    const n = countColliders();
+    if (n === undefined) return;   // no world yet — say nothing rather than warn about an unknown scene
+    const msg = colliderModeToast(turningOn, n);
+    if (msg) useEditorStore.getState().showToast(msg, 'warn');
+  }, [countColliders]);
+
   const setShowGrid = (next: boolean | ((prev: boolean) => boolean)) => {
     setShowGridState((prev) => { const on = typeof next === 'function' ? next(prev) : next; saveSceneViewPrefs({ showGrid: on }); return on; });
   };
@@ -447,6 +491,41 @@ export default function SceneView() {
   // mirrors into editorScene2DRenderer (the actual render-loop flag Scene2D reads every
   // frame) — there's no other consumer of this React state, so a plain setter call is enough.
   const setColliders2DOnly = (on: boolean) => { setColliders2DOnlyState(on); editorScene2DRenderer.setCollidersOnly(on); saveSceneViewPrefs({ colliders2DOnly: on }); };
+  // #1003 — what the viewport is currently hiding, if anything. Keyed to the SAME predicate the
+  // renderer gates on, so it cannot claim content is hidden when it is not.
+  const hiddenNotice = hiddenContentNotice(mode, showColliders, colliders2DOnly, colliderCount);
+  const hidingContent = hiddenContentNotice(mode, showColliders, colliders2DOnly) !== null;
+
+  // Re-count while (and ONLY while) content is hidden. A one-shot count taken at toggle time would go
+  // stale the moment somebody adds a collider with the mode still on, leaving the notice asserting
+  // "no colliders" about a scene that now has one — and there is no scene-version signal in the store
+  // to react to instead. Cheap because it is gated on `hidingContent`, and `setColliderCount` returns
+  // `prev` unchanged when the count has not moved, so a steady scene causes no re-renders at all.
+  useEffect(() => {
+    if (!hidingContent) { setColliderCount(undefined); return; }
+    const tick = () => setColliderCount((prev) => { const n = countColliders(); return n === prev ? prev : n; });   // `undefined` propagates as unmeasured
+    tick();
+    const h = setInterval(tick, 500);
+    return () => { clearInterval(h); };
+  }, [hidingContent, countColliders]);
+
+  // The toast, on the OFF→ON transition only (#1003).
+  // ⚠️ In an EFFECT, not inside either setter. The first version fired it from inside a
+  // `setState` updater, and it never appeared live: React may defer or double-invoke an updater, and
+  // side effects there are unsupported. Reading `prev` in the setters is no better — `showCollidersRef`
+  // is declared ~2000 lines below them, and the `C` keymap closure can hold a stale `showColliders`
+  // (its effect re-registers on `mode` alone, by design). One effect over the derived `hidingContent`
+  // has neither problem and covers the 2D and 3D flags through the same path.
+  const prevHidingRef = useRef<boolean | null>(null);
+  useEffect(() => {
+    const was = prevHidingRef.current;
+    prevHidingRef.current = hidingContent;
+    // `null` is mount, not a transition: the flag PERSISTS (#399), so toasting here would fire on
+    // every editor launch that restored it. The corner notice is what covers the restored case.
+    if (was === null || !hidingContent || was) return;
+    toastIfNothingToDraw(true);
+  }, [hidingContent, toastIfNothingToDraw]);
+
   const showFocusGraph = useEditorStore((s) => s.showFocusGraph);
   const setShowFocusGraph = useEditorStore((s) => s.setShowFocusGraph);
   // editorScene2DRenderer is a module-level singleton (outlives this component across
@@ -699,14 +778,14 @@ export default function SceneView() {
           <ViewOptionsMenu uiId="sceneView.toolbar.viewOptions3d" items={[
             { key: 'fx', label: 'FX', checked: particlePreview, onToggle: () => setParticlePreview(!particlePreview), title: 'Preview particle effects in the scene (P)', uiId: 'sceneView.toolbar.fx-preview' },
             { key: 'grid', label: 'Grid', checked: showGrid, onToggle: () => setShowGrid(!showGrid), title: 'Show/hide the ground grid (G)', uiId: 'sceneView.toolbar.grid' },
-            { key: 'colliders', label: 'Colliders', checked: showColliders, onToggle: () => setShowColliders(!showColliders), title: 'Show only colliders, hiding regular meshes (C)', uiId: 'sceneView.toolbar.colliders' },
+            { key: 'colliders', label: 'Colliders', notable: true, checked: showColliders, onToggle: () => setShowColliders(!showColliders), title: 'Show only colliders, hiding regular meshes (C)', uiId: 'sceneView.toolbar.colliders' },
           ]} />
         </>}
         {mode === 'ui' && <>
           <ViewOptionsMenu uiId="sceneView.toolbar.viewOptionsUi" items={[
             { key: 'fx', label: 'FX', checked: particlePreview, onToggle: () => setParticlePreview(!particlePreview), title: 'Preview particle effects in the scene (P)', uiId: 'sceneView.toolbar.fx-preview' },
             { key: 'focus', label: 'Focus', checked: showFocusGraph, onToggle: () => setShowFocusGraph(!showFocusGraph), title: 'Show the UIFocusable navigation graph: solid = explicit navUp/Down/Left/Right link, dashed = spatial fallback the runtime would pick · number = focusOrder · gold ring = autoFocus', uiId: 'sceneView.toolbar.focus' },
-            { key: 'colliders', label: 'Colliders', checked: colliders2DOnly, onToggle: () => setColliders2DOnly(!colliders2DOnly), title: 'Show only colliders, hiding sprites (C)', uiId: 'sceneView.toolbar.colliders2d' },
+            { key: 'colliders', label: 'Colliders', notable: true, checked: colliders2DOnly, onToggle: () => setColliders2DOnly(!colliders2DOnly), title: 'Show only colliders, hiding sprites (C)', uiId: 'sceneView.toolbar.colliders2d' },
           ]} />
           <div style={{ width: 1, height: 18, background: '#444', margin: '0 6px' }} />
           {(['show3D', 'show2D', 'showUI'] as const).map((key, i) => {
@@ -740,6 +819,17 @@ export default function SceneView() {
         </div>
         {/* Orientation gizmo: pinned to the corner OUTSIDE the pan/zoom transform, 3D mode only. */}
         {mode === '3d' && <SceneViewGizmo />}
+        {/* "content is hidden" notice (#1003) — also OUTSIDE the transform, so it stays legible at
+            any zoom. An empty authoring viewport is indistinguishable from a broken one; this is the
+            thing that makes the difference visible without the user having to open the View menu. */}
+        {hiddenNotice && (
+          <div data-ui-id="sceneView.hiddenContentNotice" data-ui-kind="status" data-ui-label={hiddenNotice}
+            style={{
+              position: 'absolute', bottom: 8, left: 8, zIndex: 20, pointerEvents: 'none',
+              background: '#12121e', border: '1px solid #3a3a4a', borderRadius: 3,
+              padding: '2px 6px', fontSize: 10, fontFamily: 'monospace', color: '#c9a227',
+            }}>{hiddenNotice}</div>
+        )}
       </div>
     </div>
   );

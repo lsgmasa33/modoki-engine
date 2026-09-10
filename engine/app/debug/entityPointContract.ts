@@ -1,3 +1,4 @@
+import type { AimGesture } from './domPointContract';
 /** The wire contract for `resolve-entity-point`, shared by the renderer that produces it
  *  (`entityResolve.ts`) and the Electron main process that consumes it (`inputRoutes.ts`).
  *
@@ -27,6 +28,12 @@ import type { ErrorCode } from '../../tools/shared/mcpResult';
  *  triggers one), so an id captured a moment ago can name a different entity by the time it is
  *  used — the same trap `docs/debug-tools-mcp.md` warns about for every other addressed tool. */
 export interface EntityPointSpec {
+  /** What the caller will do here — see `AimGesture` in `domPointContract.ts`. Only `'tap'` is
+   *  click-shaped, and only a click-shaped aim models #977's tap-zone redirect (#1016). **Absent is
+   *  read as NOT click-shaped** — the redirect only ever removes refusals, so an unknown intent
+   *  must not get it. See `isClickShaped`'s banner. */
+  gesture?: AimGesture;
+
   guid?: string;
   name?: string;
   id?: number;

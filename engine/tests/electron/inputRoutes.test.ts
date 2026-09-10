@@ -1628,3 +1628,52 @@ describe('window deliverability', () => {
     expect(res).toMatchObject({ body: { ok: true } });
   });
 });
+
+/** #1016 — the editor routes name their gesture, and `button` narrows the tap.
+ *
+ *  ⚠️ **The button carve-out first shipped in `bridge.ts`, where it was unreachable.** `device_tap`'s
+ *  schema is `{selector, x, y}` — no button can arrive — while `/api/input/tap` takes
+ *  `z.enum(['left','right','middle'])` and hands it to a real Electron mouse event, and resolved
+ *  its aim as `'tap'` regardless. Chromium fires `click` for the primary button only (right ->
+ *  `contextmenu`, middle -> `auxclick`) and `pressOrigin.ts` listens on `'click'`, so the runtime
+ *  does NOT redirect a right-press: modelling one reports a clean aim for a press that lands on the
+ *  zone. The mutation that removes this survived until these cases existed.
+ *
+ *  ⚠️ One case per `it`: `routes` captures `requestRenderer` at `beforeEach`, so reassigning it
+ *  mid-test orphans the routes under test and every assertion reads an empty mock — which looks
+ *  exactly like "the gesture was not sent". */
+describe('#1016 — gesture on the wire from the editor routes', () => {
+  const sentTo = (op: string) => requestRenderer.mock.calls
+    .filter(([o]) => o === op)
+    .map(([, params]) => (params as Record<string, unknown> | undefined)?.gesture);
+
+  it('tap sends `tap`', async () => {
+    await post('/api/input/tap', { selector: '#kebab' });
+    expect(sentTo('resolve-dom-point')).toEqual(['tap']);
+  });
+
+  it('drag sends `drag` for BOTH endpoints — the false success the split exists to prevent', async () => {
+    await post('/api/input/drag', { from: { selector: '#kebab' }, to: { selector: '#kebab' } });
+    expect(sentTo('resolve-dom-point')).toEqual(['drag', 'drag']);
+  });
+
+  it('hover sends `hover`', async () => {
+    await post('/api/input/hover', { selector: '#kebab' });
+    expect(sentTo('resolve-dom-point')).toEqual(['hover']);
+  });
+
+  it.each([
+    ['left', 'tap'],
+    [undefined, 'tap'],
+    ['right', 'press'],
+    ['middle', 'press'],
+  ])('tap with button=%s resolves its aim as %s', async (button, expected) => {
+    await post('/api/input/tap', { selector: '#kebab', ...(button ? { button } : {}) });
+    expect(sentTo('resolve-dom-point')).toEqual([expected]);
+  });
+
+  it('an ENTITY aim carries it too — entity and selector are one category', async () => {
+    await post('/api/input/tap', { entity: { name: 'StartButton' }, button: 'right' });
+    expect(sentTo('resolve-entity-point')).toEqual(['press']);
+  });
+});

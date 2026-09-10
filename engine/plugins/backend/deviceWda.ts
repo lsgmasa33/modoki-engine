@@ -291,17 +291,17 @@ export async function tryDeviceWdaInput(method: string, params: Record<string, u
 
   try {
     if (method === 'tap') {
-      const r = await resolveAimViaDevice(deps, params, 'selector', 'x', 'y');
+      const r = await resolveAimViaDevice(deps, params, 'selector', 'x', 'y', false, 'tap');
       if (r.kind === 'unsupported') return { handled: false, reason: STALE_APP_REASON };
       if (r.kind === 'refusal') return { handled: true, reply: r.error };
       await wdaTap(session, r.aim.x, r.aim.y);
       return { handled: true, reply: `ok (wda touch) css(${Math.round(r.aim.x)},${Math.round(r.aim.y)}) @ ${aimAsResolved(r.aim.label)} [input:${TRUSTED_WDA_MECHANISM}]` };
     }
     // drag
-    const from = await resolveAimViaDevice(deps, params, 'fromSelector', 'fromX', 'fromY');
+    const from = await resolveAimViaDevice(deps, params, 'fromSelector', 'fromX', 'fromY', false, 'drag');
     if (from.kind === 'unsupported') return { handled: false, reason: STALE_APP_REASON };
     if (from.kind === 'refusal') return { handled: true, reply: from.error };
-    const to = await resolveAimViaDevice(deps, params, 'toSelector', 'toX', 'toY');
+    const to = await resolveAimViaDevice(deps, params, 'toSelector', 'toX', 'toY', false, 'drag');
     if (to.kind === 'unsupported') return { handled: false, reason: STALE_APP_REASON };
     if (to.kind === 'refusal') return { handled: true, reply: to.error };
     // The synthetic path expresses a drag as steps×delay; WDA interpolates from a DURATION. Convert

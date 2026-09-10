@@ -214,6 +214,78 @@ git ls-files 'games/*/ios/**' 'games/*/android/**' | git check-ignore --stdin
 # must print nothing — no tracked source should be ignored
 ```
 
+#### Every generation input comes from `project.config.json` — flags are OVERRIDES (#1011)
+
+**The rule: `engine/scripts/generate-icons.mjs` resolves its own inputs from the project config, and a
+CLI flag only OVERRIDES one.** It also owns the freshness check, so both callers — the editor's
+`iconStep` and the CLI native build — participate in the same gate.
+
+Before this, the script took its **entire** input from flags and `iconStep`
+(`engine/plugins/vite-asset-scanner.ts`) was the only caller in the tree that supplied them from the
+config. That single seam produced four symptoms, all measured on `games/wordweave`:
+
+| | symptom |
+|---|---|
+| **A** | `build-web.mjs` ran **no** generation at all, so a CLI native build shipped whatever art was committed, with every gate green |
+| **B** | an absent `--splash` **deleted** the staged splash and rebuilt all 26 Android buckets from the icon, destroying an authored launch screen |
+| **C** | a mistyped asset path regenerated nothing and the shell reported **success** (exit 0) |
+| **D** | `--orientation` absent defaults to `'any'` while the config says `portrait`, so the two callers composed the wordmark in different places — and the hand-run version had already shipped |
+
+⚠️ **A and D are about different callers, and an earlier draft of this table read as though they were
+the same one.** Nothing `build-web.mjs` did could have shipped a differently-composed wordmark,
+because it generated nothing at all — that is A. D shipped through a **hand run** of the script,
+which is the third caller and the one facet B is also about. Three callers, not two: the editor's
+build plan, `build-web.mjs`, and a human at a shell.
+
+⚠️ **Absent is not cleared, and that distinction is the whole of facet B.** Deleting staged art is
+correct only when the config positively has **no** `splashSource` — a cleared setting, whose input
+#236 requires clearing because the staging dir is gitignored scratch that survives between builds. It
+is wrong when the operator merely did not type the flag. **When the config cannot be READ at all,
+nothing is cleared**: the packaged editor ships no esbuild, so `cfg` is legitimately null there, and
+reading that as "the author cleared every field" would destroy art.
+
+⚠️ **An unreadable REQUESTED icon is now FATAL, and fails the build.** "Requested" means a flag or a
+non-empty `app.iconSource`; a project that authors no icon still skips quietly. The old silent
+`return` is what made facet B hard to notice — an operator whose mental model becomes *"that command
+does nothing much"* does not go looking for destroyed art.
+
+⚠️ **The config load DEGRADES rather than failing** (`loadEnginePluginModuleResult`, warning with
+*which* cause), because this script is spawned by the packaged editor too. The precedent and the
+reason are `build-web.mjs`'s `validateProjectConfig`.
+
+**Consequence worth knowing:** `npm run build -- --target native` now generates icons, and can now
+FAIL on a config pointing at a missing file. Checked across `games/**` and `demos/**`: eight source
+fields are declared in total, all eight resolve — but read that for what it is. Only `games/court`
+and `games/wordweave` declare an icon source **at all**, so it is a narrow check, not broad
+assurance.
+
+⚠️ **Which is also the limit of facet A's fix, stated plainly: the two callers still disagree for a
+project that declares NO `iconSource`.** The editor falls back to the bundled `build/icon.png`
+(`vite-asset-scanner.ts`); the CLI reports "nothing to generate" and exits 0. So for the other 23
+projects the CLI native build still regenerates nothing while the editor does — which matters
+whenever the stamp is invalidated for a reason other than the art, e.g. an edit to
+`splashCompose.mjs` or `iconVariants.mjs`. Filed as **#1027** rather than fixed here: making the CLI
+match means every CLI native build starts rewriting committed icon art in 23 projects, `demos/**`
+included, and that is #162/#236's complaint by name — a deliberate call, not a finishing-pass edit.
+
+⚠️ **`--splash-cleared` is how a caller states what an absent flag cannot.** The packaged editor has
+no esbuild, so `cfg` is null there and the script cannot tell "cleared" from "not passed" — which
+silently dropped #236's cleanup on the one build that ships. `iconStep` passes the flag from the
+config it has already parsed. Absent flag + readable config still infers it; absent flag + no
+readable config still clears nothing.
+
+⚠️ **`MODOKI_ICONS_HANDLED=1` makes `build-web.mjs` stand down.** The editor's native plan runs
+`build-web.mjs --target native` and then its own `iconStep`, so without it the editor build
+generates everything twice — and since `generateNativeIcons` does BOTH platforms whenever both dirs
+exist, an iOS-only editor build also rewrote tracked Android art. `iconStep` wins because it is
+per-platform and has the bundled-icon fallback above.
+
+⚠️ **This is the sixth hand-application of the pattern #827 exists to extract** ("every CLI entry
+point re-implements its editor route's preamble by hand"). Accepted deliberately: the owner was asked
+the fork in plain terms and chose the local fix, because the icon defects were live while #827 has a
+design ready and nothing decaying. #827 stays open with `family/one-entry-point`; #1011 is its eighth
+member.
+
 ### App icons + splash are GENERATED, but still tracked
 
 `res/` counts as tracked source above, yet its icons and splashes are produced by

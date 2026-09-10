@@ -1921,7 +1921,12 @@ export function assetScannerPlugin(): Plugin {
             send(`\n── ${label} ──`);
             // Scaffold steps (npm install / npm run build / npx cap add) are pure
             // program+args, so they run on the Windows shell unchanged (no winCmd needed).
-            const proc = spawnBuildCommand(cmd, { cwd, env: buildEnv });
+            // ⚠️ MODOKI_ICONS_HANDLED: step 3 of the scaffold runs `build-web.mjs --target native`
+            // for its `dist/` — and the platform being scaffolded DOES NOT EXIST YET at that point.
+            // So `generateNativeIcons` would filter to whatever OTHER platform dir happens to be on
+            // disk and regenerate ITS art: adding `ios/` to an android-only project would rewrite
+            // `android/**` and stamp it. Never the platform being added, always collateral.
+            const proc = spawnBuildCommand(cmd, { cwd, env: { ...buildEnv, MODOKI_ICONS_HANDLED: '1' } });
             activeProc = proc;
             proc.stdout?.on('data', (d: Buffer) => send(d.toString().trimEnd()));
             proc.stderr?.on('data', (d: Buffer) => send(d.toString().trimEnd()));
@@ -2354,6 +2359,13 @@ export function assetScannerPlugin(): Plugin {
               label: 'Generating app icons...',
               cmd: `node ${JSON.stringify(script)} --project ${JSON.stringify(projectRoot)} --platform ${plat} --icon ${JSON.stringify(iconSrcAbs)} --stamp ${stamp}`
                 + opt('--splash', splashSrcAbs)
+                // ⚠️ #1011: say POSITIVELY whether the author has cleared the splash, rather than
+                // letting an absent `--splash` mean it. The script cannot infer it here — the
+                // PACKAGED editor ships no esbuild, so the config it would read is unavailable and
+                // "absent" and "cleared" become indistinguishable, which is how #236's cleanup came
+                // to be silently dropped on the one build that ships. This plan has already parsed
+                // the config; passing what it knows is cheaper than making the script guess.
+                + ` --splash-cleared ${splashSrcAbs ? 'false' : 'true'}`
                 + opt('--splash-dark', splashDarkSrcAbs)
                 + opt('--title', titleSrcAbs)
                 + ` --title-width ${cfg.app.splashTitleWidthPct} --title-offset ${cfg.app.splashTitleOffsetPct}`
@@ -2458,13 +2470,17 @@ export function assetScannerPlugin(): Plugin {
           // `cap sync` would ship the previous run's web assets, which is invisible until players
           // report a stale game.
           const iosPrefixSteps: BuildStep[] = [
-            { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', cwd: buildCwd },
+            // MODOKI_ICONS_HANDLED: `build-web.mjs --target native` generates icons itself now (#1011
+            // facet A, for the CLI path that had none). This plan has its own `iconStep` below —
+            // per-platform, stamp-gated, and able to fall back to the bundled icon — so it tells
+            // build-web to stand down rather than paying for both.
+            { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', env: { MODOKI_ICONS_HANDLED: '1' }, cwd: buildCwd },
             ...(otaEmbedStep ? [otaEmbedStep] : []),
             ...(iosIconStep ? [iosIconStep] : []),
             { label: 'Syncing Capacitor iOS...', cmd: 'npx cap sync ios', cwd: iosCwd },
           ];
           const androidPrefixSteps: BuildStep[] = [
-            { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', cwd: buildCwd },
+            { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', env: { MODOKI_ICONS_HANDLED: '1' }, cwd: buildCwd },
             ...(otaEmbedStep ? [otaEmbedStep] : []),
             ...(androidIconStep ? [androidIconStep] : []),
             { label: 'Syncing Capacitor Android...', cmd: 'npx cap sync android', cwd: androidCwd },
@@ -2824,7 +2840,12 @@ export function assetScannerPlugin(): Plugin {
           const runScaffoldShell = (label: string, cmd: string, cwd: string) => new Promise<boolean>((resolve) => {
             if (aborted) return resolve(false);
             send(`\n── ${label} ──`);
-            const proc = spawnBuildCommand(cmd, { cwd, env: buildEnv });
+            // ⚠️ MODOKI_ICONS_HANDLED — see the identical note on /api/add-native-target's runShell.
+            // This path is the one that bites hardest: the auto-scaffold runs INSIDE a build, and the
+            // build then `steps.shift()`s away the flag-carrying build-web step below, so without
+            // this an iOS build of an android-only project regenerates Android art and nothing in
+            // the plan ever regenerates iOS.
+            const proc = spawnBuildCommand(cmd, { cwd, env: { ...buildEnv, MODOKI_ICONS_HANDLED: '1' } });
             activeProc = proc;
             proc.stdout?.on('data', (d: Buffer) => send(d.toString().trimEnd()));
             proc.stderr?.on('data', (d: Buffer) => send(d.toString().trimEnd()));

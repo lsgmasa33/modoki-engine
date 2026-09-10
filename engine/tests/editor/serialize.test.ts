@@ -460,10 +460,20 @@ describe('serializeScene — runtimeOnly fields never reach the file', () => {
       ['contentHeight', 'contentWidth', 'scrollToBehavior', 'scrollToX', 'scrollToY',
         'scrollX', 'scrollY', 'viewportHeight', 'viewportWidth'].sort(),
     );
+    // `strideX`/`strideY` (#1010) are the resolved `entrySize + gap` the system publishes each
+    // tick — a readback like `visibleX` beside them, NOT a second spelling of the authored
+    // `entryWidth`/`gapX` they are computed FROM. Persisting them would write a value that is
+    // wrong the moment the viewport changes (the `%` entry-size case resolves against it), and
+    // that stale number would then be what a stepping API divides by. Confirmed engine-written.
     expect(flaggedSet('UIEntries')).toEqual(
       ['epoch', 'firstX', 'firstY', 'poolSize', 'scrollToEntryX', 'scrollToEntryY',
-        'visibleX', 'visibleY'].sort(),
+        'strideX', 'strideY', 'visibleX', 'visibleY'].sort(),
     );
+    // ⚠️ NOT followed by a `.not.toContain('entryWidth' | 'gapX' | …)` loop, though one was written
+    // here and removed in review: the exact-set `toEqual` above already implies it, so no edit can
+    // redden the loop without reddening the `toEqual` first — a guard that cannot fail
+    // (`docs/falsifiable-tests.md`). The reason those fields must stay unflagged is real and is why
+    // this comment survives; the assertion restating it was not.
     // UIEntry is stamped on pooled entries only; every field of it is engine-written.
     expect(flaggedSet('UIEntry')).toEqual(
       ['index', 'kind', 'live', 'slot', 'viewGuid', 'x', 'y'].sort(),

@@ -9,7 +9,7 @@
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, fireEvent, cleanup } from '@testing-library/react';
-import { ViewOptionsMenu, type ViewOption } from '../../src/editor/panels/ViewOptionsMenu';
+import { ViewOptionsMenu, viewBadgeLabel, type ViewOption } from '../../src/editor/panels/ViewOptionsMenu';
 
 afterEach(() => { cleanup(); });
 
@@ -26,15 +26,56 @@ describe('ViewOptionsMenu', () => {
     expect(queryByText('Grid')).toBeNull();
   });
 
-  it('the trigger label shows a (N) badge for the currently-checked count, none when zero', () => {
+  // #1003 — the trigger NAMES what is on rather than counting it. The old `(N)` badge could not
+  // answer "which one?", and in 3D it read `(1)` at rest because Grid is checked by default, so it
+  // was identical whether the content-hiding Colliders mode was on or off.
+  it('the trigger label NAMES the checked options, and says just View when none are', () => {
     const { getByTitle, rerender } = render(<ViewOptionsMenu uiId="test.menu" items={items()} />);
-    expect(getByTitle('View options').textContent).toContain('(1)'); // only Grid checked
+    expect(getByTitle('View options').textContent).toContain('View: Grid'); // only Grid checked
 
-    rerender(<ViewOptionsMenu uiId="test.menu" items={items({ fx: true, colliders: true })} />);
-    expect(getByTitle('View options').textContent).toContain('(3)');
+    rerender(<ViewOptionsMenu uiId="test.menu" items={items({ colliders: true })} />);
+    expect(getByTitle('View options').textContent).toContain('View: Grid, Colliders');
 
     rerender(<ViewOptionsMenu uiId="test.menu" items={items({ grid: false })} />);
-    expect(getByTitle('View options').textContent).not.toMatch(/\(\d/);
+    expect(getByTitle('View options').textContent).toContain('View');
+    expect(getByTitle('View options').textContent).not.toContain(':');
+  });
+
+  // The regression this replaces a count with: Colliders on must never render the same string as
+  // Colliders off. Asserted directly rather than inferred from the two cases above, because that
+  // equality is the actual defect — a count satisfies "shows something" and still says nothing.
+  it('Colliders on and Colliders off never produce the SAME badge (#1003)', () => {
+    // ⚠️ Deliberately the EQUAL-COUNT pair, which is the real-world confusion: Grid-only and
+    // Colliders-only are both "one option active", so the old `(N)` badge rendered the identical
+    // string for a viewport showing everything and one showing nothing. A pair with different counts
+    // would let a count-based badge pass this and prove nothing.
+    const { getByTitle, rerender } = render(
+      <ViewOptionsMenu uiId="test.menu" items={items({ grid: true, colliders: false })} />);
+    const gridOnly = getByTitle('View options').textContent;
+    rerender(<ViewOptionsMenu uiId="test.menu" items={items({ grid: false, colliders: true })} />);
+    const collidersOnly = getByTitle('View options').textContent;
+
+    expect(collidersOnly).not.toBe(gridOnly);
+    expect(collidersOnly).toContain('Colliders');
+    expect(gridOnly).not.toContain('Colliders');
+  });
+
+  it('a notable option survives the two-name cap — the cap must not drop what it exists to surface', () => {
+    // Regression: the cap worked in items order and `colliders` is LAST in both real menus, so
+    // FX + Focus + Colliders rendered "View: FX, Focus +1" — eliding the one content-removing option.
+    const mk = (label: string, checked: boolean, notable = false) =>
+      ({ key: label, label, checked, notable, onToggle: () => {}, uiId: label });
+    const label = viewBadgeLabel([mk('FX', true), mk('Focus', true), mk('Colliders', true, true)]);
+    expect(label).toContain('Colliders');
+    expect(label).toBe('View: Colliders, FX +1');
+  });
+
+  it('viewBadgeLabel caps the names at two and counts the rest', () => {
+    const mk = (label: string, checked: boolean) => ({ key: label, label, checked, onToggle: () => {}, uiId: label });
+    expect(viewBadgeLabel([mk('A', false)])).toBe('View');
+    expect(viewBadgeLabel([mk('A', true)])).toBe('View: A');
+    expect(viewBadgeLabel([mk('A', true), mk('B', true)])).toBe('View: A, B');
+    expect(viewBadgeLabel([mk('A', true), mk('B', true), mk('C', true), mk('D', true)])).toBe('View: A, B +2');
   });
 
   it('clicking the trigger opens the menu, revealing every item with its checked state', () => {

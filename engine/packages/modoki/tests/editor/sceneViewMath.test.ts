@@ -7,8 +7,7 @@ import {
   computeLetterbox, computeUIModeNDC, computeFullNDC, computeCamFrustumPositions, frameCameraToBox,
   frameCameraToBoxFixed, computeDeviceLetterbox, resolveDeviceSize, gameAspectFromRect,
   createSelectGesture, DESELECT_DRAG_PX, outlineSourceGeometry,
-  resolveFocusTarget, FOCUS_DEFAULT_RADIUS, shouldHideMeshesForColliderMode,
-} from '../../src/editor/scene/sceneViewMath';
+  resolveFocusTarget, FOCUS_DEFAULT_RADIUS, shouldHideMeshesForColliderMode, hiddenContentNotice, colliderModeToast } from '../../src/editor/scene/sceneViewMath';
 
 describe('frameCameraToBox (Missing Test #1 — camera framing)', () => {
   it('frames a box preserving the current view direction; sets near/far from radius', () => {
@@ -395,5 +394,80 @@ describe('shouldHideMeshesForColliderMode (collider-only view mode)', () => {
 
   it('keeps meshes visible in UI mode with the toggle off', () => {
     expect(shouldHideMeshesForColliderMode('ui', false)).toBe(false);
+  });
+});
+
+// #1003 — an empty authoring viewport is indistinguishable from a broken one. These pin that the
+// notice appears in EXACTLY the states that hide content, and in no other: a notice claiming content
+// is hidden when it is not would be worse than none.
+describe('hiddenContentNotice (#1003)', () => {
+  it('names the 3D case when collider-only mode is hiding meshes', () => {
+    expect(hiddenContentNotice('3d', true, false)).toBe('Colliders only — meshes hidden (C)');
+  });
+
+  it('names the 2D case when collider-only mode is hiding sprites', () => {
+    expect(hiddenContentNotice('ui', false, true)).toBe('Colliders only — sprites hidden (C)');
+  });
+
+  it('is silent when nothing is hidden, in either mode', () => {
+    expect(hiddenContentNotice('3d', false, false)).toBeNull();
+    expect(hiddenContentNotice('ui', false, false)).toBeNull();
+  });
+
+  it('is silent for the 3D flag in UI mode — that flag hides nothing there', () => {
+    // Mirrors shouldHideMeshesForColliderMode's own UI-mode rule above: the notice is keyed to the
+    // SAME predicate, so it cannot drift into announcing a mode that is not actually hiding anything.
+    expect(hiddenContentNotice('ui', true, false)).toBeNull();
+  });
+
+  it('is silent for the 2D flag in 3D mode', () => {
+    expect(hiddenContentNotice('3d', false, true)).toBeNull();
+  });
+
+  it('names the key, because that is what someone staring at a blank viewport needs', () => {
+    expect(hiddenContentNotice('ui', false, true)).toContain('(C)');
+  });
+
+  it('says the scene has NO colliders when the count is zero — the case that reads as a crash', () => {
+    expect(hiddenContentNotice('ui', false, true, 0)).toContain('NO colliders');
+    expect(hiddenContentNotice('3d', true, false, 0)).toContain('NO colliders');
+  });
+
+  it('does NOT claim "no colliders" when the count is unmeasured', () => {
+    // undefined is "not counted yet", not "zero". Asserting emptiness about an unmeasured scene is
+    // exactly the false notice this must never become — so it falls back to the generic wording.
+    expect(hiddenContentNotice('ui', false, true, undefined)).toBe('Colliders only — sprites hidden (C)');
+  });
+
+  it('uses the generic wording when the scene HAS colliders', () => {
+    expect(hiddenContentNotice('ui', false, true, 3)).toBe('Colliders only — sprites hidden (C)');
+    expect(hiddenContentNotice('3d', true, false, 3)).toBe('Colliders only — meshes hidden (C)');
+  });
+
+  it('stays silent when nothing is hidden, whatever the collider count says', () => {
+    // The count must never be able to CONJURE a notice — only to reword one.
+    expect(hiddenContentNotice('ui', false, false, 0)).toBeNull();
+    expect(hiddenContentNotice('3d', false, false, 0)).toBeNull();
+  });
+});
+
+describe('colliderModeToast (#1003)', () => {
+  it('warns when the mode is turned ON with nothing to draw', () => {
+    expect(colliderModeToast(true, 0)).toContain('no colliders');
+  });
+
+  it('is silent when the scene has colliders to show', () => {
+    expect(colliderModeToast(true, 1)).toBeNull();
+    expect(colliderModeToast(true, 42)).toBeNull();
+  });
+
+  it('is silent when turning the mode OFF, even with no colliders', () => {
+    // Turning it off restores the content, so there is nothing to warn about — and a toast on the way
+    // out would fire on the very action that fixes the problem.
+    expect(colliderModeToast(false, 0)).toBeNull();
+  });
+
+  it('tells the user how to get back, since the viewport it leaves is empty', () => {
+    expect(colliderModeToast(true, 0)).toContain('C again');
   });
 });

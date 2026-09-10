@@ -27,6 +27,73 @@ function stubTopmost(el: Element | null) {
 beforeEach(() => { document.body.innerHTML = ''; });
 afterEach(() => { vi.restoreAllMocks(); });
 
+/** #1016 — the SELECTOR path, which is the DEVICE path.
+ *
+ *  ⚠️ **This block exists because review found the device aim surface unwired and nothing here
+ *  could see it.** Every case added for #1016 was on the ENTITY path (`entityResolve.test.ts`), and
+ *  `bridge.ts` — `device_tap`/`device_drag`/`device_pointer` and the trusted CDP/WDA route — aims
+ *  by SELECTOR. That is also the surface that runs against the shipped game, so it is the only one
+ *  where a `minTapSize` zone authored by Court or wordweave actually exists. A whole aim surface
+ *  was uncovered because the tests followed the code path the fix was written against. */
+describe('#1016 — the selector path carries the gesture too', () => {
+  const TAP_ZONE = 'data-tap-zone';
+  const PRESS_ORIGIN = 'data-press-origin';
+
+  /** The shipping shape: a swallowClicks panel holding two sibling controls, one whose tap zone
+   *  overhangs the other. No `id`, no `className` — a UINode host has neither. */
+  function mountOverlap() {
+    const panel = document.createElement('div');
+    panel.setAttribute(PRESS_ORIGIN, '');
+    document.body.appendChild(panel);
+
+    const target = document.createElement('div');
+    target.setAttribute(PRESS_ORIGIN, '');
+    target.setAttribute('data-entity-id', '42');
+    panel.appendChild(target);
+    stubRect(target, { left: 100, top: 60, width: 40, height: 40 });
+
+    const sibling = document.createElement('div');
+    sibling.setAttribute(PRESS_ORIGIN, '');
+    sibling.setAttribute('data-entity-id', '31');
+    panel.appendChild(sibling);
+
+    const zone = document.createElement('div');
+    zone.setAttribute(TAP_ZONE, '');
+    sibling.appendChild(zone);
+
+    document.elementFromPoint = () => zone;
+    document.elementsFromPoint = () => [zone, target, panel, document.body];
+    return { panel, target, sibling, zone };
+  }
+
+  const aim = (gesture?: string) => resolveDomPointReport(
+    { selector: '[data-entity-id="42"]', ...(gesture ? { gesture } : {}) } as never,
+  );
+
+  it('a TAP by selector is not occluded by a zone that would lose the press to it', () => {
+    mountOverlap();
+    expect(aim('tap'), 'the reverted fix excused this path as "editor chrome only" — it is not')
+      .toMatchObject({ ok: true, occluded: false });
+  });
+
+  it.each(['drag', 'press', 'hover', 'scroll'])(
+    'a %s by selector is STILL occluded — device_drag must not begin on the zone host', (g) => {
+      mountOverlap();
+      expect(aim(g)).toMatchObject({ occluded: true });
+    });
+
+  it('a selector aim with NO gesture gets the strict answer', () => {
+    mountOverlap();
+    expect(aim()).toMatchObject({ occluded: true });
+  });
+
+  it('names the zone by the entity id an agent can aim at', () => {
+    const { zone, sibling, panel } = mountOverlap();
+    document.elementsFromPoint = () => [zone, sibling, panel, document.body];
+    expect(String(aim('tap').hitTarget)).toContain('entity 31');
+  });
+});
+
 describe('describeElement', () => {
   it('prefers the Enact tagging attribute over id and class', () => {
     const el = document.createElement('button');

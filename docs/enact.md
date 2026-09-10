@@ -40,6 +40,59 @@ along, and the editor was the lone holdout. Raw `{x,y}` is exempt — a coordina
 for. One carve-out, about delivery rather than aim: `modoki_pointer`'s `move`/`up` go to whatever
 captured the press, so occlusion at the destination cannot stop them and is not checked.
 
+**⚠️ "Topmost element" is not the rule any more — the GESTURE decides** (#1016). The occlusion
+check used to ask `document.elementFromPoint` and treat anything that is not the target or its
+descendant as a cover. #977 broke that: a `UIElement.minTapSize` expander is stamped `data-tap-zone`
+and **loses** the press to real content underneath it, so a zone overhanging a neighbour left
+`modoki_tap` refusing an aim a human's finger reaches — and naming a bare anonymous `div` the caller
+could not act on. The aim surface now asks the runtime's own `resolveTapZoneVeto`, so the router and
+the agent cannot disagree about who gets the click.
+
+**Only a TAP gets that redirect**, and the carve-out is the whole design rather than a caveat.
+`AimGesture` (`app/debug/domPointContract.ts`) is a typed field on both point contracts, rides the
+existing IPC payload, and is a **required** parameter on `occlusionAt`/`aimProvenance` — no default,
+because a default is what lets the next call site silently inherit tap semantics.
+
+| gesture | routes | redirect? |
+|---|---|---|
+| `tap` | `modoki_tap`, `device_tap` — **primary button only** | **yes** — press and release at one point is what `pressOrigin.ts` redirects. A right/middle press fires `contextmenu`/`auxclick`, which `pressOrigin` does not listen for, so it is modelled as `press` |
+| `drag` | `modoki_drag` (`from`/`to`), `modoki_dnd`, `device_drag` | no — the release is elsewhere, so the zone really does take it |
+| `press` | `modoki_pointer` `down`/`move`/`up`, `device_pointer` | no — **not** because a press has no release (`down`+`up` at one point IS a click and the runtime does redirect it), but because the route resolves the aim at `down` time and cannot yet know whether an `up` or a `move` follows. Strict side by choice |
+| `hover`, `scroll` | `modoki_hover`, `modoki_scroll`, `device_hover`, `device_scroll` | no — no press at all |
+
+⚠️ **All THREE aim paths carry it, and the count matters** — each was missed in turn, and each
+miss left #1016 unfixed on a surface further from where anyone was looking:
+1. the **editor** routes, through `inputRoutes.ts`'s `resolvePoint`;
+2. the **synthetic device** routes, through `bridge.ts`'s `resolveAim`;
+3. the **trusted CDP/WDA** routes, through `deviceAim.ts`'s `resolveAimViaDevice`.
+
+⚠️ The third is the one that runs against the SHIPPED game on a real phone — the only place an
+authored `minTapSize` zone exists at all — and it is NOT reached by threading `bridge.ts`. Its
+`params` is the raw MCP payload, and `device_tap`'s schema is `{selector, x, y}` with no gesture
+field, so the route must SUPPLY one; forwarding `...params` carried nothing and every trusted aim
+fell to the strict answer. Fixing (2) without (3) fixed the fallback path — synthetic input, which
+already flags itself with a banner — and left the trusted path exactly as it was. `tap_handle`/`drag_handle` are NOT in this table: they resolve HANDLE
+geometry rather than a DOM point, and pass `press`. ⚠️ Not because handles are all canvas —
+`computeHandles` also carries the editor's DOM `[data-ui-id]` handles — but because those paint
+above the game viewport, so a game's tap zone cannot cover one. `tap_handle` IS click-shaped and
+refuses on this field, so if a chrome handle ever moves under game UI, that is where a stale
+refusal appears.
+
+⚠️ **Applying it to a drag would be worse than the bug it fixes.** `modoki_drag {from:{entity:'X'}}`
+under a neighbour's expander would stop being refused, be dispatched, begin the gesture on the
+ZONE'S HOST, and report success — `mcp-tool-conventions.md` §0's rank-1 failure. A fix that made the
+tap case right without the gesture split was written and reverted (`75ba25601`) for exactly that.
+
+⚠️ **A zone that legitimately KEEPS the press is still a refusal**, and it now says so usefully:
+*"the minTapSize tap zone of entity 31"* rather than `div in the "Game" panel`. The refusal was
+always correct; it was the naming that made it unactionable. It names the host by
+**`data-entity-id`** — the handle an agent already aims by — because that is the only identifier a
+shipping `UINode` host carries: no `id`, no `className`, no `data-ui-id`. An earlier draft used
+`describeElement` and this sentence promised *"of `#pager-next`"*, which was an artefact of a test
+fixture setting an `id` no real node has; production read *"of div"*, strictly less than the message
+it replaced. When the host names nothing at all it falls back to the panel context rather than
+announcing an anonymous owner.
+
 **`occlusionScope` — the honest half, and the part to actually read.** An entity aim reports how far
 the occlusion check could see, because `occluded:false` does not mean the same thing on every path:
 

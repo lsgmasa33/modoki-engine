@@ -158,6 +158,16 @@ interface ViewState {
    *  same reason one step further on — a resize changes which ROW a slot belongs to. */
   lastEntryW: number;
   lastEntryH: number;
+  /** Last authored gap per axis. ⚠️ **In the invalidation test for the same reason the entry size
+   *  is, and it was missed** (#1010 close-out F1): the published `strideX/strideY` is
+   *  `entrySize + gap`, so an author changing ONLY the gap moves no window origin and resizes no
+   *  entry — `moved` and `resized` both stay false, the cheap early-out skips the re-drive, and
+   *  the stride stays published at its pre-edit value. `scrollByEntry` then divides by a stride
+   *  the system is no longer using, which is precisely the two-derivations bug publishing the
+   *  stride was meant to end. Measured by review: `gapY` 0 -> 10 left `strideY` reading 100
+   *  against a live 110, and a step armed entry 7 where 6 was correct. */
+  lastGapX: number;
+  lastGapY: number;
   /** Pooled counts per axis. BOTH are in the invalidation test, and the Y one is not symmetry
    *  for its own sake: at `scroll = 0` the origin is CLAMPED to 0, so a travel spike that
    *  raises the overscan and then decays changes `yw.pooled` while `first` never moves. With
@@ -396,7 +406,17 @@ function driveView(
   // if the window did not also move, nothing rebuilds the UI tree, `UINode`'s one-shot
   // `scrollTo` effect never re-runs, and the request sits on the trait forever. Found by wiring
   // the first real caller of `ui.scrollTo`: `scrollToY` read 480000 while `scrollY` stayed 0.
-  const requested = consumeEntryRequest(view, m, en, entryW, entryH);
+  // ⚠️ **The ONE place `entrySize + gap` is spelled.** It was written out inline four times —
+  // here, the travel measurement, the overscan cap and `consumeEntryRequest` — while the change
+  // that published it was arguing that a second derivation of one number is the defect
+  // (#1010 close-out F6). A fifth copy is how a redefinition of stride (say, a gap BETWEEN
+  // entries but not after the last) becomes a systematic disagreement instead of an edge case.
+  const gapX = (en.gapX as number) ?? 0;
+  const gapY = (en.gapY as number) ?? 0;
+  const strideXraw = entryW + gapX;
+  const strideYraw = entryH + gapY;
+
+  const requested = consumeEntryRequest(view, m, en, strideXraw, strideYraw);
 
   // ⚠️ **A JUMP builds this frame's window from the TARGET, not from the scroll we can still
   // observe — and that is the whole fix for "it lands on the wrong page".**
@@ -421,7 +441,7 @@ function driveView(
   const st = viewStates.get(viewGuid)
     ?? { seeded: false, lastFirstX: 0, lastFirstY: 0, lastEpoch: -1, lastCountX: -1, lastCountY: -1, travel: 0,
          frameScrollX: 0, frameScrollY: 0,
-         lastEntryW: -1, lastEntryH: -1, lastCols: -1, lastRows: -1, uncachedTicks: 0 };
+         lastEntryW: -1, lastEntryH: -1, lastGapX: -1, lastGapY: -1, lastCols: -1, lastRows: -1, uncachedTicks: 0 };
 
   // ⚠️ Runs BEFORE the early-outs below, and that placement is the whole point. A prefab that
   // never caches makes `rootSize` 0, so an authored `entryHeight: 0` ("read it from the prefab")
@@ -434,8 +454,9 @@ function driveView(
   // How far the SCROLL has moved since the last pipeline tick, in entries — see
   // ViewState.frameScrollX for why the baseline is per-FRAME and why it must not come from
   // `first`.
-  const strideXpx = Math.max(1, entryW + ((en.gapX as number) ?? 0));
-  const strideYpx = Math.max(1, entryH + ((en.gapY as number) ?? 0));
+  // Clamped ONLY so the division below cannot blow up — never published; see `writeWindowState`.
+  const strideXpx = Math.max(1, strideXraw);
+  const strideYpx = Math.max(1, strideYraw);
   // ⚠️ A jump needs no special case HERE, and one was tried and removed. On the frame a request
   // is converted the scroll has not moved yet, so this is already ~0; the thing that stops a
   // teleport being measured as travel is the BASELINE moving with it (see `frameScrollX` below),
@@ -465,16 +486,16 @@ function driveView(
   // five more entries per frame, and a 30-per-frame flick still blanked. Covering an unbounded
   // scroll speed with pool size is a losing game; this covers normal wheel and trackpad use.
   const VIEWPORTS_OF_RAISE = 3;
-  const capX = Math.max(1, VIEWPORTS_OF_RAISE * Math.ceil(sv.viewportWidth / Math.max(1, entryW + (en.gapX as number))));
-  const capY = Math.max(1, VIEWPORTS_OF_RAISE * Math.ceil(sv.viewportHeight / Math.max(1, entryH + (en.gapY as number))));
+  const capX = Math.max(1, VIEWPORTS_OF_RAISE * Math.ceil(sv.viewportWidth / strideXpx));
+  const capY = Math.max(1, VIEWPORTS_OF_RAISE * Math.ceil(sv.viewportHeight / strideYpx));
   const overscanX = effectiveOverscan(floor, travel, capX);
   const overscanY = effectiveOverscan(floor, travel, capY);
 
   const xw: AxisWindow = countX > 0
-    ? computeAxisWindow({ scroll: windowScrollX, viewport: sv.viewportWidth, entrySize: entryW, gap: en.gapX as number, count: countX, overscan: overscanX })
+    ? computeAxisWindow({ scroll: windowScrollX, viewport: sv.viewportWidth, entrySize: entryW, gap: gapX, count: countX, overscan: overscanX })
     : EMPTY_WINDOW;
   const yw: AxisWindow = countY > 0
-    ? computeAxisWindow({ scroll: windowScrollY, viewport: sv.viewportHeight, entrySize: entryH, gap: en.gapY as number, count: countY, overscan: overscanY })
+    ? computeAxisWindow({ scroll: windowScrollY, viewport: sv.viewportHeight, entrySize: entryH, gap: gapY, count: countY, overscan: overscanY })
     : EMPTY_WINDOW;
 
   const epoch = (en.epoch as number) ?? 0;
@@ -483,6 +504,7 @@ function driveView(
   // window origin, so `moved` stays false and the cheap early-out below would keep a stale
   // padding forever — see ViewState.lastEntryW.
   const resized = entryW !== st.lastEntryW || entryH !== st.lastEntryH
+    || gapX !== st.lastGapX || gapY !== st.lastGapY
     || xw.pooled !== st.lastCols || yw.pooled !== st.lastRows;
   const invalidated = epoch !== st.lastEpoch || countX !== st.lastCountX || countY !== st.lastCountY || resized;
 
@@ -497,7 +519,8 @@ function driveView(
     // the same wrong number, one frame later.
     frameScrollX: jumpX ?? (isFrameTick ? sv.scrollX : st.frameScrollX),
     frameScrollY: jumpY ?? (isFrameTick ? sv.scrollY : st.frameScrollY),
-    lastEntryW: entryW, lastEntryH: entryH, lastCols: xw.pooled, lastRows: yw.pooled,
+    lastEntryW: entryW, lastEntryH: entryH, lastGapX: gapX, lastGapY: gapY,
+    lastCols: xw.pooled, lastRows: yw.pooled,
     uncachedTicks,
   });
 
@@ -531,7 +554,7 @@ function driveView(
   const focusRef = captureFocusedEntry(world, pool.ids, m, childIndex, stepIdOf);
 
   writeLayout(content, rows, m, xw, yw, en);
-  writeWindowState(view, m, xw, yw, plan.length);
+  writeWindowState(view, m, xw, yw, plan.length, strideXraw, strideYraw);
   applySlots(world, plan, pool.ids, viewGuid, kinds[0].name, en.source as string, m, childIndex,
     { rows, cols: Math.max(1, xw.pooled), entryW, entryH });
   // ⚠️ The SAME `childIndex` serves both halves, and it is not stale for either. `applySlots`
@@ -658,7 +681,7 @@ function retargetFocus(
  *  what knows how big one is), `UIScrollView` speaks pixels (it is what the DOM consumes). The
  *  hand-off happens once, here, rather than either side learning the other's units. */
 function consumeEntryRequest(
-  view: EntityLike, m: Metas, en: Record<string, unknown>, entryW: number, entryH: number,
+  view: EntityLike, m: Metas, en: Record<string, unknown>, strideX: number, strideY: number,
 ): { x?: number; y?: number } | null {
   const reqX = (en.scrollToEntryX as number) ?? -1;
   const reqY = (en.scrollToEntryY as number) ?? -1;
@@ -671,8 +694,6 @@ function consumeEntryRequest(
   // it early computed `index x 0 = 0`, scrolled to the TOP, and cleared the request, so the
   // view silently opened at the beginning and the ask was gone. That is Court's own use case,
   // which is what makes this worth a guard rather than a comment.
-  const strideX = entryW + ((en.gapX as number) ?? 0);
-  const strideY = entryH + ((en.gapY as number) ?? 0);
   const canX = reqX < 0 || strideX > 0;
   const canY = reqY < 0 || strideY > 0;
   if (!canX || !canY) return null;    // retry next frame, once the prefab is cached
@@ -939,12 +960,24 @@ function writeLayout(
   }
 }
 
-/** Publish the window so game code, tests and Percept can verify BY DATA rather than pixels. */
-function writeWindowState(view: EntityLike, m: Metas, xw: AxisWindow, yw: AxisWindow, poolSize: number): void {
+/** Publish the window so game code, tests and Percept can verify BY DATA rather than pixels.
+ *
+ *  ⚠️ `strideX`/`strideY` are the RAW `entrySize + gap`, deliberately NOT the `Math.max(1, …)`
+ *  clamped pair `driveView` uses for its travel measurement. The clamp exists so a division
+ *  cannot blow up; publishing it would state a 1px stride for a view whose entry size is not
+ *  resolved yet, and `scrollApi` reads 0 as "no usable window" and refuses. A clamped 0 would
+ *  therefore turn a refusal into a request for entry 0 — the teleport-to-top that
+ *  `scrollByEntry`'s own banner exists to prevent. */
+function writeWindowState(
+  view: EntityLike, m: Metas, xw: AxisWindow, yw: AxisWindow, poolSize: number,
+  strideX: number, strideY: number,
+): void {
   const cur = view.get(m.enMeta.trait) as Record<string, unknown>;
-  const next = { ...cur, firstX: xw.first, firstY: yw.first, visibleX: xw.visible, visibleY: yw.visible, poolSize };
+  const next = { ...cur, firstX: xw.first, firstY: yw.first, visibleX: xw.visible, visibleY: yw.visible,
+    poolSize, strideX, strideY };
   if (cur.firstX === next.firstX && cur.firstY === next.firstY && cur.visibleX === next.visibleX
-    && cur.visibleY === next.visibleY && cur.poolSize === next.poolSize) return;
+    && cur.visibleY === next.visibleY && cur.poolSize === next.poolSize
+    && cur.strideX === next.strideX && cur.strideY === next.strideY) return;
   view.set(m.enMeta.trait, next);
 }
 

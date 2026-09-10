@@ -68,3 +68,32 @@ test('2D Colliders checkbox hides sprites, and restores them when unchecked', as
   await waitForFrames(page);
   await expect.poll(() => has2DSprite(page, spriteId!)).toBe(true);
 });
+
+// #1003 — the viewport must SAY it is hiding content. The unit tests cover the predicate and the
+// badge string; only a real gesture can show that the notice actually reaches the screen, and that it
+// leaves again. This is the assertion that makes "an empty viewport reads as a crash" false.
+test('collider-only mode announces itself in the viewport and in the View badge', async ({ page }) => {
+  await gotoEditorWithScene(page, SCENE_2D, 'CenterSprite');
+  await switchToUIMode(page);
+  const notice = page.locator('[data-ui-id="sceneView.hiddenContentNotice"]');
+  const viewBtn = page.locator(`[data-ui-id="${VIEW_MENU_UI}"]`);
+
+  await waitForFrames(page);
+  await expect(notice).toHaveCount(0);
+  await expect(viewBtn).not.toContainText('Colliders');
+
+  await clickViewOption(page, VIEW_MENU_UI, COLLIDERS_2D_ITEM);
+  await waitForFrames(page);
+  // ⚠️ This fixture has ZERO Collider2D, so the notice takes the "nothing to draw" branch — asserting
+  // /sprites hidden/ here could never pass, and `npm run verify` cannot see it (e2e runs only in
+  // verify:all and the public CI). Assert the invariant part plus the branch this fixture actually
+  // produces, which is also the case the whole feature exists for: an entirely empty viewport.
+  await expect(notice).toHaveText(/Colliders only/);
+  await expect(notice).toHaveText(/NO colliders to draw/);
+  await expect(notice).toHaveText(/\(C\)/);          // names the key that caused it
+  await expect(viewBtn).toContainText('Colliders');  // and the toolbar names the option
+
+  await clickViewOption(page, VIEW_MENU_UI, COLLIDERS_2D_ITEM);
+  await waitForFrames(page);
+  await expect(notice).toHaveCount(0);
+});

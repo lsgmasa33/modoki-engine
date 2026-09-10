@@ -113,6 +113,23 @@ async function setup(entries: Partial<Record<string, unknown>> = {}, scroll = 0,
   return { sys, src, provider, view };
 }
 
+/** Put the view genuinely AT `entry`, with NOTHING in flight — the state a settled viewer is in.
+ *
+ *  ⚠️ Exists because "rewind `scrollY` and step again" does NOT settle a view, and a test that
+ *  believes it does is testing the opposite of what it says (#1010: the case above asserted the
+ *  defect for exactly that reason). A request outlives the scroll in two stages — `UIEntries`
+ *  holds it in entries until the system converts it, then `UIScrollView` holds it in px until
+ *  `UINode` applies it — and this suite has no DOM, so nothing here clears the second one on its
+ *  own. Clearing both and THEN ticking is what makes live scroll the only thing left to read. */
+function settleAtEntry(sys: { entriesSystem: (w: typeof testWorld) => void }, view: any, entry: number,
+  stride: number = ENTRY_H) {
+  view.set(UIScrollView, {
+    ...(view.get(UIScrollView) as any), scrollY: entry * stride, scrollToX: -1, scrollToY: -1,
+  });
+  view.set(UIEntries, { ...(view.get(UIEntries) as any), scrollToEntryX: -1, scrollToEntryY: -1 });
+  sys.entriesSystem(testWorld);
+}
+
 beforeEach(() => { testWorld = createWorld(); idIndex.clear(); });
 // ⚠️ Koota caps a process at 16 worlds, so a per-test world MUST be released or the 17th test
 // in this file dies with "Too many worlds created" — which reads as a bug in the code under
@@ -688,9 +705,327 @@ describe('entriesSystem', () => {
     expect(api.scrollByEntry('view-guid', { y: 1 })).toBe(true);
     expect((view.get(UIEntries) as any).scrollToEntryY).toBe(8);
 
-    view.set(UIScrollView, { ...(view.get(UIScrollView) as any), scrollY: 7 * ENTRY_H });
+    // ⚠️ **Land the request before stepping again**, or this is no longer the case it names.
+    // It used to just rewind `scrollY` and step back, leaving the request for entry 8 ARMED —
+    // so it asserted 6, which is what stepping from LIVE scroll produces while ignoring a
+    // request already in flight. That is #1010's defect, and this test was pinning it. The
+    // in-flight case is now covered properly by the two tests below; this one is about a
+    // SETTLED view, so it settles the view: the system converts the request to px, and the DOM
+    // applying it is modelled the way the pool test above models it.
+    settleAtEntry(sys, view, 7);
     expect(api.scrollByEntry('view-guid', { y: -1 })).toBe(true);
     expect((view.get(UIEntries) as any).scrollToEntryY).toBe(6);
+  });
+
+  it('scrollByEntry counts from a pending ENTRY request, not from live scroll (#1010 stage 1)', async () => {
+    // The defect, at its narrowest: two notches inside one frame. The first arms entry 8 and the
+    // system has not run, so live scroll still reads entry 7 — stepping from it computes 8 again
+    // and overwrites the first request with itself. Two notches, one entry moved, `true` both
+    // times. Court measured the window at ~one frame (0 ms deterministic, 30 ms a coin flip).
+    const { sys, src, view } = await setup();
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    settleAtEntry(sys, view, 7);
+
+    expect(api.scrollByEntry('view-guid', { y: 1 })).toBe(true);
+    expect((view.get(UIEntries) as any).scrollToEntryY).toBe(8);
+    // No `entriesSystem` tick and no scroll movement — the request is still in flight.
+    expect((view.get(UIScrollView) as any).scrollY).toBe(7 * ENTRY_H);
+
+    expect(api.scrollByEntry('view-guid', { y: 1 })).toBe(true);
+    expect((view.get(UIEntries) as any).scrollToEntryY).toBe(9);
+  });
+
+  it('scrollByEntry counts from a pending PX request too, after the system converted it (#1010 stage 2)', async () => {
+    // The half the issue's own suggested fix would have missed. `consumeEntryRequest` clears the
+    // entry-space request as soon as it hands off, so one tick later stage 1 is empty — but
+    // `UIScrollView.scrollToY` is set and the DOM has not applied it yet, so live scroll STILL
+    // lags. Reading it back means dividing px by the stride, which is only sound because the
+    // system now publishes the stride it actually resolved rather than `scrollApi` recovering it.
+    const { sys, src, view } = await setup();
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    settleAtEntry(sys, view, 7);
+
+    expect(api.scrollByEntry('view-guid', { y: 1 })).toBe(true);
+    sys.entriesSystem(testWorld);   // converts entries -> px and clears the entry request
+    expect((view.get(UIEntries) as any).scrollToEntryY).toBe(-1);
+    expect((view.get(UIScrollView) as any).scrollToY).toBe(8 * ENTRY_H);
+    expect((view.get(UIScrollView) as any).scrollY).toBe(7 * ENTRY_H);   // DOM has not moved yet
+
+    expect(api.scrollByEntry('view-guid', { y: 1 })).toBe(true);
+    expect((view.get(UIEntries) as any).scrollToEntryY).toBe(9);
+  });
+
+  it('scrollByEntry still reads LIVE scroll when nothing is pending — the accept side', async () => {
+    // The direction the fix must not break: a viewer who scrolled by hand has no request in
+    // flight, so "where am I" is the live offset and a step is relative to THAT. Without this,
+    // a precedence bug that always preferred a stale request would pass every test above.
+    const { sys, src, view } = await setup();
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    settleAtEntry(sys, view, 7);
+    // A hand scroll: the offset moves with no request behind it.
+    view.set(UIScrollView, { ...(view.get(UIScrollView) as any), scrollY: 20 * ENTRY_H });
+
+    expect(api.scrollByEntry('view-guid', { y: 1 })).toBe(true);
+    expect((view.get(UIEntries) as any).scrollToEntryY).toBe(21);
+  });
+
+  it('snapToNearest keeps reading live scroll while a request is pending — deliberately NOT #1010', async () => {
+    // Pinned so a later "make these consistent" sweep goes red instead of silently changing what
+    // a snap means. `snapToNearest` answers "which entry am I nearest", which is a question about
+    // where the view IS; honouring a pending request would make it re-issue a jump the viewer has
+    // already been carried most of the way through. It also has no non-test caller, so nothing
+    // else pins this.
+    const { sys, src, view } = await setup();
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    settleAtEntry(sys, view, 7);
+
+    api.scrollByEntry('view-guid', { y: 5 });                       // arms entry 12
+    expect((view.get(UIEntries) as any).scrollToEntryY).toBe(12);
+    expect(api.snapToNearest('view-guid')).toBe(true);
+    expect((view.get(UIEntries) as any).scrollToEntryY).toBe(7);     // live, not the request
+  });
+
+  it('scrollByEntry refuses while the entry size is still unresolved — the stride is published RAW', async () => {
+    // ⚠️ Added because a mutation survived: publishing the CLAMPED `Math.max(1, entrySize + gap)`
+    // — the pair `driveView` uses for its travel measurement, one keystroke away — passed every
+    // other case in this file. It is not harmless. An uncached prefab makes the resolved entry
+    // size 0, and a clamped stride of 1 px reads as a perfectly usable window: `scrollByEntry`
+    // would then divide the live offset by 1 and arm a request for entry 3600 instead of
+    // refusing. The refusal is the whole reason `scrollByEntry` returns a boolean.
+    const { sys, src, view } = await setup();
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    // A prefab whose root reports no height yet — normal for the first frames of a scene, and the
+    // case `consumeEntryRequest`'s own guard is written for.
+    sys.setEntryPrefabProvider({
+      isCached: () => true,
+      rootSize: () => ({ width: 0, widthUnit: 'px' as const, height: 0, heightUnit: 'px' as const }),
+      spawnInstance: () => 0,
+    } as any);
+    view.set(UIScrollView, { ...(view.get(UIScrollView) as any), scrollY: 3600 });
+    sys.entriesSystem(testWorld);
+
+    expect((view.get(UIEntries) as any).strideY).toBe(0);
+    expect(api.scrollByEntry('view-guid', { y: 1 })).toBe(false);
+    expect((view.get(UIEntries) as any).scrollToEntryY).toBe(-1);
+  });
+
+  it('scrollByEntry uses the stride the SYSTEM resolved, not one recovered from the window', async () => {
+    // ⚠️ **The only fixture shape that can tell the two apart**, and the reason the rest of this
+    // file cannot: the old recovery was `viewport / (visible - 1)` where `visible` is
+    // `ceil(viewport / stride) + 1`, which is EXACTLY right whenever the viewport is a whole
+    // number of entries — 600/120 is, so every other case here would pass with either one and
+    // vouches for nothing. 600/250 is not: `visible` is `ceil(2.4) + 1 = 4`, so the recovery
+    // yields 200 against a true stride of 250.
+    //
+    // At a live offset of 1000 px that is the difference between entry 4 (true) and entry 5
+    // (recovered), so a single step lands on 5 or on 6 — and the error grows with the offset,
+    // which is why this was a real defect and not a rounding curiosity.
+    const { sys, src, view } = await setup({ entryHeight: 250, entryHeightUnit: 'px' });
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    settleAtEntry(sys, view, 4, 250);                                  // scrollY = 1000
+
+    expect((view.get(UIEntries) as any).strideY).toBe(250);            // published, not derived
+    expect((view.get(UIEntries) as any).visibleY).toBe(4);             // => the recovery would say 200
+
+    expect(api.scrollByEntry('view-guid', { y: 1 })).toBe(true);
+    expect((view.get(UIEntries) as any).scrollToEntryY).toBe(5);       // 4 + 1, not 5 + 1
+  });
+
+  it('scrollByEntry refuses an axis with fewer than two entries — the SECOND accidental guard', async () => {
+    // ⚠️ Close-out F2: the first fix claimed the `axis` gate replaced everything the recovery had
+    // been refusing, and that was wrong. `visible` is `min(count, …)`, so `visible <= 1` was also
+    // refusing a step on the STEPPED axis when only one entry exists — a case the axis gate cannot
+    // see, because the view really does scroll on that axis.
+    //
+    // ⚠️ **The fixture is the whole test, and the first version of it could not fail.** With a
+    // SHORT entry the view sits exactly on entry 0, `stepTo` clamps the step back to 0, and the
+    // absorbed-step predicate refuses it whether or not this gate exists — measured: deleting both
+    // `count > 1` terms left all 69 cases green. The gate is only distinguishable when the single
+    // entry is TALLER than its viewport, because only then does a live offset INSIDE that entry
+    // round to a non-zero index. 600px entry, 300px viewport, scrolled to 300 (its own maximum):
+    // `round(300/600) = 1`, `stepTo(1, 1, 1) = 0`, and `1 !== 0` reads as a move — so without the
+    // gate this returns `true` and arms entry 0, yanking a viewer reading the bottom of that entry
+    // back to its top.
+    const { sys, src, view } = await setup(
+      { countY: 1, entryHeight: 600, entryHeightUnit: 'px' },
+    );
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    view.set(UIScrollView, { ...(view.get(UIScrollView) as any), viewportHeight: 300 });
+    sys.entriesSystem(testWorld);
+    view.set(UIScrollView, { ...(view.get(UIScrollView) as any), scrollY: 300 });
+
+    expect((view.get(UIEntries) as any).strideY).toBe(600);       // a REAL stride — not the old 0
+    expect(api.scrollByEntry('view-guid', { y: 1 })).toBe(false);
+    expect((view.get(UIEntries) as any).scrollToEntryY).toBe(-1);
+  });
+
+  it('scrollByEntry clamps at the END of the list — repeated steps cannot run away', async () => {
+    // ⚠️ Close-out F3, and it is a regression the precedence itself introduced: re-reading live
+    // scroll was accidentally self-limiting, because a view that cannot move any further keeps
+    // reporting the same offset and every step recomputes the same index. Counting from the
+    // REQUEST removes that, so five in-frame steps on a ten-entry list walked the request to
+    // entry 10 — one past the end — which `consumeEntryRequest` converts to a px offset equal to
+    // the whole content height, about twice the maximum scroll.
+    const { sys, src, view } = await setup({ countY: 10 });
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    settleAtEntry(sys, view, 5);
+
+    // Steps 1-4 move (5 -> 9). The FIFTH is absorbed by the clamp and must report that.
+    for (let i = 0; i < 4; i++) expect(api.scrollByEntry('view-guid', { y: 1 })).toBe(true);
+    expect((view.get(UIEntries) as any).scrollToEntryY).toBe(9);   // count - 1, not 10
+    expect(api.scrollByEntry('view-guid', { y: 1 })).toBe(false);
+    expect((view.get(UIEntries) as any).scrollToEntryY).toBe(9);   // and armed nothing new
+
+    // ⚠️ The lower clamp is the older half, but its RETURN VALUE changed with it (close-out §2d,
+    // F4). A step at entry 0 going down cannot move, and reporting `true` for it armed a request
+    // for the entry the view was already on — a `markUIDirty()` projection rebuild, plus 140 ms of
+    // `wheelBusy` in `UINode`'s handler that swallowed the next notch. #1010's own body names that
+    // return value as a defect ("a caller gets no signal that nothing moved"), so pinning it as
+    // expected here would have endorsed the thing the issue was filed about.
+    settleAtEntry(sys, view, 0);
+    expect(api.scrollByEntry('view-guid', { y: -1 })).toBe(false);
+    expect((view.get(UIEntries) as any).scrollToEntryY).toBe(-1);  // nothing armed at all
+
+    // ...and a step that CAN move from entry 0 still does.
+    expect(api.scrollByEntry('view-guid', { y: 1 })).toBe(true);
+    expect((view.get(UIEntries) as any).scrollToEntryY).toBe(1);
+  });
+
+  it('snapToNearest clamps to the last entry too — the sibling the first sweep missed', async () => {
+    // ⚠️ Close-out §2d F-A1. `snapToNearest` sits forty lines above `scrollByEntry` in the same
+    // file, reads the same published stride through the same helper, and got neither the count
+    // gate nor the clamp — because the sibling sweep looked for "derives an index from LIVE
+    // scroll" and ejected this one as a deliberate live read, which it is. The live read was never
+    // the defect; the unbounded ROUNDING was.
+    //
+    // `Math.round(scroll / stride)` rounds UP past the last entry whenever the viewport is shorter
+    // than one entry. Here: one 600px entry in a 300px viewport, scrolled to 300 — which is that
+    // view's own MAXIMUM, not an arbitrary number, because `writeScrollState` copies `scrollY` back
+    // from the real element and the DOM can never produce more. The boundary shows the defect
+    // exactly: `round(300/600) = 1`, an entry that does not exist, converting to `scrollToY: 600`
+    // against a reachable 300 — a viewer who asked to snap while reading the bottom of a tall
+    // single entry was carried further down.
+    const { sys, src, view } = await setup(
+      { countY: 1, entryHeight: 600, entryHeightUnit: 'px' },
+    );
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    view.set(UIScrollView, { ...(view.get(UIScrollView) as any), viewportHeight: 300 });
+    sys.entriesSystem(testWorld);
+    view.set(UIScrollView, { ...(view.get(UIScrollView) as any), scrollY: 300 });
+
+    expect((view.get(UIEntries) as any).strideY).toBe(600);
+    expect(api.snapToNearest('view-guid')).toBe(true);
+    expect((view.get(UIEntries) as any).scrollToEntryY).toBe(0);   // clamped, NOT 1
+
+    // ⚠️ And it CLAMPS rather than refusing: unlike a step, a single entry is a legitimate snap
+    // target — "put me back at the top of the one entry" is a real request. The count gate that
+    // `scrollByEntry` carries would be wrong here, which is why the sibling fix is not a copy.
+    // (The stepping side of this same view is covered by its own case above, on a fixture the
+    // `snapToNearest` call here would otherwise have neutralised by arming entry 0 first.)
+  });
+
+  it('snapToNearest reports FALSE when it can answer for neither axis — and clears nothing', async () => {
+    // ⚠️ Close-out §2d B6, and it needed its own case: the mutation that removes this guard
+    // survived all 70 others. Falling through to `scrollToEntry(guid, {})` writes
+    // `NO_ENTRY_REQUEST` to BOTH entry fields and returns `true`, so a snap on a view it cannot
+    // answer for reported success AND wiped whatever was in flight — the destructive half, which
+    // is worse than the wrong return value.
+    //
+    // `countY: 0` on a `axis: 'y'` view reaches it: there are no entries to be nearest to, while
+    // the X axis is gated out by `axis`. (A view can hold a request with no entries — nothing
+    // stops a game arming one before its data arrives, which is Court's "open on the player's
+    // frontier page" case.)
+    const { sys, src, view } = await setup({ countY: 0 });
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    view.set(UIEntries, { ...(view.get(UIEntries) as any), scrollToEntryY: 7 });
+
+    expect(api.snapToNearest('view-guid')).toBe(false);
+    expect((view.get(UIEntries) as any).scrollToEntryY).toBe(7);   // survived — not wiped to -1
+  });
+
+  it('an absorbed step does not DESTROY a request in flight on the other axis', async () => {
+    // ⚠️ Close-out §2d F-A3. `scrollToEntry` writes BOTH fields on every call, mapping `undefined`
+    // to `NO_ENTRY_REQUEST` — so an axis this call is not arming gets CLEARED, not left alone. On
+    // an `axis: 'both'` view a step that moves Y therefore wiped a request already in flight on X
+    // and the view never went where it had been sent. The absorbed-step predicate made this
+    // sharper: an axis can now be un-armed because its step hit the clamp, not only because the
+    // caller left it out.
+    const { sys, src, view } = await setup({ countX: 10, countY: 10, entryWidth: 100, entryWidthUnit: 'px' });
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    view.set(UIScrollView, { ...(view.get(UIScrollView) as any), axis: 'both', viewportWidth: 300 });
+    sys.entriesSystem(testWorld);
+
+    // A jump to the last column is in flight, and the view sits at row 3.
+    settleAtEntry(sys, view, 3);
+    api.scrollToEntry('view-guid', { x: 9 });
+    expect((view.get(UIEntries) as any).scrollToEntryX).toBe(9);
+
+    // Step BOTH axes. X is absorbed by the clamp (already at 9 of 10); Y moves.
+    expect(api.scrollByEntry('view-guid', { x: 1, y: 1 })).toBe(true);
+    expect((view.get(UIEntries) as any).scrollToEntryY).toBe(4);
+    expect((view.get(UIEntries) as any).scrollToEntryX).toBe(9);   // survived — not wiped to -1
+  });
+
+  it('a gap edit REPUBLISHES the stride — it is not only entry size that moves it', async () => {
+    // ⚠️ Close-out F1. `writeWindowState` sits behind the cheap early-out, and that early-out's
+    // invalidation test covered entry size but not the gaps — while the stride it publishes is
+    // `entrySize + gap`. Changing only `gapY` moves no window origin and resizes no entry, so the
+    // re-drive was skipped and the stride stayed at its pre-edit value: `scrollByEntry` then
+    // divided by a stride the system was no longer using, which is the exact two-derivations bug
+    // publishing the stride was meant to end.
+    const { sys, src, view } = await setup({ entryHeight: 100, entryHeightUnit: 'px' });
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    expect((view.get(UIEntries) as any).strideY).toBe(100);
+
+    // An author widens the gap. Nothing else about the view changes.
+    view.set(UIEntries, { ...(view.get(UIEntries) as any), gapY: 10 });
+    sys.entriesSystem(testWorld);
+    expect((view.get(UIEntries) as any).strideY).toBe(110);
+
+    // And the step rounds off the NEW stride: 550 / 110 = 5, so +1 is 6 (off the stale 100 it
+    // would have been 550/100 = 5.5 -> 6 -> 7).
+    settleAtEntry(sys, view, 5, 110);
+    expect(api.scrollByEntry('view-guid', { y: 1 })).toBe(true);
+    expect((view.get(UIEntries) as any).scrollToEntryY).toBe(6);
+  });
+
+  it('scrollByEntry refuses an axis the view does not scroll', async () => {
+    // ⚠️ This guarantee used to be an ACCIDENT and is now a rule (#1010). The stride was recovered
+    // as `viewport / (visible - 1)`, which returns 0 below `visible: 2`, so a single-row view
+    // refused a Y step by dividing by zero rather than by deciding to. Reading the system's
+    // published stride makes that a real number, so without the explicit `axis` gate this would
+    // arm a `scrollToY` on an x-axis view — and `0` is a request for entry 0, not "no request".
+    // The harm is that `scrollTo({top})` with no `left` CANCELS an in-flight smooth scroll on the
+    // axis that does scroll; the request itself is clearable (`clearScrollRequest` has cleared
+    // both axes unconditionally since #768).
+    const { sys, src, view } = await setup({ countX: 1000, countY: 1 });
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    view.set(UIScrollView, { ...(view.get(UIScrollView) as any), axis: 'x' });
+    sys.entriesSystem(testWorld);
+
+    expect(api.scrollByEntry('view-guid', { y: 1 })).toBe(false);
+    expect((view.get(UIEntries) as any).scrollToEntryY).toBe(-1);
   });
 
   it('scrollByEntry does not arm a request on the axis it was not asked to move', async () => {

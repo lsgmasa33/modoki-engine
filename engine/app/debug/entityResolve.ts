@@ -215,7 +215,12 @@ export function resolveEntityPointReport(spec: EntityPointSpec): EntityPointReso
     if (!centreIsInWindow(p.x, p.y)) {
       return fail(`entity ${matched} centres at (${Math.round(p.x)}, ${Math.round(p.y)}), outside the window — scroll it into view first`);
     }
-    const occludedBy = occlusionAt(el, p.x, p.y);
+    // #1016: the gesture decides whether the tap-zone redirect applies. **Passed through as-is,
+    // including `undefined`** — see `isClickShaped`'s banner. An earlier version defaulted an
+    // absent gesture to `'tap'` and called that the strict reading; it is the permissive one, since
+    // the redirect only ever REMOVES refusals, so a caller that named no intent would have had a
+    // drag waved through.
+    const occludedBy = occlusionAt(el, p.x, p.y, spec.gesture);
     return {
       ok: true, x: p.x, y: p.y, entity, matched,
       hitTarget: occludedBy ?? describeElement(el),
