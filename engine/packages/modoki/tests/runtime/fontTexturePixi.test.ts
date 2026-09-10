@@ -38,11 +38,11 @@ vi.mock('pixi.js', () => ({
 let resolveLoad: (t: unknown) => void;
 let rejectLoad: (e: unknown) => void;
 let loadCalls = 0;
-const loadPixiTexture = vi.fn(() => {
+const loadMtsdfAtlasTexture = vi.fn(() => {
   loadCalls++;
   return new Promise((res, rej) => { resolveLoad = res as typeof resolveLoad; rejectLoad = rej; });
 });
-vi.mock('../../src/runtime/rendering/pixiTextureLoad', () => ({ loadPixiTexture }));
+vi.mock('../../src/runtime/rendering/pixiTextureLoad', () => ({ loadMtsdfAtlasTexture }));
 
 const { getFontTexturePixi } = await import('../../src/runtime/rendering/text/fontTexturePixi');
 const { BakedFontProvider } = await import('../../src/runtime/rendering/text/fontProvider');
@@ -59,10 +59,10 @@ function provider(id: string) {
 }
 
 /** A Texture stand-in — the code sets three fields on `.source` and calls `update()`. */
-const fakeTexture = () => ({ source: { scaleMode: '', alphaMode: '', update: vi.fn() } });
+const fakeTexture = () => ({ source: { scaleMode: '', alphaMode: '', update: vi.fn() }, destroy: vi.fn() });
 
 describe('getFontTexturePixi — concurrent renderers', () => {
-  beforeEach(() => { loadCalls = 0; loadPixiTexture.mockClear(); unload.mockClear(); });
+  beforeEach(() => { loadCalls = 0; loadMtsdfAtlasTexture.mockClear(); unload.mockClear(); });
 
   it('wakes BOTH renderers when one shared atlas load lands', async () => {
     const p = provider('font-both');
@@ -134,7 +134,7 @@ describe('getFontTexturePixi — concurrent renderers', () => {
  *  (each one only ever looks up the id it just built). This is the one that would catch it —
  *  two providers, constructed in the SAME test, sharing the atlas-image cache map. */
 describe('per-provider discriminant — two providers, same page (#828)', () => {
-  beforeEach(() => { loadCalls = 0; loadPixiTexture.mockClear(); });
+  beforeEach(() => { loadCalls = 0; loadMtsdfAtlasTexture.mockClear(); });
 
   it('two providers with different ids get DISTINCT textures for the SAME page', async () => {
     const a = provider('font-two-a');
@@ -145,11 +145,11 @@ describe('per-provider discriminant — two providers, same page (#828)', () => 
     // loads — so capture each call's own resolver instead.
     let resolveA!: (t: unknown) => void;
     let resolveB!: (t: unknown) => void;
-    loadPixiTexture.mockImplementationOnce(() => {
+    loadMtsdfAtlasTexture.mockImplementationOnce(() => {
       loadCalls++;
       return new Promise((res) => { resolveA = res as typeof resolveA; });
     });
-    loadPixiTexture.mockImplementationOnce(() => {
+    loadMtsdfAtlasTexture.mockImplementationOnce(() => {
       loadCalls++;
       return new Promise((res) => { resolveB = res as typeof resolveB; });
     });
@@ -180,7 +180,7 @@ describe('per-provider discriminant — two providers, same page (#828)', () => 
  *  for those frames — typing CJK made the Latin text flicker, and the superseded Texture leaked
  *  until the font was released. Counting loads is the assertion: one url, one load, forever. */
 describe('the baked page-0 image is cached independently of atlasVersion', () => {
-  beforeEach(() => { loadCalls = 0; loadPixiTexture.mockClear(); });
+  beforeEach(() => { loadCalls = 0; loadMtsdfAtlasTexture.mockClear(); });
   it('does not re-load the image when a generation bumps the version', async () => {
     const p = provider('hybrid') as unknown as { atlasVersion: number };
     const wake = vi.fn();
@@ -209,7 +209,7 @@ describe('the baked page-0 image is cached independently of atlasVersion', () =>
  *  ever drain. The entry then survives every release, and the re-baked font keeps drawing the old
  *  atlas until a page reload. */
 describe('a provider disposed mid-load must not leave its texture in the cache', () => {
-  beforeEach(() => { loadCalls = 0; loadPixiTexture.mockClear(); unload.mockClear(); });
+  beforeEach(() => { loadCalls = 0; loadMtsdfAtlasTexture.mockClear(); unload.mockClear(); });
 
   /** The REAL provider, not a stub: `addDisposable`/`dispose` are exactly what is under test here,
    *  so a hand-rolled pair would only assert the fixture. The glyph atlas is never read (no layout
@@ -226,12 +226,16 @@ describe('a provider disposed mid-load must not leave its texture in the cache',
     p1.dispose();
     const stale = fakeTexture();
     resolveLoad(stale);
-    await vi.waitFor(() => expect(loadPixiTexture).toHaveBeenCalled());
+    await vi.waitFor(() => expect(loadMtsdfAtlasTexture).toHaveBeenCalled());
     await Promise.resolve();
     await Promise.resolve();
 
-    // The cleanup ran late instead of never: the entry is gone and the atlas is unloaded.
-    expect(unload, 'the superseded atlas is released, not leaked').toHaveBeenCalledTimes(1);
+    // The cleanup ran late instead of never: the entry is gone and the atlas is released.
+    // ⚠️ Released by DESTROYING it, not by `Assets.unload` (#1045): the atlas is loaded outside
+    // Pixi's Assets cache now, so `unload` would be a silent no-op that leaks the whole 8 MB page.
+    expect(stale.destroy, 'the superseded atlas is released, not leaked').toHaveBeenCalledTimes(1);
+    expect(stale.destroy, 'and its SOURCE goes with it, not just the wrapper').toHaveBeenCalledWith(true);
+    expect(unload, 'Assets never owned this texture, so unloading it would be a no-op').not.toHaveBeenCalled();
 
     // ⚠️ THE WAITER MUST STILL BE WOKEN, and an earlier version of this fix asserted the exact
     // opposite. `waiters` is keyed by the font GUID, so it outlives the provider INSTANCE while
@@ -288,7 +292,7 @@ describe('a provider disposed mid-load must not leave its texture in the cache',
  *  (`try { fn(); } catch {} `, called synchronously) — a fake that queued the callback instead
  *  would vouch for the bug (this repo has a scar for exactly this class of fake). */
 describe('a dynamic texture built for an ALREADY-disposed provider (#481)', () => {
-  beforeEach(() => { loadCalls = 0; loadPixiTexture.mockClear(); });
+  beforeEach(() => { loadCalls = 0; loadMtsdfAtlasTexture.mockClear(); });
 
   function disposedDynamicProvider(id: string) {
     return {
@@ -321,7 +325,7 @@ describe('a dynamic texture built for an ALREADY-disposed provider (#481)', () =
  *  `provider.addDisposable`'s callback) must not be handed back; the cache must be evicted and a
  *  fresh load started instead. */
 describe('a destroyed baked image texture already in the cache is evicted, not served (#481 sibling)', () => {
-  beforeEach(() => { loadCalls = 0; loadPixiTexture.mockClear(); });
+  beforeEach(() => { loadCalls = 0; loadMtsdfAtlasTexture.mockClear(); });
 
   it('evicts and starts a fresh load instead of returning the destroyed texture', async () => {
     const p = provider('font-baked-destroyed');
@@ -352,7 +356,7 @@ describe('a destroyed baked image texture already in the cache is evicted, not s
  *  function. Seed a destroyed texture that the disposer did NOT evict (bypassing it, same as the
  *  baked case above) to actually exercise the branch. */
 describe('the dynamic-path eviction branch is reachable independently of the disposer (#481 coverage)', () => {
-  beforeEach(() => { loadCalls = 0; loadPixiTexture.mockClear(); });
+  beforeEach(() => { loadCalls = 0; loadMtsdfAtlasTexture.mockClear(); });
 
   function dynamicProvider(id: string) {
     let disposeFn: (() => void) | undefined;

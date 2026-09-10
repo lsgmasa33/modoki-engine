@@ -10,8 +10,8 @@
  *  `-yorigin top` bake gives top-origin UVs, which is Pixi-native (no flip).
  */
 
-import { Assets, Texture, CanvasSource } from 'pixi.js';
-import { loadPixiTexture } from '../pixiTextureLoad';
+import { Texture, CanvasSource } from 'pixi.js';
+import { loadMtsdfAtlasTexture } from '../pixiTextureLoad';
 import type { FontProvider } from './fontProvider';
 import { notifyListeners } from '../../core/notifyListeners';
 
@@ -122,17 +122,40 @@ export function getFontTexturePixi(provider: FontProvider, page = 0, onReady?: (
   if (addWaiter(key, onReady)) return null;
 
   const url = provider.atlasImageUrl;
-  loadPixiTexture(url)
+  // ⚠️ NOT `loadPixiTexture` (#1045): `Assets.load` decodes via a bare `createImageBitmap(blob)`,
+  // and on iOS 16 the UA default for that is PREMULTIPLY — which destroys the distance field and
+  // makes every glyph invisible. The three lines below cannot repair it, because the WebGL unpack
+  // flag is ignored for ImageBitmap sources. `loadMtsdfAtlasTexture` decodes unpremultiplied.
+  loadMtsdfAtlasTexture(url)
     .then((tex: Texture) => {
       // Distance-field data: linear filter, NO premultiply (RGB median must stay
       // intact under low alpha). Set before first GPU upload (lazy on first render).
+      // Redundant with the source the loader builds, and kept: the no-createImageBitmap
+      // fallback path returns an Assets-loaded texture that has NOT been styled.
       tex.source.scaleMode = 'linear';
       tex.source.alphaMode = 'no-premultiply-alpha';
       tex.source.update();
       cache.set(key, tex);
       provider.addDisposable(() => {
         cache.delete(key);
-        Assets.unload(url).catch(() => { /* already gone */ });
+        // This texture is normally OURS — `loadMtsdfAtlasTexture` builds it outside Pixi's
+        // `Assets`, so `Assets.unload` would be a silent no-op and leak the atlas (8 MB for a
+        // 2048x1024 page). Destroy it directly, source and all, as the dynamic canvas path does.
+        //
+        // ⚠️ ONE path returns an Assets-MANAGED texture instead: the no-`createImageBitmap`
+        // fallback. Destroying that one logs Pixi's "A Texture managed by Assets was destroyed
+        // instead of unloaded!" and then unloads it itself, so it self-heals — cosmetic, and
+        // unreachable on every shipping target (iOS 16.4+ / Android 12+ all have
+        // `createImageBitmap`). Not worth branching on a `destroy` vs `unload` decision that
+        // no supported device can take.
+        //
+        // The backing `ImageBitmap` is NOT `.close()`d, which matches the old `Assets.unload`
+        // path exactly — not a regression. It cannot be closed at LOAD time either: `ImageSource`
+        // forces `autoGarbageCollect`, and Pixi's texture GC re-uploads from `source.resource`
+        // after an idle unload. If Font-Inspector churn (`invalidateFont` fires per re-bake and
+        // per axis flip) is ever MEASURED to grow memory, the one safe place is capturing
+        // `tex.source.resource` here, before the destroy below.
+        tex.destroy(true);
       });
       // ⚠️ ON AN ALREADY-DISPOSED PROVIDER the disposer above just ran SYNCHRONOUSLY (#481), so
       // the entry cached one line up is already gone and this texture is being unloaded — and the

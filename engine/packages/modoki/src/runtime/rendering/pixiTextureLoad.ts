@@ -1,7 +1,7 @@
 /** PixiJS texture-load shim — the single entry every Scene2D/font Pixi texture
  *  load goes through, so the playable-blob fix lives in ONE place. */
 
-import { Assets, type Texture } from 'pixi.js';
+import { Assets, ImageSource, Texture } from 'pixi.js';
 
 /** Load a texture through PixiJS Assets, forcing the image parser for `blob:` URLs.
  *
@@ -23,6 +23,54 @@ export function loadPixiTexture(url: string): Promise<Texture> {
     return Assets.load<Texture>({ src: url, parser: 'texture' });
   }
   return Assets.load<Texture>(url);
+}
+
+/** Load a BAKED MTSDF font atlas — as DATA, never through `Assets.load` (#1045).
+ *
+ *  ⚠️ **An MTSDF atlas must not be premultiplied, and `alphaMode` cannot enforce that.**
+ *  RGB carries the 3-channel distance field and A carries the true SDF, so premultiplying
+ *  scales the field by alpha and drags `median(rgb)` below the shader's 0.5 edge threshold —
+ *  `fill = clamp((sd - 0.5) * spr + 0.5, 0, 1)` is then 0 for every pixel and EVERY GLYPH IN
+ *  THE GAME IS INVISIBLE. Measured on an iPhone 8 / iOS 16.7.16 over one glyph cell: texels
+ *  with `median(rgb) > 0.5` were 1775 in the file and 0 on the GPU.
+ *
+ *  `fontTexturePixi` does set `source.alphaMode = 'no-premultiply-alpha'`, and it CANNOT win:
+ *  per the WebGL spec `UNPACK_PREMULTIPLY_ALPHA_WEBGL` is **ignored for `ImageBitmap` uploads**
+ *  (verified on the device — flipping it changed nothing in either direction). The only lever is
+ *  the `createImageBitmap` option, and `Assets.load` does not expose it: `loadTextures.mjs`
+ *  passes `{premultiplyAlpha:'none'}` ONLY when `data.alphaMode === 'premultiplied-alpha'`, and
+ *  otherwise calls `createImageBitmap(blob)` bare, leaving it to the UA. On iOS 16 that default
+ *  is byte-identical to `'premultiply'`; iOS 26 and desktop do not premultiply, which is exactly
+ *  why this shipped green everywhere but a real iOS 16 device.
+ *
+ *  ⚠️ **Do NOT "simplify" this back to `Assets.load({src, data:{alphaMode:'premultiplied-alpha'}})`.**
+ *  It happens to produce an unpremultiplied bitmap today, but only by exploiting an inverted
+ *  condition inside Pixi's loader while ALSO mislabelling the source — it would break silently on
+ *  a Pixi bump, and the failure looks like a font bug, not a loader one.
+ *
+ *  `colorSpaceConversion:'none'` for the same reason: a colour-profile transform is a no-op on a
+ *  profile-less PNG and corruption on any other, and this is a distance field, not a picture.
+ *
+ *  Fetch + decode also sidesteps the `blob:` parser problem `loadPixiTexture` exists for, so a
+ *  playable build needs no special case here. The no-`createImageBitmap` fallback is SAFE rather
+ *  than a quiet reintroduction: without it Pixi decodes into an `HTMLImageElement`, and the unpack
+ *  flag IS honoured for those. */
+export async function loadMtsdfAtlasTexture(url: string): Promise<Texture> {
+  if (typeof createImageBitmap !== 'function') return loadPixiTexture(url);
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`atlas fetch failed (${response.status}): ${url}`);
+  const bitmap = await createImageBitmap(await response.blob(), {
+    premultiplyAlpha: 'none',
+    colorSpaceConversion: 'none',
+  });
+  return new Texture({
+    source: new ImageSource({
+      resource: bitmap,
+      alphaMode: 'no-premultiply-alpha',
+      scaleMode: 'linear',
+      autoGenerateMipmaps: false,
+    }),
+  });
 }
 
 /**

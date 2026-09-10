@@ -302,6 +302,11 @@ chunked to fit it.
   uses `-pxpadding` = `pxRange` *plus* `range/2`; the generator uses `floor(range/2)` alone).
   Two fonts with different `pxRange` are not comparable by rect. Compare *modelled* widths, or
   measure ink.
+- **⚠️ Text INVISIBLE (not wrong — gone) on an OLD iOS device, correct everywhere else?** Do not
+  re-diagnose the shader. The atlas is being decoded PREMULTIPLIED, which destroys the distance
+  field: mechanism, the measurement that identifies it, and the fix are in
+  [rendering.md](rendering.md) § "2D SDF text (MTSDF)" (#1045). Note that the entity data,
+  geometry, UVs and uniforms all read as CORRECT while this is happening.
 - **Compare at matched settings or not at all** — Block A of the reference scene.
 - **`weight` and the effects scale with `pxRange/size`** (§2) before you conclude a knob is dead.
 
