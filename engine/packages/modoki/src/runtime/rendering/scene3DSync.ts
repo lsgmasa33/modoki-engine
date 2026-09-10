@@ -10,6 +10,7 @@ import type { World } from 'koota';
 import type { WebGPURenderer } from 'three/webgpu';
 import { Transform, Renderable3D, Renderable3DPrimitive, Camera, CameraFrame, Tint, isMaterialInstanced, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, Animator, SkinnedSprite2D, Billboard3D, FlatSprite3D, Text3D, TextAnimation } from '../traits';
 import { layoutText, type TextQuad } from './text/layoutText';
+import { textCodepoints } from './text/textCodepoints';
 import { buildTextGeometryByPage, buildTextPositionsByPage, buildTextColorsByPage, canWriteTextPositionsInPlace } from './text/textMesh';
 import { applyTextAnimation, isTextAnimating, isColorEffect, type TextAnimParams } from './text/textAnimate';
 import { makeMtsdfMaterial, updateMtsdfStyle, canReuseMtsdfMaterial, type MtsdfStyle } from './text/mtsdfShader';
@@ -3597,11 +3598,6 @@ function textStyle(t: {
   };
 }
 
-function codepointsOf(text: string): number[] {
-  const out: number[] = [];
-  for (const ch of text) out.push(ch.codePointAt(0)!);
-  return out;
-}
 
 function positionsTo3D(p2: Float32Array): Float32Array {
   const n = p2.length / 2;
@@ -3642,7 +3638,7 @@ export function syncText3D(world: World, scene: THREE.Scene, state: RenderState,
     const atlasKey = [t.font, provider.atlasVersion, getTextDirtyVersion(t.font)].join('|');
 
     if (!entry || entry.hash !== hash) {
-      provider.ensureGlyphs(codepointsOf(t.text));
+      provider.ensureGlyphs(textCodepoints(t.text));
       const layout = layoutText(provider, t.text, {
         fontSize: t.fontSize, maxWidth: t.maxWidth, align: t.align as 'left' | 'center' | 'right',
         lineSpacing: t.lineSpacing, letterSpacing: t.letterSpacing,

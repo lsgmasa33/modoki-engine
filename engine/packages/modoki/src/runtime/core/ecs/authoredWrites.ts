@@ -13,14 +13,35 @@
  *
  *  Deliberately warn-only. It reports; it never suppresses a write or blocks a save.
  *
- *  KNOWN COVERAGE BOUNDARY: the probe hooks `writeTraitField`, which is the choke point game
- *  code normally uses. A system that writes via koota's `entity.set(Trait, {...})` directly
- *  bypasses it and will NOT warn. That is not fixable here — `set` is koota's own API, not
- *  something the engine funnels — so the boundary is stated rather than papered over. (No game
- *  hits it today: every `entity.set` in `games/**`/`demos/**` sits in a system below
- *  `TRANSFORM`, which `runPipeline` already skips while stopped.) Note that mutating the object
- *  returned by `entity.get(Trait)` in place is NOT a write at all — koota returns a copy — so
- *  that pattern needs no coverage; it silently does nothing.
+ *  KNOWN COVERAGE BOUNDARY — **LATENT, not live** (#1042, owner 2026-09-10): the probe hooks
+ *  `writeTraitField`, which is the choke point game code normally uses. A system that writes via
+ *  koota's `entity.set(Trait, {...})` directly bypasses it and will NOT warn. That is not fixable
+ *  here — `set` is koota's own API, not something the engine funnels — so the boundary is stated
+ *  rather than papered over.
+ *
+ *  ⚠️ **Nothing BAKES through it today, but not for the reason you would guess — and the wrong
+ *  reason was written here first.** It is NOT that "every `entity.set` sits below `TRANSFORM` and
+ *  is skipped while stopped". `entriesSystem` runs at `UI_ENTRIES (270)`, which is ABOVE
+ *  `TRANSFORM (200)`, so `runPipeline`'s `priority < TRANSFORM` gate does not skip it; it carries
+ *  no sim check of its own, and it calls `entity.set` on the AUTHORED scroll-view entity
+ *  (`entriesSystem.ts` ~`:741`/`:744`/`:1017`). Three further vectors sit outside the pipeline
+ *  entirely: the DOM scroll handler's `driveEntriesFromScroll`, the Timeline editor's preview, and
+ *  action dispatch during preview.
+ *
+ *  **The actual reason a save stays clean: every field written that way is `runtimeOnly`**
+ *  (`registerTraits.ts` — the `UIScrollView` and `UIEntries` window state), so the serializer skips
+ *  it regardless of who wrote it or when.
+ *
+ *  That is why #1042's proposal to extend the probe to `entity.set` was declined: the writes it
+ *  would newly see are ones a save already cannot persist, so it would add noise rather than
+ *  coverage. (#1042 cited `timelineSystem.ts:164`/`:264` as the live sites; those two really are
+ *  sim-gated, at `ANIMATION-1 (149)` — but they were never the whole population.)
+ *
+ *  **What would make this boundary live:** an `entity.set` on a field that is NOT `runtimeOnly`,
+ *  from anything that can run while stopped. Then a save can bake it and the probe cannot see it.
+ *
+ *  Note that mutating the object returned by `entity.get(Trait)` in place is NOT a write at all —
+ *  koota returns a copy — so that pattern needs no coverage; it silently does nothing.
  *
  *  Zero imports on purpose: the recorder is called from `writeTraitField` (L0 `core/ecs/`), so
  *  it must not pull anything down with it. The CONDITION (in a system tick + sim stopped + not

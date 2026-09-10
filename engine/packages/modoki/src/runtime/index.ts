@@ -51,6 +51,19 @@ export { scrollToEntry, snapToNearest, scrollByEntry, entryIndexOf, NO_ENTRY_REQ
 // #1016 — the agent AIM surface must model press routing with the SAME function the router uses,
 // not a second copy of the rule (§9: a rule implemented twice diverges, and these two already did).
 export { resolveTapZoneVeto, UI_TAP_ZONE_ATTR, UI_PRESS_ORIGIN_ATTR } from './ui/pressOrigin';
+// Exported for AUTHORING GUARDS as much as for runtime use (#963). A test that wants to know where
+// an anchored child actually lands has two choices: call this, or re-implement the anchor/pivot/
+// offset arithmetic beside it — and Court's `tapZoneClearance.test.ts` records what the second one
+// costs (its hand-rolled layout model was wrong 3 times out of 5). A game or demo can only reach
+// engine code through the `@modoki/engine` specifier, so an unexported helper is one a portable
+// guard cannot use at all.
+export { resolveAnchorRect, ZERO_INSETS, type AnchorData, type SafeAreaPx }
+  from './ui/anchorLayout';
+// `AnchorData.anchor` is typed `AnchorMode`, so exporting the interface without it leaves a public
+// type whose own field type is unreachable — `npm run docs:api` says so out loud ("referenced by
+// index.AnchorData.anchor but not included in the documentation"), and a caller building an
+// AnchorData literal cannot name the union.
+export type { AnchorMode } from './traits/UIAnchor';
 export { entriesSystem, resetEntriesSystem, ENTRIES_CONTENT_NAME, setEntryPrefabProvider, getEntryPrefabProvider, type EntryPrefabProvider } from './ui/entriesSystem';
 export { patchUI, patchToggle, restartClip, readChromeUI, findChromeEntity, resetSceneChromeCache, patchAnchorPct, type ChromeUIPatch, type ChromeTogglePatch, type ChromeAnchorPatch } from './ui/sceneChrome';
 export { installEntryPrefabProvider, entryPrefabProvider } from './loaders/entryPrefabProvider';
@@ -441,6 +454,13 @@ export { loadFont, loadAllFonts, loadFontFamily, getLoadedFontFamilies, getLoade
 // able to prove the result still fits the panel it draws it in, and a game may only reach the
 // engine through this package specifier (see the portability guard). Pure — no GPU, no DOM.
 export { layoutText, type LayoutFont, type LayoutOptions, type TextLayout, type TextAlign } from './rendering/text/layoutText';
+/** #1038 — the seam that lets GAME code measure real rendered 2D text. `layoutText` above was
+ *  already exported but is unusable from a game without a `LayoutFont`, and the only source of one
+ *  (`getLoadedFont`) is deliberately still not exported: it hands back a font whose atlas may not
+ *  hold the glyphs yet, and measuring through it silently returns the 0.5 em fallback advance.
+ *  `measureText2D` wraps the `ensureGlyphs` + `layoutText` pair so that trap is not re-exported
+ *  with it. */
+export { measureText2D, type MeasureText2DOptions } from './loaders/measureText2D';
 export {
   isGuid, isExternalUrl, isInternalAssetPath, newGuid, deriveGuid, registerAsset, unregisterAsset, resolveGuidToPath,
   getGuidForPath, getAssetType, getAssetEntry, getAudioLoadType, resolveRef, loadManifestJson, ensureManifestLoaded, serializeManifest,

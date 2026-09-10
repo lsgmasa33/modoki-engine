@@ -209,7 +209,12 @@ export default tseslint.config(
       '**/node_modules/**',
       // Project scaffold template — copied to new projects with placeholder tokens
       // substituted; not part of the engine build graph (also out of tsconfig).
-      'engine/templates/**',
+      // ⚠️ EXCEPT its `tests/` (#1024): the template ships a tap-target floor guard so a scaffolded
+      // project is born covered, `vite.config.ts` runs it, and `tsconfig.test.json` typechecks it —
+      // so it is real, executed source and it gets linted like the rest. The token-substituted
+      // files this entry exists for are all under `runtime/`, `game.ts` and the configs.
+      'engine/templates/starter/runtime/**',
+      'engine/templates/starter/*',
       // Native Capacitor projects (generated) — repo root AND per-game
       // (games/<id>/ios|android, #29). Not our source.
       '**/android/**',

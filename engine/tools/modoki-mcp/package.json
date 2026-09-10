@@ -11,7 +11,8 @@
     "smoke": "node test-smoke.mjs",
     "surface": "node dump-surface.mjs",
     "gen:catalog": "tsx gen-tool-catalog.ts",
-    "test:live": "tsx test-live-tools.ts"
+    "test:live": "tsx test-live-tools.ts",
+    "gen:ledger": "tsx gen-surface-ledger.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",

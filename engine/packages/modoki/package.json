@@ -19,7 +19,8 @@
     "./editor": "./src/editor/index.ts",
     "./editor/rendering": "./src/editor/rendering/index.ts",
     "./three": "./src/three/index.ts",
-    "./testing": "./tests/helpers/sourceScanner.ts"
+    "./testing": "./tests/helpers/sourceScanner.ts",
+    "./testing/tapTargetFloor": "./tests/helpers/tapTargetFloor.ts"
   },
   "scripts": {
     "test": "vitest run",

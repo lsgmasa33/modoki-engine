@@ -325,5 +325,7 @@ chunked to fit it.
 | Runtime generation (shared worker + lock) | `runtime/rendering/text/msdfGenerate.ts` |
 | Generator output → our glyph format | `runtime/rendering/text/dynamicGlyphMap.ts` |
 | Layout (shared by 2D + 3D) | `runtime/rendering/text/layoutText.ts` |
+| Codepoints for `ensureGlyphs` (shared by 2D + 3D) | `runtime/rendering/text/textCodepoints.ts` |
+| Measuring rendered text from GAME code (#1038) | `runtime/loaders/measureText2D.ts` |
 | Shaders | `runtime/rendering/text/mtsdfShader.ts` (Three/TSL), `mtsdfPixiShader.ts` (Pixi WGSL+GLSL), `mtsdfStyle.ts` (shared budgets) |
 | Reference scene | `games/text_demo/runtime/assets/scenes/font-parameters.scene.json` |

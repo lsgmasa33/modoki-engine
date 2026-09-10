@@ -10,5 +10,15 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src"]
+  // ⚠️ EVERY root `.ts` file is listed explicitly, not just `src`. Nothing imports these into a
+  // program, so with `include: ["src"]` they were typechecked by NOTHING — measured 2026-09-10
+  // (#894 review): a deliberate type error in `gen-surface-ledger.ts` left all four
+  // `npm run typecheck` legs GREEN. `surfaceBytes.ts`/`surfaceLedger.ts` were covered only by
+  // accident, via the tests that import them.
+  //
+  // ⚠️ Keep this list complete as root files are added. `test-live-tools.ts` was missed on the first
+  // pass at this fix, and it is the worst one to miss: CLAUDE.md mandates it after any
+  // `engine/tools/**` change, it only ever runs when a human drives the live gate by hand, and it
+  // had accumulated four real type errors while nothing compiled it.
+  "include": ["src", "surfaceBytes.ts", "surfaceLedger.ts", "gen-surface-ledger.ts", "gen-tool-catalog.ts", "test-live-tools.ts"]
 }

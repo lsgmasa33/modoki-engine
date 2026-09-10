@@ -1217,18 +1217,32 @@ whole reason the field exists rather than an authoring convention:
   layout minimums. That is why `minTapSize` is documented beside the pointer fields and not beside
   them.
 
-Three guards, all of which exist because the failure would otherwise be invisible:
+#### ⚠️ SIX cases where an authored `minTapSize` does NOTHING
 
-- **Emitted only for a node that takes a click** (a click binding, or `swallowClicks`). An
-  enlarged zone on a decorative element would start swallowing taps meant for what is behind it.
-- **`overflow: hidden`/`scroll` clips the expander back to the box**, so the field does nothing
-  there. That combination WARNS rather than sitting inert.
-- **An element type that cannot HOST a child** — `input`, `range` and `UIToggle` all return before
-  the container branches, and an `<input>` is a void element besides. Also a DEV warning, and the
-  check runs *before* `isolation` is set so an inert field does not leave a stacking context
-  behind.
+**This list is the count — nowhere else states one.** Cases 1-3 are guards in `UINode.tsx`, all of
+which exist because the failure would otherwise be invisible; 4-6 were each found later, by a
+measurement, and each has its own subsection below.
 
-#### Value controls: the floor is met by the control's own box, not by `minTapSize` (#1025)
+1. **The node takes no click.** The expander is emitted only for a click binding or `swallowClicks`
+   — an enlarged zone on a decorative element would start swallowing taps meant for what is behind
+   it. ⚠️ `swallowClicks` is cancelled by `pointerThrough`, which WINS, so a node authoring both
+   takes no click either.
+2. **`overflow: hidden`/`scroll` clips the expander back to the box**, so the field does nothing
+   there. That combination WARNS rather than sitting inert.
+3. **An element type that cannot HOST a child** — `input`, `range` and `UIToggle` all return before
+   the container branches, and an `<input>` is a void element besides. Also a DEV warning, and the
+   check runs *before* `isolation` is set so an inert field does not leave a stacking context
+   behind.
+4. **A value control** — its floor is met by its own authored box, not by an expander (#1025).
+5. **An expander over a `Canvas2D` host** — rejected upstream at gesture ingestion (#1017).
+6. **A `TouchControl`** — case 1 in a form that does NOT warn, because the branch that warns is
+   inside the gate it fails (#1024).
+
+⚠️ **1-3 are decidable from a scene file and are what `@modoki/engine/testing/tapTargetFloor`
+models; 4 and 5 are not.** A guard that claims to enumerate them all is claiming more than authored
+data can support.
+
+#### Case 4 — value controls: the floor is met by the control's own box, not by `minTapSize` (#1025)
 
 ⚠️ **This section used to say "to grow one, wrap it in a `div` that carries the binding and author
 `minTapSize` on the wrapper." That advice was unfollowable, and it is retracted.** Every under-floor
@@ -1275,7 +1289,7 @@ it most.
 Court's members were `SettingsMusicSlider` and `SettingsSfxSlider` (both now `48 px` tall) and
 `SettingsHapticsToggle`; wordweave's two sliders were the same shape and are fixed the same way.
 
-#### A FIFTH inert case: an expander over a 2D canvas (#1017, 2026-09-10)
+#### Case 5 — an expander over a 2D canvas (#1017, 2026-09-10)
 
 ⚠️ **Over a `Canvas2D` host, the expander is rejected UPSTREAM of everything below.** The expander is
 a real `<div>` in the UI subtree, so a press on it is blocked at gesture INGESTION by
@@ -1288,7 +1302,26 @@ gesture, which nothing in the engine arbitrates.**
 Measured and ruled on in wordweave, where five controls sit inside the crossword's own pan region
 and were ACCEPTED under the floor rather than grown — growing them converts live gesture surface
 into dead chrome. The measurements and the owner's split decision live with the game:
-`games/wordweave/tests/tapTargets.test.ts`'s `ACCEPTED_UNDER_FLOOR`.
+`games/wordweave/tests/tapTargets.test.ts`'s `UNDER_FLOOR`.
+
+#### Case 6 — a `TouchControl` gets no expander at all, and nothing warns (#1024, 2026-09-10)
+
+⚠️ **A d-pad arrow is a tap target by any human definition and `minTapSize` does nothing on one —
+silently, with no DEV warning.** `UINode.tsx` gates the entire tap-zone branch on
+`takesClick = isInteractive || swallowsClicks`, and `isInteractive` reads CLICK BINDINGS. A
+`TouchControl` entity carries no `UIAction` at all — its own docblock forbids it, because a movement
+control is a held LEVEL rather than a discrete event — so it fails that outer gate, and **the three
+warnings above all live INSIDE it**. Nothing reports the field.
+
+**So a `TouchControl` under the floor is fixed by AUTHORED SIZE**, the same lever the ceiling rule
+prescribes for a dense row. `demos/forest-camp`'s four pads and its AIM button are the repo's only
+live instances; they are 48 px, so nothing is wrong today — but the RULE was wrong, which is exactly
+the shape that ships. Pinned by `demos/forest-camp/tests/tapTargets.test.ts`, which asserts all five
+are counted as targets, that none of them emits a zone, and that none of them authors one.
+
+Found while building #1024's shared resolver, not by a failure. It is listed separately rather than
+folded into case 1 because the remedy differs: the other five leave you looking for a different
+field, this one leaves you looking for a different LEVER.
 
 #### The sibling rule — a zone LOSES to real content (#977, 2026-09-09)
 
@@ -1473,6 +1506,143 @@ fail *closed* on the element now receiving the click.
 ⚠️ **A tap zone is authored data, not a code constant** — it is exactly the "could the owner
 plausibly want this different after seeing it on screen?" case, so it lives on the trait and is set
 in the scene. Court authors `48` (clearing both platform minimums with one number) on all 16.
+
+#### SIZE is gateable from authored data; CLEARANCE is not (#963, #1024)
+
+**Two different defects live in this section, and only one of them can be a `verify` gate.** Getting
+this backwards produces either a guard that cannot fail or one that pushes authors to "fix"
+non-problems, and both have already happened here.
+
+| | the defect | can a scene-JSON gate decide it? |
+|---|---|---|
+| **Size** | a tappable's own box is under the 44 pt floor | **Yes** — the axis resolves from the authored unit and the viewport |
+| **Clearance** | adequately-sized tappables sit too close together | **No, in general** — see below |
+
+**Why clearance is not generally derivable.** `games/court/tests/tapZoneClearance.test.ts` records a
+first cut that tried to answer it for a whole scene from the JSON, and **it was wrong three times out
+of five**: two false positives from paint order (rows later in tree order paint above the zone and
+win the press), and one right-control-wrong-reason where `flex-wrap` plus a `UIAnchor` took the
+control out of the flow entirely. A sound general version would have to implement flex-wrap,
+absolute positioning, stacking contexts and paint order — a layout engine. **The general clearance
+check is the live `document.elementsFromPoint` probe**, which needs a running editor and therefore
+cannot be a `verify` gate.
+
+⚠️ **That probe has its own trap, and it belongs to the probe and not to the model** — a
+`borderRadius: 999` control's hit shape is the CIRCLE, so a tap in its bounding box's empty corner
+correctly reaches whatever is beneath, and Court's first pass read that as the veto failing. Model a
+round control as a circle or the probe lies to you.
+
+⚠️ **The narrow exceptions — there are TWO, and they are different shapes.** Clearance is pure
+arithmetic when the layout has no flexbox left to model, which happens in either direction:
+
+- **The FLOW carve-out** — plain non-wrapping siblings in a plain column/row container, no anchor
+  and no `z-index` override, so clearance is just `gap + margin`. This is Court's
+  (`games/court/tests/tapZoneClearance.test.ts`, its two pager rows).
+- **The ANCHORED carve-out** — every child taken out of the flow entirely by a `UIAnchor`. This is
+  forest-camp's (`demos/forest-camp/tests/dpadClearance.test.ts`, the D-pad).
+
+The anchored one needs **three** conditions, and a guard leaning on it asserts all three rather than
+assuming any:
+
+1. every child is **absolutely positioned out of the parent's flow** (it carries a `UIAnchor`);
+2. the parent's size is **authored in explicit `px`**, and its **`borderWidth` is 0** — every UI
+   node is `box-sizing: border-box`, so a bordered parent's children resolve against a containing
+   block narrower than its authored size;
+3. every child is **`safeArea: false`**.
+
+⚠️ **(3) is the one that looks like a detail and is not.** `UIAnchor.safeArea` **defaults to TRUE**,
+and for a POINT anchor `resolveAnchorRect` applies the device inset to the child — while the CSS
+emitter's `var(--ui-sa-*)` INHERITS, so a child nested inside a small box is inset by the **full
+device inset relative to that box**, not relative to the screen. forest-camp's D-pad shipped that
+way: four 48 px pads in a 196 px container, 26 px apart at zero insets and **overlapping by 2 px on
+an iPhone Air** (68/34), which is the handset the bug was reported from. The inset belongs to the
+one box that is actually anchored to the screen edge — the container — and the children opt out.
+
+forest-camp's guard additionally proves the result is **inset-independent** (the same clearance at
+zero and at non-zero insets), which is the check that catches (3) regressing regardless of how it
+regresses — a boolean assertion alone would not catch a change in the engine's own inset handling.
+
+⚠️ **Such a guard must call `resolveAnchorRect` (exported from `@modoki/engine/runtime`), not
+re-derive the anchor/pivot/offset arithmetic beside it.** Re-deriving it is how the model above went
+wrong, and a game or demo can only reach engine code through the `@modoki/engine` specifier — which
+is why that helper is exported at all.
+
+**The fix for a clearance defect is geometry, not `minTapSize`.** The ceiling above says why: between
+two tappable neighbours a zone expands into the GAP and no further, so on forest-camp's D-pad — 2 px
+of clearance — authoring `minTapSize` would have bought ~2 px per side and changed nothing. It was
+fixed by shrinking the buttons 64 -> 48 px inside their unchanged 196 px container **and** opting
+them out of `safeArea`, taking clearance to 26 px on every screen while staying over the floor.
+
+⚠️ **Never answer a clearance complaint by shrinking a control below the floor** — that trades this
+section's second defect for its first. A clearance guard should assert the size floor alongside the
+gap for exactly that reason.
+
+#### The engine owns the SIZE gate now — `@modoki/engine/testing/tapTargetFloor` (#1024)
+
+Three passes found under-floor controls by hand — #948 and #969 in Court, #1017 in wordweave — each
+scoped to one game, each starting from zero, each writing its own enumeration. **The instances were
+never the problem; the absence of a shared gate was.** So the resolver is engine-owned and every
+project in scope keeps a short test that supplies only DATA:
+
+```ts
+describeTapTargetFloor({
+  label: 'my-game',
+  sceneDir: join(ASSETS, 'scenes'),
+  prefabDir: join(ASSETS, 'prefabs'),
+  underFloor: [],       // MEASURED under 44 pt — each name needs a reason
+  unresolvable: [],     // an auto/`%` axis nothing here can size
+  expectAtLeast: 0,     // anti-vacuity
+});
+```
+
+⚠️ **It lives in the PACKAGE, not in `engine/tests/`.** A demo is published as a standalone snapshot
+(`scripts/publish-demo.sh`) carrying its own `tests/` and nothing else from the monorepo, so
+`@modoki/engine` is the only specifier it can name — the same constraint that put `resolveAnchorRect`
+on the runtime barrel.
+
+**The two lists are different questions, and merging them was measured wrong.** `underFloor` means an
+authored `px`/`vw`/`vh`/`vmin` axis really does resolve below 44 pt; `unresolvable` means the control
+has a `content`, `stretched` or `%` axis, so the scene file does not say how big it is. Court's
+`TutorialSkipNoticeConfirm` reads `62% x content` and measures **133 x 46 pt** live; wordweave's
+`DictionaryPrev` read `content x content` and measured **16.90 x 40.21 pt**. Same authored shape,
+opposite verdicts — the only honest answer for that shape is *measure it live*.
+
+Both lists are asserted as **set equality in both directions**, so the suite reds on a new
+under-floor control AND when a listed one is finally fixed, which must shrink the list deliberately
+rather than leave a stale constant behind.
+
+What the resolver owns, because each is an engine fact rather than per-game taste: the scene **and
+prefab** corpus walk; the four-outcome axis model (`pt` / `content` / `stretched` / `parent` —
+collapsing any two of them was a real defect twice in #1017); the six inert-`minTapSize` cases above;
+the population predicate; and the device matrix, derived from `DEVICE_PRESETS` rather than
+transcribed. What stays per-game is the exception list, because only the owner knows why a control is
+allowed under the floor.
+
+**Scope is the SHIPPING projects plus `demos/**`** (owner, 2026-09-10), plus `engine/templates/starter`
+so a scaffolded project is born covered. The fixtures and testbeds are exempt: enforcing 44 pt on a
+debug slider means inventing a value for a UI nobody ships.
+
+⚠️ **A project's own guard cannot see everything, and one of its lists says so out loud.** The
+resolver reads authored data only — it never resolves a parent chain to a real size, and it knows
+nothing about where a 2D board lands. `unresolvable` is that blind spot, enumerated.
+
+#### The population is `UIAction` **and** `TouchControl` (#963)
+
+A sweep for tappables that keys on `UIAction` alone is **blind to every on-screen movement control**.
+`TouchControl` (`runtime/traits/TouchControl.ts`) is a separate trait for a control held as a LEVEL
+rather than clicked — a d-pad arrow, a hold-to-move button — and its own docblock says *"Do not reach
+for `UIAction` for this"*, because `UIAction`'s vocabulary is discrete events fired on release. So no
+`TouchControl` entity carries a `UIAction` in any scene today — nothing in the code FORBIDS both
+traits on one entity (`UINode` refuses `TouchControl` only on `input`/`range` and alongside
+`UIToggle`), so this is a fact about the corpus, not an invariant to rely on. `demos/forest-camp`'s
+entire D-pad was counted by nothing until #963. The 44 pt floor applies to both populations
+identically.
+
+**Enforced since #1024** — the shared resolver's `isTapTarget` takes either, so no project can
+inherit the blind spot by writing its own sweep. ⚠️ **Closing it changed no COUNT**: forest-camp's
+five controls are 48 px and clear the floor, so the rule was wrong while every number was right,
+which is the shape that ships. It also carries a consequence the `UIAction` half does not — see
+§ "Case 6 — a `TouchControl` gets no expander at all, and nothing warns".
 
 ---
 

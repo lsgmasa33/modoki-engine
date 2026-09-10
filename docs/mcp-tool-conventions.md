@@ -665,6 +665,80 @@ site must apply `ctx.htmlFallthrough`/`ctx.noSuchRoute` itself.
   compares against the same render function the generator writes with; comparing against a second
   implementation of the table would reintroduce the drift it exists to prevent (§9).
 
+### 10a. The size budget is a gate; the ledger beside it is data (#894)
+
+`DEFINITION_BYTES` in `engine/tests/tools/mcpRegistry.test.ts` pins the total byte size of the whole
+advertised surface — every description plus every schema, property NAMES included — with a
+4,000-byte headroom. **It is a real product cost, not bookkeeping:** `engine/electron/connectClaude.ts`
+writes this server into the user's `.mcp.json`, so everyone who connects Claude Code to a packaged
+editor pays those ~153 KB in their context window every session, before asking for anything. Growth
+should be spent deliberately, and the pin is what forces someone to decide.
+
+**What the pin cannot do is say whose bytes they were.** It is one scalar, and six clones add tool
+prose concurrently: each stays inside the headroom alone, so each is green, and whoever crosses first
+inherits the whole accumulated gap. `61fccae48` is the pure case — a re-pin after a four-branch
+merge in which no tool changed at all.
+
+So attribution lives beside it as **data that never votes**:
+
+| | |
+|---|---|
+| written by | `npm --prefix engine/tools/modoki-mcp run gen:ledger`, **unconditionally** from `/close-out` § 6 |
+| lands in | `engine/tools/modoki-mcp/ledger/<branch>.csv`, committed |
+| grain | one row per tool whose size CHANGED — a quiet run appends nothing |
+| columns | `date, clone, tool, delta_bytes, tool_bytes_after, surface_bytes_after, sha` |
+| query | `sqlite3 :memory: '.import --csv engine/tools/modoki-mcp/ledger/work-ai3.csv l' '…'` |
+
+Three things about it are load-bearing:
+
+- **It changes no verdict.** `verify` and the free 3-OS public CI compute the same red/green from the
+  same committed pin as before. An earlier sketch put the counter in a machine-local file under
+  `~/.modoki/` and was rejected for making the GATE non-reproducible — CI has no such file, a fresh
+  clone has no such file, and the Windows clone cannot share the Mac's.
+- **One CSV per clone, never one shared file.** Six writers appending to one file conflict on every
+  merge; six files never do, and the sum is a glob.
+- ⚠️ **Run it unconditionally, not "when you touched the surface".** Skipping the step does not skip
+  the bytes, it defers them onto whoever runs it next: a clone that merges `origin/main` and skips,
+  then later edits one description, records the whole merged delta against its own sha that day.
+  A quiet run appends nothing.
+- ⚠️ **It is keyed by BRANCH, not by clone** — the filename comes from `git branch --show-current`.
+  The two are the same thing today only because each clone stays on its own long-lived branch
+  (CLAUDE.md § Clones). Check out a `release_*` branch in a worker and you get a second, separately
+  seeded CSV; run it on the hub and you seed `main.csv`, whose rows are the union everyone else's
+  exist to disaggregate. Not reachable in the normal flow, and left as-is rather than guessed at.
+- ⚠️ **A row is not authorship.** It says *this tool measured N bytes on this clone on this date,
+  having moved D since this clone last looked*. A worker merges `origin/main` before pushing, so an
+  observed delta may be work that arrived from another clone entirely. `sha` is what turns an
+  interesting row into an answer; the ledger's job is to make you read four rows instead of an
+  anonymous 4 KB.
+
+⚠️ **The measurement is shared, and must stay shared.**
+`engine/tools/modoki-mcp/surfaceBytes.ts` owns the walk; both the pin test and the ledger script call
+it. **Do not build a second walker on `dump-surface.mjs`** — that one is per-tool too, but its
+`sumDescriptionBytes` deliberately EXCLUDES property names because it prices documentation prose,
+where the budget prices the whole advertised surface. Rows built on it would look authoritative and
+quietly fail to sum to the number they exist to explain. Same reasoning as the catalog generator
+sharing `renderCatalog()` with its guard (§9).
+
+⚠️ **What the guard test can and cannot do — measured, and previously documented wrongly in BOTH
+directions.** `mcpRegistry.test.ts`'s *"the ledger prices the surface identically to the gate, tool
+for tool"* **does** catch a divergent enumeration *and* a divergent pricing function: a ledger priced
+1 B/tool differently, with identical tool names, is red there while `DEFINITION_BYTES` stays green.
+That makes it the only guard against the `dump-surface.mjs` trap above, so its per-tool loop is
+load-bearing and must not be trimmed as redundant. What it **cannot** catch is a walk that is wrong
+the same way on both sides — both call one `toolBytes` in one process — so inflating `toolBytes` by
+100 B/tool reddens the pin and leaves it green. Walk correctness belongs to the `sumSchemaBytes walk`
+block (dropping `key.length` from its `properties` branch reddens 6 of those cases; the
+`patternProperties` branch is a separate occurrence and reddens 1).
+
+There is **no zod v3/v4 skew to worry about**, and an earlier draft of this section wrongly claimed
+there was one held in check by that test. `surfaceBytes.ts` lives **inside**
+`engine/tools/modoki-mcp/`, so a bare `zod` specifier resolves to that package's nested v3 under Vite
+and Node alike — a structural guarantee from `node_modules` nesting, not a tested one. Measured both
+ways at **105 tools / 152,960 B**. (The hoisted-v4 hazard the import comment in `mcpRegistry.test.ts`
+warns about is real for files under `engine/tests/**`, which is why those import zod by explicit
+path — it just does not reach a file inside the package.)
+
 ## 11. Writing a description
 
 The description is the tool's contract with the agent — it is read far more often than this file.

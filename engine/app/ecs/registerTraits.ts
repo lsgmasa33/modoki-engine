@@ -1460,7 +1460,7 @@ export function registerAllTraits() {
       bottomUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'] },
       pivotX: { type: 'number', step: 0.1, tooltip: 'Horizontal pivot (0 = left edge, 0.5 = center, 1 = right edge).\nShifts which point of this element sits at the anchor position.' },
       pivotY: { type: 'number', step: 0.1, tooltip: 'Vertical pivot (0 = top edge, 0.5 = center, 1 = bottom edge).\nShifts which point of this element sits at the anchor position.' },
-      safeArea: { type: 'boolean', tooltip: 'Add padding for device notch, Dynamic Island, and home indicator bar' },
+      safeArea: { type: 'boolean', tooltip: 'Inset this element away from the device notch, Dynamic Island and home indicator.\nOn a POINT anchor this OFFSETS the element (it is not padding).\n\u26a0\ufe0f Set it on the outermost anchored box only \u2014 a nested child takes the FULL device inset relative to its\nparent, not to the screen, so four pads inside one container each get pushed inward.' },
     },
   });
 }

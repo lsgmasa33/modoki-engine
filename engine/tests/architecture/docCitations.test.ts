@@ -435,14 +435,45 @@ function bareNameMentions(
   lines: string[], bases: ReadonlySet<string>,
 ): Array<{ line: number; base: string }> {
   const out: Array<{ line: number; base: string }> = [];
-  const matchers = [...bases].map((base) => ({
-    base, re: new RegExp(`(?:^|[^A-Za-z0-9._/-])${escapeRegExp(base)}`, 'g'),
-  }));
+  // ⚠️ Required, not defensive: an empty `bases` would build the alternation `(?:^|[^…])()`,
+  // whose empty branch matches at nearly every position — a guard that reports the whole repo.
+  // The matcher-per-base loop this replaced degenerated to zero matchers and returned [].
+  if (bases.size === 0) return out;
+  // ONE alternation, not one regex per base. This loop runs over every line of the whole repo
+  // corpus, so its per-line cost is multiplied by ~950k lines: measured unloaded on this clone
+  // (#1046), 27 separate matchers cost 2,790 ms against 333 ms for the same 27 joined —
+  // 8.4x, and it was ~80% of the bare-name scan. The shape to watch is O(lines × names): it
+  // grows every time `RETIRED_DOCS_NAMED_ON_PURPOSE` does, which is why one pass matters.
+  //
+  // ⚠️ LONGEST-FIRST, because JS alternation is leftmost-FIRST, not longest-match. The case that
+  // needs it is narrower than it first looks: a base that is a TAIL of another (`a.md` inside
+  // `xa.md`) is already impossible, because the `[^A-Za-z0-9._/-]` prefix rejects a match whose
+  // preceding character is a word char, `.`, `/` or `-`. What survives is a base that is a strict
+  // PREFIX of another — `plan.md` and `plan.md.old` both start at the same position — where
+  // leftmost-first would report the SHORTER one and lose the specific retired doc.
+  //
+  // ⚠️ This is NOT byte-equivalent to the matcher-per-base loop for such a pair, and the
+  // difference is deliberate: scanning each base independently reported BOTH `plan.md` and
+  // `plan.md.old` for one mention of `plan.md.old`, which is a false hit on `plan.md` — a
+  // different filename. Longest-first reports only the specific one. `noPrefixPairs` below pins
+  // that no such pair exists in the real list at all, so the corpus result is unchanged today.
+  const order = new Map([...bases].map((base, i) => [base, i] as const));
+  const alternation = [...bases]
+    .sort((a, b) => b.length - a.length)
+    .map(escapeRegExp)
+    .join('|');
+  const re = new RegExp(`(?:^|[^A-Za-z0-9._/-])(${alternation})`, 'g');
+  const hits: Array<{ base: string; at: number }> = [];
   lines.forEach((line, i) => {
-    for (const { base, re } of matchers) {
-      re.lastIndex = 0;
-      for (const _m of line.matchAll(re)) out.push({ line: i + 1, base });
-    }
+    re.lastIndex = 0;
+    hits.length = 0;
+    for (const m of line.matchAll(re)) hits.push({ base: m[1], at: m.index ?? 0 });
+    if (hits.length === 0) return;
+    // Emitted in the per-base grouping the matcher-per-base loop produced (base order, then
+    // position within the line) so this stays a PURE speed change. `scanBareNameCitations` keys
+    // a Map by base and cannot see the difference, but the fixture asserts exact order.
+    hits.sort((x, y) => (order.get(x.base)! - order.get(y.base)!) || x.at - y.at);
+    for (const h of hits) out.push({ line: i + 1, base: h.base });
   });
   return out;
 }
@@ -496,6 +527,25 @@ function ambiguousRetiredBasenames(): Set<string> {
   const live = new Set(repoFiles().map((f) => path.basename(f)));
   ambiguousRetiredBasenamesCache = new Set([...retired].filter((b) => live.has(b)));
   return ambiguousRetiredBasenamesCache;
+}
+
+/** `scanDocPathCitations` with the retirement allowlist EMPTIED — the "what would rule 1 flag if
+ *  nothing were exempt" view that both #578 sweeps below read.
+ *
+ *  Memoized because those two call sites passed an identical `new Set()` and each paid a full
+ *  corpus re-read for the same answer (~700 ms apiece, measured #1046). Deliberately a separate
+ *  zero-arg helper rather than a cache inside `scanDocPathCitations`: that function's OTHER caller
+ *  passes the real allowlist, and a memo keyed on the wrong thing would hand one of them the
+ *  other's answer — the allowlist is what it filters by, so the two results are genuinely
+ *  different maps.
+ *
+ *  ⚠️ Freezing this half narrows the skew its bare-name sibling's docblock records: both scans are
+ *  now snapshots, but they are taken at different moments and `scanDocPathCitations`'s allowlisted
+ *  call still re-walks. No test here writes into the repo tree. */
+let unfilteredDocPathCitationsCache: Map<string, Set<string>> | undefined;
+function scanDocPathCitationsUnfiltered(): Map<string, Set<string>> {
+  unfilteredDocPathCitationsCache ??= scanDocPathCitations(new Set());
+  return unfilteredDocPathCitationsCache;
 }
 
 /** Rule 1's bare-name companion (#621): every retired basename mentioned WITHOUT its `docs/`
@@ -666,6 +716,76 @@ describe('cited doc paths resolve (#194)', () => {
     ]);
   });
 
+  it('bareNameMentions: a base that PREFIXES another does not shadow it (#1046)', () => {
+    // The one shape the single-alternation rewrite can get wrong. A base that is a TAIL of another
+    // is already safe (`sync.md` cannot match inside `group-sync.md` — the preceding `-` is in the
+    // excluded class), so the fixture has to use a strict PREFIX pair, where both candidates start
+    // at the SAME position and leftmost-first picks whichever the alternation lists first.
+    //
+    // ⚠️ The first version of this test used `sync.md`/`group-sync.md` and was GREEN with the sort
+    // deleted — it asserted a case the boundary rule already handled. Kept as a scar: a fixture for
+    // an ordering hazard has to exercise an actual ordering ambiguity.
+    //
+    // MUTATION CHECK: drop `.sort((a, b) => b.length - a.length)` in `bareNameMentions` and line 2
+    // reports `plan.md` instead of `plan.md.old` — red here, and nowhere else, because
+    // `noPrefixPairs` proves the real list has no such pair.
+    const bases = new Set(['plan.md', 'plan.md.old']);
+    const doc = [
+      'see plan.md here',            // 1: only the short base is present
+      'see plan.md.old here',        // 2: both start at the same column; the LONGER must win
+    ];
+    expect(bareNameMentions(doc, bases)).toEqual([
+      { line: 1, base: 'plan.md' },
+      { line: 2, base: 'plan.md.old' },
+    ]);
+  });
+
+  it('no retired-doc basename is a strict PREFIX of another — the alternation cannot shadow (#1046)', () => {
+    // The precondition that makes the single-alternation scan equivalent to the matcher-per-base
+    // loop on the REAL corpus. Longest-first ordering makes a prefix pair resolve to the specific
+    // doc rather than the general one, but it still reports ONE where the old loop reported two —
+    // so rather than rely on that, pin that the ambiguity does not exist in the list at all.
+    // Sibling of the existing "no two retired-doc entries share a basename" pin, one step weaker.
+    const bases = RETIRED_DOCS_NAMED_ON_PURPOSE.map((e) => retiredBasename(e.cited));
+    const shadowed = bases.flatMap(
+      (a) => bases.filter((b) => a !== b && b.startsWith(a)).map((b) => `${a} prefixes ${b}`),
+    );
+    expect(shadowed, 'a prefix pair makes the bare-name alternation order-dependent').toEqual([]);
+  });
+
+  it('bareNameMentions: two different bases on one line are both reported, in base order (#1046)', () => {
+    // The multi-base shape the #621 fixture never exercised (it uses a single base), and the one
+    // the rewrite could silently reorder or drop: one alternation pass finds matches in TEXT
+    // order, where the matcher-per-base loop grouped them by BASE.
+    //
+    // MUTATION CHECK: delete the `hits.sort(...)` and this goes red (line 1 reports b-doc before
+    // a-doc); replace `matchAll` with a single `exec` and it goes red for a dropped second hit.
+    const bases = new Set(['a-doc.md', 'b-doc.md']);
+    const doc = [
+      'cites b-doc.md and a-doc.md together',  // 1: text order b,a — base order must be a,b
+      'a-doc.md twice: a-doc.md',              // 2: same base twice, both positions kept
+    ];
+    expect(bareNameMentions(doc, bases)).toEqual([
+      { line: 1, base: 'a-doc.md' },
+      { line: 1, base: 'b-doc.md' },
+      { line: 2, base: 'a-doc.md' },
+      { line: 2, base: 'a-doc.md' },
+    ]);
+  });
+
+  it('bareNameMentions: no bases means no mentions, not every line (#1046)', () => {
+    // `ambiguousRetiredBasenames()` can in principle exclude every base. The matcher-per-base loop
+    // degenerated harmlessly to zero matchers; an alternation built from an empty list is
+    // `(?:^|[^…])()`, whose empty branch matches at nearly every position — so this guard would
+    // report the entire repo as citing "".
+    //
+    // MUTATION CHECK: remove the `if (bases.size === 0) return out;` early return and this test
+    // goes red with 5 phantom mentions of the empty string: 3 on line 1 (at offsets 0, 8 and 11 —
+    // NOT every position, because the `(?:^|[^A-Za-z0-9._/-])` prefix consumes a character between
+    // matches), and 1 each on lines 2 and 3.
+    expect(bareNameMentions(['anything at all', '', 'x'], new Set())).toEqual([]);
+  });
+
   it('the bare-name scan\'s ambiguity exclusion is exactly the known collision (#621)', (ctx) => {
     // docs/plans/ is stripped from the OSS snapshot, so docs/plans/profiler.md — the live file
     // that makes `profiler.md` ambiguous — is absent there, and this pin would fail for a reason
@@ -768,7 +888,7 @@ describe('cited doc paths resolve (#194)', () => {
       ctx.skip();
       return;
     }
-    const wouldFlag = scanDocPathCitations(new Set());
+    const wouldFlag = scanDocPathCitationsUnfiltered();
     const bareFlag = scanBareNameCitations();
     const inert = RETIRED_DOCS_NAMED_ON_PURPOSE
       .filter((e) => sitesNamingEntry(wouldFlag, bareFlag, e.cited).size === 0)
@@ -831,7 +951,7 @@ describe('cited doc paths resolve (#194)', () => {
     // `verify:publish` names). Ungated, every one of those would report there as "no longer cites
     // it" — the same trap the absorbedByPaths test fell into. No count is quoted on purpose: three
     // rounds of review on this file have now found a stale one, and the argument never needed it.
-    const wouldFlag = scanDocPathCitations(new Set());
+    const wouldFlag = scanDocPathCitationsUnfiltered();
     const bareFlag = scanBareNameCitations();
     const drift: string[] = [];
     for (const e of RETIRED_DOCS_NAMED_ON_PURPOSE) {

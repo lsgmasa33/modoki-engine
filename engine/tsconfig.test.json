@@ -44,5 +44,11 @@
   // `app/types` carries the ambient declarations for the Vite `define` flags
   // (__MODOKI_EDITOR__, __MODOKI_MODULE_*) and the `virtual:modoki-*` modules. Tests reach
   // app + engine source transitively, so without it every flag-gated file errors TS2304.
-  "include": ["tests", "app/types"]
+  //
+  // `templates/starter/tests` (#1024): the scaffold template ships a tap-target floor guard so a
+  // new project is born covered, and `vite.config.ts` RUNS it. The rest of the template stays out
+  // of every TS program on purpose (it carries placeholder tokens), but a file the gate executes
+  // and no program typechecks is the one file in the repo where a changed helper signature would
+  // surface at runtime instead of at `npm run typecheck`. Only `tests/` is added — not `runtime/`.
+  "include": ["tests", "app/types", "templates/starter/tests"]
 }

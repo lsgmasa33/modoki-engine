@@ -205,6 +205,24 @@ export const DEVICE_PRESETS: DevicePreset[] = [
 /** Category display order for the picker. */
 export const DEVICE_CATEGORY_ORDER: DeviceCategory[] = ['General', 'Apple', 'Samsung', 'Google', 'Android', 'Aspect'];
 
+/**
+ * The categories whose presets describe a real shipping handheld — the filter every guard that
+ * sweeps devices needs, in ONE place (#1024).
+ *
+ * ⚠️ **An ALLOW-list, deliberately.** A deny-list (`category !== 'Aspect' && !== 'General'`) excludes
+ * the abstract preview presets by NAME, so a category added here later would silently enter a game's
+ * device sweep on a geometry no device has — measured in Court: the `1:1` 512x512 preset gives a
+ * narration band 95.46 CSS px against a need of 122. A new category must default to EXCLUDED, which
+ * means the guards that consume this pin the CATEGORY SET rather than the membership test
+ * (`games/court/tests/narrationRoom.test.ts` does; the tap-target floor's own suite asserts the
+ * matrix it produces).
+ *
+ * Three guards had their own copy of this list before it moved here — Court's narration-room sweep,
+ * Court's device matrix, and the engine's tap-target floor resolver — which is the shadowing this
+ * repo's single-source-of-truth rule exists to stop.
+ */
+export const SHIPPING_DEVICE_CATEGORIES: ReadonlyArray<DeviceCategory> = ['Apple', 'Samsung', 'Google', 'Android'];
+
 export type Orientation = 'portrait' | 'landscape';
 
 /** Effective LOGICAL size for a preset under an orientation (landscape swaps w/h). */

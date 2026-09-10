@@ -4128,6 +4128,39 @@ three's incrementing material id, which differs between two runs of the same bui
     node builder reported `env none` for the stand-in). The premium belongs to the first material
     carrying the scene's REAL environment and shadow subgraphs, which do not exist before the
     assets load. It can be moved a few hundred ms earlier within the same boot, not off it.
+  - **A cheap SYNTHETIC environment primes — and costs ~9x what it saves (2026-09-10, #324a).**
+    The rejection above was cited for more than it proved: its own parenthesis says the node builder
+    reported `env none` for the stand-in, so it measured *"a build with no environment does not
+    prime"* — already known, and the whole reason F4 mirrors the real env. **Whether an early build
+    carrying a WORKING environment primes had never been tested.** It has now.
+
+    A 4×2 `DataTexture` → `getEnvPMREMTexture` → one lit `MeshStandardMaterial` compiled at
+    `createRenderer` time, `demos/postfx-demo`, URL-gated so both arms run from ONE dev server
+    (three paired runs, first run discarded as vite warm-up):
+
+    | | control | synthetic prime |
+    |---|---|---|
+    | F4 build (pre-swap, ctx 0) | 8.5 / 8.2 / 7.9 → **8.20 ms** | 5.5 / 5.4 / 5.6 → **5.50 ms** |
+    | all probe-visible builds | 172.1 ms | 163.3 ms |
+    | **the prime's own cost** | — | **51.8 ms + 27.7 ms = 79.5 ms** |
+
+    **It DOES prime** — F4 −33% with no overlap between arms, and the live compile's first build
+    drops too (10.8 → 8.9 ms). That is genuinely new: the premium is partly per-node-TYPE, not
+    purely per-texture. **And it is still dead**, for a reason nobody had written down: **making a
+    working environment is itself GPU work with its own shader compiles.** PMREM generation costs
+    ~52 ms on the first renderer to save ~9 ms of node-building — a **net ~70 ms LOSS**, before
+    considering that it runs on every renderer (two here, so 79.5 ms total).
+
+    ⚠️ **Do not re-propose "prime it earlier / cheaper" in any form.** The line is now closed from
+    both ends: a stand-in with no working environment primes NOTHING, and one with a working
+    environment costs more than the premium it absorbs. What remains is upstream (below).
+
+    ⚠️ **Instrument note for whoever measures this next:** `nodeprobe.mjs` **cannot see a build that
+    happens inside `createRenderer`** — its `getForRender` hook is installed after that, and the
+    prime's own compile appears nowhere in the log. The intended falsifier ("does the probe report a
+    real `env` on the prime build, or `env none`?") is therefore NOT directly observable, and the
+    reading above rests on the indirect evidence: an `env none` build is recorded as priming nothing,
+    and this one measurably primes.
   - **Skipping the F4 build's env/light mirrors under a post-FX stack does not help — the premium
     transfers across render contexts.** The idea, and it is a tempting one: #324b measured the
     pre-swap and post-swap compiles as sharing **zero** node-builder cache entries (different

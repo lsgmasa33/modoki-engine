@@ -52,7 +52,12 @@ export interface AnchorData {
  *  the element the browser actually drew. */
 export interface SafeAreaPx { top: number; right: number; bottom: number; left: number; }
 
-export const ZERO_INSETS: SafeAreaPx = { top: 0, right: 0, bottom: 0, left: 0 };
+/** Frozen because it is `resolveAnchorRect`'s DEFAULT ARGUMENT, so every call that omits insets
+ *  shares this one object by reference — a single `ZERO_INSETS.top = 68` anywhere would silently
+ *  inset every such call process-wide. Same reason `STRETCH_X`/`STRETCH_Y` below are `readonly`
+ *  and `devicePresets.NO_INSETS` is frozen; it matters more here since #963 put this on the
+ *  public barrel, where a game or demo can reach it. */
+export const ZERO_INSETS: Readonly<SafeAreaPx> = Object.freeze({ top: 0, right: 0, bottom: 0, left: 0 });
 
 /** Resolve a length (value + unit) to LOGICAL pixels. THE shared resolver for every
  *  pixel-space path (anchor offsets, Canvas2D sizing, SceneView).
@@ -88,7 +93,7 @@ export function resolveAnchorRect(
   w: number, h: number,
   vpW: number, vpH: number,
   anchor: AnchorData,
-  insets: SafeAreaPx = ZERO_INSETS,
+  insets: Readonly<SafeAreaPx> = ZERO_INSETS,
 ): { x: number; y: number; w: number; h: number } {
   let x = 0, y = 0, rw = w, rh = h;
 

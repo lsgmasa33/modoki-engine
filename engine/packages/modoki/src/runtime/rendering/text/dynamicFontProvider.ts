@@ -408,7 +408,13 @@ export class DynamicFontProvider implements FontProvider {
         for (const cp of batch) this.requested.delete(cp);
         // #635: the un-stick above is a promise this batch gets ANOTHER lap, but for STATIC
         // text (a label whose string never changes — "TAP TO START") no lap ever arrives on
-        // its own. Both production `ensureGlyphs` call sites are gated on a layout hash whose
+        // its own. ⚠️ There are THREE production `ensureGlyphs` call sites since #1038, not two:
+        // `measureText2D` added one, and unlike the two renderers it is NOT gated on a layout hash
+        // — a caller measuring the same string every frame calls through every frame. That is
+        // bounded and cheap (a resident-glyph `ensureGlyphs` is N set lookups plus an LRU touch,
+        // and the whole measure costs ~0.84 us), and it makes the static-label case STRICTLY
+        // better here rather than worse: an ungated caller supplies exactly the extra lap this
+        // comment says never arrives. The two RENDERER call sites are gated on a layout hash whose
         // only provider-controlled inputs (`atlasVersion`, `markTextDirty()`) move ONLY on the
         // success path below (~:496-497) — a failed flush never touches either, so a static
         // label's hash never changes and `ensureGlyphs` is never called again for it. Text

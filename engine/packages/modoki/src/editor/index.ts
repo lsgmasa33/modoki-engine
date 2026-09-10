@@ -28,7 +28,7 @@ export { enterPlay, stopPlay, pausePlay, resetPlayMode } from './scene/playMode'
 // `modoki_game_view_devices` (#367) — the catalog is the single source of truth for what screens
 // exist, so an op that hardcoded a table would go stale on the next device added.
 export {
-  DEVICE_PRESETS, DEVICE_CATEGORY_ORDER, FREE_PRESET, NO_SAFE_AREA, NO_INSETS,
+  DEVICE_PRESETS, DEVICE_CATEGORY_ORDER, SHIPPING_DEVICE_CATEGORIES, FREE_PRESET, NO_SAFE_AREA, NO_INSETS,
   resolveLogicalSize, resolvePhysicalSize, resolveSafeArea, safeAreaCssVars, presetDpr, presetLabel,
   filterDevices, findPresetByName, makeCustomPreset, validateCustomSize, describeDeviceSelection,
   CUSTOM_PRESET_NAME, CUSTOM_SIZE_MIN, CUSTOM_SIZE_MAX, CUSTOM_DPR_MIN, CUSTOM_DPR_MAX,

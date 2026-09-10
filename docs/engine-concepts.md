@@ -368,6 +368,76 @@ manifest (`registerSystems` + `registerManagers` + trait metadata).
 
 ---
 
+## Writing to an authored field you must also READ as authored (#1042)
+
+**The shape:** a system computes a value into the same trait field a human authored — a bar's
+`width`, a visual's scale, a config's `levelId` — and something later needs the value the *author*
+wrote. After the first write, a naive re-read returns the system's own previous output. The field
+is now two things at once, and nothing in the type system says so.
+
+⚠️ **It usually ships LATENT, in the way that hides it.** Of the four instances #1042 found with no
+recovery at all, **two** had a hardcoded value that *coincided* with the authored one — a puck scale
+of `1`, a gauge width of `220` — so nothing in the shipped data could distinguish "reads the authored
+value" from "ignores it". A third (court's `levelId`) only made a doc comment false. The fourth was
+**not** latent: `games/llm-test`'s bar was visibly wrong and nobody had measured it. Corollary for
+testing, which holds either way: **a test for this class must author a value that DIFFERS from the
+code's**; a test using the shipped values cannot fail.
+
+### The one question that picks the fix: where did the entity come from?
+
+|  | authored value still available? | reach for |
+|---|---|---|
+| **Instantiated from a PREFAB** | yes — the prefab doc is in the cache | read the prefab (`cachedPrefab`), or snapshot the instance's value at spawn |
+| **Authored in a SCENE** | no — nothing retains the loaded scene document at runtime | snapshot at first read, before anything writes |
+
+That asymmetry is why there is no single `authoredValue(entity, Trait, field)` primitive, and adding
+one was **declined** (owner, 2026-09-10): for a scene-authored entity it is not a helper but a change
+to scene loading (retaining every loaded document in memory), and the cheap cases already have an
+answer.
+
+### Four strategies, cheapest first — prefer the ones that delete the problem
+
+1. **Express the runtime value in a unit that needs no authored one.** A progress bar written as
+   `progress * 100` with `widthUnit: '%'` never has to know its track's width. This is the only row
+   that removes the dependency rather than recovering from it — reach for it first.
+   ⚠️ Only available when the element resolves against the thing it is a fraction OF. `forest-camp`'s
+   power gauge cannot use it: the fill's parent is the HUD, not the track it fills.
+2. **Use a DIFFERENT FIELD for the runtime state.** `audioSystem` (`autoplay` vs `playing`) and
+   `scrollApi` (`scrollBehavior` vs `scrollToBehavior`, #409). #409's comment says why it was
+   needed: one request *"permanently overwrote an author's `smooth`, and the next save baked the
+   overwrite into the scene as authored data."*
+3. **Snapshot the authored value** — from the prefab, or from the instance on the one frame before
+   the writing starts. Multiply by it rather than replacing it, so `k = 0` returns the base exactly.
+4. **Keep a last-write baseline** (`physics2DSystem`'s `rec.lastX/lastY/lastAng`) when the value
+   changes continuously and there is no stable "authored" moment.
+
+### Two things that make it worse
+
+⚠️ **A comment naming the coupling is not a fix.** `const GAUGE_MAX_PX = 220; // matches
+PowerGaugeTrack's authored width in the scene` documented its own staleness and still drifted — the
+root `CLAUDE.md`'s single-source-of-truth table forbids exactly this. Read the value; don't describe
+where it lives.
+
+⚠️ **Check the UNIT, not just the number.** `UIElement.widthUnit` defaults to `'%'`, so a px-intended
+number written into an unauthored width field silently means a percentage. `games/llm-test` shipped
+a progress bar running ~2.4x fast this way, reading full at 42%, for exactly as long as nobody
+measured it.
+
+### The save-time half
+
+`runtime/core/ecs/authoredWrites.ts` warns when a system writes an authored entity **while the
+simulation is stopped**, which is when such a write would be baked into the scene file by a save. It
+hooks `writeTraitField` and therefore cannot see koota's `entity.set`.
+
+⚠️ **That boundary IS reachable — `entriesSystem` runs above `TRANSFORM` and `set`s the authored
+scroll view — but nothing bakes, because every field written that way is `runtimeOnly` and the
+serializer skips it.** Extending the probe was declined on that basis (owner, 2026-09-10): it would
+report writes a save already cannot persist. What would make it live is an `entity.set` on a field
+that is *not* `runtimeOnly`. Read that file's header before proposing the extension again — the
+first version of this paragraph declined it for a reason that turned out to be false.
+
+---
+
 ## Where to read more
 
 - [managers-and-systems.md](./managers-and-systems.md) — Manager/System design,

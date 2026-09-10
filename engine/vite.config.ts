@@ -677,6 +677,11 @@ export default defineConfig(({ command }) => {
       // MCP server units (result formatting, identity) — `tools/` ships to the agent,
       // not to a game, but it is still CI-gated code.
       'tests/tools/**/*.test.ts',
+      // The STARTER TEMPLATE's own tests (#1024). The template ships a tap-target floor guard so a
+      // scaffolded project is born covered, and a template test that never runs is exactly the
+      // "guard that cannot fail" shape it exists to prevent — so it runs here, against the
+      // template's own scene, before it is ever copied.
+      'templates/starter/tests/**/*.test.ts',
       // Project-owned tests (game/demo logic + @3d-test/app-services packages). Co-located
       // with the project's code so their deps resolve from its own node_modules; each glob
       // matches nothing when that root is absent (the public repo has neither).

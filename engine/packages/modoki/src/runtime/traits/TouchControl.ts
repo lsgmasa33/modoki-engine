@@ -7,12 +7,20 @@ import { trait } from 'koota';
  *
  *  The engine draws NOTHING here. A control is an ordinary `UIElement` — the game authors its
  *  art (`imageSrc`, a nine-slice sprite, a border-radius box), its size and its placement
- *  (`UIAnchor`, ideally with `safeArea: true` so a bottom-anchored pad clears the home
- *  indicator / gesture bar), exactly as it authors the rest of its HUD. This trait only says
- *  *what pressing it means*. That is the whole "other games use it with their own art"
+ *  (`UIAnchor` — see the safe-area warning below), exactly as it authors the rest of its HUD.
+ *  This trait only says *what pressing it means*. That is the whole "other games use it with
+ *  their own art"
  *  requirement, and it is also the repo's standing rule: a control's size, position and look
  *  are things the owner will plausibly want different after seeing them on screen, so they are
  *  authored data, not engine constants.
+ *
+ *  ⚠️ **`UIAnchor.safeArea` belongs on the OUTERMOST box only, and it defaults to TRUE** (#963).
+ *  On a point anchor the inset is applied to the element itself, and `var(--ui-sa-*)` INHERITS —
+ *  so a control NESTED in a small container is pushed by the full device inset *relative to that
+ *  container*, not relative to the screen. A d-pad is exactly that shape: forest-camp's four pads
+ *  sat 26 px apart at zero insets and **overlapped by 2 px on an iPhone Air**, because each one
+ *  re-applied the notch inset inside a 196 px box. Author `safeArea: false` on the children and
+ *  let the container clear the home indicator once, for all of them.
  *
  *  A **d-pad is four entities**, one per direction (or eight, with diagonals as their own
  *  buttons — nothing here assumes four). A jump button is a fifth. There is no "d-pad widget"

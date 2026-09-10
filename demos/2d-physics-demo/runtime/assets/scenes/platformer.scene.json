@@ -342,7 +342,8 @@
           "fontSize": 12,
           "fontWeight": "bold",
           "textAlign": "center",
-          "zIndex": 40
+          "zIndex": 40,
+          "minTapSize": 48
         },
         "UIAction": {
           "bindings": [
@@ -493,7 +494,8 @@
           "fontSize": 14,
           "fontWeight": "bold",
           "textColor": 660754,
-          "textAlign": "center"
+          "textAlign": "center",
+          "minTapSize": 48
         },
         "UIAction": {
           "bindings": [

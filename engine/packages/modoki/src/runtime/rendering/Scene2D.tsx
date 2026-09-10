@@ -43,6 +43,7 @@ import { getFontTexturePixi } from './text/fontTexturePixi';
 import { isPixiTextureLive, loadPixiTexture } from './pixiTextureLoad';
 import { makeMtsdfPixiShader, updateMtsdfPixiStyle, canReuseMtsdfPixiShader, updateMtsdfPixiMetrics } from './text/mtsdfPixiShader';
 import { layoutText } from './text/layoutText';
+import { textCodepoints } from './text/textCodepoints';
 import { buildTextGeometryByPage, buildTextPositionsByPage, buildTextColorsByPage, canWriteTextPositionsInPlace } from './text/textMesh';
 import type { TextQuad } from './text/layoutText';
 import { getTextDirtyVersion, onTextDirty } from './text/textDirty';
@@ -799,11 +800,6 @@ function textStyle2D(t: any): MtsdfStyle {
     shadowColor: t.shadowColor, shadowOpacity: t.shadowOpacity,
     shadowOffsetX: t.shadowOffsetX, shadowOffsetY: t.shadowOffsetY, shadowSoftness: t.shadowSoftness,
   };
-}
-function textCodepoints(text: string): number[] {
-  const out: number[] = [];
-  for (const ch of text) out.push(ch.codePointAt(0)!);
-  return out;
 }
 
 const OUTLINE_STROKE = { width: 2, color: 0x2effa6, alpha: 0.9 } as const;

@@ -40,6 +40,7 @@ import {
   clearRegistry,
 } from '../../tools/modoki-mcp/src/registry';
 import { loadSurface, sumSchemaBytes, type Surface } from './mcpSurface';
+import { perToolBytes, surfaceBytes, toolBytes } from '../../tools/modoki-mcp/surfaceBytes';
 import { CONTRACTS } from '../../tools/modoki-mcp/src/contracts';
 
 const SRC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../tools/modoki-mcp/src');
@@ -570,13 +571,11 @@ describe('the real registered surface', () => {
   // walk itself and the full reasoning behind which containers it descends into.
 
   it(`the tool definitions stay near their recorded size (~${Math.round(DEFINITION_BYTES / 1000)} KB)`, () => {
-    let bytes = 0;
-    for (const name of s.names) {
-      const entry = getTool(name)!;
-      bytes += entry.description.length;
-      const schema = zodToJsonSchema(z.object(entry.shape));
-      bytes += sumSchemaBytes(schema);
-    }
+    // Priced through the SHARED walk (`surfaceBytes.ts`), not an inline loop, so the #894 ledger
+    // and this gate cannot answer differently about the same surface — the sibling test below
+    // pins that they don't.
+    const perTool = new Map(s.names.map((name) => [name, toolBytes(name)] as const));
+    const bytes = surfaceBytes(perTool);
     const ceiling = DEFINITION_BYTES + DEFINITION_HEADROOM;
     expect(
       bytes,
@@ -588,6 +587,37 @@ describe('the real registered surface', () => {
     // A floor too: a refactor that accidentally strips descriptions would otherwise pass silently,
     // and losing them is the more damaging direction.
     expect(bytes, 'the surface SHRANK sharply — descriptions lost?').toBeGreaterThan(DEFINITION_BYTES - 8_000);
+  });
+
+  it('the ledger prices the surface identically to the gate, tool for tool (#894)', () => {
+    // ⚠️ THIS COMMENT HAS BEEN WRONG IN BOTH DIRECTIONS. Read the measured boundary, not a summary.
+    //
+    // It DOES catch (each measured, each reddening this test and only this test, 1 of 41):
+    //   · the ledger enumerating a different set of tools than the gate prices;
+    //   · the ledger pricing through a DIFFERENT function — +1 B/tool with identical key sets is
+    //     red here while `DEFINITION_BYTES` stays green. That is the real guard against the
+    //     `dump-surface.mjs` trap (its `sumDescriptionBytes` omits property names), so **do not
+    //     delete the per-tool loop or the `surfaceBytes` equality below as redundant** — they are
+    //     the only thing standing between this repo and a ledger rebuilt on a second walker.
+    //
+    // It CANNOT catch a walk that is wrong the SAME way on both sides, because both call one
+    // `toolBytes` in one process off one module: inflating `toolBytes` by 100 B/tool reddens the
+    // `DEFINITION_BYTES` pin above and leaves this test GREEN (1 failed / 40 passed). Correctness
+    // of the walk itself is the `sumSchemaBytes walk` block's job — dropping `key.length` from its
+    // `properties` branch reddens 6 of those cases and none of these (the `patternProperties`
+    // branch is a separate occurrence and reddens only 1 — say which branch when quoting this).
+    //
+    // The first version of this comment claimed it policed the arithmetic (false); the second
+    // over-corrected to "enumeration only" (also false, and worse — it invites deleting a live
+    // guard). The line above is where it actually sits.
+    const standalone = perToolBytes();
+    const viaHarness = new Map(s.names.map((name) => [name, toolBytes(name)] as const));
+    expect([...standalone.keys()].sort()).toEqual([...viaHarness.keys()].sort());
+    for (const [name, bytes] of viaHarness) {
+      expect(standalone.get(name), `${name} priced differently by the ledger and the gate`)
+        .toBe(bytes);
+    }
+    expect(surfaceBytes(standalone)).toBe(surfaceBytes(viaHarness));
   });
 
   it('every tool validates its args against its own real schema', () => {
@@ -604,7 +634,7 @@ describe('sumSchemaBytes walk (#456 close-out)', () => {
   // The definitions ledger above drives `sumSchemaBytes` against the REAL 105-tool surface, and a
   // scan of every served schema found `tuples:0, oneOf:0, not:0, patternProperties:0, $defs:0` —
   // none of those branches has ever executed against real traffic. `DEFINITION_BYTES` staying pinned
-  // at 143_859 proves the walk is STABLE on today's surface; it proves nothing about whether the
+  // (143_859 when this was written; 152_065 today) proves the walk is STABLE on today's surface; it proves nothing about whether the
   // array-aware / oneOf / not / patternProperties branches are actually CORRECT, since nothing here
   // has ever forced them to run. These tests drive `zodToJsonSchema` output built to exercise each
   // branch on purpose, and assert the SUMMED byte count — not merely "greater than zero", which

@@ -77,6 +77,13 @@ export const WATCHED = [
   // which is exactly what happened. Costs a Court-touching change nothing (this is an OR over a
   // pathspec); it costs only a clone that edits this one file, which is the clone that should pay.
   'engine/packages/modoki/src/runtime/core/formatVersion.ts',
+  // #1024: Court's tap-target floor guard is DATA over this shared resolver, and the corpus walk,
+  // the axis model and the population predicate all live there. A clone editing it and touching
+  // nothing under games/court would skip `games/court/tests/**` entirely — and Court is the only
+  // project whose prefabs exercise the parent index by `localId`, and the only one with a
+  // `UIToggle` host, so a resolver change can break Court's lists while the other eight suites
+  // stay green. Guarded by courtSweepScope.test.ts.
+  'engine/packages/modoki/tests/helpers/tapTargetFloor.ts',
 ];
 
 /** Runs a git command in the repo, or `null` if it cannot. Injectable so a test can bind it to a
