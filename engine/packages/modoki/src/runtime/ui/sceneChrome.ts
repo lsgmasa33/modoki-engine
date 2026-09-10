@@ -40,7 +40,7 @@ import type { World, Entity } from 'koota';
 import { markUIDirty } from '../core/uiDirty';
 import { EntityAttributes } from '../core/traits/EntityAttributes';
 import { onWorldSwap } from '../core/ecs/world';
-import { UIElement } from '../traits/UIElement';
+import { UIElement, type UILengthUnit } from '../traits/UIElement';
 import { UIAnchor } from '../traits/UIAnchor';
 import { UIToggle } from '../traits/UIToggle';
 import { Animator } from '../traits/Animator';
@@ -138,6 +138,74 @@ export interface ChromeUIPatch {
    */
   borderWidth?: number;
   borderOpacity?: number;
+  /**
+   * The element's own box size, and the unit it is expressed in.
+   *
+   * ⚠️ **These break the "author sizes in the scene" rule on purpose, and the exception is narrow**
+   * (#1017, wordweave's first caller): a size the scene CAN express belongs in the scene, and the
+   * `rotation` note above still stands for everything else. What earns a slot here is a size the
+   * authoring vocabulary cannot express at all — one measured in the **2D design box** rather than
+   * the viewport. No `UILengthUnit` resolves against the design box: `vmin`/`vw`/`vh` track the
+   * viewport and `%` tracks the parent, while no DOM box corresponds to the design box (the canvas
+   * element fills the viewport; the letterbox lives inside its drawing as `computeCanvasScale`'s
+   * `offsetX`/`offsetY`). So a game that needs design-px chrome has to author the number and
+   * convert it per frame.
+   *
+   * The cost of NOT having this: wordweave's gap-row buttons were sized in `vmin`, which buys a
+   * different number of DESIGN px per device — 80 on an iPhone 8, 107 on a 13" iPad against a fixed
+   * ~108 design px of room — so the tablet, where they already render at 76 pt, set the ceiling and
+   * the phones stayed under the 44 pt tap floor.
+   *
+   * ⚠️ **The better fix is a design-px LENGTH UNIT, and this is the stopgap.** `cssVal`
+   * (`ui/UINode.tsx`) already resolves every unit through a CSS variable (`var(--ui-vmin, 1vmin)`),
+   * so a `--ui-dpx` published alongside them by whatever measures the canvas would make design-px
+   * sizing declarative — no per-frame patch, no per-world snapshot of the authored value, and it
+   * would serve any game with design-space chrome rather than one. Until then, a caller that
+   * patches these MUST snapshot the authored number once per world: it is writing over the very
+   * field it reads, and a fresh read would take its own previous write as authored input.
+   */
+  width?: number;
+  height?: number;
+  widthUnit?: UILengthUnit;
+  heightUnit?: UILengthUnit;
+  /**
+   * The row-gap and type size that ride ALONG with a design-px box size above.
+   *
+   * ⚠️ These are here for one reason: **a design-px box whose spacing and glyphs are not converted
+   * with it is not a design-px layout, it is a design-px box with viewport-relative contents** —
+   * and the ratio between them then varies by device, which is the exact property the box
+   * conversion exists to remove. Measured on wordweave's gap row when `width` alone was converted
+   * (#1017): the authored glyph-to-button ratio of 0.550 became **0.440 on an iPhone SE and 0.587
+   * on an iPad mini**, so the `?` floated in a visibly emptier disc on the larger screen while the
+   * buttons themselves were finally uniform. The same argument covers `gap`: a fixed `vmin` gutter
+   * between design-px buttons is a different fraction of the button on every screen.
+   *
+   * So the rule for this block is narrower than "sizes are patchable": a field belongs here when it
+   * is a LENGTH THAT MUST STAY IN PROPORTION to a `width`/`height` above it. `padding` is the
+   * obvious next candidate and is deliberately absent until a caller needs it — the allowlist is
+   * curated, and every field added is one more thing a per-frame patch can overwrite in a scene.
+   */
+  gap?: number;
+  gapUnit?: UILengthUnit;
+  fontSize?: number;
+  fontSizeUnit?: UILengthUnit;
+  /**
+   * The horizontal padding that positions design-px children INSIDE a design-px row.
+   *
+   * Predicted as "the obvious next candidate" by the block above and admitted the moment a caller
+   * needed it (#1017 follow-up). The failure it fixes: wordweave's gap row spanned the VIEWPORT
+   * while the board it frames is fixed in the design box, so on a wide screen the buttons walked
+   * out to the screen edge and left the board behind — measured on an iPad mini, the gutter from
+   * the menu button to the reveal meter was 16 design px in portrait on a phone and 316 in
+   * landscape on the tablet, for the same authored layout.
+   *
+   * ⚠️ Vertical padding is NOT here, and that is the same curation the block above describes: the
+   * row's height comes from `height` and nothing has needed to inset its contents vertically.
+   */
+  paddingLeft?: number;
+  paddingRight?: number;
+  paddingLeftUnit?: UILengthUnit;
+  paddingRightUnit?: UILengthUnit;
 }
 
 /** name → last-known entity id. Validated on every lookup (see the banner). */
