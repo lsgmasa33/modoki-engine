@@ -6,7 +6,7 @@
  *  while the Build menu's device list arrives. */
 
 import { describe, it, expect, vi } from 'vitest';
-import { buildMenuSpec, menuItemId } from '../../src/editor/menuSpec';
+import { buildMenuSpec, menuItemId, resolveMenuAction, handleMenuAction } from '../../src/editor/menuSpec';
 import type { BarMenuItem } from '../../src/editor/components/MenuBar';
 
 describe('menuItemId', () => {
@@ -93,5 +93,97 @@ describe('buildMenuSpec — structure', () => {
       Build: [{ label: 'Air', checked: true, disabled: true, shortcut: 'Cmd+B' }],
     });
     expect(menuSpec.menus[0].items[0]).toMatchObject({ checked: true, disabled: true, shortcut: 'Cmd+B' });
+  });
+});
+
+/** #1032 sibling (`family/refusal-not-surfaced`), found by the close-out sweep: a relayed
+ *  menu click whose id is no longer in the action map used to answer with a console.warn —
+ *  invisible to the user, whose menu item simply did nothing.
+ *
+ *  ⚠️ Ids here come from `menuItemId`, never hand-spelled. An earlier version of this file
+ *  used `'File/Save All#0'`, a shape the code never emits — harmless to the assertions, and
+ *  exactly the wrong example to leave in the file whose stated job is to pin the ID SCHEME. */
+describe('resolveMenuAction', () => {
+  const SAVE = menuItemId('File#0', 0, 'Save All');
+
+  it('returns the action for an id the map still owns', () => {
+    const run = vi.fn();
+    const out = resolveMenuAction({ [SAVE]: run }, SAVE);
+    expect('run' in out).toBe(true);
+    if ('run' in out) { out.run(); }
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it('a MISS returns a message for the USER, not just an absence', () => {
+    const out = resolveMenuAction({ [SAVE]: vi.fn() }, menuItemId('File#0', 0, 'Save Some'));
+    expect('miss' in out).toBe(true);
+    if ('miss' in out) {
+      // The point: something the user can be shown. An empty string is as silent as the
+      // console.warn this replaced.
+      expect(out.miss.length).toBeGreaterThan(0);
+      // ⚠️ Cause-neutral. TWO routes reach a miss (an open menu, and an accelerator whose
+      // closure captured a now-stale id — see the docstring), so a message naming one of
+      // them tells half of all users something false. "Reopen the menu" is the wording this
+      // pins against: the accelerator route never opened one.
+      expect(out.miss).not.toMatch(/reopen/i);
+      expect(out.miss).toMatch(/again/i);
+    }
+  });
+
+  it('a stale id MISSES rather than resolving into the rebuilt map — across buildMenuSpec', () => {
+    // The hazard menuItemId documents, spanning both functions: the id a user clicked before
+    // a rebuild must not land on whatever now sits at that index. An empty-map miss (the
+    // version this replaced) could not fail; it was strictly weaker than the test above and
+    // asserted on a vi.fn() that was wired to nothing.
+    const nowAtThatIndex = vi.fn();
+    const before = buildMenuSpec({ Build: [{ label: 'iOS Device', submenu: [
+      { label: 'No iOS device paired', disabled: true },
+      { label: 'Build now', action: () => {} },
+    ] }] });
+    const after = buildMenuSpec({ Build: [{ label: 'iOS Device', submenu: [
+      { label: 'iPhone Air', action: nowAtThatIndex },
+      { label: 'iPhone 8', action: nowAtThatIndex },
+    ] }] });
+
+    const staleId = Object.keys(before.menuActionMap).find((k) => k.includes('build-now'));
+    expect(staleId).toBeDefined();
+    const out = resolveMenuAction(after.menuActionMap, staleId!);
+
+    expect('miss' in out).toBe(true);
+    expect(nowAtThatIndex).not.toHaveBeenCalled();
+  });
+});
+
+/** The half that was actually broken. `resolveMenuAction` made the MESSAGE testable; deleting
+ *  the showToast call still restored the #1032 defect with every test green. These pin the
+ *  delivery, not the string. */
+describe('handleMenuAction', () => {
+  const SAVE = menuItemId('File#0', 0, 'Save All');
+  const sinks = () => ({ showToast: vi.fn(), warn: vi.fn() });
+
+  it('a hit runs the action and shows the user NOTHING', () => {
+    const run = vi.fn();
+    const s = sinks();
+    expect(handleMenuAction({ [SAVE]: run }, SAVE, s)).toBe('ran');
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(s.showToast).not.toHaveBeenCalled();
+  });
+
+  it('a miss TELLS THE USER — a console warning alone is the defect, not the fix', () => {
+    const s = sinks();
+    expect(handleMenuAction({}, SAVE, s)).toBe('missed');
+    expect(s.showToast).toHaveBeenCalledTimes(1);
+    expect(s.showToast.mock.calls[0][0]).toMatch(/again/i);
+    expect(s.showToast.mock.calls[0][1]).toBe('warn');
+    // The console line stays too — it carries the id, which the toast deliberately does not.
+    expect(s.warn).toHaveBeenCalledTimes(1);
+    expect(s.warn.mock.calls[0][0]).toContain(SAVE);
+  });
+
+  it('a miss runs NO action from the current map', () => {
+    const other = vi.fn();
+    const s = sinks();
+    handleMenuAction({ [menuItemId('File#0', 0, 'Something Else')]: other }, SAVE, s);
+    expect(other).not.toHaveBeenCalled();
   });
 });

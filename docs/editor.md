@@ -820,12 +820,22 @@ Two signature changes were needed and both are dependency injection, not redesig
 in, defeating the move), and `resetLayout` split into a testable `clearStoredLayout()` plus the
 `window.location.reload()` that stays in the component.
 
-**What genuinely remains untestable there is the other ~393 lines, and the reason is
+**What genuinely remains untestable there is the other ~390 lines, and the reason is
 structural**: they are one 650-line React component plus six modal components — 34 hooks, the
 menu tree built from live callbacks, the Electron OS-menu bridge, project open/close, HMR-epoch
-wiring. There is no decision in it that is separable from the hook that owns its state; every
-candidate is orchestration, which is the Phase-2 shape. That part needs an integration harness,
-and one e2e spec is the honest coverage for it — which the suite already has.
+wiring. Most of it is orchestration, which is the Phase-2 shape: it needs an integration
+harness, and one e2e spec is the honest coverage for it — which the suite already has.
+
+⚠️ **"There is no decision left in it" was this paragraph's claim until 2026-09-10, and it was
+wrong twice over** — once when written, and once as a rule of thumb. The `menu-action` relay
+looked like pure orchestration (an IPC handler reading a ref) and had a real decision buried in
+it: *what to do when the relayed id is not in the current action map*. It answered with a
+`console.warn` the user cannot see, so a menu click did nothing and said nothing (#1032's
+`family/refusal-not-surfaced` mechanism). Extracting `resolveMenuAction()` into `menuSpec.ts`
+made the decision testable and the toast possible; the hook kept only the dispatch. **So the
+lesson below generalises further than it was first stated: an orchestration site can still
+CONTAIN a decision, and the giveaway is a branch whose two arms differ in what the user is
+told.**
 
 **The transferable lesson**: before declaring a `.tsx` untestable, grep it for module-scope
 `function`/`const` declarations that take no hooks. "Most Electron-entangled panel in the

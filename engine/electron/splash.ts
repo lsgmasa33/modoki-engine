@@ -72,6 +72,13 @@ export function setSplashStatus(text: string): void {
   apply(text);
 }
 
+/** Is `w` the splash? Callers that PARENT a modal dialog must not attach it here:
+ *  the splash is destroyed the moment the editor renderer mounts (revealMainWindow →
+ *  closeSplash), which would take an open sheet down with it unanswered. */
+export function isSplashWindow(w: unknown): boolean {
+  return splash != null && w === splash;
+}
+
 /** Close + drop the splash (idempotent). */
 export function closeSplash(): void {
   try { if (splash && !splash.isDestroyed()) splash.destroy(); } catch { /* best-effort */ }

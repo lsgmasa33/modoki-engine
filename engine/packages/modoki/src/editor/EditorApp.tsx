@@ -87,7 +87,7 @@ function resetLayout() {
 // ── Menu definitions ────────────────────────────────────
 
 import MenuBar, { type BarMenuItem } from './components/MenuBar';
-import { buildMenuSpec } from './menuSpec';
+import { buildMenuSpec, handleMenuAction } from './menuSpec';
 
 // ── Main Editor ─────────────────────────────────────────
 
@@ -715,12 +715,15 @@ export default function EditorApp() {
   useEffect(() => {
     if (!electronBridge) return;
     return electronBridge.on('menu-action', (id) => {
-      const action = menuActionRef.current[id as string];
       // A miss means the click came from a menu that has since been rebuilt (see the id scheme
-      // above) — doing nothing is correct, but it must not be SILENT: to the user their click
-      // simply did not work, and this line is the only evidence of why.
-      if (!action) { console.warn(`[editor] ignoring a menu click for "${id}" — the menu was rebuilt since it was opened; reopen it and click again`); return; }
-      action();
+      // above) — doing nothing is correct, but it must not be SILENT. It WAS: the only evidence
+      // was a console.warn, which the user cannot see, so their click just did not work. Same
+      // mechanism as #1032 (`family/refusal-not-surfaced`); the decision lives in menuSpec.ts
+      // so it can be tested.
+      handleMenuAction(menuActionRef.current, id as string, {
+        showToast: (message, kind) => useEditorStore.getState().showToast(message, kind),
+        warn: (message) => console.warn(message),
+      });
     });
   }, []);
   // Cmd/Ctrl+wheel → whole-app UI zoom (VS Code–style). Forward the intent to main,

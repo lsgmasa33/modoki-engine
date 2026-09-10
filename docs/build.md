@@ -1386,6 +1386,85 @@ exercises the asset pipeline**: `games/anim-bug` has no rigged model, so it buil
 or without the `--configLoader runner` that was wrongly declared good on it; `demos/forest-camp` is
 the distinguishing fixture.
 
+## Editor self-update (`engine/electron/autoUpdate.ts`)
+
+The packaged editor updates itself with electron-updater over the **public** `lsgmasa33/modoki-engine`
+GitHub Releases feed (`publish:` in `electron-builder.yml`, baked into the app's `app-update.yml`).
+`npm run dist` uses `--publish never`, so packaging only records WHERE to look; the `v*` release
+workflow is what uploads `latest-mac.yml` / `latest.yml` + the zip/blockmap.
+
+**The flow, and every dialog in it.** Both entry points — the silent launch check and
+`Check for Updates…` (the macOS app menu, under About; a Help menu elsewhere — see
+`installAppMenu` in `projects.ts`) — run the same sequence:
+
+| Event | What the user sees |
+|---|---|
+| `update-not-available` | "Modoki Editor is up to date" — **interactive check only**, the launch check stays quiet |
+| `update-available` | **"Modoki Editor X.Y.Z is available — Download & Install / Later"**, on BOTH paths |
+| `download-progress` | the dock/taskbar progress bar (`win.setProgressBar`, 0→1); no dialog |
+| `update-downloaded` | "Update Ready — Restart Now / Later"; the bar goes **indeterminate**, not away |
+| `error` | reported when the check was interactive **or** a download/install was in flight; a silent launch check's feed error stays silent |
+
+⚠️ **`update-downloaded` does not mean the bytes are on disk — on macOS it fires EARLY.**
+`MacUpdater.dispatchUpdateDownloaded` runs when electron-updater's local proxy server starts
+listening, *before* it asks Squirrel to pull the ~294 MB zip through it. So the progress bar goes
+indeterminate there rather than being cleared, and — the sharper consequence — **`quitAndInstall()`
+can be a no-op**: with `squirrelDownloadedUpdate` still false and `autoInstallOnAppQuit` true,
+`MacUpdater.quitAndInstall` adds a listener and returns, so a user who clicks **Restart Now** within
+a few seconds of the prompt gets no quit until Squirrel finishes on its own. Pre-existing, tracked
+separately — do not "fix" it by flipping `autoInstallOnAppQuit`, which is what stages the update for
+the next ordinary quit.
+
+⚠️ **A dialog is never parented to the splash.** At launch `getAllWindows()[0]` IS the splash
+(`main.ts` shows it, creates the editor window *hidden*, then calls `setupAutoUpdate`), and
+`closeSplash()` destroys it the instant the renderer mounts — taking an open sheet down with it,
+unanswered. A feed round-trip beats a React mount often enough that this is the normal case, not a
+race. `show()` picks the first **visible non-splash** window and otherwise goes free-floating.
+
+⚠️ **`autoDownload` is deliberately `false` (#1032), and nothing downloads without consent.** It used
+to be `true` with `update-available` answered by a bare `console.log` — so the ONE outcome the menu
+item exists to report was the ONE with no UI. Clicking it silently began a ~294 MB fetch and showed
+nothing for minutes; it read as a dead menu item. Confirmed on the owner's Mac 2026-09-10: an
+installed, notarized 0.6.0 against a 0.7.0 feed left a 94%-complete
+`~/Library/Caches/modoki-engine-updater/pending/temp-Modoki-Editor-0.7.0-arm64.zip` abandoned when
+the app was quit mid-silence. **Flipping `autoDownload` back to `true` re-creates the whole defect** —
+`engine/tests/electron/autoUpdate.test.ts` fails if you do.
+
+**Eligibility is ONE rule (`updateBlockedReason`) shared by both entry points**, because they
+disagreed: the launch check skipped unsigned builds and the menu check did not, so an ad-hoc local
+build would happily download a few hundred MB that Squirrel then refuses to install. A build is
+ineligible when it is unpackaged (dev / `MODOKI_PROD`), has `MODOKI_NO_AUTOUPDATE=1` (the `--dir`
+packaged smoke), or is **ad-hoc signed** — a locally-built DMG, which Squirrel.Mac rejects a
+Developer-ID update for ("code failed to satisfy specified code requirement(s)"). Ineligible launches
+also force `autoInstallOnAppQuit = false`, so a build staged by a PRIOR eligible session cannot
+silently replace this one on quit. The interactive check now *says* why instead of going to the feed.
+
+**A repeat check always re-reads the feed, and the `update-available` handler decides**: mid-download
+it reports "already downloading"; a staged build of the SAME version re-offers the restart; a staged
+build the feed has since **superseded** falls through and is offered as a fresh download. Those guards
+exist because the payload is a few hundred MB — a duplicated fetch is not a cosmetic bug.
+
+⚠️ Do NOT re-add a `if (downloadedVersion) return` short-circuit to `checkForUpdatesInteractive`.
+It looks like a saving and is a bug: once 0.7.0 was staged and the user picked "Later", every later
+check re-offered 0.7.0 for the life of the process and 0.8.0 could never be seen. It also put a
+second copy of the guards where they drift from the handler's — the copy the tests then reach, while
+the handler's stay green-when-deleted. One copy, in the handler, which knows the feed's version.
+
+**One prompt at a time** (`promptOpen`). `downloading` cannot stand in for it: it is set *inside* the
+dialog's `.then`, after the await, so two unanswered `update-available` events stacked two identical
+dialogs. electron-updater happens to dedupe the second `downloadUpdate()` by returning the in-flight
+promise — its invariant, not ours, and the duplicate dialog was ours regardless.
+
+⚠️ **"Restart Now" sets `installing`, and main's `before-quit` MUST defer to Squirrel from there** —
+calling its own `app.exit(0)` hard-exits before the install handshake completes and leaves the update
+unapplied until the next quit. `isUpdateInstalling()` is that seam.
+
+⚠️ **…and a FAILED install must release that flag.** `before-quit` returns EARLY while it is set,
+skipping the whole awaited teardown — including `releaseDeviceResourcesOnExit()`. A device claim is
+**machine-wide**, so a flag stuck by a refused install would lock a phone out of every other clone on
+every later quit, hours after the update failed and with nothing on screen connecting the two. The
+`error` handler releases it and says "Update Install Failed".
+
 ## CLI recipes
 
 The examples use `games/<id>`; substitute the project and its appId. Note the **project-dir cwd**

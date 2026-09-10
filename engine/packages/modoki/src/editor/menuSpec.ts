@@ -73,3 +73,63 @@ export function buildMenuSpec(menus: Record<string, BarMenuItem[]>): {
     menuActionMap,
   };
 }
+
+/** What a relayed menu click should do, given the action map current at click time.
+ *  Extracted from EditorApp's IPC handler so the DECISION is unit-testable — the panel
+ *  itself is `.tsx` and carries no tests (CLAUDE.md § Tests).
+ *
+ *  ⚠️ A miss is not a no-op you may swallow. The native menu is rebuilt whenever its
+ *  labels/enabled state change, and ids carry the label, so a rebuild can strand an id.
+ *  Doing nothing is the correct ACTION; doing it silently is the #1032 defect
+ *  (`family/refusal-not-surfaced`) — from the user's side a menu item simply did not work,
+ *  and a console.warn is not something they can see.
+ *
+ *  ⚠️ TWO routes reach a miss, and the message must be true of BOTH — an earlier wording
+ *  said "the menu changed while it was open. Reopen it and click again", which is false and
+ *  useless on the second:
+ *    ① a native menu left OPEN across a rebuild relays an id the new map no longer owns;
+ *    ② an ACCELERATOR. `projects.ts` gives every relayed item a click closure capturing its
+ *      id at template-build time, and Chromium swallows those accelerators before the
+ *      renderer's keymap sees them — so under Electron Cmd+Z IS the relay. `Edit/Undo`'s
+ *      label carries `undoLabel()`, so its id changes as the stack changes, and main's menu
+ *      is only rebuilt an IPC round-trip after the renderer assigns the new map. Two quick
+ *      presses inside that window relay a stale id with no menu ever opened.
+ *  So the wording stays cause-neutral and the remedy is "try it again", which is true either
+ *  way. Distinguishing the routes would need main to say which one fired; the renderer
+ *  cannot tell. */
+export function resolveMenuAction(
+  // ⚠️ `| undefined` is load-bearing, not decoration. As a bare `Record<string, () => void>`
+  // TypeScript types the lookup as ALWAYS DEFINED, so `run ? … : …` is a condition that can
+  // only go one way — `tsc` says so (TS2774) and the miss branch becomes unreachable at type
+  // level even though it is the branch this function exists for. Caught by `npm run docs:api`
+  // in this change's own close-out.
+  actions: Readonly<Record<string, (() => void) | undefined>>,
+  id: string,
+): { run: () => void } | { miss: string } {
+  const run = actions[id];
+  return run
+    ? { run }
+    : { miss: 'That menu action was out of date — the menu had just been rebuilt. Try it again.' };
+}
+
+/** The whole outcome of a relayed menu click: run it, or tell the user it went stale.
+ *
+ *  ⚠️ This exists because extracting only `resolveMenuAction` did not finish the job — the
+ *  MESSAGE became testable while the thing that had actually been broken, showing it to the
+ *  user, stayed in `EditorApp.tsx` where nothing tests it. Deleting the `showToast` call
+ *  restored the #1032 defect with all 11 tests still green (found in this change's own §2d
+ *  re-review). The sinks are injected so the `.tsx` keeps only the wiring. */
+export function handleMenuAction(
+  actions: Readonly<Record<string, (() => void) | undefined>>,
+  id: string,
+  sinks: { showToast: (message: string, kind: 'warn') => void; warn: (message: string) => void },
+): 'ran' | 'missed' {
+  const outcome = resolveMenuAction(actions, id);
+  if ('miss' in outcome) {
+    sinks.warn(`[editor] ignoring a menu click for "${id}" — the action map no longer owns that id`);
+    sinks.showToast(outcome.miss, 'warn');
+    return 'missed';
+  }
+  outcome.run();
+  return 'ran';
+}

@@ -2006,9 +2006,10 @@ app.whenReady().then(async () => {
   // menu-structure IPC → revealMainWindow), or the createWindow timeout fallback —
   // so the hand-off is splash → painted editor, with no black window in between.
 
-  // Self-update from the GitHub Releases feed (packaged + signed builds only;
-  // no-op in dev). Silent on launch — surfaces only a "restart to install" prompt
-  // once a newer signed build has downloaded.
+  // Self-update from the GitHub Releases feed (packaged + signed builds only; no-op in
+  // dev). NOT silent when an update exists (#1032): it ASKS before downloading a few
+  // hundred MB, on this launch path as well as the menu one, then shows dock progress
+  // and a "restart to install" prompt. Only "you're up to date" stays quiet here.
   setupAutoUpdate();
 
   app.on('activate', () => {
