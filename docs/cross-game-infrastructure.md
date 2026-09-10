@@ -346,6 +346,17 @@ account and conflict-dialog UI is GAME-SPECIFIC.** Court's dialog keeps its self
   the same breath: ~51 of those lines are player-visible English, and there is no i18n mechanism in
   this repo. The UI ruling resolves that by subtraction rather than by care — move the vocabulary,
   move zero strings. `accountNoCopy.test.ts` is what holds the line, and it was mutation-tested twice.
+
+  ⚠️ **The gap that ruling points at now has an answer: ENGLISH ONLY, for now** (owner, 2026-09-10,
+  #941). The subtraction above is not a placeholder waiting on an i18n mechanism — it is the shape
+  the repo keeps. **Weaveling is English-only permanently**: it is a word game built on a 173k-word
+  English dictionary, a commonness-score sidecar, a definitions sidecar and a generator tuned to
+  English letter frequency, so localising it is a second corpus and a second generator tuning per
+  language, not a translated interface — a different product, not a port. **Court is English-only
+  until it is commercially successful**, at which point the UI half becomes worth doing; its copy is
+  the tractable case precisely because it is interface text, not content. So `accountNoCopy.test.ts`
+  stays as the line and the engine keeps owning vocabulary while the game owns every rendered word —
+  now for a stated reason rather than for want of a mechanism.
 - **#673 — CLOSED, won't do.** Its proposal was *"the engine owns the two-column layout and the
   choice; the game owns every noun"*, and the ruling above deletes the first half. What remains — a
   view-model of one game's nouns, rendered by that game — is already correctly placed.
