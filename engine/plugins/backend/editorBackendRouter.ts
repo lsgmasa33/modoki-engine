@@ -876,7 +876,8 @@ export type UnsavedOutcome =
  *
  *  ⚠️ **`unknown agent op` is `unknown`, NOT `absent`** (#872 review, kept verbatim in force). The
  *  transport is a BROADCAST — `ws.send` reaches every HMR client and the request registry is
- *  first-reply-wins — and `registerEditorAgentOps()` runs only from `editor/setup.ts`. So a second
+ *  first-AUTHORITATIVE-reply-wins since #1030 (a decline is counted, never obeyed) — and
+ *  `registerEditorAgentOps()` runs only from `editor/setup.ts`. So a second
  *  tab on the dev server's runtime route answers "unknown agent op" INSTANTLY and beats the editor
  *  tab that actually holds the state. One client's "I do not have that op" says nothing about
  *  whether another does. Widening this probe to more routes raises how often that matters, which
@@ -1037,7 +1038,12 @@ function unsavedRefusal(
         options: [
           'retry — the renderer is usually mid-scene-load, a GLB parse or a shader compile, and answers a moment later',
           'modoki_get_editor_state lists unsaved work under unsavedCauses; if it answers, the renderer is alive',
-          'if a SECOND tab is open on the dev server it can answer "unknown agent op" first and win the race — close it and retry',
+          // ⚠️ #1030 removed the broadcast race this used to blame, so "close the second tab" is
+          // gone. Do NOT replace it with "no editor is attached": that is the one thing this arm
+          // has already ruled out — zero clients rejects definitively one branch up
+          // (`requestBrowser`'s `clients.size === 0` guard), and this arm's own message says an
+          // editor MAY be attached and did not answer. What is still open is WHICH page answered.
+          'the attached page may be a game/runtime page rather than #/editor — open the editor route and retry',
           `${override}:true — proceed without the check, accepting that cost`,
         ],
       },
@@ -2432,7 +2438,9 @@ async function describeUnresolvedAgainstLiveWorld(
           options: [
             'retry — the renderer is usually mid-scene-load, a GLB parse or a shader compile, and answers a moment later',
             'modoki_get_editor_state — if it answers, the renderer is alive and you can see what is pending',
-            'if a SECOND tab is open on the dev server it can answer first and win the race — close it and retry',
+            // ⚠️ #1030 removed that race — see the sibling option above for why the replacement
+            // must not claim "nothing is attached" either.
+            'the attached page may be a game/runtime page rather than #/editor — open the editor route and retry',
             'modoki_save_all — flush any unsaved work first, so a later retry has nothing to lose',
           ],
         }, 503);
@@ -3326,7 +3334,8 @@ async function describeUnresolvedAgainstLiveWorld(
       // This used to collapse every non-`held` result — and the rejection — to `[]`, and the
       // disclosures below all branch on the FIRST gate. So: first probe says `held`, caller passes
       // `discardUnsaved:true`, the write lands, and the second probe times out or loses the
-      // first-reply-wins race to a second HMR client. Reply: `{ok:true, sha256}`, no
+      // first-reply race to a second HMR client (closed by #1030 — kept because the guard must
+      // not depend on that). Reply: `{ok:true, sha256}`, no
       // `discardedParked`, no note. The human's park SURVIVED and their next Cmd+S flushes the
       // older document back over this write — #872's exact defect, reported as a clean success.
       // `unknown` here is the likely branch, not the exotic one: the budget is 1500ms and a GLB
@@ -5154,7 +5163,10 @@ async function relayJson(
  *  guard, so it had copied the half that could not stand alone. Measured on the broken tree: a
  *  mutate that answered **503 NO_RENDERER, file untouched** became **200 `ok:true, changed:1` with
  *  the file rewritten**, skipping the unsaved-work probe entirely and hot-reloading the scene out
- *  from under live edits. Reachable two ways: the relay is a BROADCAST and first-reply-wins, so a
+ *  from under live edits. Reachable two ways — ⚠️ **the first is CLOSED as of #1030**, which made
+ *  the relay settle on the first AUTHORITATIVE reply; it is kept here because the guard must not
+ *  depend on that, and because the second way is still open. The relay is a BROADCAST and was
+ *  first-reply-wins, so a
  *  second tab on the runtime route answers `unknown agent op` instantly and beats the editor tab;
  *  and the launch race / a bridge connected from a game page rather than `#/editor`, which
  *  `relayFailureStatus`'s own comment already names.
@@ -5176,9 +5188,14 @@ async function relayJson(
  *  `apply-asset-path-moves` is itself registered inside `registerEditorAgentOps`, so under the
  *  broadcast race above `unknown agent op` does NOT prove the editor tab lacks it — a live editor
  *  can be holding bindings and a parked write on the old path while a runtime tab answers first,
- *  and that repair is skipped SILENTLY (no warn, no `repairFailed`). Pre-dates this change and is
- *  pinned by `moveFileRouter.test.ts` asserting the silence, so it is not repaired here — filed as
- *  **#1030**. Do not read this paragraph as certifying that site against the race. */
+ *  and that repair is skipped SILENTLY (no warn, no `repairFailed`).
+ *
+ *  ⚠️ **FIXED in #1030 — at the TRANSPORT, not here.** A client with no handler for an op now
+ *  answers `{declined:true}` instead of rejecting, and the registry counts declines, settling
+ *  `absent` only once every announced bridge client has declined. So `unknown agent op` reaching
+ *  this function now really does mean nothing out there has the op. The asymmetry this banner
+ *  describes is unchanged and still deliberate; what is gone is the race that made it dangerous.
+ *  Do not add a second guard at that site for it. */
 function relayProvesNoRenderer(msg: string): boolean {
   // The ops being unregistered says nothing about whether a window is up holding state.
   if (/unknown agent op/i.test(msg)) return false;

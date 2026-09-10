@@ -24,6 +24,21 @@ Every other visible object in both scenes is an **engine primitive**
 colour. There are no textures, no HDR environments, no audio, no fonts, and no
 external meshes anywhere in this project.
 
+## App icon — `art/icon-app-master.png`
+
+**Source:** generated 2026-09-10 with [3D AI Studio](https://www.3daistudio.com) (Nano Banana 2
+Lite) from a brief written for this repository. Not a third-party asset, and not derived from one.
+
+⚠️ **Machine-generated, so it sits outside the licence framing below.** The other assets in this
+file each have a stated upstream position; this one has no upstream author at all. The licence
+position on generated output is the repository owner's to state, not this file's to assume.
+
+**Design:** flat two-colour line art — pale cream on dark navy, one centred subject — deliberately
+matching the language of the bundled Modoki icon it replaces, so the six demos read as one suite
+rather than six unrelated marks. The flat two-colour treatment is load-bearing rather than
+stylistic: Android's **monochrome** adaptive-icon variant is derived from this master by flattening
+it to a single channel, which turns any shaded or painterly art to mud.
+
 ## Licence
 
 The two `.glb` files above are covered by this repository's licence, the same as the

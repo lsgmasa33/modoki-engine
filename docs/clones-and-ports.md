@@ -278,6 +278,43 @@ every other clone at yours.**
   the real script against a FAKE repo root in a tmpdir — pointing it at a real checkout would reap
   a developer's own dev server as a side effect of testing it.
 
+  ⚠️ **Since #961 `launch-editor.sh` LAUNCHES canonical** — `$REPO` is `pwd -P`, so everything it
+  spawns carries the physical spelling in its `pwd` and its argv, and any stopper matches whatever
+  spelling it derived. `stop-editor.sh` is unchanged; the two are asymmetric on purpose, because
+  only one of them spawns anything.
+
+  ⚠️ **But the launcher's own REAP PATTERNS are still built from the LOGICAL root, and that is
+  load-bearing — do not "tidy" them to `$REPO`.** `reap_alt_pattern` DERIVES the second spelling,
+  and it can only do so for a pattern under the root it was registered with (`case "$1" in
+  "${MODOKI_REAP_ROOT}"/*`). Hand it a physical pattern against a logical registered root and it
+  prints nothing: the second reap is skipped, and an editor still running with the LOGICAL spelling
+  in its argv survives the pre-launch sweep, keeps the pinned backend port, and the launch then
+  times out. #961's first version did exactly that and every gate stayed green, because the two
+  spellings are equal on an ordinary clone. The split to hold in your head: **what we SPAWN is
+  canonical; what we MATCH starts from the logical root**, because a reap matches a foreign
+  process's argv — a string we do not control, which may carry either spelling. Pinned by
+  `editorPorts.test.ts` § "builds its reap patterns from the LOGICAL root".
+
+  Two things that look like consequences of that change and are not:
+  - **No pinned port moves.** `backendPortForClone` has canonicalised with `fs.realpathSync.native`
+    before taking the basename since #881, so a clone reached through a link named anything at all
+    still answers the port its REAL directory name is pinned to in the table above — pinned by
+    `editorPorts.test.ts` § "resolves a clone reached through a SYMLINK". **The fear that it would
+    is what deferred #961 for a month; it was never true.**
+    ⚠️ Deliberately phrased without a `~/Projects/<clone>` + port pair: the guard that keeps this
+    file honest parses any such line as a RULE 2 table row, and an earlier draft of this very
+    paragraph reddened it. Prose about the table must not look like the table.
+  - **The HASHED lane converges rather than moving.** `clonePort.mjs` hashes `repoRoot` raw, and
+    its own `defaultRepoRoot()` is already physical (Node realpaths `import.meta.url`) — so the
+    launcher passing bash's logical `pwd` DISAGREED with every other caller of that hash (measured
+    through a symlinked clone: 9249 from the launcher, 9254 everywhere else). Passing the physical
+    spelling removes that divergence. `clonePort.mjs` itself is unchanged, and must stay so: it is
+    the one module allowed to import nothing but `node:` builtins.
+
+  ⚠️ The launch banner therefore prints the PHYSICAL path and `CLONE_NAME` is the physical
+  basename. Deliberate: that is the name the port table keys on, so banner and port derivation now
+  name the same directory.
+
   **Where the shared helper cannot reach, the two spellings are written OUT — and that is
   deliberate, not laziness** (#959). `lib/repo-reap.sh` registers the clone's logical and physical
   roots once (`reap_repo_register_roots`) and every caller inherits them, so most reaps never think

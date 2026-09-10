@@ -138,10 +138,19 @@ public class AppsFlyerPlugin: CAPPlugin, CAPBridgedPlugin, AppsFlyerLibDelegate 
         // method runs — see hasStarted's own comment for why a second call must never reach
         // registerSessionReadyListener a second time.
         guard !AppsFlyerPlugin.hasStarted else {
+            // #721 second marker. Measured on an iPad mini 5 / iOS 26.6.1 (2026-09-10): the FIRED
+            // line below did NOT print on a cold boot, while the Android port's did. That is only
+            // a finding if start() was actually CALLED -- an absent FIRED line is predicted just
+            // as well by "the JS never got here", and the iOS device log cannot see the WebView
+            // console the way Android's Capacitor/Console does, so the JS side is invisible from
+            // the one instrument this measurement has. These four markers (SHORT-CIRCUITED /
+            // ENTERED / REGISTERED / FIRED) are what separate those states.
+            NSLog("[AppsFlyerCap] start() SHORT-CIRCUITED by hasStarted (#721)")
             call.resolve(["ok": true])
             return
         }
         AppsFlyerPlugin.hasStarted = true
+        NSLog("[AppsFlyerCap] start() ENTERED — will register sessionReady listener (#721)")
 
         // v7: the SDK never calls start() itself, and start() should run once it reports
         // readiness (config set, cold/warm-launch deeplink resolution settled behind a
@@ -167,6 +176,9 @@ public class AppsFlyerPlugin: CAPPlugin, CAPBridgedPlugin, AppsFlyerLibDelegate 
         // `didFinishLaunching` and that the block is "always dispatched on the main queue", so
         // main is where the registration was always meant to happen.
         DispatchQueue.main.async {
+            // Separately from ENTERED above: this one runs on the MAIN queue, one hop later. If
+            // ENTERED prints and this does not, the hop itself is what did not happen.
+            NSLog("[AppsFlyerCap] registering sessionReady listener NOW (#721)")
             AppsFlyerLib.shared().registerSessionReadyListener {
                 // ── #721: the ONE observation that tells the two hypotheses apart ──
                 //

@@ -597,7 +597,9 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
     class with a quieter symptom — it flushes the source's park first (the click is consent, as
     `assetViews/reimport.ts` already does) rather than being refused with the reason discarded.
   - ⚠️ **`unknown agent op` does NOT mean "no renderer" over this transport.** `ws.send`
-    BROADCASTS to every HMR client and `createBrowserRequestRegistry` is first-reply-wins;
+    BROADCASTS to every HMR client and `createBrowserRequestRegistry` WAS first-reply-wins (⚠️ since
+    #1030 it settles on the first AUTHORITATIVE reply — a decline is counted, not obeyed — so the
+    race below is closed; the guard is kept because it must not depend on the transport);
     `initAgentBridge()` runs on any editor-flagged page but `registerEditorAgentOps()` only from
     `editor/setup.ts`. So a second tab on the dev server's runtime route answers *"unknown agent
     op"* instantly and beats the editor tab that actually holds the park — and reading that as

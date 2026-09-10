@@ -30,7 +30,7 @@ import { PLUGIN_CLASS_LEGS, discoverPluginPackages, legLabel, relKey, schemeFor 
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 
-type Leg = { dir: string; shape: 'spm' | 'flat'; flatSources?: string[] }
+type Leg = { dir: string; shape: 'spm' | 'flat' | 'no-spm'; flatSources?: string[]; reason?: string }
 const allLegs = PLUGIN_CLASS_LEGS as Leg[]
 
 /**
@@ -87,11 +87,35 @@ describe('#981 plugin-class leg coverage', () => {
     expect(labels.length).toBe(new Set(labels).size)
   })
 
-  it('resolves an xcodebuild scheme for every package, because the scheme IS the package name', () => {
+  it('resolves an xcodebuild scheme for every package it will actually build', () => {
     // A null scheme makes the runner SKIP with a reason rather than build the wrong thing — so a
     // manifest whose `name:` this cannot read would quietly remove a leg from the gate.
-    for (const leg of legs) {
+    // ⚠️ 'no-spm' rows are excluded because the runner returns N/A before it ever looks for a
+    // scheme, so a scheme it will never use is not this test's business.
+    //
+    // ⚠️ This comment used to add "so deleting that vestigial Package.swift, a perfectly reasonable
+    // follow-up, would not fail a test about schemes." That was FALSE when written: the premise
+    // guard in capacitorPlatformDeclarations.test.ts hard-asserts the manifest EXISTS for every
+    // 'no-spm' row, because the manifest is that row's own stated evidence. Deleting it reddens
+    // `verify` either way — deliberately. The exclusion here is a scoping choice, not a licence to
+    // remove the file.
+    for (const leg of legs.filter((l) => l.shape !== 'no-spm')) {
       expect(schemeFor(path.join(repoRoot, leg.dir)), `no scheme for ${leg.dir}`).toBeTruthy()
+    }
+  })
+
+  it('gives every no-spm leg a reason, and no other leg one', () => {
+    // The reason is printed in the gate summary and is the only thing standing between an N/A row
+    // and a silent permanent exemption — #991's whole complaint about the shape it replaced. A row
+    // added without one would report `N/A` with a placeholder nobody wrote.
+    for (const leg of legs) {
+      if (leg.shape === 'no-spm') {
+        expect(leg.reason?.trim(), `${leg.dir} is 'no-spm' but declares no reason`).toBeTruthy()
+        // A bare ticket number is not an explanation — the summary reader has no browser.
+        expect(leg.reason!.length, `${leg.dir}'s reason is too short to explain anything`).toBeGreaterThan(40)
+      } else {
+        expect(leg.reason, `${leg.dir} is '${leg.shape}' but carries a reason — dead config`).toBeUndefined()
+      }
     }
   })
 
@@ -103,9 +127,9 @@ describe('#981 plugin-class leg coverage', () => {
           expect(fs.existsSync(path.join(repoRoot, leg.dir, rel)), `${leg.dir}/${rel} is missing`).toBe(true)
         }
       } else {
-        // A stale flatSources on an 'spm' row is dead config that reads as if it were doing
-        // something — the runner ignores it entirely.
-        expect(leg.flatSources, `${leg.dir} is 'spm' but carries flatSources`).toBeUndefined()
+        // A stale flatSources on an 'spm' or 'no-spm' row is dead config that reads as if it were
+        // doing something — the runner ignores it entirely.
+        expect(leg.flatSources, `${leg.dir} is '${leg.shape}' but carries flatSources`).toBeUndefined()
       }
     }
   })

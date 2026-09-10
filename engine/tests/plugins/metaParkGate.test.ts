@@ -64,7 +64,12 @@ const rendererWithParks = (parked: string[]): RendererStub => (op, params) => {
 
 /** A SECOND page is connected that does not have the editor ops — the dev server's runtime route,
  *  a very ordinary thing to have open. `ws.send` broadcasts and the request registry is
- *  first-reply-wins, so this page can answer before the editor tab that actually holds the park. */
+ *  first-reply-wins, so this page can answer before the editor tab that actually holds the park.
+ *
+ *  ⚠️ **That race is CLOSED as of #1030** — the relay counts declines and settles on the first
+ *  AUTHORITATIVE reply. These cases are KEPT and their assertions are unchanged: the guard must
+ *  fail closed on `unknown agent op` whatever the transport does, and that is what they pin. Read
+ *  the premise as "the guard does not depend on the transport", not as a live race. */
 const rendererWithoutEditorOps: RendererStub = () => { throw new Error("unknown agent op 'resolve-unsaved'"); };
 
 /** The renderer is definitively GONE — Electron rejects synchronously when the window is closed,
@@ -354,7 +359,8 @@ describe("the dev server's no-client rejection stays DEFINITIVE, not ambiguous",
 describe('the review findings, each pinned (#872/#882 review)', () => {
   it('F3 — an "unknown agent op" reply is COULD-NOT-LOOK, never "no renderer"', async () => {
     // The fail-open the gate produced against itself. `ws.send` broadcasts to every HMR client and
-    // the request registry is first-reply-wins; `initAgentBridge()` runs on any editor-flagged page
+    // the request registry WAS first-reply-wins (closed by #1030; this case pins that the guard does
+    // not depend on that fix); `initAgentBridge()` runs on any editor-flagged page
     // but `registerEditorAgentOps()` only from `editor/setup.ts`. So a plain `/` tab answers
     // "unknown agent op" INSTANTLY and beats the editor tab holding the park. Classifying that as
     // `absent` let the write through AND told the caller "there is no renderer" — the §0 rank-1
@@ -432,7 +438,7 @@ describe('the review findings, each pinned (#872/#882 review)', () => {
     // disclosures on this route all branch on the FIRST gate, and the second (discard) call
     // collapsed every non-`held` outcome — including a rejection — to `[]`. So: first probe says
     // held, caller passes discardUnsaved:true, the write lands, the second probe times out or
-    // loses the first-reply-wins race to a second HMR client → `{ok:true, sha256}` with no
+    // lost the first-reply-wins race to a second HMR client (closed by #1030) → `{ok:true, sha256}` with no
     // `discardedParked` and no note. The human's park SURVIVED, and their next Cmd+S flushes the
     // older document back over this write, reported as clean.
     //

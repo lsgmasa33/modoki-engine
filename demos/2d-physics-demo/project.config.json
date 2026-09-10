@@ -2,7 +2,7 @@
   "app": {
     "appId": "com.modokiengine.physicsdemo",
     "appName": "2D Physics Demo",
-    "iconSource": ""
+    "iconSource": "art/icon-app-master.png"
   },
   "content": {
     "scenes": []

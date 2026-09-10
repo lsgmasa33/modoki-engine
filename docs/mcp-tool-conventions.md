@@ -345,6 +345,67 @@ Rules:
     `CaptureUnavailableError` CLASS for exactly this reason; `relayFailureStatus`'s scar is what
     string-matching an error costs — a bare word in one op's prose eventually collides with
     another's.
+- ⚠️ **THE RELAY IS A BROADCAST, and it settles on the first AUTHORITATIVE reply — not the first
+  reply** (#1030). `ws.send` reaches every HMR client, so `modoki:request` runs in every open tab,
+  not only the editor's. A tab on the dev server's runtime route has no editor ops registered and
+  used to REJECT in about a millisecond, beating the editor tab (which has to do the actual work)
+  and settling the request on its behalf. Anything reading that rejection as *"no editor exists"*
+  then got a false negative about a live editor holding state: `applyMovesInRenderer` maps
+  `unknown agent op` to `{kind:'absent'}` and skipped the asset-path repair **silently** — no warn,
+  no `repairFailed` — while the editor's bindings, parked writes and Inspector selection still
+  keyed on the dead path (#186's symptom, reported as a clean move).
+
+  **A decline is not an answer.** A client answers `{declined: true}` for an op it has no handler
+  for (`relayResponseFor`, `agentBridge.ts`), and the registry COUNTS declines, rejecting only once
+  every client has declined — at which point *"nothing out there has this op"* is true rather than
+  merely first.
+  - ⚠️ **The denominator is ANNOUNCED BRIDGE CLIENTS, not `ws.clients.size`.** Counting sockets
+    made an ordinary case hang: `/@vite/client` connects while `index.html` is still parsing, but
+    `initAgentBridge` is reached through a dynamic import several module-graph levels later — and
+    never at all for a tab sitting on the Vite error overlay. Such a tab is counted-but-mute, its
+    decline never arrives, and the request rides the CALLER's full budget instead of settling
+    (1.5s on the move repair, which then warns about a live editor that was never at risk; 60s on
+    `/api/eval`). A client is counted once it has sent a `modoki:schema` or a `modoki:response`;
+    one that has announced nothing has also registered no ops, so excluding it can hide no answer.
+  - ⚠️ **Declines are a SET of clients, not a tally.** `settle`'s contract is that a duplicate or
+    late reply cannot double-settle, and on the decline path keeping that needs identity — Vite
+    supplies it as the second argument to `ws.on`. Without it, two replies carrying one id from
+    the SAME client reach the denominator and reject while the editor is still working, which is
+    #1030 reinstated. `initAgentBridge` has no idempotency flag and `hot.on` appends without
+    dedupe, so that pair is one stray double-registration away.
+  - ⚠️ **`declined` and `error` are separate channels because they mean opposite things.** "I do
+    not have this op" is countable; "this op threw" is a real answer from the one client that OWNS
+    the op and must settle immediately. Collapsing them — which is what letting `runAgentOp` throw
+    did — IS the defect, and collapsing them the other way turns every genuine failure into a
+    stall.
+  - ⚠️ **Membership is asked BEFORE dispatch**, never by catching `/unknown agent op/` out of the
+    dispatch: a string test would miscount an op that legitimately throws those words, and would
+    already have RUN the op before deciding whether it existed.
+  - ⚠️ **The all-declined rejection carries the SAME `unknown agent op '<op>'` string**, and that
+    is load-bearing. Three consumers in `editorBackendRouter` key off it and they disagree about
+    what it MEANS on purpose — a repair's safe answer (`absent`) and a guard's safe answer
+    (`unknown` → refuse) are opposites on that exact string. #1030 removes the race WITHOUT moving
+    the string; a fix that "cleaned it up" would silently re-decide both.
+  - The same string arriving as a plain `error` (a tab loaded before #1030) is counted as a decline
+    too, **at the transport and nowhere else** — that is the only layer that knows the send was a
+    broadcast. ⚠️ That test is **anchored** (`/^unknown agent op\b/i`) and gated on the reply
+    carrying no `result`, unlike the three consumer-side tests. They ask *"is this message about an
+    absent op?"*; this one asks *"is this reply a decline rather than an answer?"* and runs against
+    every reply, so an unanchored version would miscount a real op whose own error contains the
+    words — the precise miscount the client-side membership test exists to avoid.
+  - **Bounds, both accepted:** a client that disconnects mid-flight never declines, so the request
+    rides to its timeout instead of settling absent (honest, and every consumer already treats a
+    timeout as ambiguous); and if a future Vite stops exposing `ws.clients` the intersection
+    falls back to every client still in the announced set — which is bounded only because that set
+    is PRUNED on `vite:client:disconnect`. ⚠️ Without the prune that fallback counts every client
+    ever seen, and after a day of HMR full-reloads every relayed op would ride its full budget.
+  - **Vite only.** Electron sends to its one renderer window and has no broadcast, so its relay
+    reaches `agentBridge`'s dispatcher directly rather than through `relayResponseFor`. ⚠️ **Do not
+    "make the two consistent"** — routing Electron through it would emit `declined` replies, and
+    `main.ts` would resolve them as `undefined`, turning every unregistered op there from a
+    `504 NOT_AVAILABLE_HERE` into a fabricated `200 {}` across ~30 relayed routes. That handler
+    rejects on `declined` now, so the trap is closed from both ends, but the asymmetry is correct.
+
 - **A relayed route never HARD-CODES its catch status** (#1013). This is the receive-side half of
   the rule above, and the two are not the same fix: the emit side stops an op from *losing* its
   code, this side stops the route from *inventing* one. `ctx.requestBrowser` rejects identically

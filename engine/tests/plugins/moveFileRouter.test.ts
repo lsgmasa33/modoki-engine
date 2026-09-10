@@ -4,7 +4,7 @@
  *  must NOT be treated as a collision. We model that here with a hardlink so the
  *  two differently-cased paths share one inode even on a case-sensitive CI FS. */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -13,7 +13,7 @@ import { handleBackendRequest, type BackendContext } from '../../plugins/backend
 // `resolveAssetPath` here silently modelled a route that does NOT tolerate a missing leading
 // slash or a percent-encoded segment — which is precisely the tolerance the canonicalization
 // finding is about, so a fake would have made the guard defend the bug.
-import { resolveAssetPath, absToAssetUrl, type AssetRoot } from '../../plugins/vite-asset-scanner';
+import { resolveAssetPath, absToAssetUrl, createBrowserRequestRegistry, type AssetRoot } from '../../plugins/vite-asset-scanner';
 
 let tmp: string;
 let tmp2: string;
@@ -309,7 +309,13 @@ describe('/api/move-file distinguishes NO renderer from an UNREPAIRED one (#867 
     ['editor window closed', 'electron, closed'],
     ['project changed — renderer reloading', 'electron, deliberate teardown'],
     ['Object has been destroyed', 'electron, webContents died'],
-    ["unknown agent op 'apply-asset-path-moves'", 'a runtime build with no editor ops'],
+    // ⚠️ Since #1030 this string can ONLY arrive after every connected client has declined, so it
+    // now means what it always claimed to: nothing out there has this op. Before #1030 it could
+    // also be one runtime tab winning a broadcast race against a live editor, which is why the
+    // silence below was a defect (#1030) rather than the correct answer it is now. Same row, same
+    // assertion, different justification -- and the integration case at the bottom of this file is
+    // what pins the other half.
+    ["unknown agent op 'apply-asset-path-moves'", 'every client declined — nothing has the op'],
   ])('is SILENT and claims no repair for %j (%s)', async (msg) => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const err = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -356,5 +362,48 @@ describe('/api/move-file distinguishes NO renderer from an UNREPAIRED one (#867 
     expect(r.status).toBeUndefined();
     expect(r.body?.repairFailed).toMatch(/not an asset-root path/);
     expect(rec.asked).toHaveLength(0);   // nothing unmatchable was sent
+  });
+});
+
+/** #1030 — the case that could not be represented before this change: a foreign client DECLINES
+ *  while the editor answers, and the repair must APPLY.
+ *
+ *  ⚠️ Every other case in this file stubs `requestBrowser` above the relay, so none of them can
+ *  see the broadcast race at all — which is exactly why the defect lived here with the suite
+ *  green. This one drives the REAL `createBrowserRequestRegistry` underneath the route's
+ *  `requestBrowser`, with two clients: a runtime tab with no editor ops (declines instantly) and
+ *  an editor tab that does the work. Pre-#1030 the decline settled the request, the route mapped
+ *  `unknown agent op` to `absent`, and the move reported clean while the editor's bindings, parked
+ *  writes and Inspector selection still pointed at the dead path (#186's symptom). */
+describe('the repair APPLIES when a runtime tab declines and the editor answers (#1030)', () => {
+  it('is not fooled by the faster, ignorant reply', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const reg = createBrowserRequestRegistry();
+    const ctx = {
+      ...makeCtx(),
+      requestBrowser: (op: string, params: unknown, timeoutMs = 3000) => {
+        rec.asked.push({ op, params });
+        // TWO clients receive the broadcast.
+        const p = reg.request((id) => {
+          // The runtime tab: no editor ops registered, answers in ~1ms and would have won.
+          queueMicrotask(() => reg.settle(id, undefined, undefined, true));
+          // The editor tab: actually does the repair, and answers later.
+          setTimeout(() => reg.settle(id, { notes: ['repointed 2 bindings'] }), 0);
+        }, timeoutMs, op, 2);
+        return p;
+      },
+    } as unknown as BackendContext;
+
+    fs.writeFileSync(path.join(tmp, 'a.json'), '{}');
+    const r = await handleBackendRequest(ctx, {
+      method: 'POST', urlPath: '/api/move-file', query: new URLSearchParams(),
+      body: { from: '/a.json', to: '/b.json' },
+    }) as { status?: number; body?: { ok?: boolean; repaired?: string[]; repairFailed?: string } };
+
+    expect(r.status).toBeUndefined();
+    expect(r.body?.repairFailed).toBeUndefined();      // NOT reported as unrepairable...
+    expect(r.body?.repaired).toBeTruthy();             // ...and NOT silently skipped as absent
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
   });
 });

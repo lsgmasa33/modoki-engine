@@ -573,7 +573,7 @@ let resetHeldPointerOnReload: (() => void) | null = null;
 let cachedSchema: SceneSchema | undefined;
 
 // ── M→R: pending requestRenderer() calls keyed by a monotonic id. ──
-const pendingRenderer = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
+const pendingRenderer = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout; op: string }>();
 let nextRequestId = 1;
 
 /** Reject + clear every in-flight requestRenderer call (on window close or a
@@ -587,8 +587,17 @@ function failPendingRenderer(reason: string): void {
   pendingRenderer.clear();
 }
 
-/** Forward an op to the editor renderer over IPC and await its reply. The
- *  renderer-side dispatcher is agentBridge.handleOp (same as the HMR path). */
+/** Forward an op to the editor renderer over IPC and await its reply.
+ *
+ *  The renderer-side dispatcher is `agentBridge`'s `handleOp` — reached DIRECTLY here, unlike the
+ *  HMR path, which since #1030 goes through `relayResponseFor`. ⚠️ **That asymmetry is correct and
+ *  must not be "made consistent".** #1030 exists because Vite BROADCASTS to every HMR client, so a
+ *  tab without the editor ops could answer on the editor's behalf; this transport sends to exactly
+ *  one `webContents`, so there is no race and nothing to count. Routing it through
+ *  `relayResponseFor` would emit `{declined:true}` replies that the handler below would resolve as
+ *  `undefined` — turning every unregistered op on Electron from a `504 NOT_AVAILABLE_HERE` into a
+ *  fabricated `200 {}` across ~30 relayed routes. The handler rejects on `declined` anyway, so the
+ *  trap is closed from both ends. */
 function requestRenderer(op: string, params: unknown, timeoutMs = 3000): Promise<unknown> {
   return new Promise((resolve, reject) => {
     if (!mainWindow || mainWindow.webContents.isDestroyed()) {
@@ -600,7 +609,7 @@ function requestRenderer(op: string, params: unknown, timeoutMs = 3000): Promise
       pendingRenderer.delete(id);
       reject(new Error('timed out waiting for the renderer — is the editor window open?'));
     }, timeoutMs);
-    pendingRenderer.set(id, { resolve, reject, timer });
+    pendingRenderer.set(id, { resolve, reject, timer, op });
     mainWindow.webContents.send('modoki:bridge-request', { id, op, params });
   });
 }
@@ -1165,8 +1174,8 @@ function rebuildMenu(): void {
 // panel (matching the navy app icon) rather than a plain OS message box. Shows the
 // icon, name + ™, engine/runtime versions, copyright, and a link to the site.
 // The icon is sourced from the editor favicon (which ships inside the packaged
-// engine tree) so it renders in dev AND packaged; build/icon.png is the dev
-// fallback. Reuses a single window (focuses it if already open).
+// engine tree) so it renders in dev AND packaged; engine/assets/app-icon-default.png
+// is the fallback. Reuses a single window (focuses it if already open).
 let aboutWindow: BrowserWindow | null = null;
 
 function showAboutDialog(): void {
@@ -1174,7 +1183,7 @@ function showAboutDialog(): void {
 
   const iconFile = [
     path.join(REPO_ROOT, 'engine', 'packages', 'modoki', 'src', 'runtime', 'assets', 'favicon.png'),
-    path.join(REPO_ROOT, 'build', 'icon.png'),
+    path.join(REPO_ROOT, 'engine', 'assets', 'app-icon-default.png'),
     process.resourcesPath ? path.join(process.resourcesPath, 'icon.png') : '',
   ].find((p) => { try { return !!p && fs.existsSync(p); } catch { return false; } });
   let iconSrc = '';
@@ -1264,7 +1273,7 @@ app.whenReady().then(async () => {
   // menu — no native about panel (setAboutPanelOptions) is used anymore.
   // Dev: show the Modoki icon in the Dock (packaged builds get it from the bundle).
   if (process.platform === 'darwin' && !app.isPackaged && app.dock) {
-    try { app.dock.setIcon(path.join(REPO_ROOT, 'build', 'icon.png')); } catch { /* best-effort */ }
+    try { app.dock.setIcon(path.join(REPO_ROOT, 'engine', 'assets', 'app-icon-default.png')); } catch { /* best-effort */ }
   }
 
   // Packaged: prefer bundled native CLIs (extraResources/bin) over PATH. No-op
@@ -1700,12 +1709,20 @@ app.whenReady().then(async () => {
       // handleZoom directly in rebuildMenu). Whole-app UI zoom via webContents.
       handleZoom(mainWindow, msg.data as { dir?: 'in' | 'out' | 'reset'; deltaY?: number });
     } else if (msg.event === 'response') {
-      const { id, result, error } = msg.data as { id: number; result?: unknown; error?: string };
+      const { id, result, error, declined } = msg.data as
+        { id: number; result?: unknown; error?: string; declined?: boolean };
       const p = pendingRenderer.get(id);
       if (!p) return;
       clearTimeout(p.timer);
       pendingRenderer.delete(id);
-      if (error) p.reject(new Error(error)); else p.resolve(result);
+      // ⚠️ A `declined` reply (the renderer has no handler for that op) must REJECT, not resolve
+      // (#1030 close-out F6). This transport does not produce one today — `requestRenderer`'s
+      // docblock says why, and why it must not start — but the destructure above used to drop the
+      // field entirely, so if one ever arrived it fell through to `resolve(undefined)` and every
+      // relayed route reported a fabricated `200 {}` instead of `504 NOT_AVAILABLE_HERE`. Rejecting
+      // with the string the classifiers already key on costs nothing and removes the trap.
+      if (declined) p.reject(new Error(`unknown agent op '${p.op}'`));
+      else if (error) p.reject(new Error(error)); else p.resolve(result);
     }
   });
 

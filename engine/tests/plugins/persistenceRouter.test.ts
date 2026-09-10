@@ -155,7 +155,9 @@ describe('Phase 1: file-direct routes report `saved` (additive, no behaviour cha
    *
    *  `unknown agent op` means the editor OPS are unregistered. It does not mean the WINDOW is gone,
    *  and the window is what holds unsaved work. Two ways to reach it in production: the relay is a
-   *  broadcast and first-reply-wins, so a second tab on the runtime route answers instantly and
+   *  broadcast and WAS first-reply-wins (⚠️ closed by #1030 — kept because this guard must fail
+   *  closed on the string regardless of transport), so a second tab on the runtime route answered
+   *  instantly and
    *  beats the editor tab; and the launch race, or a bridge connected from a game page rather than
    *  `#/editor`. (An earlier version of this comment also blamed a game-code boot fault — refuted:
    *  `gameBootFaults.ts` is what FIXED that, and `registerEditorAgentOps()` is now unconditionally

@@ -59,9 +59,22 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 const pluginDir = path.join(repoRoot, 'engine', 'packages', 'capacitor-game-debug');
 const requireAll = process.argv.slice(2).includes('--require-all');
 
-/** A leg either RAN (pass/fail) or was SKIPPED for a stated environmental reason. */
+/** A leg either RAN (pass/fail), was SKIPPED for a stated environmental reason, or is N/A. */
 const results = [];
 const skip = (name, reason) => results.push({ name, status: 'SKIP', reason });
+/** N/A — this leg does not exist to be run, and no machine can change that.
+ *
+ *  ⚠️ The distinction from SKIP is the whole point and it is load-bearing for `--require-all`. A
+ *  SKIP says "this runner could not check it" — install Xcode, provision a JDK, and it becomes a
+ *  real result, so counting it as a failure under `--require-all` is right. An N/A says "there is
+ *  nothing here to check", which is a fact about the PACKAGE (see the 'no-spm' shape in
+ *  nativePluginLegs.mjs). Folding the two together would mean a pre-release run can never be green
+ *  no matter what is installed, which is how `--require-all` stops being used at all.
+ *
+ *  ⚠️ It is not a quiet exemption either: it prints with its reason like every other row, and the
+ *  premise behind each N/A row is asserted under `npm run verify` by
+ *  `capacitorPlatformDeclarations.test.ts`, so a row that stops being true goes red there. */
+const na = (name, reason) => results.push({ name, status: 'N/A', reason });
 const record = (name, code) => results.push({ name, status: code === 0 ? 'PASS' : 'FAIL' });
 
 /** Is this command runnable? An ABSOLUTE path is answered from the filesystem, not from
@@ -200,6 +213,11 @@ for (const leg of SWIFT_LEGS) {
 for (const leg of PLUGIN_CLASS_LEGS) {
   const name = `ios/class/${legLabel(leg.dir)}`;
   const dir = path.join(repoRoot, leg.dir);
+  // ⚠️ BEFORE the platform/toolchain gates, on purpose. A 'no-spm' row is a statement about the
+  // PACKAGE, not about this machine — reporting it as SKIP on a Linux runner ("no xcodebuild")
+  // would name the wrong cause and, worse, would make `--require-all` fail on something no
+  // amount of tooling can satisfy. The answer is the same on every machine, so it is decided here.
+  if (leg.shape === 'no-spm') { na(name, leg.reason ?? 'no reason declared — fix the row in nativePluginLegs.mjs'); continue; }
   if (process.platform !== 'darwin') { skip(name, `xcodebuild needs macOS (this is ${process.platform})`); continue; }
   if (!has('xcodebuild')) { skip(name, 'no `xcodebuild` on PATH — install Xcode'); continue; }
   if (!fs.existsSync(path.join(dir, 'Package.swift'))) { skip(name, `no package at ${leg.dir}`); continue; }
@@ -412,6 +430,11 @@ for (const r of results) {
 const failed = results.filter((r) => r.status === 'FAIL');
 const skipped = results.filter((r) => r.status === 'SKIP');
 const known = results.filter((r) => r.status === 'KNOWN-FAIL');
+const notApplicable = results.filter((r) => r.status === 'N/A');
+if (notApplicable.length) {
+  console.log(`\n${notApplicable.length} leg(s) are N/A — there is nothing to build, on any machine: ${notApplicable.map((r) => r.name).join(', ')}.`);
+  console.log('Off the exit code even under --require-all, because no toolchain can satisfy them. Each one\'s premise is asserted by capacitorPlatformDeclarations.test.ts under `npm run verify`, so a row that goes stale fails THERE.');
+}
 if (skipped.length && !requireAll) {
   console.log(`\n${skipped.length} leg(s) SKIPPED — this run did NOT check them. Re-run with --require-all to treat that as a failure.`);
 }

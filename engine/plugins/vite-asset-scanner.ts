@@ -88,6 +88,7 @@ import {
 } from './releaseBuild';
 import { PROJECT_USER_CONFIG_FILENAME } from '../project-config';
 import { iconIsUpToDate, iconStampValue } from './iconAssets';
+import { bundledIconPath } from '../scripts/iconAssets.mjs';
 import { ensureCapacitorDeps, scaffoldNativeTarget, isNativeTargetScaffolded, type NativePlatform } from './addNativeTarget';
 import { discoverSigningTeams, type SigningTeam } from './signingTeams';
 import { serveProjectAsset } from './backend/staticAssets';
@@ -803,6 +804,51 @@ export function createEditorWriteGuard(ttlMs = 1500, now: () => number = Date.no
   return { mark, isWrite };
 }
 
+/** The rejection a client sends when it has no handler registered for an op. Spelled ONCE here
+ *  and matched case-insensitively, because it is simultaneously: the string `agentBridge.runAgentOp`
+ *  throws, the legacy shape a pre-#1030 tab still replies with, and the string three consumers in
+ *  `editorBackendRouter` classify on. See `settle`.
+ *
+ *  ⚠️ **ANCHORED**, unlike the three consumer-side tests, and deliberately so. Those ask "is this
+ *  message about an absent op?"; this one asks "is this reply a DECLINE rather than an answer?",
+ *  and it runs against EVERY reply, a real op's genuine throw included. An unanchored test would
+ *  miscount an op whose own error happens to contain the words — the exact miscount
+ *  `agentBridge`'s membership test exists to avoid on the CLIENT side, which it would be absurd to
+ *  reintroduce here. `runAgentOp` throws this string with nothing before it, so the anchor still
+ *  matches every legacy reply. */
+const UNKNOWN_AGENT_OP_RE = /^unknown agent op\b/i;
+
+/** Route one `modoki:response` payload into the pending-request registry.
+ *
+ *  A one-line function, exported for one reason: it is the WIRING, and the wiring is what #1030's
+ *  own close-out found untested (F1). With the mapping inline in `configureServer`, changing
+ *  `data.declined === true` to `false` left all 228 tests green — and that mutation is WORSE than
+ *  the bug being fixed: a `{declined:true}` reply then has `error === undefined`, falls past the
+ *  decline branch, and RESOLVES the request with `undefined`, so `applyMovesInRenderer` reports
+ *  `{kind:'applied', notes: []}` — a fabricated success where the old code at least said `absent`. */
+export function settleRelayReply(
+  registry: { settle: (id: number, result?: unknown, error?: string, declined?: boolean, client?: unknown) => boolean },
+  data: { id: number; result?: unknown; error?: string; declined?: boolean },
+  client?: unknown,
+): boolean {
+  return registry.settle(data.id, data.result, data.error, data.declined === true, client);
+}
+
+/** How many of `announced` are still in `live` — the decline denominator (#1030 close-out F2).
+ *
+ *  Pure and exported so the intersection is testable without a dev server. `live` is Vite's
+ *  `ws.clients` (a `Set`); when a transport exposes no membership test, every announced client is
+ *  assumed present. ⚠️ That fallback is bounded only BECAUSE the caller also prunes on
+ *  `vite:client:disconnect`; without the prune it counts every client ever seen, and after a day
+ *  of HMR full-reloads (each a fresh socket, each announcing) every relayed op would ride its full
+ *  budget. Within that bound it is the conservative direction: too HIGH degrades to the caller's
+ *  timeout, never to a premature `absent`. */
+export function countLiveBridgeClients(announced: Iterable<unknown>, live?: { has?: (c: unknown) => boolean }): number {
+  let n = 0;
+  for (const c of announced) { if (!live?.has || live.has(c)) n++; }
+  return n;
+}
+
 /** In-flight browser-request bookkeeping for `requestBrowser` — the dev server
  *  relays an op over the HMR socket and awaits the browser's `modoki:response`.
  *  Factored out (with injectable timers) because the lifecycle is the regression-
@@ -817,19 +863,40 @@ export function createBrowserRequestRegistry(
   },
 ) {
   let nextId = 1;
-  const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: unknown }>();
+  const pending = new Map<number, {
+    resolve: (v: unknown) => void; reject: (e: Error) => void; timer: unknown;
+    /** The op name, so an all-declined settle can name it in the SAME string a single
+     *  `unknown agent op` rejection used to carry (see `settle`). */
+    op: string;
+    /** How many announced bridge clients the broadcast reached, captured at send time. */
+    expected: number;
+    /** WHICH clients have said "I do not have this op" — a set, not a count, so one client's
+     *  duplicate reply cannot stand in for a second client's silence (#1030 close-out F3). */
+    declinedBy: Set<unknown>;
+    /** Declines that arrived with no client identity (a transport that supplies none, and the
+     *  unit tests). Counted, because there is nothing to dedupe them by. */
+    declinedAnon: number;
+  }>();
 
   /** Begin a request: allocate an id, arm the timeout, register the settlers, then
    *  run `send(id)` (the actual ws.send). If `send` throws, clean up immediately
-   *  instead of leaking the timer + entry until the timeout fires. */
-  function request(send: (id: number) => void, timeoutMs: number): Promise<unknown> {
+   *  instead of leaking the timer + entry until the timeout fires.
+   *
+   *  `op` and `expected` exist for the decline counting in `settle` — see #1030.
+   *
+   *  ⚠️ **Both are REQUIRED, and that is the guard** (#1030 close-out F1). They were optional with
+   *  `expected = 1`, and dropping them at the one production call site silently restored the exact
+   *  defect this registry was written to fix — with the whole suite green, because every test
+   *  passes them explicitly. Required makes that mutation a compile error instead. A caller that
+   *  genuinely cannot count its clients passes `1` and says so. */
+  function request(send: (id: number) => void, timeoutMs: number, op: string, expected: number): Promise<unknown> {
     return new Promise((resolve, reject) => {
       const id = nextId++;
       const timer = timers.set(() => {
         pending.delete(id);
         reject(new Error('timed out waiting for the browser — is the app open at the dev URL?'));
       }, timeoutMs);
-      pending.set(id, { resolve, reject, timer });
+      pending.set(id, { resolve, reject, timer, op, expected: Math.max(1, expected), declinedBy: new Set(), declinedAnon: 0 });
       try {
         send(id);
       } catch (e) {
@@ -841,10 +908,62 @@ export function createBrowserRequestRegistry(
   }
 
   /** Settle a pending request from a browser reply. No-op (returns false) if the id
-   *  is unknown or already settled — so a duplicate/late response can't double-reject. */
-  function settle(id: number, result?: unknown, error?: string): boolean {
+   *  is unknown or already settled — so a duplicate/late response can't double-reject.
+   *
+   *  ## ⚠️ A DECLINE IS NOT AN ANSWER (#1030)
+   *
+   *  `ws.send` is a BROADCAST — every HMR client gets the request — and this used to settle on
+   *  whichever reply arrived first. A tab on the dev server's runtime route has no editor ops
+   *  registered, so it rejects in about a millisecond and BEATS the editor tab, which has to do
+   *  the actual work. Any consumer reading that rejection as "no editor exists" then gets a false
+   *  negative about a live editor holding state: `applyMovesInRenderer` maps `unknown agent op`
+   *  to `{kind:'absent'}` and skips the path repair SILENTLY — no warn, no `repairFailed` — while
+   *  the editor's bindings, parked writes and Inspector selection still key on the dead path.
+   *
+   *  So a decline no longer settles on its own. It is COUNTED, and the request rejects only once
+   *  every client the broadcast reached has declined — at which point "nothing out there has this
+   *  op" is true rather than merely first.
+   *
+   *  ⚠️ **The all-declined rejection carries the SAME `unknown agent op '<op>'` string it always
+   *  did**, and that is load-bearing rather than lazy: `applyMovesInRenderer`, `relayProvesNoRenderer`
+   *  and `relayFailureStatus` all key off it, and they disagree about what it MEANS on purpose (a
+   *  repair's safe answer and a guard's safe answer are opposites on this string — see
+   *  `relayProvesNoRenderer`'s banner). Nothing downstream changes; only the race is removed.
+   *
+   *  ⚠️ **`declined` is also inferred from the legacy string.** A tab loaded before this change
+   *  answers `error: "unknown agent op '<op>'"` with no flag, and would otherwise settle the whole
+   *  request the old way — reintroducing the race for exactly as long as one stale tab stays open.
+   *  The string test belongs HERE, at the transport, and nowhere else: this is the only layer that
+   *  knows the send was a broadcast.
+   *
+   *  ⚠️ **A client that disconnects mid-flight never declines**, so its share of the count never
+   *  arrives and the request rides to its timeout instead of settling `absent`. Deliberate: a
+   *  timeout is the honest answer there, and every consumer already treats it as AMBIGUOUS rather
+   *  than as proof of absence (`isRelayTimeout`). */
+  function settle(id: number, result?: unknown, error?: string, declined = false, client?: unknown): boolean {
     const p = pending.get(id);
     if (!p) return false;
+    // ⚠️ `result === undefined` is part of the test, not decoration: a reply carrying a RESULT is
+    // an answer whatever its error field happens to say.
+    if (declined || (error !== undefined && result === undefined && UNKNOWN_AGENT_OP_RE.test(error))) {
+      // ⚠️ Dedupe by CLIENT. This function's header promises a duplicate reply cannot double-settle,
+      // and on the decline path that promise needs identity to keep: two declines carrying the same
+      // id from the SAME client would otherwise reach `expected` and reject while the editor tab is
+      // still doing the work — #1030 reinstated, silently. `initAgentBridge` has no idempotency
+      // flag and Vite's `hot.on` appends without dedupe, so a double-registration produces exactly
+      // that pair; what prevents it today is incidental (agentBridge.ts's module header says so).
+      if (client !== undefined) {
+        if (p.declinedBy.has(client)) return false;
+        p.declinedBy.add(client);
+      } else {
+        p.declinedAnon += 1;
+      }
+      if (p.declinedBy.size + p.declinedAnon < p.expected) return false;   // someone may still answer
+      timers.clear(p.timer);
+      pending.delete(id);
+      p.reject(new Error(error || `unknown agent op '${p.op}'`));
+      return true;
+    }
     timers.clear(p.timer);
     pending.delete(id);
     if (error) p.reject(new Error(error));
@@ -1438,7 +1557,7 @@ export function assetScannerPlugin(): Plugin {
   // and the cast kept the old `{ ws: { send } }` shape, which still compiled (the narrower type is
   // assignable) while telling the next reader `clients` was not there — the field the guard is
   // built on. A shared alias makes that impossible rather than tidy.
-  type ViteServerRef = { ws: { send: (m: object) => void; clients?: { size: number } } };
+  type ViteServerRef = { ws: { send: (m: object) => void; clients?: { size: number; has?: (c: unknown) => boolean } } };
   let viteServer: ViteServerRef | null = null;
 
   // ── Agent bridge state (dev-only AI/tooling helpers) ──
@@ -1449,6 +1568,35 @@ export function assetScannerPlugin(): Plugin {
   // waits for its modoki:response). Lifecycle + timer bookkeeping live in
   // createBrowserRequestRegistry (above), factored out so it's unit-testable.
   const browserRequests = createBrowserRequestRegistry();
+  /** HMR clients that have PROVEN they run the agent bridge, by sending us a `modoki:schema` or a
+   *  `modoki:response` (#1030 close-out F2).
+   *
+   *  ⚠️ **`ws.clients.size` is the wrong denominator for the decline count, and using it made an
+   *  ordinary case hang.** It counts SOCKETS: `/@vite/client` connects while `index.html` is still
+   *  parsing, but `initAgentBridge` is reached through a dynamic import several module-graph levels
+   *  later (`app/main.tsx`) — and never at all for a tab sitting on the Vite error overlay after a
+   *  compile error. Such a tab is counted-but-mute, its decline never arrives, and the request rides
+   *  the CALLER's full budget instead of settling: 1.5s on the move repair (which then warns and
+   *  reports `repairFailed` about a live editor that was never at risk), 60s on `/api/eval`. Before
+   *  #1030 that case was instant, silent and correct.
+   *
+   *  Counting only clients that have announced themselves makes a mute tab cost nothing.
+   *
+   *  ⚠️ **An unannounced client is DANGEROUS, not merely invisible — which is why the announce
+   *  happens at handler-registration time** (`agentBridge`'s `announce`). An earlier version of
+   *  this comment argued that a client which has not announced "has not registered any op, so
+   *  excluding it cannot hide a real answer". True, and beside the point: it cannot hide an
+   *  ANSWER, but it can still send a DECLINE, and that decline completes a count that was one too
+   *  small. Excluding a client that can reply is #1030 again. The invariant to preserve is that
+   *  nothing can answer `modoki:request` before it has announced. */
+  const bridgeClients = new Set<unknown>();
+  /** How many announced bridge clients are STILL connected — the decline denominator.
+   *
+   *  Belt and braces: entries are pruned on `vite:client:disconnect` AND the set is intersected
+   *  with the live client list on every read. Either alone would do; both, because a stale entry
+   *  inflates the count into exactly the hang this denominator exists to remove, and the prune is
+   *  the only one of the two that also stops the set growing for the process lifetime. */
+  const liveBridgeClientCount = (): number => countLiveBridgeClients(bridgeClients, viteServer?.ws?.clients);
   // Scene/prefab files the editor just saved itself (via /api/write-file). The
   // watcher skips the hot-reload broadcast for these so an editor Cmd+S doesn't
   // bounce the live scene — external edits (an agent's file write, /api/scene-
@@ -1490,9 +1638,15 @@ export function assetScannerPlugin(): Plugin {
     if (viteServer.ws?.clients?.size === 0) {
       return Promise.reject(new Error(`no renderer connected to the dev server (op '${op}' was not delivered)`));
     }
+    // ⚠️ The denominator is read HERE, at send time, and handed to the registry — it is what makes
+    // a decline countable rather than final (#1030). It counts ANNOUNCED BRIDGE CLIENTS, not
+    // sockets: see `bridgeClients` for why the socket count made an ordinary boot hang. Falls back
+    // to 1 when nothing has announced yet, which reproduces the pre-#1030 behaviour (first decline
+    // wins) rather than waiting on a reply that cannot come.
+    const expected = liveBridgeClientCount();
     return browserRequests.request((id) => {
       viteServer!.ws.send({ type: 'custom', event: 'modoki:request', data: { id, op, params } });
-    }, timeoutMs);
+    }, timeoutMs, op, expected);
   }
 
   /** Re-scan all roots, rebuild the cached manifest, and broadcast a custom
@@ -1619,9 +1773,34 @@ export function assetScannerPlugin(): Plugin {
       // pending requestBrowser() promises when the browser replies. (See
       // app/debug/agentBridge.ts for the client half.)
       const ws = server.ws as unknown as { on: (e: string, cb: (data: any) => void) => void };
-      ws.on('modoki:schema', (data: SceneSchema) => { cachedSchema = data; });
-      ws.on('modoki:response', (data: { id: number; result?: unknown; error?: string }) => {
-        browserRequests.settle(data.id, data.result, data.error);
+      // Both handlers take Vite's second argument, the WebSocketClient (`WebSocketCustomListener`).
+      // It is this transport's only source of client IDENTITY, and #1030 needs it twice: to know
+      // which sockets actually run the bridge, and to keep one client's duplicate reply from
+      // counting as two declines.
+      // The announce (#1030 close-out): a client is counted from the instant it can decline, not
+      // from whenever its trait registry first becomes non-empty. See `agentBridge`'s `announce`.
+      ws.on('modoki:bridge-hello', (_data: unknown, client?: unknown) => {
+        if (client !== undefined) bridgeClients.add(client);
+      });
+      // Kept as a second source: a tab loaded before the announce existed still gets counted, and
+      // this is also the reconnect path for one whose hello raced a server restart.
+      ws.on('modoki:schema', (data: SceneSchema, client?: unknown) => {
+        cachedSchema = data;
+        if (client !== undefined) bridgeClients.add(client);
+      });
+      // ⚠️ **Vite DOES give us a close hook** — an earlier comment here claimed otherwise and let
+      // the set grow for the process lifetime. `vite:client:disconnect` is a custom event carrying
+      // the same `getSocketClient` identity the set holds, so the entry can be dropped rather than
+      // left to be filtered out by the live intersection forever.
+      ws.on('vite:client:disconnect', (_data: unknown, client?: unknown) => {
+        if (client !== undefined) bridgeClients.delete(client);
+      });
+      // `declined` (#1030) means "I have no handler for this op" — NOT "this op failed". The
+      // registry counts those instead of settling on them, so a runtime tab cannot answer on the
+      // editor's behalf. See `createBrowserRequestRegistry.settle`.
+      ws.on('modoki:response', (data: { id: number; result?: unknown; error?: string; declined?: boolean }, client?: unknown) => {
+        if (client !== undefined) bridgeClients.add(client);
+        settleRelayReply(browserRequests, data, client);
       });
 
       // Sanity-check the project's declared postprocessors against the runtime
@@ -2285,12 +2464,32 @@ export function assetScannerPlugin(): Plugin {
           // or absolute), else the bundled Modoki icon. `@capacitor/assets` (Easy
           // Mode) resizes it into every iOS AppIcon / Android mipmap size. The
           // source is copied to <project>/assets/icon.png (the tool's convention).
-          // Non-fatal: an icon failure logs a hint but never aborts the app build.
+          // ⚠️ This comment used to end "Non-fatal: an icon failure logs a hint but never aborts
+          // the app build." That has been FALSE since #1011 facet C, and was never true the way it
+          // reads: the build runner below aborts on ANY non-zero step, so "non-fatal" was only ever
+          // a property of the SCRIPT choosing to exit 0 — never of this plan tolerating a failure.
+          // #1028 makes that explicit by passing `--strict true` (below), so the four remaining
+          // exit-0 degrades — a failed `npx` fetch, an unreadable splash source, unrestorable
+          // collateral, a post-processing throw — now stop the build instead of shipping stale art.
           const iconSrcRaw = cfg.app.iconSource.trim();
           const iconSrcAbs = iconSrcRaw
             ? (path.isAbsolute(iconSrcRaw) ? iconSrcRaw : path.join(projectRoot, iconSrcRaw))
             // Default = the bundled 1024² Modoki icon (the editor's own app icon).
-            : path.join(buildCwd, 'build/icon.png');
+            // ⚠️ #1027: READ from the shared module, not rebuilt here. This was the only place the
+            // default existed, so `generate-icons.mjs` — the CLI native path — had no default at
+            // all and generated nothing for the 22 native projects that author no `iconSource`.
+            // Both callers now resolve it from `scripts/iconAssets.mjs`, which is the one place
+            // that decides what an input is.
+            //
+            // ⚠️ `?? ''` is a corrupt-install fallback and nothing more. An earlier version of this
+            // comment claimed the step would then "fail on an unreadable source and say so" — that
+            // is FALSE: `--icon ""` is empty, so the script takes its "no icon named anywhere"
+            // branch and exits 0 silently. That mattered because the default used to live under
+            // `build/`, which the packaged editor does not ship (see the badge-art note ~30 lines
+            // below, same trap); it now lives under `engine/assets/`, which ships, so the only way
+            // to reach `''` is deleting a tracked engine asset. `bundledIconExists.test.ts` is what
+            // catches that, because this line cannot.
+            : (bundledIconPath(buildCwd) ?? '');
           // `--<plat>` (a FLAG, not the positional arg) makes the platform list
           // exclusive — the positional form still tries PWA and fails on a missing
           // www/manifest.json. The tool version is PINNED (scripts/iconAssets.mjs); the
@@ -2366,6 +2565,10 @@ export function assetScannerPlugin(): Plugin {
                 // to be silently dropped on the one build that ships. This plan has already parsed
                 // the config; passing what it knows is cheaper than making the script guess.
                 + ` --splash-cleared ${splashSrcAbs ? 'false' : 'true'}`
+                // ⚠️ #1028: this is a BUILD, so a degraded generation must stop it rather than
+                // ship the previously committed art. A bare hand run of the script does not pass
+                // this and keeps the forgiving behaviour.
+                + ' --strict true'
                 + opt('--splash-dark', splashDarkSrcAbs)
                 + opt('--title', titleSrcAbs)
                 + ` --title-width ${cfg.app.splashTitleWidthPct} --title-offset ${cfg.app.splashTitleOffsetPct}`

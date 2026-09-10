@@ -26,12 +26,32 @@
 set -euo pipefail
 
 # engine/scripts/ → repo root (npm/package.json + node_modules live there).
-REPO="$(cd "$(dirname "$0")/../.." && pwd)"
-# The PHYSICAL spelling of the same root. bash `pwd` is logical, so through a symlinked clone the
-# processes this script launches carry the link spelling in their argv while a later stopper may
-# derive the target spelling — the reaps below match both (#913). Registered after repo-reap.sh is
-# sourced, further down.
-REPO_PHYS="$(cd "$(dirname "$0")/../.." && pwd -P)"
+#
+# ⚠️ **`$REPO` is the PHYSICAL spelling — `pwd -P`, not bash's logical `pwd`** (#961). Everything
+# this script spawns inherits it in its `pwd` and its argv, so every process carries the CANONICAL
+# name of this clone and any later stopper matches, whatever spelling that stopper derived. #913
+# made the reaps match a SET of spellings, which closes the same hole from the other end; launching
+# canonical is what makes that set-matching belt-and-braces rather than the mechanism.
+#
+# ⚠️ **This does NOT move any pinned port, and the fear that it might is what deferred #961 for a
+# month.** `editorPorts.mjs`'s `backendPortForClone` already canonicalises with
+# `fs.realpathSync.native` before taking the basename (#881), so it returns the same port either
+# way — measured through a symlink named `qa-alias`: 5183 both times. What DOES change is the
+# HASHED lane: `clonePort.mjs` hashes `repoRoot` raw, and its own `defaultRepoRoot()` is already
+# physical (Node realpaths `import.meta.url`), so passing a logical `$REPO` made the launcher
+# disagree with every other caller — 9249 here vs 9254 there. Passing the physical spelling removes
+# that divergence rather than creating one.
+#
+# ⚠️ The banner below therefore prints the physical path, and `CLONE_NAME` is the physical
+# basename — deliberately. That is the name the port table keys on, so the banner and the port
+# derivation now name the same thing.
+REPO="$(cd "$(dirname "$0")/../.." && pwd -P)"
+# The LOGICAL spelling — the one the human typed, which may reach this clone through a symlink.
+# Still registered with the reaps (below) alongside the physical one, because a STOPPER invoked
+# through that link derives the logical spelling for itself and needs the pair to match what we
+# launched. Equal to `$REPO` on an ordinary clone, in which case `reap_alt_pattern` yields nothing
+# and the second reap is skipped.
+REPO_LOGICAL="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO"
 
 # Pull --scene <val> / --scene=<val> out of the positional args first, so PROJECT
@@ -149,12 +169,30 @@ export MODOKI_VITE_LOG="$VITE_LOG"
 #    a second copy would drift.
 # shellcheck source=lib/repo-reap.sh
 . "$REPO/engine/scripts/lib/repo-reap.sh"
-reap_repo_register_roots "$REPO" "$REPO_PHYS"
+# ⚠️ Argument order is (logical, physical) — see `reap_repo_register_roots`. Since #961 `$REPO` IS
+# the physical spelling, so the LOGICAL one is passed first from its own variable.
+reap_repo_register_roots "$REPO_LOGICAL" "$REPO"
 kill_repo_process() { reap_repo_process "$1"; }
 
+# ⚠️ **WHAT WE SPAWN IS CANONICAL; WHAT WE MATCH STARTS FROM THE LOGICAL ROOT. Do not "tidy" these
+# to one spelling** (#961 close-out — the first version of this change did, and killed the
+# mechanism #913 exists for).
+#
+# `reap_alt_pattern` DERIVES the second spelling, and it can only do that for a pattern under the
+# root it was registered with: its precondition is `case "$1" in "${MODOKI_REAP_ROOT}"/*)`, and its
+# own docblock says `$1 = absolute path fragment built from the LOGICAL root`. Feed it a pattern
+# built from `$REPO` (now physical) and that prefix test FAILS — it prints nothing, the second reap
+# is skipped, and an editor still running with the LOGICAL spelling in its argv survives the
+# pre-launch sweep. It then keeps the pinned backend port, the new Electron main cannot bind it,
+# and the launcher times out. Measured on a symlinked clone: pattern-from-physical -> MISSED,
+# pattern-from-logical -> FOUND. Invisible on an ordinary clone, where the two spellings are equal.
+#
+# The reaps match a FOREIGN process's command line — a string we do not control, which may carry
+# either spelling — so they must cover the SET. `cd "$REPO"` above is the other half and stays
+# physical: that governs what this launcher's own children carry, which is the point of #961.
 if [ -z "$MULTI" ]; then
-  kill_repo_process "$REPO/engine/electron/dist/main.cjs"
-  kill_repo_process "$REPO/node_modules/vite/bin/vite.js"
+  kill_repo_process "$REPO_LOGICAL/engine/electron/dist/main.cjs"
+  kill_repo_process "$REPO_LOGICAL/node_modules/vite/bin/vite.js"
   # Windows releases a listening socket a beat after the owning process dies;
   # too short a wait and the relaunch races the port it just freed.
   case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) sleep 2 ;; *) sleep 0.5 ;; esac

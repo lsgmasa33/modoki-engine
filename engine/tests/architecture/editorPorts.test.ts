@@ -24,6 +24,7 @@
 import { describe, it, expect } from 'vitest';
 import { existsSync, mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { hasPrivateTooling } from '../helpers/repoLayout';
 import { readScannedSource } from '@modoki/engine/testing';
@@ -36,7 +37,8 @@ import {
   backendUrlForClone,
 } from '../../scripts/editorPorts.mjs';
 import { pathCaseKey } from '../../scripts/pathIdentity.mjs';
-import { makeDirLink } from '../helpers/linkFixture';
+import { makeDirLink, cloneRootSpellings } from '../helpers/linkFixture';
+import { clonePort, defaultRepoRoot } from '../../scripts/clonePort.mjs';
 
 /** Mirrors `pathIdentity.mjs`'s own platform test. Asked of the module rather than re-derived,
  *  so this file cannot drift from the rule it is pinning. */
@@ -207,6 +209,126 @@ describe.skipIf(skip)('editorPorts.mjs is the one home for the clone → backend
   it('assigns every clone a DISTINCT port — the entire point of the table', () => {
     const ports = Object.values(CLONE_BACKEND_PORTS);
     expect(new Set(ports).size).toBe(ports.length);
+  });
+});
+
+/** #961 — WHICH SPELLING the launcher hands the port derivations.
+ *
+ *  ⚠️ **The pinned table was never at risk, and this suite already proves it**: "resolves a clone
+ *  reached through a SYMLINK" above pins `backendPortForClone(<link named something else>)` at
+ *  5183. That is the exact case #961 was filed as blocked on, and it has passed since #881. The
+ *  issue's stated risk — that exporting a physical `$REPO` would drop a symlinked clone onto auto
+ *  ports — is refuted by that test, not merely by argument.
+ *
+ *  What #961 actually fixes is the HASHED lane, and in the opposite direction from the fear:
+ *  `clonePort.mjs` hashes `repoRoot` raw, while its own `defaultRepoRoot()` is already physical
+ *  (Node realpaths `import.meta.url`). So a launcher passing bash's LOGICAL `pwd` disagreed with
+ *  every other caller of the same hash. */
+describe.skipIf(skip)('launch-editor.sh hands the port derivation the PHYSICAL spelling (#961)', () => {
+  const LAUNCHER = path.join(REPO, 'engine/scripts/launch-editor.sh');
+  const REAP_LIB = path.join(REPO, 'engine/scripts/lib/repo-reap.sh');
+
+  it('builds its reap patterns from the LOGICAL root, so reap_alt_pattern can derive the other spelling', () => {
+    // ⚠️ The case the first version of #961 got WRONG, and the reason this is an INTEGRATION
+    // assertion rather than another `toMatch` on the source: `reap_alt_pattern`'s precondition is
+    // `case "$1" in "${MODOKI_REAP_ROOT}"/*)`, so a pattern built from the PHYSICAL $REPO fails
+    // the prefix test against a logical registered root, prints nothing, and the second reap is
+    // silently skipped. An editor still running with the logical spelling in its argv then
+    // survives the pre-launch sweep, keeps the pinned backend port, and the launch times out.
+    // A source-shape guard cannot see that — both spellings are `$REPO`-ish strings — so this
+    // drives the real helper with the launcher's own operand pair.
+    const { code: src } = readScannedSource(LAUNCHER);
+    const patterns = [...src.matchAll(/kill_repo_process "([^"]+)"/g)].map((m) => m[1]);
+    expect(patterns.length, 'no kill_repo_process patterns found — fix the parser, not the test')
+      .toBeGreaterThan(0);
+
+    const base = mkdtempSync(path.join(tmpdir(), 'modoki-reap-'));
+    try {
+      const real = path.join(base, 'clone');
+      mkdirSync(real);
+      const link = path.join(base, 'other-name');
+      try { makeDirLink(real, link); } catch { return; }   // no privilege: the case below is moot
+      const { logical, physical } = cloneRootSpellings(link);
+      if (logical === physical) return;                    // nothing to derive on this host
+
+      for (const pat of patterns) {
+        // Substitute the launcher's own variables the way the shell would.
+        const built = pat.replace('$REPO_LOGICAL', logical).replace('$REPO', physical);
+        const alt = execFileSync('bash', ['-c',
+          `. ${JSON.stringify(REAP_LIB)}\nreap_repo_register_roots "$1" "$2"\nreap_alt_pattern "$3"`,
+          '_', logical, physical, built], { encoding: 'utf8' });
+        expect(alt, `'${pat}' yields no alternate spelling — the second reap is dead for it`)
+          .not.toBe('');
+        expect(alt).not.toBe(built);                       // and it is genuinely the OTHER one
+      }
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('derives $REPO with `pwd -P`, not bash\'s logical `pwd`', () => {
+    const { code: src } = readScannedSource(LAUNCHER);
+    // The assignment itself, not merely "the file mentions pwd -P somewhere".
+    expect(src).toMatch(/^REPO="\$\(cd "\$\(dirname "\$0"\)\/\.\.\/\.\." && pwd -P\)"$/m);
+    expect(src).toMatch(/^REPO_LOGICAL="\$\(cd "\$\(dirname "\$0"\)\/\.\.\/\.\." && pwd\)"$/m);
+    // ⚠️ Order matters and is invisible at the call: reap_repo_register_roots takes
+    // (logical, physical). Passing them the wrong way round still "registers two roots" and
+    // silently inverts which spelling the alternate reap builds.
+    expect(src).toMatch(/reap_repo_register_roots "\$REPO_LOGICAL" "\$REPO"/);
+    // The old variable must be gone, not merely unused — a stale `$REPO_PHYS` under `set -u`
+    // would abort the launch, and under a future edit would silently re-register the pair wrong.
+    expect(src).not.toMatch(/REPO_PHYS/);
+  });
+
+  it('makes the launcher AGREE with clonePort.defaultRepoRoot() through a symlinked clone', (ctx) => {
+    // The behavioural half. `cloneRootSpellings` runs the same `pwd` / `pwd -P` pair the shell
+    // scripts do, so this drives the real derivation rather than a re-typed copy of it.
+    // ⚠️ Draw the fixture until the two spellings hash DIFFERENTLY. `clonePort` is a hash mod 40,
+    // so a random `mkdtemp` path collides with any given slot about 1 run in 40 — and a colliding
+    // fixture makes the real assertion below pass under the revert-to-logical-`pwd` mutation, i.e.
+    // a SILENT 2.5% false green. (The first fix for that swapped the flake for exactly this,
+    // by moving the control onto unrelated literals: it stopped going red for nothing and stopped
+    // being able to fail.) Bounded, and a loop that ran out would fail loudly rather than skip.
+    let base = '', link = '', logical = '', physical = '';
+    let drew = 0;
+    for (; drew < 12; drew++) {
+      base = mkdtempSync(path.join(tmpdir(), 'modoki-961-'));
+      link = path.join(base, 'a-different-name');
+      try { makeDirLink(REPO, link); }
+      catch { rmSync(base, { recursive: true, force: true }); ctx.skip('cannot create a directory symlink here'); return; }
+      ({ logical, physical } = cloneRootSpellings(link));
+      if (logical !== physical && clonePort(logical, 9240, 40) !== clonePort(physical, 9240, 40)) break;
+      rmSync(base, { recursive: true, force: true });
+    }
+    expect(drew, 'could not draw a fixture whose two spellings hash apart — investigate, do not skip')
+      .toBeLessThan(12);
+    try {
+      expect(logical).not.toBe(physical);        // the fixture is doing its job
+
+      // ⚠️ Run the launcher's OWN assignment, lifted from the file, with `$0` bound to the linked
+      // path — rather than re-typing `pwd -P` here. A test that retypes the expression asserts its
+      // own copy: reverting the script to logical `pwd` would leave it green, which is exactly
+      // what happened to the first draft of this case.
+      const repoLine = readScannedSource(LAUNCHER).code.split('\n').find((l) => l.startsWith('REPO='));
+      expect(repoLine, 'no REPO= assignment found in launch-editor.sh').toBeTruthy();
+      const asLaunched = execFileSync('bash',
+        ['-c', `${repoLine}\nprintf %s "$REPO"`, path.join(link, 'engine/scripts/launch-editor.sh')],
+        { encoding: 'utf8' });
+      expect(asLaunched).toBe(physical);
+
+      const canonical = clonePort(defaultRepoRoot(), 9240, 40);
+      // What the launcher passes NOW: physical → the same port every other caller derives.
+      expect(clonePort(asLaunched, 9240, 40)).toBe(canonical);
+      expect(clonePort(physical, 9240, 40)).toBe(canonical);
+
+      // ⚠️ The control, on the FIXTURE's own two spellings — which the loop above guaranteed hash
+      // apart, so this is deterministic rather than a 1-in-40 coin flip in either direction. It is
+      // what makes the assertion above able to FAIL: revert the launcher to logical `pwd` and
+      // `asLaunched` becomes `logical`, whose port this line pins as different from `canonical`.
+      expect(clonePort(logical, 9240, 40)).not.toBe(canonical);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
   });
 });
 

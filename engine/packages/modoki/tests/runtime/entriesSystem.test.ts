@@ -72,10 +72,19 @@ const PREFAB = 'prefab-guid-1';
  *  check the system zeroes it (#651). */
 function makeProvider(rootOverrides: Record<string, unknown> = {}) {
   const spawned: number[] = [];
+  /** Which prefab guid each provider read was asked about (#1026 review F3). The size answer and
+   *  the authoring answer MUST describe the same prefab; nothing else in the suite can see them
+   *  diverge, because the fake returns the same record whatever it is handed. */
+  const askedFor: { rootSize: string[]; rootAuthoredUI: string[] } = { rootSize: [], rootAuthoredUI: [] };
   return {
     spawned,
+    askedFor,
     isCached: () => true,
-    rootSize: () => ({ width: 0, widthUnit: 'px' as const, height: ENTRY_H, heightUnit: 'px' as const }),
+    rootSize: (g: string) => { askedFor.rootSize.push(g); return { width: 0, widthUnit: 'px' as const, height: ENTRY_H, heightUnit: 'px' as const }; },
+    // ⚠️ The SAME record `spawnInstance` authors onto the root below (#1026). A fake whose
+    // `rootAuthoredUI` disagrees with what it spawns models a prefab that cannot exist, and the
+    // authoring warnings are exactly what would stop being falsifiable — see #761.
+    rootAuthoredUI: (g: string) => { askedFor.rootAuthoredUI.push(g); return { height: ENTRY_H, ...rootOverrides }; },
     spawnInstance: (world: any, _guid: string, opts: { parentId: number; guidSeed: string }) => {
       const root = world.spawn(UIElement({ height: ENTRY_H, ...rootOverrides }), RenderableUI(),
         PrefabInstance({ source: PREFAB, localId: 1 }),
@@ -341,6 +350,187 @@ describe('entriesSystem', () => {
     sys.entriesSystem(testWorld);
     const isVisibleWarnings = warn.mock.calls.filter(c => String(c[0]).includes('UIElement.isVisible='));
     expect(isVisibleWarnings).toHaveLength(0);
+  });
+
+  /** #1026 — the pin OVERWRITES the entity's own UIElement, so a guard reading the live trait back
+   *  is asking the pin about its own handiwork. Every case below is silent on the FIRST tick (the
+   *  spawned trait still carries what the prefab authored) and only diverges once the pin has run,
+   *  which is why the pre-#1026 suite was green: not one of its cases ticked twice. */
+  describe('the authoring warnings read the PREFAB, not the trait the pin overwrote (#1026)', () => {
+    it('asks the provider about the SAME prefab for the size and for the authoring', async () => {
+      // ⚠️ #1026 review F3. `applySlots` gets the authored record from `kinds[0].prefab`, the same
+      // guid `ensurePool` and the size read use — but three separate call sites reach for it, and
+      // a fake that answers identically whatever it is handed cannot tell them apart. Handing the
+      // authoring read the WRONG prefab would silence every warning for the pooled kind (or, worse,
+      // warn about a different prefab's authoring) with the whole suite green.
+      const { sys, src, provider } = await setup();
+      src.registerEntrySource('test.rows', () => ({ members: {} }));
+      sys.entriesSystem(testWorld);
+      expect(provider.askedFor.rootAuthoredUI.length).toBeGreaterThan(0);
+      expect(new Set(provider.askedFor.rootAuthoredUI)).toEqual(new Set([PREFAB]));
+      expect(new Set(provider.askedFor.rootSize)).toEqual(new Set([PREFAB]));
+    });
+
+    it("stays SILENT for an authored PERCENT width after the pin has already forced widthUnit to px", async () => {
+      // The live symptom, reduced: Court's `DailyMonth` authors `width: 100, widthUnit: '%'` and
+      // printed "authored UIElement.width=308px, but this view pins width to 309px". Tick 1 pins
+      // {width: 360, widthUnit: 'px'} onto the trait; tick 2 re-resolves to a different px value
+      // (here a 1px-wider viewport — a fractional container width or a DPR change on real
+      // hardware). Reading the trait back then sees curUnit === 'px' and two numbers that differ,
+      // and warns about a value AND a unit the pool itself wrote.
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { sys, src, view } = await setup({}, 0, { width: 100, widthUnit: '%' });
+      src.registerEntrySource('test.rows', () => ({ members: {} }));
+      sys.entriesSystem(testWorld);
+      warn.mockClear();
+
+      view.set(UIScrollView, { ...(view.get(UIScrollView) as any), viewportWidth: 361 });
+      view.set(UIEntries, { ...(view.get(UIEntries) as any), epoch: 1 });
+      sys.entriesSystem(testWorld);
+
+      const named = warn.mock.calls.filter(c => String(c[0]).includes('UIElement.width='));
+      expect(named).toHaveLength(0);
+    });
+
+    it("STILL warns for an authored px width with the PIN'S OWN VALUE nowhere in the message — the accept side", async () => {
+      // ⚠️ Two things this has to do at once, and the first draft did neither.
+      //
+      // 1. Reach a slot that has NEVER warned. `warnAuthoredOverride` is warn-once per
+      //    `viewGuid:slot:width`, so every slot alive on tick 1 is permanently quiet afterwards.
+      //    Growing `countY` does not help: it changes neither the pool size nor the window, so
+      //    `ensurePool` spawns nothing and the tick-2 assertion loop ran ZERO times. Growing the
+      //    VIEWPORT is what makes the window — and therefore the pool — bigger.
+      // 2. Assert the printed VALUE, not just that a line appeared. The guard operand and the
+      //    DISPLAY operand are separate expressions, and reverting only the display
+      //    (`${aWidth}${aWidthUnit}` -> `${ui.width}${ui.widthUnit}`) reinstates the exact string
+      //    #1026 was filed on — "authored UIElement.width=308px" for a root authored `100%` —
+      //    while both silence tests stay green. Nothing else in the suite can see that.
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { sys, src, view, provider } = await setup({}, 0, { width: 200, widthUnit: 'px' });
+      src.registerEntrySource('test.rows', () => ({ members: {} }));
+      sys.entriesSystem(testWorld);
+      const tick1 = warn.mock.calls.filter(c => String(c[0]).includes('UIElement.width='));
+      expect(tick1.length).toBe(provider.spawned.length);
+      const grownFrom = provider.spawned.length;
+      warn.mockClear();
+
+      // A taller, 1px-wider viewport: the window grows (so the pool spawns fresh slots that have
+      // never warned) AND the resolved pin changes to 361px (so the pin's own value is available
+      // to be printed by mistake).
+      view.set(UIScrollView, { ...(view.get(UIScrollView) as any), viewportHeight: 1800, viewportWidth: 361 });
+      view.set(UIEntries, { ...(view.get(UIEntries) as any), epoch: 1 });
+      sys.entriesSystem(testWorld);
+
+      expect(provider.spawned.length, 'the pool must actually grow, or the assertions below are vacuous')
+        .toBeGreaterThan(grownFrom);
+      const tick2 = warn.mock.calls.filter(c => String(c[0]).includes('UIElement.width='));
+      expect(tick2.length, 'the fresh slots must warn — they have never warned before').toBeGreaterThan(0);
+      for (const c of tick2) {
+        expect(String(c[0])).toContain('UIElement.width=200px');   // the AUTHORED value...
+        expect(String(c[0])).not.toContain('authored UIElement.width=361px');  // ...never the pin's
+        expect(String(c[0])).toContain('pins width to 361px');     // which belongs on the other side
+      }
+    });
+
+    it("stays SILENT for isVisible when a slot the pin PARKED scrolls back into the window", async () => {
+      // The sibling this issue did not report, found by the widen. `isVisible` is the one other
+      // pinned field whose pin VARIES (it tracks the slot's live state), so it fails the same way
+      // for a different reason: park a slot and the pin leaves `false` on its trait; when the data
+      // grows back the slot goes live, and `false !== true && false !== true` warns the author
+      // about an `isVisible: false` the pool wrote itself.
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { sys, src, view } = await setup();          // no overrides — nothing is authored at all
+      src.registerEntrySource('test.rows', () => ({ members: {} }));
+      sys.entriesSystem(testWorld);
+
+      // Shrink the data so pooled slots park (the pool never shrinks — that is the whole reason
+      // these slots survive to be re-driven), then grow it back so they go live again.
+      view.set(UIEntries, { ...(view.get(UIEntries) as any), countY: 3, epoch: 1 });
+      sys.entriesSystem(testWorld);
+      warn.mockClear();
+      view.set(UIEntries, { ...(view.get(UIEntries) as any), countY: 1000, epoch: 2 });
+      sys.entriesSystem(testWorld);
+
+      const named = warn.mock.calls.filter(c => String(c[0]).includes('UIElement.isVisible='));
+      expect(named).toHaveLength(0);
+    });
+
+    it("STILL warns for an authored isVisible=false when a slot's FIRST pin is parked — the accept side", async () => {
+      // ⚠️ The slot must reach `live` without having warned before, or `warnAuthoredOverride`'s
+      // warn-once (`viewGuid:slot:field`) hides the answer and the test cannot fail. A slot that
+      // starts LIVE warns on tick 1 and is then permanently quiet, which is what makes the
+      // park-then-unpark shape of the silence test above useless as an accept side.
+      //
+      // So: a small `countY` leaves the tail of the window PARKED on first sight — authored
+      // `false` equals the parked pin, so no warning is owed yet — and growing the data makes
+      // those same slots live, where the authored `false` really does contradict the pin.
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { sys, src, view } = await setup({ countY: 3 }, 0, { isVisible: false });
+      src.registerEntrySource('test.rows', () => ({ members: {} }));
+      sys.entriesSystem(testWorld);
+      warn.mockClear();
+
+      view.set(UIEntries, { ...(view.get(UIEntries) as any), countY: 1000, epoch: 1 });
+      sys.entriesSystem(testWorld);
+
+      const named = warn.mock.calls.filter(c => String(c[0]).includes('UIElement.isVisible='));
+      expect(named.length).toBeGreaterThan(0);
+      expect(String(named[0][0])).toContain('UIElement.isVisible=false');
+    });
+
+    it("names the AUTHORED value even when a source has overwritten the row root's live trait", async () => {
+      // ⚠️ This is the ONE reachable case where the guard's operand and the DISPLAY operand can
+      // disagree, and finding it took disproving the obvious one. Reverting only the display
+      // (`${aWidth}${aWidthUnit}` -> `${ui.width}${ui.widthUnit}`) survives every other test in
+      // this file, and NOT because they are weak: given the guard's own preconditions it is
+      // unobservable through the pin alone. A slot warns at most once (`viewGuid:slot:width`), the
+      // warnings run BEFORE the pin in the same block, and a slot that did not warn on an earlier
+      // tick was pinned to a value EQUAL to its authored one (that is why it did not warn) — so at
+      // the moment any warning fires, `ui.width` has always already equalled the authored width.
+      //
+      // What breaks that chain is a third writer. An entry source addressing the empty member path
+      // resolves to the row ROOT (`splitMemberPath('')` -> `[]`), so it can put a value on the
+      // trait that neither the author nor the pin wrote. Then the two operands genuinely differ,
+      // and printing the live one tells the author they wrote something they did not.
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      // Authored 360px against a 360px viewport: tick 1 resolves the pin to the SAME 360, so the
+      // guard stays quiet and the slot spends its warn-once budget on nothing. That silence is
+      // what lets it warn LATER, on a tick where its live trait no longer matches the prefab.
+      const { sys, src, view } = await setup({}, 0, { width: 360, widthUnit: 'px' });
+      // The source writes the row ROOT — `splitMemberPath('')` -> `[]` resolves to the root id.
+      src.registerEntrySource('test.rows', () => ({ members: { '': { UIElement: { width: 999, widthUnit: 'px' } } } }));
+      sys.entriesSystem(testWorld);
+      expect(warn.mock.calls.filter(c => String(c[0]).includes('UIElement.width=')))
+        .toHaveLength(0);                       // tick 1 really was silent
+
+      // 1px wider: the pin becomes 361, which no longer equals the authored 360, so the existing
+      // slots warn for the first time — with `ui.width` now holding the source's 999.
+      view.set(UIScrollView, { ...(view.get(UIScrollView) as any), viewportWidth: 361 });
+      view.set(UIEntries, { ...(view.get(UIEntries) as any), epoch: 1 });
+      sys.entriesSystem(testWorld);
+
+      const named = warn.mock.calls.filter(c => String(c[0]).includes('UIElement.width='));
+      expect(named.length, 'the slots must warn here, or this proves nothing').toBeGreaterThan(0);
+      for (const c of named) {
+        expect(String(c[0])).toContain('UIElement.width=360px');   // what the PREFAB says
+        expect(String(c[0])).not.toContain('UIElement.width=999px'); // what the SOURCE put there
+      }
+    });
+
+    it('resolves an ABSENT authored field to the trait default rather than treating it as authored', async () => {
+      // A scene/prefab save strips any field equal to its default, so most fields are simply not
+      // in the record `rootAuthoredUI` returns. If `undefined` were read as an authored value it
+      // would differ from both the pin and the default, and EVERY pooled row would warn on EVERY
+      // pinned field — a far louder regression than the one being fixed.
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { sys, src, view } = await setup();
+      src.registerEntrySource('test.rows', () => ({ members: {} }));
+      sys.entriesSystem(testWorld);
+      view.set(UIEntries, { ...(view.get(UIEntries) as any), epoch: 1, countY: 2000 });
+      sys.entriesSystem(testWorld);
+      const pooled = warn.mock.calls.filter(c => String(c[0]).includes('pooled UIEntries root'));
+      expect(pooled).toHaveLength(0);
+    });
   });
 
   it('pins exactly the field set uiAuthoring.POOLED_ROW_PINNED_FIELDS names — the #761 drift guard', async () => {
@@ -808,6 +998,7 @@ describe('entriesSystem', () => {
     sys.setEntryPrefabProvider({
       isCached: () => true,
       rootSize: () => ({ width: 0, widthUnit: 'px' as const, height: 0, heightUnit: 'px' as const }),
+      rootAuthoredUI: () => undefined,   // spawns nothing, so there is no pooled root to warn about
       spawnInstance: () => 0,
     } as any);
     view.set(UIScrollView, { ...(view.get(UIScrollView) as any), scrollY: 3600 });
@@ -1146,7 +1337,7 @@ describe('entriesSystem', () => {
     const { sys, src, view } = await setup();
     const api = await import('../../src/runtime/ui/scrollApi');
     src.registerEntrySource('test.rows', () => ({ members: {} }));
-    sys.setEntryPrefabProvider({ isCached: () => false, rootSize: () => ({ width: 0, widthUnit: 'px', height: 0, heightUnit: 'px' }), spawnInstance: () => 0 });
+    sys.setEntryPrefabProvider({ isCached: () => false, rootSize: () => ({ width: 0, widthUnit: 'px', height: 0, heightUnit: 'px' }), rootAuthoredUI: () => undefined, spawnInstance: () => 0 });
 
     api.scrollToEntry('view-guid', { y: 42 });
     sys.entriesSystem(testWorld);
@@ -1198,6 +1389,7 @@ describe('entriesSystem', () => {
       spawns,
       isCached: () => cached.value,
       rootSize: () => (cached.value ? size : { width: 0, widthUnit: 'px' as const, height: 0, heightUnit: 'px' as const }),
+      rootAuthoredUI: () => undefined,   // spawnInstance returns 0 — nothing is ever pooled here
       spawnInstance: (_w: any, guid: string) => { spawns.push(guid); return 0; },
     };
   }
@@ -1482,6 +1674,7 @@ describe('the PRODUCTION world-swap wiring (#838) — not the test-only reset ho
     sys.setEntryPrefabProvider({
       isCached: () => false,
       rootSize: () => ({ width: 0, widthUnit: 'px' as const, height: 0, heightUnit: 'px' as const }),
+      rootAuthoredUI: () => undefined,   // never cached, so nothing pools
       spawnInstance: () => 0,
     });
 

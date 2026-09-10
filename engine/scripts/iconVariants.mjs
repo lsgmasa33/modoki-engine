@@ -101,10 +101,16 @@ async function deriveMonochrome(srcAbs, size) {
 /** Read an override if one is configured and readable; otherwise `null` so the caller derives.
  *  An unreadable override is reported, never silently swapped for a derivation — a typo'd path
  *  that quietly falls back is how an authored variant goes missing without a single log line. */
-function overrideOrNull(srcAbs, label, notes) {
+function overrideOrNull(srcAbs, label, notes, missing) {
   if (!srcAbs) return null;
   if (fs.existsSync(srcAbs)) return srcAbs;
   notes.push(`${label} override not found, derived instead: ${srcAbs}`);
+  // ⚠️ REQUESTED and unreadable, which is not the same as "not configured" — the caller
+  // needs the distinction. Deriving from the base icon is a reasonable DEGRADE, but the run must
+  // not then be stamped current: with the stamp written, `iconIsUpToDate` short-circuits every
+  // later build and the derived stand-in ships forever behind one scrolled-past note. That is
+  // #1028's rule, and these three overrides were outside its first sweep.
+  missing.push(`${label}: ${srcAbs}`);
   return null;
 }
 
@@ -114,14 +120,15 @@ export async function writeIosIconVariants({ projectRoot, iconSrcAbs, darkSrcAbs
   const dir = path.join(projectRoot, IOS_APPICON_DIR);
   const notes = [];
   const written = [];
+  const missing = [];
   const contentsPath = path.join(dir, 'Contents.json');
   if (!fs.existsSync(contentsPath)) {
     notes.push('no AppIcon.appiconset/Contents.json — skipped the iOS icon variants');
-    return { written, notes };
+    return { written, notes, missing };
   }
 
-  const darkOverride = overrideOrNull(darkSrcAbs, 'iconDarkSource', notes);
-  const tintedOverride = overrideOrNull(tintedSrcAbs, 'iconTintedSource', notes);
+  const darkOverride = overrideOrNull(darkSrcAbs, 'iconDarkSource', notes, missing);
+  const tintedOverride = overrideOrNull(tintedSrcAbs, 'iconTintedSource', notes, missing);
 
   const dark = darkOverride
     ? await sharp(darkOverride).resize(IOS_ICON_SIZE, IOS_ICON_SIZE, { fit: 'cover' }).png(GENERATED_PNG).toBuffer()
@@ -148,7 +155,7 @@ export async function writeIosIconVariants({ projectRoot, iconSrcAbs, darkSrcAbs
   const kept = images.filter((i) => !(i.appearances ?? []).some((a) => a.value === 'dark' || a.value === 'tinted'));
   contents.images = [...kept, entry(IOS_DARK_FILE, 'dark'), entry(IOS_TINTED_FILE, 'tinted')];
   fs.writeFileSync(contentsPath, `${JSON.stringify(contents, null, 2)}\n`);
-  return { written, notes };
+  return { written, notes, missing };
 }
 
 /** The adaptive-icon XML with a `<monochrome>` layer added, inset to match `<foreground>`.
@@ -177,11 +184,12 @@ export async function writeAndroidIconVariants({ projectRoot, iconSrcAbs, monoch
   const res = path.join(projectRoot, ANDROID_RES_DIR);
   const notes = [];
   const written = [];
+  const missing = [];
   if (!fs.existsSync(res)) {
     notes.push('no android res/ — skipped the monochrome layer');
-    return { written, notes };
+    return { written, notes, missing };
   }
-  const override = overrideOrNull(monochromeSrcAbs, 'iconMonochromeSource', notes);
+  const override = overrideOrNull(monochromeSrcAbs, 'iconMonochromeSource', notes, missing);
 
   let emitted = 0;
   for (const d of fs.readdirSync(res, { withFileTypes: true })) {
@@ -202,7 +210,7 @@ export async function writeAndroidIconVariants({ projectRoot, iconSrcAbs, monoch
   }
   if (!emitted) {
     notes.push('no mipmap-*/ic_launcher_foreground.png found — monochrome PNGs not emitted');
-    return { written, notes };
+    return { written, notes, missing };
   }
 
   for (const name of ['ic_launcher.xml', 'ic_launcher_round.xml']) {
@@ -215,5 +223,5 @@ export async function writeAndroidIconVariants({ projectRoot, iconSrcAbs, monoch
       written.push(path.join('mipmap-anydpi-v26', name));
     }
   }
-  return { written, notes };
+  return { written, notes, missing };
 }

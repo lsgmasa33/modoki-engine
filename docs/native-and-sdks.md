@@ -71,14 +71,20 @@ the reference Mac, warm SPM cache: **4–18 s each, ~59 s for all eight, and 56 
 gate.** Cold, each package pays its SPM fetch once (AppsFlyer, AppLovin and Adjust are real network
 artifacts); the numbers above are steady-state.
 
+⚠️ Those figures predate #991, which turned the `litert-lm` leg into an instant `N/A` — so seven
+packages build now, not eight, and the totals are a little lower than stated. Left as measured
+rather than adjusted by arithmetic: nobody re-timed the gate, and a figure nobody measured is worse
+than a figure with a date on it.
+
 ⚠️ **The obvious design — one `xcodebuild -scheme` per package — is wrong, and measurably.** It
 reports a false FAILURE on `capacitor-modoki-ota` (`cannot find type 'OtaState' in scope`) against
 code that ships and works. Two integration shapes exist and **the leg must match the package's own**:
 
 | shape | who | what the leg builds |
 |---|---|---|
-| `spm` | 6 of 8 — appsflyer, game-debug, litert-lm, modoki-iap, both applovin-max copies, adjust | the package's declared product, as `Package.swift` links it |
+| `spm` | 6 of 8 — appsflyer, game-debug, modoki-iap, adjust, both applovin-max copies | the package's declared product, as `Package.swift` links it |
 | `flat` | `capacitor-modoki-ota` | a **synthesised** single-target package holding plugin + core sources together |
+| `no-spm` | `capacitor-litert-lm` | **nothing** — it reports `N/A` with a required `reason` (see below) |
 
 The `flat` shape exists because `OtaPlugin.swift` deliberately carries **no `import
 ModokiOtaCore`**: it ships as loose pbxproj file references compiled directly into the consuming
@@ -98,6 +104,45 @@ court's. And the xcodebuild **scheme is read from `Package.swift`'s `name:`**, w
 package's scheme actually is (measured: not the product name). `nativePluginLegCoverage.test.ts`
 enforces the coverage in both directions during `npm run verify`, so a new plugin package fails until
 somebody decides its shape.
+
+#### `no-spm`, and why `N/A` is not `SKIP` (#991)
+
+`capacitor-litert-lm` was an `spm` row pinned `knownFail: '#991'`, on the theory that
+`Package.swift` was missing a dependency somebody would add. **It cannot be added:** Google
+publishes no SPM distribution of `MediaPipeTasksGenAI` — the pods its podspec names are prebuilt
+binaries built internally, and
+[google-ai-edge/mediapipe#5464](https://github.com/google-ai-edge/mediapipe/issues/5464) is open and
+unanswered.
+
+The reframing that resolved it is that **this is not an SPM package at all**:
+
+- `package.json` declares `capacitor: { android }` and nothing else, so `cap sync ios` never
+  registers the plugin in any consuming app;
+- it is compiled into no App target, which is why `capacitorPlatformDeclarations.test.ts` needed a
+  *second* rule to reach it;
+- that rule exists specifically to **forbid** it declaring `ios` until the manifest is fixed.
+
+So the leg was compiling a configuration the repo deliberately outlaws, for a platform the package
+does not claim, for a consumer (`games/llm-test`) that is iceboxed.
+
+⚠️ **`N/A` and `SKIP` mean different things and `--require-all` treats them differently.** A SKIP
+says *this runner could not check it* — install Xcode, provision a JDK, and it becomes a real
+result, so counting it as a failure under `--require-all` is right. An **N/A** says *there is nothing
+here to check*, which is a fact about the package that no toolchain can change. Folding them
+together would mean a pre-release run can never be green no matter what is installed, which is how
+`--require-all` stops being used. Measured: it exited 1 on the `knownFail` and exits 0 now, with the
+gate otherwise all-PASS.
+
+⚠️ **An N/A row is only honest while its premise holds, so the premise is asserted — and it moved to
+a better gate.** `knownFail` self-expired by flipping to FAIL if the leg ever passed, but only on a
+machine with macOS *and* Xcode running `test:native`. The `no-spm` premise is checked by
+`capacitorPlatformDeclarations.test.ts` under **`npm run verify`** instead: declare `capacitor.ios`,
+or give `Package.swift` the podspec's dependencies, and it goes red naming the row. The stale-row
+check now fires in front of whoever made it stale. The row's `reason` is required, printed in the
+gate summary, and enforced by `nativePluginLegCoverage.test.ts`.
+
+⚠️ **What this does NOT fix:** the platform this package actually ships on is still compiled by
+nothing. That is #992.
 
 ⚠️ **What a green `ios/class/*` leg does NOT prove.** It compiles: the Swift parses, resolves its
 imports and type-checks against the real Capacitor headers. **No test runs**, so it says nothing

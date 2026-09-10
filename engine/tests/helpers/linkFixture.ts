@@ -46,7 +46,9 @@
  *
  * `repoReapSpellings.test.ts` registered roots built from `os.tmpdir()` — native `E:\…` on
  * Windows — and drove `repo-reap.sh` with them. No production caller can produce that shape:
- * `launch-editor.sh:29,34` and `stop-editor.sh:25,29` both use bash `pwd` / `pwd -P`. The result
+ * `launch-editor.sh`'s `REPO`/`REPO_LOGICAL` and `stop-editor.sh`'s `REPO`/`REPO_PHYS` both use
+ * bash `pwd` / `pwd -P` (cited by SYMBOL, not line: #961 moved the launcher's pair and renamed its
+ * second variable, which a line citation would have silently outlived). The result
  * was a harness that on Windows tested an input the code never receives, went RED for it, and
  * proved nothing about the case it claimed to cover. It was green on macOS only because
  * `os.tmpdir()` happens to yield a POSIX path there.

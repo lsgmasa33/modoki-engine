@@ -12,7 +12,7 @@
  *  identical on a Mac, on Windows and on the public runner. Re-run this only to change the
  *  mark deliberately, and commit what it writes.
  *
- *  The panda is keyed out of `build/icon.png` (the editor's own icon: cream #fde7d9 subject on
+ *  The panda is keyed out of `engine/assets/app-icon-default.png` (the editor's own icon: cream #fde7d9 subject on
  *  navy #1a1a2e) by a soft LUMINANCE ramp rather than a hard threshold — the logo is hand-drawn
  *  and a threshold strips the antialiasing off every stroke, which at badge size reads as a
  *  ragged edge. */
@@ -24,7 +24,7 @@ import { isEntryPoint } from './entryPoint.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
-/** The Modoki palette, sampled from `build/icon.png` rather than remembered. */
+/** The Modoki palette, sampled from `engine/assets/app-icon-default.png` rather than remembered. */
 export const MODOKI_CREAM = '#fde7d9';
 export const MODOKI_NAVY = '#1a1a2e';
 
@@ -36,7 +36,7 @@ const LABEL = 'Made by Modoki Engine';
 
 /** The panda, recoloured to one flat `hex` on transparency. */
 async function panda(hex) {
-  const { data, info } = await sharp(path.join(REPO, 'build', 'icon.png'))
+  const { data, info } = await sharp(path.join(REPO, 'engine', 'assets', 'app-icon-default.png'))
     .ensureAlpha().raw().toBuffer({ resolveWithObject: true });
   const { width: w, height: h, channels: ch } = info;
   const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));

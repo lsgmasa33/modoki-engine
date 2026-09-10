@@ -244,29 +244,120 @@ is wrong when the operator merely did not type the flag. **When the config canno
 nothing is cleared**: the packaged editor ships no esbuild, so `cfg` is legitimately null there, and
 reading that as "the author cleared every field" would destroy art.
 
-⚠️ **An unreadable REQUESTED icon is now FATAL, and fails the build.** "Requested" means a flag or a
-non-empty `app.iconSource`; a project that authors no icon still skips quietly. The old silent
-`return` is what made facet B hard to notice — an operator whose mental model becomes *"that command
-does nothing much"* does not go looking for destroyed art.
+⚠️ **An unreadable REQUESTED icon is FATAL, and fails the build.** "Requested" means a flag or a
+non-empty `app.iconSource`. The old silent `return` is what made facet B hard to notice — an operator
+whose mental model becomes *"that command does nothing much"* does not go looking for destroyed art.
+
+#### `--strict`: a BUILD stops rather than shipping stale art (#1028)
+
+Facet C above made *one* of five failure modes non-zero. The other four exited 0, so
+`build-web.mjs`'s printed promise — *"not building; building on would ship the previously committed
+art"* — covered a fifth of what it claimed:
+
+| failure | without `--strict` | with it |
+|---|---|---|
+| icon source unreadable | `exit 1` (facet C) | `exit 1` |
+| `npx @capacitor/assets` non-zero | logs, exit 0 | **`exit 1`** |
+| splash source unreadable | logs, generation continues, exit 0 | **`exit 1`, before the generator runs** |
+| collateral could not be restored | logs, no stamp, exit 0 | **`exit 1`** |
+| post-processing threw | logs, no stamp, exit 0 | **`exit 1`** |
+
+The `npx` row is the one that mattered: it is a **network fetch**, so it is much the likeliest of
+the five, and it was the one the build-side guard did not catch. The rare failure aborted the build
+and the common one did not.
+
+**`--strict true` is passed by the two BUILD callers** — `build-web.mjs` and `iconStep` — and by
+nothing else. A bare hand run of the script keeps the forgiving behaviour, which is deliberate: a
+mistyped `splashSource` must not fail somebody poking at the generator. That split is pinned by a
+test asserting both callers pass it, because dropping it from either silently restores the defect.
+
+⚠️ **`strict` is deliberately NOT in the freshness stamp.** A flag that cannot change the output
+must not change the hash, or flipping it rewrites ~60 committed PNGs in every project for nothing.
+
+⚠️ **This changed the editor's Build menu**, which is where it will be noticed: Build → iOS/Android
+now fails on a flaky `npx` fetch where it previously logged past it. The comment in
+`vite-asset-scanner.ts` claiming an icon failure *"never aborts the app build"* was already false
+before this — the build runner aborts on any non-zero step, so "non-fatal" was only ever a property
+of the script choosing to exit 0.
+
+⚠️ **A degrade must WITHHOLD THE FRESHNESS STAMP, or `--strict` is disarmable.** Every strict check
+sits downstream of the "already current" early return, so a stamped-but-degraded result means no
+later build ever reaches a strict branch — the flag gets passed and never executes. Four of the five
+degrades already withheld the stamp; the splash-staging one did not, and one forgiving hand run over
+a renamed `splashSource` would therefore stamp an icon-derived splash as current **forever**. It now
+withholds too, which also makes the state self-healing: the next run re-attempts, so repairing the
+path recovers on its own. **When adding a degrade path here, withholding the stamp is the rule, not
+the exception.**
+
+⚠️ **`build-web.mjs` loops the two platforms, and iOS can stamp before Android's strict exit** — so a
+failed native build can leave iOS art rewritten and Android's untouched. Self-healing, because the
+stamp is per-platform and the next run redoes only what is stale; worth knowing before reading a
+half-updated `git status` under `demos/` as a second bug.
 
 ⚠️ **The config load DEGRADES rather than failing** (`loadEnginePluginModuleResult`, warning with
 *which* cause), because this script is spawned by the packaged editor too. The precedent and the
 reason are `build-web.mjs`'s `validateProjectConfig`.
 
 **Consequence worth knowing:** `npm run build -- --target native` now generates icons, and can now
-FAIL on a config pointing at a missing file. Checked across `games/**` and `demos/**`: eight source
-fields are declared in total, all eight resolve — but read that for what it is. Only `games/court`
-and `games/wordweave` declare an icon source **at all**, so it is a narrow check, not broad
-assurance.
+FAIL on a config pointing at a missing file. Re-measured 2026-09-10 across `games/**` and `demos/**`:
+**14 source fields across 8 projects, all 14 resolve.** (It said "eight fields, only court and
+wordweave declare an icon source at all" — true when written, and stale the moment the six demos
+gained one. The check is correspondingly less narrow than that caveat implied.)
 
-⚠️ **Which is also the limit of facet A's fix, stated plainly: the two callers still disagree for a
-project that declares NO `iconSource`.** The editor falls back to the bundled `build/icon.png`
-(`vite-asset-scanner.ts`); the CLI reports "nothing to generate" and exits 0. So for the other 23
-projects the CLI native build still regenerates nothing while the editor does — which matters
-whenever the stamp is invalidated for a reason other than the art, e.g. an edit to
-`splashCompose.mjs` or `iconVariants.mjs`. Filed as **#1027** rather than fixed here: making the CLI
-match means every CLI native build starts rewriting committed icon art in 23 projects, `demos/**`
-included, and that is #162/#236's complaint by name — a deliberate call, not a finishing-pass edit.
+#### The bundled-icon default is shared, not per-caller (#1027)
+
+**A project that declares no `iconSource` gets the bundled Modoki icon, and BOTH callers agree on
+that** — `BUNDLED_ICON_REL` / `bundledIconPath()` in **`engine/scripts/iconAssets.mjs`**, read by
+`resolveIconInputs` and by `iconStep`.
+
+It was in `iconStep` alone until #1027, which is why facet A's fix was incomplete: the editor's
+build plan generated from `build/icon.png` for the 22 native projects that author no icon, and the
+CLI native build printed "nothing to generate" and exited 0. Same project, same config, two answers.
+That mattered most when the stamp was invalidated for a reason other than the art — editing
+`splashCompose.mjs` or `iconVariants.mjs` invalidates every project's stamp by design, at which
+point the editor regenerated 25 projects and a CLI native build regenerated 2.
+
+It lives in the plain-Node module rather than `plugins/iconAssets.ts` because `generate-icons.mjs`
+reaches the TS module through esbuild, which the **packaged editor does not ship** — a default that
+vanished there would be a third answer rather than a fix.
+
+⚠️ **The fallback is gated on the config having been READ, and that gate is the whole safety of
+it.** A config that could not be read means UNKNOWN, not "authors no icon" — precisely the state in
+which a project MIGHT have real art configured, so defaulting there would overwrite it with the
+bundled icon. Same distinction as facet B's `splashCleared`, one field over.
+
+⚠️ **"Was it read?" is NOT `loadProjectConfig() !== null`, and getting that wrong is how this
+becomes the art-destroying bug it was written to prevent.** `loadProjectConfig` catches its own
+`JSON.parse` throw and returns merged defaults — its docstring says so: *"A missing file or
+unparseable JSON falls back to the defaults."* So a trailing comma in a hand-edited
+`project.config.json` arrives as a perfectly clean config with an empty `iconSource`. The
+sanctioned way to ask is **`readProjectConfigParseErrors`**, which exists precisely because humans
+edit these files; `generate-icons.mjs` calls it and treats a parse error as UNKNOWN. This was
+shipped wrong once, in the commit that added the fallback, and caught in review.
+
+⚠️ **The bundled icon lives under `engine/assets/`, NOT `build/`.** `electron-builder.yml`'s `files:`
+ships `engine/**` + `dist/**` + `package.json`; `build/` reaches the package only as `build/bin` via
+`extraResources`. A default under `build/` therefore does not exist in the **packaged editor**, where
+`iconStep` passes `--icon ""` and the script silently generates nothing — a third answer for the same
+project. Identical to the trap that moved the splash badge art out of `build/`. Guarded by
+`engine/tests/plugins/bundledIconExists.test.ts`.
+
+⚠️ **`bundledIconPath()` returns `undefined` when the file is absent** rather than a path that does
+not resolve. Facet C makes an unreadable *requested* icon fatal, so a confident default would turn
+"this checkout has no `build/icon.png`" into a failed build for every project that authors none.
+
+**The CLI says which icon it used.** `iconStep` never needed to, having no other possibility to be
+confused with; the CLI does, because the `cfg === null` path also names no icon and deliberately
+does not default — so "it generated something" alone cannot tell an operator whether they shipped
+their own mark or the bundled one.
+
+**Measured cost of switching this on**, because the fear that kept it filed was bigger than the
+fact. Simulated on `games/sling` (no `iconSource`, 28 committed icon artifacts): `@capacitor/assets`
+reproduced **every committed mipmap and splash PNG byte-identically**, the wrapper undid the one
+piece of collateral it wrote (`ios/…/project.pbxproj`), and the only diff was **8 files** — #397's
+Android *monochrome* adaptive-icon variant, which these projects never received because it landed
+after their art was committed and only the editor's Build menu ever regenerated. So this completes
+art that was never generated; it is not #162/#236's churn re-created.
 
 ⚠️ **`--splash-cleared` is how a caller states what an absent flag cannot.** The packaged editor has
 no esbuild, so `cfg` is null there and the script cannot tell "cleared" from "not passed" — which
@@ -294,9 +385,11 @@ member.
 
 **Where the source image comes from, and the trap in it.** `app.iconSource` in
 `<project>/project.config.json` is a **project-relative** path (absolute is honoured too). When it
-is **empty — the scaffolder's default — the build falls back to the repo-root `build/icon.png`,
-which is the Modoki EDITOR's own icon**, so an unconfigured project silently ships Modoki's panda
-as its app icon and looks authored. ⚠️ **`<project>/assets/icon.png` is NOT the source**, however
+is **empty — the scaffolder's default — the build falls back to
+`engine/assets/app-icon-default.png`, the Modoki editor's own icon**, so an unconfigured project
+silently ships Modoki's panda as its app icon and looks authored. (It was `build/icon.png` until
+#1027's close-out; `build/` is not shipped in the packaged editor, so the default did not exist
+there — see the shared-default section above.) ⚠️ **`<project>/assets/icon.png` is NOT the source**, however
 much it reads like one: `generate-icons.mjs` COPIES the resolved source there because that is
 `@capacitor/assets`' input convention, and `games/*/assets/` + `demos/*/assets/` are **gitignored**.
 Editing that file changes nothing and is overwritten on the next run — put the master somewhere

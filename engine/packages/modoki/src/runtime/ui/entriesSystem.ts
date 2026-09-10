@@ -62,6 +62,30 @@ export interface EntryPrefabProvider {
    *  viewport exactly like the view's own authored `entryWidth`, not get pinned to a raw px
    *  number (#765). */
   rootSize(prefabGuid: string): { width: number; widthUnit: 'px' | '%'; height: number; heightUnit: 'px' | '%' };
+  /** The prefab root's authored `UIElement` record verbatim (`undefined` when the prefab is not
+   *  cached or its root has no `UIElement`) — **the operand every "did an author write this?"
+   *  question must use** (#1026).
+   *
+   *  ⚠️ **The pooled-row pin OVERWRITES the entity's own `UIElement`, so the live trait cannot
+   *  answer that question about itself.** `applySlots` writes the resolved box back — `width`,
+   *  `height` and their UNITS included — and a guard reading the result back sees the pool's own
+   *  write wearing an author's clothes. Two fields were provably wrong that way: `width`/`height`,
+   *  because the pin forces `widthUnit`/`heightUnit` to `'px'` and that unit is exactly what
+   *  `pooledSizeNeedsWarning` reads to grant the documented `%` exemption (so the exemption died
+   *  on frame 1 for every pooled row, and Court's `DailyMonth` — authored `100%` — warned about
+   *  a px value nothing authored); and `isVisible`, whose pin VARIES with the slot's live state,
+   *  so a slot pinned parked (`false`) and later going live compares the pool's own `false`
+   *  against a pin of `true` and warns.
+   *
+   *  ⚠️ **Required, not optional, deliberately.** A fake provider that omitted it would make every
+   *  authoring warning silently unreachable — the #761 failure exactly — and an optional method
+   *  turns that into a green suite instead of a compile error. Adding it to a fake is one line;
+   *  losing the warnings again is not worth the convenience.
+   *
+   *  A field ABSENT from the record means "the author never touched it": a scene/prefab save
+   *  strips any field equal to its default, so the caller resolves an absent field against the
+   *  trait's own schema default rather than treating `undefined` as authored. */
+  rootAuthoredUI(prefabGuid: string): Record<string, unknown> | undefined;
   /** Spawn one instance under `parentId`. Returns the root ecs id, or 0 if it cannot yet (the
    *  prefab is not cached) — the caller then tries again next frame rather than guessing. */
   spawnInstance(world: World, prefabGuid: string, opts: { parentId: number; guidSeed: string }): number;
@@ -275,6 +299,13 @@ function diagnoseBlankView(viewGuid: string, countX: number, countY: number, sou
  *  size and renders nothing this frame rather than guessing one. */
 export function prefabRootSize(prefabGuid: string): { width: number; widthUnit: 'px' | '%'; height: number; heightUnit: 'px' | '%' } {
   return provider?.rootSize(prefabGuid) ?? { width: 0, widthUnit: 'px', height: 0, heightUnit: 'px' };
+}
+
+/** The entry prefab root's authored `UIElement`, for the pooled-row authoring warnings (#1026).
+ *  `undefined` with no provider installed — which is also the right answer, because without one
+ *  nothing spawned and there is no pooled row to warn about. See `EntryPrefabProvider`. */
+export function prefabRootAuthoredUI(prefabGuid: string): Record<string, unknown> | undefined {
+  return provider?.rootAuthoredUI(prefabGuid);
 }
 
 export function entriesSystem(world: World, opts?: { fromScroll?: boolean }): void {
@@ -556,7 +587,12 @@ function driveView(
   writeLayout(content, rows, m, xw, yw, en);
   writeWindowState(view, m, xw, yw, plan.length, strideXraw, strideYraw);
   applySlots(world, plan, pool.ids, viewGuid, kinds[0].name, en.source as string, m, childIndex,
-    { rows, cols: Math.max(1, xw.pooled), entryW, entryH });
+    { rows, cols: Math.max(1, xw.pooled), entryW, entryH },
+    // ⚠️ The AUTHORED root traits, read fresh from the prefab — NOT the pooled entity's own
+    // `UIElement`, which `applySlots` has already overwritten with the pin (#1026). Same
+    // `kinds[0].prefab` the size above resolves from, so the two answers cannot disagree about
+    // which prefab is being pooled.
+    prefabRootAuthoredUI(kinds[0].prefab));
   // ⚠️ The SAME `childIndex` serves both halves, and it is not stale for either. `applySlots`
   // reparents the pooled ROOTS between rows, which changes only the rows' own child buckets —
   // both walks here start AT an entry root and go down, so neither can see that edit. Rebuilding
@@ -990,7 +1026,13 @@ function writeWindowState(
  *  `isVisible` defaults to `true` but pins to the slot's `live` state, so every freshly-spawned
  *  PARKED slot (`live === false`) would warn too. For the eight fields whose pin already equals
  *  their default (margin, min/max — all pinned and defaulted to 0) `pinned === def`, so this
- *  reduces to exactly the old `cur !== pinned` check — no behaviour change there. */
+ *  reduces to exactly the old `cur !== pinned` check — no behaviour change there.
+ *
+ *  ⚠️ **`cur` is the PREFAB-authored value, not the pooled entity's live one** (#1026). The rule
+ *  above is only sound while `cur` is something an author actually wrote: `isVisible` pins to the
+ *  slot's varying `live` state, so a slot pinned parked carries the pool's own `false` on its
+ *  trait, and reading that back on the tick it goes live gives `false !== true && false !== true`
+ *  — a warning about authoring that never happened. See `EntryPrefabProvider.rootAuthoredUI`. */
 function pooledFieldNeedsWarning(cur: unknown, pinned: unknown, def: unknown): boolean {
   return cur !== pinned && cur !== def;
 }
@@ -1018,7 +1060,16 @@ function pooledFieldNeedsWarning(cur: unknown, pinned: unknown, def: unknown): b
  *  and returned it verbatim as px — so a root authored `width: 100, widthUnit: '%'` under a view
  *  with no `entryWidth` was silently pinned to 100px with nothing warning here. `rootSize` now
  *  carries its own unit and `resolveEntrySize` resolves it against the same viewport axis as the
- *  view's own authored value, so the rule above holds for this case too. */
+ *  view's own authored value, so the rule above holds for this case too.
+ *
+ *  ⚠️ **`curValue`/`curUnit` MUST come from the PREFAB, never from the pooled entity's live
+ *  `UIElement`** (#1026 — the exemption above was unreachable for ~every pooled row until then).
+ *  The pin writes `widthUnit: 'px'` into the trait, so a caller passing `ui.widthUnit` hands this
+ *  function the pin's own unit: the `!== 'px'` line then returns `false` for one frame and `true`
+ *  forever after, and the "%" contract this whole docblock describes is granted to nobody.
+ *  Observed live: Court's `DailyMonth` authors `100%` on disk and printed
+ *  `authored UIElement.width=308px` — both the value and the unit written by the pool. The caller
+ *  in `applySlots` reads `authoredOf(...)`; keep it that way. */
 function pooledSizeNeedsWarning(curValue: unknown, curUnit: unknown, wantPx: number, def: unknown): boolean {
   if (curUnit !== 'px') return false;
   return curValue !== wantPx && curValue !== def;
@@ -1055,6 +1106,7 @@ function applySlots(
   viewGuid: string, kindName: string, sourceName: string, m: Metas,
   childIndex: Map<number, { id: number; name: string }[]>,
   grid: { rows: EntityLike[]; cols: number; entryW: number; entryH: number },
+  authoredUI: Record<string, unknown> | undefined,
 ): void {
   const resolver = sourceName ? getEntrySource(sourceName) : undefined;
 
@@ -1139,26 +1191,54 @@ function applySlots(
       const defaults = (m.uiMeta.trait as { schema?: Record<string, unknown> }).schema ?? {};
       const pinned = buildPooledRowPin({ live, wantW, wantH });
 
+      // ⚠️ **Every warning below reads `authoredOf`, NEVER `ui`** (#1026). `ui` is the pooled
+      // entity's LIVE `UIElement`, and the `entity.set` at the bottom of this block has already
+      // overwritten it with `pinned` on some earlier frame — so asking `ui` "did an author write
+      // this?" asks the pin about its own handiwork. Two fields answered wrong:
+      //
+      //   - `width`/`height`: the pin forces `widthUnit`/`heightUnit` to `'px'`, and that unit is
+      //     the exact discriminator `pooledSizeNeedsWarning` reads to grant the `%` exemption its
+      //     own docblock promises. So the exemption died on frame 1 for every pooled row, and from
+      //     then on any re-resolve to a different px value (a fractional container width, a DPR
+      //     change, a panel resize) warned. Court's `DailyMonth` authors `100%` and printed
+      //     "authored UIElement.width=308px" — a value and a unit the pool wrote itself.
+      //   - `isVisible`: its pin VARIES with the slot's live state. A slot pinned parked leaves
+      //     `false` on the trait; when it scrolls into the window `live` becomes `true`, and
+      //     `false !== true && false !== true` warns about the pool's own write.
+      //
+      // The other 11 pinned fields were never exposed — their pin is a constant, so once written
+      // `cur === pinned` and the guard is silent — but they read `authoredOf` too, because the
+      // NEXT field added to `POOLED_ROW_PINNED_GROUPS` with a varying pin would otherwise
+      // reintroduce this silently, which is precisely how #761 happened.
+      //
+      // An ABSENT authored field resolves to the trait's own schema default: a scene/prefab save
+      // strips any field equal to its default, so `undefined` means "never touched", not "authored
+      // undefined". Without this every stripped field would differ from both pin and default and
+      // warn on every row. (`??` and not `||`: an authored `0` or `false` is authoring.)
+      const authoredOf = (field: string): unknown => authoredUI?.[field] ?? defaults[field];
+
       // The nine fields the generic equality guard covers — everything `POOLED_ROW_PINNED_FIELDS`
       // names EXCEPT `isVisible` and `width`/`height` (+ their units), which each need their own
       // comparison below (live-state and folded-unit respectively).
       for (const field of POOLED_ROW_GENERIC_WARN_FIELDS) {
-        if (pooledFieldNeedsWarning(ui[field], pinned[field], defaults[field])) {
-          warnAuthoredOverride(entity, attr, viewGuid, slot, field, ui[field], pinned[field]);
+        if (pooledFieldNeedsWarning(authoredOf(field), pinned[field], defaults[field])) {
+          warnAuthoredOverride(entity, attr, viewGuid, slot, field, authoredOf(field), pinned[field]);
         }
       }
-      if (pooledFieldNeedsWarning(ui.isVisible, live, defaults.isVisible)) {
-        warnAuthoredOverride(entity, attr, viewGuid, slot, 'isVisible', ui.isVisible, live);
+      if (pooledFieldNeedsWarning(authoredOf('isVisible'), live, defaults.isVisible)) {
+        warnAuthoredOverride(entity, attr, viewGuid, slot, 'isVisible', authoredOf('isVisible'), live);
       }
       // width/height fold their companion unit into ONE warning — an author authors an axis, not
       // two independent fields, and a `width`+`widthUnit` pair that BOTH differ from the pin would
       // otherwise print twice for the same mistake. A `%` (or `vw`/`vh`/`vmin`/`vmax`) authored
       // unit is the documented contract, not a trap — see `pooledSizeNeedsWarning`.
-      if (pooledSizeNeedsWarning(ui.width, ui.widthUnit, wantW, defaults.width)) {
-        warnAuthoredOverride(entity, attr, viewGuid, slot, 'width', ui.width, `${wantW}px`, 'width', `${ui.width}${ui.widthUnit}`);
+      const aWidth = authoredOf('width'), aWidthUnit = authoredOf('widthUnit');
+      const aHeight = authoredOf('height'), aHeightUnit = authoredOf('heightUnit');
+      if (pooledSizeNeedsWarning(aWidth, aWidthUnit, wantW, defaults.width)) {
+        warnAuthoredOverride(entity, attr, viewGuid, slot, 'width', aWidth, `${wantW}px`, 'width', `${aWidth}${aWidthUnit}`);
       }
-      if (pooledSizeNeedsWarning(ui.height, ui.heightUnit, wantH, defaults.height)) {
-        warnAuthoredOverride(entity, attr, viewGuid, slot, 'height', ui.height, `${wantH}px`, 'height', `${ui.height}${ui.heightUnit}`);
+      if (pooledSizeNeedsWarning(aHeight, aHeightUnit, wantH, defaults.height)) {
+        warnAuthoredOverride(entity, attr, viewGuid, slot, 'height', aHeight, `${wantH}px`, 'height', `${aHeight}${aHeightUnit}`);
       }
 
       if (POOLED_ROW_PINNED_FIELDS.some((field) => ui[field] !== pinned[field])) {

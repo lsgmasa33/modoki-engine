@@ -9,7 +9,14 @@
  *  platform's product directory.
  *
  *  These tests drive that logic directly rather than invoking the generator: the real thing
- *  needs `npx` and the network, and what can regress here is the SCOPE RULE, not the tool. */
+ *  needs `npx` and the network, and what can regress here is the SCOPE RULE, not the tool.
+ *
+ *  ⚠️ Where a test DOES have to spawn the CLI (the exit-code and config-seam blocks), it runs with
+ *  a fake `npx` on PATH. Nothing in this file may reach the registry: `engine/tests` ships in the
+ *  OSS snapshot and the free public CI runs a Windows leg, so a networked test here is a networked
+ *  test for everyone. #1027 broke that property silently — a default that resolved where none had
+ *  before turned two early-returning tests into full generator runs — which is the shape to watch
+ *  for when adding a fixture that suddenly has more to do than it used to. */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
@@ -18,7 +25,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { collect, newFilesOutsideScope, restoreSnapshot, resolveIconInputs, stampExtrasFrom } from '../../scripts/generate-icons.mjs';
-import { ICON_COLORS, iconColorArgs } from '../../scripts/iconAssets.mjs';
+import { ICON_COLORS, iconColorArgs, bundledIconPath, BUNDLED_ICON_REL } from '../../scripts/iconAssets.mjs';
 import { DEFAULT_PROJECT_CONFIG } from '../../project-config';
 import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
 
@@ -245,10 +252,15 @@ describe('resolveIconInputs (#1011)', () => {
     expect(noCfg.badge).toBe(DEFAULT_PROJECT_CONFIG.app.splashBadge);
   });
 
-  it('reports no icon at all when neither flag nor config names one', () => {
-    // Distinct from an unreadable one: this is the legitimate "project authors no icon" case, which
-    // must stay a quiet skip rather than the facet-C failure.
-    expect(resolveIconInputs({}, ROOT, cfgWith({ iconSource: '' })).icon).toBeUndefined();
+  it('reports no icon only when the config could not be READ (#1027 narrowed this)', () => {
+    // ⚠️ This test used to assert BOTH of these were undefined, and #1027 deliberately split them.
+    // An empty `iconSource` in a config we successfully read is "authors no icon of its own", which
+    // now takes the bundled default — the same one `iconStep` has always applied, which is the
+    // whole point of that issue. A `null` cfg is "we could not read it", which must NOT default,
+    // because the project may have real art configured and defaulting would overwrite it.
+    // Kept as one test so the two cases stay visibly adjacent; the full argument is in the
+    // '#1027' describe block below.
+    expect(resolveIconInputs({}, ROOT, cfgWith({ iconSource: '' })).icon).toBeTruthy();
     expect(resolveIconInputs({}, ROOT, null).icon).toBeUndefined();
   });
 });
@@ -273,13 +285,34 @@ describe('stampExtrasFrom (#1011)', () => {
 });
 
 // ⚠️ FACET C, and it needs a REAL subprocess: the defect was an EXIT CODE, which no in-process call can
-// observe. Both cases below return before `npx @capacitor/assets` is ever spawned, so neither needs the
-// network — which is what makes an exit-code test affordable here at all (see this file's header).
+// observe. Neither case reaches the network — the fatal one returns before the generator is spawned,
+// and the other spawns a FAKE `npx` installed below. That sentence used to say "both cases return
+// before `npx @capacitor/assets` is ever spawned"; #1027's bundled-icon default made the second one
+// run the whole path, so the claim went stale in the same commit that broke it.
 describe('generate-icons CLI exit codes (#1011 facet C)', () => {
   const SCRIPT = path.join(
     path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'scripts', 'generate-icons.mjs');
+  // ⚠️ A fake `npx` that exits 1, exactly as the seam block below installs one, and #1027 is why
+  // this block needs it too. The two tests here used to return at `if (!iconSrc)` before any
+  // spawn — which is what the comment above claimed and what made an exit-code test affordable.
+  // Once the bundled-icon default landed, "no icon named anywhere" started RESOLVING one, so both
+  // tests ran the full path and reached for `@capacitor/assets@3.0.5` over the network from inside
+  // `npm test`. Worse than slow: a failed fetch exits non-zero, the non-strict path returns 0, and
+  // both tests still pass — so the dependency is invisible until it is the thing making CI hang.
+  // The `.cmd` sibling is load-bearing on Windows for the reason the seam block spells out.
+  let binDir: string;
+  beforeEach(() => {
+    binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fakebin-exit-'));
+    fs.writeFileSync(path.join(binDir, 'npx'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(binDir, 'npx.cmd'), '@echo off\r\nexit /b 1\r\n');
+  });
+  afterEach(() => { fs.rmSync(binDir, { recursive: true, force: true }); });
   const run = (args: string[]) =>
-    spawnSync(process.execPath, [SCRIPT, ...args], { encoding: 'utf8', cwd: path.join(SCRIPT, '..', '..', '..') });
+    spawnSync(process.execPath, [SCRIPT, ...args], {
+      encoding: 'utf8',
+      cwd: path.join(SCRIPT, '..', '..', '..'),
+      env: { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ''}` },
+    });
 
   it('FAILS, loudly, when something asked for an icon that cannot be read', () => {
     // It used to `return` here: nothing was regenerated and the shell reported SUCCESS. An operator
@@ -292,12 +325,19 @@ describe('generate-icons CLI exit codes (#1011 facet C)', () => {
     expect(`${res.stderr}${res.stdout}`).toMatch(/cwd/);              // and the CWD it resolved against
   });
 
-  it('succeeds quietly when NO icon is named anywhere — that is not an error', () => {
+  it('succeeds when NO icon is named anywhere, and says it used the bundled default (#1027)', () => {
     // The other side of the same branch, and the reason facet C could not just be "always fail": a
-    // project that authors no icon must still build, with its committed icons untouched.
+    // project that authors no icon must still build.
+    //
+    // ⚠️ #1027 changed what "still build" MEANS here. This used to assert the run skipped
+    // generation entirely — which was the defect, because the editor's build plan generated from
+    // the bundled icon for the very same project. Now both callers generate, so the assertion is
+    // that it ran AND announced which icon it used. The announcement is the part that matters: the
+    // `cfg === null` path also names no icon and deliberately does not default, so "generated
+    // something" alone cannot tell an operator whether they shipped their mark or the panda.
     const res = run(['--project', root, '--platform', 'android']);
     expect(res.status).toBe(0);
-    expect(`${res.stdout}${res.stderr}`).toMatch(/no icon source/);
+    expect(`${res.stdout}${res.stderr}`).toMatch(/using the BUNDLED Modoki icon/);
   });
 
   it('still refuses a missing --project with the usage message', () => {
@@ -421,10 +461,33 @@ describe('generate-icons reads project.config.json (#1011, at the seam)', () => 
     cwd: REPO,
     env: { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ''}` },
   });
+  /** Make the fake `npx` SUCCEED (doing nothing) for the rest of this test.
+   *
+   *  ⚠️ Needed by any test whose subject is downstream of the generator spawn — the freshness
+   *  stamp, the post-processing steps, the restore. The default fake exits 1, so those tests
+   *  otherwise return at `if (res.status !== 0)` and assert against a code path that never ran.
+   *  That is not hypothetical: the F2 stamp test below passed with its own mechanism deleted until
+   *  this existed, because "no stamp" was true for the wrong reason. Still no network — the point
+   *  of the fake is only ever which exit code the generator sees. */
+  const npxSucceeds = () => {
+    fs.writeFileSync(path.join(binDir, 'npx'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(binDir, 'npx.cmd'), '@echo off\r\nexit /b 0\r\n');
+  };
   const writeConfig = (app: Record<string, unknown>) =>
     write('project.config.json', JSON.stringify({ app }, null, 2));
   /** A file the generator can actually copy — its bytes are never decoded on this path. */
   const sourceArt = (rel: string) => write(rel, 'PNG-ish bytes');
+  /** A REAL PNG, for any test whose subject is downstream of sharp.
+   *
+   *  ⚠️ `sourceArt`'s placeholder makes the post-processing steps THROW, which sets `postFailed`
+   *  and withholds the stamp for a reason that has nothing to do with the test. Two stamp tests
+   *  passed with their own mechanism deleted before this existed. */
+  const realPng = (rel: string) => {
+    const abs = path.join(root, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.copyFileSync(path.join(REPO, 'engine', 'assets', 'app-icon-default.png'), abs);
+    return abs;
+  };
 
   it('resolves app.iconSource from the config, project-relative, with no --icon flag', () => {
     // The mutation this kills: passing `null` where `cfg` goes. Then nothing names an icon, the
@@ -532,10 +595,153 @@ describe('generate-icons reads project.config.json (#1011, at the seam)', () => 
   });
 
   it('treats a whitespace-only source as UNSET, not as a path', () => {
+    // Still the same rule, still for the same reason — `"art/icon.png "` must not become an
+    // unreadable path and (post-#1011 facet C) a FATAL build. What UNSET now RESOLVES to is the
+    // bundled default rather than nothing (#1027), so the observable proof moved from "it skipped"
+    // to "it used the default" — but a whitespace source reaching the generator as a path would
+    // still fail this, which is what the test is for.
     writeConfig({ iconSource: '   ' });
     const res = runIn(['--project', root, '--platform', 'android']);
     expect(res.status).toBe(0);
-    expect(`${res.stdout}${res.stderr}`).toMatch(/no icon source/);
+    expect(`${res.stdout}${res.stderr}`).toMatch(/using the BUNDLED Modoki icon/);
+    expect(`${res.stdout}${res.stderr}`).not.toMatch(/could not read the icon source/);
+  });
+
+  // ── #1028: --strict turns the remaining exit-0 degrades into failures ────────────────────
+  //
+  // #1011 facet C made an unreadable ICON source fatal and stopped there, so `build-web.mjs`'s
+  // promise — "not building; building on would ship the previously committed art" — covered one of
+  // five failure modes. The other four exited 0.
+  //
+  // ⚠️ Only the SPLASH row is driven end-to-end here, and that is a deliberate limit rather than an
+  // oversight: it is the one degrade that happens BEFORE `npx @capacitor/assets` is spawned, so it
+  // costs no network. The other three (a non-zero npx, an unrestorable collateral write, a
+  // post-processing throw) all sit after a real generator run, and faking one would mock away the
+  // mechanism under test — the shape docs/falsifiable-tests.md exists to stop. What IS pinned for
+  // all four is that both BUILD callers pass the flag, in the producer-side block below; that is
+  // the half a regression would silently revert.
+  it('--strict makes an unreadable splash source FATAL', () => {
+    writeConfig({ iconSource: 'art/icon.png', splashSource: 'art/no-such-splash.png' });
+    sourceArt('art/icon.png');
+    const res = runIn(['--project', root, '--platform', 'android', '--strict', 'true']);
+    expect(res.status).not.toBe(0);
+    expect(`${res.stdout}${res.stderr}`).toMatch(/could not stage splash\.png/);
+    expect(`${res.stdout}${res.stderr}`).toMatch(/--strict: splash\.png was requested and could not be read/);
+  });
+
+  it('WITHOUT --strict the same run still succeeds — the hand run stays forgiving', () => {
+    // ⚠️ The accept side, and CLAUDE.md requires it: a guard tested only on the reject side cannot
+    // distinguish "fails when it should" from "fails always". It also pins the actual DECISION here
+    // — the owner chose a flag over making the splash case unconditionally fatal (#1028 option b)
+    // precisely so a mistyped `splashSource` does not fail somebody poking at the script by hand.
+    writeConfig({ iconSource: 'art/icon.png', splashSource: 'art/no-such-splash.png' });
+    sourceArt('art/icon.png');
+    const res = runIn(['--project', root, '--platform', 'android']);
+    expect(res.status).toBe(0);
+    expect(`${res.stdout}${res.stderr}`).toMatch(/could not stage splash\.png/);   // still LOUD
+    expect(`${res.stdout}${res.stderr}`).not.toMatch(/--strict:/);
+  });
+
+  // ── close-out findings F1 and F2: both were wrong in the COMMENTS before they were wrong in
+  // the code, which is why each gets a test that drives the real CLI rather than the resolver.
+  it('a MALFORMED project.config.json defaults nothing — it is UNKNOWN, not empty (F1)', () => {
+    // ⚠️ The art-destroying case #1027's own docblock swore was impossible. `loadProjectConfig`
+    // CATCHES its own JSON.parse throw and returns merged defaults (its docstring: "A missing file
+    // or unparseable JSON falls back to the defaults"), so `cfg !== null` never meant "was read".
+    // A trailing comma in a hand-edited config therefore arrived as a clean config with an empty
+    // `iconSource`, and a native build regenerated every icon from the bundled panda over the
+    // project's committed art — then stamped it current.
+    fs.writeFileSync(path.join(root, 'project.config.json'),
+      '{ "app": { "iconSource": "art/icon.png", } }');   // trailing comma
+    sourceArt('art/icon.png');
+    const res = runIn(['--project', root, '--platform', 'android']);
+    expect(res.status).toBe(0);
+    expect(`${res.stdout}${res.stderr}`).toMatch(/EXISTS but does not parse/);
+    expect(`${res.stdout}${res.stderr}`).not.toMatch(/using the BUNDLED Modoki icon/);
+  });
+
+  it('a requested-but-unstageable splash writes NO stamp, so --strict stays reachable (F2)', () => {
+    // ⚠️ Every --strict check sits downstream of the `upToDate` early return, and this was the one
+    // degrade of five that fell through to the stamp write. So one forgiving hand run over a
+    // renamed `splashSource` would stamp the icon-derived splash as current, and every later
+    // build — --strict or not — would exit 0 on "already current" without reaching a strict branch.
+    // The flag would be passed and never execute. Withholding the stamp makes it self-healing.
+    // ⚠️ A REAL PNG, not `sourceArt`'s `'PNG-ish bytes'` placeholder — and that is the difference
+    // between this test working and this test being decorative. With the placeholder, sharp throws
+    // in `writeAndroidIconVariants`, `postFailed` is set for THAT reason, and no stamp is written
+    // whatever this fix does: the assertion below passes identically with the mechanism deleted.
+    // Found by mutation-checking, which is the only thing that could have found it.
+    writeConfig({ iconSource: 'art/icon.png', splashSource: 'art/no-such-splash.png' });
+    realPng('art/icon.png');
+    npxSucceeds();   // the stamp write is DOWNSTREAM of the spawn — see the helper's note
+    const res = runIn(['--project', root, '--platform', 'android']);
+    expect(res.status).toBe(0);                                    // forgiving, as designed
+    expect(`${res.stdout}${res.stderr}`).toMatch(/could not stage splash\.png/);
+    // The assertion that matters: nothing was declared current.
+    expect(fs.existsSync(path.join(root, '.cache', 'icon-stamp-android')),
+      'a stamp here re-arms the "already current" short-circuit and disarms --strict forever').toBe(false);
+    // And the run that follows it must therefore still reach the strict branch.
+    const strict = runIn(['--project', root, '--platform', 'android', '--strict', 'true']);
+    expect(strict.status).not.toBe(0);
+    expect(`${strict.stdout}${strict.stderr}`).toMatch(/--strict: splash\.png was requested and could not be read/);
+  });
+
+  // ⚠️ The three SIBLINGS the first cut of #1028 missed, and the reason its comment claiming "the
+  // other four degrades already did exactly this" was an enumeration nobody had counted. All five
+  // share one mechanism — a REQUESTED input that cannot be read degrades to a DERIVED substitute —
+  // and the fix is one rule applied once, not five patches. One test per site, against that rule.
+  it('a broken splashDarkSource withholds the stamp too — the light-splash fix missed its twin', () => {
+    // The nastiest of the five to notice: the dark splash falls back to the LIGHT art, not to the
+    // icon-derived one, so the wrong mark ships only in dark mode — the case least likely to be
+    // the one you happen to test.
+    writeConfig({ iconSource: 'art/icon.png', splashSource: 'art/splash.png', splashDarkSource: 'art/no-such-dark.png' });
+    realPng('art/icon.png');
+    realPng('art/splash.png');
+    npxSucceeds();
+    const res = runIn(['--project', root, '--platform', 'android']);
+    expect(res.status).toBe(0);
+    expect(`${res.stdout}${res.stderr}`).toMatch(/splashDarkSource/);
+    expect(fs.existsSync(path.join(root, '.cache', 'icon-stamp-android'))).toBe(false);
+  });
+
+  it('a broken icon-variant override withholds the stamp — and is FATAL under --strict', () => {
+    // `overrideOrNull` derives from the base icon and returns normally, so this trio never set
+    // `postFailed` at all: not merely disarmable like the splash pair, but never firing under
+    // --strict even on a first run.
+    writeConfig({ iconSource: 'art/icon.png', iconMonochromeSource: 'art/no-such-mono.png' });
+    realPng('art/icon.png');
+    npxSucceeds();
+    const forgiving = runIn(['--project', root, '--platform', 'android']);
+    expect(forgiving.status).toBe(0);
+    expect(`${forgiving.stdout}${forgiving.stderr}`).toMatch(/iconMonochromeSource/);
+    expect(fs.existsSync(path.join(root, '.cache', 'icon-stamp-android'))).toBe(false);
+
+    const strict = runIn(['--project', root, '--platform', 'android', '--strict', 'true']);
+    expect(strict.status).not.toBe(0);
+    expect(`${strict.stdout}${strict.stderr}`).toMatch(/not building on derived stand-ins/);
+  });
+
+  it('a malformed config is FATAL under --strict instead of exiting 0 on stale art', () => {
+    // F1's first fix stopped the panda overwriting authored art, but left the run exiting 0 — so
+    // `build-web.mjs` saw success and built on, shipping the previously committed art under the
+    // very flag that exists to prevent exactly that.
+    fs.writeFileSync(path.join(root, 'project.config.json'), '{ "app": { "iconSource": "art/icon.png", } }');
+    realPng('art/icon.png');
+    const res = runIn(['--project', root, '--platform', 'android', '--strict', 'true']);
+    expect(res.status).not.toBe(0);
+    expect(`${res.stdout}${res.stderr}`).toMatch(/refusing to build on art whose source could not be determined/);
+    // ...and NOT fatal without the flag, so a hand run over a broken config is not a hard stop.
+    expect(runIn(['--project', root, '--platform', 'android']).status).toBe(0);
+  });
+
+  it('warns on a malformed --strict rather than silently reading it as false', () => {
+    // Same reasoning as `--splash-cleared` above, and it matters more here: silently reading a
+    // BUILD caller's `--strict` as false restores exactly the shipping-stale-art behaviour the
+    // flag was added to remove, with nothing on screen to say so.
+    sourceArt('art/icon.png');
+    const res = runIn(['--project', root, '--platform', 'android',
+      '--icon', path.join(root, 'art', 'icon.png'), '--strict', 'TRUE']);
+    expect(`${res.stdout}${res.stderr}`).toMatch(/--strict expects true\|false/);
   });
 });
 
@@ -577,9 +783,102 @@ describe('the editor tells the generator what only it knows (#1011, producer sid
     expect(runners.length, 'both scaffold runners must carry it').toBe(2);
   });
 
+  it('BOTH build paths pass --strict, which is the whole of #1028', () => {
+    // ⚠️ The decision this pins is the owner's, not the code's: a degraded generation must stop a
+    // BUILD, while a bare hand run of the script stays forgiving. That splits cleanly only if both
+    // build callers actually set the flag — drop it from either and that path silently returns to
+    // shipping the previously committed art with exit 0, which is the defect, restored, invisibly.
+    expect(scanner, "iconStep must pass --strict").toContain('--strict true');
+    const rawBuildWeb = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)),
+      '..', '..', 'scripts', 'build-web.mjs'), 'utf8');
+    const buildWeb = stripComments(rawBuildWeb);
+    assertScanIsSane(rawBuildWeb, buildWeb, 'build-web.mjs', ['generate-icons']);
+    expect(buildWeb, 'build-web.mjs must pass --strict to generate-icons').toMatch(/'--strict',\s*'true'/);
+  });
+
   it('does not leave a bare build-web native step behind — that step would generate twice', () => {
     // The failure this guards: someone adds a third native entry point and copies the OLD line.
     const bare = scanner.match(/'node engine\/scripts\/build-web\.mjs --target native', cwd:/g) ?? [];
     expect(bare, 'a --target native build-web step with no MODOKI_ICONS_HANDLED').toHaveLength(0);
+  });
+});
+
+// ── #1027: the ONE input the #1011 resolver did not own ──────────────────────────────────
+//
+// #1011 moved every generation input into `resolveIconInputs` — except the bundled-icon default,
+// which stayed in `iconStep` (`engine/plugins/vite-asset-scanner.ts`). So for the 22 native projects
+// that author no `iconSource`, the EDITOR's build plan generated from `build/icon.png` and the CLI
+// native build reported "nothing to generate; committed icons untouched". Same project, same
+// config, two answers — `family/one-entry-point` (#827).
+describe('resolveIconInputs — the bundled-icon default (#1027)', () => {
+  const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+  const PROJ = path.join(path.sep, 'proj');
+  const cfgWith = (app: Record<string, unknown> = {}) => ({ app, capacitor: {} });
+
+  it('falls back to the bundled icon when the config authors none', () => {
+    // The defect exactly: this returned `undefined` and main() printed "nothing to generate".
+    expect(resolveIconInputs({}, PROJ, cfgWith({})).icon).toBe(bundledIconPath(REPO_ROOT));
+    expect(resolveIconInputs({}, PROJ, cfgWith({ iconSource: '' })).icon).toBe(bundledIconPath(REPO_ROOT));
+    // Whitespace has to read as unset too — `resolveIconInputs` trims to mirror what the editor
+    // stores, and a config of "   " must not become an unreadable path and (post-#1011 facet C)
+    // a FATAL build.
+    expect(resolveIconInputs({}, PROJ, cfgWith({ iconSource: '   ' })).icon).toBe(bundledIconPath(REPO_ROOT));
+  });
+
+  it('does NOT fall back when the config could not be read — the art-destroying case', () => {
+    // ⚠️ The single most important assertion here. `cfg === null` means UNKNOWN, not "authors no
+    // icon": the packaged editor ships no esbuild, and an unparseable file lands here too. A
+    // project in that state may well have real icon art configured, so defaulting would overwrite
+    // it with the Modoki panda — destroying authored art on the one build that ships. This is the
+    // same distinction facet B had to learn for `splashCleared`, and it was learned the hard way.
+    expect(resolveIconInputs({}, PROJ, null).icon).toBeUndefined();
+  });
+
+  it('keeps the flag and the config ahead of the default', () => {
+    // The default is a LAST resort — it must not outrank the two things that state an intent.
+    expect(resolveIconInputs({ icon: '/abs/override.png' }, PROJ, cfgWith({})).icon).toBe('/abs/override.png');
+    expect(resolveIconInputs({}, PROJ, cfgWith({ iconSource: 'art/icon.png' })).icon)
+      .toBe(path.join(PROJ, 'art/icon.png'));
+    // And a flag still beats a config that DOES author one, which is #1011's precedence rule —
+    // restated here because the `??` added for this issue sits on that same expression and could
+    // have broken it.
+    expect(resolveIconInputs({ icon: '/abs/o.png' }, PROJ, cfgWith({ iconSource: 'art/icon.png' })).icon)
+      .toBe('/abs/o.png');
+  });
+
+  it('reports the bundled icon as absent rather than returning a path that does not resolve', () => {
+    // #1011 facet C makes an unreadable REQUESTED icon fatal, so a default that pointed at a
+    // missing file would turn "this checkout has no build/icon.png" into a failed build for every
+    // project that authors no icon. Absent must stay absent.
+    expect(bundledIconPath(path.join(os.tmpdir(), 'modoki-no-such-root-ever'))).toBeUndefined();
+    expect(bundledIconPath(REPO_ROOT)).toBeTruthy();
+  });
+
+  it('is defined in ONE place — neither caller rebuilds the path', () => {
+    // ⚠️ The shadowing-constant shape this repo has scars from, and the reason #1027 existed at
+    // all: the default lived in `iconStep` and nowhere else. A second literal in either caller
+    // would silently re-open the divergence the moment one of them changed.
+    //
+    // Comments are STRIPPED before matching, on purpose: the fix's own explanatory comments
+    // discuss the bundled icon by name, and a guard matching raw text would be satisfied by the
+    // prose documenting the rule — the exact way `missingSpmDeps` was disarmed once (#812).
+    // ⚠️ Matched against BUNDLED_ICON_REL, never a hard-coded string. This guard was written as
+    // `.not.toContain('build/icon.png')` and the close-out's own `git mv` then made it VACUOUS —
+    // that literal exists nowhere now, so the assertion was satisfied by construction. Proven, not
+    // assumed: inlining `path.join(buildCwd, 'engine/assets/app-icon-default.png')` back into
+    // `iconStep` — the exact divergence #1027 was filed to close — left the whole file green. A
+    // guard that names the value it is protecting follows it when it moves; one that names today's
+    // spelling protects only today.
+    for (const rel of ['plugins/vite-asset-scanner.ts', 'scripts/generate-icons.mjs']) {
+      const raw = fs.readFileSync(path.join(REPO_ROOT, 'engine', rel), 'utf8');
+      const code = stripComments(raw);
+      assertScanIsSane(raw, code, rel);
+      expect(code, `${rel} rebuilds the bundled-icon path instead of importing bundledIconPath()`)
+        .not.toContain(BUNDLED_ICON_REL);
+    }
+    // And the constant must still be somewhere, or the two assertions above pass on an empty
+    // needle — `''` is contained in everything, so a blanked constant would flip this guard from
+    // vacuous-true to always-false, but a MISSING one would be silent.
+    expect(BUNDLED_ICON_REL.length).toBeGreaterThan(5);
   });
 });

@@ -36,6 +36,8 @@ import { execFileSync } from 'node:child_process';
 import { stripSwiftComments } from '@modoki/engine/testing';
 import { hasNativeProjects } from '../helpers/repoLayout';
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
+// @ts-expect-error — .mjs script module, no type declarations by design (it is a build script).
+import { PLUGIN_CLASS_LEGS } from '../../scripts/nativePluginLegs.mjs';
 
 const repoRoot = path.resolve(__dirname, '../../..');
 const PKG_DIR = 'engine/packages';
@@ -513,6 +515,97 @@ describe('committed Package.swift vs package.json — every SPM-iOS capacitor de
       const spm =
         '.package(name: "CapacitorModokiIap", path: "../../../node_modules/capacitor-modoki-iap")';
       expect(isSpmDepDeclared('capacitor-modoki-iap', spm)).toBe(true);
+    });
+  });
+});
+
+/** #991: a `'no-spm'` leg in `nativePluginLegs.mjs` asserts a PREMISE, and this is where it expires.
+ *
+ *  The row it replaced carried `knownFail: '#991'`, whose one virtue was self-expiry — a knownFail
+ *  leg that PASSES is reported as a failure telling you to delete the marker. That virtue is why
+ *  the replacement has to be checked somewhere, or `'no-spm'` becomes the standing exemption
+ *  nobody revisits that #991 explicitly warned about.
+ *
+ *  ⚠️ It is checked HERE rather than in the native gate, and that is an improvement rather than a
+ *  relocation. `knownFail` could only expire on a machine with macOS **and** Xcode running
+ *  `npm run test:native`, which is rare and manual. This file runs under `npm run verify` — every
+ *  push, every clone, no toolchain — so the row now goes stale in front of the person who made it
+ *  stale, not months later in front of somebody else.
+ *
+ *  ⚠️ Deliberately NO vacuity floor on the row count. Zero `'no-spm'` rows is the SUCCESS state
+ *  (it means #991 got genuinely fixed and the row was removed), so `expect(rows.length)
+ *  .toBeGreaterThan(0)` would fail the repo for doing the right thing. The rule is protected from
+ *  passing vacuously by the fixtures below instead — the same answer this file already reaches for
+ *  in `missingSpmDeps`' own describe block, and for the same reason. */
+export function noSpmPremiseProblems(pkgJsonText: string, podspecText: string, spmText: string): string[] {
+  const problems: string[] = [];
+  const platforms = Object.keys((JSON.parse(pkgJsonText).capacitor ?? {}) as Record<string, unknown>);
+  if (platforms.includes('ios')) {
+    problems.push('package.json now declares capacitor.ios — cap sync WILL add the SPM package, so this is an SPM consumer and the row should be \'spm\'');
+  }
+  if (!missingSpmDeps(podspecText, spmText).length) {
+    problems.push('Package.swift now declares every dependency the podspec does — an SPM build can resolve, so the row should be \'spm\' and the leg should actually run');
+  }
+  return problems;
+}
+
+describe("#991 a 'no-spm' leg's premise, asserted where it will actually be read", () => {
+  const rows = (PLUGIN_CLASS_LEGS as { dir: string; shape: string }[])
+    .filter((l) => l.shape === 'no-spm')
+    .filter((l) => fs.existsSync(path.join(repoRoot, l.dir)));
+
+  it('every no-spm package still cannot be an SPM consumer', () => {
+    for (const row of rows) {
+      const dir = path.join(repoRoot, row.dir);
+      const podspecName = fs.readdirSync(dir).find((f) => f.endsWith('.podspec'));
+      const manifest = path.join(dir, 'Package.swift');
+      // ⚠️ These two files ARE the row's stated evidence, so their disappearance invalidates it as
+      // surely as their contents changing. Skipping quietly when one is missing is how the check
+      // would go green on a package that had been restructured out from under it.
+      expect(podspecName, `${row.dir} is 'no-spm' but ships no podspec — the row's reasoning cites one`).toBeTruthy();
+      expect(fs.existsSync(manifest), `${row.dir} is 'no-spm' but has no Package.swift — the row's reasoning cites one`).toBe(true);
+      const problems = noSpmPremiseProblems(
+        fs.readFileSync(path.join(dir, 'package.json'), 'utf8'),
+        fs.readFileSync(path.join(dir, podspecName!), 'utf8'),
+        fs.readFileSync(manifest, 'utf8'),
+      );
+      expect(
+        problems,
+        `${row.dir}'s 'no-spm' row is STALE: ${problems.join('; ')}. Update the row in engine/scripts/nativePluginLegs.mjs.`,
+      ).toEqual([]);
+    }
+  });
+
+  describe('noSpmPremiseProblems — the rule itself, on fixtures', () => {
+    const POD = "s.dependency 'Capacitor'\ns.dependency 'MediaPipeTasksGenAI'\n";
+    const SPM_WITHOUT = 'let package = Package(name: "X", dependencies: [.package(url: "https://github.com/ionic-team/capacitor-swift-pm.git", from: "8.0.0")])';
+    const SPM_WITH = `${SPM_WITHOUT}\n.package(name: "MediaPipeTasksGenAI", path: "./vendor")`;
+    const ANDROID_ONLY = JSON.stringify({ capacitor: { android: { src: 'android' } } });
+    const BOTH = JSON.stringify({ capacitor: { android: { src: 'android' }, ios: { src: 'ios' } } });
+
+    it('is satisfied by the state the row actually describes', () => {
+      expect(noSpmPremiseProblems(ANDROID_ONLY, POD, SPM_WITHOUT)).toEqual([]);
+    });
+
+    it('flags the row once the manifest gains the podspec dependency', () => {
+      expect(noSpmPremiseProblems(ANDROID_ONLY, POD, SPM_WITH)).toHaveLength(1);
+    });
+
+    it('flags the row once package.json declares ios', () => {
+      expect(noSpmPremiseProblems(BOTH, POD, SPM_WITHOUT)).toHaveLength(1);
+    });
+
+    it('flags BOTH when the package has fully become an SPM consumer', () => {
+      // The case that matters most and is easiest to get wrong: an early `return` on the first
+      // problem would report one, and the operator would fix one thing and re-run into the other.
+      expect(noSpmPremiseProblems(BOTH, POD, SPM_WITH)).toHaveLength(2);
+    });
+
+    it('a dependency named only in a COMMENT does not satisfy the manifest', () => {
+      // The exact disarming that already happened once to `missingSpmDeps` (see its docblock): the
+      // commit that added that rule also wrote MediaPipeTasksGenAI into this manifest's prose.
+      const commented = `${SPM_WITHOUT}\n// TODO: add MediaPipeTasksGenAI once Google ships an SPM distribution`;
+      expect(noSpmPremiseProblems(ANDROID_ONLY, POD, commented)).toEqual([]);
     });
   });
 });

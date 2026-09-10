@@ -44,7 +44,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ICON_TOOL, iconColorArgs } from './iconAssets.mjs';
+import { ICON_TOOL, iconColorArgs, bundledIconPath } from './iconAssets.mjs';
 import { composeSplashOverlays } from './splashCompose.mjs';
 import { writeIosIconVariants, writeAndroidIconVariants } from './iconVariants.mjs';
 import { applyAndroidSplashTheme } from './androidSplashTheme.mjs';
@@ -99,16 +99,39 @@ async function loadIconProjectConfig(projectRoot) {
       ? 'esbuild is absent — expected inside a packaged editor; on a source checkout run `npm install` at the repo root'
       : 'no engine/plugins/load-project-config.ts here, so this is not a source checkout'}). `
       + 'Only the flags passed on the command line will be used, and no staged art will be cleared.');
-    return { cfg: null };
+    // ⚠️ `malformed: false` on purpose. This is the PACKAGED editor's normal state, not a defect —
+    // it ships no esbuild — so it must stay non-fatal even under `--strict`, or every packaged
+    // build fails. `iconStep` always passes `--icon` there, so nothing is actually unknown.
+    return { cfg: null, malformed: false };
   }
   try {
+    // ⚠️ `loadProjectConfig` SWALLOWS a malformed file: its own docstring says "A missing file or
+    // unparseable JSON falls back to the defaults", and it catches its own `JSON.parse` throw and
+    // returns `mergeProjectConfig(null)`. So a non-null return does NOT mean the config was read —
+    // and the `catch` below is unreachable for the malformed case, which is the one that matters.
+    //
+    // That is load-bearing rather than pedantic, because `cfg === null` is what gates the
+    // bundled-icon default and the splash clear. A trailing comma in a hand-edited
+    // `project.config.json` would otherwise arrive here as a clean config with an EMPTY
+    // `iconSource`, and a native build would regenerate every icon from the bundled Modoki panda
+    // over the project's committed art — then write the freshness stamp, so the next build reports
+    // "already current". `readProjectConfigParseErrors` is the sanctioned way to ask the question
+    // `loadProjectConfig` refuses to answer; it exists precisely because humans edit these files.
+    const parseErrors = mod.readProjectConfigParseErrors?.(projectRoot) ?? [];
+    const configError = parseErrors.find((e) => e.file === 'project.config.json');
+    if (configError) {
+      console.warn(`[icon] ⚠️ project.config.json EXISTS but does not parse (${configError.message}) — `
+        + 'treating every input as UNKNOWN: no bundled-icon default, no staged art cleared, and nothing '
+        + 'regenerated from a guess. Fix the JSON and re-run.');
+      return { cfg: null, malformed: true };
+    }
     // `loadProjectConfig` MERGES over DEFAULT_PROJECT_CONFIG, which is why a raw JSON.parse is wrong
     // here: `pruneProjectConfig` omits every field equal to its default, so an absent field means
     // DEFAULT, not "unset". Reading a pruned file directly is how "absent" becomes "cleared".
-    return { cfg: mod.loadProjectConfig(projectRoot) };
+    return { cfg: mod.loadProjectConfig(projectRoot), malformed: false };
   } catch (e) {
     console.warn(`[icon] ⚠️ project.config.json could not be parsed (${e.message}) — using flags only, and clearing nothing.`);
-    return { cfg: null };
+    return { cfg: null, malformed: true };
   }
 }
 
@@ -159,7 +182,7 @@ export function resolveIconInputs(args, projectRoot, cfg) {
   // exists precisely so a caller can state something the script cannot infer, so it must not
   // quietly stop stating it. `parseArgs` is a naive pairwise loop, so a flag passed LAST with no
   // value lands here as `undefined` too.
-  for (const [flag, raw] of [['badge', args.badge], ['splash-cleared', args['splash-cleared']]]) {
+  for (const [flag, raw] of [['badge', args.badge], ['splash-cleared', args['splash-cleared']], ['strict', args.strict]]) {
     if (raw !== undefined && raw !== 'true' && raw !== 'false') {
       console.warn(`[icon] ⚠️ --${flag} expects true|false, got ${JSON.stringify(raw)} — reading it as false. `
         + 'A boolean flag with no value (or a trailing flag) parses this way.');
@@ -167,7 +190,20 @@ export function resolveIconInputs(args, projectRoot, cfg) {
   }
 
   return {
-    icon: pick('icon', app?.iconSource),
+    // ⚠️ FACET A's REMAINDER (#1027). A flag wins; then the config; then — and only then — the
+    // bundled Modoki icon, which is what `iconStep` has always fallen back to. Without this the
+    // editor's build plan and the CLI native build gave DIFFERENT answers for the same project:
+    // the editor generated from `build/icon.png`, the CLI reported "nothing to generate" and left
+    // 22 native projects' committed art maintained by exactly one of the two callers.
+    //
+    // ⚠️ `cfg !== null` is NOT belt-and-braces, it is the whole safety of this line, and it is the
+    // same distinction facet B already had to learn below. `cfg === null` does not mean "no icon
+    // authored" — it means the config could not be READ (no esbuild in the packaged editor, or an
+    // unparseable file), which is precisely when a project MIGHT have real icon art configured.
+    // Falling back there would overwrite that project's authored icon with the panda, i.e. destroy
+    // art, on the one build that ships. Only a config we positively read and found empty may
+    // default. The packaged editor is unaffected either way: `iconStep` always passes `--icon`.
+    icon: pick('icon', app?.iconSource) ?? (cfg !== null ? bundledIconPath(REPO_ROOT) : undefined),
     splash: pick('splash', app?.splashSource),
     splashDark: pick('splash-dark', app?.splashDarkSource),
     title: pick('title', app?.splashTitleSource),
@@ -203,6 +239,17 @@ export function resolveIconInputs(args, projectRoot, cfg) {
     splashCleared: args['splash-cleared'] !== undefined
       ? args['splash-cleared'] === 'true'
       : args.splash === undefined && cfg !== null && !cfgSet(app?.splashSource),
+    // ⚠️ #1028. NOT a generation input — it changes nothing about the art — but it belongs here so
+    // it gets the same malformed-boolean warning as the two above, and so every caller-supplied
+    // value is resolved in ONE place. Deliberately absent from `stampExtrasFrom`: a flag that does
+    // not change the OUTPUT must not change the stamp, or flipping it would rewrite ~60 committed
+    // PNGs in every project for no reason (see that function's own note on the same trap).
+    //
+    // Default FALSE, i.e. a bare hand run stays forgiving. That is a deliberate property of this
+    // script, not an oversight: `npm run build -- --target native` and the editor's build plan both
+    // pass `--strict true`, because those two PRINT a promise about shipping stale art and this is
+    // what makes the promise true. A human poking at the generator gets the old behaviour.
+    strict: args.strict === 'true',
   };
 }
 
@@ -338,13 +385,15 @@ async function main() {
       + '                        [--title <file>]\n'
       + '                        [--title-width <pct>] [--title-offset <pct>] [--badge true|false]\n'
       + '                        [--badge-light <file>] [--badge-dark <file>] [--orientation portrait|landscape|any]\n'
-      + '                        [--icon-dark <file>] [--icon-tinted <file>] [--icon-monochrome <file>]');
+      + '                        [--icon-dark <file>] [--icon-tinted <file>] [--icon-monochrome <file>]\n'
+      + '                        [--strict true|false]  every degraded outcome exits non-zero instead of 0.\n'
+      + '                                               Set by the two BUILD callers; a hand run stays forgiving.');
     process.exit(2);
   }
   const projectRoot = path.resolve(args.project);
   // #1011: every input now comes from the config unless a flag overrides it, so the CLI and the
   // editor's build plan cannot disagree about what the project authored.
-  const { cfg } = await loadIconProjectConfig(projectRoot);
+  const { cfg, malformed } = await loadIconProjectConfig(projectRoot);
   const inputs = resolveIconInputs(args, projectRoot, cfg);
   const iconSrc = inputs.icon;
 
@@ -355,8 +404,33 @@ async function main() {
   // No icon anywhere — the project genuinely authors none. Non-fatal by design: an icon-less build
   // still ships, with the committed icons intact.
   if (!iconSrc) {
+    // ⚠️ TWO different situations reach here and the operator must be told which. A config we READ
+    // that names no icon is the ordinary "this project authors none" case. A config we could not
+    // read names nothing because we cannot see it — the project may well have art configured.
+    if (malformed) {
+      console.error('[icon] nothing generated: project.config.json could not be read, so no input is known. '
+        + 'Committed icons untouched. This is NOT "the project authors no icon".');
+      // Under --strict this is a degraded outcome like any other, and build-web.mjs's promise
+      // ("building on would ship the previously committed art") is exactly what would otherwise
+      // happen. Non-strict keeps exit 0 so a hand run over a broken config is not a hard stop.
+      if (inputs.strict) {
+        console.error('[icon] --strict: refusing to build on art whose source could not be determined.');
+        process.exit(1);
+      }
+      return;
+    }
     console.log('[icon] no icon source in project.config.json and none passed — nothing to generate; committed icons untouched.');
     return;
+  }
+  // ⚠️ #1027. SAY which icon this is generating from. The default is silent in `iconStep` because
+  // that caller had no alternative to be confused with; here it does — a config that was not read
+  // (`cfg === null`) also produces no `iconSource`, and it deliberately does NOT default. So an
+  // operator seeing generated art needs to know whether it came from their own file or from the
+  // bundled panda, and "the icons regenerated" looking identical in both cases is how a project
+  // ships the wrong mark without anyone noticing.
+  if (iconSrc === bundledIconPath(REPO_ROOT)) {
+    console.log('[icon] no icon source in project.config.json — using the BUNDLED Modoki icon, '
+      + "the same default the editor's build plan applies. Set app.iconSource in Project Settings to ship your own.");
   }
   // Freshness gate. The editor's build plan does this itself and passes `--stamp`; a CLI run had no
   // gate at all, which is why facet A could not simply be "spawn it from build-web" without also
@@ -408,16 +482,51 @@ async function main() {
       fs.copyFileSync(src, path.join(projectRoot, 'assets', name));
       return true;
     } catch (e) {
-      // Loud, and NOT fatal: the icon-derived splash still ships. Silence here would look
-      // exactly like "the author never set a splash".
+      // Loud, and NOT fatal by default: the icon-derived splash still ships. Silence here would
+      // look exactly like "the author never set a splash".
       console.error(`[icon] could not stage ${name} from ${src}: ${e.message}`);
+      // ⚠️ #1028. Under --strict this IS fatal, and the argument is facet C's word for word: an
+      // authored splash silently replaced by an icon-derived one is exactly the "that command does
+      // nothing much" degrade, and the operator does not go looking. Fatal HERE rather than after
+      // the run, so a build that is going to fail does not first spend a minute in
+      // @capacitor/assets and rewrite every bucket from the wrong source.
+      if (inputs.strict) {
+        console.error(`[icon] --strict: ${name} was requested and could not be read, so this build `
+          + 'would ship a derived stand-in in place of the authored art. Not generating.');
+        process.exit(1);
+      }
       return false;
     }
   };
   // An unset dark splash reuses the light art rather than falling back to the ICON-derived
   // splash, which would make dark mode the only mode still showing the old panda-on-white.
+  // ⚠️ ONE list, and every requested-but-unreadable input joins it. #1028's first cut fixed the
+  // LIGHT splash alone and its comment claimed "the other four degrades already did exactly this" —
+  // an enumeration that was wrong in both directions. Re-reviewed: there are FIVE more sites, all
+  // the same mechanism, and three of them never tripped `--strict` at all:
+  //
+  //    splash-dark.png            staged here, return value was discarded
+  //    iconDarkSource             iconVariants.mjs `overrideOrNull` — derives, notes, returns fine
+  //    iconTintedSource           ditto
+  //    iconMonochromeSource       ditto
+  //
+  // The shared mechanism, stated once so it does not have to be re-derived per site: **a REQUESTED
+  // input that cannot be read degrades to a DERIVED substitute, and a derived substitute must never
+  // be stamped current.** Deriving is the right degrade; stamping it is what makes it permanent,
+  // because `iconIsUpToDate` then short-circuits every later build — including the `--strict` ones,
+  // which is how one forgiving hand run disarms the flag for good.
+  const requestedButMissing = [];
   const splashStaged = stageSplash(inputs.splash, 'splash.png');
-  if (splashStaged) stageSplash(inputs.splashDark || inputs.splash, 'splash-dark.png');
+  if (!splashStaged && inputs.splash) requestedButMissing.push(`splashSource: ${inputs.splash}`);
+  if (splashStaged) {
+    // ⚠️ Capture it. The dark splash falls back to the LIGHT art rather than to the icon-derived
+    // one, so a broken `splashDarkSource` is invisible on a light-mode device and ships the wrong
+    // mark only in dark mode — the case least likely to be the one you happen to test.
+    const darkSrc = inputs.splashDark || inputs.splash;
+    if (!stageSplash(darkSrc, 'splash-dark.png') && darkSrc) {
+      requestedButMissing.push(`splashDarkSource: ${darkSrc}`);
+    }
+  }
   // ⚠️ `splashCleared`, NOT `!splashStaged` — the #1011 facet-B fix. These differ exactly where the
   // damage was: an operator who did not type `--splash` used to land here and have their staged art
   // deleted, then every splash bucket rebuilt from the ICON. Now only a config that positively has no
@@ -459,6 +568,17 @@ async function main() {
 
   if (res.status !== 0) {
     console.log('[icon] generation skipped (source missing or @capacitor/assets error)');
+    // ⚠️ #1028, and this is the row that mattered most. `npx --yes @capacitor/assets@3.0.5` is a
+    // NETWORK fetch, so this is by far the likeliest way generation fails in practice — and it was
+    // the one `build-web.mjs`'s "not building; building on would ship the previously committed art"
+    // did NOT cover, because facet C only made an unreadable icon SOURCE fatal. The rare failure (a
+    // mistyped path) aborted the build; the common one did not.
+    if (inputs.strict) {
+      console.error(`[icon] --strict: ${ICON_TOOL} exited ${res.status}, so nothing was regenerated. `
+        + 'Building on would ship the previously committed art. No freshness stamp written — fix the '
+        + 'cause (usually network or registry) and re-run.');
+      process.exit(1);
+    }
     return; // non-fatal, and NO stamp — the next build retries.
   }
   if (failed.length) {
@@ -467,6 +587,14 @@ async function main() {
     console.error(`[icon] ⚠️  ${failed.length} file(s) the generator wrote outside ${PRODUCT_DIR[platform]} could NOT be put back:`);
     for (const f of failed) console.error(`[icon]   ${f}`);
     console.error('[icon] Check `git status` and revert them by hand. No freshness stamp written — the next build retries.');
+    // ⚠️ #1028. Under --strict this is fatal because the tree is now KNOWN-DIRTY with collateral
+    // the wrapper could not undo — #236's pbxproj/manifest mangling, sitting in the working tree of
+    // whatever this build touched. Continuing would package that state and, under `demos/`, invite
+    // it into a published snapshot.
+    if (inputs.strict) {
+      console.error(`[icon] --strict: ${failed.length} file(s) outside the product directory are still modified. Not building.`);
+      process.exit(1);
+    }
     return;
   }
   // Everything below runs AFTER the restore, on purpose (#397): the files it edits — the iOS
@@ -479,6 +607,9 @@ async function main() {
   // file-by-file, so a throw half way leaves a PARTIAL splash set, and this module's own header
   // says a partial set is worse than none because it looks fine on the device you happen to test.
   // Stamping that is how it becomes permanent behind one scrolled-past console line.
+  // Named `postFailed` still, because that is what every later branch means by it: "something went
+  // wrong, do not declare this current". `requestedButMissing` is folded in after the variant steps
+  // run, since those are what discover three of the five entries.
   let postFailed = false;
 
   try {
@@ -497,6 +628,9 @@ async function main() {
 
     if (variants.written.length) console.log(`[icon] icon variants: ${variants.written.length} file(s)`);
     for (const n of variants.notes) console.log(`[icon] ${n}`);
+    // The three override slots. `overrideOrNull` derives from the base icon and carries on, which
+    // is the right DEGRADE — but the result must not be stamped current. See requestedButMissing.
+    requestedButMissing.push(...(variants.missing ?? []));
   } catch (e) {
     // Non-fatal for the BUILD — the base icons are already generated and committed, and a missing
     // variant degrades to the OS's own fallback — but NOT stamped, so the next build retries.
@@ -548,8 +682,32 @@ async function main() {
     postFailed = true;
   }
 
+  // ⚠️ THE ONE PLACE the requested-but-missing rule is applied, deliberately after every step that
+  // can discover an entry. Five sites feed this list; one branch acts on it. Patching each site
+  // instead is how the first cut of #1028 fixed the light splash and left four siblings behind.
+  if (requestedButMissing.length) {
+    console.error(`[icon] ⚠️  ${requestedButMissing.length} authored input(s) were REQUESTED and could not be read, `
+      + 'so a derived stand-in was used instead:');
+    for (const m of requestedButMissing) console.error(`[icon]   ${m}`);
+    if (inputs.strict) {
+      console.error('[icon] --strict: not building on derived stand-ins for art somebody authored. '
+        + 'Fix the path(s) above, or clear the field(s) in Project Settings if the art is genuinely gone.');
+      process.exit(1);
+    }
+    postFailed = true;   // no stamp: the next run re-attempts, so a repaired path self-heals
+  }
+
   if (postFailed) {
     console.error('[icon] no freshness stamp written — the next build will re-run this step.');
+    // ⚠️ #1028. Fatal under --strict, and this module's own header says why in stronger terms than
+    // the other three: these steps write file-by-file, so a throw half way leaves a PARTIAL splash
+    // or variant set, and a partial set "looks fine on the device you happen to test". Shipping
+    // that behind one scrolled-past console line is the exact failure the no-stamp rule already
+    // guards against for the NEXT build; --strict extends it to THIS one.
+    if (inputs.strict) {
+      console.error('[icon] --strict: post-processing failed, so the generated set may be partial. Not building.');
+      process.exit(1);
+    }
     return;
   }
   if (stamp) {

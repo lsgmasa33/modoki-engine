@@ -399,6 +399,14 @@ A leg that cannot run on this machine reports **SKIP** with the reason, as loudl
 `--require-all` makes a skip fatal. That is the point: the defect these tests were part of is a test
 that never runs looking exactly like a test that passes.
 
+⚠️ **`N/A` is a third status and is NOT a skip** (#991). A SKIP means *this runner could not check
+it*, which a toolchain install would fix — so `--require-all` is right to fail on it. An N/A means
+*there is nothing here to check on any machine*, a fact about the package rather than the runner, so
+it stays off the exit code even under `--require-all`. One row today (`ios/class/capacitor-litert-lm`,
+whose package is not an SPM package); the reason prints in the summary, and the row's premise is
+asserted under `npm run verify` so it cannot quietly go stale. Detail:
+[native-and-sdks.md](./native-and-sdks.md) § `no-spm`.
+
 ⚠️ **It is not part of `npm run verify` and must not be** — but nor is it optional after touching
 `engine/packages/capacitor-*/**`. And read the legs separately: the OTA ones replay the SHIPPING
 `OtaCore`, while the lease ones replay a port that lives inside the test file — a green lease leg

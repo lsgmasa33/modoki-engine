@@ -18,6 +18,9 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+// The ONE subtree pre-flight (#883/#990/#989/#1004) — see engine/scripts/deleteBoundary.mjs.
+// It REPORTS; the refusal policy below is this caller's own, per that module's docblock.
+import { findDeleteBoundaries, describeBoundary } from '../scripts/deleteBoundary.mjs';
 import type { ProjectConfig } from '../project-config';
 import { vendorEnginePlugins, writeVendorMarker } from './vendorPlugins';
 import { healNativeConfig } from './healNativeConfig';
@@ -361,6 +364,38 @@ export async function scaffoldNativeTarget(opts: {
       throw new Error(
         `${why} contains ${path.relative(projectRoot, survivor)} — move that file somewhere ` +
         `safe, delete ${platform}/ by hand, then run this again.`,
+      );
+    }
+    // #1006/#883: the removal below is `rmSync(recursive)`, which acts on the NAME, not the data.
+    // If `<platform>/` — or anything inside it — is a link out of the tree, that link is severed,
+    // the payload is orphaned somewhere else, and `cap add` then regenerates a pristine native
+    // project on top while every step reports success. The user's customised one is simply gone,
+    // with nothing in the log to say so.
+    //
+    // ⚠️ **REFUSE rather than warn-and-delete** (owner, on this issue). The same trade the owner
+    // made for `forceRemoveDir` on #1004, and the case here is stronger, not weaker: a refused
+    // `cap add` costs one sentence and is recoverable, while a hand-customised `ios/`/`android/`
+    // project has no other copy. Deliberately NOT exempted for `--force`: `--force` means
+    // "regenerate this target", not "sever whatever link happens to be standing here" — the same
+    // distinction the Firebase guard above already draws for the same flag.
+    //
+    // Checked HERE, beside that guard and before steps 1-3, for its reason too: a doomed run
+    // fails in seconds instead of holding the shared build slot through a multi-minute install.
+    //
+    // ⚠️ **That placement leaves a TOCTOU window minutes wide, and it is accepted, not overlooked.**
+    // The `rmSync` this protects runs after `npm install` and a full web build, so a link created
+    // (or a volume mounted) inside `<platform>/` during those is severed unreported. Inherited from
+    // the Firebase guard's own placement, and traded knowingly: moving the check down to the delete
+    // would close the window but spend the shared build slot on a run that was doomed at entry.
+    // The realistic subject is a link a human made deliberately, minutes or months earlier — not
+    // one that appears mid-build.
+    const boundaries = findDeleteBoundaries(platformDir);
+    if (boundaries.length > 0) {
+      throw new Error(
+        `Refusing to remove ${platform}/ — it is not self-contained, so a recursive delete would ` +
+        `not do what it reports:\n${boundaries.map((b) => '  ' + describeBoundary(b)).join('\n')}\n` +
+        `Remove the link itself (that deletes no payload), move the real folder into the project, ` +
+        `or unmount the volume — then run this again.`,
       );
     }
   }

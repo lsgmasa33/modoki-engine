@@ -186,7 +186,9 @@ dmg:
 #        with the macOS bundle. main.ts resolveBundled appends `.exe` on win32.
 #    Both paths are graceful: a download/stage failure leaves build/bin empty and the app
 #    falls back to source textures / a manual-install hint, so the build never fails.
-# Icon: build/icon.ico (6 sizes, generated from build/icon.png) — auto-discovered
+# Icon: build/icon.ico (6 sizes, generated from engine/assets/app-icon-default.png, which was
+#       build/icon.png until #1027's close-out moved it where the packaged editor ships it)
+#       — auto-discovered
 #    from buildResources, named explicitly here for clarity.
 # Signing: env-gated (Azure Trusted Signing), like macOS notarization — an unsigned
 #    local build needs no credentials; SmartScreen will warn until signing is wired.

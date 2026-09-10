@@ -44,16 +44,30 @@ export interface AppsFlyerPlugin {
    * a second time — via a webview reload AND by invoking the plugin method outright — produced no
    * Launch and no server-side row at all. The OUTCOME therefore matches Android, and the guard is
    * inert for Launch counts on both.
-   * ⚠️ WHERE that no-op happens is NOT established. This plugin's `start()` registers a
-   * session-ready listener whose BODY calls `AppsFlyerLib.start()`, so "nothing happened" is
-   * equally consistent with the SDK ignoring the second call and with the second listener never
-   * firing. Full run, both arms, and the ATT prompt that gates a fresh install:
+   * ⚠️ **WHERE the no-op happens is now MEASURED, and it is not one place (#721, 2026-09-10).**
+   * With the guard IN PLACE — which is how this ships — the second call never reaches the SDK at
+   * all: it returns inside `hasStarted`/`sStarted`, before `registerSessionReadyListener`. That is
+   * now observable rather than inferred; the port logs `start() SHORT-CIRCUITED by hasStarted`.
+   * For the guard-DISABLED arm #654 ran, the answer is now measured rather than inferred: **the
+   * listener fires once per FOREGROUND TRANSITION, not once per `start()`.** On an A23 the closure
+   * body ran a second time on a plain resume — no second `start()`, no reload (Court's resume-reload
+   * declined for an unrelated reason, which is what isolates it), 2m14s after the first. `start()`
+   * is simply not what drives the SDK, so calling it twice was never going to produce a second
+   * anything. The first registration's body also runs within the same millisecond as the bridge call
+   * on both ports (A23 / Android 13, iPad mini 5 / iOS 26.6.1).
+   * ⚠️ Consequence for a future `stop({stopped: false})` opt-back-in: **call `AppsFlyerLib.start()`
+   * DIRECTLY on that path and clear the guard flag — do not re-wrap it in a second
+   * `registerSessionReadyListener`.** Re-enabling is no longer "unproven". A listener registered
+   * mid-session is not broken, it is merely waiting for a foreground that may never come while the
+   * user is sitting in the app; the direct call is the only path a caller controls. Nothing calls `stop`
+   * from JS, so this is still a trap for the next author rather than a live bug.
+   * ⚠️ **Reading these markers back needs the right instrument on iOS, and the obvious one is
+   * wrong.** `NSLog` from this plugin does NOT reach the device syslog that `idevicesyslog` (and
+   * so `device_native_logs`) reads — measured 2026-09-10, where a run that showed the SDK's own
+   * lines showed none of these four. `xcrun devicectl device process launch --console` carries
+   * them, along with Capacitor's `⚡️ To Native -> AppsFlyerCap start` bridge line, which is the
+   * one that proves the JS got here. Full run and both arms:
    * `games/court/attribution.md` § "#607/#654 — the iOS leg measured, and both platforms agree".
-   * ⚠️ Consequence for a future `stop({stopped:false})` opt-back-in: the follow-up `start()` may
-   * ALSO no-op, so treat re-enabling the SDK mid-process as UNPROVEN through this API rather than
-   * impossible — if the listener is the cause, calling `AppsFlyerLib.start()` directly on that
-   * path would work. Nothing calls `stop` from JS, so this is a trap for the next author, not a
-   * live bug.
    */
   start(): Promise<{ ok: boolean }>;
 

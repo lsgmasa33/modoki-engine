@@ -96,6 +96,7 @@ const GUIDS: Record<string, { guid: string; type: 'material' | 'mesh' | 'model' 
   '/entry-percent.prefab.json': { guid: '10000000-0000-4000-8000-000000000033', type: 'prefab' },
   '/entry-nounit.prefab.json': { guid: '10000000-0000-4000-8000-000000000034', type: 'prefab' },
   '/entry-px.prefab.json': { guid: '10000000-0000-4000-8000-000000000035', type: 'prefab' },
+  '/entry-notraits.prefab.json': { guid: '10000000-0000-4000-8000-000000000036', type: 'prefab' },
   '/env/sky.hdr':      { guid: '10000000-0000-4000-8000-000000000040', type: 'environment' },
 };
 const G = (path: string) => GUIDS[path].guid;
@@ -125,6 +126,10 @@ const fetchResponses: Record<string, any> = {
     entities: [{ localId: 1, name: 'Root', traits: { UIElement: { width: 50, height: 80 } } }] },
   '/entry-px.prefab.json': { version: 1, name: 'entry-px', rootLocalId: 1,
     entities: [{ localId: 1, name: 'Root', traits: { UIElement: { width: 120, widthUnit: 'px', height: 240, heightUnit: 'px' } } }] },
+  // A cached prefab whose root row carries NO traits at all — the case that separates "not cached"
+  // from "cached with nothing on it" (#1026 review F5).
+  '/entry-notraits.prefab.json': { version: 1, name: 'entry-notraits', rootLocalId: 1,
+    entities: [{ localId: 1, name: 'Root' }] },
   '/unknown.mat.json': { type: 'totally-bogus-material-type', color: 0x123456 },
   // '/bad.mat.json' intentionally absent → fetch returns ok:false (404 path).
 };
@@ -432,6 +437,55 @@ describe('refcount cache — prefab', () => {
       await acquirePrefab(1, G('/entry-px.prefab.json'));
       expect(entryPrefabProvider.rootSize(G('/entry-px.prefab.json')))
         .toEqual({ width: 120, widthUnit: 'px', height: 240, heightUnit: 'px' });
+    });
+
+    /** #1026 — `rootAuthoredUI` against the REAL cache, for the same reason its sibling above
+     *  exists: this is the operand every pooled-row authoring warning now compares against, and a
+     *  fake provider cannot tell whether it reads the prefab root or something else entirely. The
+     *  two must resolve the SAME root (they share `rootTraits`), so a divergence here means the
+     *  size and the authoring answers have started describing different entities. */
+    it('returns the prefab root UIElement VERBATIM — units kept, nothing normalised (#1026)', async () => {
+      const { acquirePrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      await acquirePrefab(1, G('/entry-percent.prefab.json'));
+      // ⚠️ Verbatim, NOT `rootSize`-shaped: the caller resolves an absent field against the
+      // TRAIT's schema default, so normalising here would hide which fields were authored at all.
+      expect(entryPrefabProvider.rootAuthoredUI(G('/entry-percent.prefab.json')))
+        .toEqual({ width: 50, widthUnit: '%', height: 80, heightUnit: '%' });
+    });
+
+    it('leaves an ABSENT unit key absent rather than defaulting it — that is the caller\'s job (#1026)', async () => {
+      const { acquirePrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      await acquirePrefab(1, G('/entry-nounit.prefab.json'));
+      const ui = entryPrefabProvider.rootAuthoredUI(G('/entry-nounit.prefab.json'));
+      expect(ui).toEqual({ width: 50, height: 80 });
+      expect(ui).not.toHaveProperty('widthUnit');
+    });
+
+    it('is undefined for a prefab that is not cached — nothing pooled, nothing to warn about (#1026)', async () => {
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      expect(entryPrefabProvider.rootAuthoredUI(G('/entry-px.prefab.json'))).toBeUndefined();
+    });
+
+    /** ⚠️ `rootTraits` returns `null` ONLY for the uncached case, and `{}` for a cached root with
+     *  no traits. Its docblock calls that load-bearing — `rootSize`'s two branches key on it — but
+     *  nothing held it: changing `root.traits ?? {}` to `?? null` left the whole suite green
+     *  (measured, #1026 review F5). These two cases are the difference, and they are the ONLY
+     *  observable one, so without them the invariant is prose. */
+    it('tells "not cached" apart from "cached with no traits" — px vs % on the empty root (#1026)', async () => {
+      const { acquirePrefab } = await getCache();
+      const { entryPrefabProvider } = await import('../../src/runtime/loaders/entryPrefabProvider');
+      // Not cached: no authored unit exists to report, so `px` is the honest label.
+      expect(entryPrefabProvider.rootSize(G('/entry-notraits.prefab.json')))
+        .toEqual({ width: 0, widthUnit: 'px', height: 0, heightUnit: 'px' });
+
+      await acquirePrefab(1, G('/entry-notraits.prefab.json'));
+      // Cached with an empty root: there IS a root, and an absent unit key means `%` (the
+      // UIElement default a save strips) — the same rule `rootUnit` applies everywhere else.
+      expect(entryPrefabProvider.rootSize(G('/entry-notraits.prefab.json')))
+        .toEqual({ width: 0, widthUnit: '%', height: 0, heightUnit: '%' });
+      expect(entryPrefabProvider.rootAuthoredUI(G('/entry-notraits.prefab.json'))).toBeUndefined();
     });
   });
 });

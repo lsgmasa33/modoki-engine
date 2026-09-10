@@ -8,6 +8,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { ensureCapacitorDeps, ensureCapacitorConfig, detectMissingFirebase, isPlausibleProjectDir, isNativeTargetScaffolded, scaffoldNativeTarget } from '../../plugins/addNativeTarget';
 import { mergeProjectConfig } from '../../project-config';
+import { makeDirLink } from '../helpers/linkFixture';
 
 let root: string;
 let editorRoot: string;
@@ -323,6 +324,83 @@ describe('scaffoldNativeTarget repair (#581)', () => {
     })).rejects.toThrow(/GoogleService-Info\.plist/);
 
     expect(fs.existsSync(plist)).toBe(true); // never deleted
+  });
+
+  /** #1006/#883 — `rmSync(recursive)` acts on the NAME, not the data. A linked `<platform>/` is
+   *  severed, `cap add` regenerates a pristine project on top, and every step reports success
+   *  while the user's customised native project is orphaned somewhere else. */
+  describe('refuses a platform folder that is not self-contained (#1006)', () => {
+    it('REFUSES when <platform>/ is a link out of the project, and the payload survives', async () => {
+      writePkg();
+      const cfg = mergeProjectConfig({ app: { appId: 'com.x.y', appName: 'My Game', iconSource: '' } });
+      // The real native project lives elsewhere; `ios/` is only a link to it — the shape a user
+      // creates to keep a big native tree off a small volume, or to share one between checkouts.
+      const real = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ant-real-'));
+      const keeper = path.join(real, 'App', 'App.xcodeproj', 'project.pbxproj');
+      fs.mkdirSync(path.dirname(keeper), { recursive: true });
+      fs.writeFileSync(keeper, '// the user\'s customised project — must survive');
+      makeDirLink(real, path.join(root, 'ios'));
+
+      const runShell = async () => { throw new Error('must refuse before running anything'); };
+      await expect(scaffoldNativeTarget({
+        projectRoot: root, platform: 'ios', buildCwd: editorRoot, cfg, send: () => {}, runShell,
+      })).rejects.toThrow(/not self-contained/);
+
+      // ⚠️ THIS is the assertion that proves nothing was severed — not the throw. A guard that
+      // threw AFTER the rmSync would satisfy `rejects.toThrow` and still have destroyed the link.
+      expect(fs.existsSync(path.join(root, 'ios'))).toBe(true);
+      expect(fs.readFileSync(keeper, 'utf8')).toContain('must survive');
+      fs.rmSync(real, { recursive: true, force: true });
+    });
+
+    it('REFUSES on --force too — "regenerate" is not "sever whatever link is standing here"', async () => {
+      writePkg();
+      const cfg = mergeProjectConfig({ app: { appId: 'com.x.y', appName: 'My Game', iconSource: '' } });
+      // A COMPLETE target this time, so only `force` selects it for removal — the case the
+      // Firebase guard above already refuses for the same flag, and for the same reason.
+      const real = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ant-real-'));
+      const pbx = path.join(real, 'App', 'App.xcodeproj', 'project.pbxproj');
+      fs.mkdirSync(path.dirname(pbx), { recursive: true });
+      fs.writeFileSync(pbx, '// stub');
+      fs.writeFileSync(path.join(real, 'debug.xcconfig'), '// stub');
+      makeDirLink(real, path.join(root, 'ios'));
+      expect(isNativeTargetScaffolded(root, 'ios')).toBe(true);
+
+      const runShell = async () => { throw new Error('must refuse before running anything'); };
+      await expect(scaffoldNativeTarget({
+        projectRoot: root, platform: 'ios', buildCwd: editorRoot, cfg, send: () => {}, runShell, force: true,
+      })).rejects.toThrow(/not self-contained/);
+      expect(fs.existsSync(pbx)).toBe(true);
+      fs.rmSync(real, { recursive: true, force: true });
+    });
+
+    it('ACCEPTS an ordinary incomplete folder and still repairs it — the accept side', async () => {
+      // ⚠️ Without this the refusal above is indistinguishable from a guard that refuses every
+      // scaffold. The whole population of real `<platform>/` folders is self-contained, so a
+      // pre-flight that fired on them would break `cap add` for every project in the repo.
+      writePkg();
+      const cfg = mergeProjectConfig({ app: { appId: 'com.x.y', appName: 'My Game', iconSource: '' } });
+      const pbxproj = path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+      fs.mkdirSync(path.dirname(pbxproj), { recursive: true });
+      fs.writeFileSync(pbxproj, 'stale — from an interrupted extraction');
+      // A nested link pointing INSIDE the folder (the npm .bin shim shape) must not trip it either.
+      fs.mkdirSync(path.join(root, 'ios', 'inner'), { recursive: true });
+      makeDirLink(path.join(root, 'ios', 'inner'), path.join(root, 'ios', 'shim'));
+
+      const runShell = async (_l: string, cmd: string) => {
+        if (cmd.startsWith('npx cap add')) {
+          expect(fs.existsSync(pbxproj)).toBe(false);        // the repair really did run
+          fs.mkdirSync(path.dirname(pbxproj), { recursive: true });
+          fs.writeFileSync(pbxproj, '// stub');
+          fs.writeFileSync(path.join(root, 'ios', 'debug.xcconfig'), '// stub');
+        }
+        return true;
+      };
+      await expect(scaffoldNativeTarget({
+        projectRoot: root, platform: 'ios', buildCwd: editorRoot, cfg, send: () => {}, runShell,
+      })).resolves.toBeTruthy();
+      expect(isNativeTargetScaffolded(root, 'ios')).toBe(true);
+    });
   });
 
   it('does NOT touch a directory that already contains a complete target', async () => {

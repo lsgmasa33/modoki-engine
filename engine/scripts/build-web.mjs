@@ -260,9 +260,11 @@ async function generateNativeIcons() {
   // sharp splash passes, two collateral snapshots of both native trees, and two windows in which the
   // restore can fail. It is not merely waste: this function does BOTH platforms whenever both dirs
   // exist, so an iOS-only editor build would also rewrite tracked Android art, which is #162/#236's
-  // complaint by name. `iconStep` is the more capable of the two (it falls back to the bundled icon
-  // for a project that authors none, and it is per-platform), so the editor's copy wins and this one
-  // stands down. Set only by that plan's own build-web step — a plain CLI build never carries it.
+  // complaint by name. `iconStep` is per-platform, so the editor's copy wins and this one stands
+  // down. Set only by that plan's own build-web step — a plain CLI build never carries it.
+  // ⚠️ That reason used to read "`iconStep` is the more capable of the two (it falls back to the
+  // bundled icon for a project that authors none…)". #1027 removed the difference — both callers
+  // now read the default from `scripts/iconAssets.mjs` — so per-platform is the whole of it now.
   if (process.env.MODOKI_ICONS_HANDLED === '1') {
     console.log('[build-web] icon generation left to the caller (MODOKI_ICONS_HANDLED=1).');
     return;
@@ -273,7 +275,14 @@ async function generateNativeIcons() {
 
   const script = path.join(repoRoot, 'engine', 'scripts', 'generate-icons.mjs');
   for (const platform of platforms) {
-    const res = spawnSync(process.execPath, [script, '--project', projectRoot, '--platform', platform], {
+    // ⚠️ `--strict true` (#1028). Without it this function's own promise below — "not building;
+    // building on would ship the previously committed art" — covered exactly ONE of the five ways
+    // generation can fail, because #1011 facet C made only an unreadable icon SOURCE exit non-zero.
+    // The other four exited 0: a non-zero `npx @capacitor/assets` (a NETWORK fetch, and much the
+    // likeliest of the five), an unreadable splash source, collateral the wrapper could not
+    // restore, and a post-processing throw. So the rare failure aborted the build and the common
+    // one did not, which is precisely backwards.
+    const res = spawnSync(process.execPath, [script, '--project', projectRoot, '--platform', platform, '--strict', 'true'], {
       cwd: repoRoot,
       stdio: 'inherit',
     });

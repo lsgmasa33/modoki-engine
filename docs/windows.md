@@ -525,7 +525,39 @@ load-bearing and commented as such).
   **depth** (a link nested below the final component), in **kind** (a mount point, which `lstat`
   does not call a link), and in **site** (`engine/toolchain/index.ts`'s `forceRemoveDir` deletes the
   same directories and had no pre-flight at all). One walk — `engine/scripts/deleteBoundary.mjs` —
-  now answers it for both delete sites.
+  now answers it at **all six** delete sites: `clean-packaged-cache.mjs`, `forceRemoveDir`,
+  `addNativeTarget`'s `<platform>/` removal, `asset-fs-ops`'s Linux trash fallback (#1006), and —
+  found by re-sweeping in that issue's close-out — the two provisioners that REPLACE a persistent
+  destination, `androidSdkProvision` (`<sdkRoot>/cmdline-tools/latest`) and `wdaProvision`
+  (`srcDir`). Both do `rmSync(dest)` then `renameSync(fresh, dest)`, and both sit one line from a
+  `staging` removal, which is how the first sweep's "a temp dir the code itself just created"
+  exemption swallowed them. They share ONE policy module, `engine/toolchain/replaceGuard.ts` —
+  a sibling of `forceRemoveDir`'s guard rather than a merge with it, because the VERB differs
+  (remove vs restore) and so does the remedy sentence.
+
+  ⚠️ **The DETECTION is shared; the POLICY is the caller's, and the two callers added in #1006
+  answer differently on purpose.** `deleteBoundary.mjs` says so in its own docblock — *"Not a
+  policy. This reports; it never deletes, never follows, never repairs."* A single helper that also
+  decided what to do would have forced one of these two sites into the wrong answer:
+
+  | site | policy | why |
+  |---|---|---|
+  | `clean-packaged-cache.mjs`, `forceRemoveDir`, `addNativeTarget`, both provisioners | **REFUSE** | the payload is user-owned and has no other copy. A refused `cap add` costs one sentence; a severed hand-customised `ios/` — or a junctioned SDK — is gone with nothing in the log to say so. |
+  | `asset-fs-ops.moveToTrash` (Linux fallback) | **REPORT** into `failed` | this caller already HAS a per-path failure channel that the Assets panel surfaces. The defect there was never a missing throw — it was `return { failed: [] }` claiming success for paths it had just destroyed (#884's shape, different cause). Throwing would also cost the paths that CAN safely go. |
+
+  **The test for a fifth site: does a per-path failure channel already exist and reach a human?**
+  If yes, report into it; if not, refuse. Do not copy whichever neighbouring policy you read first.
+
+  ⚠️ **`addNativeTarget` refuses under `--force` too**, for the same reason the refusal applies
+  under `--dry-run` above: `--force` means *"regenerate this target"*, not *"sever whatever link is
+  standing here"*. Its neighbouring Firebase-survivor guard already drew that distinction for the
+  same flag, which is why the pre-flight sits beside it — at ENTRY, before `npm install` and the
+  web build, so a doomed run fails in seconds instead of holding the shared build slot first.
+
+  ⚠️ **`asset-fs-ops`'s darwin/win32 paths are deliberately NOT pre-flighted**, and "completing the
+  sweep" by adding them is a regression: those hand the delete to the OS trash, which MOVES rather
+  than unlinks, so it cannot orphan a link's payload. Only the Linux fallback is a real `rmSync`.
+  (`engine/electron/main.ts`'s boot-time dep-cache wipe stays excluded too — see #1006.)
 
   ⚠️ **"Refuse on ANY nested link" is not viable, and the Windows evidence is the trap.** A
   provisioned toolchain here measured **0 symlinks across 23,303 entries**, so the blunt rule looks

@@ -17,7 +17,7 @@
  * plugin's first commit — is recorded in that same file's comments. Both are compile/annotation
  * level defects in files no gate compiled.
  *
- * ── ⚠️ TWO INTEGRATION SHAPES, AND THE LEG MUST MATCH THE PACKAGE'S OWN ──────────────────
+ * ── ⚠️ THREE INTEGRATION SHAPES, AND THE LEG MUST MATCH THE PACKAGE'S OWN ────────────────
  * The obvious design — one `xcodebuild -scheme` per package — is WRONG, and measurably so
  * (2026-09-09): it reports a false FAILURE on `capacitor-modoki-ota`, whose plugin is correct.
  *
@@ -33,6 +33,16 @@
  *          declared product therefore fails with `cannot find type 'OtaState' in scope` on code
  *          that ships and works. This leg instead SYNTHESISES a package whose single target holds
  *          `flatSources` together, which is what the app really compiles.
+ *
+ *   'no-spm'
+ *          The package is NOT an SPM package and this repo has decided it must not become one —
+ *          so there is no iOS class leg to run, and pretending there is produces a permanently
+ *          red line that reads as noise. The leg reports **N/A** with its `reason`, which is off
+ *          the exit code even under `--require-all` (a machine cannot install its way out of a
+ *          structural decision, which is exactly what separates N/A from SKIP).
+ *          ⚠️ An N/A row is only honest while its premise holds, so the premise is ASSERTED by
+ *          `capacitorPlatformDeclarations.test.ts` — under `npm run verify`, not under this gate.
+ *          One row today: `capacitor-litert-lm`, whose comment carries the whole argument.
  *
  * ⚠️ `iap` and `ota` made OPPOSITE choices for the identical problem and nothing records why. The
  * gate models both rather than changing a device-verified shipping path to make a test tidier
@@ -130,30 +140,51 @@ export function schemeFor(packageDir) {
  * `nativePluginLegCoverage.test.ts` in BOTH directions, so a new plugin package fails the gate
  * until somebody decides its shape, and a deleted one fails until its row goes.
  *
- * `dir` is the repo-relative key. `shape` is 'spm' or 'flat' (see the header). `flatSources` is
- * required for, and only for, 'flat': every `.swift` the consuming app compiles into its own
- * target for this plugin. `knownFail: '#N'` marks a leg that cannot pass yet — see the litert-lm
- * row for why that is not the same thing as excusing it.
+ * `dir` is the repo-relative key. `shape` is 'spm', 'flat' or 'no-spm' (see the header).
+ * `flatSources` is required for, and only for, 'flat': every `.swift` the consuming app compiles
+ * into its own target for this plugin. `reason` is required for, and only for, 'no-spm'.
+ *
+ * ⚠️ `knownFail: '#N'` — a leg that runs and is expected to fail — is still supported by the runner
+ * but has NO row today, and reaching for it should be rare. The one row that had it (litert-lm) was
+ * not a broken SPM leg at all; it was a package that is not an SPM package, and saying so with
+ * 'no-spm' is both more honest and better checked. Before adding a `knownFail`, ask whether the leg
+ * is genuinely a temporarily-broken build of something this repo intends to build.
  */
 export const PLUGIN_CLASS_LEGS = [
   { dir: 'engine/packages/capacitor-appsflyer', shape: 'spm' },
   { dir: 'engine/packages/capacitor-game-debug', shape: 'spm' },
   {
     dir: 'engine/packages/capacitor-litert-lm',
-    shape: 'spm',
-    // ⚠️ This package CANNOT compile on any machine: `Package.swift` declares only
-    // `capacitor-swift-pm` while `LitertLmPlugin.swift:3` does `import MediaPipeTasksGenAI`, which
-    // only the podspec declares. Filed as #991; the manifest's own header predicted it in prose.
+    shape: 'no-spm',
+    // ⚠️ #991. This was a 'spm' row carrying `knownFail: '#991'`, and that was the wrong shape for
+    // the wrong reason — it modelled the package as "an SPM leg that is temporarily broken" when it
+    // is not an SPM package at all:
     //
-    // `knownFail` keeps it OFF the exit code so `npm run test:native` still has a GREEN BASELINE —
-    // without one the command exits 1 on a clean tree, and the next person to run it has to diff
-    // the summary by eye against a remembered baseline, which is exactly how a real regression gets
-    // waved through. It stays LOUD in the summary and `--require-all` still fails on it.
+    //   · `package.json` declares `capacitor: { android: … }` and nothing else, so `cap sync ios`
+    //     never registers this plugin in ANY consuming app.
+    //   · It is compiled into no App target — `capacitorPlatformDeclarations.test.ts` says so in
+    //     its own docblock, which is why that file needed a SECOND rule to reach this package.
+    //   · That second rule exists specifically to FORBID this package declaring `ios` until
+    //     `Package.swift` gains the podspec's `MediaPipeTasksGenAI` + `MediaPipeTasksGenAIC`.
     //
-    // ⚠️ It is NOT a licence, because it EXPIRES BY ITSELF: a knownFail leg that PASSES is reported
-    // as a failure telling you to delete this marker. So fixing #991 forces the marker out rather
-    // than leaving a stale exemption behind — the thing a plain "expected to fail" does wrong.
-    knownFail: '#991',
+    // So an iOS SPM leg here compiled a configuration the repo deliberately outlaws, for a platform
+    // the package does not claim. Google publishes no SPM distribution of MediaPipeTasksGenAI (the
+    // pods are prebuilt binaries built internally; google-ai-edge/mediapipe#5464 is open and
+    // unanswered), so the one-line fix has nothing to point at and never will on its own.
+    //
+    // ⚠️ THE SELF-EXPIRY IS NOT LOST, it MOVED AND GOT BETTER. `knownFail` expired by flipping to
+    // FAIL if the leg ever passed — but only on a machine with macOS + Xcode running `test:native`,
+    // which is rare. The premise of THIS row is asserted by `capacitorPlatformDeclarations.test.ts`
+    // instead: the moment `Package.swift` declares the podspec's dependencies, or `package.json`
+    // declares `ios`, that guard goes red and names this row. `npm run verify` runs everywhere, on
+    // every push, with no Xcode — so the stale-row check now fires on the machine that made it
+    // stale, in the gate that actually runs.
+    //
+    // ⚠️ `reason` is REQUIRED on this shape and is printed in the gate summary. A silent N/A is the
+    // exemption-nobody-revisits this row exists to avoid.
+    reason: 'declares capacitor.android only and is compiled into no App target; Package.swift '
+      + 'cannot declare the podspec\'s MediaPipe dependencies because Google ships no SPM '
+      + 'distribution of them (#991)',
   },
   { dir: 'engine/packages/capacitor-modoki-iap', shape: 'spm' },
   {

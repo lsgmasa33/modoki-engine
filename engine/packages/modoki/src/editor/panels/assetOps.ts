@@ -280,9 +280,13 @@ export type DeleteFilesResult = {
    *  with a non-empty `failed` means NONE of it went. Both are worth reporting to the human, so
    *  read `failed` before branching on `ok`, not after.
    *
-   *  ⚠️ **win32 only today.** darwin's `osascript` and Linux's `trash-put` are single invocations
-   *  that throw as a whole, so their refusal arrives as `ok:false` with `failed` EMPTY. An empty
-   *  `failed` is therefore not evidence that every path went — check `ok` for that. */
+   *  ⚠️ **NOT win32-only since #1006** — this said it was, and a caller reading that would branch
+   *  wrongly on Linux. darwin's `osascript` and Linux's `trash-put` are single invocations that
+   *  throw as a whole, so a refusal from EITHER still arrives as `ok:false` with `failed` EMPTY;
+   *  an empty `failed` is therefore not evidence that every path went — check `ok` for that. What
+   *  changed is Linux's `rmSync` FALLBACK (used when `trash-put` is absent — CI, headless): it
+   *  reports per path, and names any whose subtree is not self-contained (#883). Those files are
+   *  still on disk, so the rule above applies to them in full. */
   failed: string[];
 };
 

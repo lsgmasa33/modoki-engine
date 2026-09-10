@@ -92,7 +92,8 @@ export function splashPipelineVersion(engineRootAbs: string | undefined): string
   // packaged editor builds its Vite config into, so `fileURLToPath` threw AT LOAD and took the
   // whole config with it (caught by packagedViteConfig.test.ts, #326). `__dirname` is no better:
   // in a bundle it points at the bundle. The anchor therefore comes from the caller, exactly like
-  // every other path this build resolves (`build/icon.png`, `engine/assets/splash-badge-*`).
+  // every other path this build resolves (`engine/assets/app-icon-default.png`, `engine/assets/
+  // splash-badge-*`).
   if (!engineRootAbs) return 'pipeline:unanchored';
   return pipelineVersionFrom(PIPELINE_SOURCES.map((f) => path.join(engineRootAbs, 'engine', 'scripts', f)));
 }

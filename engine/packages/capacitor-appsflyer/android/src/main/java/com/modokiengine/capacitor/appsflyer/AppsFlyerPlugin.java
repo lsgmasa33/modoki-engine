@@ -129,12 +129,20 @@ public class AppsFlyerPlugin extends Plugin {
         // it reaches registerSessionReadyListener — a repeat call here, minutes apart across a
         // reload, would register a second listener sequentially rather than race the first one.
         if (sStarted) {
+            // #721 second marker, mirrored from the iOS port so one grep still covers both. It is
+            // iOS that needed it -- there the FIRED line did not print on a cold boot and the
+            // device log cannot see the WebView console, so "start() was never called" and "the
+            // listener never fired" looked identical. Android answered on the first run (FIRED
+            // printed, measured on an A23 2026-09-10) and does not need these to answer #721; it
+            // carries them so the two ports keep the same observable surface.
+            Log.i(TAG, "start() SHORT-CIRCUITED by hasStarted (#721)");
             JSObject alreadyStarted = new JSObject();
             alreadyStarted.put("ok", true);
             call.resolve(alreadyStarted);
             return;
         }
         sStarted = true;
+        Log.i(TAG, "start() ENTERED — will register sessionReady listener (#721)");
 
         AppsFlyerLib.getInstance().registerSessionReadyListener(new SessionReadyListener() {
             @Override

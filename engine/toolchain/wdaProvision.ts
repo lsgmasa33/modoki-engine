@@ -43,6 +43,9 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { extractArchive } from './nodeProvision'
+// The shared replace pre-flight (#883/#1006) — policy lives in replaceGuard.ts.
+import { refuseUnsafeReplace } from './replaceGuard'
+
 
 /** The pinned WebDriverAgent source. Appium publishes WDA to npm as `appium-webdriveragent`, so the
  *  source is version-pinned and registry-integrity-checked without us maintaining a sha — the same
@@ -312,6 +315,7 @@ async function fetchWdaSource(baseDir: string, npm: NpmInvocation, run: CommandR
     if (!fs.existsSync(path.join(unpacked, 'WebDriverAgent.xcodeproj'))) {
       throw new Error(`${spec} does not contain WebDriverAgent.xcodeproj — the package layout changed.`)
     }
+    refuseUnsafeReplace(srcDir)
     fs.rmSync(srcDir, { recursive: true, force: true })
     fs.renameSync(unpacked, srcDir)
   } finally {

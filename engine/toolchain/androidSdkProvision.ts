@@ -20,6 +20,9 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { extractArchive, type FetchLike } from './nodeProvision'
+// The shared replace pre-flight (#883/#1006) — policy lives in replaceGuard.ts.
+import { refuseUnsafeReplace } from './replaceGuard'
+
 
 /** Pinned `cmdline-tools;latest` — each host's zip is a universal Java bundle (not arch-specific). url
  *  + sha1 come from Google's `repository2-3.xml` (`<remotePackage path="cmdline-tools;latest">`, one
@@ -106,6 +109,7 @@ export async function ensureCmdlineTools(sdkRoot: string, opts: { fetchImpl?: Fe
     const destParent = path.join(sdkRoot, 'cmdline-tools')
     fs.mkdirSync(destParent, { recursive: true })
     const latest = path.join(destParent, 'latest')
+    refuseUnsafeReplace(latest)
     fs.rmSync(latest, { recursive: true, force: true })
     fs.renameSync(extracted, latest)
   } finally {

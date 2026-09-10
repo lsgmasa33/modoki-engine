@@ -614,6 +614,45 @@ export function listAgentOps(): string[] {
   return [...agentOps.keys()];
 }
 
+/** Is `name` registered in THIS client right now?
+ *
+ *  The relay's decline test (#1030) — see the `modoki:request` handler. Deliberately a membership
+ *  question rather than "did `runAgentOp` throw something that reads like `unknown agent op`":
+ *  the string test would miscount an op that legitimately throws those words, and would have RUN
+ *  the op before deciding. Exported (like `listAgentOps`) so the transport asks the registry
+ *  through the same seam a test can. */
+export function hasAgentOp(name: string): boolean {
+  return agentOps.has(name);
+}
+
+/** The `modoki:response` payload this client owes for one relayed request (#1030).
+ *
+ *  Extracted from the `modoki:request` handler because that handler lives inside
+ *  `initAgentBridge`, behind a live Vite `hot` — so the DECISION it makes had no test, which is
+ *  the shape this repo's convention exists to stop ("a panel's decisions belong in a plain `.ts`
+ *  module beside it"). It is also the half that makes #1030 work in production: the server's
+ *  decline counting is inert if no client ever sends `declined`.
+ *
+ *  Three outcomes, and the distinction between the last two is the entire fix:
+ *  - **declined** — this client has no handler for the op. NOT an answer; the server counts it and
+ *    settles only once every client has said the same.
+ *  - **error** — the op ran and threw. An ANSWER, from the one client that owns the op, and it
+ *    must settle immediately rather than wait for anyone else.
+ *  - **result** — the op ran and returned.
+ *
+ *  ⚠️ Membership is asked BEFORE dispatch, deliberately. Deciding by catching `/unknown agent op/`
+ *  out of `run` would both miscount an op that legitimately throws those words and have already
+ *  RUN the op before deciding whether it existed. */
+export async function relayResponseFor(
+  msg: { id: number; op: string; params?: unknown },
+  has: (op: string) => boolean = hasAgentOp,
+  run: (op: string, params: unknown) => Promise<unknown> = (op, params) => runAgentOp(op, params),
+): Promise<{ id: number; result?: unknown; error?: string; declined?: boolean }> {
+  if (!has(msg.op)) return { id: msg.id, declined: true };
+  try { return { id: msg.id, result: await run(msg.op, msg.params) }; }
+  catch (e) { return { id: msg.id, error: String(e instanceof Error ? e.message : e) }; }
+}
+
 // Built-in runtime ops (no editor deps — safe in every build the bridge runs in).
 // Round agent-facing floats at the OP, never in `dumpSceneState` — an in-process caller must
 // keep exact float64. `precision` defaults to 9 significant digits (~17% of the real tokens on a
@@ -2426,6 +2465,65 @@ async function handleSceneChanged(msg: { urlPath: string; kind: SceneChangedKind
   }
 }
 
+/** The minimal HMR surface `registerRelayResponder` needs, so a test can play the dev server. */
+export interface RelayHot {
+  send(event: string, data: unknown): void;
+  // `any` matches Vite's own `ViteHotContext.on`, whose callback payload is inferred per event —
+  // a narrower parameter type here makes the real `import.meta.hot` unassignable.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  on(event: string, cb: (data: any) => void): void;
+}
+
+/** Make this client a relay responder: ANNOUNCE first, then accept `modoki:request`.
+ *
+ *  ⚠️ **The two halves are one function because they are one invariant** (#1030): *nothing may be
+ *  able to answer `modoki:request` before it has announced.* The server sizes its decline
+ *  denominator from clients that have announced, so a client that can decline while uncounted
+ *  completes a count that was one short — and that is #1030 itself, a live editor's asset-path
+ *  repair skipped silently. Split across two statements they can drift; here they cannot.
+ *
+ *  The announce exists because `modoki:schema` was the only signal and it is NOT prompt:
+ *  `makeSchemaPusher` refuses to send an empty registry and polls at 200ms, while
+ *  `initAgentBridge` is reached through a top-level dynamic import from `main.tsx` — so every tab
+ *  could answer for a while before it was counted, and a tab parked on the Vite error overlay
+ *  never announced at all.
+ *
+ *  ⚠️ **Exported and taking `hot` as a parameter so the PRODUCER is testable.** `initAgentBridge`
+ *  reads `import.meta.hot` inline, which no test can fake — and with this logic inline there, the
+ *  announce could be deleted with 3,621 tests green (found by review, one round after the same
+ *  shape was found on the server side). The consumer had a seam test; the producer had nothing.
+ *
+ *  ⚠️ **`vite:ws:connect` cannot currently fire for this listener, and it is kept knowingly.**
+ *  Vite 8 emits it once per page from inside `/@vite/client`'s own `transport.connect`, long
+ *  before `main.tsx`'s dynamic import registers anything, and it has no in-page reconnect (on
+ *  disconnect the client polls and calls `location.reload()`). So a dev-server restart re-announces
+ *  via the fresh page's `announce()`, NOT via this listener. An earlier comment claimed this was
+ *  the reconnect path; it was wrong. Kept because it is free and correct if Vite ever reconnects
+ *  in place — but do not cite it as the mechanism for anything. (The neighbouring
+ *  `vite:ws:connect` schema listener is dead for exactly the same reason.) */
+export function registerRelayResponder(hot: RelayHot): void {
+  const announce = (): void => { hot.send('modoki:bridge-hello', {}); };
+  announce();
+  hot.on('vite:ws:connect', announce);
+
+  // ⚠️ **DECLINE an op we do not have — do not reject it** (#1030). The dev server BROADCASTS
+  // `modoki:request` to every HMR client, so this runs in every open tab, not only the editor's.
+  // A tab on the runtime route has no editor ops and answers in about a millisecond, which used
+  // to BEAT the editor tab and settle the request on its behalf.
+  //
+  // `declined` is a separate channel from `error` because the two mean opposite things to the
+  // server: "I do not have this op" is countable, while "this op threw" is a real answer from the
+  // one client that owns the op and must settle immediately. Collapsing them is the whole defect.
+  //
+  // The decision is `relayResponseFor`, called with NO overrides on purpose: its defaults already
+  // are `hasAgentOp` and `runAgentOp`, so passing them again adds a line that can be mis-wired —
+  // swapping `hasAgentOp` for `() => true` there left 228 tests green while making every client
+  // claim every op. Nothing to pass is nothing to get wrong.
+  hot.on('modoki:request', async (msg: { id: number; op: string; params?: unknown }) => {
+    hot.send('modoki:response', await relayResponseFor(msg));
+  });
+}
+
 export function initAgentBridge(): void {
   const hot = import.meta.hot;
   const bridge = (window as unknown as { __modokiElectron?: { bridge?: ElectronBridge } }).__modokiElectron?.bridge;
@@ -2496,16 +2594,23 @@ export function initAgentBridge(): void {
   const pusher = makeSchemaPusher((schema) => { hot.send('modoki:schema', schema); schemaPushed = true; });
   pusher.start();
   hot.on('vite:afterUpdate', () => { schemaPushed = false; pusher.start(); });
-  // Reconnect (server restart drops the dev server's cache): force a resend even if the
-  // trait set is unchanged — a plain start() would find the same signature already sent
-  // and send nothing, leaving the freshly-restarted server with no schema at all.
+  // Intended as the reconnect path: a server restart drops the dev server's cache, and a plain
+  // start() would find the same signature already sent and send nothing, leaving the freshly-
+  // restarted server with no schema at all. The `force` is what makes the resend happen.
+  //
+  // ⚠️ **This listener CANNOT FIRE in Vite 8, so the reconnect it describes is handled elsewhere.**
+  // Vite emits `vite:ws:connect` once per page from inside `/@vite/client`'s own
+  // `transport.connect`, which runs while `/@vite/client` is evaluating — long before
+  // `main.tsx`'s dynamic `import('./debug/agentBridge')` registers anything here. And there is no
+  // in-page reconnect to catch: on `vite:ws:disconnect` the client polls and calls
+  // `location.reload()`, so a restarted server is served by a FRESH page whose own `pusher.start()`
+  // above does the push. Kept because it costs nothing and would be correct if Vite ever
+  // reconnected in place — but do not cite it as the mechanism for anything. (Found while fixing
+  // #1030's announce, whose sibling listener has the same property and says so.)
   hot.on('vite:ws:connect', () => { if (!schemaPushed) pusher.start({ force: true }); });
 
-  // 2. Answer request ops from the dev server.
-  hot.on('modoki:request', async (msg: { id: number; op: string; params?: unknown }) => {
-    try { hot.send('modoki:response', { id: msg.id, result: await handleOp(msg.op, msg.params) }); }
-    catch (e) { hot.send('modoki:response', { id: msg.id, error: String(e instanceof Error ? e.message : e) }); }
-  });
+  // 2 + 3. Announce, then take the ops. ONE call, deliberately — see `registerRelayResponder`.
+  registerRelayResponder(hot);
 
   // 3. Hot-reload the active scene on a .scene.json / .prefab.json edit — ONLY when
   //    Vite owns the self-write guard (browser dev, same-origin writes). With an

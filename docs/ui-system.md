@@ -1958,6 +1958,52 @@ failure, missing endpoint or malformed body — never `[]` — and the note stay
 only ever ADDS information and never disables a field, so silence on no evidence is the correct
 failure direction. (Same rule `makeTexture2D.textureRefCount` already states for its own count.)
 
+⚠️ **THE PIN IS A LOSSY OVERWRITE, so a guard that asks "did an author write this?" must read the
+PREFAB — never the pooled entity's own `UIElement`** (#1026). `applySlots` writes the resolved box
+back onto the row root (`entity.set(uiMeta.trait, {...ui, ...pinned})`) — values *and units* — so
+by frame 2 the trait no longer records what anyone authored. Every warning above therefore reads
+`EntryPrefabProvider.rootAuthoredUI`, resolving an absent field against the trait's own schema
+default (a prefab save strips any field equal to its default, so absent means "never touched").
+
+Two fields provably answered wrong before that, and they share one property — **their pin is not a
+constant**:
+
+| field | why the live trait lies about it |
+|---|---|
+| `width`/`height` | the pin forces `widthUnit`/`heightUnit` to `px`, and that unit is the exact discriminator `pooledSizeNeedsWarning` reads to grant the documented `%` exemption. So the exemption died on frame 1 for every pooled row. Court's `DailyMonth` authors `100%` and printed `authored UIElement.width=308px` — value and unit both written by the pool. |
+| `isVisible` | pinned to the slot's varying `live` state. A slot pinned parked leaves `false` on its trait; the tick it scrolls into the window, `false !== true && false !== true` warns about authoring that never happened. |
+
+The other eleven pinned fields were never exposed (a constant pin, so `cur === pinned` once
+written) but read the authored operand too — the next field added to `POOLED_ROW_PINNED_GROUPS`
+with a varying pin would otherwise reintroduce this in silence, which is exactly how #761 happened.
+
+⚠️ **This class is invisible to a single-tick test.** On the first tick the spawned trait still
+carries the prefab's values, so the defect cannot appear; the suite that shipped it had a test
+named *"stays SILENT for an authored PERCENT width"* that passed on the broken tree for precisely
+that reason. **A pooled-row authoring test must tick at least twice, with the pin's own value
+changing in between.** Related bound: `warnAuthoredOverride` is warn-once per `viewGuid:slot:field`,
+so a slot that starts live warns immediately and is then permanently quiet — an accept-side test
+has to reach `live` on a slot that has never warned (a small `countY` leaves the tail of the window
+parked on first sight).
+
+The write-back itself is CORRECT and stays: it is what makes the box definite, which is what a
+`%`-sized root needs under an auto-width row, and the DOM renderer reads the trait. Removing it
+would need a parallel pin channel from `entriesSystem` to `UIRenderer` — a real option, and a
+larger change than this was.
+
+⚠️ **Two bounds on the authored operand, both worth knowing before trusting a silence.**
+- **A nested-instance prefab root reports NO authoring** (#1031): `rootAuthoredUI` reads the prefab
+  FILE row's own traits, so a root whose `rootLocalId` names a row carrying `entry.prefab` answers
+  `undefined`, every field collapses to its schema default, and the warnings go silent — including
+  the real `200px` trap. Latent (all six entry prefabs in `games/` are plain roots) and shared with
+  `rootSize`, which reads 0 for the same reason. ⚠️ **Do not "fix" it by falling back to the live
+  trait** — that is the defect above, wearing a rescue.
+- **A source can write the row ROOT.** `splitMemberPath('')` returns `[]`, so an entry source
+  addressing the empty member path writes the root's own `UIElement`. Its value is neither authored
+  nor the pin, and the warnings correctly name the PREFAB's value rather than the source's — which
+  is also the only observable difference between reading the authored record and the live trait for
+  the DISPLAY string, and therefore the only thing that can mutation-check that half.
+
 ### Measured on the low-end target
 
 Galaxy A23 (Mali-G57 MC2), the shipped web build of `games/scroll-demo`, driven by real touch

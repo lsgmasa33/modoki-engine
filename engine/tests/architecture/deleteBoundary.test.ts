@@ -5,6 +5,8 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { findDeleteBoundaries, describeBoundary } from '../../scripts/deleteBoundary.mjs';
 import { makeDirLink } from '../helpers/linkFixture';
+import { readScannedSource } from '@modoki/engine/testing';
+import { refuseUnsafeReplace } from '../../toolchain/replaceGuard';
 
 /** `deleteBoundary.mjs` — "would a recursive delete of this subtree misreport what it did?"
  *
@@ -302,5 +304,76 @@ describe('deleteBoundary — the subtree pre-flight (#990/#989/#1004)', () => {
       expect(s).toContain('EACCES');
       expect(s).toContain('may well exist');
     });
+  });
+});
+
+/** #1006 close-out — the sweep's OWN residue. #1006 sized the population at two user-owned
+ *  delete sites and fixed both; this pass's re-sweep found two more of the same mechanism inside
+ *  `engine/toolchain/`, one line away from a staging directory, which is how the original sweep
+ *  missed them: `androidSdkProvision` and `wdaProvision` each `rmSync` a PERSISTENT destination
+ *  and then rename a fresh extract into its place.
+ *
+ *  ⚠️ A source guard, and the reason is worth stating rather than defaulting to: driving these
+ *  behaviourally means running a real provision (a network download, an archive extract, minutes),
+ *  and the DECISION under test is one line — "does the replace consult the shared walk first". The
+ *  walk's own behaviour is covered exhaustively above, including the accept side. What could still
+ *  regress is a future edit dropping the call, which is exactly what this sees. */
+describe('every persistent-destination REPLACE in engine/toolchain consults the walk first (#1006)', () => {
+  const SITES = [
+    { file: 'androidSdkProvision.ts', dest: 'latest' },
+    { file: 'wdaProvision.ts', dest: 'srcDir' },
+  ];
+
+  // Own fixture: the suite's `root`/`mk`/`payload` belong to the describe above.
+  let gRoot: string;
+  beforeEach(() => { gRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'rg-'))); });
+  afterEach(() => { try { fs.rmSync(gRoot, { recursive: true, force: true }); } catch { /* fixture */ } });
+
+  it.each(SITES)('$file guards its rmSync of $dest', ({ file, dest }) => {
+    const { code } = readScannedSource(path.resolve(__dirname, '../../toolchain', file));
+    const lines = code.split('\n');
+    const i = lines.findIndex((l) => l.includes(`fs.rmSync(${dest}, { recursive: true`));
+    expect(i, `no recursive rmSync of \`${dest}\` found in ${file} — fix the parser, not the test`)
+      .toBeGreaterThan(-1);
+    // The pre-flight must run BEFORE the delete, not merely exist somewhere in the file.
+    const before = lines.slice(Math.max(0, i - 5), i).join('\n');
+    expect(before, `${file} deletes ${dest} without the #883 pre-flight immediately before it`)
+      .toMatch(/refuseUnsafeReplace\(/);
+  });
+
+  it('shares ONE policy rather than pasting it — and that policy REFUSES', () => {
+    // ⚠️ close-out § 1a ②: the first version of this fix put the same ~10 lines in both files,
+    // which is a missing helper wearing a fix's clothes. Detection was already shared
+    // (`deleteBoundary.mjs`); this pins that the REFUSAL is too, and that it throws — a
+    // warn-and-delete would still sever the link, which is the whole defect.
+    for (const { file } of SITES) {
+      const { code } = readScannedSource(path.resolve(__dirname, '../../toolchain', file));
+      expect(code, `${file} must import the shared guard, not re-declare it`)
+        .toMatch(/import \{ refuseUnsafeReplace \} from '\.\/replaceGuard'/);
+      expect(code).not.toMatch(/function refuseUnsafeReplace/);
+    }
+    const { code: guard } = readScannedSource(path.resolve(__dirname, '../../toolchain/replaceGuard.ts'));
+    expect(guard).toMatch(/export function refuseUnsafeReplace/);
+    expect(guard, 'the pre-flight must THROW — a warn-and-delete still severs the link')
+      .toMatch(/throw new Error\(/);
+  });
+
+  it('the shared guard ACCEPTS a self-contained dir and REFUSES a link out of it', () => {
+    // The behavioural half — the source guards above only pin that the call happens.
+    // ⚠️ The ACCEPT side first, and it is the load-bearing one: every real provision destination
+    // is a plain extracted tree, so a guard that refused them would break provisioning outright.
+    const dest = path.join(gRoot, 'provision-dest');
+    fs.mkdirSync(path.join(dest, 'inner'), { recursive: true });
+    fs.writeFileSync(path.join(dest, 'inner', 'tool'), 'x');
+    expect(() => refuseUnsafeReplace(dest)).not.toThrow();
+    expect(() => refuseUnsafeReplace(path.join(gRoot, 'no-such-dest'))).not.toThrow();  // absent is safe
+
+    const elsewhere = path.join(gRoot, 'big-sdk-on-another-drive');
+    fs.mkdirSync(elsewhere, { recursive: true });
+    fs.writeFileSync(path.join(elsewhere, 'payload.bin'), 'x');
+    const linked = path.join(gRoot, 'linked-dest');
+    makeDirLink(elsewhere, linked);
+    expect(() => refuseUnsafeReplace(linked)).toThrow(/not self-contained/);
+    expect(fs.existsSync(path.join(elsewhere, 'payload.bin'))).toBe(true);
   });
 });
