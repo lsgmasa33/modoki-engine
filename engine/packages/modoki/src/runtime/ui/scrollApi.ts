@@ -273,8 +273,8 @@ export function entryIndexOf(viewGuid: string, axis: 'x' | 'y'): number | null {
   // in the one window this accessor exists to cover.
   //
   // ⚠️ **Court's #768 suite FOUND this, and can no longer see it** — the fixture publishes a
-  // stride now, so all four of its cases have a usable window and the gate order stops mattering
-  // to them. The ONE test that fails if these two lines move below the stride gate is
+  // stride now, so every case in that describe has a usable window and the gate order stops
+  // mattering to them. The ONE test that fails if these two lines move below the stride gate is
   // `entriesSystem.test.ts`'s "answers a stage-1 request even when the view has NO usable window
   // yet". Verified by deleting them: both game suites stay green, 183 passed.
   const entryReq = axis === 'x' ? en.scrollToEntryX : en.scrollToEntryY;

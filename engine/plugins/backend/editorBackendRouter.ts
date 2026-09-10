@@ -19,10 +19,22 @@
  */
 
 import fs from 'fs';
-// The GRANULAR subpath, never the `@modoki/engine/runtime` barrel: this is a Node-side Vite
-// backend and the barrel drags the browser runtime (DOM lib, three, pixi) into its tsconfig.
-// Same reason formatVersion and notifyListeners have their own export entries.
-import { hasDocKey } from '@modoki/engine/runtime/core/docKeys';
+// RELATIVE, not the `@modoki/engine/...` specifier — and never the `@modoki/engine/runtime`
+// barrel. Two separate reasons, both load-bearing:
+//   1. Granularity: this is a Node-side backend, and the barrel drags the browser runtime
+//      (DOM lib, three, pixi) into its tsconfig. Same reason formatVersion and notifyListeners
+//      have their own export entries.
+//   2. ⚠️ A BARE specifier here is fatal in the PACKAGED editor (#1035). build-electron.mjs sets
+//      `packages: 'external'`, so a bare import survives into main.cjs as a runtime `require` —
+//      and `@modoki/engine` has no `main`/`module`, only `exports` entries pointing at `.ts`.
+//      That is correct for every Vite consumer and unloadable by plain Node, which refuses to
+//      type-strip under node_modules (ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING). The throw
+//      lands during main.cjs module evaluation, so Electron's own error dialog hangs the app
+//      before initFileLog() — no visible window, no log, no stdout, exitCode=null. A relative path
+//      is the local convention across engine/plugins/** and engine/electron/**, and esbuild
+//      inlines it. The rule covers every tree the main bundle inlines, not just these two
+//      — see docs/build.md, guarded by tests/electron/mainBundleExternals.test.ts.
+import { hasDocKey } from '../../packages/modoki/src/runtime/core/docKeys';
 import crypto from 'crypto';
 import os from 'os';
 import path from 'path';

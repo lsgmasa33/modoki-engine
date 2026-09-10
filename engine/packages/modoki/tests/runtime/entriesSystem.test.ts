@@ -1265,8 +1265,8 @@ describe('entriesSystem', () => {
     // FOUND by Court's #768 suite going red against this file's first version, which gated the
     // whole function on `usableStride`. ⚠️ **That suite can no longer see it, so this test is the
     // only thing standing between the gate order and a regression** — the fixture publishes a
-    // stride now, so all four of its cases have a usable window and the ordering stops mattering
-    // to them. Measured: delete the two lines and `levelSelectChrome` (40) and wordweave's
+    // stride now, so every case in that describe has a usable window and the ordering stops
+    // mattering to them. Measured: delete the two lines and `levelSelectChrome` (40) and wordweave's
     // `systems` (143) stay green while this case reds alone.
     const { sys, src, view } = await setup();
     const api = await import('../../src/runtime/ui/scrollApi');

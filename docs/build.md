@@ -1388,6 +1388,66 @@ Four bugs found stress-testing the very first packaged DMG (`dist:dir`), each in
 All four verified end-to-end on a clean-from-source repackage: renderer mounts, `/api/scene-state`
 returns 200 entities, a "Build → Web" run on a clean packaged install completes and deploys.
 
+### ⚠️ Main-process code must not import `@modoki/engine` by BARE specifier (#1035)
+
+**The rule: nothing the main bundle inlines may reach the engine package by a BARE specifier —
+use a RELATIVE path**, `../packages/modoki/src/…`, which is already the local convention across
+`engine/plugins/**` and `engine/electron/**`. (Deliberately no count here: this section carried
+"~10", then "34 files / 73 sites" — the second was miscounted, because the grep swept a gitignored
+`dist/*.map`, and it was hand-copied into three files. A derived number that three files restate is
+the shadowing-constant trap this repo's own rules ban. Run the grep if you want today's figure.)
+
+⚠️ **The rule is scoped to the BUNDLE's inputs, not to those two trees.** Measured 2026-09-10 from
+esbuild's metafile: the main bundle has **154 non-`node_modules` inputs across 8 roots**, and those
+two trees are only 91 of them. `engine/electron/inputRoutes.ts` value-imports
+`engine/app/debug/domPointContract.ts`, and 19 of *that* file's siblings use the bare specifier as
+their local convention — so `engine/app/**`, `engine/toolchain/**`, `engine/packages/modoki/src/**`,
+`engine/scripts/*.mjs`, `engine/tools/shared/**` and `engine/project-config.ts` are all in scope
+too. Guarded by `engine/tests/electron/mainBundleExternals.test.ts`, which derives its corpus from
+the metafile rather than listing trees — the first version listed them and had a green path through
+this exact bug.
+
+`engine/scripts/build-electron.mjs` sets **`packages: 'external'`**, so a bare specifier is not
+bundled — it survives into `dist/main.cjs` as a runtime `require` that plain Node must resolve
+inside the packaged app. And **`@modoki/engine` has no `main` and no `module`**: its `exports` map
+points only at `.ts` source. That is correct for every other consumer, all of which reach it
+through Vite, and unloadable by Node, which refuses to strip types under `node_modules`
+(`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`). A relative path has neither problem — esbuild
+inlines it, and the same TypeScript compiles.
+
+**What it looks like when it happens, because the answer is "nothing".** The throw lands during
+`main.cjs` module evaluation, and an uncaught main-process exception raises **Electron's own error
+dialog** — a native modal with **no visible window**: a full-screen `screencapture` taken while the
+process was blocked in `-[NSAlert runModal]` shows no alert anywhere. (The modal LOOP is running —
+that is what `runModal` on the stack means — so "nobody can answer it" is the observation; "it is
+never drawn" would be an inference past it.) So the app hangs alive with no window, **no child
+processes**, no stdout, an empty `--user-data-dir`, and `exitCode=null`,
+having never reached `initFileLog()` near the top of `main.ts`. Every diagnostic this repo has is
+empty at once, which is what made one import cost a day: `smoke:packaged` reported `scene never
+loaded`, `no 'provisioned Node' line`, and `could not read logs/main.log: ENOENT`, none of which
+names the cause.
+
+Three traps this laid, each of which cost a session:
+
+- **`verify` cannot see this class at all** — it never loads the packaged bundle — so the source
+  change that breaks the mandated packaging gate lands green. The guard therefore **builds the
+  bundle itself**, with the shipped options imported from `engine/scripts/electronBuildOpts.mjs`
+  (the declaration-only split `mcpBuildOpts.mjs` established for #945 B1), and asks the artifact
+  rather than a list of files. It also checks the `dist/main.cjs` on disk — but **`skipIf` when
+  it is absent, not a failure**: `dist/` is gitignored, no gate builds it, and the free public CI
+  runs `npm test` over the OSS snapshot on three OSes, so requiring it would redden all three on
+  a file nothing has built. No mtime check either, in either direction: with 154 inputs, touching
+  any of the other 153 leaves an mtime comparison green against a genuinely stale bundle, and a
+  `git merge` that rewrites an input's mtime gives a false red.
+- **It is NOT `showErrorBox` (#1034).** Three sessions concluded the hang was one of `main.ts`'s own
+  modal error boxes and that #1034 had to be fixed first to make anything readable. It isn't and it
+  didn't: execution never reaches them. #1034 is a real, separate defect on the same theme.
+- **The modal cannot be read, so make the app talk instead.** What worked: extract `app.asar` to
+  `Resources/app/`, rename the asar so the extracted tree becomes the entry point (Electron prefers
+  `app.asar` when both exist — instrumenting without the rename silently changes nothing), and
+  prepend an `uncaughtException` recorder to `main.cjs`. `sample <pid>` confirms the modal
+  (`-[NSAlert runModal]` under `node::StartExecution`) but never names its text.
+
 ### The packaged editor must not write inside its own bundle (#326)
 
 A packaged editor's `REPO_ROOT` is `<Resources>/app.asar.unpacked` — **inside the signed `.app`**.
