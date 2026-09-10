@@ -11,8 +11,9 @@
  * self-registration (Phase 4 remainder + Phase 7).
  */
 
-import { app, dialog, Menu, type BrowserWindow } from 'electron';
+import { app, Menu, type BrowserWindow } from 'electron';
 import fs from 'node:fs';
+import { showOpenDialog } from './mainDialog';
 import path from 'node:path';
 import crypto from 'node:crypto';
 // The ONE 'same directory?' comparison (#869) — see engine/scripts/pathIdentity.mjs.
@@ -231,7 +232,7 @@ export async function pickProjectFolder(win: BrowserWindow | null): Promise<stri
   const opts: Electron.OpenDialogOptions = { title: 'Open Project', properties: ['openDirectory'] };
   const defaultPath = getLastFolder('open');
   if (defaultPath) opts.defaultPath = defaultPath;
-  const res = win ? await dialog.showOpenDialog(win, opts) : await dialog.showOpenDialog(opts);
+  const res = await showOpenDialog(opts, win);
   if (res.canceled || !res.filePaths[0]) return null;
   setLastFolder('open', path.dirname(res.filePaths[0]));
   return res.filePaths[0];
@@ -249,7 +250,7 @@ export async function pickNewProjectFolder(win: BrowserWindow | null): Promise<s
   };
   const defaultPath = getLastFolder('new');
   if (defaultPath) opts.defaultPath = defaultPath;
-  const res = win ? await dialog.showOpenDialog(win, opts) : await dialog.showOpenDialog(opts);
+  const res = await showOpenDialog(opts, win);
   if (res.canceled || !res.filePaths[0]) return null;
   setLastFolder('new', path.dirname(res.filePaths[0]));
   return res.filePaths[0];

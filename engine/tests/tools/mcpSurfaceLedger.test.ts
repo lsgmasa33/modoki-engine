@@ -11,8 +11,8 @@
 
 import { describe, it, expect } from 'vitest';
 import {
-  LEDGER_HEADER, parseLedger, lastKnownSizes, ledgerDelta, renderLedger, assertCsvSafe,
-  type LedgerRow,
+  LEDGER_HEADER, parseLedger, lastKnownSizes, ledgerDelta, renderLedger, appendChunk, assertCsvSafe,
+  ledgerSkipReason, type LedgerRow,
 } from '../../tools/modoki-mcp/surfaceLedger';
 
 const row = (over: Partial<LedgerRow> = {}): LedgerRow => ({
@@ -125,18 +125,30 @@ describe('MCP surface ledger (#894)', () => {
     // Hex too — `Number('0x2b3')` is 691, a number the writer never emits.
     expect(() => parseLedger(`${LEDGER_HEADER}\n2026-09-10,work-ai3,modoki_tap,0,0x2b3,691,abc1234`))
       .toThrow(/toolBytesAfter is not a decimal integer/);
-    // and the well-formed twin still parses, negatives included, so the guard is not just
-    // rejecting everything
-    expect(parseLedger(`${LEDGER_HEADER}\n2026-09-10,work-ai3,modoki_tap,-40,691,691,abc1234`))
-      .toHaveLength(1);
+    // ⚠️ Accept side, BOTH shapes. A legitimate zero delta is the common row and a negative is the
+    // removed-tool row; the first version of this test replaced the `0` case with the `-40` one
+    // instead of adding it, leaving the accept side narrower than the comment implied.
+    expect(parseLedger(`${LEDGER_HEADER}\n2026-09-10,work-ai3,modoki_tap,0,691,691,abc1234`)[0]
+      .deltaBytes).toBe(0);
+    expect(parseLedger(`${LEDGER_HEADER}\n2026-09-10,work-ai3,modoki_tap,-40,691,691,abc1234`)[0]
+      .deltaBytes).toBe(-40);
   });
 
   it('a non-finite number is refused on the way OUT too (#894 review)', () => {
     // Both directions, because `NaN` stringifies into a perfectly well-formed CSV field and would
     // otherwise be committed by a writer that never round-tripped it through `parseLedger`.
     // MUTATION CHECK: drop the `Number.isFinite` branch in `assertCsvSafe` and this stops throwing.
-    expect(() => assertCsvSafe(row({ deltaBytes: NaN }))).toThrow(/not a finite number/);
-    expect(() => assertCsvSafe(row({ surfaceBytesAfter: Infinity }))).toThrow(/not a finite number/);
+    expect(() => assertCsvSafe(row({ deltaBytes: NaN }))).toThrow(/not an integer/);
+    expect(() => assertCsvSafe(row({ surfaceBytesAfter: Infinity }))).toThrow(/not an integer/);
+    // ⚠️ And a NON-INTEGER, so the writer cannot emit something `parseLedger` refuses to read back.
+    // `Number.isFinite` accepted 1.5 while the reader requires `/^-?\d+$/` — a file this module
+    // produced and could not parse, throwing on every later run. Flagged as a latent asymmetry in
+    // review; pinned rather than left, because it is invisible until it fires.
+    // MUTATION CHECK: revert `Number.isInteger` to `Number.isFinite` and this line goes red while
+    // the NaN/Infinity lines above stay green — which is exactly why they did not cover it.
+    expect(() => assertCsvSafe(row({ deltaBytes: 1.5 }))).toThrow(/not an integer/);
+    // a legitimate integer row still passes, so the guard is not simply rejecting everything
+    expect(() => assertCsvSafe(row({ deltaBytes: -40, toolBytesAfter: 0 }))).not.toThrow();
   });
 
   it('a UTF-8 BOM does not break the header check (#894 review)', () => {
@@ -153,6 +165,58 @@ describe('MCP surface ledger (#894)', () => {
     // MUTATION CHECK: weaken the regex to `/\n/` and the comma case stops throwing.
     expect(() => assertCsvSafe(row({ tool: 'modoki_tap,evil' }))).toThrow(/not CSV-safe/);
     expect(() => assertCsvSafe(row({ clone: 'feature/x' }))).not.toThrow();
+  });
+
+  it('INTEGRATION branches keep no ledger — main and release_* alike (#894 review)', () => {
+    // This decision is unreachable from any clone that could exercise it in the script: a worker
+    // cannot be on `main`, and its only lever (MODOKI_LEDGER_CLONE) DISABLES the check. So a typo
+    // like 'Main' would be invisible to verify, to CI and to every worker, and would first execute
+    // on the hub — once — seeding the very file it exists to prevent. Hence a pure function.
+    //
+    // ⚠️ `release_*` is here because the first version of the guard argued it was a WORKER concern
+    // and could be left alone. CLAUDE.md § Dev Workflow says the opposite in as many words: the HUB
+    // cuts the release branch and merges it back. It is the hub under another name.
+    //
+    // MUTATION CHECK: drop the `release[_-]` branch → the release cases go red; drop the
+    // `main` branch → the main case goes red; each 1 of 15, nothing else.
+    expect(ledgerSkipReason('main')).toMatch(/integration branch/);
+    expect(ledgerSkipReason('release_0_7_0')).toMatch(/release branch/);
+    expect(ledgerSkipReason('release-0-7-0')).toMatch(/release branch/);
+    // workers keep theirs
+    for (const worker of ['work-ai', 'work-ai2', 'work-ai3', 'work-qa', 'win']) {
+      expect(ledgerSkipReason(worker), worker).toBeUndefined();
+    }
+    // a branch merely CONTAINING the word is not an integration branch
+    expect(ledgerSkipReason('fix-main-thread-stall')).toBeUndefined();
+    expect(ledgerSkipReason('prerelease')).toBeUndefined();
+    // the override wins everywhere, which is what makes this a default rather than a prohibition
+    expect(ledgerSkipReason('main', { MODOKI_LEDGER_CLONE: 'main' })).toBeUndefined();
+  });
+
+  it('appendChunk heals a missing trailing newline, so two rows cannot fuse (#894 review)', () => {
+    // The un-killed residual from the second review, fixed rather than documented once the damage
+    // was measured: appending onto a file whose last line lost its newline concatenates the two
+    // rows into ONE 13-field line, which destroys the EARLIER row as well as the new one, and
+    // `parseLedger` then throws on every later run until somebody repairs the file by hand. Loud,
+    // but not local, and not recoverable from the ledger itself.
+    //
+    // MUTATION CHECK: drop the `existing.endsWith('\n')` branch and this test goes red — and the
+    // round-trip assertion below is what makes it red for the RIGHT reason (a 13-field line),
+    // rather than merely on a string mismatch.
+    const bare = `${LEDGER_HEADER}\n2026-09-10,work-ai3,a,0,10,10,abc1234`;   // no trailing \n
+    const added = [row({ tool: 'b', deltaBytes: 5, toolBytesAfter: 20, surfaceBytesAfter: 30 })];
+    const healed = bare + appendChunk(bare, added);
+    expect(parseLedger(healed)).toHaveLength(2);
+    expect(parseLedger(healed)[0].tool).toBe('a');
+
+    // and a well-formed file is NOT given a spurious blank line
+    const ok = `${LEDGER_HEADER}\n2026-09-10,work-ai3,a,0,10,10,abc1234\n`;
+    expect(parseLedger(ok + appendChunk(ok, added))).toHaveLength(2);
+    expect(appendChunk(ok, added).startsWith('\n')).toBe(false);
+
+    // nothing to append stays nothing, on either shape
+    expect(appendChunk(bare, [])).toBe('');
+    expect(appendChunk('', added)).toBe(renderLedger(added, { withHeader: false }));
   });
 
   it('renderLedger omits the header when appending, and emits nothing to APPEND for no rows', () => {

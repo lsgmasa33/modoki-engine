@@ -1496,12 +1496,8 @@ loop cannot run the timer meant to rescue it — the Promise says "async" and be
 The general lesson is worth more than the fix: **a timeout can only rescue you if the thing you are
 timing out cannot block the loop the timer runs on.**
 
-⚠️ **This mechanism is not confined to the startup paths.** `autoUpdate.ts`'s `show()` and three
-sites in `main.ts` deliberately fall back to a parentless `dialog.showMessageBox(opts)` when there is
-no window, so each of those blocks the main thread for as long as the dialog is up. That is tolerable
-where a modal is the point (an update prompt the user asked for) and it is NOT a terminate path, so
-it is left alone — but **do not copy that fallback onto a path with concurrent async work or one that
-must exit.** Not measured on those sites.
+⚠️ **This mechanism is not confined to the startup paths — see #1044 below**, which is where the
+ordinary (non-terminating) dialogs are dealt with.
 
 ⚠️ **`reportFatalStartup`'s parent probe deliberately ACCEPTS the splash, where `show()` rejects
 it** — the two want opposite things and neither is wrong. `show()` needs the user's *answer*, so it
@@ -1526,7 +1522,122 @@ non-zero. Collapsing them onto one exit fixes #1034 and reintroduces #68.
 ⚠️ **A dialog this early does not render at all** — a full-screen `screencapture` during a real
 `runModal` block showed no alert anywhere. Any argument that rests on "the human can still click OK"
 is protecting a path that, at this point in startup, does not exist. Separately, a failure *before*
-`initFileLog()` writes nothing at all — that is #1043, not this.
+`initFileLog()` used to write nothing at all — that was #1043, fixed below, and is still not this.
+
+
+### A crash before `initFileLog()` leaves a file anyway (#1043)
+
+`fileLog.ts` registers the `uncaughtException` / `unhandledRejection` handlers **inside**
+`initFileLog()`, which `main.ts` calls near the top of its body. But **ES imports are hoisted**, so the forty
+imports written *below* that call — `assetBackend`, `../toolchain`, `backendServer`, `rendererOps`,
+`ssrLoader`, `devServer`, `connectClaude`, `vendorPlugins`, `autoUpdate`, the eight reimport
+plugins — are fully evaluated first, as is `setUserDataDir()`. A throw anywhere in that window
+produced **nothing at all**: no stdout (a Finder-launched `.app` and any Windows GUI launch have no
+terminal) and no `main.log`, because the file had not been opened and no handler existed to write
+to it. That is how #1035 presented; reading the real exception took extracting `app.asar`, renaming
+it so the extracted tree won, and hand-patching `main.cjs`.
+
+**`engine/electron/crashSink.ts` is imported FIRST in `main.ts` and writes to
+`os.tmpdir()/modoki-logs/early-crash.log`.** ⚠️ **That path is the artifact to ask a user for when
+a packaged editor dies with an empty `main.log`** — `initFileLog` also prints it into `main.log` on
+every successful boot, so a reader holding one file can find the other.
+
+⚠️ **A SINK, not a buffer.** Buffering early output and flushing it once the real log opens is the
+shape this repo has retired three times — #861 named the class (*"a buffer whose only delivery path
+sits behind the boot that fills it"*), with #859 and #825 as instances. A boot that dies at module
+evaluation never reaches the flush, so the buffer dies holding the only copy of why.
+
+⚠️ **tmpdir, not userData, and that is not laziness.** WHICH userData is itself decided inside the
+unlogged window, and `main.ts` §"userData MUST be decided FIRST" exists because an early reader once
+silently relocated the shipped editor's entire profile for weeks. `os.tmpdir()` needs no decision.
+The dir is created `0700`: `tmpdir()` is per-user on macOS and Windows but SHARED on Linux.
+
+⚠️ **The import POSITION is the mechanism, and what ships is bundled CJS, not ESM.** Measured
+against the repo's real esbuild options rather than assumed: esbuild inlines bundled modules in
+SOURCE ORDER and leaves an external `require("electron")` at its own source position rather than
+hoisting it above them — so a first-position import runs before every other module and before
+electron itself. `crashSinkOrder.test.ts` pins the source position AND rebuilds with the shipped
+options to pin the emitted order, then drives a real module-eval throw in a real child process,
+because a test covering only a post-`initFileLog` throw cannot fail on this bug. It carries its own
+falsification: the same fixture with the imports REVERSED must write nothing.
+
+⚠️ **Known, measured trade: an `uncaughtException` listener suppresses Node's default
+termination**, and this one covers a window that previously had none — so under bare `node` a boot
+that exited 1 now exits 0. Under ELECTRON nothing changes: its own loader wraps the main-module
+load in a try/catch and raises a native modal, so the process hangs with or without the sink (the
+#1035 shape described above). Only the stack on disk is new. The exit code is asserted in the suite
+so the trade cannot drift unnoticed.
+
+### Every main-process dialog gets a parent when one exists (#1044)
+
+The #1034 mechanism above — a parentless box is app-modal and blocks the single-threaded main
+process — is not specific to a terminate path. While one is up, **nothing else in main runs**: no
+timers, no renderer IPC, no backend HTTP. That is a stall rather than a hang, but it is a stall the
+editor takes in its ORDINARY operation.
+
+**`engine/electron/mainDialog.ts` owns the rule and every main-process dialog goes through it.**
+`showMessageBox` / `showOpenDialog` parent to a real window whenever one exists and go free-floating
+only when there is genuinely none.
+
+⚠️ **The defect was not a forgotten parent — it was a bypassed helper.** `autoUpdate.ts` already
+had the right thing (`show()`, which parents to a visible non-splash window) and **three sites in
+that same file called `dialog.showMessageBox` directly**, passing no parent *unconditionally* rather
+than "when there is no window". So they took the app-modal path with a perfectly good editor window
+open — the ordinary case, not an edge one. **Those three are the whole behavioural surface of the
+fix.**
+
+⚠️ The other eight are routed for UNIFORMITY, not for effect — saying otherwise overstates the
+blast radius. Six (`show()` itself, three in `main.ts`, both `projects.ts` pickers) already parented
+whenever a window existed and only fell back to parentless on a null `mainWindow`. The two in
+`main.ts`'s first-run picker run inside `whenReady` at `resolveInitialProject()`, **before**
+`showSplash()` and `createWindow()`, so there is provably no window to parent to and they stay
+app-modal either way — which is fine there, because nothing else is running yet to be starved.
+
+Because a correct helper sitting beside incorrect callers is invisible to a unit test,
+**`mainDialog.test.ts` bans the `dialog` IMPORT everywhere under `engine/electron/**` except the
+owning module** (plus the one escape a specifier ban cannot see, `import * as electron`). Corpus is
+derived RECURSIVELY from the directory and read through `readScannedSource`, so a docblock mention
+neither satisfies nor hides a match (#812), with a non-vacuity test that the owner really does call
+what it bans.
+
+⚠️ **It bans the import rather than the member access, and that distinction is the whole guard.**
+The first version matched `dialog.show*` in the source and review broke it in one word:
+`import { dialog as __d } from 'electron'` slips past a regex bound to the literal identifier
+`dialog`, whether the call is `__d.showMessageBox(…)` or a destructured `const { showMessageBox } =
+__d`. The real defect was then reinstated at `autoUpdate.ts`'s error handler through such an alias
+and **all 1072 electron tests stayed green.** Banning the specifier is unspoofable by renaming,
+because the rename is IN the specifier.
+
+⚠️ **A source guard was never enough on its own, either.** The three bypassing sites had no
+behavioural test at all: every assertion on them read only `lastBox().title`, `boxAt` is
+deliberately parent-agnostic, and they all ran under a fixture with `windows = []` — so they were
+parentless BY FIXTURE and could not have observed parenting even had they asked.
+`autoUpdate.test.ts` now puts a window in the fixture and asserts the PARENT for all three.
+
+**Two policies, both correct, and the caller says which** — this is the constraint that stopped the
+two rules being merged into one:
+
+| policy | who | why |
+|---|---|---|
+| `visibleNonSplash` | `autoUpdate.ts`, `main.ts`, `projects.ts` | needs the user's ANSWER. The splash is destroyed at renderer-mount and would take an open sheet down unanswered; the editor window is hidden until reveal |
+| `anyWindow` | `fatalDialog.ts`'s probe | only needs "not app-modal" — it terminates on its own timer either way, so an unanswered sheet costs it nothing |
+
+⚠️ **`isDestroyed()` is filtered BEFORE `isVisible()`, and the order is load-bearing**:
+`isVisible()` throws on a destroyed window, so a window torn down between `getAllWindows()` and the
+probe turned a dialog into an exception. `show()` had that shape.
+
+⚠️ **When there is no window the box is still shown, parentless — deliberately.** The alternative,
+skipping it and writing to the log, re-creates the defect #1032 spent a whole issue removing: a
+user-visible outcome reported somewhere the user never looks (a packaged editor's `main.log` is not a
+UI). `fatalDialog.ts` is the ONE caller that must not take that trade, because a blocked loop kills
+the timer that does the terminating — it keeps its own "no parent ⇒ show nothing, exit now" refusal.
+
+⚠️ **But it is NOT independent of `mainDialog`, and reading it as such is the trap.** `main.ts`
+wires BOTH its injected deps through this module: the parent probe is
+`resolveDialogParent('anyWindow')` and the show is `showMessageBox(o, parent)`. What `fatalDialog`
+keeps is the DECISION — it returns early on a null parent, so `mainDialog`'s "resolve one anyway"
+branch is unreachable from there. It does not keep the plumbing. So a change to the default policy
+here, or anything that makes these retry or queue, **is inherited by the terminate path silently.**
 
 ### An editor state file's absent-case default is a MIGRATION question (#1041)
 
@@ -1673,10 +1784,38 @@ workflow is what uploads `latest-mac.yml` / `latest.yml` + the zip/blockmap.
 listening, *before* it asks Squirrel to pull the ~294 MB zip through it. So the progress bar goes
 indeterminate there rather than being cleared, and — the sharper consequence — **`quitAndInstall()`
 can be a no-op**: with `squirrelDownloadedUpdate` still false and `autoInstallOnAppQuit` true,
-`MacUpdater.quitAndInstall` adds a listener and returns, so a user who clicks **Restart Now** within
-a few seconds of the prompt gets no quit until Squirrel finishes on its own. Pre-existing, tracked
-separately — do not "fix" it by flipping `autoInstallOnAppQuit`, which is what stages the update for
-the next ordinary quit.
+`MacUpdater.quitAndInstall` adds a listener and returns, so a user who clicked **Restart Now** within
+a few seconds of the prompt got no quit until Squirrel finished on its own — an unannounced quit,
+which from the user's side is the editor closing itself.
+
+**Fixed in #1033: the RESTART PROMPT now waits for Squirrel, not for the proxy.** #1032 established
+the early fire and applied it to the progress bar, then armed the prompt on that same event two lines
+below — so the fact was already written down and only its consequence for the button was missed.
+
+The real signal is public API rather than a private field: `MacUpdater` does
+`this.nativeUpdater = require("electron").autoUpdater` and flips `squirrelDownloadedUpdate` on THAT
+emitter's `update-downloaded`. `autoUpdate.ts` listens to the same one.
+
+- **darwin only.** Windows' `NsisUpdater` has no proxy dance — its `update-downloaded` means the file
+  IS downloaded and there is no native emitter to wait for. Gating it there would hang the prompt
+  forever, which is worse than the bug. ⚠️ The suite PINS `process.platform` per test rather than
+  reading the host's, or the three legs of public CI would each test a different branch and only the
+  macOS one could catch a regression.
+- **No timeout that prompts anyway** — that re-arms the original defect. A transfer that never
+  completes is not silent: electron-updater rejects it through `nativeUpdater.once("error", reject)`,
+  which surfaces on our `error` handler as "Update Download Failed".
+- **Readiness re-arms per download.** Squirrel having finished 1.0 says nothing about 2.0.
+- **A "Restart Now" that has not quit within a grace window now says so.** This is the one path where
+  we cannot see inside Squirrel, and a click answered with neither a quit nor a message is the shape
+  #1032 existed to remove.
+
+⚠️ **Still do not "fix" any of this by flipping `autoInstallOnAppQuit`** — that flag is what stages
+the update for the next ordinary quit, which is the fallback the "Later" button promises.
+
+⚠️ **NOT verified on a device.** Confirming it needs a Developer-ID-signed, notarized build at a
+version BELOW the feed's latest (`updateBlockedReason` skips ad-hoc builds, so `npm run dist` will
+not do — `dist:notarized` will), and the window is seconds wide. The unit tests prove the decision
+table, not Squirrel.
 
 ⚠️ **A dialog is never parented to the splash.** At launch `getAllWindows()[0]` IS the splash
 (`main.ts` shows it, creates the editor window *hidden*, then calls `setupAutoUpdate`), and

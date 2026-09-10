@@ -13,8 +13,8 @@
 // discarded a 94%-complete partial (observed on disk as pending/temp-*.zip). Every
 // terminal state now has a dialog, and nothing downloads until the user says yes.
 
-import { app, dialog, BrowserWindow } from 'electron';
-import { isSplashWindow } from './splash';
+import { app, BrowserWindow, autoUpdater as nativeAutoUpdater } from 'electron';
+import { showMessageBox, resolveDialogParent } from './mainDialog';
 import { execSync } from 'node:child_process';
 // electron-updater ships CJS with a default export carrying the singleton.
 import electronUpdater from 'electron-updater';
@@ -57,18 +57,12 @@ function setProgress(fraction: number): void {
   for (const w of BrowserWindow.getAllWindows()) w.setProgressBar(fraction);
 }
 
-/** Show a message box parented to a real editor window when one is VISIBLE, and
- *  free-floating otherwise.
- *  ⚠️ Never parent to the splash, and never to the still-hidden editor window. At
- *  launch `getAllWindows()[0]` is the SPLASH (main.ts shows it, then creates the
- *  editor window hidden, then calls setupAutoUpdate) — and the splash is destroyed
- *  the instant the renderer mounts, which would take an open sheet down with it,
- *  unanswered. A feed round-trip beats a React mount often enough for that to be the
- *  normal case, not a race. An unparented box survives both. */
-function show(opts: Electron.MessageBoxOptions): Promise<Electron.MessageBoxReturnValue> {
-  const win = BrowserWindow.getAllWindows().find((w) => !isSplashWindow(w) && w.isVisible());
-  return win ? dialog.showMessageBox(win, opts) : dialog.showMessageBox(opts);
-}
+/** Every box this module shows — prompts AND notifications alike. The splash rule that used to
+ *  live here now lives in `mainDialog.ts` alongside its `anyWindow` twin, because #1044 found
+ *  three sites in THIS FILE bypassing the local helper and going unconditionally parentless.
+ *  Keeping the name as a thin alias is deliberate: it is what the call sites below read as. */
+const show = (opts: Electron.MessageBoxOptions): Promise<Electron.MessageBoxReturnValue> =>
+  showMessageBox(opts, null, 'visibleNonSplash');
 
 /** "An update exists — want it?" Shared by the launch check and the menu check: the
  *  owner's ruling (2026-09-10) is that a few-hundred-MB download never starts without
@@ -89,6 +83,8 @@ function promptDownload(version: string): void {
     promptOpen = false;
     if (r.response !== 0) return;
     downloading = true;
+    squirrelReady = false; // a fresh transfer: whatever Squirrel had is not THIS build (#1033)
+    forgetPendingReady(); // …and the previous transfer's parked listener must not speak for it
     setProgress(0); // show the bar immediately — the first progress event can be seconds away
     autoUpdater.downloadUpdate().catch((e) => {
       // A rejection here usually ALSO fires the `error` event (which reports it); clearing
@@ -99,6 +95,62 @@ function promptDownload(version: string): void {
     });
   }).catch((e) => { promptOpen = false; console.warn('[auto-update] prompt failed:', e?.message || e); });
 }
+
+/** macOS ONLY: has Squirrel actually pulled and validated the zip? (#1033)
+ *
+ *  ⚠️ **`update-downloaded` does NOT mean the bytes are on disk.** `MacUpdater` calls
+ *  `dispatchUpdateDownloaded(event)` — the event we listen for — from inside
+ *  `server.listen(0, "127.0.0.1", …)`, at the moment its local proxy STARTS LISTENING, and only
+ *  THEN asks Squirrel to pull the ~294 MB zip through that proxy. The real completion signal is
+ *  Electron's own `autoUpdater`, which is what `MacUpdater` itself keys `squirrelDownloadedUpdate`
+ *  on (`this.nativeUpdater = require("electron").autoUpdater`). We listen to the same public
+ *  emitter rather than reaching into the library's private field.
+ *
+ *  Why this matters: `MacUpdater.quitAndInstall()` with `squirrelDownloadedUpdate === false` and
+ *  `autoInstallOnAppQuit === true` takes an else-branch that registers a listener and **returns
+ *  having done nothing observable**. So a user who clicked "Restart Now" in the seconds before
+ *  Squirrel finished got no quit and no message — the app then quit on its own once Squirrel
+ *  caught up, which from the outside is the editor closing itself. */
+let squirrelReady = false;
+
+/** Windows' `NsisUpdater` has no proxy-server dance — its `update-downloaded` means the file IS
+ *  downloaded — so the gate is darwin-only and everywhere else runs `cb` straight away. */
+let pendingReady: (() => void) | null = null;
+
+/** Drop a parked readiness listener. Called when a transfer is superseded or fails.
+ *
+ *  ⚠️ Without this the `.once` is removed by nothing, and two things go wrong. The listeners
+ *  accumulate on a shared emitter (default `maxListeners` 10); worse, a parked one holds ITS
+ *  download's version in a closure, so when Squirrel finishes the SUPERSEDED v1 it would set
+ *  `squirrelReady = true` and prompt with v1's version — after which v2's early proxy event finds
+ *  readiness already true and prompts on it, restoring #1033. (`MacUpdater` gets this wrong the
+ *  same way: it sets `squirrelDownloadedUpdate` with `on` and never resets it.) */
+function forgetPendingReady(): void {
+  if (!pendingReady) return;
+  nativeAutoUpdater.removeListener('update-downloaded', pendingReady);
+  pendingReady = null;
+}
+
+/** Can Squirrel install RIGHT NOW? Windows/linux: always (their `update-downloaded` means the
+ *  bytes are there). darwin: only once the native emitter has confirmed it. */
+function installableNow(): boolean { return process.platform !== 'darwin' || squirrelReady; }
+
+function whenInstallable(cb: () => void): void {
+  if (installableNow()) { cb(); return; }
+  // ⚠️ No timeout that prompts anyway: that would re-arm the exact defect this fixes. A download
+  // that never completes is NOT silent — electron-updater rejects it through `nativeUpdater.once
+  // ("error", reject)`, which surfaces on our own `error` handler as "Update Download Failed".
+  forgetPendingReady(); // one parked listener at a time, always for the CURRENT transfer
+  const fire = () => { pendingReady = null; squirrelReady = true; cb(); };
+  pendingReady = fire;
+  nativeAutoUpdater.once('update-downloaded', fire);
+}
+
+/** How long "Restart Now" may go unanswered before we say something. Mechanism (a liveness
+ *  bound), not a tunable knob — same rule as `FATAL_DIALOG_TIMEOUT_MS`. */
+const INSTALL_QUIT_GRACE_MS = 8_000;
+/** The armed watchdog, so a second accepted prompt cannot stack a second one. */
+let quitWatchdog: ReturnType<typeof setTimeout> | null = null;
 
 /** "It's downloaded — restart?" Reached from update-downloaded, and again from a
  *  later interactive check so the staged build isn't re-downloaded. */
@@ -118,6 +170,32 @@ function promptRestart(version: string): void {
     if (r.response !== 0) { setProgress(-1); return; } // "Later" — drop the indeterminate bar
     installing = true; // before-quit must defer to Squirrel from here
     autoUpdater.quitAndInstall();
+    // Defence in depth (#1033). `whenInstallable` should mean the quit is immediate, but a click
+    // that produces neither a quit nor a message is the exact shape #1032 existed to remove, and
+    // this is the one path where we cannot see inside Squirrel. If we are still here, say so
+    // rather than leaving the user looking at an editor that ignored them.
+    if (quitWatchdog) clearTimeout(quitWatchdog);
+    quitWatchdog = setTimeout(() => {
+      quitWatchdog = null;
+      if (!installing) return; // an `error` released it and already reported
+      // ⚠️ Only with a window. `mainDialog` falls back to a PARENTLESS box when there is none,
+      // and by now the windows may be going away for the quit this is reporting on — a parentless
+      // box is app-modal and would block the very quit-and-install it is apologising for
+      // (mainDialog.ts's header; fatalDialog.ts's "never open a parentless modal on a path that
+      // must terminate"). With no window there is nobody looking anyway.
+      // ⚠️ Ask the SAME question `show()` will ask, rather than re-implementing it. A hand-rolled
+      // `getAllWindows().some(...)` had already drifted: it omitted the splash filter, so with only
+      // a splash up it answered "there is a window" while `show()`'s `visibleNonSplash` policy
+      // found none and went parentless anyway — the exact outcome this guard exists to prevent.
+      if (resolveDialogParent('visibleNonSplash') == null) return;
+      if (promptOpen) return; // do not stack a box on an open prompt
+      promptOpen = true;
+      void show({
+        type: 'info', title: 'Finishing Update',
+        message: 'The update is still being prepared.',
+        detail: 'Modoki Editor will restart on its own as soon as it is ready.',
+      }).finally(() => { promptOpen = false; });
+    }, INSTALL_QUIT_GRACE_MS);
   }).catch((e) => { promptOpen = false; console.warn('[auto-update] prompt failed:', e?.message || e); });
 }
 
@@ -141,6 +219,13 @@ function wire(): void {
     // claim is machine-wide, so a stuck flag would lock a phone out of every other clone
     // on every later quit, hours after the failed update.
     const wasInstalling = installing;
+    // ⚠️ Only drop the parked readiness listener when a TRANSFER failed — not on any `error`.
+    // electron-updater emits `error` for a failed FEED CHECK too ("Cannot check for updates"), and
+    // in the #1033 window `downloading` is already false because the early proxy event cleared it.
+    // So an unconditional forget here killed a listener whose transfer was alive and well: Squirrel
+    // would finish minutes later and "Restart Now" would never be offered again for the life of
+    // the process. Found in review, as a regression introduced by the previous review's fix.
+    if (wasInstalling || wasDownloading) forgetPendingReady();
     installing = false;
     downloading = false;
     setProgress(-1);
@@ -149,7 +234,7 @@ function wire(): void {
     if (interactiveCheck || wasDownloading || wasInstalling) {
       interactiveCheck = false;
       const what = wasInstalling ? 'install' : wasDownloading ? 'download' : 'check';
-      dialog.showMessageBox({
+      show({
         type: 'error',
         title: what === 'install' ? 'Update Install Failed'
           : what === 'download' ? 'Update Download Failed' : 'Update Check Failed',
@@ -180,7 +265,29 @@ function wire(): void {
       }
       return;
     }
-    if (downloadedVersion === info.version) { promptRestart(info.version); return; }
+    if (downloadedVersion === info.version) {
+      // ⚠️ GATED, exactly like the `update-downloaded` path (#1033 review). This is reachable
+      // DURING the minutes Squirrel spends pulling the zip: `downloadedVersion` is set by the early
+      // proxy event, so a "Check for Updates…" in that window used to re-offer "Restart Now" here
+      // ungated — the very no-op #1033 fixes, plus a stuck `installing` that makes main's
+      // before-quit skip `releaseDeviceResourcesOnExit()` on every later quit.
+      //
+      // ⚠⚠ ...but gating ALONE made this the one branch of this handler that answers a user's
+      // menu click with SILENCE (found in review). Every other branch speaks — `installing` says
+      // "Installing Update", `downloading` says "Update Downloading" — and this state is exactly
+      // the one where `downloading` was already cleared by the `update-downloaded` handler, so the
+      // branch that would have spoken is unreachable. A dead menu item during the longest wait in
+      // the whole flow is #1032's original defect, reintroduced by #1033's fix.
+      if (!installableNow() && wasInteractive) {
+        void show({
+          type: 'info', title: 'Update Downloading',
+          message: `Modoki Editor ${info.version} is still being prepared.`,
+          detail: "The app icon shows its progress. You'll be asked to restart once it's ready.",
+        });
+      }
+      whenInstallable(() => promptRestart(info.version));
+      return;
+    }
     if (downloading) {
       // A second check landing mid-download must not start a duplicate fetch — but if
       // the USER asked, the click still has to produce an answer.
@@ -203,7 +310,7 @@ function wire(): void {
     console.log('[auto-update] up to date');
     if (interactiveCheck) {
       interactiveCheck = false;
-      dialog.showMessageBox({
+      show({
         type: 'info', title: 'No Updates', message: 'Modoki Editor is up to date.',
         detail: `You're on version ${app.getVersion()}.`,
       });
@@ -224,7 +331,10 @@ function wire(): void {
     // starts listening, BEFORE Squirrel pulls the zip through it — so the machine is still
     // transferring. Switch to indeterminate rather than claiming completion; "Later" clears it.
     setProgress(2);
-    promptRestart(info.version);
+    // ⚠️ …and for the same reason the PROMPT waits too (#1033). Offering "Restart Now" here
+    // offered a button that could do nothing: #1032 fixed the progress bar for this and left the
+    // prompt armed on the early event two lines below it.
+    whenInstallable(() => promptRestart(info.version));
   });
 }
 
@@ -297,7 +407,7 @@ export function setupAutoUpdate(): void {
 export function checkForUpdatesInteractive(): void {
   const blocked = updateBlockedReason();
   if (blocked) {
-    void dialog.showMessageBox({
+    void show({
       type: 'info', title: 'Updates Unavailable',
       message: 'This build cannot check for or install updates.',
       detail: blocked,

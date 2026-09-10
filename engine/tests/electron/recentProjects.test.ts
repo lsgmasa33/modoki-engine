@@ -16,7 +16,15 @@ vi.mock('electron', () => ({
   app: { getPath: (name: string) => path.join(root.dir, name) },
   dialog: { showOpenDialog: (...args: unknown[]) => showOpenDialog(...args) },
   Menu: { buildFromTemplate: () => ({}), setApplicationMenu: () => {} },
+  // The pickers resolve their own parent through mainDialog now (#1044). These tests drive them
+  // with no window, which is the parentless case they already asserted — but the mock has to
+  // OFFER the read, or it fails as a missing export rather than as "no window".
+  BrowserWindow: { getAllWindows: () => [] },
 }));
+// A module STUB, not coverage: with `getAllWindows()` returning [] the resolver's `.find()` never
+// runs, so this is never invoked. It exists so importing mainDialog does not drag the real splash
+// module in. The splash RULE is covered in mainDialog.test.ts, not here.
+vi.mock('../../electron/splash', () => ({ isSplashWindow: () => false }));
 
 import { getRecentProjects, addRecentProject, migrateLegacyRecents, setRecentsScope, chooseInitialProject, isUnderRepo, projectFolderKind, pickProjectFolder, pickNewProjectFolder } from '../../electron/projects';
 

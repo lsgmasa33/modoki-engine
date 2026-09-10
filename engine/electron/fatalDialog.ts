@@ -42,6 +42,14 @@
 // So the rule is stronger than "arm the exit first": **never open a parentless modal on a path that
 // must terminate.** With a parent window it is a SHEET (genuinely async, loop keeps running); with
 // none it is a trap, and the only safe thing is to log and exit.
+//
+// ⚠️ **This module owns the DECISION, not the plumbing — and #1044 changed the plumbing under it.**
+// `main.ts` now supplies both injected deps from `mainDialog.ts`: the parent probe is
+// `resolveDialogParent('anyWindow')` and the show is `showMessageBox(o, parent)`. What keeps this
+// path safe is the `parent == null` early return BELOW, which means mainDialog's "resolve one
+// anyway" fallback is unreachable from here. That makes it easy to read this file as independent
+// of mainDialog. It is not: a change to mainDialog's default policy, or anything that makes those
+// functions retry or queue, is inherited by THIS path silently. See docs/build.md § #1044.
 
 /** How long to leave the dialog up before terminating anyway. Long enough that a human who IS
  *  present can read it and click through; short enough that a harness fails in bounded time rather

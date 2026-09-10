@@ -19,6 +19,7 @@ import { app } from 'electron';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { earlyCrashLogPath } from './crashSink';
 
 let stream: fs.WriteStream | null = null;
 let logFilePath = '';
@@ -282,5 +283,20 @@ export function initFileLog(): string {
   process.on('unhandledRejection', (e) => { try { stream?.write(fmt('fatal', ['unhandledRejection', e])); } catch { /* noop */ } });
 
   orig.log(`[modoki-electron] logging to ${logFilePath}`);
+  // #1043: name the early sink unconditionally, so whoever is holding `main.log` after a bad boot
+  // can find the file that has the stack.
+  //
+  // ⚠️ **`console.log`, NOT `orig.log`** — and the difference is the whole point. `orig` is
+  // captured BEFORE the tee is installed, so it writes to stdout only, and a Finder-launched `.app`
+  // or any Windows GUI launch has no terminal. A signpost that only exists on a stream nobody can
+  // read is exactly the #1043 shape this line is about. (An earlier draft used `orig.log`, having
+  // swapped it in from a `console.error` while removing an unreachable guard — silently changing
+  // the destination along with the condition.)
+  //
+  // ⚠️ Unconditional, because the obvious guard cannot fire: a throw in the unlogged window
+  // aborts main.cjs's synchronous body so this line is never reached, and a rejection is not
+  // detected until that body drains — by which time this has run with nothing yet recorded. A
+  // guard that cannot be true is worse than none, because it reads as coverage.
+  console.log(`[modoki-electron] a crash before this point would be recorded at ${earlyCrashLogPath} (#1043)`);
   return logFilePath;
 }

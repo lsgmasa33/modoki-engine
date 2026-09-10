@@ -701,11 +701,28 @@ Three things about it are load-bearing:
   the bytes, it defers them onto whoever runs it next: a clone that merges `origin/main` and skips,
   then later edits one description, records the whole merged delta against its own sha that day.
   A quiet run appends nothing.
-- ⚠️ **It is keyed by BRANCH, not by clone** — the filename comes from `git branch --show-current`.
-  The two are the same thing today only because each clone stays on its own long-lived branch
-  (CLAUDE.md § Clones). Check out a `release_*` branch in a worker and you get a second, separately
-  seeded CSV; run it on the hub and you seed `main.csv`, whose rows are the union everyone else's
-  exist to disaggregate. Not reachable in the normal flow, and left as-is rather than guessed at.
+- ⚠️ **The writer REFUSES to run against an uncommitted tool surface**, and the reason is a real
+  incident rather than a precaution. `/close-out` § 2 spawns an `opus-reviewer`; reviewers
+  mutation-test by editing the tree; § 6 then runs the writer unconditionally. On 2026-09-11 those
+  overlapped during this ledger's own close-out and it recorded **105 phantom rows** (+1 B on every
+  tool, "surface now 153065") into the committed CSV — silently wrong, and authoritative-looking,
+  which is the one thing the ledger must never be. Reverted by hand; the guard now makes it
+  impossible. A clean tree at that point is what the workflow already guarantees (CLAUDE.md: commit
+  before the gate), so it refuses only where the number would be a lie.
+- ⚠️ **INTEGRATION branches keep no ledger.** `ledgerSkipReason` refuses on `main` **and on
+  `release_*`** — a release branch is the HUB under another name (CLAUDE.md § Dev Workflow: the hub
+  cuts it and merges it back), so its rows would be the same union `main`'s would be, and the
+  never-delete rule would keep the file visible forever. An earlier version of this guard argued
+  `release_*` was a worker concern and left it open; that had the workflow backwards.
+  `MODOKI_LEDGER_CLONE` overrides both, so this is a default rather than a prohibition.
+- ⚠️ **It is keyed by BRANCH, not by clone directory** — the filename comes from
+  `git branch --show-current`, and the two coincide only because each clone stays on its own
+  long-lived branch (CLAUDE.md § Clones).
+- ⚠️ **The decision is a pure function with a test, not an `if` in the script**, and that is not
+  ceremony: the branch is unreachable from any clone that could exercise it (a worker cannot be on
+  `main`; its only lever *disables* the check), so a typo like `'Main'` would be invisible to
+  `verify`, to CI and to every worker, and would first execute on the hub — once — seeding the file
+  it exists to prevent.
 - ⚠️ **A row is not authorship.** It says *this tool measured N bytes on this clone on this date,
   having moved D since this clone last looked*. A worker merges `origin/main` before pushing, so an
   observed delta may be work that arrived from another clone entirely. `sha` is what turns an

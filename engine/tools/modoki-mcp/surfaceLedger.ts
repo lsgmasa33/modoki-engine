@@ -137,6 +137,59 @@ export function renderLedger(rows: readonly LedgerRow[], opts: { withHeader: boo
   return lines.length === 0 ? '' : `${lines.join('\n')}\n`;
 }
 
+/** Whether this branch keeps a ledger at all. `undefined` = write one; a string = skip, and the
+ *  string says why.
+ *
+ *  ⚠️ **INTEGRATION branches do not get a ledger.** `main` is where every worker branch is merged, so
+ *  its per-tool deltas are the UNION the five worker CSVs exist to disaggregate — a `main.csv` would
+ *  restate the sum `DEFINITION_BYTES` already reports, attributed to nobody, and grow a row on every
+ *  integration.
+ *
+ *  ⚠️ **`release_*` is the same case, and the first version of this guard got it backwards.** That
+ *  comment reasoned a `release_*` checkout would happen in a WORKER and stay honestly attributed.
+ *  It does not: CLAUDE.md § Dev Workflow is explicit that **the HUB cuts the release branch** and
+ *  merges it back at the end of `/release-version`. So `release_0_7_0` is the hub wearing a
+ *  different name, its rows would be the same union, and the never-delete rule keeps the file
+ *  visible forever.
+ *
+ *  ⚠️ Lives HERE, not in `gen-surface-ledger.ts`, and that is the point of the extraction: the
+ *  branch is unreachable from any clone that could exercise it (a worker cannot be on `main`, and
+ *  the only lever it has — `MODOKI_LEDGER_CLONE` — DISABLES the check), so a typo like `'Main'` or
+ *  `'origin/main'` would be invisible to `verify`, to CI and to every worker, and would first
+ *  execute on the hub, once, seeding the file it exists to prevent. As a pure function it gets a
+ *  test instead. Conventions §9, same reason as `renderCatalog()`. */
+export function ledgerSkipReason(
+  clone: string, env: { MODOKI_LEDGER_CLONE?: string } = {},
+): string | undefined {
+  if (env.MODOKI_LEDGER_CLONE) return undefined;  // explicit override always wins
+  if (clone === 'main') {
+    return 'main is the integration branch — its deltas are the union of the worker branches, '
+      + 'which the per-clone CSVs exist to separate';
+  }
+  if (/^release[_-]/.test(clone)) {
+    return `${clone} is a release branch, which the HUB cuts and merges back — its deltas are the `
+      + 'same union as main\'s';
+  }
+  return undefined;
+}
+
+/** Exactly the text to append to a ledger whose current contents are `existing`.
+ *
+ *  ⚠️ Heals a missing trailing newline instead of trusting that we wrote the file last.
+ *  `renderLedger` always ends in one, so only a hand-edit or a truncated write can leave the last
+ *  line bare — but appending onto a bare line CONCATENATES the two rows into one 13-field line,
+ *  destroying the EARLIER row as well as the new one, and `parseLedger` then throws on every later
+ *  run until somebody repairs the file by hand. Loud, but not local, and not recoverable from the
+ *  ledger itself.
+ *
+ *  Lives here rather than in `gen-surface-ledger.ts` for the usual reason (conventions §9): the
+ *  script is a thin shell with no tests, so logic put there is logic nothing can drive. */
+export function appendChunk(existing: string, rows: readonly LedgerRow[]): string {
+  const body = renderLedger(rows, { withHeader: false });
+  if (body.length === 0) return '';
+  return existing.length > 0 && !existing.endsWith('\n') ? `\n${body}` : body;
+}
+
 /** ⚠️ Rejects anything that would need CSV quoting rather than quoting it. Every field here is a
  *  tool name, a branch name, a date or a sha — none can legally contain a comma or a newline, so a
  *  value that does means the caller is wrong, and writing it would corrupt every later parse. */
@@ -147,10 +200,15 @@ export function assertCsvSafe(row: LedgerRow): void {
     }
     // ⚠️ The numeric half matters as much as the quoting half: `NaN` and `Infinity` stringify into
     // seven perfectly well-formed fields, so nothing downstream rejects them and the row is
-    // committed. This is the second gate on the same defect `parseLedger` now catches on the way
-    // in — a bad number must not be able to enter the file from EITHER direction.
-    if (typeof value === 'number' && !Number.isFinite(value)) {
-      throw new Error(`ledger field ${key} is not a finite number: ${String(value)}`);
+    // committed. A bad number must not be able to enter the file from EITHER direction.
+    //
+    // ⚠️ INTEGER, not merely finite, so the two directions agree. `parseLedger` requires
+    // `/^-?\d+$/` on the way in; a `Number.isFinite` check here would happily WRITE `1.5`, which
+    // that reader then rejects — a file this module produced and cannot read back, failing on
+    // every later run. Unreachable today (all three values are sums or differences of
+    // `String.length`), and pinned anyway, because the asymmetry is invisible until it fires.
+    if (typeof value === 'number' && !Number.isInteger(value)) {
+      throw new Error(`ledger field ${key} is not an integer: ${String(value)}`);
     }
   }
 }

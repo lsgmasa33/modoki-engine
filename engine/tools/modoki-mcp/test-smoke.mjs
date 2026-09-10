@@ -811,13 +811,35 @@ if (!kinds.kinds.some((k) => k.kind === 'material' && k.agentCreatable === true)
 // …and the refusal really refuses, against the LIVE editor rather than a fixture. A `scene` create
 // here would throw away whatever the human has open, so this asserts the guard exists rather than
 // exercising what it prevents.
+// ⚠️ Two changes here, and the SECOND one is what actually makes this immune. Both exist because
+// this compare false-failed on a cold editor (measured 2026-09-11, running the mandated live gate
+// right after `launch-editor.sh`), with a message accusing the refusal guard of failing when that
+// guard had demonstrably just worked — the REFUSED_BY_OP assertion above it passed.
+//
+// ⚠️ NOT "the editor settles". Nothing normalizes this in the background: `scenePath` is the module
+// global `_currentScenePath`, written ONLY by `setCurrentScenePath` (`editor/scene/serialize.ts`),
+// reached from `loadScene`, `newScene` and save-as. A cold launch leaves it as the dev-server
+// `/@fs/<abs>/…/scenes/x.scene.json` form, and what rewrites it to `/assets/scenes/x.scene.json`
+// is **UC8's own restore above**, which loads through `pre.scenePathRef` — the asset-root spelling.
+// So the old `pre.scenePath` compare straddled a load THIS SUITE performed, and (a detail worth
+// keeping) it could only fire when UC8 actually RAN: on a dirty editor UC8 skips and the stale
+// compare never fired, which is why this looked intermittent.
+//
+// 1. Capture immediately around the operation under test, not ~500 lines and dozens of calls back.
+// 2. Compare `scenePathRef`, the normalized form every other case in this file already uses — that
+//    is immune to the spelling no matter how wide the window, where the bracket alone only makes a
+//    flip unlikely. It still fires on the real failure: a scene created at
+//    `/assets/scenes/mcp-smoke-NEVER.json` yields a DIFFERENT ref.
+const beforeRefusal = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
 const refused = text(await client.callTool({ name: 'modoki_create_registered_asset', arguments: { kind: 'scene', path: '/assets/scenes/mcp-smoke-NEVER.json' } }));
 if (!/REFUSED_BY_OP/.test(refused) || !/modoki_new_scene/.test(refused)) {
   throw new Error(`UC13 a scene create must be refused and point at modoki_new_scene, got: ${refused.slice(0, 400)}`);
 }
 const stillThere = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
-if (stillThere.scenePath !== pre.scenePath) {
-  throw new Error(`UC13 the refused scene create CHANGED the open scene (${pre.scenePath} -> ${stillThere.scenePath}) — the refusal did not happen before the override ran`);
+const sceneBefore = beforeRefusal.scenePathRef ?? beforeRefusal.scenePath;
+const sceneAfter = stillThere.scenePathRef ?? stillThere.scenePath;
+if (sceneAfter !== sceneBefore) {
+  throw new Error(`UC13 the refused scene create CHANGED the open scene (${sceneBefore} -> ${sceneAfter}) — the refusal did not happen before the override ran`);
 }
 await withCleanup(async () => {
   const made = JSON.parse(text(await client.callTool({
@@ -1640,8 +1662,10 @@ if (canUC3) {
     // make. Skipping is the honest outcome, and it says which half went unrun.
     skipped.push('UC14b (disclosure FIRES) — the editor already has unsaved work; refusing to add probe dirt on top of it, because the restore discards');
   } else {
-    // ⚠️ `scenePathRef`, not `scenePath` — same value today, but `scenePath` is documented as the
-    //    `/@fs/<abs>` form the edit routes reject, and every other case in this file uses the ref.
+    // ⚠️ `scenePathRef`, not `scenePath` — and NOT "same value today", which this comment used to
+    //    claim: measured 2026-09-11, on a cold editor the two genuinely differ (`scenePath` is the
+    //    `/@fs/<abs>` form the edit routes reject until some load rewrites it). That difference
+    //    false-failed UC13 before it was switched to the ref as well.
     const uc14bScene = uc14bState.scenePathRef ?? uc14bState.scenePath;
     if (!uc14bScene) {
       // ⚠️ NO SCENE OPEN. Without this the mutate below silently no-ops (a NOT_FOUND ToolResult,

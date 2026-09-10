@@ -17,7 +17,14 @@
  * only the backend (/api) is main-hosted. Opening a project re-roots that server.
  */
 
-import { app, BrowserWindow, ipcMain, shell, dialog, nativeImage, Menu, session } from 'electron';
+// ⚠️⚠️ **FIRST IMPORT, AND THE POSITION IS THE MECHANISM** (#1043). Imports are hoisted and
+// evaluated in source order, so everything below this line — including the forty imports at the
+// bottom of this block and `require("electron")` itself — evaluates AFTER it. That is the only way
+// to have a crash handler installed during the window where `initFileLog()` has not run yet, in
+// which a throw used to produce no stdout and no main.log at all (it is how #1035 presented).
+// Moving this line down silently re-opens that window; `crashSinkOrder.test.ts` fails if you do.
+import './crashSink';
+import { app, BrowserWindow, ipcMain, shell, nativeImage, Menu, session } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -216,7 +223,7 @@ function editorStateDir(): string { return profileBaseDir ?? app.getPath('userDa
  *  which refuses the splash because it needs the user's ANSWER and a splash destroyed at
  *  renderer-mount takes an open sheet down unanswered — see docs/build.md § #1034. */
 function firstLiveWindow(): BrowserWindow | null {
-  return BrowserWindow.getAllWindows().find((w) => !w.isDestroyed()) ?? null;
+  return resolveDialogParent('anyWindow');
 }
 
 // Adopt a pre-existing toolchain instead of re-fetching ~1.2GB. Pinning the toolchain dir
@@ -248,6 +255,7 @@ import { captureViewport, CaptureUnavailableError, captureRefusalBody, tap, drag
 import type { RenderSurfaceFacts } from './rendererOps';
 import { createInputRoutes, inputDeliverability, hiddenWindowRefusal } from './inputRoutes';
 import { reportFatalStartup } from './fatalDialog';
+import { showMessageBox, resolveDialogParent } from './mainDialog';
 import { serializeMenu, triggerMenuItem, type MenuItemLike } from './menuActions';
 import { getSsrLoadModule, closeSsrLoader } from './ssrLoader';
 import { buildProdCsp, PROD_CSP_ORIGINS } from './csp';
@@ -658,7 +666,7 @@ async function resolveInitialProject(): Promise<string | null> {
     const kind = projectFolderKind(dir);
     if (kind === 'project') return dir;
     if (kind === 'occupied') {
-      await dialog.showMessageBox({
+      await showMessageBox({
         type: 'error',
         title: 'New Project',
         message: 'That folder can’t be used for a new project.',
@@ -674,7 +682,7 @@ async function resolveInitialProject(): Promise<string | null> {
     } catch (e) {
       const detail = e instanceof Error ? e.message : String(e);
       console.error('[modoki-electron] first-run scaffold failed:', detail);
-      await dialog.showMessageBox({
+      await showMessageBox({
         type: 'error', title: 'New Project', message: 'Could not create the project.',
         detail, buttons: ['Choose Again'],
       });
@@ -1192,7 +1200,7 @@ async function healConnectedMcp(): Promise<void> {
       detail: `${r.mcpPath} now matches this editor${portChanged ? ` (port ${r.newPort})` : ''}.\n\nIf you have “claude” running in ${claudeDir}, quit and restart it so it picks up the change.`,
       buttons: ['OK'],
     };
-    void (mainWindow ? dialog.showMessageBox(mainWindow, box) : dialog.showMessageBox(box));
+    void showMessageBox(box, mainWindow);
   } catch (e) {
     // Best-effort: a heal failure must never block opening a project.
     console.warn('[modoki-electron] .mcp.json heal failed:', e instanceof Error ? e.message : e);
@@ -1233,7 +1241,7 @@ async function setProject(newRoot: string, opts?: { openSettingsAfter?: boolean 
         detail: `${detail}\n\nThe editor may be in an inconsistent state — relaunch:\n  scripts/launch-editor.sh "${newRoot}"`,
         buttons: ['OK'],
       };
-      if (mainWindow) await dialog.showMessageBox(mainWindow, opts); else await dialog.showMessageBox(opts);
+      await showMessageBox(opts, mainWindow);
       return;
     }
   }
@@ -1273,7 +1281,7 @@ function rebuildMenu(): void {
         const detail = e instanceof Error ? e.message : String(e);
         console.error('[modoki-electron] new project failed:', detail);
         const errOpts = { type: 'error' as const, title: 'New Project failed', message: 'Could not create the project.', detail, buttons: ['OK'] };
-        if (mainWindow) await dialog.showMessageBox(mainWindow, errOpts); else await dialog.showMessageBox(errOpts);
+        await showMessageBox(errOpts, mainWindow);
         return;
       }
       // Open it, then show Project Settings so the user can fill in identity/build info.
@@ -1794,7 +1802,7 @@ app.whenReady().then(async () => {
       { title: 'Modoki Editor', message: msg },
       {
         parentWindow: firstLiveWindow,
-        showMessageBox: (parent, o) => dialog.showMessageBox(parent as BrowserWindow, o),
+        showMessageBox: (parent, o) => showMessageBox(o, parent as BrowserWindow),
         terminate: () => app.exit(1),
       },
     );
@@ -2157,7 +2165,7 @@ app.whenReady().then(async () => {
         },
         {
           parentWindow: firstLiveWindow,
-          showMessageBox: (parent, o) => dialog.showMessageBox(parent as BrowserWindow, o),
+          showMessageBox: (parent, o) => showMessageBox(o, parent as BrowserWindow),
           terminate: () => {
             closeSplash();
             quitExitCode = 1; // a failed launch must not exit 0 — see quitExitCode (#68)
@@ -2200,7 +2208,7 @@ app.whenReady().then(async () => {
     },
     {
       parentWindow: firstLiveWindow,
-      showMessageBox: (parent, o) => dialog.showMessageBox(parent as BrowserWindow, o),
+      showMessageBox: (parent, o) => showMessageBox(o, parent as BrowserWindow),
       terminate: () => app.exit(1),
     },
   );

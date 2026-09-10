@@ -136,6 +136,29 @@ describe('fileLog: process warnings are [warn], not [error] (#955)', () => {
     expect(body).not.toMatch(/\[error\].*DEP9999/);
   });
 
+  /** #1043's signpost must reach the LOG FILE, not just stdout.
+   *
+   *  ⚠️ This is the whole point of the line, and an earlier version got it exactly backwards. It
+   *  used `orig.log` — the console method captured BEFORE the tee is installed — which writes to
+   *  stdout only. A Finder-launched `.app` and any Windows GUI launch have no terminal, which is
+   *  the entire premise of #1043; a signpost that exists only on a stream nobody can read points
+   *  at the early-crash file for precisely nobody. The fix was green when deleted until this case
+   *  existed, because nothing else reads for it. */
+  it('names the early-crash file INSIDE main.log, not only on stdout (#1043)', async () => {
+    const { initFileLog } = await import('../../electron/fileLog');
+    const { earlyCrashLogPath } = await import('../../electron/crashSink');
+    const logPath = initFileLog();
+    expect(logPath).not.toBe('');
+
+    // The tee's write is async — poll for it, exactly as the warning cases do.
+    const body = await pollUntilLongerThan(logPath, 0);
+    expect(body, 'the #1043 signpost is missing from main.log entirely').toContain('#1043');
+    expect(
+      body,
+      'main.log must name the actual early-crash path — a reader holding one file finds the other',
+    ).toContain(earlyCrashLogPath);
+  });
+
   it('adopts the event: Node own onWarning is GONE and exactly one listener remains', async () => {
     const { initFileLog } = await import('../../electron/fileLog');
     initFileLog();
