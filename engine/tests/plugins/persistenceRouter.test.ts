@@ -147,6 +147,49 @@ describe('Phase 1: file-direct routes report `saved` (additive, no behaviour cha
     expect(r.body.saved).toBe(false);
   });
 
+  /** ⚠️ **A relay rejection that does not PROVE the renderer is gone must not skip the
+   *  unsaved-work probe** (#1013 close-out F1). This branch was covered by nothing — `grep "did not
+   *  answer the state probe" engine/tests` returned zero — which is how adding `unknown agent op`
+   *  to `isRelayTransportFailure` turned a 503 into a file write with both gates off, on a green
+   *  gate.
+   *
+   *  `unknown agent op` means the editor OPS are unregistered. It does not mean the WINDOW is gone,
+   *  and the window is what holds unsaved work. Two ways to reach it in production: the relay is a
+   *  broadcast and first-reply-wins, so a second tab on the runtime route answers instantly and
+   *  beats the editor tab; and the launch race, or a bridge connected from a game page rather than
+   *  `#/editor`. (An earlier version of this comment also blamed a game-code boot fault — refuted:
+   *  `gameBootFaults.ts` is what FIXED that, and `registerEditorAgentOps()` is now unconditionally
+   *  reached via `runGameHook`.) */
+  it('scene-mutate REFUSES when the state probe fails in a way that does not prove no renderer', async () => {
+    const scenePath = tempScene();
+    const before = fs.readFileSync(scenePath, 'utf8');
+    const ctx = makeCtx({
+      requestBrowser: vi.fn(async () => { throw new Error("unknown agent op 'editor-state'"); }),
+    });
+    const r = (await post('/api/scene-mutate', {
+      path: scenePath, ops: [{ op: 'setTrait', entity: { id: 1 }, trait: 'Transform', fields: { x: 9 } }],
+    }, ctx)) as { status?: number; body: { ok?: boolean; code?: string; changed?: number } };
+
+    expect(r.status, 'a refusal, not a write').toBe(503);
+    expect(r.body.code).toBe('NO_RENDERER');
+    // ⚠️ The assertion that actually matters: the FILE. A wrong status is a nuisance; a rewritten
+    // scene is the unsaved work gone from the world, the file and the undo stack.
+    expect(fs.readFileSync(scenePath, 'utf8'), 'the scene file is untouched').toBe(before);
+  });
+
+  it('...but a relay failure that DOES prove no renderer still writes — the accept side', async () => {
+    // The direction the fix must not break: a genuinely absent renderer is a normal state, and a
+    // mutate against it is a legitimate file-direct write with the guards honestly skipped.
+    const scenePath = tempScene();
+    const ctx = makeCtx({
+      requestBrowser: vi.fn(async () => { throw new Error('no renderer connected to the dev server'); }),
+    });
+    const r = (await post('/api/scene-mutate', {
+      path: scenePath, ops: [{ op: 'setTrait', entity: { id: 1 }, trait: 'Transform', fields: { x: 9 } }],
+    }, ctx)) as { status?: number; body: { ok?: boolean; changed?: number } };
+    expect(r.body.changed, 'an absent renderer does not block the write').toBe(1);
+  });
+
   it('asset-write: saved:true on a successful write', async () => {
     const assetPath = path.join(TMP, `asset-${seq++}.particle.json`);
     const r = (await post('/api/asset-write', {

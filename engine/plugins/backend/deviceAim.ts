@@ -121,10 +121,21 @@ export function aimAsResolved(label: string): string {
  *  Only `tap` is click-shaped, so `drag`/`hover`/`scroll` were unaffected by the gap: their
  *  intended gesture and the absent default agree. `tap` was the whole hole.
  *
- *  ⚠️ The default is `'tap'` HERE and `undefined` at the renderer, and that is not a contradiction:
- *  a route that forgets to name its gesture is a bug this file's callers can be read for, while an
- *  aim arriving at the renderer with no gesture is an unknown caller and must get the strict
- *  answer. Different questions, different safe answers. */
+ *  ⚠️ **No default — and an earlier version of this banner argued for one.** It said a route
+ *  forgetting its gesture "is a bug this file's callers can be read for", which is true and is not
+ *  a reason: the default it justified was `'tap'`, the PERMISSIVE value, sitting on the TRUSTED
+ *  surface — the one that drives a real phone, where a false success is most expensive. A
+ *  `device_dnd` or `device_long_press` added to `tryDeviceCdpInput` later would inherit
+ *  click-shaped semantics by omission, which is the exact back door `75ba25601` was reverted for.
+ *  It also contradicted the rule this change states twice elsewhere (`isClickShaped`'s banner,
+ *  `docs/enact.md`): required parameter, no default.
+ *
+ *  Every call site passes one explicitly — five route branches in `deviceCdp.ts` and three in
+ *  `deviceWda.ts` — so the parameter costs nothing and the compiler asks the next one. ⚠️ Counted,
+ *  not estimated: an earlier draft said "four callers", which is `tryDeviceCdpInput`'s branches
+ *  alone and silently omits the WDA surface — the one the paragraph above singles out as where this
+ *  matters (the iPad mini / iPhone Air). A reader auditing "did every caller get updated?" against
+ *  "four" stops after the CDP file. */
 export async function resolveAimViaDevice(
   deps: AimProxyDeps,
   params: Record<string, unknown>,
@@ -132,7 +143,7 @@ export async function resolveAimViaDevice(
   xKey: string,
   yKey: string,
   center = false,
-  gesture: AimGesture = 'tap',
+  gesture: AimGesture,
 ): Promise<AimOutcome> {
   const raw = await deps.proxy('resolve-aim', {
     ...params, selKey, xKey, yKey, gesture, ...(center ? { center: true } : {}),

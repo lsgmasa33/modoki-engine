@@ -866,8 +866,13 @@ export type UnsavedOutcome =
  *  timeout, and "the renderer did not answer" is not "nothing is held" (§5: *could not look is
  *  never reported as nothing is there*). `docs/mcp-tool-conventions.md` §8 settles the policy and
  *  says so in as many words: *"the renderer did not answer" must be a refusal, not a proceed.*
- *  The classifier is `isRelayTransportFailure` + `isRelayTimeout` — the SAME pair
- *  `applyMovesInRenderer` uses, deliberately not a second copy.
+ *  The classifier is **`relayProvesNoRenderer`** — the guard question, not the status one.
+ *  ⚠️ This sentence used to read *"`isRelayTransportFailure` + `isRelayTimeout` — the SAME pair
+ *  `applyMovesInRenderer` uses"*, and that framing is what caused a data-loss regression at
+ *  `/api/scene-mutate`: the probe there copied the PAIR, while this function was the pair PLUS an
+ *  `unknown agent op` guard, so the day that string joined `isRelayTransportFailure` the probe
+ *  started answering "absent" and writing the file. `applyMovesInRenderer` is deliberately NOT the
+ *  same recipe — see `relayProvesNoRenderer`'s banner. Do not re-consolidate them.
  *
  *  ⚠️ **`unknown agent op` is `unknown`, NOT `absent`** (#872 review, kept verbatim in force). The
  *  transport is a BROADCAST — `ws.send` reaches every HMR client and the request registry is
@@ -937,8 +942,7 @@ async function unsavedGate(
     return { kind: 'held', holds, discarded: decodeHolds(r?.discarded) };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    if (/unknown agent op/i.test(msg)) return { kind: 'unknown', reason: msg };
-    if (isRelayTransportFailure(msg) && !isRelayTimeout(msg)) return { kind: 'absent' };
+    if (relayProvesNoRenderer(msg)) return { kind: 'absent' };
     return { kind: 'unknown', reason: msg };
   }
 }
@@ -2382,7 +2386,11 @@ async function describeUnresolvedAgainstLiveWorld(
        *  as a 503 telling it to retry. The thing it buys is that the same write no longer
        *  hot-reloads the scene out from under unsaved live work it could not see.
        *
-       *  ⚠️ Same classifier pair as `unsavedGate`, deliberately not a second copy. */
+       *  ⚠️ Same question as `unsavedGate`, asked through the same `relayProvesNoRenderer` — not a
+       *  second copy of the recipe. This said "same classifier PAIR" and copied only the pair,
+       *  while `unsavedGate` was the pair plus an `unknown agent op` guard; the day that string
+       *  joined `isRelayTransportFailure` this probe started answering "absent" and writing the
+       *  file. See that helper's banner. */
       let probeOutcome: 'answered' | 'absent' | 'unknown' = 'answered';
       let probeReason = '';
       // 8s, not 2s (independent review, 2026-07-30). `requestBrowser` REJECTS on timeout, and this
@@ -2399,8 +2407,7 @@ async function describeUnresolvedAgainstLiveWorld(
       try { st = (await ctx.requestBrowser('editor-state', {}, 8000)) as EditorStateProbe; }
       catch (e) {
         probeReason = e instanceof Error ? e.message : String(e);
-        probeOutcome = isRelayTransportFailure(probeReason) && !isRelayTimeout(probeReason)
-          ? 'absent' : 'unknown';
+        probeOutcome = relayProvesNoRenderer(probeReason) ? 'absent' : 'unknown';
       }
       // ── §8: a renderer that MAY be attached and did not answer is a refusal. ──
       // Placed here rather than beside the old warning further down because the write must not
@@ -5130,6 +5137,55 @@ async function relayJson(
   }
 }
 
+/** **Does this relay rejection PROVE there is no renderer holding state we must respect?**
+ *
+ *  ⚠️ **Fail-closed by construction, because the two questions that look alike have OPPOSITE safe
+ *  answers** (#1013 close-out F1 — a data-loss regression this file's own shape invited).
+ *  `isRelayTransportFailure` answers "did the transport fail", which is the right question for a
+ *  STATUS (`relayFailureStatus`) and the wrong one for a GUARD. A guard needs "can I prove nothing
+ *  is at risk", and `unknown agent op` is exactly the case where those diverge: the editor ops are
+ *  absent, but the WINDOW may be very much alive and holding unsaved work.
+ *
+ *  The scar: #1013 added `unknown agent op` to `isRelayTransportFailure` — correct for the routes
+ *  it was fixing, where an absent op really is "could not look". `unsavedGate` and
+ *  `applyMovesInRenderer` were immune because each already tested that string explicitly first.
+ *  `/api/scene-mutate`'s state probe was not, and its comment said it used "the same classifier
+ *  pair as `unsavedGate`, deliberately not a second copy" — but `unsavedGate` is the pair PLUS a
+ *  guard, so it had copied the half that could not stand alone. Measured on the broken tree: a
+ *  mutate that answered **503 NO_RENDERER, file untouched** became **200 `ok:true, changed:1` with
+ *  the file rewritten**, skipping the unsaved-work probe entirely and hot-reloading the scene out
+ *  from under live edits. Reachable two ways: the relay is a BROADCAST and first-reply-wins, so a
+ *  second tab on the runtime route answers `unknown agent op` instantly and beats the editor tab;
+ *  and the launch race / a bridge connected from a game page rather than `#/editor`, which
+ *  `relayFailureStatus`'s own comment already names.
+ *
+ *  ⚠️ An earlier version of this banner also claimed *"a game-code boot fault means
+ *  `registerEditorAgentOps()` never runs"*. **That is refuted by the tree** — `gameBootFaults.ts`
+ *  is the module that FIXED it, and every game hook now goes through `runGameHook`
+ *  (`editor/setup.ts`), which catches, records the fault and returns, so step 5's
+ *  `registerEditorAgentOps()` is unconditionally reached; an import-time throw falls back to
+ *  `virtual:modoki-games`. Corrected rather than deleted because it would have sent anyone
+ *  debugging a live `unknown agent op` to read a module that cannot produce one.
+ *
+ *  ⚠️ `applyMovesInRenderer` deliberately does NOT use this and must not be "made consistent": it
+ *  is a REPAIR path, so a build that genuinely never registered the editor ops has nothing in
+ *  memory to repair and `absent` is its safe answer. Same string, opposite correct outcome — which
+ *  is the whole reason this is a named question rather than a shared predicate.
+ *
+ *  ⚠️ **That is the honest scope of the blessing, and it is narrower than it first read.**
+ *  `apply-asset-path-moves` is itself registered inside `registerEditorAgentOps`, so under the
+ *  broadcast race above `unknown agent op` does NOT prove the editor tab lacks it — a live editor
+ *  can be holding bindings and a parked write on the old path while a runtime tab answers first,
+ *  and that repair is skipped SILENTLY (no warn, no `repairFailed`). Pre-dates this change and is
+ *  pinned by `moveFileRouter.test.ts` asserting the silence, so it is not repaired here — filed as
+ *  **#1030**. Do not read this paragraph as certifying that site against the race. */
+function relayProvesNoRenderer(msg: string): boolean {
+  // The ops being unregistered says nothing about whether a window is up holding state.
+  if (/unknown agent op/i.test(msg)) return false;
+  // ⚠️ A TIMEOUT is not "no renderer" — a busy renderer misses the window and IS attached.
+  return isRelayTransportFailure(msg) && !isRelayTimeout(msg);
+}
+
 /** Which status a thrown relay error deserves.
  *
  *  Everything used to be a **504**, which reads as "the editor hung" — so a DELIBERATE, correct
@@ -5157,6 +5213,12 @@ function relayFailureStatus(e: unknown): number {
   // fix, in the opposite direction. (`'editor window closed'` was already covered by `window
   // closed`.) A teardown is retryable once the renderer is back; a refusal is not, so telling the
   // two apart changes what the agent does next.
+  // ⚠️ **`project changed` was REMOVED as a bare alternative** — subject-less, exactly what the
+  // `destroyed` scar below says must never recur, and strictly redundant: its only producer
+  // (`electron/main.ts`) sends `'project changed — renderer reloading'`, which the
+  // `renderer reloading` alternative already matches. Left in place it would have let any op
+  // refusal whose prose contains "project changed" make `relayProvesNoRenderer` return true, and
+  // that hard-codes `mutateUnsaved = absent` and writes the scene file.
   // ⚠️ **`unknown agent op` is here because the op being ABSENT is "could not look", not "it said
   // no"** (#1013 close-out F5). `runAgentOp` throws it when the bridge is connected from a game
   // page rather than `#/editor`, or in the window before `registerEditorAgentOps()` has run — so
@@ -5197,7 +5259,7 @@ function relayFailureStatus(e: unknown): number {
  *  editor surface. This list has now been found incomplete three times by review; a copy of it is
  *  the wrong shape of thing to own. Read the history above before touching the pattern. */
 export function isRelayTransportFailure(msg: string): boolean {
-  return /no (editor )?renderer|unknown agent op|timed out waiting for the (renderer|browser)|renderer went away|renderer reloading|project changed|window (is )?closed|object has been destroyed|\b(renderer|window|webcontents|view)\b (has been |was |is )?destroyed|websocket not ready/i.test(msg);
+  return /no (editor )?renderer|unknown agent op|timed out waiting for the (renderer|browser)|renderer went away|renderer reloading|window (is )?closed|object has been destroyed|\b(renderer|window|webcontents|view)\b (has been |was |is )?destroyed|websocket not ready/i.test(msg);
 }
 
 /** Was the relay failure specifically a TIMEOUT — the renderer never answered in the window?

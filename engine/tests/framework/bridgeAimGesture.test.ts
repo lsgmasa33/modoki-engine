@@ -76,10 +76,17 @@ describe('#1016 — bridge.ts sends the gesture with every selector aim', () => 
     expect(gestureFor()).toEqual([undefined]);
   });
 
-  /** ⚠️ **`button` narrows the tap.** Chromium fires `click` for the primary button only — a right
-   *  press produces `contextmenu`, which `pressOrigin.ts` does not listen for — so the runtime does
-   *  NOT redirect it. Modelling the redirect for a right-click reports `occluded:false` for a press
-   *  that then lands on the zone: the same false success, one parameter further in. */
+  /** ⚠️ **`button` narrows the tap** — Chromium fires `click` for the primary button only (right ->
+   *  `contextmenu`, which `pressOrigin.ts` does not listen for), so the runtime does not redirect
+   *  it, and modelling the redirect would report `occluded:false` for a press that lands on the
+   *  zone.
+   *
+   *  ⚠️ **On THIS surface the carve-out is unreachable, and these rows drive an input production
+   *  cannot produce.** `device_tap`'s schema is `{selector, x, y}` (`mcp-tools.ts`) and
+   *  `dispatchTapAt`'s `mouseInit` hardcodes `button: 0`, so a device tap is always primary. The
+   *  live rule is pinned in `inputRoutes.test.ts`, where `/api/input/tap` really does take
+   *  `z.enum(['left','right','middle'])`. Kept here as the unreachable twin so the day someone adds
+   *  `button` to `device_tap` the behaviour is already stated — not as evidence of a live path. */
   it.each([
     ['right', 'press'],
     ['middle', 'press'],

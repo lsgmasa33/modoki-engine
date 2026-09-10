@@ -1,4 +1,3 @@
-import type { AimGesture } from './domPointContract';
 /** The wire contract for `resolve-entity-point`, shared by the renderer that produces it
  *  (`entityResolve.ts`) and the Electron main process that consumes it (`inputRoutes.ts`).
  *
@@ -16,6 +15,8 @@ import type { AimGesture } from './domPointContract';
  *  fetched in one round-trip and clicked in the next are aiming at where the entity WAS. This
  *  contract closes it — `{guid}`/`{name}` resolves to the entity's live screen rect INSIDE the
  *  same call that dispatches the click. See `docs/enact.md`. */
+
+import type { AimGesture } from './domPointContract';
 
 // Type-only, and DOM-free like the rest of this file — `mcpResult.ts` is dependency-free
 // (`docs/mcp-tool-conventions.md` §9), so pulling just the `ErrorCode` union in does not

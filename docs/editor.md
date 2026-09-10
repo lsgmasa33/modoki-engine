@@ -1337,6 +1337,37 @@ Not persisted to localStorage, unlike `sceneViewMode`: this reset to `Free` on e
 moved to the store, and a custom resolution silently restored days later is a measurement taken at a
 size nobody chose.
 
+### ⚠️ The preview is ~0.4% NARROWER than the preset it names — so it confirms a mechanism, never a sub-1% margin
+
+**Measured 2026-09-10** (Court, #969's close-out), driving the editor at the `Galaxy S22` preset:
+the Game panel's host box computed **358.468 x 778.472** for a preset that reports **360 x 780**.
+That is **0.43% short on width** and 0.20% on height. The engine resolves viewport units against
+that host box — it does not use CSS `vmin`/`vh`, it computes them and writes px — so **every
+`vmin`/`vw`/`vh`-authored length in the preview is short by the same fraction.**
+
+**The rule that follows, and it applies to every project, not just the one that found it:**
+
+> An editor pass can confirm a **mechanism** — that a tap zone renders, that a row wraps where you
+> think, that a value is read rather than ignored. It cannot confirm a **margin thinner than ~0.5%**,
+> because the instrument's own error is that size. A measurement inside its own error bar is not
+> evidence, however precise the number looks.
+
+What this cost when it was not written down: #969 shipped two tap-target fixes whose margins were
+0.24dp and 0.23pt — both well inside this error — and an editor pass would have appeared to confirm
+or refute them at random. The margins were settled by arithmetic on the AUTHORED values instead, and
+the live pass was used only for what it can actually decide: the pad renders, and three markers fit
+per row. A margin that genuinely needs settling needs a real device (#973's `elementsFromPoint`
+probe on hardware), not this panel.
+
+⚠️ **The CAUSE is not diagnosed** — plausibly the host's fractional-zoom rounding (the editor window
+runs a non-integer `zoomFactor`, and authored `px` lengths do come back divided by it), but that was
+not confirmed, so do not repeat it as fact. The *size* of the discrepancy is measured; the *reason*
+is open. If it is ever fixed, this rule relaxes rather than disappearing — re-measure before
+trusting a tighter bound.
+
+The measurement's own home, with the full numbers and the layout they were taken against, is
+`games/court/tests/tapZoneClearance.test.ts`.
+
 ---
 
 ## Play / Stop / Pause

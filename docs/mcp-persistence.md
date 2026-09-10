@@ -614,9 +614,14 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
     park is filed under the canonical form, so the check missed and the write destroyed the park it
     had just looked for.
   - ⚠️ **The gate must not fail OPEN, and that is the hard part.** `requestBrowser` rejects on a
-    timeout, and *"the renderer did not answer"* is not *"there is no park"* (§5). It reuses
-    `applyMovesInRenderer`'s classifier rather than a second copy — `isRelayTransportFailure` minus
-    `isRelayTimeout`. A definitively-absent renderer PROCEEDS (a park is renderer-only state, so
+    timeout, and *"the renderer did not answer"* is not *"there is no park"* (§5). It asks
+    **`relayProvesNoRenderer`** — the GUARD question ("can I prove nothing is at risk"), which is
+    `isRelayTransportFailure` minus `isRelayTimeout` **plus an `unknown agent op` guard**.
+    ⚠️ This used to say it "reuses `applyMovesInRenderer`'s classifier rather than a second copy",
+    and that consolidation is exactly what must not happen: `applyMovesInRenderer` is a REPAIR path
+    where an absent op means nothing to repair, so `absent` is ITS safe answer and the opposite of
+    a guard's. Copying only the pair is what let `/api/scene-mutate` skip its unsaved-work probe and
+    rewrite a scene file over live edits. A definitively-absent renderer PROCEEDS (a park is renderer-only state, so
     with no renderer there is none) and says `editorConnected:false`; a **silent** one REFUSES with
     `NO_RENDERER`. Reading a timeout as "clear" would be #872 rebuilt inside its own fix, and every
     test that stubs a working renderer passes either way.
@@ -1095,8 +1100,12 @@ why `editorActionRouter.test.ts` now carries one per registry rather than one pe
 `probeFailed` boolean and wrote the file anyway. Its rationale was honest: a genuinely headless edit
 is this route's normal case, and refusing would break it. It rested on the premise that the two
 failures were *"genuinely indistinguishable here"* — which stopped being true when phase 1 landed
-`isRelayTransportFailure` + `isRelayTimeout`. A transport failure that is **not** a timeout means no
-renderer exists; anything else means one may be attached and did not answer. So the route refuses
+`isRelayTransportFailure` + `isRelayTimeout`. ⚠️ **That pair alone is not the rule, and stating it
+as one caused a data-loss regression** — `unknown agent op` is a transport-classified failure that
+does NOT mean no renderer exists (the ops are unregistered; the window may be up holding unsaved
+work). The rule is `relayProvesNoRenderer`: a non-timeout transport failure that is not
+`unknown agent op` means no renderer exists; anything else means one may be attached and did not
+answer. So the route refuses
 503 on the second and proceeds on the first, and the headless path now says *why* it skipped the
 guards instead of implying they passed.
 
