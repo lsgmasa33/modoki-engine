@@ -168,6 +168,27 @@ public class AppsFlyerPlugin: CAPPlugin, CAPBridgedPlugin, AppsFlyerLibDelegate 
         // main is where the registration was always meant to happen.
         DispatchQueue.main.async {
             AppsFlyerLib.shared().registerSessionReadyListener {
+                // ── #721: the ONE observation that tells the two hypotheses apart ──
+                //
+                // `start()` does not call the SDK's `start()` directly — it registers this listener,
+                // whose BODY does. So #654's decisive result ("a second start() produces no SDK log
+                // line and no server row") is predicted equally by "the SDK ignores a second start"
+                // and by "our second listener never fires", and #654's instrument could not
+                // separate them. This line can: if it prints, the body ran.
+                //
+                // ⚠️ It does NOT need the guard-disabled second-start arm to be useful. On an
+                // ORDINARY cold boot it already answers half the question — if this prints, the
+                // listener mechanism works when a foreground transition exists, which is exactly
+                // what a mid-session re-registration lacks (the Android port's `hasStarted` comment
+                // records that AppsFlyer's readiness evaluation follows `onBecameForeground`), and
+                // hypothesis (2) is where the evidence points. If it NEVER prints, this plugin
+                // calls `AppsFlyerLib.start()` on no path at all, which is a bigger finding than
+                // #721 anticipates and wants its own issue.
+                //
+                // Same message text as the Android port so one grep covers both. `NSLog` rather
+                // than `print` because this must survive into the device log that
+                // `device_native_logs` reads; the plugin had no logging idiom before this.
+                NSLog("[AppsFlyerCap] sessionReady listener FIRED — calling AppsFlyerLib.start() (#721)")
                 AppsFlyerLib.shared().start()
             }
         }

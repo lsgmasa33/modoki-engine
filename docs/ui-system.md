@@ -1192,6 +1192,12 @@ iPhone 8** (measured: 17.242px rendered in a 507.53px-tall viewport standing for
 `minTapSize` raises the receiving box to a floor without touching the drawing box, the layout, or
 where any sibling sits.
 
+⚠️ **"A floor" holds only where the zone has room to expand into.** Between two tappable neighbours
+the reachable target is `artwork + gap` and the authored value is NOT reached — so this field cannot
+deliver the floor in a dense row or grid, and the three guards below are not the only way it can
+come out short. Read § "The ceiling the sibling rule creates" before authoring it on anything with a
+tappable neighbour.
+
 The renderer emits a transparent, absolutely-positioned child sized `max(100%, minTapSize)` per
 axis, at `zIndex: -1` inside an `isolation: isolate` stacking context. `max()` makes a value below
 the element's own size a no-op rather than a shrink — it is a minimum, and it must never take tap
@@ -1276,6 +1282,96 @@ layout, not a value that is safe everywhere" — a control packed against an int
 needed its spacing fixed instead. That is no longer true for taps, and #969's nine adjacent Court
 controls are unblocked to the same extent. The history below is kept because it is what the rule was
 derived from.
+
+#### ⚠️ The ceiling the sibling rule creates: a zone expands into the GAP, and no further (#969)
+
+**Between two tappable neighbours, a control's reachable target is `artwork + gap` — never the
+authored `minTapSize`.** The two rules above are the same rule seen from opposite ends: the zone
+overhangs the neighbour, and the veto then hands that overhang straight back. Safe, and capped.
+
+The consequence is the one that catches authors: **`minTapSize` cannot deliver a floor in a dense
+row or grid.** Set 48 on a 26pt control with a 6pt gap and you get ~32pt across, not 48. The axis
+with no neighbour (and the outer edge of a row) does get the full value, so the same field can
+succeed on one axis and quietly fail on the other.
+
+Measured in Court's piece-colour flyout, 375x667, by driving real taps and reading the game's own
+journal — the numbers are in #969, and the two that matter:
+
+- a press over a neighbour's artwork, under the neighbouring pad → **the marker actually pressed**
+  wins (`court.regionNote {region: 1}`, not region 2). The veto, working.
+- a press in the gap, with no artwork under the point → the **later sibling** wins,
+  deterministically, because paint order decides among zones and the panel is an interactive
+  ancestor of both hosts.
+
+⚠️ **The probe ran at the ORIGINAL `gap: 3.2vmin`, where the two pads all but met** — a 48pt pad on
+36pt of artwork overhangs 6pt per side, which is the whole 12pt gap, leaving ~0 of bare gap and a
+0.26px pad-on-pad sliver at the midpoint. So "in the gap" there meant "at the seam between two
+pads". #969's close-out raised the gap to `3.8vmin` (14.25pt) to clear 360dp, so today 2.25pt of
+genuinely bare gap sits between the pads. The finding is unchanged and strengthened — a press over a
+neighbour's artwork was never the pad's — but an earlier version of this list called the probe point
+a "bare 5.99px gap", which was the per-SIDE overhang wearing the wrong label.
+
+**So if a layout must MEET the 44pt floor, size or space the artwork — `minTapSize` is the courtesy
+margin on top, not the mechanism.**
+
+⚠️ **And "size the artwork" is the WORSE of the two levers — reach for SPACING first.** The obvious
+move is to inflate the control until it is 48pt on its own, and that makes a heavy, clumsy-looking
+UI for no reason. Widening the gap instead buys exactly the same target from a much smaller control,
+because **once the gap is at least `minTapSize - artwork`, the pad stops half way across it and never
+reaches a neighbour at all** — so the veto is not even consulted and the ceiling above does not bind.
+
+Court's markers, before and after, at 375x667 — same 48pt target both times:
+
+| | artwork | gap | pad overhang/side | target | pads reach a neighbour? |
+|---|---|---|---|---|---|
+| inflate the control | 48.0pt | 6.0pt | **0** | 48pt | no — the pad is a NO-OP at this size |
+| **widen the gap** | **36.0pt** | **14.25pt** | **6.0pt** | **48pt** | **no — 2.25pt of bare gap left between pads** |
+
+⚠️ The inflate row's overhang really is zero, and an earlier version of this table said "yes,
+~4.9pt/side (veto load-bearing)" — wrong on both counts. `minTapSize` emits `max(100%, 48)`, so on
+48pt artwork the expander is exactly the element's own box and there is nothing to overhang. The
+veto is not involved in that variant at all: what met the floor was the artwork. Corrected #969
+close-out; the figure could not be reproduced from the authored values and was most likely measured
+against an editor-preview viewport (this doc records a "507.53px-tall viewport standing for 667
+logical pt" further up) while being labelled 375x667.
+
+The second is what shipped (`9.6vmin` capped `5.4vh`, `gap: 3.8vmin`), and it is both lighter on
+screen and structurally safer. `minTapSize: 48` stays on the markers as the courtesy margin that
+does the work.
+
+⚠️ **Both terms scale with the host, so the floor is a per-DEVICE claim and has to be checked as
+one.** This is not a caveat — it is the bug that shipped inside #969 itself. The layout was verified
+at 375x667 and nowhere narrower, and at **360dp** — the Galaxy S22 and the A23, i.e. both Android
+handsets root `CLAUDE.md` names as Court's targets, and the commonest Android width in the world —
+the markers delivered **46.08dp** and the daily calendar's column **43.09pt**. Both under the floor,
+with two green guards, because each resolved its units against one hardcoded reference device.
+
+The matrix now lives in `games/court/tests/devices.ts` and both guards iterate it — and it is
+**DERIVED from the engine's own `DEVICE_PRESETS`**, not transcribed. That is not tidiness: the first
+version of that file hand-wrote its rows and had the Galaxy S22 at 360x800, which is the Motorola
+Edge 50's height (the S22 is 360x780). Deriving also means a narrower phone entering the catalog
+turns these floors RED instead of being accommodated, and it is why there is no accepted-exception
+list any more: all 18 shipping presets clear both floors.
+
+On the older Fold's outer 280px screen the target is 37.5pt and stays an **accepted** miss — and it
+is not a shipping preset, so it does not set the bar for the game. Clearing 48 there needs
+`artwork + gap` of **17.14vmin** against today's 13.40. Where that 3.74vmin goes decides the cost:
+into the artwork it makes a **~50pt marker** at 375x667 (against the 36pt that shipped), and into the
+gap it does not grow the marker at all but breaks the three-per-row shape the panel is sized for.
+Either way it undoes a decision that was made deliberately — "the chip looks really big" — which is
+why the miss is accepted rather than fixed.
+
+⚠️ An earlier version of this paragraph said "~64pt". That read 17.14vmin as if it were the marker
+alone; it is `artwork + gap`.
+
+⚠️ **The corollary is a retune hazard worth stating: shrinking a container's `gap` can silently
+un-meet the floor,** because the gap is carrying the target size. Court's guard records the
+`gap >= minTapSize - artwork` relationship for exactly this reason
+(`games/court/tests/tapZoneClearance.test.ts`).
+
+⚠️ **Model a round control as a CIRCLE when probing.** `borderRadius: 999` makes the hit shape the
+circle, so a pad overlapping the bounding box's corner overlaps *nothing*, and a tap there correctly
+goes to the pad. A first pass at #969's probe read that as the veto failing.
 
 **#973 OBSERVED it, twice, on the shipped Court scene** (#948's close-out only computed it). Driven
 with `document.elementsFromPoint` on the live DOM: at 375x667 the level-select pager arrows took the
