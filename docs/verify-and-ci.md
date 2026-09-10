@@ -508,7 +508,10 @@ runners for PUBLIC repos — `windows-latest` AND `macos-*` included — and
 assembles; measured over 20 runs 2026-08-10, range 16–26s, and GitHub rounds each job up to the
 minute), which force-pushes a **scrubbed snapshot** to the `ci/main` branch; that fires the
 public `ci.yml`. What runs there, all free, on every `main` push: **typecheck/lint/tests on
-ubuntu + windows**, the **Playwright e2e suite**, and a **DMG + Windows installer build**. The
+ubuntu + windows + macos-14** (the macOS leg was added 2026-09-09; observed job names are
+`check (ubuntu-latest)`, `check (windows-latest)`, `check (macos-14)`, `package (macos-14)`,
+`package (windows-latest)`, `e2e (editor, chromium)`), the **Playwright e2e suite**, and a
+**DMG + Windows installer build**. The
 legs that cost the most privately (Windows 2×, macOS 10×) are the ones this buys back. Nothing
 waits for the result (polling would bill the wait); read it with
 `gh run list --repo lsgmasa33/modoki-engine --branch ci/main`.
@@ -523,6 +526,43 @@ secret `OSS_PUSH_TOKEN`, and **public run logs are world-readable and permanent*
 private tree to a public branch to get a free run — deleting a branch unpublishes nothing. Full
 mechanism: [engine-oss-publishing.md](./engine-oss-publishing.md) § "The public repo as a free CI
 runner".
+
+### The ubuntu leg is the ONLY Linux this repo can reach — and it finds a real class
+
+⚠️ **Five of the six clones are Macs and the sixth is Windows, so nothing local runs Linux.** A
+shell tool invoked with BSD-only syntax therefore passes `npm run verify` on every machine that
+runs it and fails only on the public ubuntu leg — *after* the push, with `main` already red.
+
+Measured 2026-09-10 (#1037 follow-up): `ps -Axo command=` shipped to `main` in two files. `x` is
+a BSD-style option, and Linux `procps` parses a **dash-prefixed** bundle as UNIX-style, where `x`
+is not an option at all:
+
+```
+error: must set personality to get -x option
+```
+
+So the call **threw** on ubuntu, `listProcesses()` correctly returned `null` rather than `[]`, and
+three cases went red across `cleanPackagedCacheLinkGuard` and `livePackagedEditor`. The hub's
+`verify` had been green minutes earlier, as had the worker's.
+
+Two things worth carrying forward:
+
+- **What is unportable is the MIX, not BSD syntax.** `ps axo command=` (no dash) is BSD-style and
+  procps accepts it; `ps -Ao` / `ps -eo` are UNIX-style and portable. Only a dash-prefixed bundle
+  containing `x` breaks. On macOS the `x` buys nothing anyway — it lifts the must-have-a-tty
+  restriction `-A` has already lifted (measured: the `-Axo` and `-Ao` pid sets differ only by churn
+  between the two calls, symmetrically, 3–6 pids).
+- **The detector has to be static, because the dynamic one does not exist here.**
+  `engine/tests/architecture/psFlagPortability.test.ts` scans the tooling corpus for the pattern.
+  It matches `.code` via `readScannedSource`, never `raw` — both fixes explain themselves in
+  comments that necessarily quote `-Axo`, so a raw-text scan would flag the fix as the defect — and
+  it excludes itself, its fixtures being string literals that survive the strip.
+
+⚠️ **The same shape is one flag over in `pgrep`**, and was already written down:
+`repoReapSpellings.test.ts` records that BSD `pgrep` skips its own ancestor chain while `procps`
+skips only its own pid. `cleanPackagedCacheLinkGuard`'s helper **cites that note** and still
+reached for BSD `ps` on the next line. Knowing the class did not prevent the instance, which is the
+argument for a guard rather than a doc paragraph.
 
 ## e2e (Playwright)
 
