@@ -273,8 +273,13 @@ export function listProcesses(platform = process.platform) {
       // is the honest answer, and the row still counts toward "we enumerated something".
       }).filter((r) => Number.isFinite(r.pid));
     }
+    // ⚠️ `-Ao`, NOT `-Axo`, on BOTH queries. `x` is BSD-style and Linux procps refuses to combine
+    // it with UNIX-style `-A` (`error: must set personality to get -x option`), which threw here
+    // and reddened the public ubuntu leg while every Mac gate stayed green. `x` buys nothing on
+    // macOS either: it only lifts the must-have-a-tty restriction that `-A` has already lifted —
+    // measured, the pid sets differ only by process churn between the two calls, symmetrically.
     const exeOut = execFileSync('ps', ['-Ao', 'pid=,comm='], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-    const cmdOut = execFileSync('ps', ['-Axo', 'pid=,command='], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    const cmdOut = execFileSync('ps', ['-Ao', 'pid=,command='], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
     const commands = new Map();
     for (const line of cmdOut.split('\n')) {
       const m = line.match(/^\s*(\d+)\s+(.*)$/);

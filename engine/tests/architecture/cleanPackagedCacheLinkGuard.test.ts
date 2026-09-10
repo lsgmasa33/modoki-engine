@@ -193,7 +193,11 @@ describe('clean-packaged-cache: a process merely MENTIONING the bundle does not 
   /** Is a process alive whose ARGV contains the marker? Read through `ps`, never `pgrep -f` — the
    *  diagnostic for this bug is itself an instance of it. */
   function decoyVisible(): boolean {
-    const out = execFileSync('ps', ['-Axo', 'command='], { encoding: 'utf8' });
+    // ⚠️ `-Ao`, NOT `-Axo`. The docblock above already cites `repoReapSpellings.test.ts` for the
+    // BSD-vs-procps split in `pgrep`, and `ps` has the same split one flag over: `x` is BSD-style
+    // and Linux procps refuses to combine it with UNIX-style `-A` (`error: must set personality to
+    // get -x option`). This threw on the public ubuntu leg while every Mac gate stayed green.
+    const out = execFileSync('ps', ['-Ao', 'command='], { encoding: 'utf8' });
     return out.split('\n').some((l) => l.includes(MARKER) && l.includes('-e'));
   }
 
