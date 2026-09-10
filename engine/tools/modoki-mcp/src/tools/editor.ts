@@ -479,7 +479,11 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_game_view_devices',
     'List the device presets the Game panel can preview at, plus the one selected now. Each row '
       + 'carries the LOGICAL size (CSS points — the space layout math runs in), the PHYSICAL size '
-      + '(device pixels), the dpr, and safe-area insets for both orientations. Read this instead of '
+      + '(device pixels), the dpr, and safe-area insets for both orientations — each with a '
+      + "safeAreaBasis saying where the numbers came from: 'measured' (read off real hardware), "
+      + "'published' (a vendor's spec table), 'inferred' (reasoned, or generalised from another device — "
+      + "NOT a measurement, so do not attribute a layout verdict to it), or 'no-device' (zeros by "
+      + 'construction). Read this instead of '
       + 'hardcoding a device table. Rows are PORTRAIT — landscape is a flip applied on selection, '
       + 'not a separate row, so pass `orientation` to modoki_set_game_view_device. Changes nothing.',
     {},
@@ -494,7 +498,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       + 'the catalog lacks — both together is refused as ambiguous. An unknown name is refused with '
       + 'the real list, never fuzzy-matched: previewing a screen other than the one you named makes '
       + 'every later measurement wrong. A custom size gets ZERO safe-area insets '
-      + "(safeAreaBasis:'custom-none') — there is no device to look them up from, so do not read "
+      + "(safeAreaBasis:'no-device') — there is no device to look them up from, so do not read "
       + 'those zeros as "no notch". Returns the resolved selection, which modoki_get_editor_state '
       + 'also reports as `gameView`. Editor-session state — nothing is written to disk, and a real '
       + 'device is unaffected.',

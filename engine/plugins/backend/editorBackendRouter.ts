@@ -4529,11 +4529,9 @@ async function describeUnresolvedAgainstLiveWorld(
   // (editor/scene/devicePresets.ts) and is relayed rather than duplicated here — a second copy
   // would go stale the first time a device is added, silently.
   if (urlPath === '/api/game-view-devices' && method === 'GET') {
-    try {
-      return json(await ctx.requestBrowser('game-view-devices', {}));
-    } catch (e) {
-      return json({ error: String(e instanceof Error ? e.message : e) }, relayFailureStatus(e));
-    }
+    // `relayJson` rather than a bare `json(raw)`, the #1012 sweep: the op never refuses today, but
+    // this is a GET tool without `checkFailure`, so the day it does a 200 envelope reads as success.
+    return relayJson(ctx, 'game-view-devices', {});
   }
 
   // ── GET /api/editor-state (M→R) ── the WHOLE editor UI state in one read:
@@ -4656,13 +4654,10 @@ async function describeUnresolvedAgainstLiveWorld(
     const path = query.get('path');
     if (!path) return json({ error: 'asset-def requires ?path=<asset-root URL>' }, 400);
     const type = query.get('type');
-    try { return json(await ctx.requestBrowser('read-asset-def', { path, ...(type ? { type } : {}) })); }
-    catch (e) {
-      // Same split as the editor-action relay: a miss ("not in the live cache") is the op
-      // answering (400), not a dead gateway.
-      const msg = String(e instanceof Error ? e.message : e);
-      return json({ error: msg }, relayFailureStatus(e));
-    }
+    // `relayJson`, not a bare `json(raw)`: `modoki_read_asset_def` is a GET without `checkFailure`, so a
+    // coded refusal relayed as a 200 would reach the agent as a SUCCESS (#1012). A thrown miss ("not
+    // in the live cache") is still the op answering (400), not a dead gateway.
+    return relayJson(ctx, 'read-asset-def', { path, ...(type ? { type } : {}) });
   }
 
   // ── GET /api/asset-meta?path= (M→R) ── the sidecar, PREFERRING a parked Inspector edit (#872).
@@ -4683,8 +4678,14 @@ async function describeUnresolvedAgainstLiveWorld(
     const preResolved = ctx.resolveAssetPath(assetPath);
     if (!preResolved) return json({ error: `path outside allowed directories: ${assetPath}` }, 403);
     if (!fs.existsSync(preResolved)) return json({ error: `asset not found: ${assetPath}` }, 404);
-    try { return json(await ctx.requestBrowser('read-asset-meta', { path: assetPath })); }
-    catch (e) {
+    try {
+      const raw = await ctx.requestBrowser('read-asset-meta', { path: assetPath });
+      // A coded refusal travels on its code's status. Checked here rather than through `relayJson`
+      // because this route's CATCH differs (the disk fallback below), and `modoki_read_asset_meta` is
+      // a GET without `checkFailure` — a refusal relayed as a 200 would read as a success (#1012).
+      const refusal = opRefusal(raw);
+      return refusal ? json(raw as Record<string, unknown>, refusalStatus(refusal.code)) : json(raw);
+    } catch (e) {
       // Same split as `/api/asset-def` and the editor-action relay: the op answering (400) is not
       // a dead gateway. But unlike asset-def, a transport failure here is RECOVERABLE — the disk
       // read is a real, if weaker, answer — so fall back rather than fail, and SAY which it is.
@@ -4815,13 +4816,11 @@ async function describeUnresolvedAgainstLiveWorld(
     const relayParams = ASSET_PERSISTENCE_ACTIONS.has(action)
       ? { ...params, _persistenceMode: getPersistenceMode() }
       : params;
-    try {
-      // Scene/resource-touching actions (load-scene, play) can take a while — give
-      // them generous headroom over the default relay timeout.
-      return json(await ctx.requestBrowser(action, relayParams, 60_000));
-    } catch (e) {
-      return json({ error: String(e instanceof Error ? e.message : e) }, relayFailureStatus(e));
-    }
+    // Scene/resource-touching actions (load-scene, play) can take a while — give
+    // them generous headroom over the default relay timeout. Through `relayJson` because this route
+    // carries most of the ops that NAME a §5 code: a bare `json(raw)` sent their refusal as a 200
+    // (#1012), which only `postJson`'s `isFailureBody` rescued.
+    return relayJson(ctx, action, relayParams, 60_000);
   }
 
   // ── GET /api/scenes (M) ── list the project's scene assets (guid/path/name)

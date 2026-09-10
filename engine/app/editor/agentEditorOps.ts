@@ -17,6 +17,7 @@
 
 import * as THREE from 'three';
 import type { ErrorCode } from '../../tools/shared/mcpResult';
+import { OpRefusal } from '../debug/opRefusal';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
 import { registerAgentOp as _registerAgentOp, type AgentOpHandler, setSceneReloadSuppressor, inferAssetDefType } from '../debug/agentBridge';
 import { performDomDnd, type DomDndParams } from '../debug/domDnd';
@@ -469,7 +470,7 @@ function resolveLiveId(ref: { id?: number; guid?: string } | undefined): number 
  *  resolves what this asserts against. */
 function requireAssetPath(path: string | undefined, expected: string, op: string): void {
   if (typeof path !== 'string' || !path) throw new Error(`${op} requires { path } — the asset's served URL (see modoki_list_assets).`);
-  if (!getGuidForPath(path)) throw new Error(`${op}: no asset found at "${path}" — it resolves to no manifest entry (typo, or wrong path). Find it with modoki_list_assets.`);
+  if (!getGuidForPath(path)) throw new OpRefusal('NOT_FOUND', `${op}: no asset found at "${path}" — it resolves to no manifest entry (typo, or wrong path). Find it with modoki_list_assets.`);
   const type = getAssetEntry(path)?.type;
   if (type && type !== expected) throw new Error(`${op}: "${path}" is a ${type}, not a ${expected} — this editor only opens ${expected} assets.`);
 }
@@ -480,7 +481,7 @@ function requireLiveId(ref: { id?: number; guid?: string } | undefined, op: stri
   const id = resolveLiveId(ref);
   if (id == null) {
     const what = ref?.guid ? `guid "${ref.guid}"` : ref?.id != null ? `id ${ref.id}` : 'entity ref';
-    throw new Error(`${op}: ${what} matched no live entity — it may be stale (runtime ids are reassigned on every scene reload; prefer addressing by guid). Re-read it with get_scene_state.`);
+    throw new OpRefusal('NOT_FOUND', `${op}: ${what} matched no live entity — it may be stale (runtime ids are reassigned on every scene reload; prefer addressing by guid). Re-read it with get_scene_state.`);
   }
   return id;
 }
@@ -1077,7 +1078,7 @@ export function registerEditorAgentOps(): void {
       else if (!resolved.includes(id)) resolved.push(id);
     }
     if (requested.length && resolved.length === 0) {
-      throw new Error('set-selection: none of the requested entities resolve to a live entity (ids are reassigned on scene reload — prefer guid). Re-read them with get_scene_state.');
+      throw new OpRefusal('NOT_FOUND', 'set-selection: none of the requested entities resolve to a live entity (ids are reassigned on scene reload — prefer guid). Re-read them with get_scene_state.');
     }
     setSelectionRaw(resolved.length ? resolved[resolved.length - 1] : null, resolved);
     const state = readEditorState();
@@ -1164,6 +1165,9 @@ export function registerEditorAgentOps(): void {
         physical: resolvePhysicalSize(p, 'portrait'),
         dpr: presetDpr(p),
         safeArea: { portrait: resolveSafeArea(p, 'portrait'), landscape: resolveSafeArea(p, 'landscape') },
+        // Where each quartet came from (#786) — this row relayed the numbers with no provenance at
+        // all, so a reasoned tablet zero read exactly like a measured one.
+        safeAreaBasis: p.safeArea.basis,
         free: p.logicalW <= 0,
       })),
       note: "Sizes are LOGICAL (CSS points) unless named physical; layout math runs in logical space. "
@@ -1198,6 +1202,7 @@ export function registerEditorAgentOps(): void {
     if (wantsCustom && p.device !== undefined) {
       return {
         ok: false,
+        code: 'AMBIGUOUS',
         error: 'give EITHER device (a catalog preset by name) OR logicalWidth+logicalHeight (an '
           + 'explicit size) — not both. Which screen you meant cannot be inferred from the pair.',
       };
@@ -1225,6 +1230,7 @@ export function registerEditorAgentOps(): void {
       if (!device) {
         return {
           ok: false,
+          code: 'NOT_FOUND',
           error: `no device preset named ${JSON.stringify(p.device)}. Names are matched exactly `
             + '(case-insensitively) and NOT fuzzy-matched — a near miss would silently preview a '
             + 'different screen. Use "Free" to fill the panel, or pass logicalWidth+logicalHeight '
@@ -1627,7 +1633,8 @@ export function registerEditorAgentOps(): void {
           + ' modoki_write_asset_meta {discardUnsaved:true} (the import-settings park for the path it writes),'
           + ' or modoki_persistence {op:"resolve-unsaved"} (discard by registry).'
         : '');
-    throw new Error(
+    throw new OpRefusal(
+      'REQUIRES_SAVE',
       `${op}: the editor has UNSAVED work — ${causes.join(' AND ')}. ${op} swaps the world.`
       + `${consequence}${survives}${remedy}`,
     );
@@ -1732,7 +1739,8 @@ export function registerEditorAgentOps(): void {
       const note = flushedAll.length
         ? ` (${flushedAll.length} parked item(s) WERE written: ${flushedAll.join(', ')})`
         : '';
-      throw new Error(
+      throw new OpRefusal(
+        flushedAll.length ? 'PARTIAL' : 'REFUSED_BY_OP',
         'save-all: the editor is in PREFAB-EDIT mode — its world is a synthetic prefab scene, ' +
         'not a real one, so saving it to a scene path would overwrite that scene with prefab ' +
         'scaffolding. Use the prefab editor\'s own save (Save Prefab), or leave prefab-edit mode ' +
@@ -1740,6 +1748,22 @@ export function registerEditorAgentOps(): void {
       );
     }
     const r = await saveAll({ path: savePath, allowDialog: false });
+    // Every parked item this save DID write, for the exits below. ⚠️ Named at ALL of them, not
+    // just the terminal throw: `playing` and `needs-path` each reported only `r.assets.saved` (or
+    // nothing), so an agent read them as "nothing was saved" and re-parked work already on disk —
+    // which is the reason the `playing` branch's own comment gives for having a note at all, then
+    // applied to one channel of three. (Close-out round three.)
+    // Computed BEFORE the first exit so every refusal below can take its §5 code from it: `PARTIAL`
+    // exactly when something was written, decided from this list rather than from the prose (#1012).
+    const landed = [
+      ...(r.assets?.saved ?? []).map((pth) => `asset ${pth}`),
+      ...(r.importSettings?.saved ?? []).map((pth) => `import settings for ${pth}`),
+      ...(r.baseScenes?.saved ?? []).map((pth) => `base-scene ref on ${pth}`),
+    ];
+    const landedNote = landed.length
+      ? ` ${landed.length} parked item(s) DID land and are on disk: ${landed.join(', ')}.`
+      : '';
+    const partialOr = (code: ErrorCode): ErrorCode => (r.saved || landed.length ? 'PARTIAL' : code);
     // PARTIAL IS A FAILURE (conventions §5). The primary scene saving does not mean Save All
     // succeeded: a dirty BASE scene that could not be serialized or written was previously just a
     // `console.error` + `continue`, and this returned `{ok:true}`. The edit then lived only in
@@ -1763,26 +1787,14 @@ export function registerEditorAgentOps(): void {
     const metaFails = (r.importSettings?.failed ?? []).map((f) => `import settings for ${f.path} (${f.error})`);
     const allFails = [...sceneFails, ...assetFails, ...baseSceneFails, ...metaFails];
     if (allFails.length) {
-      throw new Error(
+      throw new OpRefusal(
+        partialOr('REFUSED_BY_OP'),
         `save-all PARTIALLY failed: the primary scene ${r.saved ? `saved to ${r.path}` : 'did not save'}, but ` +
         `${allFails.length} item(s) did NOT: ${allFails.join('; ')}. Those changes are still in the ` +
         `live world / pending only, and stay marked dirty — a build reads FILES and would ship ` +
         `WITHOUT them. Fix the cause and call save_all again.`,
       );
     }
-    // Every parked item this save DID write, for the exits below. ⚠️ Named at ALL of them, not
-    // just the terminal throw: `playing` and `needs-path` each reported only `r.assets.saved` (or
-    // nothing), so an agent read them as "nothing was saved" and re-parked work already on disk —
-    // which is the reason the `playing` branch's own comment gives for having a note at all, then
-    // applied to one channel of three. (Close-out round three.)
-    const landed = [
-      ...(r.assets?.saved ?? []).map((pth) => `asset ${pth}`),
-      ...(r.importSettings?.saved ?? []).map((pth) => `import settings for ${pth}`),
-      ...(r.baseScenes?.saved ?? []).map((pth) => `base-scene ref on ${pth}`),
-    ];
-    const landedNote = landed.length
-      ? ` ${landed.length} parked item(s) DID land and are on disk: ${landed.join(', ')}.`
-      : '';
     if (r.saved) {
       return {
         ok: true, scenePath: r.path,
@@ -1800,7 +1812,8 @@ export function registerEditorAgentOps(): void {
       };
     }
     if (r.reason === 'needs-path') {
-      throw new Error(
+      throw new OpRefusal(
+        partialOr('REFUSED_BY_OP'),
         'save-all: this scene has no path yet (new_scene never saved), and the Save-As panel ' +
         'needs a human. Pass an explicit path, e.g. save_all { path: "/assets/scenes/my-scene.scene.json" }.'
         + landedNote,
@@ -1816,14 +1829,15 @@ export function registerEditorAgentOps(): void {
       const note = landed.length
         ? ` The ${landed.length} parked item(s) WERE written (${landed.join(', ')}) — those are authored documents and are not affected by run mode.`
         : '';
-      throw new Error(`save-all: the SCENE was NOT saved — blocked while the editor is playing/previewing, because saving now would bake the runtime world (physics-settled positions, spawned entities, a preview pose) over your authored scene, and Stop would revert the live world anyway. Stop the editor first (modoki_play_control {action:"stop"}).${note}`);
+      throw new OpRefusal(partialOr('REFUSED_BY_OP'), `save-all: the SCENE was NOT saved — blocked while the editor is playing/previewing, because saving now would bake the runtime world (physics-settled positions, spawned entities, a preview pose) over your authored scene, and Stop would revert the live world anyway. Stop the editor first (modoki_play_control {action:"stop"}).${note}`);
     }
     // ⚠️ "NOTHING was written" was a claim about the WHOLE save, and a failed scene write does not
     // undo the parked flushes — so with anything in `landed` it was a real write reported as a
     // no-op, the same defect the toast had. ("before it" is deliberately NOT said: the base-scene
     // flush is `writtenBy:{flush:'after-scene'}` and runs AFTER the scene write, so two of the
     // three lists land on the far side of it.)
-    throw new Error(
+    throw new OpRefusal(
+      partialOr('REFUSED_BY_OP'),
       `save-all FAILED (${r.reason}) for ${r.path ?? '(no path)'} — the SCENE was not written to disk.`
       + (landed.length ? landedNote : ' Nothing was written.'),
     );
@@ -1853,7 +1867,7 @@ export function registerEditorAgentOps(): void {
           pending.length ? `Pending now (${pending.length}): ${pending.join(', ')}` : 'Nothing is pending right now.'}`,
       );
     }
-    if (p.paths?.length && p.all) throw new Error('discard-asset-edits: pass `paths` OR `all:true`, not both — they disagree about the scope.');
+    if (p.paths?.length && p.all) throw new OpRefusal('AMBIGUOUS', 'discard-asset-edits: pass `paths` OR `all:true`, not both — they disagree about the scope.');
     const r = discardDirtyAssets(p.all ? undefined : p.paths);
     // ⚠️ This op owns the DIRTY-ASSET registry and not the sidecar one, and `all:true` reads as if
     // it owned both. A parked `.meta.json` import-settings edit survives it untouched, so an agent
@@ -1981,7 +1995,7 @@ export function registerEditorAgentOps(): void {
       else if (!deleted.includes(id)) deleted.push(id);
     }
     if (deleted.length === 0) {
-      throw new Error('delete-entities: none of the requested entities exist — nothing was deleted. Runtime ids are reassigned on every scene reload; re-read them with get_scene_state, or address entities by guid.');
+      throw new OpRefusal('NOT_FOUND', 'delete-entities: none of the requested entities exist — nothing was deleted. Runtime ids are reassigned on every scene reload; re-read them with get_scene_state, or address entities by guid.');
     }
     deleteEntitiesWithUndo(deleted, (sel) => setSelectionRaw(sel[0] ?? null, sel));
     return { ok: true, deleted, saved: false, ...(missing.length ? { skipped: missing, warning: `${missing.length} ref(s) matched no live entity and were skipped (ids are reassigned on scene reload — prefer guid)` } : {}) };
@@ -2172,7 +2186,8 @@ export function registerEditorAgentOps(): void {
       // instead have had every override on the instance applied to the shared prefab (or
       // reverted away). `keys` being absent is the only thing that means "all".
       if (p.keys && p.keys.length === 0) {
-        throw new Error(
+        throw new OpRefusal(
+          'AMBIGUOUS',
           `prefab ${verb}: \`keys\` was given as an EMPTY array, which is ambiguous — omit \`keys\` ` +
           `entirely to ${verb} ALL ${available.all.length} override(s), or pass the ones you mean. ` +
           'Refusing rather than guessing: an empty selection computed by a filter means "nothing", ' +
@@ -2190,12 +2205,14 @@ export function registerEditorAgentOps(): void {
         const unknown = new Set(p.keys.filter((k) => !available.all.includes(k)));
         if (unknown.size > 0) {
           const sample = available.all.slice(0, 5).join(', ');
-          throw new Error(
+          throw new OpRefusal(
+            'NOT_FOUND',
             `prefab ${verb}: ${unknown.size} of the ${p.keys.length} given key(s) match no override on this ` +
             `instance — ${[...unknown].slice(0, 5).join(', ')}${unknown.size > 5 ? ', …' : ''}. NOTHING was ` +
             `${verb === 'apply' ? 'applied' : 'reverted'} (a partial ${verb} would look like a success). Valid ` +
             `keys (${available.all.length} total) include: ${sample}${available.all.length > 5 ? ', …' : ''}. ` +
             "Call prefabAction:'overrides' for the exact set.",
+            { options: available.all },
           );
         }
         keySet = new Set(p.keys);

@@ -125,6 +125,29 @@ describe('/api/editor-action', () => {
     const r = (await post('/api/editor-action', { action: 'undo' }, ctx)) as { status?: number };
     expect(r.status).toBe(400);
   });
+
+  /** #1012 — this route relayed with a bare `json(raw)`, so a coded refusal an op RETURNED (or threw
+   *  as `OpRefusal`) left as a 200. It carries most of the ops that name a code. */
+  it('relays a CODED refusal on its code\'s status, body intact — not as a 200', async () => {
+    const envelope = { ok: false, code: 'NOT_FOUND', error: 'stale guid', options: ['g1'] };
+    const ctx = makeCtx({ requestBrowser: async () => envelope });
+    const r = (await post('/api/editor-action', { action: 'reparent-entity', guid: 'x' }, ctx)) as { status?: number; body?: unknown };
+    expect(r.status).toBe(400);
+    expect(r.body).toEqual(envelope);
+  });
+
+  it('NO_RENDERER travels on 503 here too — one code, one status', async () => {
+    const ctx = makeCtx({ requestBrowser: async () => ({ ok: false, code: 'NO_RENDERER', error: 'nothing is rendering' }) });
+    const r = (await post('/api/editor-action', { action: 'undo' }, ctx)) as { status?: number };
+    expect(r.status).toBe(503);
+  });
+
+  it('an UNCODED {ok:false, reason} still answers 200 — only a named code earns a status (accept side)', async () => {
+    const ctx = makeCtx({ requestBrowser: async () => ({ ok: false, reason: 'nothing to undo' }) });
+    const r = (await post('/api/editor-action', { action: 'undo' }, ctx)) as { status?: number; body?: unknown };
+    expect(r.status ?? 200).toBe(200);
+    expect(r.body).toEqual({ ok: false, reason: 'nothing to undo' });
+  });
 });
 
 /** Drift guard for the timeline-MCP-400 bug (2026-07-26): `editorBackendRouter.ts`'s
@@ -1520,14 +1543,15 @@ describe('/api/asset-def', () => {
     const requestBrowser = vi.fn(async () => ({ ok: true, def: { maxParticles: 137 } }));
     const ctx = makeCtx({ requestBrowser });
     const r = (await get('/api/asset-def?path=/assets/particles/a.particle.json&type=particle', ctx)) as { body?: unknown };
-    expect(requestBrowser).toHaveBeenCalledWith('read-asset-def', { path: '/assets/particles/a.particle.json', type: 'particle' });
+    // Third arg: the route passes no timeout of its own (relayJson's optional slot, so the relay default applies).
+    expect(requestBrowser).toHaveBeenCalledWith('read-asset-def', { path: '/assets/particles/a.particle.json', type: 'particle' }, undefined);
     expect(r.body).toEqual({ ok: true, def: { maxParticles: 137 } });
   });
 
   it('omits `type` entirely when not given, so the op can infer it from the suffix', async () => {
     const requestBrowser = vi.fn(async () => ({ ok: true }));
     await get('/api/asset-def?path=/assets/particles/a.particle.json', makeCtx({ requestBrowser }));
-    expect(requestBrowser).toHaveBeenCalledWith('read-asset-def', { path: '/assets/particles/a.particle.json' });
+    expect(requestBrowser).toHaveBeenCalledWith('read-asset-def', { path: '/assets/particles/a.particle.json' }, undefined);
   });
 
   it('400 when the asset is not in the live cache — the op answering, not a dead gateway', async () => {
@@ -1540,6 +1564,76 @@ describe('/api/asset-def', () => {
   it('504 when the RELAY is down', async () => {
     const ctx = makeCtx({ requestBrowser: async () => { throw new Error('no editor renderer window'); } });
     const r = (await get('/api/asset-def?path=/x.particle.json', ctx)) as { status?: number };
+    expect(r.status).toBe(504);
+  });
+
+  it('a CODED refusal is a 400, not a 200 — the GET tool runs no checkFailure, so a 200 reads as success (#1012)', async () => {
+    const envelope = { ok: false, code: 'NOT_FOUND', error: 'no such def' };
+    const ctx = makeCtx({ requestBrowser: async () => envelope });
+    const r = (await get('/api/asset-def?path=/x.particle.json', ctx)) as { status?: number; body?: unknown };
+    expect(r.status).toBe(400);
+    expect(r.body).toEqual(envelope);
+  });
+});
+
+/** `GET /api/asset-meta` — the agent's sidecar read, preferring a parked Inspector edit (#872).
+ *  It had no route test. Its catch differs from `relayJson`'s (a transport failure falls back to the
+ *  disk read), so the envelope check sits in its `try` — which is exactly the shape that can drift. */
+describe('/api/asset-meta', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'asset-meta-1012-'));
+  const asset = path.join(dir, 'tex.png');
+  fs.writeFileSync(asset, 'png');
+  afterAll(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  it('relays the op\'s answer as-is when it has one', async () => {
+    const reply = { ok: true, path: asset, meta: { type: '2d' }, source: 'pending' };
+    const r = (await get(`/api/asset-meta?path=${asset}`, makeCtx({ requestBrowser: async () => reply }))) as { status?: number; body?: unknown };
+    expect(r.status ?? 200).toBe(200);
+    expect(r.body).toEqual(reply);
+  });
+
+  it('a CODED refusal is a 400 with its body — not a 200 the GET tool would read as success (#1012)', async () => {
+    const envelope = { ok: false, code: 'AMBIGUOUS', error: 'which one' };
+    const r = (await get(`/api/asset-meta?path=${asset}`, makeCtx({ requestBrowser: async () => envelope }))) as { status?: number; body?: unknown };
+    expect(r.status).toBe(400);
+    expect(r.body).toEqual(envelope);
+  });
+
+  it('a transport failure still falls back to the DISK read, and says so (accept side)', async () => {
+    const ctx = makeCtx({ requestBrowser: async () => { throw new Error('no editor renderer window'); } });
+    const r = (await get(`/api/asset-meta?path=${asset}`, ctx)) as { status?: number; body?: { source?: string; editorConnected?: boolean } };
+    expect(r.status ?? 200).toBe(200);
+    expect(r.body).toMatchObject({ source: 'disk', editorConnected: false });
+  });
+
+  it('an op that THROWS is still the op answering — 400, no disk fallback', async () => {
+    const ctx = makeCtx({ requestBrowser: async () => { throw new Error('read-asset-meta requires { path }'); } });
+    const r = (await get(`/api/asset-meta?path=${asset}`, ctx)) as { status?: number };
+    expect(r.status).toBe(400);
+  });
+});
+
+/** `GET /api/game-view-devices` — the fourth route the #1012 sweep found relaying a bare `json(raw)`.
+ *  Its op never refuses today, so this pins the ROUTE's shape: the GET tool runs no `checkFailure`,
+ *  and a coded envelope relayed as a 200 would reach the agent as a success. */
+describe('/api/game-view-devices', () => {
+  it('relays the catalog as-is', async () => {
+    const reply = { ok: true, current: { device: 'Free' }, presets: [] };
+    const r = (await get('/api/game-view-devices', makeCtx({ requestBrowser: async () => reply }))) as { status?: number; body?: unknown };
+    expect(r.status ?? 200).toBe(200);
+    expect(r.body).toEqual(reply);
+  });
+
+  it('a CODED refusal travels on its code\'s status, not as a 200', async () => {
+    const envelope = { ok: false, code: 'NO_RENDERER', error: 'no editor window' };
+    const r = (await get('/api/game-view-devices', makeCtx({ requestBrowser: async () => envelope }))) as { status?: number; body?: unknown };
+    expect(r.status).toBe(503);
+    expect(r.body).toEqual(envelope);
+  });
+
+  it('a dead relay is still a 504', async () => {
+    const ctx = makeCtx({ requestBrowser: async () => { throw new Error('no editor renderer window'); } });
+    const r = (await get('/api/game-view-devices', ctx)) as { status?: number };
     expect(r.status).toBe(504);
   });
 });

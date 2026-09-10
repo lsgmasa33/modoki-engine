@@ -1082,7 +1082,7 @@ if (canGameViewDevice) {
     if (custom.physical.w !== 1280 || custom.physical.h !== 960) throw new Error(`dpr did not reach the physical size: ${JSON.stringify(custom.physical)}`);
     // Zeros with no device behind them must SAY they are zeros by construction — four bare zeros
     // are indistinguishable from a measured "this screen has no notch".
-    if (custom.safeAreaBasis !== 'custom-none') throw new Error(`a custom size must report safeAreaBasis:'custom-none', got ${custom.safeAreaBasis}`);
+    if (custom.safeAreaBasis !== 'no-device') throw new Error(`a custom size must report safeAreaBasis:'no-device', got ${custom.safeAreaBasis}`);
 
     // An unknown name is refused WITH the real list, never fuzzy-matched onto a nearby screen.
     const unknown = await client.callTool({ name: 'modoki_set_game_view_device', arguments: { device: 'iPhone 16 Pruo' } });

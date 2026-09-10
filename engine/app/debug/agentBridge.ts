@@ -31,6 +31,7 @@
  *  ops to the runtime ones. Nobody designed it as a safety mechanism: removing or `@vite-ignore`-ing
  *  the `main.tsx` import, or adding an accept boundary here, would quietly break it. */
 
+import { opReplyFor } from './opRefusal';
 import {
   sceneManager,
   getAllEntities,
@@ -649,8 +650,9 @@ export async function relayResponseFor(
   run: (op: string, params: unknown) => Promise<unknown> = (op, params) => runAgentOp(op, params),
 ): Promise<{ id: number; result?: unknown; error?: string; declined?: boolean }> {
   if (!has(msg.op)) return { id: msg.id, declined: true };
-  try { return { id: msg.id, result: await run(msg.op, msg.params) }; }
-  catch (e) { return { id: msg.id, error: String(e instanceof Error ? e.message : e) }; }
+  // An `OpRefusal` comes back as a coded RESULT, not an `error` — through `opReplyFor`, which the
+  // Electron IPC handler shares so the two transports cannot disagree about it (#1012).
+  return { id: msg.id, ...(await opReplyFor(() => run(msg.op, msg.params))) };
 }
 
 // Built-in runtime ops (no editor deps — safe in every build the bridge runs in).
@@ -2549,8 +2551,9 @@ export function initAgentBridge(): void {
     pusher.start();
     bridge.on('request', async (data) => {
       const msg = data as { id: number; op: string; params?: unknown };
-      try { bridge.send('response', { id: msg.id, result: await handleOp(msg.op, msg.params) }); }
-      catch (e) { bridge.send('response', { id: msg.id, error: String(e instanceof Error ? e.message : e) }); }
+      // The same reply function as the HMR relay's `relayResponseFor`, so an `OpRefusal` reaches the
+      // packaged editor's backend as a coded envelope too — not only the dev server's (#1012).
+      bridge.send('response', { id: msg.id, ...(await opReplyFor(() => handleOp(msg.op, msg.params))) });
     });
     // Drive scene reloads off main's watcher (which owns the guard) when chosen —
     // for an Electron bridge this is ALWAYS the case, dev or packaged. See

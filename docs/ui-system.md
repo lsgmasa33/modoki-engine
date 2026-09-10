@@ -875,7 +875,10 @@ the selected device preset. Four things about that shape are load-bearing:
   does for the screen box — invents a top inset the device does not have.
 - **An Android tablet preset carries zero insets in both orientations** (no display cutout,
   both system bars hidden) — but unlike the phone row's measured 28, this one is REASONED,
-  not measured, and awaits a real tablet to confirm it.
+  not measured, and awaits a real tablet to confirm it. That provenance is DATA, not only this
+  sentence: each preset's `SafeAreaSet.basis` marks every orientation `measured`, `published`,
+  `inferred` or `no-device`, and the editor's device read-back reports it as `safeAreaBasis`
+  (#786, [editor.md](./editor.md) § the device-selection bullets).
 
 The bands are drawn over the preview (`editor/rendering/SafeAreaOverlay.tsx`), always on
 with a device preset: simulating an inset without showing it trades one invisible failure

@@ -3,7 +3,7 @@
  *  mis-letterboxes every view), and the search/filter used by the device picker. */
 import { describe, it, expect } from 'vitest';
 import {
-  DEVICE_PRESETS, FREE_PRESET, DEVICE_CATEGORY_ORDER, type DevicePreset,
+  DEVICE_PRESETS, FREE_PRESET, DEVICE_CATEGORY_ORDER, SHIPPING_DEVICE_CATEGORIES, type DevicePreset,
   resolveLogicalSize, resolvePhysicalSize, presetDpr, presetLabel, filterDevices,
   resolveSafeArea, safeAreaCssVars,
   findPresetByName, makeCustomPreset, validateCustomSize, describeDeviceSelection,
@@ -214,8 +214,7 @@ describe('devicePresets — safe area', () => {
     }
   });
 
-  // REASONED, not measured — no ANDROID tablet is attached to this machine (an iPad mini 5 is,
-  // and it is what pins `faceIdIPad`). All three put the camera in the
+  // REASONED, not measured — no ANDROID tablet is attached to this machine. All three put the camera in the
   // bezel (no cutout) and hide both system bars (nothing at the bottom), so all four edges are 0 in
   // both orientations. Replace with a real quartet the first time a tablet is on hand to measure.
   it('the Android tablets have no insets in either orientation — reasoned, not measured', () => {
@@ -223,6 +222,52 @@ describe('devicePresets — safe area', () => {
       const p = find(name);
       for (const o of ['portrait', 'landscape'] as const) {
         expect(resolveSafeArea(p, o), `${name} ${o}`).toEqual({ top: 0, right: 0, bottom: 0, left: 0 });
+      }
+    }
+  });
+
+  /** #786 — WHERE each quartet came from, as data the read-back carries. Every one of these used to
+   *  report `safeAreaBasis: 'preset'`, which the type's own docblock defined as "zeros here are a
+   *  STATEMENT" — so a reasoned tablet zero read exactly like the SE's measured one.
+   *
+   *  Pinned per row and per orientation on purpose: the provenance is a claim about a specific
+   *  measurement on a specific device, and the landscape half of every measured row was inferred
+   *  (the apps that measured them are portrait-locked). */
+  const basisOf = (name: string, o: 'portrait' | 'landscape') => describeDeviceSelection(find(name), o).safeAreaBasis;
+
+  it('MEASURED is exactly the portrait rows a real device reported — and never their landscape half', () => {
+    // NOT the Galaxy S22 (close-out review): it read 27, and its row serves the two handsets' SHARED
+    // 28 — a value no device reported, which is 'inferred'. The SE's zeros were read on an iPhone 8,
+    // the same 375x667 home-button screen, and a zero quartet has no rounding to disagree with.
+    for (const name of ['iPhone SE', 'iPhone Air']) {
+      expect(basisOf(name, 'portrait'), `${name} portrait`).toBe('measured');
+      expect(basisOf(name, 'landscape'), `${name} landscape — the measuring app was portrait-locked`).toBe('inferred');
+    }
+  });
+
+  it('PUBLISHED is the Apple rows read off the per-model table, in both orientations', () => {
+    // The iPads included: an earlier comment claimed the attached iPad mini 5 "pins" `faceIdIPad`,
+    // but that model has a Home button and no home indicator, and no commit records the measurement.
+    for (const name of ['iPhone 16 Pro', 'iPhone 16 Pro Max', 'iPad Pro 11"', 'iPad Pro 13"', 'iPad Pro 12.9"']) {
+      for (const o of ['portrait', 'landscape'] as const) expect(basisOf(name, o), `${name} ${o}`).toBe('published');
+    }
+  });
+
+  it('INFERRED covers the Android tablets (this issue) and the phones generalised from two handsets', () => {
+    const inferred = [...ANDROID_TABLETS, 'Galaxy S22', 'Galaxy S24', 'Galaxy Z Fold7 (Folded)', 'Galaxy Z Fold7 (Open)',
+      'Pixel 9', 'Xiaomi 14', 'Huawei Mate 60 Pro', 'Motorola Edge 50'];
+    for (const name of inferred) {
+      for (const o of ['portrait', 'landscape'] as const) expect(basisOf(name, o), `${name} ${o}`).toBe('inferred');
+    }
+  });
+
+  it('census: a shipping device is NEVER no-device, and an abstract preset ALWAYS is — both directions', () => {
+    for (const p of [...DEVICE_PRESETS, makeCustomPreset(640, 480)]) {
+      const shipping = SHIPPING_DEVICE_CATEGORIES.includes(p.category);
+      for (const o of ['portrait', 'landscape'] as const) {
+        const basis = describeDeviceSelection(p, o).safeAreaBasis;
+        if (shipping) expect(basis, `${p.name} ${o} is a real device`).not.toBe('no-device');
+        else expect(basis, `${p.name} ${o} has no device behind it`).toBe('no-device');
       }
     }
   });
@@ -349,14 +394,16 @@ describe('agent device resolution (#367)', () => {
     expect(portrait.free).toBe(false);
   });
 
-  it("distinguishes a preset's authored zeros from a custom size's zeros-by-construction", () => {
+  it("distinguishes a MEASURED zero from a zero with no device behind it (#786)", () => {
     // Four bare zeros are indistinguishable from a measurement, which is why the basis is
-    // reported: an iPhone SE really DOES report 0 with the status bar hidden, while a custom
-    // size has no device to look anything up from.
+    // reported: an iPhone SE really DOES report 0 with the status bar hidden (measured on the
+    // iPhone 8), while a custom size — and an abstract aspect preset — has no device to look
+    // anything up from. Both used to say the same thing ('preset' for the SE and the 16:9 alike).
     expect(describeDeviceSelection(find('iPhone SE'), 'portrait')).toMatchObject({
-      safeArea: { top: 0, right: 0, bottom: 0, left: 0 }, safeAreaBasis: 'preset',
+      safeArea: { top: 0, right: 0, bottom: 0, left: 0 }, safeAreaBasis: 'measured',
     });
-    expect(describeDeviceSelection(makeCustomPreset(640, 480), 'portrait').safeAreaBasis).toBe('custom-none');
+    expect(describeDeviceSelection(makeCustomPreset(640, 480), 'portrait').safeAreaBasis).toBe('no-device');
+    expect(describeDeviceSelection(find('16:9 (720p)'), 'portrait').safeAreaBasis).toBe('no-device');
   });
 
   it('marks Free as free, with no fixed size', () => {

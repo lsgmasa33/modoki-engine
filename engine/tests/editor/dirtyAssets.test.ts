@@ -199,6 +199,10 @@ describe('save_all flushes the dirty-asset registry alongside the scene write', 
     });
 
     await expect(runAgentOp('save-all', {})).rejects.toThrow(/PARTIALLY failed[\s\S]*op-willfail\.particle\.json/);
+    // #1012 — the primary scene DID save, so this is PARTIAL by §5's own definition.
+    await expect(runAgentOp('save-all', {})).rejects.toMatchObject({ code: 'PARTIAL' });
+    // Close-out review: the recode dropped the space after the colon ("failed:the primary scene").
+    await expect(runAgentOp('save-all', {})).rejects.toThrow(/PARTIALLY failed: the primary scene/);
     // …and it must name the consequence, not just the fact.
     await expect(runAgentOp('save-all', {})).rejects.toThrow(/build reads FILES/);
     expect(getDirtyAssetPaths()).toEqual(['/assets/fx/op-willfail.particle.json']); // still pending
@@ -395,6 +399,7 @@ describe('discard-asset-edits — abandoning a parked write', () => {
   it('`paths` and `all` together are refused — they disagree about the scope', async () => {
     markAssetDirty(A, 'particle', def());
     await expect(runAgentOp('discard-asset-edits', { paths: [A], all: true })).rejects.toThrow(/not both/);
+    await expect(runAgentOp('discard-asset-edits', { paths: [A], all: true })).rejects.toMatchObject({ code: 'AMBIGUOUS' });
     expect(getDirtyAssetPaths()).toEqual([A]);
   });
 

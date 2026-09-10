@@ -325,7 +325,8 @@ Rules:
   of truth while an editor is open".
 - **A no-op is a failure when the caller asked for a change.** `changed:0`, or a write whose keys
   the loader ignores, is `REFUSED_BY_OP` with the real field names — not `{ok:true, changed:1}` (V1).
-- **A STATE refusal is RETURNED with its code — it must never escape as a throw** (#994). This is
+- **A STATE refusal is RETURNED with its code — it must never escape as a PLAIN throw** (#994;
+  `OpRefusal`, below, is the coded throw the bridge returns for you). This is
   the emit-side half of "a refusal is not a transport failure" above, and without it that rule
   cannot be kept: an op that throws has no way to name its code, because every relay route turns a
   throw into a hard-coded **504** (a **500** on the Electron host), which the MCP client maps to
@@ -334,7 +335,19 @@ Rules:
   and told `test:mcp:live` a live route was a DEFECT. **The op is
   the only layer that knows which failure this is**, so it returns `{ok:false, code, error,
   options}` and the route relays it (`opRefusal`/`refusalStatus` in `editorBackendRouter.ts`).
-  Three riders:
+  **Or it throws `OpRefusal(code, message, {options})`** (`engine/app/debug/opRefusal.ts`, #1012):
+  the form for a helper buried under many callers (`requireLiveId`, `guardUnsaved`), which
+  `opReplyFor` turns into that same returned envelope. A plain `Error` is never a coded refusal.
+  ⚠️ **The editor has TWO relay transports, and both call `opReplyFor`.** The HMR relay answers
+  through `relayResponseFor`; the Electron IPC handler deliberately does not use it — IPC reaches
+  exactly one `webContents`, so there is no broadcast and no decline to count (`main.ts`'s
+  `requestRenderer` docblock) — so a conversion placed in only one of them is dead in
+  the other — the packaged editor. **The device TCP relay is a third, and it does NOT carry a code:**
+  `bridge.ts`'s `delegateToAgentOps` flattens any throw into the `Error: <msg>` string sentinel the
+  game-debug MCP flags, so an `OpRefusal` thrown by a RUNTIME op would lose its code there. None is
+  thrown by one today — every recoded site is an editor op, which never runs on a device — and
+  making the device channel carry §5 codes is a protocol change to that MCP, not an extra call to
+  `opReplyFor`. Four riders:
   - **The discriminator is a code from the CLOSED set**, not `ok:false`. Dozens of ops report a bad
     parameter as `{ok:false, reason}` at HTTP 200, where `isFailureBody` picks them up; only a
     named code is a claim to know which §5 failure this is, and only that claim earns a status.
@@ -345,6 +358,13 @@ Rules:
     `CaptureUnavailableError` CLASS for exactly this reason; `relayFailureStatus`'s scar is what
     string-matching an error costs — a bare word in one op's prose eventually collides with
     another's.
+  - **Recode a refusal only where the sharper code is TRUE** (#1012). Of the 67 plain throws in
+    `agentEditorOps.ts`, about a dozen were: a stale entity or missing asset (`NOT_FOUND`), unsaved
+    work (`REQUIRES_SAVE`), a save where something landed (`PARTIAL` — decided from the landed
+    list, never from the prose), contradictory arguments (`AMBIGUOUS`). A missing parameter, a wrong
+    asset kind, a no-op and an internal failure are honestly `REFUSED_BY_OP` and stay plain throws —
+    and so does a loader whose `null` conflates *missing* with *malformed* (`getPrefabSource`),
+    where `NOT_FOUND` would be a guess stated as a fact.
 - ⚠️ **THE RELAY IS A BROADCAST, and it settles on the first AUTHORITATIVE reply — not the first
   reply** (#1030). `ws.send` reaches every HMR client, so `modoki:request` runs in every open tab,
   not only the editor's. A tab on the dev server's runtime route has no editor ops registered and
@@ -423,7 +443,10 @@ Rules:
   - ⚠️ **`/api/eval` is the one route that must NOT read a returned envelope as a refusal.** The
     reply is the eval's own return value, so a body ending `return {ok:false, code:'NOT_FOUND'}` is
     agent DATA; it is wrapped in `{result: …}` so no envelope reaches the top level. Every other
-    relayed route relays one.
+    relayed route relays one. ⚠️ Three did not until #1012 — `/api/editor-action`, `/api/asset-def`
+    and `/api/asset-meta` sent a bare `json(raw)`, i.e. the envelope as a **200**. `postJson`'s
+    `isFailureBody` rescued the POST, but the two GET tools run no `checkFailure`, so a coded
+    refusal there would have reached the agent as a SUCCESS.
   - ⚠️ **A route that post-processes its reply must check the envelope before it returns.** Only one
     of the six spreads unconditionally (`/api/editor-state`, which merges main-process facts into
     the relayed object) — there an envelope really would come back as a 200 whose body is a refusal

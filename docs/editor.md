@@ -1318,10 +1318,16 @@ Six things about that surface are load-bearing:
   so every `resolve*` helper and every GameView consumer handles it unbranched. `logicalW: 0` is
   reserved by `FREE_PRESET` for "fill the panel", so a zero dimension is refused rather than
   silently becoming Free.
-- **A custom size reports `safeAreaBasis: 'custom-none'`.** There is no device to look insets up
-  from, so its zeros are zeros *by construction* — and four bare zeros are indistinguishable from a
-  measured "this screen has no notch", which is the mis-authoring `devicePresets.ts` warns about.
-  A catalog preset reports `'preset'`, where a zero is a statement.
+- **Every inset quartet says where it came from — `safeAreaBasis`, per orientation (#786).**
+  `'measured'` (a real device reported it), `'published'` (a vendor's per-model table),
+  `'inferred'` (reasoned, or generalised from another device) or `'no-device'` (zeros by
+  construction: `Custom`, `Free` and the aspect presets). Four bare zeros are indistinguishable from
+  a measured "this screen has no notch", which is the mis-authoring `devicePresets.ts` warns about.
+  It is DATA authored beside the numbers in `SafeAreaSet.basis`, not derived from the preset's name:
+  the old name check reported every catalog row as `'preset'` — a reasoned Android-tablet zero and
+  the iPhone SE's measured one alike — and missed that a `16:9` row has no device behind it either.
+  ⚠️ The landscape half of every measured row is `'inferred'`: the apps that measured them are
+  portrait-locked, so nothing rotated to check.
 - **A `dpr` that cannot round-trip is refused, not rounded.** `physical` is stored as
   `round(logical × dpr)` and the read-back recovers dpr as `physical / logical`, so `{1, 1, dpr: 0.5}`
   used to be accepted and answer `dpr: 1` — a wrong answer stated authoritatively. The combination is

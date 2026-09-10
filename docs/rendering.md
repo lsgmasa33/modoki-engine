@@ -4153,7 +4153,8 @@ three's incrementing material id, which differs between two runs of the same bui
 
     ⚠️ **Do not re-propose "prime it earlier / cheaper" in any form.** The line is now closed from
     both ends: a stand-in with no working environment primes NOTHING, and one with a working
-    environment costs more than the premium it absorbs. What remains is upstream (below).
+    environment costs more than the premium it absorbs. What remains is inside three.js, and it is
+    accepted rather than chased (the ⛔ CLOSED entry at the end of this bullet).
 
     ⚠️ **Instrument note for whoever measures this next:** `nodeprobe.mjs` **cannot see a build that
     happens inside `createRenderer`** — its `getForRender` hook is installed after that, and the
@@ -4190,6 +4191,26 @@ three's incrementing material id, which differs between two runs of the same bui
     11 ms. For contrast, the HDR-decode longtask in the same boot is **100% of its self time in 9
     functions**. That is the profile of graph traversal, not of a hot loop — so a fix has to remove
     or move the build, because there is nothing inside it to make faster.
+  - ⛔ **CLOSED 2026-09-11 (#324), on the owner's call: the remaining ~193 ms (A23) is accepted, not
+    fixed.** Five sessions reopened this and each left it open, so the reason to stop is recorded here:
+    - **It already runs behind the loading screen.** `App.tsx` awaits `sceneManager.loadScene`
+      (which fires the before-swap hooks, and so the prewarm) *before* `waitForScenePaint`, and the
+      loading overlay is dismissed only after both. The player's cost is that much longer on the
+      loading screen of a low-end phone, not a frozen game. `LoadingOverlay`'s spinner is a CSS
+      `transform` keyframe animation, which normally runs on the compositor through a main-thread
+      block (not verified on the A23). Moving the build EARLIER inside that window was tried and
+      reverted (the early-environment prime above): same total, nothing the player can see.
+    - **A worker renderer (OffscreenCanvas) was considered and not pursued.** It does not shrink the
+      build — the same CPU work runs on another core, so at most part of ~193 ms comes back, and only
+      if other boot work runs alongside it. The build cannot be split out on its own: it reads the
+      live scene, lights and environment, so the whole Three.js layer would have to move into the
+      worker (`Scene3D`, the per-frame ECS→three sync, picking, video textures, the editor
+      viewports). A rewrite of that size for at most ~0.2 s on the lowest-end target is the wrong
+      trade. Mobile WebView support for a worker-hosted WebGPU/WebGL2 context was not checked.
+    - **Not reported upstream.** No three.js issue covers the premium (searched 2026-09-11).
+    - **Reopen only with a changed premise**: a player-visible symptom (the spinner freezing, or a
+      stall OUTSIDE the loading screen), a three.js change to `NodeBuilder`, or a worker-hosted
+      renderer wanted for its own reasons.
 - ⭐ **The post-FX STAGE quads now have a precompile — PARTIALLY (#323, 2026-08-26).**
   `PostFXStack.compileStagesAsync()` warms them; see § "Precompiling the stack's own stage quads"
   above for the mechanism, the two new three.js sharp edges it exists for, and what it still

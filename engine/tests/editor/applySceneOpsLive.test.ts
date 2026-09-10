@@ -296,6 +296,9 @@ describe('create-entity / reparent-entity: a bad parent is REFUSED, never an orp
   it('create-entity refuses a parentId that matches no live entity', async () => {
     await expect(runAgentOp('create-entity', { spec: { kind: 'empty' }, parentId: 99999 }))
       .rejects.toThrow(/id 99999 matched no live entity/);
+    // #1012 — and it names its §5 code, so a relay reply carries NOT_FOUND, not REFUSED_BY_OP.
+    await expect(runAgentOp('create-entity', { spec: { kind: 'empty' }, parentId: 99999 }))
+      .rejects.toMatchObject({ code: 'NOT_FOUND' });
   });
 
   it('create-entity still accepts a REAL parentId, and 0 (root)', async () => {

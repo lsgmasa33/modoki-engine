@@ -41,8 +41,9 @@
  *  logical sizes already in this file — they agree), except the iPhone Air, which is measured.
  *  Android's come from two measured handsets that agree within 1dp — see `androidPhone`. A wrong number here mis-authors a layout in a way that looks perfect in
  *  the editor, so treat this table as data to be CORRECTED as devices get tested — there
- *  is an iPhone Air, a Galaxy S22 and a Galaxy A23 attached to this machine, and each one
- *  that gets measured should replace its guess and lose its `UNVERIFIED` marker.
+ *  is an iPhone Air, a Galaxy S22 and a Galaxy A23 attached to this machine, and each row
+ *  that gets measured should replace its guess and flip its `basis` to `'measured'` — the
+ *  provenance is data the editor reports (`SafeAreaBasis`, #786), not only a comment.
  *
  *  Orientation is NOT baked into the list (no separate portrait/landscape entries) —
  *  presets are authored portrait and flipped at runtime by `resolveLogicalSize` /
@@ -71,12 +72,31 @@ export type { SafeAreaPx };
 export interface SafeAreaSet {
   portrait: SafeAreaPx;
   landscape: SafeAreaPx;
+  /** WHERE each orientation's quartet came from (#786) — authored beside the numbers, and required,
+   *  so a new row cannot add insets without saying whether anyone measured them. Per orientation
+   *  because the two halves of one row genuinely differ: every measured row was read off a
+   *  portrait-locked app, so its landscape half is inferred. */
+  basis: { portrait: SafeAreaBasis; landscape: SafeAreaBasis };
 }
 
-/** No insets at all — a device with no notch and no home indicator (and the shape every
- *  abstract/Free preset takes). Frozen because it is shared by reference across presets. */
+/** No insets at all — a device with no notch and no home indicator, or no device. Frozen because
+ *  it is shared by reference across presets. */
 export const NO_INSETS: SafeAreaPx = Object.freeze({ top: 0, right: 0, bottom: 0, left: 0 });
-export const NO_SAFE_AREA: SafeAreaSet = Object.freeze({ portrait: NO_INSETS, landscape: NO_INSETS });
+/** The quartet of something that is NOT a device — Free, the aspect presets, a custom size. Its
+ *  zeros are zeros by construction, and say so. A real device with no insets is `insetless(...)`,
+ *  whose zeros are a claim about that device. */
+export const NO_SAFE_AREA: SafeAreaSet = Object.freeze({
+  portrait: NO_INSETS, landscape: NO_INSETS,
+  basis: Object.freeze({ portrait: 'no-device', landscape: 'no-device' }) as SafeAreaSet['basis'],
+});
+
+/** Provenance for a row: portrait, and landscape when it differs. */
+const basis = (portrait: SafeAreaBasis, landscape: SafeAreaBasis = portrait): SafeAreaSet['basis'] => ({ portrait, landscape });
+
+/** A real device whose screen imposes no inset in either orientation — the iPhone SE, the bezel-camera
+ *  Android tablets. Unlike `NO_SAFE_AREA` the zeros here are a STATEMENT about hardware, so they carry
+ *  the basis of whoever made it. */
+const insetless = (b: SafeAreaSet['basis']): SafeAreaSet => ({ portrait: NO_INSETS, landscape: NO_INSETS, basis: b });
 
 /** Every home-indicator iPhone follows ONE pattern, so it is written once here rather
  *  than 4x in the table where a digit could drift: portrait is `top` + a 34pt home
@@ -85,9 +105,10 @@ export const NO_SAFE_AREA: SafeAreaSet = Object.freeze({ portrait: NO_INSETS, la
  *  know which way you will rotate). Values cross-checked against the published per-model
  *  table; the iPhone 16 Pro row (62/34 portrait, 0/21/62/62 landscape) is the worked
  *  example the pattern was read off. */
-const notchedIPhone = (topPt: number): SafeAreaSet => ({
+const notchedIPhone = (topPt: number, b: SafeAreaSet['basis']): SafeAreaSet => ({
   portrait: { top: topPt, right: 0, bottom: 34, left: 0 },
   landscape: { top: 0, right: topPt, bottom: 21, left: topPt },
+  basis: b,
 });
 
 /** An Android phone under Capacitor, bars hidden: the **display cutout on top, nothing else**.
@@ -110,18 +131,25 @@ const notchedIPhone = (topPt: number): SafeAreaSet => ({
  *  that A23 was the same defect. Measuring a bug and generalising it as a platform fact is the
  *  trap here: the question to ask of a zero is always "is this device insetless, or is my window
  *  not reaching the edge?" */
-const androidPhone = (): SafeAreaSet => ({
+const androidPhone = (b: SafeAreaSet['basis']): SafeAreaSet => ({
   portrait: { top: 28, right: 0, bottom: 0, left: 0 },
   // Rotated, the cutout moves to a side. Both bars stay hidden, so still nothing at top/bottom.
   // INFERRED, not measured: Court is portrait-locked, so nothing here could rotate to check it.
   landscape: { top: 0, right: 28, bottom: 0, left: 28 },
+  // The basis is the CALLER's to state, not this helper's. Every caller today says 'inferred', the
+  // Galaxy S22 included: it read 27, and this helper serves the two handsets' SHARED 28 — a value no
+  // device reported (close-out review). A row authoring its own measured value may say 'measured'.
+  basis: b,
 });
 
 /** A Face ID iPad: no notch, so NO top inset with the status bar hidden — only the 20pt
- *  home indicator, on the bottom in both orientations. */
+ *  home indicator, on the bottom in both orientations. PUBLISHED, not measured: the iPad attached
+ *  to this machine is an iPad mini 5, which has a Home button and no home indicator, so it cannot
+ *  confirm this row (#786 found a comment claiming it did). */
 const faceIdIPad = (): SafeAreaSet => ({
   portrait: { top: 0, right: 0, bottom: 20, left: 0 },
   landscape: { top: 0, right: 0, bottom: 20, left: 0 },
+  basis: basis('published'),
 });
 
 export interface DevicePreset {
@@ -147,22 +175,23 @@ export const DEVICE_PRESETS: DevicePreset[] = [
   FREE_PRESET,
 
   // ── Apple — logical points @ DPR → physical pixels ──
-  { name: 'iPhone SE',          category: 'Apple', logicalW: 375,  logicalH: 667,  physicalW: 750,  physicalH: 1334, safeArea: NO_SAFE_AREA }, // @2 — home button, no notch: 0 insets with the status bar hidden (measured on the iPhone 8, same generation)
-  { name: 'iPhone Air',         category: 'Apple', logicalW: 420,  logicalH: 912,  physicalW: 1260, physicalH: 2736, safeArea: notchedIPhone(68) }, // @3 — MEASURED on the device 2026-08-20 (viewport 420x912, env() top 68 / bottom 34). ⚠️ 68 is NEITHER published Dynamic Island value (59 on 16/16 Plus, 62 on 16 Pro/Max) — the Air has its own, so do not "correct" it to 62. Landscape is inferred from the portrait measurement: the app is portrait-locked, so it could not be read.
-  { name: 'iPhone 16 Pro',      category: 'Apple', logicalW: 402,  logicalH: 874,  physicalW: 1206, physicalH: 2622, safeArea: notchedIPhone(62) }, // @3
-  { name: 'iPhone 16 Pro Max',  category: 'Apple', logicalW: 440,  logicalH: 956,  physicalW: 1320, physicalH: 2868, safeArea: notchedIPhone(62) }, // @3
+  { name: 'iPhone SE',          category: 'Apple', logicalW: 375,  logicalH: 667,  physicalW: 750,  physicalH: 1334, safeArea: insetless(basis('measured', 'inferred')) }, // @2 — home button, no notch: 0 insets with the status bar hidden (measured on the iPhone 8, same generation)
+  { name: 'iPhone Air',         category: 'Apple', logicalW: 420,  logicalH: 912,  physicalW: 1260, physicalH: 2736, safeArea: notchedIPhone(68, basis('measured', 'inferred')) }, // @3 — MEASURED on the device 2026-08-20 (viewport 420x912, env() top 68 / bottom 34). ⚠️ 68 is NEITHER published Dynamic Island value (59 on 16/16 Plus, 62 on 16 Pro/Max) — the Air has its own, so do not "correct" it to 62. Landscape is inferred from the portrait measurement: the app is portrait-locked, so it could not be read.
+  { name: 'iPhone 16 Pro',      category: 'Apple', logicalW: 402,  logicalH: 874,  physicalW: 1206, physicalH: 2622, safeArea: notchedIPhone(62, basis('published')) }, // @3
+  { name: 'iPhone 16 Pro Max',  category: 'Apple', logicalW: 440,  logicalH: 956,  physicalW: 1320, physicalH: 2868, safeArea: notchedIPhone(62, basis('published')) }, // @3
   { name: 'iPad Pro 11"',       category: 'Apple', logicalW: 834,  logicalH: 1194, physicalW: 1668, physicalH: 2388, safeArea: faceIdIPad() }, // @2
   { name: 'iPad Pro 13"',       category: 'Apple', logicalW: 1032, logicalH: 1376, physicalW: 2064, physicalH: 2752, safeArea: faceIdIPad() }, // @2 (M4)
   { name: 'iPad Pro 12.9"',     category: 'Apple', logicalW: 1024, logicalH: 1366, physicalW: 2048, physicalH: 2732, safeArea: faceIdIPad() }, // @2
 
   // ── Samsung ──
-  { name: 'Galaxy S22',              category: 'Samsung', logicalW: 360, logicalH: 780,  physicalW: 1080, physicalH: 2340, safeArea: androidPhone() }, // @3
-  { name: 'Galaxy S24',              category: 'Samsung', logicalW: 360, logicalH: 780,  physicalW: 1080, physicalH: 2340, safeArea: androidPhone() }, // @3
-  { name: 'Galaxy Z Fold7 (Folded)', category: 'Samsung', logicalW: 360, logicalH: 840,  physicalW: 1080, physicalH: 2520, safeArea: androidPhone() }, // cover, @3
-  { name: 'Galaxy Z Fold7 (Open)',   category: 'Samsung', logicalW: 656, logicalH: 728,  physicalW: 1968, physicalH: 2184, safeArea: androidPhone() }, // main, @3 (near-square)
+  { name: 'Galaxy S22',              category: 'Samsung', logicalW: 360, logicalH: 780,  physicalW: 1080, physicalH: 2340, safeArea: androidPhone(basis('inferred')) }, // @3
+  { name: 'Galaxy S24',              category: 'Samsung', logicalW: 360, logicalH: 780,  physicalW: 1080, physicalH: 2340, safeArea: androidPhone(basis('inferred')) }, // @3
+  { name: 'Galaxy Z Fold7 (Folded)', category: 'Samsung', logicalW: 360, logicalH: 840,  physicalW: 1080, physicalH: 2520, safeArea: androidPhone(basis('inferred')) }, // cover, @3
+  { name: 'Galaxy Z Fold7 (Open)',   category: 'Samsung', logicalW: 656, logicalH: 728,  physicalW: 1968, physicalH: 2184, safeArea: androidPhone(basis('inferred')) }, // main, @3 (near-square)
   // Android tablets, both DPR 2 — the Tab S9 is 11" / 2560x1600 native, the S9+ 12.4" / 2800x1752.
-  // The zero insets are REASONED, not measured like androidPhone()'s 28: no ANDROID tablet is
-  // attached to this machine (an iPad mini 5 is, and it is what pins `faceIdIPad`). All three
+  // The zero insets are REASONED, not measured like androidPhone()'s 28 — and say so in their
+  // `basis` ('inferred'), which the read-back reports (#786): no ANDROID tablet is attached to this
+  // machine. All three
   // tablet rows (the Pixel Tablet below shares this note) put the camera in the BEZEL, so there is
   // no cutout to inset, and hide both system bars, so there is nothing at the bottom either — the
   // same shape and the same reason as the iPhone SE row. Replace with a real measurement the first
@@ -183,17 +212,17 @@ export const DEVICE_PRESETS: DevicePreset[] = [
   // 800x1280 logical is the Android-tablet mainstream, not a copy-paste slip: the Pixel Tablet and
   // the Galaxy Tab A9+ share the Tab S9's viewport exactly. Bigger logical size means a physically
   // bigger tablet, and the iPads still hold the catalog's widest portrait rows (iPad Pro 13" is 1032).
-  { name: 'Galaxy Tab S9',           category: 'Samsung', logicalW: 800, logicalH: 1280, physicalW: 1600, physicalH: 2560, safeArea: NO_SAFE_AREA },
-  { name: 'Galaxy Tab S9+',          category: 'Samsung', logicalW: 876, logicalH: 1400, physicalW: 1752, physicalH: 2800, safeArea: NO_SAFE_AREA },
+  { name: 'Galaxy Tab S9',           category: 'Samsung', logicalW: 800, logicalH: 1280, physicalW: 1600, physicalH: 2560, safeArea: insetless(basis('inferred')) },
+  { name: 'Galaxy Tab S9+',          category: 'Samsung', logicalW: 876, logicalH: 1400, physicalW: 1752, physicalH: 2800, safeArea: insetless(basis('inferred')) },
 
   // ── Google ──
-  { name: 'Pixel 9',      category: 'Google', logicalW: 412, logicalH: 924, physicalW: 1080, physicalH: 2424, safeArea: androidPhone() }, // ~@2.62
-  { name: 'Pixel Tablet', category: 'Google', logicalW: 800, logicalH: 1280, physicalW: 1600, physicalH: 2560, safeArea: NO_SAFE_AREA }, // same reasoned-zero shape as the Galaxy Tab S9 row above
+  { name: 'Pixel 9',      category: 'Google', logicalW: 412, logicalH: 924, physicalW: 1080, physicalH: 2424, safeArea: androidPhone(basis('inferred')) }, // ~@2.62
+  { name: 'Pixel Tablet', category: 'Google', logicalW: 800, logicalH: 1280, physicalW: 1600, physicalH: 2560, safeArea: insetless(basis('inferred')) }, // same reasoned-zero shape as the Galaxy Tab S9 row above
 
   // ── Other Android ──
-  { name: 'Xiaomi 14',         category: 'Android', logicalW: 400, logicalH: 890, physicalW: 1200, physicalH: 2670, safeArea: androidPhone() }, // @3
-  { name: 'Huawei Mate 60 Pro', category: 'Android', logicalW: 420, logicalH: 907, physicalW: 1260, physicalH: 2720, safeArea: androidPhone() }, // @3
-  { name: 'Motorola Edge 50',  category: 'Android', logicalW: 360, logicalH: 800, physicalW: 1080, physicalH: 2400, safeArea: androidPhone() }, // @3
+  { name: 'Xiaomi 14',         category: 'Android', logicalW: 400, logicalH: 890, physicalW: 1200, physicalH: 2670, safeArea: androidPhone(basis('inferred')) }, // @3
+  { name: 'Huawei Mate 60 Pro', category: 'Android', logicalW: 420, logicalH: 907, physicalW: 1260, physicalH: 2720, safeArea: androidPhone(basis('inferred')) }, // @3
+  { name: 'Motorola Edge 50',  category: 'Android', logicalW: 360, logicalH: 800, physicalW: 1080, physicalH: 2400, safeArea: androidPhone(basis('inferred')) }, // @3
 
   // ── Abstract aspect-ratio presets — logical == physical (DPR 1), no device chrome ──
   { name: '16:9 (720p)',  category: 'Aspect', logicalW: 1280, logicalH: 720,  physicalW: 1280, physicalH: 720,  safeArea: NO_SAFE_AREA },
@@ -300,15 +329,23 @@ export const CUSTOM_SIZE_MAX = 8192;
 export const CUSTOM_DPR_MIN = 0.5;
 export const CUSTOM_DPR_MAX = 4;
 
-/** Why a reported safe-area quartet reads the way it does.
+/** Where a reported safe-area quartet came from — how much to trust it (#786).
  *
- *  `'preset'` — the catalog's authored insets for this device and orientation. Zeros here are a
- *  STATEMENT (an iPhone SE with the status bar hidden really reports 0), not an absence.
- *  `'custom-none'` — an explicit pixel size has no device behind it, so there is nothing to look
- *  up and the quartet is zeros BY CONSTRUCTION. Reported rather than left implicit because
- *  `devicePresets.ts`'s header warns at length that an invented inset mis-authors a layout that
- *  then looks perfect in the editor; four bare zeros are indistinguishable from a measurement. */
-export type SafeAreaBasis = 'preset' | 'custom-none';
+ *  - `'measured'` — a real device reported it (`env()` read over its WebView's devtools socket).
+ *  - `'published'` — a vendor's per-model table, cross-checked but not measured here.
+ *  - `'inferred'` — REASONED (the bezel-camera tablets) or GENERALISED from another device (the
+ *    Android phones from two handsets, every landscape half from a portrait measurement). Not a
+ *    measurement: do not attribute a layout verdict to it.
+ *  - `'no-device'` — Free, the aspect presets, a custom size: there is nothing to look up, so the
+ *    quartet is zeros BY CONSTRUCTION.
+ *
+ *  Reported rather than left implicit because this file's header warns at length that an invented
+ *  inset mis-authors a layout that then looks perfect in the editor, and four bare zeros are
+ *  indistinguishable from a measurement. It replaces `'preset' | 'custom-none'`, which was derived
+ *  from the preset's NAME: every catalog row said `'preset'` — "zeros here are a statement" — for a
+ *  reasoned tablet zero and a measured iPhone SE zero alike, and a `16:9` row with no device behind
+ *  it said the same. Authored per row now, in `SafeAreaSet.basis`. */
+export type SafeAreaBasis = 'measured' | 'published' | 'inferred' | 'no-device';
 
 /** The name a custom-size preset carries. Flat rather than `Custom 800x600`: the read-back
  *  carries the numbers, so encoding them in the name would be a second copy to drift. */
@@ -342,7 +379,7 @@ export function describeDeviceSelection(p: DevicePreset, orientation: Orientatio
     physical: resolvePhysicalSize(p, orientation),
     dpr: presetDpr(p),
     safeArea: resolveSafeArea(p, orientation),
-    safeAreaBasis: p.name === CUSTOM_PRESET_NAME ? 'custom-none' : 'preset',
+    safeAreaBasis: p.safeArea.basis[orientation],
     free: p.logicalW <= 0,
   };
 }
