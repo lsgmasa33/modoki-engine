@@ -4246,9 +4246,32 @@ async function prewarmShadersForWorldInner(
   // module-global per-frame answer that `syncLights` reads, and the prewarm runs against the
   // STAGING world while the OLD one is still rendering frames — arming it here would decide the
   // outgoing scene's shadows from the incoming scene's lights for the length of the load.
+  //
+  // ⚠️ **Both this and the light mirror below are SKIPPED under a post-FX stack (#324a).** Under a
+  // stack the only thing this pass builds is the F4 placeholder, and #324b established that
+  // NOTHING downstream can cache-hit it — the live compile runs in the stack's own render context
+  // and shares zero node-builder states with `ctx 0`. So the lights are not here to make a variant
+  // the render will reuse (they cannot); the build's whole remaining job is to be a normal
+  // material compiled first (the TSL race) and to absorb the one-time NodeBuilder premium, and
+  // MEASURED 2026-09-10 on `demos/postfx-demo`, three paired runs, neither needs them:
+  //
+  //   arm            F4 build (ctx 0)   live compile (ctx 4)   ctx4 builds
+  //   lights mirrored    19.5 ms            138.3 ms               106
+  //   no lights           8.8 ms            137.9 ms               106
+  //
+  // The premium still transfers (the first ctx-4 build stays ~9 ms either way, versus ~19 ms
+  // unprimed), the live compile does not get more expensive, the call count is identical, and the
+  // scene renders the same 36 draw calls with no LightsNode warning and no `OutputType` error. So
+  // the mirror was costing ~55% of the one build this pass still makes, for nothing.
+  //
+  // ⚠️ It stays ON for the no-stack path, where it is load-bearing for the reason below: there the
+  // placeholders ARE compiled in the render's own context and ARE cache-hit by the first frame, so
+  // a missing `ShadowNode` means the first frame rebuilds the lot. Do not "simplify" this to an
+  // unconditional skip.
+  const mirrorLights = !willUseStack;
   const prewarmCasters: ShadowCaster[] = [];
   const maxShadowCasters = getActiveTierOverrides().maxShadowCasters;
-  if (maxShadowCasters > 0) {
+  if (mirrorLights && maxShadowCasters > 0) {
     world.query(Light).forEach((entity) => {
       if (deactivatedEntities.has(entity.id())) return;
       const l = entity.get(Light);
@@ -4261,8 +4284,19 @@ async function prewarmShadersForWorldInner(
   const keptCasters = keptShadowCasters(prewarmCasters, maxShadowCasters);
   const prewarmCasterAllowed = (id: number) => keptCasters === null || keptCasters.has(id);
 
-  // Mirror the staging world's lights so compileAsync produces the correct
-  // shader variants (otherwise Three.js's LightsNode warns + skips compile).
+  // Mirror the staging world's lights so compileAsync produces the correct shader variants
+  // (otherwise Three.js's LightsNode warns + skips compile).
+  //
+  // ⚠️ That parenthetical is about a scene carrying LIT PLACEHOLDER MESHES — it is not a reason
+  // the F4-only path needs lights, and reading it as one is why the skip below looks riskier than
+  // it is. Measured on the stack path: no warning, no `OutputType` error, same 36 draw calls.
+  //
+  // ⚠️ **The FOG mirror above is the same shape of waste under a stack and is deliberately NOT
+  // gated** (close-out sweep). Two reasons, both honest: no project pairs `Fog` with a post-FX
+  // trait today (`games/3d-test` has fog and no stack), so the case is unreachable; and unlike the
+  // lights, nothing has measured whether fog contributes to the one-time NodeBuilder premium that
+  // the F4 build exists to absorb. Gate it when a project makes it reachable AND the measurement
+  // says it is free — not before.
   //
   // ⚠️ `castShadow` is mirrored with the SAME tier gate the real render applies (#238). A
   // shadow-casting light puts a `ShadowNode` in every lit material's node graph, so a prewarm
@@ -4270,7 +4304,7 @@ async function prewarmShadersForWorldInner(
   // and the first frame then builds the real set synchronously, which is the stall. Measured on
   // the A23: 8 of forest-camp's pipelines were built twice, the second time at ~150 ms each.
   // Same reasoning as the environment mirror above: model the scene the tier will actually draw.
-  world.query(Light).updateEach(([light]: [{ lightType: string; color: number; intensity: number; distance: number; angle: number; penumbra: number; castShadow: boolean }], entity) => {
+  if (mirrorLights) world.query(Light).updateEach(([light]: [{ lightType: string; color: number; intensity: number; distance: number; angle: number; penumbra: number; castShadow: boolean }], entity) => {
     if (deactivatedEntities.has(entity.id())) return;
     const l = createLightFromTrait(light);
     if (l) {

@@ -8,11 +8,13 @@ import {
   resolveToolchainDir,
   shouldOverrideUserData,
   adoptLegacyToolchain,
+  adoptLegacyEditorState,
   multiProfileKey,
   PACKAGED_DIR,
   DEV_DIR,
 } from '../../electron/userDataDir';
 import { makeDirLink } from '../helpers/linkFixture';
+import { readCdpEnabled } from '../../electron/cdp';
 
 /**
  * WHERE the editor keeps its state. Every property here was a real, measured bug:
@@ -615,5 +617,126 @@ describe('main.ts must adopt the toolchain before anything provisions it', () =>
 
   it('it runs BEFORE the first ensureNodeProvisioned() call site', () => {
     expect(src.indexOf('adoptLegacyToolchain(')).toBeLessThan(src.indexOf('ensureNodeProvisioned()'));
+  });
+});
+
+/** #1041 — `3c61ce6fe` (#1036) keyed the packaged profile, so an EXISTING install's state files sit
+ *  one directory up and every reader keyed off `editorStateDir()` reads "absent" as "never chosen".
+ *  `readCdpEnabled` fails OPEN on that, so a deliberately-closed CDP port silently reopens once.
+ *
+ *  ⚠️ The load-bearing pair is "legacy present → honoured" AND "both absent → still ON". Getting
+ *  those backwards turns a one-launch reversion into a PERMANENT one, or breaks a clean install's
+ *  agent-first default. Neither test can catch that alone. */
+describe('adoptLegacyEditorState (#1041)', () => {
+  let appData: string;
+  /** The post-#1036 keyed profile: `<appData>/Modoki Editor/<install-id>`. */
+  let target: string;
+  const legacy = () => path.join(appData, PACKAGED_DIR);
+  const seedLegacy = (name: string, body: string) => {
+    realFs.mkdirSync(legacy(), { recursive: true });
+    realFs.writeFileSync(path.join(legacy(), name), body);
+  };
+  const seedTarget = (name: string, body: string) => {
+    realFs.mkdirSync(target, { recursive: true });
+    realFs.writeFileSync(path.join(target, name), body);
+  };
+  const read = (name: string) => realFs.readFileSync(path.join(target, name), 'utf8');
+
+  beforeEach(() => {
+    appData = realFs.mkdtempSync(path.join(os.tmpdir(), 'modoki-1041-'));
+    target = path.join(appData, PACKAGED_DIR, 'deadbeef');
+  });
+  afterEach(() => { realFs.rmSync(appData, { recursive: true, force: true }); });
+
+  it('adopts a legacy CDP opt-OUT, so the port stays closed after the upgrade (the bug)', () => {
+    seedLegacy('cdp.json', '{"enabled": false}');
+    expect(adoptLegacyEditorState(appData, target, realFs)).toEqual(['cdp.json']);
+    expect(readCdpEnabled(target)).toBe(false);
+  });
+
+  it('a clean install with NO legacy dir still defaults CDP ON (the other half of the pair)', () => {
+    expect(adoptLegacyEditorState(appData, target, realFs)).toEqual([]);
+    expect(readCdpEnabled(target)).toBe(true);
+  });
+
+  it('COPIES rather than moves — a sibling install must still find the opt-out', () => {
+    seedLegacy('cdp.json', '{"enabled": false}');
+    adoptLegacyEditorState(appData, target, realFs);
+    expect(realFs.existsSync(path.join(legacy(), 'cdp.json'))).toBe(true);
+    // …and a second install keyed differently adopts it independently.
+    const other = path.join(appData, PACKAGED_DIR, 'feedface');
+    expect(adoptLegacyEditorState(appData, other, realFs)).toEqual(['cdp.json']);
+    expect(readCdpEnabled(other)).toBe(false);
+  });
+
+  it('NEVER clobbers a choice already made in the new profile — either direction', () => {
+    seedLegacy('cdp.json', '{"enabled": false}');
+    seedTarget('cdp.json', '{"enabled": true}');
+    expect(adoptLegacyEditorState(appData, target, realFs)).toEqual([]);
+    expect(readCdpEnabled(target)).toBe(true);
+
+    const t2 = path.join(appData, PACKAGED_DIR, 'cafe0000');
+    realFs.mkdirSync(t2, { recursive: true });
+    realFs.writeFileSync(path.join(t2, 'cdp.json'), '{"enabled": false}');
+    seedLegacy('cdp.json', '{"enabled": true}');
+    expect(adoptLegacyEditorState(appData, t2, realFs)).toEqual([]);
+    expect(readCdpEnabled(t2)).toBe(false);
+  });
+
+  it('adopts the whole state set, not just the file #1041 was filed about', () => {
+    // Matched by EXTENSION — `ui-prefs.json` is a bare literal in zoom.ts, so a name list would
+    // have missed it. These are the five real state files as of 2026-09-10.
+    for (const n of ['cdp.json', 'cdp-port.json', 'backend-port.json', 'instance-tokens.json', 'ui-prefs.json']) {
+      seedLegacy(n, '{}');
+    }
+    expect(adoptLegacyEditorState(appData, target, realFs).sort()).toEqual(
+      ['backend-port.json', 'cdp-port.json', 'cdp.json', 'instance-tokens.json', 'ui-prefs.json'],
+    );
+  });
+
+  it("leaves Chromium's own profile data alone — it is extension-less or directories", () => {
+    // Verified against a real pre-#1036 profile: the only *.json at that root were ours.
+    seedLegacy('cdp.json', '{"enabled": false}');
+    for (const n of ['Preferences', 'Local State', 'Cookies', 'DIPS', 'Network Persistent State']) {
+      seedLegacy(n, 'binary-ish');
+    }
+    realFs.mkdirSync(path.join(legacy(), 'GPUCache'), { recursive: true });
+    expect(adoptLegacyEditorState(appData, target, realFs)).toEqual(['cdp.json']);
+    expect(realFs.readdirSync(target)).toEqual(['cdp.json']);
+  });
+
+  /** ⚠️ The return value alone CANNOT fail here — `copyFileSync` on a directory throws EISDIR and
+   *  the per-file catch swallows it, so `[]` comes back with or without the `isFile` check. The
+   *  distinguishing observation is the target DIR: the guard skips before `mkdirSync`, so a legacy
+   *  dir holding nothing but a `.json`-named FOLDER must not conjure an empty profile. */
+  it('skips a DIRECTORY that happens to end in .json — without creating the profile dir', () => {
+    realFs.mkdirSync(path.join(legacy(), 'weird.json'), { recursive: true });
+    expect(adoptLegacyEditorState(appData, target, realFs)).toEqual([]);
+    expect(realFs.existsSync(target)).toBe(false);
+  });
+
+  it('is idempotent — a second launch adopts nothing and changes nothing', () => {
+    seedLegacy('cdp.json', '{"enabled": false}');
+    expect(adoptLegacyEditorState(appData, target, realFs)).toEqual(['cdp.json']);
+    expect(adoptLegacyEditorState(appData, target, realFs)).toEqual([]);
+    expect(read('cdp.json')).toBe('{"enabled": false}');
+  });
+
+  /** ⚠️ Asserting only the `[]` return is UNFALSIFIABLE — with the never-clobber guard in place,
+   *  every entry would `continue` anyway, and `copyFileSync(x, x)` throws into the per-file catch
+   *  regardless. So this asserts the guard's own observable effect: it returns BEFORE the directory
+   *  is ever read. A spy that throws on `readdirSync` is the only thing that can tell the two
+   *  apart. */
+  it('no-ops when the target IS the legacy dir (a pre-#1036 flat layout) — without even reading it', () => {
+    seedLegacy('cdp.json', '{"enabled": false}');
+    // RECORDS rather than throws: the function catches a failing `readdirSync` and returns `[]`,
+    // so a tripwire that throws is swallowed and proves nothing — the first draft of this test.
+    let didRead = false;
+    const spy = {
+      ...realFs,
+      readdirSync: (p: string) => { didRead = true; return realFs.readdirSync(p) as unknown as string[]; },
+    } as unknown as Parameters<typeof adoptLegacyEditorState>[2];
+    expect(adoptLegacyEditorState(appData, legacy(), spy)).toEqual([]);
+    expect(didRead, 'the unkeyed-target guard must return before the directory is read').toBe(false);
   });
 });

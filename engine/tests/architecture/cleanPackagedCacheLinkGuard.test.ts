@@ -27,7 +27,7 @@
  *  `mkdirSync` and makes the fixture representative of what MODOKI_TOOLCHAIN_DIR actually points at.
  */
 import { describe, it, expect } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -159,6 +159,104 @@ function runForReal(toolchainDir: string, sandbox: string): { out: string; statu
 /** The script's OTHER refusal — a live packaged editor — also exits 1, and would make a reject
  *  case pass for the wrong reason and the accept case fail for one. Tell them apart by the text. */
 const RUNNING = /is currently running/;
+
+/** #1037 — **`--dry-run` must never be gated on liveness**, and this is the case the fix's own
+ *  design named and then did not build. It shipped as "structural, therefore covered", which is the
+ *  reasoning this repo keeps punishing: the branch `DRY_RUN ? [] : blockingEditors()` is one edit
+ *  away from being re-ordered back, and nothing would have noticed.
+ *
+ *  The discriminator is an environment where the liveness check CANNOT SUCCEED: with `PATH`
+ *  emptied, the script's `ps` spawn throws ENOENT, `listProcesses` returns `null`, and a real run
+ *  must refuse rather than assume nothing is running. A dry run in the SAME environment must still
+ *  work — because it deletes nothing, so what is alive cannot change its answer. Two flags, one
+ *  environment, opposite outcomes; neither assertion means anything without the other.
+ *
+ *  ⚠️ Spawned via `process.execPath`, not `'node'` — with `PATH` emptied the child could not
+ *  otherwise be found, and the test would "pass" by failing to start the subject at all. */
+/** #1037 case 6 — **the false red, reproduced and then shown gone, through the REAL CLI.**
+ *
+ *  The unit suite proves the predicate ignores a process that merely mentions the bundle path. This
+ *  proves the thing that actually happened: the six cases in this file went red on four different
+ *  clones because SOMETHING unrelated held that string in its argv. So hold one open on purpose and
+ *  drive the real script, which is the only form that can say the gate is fixed rather than that
+ *  the predicate is.
+ *
+ *  ⚠️ **The decoy carries the marker in its own ARGV, which is the whole point and also the
+ *  hazard.** `repoReapSpellings.test.ts` records the same trap: a test that spells the pattern into
+ *  its own command line matches itself, and BSD `pgrep` hides that by skipping its own ancestor
+ *  chain while `procps` does not. Here only the CHILD gets the string — `execFileSync`/`spawn` pass
+ *  argv to the child, and this worker's own argv is untouched — so the marker cannot come back
+ *  through the parent. */
+describe('clean-packaged-cache: a process merely MENTIONING the bundle does not red the gate (#1037)', () => {
+  const MARKER = `/Applications/${'Modoki Editor'}.app/Contents/MacOS/${'Modoki Editor'}`;
+
+  /** Is a process alive whose ARGV contains the marker? Read through `ps`, never `pgrep -f` — the
+   *  diagnostic for this bug is itself an instance of it. */
+  function decoyVisible(): boolean {
+    const out = execFileSync('ps', ['-Axo', 'command='], { encoding: 'utf8' });
+    return out.split('\n').some((l) => l.includes(MARKER) && l.includes('-e'));
+  }
+
+  it.skipIf(process.platform === 'win32')('the six cases stay green with a decoy held open', () => {
+    const decoy = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 20000)', MARKER], {
+      stdio: 'ignore', detached: false,
+    });
+    try {
+      // The control: without this the case passes when the decoy failed to start, which is the
+      // shape that makes "it stayed green" mean nothing.
+      const deadline = Date.now() + 5000;
+      let seen = false;
+      while (Date.now() < deadline && !(seen = decoyVisible())) { /* spin briefly */ }
+      expect(seen, 'the decoy never appeared in the process table — the case would be vacuous').toBe(true);
+
+      // ⚠️ **A REAL run, not `--dry-run`** — and the first version of this case used the dry one,
+      // which made it unfalsifiable. `--dry-run` now short-circuits the liveness check entirely
+      // (that is its own rule, tested above), so with it the predicate is never consulted and the
+      // case passed with the ORIGINAL #1037 bug restored. Mutation-checked after the change:
+      // matching argv instead of the executable now turns this red.
+      // `runForReal` proves every target is inside the fixture before it deletes anything.
+      const base = makeFixtureRoot('cpc-decoy-');
+      const tc = path.join(base, 'tc');
+      fs.mkdirSync(tc, { recursive: true });
+      const { out, status } = runForReal(tc, base);
+
+      expect(out, 'the decoy must not be read as a running editor').not.toMatch(RUNNING);
+      expect(out).not.toMatch(/is currently running out of the state/i);
+      expect(status, `expected a clean run, got ${status}:\n${out}`).toBe(0);
+    } finally {
+      decoy.kill('SIGKILL');
+    }
+  });
+});
+
+describe('clean-packaged-cache: --dry-run is never gated on liveness (#1037)', () => {
+  function spawnWithoutPath(args: string[], sandbox: string): { out: string; status: number } {
+    const env = { ...sandboxEnv(sandbox), PATH: '', Path: '' };
+    try {
+      const out = execFileSync(process.execPath, [CLI, ...args], { encoding: 'utf8', env });
+      return { out, status: 0 };
+    } catch (e) {
+      const err = e as { status?: number; stdout?: string; stderr?: string };
+      return { out: `${err.stdout ?? ''}${err.stderr ?? ''}`, status: err.status ?? -1 };
+    }
+  }
+
+  it('REFUSES a real run when the process table cannot be read — it must not assume "nothing is running"', () => {
+    const base = makeFixtureRoot('cpc-nopath-real-');
+    const { out, status } = spawnWithoutPath([], base);
+    expect(status, `expected a refusal, got:\n${out}`).not.toBe(0);
+    expect(out).toMatch(/could not read the process table/i);
+  });
+
+  /** The half that is the actual subject: SAME unreadable process table, `--dry-run` proceeds. */
+  it('does NOT refuse a --dry-run in that same environment', () => {
+    const base = makeFixtureRoot('cpc-nopath-dry-');
+    const { out, status } = spawnWithoutPath(['--dry-run'], base);
+    expect(status, `--dry-run must not be gated on liveness, but it exited ${status}:\n${out}`).toBe(0);
+    expect(out).not.toMatch(/could not read the process table/i);
+    expect(out).not.toMatch(RUNNING);
+  });
+});
 
 describe.skipIf(!canMakeDirLink())('clean-packaged-cache refuses a linked target (#883)', () => {
   it('REFUSES, naming the link and what it resolves to', () => {

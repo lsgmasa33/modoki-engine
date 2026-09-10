@@ -253,6 +253,49 @@ describe('prewarmShadersForWorld — F4 empty-scene first-compile guarantee', ()
     expect(standardMeshCounts[0]).toBe(1);
   });
 
+  /** #324a — the SECOND half of #324b's waste, and the reason it is safe to drop.
+   *
+   *  The light + shadow-caster mirrors exist (#238) so a placeholder compiles the same lit variant
+   *  the first real frame binds. Under a stack there is no such reuse to protect: #324b measured
+   *  ZERO overlap between the canvas-context states this pass builds and the ones the live compile
+   *  builds in the stack's own context. What is left for F4 to do is be a normal material compiled
+   *  first (the TSL race) and absorb the one-time NodeBuilder premium — and measured on
+   *  `demos/postfx-demo` over three paired runs, neither needs the lights: the F4 build falls
+   *  19.5ms -> 8.8ms while the live compile stays 138.3ms -> 137.9ms over an identical 106 builds.
+   *
+   *  ⚠️ The control below is what makes this mean anything. A mirror that skipped unconditionally
+   *  would pass this test and silently re-buy #238's first-frame stall on every project without a
+   *  stack, which is most of them. */
+  it('skips the LIGHT mirror too under a post-FX stack — nothing downstream can cache-hit it', async () => {
+    const { world, sync } = await setup({ primitives: true });
+    const { NPRPostFX } = await import('../../src/runtime/traits/NPRPostFX');
+    const { Light } = await import('../../src/three/traits/Light');
+    const { renderer, compiledLightShadows, compiledMeshes } = makeRendererStub({ isWebGPU: true });
+
+    world.spawn(NPRPostFX({ enabled: false }));
+    world.spawn(Light({ lightType: 'directional', intensity: 1, castShadow: true }));
+
+    await sync.prewarmShadersForWorld(world, renderer as never, camera);
+
+    expect(compiledLightShadows[0], 'no light may be mirrored into the F4-only prewarm').toEqual([]);
+    // …and F4 is still there, still plain: dropping the lights must not cost the first-compile
+    // guarantee, which is the one job this build still has that nothing else can do.
+    expect(compiledMeshes[0][0].material.constructor).toBe(THREE.MeshStandardMaterial);
+  });
+
+  it('still mirrors the light when NO post-FX trait is present — the control for the case above', async () => {
+    const { world, sync } = await setup({ primitives: true });
+    const { Light } = await import('../../src/three/traits/Light');
+    const { renderer, compiledLightShadows } = makeRendererStub({ isWebGPU: true });
+
+    world.spawn(Light({ lightType: 'directional', intensity: 1, castShadow: true }));
+
+    await sync.prewarmShadersForWorld(world, renderer as never, camera);
+
+    expect(compiledLightShadows[0], 'the no-stack path still needs the lit variant to match')
+      .toEqual([true]);
+  });
+
   it('leaves the prewarm scene clean afterwards (placeholder disposed + removed)', async () => {
     const { world, sync } = await setup();
     const { renderer, compiledScenes } = makeRendererStub();

@@ -24,7 +24,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 // The ONE path-identity normalisation (#869) — see engine/scripts/pathIdentity.mjs. Until #899
 // this file hand-rolled it twice, and neither copy resolved symlinks.
-import { canonicalPath, pathCaseKey } from '../scripts/pathIdentity.mjs';
+import { canonicalPath, pathCaseKey, samePath } from '../scripts/pathIdentity.mjs';
 
 /** Product dir for the shipped editor — what `setName` was supposed to give us. */
 export const PACKAGED_DIR = 'Modoki Editor';
@@ -206,4 +206,77 @@ export function adoptLegacyToolchain(
     }
   }
   return null;
+}
+
+/**
+ * One-time ADOPT of the editor's OWN state files into the keyed profile dir (#1041).
+ *
+ * `3c61ce6fe` (#1036) moved the packaged profile from `<appData>/Modoki Editor` to
+ * `<appData>/Modoki Editor/<install-id>` — so the legacy home is precisely the PARENT of the new
+ * one. It moved where we LOOK, not the data, and **every reader keyed off `editorStateDir()` reads
+ * "file absent" as "the user never chose"**. For an existing install that is wrong exactly once, and
+ * one of those readers is a security opt-out that fails OPEN: `readCdpEnabled` returns true for an
+ * absent `cdp.json`, so a 127.0.0.1 remote-debugging port the user deliberately unchecked silently
+ * comes back on the first launch after upgrade. It is the one item in #1036's reset list a user
+ * cannot notice by looking — the AI panel's checkbox reads the same missing file, so it agrees with
+ * the wrong answer. (Measured 2026-09-10: the shipped v0.6.0 install on the author's machine still
+ * has `backend-port.json`, `cdp-port.json` and `instance-tokens.json` sitting flat in the legacy dir.)
+ *
+ * ⚠️ **Matched by EXTENSION, not by a list of names.** Enumerating the state files was the first
+ * draft and it was already wrong: `ui-prefs.json` is a bare literal in `zoom.ts` rather than an
+ * exported constant, so a hand-maintained set would have shipped missing one, invisibly — the same
+ * "bind the whole thing rather than enumerate fields" call CLAUDE.md makes for authored prefabs. A
+ * `*.json` file directly in the profile root is ours by construction: Chromium's own files there are
+ * extension-less (`Preferences`, `Local State`, `Cookies`, `DIPS`, `Network Persistent State`) or
+ * directories. Verified against a real pre-#1036 profile — the only `*.json` at that root were the
+ * three above.
+ *
+ * ⚠️ **COPY, not rename** (owner, 2026-09-10) — the one place this deliberately departs from
+ * `adoptLegacyToolchain` above. A toolchain is 1.2GB and single-owner, so moving it is right. These
+ * are small JSON files under a dir shared by EVERY packaged install on the machine (each clone's
+ * `smoke-packaged.sh` builds its own), and a rename would let the first upgraded install strip the
+ * opt-out from the others — reintroducing this very bug, rarer and harder to spot. The cost accepted
+ * in exchange is that the legacy files linger; cleaning them up is a separate, deliberate step.
+ *
+ * ⚠️ **The two DOTFILES in that directory are deliberately NOT adopted, and this is not an
+ * oversight of the `*.json` rule.** `.updaterId` (electron-updater's staged-rollout id) and
+ * `.vite-cache-build` (the signature pairing with `vite-cache`) are both read from
+ * `app.getPath('userData')` — which is the possibly SUB-KEYED dir — while everything here is read
+ * from `editorStateDir()`, which is deliberately the subKey-less `base`. They live in a different
+ * directory by design, so copying them into `base` would not put them where their readers look.
+ * The cost of leaving them is a fresh rollout bucket and one cache rebuild after an upgrade.
+ *
+ * Non-recursive, best-effort per file, and **never clobbers**: a file already present in the new
+ * profile is a choice made THERE and always wins, which is also what makes this idempotent and safe
+ * to run on every launch. Returns the basenames adopted (for the launch log), or `[]`.
+ */
+export function adoptLegacyEditorState(
+  appData: string,
+  target: string,
+  fsLike: {
+    readdirSync(p: string): string[];
+    statSync(p: string): { isFile(): boolean };
+    existsSync(p: string): boolean;
+    mkdirSync(p: string, o: { recursive: true }): void;
+    copyFileSync(a: string, b: string): void;
+  },
+): string[] {
+  const legacy = path.join(appData, PACKAGED_DIR);
+  // Nothing to do when the profile IS the legacy dir (a pre-#1036 layout, or a caller that passed
+  // the unkeyed path) — copying a directory onto itself would be a no-op at best.
+  if (samePath(legacy, target)) return [];
+  let names: string[];
+  try { names = fsLike.readdirSync(legacy); } catch { return []; } // no legacy profile — a clean install
+  const adopted: string[] = [];
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue; // …which also skips the keyed subdir itself
+    try {
+      if (!fsLike.statSync(path.join(legacy, name)).isFile()) continue;
+      if (fsLike.existsSync(path.join(target, name))) continue; // the new profile's own choice wins
+      fsLike.mkdirSync(target, { recursive: true });
+      fsLike.copyFileSync(path.join(legacy, name), path.join(target, name));
+      adopted.push(name);
+    } catch { /* best-effort per file: one unreadable pref must not strand the others */ }
+  }
+  return adopted;
 }

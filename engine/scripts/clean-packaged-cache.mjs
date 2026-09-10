@@ -8,8 +8,22 @@
  *  clearing one out from under a live dev editor corrupts that session, not this machine's
  *  "packaged install" state.
  *
- *  Refuses to run while a packaged instance is alive (its Chromium profile is open — deleting
- *  under it corrupts rather than cleans) unless `--force` is passed to kill it first.
+ *  Refuses to run while a packaged instance is alive IN THE STATE IT WOULD DELETE (its Chromium
+ *  profile is open — deleting under it corrupts rather than cleans) unless `--force` is passed to
+ *  kill it first. The predicate is `livePackagedEditor.mjs`; read its header before touching it,
+ *  because the obvious spelling of this check is the one that was wrong (#1037). Two properties
+ *  worth knowing here: **`--dry-run` never consults it** (a report-only run deletes nothing, so
+ *  liveness cannot change its answer), and a sibling clone's packaged smoke running out of its own
+ *  temp dir is deliberately NOT a blocker.
+ *
+ *  ⚠️ **KNOWN GAP: `--toolchain` does not check for a live DEV editor** (owner, 2026-09-10, asked
+ *  and declined). The toolchain is shared between dev and packaged, so a `--toolchain` wipe can
+ *  proceed with a dev editor running and this guard reporting all clear. Left as a gap on purpose
+ *  rather than guarded: **nobody has established that a toolchain wipe actually breaks a running
+ *  dev editor** — `ensureNode`/`ensureJdk` resolve at build time, not continuously — and a guard
+ *  against an unobserved failure would be the third refusal in this script defended by reasoning
+ *  rather than measurement. If you see a dev editor break this way, that observation is the thing
+ *  that should motivate the fix; record it before writing one.
  *
  *  Also refuses — on every platform, `--dry-run` included, and BEFORE the `--force` kill above —
  *  when a candidate's subtree is not SELF-CONTAINED, because `rmSync` acts on names rather than
@@ -33,13 +47,15 @@ import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { productName, killPackaged, REAP_ERROR, appSupportRoot, defaultToolchainDir } from './packagedAppPaths.mjs';
+import { productName, killPackaged, REAP_ERROR, appSupportRoot, defaultToolchainDir, packagedUserData } from './packagedAppPaths.mjs';
 // The ONE 'same directory?' comparison (#869).
 import { samePath } from './pathIdentity.mjs';
 // The ONE 'would a recursive delete misreport this subtree?' walk (#990/#989/#1004).
 import { findDeleteBoundaries, describeBoundary } from './deleteBoundary.mjs';
 // The ONE 'does this look like a toolchain root?' check, shared with toolchain/index.ts (#1005).
 import { toolchainRootRefusal, describeToolchainRootRefusal } from './toolchainRoot.mjs';
+// The ONE 'is a packaged editor living in what I am about to delete?' check (#1037).
+import { findBlockingEditors, sharedStatePaths, stagingRoots } from './livePackagedEditor.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(__dirname, '..', '..');
@@ -157,17 +173,32 @@ function targets() {
   return list;
 }
 
-function isPackagedRunning() {
-  if (process.platform === 'win32') {
-    try {
-      const out = execFileSync('tasklist', ['/FI', `IMAGENAME eq ${NAME}.exe`], { encoding: 'utf8' });
-      return out.includes(`${NAME}.exe`);
-    } catch { return false; }
-  }
-  try {
-    execFileSync('pgrep', ['-f', `${NAME}.app`], { stdio: 'ignore' });
-    return true;
-  } catch { return false; } // pgrep exits 1 when nothing matches — the normal case
+/** Packaged instances LIVING IN the state this run would delete — see `livePackagedEditor.mjs`
+ *  for why the question is about the targets and the executable rather than about a NAME in argv.
+ *
+ *  ⚠️ Candidates are recomputed per call, not captured: the `--force` path calls this again after
+ *  the reap, and between the two calls the only thing that may have changed is which processes are
+ *  alive. Recomputing keeps the two answers about the same set of paths. */
+function blockingEditors() {
+  return findBlockingEditors({
+    productName: NAME,
+    candidates: targets().map((t) => t.p),
+    // Both from `livePackagedEditor.mjs`, not re-derived here: a second spelling of the
+    // bundle-id-keyed list is the shadowing shape this file already fixed once, and it would go
+    // stale the day a name-keyed candidate is added to `targets()` alone.
+    sharedStatePaths: sharedStatePaths(id, NAME),
+    stagingRoots: stagingRoots(),
+    // `packagedUserData()`, not a second spelling of it (close-out review): this file already
+    // imports the module that owns where packaged state lives, and a hand-re-derivation here would
+    // keep checking the old location the day that moves — the guard then silently stops blocking.
+    defaultUserData: packagedUserData(),
+  });
+}
+
+function describeBlockers(blockers) {
+  return blockers
+    .map((b) => `  pid ${b.pid} — ${b.exe}\n      using ${b.userData}`)
+    .join('\n');
 }
 
 function ejectStaleVolumes() {
@@ -285,16 +316,41 @@ if (linked.length > 0) {
   process.exit(1);
 }
 
-if (isPackagedRunning()) {
+// ⚠️ **A dry run never consults this at all** (#1037). Liveness decides whether DELETING is safe,
+// and a dry run deletes nothing — the old order asked the question first and refused a report-only
+// run on the strength of it, which is most of what made this guard fire when it had no business
+// firing. `--dry-run`'s job is to answer "what would this do", and a live editor does not change
+// that answer.
+const blockers = DRY_RUN ? [] : blockingEditors();
+// ⚠️ `null` is "the process table could not be READ", which is not "nothing is running" — see
+// `livePackagedEditor.mjs`. Refusing is the only safe reading: this script's next act is a
+// recursive delete of an app's state.
+if (blockers === null) {
+  console.error(
+    `[clean-packaged-cache] refusing to continue: could not read the process table, so it is `
+    + `unknown whether "${NAME}" is running. Deleting its state while it is live corrupts rather `
+    + 'than cleans. Re-run once the process list is readable, or quit the editor and pass --force.',
+  );
+  process.exit(1);
+}
+if (blockers.length > 0) {
   if (!FORCE) {
-    console.error(`[clean-packaged-cache] "${NAME}" is currently running — quit it first, or re-run with --force to kill it.`);
+    console.error(
+      `[clean-packaged-cache] "${NAME}" is currently running out of the state this would delete `
+      + `— quit it first, or re-run with --force to kill it:\n${describeBlockers(blockers)}`,
+    );
     process.exit(1);
   }
   console.log(`[clean-packaged-cache] killing running "${NAME}"…`);
-  if (!DRY_RUN) {
+  {
+    // No `if (!DRY_RUN)` here any more (close-out review): a dry run now short-circuits the
+    // liveness check entirely above, so this branch was unreachable with DRY_RUN true and the
+    // condition read as a guard that could still fire. ⚠️ The visible consequence is that
+    // `--dry-run --force` says NOTHING about a live editor — it is a report of what would be
+    // deleted, and liveness does not change that report.
     // ⚠️ **The reap's outcome decides whether the wipe below is safe, so it must not be
     // discarded** (close-out review of #944/#959). We are on this branch because
-    // `isPackagedRunning()` said TRUE; if the reap then fails to run at all, the `rmSync` below
+    // `blockingEditors()` was non-empty; if the reap then fails to run at all, the `rmSync` below
     // deletes this app's userData WHILE IT IS LIVE — which this file's own header calls
     // "corrupts rather than cleans", the exact outcome the running-check exists to prevent.
     const outcome = killPackaged();
@@ -302,15 +358,28 @@ if (isPackagedRunning()) {
     // was delivered, not that the process is gone yet, and a `--force` run that proceeds into
     // the wipe a beat too early has the same consequence as one that never killed anything.
     // `Atomics.wait`, not `execFileSync('sleep')` — Windows has no `sleep`, and this script is
-    // the one that runs there too. Up to 2s, re-asking each 100ms.
+    // the one that runs there too. ⚠️ **Up to ~3.5s, not the 2s this said** (close-out review):
+    // 20 naps of 100ms PLUS 21 evaluations of the predicate, and each of those spawns two `ps`
+    // processes — measured at ~70ms per call on an 841-row machine. The number is stated because a
+    // wrong one here reads as a timeout budget somebody may rely on.
     const nap = () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
-    for (let i = 0; i < 20 && isPackagedRunning(); i += 1) nap();
+    for (let i = 0; i < 20 && (blockingEditors()?.length ?? 1) > 0; i += 1) nap();
     // ⚠️ **Two different facts, and only one of them justifies refusing.** An earlier version
     // OR'd them and then printed "is STILL RUNNING" — stating as fact something the line above
     // had just measured to be false (a box with no `pkill` gives REAP_ERROR; if the human quits
     // the editor during the wait, the app is gone and the message is a lie). The measurement
     // wins: what makes the wipe unsafe is the app being ALIVE, not the reap's verdict.
-    if (isPackagedRunning()) {
+    // `?? 1` again: an unreadable process table after the reap is not proof the app is gone.
+    const after = blockingEditors();
+    if (after === null) {
+      console.error(
+        `[clean-packaged-cache] refusing to continue: the process table became unreadable after the`
+        + ` reap, so whether "${NAME}" is still running is UNKNOWN. Wiping its userData now would`
+        + ' corrupt a live app rather than clean it.',
+      );
+      process.exit(1);
+    }
+    if (after.length > 0) {
       console.error(
         `[clean-packaged-cache] refusing to continue: "${NAME}" is STILL RUNNING after the reap`
         + `${outcome === REAP_ERROR ? ' (and the reap itself failed to run)' : ''}. `

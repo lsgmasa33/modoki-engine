@@ -22,7 +22,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import { initFileLog, getLogFilePath, logToFile } from './fileLog';
-import { resolveUserDataDir, resolveToolchainDir, shouldOverrideUserData, adoptLegacyToolchain, multiProfileKey } from './userDataDir';
+import { resolveUserDataDir, resolveToolchainDir, shouldOverrideUserData, adoptLegacyToolchain, adoptLegacyEditorState, multiProfileKey } from './userDataDir';
 
 // The app version, bundled from the root package.json at build time (the single source
 // of truth — see build-electron.mjs). Prefer this over `app.getVersion()` for DISPLAY:
@@ -108,6 +108,9 @@ setRecentsScope(editorIdentity());
  *  the accessor then falls back to whatever Chromium was told. Lazy on purpose — reading
  *  `getPath('userData')` eagerly here is the very thing this file's header forbids. */
 let profileBaseDir: string | null = null;
+/** Editor state files adopted from the pre-#1036 profile this launch — reported once the log file
+ *  exists (see the stash note in setUserDataDir). */
+let adoptedLegacyState: string[] = [];
 
 /** WHICH PROJECT this launch opens — decided ONCE, at module load, and reused by whenReady.
  *
@@ -178,6 +181,22 @@ if (shouldOverrideUserData(process.argv)) {
   // #1036 and matters for EVERY launch now. See setUiPrefsDir.
   setUiPrefsDir(base);
   profileBaseDir = base;
+
+  // #1041: #1036 keyed the PACKAGED profile, so an existing install's state files are one dir up —
+  // and every reader here treats absent as "never chosen". `readCdpEnabled` fails OPEN on that, so
+  // a deliberately-closed CDP port would silently reopen once, invisibly. Adopt before the first
+  // read (the CDP decision below is module-level and runs a few hundred lines down).
+  // Packaged only: dev's dir was ALREADY keyed before #1036, so it has no legacy state to adopt.
+  if (app.isPackaged) {
+    // ⚠️ The result is STASHED, not logged here. This runs before `initFileLog()` below, where
+    // `console` is not yet teed to `main.log` and a packaged app has no terminal — so a message
+    // logged at this point is written precisely nowhere (that unlogged window is #1043). Adopting
+    // a security opt-out silently is exactly what we must not do, so it is reported after the log
+    // file exists.
+    try {
+      adoptedLegacyState = adoptLegacyEditorState(app.getPath('appData'), base, fs);
+    } catch { /* never block startup on a migration */ }
+  }
 }
 
 // ⚠️ **Declared BELOW the setPath on purpose.** It mentions `app.getPath('userData')`, and
@@ -188,6 +207,17 @@ if (shouldOverrideUserData(process.argv)) {
 // `app.setName` and moved the shipped editor's whole profile for weeks. Function declarations
 // hoist, so the call site further down is unaffected.
 function editorStateDir(): string { return profileBaseDir ?? app.getPath('userData'); }
+
+/** Any live BrowserWindow, or null — the parent probe `reportFatalStartup` needs (#1034).
+ *
+ *  ⚠️ ANY window counts, the splash included. All this has to buy is that the message box is a
+ *  SHEET rather than app-modal: a parentless box runs a nested native modal loop and blocks the
+ *  event loop the armed exit timer runs on. Deliberately laxer than `autoUpdate.ts`'s `show()`,
+ *  which refuses the splash because it needs the user's ANSWER and a splash destroyed at
+ *  renderer-mount takes an open sheet down unanswered — see docs/build.md § #1034. */
+function firstLiveWindow(): BrowserWindow | null {
+  return BrowserWindow.getAllWindows().find((w) => !w.isDestroyed()) ?? null;
+}
 
 // Adopt a pre-existing toolchain instead of re-fetching ~1.2GB. Pinning the toolchain dir
 // moved where we LOOK, not the data — without this the shipped editor silently re-downloads
@@ -204,6 +234,10 @@ try {
 // attached terminal on macOS Finder-launch OR any Windows GUI launch) leaves a
 // diagnosable trail instead of failing silently. Best-effort; never throws.
 initFileLog();
+// Now that console is teed to main.log, report the #1041 adopt that ran before it.
+if (adoptedLegacyState.length) {
+  console.log(`[modoki-electron] adopted legacy editor state (#1041): ${adoptedLegacyState.join(', ')}`);
+}
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { createAssetBackend, type ElectronAssetBackend } from './assetBackend';
@@ -213,6 +247,7 @@ import type { LiveReloadKind } from '../plugins/vite-asset-scanner';
 import { captureViewport, CaptureUnavailableError, captureRefusalBody, tap, drag, hover, scroll, pointerDown, pointerMove, pointerUp, pressKey, typeText, focusElement, captureGesture } from './rendererOps';
 import type { RenderSurfaceFacts } from './rendererOps';
 import { createInputRoutes, inputDeliverability, hiddenWindowRefusal } from './inputRoutes';
+import { reportFatalStartup } from './fatalDialog';
 import { serializeMenu, triggerMenuItem, type MenuItemLike } from './menuActions';
 import { getSsrLoadModule, closeSsrLoader } from './ssrLoader';
 import { buildProdCsp, PROD_CSP_ORIGINS } from './csp';
@@ -1752,8 +1787,17 @@ app.whenReady().then(async () => {
       ? `MODOKI_BACKEND_PORT=${pinned} is already in use — refusing to drift (the MCP target must stay stable). Free that port or unset MODOKI_BACKEND_PORT.`
       : `Could not start the local backend on any port.\n\n${why}`;
     console.error(`[modoki-electron] ${msg}`);
-    dialog.showErrorBox('Modoki Editor', msg); // fail LOUD — a windowless live process is worse
-    app.exit(1);
+    logToFile('error', `[startup] ${msg}`);
+    // fail LOUD — a windowless live process is worse. #1034: the exit is ARMED FIRST, so an
+    // unattended launch cannot be parked forever in a modal nobody can answer.
+    reportFatalStartup(
+      { title: 'Modoki Editor', message: msg },
+      {
+        parentWindow: firstLiveWindow,
+        showMessageBox: (parent, o) => dialog.showMessageBox(parent as BrowserWindow, o),
+        terminate: () => app.exit(1),
+      },
+    );
     return;
   }
   resolvedBackendPort = backendHandle.port; // the port that actually bound — what /api/identity reports
@@ -2102,16 +2146,25 @@ app.whenReady().then(async () => {
       // Show the dialog (modal, sits above the frameless splash) BEFORE closing the
       // splash — destroying the last window first would trip window-all-closed →
       // app.quit() and race the dialog away.
-      try {
-        const logHint = getLogFilePath() ? `\n\nFull log: ${getLogFilePath()}` : '';
-        dialog.showErrorBox(
-          'Modoki could not open the project',
-          `Opening:\n${state.root}\n\nfailed while starting the editor:\n\n${msg}${logHint}`,
-        );
-      } catch { /* pre-window dialog best-effort */ }
-      closeSplash();
-      quitExitCode = 1; // a failed launch must not exit 0 — see quitExitCode (#68)
-      app.quit();
+      const logHint = getLogFilePath() ? `\n\nFull log: ${getLogFilePath()}` : '';
+      // #1034: exit armed before the dialog. ⚠️ This site must NOT become `app.exit(1)` — it goes
+      // through the deferred before-quit teardown, and `quitExitCode` is what keeps a failed launch
+      // from reporting 0 (#68).
+      reportFatalStartup(
+        {
+          title: 'Modoki could not open the project',
+          message: `Opening:\n${state.root}\n\nfailed while starting the editor:\n\n${msg}${logHint}`,
+        },
+        {
+          parentWindow: firstLiveWindow,
+          showMessageBox: (parent, o) => dialog.showMessageBox(parent as BrowserWindow, o),
+          terminate: () => {
+            closeSplash();
+            quitExitCode = 1; // a failed launch must not exit 0 — see quitExitCode (#68)
+            app.quit();
+          },
+        },
+      );
       return;
     }
   }
@@ -2138,8 +2191,19 @@ app.whenReady().then(async () => {
   const why = e instanceof Error ? (e.stack ?? e.message) : String(e);
   console.error('[modoki-electron] startup failed:', why);
   logToFile('error', `[startup] ${why}`);
-  try { dialog.showErrorBox('Modoki Editor — startup failed', `${e instanceof Error ? e.message : String(e)}\n\nLog: ${getLogFilePath()}`); } catch { /* pre-ready */ }
-  app.exit(1);
+  // #1034: the exit is armed before the dialog, so this handler terminates even when nobody can
+  // answer the modal — which is every unattended launch, and is the state it exists to prevent.
+  reportFatalStartup(
+    {
+      title: 'Modoki Editor — startup failed',
+      message: `${e instanceof Error ? e.message : String(e)}\n\nLog: ${getLogFilePath()}`,
+    },
+    {
+      parentWindow: firstLiveWindow,
+      showMessageBox: (parent, o) => dialog.showMessageBox(parent as BrowserWindow, o),
+      terminate: () => app.exit(1),
+    },
+  );
 });
 
 app.on('window-all-closed', () => {

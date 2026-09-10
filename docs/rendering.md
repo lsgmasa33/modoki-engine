@@ -4068,6 +4068,46 @@ three's incrementing material id, which differs between two runs of the same bui
   presence rather than `enabled`. What remains is the F4 build itself, which is not waste: it is
   what keeps a normal material the renderer's first compile, and what absorbs the first-lit-build
   premium below.
+- ⭐ **…and its LIGHT/shadow mirrors were the other half of that waste — FIXED 2026-09-10 (#324a).**
+  #324b skipped the per-object walk because nothing downstream can cache-hit it; the light and
+  shadow-caster mirrors were left in, and they are wasted for exactly the same reason. Under a stack
+  F4's only remaining jobs are being a normal material compiled first (the TSL race) and absorbing
+  the one-time premium, and **neither needs the lights**. Measured on `demos/postfx-demo`, three
+  paired local runs: F4 build **19.5 ms → 8.8 ms** while the live compile held at **138.3 ms →
+  137.9 ms over an identical 106 builds**, same 36 draw calls, no `LightsNode` warning and no
+  `OutputType` error. Device A/B on the **A23**, both arms built from the same tree as debug APKs
+  and installed back-to-back, three cold boots each — the prewarm longtask:
+
+  | arm | runs | mean |
+  |---|---|---|
+  | lights mirrored | 310 / 283 / 273 ms | **288.7 ms** |
+  | mirror skipped | 208 / 185 / 186 ms | **193.0 ms** |
+
+  ⚠️ **A fourth idea was BUILT, measured and deliberately reverted — read this before rebuilding it.**
+  Paying the premium when the scene's ENVIRONMENT resource lands (~1.0-1.1 s) rather than at the
+  swap (~2.1 s), via a `SceneManager` hook fired per acquired resource. It **works**: on the A23 the
+  pre-swap stall left the top-6 longtasks entirely and a ~270 ms task appeared at ~1000-1120 ms
+  instead, during model streaming, and the ctx-0 build count proves the transfer (1 standard build
+  before — F4 paying ~8 ms; 2 after — prime 5.3 ms, then F4 **0.0 ms**). It was reverted anyway
+  (owner, 2026-09-10) because **relocation is not a saving**:
+  - `#334`'s `waitForScenePaint` holds the loading overlay up until the swapped scene's first
+    painted frame, so work moved from one side of that window to the other is invisible to the
+    player unless the window itself shrinks.
+  - Total longtask across the three arms went 1544 -> 1574 -> 1488 ms, and the MIDDLE arm is higher
+    than the control despite the light-mirror fix definitively removing ~96 ms. The metric is
+    noisier than the effect.
+
+  **What it would need to be worth landing is an end-to-end time-to-first-paint metric, not a better
+  implementation** — the mechanism is sound. Three traps it hit, all worth knowing: firing after the
+  whole acquire loop is NOT early (2156 ms on the A23, ~100 ms before the stall it targets); firing
+  per-resource puts it in front of its own registrar, because the renderer does not exist until
+  `Scene3D` mounts, and the hook then silently does nothing; and a new callback fan-out trips #888's
+  `notifyIsShared` ledger.
+
+  **−95.7 ms (−33%), with no overlap between the arms.** ⚠️ The mirror stays ON for the no-stack
+  path, where the placeholders ARE compiled in the render's own context and ARE cache-hit by the
+  first frame — an unconditional skip re-buys #238's first-frame stall on most projects, and the
+  control test in `prewarmShaders.test.ts` exists to catch exactly that.
 - ⚠️ **The FIRST lit node-graph build a renderer performs costs several times an identical later
   one, and nothing can move it off the boot.** Measured on `games/3d-test` with `nodeprobe.mjs`
   (2026-08-26): of the prewarm's 26 builds the first costs **24.4 ms** and the other 25 cost
@@ -4088,6 +4128,35 @@ three's incrementing material id, which differs between two runs of the same bui
     node builder reported `env none` for the stand-in). The premium belongs to the first material
     carrying the scene's REAL environment and shadow subgraphs, which do not exist before the
     assets load. It can be moved a few hundred ms earlier within the same boot, not off it.
+  - **Skipping the F4 build's env/light mirrors under a post-FX stack does not help — the premium
+    transfers across render contexts.** The idea, and it is a tempting one: #324b measured the
+    pre-swap and post-swap compiles as sharing **zero** node-builder cache entries (different
+    `context.id`, sharp edge 3), so the expensive lit+env F4 build in `ctx 0` looks like something
+    `compileLiveScene` throws away and rebuilds in the stack's context — which would make its cost
+    buy only TSL-race protection, and a mirror-free placeholder would buy that for ~1 ms.
+    **Measured 2026-09-10 on `demos/postfx-demo` with `nodeprobe.mjs`, and it is wrong:**
+
+    ```
+    17.6ms compile obj#13  env=7052…  ctx=0@d-1(1000x700 s4 t1 mrtnone)   MeshStandardMaterial  ← F4, pre-swap
+     7.9ms compile obj#14  env=7052…  ctx=4@d-1(0x0 s4 t3 mrt7737)        MeshStandardMaterial  ← compileLiveScene, first
+     7.8ms compile obj#17  …ctx=4…      (and 20 more, all 4.5-7.9 ms)
+    ```
+
+    The FIRST build in the stack's `ctx 4` costs **7.9 ms, not 17.6 ms** — it does not re-pay the
+    premium. So zero cache overlap does **not** imply zero benefit: the premium is a
+    renderer-lifetime warm-up inside three's `NodeBuilder`, not a per-context cache effect, and the
+    F4 build absorbs it for the whole renderer. ⚠️ **Do not "optimise" the F4 placeholder by dropping
+    its scene-global mirrors** — that is the same experiment as the rejected hoist above (a
+    mirror-free build reports `env none` and primes nothing), and it would move the full premium
+    onto the first post-swap build instead of removing it.
+  - ⚠️ **And there is no hotspot inside the build to attack.** Re-measured 2026-09-10 on the A23
+    (`demos/postfx-demo`, cold boot, 500 µs sampling — 4x finer than the 2 ms default, which is as
+    fine as the CDP link survives; 200 µs and below closes the socket with `code=1006`): the
+    prewarm's longtask is **336 ms**, of which the top-20 self rows account for **54.2 ms (16.1%),
+    spread across 180 distinct functions**, the largest single entry being the garbage collector at
+    11 ms. For contrast, the HDR-decode longtask in the same boot is **100% of its self time in 9
+    functions**. That is the profile of graph traversal, not of a hot loop — so a fix has to remove
+    or move the build, because there is nothing inside it to make faster.
 - ⭐ **The post-FX STAGE quads now have a precompile — PARTIALLY (#323, 2026-08-26).**
   `PostFXStack.compileStagesAsync()` warms them; see § "Precompiling the stack's own stage quads"
   above for the mechanism, the two new three.js sharp edges it exists for, and what it still

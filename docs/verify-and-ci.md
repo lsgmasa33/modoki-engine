@@ -175,6 +175,36 @@ Both sightings that day cost a gate re-run each and self-corrected. The expensiv
 other one: reading the red as your own and going looking for it in a diff that never touched
 `engine/toolchain/**`.
 
+#### ⭐ FIXED 2026-09-10 (#1037) — and the fix is narrower than "a packaged editor is running"
+
+The section above is kept because the *attribution* advice is still how you read a red gate, but its
+premise is gone: **the guard no longer fires because an editor is running somewhere on the machine.**
+
+`isPackagedRunning()` asked `pgrep -f "<productName>.app"` — *"does this string appear in ANY
+process's argv"* — which is not the question that makes a wipe unsafe. It was wrong in both
+directions, and the too-broad half had **three** observed shapes, only the first of which the advice
+above covers:
+
+| what matched | was it an editor? |
+|---|---|
+| a sibling clone's packaged smoke, in its own temp dir | yes, but not *this* installation |
+| a shell running a heredoc that QUOTED the path | no |
+| a `grep`/`pgrep` typed to debug this very issue | no — **the diagnostic triggered the bug** |
+
+It also refused `--dry-run`, which deletes nothing, because liveness was consulted before `DRY_RUN`.
+Five sightings across four clones, and it reds **`verify:publish`** too — the hub's only gate against
+a private value reaching the public mirror.
+
+`engine/scripts/livePackagedEditor.mjs` now asks two questions instead: is this process **executing**
+the bundle (from the executable path, never argv), and is it **this installation** (its
+`--user-data-dir`, or the packaged default, under one of the paths the run would delete). A sibling's
+smoke points at its own scratchpad and no longer blocks; the developer's real editor still does.
+
+⚠️ **The remaining reason to read this section is that `--toolchain` still cannot see a live DEV
+editor** — the toolchain is machine-shared, and that gap is deliberate (owner, 2026-09-10): nobody
+has established a toolchain wipe actually breaks one. If you ever see it happen, record the
+observation before writing a guard.
+
 ### The Windows clone
 
 The Windows clone was **~10 min** at the old shape (2026-08-04): 608s, of which the app-tests

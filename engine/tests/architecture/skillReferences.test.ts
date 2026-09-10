@@ -58,13 +58,18 @@ const codeSpans = (text: string): string[] => [...text.matchAll(/`([^`\n]+)`/g)]
 
 const FILE_EXT = /\.(ts|tsx|mjs|cjs|sh|ps1|md|json|yml|yaml)$/;
 
-/** A repo-relative path: has a separator, a known extension, and no glob/placeholder/URL. */
+/** A repo-relative path: has a separator, a known extension, and no glob/placeholder/URL.
+ *  ⚠️ `~/…` is excluded for the same reason `/…` is — it is ABSOLUTE, in the user's home, and
+ *  resolving it against REPO_ROOT invents a path nobody wrote. Skills legitimately cite machine
+ *  paths (`~/Projects/modoki`, `~/.modoki/device-claims.json`), and four already did; they escaped
+ *  this hole only by carrying no file extension, so nothing here was pinning it (2026-09-10). */
 const isRepoPath = (tok: string): boolean =>
   tok.includes('/') &&
   FILE_EXT.test(tok) &&
   !/[*<>${}\s]/.test(tok) &&
   !tok.startsWith('/') &&
   !tok.startsWith('.') &&
+  !tok.startsWith('~') &&
   !tok.includes('://') &&
   !tok.startsWith('node_modules');
 
@@ -78,6 +83,26 @@ describe.skipIf(!HAS_SKILLS)('skill references', () => {
       }
     }
     expect(dangling).toEqual([]);
+  });
+
+  /**
+   * The classifier itself, both sides. The corpus covers the ACCEPT side thoroughly and the
+   * REJECT side only by accident — a rejected shape is pinned only for as long as some skill
+   * happens to contain one, so a reword deletes the coverage silently. These cases do not move.
+   */
+  it('classifies a path: repo-relative accepted, absolute/external/placeholder rejected', () => {
+    // Accept — the shape the guard exists to check.
+    expect(isRepoPath('engine/scripts/launch-editor.sh')).toBe(true);
+    expect(isRepoPath('docs/README.md')).toBe(true);
+    // Reject — absolute, and therefore not ours to resolve against REPO_ROOT.
+    expect(isRepoPath('~/.modoki/device-claims.json')).toBe(false);
+    expect(isRepoPath('~/Projects/modoki/docs/README.md')).toBe(false);
+    expect(isRepoPath('/etc/hosts.yml')).toBe(false);
+    // Reject — not a repo path at all.
+    expect(isRepoPath('https://example.com/schema.json')).toBe(false);
+    expect(isRepoPath('games/<id>/game.ts')).toBe(false);
+    expect(isRepoPath('node_modules/vite/bin/vite.mjs')).toBe(false);
+    expect(isRepoPath('./sibling/thing.ts')).toBe(false);
   });
 
   /**

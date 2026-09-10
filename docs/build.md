@@ -1442,11 +1442,121 @@ Three traps this laid, each of which cost a session:
 - **It is NOT `showErrorBox` (#1034).** Three sessions concluded the hang was one of `main.ts`'s own
   modal error boxes and that #1034 had to be fixed first to make anything readable. It isn't and it
   didn't: execution never reaches them. #1034 is a real, separate defect on the same theme.
+**Considered and DECLINED: aliasing the package in the bundler** (owner, 2026-09-10). An esbuild
+`alias` mapping `@modoki/engine` → `engine/packages/modoki/src` in `build-electron.mjs` would make
+this class *unreachable* rather than guarded — a bare import would resolve to the same file the
+relative path does, from every tree and whatever the call form, demoting the guard to defence in
+depth. It was declined because of a risk nobody has measured: the alias would also make the
+`@modoki/engine/runtime` **barrel** bundleable, and that barrel is what drags the browser runtime
+(DOM, three, pixi) into what is a `platform: 'node'` build. Today those imports are external and
+simply never fire; under an alias they would be inlined, which could bloat `main.cjs` or fail the
+build outright. Recorded so the next reviewer does not re-propose it and re-derive the objection —
+if anyone revisits it, **measure the barrel first**.
+
 - **The modal cannot be read, so make the app talk instead.** What worked: extract `app.asar` to
   `Resources/app/`, rename the asar so the extracted tree becomes the entry point (Electron prefers
   `app.asar` when both exist — instrumenting without the rename silently changes nothing), and
   prepend an `uncaughtException` recorder to `main.cjs`. `sample <pid>` confirms the modal
   (`-[NSAlert runModal]` under `node::StartExecution`) but never names its text.
+
+### Never sequence termination after a dialog (#1034)
+
+`dialog.showErrorBox` — and every `show*Sync` sibling — is **synchronous**: it runs a *nested native
+modal loop*. So anything written after it does not run until somebody clicks OK, and on an unattended
+launch (headless smoke, CI, launchd, a shell script) that is never. All three of main.ts's
+startup-failure paths were `console.error → showErrorBox → app.exit(1)`, which means the process sat
+alive with no window, no stdout and **no exit code** — a harness saw a hang instead of a failure,
+which is the exact state the handler existed to prevent. Measured: the main thread parked in
+`-[NSAlert runModal]` → `_DPSNextEvent` → `_BlockUntilNextEventMatchingListInMode`.
+
+**The rule has TWO halves, and the first one alone does not work.**
+
+1. **Arm the exit BEFORE showing the dialog.**
+2. ⚠️ **Never open a PARENTLESS modal on a path that must terminate.**
+
+`engine/electron/fatalDialog.ts` (`reportFatalStartup`) is the one way to report a fatal startup
+failure. It arms a bounded timer, then asks for a parent window: with one, it shows the async
+`dialog.showMessageBox` **as a sheet** and whichever settles first terminates exactly once; with
+none, it shows **nothing** and terminates immediately. Guarded by `fatalDialog.test.ts`, which also
+bans the whole `*Sync` dialog family across `engine/electron/**`.
+
+⚠️⚠️ **Why half 2 exists — this was found the expensive way.** The first fix did only half 1: arm a
+timer, then show the *async* `showMessageBox`. It passed `verify`, `verify:packaged` and 34 unit
+tests **and it still hung** — 4m51s against a 10s timer, in a real packaged launch. Instrumented,
+neither racer ever ran. `sample` on the real Electron main process:
+
+```
+-[NSAlert runModal] → _NSTryRunModal → -[NSApplication _doModalLoop:peek:]
+  → _DPSNextEvent → _BlockUntilNextEventMatchingListInMode
+```
+
+**`dialog.showMessageBox` with no parent window is APP-MODAL on macOS: it runs a nested native modal
+loop on the main thread even though it returns a Promise.** Node is single-threaded, so the blocked
+loop cannot run the timer meant to rescue it — the Promise says "async" and behaves synchronously.
+The general lesson is worth more than the fix: **a timeout can only rescue you if the thing you are
+timing out cannot block the loop the timer runs on.**
+
+⚠️ **This mechanism is not confined to the startup paths.** `autoUpdate.ts`'s `show()` and three
+sites in `main.ts` deliberately fall back to a parentless `dialog.showMessageBox(opts)` when there is
+no window, so each of those blocks the main thread for as long as the dialog is up. That is tolerable
+where a modal is the point (an update prompt the user asked for) and it is NOT a terminate path, so
+it is left alone — but **do not copy that fallback onto a path with concurrent async work or one that
+must exit.** Not measured on those sites.
+
+⚠️ **`reportFatalStartup`'s parent probe deliberately ACCEPTS the splash, where `show()` rejects
+it** — the two want opposite things and neither is wrong. `show()` needs the user's *answer*, so it
+refuses to parent to a window that may vanish mid-question (the splash is destroyed the instant the
+renderer mounts, taking an open sheet down with it unanswered). `reportFatalStartup` needs only to
+*not block the loop*, and it terminates on the armed timer whether or not the sheet survives — so any
+live window will do, and the splash is usually the only one there is. Copying `show()`'s stricter
+probe here would hand back the parentless case, i.e. the hang.
+
+Two shapes that look like fixes and are not:
+
+- ⚠️ **A TTY check is wrong in both directions.** The `.app` a real user double-clicks has no TTY
+  either, so it would suppress the dialog in exactly the case the dialog exists for.
+- ⚠️ **A harness env var is worse.** It makes correctness depend on the caller remembering to set it,
+  and an unattended launch that is not our own smoke still hangs.
+
+⚠️ **`terminate` is injected, not hardcoded**, because the three sites do not agree: two want
+`app.exit(1)`, while the dev-server failure must keep going through `closeSplash()` +
+`quitExitCode = 1` + `app.quit()` so the deferred teardown runs and a failed launch still reports
+non-zero. Collapsing them onto one exit fixes #1034 and reintroduces #68.
+
+⚠️ **A dialog this early does not render at all** — a full-screen `screencapture` during a real
+`runModal` block showed no alert anywhere. Any argument that rests on "the human can still click OK"
+is protecting a path that, at this point in startup, does not exist. Separately, a failure *before*
+`initFileLog()` writes nothing at all — that is #1043, not this.
+
+### An editor state file's absent-case default is a MIGRATION question (#1041)
+
+`editorStateDir()` is the subKey-less profile `base`, and `3c61ce6fe` (#1036) moved the packaged one
+from `<appData>/Modoki Editor` to `<appData>/Modoki Editor/<install-id>`. That moved **where we look,
+not the data** — so for an upgraded install every reader keyed off it saw its file as *absent*, and
+every one of them reads absent as "the user never chose".
+
+Mostly that is harmless and self-heals. Once it was not: `readCdpEnabled` returns **true** for an
+absent `cdp.json`, so a 127.0.0.1 remote-debugging port a user had deliberately unchecked came back
+on. It is the only item in #1036's reset list a user cannot notice by looking — the AI panel's
+checkbox reads the same missing file and agrees with the wrong answer.
+
+**The rule: a state file whose absent-case default is not the SAFE one must be covered by
+`adoptLegacyEditorState`** (`engine/electron/userDataDir.ts`), which runs at profile-decision time,
+packaged only, before the first read.
+
+- **Matched by EXTENSION, not a list of names.** The enumerated first draft was already wrong:
+  `ui-prefs.json` is a bare literal in `zoom.ts`, not an exported constant, so a hand-maintained set
+  shipped missing one, invisibly. A `*.json` at the profile root is ours by construction — Chromium's
+  own files there are extension-less (`Preferences`, `Local State`, `Cookies`, `DIPS`) or directories.
+  Verified against a real pre-#1036 profile.
+- **COPY, not rename** (owner, 2026-09-10) — the one place this departs from `adoptLegacyToolchain`.
+  That dir is shared by every packaged install on the machine, and a rename lets the first upgraded
+  one strip the opt-out from the others: this bug again, rarer and harder to spot.
+- ⚠️ **The two dotfiles there are out of scope, not missed.** `.updaterId` and `.vite-cache-build` are
+  read from `app.getPath('userData')` — the possibly SUB-KEYED dir — not from `editorStateDir()`, so
+  copying them into `base` would not put them where their readers look.
+- ⚠️ **Use `samePath`, never `path.resolve(a) === path.resolve(b)`**, for "is the target already the
+  legacy dir" — the architecture guard catches it, and it fails open on Windows (#869/#899).
 
 ### The packaged editor must not write inside its own bundle (#326)
 
