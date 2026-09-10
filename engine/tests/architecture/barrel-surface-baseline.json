@@ -360,6 +360,7 @@
   "ensureRiggedModelLoadedFor",
   "entityRef",
   "entriesSystem",
+  "entryIndexOf",
   "entryPrefabProvider",
   "estimateIntervalMs",
   "eulerToQuat",

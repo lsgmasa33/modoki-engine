@@ -226,6 +226,81 @@ export function scrollByEntry(
   }, opts);
 }
 
+/**
+ * Which entry the view is on, counting a request that is still in flight — the READ half of
+ * `scrollByEntry`, for a caller that has to compute its own destination.
+ *
+ * ⚠️ **This exists so no caller hand-rolls the precedence again** (#1019). `scrollByEntry` already
+ * knew the rule and kept it private, so `games/court` and `games/wordweave` each wrote their own
+ * "is a request pending" read — and BOTH stopped at stage 1 of the two-stage hand-off
+ * `currentEntryIndex`'s banner describes, which is the very defect #768 and #672 were closed for,
+ * one stage later. A third and fourth copy of one rule is what an accessor is for.
+ *
+ * ⚠️ **Not `scrollByEntry` with the answer returned, and the difference is why this is a separate
+ * entry point.** `scrollByEntry` decides the destination itself and clamps it against `countX/Y`;
+ * a pager clamps against its OWN population instead — Court's ladder length, wordweave's live
+ * dictionary entry count, which grows while the panel is open — and needs the number to write its
+ * own state. So this deliberately does NOT clamp: it answers where the view is, and the caller
+ * bounds that against whatever it is paging over.
+ *
+ * `null` means **"cannot answer"**, never "entry 0": the guid names no scroll view, the view does
+ * not scroll on `axis`, or nothing is pending and the live offset cannot be converted (no usable
+ * stride, or no entries at all). A caller keeps its own fallback for that — during scene load a
+ * view is legitimately unmeasured, and answering 0 there would teleport a pager to the top.
+ *
+ * ⚠️ **A pending request is answered even when the live read could not be**, and the ordering in
+ * the body says why: stage 1 is already in entry coordinates. A pager's OPENING request is issued
+ * on the first frame it is shown — before the entry prefab is cached and before the source has
+ * published a count — so the unmeasured case and the in-flight case overlap in production rather
+ * than being alternatives.
+ */
+export function entryIndexOf(viewGuid: string, axis: 'x' | 'y'): number | null {
+  const v = viewOf(viewGuid);
+  if (!v) return null;
+  // Not `Record<string, number>`: `axis` is a string — the same widening `snapToNearest` carries.
+  const sv = v.entity.get(v.svMeta.trait) as Record<string, number | string>;
+  const en = v.entity.get(v.enMeta.trait) as Record<string, number>;
+  // ⚠️ Gated on the view's own axis, like both steppers above — asking "which column am I in" of a
+  // view that only scrolls vertically has no answer, and 0 would be a plausible-looking lie.
+  if (axis === 'x' ? sv.axis === 'y' : sv.axis === 'x') return null;
+  // ⚠️ **Stage 1 answers BEFORE either gate below, and that ordering is load-bearing** — it is
+  // already in ENTRY coordinates, so it needs neither a stride to divide by nor a published count
+  // to be meaningful. Gating it cost a real production case, caught by Court's own #768 suite: a
+  // pager issues its opening request on the first frame it is shown, which is exactly when the
+  // entry prefab is uncached (stride 0) and the source has not published a count yet.
+  // `consumeEntryRequest` guards that state deliberately — the request stays pending rather than
+  // resolving to 0 — so refusing to report it here would send the caller back to its live mirror
+  // in the one window this accessor exists to cover.
+  //
+  // ⚠️ **Court's #768 suite FOUND this, and can no longer see it** — the fixture publishes a
+  // stride now, so all four of its cases have a usable window and the gate order stops mattering
+  // to them. The ONE test that fails if these two lines move below the stride gate is
+  // `entriesSystem.test.ts`'s "answers a stage-1 request even when the view has NO usable window
+  // yet". Verified by deleting them: both game suites stay green, 183 passed.
+  const entryReq = axis === 'x' ? en.scrollToEntryX : en.scrollToEntryY;
+  if (entryReq >= 0) return entryReq;
+  // Stages 2 and 3 are both in PX and both divide by the stride, so from here it is required.
+  const stride = axis === 'x'
+    ? usableStride(en.strideX, sv.viewportWidth as number)
+    : usableStride(en.strideY, sv.viewportHeight as number);
+  if (stride <= 0) return null;
+  // ⚠️ **The count gate gets only the LIVE read, not stage 2.** A px request is a destination
+  // something explicitly asked for, and it converts whether or not the source has published a
+  // count; a live OFFSET on a view with no entries in it is the one that has no answer — and THAT
+  // is reachable with a perfectly usable stride, since `entriesSystem` publishes the stride
+  // regardless of count (see `snapToNearest`'s own ⚠️).
+  //
+  // ⚠️ The stage-2 half of this exemption has **no shipping caller today** — every current pager
+  // keeps its count at 1 or more, or refuses before asking. It is a contract, not an observed
+  // case; `entriesSystem.test.ts` names the three call sites that were traced.
+  const pxReq = axis === 'x' ? (sv.scrollToX as number) : (sv.scrollToY as number);
+  const count = Math.floor((axis === 'x' ? en.countX : en.countY) ?? 0);
+  if (pxReq === NO_SCROLL_REQUEST && count <= 0) return null;
+  return axis === 'x'
+    ? currentEntryIndex(en.scrollToEntryX, sv.scrollToX as number, sv.scrollX as number, stride)
+    : currentEntryIndex(en.scrollToEntryY, sv.scrollToY as number, sv.scrollY as number, stride);
+}
+
 /** Pass an in-flight entry request back through unchanged, or `undefined` when there is none. */
 function keep(pending: number): number | undefined {
   return pending >= 0 ? pending : undefined;

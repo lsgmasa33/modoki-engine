@@ -1151,6 +1151,185 @@ describe('entriesSystem', () => {
     expect((view.get(UIEntries) as any).scrollToEntryY).toBe(7);   // survived — not wiped to -1
   });
 
+  it('entryIndexOf answers from a pending ENTRY request, not from live scroll (#1019 stage 1)', async () => {
+    // The read half of the precedence `scrollByEntry` already had. Both games hand-rolled exactly
+    // this much and stopped here — the copies were correct for stage 1, which is why the swallow
+    // only appeared once a tick landed between two steps (the stage-2 case below).
+    const { sys, src, view } = await setup();
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    settleAtEntry(sys, view, 7);
+    expect(api.entryIndexOf('view-guid', 'y')).toBe(7);            // settled: live is the answer
+
+    api.scrollToEntry('view-guid', { y: 8 });
+    expect((view.get(UIScrollView) as any).scrollY).toBe(7 * ENTRY_H);   // the view has not moved
+    expect(api.entryIndexOf('view-guid', 'y')).toBe(8);            // ...but this is where it is going
+  });
+
+  it('entryIndexOf answers from a pending PX request once the system converted it (#1019 stage 2)', async () => {
+    // ⚠️ **The stage BOTH games' copies were blind to, and the only one that needs a system tick to
+    // build.** `consumeEntryRequest` clears the entry-space request the moment it hands off, so a
+    // stage-1-only read answers "nothing pending" while `scrollToY` is set and the DOM has not
+    // applied it — and the caller falls back to live scroll, which still reports the page being
+    // LEFT. That is #768/#672 one stage later.
+    const { sys, src, view } = await setup();
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    settleAtEntry(sys, view, 7);
+
+    api.scrollToEntry('view-guid', { y: 8 });
+    sys.entriesSystem(testWorld);                                  // entries -> px, clears stage 1
+    expect((view.get(UIEntries) as any).scrollToEntryY).toBe(-1);   // stage 1 is empty...
+    expect((view.get(UIScrollView) as any).scrollToY).toBe(8 * ENTRY_H);   // ...stage 2 is not
+    expect((view.get(UIScrollView) as any).scrollY).toBe(7 * ENTRY_H);     // the DOM has not moved
+
+    expect(api.entryIndexOf('view-guid', 'y')).toBe(8);            // 7 is what the old copies said
+  });
+
+  it('entryIndexOf reads LIVE scroll when nothing is pending — the accept side', async () => {
+    // The direction the fix must not break: a viewer who scrolled by hand has no request in
+    // flight, so "which entry am I on" is the live offset. Without this a precedence bug that
+    // preferred a stale request forever would pass both stage tests above.
+    const { sys, src, view } = await setup();
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    settleAtEntry(sys, view, 7);
+    view.set(UIScrollView, { ...(view.get(UIScrollView) as any), scrollY: 20 * ENTRY_H });
+
+    expect(api.entryIndexOf('view-guid', 'y')).toBe(20);
+  });
+
+  it('entryIndexOf does NOT clamp — the caller bounds it against its OWN population', async () => {
+    // ⚠️ Deliberate, and the difference from `scrollByEntry`, which clamps to `count - 1`. A pager
+    // clamps against a population the engine cannot see: Court's ladder length, wordweave's live
+    // dictionary entry count (which GROWS while the panel is open, so a request armed before the
+    // growth must not be bounded by the old end). Clamping here would silently disagree with both.
+    const { sys, src, view } = await setup({ countY: 10 });
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    settleAtEntry(sys, view, 5);
+
+    api.scrollToEntry('view-guid', { y: 50 });                     // past the end of a 10-entry view
+    expect(api.entryIndexOf('view-guid', 'y')).toBe(50);
+  });
+
+  it('entryIndexOf answers a stage-2 request on a view whose entry COUNT has gone to zero', async () => {
+    // ⚠️ **Added because the narrowing survived its mutation.** Applying the count gate to stage 2
+    // as well as to the live read left all 85 other cases green — nothing built a px request on an
+    // empty view — so the branch was there on an argument nobody had tested.
+    //
+    // It is CONSTRUCTIBLE, which is why it is kept rather than simplified away: `consumeEntryRequest`
+    // gates the hand-off on the STRIDE alone (`canX`/`canY`), and the stride comes from the entry
+    // prefab's resolved size, not from the data — so a source that empties while a request is in
+    // flight leaves a perfectly real px destination on a view reporting `count: 0`. Something
+    // explicitly asked to go there and the view still will.
+    //
+    // ⚠️ **NO SHIPPING CALLER reaches it today, and an earlier version of this comment claimed two
+    // that do** (close-out review). Traced: Court's level pager writes `countX = pageCount(...)`,
+    // which is 1 and never 0 even for an empty ladder; its calendar writes
+    // `countX = dailyMonthCount()` against an authored floor of 2; and `navigateDictionary` returns
+    // on `entries.length === 0` BEFORE it ever asks. This is a sound engine contract with no
+    // present consumer — do not re-derive it as an observed production case.
+    const { sys, src, view } = await setup({ countY: 20 });
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+    settleAtEntry(sys, view, 3);
+
+    api.scrollToEntry('view-guid', { y: 8 });
+    sys.entriesSystem(testWorld);                                  // entries -> px
+    expect((view.get(UIScrollView) as any).scrollToY).toBe(8 * ENTRY_H);
+
+    // The data empties underneath the in-flight request. Nothing here clears `scrollToY` — only
+    // `UINode` does, and this suite has no DOM, which is the same reason `settleAtEntry` exists.
+    view.set(UIEntries, { ...(view.get(UIEntries) as any), countY: 0 });
+    sys.entriesSystem(testWorld);
+    expect((view.get(UIEntries) as any).strideY).toBe(ENTRY_H);    // stride survives the emptying
+    expect((view.get(UIEntries) as any).countY).toBe(0);
+
+    expect(api.entryIndexOf('view-guid', 'y')).toBe(8);            // the destination still answers
+  });
+
+  it('entryIndexOf answers a stage-1 request even when the view has NO usable window yet', async () => {
+    // ⚠️ **The case that decides the ORDER of the gates, and the accessor got it wrong first.**
+    // Stage 1 is already in ENTRY coordinates, so it needs neither a stride nor a published count —
+    // and refusing it when those are missing is not a hypothetical: a pager issues its OPENING
+    // request on the first frame it is shown, which is exactly when the entry prefab is uncached
+    // (stride 0) and the source has published nothing. `consumeEntryRequest` guards that state on
+    // purpose, keeping the request pending rather than resolving it to 0.
+    //
+    // FOUND by Court's #768 suite going red against this file's first version, which gated the
+    // whole function on `usableStride`. ⚠️ **That suite can no longer see it, so this test is the
+    // only thing standing between the gate order and a regression** — the fixture publishes a
+    // stride now, so all four of its cases have a usable window and the ordering stops mattering
+    // to them. Measured: delete the two lines and `levelSelectChrome` (40) and wordweave's
+    // `systems` (143) stay green while this case reds alone.
+    const { sys, src, view } = await setup();
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.setEntryPrefabProvider({
+      isCached: () => true,
+      rootSize: () => ({ width: 0, widthUnit: 'px' as const, height: 0, heightUnit: 'px' as const }),
+      rootAuthoredUI: () => undefined,
+      spawnInstance: () => 0,
+    } as any);
+    view.set(UIEntries, { ...(view.get(UIEntries) as any), countY: 0 });
+    sys.entriesSystem(testWorld);
+
+    expect((view.get(UIEntries) as any).strideY).toBe(0);          // no window...
+    expect(api.entryIndexOf('view-guid', 'y')).toBeNull();         // ...so the LIVE read refuses
+
+    api.scrollToEntry('view-guid', { y: 4 });
+    expect(api.entryIndexOf('view-guid', 'y')).toBe(4);            // the REQUEST still answers
+  });
+
+  it('entryIndexOf returns NULL rather than 0 when it cannot answer', async () => {
+    // ⚠️ **`null` is "cannot answer", never "entry 0"**, and the distinction is the whole contract:
+    // every caller keeps its own fallback for `null`, and during scene load a view is legitimately
+    // unmeasured — answering 0 there teleports a pager to the top of a list the player was
+    // partway down. Four ways to be unanswerable, all reachable:
+    const { sys, src, view } = await setup({ countY: 10 });
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.entriesSystem(testWorld);
+
+    expect(api.entryIndexOf('no-such-view', 'y')).toBeNull();      // the guid names nothing
+    // ② an axis this view does not scroll. The fixture is `axis: 'y'`; X has a real stride and a
+    //    real count, so nothing but the axis test can refuse it — and `0` would look plausible.
+    expect(api.entryIndexOf('view-guid', 'x')).toBeNull();
+    // ③ no entries. `entriesSystem` publishes a stride regardless of count, so this view has a
+    //    perfectly usable window and nothing in it — `snapToNearest`'s own ⚠️ records the trap.
+    view.set(UIEntries, { ...(view.get(UIEntries) as any), countY: 0 });
+    sys.entriesSystem(testWorld);
+    expect((view.get(UIEntries) as any).strideY).toBe(ENTRY_H);    // usable...
+    expect(api.entryIndexOf('view-guid', 'y')).toBeNull();         // ...and still unanswerable
+  });
+
+  it('entryIndexOf returns NULL while the entry size is still unresolved — a scene-load frame', async () => {
+    // ④ The fourth way, split out because it needs its own fixture: an uncached prefab resolves to
+    // entry size 0, so `entriesSystem` publishes a stride of 0. This is the normal state for the
+    // first frames of a scene — exactly when a pager's sync function is running — so a `0` here
+    // would not be a rare edge case, it would be the common one.
+    const { sys, src, view } = await setup();
+    const api = await import('../../src/runtime/ui/scrollApi');
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    sys.setEntryPrefabProvider({
+      isCached: () => true,
+      rootSize: () => ({ width: 0, widthUnit: 'px' as const, height: 0, heightUnit: 'px' as const }),
+      rootAuthoredUI: () => undefined,
+      spawnInstance: () => 0,
+    } as any);
+    view.set(UIScrollView, { ...(view.get(UIScrollView) as any), scrollY: 3600 });
+    sys.entriesSystem(testWorld);
+
+    expect((view.get(UIEntries) as any).strideY).toBe(0);
+    expect(api.entryIndexOf('view-guid', 'y')).toBeNull();
+  });
+
   it('an absorbed step does not DESTROY a request in flight on the other axis', async () => {
     // ⚠️ Close-out §2d F-A3. `scrollToEntry` writes BOTH fields on every call, mapping `undefined`
     // to `NO_ENTRY_REQUEST` — so an axis this call is not arming gets CLEARED, not left alone. On

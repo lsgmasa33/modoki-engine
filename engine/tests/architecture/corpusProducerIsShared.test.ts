@@ -70,6 +70,22 @@ const ROOT_PRESENT: Record<string, boolean> = {
 const rootIsPresent = (rel: string): boolean =>
   Object.entries(ROOT_PRESENT).every(([root, present]) => present || !rel.startsWith(root));
 
+/** ⚠️ **`demos/` is the one root the snapshot ships PARTIALLY**, so `ROOT_PRESENT` cannot describe
+ *  it: `verify:publish` assembles a CURATED subset (`publish-engine-oss.sh --with-demos=...`, two
+ *  demos today), which makes `demos/` present while any unpublished demo under it is not. A
+ *  per-root boolean therefore reads an EXEMPT row naming an unpublished demo as STALE, and #1018's
+ *  `demos/forest-camp` row did exactly that — green in the repo, red inside the snapshot, on a
+ *  gate `npm run verify` structurally cannot run. So presence is asked per PROJECT for this root.
+ *  Same trade as `games/` above, deliberately: if a SHIPPED demo were deleted wholesale, its rows
+ *  would go quietly exempt rather than stale — absent-by-layout cannot be told from deleted once
+ *  the whole directory is gone, and the alternative fails the snapshot on every unpublished row. */
+const demoProjectIsPresent = (rel: string, scanned: Iterable<string>): boolean => {
+  const prefix = /^demos\/[^/]+\//.exec(rel)?.[0];
+  if (!prefix) return true;
+  for (const k of scanned) if (k.startsWith(prefix)) return true;
+  return false;
+};
+
 /** Rule 1's target, assembled from two halves rather than written as one literal — the same
  *  reason `commentStripperIsShared.test.ts`'s `BLOCK_LAZY` is split: spelling it out would make
  *  every sentence in THIS file discussing the rule (this docblock, every `reason` string below
@@ -316,6 +332,20 @@ const EXEMPT: ReadonlyArray<{ file: string; rule: 'ls-files' | 'walker'; reason:
     file: 'games/sling/tests/sling-assets.test.ts', rule: 'walker',
     reason: 'Walks games/sling/runtime/assets to build a GUID->path map. Same #29 bar.',
   },
+  {
+    file: 'games/sling/tests/slingConfigFields.test.ts', rule: 'walker',
+    reason: 'Walks games/sling\'s own runtime/ + packages/ to prove every SlingConfig field is '
+      + 'READ (#1018) — the sibling of courtConfigFields.test.ts above, and exempt for the same '
+      + '#29 reason: a game is copied OUT of the monorepo, so a reach into engine/scripts/ '
+      + 'resolves only while it sits here and gamePortability.test.ts fails the build for it.',
+  },
+  {
+    file: 'demos/forest-camp/tests/forestCampConfigFields.test.ts', rule: 'walker',
+    reason: 'Walks demos/forest-camp\'s own runtime/ + packages/ to prove every ForestCampConfig '
+      + 'field is READ (#1018). Same #29 bar as the two above, and slightly harder: a DEMO is '
+      + 'published to its own public repo by curated snapshot, so a path into engine/ would not '
+      + 'even exist in the tree the demo ships as.',
+  },
 
   /* ───────────────────────────────────────── Rule 2: BUILD-TIME or RUNTIME walks of a PROJECT dir
    * or of build output — not the repo corpus. repoFiles() enumerates git-tracked-or-untracked-
@@ -455,7 +485,9 @@ describe('corpus producers use the shared repoFiles()/repoCorpus.mjs (#799/#771/
         // which the OSS snapshot does not ship — reporting those as stale there would demand
         // deleting rows that are load-bearing in the private repo. Only a file whose ROOT is
         // present and which has nonetheless vanished is a real stale entry.
-        if (rootIsPresent(e.file)) {
+        // `demos/` needs the second, per-PROJECT check: the snapshot ships a CURATED SUBSET of
+        // it, so the root is present while an unpublished demo under it is not.
+        if (rootIsPresent(e.file) && demoProjectIsPresent(e.file, byRel.keys())) {
           stale.push(`${e.file} — no longer exists in the scanned corpus; drop this entry`);
         }
         continue;

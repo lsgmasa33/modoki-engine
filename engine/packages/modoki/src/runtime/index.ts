@@ -47,7 +47,7 @@ export {
   type EntryCoord, type EntryContent, type EntryResolver,
 } from './ui/entrySource';
 export { parseEntryPrefabs } from './traits/UIEntries';
-export { scrollToEntry, snapToNearest, scrollByEntry, NO_ENTRY_REQUEST } from './ui/scrollApi';
+export { scrollToEntry, snapToNearest, scrollByEntry, entryIndexOf, NO_ENTRY_REQUEST } from './ui/scrollApi';
 // #1016 — the agent AIM surface must model press routing with the SAME function the router uses,
 // not a second copy of the rule (§9: a rule implemented twice diverges, and these two already did).
 export { resolveTapZoneVeto, UI_TAP_ZONE_ATTR, UI_PRESS_ORIGIN_ATTR } from './ui/pressOrigin';

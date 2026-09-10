@@ -2177,9 +2177,9 @@ since #316, by Court's level-selector arrows, which is the first caller in a SHI
 ### Stepping counts from the REQUEST; snapping counts from the POSITION
 
 A stepping API (`scrollByEntry`) and a snapping one (`snapToNearest`) ask different questions, and
-answering both from live scroll is one defect that has now been found three times — #672
-(wordweave's dictionary arrows), #768 (Court's level-select and daily-month arrows) and #1010 (the
-engine helper both of them route through).
+answering both from live scroll is one defect that has now been found four times — #672
+(wordweave's dictionary arrows), #768 (Court's level-select and daily-month arrows), #1010 (the
+engine helper both of them route through) and #1019 (both games' own reads, blind to stage 2).
 
 **A request outlives the scroll, in two stages**, and live scroll lags both:
 
@@ -2201,6 +2201,33 @@ the rounding, vs how long the animation runs). Do not repeat either without that
 deliberately keeps reading live** — "which entry am I nearest" is a question about where the view
 IS, and honouring a pending request would re-issue a jump the viewer has already been carried most
 of the way through. Do not "make these consistent"; a test pins the difference.
+
+#### A caller that computes its own destination asks `entryIndexOf` — it must not hand-roll this
+
+**`entryIndexOf(viewGuid, axis)` is the READ half of that precedence, and it is public for exactly
+one reason: keeping it private produced #1019.** `scrollByEntry` decides its own destination, so a
+pager that clamps against a population the engine cannot see — Court's ladder length, wordweave's
+dictionary count, which grows while the panel is open — cannot use it and needs the number instead.
+Both games therefore wrote their own "is a request pending" read, and **both stopped at stage 1**:
+one system tick after the tap, `consumeEntryRequest` had cleared stage 1, each helper answered "no
+request", and each fell back to a live mirror that still reported the entry being LEFT. That is
+#768's and #672's swallow, one stage later, in the code that closed them.
+
+- It returns the same `currentEntryIndex` precedence `scrollByEntry` uses — **not a second
+  implementation**, which would be the same defect one layer down.
+- **It does not clamp.** The caller bounds the answer against its own population.
+- **`null` means "cannot answer", never entry 0** — an unknown guid, an axis the view does not
+  scroll, or nothing pending with no way to convert the live offset (no usable stride, no entries).
+  A caller keeps its own fallback for that; answering 0 during scene load teleports a pager to the
+  top of a list the player was partway down.
+- ⚠️ **Stage 1 is answered before the stride and count gates**, because it is already in entry
+  coordinates. This is not a micro-optimisation: a pager issues its OPENING request on the first
+  frame it is shown, which is exactly when the entry prefab is uncached and the source has published
+  nothing — `consumeEntryRequest` keeps that request pending on purpose. The first version of the
+  accessor gated the whole function on `usableStride`; Court's #768 suite is what FOUND that, but it
+  can no longer see it (its fixture publishes a stride now, so every case there has a usable
+  window). The one guard on the ordering is `entriesSystem.test.ts`'s "answers a stage-1 request
+  even when the view has NO usable window yet" — do not delete it as redundant.
 
 ⚠️ **What this does NOT cover: the glide.** Once `UINode` has issued the DOM `scrollTo` with
 `behavior: 'smooth'`, both stages are clear and `scrollX` eases to the target over ~86 frames, so a
