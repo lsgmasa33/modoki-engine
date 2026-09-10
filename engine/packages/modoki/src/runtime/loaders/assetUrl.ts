@@ -41,17 +41,35 @@ export function assetUrl(path: string): string {
   return resolved;
 }
 
-/** Append the content-hash cache-bust query `?v=<hash>` to a resolved URL, but
- *  ONLY in production builds and ONLY when a hash is known — a re-import mints a
- *  new hash → a new URL the browser/CDN hasn't cached. Dev + the packaged editor
- *  serve through the Vite dev server (no immutable caching, HMR), so it's a no-op
- *  there. Query-aware (`&` when the URL already has a `?`). Single source of truth
- *  for BOTH the model (`modelGlbUrl`) and texture (`resolveTextureVariantUrl`)
- *  appenders so the scheme can never drift between them. (B4) */
+/** Append the content-hash cache-bust query `?v=<hash>` to a resolved URL whenever a
+ *  hash is known — a re-import mints a new hash → a new URL. Query-aware (`&` when the
+ *  URL already has a `?`). Single source of truth for BOTH the model (`modelGlbUrl`) and
+ *  texture (`resolveTextureVariantUrl`) appenders so the scheme can never drift between
+ *  them. (B4)
+ *
+ *  ⚠️ **This used to be gated on `import.meta.env.PROD`, and that gate was the whole of
+ *  #1022** — it made the URL inert in DEV, which is precisely where re-import happens. The
+ *  old docblock justified it by what the query is for in production (defeating immutable
+ *  browser/CDN caching, which the Vite dev server does not need). That reasoning was sound
+ *  and incomplete: the URL is not only a fetch key, it is the identity every downstream
+ *  cache keys on. With it frozen in dev, a re-imported texture kept the SAME PixiJS
+ *  `Assets` cache key and the same live `TextureSource`, so a live sprite went on drawing
+ *  the pre-import bytes — and `Scene2D`'s retain-before-release bridge, which compares
+ *  `resolved.url === displaySlot.textureUrl` to avoid a needless re-download, read the
+ *  frozen URL as "nothing changed" and held the refcount off zero so nothing ever
+ *  unloaded it.
+ *
+ *  ⚠️ **The hash is what distinguishes the two cases, and that is why the fix belongs
+ *  HERE rather than in an eviction pass at the consumer.** A re-import moves the hash, so
+ *  the URL moves and every layer re-fetches. A **re-slice** does NOT move it (same bytes,
+ *  different frame rects), so the URL is unchanged, the bridge still fires, and the shared
+ *  `TextureSource` is correctly kept. A consumer-side fix keyed on the sprite epoch cannot
+ *  tell those apart — the epoch bumps for both — and would force a re-download on every
+ *  re-slice. See `docs/textures.md` § "The dev URL carries the content hash". */
 export function withCacheBust(url: string, hash?: string): string {
   // blob:/data: URLs are already unique (playable single-file build) — a `?v=hash`
   // suffix would break blob-URL lookup (matched by UUID, not query) and bloat data URLs.
   if (url.startsWith('blob:') || url.startsWith('data:')) return url;
-  if (!(import.meta.env?.PROD && hash)) return url;
+  if (!hash) return url;
   return url + (url.includes('?') ? '&' : '?') + 'v=' + hash;
 }

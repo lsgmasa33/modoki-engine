@@ -15,9 +15,13 @@ describe('modelGlbUrl', () => {
     expect(modelGlbUrl(MODEL)).not.toContain('?v=');
   });
 
-  it('does NOT append ?v in dev even with a hash', () => {
+  // ⚠️ This asserted the OPPOSITE until #1022 ("does NOT append ?v in dev even with a hash"). The
+  // PROD gate it pinned lived in `withCacheBust`, which models and textures SHARE, and freezing the
+  // dev URL is what let a re-imported asset keep its old cache entry. Removed for textures' sake;
+  // models get the same benefit and the same contract.
+  it('appends ?v in dev too, so a re-import moves the URL (#1022)', () => {
     registerAsset(GUID, MODEL, 'model', undefined, undefined, 'cafe1234');
-    expect(modelGlbUrl(MODEL)).not.toContain('?v=');
+    expect(modelGlbUrl(MODEL)).toContain(`${MODEL}?v=cafe1234`);
   });
 
   it('appends ?v=<hash> for the base model path in production', () => {

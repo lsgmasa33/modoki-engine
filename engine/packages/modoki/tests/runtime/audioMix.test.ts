@@ -77,12 +77,14 @@ describe('resolveAudioUrl — converted variant vs source', () => {
     expect(resolveAudioUrl(guid)).toBe('/games/x/assets/audio/plain.mp3');
   });
 
-  it('returns the ~audio.<ext> variant when converted (cache-bust is prod-only)', () => {
+  // ⚠️ Was "(cache-bust is prod-only)". `withCacheBust` stopped gating on PROD in #1022 — audio
+  // shares that helper with textures and models, so a converted clip now carries its hash in dev
+  // as well. The variant suffix itself is what this case is really about and is unchanged.
+  it('returns the ~audio.<ext> variant when converted, hash-busted (#1022)', () => {
     const guid = newGuid();
     registerAsset(guid, '/games/x/assets/audio/music.mp3', 'audio', undefined, {
       audio: { loadType: 'stream', format: 'mp3', ext: 'mp3' },
     }, 'deadbeefdeadbeef');
-    // vitest runs with import.meta.env.PROD=false ⇒ withCacheBust omits ?v=.
-    expect(resolveAudioUrl(guid)).toBe('/games/x/assets/audio/music.mp3~audio.mp3');
+    expect(resolveAudioUrl(guid)).toBe('/games/x/assets/audio/music.mp3~audio.mp3?v=deadbeefdeadbeef');
   });
 });

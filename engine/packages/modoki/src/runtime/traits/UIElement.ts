@@ -277,8 +277,17 @@ export const UIElement = trait({
    * that combination rather than leaving it silent.
    *
    * ⚠️ **Inert on an element type that cannot HOST a child** — `input`, `range` and `UIToggle`.
-   * An `<input>` is a void element and a toggle owns its own inner layout. Also a DEV warning; to
-   * grow one of these, wrap it in a `div` carrying the click binding and author this there.
+   * An `<input>` is a void element and a toggle owns its own inner layout. Also a DEV warning.
+   *
+   * ⚠️ **Do NOT reach for a wrapper first — for an `input`/`range` this field is the wrong tool,
+   * not a blocked one** (#1025). Those hit-test their WHOLE authored box while the platform draws
+   * the control at a fixed thickness, so a bigger `height`/`width` on the element itself raises the
+   * receiving area and leaves the artwork alone — which is exactly what this field does for a
+   * `div`, already built in. A `UIToggle` is the real exception: its knob is sized off its track
+   * height, so growing it fattens the switch, and only there is a wrapper the answer. ⚠️ That
+   * wrapper needs its OWN `click` binding — moving the control's `change` binding onto it leaves
+   * `takesClick` false, so the wrapper gets no expander either. This doc used to prescribe exactly
+   * that, for every one of the three. `docs/ui-system.md` § "Tap zones" has the measurement.
    *
    * ⚠️ **It protects this element's own children, NOT its siblings — so this is an authoring
    * decision about a layout, not a value that is safe everywhere.** The expander sits at the

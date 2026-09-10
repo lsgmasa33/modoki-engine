@@ -1226,9 +1226,69 @@ Three guards, all of which exist because the failure would otherwise be invisibl
 - **An element type that cannot HOST a child** — `input`, `range` and `UIToggle` all return before
   the container branches, and an `<input>` is a void element besides. Also a DEV warning, and the
   check runs *before* `isolation` is set so an inert field does not leave a stacking context
-  behind. Court has three such controls under the floor already (`SettingsHapticsToggle`,
-  `SettingsMusicSlider`, `SettingsSfxSlider`) — to grow one, wrap it in a `div` that carries the
-  binding and author `minTapSize` on the wrapper.
+  behind.
+
+#### Value controls: the floor is met by the control's own box, not by `minTapSize` (#1025)
+
+⚠️ **This section used to say "to grow one, wrap it in a `div` that carries the binding and author
+`minTapSize` on the wrapper." That advice was unfollowable, and it is retracted.** Every under-floor
+`input`/`range`/`UIToggle` in the repo binds `change`, not `click` — so the *first* guard above
+already excludes them, before element type is ever consulted, and a wrapper carrying that same
+`change` binding is excluded for the same reason. There is no click binding to move.
+
+**A `range` or `input` needs no expander at all.** It hit-tests its **whole authored box** while the
+platform draws the control at a fixed thickness, centred — so `height` already separates the two
+boxes, which is the entire job `minTapSize` does for a `div`. Measured with `elementFromPoint` down
+the element's centre column, in **Chromium and WebKit** (WebKit is what ships on iOS):
+
+| authored height | rows hit-testing to the `<input type=range>` | painted track |
+|---|---|---|
+| 32 px | 32 | unchanged |
+| 44 px | 44 | unchanged |
+| 64 px | 64 | unchanged |
+
+⚠️ **This does not contradict #948's `minWidth`/`minHeight` finding — it is a different control.**
+That measurement was on an icon **`div`**, whose artwork is a CSS `background-image` sized `contain`
+and therefore scales with the box. A native `range` has no background artwork to scale.
+
+**A `UIToggle` is the real exception**, and the only one: `UINode.tsx` sizes the knob off the
+track's own height, so growing the host fattens the switch. Separating the boxes there does need a
+wrapper `div` — and that wrapper needs its **own `click` binding**, not the toggle's `change` one.
+⚠️ **A `change` binding copied onto the wrapper is inert**: a div never dispatches `change`, and
+`applyBindings` skips rows whose event differs, so the enlarged target silently does nothing.
+
+⚠️ **The wrapper's action must also accept a click's EMPTY payload.** A div click carries no
+`$value`, so a handler written for the toggle's boolean (`if (typeof payload !== 'boolean') return`)
+drops it and the enlarged target is a dead zone — this defect one level out. Court's
+`court.settingsHaptics` now reads a missing payload as "flip", and still refuses a non-boolean one
+so a miswired binding stays visible.
+
+⚠️ **Prefer sizing the wrapper's own box over giving it a `minTapSize`.** An expander is absolutely
+positioned and OVERHANGS its neighbours, so its correctness then rests on #977's veto; an in-flow
+wrapper takes its space in the layout and there is no overlap to adjudicate. Court's
+`SettingsHapticsTapTarget` is a plain `56 x 48` div for that reason, which is also why it needs no
+entry in that game's `KNOWN_TAP_ZONES` probe registry. ⚠️ Sized in **px**, against this doc's
+usual "size in `vmin`/`%`" advice, and deliberately: a 44 pt floor is an absolute physical target,
+and a viewport-relative height would fall back under it on the smallest screens — the ones that need
+it most.
+
+Court's members were `SettingsMusicSlider` and `SettingsSfxSlider` (both now `48 px` tall) and
+`SettingsHapticsToggle`; wordweave's two sliders were the same shape and are fixed the same way.
+
+#### A FIFTH inert case: an expander over a 2D canvas (#1017, 2026-09-10)
+
+⚠️ **Over a `Canvas2D` host, the expander is rejected UPSTREAM of everything below.** The expander is
+a real `<div>` in the UI subtree, so a press on it is blocked at gesture INGESTION by
+`isPointerBlocked` (`runtime/core/pointerBlockers.ts`) — which runs *before* the sibling rule's
+`resolveTapZoneVeto`, so that veto never gets to arbitrate. And the veto is tap-only in any case,
+while what sits under such a zone is usually a DRAG (a pan, a drag-to-spell). So the risk there is
+not stealing a neighbour's button press, which #977 handles; it is **swallowing the start of a
+gesture, which nothing in the engine arbitrates.**
+
+Measured and ruled on in wordweave, where five controls sit inside the crossword's own pan region
+and were ACCEPTED under the floor rather than grown — growing them converts live gesture surface
+into dead chrome. The measurements and the owner's split decision live with the game:
+`games/wordweave/tests/tapTargets.test.ts`'s `ACCEPTED_UNDER_FLOOR`.
 
 #### The sibling rule — a zone LOSES to real content (#977, 2026-09-09)
 
@@ -2847,8 +2907,10 @@ The four parts are a **package** — any one alone still leaves the old face ren
    collision log against the font's own previous self).
 2. **The URL is cache-busted** — `withCacheBust(assetUrl(path), getAssetEntry(path)?.hash)`,
    matching `fontUrls()` in the SDF sibling. Without it the refetch is served the cached bytes and
-   the reload is a no-op. Like its sibling this is a **no-op in dev** (the Vite dev server does not
-   cache), so it is the production half of the fix; the editor half is (1) and (3).
+   the reload is a no-op. ⚠️ This used to read "like its sibling this is a **no-op in dev** … so it
+   is the production half of the fix"; that gate was removed in #1022 and the bust now applies
+   wherever a hash is known, so it is part of the editor path too. (1) and (3) are still what evict
+   the registry and the old `FontFace`, which no URL change can do.
 3. **The old `FontFace` is deleted from `document.fonts`** — the browser owns a face until
    something removes it, so re-adding alone leaves the stale one registered. A `faces` map keys the
    live face per path, and the delete happens in `doLoadFont` **immediately after the replacement is

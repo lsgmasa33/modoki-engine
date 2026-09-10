@@ -296,8 +296,11 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
     // Defeat the browser's cached copy of an unchanged URL after a re-import. Applied
     // to the BAKED artifacts only — the raw source model (OBJ/FBX/DAE below) is an
     // input to the importer, never rewritten by it, and its sidecar .mtl/texture refs
-    // resolve relative to the URL. `withCacheBust` is not the tool here: it is
-    // PROD-and-content-hash only, and the editor runs neither.
+    // resolve relative to the URL. `withCacheBust` is still not the tool here, but the
+    // reason narrowed in #1022: it is keyed on the manifest CONTENT HASH, and a re-bake of
+    // an unchanged source leaves that hash alone, so it cannot bust this. (It used to be
+    // "PROD-and-content-hash only"; the PROD half is gone.) `reimportEpoch` is what moves
+    // per re-import, which is exactly what this needs.
     const bust = (url: string) => cacheBustReimport(url, reimportEpoch);
 
     // Clear any previously loaded geometry/materials before fetching the next one.

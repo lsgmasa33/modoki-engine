@@ -497,9 +497,19 @@ function warnClippedTapZone(key: string, overflow: string): void {
  *  expander (#948 close-out). Same shape and reason as the three warns above.
  *
  *  ⚠️ Distinct from the clipped case: that one is fixable by the author (drop the clip), this one
- *  is not — an `<input>` is a void element and a `UIToggle` owns its inner layout, so the fix is a
- *  wrapper element carrying the binding, which is a different authoring shape. The message says so
- *  rather than implying a value will help. */
+ *  is not — an `<input>` is a void element and a `UIToggle` owns its inner layout.
+ *
+ *  ⚠️ **The remedy this used to print was UNFOLLOWABLE on the controls it fires for** (#1025). It
+ *  said "wrap it in a div that carries the click binding" — and every under-floor `input`/`range`/
+ *  `UIToggle` in the repo binds `change`, not `click`, so there is no click binding to carry. A
+ *  wrapper made that way still fails `takesClick` and gets no expander either, which is the same
+ *  silence one level out.
+ *
+ *  The message now splits by what the control actually is, because the right answer differs:
+ *  a **`range`** needs no expander at all (it hit-tests its whole authored box while the platform
+ *  draws the track at a fixed thickness — so grow `height`), while a **`UIToggle`** draws its knob
+ *  off the track height and so does need the two boxes separated. `docs/ui-system.md` § "Tap zones"
+ *  carries the measurement. */
 const _unhostableTapZones = new Set<string>();
 // Cleared on world swap for the entity-id-fallback reason spelled out over `_deadToggles`.
 onWorldSwap(() => _unhostableTapZones.clear());
@@ -507,7 +517,12 @@ onWorldSwap(() => _unhostableTapZones.clear());
 function warnUnhostableTapZone(key: string, kind: string): void {
   if (_unhostableTapZones.has(key)) return;
   _unhostableTapZones.add(key);
-  console.warn(`[UIElement] ${key} authors minTapSize but renders as '${kind}', which cannot hold the tap zone — so minTapSize does nothing here. The enlarged zone is a child element, and an <input>/<input type=range> is a void element while a UIToggle owns its own inner layout. To grow one of these, wrap it in a div that carries the click binding and author minTapSize on the wrapper.`);
+  // `range`/`input` grow correctly in place; a toggle does not, so it is the one that needs a
+  // wrapper — and the wrapper needs a CLICK binding of its own, not the control's `change` one.
+  const remedy = kind === 'UIToggle'
+    ? 'A UIToggle draws its knob off its track height, so growing it fattens the switch: wrap it in a div that carries its OWN click binding and author minTapSize there. ⚠️ Moving the toggle\'s `change` binding to the wrapper does NOT work — a wrapper with no click binding gets no tap zone either.'
+    : `An <input>/<input type=range> hit-tests its WHOLE authored box while the platform draws its track at a fixed thickness, so author a larger height/width on this element directly — minTapSize is not the field for it.`;
+  console.warn(`[UIElement] ${key} authors minTapSize but renders as '${kind}', which cannot hold the tap zone — so minTapSize does nothing here. The enlarged zone is a child element, and an <input>/<input type=range> is a void element while a UIToggle owns its own inner layout. ${remedy}`);
 }
 
 /** Warn ONCE per entity that authored `text` is dropped because this element type never renders

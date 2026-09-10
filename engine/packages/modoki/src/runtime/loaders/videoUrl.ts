@@ -17,8 +17,9 @@ function servedVideoUrl(path: string): string {
   if (video?.ext && entry?.hash) {
     // `assetUrl()` wraps the FULL served-variant path (not just the source) so a
     // playable single-file build resolves it to the inlined blob: URL — the
-    // __PLAYABLE_ASSETS__ map is keyed by the served path. `withCacheBust` is a no-op
-    // in dev/editor (Vite serves without immutable caching).
+    // __PLAYABLE_ASSETS__ map is keyed by the served path. ⚠️ `withCacheBust` used to
+    // be "a no-op in dev/editor"; since #1022 it appends wherever a hash is known, in
+    // every environment (see `assetUrl.ts`). blob:/data: are still exempt.
     return withCacheBust(assetUrl(`${path}~video.${video.ext ?? VIDEO_EXTENSION}`), entry.hash);
   }
   return assetUrl(path);

@@ -59,10 +59,11 @@ function basename(path: string): string {
 
 async function doLoadFont(path: string): Promise<string> {
   const info = parseFontFilename(path);
-  // `?v=<hash>` so a re-imported font is a NEW URL the browser/CDN has not cached —
-  // without it the refetch below is served the old bytes and the reload is a no-op.
-  // Same appender the SDF sibling's `fontUrls()` uses, and like it a no-op in dev
-  // (the Vite dev server does not cache), so this is the production half of #276.
+  // `?v=<hash>` so a re-imported font is a NEW URL nothing has cached — without it the
+  // refetch below is served the old bytes and the reload is a no-op. Same appender the
+  // SDF sibling's `fontUrls()` uses. ⚠️ This used to add "and like it a no-op in dev …
+  // so this is the production half of #276"; that PROD gate went in #1022, so the bust
+  // now applies here too and the dev reload is a real refetch (see `assetUrl.ts`).
   // QUOTE the CSS url() — an unquoted url() breaks on a SPACE (or other CSS-special
   // char) in the filename (e.g. "Geologica-Bold Dynamic.ttf"), failing face.load().
   // Escape any embedded double-quote/backslash so the quoted url() stays well-formed.

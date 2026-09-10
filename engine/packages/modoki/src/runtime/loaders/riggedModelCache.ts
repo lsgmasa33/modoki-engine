@@ -237,10 +237,11 @@ function fetchRiggedModel(path: string, postprocessorId?: string): Promise<void>
     if (handoff) { finishLoad({ scene: handoff.scene, animations: handoff.animations }, `${path} (import handoff)`); return; }
 
     const tryLoad = (loader: GLTFLoader, i: number) => loader.load(
-      // modelGlbUrl appends the model's content hash as ?v=<hash> in PROD builds
-      // (mirrors the static modelGlbUrl path) so a re-import busts immutable
-      // CDN/browser caches. Both candidates (the `.processed.glb` variant and
-      // the raw fallback) resolve the hash from the base model's manifest entry.
+      // modelGlbUrl appends the model's content hash as ?v=<hash> (mirrors the static
+      // modelGlbUrl path) so a re-import busts every cache keyed on that URL. Both
+      // candidates (the `.processed.glb` variant and the raw fallback) resolve the hash
+      // from the base model's manifest entry. ⚠️ Said "in PROD builds" until #1022
+      // removed that gate — it applies in dev too now.
       modelGlbUrl(candidates[i]),
       (gltf) => finishLoad(gltf as { scene: THREE.Group; animations?: THREE.AnimationClip[] }, candidates[i]),
       undefined,

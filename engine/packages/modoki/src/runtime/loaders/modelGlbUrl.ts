@@ -1,12 +1,16 @@
 /** Resolve a model GLB / LOD / processed-variant path to its served URL,
- *  appending the model's content hash as `?v=<hash>` in PRODUCTION builds so a
- *  re-import (new hash → new URL) busts immutable browser/CDN caches — the
- *  model-side mirror of `resolveTextureVariantUrl`.
+ *  appending the model's content hash as `?v=<hash>` so a re-import (new hash →
+ *  new URL) busts every cache keyed on that URL — the model-side mirror of
+ *  `resolveTextureVariantUrl`.
  *
  *  Derived paths (`<model>.glb.processed.glb` / `.glb.lod<N>.glb`) carry no
  *  manifest entry of their own, so the hash is derived from the base model
- *  entry. Dev + the packaged editor serve via the Vite dev server
- *  (query-agnostic, no immutable caching), so no `?v` is added there.
+ *  entry.
+ *
+ *  ⚠️ **This used to say "in PRODUCTION builds … so no `?v` is added there [dev]".**
+ *  That gate was removed in #1022: the query is not only about immutable
+ *  browser/CDN caching, it is the asset's IDENTITY, and freezing it in dev meant a
+ *  re-imported asset kept its old cache entry. See `assetUrl.ts`'s `withCacheBust`.
  *
  *  This lives in its own leaf module (depending only on `assetManifest` +
  *  `assetUrl`) so BOTH the static `meshTemplateCache` and the rigged

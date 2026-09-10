@@ -4587,10 +4587,16 @@ exists only where 2+ renderers are live (i.e. the editor, where retention is wan
 has one renderer, so `unloadAllSpriteTextures` runs on its every scene swap and the bound is exact.
 
 ⚠️ **A texture invalidation purges the parked set**, or a re-imported sprite would keep being served
-from it — `withCacheBust` is a **no-op in dev** (`loaders/assetUrl.ts`), so the cache key does not
-change on re-import. That restores the pre-retention behaviour and no more: nothing Pixi-side listens
-for texture invalidation at all, so a re-import of a texture a LIVE sprite still holds is unaffected
-(pre-existing, #1022).
+from it. That listener is **parked-set-only** — a texture a LIVE sprite still holds has a non-zero
+`spriteTextureRefs`, so the `deferUnload` guard keeps it out of the parked set by construction.
+
+⚠️ **The live-sprite half is closed by the URL, not by that listener** (#1022). This passage used to
+say `withCacheBust` was "a no-op in dev, so the cache key does not change on re-import", and that
+nothing Pixi-side listened at all. Both were wrong by the time they were read: the listener above
+already existed, and the dev gate has since been removed — the bust now applies whenever a hash is
+known, so a re-import moves the resolved url and a live sprite's slot rebuilds against a key the Pixi
+`Assets` cache has never seen. See [docs/textures.md](textures.md) § "The dev URL carries the content
+hash".
 
 **What it fixes, measured** (dev editor, WebGPU, pixi 8.20.1, 2026-09-10). Every play/stop cycle
 destroyed each runtime-spawned sprite's `TextureSource` and re-created it on the next play:

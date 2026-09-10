@@ -140,6 +140,41 @@ the filenames from the producers' own source, so renaming one goes red instead o
 reopening the hole. ⚠️ **It pins those two, not the class** — a new test writing some other linted
 extension into a linted directory reopens this with the guard green. That is what this rule is for.
 
+### A red gate that belongs to ANOTHER CLONE's machine, not to your branch
+
+⚠️ **`cleanPackagedCacheLinkGuard.test.ts` goes red whenever a packaged editor is running anywhere
+on this machine — including one another clone started.** `clean-packaged-cache.mjs` refuses to run
+while the app is up (*"is currently running — quit it first, or re-run with --force to kill it"*),
+which is correct: it is about to delete that app's cache. The guard drives the real script, so the
+refusal reaches your gate as a failure.
+
+`smoke-packaged.sh` stages its app at `$TMPBASE/modoki-pkg-smoke-$CLONE`, so the running binary's
+path NAMES the clone that launched it — read it before doing anything else:
+
+```
+ps aux | grep -i "Modoki Editor" | grep -v grep
+#   …/T/modoki-pkg-smoke-modoki-qa/mac-arm64/Modoki Editor.app/…   ← work-qa's, not yours
+```
+
+⚠️ **This is NOT the "a live editor breaks a concurrent verify" rule in `CLAUDE.md` § Editor.** That
+one is about a DEV editor on your own clone, which your own discipline can prevent. This is a
+PACKAGED editor on a sibling clone: nothing on this checkout can see it coming, and the failure text
+("quit it and re-run") addresses someone who is not you.
+
+**What to do — and the first step is attribution, not a fix:**
+
+1. **Check whether the failing file is the ONLY one that failed.** If your change is innocent, it
+   will be — a real defect does not confine itself to a guard about packaged-cache deletion.
+2. **Re-run that file alone once the sibling's process exits.** Passing in isolation on a quiet
+   machine is the confirmation.
+3. ⚠️ **Do NOT kill it, and do not reach for `--force`.** `CLAUDE.md` § Clones: never reap another
+   clone's processes — a packaged smoke takes minutes and killing it costs that clone its run. Wait;
+   observed 2026-09-10 exiting on its own inside ~100 s.
+
+Both sightings that day cost a gate re-run each and self-corrected. The expensive outcome is the
+other one: reading the red as your own and going looking for it in a diff that never touched
+`engine/toolchain/**`.
+
 ### The Windows clone
 
 The Windows clone was **~10 min** at the old shape (2026-08-04): 608s, of which the app-tests

@@ -59,9 +59,10 @@ function servedAudioUrl(path: string): string {
   const audio = entry?.audio;
   if (audio?.ext && entry?.hash) {
     // Convention (matches modelGlbUrl / resolveTextureVariantUrl): the `~audio.<ext>`
-    // variant URL is always used when converted; the `?v=<hash>` cache-bust is
-    // appended ONLY in a production build (dev + editor serve via Vite, no immutable
-    // caching), so `withCacheBust` is a no-op in dev/tests. assetUrl() wraps the FULL
+    // variant URL is always used when converted, and the `?v=<hash>` cache-bust rides
+    // along wherever the manifest knows a hash. ⚠️ This used to say the bust was
+    // "appended ONLY in a production build … a no-op in dev/tests"; that gate went in
+    // #1022 (see `assetUrl.ts`). assetUrl() wraps the FULL
     // served-variant path (not just the source) so a playable single-file build resolves
     // it to the inlined blob: URL — the __PLAYABLE_ASSETS__ map is keyed by the served path.
     return withCacheBust(assetUrl(`${path}~audio.${audio.ext}`), entry.hash);

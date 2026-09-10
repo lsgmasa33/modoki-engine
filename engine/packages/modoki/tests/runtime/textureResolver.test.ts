@@ -51,11 +51,16 @@ describe('resolveTextureVariantUrl', () => {
     err.mockRestore();
   });
 
-  it('does NOT append the cache-bust ?v in dev even when a hash is present', () => {
+  // ⚠️ **This pair used to assert the OPPOSITE in dev, and that assertion WAS #1022.** The old
+  // test ("does NOT append the cache-bust ?v in dev even when a hash is present") pinned the PROD
+  // gate as intended behaviour, on the reasoning that the query exists to defeat immutable
+  // browser/CDN caching and the Vite dev server needs no such thing. True, and beside the point:
+  // the URL is also the IDENTITY every downstream cache keys on, so freezing it in dev meant a
+  // re-imported texture kept the same PixiJS `Assets` key and the same live `TextureSource`.
+  // See `assetUrl.ts`'s `withCacheBust` docblock.
+  it('appends ?v=<hash> in DEV too, so a re-import moves the URL (#1022)', () => {
     registerAsset(GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }, undefined, 'deadbeef');
-    const url = resolveTextureVariantUrl(GUID, '3d');
-    expect(url).toContain(PATH + '~uastc.ktx2');
-    expect(url).not.toContain('?v=');
+    expect(resolveTextureVariantUrl(GUID, '3d')).toContain(PATH + '~uastc.ktx2?v=deadbeef');
   });
 
   it('appends ?v=<hash> in production builds (immutable-cache bust)', () => {
@@ -66,6 +71,33 @@ describe('resolveTextureVariantUrl', () => {
     } finally {
       vi.unstubAllEnvs();
     }
+  });
+
+  // The HALF THAT MATTERS, and the reason the fix is at the URL rather than an eviction pass in
+  // `Scene2D`: the URL must move when the BYTES move and stay put when they do not. A re-slice
+  // bumps the sprite epoch without changing the hash, and `Scene2D`'s retain-before-release bridge
+  // (`Scene2D.tsx:1761`) keys on `resolved.url === displaySlot.textureUrl` to keep the shared
+  // `TextureSource` across that rebuild. An epoch-keyed fix cannot tell the two apart — the epoch
+  // bumps for both — and would force a re-download on every re-slice.
+  it('moves the URL when the hash moves, and holds it when the hash does not (#1022)', () => {
+    registerAsset(GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }, undefined, 'hash-before');
+    const before = resolveTextureVariantUrl(GUID, '3d');
+
+    // A RE-SLICE: same bytes, so the same hash — the URL must not move.
+    registerAsset(GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }, undefined, 'hash-before');
+    expect(resolveTextureVariantUrl(GUID, '3d')).toBe(before);
+
+    // A RE-IMPORT: new bytes, new hash — the URL must move.
+    registerAsset(GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' }, undefined, 'hash-after');
+    expect(resolveTextureVariantUrl(GUID, '3d')).not.toBe(before);
+  });
+
+  // A hashless entry must stay unsuffixed rather than gain a `?v=undefined` — the manifest can
+  // legitimately carry no hash (an external URL, a fixture), and a literal "undefined" in the URL
+  // would be a 404 that no layer reports.
+  it('appends nothing when the manifest carries no hash', () => {
+    registerAsset(GUID, PATH, 'texture', { ...DEFAULT_TEXTURE_SETTINGS, format: 'ktx2-uastc' });
+    expect(resolveTextureVariantUrl(GUID, '3d')).not.toContain('?v=');
   });
 
   // #212 texture LOD by quality tier. The resolver must NEVER guess a capped URL the build

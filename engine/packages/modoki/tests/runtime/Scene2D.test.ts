@@ -23,10 +23,26 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 const createdWorlds: any[] = [];
 function trackWorld<T>(w: T): T { createdWorlds.push(w); return w; }
 
+/**
+ * Re-import redirect for the `resolveSprite` mock: `ref` → the url it resolves to NOW.
+ *
+ * ⚠️ **This exists because the harness mocks the resolver, so it cannot exercise
+ * `withCacheBust` itself** — the URL derivation is stubbed out (see `mockDeps`). What the
+ * tests below cover is the CONSUMER half of #1022: given that a re-import moves the resolved
+ * url (which `textureResolver.test.ts` pins on the real code), does a LIVE sprite actually
+ * drop the old texture and bind the new one? That question is `Scene2D`'s alone, and the two
+ * existing invalidation tests cannot answer it because both despawn the sprite first.
+ *
+ * Set by a test, read by the mock, cleared here — a leaked entry would silently redirect a
+ * later test's sprite.
+ */
+const spriteUrlRedirects = new Map<string, string>();
+
 beforeEach(() => {
   vi.resetModules();
 });
 afterEach(() => {
+  spriteUrlRedirects.clear();
   for (const w of createdWorlds) { try { w.destroy(); } catch { /* already disposed */ } }
   createdWorlds.length = 0;
 });
@@ -286,10 +302,15 @@ function mockDeps() {
     // A 'vid:' ref stands in for a video-asset GUID: a Sprite slot that skips the
     // still-image pipeline entirely (no resolve, no Assets.load, no url retain).
     isVideoRef: (ref: string) => typeof ref === 'string' && ref.startsWith('vid:'),
+    // All three consult `spriteUrlRedirects` first, and consistently — a ref that resolves to a
+    // url must also BE an image path, or `imageMode` is false and the sprite branch is never
+    // reached at all (which is not a failure any assertion about the texture can read).
     isImagePath: (ref: string) =>
-      typeof ref === 'string' && (ref.startsWith('sheet:') || ref.startsWith('img:') || ref.startsWith('http') || ref.startsWith('/')),
+      typeof ref === 'string' && (spriteUrlRedirects.has(ref) || ref.startsWith('sheet:') || ref.startsWith('img:') || ref.startsWith('http') || ref.startsWith('/')),
     resolveImageUrl: (ref: string) => {
       if (typeof ref !== 'string') return undefined;
+      const redirected = spriteUrlRedirects.get(ref);
+      if (redirected) return redirected;
       if (ref.startsWith('sheet:')) return 'http://t/sheet.png';
       if (ref.startsWith('img:')) return ref.slice(4);
       if (ref.startsWith('http') || ref.startsWith('/')) return ref;
@@ -301,6 +322,11 @@ function mockDeps() {
       // the sprite-sheet animation case the in-place frame-swap path targets.
       const m = /^sheet:(\d+)$/.exec(ref);
       if (m) { const i = +m[1]; return { url: 'http://t/sheet.png', frame: { x: i * 10, y: 0, w: 10, h: 10 }, pivot: null, sheetW: 100, sheetH: 10 }; }
+      // #1022: a re-import moves the resolved url (the real `withCacheBust` appends `?v=<hash>`)
+      // WITHOUT the ref changing — the one thing a ref-shaped stub cannot express. Consulted
+      // first so a GUID ref, which none of the prefix rules below match, resolves through it.
+      const redirected = spriteUrlRedirects.get(ref);
+      if (redirected) return { url: redirected, frame: null, pivot: null, sheetW: null, sheetH: null };
       let url: string | undefined;
       if (ref.startsWith('img:')) url = ref.slice(4);
       else if (ref.startsWith('http') || ref.startsWith('/')) url = ref;
@@ -2554,8 +2580,13 @@ describe('Scene2DRenderer instancing', () => {
 
   // Retention must not make a RE-IMPORT invisible (#1000). Before parking, a single-renderer play/stop
   // ran the wholesale sweep and the next Play re-fetched; parking removed that flush, so re-importing a
-  // sprite and pressing Play would keep showing the old bytes. `withCacheBust` cannot cover it — it is
-  // a no-op unless PROD, i.e. inert exactly where re-import happens.
+  // sprite and pressing Play would keep showing the old bytes.
+  //
+  // ⚠️ This comment used to add "`withCacheBust` cannot cover it — it is a no-op unless PROD, i.e.
+  // inert exactly where re-import happens." That gate is GONE (#1022): the bust now applies in dev,
+  // so a re-import moves the url. This test still earns its place — it pins the PARKED path, which
+  // is a different route to the same symptom and is what #1000 actually fixed — but it is no longer
+  // the only thing standing between a re-import and stale bytes.
   it('a texture invalidation purges the parked set, so a re-import is not served stale (#1000)', async () => {
     const { pixi, traits, scene2d, pool, world, worldReg, newWorld } = await setup({ start: true }); // live=1
     const { emitAssetInvalidated } = await import('../../src/runtime/core/assetInvalidation');
@@ -2612,6 +2643,113 @@ describe('Scene2DRenderer instancing', () => {
       editorRenderer.stop();
       scene2d.stopScene2D();
     }
+  });
+
+  /**
+   * #1022 — the LIVE-sprite half, which neither test above can reach.
+   *
+   * Both #1000 tests despawn the sprite first (`setCurrentWorld(newWorld())`), so they assert the
+   * PARKED case only: `releaseRetainedSpriteTextures` iterates `retainedSpriteTextures`, and the
+   * `spriteTextureRefs > 0` guard makes that set disjoint from anything a live sprite holds. A
+   * texture still bound to a drawing sprite was untouched by #1000 and is what #1022 filed.
+   *
+   * ⚠️ **This pins the ASSUMPTION the fix rests on, not the fix itself.** The fix is in
+   * `withCacheBust` (`assetUrl.ts`), which this harness stubs out — so `textureResolver.test.ts`
+   * owns the "does a re-import move the url?" half, and this owns "given the url moved, does a live
+   * sprite actually let go of the old texture?". Splitting it that way is deliberate: asserting the
+   * fix here would be asserting the mock.
+   *
+   * ⚠️ **Measured consequence, stated so nobody mistakes this pair for #1022's safety net: BOTH
+   * tests below stay GREEN under a full revert of #1022** (restore the `PROD` gate → only
+   * `textureResolver.test.ts` reds). What reds them is dropping `displaySlot.builtEpoch !==
+   * spriteEpoch` from `needResolve` (`Scene2D.tsx`'s slot sync) — the epoch TRIGGER, which predates
+   * #1022 and which they therefore pin twice over. The whole evidentiary weight for the fix
+   * itself sits on `textureResolver.test.ts`; these two guard the consumer behaviour it relies on.
+   * The harness cannot do better — it stubs the resolver, so the real url derivation is not
+   * reachable from here at all.
+   */
+  it('a live sprite drops the old texture and binds the new one when a re-import moves the url (#1022)', async () => {
+    const { pixi, traits, pool, scene2d, world } = await setup();
+    // The REAL manifest, not a stub: `getSpriteEpoch` is what makes the renderer re-consult the
+    // resolver at all (`Scene2D.tsx`'s `needResolve`), and it reads `_spriteEpochByTexture`, which
+    // `registerAsset` bumps only when the content hash actually moves. Driving the real thing is
+    // what keeps this test honest about the TRIGGER; only the url derivation is stubbed.
+    const manifest = await import('../../src/runtime/loaders/assetManifest');
+    const GUID = '11111111-1111-4111-8111-111111111111';
+    const PATH = '/assets/textures/hero.png';
+    manifest.registerAsset(GUID, PATH, 'texture', undefined, undefined, 'hash-before');
+
+    const before = { width: 32, height: 32, source: { style: {} } };
+    const after = { width: 64, height: 64, source: { style: {} } };
+    pixi.Assets.__seed('/hero.png?v=hash-before', before);
+    spriteUrlRedirects.set(GUID, '/hero.png?v=hash-before');
+    const canvas = spawnCanvas(world, traits);
+    spawnChild(world, traits, canvas.id(), { sprite: GUID });
+
+    scene2d.renderFrame();
+    expect((pool.getSlot(canvas.id())!.container.children[0] as any).texture).toBe(before);
+
+    // The re-import: same scene, same ref, same live sprite. New bytes → new hash → the manifest
+    // bumps the epoch (so the renderer looks again) AND the url moves (so it fetches again).
+    // Before #1022's fix the second half did not happen in dev: the renderer looked, found the
+    // identical url, and the retain-before-release bridge held the stale source.
+    pixi.Assets.__seed('/hero.png?v=hash-after', after);
+    manifest.registerAsset(GUID, PATH, 'texture', undefined, undefined, 'hash-after');
+    spriteUrlRedirects.set(GUID, '/hero.png?v=hash-after');
+    scene2d.markScene2DDirty();
+    scene2d.renderFrame();
+    await new Promise((r) => setTimeout(r, 0));   // let the deferred unload elapse
+
+    const kids = pool.getSlot(canvas.id())!.container.children as any[];
+    expect(kids).toHaveLength(1);
+    expect(kids[0].texture).toBe(after);                                   // re-bound, not stale
+    expect(pixi.Assets.__unloaded).toContain('/hero.png?v=hash-before');   // old one let go
+  });
+
+  /**
+   * The complement, and the reason #1022's fix is at the URL rather than keyed on the epoch: a
+   * RE-SLICE bumps the same epoch with the SAME bytes, and must NOT cost a re-download. Without
+   * this, "evict whenever the epoch moved" reads as a simpler fix than the one taken. It is not —
+   * it would re-download on every sprite-sheet re-slice.
+   *
+   * ⚠️ **What holds the texture here is NOT the retain-before-release bridge, and an earlier
+   * version of this comment said it was.** Mutation-checked: disabling the bridge outright
+   * (`if (false && …)` at `Scene2D.tsx:1762`) leaves this test GREEN. The actual protection is
+   * `deferUnload`'s `setTimeout(0)` — `disposeSlot` schedules the unload, `makeSprite` re-retains
+   * the same url later in the SAME frame, and `retainSpriteTexture` clears the pending timer
+   * before it can fire. The bridge is a second belt on a path that already holds.
+   *
+   * So this test is falsifiable on the TRIGGER, not on the bridge: dropping
+   * `displaySlot.builtEpoch !== spriteEpoch` from `needResolve` (`:1724`) reds it, because
+   * `resolved` then goes stale and the dispose is no longer balanced by a re-retain.
+   */
+  it('a re-slice bumps the epoch but keeps the texture, because the url did not move (#1022)', async () => {
+    const { pixi, traits, pool, scene2d, world } = await setup();
+    const manifest = await import('../../src/runtime/loaders/assetManifest');
+    const GUID = '22222222-2222-4222-8222-222222222222';
+    const PATH = '/assets/textures/sheet.png';
+    manifest.registerAsset(GUID, PATH, 'texture', undefined, undefined, 'hash-stable');
+
+    const tex = { width: 32, height: 32, source: { style: {} } };
+    pixi.Assets.__seed('/sheet.png?v=hash-stable', tex);
+    spriteUrlRedirects.set(GUID, '/sheet.png?v=hash-stable');
+    const canvas = spawnCanvas(world, traits);
+    spawnChild(world, traits, canvas.id(), { sprite: GUID });
+
+    scene2d.renderFrame();
+    const epochBefore = manifest.getSpriteEpoch(GUID);
+
+    // A re-slice: the sprite's frames change, the BYTES do not — so the epoch moves and the url
+    // (which carries the content hash) does not.
+    manifest.registerAsset(GUID, PATH, 'texture', undefined, undefined, 'hash-stable');
+    manifest.registerSprite('33333333-3333-4333-8333-333333333333', GUID, PATH,
+      { texture: GUID, rect: { x: 0, y: 0, w: 16, h: 16 } } as never);
+    expect(manifest.getSpriteEpoch(GUID)).toBeGreaterThan(epochBefore);   // the trigger really fired
+    scene2d.markScene2DDirty();
+    scene2d.renderFrame();
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(pixi.Assets.__unloaded).not.toContain('/sheet.png?v=hash-stable');
   });
 });
 

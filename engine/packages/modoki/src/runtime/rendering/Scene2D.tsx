@@ -357,19 +357,25 @@ function releaseRetainedSpriteTextures() {
 // ⚠️ A re-imported texture must not keep being served from the PARKED set (#1000).
 // Before retention, a single-renderer play/stop ran `unloadAllSpriteTextures` and the next Play
 // re-fetched; parking removed that flush, so re-importing a sprite PNG and pressing Play would keep
-// showing the OLD bytes until a genuine scene change. `withCacheBust` cannot save it — it returns the
-// url unchanged unless `PROD && hash` (`loaders/assetUrl.ts`), i.e. it is a no-op in dev, which is
-// exactly where re-import happens.
+// showing the OLD bytes until a genuine scene change.
 //
 // Purges the WHOLE parked set rather than the one url, deliberately: everything parked is BY
 // DEFINITION unreferenced, so dropping all of it is free, and it avoids mapping an asset PATH back to
 // the resolved variant URL(s) the set is keyed by — a mapping that would be a second place to get the
 // texture-variant scheme wrong.
 //
-// ⚠️ This restores the pre-retention behaviour; it does NOT close the wider hole. Nothing on the Pixi
-// side listens for texture invalidation at all (every `onAssetInvalidated` subscriber is in
-// `meshTemplateCache.ts`, i.e. 3D), so a re-import of a texture a LIVE sprite is still holding is
-// unaffected by this and was equally unaffected before. Pre-existing, filed separately.
+// ⚠️ **THIS LISTENER IS PARKED-SET-ONLY, and it is the only Pixi-side one.** A texture a LIVE sprite
+// still holds has `spriteTextureRefs >= 1`, so the guard in `deferUnload` keeps it out of
+// `retainedSpriteTextures` by construction and nothing here can reach it.
+//
+// ⚠️ **Two earlier claims in this comment were FALSE, and #1022 was filed off them.** It said
+// "nothing on the Pixi side listens for texture invalidation at all" — four lines above this
+// listener — and that "`withCacheBust` cannot save it" because it is a dev no-op. The first was
+// stale the moment this listener landed. The second described a real gate that has since been
+// REMOVED: `withCacheBust` now appends `?v=<hash>` in dev too, so a re-import moves the resolved
+// url, the live sprite's slot rebuilds against a url the Pixi `Assets` cache has never seen, and
+// the stale source is released on the ordinary path. That is what closes the live-sprite half —
+// not this listener. See `loaders/assetUrl.ts` and `docs/textures.md`.
 onAssetInvalidated((kind) => {
   if (kind !== 'texture') return;
   releaseRetainedSpriteTextures();

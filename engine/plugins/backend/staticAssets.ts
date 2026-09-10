@@ -64,17 +64,34 @@ const file = (contentType: string, absPath: string, headers?: Record<string, str
  *  Only the Basis transcoder qualifies here; its bytes never change. */
 const IMMUTABLE = { 'Cache-Control': 'public, max-age=31536000, immutable' } as const;
 
-/** Revalidating cache policy for the converted model + texture *variant* URLs.
- *  These are NOT content-addressed in the URL: the editor/dev backend serves them
- *  query-agnostic (`<model>.glb.processed.glb`, `<src>~uastc.ktx2`) — the hash
- *  lives only in the meta sidecar + cache *disk* path, and `modelGlbUrl` /
- *  `resolveTextureVariantUrl` append `?v=<hash>` ONLY in the GCS prod build, never
- *  here. So `immutable` was a LIE: after a re-bake (e.g. a `recipeVersion` bump
- *  that adds the island's planar UVs) the bytes at the same URL change but the
- *  browser keeps serving its year-cached copy → grass renders untextured until you
- *  manually "Disable cache". `no-cache` makes the browser revalidate every load;
- *  the content hash as `ETag` lets `writeBackendResult` answer a cheap 304 when the
- *  bake is unchanged, and a 200 with fresh bytes the moment it changes. */
+/** Revalidating cache policy for the converted model + texture *variant* URLs
+ *  (`<model>.glb.processed.glb`, `<src>~uastc.ktx2`).
+ *
+ *  ⚠️ **`immutable` would be a LIE here because NOT EVERY CLIENT SENDS THE HASH.** The
+ *  runtime resolvers do — `modelGlbUrl` / `resolveTextureVariantUrl` append `?v=<hash>`,
+ *  and since #1022 they do it in dev as well as in prod, so for that caller the URL really
+ *  is content-addressed and moves whenever the bake does (`model-cache.ts`'s `hashKey`
+ *  folds `recipeVersion`, the source bytes, the settings and the tool versions). But the
+ *  EDITOR's own preview fetches do not: `ModelPreview` and `MeshAssetView` go through
+ *  `cacheBustReimport`, which returns the URL untouched at epoch 0 — a bare path, no hash,
+ *  no query. A client whose manifest is older than a sidecar `autoBakeThenServe` just
+ *  rewrote server-side is in the same position. Cache those `immutable` and the browser
+ *  serves a year-old copy of bytes that have since changed, with no way back but "Disable
+ *  cache" by hand.
+ *
+ *  `no-cache` makes the browser revalidate every load; the content hash as `ETag` lets
+ *  `writeBackendResult` answer a cheap 304 when the bake is unchanged, and a 200 with fresh
+ *  bytes the moment it changes — so the hash-carrying callers pay almost nothing for the
+ *  hashless ones being correct.
+ *
+ *  ⚠️ **Two earlier versions of this comment justified the policy from a premise about the
+ *  URL rather than about the CLIENT, and both aged into falsehoods.** The first said the
+ *  appenders add `?v=` "ONLY in the GCS prod build, never here" — untrue since #1022. The
+ *  second (this change) said "this handler strips the query before matching" — untrue in a
+ *  different way: `serveProjectAsset` is HANDED an already-stripped path (`vite-asset-scanner`
+ *  splits on `?`, `backendServer` passes `u.pathname`), and what the handler sees was never
+ *  the point, because the browser keys its cache on the full URL the CLIENT sent. State the
+ *  policy in terms of who is asking. */
 const revalidate = (hash: string) =>
   ({ 'Cache-Control': 'no-cache', ETag: `"${hash}"` }) as const;
 

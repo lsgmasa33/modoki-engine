@@ -619,10 +619,20 @@ describe('fontLoader', () => {
       await Promise.resolve();
       await Promise.resolve();
 
-      // Dev builds don't cache-bust, so both FontFace instances share the same `source` URL —
-      // the count under that shared key is the total number of loads for the path (2), which
-      // is exactly the regression: before the fix it stayed at 1 forever.
-      expect(loadCalls[instances[1].source], 'loaded a second time for the same path').toBe(2);
+      // ⚠️ **This assertion used to read `toBe(2)` under a SHARED source url, and that sharing was
+      // itself the #1022 defect.** The original comment said "dev builds don't cache-bust, so both
+      // FontFace instances share the same `source` URL — the count under that shared key is the
+      // total number of loads for the path". True at the time, and it made the count an artifact
+      // of the very thing that was wrong: a re-import that did not move the url.
+      //
+      // Since #1022 the hash rides the url in dev too, so the two loads land under DIFFERENT keys.
+      // The invariant this test is actually about — "a re-import really does re-load" — is proved
+      // by `instances.length === 2` above; what is asserted here is that the second load happened
+      // and that it went to a genuinely new url, which is strictly more than the old form could say.
+      expect(loadCalls[instances[1].source], 'the reload issued its own load').toBe(1);
+      expect(instances[1].source, 'the re-import moved the url').not.toBe(instances[0].source);
+      expect(instances[0].source).toContain('?v=hash-v1');
+      expect(instances[1].source).toContain('?v=hash-v2');
     });
 
     it('deletes the superseded face from document.fonts after the reload settles', async () => {
@@ -858,15 +868,18 @@ describe('fontLoader', () => {
       warn.mockRestore();
     });
 
-    it('cache-busts the FontFace source with ?v=<hash> in production, but not in dev', async () => {
+    // ⚠️ Was "…in production, but not in dev". The dev half was #1022: `withCacheBust`'s PROD gate
+    // froze the url, and a frozen url is a cache key nothing can invalidate. Fonts share that
+    // helper with textures, models and audio, so the contract is now the same everywhere — a hash
+    // in the manifest means a hash in the url.
+    it('cache-busts the FontFace source with ?v=<hash> in BOTH dev and production (#1022)', async () => {
       installFontFaceMock();
       await seedManifest('hash-v1');
       const { loadFont } = await getLoader();
 
-      // Dev (default test env): no cache-bust suffix.
       const pDev = loadFont(PATH);
       await Promise.resolve();
-      expect(instances[0].source).not.toContain('?v=');
+      expect(instances[0].source).toContain('?v=hash-v1');
       instances[0].resolve();
       await pDev;
 

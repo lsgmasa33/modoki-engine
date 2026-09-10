@@ -36,8 +36,8 @@ export async function encodeUltraHDR(sourceUrl: string): Promise<Uint8Array> {
 }
 
 /** Small deterministic content hash (FNV-style 2-lane mix, 16-hex) of the encoded
- *  bytes — cache-busts the committed `~ultrahdr.jpg` variant URL (`?v=<hash>` in prod),
- *  like the Node content hashes. Changes iff the bytes change. */
+ *  bytes — cache-busts the committed `~ultrahdr.jpg` variant URL (`?v=<hash>`, in dev as
+ *  well as prod since #1022), like the Node content hashes. Changes iff the bytes change. */
 export function hashBytes(bytes: Uint8Array): string {
   let h1 = 0x811c9dc5, h2 = 0x1000193;
   for (let i = 0; i < bytes.length; i++) {

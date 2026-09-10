@@ -2464,4 +2464,41 @@ describe('UINode minTapSize (#948)', () => {
     expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('minTapSize'));
     warn.mockRestore();
   });
+
+  // ── #1025: the REMEDY the warning prints ──
+  //
+  // ⚠️ The assertions above all match `stringContaining('minTapSize')`, which is loose enough to
+  // pass whatever the message advises — so the advice itself was never covered, and it was WRONG
+  // for years: "wrap it in a div that carries the click binding", printed at controls that bind
+  // `change` and therefore have no click binding to carry. A wrapper built to that instruction
+  // fails `takesClick` and gets no expander either.
+  //
+  // These pin the remedy per kind, because the right answer genuinely differs — and a warning that
+  // names the wrong fix is worse than one that names none.
+  it.each(['input', 'range'] as const)('tells a %s author to grow the control itself, NOT to wrap it', kind => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    renderNode(makeNode({ ...clickable, guid: `remedy-${kind}`, elementType: kind, minTapSize: 48, minTapSizeUnit: 'px' } as Partial<UINodeData>));
+    const msg = String(warn.mock.calls.map(c => String(c[0])).filter(m => m.includes('minTapSize')).at(-1));
+    expect(msg).toContain('hit-tests its WHOLE authored box');
+    expect(msg).not.toContain('wrap it in a div');   // the retracted advice
+    warn.mockRestore();
+  });
+
+  it('tells a UIToggle author to wrap it — and that moving the change binding will NOT do', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // ⚠️ A real `toggle` BLOCK, not `toggle: true`. `UINode` only tests it for truthiness, so the
+    // boolean rendered identically and the test passed — while `npm run verify`'s typecheck leg
+    // rejected it, because `UINodeData.toggle` is a nested object. A node that cannot exist is not
+    // the node this warning fires on.
+    const toggle = {
+      value: false, trackOnColor: 0x4caf50, trackOffColor: 0x888888, trackOpacity: 1,
+      knobColor: 0xffffff, knobOpacity: 1, knobInset: 2, trackRadius: 16, knobRadius: 14,
+      disabled: false,
+    };
+    renderNode(makeNode({ ...clickable, guid: 'remedy-toggle', toggle, minTapSize: 48, minTapSizeUnit: 'px' } as Partial<UINodeData>));
+    const msg = String(warn.mock.calls.map(c => String(c[0])).filter(m => m.includes('minTapSize')).at(-1));
+    expect(msg).toContain('wrap it in a div that carries its OWN click binding');
+    expect(msg).toContain('does NOT work');          // the trap an author falls into next
+    warn.mockRestore();
+  });
 });

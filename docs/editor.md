@@ -1989,8 +1989,11 @@ load-bearing:
   fetches the baked `.glb` over HTTP, so even a re-run effect would replay the browser's cached
   copy of an unchanged URL. `cacheBustReimport(url, epoch)` appends `?reimport=<n>` — with the
   `blob:`/`data:` carve-out `withCacheBust` makes for the same reason (a blob URL is matched by
-  UUID, so a query suffix 404s the model). The engine's own `withCacheBust` cannot serve here:
-  it is PROD-and-content-hash only, and the editor is neither.
+  UUID, so a query suffix 404s the model). The engine's own `withCacheBust` still cannot serve
+  here, but the reason narrowed in #1022: it keys on the manifest CONTENT HASH, and a re-bake of
+  an unchanged source leaves that hash alone. (It used to be "PROD-and-content-hash only"; the
+  PROD half is gone, so the bust now applies in the editor too — just not on the axis this needs.)
+  `reimport=<n>` moves per re-import, which is exactly the axis that does.
 - **The epoch coalesces on a trailing 250 ms timer, and that is not cosmetic.** ONE Import click
   fires `invalidateModel` for the same model **three** times — measured on `games/sling`'s
   `ramp_wedge`, 2 ms apart then 32 ms later (it invalidates before re-deriving templates, again
