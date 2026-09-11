@@ -14,6 +14,7 @@ import { loadDeviceSurface, type DeviceSurface } from './deviceSurface';
 import { CREATE_ENTITY_KINDS, LIGHT_KINDS, JOURNAL_LEVELS } from '../../packages/modoki/src/runtime/index';
 import { UI_PRESET_NAMES } from '../../packages/modoki/src/runtime/ui/uiAuthoring';
 import { EDITOR_JOURNAL_SOURCES } from '../../packages/modoki/src/editor/editorJournal';
+import { DEVICE_KEY_MODIFIERS, EDITOR_INPUT_MODIFIERS, MOUSE_BUTTONS, POINTER_ACTIONS } from '../../tools/shared/inputVocabulary';
 
 let surface: Surface | undefined;
 let device: DeviceSurface | undefined;
@@ -39,6 +40,25 @@ describe('editor MCP tool enums == the runtime tables', () => {
     surface = loadSurface();
     expect(sorted(enumOf(surface, tool, param))).toEqual(sorted(table));
   });
+
+  // #1076 — the input vocabularies the `/api/input/*` routes refuse against.
+  it.each([
+    ...['modoki_tap', 'modoki_drag', 'modoki_pointer', 'modoki_tap_handle', 'modoki_drag_handle']
+      .map((tool) => ({ tool, param: 'button', table: MOUSE_BUTTONS as readonly string[] })),
+    { tool: 'modoki_pointer', param: 'action', table: POINTER_ACTIONS as readonly string[] },
+  ])('$tool $param', ({ tool, param, table }) => {
+    surface = loadSurface();
+    expect(sorted(enumOf(surface, tool, param))).toEqual(sorted(table));
+  });
+
+  it.each(['modoki_tap', 'modoki_drag', 'modoki_pointer', 'modoki_hover', 'modoki_scroll', 'modoki_press_key', 'modoki_tap_handle', 'modoki_drag_handle'])(
+    '%s modifiers', (tool) => {
+      surface = loadSurface();
+      const json = zodToJsonSchema(surface.schemaFor(tool) as never) as { properties?: Record<string, { items?: { enum?: string[] } }> };
+      const values = json.properties?.modifiers?.items?.enum;
+      if (!values) throw new Error(`${tool}.modifiers is not a list of an enum in the advertised schema`);
+      expect(sorted(values)).toEqual(sorted(EDITOR_INPUT_MODIFIERS));
+    });
 
   it('modoki_create_entity.kind offers every runtime kind except `environment`', () => {
     surface = loadSurface();
@@ -78,6 +98,31 @@ describe('modoki_create_entity leaves the light/preset DEFAULTS to the op (#1070
     expect(relayedSpec(surface).light).toBe('spot');
     await surface.call('modoki_create_entity', { kind: 'ui', preset: 'button' });
     expect(relayedSpec(surface).preset).toBe('button');
+  });
+});
+
+describe('device input tools accept exactly the tables the relay refuses against (#1076)', () => {
+  it.each([...MOUSE_BUTTONS])('device_pointer button %s', async (button) => {
+    device = await loadDeviceSurface();
+    expect(device.validate('device_pointer', { action: 'down', x: 1, y: 1, button }).ok).toBe(true);
+  });
+
+  it.each([...POINTER_ACTIONS])('device_pointer action %s', async (action) => {
+    device = await loadDeviceSurface();
+    expect(device.validate('device_pointer', { action, x: 1, y: 1 }).ok).toBe(true);
+  });
+
+  it.each([...DEVICE_KEY_MODIFIERS])('device_press_key modifier %s', async (modifier) => {
+    device = await loadDeviceSurface();
+    expect(device.validate('device_press_key', { key: 'z', modifiers: [modifier] }).ok).toBe(true);
+  });
+
+  // The other half: a value outside the table is refused by the schema too, not only by the relay.
+  it('a value outside each table is refused', async () => {
+    device = await loadDeviceSurface();
+    expect(device.validate('device_pointer', { action: 'down', x: 1, y: 1, button: 'rigth' }).ok).toBe(false);
+    expect(device.validate('device_pointer', { action: 'wiggle', x: 1, y: 1 }).ok).toBe(false);
+    expect(device.validate('device_press_key', { key: 'z', modifiers: ['control'] }).ok).toBe(false);
   });
 });
 

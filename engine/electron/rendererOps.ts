@@ -23,6 +23,7 @@ import { pruneOldTempFiles } from '../plugins/backend/tempFiles';
 // `agentBridge.ts` are reached through, so a member rename here must redden this branch on
 // `frameLoop.status` too, not just those two (#682 close-out round 3, BLOCKER 2).
 import type { FrameLoopStatus } from '../packages/modoki/src/runtime/rendering/frameLoopStatus';
+import type { MouseButton as SharedMouseButton, EditorInputModifier } from '../tools/shared/inputVocabulary';
 
 const MAX_SIDE = 1568;
 const JPEG_QUALITY = 70;
@@ -440,10 +441,10 @@ export async function captureViewport(
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /** Which mouse button a click/drag uses. `right` opens context menus; `middle`
- *  is orbit-pan in the 3D viewport. */
-export type MouseButton = 'left' | 'right' | 'middle';
+ *  is orbit-pan in the 3D viewport. Declared once in `tools/shared/inputVocabulary.ts` (#1076). */
+export type MouseButton = SharedMouseButton;
 /** Chromium input modifier keys (as `sendInputEvent` expects them). */
-export type InputModifier = 'shift' | 'control' | 'alt' | 'meta' | 'cmd' | 'command';
+export type InputModifier = EditorInputModifier;
 
 export interface TapOpts {
   /** Mouse button (default 'left'). 'right' → context menu. */
@@ -689,7 +690,9 @@ export const KEYCODE_ALIAS: Record<string, string> = {
 
 export async function pressKey(win: BrowserWindow, key: string, modifiers?: InputModifier[]): Promise<{ activeElement: string | null; gameSwallows: boolean }> {
   const wc = win.webContents;
-  const keyCode = KEYCODE_ALIAS[key] ?? key;
+  // An own-key read, not `KEYCODE_ALIAS[key] ?? key`: `key` is agent-supplied, and `'toString'` would
+  // index the inherited FUNCTION — not nullish, so the fallback never fires (#993's shape, #1076).
+  const keyCode = Object.prototype.hasOwnProperty.call(KEYCODE_ALIAS, key) ? KEYCODE_ALIAS[key] : key;
   // Keyboard sendInputEvent dispatches to the FOCUSED web contents — unlike mouse events,
   // which hit-test by coordinate. When the editor window isn't the OS-focused window (agent-
   // driven, headless), a keyDown otherwise never reaches the page's window listeners. Focus

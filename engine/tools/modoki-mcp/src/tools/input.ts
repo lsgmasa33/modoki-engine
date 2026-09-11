@@ -9,6 +9,7 @@ import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
 import { ALLOW_OCCLUDED_BASE, MODIFIERS_BASE, allowOccludedParam, makeEntitySpec, modifierEnum, makePointSpec } from '../shapes.js';
+import { MOUSE_BUTTONS, POINTER_ACTIONS } from '../../../shared/inputVocabulary.js';
 
 export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
   const { getJson, postJson, evalRenderer, editorAction } = ctx;
@@ -43,7 +44,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       // wrong selector propagates — it was copied into a QA case brief before anyone checked.
       selector: z.string().optional().describe("CSS selector to aim at, e.g. '[data-ui-id=\"inspector.header.delete\"]'. Overrides x/y."),
       entity: makeEntitySpec().optional(),
-      button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button (default 'left')."),
+      button: z.enum(MOUSE_BUTTONS).optional().describe("Mouse button (default 'left')."),
       clickCount: z.number().optional().describe('1 = single (default), 2 = double-click.'),
       modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}.`),
       allowOccluded: allowOccludedParam,
@@ -68,7 +69,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       from: makePointSpec().describe('Drag origin: {entity} | {selector} | {x,y}.'),
       to: makePointSpec().describe('Drag destination: {entity} | {selector} | {x,y}.'),
       steps: z.number().optional().describe('Intermediate move count (default 10).'),
-      button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button (default 'left')."),
+      button: z.enum(MOUSE_BUTTONS).optional().describe("Mouse button (default 'left')."),
       modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}, held for the WHOLE drag as a real keyDown/keyUp around the gesture — so a listener tracking the modifier's LEVEL (the 3D gizmo's snap) sees it down for every intermediate move.`),
       allowOccluded: allowOccludedParam.describe(`${ALLOW_OCCLUDED_BASE}. Applies to BOTH endpoints; set it on \`from\`/\`to\` individually to allow just one — e.g. a covered destination while keeping the press honest.`),
     },
@@ -95,12 +96,12 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'modoki_get_editor_state reports `heldPointer` if you need to check. ' +
       'Requires the Electron editor.',
     {
-      action: z.enum(['down', 'move', 'up']).describe("'down' press+hold, 'move' re-aim the held pointer, 'up' release."),
+      action: z.enum(POINTER_ACTIONS).describe("'down' press+hold, 'move' re-aim the held pointer, 'up' release."),
       x: z.number().optional().describe('Page CSS x. Required unless `selector` is given.'),
       y: z.number().optional().describe('Page CSS y. Required unless `selector` is given.'),
       selector: z.string().optional().describe('CSS selector to aim at (resolved server-side). Overrides x/y.'),
       entity: makeEntitySpec().optional(),
-      button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button for 'down' (default 'left'); ignored on move/up (the held button is reused)."),
+      button: z.enum(MOUSE_BUTTONS).optional().describe("Mouse button for 'down' (default 'left'); ignored on move/up (the held button is reused)."),
       modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}.`),
       allowOccluded: allowOccludedParam.describe(`${ALLOW_OCCLUDED_BASE}. Applies to \`action:'down'\` only — a move/up is delivered to whatever captured the press, so what sits under the destination cannot stop it.`),
     },
@@ -393,7 +394,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       '`allowOccluded:true` to press anyway and see what happens. Requires the Electron editor.',
     {
       id: z.string().describe('Handle id from modoki_handles.'),
-      button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button to click with (default 'left'). This tool CLICKS — the 'held during the drag' wording here was copy-pasted from modoki_drag_handle."),
+      button: z.enum(MOUSE_BUTTONS).optional().describe("Mouse button to click with (default 'left'). This tool CLICKS — the 'held during the drag' wording here was copy-pasted from modoki_drag_handle."),
       clickCount: z.number().optional().describe('1 = single (default), 2 = double-click — same meaning as modoki_tap.'),
       modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}, e.g. ["shift"] to add to a marquee selection — same meaning as modoki_tap.`),
       allowOccluded: allowOccludedParam.describe(`${ALLOW_OCCLUDED_BASE}. Here the target is a HANDLE, and a covered one reads as an inert one — which is how a working gizmo handle under the SceneView toolbar got filed as a high-severity bug.`),
@@ -422,7 +423,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       toId: z.string().optional().describe('Drag onto another handle by its id.'),
       delta: z.object({ dx: z.number(), dy: z.number() }).optional().describe('Offset from the handle\'s current position.'),
       steps: z.number().optional().describe('Intermediate move count (default 10).'),
-      button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button held for the drag (default 'left')."),
+      button: z.enum(MOUSE_BUTTONS).optional().describe("Mouse button held for the drag (default 'left')."),
       modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}, held for the WHOLE drag as a real keyDown/keyUp around the gesture — so a listener tracking the modifier's LEVEL (the 3D gizmo's snap) sees it down for every intermediate move.`),
       allowOccluded: allowOccludedParam.describe(`${ALLOW_OCCLUDED_BASE}. Reported PER ENDPOINT — \`fromTarget\`/\`toTarget\` each carry their own \`occluded\`, since a covered source and a covered destination need different fixes.`),
     },

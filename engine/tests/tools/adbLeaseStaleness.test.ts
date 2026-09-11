@@ -24,6 +24,14 @@ import { statusLeaseKey, screenInfoIfLeaseHeld } from '../../tools/game-debug-mc
 // Minimal shape matching DeviceStatusReply — not exported, so mirrored here structurally.
 type Status = { state?: string; target?: { host?: string; port?: number; useAdb?: boolean; serial?: string } | null };
 
+describe('statusLeaseKey — a USB iOS lease keys by UDID (#1065)', () => {
+  it('two iPhones behind the same host port key differently', () => {
+    const at = (udid: string) => statusLeaseKey({ state: 'connected', target: { host: '127.0.0.1', port: 9097, useAdb: false, useUsb: true, udid } } as Status);
+    expect(at('UDID-A')).toBe('usb:UDID-A');
+    expect(at('UDID-A')).not.toEqual(at('UDID-B'));
+  });
+});
+
 describe('statusLeaseKey', () => {
   it('is null when disconnected', () => {
     expect(statusLeaseKey({ state: 'disconnected', target: { useAdb: true, serial: 'A' } } as Status)).toBeNull();

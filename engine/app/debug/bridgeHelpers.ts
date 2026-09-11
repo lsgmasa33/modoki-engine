@@ -35,8 +35,9 @@ export { PENDING_PROMISE_MARKER };
  *
  *  ⚠️ Deliberately a COPY of `describeShape` in `engine/tools/shared/mcpResult.ts` rather than an
  *  import of it (#648). Every OTHER `engine/app` → `tools/shared` reference is `import type`, which
- *  costs the bundle nothing — `agentBridge.ts`'s `simStepTiming.ts` import is the one deliberate
- *  VALUE-import exception (#822), and its own docblock explains why THAT one is worth the cost. A
+ *  costs the bundle nothing — `agentBridge.ts`'s `simStepTiming.ts` (#822) and `bridge.ts`'s
+ *  `inputVocabulary.ts` (#1076) are the deliberate VALUE-import exceptions, each a few dependency-free
+ *  constants where a hand-kept copy is the very defect being fixed, and each module's docblock says so. A
  *  value import here would pull MCP result-formatting code into the bundle that ships to devices for
  *  no comparable reason. Eight lines on this side of that boundary is the cheaper trade. If this
  *  ever needs to change, change both — they are the same refusal vocabulary. */

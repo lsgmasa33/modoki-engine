@@ -439,8 +439,16 @@ Rules:
   close-out sweep found it at an op (`hit-regions` ran an unknown `action` as a read) and in a pure
   decision (`pickHostSidePlatform` ignored an unknown explicit `platform` and answered about the
   lease's device); both now refuse. The router guard sees only the one-line `=== … ||` spelling, not
-  a `Set.has`/`switch`/multi-line copy. Still open: the Electron input routes' `button` (#1076).
-  Two riders:
+  a `Set.has`/`switch`/multi-line copy. Three riders:
+  - **Where NO op sits behind the route, the route IS the table's owner, and it refuses** (#1076).
+    The Electron `/api/input/*` routes dispatch trusted input themselves, so an unknown `button` or
+    modifier cannot be "forwarded to the op" — it was coerced instead: `button:'rigth'` pressed left,
+    an unknown modifier fell out of a Cmd+drag's key pair, the device's `press-key` sent Cmd+Z as a
+    plain `z`, all under `ok`. Those vocabularies are declared ONCE in
+    `engine/tools/shared/inputVocabulary.ts`; the tools derive their `z.enum` from it, the routes
+    refuse against it before resolving the aim (a 400 with `REFUSED_BY_OP` + `options`), and
+    `/api/device/request` refuses before choosing a transport — CDP dispatches `press-key` itself and
+    never reaches the bridge handler, which refuses with the same predicate.
   - **On a GET, the refusal needs a CODE.** `getJson` does not run `isFailureBody` on a plain read,
     so an uncoded `{ok:false}` reaches the agent as a SUCCESS; a coded envelope leaves `relayJson`
     as a 400. (`/api/watch/read` is safe without one only because its route re-codes the op's

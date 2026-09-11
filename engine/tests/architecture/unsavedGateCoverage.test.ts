@@ -360,6 +360,8 @@ describe('the sidecar park gate covers every Node route that could clobber a par
       //    silently absorb a future file that DOES sit behind a route.
       'engine/plugins/addNativeTarget.ts', 'engine/plugins/audio-convert.ts',
       'engine/plugins/backend/deviceConnection.ts', 'engine/plugins/backend/deviceCrashReports.ts',
+      // #1065: reads/writes only this clone's `.modoki/ios-forward.json` pid record for the go-ios forward.
+      'engine/plugins/backend/iosUsbForward.ts',
       'engine/plugins/backend/wdaLauncher.ts', 'engine/plugins/detect-modules.ts',
       'engine/plugins/env-convert.ts', 'engine/plugins/font-convert.ts',
       'engine/plugins/font-instance.ts', 'engine/plugins/healNativeConfig.ts',

@@ -100,8 +100,9 @@ export const TRUSTED_WDA_MECHANISM = 'trusted-wda' as const;
 /** The device-lease status from `/api/device/status` (and returned by connect/disconnect). */
 export interface LeaseStatus {
   state: string;
-  target: { host: string; port: number; useAdb: boolean } | null;
-  lastTarget: { ip: string; useAdb: boolean } | null;
+  /** `useUsb`/`udid`: an iOS lease tunnelled over USB by go-ios (#1065). */
+  target: { host: string; port: number; useAdb: boolean; useUsb?: boolean; udid?: string } | null;
+  lastTarget: { ip: string; useAdb: boolean; useUsb?: boolean } | null;
   detail?: string;
   /** LIVE probe result (#32) — present only when `state === 'connected'` (a disconnected lease has
    *  no mechanism to report). 'trusted-cdp' when Android CDP injection is reachable right now,
@@ -132,17 +133,21 @@ export function describeLease(s: LeaseStatus): string {
     // passed 9097 back would forward `tcp:9097 → tcp:9097` on the phone, where nothing is
     // listening — and `explainConnectFailure`'s advice stays silent, because it only fires on the
     // default 9095. Naming the side is what stops the round trip.
-    const where = s.target.useAdb
-      ? `adb (USB) — host tunnel 127.0.0.1:${s.target.port}`
-      : `WiFi ${s.target.host}:${s.target.port}`;
+    const where = s.target.useUsb
+      ? `USB (iOS, go-ios forward${s.target.udid ? ` to ${s.target.udid}` : ''}) — host tunnel 127.0.0.1:${s.target.port}`
+      : s.target.useAdb
+        ? `adb (USB) — host tunnel 127.0.0.1:${s.target.port}`
+        : `WiFi ${s.target.host}:${s.target.port}`;
     return `Device connected via ${where}. device_* tools proxy through Modoki's lease.`;
   }
   if (s.state === 'disconnected' || s.state === 'error') {
-    const hint = s.lastTarget?.ip ? ` (last: ${s.lastTarget.useAdb ? 'adb' : s.lastTarget.ip})` : '';
+    const last = s.lastTarget?.useUsb ? 'USB (iOS)' : s.lastTarget?.useAdb ? 'adb' : s.lastTarget?.ip;
+    const hint = last ? ` (last: ${last})` : '';
     return (
       `No device connected (state: ${s.state}${s.detail ? `, ${s.detail}` : ''})${hint}. ` +
-      `Connect with device_connect (ip="<device IP from the game's debug menu>" or useAdb:true for ` +
-      `Android over USB; bare = reconnect the last target), or the editor AI panel → Connect a Device.`
+      `Connect with device_connect (ip="<device IP from the game's debug menu>", useAdb:true for ` +
+      `Android over USB, or useUsb:true for iOS over USB; bare = reconnect the last target), or the ` +
+      `editor AI panel → Connect a Device.`
     );
   }
   return `Device lease is ${s.state}${s.detail ? ` (${s.detail})` : ''} — Modoki is handling it; retry shortly.`;

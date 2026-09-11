@@ -47,6 +47,19 @@ main 5179 / work-ai 5180 / work-ai2 5181). No `target` param, no platform in the
 4. First install shows the iOS **Local Network** permission prompt — tap Allow.
 5. **Keep the game foregrounded** — iOS tears down the listener on suspend/background.
 
+### iOS (USB, through go-ios)
+1. Connect over USB; `ios list --details` (the provisioned go-ios) lists the device as `USB`.
+2. AI panel → *Connect a Device* → check **Use USB (iOS)** (pick the device if several) → **Connect**,
+   or `device_connect {useUsb:true, udid?}`. The backend runs
+   `ios forward <hostPort> 9095 --udid=<udid>` and connects to `127.0.0.1:<hostPort>`, with the host
+   port derived per clone exactly as for adb below.
+3. A phone with WiFi sync on is listed twice; if its `Network` entry comes first the connect refuses
+   (the tunnel would run over WiFi) — untick *Show this iPhone when on Wi-Fi* in Finder. A device
+   usbmuxd does not see is refused with "replug it", even if Xcode still lists it.
+4. Still **keep the game foregrounded** — USB changes the transport, not iOS's background rule.
+
+Why go-ios and what it does differently: `docs/debug-tools-mcp.md` § "iOS over USB goes through go-ios".
+
 ### Android (adb over USB — recommended)
 1. Connect over USB; `adb devices` shows it as `device`.
 2. AI panel → *Connect a Device* → check **Use adb (USB)** → **Connect**. The backend runs
@@ -103,7 +116,7 @@ WebGPU screenshot is black:
 | Tool | Description |
 |---|---|
 | `device_status` | Report the lease (connected device, or how to connect) |
-| `device_connect` | Open the lease — `ip` (WiFi) or `useAdb:true` (USB); bare = reconnect the last target. Same action as the AI panel's *Connect a Device* |
+| `device_connect` | Open the lease — `ip` (WiFi), `useAdb:true` (Android USB) or `useUsb:true` (iOS USB, go-ios); bare = reconnect the last target. Same action as the AI panel's *Connect a Device* |
 | `device_disconnect` | Close the lease (release the device for another editor) |
 | `device_eval` | Execute JavaScript in the game page context |
 | `device_screenshot` | Capture the screen → saves file, opens Preview, returns **path + dimensions** (image inlined only with `inline:true`). Android: full framebuffer via `adb screencap`; iOS: native via the lease, or `source:"wda"` for the whole device screen (a system dialog / springboard the app's own capture cannot see — its pixels are NOT aimable) |

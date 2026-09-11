@@ -23,8 +23,8 @@ The `game-debug` MCP (`engine/tools/game-debug-mcp/`) is a **thin client**: ever
 held socket. **The GUID never leaves the backend** (controlled comms). The MCP owns no connection —
 no Bonjour, no adb, no discovery. There is **no `target` param** and no platform in the tool name;
 the lease already picks the single device. Opening the lease is **deliberate** — the human clicks
-*Connect a Device* in the AI panel, or an agent calls **`device_connect`** (`ip=` / `useAdb:true`, or
-bare to reconnect the last target) — NOT the removed Bonjour auto-connect, and the lease is first-wins
+*Connect a Device* in the AI panel, or an agent calls **`device_connect`** (`ip=` / `useAdb:true` /
+`useUsb:true`, or bare to reconnect the last target) — NOT the removed Bonjour auto-connect, and the lease is first-wins
 so an explicit connect can't storm a device another editor holds. If nothing is connected, the
 data-plane tools error and point at `device_connect`.
 
@@ -325,9 +325,65 @@ now covers device ops too, and manual IP deletes discovery entirely — nothing 
 | **Second Modoki** | `connect` with a different GUID while leased → **rejected** (device is first-wins). The incumbent auto-reconnects aggressively, so ownership stays put. |
 | **Wedged** (last resort) | Relaunch the game — the in-memory lease resets unconditionally. |
 
-**Android transport is a user choice:** *Use adb (USB)* tunnels over `adb forward`→`127.0.0.1` (the
-reliable path; IP field disabled) vs. the typed IP over WiFi. iOS is always WiFi/IP. Same lease/GUID
-protocol rides either transport — only the socket target differs.
+**Transport is a user choice, on both platforms:** *Use adb (USB)* tunnels an Android over `adb
+forward`→`127.0.0.1`, *Use USB (iOS)* tunnels an iPhone/iPad over go-ios `ios forward`→`127.0.0.1`
+(#1065), and otherwise the typed IP goes over WiFi. Same lease/GUID protocol rides every transport —
+only the socket target differs. The host side of either tunnel is this clone's derived port
+(`9095 + (backend − 5179)`); the device side is the app's own port.
+
+#### iOS over USB goes through go-ios, and three things differ from adb (#1065)
+
+`device_connect {useUsb:true, udid?}` spawns `ios forward <host port> <device port> --udid=<udid>`
+with the provisioned go-ios (not `iproxy`, which only exists where Homebrew's libusbmuxd was
+installed). Checked on 2026-09-11 — the manual path on the hub reached the iPad mini 5 (iOS 26.6.1)
+with **no go-ios tunnel**, and the iPhone 8 was probed directly:
+
+- **A WiFi-synced phone is listed TWICE, and go-ios takes the first.** `ios list --details` showed the
+  iPhone 8 as `ConnectionType: USB` *and* `Network`. go-ios looks a device up by serial and uses the
+  first match: a traced `ios forward` bound usbmuxd DeviceID 1657, which usbmuxd's own `ListDevices`
+  lists as `USB`, ahead of 1656 `Network`. That order is usbmuxd's, not a guarantee, so the connect
+  **refuses when a device's first entry is `Network`** — the lease would say USB and run over WiFi.
+  The fix on the phone is Finder → the device → untick *Show this iPhone when on Wi-Fi*.
+- **The device is picked from go-ios's list, never devicectl's.** usbmuxd can lose a wired device that
+  CoreDevice still reports `available (paired)` — the hub saw exactly that, and replugging fixed it —
+  so a UDID usbmuxd does not see is refused with "replug it" rather than forwarded to nothing.
+- **"start listening" is NOT proof of a bind, and the child's bind is not proof of the tunnel.**
+  go-ios v1.3.2's `forward.Forward` logs that line BEFORE `net.Listen`, and exits 1 when the listen
+  fails. But on macOS its `0.0.0.0` listen is an IPv6 wildcard, which COEXISTS with another process's
+  IPv4 socket on the same port — measured 2026-09-11: Python on IPv4 `*:19779` and go-ios on IPv6
+  `*:19779` both LISTEN, go-ios runs on with no error, and `127.0.0.1:19779` (what the lease dials) is
+  answered by Python. So the tunnel is ready only when the child holds the port and NO other process
+  does (`lsof` over the port's LISTEN sockets, asynchronously and with a timeout, because under
+  Electron it runs in the main process); a port someone already holds is refused before spawning,
+  naming them, and a socket table that cannot be read is a refusal too, never "nobody listens".
+  Accepted blind spot: a non-root `lsof` cannot see root-owned listeners, and the host port is this
+  clone's derived 909x, which no root daemon holds.
+- **The forward is a PROCESS, and the lease owns it.** `adb forward` installs a rule and returns;
+  `ios forward` runs until killed and does not exit when the phone goes away. So it is stopped by
+  `DeviceConnectionManager.disconnect()` (which heads every connect, so a superseding connect stops
+  it too), by a connect that does not land, synchronously on quit, and reaped at startup from
+  `ios-forward.json` in the state dir (the clone's `.modoki`, or `~/.modoki` when packaged) when a
+  crashed editor left it running — only while that pid is still the recorded go-ios binary
+  forwarding this clone's port, and never while its owner is live: another backend process still
+  running, or the reaping process's own module load. The SAME process through an earlier load is
+  reaped — a standalone Vite config restart re-evaluates the plugin in one pid and abandons the old
+  manager with its forward still up. A record with no owner predates the rule and counts as orphaned. The owner check is not
+  decoration: Electron's Vite child, respawned on every project open, runs the startup pass too, and
+  once killed a LIVE lease's forward — so that child now skips the reclaim altogether
+  (`shouldReclaimDeviceStateHere`), which also stops it stripping a live adb forward. A forward that
+  dies mid-lease ENDS the lease with an error saying so and hands the phone back — nothing restarts
+  the tunnel, so the client's reconnect loop could never succeed and kept the phone claimed. A
+  disconnect waits (capped) for the child to exit, so a re-target does not find its own predecessor
+  still on the port. It **listens on every interface** (`0.0.0.0`, no bind option);
+  accepted, because a debug build's bridge already listens on the phone's own WiFi.
+
+`refused` over this tunnel has the adb case's ambiguity (below) and the same three causes, with iOS
+remedies: bring the app to the FOREGROUND (iOS stops the bridge when backgrounded; USB changes the
+transport, not that), heal and rebuild, or read the fallback port the app printed
+(`[GameDebug] TCP server listening on port N`, via `device_native_logs {source:'system'}`) and pass
+`port`. A USB lease carries its `udid`, so host-side go-ios ops (system logs, crash reports) target
+that phone directly — unless `MODOKI_IOS_DEVICE_UDID` pins another, which still wins, exactly as it
+does over the lease's model match. WDA trusted input stays on WiFi (WebDriverAgent's port 8100) either way.
 
 #### `busy` / `refused` over adb does NOT mean another Modoki has it (#164)
 

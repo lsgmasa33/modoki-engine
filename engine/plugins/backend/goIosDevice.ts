@@ -152,6 +152,9 @@ export function pickGoIosDevice(o: {
   devices: GoIosDevice[];
   /** The lease's hardware — ABSENT when there is no lease at all (see the router). */
   lease?: LeaseHardwareHint;
+  /** The UDID a USB lease tunnels to (#1065). Unlike `lease`, this is not evidence to match — the
+   *  lease was OPENED to this exact device through go-ios, so it names the leased phone outright. */
+  leaseUdid?: string;
 }): GoIosChoice | { error: string } {
   if (o.pinned) {
     const hit = o.devices.find((d) => d.udid === o.pinned);
@@ -160,6 +163,12 @@ export function pickGoIosDevice(o: {
       // Name what IS attached: "your pin matches nothing" plus an empty room is a dead end, and the
       // most common cause is a pin left over from a phone that has since been unplugged.
       : { error: `MODOKI_IOS_DEVICE_UDID=${o.pinned} is not attached (go-ios sees: ${o.devices.map((d) => d.udid).join(', ') || 'nothing'})` };
+  }
+  if (o.leaseUdid) {
+    const hit = o.devices.find((d) => d.udid === o.leaseUdid);
+    return hit
+      ? { device: hit }
+      : { error: `the USB lease's device ${o.leaseUdid} is not attached (go-ios sees: ${o.devices.map((d) => d.udid).join(', ') || 'nothing'}) — replug it, or disconnect the lease` };
   }
   if (o.devices.length === 0) return { error: 'no iOS device is attached (go-ios sees none) — check the cable and that the device is unlocked and trusted' };
 
@@ -212,6 +221,8 @@ export async function resolveGoIosDevice(opts: {
   goIos: string;
   env?: NodeJS.ProcessEnv;
   lease?: LeaseHardwareHint;
+  /** See `pickGoIosDevice`'s `leaseUdid`. */
+  leaseUdid?: string;
 }): Promise<GoIosChoice | { error: string }> {
   const env = opts.env ?? process.env;
   let udids: string[];
@@ -230,5 +241,5 @@ export async function resolveGoIosDevice(opts: {
     ? await Promise.all(udids.map(async (u) => ({ udid: u, ...await goIosDeviceInfo(opts.goIos, u) })))
     : udids.map((u) => ({ udid: u }));
 
-  return pickGoIosDevice({ pinned: env.MODOKI_IOS_DEVICE_UDID?.trim(), devices, lease: opts.lease });
+  return pickGoIosDevice({ pinned: env.MODOKI_IOS_DEVICE_UDID?.trim(), devices, lease: opts.lease, leaseUdid: opts.leaseUdid });
 }

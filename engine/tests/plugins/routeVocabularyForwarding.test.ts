@@ -153,3 +153,37 @@ describe('guard: the router copies no vocabulary out of a request value', () => 
     expect(NARROWING.test("if (query.get('clear') === '1' || query.get('clear') === 'true') params.clear = true;")).toBe(false);
   });
 });
+
+describe('/api/device/request refuses an unknown input vocabulary value before any transport (#1076)', () => {
+  // The inverse of the relayed routes above, and deliberately so: the device's tables are enforced on
+  // the far side of a transport this route CHOOSES — CDP dispatches `press-key` itself and never reaches
+  // the bridge handler, and an installed app may predate the handler's own refusal. So this dispatch,
+  // which every transport passes first, is where it has to be caught. No lease is held in this test,
+  // which is what makes it discriminating: a value that got past the check would answer with the LEASE
+  // error instead.
+  const request = async (method: string, params: Record<string, unknown>) => {
+    const { ctx } = makeCtx(() => ({ ok: true }));
+    return await handleBackendRequest(ctx, {
+      method: 'POST', urlPath: '/api/device/request', query: new URLSearchParams(), body: { method, params },
+    }) as { status?: number; body: Record<string, unknown> };
+  };
+
+  it.each([
+    { method: 'pointer', params: { action: 'down', x: 1, y: 1, button: 'rigth' }, field: 'pointer button' },
+    { method: 'pointer', params: { action: 'wiggle', x: 1, y: 1 }, field: 'pointer action' },
+    { method: 'press-key', params: { key: 'z', modifiers: ['cmmd'] }, field: 'press-key modifiers' },
+  ])('$method: $field', async ({ method, params, field }) => {
+    const r = await request(method, params);
+    expect(r.body.result).toMatch(new RegExp(`^Error: ${field}: unknown value .* — nothing was dispatched\\. Valid: `));
+  });
+
+  it('ACCEPT: a known value goes on to the lease (and fails there, with no lease held)', async () => {
+    for (const [method, params] of [
+      ['pointer', { action: 'down', x: 1, y: 1, button: 'middle' }],
+      ['press-key', { key: 'z', modifiers: ['meta'] }],
+    ] as const) {
+      const r = await request(method, params);
+      expect(JSON.stringify(r.body)).not.toMatch(/unknown value/);
+    }
+  });
+});

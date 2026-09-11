@@ -599,7 +599,10 @@ export async function startDevServer(opts: { repoRoot: string; projectRoot: stri
   // whatever the module-level `child` happens to be by the time an async event fires.
   const proc = spawn(process.execPath, [viteEntry, '--config', 'engine/vite.config.ts', '--configLoader', 'runner', '--host', '127.0.0.1', '--port', port, '--strictPort'], {
     cwd: repoRoot,
-    env: { ...process.env, MODOKI_PROJECT: projectRoot, ELECTRON_RUN_AS_NODE: '1' },
+    // MODOKI_VITE_UNDER_ELECTRON: this child must not run the startup device reclaim — the lease lives in
+    // THIS process's backend (`VITE_UNDER_ELECTRON_ENV` in plugins/backend/deviceConnection.ts, #1065). A
+    // literal rather than an import: that module builds the device-connection singleton at load.
+    env: { ...process.env, MODOKI_PROJECT: projectRoot, ELECTRON_RUN_AS_NODE: '1', MODOKI_VITE_UNDER_ELECTRON: '1' },
     stdio: ['ignore', logFd, logFd],
   });
   child = proc;

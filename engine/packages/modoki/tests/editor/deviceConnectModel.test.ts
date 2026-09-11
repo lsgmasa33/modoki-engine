@@ -6,13 +6,65 @@ import {
   androidRowLabel,
   androidRowNote,
   androidRowSelectable,
+  connectRequestFor,
+  modeOfTarget,
+  iosPickerRows,
   type DeviceStatus,
   type AndroidDeviceRow,
   type DeviceClaim,
+  type IosDeviceRow,
 } from '../../src/editor/panels/deviceConnectModel';
 
 const mk = (over: Partial<DeviceStatus>): DeviceStatus =>
   ({ state: 'disconnected', guid: 'g', target: null, ...over });
+
+describe('connectRequestFor — the panel\'s connect rule (#149, #1065)', () => {
+  const base = { ip: '', serial: null, udid: null, androidAttached: 0, iosAttached: 0 };
+
+  it('WiFi sends the trimmed IP alone, and refuses one that is not an IP', () => {
+    expect(connectRequestFor({ ...base, mode: 'wifi', ip: ' 10.0.0.7 ' })).toEqual({ request: { ip: '10.0.0.7' } });
+    expect(connectRequestFor({ ...base, mode: 'wifi', ip: 'not-an-ip' })).toEqual({ note: 'Enter the device IP shown in its debug menu (or connect over USB).' });
+  });
+
+  it('adb: several Androids with none picked is a note; one picked or one attached is a request', () => {
+    expect(connectRequestFor({ ...base, mode: 'adb', androidAttached: 2 })).toEqual({ note: 'Pick which Android to connect to.' });
+    expect(connectRequestFor({ ...base, mode: 'adb', androidAttached: 2, serial: 'S2' })).toEqual({ request: { useAdb: true, serial: 'S2' } });
+    expect(connectRequestFor({ ...base, mode: 'adb', androidAttached: 1 })).toEqual({ request: { useAdb: true } });
+  });
+
+  it('usb: the same rule for iOS, sending useUsb + udid and NEVER the IP field', () => {
+    expect(connectRequestFor({ ...base, mode: 'usb', iosAttached: 2 })).toEqual({ note: 'Pick which iPhone/iPad to connect to.' });
+    expect(connectRequestFor({ ...base, mode: 'usb', iosAttached: 2, udid: 'U2', ip: '10.0.0.7' })).toEqual({ request: { useUsb: true, udid: 'U2' } });
+    expect(connectRequestFor({ ...base, mode: 'usb', iosAttached: 1 })).toEqual({ request: { useUsb: true } });
+  });
+});
+
+describe('modeOfTarget', () => {
+  it('USB wins over adb, adb over WiFi; nothing remembered is WiFi', () => {
+    expect(modeOfTarget({ useAdb: false, useUsb: true })).toBe('usb');
+    expect(modeOfTarget({ useAdb: true })).toBe('adb');
+    expect(modeOfTarget({ useAdb: false })).toBe('wifi');
+    expect(modeOfTarget(null)).toBe('wifi');
+  });
+});
+
+describe('iosPickerRows', () => {
+  const claim = (clone: string): DeviceClaim => ({ deviceId: 'ios:U', clone, branch: 'b', pid: 42, at: 0 });
+  const row = (over: Partial<IosDeviceRow>): IosDeviceRow => ({ udid: 'U1', name: 'Masaki iPad', connected: true, claim: null, ...over });
+
+  it('labels by name and UDID; a free connected device is selectable with no note', () => {
+    expect(iosPickerRows([row({})])).toEqual([{ id: 'U1', label: 'Masaki iPad — U1', note: null, selectable: true }]);
+  });
+
+  it('this editor\'s own claim stays selectable; a sibling\'s blocks; a disconnected one is not offered', () => {
+    const [own, foreign, gone] = iosPickerRows([
+      row({ claim: claim('/p/modoki-ai3') }), row({ udid: 'U2', claim: claim('/p/modoki-ai2') }), row({ udid: 'U3', connected: false }),
+    ], '/p/modoki-ai3');
+    expect(own).toMatchObject({ note: 'in use by this editor', selectable: true });
+    expect(foreign).toMatchObject({ note: 'held by modoki-ai2 (pid 42)', selectable: false });
+    expect(gone).toMatchObject({ note: 'not connected', selectable: false });
+  });
+});
 
 describe('deviceSummary', () => {
   it('is off/disconnected for null or disconnected', () => {

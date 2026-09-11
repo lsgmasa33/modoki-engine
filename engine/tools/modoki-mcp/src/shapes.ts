@@ -8,6 +8,7 @@
  */
 
 import { z } from 'zod';
+import { EDITOR_INPUT_MODIFIERS } from '../../shared/inputVocabulary.js';
 
 /* `SAVE_PARAM` was here. REMOVED 2026-08-22 (owner decision).
  *
@@ -22,8 +23,9 @@ import { z } from 'zod';
  *  tool's real parameters (§1/§5) instead of being silently accepted and ignored. Persistence is
  *  manual-only: `modoki_save_all` is the one route to disk. */
 
-// Chromium input modifiers, shared by the trusted-input tools below.
-export const modifierEnum = z.enum(['shift', 'control', 'alt', 'meta', 'cmd', 'command']);
+// Chromium input modifiers, shared by the trusted-input tools below. Derived from the table the
+// `/api/input/*` routes refuse against (#1076), so the advertised enum and the enforced one are one list.
+export const modifierEnum = z.enum(EDITOR_INPUT_MODIFIERS);
 
 /** A point to aim trusted input at: page CSS coordinates, or a CSS selector resolved to
  *  the element's center inside the same call (no read-then-tap race).

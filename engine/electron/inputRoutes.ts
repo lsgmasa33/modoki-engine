@@ -32,6 +32,10 @@ import type { DomPointResolution } from '../app/debug/domPointContract';
 import { NOTHING_AT_POINT } from '../app/debug/domPointContract';
 import type { EntityPointSpec, EntityPointResolution, OcclusionScope, AimedAt } from '../app/debug/entityPointContract';
 import type { ErrorCode } from '../tools/shared/mcpResult';
+import {
+  EDITOR_INPUT_MODIFIERS, MOUSE_BUTTONS, POINTER_ACTIONS, refuseUnknownValue, refuseUnknownValues,
+  type VocabularyRefusal,
+} from '../tools/shared/inputVocabulary';
 
 /** The trusted-input primitives, pre-bound to the live window by the caller. */
 export interface InputOps {
@@ -152,7 +156,17 @@ export interface ResolvedPoint {
 }
 
 const json = (body: unknown, status?: number): BackendResult => ({ kind: 'json', ...(status ? { status } : {}), body });
-const bad = (error: string, code?: ErrorCode) => json({ error, ...(code ? { code } : {}) }, 400);
+const bad = (error: string, code?: ErrorCode, options?: string[]) =>
+  json({ error, ...(code ? { code } : {}), ...(options ? { options } : {}) }, 400);
+
+/** The first vocabulary refusal among `checks`, as a 400 carrying its options (#1076). These routes
+ *  OWN the input tables — nothing sits between them and the trusted dispatch — so an unknown button
+ *  or modifier is refused here, BEFORE the aim resolves and before any `ops.*` call, instead of being
+ *  coerced into a press the caller did not ask for. */
+function refuseVocabulary(...checks: Array<VocabularyRefusal | null>): BackendResult | null {
+  const hit = checks.find((c): c is VocabularyRefusal => c !== null);
+  return hit ? bad(hit.error, 'REFUSED_BY_OP', hit.options) : null;
+}
 
 /** Resolve a `{selector}` in the renderer, or pass `{x,y}` through. Returns the point or
  *  a prefixed error string — never throws, so a bad selector is a 400, not a 500. */
@@ -641,6 +655,11 @@ export function createInputRoutes(deps: InputRouteDeps) {
 
     if (urlPath === '/api/input/tap') {
       const { x, y, selector, entity, allowOccluded, button, clickCount, modifiers } = (body ?? {}) as PointSpec & { button?: MouseButton; clickCount?: number; modifiers?: InputModifier[] };
+      const unknownVocab = refuseVocabulary(
+        refuseUnknownValue('tap button', button, MOUSE_BUTTONS),
+        refuseUnknownValues('tap modifiers', modifiers, EDITOR_INPUT_MODIFIERS),
+      );
+      if (unknownVocab) return unknownVocab;
       // ⚠️ **`button` narrows the gesture, and this is the route that HAS one** (#1016 close-out F5').
       // The carve-out first landed in `bridge.ts`, where `device_tap`'s schema is `{selector,x,y}`
       // and no button can arrive — unreachable there, and missing here, where `modoki_tap` takes
@@ -650,7 +669,9 @@ export function createInputRoutes(deps: InputRouteDeps) {
       // right-press. Modelling one reports `occluded:false` for a press that then lands on the
       // zone: the false success this whole change exists to prevent, one parameter in.
       const r = await resolvePoint({ x, y, selector, entity, allowOccluded }, 'tap', requestRenderer,
-        button === undefined || button === 'left' ? 'tap' : 'press');
+        // `== null`: a JSON `button:null` is "not given" (the vocabulary check passes it), so it clicks
+        // LEFT and must be modelled as the tap it is, not the stricter press (#1076 close-out).
+        button == null || button === 'left' ? 'tap' : 'press');
       if ('error' in r) return bad(r.error, r.code);
       await ops.tap(r.point.x, r.point.y, { button, clickCount, modifiers });
       return json({ ok: true, tapped: { x: r.point.x, y: r.point.y, button: button ?? 'left', clickCount: clickCount ?? 1 }, ...provenance(r.point) });
@@ -658,6 +679,11 @@ export function createInputRoutes(deps: InputRouteDeps) {
 
     if (urlPath === '/api/input/drag') {
       const { from, to, steps, button, modifiers, allowOccluded } = (body ?? {}) as { from?: PointSpec; to?: PointSpec; steps?: number; button?: MouseButton; modifiers?: InputModifier[]; allowOccluded?: boolean };
+      const unknownVocab = refuseVocabulary(
+        refuseUnknownValue('drag button', button, MOUSE_BUTTONS),
+        refuseUnknownValues('drag modifiers', modifiers, EDITOR_INPUT_MODIFIERS),
+      );
+      if (unknownVocab) return unknownVocab;
       // A top-level flag covers BOTH ends; a per-endpoint one still wins, so a caller can allow a
       // covered destination while keeping the press honest.
       const withFlag = (p?: PointSpec) => (p ? { ...p, allowOccluded: p.allowOccluded ?? allowOccluded } : p);
@@ -694,8 +720,15 @@ export function createInputRoutes(deps: InputRouteDeps) {
       const { action, x, y, selector, entity, allowOccluded, button, modifiers } =
         (body ?? {}) as PointSpec & { action?: 'down' | 'move' | 'up'; button?: MouseButton; modifiers?: InputModifier[] };
       if (action !== 'down' && action !== 'move' && action !== 'up') {
-        return bad(`pointer: action must be 'down', 'move', or 'up' (got ${JSON.stringify(action)})`);
+        return bad(`pointer: action must be 'down', 'move', or 'up' (got ${JSON.stringify(action)})`, 'REFUSED_BY_OP', [...POINTER_ACTIONS]);
       }
+      // Checked on move/up too: a valid button is ignored there (the held one is reused), but an
+      // unknown one is a caller mistake either way, and refusing it is the only way it is seen.
+      const unknownVocab = refuseVocabulary(
+        refuseUnknownValue('pointer button', button, MOUSE_BUTTONS),
+        refuseUnknownValues('pointer modifiers', modifiers, EDITOR_INPUT_MODIFIERS),
+      );
+      if (unknownVocab) return unknownVocab;
       if (action === 'down' && heldPointer) {
         return json({ error: `a pointer is already held (button '${heldPointer.button}' down at ${heldPointer.x},${heldPointer.y}). Release it with action:'up' before pressing again.` }, 409);
       }
@@ -778,6 +811,8 @@ export function createInputRoutes(deps: InputRouteDeps) {
 
     if (urlPath === '/api/input/hover') {
       const { x, y, selector, entity, allowOccluded, modifiers } = (body ?? {}) as PointSpec & { modifiers?: InputModifier[] };
+      const unknownVocab = refuseVocabulary(refuseUnknownValues('hover modifiers', modifiers, EDITOR_INPUT_MODIFIERS));
+      if (unknownVocab) return unknownVocab;
       const r = await resolvePoint({ x, y, selector, entity, allowOccluded }, 'hover', requestRenderer, 'hover');
       if ('error' in r) return bad(r.error, r.code);
       await ops.hover(r.point.x, r.point.y, modifiers);
@@ -786,6 +821,8 @@ export function createInputRoutes(deps: InputRouteDeps) {
 
     if (urlPath === '/api/input/scroll') {
       const { x, y, selector, entity, allowOccluded, deltaX, deltaY, modifiers } = (body ?? {}) as PointSpec & { deltaX?: number; deltaY?: number; modifiers?: InputModifier[] };
+      const unknownVocab = refuseVocabulary(refuseUnknownValues('scroll modifiers', modifiers, EDITOR_INPUT_MODIFIERS));
+      if (unknownVocab) return unknownVocab;
       const r = await resolvePoint({ x, y, selector, entity, allowOccluded }, 'scroll', requestRenderer, 'scroll');
       if ('error' in r) return bad(r.error, r.code);
       // A scroll with no delta is a no-op wearing an action's name (S3.15). `deltaY` documents no
@@ -803,6 +840,9 @@ export function createInputRoutes(deps: InputRouteDeps) {
     if (urlPath === '/api/input/key') {
       const { key, modifiers, panel } = (body ?? {}) as { key?: string; modifiers?: InputModifier[]; panel?: string };
       if (typeof key !== 'string' || !key) return bad('key is a required string');
+      // Before the focus-scope change and the reach probe: a refused press must move nothing.
+      const unknownVocab = refuseVocabulary(refuseUnknownValues('key modifiers', modifiers, EDITOR_INPUT_MODIFIERS));
+      if (unknownVocab) return unknownVocab;
       // Panel-scoped chords resolve against the FOCUSED panel, so a bare `w` sent with the
       // wrong panel focused does nothing — silently, since the dispatcher yields rather than
       // erroring. `panel` sets the keyboard scope first so the caller can steer a chord
@@ -933,6 +973,12 @@ export function createInputRoutes(deps: InputRouteDeps) {
         allowOccluded?: boolean;
       };
       if (typeof h.id !== 'string' || !h.id) return bad('id (handle id) is required');
+      const verb = urlPath === '/api/input/tap-handle' ? 'tap-handle' : 'drag-handle';
+      const unknownVocab = refuseVocabulary(
+        refuseUnknownValue(`${verb} button`, h.button, MOUSE_BUTTONS),
+        refuseUnknownValues(`${verb} modifiers`, h.modifiers, EDITOR_INPUT_MODIFIERS),
+      );
+      if (unknownVocab) return unknownVocab;
       // Carry the aimability annotations computeHandles already produces — the old closure narrowed
       // the result to {id,x,y} and DROPPED them, so tap/drag fired unconditionally: an off-screen
       // handle taps nothing, an occluded one hits the covering element, a disabled one is inert, and

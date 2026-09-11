@@ -9,7 +9,7 @@
  *  aim dynamically imports `agentBridge`, which needs a live ECS world.
  */
 import { describe, it, expect, afterEach } from 'vitest';
-import { handlePointer, _resetHeldPointerForTests } from '../../app/debug/bridge';
+import { handlePointer, handlePressKey, _resetHeldPointerForTests } from '../../app/debug/bridge';
 
 const PROTO_KEYS = [
   '__proto__', 'constructor', 'toString', 'valueOf',
@@ -39,20 +39,22 @@ async function pressAndRelease(button: unknown): Promise<{ down: string; up: str
   return { down, up, seen };
 }
 
-describe('handlePointer button vocabulary (#993)', () => {
-  it.each(PROTO_KEYS)('button %s falls back to left (0), not a function', async (button) => {
+describe('handlePointer button vocabulary (#993, #1076)', () => {
+  // #1076 turned #993's FALLBACK into a REFUSAL. #993 fixed the prototype-key lookup and let an unknown
+  // name press left; that answered `ok` for a press the caller did not ask for. Now nothing is pressed,
+  // so the release has nothing to lift — which is what proves no gesture was started at all.
+  it.each(PROTO_KEYS)('button %s is refused, and nothing is pressed', async (button) => {
     const { down, up, seen } = await pressAndRelease(button);
-    expect(down).toMatch(/^ok /);
-    expect(seen).toBe(0);
-    // The discriminator: the HELD button survives uncoerced, and the release reads it back.
-    expect(up).toContain('button left');
-    expect(up).not.toContain('button undefined');
+    expect(down).toMatch(/^Error: pointer button: unknown value .* Valid: left, right, middle\.$/);
+    expect(seen).toBeUndefined();
+    expect(up).toMatch(/^Error: no pointer is held/);
   });
 
-  it('an ordinary unknown button name falls back to left too', async () => {
-    const { seen, up } = await pressAndRelease('middel');
-    expect(seen).toBe(0);
-    expect(up).toContain('button left');
+  it('an ordinary unknown button name is refused too', async () => {
+    const { down, seen, up } = await pressAndRelease('middel');
+    expect(down).toBe('Error: pointer button: unknown value "middel" — nothing was dispatched. Valid: left, right, middle.');
+    expect(seen).toBeUndefined();
+    expect(up).toMatch(/^Error: no pointer is held/);
   });
 
   // ⚠️ ACCEPT SIDE. A fix that answered 0 for everything would pass every case above while
@@ -64,4 +66,33 @@ describe('handlePointer button vocabulary (#993)', () => {
       expect(down).toContain(`button ${name}`);
       expect(up).toContain(`button ${name}`);
     });
+});
+
+describe('handlePressKey modifier vocabulary (#1076)', () => {
+  /** Press `key` with `modifiers` and report the reply plus every keydown the window saw. */
+  async function press(modifiers: unknown): Promise<{ reply: string; downs: KeyboardEvent[] }> {
+    const downs: KeyboardEvent[] = [];
+    const onDown = (e: Event) => { downs.push(e as KeyboardEvent); };
+    window.addEventListener('keydown', onDown);
+    try {
+      const reply = await handlePressKey({ key: 'z', modifiers });
+      return { reply, downs };
+    } finally {
+      window.removeEventListener('keydown', onDown);
+    }
+  }
+
+  // Before: `mods.includes('meta')` just never matched `'cmmd'`, so Cmd+Z went out as a plain `z` —
+  // an undo became a keystroke — and the reply still said `ok (key z +cmmd)`.
+  it('an unknown modifier is refused, and no key is pressed', async () => {
+    const { reply, downs } = await press(['cmmd']);
+    expect(reply).toBe('Error: press-key modifiers: unknown value "cmmd" — nothing was dispatched. Valid: ctrl, shift, alt, meta.');
+    expect(downs).toEqual([]);
+  });
+
+  it('ACCEPT: a known modifier still reaches the event', async () => {
+    const { reply, downs } = await press(['meta']);
+    expect(reply).toMatch(/^ok \(key z \+meta\)/);
+    expect(downs.map((e) => [e.key, e.metaKey])).toEqual([['z', true]]);
+  });
 });

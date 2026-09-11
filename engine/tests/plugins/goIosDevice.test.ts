@@ -182,6 +182,27 @@ describe('goIosDevice — pickGoIosDevice', () => {
 // filter its hardware by the lease's PLATFORM before handing it to `pickGoIosDevice` — an Android
 // lease's `deviceModel` (e.g. 'SM-S901B') can never match an attached iPhone's `ProductType`, so
 // it read as a genuine mismatch and refused about a device that was attached, just on Android.
+describe('goIosDevice — a USB lease names its device by UDID (#1065)', () => {
+  const devices: GoIosDevice[] = [
+    { udid: 'UDID-A', productType: 'iPhone10,1' },
+    { udid: 'UDID-B', productType: 'iPhone10,1' },
+  ]
+
+  it('picks the leased UDID outright — two phones of the same model are no longer ambiguous', () => {
+    expect(pickGoIosDevice({ devices, lease: { deviceModel: 'iPhone10,1', osVersion: null }, leaseUdid: 'UDID-B' }))
+      .toEqual({ device: devices[1] })
+  })
+
+  it('refuses when the leased UDID is not attached — never another phone', () => {
+    const r = pickGoIosDevice({ devices, leaseUdid: 'UDID-GONE' })
+    expect((r as { error: string }).error).toMatch(/USB lease's device UDID-GONE is not attached/)
+  })
+
+  it('an explicit MODOKI_IOS_DEVICE_UDID pin still wins, as it does over the lease model', () => {
+    expect(pickGoIosDevice({ pinned: 'UDID-A', devices, leaseUdid: 'UDID-B' })).toEqual({ device: devices[0] })
+  })
+})
+
 describe('goIosDevice — leaseForIosOps (#670 finding 3)', () => {
   const hardware = { deviceModel: 'iPhone14,5', osVersion: '17.0' }
 

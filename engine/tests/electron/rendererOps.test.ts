@@ -9,7 +9,7 @@
 
 import { describe, it, expect } from 'vitest';
 import type { BrowserWindow } from 'electron';
-import { pointerDown, pointerMove, pointerUp, scroll, drag } from '../../electron/rendererOps';
+import { pointerDown, pointerMove, pointerUp, scroll, drag, pressKey } from '../../electron/rendererOps';
 
 interface RecordedEvent { type: string; x?: number; y?: number; button?: string; clickCount?: number; modifiers?: string[]; deltaX?: number; deltaY?: number; keyCode?: string }
 
@@ -24,6 +24,29 @@ function makeWin(zoomFactor = 1) {
   } } as unknown as BrowserWindow;
   return { win, events, focusCount: () => focused };
 }
+
+describe('pressKey — the DOM-name alias is an own-key lookup (#1076, #993\'s shape)', () => {
+  /** `pressKey` also reads the focused element through `executeJavaScript`; answer "nothing focused". */
+  function makeKeyWin() {
+    const made = makeWin();
+    (made.win.webContents as unknown as { executeJavaScript: () => Promise<unknown> }).executeJavaScript =
+      async () => ({ typable: false, gameSwallows: false, descriptor: null });
+    return made;
+  }
+
+  it.each(['toString', 'constructor', 'valueOf', 'hasOwnProperty'])(
+    'key %s is sent as itself, not as the inherited function', async (key) => {
+      const { win, events } = makeKeyWin();
+      await pressKey(win, key);
+      expect(events.map((e) => [e.type, e.keyCode])).toEqual([['keyDown', key], ['keyUp', key]]);
+    });
+
+  it('ACCEPT: a DOM arrow name is still aliased to the Accelerator name', async () => {
+    const { win, events } = makeKeyWin();
+    await pressKey(win, 'ArrowUp');
+    expect(events.map((e) => e.keyCode)).toEqual(['Up', 'Up']);
+  });
+});
 
 describe('pointerDown', () => {
   it('emits a bare mouseMove then a mouseDown with the button held (buttons via the down)', async () => {

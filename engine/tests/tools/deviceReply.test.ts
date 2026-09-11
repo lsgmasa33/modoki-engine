@@ -16,6 +16,20 @@ describe('parseReply', () => {
   });
 });
 
+describe('describeLease — iOS over USB (#1065)', () => {
+  it('names the go-ios tunnel and its device, not WiFi 127.0.0.1', () => {
+    const text = describeLease({ state: 'connected', target: { host: '127.0.0.1', port: 9097, useAdb: false, useUsb: true, udid: 'UDID-IPAD' }, lastTarget: null });
+    expect(text).toBe('Device connected via USB (iOS, go-ios forward to UDID-IPAD) — host tunnel 127.0.0.1:9097. device_* tools proxy through Modoki\'s lease.');
+    expect(text).not.toMatch(/WiFi/);
+  });
+
+  it('a disconnected lease says its last target was USB, and offers useUsb', () => {
+    const text = describeLease({ state: 'disconnected', target: null, lastTarget: { ip: '10.0.0.7', useAdb: false, useUsb: true } });
+    expect(text).toMatch(/\(last: USB \(iOS\)\)/);
+    expect(text).toMatch(/useUsb:true for iOS over USB/);
+  });
+});
+
 describe('isDeviceError', () => {
   it('flags the device Error: convention', () => {
     expect(isDeviceError('Error: nope is not defined')).toBe(true);

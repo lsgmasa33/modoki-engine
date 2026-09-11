@@ -93,6 +93,11 @@ The rule now:
   survive the whole call, leaving a rule for a socket discovery had just declined.
 - **Removal is best-effort and never throws.** The failure being fixed is a rule *left standing*;
   throwing out of the cleanup would strand the teardown that follows it. It warns instead.
+- **The iOS USB lease's tunnel is born under the same rule** (#1065). Its go-ios `ios forward` is a
+  running process rather than an adb rule, so `disconnect()` kills it, a connect that does not land
+  kills it, the exit path kills it, and startup reaps one a crashed editor left behind — the four
+  endings this section and the next learned one at a time. Detail:
+  [debug-tools-mcp.md](./debug-tools-mcp.md) § "iOS over USB goes through go-ios".
 
 #### …but that teardown is the SECOND line of defence. Startup reclamation is the first.
 
@@ -111,7 +116,11 @@ it — the three ways an editor most often dies badly.
 
 So the lifetime is closed at **startup** instead — `reclaimStaleDeviceStateAtStartup()`, called by both
 backend hosts (`startBackendServer` in Electron, the Vite plugin's `configureServer` under a bare
-`npm run dev`), which no manner of dying can skip. Same shape the device-claims file already uses: a
+`npm run dev`), which no manner of dying can skip. ⚠️ **Only the host that owns the lease may run
+it.** Under Electron the Vite server is a CHILD of main, respawned on every project open while main's
+lease may be live, and its `configureServer` used to reclaim too — stripping this clone's live adb
+forward (and, once #1065 added one, killing a live go-ios forward). Electron now marks that child
+(`MODOKI_VITE_UNDER_ELECTRON`) and it skips the pass (`shouldReclaimDeviceStateHere`). Same shape the device-claims file already uses: a
 claim is expired by pid-liveness **on read**, not by a polite release — and since #225 the same
 startup hook also SWEEPS those expired claims out of the file, so `~/.modoki/device-claims.json`
 stops accumulating corpses that read as live holds. (What #225 turned out NOT to be: a lockout. A

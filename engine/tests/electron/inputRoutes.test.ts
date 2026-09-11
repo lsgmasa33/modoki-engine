@@ -1665,15 +1665,92 @@ describe('#1016 — gesture on the wire from the editor routes', () => {
   it.each([
     ['left', 'tap'],
     [undefined, 'tap'],
+    // A JSON null is "not given" — it clicks left, so it is modelled as a tap (#1076 close-out).
+    [null, 'tap'],
     ['right', 'press'],
     ['middle', 'press'],
   ])('tap with button=%s resolves its aim as %s', async (button, expected) => {
-    await post('/api/input/tap', { selector: '#kebab', ...(button ? { button } : {}) });
+    await post('/api/input/tap', { selector: '#kebab', ...(button !== undefined ? { button } : {}) });
     expect(sentTo('resolve-dom-point')).toEqual([expected]);
   });
 
   it('an ENTITY aim carries it too — entity and selector are one category', async () => {
     await post('/api/input/tap', { entity: { name: 'StartButton' }, button: 'right' });
     expect(sentTo('resolve-entity-point')).toEqual(['press']);
+  });
+});
+
+describe('an unknown input vocabulary value is REFUSED before anything resolves or dispatches (#1076)', () => {
+  // Every route that takes a `button` or `modifiers` — the MCP tools enum-check both, but curl and
+  // `modoki.api` from an eval reach these routes with no schema at all. Before this, `button:'rigth'`
+  // pressed LEFT on drag/pointer (the held-move modifier fell back to leftButtonDown) and was echoed back
+  // under `ok:true`; an unknown modifier dropped out of a drag's keyDown/keyUp pair, so Cmd+drag went
+  // out as a plain drag.
+  const ROUTES: Array<{ route: string; body: Record<string, unknown>; button: boolean }> = [
+    { route: '/api/input/tap', body: { x: 5, y: 6 }, button: true },
+    { route: '/api/input/drag', body: { from: { x: 1, y: 1 }, to: { x: 9, y: 9 } }, button: true },
+    { route: '/api/input/pointer', body: { action: 'down', x: 5, y: 6 }, button: true },
+    { route: '/api/input/tap-handle', body: { id: 'bone.0' }, button: true },
+    { route: '/api/input/drag-handle', body: { id: 'bone.0', delta: { dx: 5, dy: 0 } }, button: true },
+    { route: '/api/input/hover', body: { x: 5, y: 6 }, button: false },
+    { route: '/api/input/scroll', body: { x: 5, y: 6, deltaY: 120 }, button: false },
+    { route: '/api/input/key', body: { key: 'z' }, button: false },
+  ];
+
+  /** Nothing reached the renderer (no aim resolve, no handle lookup, no key probe) and no op ran. */
+  const expectNothingHappened = () => {
+    expect(calls).toEqual([]);
+    for (const op of Object.values(ops)) expect(op).not.toHaveBeenCalled();
+  };
+
+  it.each(ROUTES.filter((r) => r.button))('$route refuses button "rigth" with the options', async ({ route, body }) => {
+    const res = await post(route, { ...body, button: 'rigth' }) as { status?: number; body: Record<string, unknown> };
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ code: 'REFUSED_BY_OP', options: ['left', 'right', 'middle'] });
+    expect(res.body.error).toMatch(/button: unknown value "rigth" — nothing was dispatched/);
+    expectNothingHappened();
+  });
+
+  it.each(ROUTES)('$route refuses modifier "cmmd" with the options', async ({ route, body }) => {
+    const res = await post(route, { ...body, modifiers: ['shift', 'cmmd'] }) as { status?: number; body: Record<string, unknown> };
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ code: 'REFUSED_BY_OP', options: ['shift', 'control', 'alt', 'meta', 'cmd', 'command'] });
+    expect(res.body.error).toMatch(/modifiers: unknown value "cmmd" — nothing was dispatched/);
+    expectNothingHappened();
+  });
+
+  it('a prototype key is not a button', async () => {
+    const res = await post('/api/input/tap', { x: 5, y: 6, button: 'toString' }) as { status?: number };
+    expect(res.status).toBe(400);
+    expectNothingHappened();
+  });
+
+  it('pointer: an unknown button is refused on move/up too, and the held press survives it', async () => {
+    await post('/api/input/pointer', { action: 'down', x: 5, y: 6, button: 'right' });
+    const res = await post('/api/input/pointer', { action: 'up', x: 5, y: 6, button: 'rigth' }) as { status?: number };
+    expect(res.status).toBe(400);
+    expect(ops.pointerUp).not.toHaveBeenCalled();
+    // Still held as RIGHT — the refused call neither released it nor re-labelled it.
+    await post('/api/input/pointer', { action: 'up', x: 5, y: 6 });
+    expect(ops.pointerUp).toHaveBeenCalledWith(5, 6, { button: 'right', modifiers: undefined });
+  });
+
+  it('pointer: an unknown action now carries the code and options too', async () => {
+    const res = await post('/api/input/pointer', { action: 'wiggle', x: 1, y: 1 }) as { status?: number; body: Record<string, unknown> };
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ code: 'REFUSED_BY_OP', options: ['down', 'move', 'up'] });
+  });
+
+  // ACCEPT SIDE: a refusal that fired on everything would pass every case above.
+  it.each(ROUTES.filter((r) => r.button))('ACCEPT: $route still dispatches button "middle" and modifiers [cmd, shift]', async ({ route, body }) => {
+    const res = await post(route, { ...body, button: 'middle', modifiers: ['cmd', 'shift'] }) as { status?: number; body: Record<string, unknown> };
+    expect(res.status ?? 200).toBe(200);
+    expect(Object.values(ops).some((op) => (op as ReturnType<typeof vi.fn>).mock.calls.length > 0)).toBe(true);
+  });
+
+  it.each(ROUTES.filter((r) => !r.button))('ACCEPT: $route still dispatches modifiers [meta]', async ({ route, body }) => {
+    const res = await post(route, { ...body, modifiers: ['meta'] }) as { status?: number };
+    expect(res.status ?? 200).toBe(200);
+    expect(Object.values(ops).some((op) => (op as ReturnType<typeof vi.fn>).mock.calls.length > 0)).toBe(true);
   });
 });

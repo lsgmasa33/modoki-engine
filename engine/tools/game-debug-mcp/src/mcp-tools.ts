@@ -18,6 +18,7 @@ import { identityMismatch, tokenMismatchWarning, describeIdentity, type BackendI
 // Single-sourced with the DEVICE side (`agentBridge.ts`'s `sim-step` op) so this tool's outbound
 // `timeoutMs` and the device's own internal step budget can never independently drift (#822).
 import { simStepDefaultTimeout } from '../../shared/simStepTiming.js';
+import { DEVICE_KEY_MODIFIERS, MOUSE_BUTTONS, POINTER_ACTIONS } from '../../shared/inputVocabulary.js';
 import { z } from 'zod';
 import { writeFileSync, readFileSync, unlinkSync, statSync } from 'fs';
 import { execFile } from 'child_process';
@@ -163,14 +164,15 @@ type DeviceStatusReply = {
   // driving (see `adbScreencap`'s `-s` argv below) without this file resolving or guessing one of
   // its own; guessing would risk photographing a DIFFERENT attached Android while still reporting
   // success (the same failure class as #142).
-  target?: { host?: string; port?: number; useAdb?: boolean; serial?: string } | null;
-  lastTarget?: { ip?: string; port?: number; useAdb?: boolean } | null;
+  // `useUsb`/`udid` (#1065): an iOS lease tunnelled over USB — the udid is what tells two of them apart.
+  target?: { host?: string; port?: number; useAdb?: boolean; serial?: string; useUsb?: boolean; udid?: string } | null;
+  lastTarget?: { ip?: string; port?: number; useAdb?: boolean; useUsb?: boolean } | null;
   detail?: string;
 };
 
 /** The `target` keys the mirror above claims. Exported so the drift guard can compare them against
  *  the real interface without re-parsing this file's type declaration. */
-export const DEVICE_STATUS_TARGET_FIELDS = ['host', 'port', 'useAdb', 'serial'] as const;
+export const DEVICE_STATUS_TARGET_FIELDS = ['host', 'port', 'useAdb', 'serial', 'useUsb', 'udid'] as const;
 
 /** The `type` values `device_read_asset_def` accepts — the 7 of the 9 `ASSET_SCHEMA_TYPES` that
  *  `read-asset-def` (agentBridge.ts) actually serves; `material` is deliberately absent (that op
@@ -233,6 +235,9 @@ type DeviceListReply = {
  *  behaviour — no worse than before, just no longer the *only* case. */
 export function statusLeaseKey(s: DeviceStatusReply | null | undefined): string | null {
   if (s?.state !== 'connected' || !s.target) return null;
+  // A USB iOS lease dials 127.0.0.1:<this clone's host port> whichever phone it tunnels to, so the
+  // host:port form would key two different iPhones identically (#1065) — the UDID is what differs.
+  if (s.target.useUsb) return `usb:${s.target.udid ?? ''}`;
   return s.target.useAdb ? `adb:${s.target.serial ?? ''}` : `${s.target.host}:${s.target.port}`;
 }
 
@@ -600,13 +605,20 @@ export function registerTools(server: McpServer) {
     'Connect the editor to a device (open the Modoki lease) — the same action as the AI panel\'s ' +
       '"Connect a Device". Pass `ip` (WiFi — the IP shown in the game\'s debug menu → Device tab) or ' +
       '`useAdb:true` (Android over USB via `adb forward`) — add `serial` when several Androids are ' +
-      'attached (device_list names them). With NEITHER ip nor useAdb, reconnects to the last target ' +
+      'attached (device_list names them) — or `useUsb:true` (iPhone/iPad over USB via go-ios `ios forward`; ' +
+      'add `udid` when several are attached). With NONE of ip/useAdb/useUsb, reconnects to the last target ' +
       'this clone used. `port` overrides the fixed 9095 when the app fell back to an OS-assigned one. ' +
       'Bounded (~6s); on failure it reports why (wrong IP / not same WiFi / not a Debug ' +
       'build / firewalled). Then device_* tools proxy through the lease.',
     {
       ip: z.string().optional().describe('Device LAN IP (WiFi). Omit when useAdb, or to reuse the last IP.'),
       useAdb: z.boolean().optional().describe('Android over USB via adb forward (ignores ip).'),
+      // #1065: the iOS twin of useAdb. The device is picked from go-ios's own usbmuxd list, never
+      // devicectl's, and a phone whose usbmuxd entry lists the NETWORK first is refused — go-ios would
+      // tunnel over WiFi while the lease said USB.
+      useUsb: z.boolean().optional().describe('iPhone/iPad over USB via go-ios `ios forward` (ignores ip). Not combinable with useAdb.'),
+      udid: z.string().optional()
+        .describe('Which iOS device when SEVERAL are attached over USB — its UDID. Only meaningful with useUsb:true. A UDID usbmuxd does not see is an error, never a fall-through to another device.'),
       // #149: with only one Android attached the lease could already resolve it unambiguously, so
       // this stays optional. Once a SECOND is plugged in, `useAdb:true` alone is no longer enough
       // information to know which phone is meant — and the answer must be "refuse", never "pick
@@ -623,7 +635,9 @@ export function registerTools(server: McpServer) {
       port: z.number().int().positive().optional()
         .describe('Bound TCP port, when the app fell back off the default 9095 — read it from the device log ("TCP server listening on port N") or the in-game debug menu.'),
     },
-    async ({ ip, useAdb, serial, port }) => {
+    async ({ ip, useAdb, useUsb, serial, udid, port }) => {
+      const what = useUsb ? 'open a device lease over USB (iOS)'
+        : ip ? `open a device lease to ${ip}` : 'open a device lease over adb';
       try {
         // A new lease means the old device's screenshot scale is meaningless. `currentScreenInfo`
         // also catches this lazily (the human can reconnect from the AI panel without telling us),
@@ -632,27 +646,29 @@ export function registerTools(server: McpServer) {
         const s = (await backendPost('/api/device/connect', {
           ...(ip ? { ip } : {}),
           ...(useAdb !== undefined ? { useAdb } : {}),
+          ...(useUsb !== undefined ? { useUsb } : {}),
           ...(serial ? { serial } : {}),
+          ...(udid ? { udid } : {}),
           ...(port !== undefined ? { port } : {}),
         })) as LeaseStatus;
         if (s.state !== 'connected') {
           return deviceFail({
             code: 'REFUSED_BY_OP',
             tool: 'device_connect',
-            what: ip ? `open a device lease to ${ip}` : 'open a device lease over adb',
+            what,
             why: `the lease did not reach the connected state (state: ${s.state}). ${describeLease(s)}`,
             got: s,
             options: [
-              'the device app must be RUNNING and on the same network — check the IP in its debug menu',
-              'for Android over USB pass useAdb:true instead of an ip',
+              'the device app must be RUNNING (and, on iOS, in the FOREGROUND) — check the IP in its debug menu',
+              'for Android over USB pass useAdb:true instead of an ip; for an iPhone/iPad over USB pass useUsb:true',
               'another clone may already hold the lease — device_status says who',
-              'several devices attached — pass serial (device_list names them)',
+              'several devices attached — pass serial (Android) or udid (iOS); device_list names them',
             ],
           });
         }
         return { content: [{ type: 'text' as const, text: describeLease(s) }] };
       } catch (e) {
-        return caughtFailure('device_connect', ip ? `open a device lease to ${ip}` : 'open a device lease over adb', e);
+        return caughtFailure('device_connect', what, e);
       }
     },
   );
@@ -1531,11 +1547,11 @@ export function registerTools(server: McpServer) {
       'reads NO dragging at all — including the human\'s (#299). The reply says where the press ' +
       'landed: `dom:<element>` when it went to DOM UI, `canvas:<how>` when it went to the game surface.',
     {
-      action: z.enum(['down', 'move', 'up']).describe("'down' press+hold, 'move' re-aim the held pointer, 'up' release."),
+      action: z.enum(POINTER_ACTIONS).describe("'down' press+hold, 'move' re-aim the held pointer, 'up' release."),
       selector: z.string().optional().describe('CSS selector to aim at (resolved on-device; refuses if occluded). Preferred.'),
       x: z.number().optional().describe('X (screenshot pixels) — used when no selector.'),
       y: z.number().optional().describe('Y (screenshot pixels) — used when no selector.'),
-      button: z.enum(['left', 'right', 'middle']).optional().describe("Mouse button for 'down' (default 'left'); ignored on move/up (the held button is reused)."),
+      button: z.enum(MOUSE_BUTTONS).optional().describe("Mouse button for 'down' (default 'left'); ignored on move/up (the held button is reused)."),
     },
     async ({ action, selector, x, y, button }) => {
       if (!selector && (x == null || y == null)) {
@@ -1919,7 +1935,7 @@ export function registerTools(server: McpServer) {
       'do nothing with a game canvas focused (#32). Check device_status\'s input-mechanism line.',
     {
       key: z.string().describe('KeyboardEvent.key, e.g. "F12", "Escape", "ArrowLeft", "a".'),
-      modifiers: z.array(z.enum(['ctrl', 'shift', 'alt', 'meta'])).optional().describe('Held modifiers, e.g. ["meta"] for Cmd+key.'),
+      modifiers: z.array(z.enum(DEVICE_KEY_MODIFIERS)).optional().describe('Held modifiers, e.g. ["meta"] for Cmd+key.'),
     },
     async ({ key, modifiers }) => enactCall('device_press_key', 'press-key', { key, ...(modifiers ? { modifiers } : {}) }, (r) => r.replace(/^ok /, 'Pressed ')),
   );

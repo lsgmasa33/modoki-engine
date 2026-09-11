@@ -17,6 +17,7 @@ import { setJournalEnabled, getFrameLoopHealth, hasDocKey } from '@modoki/engine
 import { createSupersessionToken, createTeardownToken } from '@modoki/engine/runtime/core/liveness';
 import { consoleRing, installDeviceConsoleCapture, unpatchedLog } from './deviceConsoleCapture';
 import { getConsoleRingDropped } from '@modoki/engine/runtime/core/consoleRing';
+import { refuseDeviceInputVocabulary } from '../../tools/shared/inputVocabulary';
 import {
   safeStringify,
   describeShape,
@@ -918,6 +919,10 @@ export async function handlePointer(params: Record<string, unknown>): Promise<st
   if (action !== 'down' && action !== 'move' && action !== 'up') {
     return `Error: pointer action must be 'down', 'move', or 'up' (got ${JSON.stringify(action)})`;
   }
+  // An unknown `button` is refused, not pressed as left (#1076) — the same check the backend's
+  // `/api/device/request` dispatch runs first, so a caller reaching this handler another way agrees.
+  const unknownVocab = refuseDeviceInputVocabulary('pointer', params);
+  if (unknownVocab) return `Error: ${unknownVocab.error}`;
   if (action === 'down' && heldPointer) {
     return `Error: a pointer is already held (button ${POINTER_BUTTON_NAME[heldPointer.button]} down at ${heldPointer.x.toFixed(1)},${heldPointer.y.toFixed(1)}). Release it with action:'up' before pressing again.`;
   }
@@ -1161,6 +1166,9 @@ export async function handlePressKey(params: Record<string, unknown>): Promise<s
   if (refusal) return refusal;
   const key = params.key as string;
   if (!key) return 'Error: press-key needs a key';
+  // An unknown modifier used to be dropped from the chord while the reply echoed it (#1076).
+  const unknownVocab = refuseDeviceInputVocabulary('press-key', params);
+  if (unknownVocab) return `Error: ${unknownVocab.error}`;
   const mods = (params.modifiers as string[]) ?? [];
   const init: KeyboardEventInit = {
     key, code: (params.code as string) || keyToCode(key), bubbles: true, cancelable: true,

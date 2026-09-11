@@ -77,7 +77,7 @@ import { type SpriteSlice, type SpriteAssetRef } from '../packages/modoki/src/ru
 import { type AtlasCacheBlock } from '../packages/modoki/src/runtime/loaders/spriteAtlas';
 import { type SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneValidation';
 import { handleBackendRequest, assetJsonBytes, type BackendContext, type BackendResult } from './backend/editorBackendRouter';
-import { reclaimStaleDeviceStateAtStartup } from './backend/deviceConnection';
+import { reclaimStaleDeviceStateAtStartup, shouldReclaimDeviceStateHere } from './backend/deviceConnection';
 import { vendorEnginePlugins, writeVendorMarker, verifyInstalledMatchesTarballResult } from './vendorPlugins';
 import { spawnBuildCommand, killBuildProcess, resolveBuildStep, type BuildStep } from './buildStepShell';
 import { healNativeConfig } from './healNativeConfig';
@@ -1765,8 +1765,10 @@ export function assetScannerPlugin(): Plugin {
     },
 
     configureServer(server) {
-      // The OTHER backend host — see startBackendServer in electron/backendServer.ts (#160).
-      reclaimStaleDeviceStateAtStartup();
+      // The OTHER backend host — see startBackendServer in electron/backendServer.ts (#160). Not when this
+      // Vite server is Electron's child: the lease lives in Electron main, and this child restarts on every
+      // project open (see shouldReclaimDeviceStateHere).
+      if (shouldReclaimDeviceStateHere()) reclaimStaleDeviceStateAtStartup();
       viteServer = server as unknown as ViteServerRef;
 
       // Agent bridge: cache the trait schema the browser pushes, and resolve

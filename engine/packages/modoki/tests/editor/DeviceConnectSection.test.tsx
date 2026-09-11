@@ -49,7 +49,8 @@ describe('DeviceConnectSection', () => {
     fireEvent.change(input, { target: { value: '10.0.0.7' } });
     fireEvent.click(getByText('Connect'));
 
-    await waitFor(() => expect(h.deviceConnect).toHaveBeenCalledWith({ ip: '10.0.0.7', useAdb: false }));
+    // WiFi mode sends the IP alone — `connectRequestFor` (#1065); the backend reads an absent `useAdb` as false.
+    await waitFor(() => expect(h.deviceConnect).toHaveBeenCalledWith({ ip: '10.0.0.7' }));
     await waitFor(() => getByText('Disconnect'));                        // commitStatus updated the UI
   });
 

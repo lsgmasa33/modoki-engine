@@ -203,6 +203,29 @@ describe('a FALLBACK port is named, not guessed around (#OikQcN8V5NMH0xUr9UnK)',
   });
 });
 
+describe('explainConnectFailure over go-ios USB (#1065)', () => {
+  it('a refused handshake names the three causes with iOS remedies, not adb ones', () => {
+    const out = explainConnectFailure('refused', DEVICE_PORT, 'usb')!;
+    expect(out).toMatch(/USB tunnel \(go-ios forward\) opened/);
+    expect(out).toMatch(/BACKGROUND/);                           // iOS stops the bridge when backgrounded
+    expect(out).toMatch(/TCP server listening on port N/);        // the line GameDebugPlugin.swift prints
+    expect(out).toMatch(/device_connect \{useUsb:true, port:N\}/);
+    expect(out).not.toMatch(/adb shell|adb logcat/);             // there is no shell on this path
+  });
+
+  it('ECONNREFUSED over the USB tunnel means the FORWARD is gone — not "no debug bridge", even with debugBuild off', () => {
+    const out = explainConnectFailure('connect ECONNREFUSED 127.0.0.1:9098', DEVICE_PORT, 'usb', false)!;
+    expect(out).toMatch(/go-ios forward on this clone's host port is gone/);
+    expect(out).toMatch(/device_connect \{useUsb:true\}/);
+    expect(out).not.toMatch(/debugBuild|adb shell/);
+  });
+
+  it('`true` still means adb, so the #164 callers read unchanged', () => {
+    expect(explainConnectFailure('refused', DEVICE_PORT, true)).toBe(explainConnectFailure('refused', DEVICE_PORT, 'adb'));
+    expect(explainConnectFailure('refused', DEVICE_PORT, true)).toMatch(/adb tunnel opened/);
+  });
+});
+
 describe('parseBoundBridgePort', () => {
   it('reads the port the app printed', () => {
     expect(parseBoundBridgePort(

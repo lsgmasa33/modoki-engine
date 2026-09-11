@@ -189,6 +189,7 @@ import { validateSceneData, validatePrefabData, typeMismatch, type SceneSchema, 
 import { isGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type MutableScene, type MutateOp, type EntityRef } from '../../packages/modoki/src/runtime/scene/sceneMutate';
 import { ERROR_CODES, type ErrorCode } from '../../tools/shared/mcpResult';
+import { refuseDeviceInputVocabulary } from '../../tools/shared/inputVocabulary';
 import { decodeSceneOpsReply } from './sceneOpsReply';
 // ASSET_SCHEMA_TYPES is IMPORTED, never restated. This file used to keep its own copy, and it
 // advertised a narrower set in its 400s than `getAssetSchema` actually served — a wrong error
@@ -1472,7 +1473,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     // able to talk the refusal out of naming the real cause (#239).
     let debugBuild: boolean | undefined;
     try { debugBuild = loadProjectConfig(ctx.projectRoot).build.debugBuild === true; } catch { /* unreadable config: stay silent rather than guess */ }
-    try { return json(await deviceConnection.connect({ ip: b.ip, useAdb: b.useAdb, port: b.port, serial: b.serial, debugBuild })); }
+    try { return json(await deviceConnection.connect({ ip: b.ip, useAdb: b.useAdb, useUsb: b.useUsb, port: b.port, serial: b.serial, udid: b.udid, debugBuild })); }
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 500); }
   }
   if (urlPath === '/api/device/disconnect' && method === 'POST') {
@@ -1493,6 +1494,12 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   if (urlPath === '/api/device/request' && method === 'POST') {
     const b = (body ?? {}) as { method?: string; params?: Record<string, unknown> };
     if (!b.method) return json({ error: 'method required' }, 400);
+    // An unknown input VOCABULARY value (#1076) — `pointer`'s button/action, `press-key`'s modifiers —
+    // is refused here, before any transport is chosen: CDP dispatches `press-key` itself and never
+    // reaches the bridge handler, and the device's own build may predate the handler's refusal. The
+    // same shape as `refuseUndeliverableDeviceInput`'s reply, so the tools read it as a failure.
+    const unknownVocab = refuseDeviceInputVocabulary(b.method, b.params ?? {});
+    if (unknownVocab) return json({ result: `Error: ${unknownVocab.error}` });
     try {
       // NESTED DEADLINES (#153), the same rule `/api/eval` follows one layer up: the transport
       // deadline is sized from the OP'S OWN budget plus headroom, so the innermost timeout is the
@@ -1535,9 +1542,13 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
         // `pickGoIosDevice` also tells "no lease" from "lease with no reported hardware" apart, so
         // `undefined` (not a hardware object with null fields) is what a non-iOS/unresolved lease
         // must produce.
-        const connected = deviceConnection.status().state === 'connected';
+        const st = deviceConnection.status();
+        const connected = st.state === 'connected';
         const lease = connected ? leaseForIosOps(await deviceConnection.devicePlatform(), await deviceConnection.deviceHardware()) : undefined;
-        return resolveGoIosDevice({ goIos, env: process.env, lease });
+        // A USB lease was opened THROUGH go-ios to one UDID (#1065), so it names the phone outright —
+        // read ungated, like the adb serial below: a go-ios tunnel is iOS by construction.
+        const leaseUdid = connected && st.target?.useUsb ? st.target.udid : undefined;
+        return resolveGoIosDevice({ goIos, env: process.env, lease, leaseUdid });
       };
       // WHICH Android, for the host-side adb ops. The LEASE's serial wins (it is the phone the
       // caller is already driving); otherwise the same rule a build follows — the project pin, else

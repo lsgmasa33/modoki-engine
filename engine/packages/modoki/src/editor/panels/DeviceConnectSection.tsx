@@ -6,17 +6,19 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   type DeviceStatus,
   type DeviceListReply,
-  type AndroidDeviceRow,
+  type DeviceConnectMode,
+  type PickerRow,
+  connectRequestFor,
+  modeOfTarget,
   fetchDeviceStatus,
   fetchDeviceList,
   deviceConnect,
   deviceDisconnect,
   deviceSummary,
   deviceButtonLabel,
-  looksLikeIp,
-  androidRowLabel,
-  androidRowNote,
   androidRowSelectable,
+  androidPickerRows,
+  iosPickerRows,
 } from './deviceConnectModel';
 
 const LEVEL_COLOR: Record<string, string> = { ok: '#2ecc71', off: '#666', action: '#e0a030', error: '#e07a5a' };
@@ -35,15 +37,15 @@ function Dot({ level }: { level: string }): React.ReactElement {
  *  a `combobox` button plus a `listbox` of `option` rows, each with a stable `data-testid` to aim
  *  at, keyboard-operable, and closing on Escape or an outside click. Same affordance, drivable. */
 function DevicePicker({
-  rows, selected, disabled, thisClone, onSelect,
+  rows, selected, disabled, ariaLabel, onSelect,
 }: {
-  rows: AndroidDeviceRow[];
+  /** Already resolved per platform (`androidPickerRows` / `iosPickerRows`), including whether THIS
+   *  editor's own claim keeps a row selectable — which is why the picker needs no clone path. */
+  rows: PickerRow[];
   selected: string | null;
   disabled: boolean;
-  /** This backend's own clone path, from `/api/device/list`'s `self` — so a device THIS editor
-   *  claims stays selectable and reads as "in use by this editor" rather than as a rival clone. */
-  thisClone?: string;
-  onSelect: (serial: string) => void;
+  ariaLabel: string;
+  onSelect: (id: string) => void;
 }): React.ReactElement {
   const [open, setOpen] = useState(false);
   const wrap = useRef<HTMLDivElement | null>(null);
@@ -67,8 +69,8 @@ function DevicePicker({
   }, [open]);
 
   // Anything not selectable is closed over here once, so the button and the list agree.
-  const current = rows.find((r) => r.serial === selected) ?? null;
-  const closedLabel = current ? androidRowLabel(current) : rows.length ? 'Select a device…' : 'No devices';
+  const current = rows.find((r) => r.id === selected) ?? null;
+  const closedLabel = current ? current.label : rows.length ? 'Select a device…' : 'No devices';
 
   return (
     <div
@@ -82,7 +84,7 @@ function DevicePicker({
         role="combobox"
         aria-expanded={open}
         aria-haspopup="listbox"
-        aria-label="Android device"
+        aria-label={ariaLabel}
         data-testid="device-picker-button"
         disabled={disabled || rows.length === 0}
         onClick={() => setOpen((v) => !v)}
@@ -98,27 +100,26 @@ function DevicePicker({
       </button>
 
       {open && (
-        <div role="listbox" aria-label="Android device" data-testid="device-picker-list"
+        <div role="listbox" aria-label={ariaLabel} data-testid="device-picker-list"
           style={{
             position: 'absolute', top: '100%', left: 0, right: 0, zIndex: 10, marginTop: 2,
             display: 'flex', flexDirection: 'column', borderRadius: 3, overflow: 'hidden',
             border: '1px solid #555', background: '#14141c', boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
           }}>
           {rows.map((row) => {
-            const selectable = androidRowSelectable(row, thisClone);
-            const note = androidRowNote(row, thisClone);
-            const isSelected = row.serial === selected;
+            const { selectable, note } = row;
+            const isSelected = row.id === selected;
             return (
               <div
-                key={row.serial}
+                key={row.id}
                 role="option"
                 aria-selected={isSelected}
                 aria-disabled={!selectable}
                 tabIndex={selectable ? 0 : -1}
-                data-testid={`device-row-${row.serial}`}
-                onClick={() => { if (selectable) { onSelect(row.serial); setOpen(false); } }}
+                data-testid={`device-row-${row.id}`}
+                onClick={() => { if (selectable) { onSelect(row.id); setOpen(false); } }}
                 onKeyDown={(e) => {
-                  if (selectable && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); onSelect(row.serial); setOpen(false); }
+                  if (selectable && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); onSelect(row.id); setOpen(false); }
                 }}
                 style={{
                   display: 'flex', alignItems: 'baseline', gap: 8, padding: '5px 8px',
@@ -132,7 +133,7 @@ function DevicePicker({
                     AI panel is ~250px, and side-by-side clipped the holder mid-pid ("pid 25…") —
                     which is exactly the digit you need to go find the session holding your phone. */}
                 <span style={{ flex: 1, minWidth: 0 }}>
-                  <span style={{ color: '#ddd', display: 'block' }}>{androidRowLabel(row)}</span>
+                  <span style={{ color: '#ddd', display: 'block' }}>{row.label}</span>
                   {note && <span style={{ color: '#999', fontSize: 10, display: 'block', marginTop: 1 }}>{note}</span>}
                 </span>
               </div>
@@ -147,7 +148,10 @@ function DevicePicker({
 export default function DeviceConnectSection(): React.ReactElement {
   const [status, setStatus] = useState<DeviceStatus | null>(null);
   const [ip, setIp] = useState<string>('');
-  const [useAdb, setUseAdb] = useState<boolean>(false);
+  const [mode, setMode] = useState<DeviceConnectMode>('wifi');
+  const useAdb = mode === 'adb';
+  const useUsb = mode === 'usb';
+  const [udid, setUdid] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
   const [deviceList, setDeviceList] = useState<DeviceListReply | null>(null);
@@ -161,6 +165,8 @@ export default function DeviceConnectSection(): React.ReactElement {
   // Same one-shot guard for the serial pre-select (#149) — separate from `hydrated` because the
   // list (and so the attached-device set) can still be loading after the status reply lands.
   const serialHydrated = useRef(false);
+  // …and for the iOS UDID (#1065).
+  const udidHydrated = useRef(false);
 
   const refresh = useCallback(async () => {
     const seq = ++reqSeq.current;
@@ -170,7 +176,7 @@ export default function DeviceConnectSection(): React.ReactElement {
     if (!hydrated.current && s?.lastTarget) {
       hydrated.current = true;
       if (s.lastTarget.ip) setIp(s.lastTarget.ip);
-      setUseAdb(s.lastTarget.useAdb);
+      setMode(modeOfTarget(s.lastTarget));
     }
   }, []);
 
@@ -202,6 +208,16 @@ export default function DeviceConnectSection(): React.ReactElement {
     else if (attached.length === 1) { serialHydrated.current = true; setSerial(attached[0].serial); }
   }, [deviceList, status]);
 
+  // The iOS twin (#1065): the remembered UDID if it is still listed, else the single selectable device.
+  useEffect(() => {
+    if (udidHydrated.current || !deviceList) return;
+    const attached = iosPickerRows(deviceList.ios, deviceList.self?.clone).filter((r) => r.selectable);
+    const remembered = status?.lastTarget?.udid;
+    const stillAttached = remembered ? attached.find((r) => r.id === remembered) : undefined;
+    if (stillAttached) { udidHydrated.current = true; setUdid(stillAttached.id); }
+    else if (attached.length === 1) { udidHydrated.current = true; setUdid(attached[0].id); }
+  }, [deviceList, status]);
+
   const summary = deviceSummary(status);
 
   // A command's result is fresher than any poll — bump reqSeq so an in-flight refresh() (which
@@ -213,6 +229,8 @@ export default function DeviceConnectSection(): React.ReactElement {
   }, []);
 
   const androidAttached = deviceList?.android.filter((d) => androidRowSelectable(d, deviceList.self?.clone)) ?? [];
+  const iosRows = deviceList ? iosPickerRows(deviceList.ios, deviceList.self?.clone) : [];
+  const iosAttached = iosRows.filter((r) => r.selectable);
 
   const onConnect = useCallback(async () => {
     if (summary.connected) {
@@ -229,31 +247,32 @@ export default function DeviceConnectSection(): React.ReactElement {
       }
       return;
     }
-    if (!useAdb && !looksLikeIp(ip)) { setNote('Enter the device IP shown in its debug menu (or check “Use adb”).'); return; }
-    // Several attached with none picked is ambiguous — the same gate as an empty IP field, since
-    // connecting without a serial would leave the backend to guess (#149).
-    if (useAdb && androidAttached.length > 1 && !serial) { setNote('Pick which Android to connect to.'); return; }
+    // The rule — an empty IP, or several attached with none picked (#149, #1065) — is `connectRequestFor`.
+    const decided = connectRequestFor({ mode, ip, serial, udid, androidAttached: androidAttached.length, iosAttached: iosAttached.length });
+    if ('note' in decided) { setNote(decided.note); return; }
     setBusy(true); setNote(null);
     try {
-      commitStatus(await deviceConnect({ ip: useAdb ? undefined : ip.trim(), useAdb, serial: useAdb ? (serial ?? undefined) : undefined }));
+      commitStatus(await deviceConnect(decided.request));
     } catch (e) {
       if (mounted.current) setNote(`Connect failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       if (mounted.current) setBusy(false);
       void refreshList();
     }
-  }, [summary.connected, useAdb, ip, serial, androidAttached.length, commitStatus, refreshList]);
+  }, [summary.connected, mode, ip, serial, udid, androidAttached.length, iosAttached.length, commitStatus, refreshList]);
 
   // User edits mark the form as touched so the one-time server hydration won't overwrite it.
   const onIpChange = (v: string) => { hydrated.current = true; setIp(v); };
-  const onAdbChange = (v: boolean) => { hydrated.current = true; setUseAdb(v); };
+  // The two USB boxes are ONE choice (see `DeviceConnectMode`): ticking one clears the other.
+  const onModeToggle = (m: 'adb' | 'usb', checked: boolean) => { hydrated.current = true; setMode(checked ? m : 'wifi'); };
+  const onUdidChange = (v: string) => { udidHydrated.current = true; setUdid(v); };
   const onSerialChange = (v: string) => { serialHydrated.current = true; setSerial(v); };
 
   return (
     <div style={{ marginTop: 16, paddingTop: 12, borderTop: '1px solid #22222e' }}>
       <div style={{ color: '#fff', fontSize: 13, fontWeight: 600, marginBottom: 4 }}>Connect a Device</div>
       <div style={{ color: '#888', marginBottom: 10, lineHeight: 1.5 }}>
-        Debug the game on a phone. Enter the IP from the device’s debug menu, or connect over USB with adb.
+        Debug the game on a phone. Enter the IP from the device’s debug menu, or connect over USB (adb for Android, go-ios for an iPhone/iPad).
       </div>
 
       {/* Headline status */}
@@ -268,8 +287,15 @@ export default function DeviceConnectSection(): React.ReactElement {
       {/* adb toggle */}
       <label style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#9a9ac0', marginBottom: 8, cursor: 'pointer' }}
         title="Tunnel over USB via `adb forward` (Android). The IP field is not needed.">
-        <input data-ui-id="ai.device.useAdb" data-ui-kind="toggle" data-ui-label="use adb (USB)" type="checkbox" checked={useAdb} disabled={busy || summary.connected} onChange={(e) => onAdbChange(e.target.checked)} />
+        <input data-ui-id="ai.device.useAdb" data-ui-kind="toggle" data-ui-label="use adb (USB)" type="checkbox" checked={useAdb} disabled={busy || summary.connected} onChange={(e) => onModeToggle('adb', e.target.checked)} />
         Use adb (USB)
+      </label>
+
+      {/* iOS over USB (#1065) */}
+      <label style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#9a9ac0', marginBottom: 8, cursor: 'pointer' }}
+        title="Tunnel over USB via go-ios `ios forward` (iPhone/iPad). The IP field is not needed.">
+        <input data-ui-id="ai.device.useUsb" data-ui-kind="toggle" data-ui-label="use USB (iOS)" type="checkbox" checked={useUsb} disabled={busy || summary.connected} onChange={(e) => onModeToggle('usb', e.target.checked)} />
+        Use USB (iOS)
       </label>
 
       {/* adb device picker (#149) — only meaningful in adb mode; the WiFi/IP path is untouched. */}
@@ -280,13 +306,21 @@ export default function DeviceConnectSection(): React.ReactElement {
             ? <div style={{ color: '#888', marginBottom: 8 }}>No Android devices attached.</div>
             : deviceList && (
               <DevicePicker
-                rows={deviceList.android}
+                rows={androidPickerRows(deviceList.android, deviceList.self?.clone)}
                 selected={serial}
                 disabled={busy || summary.connected}
-                thisClone={deviceList.self?.clone}
+                ariaLabel="Android device"
                 onSelect={onSerialChange}
               />
             )
+      )}
+
+      {/* iOS device picker (#1065) — candidates from the Apple listing; the backend re-resolves the
+          choice through go-ios and refuses a device usbmuxd cannot see. */}
+      {useUsb && deviceList && (
+        deviceList.ios.length === 0
+          ? <div style={{ color: '#888', marginBottom: 8 }}>No iOS devices attached.</div>
+          : <DevicePicker rows={iosRows} selected={udid} disabled={busy || summary.connected} ariaLabel="iOS device" onSelect={onUdidChange} />
       )}
 
       {/* IP + Connect */}
@@ -296,13 +330,13 @@ export default function DeviceConnectSection(): React.ReactElement {
           type="text"
           value={ip}
           placeholder="192.168.1.42"
-          disabled={useAdb || busy || summary.connected}
+          disabled={mode !== 'wifi' || busy || summary.connected}
           onChange={(e) => onIpChange(e.target.value)}
           onKeyDown={(e) => { if (e.key === 'Enter' && !summary.connected) void onConnect(); }}
           style={{
             flex: 1, minWidth: 120, padding: '4px 8px', fontSize: 11, borderRadius: 3,
-            border: '1px solid #555', background: useAdb ? '#20202a' : '#101018',
-            color: useAdb ? '#666' : '#ddd', fontVariantNumeric: 'tabular-nums',
+            border: '1px solid #555', background: mode !== 'wifi' ? '#20202a' : '#101018',
+            color: mode !== 'wifi' ? '#666' : '#ddd', fontVariantNumeric: 'tabular-nums',
           }}
         />
         <button data-ui-id="ai.device.connect" data-ui-kind="button" data-ui-label="connect device" data-ui-state={deviceButtonLabel(status, busy)} onClick={() => void onConnect()} disabled={busy} style={{

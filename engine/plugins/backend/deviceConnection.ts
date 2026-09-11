@@ -23,7 +23,11 @@ import {
   adbArgs, adbBinary, describeAndroidDevice, forwardOwner, listAndroidDevices, resolveAndroidSerial,
   withFriendlyNames,
 } from './androidDevices';
-import { adbDeviceId, claimDevice, releaseDevice, releaseAllForThisProcess, sweepStaleClaims, wifiDeviceId } from './deviceClaims';
+import { adbDeviceId, claimDevice, iosDeviceId, releaseDevice, releaseAllForThisProcess, sweepStaleClaims, wifiDeviceId } from './deviceClaims';
+import {
+  FORWARD_EXIT_WAIT_MS, clearIosForwardRecord, goIosForwardRunner, parseGoIosListDetails, pickUsbIosDevice,
+  reapRecordedIosForward, recordIosForward, startIosForward, waitForForwardExit, type IosForward, type UsbmuxEntry,
+} from './iosUsbForward';
 import { DeviceLeaseClient, type LeaseTransport, type LeaseRequest, type LeaseReply, type LeaseState } from './deviceLease';
 import { resetDeviceCdpSession, resolveDeviceCdpPort } from './deviceCdp';
 import { parseBoundBridgePort } from './deviceAndroidDiag';
@@ -76,6 +80,10 @@ export function resolveDeviceHostPort(env: NodeJS.ProcessEnv = process.env): num
   return DEVICE_HOST_PORT_BASE + (backendPort - 5179);
 }
 
+/** A host-side tunnel to the device's port: `adb forward` (Android) or go-ios `ios forward` (iOS,
+ *  #1065). Both accept on this clone's end whether or not the phone answers — see below. */
+export type ConnectTunnel = 'adb' | 'usb';
+
 /** Turn a bare `ECONNREFUSED` on the DEFAULT port into the answer to the question it actually
  *  raises (#95).
  *
@@ -106,9 +114,12 @@ export function resolveDeviceHostPort(env: NodeJS.ProcessEnv = process.env): num
  *  and gives the one command that settles it. Reporting two candidates honestly beats reporting one
  *  confidently and wrongly. */
 export function explainConnectFailure(
-  detail: string | undefined, port: number, useAdb = false, debugBuild?: boolean,
+  detail: string | undefined, port: number, tunnel: boolean | ConnectTunnel = false, debugBuild?: boolean,
   fallbackPort?: number | null,
 ): string | undefined {
+  // `true` is the original `useAdb` spelling, kept so the adb callers and their tests read unchanged.
+  const via: ConnectTunnel | null = tunnel === true ? 'adb' : tunnel === false ? null : tunnel;
+  const useAdb = via === 'adb';
   // ⭐ A KNOWN FALLBACK PORT OUTRANKS EVERY GUESS BELOW, because it is not a guess: the app
   // PRINTED the port it bound. 9095 is shared by every Modoki game, so when a second one still
   // holds it the app under test takes an OS-assigned port exactly as designed — and this message
@@ -126,6 +137,15 @@ export function explainConnectFailure(
       + `\`device_connect {..., port: ${fallbackPort}}\`, or force-stop the app squatting `
       + `${port} (\`adb shell ps -A | grep modoki\`, then \`adb shell am force-stop <pkg>\`) and `
       + `relaunch, after which it binds ${port} first try.`;
+  }
+  // Over go-ios's tunnel (#1065) ECONNREFUSED cannot mean "nothing listens on the phone": the forward
+  // accepts on this clone's port whatever the phone does. It means the FORWARD is gone — go-ios exited or
+  // was killed mid-lease. Checked before the debugBuild branch, whose "no bridge compiled in" reading is
+  // about the phone and would send the reader to a rebuild that cannot help.
+  if (via === 'usb' && detail && /ECONNREFUSED/i.test(detail)) {
+    return `${detail} — the go-ios forward on this clone's host port is gone (it exited or was killed), so `
+      + 'nothing tunnels to the device any more. Reconnect with device_connect {useUsb:true} to start a new '
+      + 'one; if it keeps dying, check the cable and that `ios list --details` still lists the device as USB.';
   }
   // ⭐ A KNOWN-OFF FLAG IS THE LEADING SUSPECT (#239) — but only ECONNREFUSED lets it be the
   // ONLY one, and that asymmetry is the whole of this branch.
@@ -173,6 +193,23 @@ export function explainConnectFailure(
   // handshake produced nothing (deviceLease.ts). A GENUINE busy reply from the device always names
   // its reason — `busy` / `no-lease` / `not-owner` — so this branch cannot swallow a real lease
   // conflict; it only catches the case the device never answered at all.
+  // The same indistinguishable pair over go-ios's forward (#1065): `ios forward` accepts on this
+  // clone's port whether or not anything listens on the phone, exactly as `adb forward` does. The
+  // advice differs only where adb had a shell and iOS does not.
+  if (via === 'usb' && detail === 'refused') {
+    return `refused — the USB tunnel (go-ios forward) opened but the app never answered the lease `
+      + `handshake, which has THREE causes this end cannot tell apart:\n`
+      + `  1. Nothing is listening on the device's port ${port}. The app is not running, or it is in `
+      + `the BACKGROUND — iOS stops the debug bridge when the app leaves the foreground, and USB does `
+      + `not change that. Bring it to the front and connect again. If it is in front, the build may `
+      + `have no native debug bridge: reopen the project in the editor (heal-on-open) and rebuild.\n`
+      + `  2. Another Modoki genuinely owns the lease — it refuses an extra client by dropping the `
+      + `socket, which looks identical from here. Disconnect it there, or relaunch the app.\n`
+      + `  3. The app IS running, but listening on a DIFFERENT port: ${port} is shared by every Modoki `
+      + `game, and an app launched while another held it falls back to an OS-assigned one (#88/#283). `
+      + `The app prints "[GameDebug] TCP server listening on port N" — read it with `
+      + `\`device_native_logs {source:'system'}\` — and pass \`device_connect {useUsb:true, port:N}\`.`;
+  }
   if (useAdb && detail === 'refused') {
     return `refused — the adb tunnel opened but the app never answered the lease handshake, which `
       + `over USB has TWO causes and this end cannot tell them apart:\n`
@@ -476,7 +513,14 @@ export function loadOrCreateGuid(dir: string = modokiStateDir()): string {
  *  re-picking the right one every session is the friction the device picker exists to remove. It is
  *  a PREFERENCE, not a pin — a remembered serial that is no longer attached must not hard-fail the
  *  reconnect, because the common cause is simply that the phone was unplugged. See `connect()`. */
-export interface LastTarget { ip: string; useAdb: boolean; serial?: string }
+export interface LastTarget {
+  ip: string;
+  useAdb: boolean;
+  serial?: string;
+  /** iOS over USB (#1065), and which device — remembered the same way, and as a preference only. */
+  useUsb?: boolean;
+  udid?: string;
+}
 
 function lastTargetFile(dir: string): string {
   return path.join(dir, 'device-target.json');
@@ -491,7 +535,11 @@ export function loadLastTarget(dir: string = modokiStateDir()): LastTarget | nul
       // process. Blank normalises to absent so the field is either a real serial or missing —
       // a cosmetic tidy, not load-bearing (every consumer already tests it for truthiness).
       const serial = typeof t?.serial === 'string' && t.serial ? t.serial : undefined;
-      return { ip: String(t.ip ?? ''), useAdb: Boolean(t.useAdb), ...(serial ? { serial } : {}) };
+      const udid = typeof t?.udid === 'string' && t.udid ? t.udid : undefined;
+      return {
+        ip: String(t.ip ?? ''), useAdb: Boolean(t.useAdb), ...(serial ? { serial } : {}),
+        ...(t?.useUsb === true ? { useUsb: true } : {}), ...(udid ? { udid } : {}),
+      };
     }
   } catch { /* not created yet */ }
   return null;
@@ -519,7 +567,10 @@ export interface DeviceConnectStatus {
   /** `serial` is the adb device this lease resolved at connect time (#149). It is on the STATUS,
    *  not re-derived per call, so every later adb call — the CDP tunnel, `device_screenshot` —
    *  targets the phone the lease actually holds. Absent for a WiFi lease. */
-  target: { host: string; port: number; useAdb: boolean; serial?: string } | null;
+  //
+  // `useUsb`/`udid` mark an iOS lease tunnelled by go-ios (#1065): the udid rides on the status for
+  // the same reason `serial` does. Kept an inline literal — `deviceStatusShape.test.ts` parses it.
+  target: { host: string; port: number; useAdb: boolean; serial?: string; useUsb?: boolean; udid?: string } | null;
   /** Last chosen IP/adb, remembered across restarts, so the panel can pre-fill the field. */
   lastTarget: LastTarget | null;
   detail?: string;
@@ -545,11 +596,17 @@ export interface ConnectRequest {
   ip?: string;
   /** Tunnel over USB via `adb forward` and connect to 127.0.0.1 (Android only). */
   useAdb?: boolean;
+  /** Tunnel over USB via go-ios `ios forward` and connect to 127.0.0.1 (iOS only, #1065). Refused
+   *  together with `useAdb` — they are two different tunnels. */
+  useUsb?: boolean;
   port?: number;
   /** WHICH Android, when several are attached (#149). adb serial, as listed by `device_list` /
    *  `adb devices`. Only meaningful with `useAdb`; a serial that matches nothing attached is an
    *  error, never a fall-through to another phone. */
   serial?: string;
+  /** WHICH iOS device over USB — a UDID as go-ios lists it. Only meaningful with `useUsb`; the same
+   *  error-not-fall-through rule as `serial`. */
+  udid?: string;
   /** The OPEN PROJECT's `build.debugBuild`, supplied by the router — never by the caller (#239).
    *  When it is `false` the app has no debug bridge compiled in at all, which turns the handshake
    *  failure below from two guesses into one certainty. */
@@ -579,7 +636,9 @@ function connectRequestKey(req: ConnectRequest): string {
   return JSON.stringify({
     ip: req.ip?.trim() ?? '',
     useAdb: req.useAdb === undefined ? OMITTED : req.useAdb,
+    useUsb: req.useUsb === undefined ? OMITTED : req.useUsb,
     serial: req.serial === undefined ? OMITTED : (req.serial ?? '').trim(),
+    udid: req.udid === undefined ? OMITTED : (req.udid ?? '').trim(),
     port: req.port === undefined ? OMITTED : req.port,
     debugBuild: !!req.debugBuild,
   });
@@ -590,7 +649,10 @@ export class DeviceConnectionManager {
   private transport: TcpLeaseTransport | null = null;
   private state: LeaseState = 'disconnected';
   private detail?: string;
-  private target: { host: string; port: number; useAdb: boolean; serial?: string } | null = null;
+  private target: DeviceConnectStatus['target'] = null;
+  /** The go-ios `ios forward` child a USB lease owns (#1065). A PROCESS, unlike the adb rule, so it has
+   *  to be killed on every path that ends the lease — see `iosUsbForward.ts`. */
+  private iosForward: IosForward | null = null;
   private lastTarget: LastTarget | null;
   /** The machine-wide hardware claim this lease holds (#149), so `disconnect` can hand back exactly
    *  what `connect` took. Kept separately from `target` because it must survive the same failure
@@ -683,18 +745,32 @@ export class DeviceConnectionManager {
     // supplying just an ip still means WiFi (never adb) and supplying useAdb still means USB. Capture
     // the prior target BEFORE we overwrite this.lastTarget below.
     const reqIp = req.ip?.trim();
-    const bareReconnect = !reqIp && req.useAdb === undefined && !!this.lastTarget;
+    const bareReconnect = !reqIp && req.useAdb === undefined && req.useUsb === undefined && !!this.lastTarget;
     const useAdb = bareReconnect ? !!this.lastTarget!.useAdb : !!req.useAdb;
+    const useUsb = bareReconnect ? !!this.lastTarget!.useUsb : !!req.useUsb;
     const ip = reqIp || (bareReconnect ? this.lastTarget!.ip : undefined);
+    if (useAdb && useUsb) {
+      this.state = 'error';
+      this.detail = 'useAdb (Android, adb forward) and useUsb (iOS, go-ios forward) are two different tunnels — pass one';
+      return this.status();
+    }
     // The serial the CALLER asked for, else the one this clone used last. Remembered rather than
     // re-picked, so a two-phone machine does not ask again every session — but only as a preference:
     // `resolveSerial` below downgrades a remembered-and-now-unplugged serial to "no preference"
     // instead of failing, because a phone being unplugged is not a typo (see its doc).
     const reqSerial = req.serial?.trim();
     const wantSerial = reqSerial || (req.serial === undefined ? this.lastTarget?.serial : undefined);
+    // Same preference rule for the iOS UDID (#1065).
+    const reqUdid = req.udid?.trim();
+    const wantUdid = reqUdid || (req.udid === undefined ? this.lastTarget?.udid : undefined);
     // Remember what we chose (even if the connect then fails), so the panel pre-fills it next time.
     // Keep the last typed IP across an adb connect (so toggling back to WiFi re-fills).
-    this.lastTarget = { ip: ip || this.lastTarget?.ip || '', useAdb, ...(wantSerial ? { serial: wantSerial } : {}) };
+    this.lastTarget = {
+      ip: ip || this.lastTarget?.ip || '', useAdb,
+      ...(wantSerial ? { serial: wantSerial } : {}),
+      ...(useUsb ? { useUsb: true } : {}),
+      ...(wantUdid ? { udid: wantUdid } : {}),
+    };
     saveLastTarget(this.lastTarget, this.stateDir);
     // `req.port` is the port ON THE PHONE (the #88/#95 escape hatch for an app that fell back off
     // 9095). Over adb the port we CONNECT to is this clone's derived host end of the tunnel; over
@@ -704,7 +780,92 @@ export class DeviceConnectionManager {
     let port = devicePort;
     let host: string;
     let serial: string | undefined;
-    if (useAdb) {
+    let udid: string | undefined;
+    if (useUsb) {
+      const goIos = goIosForwardRunner.resolveBinary();
+      if (!goIos) {
+        this.state = 'error';
+        this.detail = "go-ios is not installed, and iOS over USB tunnels through it. Install it from the editor's Build Support dialog (iOS Build Support → go-ios), or set MODOKI_GO_IOS.";
+        return this.status();
+      }
+      // WHICH device — from go-ios's usbmuxd list, never devicectl's (see iosUsbForward.ts).
+      let entries: UsbmuxEntry[] | null = null;
+      let listError: string | undefined;
+      try { entries = parseGoIosListDetails(await goIosForwardRunner.listDetails(goIos)); }
+      catch (e) { listError = e instanceof Error ? e.message : String(e); }
+      // Superseded while listing: a later connect/disconnect owns the manager now, and nothing has
+      // been claimed or spawned yet, so there is nothing to unwind.
+      if (generation !== this.sessionGeneration) return this.status();
+      if (!entries) {
+        this.state = 'error';
+        this.detail = `could not list iOS devices via go-ios (${listError ?? 'no device list in its output'})`;
+        return this.status();
+      }
+      const picked = pickUsbIosDevice({ entries, want: wantUdid, strict: !!reqUdid });
+      if ('error' in picked) {
+        this.state = 'error';
+        this.detail = picked.error;
+        return this.status();
+      }
+      udid = picked.udid;
+      // The same key WDA and the go-ios claim guard use for this phone.
+      const claim = claimDevice({
+        deviceId: iosDeviceId(udid),
+        guid: this.guid,
+        label: picked.label,
+        purpose: 'holding a device lease over USB (go-ios forward)',
+      });
+      if (!claim.ok) {
+        this.state = 'error';
+        this.detail = claim.message;
+        return this.status();
+      }
+      this.claimedDeviceId = iosDeviceId(udid);
+      port = resolveDeviceHostPort();
+      const forward: IosForward = startIosForward({
+        goIos, hostPort: port, devicePort, udid,
+        // Recorded the moment the child exists, so a crash while it starts still leaves the reap a record.
+        onSpawn: (pid) => recordIosForward(this.stateDir, { pid, hostPort: port, bin: goIos }),
+        // The tunnel died mid-lease (a crash, an external kill, the phone gone). Nothing restarts it, so the
+        // client's reconnect loop would spin against a dead port forever while this clone kept the phone
+        // claimed — observed by the close-out re-review. End the lease, and say why. Keyed on identity: a
+        // stop() this manager made cleared the field first, so that exit no-ops.
+        onExit: (code, signal) => {
+          if (this.iosForward !== forward) return;
+          this.iosForward = null;
+          clearIosForwardRecord(this.stateDir, forward.pid);
+          const why = `the go-ios forward exited (${code ?? signal}) mid-lease, so nothing tunnels to the device `
+            + 'any more — reconnect with device_connect {useUsb:true}';
+          const gen = this.sessionGeneration;
+          void this.disconnect().then(() => {
+            // Only if nothing moved the manager on meanwhile — disconnect() bumps the generation by exactly one.
+            if (this.sessionGeneration !== gen + 1) return;
+            this.state = 'error';
+            this.detail = why;
+          });
+        },
+      });
+      // Published BEFORE the await, so a disconnect landing while the forward starts finds it and
+      // stops it — a child held only in this local would outlive the lease it was started for.
+      this.iosForward = forward;
+      const ready = await forward.ready;
+      if (generation !== this.sessionGeneration) {
+        // The disconnect that superseded this connect already stopped the child and released the
+        // claim. `stop` is idempotent, and the manager's fields belong to the newer session now.
+        forward.stop();
+        return this.status();
+      }
+      if (!ready.ok) {
+        this.iosForward = null;
+        forward.stop();
+        clearIosForwardRecord(this.stateDir, forward.pid);
+        this.releaseClaim();
+        this.state = 'error';
+        this.detail = `go-ios forward failed: ${ready.error}`;
+        return this.status();
+      }
+      host = '127.0.0.1';
+    } else if (useAdb) {
       // WHICH phone, decided ONCE — before any adb call, so the forward and everything that later
       // reuses this lease's serial cannot disagree (#149). A refusal here names the candidates.
       const resolved = this.resolveSerial(wantSerial, !!reqSerial);
@@ -744,7 +905,7 @@ export class DeviceConnectionManager {
     } else {
       if (!ip) {
         this.state = 'error';
-        this.detail = 'no IP provided (uncheck "Use adb" and enter the device IP, or check it for USB)';
+        this.detail = 'no IP provided (enter the device IP, or connect over USB: "Use adb" for Android, "Use USB (iOS)" for an iPhone/iPad)';
         return this.status();
       }
       // A WiFi lease can only be claimed by ADDRESS — the phone reports its model over the bridge,
@@ -775,9 +936,9 @@ export class DeviceConnectionManager {
       // `connect()` resolves, so a `disconnect()` landing while `client.connect()` below is still
       // in flight must not have this stale callback write status onto the manager AFTER the
       // teardown already ran (#506).
-      onState: (s, d) => { if (generation !== this.sessionGeneration) return; this.state = s; this.detail = explainConnectFailure(d, devicePort, useAdb, debugBuild); },
+      onState: (s, d) => { if (generation !== this.sessionGeneration) return; this.state = s; this.detail = explainConnectFailure(d, devicePort, useUsb ? 'usb' : useAdb, debugBuild); },
     });
-    this.target = { host, port, useAdb, ...(serial ? { serial } : {}) };
+    this.target = { host, port, useAdb, ...(serial ? { serial } : {}), ...(useUsb ? { useUsb: true } : {}), ...(udid ? { udid } : {}) };
     let landed = await this.client.connect();
     // #283 — the app may be up and listening on a port that is NOT the default. Ask the DEVICE
     // where its bridge actually is and try once more.
@@ -900,7 +1061,13 @@ export class DeviceConnectionManager {
     // Whether the event loop really orders it that way is delicate and I did not reproduce it; the
     // guard costs one integer compare and makes the question moot, which is the right trade for a
     // failure whose blast radius is "two clones drive one phone".
-    if (landed !== 'connected' && generation === this.sessionGeneration) this.releaseClaim();
+    if (landed !== 'connected' && generation === this.sessionGeneration) {
+      // A USB lease that did not land gives back its go-ios child too (#1065) — before the claim, for
+      // the reason `disconnect()` orders them that way. Unlike an adb rule it is a live process
+      // tunnelling to the phone, and nothing else would stop it before the next connect or quit.
+      if (useUsb) this.releaseIosForwardSync();
+      this.releaseClaim();
+    }
     // The app may be alive on a FALLBACK port. Ask the phone before leaving the caller with a
     // message that guesses — this is the one cause `explainConnectFailure` cannot infer from a
     // socket outcome, and the app prints it (bug `OikQcN8V5NMH0xUr9UnK`). Done HERE rather than in
@@ -955,6 +1122,15 @@ export class DeviceConnectionManager {
     if (!this.target?.useAdb) return;
     try { adbRunner.removeForward(this.target.port, this.target.serial); }
     catch { /* forward may already be gone / adb absent — non-fatal */ }
+  }
+
+  /** The iOS twin, for the same exit path: kill this lease's go-ios forward, synchronously (#1065). */
+  releaseIosForwardSync(): void {
+    const forward = this.iosForward;
+    if (!forward) return;
+    this.iosForward = null;
+    forward.stop();
+    clearIosForwardRecord(this.stateDir, forward.pid);
   }
 
   /** Stamp what the phone says it IS onto this lease's claim (#285).
@@ -1023,6 +1199,9 @@ export class DeviceConnectionManager {
     // observe or clobber a session that arrived later.
     const client = this.client;
     const target = this.target;
+    // The USB lease's go-ios child (#1065) — captured and cleared with the other fields, before the await.
+    const iosForward = this.iosForward;
+    this.iosForward = null;
     // The CDP session is reached through a SECOND, separate adb forward (its own per-clone port),
     // and the lease used to leave both it and its socket standing — so releasing the phone left a
     // cached session and a tunnel still aimed at it (#160). Unconditional, not gated on `useAdb`:
@@ -1083,6 +1262,16 @@ export class DeviceConnectionManager {
     if (target?.useAdb) {
       try { adbRunner.removeForward(target.port, target.serial); }
       catch { /* forward may already be gone / adb absent — non-fatal */ }
+    }
+    // Same ordering for the go-ios forward (#1065): stopped after the hangup (the lease's goodbye rides
+    // the tunnel) and before the claim goes back, so a sibling that re-claims the phone never finds
+    // this clone's child still tunnelling to it.
+    if (iosForward) {
+      iosForward.stop();
+      clearIosForwardRecord(this.stateDir, iosForward.pid);
+      // Let it actually EXIT, capped. A re-target is this disconnect and then a connect, and that connect's
+      // port check would otherwise find its own predecessor still listening and refuse, naming it.
+      await waitForForwardExit(iosForward, FORWARD_EXIT_WAIT_MS);
     }
     // The actual external release, on the captured local — not `releaseClaim()`, which reads
     // `this.claimedDeviceId` (already nulled above) and would be a no-op here. Gated on OWNERSHIP,
@@ -1272,8 +1461,22 @@ export function releaseDeviceResourcesOnExit(conn: DeviceConnectionManager = dev
   // the before-quit caller passes nothing. Without it a test can only assert against process-global state.
   // Order matters only in that each step must not be able to prevent the next.
   try { conn.releaseAdbForwardSync(); } catch { /* adb gone / rule already removed */ }
+  try { conn.releaseIosForwardSync(); } catch { /* the child is already gone */ }
   try { resetDeviceCdpSession(); } catch { /* already torn down */ }
   try { releaseAllForThisProcess(); } catch { /* an unwritable claims file must never block exit */ }
+}
+
+/** Set by Electron main on the Vite child it spawns (`electron/devServer.ts`). That child runs the Vite
+ *  plugin's `configureServer` — the startup reclaim's second host — but under Electron the device lease
+ *  lives in MAIN's backend, and the child is respawned on every project open while that lease may be
+ *  live. Reclaiming from it stripped a live adb forward and killed a live go-ios forward (#1065 close-out
+ *  review): the reclaim's premise, "at startup this process holds no lease", is about the process that
+ *  OWNS the lease, and the child is not it. */
+export const VITE_UNDER_ELECTRON_ENV = 'MODOKI_VITE_UNDER_ELECTRON';
+
+/** Should THIS process run the startup device reclaim? Not Electron's Vite child — see above. */
+export function shouldReclaimDeviceStateHere(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[VITE_UNDER_ELECTRON_ENV] !== '1';
 }
 
 /** Reclaim any adb forward left on THIS clone's ports by a previous run — called once when the
@@ -1298,7 +1501,13 @@ export function releaseDeviceResourcesOnExit(conn: DeviceConnectionManager = dev
  *  holds no lease, so a rule sitting on one of our own ports can only be our own leftover. It is
  *  emphatically not a sweep of "stale-looking" rules in general: reaching across to a port we do
  *  not own is #158, and this never does. */
-export function reclaimStaleDeviceStateAtStartup(): void {
+export function reclaimStaleDeviceStateAtStartup(stateDir: string = modokiStateDir()): void {
+  // A go-ios forward (#1065) a previous run of THIS clone left holding its host port — see
+  // `reapRecordedIosForward` for why a spawned child survives the editor that spawned it.
+  try {
+    const reaped = reapRecordedIosForward(stateDir);
+    if (reaped) console.log(reaped);
+  } catch { /* never block startup over a cleanup */ }
   // Claims first — it is pure fs and cannot be blocked by a missing adb. A dead-pid claim never
   // BLOCKED anyone (every reader applies `isStale`), but it sits in `~/.modoki/device-claims.json`,
   // which CLAUDE.md tells an agent to read as the answer to "did I give the phone back" — so a
