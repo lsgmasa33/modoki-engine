@@ -116,6 +116,20 @@ describe('detectModules', () => {
     expect(used.render3d).toBe(true);
     expect(used.physics2d).toBe(false);
   });
+
+  it('a trait NAMED like a prototype key sets no flag and adds no key — the hasDocKey call site (#993, #1069)', () => {
+    // `TRAIT_TO_MODULE` is a code literal, so `TRAIT_TO_MODULE['constructor']` is the inherited
+    // FUNCTION. With the `hasDocKey` line reverted to `if (mod)`, the next line writes
+    // `used[String(fn)] = true` — a garbage key in the bag handed to the build's defines. The key SET
+    // is the observable, because no existing flag changes value.
+    const root = makeProject({
+      'main.json': { entities: [ent({ constructor: {}, toString: {}, valueOf: {}, Renderable3D: {} })] },
+    });
+    const { used } = detectModules(root);
+    expect(Object.keys(used).sort()).toEqual([...MODULE_KEYS].sort());
+    // ACCEPT, in the same scene: the real trait beside them still counts.
+    expect(MODULE_KEYS.filter((k) => used[k])).toEqual(['render3d']);
+  });
 });
 
 describe('resolveModules', () => {

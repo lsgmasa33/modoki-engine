@@ -519,14 +519,48 @@ gate, and the Windows class of bug is simply unguarded until the next manual run
 
 `npm run verify` is vitest. It cannot run XCTest and it cannot run gradle, so anything written in
 Swift or Java is structurally outside it. **`npm run test:native`** (`engine/scripts/test-native.mjs`)
-is where those suites run, on demand. Four legs today, all golden-vector parity replays:
+is where those suites run, on demand. Two kinds of leg:
 
 | leg | what runs it |
 |---|---|
 | `ios/lease-parity` | `swift test` on the standalone `capacitor-game-debug/ios/Tests` package — no deps, no simulator, seconds |
 | `android/lease-parity` | gradle on `capacitor-game-debug/android/test-harness` — plain JVM, no AGP, no Android SDK |
-| `ios/ota-core` | `swift test` on `capacitor-modoki-ota/core` (already a standalone package) |
-| `android/ota-core` | `javac` + `java` on `OtaCoreSelfTest` — a `main()` that exits non-zero, no gradle at all |
+| `ios/ota-core`, `ios/iap-core` | `swift test` on the extracted core package (the SHIPPING core, replayed against golden vectors) |
+| `android/ota-core`, `android/iap-core` | `javac` + `java` on the core's self-test `main()` — no gradle at all, only possible because both cores import nothing |
+| `ios/class/*` (#981) | `xcodebuild` per plugin package — COMPILES the plugin class; shapes in `engine/scripts/nativePluginLegs.mjs` |
+| `android/class/*` (#992) | gradle per plugin package on a synthesised project: `:capacitor-android` from the root `node_modules` + the package's `android/`, AGP at the version Capacitor's core pins, build output redirected into the temp dir — COMPILES the Java/Kotlin class against the real core, AndroidX and the vendor SDK |
+
+⚠️ **The `*/class/*` legs cannot catch a `@PluginMethod` defect**, which is what #992 was filed
+assuming they would. Capacitor indexes plugin methods by reflection at runtime, so a MISSING
+annotation and one on a PRIVATE helper both compile. That class is caught under `npm run verify`,
+for every plugin package, by `engine/tests/architecture/pluginMethodParity.test.ts`: the JS name
+the TS interface declares against the Android annotations and the iOS `pluginMethods` array, the
+three plugin names, and an `@objc func` behind every iOS entry. That last one is the iOS twin: the
+bridge dispatches by `NSSelectorFromString` + `responds(to:)`, so a method without `@objc` compiles
+too.
+
+⚠️ **Once its prerequisites are present, an `android/class/*` leg SKIPs only on a NETWORK failure**
+(offline, or a vendor SDK not yet in the Gradle cache), and FAILs on anything else. The
+prerequisites are `android/build.gradle`, gradle, the Android SDK and `@capacitor/android`, and each
+one missing is its own SKIP. The network test is ANCHORED. It needs a Gradle cause that STARTS
+with the failure (`> Could not GET '…'`, `> Could not get resource '…'` for a download that stalls
+mid-body, `> No cached version … offline mode`), the resolve step's
+own `> MODOKI-UNRESOLVED` cause naming one, or the wrapper's `java.net` exception at column 0
+(distribution not cached, offline). A looser match turned a real compile failure into a SKIP twice
+in #992's close-out. The first was a compiler error quoting `UnknownHostException`; the second was
+a javac-echoed source line that itself began with `>`, which Gradle 8.14 repeats in its summary.
+That is `networkFailureCause` in `nativePluginLegs.mjs`, unit-tested in
+`nativePluginLegCoverage.test.ts`. Treating a network failure as a FAIL would report
+a machine without network as a broken plugin. The rule keys on network-specific output lines
+(`Could not GET '…'`, `No cached version … offline mode`, `UnknownHostException`) and never on
+`Could not resolve`. That word is Gradle's headline for EVERY resolution failure, and the first run
+of these legs matched it: all eight reported SKIP, "offline", while the real cause was a broken
+resolve step (an AGP artifact-variant ambiguity). A mistyped coordinate with the network up reads
+`Could not find` and FAILs. With the network down it cannot be told apart, and `--require-all`
+catches the resulting SKIP. The first
+run on a machine downloads the AppLovin, Adjust and LiteRT-LM SDKs and the Kotlin Gradle plugin.
+`capacitor-litert-lm` pins `litertlm-android:+`, a dynamic version, so its leg compiles against
+whatever is newest that day.
 
 The lease legs were wired in #376 after both sat unrunnable — and therefore permanently
 green-looking — since they were written; the OTA legs existed only as two hand-typed recipes in

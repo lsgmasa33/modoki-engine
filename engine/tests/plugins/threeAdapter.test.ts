@@ -359,3 +359,61 @@ describe('Stage A round-trip — quantized UV source never bakes a FLOAT+normali
     expect(checked).toBe(1);
   });
 });
+
+describe('loadGlbToThreeMeshes — a prototype-named attribute SEMANTIC never reaches buildGeometry (#993, #1069)', () => {
+  // ⚠️ MEASURED 2026-09-11 (#1069): `buildGeometry`'s `hasDocKey` guard is UNREACHABLE today, so this
+  // file pins the PREMISE that makes it so, not the guard. gltf-transform keeps a primitive's
+  // attributes in a plain object, and its READER calls `setAttribute(semantic, …)` for every semantic
+  // in the file — so for `toString` it finds the inherited function as the "previous ref", calls
+  // `.dispose()` on it and throws `TypeError: prevRef.dispose is not a function`. Measured for
+  // `toString`, `constructor` AND `__proto__`. Such a GLB therefore fails LOUDLY at `io.read`, and the
+  // guard's "files the data under a stringified function" cannot happen.
+  //
+  // So a behavioural test of the guard is impossible, and a test asserting it "skips" the name would
+  // be green for the wrong reason. The day this goes RED — gltf-transform stops throwing — is the day
+  // the guard becomes live: replace this with a load that asserts only real attributes are mapped.
+  let tmpDir: string;
+  beforeAll(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-adapter-proto-')); });
+  afterAll(() => { if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true }); });
+
+  /** gltf-transform cannot even BUILD a primitive with a prototype-named semantic (the same throw, on
+   *  `setAttribute`), so write one under a SAME-LENGTH placeholder and patch the JSON chunk's bytes —
+   *  equal length keeps every chunk offset valid. `semantic` omitted = the unpatched control. */
+  async function glbWithSemantic(placeholder: string, semantic?: string): Promise<string> {
+    const doc = new Document();
+    const buf = doc.createBuffer();
+    const prim = doc.createPrimitive()
+      .setAttribute('POSITION', doc.createAccessor().setType('VEC3')
+        .setArray(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0])).setBuffer(buf))
+      .setAttribute(placeholder, doc.createAccessor().setType('VEC2')
+        .setArray(new Float32Array([7, 7, 7, 7, 7, 7])).setBuffer(buf));
+    doc.createScene().addChild(doc.createNode('N').setMesh(doc.createMesh('M').addPrimitive(prim)));
+    const bytes = Buffer.from(await new NodeIO().writeBinary(doc));
+    if (semantic) {
+      expect(semantic.length).toBe(placeholder.length);
+      const at = bytes.indexOf(`"${placeholder}"`);
+      expect(at, 'placeholder not found in the JSON chunk — the patch would be a no-op').toBeGreaterThan(0);
+      bytes.write(`"${semantic}"`, at, 'utf8');
+    }
+    const file = path.join(tmpDir, `${placeholder}-${semantic ?? 'control'}.glb`);
+    fs.writeFileSync(file, bytes);
+    return file;
+  }
+
+  it.each([
+    ['toString', '_TOSTRNG'],
+    ['constructor', '_CONSTRUCT_'],
+    ['__proto__', '_PROTO___'],
+  ])('a GLB naming a `%s` attribute is rejected by the reader, before the adapter', async (semantic, placeholder) => {
+    await expect(loadGlbToThreeMeshes(await glbWithSemantic(placeholder, semantic)))
+      .rejects.toThrow(/prevRef\.dispose is not a function/);
+  });
+
+  it('CONTROL: the same GLB unpatched loads, and its unknown custom semantic is skipped', async () => {
+    // What makes the rejections above about the NAME rather than a broken fixture.
+    const loaded = await loadGlbToThreeMeshes(await glbWithSemantic('_TOSTRNG'));
+    const mesh = loaded.meshes.find((m) => m.threeMesh.name === 'N')!;
+    expect(mesh.primitive.listSemantics()).toContain('_TOSTRNG');
+    expect(Object.keys(mesh.threeMesh.geometry.attributes)).toEqual(['position']);
+  });
+});

@@ -521,6 +521,13 @@ the fixed sites share no single greppable spelling (`loaders/primitives.ts` was 
 | `TABLE[key] \|\| fallback` | a function is **truthy** — `\|\|` never fires |
 | `const v = TABLE[key]; if (!v) return` | same: truthy, so the early return is skipped |
 
+⚠️ **`??` fails one step earlier too, on the EMPTY STRING** (#1074). `params?.bus ?? 'master'` keeps
+`''`, because `''` is not nullish either, so the fallback never runs and the empty string reaches
+whatever comes next. In `audio.setBusVolume` that was a key builder, `''[0].toUpperCase()`, which
+threw out of `dispatchUIAction`. When `''` means "unset", say so at the read
+(`raw == null || raw === '' ? undefined : raw`). When it doesn't, it is just another unknown key
+and the refusal handles it.
+
 **The fix is `hasDocKey` at the read**, never a fourth spelling:
 
 ```ts
@@ -545,7 +552,7 @@ found:
 | an asset `.meta.json` / `.particle.json` / `.shader.json` | `textureResolver`, `gpuComputeBackend`, `shaderSchema` | a function assigned into a three.js enum or a GPU uniform |
 | a **GLB node name** | `games/3d-test/runtime/config.ts` | a stringified function as the editor's display name |
 | a **font filename** segment | `loaders/fontNaming.ts` | `match.weight` is `undefined`, so the face ships with no weight |
-| a **GLB attribute semantic**, at BUILD time | `plugins/model-convert/threeAdapter.ts` | `geom.setAttribute(fn, …)` files the data under a stringified function |
+| a **GLB attribute semantic**, at BUILD time | `plugins/model-convert/threeAdapter.ts` | ⚠️ **nothing, today — unreachable** (measured, #1069): gltf-transform's reader throws `prevRef.dispose is not a function` on a prototype-named semantic before the adapter runs. The guard is kept for the day that changes; `threeAdapter.test.ts` pins the premise |
 | a **scene-JSON trait name**, at BUILD time | `plugins/detect-modules.ts` | a garbage module flag in the bag handed to the build's `define`s |
 | **scene JSON**, a game config field typed `'x' as string` (#1061) | Court's `systems.ts` — `COIN_SETS[cfg.coinSet]`, `UNIT_PX[widthUnit]` | the inherited `valueOf` is **invoked** → TypeError on every piece drawn; a panel half-width of NaN |
 

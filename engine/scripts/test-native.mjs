@@ -41,8 +41,10 @@
  *     device verification, out of scope for #376 and recorded in both test headers.
  *   - The `ios/class/*` legs (#981) COMPILE each plugin class, which nothing did before: they
  *     prove the Swift parses, resolves its imports and type-checks against the real Capacitor
- *     headers. They prove NOTHING about behaviour — no test runs — and they say nothing about the
- *     ANDROID plugin classes, which stay uncompiled by anything (see nativePluginLegs.mjs).
+ *     headers. The `android/class/*` legs (#992) do the same for the Java/Kotlin class against the
+ *     real Capacitor core, AndroidX and the vendor SDK. Both prove NOTHING about behaviour — no test
+ *     runs — and ⚠️ the Android ones cannot see a `@PluginMethod` defect at all (a missing or
+ *     misplaced annotation compiles); `pluginMethodParity.test.ts` under `npm run verify` does.
  */
 
 import fs from 'node:fs';
@@ -53,7 +55,7 @@ import { fileURLToPath } from 'node:url';
 import { PROJECT_ROOT_DIRS } from './projectRoots.mjs';
 import { loadEnginePluginModule } from './loadVendorPlugins.mjs';
 import { buildZip } from './ota/zip.mjs';
-import { PLUGIN_CLASS_LEGS, schemeFor, legLabel } from './nativePluginLegs.mjs';
+import { PLUGIN_CLASS_LEGS, schemeFor, legLabel, networkFailureCause } from './nativePluginLegs.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const pluginDir = path.join(repoRoot, 'engine', 'packages', 'capacitor-game-debug');
@@ -305,16 +307,19 @@ for (const leg of PLUGIN_CLASS_LEGS) {
   }
 }
 
-/** JAVA_HOME from the SAME resolver the editor and the CLI build use — never a fresh probe, and
- *  never `/usr/libexec/java_home -v 21`, which on this machine returns a JDK 25 path with exit 0
- *  (see print-toolchain-env.mjs). */
-function toolchainJavaHome() {
+/** The toolchain's resolved paths, from the SAME resolver the editor and the CLI build use — never a
+ *  fresh probe, and never `/usr/libexec/java_home -v 21`, which on this machine returns a JDK 25
+ *  path with exit 0 (see print-toolchain-env.mjs). `androidHome` feeds the plugin-class legs (#992):
+ *  neither ANDROID_HOME nor ANDROID_SDK_ROOT is set on the reference Mac, because the SDK lives
+ *  under the Modoki toolchain directory instead. */
+function toolchainEnv() {
   const r = spawnSync(process.execPath, [path.join(repoRoot, 'engine', 'scripts', 'print-toolchain-env.mjs'), '--json'],
     { cwd: repoRoot, encoding: 'utf8' });
-  try { return JSON.parse(r.stdout).javaHome ?? null; } catch { return null; }
+  try { return JSON.parse(r.stdout) ?? {}; } catch { return {}; }
 }
 
-const javaHome = toolchainJavaHome();
+const toolchain = toolchainEnv();
+const javaHome = toolchain.javaHome ?? null;
 if (javaHome) console.log(`[test:native] JAVA_HOME=${javaHome}`);
 else console.warn('[test:native] no provisioned JDK found — the JVM legs will use the machine default, which on a JDK 25 default fails with "Unsupported class file major version 69"');
 const javaBin = (tool) => (javaHome ? path.join(javaHome, 'bin', tool) : tool);
@@ -358,6 +363,152 @@ if (!gradle) {
 } else {
   console.log(`[test:native] gradle: ${gradle.cmd} (${gradle.from})`);
   run('android/lease-parity', gradle.cmd, ['-p', harness, 'test'], { env: javaEnv });
+}
+
+// ── Android: the plugin CLASS legs (#992) ───────────────────────────────────────────────
+/** The Android twin of `ios/class/*`: compile each plugin class against the REAL Capacitor core,
+ *  AndroidX and the plugin's vendor SDK. Before this, a plugin class was compiled only inside some
+ *  game's own native build.
+ *
+ *  ⚠️ WHAT THIS CANNOT CATCH — stated first, because the issue it closes assumed otherwise: neither
+ *  `@PluginMethod` defect #971 found. Capacitor indexes plugin methods at RUNTIME
+ *  (`PluginHandle` → `getMethods()` + the annotation), so javac accepts a MISSING annotation and one
+ *  on a PRIVATE helper alike. Those are caught under `npm run verify`, for every package, by
+ *  `engine/tests/architecture/pluginMethodParity.test.ts`. This leg catches what javac can see: API
+ *  drift against Capacitor / AndroidX / a vendor SDK, a wrong import, a type error.
+ *
+ *  Shape: one throwaway Gradle project per leg, whose settings include `:capacitor-android` (from the
+ *  root node_modules, as a game's `capacitor.settings.gradle` does) and `:plugin` (the package's own
+ *  `android/`). No `rootProject.ext` is set — every build.gradle here falls back to its own defaults
+ *  — and AGP is declared once at the root, at the version Capacitor's core pins, because two
+ *  subprojects loading AGP into separate classloaders is a Gradle error.
+ *
+ *  ⚠️ Every subproject's build directory is REDIRECTED into the temp project. At Gradle's default,
+ *  `:plugin` builds into the package's own `android/build` and `:capacitor-android` into
+ *  node_modules — which the first probe of this design did.
+ *
+ *  ⚠️ SKIP vs FAIL. A missing prerequisite — no `android/build.gradle`, gradle, Android SDK or
+ *  `@capacitor/android` — is a SKIP. After that, a failure is a SKIP ONLY when Gradle's own cause
+ *  lines name a network failure (`networkFailureCause`, nativePluginLegs.mjs), because otherwise a
+ *  laptop on a train reads as a broken plugin; every other failure is a FAIL. The dependency graph
+ *  is resolved as its own step first, so the output of a resolution failure is not mixed with
+ *  compiler output. A mistyped coordinate FAILs while the network is up ("Could not find"); offline,
+ *  it cannot be told apart and SKIPs, which `--require-all` turns back into a failure. */
+const capacitorCore = path.join(repoRoot, 'node_modules', '@capacitor', 'android', 'capacitor');
+const androidHome = toolchain.androidHome ?? null;
+
+/** A Groovy SINGLE-quoted string literal for a path. Forward slashes, because `\` is an escape in a
+ *  Groovy string and java.io.File accepts `/` on Windows; single quotes, because a double-quoted
+ *  Groovy string interpolates `$`. */
+const groovyPath = (p) => `'${p.split(path.sep).join('/').replace(/\\/g, '/').replace(/'/g, "\\'")}'`;
+
+/** Remove a temp dir without letting a failure escape. ⚠️ On Windows a Gradle or Kotlin daemon can
+ *  still hold a handle under `build/`, `.gradle` or `.kotlin` when the leg ends, and `force` only
+ *  swallows ENOENT — an EBUSY here would abort the loop before the summary prints (#992 review;
+ *  unobserved, since it cannot be driven from a Mac). A leaked temp dir is the cheaper failure. */
+function removeTempDir(dir) {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch (e) {
+    console.warn(`[test:native] could not remove ${dir} (${e.code ?? e.message}) — leaving it`);
+  }
+}
+
+/** Run gradle CAPTURING its output — the SKIP/FAIL classification reads it — while still showing it. */
+function gradleCapture(args) {
+  const sp = spawnable ? spawnable(gradle.cmd, args) : { command: gradle.cmd, args, shell: false };
+  console.log(`\n── ${gradle.cmd} ${args.join(' ')}\n`);
+  const r = spawnSync(sp.command, sp.args, {
+    cwd: repoRoot, encoding: 'utf8', shell: sp.shell, env: javaEnv, maxBuffer: 256 * 1024 * 1024,
+  });
+  const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+  process.stdout.write(out);
+  if (r.error) console.error(`[test:native] ${r.error.message}`);
+  return { code: r.error ? 1 : r.status ?? 1, out };
+}
+
+let classBuildCache = null;
+try {
+  for (const leg of PLUGIN_CLASS_LEGS) {
+    const name = `android/class/${legLabel(leg.dir)}`;
+    const androidDir = path.join(repoRoot, leg.dir, 'android');
+    // A fact about the PACKAGE first, as the iOS loop decides N/A before the toolchain gates.
+    // `nativePluginLegCoverage.test.ts` asserts every row HAS one, so this is a stale-row message.
+    if (!fs.existsSync(path.join(androidDir, 'build.gradle'))) { skip(name, `no android/build.gradle in ${leg.dir}`); continue; }
+    if (!gradle) { skip(name, 'no gradle: no project wrapper in the repo, none on PATH, MODOKI_GRADLE unset'); continue; }
+    if (!androidHome) { skip(name, 'no Android SDK: the Modoki toolchain has not provisioned one (engine/toolchain detect("android-sdk"))'); continue; }
+    if (!fs.existsSync(path.join(capacitorCore, 'build.gradle'))) { skip(name, 'no @capacitor/android in the root node_modules: run npm install'); continue; }
+    // AGP at the version Capacitor's core itself pins — read, not written here a second time.
+    const agp = /com\.android\.tools\.build:gradle:([\w.-]+)/.exec(fs.readFileSync(path.join(capacitorCore, 'build.gradle'), 'utf8'))?.[1];
+    if (!agp) {
+      results.push({ name, status: 'FAIL', reason: "could not read the AGP version from @capacitor/android's build.gradle: the synthesiser needs updating" });
+      continue;
+    }
+
+    classBuildCache ??= fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-plugin-class-cache-'));
+    const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-plugin-class-android-'));
+    try {
+      fs.writeFileSync(path.join(proj, 'settings.gradle'), [
+        '// GENERATED by engine/scripts/test-native.mjs (#992): one plugin class against the real Capacitor core.',
+        "rootProject.name = 'modoki-plugin-class'",
+        "include ':capacitor-android'",
+        `project(':capacitor-android').projectDir = new File(${groovyPath(capacitorCore)})`,
+        "include ':plugin'",
+        `project(':plugin').projectDir = new File(${groovyPath(androidDir)})`,
+        // One cache for the whole run, so a later leg can reuse Capacitor core's compile outputs.
+        `buildCache { local { directory = new File(${groovyPath(classBuildCache)}) } }`,
+        '',
+      ].join('\n'));
+      fs.writeFileSync(path.join(proj, 'build.gradle'), [
+        'buildscript {',
+        '  repositories { google(); mavenCentral() }',
+        `  dependencies { classpath 'com.android.tools.build:gradle:${agp}' }`,
+        '}',
+        'allprojects { repositories { google(); mavenCentral() } }',
+        'subprojects { sp ->',
+        "  sp.layout.buildDirectory.set(new File(rootDir, 'build/' + sp.name))",
+        // The dependency GRAPH only. ⚠️ Not `configuration.resolve()`: that selects ARTIFACT variants
+        // without the `artifactType` AGP's own tasks ask for, and fails on Capacitor core's
+        // android-classes-jar / android-lint ambiguity for every plugin (measured on the first run).
+        "  sp.tasks.register('modokiResolveCompileClasspath') {",
+        '    doLast {',
+        "      def result = sp.configurations.getByName('releaseCompileClasspath').incoming.resolutionResult",
+        '      def unresolved = result.allDependencies.findAll { it instanceof org.gradle.api.artifacts.result.UnresolvedDependencyResult }',
+        '      if (!unresolved.isEmpty()) {',
+        "        throw new GradleException('MODOKI-UNRESOLVED ' + unresolved.collect { d ->",
+        '          def msgs = []; def t = d.failure; while (t != null) { msgs << t.message; t = t.cause }',
+        "          d.requested.displayName + ': ' + msgs.join(' <- ')",
+        "        }.join(' | '))",
+        '      }',
+        '    }',
+        '  }',
+        '}',
+        '',
+      ].join('\n'));
+      // A .properties value: `\` and `:` must be escaped, or a Windows `C:\…` path is misread.
+      fs.writeFileSync(path.join(proj, 'local.properties'), `sdk.dir=${androidHome.replace(/\\/g, '\\\\').replace(/:/g, '\\:')}\n`);
+      fs.writeFileSync(path.join(proj, 'gradle.properties'), 'android.useAndroidX=true\norg.gradle.jvmargs=-Xmx2g\n');
+
+      const common = ['-p', proj, '--console=plain', '--build-cache'];
+      /** SKIP only when the output names a NETWORK failure; any other non-zero exit is a FAIL. Applied
+       *  to both steps: the resolve step walks the graph (metadata), so an artifact that is cached as
+       *  metadata but not as a file can still fail to download during the compile. */
+      const classify = (step, { code, out }) => {
+        if (code === 0) return true;
+        const cause = networkFailureCause(out);
+        if (cause) skip(name, `${step}: the network could not supply an artifact (offline, or not cached): ${cause}`);
+        else results.push({ name, status: 'FAIL', reason: `${step} failed, and not on the network: see the output above` });
+        return false;
+      };
+      if (!classify('resolving the compile classpath', gradleCapture([...common, ':plugin:modokiResolveCompileClasspath']))) continue;
+      // The javac task for a Kotlin module too: KGP wires it to run after compileReleaseKotlin.
+      if (classify('compiling', gradleCapture([...common, ':plugin:compileReleaseJavaWithJavac']))) record(name, 0);
+    } finally {
+      removeTempDir(proj);
+    }
+  }
+} finally {
+  if (classBuildCache) removeTempDir(classBuildCache);
 }
 
 // ── Android: the OTA self-test (javac + java, no gradle at all) ─────────────────────────

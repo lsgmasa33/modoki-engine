@@ -53,20 +53,39 @@ build of that target cannot resolve `import MediaPipeTasksGenAI` and fails to co
 podspec is not a "fallback" here — it is the only iOS path whose dependencies resolve. Declaring
 `"ios"` on this package without first adding the MediaPipe dependency to `Package.swift` turns a
 green `npm run verify` into a broken `cap sync ios` build on `games/llm-test`.
-⚠️ **Since #981 this is no longer only a comment** — `npm run test:native` compiles the class and
-`ios/class/capacitor-litert-lm` FAILS on every run with the exact error above. That red is
-deliberate and tracked as #991; it is left standing rather than marked expected-to-fail.
+⚠️ **Since #981 this is no longer only a comment.** `npm run test:native` compiled the class, and
+`ios/class/capacitor-litert-lm` failed with the exact error above until #991 reframed the row as
+`no-spm`: it now reports **N/A**, and its premise is asserted under `verify` (see `no-spm` below).
 
 ### Compiling the plugin CLASSES — two integration shapes (#981)
 
 Until #981 **nothing in this repo compiled a Capacitor plugin class.** `npm run verify` is vitest;
 `test:native`'s `SWIFT_LEGS`/`JAVA_LEGS` compile the extracted, dependency-free *cores*
 (`OtaCore`, `IapCore`). The `CAPPlugin` subclass Capacitor actually dispatches into was built by
-nothing — which is why both known defects of that kind were found by *reading*: `@PluginMethod` on a
-private helper in `ModokiIapPlugin.java` (#971), and a **missing** `@PluginMethod` on `products()`
-that broke every Android shelf call from that plugin's first commit.
+nothing.
 
-`npm run test:native` now carries an `ios/class/<plugin>` leg per package. Measured 2026-09-09 on
+⚠️ **The two known plugin-class defects were NOT compile errors, and no leg below catches them:**
+`@PluginMethod` on a private helper in `ModokiIapPlugin.java` (#971), and a **missing** `@PluginMethod`
+on `products()` that broke every Android shelf call from that plugin's first commit. Capacitor
+indexes methods by reflection at runtime (`PluginHandle` → `getMethods()` + the annotation), so
+javac accepts both. #992 was filed expecting a compile leg to catch them. What does is
+`engine/tests/architecture/pluginMethodParity.test.ts`, under `npm run verify`, for every discovered
+package: TS interface ↔ Android annotated public methods ↔ iOS `pluginMethods`, the three plugin
+names, any annotation that sits on nothing dispatchable, and a func behind every iOS entry that
+Objective-C can perform as exactly `name:`. The iOS side has the same blind spot: `CapacitorBridge`
+dispatches by `NSSelectorFromString(name + ":")` + `responds(to:)`, so each of these builds and then
+never answers at runtime:
+- a func without `@objc`
+- an `async` or `throws` func (Swift renames the selector to `name:completionHandler:` / `name:error:`)
+- an `@objc(other:)` func
+
+All three were measured with a compiled probe.
+
+`npm run test:native` now carries an `ios/class/<plugin>` leg AND an `android/class/<plugin>` leg
+(#992) per package. The Android one synthesises a Gradle project (Capacitor's core from the root
+`node_modules` plus the package's `android/`). Once its toolchain is present, it SKIPs only on a
+network failure named in Gradle's own cause lines. Detail:
+[verify-and-ci.md](./verify-and-ci.md) § `test:native`. The iOS legs were measured 2026-09-09 on
 the reference Mac, warm SPM cache: **4–18 s each, ~59 s for all eight, and 56 s for the entire
 gate.** Cold, each package pays its SPM fetch once (AppsFlyer, AppLovin and Adjust are real network
 artifacts); the numbers above are steady-state.
@@ -141,14 +160,16 @@ or give `Package.swift` the podspec's dependencies, and it goes red naming the r
 check now fires in front of whoever made it stale. The row's `reason` is required, printed in the
 gate summary, and enforced by `nativePluginLegCoverage.test.ts`.
 
-⚠️ **What this does NOT fix:** the platform this package actually ships on is still compiled by
-nothing. That is #992.
+The platform this package actually ships on is covered separately: `android/class/capacitor-litert-lm`
+(#992) compiles its Kotlin class. ⚠️ Its `litertlm-android:+` dependency is a dynamic version, so that
+leg compiles against whatever is newest on the day it runs.
 
-⚠️ **What a green `ios/class/*` leg does NOT prove.** It compiles: the Swift parses, resolves its
-imports and type-checks against the real Capacitor headers. **No test runs**, so it says nothing
-about behaviour — and it says nothing about the **Android** plugin classes, which are still compiled
-by nothing (#992; the blocker is `android.jar` plus the Capacitor AAR's `classes.jar` on a harness
-that is deliberately plain-JVM).
+⚠️ **What a green `*/class/*` leg does NOT prove.** It compiles: the Swift or Java/Kotlin parses,
+resolves its imports and type-checks against the real Capacitor core (and, on Android, AndroidX and
+the vendor SDK). **No test runs**, so it says nothing about behaviour, and nothing about a
+`@PluginMethod` defect (see above). The plain-JVM `test-harness` was not extended for Android: a
+plugin class needs Capacitor's core, which drags in AndroidX AARs, so only an AGP project can
+resolve it (measured in #992).
 
 ### The SceneDelegate trap — a silently dead iOS debug bridge (#368)
 
@@ -689,8 +710,9 @@ indexes it, so every call failed with `"ModokiIap.products() is not implemented 
 shelf could price nothing on Android and fired `store_products_failed` on every open. iOS carried its
 `CAPPluginMethod(name: "products")` entry all along, which is why it survived so long — the platform
 where IAP got the most use was the one that worked. `npm run verify` is vitest and compiles no Java,
-so nothing local could see it; `engine/tests/architecture/pluginMethodParity.test.ts` now holds the
-TS, Android and iOS method surfaces to the same set.
+so nothing local could see it. The `android/class/*` legs that exist now (#992) could not have seen it
+either, because a missing annotation compiles. `engine/tests/architecture/pluginMethodParity.test.ts`
+holds the TS, Android and iOS method surfaces to the same set, for every plugin package since #992.
 
 ⚠️ **#584's fix is complete for the shell only.** A sub-game's boot attempt IS counted on a reload
 (`beginBundleLoad` re-runs and its JS genuinely re-executes), so a sub-game bundle can still reach

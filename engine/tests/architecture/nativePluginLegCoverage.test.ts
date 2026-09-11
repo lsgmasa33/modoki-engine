@@ -26,7 +26,7 @@ import { fileURLToPath } from 'node:url'
 import { readScannedSource } from '@modoki/engine/testing'
 import { hasInternalGames } from '../helpers/repoLayout'
 // @ts-expect-error — .mjs script module, no type declarations by design (it is a build script).
-import { PLUGIN_CLASS_LEGS, discoverPluginPackages, legLabel, relKey, schemeFor } from '../../scripts/nativePluginLegs.mjs'
+import { PLUGIN_CLASS_LEGS, discoverPluginPackages, legLabel, networkFailureCause, relKey, schemeFor } from '../../scripts/nativePluginLegs.mjs'
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 
@@ -75,6 +75,15 @@ describe('#981 plugin-class leg coverage', () => {
     // that HAS games/ — in the snapshot the three games/* rows are absent on purpose, not stale.
     for (const leg of allLegs) {
       expect(fs.existsSync(path.join(repoRoot, leg.dir)), `${leg.dir} has a leg but no package`).toBe(true)
+    }
+  })
+
+  it('every leg has an android/ Gradle project for its android/class leg (#992)', () => {
+    // test-native.mjs runs an `android/class/*` leg for EVERY row. A package without
+    // `android/build.gradle` would SKIP there forever under a reason nobody reads, so one needs an
+    // explicit decision — an N/A shape like iOS's `no-spm` — and this is what forces it.
+    for (const leg of legs) {
+      expect(fs.existsSync(path.join(repoRoot, leg.dir, 'android', 'build.gradle')), `${leg.dir} has no android/build.gradle`).toBe(true)
     }
   })
 
@@ -164,6 +173,100 @@ describe('#981 plugin-class leg coverage', () => {
       expect(referenced.length, `no ${pkg} file references found in ${path.basename(pbx)} — the regex or the wiring changed`).toBeGreaterThan(0)
       expect([...referenced].sort(), `${leg.dir}'s flatSources and the pbxproj disagree`).toEqual([...(leg.flatSources ?? [])].sort())
     }
+  })
+
+  describe('networkFailureCause — the android/class SKIP-vs-FAIL decision (#992)', () => {
+    // Shapes are Gradle's real "What went wrong" layout. The first two lines of each FAIL case are
+    // what the first run of these legs mis-classified, and what the close-out review showed a
+    // compiler error could do.
+    const whatWentWrong = (...causes: string[]) =>
+      ['* What went wrong:', "Execution failed for task ':plugin:modokiResolveCompileClasspath'.", ...causes].join('\n')
+
+    it.each([
+      ['a dependency the network could not GET', whatWentWrong(
+        "> MODOKI-UNRESOLVED com.applovin:applovin-sdk:13.5.1: Could not resolve com.applovin:applovin-sdk:13.5.1. <- Could not GET 'https://dl.google.com/…/applovin-sdk-13.5.1.pom'.")],
+      ['offline mode with nothing cached', whatWentWrong(
+        '> MODOKI-UNRESOLVED com.adjust.sdk:adjust-android:5.0.1: No cached version of com.adjust.sdk:adjust-android:5.0.1 available for offline mode.')],
+      ['the buildscript classpath, nested causes', [
+        '* What went wrong:', "A problem occurred configuring project ':plugin'.",
+        "> Could not resolve all artifacts for configuration ':plugin:classpath'.",
+        '   > Could not resolve org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.0.',
+        "      > Could not GET 'https://repo.maven.apache.org/…'.",
+      ].join('\n')],
+      // The SHAPE of a real run (the #992 close-out review's probe, 2026-09-11): a project gradlew
+      // whose distribution is not cached dies in the WRAPPER before Gradle prints a single cause line.
+      // Only the exception line's form was captured; the host is neutralised and the two stack frames
+      // are illustrative, since nothing classifies on them.
+      ['the wrapper dying before Gradle starts', [
+        'Downloading https://services.gradle.org/distributions/gradle-8.14.3-all.zip',
+        '',
+        'Exception in thread "main" java.net.UnknownHostException: services.gradle.org',
+        '\tat java.base/sun.nio.ch.NioSocketImpl.connect(NioSocketImpl.java:567)',
+        '\tat org.gradle.wrapper.Download.downloadInternal(Download.java:129)',
+      ].join('\n')],
+      // Captured from a real Gradle 8.14.3 run against a server that sent 14 bytes of a 200 and stalled
+      // (URL neutralised). The GET SUCCEEDED, so there is no `Could not GET` line — only `get resource`.
+      ['a download that stalls mid-body, compile step', [
+        '* What went wrong:', "Execution failed for task ':plugin:compileReleaseJavaWithJavac'.",
+        "> Could not resolve all files for configuration ':plugin:releaseCompileClasspath'.",
+        '   > Could not download stall-1.0.jar (com.x:stall:1.0)',
+        "      > Could not get resource 'https://repo.example/m2/com/x/stall/1.0/stall-1.0.jar'.",
+        '         > Read timed out',
+      ].join('\n')],
+    ])('SKIP: %s', (_label, out) => {
+      expect(networkFailureCause(out)).toMatch(/Could not GET|Could not get resource|No cached version|java\.net\.UnknownHostException/)
+    })
+
+    it.each([
+      ['the generic resolution HEADLINE alone — variant ambiguity, the first run\'s false SKIP', whatWentWrong(
+        "> Could not resolve all files for configuration ':plugin:releaseCompileClasspath'.",
+        '   > The consumer was configured to find a library for use during compile-time … However we cannot choose between the following variants of project :capacitor-android:')],
+      ['a coordinate that does not exist, network up', whatWentWrong(
+        '> MODOKI-UNRESOLVED com.applovin:applovin-sdkk:13.5.1: Could not find com.applovin:applovin-sdkk:13.5.1.')],
+      ['a Kotlin compile error QUOTING a network class name', [
+        "e: file:///x/LitertLmPlugin.kt:12:5 Unresolved reference 'UnknownHostException'.",
+        '* What went wrong:', "Execution failed for task ':plugin:compileReleaseKotlin'.",
+        '> A failure occurred while executing org.jetbrains.kotlin.compilerRunner.GradleCompilerRunnerWithWorkers$GradleKotlinCompilerWorkAction',
+        '   > Compilation error. See log for more details',
+      ].join('\n')],
+      ['a javac error echoing a source line with a network phrase', [
+        'GameDebugPlugin.java:40: error: cannot find symbol',
+        '        } catch (UnknownHostException e) { call.reject("Read timed out"); }',
+        '* What went wrong:', "Execution failed for task ':plugin:compileReleaseJavaWithJavac'.",
+        '> Compilation failed; see the compiler error output for details.',
+      ].join('\n')],
+      // The layout of a real Gradle 8.14.3 run (captured 2026-09-11 in #992's close-out review), path
+      // neutralised: javac ECHOES the offending source line, Gradle repeats that echo under "What went
+      // wrong", and a wrapped comparison makes the echoed line itself begin with `>`. Narrowing to
+      // `> ` lines alone let this through as a SKIP.
+      ['a javac-echoed source line that itself begins with `>`', [
+        '> Task :plugin:compileReleaseJavaWithJavac FAILED',
+        '/work/src/main/java/Probe.java:5: error: cannot find symbol',
+        '        > MAX_RETRIES && e instanceof UnknownHostException;',
+        '                                      ^',
+        '  symbol:   class UnknownHostException',
+        '1 error',
+        '',
+        'FAILURE: Build failed with an exception.',
+        '',
+        '* What went wrong:',
+        "Execution failed for task ':plugin:compileReleaseJavaWithJavac'.",
+        '> Compilation failed; see the compiler output below.',
+        '  /work/src/main/java/Probe.java:5: error: cannot find symbol',
+        '          > MAX_RETRIES && e instanceof UnknownHostException;',
+        '                                        ^',
+        '    symbol:   class UnknownHostException',
+        '  1 error',
+        '',
+        '* Try:',
+        '> Check your code and dependencies to fix the compilation error(s)',
+      ].join('\n')],
+      ['the resolve step naming a coordinate that does not exist', whatWentWrong(
+        '> MODOKI-UNRESOLVED com.x:y:1.0: Could not find com.x:y:1.0.')],
+      ['no output at all', ''],
+    ])('FAIL: %s', (_label, out) => {
+      expect(networkFailureCause(out)).toBeNull()
+    })
   })
 
   it("the flat leg's sources really do lack the import that would make it an 'spm' package", () => {

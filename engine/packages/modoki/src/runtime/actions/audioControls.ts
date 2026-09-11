@@ -28,26 +28,41 @@ import { addStoreHook } from '../ui/storeHooks';
 import { markUIDirty } from '../ui/uiTreeStore';
 import { AudioSource } from '../traits/AudioSource';
 import { stopEntityAudio } from '../audio/audioSystem';
-import { setBusVolume, type BusName } from '../audio/audioService';
+import { setBusVolume, BUS_NAMES, type BusName } from '../audio/audioService';
 import { cueClip, cueSound } from '../audio/audioCues';
 import { setUIClickCue } from '../ui/bindings';
 import { clipRefForKey } from '../audio/clipBank';
 
-type MixBus = 'master' | 'music' | 'sfx' | 'ui';
-
 interface AudioMixState {
   audioMaster: number; audioMusic: number; audioSfx: number; audioUi: number;
   audioMasterPct: string; audioMusicPct: string; audioSfxPct: string; audioUiPct: string;
-  setBusPct: (bus: MixBus, pct: number) => void;
+  setBusPct: (bus: BusName, pct: number) => void;
 }
 
 const pctStr = (v: number) => `${Math.round(v)}%`;
-const capKey = (bus: MixBus) => `audio${bus[0].toUpperCase()}${bus.slice(1)}`; // master → audioMaster
+
+/** Each bus's two store fields. A TABLE, not `audio${Cap(bus)}` string surgery (#1074): that
+ *  derived a key from whatever string arrived, so a typo'd bus wrote fields nothing reads and `''`
+ *  threw on `''[0].toUpperCase()`. Keyed by `BusName`, so a bus added to `BUS_NAMES` fails to
+ *  compile here until it has fields — and a write can only ever name one of the eight
+ *  `useAudioMixSelector` publishes. */
+const MIX_FIELDS: Record<BusName, readonly [
+  value: 'audioMaster' | 'audioMusic' | 'audioSfx' | 'audioUi',
+  pct: 'audioMasterPct' | 'audioMusicPct' | 'audioSfxPct' | 'audioUiPct',
+]> = {
+  master: ['audioMaster', 'audioMasterPct'],
+  music: ['audioMusic', 'audioMusicPct'],
+  sfx: ['audioSfx', 'audioSfxPct'],
+  ui: ['audioUi', 'audioUiPct'],
+};
 
 export const useAudioMixStore = create<AudioMixState>((set) => ({
   audioMaster: 100, audioMusic: 100, audioSfx: 100, audioUi: 100,
   audioMasterPct: '100%', audioMusicPct: '100%', audioSfxPct: '100%', audioUiPct: '100%',
-  setBusPct: (bus, v) => set({ [capKey(bus)]: v, [`${capKey(bus)}Pct`]: pctStr(v) } as Partial<AudioMixState>),
+  setBusPct: (bus, v) => {
+    const [value, pct] = MIX_FIELDS[bus];
+    set({ [value]: v, [pct]: pctStr(v) } as Partial<AudioMixState>);
+  },
 }));
 
 // Stable Zustand selector — useShallow keeps the object referentially equal so the
@@ -80,6 +95,12 @@ const numArg = (raw: unknown): number | null => {
   const v = typeof raw === 'number' ? raw : parseFloat(String(raw));
   return Number.isFinite(v) ? v : null;
 };
+
+/** A string param where `''` means UNSET — the reading `resolveClip` already gives `key`. A bare
+ *  `params.x ?? fallback` cannot express it: `''` is not nullish, so the fallback never runs
+ *  (#1074; the empty-string form of `docs/format-versioning.md` § 4b-ter's `??` row). */
+const unsetIfEmpty = (raw: unknown): string | undefined =>
+  raw == null || raw === '' ? undefined : String(raw);
 
 /** The clip a `setClip`/`playOneShot` should act on: a `key` looked up in the
  *  target's bank (`AudioSource.clips`, a JSON-string) takes precedence; else a
@@ -136,28 +157,35 @@ export function registerAudioControls(): void {
   });
   registerUIAction('audio.setBusVolume', {
     params: {
-      bus: { type: 'enum', options: ['master', 'music', 'sfx', 'ui'], tooltip: 'Mixer bus to set.' },
+      bus: { type: 'enum', options: [...BUS_NAMES], tooltip: 'Mixer bus to set.' },
       value: { type: 'number', min: 0, max: 100, tooltip: '0..100 (from a slider). $value binds the slider value.' },
     },
     handler: ({ params, payload }) => {
-      const bus = (params?.bus as MixBus) ?? 'master';
+      const bus = unsetIfEmpty(params?.bus) ?? 'master';
       const v = numArg(params?.value ?? payload);
       if (v == null) return;
       const clamped = Math.max(0, Math.min(100, v));
-      useAudioMixStore.getState().setBusPct(bus, clamped);
-      setBusVolume(bus as BusName, clamped / 100);
+      // ⚠️ The SERVICE decides, and the store follows (#1074). This used to write the store first,
+      // so a bus `setBusVolume` refused still left fields in the store — and `''` threw inside the
+      // store's key builder before the service was ever asked. The cast is safe only because the
+      // refusal comes next; `bus` is a document string here, not the enum the picker suggests.
+      if (!setBusVolume(bus as BusName, clamped / 100)) return;
+      useAudioMixStore.getState().setBusPct(bus as BusName, clamped);
     },
   });
   registerUIAction('audio.playOneShot', {
     params: {
       key: { type: 'string', tooltip: "Bank key on the target AudioSource.clips (preferred). Falls back to `clip` if empty." },
       clip: { type: 'string', accept: ['.mp3', '.m4a', '.aac', '.wav', '.ogg', '.flac'], tooltip: 'Literal clip GUID (bank-less shorthand).' },
-      bus: { type: 'enum', options: ['master', 'music', 'sfx', 'ui'], tooltip: "Bus to play on (default: the target's bus, else sfx)." },
+      bus: { type: 'enum', options: [...BUS_NAMES], tooltip: "Bus to play on (default: the target's bus, else sfx)." },
     },
     handler: ({ target, params, payload }) => {
       const clip = resolveClip(target, params, payload);
       if (!clip) return;
-      const bus = (params?.bus as BusName) ?? (target?.get(AudioSource)?.bus as BusName) ?? 'sfx';
+      // `unsetIfEmpty`, not a bare `??` (#1074): `''` is not nullish, so it skipped the target's bus
+      // and reached `resolveBus('')`, which warned and played it on sfx. An unknown NON-empty bus
+      // still goes to `resolveBus`, which falls back with a warning — deliberately, see its comment.
+      const bus = (unsetIfEmpty(params?.bus) ?? target?.get(AudioSource)?.bus ?? 'sfx') as BusName;
       cueClip(clip, { bus });
     },
   });

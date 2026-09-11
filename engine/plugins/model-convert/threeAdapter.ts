@@ -79,9 +79,12 @@ function buildGeometry(prim: Primitive): THREE.BufferGeometry {
     if (!arr) continue;
     const itemSize = acc.getElementSize();
     // ⚠️ `hasDocKey`, NOT `if (!threeName)` (#993). `sem` is an attribute semantic read off the
-    // GLB's own primitive, and `SEMANTIC_TO_THREE` is a code-declared literal — so a model
-    // carrying an attribute named `toString` returns the inherited FUNCTION, passes this guard,
-    // and `geom.setAttribute(fn, …)` files the data under a stringified function.
+    // GLB's own primitive, and `SEMANTIC_TO_THREE` is a code-declared literal — so a semantic named
+    // `toString` would return the inherited FUNCTION and file the data under a stringified function.
+    // ⚠️ UNREACHABLE TODAY, measured (#1069): gltf-transform's own reader throws
+    // `prevRef.dispose is not a function` on any prototype-named semantic before this runs, so such
+    // a GLB fails loudly at `io.read`. Kept because it is correct the day that stops being true —
+    // `threeAdapter.test.ts` pins the premise and goes red on that day.
     if (!hasDocKey(SEMANTIC_TO_THREE, sem)) continue;
     const threeName = SEMANTIC_TO_THREE[sem];
     // Denormalize quantized integer accessors into a plain (non-normalized)

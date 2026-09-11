@@ -90,6 +90,74 @@ describe('busNode callers normalise (#993)', () => {
   it('the one caller that does NOT wrap is the one that refuses first', () => {
     // `setBusVolume` passes `bus` bare, which is only safe because it returns early on an unknown
     // bus. Asserting the refusal is what stops that call site being "the exception" by habit.
-    expect(source).toMatch(/if \(!hasDocKey\(busVolumes, bus\)\)[\s\S]{0,200}?return;/);
+    // `return false` since #1074 — the caller mirroring the volume into the mixer store reads it.
+    expect(source).toMatch(/if \(!hasDocKey\(busVolumes, bus\)\)[\s\S]{0,200}?return false;/);
+  });
+});
+
+// ── audioSystem.ts — every `@audio` journal emission that reports a bus RESOLVES it (#1069) ──────
+
+const SYSTEM_SRC = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '../../src/runtime/audio/audioSystem.ts',
+);
+
+/** The full text of every `journalAudio(` CALL, paren-balanced — `startOrSwap`'s payload spans three
+ *  lines with `bus:` on the middle one, so a line-based scan (as `busNodeCallSites` is) would read
+ *  that call as carrying no bus at all and wave it through. */
+function journalAudioCalls(code: string): string[] {
+  const out: string[] = [];
+  const re = /\bjournalAudio\(/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(code))) {
+    if (/function\s+$/.test(code.slice(Math.max(0, m.index - 16), m.index))) continue; // the declaration
+    let depth = 1;
+    let i = m.index + m[0].length;
+    for (; i < code.length && depth > 0; i++) {
+      if (code[i] === '(') depth++;
+      else if (code[i] === ')') depth--;
+    }
+    out.push(code.slice(m.index, i).replace(/\s+/g, ' '));
+  }
+  return out;
+}
+
+/** The one emission allowed to report `bus` by SHORTHAND: `playOneShot`'s `stolen`, whose `bus` is the
+ *  local declared as `resolveBus(spec.bus)` — asserted below. Matched exactly, like
+ *  `REFUSES_BEFORE_CALLING`, so an edit to it re-opens the question instead of inheriting this. */
+const SHORTHAND_OK = "journalAudio(world, 'stolen', undefined, { clip: victim.clip, bus, reason: 'voice-cap' })";
+
+describe('audioSystem journals the RESOLVED bus on every emission (#1069)', () => {
+  // The behavioural half — one case per path, each proven by reverting its call site — is in
+  // vocabWiringReaches.test.ts and audioCueRetry.test.ts. This is the POPULATION half: a fifth
+  // emission path written with a raw bus has no behavioural test yet, and this is what reds on it.
+  const source = readScannedSource(SYSTEM_SRC).code;
+  const withBus = journalAudioCalls(source).filter((c) => /[{,]\s*bus\s*[:,}]/.test(c));
+
+  it('the scan finds bus-carrying emissions at all — a vacuous pass is a failure', () => {
+    expect(withBus.length).toBeGreaterThanOrEqual(5);
+  });
+
+  it('every emission that reports a bus passes it through resolveBus()', () => {
+    const offenders = withBus.filter((c) => c !== SHORTHAND_OK && !/\bbus: resolveBus\(/.test(c));
+    expect(
+      offenders,
+      'An `@audio` journal event reports a bus that did not go through resolveBus(). The graph plays '
+      + 'an unrecognised bus on sfx, so a raw field makes the journal disagree with what was heard — '
+      + 'and the journal is what QA and agents assert on (#993 § 2d, #1069).',
+    ).toEqual([]);
+  });
+
+  it("the shorthand exception's `bus` is the resolved local", () => {
+    expect(withBus).toContain(SHORTHAND_OK);
+    expect(source).toMatch(/const bus = resolveBus\(spec\.bus\);/);
+  });
+
+  it('every emission is covered — a sixth is not silently allowed', () => {
+    expect(
+      withBus.length,
+      `audioSystem.ts gained a bus-carrying journalAudio call (${withBus.length} now). Give it a `
+      + 'behavioural case in vocabWiringReaches.test.ts, then update this number.',
+    ).toBe(5);
   });
 });

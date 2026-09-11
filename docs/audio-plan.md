@@ -228,6 +228,11 @@ trait fields controlled by built-in actions** — and every game gets it for fre
   `audioUi` (0..100) + `…Pct` label strings via `addStoreHook`, because a slider's
   `inputBinding` reads `storeState` ONLY (not read-sources). Lets sliders resolve bus
   volumes with **no per-game store**; `audio.setBusVolume` updates the store + the bus.
+  ⚠️ **The service decides, the store follows** (#1074): `setBusVolume` returns whether it
+  accepted the bus, and the handler writes the store only on `true`. It used to write the store
+  first, so a bus the service refused still left store fields nothing reads, and `bus: ''` threw
+  out of `dispatchUIAction` before the service was asked. An **empty** `bus` param means unset
+  (`setBusVolume` → `master`, `playOneShot` → the target's bus), the reading `key` already had.
 - **`games/audio-demo` is now fully declarative** — a **Music `AudioSource` entity**
   in the Hierarchy (autoplay/loop), track buttons → `audio.setClip`, transport →
   `audio.toggle`/`audio.stop`, crossfade toggle → `audio.toggleCrossfade` with a

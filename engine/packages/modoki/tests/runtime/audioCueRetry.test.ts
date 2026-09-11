@@ -150,3 +150,44 @@ describe('audioSystem — the failures that used to leave no trace at all', () =
     expect(plays()).toHaveLength(0);
   });
 });
+
+/** #1069 — the fourth `journalAudio` resolved-bus emission, the DEFERRED-cue retry. It is the one of
+ *  the four that record mode cannot reach (a cue only defers when a decoder exists), so it lives in
+ *  this file with that mock; the other three are in vocabWiringReaches.test.ts. */
+describe('audioSystem — a deferred cue journals the RESOLVED bus when it finally plays (#1069)', () => {
+  const startBus = (clip: string) =>
+    journalEvents({ type: '@audio' }, world!)
+      .map((ev) => ev.payload as { phase: string; clip?: string; bus?: string })
+      .filter((p) => p.phase === 'start' && p.clip === clip)
+      .map((p) => p.bus);
+
+  function deferThenDecode(bus: string): string {
+    const clip = mintClip();
+    world = createWorld();
+    setCurrentWorld(world);
+    clearJournal(world);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    cueClip(clip, { bus: bus as any }, world);
+    audioSystem(world);                 // not decoded → deferred; nothing journalled yet
+    expect(startBus(clip)).toEqual([]);
+    decoded.add(clip);
+    audioSystem(world);                 // the retry path plays it — the emission under test
+    return clip;
+  }
+
+  it("a typo'd bus is journalled as sfx, the bus it actually played on", () => {
+    // Reverting `resolveBus(p.cue.bus)` to `p.cue.bus` makes this read 'constructor'.
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const clip = deferThenDecode('constructor');
+      expect(startBus(clip)).toEqual(['sfx']);
+    } finally {
+      vi.restoreAllMocks(); // in `finally`: a failed assertion must not leave console.warn mocked for the rest of the file
+    }
+  });
+
+  it('ACCEPT: a real bus is journalled as itself', () => {
+    const clip = deferThenDecode('ui');
+    expect(startBus(clip)).toEqual(['ui']);
+  });
+});

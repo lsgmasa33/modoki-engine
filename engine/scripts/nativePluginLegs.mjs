@@ -11,11 +11,15 @@
  * ── WHAT THESE LEGS ADD OVER THE CORE LEGS ───────────────────────────────────────────────
  * `SWIFT_LEGS`/`JAVA_LEGS` in test-native.mjs compile the extracted, dependency-free CORES
  * (OtaCore, IapCore). They do not compile a single plugin CLASS — the `CAPPlugin` subclass that
- * Capacitor actually dispatches into. That gap is not academic: #971 found `@PluginMethod` sitting
- * on a PRIVATE helper in `ModokiIapPlugin.java` (fixed in `2d711ee05`), and the mirror-image bug —
- * a MISSING `@PluginMethod` on `products()`, which broke every Android shelf call from that
- * plugin's first commit — is recorded in that same file's comments. Both are compile/annotation
- * level defects in files no gate compiled.
+ * Capacitor actually dispatches into. Each row runs on BOTH platforms: `ios/class/*` (#981, shaped
+ * below) and `android/class/*` (#992, one synthesised Gradle project per row — test-native.mjs).
+ *
+ * ⚠️ Do not read these legs as the guard for the two `@PluginMethod` defects #971 found — a
+ * `@PluginMethod` on a PRIVATE helper in `ModokiIapPlugin.java` (fixed in `2d711ee05`), and a MISSING
+ * one on `products()` that broke every Android shelf call from that plugin's first commit. Both
+ * COMPILE: Capacitor finds plugin methods by reflection at runtime, so javac has nothing to reject.
+ * That class is caught by `engine/tests/architecture/pluginMethodParity.test.ts` under
+ * `npm run verify`, for every package this file discovers. These legs catch what a compiler sees.
  *
  * ── ⚠️ THREE INTEGRATION SHAPES, AND THE LEG MUST MATCH THE PACKAGE'S OWN ────────────────
  * The obvious design — one `xcodebuild -scheme` per package — is WRONG, and measurably so
@@ -59,6 +63,48 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { PROJECT_ROOT_DIRS } from './projectRoots.mjs';
+
+/** Network-specific failure phrases in Gradle output. ⚠️ Deliberately NOT `Could not resolve`: Gradle
+ *  prints "Could not resolve all files for configuration" as the headline of EVERY resolution failure,
+ *  variant ambiguity included, and the first run of the `android/class/*` legs matched exactly that
+ *  and reported all eight as offline while the synthesised project was broken (#992). Nor
+ *  `Could not find <coordinate>` — the repositories answered "no such artifact", so a mistyped
+ *  coordinate FAILs while the network is up. */
+export const NETWORK_FAILURE = /Could not (?:GET|HEAD) '|No cached version of .+ available for offline mode|UnknownHostException|Network is unreachable|Connection (?:refused|timed out)|Read timed out/;
+
+/** Gradle cause lines whose cause STARTS with a network failure. */
+const NETWORK_CAUSE_START = /^\s*>\s+(?:Could not (?:GET|HEAD|get resource) '|No cached version of .+ available for offline mode)/;
+/** The resolve step's own synthesised cause (test-native.mjs), which carries the whole chain on one line. */
+const RESOLVE_TASK_CAUSE = /^\s*>\s+MODOKI-UNRESOLVED /;
+/** The Gradle WRAPPER dying before Gradle starts (its distribution not cached, offline): a bare JVM
+ *  stack with no cause lines at all. */
+const WRAPPER_NETWORK = /^Exception in thread "main" java\.net\.(?:UnknownHost|Connect|NoRouteToHost|SocketTimeout)Exception\b/;
+
+/**
+ * The line that shows the network could not supply an artifact, or `null` — the one input to an
+ * `android/class/*` leg's SKIP-vs-FAIL decision, here rather than in test-native.mjs so it can be
+ * unit-tested (that file runs the gate at import time).
+ *
+ * ⚠️ Anchored to where a network cause STARTS, never to a phrase anywhere in a line. A SKIP exits 0
+ * without `--require-all`, and a loose match has turned a real compile failure into one twice (#992
+ * close-out): first a compiler error quoting `UnknownHostException` anywhere in the output, then —
+ * after narrowing to `> ` lines — a javac-echoed source line that itself began with `>` (a wrapped
+ * `> MAX_RETRIES && e instanceof UnknownHostException;`), which Gradle 8.14 repeats inside its
+ * "What went wrong" summary. So the accepted causes are:
+ *   - a cause that begins `Could not GET '` / `Could not get resource '` / `No cached version …
+ *     offline mode`. `get resource` is needed because a download that STALLS mid-body has no
+ *     `Could not GET` line at all, only `Could not get resource '…'` → `Read timed out` (captured
+ *     from a real Gradle 8.14.3 run);
+ *   - the resolve step's `MODOKI-UNRESOLVED` cause naming a network failure;
+ *   - the wrapper's own `java.net` exception at column 0.
+ */
+export function networkFailureCause(output) {
+  for (const line of String(output ?? '').split('\n')) {
+    if (NETWORK_CAUSE_START.test(line) || WRAPPER_NETWORK.test(line)
+      || (RESOLVE_TASK_CAUSE.test(line) && NETWORK_FAILURE.test(line))) return line.trim();
+  }
+  return null;
+}
 
 /** Repo-relative, forward-slashed — the key both the table and the guard compare on, so the
  *  comparison does not become a Windows path-separator question. */

@@ -602,7 +602,8 @@ classifies as NOT a cancel while `storekit.userCancelled` does — is pinned in 
 mutation-checked.
 
 What that still does **not** give you: the legs prove the CORE, not that `IapPlugin.swift` calls it
-correctly on a live purchase, and not the plugin classes themselves (nothing compiles those yet).
+correctly on a live purchase. The plugin classes themselves ARE compiled now, by `ios/class/*` (#981)
+and `android/class/*` (#992), but a compile runs nothing.
 The TS half is unit-tested (`iapFailurePaths.test.ts`, `analyticsPurchaseFunnel.test.ts`, with
 mutation checks). So the answer to run 5 is unchanged: **verifiable only on device, and only on the
 next occurrence.** A green gate still does not mean the iOS change works end-to-end.
@@ -818,11 +819,13 @@ tests a port of its spec (`engine/scripts/test-native.mjs`'s header keeps the pe
    than the mislabelled analytics event it guarded. A hand-edit of the value IS caught by the
    `android/iap-core` leg; an upstream renumbering is caught by nothing, accepted because it is a
    wire-protocol constant that has never moved.
-3. **That the plugin CLASSES compile.** These legs compile the *cores*. `IapPlugin.swift` and
-   `ModokiIapPlugin.java` are still compiled by nothing in this repo, so a missing `@PluginMethod`
-   or a Swift error in the Capacitor-facing half remains invisible — the gap that let a stray
-   `@PluginMethod` sit on a private helper until #971 read the file. Closing it needs an
-   `xcodebuild`/gradle leg, which is a materially heavier gate and a separate decision.
+3. **That the plugin CLASSES compile** — which these legs do not check, because they compile the
+   *cores*. That gap is closed by other legs: `ios/class/*` (#981) compiles `IapPlugin.swift`, and
+   `android/class/*` (#992) compiles `ModokiIapPlugin.java` against the real Capacitor core and the
+   billing library. ⚠️ **Neither would have caught the stray `@PluginMethod` on a private helper that
+   #971 found by reading**, nor the missing one on `products()`. Capacitor indexes plugin methods by
+   reflection at runtime, so both compile. That class is caught under `npm run verify` by
+   `engine/tests/architecture/pluginMethodParity.test.ts`, for every plugin package.
 
 **What the extraction surfaced immediately**, none of it reachable by any prior gate: an SPM
 platform-floor mismatch (the library defaulted to macOS 10.13 and would not build against the

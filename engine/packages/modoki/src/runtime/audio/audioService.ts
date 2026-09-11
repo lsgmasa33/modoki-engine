@@ -20,7 +20,10 @@ import { hasDocKey } from '../core/docKeys';
 import { warnVocabOnce } from '../core/warnVocab';
 function retryFailedAudioDecodes() { audioAssetProvider.get()?.retryFailedAudioDecodes(); }
 
-export type BusName = 'master' | 'music' | 'sfx' | 'ui';
+/** The mixer's buses — the ONE list. Enum pickers spread it rather than typing the four names out
+ *  again beside the table they must agree with (#1074; `docs/format-versioning.md` § 4b-ter). */
+export const BUS_NAMES = ['master', 'music', 'sfx', 'ui'] as const;
+export type BusName = typeof BUS_NAMES[number];
 
 export interface AudioPlaySpec {
   /** Decoded buffer (loadType 'buffer'). Mutually exclusive with `url`. */
@@ -341,11 +344,15 @@ export function resume(): void {
   for (const h of active) h.resumeMedia();
 }
 
-export function setBusVolume(bus: BusName, volume: number): void {
+/** Set a bus's volume. Returns whether the bus was ACCEPTED — `false` means nothing was written,
+ *  and a caller mirroring the volume anywhere else (the `audio.setBusVolume` action's mixer store)
+ *  must take this answer rather than re-deciding it: a second copy of the rule is how the store
+ *  and the mixer came to disagree (#1074). */
+export function setBusVolume(bus: BusName, volume: number): boolean {
   // ⚠️ REFUSE an unknown bus, and do it before the write. This line is #986's WRITE half and
   // `busNode` below is #993's read half, and both arrive on the same agent action
-  // (`actions/audioControls.ts` does `params?.bus ?? 'master'`, and `??` never fires for a
-  // prototype name). `bus: "__proto__"` hits `Object.prototype`'s setter, so the value is lost
+  // (`actions/audioControls.ts`, whose `bus` param is an unchecked document string — and whose
+  // store write used to run BEFORE this refusal, #1074). `bus: "__proto__"` hits `Object.prototype`'s setter, so the value is lost
   // silently with no own key created; `bus: "constructor"` then made `busNode(…).gain.value`
   // throw. One rejection covers both, and keeps a refused op out of the record log.
   //
@@ -355,12 +362,13 @@ export function setBusVolume(bus: BusName, volume: number): void {
   // saying so.
   if (!hasDocKey(busVolumes, bus)) {
     warnVocabOnce('audio', 'setBusVolume bus', bus, 'ignored (no such bus)');
-    return;
+    return false;
   }
   busVolumes[bus] = volume;
-  if (recording()) { log.push({ op: 'setBusVolume', bus, volume }); return; }
+  if (recording()) { log.push({ op: 'setBusVolume', bus, volume }); return true; }
   const g = graphOrNull();
   if (g) busNode(g, bus).gain.value = volume;
+  return true;
 }
 
 // ── Mix helper (crossfade) ────────────────────────────────────────
