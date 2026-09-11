@@ -245,6 +245,79 @@ function toUnderPrefix(u, root) {
   );
 }
 
+/**
+ * The GITIGNORED corpus — the one question `repoFiles()` structurally cannot answer.
+ *
+ * `repoFiles()` enumerates with `--exclude-standard`, so a gitignored path is invisible to it by
+ * construction. That is right for every "scan the source" guard, and exactly wrong for a guard
+ * asking *"is a build artifact of this shape sitting in the tree?"* — #1050, where five SwiftPM
+ * caches (731 MB, 9,609 files) were packaged into a signed app precisely because nothing ever
+ * enumerated the set that `.gitignore` names.
+ *
+ * Lives here rather than in the caller for the reason the whole module exists: this is the ONE
+ * sanctioned place that shells out to git, so a second producer hand-rolling `git ls-files` (or a
+ * `readdirSync` walker, which cannot consult `.gitignore` at all) is the drift
+ * `corpusProducerIsShared.test.ts` exists to catch.
+ *
+ * ⚠️ `--directory` COLLAPSES a wholly-ignored directory to the directory itself, so this returns
+ * `engine/packages/x/.build` — not its 2,592 files. That is what makes it cheap (~30 rows against
+ * ~18,000), and it is the right shape for an existence question, but it means a caller must match
+ * BOTH `<dir>` and `<dir>/**` if it globs. Trailing slashes are stripped so `rel` is uniform with
+ * `repoFiles()`. A file ignored individually inside a tracked directory is still listed in full.
+ *
+ * @param {{ under?: string | string[], exclude?: string[], floor: number }} options
+ *   `exclude` drops any path with a matching path SEGMENT, as in `repoFiles`.
+ * @returns {Array<{ rel: string, abs: string }>} sorted, git's own POSIX paths
+ */
+export function repoIgnoredFiles(options) {
+  const { under, exclude, floor } = options ?? {};
+  if (typeof floor !== 'number') {
+    throw new Error('repoCorpus.repoIgnoredFiles: `floor` is required (pass the minimum expected count).');
+  }
+  const root = repoRoot();
+
+  // `-z` for the same reason rawRepoFiles uses it: without it git C-quotes any non-ASCII path,
+  // and every downstream comparison against a real filename then fails silently.
+  let listed;
+  try {
+    listed = execFileSync(
+      'git',
+      ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'],
+      { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 },
+    ).split('\0').filter(Boolean);
+  } catch (e) {
+    // A throw is a different failure from "git ran and listed nothing", and an empty-result
+    // check cannot catch it — same split as rawRepoFiles.
+    throw new Error(`repoCorpus.repoIgnoredFiles: git failed in ${root}: ${e.message}`, { cause: e });
+  }
+
+  let result = listed.map((rel) => rel.replace(/\/$/, ''));
+
+  if (under != null) {
+    const underList = (Array.isArray(under) ? under : [under]).map((u) => toUnderPrefix(u, root));
+    result = result.filter((rel) => {
+      const relLower = rel.toLowerCase();
+      return underList.some((u) => u === '' || relLower === u || relLower.startsWith(`${u}/`));
+    });
+  }
+
+  if (exclude != null) {
+    const excludeSet = new Set(exclude);
+    result = result.filter((rel) => !rel.split('/').some((seg) => excludeSet.has(seg)));
+  }
+
+  if (result.length < floor) {
+    throw new Error(
+      `repoCorpus.repoIgnoredFiles: matched ${result.length} path(s), below the required floor of `
+      + `${floor} (${listed.length} ignored path(s) enumerated before filtering).`,
+    );
+  }
+
+  return result
+    .map((rel) => ({ rel, abs: path.join(root, rel) }))
+    .sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+}
+
 export function repoFiles(options) {
   const { under, match, exclude, floor, includeUntracked = true } = options ?? {};
   if (typeof floor !== 'number') {

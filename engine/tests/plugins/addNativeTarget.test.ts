@@ -509,6 +509,51 @@ describe('scaffoldNativeTarget repair (#581)', () => {
     expect(fs.existsSync(plist)).toBe(true);
     expect(fs.existsSync(pbxproj)).toBe(true); // nothing touched
   });
+
+  // #1051 — the app's privacy manifest is hand-written and `cap add` cannot regenerate it, so it is a
+  // survivor exactly like the Firebase config: a regenerated ios/ would build fine and ship without it.
+  it('force:true refuses when the iOS privacy manifest is present, and deletes nothing (#1051)', async () => {
+    writePkg();
+    const cfg = mergeProjectConfig({ app: { appId: 'com.x.y', appName: 'My Game', iconSource: '' } });
+    const pbxproj = path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+    fs.mkdirSync(path.dirname(pbxproj), { recursive: true });
+    fs.writeFileSync(pbxproj, '// stub');
+    fs.writeFileSync(path.join(root, 'ios', 'debug.xcconfig'), '// stub');
+    const manifest = path.join(root, 'ios', 'App', 'App', 'PrivacyInfo.xcprivacy');
+    fs.mkdirSync(path.dirname(manifest), { recursive: true });
+    fs.writeFileSync(manifest, 'a hand-written declaration to Apple — must survive even under --force');
+    expect(isNativeTargetScaffolded(root, 'ios')).toBe(true);
+
+    const runShell = async () => true; // must never be reached
+    await expect(scaffoldNativeTarget({
+      projectRoot: root, platform: 'ios', buildCwd: editorRoot, cfg, send: () => {}, runShell, force: true,
+    })).rejects.toThrow(/PrivacyInfo\.xcprivacy/);
+    expect(fs.existsSync(manifest)).toBe(true);
+    expect(fs.existsSync(pbxproj)).toBe(true); // nothing touched
+  });
+
+  // #1051 close-out review: Court and Weaveling carry BOTH iOS survivors. Naming only the first
+  // meant move one file, rerun, and get refused again for the second.
+  it('names every survivor in one refusal when several are present', async () => {
+    writePkg();
+    const cfg = mergeProjectConfig({ app: { appId: 'com.x.y', appName: 'My Game', iconSource: '' } });
+    const pbxproj = path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+    fs.mkdirSync(path.dirname(pbxproj), { recursive: true });
+    fs.writeFileSync(pbxproj, '// stub');
+    fs.writeFileSync(path.join(root, 'ios', 'debug.xcconfig'), '// stub');
+    const appDir = path.join(root, 'ios', 'App', 'App');
+    fs.mkdirSync(appDir, { recursive: true });
+    fs.writeFileSync(path.join(appDir, 'GoogleService-Info.plist'), 'firebase');
+    fs.writeFileSync(path.join(appDir, 'PrivacyInfo.xcprivacy'), 'manifest');
+
+    const runShell = async () => true; // must never be reached
+    const error = await scaffoldNativeTarget({
+      projectRoot: root, platform: 'ios', buildCwd: editorRoot, cfg, send: () => {}, runShell, force: true,
+    }).then(() => null, (e: Error) => e);
+    expect(error?.message).toMatch(/GoogleService-Info\.plist/);
+    expect(error?.message).toMatch(/PrivacyInfo\.xcprivacy/);
+    expect(error?.message).toMatch(/those files/);
+  });
 });
 
 describe('detectMissingFirebase', () => {

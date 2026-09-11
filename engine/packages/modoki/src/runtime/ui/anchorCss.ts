@@ -14,6 +14,7 @@ import type { CSSProperties } from 'react';
 // modes stretch — that membership now decides offset semantics, not just pivot.
 import { STRETCH_X, STRETCH_Y, type AnchorData } from './anchorLayout';
 import { isElementMarginInert } from './uiAuthoring';
+import { hasDocKey } from '../core/docKeys';
 
 /** Compose a UIElement's tilt AND scale onto whatever transform the anchor already wrote
  *  (#234 tilt, #340 scale).
@@ -121,12 +122,18 @@ export function applyAnchorStyle(style: CSSProperties, a: AnchorData): void {
   const VP_VARS: Record<string, string> = { vw: '--ui-vw', vh: '--ui-vh', vmin: '--ui-vmin', vmax: '--ui-vmax' };
   const term = (v: number, unit: string): string =>
     unit === '%' ? `${v}%`
-      : VP_VARS[unit] ? `${v} * var(${VP_VARS[unit]}, 1${unit})`
+      // ⚠️ `hasDocKey`, NOT truthiness (#993). `topUnit`/`leftUnit`/… are declared `string` in
+      // anchorLayout.ts (the trait's `UILengthUnit` is a cast on a default), so `topUnit:
+      // "constructor"` made this emit `calc(12 * var(function Object() …))`, which the browser
+      // drops — the element sits unoffset instead of falling back to px. Its twin
+      // `anchorLayout.resolveVal` uses a `switch`, so the two paths `uiAnchorParity.test.ts`
+      // exists to keep in lockstep had silently diverged.
+      : hasDocKey(VP_VARS, unit) ? `${v} * var(${VP_VARS[unit]}, 1${unit})`
       : `${v}px`;
   // A bare length (used when there's no base to fold into): a viewport term must be
   // wrapped in calc(); px collapses to the raw number; % stays a string.
   const bare = (v: number, unit: string): string | number =>
-    unit === '%' ? `${v}%` : VP_VARS[unit] ? `calc(${term(v, unit)})` : v;
+    unit === '%' ? `${v}%` : hasDocKey(VP_VARS, unit) ? `calc(${term(v, unit)})` : v;
   const fmtAdd = (base: string | number | undefined, v: number, unit: string): string | number => {
     if (!v) return base ?? 0;
     return base ? `calc(${base}${typeof base === 'number' ? 'px' : ''} + ${term(v, unit)})` : bare(v, unit);

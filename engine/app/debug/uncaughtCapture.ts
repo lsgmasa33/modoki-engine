@@ -56,6 +56,7 @@
  */
 
 import { recordConsoleRingEntry } from '@modoki/engine/runtime/core/consoleRing';
+import { errorText } from '@modoki/engine/runtime/core/errorText';
 
 /** Prefixes the synthetic ring entries below, and doubles as the bundle-leak marker
  *  `smoke-debug-build-flag.mjs` greps for — this module rides `installConsoleRing.ts`'s side-effect
@@ -155,14 +156,15 @@ export function installUncaughtCapture(): void {
   window.addEventListener('error', (e) => {
     try {
       const where = e.filename ? ` (${e.filename}:${e.lineno}:${e.colno})` : '';
-      const msg = e.error instanceof Error ? (e.error.stack || e.error.message) : String(e.message);
+      // `errorText`, not `stack || message`: an iOS stack carries no message line (#1055).
+      const msg = e.error instanceof Error ? errorText(e.error) : String(e.message);
       recordConsoleRingEntry('error', [`${CONSOLE_CAPTURE_MARKER} [uncaught] ${msg}${where}`]);
     } catch { /* ignore — a capture failure must never amplify the error it is reporting */ }
   });
   window.addEventListener('unhandledrejection', (e) => {
     try {
       const r = (e as PromiseRejectionEvent).reason;
-      const msg = r instanceof Error ? (r.stack || r.message) : String(r);
+      const msg = r instanceof Error ? errorText(r) : String(r);
       recordConsoleRingEntry('error', [`${CONSOLE_CAPTURE_MARKER} [unhandledrejection] ${msg}`]);
     } catch { /* ignore */ }
   });

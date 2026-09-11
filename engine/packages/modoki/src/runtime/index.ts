@@ -667,6 +667,7 @@ export { stepSimulation, type StepOptions } from './core/stepSimulation';
 export { seedRng, rngNext, rngFloat, rngInt, rngBool, rngPick } from './core/rng';
 export {
   emit, entityRef, journalEvents, drainJournal, clearJournal, setJournalTick, journalTick, setJournalEnabled,
+  JOURNAL_LEVELS, isJournalLevel,
   resolveRefName, setVerboseCapture, verboseCaptureState, isVerboseType,
   isJournalEnabled,
   type GameEvent, type JournalLevel,

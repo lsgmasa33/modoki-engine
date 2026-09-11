@@ -39,7 +39,7 @@ import { getPlayState } from '../core/playState';
 import { isTimelinePreviewActive } from '../core/timelinePreview';
 import { onWorldSwap } from '../core/ecs/world';
 import {
-  play, updateListener, crossfade, type AudioHandle, type AudioPlaySpec, type BusName,
+  play, updateListener, crossfade, resolveBus, type AudioHandle, type AudioPlaySpec, type BusName,
 } from './audioService';
 import { drainAudioCues, clearAudioCues, type AudioCue } from './audioCues';
 import { audioAssetProvider } from './audioAssetProvider';
@@ -459,7 +459,8 @@ function startOrSwap(world: World, state: AudioState, entity: Entity, a: TraitVa
   state.sources.set(entity.id(), { handle: next, clip, paused: false });
   a.playing = true;
   journalAudio(world, prev ? 'swap' : 'start', entity, {
-    clip, bus: a.bus, loop: a.loop, spatial: a.spatial,
+    // ⚠️ RESOLVED, like the record log — see audioService.play (#993 close-out § 2d).
+    clip, bus: resolveBus(a.bus), loop: a.loop, spatial: a.spatial,
     ...(cross ? { crossfadeSec } : {}),
   });
 }
@@ -473,7 +474,12 @@ function startOrSwap(world: World, state: AudioState, entity: Entity, a: TraitVa
 function playOneShot(
   world: World, state: AudioState, spec: AudioPlaySpec, limit: number, stealFadeSec: number,
 ): void {
-  const bus = spec.bus ?? 'sfx';
+  // ⚠️ `resolveBus`, NOT `?? 'sfx'` (#993 close-out § 2d). Once an unrecognised bus falls back
+  // to `sfx` at the graph, deciding the cap from the raw field makes TWO readers of one field
+  // disagree — structurally the same defect this change closed for the CPU/GPU particle backends.
+  // Concretely: N entities authored `bus: "Sfx"` all play on the sfx bus while none is counted
+  // against `sfxVoiceLimit`, so nothing ever steals.
+  const bus = resolveBus(spec.bus);
   if (bus !== 'sfx' || limit <= 0) { play(spec); return; }
   // Oldest first: insertion order is age order, so the victim is always at the head.
   while (state.oneShots.length >= limit) {
@@ -526,7 +532,7 @@ function playCues(world: World, state: AudioState, cues: AudioCue[]): void {
       const spec = resolveSpec(p.cue.clip ?? '', { bus: p.cue.bus, volume: p.cue.volume, pitch: p.cue.pitch });
       if (spec) {
         playOneShot(world, state, spec, limit, stealFadeSec);
-        journalAudio(world, 'start', undefined, { clip: p.cue.clip, bus: p.cue.bus });
+        journalAudio(world, 'start', undefined, { clip: p.cue.clip, bus: resolveBus(p.cue.bus) });
         continue;
       }
       if (--p.frames > 0) { still.push(p); continue; }
@@ -541,7 +547,7 @@ function playCues(world: World, state: AudioState, cues: AudioCue[]): void {
       const spec = resolveSpec(cue.clip, { bus: cue.bus, volume: cue.volume, pitch: cue.pitch });
       if (spec) {
         playOneShot(world, state, spec, limit, stealFadeSec);
-        journalAudio(world, 'start', undefined, { clip: cue.clip, bus: cue.bus });
+        journalAudio(world, 'start', undefined, { clip: cue.clip, bus: resolveBus(cue.bus) });
         continue;
       }
       // Buffer clip not decoded yet (iOS: decode lands only after the first-gesture resume) → defer
@@ -576,7 +582,7 @@ function playCues(world: World, state: AudioState, cues: AudioCue[]): void {
         // against the cap like any other. What is exempt is a source's OWN declarative
         // playback via `startOrSwap`, which the cap never touches.
         playOneShot(world, state, spec, limit, stealFadeSec);
-        journalAudio(world, 'start', entity, { clip: a.clip, bus: cue.bus ?? a.bus, spatial: a.spatial });
+        journalAudio(world, 'start', entity, { clip: a.clip, bus: resolveBus(cue.bus ?? a.bus), spatial: a.spatial });
       }
     });
   }

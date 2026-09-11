@@ -25,6 +25,7 @@ import { isGuid } from '../core/assetRefRules';
 import { getGuidForPath, resolveRef } from './assetManifest';
 import { emitAssetInvalidated } from '../core/assetInvalidation';
 import { notifyListeners } from '../core/notifyListeners';
+import { errorText } from '../core/errorText';
 
 const programs = new Map<string, PixiShaderProgram>(); // guid → resolved program
 const loading = new Map<string, Promise<void>>();      // guid → in-flight compile
@@ -101,7 +102,7 @@ export function ensureSpriteMaterial(guid: string, onReady?: () => void): PixiSh
       else failed.add(guid); // missing body / wrong space / reserved-name — buildPixiShaderProgram warned
     })
     .catch((e) => {
-      console.warn(`[spriteMaterialCache] failed to build 2D material ${guid}: ${e instanceof Error ? e.stack || e.message : String(e)}`);
+      console.warn(`[spriteMaterialCache] failed to build 2D material ${guid}: ${e instanceof Error ? errorText(e) : String(e)}`);
       if (!stillLive()) return; // superseded — see .then above
       loading.delete(guid); waiters.delete(guid);
       failed.add(guid);

@@ -125,15 +125,27 @@ export interface StashedFault {
  * flattening them into one shape would lose information rather than simplify. A window-1 fault is
  * raw fields, because `engine/index.html` cannot format — `globalErrors.ts` owns the wording via
  * `describe()`. A window-3 report has ALREADY been through `captureToCrashlytics`, so it is final
- * text that must not be re-prefixed, and it carries a `CaptureKind` (`warn` and `breadcrumb` are
- * both reachable there) that `StashedFault.kind` cannot express.
+ * text that must not be re-prefixed, and it carries a `CaptureKind` (`caught`, `warn` and
+ * `breadcrumb` are all reachable there) that `StashedFault.kind` cannot express.
  *
  * They still share ONE cap and ONE drop count — see {@link REPLAY_ENTRY_CAP}. Separate arrays,
  * single pool: that is the invariant, not "a single array".
  */
 export interface StashedReport {
-  kind: 'error' | 'warn' | 'breadcrumb';
+  kind: 'error' | 'caught' | 'warn' | 'breadcrumb';
   text: string;
+}
+
+/** Report priority, lower kept first. ONE definition for both places that rank reports:
+ *  `globalErrors.ts`'s boot-queue admission and this file's stash selection. Two hand-kept copies
+ *  could disagree about what survives, which is the "kept the benign warns and dropped the crash"
+ *  bug moved from one layer to the other.
+ *
+ *  An `error` (an uncaught fault, a `console.error`) outranks a `caught` failure (`journalError`,
+ *  #1056), which outranks a `warn`, which outranks a `breadcrumb`. `caught` sits below `error`
+ *  because a game that caught something kept running, and a boot that died did not. */
+export function reportKindRank(kind: StashedReport['kind']): number {
+  return kind === 'error' ? 0 : kind === 'caught' ? 1 : kind === 'warn' ? 2 : 3;
 }
 
 export interface BootStashEnvelope {
@@ -277,8 +289,8 @@ export function readAndClearBootStash(): BootStashEnvelope | null {
  *    deliver, so the bug silently un-did the fix while every test stayed green.
  *  - **Tail slice** inverts it: a fatal throw followed by six cascade errors drops the root cause.
  *
- * So the pool is filled by KIND first — `error` (uncaught faults and `console.error`) outranks
- * `warn`, which outranks `breadcrumb` — and within a kind by original order, keeping the EARLIEST.
+ * So the pool is filled by KIND first ({@link reportKindRank}: `error`, then `caught`, then `warn`,
+ * then `breadcrumb`) and within a kind by original order, keeping the EARLIEST.
  * Earliest-within-errors is deliberate and matches `engine/index.html`'s `consider()`, which picks
  * the first stacked error because a later one is usually a cascade symptom of it (#823).
  *
@@ -286,12 +298,11 @@ export function readAndClearBootStash(): BootStashEnvelope | null {
  * log noise, however much of it a boot emitted first.**
  */
 function selectReportsForStash(reports: readonly StashedReport[]): StashedReport[] {
-  const rank = (k: StashedReport['kind']): number => (k === 'error' ? 0 : k === 'warn' ? 1 : 2);
   return reports
     .map((r, i) => ({ r, i }))
     // Stable by construction: ties on kind fall back to the original index, so "earliest wins"
     // holds within each kind rather than depending on the sort being stable.
-    .sort((a, b) => rank(a.r.kind) - rank(b.r.kind) || a.i - b.i)
+    .sort((a, b) => reportKindRank(a.r.kind) - reportKindRank(b.r.kind) || a.i - b.i)
     .slice(0, REPLAY_ENTRY_CAP)
     // Back into chronological order — a replay should read as the boot happened, not as the
     // priority order that decided what survived.

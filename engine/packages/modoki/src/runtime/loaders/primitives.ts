@@ -28,8 +28,14 @@ export function isPrimitive(meshName: string): boolean {
  *  is expected to replace immediately — useful when an override material is
  *  already known so we avoid alloc+dispose churn. */
 export function createPrimitiveMesh(meshName: string, size: number, color: number, skipDefaultMaterial = false): THREE.Mesh | null {
+  // ⚠️ Ask `isPrimitive` (#993) — do NOT re-check this table a second way. `meshName` is
+  // `Renderable.mesh` from scene JSON, and `PRIMITIVES` is a code-declared literal, so
+  // `PRIMITIVES['toString']` is the inherited FUNCTION: truthy, so `if (!factory)` passes, and
+  // `Object.prototype.toString(size)` then hands its STRING to `new THREE.Mesh()` as geometry.
+  // `isPrimitive` three lines above already had this right; two functions over one table
+  // disagreeing is how the hole survived.
+  if (!isPrimitive(meshName)) return null;
   const factory = PRIMITIVES[meshName];
-  if (!factory) return null;
   const geo = factory(size);
   // We always need *some* material for THREE.Mesh; use a shared sentinel when
   // caller will overwrite it. The sentinel must never be disposed.

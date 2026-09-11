@@ -13,7 +13,7 @@ import { makeDeviceEvalApi } from './deviceEvalApi';
 import { describeElement } from './domResolve';
 import { Capacitor } from '@capacitor/core';
 import { App as CapacitorApp } from '@capacitor/app';
-import { setJournalEnabled, getFrameLoopHealth } from '@modoki/engine/runtime';
+import { setJournalEnabled, getFrameLoopHealth, hasDocKey } from '@modoki/engine/runtime';
 import { createSupersessionToken, createTeardownToken } from '@modoki/engine/runtime/core/liveness';
 import { consoleRing, installDeviceConsoleCapture, unpatchedLog } from './deviceConsoleCapture';
 import { getConsoleRingDropped } from '@modoki/engine/runtime/core/consoleRing';
@@ -946,7 +946,11 @@ export async function handlePointer(params: Record<string, unknown>): Promise<st
   // 'down' picks the button (default left); 'move'/'up' MUST reuse the one already held — the
   // event has to say which button is down, and there is no way to change it mid-gesture.
   const buttonName = action === 'down' ? ((params.button as string) ?? 'left') : POINTER_BUTTON_NAME[heldPointer!.button];
-  const button = POINTER_BUTTON_CODE[buttonName] ?? 0;
+  // ⚠️ `hasDocKey`, NOT `?? 0` (#993). `buttonName` can be `params.button` straight off an
+  // MCP/agent payload and `POINTER_BUTTON_CODE` is a code-declared literal, so `button:"toString"`
+  // returns the inherited FUNCTION — not nullish, so `?? 0` never fires — and a function reaches
+  // the synthesized PointerEvent.
+  const button = hasDocKey(POINTER_BUTTON_CODE, buttonName) ? POINTER_BUTTON_CODE[buttonName] : 0;
 
   // The canvas is picked ONCE, at `down`, and reused for every move/up of that gesture (#93).
   // Re-picking per call would let a drag that crosses onto another canvas switch mid-gesture and

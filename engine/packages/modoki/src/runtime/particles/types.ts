@@ -138,8 +138,18 @@ export interface ForceField {
   strength: number;
 }
 
-/** Collider geometry particles can interact with. */
-export type ColliderShape = 'plane' | 'sphere' | 'box' | 'cylinder';
+/** Collider geometry particles can interact with.
+ *
+ *  ⚠️ THE ONE LIST (#993). The Inspector's Shape picker derives its options from this tuple
+ *  and the GPU backend's numeric table is typed `Record<ColliderShape, number>`, so a shape added
+ *  here fails to compile until it has a code — rather than a hand-listed picker and a separate
+ *  table drifting apart on the first shape anybody adds. */
+export const COLLIDER_SHAPES = ['plane', 'sphere', 'box', 'cylinder'] as const;
+export type ColliderShape = typeof COLLIDER_SHAPES[number];
+
+/** What a collider DOES on contact. The one list, for the same reason as `COLLIDER_SHAPES`. */
+export const COLLISION_MODES = ['none', 'kill', 'bounce'] as const;
+export type CollisionMode = typeof COLLISION_MODES[number];
 
 /**
  * A solid collider particles interact with (kill on contact or bounce off). Three shapes:
@@ -159,7 +169,7 @@ export type ColliderShape = 'plane' | 'sphere' | 'box' | 'cylinder';
  * or GPU.
  */
 export interface CollisionConfig {
-  mode: 'none' | 'kill' | 'bounce';
+  mode: CollisionMode;
   /** velocity retained on bounce (0..1) */
   bounce: number;
   /** collider geometry (default `'plane'`) */

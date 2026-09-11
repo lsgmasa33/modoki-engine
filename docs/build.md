@@ -1760,6 +1760,79 @@ exercises the asset pipeline**: `games/anim-bug` has no rigged model, so it buil
 or without the `--configLoader runner` that was wrongly declared good on it; `demos/forest-camp` is
 the distinguishing fixture.
 
+### `files` ships the WORKING TREE, not the repo (#1050)
+
+`files: engine/**/*` packages every **gitignored** artifact under `engine/` unless a `!` glob says
+otherwise. Measured 2026-09-11: `engine/` held **2,802 tracked files and 20,770 on disk**, and the
+delta shipped. Five SwiftPM caches alone were **731 MB / 9,609 files** — `codesign` was still walking
+`capacitor-modoki-ota/core/.build/debug/index/store/v5/records/…` **58 minutes** into a local
+`dist:mac`, producing a 1.8 GB app against CI's 881 MB. It never reached a user (releases are cut on a
+clean runner with no such caches), but it cost every developer who packaged locally, and a Swift index
+database inside a signed, notarized bundle is content nobody intended to ship.
+
+**This is the third list in [#885's class](verify-and-ci.md) — "N hand-maintained ignore lists must
+agree, and nothing makes them".** #885 reconciled `.gitignore` with ESLint's `ignores`; `files` was
+never enumerated, and #1050 is the eighth instance it predicted.
+
+⚠️ **`files` cannot be DERIVED from `.gitignore` the way ESLint's `ignores` was.**
+`engine/electron/dist/`, `engine/packages/*/dist/`, `engine/tools/*/dist/`, `node_modules/` and
+`engine/vite.config.cjs` are all gitignored and all **required at runtime** — the packaged editor
+spawns `engine/tools/modoki-mcp/dist/index.js` directly, and #326 turns on `vite.config.cjs` being
+present. "Gitignored" carries no packaging verdict at all. So the rule enforced by
+`engine/tests/electron/packagingManifest.test.ts` is **exhaustive classification**: every `.gitignore`
+pattern that can match under a shipped root carries a row saying `ship`, `exclude` or `absent`, with
+its reason. A pattern with no row is a RED, which turns the ninth instance into a failing test the
+day the artifact appears.
+
+#### ⚠️ The trap: an artifact arrives at TWO paths, and the on-disk one is the wrong one
+
+**npm workspaces symlink every `engine/packages/<dir>` into the root `node_modules` under its package
+NAME, and electron-builder DEREFERENCES those links at pack time.** So the SwiftPM caches reach the
+app as `node_modules/capacitor-modoki-ota/.build/…` and **never** as
+`engine/packages/capacitor-modoki-ota/.build/…` — which is the path every `find`, every `du` and
+#1050's own table reports, because that is where the bytes sit.
+
+The first fix for #1050 was `engine/**`-anchored. It passed every assertion in the packaging guard
+and **still shipped 3,506 `.build` files into a 1.1 GB app.** The unit test and the packaged build
+disagreed; the packaged build was right. Hence:
+
+- The artifact excludes are **unanchored** (`!**/.build/**`, `.swiftpm`, `.spm-cache`, `DerivedData`,
+  `*.xcuserdata`, `.gradle`, `android/**/build`, `.modoki`, `*.tsbuildinfo`, `*.meta.local.json`,
+  logs, `.DS_Store`, and the secret-class patterns). Only `engine/coverage/` and
+  `engine/tsconfig.app.scoped*.json` stay anchored — they have no workspace twin.
+- The guard checks **both** path shapes, deriving the twin from each package's own `name` field
+  rather than a hand-written table, so a renamed or added workspace package cannot fall out of
+  coverage.
+
+#### Verifying a change here
+
+`npm run verify:packaged` is mandatory, but it is not sufficient on its own: **the unit test models
+electron-builder, and a model can be wrong in exactly the way above.** Build the real thing and count:
+
+⚠️ The path below is **macOS-only** — `/var/folders/…` is the macOS temp root, and the artifact is
+a `.app` bundle. On Windows `smoke-packaged.sh` stages under the platform temp dir and produces an
+unpacked `win-unpacked/` directory instead; read the path the script prints rather than assuming
+either shape. (This repo has a standing scar for Mac-shaped assumptions in shared tooling — see
+[windows.md](windows.md).)
+
+```bash
+npm run smoke:packaged     # builds the faithful packaged .app, launches it headless
+APP=$(find /var/folders/*/*/T/modoki-pkg-smoke-* -maxdepth 3 -name '*.app' | head -1)   # macOS
+find "$APP" -type d -name .build -exec find {} -type f \; | wc -l      # must be 0
+du -sh "$APP"                                                         # 905 MB, not 1.1 GB
+```
+
+⚠️ **Check the accept side in the same pass** — an over-broad glob drops a required binary and fails
+at RUNTIME, never at build time. `Contents/Resources/bin/{toktx,msdf-atlas-gen}` and
+`app.asar.unpacked/engine/tools/modoki-mcp/dist/index.js` must all still be there.
+
+**Result of #1050:** 1.1 GB → **905 MB**, 19,548 → 16,039 files, zero `.build` / `.swiftpm` /
+`.gradle` / `.modoki` / `DerivedData` / `*.tsbuildinfo` / `*.meta.local.json`, smoke green (scene
+loaded, no Vite resolve errors, no renderer console errors, CSP enforced). Two secret-class gaps were
+closed at the same time — nothing matching `.env`, `*.p8`, `*.jks`, `*.keystore` or
+`project.user.json` existed under `engine/` (verified), but nothing excluded them either, and
+`asarUnpack` is a real directory on disk rather than a sealed archive.
+
 ## Editor self-update (`engine/electron/autoUpdate.ts`)
 
 The packaged editor updates itself with electron-updater over the **public** `lsgmasa33/modoki-engine`

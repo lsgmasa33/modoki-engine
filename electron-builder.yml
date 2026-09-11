@@ -99,6 +99,83 @@ files:
   # (a stale generated-config snapshot "failing", stale vendorPlugins copies) more than once.
   - "!engine/tests/**"
   - "!engine/packages/*/tests/**"
+  # ⚠️ …and again at the TWIN path (#1050 close-out). A workspace package is copied as a
+  # node_modules DEPENDENCY, and app-builder-lib matches `files:` against
+  # `node_modules/<packageName>/<rest>` — never the on-disk path — so the line above is
+  # structurally incapable of excluding `node_modules/@modoki/engine/tests/**`. Those ~200
+  # files (9.4 MB) are held out today ONLY by a hardcoded basename set in
+  # app-builder-lib's NodeModuleCopyHelper (`topLevelExcludedFiles`, which contains "tests"),
+  # applied ONLY at a package's top level. That is third-party, undocumented, and breaks the
+  # moment a package nests its tests (`src/tests/`) or `disableDefaultIgnoredFiles` is set.
+  # ⚠️ Do NOT collapse these to `!**/tests/**` — that would drop
+  # engine/templates/starter/tests/tapTargets.test.ts, which #1024 ships DELIBERATELY so a
+  # scaffolded project is born with a passing test.
+  - "!node_modules/*/tests/**"
+  - "!node_modules/@*/*/tests/**"
+  # ── Gitignored artifacts under engine/** (#1050) ────────────────────────────
+  # `engine/**/*` above ships the WORKING TREE, not the repo. Every gitignored build or
+  # local-state artifact under engine/ is packaged, signed and notarized unless a `!` glob
+  # here says otherwise, and until #1050 the only ones anyone had thought of were .vite and
+  # the test suites. Measured 2026-09-11: engine/ held 2,802 TRACKED files and 20,770 on
+  # disk. The five SwiftPM caches alone were 731 MB / 9,609 files — codesign was still
+  # walking capacitor-modoki-ota/core/.build/debug/index/store 58 MINUTES into a local
+  # `dist:mac`, for a 1.8 GB app against CI's 881 MB.
+  # This is the THIRD list in #885's class ("two hand-maintained ignore lists must agree,
+  # and nothing makes them"); #885 reconciled .gitignore <-> eslint `ignores` and this one
+  # was never enumerated. ⚠️ It cannot simply be DERIVED from .gitignore the way #885's was:
+  # engine/**/dist/, node_modules/ and engine/vite.config.cjs are all gitignored and all
+  # REQUIRED at runtime. So it is a CLASSIFIED list — and
+  # engine/tests/electron/packagingManifest.test.ts fails if a .gitignore pattern that can
+  # match under engine/ is in neither the ship allowlist nor these excludes.
+  #
+  # Native build output (the #1050 measurement):
+  # ⚠️ UNANCHORED (`**/`), not `engine/**/` — and this cost a full packaged build to learn.
+  # npm WORKSPACES symlink each engine/packages/<pkg> into the root node_modules, and
+  # electron-builder DEREFERENCES those links at pack time. So the same cache arrives at the
+  # app as `node_modules/capacitor-modoki-ota/.build/…`, never as
+  # `engine/packages/capacitor-modoki-ota/.build/…` — the path this issue's own table reports,
+  # because that is where the files sit ON DISK. The first fix here was engine/**-anchored,
+  # passed its unit test, and still shipped 3,506 .build files into a 1.1 GB app.
+  - "!**/.build/**"
+  - "!**/.swiftpm/**"
+  - "!**/.spm-cache/**"
+  - "!**/DerivedData/**"
+  # ⚠️ THREE spellings, because the obvious one matches nothing Xcode makes. Xcode writes
+  # `<proj>.xcodeproj/xcuserdata/<user>.xcuserdatad/…` — the dir is literally `xcuserdata`,
+  # with no dot-prefixed stem — so `*.xcuserdata/` (the spelling .gitignore uses, and the one
+  # tried first here) matches neither the parent nor the child. That also means such a dir is
+  # untracked-and-NOT-ignored, so the classification guard cannot see it either; only these
+  # globs stop it. Latent today: no .xcodeproj exists under engine/.
+  - "!**/*.xcuserdata/**"
+  - "!**/xcuserdata/**"
+  - "!**/*.xcuserdatad/**"
+  - "!**/android/**/build/**"
+  - "!**/.gradle/**"
+  # Local editor/build state (5 of these ship today — engine/.modoki,
+  # engine/packages/modoki/.modoki, engine/tsconfig.app.scoped.json and two font
+  # *.meta.local.json sidecars; the scoped tsconfig is #885's own row 6):
+  - "!**/.modoki"
+  - "!**/.modoki/**"
+  - "!**/.modoki-building/**"
+  - "!engine/coverage/**"
+  - "!engine/tsconfig.app.scoped*.json"
+  - "!**/*.tsbuildinfo"
+  - "!**/*.meta.local.json"
+  - "!**/*.meta.json.corrupt"
+  - "!**/*.log"
+  - "!**/.DS_Store"
+  # ⚠️ Secret-class patterns. Gitignored, and excluded by NOTHING here until #1050.
+  # Verified 2026-09-11: none of these exists under engine/ today, so this closes a LATENT
+  # gap rather than an incident. One landing under engine/ would otherwise be packaged into
+  # a signed, notarized, DISTRIBUTED app in the clear, inside asarUnpack (a real dir).
+  - "!**/.env"
+  - "!**/.env.*"
+  - "!**/*.p8"
+  - "!**/*.jks"
+  - "!**/*.keystore"
+  - "!**/project.user.json"
+  - "!**/modoki.local.xcconfig"
+  - "!**/local.properties"
   # ⚠️ This exclude set is unverified against a real packaged Vite run — if a
   #    renderer/game import 404s in the .dmg, the culprit is almost certainly an
   #    over-broad exclude here.

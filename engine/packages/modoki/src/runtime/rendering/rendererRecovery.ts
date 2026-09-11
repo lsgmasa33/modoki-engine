@@ -43,6 +43,8 @@
  *     counts how often the GPU dies, this counts how often bring-up refuses to start.
  */
 
+import { errorText } from '../core/errorText';
+
 /** Delay before a rebuild starts. A DELIBERATE GUESS, not a tuned figure: long enough to be
  *  clearly out of the loss event and to let a context teardown settle, short enough that the
  *  user reads it as a hitch rather than a hang. The recovery this serves is already visible
@@ -84,7 +86,8 @@ export const REBUILD_BRINGUP_TIMEOUT_MS = 8000;
  *
  *  Pure, and total: it must never throw while describing why something else failed. */
 export function describeRebuildFailure(e: unknown): string {
-  if (e instanceof Error) return e.stack || `${e.name}: ${e.message}`;
+  // `errorText`, not `stack || message`: an iOS stack carries no message line (#1055).
+  if (e instanceof Error) return errorText(e);
   if (e === undefined) return 'rejected with undefined';
   if (e === null) return 'rejected with null';
   const kind = typeof e === 'object' ? (e.constructor?.name ?? 'object') : typeof e;

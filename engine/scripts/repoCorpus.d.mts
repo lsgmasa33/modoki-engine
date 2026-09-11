@@ -31,3 +31,17 @@ export declare function repoRoot(): string;
 
 /** The repo's file corpus, filtered per `options`. Sorted by `rel`. */
 export declare function repoFiles(options: RepoFilesOptions): RepoCorpusFile[];
+
+export interface RepoIgnoredFilesOptions {
+  /** As `RepoFilesOptions.under`. */
+  under?: string | string[];
+  /** Path segment names to drop wholesale (e.g. `['node_modules']`). */
+  exclude?: Iterable<string>;
+  /** Required: throws if the final matched count is below this. */
+  floor: number;
+}
+
+/** The GITIGNORED corpus — what `repoFiles()` cannot return, because it enumerates with
+ *  `--exclude-standard`. ⚠️ `--directory` collapses a wholly-ignored directory to the directory
+ *  itself, so a caller that globs must match BOTH `<dir>` and `<dir>/**`. Sorted by `rel`. */
+export declare function repoIgnoredFiles(options: RepoIgnoredFilesOptions): RepoCorpusFile[];

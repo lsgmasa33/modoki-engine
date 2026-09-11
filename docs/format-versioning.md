@@ -477,7 +477,8 @@ into a Node tsconfig.
 ⚠️ **Three of the 18 are NOT this mechanism and were split out as #993** — vocab-table lookups
 (`WRAP[s.wrapS]`, `SHAPE[...]`, `COLLIDER[...]`) where the table is a code literal, fixing the guard
 alone still lets the prototype value flow, and one has no guard at all so "fixing" it means choosing
-a fallback. Bending them to fit would have been a forced family.
+a fallback. Bending them to fit would have been a forced family. That split turned out to be the
+larger half — **§ 4b-ter**, below.
 
 ⚠️ **One #986 guard is deliberately UNTESTED, and the mutation check is why.** `mergeParamDefaults`'
 read guard changes no output: `coerceParamValue` type-checks every branch and falls back to the
@@ -494,6 +495,88 @@ and `engine/plugins` finds **zero** — the same `.call`-form convention that ma
 Covered by `engine/packages/modoki/tests/runtime/docKeys.test.ts` (34 cases). ⚠️ **Almost every case
 uses one of the OTHER SEVEN names, not `__proto__`** — only `__proto__` goes through a setter, so a
 `__proto__`-only suite stays green against the entire read half, which is most of these sites.
+
+### 4b-ter. The READ side — a code-declared VOCABULARY TABLE indexed by a document string (#993)
+
+§ 4b-bis is about bags **we build**. This is the other half, and it is bigger: **22 sites** where a
+*code-declared literal object* is used as a vocabulary table and indexed with a string that came from
+outside the code. The table was never a bag anybody thought of as document data — it is a `const` a
+few lines up — which is exactly why the reads went unguarded.
+
+> **The mechanism, in one sentence:** a code-declared literal inherits `Object.prototype`, so a key
+> like `constructor`, `toString` or `valueOf` returns an inherited **FUNCTION**, and the value flows
+> on because the guard beside the read cannot see it.
+
+⚠️ **All four of the guard shapes people reach for fail, and this is the part worth memorising:**
+
+| written as | why it does not hold |
+|---|---|
+| `if (!(key in TABLE)) warn(…)` | `'toString' in TABLE` is **true** — the warning never fires |
+| `TABLE[key] ?? fallback` | a function is **not nullish** — `??` never fires |
+| `TABLE[key] \|\| fallback` | a function is **truthy** — `\|\|` never fires |
+| `const v = TABLE[key]; if (!v) return` | same: truthy, so the early return is skipped |
+
+**The fix is `hasDocKey` at the read**, never a fourth spelling:
+
+```ts
+const wrap = hasDocKey(WRAP, s.wrapS) ? WRAP[s.wrapS] : undefined
+```
+
+Why not a `Map`: `Object.hasOwn` is already a *second* spelling in the tree
+(`loaders/primitives.ts`, `haptics/patterns.ts`, Court's `saveSync.ts`), a `Map` would be a **third**,
+and it would change every declaration site — plus its iteration and spread behaviour — to repair
+a defect that lives entirely on the read.
+
+**Severity is decided by where the KEY comes from, not by what the table holds.** Ranked, as they were
+found:
+
+| key provenance | example site | what it cost |
+|---|---|---|
+| a **URL query param** | `games/scroll-demo/runtime/config.ts` | `?scene=constructor` sets `scenePath` to a function |
+| a **debug/HMR protocol payload**, and the value is **invoked** | `app/debug/agentBridge.ts` | `kind:"constructor"` calls `Object(path)` |
+| an **agent tool payload** | `runtime/core/journal.ts` | every `>=` is false → the journal returns **zero events**, which the agent reads as "nothing happened" |
+| **scene/prefab JSON**, a trait NAME | `loaders/sceneValidation.ts` (validation, every scene), `loaders/loadSceneFile.ts` (the v5→v6 migration) | `.includes` / `for…of` on a function → **TypeError** |
+| **scene JSON**, a trait FIELD | `audio/audioService.ts` (`AudioSource.bus`) | `tail.connect(Object)` → **TypeError**, that entity's audio dies |
+| an asset `.meta.json` / `.particle.json` / `.shader.json` | `textureResolver`, `gpuComputeBackend`, `shaderSchema` | a function assigned into a three.js enum or a GPU uniform |
+| a **GLB node name** | `games/3d-test/runtime/config.ts` | a stringified function as the editor's display name |
+| a **font filename** segment | `loaders/fontNaming.ts` | `match.weight` is `undefined`, so the face ships with no weight |
+| a **GLB attribute semantic**, at BUILD time | `plugins/model-convert/threeAdapter.ts` | `geom.setAttribute(fn, …)` files the data under a stringified function |
+| a **scene-JSON trait name**, at BUILD time | `plugins/detect-modules.ts` | a garbage module flag in the bag handed to the build's `define`s |
+
+Three findings that generalise beyond this family:
+
+- ⚠️ **Two functions over one table, disagreeing.** `loaders/primitives.ts` had `isPrimitive` using
+  `Object.hasOwn` **three lines above** `createPrimitiveMesh` indexing the same table raw. A correct
+  guard existing nearby is not protection; it is camouflage. The fix was to make the second function
+  ask the first, not to add a third check.
+- ⚠️ **A sibling read in the same function can be the proof.** `gpuComputeBackend` had two vocab
+  fields one screen apart where an identical typo **warned and fell back** in one and was **silently
+  `undefined`** in the other. Two fields disagreeing about one class of typo is a design question,
+  not a lint fix — it went to the owner, who chose warn + fall back at runtime **and** a picker at the
+  authoring surface.
+- ⚠️ **A picker whose options are hand-listed is a second copy of the table.** The Inspector's
+  collider-shape picker already existed — with its four options typed out beside a separate four-entry
+  `COLLIDER` table, so the first shape anybody added would have appeared in one and not the other.
+  `COLLIDER_SHAPES` is now the one list, the picker spreads it, and the GPU table is typed
+  `Record<ColliderShape, number>` so a new member fails to compile until it has a shader code. This is
+  root `CLAUDE.md` § "Author values in the SCENE and the PREFAB" in its read-the-field form.
+
+⚠️ **Not every site is reachable by every name, and that decides which case is the test.**
+`fontNaming` is the worked example: `.toLowerCase()` kills six of the eight, the `split(/[-_]/)`
+kills `__proto__`, and **`constructor` alone survives both** — so seven of its eight cases pass with
+or without the fix and only one of them is evidence. Work out which names actually reach the read
+before writing the assertions, or the suite looks eight times stronger than it is.
+
+⚠️ **The reachable half is the OTHER SEVEN names, not `__proto__`.** These are all *reads*, and
+`__proto__` is the only one that goes through a setter — so a `__proto__`-only test suite stays green
+against every site in this family. `docKeys.test.ts` enumerates all eight for that reason; copy it.
+
+⚠️ **And test the ACCEPT side of every one.** A table that answers `undefined` for everything passes
+every reject case while breaking all texture wrapping and every particle emitter. The coverage
+baseline when #993 was picked up was that **zero of the sixteen sites had a test that failed**, and
+`games/3d-test/tests/tropicalIslandConfig.test.ts` asserted the right thing in a way that passed
+before *and* after the fix — [docs/falsifiable-tests.md](falsifiable-tests.md)'s shape, already in the
+tree.
 
 ## 5. Adding a new versioned document
 

@@ -75,7 +75,6 @@ engine/packages/*/android/test-harness/.gradle/
 android/.safedk/
 
 # Platform Tech SDK dist (built from source)
-engine/packages/platform-tech/dist/
 
 # SPM build/index cache (large files) — can appear under any package
 **/.build/

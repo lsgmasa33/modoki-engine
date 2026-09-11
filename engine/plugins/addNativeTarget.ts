@@ -343,26 +343,36 @@ export async function scaffoldNativeTarget(opts: {
   // destroying a working project if one of them fails first.
   //
   // The one case worth refusing outright is checked HERE, at entry, before any of steps 1-3: a
-  // Firebase config file inside the folder. Nothing user-authored belongs in a folder that fails
+  // hand-authored file inside the folder that `cap add` cannot regenerate (the survivors listed
+  // below). Nothing else user-authored belongs in a folder that fails
   // isNativeTargetScaffolded under the ordinary (non-force) repair path — a kill during template
   // extraction only ever leaves PRISTINE template files (step 3 below writes machine-derived
   // config like android/local.properties into the same folder via healNativeConfig, but that's
-  // regenerated identically every run, not user content). Firebase config is the one exception
-  // that can plausibly land there out-of-band, and it's the ONLY thing a genuinely COMPLETE
-  // target's `force` removal could destroy for real, so the same guard covers both cases.
+  // regenerated identically every run, not user content). Those survivors are the exception that
+  // can plausibly land there out-of-band, and the ONLY thing a genuinely COMPLETE target's `force`
+  // removal could destroy for real, so the same guard covers both cases.
   // Checking this before steps 1-3 also means a doomed run fails in seconds instead of holding
   // the shared build slot through a multi-minute install first.
   if (willRemove) {
-    const firebaseFiles = platform === 'ios'
-      ? [path.join(platformDir, 'App', 'App', 'GoogleService-Info.plist')]
+    // Files a human authored INTO the platform folder that `cap add` cannot regenerate: the Firebase
+    // config, and on iOS the app's privacy manifest (#1051), a hand-written declaration to Apple of
+    // what the app collects. Losing either leaves a project that still builds and is wrong.
+    const survivors = platform === 'ios'
+      ? [
+        path.join(platformDir, 'App', 'App', 'GoogleService-Info.plist'),
+        path.join(platformDir, 'App', 'App', 'PrivacyInfo.xcprivacy'),
+      ]
       : [path.join(platformDir, 'app', 'google-services.json')];
-    const survivor = firebaseFiles.find((f) => fs.existsSync(f));
-    if (survivor) {
+    // ALL of them, not the first: Court and Weaveling carry both iOS files, and naming one per run
+    // made the user move a file, rerun, and get refused again for the other.
+    const present = survivors.filter((f) => fs.existsSync(f));
+    if (present.length > 0) {
       const why = alreadyComplete
         ? `${platform}/ is a complete target, but --force was requested and it`
         : `${platform}/ is incomplete (an earlier scaffold was interrupted) but`;
+      const names = present.map((f) => path.relative(projectRoot, f)).join(' and ');
       throw new Error(
-        `${why} contains ${path.relative(projectRoot, survivor)} — move that file somewhere ` +
+        `${why} contains ${names} — move ${present.length > 1 ? 'those files' : 'that file'} somewhere ` +
         `safe, delete ${platform}/ by hand, then run this again.`,
       );
     }

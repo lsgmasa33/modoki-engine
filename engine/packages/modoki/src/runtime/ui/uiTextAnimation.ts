@@ -13,6 +13,8 @@
  *  property so the keyframes stay static (injected once). `frequency` is unused here
  *  (no per-glyph phase). Pure except {@link ensureUITextAnimStyles} (DOM injection).
  */
+import { hasDocKey } from '../core/docKeys';
+
 
 export interface UITextAnimParams {
   effect: string;
@@ -136,7 +138,11 @@ function rainbowStyleFor(textAlign?: string): Record<string, string> {
 }
 
 export function uiTextAnimation(params: UITextAnimParams, textAlign?: string): UITextAnimStyle | null {
-  const m = EFFECTS[params.effect];
+  // ⚠️ `hasDocKey`, NOT `if (!m)` (#993). `params.effect` is `UIElement.textAnim.effect` from
+  // scene JSON and `EFFECTS` is a code-declared literal, so `effect: "toString"` returns the
+  // inherited FUNCTION — truthy, so the guard passes — and the function's absent `.perChar`
+  // sends it down the CSS branch, emitting `animation: undefined …` instead of returning null.
+  const m = hasDocKey(EFFECTS, params.effect) ? EFFECTS[params.effect] : undefined;
   if (!m) return null;
   if (m.perChar) {
     // ~11 glyphs/sec at speed 1. The renderer turns this into a per-glyph delay.

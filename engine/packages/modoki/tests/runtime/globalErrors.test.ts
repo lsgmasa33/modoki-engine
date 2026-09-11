@@ -142,6 +142,50 @@ describe('globalErrors — window handlers', () => {
   });
 });
 
+/**
+ * #1055. A JavaScriptCore stack (every iOS build) is frames only, with no `Name: message` line, so
+ * `stack || message` sent Crashlytics a bare frame. OBSERVED on an iPad mini 5, 2026-09-11. These run
+ * on V8, so the iOS stack is fabricated in the exact shape the device produced.
+ */
+describe('globalErrors — an iOS (JavaScriptCore) stack carries no message line (#1055)', () => {
+  const JSC_STACK = 'anonymous@capacitor://localhost/assets/bridge-6HfFgXzW.js:2:1673';
+  const jscError = (message: string): Error => {
+    const err = new Error(message);
+    Object.defineProperty(err, 'stack', { value: JSC_STACK, configurable: true });
+    return err;
+  };
+
+  it('console.error(err) reports the message, not only the frame', async () => {
+    const m = await load();
+    m.registerAppServices({ crashlytics: svc });
+
+    console.error(jscError('save failed'));
+    await new Promise((r) => setTimeout(r, 0)); // a lone Error is reported on a microtask
+
+    expect(sink.errors).toEqual([`[console.error] Error: save failed\n${JSC_STACK}`]);
+  });
+
+  it('an uncaught error reports the message', async () => {
+    const m = await load();
+    m.registerAppServices({ crashlytics: svc });
+
+    window.dispatchEvent(new ErrorEvent('error', { error: jscError('kaboom'), message: 'kaboom' }));
+
+    expect(sink.errors).toEqual([`[uncaught] Error: kaboom\n${JSC_STACK}`]);
+  });
+
+  it('an unhandled rejection reports the message', async () => {
+    const m = await load();
+    m.registerAppServices({ crashlytics: svc });
+
+    const e = new Event('unhandledrejection') as Event & { reason?: unknown };
+    e.reason = jscError('nope');
+    window.dispatchEvent(e);
+
+    expect(sink.errors).toEqual([`[unhandledrejection] Error: nope\n${JSC_STACK}`]);
+  });
+});
+
 describe('globalErrors — Capacitor double-reporting', () => {
   it('reports an uncaught error ONCE, keeping the [uncaught] label', async () => {
     const m = await load();
@@ -278,6 +322,69 @@ describe('globalErrors — rate limiting', () => {
     m.captureToCrashlytics('error', 'REAL CRASH — the report that matters');
     expect(sink.errors, 'and a genuine crash still gets through').toHaveLength(afterFlood + 1);
     expect(sink.errors[sink.errors.length - 1]).toContain('REAL CRASH');
+  });
+
+  /**
+   * #1056. `journalError` files a `caught` report in every build. A caught failure that recurs with a
+   * varying payload (a distinct payout id per solve, on a phone whose storage refuses writes) defeats
+   * dedupe, so on the crash budget it would silence every later genuine crash. It gets its own budget
+   * (owner, 2026-09-11) and is still delivered as an issue.
+   */
+  it('does NOT let a caught-failure flood spend the crash budget (#1056)', async () => {
+    let t = 0;
+    const m = await load(() => t);
+    m.registerAppServices({ crashlytics: svc });
+
+    for (let i = 0; i < 300; i++) {
+      if (i % 20 === 0) t += 6000;
+      m.captureToCrashlytics('caught', `[journalError] court.solve.payout-unconfirmed {"payoutId":"p-${i}"}`);
+    }
+    expect(sink.errors, 'caught failures are issues, capped by their own budget of 100').toHaveLength(100);
+    expect(sink.logs, 'a caught failure is never a breadcrumb').toEqual([]);
+
+    t += 6000;
+    m.captureToCrashlytics('error', 'REAL CRASH — the report that matters');
+    expect(sink.errors, 'and a genuine crash still gets through').toHaveLength(101);
+    expect(sink.errors[100]).toContain('REAL CRASH');
+  });
+
+  it('does NOT let a crash flood or a warn flood spend the caught budget either (#1056)', async () => {
+    let t = 0;
+    const m = await load(() => t);
+    m.registerAppServices({ crashlytics: svc });
+
+    for (let i = 0; i < 150; i++) {
+      if (i % 10 === 0) t += 6000;
+      m.captureToCrashlytics('error', `crash ${i}`);
+      m.captureToCrashlytics('warn', `warn ${i}`);
+    }
+    expect(sink.errors, 'both floods are at their own caps').toHaveLength(200);
+
+    t += 6000;
+    m.captureToCrashlytics('caught', '[journalError] court.iap.durability-unconfirmed {"transactionId":"t-1"}');
+    expect(sink.errors).toHaveLength(201);
+    expect(sink.errors[200]).toContain('court.iap.durability-unconfirmed');
+  });
+
+  it('the caught budget survives a simulated reload, like the others (#588, #1056)', async () => {
+    let t = 0;
+    const m1 = await load(() => t);
+    m1.registerAppServices({ crashlytics: svc });
+    for (let i = 0; i < 99; i++) {
+      if (i % 20 === 0) t += 6000;
+      m1.captureToCrashlytics('caught', `pre-reload ${i}`);
+    }
+    expect(sink.errors).toHaveLength(99);
+
+    vi.resetModules();
+    const g2 = await import('../../src/runtime/core/globalErrors');
+    const a2 = await import('../../src/runtime/core/appServices');
+    g2.installGlobalErrorHandlers();
+    a2.registerAppServices({ crashlytics: svc });
+
+    g2.captureToCrashlytics('caught', 'post-reload A');
+    g2.captureToCrashlytics('caught', 'post-reload B — should be capped');
+    expect(sink.errors, 'the reload did not refresh the caught budget to a fresh 100').toHaveLength(100);
   });
 
   it('delivers a warn as an ISSUE, not a breadcrumb — a separate budget is not a separate destination', async () => {

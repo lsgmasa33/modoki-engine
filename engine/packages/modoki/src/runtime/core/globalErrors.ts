@@ -30,12 +30,13 @@
 
 import { appServices, onAppServicesRegistered } from './appServices';
 import {
-  readAndClearBootStash, writeBootStash, clearBootStash, joinConsoleTail, CONSOLE_TAIL_LINES,
+  readAndClearBootStash, writeBootStash, clearBootStash, joinConsoleTail, CONSOLE_TAIL_LINES, reportKindRank,
   type StashedFault, type BootStashEnvelope,
 } from './bootStash';
 import { getConsoleRingTail, isConsoleRingInstalled } from './consoleRing';
 import { rawEpochNow, rawNow } from './clock';
 import { peekResumeReload } from './resumeReload';
+import { errorText } from './errorText';
 
 /** `console.error` AND `console.warn` → a non-fatal Crashlytics ISSUE (grouped, alerted on).
  *
@@ -52,8 +53,12 @@ import { peekResumeReload } from './resumeReload';
  * list — see `games/court/packages/app-services/src/track.ts`.
  *
  * The caps below matter MORE under this decision, not less: they are what stops a warn inside a
- * per-frame system from becoming 60 issues a second. */
-export type CaptureKind = 'error' | 'warn' | 'breadcrumb';
+ * per-frame system from becoming 60 issues a second.
+ *
+ * `caught` (#1056) is a failure a game CAUGHT and carried on from, filed by `journalError` in every
+ * build. It is delivered as an ISSUE exactly like `error`, on its OWN budget
+ * (`MAX_CAUGHT_PER_SESSION`), for the reason `warn` has one. */
+export type CaptureKind = 'error' | 'caught' | 'warn' | 'breadcrumb';
 
 /** Caps. A warn inside a per-frame system is 60 calls/second; unbounded, that is a flooded
  *  console, a throttled SDK and a real bridge cost on the player's phone for no information. */
@@ -76,6 +81,14 @@ const MAX_ERRORS_PER_SESSION = 100;
  * care where a message came from.
  */
 const MAX_WARNS_PER_SESSION = 100;
+/**
+ * ⚠️ **`caught` (#1056) gets its own budget too, for the reason `warn` does.** `journalError` files
+ * one report per caught failure, and a failure that recurs with a varying payload is a new dedupe key
+ * every time: a phone whose storage refuses writes files a fresh `payout-unconfirmed` (a distinct
+ * payout id) on every solve. On the shared crash budget, 100 of those would silence every genuine
+ * crash for the rest of that session. Owner's call, 2026-09-11.
+ */
+const MAX_CAUGHT_PER_SESSION = 100;
 const MAX_BREADCRUMBS_PER_SESSION = 500;
 /** Burst ceiling, for the flood that DEFEATS dedupe by varying its text (an entity id in the
  *  message). Sliding window, deliberately coarse.
@@ -139,10 +152,10 @@ const SESSION_COUNTERS_KEY = 'modoki.globalErrors.sessionCounters';
  */
 const CRASHLYTICS_SESSION_WINDOW_MS = 30 * 60_000;
 
-interface PersistedCounters { errorsSent: number; warnsSent: number; breadcrumbsSent: number }
+interface PersistedCounters { errorsSent: number; caughtSent: number; warnsSent: number; breadcrumbsSent: number }
 
 /**
- * Read the three session budgets left behind by a PREVIOUS boot of this same realm (see the
+ * Read the session budgets left behind by a PREVIOUS boot of this same realm (see the
  * comment on `errorsSent` below for what "durable" means and does not mean here).
  *
  * ⚠️ Same shape and same caution as `resumeReload.ts`'s `markResumeReload`/`consumeResumeReload`:
@@ -156,10 +169,10 @@ interface PersistedCounters { errorsSent: number; warnsSent: number; breadcrumbs
  * init below, which calls this at module-evaluation time — a `const` referenced before its own
  * declaration line throws (TDZ), and that throw was previously swallowed by this function's own
  * try/catch, silently returning zero on every load. Caught by the reload test in
- * `globalErrors.test.ts`; keep this above the `errorsSent`/`warnsSent`/`breadcrumbsSent` `let`s.
+ * `globalErrors.test.ts`; keep this above the `errorsSent`/`caughtSent`/`warnsSent`/`breadcrumbsSent` `let`s.
  */
 function loadPersistedCounters(): PersistedCounters {
-  const zero: PersistedCounters = { errorsSent: 0, warnsSent: 0, breadcrumbsSent: 0 };
+  const zero: PersistedCounters = { errorsSent: 0, caughtSent: 0, warnsSent: 0, breadcrumbsSent: 0 };
   try {
     // ⚠️ A budget only belongs to the next realm if the NATIVE session is still the same one.
     // `peekResumeReload()` (never `consume` — that one-shot belongs to the resume-reload path)
@@ -191,6 +204,7 @@ function loadPersistedCounters(): PersistedCounters {
       typeof v === 'number' && Number.isFinite(v) ? Math.min(Math.max(0, Math.trunc(v)), cap) : 0;
     return {
       errorsSent: readCount(parsed.errorsSent, MAX_ERRORS_PER_SESSION),
+      caughtSent: readCount(parsed.caughtSent, MAX_CAUGHT_PER_SESSION),
       warnsSent: readCount(parsed.warnsSent, MAX_WARNS_PER_SESSION),
       breadcrumbsSent: readCount(parsed.breadcrumbsSent, MAX_BREADCRUMBS_PER_SESSION),
     };
@@ -199,11 +213,11 @@ function loadPersistedCounters(): PersistedCounters {
   }
 }
 
-/** Write the three session budgets back, so the NEXT boot of this realm (a reload) sees them.
+/** Write the session budgets back, so the NEXT boot of this realm (a reload) sees them.
  *  Called every time one is charged in `allow()`. Failure is silent — see `loadPersistedCounters`. */
 function savePersistedCounters(): void {
   try {
-    sessionStorage.setItem(SESSION_COUNTERS_KEY, JSON.stringify({ errorsSent, warnsSent, breadcrumbsSent }));
+    sessionStorage.setItem(SESSION_COUNTERS_KEY, JSON.stringify({ errorsSent, caughtSent, warnsSent, breadcrumbsSent }));
   } catch {
     /* private mode, disabled site data, or a context that throws on access — see above */
   }
@@ -227,7 +241,7 @@ function clearPersistedCounters(): void {
 
 const repeats = new Map<string, number>();
 /**
- * ⚠️ **`errorsSent`/`warnsSent`/`breadcrumbsSent` are seeded from `sessionStorage` and DURABLE
+ * ⚠️ **`errorsSent`/`caughtSent`/`warnsSent`/`breadcrumbsSent` are seeded from `sessionStorage` and DURABLE
  * across a same-origin reload; `windowStart`/`windowCount` and `repeats` are deliberately NOT.**
  *
  * A webview reload re-runs this module from scratch, re-zeroing every `let` here — but native
@@ -254,6 +268,7 @@ const persistedCounters = loadPersistedCounters();
 let errorsSent = persistedCounters.errorsSent;
 let warnsSent = persistedCounters.warnsSent;
 let breadcrumbsSent = persistedCounters.breadcrumbsSent;
+let caughtSent = persistedCounters.caughtSent;
 let windowStart = 0;
 let windowCount = 0;
 
@@ -287,10 +302,14 @@ function truncate(text: string): string {
 
 /** Describe anything at all without trusting it. `e.error` is attacker-shaped in the general
  *  case — a Proxy, or a value whose `stack` getter throws — and this runs at the moment
- *  something is already going wrong, so a throw in here would become a second error event. */
+ *  something is already going wrong, so a throw in here would become a second error event.
+ *
+ *  ⚠️ An Error goes through `errorText`, never `stack || message`: on iOS the stack carries no
+ *  message line, so every uncaught error and every `console.error(err)` reached Crashlytics as a
+ *  bare stack frame (#1055). */
 function describe(value: unknown): string {
   try {
-    if (value instanceof Error) return value.stack || `${value.name}: ${value.message}`;
+    if (value instanceof Error) return errorText(value);
     if (typeof value === 'string') return value;
     return String(value);
   } catch {
@@ -339,10 +358,13 @@ function allow(kind: CaptureKind, text: string): boolean {
   repeats.set(text, Math.min(seen, MAX_REPEATS_PER_MESSAGE + 1));
   if (seen > MAX_REPEATS_PER_MESSAGE) return false;
 
-  // 2. Session cap — read, not yet charged. THREE budgets, not two: see MAX_WARNS_PER_SESSION for
-  //    why a warn flood must not be able to spend the crash budget.
-  const spent = kind === 'error' ? errorsSent : kind === 'warn' ? warnsSent : breadcrumbsSent;
+  // 2. Session cap — read, not yet charged. One budget per kind: see MAX_WARNS_PER_SESSION and
+  //    MAX_CAUGHT_PER_SESSION for why neither a warn flood nor a caught-failure flood may spend the
+  //    crash budget.
+  const spent = kind === 'error' ? errorsSent : kind === 'caught' ? caughtSent
+              : kind === 'warn' ? warnsSent : breadcrumbsSent;
   const cap = kind === 'error' ? MAX_ERRORS_PER_SESSION
+            : kind === 'caught' ? MAX_CAUGHT_PER_SESSION
             : kind === 'warn' ? MAX_WARNS_PER_SESSION
             : MAX_BREADCRUMBS_PER_SESSION;
   if (spent >= cap) return false;
@@ -357,6 +379,7 @@ function allow(kind: CaptureKind, text: string): boolean {
   windowCount++;
 
   if (kind === 'error') errorsSent++;
+  else if (kind === 'caught') caughtSent++;
   else if (kind === 'warn') warnsSent++;
   else breadcrumbsSent++;
   savePersistedCounters();
@@ -389,11 +412,11 @@ function allow(kind: CaptureKind, text: string): boolean {
  * boot that is already dying. The trade that buys: `dropped` in the persisted envelope counts drops
  * up to the LAST content-changing write, so a tail of pure refusals is under-counted there.
  */
-/** Report priority, shared by the queue's admission policy and the stash's selection so the two
- *  cannot disagree about what is worth keeping. `error` (uncaught faults and `console.error`)
- *  outranks `warn`, which outranks `breadcrumb`. */
+/** Report priority for the queue's admission policy. It IS `bootStash.ts`'s `reportKindRank`, the
+ *  one definition the stash's selection also uses, so the two cannot disagree about what is worth
+ *  keeping. Two hand-kept copies were one new kind (#1056) away from doing exactly that. */
 function queuedRank(kind: CaptureKind): number {
-  return kind === 'error' ? 0 : kind === 'warn' ? 1 : 2;
+  return reportKindRank(kind);
 }
 
 /** Index of the LAST lowest-priority queued item, or -1 when the queue is empty. Last, so an
@@ -428,8 +451,9 @@ function stashQueuedReports(): void {
     // `[reload]` breadcrumb, replayed reports (already excluded above), and a game's own analytics
     // breadcrumbs routed through `captureToCrashlytics` (see `CaptureKind` above). Rather than
     // enumerate them — an enumeration goes stale on the first new caller — the gate asks the only
-    // question that matters: is there an actual `error`/`warn`? A breadcrumb-only queue is not a crash.
-    const worthStashing = persistable.some((q) => q.kind === 'error' || q.kind === 'warn');
+    // question that matters: is there an actual report (`error`/`caught`/`warn`)? A breadcrumb-only
+    // queue is not a crash.
+    const worthStashing = persistable.some((q) => q.kind !== 'breadcrumb');
     if (!worthStashing) {
       // Clear rather than leave a previous write standing: the faults that justified it may have
       // just been flushed, and a stale envelope replays as this boot's death.
@@ -712,7 +736,8 @@ function replayStashedEarlyErrorsInner(stash: BootStashEnvelope, stashAgeMs: num
   for (const report of stash.reports ?? []) {
     try {
       if (report === null || typeof report !== 'object') continue;
-      if (report.kind !== 'error' && report.kind !== 'warn' && report.kind !== 'breadcrumb') continue;
+      if (report.kind !== 'error' && report.kind !== 'caught' && report.kind !== 'warn'
+        && report.kind !== 'breadcrumb') continue;
       if (typeof report.text !== 'string' || report.text === '') continue;
       captureToCrashlytics(report.kind, `[prev-boot] ${report.text}`);
     } catch {
@@ -868,6 +893,7 @@ export function __resetGlobalErrorsForTest(opts?: { clock?: () => number; uninst
   errorsSent = 0;
   warnsSent = 0;
   breadcrumbsSent = 0;
+  caughtSent = 0;
   windowStart = 0;
   windowCount = 0;
   queued = [];

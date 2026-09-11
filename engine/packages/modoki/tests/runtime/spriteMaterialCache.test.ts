@@ -141,6 +141,21 @@ describe('ensureSpriteMaterial', () => {
     expect(onReady).not.toHaveBeenCalled();
   });
 
+  // #1055. A JavaScriptCore stack (iOS) is frames only, so `stack || message` warned with a frame and
+  // no message. Fabricated in the shape an iPad produced, since these run on V8.
+  it('a rejection whose stack is frames only (JavaScriptCore) still warns with its MESSAGE (#1055)', async () => {
+    paths.set('g1', 'mat.shader.json');
+    const err = new Error('shader parse failed');
+    Object.defineProperty(err, 'stack', { value: 'buildPixiShaderProgram@capacitor://localhost/assets/index.js:3:7' });
+    build.mockRejectedValue(err);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    cache.ensureSpriteMaterial('g1');
+    await flush();
+
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('Error: shader parse failed'));
+  });
+
   it('marks an unresolved GUID as failed without calling build', () => {
     // no path seeded → resolveRef returns undefined
     expect(cache.ensureSpriteMaterial('missing')).toBeUndefined();

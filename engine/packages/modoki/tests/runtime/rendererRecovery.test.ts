@@ -307,6 +307,13 @@ describe('describeRebuildFailure', () => {
     expect(describeRebuildFailure(e)).toContain('boom');
   });
 
+  it('keeps the MESSAGE of an Error whose stack is frames only (JavaScriptCore, iOS — #1055)', () => {
+    const frame = 'createRenderer@capacitor://localhost/assets/index.js:9:42';
+    const e = new Error('device lost');
+    Object.defineProperty(e, 'stack', { value: frame });
+    expect(describeRebuildFailure(e)).toBe(`Error: device lost\n${frame}`);
+  });
+
   it('salvages something from the {} that started this — an object with no enumerable props', () => {
     const opaque = Object.create({}, { name: { value: 'GPUError', enumerable: false } });
     const out = describeRebuildFailure(opaque);

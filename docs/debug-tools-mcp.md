@@ -1550,7 +1550,9 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
 - **Severity (bug triage):** every event carries a `level` — `info` (default) / `warn` / `error`.
   Game code sets it via `gameJournal.ts`'s `journalWarn`/`journalError` helpers (thin wrappers over
   `emit()` for "something unexpected happened" — a missing spawn point, a failed asset acquire — the
-  kind of thing worth finding FIRST in a bug hunt); `journalState`/`journalDecision` cover `info`-level
+  kind of thing worth finding FIRST in a bug hunt. ⚠️ `journalError` is NOT journal-only: it also
+  files a Crashlytics report in every build (#1056), so a handled, expected outcome belongs in
+  `journalWarn`); `journalState`/`journalDecision` cover `info`-level
   state transitions and "why did the game take this branch" events. `modoki_journal`/`device_journal
   level=` filters to that severity **and above** (`level:"warn"` returns `warn`+`error`), skipping the
   normal-gameplay noise. Raw `emit(type, payload, world, level)` still works for a plain semantic event

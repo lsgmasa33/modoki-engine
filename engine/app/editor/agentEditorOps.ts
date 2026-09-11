@@ -190,8 +190,9 @@ function describeGameView() {
     ...(!panelMounted ? {
       panelNote: 'The Game panel is NOT mounted, so nothing derived from this selection has moved — '
         + 'the preview size, safe-area insets and letterbox rect all still describe the previous '
-        + 'state. Open (and SELECT) the Game tab before attributing any layout measurement to this '
-        + 'screen: an unselected tab does not mount.',
+        + 'state. Open AND SELECT the Game tab before attributing any layout measurement to this '
+        + 'screen: a tab that has never been opened — or one that was closed and re-added — does '
+        + 'not mount until it is selected once.',
     } : panelCollapsed ? {
       panelNote: 'The Game panel is mounted but COLLAPSED to zero area. Anything derived from its '
         + 'extent — a capture size, a letterbox rect, an aim inside the preview — is unusable until '
@@ -211,9 +212,10 @@ function describeGameView() {
  *  `mode` alone is not enough to explain `modoki_handles editor=curves` coming back empty, and
  *  reporting it alone repeats the mistake `describeGameView` above had to fix one commit earlier:
  *
- *  - **`panelMounted`** — FlexLayout mounts only the SELECTED tab, so neither view's handle
- *    provider is registered when the Animation tab has never been clicked. `mode` would still
- *    read 'curves'.
+ *  - **`panelMounted`** — a tab that has never been opened this session is not mounted (see
+ *    docs/editor.md § Tab mounting latches; mounting LATCHES, so this is about never-opened, not
+ *    about currently-unselected), so neither view's handle provider is registered until the
+ *    Animation tab is clicked once. `mode` would still read 'curves'.
  *  - **`tangentsNeedActiveTrack`** — CurvesView publishes tangent handles for the ACTIVE track
  *    only (`CurvesView.tsx`), and `activeTi` resolves with no selection ONLY when exactly one
  *    curve is visible. So on a clip with two or more numeric tracks, switching to Curves is
@@ -230,7 +232,8 @@ function describeAnimationView() {
     ...(mounted ? {} : {
       panelNote: 'The Animation panel is NOT mounted, so neither view is showing and NEITHER '
         + "publishes handles — modoki_handles editor=dopesheet|curves is empty for that reason, "
-        + 'not because the clip is empty. FlexLayout mounts only the SELECTED tab, so open AND '
+        + 'not because the clip is empty. A tab that has never been OPENED this session is not '
+        + 'mounted, so open AND '
         + 'select the Animation tab (modoki_open_animation_editor does both when it opens a clip).',
     }),
     ...(s.animationViewMode === 'curves' ? {
@@ -1441,15 +1444,17 @@ export function registerEditorAgentOps(): void {
       };
     }
     if (!clip) {
-      // The realistic cause, and it is worth naming precisely: FlexLayout mounts only the SELECTED
-      // tab, so a docked-but-unselected Animation panel never runs the load effect.
+      // The realistic cause, named precisely: an Animation panel that has never been opened this
+      // session is not mounted, so it never runs the load effect. ⚠️ Mounting LATCHES — a panel
+      // opened earlier and since switched away from IS still mounted — see
+      // docs/editor.md § Tab mounting latches.
       return {
         ok: false, code: 'NOT_AVAILABLE_HERE', path: p.path,
         error: `the Animation editor was pointed at ${p.path} but no clip document loaded within 3s.`,
         hint: 'The clip DOCUMENT is fetched by the Animation panel, so that panel has to be mounted '
-          + '— and FlexLayout mounts only the SELECTED tab. Open/select the Animation tab (or check '
-          + 'modoki_get_editor_state.openPanels) and retry. The pose itself needs no panel; only '
-          + 'this load step does.',
+          + '— and a tab that has never been OPENED this session is not mounted. Open AND select the '
+          + 'Animation tab (or check modoki_get_editor_state.openPanels) and retry. The pose itself '
+          + 'needs no panel; only this load step does.',
       };
     }
     // Report the BIND separately from the open. They fail independently — a clip can load

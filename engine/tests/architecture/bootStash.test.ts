@@ -253,6 +253,26 @@ describe('#860 — a fault queued with no crashlytics sink survives the boot tha
     expect(localStorage.getItem(STASH_KEY), 'clear-on-read: one replay only').toBeNull();
   });
 
+  /** #1056 — the replay validates each stashed report's kind, and `caught` is one of them. A kind the
+   *  replay did not list would be skipped silently: the failure recorded, and then never sent. */
+  it('replays a previous boot\'s CAUGHT report (journalError) as an issue (#1056)', async () => {
+    const g = await import('../../packages/modoki/src/runtime/core/globalErrors');
+    const a = await import('../../packages/modoki/src/runtime/core/appServices');
+    a.clearAppServices();
+    g.__resetGlobalErrorsForTest({ uninstall: true });
+    localStorage.setItem(STASH_KEY, JSON.stringify({
+      v: STASH_VERSION, ts: Date.now(), dropped: 0, entries: [],
+      reports: [{ kind: 'caught', text: '[journalError] court.iap.durability-unconfirmed {"transactionId":"t-9"}' }],
+    }));
+
+    const errors: string[] = [];
+    g.installGlobalErrorHandlers();
+    a.registerAppServices({ crashlytics: { recordError: (m: string) => { errors.push(m); }, log: () => {} } });
+
+    expect(errors, 'the previous boot\'s caught failure must reach recordError')
+      .toContain('[prev-boot] [journalError] court.iap.durability-unconfirmed {"transactionId":"t-9"}');
+  });
+
   /** ⚠️ The half that keeps the eager write honest. Without it, a boot that queued a warn early and
    *  then booted FINE would replay that warn on every subsequent launch. */
   it('clears the stash when the sink arrives, so a boot that RECOVERED never replays itself', async () => {
@@ -472,6 +492,56 @@ describe('#860 — a fault queued with no crashlytics sink survives the boot tha
       .reports ?? []).map((r) => r.text);
     expect(texts.some((x) => x.includes('FIRST-FATAL')), 'the queued error must not be what gets evicted').toBe(true);
     expect(texts.some((x) => x.includes('SECOND-FATAL')), 'and the newcomer still gets in').toBe(true);
+  });
+
+  /** #1056 — a `caught` report (`journalError`) ranks BELOW an error and ABOVE a warn, in queue
+   *  admission and stash selection alike, because both read the one `reportKindRank`. */
+  it('a caught failure arriving at a FULL queue of warns evicts a warn (#1056)', async () => {
+    const g = await import('../../packages/modoki/src/runtime/core/globalErrors');
+    const a = await import('../../packages/modoki/src/runtime/core/appServices');
+    a.clearAppServices();
+
+    let t = 0;
+    g.__resetGlobalErrorsForTest({ clock: () => t });
+    runInlineScript('');
+    g.installGlobalErrorHandlers();
+
+    for (let i = 0; i < MAX_QUEUED + 5; i++) {
+      if (i % 20 === 0) t += 6000;
+      g.captureToCrashlytics('warn', `[console.warn] filler-${i}`);
+    }
+    t += 6000;
+    g.captureToCrashlytics('caught', '[journalError] LATE-CAUGHT');
+
+    const texts = ((JSON.parse(localStorage.getItem(STASH_KEY)!) as { reports?: Array<{ text: string }> })
+      .reports ?? []).map((r) => r.text);
+    expect(texts.some((x) => x.includes('LATE-CAUGHT')), 'a caught failure outranks a queued warn').toBe(true);
+  });
+
+  it('an error arriving at a FULL queue of caught failures evicts one, and a caught-only queue is stashed (#1056)', async () => {
+    const g = await import('../../packages/modoki/src/runtime/core/globalErrors');
+    const a = await import('../../packages/modoki/src/runtime/core/appServices');
+    a.clearAppServices();
+
+    let t = 0;
+    g.__resetGlobalErrorsForTest({ clock: () => t });
+    runInlineScript('');
+    g.installGlobalErrorHandlers();
+
+    g.captureToCrashlytics('caught', '[journalError] FIRST-CAUGHT');
+    expect(localStorage.getItem(STASH_KEY), 'a caught failure is a report, not a breadcrumb: it must be stashed')
+      .not.toBeNull();
+
+    for (let i = 1; i < MAX_QUEUED + 5; i++) {
+      if (i % 20 === 0) t += 6000;
+      g.captureToCrashlytics('caught', `[journalError] filler-${i}`);
+    }
+    t += 6000;
+    g.captureToCrashlytics('error', '[uncaught] LATE-FATAL');
+
+    const texts = ((JSON.parse(localStorage.getItem(STASH_KEY)!) as { reports?: Array<{ text: string }> })
+      .reports ?? []).map((r) => r.text);
+    expect(texts.some((x) => x.includes('LATE-FATAL')), 'an error outranks a queued caught failure').toBe(true);
   });
 
   /** ⚠️ The new key is read and REMOVED before the legacy key is touched, so a throw on the legacy

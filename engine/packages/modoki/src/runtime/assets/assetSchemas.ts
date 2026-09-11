@@ -19,6 +19,7 @@ import { defaultTimeline, normalizeTimeline, type TimelineDef } from '../timelin
 import { defaultSpriteClip } from '../traits/SpriteAnimator';
 import { defaultRig2DFile } from '../skinning/rig2dTypes';
 import { MATERIAL_TEXTURE_SLOTS } from './materialTextureSlots';
+import { hasDocKey } from '../core/docKeys';
 import { SHADER_PARAM_TYPES } from '../core/shaderSchema';
 import { defaultAtlasSource, ATLAS_FORMAT_VERSION } from '../loaders/spriteAtlas';
 
@@ -246,6 +247,11 @@ const SCHEMAS: Record<AssetSchemaType, () => AssetSchema> = {
 };
 
 export function getAssetSchema(type: AssetSchemaType): AssetSchema | null {
+  // ⚠️ `hasDocKey`, NOT `?.()` (#993). `type` arrives on the `modoki_asset_schema` agent
+  // payload and `SCHEMAS` is a code-declared literal, so `type: "constructor"` resolves to the
+  // inherited FUNCTION and `?.()` INVOKES it — `Object()` returns a truthy `{}`, which defeats
+  // `?? null`, and the caller then reads `.fields` off it and gets `undefined`.
+  if (!hasDocKey(SCHEMAS, type)) return null;
   return SCHEMAS[type]?.() ?? null;
 }
 

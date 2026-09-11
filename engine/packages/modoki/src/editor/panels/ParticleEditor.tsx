@@ -20,7 +20,7 @@ import { createTeardownScope } from '../../runtime/core/teardownScope';
 import { makePreviewLossPolicy } from './previewLossPolicy';
 import { canApplyParticleDef, handleParticleLossTeardown } from './particle/particlePreviewLoss';
 import { particleBackend } from '../../runtime/particles/particleBackend';
-import { defaultParticleEffect, resolveTrailSegments, type ParticleEffectDef, type ParticleHandle, type EmitterShapeType, type BlendMode, type ForceField, type MeshPrimitive, type SpriteMode, type SubEmitter, type CollisionConfig, type ColliderShape } from '../../runtime/particles/types';
+import { defaultParticleEffect, resolveTrailSegments, type ParticleEffectDef, type ParticleHandle, type EmitterShapeType, type BlendMode, type ForceField, type MeshPrimitive, type SpriteMode, type SubEmitter, type CollisionConfig, type ColliderShape, COLLIDER_SHAPES, COLLISION_MODES } from '../../runtime/particles/types';
 import { normalizeParticleDef } from '../../runtime/loaders/particleCache';
 import { newGuid, registerAsset } from '../../runtime/loaders/assetManifest';
 import { parseAssetJson } from '../../runtime/loaders/assetFetch';
@@ -675,10 +675,10 @@ export default function ParticleEditor() {
           </Section>
 
           <Section title="Collision" hint="Solid collider particles hit — a plane, sphere, or box. Coordinates are in the emitter's simulation space (emitter-local unless World space is enabled).">
-            <Enum label="Mode" hint="None = pass through. Kill = particle dies on contact. Bounce = reflect off the surface." v={def.collision?.mode ?? 'none'} options={['none', 'kill', 'bounce']} on={(v) => updColl({ mode: v as CollisionConfig['mode'] })} />
+            <Enum label="Mode" hint="None = pass through. Kill = particle dies on contact. Bounce = reflect off the surface." v={def.collision?.mode ?? 'none'} options={[...COLLISION_MODES]} on={(v) => updColl({ mode: v as CollisionConfig['mode'] })} />
             {def.collision && def.collision.mode !== 'none' && (
               <>
-                <Enum label="Shape" hint="Plane = infinite half-space (normal + a point). Sphere = solid ball. Box = solid axis-aligned box. Cylinder = solid column (axis + radius + length)." v={def.collision.shape ?? 'plane'} options={['plane', 'sphere', 'box', 'cylinder']} on={(v) => updColl({ shape: v as ColliderShape })} />
+                <Enum label="Shape" hint="Plane = infinite half-space (normal + a point). Sphere = solid ball. Box = solid axis-aligned box. Cylinder = solid column (axis + radius + length)." v={def.collision.shape ?? 'plane'} options={[...COLLIDER_SHAPES]} on={(v) => updColl({ shape: v as ColliderShape })} />
                 <Check label="Container" hint="Off = solid collider (keep particles OUT — they hit when entering). On = container (keep particles IN — they hit when leaving). Use a container sphere/box to trap an effect inside a volume and cull strays." v={def.collision.invert ?? false} on={(v) => updColl({ invert: v })} />
                 {def.collision.mode === 'bounce' && <Num label="Bounce" hint="Fraction of velocity retained on bounce: 0 = stop dead, 1 = perfectly elastic." v={def.collision.bounce} min={0} max={1} step={0.05} on={(v) => updColl({ bounce: v })} />}
                 {(def.collision.shape ?? 'plane') === 'plane' && (

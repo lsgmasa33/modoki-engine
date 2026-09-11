@@ -793,6 +793,30 @@ journal, which `setJournalEnabled` switches off in a release build.
 - The **re-entrancy latch is synchronous and a real service is async**, so what bounds the
   report-the-report bounce is the game wrapper's own once-per-message latch. Measured at two
   messages and pinned by a test.
+- **Caught failures: `journalError` files a `caught` report, in every build (#1056).** A failure a
+  game catches and carries on from never crashes and never reaches the console, and the journal is
+  off in a release build, so a journal-only `journalError` reached nobody from a store build (Court
+  had 28 such sites). `gameJournal.ts`'s `journalError` now also calls
+  `captureToCrashlytics('caught', '[journalError] <name> <payload>')`, outside the journal's enable
+  gate. `journalWarn` stays journal-only, so **the level is the decision**: `error` means a person
+  should look at it. ⚠️ The payload is sent as text: guids, keys, product/transaction ids and error
+  text only, never player content or an account id. **Verified on an iPhone 8 (2026-09-11):** one
+  `recordException` per call, reading `[journalError] <name> {…}`, and none for `journalWarn`.
+  ⚠️ **Pass error TEXT, not an Error object:** an Error in the payload reaches Crashlytics intact
+  (through `errorText`), but the journal bridge shows it as `{}`, measured in the same session.
+- ⚠️ **`caught` has its OWN session budget (100), like `warn`, and ranks between `error` and
+  `warn`** in the boot queue and in the stash. Both read `bootStash.ts`'s `reportKindRank`, the one
+  definition. A caught failure that recurs with a varying payload (a new transaction id each time)
+  defeats dedupe, and on the crash budget it would silence every later crash (owner, 2026-09-11).
+- ⚠️ **An `Error` is rendered by `runtime/core/errorText.ts`, never `stack || message` (#1055).**
+  JavaScriptCore (every iOS build) writes a stack of frames only, with no `Name: message` line, so
+  that shape sent Crashlytics a bare frame with the message gone: observed twice on an iPad mini 5.
+  V8's output comes back byte-identical, so Android reports, and the rate limiter's dedupe keys
+  built from them, did not move. ⚠️ Separately, and predating all of this: the plugin receives every
+  JS report with no domain, code or stack, so Crashlytics very likely groups them all into ONE issue
+  per platform. Found by reading the plugin's source; not yet checked in the console (#1063).
+  `engine/tests/architecture/errorTextIsShared.test.ts` fails a new copy of the pattern in
+  `engine/packages/modoki/src` or `engine/app`.
 
 **A JS fault during boot has to reach `appServices().crashlytics` to be reported, and there are
 THREE distinct windows depending on how far boot got before it died** (#823, #825, #860):
@@ -982,6 +1006,45 @@ Two limits worth knowing:
 A worked example of a game filling the slot — including the Firebase wrapper, the Proxy-thenable
 trap, the gradle/dSYM wiring and the on-device verification — is
 [games/court/attribution.md](../games/court/attribution.md) § "Phase 7 — Crashlytics".
+
+## iOS privacy manifest (#1051)
+
+Apple builds an app's privacy report from every `PrivacyInfo.xcprivacy` in the bundle: the app's
+own, plus one for each SDK that ships one. **So the app declares only what no SDK in its resolved
+package graph already declares.** A declaration the app does not need is still a false statement to
+Apple. Court and Weaveling each carry one at `ios/App/App/PrivacyInfo.xcprivacy`, in the App target's
+Resources phase. `engine/tests/architecture/iosPrivacyManifest.test.ts` checks the file, the wiring
+and the exact declarations.
+
+Measured 2026-09-11 from each game's `Package.resolved` and Xcode's package cache (Firebase 12.18.0,
+AppsFlyer 7.0.2, capacitor-swift-pm 8.4 / 8.5):
+
+| Ships its own manifest | Does not |
+|---|---|
+| Capacitor and CapacitorCordova (both empty) · AppsFlyerLib (tracking + domains, UserDefaults, FileTimestamp) · FirebaseCore, CoreInternal, Crashlytics, Auth, Installations, Firestore · GoogleUtilities · GoogleDataTransport · grpc · leveldb · gtm-session-fetcher · nanopb · promises · abseil · AppAuth · GTMAppAuth · GoogleSignIn · Facebook (tracking) | **`@capacitor/preferences`**, which calls `UserDefaults.standard` · the `@capacitor-firebase/*` and `capacitor-appsflyer` wrappers (no required-reason calls) · `capacitor-modoki-iap` · `GameDebugPlugin.swift` · **GoogleAppMeasurement** and GoogleAdsOnDeviceConversion (binary artifacts; no manifest in the checkout or the artifact) |
+
+- **Required-reason APIs: UserDefaults `CA92.1` only**, for `@capacitor/preferences`. The app
+  target's own Swift uses none. The guard derives this from each game's `package.json`.
+- **Tracking: `false`, with no domains.** The SDKs that track (AppsFlyer; Facebook in Court's graph)
+  declare it in their own manifests.
+- **Collected data: only the game's OWN first-party collection** (owner, 2026-09-11). Court declares
+  User ID, Gameplay Content and Purchase History (its Firestore cloud save), each linked, App
+  Functionality, not tracking. Weaveling declares none today; revisit when #927, #925 or #932 lands.
+- ⚠️ **GoogleAppMeasurement ships no manifest, so Firebase Analytics' own collection is declared by
+  nothing in the graph.** That is App Store privacy-label work (#933), not something to paper over
+  in the app's manifest. Confirmed in a built Court `App.app`, whose bundle carries ~45 SDK
+  manifests and none for it.
+- ⚠️ **Court embeds the Facebook SDK (FBSDKCoreKit, FBSDKLoginKit, FBAEMKit) without offering
+  Facebook sign-in.** `@capacitor-firebase/authentication`'s `Package.swift` links FacebookCore and
+  FacebookLogin unconditionally, and SPM has no optional products, so `providers` in
+  `capacitor.config.json` cannot remove them. Its manifests declare tracking, so Court's privacy
+  report carries that. Observed in a simulator build, 2026-09-11; filed as #1062.
+- ⚠️ **A re-scaffold refuses to delete an `ios/` that holds this file**, through the same survivor
+  guard as `GoogleService-Info.plist` (`engine/plugins/addNativeTarget.ts`). `cap add` cannot
+  regenerate it, and a project without it still builds.
+- ⚠️ **Adding a native dependency means re-checking this table**: does the new package ship a
+  manifest, and if not, which required-reason APIs does its native code call? The guard cannot see
+  either.
 
 ## AppLovin MAX Mediation (12 networks)
 

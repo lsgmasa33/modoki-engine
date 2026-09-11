@@ -380,7 +380,8 @@ exit cannot leave the panel's Cmd+S save handler pointed at a closed envelope; t
 had just reverted.
 
 A real limit: POSING needs no Animation panel mounted, but OPENING a clip does — the clip document
-is fetched by the panel's own effect and FlexLayout mounts only the selected tab, so
+is fetched by the panel's own effect, and a panel never opened this session is not mounted
+([editor.md](editor.md) § Tab mounting latches), so
 `modoki_open_animation_editor` waits for it and refuses with that as the reason rather than
 reporting a clip it has not got.
 

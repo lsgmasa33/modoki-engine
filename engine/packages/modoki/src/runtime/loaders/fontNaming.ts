@@ -1,6 +1,8 @@
 /** Font filename parsing — shared between runtime FontLoader and the build-time
  *  asset tree-shaker. Both must agree on family names or fonts will silently
  *  fail to load in production. */
+import { hasDocKey } from '../core/docKeys';
+
 
 /** Weight/style suffixes stripped from filenames to derive the base family name */
 export const WEIGHT_MAP: Record<string, { weight: string; style?: string }> = {
@@ -54,7 +56,13 @@ export function parseFontFilename(path: string): FontInfo {
 
   if (parts.length > 1) {
     const lastPart = parts[parts.length - 1].toLowerCase();
-    const match = WEIGHT_MAP[lastPart];
+    // ⚠️ `hasDocKey`, NOT `if (match)` (#993). `lastPart` is a segment of the font FILENAME
+    // and `WEIGHT_MAP` is a code-declared literal. Only ONE of the eight prototype names reaches
+    // this read: `.toLowerCase()` kills six of them and the `split(/[-_]/)` above kills
+    // `__proto__` (its segment is empty), while `constructor` is already lowercase and carries no
+    // separator. So `MyFont-constructor.ttf` returns the inherited FUNCTION, passes this
+    // truthiness guard, and `match.weight` is `undefined`.
+    const match = hasDocKey(WEIGHT_MAP, lastPart) ? WEIGHT_MAP[lastPart] : undefined;
     if (match) {
       family = parts.slice(0, -1).join(' ');
       weight = match.weight;

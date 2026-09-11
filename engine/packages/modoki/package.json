@@ -16,6 +16,7 @@
     "./runtime/core/abandonment": "./src/runtime/core/abandonment.ts",
     "./runtime/core/notifyListeners": "./src/runtime/core/notifyListeners.ts",
     "./runtime/core/consoleRing": "./src/runtime/core/consoleRing.ts",
+    "./runtime/core/errorText": "./src/runtime/core/errorText.ts",
     "./editor": "./src/editor/index.ts",
     "./editor/rendering": "./src/editor/rendering/index.ts",
     "./three": "./src/three/index.ts",

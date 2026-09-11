@@ -561,6 +561,61 @@ question the person in front of it was actually asking.
 
 ## Panels
 
+### Tab mounting LATCHES — "unselected" is not "unmounted" (#1015)
+
+**THE FACT, and everything else in the repo links here rather than restating it:** FlexLayout
+defers only a tab's **first** render. Once a tab has been rendered it keeps rendering after you
+switch away, so *"FlexLayout mounts only the SELECTED tab"* is true **only of a tab that has never
+been opened this session.**
+
+Verified in `flexlayout-react`'s `Layout` renderer (`dist/index.js`). ⚠️ **Two methods there each
+compute a local called `renderTab`, and only one of them governs MOUNTING** — `renderTabMoveables()`,
+the sole creator of the `SizeTracker` portal, and `SizeTracker` is in turn the sole caller of
+`layout.props.factory(node)`, which is what instantiates a panel:
+
+```js
+// renderTabMoveables() — the MOUNTING decision
+const visible = selected || !child.isEnableRenderOnDemand();
+const renderTab = child.isRendered() || visible && (rect.width > 0 && rect.height > 0);
+if (renderTab) { /* …createPortal(<SizeTracker …/>, element, key)… */ child.setRendered(renderTab); }
+```
+
+`setRendered` has exactly **one** call site, and it is that one, inside `if (renderTab)` — so
+`rendered` is only ever written `true`, and nothing anywhere resets it. The editor does not set
+`tabEnableRenderOnDemand`, so FlexLayout's default (`true`) applies.
+
+⚠️ **What latches is the tab NODE, not the tab's name.** `rendered` is initialised `false` in the
+`TabNode` constructor, and CLOSING a tab removes the node — so a tab closed and re-added is a
+*fresh* node that must be selected once again. "I opened it earlier this session" is therefore not
+by itself a reason to believe a panel is mounted; `panelMounted` is.
+
+⚠️ **Do not read the decision off `renderTabs()`.** Its `renderTab` is a *different* expression
+(`child.isRendered() || selected || !child.isEnableRenderOnDemand()`), it calls no `setRendered`,
+and what it renders is the `Tab` positioning element — not the panel.
+
+⚠️ **Selection is not sufficient either.** The mounting condition also requires
+`rect.width > 0 && rect.height > 0`, so a **selected tab in a zero-area tabset never mounts.**
+That case is **not** the one `panelCollapsed` reports — it is the opposite one. `panelCollapsed` is
+`panelMounted && <zero area>` (`describeGameView` in `engine/app/editor/agentEditorOps.ts`), so it
+describes a panel that latched first and was squeezed flat afterwards; a tab first selected INTO a
+zero-area tabset surfaces as `panelMounted: false` instead. Which is why "is it selected?" answers
+neither direction of the question.
+
+**So mountedness has exactly one source of truth: the panel publishes it from its own mount effect**
+(`gameViewMounted`, `animationPanelMounted`), read back as `panelMounted`. It is **not** derivable
+from `openPanels` — that is every tab NODE in the model with no selection test — and it is not
+derivable from selection. ⚠️ Do not "simplify" `panelMounted` into either; #367 shipped the
+`openPanels` version, which answered `mounted: true` for precisely the case the field exists to
+catch.
+
+**The practical advice everywhere is unchanged and still correct** — *open AND select the tab* —
+because selecting an unmounted tab does mount it. Only the stated *reason* was wrong.
+
+⚠️ **The scar is that this propagates.** #994's session read one of the unqualified copies, believed
+it, and wrote the claim into an agent-facing refusal string and two normative docs before measuring
+`gameView.panelMounted: false` alongside a live `game-3d` surface and having to retract. #1015 then
+found seven more copies. A fact restated at N sites is a fact that gets corrected at one.
+
 ### A panel's load/write DECISION goes in a plain `.ts` beside it, not in the `.tsx`
 
 Editor `.tsx` is not mounted in jsdom — that asserts the mock rather than the panel — so any logic

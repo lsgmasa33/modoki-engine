@@ -280,7 +280,14 @@ export function refFieldWarnings(traits: unknown, label: string, assetExists?: A
   const out: string[] = [];
   if (!traits || typeof traits !== 'object') return out;
   for (const [traitName, traitVal] of Object.entries(traits as Record<string, unknown>)) {
-    const refFields = REF_FIELDS_BY_TRAIT[traitName];
+    // ⚠️ `hasDocKey`, NOT a raw index (#993). `traitName` is document data and
+    // `REF_FIELDS_BY_TRAIT` is a code-declared literal, so a trait named `toString` returns the
+    // inherited FUNCTION — truthy, so the `!refFields` guard below passes it through, and the
+    // `for (… of refFields)` loop then throws "not iterable". #986 fixed `traitSchema.fields`
+    // in this same file (see `hasDocKey` below) and missed this read.
+    const refFields = hasDocKey(REF_FIELDS_BY_TRAIT, traitName)
+      ? REF_FIELDS_BY_TRAIT[traitName]
+      : undefined;
     // A tag trait serializes as `true` and carries no fields; an unknown trait still gets
     // its refs checked (a typo'd trait name must not also hide a dead asset ref).
     if (!refFields || !traitVal || typeof traitVal !== 'object') continue;

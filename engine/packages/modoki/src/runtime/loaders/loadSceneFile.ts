@@ -8,7 +8,7 @@ import { isGuid, isExternalUrl, resolveRef, getAssetType, deriveGuid, newGuid, g
 import { parseEntryPrefabs } from '../traits/UIEntries';
 import { markUIDirty } from '../ui/uiTreeStore';
 import { markOverride, clearOverrideMarks, clearAllOverrideMarks } from './overrideMarks';
-import { emptyDocMap } from '../core/docKeys';
+import { emptyDocMap, hasDocKey } from '../core/docKeys';
 import { isPersistentTraitField } from '../core/ecs/traitSchema';
 import {
   mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, foldTraitOverride,
@@ -1367,7 +1367,13 @@ export function collectResourceRefsFromEntities(
       // fontFamily FIELD ITSELF — a real atlas fetch + GPU upload, on every scene load, for a
       // game whose font is DOM-only. Skipping by FIELD is what actually holds: the registry
       // owns those fields, the sweep owns the rest (#231).
-      const registryFields = REF_FIELDS_BY_TRAIT[traitName];
+      // ⚠️ `hasDocKey`, NOT a raw index (#993). `traitName` comes from the scene/prefab JSON and
+      // `REF_FIELDS_BY_TRAIT` is a code-declared literal, so a trait named `constructor` returns
+      // the inherited FUNCTION — and `registryFields?.includes(field)` on the next line is a
+      // TypeError, i.e. a crash on the load path for EVERY scene and prefab.
+      const registryFields = hasDocKey(REF_FIELDS_BY_TRAIT, traitName)
+        ? REF_FIELDS_BY_TRAIT[traitName]
+        : undefined;
       for (const [field, value] of Object.entries(bag as Record<string, unknown>)) {
         if (registryFields?.includes(field)) continue;
         // One level of array unwrap, to also catch an AnimationLibrary-shaped guid

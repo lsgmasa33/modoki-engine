@@ -33,6 +33,7 @@
 
 import { opReplyFor } from './opRefusal';
 import {
+  hasDocKey,
   sceneManager,
   getAllEntities,
   getAllTraits,
@@ -46,6 +47,8 @@ import {
   journalEvents,
   clearJournal,
   setJournalEnabled,
+  JOURNAL_LEVELS,
+  isJournalLevel,
   resolveRefName,
   setVerboseCapture,
   verboseCaptureState,
@@ -772,6 +775,18 @@ registerAgentOp('journal-events', (params) => {
     if (!isVerboseType(t)) return { ok: false, reason: `"${t}" is always-on, not watch-gated — nothing to start/stop. Watch-gated types: ${verboseCaptureState().types.join(', ') || '(none)'}.`, captures: verboseCaptureState() };
     setVerboseCapture(t, p.action === 'start');
     return { ok: true, action: p.action, type: t, captures: verboseCaptureState() };
+  }
+  // ⚠️ REFUSE an unknown level rather than silently returning the whole ring (#993 close-out
+  // § 2d). `p.level` arrives unvalidated on the `device_journal`/`modoki_journal` payload, and
+  // `filtered` below would still report the reply as filtered — so `level:"wran"` answered with
+  // every event of every level, which an agent reads as "there really were N warn+ events". The
+  // shape is the `isVerboseType` refusal eleven lines above, deliberately.
+  if (p.level !== undefined && !isJournalLevel(p.level)) {
+    return {
+      ok: false,
+      reason: `unknown level "${p.level}" — nothing was read and nothing was cleared. Valid: ${JOURNAL_LEVELS.join(', ')}. `
+        + 'A level filter means that severity AND ABOVE.',
+    };
   }
   const filtered = !!(p.type || p.level);
   const all = journalEvents();
@@ -2364,7 +2379,14 @@ async function handleSceneChanged(msg: { urlPath: string; kind: SceneChangedKind
   // it prevents. The parked write goes with the cache entry: once the cached def is dropped the
   // pending doc has no live counterpart, and disk becomes the truth for that asset (otherwise the
   // next save_all flushes the stale parked doc over the file that was just written).
-  const invalidateCachedAsset = ASSET_CACHE_INVALIDATORS[msg.kind];
+  // ⚠️ `hasDocKey`, NOT a raw index (#993). `msg.kind` arrives on the device-debug/HMR
+  // protocol and `ASSET_CACHE_INVALIDATORS` is a code-declared literal, so `kind:"constructor"`
+  // returns the inherited FUNCTION — truthy, so the `if` below passes — and the next line CALLS
+  // it: `Object(urlPath)`. The looked-up value being invoked is what makes this one the sharpest
+  // read in the family after scroll-demo's URL param.
+  const invalidateCachedAsset = hasDocKey(ASSET_CACHE_INVALIDATORS, msg.kind)
+    ? ASSET_CACHE_INVALIDATORS[msg.kind]
+    : undefined;
   if (invalidateCachedAsset) {
     invalidateCachedAsset(msg.urlPath);
     // ⚠️ Only when THIS asset's own file changed. `viaSibling` says the broadcast was raised by a

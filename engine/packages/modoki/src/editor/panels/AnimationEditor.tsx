@@ -175,9 +175,9 @@ export default function AnimationEditor() {
   // handle unreachable to an agent (#369). See editorStore.animationViewMode.
   const viewMode = useEditorStore((s) => s.animationViewMode);
   const setViewMode = useEditorStore((s) => s.setAnimationViewMode);
-  // Publish mountedness for the agent read-back. FlexLayout mounts only the SELECTED tab, so
-  // "the Animation tab exists" (openPanels) is not "a view is showing" — the distinction #367
-  // had to learn on the Game panel. Without this, set-animation-view-mode answers ok:true for an
+  // Publish mountedness for the agent read-back. It is derivable from NEITHER openPanels NOR
+  // selection (docs/editor.md § Tab mounting latches), so "the Animation tab exists" is not
+  // "a view is showing" — the distinction #367 had to learn on the Game panel. Without this, set-animation-view-mode answers ok:true for an
   // editor where neither view's handle provider is registered.
   const setPanelMounted = useEditorStore((s) => s.setAnimationPanelMounted);
   useEffect(() => {

@@ -28,8 +28,8 @@ import {
   texture, uv, mix, sin, cos, max, floor, abs, sign, select,
   positionLocal, normalLocal,
 } from 'three/tsl';
-import { resolveTiles, renderBuildKey, renderQuadKey, clampSimDt, PREWARM_STEP, seekSteps, MAX_GPU_FORCES, TEXTURE_WAIT_BUDGET_MS, type IParticleBackend, type ParticleEffectDef, type ParticleHandle, type EmitterShapeType } from './types';
-import { resolveCollider } from './colliders';
+import { resolveTiles, renderBuildKey, renderQuadKey, clampSimDt, PREWARM_STEP, seekSteps, MAX_GPU_FORCES, TEXTURE_WAIT_BUDGET_MS, type IParticleBackend, type ParticleEffectDef, type ParticleHandle, type EmitterShapeType, type ColliderShape, type CollisionMode } from './types';
+import { resolveCollider, resolveColliderShape } from './colliders';
 import { resolveShape } from './emitterShapes';
 import { resolveGravity, type Vec3 } from './simSpec';
 import { createOverLifeLUT, type OverLifeLUT } from './gpuLut';
@@ -40,6 +40,7 @@ import { resolveQuadShift, computeQuadCorners, applyQuadInPlace } from './sprite
 import { textureProvider } from '../core/textureProvider';
 import { rawNow } from '../core/clock';
 import { warnVocabOnce } from '../core/warnVocab';
+import { hasDocKey } from '../core/docKeys';
 
 function loadTexture3D(ref: string, opts?: { flipY?: boolean }): Promise<THREE.Texture> {
   const p = textureProvider.get();
@@ -148,8 +149,12 @@ const SHAPE: Record<EmitterShapeType, number> = { point: 0, cone: 1, sphere: 2, 
 // MAX_GPU_FORCES (the unrolled force-field cap) is shared from ./types so the router's
 // eligibility check (gpuDefSupported) and this kernel agree — an effect with more forces
 // than the cap now falls back to CPU instead of silently dropping the extras (F11).
-const COLL = { none: 0, kill: 1, bounce: 2 } as const;
-const COLLIDER = { plane: 0, sphere: 1, box: 2, cylinder: 3 } as const;
+// ⚠️ These codes are read by the TSL kernel below, so they are written out rather than derived
+// from the tuple's index — reordering `COLLIDER_SHAPES` must not silently re-map the shader. The
+// `Record<…>` annotations are what keeps the two in step: add a member to the tuple and this
+// file stops compiling until it has a code (#993).
+const COLL: Record<CollisionMode, number> = { none: 0, kill: 1, bounce: 2 };
+const COLLIDER: Record<ColliderShape, number> = { plane: 0, sphere: 1, box: 2, cylinder: 3 };
 
 // Storage-buffer nodes are consumed via `.element(instanceIndex)` in both the compute kernels
 // and the render builder — a storage BINDING, not a vertex attribute. (This said `.toAttribute()`
@@ -329,8 +334,12 @@ function applyUniforms(u: GpuUniforms, def: ParticleEffectDef): void {
   u.noiseStr.value = def.noise?.strength ?? 0;
   u.noiseFreq.value = def.noise?.frequency ?? 1;
   u.noiseScroll.value = def.noise?.scrollSpeed ?? 1;
-  if (!(def.shape.type in SHAPE)) warnVocabOnce('particles', 'EmitterShape.type', def.shape.type, "treated as 'point'");
-  u.shapeType.value = SHAPE[def.shape.type] ?? 0;
+  // ⚠️ `hasDocKey`, NOT `in` (#993). `shape.type` comes from the `.particle.json`; `SHAPE` is
+  // a code-declared literal, so `'toString' in SHAPE` is TRUE — no warning — and `?? 0` cannot
+  // catch what comes back, because a function is not nullish.
+  const shapeType = hasDocKey(SHAPE, def.shape.type) ? SHAPE[def.shape.type] : undefined;
+  if (shapeType === undefined) warnVocabOnce('particles', 'EmitterShape.type', def.shape.type, "treated as 'point'");
+  u.shapeType.value = shapeType ?? 0;
   const rsh = resolveShape(def.shape);
   u.radiusInner.value = rsh.innerR;
   u.radiusOuter.value = rsh.outerR;
@@ -359,7 +368,16 @@ function applyUniforms(u: GpuUniforms, def: ParticleEffectDef): void {
     u.forceTypes[k].value = f?.type === 'point' ? 1 : 0;
   }
   const coll = def.collision;
-  u.collMode.value = coll && coll.mode !== 'none' ? COLL[coll.mode] : COLL.none;
+  // ⚠️ `hasDocKey` (#993) — same table family, same file, third read. `mode` is
+  // `.particle.json` data and `COLL` is a code-declared literal, so `mode: "constructor"`
+  // survives the `!== 'none'` test and returns the inherited FUNCTION into a GPU uniform.
+  const collMode = coll && coll.mode !== 'none' && hasDocKey(COLL, coll.mode)
+    ? COLL[coll.mode]
+    : undefined;
+  if (coll && coll.mode !== 'none' && collMode === undefined) {
+    warnVocabOnce('particles', 'collision.mode', coll.mode, "treated as 'none'");
+  }
+  u.collMode.value = collMode ?? COLL.none;
   u.bounce.value = coll?.bounce ?? 0;
   if (coll && coll.mode !== 'none') {
     // Reuse the CPU resolver so plane normalization + legacy planeY migration match exactly.
@@ -542,7 +560,12 @@ export class GpuComputeBackend implements IParticleBackend {
     // so the common ambient case (galaxy/snow/dust) pays nothing for either.
     const hasForces = (def.forces?.length ?? 0) > 0;
     const hasCollision = !!def.collision && def.collision.mode !== 'none';
-    const colliderShape = COLLIDER[def.collision?.shape ?? 'plane'];
+    // ⚠️ This read had NO guard at all (#993): an ordinary typo (`"spere"`) was silently
+    // `undefined` here while its sibling at `shapeType` above warned and fell back. Route it
+    // through `resolveColliderShape`, the SHARED normaliser the CPU backend uses — which both
+    // closes the prototype hole (the result can only be a real member, so this index is total)
+    // and stops the two backends answering differently for one typo.
+    const colliderShape = COLLIDER[resolveColliderShape(def.collision?.shape)];
     const colliderInvert = !!def.collision?.invert;
 
     // ── per-frame update: age, respawn-on-death, integrate (+ forces, + collision) ──

@@ -16,6 +16,7 @@
  *  Only the first set lives in SELF_PLACEMENT_PROPS. */
 
 import { isSizeInert } from './anchorLayout';
+import { hasDocKey } from '../core/docKeys';
 
 export type UiPreset = 'view' | 'text' | 'image' | 'button' | 'input' | 'slider';
 
@@ -34,6 +35,20 @@ export const UI_PRESET_DEFAULTS: Record<UiPreset, Record<string, unknown>> = {
   slider: { elementType: 'range', width: 160, height: 24, rangeMin: 0, rangeMax: 100, rangeStep: 1 },
 };
 
+/** The valid preset names, DERIVED from the table rather than re-listed. */
+export const UI_PRESET_NAMES = Object.keys(UI_PRESET_DEFAULTS) as ReadonlyArray<UiPreset>;
+
+/** ⚠️ `hasDocKey`, and a THROW rather than a fallback (#993) — the mirror of `lightDefaults`
+ *  in scene/entityCreateSpecs.ts, and for the same reason. `preset` is `spec.preset` off the
+ *  `create-entity` agent payload, so `preset: "toString"` handed the inherited FUNCTION to the
+ *  `UIElement` trait's `data` and the op still answered `{ok: true}`. */
+function uiPresetDefaults(preset: UiPreset): Record<string, unknown> {
+  if (!hasDocKey(UI_PRESET_DEFAULTS, preset)) {
+    throw new Error(`create-entity: unknown UI preset "${preset}" — nothing was created. Valid: ${UI_PRESET_NAMES.join(', ')}.`);
+  }
+  return UI_PRESET_DEFAULTS[preset];
+}
+
 /** Default anchor stamped on every newly-created UI element: centered, with
  *  pivot 0.5 so the element's CENTER (not its top-left) lands at the parent
  *  center — pivot 0 against a `center` anchor would offset it down-right. */
@@ -50,7 +65,7 @@ export function buildUiCreateSpecs(preset: UiPreset, parentId: number): { name: 
       { name: 'EntityAttributes', data: { name, parentId, layer: 'ui' } },
       { name: 'RenderableUI' },
       { name: 'UIAnchor', data: { ...DEFAULT_UI_ANCHOR } },
-      { name: 'UIElement', data: UI_PRESET_DEFAULTS[preset] },
+      { name: 'UIElement', data: uiPresetDefaults(preset) },
     ],
   };
 }

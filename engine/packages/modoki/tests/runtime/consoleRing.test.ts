@@ -273,6 +273,32 @@ describe('consoleRing', () => {
     expect(entry.args[0].split('\n').length).toBeGreaterThan(1); // a stack, not a one-liner
   });
 
+  // #1055. A JavaScriptCore stack (iOS) is frames only, so `stack || message` kept the stack and
+  // LOST the message. Fabricated here in the shape an iPad produced, since these run on V8.
+  const JSC_STACK = 'anonymous@capacitor://localhost/assets/bridge-6HfFgXzW.js:2:1673';
+  const jscError = (message: string): Error => {
+    const err = new Error(message);
+    Object.defineProperty(err, 'stack', { value: JSC_STACK, configurable: true });
+    return err;
+  };
+
+  it('an Error with a frames-only (JavaScriptCore) stack keeps its MESSAGE too (#1055)', () => {
+    installConsoleRing();
+    console.error(jscError('boom'));
+
+    const [entry] = getConsoleRingEntries();
+    expect(entry.args[0]).toBe(`Error: boom\n${JSC_STACK}`);
+  });
+
+  it('a frames-only (JavaScriptCore) Error NESTED in an object keeps its MESSAGE too (#1055)', () => {
+    installConsoleRing();
+    console.error('ctx', { err: jscError('inner boom') });
+
+    const [entry] = getConsoleRingEntries();
+    expect(entry.args[1]).toContain('Error: inner boom');
+    expect(entry.args[1]).toContain('anonymous@capacitor://');
+  });
+
   // F3 (#626/#633 adversarial review): the editor's own `formatError` used to add this, but
   // nothing called it any more — `getEditorLogs()` (and every other projection) reads THIS
   // module's `stringifyArg`, which is `stack || message` alone and drops `cause` entirely. Moved

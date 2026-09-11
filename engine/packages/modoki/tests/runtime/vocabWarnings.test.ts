@@ -29,6 +29,14 @@ import { computeCanvasScale } from '../../src/runtime/rendering/canvas2DScaler';
 import { CpuParticleSim, type ParticleOutputs } from '../../src/runtime/particles/cpuSimulator';
 import { defaultParticleEffect, type ParticleEffectDef } from '../../src/runtime/particles/types';
 import { resolveCollider, collide, type CollisionHit } from '../../src/runtime/particles/colliders';
+import { COLLIDER_SHAPES } from '../../src/runtime/particles/types';
+
+/** The full set (#986/#993). A suite naming only `__proto__` stays green against every READ
+ *  site in this family — only `__proto__` goes through a setter. */
+const PROTO_KEYS = [
+  '__proto__', 'constructor', 'toString', 'valueOf',
+  'hasOwnProperty', 'isPrototypeOf', 'propertyIsEnumerable', 'toLocaleString',
+] as const;
 import type { CollisionConfig } from '../../src/runtime/particles/types';
 
 import { clearManifest, registerAsset } from '../../src/runtime/loaders/assetManifest';
@@ -267,35 +275,68 @@ describe('CpuParticleSim — unrecognised EmitterShape.type', () => {
 // ── 4: particle CollisionConfig.shape ──
 
 describe('particle CollisionConfig.shape — unrecognised value', () => {
-  it('warns once and collides exactly like a solid "box"', () => {
+  // ⚠️ The input here is load-bearing, and the version of this suite that shipped with #73 got
+  // it wrong. It probed at (5,0,0) against a 2×2×2 collider — OUTSIDE the box, and on the
+  // allowed side of the default plane — so EVERY shape returns false and leaves `out` untouched.
+  // "collides exactly like a solid box" was therefore asserted by an input that cannot tell box
+  // from plane from sphere, and it stayed green when the fallback changed (#993).
+  //
+  // (0, -0.5, 0) discriminates: the plane (normal +Y through the origin) is violated and
+  // projects to y = 0, while the box's least-penetration exit is the -Y face at y = -1.
+  const probe = (cfg: CollisionConfig) => {
+    const out: CollisionHit = { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0 };
+    const hit = collide(resolveCollider(cfg), 0, -0.5, 0, 0, -1, 0, 1, out);
+    return { hit, out };
+  };
+  const base = { mode: 'bounce', bounce: 1, width: 2, height: 2, depth: 2 } as const;
+
+  it('the probe input tells the two fallbacks APART — without this the rest is vacuous', () => {
+    const plane = probe({ ...base, shape: 'plane' } as CollisionConfig);
+    const box = probe({ ...base, shape: 'box' } as CollisionConfig);
+    expect(plane.hit).toBe(true);
+    expect(box.hit).toBe(true);
+    expect(plane.out.y).not.toBe(box.out.y);
+  });
+
+  it("warns once and collides exactly like a 'plane' — what an ABSENT shape already meant", () => {
     const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const badCfg = { mode: 'bounce', bounce: 1, shape: 'shpere' as any, width: 2, height: 2, depth: 2 } as CollisionConfig;
-    const boxCfg: CollisionConfig = { mode: 'bounce', bounce: 1, shape: 'box', width: 2, height: 2, depth: 2 };
-    const rcBad = resolveCollider(badCfg);
-    const rcBox = resolveCollider(boxCfg);
-    const outBad: CollisionHit = { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0 };
-    const outBox: CollisionHit = { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0 };
-    const hitBad = collide(rcBad, 5, 0, 0, -1, 0, 0, 1, outBad); // outside +X face
-    const hitBox = collide(rcBox, 5, 0, 0, -1, 0, 0, 1, outBox);
-    expect(hitBad).toBe(hitBox);
-    expect(outBad).toEqual(outBox);
+    const bad = probe({ ...base, shape: 'shpere' as any } as CollisionConfig);
+    const plane = probe({ ...base, shape: 'plane' } as CollisionConfig);
+    const box = probe({ ...base, shape: 'box' } as CollisionConfig);
+    expect(bad.hit).toBe(plane.hit);
+    expect(bad.out).toEqual(plane.out);
+    // The half that makes the assertion above mean something: it is NOT the old 'box' answer.
+    expect(bad.out).not.toEqual(box.out);
 
-    collide(rcBad, 5, 0, 0, -1, 0, 0, 1, outBad); // repeat — still one warn
+    probe({ ...base, shape: 'shpere' as any } as CollisionConfig); // repeat — still one warn
     const warns = spy.mock.calls.filter((c) => String(c[0]).includes('CollisionConfig.shape'));
     expect(warns.length).toBe(1);
     expect(String(warns[0][0])).toContain('shpere');
+    expect(String(warns[0][0])).toContain("treated as 'plane'");
     spy.mockRestore();
   });
 
-  it('a legitimate "box" shape never warns', () => {
+  it('ACCEPT side: every real shape resolves to itself and never warns', () => {
     const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const cfg: CollisionConfig = { mode: 'bounce', bounce: 1, shape: 'box', width: 2, height: 2, depth: 2 };
-    const rc = resolveCollider(cfg);
-    const out: CollisionHit = { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0 };
-    collide(rc, 5, 0, 0, -1, 0, 0, 1, out);
+    for (const shape of COLLIDER_SHAPES) {
+      expect(resolveCollider({ ...base, shape } as CollisionConfig).shape).toBe(shape);
+    }
+    // An ABSENT shape is `plane` — which is exactly why an unrecognised one is too.
+    expect(resolveCollider({ ...base } as CollisionConfig).shape).toBe('plane');
     const warns = spy.mock.calls.filter((c) => String(c[0]).includes('CollisionConfig.shape'));
     expect(warns.length).toBe(0);
+    spy.mockRestore();
+  });
+
+  it('a prototype key is not a shape — the guard is hasOwn-shaped, not `in`-shaped (#993)', () => {
+    const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    for (const proto of PROTO_KEYS) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect(resolveCollider({ ...base, shape: proto as any } as CollisionConfig).shape).toBe('plane');
+    }
+    const warns = spy.mock.calls.filter((c) => String(c[0]).includes('CollisionConfig.shape'));
+    expect(warns.length).toBe(PROTO_KEYS.length);
     spy.mockRestore();
   });
 });

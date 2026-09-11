@@ -75,8 +75,8 @@ describe('set-animation-view-mode', () => {
   });
 
   it("reports panelMounted, so ok:true cannot mean 'a view is showing' when none is", async () => {
-    // The #367 lesson applied one panel over: FlexLayout mounts only the SELECTED tab, so an
-    // Animation tab that exists in the layout but was never clicked does not mount — and then
+    // The #367 lesson applied one panel over: an Animation tab that exists in the layout but was
+    // never OPENED does not mount (docs/editor.md § Tab mounting latches) — and then
     // NEITHER view registers a handle provider. Reporting the mode alone would answer
     // `curves` for an editor showing no Animation view at all, which is the readiness lie.
     const r = await setView('curves');

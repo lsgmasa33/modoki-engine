@@ -116,7 +116,11 @@ export function coerceParamValue(param: ShaderParam, value: unknown): unknown {
       // An asset ref (guid or path) to an image, or '' when unset.
       return typeof v === 'string' ? v : (typeof fallback === 'string' ? fallback : '');
     default: {
-      const n = VEC_COMPONENTS[param.type];
+      // ⚠️ `hasDocKey` (#993). `param.type` comes from the `.shader.json` and `VEC_COMPONENTS`
+      // is a code-declared literal, so a `type` of `valueOf` returns the inherited FUNCTION and
+      // `new Array(fn)` builds a one-element array holding it — a uniform shipping a function.
+      // 0 components is the honest answer for a type this table does not know.
+      const n = hasDocKey(VEC_COMPONENTS, param.type) ? VEC_COMPONENTS[param.type] : 0;
       if (Array.isArray(v) && v.length === n) return v;
       if (Array.isArray(fallback) && fallback.length === n) return fallback;
       return new Array(n).fill(0);

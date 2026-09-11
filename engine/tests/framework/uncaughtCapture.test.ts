@@ -102,6 +102,32 @@ describe('installUncaughtCapture', () => {
     )).toBe(true);
   });
 
+  // #1055. A JavaScriptCore stack (iOS) is frames only, so `stack || message` recorded a frame with no
+  // message. Fabricated in the shape an iPad produced, since these run on V8.
+  it('keeps the MESSAGE of an uncaught error and a rejection whose stack is frames only (#1055)', async () => {
+    vi.resetModules();
+    const { installConsoleRing, getConsoleRingEntries } = await import('@modoki/engine/runtime/core/consoleRing');
+    installConsoleRing();
+    const { installUncaughtCapture } = await import('../../app/debug/uncaughtCapture');
+    installUncaughtCapture();
+    const jscError = (message: string): Error => {
+      const err = new Error(message);
+      Object.defineProperty(err, 'stack', { value: 'anonymous@capacitor://localhost/assets/bridge.js:2:1673' });
+      return err;
+    };
+
+    const before = getConsoleRingEntries().length;
+    window.dispatchEvent(new ErrorEvent('error', { error: jscError('jsc boom'), message: 'jsc boom' }));
+    window.dispatchEvent(new PromiseRejectionEvent('unhandledrejection', {
+      promise: Promise.reject().catch(() => {}),
+      reason: jscError('jsc rejected'),
+    }));
+
+    const lines = getConsoleRingEntries().slice(before).map((e) => e.args.join(' '));
+    expect(lines.some((l) => l.includes('[uncaught]') && l.includes('Error: jsc boom'))).toBe(true);
+    expect(lines.some((l) => l.includes('[unhandledrejection]') && l.includes('Error: jsc rejected'))).toBe(true);
+  });
+
   it('captures an unhandledrejection into the shared ring with the [console-capture] marker', async () => {
     vi.resetModules();
     const { installConsoleRing, getConsoleRingEntries } = await import('@modoki/engine/runtime/core/consoleRing');

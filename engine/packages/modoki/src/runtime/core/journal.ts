@@ -25,6 +25,8 @@
 import { type World } from 'koota';
 import { getCurrentWorld, peekCurrentWorld } from './ecs/worldRegistry';
 import { EntityAttributes } from './traits/EntityAttributes';
+import { hasDocKey } from './docKeys';
+import { warnVocabOnce } from './warnVocab';
 
 /** Triage severity for a journal event — the axis Claude filters on first when hunting
  *  a bug ("show me warn+ in the last N ticks") rather than reading the full trace.
@@ -32,6 +34,16 @@ import { EntityAttributes } from './traits/EntityAttributes';
 export type JournalLevel = 'info' | 'warn' | 'error';
 
 const LEVEL_RANK: Record<JournalLevel, number> = { info: 0, warn: 1, error: 2 };
+
+/** The level vocabulary, DERIVED from the rank table — so a caller that wants to REFUSE an
+ *  unknown level (the `journal-events` op does) cannot list a fourth one by hand (#993). */
+export const JOURNAL_LEVELS = Object.keys(LEVEL_RANK) as ReadonlyArray<JournalLevel>;
+
+/** Is `level` one this journal ranks? Exported for the op, which must answer the CALLER rather
+ *  than warn into an editor console the caller never reads. */
+export function isJournalLevel(level: string): level is JournalLevel {
+  return hasDocKey(LEVEL_RANK, level);
+}
 
 export interface GameEvent {
   /** `Time.frame` when emitted — ordered, monotonic within a run. */
@@ -264,7 +276,23 @@ export function emit(type: string, payload?: unknown, world: World = getCurrentW
 export function journalEvents(filter?: { type?: string; level?: JournalLevel }, world: World = getCurrentWorld()): GameEvent[] {
   let out = liveEvents(journalStateFor(world));
   if (filter?.type) out = out.filter((e) => e.type === filter.type);
-  if (filter?.level) { const min = LEVEL_RANK[filter.level]; out = out.filter((e) => LEVEL_RANK[e.level] >= min); }
+  // ⚠️ `hasDocKey` (#993). `filter.level` arrives on the `device_journal` agent payload and
+  // `LEVEL_RANK` is a code-declared literal, so `level:"toString"` yields the inherited FUNCTION:
+  // every `>=` against it is false and the journal silently returns ZERO events — which an agent
+  // reads as "nothing happened". An unknown level filters nothing instead.
+  if (filter?.level) {
+    if (isJournalLevel(filter.level)) {
+      const min = LEVEL_RANK[filter.level];
+      out = out.filter((e) => LEVEL_RANK[e.level] >= min);
+    } else {
+      // ⚠️ This warn is the LAST resort, not the fix. It reaches an editor console the calling
+      // agent never reads, so `journal-events` REFUSES an unknown level outright (see
+      // `isJournalLevel` there) — without that, `level:"wran"` returned the whole ring under a
+      // `filtered: true` framing, which is indistinguishable from "there really were N warn+
+      // events". This branch stays for the non-op callers (JournalTab, game code).
+      warnVocabOnce('journal', 'level', filter.level, 'level filter IGNORED (every level returned)');
+    }
+  }
   return out;
 }
 

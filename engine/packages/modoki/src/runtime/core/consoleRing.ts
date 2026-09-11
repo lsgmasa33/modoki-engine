@@ -24,6 +24,7 @@
 import { rawNow } from './clock';
 import { createTeardownToken } from './liveness';
 import { notifyListeners } from './notifyListeners';
+import { errorText } from './errorText';
 
 export type ConsoleRingLevel = 'log' | 'info' | 'warn' | 'error';
 
@@ -179,7 +180,8 @@ function stringifyArg(v: unknown): string {
   // error once reached `diagnose` as a literal `{}` (measured on a Samsung, #157). An earlier draft
   // of THIS file returned `${v.name}: ${v.message}`, which is the same defect wearing a nicer
   // label: visible but useless, because the stack is what says WHERE. All three captures this file
-  // replaced returned `stack || message`; so does this.
+  // replaced returned `stack || message`. That kept the stack but, on iOS, LOST the message: a
+  // JavaScriptCore stack has no `Name: message` line (#1055). `errorText` keeps both.
   //
   // F3 (#626/#633 adversarial review): PLUS the `cause` chain, which `.stack` alone never carries.
   // `formatError` used to do this in the editor's own projection — reachable by nothing once #626
@@ -187,7 +189,7 @@ function stringifyArg(v: unknown): string {
   // `createEditor.tsx`'s `sceneReady.catch((e) => console.error('[Editor] scene load failed:', e))`
   // logs) reached every consumer with its cause silently erased. Fixed HERE, at the ring, so every
   // projection (editor, in-game debug menu, agent bridge, device bridge) gains it at once.
-  if (v instanceof Error) return (v.stack || v.message) + formatCauseChain(v);
+  if (v instanceof Error) return errorText(v) + formatCauseChain(v);
   try {
     // Handled at BOTH depths, matching `safeStringify`: the branch above catches a top-level Error,
     // the replacer below catches one NESTED in an object or array. `{cause: err}` and `[err]` are
@@ -203,7 +205,7 @@ function stringifyArg(v: unknown): string {
     // `Error` cause carries anything worth chaining.
     const json = JSON.stringify(v, (_k, val) => (
       isThenable(val) ? PENDING_PROMISE_MARKER
-        : val instanceof Error ? (val.stack || val.message) + formatCauseChain(val)
+        : val instanceof Error ? errorText(val) + formatCauseChain(val)
           : val));
     // `JSON.stringify` returns `undefined` — not a string — for a function, a symbol, or any value
     // whose `toJSON` yields undefined. Returning that would put a non-string into

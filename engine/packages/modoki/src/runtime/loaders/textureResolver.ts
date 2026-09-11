@@ -23,6 +23,7 @@ import {
 } from '../core/activeRenderer';
 import { ktx2LoaderCtor, prewarmGlbLoaders } from './threeLoaderModules';
 import { warnVocabOnce } from '../core/warnVocab';
+import { hasDocKey } from '../core/docKeys';
 import { getActiveTextureSizeCap } from '../core/textureSizeCap';
 import { emitAssetInvalidated } from '../core/assetInvalidation';
 import { createSupersessionToken, createTeardownToken } from '../core/liveness';
@@ -388,10 +389,17 @@ export function resolveBrowserImageUrl(ref: string, warnKtx = false): string | u
 function applyTextureSettings(tex: THREE.Texture, s: TextureImportSettings, isKtx: boolean, flipY?: boolean): void {
   // Unrecognised wrapS/wrapT falls through to `undefined` (not three's own ClampToEdgeWrapping
   // default — verified they differ, see #73) — preserved as-is, just warned once.
-  if (!(s.wrapS in WRAP)) warnVocabOnce('texture', 'wrapS', s.wrapS, 'wrapS left unset (undefined)');
-  if (!(s.wrapT in WRAP)) warnVocabOnce('texture', 'wrapT', s.wrapT, 'wrapT left unset (undefined)');
-  tex.wrapS = WRAP[s.wrapS];
-  tex.wrapT = WRAP[s.wrapT];
+  // ⚠️ `hasDocKey`, NOT `s.wrapS in WRAP` (#993). `wrapS`/`wrapT` come from the texture
+  // `.meta.json`; `WRAP` is a code-declared literal, so `'toString' in WRAP` is TRUE — the
+  // warning never fired AND `Object.prototype.toString` was assigned into a three.js wrapping
+  // enum. Both halves have to move together: guarding the warning alone still leaks the value.
+  const wrapS = hasDocKey(WRAP, s.wrapS) ? WRAP[s.wrapS] : undefined;
+  const wrapT = hasDocKey(WRAP, s.wrapT) ? WRAP[s.wrapT] : undefined;
+  if (wrapS === undefined) warnVocabOnce('texture', 'wrapS', s.wrapS, 'wrapS left unset (undefined)');
+  if (wrapT === undefined) warnVocabOnce('texture', 'wrapT', s.wrapT, 'wrapT left unset (undefined)');
+  // The casts are the #73 behaviour above, which `Record<TextureWrap, Wrapping>` cannot express.
+  tex.wrapS = wrapS as THREE.Wrapping;
+  tex.wrapT = wrapT as THREE.Wrapping;
   // Only 'linear' and 'srgb' are valid TextureColorspace values — anything else silently keeps
   // today's fallback (SRGBColorSpace), same as a legitimate 'srgb'.
   if (s.colorspace !== 'linear' && s.colorspace !== 'srgb') {

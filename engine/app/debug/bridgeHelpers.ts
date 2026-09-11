@@ -3,6 +3,7 @@
  *  re-implementing them (which let copies silently drift from the shipping code — code-review T7). */
 
 import { withTimeout } from '@modoki/engine/runtime/core/abandonment';
+import { errorText } from '@modoki/engine/runtime/core/errorText';
 
 /** Native (iOS drawHierarchy) capture dims, kept by the bridge after a native screenshot. */
 export interface LastScreenInfo { imageWidth: number; imageHeight: number; screenWidth: number; screenHeight: number }
@@ -63,20 +64,23 @@ export function safeStringify(value: unknown): string {
   // it through here and did not, which is exactly the kind of divergence one shared helper exists
   // to prevent.
   //
-  // Handled at BOTH depths, like the thenable case beside it: the top-level branch returns the raw
-  // stack (so a captured console arg reads as text, matching `agentBridge`'s capture), and the
+  // Handled at BOTH depths, like the thenable case beside it: the top-level branch returns the
+  // stack as text (so a captured console arg reads as text, matching `agentBridge`'s capture), and the
   // replacer below catches Errors NESTED in an object or array. The first cut of this fix did only
   // the top level — `{cause: err}` and `[err]` still serialized to `{"cause":{}}` / `[{}]`, which is
   // the same defect one level down, and a rejection value is exactly the kind of thing that arrives
   // wrapped. Caught in close-out review by asking why the thenable directly above was nested-aware
   // and this was not.
-  if (value instanceof Error) return value.stack || value.message;
+  //
+  // Both depths go through `errorText`, never `stack || message`: on iOS the stack has no message
+  // line, so the device bridge showed frames with no message (#1055).
+  if (value instanceof Error) return errorText(value);
   try {
     return typeof value === 'string'
       ? value
       : JSON.stringify(value, (_k, v) => (
         isThenable(v) ? PENDING_PROMISE_MARKER
-          : v instanceof Error ? (v.stack || v.message)
+          : v instanceof Error ? errorText(v)
             : v));
   } catch {
     return String(value);

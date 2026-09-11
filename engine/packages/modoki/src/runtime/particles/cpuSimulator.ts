@@ -10,7 +10,7 @@
 
 import { resolveTrailSegments, resolveTiles, spriteFrameIndex, type ParticleEffectDef, type RGB } from './types';
 import { makeRng, randRange, sampleCurve, sampleGradientAlpha, sampleGradientColor } from '../core/curves';
-import { resolveCollider, collide, type CollisionHit } from './colliders';
+import { resolveCollider, resolveCollisionMode, collide, type CollisionHit } from './colliders';
 import { resolveShape, samplePolyline, type ResolvedShape } from './emitterShapes';
 import { accumNoise, accumForce, dragFactor, annulusRadius, sphereRadius, resolveGravity, type Vec3 } from './simSpec';
 import { warnVocabOnce } from '../core/warnVocab';
@@ -433,7 +433,11 @@ export class CpuParticleSim {
     const noiseT = this.time * (noise?.scrollSpeed ?? 1);
     const forces = def.forces;
     const coll = def.collision;
-    const rc = coll && coll.mode !== 'none' ? resolveCollider(coll) : null;
+    // ⚠️ `resolveCollisionMode`, NOT `coll.mode !== 'none'` (#993 review). A typo'd mode used to
+    // pass that test and then fall through every `=== 'kill'` branch below, so the CPU BOUNCED
+    // where the GPU treated the same file as no collision at all.
+    const mode = resolveCollisionMode(coll?.mode);
+    const rc = coll && mode !== 'none' ? resolveCollider(coll) : null;
     const collHit = this.collHit;
     let i = 0;
     while (i < this.count) {
@@ -462,7 +466,7 @@ export class CpuParticleSim {
       let nx = px + vx * dt, ny = py + vy * dt, nz = pz + vz * dt;
       // plane / sphere / box collision (shared geometry with the GPU kernel)
       if (rc && collide(rc, nx, ny, nz, vx, vy, vz, coll!.bounce, collHit)) {
-        if (coll!.mode === 'kill') {
+        if (mode === 'kill') {
           if (this.fillPool) {
             // keep the pool full: recycle in place (mirrors the GPU backend), don't drain
             if (this.recordDeaths) this.deathEvents.push(this.px[i], this.py[i], this.pz[i], this.vx[i], this.vy[i], this.vz[i]);

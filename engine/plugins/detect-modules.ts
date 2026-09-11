@@ -13,6 +13,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { BuildModules, ModuleKey } from '../project-config';
+import { hasDocKey } from '../packages/modoki/src/runtime/core/docKeys';
 
 export type { ModuleKey };
 
@@ -94,8 +95,12 @@ export function detectModules(projectRoot: string): DetectResult {
       const traits = (ent as { traits?: Record<string, unknown> }).traits;
       if (!traits || typeof traits !== 'object') continue;
       for (const traitName of Object.keys(traits)) {
-        const mod = TRAIT_TO_MODULE[traitName];
-        if (mod) used[mod] = true;
+        // ⚠️ `hasDocKey`, NOT `if (mod)` (#993). `traitName` is a raw key off the scene JSON and
+        // `TRAIT_TO_MODULE` is a code-declared literal, so a trait named `constructor` returns the
+        // inherited FUNCTION — truthy — and the next line writes `used[String(fn)] = true`, i.e. a
+        // garbage module flag into the bag this plugin hands the build's `define`s.
+        if (!hasDocKey(TRAIT_TO_MODULE, traitName)) continue;
+        used[TRAIT_TO_MODULE[traitName]] = true;
       }
       const layer = (traits.EntityAttributes as { layer?: unknown } | undefined)?.layer;
       if (layer === '3d') used.render3d = true;

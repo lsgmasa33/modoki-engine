@@ -11,8 +11,28 @@
  * the caller applies them (bounce) or recycles the particle (kill).
  */
 
-import type { CollisionConfig, ColliderShape } from './types';
+import { COLLIDER_SHAPES, COLLISION_MODES, type CollisionConfig, type ColliderShape, type CollisionMode } from './types';
 import { warnVocabOnce } from '../core/warnVocab';
+
+/**
+ * Normalise an authored `collision.shape` to one this code actually implements.
+ *
+ * ⚠️ **ONE place, because the two backends must not disagree about a typo** (#993). An absent
+ * shape has always meant `plane`, so an UNRECOGNISED one is treated the same way — warn once, then
+ * plane. Owner decision, 2026-09-11 (recorded on #993), taken together with the Inspector picker
+ * that keeps a new typo from being authored in the first place.
+ *
+ * It used to differ by backend, and neither answer was chosen: the GPU path produced `undefined`
+ * silently, and this file fell through to **`box`** purely because box was the last branch of an
+ * if/else chain. The same `.particle.json` collided differently on CPU and GPU — against this
+ * module's own docblock, which says to keep the two in lockstep.
+ */
+export function resolveColliderShape(shape: string | undefined): ColliderShape {
+  if (shape === undefined) return 'plane';
+  if ((COLLIDER_SHAPES as readonly string[]).includes(shape)) return shape as ColliderShape;
+  warnVocabOnce('particles', 'CollisionConfig.shape', shape, "treated as 'plane'");
+  return 'plane';
+}
 
 /** Runtime form of a {@link CollisionConfig} — defaults filled, plane normal unit-length. */
 export interface ResolvedCollider {
@@ -29,8 +49,26 @@ export interface ResolvedCollider {
   invert: boolean;
 }
 
+/**
+ * Normalise an authored `collision.mode` to one both backends implement.
+ *
+ * ⚠️ The twin of {@link resolveColliderShape}, and it exists for the identical reason (#993
+ * review). Fixing `shape` alone left `mode` one screen away in the same function still splitting
+ * the backends: for `mode: "bounse"` the GPU mapped to `COLL.none` and its kernel's
+ * `collMode.greaterThan(0)` made the whole collision block inert — particles pass through — while
+ * the CPU sim asked only `mode !== 'none'` and then special-cased `'kill'`, so the SAME file
+ * bounced. `none` is the fallback because it is what the GPU path already warned it was doing,
+ * and because it is what an absent `collision` means.
+ */
+export function resolveCollisionMode(mode: string | undefined): CollisionMode {
+  if (mode === undefined) return 'none';
+  if ((COLLISION_MODES as readonly string[]).includes(mode)) return mode as CollisionMode;
+  warnVocabOnce('particles', 'CollisionConfig.mode', mode, "treated as 'none'");
+  return 'none';
+}
+
 export function resolveCollider(c: CollisionConfig): ResolvedCollider {
-  const shape = c.shape ?? 'plane';
+  const shape = resolveColliderShape(c.shape);
   // `nx/ny/nz` is the plane surface normal, or the cylinder axis — both unit-length.
   const n = shape === 'cylinder' ? (c.axis ?? [0, 1, 0]) : (c.planeNormal ?? [0, 1, 0]);
   const nlen = Math.hypot(n[0], n[1], n[2]) || 1;
@@ -164,7 +202,16 @@ export function collide(
     const s = rc.invert ? -1 : 1; // container → normal points inward
     nx = ux * s; ny = uy * s; nz = uz * s;
   } else { // solid box (axis-aligned)
-    if (rc.shape !== 'box') warnVocabOnce('particles', 'CollisionConfig.shape', rc.shape, "treated as 'box'");
+    // ⚠️ KEEP this check even though `resolveColliderShape` makes an unrecognised STRING
+    // unreachable here (#993 review). What it does not cover is a shape ADDED to
+    // `COLLIDER_SHAPES` whose CPU math nobody wrote: the GPU's table is typed
+    // `Record<ColliderShape, number>` so that case fails to COMPILE there, but this is an
+    // if/else chain and would silently run solid-box math. Removing this line is what made
+    // that silent — and the accept-side test (`for (const shape of COLLIDER_SHAPES)`) would
+    // pass for the new member too.
+    if (rc.shape !== 'box') {
+      warnVocabOnce('particles', 'CollisionConfig.shape', rc.shape, "has no CPU collider math — treated as 'box'");
+    }
     const lx = x - rc.cx, ly = y - rc.cy, lz = z - rc.cz;
     const px = rc.hx - Math.abs(lx);
     const py = rc.hy - Math.abs(ly);

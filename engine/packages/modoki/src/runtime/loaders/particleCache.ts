@@ -11,6 +11,7 @@ import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import { defaultParticleEffect, PARTICLE_FORMAT_VERSION, type ParticleEffectDef, type CollisionConfig } from '../particles/types';
 import { particleDefProvider } from '../particles/particleDefProvider';
+import { resolveColliderShape } from '../particles/colliders';
 import { createTeardownToken } from '../core/liveness';
 import { classifyFormatVersion } from '../core/formatVersion';
 
@@ -35,9 +36,19 @@ const liveness = createTeardownToken<string>();
 /** Migrate a legacy collision config (infinite horizontal plane at `planeY`, no `shape`)
  *  to the explicit `plane` collider so old assets upgrade on their next save. */
 function migrateCollision(c?: CollisionConfig): CollisionConfig | undefined {
-  if (!c || c.shape) return c; // already in the new (shape-tagged) format, or absent
+  if (!c) return c;
+  // ⚠️ Normalise the SHAPE here too, not only at the two runtime readers (#993 review). This
+  // is the one place the INSPECTOR also goes through — the docblock above says this module is
+  // shared with the Particle Editor so loaded and edited defs normalize identically — and
+  // without it a `.particle.json` carrying `shape: "spere"` renders a Shape dropdown holding a
+  // value absent from its own options while every geometry block (`shape === 'plane'`, …) is
+  // `===`-guarded and therefore hidden. The author could see neither the typo nor the plane the
+  // runtime was actually simulating.
+  const shape = resolveColliderShape(c.shape);
+  if (c.shape) return c.shape === shape ? c : { ...c, shape };
+  // Legacy: no `shape` at all — an infinite horizontal plane at `planeY`.
   const { planeY, ...rest } = c;
-  return { ...rest, shape: 'plane', planeNormal: [0, 1, 0], planePoint: [0, planeY ?? 0, 0] };
+  return { ...rest, shape, planeNormal: [0, 1, 0], planePoint: [0, planeY ?? 0, 0] };
 }
 
 /** Hard ceiling on pool size — guards against a corrupt/huge maxParticles allocating
