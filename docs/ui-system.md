@@ -441,6 +441,15 @@ Field groups (representative fields, verified against `UIElement.ts`):
   deliberately skips any entity on a genuine `pre-wrap` path (`autoFitText`, or the `TextAnimation`
   trait), where authoring a newline is correct — a false positive on legitimate multi-line text
   costs more than a miss.
+  **Code is gated too (#841)** — both instances #676 fixed were string literals in `.ts`, not scene
+  text. The same guard file scans string and template tokens (parser-located, comments stripped,
+  COOKED text, so a `\n` escape counts) for space runs and newlines: **game and demo code with no
+  "reaches UIElement.text" marker**, because the one known case (wordweave's `hudFormat`) is written
+  in one file and reaches the DOM from another; **engine code only in files that write UIElement
+  text**, because the rest of its strings are shader source, CSS and console text. Every accepted
+  site is a ledger row with a reason. ⚠️ It cannot see text built at RUNTIME — LLM chat, player
+  names, a separator computed with `repeat`/`padStart` — nor engine code that passes game text
+  through without a write marker; `tools/`, `editor/` and tests are out of scope.
 
 - **Image** — `imageSrc`, `imageMode` (`cover | contain | fill | none`).
 - **Element type** — `elementType` (`div | input | range`) and `placeholder`. Most

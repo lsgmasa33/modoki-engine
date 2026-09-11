@@ -14,10 +14,18 @@
  */
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
-import { validateSceneData } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
+import { validateSceneData, collapsedNewlineWarnings } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { hasAnyProject, hasInternalGames } from '../helpers/repoLayout';
 import { assertDeclaredListIsComplete } from '../helpers/declaredList';
+import { readScannedSource, stringTokens, stripComments } from '@modoki/engine/testing';
+
+/** A whitespace run the DOM collapses to one space (`white-space: normal`). ONE constant for the
+ *  scene half (#676) and the code half (#841), so the two halves cannot come to disagree. */
+const SPACE_RUN = /[ \t]{2,}/;
+/** An authored newline, which the same collapse eats. Used by the code half only — the scene half
+ *  goes through `collapsedNewlineWarnings` instead, for the reason its own test gives. */
+const NEWLINE = /\n/;
 
 type RawEntity = { traits?: Record<string, unknown> };
 type RawScene = { entities?: RawEntity[] };
@@ -171,7 +179,9 @@ describe('committed UI content does not fake spacing with whitespace (#676)', ()
    *  collapse those into one row that vouches for both. */
   function textSites(predicate: (text: string) => boolean): string[] {
     const out: string[] = [];
-    for (const { rel, abs } of scenes) {
+    // Prefabs too: a prefab's authored text renders exactly like a scene's, and one spawned from
+    // code is never reached through any scene — scanning scenes alone left that text unguarded.
+    for (const { rel, abs } of [...scenes, ...prefabFiles]) {
       let data: RawScene;
       try { data = JSON.parse(fs.readFileSync(abs, 'utf8')) as RawScene; } catch { continue; }
       for (const e of data.entities ?? []) {
@@ -236,11 +246,34 @@ describe('committed UI content does not fake spacing with whitespace (#676)', ()
     ).toBeDefined();
   });
 
+  /** A prefab's text reaches that validator only when a scene instantiates the prefab, so a prefab
+   *  spawned from code (an arrow, a pooled row) was never checked. This calls the same arm on every
+   *  prefab entity directly, rather than restating the rule. */
+  it('no prefab authors a newline the DOM will collapse, instantiated by a scene or not', () => {
+    const findings: string[] = [];
+    let withText = 0;
+    for (const { rel, abs } of prefabFiles) {
+      let data: RawPrefab;
+      try { data = JSON.parse(fs.readFileSync(abs, 'utf8')) as RawPrefab; } catch { continue; }
+      for (const e of data.entities ?? []) {
+        if (typeof (e.traits?.UIElement as { text?: unknown } | undefined)?.text === 'string') withText++;
+        findings.push(...collapsedNewlineWarnings(e.traits, rel));
+      }
+    }
+    // Measured 21 prefab entities with UIElement text when this landed; the floor catches the loop
+    // reaching nothing, which would otherwise pass as "no findings".
+    if (hasInternalGames()) expect(withText).toBeGreaterThan(10);
+    expect(
+      findings,
+      `authored newlines in prefab text collapse exactly as scene text does (docs/ui-system.md § spacing is layout):\n${findings.join('\n')}`,
+    ).toEqual([]);
+  });
+
   it.skipIf(!hasInternalGames())('every space-run site is a reviewed exemption', () => {
     assertDeclaredListIsComplete({
       label: 'UIElement.text space runs (#676)',
       declared: [],
-      population: textSites((t) => /[ \t]{2,}/.test(t)),
+      population: textSites((t) => SPACE_RUN.test(t)),
       // Well under the twelve rows below: this floor exists to catch the MARKER breaking (a regex
       // that stops matching makes every assertion here vacuous), not to pin the corpus. Converting
       // a few of these to layout later is expected and must not fail the gate — the stale-exemption
@@ -275,7 +308,159 @@ describe('committed UI content does not fake spacing with whitespace (#676)', ()
   it('CONTROL: the space-run marker still matches', () => {
     // Same reasoning as the controls above — an "everything is exempt" pass and a "the regex
     // stopped matching" pass look identical from the outside.
-    expect(/[ \t]{2,}/.test('a  b')).toBe(true);
-    expect(/[ \t]{2,}/.test('a b')).toBe(false);
+    expect(SPACE_RUN.test('a  b')).toBe(true);
+    expect(SPACE_RUN.test('a b')).toBe(false);
+  });
+});
+
+/** #841 — the same collapse, reached from CODE.
+ *
+ *  The describe above gates authored JSON, but both instances #676 actually fixed were string
+ *  literals in `.ts` (`iap-test`'s `parts.join('   ·   ')`, `postfx-demo`'s double-spaced template).
+ *  This is that half. It reads string and template tokens located by the TypeScript parser
+ *  (`stringTokens`), on comment-stripped source, and tests their COOKED text — so a `\n` escape and
+ *  a raw newline inside a template are the same finding.
+ *
+ *  **Two corpora, scoped differently on purpose** (measured 2026-09-11):
+ *  - **Game and demo code is scanned WITHOUT a "reaches UIElement.text" marker.** The one known
+ *    space-run literal, wordweave's `hudFormat`, is authored in `traits.ts` and reaches the DOM from
+ *    `screen.ts` — a per-file marker cannot see it, nor any other flow that crosses a file. Unmarked,
+ *    this corpus is quiet: one space-run token and three newline files, all ledgered below.
+ *  - **Engine code is scanned only where it WRITES UIElement text** (`UI_TEXT_WRITE`). Unmarked, its
+ *    strings are shader source, CSS keyframes and console text — 60+ space runs and 21 newline files,
+ *    none reaching a UIElement — so an unmarked scan would be a ledger of noise nobody reads.
+ *
+ *  ⚠️ **What it deliberately does NOT reach**, so green is not read as more than it is:
+ *  - text built at runtime (LLM chat, player names) and separators computed at runtime
+ *    (`' '.repeat(n)`, `padStart(n, ' ')` — zero such calls in game code when this landed);
+ *  - engine code that passes game text through without a write marker;
+ *  - `tools/` (Node CLI scripts that print to a terminal and never ship), `editor/` (editor-only
+ *    panels) and tests;
+ *  - JSX text, which is neither a string token nor UIElement text. */
+describe('shippable code does not fake spacing with whitespace (#841)', () => {
+  const SKIP_SEGMENTS = ['node_modules', 'dist', 'ios', 'android', 'ads', 'release', 'tests', 'test', '__tests__', 'tools', 'editor'];
+  const isSource = ({ rel }: { rel: string }) => !/\.(test|spec|d)\.tsx?$/.test(rel);
+  // `floor: 0` for the same public-snapshot reason as `scenes` at the top of this file; the
+  // non-vacuity pins live in the gated sanity test below.
+  const projectCode = repoFiles({ under: ['games', 'demos'], match: /\.tsx?$/, exclude: SKIP_SEGMENTS, floor: 0 })
+    .filter(isSource);
+  const engineCode = repoFiles({
+    under: ['engine/packages/modoki/src/runtime', 'engine/app'], match: /\.tsx?$/, exclude: SKIP_SEGMENTS, floor: 400,
+  }).filter(isSource);
+
+  /** A write of UIElement text, in the shapes code uses to write one: a `set`, the trait CONSTRUCTOR
+   *  (`spawn`/`add(UIElement({ … }))`), a chrome patch, a UIEntries patch object, a meta-spawn, a store
+   *  value. Every alternative requires its call paren or object brace, so prose and type names that
+   *  merely MENTION these do not match. ⚠️ A floor on matched files cannot tell which alternatives
+   *  are live (two of these match no engine file today) — the CONTROL below pins each one. */
+  const UI_TEXT_WRITE = /\.set\(\s*UIElement\b|\bUIElement\s*\(\s*\{|\bpatchUI\s*\(|\bUIElement\s*:\s*\{|\buiElMeta\.trait\s*\(|\bsetUIValues\s*\(/;
+
+  const FIX = 'Spacing between two pieces of visible text must be LAYOUT — separate flex children with an '
+    + 'authored gap — never consecutive spaces or a newline inside one string, which the DOM collapses '
+    + '(docs/ui-system.md § spacing is layout). If this string never reaches a UIElement, add an exempt '
+    + 'row saying where it goes instead.';
+
+  type Site = { rel: string; line: number; text: string };
+  function whitespaceSites(files: { rel: string; abs: string }[]): { spaceRuns: Site[]; newlines: Site[]; tokens: number } {
+    const spaceRuns: Site[] = [];
+    const newlines: Site[] = [];
+    let tokens = 0;
+    for (const { rel, abs } of files) {
+      for (const t of stringTokens(readScannedSource(abs).code, rel)) {
+        tokens++;
+        if (SPACE_RUN.test(t.text)) spaceRuns.push({ rel, ...t });
+        if (NEWLINE.test(t.text)) newlines.push({ rel, ...t });
+      }
+    }
+    return { spaceRuns, newlines, tokens };
+  }
+  let projectScanCache: ReturnType<typeof whitespaceSites> | undefined;
+  const projectScan = () => (projectScanCache ??= whitespaceSites(projectCode));
+
+  it.skipIf(!hasInternalGames())('scanned the game and demo code (sanity: the guard is not passing vacuously)', () => {
+    // Measured 245 files / 10,479 string tokens when this landed. Floors sit well under that so
+    // ordinary corpus change does not trip them; they exist to catch the ENUMERATION or the TOKENIZER
+    // breaking, either of which would otherwise read as "no findings".
+    expect(projectCode.length).toBeGreaterThan(120);
+    expect(projectScan().tokens).toBeGreaterThan(5000);
+  });
+
+  it.skipIf(!hasInternalGames())('every space run in game/demo code is a reviewed exemption', () => {
+    assertDeclaredListIsComplete({
+      label: 'string-literal space runs in game/demo code (#841)',
+      declared: [],
+      population: [...new Set(projectScan().spaceRuns.map((s) => `${s.rel}::${JSON.stringify(s.text)}`))].sort(),
+      floor: 1,
+      fix: FIX,
+      exempt: [
+        { item: 'games/wordweave/runtime/traits.ts::"LEVEL {level}    {found}/{total} WORDS    {extras}/{extraTotal} EXTRA"',
+          reason: 'a DELIMITER, never displayed as one string: splitHudParts (screen.ts) splits the format on its '
+            + 'space runs into separate HUD parts laid out by the row — the runs are the instruction, not the spacing' },
+      ],
+    });
+  });
+
+  it.skipIf(!hasInternalGames())('every newline literal in game/demo code is a reviewed exemption', () => {
+    // Keyed by FILE and COUNT. Every known site is a file of non-UI text, where a per-literal ledger
+    // would be thirteen rows saying the same thing about ChessAI.ts — but a bare file key would also
+    // excuse the NEXT newline literal anyone adds to that file, UI-bound or not. The count makes a
+    // new literal change the key, so it goes red and gets looked at.
+    const perFile = new Map<string, number>();
+    for (const s of projectScan().newlines) perFile.set(s.rel, (perFile.get(s.rel) ?? 0) + 1);
+    assertDeclaredListIsComplete({
+      label: 'string-literal newlines in game/demo code (#841) — rows are `<file> ×<literal count>`; a '
+        + 'count that no longer matches means a newline literal was added to or removed from that file: '
+        + 'confirm the new one never reaches UI text, then update the count',
+      declared: [],
+      population: [...perFile].map(([rel, n]) => `${rel} ×${n}`).sort(),
+      floor: 1,
+      fix: FIX,
+      exempt: [
+        { item: 'games/chess/runtime/ai/ChessAI.ts ×13', reason: 'assembles the LLM prompt (system prompt, board, move history) sent to the model — never rendered' },
+        { item: 'games/chess/runtime/ChessManager.ts ×1', reason: 'the chat-reply LLM prompt — sent to the model, never rendered; the REPLY is runtime text this scan cannot see' },
+        { item: 'games/wordweave/runtime/dictionary.ts ×1', reason: "'\\n' is the delimiter of the word list it indexes — parsing data, never displayed" },
+      ],
+    });
+  });
+
+  it('engine code that writes UIElement text carries no space-run or newline literal', () => {
+    const marked = engineCode.filter(({ abs }) => UI_TEXT_WRITE.test(readScannedSource(abs).code));
+    // Measured 2 (ui/sceneChrome.ts, ui/uiValues.ts). A floor, not a pin — it catches the marker
+    // breaking, which would otherwise empty this scan and pass it.
+    expect(marked.length, 'UI_TEXT_WRITE matched fewer engine files than when it landed — it may have stopped matching')
+      .toBeGreaterThanOrEqual(2);
+    const { spaceRuns, newlines } = whitespaceSites(marked);
+    expect([...spaceRuns, ...newlines].map((s) => `${s.rel}:${s.line}  ${JSON.stringify(s.text)}`), FIX).toEqual([]);
+  });
+
+  it('CONTROL: the token scan flags space runs and newlines, and nothing the DOM does not collapse', () => {
+    const src = [
+      "const a = 'x  y';", //                  1 flag: space run
+      "const b = 'x\\t\\ty';", //              2 flag: escaped tabs cook to a tab run
+      "const c = 'x\\ny';", //                 3 flag: newline escape
+      'const d = `x', //                       4 flag: raw newline inside a template
+      'y`;',
+      'const e = `x  ${a}`;', //               6 flag: a template's static part
+      "const f = 'x y';", //                   7 single space
+      "const g = 'x\u2007\u2007y';", //     8 figure space (U+2007) does not collapse
+      "const h = 'x\u00a0\u00a0y';", //     9 no-break space (U+00A0) does not collapse
+      "// const i = 'x  y';", //               10 inside a comment
+      "/* const j = 'x\\ny'; */", //           11 inside a block comment
+      'const k = <b>x  y</b>;', //             12 JSX text is not a string token
+    ].join('\n');
+    const tokens = stringTokens(stripComments(src, { regexLiterals: true }), 'control.tsx');
+    expect(tokens.filter((t) => SPACE_RUN.test(t.text)).map((t) => t.line)).toEqual([1, 2, 6]);
+    expect(tokens.filter((t) => NEWLINE.test(t.text)).map((t) => t.line)).toEqual([3, 4]);
+  });
+
+  it('CONTROL: UI_TEXT_WRITE matches the write shapes and not their neighbours', () => {
+    for (const s of [
+      'e.set(UIElement, { ...ui, text })', "world.spawn(UIElement({ text: 'a' }))", 'e.add(UIElement( { text }))',
+      "patchUI(world, 'Title', { text })",
+      'entries.push({ UIElement: { text } })', 'uiElMeta.trait({ text })', 'setUIValues({ hearts: 3 })',
+    ]) expect(UI_TEXT_WRITE.test(s), s).toBe(true);
+    for (const s of [
+      'e.get(UIElement)', 'world.query(UIElement, Transform)', 'const patchUIs = 1', 'type UIElementData = {}',
+    ]) expect(UI_TEXT_WRITE.test(s), s).toBe(false);
   });
 });

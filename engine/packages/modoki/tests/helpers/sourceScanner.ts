@@ -287,6 +287,33 @@ export function assertScanIsSane(
  * scanner is the one to reach for on anything else (shader text, a sliced function body).
  */
 export function stripCommentsAndStrings(src: string, label: string): string {
+  const out = stripComments(src).split('');
+  forEachStringToken(src, label, 'blanking them with a character scanner is what this function exists to avoid', (node, sf) => {
+    // `getStart` skips leading trivia; the span is the literal including its own delimiters.
+    for (let i = node.getStart(sf); i < node.getEnd(); i++) {
+      if (out[i] !== '\n') out[i] = ' ';
+    }
+  });
+  return out.join('');
+}
+
+/** The literal tokens `stripCommentsAndStrings` blanks and `stringTokens` returns. Deliberately NOT
+ *  the whole `FirstLiteralToken..LastTemplateToken` range — that starts at `NumericLiteral`, and a
+ *  bare-hex sweep is exactly the caller this exists for. `JsxText` is absent for the same reason. */
+const STRING_TOKEN_KINDS: ReadonlySet<ts.SyntaxKind> = new Set([
+  ts.SyntaxKind.StringLiteral,
+  ts.SyntaxKind.NoSubstitutionTemplateLiteral,
+  ts.SyntaxKind.TemplateHead,
+  ts.SyntaxKind.TemplateMiddle,
+  ts.SyntaxKind.TemplateTail,
+]);
+
+/** Parse `src` and call `each` for every `STRING_TOKEN_KINDS` token, in source order. The ONE place
+ *  both string-token consumers locate literals, so blanking them and reading them cannot disagree
+ *  about what a literal is. Throws on a parse failure — `why` says what the caller would get wrong. */
+function forEachStringToken(
+  src: string, label: string, why: string, each: (node: ts.Node, sf: ts.SourceFile) => void,
+): void {
   const sf = ts.createSourceFile(
     label,
     src,
@@ -296,33 +323,42 @@ export function stripCommentsAndStrings(src: string, label: string): string {
   );
   const parsed = sf as ts.SourceFile & { parseDiagnostics?: readonly ts.Diagnostic[] };
   if ((parsed.parseDiagnostics?.length ?? 0) > 0) {
-    throw new Error(`${label}: did not parse, so its string literals cannot be located — `
-      + 'blanking them with a character scanner is what this function exists to avoid');
+    throw new Error(`${label}: did not parse, so its string literals cannot be located — ${why}`);
   }
-  const out = stripComments(src).split('');
   const visit = (node: ts.Node): void => {
     const kids = node.getChildren(sf);
     if (kids.length > 0) { for (const k of kids) visit(k); return; }
-    if (!STRING_TOKEN_KINDS.has(node.kind)) return;
-    // `getStart` skips leading trivia; the span is the literal including its own delimiters.
-    for (let i = node.getStart(sf); i < node.getEnd(); i++) {
-      if (out[i] !== '\n') out[i] = ' ';
-    }
+    if (STRING_TOKEN_KINDS.has(node.kind)) each(node, sf);
   };
   visit(sf);
-  return out.join('');
 }
 
-/** The literal tokens `stripCommentsAndStrings` blanks. Deliberately NOT the whole
- *  `FirstLiteralToken..LastTemplateToken` range — that starts at `NumericLiteral`, and a bare-hex
- *  sweep is exactly the caller this exists for. `JsxText` is absent for the same reason. */
-const STRING_TOKEN_KINDS: ReadonlySet<ts.SyntaxKind> = new Set([
-  ts.SyntaxKind.StringLiteral,
-  ts.SyntaxKind.NoSubstitutionTemplateLiteral,
-  ts.SyntaxKind.TemplateHead,
-  ts.SyntaxKind.TemplateMiddle,
-  ts.SyntaxKind.TemplateTail,
-]);
+/** One string or template token: its COOKED text — escapes resolved, so `'\n'` holds a real newline
+ *  and `'\t\t'` a real tab run — and the 1-based line its opening delimiter sits on. */
+export interface StringToken {
+  text: string;
+  line: number;
+}
+
+/**
+ * Every string and template token in `src`, located by the TypeScript parser — the token set
+ * `stripCommentsAndStrings` blanks, handed back instead of hidden, for a guard that inspects what a
+ * literal SAYS (#841's whitespace-collapse scan). A template with substitutions yields one token per
+ * static part, so `` `a  ${x}  b` `` is two tokens, each carrying its own run.
+ *
+ * Pass it `readScannedSource(abs).code`: comment stripping is length-preserving, so lines still line
+ * up, and a literal quoted inside a comment is not reported as code.
+ */
+export function stringTokens(src: string, label: string): StringToken[] {
+  const out: StringToken[] = [];
+  forEachStringToken(src, label, 'a guard reading them would silently skip what it could not place', (node, sf) => {
+    out.push({
+      text: (node as ts.LiteralLikeNode).text,
+      line: sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1,
+    });
+  });
+  return out;
+}
 
 /** One damaged token, as `<label>:<line>  <raw> became <stripped>`. */
 export type DamagedToken = string;

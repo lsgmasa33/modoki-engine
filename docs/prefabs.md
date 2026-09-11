@@ -316,6 +316,10 @@ first alone is not enough:
    Apply-to-Prefab in the same session stays broken. Re-arming unconditionally is the opposite
    trap, refetching a genuinely-missing prefab every frame forever. `.finally(() => { if
    (getCachedPrefab(ref)) rearm; })` is the shape that does neither.
+   ⚠️ **The re-acquire is async, so the action that found the miss still fails — record it.** The
+   shot, spawn or build that hit the empty cache cannot wait for the fetch, and dropping it silently
+   makes it read as a dead control. `demos/forest-camp` journals `archery.shot-refused` with
+   `reason: 'arrow-prefab-not-cached'` for exactly this window (#996).
    ⚠️ Whether you are exposed depends on **what else clears your guard**: `games/court` clears its
    on every board build, so it was safe either way; `games/sling` clears its only on unregister and
    `demos/forest-camp` only on world swap — and an Apply-to-Prefab is neither.
