@@ -9,8 +9,9 @@
  *
  * ⚠️ **Every block asserts the ACCEPT side too.** A table that answers `undefined` for everything
  * passes every reject case in this file while breaking all texture wrapping and every particle
- * emitter — which is the outcome the coverage baseline for #993 was measured against (zero of the
- * sixteen sites had a failing test, and one had a passing test that could not fail either way).
+ * emitter — which is the outcome the coverage baseline for #993 was measured against (none of the
+ * sites known when #993 was first written up had a failing test, and one had a passing test that
+ * could not fail either way). The site count lives in § 4b-ter only; do not restate it here.
  *
  * ⚠️ **`__proto__` is NOT the reachable half.** These are all READS. Only `__proto__` goes through
  * a setter, so a suite naming only it stays green against the entire family. `PROTO_KEYS` below is

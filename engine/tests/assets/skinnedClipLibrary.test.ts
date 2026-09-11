@@ -16,6 +16,7 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import path from 'path';
 import fs from 'fs';
 import * as THREE from 'three';
+import { hasInternalGames } from '../helpers/repoLayout';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { clone as cloneSkeleton, retargetClip } from 'three/examples/jsm/utils/SkeletonUtils.js';
 
@@ -43,9 +44,13 @@ function hasSkinning(root: THREE.Object3D): boolean {
   return ok;
 }
 
-// Uses generated GLB fixtures under games/3d-test; skip when absent (engine-only OSS repo).
+// Fixtures live under games/3d-test and are TRACKED (12 files in git), so they are present
+// exactly when games/ is — hence hasInternalGames(), not a hand-rolled existsSync. Spelling it
+// by hand is the "fourth variant" projectPresencePredicate.test.ts exists to stop, and
+// repoLayout.ts's own header forbids it; that guard missed these two because it matches
+// existsSync(path.join(..., 'games')), not a '../../../games/...' relative literal.
 // TODO(oss): move these skinned-test GLBs to an engine-owned tests/ fixture so they run in public.
-describe.skipIf(!fs.existsSync(ASSET_DIR))('P6 skinned clip library (real generated assets)', () => {
+describe.skipIf(!hasInternalGames())('P6 skinned clip library (real generated assets)', () => {
   let cylinder: Awaited<ReturnType<typeof loadGLB>>;
   let cone: Awaited<ReturnType<typeof loadGLB>>;
   let clips: Awaited<ReturnType<typeof loadGLB>>;

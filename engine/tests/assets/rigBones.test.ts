@@ -9,6 +9,7 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import path from 'path';
 import fs from 'fs';
 import * as THREE from 'three';
+import { hasInternalGames } from '../helpers/repoLayout';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { extractRigBones, glbDeclaresSkin } from '../../packages/modoki/src/editor/scene/rigBones';
 
@@ -25,9 +26,13 @@ function skeletonsOf(root: THREE.Object3D): Set<THREE.Skeleton> {
   return set;
 }
 
-// Uses generated GLB fixtures under games/3d-test; skip when absent (engine-only OSS repo).
+// Fixtures live under games/3d-test and are TRACKED (12 files in git), so they are present
+// exactly when games/ is — hence hasInternalGames(), not a hand-rolled existsSync. Spelling it
+// by hand is the "fourth variant" projectPresencePredicate.test.ts exists to stop, and
+// repoLayout.ts's own header forbids it; that guard missed these two because it matches
+// existsSync(path.join(..., 'games')), not a '../../../games/...' relative literal.
 // TODO(oss): move these skinned-test GLBs to an engine-owned tests/ fixture so they run in public.
-describe.skipIf(!fs.existsSync(ASSET_DIR))('extractRigBones (P7b-2 skeleton expansion)', () => {
+describe.skipIf(!hasInternalGames())('extractRigBones (P7b-2 skeleton expansion)', () => {
   let cylinder: Awaited<ReturnType<typeof loadGLB>>;
   let capsule: Awaited<ReturnType<typeof loadGLB>>;
 

@@ -171,6 +171,28 @@ PACKAGED editor on a sibling clone: nothing on this checkout can see it coming, 
    clone's processes — a packaged smoke takes minutes and killing it costs that clone its run. Wait;
    observed 2026-09-10 exiting on its own inside ~100 s.
 
+#### The other shape: a guard whose SAMPLE only exists on a machine that has built iOS
+
+⚠️ **Same class, but no running process to blame — the file simply cannot exist here.**
+`packagingManifest.test.ts`'s accept side asserts every `ship` row names a path that really occurs,
+so an over-broad exclude cannot silently drop something required. Its `Package.resolved` row sampled
+`engine/packages/capacitor-game-debug/Package.resolved` — which **SwiftPM writes during an
+Xcode/`cap sync` build**, and `.gitignore:83` excludes. On a Mac that has built iOS it is there; on a
+clone that has not it is absent; and on the **Windows clone it is permanently absent**, because that
+toolchain cannot run at all.
+
+So it was green on the clone that wrote it (#1050 close-out, `work-qa`) and red on the next gate to
+see it — 1 failed file out of 723, on a branch that had touched neither packaging nor any capacitor
+package. **Attribution first: if your change is innocent, the red confines itself to one unrelated
+guard.** The fix is the escape hatch the guard already provides — `absentOk` with a written reason,
+the same shape two neighbouring rows use for "absent in a fresh clone" and "staged at pack time".
+Declaring it does NOT disarm the assertion: mutation-checked by removing a *different* row's
+`absentOk`, which goes red.
+
+The general rule, of which this is the second instance: **a guard asserting that a GITIGNORED,
+build-generated artifact EXISTS is asserting something about the machine, not about the repo** — and
+the machines differ. Five of six clones are Macs.
+
 Both sightings that day cost a gate re-run each and self-corrected. The expensive outcome is the
 other one: reading the red as your own and going looking for it in a diff that never touched
 `engine/toolchain/**`.
@@ -228,6 +250,50 @@ rather than reading a long run as a hang; and a budget tuned on a Mac is not aut
 budget — that is exactly how five Court hint sweeps came to time out and leave `win` with no
 working gate at all (#108, `games/court/tests/budgets.ts`, whose tiers are still sized on the
 Windows measurement).
+
+### The 20 files no runner checks on Windows (#1054)
+
+⚠️ **A test whose subject is private-repo-only skips on the public mirror, and the public mirror is
+the only automated runner.** On run `34538499332`, job `check (windows-latest)`, the summary read
+`Test Files 574 passed | 20 skipped (594)` — **green**, because nothing reads skip counts.
+
+Be precise about what is and is not covered, because the original filing got this wrong in both
+directions:
+
+- These tests are **not** ungated in general. They run on every PRIVATE clone's `npm run verify`,
+  and five Mac clones run that constantly. **On darwin they are well covered.**
+- What has no automated gate is their **Windows** verdict. `win` is the only Windows checkout, so a
+  Windows-specific defect in one of them is visible to exactly one machine, and only when a human
+  runs the gate on it.
+
+**Measured cost, 2026-09-11:** two defects shipped through this gap in one week, both found by
+running `verify` on `win` after a routine merge, both green on every gate, both fixed in
+`c23d4a6f9`. Both were Windows path-SPELLING bugs — **a class no Mac clone's `verify` can catch by
+construction**: `clonePort` hashed the repo path raw, so Git Bash's `E:/Projects/modoki` and Node's
+`E:Projectsmodoki` resolved as two different clones and the launch banner advertised a CDP port
+no tool would aim at; and `memoryIndexSync` did `import("E:...")`, which Node rejects as scheme
+`e:` before reaching the guard under test.
+
+**THE RULE (owner, 2026-09-11): `win` runs `npm run verify` after every `merge-main`.** That is
+already the natural trigger — `/close-out` § 6 merges main on a worker — and it is exactly what
+caught both defects above. A self-hosted Actions runner on the Windows box was considered and
+**declined**: `verify` takes ~19 min there, so gating every push would cost more of that machine
+than the gap is worth. The honest position is that this stays **discipline-guarded, not gated** —
+the same acceptance #968 made, now with a price tag attached.
+
+What IS gated: `engine/tests/architecture/layoutConditionalTestLedger.test.ts` pins the **66
+test files whose execution is conditional on this checkout** — every one importing
+`helpers/repoLayout.ts`, plus any test gating a skip on a raw `existsSync` — and for each, the
+predicates its gates call **with their sense** (`!hasInternalGames` = skips when `games/` is absent;
+unsigned = the gate is inverted). Membership is the IMPORT, not a skip shape: review
+mutation-proved a shape-based detector blind to `describe.runIf(...)`, to an aliased
+`const present = fs.existsSync(...)`, to `if (!pred()) { ctx.skip(); }` (which `docCitations.test.ts`
+uses nine times), and to a `repoLayout.js` import specifier — `showRefsCorpus.test.ts` skips its
+whole suite on the snapshot and went unledgered for exactly that reason. The measurement lives in
+`engine/tests/helpers/layoutConditionalScan.ts`, imported by both the guard and the generator that
+writes the table, so the two cannot drift.
+
+It closes the silence, not the coverage.
 
 ## What made it faster (2026-08-06)
 
@@ -543,8 +609,10 @@ silently skip when `toktx`/`msdf-atlas-gen` are absent, which those jobs do not 
 packaging with them; never distribute them.
 
 Caveats that matter: it is a **subset** gate (no `games/`, so anything game-dependent still runs
-only locally), it tests the **transformed snapshot** rather than this tree, it needs the repo
-secret `OSS_PUSH_TOKEN`, and **public run logs are world-readable and permanent**. Never push the
+only locally — **and that is bigger than it sounds: 20 test files skip outright there**, see
+§ "The 20 files no runner checks on Windows" above), it tests the **transformed snapshot** rather
+than this tree, it needs the repo secret `OSS_PUSH_TOKEN`, and **public run logs are world-readable
+and permanent**. Never push the
 private tree to a public branch to get a free run — deleting a branch unpublishes nothing. Full
 mechanism: [engine-oss-publishing.md](./engine-oss-publishing.md) § "The public repo as a free CI
 runner".

@@ -503,6 +503,11 @@ uses one of the OTHER SEVEN names, not `__proto__`** — only `__proto__` goes t
 outside the code. The table was never a bag anybody thought of as document data — it is a `const` a
 few lines up — which is exactly why the reads went unguarded.
 
+⚠️ **Every count in this section is stamped as of #993's close-out, not derived** — it went 16 → 20 →
+22 in one day as review found members, and a stale copy survived each bump. It cannot be derived:
+the fixed sites share no single greppable spelling (`loaders/primitives.ts` was fixed by asking
+`isPrimitive`, not with `hasDocKey`). If you find a member, update the count here in the same change.
+
 > **The mechanism, in one sentence:** a code-declared literal inherits `Object.prototype`, so a key
 > like `constructor`, `toString` or `valueOf` returns an inherited **FUNCTION**, and the value flows
 > on because the guard beside the read cannot see it.
@@ -573,7 +578,8 @@ against every site in this family. `docKeys.test.ts` enumerates all eight for th
 
 ⚠️ **And test the ACCEPT side of every one.** A table that answers `undefined` for everything passes
 every reject case while breaking all texture wrapping and every particle emitter. The coverage
-baseline when #993 was picked up was that **zero of the sixteen sites had a test that failed**, and
+baseline when #993 was first written up — **sixteen** sites at the time, before review found the
+other six — was that **zero of those sixteen had a test that failed**, and
 `games/3d-test/tests/tropicalIslandConfig.test.ts` asserted the right thing in a way that passed
 before *and* after the fix — [docs/falsifiable-tests.md](falsifiable-tests.md)'s shape, already in the
 tree.
