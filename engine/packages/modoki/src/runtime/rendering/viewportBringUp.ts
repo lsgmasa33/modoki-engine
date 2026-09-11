@@ -1,13 +1,24 @@
-/** Scene3D's renderer bring-up DECISIONS, in a module a test can reach (#824).
+/** A 3D viewport's renderer bring-up DECISIONS, in a module a test can reach (#824, #1052).
  *
  *  These used to be `const`s inside `Scene3D.tsx`'s ~900-line effect closure, reachable only by
  *  mounting the component — which CLAUDE.md rules out ("never mount a panel in jsdom: that asserts
  *  the mock"). Measured when #824 was filed: with #819's target retirement and both halves of #820
  *  deleted from `Scene3D.tsx`, the full gate still passed 18,116 tests. Three landed fixes, pinned by
- *  nothing. `tests/runtime/scene3DBringUp.test.ts` is where they are pinned now.
+ *  nothing. `tests/runtime/viewportBringUp.test.ts` is where they are pinned now.
+ *
+ *  TWO callers: the game's `Scene3D.tsx`, and since #1052 the editor's `SceneView.tsx`, whose
+ *  context-loss rebuild used to re-run its whole setup UNBOUNDED — a hung WebGPU init latched its
+ *  recovery exactly as #820 latched Scene3D's. The editor needs three seams Scene3D does not use:
+ *   - `createRenderer(kind)` — SceneView retries a BOOT's creation itself but leaves a rebuild's
+ *     retries to `rendererRecovery`, so one bound measures one attempt.
+ *   - an ASYNC `install(r, stillCurrent)` — SceneView awaits `setActiveRenderer` mid-install, and a
+ *     loss during that await can start a newer bring-up, which the check reveals.
+ *   - `discard(r, reason)` — a leased renderer arriving after UNMOUNT must go back through its
+ *     container lease (a StrictMode remount may be re-acquiring it), while a SUPERSEDED one's lease
+ *     was already dropped by the attempt that overtook it.
  *
  *  ⚠️ **Keep this module free of the DOM and of three.** A renderer here is anything with `dispose()`
- *  and a `domElement`; `Scene3D.tsx` supplies `createRenderer`, `install` and `teardown`. That is the
+ *  and a `domElement`; the viewport supplies `createRenderer`, `install` and `teardown`. That is the
  *  seam that lets a test drive the real decisions with a fake renderer — move a DOM call in here and
  *  the tests go back to asserting a mock.
  *
@@ -46,21 +57,38 @@ export interface BringUpRenderer {
   readonly domElement: { remove(): void };
 }
 
-export interface Scene3DBringUpDeps<R extends BringUpRenderer> {
-  /** Create and initialise a renderer. Not cancellable — which is why a late one needs a disposition. */
-  createRenderer: () => Promise<R>;
+/** Which bring-up a `createRenderer` call serves. */
+export type BringUpKind = 'boot' | 'rebuild';
+
+/** Why a renderer is being thrown away instead of installed. */
+export type DiscardReason = 'disposed' | 'superseded';
+
+export interface ViewportBringUpDeps<R extends BringUpRenderer> {
+  /** Create and initialise a renderer. Not cancellable — which is why a late one needs a disposition.
+   *  `kind` lets a caller treat a first bring-up and a context-loss rebuild differently. */
+  createRenderer: (kind: BringUpKind) => Promise<R>;
   /** True once the owning effect has unmounted for good. */
   isDisposed: () => boolean;
-  /** Wire a renderer that has been cleared for service. */
-  install: (r: R) => void;
+  /** Wire a renderer that has been cleared for service. May be async: `boot()`/`rebuild()` settle
+   *  only once it has. `stillCurrent` turns false as soon as a NEWER bring-up begins, so an install
+   *  that awaits can tell it has been overtaken. */
+  install: (r: R, stillCurrent: LivenessCheck) => void | Promise<void>;
   /** Tear down whatever the last `install` wired. `rebuild()` calls it before its bring-up. */
   teardown: () => void;
+  /** Where a renderer that will NOT be installed goes. Default: `dispose()` + `domElement.remove()`.
+   *  ⚠️ `superseded` is decided BEFORE `disposed`, deliberately: a caller that leases renderers had a
+   *  superseded one's lease dropped by the attempt that overtook it — even when the viewport has also
+   *  unmounted since — so handing it back to the lease would release the SUCCESSOR's hold. */
+  discard?: (r: R, reason: DiscardReason) => void;
+  /** A renderer adopted LATE (after the rebuild bound) has no caller left to await its install, so an
+   *  install failure there is reported through this. Default: `console.error`. */
+  onLateInstallError?: (e: unknown) => void;
   /** Override for tests only; production uses `REBUILD_BRINGUP_TIMEOUT_MS`. */
   rebuildTimeoutMs?: number;
 }
 
-export interface Scene3DBringUp {
-  /** The FIRST bring-up. Unbounded (rule 1): rejects only if `createRenderer` itself rejects. */
+export interface ViewportBringUp {
+  /** The FIRST bring-up. Unbounded (rule 1): rejects only if `createRenderer` or `install` does. */
   boot(): Promise<void>;
   /** The context-loss rebuild `rendererRecovery` drives: teardown, then a bounded bring-up that
    *  rejects with a `TimeoutError` past the bound — and still adopts the renderer if it arrives
@@ -68,40 +96,50 @@ export interface Scene3DBringUp {
   rebuild(): Promise<void>;
 }
 
-export function createScene3DBringUp<R extends BringUpRenderer>(deps: Scene3DBringUpDeps<R>): Scene3DBringUp {
+export function createViewportBringUp<R extends BringUpRenderer>(deps: ViewportBringUpDeps<R>): ViewportBringUp {
   const token = createSupersessionToken();
 
-  /** Take a renderer into service, or dispose it if it lost its race. */
+  const discard = (r: R, reason: DiscardReason): void => {
+    try {
+      if (deps.discard) deps.discard(r, reason);
+      else { r.dispose(); r.domElement.remove(); }
+    } catch { /* already dead */ }
+  };
+
+  /** Take a renderer into service, or discard it if it lost its race. Superseded first — see `discard`. */
   const adopt = (r: R, stillCurrent: LivenessCheck): boolean => {
-    if (deps.isDisposed() || !stillCurrent()) {
-      try { r.dispose(); r.domElement.remove(); } catch { /* already dead */ }
-      return false;
-    }
+    if (!stillCurrent()) { discard(r, 'superseded'); return false; }
+    if (deps.isDisposed()) { discard(r, 'disposed'); return false; }
     return true;
   };
 
-  const bringUp = async (timeoutMs?: number): Promise<void> => {
+  const bringUp = async (kind: BringUpKind, timeoutMs?: number): Promise<void> => {
     const stillCurrent = token.begin();
-    const create = deps.createRenderer();
+    const create = deps.createRenderer(kind);
     const r = timeoutMs === undefined
       ? await create
-      : await withTimeout(create, timeoutMs, 'Scene3D renderer bring-up', {
-        // Rule 2: adopted if nothing superseded it, disposed if something did. Throwing it away
+      : await withTimeout(create, timeoutMs, 'viewport renderer bring-up', {
+        // Rule 2: adopted if nothing superseded it, discarded if something did. Throwing it away
         // unconditionally is what turns a slow device into a permanently black one.
         onSettled: (res) => {
-          if (!res.ok) return;
-          if (adopt(res.value, stillCurrent)) deps.install(res.value);
+          if (!res.ok || !adopt(res.value, stillCurrent)) return;
+          void Promise.resolve()
+            .then(() => deps.install(res.value, stillCurrent))
+            .catch((e) => {
+              if (deps.onLateInstallError) deps.onLateInstallError(e);
+              else console.error('[viewportBringUp] a late renderer was adopted, but installing it FAILED:', e);
+            });
         },
       });
     if (!adopt(r, stillCurrent)) return;
-    deps.install(r);
+    await deps.install(r, stillCurrent);
   };
 
   return {
-    boot: () => bringUp(),
+    boot: () => bringUp('boot'),
     rebuild: async () => {
       deps.teardown();
-      await bringUp(deps.rebuildTimeoutMs ?? REBUILD_BRINGUP_TIMEOUT_MS);
+      await bringUp('rebuild', deps.rebuildTimeoutMs ?? REBUILD_BRINGUP_TIMEOUT_MS);
     },
   };
 }

@@ -3001,7 +3001,9 @@ breaks. Three consequences that are easy to get wrong:
   tear down a healthy renderer in sympathy.
 - **A render-on-demand viewport must be re-marked dirty after a rebuild**, or it completes
   recovery and stays black until the user nudges the camera — indistinguishable from failure.
-  `SceneView`'s dirty gate is created at mount, so a rebuild inherits it already spent.
+  `SceneView`'s dirty gate is created at mount, so a rebuild inherits it already spent. The re-arm
+  lives at the END of SceneView's `install`, not after the rebuild's await: since #1052 a renderer
+  can be adopted LATE, after the bring-up bound, with no caller left to run a line after any await.
 
 **It is a re-UPLOAD, not a re-download.** Bring-up never calls `loadScene`; it rebuilds the three
 objects from the ECS world through the scene-scoped caches (the same path a world swap uses), so
@@ -3181,7 +3183,7 @@ caller's own `onLost`, exactly as before.
 | Surface | On loss | Why |
 |---|---|---|
 | `canvas2DPool` slots | rebuild in place | mid-scene 2D content must not go permanently blank |
-| `Scene3D` / `SceneView` (via `activeRenderer.ts`) | rebuild in place, bounded recovery budget | the GameView/SceneView must not stay blank mid-play |
+| `Scene3D` / `SceneView` (via `activeRenderer.ts`) | rebuild in place, bounded recovery budget; each rebuild's bring-up is bounded by `REBUILD_BRINGUP_TIMEOUT_MS` through `viewportBringUp.ts` (#820, #1052) | the GameView/SceneView must not stay blank mid-play |
 | `ShaderPreview`, `previewScene` (Mesh/Material previews), `ModelPreview`, `ParticleEditor` | log loudly, then run the panel's OWN existing teardown | these panels are cheap to reopen, and rebuild-in-place would land this decision inside `canvas2DPool.ts`, where #801 is a pending, separate design change to that machinery |
 
 The four previews share ONE policy, `editor/panels/previewLossPolicy.ts`'s
@@ -4568,7 +4570,7 @@ The pass is a `Scene2DRenderer` CLASS (not a singleton): a Pixi display object a
 
 #### Sprite textures: why the unload is DEFERRED, and the sourceless-entry trap
 
-⚠️ **A refcount reaching 0 does NOT mean a texture is finished with — it means nothing holds it AT THIS INSTANT.** A renderer that rebuilds a subtree by despawning and respawning it (Court's board overlay does this on every interaction) legitimately drops a url to 0 and back to 1 inside ONE synchronous frame. `releaseSpriteTexture` therefore defers its `Assets.unload` by a macrotask and `retainSpriteTexture` CANCELS a pending one; `unloadAllSpriteTextures` flushes any still armed, so none can fire against the next scene (the F3 "no texture accounting survives a scene" invariant stays exact).
+⚠️ **A refcount reaching 0 does NOT mean a texture is finished with — it means nothing holds it AT THIS INSTANT.** A renderer that rebuilds a subtree by despawning and respawning it (Court's board overlay does this on every interaction) legitimately drops a url to 0 and back to 1 inside ONE synchronous frame. `releaseSpriteTexture` therefore defers its `Assets.unload` by a macrotask and `retainSpriteTexture` CANCELS a pending one; `unloadAllSpriteTextures` flushes any still armed, so none can fire against the next scene (the F3 "no texture accounting survives a scene" invariant stays exact). ⚠️ **The deferral covers a rebuild inside ONE task only.** A rebuild that awaits in between — Court's level load despawns the board, awaits the next level's fetch, then respawns the same art — outlives it, which is why a release made during Play parks instead (#1053, § "Sprite textures are SCENE-scoped" below).
 
 **The trap this closes**: `Assets.unload` destroys the texture's `source` EAGERLY but removes the cache entry ASYNCHRONOUSLY, so there is a window where the entry is **present and unusable**. `Assets.cache.has(url)` says yes, `Assets.get(url)` hands back a corpse, and every consumer reads it as live — a Sprite binds it and draws **nothing, forever** (no load is ever kicked, because `has()` stays true), a Mesh binds it, and the font atlas path does `tex.source.scaleMode = 'linear'` and throws. Measured on a live renderer 2026-08-10: `{inCache: true, hasSource: false}` while a healthy sibling texture in the same overlay rendered fine.
 
@@ -4722,10 +4724,13 @@ reports through `onError`.
 
 #### Sprite textures are SCENE-scoped, so a play/stop swap must not free them (#1000)
 
-**The rule: a sprite texture whose refcount reaches 0 *during a world-swap teardown* is PARKED, not
-destroyed. It is freed when the SCENE changes, or when the last 2D renderer stops.** An ordinary
-mid-scene release — an entity deleted, a `Renderable2D.sprite` repointed — still frees it immediately;
-retaining those would pin every sprite an authoring session ever touched.
+**The rule: a sprite texture whose refcount reaches 0 *during a world-swap teardown*, or *from a scene
+slot while the run mode is `playing`* (paused included — #1053), is PARKED, not destroyed. It is freed
+when the SCENE changes, on a texture invalidation, or when the last 2D renderer stops.** A release made
+with Play STOPPED — authoring: an entity deleted, a `Renderable2D.sprite` repointed — and an editor
+panel dropping its hold still free immediately; retaining those would pin every sprite an editing
+session ever touched. The run-mode check lives in `releaseSpriteTexture`, not `deferUnload`, for
+exactly that panel reason.
 
 This brings sprite textures in line with the rule
 [docs/scene-loading.md](scene-loading.md) already states for every other GPU resource — *the scene is
@@ -4759,10 +4764,43 @@ destroyed each runtime-spawned sprite's `TextureSource` and re-created it on the
 Proof it was a re-create and not a one-way free: Pixi `uid`s across two cycles — `king.png` 5 → 11,
 `count-banner.png` 7 → 12, `cell-washi.ktx2` 13 → 16. A new uid is a new `TextureSource`.
 
+**A rebuild DURING Play churned the same way, with no world swap anywhere (#1053).** `court_load_level`
+despawns the board, AWAITS the next level's fetch, then respawns the same art. The one-macrotask
+deferral only protects a rebuild inside ONE task, so it expired inside the fetch, and the swap-only
+park never saw a release that happened outside a swap. Measured in the dev editor on `games/court`
+(WebGPU, ONE 2D renderer — the Scene panel was not mounted — with a counter on
+`_TextureSource.prototype.destroy` installed the way § "The technique that actually settled it"
+describes, over three settled loads Hard 4 → Easy 6 → Hard 4):
+
+| same editor, same probe | `TextureSource` destroys | `[BindGroup]` warn lines |
+|---|---|---|
+| the retention line disabled (a revert run) | 20 — all ten board/tray textures (`king.png` … `count-banner.png`, `tray-badge-frame.png`) | 46 (12 / 20 / 14 per load) |
+| with #1053 | **0** | **0** |
+
+The owner chose engine-wide retention during Play over reordering Court's load, so any game that
+despawns, awaits and respawns is covered, not just Court. The check is `getRunMode() === 'playing'`,
+not `isSimRunning()`, because a PAUSED Play is still a play session.
+
+⚠️ **The bound is WIDER than #1000's, and that is the accepted cost.** #1000 parks one swap's
+working set. #1053 parks EVERY url a scene slot releases during Play, for as long as that scene stays
+current. So a single-scene game that cycles through distinct textures (per-level art, unique `blob:`
+or `data:` urls) keeps all of them loaded until the scene changes, an invalidation purges the set, or
+the last renderer stops. A re-import during Play can park the OLD `?v=<hash>` url, which will never be
+requested again. Whether it lingers depends on which of two independent events lands first. If the
+texture invalidation (which purges the parked set) comes before the manifest update that moves the
+renderer to the new url, the old url is released after the purge, parked, and stays until the next
+such event. In the reverse order the purge frees it. This session did not establish which order a
+real re-import takes.
+
 ⚠️ **The `[BindGroup] … destroyed while still bound` warning is the SYMPTOM, not the defect.** It is
 emitted by Pixi's process-global batch bind-group cache (`getTextureBatchBindGroup`'s `cachedGroups`),
 which is never evicted and exposes **no public API to evict** — so it cannot be silenced directly, and
-an attempt to do so is wasted effort. It goes quiet only when nothing is wrongly destroyed. Warning
+an attempt to do so is wasted effort. ⚠️ **It fires for a CORRECT destroy too** (#1053):
+`BindGroup.onResourceChange` warns for any destroyed resource a cached group still references, and
+that cache holds every source that was ever in a drawn batch — so on WebGPU even a genuine free of a
+long-off-screen texture warns. (The WebGL batch adaptor binds textures directly, so plain sprite
+batches cannot warn there.) This line used to say the warning "goes quiet only when nothing is wrongly
+destroyed"; it goes quiet only when nothing is destroyed. Warning
 count scales with LIVE RENDERERS, not textures (~2 per renderer per destroyed source), which is why
 Court showed 12 for 3 textures and wordweave 4 for 2.
 

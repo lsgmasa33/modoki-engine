@@ -1,11 +1,25 @@
 /** canvas2DPool unit tests — allocate, release, getSlot, resize, releaseAll, destroyPool. */
 // @vitest-environment jsdom
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { DEFAULT_REBUILD_DELAY_MS } from '../../src/runtime/rendering/rendererRecovery';
+import { teardownCanvas2DPools, type TeardownablePool } from './canvas2DPoolTeardown';
 
 beforeEach(() => {
   vi.resetModules();
   vi.restoreAllMocks();   // don't let one test's console spy leak its calls into the next
+});
+
+/** Every module instance `getModule()` loaded this test — each has its own `defaultPool`. Pools a
+ *  test builds itself with `new mod.Canvas2DPool()` are not tracked; none of those arm a recovery. */
+const loaded = new Set<TeardownablePool>();
+// #1058 — a stuck-render detection below arms a REAL rebuild timer. Against this file's mock
+// Container (no `removeFromParent`) that rebuild throws, so a leaked one logs `console.error`
+// "retrying" twice and "giving up" once, over ~1.75 s of backoff, into whichever tests are running.
+// Observed with this teardown removed. See `canvas2DPoolTeardown.ts`.
+afterEach(() => {
+  teardownCanvas2DPools(loaded);
+  loaded.clear();
 });
 
 function mockDeps() {
@@ -42,7 +56,9 @@ function mockDeps() {
 
 async function getModule() {
   mockDeps();
-  return import('../../src/runtime/rendering/canvas2DPool');
+  const mod = await import('../../src/runtime/rendering/canvas2DPool');
+  loaded.add(mod);
+  return mod;
 }
 
 describe('canvas2DPool', () => {
@@ -384,6 +400,22 @@ describe('canvas2DPool', () => {
       for (let i = 0; i < 50; i++) pool.renderAll(); // sustained failure
       const stuck = warn.mock.calls.filter((c) => String(c[0]).includes('stuck renderer'));
       expect(stuck).toHaveLength(1); // surfaced exactly once, not every frame
+    });
+
+    // ⚠️ ORDER-DEPENDENT BY DESIGN — must stay IMMEDIATELY after the stuck-renderer test above. That
+    // test's 50 throwing frames trip #1000's stuck-render detection, which arms a REAL rebuild timer.
+    // Observed with the afterEach teardown removed: the leaked rebuild throws against this file's
+    // mock Container and logs `, retrying): TypeError: slot.container.removeFromParent is not a
+    // function` twice, then `, giving up)`, into whatever test is running. An earlier cut of this
+    // test watched only for the "2D renderer rebuilt" WARN, which this mock can never reach, and it
+    // stayed green with the teardown deleted. So: nothing at all may be logged during an idle wait
+    // that outlasts the first rebuild attempt.
+    it('…and leaves no rebuild armed behind it once the test is over (#1058)', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+      await new Promise((r) => setTimeout(r, DEFAULT_REBUILD_DELAY_MS + 100));
+      const said = [...warn.mock.calls, ...err.mock.calls].map((c) => String(c[0]));
+      expect(said, 'the previous test leaked a rebuild — is afterEach still tearing pools down?').toEqual([]);
     });
 
     it('a successful render resets the fail streak (transient blip never escalates)', async () => {

@@ -348,6 +348,14 @@ log. That log can prove a voice *started* and, until the fix below, nothing else
 | `unresolved` | an entity source whose clip will not resolve. `warn` |
 
 Payload: `{ phase, entity?, clip, bus, loop, spatial, crossfadeSec?, reason? }`.
+⚠️ **`bus` is the RESOLVED bus, not the authored one** (#993). `AudioSource.bus` and
+`VideoPlayer.bus` are declared as a union by a CAST on a default, so the authored value is an
+unchecked string from scene JSON; an unrecognised one falls back to `sfx` with a one-time warning
+(`resolveBus`). A scene authoring `bus: "Music"` therefore journals `bus: 'sfx'` — which is where
+the sound actually went. The journal is the sanctioned headless observable (root `CLAUDE.md`
+§ Time, Determinism), so it reports behaviour rather than intent; the typo is not lost, it is in
+the warning. The record-mode log (`getAudioLog`) reports the same resolved value, for the same
+reason.
 `entity` is `entityRef` (the stable GUID, so a trace survives a scene hot-reload) and
 is **omitted for a fire-and-forget cue one-shot**, which has no owning entity by
 design — that absence is the signal, not a gap. `reason` distinguishes the four

@@ -221,10 +221,13 @@ export function isAudioMuted(): boolean { return muted; }
  *  refusal in `setBusVolume` — so this index is total and needs no guard of its own (#993). Do not
  *  add one: a third check over one table is what let `loaders/primitives.ts` disagree with itself.
  *
- *  ⚠️ An earlier version of this comment said "the playback path", singular, and was WRONG:
- *  `attachMediaElementToBus` is a third caller and it was passing `VideoPlayer.bus` raw. A comment
- *  asserting totality is only worth having if it is checked — `audioBusVocabulary.test.ts` now
- *  asserts every caller of this function normalises, so the claim cannot rot again silently. */
+ *  ⚠️ This claim has ROTTED once and been FAKED once. It said "the playback path", singular,
+ *  while `attachMediaElementToBus` passed `VideoPlayer.bus` raw; the fix for that then cited a
+ *  test file that had never existed on any branch — propping up "do not add one" with nothing.
+ *  `tests/runtime/audioBusVocabulary.test.ts` exists now and SOURCE-SCANS this file: every
+ *  `busNode(` call must pass `resolveBus(…)` or a code literal, with exactly one named exception
+ *  (`setBusVolume`, which returns first), and it goes red on a fourth caller rather than
+ *  absorbing it. */
 function busNode(g: Graph, bus: BusName): GainNode {
   return bus === 'master' ? g.master : g.buses[bus];
 }

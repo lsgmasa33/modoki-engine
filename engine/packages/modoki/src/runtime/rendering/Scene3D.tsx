@@ -19,7 +19,7 @@ import { registerBoundsProvider } from '../core/screenBounds';
 import { createTeardownScope, type TeardownScope } from '../core/teardownScope';
 import { computeEntityScreenBounds } from './entityScreenBounds';
 import { readbackToRGBA, type ReadbackBackend } from './readbackToRGBA';
-import { createScene3DBringUp, boundedCaptureReadback } from './scene3DBringUp';
+import { createViewportBringUp, boundedCaptureReadback } from './viewportBringUp';
 import { createRenderer, createRenderState, disposeRenderState, syncCamera, applyOrthoFrustum, computeActiveFrameFit, computeFrameFitById, activeFrameId, type ActiveFrameFit, syncEnvironment, syncFog, syncLights, syncSceneRenderables3D, orientBillboards, reconcileToneExposure, prewarmShadersForWorld, compileLiveScene, clearOwnedMaterials, attachInvalidationListener } from './scene3DSync';
 import { disposeVideoTextures } from './videoTextureSync';
 import { registerRenderSurface } from './materialBroker';
@@ -150,21 +150,21 @@ export default function Scene3D() {
     //
     // A lost three renderer cannot be revived (`_isDeviceLost` is never cleared anywhere in
     // three), which is why this rebuilds rather than restores. See `core/activeRenderer.ts`.
-    // #820/#824 — the bring-up DECISIONS live in `scene3DBringUp.ts`, where a test can reach them:
+    // #820/#824 — the bring-up DECISIONS live in `viewportBringUp.ts`, where a test can reach them:
     // the rebuild-only bound, adopting a late renderer unless a newer attempt superseded it, and
     // disposing one that lost its race. They were effect-local `const`s here once, and deleting
     // all of them broke nothing in `verify`. This closure supplies only what needs the DOM.
     // (The loss filter further down cannot stop a second, overlapping attempt during boot —
     // `if (info.renderer && renderer && …)` is a no-op while `renderer` is still undefined — which
     // is why supersession is decided in there rather than by that filter.)
-    const bringUp = createScene3DBringUp({
+    const bringUp = createViewportBringUp({
       createRenderer: () => createRenderer(container, config.preferWebGPU),
       isDisposed: () => disposed,
       install: (r) => install(r),
       teardown: () => teardown(),
     });
 
-    /** Wire a renderer that `scene3DBringUp` has cleared for service. */
+    /** Wire a renderer that `viewportBringUp` has cleared for service. */
     function install(r: Awaited<ReturnType<typeof createRenderer>>) {
       renderer = r;
       // #858: the release path, BEFORE anything is taken. `startRenderLoop()` below is ~630 lines
@@ -211,7 +211,7 @@ export default function Scene3D() {
 
     const recovery = createRendererRecovery({
       // ⚠️ `rebuild` is BOUNDED and the `boot()` below is NOT — a measured asymmetry, pinned in
-      // `scene3DBringUp.test.ts` (rule 1 of that module's header).
+      // `viewportBringUp.test.ts` (rule 1 of that module's header).
       rebuild: bringUp.rebuild,
       isDisposed: () => disposed,
       // `description` first (it is what survives the device bridge — a bare non-Error logged

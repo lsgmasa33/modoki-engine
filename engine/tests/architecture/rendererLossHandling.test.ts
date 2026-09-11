@@ -91,14 +91,15 @@ const ALLOWLIST = new Map<string, string>([
   // lives — wiring a SECOND, functionally redundant attach here would double-fire every loss for
   // the one GameView renderer, not satisfy anything the guard is actually checking for.
   ['runtime/rendering/scene3DSync.ts', 'createRenderer/makeWebGPURenderer match their own declarations here — real detection is wired at the one caller, Scene3D.tsx'],
-  // #824 extracted Scene3D's bring-up DECISIONS into `scene3DBringUp.ts`, which calls an INJECTED
-  // `deps.createRenderer()` — `CONSTRUCT_RE` matches that call by name, the same structural false
+  // #824 extracted Scene3D's bring-up DECISIONS into `viewportBringUp.ts`, which calls an INJECTED
+  // `deps.createRenderer(kind)` — `CONSTRUCT_RE` matches that call by name, the same structural false
   // match as `scene3DSync.ts` above. It constructs nothing itself: the module is DOM- and three-free
-  // by its own header contract (that is what lets its tests drive it with a fake renderer), and the
-  // factory it calls is supplied by `Scene3D.tsx`, which is where the real `createRenderer(container,
-  // …)` and its `attachRendererLossHandling` call both live. A real construction added to that file
-  // would break its contract before it broke this guard.
-  ['runtime/rendering/scene3DBringUp.ts', 'calls the renderer factory Scene3D.tsx injects — the real construction and its attach both live in Scene3D.tsx'],
+  // by its own header contract (that is what lets its tests drive it with a fake renderer). The
+  // factory it calls is supplied by its two callers, and each is where the real construction and its
+  // `attachRendererLossHandling` call live: `Scene3D.tsx` (`createRenderer(container, …)`) and, since
+  // #1052, the editor's `SceneView.tsx` (`makeWebGPURenderer(container)` via its container lease).
+  // A real construction added to this file would break its contract before it broke this guard.
+  ['runtime/rendering/viewportBringUp.ts', 'calls the renderer factory its callers inject — the real construction and its attach live in Scene3D.tsx and SceneView.tsx'],
 ]);
 
 describe('Renderer loss handling — every renderer/app construction site wires loss DETECTION', () => {

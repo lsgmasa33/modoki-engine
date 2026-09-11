@@ -130,24 +130,37 @@ const RETRACTED_CLAIMS: ReadonlyArray<{
 // strings — and `.mjs`/`.cjs`/`.js` for the same reason, because `engine/scripts/**` and
 // `qa/tools/**` carry exactly that kind of prose and are otherwise the half of "agent-facing
 // strings" this guard would not reach. Third-party and build output are not ours to police.
-const CORPUS = /\.(md|ts|tsx|mjs|cjs|js)$/;
+// The extension list is EXT_FLOORS below — CORPUS is derived from it.
 const SKIP = ['node_modules', 'dist', 'release', '.build', 'ios', 'android', 'worktrees'];
 
-// ⚠️ Non-vacuity is checked PER EXTENSION, not as one total. A single number cannot detect the
-// most damaging corpus mutation there is: narrowing CORPUS to `/\.(ts|tsx)$/` blinds this guard
-// to every markdown copy of both claims and still leaves ~3,000 files, so a `length > 500`
-// assertion passes with the prose half of the corpus gone.
+// ⚠️ Non-vacuity is checked for EACH extension, singly — not as one total, and not as groups. A
+// single number cannot detect the most damaging corpus mutation there is: narrowing the corpus to
+// `.ts|.tsx` blinds this guard to every markdown copy of both claims and still leaves ~3,000
+// files, so a `length > 500` assertion passes with the prose half of the corpus gone. Grouped
+// floors had the same hole one level down: dropping `tsx` alone left a `ts|tsx` floor green, and
+// the editor's panels — where the FlexLayout claim lived — are `.tsx`.
 //
-// ⚠️ Each floor is PER LAYOUT. This file ships in the public engine snapshot, which drops
-// `docs/`, `qa/`, `.agent-memory/`, `games/` and the root scripts — measured there at 86 md /
-// 2490 ts / 107 js against 729 / 3117 / 187 in a developer clone, so the clone floors went red
-// on the public gate. The snapshot floors still sit far above the ~0 a dropped extension leaves.
+// ⚠️ CORPUS is DERIVED from this table, never written beside it. As a second hand-kept list it
+// could be widened with no floor for the new extension, and a later edit could drop that extension
+// again with nothing red. Scanning an extension now means adding its row, and un-scanning one
+// means deleting a row and its `why` — the deliberate act this file prefers to a clever check.
+//
+// ⚠️ Some floors are PER LAYOUT. This file also ships in the public engine snapshot, whose
+// contents are the manifest in `scripts/publish-engine-oss.sh`. Measured 2026-09-11, clone vs the
+// two-demo snapshot `verify:publish` and ci/main assemble: md 731/86, ts 2898/2284, tsx 220/208,
+// mjs 176/97, cjs 9/9, js 2/1 — clone-sized floors went red on the public gate. A release with no
+// demos is slightly smaller (md 80, ts 2276) and clears every floor too. Where the layouts agree,
+// one floor serves both.
 const PRIVATE = hasPrivateTooling();
-const EXT_FLOORS: ReadonlyArray<{ ext: RegExp; min: number; why: string }> = [
-  { ext: /\.md$/, min: PRIVATE ? 600 : 50, why: 'prose — where most restatements live' },
-  { ext: /\.(ts|tsx)$/, min: PRIVATE ? 2500 : 2000, why: 'code comments and agent-facing strings' },
-  { ext: /\.(mjs|cjs|js)$/, min: PRIVATE ? 150 : 70, why: 'scripts and QA tooling — agent-facing prose too' },
+const EXT_FLOORS: ReadonlyArray<{ name: string; min: number; why: string }> = [
+  { name: 'md', min: PRIVATE ? 600 : 50, why: 'prose — where most restatements live' },
+  { name: 'ts', min: PRIVATE ? 2500 : 2000, why: 'code comments and agent-facing strings' },
+  { name: 'tsx', min: 100, why: 'component comments and agent-facing strings' },
+  { name: 'mjs', min: PRIVATE ? 150 : 70, why: 'scripts and QA tooling — agent-facing prose too' },
+  { name: 'cjs', min: 5, why: 'CommonJS scripts' },
+  { name: 'js', min: 0, why: 'plain-JS scripts — a single file in the snapshot' },
 ];
+const CORPUS = new RegExp(`\\.(${EXT_FLOORS.map((f) => f.name).join('|')})$`);
 
 describe('a retracted claim is not restated outside its owning doc (#1014/#1015)', () => {
   // ⚠️ THIS FILE is excluded structurally, not via a `citedBy` row. It is definitionally the
@@ -159,9 +172,12 @@ describe('a retracted claim is not restated outside its owning doc (#1014/#1015)
   const files = repoFiles({ match: CORPUS, exclude: SKIP, floor: 500 })
     .filter((f: { rel: string }) => f.rel !== SELF);
 
-  it.each(EXT_FLOORS)('the corpus still reaches $ext — a vacuous pass is a failure', ({ ext, min, why }) => {
-    const n = files.filter((f: { rel: string }) => ext.test(f.rel)).length;
-    expect(n, `only ${n} file(s) match ${ext} (${why}) — the corpus lost a whole extension`)
+  it.each(EXT_FLOORS)('the corpus still reaches $name files — a vacuous pass is a failure', ({ name, min, why }) => {
+    const n = files.filter((f: { rel: string }) => f.rel.endsWith(`.${name}`)).length;
+    // CORPUS cannot lose an extension without its row going too, so a red here is never "CORPUS
+    // was narrowed" — it is the WALK reaching fewer files, or the repo no longer having them.
+    expect(n, `only ${n} .${name} file(s) reached (${why}), floor ${min}: either the walk lost `
+      + 'files (SKIP, repoFiles) or the repo no longer has them — then lower the floor or delete the row')
       .toBeGreaterThan(min);
   });
 

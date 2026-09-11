@@ -62,7 +62,13 @@ export function acquireRenderer<R extends LeasableRenderer>(
   const lease: RendererLease<R> = { promise: undefined as unknown as Promise<R>, refs: 1 };
   lease.promise = create().then(
     (r) => { lease.renderer = r; return r; },
-    (e) => { leases.delete(container); throw e; },
+    // Delete THIS lease, never whichever lease the container holds by now. A context-loss rebuild
+    // discards a pending lease and acquires a fresh one for the same container, and since #1052 bounds
+    // a rebuild, recovery retries while the timed-out attempt's create is still running. When that
+    // abandoned create finally rejects, an unconditional delete dropped the SUCCESSOR's lease: its
+    // renderer then escaped both `releaseRenderer` and the next rebuild's `discardRenderer`, and its
+    // canvas stayed in the container beside the one that replaced it.
+    (e) => { if (leases.get(container) === lease) leases.delete(container); throw e; },
   );
   leases.set(container, lease as RendererLease<LeasableRenderer>);
   return lease.promise;
@@ -80,7 +86,12 @@ export function releaseRenderer(container: object): void {
   if (lease.refs > 0 || lease.releaseTimer !== undefined) return;
   lease.releaseTimer = setTimeout(() => {
     if (lease.refs > 0) return; // re-acquired between scheduling and firing
-    leases.delete(container);
+    // THIS lease only, for the same reason as `acquireRenderer`'s failure handler: if its create
+    // rejected after the release armed this timer, that handler already removed it and a fresh lease
+    // may hold the container by now. An unconditional delete would drop the successor's (latent today
+    // — SceneView only releases a resolved lease — but the same mechanism #1052's review found). This
+    // lease's own renderer, if it ever got one, is still ours to dispose either way.
+    if (leases.get(container) === lease) leases.delete(container);
     lease.renderer?.dispose();
     lease.renderer?.domElement.remove();
   }, 0);

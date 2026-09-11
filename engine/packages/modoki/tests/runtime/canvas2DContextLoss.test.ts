@@ -104,13 +104,27 @@ import {
   livePixiApplicationCount,
   __resetPixiApplicationTrackingForTest,
 } from '../../src/runtime/rendering/pixiGlobalResources';
+import { DEFAULT_REBUILD_DELAY_MS } from '../../src/runtime/rendering/rendererRecovery';
+import { teardownCanvas2DPools } from './canvas2DPoolTeardown';
 
 let pool: Canvas2DPool;
+/** Every pool a test builds, so `afterEach` can tear each one down — see `canvas2DPoolTeardown.ts`.
+ *  Build pools through `newPool()`, never `new Canvas2DPool()`, or the teardown cannot reach them. */
+const pools: Canvas2DPool[] = [];
+const newPool = () => { const p = new Canvas2DPool(); pools.push(p); return p; };
 // The live-Application count is module state and outlives a test file, so a pool abandoned by an
 // earlier test would otherwise leave it permanently above zero and make every count assertion
 // below read a number nobody set.
-beforeEach(() => { created.length = 0; passthroughs.length = 0; initGate.hold = null; deviceLostGate.promise = null; __resetPixiApplicationTrackingForTest(); pool = new Canvas2DPool(); });
-afterEach(() => { vi.restoreAllMocks(); });
+beforeEach(() => { created.length = 0; passthroughs.length = 0; initGate.hold = null; deviceLostGate.promise = null; __resetPixiApplicationTrackingForTest(); pool = newPool(); });
+afterEach(() => {
+  // #1058/#1059 — a rebuild armed on the REAL clock and never disposed fires inside a later test's
+  // fake-timer window and inflates `created` there. Real timers FIRST: the recovery timers this
+  // cancels were armed on whichever clock was installed, and several tests end with a fake clock
+  // still installed, which would otherwise also leak into the next test.
+  vi.useRealTimers();
+  teardownCanvas2DPools(pools.splice(0));
+  vi.restoreAllMocks();   // last, so a test's console spies still absorb what teardown logs
+});
 
 /** Drive the event the browser fires. jsdom has no WebGL, so the listener is what we test. */
 const fireLost = (canvas: HTMLCanvasElement) => {
@@ -137,6 +151,17 @@ describe('canvas2DPool — GPU context loss', () => {
     const slot = pool.allocate(2)!;
     const e = fireLost(slot.canvas);
     expect(e.defaultPrevented).toBe(true);
+  });
+
+  // ⚠️ ORDER-DEPENDENT BY DESIGN — must stay IMMEDIATELY after the two tests above (#1058). Those two
+  // fire a loss on the REAL clock. The rebuild the second one leaves armed is still pending right here
+  // on any machine, fast or loaded: it was armed milliseconds before this test starts. The first one's
+  // is caught too unless the event loop stalls longer than DEFAULT_REBUILD_DELAY_MS between the two,
+  // which is exactly where the end-of-file sentinel stops seeing anything (close-out review).
+  // Mutation-check target: deleting the afterEach teardown reddens this on any machine.
+  it('…and neither of the two tests above leaves a rebuild armed once it is over (#1058)', async () => {
+    await new Promise((r) => setTimeout(r, DEFAULT_REBUILD_DELAY_MS + 50));
+    expect(created.length, 'a test above leaked a rebuild — is afterEach still tearing pools down?').toBe(0);
   });
 
   it('rebuilds onto a FRESH canvas, swapped in place, keeping the scene graph', async () => {
@@ -676,8 +701,8 @@ describe('canvas2DPool.rebuildSlotApp — TWO POOLS (cross-pool _gpuData safety)
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     vi.useFakeTimers();
 
-    const poolA = new Canvas2DPool();
-    const poolB = new Canvas2DPool();
+    const poolA = newPool();
+    const poolB = newPool();
     const slotA = poolA.allocate(100)!;
     const slotB = poolB.allocate(200)!;
     await slotA.ready;
@@ -1065,5 +1090,40 @@ describe('canvas2DPool — a stuck renderer reaches recovery (#1000)', () => {
     await vi.advanceTimersByTimeAsync(2000);
 
     expect(created.length, 'the reused slot gets its own rebuild').toBeGreaterThan(afterFirst);
+  });
+});
+
+// ── #1058/#1059: no pool outlives its test ──
+//
+// The first two tests in this file fire a context loss on the REAL clock and never tore their pool
+// down, so each left a `DEFAULT_REBUILD_DELAY_MS` rebuild armed. On a loaded machine those rebuilds
+// fired inside the #1000 suite's `advanceTimersByTimeAsync` windows and pushed two extra entries into
+// `created`: `expected 4 to be 2`, green in isolation. Reproduced deterministically by a 300 ms
+// real-clock busy-wait placed right after `madeBefore`, and attributed by skipping those two tests.
+describe('test hygiene: no pool outlives its test (#1058/#1059)', () => {
+  // ⚠️ ORDER-DEPENDENT BY DESIGN, and it must stay AFTER every other test that builds a pool. This
+  // file finishes in well under `DEFAULT_REBUILD_DELAY_MS`, so a rebuild any earlier test left armed
+  // is still pending when this starts, and fires during the wait below — into this test's own reset
+  // `created`. It is the guard on the `afterEach` WIRING: the test after it pins the helper itself.
+  it('no earlier test left a rebuild armed', async () => {
+    await new Promise((r) => setTimeout(r, DEFAULT_REBUILD_DELAY_MS + 50));
+    expect(created.length, 'an earlier test leaked a rebuild — is afterEach still tearing pools down?').toBe(0);
+  });
+
+  it('teardownCanvas2DPools cancels a rebuild armed on the real clock, even for a mounted, DOM-attached, sim-bound slot', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    // All three things that keep a slot out of `destroyPool`'s teardown, at once.
+    const slot = pool.mount(40)!;
+    pool.allocate(40);
+    document.body.appendChild(slot.canvas);
+    await slot.ready;
+    fireLost(slot.canvas);                    // arms a real DEFAULT_REBUILD_DELAY_MS rebuild
+    const madeBefore = created.length;
+
+    teardownCanvas2DPools([pool]);
+    await new Promise((r) => setTimeout(r, DEFAULT_REBUILD_DELAY_MS + 50));
+
+    expect(slot.destroyed, 'precondition: the slot was actually torn down').toBe(true);
+    expect(created.length, 'a torn-down pool must not rebuild').toBe(madeBefore);
   });
 });

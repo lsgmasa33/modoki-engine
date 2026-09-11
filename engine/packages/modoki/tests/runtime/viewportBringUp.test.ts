@@ -1,4 +1,4 @@
-/** Scene3D's bring-up decisions (#824) — `runtime/rendering/scene3DBringUp.ts`.
+/** A 3D viewport's bring-up decisions (#824, #1052) — `runtime/rendering/viewportBringUp.ts`.
  *
  *  Each case pins one decision that used to live inside `Scene3D.tsx`'s effect closure, where
  *  deleting it broke nothing: with #819's retirement and both halves of #820 removed, the full gate
@@ -10,8 +10,8 @@
 
 import { describe, it, expect, vi, afterEach, type Mock } from 'vitest';
 import {
-  createScene3DBringUp, boundedCaptureReadback, OFFSCREEN_READBACK_TIMEOUT_MS,
-} from '../../src/runtime/rendering/scene3DBringUp';
+  createViewportBringUp, boundedCaptureReadback, OFFSCREEN_READBACK_TIMEOUT_MS, type ViewportBringUpDeps,
+} from '../../src/runtime/rendering/viewportBringUp';
 import {
   createRendererRecovery, REBUILD_BRINGUP_TIMEOUT_MS, DEFAULT_REBUILD_DELAY_MS, DEFAULT_MAX_REBUILD_ATTEMPTS,
 } from '../../src/runtime/rendering/rendererRecovery';
@@ -39,24 +39,29 @@ function deferred<T>(): Deferred<T> {
 const flush = async () => { for (let i = 0; i < 6; i++) await Promise.resolve(); };
 
 /** `createRenderer` hands out a fresh deferred per call, in order, so a test decides when (and
- *  whether) each attempt's renderer arrives. */
-function harness() {
+ *  whether) each attempt's renderer arrives. `overrides` swaps in the #1052 seams a case is about;
+ *  without them this is exactly Scene3D's wiring (sync install, default discard). */
+function harness(overrides: Partial<Pick<ViewportBringUpDeps<FakeRenderer>, 'install' | 'discard' | 'onLateInstallError'>> = {}) {
   const attempts: Deferred<FakeRenderer>[] = [];
+  const kinds: string[] = [];
   const installed: string[] = [];
   const events: string[] = [];
   let unmounted = false;
-  const bringUp = createScene3DBringUp<FakeRenderer>({
-    createRenderer: () => {
+  const bringUp = createViewportBringUp<FakeRenderer>({
+    createRenderer: (kind) => {
       const d = deferred<FakeRenderer>();
       attempts.push(d);
+      kinds.push(kind);
       events.push(`create#${attempts.length}`);
       return d.promise;
     },
     isDisposed: () => unmounted,
-    install: (r) => { installed.push(r.id); events.push(`install:${r.id}`); },
+    install: overrides.install ?? ((r) => { installed.push(r.id); events.push(`install:${r.id}`); }),
     teardown: () => { events.push('teardown'); },
+    discard: overrides.discard,
+    onLateInstallError: overrides.onLateInstallError,
   });
-  return { bringUp, attempts, installed, events, unmount: () => { unmounted = true; } };
+  return { bringUp, attempts, kinds, installed, events, unmount: () => { unmounted = true; } };
 }
 
 describe('boot() — the FIRST bring-up is not bounded', () => {
@@ -260,6 +265,103 @@ describe('driven by rendererRecovery, as Scene3D drives it', () => {
     expect(w.installed).toEqual([last.id]);
     expect(last.dispose).not.toHaveBeenCalled();
     for (const earlier of renderers.slice(0, -1)) expect(earlier.dispose).toHaveBeenCalledTimes(1);
+  });
+});
+
+/** #1052 — the three seams the editor's SceneView needs and Scene3D does not use. Each runs under fake
+ *  timers even where no bound is advanced: a `rebuild()` arms `withTimeout`'s real 8 s timer otherwise,
+ *  and a timer that outlives its test is #1058's defect class. */
+describe('the SceneView seams (#1052)', () => {
+  it('createRenderer is told which bring-up it serves — boot for boot(), rebuild for rebuild()', async () => {
+    vi.useFakeTimers();
+    const h = harness();
+    const boot = h.bringUp.boot();
+    h.attempts[0].resolve(fakeRenderer('r1'));
+    await boot;
+    const rebuild = h.bringUp.rebuild();
+    h.attempts[1].resolve(fakeRenderer('r2'));
+    await rebuild;
+    expect(h.kinds).toEqual(['boot', 'rebuild']);
+  });
+
+  it('an ASYNC install is awaited: rebuild() settles only once install has finished', async () => {
+    vi.useFakeTimers();
+    const gate = deferred<void>();
+    const h = harness({ install: () => gate.promise });
+    let settled = false;
+    const p = h.bringUp.rebuild().then(() => { settled = true; });
+    h.attempts[0].resolve(fakeRenderer('r1'));
+    await flush();
+    expect(settled, 'rebuild() reported success while install was still running').toBe(false);
+    gate.resolve();
+    await p;
+    expect(settled).toBe(true);
+  });
+
+  it('install gets a check that turns false once a NEWER bring-up begins — an awaiting install can see it was overtaken', async () => {
+    vi.useFakeTimers();
+    const checks: Array<() => boolean> = [];
+    const gate = deferred<void>();
+    const h = harness({ install: (_r, stillCurrent) => { checks.push(stillCurrent); return gate.promise; } });
+    const boot = h.bringUp.boot();
+    h.attempts[0].resolve(fakeRenderer('r1'));
+    await flush();
+    expect(checks, 'precondition: install is running').toHaveLength(1);
+    expect(checks[0](), 'precondition: nothing has overtaken it yet').toBe(true);
+
+    void h.bringUp.rebuild().catch(() => { /* never resolved — the subject is the boot's check */ });
+
+    expect(checks[0](), 'a rebuild began while the boot install awaited').toBe(false);
+    gate.resolve();
+    await boot;
+  });
+
+  it('a late renderer arriving after UNMOUNT goes to discard(r, "disposed") — the caller releases it, nothing disposes it here', async () => {
+    vi.useFakeTimers();
+    const discard = vi.fn();
+    const h = harness({ discard });
+    const r1 = fakeRenderer('r1');
+    const p = h.bringUp.rebuild().catch(() => { /* timed out */ });
+    await vi.advanceTimersByTimeAsync(REBUILD_BRINGUP_TIMEOUT_MS);
+    await p;
+    h.unmount();
+    h.attempts[0].resolve(r1);
+    await flush();
+    expect(discard).toHaveBeenCalledWith(r1, 'disposed');
+    expect(r1.dispose, 'the hook owns disposal once it is supplied').not.toHaveBeenCalled();
+    expect(h.installed).toEqual([]);
+  });
+
+  /** Mutation-check target: deciding `disposed` before `superseded` in `adopt` reddens this. */
+  it('a SUPERSEDED late renderer goes to discard(r, "superseded") even after unmount — its lease is already gone', async () => {
+    vi.useFakeTimers();
+    const discard = vi.fn();
+    const h = harness({ discard });
+    const r1 = fakeRenderer('r1');
+    const first = h.bringUp.rebuild().catch(() => { /* timed out */ });
+    await vi.advanceTimersByTimeAsync(REBUILD_BRINGUP_TIMEOUT_MS);
+    await first;
+    const second = h.bringUp.rebuild();
+    h.attempts[1].resolve(fakeRenderer('r2'));
+    await second;
+    h.unmount();
+    h.attempts[0].resolve(r1);
+    await flush();
+    expect(discard).toHaveBeenCalledWith(r1, 'superseded');
+    expect(discard).not.toHaveBeenCalledWith(r1, 'disposed');
+  });
+
+  it('a late ADOPTED renderer whose install throws is reported, not left as an unhandled rejection', async () => {
+    vi.useFakeTimers();
+    const onLateInstallError = vi.fn();
+    const boom = new Error('install failed');
+    const h = harness({ install: () => { throw boom; }, onLateInstallError });
+    const p = h.bringUp.rebuild().catch(() => { /* timed out */ });
+    await vi.advanceTimersByTimeAsync(REBUILD_BRINGUP_TIMEOUT_MS);
+    await p;
+    h.attempts[0].resolve(fakeRenderer('r1'));
+    await flush();
+    expect(onLateInstallError).toHaveBeenCalledWith(boom);
   });
 });
 

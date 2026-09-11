@@ -20,7 +20,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   setAudioRecordMode, clearAudioLog, getAudioLog, play,
 } from '../../src/runtime/audio/audioService';
-import { defaultParticleEffect, type ParticleEffectDef, type CollisionConfig } from '../../src/runtime/particles/types';
+import { type ParticleEffectDef, type CollisionConfig } from '../../src/runtime/particles/types';
 import { normalizeParticleDef } from '../../src/runtime/loaders/particleCache';
 import { collide, resolveCollider, type ResolvedCollider, type CollisionHit } from '../../src/runtime/particles/colliders';
 

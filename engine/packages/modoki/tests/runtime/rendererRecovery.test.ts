@@ -235,8 +235,8 @@ describe('rendererRecovery — a failed rebuild is retried (#156)', () => {
   //
   // ⚠️ Be clear about what this does NOT prove: whether `Scene3D` passes a bound, or adopts a late
   // renderer. Those decisions were effect-local in `Scene3D.tsx` and deleting them broke nothing in
-  // `verify` (#824); they now live in `scene3DBringUp.ts` and are pinned by
-  // `scene3DBringUp.test.ts`, including this module driven with a hanging `createRenderer`.
+  // `verify` (#824); they now live in `viewportBringUp.ts` and are pinned by
+  // `viewportBringUp.test.ts`, including this module driven with a hanging `createRenderer`.
   it('a rebuild that never settles latches recovery — the reason bring-up must be bounded', async () => {
     const rebuild = vi.fn(() => new Promise<void>(() => { /* never settles: a hung bring-up */ }));
     const onError = vi.fn();

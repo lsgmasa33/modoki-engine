@@ -258,9 +258,9 @@ describe('gitignored paths under engine/ are classified, not defaulted (#1050)',
     // protects nothing. game-debug's dist is real, ships 10 files at the twin path, and IS
     // runtime-required: it is the engine debug bridge engine/app/debug/bridge.ts imports.
     'dist/': { verdict: 'ship', sample: 'engine/packages/capacitor-game-debug/dist/plugin.js', why: 'plugin JS ships only in a gitignored dist/ (CLAUDE.md clones RULE 1); the editor imports this one at runtime' },
-    'engine/electron/dist/': { verdict: 'ship', sample: 'engine/electron/dist/main.cjs', why: 'the packaged main process itself' },
+    'engine/electron/dist/': { verdict: 'ship', sample: 'engine/electron/dist/main.cjs', why: 'the packaged main process itself', absentOk: 'gitignored output of `npm run build:electron` — absent in any checkout that has not built, which includes every ci/main check job' },
     'engine/tools/game-debug-mcp/dist/': { verdict: 'ship', sample: 'engine/tools/game-debug-mcp/dist/index.js', why: 'the MCP server the packaged editor spawns', absentOk: "built on demand by that tool's own build, not by postinstall — absent in a fresh clone" },
-    'Package.resolved': { verdict: 'ship', sample: 'engine/packages/capacitor-game-debug/Package.resolved', why: 'a SwiftPM version PIN (~4 KB); dropping it makes a native build re-resolve to different SDK versions, which is the opposite of what a lockfile is for' },
+    'Package.resolved': { verdict: 'ship', sample: 'engine/packages/capacitor-game-debug/Package.resolved', why: 'a SwiftPM version PIN (~4 KB); dropping it makes a native build re-resolve to different SDK versions, which is the opposite of what a lockfile is for', absentOk: 'gitignored — written by a SwiftPM resolve on a Mac, so a fresh checkout (ci/main) has none' },
     'engine/vite.config*.cjs': { verdict: 'ship', sample: 'engine/vite.config.cjs', absentOk: 'staged into the source tree only at pack time by stage-vite-config.cjs', why: '#326 — chooseViteConfig()\'s only way to avoid the .vite-temp write inside a signed bundle. Staged at pack time, so absent in a dev clone; see the mustShip list above, which asserts the same thing from the other side' },
 
     // ── NATIVE BUILD OUTPUT — the #1050 measurement ──────────────────────────────────

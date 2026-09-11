@@ -372,6 +372,16 @@ function spawnCanvas(world: any, traits: any, sortOrder = 0) {
   );
 }
 
+/** #1053 — make the NEXT release frame an AUTHORING one. The runtime, and so this harness, defaults to
+ *  Play, where a scene-slot release PARKS its texture; the tests about the immediate free release with
+ *  Play stopped, as an editing session does. A stopped renderer idle-skips its frame unless something
+ *  dirtied it, hence the mark — call this again before each further release frame. */
+async function releaseAsAuthoring(scene2d: { markScene2DDirty(): void }) {
+  const { setPlayState } = await import('../../src/runtime/core/playState');
+  setPlayState('stopped');
+  scene2d.markScene2DDirty();
+}
+
 // Spawn a Renderable2D child parented to a canvas.
 function spawnChild(world: any, traits: any, canvasId: number, rend: any = {}, sortOrder = 0) {
   return world.spawn(
@@ -1448,6 +1458,7 @@ describe('Scene2D.renderFrame', () => {
       await new Promise((r) => setTimeout(r, 0)); // let a (should-be-absent) deferred unload elapse
       expect(pixi.Assets.__unloaded).not.toContain('http://t/noise.png'); // held while resident
 
+      await releaseAsAuthoring(scene2d);
       child.destroy();
       scene2d.markScene2DDirty();
       scene2d.renderFrame();
@@ -1521,6 +1532,7 @@ describe('Scene2D.renderFrame', () => {
       expect((pool.getSlot(canvas.id())!.container.children[0] as any).shader.extraTextures.uReveal).toBe(a);
 
       // Swap the override ref → matSig's extraSig changes → rebuild binds b, releases a to 0.
+      await releaseAsAuthoring(scene2d);
       child.set(traits.MaterialInstance, { overrides: [{ target: 'uReveal', kind: 'texture', ref: 'http://t/b.png' }] });
       scene2d.markScene2DDirty();
       scene2d.renderFrame();
@@ -1539,6 +1551,7 @@ describe('Scene2D.renderFrame', () => {
       const child = spawnChild(world, traits, canvas.id(), { sprite: 'http://t/hero.png', material: 'matGuid' });
 
       scene2d.renderFrame();
+      await releaseAsAuthoring(scene2d);
       child.destroy();
       scene2d.renderFrame();
       await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
@@ -1577,6 +1590,7 @@ describe('Scene2D.renderFrame', () => {
       scene2d.renderFrame();
       const wrapper = (pool.getSlot(canvas.id())!.container.children[0] as any).texture;
 
+      await releaseAsAuthoring(scene2d);
       child.destroy();
       scene2d.renderFrame();
       await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
@@ -1614,6 +1628,7 @@ describe('Scene2D.renderFrame', () => {
     const child = spawnChild(world, traits, canvas.id(), { sprite: 'http://t/a.png' });
 
     scene2d.renderFrame();
+    await releaseAsAuthoring(scene2d);
     child.set(traits.Renderable2D, { ...child.get(traits.Renderable2D), sprite: 'http://t/b.png' });
     scene2d.renderFrame();
     await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
@@ -1708,6 +1723,7 @@ describe('Scene2D.renderFrame', () => {
     const obj = pool.getSlot(canvas.id())!.container.children[0] as any;
     expect(obj.kind).toBe('sprite');
 
+    await releaseAsAuthoring(scene2d);
     child.destroy();
     scene2d.renderFrame();
     await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
@@ -1729,6 +1745,7 @@ describe('Scene2D.renderFrame', () => {
     const child = spawnChild(world, traits, canvas.id(), { sprite: 'img:/a.png' }); // ref 'img:/a.png' → url '/a.png'
 
     scene2d.renderFrame();
+    await releaseAsAuthoring(scene2d);
     child.destroy();
     scene2d.renderFrame();
     await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
@@ -1750,6 +1767,7 @@ describe('Scene2D.renderFrame', () => {
     scene2d.renderFrame();
     const obj = pool.getSlot(canvas.id())!.container.children[0] as any;
 
+    await releaseAsAuthoring(scene2d);
     canvas.destroy();          // remove the CANVAS but keep its child entity
     scene2d.renderFrame();
     await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
@@ -1806,6 +1824,7 @@ describe('Scene2D.renderFrame', () => {
       // b still uses it → must NOT be unloaded yet.
       expect(pixi.Assets.__unloaded).not.toContain('http://t/shared.png');
 
+      await releaseAsAuthoring(scene2d);
       b.destroy();
       scene2d.renderFrame();
       await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
@@ -1821,6 +1840,7 @@ describe('Scene2D.renderFrame', () => {
       const b = spawnChild(world, traits, canvas.id(), { sprite: 'http://t/shared.png' });
 
       scene2d.renderFrame();
+      await releaseAsAuthoring(scene2d);
       a.destroy(); b.destroy();
       scene2d.renderFrame();                       // both released → unloaded once, map cleared
       await new Promise((r) => setTimeout(r, 0)); // let the deferred unload elapse
@@ -2182,6 +2202,7 @@ describe('panel texture holds veto the shared unload (#701)', () => {
 
     scene2d.retainPanelTexture('http://t/panel-c.png');
 
+    await releaseAsAuthoring(scene2d);
     child.destroy();
     scene2d.renderFrame(); // scene drops its hold (deferred)
     scene2d.releasePanelTexture('http://t/panel-c.png'); // panel drops its last hold too
@@ -2696,6 +2717,7 @@ describe('Scene2DRenderer instancing', () => {
     pixi.Assets.__seed('/hero.png?v=hash-after', after);
     manifest.registerAsset(GUID, PATH, 'texture', undefined, undefined, 'hash-after');
     spriteUrlRedirects.set(GUID, '/hero.png?v=hash-after');
+    await releaseAsAuthoring(scene2d);   // a re-import is an authoring act — during Play the old url would park (#1053)
     scene2d.markScene2DDirty();
     scene2d.renderFrame();
     await new Promise((r) => setTimeout(r, 0));   // let the deferred unload elapse
@@ -2758,6 +2780,127 @@ describe('Scene2DRenderer instancing', () => {
 // direct-write edits show live); while it returns undefined the frame is skipped as before. Runtime (no
 // provider) is unaffected. We observe the gate via a direct Transform write (which does NOT set the
 // external-dirty flag): it only lands when the frame actually runs.
+// ── #1053: a mid-scene release DURING PLAY parks its texture ─────────────────────────────────────
+// MEASURED before the fix (dev editor, games/court, WebGPU): three `court_load_level` calls added
+// +14, +46 and +40 `[BindGroup] … destroyed while still bound` warnings. Court despawns its board,
+// AWAITS the next level's fetch, then respawns the same art, so the one-macrotask unload deferral —
+// built for a SAME-task rebuild — had expired before anything re-retained, and every level load
+// destroyed and re-decoded the board. The owner chose retention during Play over a Court-only reorder.
+describe('a mid-scene release during Play parks the texture (#1053)', () => {
+  /** Two macrotasks with nothing re-retaining — the shape of Court's despawn → await fetch → respawn. */
+  const fetchGap = async () => {
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+  };
+
+  it('despawn → async gap → respawn of the same art binds the SAME loaded texture: no destroy, no re-decode', async () => {
+    const { pixi, traits, pool, scene2d, world } = await setup();   // the runtime default: Play
+    const piece = { width: 64, height: 64, source: { style: {} } };
+    pixi.Assets.__seed('http://t/piece.png', piece);
+    const canvas = spawnCanvas(world, traits);
+    const board = spawnChild(world, traits, canvas.id(), { sprite: 'http://t/piece.png' });
+    scene2d.renderFrame();
+
+    board.destroy();
+    scene2d.renderFrame();
+    expect(pool.getSlot(canvas.id())!.container.children.length, 'precondition: the release frame ran').toBe(0);
+    await fetchGap();   // the deferral expires in here — pre-fix, this destroyed the source
+
+    expect(pixi.Assets.__unloaded).not.toContain('http://t/piece.png');
+    spawnChild(world, traits, canvas.id(), { sprite: 'http://t/piece.png' });
+    scene2d.renderFrame();
+    // Identity, not "not unloaded": a texture freed and reloaded would also end up bound, as a NEW object.
+    expect((pool.getSlot(canvas.id())!.container.children[0] as any).texture).toBe(piece);
+  });
+
+  it('a PAUSED Play still parks — pausing does not end the play session', async () => {
+    const { pixi, traits, pool, scene2d, world } = await setup();
+    const { setRunMode } = await import('../../src/runtime/core/playState');
+    pixi.Assets.__seed('http://t/paused.png', { width: 64, height: 64, source: { style: {} } });
+    const canvas = spawnCanvas(world, traits);
+    const child = spawnChild(world, traits, canvas.id(), { sprite: 'http://t/paused.png' });
+    scene2d.renderFrame();
+
+    setRunMode('playing', { advancing: false });
+    child.destroy();
+    scene2d.markScene2DDirty();   // a paused renderer idle-skips unless dirtied
+    scene2d.renderFrame();
+    expect(pool.getSlot(canvas.id())!.container.children.length, 'precondition: the release frame ran').toBe(0);
+    await fetchGap();
+
+    expect(pixi.Assets.__unloaded).not.toContain('http://t/paused.png');
+  });
+
+  it('with Play STOPPED the same release still frees at once — authoring must not pin what it touched', async () => {
+    const { pixi, traits, scene2d, world } = await setup();
+    pixi.Assets.__seed('http://t/authored.png', { width: 64, height: 64, source: { style: {} } });
+    const canvas = spawnCanvas(world, traits);
+    const child = spawnChild(world, traits, canvas.id(), { sprite: 'http://t/authored.png' });
+    scene2d.renderFrame();
+
+    await releaseAsAuthoring(scene2d);
+    child.destroy();
+    scene2d.renderFrame();
+    await fetchGap();
+
+    expect(pixi.Assets.__unloaded).toContain('http://t/authored.png');
+  });
+
+  it('a PANEL hold dropped during Play still frees — play retention is for scene slots only', async () => {
+    const { pixi, scene2d } = await setup();
+    pixi.Assets.__seed('http://t/preview.png', { width: 8, height: 8, source: { style: {} } });
+    scene2d.retainPanelTexture('http://t/preview.png');
+    scene2d.releasePanelTexture('http://t/preview.png');
+    await fetchGap();
+
+    expect(pixi.Assets.__unloaded).toContain('http://t/preview.png');
+  });
+
+  it('a texture parked during Play is freed by a genuine scene change — retention is bounded by the scene', async () => {
+    const { pixi, traits, scene2d, worldReg, newWorld } = await setup({ start: true }); // live=1, a shipped game's shape
+    const { sceneManager } = await import('../../src/runtime/scene/SceneManager');
+    let path = '/assets/scenes/a.scene.json';
+    const spy = vi.spyOn(sceneManager, 'getCurrent')
+      .mockImplementation(() => ({ id: 's' as never, path, state: 'loaded' as never }));
+    try {
+      pixi.Assets.__seed('/level-art.png', { width: 32, height: 32, source: { style: {} } });
+      const w1 = newWorld();
+      worldReg.setCurrentWorld(w1);   // the first swap records scene A
+      const canvas = spawnCanvas(w1, traits);
+      const board = spawnChild(w1, traits, canvas.id(), { sprite: 'img:/level-art.png' });
+      scene2d.renderFrame();
+      board.destroy();
+      scene2d.renderFrame();
+      await fetchGap();
+      expect(pixi.Assets.__unloaded, 'precondition: parked during Play, not freed').not.toContain('/level-art.png');
+
+      path = '/assets/scenes/b.scene.json';
+      worldReg.setCurrentWorld(newWorld());
+
+      expect(pixi.Assets.__unloaded).toContain('/level-art.png');
+    } finally {
+      spy.mockRestore();
+      scene2d.stopScene2D();
+    }
+  });
+
+  it('a texture parked during Play is freed when the last renderer stops', async () => {
+    const { pixi, traits, scene2d, world } = await setup({ start: true });
+    pixi.Assets.__seed('http://t/tail.png', { width: 16, height: 16, source: { style: {} } });
+    const canvas = spawnCanvas(world, traits);
+    const child = spawnChild(world, traits, canvas.id(), { sprite: 'http://t/tail.png' });
+    scene2d.renderFrame();
+    child.destroy();
+    scene2d.renderFrame();
+    await fetchGap();
+    expect(pixi.Assets.__unloaded, 'precondition: parked during Play, not freed').not.toContain('http://t/tail.png');
+
+    scene2d.stopScene2D();   // live=0
+
+    expect(pixi.Assets.__unloaded).toContain('http://t/tail.png');
+  });
+});
+
 describe('Scene2DRenderer 2D-particle-preview render gate (Phase 4)', () => {
   it('a preview provider keeps renderFrame alive while stopped; undefined skips as before', async () => {
     const { traits, scene2d, pool, world } = await setup();

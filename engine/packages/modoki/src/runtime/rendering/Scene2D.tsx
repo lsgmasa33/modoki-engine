@@ -77,7 +77,7 @@ import {
   type ParticleSync2DState, type ParticleSync2DCtx,
 } from './particleSync2D';
 import { addDirtyListener, onStructureDirty, readTraitData } from '../core/ecs/entityUtils';
-import { isSimRunning, onPlayStateChange } from '../core/playState';
+import { getRunMode, isSimRunning, onPlayStateChange } from '../core/playState';
 import { Canvas2DPool, defaultPool, type Canvas2DSlot } from './canvas2DPool';
 import { registerBoundsProvider, type BoundsSurface, type EntityScreenBounds } from '../core/screenBounds';
 import { ensurePixiKtxTranscoder } from '../loaders/pixiKtxTranscoder';
@@ -185,7 +185,8 @@ const spriteTextureRefs = new Map<string, number>();
 // a genuine last release still frees the VRAM one tick later.
 const pendingTextureUnloads = new Map<string, ReturnType<typeof setTimeout>>();
 
-// Urls whose ALREADY-ARMED unload must retain rather than destroy (#1000). `deferUnload` early-returns
+// Urls whose ALREADY-ARMED unload must retain rather than destroy (#1000; and since #1053, any
+// scene-slot release made during Play — see `releaseSpriteTexture`). `deferUnload` early-returns
 // when a url is already pending, so a swap teardown re-releasing a url that an ORDINARY mid-scene
 // release armed a moment earlier cannot re-arm it — and would silently keep that arm's destroy
 // semantics. MEASURED: `games/court` hits exactly this on every stop, because its board overlay
@@ -256,11 +257,12 @@ const retainedSpriteTextures = new Set<string>();
 // Which base scene `retainedSpriteTextures` belongs to, so a genuine scene change can be told from a
 // play/stop swap (both are world swaps). `undefined` until the first retention.
 let retainedForScene: string | null | undefined;
-// >0 while a world-swap teardown is releasing slots, which is the ONLY release that may retain.
-// ⚠️ Scoped this narrowly on purpose: retaining on every release also retained every mid-scene one —
-// an entity deleted, a sprite ref repointed — so an authoring session that cycled through sprites
-// would pin each one until the scene changed. 11 existing tests in Scene2D.test.ts pin that
-// mid-scene release, and they were right to; a counter is what keeps both behaviours.
+// >0 while a world-swap teardown is releasing slots — one of the TWO releases that may retain; the
+// other is a scene-slot release during Play (#1053, `releaseSpriteTexture`).
+// ⚠️ Scoped on purpose: retaining on EVERY release also retained every AUTHORING one — an entity
+// deleted, a sprite ref repointed with Play stopped — so an editing session that cycled through
+// sprites would pin each one until the scene changed. The mid-scene tests in Scene2D.test.ts pin
+// that by releasing with Play stopped; a counter plus the run mode is what keeps both behaviours.
 let swapTeardownDepth = 0;
 
 // ── EDITOR-PANEL holds on a sprite url (#701) ──
@@ -304,10 +306,10 @@ function deferUnload(url: string): void {
   if (pendingTextureUnloads.has(url)) return;
   const handle = setTimeout(() => {
     pendingTextureUnloads.delete(url);
-    // Consume-and-read: only a release performed BY a world-swap teardown may retain. An ordinary
-    // mid-scene release — an entity removed, a sprite ref repointed — must still FREE the texture, or
-    // an authoring session that cycles through sprites would pin every one it ever touched (11 tests
-    // in Scene2D.test.ts pin that, correctly).
+    // Consume-and-read: only a release performed BY a world-swap teardown, or by a scene slot during
+    // Play (#1053), may retain. An AUTHORING release — an entity removed, a sprite ref repointed with
+    // Play stopped — must still FREE the texture, or an editing session that cycles through sprites
+    // would pin every one it ever touched (the mid-scene tests in Scene2D.test.ts pin that).
     const retain = pendingRetainUpgrade.delete(url);
     if ((spriteTextureRefs.get(url) ?? 0) > 0 || panelTextureRefs.has(url)) return;
     if (retain) parkRetainedSpriteTexture(url);
@@ -395,6 +397,17 @@ function releaseSpriteTexture(url: string) {
   const n = (spriteTextureRefs.get(url) ?? 0) - 1;
   if (n <= 0) {
     spriteTextureRefs.delete(url);
+    // #1053 — a release DURING PLAY parks rather than destroys. A running game rebuilds content it
+    // is about to show again, and not always inside one task: Court despawns its board, AWAITS the
+    // next level's fetch, then respawns the same art — so the macrotask deferral below expired inside
+    // the fetch, and every level load destroyed and re-decoded the board (on WebGPU, ~2 `[BindGroup]`
+    // warnings per source per live renderer). Parked textures are freed on a scene change, a texture
+    // invalidation or the last renderer's stop — but the set is WIDER than #1000's one-swap working
+    // set: every url released during Play, for the life of the scene (docs/rendering.md). Two scoping calls:
+    //  - `getRunMode()`, NOT `isSimRunning()` — a PAUSED Play is still a play session.
+    //  - Here, NOT in `deferUnload` — a panel hold dropping is authoring, and while Play is stopped a
+    //    release still frees at once, or an authoring session would pin every sprite it touched.
+    if (getRunMode() === 'playing') pendingRetainUpgrade.add(url);
     deferUnload(url);
   } else {
     spriteTextureRefs.set(url, n);

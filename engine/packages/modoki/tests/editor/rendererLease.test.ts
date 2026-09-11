@@ -66,6 +66,45 @@ describe('rendererLease', () => {
     expect(create).toHaveBeenCalledTimes(2);
   });
 
+  // #1052 close-out review, finding 1. A context-loss rebuild discards a still-PENDING lease and
+  // leases a fresh one for the same container, and the abandoned create can reject afterwards. Its
+  // failure handler used to delete whatever lease the container held BY THEN — the successor's.
+  it("a discarded lease's LATE rejection does not delete the successor's lease", async () => {
+    const container = {};
+    let rejectFirst!: (e: unknown) => void;
+    const first = acquireRenderer(container, () => new Promise<ReturnType<typeof fakeRenderer>>((_resolve, reject) => { rejectFirst = reject; }));
+    discardRenderer(container);                                  // the rebuild drops the pending lease…
+    const successor = fakeRenderer();
+    await acquireRenderer(container, async () => successor);     // …and leases a fresh one
+
+    rejectFirst(new Error('the abandoned create fails late'));
+    await expect(first).rejects.toThrow('the abandoned create fails late');
+
+    expect(__hasLease(container), "the stale rejection must leave the successor's lease in place").toBe(true);
+    discardRenderer(container);
+    expect(successor.dispose, 'so the next rebuild can still dispose it').toHaveBeenCalledTimes(1);
+  });
+
+  // The same mechanism in the RELEASE path (#1052 close-out §2d review; latent — SceneView only releases
+  // a lease whose create has resolved). A release arms the deferred teardown while the create is still
+  // pending, the create then rejects, a fresh lease is acquired for the container, and the stale timer
+  // used to delete whatever lease the container held when it fired.
+  it("a released lease's deferred teardown does not delete a lease acquired after its create rejected", async () => {
+    const container = {};
+    let rejectFirst!: (e: unknown) => void;
+    const first = acquireRenderer(container, () => new Promise<ReturnType<typeof fakeRenderer>>((_resolve, reject) => { rejectFirst = reject; }));
+    releaseRenderer(container);                                  // refs 0: the deferred teardown is armed
+    rejectFirst(new Error('the create fails'));
+    await expect(first).rejects.toThrow('the create fails');
+    const successor = fakeRenderer();
+    await acquireRenderer(container, async () => successor);     // a fresh lease on the same container
+
+    await flushRelease();                                        // the stale teardown fires
+
+    expect(__hasLease(container), "the stale teardown must not delete the successor's lease").toBe(true);
+    expect(successor.dispose).not.toHaveBeenCalled();
+  });
+
   it('keeps separate containers on separate renderers', async () => {
     const a = {}, b = {};
     const ra = fakeRenderer(), rb = fakeRenderer();

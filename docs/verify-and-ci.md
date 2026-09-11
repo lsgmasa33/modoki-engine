@@ -505,6 +505,16 @@ valid TypeScript. **One slice of it IS in `npm test` now** —
 tracked at all. That is the merge-re-leak shape specifically, caught before the push instead of
 on `main`; a real id pasted into a fixture or prose still needs `verify:publish`.
 
+⚠️ **The in-stage run is SCOPED to `architecture/`+`assets/`** (why: `scripts/publish-engine-oss.sh`
+§ 4b), so it covers the class, not every test. One hub merge on 2026-09-11 carried both shapes:
+a COUNT floor sized for a clone (`retractedClaims.test.ts` — inside the scope, caught here) and,
+outside it, a guard asserting a GITIGNORED build output exists on disk
+(`tests/electron/packagingManifest.test.ts` sampling `engine/electron/dist/main.cjs`), which only
+`ci/main` saw — its fresh checkout has never built. So: a floor over a walk that reaches beyond
+`engine/` must clear the snapshot's counts, in every layout it ships (this gate assembles the
+two-demo one; a publish without `--with-demos` ships none), or pick per layout through a
+`repoLayout` predicate; and a sample that only a build produces declares `absentOk`.
+
 Twice now a leak has ridden a worker branch into `main` and killed the snapshot there — a real
 Team ID in a test fixture, then three real iPhone UDIDs plus a third party's device name in the
 #143 xctrace fixture. It scans WORKING-TREE content of tracked files, so it answers about what

@@ -52,6 +52,8 @@ import {
 } from '../../runtime/core/activeRenderer';
 import { attachRendererLossHandling } from '../../runtime/rendering/rendererLossHandling';
 import { createRendererRecovery } from '../../runtime/rendering/rendererRecovery';
+import { createViewportBringUp, type BringUpKind } from '../../runtime/rendering/viewportBringUp';
+import type { LivenessCheck } from '../../runtime/core/liveness';
 import { acquireRenderer, releaseRenderer, discardRenderer } from './rendererLease';
 import { disposeSceneViewEntityObjects } from './sceneViewResources';
 import { drawColliderOutline, drawSkinnedMeshFlat2D, drawSkinnedMeshWireframe2D, drawWeightHeatmap2D, drawDominantBoneMap2D, computePivotOffset, COLLIDER_SPRITE } from '../../runtime/rendering/render2DUtils';
@@ -2665,29 +2667,12 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
 
     noteRendererProgress('viewport effect entered; renderer init starting');
 
-    const setup = async () => {
-    // #858: THE FIRST STATEMENT, and it is load-bearing. Everything below registers into module
-    // scope or takes a GPU resource long before the big teardown closure at the end of this
-    // function exists, and a throw in between used to leave `cleanup` undefined — so
-    // `teardownViewport()`'s `fn?.()` released NOTHING and every slot taken so far dangled into a
-    // viewport that was never finished. Seeding the scope here makes a PARTIAL teardown possible:
-    // each acquisition below pushes its own release the moment it takes the thing, so whatever
-    // this run managed to take is released whether or not it reached the end.
-    // A fresh scope per run, because the context-loss rebuild calls `setup()` again.
-    const scope = createTeardownScope('SceneView');
-    cleanup = scope.dispose;
-    // Three.js r183 WebGPU's node system warns 'Light node not found' for
-    // dynamically-added lights (they still work — a Three.js internal issue). It's
-    // emitted at render time, so it's suppressed via the SCOPED `withWarnFilter`
-    // wrapped around the per-frame `renderer.render` (F9) — NOT a lifetime-long
-    // global `console.warn` patch that would swallow every other warning in the app.
-
     // ── Renderer (WebGPU when available, else WebGL2 via forceWebGL — matches
     //    the game renderer, including the WebGPU-init-failure → WebGL2 fallback) ──
     // makeWebGPURenderer creates + inits the renderer (and appends its canvas),
-    // so the backend is fully settled BEFORE we bind OrbitControls /
-    // TransformControls and pointer listeners to renderer.domElement below.
-    // Renderer creation is RETRIED, not attempted once. The old code gave up permanently on
+    // so the backend is fully settled BEFORE install binds OrbitControls /
+    // TransformControls and pointer listeners to renderer.domElement.
+    // A BOOT's renderer creation is RETRIED, not attempted once. The old code gave up permanently on
     // the first throw — and because the effect has `[]` deps and is latched by `initedRef`, a
     // mounted-but-failed viewport could never try again. Since nothing then ever called
     // `setActiveRenderer`, the scene-load gate sat on its full 120s cold-start budget before
@@ -2727,38 +2712,40 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         }
       }
     };
-
-    let created: WebGPURenderer;
-    try {
+    // #1052 — a REBUILD makes ONE attempt and leaves retrying to `rendererRecovery`, which already
+    // retries a rejected rebuild with backoff. Retrying here as well would make the bring-up bound
+    // (`REBUILD_BRINGUP_TIMEOUT_MS`) measure four attempts plus 4.25 s of sleeps rather than one
+    // bring-up — and Scene3D's rebuild has no inner retry either.
+    // `bootCreateFailed` tells the boot's `.catch` below "creation failed" from "install threw".
+    let bootCreateFailed = false;
+    const createRenderer = (kind: BringUpKind): Promise<WebGPURenderer> => {
       // Leased per container, so a StrictMode remount reuses this renderer rather than racing
       // a second GPU device into existence while the first is still releasing.
-      created = await acquireRenderer(container, createWithRetry,
+      const leased = acquireRenderer(container, kind === 'boot' ? createWithRetry : () => makeWebGPURenderer(container),
         () => noteRendererProgress('reusing the renderer already leased to this container'));
-    } catch (e) {
-      if (outerDisposed) return; // unmounted mid-attempt — nothing to recover for
-      const err = e instanceof Error ? e : new Error(String(e));
-      noteRendererProgress(`renderer init failed after ${RETRY_DELAYS_MS.length + 1} attempts: ${err.message}`);
-      // ERROR, not warn. This was logged at warn level while the timeout message told the
-      // reader to "check the console for a WebGPU/WebGL init error" — so anyone filtering
-      // to `error`, exactly as instructed, saw an empty console and blamed their own code.
-      console.error(
-        `[SceneView] renderer init FAILED after ${RETRY_DELAYS_MS.length + 1} attempts — the 3D ` +
-        `viewport cannot render and no scene will load. This does not recover on its own; ` +
-        `relaunch the editor once the cause below is addressed.`, err,
-      );
-      initedRef.current = false;
-      // Unblock every scene-load waiter NOW rather than leaving them on the 120s budget.
-      reportRendererInitFailure(err);
-      return;
-    }
+      return kind === 'boot' ? leased.catch((e: unknown) => { bootCreateFailed = true; throw e; }) : leased;
+    };
+
+    const install = async (created: WebGPURenderer, stillCurrent: LivenessCheck) => {
+    // #858: THE FIRST STATEMENT, and it is load-bearing. Everything below registers into module
+    // scope or takes a GPU resource long before the big teardown closure at the end of this
+    // function exists, and a throw in between used to leave `cleanup` undefined — so
+    // `teardownViewport()`'s `fn?.()` released NOTHING and every slot taken so far dangled into a
+    // viewport that was never finished. Seeding the scope here makes a PARTIAL teardown possible:
+    // each acquisition below pushes its own release the moment it takes the thing, so whatever
+    // this run managed to take is released whether or not it reached the end.
+    // A fresh scope per install, because a context-loss rebuild installs again.
+    const scope = createTeardownScope('SceneView');
+    cleanup = scope.dispose;
+    // Three.js r183 WebGPU's node system warns 'Light node not found' for
+    // dynamically-added lights (they still work — a Three.js internal issue). It's
+    // emitted at render time, so it's suppressed via the SCOPED `withWarnFilter`
+    // wrapped around the per-frame `renderer.render` (F9) — NOT a lifetime-long
+    // global `console.warn` patch that would swallow every other warning in the app.
+
     const renderer: WebGPURenderer = created;
-    // The component may have unmounted while init was in flight. Release our hold rather than
-    // disposing directly — a StrictMode remount is about to re-acquire this very renderer.
-    if (outerDisposed) {
-      noteRendererProgress('viewport unmounted before the renderer could be registered');
-      releaseRenderer(container);
-      return;
-    }
+    // Nothing to check before the first await: a renderer that arrived after unmount, or that a newer
+    // bring-up superseded, never reaches install — `viewportBringUp`'s `discard` takes it (#1052).
     const disposeActiveRenderer = await setActiveRenderer(renderer); // KTX2Loader GPU-format detection (async since #254)
     // Compose onto the renderer's own `dispose()` rather than adding a second teardown path:
     // `rendererLease.ts`'s `releaseRenderer`/`discardRenderer` are the only callers of
@@ -2770,12 +2757,21 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       return priorDispose(...args);
     };
     noteRendererProgress('renderer registered (setActiveRenderer called)');
-    // RE-CHECK, and it is the SECOND await in this body, not the first. #254 made
-    // `setActiveRenderer` genuinely async (it fetches the KTX2Loader chunk on a cold boot), so
-    // an unmount can land here — past the guard above. `cleanup` is not assigned until the very
-    // END of setup(), ~2000 lines down, so bailing without this check makes the effect's
-    // teardown a no-op while setup runs on to `startFrameDriver()`: a zombie renderer animating
-    // a detached canvas, its container lease never released, one per open/close cycle.
+    // RE-CHECK after install's ONLY await (the acquire moved out to `createRenderer`, #1052). #254 made
+    // `setActiveRenderer` genuinely async (it fetches the KTX2Loader chunk on a cold boot), so two
+    // things can land here, and bailing without these checks runs on to `startFrameDriver()`: a
+    // zombie renderer animating a detached canvas, its container lease never released.
+    //  - A NEWER bring-up — a context loss during the await starts a rebuild. Its teardown already
+    //    `discardRenderer`ed this container's lease, which DISPOSED this renderer (the lease held
+    //    it) before the dispose wrap above existed, so only the active-renderer registration taken
+    //    just above is still ours to drop. `releaseRenderer` here would decrement the SUCCESSOR's
+    //    lease, which is why this is checked FIRST, even when the viewport has also unmounted.
+    //  - An unmount — release our hold, since a StrictMode remount may be re-acquiring this renderer.
+    if (!stillCurrent()) {
+      noteRendererProgress('a newer bring-up overtook this one while the KTX2 loader chunk was in flight');
+      disposeActiveRenderer();
+      return;
+    }
     if (outerDisposed) {
       noteRendererProgress('viewport unmounted while the KTX2 loader chunk was in flight');
       releaseRenderer(container);
@@ -5117,54 +5113,73 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       scene.clear();
       initedRef.current = false;
     });
-    }; // end setup
+    // RE-ARM THE DIRTY GATE — without this a rebuild completes and the viewport stays BLACK.
+    // Measured, not theorised: after a live rebuild the Scene panel rendered nothing until the
+    // camera was nudged. This surface is render-on-demand, and the gate is a component-level
+    // `useRef` created at MOUNT, so a rebuild inherits it with its grace window already decayed to
+    // 0 — every event that would normally re-arm it (scene load, world swap) belongs to a mount
+    // that already happened. It used to run after `await setup()` in the rebuild; it lives HERE
+    // since #1052 because a rebuild's renderer can now be adopted LATE, after the bound, with no
+    // caller left to run a line after any await. A black viewport after recovery is
+    // indistinguishable from recovery having failed.
+    gateRef.current.markDirty();
+    }; // end install
 
     // ── GPU context-loss recovery (#121 P1) ────────────────────────────────────────────────
-    // Same shape as the runtime viewport (`runtime/rendering/Scene3D.tsx`): `setup()` builds
-    // everything and installs one `cleanup`, so recovery is teardown + a second `setup()`
-    // rather than re-pointing a renderer through ~2000 lines of wiring. A lost three renderer
-    // cannot be revived — see `core/activeRenderer.ts` for why this rebuilds instead.
+    // Same shape as the runtime viewport (`runtime/rendering/Scene3D.tsx`), and since #1052 the SAME
+    // decisions: `viewportBringUp.ts` bounds a rebuild's bring-up (`REBUILD_BRINGUP_TIMEOUT_MS`),
+    // adopts a late renderer nothing superseded, and discards one that lost its race. Before #1052
+    // the rebuild was `teardownViewport(); discardRenderer(container); await setup();` with no bound,
+    // so a WebGPU init that never settled latched `rendererRecovery`'s `inFlight` forever — no retry,
+    // no report, a Scene panel black until relaunch. `install()` builds everything and installs one
+    // `cleanup`, so recovery is teardown + a second install rather than re-pointing a renderer
+    // through ~2000 lines of wiring. A lost three renderer cannot be revived — see
+    // `core/activeRenderer.ts` for why this rebuilds instead.
     //
-    // `discardRenderer` is LOAD-BEARING and not obvious. `cleanup` still ENDS in
-    // `releaseRenderer(container)` — it is the scope's first-pushed release, so LIFO drains it
-    // last (#858) — and that defers teardown to a macrotask precisely so a
-    // StrictMode remount can re-acquire the SAME renderer. This rebuild is `cleanup(); setup();`
-    // in one task, so without the discard its `acquireRenderer` would cancel that timer and be
-    // handed the DEAD renderer straight back — recovery silently doing nothing, no error
-    // anywhere, viewport black forever. A dead renderer must never be leasable.
+    // `discardRenderer` in the bring-up's `teardown` is LOAD-BEARING and not obvious. `cleanup` still
+    // ENDS in `releaseRenderer(container)` — it is the scope's first-pushed release, so LIFO drains it
+    // last (#858) — and that defers teardown to a macrotask precisely so a StrictMode remount can
+    // re-acquire the SAME renderer. A rebuild's teardown and its `createRenderer` run in one task, so
+    // without the discard the acquire would cancel that timer and be handed the DEAD renderer straight
+    // back — recovery silently doing nothing, no error anywhere, viewport black forever. A dead
+    // renderer must never be leasable.
     //
     // The editor is the lower-stakes half of this phase (a human can relaunch it; a player on a
     // phone cannot), but it is the surface where a context loss is most likely to be SEEN.
     const teardownViewport = () => {
       const fn = cleanup;
-      cleanup = undefined; // a failed re-setup must not leave the unmount path on a stale closure
+      cleanup = undefined; // a failed re-install must not leave the unmount path on a stale closure
       fn?.();
     };
-    const recovery = createRendererRecovery({
-      rebuild: async () => {
-        teardownViewport();
-        discardRenderer(container);
-        initedRef.current = true; // cleanup released the latch; this viewport is still live
-        await setup();
-        // RE-ARM THE DIRTY GATE — without this the rebuild completes and the viewport stays
-        // BLACK. Measured, not theorised: after a live rebuild the Scene panel rendered nothing
-        // until the camera was nudged. This surface is render-on-demand, and the gate is a
-        // component-level `useRef` created at MOUNT, so a rebuild inherits it with its grace
-        // window already decayed to 0 — every event that would normally re-arm it (scene load,
-        // world swap) belongs to a mount that already happened. The runtime viewport does not
-        // have this bug because its counter is re-initialised inside the bring-up closure.
-        // A black viewport after recovery is indistinguishable from recovery having failed.
-        gateRef.current.markDirty();
+    const bringUp = createViewportBringUp<WebGPURenderer>({
+      createRenderer: (kind) => createRenderer(kind),
+      isDisposed: () => outerDisposed,
+      install: (r, stillCurrent) => install(r, stillCurrent),
+      teardown: () => { teardownViewport(); discardRenderer(container); initedRef.current = true; },
+      // A renderer that will not be installed. After UNMOUNT it goes back through the lease, since a
+      // StrictMode remount may be re-acquiring it. SUPERSEDED, its lease was already discarded by
+      // the rebuild that overtook it, so a release here would decrement the SUCCESSOR's hold.
+      discard: (r, reason) => {
+        if (reason === 'disposed') releaseRenderer(container);
+        else { r.dispose(); r.domElement.remove(); }
       },
+    });
+    const recovery = createRendererRecovery({
+      rebuild: bringUp.rebuild,
       isDisposed: () => outerDisposed,
       // `description` first, then the raw value — see the twin in Scene3D.tsx for why both.
-      onError: (e, { description, attempt, willRetry }) => console.error(
-        `[SceneView] renderer rebuild after context loss FAILED (attempt ${attempt}) — ` +
-        (willRetry
-          ? 'retrying after a backoff:'
-          : 'giving up; the 3D viewport stays black. Relaunch the editor once the cause below is addressed:'),
-        description, e,
-      ),
+      onError: (e, { description, attempt, willRetry }) => {
+        console.error(
+          `[SceneView] renderer rebuild after context loss FAILED (attempt ${attempt}) — ` +
+          (willRetry
+            ? 'retrying after a backoff:'
+            : 'giving up; the 3D viewport stays black. Relaunch the editor once the cause below is addressed:'),
+          description, e,
+        );
+        // Deliberately NO `reportRendererInitFailure` here, although a failed boot calls it: it returns
+        // at once once any renderer has fired ready, and a rebuild only ever follows a loss on a renderer
+        // that already did — so from a rebuild it could never unblock a waiter (#1052 close-out review).
+      },
     });
     // Only OUR renderer's death is ours to act on — GameView mounts a second viewport with its
     // own renderer, and rebuilding a healthy one costs a prewarm stall for nothing.
@@ -5174,15 +5189,35 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       recovery.request();
     });
 
-    // Fire-and-forget; the async body guards on `outerDisposed` after EACH of its awaits
-    // (renderer acquire, then `setActiveRenderer` — #254 added the second one).
-    // The `.catch` is load-bearing, not hygiene: `setup()` registers the frame callback and
-    // calls startFrameDriver() at its very END, after ~2000 lines of synchronous scene/gizmo
-    // wiring. A throw anywhere in there leaves the renderer ALREADY registered (so
-    // `rendererReady` resolved and the scene loaded normally) while the frame loop was never
-    // started — the exact "playing, advancing, entityCount correct, fps 0, nothing renders"
-    // wedge. Unhandled, the reason went nowhere useful. Report it as a viewport failure.
-    void setup().catch((e) => {
+    // The FIRST bring-up — unbounded by design (`viewportBringUp.ts` rule 1). Fire-and-forget: an
+    // unmount during the acquire is the bring-up's `discard`, and one during `setActiveRenderer` is
+    // install's own re-check (#254). The `.catch` is load-bearing, not hygiene, and has two cases:
+    //  - creation failed after every retry (`bootCreateFailed`) — the renderer-init failure report.
+    //  - install threw — it registers the frame callback and calls startFrameDriver() at its very
+    //    END, after ~2000 lines of synchronous scene/gizmo wiring, so a throw anywhere in there leaves
+    //    the renderer ALREADY registered (`rendererReady` resolved and the scene loaded normally)
+    //    while the frame loop never started — the exact "playing, advancing, entityCount correct,
+    //    fps 0, nothing renders" wedge. Unhandled, the reason went nowhere useful.
+    bringUp.boot().catch((e) => {
+      if (bootCreateFailed) {
+        // Unmounted mid-attempt — nothing to recover for. And if a rebuild overtook this boot and
+        // already installed its own renderer, a stale boot failure must not report the viewport dead.
+        if (outerDisposed || rendererRef.current) return;
+        const err = e instanceof Error ? e : new Error(String(e));
+        noteRendererProgress(`renderer init failed after ${RETRY_DELAYS_MS.length + 1} attempts: ${err.message}`);
+        // ERROR, not warn. This was logged at warn level while the timeout message told the
+        // reader to "check the console for a WebGPU/WebGL init error" — so anyone filtering
+        // to `error`, exactly as instructed, saw an empty console and blamed their own code.
+        console.error(
+          `[SceneView] renderer init FAILED after ${RETRY_DELAYS_MS.length + 1} attempts — the 3D ` +
+          `viewport cannot render and no scene will load. This does not recover on its own; ` +
+          `relaunch the editor once the cause below is addressed.`, err,
+        );
+        initedRef.current = false;
+        // Unblock every scene-load waiter NOW rather than leaving them on the 120s budget.
+        reportRendererInitFailure(err);
+        return;
+      }
       initedRef.current = false; // let a remount retry rather than latching the panel dead
       console.error(
         '[SceneView] viewport setup FAILED after the renderer was created — the 3D viewport ' +
