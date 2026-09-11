@@ -22,6 +22,7 @@
  *  throw, message unchanged — only a relay reply carries the envelope. */
 
 import type { ErrorCode } from '../../tools/shared/mcpResult';
+import { toJsonSafe } from '@modoki/engine/runtime/core/jsonSafe';
 
 export class OpRefusal extends Error {
   readonly code: ErrorCode;
@@ -39,10 +40,18 @@ export class OpRefusal extends Error {
 /** What a transport sends back for one op run: the op's result, or the message of what it threw.
  *  An `OpRefusal` becomes a RESULT — the `{ok:false, code, error, options}` envelope the router's
  *  `opRefusal` relays on its code's status — rather than an `error`, which reaches the router as a
- *  rejection that can only be classified by its prose. */
+ *  rejection that can only be classified by its prose.
+ *
+ *  ⚠️ **The result goes through `toJsonSafe` (#1068).** Both editor transports end in a bare
+ *  `JSON.stringify` this code does not own: Vite's `hot.send` in the renderer, and the backend's
+ *  response write after Electron's IPC. So an `Error` anywhere in a result (a journal payload, a
+ *  captured rejection) reached the agent as `{}`, while the device bridge's `safeStringify` showed
+ *  the same event as text. Rendering it here, where both transports already meet, fixes both at
+ *  once. Copy-on-write: a result with nothing to render is sent as the same object. */
 export async function opReplyFor(run: () => unknown): Promise<{ result: unknown } | { error: string }> {
   try {
-    return { result: await run() };
+    // `'result'`: the key the transport's stringify hands a root `toJSON`, since the value is sent as `{ result }`.
+    return { result: toJsonSafe(await run(), 'result') };
   } catch (e) {
     if (e instanceof OpRefusal) {
       return { result: { ok: false, code: e.code, error: e.message, ...(e.options ? { options: e.options } : {}) } };

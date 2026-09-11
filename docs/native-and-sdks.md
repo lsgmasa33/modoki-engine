@@ -824,8 +824,9 @@ journal, which `setJournalEnabled` switches off in a release build.
   should look at it. ⚠️ The payload is sent as text: guids, keys, product/transaction ids and error
   text only, never player content or an account id. **Verified on an iPhone 8 (2026-09-11):** one
   `recordException` per call, reading `[journalError] <name> {…}`, and none for `journalWarn`.
-  ⚠️ **Pass error TEXT, not an Error object:** an Error in the payload reaches Crashlytics intact
-  (through `errorText`), but the journal bridge shows it as `{}`, measured in the same session.
+  An Error object in the payload is fine: every exit renders it as text through
+  `runtime/core/jsonSafe.ts`. That covers the Crashlytics text, the device and editor journal reads,
+  and the in-game Journal tab. (The editor read used to show it as `{}`, #1068.)
 - ⚠️ **`caught` has its OWN session budget (100), like `warn`, and ranks between `error` and
   `warn`** in the boot queue and in the stash. Both read `bootStash.ts`'s `reportKindRank`, the one
   definition. A caught failure that recurs with a varying payload (a new transaction id each time)

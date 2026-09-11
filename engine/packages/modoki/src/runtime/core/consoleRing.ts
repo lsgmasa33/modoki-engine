@@ -24,7 +24,7 @@
 import { rawNow } from './clock';
 import { createTeardownToken } from './liveness';
 import { notifyListeners } from './notifyListeners';
-import { errorText } from './errorText';
+import { PENDING_PROMISE_MARKER, isThenable, jsonSafeReplacer, renderError } from './jsonSafe';
 
 export type ConsoleRingLevel = 'log' | 'info' | 'warn' | 'error';
 
@@ -133,40 +133,15 @@ let notifyScheduled = false;
  *  restores `console[level]` from them. */
 let originals: Record<ConsoleRingLevel, (...args: unknown[]) => void> | null = null;
 
-/** Duplicates `engine/app/debug/bridgeHelpers.ts`'s `safeStringify` semantics on purpose — that
- *  helper lives in the app layer (L-above L0) and this file cannot import it. Strings pass
- *  through; an `Error` becomes `"Name: message"`; anything else goes through `JSON.stringify`,
- *  falling back to `String(v)` on failure (a circular reference, a BigInt, a symbol, …); a plain
- *  `undefined` argument stringifies to the literal `'undefined'`, matching `String(undefined)`. */
-/** Kept BYTE-IDENTICAL to `engine/app/debug/bridgeHelpers.ts`'s `PENDING_PROMISE_MARKER`. Duplicated
- *  rather than imported because that helper is in the app layer and this file is L0. */
-const PENDING_PROMISE_MARKER = '[unresolved Promise — did you forget `await`?]';
-
-function isThenable(v: unknown): boolean {
-  return !!v && (typeof v === 'object' || typeof v === 'function')
-    && typeof (v as { then?: unknown }).then === 'function';
-}
-
-/** Depth cap for `formatCauseChain` below — copied from the editor's now-deleted `formatError`
- *  (F3, #626/#633 adversarial review). Guards against a pathological (or cyclic) `cause` chain
- *  growing an entry without bound; four links is already far more than any real error chain in
- *  this codebase has ever carried. */
-const CAUSE_CHAIN_DEPTH_CAP = 4;
-
-/** `\n  caused by: Name: message`, repeated for each `Error` in `err.cause`'s chain, depth-capped.
- *  Returns `''` when there is no `cause` (or it isn't an `Error`) — the overwhelmingly common case,
- *  so a caller can always just append the result.
+/** One console arg as text, with `engine/app/debug/bridgeHelpers.ts`'s `safeStringify` semantics.
+ *  Strings pass through; an `Error` becomes its `renderError` text; anything else goes through
+ *  `JSON.stringify` with the shared replacer, falling back to `String(v)` on failure (a circular
+ *  reference, a BigInt, a symbol, …); a plain `undefined` argument stringifies to the literal
+ *  `'undefined'`, matching `String(undefined)`.
  *
- *  Each link is rendered as `Name: message`, not its own `.stack` — the HEAD (whatever the caller
- *  prefixes this with) already carries a full stack saying WHERE the outer error was thrown; a
- *  cause is there to say WHAT led to it, one line each. */
-function formatCauseChain(err: Error, depth = 0): string {
-  const cause = (err as { cause?: unknown }).cause;
-  if (depth >= CAUSE_CHAIN_DEPTH_CAP || !(cause instanceof Error)) return '';
-  const head = `${cause.name || 'Error'}: ${cause.message}`;
-  return `\n  caused by: ${head}${formatCauseChain(cause, depth + 1)}`;
-}
-
+ *  The marker, the thenable check, the cause chain and the replacer all come from `./jsonSafe`
+ *  (#1068). They used to be copies kept "byte-identical" with `bridgeHelpers.ts` by hand, because
+ *  that helper is in the app layer and this file is L0; the shared module is L0 as well. */
 function stringifyArg(v: unknown): string {
   if (typeof v === 'string') return v;
   if (v === undefined) return 'undefined';
@@ -189,7 +164,10 @@ function stringifyArg(v: unknown): string {
   // `createEditor.tsx`'s `sceneReady.catch((e) => console.error('[Editor] scene load failed:', e))`
   // logs) reached every consumer with its cause silently erased. Fixed HERE, at the ring, so every
   // projection (editor, in-game debug menu, agent bridge, device bridge) gains it at once.
-  if (v instanceof Error) return errorText(v) + formatCauseChain(v);
+  //
+  // Both the rendering and the cause chain now live in `jsonSafe.ts`'s `renderError` (#1068), shared
+  // with every other exit rather than kept here in a copy.
+  if (v instanceof Error) return renderError(v);
   try {
     // Handled at BOTH depths, matching `safeStringify`: the branch above catches a top-level Error,
     // the replacer below catches one NESTED in an object or array. `{cause: err}` and `[err]` are
@@ -197,16 +175,11 @@ function stringifyArg(v: unknown): string {
     // the same defect one level down — a distinction `bridgeHelpers.ts` records learning the hard
     // way, in its own close-out review.
     //
-    // The `cause` chain is appended here too (F3/F8, #626/#633 adversarial review) — the module doc
-    // comment above already claimed a nested Error is "handled at BOTH depths", but until now that
-    // meant `stack || message` only, dropping `cause` for exactly the shapes this branch exists for
-    // (`console.error('ctx', { err })`, `console.error([err])`). A non-Error `cause` still stays
-    // dropped here, same as the top-level branch above — that is pre-existing and fine, only an
-    // `Error` cause carries anything worth chaining.
-    const json = JSON.stringify(v, (_k, val) => (
-      isThenable(val) ? PENDING_PROMISE_MARKER
-        : val instanceof Error ? errorText(val) + formatCauseChain(val)
-          : val));
+    // The `cause` chain is appended here too (F3/F8, #626/#633 adversarial review): `renderError`
+    // carries it at both depths, for exactly the shapes this branch exists for
+    // (`console.error('ctx', { err })`, `console.error([err])`). A non-Error `cause` stays dropped,
+    // same as the top-level branch above — only an `Error` cause carries anything worth chaining.
+    const json = JSON.stringify(v, jsonSafeReplacer);
     // `JSON.stringify` returns `undefined` — not a string — for a function, a symbol, or any value
     // whose `toJSON` yields undefined. Returning that would put a non-string into
     // `ConsoleRingEntry.args` despite its `string[]` type, and the first consumer to call

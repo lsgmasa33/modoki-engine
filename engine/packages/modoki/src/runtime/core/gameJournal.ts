@@ -17,7 +17,7 @@
 import { type World } from 'koota';
 import { emit } from './journal';
 import { captureToCrashlytics } from './globalErrors';
-import { errorText } from './errorText';
+import { jsonSafeReplacer } from './jsonSafe';
 
 /** A state-machine/phase transition — `resetPhase`, a wave start/end, a boss phase
  *  change. `level: 'info'`. */
@@ -65,16 +65,16 @@ export function journalError(name: string, payload?: unknown, world?: World): vo
   emit(name, payload, world, 'error');
 }
 
-/** `[journalError] <name> <payload>`. A string payload is used verbatim; anything else is JSON, with
- *  each `Error` rendered by `errorText` (a bare `JSON.stringify` turns an Error into `{}`). A payload
- *  that cannot be serialized still reports. */
+/** `[journalError] <name> <payload>`. A string payload is used verbatim; anything else is JSON through
+ *  the shared `jsonSafeReplacer`, so each nested `Error` reads as text (a bare `JSON.stringify` turns
+ *  it into `{}`, #1068). A payload that cannot be serialized still reports. */
 function caughtFailureText(name: string, payload: unknown): string {
   if (payload === undefined) return `[journalError] ${name}`;
   let detail: string;
   try {
     detail = typeof payload === 'string'
       ? payload
-      : JSON.stringify(payload, (_k, v: unknown) => (v instanceof Error ? errorText(v) : v)) ?? String(payload);
+      : JSON.stringify(payload, jsonSafeReplacer) ?? String(payload);
   } catch {
     try { detail = String(payload); } catch { detail = '<unprintable>'; }
   }

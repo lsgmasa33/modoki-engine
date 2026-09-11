@@ -3,7 +3,9 @@
  *  re-implementing them (which let copies silently drift from the shipping code — code-review T7). */
 
 import { withTimeout } from '@modoki/engine/runtime/core/abandonment';
-import { errorText } from '@modoki/engine/runtime/core/errorText';
+import {
+  PENDING_PROMISE_MARKER, isThenable, jsonSafeReplacer, renderError,
+} from '@modoki/engine/runtime/core/jsonSafe';
 
 /** Native (iOS drawHierarchy) capture dims, kept by the bridge after a native screenshot. */
 export interface LastScreenInfo { imageWidth: number; imageHeight: number; screenWidth: number; screenHeight: number }
@@ -24,15 +26,9 @@ export interface ConsoleLine {
   timestamp: number;
 }
 
-/** What an un-awaited Promise serializes to. A pending thenable has no own enumerable properties,
- *  so `JSON.stringify` renders it `{}` — an empty-looking RESULT rather than a mistake, which is
- *  how it silently cost real debugging calls (#145). Naming it makes the omission self-diagnosing. */
-export const PENDING_PROMISE_MARKER = '[unresolved Promise — did you forget `await`?]';
-
-function isThenable(v: unknown): boolean {
-  return !!v && (typeof v === 'object' || typeof v === 'function')
-    && typeof (v as { then?: unknown }).then === 'function';
-}
+/** What an un-awaited Promise serializes to (#145). Re-exported: the one definition is in
+ *  `runtime/core/jsonSafe.ts` (#1068), shared with the console ring and the editor transports. */
+export { PENDING_PROMISE_MARKER };
 
 /** A short, content-free description of a value's shape — for a refusal that must never echo what
  *  the value actually held (a log line can carry secrets).
@@ -72,16 +68,15 @@ export function safeStringify(value: unknown): string {
   // wrapped. Caught in close-out review by asking why the thenable directly above was nested-aware
   // and this was not.
   //
-  // Both depths go through `errorText`, never `stack || message`: on iOS the stack has no message
-  // line, so the device bridge showed frames with no message (#1055).
-  if (value instanceof Error) return errorText(value);
+  // Both depths render through `runtime/core/jsonSafe.ts` (#1068): `errorText`, never
+  // `stack || message` (on iOS the stack has no message line, so the device bridge showed frames
+  // with no message, #1055), plus the `cause` chain. The two EDITOR transports render through the
+  // same module (`opReplyFor`), so all three agree on what an Error in a reply reads as.
+  if (value instanceof Error) return renderError(value);
   try {
     return typeof value === 'string'
       ? value
-      : JSON.stringify(value, (_k, v) => (
-        isThenable(v) ? PENDING_PROMISE_MARKER
-          : v instanceof Error ? errorText(v)
-            : v));
+      : JSON.stringify(value, jsonSafeReplacer);
   } catch {
     return String(value);
   }

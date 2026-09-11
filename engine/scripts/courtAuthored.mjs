@@ -153,9 +153,10 @@ export function courtTouched() {
   if (base === null) return 'git-failed';
 
   // ⚠️ A branch with NO commits of its own cannot be asked what it changed, and answering "nothing"
-  // there is this gate's worst failure: `merge-base(HEAD, origin/main) === HEAD` on any checkout of
-  // `main` itself, which is EVERY CI run. That is the degenerate case, not a negative answer, so it
-  // maps to "could not tell" and therefore to RUN.
+  // there is this gate's worst failure: `merge-base(HEAD, origin/main) === HEAD` on any checkout
+  // with no commits beyond `origin/main`, at or behind it — a clean `main` with nothing unpushed (NOT the hub between a merge and
+  // its push, which answers `false` here, #1073) — and on EVERY CI run. That is the degenerate case,
+  // not a negative answer, so it maps to "could not tell" and therefore to RUN.
   // ⚠️ #826: `'no-own-commits'`, not `null`. Same fail-safe direction, honest about the cause —
   // a caller that reports this as a git FAILURE is making a false statement, which is what the
   // Court sweep banner did on every hub push and every fast-forward worker merge.

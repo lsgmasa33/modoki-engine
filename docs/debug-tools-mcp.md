@@ -955,6 +955,13 @@ same actions + state a person has in the editor. They relay to the renderer over
     used to come back `{"a":{}}` — an empty-looking *result* rather than a mistake, which is how it
     silently ate real debugging calls. The top-level `return modoki.foo()` is unaffected: that one is
     awaited.
+  - **An `Error` anywhere in an op result arrives as TEXT on all three transports** — `errorText`
+    (the message survives on iOS) plus its `cause` chain, never `{}`. Three reply paths were fixed:
+    the device bridge (`safeStringify`); the two editor transports, HMR relay and Electron IPC,
+    which both go through `opReplyFor` → `toJsonSafe`; and the in-game Journal tab. All three render
+    through `runtime/core/jsonSafe.ts`. Before #1068 only the device did, so a journal payload
+    carrying an Error read as `"error":{}` through `modoki_journal`. The one module is guarded by
+    `jsonSafeIsShared.test.ts`, so do not hand-write a replacer in a new exit.
   - **`timeoutMs` bounds the whole body, and the two surfaces cap DIFFERENTLY** — `modoki_eval`
     default 5000 / max 25000, `device_eval` default 4000 / **max 20000**. Out-of-range is clamped,
     not refused. Asking for more than the default also lifts the device's transport deadline with it

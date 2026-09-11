@@ -8,6 +8,7 @@
 import { useEffect, useState, type CSSProperties } from 'react';
 import { fillRootStyle, fillRegionStyle } from '../tabLayout';
 import { journalEvents, clearJournal, isJournalEnabled, type GameEvent } from '../../core/journal';
+import { jsonSafeReplacer } from '../../core/jsonSafe';
 
 const REFRESH_MS = 300;
 const MAX_ROWS = 100;
@@ -66,7 +67,8 @@ function EventRow({ event }: { event: GameEvent }) {
 function summarize(payload: unknown): string {
   if (typeof payload === 'object') {
     try {
-      const s = JSON.stringify(payload);
+      // The shared replacer, so an Error in a payload shows as text here too, not `{}` (#1068).
+      const s = JSON.stringify(payload, jsonSafeReplacer);
       return s.length > 80 ? s.slice(0, 79) + '…' : s;
     } catch {
       return '{…}';

@@ -71,6 +71,14 @@ describe('JournalTab', () => {
     expect(queryByText('score')).toBeNull();
   });
 
+  // #1068 — the row summary used a bare JSON.stringify, so an Error in a payload showed as `{}`.
+  it('shows an Error nested in a payload as its text, not {}', () => {
+    emit('probe.caught-failure', { error: new Error('tab boom') });
+    const { container } = render(<JournalTab />);
+    expect(container.textContent).toContain('Error: tab boom');
+    expect(container.textContent).not.toContain('"error":{}');
+  });
+
   it('clears the journal', () => {
     emit('win');
     const { queryByText, getByText } = render(<JournalTab />);
