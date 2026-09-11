@@ -685,6 +685,16 @@ supposedly already hardened against.
   common path rather than a corner. The MEASUREMENT is still the point: when text really does not
   land, the live cause is a field that reformats, truncates or rejects input as you type, and
   `valueAfter` names what it actually accepted.
+
+  ⚠️ **There are TWO causes, and the message now says which one** (#1081). The sentence above was
+  the only one offered, and it is false for the second: `sendInputEvent` takes an ACCELERATOR NAME
+  as its `keyCode`, so a character with no such name is never put on the wire and the FIELD never
+  sees it. A `\n` was exactly that — it inserted nothing while the refusal blamed the field, and
+  `submitKey:'Enter'` reported success having inserted nothing, because a bare keyDown/keyUp pair
+  carries no text for any spelling. Newline and tab are mapped to the spellings that do insert
+  (measured, Electron 43.2.0); any other control character is refused BY NAME as the tool's own
+  limit. When you read "reformats, truncates or rejects", the field really is the party that
+  refused it.
 - **`press_key`'s warning over-claimed.** It said a focused field "will swallow this key" on a
   press where `f` demonstrably framed the selection (camera `[12,15,20]` → `[-0.1,1.4,1.8]`).
 

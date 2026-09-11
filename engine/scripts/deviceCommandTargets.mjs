@@ -82,6 +82,49 @@ function empty() {
   return { ids: [], destructive: false, untargeted: false, tools: [] };
 }
 
+/** (#1083) A segment this parser could NOT follow, which nevertheless names a device CLI.
+ *
+ *  The defect this exists for: an empty result meant two different things — "nothing here touches a
+ *  phone" and "I could not tell" — and both callers read it as the first and ran the command. So
+ *  every wrapper the parser cannot re-parse failed OPEN. Measured on one destructive control wrapped
+ *  26 ways: 18 came back empty, including `timeout 30 adb …`, `bash -lc "adb …"`, `eval "adb …"`,
+ *  `$(adb …)`, `( adb … )`, `sleep 1 & adb …` and `env -S "adb …"`.
+ *
+ *  Enumerating those shapes one at a time is the game this loses — the 19th wrapper exists tomorrow
+ *  and nothing would announce it. So the shapes that CAN be parsed are parsed (see the separators and
+ *  the wrapper grammars below), and whatever is left becomes this: a third outcome the callers refuse
+ *  rather than run, naming the remedy. Polarity decided by the owner, 2026-09-12. */
+function opaqueSegment() {
+  return { ids: [], destructive: false, untargeted: false, tools: [], opaque: true };
+}
+
+/** A command STRING this segment hands to a shell, when the segment is one of the shapes that does
+ *  that without a `-c`: a lone quoted span (what `bash <<< "…"` leaves after the `<<<` split, and
+ *  what `env -S -i "…"` leaves once its flags are stepped over), or `eval`'s argument. Returns null
+ *  when the segment is not one of those — `ssh host "adb …"` deliberately included, since it runs on
+ *  ANOTHER machine and this machine's claims cannot speak for that phone. */
+function payloadCommandOf(tokens, first) {
+  if (tokens.length === 1 && /^['"]/.test(tokens[0])) return stripQuotes(tokens[0]);
+  if (first === 'eval' && tokens.length > 1) return stripQuotes(tokens[1]);
+  return null;
+}
+
+/** The CLIs whose bare name in a segment means "a phone could be touched here".
+ *
+ *  ⚠️ `ios` (go-ios) is deliberately ABSENT, and that is not an oversight: `basenameOf` reduces
+ *  `games/court/ios` to `ios`, so including it would make `cd games/court/ios && pod install` — an
+ *  everyday command in this repo — an opaque refusal. go-ios stays recognised as a COMMAND WORD only,
+ *  which is the same carve-out the dispatch below already makes for it. */
+const DEVICE_CLI_WORDS = new Set(['adb', 'devicectl', 'xcodebuild', 'ideviceinstaller']);
+
+/** Does this token list NAME a device CLI as a bare word, in a segment whose command word this parse
+ *  could not resolve? Quoted spans are skipped: a device command inside quotes is TEXT — a doc
+ *  example, a test fixture, a heredoc line — and refusing on text is what teaches a reader to route
+ *  around the guard (see `splitSegments`' note). */
+function mentionsDeviceCli(tokens) {
+  return tokens.some((t) => !/^['"]/.test(t) && DEVICE_CLI_WORDS.has(basenameOf(t)));
+}
+
 /**
  * Build a segment result from an id list + a destructive verdict.
  *
@@ -366,6 +409,17 @@ function analyzeSegmentTokens(tokens, envVars) {
       idx++;
       while (idx < tokens.length) {
         const t = stripQuotes(tokens[idx]);
+        // (#1083) `env -S "<command>"` (and `--split-string`) does not take a VALUE, it takes a
+        // COMMAND — so stepping over it as an option value threw the command away and the segment
+        // read as naming no device CLI at all. Parse the payload the way `bash -c`'s is parsed; if
+        // that finds nothing, fall through so the mention check below can still call it opaque
+        // (`env -S -i "adb …"` puts another flag where this expects the payload).
+        if (first === 'env' && /^(-S|--split-string)$/.test(t) && idx + 1 < tokens.length) {
+          const inner = parseDeviceCommand(stripQuotes(tokens[idx + 1]));
+          if (inner.tools.length || inner.opaque) return inner;
+          idx += 2;
+          continue;
+        }
         if (t.startsWith('-') && t !== '-') { idx += valueOpts.test(t) ? 2 : 1; continue; }
         const assigned = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(t);
         if (assigned) { envVars[assigned[1]] = stripQuotes(assigned[2]); idx++; continue; }
@@ -382,8 +436,12 @@ function analyzeSegmentTokens(tokens, envVars) {
   // Termination is guaranteed by the string shrinking on every hop (a `-c` value is a strict
   // substring of the segment holding it); a wrapper with no `-c` has nothing to parse.
   if (SHELL_WRAPPERS.has(first)) {
-    const inner = findFlagValue(tokens.slice(idx + 1), ['-c']);
-    return inner ? parseDeviceCommand(inner) : empty();
+    const rest = tokens.slice(idx + 1);
+    // `-lc`/`-ec` are a CLUSTER of short flags ending in `c`, and `findFlagValue` matches neither —
+    // so `bash -lc "adb -s X uninstall …"` was parsed as naming no device CLI (#1083, measured).
+    const inner = findFlagValue(rest, ['-c']) ?? findClusteredCFlagValue(rest);
+    if (inner) return parseDeviceCommand(inner);
+    return mentionsDeviceCli(rest) ? opaqueSegment() : empty();
   }
 
   // Declared without an initialiser: every branch below either assigns or returns, so a `= null`
@@ -397,7 +455,71 @@ function analyzeSegmentTokens(tokens, envVars) {
   // (never scanning the rest of the segment) so `echo ios` or a path
   // component named `ios` is never mistaken for the go-ios CLI.
   else if (first === 'ios') tool = 'go-ios';
-  else return empty();
+  else {
+    // (#1083) The command word is not a device CLI. Two ways a device command can still be in here.
+    //
+    // ONE: the segment hands a command STRING to a shell without a `-c` — a here-string payload, an
+    // `eval` argument. Parse it the way a `bash -c` payload is parsed.
+    const payload = payloadCommandOf(tokens.slice(idx), first);
+    if (payload !== null) {
+      const inner = parseDeviceCommand(payload);
+      if (inner.tools.length || inner.opaque) return inner;
+    }
+    // TWO: a launcher this parser does not model ran it directly — `timeout 30 adb …`,
+    // `script -q /dev/null adb …`, `watch -n1 adb …`, `find . -exec adb … \;`, or tomorrow's. Rather
+    // than refuse blind, RE-PARSE from the device CLI's own token: that classifies the command
+    // exactly, so `timeout 30 adb -s X uninstall` is refused as the destructive targeted command it
+    // is, while `timeout 30 adb devices` stays allowed as the read-only call it is. Blanket-refusing
+    // both would be the over-refusal this module warns gets a guard routed around.
+    //
+    // Two bounds, both pinned by cases this suite already had, and both learned by breaking them:
+    //
+    // ⚠️ Scan from `idx`, NOT from the start. Everything before it is launcher words and the option
+    // VALUES the loop above deliberately stepped over — and `sudo -u adb whoami` runs as the user
+    // named `adb`, with `whoami` as the command. Scanning the whole list dragged that username back
+    // in and refused a command that touches no device.
+    //
+    // ⚠️ And accept the re-parse only when it SAYS something. `echo adb` re-parses to a bare `adb`
+    // with no subcommand, which reports `tools:['adb']` and nothing else — treating that as a device
+    // command makes an argument into a refusal.
+    //
+    // Terminating: `at` is never 0 (a device CLI at the command word is dispatched above), so each
+    // re-parse runs on a strictly shorter token list.
+    const rest = tokens.slice(idx);
+    // A SHELL WRAPPER counts as a re-dispatch point too, not only a device CLI. `timeout 30 bash -lc
+    // "adb …"` names its device CLI inside the wrapper's quoted payload, which the scan skips as text
+    // — so without this the nested case reads as naming nothing. Finding `bash` here says plainly
+    // what happened: the word this parse resolved was a launcher it does not model.
+    const at = rest.findIndex((t) => !/^['"]/.test(t)
+      && (DEVICE_CLI_WORDS.has(basenameOf(t)) || SHELL_WRAPPERS.has(basenameOf(t))));
+    if (at !== -1) {
+      const reparsed = analyzeSegmentTokens(rest.slice(at), envVars);
+      // ⚠️ ACCEPT NARROWLY, and this bound is the difference between a guard and a nuisance.
+      //
+      // Taking any re-parse that came back `destructive` meant `grep -rn adb engine/scripts` and
+      // `rg adb docs/` were REFUSED: the scan found the bare word, `analyzeAdb` fail-safed the next
+      // word into an unrecognised subcommand, and the refusal fired unconditionally. In a repo whose
+      // own sources say `adb` several hundred times, that is precisely the "fires on TEXT rather than
+      // on execution" failure this module warns trains a reader to route around.
+      //
+      // Two signals are trusted, and a bare word alone is not either of them:
+      //   - the re-parse NAMES a device (`-s`/`--device`/`-u`/`--udid` resolved an id) — a search for
+      //     a word does not carry a serial, so this is near-impossible to hit by accident; or
+      //   - the command word is a LAUNCHER, i.e. something whose job is to run another command.
+      // `opaque` propagates regardless: an unreadable payload stays unreadable.
+      const namesADevice = reparsed.ids.length > 0;
+      // ⚠️ `find` is BOTH a launcher and a searcher — `-exec adb …` runs one, `-name adb` looks for a
+      // FILE called adb — so membership alone refused `find . -name adb -print`. Its launcher signal
+      // counts only after an exec flag; `-exec` is the half that runs anything.
+      const execFlag = /^-(exec|execdir|ok|okdir)$/;
+      const launcherHead = LAUNCHER_WORDS.has(first)
+        && (first !== 'find' || rest.slice(0, at).some((t) => execFlag.test(stripQuotes(t))));
+      if (reparsed.opaque || namesADevice || (reparsed.destructive && launcherHead)) {
+        return reparsed;
+      }
+    }
+    return empty();
+  }
 
   const restTokens = tokens.slice(idx + 1);
   switch (tool) {
@@ -447,6 +569,11 @@ function analyzeSegmentTokens(tokens, envVars) {
 function stripHeredocBodies(command) {
   const lines = command.split(/\r?\n/);
   const out = [];
+  /** (#1083) Did a heredoc run off the END without its terminator? Then this strip swallowed the
+   *  rest of the string — possibly a whole device command — and the caller must not read the result
+   *  as "nothing here". This is hole A: `bash -c "cat <<EOF … EOF … adb uninstall"` strips at the
+   *  OUTER level first, so the inner parse sees an unterminated heredoc and drops the `adb` line. */
+  let unterminated = false;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     out.push(line);
@@ -454,18 +581,28 @@ function stripHeredocBodies(command) {
     // is irrelevant here: either way the body is data.
     const m = /<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/.exec(line);
     if (!m) continue;
+    // ⚠️ A `<<EOF` INSIDE QUOTES is text about a heredoc, not a heredoc — `grep -rn "<<EOF" tests/`
+    // is the everyday case. Swallowing from there costs in both directions, which is why this is a
+    // skip rather than a softer verdict: `… && adb devices` was dropped and read as "nothing here"
+    // (a fail-open that predates this issue), and once an unterminated swallow became `opaque`, the
+    // same line started REFUSING an ordinary search. Found by this change's own review.
+    if (isInsideQuotes(line, m.index)) continue;
     const delimiter = m[2];
     // Skip the body, and the terminator line with it: neither is a command.
     i++;
     while (i < lines.length && lines[i].trim() !== delimiter) i++;
+    if (i >= lines.length) unterminated = true;
   }
-  return out.join('\n');
+  return { text: out.join('\n'), unterminated };
 }
 
 function splitSegments(command) {
   const out = [];
   let cur = '';
   let quote = null;
+  /** Command substitutions lifted OUT of the command they sit in, each parsed as its own segment.
+   *  Appended after the outer segments, so the outer command keeps its own shape and its verb. */
+  const subs = [];
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
     if (quote) {
@@ -476,20 +613,105 @@ function splitSegments(command) {
       continue;
     }
     if (ch === "'" || ch === '"') { quote = ch; cur += ch; continue; }
-    // Order matters: `||` must be consumed whole, or it splits into two spurious `|` separators.
+    // Order matters: `||` must be consumed whole, or it splits into two spurious `|` separators, and
+    // `<<<` must be consumed before the `<` of a here-string is mistaken for anything else.
+    const three = command.slice(i, i + 3);
+    if (three === '<<<') { out.push(cur); cur = ''; i += 2; continue; }
     const two = command.slice(i, i + 2);
     if (two === '&&' || two === '||') { out.push(cur); cur = ''; i++; continue; }
     if (ch === ';' || ch === '|' || ch === '\n' || ch === '\r') { out.push(cur); cur = ''; continue; }
+    // (#1083) `$( … )` and a backticked span RUN a command, so their INSIDE is a command position —
+    // but their outside is still the command they sit in.
+    //
+    // ⚠️ This was first written as a plain split on the paren, and that CUT A REAL DEVICE COMMAND IN
+    // HALF: `adb -s $(cat s.txt) shell pm clear com.foo` became `adb -s $` + `cat s.txt` +
+    // `shell pm clear com.foo`, so the verb left the segment holding the command word and the verdict
+    // flipped to NOT destructive — the guard then allowed an uninstall it used to refuse. A fail-open
+    // introduced by the very change meant to close fail-opens, found by this change's own review.
+    //
+    // So the substitution is EXTRACTED instead: its inside becomes a segment of its own, and the
+    // outside keeps a placeholder token, which leaves `-s` with a value and the rest of the command
+    // attached to its verb.
+    if (ch === '$' && command[i + 1] === '(') {
+      const close = matchingClose(command, i + 1);
+      subs.push(command.slice(i + 2, close === -1 ? command.length : close));
+      cur += SUBST_PLACEHOLDER;
+      i = close === -1 ? command.length : close;
+      continue;
+    }
+    if (ch === '`') {
+      const close = command.indexOf('`', i + 1);
+      subs.push(command.slice(i + 1, close === -1 ? command.length : close));
+      cur += SUBST_PLACEHOLDER;
+      i = close === -1 ? command.length : close;
+      continue;
+    }
+    // A single `&` backgrounds what precedes it, and a bare parenthesis groups commands — a command
+    // position opens after both. ⚠️ `{` and `}` are deliberately NOT separators: `${SERIAL}` is one
+    // token, and splitting it is what produced the `adb -s $` fail-open above. A brace GROUP still
+    // parses, because its `;` splits and the re-dispatch below finds the device CLI after the `{`.
+    if (ch === '&' || ch === '(' || ch === ')') { out.push(cur); cur = ''; continue; }
     cur += ch;
   }
   out.push(cur);
-  return out;
+  return [...out, ...subs];
 }
 
 /** Command words that RUN their string argument, so that string is a command and not merely text.
  *  Without this, the quote-awareness above would open an exact evasion: a `bash -c "<device
  *  command>"` is one segment beginning with `bash`, and everything inside it would be invisible. */
 const SHELL_WRAPPERS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh']);
+
+/** What a lifted-out command substitution leaves behind in the command it came from. It only has to
+ *  be a token that matches no tool and no flag value anyone reads — its job is to keep `-s` supplied
+ *  and the rest of the command attached to its verb. */
+const SUBST_PLACEHOLDER = 'SUBST';
+
+/** Is position `at` inside a single- or double-quoted span of this ONE line? Deliberately per-line
+ *  and deliberately simple: its only caller asks about a heredoc opener, and a quoted span that runs
+ *  across a newline is not a shape a heredoc opener can sit in. */
+function isInsideQuotes(line, at) {
+  let quote = null;
+  for (let i = 0; i < at && i < line.length; i++) {
+    const ch = line[i];
+    if (quote) {
+      if (ch === quote && !(quote === '"' && line[i - 1] === '\\')) quote = null;
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+    }
+  }
+  return quote !== null;
+}
+
+/** Index of the `)` that closes the `(` at `openIdx`, or -1. Depth-aware, so a nested substitution
+ *  does not end the outer one early. */
+function matchingClose(s, openIdx) {
+  let depth = 0;
+  for (let i = openIdx; i < s.length; i++) {
+    if (s[i] === '(') depth += 1;
+    else if (s[i] === ')') { depth -= 1; if (depth === 0) return i; }
+  }
+  return -1;
+}
+
+/** Words whose JOB is to run another command. Used as one of the two signals that justify
+ *  re-dispatching from a device CLI found later in a segment (the other is that the re-parse names an
+ *  actual device) — because a bare `adb` word alone is far more often TEXT, as in `grep -rn adb …`.
+ *  Union of the launchers already modelled above, plus the ones measured walking past this guard. */
+const LAUNCHER_WORDS = new Set([
+  ...PLAIN_LAUNCHERS, ...Object.keys(OPTION_LAUNCHERS), ...SHELL_WRAPPERS,
+  'timeout', 'gtimeout', 'watch', 'script', 'find', 'eval', 'setsid', 'ionice', 'chrt',
+]);
+
+/** The value of a CLUSTERED short-flag group ending in `c` — `-lc`, `-ec`, `-ic` — whose next token
+ *  is the command string. `findFlagValue` only matches `-c` exactly, and `bash -lc` is the spelling a
+ *  login shell invocation actually uses. */
+function findClusteredCFlagValue(tokens) {
+  for (let i = 0; i < tokens.length; i++) {
+    if (/^-[A-Za-z]*c$/.test(tokens[i]) && i + 1 < tokens.length) return stripQuotes(tokens[i + 1]);
+  }
+  return null;
+}
 
 /**
  * Parse a shell command string and report which physical device(s) it names,
@@ -500,7 +722,9 @@ const SHELL_WRAPPERS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh']);
  * @returns {{ ids: string[], destructive: boolean, untargeted: boolean, tools: string[] }}
  */
 export function parseDeviceCommand(command) {
-  const segments = splitSegments(stripHeredocBodies(String(command)));
+  const source = String(command);
+  const { text, unterminated } = stripHeredocBodies(source);
+  const segments = splitSegments(text);
 
   const idsSeen = new Set();
   const ids = [];
@@ -508,11 +732,17 @@ export function parseDeviceCommand(command) {
   const tools = [];
   let destructive = false;
   let untargeted = false;
+  // (#1083) An unterminated heredoc swallowed the rest of this string. If a device CLI was named in
+  // there, the parse below cannot see it — so say so rather than reporting an empty result, which
+  // both callers read as "nothing to arbitrate". Checked against the PRE-STRIP source for that exact
+  // reason. This arm is what closes the filed hole A, via the inner parse of a `bash -c` payload.
+  let opaque = unterminated && mentionsDeviceCli(tokenize(source));
 
   for (const rawSegment of segments) {
     const result = analyzeSegment(rawSegment);
     destructive = destructive || result.destructive;
     untargeted = untargeted || result.untargeted;
+    opaque = opaque || result.opaque;
     for (const id of result.ids) {
       if (!idsSeen.has(id)) {
         idsSeen.add(id);
@@ -527,5 +757,7 @@ export function parseDeviceCommand(command) {
     }
   }
 
-  return { ids, destructive, untargeted, tools };
+  // Absent when false, so a result is byte-identical to what every existing consumer and test asserts
+  // today — and `opaque: true` is a shape they would notice rather than silently deep-equal past.
+  return { ids, destructive, untargeted, tools, ...(opaque ? { opaque: true } : {}) };
 }

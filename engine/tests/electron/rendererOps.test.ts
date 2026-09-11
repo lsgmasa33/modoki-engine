@@ -46,6 +46,39 @@ describe('pressKey — the DOM-name alias is an own-key lookup (#1076, #993\'s s
     await pressKey(win, 'ArrowUp');
     expect(events.map((e) => e.keyCode)).toEqual(['Up', 'Up']);
   });
+
+  /** #1081 — a keyDown/keyUp pair inserts NOTHING for any spelling (measured, Electron 43.2.0), so
+   *  pressing Enter in a textarea was a silent no-op. Only the `char` event carries text. */
+  it('Enter carries a char, so the press does what the key does', async () => {
+    const { win, events } = makeKeyWin();
+    await pressKey(win, 'Enter');
+    expect(events.map((e) => [e.type, e.keyCode]))
+      .toEqual([['keyDown', 'Enter'], ['char', 'Enter'], ['keyUp', 'Enter']]);
+  });
+
+  it('…and so does Return, the other spelling of it', async () => {
+    const { win, events } = makeKeyWin();
+    await pressKey(win, 'Return');
+    expect(events.map((e) => e.type)).toEqual(['keyDown', 'char', 'keyUp']);
+  });
+
+  it('a MODIFIED Enter does NOT — Cmd/Ctrl+Enter commits, it does not also type a newline', async () => {
+    // Found by review: the char was emitted without the surrounding modifiers, so the standard
+    // "commit, do not insert" chord would have left a stray newline in the field it just committed.
+    for (const mod of ['meta', 'control', 'shift'] as const) {
+      const { win, events } = makeKeyWin();
+      await pressKey(win, 'Enter', [mod]);
+      expect(events.map((e) => e.type), mod).toEqual(['keyDown', 'keyUp']);
+    }
+  });
+
+  it('no other key gains a char — a Tab one would type a literal tab', async () => {
+    for (const key of ['Escape', 'Tab', 'Delete', 'w']) {
+      const { win, events } = makeKeyWin();
+      await pressKey(win, key);
+      expect(events.map((e) => e.type), key).toEqual(['keyDown', 'keyUp']);
+    }
+  });
 });
 
 describe('pointerDown', () => {

@@ -592,3 +592,157 @@ describe('parseDeviceCommand — launcher words must not become a bypass', () =>
     expect(parseDeviceCommand('env FOO=bar node script.mjs')).toEqual({ ids: [], destructive: false, untargeted: false, tools: [] });
   });
 });
+
+/** #1083 — a device command inside a wrapper the parser could not re-parse.
+ *
+ *  An empty result meant two different things — "nothing here touches a phone" and "I could not
+ *  tell" — and both callers read it as the first and RAN the command. Measured with one destructive
+ *  control wrapped 24 ways: 18 reached the phone unchecked, including `timeout 30 adb …`,
+ *  `bash -lc "adb …"`, `eval "adb …"`, `$(adb …)`, `( adb … )`, `sleep 1 & adb …` and `env -S "adb …"`.
+ *
+ *  ⚠️ This table IS the corpus. A newly-found wrapper shape gets a ROW here — fixing one quietly at a
+ *  call site is the whack-a-mole the issue was filed about. */
+describe('parseDeviceCommand — a device command inside a wrapper (#1083)', () => {
+  const D = 'adb -s RFTESTSERIAL1 uninstall com.foo';
+  const WRAPPED: Array<[string, string]> = [
+    ['timeout', `timeout 30 ${D}`],
+    ['gtimeout', `gtimeout 30 ${D}`],
+    ['bash -lc (clustered short flags)', `bash -lc "${D}"`],
+    ['bash -ec', `bash -ec "${D}"`],
+    ['eval', `eval "${D}"`],
+    ['a single & (not &&)', `sleep 1 & ${D}`],
+    ['command substitution', `echo $(${D})`],
+    ['backticks', `echo \`${D}\``],
+    ['here-string', `bash <<< "${D}"`],
+    ['subshell parens', `( ${D} )`],
+    ['brace group', `{ ${D} ; }`],
+    ['script -q', `script -q /dev/null ${D}`],
+    ['watch', `watch -n1 ${D}`],
+    ['env -S', `env -S "${D}"`],
+    ['sudo env -S', `sudo env -S "${D}"`],
+    ['env -S with another flag first', `env -S -i "${D}"`],
+    ['heredoc inside bash -c', `bash -c "cat <<EOF\nx\nEOF\n${D}"`],
+    ['heredoc inside sh -c', `sh -c "cat <<EOF\nx\nEOF\n${D}"`],
+    ['unterminated heredoc', `cat <<EOF\nx\n${D}`],
+    ['find -exec', `find . -exec ${D} \\;`],
+    ['xargs -I', `echo x | xargs -I{} ${D}`],
+    ['nested: timeout + bash -lc', `timeout 30 bash -lc "${D}"`],
+    ['nested: script + sh -c', `script -q /dev/null sh -c "${D}"`],
+    ['nested: timeout + a heredoc payload', `timeout 30 bash -c "cat <<EOF\nx\nEOF\n${D}"`],
+  ];
+
+  it.each(WRAPPED)('%s never reads as "names no device CLI"', (_label, command) => {
+    const r = parseDeviceCommand(command);
+    // Either the parser followed it (and the claim logic arbitrates normally), or it says plainly
+    // that it could not. What must never happen is the empty result, which both callers run.
+    expect(r.tools.length > 0 || r.opaque === true,
+      `this shape reported no device CLI, so the guard would run it unchecked: ${command}`).toBe(true);
+  });
+
+  it('classifies a wrapped command EXACTLY rather than refusing it blind', () => {
+    // Re-parsing from the device CLI's own token is what makes this possible — a blanket "unreadable,
+    // refuse" would have lost the id and the destructive verdict, and refused the read-only twin too.
+    expect(parseDeviceCommand(`timeout 30 ${D}`)).toEqual({
+      ids: ['adb:RFTESTSERIAL1'], destructive: true, untargeted: false, tools: ['adb'],
+    });
+  });
+
+  it('…so a READ-ONLY call in the same wrapper is still allowed', () => {
+    expect(parseDeviceCommand('timeout 30 adb -s RFTESTSERIAL1 devices')).toEqual({
+      ids: ['adb:RFTESTSERIAL1'], destructive: false, untargeted: false, tools: ['adb'],
+    });
+  });
+
+  it('a payload it genuinely cannot read is OPAQUE, and opaque is not empty', () => {
+    // An UNTERMINATED heredoc: the strip swallows to the end of the string, so the command that
+    // follows cannot be seen by anything. (`bash -c "cat <<EOF … EOF … adb …"` is deliberately NOT
+    // the example any more — since heredoc openers inside quotes are skipped, that one parses fully
+    // and is refused exactly, with its id. Classifying beats refusing blind wherever it is possible.)
+    const r = parseDeviceCommand(`cat <<EOF\nx\n${D}`);
+    expect(r.opaque).toBe(true);
+    expect(r.tools).toEqual([]);      // nothing was parsed out of it — that IS the point
+  });
+
+  it('an expansion inside a real device command does not cut it in half', () => {
+    // The fail-open this change introduced and its own review caught: splitting on `(`/`{` moved the
+    // VERB into another segment, so `uninstall` vanished and the verdict flipped to non-destructive —
+    // the hook then allowed a command it had refused the day before.
+    expect(parseDeviceCommand('adb -s ${SERIAL} uninstall com.foo')).toMatchObject({
+      ids: ['adb:${SERIAL}'], destructive: true,
+    });
+    expect(parseDeviceCommand('adb -s $(cat serial.txt) shell pm clear com.foo')).toMatchObject({
+      destructive: true,
+    });
+    expect(parseDeviceCommand('adb -s `cat serial.txt` uninstall com.foo')).toMatchObject({
+      destructive: true,
+    });
+  });
+
+  it('…while the substitution itself is still parsed as the command it is', () => {
+    expect(parseDeviceCommand(`echo $(${D})`)).toMatchObject({ destructive: true, ids: ['adb:RFTESTSERIAL1'] });
+  });
+
+  it('a heredoc opener inside QUOTES is text, not a heredoc', () => {
+    // Quote-blind stripping swallowed the rest of the line, which cost in both directions: a
+    // read-only call after it vanished (read as "nothing here"), and once an unterminated swallow
+    // became opaque, an ordinary search started being refused.
+    // ⚠️ The `opaque` assertions are the load-bearing half, and they were missing at first: on a
+    // single-line command the swallow consumes nothing, so the command still PARSES — it just comes
+    // back unreadable, and is refused. Without these two lines a mutation that deletes the quote
+    // check sails past this test, and the mechanism is only caught incidentally by CLI tests that
+    // are about something else.
+    const readOnly = parseDeviceCommand('grep -rn "<<EOF" engine/tests && adb devices');
+    expect(readOnly).toMatchObject({ tools: ['adb'], destructive: false });
+    expect(readOnly, 'a quoted <<EOF must not make an ordinary line unreadable').not.toHaveProperty('opaque');
+
+    const destructive = parseDeviceCommand(`grep -rn "<<EOF" engine/tests && ${D}`);
+    expect(destructive).toMatchObject({ destructive: true, ids: ['adb:RFTESTSERIAL1'] });
+    expect(destructive, 'refused by NAME, not as unreadable').not.toHaveProperty('opaque');
+  });
+
+  it('opaque is ABSENT, not false, when the parse was readable', () => {
+    // Every existing consumer and test asserts the whole result shape; an always-present key would
+    // have rewritten all of them while proving nothing.
+    expect(parseDeviceCommand('git status')).not.toHaveProperty('opaque');
+    expect(parseDeviceCommand(D)).not.toHaveProperty('opaque');
+  });
+
+  it('does NOT refuse the false positives a bare-word scan invites', () => {
+    // Each of these broke while this was being built, and each is an ordinary command:
+    //   `sudo -u adb whoami` runs as the USER named adb; `echo adb` names an argument;
+    //   `bash` can be a word or a path component with no shell payload behind it.
+    for (const cmd of [
+      'echo adb', 'echo bash', 'sudo -u adb whoami', 'sudo -u bash whoami',
+      'node /usr/local/sh/tool.mjs', 'npm run build:bash', 'cd games/court/ios && pod install',
+    ]) {
+      expect(parseDeviceCommand(cmd), cmd).toEqual({ ids: [], destructive: false, untargeted: false, tools: [] });
+    }
+  });
+
+  it('leaves a command aimed at ANOTHER machine alone — a claim cannot speak for that phone', () => {
+    expect(parseDeviceCommand(`ssh host "${D}"`)).toEqual({ ids: [], destructive: false, untargeted: false, tools: [] });
+  });
+
+  it('a bare adb WORD is not enough to refuse — searching for the string is not running the tool', () => {
+    // This started out refusing all of these, on the theory that refusing was the safe direction.
+    // It is not: this repo's own sources say `adb` several hundred times, so `grep -rn adb …` and
+    // `rg adb docs/` became refusals, and a guard that fires on TEXT rather than on execution is one
+    // its reader learns to route around — the failure mode this module's own header warns about.
+    for (const cmd of ['grep -rn adb engine/scripts', 'rg adb docs/', 'grep adb notes.txt',
+      'ls -la /usr/bin/adb', 'find . -name adb -print']) {
+      expect(parseDeviceCommand(cmd), cmd).toEqual({ ids: [], destructive: false, untargeted: false, tools: [] });
+    }
+  });
+
+  it('…but `find -exec` IS running it, and that half still counts', () => {
+    // `find` is both a launcher and a searcher, which is why the two cases are pinned together: the
+    // exec flag is the half that runs anything.
+    expect(parseDeviceCommand(`find . -exec ${D} \\;`)).toMatchObject({ destructive: true, ids: ['adb:RFTESTSERIAL1'] });
+  });
+
+  it('a device NAMED in the re-parse is enough on its own, launcher or not', () => {
+    // The second accept signal: a search for a word does not carry a serial, so an id is near
+    // impossible to hit by accident — it keeps unmodelled launchers covered without a bare-word scan.
+    expect(parseDeviceCommand(`myrunner --wrap ${D}`)).toMatchObject({ destructive: true, ids: ['adb:RFTESTSERIAL1'] });
+  });
+});

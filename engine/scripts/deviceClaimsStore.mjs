@@ -367,6 +367,26 @@ function isSameHolder(existing, req) {
  *  must survive its (short-lived) process exiting, so it must never be revocable by some UNRELATED
  *  future process that happens to recycle that pid — `releaseAllForThisProcess` filters by pid, and
  *  a real pid there would let a totally different later process accidentally own/clear it. */
+/** (#1082) The holders registered on a claim, with `holder` added — the ONE place the set is built.
+ *
+ *  Why a set at all: this module deliberately treats a same-process re-claim as a refreshing no-op
+ *  success, because "the lease reconnects, the WDA launcher and an install all legitimately claim the
+ *  same phone within one session" (see `claimDevice` below) and making those coordinate amongst
+ *  themselves would put the arbitration back where this module took it from. That is right, and it
+ *  left `releaseDevice` unable to tell the two apart: it drops by `(deviceId, pid)`, so the FIRST
+ *  holder to let go handed back a phone the second was still using. A stalled USB teardown resuming
+ *  after a newer WDA launch did exactly that, releasing an agent's claim out from under it.
+ *
+ *  So a record carries WHO holds it, and the phone is free only when the last of them lets go. A
+ *  claim taken without a `holder` registers none and keeps today's whole-record behaviour — and an
+ *  unnamed refresh must never WIPE someone else's registration, which is why the previous set is
+ *  carried forward rather than replaced. */
+function mergeHolders(existing, holder) {
+  const prev = Array.isArray(existing?.holders) ? existing.holders.filter((h) => typeof h === 'string') : [];
+  if (!holder || prev.includes(holder)) return prev;
+  return [...prev, holder];
+}
+
 export function claimDevice(req, opts = {}) {
   const now = opts.now ?? Date.now();
   return withLock(() => {
@@ -375,6 +395,7 @@ export function claimDevice(req, opts = {}) {
     if (existing && !isSameHolder(existing, req)) {
       return { ok: false, held: existing, message: describeConflict(existing, now) };
     }
+    const holders = mergeHolders(existing, req.holder);
     const claim = {
       deviceId: req.deviceId,
       clone: req.clone ?? process.cwd(),
@@ -388,6 +409,9 @@ export function claimDevice(req, opts = {}) {
       ...(clampTtlMs(req.ttlMs) !== undefined ? { ttlMs: clampTtlMs(req.ttlMs) } : {}),
       ...(req.model ? { model: req.model } : {}),
       ...(req.osVersion ? { osVersion: req.osVersion } : {}),
+      // (#1082) Absent rather than empty when nobody named themselves, so a record written by a
+      // caller that passes no holder is byte-identical to what it was before this field existed.
+      ...(holders.length ? { holders } : {}),
     };
     writeClaims([...live.filter((c) => c.deviceId !== req.deviceId), claim]);
     // Only a pid-claim registers for the exit hook: an owner-claim's whole point is to outlive
@@ -413,13 +437,36 @@ export function claimDevice(req, opts = {}) {
 export function releaseDevice(deviceId, opts = {}) {
   withLock(() => {
     const all = readClaims();
-    const next = all
-      .filter((c) => !isStale(c, opts))
-      .filter((c) => !(c.deviceId === deviceId && (opts.owner ? c.owner === opts.owner : (c.pid === process.pid && !c.owner))));
-    // Write when anything went — our claim, or stale entries swept while we hold the lock. Compared
-    // against the file as READ, so a pure stale-sweep still persists rather than being discarded.
-    if (next.length !== all.length) writeClaims(next);
-    held.delete(deviceId);
+    let changed = false;
+    /** Does THIS process still hold the device after this release? Gates the exit-hook bookkeeping
+     *  below: forgetting a device another holder in this process is still using would leave its
+     *  claim behind at exit, which is the stale lock the TTL exists to paper over. */
+    let stillHeldHere = false;
+    const next = [];
+    for (const c of all) {
+      // Swept in the same write, since we hold the lock.
+      if (isStale(c, opts)) { changed = true; continue; }
+      const isMine = c.deviceId === deviceId
+        && (opts.owner ? c.owner === opts.owner : (c.pid === process.pid && !c.owner));
+      if (!isMine) { next.push(c); continue; }
+      // (#1082) Release by HOLDER when one is named: one process can hold a key through two
+      // independent holders (a lease and the WebDriverAgent launch), and `(deviceId, pid)` cannot
+      // tell them apart — so whichever let go first handed back a phone the other was still on.
+      // A record with no registered holders, or a release that names none, drops whole as before.
+      const others = mergeHolders(c, undefined).filter((h) => h !== opts.holder);
+      if (opts.holder && others.length) {
+        next.push({ ...c, holders: others });
+        changed = true;
+        stillHeldHere = true;
+        continue;
+      }
+      changed = true;   // the record itself goes
+    }
+    // Write when anything went — our claim, a holder off it, or stale entries swept while we hold
+    // the lock. A holder-narrowing edit leaves the LENGTH unchanged, so a length comparison (what
+    // this used to do) would silently discard it.
+    if (changed) writeClaims(next);
+    if (!stillHeldHere) held.delete(deviceId);
   });
 }
 

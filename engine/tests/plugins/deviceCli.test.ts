@@ -223,6 +223,26 @@ describe('device run', () => {
     expect(status).toBe(0);
     expect(stdout).toMatch(/ran/);
   });
+
+  it('refuses a wrapper it cannot re-parse instead of running it unchecked (#1083)', () => {
+    // A heredoc payload inside `bash -c` hides the adb line from the classifier, which then reported
+    // "names no device CLI" — and THIS branch ran it. That empty-means-harmless reading is what let
+    // 18 of 24 measured wrapper shapes reach a phone with no claim check at all.
+    const payload = 'cat <<EOF\nx\nadb -s RFTESTSERIAL3 uninstall com.foo';
+    const { status, stderr } = runCli(['run', '--', 'bash', '-c', payload]);
+    expect(status).toBe(1);
+    expect(stderr).toMatch(/Refused/);
+    expect(stderr).toMatch(/re-parse/);
+    // Refused on the CHECK, not by an exec that happened to fail — the distinction the sibling
+    // refusal test above also makes.
+    expect(stderr).not.toMatch(/Failed to run/);
+  });
+
+  it('…and says how to run it, rather than only saying no', () => {
+    const { stderr } = runCli(['run', '--', 'bash', '-c', 'cat <<EOF\nx\nadb -s RFTESTSERIAL3 uninstall com.foo']);
+    // A refusal with no remedy is the kind a reader learns to route around.
+    expect(stderr).toMatch(/device:run/);
+  });
 });
 
 /**

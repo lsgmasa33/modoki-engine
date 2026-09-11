@@ -438,7 +438,10 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'FOCUS THE TARGET FIRST with modoki_tap on the input. `clearFirst` selects-all + ' +
       'deletes so the field is replaced rather than appended. `submitKey` presses a ' +
       "terminal key: 'Tab'/'Escape' BLUR the field (use to verify commit-on-blur), " +
-      "'Enter' submits. `typed` is MEASURED (the focused element's value delta), not the length of " +
+      "'Enter' submits — and in a TEXTAREA inserts a newline, because that is what the key does " +
+      'there. A newline or a tab INSIDE `text` types too; any other control character has no key ' +
+      'spelling, so it is not sent and the error names it as THIS tool\'s limit rather than telling ' +
+      'you the field rejected it. `typed` is MEASURED (the focused element\'s value delta), not the length of ' +
       'what you asked for, and `valueAfter` echoes the field — so a short insert is a FAILURE naming ' +
       'what landed. NON-ASCII (Japanese, emoji, accented) text DOES insert — measured on Electron ' +
       '43. This used to say it could not, and steered agents to modoki_eval, which is a ' +

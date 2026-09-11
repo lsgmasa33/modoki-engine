@@ -10,6 +10,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import {
   claimsDir, isPidAlive, isStale, listClaims, claimDevice, releaseDevice,
   releaseAllForThisProcess, sweepStaleClaims, describeConflict, adbDeviceId, iosDeviceId, wifiDeviceId,
@@ -224,6 +225,127 @@ describe('releaseDevice', () => {
 
   it('is a no-op (never throws) when there is nothing to release', () => {
     expect(() => releaseDevice('adb:nonexistent')).not.toThrow();
+  });
+});
+
+/** #1082 — one process, one device id, TWO holders.
+ *
+ *  A USB lease and the WebDriverAgent launch both key an iPhone as `ios:<udid>`, and both run in the
+ *  backend process. `releaseDevice` dropped by `(deviceId, pid)`, which cannot separate them, so the
+ *  first holder to let go handed back a phone the other was still driving — and the agent kept
+ *  running on a device whose claim was gone, which is exactly the collision #149 exists to prevent. */
+describe('releaseDevice and two holders on one key (#1082)', () => {
+  const LEASE = 'lease:g-1';
+  const WDA = 'wda';
+  const holdersOf = (deviceId: string) => listClaims().find((c) => c.deviceId === deviceId)?.holders;
+
+  it('a second holder joins the SAME record rather than replacing it', () => {
+    claimDevice({ deviceId: 'ios:U1', clone: CLONE_MINE_SHORT, holder: LEASE });
+    const second = claimDevice({ deviceId: 'ios:U1', clone: CLONE_MINE_SHORT, holder: WDA });
+    // Still a refreshing no-op success — this module deliberately does not make the two holders
+    // coordinate with each other; it arbitrates for them.
+    expect(second.ok).toBe(true);
+    expect(listClaims().filter((c) => c.deviceId === 'ios:U1')).toHaveLength(1);
+    expect(holdersOf('ios:U1')).toEqual([LEASE, WDA]);
+  });
+
+  it('THE DEFECT: a lease release does not take the agent\'s claim with it', () => {
+    claimDevice({ deviceId: 'ios:U1', clone: CLONE_MINE_SHORT, holder: LEASE });
+    claimDevice({ deviceId: 'ios:U1', clone: CLONE_MINE_SHORT, holder: WDA });
+
+    releaseDevice('ios:U1', { holder: LEASE });
+
+    expect(listClaims().map((c) => c.deviceId), 'the agent is still running on this phone')
+      .toContain('ios:U1');
+    expect(holdersOf('ios:U1')).toEqual([WDA]);
+  });
+
+  it('…and the phone is free once the LAST holder lets go', () => {
+    claimDevice({ deviceId: 'ios:U1', clone: CLONE_MINE_SHORT, holder: LEASE });
+    claimDevice({ deviceId: 'ios:U1', clone: CLONE_MINE_SHORT, holder: WDA });
+    releaseDevice('ios:U1', { holder: LEASE });
+    releaseDevice('ios:U1', { holder: WDA });
+    expect(listClaims().map((c) => c.deviceId)).not.toContain('ios:U1');
+  });
+
+  it('releasing a holder that never registered leaves the other holds alone', () => {
+    claimDevice({ deviceId: 'ios:U1', clone: CLONE_MINE_SHORT, holder: LEASE });
+    releaseDevice('ios:U1', { holder: 'lease:someone-else' });
+    expect(holdersOf('ios:U1')).toEqual([LEASE]);
+  });
+
+  it('a release naming NO holder still drops the whole record — the process-is-exiting path', () => {
+    // `releaseAllForThisProcess` and the exit hook mean "this process is going away", and must not
+    // be narrowed by a holder set.
+    claimDevice({ deviceId: 'ios:U1', clone: CLONE_MINE_SHORT, holder: LEASE });
+    claimDevice({ deviceId: 'ios:U1', clone: CLONE_MINE_SHORT, holder: WDA });
+    releaseDevice('ios:U1');
+    expect(listClaims().map((c) => c.deviceId)).not.toContain('ios:U1');
+  });
+
+  it('a holder-named release of a claim that registered NONE drops it, as it always did', () => {
+    // Back-compat in the direction that matters: a caller that names no holder keeps the old
+    // whole-record behaviour on both sides, so nothing is stranded by a half-migrated call site.
+    claimDevice({ deviceId: 'adb:X', clone: CLONE_MINE_SHORT });
+    releaseDevice('adb:X', { holder: LEASE });
+    expect(listClaims().map((c) => c.deviceId)).not.toContain('adb:X');
+  });
+
+  it('an unnamed re-claim does not WIPE a registration someone else made', () => {
+    // The refresh path rewrites the record wholesale, so the holder set has to be carried forward
+    // rather than rebuilt from the request — otherwise a plain refresh silently unregisters WDA.
+    claimDevice({ deviceId: 'ios:U1', clone: CLONE_MINE_SHORT, holder: WDA });
+    claimDevice({ deviceId: 'ios:U1', clone: CLONE_MINE_SHORT, purpose: 'refreshed with no holder' });
+    expect(holdersOf('ios:U1')).toEqual([WDA]);
+  });
+
+  it('a claim with no holder anywhere writes no holders field at all', () => {
+    // A record from a caller that names nobody must be byte-identical to what it was before this
+    // field existed — an empty array would be a new shape for every existing writer.
+    claimDevice({ deviceId: 'adb:X', clone: CLONE_MINE_SHORT });
+    expect(listClaims().find((c) => c.deviceId === 'adb:X')).not.toHaveProperty('holders');
+  });
+
+  it('the exit hook still hands back a device that had a holder released earlier', () => {
+    // The `held` set decides what the exit hook gives back, and releasing ONE holder must not drop
+    // the device from it while another holder still has it — otherwise a quitting backend leaves the
+    // record behind. Driven in a CHILD process, because `process.on('exit')` is the mechanism.
+    //
+    // ⚠️ Asserted against the FILE, never `listClaims()`. The child's pid is dead by the time this
+    // reads, so staleness would filter a leaked record and the assertion would pass against a broken
+    // exit hook — a test that mocks away the thing it covers.
+    //
+    // Stake, stated honestly: pid-liveness expiry already makes a leaked pid-claim invisible to every
+    // reader, so this is about handing hardware back AT EXIT rather than leaning on the backstop.
+    // `import.meta.url` is vite-transformed here and can carry a `?v=` cache-buster, which is not a
+    // path the child can import — so strip the query before resolving.
+    const store = new URL('../../scripts/deviceClaimsStore.mjs', import.meta.url.split('?')[0]).href;
+    const clone = JSON.stringify(CLONE_MINE_SHORT);
+    try {
+      execFileSync(process.execPath, ['--input-type=module', '-e', `
+        const { claimDevice, releaseDevice } = await import(${JSON.stringify(store)});
+        claimDevice({ deviceId: 'ios:U1', clone: ${clone}, holder: 'lease:g' });
+        claimDevice({ deviceId: 'ios:U1', clone: ${clone}, holder: 'wda' });
+        releaseDevice('ios:U1', { holder: 'lease:g' });
+      `], {
+        // NODE_OPTIONS is set by the runner and would be inherited into a plain `node -e`, where its
+        // loader flags do not apply. Cleared so the child is an ordinary Node process.
+        env: { ...process.env, MODOKI_HOME: home, NODE_OPTIONS: '' },
+        stdio: 'pipe',
+      });
+    } catch (e) {
+      // execFileSync's message is just "Command failed" — the child's own reason is on `stderr`, and
+      // without this a broken PROBE is indistinguishable from a broken exit hook.
+      const err = e as { stderr?: Buffer; message?: string };
+      throw new Error(
+        `child failed: ${err.message}\n--- child stderr:\n${err.stderr?.toString() ?? '(none)'}`,
+        { cause: e },
+      );
+    }
+
+    const onDisk = JSON.parse(fs.readFileSync(claimsFilePath(), 'utf8')) as { claims: DeviceClaim[] };
+    expect(onDisk.claims, 'the child exited holding ios:U1 through one remaining holder, so its exit '
+      + 'hook must have handed it back').toEqual([]);
   });
 });
 

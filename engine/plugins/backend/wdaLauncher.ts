@@ -524,6 +524,12 @@ let launchWarning: string | null = null;
 /** The machine-wide hardware claim this launch holds (#149), so `stopWda` hands back exactly what
  *  the launch took. Null when no agent is running. */
 let claimedUdid: string | null = null;
+/** (#1082) This module's identity as a claim HOLDER. A USB lease keys the same iPhone as
+ *  `ios:<udid>` in this same process, and the store used to release by `(deviceId, pid)` — which
+ *  cannot tell the two apart, so whichever released first handed back a phone the other was still
+ *  using. A single constant, not one token per launch: `wdaLauncher` keeps one agent in module
+ *  state, so this process is only ever ONE WDA holder. */
+const WDA_HOLDER = 'wda';
 /** The state dir holding this launch's pid record (#1077) — see `reapRecordedWdaAgent`. Null when none. */
 let recordDir: string | null = null;
 /** Invalidated by `stopWda`, i.e. by every ending of a lease. A launch captures it on entry and re-checks it
@@ -723,7 +729,11 @@ export function stopWda(): void {
   // by the next input op, and releasing the claim in between would let a sibling clone take the
   // device out from under a live session.
   if (claimedUdid) {
-    try { releaseDevice(claimedUdid); } catch { /* an unwritable claims file must never block a stop */ }
+    // (#1082) By HOLDER: a USB lease keys the same iPhone as `ios:<udid>` in this same process, and a
+    // release by `(deviceId, pid)` cannot tell the two apart — so this stop would hand back a phone
+    // the lease is still holding (and, the other way round, a stalled lease teardown would release
+    // the agent's claim).
+    try { releaseDevice(claimedUdid, { holder: WDA_HOLDER }); } catch { /* an unwritable claims file must never block a stop */ }
     claimedUdid = null;
   }
   // The warning describes the launch we just ended; carrying it into the NEXT one would attach a
@@ -919,6 +929,10 @@ export async function ensureWdaRunning(opts: EnsureWdaRunningOpts): Promise<{ ru
     deviceId: iosDeviceId(resolved.device.udid),
     label: resolved.device.name,
     purpose: 'running WebDriverAgent',
+    // (#1082) Name the holder: this module's claim can share a key with the lease's, inside one
+    // process, and the store cannot otherwise tell whose hold it is dropping. One token, not one
+    // per launch — `wdaLauncher` keeps a single agent in module state, so there is only ever one.
+    holder: WDA_HOLDER,
   });
   if (!claim.ok) {
     lastFailure = `cannot start WebDriverAgent — ${claim.message}`;

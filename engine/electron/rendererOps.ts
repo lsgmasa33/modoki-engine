@@ -688,6 +688,34 @@ export const KEYCODE_ALIAS: Record<string, string> = {
   ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right',
 };
 
+/** Characters a `char` event cannot carry under their own name, with the Accelerator spelling that
+ *  DOES insert them. MEASURED on Electron 43.2.0 against a real `<textarea>` (#1081):
+ *
+ *    keyCode sent   down+char+up   char only   down+up only
+ *    '\n'           "abc"          "abc"       "abc"    ← what typeText used to send: nothing lands
+ *    'Return'       "abc\n"        "abc\n"     "abc"
+ *    '\r'           "abc\n"        "abc\n"     "abc"
+ *    'Tab'          "abc"          "abc\t"     "abc"
+ *
+ *  Three things that table decides, none of them guessable from Electron's docs:
+ *   - a newline keeps the bracketing keyDown/keyUp (so Enter-to-commit handlers still see a press),
+ *     but a TAB must be sent as the char ALONE — its keyDown moves focus first, and the char then
+ *     lands in the next field or nowhere, which is why the `down+char+up` column is unchanged;
+ *   - `down+up only` inserts NOTHING for any spelling — that column is exactly what `submitKey` and
+ *     `pressKey` send, and is why `submitKey:'Enter'` reported success having inserted nothing;
+ *   - the set is CLOSED on purpose. An unrecognised Accelerator name does not fail, it inserts a
+ *     FRAGMENT OF ITS OWN NAME ('NumpadEnter' → "Num"), so passing an arbitrary spelling through
+ *     would silently corrupt the field. Anything not in this map and not printable is REFUSED and
+ *     named, rather than guessed at. */
+const CHAR_KEYCODE: Record<string, { keyCode: string; charOnly: boolean }> = {
+  '\n': { keyCode: 'Return', charOnly: false },
+  '\t': { keyCode: 'Tab', charOnly: true },
+};
+
+/** Keys whose press inserts TEXT as well as firing handlers, so a bare keyDown/keyUp is not the
+ *  whole press. Measured in the same table above. */
+const KEY_INSERTS_TEXT = new Set(['Return', 'Enter']);
+
 export async function pressKey(win: BrowserWindow, key: string, modifiers?: InputModifier[]): Promise<{ activeElement: string | null; gameSwallows: boolean }> {
   const wc = win.webContents;
   // An own-key read, not `KEYCODE_ALIAS[key] ?? key`: `key` is agent-supplied, and `'toString'` would
@@ -705,6 +733,19 @@ export async function pressKey(win: BrowserWindow, key: string, modifiers?: Inpu
   // element so a caller can see a text field is intercepting it. (C7 re-audit.)
   const active = await readActiveElement(wc);
   wc.sendInputEvent({ type: 'keyDown', keyCode, modifiers } as Electron.KeyboardInputEvent);
+  // Enter/Return INSERT as well as fire (#1081). A keyDown/keyUp pair alone inserts nothing — see
+  // the `down+up only` column in CHAR_KEYCODE's table — so pressing Enter in a textarea was a
+  // silent no-op, which is not what the key does for a human. The char rides with the press for
+  // the keys that carry text, and no other key gains one (a Tab char would insert a literal tab
+  // into a field whose focus move was swallowed).
+  // ⚠️ Only for an UNMODIFIED press. Cmd/Ctrl+Enter is the standard "commit, do not insert" chord, and
+  // a char event under it would insert a newline as well as firing the chord — leaving a stray
+  // trailing newline in a field that had just committed. Shift+Enter does insert for a human; not
+  // emitting it there is a deliberate, stated limitation, because the measured table behind
+  // CHAR_KEYCODE was taken with no modifiers and nothing here has measured the modified case.
+  if (KEY_INSERTS_TEXT.has(keyCode) && !modifiers?.length) {
+    wc.sendInputEvent({ type: 'char', keyCode } as Electron.KeyboardInputEvent);
+  }
   await sleep(48); // ≈3 frames @60fps — spans a frame boundary so the per-frame sampler catches it
   wc.sendInputEvent({ type: 'keyUp', keyCode, modifiers } as Electron.KeyboardInputEvent);
   await sleep(8);
@@ -901,7 +942,7 @@ async function readFocusedValue(wc: Electron.WebContents): Promise<string | null
 
 export async function typeText(
   win: BrowserWindow,
-  text: string,
+  rawText: string,
   opts?: { clearFirst?: boolean; submitKey?: string },
 ): Promise<{
   typed: number; editable: boolean; activeElement: string | null;
@@ -912,6 +953,10 @@ export async function typeText(
   error?: string;
 }> {
   const wc = win.webContents;
+  // Chromium normalises a <textarea>'s value to LF, so a CRLF (or a lone CR) in the request could
+  // never be found in the field afterwards and would read as dropped characters. Normalise once,
+  // up front, and measure against what the field can actually hold.
+  const text = rawText.replace(/\r\n?/g, '\n');
   // A trusted `char` event only INSERTS text when an editable element holds focus. With nothing
   // (or a non-editable div/canvas) focused, the chars land nowhere yet `sendInputEvent` can't
   // fail — so the route used to report {ok:true, typed:N} typing into the void. Check first and
@@ -926,12 +971,31 @@ export async function typeText(
   let clearError: string | undefined;
   if (opts?.clearFirst) clearError = await clearFocusedField(wc);
   const before: string | null = await readFocusedValue(wc);
+  /** Characters this tool could not put on the wire at all — reported as ITS limit, not the field's. */
+  const unsendable: string[] = [];
   for (const ch of text) {
-    // Only the `char` event inserts text; keyDown/keyUp bracket it so key handlers
-    // (shortcut guards, Enter-to-commit) still see a real press.
-    wc.sendInputEvent({ type: 'keyDown', keyCode: ch } as Electron.KeyboardInputEvent);
-    wc.sendInputEvent({ type: 'char', keyCode: ch } as Electron.KeyboardInputEvent);
-    wc.sendInputEvent({ type: 'keyUp', keyCode: ch } as Electron.KeyboardInputEvent);
+    // Own-key read, not `CHAR_KEYCODE[ch] ?? …`: `ch` is caller-supplied, and 'constructor'/'toString'
+    // would index the inherited FUNCTION — not nullish, so a `??` fallback never fires (#993's shape,
+    // #1076; `pressKey` carries the same note for KEYCODE_ALIAS).
+    const special = Object.prototype.hasOwnProperty.call(CHAR_KEYCODE, ch) ? CHAR_KEYCODE[ch] : undefined;
+    if (special) {
+      // Only the `char` event inserts text; keyDown/keyUp bracket it so key handlers
+      // (shortcut guards, Enter-to-commit) still see a real press — EXCEPT where the bracket is
+      // what breaks the insert: Tab's keyDown moves focus, and the char then lands elsewhere.
+      if (!special.charOnly) wc.sendInputEvent({ type: 'keyDown', keyCode: special.keyCode } as Electron.KeyboardInputEvent);
+      wc.sendInputEvent({ type: 'char', keyCode: special.keyCode } as Electron.KeyboardInputEvent);
+      if (!special.charOnly) wc.sendInputEvent({ type: 'keyUp', keyCode: special.keyCode } as Electron.KeyboardInputEvent);
+    } else if (ch < ' ' || ch === '\u007F') {
+      // A control character with no MEASURED spelling. Guessing an Accelerator name for it does not
+      // fail safely — it inserts that name's own text (CHAR_KEYCODE's table: 'NumpadEnter' → "Num")
+      // — so it is not sent, and it is named in the error instead (#1081).
+      unsendable.push(ch);
+      continue;
+    } else {
+      wc.sendInputEvent({ type: 'keyDown', keyCode: ch } as Electron.KeyboardInputEvent);
+      wc.sendInputEvent({ type: 'char', keyCode: ch } as Electron.KeyboardInputEvent);
+      wc.sendInputEvent({ type: 'keyUp', keyCode: ch } as Electron.KeyboardInputEvent);
+    }
     await sleep(8);
   }
   // MEASURE before the submitKey: 'Tab'/'Escape' blur the field, after which there is nothing
@@ -939,16 +1003,36 @@ export async function typeText(
   const after = await readFocusedValue(wc);
   if (opts?.submitKey) {
     wc.sendInputEvent({ type: 'keyDown', keyCode: opts.submitKey } as Electron.KeyboardInputEvent);
+    // Enter/Return carry TEXT as well as firing handlers (#1081). Without the char event this pair
+    // inserts nothing at all — CHAR_KEYCODE's `down+up only` column — so `submitKey:'Enter'` on a
+    // textarea reported ok:true having done nothing. 'Tab'/'Escape' keep the bare pair: their job
+    // here is to BLUR, and a Tab char would insert a literal tab wherever the focus move was
+    // swallowed.
+    if (KEY_INSERTS_TEXT.has(opts.submitKey)) wc.sendInputEvent({ type: 'char', keyCode: opts.submitKey } as Electron.KeyboardInputEvent);
     wc.sendInputEvent({ type: 'keyUp', keyCode: opts.submitKey } as Electron.KeyboardInputEvent);
     await sleep(8);
   }
   // The measured insert. `before` is null for an unreadable target (a contentEditable canvas
   // wrapper, say) — then there is nothing to measure and `typed` falls back to the request, which
   // is at least no worse than before and is not dressed up as an observation.
+  // (#1081, found by this change's own review) The unsendable report has to survive EVERY return path.
+  // It was read only inside the `!landed` branch at the very end — so an unreadable target, the case
+  // immediately below, returned ok:true having silently dropped characters. That is the exact defect
+  // #1081 is about, surviving on the one path where the tool cannot measure what landed.
+  const unsendableNote = unsendable.length
+    ? `${unsendable.length} character(s) could not be SENT at all — `
+      + `${unsendable.map((c) => JSON.stringify(c)).join(', ')} — so this is THIS TOOL's limit, not `
+      + `the field's: a trusted char event carries a key, and these have no key spelling to carry `
+      + `them. Newline and tab DO and are sent normally; for anything else, drive the value through `
+      + `the control the app gives it.`
+    : '';
+  const withNote = (rest: string) => [unsendableNote, rest].filter(Boolean).join(' ');
+
   if (before === null || after === null) {
+    const error = withNote(clearError ?? '');
     return {
       typed: text.length, editable: true, activeElement: active.descriptor, valueAfter: after,
-      ...(clearError ? { error: clearError } : {}),
+      ...(error ? { error } : {}),
     };
   }
   // WHAT LANDED, not how much the length grew (independent review, 2026-07-30). A length delta is
@@ -969,7 +1053,9 @@ export async function typeText(
   if (clearError) {
     return {
       typed: inserted, editable: true, activeElement: active.descriptor, valueAfter: after,
-      error: clearError,
+      // Both failures are reported, not just the one that returns first: a field that would not clear
+      // AND a character that could not be sent are independent, and hiding either loses a cause.
+      error: withNote(clearError),
     };
   }
   return {
@@ -982,12 +1068,17 @@ export async function typeText(
       // input and recommend modoki_eval; both halves were wrong (bug `xaewBYMBYXoeuiTllsI8`) —
       // non-ASCII types fine, and modoki_eval is a non-input write a controlled input never sees,
       // so the "workaround" was more fragile than the path it replaced.
-      error: `the requested text is NOT in the field after typing — ${inserted} of ${text.length} `
-        + `character(s) appear to have reached it (before: ${JSON.stringify(before)}, after: `
-        + `${JSON.stringify(after)}). The usual cause is a field that reformats, truncates or `
-        + `rejects input as you type (a numeric field, a max-length, an input mask), so `
-        + `\`valueAfter\` above is what it actually accepted. Retype in the shape the field wants, `
-        + `or drive the value through the control the app gives it.`,
+      // ⚠️ And it must not blame the FIELD for this tool's OWN limit (#1081). A character with no key
+      // spelling was never put on the wire, so "the field rejected it" is false — and a session
+      // reading that goes hunting a bug in a field that is working. Say which party failed.
+      error: unsendableNote
+        ? `${unsendableNote} The field holds ${JSON.stringify(after)}.`
+        : `the requested text is NOT in the field after typing — ${inserted} of ${text.length} `
+          + `character(s) appear to have reached it (before: ${JSON.stringify(before)}, after: `
+          + `${JSON.stringify(after)}). The usual cause is a field that reformats, truncates or `
+          + `rejects input as you type (a numeric field, a max-length, an input mask), so `
+          + `\`valueAfter\` above is what it actually accepted. Retype in the shape the field wants, `
+          + `or drive the value through the control the app gives it.`,
     }),
   };
 }

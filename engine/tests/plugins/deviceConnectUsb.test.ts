@@ -22,7 +22,7 @@ import { readScannedSource } from '@modoki/engine/testing';
 import { goIosForwardRunner, reapDeps } from '../../plugins/backend/iosUsbForward';
 import { DeviceLeaseAuthority } from '../../plugins/backend/deviceLease';
 import { listClaims } from '../../plugins/backend/deviceClaims';
-import { WDA_RECORD_FILE } from '../../plugins/backend/wdaLauncher';
+import { WDA_RECORD_FILE, ensureWdaRunning, stopWda, _resetWdaLauncherForTests } from '../../plugins/backend/wdaLauncher';
 
 let nextPid = 4242;
 
@@ -138,7 +138,28 @@ function startMockDevice(authority: DeviceLeaseAuthority, opts: { disconnectDela
 }
 
 const claimed = () => listClaims().map((c: { deviceId: string }) => c.deviceId);
+const holdersOf = (deviceId: string) => listClaims().find((c) => c.deviceId === deviceId)?.holders;
 const recordFile = () => path.join(stateDir, 'ios-forward.json');
+
+/** The launcher fakes needed to put a SECOND holder on this suite's `ios:UDID-IPAD` key (#1082).
+ *  Deliberately local and minimal rather than imported from `deviceConnectWda.test.ts`: that suite
+ *  leases over WiFi (`ip:`) throughout, which is precisely why the two-holders-on-one-key case could
+ *  never arise there — a USB lease is the only one that keys a phone the way WDA does. */
+type FakeAgent = { exitCode: number | null; killed: boolean; kill(): void; on(): void };
+const wdaListing = (udid: string) => JSON.stringify({
+  result: { devices: [{ identifier: `GUID-${udid}`, hardwareProperties: { udid, platform: 'iOS' }, deviceProperties: { name: udid } }] },
+});
+async function launchWdaAgent(udid: string): Promise<FakeAgent> {
+  const agent: FakeAgent = { exitCode: null, killed: false, kill() { agent.killed = true; }, on() { /* never exits */ } };
+  let up = false;
+  const r = await ensureWdaRunning({
+    host: '10.0.0.5', port: 8100, sleep: async () => {}, xctestrun: '/fake/WDA.xctestrun',
+    listDevices: () => wdaListing(udid), spawnImpl: (() => agent) as never,
+    probe: async () => { const seen = up; up = true; return seen; }, platform: 'darwin' as NodeJS.Platform,
+  });
+  expect(r).toEqual({ running: true });
+  return agent;
+}
 
 /** A connected USB lease against a mock device standing in for the host end of the tunnel. */
 async function connectedUsb(mgr: DeviceConnectionManager, opts: { disconnectDelayMs?: number } = {}) {
@@ -197,6 +218,68 @@ describe('DeviceConnectionManager — useUsb branch (#1065)', () => {
     expect(children[0].kill).toHaveBeenCalledOnce();
     expect(fs.existsSync(recordFile())).toBe(false);
     expect(claimed()).not.toContain('ios:UDID-IPAD');
+  });
+
+  it('a stalled teardown does not release a WebDriverAgent claim taken while it was suspended (#1082)', async () => {
+    // The axis no suite had: ONE process holding ONE device id through TWO holders. A USB lease and
+    // a WDA launch both key this iPhone as `ios:UDID-IPAD`, and `releaseDevice` dropped by
+    // `(deviceId, pid)` — which cannot separate them — so the lease's teardown, resuming after the
+    // agent had claimed, handed the phone back while the agent was still running on it. A sibling
+    // clone could then take a phone this process was driving (#149's collision).
+    //
+    // The manager's own ownership guard cannot close this: it compares against the MANAGER's field,
+    // which knows nothing about `wdaLauncher`'s module state.
+    const mgr = new DeviceConnectionManager('g-usb-wda-1082', stateDir);
+    const { device } = await connectedUsb(mgr, { disconnectDelayMs: 300 });
+    try {
+      expect(claimed()).toContain('ios:UDID-IPAD');
+
+      // The teardown suspends inside the lease hangup, past its synchronous field-nulling. `stopWda`
+      // runs at the HEAD of disconnect (#527), before this point, so it cannot reach the agent that
+      // is about to launch.
+      const hangup = mgr.disconnect();
+      await new Promise((r) => setTimeout(r, 30));
+
+      // …and meanwhile the agent starts on the same phone and claims the same key.
+      const agent = await launchWdaAgent('UDID-IPAD');
+      expect(claimed()).toContain('ios:UDID-IPAD');
+      expect(holdersOf('ios:UDID-IPAD')).toContain('wda');
+
+      await hangup;   // the stale continuation now reaches its releaseDevice call
+
+      expect(claimed(), 'an agent is still running on this phone, so the lease teardown must not '
+        + 'hand it back').toContain('ios:UDID-IPAD');
+      expect(holdersOf('ios:UDID-IPAD')).toEqual(['wda']);
+      expect(agent.killed).toBe(false);
+    } finally {
+      stopWda();
+      _resetWdaLauncherForTests();
+      await device.close();
+    }
+  });
+
+  it('and the mirror: stopping the agent does not release the LEASE\'s claim (#1082)', async () => {
+    // The same defect pointed the other way, and it is reachable without any stall at all: the agent
+    // exits (or a tap ends it) while the lease is still open, and a `(deviceId, pid)` release hands
+    // back a phone this process is still tunnelling to. Both directions come from one mechanism, so
+    // both are pinned — an untested half is where the next change quietly reopens it.
+    const mgr = new DeviceConnectionManager('g-usb-wda-mirror', stateDir);
+    const { device } = await connectedUsb(mgr);
+    try {
+      const agent = await launchWdaAgent('UDID-IPAD');
+      expect(holdersOf('ios:UDID-IPAD')).toEqual(['lease:g-usb-wda-mirror', 'wda']);
+
+      stopWda();
+
+      expect(agent.killed).toBe(true);
+      expect(claimed(), 'the lease is still open, so its phone must not be handed back')
+        .toContain('ios:UDID-IPAD');
+      expect(holdersOf('ios:UDID-IPAD')).toEqual(['lease:g-usb-wda-mirror']);
+    } finally {
+      _resetWdaLauncherForTests();
+      await mgr.disconnect();
+      await device.close();
+    }
   });
 
   it('a forward that never binds is a connect error carrying go-ios\'s own reason, with nothing left held', async () => {

@@ -11,6 +11,16 @@ export interface DeviceCommandTargets {
   untargeted: boolean;
   /** Which device CLIs were seen, in first-seen order — a subset of `'adb'|'devicectl'|'xcodebuild'|'ideviceinstaller'|'go-ios'`. */
   tools: string[];
+  /** (#1083) The command NAMES a device CLI inside something this parser could not re-parse, so
+   *  `tools`/`ids`/`destructive` say nothing about it. Distinct from an all-empty result, which means
+   *  "nothing here touches a phone" — conflating the two is what made every unmodelled wrapper
+   *  (`timeout 30 adb …`, `bash -lc "adb …"`, `env -S "adb …"`, `$(adb …)`) run unchecked.
+   *  Callers must REFUSE this rather than proceed (owner ruling, 2026-09-12).
+   *
+   *  ABSENT when the parse was readable, rather than `false`: every existing consumer and test
+   *  asserts the whole result shape, and a new always-present key would have changed all of them
+   *  while proving nothing. */
+  opaque?: true;
 }
 
 export declare function parseDeviceCommand(command: string): DeviceCommandTargets;

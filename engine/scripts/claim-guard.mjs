@@ -121,6 +121,20 @@ function main() {
   if (typeof command !== 'string' || !MENTIONS_DEVICE_TOOL.test(command)) return allow();
 
   const targets = parseDeviceCommand(command);
+  // (#1083) UNREADABLE is not the same as harmless. The parser returns `opaque` when a device CLI is
+  // named inside something it cannot re-parse — a heredoc payload, `env -S`, a substitution, an
+  // unmodelled launcher — and an empty result used to be the only way it could say so, which both
+  // callers read as "nothing to arbitrate" and ran. Measured: 18 of 26 wrapper shapes reached the
+  // phone unchecked that way. Refusing is the owner's call (2026-09-12); it is bounded to commands
+  // that NAME a device CLI outside quotes, so ordinary Bash is untouched.
+  if (targets.opaque) {
+    return deny(`Refused: ${command.slice(0, 120)}\n\nThis names a device CLI inside something this `
+      + 'guard cannot re-parse (a heredoc payload, `env -S`, a `$(…)`/backtick substitution, or a '
+      + 'launcher it does not model), so it cannot tell WHICH phone the command would reach — and an '
+      + 'unreadable command aimed at a phone is exactly what this guard is for.\n\nRun the device '
+      + 'command directly rather than through a wrapper, or `npm run device:run -- <command>`, which '
+      + 'takes the claim itself.');
+  }
   if (!targets.tools.length) return allow();
   // Read-only calls (`adb devices`, `getprop`, `logcat -d`, `devicectl device info`) cannot disturb
   // another session, so they are allowed against a claimed phone. The claim arbitrates INTERFERENCE,

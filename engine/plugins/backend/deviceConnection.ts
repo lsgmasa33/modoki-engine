@@ -816,6 +816,9 @@ export class DeviceConnectionManager {
         guid: this.guid,
         label: picked.label,
         purpose: 'holding a device lease over USB (go-ios forward)',
+        // (#1082) This is the one lease that shares a KEY with WDA's claim — both `ios:<udid>`, both
+        // in this process — so naming the holder is what stops either release taking the other's.
+        holder: this.claimHolder,
       });
       if (!claim.ok) {
         this.state = 'error';
@@ -884,6 +887,7 @@ export class DeviceConnectionManager {
         guid: this.guid,
         label: resolved.label,
         purpose: 'holding a device lease over USB',
+        holder: this.claimHolder,
       });
       if (!claim.ok) {
         this.state = 'error';
@@ -917,6 +921,7 @@ export class DeviceConnectionManager {
         deviceId: wifiDeviceId(ip),
         guid: this.guid,
         purpose: 'holding a device lease over WiFi',
+        holder: this.claimHolder,
       });
       if (!claim.ok) {
         this.state = 'error';
@@ -1172,15 +1177,25 @@ export class DeviceConnectionManager {
         purpose: 'holding a device lease over WiFi',
         model: deviceModel,
         ...(osVersion ? { osVersion } : {}),
+        // Same holder as the claim this refreshes — a re-claim under a DIFFERENT name would register
+        // a second holder for one lease, and the phone would then need two releases to come free.
+        holder: this.claimHolder,
       });
     } catch { /* the claim is already held and usable; a missing model is never worth failing over */ }
   }
+
+  /** (#1082) THIS lease's identity as a claim holder. One backend process can hold one device id
+   *  through two independent holders — this lease and `wdaLauncher`'s agent launch, which key an
+   *  iPhone the same way (`ios:<udid>`) — and the store released by `(deviceId, pid)`, which cannot
+   *  separate them. Keyed by the lease GUID rather than a bare `'lease'` so two managers in one
+   *  process (a test, a future second lease) are distinct holders too. */
+  private get claimHolder(): string { return `lease:${this.guid}`; }
 
   /** Hand back the hardware claim, if this lease holds one. Idempotent — a second call after the
    *  claim is gone is a no-op, which matters because `disconnect()` is called on every connect. */
   private releaseClaim(): void {
     if (!this.claimedDeviceId) return;
-    try { releaseDevice(this.claimedDeviceId); } catch { /* a claims file we cannot write must never block a disconnect */ }
+    try { releaseDevice(this.claimedDeviceId, { holder: this.claimHolder }); } catch { /* a claims file we cannot write must never block a disconnect */ }
     this.claimedDeviceId = null;
   }
 
@@ -1219,7 +1234,10 @@ export class DeviceConnectionManager {
     // agent that a NEWER session had launched meanwhile (the #527 rule). Safe to release WDA's claim before
     // the lease's own: within ONE lease they never share a key, because WDA is reached only under a WiFi
     // lease (`wdaHost`), which claims `ip:<host>`, not `ios:<udid>`. Across two overlapping connects they
-    // can — a stalled USB teardown's deferred release can remove a newer WDA claim on the same key (#1082).
+    // CAN share one — and that no longer decides anything (#1082, closed): a claim carries its HOLDERS,
+    // and a release drops only the holder that names itself, so neither teardown can hand back a phone
+    // the other is still using. ⚠️ Do not reduce either side to a bare `releaseDevice(id)` again — that
+    // is precisely the call that took the agent's claim, and the store cannot tell the two apart.
     stopWda();
     endDeviceWdaLease();
     // The claim is held ACROSS the hangup, ON PURPOSE. Releasing it before `client.disconnect()`
@@ -1293,7 +1311,11 @@ export class DeviceConnectionManager {
     // different id means ours is still the one to hand back. A plain generation check would be
     // wrong here — a second bare `disconnect()` call (no reconnect after) has its own `claimId`
     // already null, and a generation check would then wrongly skip releasing the still-valid claim.
-    if (claimId && this.claimedDeviceId !== claimId) { try { releaseDevice(claimId); } catch { /* a claims file we cannot write must never block a disconnect */ } }
+    // (#1082) Released by HOLDER. The ownership check on the line below is against this MANAGER's own
+    // field, so it can see a newer connect on this same manager re-taking the id — and cannot see a
+    // WDA launch holding the very same `ios:<udid>` key in this process. Naming the holder is what
+    // makes this release incapable of taking the agent's claim with it.
+    if (claimId && this.claimedDeviceId !== claimId) { try { releaseDevice(claimId, { holder: this.claimHolder }); } catch { /* a claims file we cannot write must never block a disconnect */ } }
     return result;
   }
 

@@ -199,6 +199,56 @@ describe('claim-guard — false positives that make a guard get routed around', 
   });
 });
 
+/** #1083 — a wrapper the classifier could not re-parse reached the phone unchecked.
+ *
+ *  `parseDeviceCommand` returned the all-empty result for it, and this hook's `!targets.tools.length`
+ *  branch reads that as "nothing to arbitrate" and ALLOWS — so a heredoc payload, an `env -S`, a
+ *  substitution or an unmodelled launcher walked straight past the guard. Measured with one
+ *  destructive control wrapped 24 ways: 18 ran unchecked. The parser now reports `opaque`, and the
+ *  refusal polarity is the owner's call (2026-09-12). */
+describe('claim-guard — a wrapper it cannot re-parse (#1083)', () => {
+  // An UNTERMINATED heredoc — the strip swallows to the end of the string, so nothing downstream can
+  // see the command that follows. (A `bash -c "cat <<EOF … EOF … adb …"` is no longer the example: a
+  // heredoc opener inside quotes is skipped now, so that one parses fully and is refused by NAME,
+  // which is the better outcome wherever it is reachable.)
+  const HIDDEN = `cat <<EOF\nx\n${INSTALL}`;
+
+  it('refuses it, in the deny SHAPE the harness acts on', () => {
+    // Shape, not just output: Claude Code treats malformed hook output as non-blocking, so a guard
+    // that prints the wrong thing fails OPEN and "it printed something" proves nothing.
+    const r = runGuard(HIDDEN);
+    expect(r.decision?.permissionDecision).toBe('deny');
+    expect(r.status).toBe(0);
+  });
+
+  it('refuses with NO claim in the file at all — it cannot tell which phone, so there is nothing to look up', () => {
+    // Every other refusal here consults the claims file first. This one cannot, and that is exactly
+    // why it refuses: an unreadable command aimed at a phone is the case the guard exists for.
+    const r = runGuard(HIDDEN);
+    expect(r.reason).toMatch(/re-parse/);
+  });
+
+  it('names a remedy rather than only saying no', () => {
+    expect(runGuard(HIDDEN).reason).toMatch(/device:run/);
+  });
+
+  it('a wrapped command it CAN read is arbitrated normally, by holder — not blanket-refused', () => {
+    // The difference between this and a blunt "unreadable, refuse": re-parsing from the device CLI's
+    // own token classifies the command exactly, so the refusal still names who holds the phone.
+    writeClaim(foreignClaim('adb:RFTESTSERIAL1'));
+    const r = runGuard(`timeout 30 ${INSTALL}`);
+    expect(r.decision?.permissionDecision).toBe('deny');
+    expect(r.reason).toMatch(/held by another clone/);
+    expect(r.reason).not.toMatch(/re-parse/);
+  });
+
+  it('leaves the accept side alone', () => {
+    for (const cmd of ['echo adb', 'sudo -u adb whoami', 'git status', 'node /usr/local/sh/tool.mjs']) {
+      expect(runGuard(cmd).decision, cmd).toBeNull();
+    }
+  });
+});
+
 /** #1078 — `devicectl --device` (or `-d`) may name a phone by its CoreDevice identifier, ECID, serial number
  *  or name, while every claim is keyed by UDID. The guard compared the raw string, so a sibling's
  *  `ios:<udid>` claim was invisible to such a command, and this clone's own claim did not cover it. The

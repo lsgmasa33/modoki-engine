@@ -760,6 +760,30 @@ Two mechanisms now close it, and they are deliberately different in reach:
   `getprop`, `logcat -d`, `devicectl device info`) are always allowed — the claim arbitrates
   interference, not curiosity, and a guard that refused listings would be routed around.
 
+⚠️ **A wrapper the classifier cannot re-parse is REFUSED, not run** (#1083; polarity is the owner's
+call, 2026-09-12). `parseDeviceCommand` had only one way to say *"I found no device CLI"* — the
+all-empty result — and **both** entry points read it as *nothing to arbitrate*, so every shape the
+parser could not follow failed OPEN. Measured with one destructive control (`adb -s … uninstall …`)
+wrapped 24 ways: **18 ran unchecked**, among them `timeout 30 adb …`, `bash -lc "adb …"`,
+`eval "adb …"`, `$(adb …)`, `( adb … )`, `{ adb …; }`, `sleep 1 & adb …` and `env -S "adb …"`. The
+parser now reports a third outcome, `opaque`, which `claim-guard.mjs` and `device run` both refuse,
+naming the remedy.
+- **Most of those shapes are not opaque — they are CLASSIFIED.** When a segment's command word is not
+  a device CLI, the parse re-dispatches from the device CLI's own token (or from a shell wrapper's),
+  so `timeout 30 adb -s X uninstall` is refused as the destructive, targeted command it is, while
+  `timeout 30 adb devices` stays **allowed** as the read-only call it is. Blanket-refusing both would
+  be exactly the over-refusal the wireless carve-out below exists to avoid.
+- `opaque` is left for what genuinely cannot be read — a heredoc payload that swallows the command
+  (`bash -c "cat <<EOF … EOF … adb uninstall …"`), where nothing can say which phone is meant.
+- **The accepted cost**: a bare `adb` word with an unrecognised subcommand is refused wherever it
+  appears, so `grep adb notes.txt` is refused exactly as `adb notes.txt` typed directly always has
+  been. Deliberate, and pinned by a test — that test is the line to revisit if it proves noisy.
+- ⚠️ The corpus lives in `engine/tests/plugins/deviceCommandTargets.test.ts` as a **table**. A newly
+  found wrapper shape gets a ROW there; fixing one quietly at a call site is the whack-a-mole this
+  issue was filed about.
+- Out of scope on purpose: `ssh host "adb …"` runs on ANOTHER machine, and a per-machine claim cannot
+  speak for that phone.
+
 A different `PreToolUse` hook, `engine/scripts/context-cost-guard.mjs`, warns (never blocks) on a
 large unbounded `Read` or an unbounded verbose `Bash` call — see
 [docs/agent-context-cost.md](./agent-context-cost.md).
@@ -972,7 +996,13 @@ The MCP is **parity-plus** with chrome-devtools for the editor, and better on tw
 - `modoki_type_text` — **trusted** keyboard input into the focused element (tap the input first);
   a real Chromium `char` event, so React controlled inputs (Inspector `BufferedTextInput`) fire
   their `onChange`. `clearFirst` replaces vs appends; `submitKey` `'Tab'`/`'Escape'` BLURs (to test
-  commit-on-blur), `'Enter'` submits. This is how you author text fields (rename, `UIElement.text`)
+  commit-on-blur), `'Enter'` submits — and inserts a newline in a textarea, since that is what the
+  key does there. **A newline or tab inside `text` types**; any other control character is not sent
+  at all and the error names it as the TOOL's limit (#1081 — a `\n` used to insert nothing while the
+  message blamed the field, and `submitKey:'Enter'` reported success having done nothing; measured
+  on Electron 43.2.0 — a keyDown/keyUp pair inserts nothing for any spelling, and an unrecognised
+  Accelerator name inserts a fragment of its own name, so the mapping is a closed set).
+  This is how you author text fields (rename, `UIElement.text`)
   headlessly — the piece `tap`/`drag` couldn't reach. *(Electron editor only.)*
 - `modoki_get_scene_state` / `modoki_mutate_scene` / `modoki_validate_scene` — same live-world
   data + validated edits as the curl `/api/*` endpoints, relayed over the IPC bridge.

@@ -626,6 +626,19 @@ function cmdRun(rawArgs) {
   const cmdStr = requoted.join(' ');
   const targets = parseDeviceCommand(cmdStr);
 
+  // (#1083) The classifier could not follow this one, and it names a device CLI — so it is refused
+  // rather than run, the same way the PreToolUse guard refuses it. The two entry points arbitrate the
+  // same command and must not disagree about it (#827's class); this one is the CLI half.
+  if (targets.opaque) {
+    console.error(
+      `Refused: ${cmdStr}\n\nThis names a device CLI inside something the claim check cannot `
+      + 're-parse (a heredoc payload, `env -S`, a `$(…)`/backtick substitution, or a launcher it does '
+      + 'not model), so it cannot tell which phone the command would reach. Pass the device command '
+      + 'directly — `npm run device:run -- adb -s <serial> …` — rather than wrapped in a shell string.',
+    );
+    process.exit(1);
+  }
+
   if (!targets.tools.length) {
     // Names no device CLI at all — nothing for this tool to arbitrate.
     execCommand(command);
