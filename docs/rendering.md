@@ -5190,11 +5190,12 @@ not. **#828 tracks the six sites where this cover is still missing**, including
 `pixiShaderBuilder.ts`, which shares compiled GPU programs across both live `Scene2DRenderer`s with
 no renderer in the key and may be a live defect rather than a cover gap.
 
-#### `pixiShaderBuilder`'s shared `GlProgram` — MEASURED, and invisible on every engine we can drive (#846)
+#### `pixiShaderBuilder`'s shared `GlProgram` — MEASURED on desktop AND on an iOS 16 device, invisible on all of them (#846)
 
 `programCache` (`runtime/rendering/pixiShaderBuilder.ts`) keys on backend + manifest path + name +
-params + body, with **no renderer identity**, so one `GlProgram` object is handed to all three live
-Pixi `Application`s. Pixi's `generateProgram` then mutates that SHARED object in place —
+params + body, with **no renderer identity**, so one `GlProgram` object is handed to every live Pixi
+`Application` — one per `canvas2DPool` slot, so a shipped scene with two `Canvas2D` entities already
+has two, before the editor adds its own. Pixi's `generateProgram` then mutates that SHARED object in place —
 `program._attributeData = extractAttributesFromGlProgram(...)`, whose `location` values come from
 `gl.getAttribLocation` and are valid only for the `WebGLProgram` just compiled in **that** context.
 `GlGeometrySystem.activateVao` later reads those locations off the shared object when it lazily
@@ -5203,30 +5204,41 @@ build a VAO from renderer B's attribute locations.
 
 **Whether that is a real defect turns on one physical question, and the answer is measured, not
 reasoned:** do two independent WebGL contexts assign the same attribute locations to byte-identical
-GLSL? On this machine (2026-09-09, macOS, Apple M4 Max) — **yes, on both engines**:
+GLSL? **Yes, everywhere it has been measured**:
 
-| engine | renderer | ctx A | ctx B |
-|---|---|---|---|
-| Chromium | `ANGLE (Apple, ANGLE Metal Renderer: Apple M4 Max)` | `aPosition 0, aUV 1, aColor 2` | identical |
-| WebKit | `Apple GPU` | `aPosition 0, aUV 1, aColor 2` | identical |
+| where (date) | context | renderer | ctx A | ctx B |
+|---|---|---|---|---|
+| macOS, Apple M4 Max (2026-09-09) | Chromium, WebGL2 | `ANGLE (Apple, ANGLE Metal Renderer: Apple M4 Max)` | `aPosition 0, aUV 1, aColor 2` | identical |
+| macOS, Apple M4 Max (2026-09-09) | WebKit, WebGL2 | `Apple GPU` | `aPosition 0, aUV 1, aColor 2` | identical |
+| **iPhone 8 / A11, iOS 16.7.16 (2026-09-11)** | Court's WKWebView, WebGL2 | `Apple GPU` | `aPosition 0, aUV 1, aColor 2` | identical |
+| **iPhone 8 / A11, iOS 16.7.16 (2026-09-11)** | Court's WKWebView, WebGL1 | `Apple GPU` | `aPosition 0, aUV 1, aColor 2` | identical |
 
 A second shader with the declarations deliberately SHUFFLED came back `aColor 0, aUV 1, aPosition 2`
-on both contexts of both engines — i.e. assignment follows **declaration order**, deterministically,
+on both contexts of every row — i.e. assignment follows **declaration order**, deterministically,
 and Pixi generates identical source for both contexts. The GLSL spec does not guarantee this; these
-two implementations both do it.
+implementations all do it. The device run went further than the desktop one, on purpose: its two
+contexts compiled the programs in **reverse order** of each other (so any allocation state an
+earlier program left behind would have shown up), and it added a four-attribute batcher-shaped set
+(`aPosition 0, aUV 1, aColor 2, aTextureIdAndRound 3` — identical on both contexts). It ran through
+`device_eval` inside the installed Court app, which reported `navigator.gpu` absent, so this is the
+GL path Pixi actually takes there.
 
-⚠️ **Bounds, because this is one machine.** Not measured on iOS 16 / A11 — which is precisely where
-the GL path actually runs, since `pixi.backend` defaults to `'auto'` and resolves to WebGPU
-everywhere it is supported. Playwright's WebKit is not iOS WebKit. And the two-live-`Application`
-condition exists only in the EDITOR, which runs on desktop where WebGPU is available — so GL **and**
-two surfaces co-occur only under an explicitly pinned `pixi.backend: 'webgl'`, or on a desktop
-browser without WebGPU.
+⚠️ **The two-surface condition is NOT editor-only — this paragraph said it was, until the device run
+measured otherwise.** Court on the iPhone 8 had **two** live `data-canvas2d-mount` canvases, each
+under its own `Canvas2D` entity and each holding its own WebGL2 context (neither lost). iOS 16 has no
+WebGPU, so on that class of device GL **and** several live `Application`s is the ordinary shipped
+state, not an exotic pinned-backend one. That is what made the device measurement the deciding one,
+and it is why the verdict below rests on the table rather than on the condition being rare.
+
+⚠️ **Bounds that remain.** Not measured on any Android GPU (Adreno, Mali) — and whether a supported
+Android device takes the GL path at all is itself unmeasured, since `pixi.backend: 'auto'` resolves to
+WebGPU wherever the browser offers it. Every row above is an Apple GPU stack.
 
 **Verdict: a documented caveat, not a fix.** Adding a renderer to our key would diverge from Pixi's
 own design (`GlProgram.from()` is itself a module-level content-addressed cache, so Pixi shares its
 built-in shaders across every `Application` by design) and would cost a duplicate compile per
-surface for a collision nobody can produce. #846 stays filed for the one residual — iOS-16-class
-WebKit on a real device — and nobody should re-run the desktop probe.
+surface for a collision no measured driver produces. #846 was closed on the device measurement; do
+not re-run either probe unless an Android GL device turns up a wrong frame.
 
 ### Retractions worth keeping — each was a confident claim that measurement killed
 
