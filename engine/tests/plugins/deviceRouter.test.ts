@@ -3,15 +3,15 @@
  *  mock TCP device, proving the request→router→manager→transport→device round-trip and the route
  *  error mapping (the whole data plane was previously untested — code-review T1/T2). */
 
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import net from 'net';
 import os from 'os';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
 import { deviceConnection } from '../../plugins/backend/deviceConnection';
 import { DeviceLeaseAuthority } from '../../plugins/backend/deviceLease';
-import { WDA_NOT_IOS_REASON, _resetDeviceWdaStateForTests } from '../../plugins/backend/deviceWda';
+import { WDA_NOT_IOS_REASON, WDA_NEEDS_WIFI_REASON, WDA_SHOT_NO_SESSION_REASON, WDA_LEASE_ENDED_REASON, endDeviceWdaLease, resolveWdaPort, _resetDeviceWdaStateForTests } from '../../plugins/backend/deviceWda';
 import { _resetDeviceCdpStateForTests, _setDeviceCdpSessionProbeForTests } from '../../plugins/backend/deviceCdp';
-import { _resetWdaLauncherForTests } from '../../plugins/backend/wdaLauncher';
+import { _resetWdaLauncherForTests, ensureWdaRunning, isWdaProcessRunning } from '../../plugins/backend/wdaLauncher';
 import type { FrameLoopStatus } from '../../packages/modoki/src/runtime/rendering/frameLoopStatus';
 
 /** Minimal lease-speaking device that also echoes a data method.
@@ -408,6 +408,196 @@ describe('/api/device/request WDA gated on device platform (#99)', () => {
       expect(req.status).toBe(409);
       expect(bodyOf(req).error).toBe(WDA_NOT_IOS_REASON);
     } finally {
+      await device.close();
+    }
+  });
+
+  // #1077 — the stop moved out of this route and into `deviceConnection.disconnect()`. Pinned at the
+  // ROUTE as well: dropping the route's own call is only safe while the manager's call exists.
+  it('POST /api/device/disconnect still stops WebDriverAgent — now through the manager (#1077)', async () => {
+    const device = await startMockDevice(new DeviceLeaseAuthority(), { 'app-identity': { platform: 'ios', appId: 'x', appName: 'y' } });
+    vi.stubEnv('MODOKI_IOS_DEVICE_UDID', '');   // a pin in the developer's shell would match no listing below
+    const agent = { exitCode: null as number | null, killed: false, kill() { agent.killed = true; }, on() { /* never exits */ } };
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      let up = false;
+      const launched = await ensureWdaRunning({
+        host: '127.0.0.1', port: 8100, sleep: async () => {}, xctestrun: '/fake/WDA.xctestrun', platform: 'darwin',
+        listDevices: () => JSON.stringify({ result: { devices: [{ hardwareProperties: { udid: 'UDID-A', platform: 'iOS' }, deviceProperties: { name: 'A' } }] } }),
+        spawnImpl: (() => agent) as never,
+        probe: async () => { const v = up; up = true; return v; },
+      });
+      expect(launched).toEqual({ running: true });
+      await post('/api/device/disconnect', {});
+      expect(agent.killed).toBe(true);
+      expect(isWdaProcessRunning()).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+      await device.close();
+    }
+  });
+
+  it('an iOS lease with no WDA route (USB) gets the WiFi reason for input and source:"wda", and launches nothing (#1077)', async () => {
+    const device = await startMockDevice(new DeviceLeaseAuthority(), { 'app-identity': { platform: 'ios', appId: 'x', appName: 'y' } });
+    // This pins the ROUTER's use of the accessor — every WDA call site asks it — not the rule behind it,
+    // which `wdaHostFor` is tested for in deviceConnectWda.test.ts (a real USB lease needs the go-ios seams).
+    const noRoute = vi.spyOn(deviceConnection, 'wdaHost').mockReturnValue(undefined);
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      const tap = await post('/api/device/request', { method: 'tap', params: { x: 1, y: 2 } });
+      expect((bodyOf(tap).result as { inputFidelityWarning?: string }).inputFidelityWarning ?? '').toContain(WDA_NEEDS_WIFI_REASON);
+      const shot = (await post('/api/device/request', { method: 'screenshot', params: { source: 'wda' } })) as { status?: number };
+      expect(shot.status).toBe(409);
+      expect(bodyOf(shot).error).toBe(WDA_NEEDS_WIFI_REASON);
+      expect(isWdaProcessRunning()).toBe(false);
+    } finally {
+      noRoute.mockRestore();
+      await device.close();
+    }
+  });
+
+  it('a launch failure from the previous lease is not the next lease\'s screenshot-fallback reason (#1077)', async () => {
+    const ios = { 'app-identity': { platform: 'ios', appId: 'x', appName: 'y' }, screenshot: 'Error: no window to capture' };
+    const first = await startMockDevice(new DeviceLeaseAuthority(), ios);
+    const second = await startMockDevice(new DeviceLeaseAuthority(), ios);
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: first.port });
+      // No agent can start in a test, so the tap's launch fails and deviceWda remembers why.
+      await post('/api/device/request', { method: 'tap', params: { x: 1, y: 2 } });
+      // The premise, shown on the SAME lease: the fallback reports that remembered launch failure.
+      const sameLease = await post('/api/device/request', { method: 'screenshot', params: {} });
+      expect(bodyOf(sameLease).wdaFallbackUnavailable).not.toBe(WDA_SHOT_NO_SESSION_REASON);
+
+      await post('/api/device/disconnect', {});
+      await post('/api/device/connect', { ip: '127.0.0.1', port: second.port });
+      const nextLease = await post('/api/device/request', { method: 'screenshot', params: {} });
+      expect(bodyOf(nextLease).wdaFallbackUnavailable).toBe(WDA_SHOT_NO_SESSION_REASON);
+    } finally {
+      await first.close();
+      await second.close();
+    }
+  });
+
+  // The routes read `wdaHost()` and then AWAIT (the platform and hardware probes, the native capture) before calling
+  // into deviceWda. A lease that ends in that window must stop the WDA call, so each route captures the lease beside
+  // the address and passes it down (#1077's close-out round-4 review). These end the lease INSIDE that window;
+  // `endDeviceWdaLease` is what `disconnect()` runs.
+  const iosIdentity = { 'app-identity': { platform: 'ios', appId: 'x', appName: 'y' } };
+
+  /** End the lease inside the route's next `probe()` await, but only once the route has read the address. */
+  function endLeaseAfterAddressRead(probe: 'devicePlatform' | 'deviceHardware'): () => void {
+    let addressRead = false;
+    const endIfAddressRead = () => { if (addressRead) { addressRead = false; endDeviceWdaLease(); } };
+    const realHost = deviceConnection.wdaHost.bind(deviceConnection);
+    const host = vi.spyOn(deviceConnection, 'wdaHost').mockImplementation(() => { addressRead = true; return realHost(); });
+    let restoreProbe: () => void;
+    if (probe === 'deviceHardware') {
+      const real = deviceConnection.deviceHardware.bind(deviceConnection);
+      const spy = vi.spyOn(deviceConnection, 'deviceHardware').mockImplementation(async (...args: Parameters<typeof real>) => {
+        const out = await real(...args);
+        endIfAddressRead();
+        return out;
+      });
+      restoreProbe = () => spy.mockRestore();
+    } else {
+      const real = deviceConnection.devicePlatform.bind(deviceConnection);
+      const spy = vi.spyOn(deviceConnection, 'devicePlatform').mockImplementation(async (...args: Parameters<typeof real>) => {
+        const out = await real(...args);
+        endIfAddressRead();
+        return out;
+      });
+      restoreProbe = () => spy.mockRestore();
+    }
+    return () => { host.mockRestore(); restoreProbe(); };
+  }
+
+  /** Requests to the agent's port. The launcher's `/status` probe and every session call go through global `fetch`, so
+   *  this sees a launch attempt or a session opened on the previous phone even when the REPLY looks the same — a
+   *  later check refuses those too, and no agent can spawn in a test (no toolchain dir), so neither can tell. */
+  function watchAgentPort(): { calls: () => string[]; restore: () => void } {
+    const spy = vi.spyOn(globalThis, 'fetch');
+    return {
+      calls: () => spy.mock.calls.map(([u]) => String(u)).filter((u) => u.includes(`:${resolveWdaPort()}/`)),
+      restore: () => spy.mockRestore(),
+    };
+  }
+
+  it('the screenshot fallback does not ask WDA when the lease ended during the native capture (#1077)', async () => {
+    const device = await startMockDevice(new DeviceLeaseAuthority(), iosIdentity);
+    const realProxy = deviceConnection.proxy.bind(deviceConnection);
+    const proxy = vi.spyOn(deviceConnection, 'proxy').mockImplementation(async (...args: Parameters<typeof realProxy>) => {
+      if (args[0] !== 'screenshot') return realProxy(...args);
+      endDeviceWdaLease();
+      return 'Error: no window to capture';
+    });
+    const agent = watchAgentPort();
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      const shot = await post('/api/device/request', { method: 'screenshot', params: {} });
+      expect(bodyOf(shot).wdaFallbackUnavailable).toBe(WDA_LEASE_ENDED_REASON);
+      expect(agent.calls()).toEqual([]);
+    } finally {
+      agent.restore();
+      proxy.mockRestore();
+      await device.close();
+    }
+  });
+
+  it('the fallback after a THROWN native capture sends nothing to the previous phone\'s agent (#1077)', async () => {
+    // This path rethrows the native error whether or not WDA was asked, so the reply cannot tell. The side effect
+    // can: no request to the agent's port once the lease has ended.
+    const device = await startMockDevice(new DeviceLeaseAuthority(), iosIdentity);
+    const realProxy = deviceConnection.proxy.bind(deviceConnection);
+    const proxy = vi.spyOn(deviceConnection, 'proxy').mockImplementation(async (...args: Parameters<typeof realProxy>) => {
+      if (args[0] !== 'screenshot') return realProxy(...args);
+      endDeviceWdaLease();
+      throw new Error('no device connected');
+    });
+    const agent = watchAgentPort();
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      await post('/api/device/request', { method: 'screenshot', params: {} });
+      expect(agent.calls()).toEqual([]);
+    } finally {
+      agent.restore();
+      proxy.mockRestore();
+      await device.close();
+    }
+  });
+
+  // The explicit route awaits TWO probes after reading the address. `devicePlatform()` is usually cached, but after a
+  // failed identity ask it is a real round trip, so the capture must sit before it, not just before the hardware read.
+  for (const probe of ['devicePlatform', 'deviceHardware'] as const) {
+    it(`source:"wda" is refused, and asks the previous phone's agent nothing, when the lease ended inside ${probe}() (#1077)`, async () => {
+      const device = await startMockDevice(new DeviceLeaseAuthority(), iosIdentity);
+      const restore = endLeaseAfterAddressRead(probe);
+      const agent = watchAgentPort();
+      try {
+        await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+        const shot = (await post('/api/device/request', { method: 'screenshot', params: { source: 'wda' } })) as { status?: number };
+        expect(shot.status).toBe(409);
+        expect(bodyOf(shot).error).toBe(WDA_LEASE_ENDED_REASON);
+        expect(agent.calls()).toEqual([]);
+      } finally {
+        agent.restore();
+        restore();
+        await device.close();
+      }
+    });
+  }
+
+  it('a WDA-routed tap is refused when the lease ended after the route read the address (#1077)', async () => {
+    const device = await startMockDevice(new DeviceLeaseAuthority(), iosIdentity);
+    const restore = endLeaseAfterAddressRead('deviceHardware');
+    const agent = watchAgentPort();
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      const tap = await post('/api/device/request', { method: 'tap', params: { x: 1, y: 2 } });
+      expect(bodyOf(tap).result).toBe(`Error: ${WDA_LEASE_ENDED_REASON}`);
+      expect(agent.calls()).toEqual([]);
+    } finally {
+      agent.restore();
+      restore();
       await device.close();
     }
   });

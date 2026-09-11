@@ -44,7 +44,7 @@ interface GuardResult {
   reason: string;
 }
 
-function runGuard(command: string, opts: { cwd?: string } = {}): GuardResult {
+function runGuard(command: string, opts: { cwd?: string; env?: Record<string, string> } = {}): GuardResult {
   const payload = JSON.stringify({
     session_id: 'test',
     hook_event_name: 'PreToolUse',
@@ -61,6 +61,7 @@ function runGuard(command: string, opts: { cwd?: string } = {}): GuardResult {
       // The harness sets this in a real session and the guard prefers it. Pin it to the test's
       // clone so the result does not depend on whether the suite itself was launched by Claude.
       CLAUDE_PROJECT_DIR: opts.cwd ?? clone,
+      ...opts.env,
     },
   });
   const out = (res.stdout ?? '').trim();
@@ -195,6 +196,57 @@ describe('claim-guard — false positives that make a guard get routed around', 
   it('does not refuse a simulator build', () => {
     const r = runGuard("xcodebuild -destination 'platform=iOS Simulator,name=iPhone 15' -scheme App build");
     expect(r.decision).toBeNull();
+  });
+});
+
+/** #1078 — `devicectl --device` (or `-d`) may name a phone by its CoreDevice identifier, ECID, serial number
+ *  or name, while every claim is keyed by UDID. The guard compared the raw string, so a sibling's
+ *  `ios:<udid>` claim was invisible to such a command, and this clone's own claim did not cover it. The
+ *  devicectl listing is a fixture, and every id is invented. */
+describe('claim-guard — one iPhone, several devicectl ids (#1078)', () => {
+  const UDID = '00008150-TESTTESTTESTTEST';
+  const IDENTIFIER = 'C0DEC0DE-0000-4000-8000-00000000000A';
+  const launch = (flag: string, id: string) => `xcrun devicectl device process launch ${flag} ${id} com.example.app`;
+  let env: Record<string, string>;
+
+  beforeEach(() => {
+    const file = path.join(home, 'devicectl.json');
+    fs.writeFileSync(file, JSON.stringify({
+      result: { devices: [{ identifier: IDENTIFIER, hardwareProperties: { udid: UDID, platform: 'iOS' }, deviceProperties: { name: 'Test iPad' } }] },
+    }));
+    env = { MODOKI_DEVICECTL_JSON_FIXTURE: file };
+  });
+
+  it('refuses a command naming the CoreDevice identifier of a phone a sibling holds by UDID', () => {
+    writeClaim(foreignClaim(`ios:${UDID}`, { label: 'Test iPad' }));
+    const r = runGuard(launch('--device', IDENTIFIER), { env });
+    expect(r.decision?.permissionDecision).toBe('deny');
+    expect(r.reason).toContain('modoki-ai2');
+  });
+
+  it('allows it when THIS clone holds the phone by UDID — the refusal the hub hit', () => {
+    writeClaim({ ...foreignClaim(`ios:${UDID}`), clone, branch: 'work-ai3' });
+    expect(runGuard(launch('--device', IDENTIFIER), { env }).decision).toBeNull();
+  });
+
+  it('reads -d, devicectl\'s short flag, the same way', () => {
+    writeClaim(foreignClaim(`ios:${UDID}`));
+    const r = runGuard(launch('-d', IDENTIFIER), { env });
+    expect(r.decision?.permissionDecision).toBe('deny');
+    expect(r.reason).toContain('modoki-ai2');
+  });
+
+  it('still honors a claim a sibling took under the identifier spelling itself', () => {
+    writeClaim(foreignClaim(`ios:${IDENTIFIER}`));
+    const r = runGuard(launch('--device', IDENTIFIER), { env });
+    expect(r.decision?.permissionDecision).toBe('deny');
+    expect(r.reason).toContain('modoki-ai2');
+  });
+
+  it('refuses an unclaimed phone with a claim hint naming the UDID key', () => {
+    const r = runGuard(launch('--device', IDENTIFIER), { env });
+    expect(r.decision?.permissionDecision).toBe('deny');
+    expect(r.reason).toContain(`npm run device:claim ios:${UDID}`);
   });
 });
 

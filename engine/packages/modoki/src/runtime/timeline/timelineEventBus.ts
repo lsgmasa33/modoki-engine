@@ -14,6 +14,7 @@
 import type { Entity, World } from 'koota';
 import { getCurrentWorld } from '../core/ecs/world';
 import type { ManagerDef } from '../core/managerTypes';
+import { notifyListeners } from '../core/notifyListeners';
 
 export type SequenceStartHandler = (director: Entity) => void;
 export type SequenceEndHandler = (director: Entity) => void;
@@ -32,8 +33,13 @@ export interface TimelineEventBus {
   __clear(world: World): void;
 }
 
-/** Build the timeline event bus + its scene-scoped manager. */
+/** Build the timeline event bus + its scene-scoped manager. `logTag` names the bus in the report
+ *  when a handler throws. That report is `notifyListeners`' `console.error`: a game handler that
+ *  throws spends the crash budget like any other listener defect (owner ruling on #953). */
 export function createTimelineEventBus(managerName: string, logTag: string): { events: TimelineEventBus; manager: ManagerDef } {
+  const startLabel = `${logTag}:start`;
+  const endLabel = `${logTag}:end`;
+  const markerLabel = `${logTag}:marker`;
   const startsByWorld = new WeakMap<World, Set<SequenceStartHandler>>();
   const endsByWorld = new WeakMap<World, Set<SequenceEndHandler>>();
   const markersByWorld = new WeakMap<World, Set<SequenceMarkerHandler>>();
@@ -52,17 +58,17 @@ export function createTimelineEventBus(managerName: string, logTag: string): { e
     __emitStart(world, director) {
       const s = startsByWorld.get(world);
       if (!s || s.size === 0) return;
-      for (const cb of s) { try { cb(director); } catch (e) { console.warn(`[${logTag}] start handler threw`, e); } }
+      notifyListeners(s, startLabel, [director]);
     },
     __emitEnd(world, director) {
       const s = endsByWorld.get(world);
       if (!s || s.size === 0) return;
-      for (const cb of s) { try { cb(director); } catch (e) { console.warn(`[${logTag}] end handler threw`, e); } }
+      notifyListeners(s, endLabel, [director]);
     },
     __emitMarker(world, director, action, t) {
       const s = markersByWorld.get(world);
       if (!s || s.size === 0) return;
-      for (const cb of s) { try { cb(director, action, t); } catch (e) { console.warn(`[${logTag}] marker handler threw`, e); } }
+      notifyListeners(s, markerLabel, [director, action, t]);
     },
     __clear(world) { startsByWorld.delete(world); endsByWorld.delete(world); markersByWorld.delete(world); },
   };

@@ -35,7 +35,8 @@ modoki/                          # Git root (this clone: the integration hub on 
 │   │                            # `game: GameDefinition`) + project.config.json (identity/build/
 │   │                            # postprocessors) + runtime/ + assets + its OWN ios/ android/
 │   │                            # capacitor.config.json + packages/ (per-game native plugins, e.g.
-│   │                            # capacitor-applovin-max / capacitor-adjust). Opened standalone via
+│   │                            # capacitor-adjust; ENGINE plugins arrive as vendored tarballs
+│   │                            # under plugins/). Opened standalone via
 │   │                            # the editor's Open Project or MODOKI_PROJECT=games/<id>. No registry/hub.
 │   ├── 3d-test/                 # Tropical Island (com.modokiengine.tropicalisland) — has iOS+Android native
 │   ├── alien-animal/            # skeletal-animation showcase (com.modokiengine.alienanimal)

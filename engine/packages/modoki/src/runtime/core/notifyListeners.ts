@@ -1,6 +1,6 @@
 /** Fire a subscriber set so that one bad subscriber cannot take out the publisher.
  *
- *  The engine has ~75 hand-rolled callback fan-outs. Eight of them already wrapped each callback in
+ *  The engine hand-rolled its callback fan-outs dozens of times. Eight of them already wrapped each callback in
  *  its own `try`, each with its own comment arguing the same point in different words:
  *
  *  > *"A listener must never break registration — the game's services are the point, the
@@ -11,14 +11,16 @@
  *
  *  This file is that convention extracted once, so those eight copies stop being eight copies.
  *
- *  ⚠️ **The migration is NOT complete, and this docblock said it was.** #888 migrated **36 call sites**; **46** remain
- *  hand-rolled (41 inside the guard's SCAN_DIRS, 5 outside), pinned row-by-row in
- *  `engine/tests/architecture/notifyIsShared.test.ts` and tracked as **#953**. A further 4 are
- *  permanently EXEMPT there — queries that read a value back out of each callback, which a
- *  "call them all, return nothing" helper cannot express. The original census said "23 sites" because its
+ *  **This is the engine's only fan-out implementation**, enforced by
+ *  `engine/tests/architecture/notifyIsShared.test.ts` (within the blind spots its header states).
+ *  Getting there took two passes, and the first one declared victory early: #888 migrated 36 call
+ *  sites and claimed completion, and the guard's own close-out then found the rest; #953 migrated or
+ *  exempted all of them. The few permanent exemptions are tagged with why the helper cannot express
+ *  them: a QUERY that reads a value back out of each callback, an ASYNC-SEQUENTIAL loop that awaits
+ *  each one in order, or a REGISTRATION that must stop on the first failure. A game reaches this
+ *  file as the deep export `@modoki/engine/runtime/core/notifyListeners`. #888's census said "23 sites" because its
  *  detector keyed on the variable names `listeners`/`subs`/`cbs` — a claim about how every author
- *  in this repo spells things, and a false one. If you are adding a caller: you are joining a
- *  convention that is most of the way in, not one that is finished.
+ *  in this repo spells things, and a false one.
  *
  *  **The reason it matters is the ORDER, not the tidiness.** Every one of those loops mutates its
  *  own state *before* it notifies — `_currentWorld = next`, `_version += 1`, `waiters.delete(key)`.
@@ -65,13 +67,15 @@
  *  @param label appears in the report, so it must name the publisher (`'worldRegistry'`), not the
  *    event.
  *  @param args the tuple handed to each listener. Pass `[]` for a bare `() => void` set.
- *  @param report overrides the default `console.error`. Only for a publisher that cannot reach
- *    `console` safely — see the module docblock. */
+ *  @param report overrides the default `console.error`. Two reasons to pass one: a publisher that
+ *    cannot reach `console` safely (see the module docblock), or one whose report must NAME the
+ *    failing entry. The third argument is the listener that threw, which is how `lateUpdate` maps
+ *    a failure back to its registry key (#953). Existing two-argument reporters are unaffected. */
 export function notifyListeners<A extends readonly unknown[]>(
   listeners: Iterable<(...args: [...A]) => void>,
   label: string,
   args: [...A],
-  report: (label: string, err: unknown) => void = defaultReport,
+  report: (label: string, err: unknown, listener: (...args: [...A]) => void) => void = defaultReport,
 ): void {
   for (const fn of listeners) {
     try {
@@ -80,7 +84,7 @@ export function notifyListeners<A extends readonly unknown[]>(
       // The report itself is inside the loop's isolation, not outside it: a `report` that throws
       // would otherwise reintroduce the exact defect this helper exists to remove, and it is a
       // caller-supplied function.
-      try { report(label, err); } catch { /* nothing left to report it to */ }
+      try { report(label, err, fn); } catch { /* nothing left to report it to */ }
     }
   }
 }

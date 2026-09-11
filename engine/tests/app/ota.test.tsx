@@ -122,6 +122,29 @@ describe('#437 checkAppOtaUpdate / the blocking gate', () => {
     expect(snapshots[snapshots.length - 1]).toEqual({ phase: 'ready-to-restart', version: 'v1' });
   });
 
+  it('a gate listener that throws on ready-to-restart cannot let the app boot past a mandatory update (#953)', async () => {
+    // Pre-#953 `setGate` fanned out with a bare `forEach`. The throw escaped through
+    // `setGateIfCurrent` into `checkAppOtaUpdate`'s catch; there, `setGateIfCurrent(null)` was
+    // swallowed by `setGate`'s ready-to-restart backstop, and the call resolved `true`, so App.tsx
+    // loaded the scene underneath a gate the user cannot dismiss.
+    const ota = await freshOta();
+    h.addListener.mockResolvedValue({ remove: vi.fn(async () => {}) });
+    h.checkForUpdate.mockResolvedValueOnce({ outcome: 'staged', mandatory: true, version: 'v1' });
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const seen: unknown[] = [];
+    ota.subscribeOtaGate((s) => { if (s?.phase === 'ready-to-restart') throw new Error('gate UI boom'); });
+    ota.subscribeOtaGate((s) => { seen.push(s); });
+
+    const result = await ota.checkAppOtaUpdate();
+
+    expect(result, 'a mandatory staged update must hold the launch').toBe(false);
+    expect(seen[seen.length - 1], 'the listener behind the thrower still saw the gate').toEqual({ phase: 'ready-to-restart', version: 'v1' });
+    expect(errSpy).toHaveBeenCalled();
+    errSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
   it('once ready-to-restart, a later check resolves false without re-running the update check (terminal short-circuit)', async () => {
     const ota = await freshOta();
     h.addListener.mockResolvedValue({ remove: vi.fn(async () => {}) });

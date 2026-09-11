@@ -13,7 +13,7 @@ import { writeAssetFile, jsonFileBody } from '../backend/editorBackend';
 import { useEditorStore } from '../store/editorStore';
 import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
-import { register } from '../input/keymap';
+import { register, registerBindings } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { findEntity, getStructureVersion } from '../../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
@@ -969,7 +969,7 @@ export default function AnimationEditor() {
       const fr = s.editingAnimationClip?.frameRate ?? 60;
       scrub(frameToTime(Math.max(0, timeToFrame(s.playheadTime, fr) + dir * step), fr));
     };
-    const offs = [
+    const offBindings = registerBindings(() => [
       register({ id: 'anim.copyKeys', keys: 'mod+c', scope: S, when: hasClip, run: copyKeys }),
       register({ id: 'anim.pasteKeys', keys: 'mod+v', scope: S, when: hasClip, run: pasteKeys }),
       register({ id: 'anim.dupKeys', keys: 'mod+d', scope: S, when: hasKeys, run: duplicateSelectedKeys }),
@@ -1011,8 +1011,8 @@ export default function AnimationEditor() {
         when: () => hasClip() && (selectedKeysRef.current.size > 0 || selectedTracks.size > 0 || selectedTrack != null),
         run: () => { if (selectedKeysRef.current.size) deleteSelectedKeys(); else removeSelectedTracks(); },
       }),
-    ];
-    return () => { for (const off of offs) off(); };
+    ]);
+    return offBindings;
   }, [stepFrame, jumpKey, addKeyAll, deleteSelectedKeys, scrub, copyKeys, pasteKeys, nudgeSelectedKeys,
       nudgeValueSelected, toggleBreakSelected, removeSelectedTracks, duplicateSelectedKeys,
       selectedTracks, selectedTrack, setViewport, hmrEpoch]);

@@ -73,6 +73,16 @@
  * asymmetry the readers implement: a match refuses, a mismatch allows, and an ABSENT model is
  * "cannot tell", never "different".
  *
+ * ── One phone, several `ios:` spellings — closed (#1078) ──
+ * A narrower gap lived INSIDE the `ios:` namespace. `devicectl --device` accepts a CoreDevice
+ * identifier, an ECID, a serial number or a name as well as the UDID, and a claim was keyed by whichever
+ * string the command passed, while every claim the editor takes is keyed by UDID. So a `devicectl`
+ * command naming the identifier neither saw a sibling's claim nor was covered by this clone's own. The
+ * guard's two edges now resolve an `ios:` id to its UDID first (`iosDeviceIdentity.mjs`): the hook and
+ * `device run` compare under the UDID (and the raw spelling), and `device claim` stores the UDID or
+ * refuses. This store stays a plain string map on purpose — resolving needs `xcrun`, and the editor's
+ * own writers already have the UDID in hand.
+ *
  * ── Implementation lives here, in a plain .mjs (#285) ──
  * This module is plain ESM JavaScript (not TypeScript) so a standalone Node CLI script — the
  * #285 claim guard that wraps raw `adb`/`xcodebuild`/`devicectl` calls outside the MCP surface —

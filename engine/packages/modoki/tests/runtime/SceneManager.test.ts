@@ -207,6 +207,35 @@ describe('SceneManager — basic load', () => {
     expect(current!.state).toBe('active');
   });
 
+  /** #953 — `fireSceneCallbacks` filters by pattern, then fans out through `notifyListeners`. A
+   *  callback that throws must not starve a later MATCHING one, a non-matching pattern must never
+   *  be called, and the Map is walked LIVE: a match that unregisters a later match before it is
+   *  reached stops it firing, as the pre-#953 loop did (a snapshot would still fire it). Driven
+   *  through a real `loadScene`, which is the only caller. */
+  it('a throwing onSceneLoaded callback does not starve the next match, and a non-match never fires', async () => {
+    defineSceneA();
+    const { sceneManager } = await getSceneManager();
+    const { getCurrentWorld } = await getWorld();
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    // Destroy the promoted world when done, registered up front: koota's 16-world pool survives
+    // `vi.resetModules()`, so a test that promotes a world and walks away starves a LATER test in
+    // this file (measured: without this, the #888 and beforeSwap tests died of pool exhaustion).
+    onTestFinished(() => { errSpy.mockRestore(); getCurrentWorld().destroy(); });
+    const ran: string[] = [];
+    sceneManager.registerSceneCallback('*', () => { throw new Error('bad scene callback'); });
+    sceneManager.registerSceneCallback('sceneA', () => {
+      ran.push('sceneA');
+      sceneManager.unregisterSceneCallback('A.json'); // a LATER match, not yet reached
+    });
+    sceneManager.registerSceneCallback('A.json', () => { ran.push('A.json'); });
+    sceneManager.registerSceneCallback('sceneZ', () => { ran.push('sceneZ'); });
+
+    await sceneManager.loadScene('/sceneA.json');
+
+    expect(ran).toEqual(['sceneA']);
+    expect(errSpy.mock.calls.some((c) => String(c[0]).includes('[SceneManager:onSceneLoaded]'))).toBe(true);
+  });
+
   /** #91 — the dev server answers an unknown path with a 200 OK `index.html` (its SPA fallback),
    *  so `res.ok` is true, there is no 404, and a bare `res.json()` throws
    *  `SyntaxError: Unexpected token '<', "<!doctype "…` — which reads as a CORRUPT scene when the

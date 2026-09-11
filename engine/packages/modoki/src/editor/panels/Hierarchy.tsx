@@ -17,7 +17,7 @@ import { sceneManager } from '../../runtime/scene/SceneManager';
 import { aSceneSwapIsHappening } from '../scene/playMode';
 import { assetDisplayName } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
-import { register } from '../input/keymap';
+import { register, registerBindings } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { pushAction } from '../undo/undoManager';
 import { makePrefabInstantiateAction } from '../undo/prefabInstantiateUndo';
@@ -1129,7 +1129,7 @@ export default function Hierarchy() {
     /** Register one selection command in every panel that shows the selection. */
     const each = (id: string, keys: string, when: () => boolean, run: () => void) =>
       SCOPES.map((scope) => register({ id: `${scope}.${id}`, keys, scope, when, run }));
-    const offs = [
+    const offBindings = registerBindings(() => [
       ...each('paste', 'mod+v',
         () => !!kbdRef.current.entityClipboard && noTextSelection(),
         () => kbdRef.current.handlePaste(kbdRef.current.selectedId ?? 0)),
@@ -1175,14 +1175,14 @@ export default function Hierarchy() {
           const ids = deletableIds();
           if (ids.length > 0) deleteEntitiesWithUndo(ids, kbdRef.current.setSelectionRaw);
         })),
-    ];
+    ]);
     function deletableIds(): number[] {
       const { selectedId, selectedEntityIds } = kbdRef.current;
       const resourceIds = new Set(getAllEntities().filter((en) => en.isResource).map((en) => en.id));
       return (selectedEntityIds.length > 0 ? selectedEntityIds : (selectedId != null ? [selectedId] : []))
         .filter((id) => id !== 0 && !resourceIds.has(id));
     }
-    return () => { for (const off of offs) off(); };
+    return offBindings;
     // `hmrEpoch` (0 in production) re-runs this on a hot update — Fast Refresh re-renders
     // the panel but never re-runs a []-deps effect, so without it an edited/added binding
     // silently never reaches the registry. See input/hmrEpoch.ts.

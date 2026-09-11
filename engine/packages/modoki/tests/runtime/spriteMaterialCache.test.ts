@@ -307,6 +307,20 @@ describe('ensureSpriteMaterial', () => {
     expect(onReady).toHaveBeenCalledTimes(1);
     expect(onReady2).toHaveBeenCalledTimes(1);
   });
+
+  it('clearSpriteMaterialCache: a waiter that throws does not starve the waiters after it (#953)', () => {
+    paths.set('g1', 'mat.shader.json');
+    build.mockReturnValue(new Promise(() => {})); // in flight forever, so both waiters stay parked
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const second = vi.fn();
+    cache.ensureSpriteMaterial('g1', () => { throw new Error('bad wake'); });
+    cache.ensureSpriteMaterial('g1', second);
+
+    expect(() => cache.clearSpriteMaterialCache()).not.toThrow();
+
+    expect(second, 'every map is already cleared, so a starved wake is never fired again').toHaveBeenCalledTimes(1);
+    expect(errSpy).toHaveBeenCalled();
+  });
 });
 
 // #852: `invalidateShader` used to be a thin wrapper around the wholesale `clearSpriteMaterialCache`
@@ -351,6 +365,25 @@ describe('invalidateShader (#852 per-key)', () => {
     expect(cache.getSpriteMaterialProgram(GUID_A)).toBe(programA);
     expect(build).toHaveBeenCalledTimes(3); // A, B, A again
     expect(invalidateProgram).toHaveBeenCalledWith(PATH_A); // the pixiShaderBuilder optimisation still runs
+  });
+
+  it('a waiter that throws skips neither the waiters after it nor the pixiShaderBuilder eviction (#953)', async () => {
+    // Pre-#953 the per-key wake was a bare loop, so a throw escaped `invalidateShader` BEFORE its
+    // last statement, `invalidatePixiShaderProgram(manifestPath)`: the edit silently did not take.
+    const { registerAsset } = await import('../../src/runtime/loaders/assetManifest');
+    paths.set(GUID_A, PATH_A);
+    registerAsset(GUID_A, PATH_A, 'shader');
+    build.mockReturnValue(new Promise(() => {})); // in flight forever, so both waiters stay parked
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const second = vi.fn();
+    cache.ensureSpriteMaterial(GUID_A, () => { throw new Error('bad wake'); });
+    cache.ensureSpriteMaterial(GUID_A, second);
+
+    expect(() => cache.invalidateShader(PATH_A)).not.toThrow();
+
+    expect(second).toHaveBeenCalledTimes(1);
+    expect(invalidateProgram).toHaveBeenCalledWith(PATH_A);
+    expect(errSpy).toHaveBeenCalled();
   });
 
   it('resolves a WATCHER-shaped path (a leading-slash asset URL, not a bare relative path invented by a test)', async () => {

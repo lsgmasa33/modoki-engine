@@ -28,9 +28,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { claimDevice, iosDeviceId, releaseDevice } from './deviceClaims';
+import { createTeardownToken } from '../../packages/modoki/src/runtime/core/liveness';
 import { wdaBaseDir, detect as detectTool } from '../../toolchain';
 import { listGoIosUdids, goIosDeviceInfo } from './goIosDevice';
 import { findXctestrun, wdaDerivedDataDir } from '../../toolchain/wdaProvision';
+import { randomUUID } from 'node:crypto';
+import { modokiStateDir } from './deviceStateDir';
+import { reapDeps } from './iosUsbForward';
 
 /** One iOS device `xcodebuild` could target. `connected` = a live tunnel right now.
  *
@@ -520,6 +524,16 @@ let launchWarning: string | null = null;
 /** The machine-wide hardware claim this launch holds (#149), so `stopWda` hands back exactly what
  *  the launch took. Null when no agent is running. */
 let claimedUdid: string | null = null;
+/** The state dir holding this launch's pid record (#1077) — see `reapRecordedWdaAgent`. Null when none. */
+let recordDir: string | null = null;
+/** Invalidated by `stopWda`, i.e. by every ending of a lease. A launch captures it on entry and re-checks it
+ *  after each `await`: a launch still waiting on a probe, or in its poll loop, when the lease ends must not
+ *  claim, spawn, latch a failure or report on the NEXT lease. Found by #1077's close-out review and
+ *  reproduced: a tap mid-probe during a `device_connect` to another phone spawned onto the old one, under the
+ *  new lease. The shared teardown token, not a hand-rolled counter (#573, docs/async-lifetime.md). */
+const launchToken = createTeardownToken();
+const LEASE_ENDED_REASON = 'the device lease ended while WebDriverAgent was starting, so that launch was abandoned — '
+  + 'the next input op starts fresh';
 
 /** How much of the child's stderr to keep. Both bounds matter: a test runner can emit megabytes,
  *  and one line of it can itself be enormous. */
@@ -594,10 +608,113 @@ export function pickWdaFailureLine(lines: string[]): string | null {
 /** True when we have a live agent process we started. */
 export function isWdaProcessRunning(): boolean { return !!child && child.exitCode === null && !child.killed; }
 
-/** Stop the agent we started. Called when the lease drops (Decision 2: WDA is torn down with the
- *  lease, so disconnecting can never strand a signed agent running on the phone). */
-export function stopWda(): void {
+// ── An agent left running by an editor that died without stopping it (#1077) ─────────────────────────
+//
+// `stopWda` runs from `DeviceConnectionManager.disconnect()` and from the quit teardown, and neither runs
+// when the editor is ended by SIGTERM (`stop-editor.sh`), a crash or `kill -9`. The `xcodebuild` child is
+// not killed with the editor on macOS: it is re-parented and keeps a signed agent running on the phone.
+// MEASURED 2026-09-11 on the iPad mini 5, twice: after `npm run editor:stop` the agent kept running with
+// ppid 1. Its claim expires on pid liveness, so the phone then looks free to every clone while the agent
+// still runs. Two closures:
+//   - the per-clone pid record below, reaped by the next start of this clone's backend. This is the one
+//     that covers the Electron editor (measured: the orphan was killed on relaunch, its record removed,
+//     the dead pid's claims swept).
+//   - an `exit` hook, for a backend host that does run Node's `exit` event on its way out. It does NOT fire
+//     when the Electron editor takes a SIGTERM (measured: neither it nor the claims store's own hook ran).
+
+/** The pid record's file name inside the clone's state dir. */
+export const WDA_RECORD_FILE = 'wda-agent.json';
+
+interface WdaAgentRecord {
+  pid: number;
+  /** The `.xctestrun` the agent runs — what a recycled pid will not be running. */
+  xctestrun: string;
+  /** `ps -o lstart=` of the pid when it was recorded. The `.xctestrun` path sits under the machine-wide
+   *  toolchain dir, so ANOTHER clone's agent that reused the pid would pass the command check; its start time
+   *  does not (#1077's close-out review). Null when `ps` could not say — such a record is never reaped. */
+  startedAt: string | null;
+  /** The backend process that launched it. While it lives, the agent is not an orphan. */
+  owner: number;
+  /** WHICH load of this module inside `owner` — a pid alone cannot tell a live load from an abandoned one
+   *  (`iosUsbForward.ts`'s `OWNER_INSTANCE` has the measurement). */
+  instance: string;
+}
+
+const OWNER_INSTANCE = randomUUID();
+
+/** Where the record goes by default: the clone's state dir, or a per-worker temp dir under vitest — never
+ *  the repo's own `.modoki` from a test. The same interlock `claimsDir()` has, and for the same reason:
+ *  every `ensureWdaRunning` test launches a (fake) agent. */
+function defaultRecordDir(): string {
+  return process.env.VITEST ? path.join(os.tmpdir(), `modoki-wda-vitest-${process.pid}`) : modokiStateDir();
+}
+
+function recordWdaAgent(dir: string, rec: Omit<WdaAgentRecord, 'owner' | 'instance'>): void {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, WDA_RECORD_FILE), JSON.stringify({ owner: process.pid, instance: OWNER_INSTANCE, ...rec }));
+  } catch { /* non-fatal: only the startup reap loses its evidence */ }
+}
+
+/** Drop the record — only if it still describes `pid`, so a newer agent's record survives. */
+function clearWdaRecord(dir: string | null, pid: number | undefined): void {
+  if (!dir) return;
+  const file = path.join(dir, WDA_RECORD_FILE);
+  try {
+    const rec = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<WdaAgentRecord>;
+    if (rec.pid === pid) fs.rmSync(file, { force: true });
+  } catch { /* no record */ }
+}
+
+/** The `exit` hook's body: kill the running agent. `child.kill()` is synchronous, the only kind of work an
+ *  `exit` handler can do. The record is KEPT on purpose, so a startup reap still finds an agent that did not
+ *  die of the signal. Exported for its test. */
+export function killWdaChildOnExit(): void {
   if (child && child.exitCode === null) { try { child.kill(); } catch { /* already gone */ } }
+}
+
+let exitHookInstalled = false;
+/** Registered lazily, on the first launch. `exit` only: a SIGTERM/SIGINT listener would suppress Node's
+ *  default terminate-on-signal behaviour — the trade `deviceClaimsStore.mjs` declines for the same reason. */
+function installWdaExitHook(): void {
+  if (exitHookInstalled) return;
+  exitHookInstalled = true;
+  process.on('exit', killWdaChildOnExit);
+}
+
+/** Kill the agent a previous run of THIS clone recorded, if that pid is still that agent and the backend
+ *  that launched it is gone. Called by `reclaimStaleDeviceStateAtStartup`; returns a log line when it
+ *  killed one. The ownership rule is `reapRecordedIosForward`'s: a LIVE owner — another process still
+ *  running, or this module load — keeps its agent and record. A pid whose command line is no longer
+ *  `test-without-building` with the recorded `.xctestrun` is a recycled pid, and is left alone. */
+export function reapRecordedWdaAgent(dir: string): string | null {
+  const file = path.join(dir, WDA_RECORD_FILE);
+  let rec: Partial<WdaAgentRecord>;
+  try { rec = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<WdaAgentRecord>; } catch { return null; }
+  const liveElsewhere = typeof rec.owner === 'number' && rec.owner !== process.pid && reapDeps.isAlive(rec.owner);
+  const liveHere = rec.owner === process.pid && rec.instance === OWNER_INSTANCE;
+  if (liveElsewhere || liveHere) return null;
+  try { fs.rmSync(file, { force: true }); } catch { /* */ }
+  if (typeof rec.pid !== 'number' || typeof rec.xctestrun !== 'string') return null;
+  const command = reapDeps.commandOf(rec.pid);
+  if (!command || !command.includes('test-without-building') || !command.includes(rec.xctestrun)) return null;
+  if (typeof rec.startedAt !== 'string' || reapDeps.startTimeOf(rec.pid) !== rec.startedAt) return null;
+  try { reapDeps.kill(rec.pid); } catch { return null; }
+  return `[device] reaped a WebDriverAgent (pid ${rec.pid}) left running on the phone by a previous run`;
+}
+
+/** Stop the agent we started (Decision 2: WDA is torn down with the lease — an ending that runs no teardown
+ *  at all is left to `reapRecordedWdaAgent`). Called by `DeviceConnectionManager.disconnect()` — which
+ *  an explicit Disconnect, a `device_connect` that supersedes the lease, and a USB forward dying mid-lease
+ *  all run through — and by `releaseDeviceResourcesOnExit` on quit. It used to be called only by the
+ *  Disconnect ROUTE, so a superseding connect left the agent and its `ios:<udid>` claim behind (#1077). */
+export function stopWda(): void {
+  launchToken.invalidateAll();
+  const stoppedPid = child?.pid;
+  if (child && child.exitCode === null) { try { child.kill(); } catch { /* already gone */ } }
+  // Stopped deliberately, so there is nothing left for a startup reap to find (#1077).
+  clearWdaRecord(recordDir, stoppedPid);
+  recordDir = null;
   child = null;
   launchStartedAt = null;
   lastFailure = null;
@@ -625,6 +742,8 @@ export interface EnsureWdaRunningOpts {
   /** What the LEASED device says its own hardware is, so the launch can be tied to that phone
    *  rather than to whatever is plugged into this Mac (#146). Absent/null fields ⇒ unverified. */
   lease?: LeaseHardware;
+  /** Where the agent's pid record goes (#1077). Defaults to the clone's state dir; injected by tests. */
+  stateDir?: string;
   /** Injected for tests. */
   probe?: (url: string) => Promise<boolean>;
   spawnImpl?: typeof spawn;
@@ -684,6 +803,7 @@ async function defaultProbe(url: string): Promise<boolean> {
 export async function ensureWdaRunning(opts: EnsureWdaRunningOpts): Promise<{ running: boolean; reason?: string }> {
   const probe = opts.probe ?? defaultProbe;
   const statusUrl = `http://${opts.host}:${opts.port}/status`;
+  const launchLive = launchToken.capture();
 
   // Off macOS there is NOTHING to reach and nothing to start, so refuse FIRST — before spending a
   // network probe (#99).
@@ -709,6 +829,9 @@ export async function ensureWdaRunning(opts: EnsureWdaRunningOpts): Promise<{ ru
 
   // Already up — including a WDA someone started by hand, which must not be duplicated.
   if (await probe(statusUrl)) return { running: true };
+  // The lease ended while that probe was out: everything below claims, spawns or latches for a lease that is
+  // gone. Not latched itself — it describes this call, not the device.
+  if (!launchLive()) return { running: false, reason: LEASE_ENDED_REASON };
 
   // ⚠️ INVARIANT: from this guard down to `child = spawnFn(...)` there must be NO `await`. That
   // synchronous window is the ONLY thing making check-and-set atomic, which is what lets this
@@ -807,13 +930,26 @@ export async function ensureWdaRunning(opts: EnsureWdaRunningOpts): Promise<{ ru
   // discarded — a test runner's log is not something an input op should stream — but stderr is
   // PIPED into a small ring buffer so a failure can name its own cause (#144, `captureStderr`).
   const spawnFn = opts.spawnImpl ?? spawn;
-  child = spawnFn('xcodebuild', [
+  const spawned = spawnFn('xcodebuild', [
     'test-without-building',
     '-xctestrun', xctestrun,
     '-destination', `id=${resolved.device.udid}`,
   ], { stdio: ['ignore', 'ignore', 'pipe'] });
-  captureStderr(child);
-  child.on('exit', () => { child = null; launchStartedAt = null; });
+  child = spawned;
+  captureStderr(spawned);
+  // Outlive-the-editor closures (#1077): record the pid for a startup reap, and kill the child from an
+  // `exit` hook. Both are synchronous, so the no-await invariant above is untouched.
+  const dir = opts.stateDir ?? defaultRecordDir();
+  if (typeof spawned.pid === 'number') {
+    recordWdaAgent(dir, { pid: spawned.pid, xctestrun, startedAt: reapDeps.startTimeOf(spawned.pid) });
+    recordDir = dir;
+  }
+  installWdaExitHook();
+  spawned.on('exit', () => {
+    clearWdaRecord(dir, spawned.pid);
+    // Only while it is still the current agent: a stopWda + relaunch may already have replaced it.
+    if (child === spawned) { child = null; launchStartedAt = null; }
+  });
   launchStartedAt = nowFn();
 
   // Poll rather than parse the log: readiness is a property of the SERVER, and `/status` answering
@@ -822,8 +958,12 @@ export async function ensureWdaRunning(opts: EnsureWdaRunningOpts): Promise<{ ru
   const deadline = nowFn() + (opts.timeoutMs ?? DEFAULT_LAUNCH_TIMEOUT_MS);
   while (nowFn() < deadline) {
     await sleep(1000);
+    if (!launchLive()) return { running: false, reason: LEASE_ENDED_REASON };
     if (await probe(statusUrl)) return { running: true };
-    if (!child) break;   // the test process died — no point waiting out the clock
+    // `!child`, not `child !== spawned`: when THIS agent exited and another op has already relaunched, the new
+    // agent is the one worth waiting for. The identity check gave up on a healthy relaunch and reported the
+    // exit with the relaunch's wiped stderr (#1077's close-out re-review); a `stopWda` is the liveness return above.
+    if (!child) break;
   }
 
   // Do NOT latch this one: a timeout can be a slow first install, and a later call may well find it
@@ -868,7 +1008,9 @@ function withLaunchWarning(reason: string): string {
  *  message self-diagnosing without inventing a give-up policy: 20s reads as normal, 5 minutes reads
  *  as wedged, and the reader can tell which without knowing our timeouts. The escape hatch is named
  *  for the same reason — reconnecting the lease runs `stopWda()`, so there IS a way to start over,
- *  and a message that admits no way out invites someone to invent one. */
+ *  and a message that admits no way out invites someone to invent one. Any reconnect counts, including
+ *  a bare `device_connect` to the same device: `connect()` begins with `disconnect()`, which stops the
+ *  agent (#1077 — before that only the Disconnect route did, and this sentence was false). */
 function launchInProgressReason(nowMs: number): string {
   const secs = launchStartedAt === null ? 0 : Math.max(0, Math.round((nowMs - launchStartedAt) / 1000));
   return withLaunchWarning(
@@ -880,5 +1022,5 @@ function launchInProgressReason(nowMs: number): string {
 
 /** Test seam — forget any process handle and latched failure. */
 export function _resetWdaLauncherForTests(): void {
-  child = null; launchStartedAt = null; lastFailure = null; launchWarning = null; stderrTail = [];
+  child = null; launchStartedAt = null; lastFailure = null; launchWarning = null; stderrTail = []; recordDir = null;
 }

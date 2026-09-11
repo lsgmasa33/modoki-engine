@@ -21,6 +21,7 @@
 import type { Entity, World } from 'koota';
 import { getCurrentWorld } from '../core/ecs/world';
 import type { ManagerDef } from '../core/managerTypes';
+import { notifyListeners } from '../core/notifyListeners';
 
 export type ZonePhase = 'enter' | 'exit';
 /** `(zone, other, phase)` — `zone` is the `Zone2D`/`Zone3D` entity, `other` the `ZoneOccupant`. */
@@ -43,8 +44,11 @@ function phaseFilter(want: ZonePhase, cb: (zone: Entity, other: Entity) => void)
 }
 
 /** Build a zone event bus + its scene-scoped manager. `managerName` is the ManagerDef name
- *  (e.g. 'Zone2DEvents'); `logTag` prefixes handler-threw warnings (e.g. 'zone2DEvents'). */
+ *  (e.g. 'Zone2DEvents'); `logTag` names the bus in the report when a handler throws (e.g.
+ *  'zone2DEvents'). That report is `notifyListeners`' `console.error`: a game handler that throws
+ *  spends the crash budget like any other listener defect (owner ruling on #953). */
 export function createZoneEventBus(managerName: string, logTag: string): { events: ZoneEventBus; manager: ManagerDef } {
+  const zoneLabel = `${logTag}:zone`;
   const subsByWorld = new WeakMap<World, Set<ZoneHandler>>();
   const subsFor = (world: World): Set<ZoneHandler> => {
     let s = subsByWorld.get(world);
@@ -63,7 +67,7 @@ export function createZoneEventBus(managerName: string, logTag: string): { event
     __emitZone(world, zone, other, phase) {
       const s = subsByWorld.get(world);
       if (!s || s.size === 0) return;
-      for (const cb of s) { try { cb(zone, other, phase); } catch (e) { console.warn(`[${logTag}] zone handler threw`, e); } }
+      notifyListeners(s, zoneLabel, [zone, other, phase]);
     },
     __clear(world) { subsByWorld.delete(world); },
   };

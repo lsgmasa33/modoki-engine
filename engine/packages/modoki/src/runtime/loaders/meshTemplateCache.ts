@@ -29,6 +29,7 @@ import { clearParticleCache } from './particleCache';
 import { fireDirtyListeners } from '../core/ecs/entityUtils';
 import { emitAssetInvalidated, onAssetInvalidated } from '../core/assetInvalidation';
 import { createTeardownToken } from '../core/liveness';
+import { notifyListeners } from '../core/notifyListeners';
 import { clearAnimationClipCache } from './animationClipCache';
 import { clearTimelineCache } from './timelineCache';
 import { clearControlSpawns } from '../timeline/controlSpawnRegistry';
@@ -2149,8 +2150,11 @@ export function registerEnvDisposeHook(key: string, fn: (tex: THREE.DataTexture)
   envDisposeHooks.set(key, fn);
 }
 
+/** Isolated per hook (#953). Every caller disposes `tex` on the next statement, and two of them run
+ *  inside the `disposeAllCachedResources` sweep, so a throwing hook used to skip that texture's
+ *  `dispose()`, every later env in the sweep, and the rest of the teardown after it. */
 function runEnvDisposeHooks(tex: THREE.DataTexture): void {
-  for (const fn of envDisposeHooks.values()) fn(tex);
+  notifyListeners(envDisposeHooks.values(), 'MeshCache:envDisposeHook', [tex]);
 }
 
 function fetchEnvironment(hdrPath: string): Promise<void> {

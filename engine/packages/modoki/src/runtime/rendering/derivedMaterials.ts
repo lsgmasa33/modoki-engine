@@ -27,6 +27,7 @@
 
 import * as THREE from 'three';
 import { onWorldSwap } from '../core/ecs/world';
+import { notifyListeners } from '../core/notifyListeners';
 import { carryMaterialExtras } from './materialExtras';
 
 /** `userData` key holding the material this one was cloned from.
@@ -189,7 +190,9 @@ export function disposeRetiredDerivedMaterial(clone: THREE.Material): void {
 function disposeAllRetiredDerived(): void {
   const pending = [...retiredDerived.values()];
   retiredDerived.clear();
-  for (const dispose of pending) dispose();
+  // Isolated per disposer (#953): the queue is already cleared, so a throwing dispose used to leak
+  // every clone behind it on the GPU with nothing left that could ever free it.
+  notifyListeners(pending, 'derivedMaterials:disposeAllRetired', []);
 }
 
 onWorldSwap(disposeAllRetiredDerived);

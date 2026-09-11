@@ -13,6 +13,7 @@ if (import.meta.hot) import.meta.hot.accept(() => { window.location.reload(); })
  *  Games call this with their config, postprocessors, traits, and custom panels. */
 
 import React from 'react';
+import { notifyListeners } from '../runtime/core/notifyListeners';
 import type { GameConfig } from '../runtime/core/config';
 import type { EditorPanelDef } from '../runtime/core/gameDefinition';
 import type { TraitMeta } from '../runtime/core/ecs/traitRegistry';
@@ -603,7 +604,7 @@ export function getExtraMenus() { return _reg.extraMenus; }
 export function setExtraMenus(menus: NonNullable<EditorOptions['extraMenus']>): void {
   _reg.extraMenus = menus;
   _reg.extraMenusVersion++;
-  for (const l of _reg.extraMenuListeners) l();
+  notifyListeners(_reg.extraMenuListeners, 'createEditor:extraMenus', []);
 }
 
 export function subscribeExtraMenus(cb: () => void): () => void {

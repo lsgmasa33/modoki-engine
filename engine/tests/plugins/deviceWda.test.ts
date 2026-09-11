@@ -1,13 +1,14 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
   resolveWdaPort, DEFAULT_WDA_PORT, makeWdaSession, wdaTap, wdaDrag,
   getDeviceWdaSession, tryDeviceWdaInput, isDeviceWdaAvailable, isWdaRoutableMethod,
-  _resetDeviceWdaStateForTests, TRUSTED_WDA_MECHANISM,
+  _resetDeviceWdaStateForTests, endDeviceWdaLease, TRUSTED_WDA_MECHANISM,
   tryDeviceWdaScreenshot, pngDimensions, WDA_SHOT_NO_SESSION_REASON, WDA_SHOT_COORDINATE_WARNING,
-  WDA_NOT_RUNNING_REASON, WDA_SESSION_LOST_REASON,
+  WDA_NOT_RUNNING_REASON, WDA_SESSION_LOST_REASON, WDA_LEASE_ENDED_REASON,
   type WdaFetch, type WdaSession,
 } from '../../plugins/backend/deviceWda';
 import { STALE_APP_REASON } from '../../plugins/backend/deviceAim';
+import { _resetWdaLauncherForTests, stopWda } from '../../plugins/backend/wdaLauncher';
 
 /**
  * iOS trusted input via WebDriverAgent (#32 Phase 2). Everything here is pinned against behaviour
@@ -152,6 +153,68 @@ describe('getDeviceWdaSession', () => {
     const s2 = await getDeviceWdaSession({ host: '10.0.0.5', port: 8101, fetchImpl: f2 });
     expect(s2?.sessionId).toBe('S-8101');
   });
+
+  // Found by #1077's close-out review: a call still launching or opening a session when the lease ends
+  // wrote its result onto the NEXT lease, after `endDeviceWdaLease` had already reset it.
+  it('a launch failure that lands after the lease ended is not reported for the next lease (#1077)', async () => {
+    // The real launcher runs here: keep it from finding a real toolchain, and so a real phone.
+    vi.stubEnv('MODOKI_TOOLCHAIN_DIR', '');
+    try {
+      // The premise, first: with no lease ending in between, the launch failure IS the fallback's reason.
+      expect(await getDeviceWdaSession({ host: '127.0.0.1', port: 1, autoLaunch: true, fetchImpl: fakeFetch({}) })).toBeNull();
+      expect(await tryDeviceWdaScreenshot({ host: '127.0.0.1', getSession: async () => null }))
+        .not.toEqual({ handled: false, reason: WDA_SHOT_NO_SESSION_REASON });
+      endDeviceWdaLease();
+
+      const pending = getDeviceWdaSession({ host: '127.0.0.1', port: 1, autoLaunch: true, fetchImpl: fakeFetch({}) });
+      endDeviceWdaLease();   // the lease ends while that launch is still out
+      expect(await pending).toBeNull();
+      expect(await tryDeviceWdaScreenshot({ host: '127.0.0.1', getSession: async () => null }))
+        .toEqual({ handled: false, reason: WDA_SHOT_NO_SESSION_REASON });
+    } finally {
+      vi.unstubAllEnvs();
+      _resetWdaLauncherForTests();
+    }
+  });
+
+  it('a session opened after the lease ended is not cached for the next lease (#1077)', async () => {
+    let openSession!: () => void;
+    const gate = new Promise<void>((r) => { openSession = r; });
+    const base = fakeFetch({ '/status': OK, '/session': { sessionId: 'S-OLD', value: null } });
+    const slow = (async (url: string, init?: { method?: string; body?: string }) => {
+      if (url.endsWith('/session')) await gate;
+      return base(url, init);
+    }) as WdaFetch;
+    const pending = getDeviceWdaSession({ host: '10.0.0.5', fetchImpl: slow });
+    await vi.waitFor(() => expect(base.calls.some((c) => c.url.endsWith('/status'))).toBe(true));
+    endDeviceWdaLease();
+    openSession();
+    expect(await pending).toBeNull();
+    const fresh = fakeFetch({ '/status': OK, '/session': { sessionId: 'S-NEW', value: null } });
+    expect((await getDeviceWdaSession({ host: '10.0.0.5', fetchImpl: fresh }))?.sessionId).toBe('S-NEW');
+  });
+
+  it('a lease that ends while the launcher module is loading starts no launch (#1077)', async () => {
+    // `getDeviceWdaSession` runs synchronously up to `await import('./wdaLauncher')`, so ending the lease right after
+    // the call lands INSIDE that await — where `ensureWdaRunning` would otherwise capture a fresh launch token. The
+    // observable is the launcher's `/status` probe (global fetch). Falsifiable on macOS, where these run: elsewhere
+    // the launcher refuses on platform before probing, so nothing is read either way.
+    const probed: string[] = [];
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      probed.push(String(input));
+      throw new Error('connection refused');
+    });
+    try {
+      const pending = getDeviceWdaSession({ host: '10.0.0.5', autoLaunch: true, fetchImpl: fakeFetch({}) });
+      endDeviceWdaLease();
+      stopWda();   // what `disconnect()` runs alongside it
+      expect(await pending).toBeNull();
+      expect(probed).toEqual([]);
+    } finally {
+      fetchSpy.mockRestore();
+      _resetWdaLauncherForTests();
+    }
+  });
 });
 
 // ── Routing ───────────────────────────────────────────────────────────────────
@@ -195,6 +258,91 @@ describe('tryDeviceWdaInput — what iOS routes, and what it deliberately does n
     const r = await tryDeviceWdaInput('tap', {}, { proxy: async () => aimString(1, 2), getSession: async () => null });
     expect(r).toEqual({ handled: false, reason: WDA_NOT_RUNNING_REASON });
     expect(WDA_NOT_RUNNING_REASON).toMatch(/Build Support/);   // says what to DO
+  });
+
+  it('refuses an input op whose lease ended while it was starting the agent — no synthetic fallback (#1077)', async () => {
+    // Falling back here would send the tap to whatever device the lease holds NOW, under a Build Support banner.
+    const r = await tryDeviceWdaInput('tap', { x: 1, y: 2 }, {
+      proxy: async () => aimString(1, 2),
+      host: 'd',
+      getSession: async () => { endDeviceWdaLease(); return null; },
+    });
+    expect(r).toEqual({ handled: true, reply: `Error: ${WDA_LEASE_ENDED_REASON}` });
+  });
+
+  it('refuses, and sends nothing, when the lease ends while the tap is being aimed (#1077)', async () => {
+    // The aim came through the lease's proxy, so after a lease change it is the NEW device's aim.
+    const session = sessionStub();
+    const r = await tryDeviceWdaInput('tap', { x: 1, y: 2 }, {
+      host: 'd',
+      getSession: async () => session,
+      proxy: async () => { endDeviceWdaLease(); return aimString(1, 2); },
+    });
+    expect(r).toEqual({ handled: true, reply: `Error: ${WDA_LEASE_ENDED_REASON}` });
+    expect(session.sent).toEqual([]);
+  });
+
+  // The next three answer `Unknown method` from the NEW lease's device where they can: an app build predating
+  // `resolve-aim` takes the `unsupported` branch, which falls back synthetically onto that device. A proxy that
+  // always returns a valid aim let either drag check be deleted with this suite green (round-3 review).
+  it('refuses a tap whose aim came from a NEW-lease device whose app predates resolve-aim (#1077)', async () => {
+    const session = sessionStub();
+    const r = await tryDeviceWdaInput('tap', { x: 1, y: 2 }, {
+      host: 'd',
+      getSession: async () => session,
+      proxy: async () => { endDeviceWdaLease(); return 'Unknown method: resolve-aim'; },
+    });
+    expect(r).toEqual({ handled: true, reply: `Error: ${WDA_LEASE_ENDED_REASON}` });
+    expect(session.sent).toEqual([]);
+  });
+
+  it('refuses a drag when the lease ends while its START point is aimed, on an app predating resolve-aim (#1077)', async () => {
+    const session = sessionStub();
+    let call = 0;
+    const r = await tryDeviceWdaInput('drag', { fromX: 1, fromY: 2, toX: 3, toY: 4 }, {
+      host: 'd',
+      getSession: async () => session,
+      proxy: async () => {
+        if (++call === 1) { endDeviceWdaLease(); return 'Unknown method: resolve-aim'; }
+        return aimString(3, 4);
+      },
+    });
+    expect(r).toEqual({ handled: true, reply: `Error: ${WDA_LEASE_ENDED_REASON}` });
+    expect(session.sent).toEqual([]);
+  });
+
+  it('refuses a drag when the lease ends while its END point is aimed, on an app predating resolve-aim (#1077)', async () => {
+    const session = sessionStub();
+    let call = 0;
+    const r = await tryDeviceWdaInput('drag', { fromX: 1, fromY: 2, toX: 3, toY: 4 }, {
+      host: 'd',
+      getSession: async () => session,
+      proxy: async () => {
+        if (++call === 1) return aimString(1, 2);
+        endDeviceWdaLease(); return 'Unknown method: resolve-aim';
+      },
+    });
+    expect(r).toEqual({ handled: true, reply: `Error: ${WDA_LEASE_ENDED_REASON}` });
+    expect(session.sent).toEqual([]);
+  });
+
+  it('refuses a drag, and sends nothing, when the lease ends while its end point is aimed (#1077)', async () => {
+    const session = sessionStub();
+    let call = 0;
+    const r = await tryDeviceWdaInput('drag', { fromX: 1, fromY: 2, toX: 3, toY: 4 }, {
+      host: 'd',
+      getSession: async () => session,
+      proxy: async () => { if (++call === 2) endDeviceWdaLease(); return aimString(call, call); },
+    });
+    expect(r).toEqual({ handled: true, reply: `Error: ${WDA_LEASE_ENDED_REASON}` });
+    expect(session.sent).toEqual([]);
+  });
+
+  it('refuses rather than falling back when the gesture fails after the lease ended (#1077)', async () => {
+    const stub = sessionStub();
+    const dying = { ...stub, actions: async () => { endDeviceWdaLease(); throw new Error('agent killed with the lease'); } } as WdaSession;
+    const r = await tryDeviceWdaInput('tap', { x: 1, y: 2 }, { host: 'd', getSession: async () => dying, proxy: async () => aimString(1, 2) });
+    expect(r).toEqual({ handled: true, reply: `Error: ${WDA_LEASE_ENDED_REASON}` });
   });
 
   it('dispatches a tap and reports the WDA mechanism', async () => {
@@ -246,6 +394,32 @@ describe('tryDeviceWdaInput — what iOS routes, and what it deliberately does n
     const r = await tryDeviceWdaInput('tap', {}, { proxy: async () => aimString(1, 2), getSession: async () => s });
     expect(s.released).toBe(1);
     expect(r).toEqual({ handled: false, reason: WDA_SESSION_LOST_REASON });
+  });
+
+  it('a failed gesture whose lease ended keeps the session the NEXT lease cached meanwhile (#1077)', async () => {
+    // `releaseActions` is a network call. If the next lease opens and caches its session while it is out, a reset
+    // after it would drop that session — so the lease check comes first (round-3 review).
+    const next = fakeFetch({ '/status': OK, '/session': { sessionId: 'S-NEXT', value: null } });
+    const old = sessionStub();
+    const dying = {
+      ...old,
+      actions: async () => { endDeviceWdaLease(); throw new Error('agent killed with the lease'); },
+      releaseActions: async () => { await getDeviceWdaSession({ host: '10.0.0.9', fetchImpl: next }); },
+    } as WdaSession;
+    const r = await tryDeviceWdaInput('tap', { x: 1, y: 2 }, { host: 'd', getSession: async () => dying, proxy: async () => aimString(1, 2) });
+    expect(r).toEqual({ handled: true, reply: `Error: ${WDA_LEASE_ENDED_REASON}` });
+    const other = fakeFetch({ '/status': OK, '/session': { sessionId: 'S-OTHER', value: null } });
+    expect((await getDeviceWdaSession({ host: '10.0.0.9', fetchImpl: other }))?.sessionId).toBe('S-NEXT');
+    expect(other.calls).toEqual([]);
+  });
+
+  it('refuses WITHOUT opening a session when the caller\'s lease capture is already stale (#1077)', async () => {
+    // The router read `host` and then awaited; the lease ended meanwhile, so `host` is the previous phone. A later
+    // check would still refuse, but only after launching or opening a session there — hence "not called".
+    const getSession = vi.fn(async () => sessionStub());
+    const r = await tryDeviceWdaInput('tap', { x: 1, y: 2 }, { host: 'd', proxy: async () => aimString(1, 2), getSession, leaseLive: () => false });
+    expect(r).toEqual({ handled: true, reply: `Error: ${WDA_LEASE_ENDED_REASON}` });
+    expect(getSession).not.toHaveBeenCalled();
   });
 });
 
@@ -352,6 +526,11 @@ describe('tryDeviceWdaScreenshot', () => {
     expect(WDA_SHOT_NO_SESSION_REASON).toMatch(/Build Support/);
   });
 
+  it('says the lease ended, not "install it from Build Support", when the lease ended while it was launching (#1077)', async () => {
+    const r = await tryDeviceWdaScreenshot({ host: 'd', getSession: async () => { endDeviceWdaLease(); return null; } }, { autoLaunch: true });
+    expect(r).toEqual({ handled: false, reason: WDA_LEASE_ENDED_REASON });
+  });
+
   it('does NOT auto-launch by default, and does when asked', async () => {
     // A screenshot that silently takes ~6s starting an agent — on the AUTOMATIC fallback path,
     // where nobody asked for WDA — is worse than one that says why it could not help. An explicit
@@ -372,5 +551,26 @@ describe('tryDeviceWdaScreenshot', () => {
     expect(r).toMatchObject({ handled: false });
     if (r.handled) return;
     expect(r.reason).toMatch(/socket hang up/);
+  });
+
+  it('does not report the PREVIOUS phone\'s screen when the lease ends during the capture (#1077)', async () => {
+    const s = sessionStub();
+    s.screenshot = async () => { endDeviceWdaLease(); return pngBase64(390, 844); };
+    const r = await tryDeviceWdaScreenshot({ host: 'd', getSession: async () => s });
+    expect(r).toEqual({ handled: false, reason: WDA_LEASE_ENDED_REASON });
+  });
+
+  it('names the lease ending, not a capture failure, when the capture throws after the lease ended (#1077)', async () => {
+    const s = sessionStub();
+    s.screenshot = async () => { endDeviceWdaLease(); throw new Error('socket hang up'); };
+    const r = await tryDeviceWdaScreenshot({ host: 'd', getSession: async () => s });
+    expect(r).toEqual({ handled: false, reason: WDA_LEASE_ENDED_REASON });
+  });
+
+  it('does not open a session on the previous phone when the caller\'s lease capture is already stale (#1077)', async () => {
+    const getSession = vi.fn(async () => sessionStub());
+    const r = await tryDeviceWdaScreenshot({ host: 'd', getSession, leaseLive: () => false }, { autoLaunch: true });
+    expect(r).toEqual({ handled: false, reason: WDA_LEASE_ENDED_REASON });
+    expect(getSession).not.toHaveBeenCalled();
   });
 });

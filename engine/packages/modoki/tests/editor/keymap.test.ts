@@ -8,7 +8,7 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
-  register, unregister, resolve, clearBindings, getBindings, normalizeChord,
+  register, registerBindings, unregister, resolve, clearBindings, getBindings, normalizeChord,
   chordFromEvent, formatChord, KeymapConflictError, type ResolveContext,
 } from '../../src/editor/input/keymap';
 import {
@@ -94,6 +94,79 @@ describe('register — conflict detection at registration time', () => {
     off();
     expect(getBindings()).toHaveLength(0);
     expect(() => register({ id: 'tmp2', keys: 'g', scope: 'scene', run: noop })).not.toThrow();
+  });
+});
+
+describe('registerBindings — a panel\'s bindings as one unit (#953)', () => {
+  const noop = () => {};
+
+  it('one disposer removes every binding the builder registered', () => {
+    const off = registerBindings(() => [
+      register({ id: 'p.a', keys: 'a', scope: 'scene', run: noop }),
+      register({ id: 'p.b', keys: 'b', scope: 'scene', run: noop }),
+      register({ id: 'p.c', keys: 'c', scope: 'scene', run: noop }),
+    ]);
+    expect(getBindings().map((b) => b.id)).toEqual(['p.a', 'p.b', 'p.c']);
+    off();
+    expect(getBindings()).toHaveLength(0);
+  });
+
+  it('a conflict on the THIRD binding rolls back the first two, then rethrows', () => {
+    // The bare `const offs = [register(…), …]` idiom never received the first two disposers,
+    // because the throw happened while the array literal was still being built. Their bindings
+    // stayed live with nothing able to remove them.
+    register({ id: 'existing', keys: 'g', scope: 'scene', run: noop });
+    expect(() => registerBindings(() => [
+      register({ id: 'p.a', keys: 'a', scope: 'scene', run: noop }),
+      register({ id: 'p.b', keys: 'b', scope: 'scene', run: noop }),
+      register({ id: 'p.clash', keys: 'g', scope: 'scene', run: noop }),
+    ])).toThrow(KeymapConflictError);
+    expect(getBindings().map((b) => b.id)).toEqual(['existing']);
+  });
+
+  it('records registrations made through a local helper, as SpriteEditor\'s `mk` does', () => {
+    const mk = (id: string, keys: string) => register({ id, keys, scope: 'overlay', run: noop });
+    const off = registerBindings(() => [mk('o.undo', 'mod+z'), mk('o.redo', 'mod+shift+z')]);
+    expect(getBindings()).toHaveLength(2);
+    off();
+    expect(getBindings()).toHaveLength(0);
+  });
+
+  it('a register AFTER a finished builder is not captured by it (the `finally` reset)', () => {
+    // #953 phase-5/7 review, measured: without the reset, `collecting` kept pointing at the first
+    // builder's record, so a LATER panel's bindings landed in it and the first panel's cleanup
+    // deleted them. Every editor test stayed green.
+    const off = registerBindings(() => [register({ id: 'p.a', keys: 'a', scope: 'scene', run: noop })]);
+    const later = register({ id: 'later', keys: 'l', scope: 'scene', run: noop });
+    off();
+    expect(getBindings().map((b) => b.id)).toEqual(['later']);
+    later();
+  });
+
+  it('nested builders: the inner disposer removes only its own, the outer owns everything under it', () => {
+    let offInner: () => void = () => {};
+    const offOuter = registerBindings(() => {
+      register({ id: 'outer', keys: 'o', scope: 'scene', run: noop });
+      offInner = registerBindings(() => [register({ id: 'inner', keys: 'i', scope: 'scene', run: noop })]);
+    });
+    offInner();
+    expect(getBindings().map((b) => b.id)).toEqual(['outer']);
+    offOuter();
+    expect(getBindings()).toHaveLength(0);
+
+    const offBoth = registerBindings(() => {
+      registerBindings(() => [register({ id: 'inner2', keys: 'j', scope: 'scene', run: noop })]);
+    });
+    offBoth();
+    expect(getBindings(), 'the outer disposer must also remove what an inner builder registered').toHaveLength(0);
+  });
+
+  it('a register OUTSIDE any builder is not captured by a later one', () => {
+    const lone = register({ id: 'lone', keys: 'l', scope: 'scene', run: noop });
+    const off = registerBindings(() => [register({ id: 'p.a', keys: 'a', scope: 'scene', run: noop })]);
+    off();
+    expect(getBindings().map((b) => b.id)).toEqual(['lone']);
+    lone();
   });
 });
 

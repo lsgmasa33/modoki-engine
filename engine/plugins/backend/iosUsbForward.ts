@@ -402,6 +402,13 @@ export const reapDeps = {
     catch { return null; }   // not running (ps exits 1), or no ps
   },
   kill(pid: number): void { process.kill(pid); },
+  /** When `pid` started (`ps -o lstart=`), or null. The WDA reap's defence against pid reuse (#1077). Pinned to
+   *  the C locale and UTC: `lstart` is formatted by both (measured: `金  9/11 21:00:15 2026` under ja_JP, the
+   *  hour moves with TZ), and the record is written by one editor run and compared by a later one. */
+  startTimeOf(pid: number): string | null {
+    try { return execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' } }).trim() || null; }
+    catch { return null; }
+  },
   isAlive(pid: number): boolean {
     try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM'; }
   },

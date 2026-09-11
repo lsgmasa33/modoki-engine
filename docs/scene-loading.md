@@ -91,12 +91,12 @@ world scans in `selectionRestore`, the Hierarchy's whole-tree rebuild.
 `setCurrentWorld` now goes through **`runtime/core/notifyListeners.ts`**. Read that file's docblock
 for the reporting policy and the two publishers that must supply their own reporter.
 
-⚠️ **That helper is not yet the engine's ONLY fan-out implementation, and an earlier version of this
-paragraph said it was.** #888 migrated 36 call sites; 46 remain hand-rolled — 41 inside the guard's
-scanned roots and 5 outside — pinned individually in
-`engine/tests/architecture/notifyIsShared.test.ts` and tracked as **#953**. What the guard enforces
-is the weaker, true claim: every loop matching the fan-out shape is migrated, on that ledger, or on
-a short EXEMPT list of queries the helper cannot express — so a new one fails at authorship. The three promoters here are migrated — that part is not partial.
+**Since #953 that helper is the engine's ONLY fan-out implementation.** It took two passes: #888
+migrated 36 call sites and claimed completion early, and #953 migrated or exempted the rest.
+`engine/tests/architecture/notifyIsShared.test.ts` enforces it: every loop matching the fan-out
+shape is on the helper or on a short EXEMPT list of shapes the helper cannot express (queries,
+loops that await each callback in order, and a registration that must fail loudly), within the
+blind spots that guard's header states — so a new one fails at authorship. The three promoters here are migrated — that part is not partial.
 
 ⚠️ **The ownership latches deliberately stay AFTER the promote.** Moving them earlier looks like
 defence in depth and is the opposite: with the listener loop isolated, nothing after

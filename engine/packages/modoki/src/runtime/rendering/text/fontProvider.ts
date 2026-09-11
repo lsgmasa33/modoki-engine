@@ -8,6 +8,7 @@
  *  keyed on {@link FontProvider.atlasVersion} so a dynamic grow triggers a re-upload.
  */
 
+import { notifyListeners } from '../../core/notifyListeners';
 import type { GlyphAtlas } from './glyphAtlas';
 import { kerningKey } from './glyphAtlas';
 import type { LayoutFont } from './layoutText';
@@ -83,7 +84,7 @@ export class BakedFontProvider implements FontProvider {
   dispose() {
     this.disposed = true;
     // Renderer-attached GPU resources (the Three/Pixi atlas texture) clean up here.
-    for (const fn of this.disposables) { try { fn(); } catch { /* ignore */ } }
+    notifyListeners(this.disposables, 'fontProvider:dispose', []);
     this.disposables = [];
   }
 }

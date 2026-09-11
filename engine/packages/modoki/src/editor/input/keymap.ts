@@ -146,7 +146,43 @@ export function register(b: Binding): () => void {
     }
   }
   bindings.set(b.id, b);
+  collecting?.push(b.id);
   return () => { bindings.delete(b.id); };
+}
+
+/** Ids registered while a {@link registerBindings} builder runs. `null` outside one. */
+let collecting: string[] | null = null;
+
+/** Register a panel's whole set of bindings as ONE unit, and get ONE disposer back.
+ *
+ *  `build` is the panel's existing array of `register(...)` calls, unchanged, wrapped in a
+ *  function: every `register` it makes (including through a local helper) is recorded here.
+ *
+ *  - **All or nothing.** If a later `register` throws `KeymapConflictError`, the ones that already
+ *    succeeded are rolled back before the error propagates. The bare `const offs = [register(…), …]`
+ *    idiom could not: the throw happened while the array literal was still being built, so the
+ *    effect never received the earlier disposers and their bindings stayed live with nothing able
+ *    to remove them.
+ *  - **One disposer, and no callback loop.** It deletes the recorded ids from the registry, which
+ *    cannot throw. This replaces seven panels' `for (const off of offs) off()` effect cleanups
+ *    (#953, family `notifyIsShared`).
+ *
+ *  Synchronous only: `build` must make its `register` calls before it returns. Nested calls each
+ *  keep their own record. */
+export function registerBindings(build: () => unknown): () => void {
+  const outer = collecting;
+  const ids: string[] = [];
+  collecting = ids;
+  try {
+    build();
+  } catch (err) {
+    for (const id of ids) bindings.delete(id);
+    throw err;
+  } finally {
+    collecting = outer;
+  }
+  outer?.push(...ids);
+  return () => { for (const id of ids) bindings.delete(id); };
 }
 
 export function unregister(id: string): void { bindings.delete(id); }

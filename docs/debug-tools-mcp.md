@@ -77,7 +77,8 @@ Grouped:
   (` [input:trusted-wda]`) — **but only those two**: WDA has no `wheel` action, a touchscreen has no
   hover, and a trusted key reaches only a focused element, so `press_key`/`hover`/`scroll` stay
   synthetic there by design. WDA is a Build Support item and starts **lazily on the first iOS input
-  op** (~6s), then is torn down with the lease. When no trusted route exists, ops fall back to a
+  op** (~6s) — over a WiFi lease only; a USB lease has no route to it — and is torn down with the
+  lease however the lease ends, a superseding `device_connect` included (#1077). When no trusted route exists, ops fall back to a
   SYNTHETIC DOM event —
   and that fallback is **loud**: the reply is fronted by a banner naming the cause and its
   consequences, because a trailing ` [input:synthetic]` on a long line is too easy to skim past.
@@ -819,6 +820,15 @@ compares. It is a hint, not a proof — two identical handsets report one model 
 asymmetric on purpose: **a match refuses (with `--force` to override), a mismatch allows, and an
 absent model warns but proceeds.** "Cannot tell" is never "different", and never grounds to block a
 Mac with no Xcode from claiming any iPhone at all.
+
+**Inside the `ios:` namespace, an id is resolved before it is compared (#1078).** `devicectl --device`
+(or `-d`) accepts a CoreDevice identifier, an ECID, a serial number, a name or a DNS name as well as the
+UDID, while every claim the editor takes — USB lease, WebDriverAgent, build — is keyed by UDID. So the
+hook, `device run` and `device claim`/`release` resolve an `ios:` id to its UDID through
+`xcrun devicectl list devices` first (`engine/scripts/iosDeviceIdentity.mjs`): a `devicectl` command
+naming the identifier now sees a sibling's `ios:<udid>` claim, and is covered by this clone's own. A
+UDID-shaped id costs no lookup. An id that cannot be resolved is compared as written, and `device claim`
+and `device run` both refuse to store it rather than create a second key for one phone.
 
 **⚠️ Listing devices must never be SYNCHRONOUS — the backend runs inside the Electron main process
 (#168).** `/api/device/list` resolved its iOS half with `execFileSync('xcrun', ['xctrace', 'list',

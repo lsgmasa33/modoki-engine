@@ -21,6 +21,8 @@
  *  cannot change without rebuilding the renderer, so they are deliberately unreachable here.)
  */
 
+import { notifyListeners } from '../core/notifyListeners';
+
 const listeners = new Set<() => void>();
 
 export function onForceResize(cb: () => void): () => void {
@@ -32,8 +34,7 @@ export function onForceResize(cb: () => void): () => void {
 
 export function forceResizeAllSurfaces(): void {
   // Iterate a COPY: a listener that unsubscribes itself (or another listener) during the
-  // callback must not corrupt the live Set's iteration or skip a sibling.
-  for (const cb of [...listeners]) {
-    cb();
-  }
+  // callback must not corrupt the live Set's iteration or skip a sibling. Isolated per listener
+  // (#953), so one surface whose resize handler throws cannot leave the others un-resized.
+  notifyListeners([...listeners], 'resizeBus', []);
 }

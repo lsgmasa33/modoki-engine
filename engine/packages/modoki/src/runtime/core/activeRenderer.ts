@@ -6,6 +6,7 @@
  *  directly instead of reaching into `loaders/` for a renderer handle it has nothing else to do
  *  with. */
 
+import { notifyListeners } from './notifyListeners';
 import type { WebGPURenderer } from 'three/webgpu';
 import type * as THREE from 'three';
 // The sanctioned wall-clock wrapper — a direct `Date.now()`/`performance.now()` here would fail
@@ -291,12 +292,9 @@ function reportRendererLoss(
     'rebuilding the renderer. Expect a visible hitch.',
   );
 
-  for (const fn of lostListeners) {
-    // A listener that throws must not prevent the others from rebuilding. Reported, not swallowed
-    // silently: a viewport that cannot rebuild is exactly the fault worth seeing.
-    try { fn({ api, reason, message, attempt, renderer }); }
-    catch (e) { console.error('[activeRenderer] a renderer-lost listener threw', e); }
-  }
+  // A listener that throws must not prevent the others from rebuilding. Reported, not swallowed
+  // silently: a viewport that cannot rebuild is exactly the fault worth seeing.
+  notifyListeners(lostListeners, 'activeRenderer:rendererLost', [{ api, reason, message, attempt, renderer }]);
 }
 
 /** Structural (not imported) twin of `runtime/rendering/rendererLossHandling.ts`'s
@@ -504,7 +502,7 @@ export function getRendererProgress(): string {
 export function reportRendererInitFailure(err: Error): void {
   if (rendererReadyFired) return; // a renderer is already live; a later failure is not fatal
   initFailure = err;
-  for (const fn of failWaiters) { try { fn(err); } catch { /* a bad waiter must not block others */ } }
+  notifyListeners(failWaiters, 'activeRenderer:initFailure', [err]); // a bad waiter must not block others
   failWaiters.clear();
 }
 

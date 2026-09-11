@@ -286,6 +286,7 @@ import type { BackendContext } from '../plugins/backend/editorBackendRouter';
 import { releaseDeviceResourcesOnExit } from '../plugins/backend/deviceConnection';
 import type { SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneValidation';
 import { ENGINE_VERSION } from '../packages/modoki/src/runtime/core/version';
+import { notifyListeners } from '../packages/modoki/src/runtime/core/notifyListeners';
 
 /**
  * Find the enclosing git repo/worktree root for a project path by walking up
@@ -511,7 +512,8 @@ async function ensureProjectDeps(projectRoot: string): Promise<void> {
   console.log(`[modoki-electron] dependencies installed for ${projectRoot}`);
 
   // `npm install` only creates the WORKSPACE SYMLINK for a project-owned native plugin (e.g.
-  // games/court's capacitor-applovin-max) — it does not build it. Those plugins ship their JS
+  // games/3d-test's capacitor-applovin-max fork; Court's copy was promoted to engine/packages in
+  // #931 and arrives prebuilt in a vendored tarball) — it does not build it. Those plugins ship their JS
   // only in a gitignored `dist/` (bootstrap-game-deps.mjs's own comment on this exact class), so
   // an install that stops here can leave the symlink restored and the import still unresolved:
   // `Failed to resolve import "capacitor-applovin-max"`, now AFTER a log line that reads as
@@ -718,10 +720,13 @@ let nextRequestId = 1;
  *  project reload that swaps the renderer out from under them). Without this they
  *  only resolve via their timeout and leak the timer until then (P1-4). */
 function failPendingRenderer(reason: string): void {
-  for (const { reject, timer } of pendingRenderer.values()) {
-    clearTimeout(timer);
-    reject(new Error(reason));
-  }
+  // Isolated per call (#953), for uniformity with every other fan-out: `clearTimeout` and a Promise
+  // `reject` cannot throw today, but that is a fact about the callee, which nothing enforces.
+  notifyListeners(
+    [...pendingRenderer.values()].map(({ reject, timer }) => () => { clearTimeout(timer); reject(new Error(reason)); }),
+    'electron:pendingRenderer',
+    [],
+  );
   pendingRenderer.clear();
 }
 

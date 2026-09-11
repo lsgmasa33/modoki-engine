@@ -25,6 +25,7 @@
  *  forget, which is the same reason the envelope-opening moved into `pose` in the first place.
  */
 
+import { notifyListeners } from '../../runtime/core/notifyListeners';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { fireDirtyListeners } from '../../runtime/core/ecs/entityUtils';
 import { applyClipAtTime } from '../../runtime/animation/sampleClip';
@@ -171,7 +172,7 @@ export async function exitPoseEnvelope(restore: boolean): Promise<{ exited: bool
     // and notifying is exactly what must survive a failed restore, because the failure is when
     // the editor most needs to be usable again.
     exitPreviewMode('animation');
-    for (const cb of exitListeners) { try { cb(); } catch { /* a bad listener must not block the exit */ } }
+    notifyListeners(exitListeners, 'poseClip:exit', []); // a bad listener must not block the exit
   }
   return { exited: true, rebound };
 }

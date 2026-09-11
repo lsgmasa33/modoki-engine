@@ -761,6 +761,17 @@ measurement, so ordering or subtracting two values means nothing. It is 0 on a f
 not run (suppressed by the host gate, or no source registered) and never 0 while a pointer is live, so
 a consumer may read 0 as a discontinuity too.
 
+**Which set a tap went down in — `tapSetVersion`.** On the frame `tapped` is true it holds the
+`pointerSetVersion` from the moment the tap's finger went down (0 otherwise). A consumer that kept the
+version of a frame it sampled compares the two for equality: equal means a frame it sampled had this
+tap's finger down, alone; unequal means the press and the lift both fell between two samples. ⚠️ Equal
+does not mean that frame was the PRESS — the finger may already have moved. To hold state as of the
+press (a view, a hit target), record it on the FIRST frame a version appears and never re-take it for
+the same version. It exists so a consumer never has to reason "exactly one lift since
+my last frame" by subtracting versions — how far a lift, a land or a reset moves the stamp is not part
+of the contract. Wordweave's paid reveal resolves a tap through the crossword view it snapshotted on
+the first frame it sampled the tapping finger's set (#951).
+
 ⚠️ **Every mutation of `gestureSource`'s live list goes through `addPointer`/`removePointer`/
 `clearPointers`.** An inline `live.push` or `live.length = 0` would leave the version describing a set
 that has already changed, and **nothing would error** — the consumer would simply stop seeing a

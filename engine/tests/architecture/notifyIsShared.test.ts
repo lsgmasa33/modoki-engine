@@ -1,15 +1,17 @@
 /**
- * Every loop in SCAN_DIRS that matches the fan-out SHAPE is accounted for in exactly one of three
- * buckets: migrated onto `runtime/core/notifyListeners.ts`, on this file's `KNOWN_UNMIGRATED`
- * ledger, or on its `EXEMPT` list as a shape the helper cannot express (#888).
+ * Every loop in SCAN_DIRS that matches the fan-out SHAPE is accounted for in exactly one of two
+ * buckets: migrated onto `runtime/core/notifyListeners.ts`, or on this file's `EXEMPT` list as a
+ * shape the helper cannot express (#888, #953).
  *
- * Measured at the time of writing: **36 call sites migrated, 41 ledger rows inside SCAN_DIRS,
- * 5 outside, 4 exempt** — ~85 instances of the shape in total.
+ * The arrays below ARE the counts. No number is restated in prose, because every restated one went
+ * stale: this header once said "41 ledger rows" while the ledger held 40 (#953).
  *
- * ⚠️ **That is deliberately weaker than "the helper is the only one", which is what this header
- * claimed when it landed, and it was false.** See § "What the close-out sweep found" below: the
- * detector was scoped by variable NAME, the real population is roughly three times the size the
- * census reported, and 41 rows are on the ledger rather than migrated.
+ * ⚠️ **History, because it explains the guard's shape.** When it landed (#888) this header claimed
+ * "the helper is the only one", and that was false: the detector was scoped by variable NAME, the
+ * real population was roughly three times the size the census reported, and the remainder had to
+ * be pinned row by row in a `KNOWN_UNMIGRATED` ledger. #953 migrated or exempted every row and
+ * deleted that ledger, so the strong claim is now the enforced one, subject to the blind spots
+ * stated below.
  *
  * The loop was hand-rolled 23 times. Eight copies wrapped each listener in its own `try` and
  * argued the point in eight separately-worded comments; fifteen did not, and one of the fifteen
@@ -50,11 +52,14 @@
  *   - **`.forEach((cb, i) => cb())`** — a multi-parameter callback. `FOREACH_NOTIFY` requires a
  *     single parameter. No instance in SCAN_DIRS (scanned); stated because the single-parameter
  *     assumption is exactly the kind this guard has now been wrong about twice.
- *   - **Ledger rows are `path :: identifier`, and six are extra copies of a row already present**
- *     (41 rows, 35 distinct: `activeRenderer.ts :: fn` ×2, `spriteMaterialCache.ts :: cb` ×2,
- *     `physicsEventBus.ts :: cb` ×3, `timelineEventBus.ts :: cb` ×3). So migrating ONE of a same-named pair while adding a NEW hand-rolled loop
- *     with the same loop variable in the same file keeps the equality green. Line numbers would
- *     close it and would churn on every unrelated edit above them; the trade was made knowingly.
+ *   - **Rows are `path :: identifier`, not line numbers.** While the `KNOWN_UNMIGRATED` ledger
+ *     existed this was a real hole: one file could hold several identical rows (each event bus did,
+ *     one per emitter), so migrating one of a same-named pair while adding a NEW loop with the same
+ *     loop variable kept the equality green. With no in-scope ledger the expected set is empty and
+ *     `subtractOnce` removes only ONE occurrence per EXEMPT row, so a second same-named loop in an
+ *     exempt file now shows up as an offender. What remains: replacing an exempt loop with a
+ *     different, plain fan-out of the SAME identifier in the same file passes. Line numbers would
+ *     close that and churn on every unrelated edit above them; the trade was made knowingly.
  *
  * ⚠️ **Two blind spots this header used to claim are gone, because both were wrong — and finding
  * that out is what the close-out sweep was for.** The first version keyed on the house names
@@ -98,107 +103,21 @@ const SCAN_DIRS = [
   'engine/app',
 ];
 
-/** Hand-rolled fan-outs known to live OUTSIDE SCAN_DIRS.
+/** Hand-rolled fan-outs known to live OUTSIDE SCAN_DIRS: none, since #953 migrated the last four
+ *  (`engine/electron/main.ts`, Court's reload-blocker disposers and cloud-sync resolvers,
+ *  `games/llm-test`'s progress callbacks).
  *
- *  Kept as an explicit ledger rather than a bare `toEqual([])` so that a NEW instance appearing in
- *  `games/`, `demos/`, `engine/electron` or `engine/plugins` is a decision someone makes on
- *  purpose — migrate it, or write down why it stays.
- *
- *  None is this change's to migrate. `games/court/**` is `work-ai2`'s lane (CLAUDE.md
- *  § Clones: the Role column is a standing subject assignment, not a description), `games/llm-test`
- *  is a fixture, and `engine/tools/modoki-mcp` is the MCP server rather than engine runtime — the
- *  same reason `SCAN_DIRS` stops where it does. A game CAN reach the helper: it is a deep export
- *  (`@modoki/engine/runtime/core/notifyListeners`), which is how `games/sling`'s two stores
- *  migrated in this change. */
-const KNOWN_OUTSIDE_SCAN_DIRS: readonly string[] = [
-  // ⚠️ A REAL one, and the object-pattern widening is what surfaced it: a teardown fan-out over
-  // pending promise rejectors, unguarded, that also skips `pendingRenderer.clear()` on the line
-  // after it. Electron MAIN process — outside SCAN_DIRS because the helper is browser-side engine
-  // code, though it has zero imports and `@modoki/engine/runtime/core/notifyListeners` is a deep
-  // export, so migrating it is possible and just is not this change's call to make.
-  'engine/electron/main.ts :: reject',
-  'engine/tools/modoki-mcp/src/registerAll.ts :: register',
-  'games/court/runtime/cloudSyncWiring.ts :: r (forEach)',
-  'games/court/runtime/systems.ts :: dispose',
-  'games/llm-test/runtime/services/CapacitorLLMService.ts :: cb',
-];
+ *  Kept as an explicit, EMPTY ledger rather than a bare `toEqual([])` so that a NEW instance
+ *  appearing in `games/`, `demos/`, `engine/electron` or `engine/plugins` is a decision someone
+ *  makes on purpose: migrate it, or write down why it stays. A game CAN reach the helper; it is a
+ *  deep export (`@modoki/engine/runtime/core/notifyListeners`), as `games/sling` and `games/court`
+ *  use it. `engine/electron` reaches it by relative path, as `main.ts` already imports engine
+ *  source. */
+const KNOWN_OUTSIDE_SCAN_DIRS: readonly string[] = [];
 
-/** ⚠️ **Hand-rolled fan-outs still INSIDE `SCAN_DIRS`, not yet migrated.**
- *
- *  36 call sites were migrated in #888. These 41 rows were found afterwards, by this guard's own close-out
- *  sweep, once the name-scoped detector was replaced with a shape-scoped one — see the header.
- *  They are pinned rather than migrated for two reasons, and neither is "they are fine":
- *
- *  - **Authorised scope.** The change was approved as "all 23 sites" against a census that turned
- *    out to be wrong by roughly 3x. Tripling a landed change inside a finishing pass is exactly
- *    the refactor `/close-out` § 1a says not to absorb.
- *  - **Two of these groups are not one decision.** The three event buses
- *    (`zoneEventBus` / `physicsEventBus` / `timelineEventBus`) are one factory shape each feeding
- *    singletons — #851 already says whoever fixes them should fix the FACTORY's contract once
- *    rather than three suites separately. And the `off` loops in the `.tsx` panels are React
- *    effect cleanups, whose severity and idiom differ from a publisher notifying subscribers.
- *
- *  What the pin buys: a FORTY-SECOND instance fails immediately instead of joining a silent
- *  population, which is the state that let this class reach ~85 sites unnoticed.
- *  ⚠️ It also goes red when one of these is legitimately MIGRATED — that is intended. Removing a
- *  row is a deliberate edit in the same commit as the migration.
- *
- *  Filed as #953 (family/one-entry-point); do not fix these one at a time. */
-const KNOWN_UNMIGRATED: readonly string[] = [
-  // ⚠️ These two were invisible until the detector learned to read a DESTRUCTURED binding, and
-  // both carry their own hand-rolled isolation — copies nine and ten of the convention. They are
-  // ledgered rather than migrated because each wants something `notifyListeners` does not have:
-  // `lateUpdate` names the failing system in its report (`system "${key}" threw`), which
-  // `report(label, err)` cannot express — it receives no per-entry handle. That one is a real
-  // contract question for #953.
-  //
-  // ⚠️ `fireSceneCallbacks` is the WEAKER of the two, and saying so is the point: its pattern
-  // filter is NOT a blocker, because `notifyListeners` takes an `Iterable`, so the caller can
-  // filter and map to callbacks itself. What actually stops it here is only that its report is a
-  // `console.warn` with its own wording. An earlier version of this comment claimed the filter
-  // needed a contract change; it does not, and #953's designer should not be handed a parameter
-  // nobody needs.
-  'engine/packages/modoki/src/runtime/core/lateUpdate.ts :: fn',
-  'engine/packages/modoki/src/runtime/scene/SceneManager.ts :: cb',
-  'engine/app/ota.ts :: l (forEach)',
-  'engine/app/subgameLoader.ts :: l (forEach)',
-  'engine/packages/modoki/src/editor/EditorApp.tsx :: off',
-  'engine/packages/modoki/src/editor/animation/poseClip.ts :: cb',
-  'engine/packages/modoki/src/editor/createEditor.tsx :: l',
-  'engine/packages/modoki/src/editor/panels/AnimationEditor.tsx :: off',
-  'engine/packages/modoki/src/editor/panels/Hierarchy.tsx :: off',
-  'engine/packages/modoki/src/editor/panels/SceneView.tsx :: off',
-  'engine/packages/modoki/src/editor/panels/SkinCanvas.tsx :: off',
-  'engine/packages/modoki/src/editor/panels/SpriteEditor.tsx :: off',
-  'engine/packages/modoki/src/editor/panels/TimelineEditor.tsx :: off',
-  'engine/packages/modoki/src/editor/undo/compositeAction.ts :: step',
-  'engine/packages/modoki/src/editor/undo/undoManager.ts :: l',
-  'engine/packages/modoki/src/runtime/audio/audioService.ts :: fn',
-  'engine/packages/modoki/src/runtime/core/activeRenderer.ts :: fn',
-  'engine/packages/modoki/src/runtime/core/activeRenderer.ts :: fn',
-  'engine/packages/modoki/src/runtime/core/renderDirty.ts :: fn',
-  'engine/packages/modoki/src/runtime/loaders/assetManifest.ts :: fn',
-  'engine/packages/modoki/src/runtime/loaders/meshTemplateCache.ts :: fn',
-  'engine/packages/modoki/src/runtime/loaders/spriteMaterialCache.ts :: cb',
-  'engine/packages/modoki/src/runtime/loaders/spriteMaterialCache.ts :: cb',
-  'engine/packages/modoki/src/runtime/physics/physicsEventBus.ts :: cb',
-  'engine/packages/modoki/src/runtime/physics/physicsEventBus.ts :: cb',
-  'engine/packages/modoki/src/runtime/physics/physicsEventBus.ts :: cb',
-  'engine/packages/modoki/src/runtime/rendering/derivedMaterials.ts :: dispose',
-  'engine/packages/modoki/src/runtime/rendering/frameDriver.ts :: fn',
-  'engine/packages/modoki/src/runtime/rendering/interactionHandles.ts :: p',
-  'engine/packages/modoki/src/runtime/rendering/renderSettings.ts :: cb',
-  'engine/packages/modoki/src/runtime/rendering/resizeBus.ts :: cb',
-  'engine/packages/modoki/src/runtime/rendering/text/dynamicFontProvider.ts :: fn',
-  'engine/packages/modoki/src/runtime/rendering/text/fontProvider.ts :: fn',
-  'engine/packages/modoki/src/runtime/rendering/tierCalibration.ts :: fn',
-  'engine/packages/modoki/src/runtime/scene/SceneManager.ts :: hook',
-  'engine/packages/modoki/src/runtime/timeline/timelineEventBus.ts :: cb',
-  'engine/packages/modoki/src/runtime/timeline/timelineEventBus.ts :: cb',
-  'engine/packages/modoki/src/runtime/timeline/timelineEventBus.ts :: cb',
-  'engine/packages/modoki/src/runtime/video/VideoEvents.ts :: fn',
-  'engine/packages/modoki/src/runtime/zones/zoneEventBus.ts :: cb',
-];
+// There is no in-SCAN_DIRS ledger any more. #888 migrated 36 sites and pinned the remaining ~40
+// row by row as `KNOWN_UNMIGRATED`; #953 migrated or exempted every one, so inside SCAN_DIRS a
+// fan-out-shaped loop is now either on the helper or on `EXEMPT` below, and nothing else is legal.
 
 const UNSCANNED_ROOTS: readonly string[] = deriveUnscannedRoots(SCAN_DIRS);
 const expectedOutsideRows = (): string[] =>
@@ -225,9 +144,17 @@ const insideScanDirs = (rel: string): boolean =>
 /** ⚠️ **Loops the helper CANNOT express — permanently exempt, not "not done yet".**
  *
  *  The distinction matters: a ledger row is a todo, an exemption is an argued decision, and
- *  migrating one of these would be a REGRESSION rather than a cleanup. Both are QUERIES, not
- *  fan-outs: they read a value back out of each callback, which `notifyListeners` — whose whole
- *  contract is "call them all, return nothing" — has no way to do.
+ *  migrating one of these would be a REGRESSION rather than a cleanup. Every row carries one of
+ *  three KINDS, and the kind is the argument:
+ *
+ *  - **`query`** reads a value back out of each callback, which `notifyListeners` — whose whole
+ *    contract is "call them all, return nothing" — has no way to do.
+ *  - **`async-sequential`** AWAITS each callback before starting the next, so order and completion
+ *    are part of the contract. The helper is synchronous.
+ *  - **`registration`** must STOP on the first failure. Isolating it would leave a half-registered
+ *    system that reports success.
+ *
+ *  ── query ──
  *
  *  - `runtime/core/screenPick.ts` `pickAt` — a FIRST-MATCH query. It `break`s on the first
  *    provider that answers and returns that answer; a helper that always calls everyone would
@@ -237,6 +164,10 @@ const insideScanDirs = (rel: string): boolean =>
  *    guarding only `fn()` catches a provider that throws and misses one that returns malformed
  *    DATA. `notifyListeners` can only isolate the call, so migrating it would narrow a guard whose
  *    width is documented and deliberate.
+ *  - `runtime/rendering/interactionHandles.ts` `collectHandles` — a COLLECT query of the same
+ *    shape: each provider RETURNS its handles, which are then filtered and de-duplicated. It also
+ *    reports a throwing provider once per provider (`warnedThrowers`) so a per-frame
+ *    `modoki_handles` poll cannot flood the console; the helper would report on every call.
  *
  *  - `engine/plugins/load-project-config.ts` — `for (const [filename, read] of [[…, readRawProjectConfig],
  *    […, readRawProjectUserConfig]] as const)`. An inline two-element array of READERS whose return
@@ -254,20 +185,41 @@ const insideScanDirs = (rel: string): boolean =>
  *  - `games/wordweave/runtime/stem.ts` — `for (const [base, coValidate] of candidatesFor(…))`, a
  *    first-match query: it `continue`s on a falsy `coValidate(base)` and `break`s on the first
  *    accepted candidate. Same shape as `pickAt`. Surfaced only once the detector learned object and
- *    nested patterns, which is also how it found a REAL one in `engine/electron/main.ts`.
+ *    nested patterns, which is also how it found `engine/electron/main.ts`'s rejector loop.
  *
- *  ⚠️ Exactly these four, and each is asserted to still BE DETECTED below — an exemption whose
- *  loop was deleted or migrated goes red rather than lingering as a licence. That re-detection is
- *  skipped for a row whose FILE is absent from the checkout (the public snapshot ships no
- *  `games/`); see the ⚠️ on that test. A fourth is a signal
- *  that either the helper needs a query-shaped sibling or the exemption is being used to dodge a
- *  migration; decide that deliberately, do not append. */
-const EXEMPT: readonly string[] = [
-  'engine/packages/modoki/src/runtime/core/screenPick.ts :: fn',
-  'engine/packages/modoki/src/runtime/rendering/hitRegions.ts :: fn',
-  'engine/plugins/load-project-config.ts :: read',
-  'games/wordweave/runtime/stem.ts :: coValidate',
-];
+ *  ── async-sequential ──
+ *  - `runtime/scene/SceneManager.ts` `fireBeforeSwapHooks` — beforeSwap hooks (shader prewarm),
+ *    `await`ed one at a time against the STAGING world before the atomic swap. Each is already
+ *    isolated with its own `try` + `console.warn`; what the helper cannot do is wait for it.
+ *  - `editor/undo/compositeAction.ts` `runSequential` — a batch's undo/redo sub-steps, `await`ed
+ *    strictly in order. Failures are COLLECTED and rethrown as one `AggregateError`, so `undo()`
+ *    still rejects visibly; a helper that reports and swallows would make a failed undo look done.
+ *
+ *  ── registration ──
+ *  - `engine/tools/modoki-mcp/src/registerAll.ts` `registerAllTools` — the fixed list of tool
+ *    GROUPS registered at server start. A throw there is a programming error in a group and must
+ *    stop the server loudly: isolating it would start a server with a whole group of tools silently
+ *    absent, and a missing tool reads as "not offered", never as broken.
+ *
+ *  ⚠️ Each row is asserted to still BE DETECTED below — an exemption whose loop was deleted or
+ *  migrated goes red rather than lingering as a licence. That re-detection is skipped for a row
+ *  whose FILE is absent from the checkout (the public snapshot ships no `games/`); see the ⚠️ on
+ *  that test. ⚠️ **A new KIND is a decision, not an append**: it means either the helper needs a
+ *  sibling or an exemption is being used to dodge a migration. The two `async-sequential` rows
+ *  have DIFFERENT error policies (warn-and-continue vs collect-and-rethrow), so they do not justify
+ *  an async helper; a third row sharing one of those policies would. */
+type ExemptKind = 'query' | 'async-sequential' | 'registration';
+const EXEMPT: Readonly<Record<string, ExemptKind>> = {
+  'engine/packages/modoki/src/runtime/core/screenPick.ts :: fn': 'query',
+  'engine/packages/modoki/src/runtime/rendering/hitRegions.ts :: fn': 'query',
+  'engine/packages/modoki/src/runtime/rendering/interactionHandles.ts :: p': 'query',
+  'engine/plugins/load-project-config.ts :: read': 'query',
+  'games/wordweave/runtime/stem.ts :: coValidate': 'query',
+  'engine/packages/modoki/src/runtime/scene/SceneManager.ts :: hook': 'async-sequential',
+  'engine/packages/modoki/src/editor/undo/compositeAction.ts :: step': 'async-sequential',
+  'engine/tools/modoki-mcp/src/registerAll.ts :: register': 'registration',
+};
+const EXEMPT_ROWS: readonly string[] = Object.keys(EXEMPT);
 
 /** The helper IS the implementation — its own loop is the one legitimate instance. */
 const HELPER = path.join(REPO, 'engine/packages/modoki/src/runtime/core/notifyListeners.ts');
@@ -361,7 +313,7 @@ const FOREACH_NOTIFY =
  *  Measured on the shipped version before the swap: 353 of 880 scanned files had real code blanked
  *  (mostly `${…}` interpolation contents), and `' '.repeat()` over a multi-line template destroyed
  *  the line count that `assertScanIsSane` exists to check. The parser build yields the identical
- *  40 ledger rows and additionally closes the regex-literal hole the hand-rolled one had to
+ *  ledger rows and additionally closes the regex-literal hole the hand-rolled one had to
  *  declare as a blind spot. */
 function bodyCallsElement(src: string, from: number, element: string): boolean {
   let i = from;
@@ -397,8 +349,8 @@ function rowsFrom(scanned: Scanned[]): string[] {
  *  hand-rolled loop, which is precisely what this guard is for, stayed green. Subtracting one
  *  occurrence leaves the second `hitRegions.ts :: fn` standing, and it goes red.
  *
- *  This is the same duplicate-row limitation the header states for `KNOWN_UNMIGRATED` — there it is
- *  a narrow accepted risk, here it was live. */
+ *  This is the same `path :: identifier` limitation the header's blind-spot list states; with no
+ *  in-scope ledger left, subtracting ONE occurrence is what keeps it narrow. */
 function subtractOnce(rows: string[], exemptions: readonly string[]): string[] {
   const budget = new Map<string, number>();
   for (const e of exemptions) budget.set(e, (budget.get(e) ?? 0) + 1);
@@ -411,6 +363,24 @@ function subtractOnce(rows: string[], exemptions: readonly string[]): string[] {
   return out;
 }
 
+/** The offenders in ONE comment-and-string-stripped source: both halves of the detector, exactly as
+ *  `scan` runs them. A function of its own so the positive control below exercises the SAME code
+ *  `scan` does. A control that re-implements the match is not a control, and the #953 phase-3/4
+ *  review measured that: disabling the forEach branch in here left the string-regex check green. */
+function offendersIn(src: string): string[] {
+  const offenders: string[] = [];
+  for (const m of src.matchAll(SUBSCRIBER_LOOPS)) {
+    const body = headerEnd(src, m.index!);
+    for (const name of boundNames(m[1]!)) {
+      if (bodyCallsElement(src, body, name)) offenders.push(name);
+    }
+  }
+  for (const m of src.matchAll(FOREACH_NOTIFY)) {
+    if (m[1] === m[2]) offenders.push(`${m[1]!} (forEach)`);
+  }
+  return offenders;
+}
+
 function scan(roots: readonly string[] = SCAN_DIRS, dropOverlap = false): Scanned[] {
   const results: Scanned[] = [];
   for (const { rel, abs } of scannedFiles(roots)) {
@@ -420,27 +390,20 @@ function scan(roots: readonly string[] = SCAN_DIRS, dropOverlap = false): Scanne
     // call that used to sit here — and doing it per LOOP-MATCH instead of per file timed the suite
     // out at 20s, which is how this ended up hoisted rather than tucked inside the predicate.
     const src = stripCommentsAndStrings(fs.readFileSync(abs, 'utf8'), rel);
-    const offenders: string[] = [];
-    if (abs !== HELPER) {
-      for (const m of src.matchAll(SUBSCRIBER_LOOPS)) {
-        const body = headerEnd(src, m.index!);
-        for (const name of boundNames(m[1]!)) {
-          if (bodyCallsElement(src, body, name)) offenders.push(name);
-        }
-      }
-      for (const m of src.matchAll(FOREACH_NOTIFY)) {
-        if (m[1] === m[2]) offenders.push(`${m[1]!} (forEach)`);
-      }
-    }
-    results.push({ file: rel, offenders });
+    results.push({ file: rel, offenders: abs === HELPER ? [] : offendersIn(src) });
   }
   return results;
 }
 
-describe('every fan-out-shaped loop is migrated, ledgered, or exempt (#888)', () => {
+describe('every fan-out-shaped loop is migrated or exempt (#888, #953)', () => {
   it('SCAN_DIRS itself is non-vacuous (the floor moved onto the callers)', () => {
     expect(scannedFiles().length, 'the SCAN_DIRS corpus collapsed — every check below would pass '
       + 'having read nothing').toBeGreaterThan(500);
+    // Its own floor, because the total cannot see it: measured in #953's phase-5/7 review, narrowing
+    // the file filter to `.ts` left every check green (the `.ts` files clear the 500 floor alone)
+    // while every `.tsx` file — the editor panels, where seven fan-outs lived — dropped out.
+    expect(scannedFiles().filter(({ rel }) => rel.endsWith('.tsx')).length,
+      'no .tsx file is being scanned — every editor panel is invisible to this guard').toBeGreaterThan(50);
   });
 
   it('detects the positive case at all — the helper itself would match but for the exemption', () => {
@@ -462,16 +425,39 @@ describe('every fan-out-shaped loop is migrated, ledgered, or exempt (#888)', ()
     expect([...negative.matchAll(FOREACH_NOTIFY)].filter((m) => m[1] === m[2]).length).toBe(0);
   });
 
-  it('SCAN_DIRS holds exactly the fan-outs on the ledger — no more', () => {
-    const offenders = subtractOnce(rowsFrom(scan()), EXEMPT);
+  it('the detector `scan` runs fires on BOTH spellings — a positive control through the real path', () => {
+    // Measured in #953's phase-3/4 review: with the forEach branch inside `scan` disabled, every
+    // control above stayed green, and only ledger rows that happened to use `.forEach` went red.
+    // #953 migrated the last of those, so without this control the forEach half could stop firing
+    // and the whole guard would still pass.
+    const fixture = stripCommentsAndStrings([
+      'for (const fn of listeners) { fn(); }',
+      'subs.forEach((cb) => cb(1));',
+      'rows.forEach((r) => render(r));',
+      'for (const id of ids) { clearTimeout(id); }',
+    ].join('\n'), 'fixture.ts');
+    expect(offendersIn(fixture)).toEqual(['fn', 'cb (forEach)']);
+
+    // And through the TSX parse, with JSX around the loop: the panels' effect-cleanup shape.
+    const tsx = stripCommentsAndStrings([
+      'export function Panel() {',
+      '  useEffect(() => { return () => { for (const off of offs) off(); }; }, []);',
+      '  return <div className="row">{items.map((i) => <span key={i}>{i}</span>)}</div>;',
+      '}',
+    ].join('\n'), 'fixture.tsx');
+    expect(offendersIn(tsx)).toEqual(['off']);
+  });
+
+  it('SCAN_DIRS holds no hand-rolled fan-out outside EXEMPT', () => {
+    const offenders = subtractOnce(rowsFrom(scan()), EXEMPT_ROWS);
     expect(offenders, 'A callback fan-out was hand-rolled instead of going through '
       + '`runtime/core/notifyListeners.ts`. That is #888: the publisher mutates its state before '
       + 'it fans out, so one throwing callback commits the mutation, starves every callback '
       + 'behind it, and aborts the publisher\'s own tail. Call `notifyListeners(set, label, args)`; '
-      + 'pass a `report` only if this publisher cannot reach `console.error` safely. '
-      + 'If instead a row DISAPPEARED because you migrated it: good — delete its ledger row in the '
-      + 'same commit.')
-      .toEqual([...KNOWN_UNMIGRATED].sort());
+      + 'pass a `report` only if the publisher cannot reach `console.error` safely or must name the '
+      + 'failing entry. If the loop genuinely cannot be expressed that way, argue it into EXEMPT '
+      + 'with its kind.')
+      .toEqual([]);
   });
 
   it('every EXEMPT row is still DETECTED — an exemption cannot go stale into a licence', () => {
@@ -487,8 +473,8 @@ describe('every fan-out-shaped loop is migrated, ledgered, or exempt (#888)', ()
     // `games/`, so `games/wordweave/runtime/stem.ts` is absent by design. Exactly the #830 class
     // `expectedLedgerRows` exists for, and it went red here at `verify:publish` on the hub merge —
     // the only place these guards run inside the snapshot. That helper cannot be reused as-is:
-    // two EXEMPT rows sit INSIDE `SCAN_DIRS`, where it throws on purpose.
-    const missing = EXEMPT.filter((row) => !fs.existsSync(path.join(REPO, row.split(' :: ')[0]!)));
+    // most EXEMPT rows sit INSIDE `SCAN_DIRS`, where it throws on purpose.
+    const missing = EXEMPT_ROWS.filter((row) => !fs.existsSync(path.join(REPO, row.split(' :: ')[0]!)));
     // The floor that stops the filter draining the loop into a no-op: an EXEMPT row inside
     // SCAN_DIRS is present in ANY checkout that runs this guard at all — the non-vacuity
     // assertion above already vouches for that corpus — so its absence is a broken checkout
@@ -496,13 +482,11 @@ describe('every fan-out-shaped loop is migrated, ledgered, or exempt (#888)', ()
     expect(missing.filter((row) => insideScanDirs(row.split(' :: ')[0]!)),
       'an EXEMPT row INSIDE SCAN_DIRS names a file this checkout does not have — the corpus is '
       + 'broken, and dropping the row would leave this test checking nothing').toEqual([]);
-    for (const row of EXEMPT.filter((r) => !missing.includes(r))) {
+    for (const row of EXEMPT_ROWS.filter((r) => !missing.includes(r))) {
       expect(detected.has(row), `EXEMPT row "${row}" is no longer detected — the loop it excuses is `
         + 'gone or migrated, so the row is now a blanket licence for whatever takes its place. '
         + 'Delete it.').toBe(true);
     }
-    expect(EXEMPT.length, 'a fifth exemption is a decision, not an append — see the docblock')
-      .toBe(4);
   });
 
   it('a `}` inside a string literal does not truncate the loop body', () => {
@@ -565,19 +549,11 @@ describe('every fan-out-shaped loop is migrated, ledgered, or exempt (#888)', ()
       .toBe(false);
   });
 
-  it('the ledger is not silently emptying — it is the population, not a formality', () => {
-    // A ledger that drains to nothing because the DETECTOR broke reads exactly like a ledger that
-    // drained because someone did the work. This floor separates them: it fails long before the
-    // list is empty, and the last few migrations are expected to edit it deliberately.
-    expect(KNOWN_UNMIGRATED.length, 'the unmigrated ledger has collapsed — check the detector '
-      + 'still fires before believing the work was done').toBeGreaterThan(20);
-  });
-
   it('the roots this guard does NOT scan hold exactly the KNOWN fan-outs', () => {
     // The guard's OWN detector over the unscanned roots, so this cannot drift from what the real
     // check would say. A first instance out there fails here rather than joining a silent
     // population.
-    const outside = subtractOnce(rowsFrom(scan(UNSCANNED_ROOTS, true)), EXEMPT);
+    const outside = subtractOnce(rowsFrom(scan(UNSCANNED_ROOTS, true)), EXEMPT_ROWS);
     expect(scannedFiles(UNSCANNED_ROOTS).filter(({ rel }) => !insideScanDirs(rel)).length,
       'the unscanned-roots corpus is empty — this assertion would pass having examined nothing')
       .toBeGreaterThan(50);

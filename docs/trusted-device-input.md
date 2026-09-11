@@ -171,8 +171,75 @@ build, the per-machine signing, and the expiry rule.
   is pid-liveness + a 12h TTL, so a crashed editor never leaves a phone locked. See
   [debug-tools-mcp.md](debug-tools-mcp.md) § "Several phones attached".
 - **Torn down with the lease** — one lease owns both channels, so there is exactly one answer to
-  "who holds this device", and disconnecting can never strand a signed agent on the phone. Losing WDA
-  **degrades input; it does not drop the lease** — screenshots and Percept reads keep working.
+  "who holds this device", and every ending of a lease that runs a teardown stops the agent (an editor that
+  dies without one is covered below). Losing WDA **degrades input; it does not drop the lease** —
+  screenshots and Percept reads keep working.
+
+  "The lease" means every way it ends, not the Disconnect button (#1077). The stop lives in
+  `DeviceConnectionManager.disconnect()`, which an explicit Disconnect, a `device_connect` that
+  supersedes the lease (`connect()` begins with `disconnect()`) and a USB forward dying mid-lease all
+  run through, plus `releaseDeviceResourcesOnExit` on quit. It used to live in the Disconnect ROUTE,
+  so connecting to iPhone B without disconnecting from A left A's agent running and `ios:<A>` claimed —
+  and left the launcher's module state behind, so every tap on B read *"has been starting for Ns"*
+  and the "reconnect to start over" advice did not work. A reconnect to the SAME device also stops the
+  agent, on purpose: that keeps the escape hatch true for a wedged launch, and a game relaunch does not
+  go through `connect()`, so only a deliberate reconnect pays the relaunch.
+
+  A launch still in flight when the lease ends — waiting on its first `/status` probe, or in its 60s poll
+  loop — abandons itself. `stopWda` and `endDeviceWdaLease` invalidate a teardown token (the shared #573 helper) that `ensureWdaRunning` and
+  `getDeviceWdaSession` re-check after the awaits that precede a write, so it cannot spawn onto the old
+  phone, latch a failure, or cache a session for the next lease. An input op caught that way is refused with
+  the reason, rather than sent synthetically to the device the lease holds now. That includes an op whose
+  aim resolved on the NEW lease: each aim is checked before its `Unknown method` branch, because an app
+  build on the new device that predates `resolve-aim` would otherwise hand the op to the synthetic path
+  (a single check after both drag aims was once judged redundant — only a valid-aim test could not tell).
+  A WDA screenshot whose lease ends mid-capture is dropped the same way: it shows the previous phone.
+  "The lease ended" is measured from when the ROUTE read the address, not from the WDA call. The router
+  reads `wdaHost()` and then awaits (the platform and hardware probes, and for the fallback the whole
+  native capture), so it takes `captureDeviceWdaLease()` in the same synchronous block and passes it down.
+  Both entry points refuse on a stale capture before opening a session, since a later check would refuse
+  only after launching on, or caching a session for, the previous phone.
+  Found by the close-out review
+  and reproduced in tests that drive the launch directly: a launch mid-probe during a `device_connect` to
+  another phone had spawned onto the old one, under the new lease.
+
+  **What this deliberately leaves open** (found by #1077's close-out reviews, read from the code, none
+  reproduced live):
+  - **An input op whose `actions` call is already out when the lease ends still reports `ok (wda touch)`.**
+    There is no lease check after `wdaTap`/`wdaDrag`. The reply is true: the input reached the previous
+    phone, which held the lease when it was sent. It just no longer describes the device the lease holds
+    by the time the reply arrives.
+  - **`WDA_LEASE_ENDED_REASON` says "no input was sent", which the gesture's error path cannot promise.**
+    A WDA gesture is one `actions` call, and a call that throws because the agent died with the lease may
+    already have run part of the gesture on the previous phone. Not measured.
+  - **The `device_status` probe can report `trusted-wda` across a lease change.** `isDeviceWdaAvailable`
+    opens (or reuses) its session, then awaits `resolve-aim` with no lease check, so a lease that changes
+    during that await pairs the previous phone's session with the new phone's app. It is a read: nothing
+    launches, sends or caches.
+  - **The launcher's own `LEASE_ENDED_REASON` never reaches a reply.** Its one production caller,
+    `getDeviceWdaSession`, re-checks the lease right after `ensureWdaRunning` returns and returns null, so
+    only a direct caller of `ensureWdaRunning` (the tests) ever sees that string.
+- **WiFi leases only** (#1077). WDA binds the phone's :8100, and a USB lease (#1065) reaches the phone
+  through a go-ios forward of the bridge's port alone, so its `127.0.0.1` reaches no agent. Every WDA
+  call in the router reads `deviceConnection.wdaHost()`, which is undefined for a USB or adb lease: input
+  stays synthetic with a reason saying so, and `source:'wda'` is refused. Before the gate, a USB lease
+  launched a signed agent it could never reach, under `ios:<udid>` — the key the USB lease itself holds
+  in the same process, so stopping that agent released the lease's claim.
+- **An editor that dies without a teardown leaves the agent running — it is reaped at the next start**
+  (#1077). A normal quit stops the agent (`before-quit` → `releaseDeviceResourcesOnExit` → `stopWda`;
+  measured on the iPad mini 5: gone with the editor). SIGTERM (`npm run editor:stop`), a crash and `kill -9`
+  run no teardown, and macOS does not kill the `xcodebuild` child with its parent: measured twice, it kept
+  running re-parented to launchd. So each launch records `{pid, xctestrun, owner, instance}` in the clone's
+  `.modoki/wda-agent.json`, and `reclaimStaleDeviceStateAtStartup` kills a recorded agent whose owner is
+  gone and whose command line is still that agent (measured: killed on relaunch, record removed, the dead
+  pid's claims swept). **The gap that stays:** until this clone's editor starts again, the orphan runs on a
+  phone whose claim has expired on pid liveness, so another clone can see that phone as free. A lazy `exit`
+  hook also kills the child, but it does not fire on an Electron SIGTERM (measured: neither it nor the
+  claims store's own `exit` hook ran) — it is there for backend hosts that exit through Node. The reap
+  matches the pid's START TIME as well as its command line: the `.xctestrun` path is machine-wide, so
+  another clone's agent that reused the pid would pass a command check alone. And a sibling clone that
+  picked up an orphan (its probe answered ready, so it launched nothing) loses it when this clone's next
+  start reaps it; its next tap launches its own.
 - **A launch failure QUOTES xcodebuild rather than guessing** (#144). The child's stdout is still
   discarded — a test runner's log is not something an input op should stream — but its **stderr**
   is piped into a 20-line ring buffer, and on a non-zero exit the most specific line is what the

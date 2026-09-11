@@ -113,8 +113,8 @@ export const relKey = (repoRoot, abs) => path.relative(repoRoot, abs).split(path
 /**
  * The leg's name in the gate summary.
  *
- * ⚠️ NOT `path.basename(dir)`. Two copies of `capacitor-applovin-max` exist — court's and
- * 3d-test's — so the basename produced TWO legs called `ios/class/capacitor-applovin-max` in one
+ * ⚠️ NOT `path.basename(dir)`. Two copies of `capacitor-applovin-max` exist — the engine plugin
+ * (court's copy until #931 promoted it) and 3d-test's fork — so the basename produced TWO legs called `ios/class/capacitor-applovin-max` in one
  * summary, and a FAIL on either was unattributable. Measured on the first real run of this gate.
  * An engine plugin keeps its bare name; a project-owned one is prefixed with its project, which is
  * the only thing that distinguishes the two copies.
@@ -136,8 +136,8 @@ export function legLabel(dir) {
  * Every Capacitor plugin package that exists on disk, found by GLOB.
  *
  * ⚠️ Derived, never listed. #981's own table enumerated seven packages by hand and missed
- * `games/3d-test/packages/capacitor-applovin-max` — a second copy of court's, identical but for
- * build artifacts. A hand-maintained list is a second copy of the filesystem and drifts silently;
+ * `games/3d-test/packages/capacitor-applovin-max` — a second copy of court's (since #931, a fork of
+ * the engine plugin), identical but for build artifacts. A hand-maintained list is a second copy of the filesystem and drifts silently;
  * this is what lets `nativePluginLegCoverage.test.ts` fail when a package is added with no leg.
  *
  * A package counts if it carries a `Package.swift`. That is the manifest every one of them has,
@@ -197,6 +197,7 @@ export function schemeFor(packageDir) {
  * is genuinely a temporarily-broken build of something this repo intends to build.
  */
 export const PLUGIN_CLASS_LEGS = [
+  { dir: 'engine/packages/capacitor-applovin-max', shape: 'spm' },
   { dir: 'engine/packages/capacitor-appsflyer', shape: 'spm' },
   { dir: 'engine/packages/capacitor-game-debug', shape: 'spm' },
   {
@@ -246,10 +247,11 @@ export const PLUGIN_CLASS_LEGS = [
       'core/Sources/ModokiOtaCore/OtaZip.swift',
     ],
   },
-  // ⚠️ TWO copies of applovin-max exist — court's and 3d-test's, identical but for build
-  // artifacts. Both get a leg because both are on disk and both would ship. #931 proposes
-  // promoting one into engine/packages/, which collapses these two rows into one.
+  // ⚠️ TWO copies of applovin-max still exist: the engine plugin above (promoted out of Court in
+  // #931) and 3d-test's game-owned fork, identical at the promotion but maintained by nobody since.
+  // The fork keeps its own leg because it is on disk and compiles. It is NOT switched to the engine
+  // tarball: 3d-test's root never declares the plugin, so it stays out of that game's native build,
+  // and vendoring it in would put MAX there, where blank unit ids crash at init (#510).
   { dir: 'games/3d-test/packages/capacitor-adjust', shape: 'spm' },
   { dir: 'games/3d-test/packages/capacitor-applovin-max', shape: 'spm' },
-  { dir: 'games/court/packages/capacitor-applovin-max', shape: 'spm' },
 ];

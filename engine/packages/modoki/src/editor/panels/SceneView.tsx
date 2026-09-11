@@ -73,7 +73,7 @@ import { resolvePickSelection, type PickModifiers } from '../scene/pickSelection
 import { computePaintOrder } from '../../runtime/rendering/paintOrder';
 import { UIRenderer } from '../../runtime/ui/UIRenderer';
 import { useEditorStore } from '../store/editorStore';
-import { register } from '../input/keymap';
+import { register, registerBindings } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { isTextEditable } from '../input/focusScope';
 import { worldToLocalTransform, clampScaleCrossingPivot, scaleCrossedPivot, scaleFromGizmoRatio, type ScaleSigns } from '../scene/gizmoTransform';
@@ -695,7 +695,7 @@ export default function SceneView() {
   // they can't drift. Everywhere else — Game view, Inspector, nothing focused — yields,
   // for free, via keymap scope priority; no `focusedPanel` check needed here at all.
   useEffect(() => {
-    const offs = [
+    const offBindings = registerBindings(() => [
       register({
         id: 'scene.gizmoSpace', keys: 'x', scope: 'scene',
         run: () => setGizmoSpace(useEditorStore.getState().gizmoSpace === 'world' ? 'local' : 'world'),
@@ -744,8 +744,8 @@ export default function SceneView() {
         id: `scene.gizmo.${m.value}`, keys: m.key, scope: 'scene',
         run: () => setGizmoMode(m.value),
       })),
-    ];
-    return () => { for (const off of offs) off(); };
+    ]);
+    return offBindings;
   }, [setGizmoMode, setGizmoSpace, setParticlePreview, mode, updateViewTransform, hmrEpoch]);
 
   const handleViewportContextMenu = useCallback((e: React.MouseEvent) => {

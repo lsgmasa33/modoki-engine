@@ -30,6 +30,7 @@ import {
   type TierRenderOverrides, type AuthoredTiers, type TierDefaultOverrides,
 } from './qualityTier';
 import { publishQualityTierChange } from './tierChangeNotify';
+import { notifyListeners } from '../core/notifyListeners';
 
 export interface ThreeRenderSettings {
   backend: 'auto' | 'webgpu' | 'webgl';
@@ -252,9 +253,11 @@ export function onDebugPixelRatioCapOverrideChange(cb: () => void): () => void {
 }
 
 /** Iterate a COPY — a listener that unsubscribes itself during the callback must not corrupt the
- *  live Set's iteration or skip a sibling (same rule as `resizeBus`). */
+ *  live Set's iteration or skip a sibling (same rule as `resizeBus`). Isolated per listener (#953):
+ *  the override is already committed, so a throwing listener used to leave later panels showing
+ *  the pre-override state. */
 function notifyOverrideChanged(): void {
-  for (const cb of [...overrideListeners]) cb();
+  notifyListeners([...overrideListeners], 'renderSettings:pixelRatioCapOverride', []);
 }
 
 /** Set (or clear, with `null`) the debug override for one surface's `pixelRatioCap`. Debug-only,

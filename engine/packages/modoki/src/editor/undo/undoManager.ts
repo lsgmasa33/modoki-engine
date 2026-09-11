@@ -3,6 +3,7 @@
 import { editorEmit } from '../editorJournal';
 import { markSceneDirty } from '../scene/sceneDirty';
 import { reportUndoThrew } from './undoFailure';
+import { notifyListeners } from '../../runtime/core/notifyListeners';
 
 /** Structured diff for a trait-field edit — the machine-readable companion to an
  *  action's human `label`, forwarded into the editor journal's `!edit` event so
@@ -122,7 +123,7 @@ let _version = 0;
 const _changeListeners = new Set<() => void>();
 function notifyUndoChanged() {
   _version++;
-  for (const l of _changeListeners) l();
+  notifyListeners(_changeListeners, 'undoManager', []);
 }
 /** Subscribe to undo/redo stack changes. Returns an unsubscribe fn. */
 export function subscribeUndo(listener: () => void): () => void {

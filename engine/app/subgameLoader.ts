@@ -14,6 +14,7 @@
 import { Capacitor } from '@capacitor/core';
 import { ENGINE_API_VERSION, SUBGAME_MANIFEST_SCHEMA_VERSION, loadManifestJson, ASSET_MANIFEST_VERSION, type AssetManifestFile, type GameDefinition } from '@modoki/engine/runtime';
 import projectConfig from 'virtual:modoki-project-config';
+import { notifyListeners } from '@modoki/engine/runtime/core/notifyListeners';
 import { checkAppSubgameUpdates, isPluginUnimplemented } from './ota';
 import { registerDynamicGame, getGames } from './gameRegistry';
 
@@ -30,7 +31,7 @@ const listeners = new Set<Listener>();
 function reportError(bundleName: string, version: string, message: string): void {
   console.error(`[GameShell] sub-game "${bundleName}"@${version} refused to load: ${message}`);
   loadErrors.push({ bundleName, version, message });
-  listeners.forEach((l) => l(loadErrors));
+  notifyListeners(listeners, 'subgameLoader:loadErrors', [loadErrors]);
 }
 
 /** Subscribes to the sub-game load-error list for the UI. Invoked immediately with the

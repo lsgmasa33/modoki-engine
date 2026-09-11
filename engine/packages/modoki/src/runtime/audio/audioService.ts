@@ -14,6 +14,7 @@
  *  still letting a test assert *what would have played* (`getAudioLog()`), with no
  *  dependency on the journal being enabled. */
 
+import { notifyListeners } from '../core/notifyListeners';
 import { getAudioContext, hasAudioSupport } from './audioContext';
 import { audioAssetProvider } from './audioAssetProvider';
 import { hasDocKey } from '../core/docKeys';
@@ -329,9 +330,7 @@ export function resume(): void {
   // `hasAudioSupport()` is false) the signal never fired at all. Harmless for audio,
   // since there is nothing to unlock — but VIDEO does not need Web Audio to play, so
   // it would have sat behind the autoplay block forever on exactly those devices.
-  for (const fn of gestureUnlockListeners) {
-    try { fn(); } catch { /* a subsystem's retry must not break the unlock */ }
-  }
+  notifyListeners(gestureUnlockListeners, 'audioService:gestureUnlock', []); // a subsystem's retry must not break the unlock
   if (recording()) { log.push({ op: 'resume' }); return; }
   const g = graphOrNull();
   if (g && g.ctx.state === 'suspended') {

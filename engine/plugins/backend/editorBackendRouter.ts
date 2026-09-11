@@ -232,9 +232,9 @@ import { deviceConnection, type ConnectRequest } from './deviceConnection';
 import { adbBinary, isUsable, listAndroidDevices, pickHostSideAndroidSerial, resolveBuildAndroidSerial, withFriendlyNames } from './androidDevices';
 import { adbDeviceId, iosDeviceId, listClaims, type DeviceClaim } from './deviceClaims';
 import { tryDeviceCdpInput, isDeviceCdpAvailable, synthFallbackBanner, TRUSTED_CDP_MECHANISM, isCdpRoutableMethod } from './deviceCdp';
-import { tryDeviceWdaInput, isDeviceWdaAvailable, resetDeviceWdaSession, tryDeviceWdaScreenshot, TRUSTED_WDA_MECHANISM, WDA_NOT_IOS_REASON, NO_WDA_ON_THIS_DEVICE } from './deviceWda';
+import { tryDeviceWdaInput, isDeviceWdaAvailable, tryDeviceWdaScreenshot, captureDeviceWdaLease, isWdaRoutableMethod, TRUSTED_WDA_MECHANISM, WDA_NOT_IOS_REASON, WDA_NEEDS_WIFI_REASON, NO_WDA_ON_THIS_DEVICE } from './deviceWda';
 import { isDeviceFailureReply } from './deviceAim';
-import { listIosDevicesForSelection, stopWda } from './wdaLauncher';
+import { listIosDevicesForSelection } from './wdaLauncher';
 import { captureIosSyslog, resolveGoIos } from './deviceSyslog';
 import { resolveGoIosDevice, listGoIosUdids, pickHostSidePlatform, leaseForIosOps } from './goIosDevice';
 import { readAndroidDiagnostics, readAndroidSystemLog } from './deviceAndroidDiag';
@@ -1416,7 +1416,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     // READ spends a :8100 probe on an Android phone, and would report `trusted-wda` for it if
     // anything at all answered there.
     if (await deviceConnection.devicePlatform() === 'ios'
-        && await isDeviceWdaAvailable({ proxy, host: status.target?.host })) {
+        && await isDeviceWdaAvailable({ proxy, host: deviceConnection.wdaHost() })) {
       return json({ ...status, inputMechanism: TRUSTED_WDA_MECHANISM, trustedOps: ['tap', 'drag'] });
     }
     return json({ ...status, inputMechanism: 'synthetic' });
@@ -1477,11 +1477,9 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 500); }
   }
   if (urlPath === '/api/device/disconnect' && method === 'POST') {
-    // Decision 2 — WDA is attached UNDER the lease and torn down with it, so exactly one thing
-    // answers "who holds this device", and disconnecting can never strand a signed agent running
-    // on the phone. Done before the lease drops so a failure here still leaves the lease closable.
-    stopWda();
-    resetDeviceWdaSession();
+    // Decision 2 — WDA is attached UNDER the lease and torn down with it. That teardown lives in
+    // `deviceConnection.disconnect()` itself, not here (#1077): this route is only ONE way a lease
+    // ends, and a `device_connect` that supersedes the lease never came through it.
     try { return json(await deviceConnection.disconnect()); }
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 500); }
   }
@@ -1741,6 +1739,13 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
         // whose app happens to be suspended. (Tried it; it also broke the no-lease test by leaking
         // a previous connection's address, which is the same bug wearing a test failure.)
         const host = st.target?.host;
+        // Where WDA is reached — the same address for a WiFi lease, undefined for a USB/adb one (#1077).
+        // `host` above still decides "was any device ever connected"; only the WDA calls read this.
+        const wdaHost = deviceConnection.wdaHost();
+        // Captured in the SAME synchronous block as the address. Everything below awaits (the platform and hardware
+        // probes, the native capture) before WDA is asked, and a lease that ends in between must not be photographed
+        // through the address it left behind (#1077's close-out round-4 review).
+        const wdaLease = captureDeviceWdaLease();
         // WDA is an iOS agent (#99). Resolved from the lease's cached `app-identity`, so it still
         // answers while the app is suspended — see `devicePlatform()`, which is why it is learned
         // at connect time rather than here.
@@ -1762,11 +1767,13 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
           // agent only exists on iOS, so answer immediately instead of spending a :8100 probe (and,
           // on a Mac, a doomed xcodebuild) on a phone that can never host one.
           if (!isIos) return json({ error: WDA_NOT_IOS_REASON }, 409);
+          // An iOS lease over USB has no route to :8100 (#1077) — say so before spending a launch.
+          if (!wdaHost) return json({ error: WDA_NEEDS_WIFI_REASON }, 409);
           // Explicit ask pays the agent spin-up; a refusal must say why rather than quietly
           // handing back a native capture the caller specifically did not want.
           // The only screenshot path that LAUNCHES, so the only one that needs the lease's
           // hardware to pick the right phone (#146). The two fallbacks below never auto-launch.
-          const shot = await tryDeviceWdaScreenshot({ host, lease: await deviceConnection.deviceHardware() }, { autoLaunch: true });
+          const shot = await tryDeviceWdaScreenshot({ host: wdaHost, leaseLive: wdaLease, lease: await deviceConnection.deviceHardware() }, { autoLaunch: true });
           return shot.handled ? json({ result: shot.reply }) : json({ error: shot.reason }, 409);
         }
         // The native capture fails two ways, and BOTH mean "the app could not photograph itself":
@@ -1780,11 +1787,11 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
         } catch (e) {
           // Non-iOS has no agent to fall back TO, so skip straight to the canonical lease error
           // rather than probing the phone's :8100 first.
-          const shot = isIos ? await tryDeviceWdaScreenshot({ host }) : NO_WDA_ON_THIS_DEVICE;
+          const shot = isIos ? await tryDeviceWdaScreenshot({ host: wdaHost, leaseLive: wdaLease }) : NO_WDA_ON_THIS_DEVICE;
           if (shot.handled) return json({ result: { ...shot.reply, nativeCaptureFailed: String(e instanceof Error ? e.message : e) } });
           throw e;   // nothing to add: the canonical lease error IS the right answer
         }
-        const shot = isIos ? await tryDeviceWdaScreenshot({ host }) : NO_WDA_ON_THIS_DEVICE;
+        const shot = isIos ? await tryDeviceWdaScreenshot({ host: wdaHost, leaseLive: wdaLease }) : NO_WDA_ON_THIS_DEVICE;
         if (shot.handled) return json({ result: { ...shot.reply, nativeCaptureFailed: String(native) } });
         // Both paths failed: return the NATIVE error, which is the one the caller asked for. The
         // WDA reason rides along so "why didn't the fallback save me" is answerable without a
@@ -1837,11 +1844,20 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       if (!outcome.handled && await deviceConnection.devicePlatform() === 'ios') {
         // `lease` is what stops the lazy launch picking a phone by what is plugged into this Mac
         // (#146). Same probe as `devicePlatform()` just above, so it costs no extra round trip.
-        const wda = await tryDeviceWdaInput(b.method, b.params ?? {}, {
-          proxy,
-          host: deviceConnection.status().target?.host,
-          lease: await deviceConnection.deviceHardware(),
-        });
+        // No route to the agent under a USB lease (#1077): a WDA op gets the reason instead of a launch
+        // aimed at `127.0.0.1` — which could never answer, and would claim the lease's own `ios:<udid>`.
+        // A non-WDA op keeps `reason: null`, so the CDP-side cause stays the banner's reason.
+        const wdaHost = deviceConnection.wdaHost();
+        // Beside the address, for the same reason as the screenshot route: `deviceHardware()` awaits before the call.
+        const wdaLease = captureDeviceWdaLease();
+        const wda = wdaHost
+          ? await tryDeviceWdaInput(b.method, b.params ?? {}, {
+            proxy,
+            host: wdaHost,
+            leaseLive: wdaLease,
+            lease: await deviceConnection.deviceHardware(),
+          })
+          : { handled: false as const, reason: isWdaRoutableMethod(b.method) ? WDA_NEEDS_WIFI_REASON : null };
         // Keep the CDP reason when WDA has nothing to add (`reason: null` = not an op it routes):
         // the caller's banner should name the cause, and "not a WDA op" is not the cause.
         if (wda.handled || wda.reason) outcome = wda;

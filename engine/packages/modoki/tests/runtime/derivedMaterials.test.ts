@@ -8,7 +8,7 @@
  *  real call site could ever observe WHICH of two retires' dispose steps actually runs; both do
  *  the same thing. This file passes two DISTINGUISHABLE closures instead, which is the only way
  *  to tell "first wins" apart from "last wins" or "both run". */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import * as THREE from 'three';
 import { createWorld } from 'koota';
 import { setCurrentWorld } from '../../src/runtime/core/ecs/world';
@@ -63,6 +63,21 @@ describe('the retirement queue', () => {
     const clone = new THREE.MeshStandardMaterial();
     expect(() => disposeRetiredDerivedMaterial(clone)).not.toThrow();
     expect(retiredDerivedCount()).toBe(0);
+  });
+
+  it('a dispose step that throws does not leak the clones queued behind it (#953)', () => {
+    // The drain clears the queue BEFORE disposing, so pre-#953 a throwing step left every clone
+    // behind it undisposed with nothing left that could ever reach it.
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const ran: string[] = [];
+    retireDerivedMaterial(new THREE.MeshStandardMaterial(), () => { throw new Error('dispose boom'); });
+    retireDerivedMaterial(new THREE.MeshStandardMaterial(), () => { ran.push('second'); });
+
+    expect(() => resetDerivedMaterials()).not.toThrow();
+
+    expect(ran).toEqual(['second']);
+    expect(retiredDerivedCount()).toBe(0);
+    errSpy.mockRestore();
   });
 });
 

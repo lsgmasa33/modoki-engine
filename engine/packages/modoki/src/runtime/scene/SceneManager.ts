@@ -88,6 +88,7 @@
 import { createWorld, type World, type Entity } from 'koota';
 import { setCurrentWorld, getCurrentWorld, spawnEntity } from '../core/ecs/world';
 import { createTeardownToken, type LivenessCheck } from '../core/liveness';
+import { notifyListeners } from '../core/notifyListeners';
 import { getAllTraits } from '../core/ecs/traitRegistry';
 import { resolveKootaSchema } from './sceneSchema';
 import { resolveSceneChain, type SceneRef, type FetchSceneMeta } from './sceneChain';
@@ -339,10 +340,19 @@ class SceneManagerImpl implements SceneManager {
   }
 
   private fireSceneCallbacks(scenePath: string) {
+    // Fan out through the shared helper (#953). Its report is `console.error`, so a game callback
+    // that throws spends the crash budget like any other listener defect (owner ruling on #953);
+    // this used to be a `console.warn`.
+    notifyListeners(this.matchingSceneCallbacks(scenePath), 'SceneManager:onSceneLoaded', []);
+  }
+
+  /** The callbacks whose pattern matches, yielded LAZILY from the live Map. A snapshot array would
+   *  change what the old loop did when a callback (un)registers another mid-fan-out: an
+   *  unregistered later match must not fire, and a newly registered one fires in the same pass —
+   *  the Map semantics `notifyListeners` documents keeping. */
+  private *matchingSceneCallbacks(scenePath: string): Generator<() => void> {
     for (const [pattern, cb] of this.sceneCallbacks) {
-      if (pattern === '*' || scenePath.includes(pattern)) {
-        try { cb(); } catch (e) { console.warn(`[SceneManager] onSceneLoaded callback failed:`, e); }
-      }
+      if (pattern === '*' || scenePath.includes(pattern)) yield cb;
     }
   }
 

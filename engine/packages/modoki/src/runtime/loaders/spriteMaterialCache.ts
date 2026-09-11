@@ -128,7 +128,9 @@ export function clearSpriteMaterialCache(): void {
   loading.clear();
   waiters.clear();
   failed.clear();
-  for (const cb of pending) cb();
+  // Isolated per waiter (#953): every map above is already cleared, so a throwing wake would leave
+  // each wake behind it permanently unfired — those renderers stay on the fallback sprite.
+  notifyListeners(pending, 'spriteMaterialCache', []);
 }
 
 /** The ONE definition of "a `.shader.json` changed" (#842, made per-key by #852). Both the
@@ -196,7 +198,9 @@ export function invalidateShader(manifestPath: string): void {
     failed.delete(guid);
     loading.delete(guid);
     waiters.delete(guid);
-    for (const cb of pending) cb();
+    // Isolated per waiter (#953): a throwing wake used to escape here and skip BOTH the wakes
+    // behind it and `invalidatePixiShaderProgram` below, so the shader edit silently didn't take.
+    notifyListeners(pending, 'spriteMaterialCache', []);
   } else {
     // Unresolved guid — fail SAFE, not silent. See the docblock above: "unknown" must not be
     // treated as "absent", or an edit to a not-yet-indexed shader would silently not take.

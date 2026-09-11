@@ -33,6 +33,7 @@
  *  Re-running it is therefore the whole of "apply the new cap", and it keeps ONE implementation
  *  of the clamp instead of a second copy here that could drift. */
 
+import { notifyListeners } from '../core/notifyListeners';
 import { rawNow } from '../core/clock';
 import { hasRecentUserInput, msSinceUserInput } from '../core/userActivity';
 import { getFrameProfile, resetFrameProfile } from '../core/frameProfiler';
@@ -164,9 +165,7 @@ export function getTierSwitchOverlayMessage(): string | null { return overlayMes
 
 function publishTierSwitchOverlay(message: string | null): void {
   overlayMessage = message;
-  for (const fn of overlayListeners) {
-    try { fn(message); } catch (e) { console.warn('[qualityTier] overlay listener failed:', e); }
-  }
+  notifyListeners(overlayListeners, 'qualityTier:overlay', [message]);
 }
 
 /** Arm live calibration: from here on, the frame profile is treated as evidence about what this

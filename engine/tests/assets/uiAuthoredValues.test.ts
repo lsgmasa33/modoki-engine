@@ -322,10 +322,11 @@ describe('committed UI content does not fake spacing with whitespace (#676)', ()
  *  a raw newline inside a template are the same finding.
  *
  *  **Two corpora, scoped differently on purpose** (measured 2026-09-11):
- *  - **Game and demo code is scanned WITHOUT a "reaches UIElement.text" marker.** The one known
- *    space-run literal, wordweave's `hudFormat`, is authored in `traits.ts` and reaches the DOM from
- *    `screen.ts` — a per-file marker cannot see it, nor any other flow that crosses a file. Unmarked,
- *    this corpus is quiet: one space-run token and three newline files, all ledgered below.
+ *  - **Game and demo code is scanned WITHOUT a "reaches UIElement.text" marker.** The space-run literal
+ *    that motivated it, wordweave's `hudFormat`, was authored in `traits.ts` and reached the DOM from
+ *    `screen.ts` — a per-file marker cannot see that, nor any other flow that crosses a file. Unmarked,
+ *    this corpus is quiet: zero space-run tokens since #1080 retired `hudFormat`, and three newline
+ *    files, all ledgered below.
  *  - **Engine code is scanned only where it WRITES UIElement text** (`UI_TEXT_WRITE`). Unmarked, its
  *    strings are shader source, CSS keyframes and console text — 60+ space runs and 21 newline files,
  *    none reaching a UIElement — so an unmarked scan would be a ledger of noise nobody reads.
@@ -390,13 +391,14 @@ describe('shippable code does not fake spacing with whitespace (#841)', () => {
       label: 'string-literal space runs in game/demo code (#841)',
       declared: [],
       population: [...new Set(projectScan().spaceRuns.map((s) => `${s.rel}::${JSON.stringify(s.text)}`))].sort(),
-      floor: 1,
+      // `floor: 0` — the population is legitimately EMPTY now. Its one member was wordweave's `hudFormat`,
+      // whose space runs split one string into HUD parts; #1080 replaced it with one authored format per
+      // DOM node, so no space-run literal is left in game code. The non-vacuity this floor would otherwise
+      // provide is pinned by the sanity test above (files and string tokens scanned), which is what can
+      // tell "nothing found" from "the scan broke".
+      floor: 0,
       fix: FIX,
-      exempt: [
-        { item: 'games/wordweave/runtime/traits.ts::"LEVEL {level}    {found}/{total} WORDS    {extras}/{extraTotal} EXTRA"',
-          reason: 'a DELIMITER, never displayed as one string: splitHudParts (screen.ts) splits the format on its '
-            + 'space runs into separate HUD parts laid out by the row — the runs are the instruction, not the spacing' },
-      ],
+      exempt: [],
     });
   });
 

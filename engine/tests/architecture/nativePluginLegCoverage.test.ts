@@ -88,8 +88,8 @@ describe('#981 plugin-class leg coverage', () => {
   })
 
   it('gives every leg a DISTINCT name in the summary', () => {
-    // Found on this gate's first real run: two copies of capacitor-applovin-max exist (court's and
-    // 3d-test's), so `path.basename(dir)` printed two legs called `ios/class/capacitor-applovin-max`
+    // Found on this gate's first real run: two copies of capacitor-applovin-max existed (court's and
+    // 3d-test's; since #931 the engine plugin and 3d-test's fork), so `path.basename(dir)` printed two legs called `ios/class/capacitor-applovin-max`
     // and a FAIL on either was unattributable — the summary is the whole output of this gate, so a
     // name collision there is a real defect, not cosmetics.
     const labels = legs.map((l) => legLabel(l.dir))

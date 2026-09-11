@@ -1,7 +1,7 @@
 /** resizeBus unit tests — the debug menu's force-resize registry (see resizeBus.ts's
  *  header for WHY it exists: it just re-invokes handlers that already re-read config). */
 
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { onForceResize, forceResizeAllSurfaces } from '../../src/runtime/rendering/resizeBus';
 
 describe('resizeBus', () => {
@@ -36,6 +36,18 @@ describe('resizeBus', () => {
     cleanups.push(onForceResize(() => { c += 1; }));
     forceResizeAllSurfaces();
     expect([a, b, c]).toEqual([1, 1, 1]);
+  });
+
+  it('a listener that throws does not leave the surfaces after it un-resized, and nothing escapes (#953)', () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    let after = 0;
+    cleanups.push(onForceResize(() => { throw new Error('resize boom'); }));
+    cleanups.push(onForceResize(() => { after += 1; }));
+
+    expect(() => forceResizeAllSurfaces()).not.toThrow();
+
+    expect(after).toBe(1);
+    errSpy.mockRestore();
   });
 
   it('a listener that unsubscribes ITSELF mid-notify still lets every other listener fire', () => {

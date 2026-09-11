@@ -110,6 +110,9 @@ let phase: Phase = 'idle';
 let downX = 0;
 let downY = 0;
 let downT = 0;
+// The set version the press left behind — what a frame sampling this finger alone publishes. Taken
+// AFTER `addPointer`'s bump, so it names the set with this finger in it.
+let downSetVersion = 0;
 
 // The reference point pan deltas are measured from. Set to the CROSSING point when a pan is
 // promoted (not to the press origin), so engaging pan does not jump the content by the slop.
@@ -137,6 +140,7 @@ let tapEligible = false;
 let tapPending = false;
 let tapAtX = 0;
 let tapAtY = 0;
+let tapAtSetVersion = 0;
 
 const find = (id: number): LivePointer | undefined => live.find((p) => p.id === id);
 
@@ -320,6 +324,7 @@ function onPointerDown(e: PointerEvent): void {
     downX = e.clientX;
     downY = e.clientY;
     downT = e.timeStamp;
+    downSetVersion = pointerSetVersion;
     panRefX = e.clientX;
     panRefY = e.clientY;
     tapPending = false;
@@ -391,6 +396,7 @@ function onPointerUp(e: PointerEvent): void {
       // what the player aimed at.
       tapAtX = downX;
       tapAtY = downY;
+      tapAtSetVersion = downSetVersion;
     }
   }
   endGesture();
@@ -482,6 +488,7 @@ export const gestureSource: InputSource = {
     if (tapPending) {
       g.tapX = tapAtX;
       g.tapY = tapAtY;
+      g.tapSetVersion = tapAtSetVersion;
       tapPending = false;
     }
 

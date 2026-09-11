@@ -12,6 +12,7 @@
 import { Capacitor, ExceptionCode } from '@capacitor/core';
 import { checkForUpdate, fetchRelease } from '@modoki/engine/runtime';
 import { createSupersessionToken } from '@modoki/engine/runtime/core/liveness';
+import { notifyListeners } from '@modoki/engine/runtime/core/notifyListeners';
 import type { OtaProgressEvent } from 'capacitor-modoki-ota';
 import projectConfig from 'virtual:modoki-project-config';
 
@@ -69,7 +70,7 @@ function setGate(state: OtaGateState | null): void {
   // not because anything today depends on it.
   if (state === null && gateState?.phase === 'ready-to-restart') return;
   gateState = state;
-  gateListeners.forEach((l) => l(state));
+  notifyListeners(gateListeners, 'ota:gate', [state]);
 }
 
 /** Subscribes to the blocking-gate state for the UI (App.tsx). Invoked immediately with

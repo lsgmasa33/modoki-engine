@@ -110,6 +110,60 @@ describe('tap', () => {
   });
 });
 
+describe('the tap names the pointer set it went down in (`tapSetVersion`, #951)', () => {
+  it('equals the version a frame that sampled the press published', () => {
+    send('pointerdown', 1, 100, 100, T0 + 0);
+    const pressed = sample().gesture.pointerSetVersion;
+    send('pointerup', 1, 100, 100, T0 + 50);
+    const f = sample();
+
+    expect(f.gesture.tapped).toBe(true);
+    expect(f.gesture.pointerSetVersion, 'the lift changed the set').not.toBe(pressed);
+    expect(f.gesture.tapSetVersion).toBe(pressed);
+  });
+
+  it('a re-grip: the tap names the set sampled with the NEW finger down, not the one before the swap', () => {
+    send('pointerdown', 1, 100, 100, T0 + 0);
+    const first = sample().gesture.pointerSetVersion;
+    // Finger 1 lifts and finger 2 lands between two samples; finger 2 is then sampled, and taps.
+    send('pointerup', 1, 100, 100, T0 + 300);
+    send('pointerdown', 2, 300, 300, T0 + 310);
+    const regrip = sample().gesture.pointerSetVersion;
+    send('pointerup', 2, 300, 300, T0 + 360);
+    const f = sample();
+
+    expect(regrip, 'setup: the swap changed the set').not.toBe(first);
+    expect(f.gesture.tapped).toBe(true);
+    expect(f.gesture.tapSetVersion).toBe(regrip);
+  });
+
+  it('a tap whose press was never sampled matches no version a consumer saw', () => {
+    send('pointerdown', 1, 100, 100, T0 + 0);
+    send('pointermove', 1, 100 + DEFAULT_TAP_SLOP_PX + 5, 100, T0 + 10); // a pan, not a tap
+    const seen = sample().gesture.pointerSetVersion;
+    // Finger 1 lifts, finger 2 lands AND lifts — all between the same two samples.
+    send('pointerup', 1, 100 + DEFAULT_TAP_SLOP_PX + 5, 100, T0 + 20);
+    send('pointerdown', 2, 300, 300, T0 + 30);
+    send('pointerup', 2, 300, 300, T0 + 60);
+    const f = sample();
+
+    expect(f.gesture.tapped).toBe(true);
+    expect(f.gesture.tapSetVersion).not.toBe(seen);
+    expect(f.gesture.tapSetVersion, 'nor the set left after the lift').not.toBe(f.gesture.pointerSetVersion);
+  });
+
+  it('is 0 on a frame with no tap', () => {
+    send('pointerdown', 1, 100, 100, T0 + 0);
+    send('pointerup', 1, 100, 100, T0 + 50);
+    // ONE frame, re-sampled, as `inputSystem` does — a fresh frame per sample starts at 0 and could not
+    // tell a per-frame clear from none (mutation-checked).
+    const f = sample();
+    expect(f.gesture.tapSetVersion).toBeGreaterThan(0);
+    sample(f);
+    expect(f.gesture.tapSetVersion).toBe(0);
+  });
+});
+
 describe('pan', () => {
   it('promotes the instant the slop is crossed — it does NOT wait out the tap window', () => {
     send('pointerdown', 1, 100, 100, T0 + 0);

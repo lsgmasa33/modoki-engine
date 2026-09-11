@@ -50,6 +50,7 @@ import { readFileSync } from 'node:fs';
 import { listClaims, sameClone } from './deviceClaimsStore.mjs';
 import { canonicalPath } from './pathIdentity.mjs';
 import { parseDeviceCommand } from './deviceCommandTargets.mjs';
+import { iosClaimKeys, onceLoader } from './iosDeviceIdentity.mjs';
 
 /** Cheap pre-filter: does this command even mention a tool that can touch a phone? Deliberately
  *  broader than the parser (it may match a command the parser then dismisses) — being wrong in the
@@ -129,18 +130,27 @@ function main() {
   const clone = thisClone(payload);
   const claims = listClaims();
 
+  // One phone, several ids (#1078): `devicectl --device` may name the CoreDevice identifier, an ECID, a
+  // serial number or a name, while every claim is keyed by UDID. So an `ios:` id is compared under its
+  // UDID AND as written (a claim someone took under that spelling still counts). The device listing is
+  // read at most once, and only for an id that is not already UDID-shaped — never for adb, and never on
+  // the allow paths above.
+  const loadIosDevices = onceLoader();
   for (const id of targets.ids) {
-    const held = claims.find((c) => c.deviceId === id);
-    if (held && !heldByThisClone(held, clone)) {
+    const { canonical, keys } = iosClaimKeys(id, loadIosDevices);
+    const heldUnder = keys.map((k) => claims.find((c) => c.deviceId === k)).filter(Boolean);
+    const named = canonical === id ? id : `${canonical} (the device ${id} names)`;
+    const held = heldUnder.find((c) => !heldByThisClone(c, clone));
+    if (held) {
       return deny(`Refused: ${command.slice(0, 120)}\n\nThis device is held by another clone. `
         + `${describeHeld(held)}\n\nTwo sessions driving one phone install over each other and `
         + 'interleave taps, and the victim gets no attribution — which is why this is refused rather '
         + 'than warned about. Use a different device, or ask that session to release it.');
     }
-    if (!held) {
-      return deny(`Refused: ${command.slice(0, 120)}\n\nNothing holds ${id} on this machine, and a `
+    if (!heldUnder.length) {
+      return deny(`Refused: ${command.slice(0, 120)}\n\nNothing holds ${named} on this machine, and a `
         + 'destructive device command must run under a claim — four clones share this hardware, and '
-        + `an unclaimed phone is one another session may take mid-flight.\n\n${CLAIM_HINT(id)}`);
+        + `an unclaimed phone is one another session may take mid-flight.\n\n${CLAIM_HINT(canonical)}`);
     }
   }
 

@@ -256,7 +256,9 @@ if (invokedDirectly) {
       // which is the confusion #881 was about in the first place.
       `[editor-ports] '${path.basename(canonicalPath(repoRoot))}' is not a known clone directory — ` +
         `using AUTO ports. Set MODOKI_BACKEND_PORT explicitly to pin one ` +
-        `(known: ${Object.keys(CLONE_BACKEND_PORTS).join(', ')}; see docs/clones-and-ports.md).\n`,
+        // Names the TABLE, not a doc: this file ships in the public snapshot and runs on every
+        // launch from an unknown directory, while docs/clones-and-ports.md does not ship (#907).
+        `(known: ${Object.keys(CLONE_BACKEND_PORTS).join(', ')}; table: CLONE_BACKEND_PORTS in engine/scripts/editorPorts.mjs).\n`,
     );
   } else if (cmd === 'backend') {
     process.stdout.write(String(port));

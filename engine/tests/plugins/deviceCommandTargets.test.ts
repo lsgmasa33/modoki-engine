@@ -324,6 +324,16 @@ describe('parseDeviceCommand — devicectl', () => {
     expect(r.untargeted).toBe(true);
     expect(r.ids).toEqual([]);
   });
+
+  it('reads devicectl\'s short -d as the device, the same as --device (#1078)', () => {
+    // Before, this was "untargeted" and refused for naming no device, although it names one.
+    expect(parseDeviceCommand('xcrun devicectl device process launch -d 00008150-TESTTESTTESTTEST com.example.app')).toEqual({
+      ids: ['ios:00008150-TESTTESTTESTTEST'],
+      destructive: true,
+      untargeted: false,
+      tools: ['devicectl'],
+    });
+  });
 });
 
 describe('parseDeviceCommand — ideviceinstaller', () => {

@@ -8,6 +8,8 @@
  *
  *  `entityUtils.ts` re-exports both functions unchanged, so every existing caller keeps working. */
 
+import { notifyListeners } from './notifyListeners';
+
 const _dirtyListeners: Set<() => void> = new Set();
 
 /** Register a dirty listener. Returns an unsubscribe function. */
@@ -26,7 +28,5 @@ export function addDirtyListener(fn: () => void): () => void {
  *  listener loop — must not let one throwing subscriber abort a caller mid-eviction, or a
  *  half-pruned manifest / half-evicted cache is the result. Mirrors that loop's isolation. */
 export function fireDirtyListeners() {
-  for (const fn of _dirtyListeners) {
-    try { fn(); } catch (e) { console.warn('[renderDirty] a dirty listener threw:', e); }
-  }
+  notifyListeners(_dirtyListeners, 'renderDirty', []);
 }

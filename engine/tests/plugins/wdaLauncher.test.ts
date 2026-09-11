@@ -1,12 +1,16 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { reapDeps } from '../../plugins/backend/iosUsbForward';
 import { readScannedSource } from '@modoki/engine/testing';
 import {
   parseIosDevices, resolveIosDevice, ensureWdaRunning, stopWda,
   isWdaProcessRunning, _resetWdaLauncherForTests, WDA_PROBE_TIMEOUT_MS,
   parseXctraceDevices, mergeIosDevices, mergeGoIosDevices, pickWdaFailureLine, describeExecFailure,
   _devicectlOutPath, listIosDevicesForSelection, wdaLauncherExec, _clearIosListCache,
+  reapRecordedWdaAgent, killWdaChildOnExit, WDA_RECORD_FILE,
 } from '../../plugins/backend/wdaLauncher';
 
 /**
@@ -823,6 +827,165 @@ describe('iOS listing — go-ios fills what Apple\'s listings drop', () => {
       wdaLauncherExec.listGoIosUdids = real.l; wdaLauncherExec.goIosInfo = real.i;
       wdaLauncherExec.listDevices = real.d; wdaLauncherExec.listLegacyDevices = real.g;
     }
+  });
+});
+
+/** #1077 — an agent outlives an editor that dies without running a teardown. MEASURED on the iPad mini 5:
+ *  after `npm run editor:stop` (SIGTERM) the `xcodebuild` child kept running with ppid 1. Two closures:
+ *  an `exit` hook that kills it, and a per-clone pid record the next startup reaps. */
+describe('WebDriverAgent left behind by an editor that died (#1077)', () => {
+  const XCTESTRUN = '/fake/toolchain/wda/WDA.xctestrun';
+  const AGENT_COMMAND = `/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild test-without-building -xctestrun ${XCTESTRUN} -destination id=UDID-A`;
+  const realReap = { ...reapDeps };
+  const STARTED = 'Fri Sep 11 20:30:00 2026';
+  let dir: string;
+  const recordFile = () => path.join(dir, WDA_RECORD_FILE);
+  const writeRecord = (rec: Record<string, unknown>) => fs.writeFileSync(recordFile(), JSON.stringify(rec));
+
+  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-wda-record-')); });
+  afterEach(() => {
+    stopWda();
+    Object.assign(reapDeps, realReap);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  async function launch(pid: number) {
+    const proc = { pid, exitCode: null as number | null, killed: false, kill() { proc.killed = true; }, on() { /* never exits */ } };
+    let up = false;
+    const r = await ensureWdaRunning({
+      host: 'd', port: 8100, sleep: async () => {}, xctestrun: XCTESTRUN, stateDir: dir, platform: 'darwin',
+      probe: async () => { const v = up; up = true; return v; },
+      listDevices: () => listing([{ udid: 'UDID-A', name: 'Air' }]),
+      spawnImpl: (() => proc) as never,
+    });
+    expect(r).toEqual({ running: true });
+    return proc;
+  }
+
+  it('a launch records the agent under this process, and stopWda drops the record', async () => {
+    await launch(4321);
+    expect(JSON.parse(fs.readFileSync(recordFile(), 'utf8'))).toMatchObject({ pid: 4321, xctestrun: XCTESTRUN, owner: process.pid });
+    stopWda();
+    expect(fs.existsSync(recordFile())).toBe(false);
+  });
+
+  it('the launch registers an exit hook, and the hook kills the running agent', async () => {
+    const proc = await launch(4322);
+    expect(process.listeners('exit')).toContain(killWdaChildOnExit);
+    killWdaChildOnExit();
+    expect(proc.killed).toBe(true);
+  });
+
+  it('startup reaps a recorded agent whose launching backend is gone', () => {
+    writeRecord({ pid: 777, xctestrun: XCTESTRUN, startedAt: STARTED, owner: 999999, instance: 'dead' });
+    reapDeps.isAlive = () => false;
+    reapDeps.commandOf = () => AGENT_COMMAND;
+    reapDeps.startTimeOf = () => STARTED;
+    reapDeps.kill = vi.fn();
+    expect(reapRecordedWdaAgent(dir)).toMatch(/reaped a WebDriverAgent \(pid 777\)/);
+    expect(reapDeps.kill).toHaveBeenCalledWith(777);
+    expect(fs.existsSync(recordFile())).toBe(false);
+  });
+
+  it('leaves the agent and its record alone while the launching backend is still alive', () => {
+    writeRecord({ pid: 777, xctestrun: XCTESTRUN, owner: 999999, instance: 'other' });
+    reapDeps.isAlive = () => true;
+    reapDeps.commandOf = () => AGENT_COMMAND;
+    reapDeps.kill = vi.fn();
+    expect(reapRecordedWdaAgent(dir)).toBeNull();
+    expect(reapDeps.kill).not.toHaveBeenCalled();
+    expect(fs.existsSync(recordFile())).toBe(true);
+  });
+
+  it('never kills a recycled pid: the command must still be that agent, and the stale record is dropped', () => {
+    writeRecord({ pid: 777, xctestrun: XCTESTRUN, owner: 999999, instance: 'dead' });
+    reapDeps.isAlive = () => false;
+    reapDeps.commandOf = () => '/usr/sbin/some-other-daemon --serve';
+    reapDeps.kill = vi.fn();
+    expect(reapRecordedWdaAgent(dir)).toBeNull();
+    expect(reapDeps.kill).not.toHaveBeenCalled();
+    expect(fs.existsSync(recordFile())).toBe(false);
+  });
+
+  it('reads a start time that does not depend on the editor\'s locale or time zone', () => {
+    if (process.platform === 'win32') return;   // `ps` is POSIX-only; the reap never runs a WDA there
+    const plain = reapDeps.startTimeOf(process.pid);
+    expect(plain).toMatch(/^[A-Z][a-z]{2} [A-Z][a-z]{2} +\d{1,2} \d\d:\d\d:\d\d \d{4}$/);
+    // Two zones far from each other AND from UTC and JST, so the TZ half is tested wherever this runs — the
+    // owner's Macs are on JST, where stubbing Tokyo changed nothing (#1077's close-out re-review).
+    try {
+      vi.stubEnv('LC_ALL', 'ja_JP.UTF-8');
+      vi.stubEnv('LANG', 'ja_JP.UTF-8');
+      vi.stubEnv('TZ', 'Pacific/Kiritimati');
+      const east = reapDeps.startTimeOf(process.pid);
+      vi.stubEnv('TZ', 'Etc/GMT+12');
+      const west = reapDeps.startTimeOf(process.pid);
+      expect(east).toBe(plain);
+      expect(west).toBe(plain);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('a launch in its poll loop keeps waiting when its agent exited and another op already relaunched', async () => {
+    let exitFirst!: () => void;
+    const first = {
+      pid: 5001, exitCode: null as number | null, killed: false, kill() {},
+      on(ev: string, cb: () => void) { if (ev === 'exit') exitFirst = () => { first.exitCode = 1; cb(); }; },
+    };
+    const second = { pid: 5002, exitCode: null as number | null, killed: false, kill() {}, on() {} };
+    let up = false;
+    let sleeps = 0;
+    let wake!: () => void;
+    const base = {
+      host: 'd', port: 8100, xctestrun: XCTESTRUN, stateDir: dir, platform: 'darwin' as NodeJS.Platform,
+      listDevices: () => listing([{ udid: 'UDID-A', name: 'Air' }]), probe: async () => up,
+    };
+    const tap1 = ensureWdaRunning({
+      ...base, spawnImpl: (() => first) as never,
+      sleep: () => { sleeps++; return new Promise<void>((r) => { wake = r; }); },
+    });
+    await vi.waitFor(() => expect(sleeps).toBe(1));
+    exitFirst();   // tap 1's agent dies on its own
+    const tap2 = await ensureWdaRunning({ ...base, spawnImpl: (() => second) as never, sleep: async () => {}, timeoutMs: 5 });
+    expect(tap2.running).toBe(false);           // the relaunch is still starting
+    expect(isWdaProcessRunning()).toBe(true);
+    wake();
+    await vi.waitFor(() => expect(sleeps).toBe(2));   // tap 1 kept polling instead of giving up
+    up = true;
+    wake();
+    expect(await tap1).toEqual({ running: true });
+  });
+
+  it('never kills ANOTHER clone\'s agent that reused the pid: same command, different start time', () => {
+    // The .xctestrun lives under the machine-wide toolchain dir, so the command line alone matches a sibling
+    // clone's agent; the start time is what differs (#1077's close-out review).
+    writeRecord({ pid: 777, xctestrun: XCTESTRUN, startedAt: STARTED, owner: 999999, instance: 'dead' });
+    reapDeps.isAlive = () => false;
+    reapDeps.commandOf = () => AGENT_COMMAND;
+    reapDeps.startTimeOf = () => 'Fri Sep 11 21:45:10 2026';
+    reapDeps.kill = vi.fn();
+    expect(reapRecordedWdaAgent(dir)).toBeNull();
+    expect(reapDeps.kill).not.toHaveBeenCalled();
+  });
+
+  it('does not reap the agent THIS module load launched', async () => {
+    await launch(4323);
+    reapDeps.commandOf = () => AGENT_COMMAND;
+    reapDeps.kill = vi.fn();
+    expect(reapRecordedWdaAgent(dir)).toBeNull();
+    expect(reapDeps.kill).not.toHaveBeenCalled();
+  });
+
+  it('DOES reap an agent recorded by an earlier load of this module in the same process', () => {
+    // A standalone Vite config restart re-evaluates the plugin in one pid and abandons the old manager;
+    // nothing can stop that manager's agent any more, so the pid alone must not make it look live.
+    writeRecord({ pid: 779, xctestrun: XCTESTRUN, startedAt: STARTED, owner: process.pid, instance: 'an-earlier-module-load' });
+    reapDeps.commandOf = () => AGENT_COMMAND;
+    reapDeps.startTimeOf = () => STARTED;
+    reapDeps.kill = vi.fn();
+    expect(reapRecordedWdaAgent(dir)).toMatch(/pid 779/);
+    expect(reapDeps.kill).toHaveBeenCalledWith(779);
   });
 });
 

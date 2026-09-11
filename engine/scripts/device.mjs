@@ -41,6 +41,7 @@ import {
 } from './deviceClaimsStore.mjs';
 import { parseDeviceCommand } from './deviceCommandTargets.mjs';
 import { canonicalPath } from './pathIdentity.mjs';
+import { IOS_UDID_SHAPE, iosClaimKeys, onceLoader, readDevicectlDevices, resolveIosUdid } from './iosDeviceIdentity.mjs';
 
 // ── Repo root + owner token ─────────────────────────────────────────────────
 
@@ -220,8 +221,39 @@ const IOS_UDID_RE = /^(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{16})$/;
  *  guesses silently (the brief's own rule): an id that matches nothing known
  *  is refused with what IS attached, rather than assumed to be one namespace
  *  or another. */
+/** This invocation's devicectl listing, read at most once and only when an iOS id needs resolving (#1078). */
+const loadIosDevices = onceLoader(readDevicectlDevices);
+
+/** An `ios:<value>` id, resolved to the key every other iOS tool and every editor claim uses (#1078).
+ *  A UDID-shaped value stands as written. Anything else — a CoreDevice identifier, an ECID, a serial
+ *  number, a device name — is looked up in `xcrun devicectl list devices`. Storing it unresolved would
+ *  split one phone into two claim keys, so an id that cannot be resolved is refused, not stored. */
+function resolveIosNamespaced(value) {
+  if (IOS_UDID_SHAPE.test(value)) return { ok: true, deviceId: `ios:${value}` };
+  const hit = resolveIosUdid(value, loadIosDevices);
+  if (hit) return { ok: true, deviceId: `ios:${hit.udid}`, label: hit.name };
+  // "Could not look" is not "looked and found nothing" — say which (#1078's close-out re-review).
+  if (loadIosDevices() === null) {
+    return {
+      ok: false,
+      message: `"ios:${value}" is not a hardware UDID, and \`xcrun devicectl list devices\` could not be read `
+        + '(no Xcode command-line tools, or it timed out), so it cannot be resolved to one. Claims are keyed by '
+        + 'UDID (#1078) — use the UDID: `npm run device:list` shows them.',
+    };
+  }
+  return {
+    ok: false,
+    message: `"ios:${value}" is not a hardware UDID, and \`xcrun devicectl list devices\` shows no single `
+      + 'device with that identifier, ECID, serial number or name. Claims are keyed by UDID — the id every '
+      + 'other iOS tool and the editor use — so a claim under this spelling would be a second key for one '
+      + 'phone (#1078). Claim it by UDID: `npm run device:list` shows them.',
+  };
+}
+
 function resolveDeviceId(rawId) {
-  if (isNamespaced(rawId)) return { ok: true, deviceId: rawId };
+  if (isNamespaced(rawId)) {
+    return rawId.startsWith('ios:') ? resolveIosNamespaced(rawId.slice('ios:'.length)) : { ok: true, deviceId: rawId };
+  }
 
   const adb = tryListAdb();
   const adbHit = adb.find((d) => d.serial === rawId);
@@ -231,6 +263,13 @@ function resolveDeviceId(rawId) {
     const ios = tryListXctrace();
     const iosHit = ios.find((d) => d.udid === rawId);
     return { ok: true, deviceId: `ios:${rawId}`, label: iosHit ? iosHit.name : undefined };
+  }
+
+  // What `devicectl list devices` prints and `--device` accepts — a CoreDevice identifier, an ECID, a
+  // serial number, a name — resolved to the UDID (#1078).
+  if (!IOS_UDID_SHAPE.test(rawId)) {
+    const hit = resolveIosUdid(rawId, loadIosDevices);
+    if (hit) return { ok: true, deviceId: `ios:${hit.udid}`, label: hit.name };
   }
 
   const ios = tryListXctrace();
@@ -246,7 +285,15 @@ function resolveDeviceId(rawId) {
  *  attached hardware, yet its claim (and the ability to give it back) must
  *  still be reachable. Falls back to this clone's OWN live claims. */
 function resolveIdForRelease(rawId) {
-  if (isNamespaced(rawId)) return { ok: true, deviceId: rawId };
+  if (isNamespaced(rawId)) {
+    const value = rawId.slice(rawId.indexOf(':') + 1);
+    if (!rawId.startsWith('ios:') || IOS_UDID_SHAPE.test(value)) return { ok: true, deviceId: rawId };
+    // A non-UDID `ios:` spelling (#1078): give back the UDID claim it names — or, when there is none, a
+    // claim some session took under this exact spelling before ids were resolved (`alternates`).
+    // Never refused here: releasing must work for a phone devicectl no longer lists.
+    const hit = resolveIosUdid(value, loadIosDevices);
+    return hit ? { ok: true, deviceId: `ios:${hit.udid}`, alternates: [rawId] } : { ok: true, deviceId: rawId };
+  }
   const live = resolveDeviceId(rawId);
   if (live.ok) return live;
   const mine = listClaims().filter((c) => c.owner === OWNER);
@@ -289,33 +336,15 @@ function parseFlags(args) {
 // report. It is still only a HINT: two identical handsets report the same model, so a match cannot
 // be certain — hence `--force`.
 
-/** Find `hardwareProperties.productType` for a matching `hardwareProperties.udid` inside a parsed
- *  `xcrun devicectl list devices --json-output` document. Mirrors `wdaLauncher.ts`'s
- *  `parseIosDevices` shape (`result.devices[].hardwareProperties`) — kept as a small local parse
- *  rather than importing that module, since this script is deliberately dependency-free plain JS
- *  (see the file header on why `deviceClaimsStore.mjs` is plain JS too). Case-insensitive because
- *  UDIDs are hex and nothing here promises consistent casing between `xcrun` and the caller. */
-function findProductType(parsed, udidLower) {
-  const devices = parsed?.result?.devices;
-  if (!Array.isArray(devices)) return undefined;
-  for (const d of devices) {
-    const udid = d?.hardwareProperties?.udid;
-    if (typeof udid === 'string' && udid.toLowerCase() === udidLower) {
-      const productType = d.hardwareProperties?.productType;
-      return typeof productType === 'string' && productType ? productType : undefined;
-    }
-  }
-  return undefined;
-}
-
 /** Resolve a UDID's product type, best-effort. Returns `undefined` on ANYTHING that stops this from
  *  producing an answer — no `xcrun`, a timeout, a device list that never mentions the UDID — because
  *  the caller's whole design hinges on "cannot tell" never being treated as evidence of anything.
  *
- *  `MODOKI_DEVICECTL_JSON_FIXTURE` points this at a canned JSON file (the same shape `xcrun devicectl
- *  --json-output` writes) instead of really spawning `xcrun` — the seam `deviceCli.test.ts` needs to
- *  pass on a machine with no Xcode and no phone attached. It does not change the rule under test,
- *  only where the JSON comes from.
+ *  The listing is `iosDeviceIdentity.mjs`'s: one devicectl parse for the whole script (#1078 — this used
+ *  to be a second, local copy of it), read at most once per invocation, so claiming `ios:<identifier>`
+ *  against a foreign WiFi claim lists devices once, not twice. It honors `MODOKI_DEVICECTL_JSON_FIXTURE`,
+ *  the seam `deviceCli.test.ts` uses to pass with no Xcode and no phone. Case-insensitive because nothing
+ *  promises consistent casing between `xcrun` and the caller.
  *
  *  `MODOKI_DEVICECTL_LOOKUP_MARKER`, when set, has this function touch that path the moment it is
  *  entered — a test-only observability hook so a test can assert the lookup was never even attempted
@@ -326,26 +355,7 @@ function resolveIosProductType(udid) {
     try { fs.writeFileSync(process.env.MODOKI_DEVICECTL_LOOKUP_MARKER, '1'); } catch { /* test-only, best-effort */ }
   }
   const needle = udid.toLowerCase();
-
-  const fixture = process.env.MODOKI_DEVICECTL_JSON_FIXTURE;
-  if (fixture) {
-    try {
-      return findProductType(JSON.parse(fs.readFileSync(fixture, 'utf8')), needle);
-    } catch {
-      return undefined;
-    }
-  }
-
-  const tmp = path.join(os.tmpdir(), `modoki-device-cli-devicectl-${process.pid}-${Date.now()}.json`);
-  try {
-    const res = spawnSync('xcrun', ['devicectl', 'list', 'devices', '--json-output', tmp], { timeout: 8000 });
-    if (res.error || res.status !== 0) return undefined;
-    return findProductType(JSON.parse(fs.readFileSync(tmp, 'utf8')), needle);
-  } catch {
-    return undefined;
-  } finally {
-    try { fs.rmSync(tmp, { force: true }); } catch { /* best-effort cleanup */ }
-  }
+  return (loadIosDevices() ?? []).find((d) => d.udid?.toLowerCase() === needle)?.productType;
 }
 
 /** The narrowing check itself, run only for an `ios:<udid>` claim. Does nothing at all — no lookup,
@@ -486,11 +496,22 @@ function cmdRelease(args) {
     process.exit(1);
   }
 
-  const before = listClaims().find((c) => c.deviceId === resolved.deviceId);
+  // The resolved id first, then the raw spelling it came from (#1078): a claim some session took under
+  // that exact spelling before ids were resolved has to stay releasable.
+  const claimsNow = listClaims();
+  const found = [resolved.deviceId, ...(resolved.alternates ?? [])]
+    .map((id) => claimsNow.find((c) => c.deviceId === id))
+    .filter(Boolean);
+  // THIS clone's own claim first. With another session holding the UDID key and this CLI holding the raw
+  // spelling, taking the first hit answered "held by another session" and kept this clone's claim
+  // (#1078's close-out review).
+  const before = found.find((c) => c.owner === OWNER) ?? found[0];
   if (!before) {
     console.log(`This clone holds no claim on ${resolved.deviceId} — nothing claims it at all.`);
     process.exit(0);
   }
+  // From here on, act on the claim actually found — it may be the raw-spelling alternate.
+  resolved.deviceId = before.deviceId;
   if (before.owner !== OWNER) {
     // A release must only ever be able to give back what THIS clone's CLI token took — never a
     // sibling clone's or a running editor's hold. Say so plainly rather than silently no-op'ing,
@@ -586,7 +607,23 @@ function cmdRun(rawArgs) {
   // function uses the original argv array with no shell, per the "never build a shell string from
   // user input" rule. Reconstructing a string here is safe because these tokens already came out
   // of the invoking shell's own parsing (no re-quoting needed).
-  const cmdStr = command.join(' ');
+  // A token with whitespace is re-quoted, or the classifier re-splits it: `--device "Test iPad"` read as `Test`,
+  // and a `bash -c '… "My App.app"'` payload read as `bash -c xcrun`, which named no device tool and ran
+  // unchecked (#1078's close-out re-reviews). Double quotes, else single; a token holding BOTH kinds cannot be
+  // re-quoted for the classifier, so it is refused rather than run unchecked.
+  const requoted = command.map((t) => {
+    if (!/\s/.test(t)) return t;
+    if (!t.includes('"')) return `"${t}"`;
+    if (!t.includes("'")) return `'${t}'`;
+    return null;
+  });
+  if (requoted.includes(null)) {
+    console.error('Refused: an argument contains whitespace and both quote kinds (a `bash -c` payload naming a device '
+      + 'or path with an apostrophe, say), so `device run` cannot re-quote it for its claim check and will not run it '
+      + 'unchecked. Pass the device command directly instead of through `bash -c`, or name the device by its UDID.');
+    process.exit(1);
+  }
+  const cmdStr = requoted.join(' ');
   const targets = parseDeviceCommand(cmdStr);
 
   if (!targets.tools.length) {
@@ -617,15 +654,28 @@ function cmdRun(rawArgs) {
   // "every refused multi-device run" to "a genuine race". Closing it properly needs an all-or-nothing
   // claim across several ids, which the store cannot express today and which no caller has needed:
   // a command naming two physical devices at once is rare enough that it has never been observed.
-  const blocked = targets.ids
-    .map((id) => ({ id, held: foreignClaimFor(id, { clone: repoRoot }) }))
-    .filter((x) => x.held);
+  // Each id under the UDID key every editor claim uses, and as written (#1078) — see `iosClaimKeys`.
+  // Without it, `devicectl --device <identifier>` walked past a sibling's `ios:<udid>` claim and then
+  // took a second claim on the same phone under the identifier.
+  const resolvedIds = targets.ids.map((id) => iosClaimKeys(id, loadIosDevices));
+  // An `ios:` id that is not a UDID and did not resolve is refused, the way `device claim` refuses it:
+  // claiming it as written would be a second key for one phone (#1078's close-out review).
+  for (const { canonical } of resolvedIds) {
+    const value = canonical.startsWith('ios:') ? canonical.slice('ios:'.length) : null;
+    if (value !== null && !IOS_UDID_SHAPE.test(value)) {
+      console.error(`Refused: ${cmdStr}\n\n${resolveIosNamespaced(value).message}`);
+      process.exit(1);
+    }
+  }
+  const blocked = resolvedIds
+    .flatMap(({ keys }) => keys.map((key) => foreignClaimFor(key, { clone: repoRoot })))
+    .filter(Boolean);
   if (blocked.length) {
-    for (const { held } of blocked) console.error(describeConflict(held));
+    for (const held of blocked) console.error(describeConflict(held));
     process.exit(1);
   }
 
-  for (const id of targets.ids) {
+  for (const { canonical: id } of resolvedIds) {
     // `claimDevice` already IS the claim-or-refresh decision this subcommand needs: it treats a
     // matching `owner` token as a refresh rather than a conflict (see `deviceClaimsStore.mjs`'s
     // `isSameHolder`), so there is no separate branch here for "mine" vs "free". Its refusal path
@@ -657,6 +707,8 @@ function printUsage() {
       another clone already has it. An "ios:" claim that matches a foreign
       "ip:" (WiFi) claim's reported product type is ALSO refused as a
       probable same-phone collision (#285) — pass --force to override.
+      An "ios:" id that is not a UDID (a devicectl identifier, ECID, serial
+      number or name) is stored under the UDID it resolves to, or refused (#1078).
 
   device release <id|--all>
       Give back a device THIS clone's CLI previously claimed. --all releases

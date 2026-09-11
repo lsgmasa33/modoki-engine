@@ -7,7 +7,7 @@ import { Layout, Model, TabNode, Actions, DockLocation } from 'flexlayout-react'
 import 'flexlayout-react/style/dark.css';
 
 import { PanelFocusHost } from './input/PanelFocusHost';
-import { register } from './input/keymap';
+import { register, registerBindings } from './input/keymap';
 import { useHmrEpoch } from './input/hmrEpoch';
 import { installKeymapDispatcher } from './input/dispatcher';
 import { setInputGate } from '../runtime/input/inputSources';
@@ -278,7 +278,7 @@ export default function EditorApp() {
   // fires instead, per plan A.8), which would swallow the explanatory toast the user
   // needs. These commands always CLAIM their chord and then explain themselves.
   useEffect(() => {
-    const offs = [
+    const offBindings = registerBindings(() => [
       register({
         id: 'app.saveAll',
         keys: 'mod+s',
@@ -349,7 +349,7 @@ export default function EditorApp() {
           void redo();
         },
       }),
-    ];
+    ]);
     const offDispatch = installKeymapDispatcher();
 
     // Focus scoping for the RUNNING GAME (plan P5.1). While an editor panel other than
@@ -371,7 +371,7 @@ export default function EditorApp() {
     return () => {
       setInputGate(null);
       offDispatch();
-      for (const off of offs) off();
+      offBindings();
     };
     // See input/hmrEpoch.ts — 0 in production, so this stays a mount-once effect there.
   }, [hmrEpoch]);

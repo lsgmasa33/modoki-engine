@@ -348,6 +348,142 @@ describe('device claim — ios: vs. foreign ip: same-phone narrowing (#285)', ()
   });
 });
 
+/**
+ * #1078 — one iPhone, several `ios:` spellings. `devicectl --device` takes a CoreDevice identifier, an ECID,
+ * a serial number or a name as well as the UDID, and every claim the editor takes is keyed by UDID. So the
+ * CLI resolves before it stores or compares, and one phone keeps one key. `xcrun` is never spawned here —
+ * `MODOKI_DEVICECTL_JSON_FIXTURE` stands in — and every id is invented.
+ */
+describe('device claim / release / run — an ios: id is resolved to its UDID (#1078)', () => {
+  const UDID = '00008150-TESTTESTTESTTEST';
+  const IDENTIFIER = 'C0DEC0DE-0000-4000-8000-00000000000A';
+  const ECID = 1234567890123456;
+
+  function fixtureEnv() {
+    const file = path.join(home, 'devicectl-identity.json');
+    fs.writeFileSync(file, JSON.stringify({
+      result: {
+        devices: [{
+          identifier: IDENTIFIER,
+          hardwareProperties: { udid: UDID, ecid: ECID, serialNumber: 'SERIALTESTA', platform: 'iOS' },
+          deviceProperties: { name: 'Test iPad' },
+        }],
+      },
+    }));
+    return { MODOKI_DEVICECTL_JSON_FIXTURE: file };
+  }
+  const stored = (): string[] => (fs.existsSync(claimsFilePath())
+    ? JSON.parse(fs.readFileSync(claimsFilePath(), 'utf8')).claims.map((c: { deviceId: string }) => c.deviceId)
+    : []);
+
+  it('claim ios:<CoreDevice identifier> stores the UDID key — the one every editor claim uses', () => {
+    const { status, stdout } = runCli(['claim', `ios:${IDENTIFIER}`], fixtureEnv());
+    expect(status).toBe(0);
+    expect(stdout).toContain(`ios:${UDID}`);
+    expect(stored()).toEqual([`ios:${UDID}`]);
+  });
+
+  it('a bare identifier, ECID or name resolves the same way, and refreshes the one key', () => {
+    for (const id of [IDENTIFIER.toLowerCase(), String(ECID), 'Test iPad']) {
+      expect(runCli(['claim', id], fixtureEnv()).status, id).toBe(0);
+    }
+    expect(stored()).toEqual([`ios:${UDID}`]);
+  });
+
+  it('refuses an ios: id it cannot resolve, and stores nothing', () => {
+    const { status, stderr } = runCli(['claim', 'ios:C0DEC0DE-0000-4000-8000-0000000000FF'], fixtureEnv());
+    expect(status).toBe(1);
+    expect(stderr).toMatch(/not a hardware UDID/);
+    expect(stored()).toEqual([]);
+  });
+
+  it('release ios:<identifier> gives back the UDID claim', () => {
+    expect(runCli(['claim', `ios:${UDID}`], fixtureEnv()).status).toBe(0);
+    const { status, stdout } = runCli(['release', `ios:${IDENTIFIER}`], fixtureEnv());
+    expect(status).toBe(0);
+    expect(stdout).toMatch(/Released/);
+    expect(stored()).toEqual([]);
+  });
+
+  it('device run refuses a devicectl command naming the identifier of a phone a sibling holds by UDID', () => {
+    writeForeignClaim(`ios:${UDID}`, { purpose: 'holding a device lease over USB' });
+    const { status, stderr } = runCli(
+      ['run', '--', 'xcrun', 'devicectl', 'device', 'install', 'app', '--device', IDENTIFIER, './App.app'],
+      fixtureEnv(),
+    );
+    expect(status).toBe(1);
+    expect(stderr).toContain('work-other');
+    expect(stored()).toEqual([`ios:${UDID}`]);   // only the sibling's claim: nothing taken, nothing run
+  });
+
+  it('device run refuses an ios: id that is not a UDID and does not resolve, and claims nothing', () => {
+    const { status, stderr } = runCli(
+      ['run', '--', 'xcrun', 'devicectl', 'device', 'install', 'app', '--device', 'C0DEC0DE-0000-4000-8000-0000000000FF', './App.app'],
+      fixtureEnv(),
+    );
+    expect(status).toBe(1);
+    expect(stderr).toMatch(/not a hardware UDID/);
+    expect(stored()).toEqual([]);
+  });
+
+  it('release by the raw spelling gives back THIS clone\'s claim even when another session holds the UDID key', () => {
+    const root = fs.realpathSync.native(spawnSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).stdout.trim());
+    const claim = (deviceId: string, clone: string) =>
+      ({ deviceId, clone, branch: 'b', pid: 0, at: Date.now(), owner: `cli:${clone}`, ttlMs: 90 * 60 * 1000 });
+    fs.mkdirSync(home, { recursive: true });
+    fs.writeFileSync(claimsFilePath(), JSON.stringify({
+      claims: [claim(`ios:${UDID}`, '/Users/other/Projects/modoki-other'), claim(`ios:${IDENTIFIER}`, root)],
+    }));
+    const { status, stdout } = runCli(['release', `ios:${IDENTIFIER}`], fixtureEnv());
+    expect(status).toBe(0);
+    expect(stdout).toMatch(/Released/);
+    expect(stored()).toEqual([`ios:${UDID}`]);
+  });
+
+  it('device run keeps a device name with a space whole, so it resolves the way device claim does', () => {
+    writeForeignClaim(`ios:${UDID}`, { purpose: 'holding a device lease over USB' });
+    const { status, stderr } = runCli(
+      ['run', '--', 'xcrun', 'devicectl', 'device', 'install', 'app', '--device', 'Test iPad', './App.app'],
+      fixtureEnv(),
+    );
+    expect(status).toBe(1);
+    expect(stderr).toContain('work-other');           // refused for the sibling's claim on the resolved UDID
+    expect(stderr).not.toMatch(/not a hardware UDID/);
+  });
+
+  it('device run checks the claim for a bash -c payload that quotes a path with a space', () => {
+    // Re-joined without single quotes, this payload classified as `bash -c xcrun` — no device tool — and ran.
+    writeForeignClaim(`ios:${UDID}`, { purpose: 'holding a device lease over USB' });
+    const { status, stderr } = runCli(
+      ['run', '--', 'bash', '-c', `xcrun devicectl device install app --device ${UDID} "./My App.app"`],
+      fixtureEnv(),
+    );
+    expect(status).toBe(1);
+    expect(stderr).toContain('work-other');
+  });
+
+  it('device run refuses, and runs nothing, for a token holding whitespace AND both quote kinds', () => {
+    // Neither quote kind can re-quote this token for the classifier. Without the refusal it joined as an empty
+    // string, so the command named no device tool and ran unchecked. The payload exits before reaching devicectl
+    // so a mutation run touches no real device, while the marker proves whether the shell ran at all.
+    const marker = path.join(home, 'ran-marker');
+    const { status, stderr } = runCli(
+      ['run', '--', 'bash', '-c', `touch ${marker}; exit 0; xcrun devicectl device install app --device ${UDID} "./Bob's App.app"`],
+      fixtureEnv(),
+    );
+    expect(status).toBe(1);
+    expect(stderr).toMatch(/both quote kinds/);
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it('says the device listing could not be read, rather than that it lists no such device', () => {
+    const { status, stderr } = runCli(['claim', `ios:${IDENTIFIER}`], { MODOKI_DEVICECTL_JSON_FIXTURE: path.join(home, 'no-such-fixture.json') });
+    expect(status).toBe(1);
+    expect(stderr).toMatch(/could not be read/);
+    expect(stored()).toEqual([]);
+  });
+});
+
 describe('device run — a refused command must leave no claim behind', () => {
   it('leaks no claim when a multi-device command is refused on the second device', () => {
     // Measured before the two-pass fix: the free Android was claimed, the foreign iPhone refused the

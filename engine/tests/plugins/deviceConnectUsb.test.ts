@@ -22,6 +22,7 @@ import { readScannedSource } from '@modoki/engine/testing';
 import { goIosForwardRunner, reapDeps } from '../../plugins/backend/iosUsbForward';
 import { DeviceLeaseAuthority } from '../../plugins/backend/deviceLease';
 import { listClaims } from '../../plugins/backend/deviceClaims';
+import { WDA_RECORD_FILE } from '../../plugins/backend/wdaLauncher';
 
 let nextPid = 4242;
 
@@ -362,6 +363,17 @@ describe('DeviceConnectionManager — useUsb branch (#1065)', () => {
     reclaimStaleDeviceStateAtStartup(stateDir);
     expect(reapDeps.kill).toHaveBeenCalledWith(777);
     expect(fs.existsSync(recordFile())).toBe(false);
+  });
+
+  it('startup also reaps a WebDriverAgent a previous run of this clone left on the phone (#1077)', () => {
+    fs.writeFileSync(path.join(stateDir, WDA_RECORD_FILE), JSON.stringify({ pid: 778, xctestrun: '/fake/WDA.xctestrun', startedAt: 'T0', owner: 999999, instance: 'dead' }));
+    reapDeps.isAlive = () => false;
+    reapDeps.startTimeOf = () => 'T0';
+    reapDeps.commandOf = () => 'xcodebuild test-without-building -xctestrun /fake/WDA.xctestrun -destination id=UDID-IPAD';
+    reapDeps.kill = vi.fn();
+    adbRunner.listForwards = () => '';
+    reclaimStaleDeviceStateAtStartup(stateDir);
+    expect(reapDeps.kill).toHaveBeenCalledWith(778);
   });
 });
 

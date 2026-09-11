@@ -21,6 +21,7 @@
 import type { Entity, World } from 'koota';
 import { getCurrentWorld } from '../core/ecs/world';
 import type { ManagerDef } from '../core/managerTypes';
+import { notifyListeners } from '../core/notifyListeners';
 
 export type CollisionPhase = 'enter' | 'exit';
 /** `(sensor, other, phase)` — `sensor` is the entity whose collider `isSensor`. */
@@ -67,8 +68,13 @@ function phaseFilter<A, B>(want: CollisionPhase, cb: (a: A, b: B) => void) {
 }
 
 /** Build a physics event bus + its scene-scoped manager. `managerName` is the ManagerDef name
- *  (e.g. 'Physics2DEvents'); `logTag` prefixes handler-threw warnings (e.g. 'physics2DEvents'). */
+ *  (e.g. 'Physics2DEvents'); `logTag` names the bus in the report when a handler throws (e.g.
+ *  'physics2DEvents'). That report is `notifyListeners`' `console.error`: a game handler that
+ *  throws spends the crash budget like any other listener defect (owner ruling on #953). */
 export function createPhysicsEventBus(managerName: string, logTag: string): { events: PhysicsEventBus; manager: ManagerDef } {
+  const sensorLabel = `${logTag}:sensor`;
+  const collisionLabel = `${logTag}:collision`;
+  const contactLabel = `${logTag}:contact`;
   const subsByWorld = new WeakMap<World, Subs>();
   const subsFor = (world: World): Subs => {
     let s = subsByWorld.get(world);
@@ -97,17 +103,17 @@ export function createPhysicsEventBus(managerName: string, logTag: string): { ev
     __emitSensor(world, sensor, other, phase) {
       const s = subsByWorld.get(world);
       if (!s || s.sensor.size === 0) return;
-      for (const cb of s.sensor) { try { cb(sensor, other, phase); } catch (e) { console.warn(`[${logTag}] sensor handler threw`, e); } }
+      notifyListeners(s.sensor, sensorLabel, [sensor, other, phase]);
     },
     __emitCollision(world, a, b, phase) {
       const s = subsByWorld.get(world);
       if (!s || s.collision.size === 0) return;
-      for (const cb of s.collision) { try { cb(a, b, phase); } catch (e) { console.warn(`[${logTag}] collision handler threw`, e); } }
+      notifyListeners(s.collision, collisionLabel, [a, b, phase]);
     },
     __emitContact(world, a, b, detail) {
       const s = subsByWorld.get(world);
       if (!s || s.contact.size === 0) return;
-      for (const cb of s.contact) { try { cb(a, b, detail); } catch (e) { console.warn(`[${logTag}] contact handler threw`, e); } }
+      notifyListeners(s.contact, contactLabel, [a, b, detail]);
     },
     __clear(world) { subsByWorld.delete(world); },
   };

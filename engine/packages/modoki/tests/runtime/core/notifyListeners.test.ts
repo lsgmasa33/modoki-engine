@@ -77,6 +77,17 @@ describe('notifyListeners', () => {
     expect(spy).not.toHaveBeenCalled();
   });
 
+  it('hands the report the listener that THREW as its third argument, not a neighbour (#953)', () => {
+    // `lateUpdate` names the failing system by mapping this back to its registry key. Threaded
+    // between two healthy listeners so an off-by-one (the previous or next listener) cannot pass.
+    const err = new Error('boom');
+    const good = (): void => {};
+    const bad = (): void => { throw err; };
+    const reported: unknown[][] = [];
+    notifyListeners([good, bad, good], 'pub', [], (...a) => { reported.push(a); });
+    expect(reported).toEqual([['pub', err, bad]]);
+  });
+
   it('a report that itself throws does not reintroduce the defect', () => {
     // `report` is caller-supplied, so it is exactly as untrusted as the listeners are.
     const order: string[] = [];

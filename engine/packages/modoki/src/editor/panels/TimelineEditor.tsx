@@ -11,7 +11,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
-import { register } from '../input/keymap';
+import { register, registerBindings } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { getCurrentWorld, onWorldSwap } from '../../runtime/core/ecs/world';
 import { resolveDirectorRootForTimeline } from './openAssetInEditor';
@@ -433,11 +433,11 @@ export default function TimelineEditor() {
     const canDelete = () =>
       !!useEditorStore.getState().editingTimelineDoc && selectedTrack != null && selectedItem != null;
     const del = () => { if (selectedTrack != null && selectedItem != null) deleteItemAt(selectedTrack, selectedItem); };
-    const offs = [
+    const offBindings = registerBindings(() => [
       register({ id: 'timeline.deleteItem', keys: 'Delete', scope: 'timeline-editor', when: canDelete, run: del }),
       register({ id: 'timeline.deleteItemBack', keys: 'Backspace', scope: 'timeline-editor', when: canDelete, run: del }),
-    ];
-    return () => { for (const off of offs) off(); };
+    ]);
+    return offBindings;
   }, [deleteItemAt, selectedTrack, selectedItem, hmrEpoch]);
 
   // ── Scrub / transport ──

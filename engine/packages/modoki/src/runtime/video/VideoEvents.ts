@@ -8,6 +8,7 @@
  *  Mirrors TimelineEvents. The journal names are prefixed `@video.` so they group
  *  with the other engine-emitted lifecycle events rather than a game's own. */
 
+import { notifyListeners } from '../core/notifyListeners';
 import { emit } from '../core/journal';
 
 export interface VideoEventPayload {
@@ -31,9 +32,7 @@ function sub(set: Set<Handler>, fn: Handler): () => void {
 function fire(set: Set<Handler>, p: VideoEventPayload): void {
   // Copy before iterating: a handler that unsubscribes itself (the common
   // "play once then detach" shape) would otherwise mutate the set mid-iteration.
-  for (const fn of [...set]) {
-    try { fn(p); } catch (e) { console.error('[video] event handler threw:', e); }
-  }
+  notifyListeners([...set], 'video', [p]);
 }
 
 export const videoEvents = {

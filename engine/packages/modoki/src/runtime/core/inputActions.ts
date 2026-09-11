@@ -132,6 +132,14 @@ export interface GestureFrame {
   /** Where the tap went down (not where it came up; they differ by at most the slop radius). */
   tapX: number;
   tapY: number;
+  /** The `pointerSetVersion` as the tap's finger went DOWN — the value any frame that sampled that
+   *  press published. 0 on a frame with no tap. Compare it for EQUALITY with a version you kept:
+   *  equal means a frame you sampled had this tap's finger down, alone; unequal means the press fell
+   *  between two samples and you never saw that finger down. ⚠️ Equal is not "that frame was the
+   *  press" — the finger may already have moved; record press-time state on the FIRST frame a version
+   *  appears. It answers "did the gesture I tracked become this tap" without doing arithmetic on the
+   *  stamp (a +1 per lift is not part of the contract). */
+  tapSetVersion: number;
 }
 
 export function makeGesture(): GestureFrame {
@@ -139,7 +147,7 @@ export function makeGesture(): GestureFrame {
     pointerCount: 0, pointerSetVersion: 0, panning: false, panX: 0, panY: 0,
     pinching: false, pinchStarted: false, pinchEnded: false,
     pinchScale: 1, pinchScaleDelta: 1, centerX: 0, centerY: 0,
-    tapped: false, tapX: 0, tapY: 0,
+    tapped: false, tapX: 0, tapY: 0, tapSetVersion: 0,
   };
 }
 
@@ -201,6 +209,7 @@ export function beginSample(frame: InputFrame): void {
   g.pinchScale = 1; g.pinchScaleDelta = 1;
   g.centerX = 0; g.centerY = 0;
   g.tapped = false;
+  g.tapSetVersion = 0;
 }
 
 /** Derive the pointer down-edge into `frame.pointer.pressed`/`.released` from the

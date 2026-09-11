@@ -2,6 +2,7 @@
  *  Replaces multiple independent rAF loops to guarantee deterministic execution order:
  *  ECS pipeline (0) → Three.js render (10) → PixiJS render (20). */
 
+import { notifyListeners } from '../core/notifyListeners';
 import { createSupersessionToken, type LivenessCheck } from '../core/liveness';
 import { rawNow } from '../core/clock';
 import { recordFrame, setProfilerFrameCap } from '../core/frameProfiler';
@@ -385,10 +386,7 @@ function declareUnrecoverable() {
     `no further automatic repair will be attempted.` +
     (gpuFault?.deviceLost ? ` GPU fault: ${gpuFault.reason ?? 'unknown reason'}.` : ''),
   );
-  for (const fn of unrecoverableListeners) {
-    try { fn(info); }
-    catch (e) { console.error('[frameDriver] an unrecoverable listener threw', e); }
-  }
+  notifyListeners(unrecoverableListeners, 'frameDriver:unrecoverable', [info]);
 }
 
 /** Subscribe to "the frame loop is permanently dead — no further automatic repair will run".

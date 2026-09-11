@@ -23,7 +23,7 @@
  * `projectNeedsInstall.mjs` so a test can sweep every real project against it.
  *
  * After a game's deps are linked we also run its `build:plugins` script IF it
- * defines one. A game's native Capacitor plugins (e.g. capacitor-applovin-max)
+ * defines one. A game's own native Capacitor plugins (e.g. games/3d-test's capacitor-adjust)
  * ship their JS only in a gitignored `dist/`, so without this a fresh
  * clone/worktree fails at runtime with `Failed to resolve import "capacitor-…"`
  * — exactly the manual post-merge step this script exists to eliminate. Games

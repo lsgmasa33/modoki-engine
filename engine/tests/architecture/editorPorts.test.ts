@@ -26,7 +26,7 @@ import { existsSync, mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
-import { hasPrivateTooling } from '../helpers/repoLayout';
+import { hasPrivateDocs, hasPrivateTooling } from '../helpers/repoLayout';
 import { readScannedSource } from '@modoki/engine/testing';
 import {
   CLONE_BACKEND_PORTS,
@@ -56,8 +56,11 @@ const readDoc = (rel: string) => readScannedSource(path.join(REPO, rel), {
   comments: 'include',
   reason: 'the assertions are about the port TABLES written in this doc — prose is the subject',
 }).raw;
-// engine/scripts/** and the committed agent-CLI configs are private-repo-only; the public
-// engine snapshot ships neither, so there is nothing to assert there.
+// ⚠️ A PROXY, and the reason once written here was false: this said the public snapshot ships no
+// `engine/scripts/**`, but its manifest is `git ls-files -- engine`, so `editorPorts.mjs` and
+// `launch-editor.sh` DO ship. The `.mcp.json` probe skips every block below on the public leg
+// anyway — a known coverage gap, deliberately not widened in #907 (un-gating runs the launcher and
+// symlink fixtures on the public 3-OS matrix). The doc-table block ALSO needs the private docs.
 const skip = !hasPrivateTooling();
 
 /** Every `| ~/Projects/<dir> … | <port> |` row of a markdown table, as dir → first port cell.
@@ -353,7 +356,9 @@ describe.skipIf(skip)('launch-editor.sh hands the port derivation the PHYSICAL s
   });
 });
 
-describe.skipIf(skip)('the docs still say what the table says', () => {
+// Gated on what it READS: `CLAUDE.md` is not in the snapshot manifest, and `docs/clones-and-ports.md`
+// is a private doc since #907 — so the snapshot carries neither, whatever `.mcp.json` says.
+describe.skipIf(skip || !hasPrivateDocs())('the docs still say what the table says', () => {
   // The drift this catches is not cosmetic: a human reads the doc table to decide what to pass
   // to MODOKI_BACKEND_PORT, so a doc that disagrees with the code hands them a sibling's lane.
   for (const [doc, section] of [

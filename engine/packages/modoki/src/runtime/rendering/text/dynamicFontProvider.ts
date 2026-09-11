@@ -18,6 +18,7 @@
  *  and draw one mesh per page a text string touches.
  */
 
+import { notifyListeners } from '../../core/notifyListeners';
 import type { FontProvider } from './fontProvider';
 import type { Glyph, FontMetrics, AtlasInfo, GlyphAtlas } from './glyphAtlas';
 import { kerningKey } from './glyphAtlas';
@@ -671,7 +672,7 @@ export class DynamicFontProvider implements FontProvider {
     this.disposed = true;
     this.cancelFlushRetry(); // #635: an armed retry must not fire into a disposed provider.
     // Renderer-attached per-page GPU textures clean up via their addDisposable hooks.
-    for (const fn of this.disposables) { try { fn(); } catch { /* ignore */ } }
+    notifyListeners(this.disposables, 'dynamicFontProvider:dispose', []);
     this.disposables = [];
     this.glyphMap.clear();
     this.kern.clear();

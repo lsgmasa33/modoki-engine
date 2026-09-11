@@ -228,7 +228,10 @@ const DEVICECTL_DESTRUCTIVE_PATTERNS = [
 const DEVICECTL_READONLY_PATTERNS = [/\bdevice\s+info\b/, /\blist\s+devices\b/];
 
 function analyzeDevicectl(restTokens) {
-  const udid = findFlagValue(restTokens, ['--device']);
+  // `-d` is devicectl's short form of `--device` (#1078). Missing it read a correctly aimed command as
+  // untargeted. The value may be any of devicectl's six id kinds, not only a UDID — `claim-guard.mjs`
+  // resolves it (`iosDeviceIdentity.mjs`); this parser stays pure and reports the id as written.
+  const udid = findFlagValue(restTokens, ['--device', '-d']);
   const ids = udid ? [`ios:${udid}`] : [];
   const text = restTokens.map(stripQuotes).join(' ');
   if (DEVICECTL_DESTRUCTIVE_PATTERNS.some((p) => p.test(text))) return finalize(ids, true, 'devicectl');

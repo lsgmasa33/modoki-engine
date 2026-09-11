@@ -16,7 +16,6 @@ import net from 'net';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import os from 'os';
 import { execFileSync, execFile as execFileDevice } from 'child_process';
 import { promisify } from 'node:util';
 import {
@@ -31,6 +30,10 @@ import {
 import { DeviceLeaseClient, type LeaseTransport, type LeaseRequest, type LeaseReply, type LeaseState } from './deviceLease';
 import { resetDeviceCdpSession, resolveDeviceCdpPort } from './deviceCdp';
 import { parseBoundBridgePort } from './deviceAndroidDiag';
+// WebDriverAgent is lease-owned (#1077): its stop lives in `disconnect()`, which every ending of a lease
+// runs through, not in the Disconnect route. Neither module imports this one, so there is no cycle.
+import { reapRecordedWdaAgent, stopWda } from './wdaLauncher';
+import { endDeviceWdaLease } from './deviceWda';
 
 /** Async exec for the one adb call whose caller can await it — see `adbRunner.logcatDump`. */
 const execFileAsyncDevice = promisify(execFileDevice);
@@ -471,23 +474,10 @@ export class TcpLeaseTransport implements LeaseTransport {
 
 // ── GUID persistence (per clone) ──────────────────────────────────────────────
 
-/** Where this backend keeps its small persistent state (device GUID, last connect target).
- *
- *  A dev clone gets `<cwd>/.modoki`, so each checkout keeps its own stable token — that is the
- *  "per clone" property the GUID doc below describes.
- *
- *  ⚠️ A PACKAGED editor must not use cwd: it is `REPO_ROOT`, which is
- *  `<Resources>/app.asar.unpacked` — INSIDE the signed .app. Writing there breaks the bundle's
- *  code signature, and `codesign --verify` / `spctl --assess` both start failing with "a sealed
- *  resource is missing or invalid" (measured 2026-08-22: `.modoki/device-guid` was one of the two
- *  files `codesign` named after a single build). There is also no "clone" to be per, so the
- *  machine-wide `~/.modoki` is both safe and correct — it is already where `device-claims.json`
- *  and `editor-launches.log` live. */
-export function modokiStateDir(): string {
-  return process.env.MODOKI_PACKAGED === '1'
-    ? path.join(os.homedir(), '.modoki')
-    : path.join(process.cwd(), '.modoki');
-}
+// Moved to a leaf module so `wdaLauncher` can record its agent's pid per clone without importing this file
+// (#1077); re-exported so existing importers keep working. The packaged-editor rule is documented there.
+import { modokiStateDir } from './deviceStateDir';
+export { modokiStateDir };
 
 /** Load the clone's persistent device GUID, minting + saving one on first use. Keyed on the
  *  backend process's cwd (the clone root) so each checkout keeps its own stable token — except
@@ -642,6 +632,18 @@ function connectRequestKey(req: ConnectRequest): string {
     port: req.port === undefined ? OMITTED : req.port,
     debugBuild: !!req.debugBuild,
   });
+}
+
+/** The address WebDriverAgent answers on for a lease target — its host for a WiFi lease, undefined for
+ *  anything else (#1077). PURE, so the rule is testable without a lease.
+ *
+ *  WDA binds the PHONE's :8100, so it is reachable only where the lease's host IS the phone. An adb lease
+ *  is Android. An iOS USB lease (#1065) dials `127.0.0.1` through a go-ios forward of the bridge's port
+ *  alone, so its host reaches nothing on :8100 — and a launch there would claim `ios:<udid>`, the very key
+ *  the USB lease holds in this process, which `stopWda` would then release out from under it. */
+export function wdaHostFor(target: DeviceConnectStatus['target']): string | undefined {
+  if (!target || target.useAdb || target.useUsb) return undefined;
+  return target.host;
 }
 
 export class DeviceConnectionManager {
@@ -1209,6 +1211,17 @@ export class DeviceConnectionManager {
     // phone — or to one reached by IP — must not inherit the previous device's route. Cheap when
     // there is nothing to drop, and `disconnect()` runs at the head of every connect.
     resetDeviceCdpSession();
+    // WebDriverAgent goes with the lease too (#1077). It was stopped only by the Disconnect ROUTE, so a
+    // `device_connect` that superseded the lease (this method heads every connect) left the agent running
+    // on the old phone with its `ios:<udid>` claim held — and left `wdaLauncher`'s module state behind, so
+    // the first tap on the NEW device read "has been starting for Ns" for good. Here, not after the await:
+    // `stopWda` acts on module state, and a stale continuation resuming after the hangup would kill an
+    // agent that a NEWER session had launched meanwhile (the #527 rule). Safe to release WDA's claim before
+    // the lease's own: within ONE lease they never share a key, because WDA is reached only under a WiFi
+    // lease (`wdaHost`), which claims `ip:<host>`, not `ios:<udid>`. Across two overlapping connects they
+    // can — a stalled USB teardown's deferred release can remove a newer WDA claim on the same key (#1082).
+    stopWda();
+    endDeviceWdaLease();
     // The claim is held ACROSS the hangup, ON PURPOSE. Releasing it before `client.disconnect()`
     // resolves would empty the machine-wide claims file while `DeviceLeaseAuthority` still records
     // our guid as the live lease owner: a sibling clone polling `device_list` then passes the claim
@@ -1389,6 +1402,10 @@ export class DeviceConnectionManager {
     return this.platformInFlight;
   }
 
+  /** Where WebDriverAgent is reached for THIS lease, or undefined when there is no route (#1077). Every
+   *  WDA call in the router reads this rather than `status().target?.host`. See `wdaHostFor`. */
+  wdaHost(): string | undefined { return wdaHostFor(this.target); }
+
   status(): DeviceConnectStatus {
     return { state: this.state, guid: this.guid, target: this.target, lastTarget: this.lastTarget, ...(this.detail ? { detail: this.detail } : {}) };
   }
@@ -1462,6 +1479,9 @@ export function releaseDeviceResourcesOnExit(conn: DeviceConnectionManager = dev
   // Order matters only in that each step must not be able to prevent the next.
   try { conn.releaseAdbForwardSync(); } catch { /* adb gone / rule already removed */ }
   try { conn.releaseIosForwardSync(); } catch { /* the child is already gone */ }
+  // The WebDriverAgent `xcodebuild` child (#1077) — `child.kill()` is synchronous, so it fits this path.
+  // Its claim goes with `releaseAllForThisProcess` below either way; this is about the process.
+  try { stopWda(); } catch { /* already gone */ }
   try { resetDeviceCdpSession(); } catch { /* already torn down */ }
   try { releaseAllForThisProcess(); } catch { /* an unwritable claims file must never block exit */ }
 }
@@ -1506,6 +1526,12 @@ export function reclaimStaleDeviceStateAtStartup(stateDir: string = modokiStateD
   // `reapRecordedIosForward` for why a spawned child survives the editor that spawned it.
   try {
     const reaped = reapRecordedIosForward(stateDir);
+    if (reaped) console.log(reaped);
+  } catch { /* never block startup over a cleanup */ }
+  // A WebDriverAgent a previous run left on the phone (#1077): SIGTERM, a crash and `kill -9` skip every
+  // teardown, and the `xcodebuild` child outlives the editor — measured, see `reapRecordedWdaAgent`.
+  try {
+    const reaped = reapRecordedWdaAgent(stateDir);
     if (reaped) console.log(reaped);
   } catch { /* never block startup over a cleanup */ }
   // Claims first — it is pure fs and cannot be blocked by a missing adb. A dead-pid claim never

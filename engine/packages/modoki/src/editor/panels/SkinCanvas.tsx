@@ -6,7 +6,7 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import { paintPressIntent, promotesToStroke, advancePaintStroke, type PaintStrokeState } from './skinPaintGesture';
-import { register } from '../input/keymap';
+import { register, registerBindings } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { activePartOf, withActivePart, partCount, bboxCenter } from './skinParts';
 import { drawTexturedMesh } from './texturedMesh';
@@ -208,7 +208,7 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
   // paint tools aren't active.
   useEffect(() => {
     if (!paintMode) return;
-    const offs = [
+    const offBindings = registerBindings(() => [
       register({
         id: 'skin.toolBrush', keys: 'b', scope: 'skin-editor',
         run: () => useEditorStore.getState().setSkinWeightTool('paint'),
@@ -217,8 +217,8 @@ export default function SkinCanvas({ selBone, setSelBone, testPose = {}, setTest
         id: 'skin.toolTransform', keys: 'w', scope: 'skin-editor',
         run: () => useEditorStore.getState().setSkinWeightTool('transform'),
       }),
-    ];
-    return () => { for (const off of offs) off(); };
+    ]);
+    return offBindings;
   }, [paintMode, hmrEpoch]);
   // Active gizmo drag (translate/rotate a bone — bind pose in bone edit, test pose in paint).
   const gizmoRef = useRef<{ handle: GizmoHandle; startPx: number; startPy: number; centerPx: [number, number]; worldRz: number; parentWorldRz: number; before: Rig2DFile | null } | null>(null);

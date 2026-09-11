@@ -20,6 +20,7 @@
  *  pass through unchanged.
  */
 
+import { notifyListeners } from '../core/notifyListeners';
 import { assetUrl } from './assetUrl';
 import { ASSET_MANIFEST_VERSION } from './assetManifestVersion';
 import { markUIDirty } from '../core/uiDirty';
@@ -340,7 +341,7 @@ export function registerAsset(
     markUIDirty();
   }
   // Fire AFTER the entry is committed so a listener re-acquiring reads the new block.
-  if (fontChanged) for (const fn of fontInvalidationListeners) { try { fn(guid); } catch { /* ignore */ } }
+  if (fontChanged) notifyListeners(fontInvalidationListeners, 'assetManifest:fontInvalidation', [guid]);
   // Mark a frame dirty on a MEANINGFUL registration (close-out review of QA-ASSET-0005's fix):
   // `unregisterAsset` fires when a guid disappears, but nothing fired when one REAPPEARS or
   // starts resolving somewhere new — so an idle-gated renderer holding a stale "unresolved" ref

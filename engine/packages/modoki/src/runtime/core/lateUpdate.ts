@@ -13,6 +13,7 @@
  *  sim state (time / RNG / journal). */
 
 import type { World } from 'koota';
+import { notifyListeners } from './notifyListeners';
 
 export type LateUpdateFn = (world: World) => void;
 
@@ -27,6 +28,13 @@ export interface IdempotencyProbe {
 
 const lateUpdates = new Map<string, LateUpdateFn>();
 
+/** The key each system was registered under, for the error report only. Written at registration
+ *  and never deleted: a system that unregisters or replaces itself BEFORE it throws must still be
+ *  reported by name, which a lookup in `lateUpdates` at report time cannot do (it answered `"?"`,
+ *  the #953 phase-2 review's finding). A WeakMap, so a dropped system's entry is collected. A
+ *  function registered under two keys reports the LATER one. */
+const keyOfSystem = new WeakMap<LateUpdateFn, string>();
+
 /** Signature of the verified system set — the dev idempotency guard runs once per
  *  distinct set (re-armed on any register/unregister/clear) to bound cost + log spam. */
 let _idempotencyCheckedSig: string | null = null;
@@ -34,6 +42,7 @@ let _idempotencyCheckedSig: string | null = null;
 /** Register a LateUpdate system (replaces any with the same key). */
 export function registerLateUpdate(key: string, fn: LateUpdateFn): void {
   lateUpdates.set(key, fn);
+  keyOfSystem.set(fn, key);
   _idempotencyCheckedSig = null; // re-arm the dev idempotency guard
 }
 
@@ -50,9 +59,15 @@ export function hasLateUpdates(): boolean {
   return lateUpdates.size > 0;
 }
 
+/** Names a throwing system by its KEY. `notifyListeners` hands back the function that threw; the
+ *  key comes from `keyOfSystem`, so the per-frame happy path pays nothing for it. */
+function reportLateUpdate(_label: string, err: unknown, fn: LateUpdateFn): void {
+  console.error(`[lateUpdate] system "${keyOfSystem.get(fn) ?? '?'}" threw:`, err);
+}
+
 /** Run every registered LateUpdate (insertion order). Called by `syncBones`
- *  between bone read-back and write-back. Errors are isolated so one bad system
- *  can't break the bridge.
+ *  between bone read-back and write-back. Errors are isolated through
+ *  `notifyListeners`, so one bad system can't break the bridge or starve the ones after it.
  *
  *  DEV idempotency guard: a LateUpdate runs once per active 3D viewport (so in the
  *  editor, with both GameView + SceneView live, twice per frame on the same world).
@@ -66,12 +81,7 @@ export function hasLateUpdates(): boolean {
 export function runLateUpdates(world: World, probe?: IdempotencyProbe): void {
   if (lateUpdates.size === 0) return;
 
-  const runAll = () => {
-    for (const [key, fn] of lateUpdates) {
-      try { fn(world); }
-      catch (e) { console.error(`[lateUpdate] system "${key}" threw:`, e); }
-    }
-  };
+  const runAll = () => notifyListeners(lateUpdates.values(), 'lateUpdate', [world], reportLateUpdate);
 
   if (probe && import.meta.env?.DEV) {
     const sig = [...lateUpdates.keys()].join('\x00');

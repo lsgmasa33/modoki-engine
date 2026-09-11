@@ -44,6 +44,7 @@
  */
 
 import { decodeAimReply, resolveAimViaDevice, aimAsResolved, STALE_APP_REASON, type RouteOutcome } from './deviceAim';
+import { createTeardownToken, type LivenessCheck } from '../../packages/modoki/src/runtime/core/liveness';
 // TYPE-ONLY, and it must stay that way: `wdaLauncher` is loaded through a dynamic import below so
 // an iOS-free session never pays for it. A type import is erased, so this costs nothing at runtime.
 import type { LeaseHardware } from './wdaLauncher';
@@ -172,6 +173,11 @@ let cached: WdaSession | null = null;
  *  device is connected", "not built — install it from Build Support") instead of the generic
  *  "WDA is not answering", which would send the reader looking in the wrong place. */
 let lastLaunchFailure: string | null = null;
+/** Invalidated by `endDeviceWdaLease`. `getDeviceWdaSession` captures it on entry and re-checks it after each
+ *  `await`, so a call still launching or opening a session when the lease ends writes neither
+ *  `lastLaunchFailure` nor the cached session for the NEXT lease (#1077's close-out review). The shared
+ *  teardown token, not a hand-rolled counter (#573, docs/async-lifetime.md). */
+const leaseToken = createTeardownToken();
 
 /** Reach WDA on the device and open a session, reusing a live one.
  *
@@ -186,11 +192,13 @@ export async function getDeviceWdaSession(
     lease?: LeaseHardware;
   } = {},
 ): Promise<WdaSession | null> {
+  const leaseLive = leaseToken.capture();
   const host = opts.host;
-  // No WiFi lease target ⇒ nothing to reach (adb/USB leases are Android). Dropping the cache here
-  // is the second half of #519: `host` goes undefined exactly when the lease moved to an Android
-  // device, so a session kept across that move would be handed to the next iOS call for a phone
-  // this machine no longer holds.
+  // No WiFi lease target ⇒ nothing to reach: the router passes `deviceConnection.wdaHost()`, which is
+  // undefined for an adb lease AND for an iOS USB lease (#1077 — go-ios forwards only the bridge's
+  // port, not :8100). Dropping the cache here is the second half of #519: `host` goes undefined
+  // exactly when the lease moved off WiFi, so a session kept across that move would be handed to the
+  // next iOS call for a phone this machine no longer reaches.
   if (!host) { resetDeviceWdaSession(); return null; }
   const fetchImpl = opts.fetchImpl ?? (fetch as unknown as WdaFetch);
   const port = opts.port ?? resolveWdaPort();
@@ -207,7 +215,11 @@ export async function getDeviceWdaSession(
   // it reports what is true now, and the first tap is what pays the spin-up.
   if (opts.autoLaunch) {
     const { ensureWdaRunning } = await import('./wdaLauncher');
+    // A `disconnect()` during that await would let `ensureWdaRunning` capture its launch token only AFTER `stopWda`
+    // invalidated it, and launch onto the previous phone with nothing left to tear it down (#1077's round-5 review).
+    if (!leaseLive()) return null;   // ended while the launcher module loaded
     const r = await ensureWdaRunning({ host, port, ...(opts.lease ? { lease: opts.lease } : {}) });
+    if (!leaseLive()) return null;   // the lease ended meanwhile: this outcome is not the next lease's
     if (!r.running) { lastLaunchFailure = r.reason ?? null; return null; }
     lastLaunchFailure = null;
   }
@@ -218,6 +230,7 @@ export async function getDeviceWdaSession(
     });
     const sessionId = reply.sessionId ?? (reply.value as unknown as { sessionId?: string })?.sessionId;
     if (!sessionId) return null;
+    if (!leaseLive()) return null;   // same: never cache a session opened for a lease that has ended
     cached = makeWdaSession(fetchImpl, baseUrl, sessionId);
     return cached;
   } catch {
@@ -227,8 +240,18 @@ export async function getDeviceWdaSession(
 
 export function resetDeviceWdaSession(): void { cached = null; }
 
+/** The lease ended (#1077): drop the cached session AND the last launch failure. That failure described
+ *  the PREVIOUS lease's launch, so a screenshot fallback on the next lease would report it as its own
+ *  reason. Called by `DeviceConnectionManager.disconnect()`, alongside `stopWda()`. */
+export function endDeviceWdaLease(): void { leaseToken.invalidateAll(); resetDeviceWdaSession(); lastLaunchFailure = null; }
+
+/** Snapshot the current lease for a caller that reads the WDA address and then AWAITS before calling in here — the
+ *  router's screenshot and input routes. Pass it as `leaseLive`: a capture taken inside this module only starts at
+ *  the call, so a lease that ended during the caller's own await would read as live (#1077's round-4 review). */
+export function captureDeviceWdaLease(): LivenessCheck { return leaseToken.capture(); }
+
 /** Test seam — drop any cached session so one test cannot leak into the next. */
-export function _resetDeviceWdaStateForTests(): void { resetDeviceWdaSession(); lastLaunchFailure = null; }
+export function _resetDeviceWdaStateForTests(): void { endDeviceWdaLease(); }
 
 // ── Routing ───────────────────────────────────────────────────────────────────
 
@@ -261,17 +284,39 @@ export const WDA_NOT_IOS_REASON =
  *  than a call that has to be skipped. */
 export const NO_WDA_ON_THIS_DEVICE: WdaShotOutcome = { handled: false, reason: WDA_NOT_IOS_REASON };
 
+/** The lease holds an iOS device, but not over WiFi — a USB lease (#1065) — so there is no route to the
+ *  agent (#1077). WDA listens on the PHONE's :8100, and the go-ios tunnel forwards only the debug bridge's
+ *  port, so the lease's `127.0.0.1` reaches nothing. Launching anyway would also put a signed agent on the
+ *  phone under `ios:<udid>` — the claim key the USB lease itself holds, in the same process, so stopping
+ *  that agent would release the LEASE's claim. The router refuses before any launch instead. */
+export const WDA_NEEDS_WIFI_REASON =
+  'WebDriverAgent is reached over WiFi (the phone\'s :8100) and this lease is over USB, so there is no '
+  + 'trusted input or out-of-app capture route here — connect over WiFi (device_connect {ip}) for trusted tap/drag';
+
+/** The device lease ended while this call was using WebDriverAgent, so its result was dropped (#1077). Shared by
+ *  the input route (nothing was sent) and the screenshot route (the capture showed the previous phone). */
+export const WDA_LEASE_ENDED_REASON =
+  'the device lease changed while this call was using WebDriverAgent, so the call was abandoned (no input was sent, '
+  + 'no capture is reported) — try again on the current lease';
+
+/** An input op whose lease ended mid-flight: refused, never handed to the synthetic fallback — which would send
+ *  it to whatever device the lease holds NOW. */
+const LEASE_ENDED_OUTCOME: RouteOutcome = { handled: true, reply: `Error: ${WDA_LEASE_ENDED_REASON}` };
+
 /** Abandoned before dispatching anything. */
 export const WDA_SESSION_LOST_REASON =
   'the trusted WebDriverAgent route failed before dispatching (session dropped); it will be re-established on the next call';
 
 export interface WdaRouteDeps {
   proxy(method: string, params: Record<string, unknown>): Promise<unknown>;
-  /** The device's LAN address, from the lease target. Absent ⇒ no WDA route (adb/USB is Android). */
+  /** The device's LAN address — `deviceConnection.wdaHost()`. Absent ⇒ no WDA route: an adb lease, or an
+   *  iOS lease over USB, whose `127.0.0.1` tunnel does not carry :8100 (#1077). */
   host?: string;
   /** The leased device's own hardware report, so a lazy launch can be tied to it (#146). */
   lease?: LeaseHardware;
   getSession?: (opts: { host?: string; autoLaunch?: boolean; lease?: LeaseHardware }) => Promise<WdaSession | null>;
+  /** `captureDeviceWdaLease()` taken when `host` was read. Absent ⇒ captured at the call. */
+  leaseLive?: LivenessCheck;
 }
 
 /** Route ONE device-input method through WebDriverAgent. Same contract as `tryDeviceCdpInput`.
@@ -285,23 +330,38 @@ export async function tryDeviceWdaInput(method: string, params: Record<string, u
   if (!isWdaRoutableMethod(method)) return { handled: false, reason: null };
 
   const getSession = deps.getSession ?? getDeviceWdaSession;
+  const leaseLive = deps.leaseLive ?? leaseToken.capture();
+  // The lease ended after the caller read `host`: that address is the previous phone's, so nothing may launch or
+  // open a session there.
+  if (!leaseLive()) return LEASE_ENDED_OUTCOME;
   // autoLaunch: this IS the "first input op" Decision 1 starts the agent on.
   const session = await getSession({ host: deps.host, autoLaunch: true, ...(deps.lease ? { lease: deps.lease } : {}) });
+  // The lease ended while this op was starting the agent. Falling back would send the tap SYNTHETICALLY to the
+  // device the lease holds NOW, under a banner blaming Build Support — so it is refused, saying why
+  // (#1077's close-out re-review).
+  if (!session && !leaseLive()) return LEASE_ENDED_OUTCOME;
   if (!session) return { handled: false, reason: lastLaunchFailure ?? WDA_NOT_RUNNING_REASON };
 
   try {
     if (method === 'tap') {
       const r = await resolveAimViaDevice(deps, params, 'selector', 'x', 'y', false, 'tap');
+      // The aim came through the lease's proxy: if the lease moved meanwhile it is the NEW device's aim, and
+      // this session drives the old phone. Before the `unsupported` branch, which would fall back onto that device.
+      if (!leaseLive()) return LEASE_ENDED_OUTCOME;
       if (r.kind === 'unsupported') return { handled: false, reason: STALE_APP_REASON };
       if (r.kind === 'refusal') return { handled: true, reply: r.error };
       await wdaTap(session, r.aim.x, r.aim.y);
       return { handled: true, reply: `ok (wda touch) css(${Math.round(r.aim.x)},${Math.round(r.aim.y)}) @ ${aimAsResolved(r.aim.label)} [input:${TRUSTED_WDA_MECHANISM}]` };
     }
-    // drag
+    // drag — EACH aim is checked before its own `unsupported` branch, not once after both: an app build on the new
+    // lease's device that predates `resolve-aim` answers `Unknown method`, and that branch falls back synthetically
+    // onto that device (#1077's close-out round-3 review; a single check after `to` was wrongly measured redundant).
     const from = await resolveAimViaDevice(deps, params, 'fromSelector', 'fromX', 'fromY', false, 'drag');
+    if (!leaseLive()) return LEASE_ENDED_OUTCOME;
     if (from.kind === 'unsupported') return { handled: false, reason: STALE_APP_REASON };
     if (from.kind === 'refusal') return { handled: true, reply: from.error };
     const to = await resolveAimViaDevice(deps, params, 'toSelector', 'toX', 'toY', false, 'drag');
+    if (!leaseLive()) return LEASE_ENDED_OUTCOME;
     if (to.kind === 'unsupported') return { handled: false, reason: STALE_APP_REASON };
     if (to.kind === 'refusal') return { handled: true, reply: to.error };
     // The synthetic path expresses a drag as steps×delay; WDA interpolates from a DURATION. Convert
@@ -313,6 +373,11 @@ export async function tryDeviceWdaInput(method: string, params: Record<string, u
   } catch {
     // Release any pointer the failed gesture may have left down, THEN let the caller fall back.
     await session.releaseActions();
+    // …unless the lease ended meanwhile (the agent is killed with it, which is likely WHY this threw): the
+    // fallback would replay the tap synthetically on the device the lease holds now. Checked BEFORE the reset:
+    // `endDeviceWdaLease` already dropped this session, so a reset here could only drop one the NEXT lease cached
+    // while `releaseActions` was out.
+    if (!leaseLive()) return LEASE_ENDED_OUTCOME;
     resetDeviceWdaSession();
     return { handled: false, reason: WDA_SESSION_LOST_REASON };
   }
@@ -324,7 +389,7 @@ export async function tryDeviceWdaInput(method: string, params: Record<string, u
  *  reader is not sent to Build Support for a problem that is really "no WiFi lease". */
 export const WDA_SHOT_NO_SESSION_REASON =
   'WebDriverAgent is not answering on the phone, so the out-of-app capture is unavailable — install '
-  + 'it from Build Support (iOS) and make sure the lease is a WiFi one (adb/USB leases are Android)';
+  + 'it from Build Support (iOS) and make sure the lease is a WiFi one (WebDriverAgent is not reachable through a USB lease)';
 
 /** The coordinate-space warning every WDA capture carries.
  *
@@ -373,16 +438,25 @@ export type WdaShotOutcome =
  *  screenshot that silently takes six seconds because the app crashed is a worse experience than
  *  one that says why it could not help. */
 export async function tryDeviceWdaScreenshot(
-  deps: { host?: string; lease?: LeaseHardware; getSession?: WdaRouteDeps['getSession'] },
+  deps: { host?: string; lease?: LeaseHardware; getSession?: WdaRouteDeps['getSession']; leaseLive?: LivenessCheck },
   opts: { autoLaunch?: boolean } = {},
 ): Promise<WdaShotOutcome> {
   const getSession = deps.getSession ?? getDeviceWdaSession;
+  const leaseLive = deps.leaseLive ?? leaseToken.capture();
+  // The lease ended after the caller read `host` — during the router's native capture, say. That address is the
+  // previous phone's: photographing it would present its screen as the current lease's.
+  if (!leaseLive()) return { handled: false, reason: WDA_LEASE_ENDED_REASON };
   const session = await getSession({
     host: deps.host, autoLaunch: opts.autoLaunch ?? false, ...(deps.lease ? { lease: deps.lease } : {}),
   });
-  if (!session) return { handled: false, reason: lastLaunchFailure ?? WDA_SHOT_NO_SESSION_REASON };
+  // A lease that ended while this capture was launching has had its failure cleared — say why, rather than
+  // falling through to "install it from Build Support" (#1077's close-out re-review).
+  if (!session) return { handled: false, reason: !leaseLive() ? WDA_LEASE_ENDED_REASON : (lastLaunchFailure ?? WDA_SHOT_NO_SESSION_REASON) };
   try {
     const base64 = await session.screenshot();
+    // The lease ended while the capture was out: this is the OLD phone's screen, and returning it as a success
+    // would present it as the current lease's device.
+    if (!leaseLive()) return { handled: false, reason: WDA_LEASE_ENDED_REASON };
     const dims = pngDimensions(base64);
     return {
       handled: true,
@@ -397,7 +471,9 @@ export async function tryDeviceWdaScreenshot(
     };
   } catch (e) {
     // Drop the cached session: the usual cause is that the agent died (its xcodebuild test process
-    // is not running), and a stale session id would fail every later call the same way.
+    // is not running), and a stale session id would fail every later call the same way. A lease that ended
+    // meanwhile is the likelier cause and says so — checked before the reset, for the same reason as the input catch.
+    if (!leaseLive()) return { handled: false, reason: WDA_LEASE_ENDED_REASON };
     resetDeviceWdaSession();
     return { handled: false, reason: `the WebDriverAgent capture failed: ${e instanceof Error ? e.message : String(e)}` };
   }

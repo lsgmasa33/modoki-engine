@@ -12,7 +12,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react';
 import { useOverlay } from '../input/useOverlayEscape';
 import { isTextEditable } from '../input/focusScope';
-import { register } from '../input/keymap';
+import { register, registerBindings } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { useEditorStore } from '../store/editorStore';
 import { writeMetaOrWarn } from './assetViews/widgets';
@@ -462,12 +462,12 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
         preventDefault: notTyping,
         run: () => { if (notTyping()) fn(); },
       });
-    const offs = [
+    const offBindings = registerBindings(() => [
       mk('spriteEditor.undo', 'mod+z', undo),
       mk('spriteEditor.redo', 'mod+shift+z', redo),
       mk('spriteEditor.redoY', 'mod+y', redo),
-    ];
-    return () => { for (const off of offs) off(); };
+    ]);
+    return offBindings;
   }, [undo, redo, overlayId, hmrEpoch]);
 
   // ── Mouse interaction ──
