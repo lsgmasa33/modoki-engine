@@ -1211,13 +1211,19 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   // ── GET /api/journal[?type=&clear=1] (M→R) ── the tick-stamped game-event trace
   // (emit/journalEvents) — verify game LOGIC (match/score/win) without screenshots.
   if (urlPath === '/api/journal' && method === 'GET') {
-    const params: { type?: string; level?: 'info' | 'warn' | 'error'; clear?: boolean; limit?: number; action?: 'start' | 'stop' } = {};
+    const params: { type?: string; level?: string; clear?: boolean; limit?: number; action?: string } = {};
     const type = query.get('type');
     if (type) params.type = type;
+    // ⚠️ `level` and `action` are forwarded RAW — never narrowed to the values this route knows
+    // (#1072). It used to copy only `info|warn|error` and `start|stop`, so `?level=wran` was DROPPED
+    // and the op answered an UNFILTERED read under a filtered framing, and `?action=strat` turned a
+    // capture toggle into a plain read. A copy of the op's vocabulary here turns a typo into a wrong
+    // answer; the op owns the tables and refuses an unknown value with its options, on a coded
+    // envelope `relayJson` sends as a 400. Guarded by `tests/plugins/routeVocabularyForwarding.test.ts`.
     const level = query.get('level');
-    if (level === 'info' || level === 'warn' || level === 'error') params.level = level;
+    if (level) params.level = level;
     const action = query.get('action');
-    if (action === 'start' || action === 'stop') params.action = action;
+    if (action) params.action = action;
     if (query.get('clear') === '1' || query.get('clear') === 'true') params.clear = true;
     const jLimit = query.get('limit');
     if (jLimit != null && jLimit !== '' && !Number.isNaN(Number(jLimit))) params.limit = Number(jLimit);
@@ -4609,7 +4615,8 @@ async function describeUnresolvedAgainstLiveWorld(
     const sinceCap = query.get('sinceCap');
     const ejLimit = query.get('limit');
     if (type) params.type = type;
-    if (source === 'human' || source === 'agent') params.source = source;
+    // Forwarded RAW (#1072) — the op refuses an unknown source with its options. See /api/journal.
+    if (source) params.source = source;
     if (since != null && since !== '' && !Number.isNaN(Number(since))) params.since = Number(since);
     if (ejLimit != null && ejLimit !== '' && !Number.isNaN(Number(ejLimit))) params.limit = Number(ejLimit);
     if (sinceCap != null && sinceCap !== '' && !Number.isNaN(Number(sinceCap))) params.sinceCap = Number(sinceCap);
@@ -4637,7 +4644,9 @@ async function describeUnresolvedAgainstLiveWorld(
     const since = query.get('since');
     const timeoutMsQ = query.get('timeoutMs');
     if (type) params.type = type;
-    if (source === 'human' || source === 'agent') params.source = source;
+    // Forwarded RAW (#1072). Dropping `?source=agnet` here made the op fall back to its 'human'
+    // default and park waiting for the WRONG actor; the op refuses it instead. See /api/journal.
+    if (source) params.source = source;
     if (since != null && since !== '' && !Number.isNaN(Number(since))) params.since = Number(since);
     if (timeoutMsQ != null && timeoutMsQ !== '' && !Number.isNaN(Number(timeoutMsQ))) params.timeoutMs = Number(timeoutMsQ);
     const clampedOpTimeout = Math.max(50, Math.min(120_000, params.timeoutMs ?? 30_000));

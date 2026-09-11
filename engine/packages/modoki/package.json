@@ -21,7 +21,8 @@
     "./editor/rendering": "./src/editor/rendering/index.ts",
     "./three": "./src/three/index.ts",
     "./testing": "./tests/helpers/sourceScanner.ts",
-    "./testing/tapTargetFloor": "./tests/helpers/tapTargetFloor.ts"
+    "./testing/tapTargetFloor": "./tests/helpers/tapTargetFloor.ts",
+    "./testing/prefabInstances": "./tests/helpers/prefabInstances.ts"
   },
   "scripts": {
     "test": "vitest run",

@@ -87,6 +87,14 @@ export function pickHostSidePlatform(o: {
   /** Serials adb can see. */  androids: string[];
 }): 'ios' | 'android' | { error: string } {
   if (o.explicit === 'ios' || o.explicit === 'android') return o.explicit;
+  // An UNKNOWN explicit platform is refused, not ignored (#1072's mechanism, found by its close-out
+  // sweep). Ignoring `platform:'andriod'` fell through to the lease or to whatever is attached — so a
+  // caller who NAMED a platform could be answered about the other one, the exact wrong-device
+  // answer the refusal below exists to prevent. The MCP tools enum-validate it; the curl API does not.
+  // `!= null`: a JSON body's `platform: null` means "not given", as it does everywhere else here.
+  if (o.explicit != null && o.explicit !== '') {
+    return { error: `unknown platform ${JSON.stringify(o.explicit)} — pass platform:'ios' or platform:'android'` };
+  }
   if (o.leased === 'ios' || o.leased === 'android') return o.leased;
   if (o.iphones.length && o.androids.length) {
     return { error: `both an iPhone (${o.iphones.join(', ')}) and an Android (${o.androids.join(', ')}) are attached and no lease says which — pass platform:'ios' or platform:'android'` };

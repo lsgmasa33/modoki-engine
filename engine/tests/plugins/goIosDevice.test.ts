@@ -39,8 +39,21 @@ describe('goIosDevice — pickHostSidePlatform', () => {
     expect(String((got as { error: string }).error)).toMatch(/no device is attached/)
   })
 
-  it('ignores a junk `explicit` instead of trusting it', () => {
-    expect(pickHostSidePlatform({ explicit: 'windows-phone', leased: 'android', iphones: [], androids: ['S'] })).toBe('android')
+  // This used to assert the junk was IGNORED — falling through to the lease. Not trusting it was
+  // right; ignoring it was the same wrong-device answer this function exists to refuse: a caller who
+  // NAMED a platform (`'andriod'`) was answered about whatever the lease or the cable said instead,
+  // with no hint its ask had been dropped. #1072's close-out sweep found it; the curl API reaches it
+  // (the MCP tools enum-validate `platform`).
+  it('REFUSES a junk `explicit` — neither trusting it nor silently falling through to the lease', () => {
+    const got = pickHostSidePlatform({ explicit: 'windows-phone', leased: 'android', iphones: [], androids: ['S'] })
+    expect(got).toHaveProperty('error')
+    expect(String((got as { error: string }).error)).toContain('windows-phone')
+  })
+
+  it('an EMPTY or NULL explicit is "not given", not junk', () => {
+    expect(pickHostSidePlatform({ explicit: '', leased: 'android', iphones: [], androids: ['S'] })).toBe('android')
+    // A JSON body can carry `platform: null` — the curl API reaches this with it.
+    expect(pickHostSidePlatform({ explicit: null as unknown as string, leased: 'android', iphones: [], androids: ['S'] })).toBe('android')
   })
 })
 

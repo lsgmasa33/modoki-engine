@@ -13,6 +13,7 @@ import {
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
+import { opReplyFor } from '../../app/debug/opRefusal';
 
 registerAllTraits();
 registerEditorAgentOps();
@@ -480,6 +481,52 @@ describe('create-entity validates the primitive vocabulary (S2.15)', () => {
   it('omitting mesh/shape still uses the documented default', async () => {
     const r = await runAgentOp('create-entity', { spec: { kind: 'primitive' } }) as { id: number };
     expect(r.id).toBeGreaterThan(0);
+  });
+
+  it('omitting light/preset uses the default the MCP tool applies (a direct op call is not exempt)', async () => {
+    expect((await runAgentOp('create-entity', { spec: { kind: 'light' } }) as { name: string }).name).toBe('Point Light');
+    expect((await runAgentOp('create-entity', { spec: { kind: 'ui' } }) as { name: string }).name).toBe('UI View');
+  });
+});
+
+describe('create-entity refusals reach the relay WITH their options (#1070)', () => {
+  // A plain throw reached the agent as a generic REFUSED_BY_OP whose valid values existed only inside
+  // the prose. `opReplyFor` is the seam both editor relay transports (HMR and Electron IPC) run, so
+  // the envelope it produces is exactly what `/api/editor-action` relays on a 400.
+  it.each([
+    { spec: { kind: 'primitive', mesh: 'pyramid' }, option: 'sphere' },
+    { spec: { kind: '2d', shape: 'star' }, option: 'circle' },
+    { spec: { kind: 'light', light: 'pont' }, option: 'point' },
+    { spec: { kind: 'ui', preset: 'buton' }, option: 'button' },
+    { spec: { kind: 'pyramid' }, option: 'camera' },
+  ])('$spec → REFUSED_BY_OP with options, and no edit', async ({ spec, option }) => {
+    const version = getEditVersion();
+    const reply = await opReplyFor(() => runAgentOp('create-entity', { spec })) as
+      { result?: { ok?: boolean; code?: string; options?: string[] } };
+    expect(reply.result?.ok).toBe(false);
+    expect(reply.result?.code).toBe('REFUSED_BY_OP');
+    expect(reply.result?.options).toContain(option);
+    expect(getEditVersion()).toBe(version);
+  });
+});
+
+describe('editor-journal / wait-for-edit refuse an unknown source WITH options (#1072)', () => {
+  // An unknown source matched no event: editor-journal answered an EMPTY filtered read, and
+  // wait-for-edit parked for its whole timeout and answered `timedOut:true` — both indistinguishable
+  // from "nobody did anything". The route used to drop the value first; now it forwards it here.
+  it.each(['editor-journal', 'wait-for-edit'])('%s {source:"agnet"}', async (op) => {
+    const reply = await opReplyFor(() => runAgentOp(op, { source: 'agnet', timeoutMs: 50 })) as
+      { result?: { ok?: boolean; code?: string; options?: string[] } };
+    expect(reply.result?.ok).toBe(false);
+    expect(reply.result?.code).toBe('REFUSED_BY_OP');
+    expect(reply.result?.options).toEqual(['human', 'agent']);
+  });
+
+  it('a valid source still reads, and still waits', async () => {
+    const read = await runAgentOp('editor-journal', { source: 'agent' }) as { ok?: boolean };
+    expect(read.ok).not.toBe(false);
+    const waited = await runAgentOp('wait-for-edit', { source: 'human', timeoutMs: 50 }) as { timedOut?: boolean };
+    expect(waited.timedOut).toBe(true);
   });
 });
 

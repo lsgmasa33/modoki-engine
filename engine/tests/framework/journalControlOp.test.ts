@@ -96,6 +96,42 @@ describe('journal-events: a FILTERED read must not destroy the rest of the ring'
   });
 });
 
+describe('journal-events: an unknown vocabulary value is REFUSED with a code and options (#1072)', () => {
+  /** The CODE is what makes these refusals reach an agent as failures: this op answers a GET relay,
+   *  and the MCP client does not check a plain read's `ok` — only its status, which `relayJson`
+   *  derives from the code. `routeVocabularyForwarding.test.ts` drives the same thing through the
+   *  route; these pin what the op itself decides. */
+  type Refusal = { ok?: boolean; code?: string; error?: string; options?: string[]; events?: unknown; captures?: CaptureState };
+
+  it('an unknown level: code + the levels, nothing read, nothing cleared', async () => {
+    game = createTestWorld();
+    emit('match', { n: 1 });
+    const r = await journal({ level: 'wran', clear: true }) as unknown as Refusal;
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('REFUSED_BY_OP');
+    expect(r.options).toEqual(['info', 'warn', 'error']);
+    expect(r.events).toBeUndefined();
+    const after = await journal({}) as unknown as { events: unknown[] };
+    expect(after.events).toHaveLength(1);
+  });
+
+  it('a non-string level is refused the same way, not thrown', async () => {
+    game = createTestWorld();
+    const r = await journal({ level: 2 }) as unknown as Refusal;
+    expect(r.code).toBe('REFUSED_BY_OP');
+  });
+
+  it('an unknown action: code + the verbs, and the capture state is untouched', async () => {
+    game = createTestWorld(); // @contact active by default
+    const r = await journal({ action: 'strat', type: '@contact' }) as unknown as Refusal;
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('REFUSED_BY_OP');
+    expect(r.options).toEqual(['start', 'stop']);
+    expect(r.events).toBeUndefined(); // it did not fall through to a read
+    expect(r.captures?.active).toContain('@contact');
+  });
+});
+
 describe('journal-events: byType describes the RING, not the filtered slice', () => {
   it('a filtered read still reports the whole-ring histogram + its own filter', async () => {
     game = createTestWorld();

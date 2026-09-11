@@ -1612,8 +1612,7 @@ project in scope keeps a short test that supplies only DATA:
 ```ts
 describeTapTargetFloor({
   label: 'my-game',
-  sceneDir: join(ASSETS, 'scenes'),
-  prefabDir: join(ASSETS, 'prefabs'),
+  assetsDir: ASSETS,    // walked RECURSIVELY for every *.scene.json and *.prefab.json
   underFloor: [],       // MEASURED under 44 pt — each name needs a reason
   unresolvable: [],     // an auto/`%` axis nothing here can size
   expectAtLeast: 0,     // anti-vacuity
@@ -1650,6 +1649,41 @@ debug slider means inventing a value for a UI nobody ships.
 ⚠️ **A project's own guard cannot see everything, and one of its lists says so out loud.** The
 resolver reads authored data only — it never resolves a parent chain to a real size, and it knows
 nothing about where a 2D board lands. `unresolvable` is that blind spot, enumerated.
+
+⚠️ **A placed prefab INSTANCE is measured as composed, never as its prefab's root (#1060).** A pooled
+cell (`level-page` placing 16 `level-tile`s, `daily-month` placing 42 `daily-day`s) is a ROW naming
+the child prefab plus `overrides` — no `traits.UIElement` of its own — and the runtime sizes each one
+as the child root PLUS that row's overrides (`effectivePrefabMemberTraits`, #1031). The resolver used
+to skip such rows and measure the cell once, from the prefab file, so resizing ONE tile in the Prefab
+editor passed the gate while that tile was 33 pt wide. Now `@modoki/engine/testing/prefabInstances`
+composes every member of every instance with the engine's own function and measures it TWICE — as
+placed (composed traits, composed parent chain continuing into the document that placed it) and as
+its prefab file measures it (standalone traits, a chain stopping at the prefab root). When the gate
+would CONCLUDE something different — a measured pt size, the blind-spot status, the scrim exclusion,
+zone coverage, the population predicates — the member becomes a control of its own, named by the
+instance's runtime name (`Tile3`, or `Tile3/Badge`, qualified by every nested row). Three consequences
+are deliberate: the corpus does not move until a placement changes a verdict (it did not move when
+this landed — 0 of 86 override rows touched `UIElement`); a deliberately LARGER instance passes rather
+than being refused for differing; and a cosmetic override (`opacity`) adds nothing, because a
+project's lists are set equality.
+
+⚠️ **Why VERDICTS and not fields — every narrower cut was measured wrong in #1060's close-out.** A
+member-only field diff missed an unchanged `100%` icon under a wrapper one placement resized to 24 px
+(the file's copy is a scrim, the placed one a 24 pt target in no list). An ancestor field diff
+re-listed children whose verdict could not move. A list of "fields the resolver reads" needed a source
+scan that missed other call spellings. And none of them saw an UNCHANGED placement under a small scene
+box. Sizes are compared EXACTLY — a rounded comparison called a 43.9996 pt instance of a 44 pt prefab
+unchanged. Three spawner facts the chain depends on: a member parented to a NESTED child's root is
+listed at the row that placed that child (`InstanceMember.parent` is an exact address, or the chain
+comes back empty); a top-level member authored with no parent hangs under the placing row's parent
+when a SCENE placed it but at the world root when a prefab did; and an ancestor that is itself a placed
+instance is read as its composed root (such a row normally carries no `UIElement` of its own, and a
+scene instance row keeps its `guid` at the top level, not under `EntityAttributes`). A `designPx`
+entry matches an instance member by its unqualified RUNTIME name — production finds design-px
+controls with `findByName` on the spawned entity, so a placement that renames a member moves it. Any other guard that sizes a pooled
+cell reads it the same way — Court's `levelSelectGeometry`, `dailyCalendarTarget` and `dailyCalendar`
+tests do. ⚠️ **Still not modelled:** a row's structural `added`/`removed` members, so a guard that
+needs a member to EXIST refuses those itself.
 
 #### The population is `UIAction` **and** `TouchControl` (#963)
 

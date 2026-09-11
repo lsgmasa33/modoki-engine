@@ -49,7 +49,7 @@ import {
   poseClipAtTime, exitPoseEnvelope, resolveAnimatorRootForClip,
   getCreatableAssets, createRegisteredAsset,
   readEditorJournal, clearEditorJournal, withEditorActor, openActorLease, closeActorLease,
-  waitForEditorJournal,
+  waitForEditorJournal, EDITOR_JOURNAL_SOURCES, isEditorJournalSource,
   readMetaPreferringPark, peekPendingMeta, discardPendingMeta, getPendingMetaPaths,
   getResolvedRender3d,
   probeKeyReach,
@@ -66,7 +66,7 @@ import {
   getTimeline, normalizeTimeline, getGuidForPath, getAssetEntry, getPresentationScale,
   getSpriteAnim, getRig2D, getRig2DSource,
   getAnimSet, getSpriteMaterialProgram, isGuid,
-  getAllTraits, PRIMITIVE_NAMES, PRIMITIVE_SPRITE_NAMES, type MutateOp, type MutateEntityRef,
+  getAllTraits, resolveCreateEntitySpec, type MutateOp, type MutateEntityRef,
   Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
   type AnimationClipDef, type TrackValueType, type TimelineDef, type TrackDef, type TrackKind,
   sceneManager, assetUrl, type AssetSchemaType,
@@ -941,6 +941,14 @@ export function registerEditorAgentOps(): void {
   // → set timeScale 0.3 → @match on tick 84 → paused").
   registerAgentOp('editor-journal', (params) => {
     const p = (params ?? {}) as { type?: string; source?: 'human' | 'agent'; since?: number; sinceCap?: number; clear?: boolean; merged?: boolean; limit?: number };
+    // An unknown `source` matched nothing, so the read came back EMPTY under a filtered framing —
+    // "the agent did nothing" for a typo. Refused with the options instead (#1072); the route used to
+    // drop the value before it got here, and forwards it raw now so this can fire.
+    if (p.source !== undefined && !isEditorJournalSource(p.source)) {
+      throw new OpRefusal('REFUSED_BY_OP',
+        `editor-journal: unknown source ${JSON.stringify(p.source)} — nothing was read and nothing was cleared. Valid: ${EDITOR_JOURNAL_SOURCES.join(', ')}.`,
+        { options: [...EDITOR_JOURNAL_SOURCES] });
+    }
     // `editor` is the editor-only view: filtered by type/source and cursored by the
     // editor-local `since` (a `seq`). `timeline` is the single-axis merged view.
     //
@@ -1046,6 +1054,13 @@ export function registerEditorAgentOps(): void {
   // manages/observes attribution, so it must not itself be attributed.
   _registerAgentOp('wait-for-edit', (params) => {
     const p = (params ?? {}) as { type?: string; source?: 'human' | 'agent'; since?: number; timeoutMs?: number };
+    // Refused BEFORE parking (#1072): an unknown source matches no event, so this would sit out the
+    // whole timeout and answer `timedOut:true` — indistinguishable from "the human did nothing".
+    if (p.source !== undefined && !isEditorJournalSource(p.source)) {
+      throw new OpRefusal('REFUSED_BY_OP',
+        `wait-for-edit: unknown source ${JSON.stringify(p.source)} — nothing was waited for. Valid: ${EDITOR_JOURNAL_SOURCES.join(', ')}.`,
+        { options: [...EDITOR_JOURNAL_SOURCES] });
+    }
     const requested = typeof p.timeoutMs === 'number' && Number.isFinite(p.timeoutMs) ? p.timeoutMs : WAIT_FOR_EDIT_DEFAULT_MS;
     const timeoutMs = Math.max(WAIT_FOR_EDIT_MIN_MS, Math.min(WAIT_FOR_EDIT_MAX_MS, requested));
     return waitForEditorJournal({ type: p.type, source: p.source ?? 'human', since: p.since }, timeoutMs);
@@ -1936,31 +1951,24 @@ export function registerEditorAgentOps(): void {
   registerAgentOp('create-entity', (params) => {
     const p = (params ?? {}) as CreateEntityParams;
     if (!p.spec) throw new Error('create-entity requires { spec }');
-    // `mesh` / `shape` were free strings, so `{kind:'primitive', mesh:'pyramid'}` returned
-    // `{id, name:'Pyramid', guid}` — a clean success — and produced an entity whose renderer
-    // resolves to nothing: invisible, with no error anywhere. Validate against the ONE vocabulary
-    // the renderer actually has, and name the valid values (§5).
-    const spec = p.spec as { kind?: string; mesh?: string; shape?: string };
-    // Defaults belong HERE, not in the MCP tool that happens to be one caller of many. They lived
-    // in tools/editor.ts (`mesh ?? 'sphere'`), so a direct op call — the curl API, a test, any
-    // future caller — reached `cap(undefined)` and died with a raw
-    // `Cannot read properties of undefined (reading 'charAt')`. §9: the curl surface is not exempt
-    // from the contract the MCP tool advertises.
-    if (spec.kind === 'primitive' && !spec.mesh) spec.mesh = 'sphere';
-    if (spec.kind === '2d' && !spec.shape) spec.shape = 'square';
-    if (spec.kind === 'primitive' && spec.mesh && !PRIMITIVE_NAMES.includes(spec.mesh)) {
-      throw new Error(`create-entity: unknown primitive mesh "${spec.mesh}" — nothing was created. Valid: ${PRIMITIVE_NAMES.join(', ')}.`);
-    }
-    if (spec.kind === '2d' && spec.shape && !(PRIMITIVE_SPRITE_NAMES as readonly string[]).includes(spec.shape)) {
-      throw new Error(`create-entity: unknown 2D shape "${spec.shape}" — nothing was created. Valid: ${PRIMITIVE_SPRITE_NAMES.join(', ')}. (For an image sprite, create the entity then set Renderable2D.sprite to a texture GUID.)`);
+    // The ONE vocabulary check both create-entity ops share (#1070) — `resolveCreateEntitySpec`
+    // applies the per-kind defaults and checks kind, mesh, shape, light and preset. Two scars live
+    // in it: `{kind:'primitive', mesh:'pyramid'}` once returned a clean success for an entity whose
+    // renderer resolves to nothing, and defaults that lived in tools/editor.ts let a direct op call
+    // (§9: the curl surface is not exempt) reach `cap(undefined)` and die with a raw TypeError.
+    // ⚠️ An `OpRefusal`, not a plain throw: a plain throw reached the agent as a generic
+    // REFUSED_BY_OP whose valid values existed only inside the prose; this carries them as `options`.
+    const resolved = resolveCreateEntitySpec(p.spec);
+    if (!resolved.ok) {
+      throw new OpRefusal('REFUSED_BY_OP', `create-entity: ${resolved.error} Valid: ${resolved.options.join(', ')}.`, { options: resolved.options });
     }
     // parentGuid (stable) wins over parentId; BOTH are validated; 0 = root stays literal.
     const parentId = resolveParentId(p, 'create-entity parent');
-    const { name, specs } = buildEntityCreateSpecs(p.spec, parentId);
+    const { name, specs } = buildEntityCreateSpecs(resolved.spec, parentId);
     const id = createEntityWithUndo(`Create ${name}`, parentId, specs as TraitSpec[], (i) => setSelectionRaw(i, i != null ? [i] : []));
     // null = nothing was created. Reporting {id:null} as a success let an agent proceed as
     // if the entity existed — say so instead. (C7)
-    if (id == null) throw new Error(`create-entity: nothing was created for spec ${JSON.stringify(p.spec)} (parentId ${parentId})`);
+    if (id == null) throw new Error(`create-entity: nothing was created for spec ${JSON.stringify(resolved.spec)} (parentId ${parentId})`);
     // Return the GUID, not just the live id. CLAUDE.md's rule is "address entities by
     // {guid}, NEVER {id}" — runtime ids are reassigned on every scene hot-reload, and the
     // file's id space is a DIFFERENT namespace (loadSceneFile remaps them), so a stale id

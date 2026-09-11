@@ -324,8 +324,11 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
         // direct curl call behave identically — they used to differ, and the direct path crashed.
         case 'primitive': spec = { kind, ...(mesh ? { mesh } : {}) }; break;
         case '2d': spec = { kind, ...(shape ? { shape } : {}) }; break;
-        case 'ui': spec = { kind, preset: preset ?? 'view' }; break;
-        case 'light': spec = { kind, light: light ?? 'point' }; break;
+        // ⚠️ No `?? 'view'` / `?? 'point'` here (#1070 close-out review): the op owns those defaults
+        // now (`resolveCreateEntitySpec`), and a copy in the tool would silently keep the OLD one if
+        // the runtime's ever changed — curl and the tool would build different entities again.
+        case 'ui': spec = { kind, ...(preset ? { preset } : {}) }; break;
+        case 'light': spec = { kind, ...(light ? { light } : {}) }; break;
         default: spec = { kind };
       }
       return editorAction('create-entity', { spec, parentId, parentGuid });

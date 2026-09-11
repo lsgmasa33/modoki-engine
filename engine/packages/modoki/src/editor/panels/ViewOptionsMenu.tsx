@@ -7,6 +7,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { useOverlayEscape } from '../input/useOverlayEscape';
+import { namedBadgeLabel } from './badgeLabel';
 
 export interface ViewOption {
   key: string;
@@ -25,17 +26,14 @@ export interface ViewOption {
 /** The trigger's label: names the checked options instead of counting them (#1003).
  *
  *  `View` when nothing is on, `View: Colliders` for one, `View: Grid, Colliders` for two, and
- *  `View: Grid, Colliders +2` beyond that — so at least one option is always NAMED however many are
- *  active, and the width stays bounded. Exported (and pure) so the rule is testable without mounting
- *  the menu, per docs/editor.md's "a panel's DECISIONS belong in a plain module" convention. */
+ *  `View: Grid, Colliders +2` beyond that. The naming rule itself is `namedBadgeLabel`, shared with the
+ *  tree panels' `Type ▾` filter (#1021); what is THIS menu's own is the order names reach the cap in. */
 export function viewBadgeLabel(items: readonly ViewOption[]): string {
   // `notable` first, order otherwise preserved — so a content-removing option is never the one the
   // cap drops. A stable partition rather than a sort, so the menu's own ordering still reads through.
   const checked = items.filter((i) => i.checked);
   const on = [...checked.filter((i) => i.notable), ...checked.filter((i) => !i.notable)];
-  if (on.length === 0) return 'View';
-  if (on.length <= 2) return `View: ${on.map((i) => i.label).join(', ')}`;
-  return `View: ${on[0].label}, ${on[1].label} +${on.length - 2}`;
+  return namedBadgeLabel('View', on.map((i) => i.label));
 }
 
 /** One checkable row inside {@link ViewOptionsMenu}. */
@@ -53,8 +51,8 @@ function ViewOptionItem({ label, checked, onToggle, title, uiId }: ViewOption) {
 }
 
 /** Self-contained: closes on outside-click or Escape (`useOverlayEscape`), and renders its own
- *  leading divider so callers just drop it into a toolbar. The trigger shows a `(N)` badge for
- *  how many items are currently checked. */
+ *  leading divider so callers just drop it into a toolbar. The trigger NAMES the checked items
+ *  ({@link viewBadgeLabel}). */
 export function ViewOptionsMenu({ items, uiId }: { items: ViewOption[]; uiId: string }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);

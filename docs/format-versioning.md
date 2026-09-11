@@ -547,6 +547,14 @@ found:
 | a **font filename** segment | `loaders/fontNaming.ts` | `match.weight` is `undefined`, so the face ships with no weight |
 | a **GLB attribute semantic**, at BUILD time | `plugins/model-convert/threeAdapter.ts` | `geom.setAttribute(fn, …)` files the data under a stringified function |
 | a **scene-JSON trait name**, at BUILD time | `plugins/detect-modules.ts` | a garbage module flag in the bag handed to the build's `define`s |
+| **scene JSON**, a game config field typed `'x' as string` (#1061) | Court's `systems.ts` — `COIN_SETS[cfg.coinSet]`, `UNIT_PX[widthUnit]` | the inherited `valueOf` is **invoked** → TypeError on every piece drawn; a panel half-width of NaN |
+
+⚠️ **`'metal' as string` reads like a union at the call site, and is not one** (#1061). #993's triage
+ejected Court's tables as "keyed by TS unions the code produced" — right for `haptics.ts`,
+`accountUi.ts` and `debugTab.tsx`, wrong for `COIN_SETS`, whose key is a trait field declared
+`coinSet: 'metal' as string`. An Inspector `enum` over the same field does not narrow it either: the
+dropdown constrains ONE authoring surface, while the scene file and `modoki_mutate_scene` write any
+string. **Classify a key by its DECLARATION and every route that writes it, never by how it is used.**
 
 Three findings that generalise beyond this family:
 

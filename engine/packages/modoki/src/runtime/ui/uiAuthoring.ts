@@ -42,8 +42,14 @@ export const UI_PRESET_NAMES = Object.keys(UI_PRESET_DEFAULTS) as ReadonlyArray<
  *  in scene/entityCreateSpecs.ts, and for the same reason. `preset` is `spec.preset` off the
  *  `create-entity` agent payload, so `preset: "toString"` handed the inherited FUNCTION to the
  *  `UIElement` trait's `data` and the op still answered `{ok: true}`. */
+/** Membership in `UI_PRESET_DEFAULTS` — own keys only (#993). The one test both
+ *  `uiPresetDefaults` below and `resolveCreateEntitySpec`'s agent refusal use. */
+export function isUiPreset(preset: string): preset is UiPreset {
+  return hasDocKey(UI_PRESET_DEFAULTS, preset);
+}
+
 function uiPresetDefaults(preset: UiPreset): Record<string, unknown> {
-  if (!hasDocKey(UI_PRESET_DEFAULTS, preset)) {
+  if (!isUiPreset(preset)) {
     throw new Error(`create-entity: unknown UI preset "${preset}" — nothing was created. Valid: ${UI_PRESET_NAMES.join(', ')}.`);
   }
   return UI_PRESET_DEFAULTS[preset];

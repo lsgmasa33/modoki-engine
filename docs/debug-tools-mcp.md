@@ -567,7 +567,11 @@ was. The first cut fell through to iOS whenever the platform was unknown, and wi
 three Androids attached it silently answered about the iPhone: right-looking payload, wrong device,
 no hint a choice had been made. Both tools now take `platform: 'ios'|'android'`, and the order is
 **explicit → lease → what is actually attached → refuse naming both sides**. `pickHostSidePlatform`
-is the one pure function that decides it, the same shape as `planIosInstall`.
+is the one pure function that decides it, the same shape as `planIosInstall`. An explicit platform
+that is neither `ios` nor `android` is REFUSED, not skipped (#1072 close-out): skipping it fell through
+to the lease, so a caller who named `'andriod'` was answered about the other device — this rule's own
+defect one step earlier. The MCP tools enum-validate `platform`; the curl API does not
+(docs/mcp-tool-conventions.md §5).
 
 ⚠️ **A WiFi lease names no adb serial.** `target.serial` is set only on the `useAdb` path, so "there
 is a lease" is not "we know which handset" — and falling through to the build resolver would read a

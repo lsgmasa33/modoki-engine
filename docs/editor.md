@@ -108,7 +108,14 @@ overlay — the 2D `colliders2DOnly` flag, the 3D `showColliders` flag, and the 
 Two surfaces carry that for the **two collider flags**:
 
 - **The `View ▾` badge NAMES what is on** — `View: Colliders`, not `View (1)` — via the pure
-  `viewBadgeLabel()` in `editor/panels/ViewOptionsMenu.tsx` (two names, then `+N`).
+  `viewBadgeLabel()` in `editor/panels/ViewOptionsMenu.tsx` (two names, then `+N`). The naming rule
+  is `namedBadgeLabel()` in `editor/panels/badgeLabel.ts`, which the Hierarchy/Assets **`Type ▾`**
+  filter uses too (#1021) — same mechanism, second site: a filter hides tree rows, and `Type (2)`
+  could not say which. That trigger names a selected type the menu has NO row for first (a persisted
+  Assets filter can carry one across projects), since it is the one filter with no checkbox to untick.
+  ⚠️ At the default 281px column a named `Type ▾` no longer fits beside the search field and drops to
+  the toolbar's second row while a filter is on — measured live and accepted by the owner over moving
+  the names to the footer.
 - **A corner notice in the viewport** while content is hidden, from `hiddenContentNotice()` in
   `editor/scene/sceneViewMath.ts`. It is keyed to the SAME predicate the renderer gates on
   (`shouldHideMeshesForColliderMode`) so it can never claim content is hidden when it is not, and it

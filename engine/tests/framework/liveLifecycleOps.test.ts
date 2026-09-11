@@ -56,6 +56,30 @@ describe('create-entity (runtime twin)', () => {
     expect((await sceneGuids()).length).toBe(before);
   });
 
+  // #1070: the light/preset checks used to THROW out of the spec builders, escaping this op's own
+  // `{ok:false, options}` convention — the device relay flattened the throw into a bare error string.
+  // An unknown kind was worse: the builder returned undefined and the destructuring threw a TypeError.
+  // A throw here would REJECT `runAgentOp`, so awaiting a plain reply is itself the assertion.
+  it.each([
+    { spec: { kind: 'light', light: 'pont' }, option: 'point' },
+    { spec: { kind: 'ui', preset: 'toString' }, option: 'view' },
+    { spec: { kind: 'pyramid' }, option: 'camera' },
+  ])('refuses $spec in its own {ok:false, options} shape, creating nothing (#1070)', async ({ spec, option }) => {
+    game = createTestWorld({});
+    const before = (await sceneGuids()).length;
+    const r = await runAgentOp('create-entity', { spec }) as CreateReply;
+    expect(r.ok).toBe(false);
+    expect(r.options).toContain(option);
+    expect((await sceneGuids()).length).toBe(before);
+  });
+
+  it('a light with no `light` field gets the default rather than a refusal', async () => {
+    game = createTestWorld({});
+    const r = await runAgentOp('create-entity', { spec: { kind: 'light' } }) as CreateReply;
+    expect(r.ok).not.toBe(false);
+    expect(r.name).toBe('Point Light');
+  });
+
   it('refuses a stale parentGuid rather than silently creating an orphan', async () => {
     game = createTestWorld({});
     const r = await runAgentOp('create-entity', { spec: { kind: 'primitive', mesh: 'sphere' }, parentGuid: 'ghost' }) as CreateReply;

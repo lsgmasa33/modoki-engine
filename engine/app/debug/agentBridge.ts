@@ -49,6 +49,7 @@ import {
   setJournalEnabled,
   JOURNAL_LEVELS,
   isJournalLevel,
+  type JournalLevel,
   resolveRefName,
   setVerboseCapture,
   verboseCaptureState,
@@ -763,13 +764,32 @@ registerAgentOp('console-logs', (params) => {
 // Read the tick-stamped game-event trace — the screenshot-free way to verify game
 // LOGIC (assert on match/score/win). Journaling is on by default, but force-enable
 // in case a shipped game turned it off, so the agent always sees events.
+/** The capture-control verbs `journal-events` accepts — a table so an unknown one is refused with the
+ *  real options (#1072) rather than falling through to a plain read. */
+const JOURNAL_CAPTURE_ACTIONS = ['start', 'stop'] as const;
+const isJournalCaptureAction = (a: unknown): a is typeof JOURNAL_CAPTURE_ACTIONS[number] =>
+  (JOURNAL_CAPTURE_ACTIONS as readonly unknown[]).includes(a);
+
 registerAgentOp('journal-events', (params) => {
-  const p = (params ?? {}) as { type?: string; level?: 'info' | 'warn' | 'error'; clear?: boolean; limit?: number; action?: 'start' | 'stop' };
+  const p = (params ?? {}) as { type?: string; level?: unknown; clear?: boolean; limit?: number; action?: unknown };
   setJournalEnabled(true);
+  // ⚠️ These two vocabulary refusals carry a §5 CODE and `options`, and that is load-bearing, not
+  // decoration (#1072). This op answers a GET relay: `relayJson` sends a coded envelope as a 400, and
+  // the MCP client fails any status ≥400 — but a plain read's 200 body is NOT checked for `ok:false`
+  // (`getJson`'s `checkFailure` is off for reads, because diagnose/validate return `ok:false` as their
+  // ANSWER). So an uncoded `{ok:false, reason}` here reached the agent as a SUCCESSFUL read. The route
+  // forwards the raw value precisely so these can fire; it used to drop an unknown one first.
+  if (p.action !== undefined && !isJournalCaptureAction(p.action)) {
+    return {
+      ok: false, code: 'REFUSED_BY_OP',
+      error: `unknown action ${JSON.stringify(p.action)} — nothing was started, stopped, read or cleared. Omit action to just read.`,
+      options: [...JOURNAL_CAPTURE_ACTIONS], captures: verboseCaptureState(),
+    };
+  }
   // Tier-2 capture control: `action:start|stop` with `type` names the watch-gated diagnostic
   // (e.g. @contact) to begin/end capturing. Off by default so the journal stays lean; a Tier-2
   // type emits NOTHING until started, and only from the start point forward (no back-history).
-  if (p.action === 'start' || p.action === 'stop') {
+  if (p.action !== undefined) {
     const t = p.type;
     if (!t) return { ok: false, reason: 'action needs type= naming the diagnostic to capture (e.g. @contact)', captures: verboseCaptureState() };
     if (!isVerboseType(t)) return { ok: false, reason: `"${t}" is always-on, not watch-gated — nothing to start/stop. Watch-gated types: ${verboseCaptureState().types.join(', ') || '(none)'}.`, captures: verboseCaptureState() };
@@ -777,20 +797,22 @@ registerAgentOp('journal-events', (params) => {
     return { ok: true, action: p.action, type: t, captures: verboseCaptureState() };
   }
   // ⚠️ REFUSE an unknown level rather than silently returning the whole ring (#993 close-out
-  // § 2d). `p.level` arrives unvalidated on the `device_journal`/`modoki_journal` payload, and
-  // `filtered` below would still report the reply as filtered — so `level:"wran"` answered with
-  // every event of every level, which an agent reads as "there really were N warn+ events". The
-  // shape is the `isVerboseType` refusal eleven lines above, deliberately.
-  if (p.level !== undefined && !isJournalLevel(p.level)) {
+  // § 2d). `filtered` below would still report the reply as filtered — so `level:"wran"` answered
+  // with every event of every level, which an agent reads as "there really were N warn+ events".
+  // Both MCP tools enum-validate `level`, so what reaches this is the dev-server curl API and an
+  // in-process call; it was unreachable from curl too until #1072 stopped the route dropping it.
+  if (p.level !== undefined && (typeof p.level !== 'string' || !isJournalLevel(p.level))) {
     return {
-      ok: false,
-      reason: `unknown level "${p.level}" — nothing was read and nothing was cleared. Valid: ${JOURNAL_LEVELS.join(', ')}. `
+      ok: false, code: 'REFUSED_BY_OP',
+      error: `unknown level ${JSON.stringify(p.level)} — nothing was read and nothing was cleared. `
         + 'A level filter means that severity AND ABOVE.',
+      options: [...JOURNAL_LEVELS],
     };
   }
-  const filtered = !!(p.type || p.level);
+  const level = p.level as JournalLevel | undefined;
+  const filtered = !!(p.type || level);
   const all = journalEvents();
-  const events = filtered ? journalEvents({ type: p.type, level: p.level }) : all;
+  const events = filtered ? journalEvents({ type: p.type, level }) : all;
   // `clear` used to wipe the ENTIRE 10,000-event ring even when the read was FILTERED — so
   // `journal {type:'match', clear:true}` returned 100 match events and silently destroyed every
   // @contact / score / win event alongside them, including the human's. There is no selective
@@ -1417,12 +1439,23 @@ registerAgentOp('input-watch-clear', () => ({ ok: true, cleared: clearInputPress
 // by how much. `show`/`hide` drive the on-screen overlay (which also plots the last few recorded
 // presses); `read` returns the geometry as data, which is what an agent actually reasons over. ──
 const DEFAULT_HIT_REGION_LIMIT = 60;
+const HIT_REGION_ACTIONS = ['read', 'show', 'hide'] as const;
 registerAgentOp('hit-regions', (raw: unknown) => {
   const p = (raw ?? {}) as {
     action?: string; provider?: string; kind?: string; ids?: string[];
     limit?: number; precision?: number; at?: { x: number; y: number };
   };
   const action = String(p.action ?? 'read');
+  // An unknown action is REFUSED with the verbs, not run as a read (#1072's mechanism, found by its
+  // close-out sweep): `action:'shwo'` answered geometry, so a caller that meant to put the overlay
+  // up read "it worked" while nothing appeared. Coded, because this op answers a GET relay too.
+  if (!(HIT_REGION_ACTIONS as readonly string[]).includes(action)) {
+    return {
+      ok: false, code: 'REFUSED_BY_OP',
+      error: `hit-regions: unknown action ${JSON.stringify(p.action)} — nothing was shown, hidden or read.`,
+      options: [...HIT_REGION_ACTIONS],
+    };
+  }
   if (action === 'show' || action === 'hide') {
     setHitRegionOverlayVisible(action === 'show');
     return { ok: true, visible: action === 'show', providers: hitRegionProviders() };

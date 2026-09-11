@@ -39,6 +39,7 @@ export {
   editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled,
   withEditorActor, openActorLease, closeActorLease, ACTOR_LEASE_TTL_MS, ACTOR_LEASE_GRACE_MS,
   waitForEditorJournal, type EditorEvent, type WaitForEditResult,
+  EDITOR_JOURNAL_SOURCES, isEditorJournalSource, type EditorJournalSource,
 } from './editorJournal';
 export {
   getEditorViewportCamera, setEditorViewportCamera, focusEntityInSceneView,

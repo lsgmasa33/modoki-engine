@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { useOverlayEscape } from '../input/useOverlayEscape';
+import { typeFilterBadgeLabel } from './badgeLabel';
 
 /** Shared chrome for the Assets-panel trees so the three top-level sections
  *  (Assets, Scripts, Engine) read as one consistent tree — an identical header
@@ -165,6 +166,9 @@ export function TypeFilterMenu({ types, selected, onToggle, onClear, label = 'Ty
     : null;
 
   const active = selected.size > 0;
+  // The order the dropdown actually LISTS types in — grouped when `groupBy` is set — so the badge's
+  // two names are the first two ticked rows the user sees, not the first two of the flat sort.
+  const listedTypes = groups ? groups.flatMap(([, entries]) => entries) : types;
   return (
     <div ref={ref} style={{ position: 'relative' }}>
       <button
@@ -185,7 +189,8 @@ export function TypeFilterMenu({ types, selected, onToggle, onClear, label = 'Ty
           ...(active ? { border: '1px solid #5a8ec5', color: '#fff' } : null),
         }}
       >
-        <span>{label}{active ? ` (${selected.size})` : ''}</span>
+        {/* NAMES the active types rather than counting them (#1021) — the #1003 rule, shared. */}
+        <span>{typeFilterBadgeLabel(label, listedTypes, selected)}</span>
         <span style={{ fontSize: 8, opacity: 0.7 }}>▾</span>
       </button>
       {open && anchor && createPortal((

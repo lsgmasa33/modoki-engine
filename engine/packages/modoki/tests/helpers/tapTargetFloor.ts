@@ -55,6 +55,7 @@ import { describe, expect, it } from 'vitest';
 import { UIElement } from '../../src/runtime/traits/UIElement';
 import { traitFieldOrDefault } from '../../src/runtime/core/ecs/traitSchema';
 import { DEVICE_PRESETS, SHIPPING_DEVICE_CATEGORIES } from '../../src/editor/scene/devicePresets';
+import { prefabInstances, prefabLookup, type InstanceMember } from './prefabInstances';
 
 /** Apple HIG asks 44 pt; Material asks 48 dp. **44 is the floor being enforced** (#1024 Q2,
  *  answered from evidence 2026-09-10) — the repo authors 48 and gates 44, so an author has room
@@ -102,6 +103,14 @@ export type Fields = Record<string, unknown>;
 
 export interface AuthoredEntity {
   localId?: number;
+  /** Set on a prefab-INSTANCE row: the child prefab's id. Such a row's own `traits` are NOT what
+   *  spawns — see `prefabInstances.ts` (#1060). */
+  prefab?: string;
+  /** A scene's prefab-instance row keeps its guid HERE, not under `EntityAttributes`. */
+  guid?: string;
+  overrides?: unknown;
+  nestedOverrides?: unknown;
+  removedTraits?: unknown;
   traits?: {
     EntityAttributes?: { name?: string; guid?: string; parentId?: string | number };
     UIElement?: Fields;
@@ -303,6 +312,9 @@ export interface Control {
   emits: boolean;
   /** Whether the element can carry the expander, once emitted. */
   hosts: boolean;
+  /** Set when this control is a member of a placed prefab INSTANCE that diverges from its prefab — see
+   *  `tapTargetCorpus`. Absent for a control authored directly in `file`. */
+  instance?: { ref: string; localId: number; path: readonly number[]; memberName: string };
 }
 
 /**
@@ -422,65 +434,81 @@ export interface TapTargetCorpus {
   byName(name: string): Control | undefined;
 }
 
+/** Everything carrying a binding of ANY event, every TouchControl, and every swallow surface.
+ *  Narrowing happens per-assertion via `isTarget` / `emits`, never at collection. */
+function isCollected(e: AuthoredEntity): boolean {
+  const ui = e.traits?.UIElement;
+  const hasAnyBinding = (e.traits?.UIAction?.bindings ?? []).length > 0;
+  const isTouch = e.traits?.TouchControl !== undefined;
+  return !!ui && (hasAnyBinding || isTouch || uiField<boolean>(ui, 'swallowClicks') === true);
+}
+
+/** A control from one trait bag and its nearest-first ancestor `UIElement`s — or `undefined` for a
+ *  bag the corpus does not collect. */
+function controlOf(
+  file: string, traits: Record<string, unknown>, name: string, ancestorUi: Array<Fields | undefined>,
+  instance?: Control['instance'],
+): Control | undefined {
+  const entity: AuthoredEntity = { traits: traits as AuthoredEntity['traits'] };
+  if (!isCollected(entity)) return undefined;
+  const ui = entity.traits!.UIElement!;
+  const hasToggle = entity.traits!.UIToggle !== undefined;
+  return {
+    name, file, ui, hasToggle, parentUi: ancestorUi[0], ancestorUi,
+    isTarget: isTapTarget(entity), emits: emitsExpander(entity), hosts: hostsExpander(ui, hasToggle),
+    ...(instance ? { instance } : {}),
+  };
+}
+
 /** Build the corpus without registering any assertion — for a project that needs its own cases.
- *  `docs` is injectable only so a synthetic entity can reach a branch the real corpus cannot. */
+ *  `docs` is injectable only so a synthetic entity can reach a branch the real corpus cannot; a
+ *  synthetic PREFAB passes its `id` (and `rootLocalId`) so an instance row can resolve it.
+ *
+ *  ⚠️ **A placed prefab instance is measured as ITSELF whenever the gate would CONCLUDE something
+ *  different about it than about its prefab's own copy (#1060).** An instance row carries only
+ *  `overrides` — no `traits.UIElement` — so reading authored entities alone measured every pooled cell
+ *  once, as its prefab's root, while the runtime sizes each instance as root PLUS its row's overrides.
+ *  Now every member of every instance is composed by the engine's own `effectivePrefabMemberTraits`
+ *  and measured TWICE: as placed (its composed traits, its composed parent chain, continuing into the
+ *  document that placed it) and as its prefab file measures it (its standalone traits, a chain that
+ *  stops at the prefab root). When the two `verdict`s differ it becomes a control, named by the
+ *  instance's runtime name (`Tile3`, or `Tile3/Badge`, qualified by every nested row below the root).
+ *
+ *  Comparing VERDICTS rather than fields is what makes this total, and each narrower cut was measured
+ *  wrong in #1060's close-out: a member-only field diff missed an unchanged icon under a resized
+ *  wrapper, an ancestor field diff re-listed children whose verdict could not have moved, a field
+ *  LIST needed a source scan that missed call spellings, and none of them saw an unchanged placement
+ *  under a small scene box. So the corpus is unchanged until a placement actually changes what the
+ *  gate concludes, a deliberately LARGER instance passes rather than being refused for differing, and
+ *  a cosmetic override (`opacity`) adds nothing. */
 export function tapTargetCorpus(
   opts: TapTargetFloorOptions,
-  docs?: Array<{ file: string; entities: AuthoredEntity[] }>,
+  docs?: Array<{ file: string; entities: AuthoredEntity[]; id?: string; rootLocalId?: number }>,
 ): TapTargetCorpus {
   const viewports = opts.viewports ?? SHIPPING_VIEWPORTS;
   const files = authoredFiles(opts.assetsDir);
-  const src = docs ?? files.map((file) => ({
-    file,
-    entities: (JSON.parse(readFileSync(file, 'utf8')) as { entities?: AuthoredEntity[] }).entities ?? [],
-  }));
+  const src = docs ?? files.map((file) => {
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as { id?: string; rootLocalId?: number; entities?: AuthoredEntity[] };
+    return { file, id: parsed.id, rootLocalId: parsed.rootLocalId, entities: parsed.entities ?? [] };
+  });
+  // ⚠️ Resolves only prefabs under THIS project's assets tree. A child that does not resolve yields no
+  // members (`prefabInstances`), i.e. the instance is not measured as itself — the same silence the
+  // root-only read had, and no worse; every shipping project's UI prefabs are local.
+  const getPrefab = prefabLookup(src);
 
-  const controls: Control[] = [];
-  for (const { file, entities } of src) {
-    // Parent index, per document. Scenes address by `guid`; prefabs by numeric `localId`.
-    const byKey = new Map<string | number, AuthoredEntity>();
-    for (const e of entities) {
-      const g = e.traits?.EntityAttributes?.guid;
-      if (g) byKey.set(g, e);
-      if (e.localId !== undefined) byKey.set(e.localId, e);
-    }
-    for (const e of entities) {
-      const ui = e.traits?.UIElement;
-      // Everything carrying a binding of ANY event, every TouchControl, and every swallow surface.
-      // Narrowing happens per-assertion via `isTarget` / `emits`, never here.
-      const hasAnyBinding = (e.traits?.UIAction?.bindings ?? []).length > 0;
-      const isTouch = e.traits?.TouchControl !== undefined;
-      if (!ui || !(hasAnyBinding || isTouch || uiField<boolean>(ui, 'swallowClicks') === true)) continue;
-      const pid = e.traits?.EntityAttributes?.parentId;
-      const hasToggle = e.traits?.UIToggle !== undefined;
-      // Nearest-first ancestor chain, depth-capped so a malformed `parentId` cycle cannot hang the
-      // suite (a scene file is authored data and nothing validates it before this reads it).
-      const ancestorUi: Array<Fields | undefined> = [];
-      let cursor = pid;
-      const seen = new Set<string | number>();
-      while (cursor !== undefined && cursor !== '' && !seen.has(cursor) && ancestorUi.length < 64) {
-        seen.add(cursor);
-        const parent = byKey.get(cursor);
-        if (!parent) break;
-        ancestorUi.push(parent.traits?.UIElement);
-        cursor = parent.traits?.EntityAttributes?.parentId;
-      }
-      controls.push({
-        name: e.traits?.EntityAttributes?.name ?? '(unnamed)',
-        file,
-        ui,
-        hasToggle,
-        parentUi: pid !== undefined && pid !== '' ? byKey.get(pid)?.traits?.UIElement : undefined,
-        ancestorUi,
-        isTarget: isTapTarget(e),
-        emits: emitsExpander(e),
-        hosts: hostsExpander(ui, hasToggle),
-      });
-    }
-  }
+  /** `designPx` is keyed by NAME, and an instance member is named `Tile3/Badge` — so it also answers
+   *  to the member's unqualified RUNTIME name (`instance.memberName`, its effective
+   *  `EntityAttributes.name`), which is the name production resolves a design-px control by
+   *  (`readChromeUI` → `findByName` on the spawned entity). ⚠️ Not the name the prefab AUTHORS it
+   *  under: a placement that renames a member moves it to a different design-px entry at runtime, and
+   *  keying on the authored name both missed a control renamed INTO the list and invented a rescale
+   *  for one renamed OUT of it (#1060 close-out review, round 4). */
+  const designPxScale = (c: Control, vp: Viewport) =>
+    opts.designPx && (opts.designPx.names.has(c.name) || (c.instance !== undefined && opts.designPx.names.has(c.instance.memberName)))
+      ? opts.designPx.ptPerDesignPx(vp) : null;
 
   const axis = (c: Control, key: 'width' | 'height', vp: Viewport) =>
-    resolveAxis(c.ui, key, c.parentUi, vp, opts.designPx?.names.has(c.name) ? opts.designPx.ptPerDesignPx(vp) : null);
+    resolveAxis(c.ui, key, c.parentUi, vp, designPxScale(c, vp));
 
   /** ⚠️ **The zone counts only where the renderer would deliver it.** An authored `minTapSize` on a
    *  control that takes no click (a `TouchControl`) or cannot host the expander (a `range`, a
@@ -496,6 +524,164 @@ export function tapTargetCorpus(
     return p(axis(c, 'width', vp)) || p(axis(c, 'height', vp));
   });
 
+  /** ⚠️ Excluded from the blind-spot list below, and it is a real exclusion rather than tidying:
+   *  a dismiss scrim is `100% x 100%`, so BOTH its axes are unresolvable `%` and it would head
+   *  every project's list while being the one control nobody could possibly miss. Court has ten
+   *  of them, wordweave four.
+   *
+   *  ⚠️ **The whole ANCESTOR CHAIN must be `100%` too, and checking only the element was a hole**
+   *  (#1024 close-out review). `100% x 100%` says "fill my parent" and nothing more — an icon
+   *  authored that way inside a `24 x 24 px` wrapper is a 24 pt target, and a geometry-only
+   *  exclusion dropped it from the blind-spot list while `resolvedUnderFloor` could not see it
+   *  either (there is no `pt` axis), so it appeared in NO list and the suite stayed green. Only a
+   *  chain that reaches a root — or an ancestor sized in something this cannot resolve — is
+   *  genuinely full-screen. Latent when found: all 28 live matches satisfy the chain check. */
+  const isFullScreenScrim = (c: Control) => {
+    const fills = (ui: Fields | undefined, vp: Viewport) => {
+      if (ui === undefined) return false;
+      const w = resolveAxis(ui, 'width', undefined, vp);
+      const h = resolveAxis(ui, 'height', undefined, vp);
+      return w.kind === 'parent' && w.pct >= 100 && h.kind === 'parent' && h.pct >= 100;
+    };
+    return viewports.every((vp) => {
+      const w = axis(c, 'width', vp);
+      const h = axis(c, 'height', vp);
+      if (!(w.kind === 'parent' && w.pct >= 100 && h.kind === 'parent' && h.pct >= 100)) return false;
+      // Every ancestor up to the root must fill its own parent as well.
+      return c.ancestorUi.every((ui) => fills(ui, vp));
+    });
+  };
+
+  /** Everything the suite's lists can conclude about one control, as one comparable string. A measured
+   *  axis is its EXACT pt — ⚠️ never rounded: both copies run the same arithmetic, so equal inputs are
+   *  already equal floats, and rounding let a 43.9996 pt instance of a 44 pt prefab read as unchanged
+   *  (#1060 close-out review). Every unresolvable kind reads the SAME — a `content` axis turning
+   *  `stretched` under a new parent is "measure it live" either way, and treating it as a change would
+   *  re-list the control for nothing. */
+  const verdict = (c: Control): string => JSON.stringify([
+    c.isTarget, c.emits, c.hosts, isFullScreenScrim(c),
+    viewports.map((vp) => [
+      ...(['width', 'height'] as const).map((k) => {
+        const a = axis(c, k, vp);
+        return a.kind === 'pt' ? a.pt : '?';
+      }),
+      effectiveTapZonePt(c, vp) >= FLOOR_PT,
+      authoredTapZonePt(c.ui, vp) > 0,
+    ]),
+  ]);
+
+  const controls: Control[] = [];
+  for (const { file, entities } of src) {
+    // Parent index, per document. Scenes address by `guid`; prefabs by numeric `localId`.
+    const byKey = new Map<string | number, AuthoredEntity>();
+    for (const e of entities) {
+      // A scene's prefab-instance row keeps its guid at the TOP level; a child addressing that row by
+      // guid otherwise finds no parent at all.
+      const g = e.traits?.EntityAttributes?.guid || e.guid;
+      if (g) byKey.set(g, e);
+      if (e.localId !== undefined) byKey.set(e.localId, e);
+    }
+    const instances = prefabInstances({ entities }, getPrefab);
+    // ⚠️ An instance ROW carries no `traits.UIElement` — the entity it spawns is its prefab's root plus
+    // the row's overrides — so an ancestor that is a placed instance is read AS COMPOSED. Read raw it was
+    // `undefined`, which fails `isFullScreenScrim`'s fill check: a real scrim under a placed
+    // full-screen panel landed in the blind-spot list (#1060 close-out review).
+    const composedRootUi = new Map<AuthoredEntity, Fields | undefined>(
+      instances.map((i) => [i.row as AuthoredEntity, i.root.effective?.UIElement as Fields | undefined]));
+    const uiOfRow = (e: AuthoredEntity | undefined): Fields | undefined =>
+      (e !== undefined && composedRootUi.has(e) ? composedRootUi.get(e) : e?.traits?.UIElement);
+    // Nearest-first ancestor chain from `pid`, depth-capped so a malformed `parentId` cycle cannot hang
+    // the suite (a scene file is authored data and nothing validates it before this reads it).
+    const chainFrom = (pid: string | number | undefined, budget = 64): Array<Fields | undefined> => {
+      const ancestorUi: Array<Fields | undefined> = [];
+      let cursor = pid;
+      const seen = new Set<string | number>();
+      while (cursor !== undefined && cursor !== '' && !seen.has(cursor) && ancestorUi.length < budget) {
+        seen.add(cursor);
+        const parent = byKey.get(cursor);
+        if (!parent) break;
+        ancestorUi.push(uiOfRow(parent));
+        cursor = parent.traits?.EntityAttributes?.parentId;
+      }
+      return ancestorUi;
+    };
+
+    for (const e of entities) {
+      if (!isCollected(e)) continue;
+      const ui = e.traits!.UIElement!;
+      const pid = e.traits?.EntityAttributes?.parentId;
+      const hasToggle = e.traits?.UIToggle !== undefined;
+      controls.push({
+        name: e.traits?.EntityAttributes?.name ?? '(unnamed)',
+        file,
+        ui,
+        hasToggle,
+        parentUi: pid !== undefined && pid !== '' ? uiOfRow(byKey.get(pid)) : undefined,
+        ancestorUi: chainFrom(pid),
+        isTarget: isTapTarget(e),
+        emits: emitsExpander(e),
+        hosts: hostsExpander(ui, hasToggle),
+      });
+    }
+
+    // Where the spawner hangs a TOP-LEVEL member authored with no parent (or a dangling one) depends on
+    // who placed the instance: `SceneManager` passes the placing row's parent, so under a SCENE it goes
+    // there; a nested placement passes 0 (`loadSceneFile.ts`), so under a PREFAB it is a world root.
+    const placedByScene = file.endsWith('.scene.json');
+
+    for (const inst of instances) {
+      const keyOf = (path: readonly number[], lid: number) => `${path.join('.')}:${lid}`;
+      const byMember = new Map(inst.members.map((m) => [keyOf(m.path, m.localId), m]));
+      const parentOf = (m: InstanceMember) => (m.parent ? byMember.get(keyOf(m.parent.path, m.parent.localId)) : undefined);
+      // In-instance ancestors, nearest first — depth-capped and cycle-safe, since a prefab's
+      // `parentId`s are authored data too.
+      const innerChain = (m: InstanceMember): InstanceMember[] => {
+        const chain: InstanceMember[] = [];
+        for (let cur = parentOf(m); cur && chain.length < 64 && !chain.includes(cur); cur = parentOf(cur)) chain.push(cur);
+        return chain;
+      };
+      const nameIn = (traits: Record<string, unknown> | null | undefined): string | undefined => {
+        const n = (traits?.EntityAttributes as { name?: unknown } | undefined)?.name;
+        return typeof n === 'string' && n ? n : undefined;
+      };
+      // `Tile3`, `Tile3/Badge`, and for a member of a nested instance every row it sits under, so two
+      // nested instances of one prefab cannot collapse into one name in a set-equality list — and
+      // `byName('Badge')` still means the prefab file's own copy.
+      const qualifiedName = (m: InstanceMember): string => {
+        if (m === inst.root) return inst.name;
+        const segs = [inst.name];
+        m.path.forEach((seg, i) => segs.push(nameIn(byMember.get(keyOf(m.path.slice(0, i), seg))?.effective) ?? `#${seg}`));
+        segs.push(nameIn(m.effective) ?? `#${m.localId}`);
+        return segs.join('/');
+      };
+      const rowPid = (inst.row as AuthoredEntity).traits?.EntityAttributes?.parentId;
+
+      for (const m of inst.members) {
+        if (!m.effective) continue;
+        const inner = innerChain(m);
+        const top = inner.length > 0 ? inner[inner.length - 1] : m;
+        const continuesOutward = top === inst.root || (placedByScene && top.path.length === 0);
+        const placed = controlOf(
+          file, m.effective, qualifiedName(m),
+          [...inner.map((x) => x.effective?.UIElement as Fields | undefined),
+            ...(continuesOutward ? chainFrom(rowPid, 64 - inner.length) : [])],
+          { ref: inst.ref, localId: m.localId, path: m.path, memberName: nameIn(m.effective) ?? '' },
+        );
+        if (!placed) continue;
+        // The copy ONE LEVEL IN, measured as the document that authors it measures it: standalone traits
+        // and a chain that stops at the placed prefab's root. For a top-level member that is the prefab
+        // file's own copy; for a nested member it is the placing prefab's copy of its instance, which
+        // that prefab's own pass compares one level further in. Same verdict → covered there, by
+        // induction; add nothing.
+        const asFiled = m.standalone
+          ? controlOf(file, m.standalone, nameIn(m.standalone) ?? '', inner.map((x) => x.standalone?.UIElement as Fields | undefined))
+          : undefined;
+        if (asFiled && verdict(asFiled) === verdict(placed)) continue;
+        controls.push(placed);
+      }
+    }
+  }
+
   return {
     files,
     controls,
@@ -504,33 +690,7 @@ export function tapTargetCorpus(
     effectiveTapZonePt,
     resolvedUnderFloor: (c) => onSomeScreen(c, (a) => a.kind === 'pt' && a.pt < FLOOR_PT),
     hasUnresolvableAxis: (c) => onSomeScreen(c, (a) => a.kind !== 'pt'),
-    /** ⚠️ Excluded from the blind-spot list below, and it is a real exclusion rather than tidying:
-     *  a dismiss scrim is `100% x 100%`, so BOTH its axes are unresolvable `%` and it would head
-     *  every project's list while being the one control nobody could possibly miss. Court has ten
-     *  of them, wordweave four.
-     *
-     *  ⚠️ **The whole ANCESTOR CHAIN must be `100%` too, and checking only the element was a hole**
-     *  (#1024 close-out review). `100% x 100%` says "fill my parent" and nothing more — an icon
-     *  authored that way inside a `24 x 24 px` wrapper is a 24 pt target, and a geometry-only
-     *  exclusion dropped it from the blind-spot list while `resolvedUnderFloor` could not see it
-     *  either (there is no `pt` axis), so it appeared in NO list and the suite stayed green. Only a
-     *  chain that reaches a root — or an ancestor sized in something this cannot resolve — is
-     *  genuinely full-screen. Latent when found: all 28 live matches satisfy the chain check. */
-    isFullScreenScrim: (c) => {
-      const fills = (ui: Fields | undefined, vp: Viewport) => {
-        if (ui === undefined) return false;
-        const w = resolveAxis(ui, 'width', undefined, vp);
-        const h = resolveAxis(ui, 'height', undefined, vp);
-        return w.kind === 'parent' && w.pct >= 100 && h.kind === 'parent' && h.pct >= 100;
-      };
-      return viewports.every((vp) => {
-        const w = axis(c, 'width', vp);
-        const h = axis(c, 'height', vp);
-        if (!(w.kind === 'parent' && w.pct >= 100 && h.kind === 'parent' && h.pct >= 100)) return false;
-        // Every ancestor up to the root must fill its own parent as well.
-        return c.ancestorUi.every((ui) => fills(ui, vp));
-      });
-    },
+    isFullScreenScrim,
     byName: (name) => controls.find((c) => c.name === name),
   };
 }

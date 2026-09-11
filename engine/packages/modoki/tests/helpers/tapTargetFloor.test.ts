@@ -325,3 +325,316 @@ describe('building a corpus', () => {
     expect(c).toEqual(['Click', 'Change', 'Pad', 'Shield']);
   });
 });
+
+describe('a placed prefab instance is measured as ITSELF once it diverges (#1060)', () => {
+  // ⚠️ The blind spot: an instance row carries only `overrides` — no `traits.UIElement` — so the
+  // corpus skipped it and measured the cell once, as its prefab's root, while the runtime sizes each
+  // instance as root PLUS its row's overrides. The real corpora hold 0 diverging rows (86 rows with
+  // overrides, none touching UIElement, 2026-09-11), which is why only synthetic documents can
+  // falsify this.
+  const PX = (w: number, h: number) => ({ width: w, widthUnit: 'px', height: h, heightUnit: 'px' });
+  const TILE = {
+    file: 'tile.prefab.json', id: 'tile', rootLocalId: 1,
+    entities: [
+      { localId: 1, traits: { EntityAttributes: { name: 'LevelTile', parentId: 0 }, UIElement: PX(48, 48), UIAction: CLICK } },
+      { localId: 2, traits: { EntityAttributes: { name: 'Badge', parentId: 1 }, UIElement: PX(48, 48), UIAction: CLICK } },
+    ] as AuthoredEntity[],
+  };
+  const page = (...rows: AuthoredEntity[]) => ({
+    file: 'page.prefab.json', id: 'page', rootLocalId: 1,
+    entities: [{ localId: 1, traits: { EntityAttributes: { name: 'Grid', parentId: 0 }, UIElement: {} } }, ...rows],
+  });
+  const place = (localId: number, overrides: Record<number, Record<string, unknown>>): AuthoredEntity =>
+    ({ localId, prefab: 'tile', traits: { EntityAttributes: { parentId: 1 } }, overrides });
+
+  it('measures a shrunk instance, adds nothing for an identical one, and passes an enlarged one', () => {
+    const c = tapTargetCorpus(SYNTHETIC, [TILE, page(
+      place(2, { 1: { EntityAttributes: { name: 'Small' }, UIElement: { width: 20 } } }),
+      place(3, { 1: { EntityAttributes: { name: 'Same' } } }),
+      place(4, { 1: { EntityAttributes: { name: 'Big' }, UIElement: { width: 96 } } }),
+    )]);
+    // NOT `Small/Badge`: its parent was resized, but a 48 px Badge measures 48 pt under any parent, so
+    // nothing the gate concludes about it moved — re-listing it would be churn in every project list.
+    expect(c.controls.map((x) => x.name)).toEqual(['LevelTile', 'Badge', 'Small', 'Big']);
+    expect(c.resolvedUnderFloor(c.byName('Small')!), 'the 20 pt instance is SEEN').toBe(true);
+    expect(c.resolvedUnderFloor(c.byName('Big')!), 'a larger instance is not refused for differing').toBe(false);
+    expect(c.resolvedUnderFloor(c.byName('LevelTile')!)).toBe(false);
+    expect(c.byName('Small')!.instance).toEqual({ ref: 'tile', localId: 1, path: [], memberName: 'Small' });
+    expect(c.byName('LevelTile')!.instance, 'a directly authored control is not an instance').toBeUndefined();
+  });
+
+  it('reaches a member the row overrides, parented by the INSTANCE\'s root, not the prefab\'s', () => {
+    // The instance root is overridden into a stretching column, so the member's unauthored width
+    // resolves `stretched` ONLY if its parent is read as composed; the prefab's own root would say
+    // `content`.
+    const c = tapTargetCorpus(SYNTHETIC, [TILE, page(place(2, {
+      1: { EntityAttributes: { name: 'Tile0' }, UIElement: { flexDirection: 'column', alignItems: 'stretch' } },
+      2: { UIElement: { width: 0, height: 20 } },
+    }))]);
+    const badge = c.controls.find((x) => x.instance?.localId === 2)!;
+    expect(badge, 'the overridden member is a control of its own').toBeDefined();
+    expect(badge.name, 'qualified by its instance, so it cannot collide with the prefab\'s own Badge').toBe('Tile0/Badge');
+    expect(c.byName('Badge')!.instance, '`byName` still means the prefab file\'s copy').toBeUndefined();
+    expect(c.axis(badge, 'width', VP)).toEqual({ kind: 'stretched' });
+    expect(c.resolvedUnderFloor(badge), 'its 20 px height is measured').toBe(true);
+    expect(badge.ancestorUi.length, 'instance root, then the page Grid it sits in').toBe(2);
+  });
+
+  it('continues the parent chain into the SCENE that placed it — addressed by guid', () => {
+    const scene = { file: 'main.scene.json', entities: [
+      { traits: { EntityAttributes: { name: 'Holder', guid: 'g-h' }, UIElement: { flexDirection: 'column', alignItems: 'stretch' } } },
+      { prefab: 'tile', traits: { EntityAttributes: { parentId: 'g-h' }, PrefabInstance: { source: 'tile', localId: 1 } },
+        overrides: { 1: { EntityAttributes: { name: 'Placed' }, UIElement: { width: 0, height: 20 } } } },
+    ] as AuthoredEntity[] };
+    const c = tapTargetCorpus(SYNTHETIC, [TILE, scene]);
+    const placed = c.byName('Placed')!;
+    expect(c.axis(placed, 'width', VP), 'the scene Holder is its parent').toEqual({ kind: 'stretched' });
+    expect(placed.ancestorUi.length).toBe(1);
+  });
+
+  // A wrapper that sizes the hit area, and an icon that fills it — the shape `isFullScreenScrim`'s
+  // ancestor check exists for (a `100% x 100%` icon inside a 24 px wrapper is a 24 pt target).
+  const FILL = { width: 100, height: 100 };
+  const WRAPPED = {
+    file: 'wrapped.prefab.json', id: 'wrapped', rootLocalId: 1,
+    entities: [
+      { localId: 1, traits: { EntityAttributes: { name: 'Wrap', parentId: 0 }, UIElement: FILL } },
+      { localId: 2, traits: { EntityAttributes: { name: 'Icon', parentId: 1 }, UIElement: FILL } },
+    ] as AuthoredEntity[],
+  };
+
+  it('walks a NESTED instance member\'s chain through the row that placed its prefab (#1060 review)', () => {
+    // `holder` places `wrapped` at row 2; the scene places `holder` and binds the deep Icon through
+    // nestedOverrides, while resizing that nested Wrap to 24 px. The nested root is listed one level
+    // up, so the Icon's parent must be addressed THERE — addressed at its own depth it resolved to
+    // nothing, the chain came back EMPTY, and an empty chain made the 24 pt Icon a full-screen scrim
+    // that appeared in no list at all.
+    const holder = {
+      file: 'holder.prefab.json', id: 'holder', rootLocalId: 1,
+      entities: [
+        { localId: 1, traits: { EntityAttributes: { name: 'Holder', parentId: 0 }, UIElement: FILL } },
+        { localId: 2, prefab: 'wrapped', traits: { EntityAttributes: { parentId: 1 } } },
+      ] as AuthoredEntity[],
+    };
+    const scene = { file: 'main.scene.json', entities: [
+      { traits: { EntityAttributes: { name: 'Root', guid: 'g-root' }, UIElement: FILL } },
+      { prefab: 'holder', traits: { EntityAttributes: { parentId: 'g-root' } },
+        overrides: { 2: { UIElement: { width: 24, widthUnit: 'px', height: 24, heightUnit: 'px' } } },
+        nestedOverrides: { 2: { 2: { UIAction: CLICK } } } },
+    ] as AuthoredEntity[] };
+    const c = tapTargetCorpus(SYNTHETIC, [WRAPPED, holder, scene]);
+    const icon = c.controls.find((x) => x.instance?.path.join('.') === '2' && x.instance.localId === 2)!;
+    expect(icon, 'the bound deep Icon is a control').toBeDefined();
+    expect(icon.name, 'qualified by the nested row it sits under').toBe('Holder/Wrap/Icon');
+    expect(icon.ancestorUi.length, 'Wrap, Holder, then the scene Root').toBe(3);
+    expect(c.isFullScreenScrim(icon), 'a 100% icon in a 24 px wrapper is NOT a scrim').toBe(false);
+    expect(c.hasUnresolvableAxis(icon), 'so it stays in the blind-spot register').toBe(true);
+  });
+
+  it('measures an UNCHANGED member whose ancestor the placement resized (#1060 review)', () => {
+    // Only the Wrap is overridden; the bound Icon is byte-identical to the prefab file's. The file's
+    // Icon is legitimately a scrim (every ancestor fills) — this instance's is a 24 pt target, and
+    // comparing the member alone would have added nothing, leaving it in NO list.
+    const wrapped = { ...WRAPPED, entities: WRAPPED.entities.map((e) => (e.localId === 2
+      ? { ...e, traits: { ...e.traits, UIAction: CLICK } } : e)) };
+    const scene = { file: 'main.scene.json', entities: [
+      { traits: { EntityAttributes: { name: 'Root', guid: 'g-root' }, UIElement: FILL } },
+      { prefab: 'wrapped', traits: { EntityAttributes: { parentId: 'g-root' } },
+        overrides: { 1: { EntityAttributes: { name: 'Card' }, UIElement: { width: 24, widthUnit: 'px', height: 24, heightUnit: 'px' } } } },
+    ] as AuthoredEntity[] };
+    const c = tapTargetCorpus(SYNTHETIC, [wrapped, scene]);
+    expect(c.isFullScreenScrim(c.byName('Icon')!), 'fixture: the prefab file\'s own Icon is a scrim').toBe(true);
+    const icon = c.byName('Card/Icon')!;
+    expect(icon, 'the unchanged Icon under a resized Wrap is measured').toBeDefined();
+    expect(c.isFullScreenScrim(icon)).toBe(false);
+    expect(c.hasUnresolvableAxis(icon)).toBe(true);
+  });
+
+  it('ignores an override the resolver cannot see — a cosmetic field, or a default spelled out', () => {
+    // The accept side of comparing only read fields. A whole-bag comparison turned an `opacity`
+    // override into a new control, which lands in a project's set-equality lists and reds its suite.
+    const c = tapTargetCorpus(SYNTHETIC, [TILE, page(
+      place(2, { 1: { EntityAttributes: { name: 'Faded' }, UIElement: { opacity: 0.5, backgroundColor: 0xff0000 } } }),
+      // `overflow: 'visible'` IS the trait default (`UIElement.ts`), so spelling it out changes nothing.
+      place(3, { 1: { EntityAttributes: { name: 'Spelled' }, UIElement: { overflow: 'visible' } } }),
+    )]);
+    expect(c.controls.map((x) => x.name)).toEqual(['LevelTile', 'Badge']);
+  });
+
+  it('does not re-list a member whose unresolvable axis merely changes KIND under a new parent', () => {
+    // `content` → `stretched` is "measure it live" either way; counting the change would add a name to
+    // a project's blind-spot list for nothing. So `verdict` reads every unresolvable kind alike.
+    // `alignItems` defaults to `stretch`, so the file's tile root authors `center` to make its Badge
+    // `content`-sized there; the placement puts `stretch` back.
+    const autoTile = { ...TILE, entities: TILE.entities.map((e) => (e.localId === 1
+      ? { ...e, traits: { ...e.traits, UIElement: { ...PX(48, 48), alignItems: 'center' } } }
+      : e.localId === 2
+        ? { ...e, traits: { ...e.traits, UIElement: { width: 0, height: 48, heightUnit: 'px' } } } : e)) };
+    const c = tapTargetCorpus(SYNTHETIC, [autoTile, page(place(2, {
+      1: { EntityAttributes: { name: 'Col' }, UIElement: { alignItems: 'stretch' } },
+    }))]);
+    expect(c.axis(c.byName('Badge')!, 'width', VP), 'fixture: the file\'s copy is content-sized').toEqual({ kind: 'content' });
+    expect(c.controls.map((x) => x.name)).not.toContain('Col/Badge');
+    // Positive anchor, so the absence above cannot come from a placement that never resolved: the same
+    // placement with a REAL change is listed, and its width does compose to `stretched`.
+    const moved = tapTargetCorpus(SYNTHETIC, [autoTile, page(place(2, {
+      1: { EntityAttributes: { name: 'Col' }, UIElement: { alignItems: 'stretch' } },
+      2: { UIElement: { height: 20 } },
+    }))]);
+    expect(moved.axis(moved.byName('Col/Badge')!, 'width', VP)).toEqual({ kind: 'stretched' });
+  });
+
+  it('does not re-list a child whose verdict cannot have moved — a tap zone added to its parent', () => {
+    // The parent's own verdict changes (it gains a zone), so the parent IS measured as itself; the
+    // 48 px Badge under it concludes exactly what the prefab file's Badge does.
+    const c = tapTargetCorpus(SYNTHETIC, [TILE, page(
+      place(2, { 1: { EntityAttributes: { name: 'Zoned' }, UIElement: { minTapSize: 60, minTapSizeUnit: 'px' } } }),
+    )]);
+    expect(c.controls.map((x) => x.name)).toContain('Zoned');
+    expect(c.controls.map((x) => x.name)).not.toContain('Zoned/Badge');
+  });
+
+  // `Hit` fills its parent; `Loose` fills its parent too but is authored with NO parent inside the prefab.
+  const HIT = {
+    file: 'hit.prefab.json', id: 'hit', rootLocalId: 1,
+    entities: [
+      { localId: 1, traits: { EntityAttributes: { name: 'Hit', parentId: 0 }, UIElement: FILL, UIAction: CLICK } },
+      { localId: 2, traits: { EntityAttributes: { name: 'Loose', parentId: 0 }, UIElement: FILL, UIAction: CLICK } },
+    ] as AuthoredEntity[],
+  };
+  const PX24 = { width: 24, widthUnit: 'px', height: 24, heightUnit: 'px' };
+
+  it('measures an UNCHANGED placement when the placing document changes its verdict (#1060 re-review)', () => {
+    // Nothing is overridden but the name. The prefab file's `Hit` has no ancestors, so it is a scrim;
+    // placed under a 24 px scene box it is a 24 pt target — skipped as "identical", it was in no list.
+    const scene = { file: 'main.scene.json', entities: [
+      { traits: { EntityAttributes: { name: 'Box', guid: 'g-box' }, UIElement: PX24 } },
+      { prefab: 'hit', traits: { EntityAttributes: { parentId: 'g-box' } }, overrides: { 1: { EntityAttributes: { name: 'P' } } } },
+    ] as AuthoredEntity[] };
+    const c = tapTargetCorpus(SYNTHETIC, [HIT, scene]);
+    expect(c.isFullScreenScrim(c.byName('Hit')!), 'fixture: the file\'s copy is a scrim').toBe(true);
+    const placed = c.byName('P')!;
+    expect(placed, 'the unchanged placement is measured').toBeDefined();
+    expect(c.isFullScreenScrim(placed)).toBe(false);
+    // A member with NO parent goes where the spawner puts it: under the row's parent, when a SCENE placed it.
+    const loose = c.byName('P/Loose')!;
+    expect(loose, 'the parentless member is measured under the scene Box').toBeDefined();
+    expect(loose.ancestorUi.length).toBe(1);
+    expect(c.isFullScreenScrim(loose)).toBe(false);
+  });
+
+  it('leaves a parentless member at the world root when a PREFAB placed it — a nested placement passes 0', () => {
+    const outer = {
+      file: 'outer.prefab.json', id: 'outer', rootLocalId: 1,
+      entities: [
+        { localId: 1, traits: { EntityAttributes: { name: 'Outer', parentId: 0 }, UIElement: PX24 } },
+        { localId: 2, prefab: 'hit', traits: { EntityAttributes: { parentId: 1 } }, overrides: { 1: { EntityAttributes: { name: 'Nested' } } } },
+      ] as AuthoredEntity[],
+    };
+    const c = tapTargetCorpus(SYNTHETIC, [HIT, outer]);
+    expect(c.byName('Nested'), 'the placed root IS under the 24 px Outer').toBeDefined();
+    expect(c.byName('Nested/Loose'), 'the parentless member is not, so it concludes what the file\'s copy does').toBeUndefined();
+  });
+
+  it('qualifies a nested member by every row it sits under, so two nested instances stay two names', () => {
+    const pair = {
+      file: 'pair.prefab.json', id: 'pair', rootLocalId: 1,
+      entities: [
+        { localId: 1, traits: { EntityAttributes: { name: 'Pair', parentId: 0 }, UIElement: {} } },
+        { localId: 2, prefab: 'tile', traits: { EntityAttributes: { parentId: 1 } }, overrides: { 1: { EntityAttributes: { name: 'Left' } } } },
+        { localId: 3, prefab: 'tile', traits: { EntityAttributes: { parentId: 1 } }, overrides: { 1: { EntityAttributes: { name: 'Right' } } } },
+      ] as AuthoredEntity[],
+    };
+    const scene = { file: 'main.scene.json', entities: [
+      { prefab: 'pair', traits: { EntityAttributes: {} },
+        nestedOverrides: { 2: { 2: { UIElement: { height: 20 } } }, 3: { 2: { UIElement: { height: 20 } } } } },
+    ] as AuthoredEntity[] };
+    const c = tapTargetCorpus(SYNTHETIC, [TILE, pair, scene]);
+    expect(c.controls.filter((x) => x.instance?.path.length === 1).map((x) => x.name).sort())
+      .toEqual(['Pair/Left/Badge', 'Pair/Right/Badge']);
+  });
+
+  it('applies designPx to an instance member listed by its UNQUALIFIED name, though the control is `T/Badge`', () => {
+    const c = tapTargetCorpus(
+      { ...SYNTHETIC, designPx: { names: new Set(['Badge']), ptPerDesignPx: () => 0.5 } },
+      [TILE, page(place(2, { 1: { EntityAttributes: { name: 'T' } }, 2: { UIElement: { height: 100 } } }))],
+    );
+    const badge = c.controls.find((x) => x.instance?.localId === 2)!;
+    expect(badge.name).toBe('T/Badge');
+    expect(c.axis(badge, 'height', VP), 'rescaled though the control is named T/Badge').toEqual({ kind: 'pt', pt: 50 });
+  });
+
+  it('matches designPx by the RUNTIME name a member spawns under — the name production looks it up by', () => {
+    // Production resolves a design-px control with `findByName` on the spawned entity, so a placement
+    // that RENAMES a member moves it between entries: `Renamed` is rescaled, the authored `GapButton`
+    // name no longer reaches it.
+    const gap = {
+      file: 'gap.prefab.json', id: 'gap', rootLocalId: 1,
+      entities: [
+        { localId: 1, traits: { EntityAttributes: { name: 'GapTile', parentId: 0 }, UIElement: PX(200, 200) } },
+        { localId: 2, traits: { EntityAttributes: { name: 'GapButton', parentId: 1 }, UIElement: PX(100, 100), UIAction: CLICK } },
+      ] as AuthoredEntity[],
+    };
+    const outer = {
+      file: 'outer.prefab.json', id: 'outer', rootLocalId: 1,
+      entities: [
+        { localId: 1, traits: { EntityAttributes: { name: 'Outer', parentId: 0 }, UIElement: {} } },
+        { localId: 2, prefab: 'gap', traits: { EntityAttributes: { parentId: 1 } },
+          overrides: { 1: { EntityAttributes: { name: 'Tile' } }, 2: { EntityAttributes: { name: 'Renamed' } } } },
+      ] as AuthoredEntity[],
+    };
+    const scene = (extra: object) => ({ file: 'main.scene.json', entities: [
+      { prefab: 'outer', traits: { EntityAttributes: {} }, ...extra },
+    ] as AuthoredEntity[] });
+    const resized = scene({ nestedOverrides: { 2: { 2: { UIElement: { width: 70 } } } } });
+    const px = (name: string) => ({ ...SYNTHETIC, designPx: { names: new Set([name]), ptPerDesignPx: () => 0.5 } });
+
+    const byRuntime = tapTargetCorpus(px('Renamed'), [gap, outer, resized]);
+    const btn = byRuntime.byName('Outer/Tile/Renamed')!;
+    expect(btn, 'the resized nested button is measured').toBeDefined();
+    expect(btn.instance!.memberName).toBe('Renamed');
+    expect(byRuntime.axis(btn, 'width', VP), '70 design px is 35 pt').toEqual({ kind: 'pt', pt: 35 });
+    expect(byRuntime.resolvedUnderFloor(btn)).toBe(true);
+
+    const byAuthored = tapTargetCorpus(px('GapButton'), [gap, outer, resized]);
+    expect(byAuthored.axis(byAuthored.byName('Outer/Tile/Renamed')!, 'width', VP), 'renamed away: not rescaled')
+      .toEqual({ kind: 'pt', pt: 70 });
+
+    // An UNCHANGED placement is not re-listed: both copies answer to `Renamed`, so both rescale alike.
+    expect(tapTargetCorpus(px('Renamed'), [gap, outer, scene({})]).byName('Outer/Tile/Renamed')).toBeUndefined();
+  });
+
+  it('compares measured sizes EXACTLY — 43.9996 pt is not the 44 pt prefab it came from', () => {
+    const edge = { ...TILE, entities: [
+      { localId: 1, traits: { EntityAttributes: { name: 'Edge', parentId: 0 }, UIElement: PX(44, 44), UIAction: CLICK } },
+    ] as AuthoredEntity[] };
+    const c = tapTargetCorpus(SYNTHETIC, [edge, page(place(2, { 1: { EntityAttributes: { name: 'Shaved' }, UIElement: { width: 43.9996 } } }))]);
+    expect(c.resolvedUnderFloor(c.byName('Edge')!), 'fixture: the prefab clears the floor exactly').toBe(false);
+    expect(c.byName('Shaved'), 'a rounded comparison called this unchanged').toBeDefined();
+    expect(c.resolvedUnderFloor(c.byName('Shaved')!)).toBe(true);
+  });
+
+  it('reads an ancestor that is itself a placed instance AS COMPOSED — a real scrim stays a scrim', () => {
+    // A full-screen panel placed as a prefab, and two full-screen scrims under it: one placed, one
+    // authored. Read raw, the panel row has no `UIElement`, so neither chain fills and both scrims
+    // land in the blind-spot list.
+    const panel = { file: 'panel.prefab.json', id: 'panel', rootLocalId: 1, entities: [
+      { localId: 1, traits: { EntityAttributes: { name: 'Panel', parentId: 0 }, UIElement: FILL } },
+    ] as AuthoredEntity[] };
+    const scrim = { file: 'scrim.prefab.json', id: 'scrim', rootLocalId: 1, entities: [
+      { localId: 1, traits: { EntityAttributes: { name: 'Scrim', parentId: 0 }, UIElement: FILL, UIAction: CLICK } },
+    ] as AuthoredEntity[] };
+    const scene = { file: 'main.scene.json', entities: [
+      { traits: { EntityAttributes: { name: 'Root', guid: 'g-root' }, UIElement: FILL } },
+      // The shape the editor's scene save writes: the instance row's guid at the TOP level.
+      { prefab: 'panel', guid: 'g-p', traits: { EntityAttributes: { parentId: 'g-root' } } },
+      { prefab: 'scrim', traits: { EntityAttributes: { parentId: 'g-p' } }, overrides: { 1: { EntityAttributes: { name: 'S2' } } } },
+      { traits: { EntityAttributes: { name: 'Direct', parentId: 'g-p' }, UIElement: FILL, UIAction: CLICK } },
+    ] as AuthoredEntity[] };
+    const c = tapTargetCorpus(SYNTHETIC, [panel, scrim, scene]);
+    const direct = c.byName('Direct')!;
+    expect(direct.ancestorUi.length, 'the placed panel IS found as the parent, by its top-level guid').toBe(2);
+    expect(c.isFullScreenScrim(direct), 'an authored scrim under the placed panel is a scrim').toBe(true);
+    expect(c.byName('S2'), 'the placed scrim concludes what the file\'s copy does, so adds nothing').toBeUndefined();
+  });
+});

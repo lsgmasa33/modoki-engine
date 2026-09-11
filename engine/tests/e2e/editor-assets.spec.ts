@@ -116,9 +116,16 @@ test('a stale type filter is surfaced by a clearable footer banner', async ({ pa
   const banner = page.locator('[data-ui-id="assets.toolbar.typeFilterBanner"]');
   await expect(banner).toBeVisible();
   await expect(page.getByText(/^\d+ of \d+ assets$/)).toBeVisible();
+  // The trigger NAMES the persisted type rather than counting it (#1021). `badgeLabel.test.tsx`
+  // owns the rule; this proves the live trigger renders it for a filter no click in this session set.
+  const trigger = page.locator('[data-ui-id="assets.toolbar.typeFilter"]');
+  await expect(trigger).toHaveText(/^Type: Texture\b/);
   await banner.click();
   await expect(banner).not.toBeVisible();
   await expect(page.getByText(/^\d+ assets$/)).toBeVisible();
+  // The negative lookahead proves no type is named — a bare `not.toHaveText(/Texture/)` would also
+  // pass if the trigger stopped rendering at all.
+  await expect(trigger).toHaveText(/^Type(?!:)/);
 });
 
 test('Import writes picked files into the project as base64', async ({ page }) => {

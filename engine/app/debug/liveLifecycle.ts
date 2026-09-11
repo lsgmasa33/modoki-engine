@@ -24,8 +24,7 @@ import {
   getCurrentWorld,
   newGuid,
   buildEntityCreateSpecs,
-  PRIMITIVE_NAMES,
-  PRIMITIVE_SPRITE_NAMES,
+  resolveCreateEntitySpec,
   type CreateEntitySpec,
 } from '@modoki/engine/runtime';
 
@@ -90,17 +89,13 @@ export function createEntityLive(params: unknown): unknown {
   const p = (params ?? {}) as { spec?: CreateEntitySpec; parentGuid?: string; parentId?: number };
   if (!p.spec) return { ok: false, error: 'create-entity requires { spec } — nothing was created.' };
 
-  // Same vocabulary check the editor op makes: `{kind:'primitive', mesh:'pyramid'}` used to return a
-  // clean success and produce an entity whose renderer resolves to nothing — invisible, no error.
-  const spec = p.spec as { kind?: string; mesh?: string; shape?: string };
-  if (spec.kind === 'primitive' && !spec.mesh) spec.mesh = 'sphere';
-  if (spec.kind === '2d' && !spec.shape) spec.shape = 'square';
-  if (spec.kind === 'primitive' && spec.mesh && !PRIMITIVE_NAMES.includes(spec.mesh)) {
-    return { ok: false, error: `unknown primitive mesh "${spec.mesh}" — nothing was created.`, options: [...PRIMITIVE_NAMES] };
-  }
-  if (spec.kind === '2d' && spec.shape && !(PRIMITIVE_SPRITE_NAMES as readonly string[]).includes(spec.shape)) {
-    return { ok: false, error: `unknown 2D shape "${spec.shape}" — nothing was created.`, options: [...PRIMITIVE_SPRITE_NAMES] };
-  }
+  // The ONE vocabulary check both create-entity ops share (#1070): the per-kind defaults, then the
+  // kind, mesh, shape, light and preset — returned as DATA so this op answers in its own
+  // `{ok:false, error, options}` shape. `{kind:'primitive', mesh:'pyramid'}` once returned a clean
+  // success for an invisible entity; the light/preset checks then THREW out of the spec builders,
+  // which the device relay flattened into a bare error string with no options.
+  const resolved = resolveCreateEntitySpec(p.spec);
+  if (!resolved.ok) return { ok: false, error: resolved.error, options: resolved.options };
 
   let parentId = 0;
   if (p.parentGuid != null) {
@@ -113,9 +108,9 @@ export function createEntityLive(params: unknown): unknown {
     parentId = p.parentId;
   }
 
-  const { name, specs } = buildEntityCreateSpecs(p.spec, parentId);
+  const { name, specs } = buildEntityCreateSpecs(resolved.spec, parentId);
   const id = spawnFromSpecs(specs);
-  if (id == null) return { ok: false, error: `nothing was created for spec ${JSON.stringify(p.spec)} — a referenced trait is not registered in this build.` };
+  if (id == null) return { ok: false, error: `nothing was created for spec ${JSON.stringify(resolved.spec)} — a referenced trait is not registered in this build.` };
   return { ok: true, id, guid: mintGuid(id), name, saved: false, savedNote: LIVE_ONLY };
 }
 

@@ -440,7 +440,9 @@ export { applyOps, type MutateOp, type MutableScene, type MutableEntity, type En
 // since #166 so the DEVICE create-entity op can build the SAME entities the editor does — the
 // editor half of the package is stripped from a shipped game build. See
 // docs/mcp-tool-conventions.md §9.
-export { buildEntityCreateSpecs, type CreateEntitySpec, type CreateSpecs, type TraitSpec, type LightKind } from './scene/entityCreateSpecs';
+export { buildEntityCreateSpecs, CREATE_ENTITY_KINDS, LIGHT_KINDS, type CreateEntitySpec, type CreateSpecs, type TraitSpec, type LightKind } from './scene/entityCreateSpecs';
+// The one vocabulary check both create-entity ops (editor + device) share, returned as data (#1070).
+export { resolveCreateEntitySpec, type CreateEntitySpecResolution } from './scene/createEntitySpec';
 export { buildUiCreateSpecs, type UiPreset, type UiTraitSpec } from './ui/uiAuthoring';
 // Hierarchy legality (#166 P7) — the ONE self-parent/cycle rule, shared by the editor's undoable
 // reparent and the device's direct parentId write. See runtime/core/ecs/hierarchy.ts.

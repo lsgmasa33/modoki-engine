@@ -16,6 +16,16 @@
 import { nextCaptureSeq } from '../runtime/core/journal';
 import { notifyListeners } from '../runtime/core/notifyListeners';
 
+/** Who an editor event is attributed to — the vocabulary of `EditorEvent.source` and of the
+ *  `source` filter on `editor-journal` / `wait-for-edit`. A table, not only a type, so those ops can
+ *  REFUSE an unknown value with the real options instead of a route dropping it (#1072). */
+export const EDITOR_JOURNAL_SOURCES = ['human', 'agent'] as const;
+export type EditorJournalSource = typeof EDITOR_JOURNAL_SOURCES[number];
+
+export function isEditorJournalSource(source: unknown): source is EditorJournalSource {
+  return (EDITOR_JOURNAL_SOURCES as readonly unknown[]).includes(source);
+}
+
 export interface EditorEvent {
   /** Editor-local monotonic sequence — the poll cursor (use as `since`). Bumps only
    *  on editor emits, so it stays contiguous within the editor stream. */

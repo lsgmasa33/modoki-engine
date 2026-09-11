@@ -426,6 +426,31 @@ Rules:
     `504 NOT_AVAILABLE_HERE` into a fabricated `200 {}` across ~30 relayed routes. That handler
     rejects on `declined` now, so the trap is closed from both ends, but the asymmetry is correct.
 
+- **A route never narrows an agent-supplied VOCABULARY — it forwards the raw value, and the op that
+  owns the table refuses it with `options`** (#1072). §1 rules out silently dropping an unknown
+  KEY; this is the same rule for a VALUE, one layer further in. `/api/journal` copied
+  `info|warn|error` and dropped anything else, so `?level=wran` returned the whole ring under a
+  filtered framing and the op's own refusal could never fire; `/api/editor-journal` and
+  `/api/wait-for-edit` did the same to `source`, and the latter then parked for the default
+  `human`. The MCP tools' `z.enum`s hide this from every tool call, which is how it survived —
+  the curl API is still a surface (§9). Guarded by `tests/plugins/routeVocabularyForwarding.test.ts`;
+  the tools' hand-copied enums are pinned to the runtime tables by
+  `tests/tools/vocabularyEnumParity.test.ts`. The same mechanism is not only a ROUTE shape — the
+  close-out sweep found it at an op (`hit-regions` ran an unknown `action` as a read) and in a pure
+  decision (`pickHostSidePlatform` ignored an unknown explicit `platform` and answered about the
+  lease's device); both now refuse. The router guard sees only the one-line `=== … ||` spelling, not
+  a `Set.has`/`switch`/multi-line copy. Still open: the Electron input routes' `button` (#1076).
+  Two riders:
+  - **On a GET, the refusal needs a CODE.** `getJson` does not run `isFailureBody` on a plain read,
+    so an uncoded `{ok:false}` reaches the agent as a SUCCESS; a coded envelope leaves `relayJson`
+    as a 400. (`/api/watch/read` is safe without one only because its route re-codes the op's
+    uncoded refusal as a 404.)
+  - **A runtime vocabulary check RETURNS its refusal as data, and each op adapts it once** —
+    `resolveCreateEntitySpec` for `create-entity` (#1070): the editor op throws `OpRefusal`, the
+    device twin returns `{ok:false, error, options}`. A runtime THROW serves neither transport: the
+    device relay flattens it to a string, and the editor relay can only call it `REFUSED_BY_OP`
+    with the options stranded in the prose. The builders keep a throw as a programming-error
+    backstop, using the SAME membership predicate — one check per table, not a second copy.
 - **A relayed route never HARD-CODES its catch status** (#1013). This is the receive-side half of
   the rule above, and the two are not the same fix: the emit side stops an op from *losing* its
   code, this side stops the route from *inventing* one. `ctx.requestBrowser` rejects identically
