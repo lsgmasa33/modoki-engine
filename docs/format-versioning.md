@@ -524,7 +524,10 @@ the fixed sites share no single greppable spelling (`loaders/primitives.ts` was 
 ⚠️ **`??` fails one step earlier too, on the EMPTY STRING** (#1074). `params?.bus ?? 'master'` keeps
 `''`, because `''` is not nullish either, so the fallback never runs and the empty string reaches
 whatever comes next. In `audio.setBusVolume` that was a key builder, `''[0].toUpperCase()`, which
-threw out of `dispatchUIAction`. When `''` means "unset", say so at the read
+threw out of `dispatchUIAction`. **For a UI action's DECLARED params this is now handled once, at
+the seam** (#1075): the registry drops `''` before the handler runs — see the `UIAction` section of
+`docs/ui-system.md` — so a handler's `params.x ?? fallback` is correct again. Anywhere else, a
+document string read outside the action registry: when `''` means "unset", say so at the read
 (`raw == null || raw === '' ? undefined : raw`). When it doesn't, it is just another unknown key
 and the refusal handles it.
 

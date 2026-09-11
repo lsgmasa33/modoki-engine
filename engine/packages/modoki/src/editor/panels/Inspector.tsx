@@ -61,7 +61,7 @@ import { getUIActionNames } from '../../runtime/core/actionRegistry';
 import { getPhysicsLayerNames } from '../../runtime/physics/physicsLayers';
 import { getClipNames, getBoneNames, getNodeMaterials } from '../../runtime/loaders/riggedModelCache';
 import { EntityAttributes } from '../../runtime/traits';
-import { readUILength, readUIAnchorLength, type UIElementLengthField, type UIAnchorLengthField } from '../../runtime/traits/uiLength';
+import { readUILength, readUIAnchorLength, UI_LENGTH_UNITS, type UIElementLengthField, type UIAnchorLengthField } from '../../runtime/traits/uiLength';
 import { registerFrameCallback, unregisterFrameCallback, startFrameDriver, stopFrameDriver } from '../../runtime/rendering/frameDriver';
 import type { SelectedAsset } from '../store/editorStore';
 
@@ -1106,12 +1106,7 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
           <select value={isMixed(unitKey) ? '' : unit} onChange={e => { if (e.target.value !== '') write(unitKey, e.target.value); }} disabled={stretchDisabled}
             style={{ background: '#111', color: '#ddd', border: '1px solid #444', borderRadius: 3, padding: '2px 2px', fontSize: '11px', fontFamily: 'monospace', cursor: 'pointer' }}>
             {isMixed(unitKey) && <option value="">--</option>}
-            <option value="px">px</option>
-            <option value="%">%</option>
-            <option value="vw">vw</option>
-            <option value="vh">vh</option>
-            <option value="vmin">vmin</option>
-            <option value="vmax">vmax</option>
+            {UI_LENGTH_UNITS.map((u) => <option key={u} value={u}>{u}</option>)}
           </select>
         </div>
       );

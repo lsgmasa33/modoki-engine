@@ -66,6 +66,12 @@ export interface FieldHint {
   editorPanel?: string;
   multiline?: boolean;  // string field renders as a resizable textarea (Enter inserts a newline)
   tooltip?: string;     // hover tooltip text for the field label
+  /** For a UI ACTION param only (`UIActionDef.params`): keep an empty string `''` as a real value.
+   *  By default the registry drops `''` from every DECLARED param before the handler runs
+   *  (`normaliseParams`, actionRegistry.ts, #1075), because the Inspector, a cleared text field, an
+   *  empty `$value` and MCP all deliver `''` for "nothing chosen" — and `params.x ?? fallback` cannot
+   *  see it. Set this on a string param whose empty value genuinely means empty text. */
+  allowEmpty?: boolean;
   showWhen?: Record<string, string[]>;  // field visible only when another field's value is in the list
   section?: string;     // collapsible sub-section within the trait (distinct from group which renders as VecField)
   sectionDefaultOpen?: boolean;  // whether this section starts expanded (default true)

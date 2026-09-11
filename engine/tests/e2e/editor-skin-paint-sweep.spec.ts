@@ -27,15 +27,19 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { gotoEditorWithScene, stableBoundingBox } from './helpers';
+import { hasInternalGames } from '../helpers/repoLayout';
 
 // games/skin-test is the documented fixture for the Skin editor (docs/2d-skinning.md
 // "Fixture + tests"): a generated 64×256 striped bar.png + a 3-bone base→mid→tip
 // bar.rig2d.json. Absent from the public OSS snapshot (games/ is private-only), so this
-// spec skips there rather than failing — the same pattern editor-particles.spec.ts uses.
+// spec skips there rather than failing.
+//
+// ⚠️ The skip asks the PREDICATE, and the fixture is then ASSERTED inside the test (#1071). The raw
+// `existsSync(RIG_FS_PATH)` skip this replaced also fired in a private clone where the rig had been
+// moved or renamed — and a skipped e2e spec reads as green on every runner.
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const RIG_FS_PATH = path.join(REPO_ROOT, 'games/skin-test/runtime/assets/rigs/bar.rig2d.json');
-const HAS_FIXTURE = fs.existsSync(RIG_FS_PATH);
-test.skip(!HAS_FIXTURE, 'editor-skin-paint-sweep: games/skin-test is absent from this snapshot');
+test.skip(!hasInternalGames(), 'editor-skin-paint-sweep: games/ is absent from this snapshot');
 
 // Fully-qualified so it resolves regardless of which project (if any) the e2e dev server's
 // MODOKI_PROJECT happens to be — every discovered project's assets are served under
@@ -79,6 +83,7 @@ function newlyPainted(after: number[], baseline: number[]): Set<number> {
 }
 
 test('a fast single-jump stroke paints the same interior vertices as an equivalent slow drag', async ({ page }) => {
+  expect(fs.existsSync(RIG_FS_PATH), `${RIG_PATH} is gone — games/skin-test is this spec's fixture`).toBe(true);
   await gotoEditorWithScene(page);
 
   // Open the rig in Weights mode — a plain store mutation (mirrors what a double-click in

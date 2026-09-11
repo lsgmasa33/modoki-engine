@@ -2,8 +2,14 @@
  * Integration guards for the vendored-plugin identity hash + the manual re-vendor
  * CLI. These use the REAL git/node/esbuild + the REAL committed engine plugins, so
  * they live apart from vendorPlugins.test.ts (which mocks child_process — that mock
- * would swallow the git/node spawns here). They skip cleanly where those tools or
- * the games/engine layout are absent (e.g. a packaged/external checkout).
+ * would swallow the git/node spawns here). They skip cleanly where those TOOLS are
+ * absent (e.g. a packaged/external checkout).
+ *
+ * ⚠️ They do NOT skip on the plugins being absent (#1071). `engine/packages/capacitor-*` is
+ * git-tracked and ships in the public snapshot too (publish-engine-oss.sh includes all of
+ * `engine/`), so there is no checkout where their absence is legitimate: it can only mean a
+ * move or a rename, and the presence gates this file used to carry would have answered that
+ * by skipping every check here and reporting green.
  */
 import { describe, it, expect, afterAll } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -31,9 +37,7 @@ function esbuildOk(): boolean {
 }
 /** The real engine capacitor plugins (the ones vendorEnginePlugins packs). */
 function enginePluginDirs(): string[] {
-  let names: string[];
-  try { names = fs.readdirSync(enginePkgs); } catch { return []; }
-  return names
+  return fs.readdirSync(enginePkgs)
     .filter((n) => n.startsWith('capacitor-'))
     .map((n) => path.join(enginePkgs, n))
     .filter((d) => fs.existsSync(path.join(d, 'package.json')));
@@ -46,9 +50,14 @@ function enginePluginDirs(): string[] {
 // the hash MUST be git-tracked. Catches a future plugin whose build tool emits to
 // a dir name not in BUILD_OUTPUT_DIRS (out/, lib/, .kotlin/, …) far better than
 // the hand-listed synthetic cases in vendorPlugins.test.ts.
-describe.skipIf(!(gitOk() && enginePluginDirs().length > 0))(
+describe.skipIf(!gitOk())(
   'plugin identity hash is reproducible — hashed set is exactly committed source',
   () => {
+    // The loop below makes one test per plugin, so an empty list would make NO tests — green.
+    it('finds the engine capacitor plugins to check', () => {
+      expect(enginePluginDirs().length).toBeGreaterThan(0);
+    });
+
     for (const dir of enginePluginDirs()) {
       const name = path.basename(dir);
       it(`${name}: every hashed input is git-tracked (no untracked/ignored litter leaks in)`, () => {
@@ -87,25 +96,30 @@ describe.skipIf(!(gitOk() && enginePluginDirs().length > 0))(
 // churn this scoping fixed), while its shipped native + src build inputs MUST. Reverting
 // pluginHashInputs to "all non-dist inputs" fails this; over-narrowing (dropping src or
 // native) fails it too.
-describe.skipIf(!(gitOk() && enginePluginDirs().some((d) => path.basename(d) === 'capacitor-game-debug')))(
+describe.skipIf(!gitOk())(
   'plugin identity hash EXCLUDES non-shipped dev files, INCLUDES shipped + build inputs (real plugin)',
   () => {
-    const dir = enginePluginDirs().find((d) => path.basename(d) === 'capacitor-game-debug')!;
-    const inputs = new Set(pluginHashInputs(dir));
+    const dir = enginePluginDirs().find((d) => path.basename(d) === 'capacitor-game-debug');
+    const inputs = new Set(dir ? pluginHashInputs(dir) : []);
     const under = (prefix: string) => [...inputs].filter((p) => p === prefix || p.startsWith(prefix + '/'));
-    const onDisk = (rel: string) => fs.existsSync(path.join(dir, rel));
 
-    // Non-shipped, non-build-input dev files → must be EXCLUDED (only assert for the ones
-    // that actually exist, so a future plugin reshuffle can't falsely pass/fail).
+    it('the real capacitor-game-debug plugin is present', () => {
+      expect(dir, 'engine/packages/capacitor-game-debug is gone — repoint this partition test').toBeDefined();
+    });
+
+    // Non-shipped, non-build-input dev files → must be EXCLUDED. Each one is asserted to EXIST
+    // first: an exclusion check over a directory that is not there passes by having nothing in
+    // it, so a plugin reshuffle must turn this red and update the list, not quietly stop checking.
     for (const excluded of ['android/src/test', 'ios/Tests', 'test-vectors']) {
-      it.skipIf(!onDisk(excluded))(`excludes ${excluded}/** (not shipped, not a dist input)`, () => {
+      it(`excludes ${excluded}/** (not shipped, not a dist input)`, () => {
+        expect(fs.existsSync(path.join(dir!, excluded)), `${excluded}/ moved — update this list`).toBe(true);
         expect(under(excluded), `${excluded}/** must not feed the identity hash`).toEqual([]);
       });
     }
 
     // Shipped native + src build inputs → must be INCLUDED (guards against over-narrowing).
     for (const included of ['src', 'android/src/main', 'ios/Sources']) {
-      it.skipIf(!onDisk(included))(`includes ${included}/** (shipped and/or a dist build input)`, () => {
+      it(`includes ${included}/** (shipped and/or a dist build input)`, () => {
         expect(under(included).length, `${included}/** must feed the identity hash`).toBeGreaterThan(0);
       });
     }
@@ -125,8 +139,8 @@ describe.skipIf(!esbuildOk())('vendor-plugins.mjs CLI runs (esbuild-bundled, no 
   it('bundles + vendors an engine plugin into a temp project, exit 0', () => {
     const plugin = enginePluginDirs().find((d) => path.basename(d) === 'capacitor-game-debug')
       ?? enginePluginDirs()[0];
-    if (!plugin) { expect(true).toBe(true); return; } // no engine plugins → nothing to vendor
-    const pluginName = JSON.parse(fs.readFileSync(path.join(plugin, 'package.json'), 'utf8')).name as string;
+    expect(plugin, 'no engine capacitor plugin to vendor — they are tracked, so this is a move').toBeDefined();
+    const pluginName = JSON.parse(fs.readFileSync(path.join(plugin!, 'package.json'), 'utf8')).name as string;
 
     fs.writeFileSync(path.join(tmp, 'package.json'), JSON.stringify({
       name: 'vendor-cli-smoke', version: '0.0.0', dependencies: { [pluginName]: '*' },

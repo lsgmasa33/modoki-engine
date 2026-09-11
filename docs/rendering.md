@@ -4482,9 +4482,12 @@ effectiveRefW = clamp(referenceHeight x hostAspect, referenceWidth, maxReference
   nothing moves.
 - Past the cap the content letterboxes exactly as before. **That ceiling is load-bearing, not
   cosmetic**: an iPad in LANDSCAPE would otherwise follow the aspect to ~2746 design px. Apple
-  requires an iPad-capable bundle to declare all four orientations (`healNativeConfig.ts`), and
-  Android 16 ignores `android:screenOrientation` on displays >= 600dp, so a wide host is reachable on
-  both platforms in a shipping build.
+  requires an iPad-capable bundle to declare all four orientations (`healNativeConfig.ts`), so a wide
+  host is reachable on iPad in a shipping build. ⚠️ **Not on an Android tablet — this line said so
+  until #782, and it was wrong.** Android 16+ ignores `android:screenOrientation` on displays >= 600dp
+  for apps targeting API 36, but EXEMPTS games (`android:appCategory`), at API 37 as well, and
+  `healAndroidGameMode` declares every Modoki project a game. Read from Google's behavior-change pages
+  and the manifests, not observed on an Android 16 tablet.
 
 ⚠️ **The mode is NOT the lever — do not reach for `fitH` instead.** Every mode in
 `computeCanvasScale` centres on both axes, so with `referenceWidth` pinned, `fitH` pillarboxes

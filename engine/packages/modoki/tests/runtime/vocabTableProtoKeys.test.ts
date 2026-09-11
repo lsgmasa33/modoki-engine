@@ -363,7 +363,7 @@ describe('buildEntityCreateSpecs / buildUiCreateSpecs — an unknown vocabulary 
 
 // ── ui/anchorCss.ts — AnchorData.*Unit, declared `string` ────────────────────────────────────
 
-describe('applyAnchorStyle VP_VARS — an unrecognised length unit (#993)', () => {
+describe('applyAnchorStyle viewport-unit vars — an unrecognised length unit (#993)', () => {
   // ⚠️ TWO anchors, because the unit is read in TWO places and one probe reaches only one of
   // them. `top-left` sets `style.top = 0`, and 0 is FALSY, so `fmtAdd` takes its `bare(v, unit)`
   // branch; `center` sets `style.top = '50%'`, a truthy base, so it takes `term(v, unit)`.

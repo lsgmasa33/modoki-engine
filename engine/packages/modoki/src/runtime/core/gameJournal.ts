@@ -52,8 +52,9 @@ export function journalWarn(name: string, payload?: unknown, world?: World): voi
  *  `'caught'` is an issue on its OWN session budget, not the crash budget: a failure that recurs
  *  with a varying payload (a new transaction id each time) would otherwise spend the budget that
  *  guarantees a genuine crash gets through. See `MAX_CAUGHT_PER_SESSION` in `globalErrors.ts`.
- *  ⚠️ Whether the Crashlytics CONSOLE shows distinct failures as distinct issues is a separate,
- *  pre-existing question: the plugin receives every JS report with the same grouping inputs (#1063).
+ *  The `name` is the report's Crashlytics GROUP (`journalError/<name>`, #1063) and the payload is not,
+ *  so keep one name per kind of failure: a name that varies per occurrence splits one failure into many
+ *  console issues.
  *
  *  ⚠️ **PRIVACY: the payload is sent to Crashlytics as text.** Guids, keys, product and transaction
  *  ids, counts and error text only. Never player content (a typed word, a name) and never an

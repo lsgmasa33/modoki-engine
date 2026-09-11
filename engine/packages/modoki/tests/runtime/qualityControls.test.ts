@@ -76,6 +76,13 @@ describe('quality.set', () => {
     expect(getPlayerQualityTier()).toBe('high');
   });
 
+  // #1075: an unticked `tier` picker writes ''. `tier` is declared, so the registry drops it and
+  // the event value gets its turn — before, '' failed `isQualityTier` and the payload was ignored.
+  it('an EMPTY `tier` falls back to the event value (#1075)', () => {
+    dispatchUIAction('quality.set', { params: { tier: '' }, payload: 'low' });
+    expect(getPlayerQualityTier()).toBe('low');
+  });
+
   it("'auto' clears the override, from either authoring", () => {
     setPlayerQualityTier('high');
     byParams('auto');

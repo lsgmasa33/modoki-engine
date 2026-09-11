@@ -1576,6 +1576,22 @@ describe('healNativeConfig — orientation + status bar', () => {
     },
   );
 
+  // The Android half is the OPPOSITE of the iPad rule above, and it rests on a different heal. For
+  // an app targeting API 36+, Android ignores `screenOrientation` on a >= 600dp display unless the
+  // app declares itself a game (`android:appCategory`), so a portrait game stays portrait on a
+  // tablet only while BOTH heals land in the same manifest (#782). Each heal's own suite passes
+  // with the other deleted, which is why this pins them together.
+  it('a portrait game gets BOTH the orientation lock and the game category that keeps it honoured on Android tablets', () => {
+    writeManifest();
+    writeCapConfig({ orientation: 'portrait', statusBarHidden: false, statusBarStyle: 'default' });
+    healNativeConfig(root);
+    const out = fs.readFileSync(manifestPath(), 'utf8');
+    const activity = out.match(/<activity\b[^>]*android:name="\.MainActivity"[^>]*>/)?.[0] ?? '';
+    const application = out.match(/<application\b[^>]*>/)?.[0] ?? '';
+    expect(activity).toContain('android:screenOrientation="portrait"');
+    expect(application, 'without appCategory="game" Android 16+ ignores the lock on tablets').toContain('android:appCategory="game"');
+  });
+
   it('replaces the existing orientation array with portrait-only + adds status-bar keys', () => {
     writeIosPlist();
     writeCapConfig({ orientation: 'portrait', statusBarHidden: true, statusBarStyle: 'light' });

@@ -698,7 +698,8 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
               fields: [
                 { key: 'ota.enabled', label: 'Enabled', type: 'checkbox', help: 'the shell checks for + applies OTA updates at boot. Off = no network call, no dynamic import of the OTA plugin.' },
                 { key: 'ota.baseUrl', label: 'Base URL', type: 'text', placeholder: 'https://storage.googleapis.com/<bucket>/<prefix>', help: 'what the CLIENT fetches from — no trailing slash' },
-                { key: 'ota.bundleName', label: 'Bundle name', type: 'text', placeholder: 'shell', help: "this build's own bundle — 'shell' for the main app; a sub-game id for a Phase 4 sub-game" },
+                { key: 'ota.bundleName', label: 'Bundle name', type: 'text', placeholder: 'shell', help: "this build's own bundle — 'shell' for the main app" },
+                { key: 'ota.subgames', label: 'Sub-games', type: 'string-list', placeholder: 'one project id per line, e.g. ota-subgame-test', help: 'sub-game project folder names this shell publishes into its bucket — looked up next to this project first, then under games/ and demos/ of the repo; each becomes a Bundle choice in Build → Publish OTA Update… (#837)' },
                 { key: 'ota.engineApi', label: 'Engine API version', type: 'number', help: 'stamped from ENGINE_API_VERSION — do not hand-edit to "fix" a rejected update' },
                 { key: 'ota.publicKey', label: 'Public key', type: 'readonly-text', placeholder: 'empty — generate a key via Build → OTA Keys…', help: 'derived from build/ota-keys/<name>.json, never hand-typed (Build → OTA Keys…)' },
               ],

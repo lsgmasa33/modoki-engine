@@ -1506,7 +1506,15 @@ function healIosOrientationStatusBar(projectRoot: string, cap: ProjectConfig['ca
 }
 
 /** Patch the Android MainActivity's android:screenOrientation to match the
- *  configured orientation (auto → fullSensor). Idempotent. No-op without android/. */
+ *  configured orientation (auto → fullSensor). Idempotent. No-op without android/.
+ *
+ *  ⚠️ **On an Android 16+ TABLET this attribute is honoured only because `healAndroidGameMode`
+ *  declares the app a GAME.** For an app targeting API 36 (every Modoki project), Android ignores
+ *  `screenOrientation` on displays with smallest width >= 600dp, and exempts games, per
+ *  `android:appCategory`; Google's API 37 page keeps that exemption. Remove `appCategory="game"` and
+ *  every portrait game silently rotates on tablets, with nothing failing (#782). This is the opposite
+ *  of iPad, where Apple's four-orientation rule above DOES make a portrait game rotatable. Both halves
+ *  are pinned together in `healNativeConfig.test.ts`. */
 function healAndroidOrientation(projectRoot: string, cap: ProjectConfig['capacitor']): string | undefined {
   const manifest = path.join(projectRoot, 'android', 'app', 'src', 'main', 'AndroidManifest.xml');
   if (!fs.existsSync(manifest)) return undefined;
@@ -1576,6 +1584,12 @@ const ANDROID_GAME_MODE_CONFIG_XML = `<?xml version="1.0" encoding="utf-8"?>
  *
  *  It stays because the two intervention opt-outs below are worth having on their own, and because
  *  correct app metadata is correct regardless.
+ *
+ *  ⚠️ **It is also what keeps a portrait game portrait on an Android 16+ TABLET (#782).** Android
+ *  ignores `screenOrientation` on large screens for apps targeting API 36, except for games per
+ *  `android:appCategory`. So `healAndroidOrientation`'s attribute works there ONLY because of this
+ *  heal. Making this conditional, or dropping `appCategory`, would unlock rotation on every tablet
+ *  with nothing failing.
  *
  *  Both keys degrade silently on older platforms: `appCategory` is API 26+ and the game-mode
  *  config is API 33+; an older device ignores an attribute it does not know.

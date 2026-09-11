@@ -669,6 +669,45 @@ describe('ota.engineApi / ENGINE_API_VERSION agreement', () => {
   });
 });
 
+describe('ota.subgames is a validated list of project ids (#837)', () => {
+  let warn: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => { warn = vi.spyOn(console, 'warn').mockImplementation(() => {}); });
+  afterEach(() => { warn.mockRestore(); });
+
+  it('passes a list of ids through', () => {
+    expect(mergeProjectConfig({ ota: { subgames: ['ota-subgame-test', 'minigame-b'] } }).ota.subgames)
+      .toEqual(['ota-subgame-test', 'minigame-b']);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('defaults to an empty list that a Project Settings save keeps OUT of a file that never had it', () => {
+    expect(mergeProjectConfig({}).ota.subgames).toEqual([]);
+    const resolved = mergeProjectConfig({ ota: { enabled: true } });
+    const pruned = pruneProjectConfig(resolved as unknown as RawProjectConfig, {}, DEFAULT_PROJECT_CONFIG as unknown as RawProjectConfig);
+    expect(Object.prototype.hasOwnProperty.call((pruned as { ota?: object }).ota ?? {}, 'subgames')).toBe(false);
+  });
+
+  it('falls back to the default and WARNS when the value is not a list', () => {
+    expect(mergeProjectConfig({ ota: { subgames: 'ota-subgame-test' as unknown as string[] } }).ota.subgames).toEqual([]);
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/ota\.subgames: "ota-subgame-test" is not a list of strings/));
+  });
+
+  it('drops entries that are not non-empty strings, and WARNS', () => {
+    expect(mergeProjectConfig({ ota: { subgames: ['a', 42, '', '  ', null, 'b'] as unknown as string[] } }).ota.subgames).toEqual(['a', 'b']);
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/ota\.subgames: dropped 4 entry/));
+  });
+
+  it('never hands out the shared default array', () => {
+    mergeProjectConfig({}).ota.subgames.push('leak');
+    expect(DEFAULT_PROJECT_CONFIG.ota.subgames).toEqual([]);
+  });
+
+  it('round-trips whatever the file said when coercion is off (the write path)', () => {
+    const raw = 'not-a-list' as unknown as string[];
+    expect(mergeProjectConfig({ ota: { subgames: raw } }, { coerceUnions: false }).ota.subgames).toBe(raw);
+  });
+});
+
 describe('string-union fields are validated, not passed through (#25)', () => {
   let warn: ReturnType<typeof vi.spyOn>;
   beforeEach(() => { warn = vi.spyOn(console, 'warn').mockImplementation(() => {}); });

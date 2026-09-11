@@ -21,6 +21,7 @@ vi.mock('../../src/runtime/ui/UINode', () => ({
 import { UIRenderer } from '../../src/runtime/ui/UIRenderer';
 import { isPointerBlocked, clearPointerBlockers } from '../../src/runtime/core/pointerBlockers';
 import { resetSafeAreaInsets } from '../../src/runtime/ui/safeArea';
+import { VIEWPORT_LENGTH_UNITS, viewportUnitVar } from '../../src/runtime/traits/uiLength';
 
 // jsdom has no ResizeObserver — install a controllable fake that records instances.
 class FakeRO {
@@ -81,6 +82,19 @@ describe('UIRenderer', () => {
     expect(root.style.getPropertyValue('--ui-vh')).toBe('8px');
     expect(root.style.getPropertyValue('--ui-vmin')).toBe('4px');
     expect(root.style.getPropertyValue('--ui-vmax')).toBe('8px');
+  });
+
+  // The publisher is the copy #1064 was filed about: the old "update these files when adding a
+  // unit" docblock left it out, and a reader of an unpublished var falls back to the browser's own
+  // `1vw` without a word. Iterating the table means a unit added there must be published here.
+  it('publishes a var for EVERY viewport unit in the table', () => {
+    sizeDom(400, 800);
+    h.tree.current = [{ entityId: 1 }];
+    const { container } = render(<UIRenderer />);
+    const root = container.firstElementChild as HTMLElement;
+    for (const u of VIEWPORT_LENGTH_UNITS) {
+      expect(root.style.getPropertyValue(viewportUnitVar(u)), u).toMatch(/^\d+(\.\d+)?px$/);
+    }
   });
 
   it('does not publish vars when the container measures 0 (still-laying-out)', () => {

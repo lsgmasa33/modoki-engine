@@ -794,7 +794,7 @@ journal, which `setJournalEnabled` switches off in a release build.
   not a separate destination (`globalErrors.ts` — see the comment at its `deliver()`: *"'warn'
   delivers as an ISSUE exactly like 'error' — it is a separate BUDGET, not a separate destination.
   Only 'breadcrumb' takes the log path."*). The two Crashlytics concepts still differ — an issue is
-  grouped and alerted on, a breadcrumb is visible only inside somebody else's report — and the
+  grouped (by the report's group, below) and alerted on, a breadcrumb is visible only inside somebody else's report — and the
   reason warns get their own cap is so a warn flood cannot spend the crash budget.
 - ⚠️ **It is installed by a SIDE-EFFECT IMPORT above `./App.tsx`, not by a call.** ES imports are
   hoisted and evaluated before any statement of the importing module, so the installer written as
@@ -835,11 +835,33 @@ journal, which `setJournalEnabled` switches off in a release build.
   JavaScriptCore (every iOS build) writes a stack of frames only, with no `Name: message` line, so
   that shape sent Crashlytics a bare frame with the message gone: observed twice on an iPad mini 5.
   V8's output comes back byte-identical, so Android reports, and the rate limiter's dedupe keys
-  built from them, did not move. ⚠️ Separately, and predating all of this: the plugin receives every
-  JS report with no domain, code or stack, so Crashlytics very likely groups them all into ONE issue
-  per platform. Found by reading the plugin's source; not yet checked in the console (#1063).
+  built from them, did not move.
   `engine/tests/architecture/errorTextIsShared.test.ts` fails a new copy of the pattern in
   `engine/packages/modoki/src` or `engine/app`.
+- ⚠️ **Every report carries a GROUP, or they all share one console issue (#1063).** A bare
+  `recordException({ message })` gives the plugin no grouping inputs:
+  - iOS records an `NSError` with domain `""` and code `-1001`, and Crashlytics groups NSErrors by
+    domain and code.
+  - Android builds a `JavaScriptException` inside the plugin, and Crashlytics groups a throwable by
+    its stack, which is then the plugin's own Java site.
+
+  So every JS report most likely landed in ONE issue per platform, and a new kind of failure raised
+  no alert. That is read from the plugin's source, not seen in the console.
+  - **The grain is kind + name** (owner, 2026-09-11), computed by `runtime/core/crashlyticsGroup.ts`:
+    `journalError/<name>` with the payload ignored, `uncaught/TypeError`, `unhandledrejection/FirebaseError`,
+    `console.warn/MeshCache` from a console line's leading `[Tag]`, and a `prev-boot/` prefix on a replay.
+    Rejected: by throw site (minified names change every release, so a bug re-alerts per build) and
+    by exact message (an id splits one failure into many issues).
+  - **It is derived from the message text**, because the engine composes every issue-kind label.
+    That reaches the boot queue and the cross-boot stash without a field threaded through them. A
+    producer that changes its label shape degrades to a coarser group, so `crashlyticsGroup.test.ts`
+    drives every real producer.
+  - **Each game wrapper sends `crashlyticsExceptionOptions(message, Capacitor.getPlatform())`.** iOS
+    gets `domain` + a fixed `code`. Android gets a one-frame `stacktrace` named after the group. They
+    are never combined, because iOS drops `domain` once a stacktrace is present.
+    `engine/tests/architecture/crashlyticsPayloadShared.test.ts` fails a hand-built payload.
+  - **Not verified in the console.** Only the owner can open it. The check is whether two different
+    `journalError` names now appear as two issues.
 
 **A JS fault during boot has to reach `appServices().crashlytics` to be reported, and there are
 THREE distinct windows depending on how far boot got before it died** (#823, #825, #860):

@@ -15,6 +15,7 @@ import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { execFileSync, spawnSync } from 'child_process';
 import { mergeProjectConfig, pruneProjectConfig, DEFAULT_PROJECT_CONFIG, type RawProjectConfig } from '../../project-config';
+import { acquireBuildClaim, resetBuildClaimsForTests } from '../../scripts/buildClaimsStore.mjs';
 
 const engineRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -902,6 +903,127 @@ describe('ota-publish.mjs publish-identity guards (#582)', () => {
     } finally {
       fs.rmSync(subgameDistDir, { recursive: true, force: true });
     }
+  });
+
+  // ── #837: a sub-game dist's engine API comes from its own subgame.json ──
+  // `publish()` above always passes --engine-api, so these build their own argument list.
+  function runPublish(args: string[]) {
+    return runNode(repoRoot, {
+      ...process.env,
+      PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
+      FAKE_GCS_BUCKET_DIR: bucketDir,
+    }, ['engine/scripts/ota-publish.mjs', '--bucket', 'gs://fakebucket/testprefix', '--version', 'v1', '--key', 'default', ...args]);
+  }
+
+  function withSubgameDist(subgameJson: string, fn: (dist: string) => void) {
+    const dist = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-guards-subgame-api-'));
+    try {
+      fs.writeFileSync(path.join(dist, 'index.html'), '<html>subgame</html>');
+      fs.writeFileSync(path.join(dist, 'subgame.json'), subgameJson);
+      fn(dist);
+    } finally {
+      fs.rmSync(dist, { recursive: true, force: true });
+    }
+  }
+
+  it('j) #837: a sub-game dist with NO --engine-api publishes the engine API its subgame.json stamped', () => {
+    // 3 on both sides, not the default 1: a manifest reading 3 can only have come from subgame.json.
+    const shellDir = writeProjectConfig(path.join(repoRoot, 'games', 'testproj-api-3'), { bundleName: 'shell', publicKey: realPublicKey, engineApi: 3 });
+    withSubgameDist(JSON.stringify({ engineApi: 3 }), (dist) => {
+      const result = runPublish(['--dist', dist, '--name', 'subgame-x', '--project', shellDir]);
+      expect(result.status, result.stderr).toBe(0);
+      const manifestPath = path.join(bucketDir, 'fakebucket', 'testprefix', 'bundles', 'subgame-x', 'v1', 'manifest.json');
+      expect(JSON.parse(fs.readFileSync(manifestPath, 'utf8')).engineApi).toBe(3);
+    });
+  });
+
+  it('k) #837: an --engine-api that disagrees with subgame.json is refused before any upload', () => {
+    withSubgameDist(JSON.stringify({ engineApi: 1 }), (dist) => {
+      const result = runPublish(['--dist', dist, '--name', 'subgame-x', '--engine-api', '2', '--project', projectDir]);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/--engine-api 2 disagrees with/);
+      expect(bucketIsEmpty()).toBe(true);
+    });
+  });
+
+  it('l) #837: a stamped engine API that differs from the shell\'s ota.engineApi is refused before any upload', () => {
+    withSubgameDist(JSON.stringify({ engineApi: 2 }), (dist) => {
+      const result = runPublish(['--dist', dist, '--name', 'subgame-x', '--project', projectDir]);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/built against engine API 2.*ota\.engineApi is 1/);
+      expect(bucketIsEmpty()).toBe(true);
+    });
+  });
+
+  it('m) #837: an ABSENT shell ota.engineApi resolves to the default — it is compared, not skipped', () => {
+    const noApiDir = path.join(repoRoot, 'games', 'testproj-no-engineapi');
+    fs.mkdirSync(noApiDir, { recursive: true });
+    fs.writeFileSync(path.join(noApiDir, 'project.config.json'), JSON.stringify({ ota: { enabled: true, bundleName: 'shell', publicKey: realPublicKey } }));
+    withSubgameDist(JSON.stringify({ engineApi: 2 }), (dist) => {
+      const result = runPublish(['--dist', dist, '--name', 'subgame-x', '--project', noApiDir]);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/ota\.engineApi is 1/);
+      expect(bucketIsEmpty()).toBe(true);
+    });
+  });
+
+  it('n) #837: an unparseable subgame.json is refused before any upload', () => {
+    withSubgameDist('{ not json', (dist) => {
+      const result = runPublish(['--dist', dist, '--name', 'subgame-x', '--project', projectDir]);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/subgame\.json could not be parsed as JSON/);
+      expect(bucketIsEmpty()).toBe(true);
+    });
+  });
+
+  it('p) #837: a sub-game dist is claimed under its OWN project while it is published — a build holding that project refuses the publish', () => {
+    // build-subgame.mjs claims the SUB-GAME project; the publish used to claim only --project (the
+    // shell), so a second build of the sub-game could empty the dist mid-upload (close-out review).
+    const subProject = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-subgame-project-'));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-claims-home-'));
+    const prevHome = process.env.MODOKI_HOME;
+    const prevToken = process.env.MODOKI_BUILD_CLAIM_TOKEN;
+    process.env.MODOKI_HOME = home;
+    try {
+      const dist = path.join(subProject, 'subgame-dist');
+      fs.mkdirSync(dist, { recursive: true });
+      fs.writeFileSync(path.join(dist, 'index.html'), '<html>subgame</html>');
+      fs.writeFileSync(path.join(dist, 'subgame.json'), JSON.stringify({ engineApi: 1 }));
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
+        FAKE_GCS_BUCKET_DIR: bucketDir,
+        MODOKI_HOME: home,
+      };
+      const args = ['engine/scripts/ota-publish.mjs', '--dist', dist, '--bucket', 'gs://fakebucket/testprefix',
+        '--name', 'subgame-x', '--version', 'v1', '--key', 'default', '--project', projectDir];
+
+      // A racing `build-subgame.mjs` on that sub-game, stood in for by a claim this live process holds.
+      const racing = acquireBuildClaim(subProject, 'racing sub-game build', { kind: 'cli' });
+      expect(racing.ok).toBe(true);
+      delete env.MODOKI_BUILD_CLAIM_TOKEN; // the publish is an unrelated process, not the holder's child
+      const refused = runNode(repoRoot, env, args);
+      expect(refused.status).not.toBe(0);
+      expect(refused.stderr).toMatch(/racing sub-game build/);
+      expect(bucketIsEmpty()).toBe(true);
+
+      if (racing.ok) racing.release();
+      const allowed = runNode(repoRoot, env, args);
+      expect(allowed.status, allowed.stderr).toBe(0);
+    } finally {
+      resetBuildClaimsForTests();
+      if (prevHome === undefined) delete process.env.MODOKI_HOME; else process.env.MODOKI_HOME = prevHome;
+      if (prevToken === undefined) delete process.env.MODOKI_BUILD_CLAIM_TOKEN; else process.env.MODOKI_BUILD_CLAIM_TOKEN = prevToken;
+      fs.rmSync(subProject, { recursive: true, force: true });
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('o) #837: a SHELL dist still requires --engine-api', () => {
+    const result = runPublish(['--dist', distDir, '--name', 'shell', '--project', projectDir]);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/--engine-api is required for a shell dist/);
+    expect(bucketIsEmpty()).toBe(true);
   });
 });
 

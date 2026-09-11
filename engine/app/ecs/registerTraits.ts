@@ -1,7 +1,7 @@
 /** Game-specific trait registrations — this is the only file a new game
  *  needs to modify to declare its traits to the editor. */
 
-import { registerTrait, type FieldHint } from '@modoki/engine/runtime';
+import { registerTrait, UI_LENGTH_UNITS, type FieldHint } from '@modoki/engine/runtime';
 import {
   Transform, Renderable3D, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, AnimationLibrary, BoneAttachment, Bone, SkinnedSprite2D, Bone2D, Billboard3D, GroupAlpha, Mask2D, FlatSprite3D, Zone3D, Zone2D, ZoneOccupant, OnZone3D, OnZone2D, Director, OnSequence, Renderable3DPrimitive, Renderable2D, Text3D, Text2D, TextAnimation, RenderableUI, Camera, CameraFrame, Time, HapticSettings, AudioSettings, UISettings, Paused, Persistent, PrefabInstance, EntityAttributes, Light, Environment, Fog, ModelSource,
   UIElement, UIBinding, UIAction, UIFocusable, UIToggle, UIScrollView, UIEntries, UIEntry, TouchControl, TOUCH_CONTROL_ACTIONS, TOUCH_CONTROL_SHOW_ON, UIAnchor, Canvas2D, NPRPostFX, BloomPostFX, VignettePostFX, DepthOfFieldPostFX, AmbientOcclusionPostFX, Rotate3D, Tint, MaterialInstance, ParticleEmitter, FlameMesh, BlobShadow, Animator, SpriteAnimator,
@@ -991,9 +991,9 @@ export function registerAllTraits() {
       // positions it absolutely); width/height disable only on a stretched axis.
       // See uiAuthoring.SELF_PLACEMENT_PROPS + the AnchorLayoutNote banner.
       width: { type: 'number', step: 1, tooltip: 'Element width. 0 = auto (sized by content/flexbox)', ...S('Layout') },
-      widthUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], ...S('Layout') },
+      widthUnit: { type: 'enum', options: [...UI_LENGTH_UNITS], ...S('Layout') },
       height: { type: 'number', step: 1, tooltip: 'Element height. 0 = auto (sized by content/flexbox)', ...S('Layout') },
-      heightUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], ...S('Layout') },
+      heightUnit: { type: 'enum', options: [...UI_LENGTH_UNITS], ...S('Layout') },
       flexGrow: { type: 'number', step: 1, tooltip: 'How much this element grows to fill available space.\n0 = don\'t grow, 1 = take equal share', ...S('Layout') },
       flexShrink: { type: 'number', step: 1, tooltip: 'How much this element shrinks when parent overflows.\n0 = don\'t shrink, 1 = shrink equally', ...S('Layout') },
       alignSelf: { type: 'enum', options: ['auto', 'flex-start', 'center', 'flex-end', 'stretch'], tooltip: 'Override parent alignItems for this element', ...S('Layout') },
@@ -1007,7 +1007,7 @@ export function registerAllTraits() {
       pointerThrough: { type: 'boolean', tooltip: 'Never take the pointer — taps fall through to whatever is BEHIND this element.\nChildren keep their own (a button inside stays clickable).\nFor a decorative container drawn over something that must stay tappable.\nNOTE: on an overflow:scroll box this gives up scrolling it.', ...S('Layout') },
       swallowClicks: { type: 'boolean', tooltip: 'Consume a click that lands here (or on a non-interactive child) instead of letting it bubble.\nDoes NOT run bindings or show a pointer cursor — this is not a button.\nFor a dialog card whose backdrop dismisses on tap.\n⚠️ Inert if pointerThrough is also on — pointerThrough wins. Pick one; they are opposites.\n⚠️ Redundant (not lost) with a real click binding — the binding already stops the tap and still runs.', ...S('Layout') },
       minTapSize: { type: 'number', step: 1, tooltip: 'Minimum size of the TAP ZONE, both axes, in minTapSizeUnit. 0 = off.\nRaises the area that RECEIVES a tap without changing the area that DRAWS — the artwork, the box and every sibling stay exactly where they are.\nFor an icon control whose glyph is smaller than a finger: ~44pt (Apple HIG) / 48dp (Material).\n\u26a0 padding and minWidth/minHeight do NOT do this. Padding is a measured no-op (border-box sizing); minWidth/minHeight grow the box AND scale a contain image with it.\n\u26a0 Inert on an element that takes no click, and clipped away by overflow hidden/scroll — both warn in the console.', ...S('Layout') },
-      minTapSizeUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for minTapSize. Default px — a tap target is a physical-finger size, so px is usually right and a viewport unit will shrink it on a small screen.', ...S('Layout') },
+      minTapSizeUnit: { type: 'enum', options: [...UI_LENGTH_UNITS], tooltip: 'Unit for minTapSize. Default px — a tap target is a physical-finger size, so px is usually right and a viewport unit will shrink it on a small screen.', ...S('Layout') },
 
       // ── Child Layout section (Unity LayoutGroup — arranges THIS element's children) ──
       // Container-level flexbox. Independent of this element's own anchor, so it
@@ -1018,17 +1018,17 @@ export function registerAllTraits() {
       justifyContent: { type: 'enum', options: ['flex-start', 'center', 'flex-end', 'space-between', 'space-around'], tooltip: 'How children are distributed along the main axis', ...S('Child Layout') },
       alignItems: { type: 'enum', options: ['flex-start', 'center', 'flex-end', 'stretch'], tooltip: 'How children are aligned on the cross axis', ...S('Child Layout') },
       gap: { type: 'number', step: 1, tooltip: 'Space between children', ...S('Child Layout') },
-      gapUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for gap.\nMatch it to the CHILDREN\u2019s unit: scaling items with px gaps reflow at small sizes.', ...S('Child Layout') },
+      gapUnit: { type: 'enum', options: [...UI_LENGTH_UNITS], tooltip: 'Unit for gap.\nMatch it to the CHILDREN\u2019s unit: scaling items with px gaps reflow at small sizes.', ...S('Child Layout') },
 
       // ── Padding section (collapsed by default) ──
       paddingTop: { type: 'number', step: 1, tooltip: 'Inner spacing top', ...S('Padding', { sectionDefaultOpen: false }) },
-      paddingTopUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], ...S('Padding') },
+      paddingTopUnit: { type: 'enum', options: [...UI_LENGTH_UNITS], ...S('Padding') },
       paddingRight: { type: 'number', step: 1, tooltip: 'Inner spacing right', ...S('Padding') },
-      paddingRightUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], ...S('Padding') },
+      paddingRightUnit: { type: 'enum', options: [...UI_LENGTH_UNITS], ...S('Padding') },
       paddingBottom: { type: 'number', step: 1, tooltip: 'Inner spacing bottom', ...S('Padding') },
-      paddingBottomUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], ...S('Padding') },
+      paddingBottomUnit: { type: 'enum', options: [...UI_LENGTH_UNITS], ...S('Padding') },
       paddingLeft: { type: 'number', step: 1, tooltip: 'Inner spacing left', ...S('Padding') },
-      paddingLeftUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], ...S('Padding') },
+      paddingLeftUnit: { type: 'enum', options: [...UI_LENGTH_UNITS], ...S('Padding') },
 
       // ── Style section ──
       backgroundColor: { type: 'color', alphaField: 'backgroundOpacity', tooltip: 'Background fill color', ...S('Style') },
@@ -1041,7 +1041,7 @@ export function registerAllTraits() {
       // ── Text section ──
       text: { type: 'string', tooltip: 'Text content. Supports {storeField} templates', ...S('Text'), sectionDivider: true },
       fontSize: { type: 'number', step: 1, tooltip: 'Text size, in fontSizeUnit (px by default).', ...S('Text') },
-      fontSizeUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for fontSize. Default px.\nSet it to vh when the element\u2019s HEIGHT comes from its text and its parent is sized in %/vh \u2014 vh, NOT vmin, which is min(vw,vh) and so follows WIDTH on any viewport taller than wide (every phone in portrait), leaving the text fixed while the parent shrinks \u2014 otherwise the parent scales and the text does not, and there is a viewport size below which the content overflows its container. lineHeight is still px-only, so leave it 0 (auto) with a scaling fontSize.', ...S('Text') },
+      fontSizeUnit: { type: 'enum', options: [...UI_LENGTH_UNITS], tooltip: 'Unit for fontSize. Default px.\nSet it to vh when the element\u2019s HEIGHT comes from its text and its parent is sized in %/vh \u2014 vh, NOT vmin, which is min(vw,vh) and so follows WIDTH on any viewport taller than wide (every phone in portrait), leaving the text fixed while the parent shrinks \u2014 otherwise the parent scales and the text does not, and there is a viewport size below which the content overflows its container. lineHeight is still px-only, so leave it 0 (auto) with a scaling fontSize.', ...S('Text') },
       autoFitText: { type: 'boolean', tooltip: 'Shrink-only auto-fit (#614): when on, the effective font size is reduced \u2014 NEVER grown past the authored fontSize \u2014 until the text fits its box on one line, down to fontSizeMin. Below that floor, maxLines/textOverflow take over exactly as they would with this off. Use it where a fixed string can overflow at some viewport/locale (a hardcoded smaller fontSize must be re-tuned per device width, and shortening the string collides with localisation).\nDoes nothing when elementType is \u2018input\u2019 \u2014 an input\u2019s text is player-entered, not an authored label.', ...S('Text') },
       fontSizeMin: { type: 'number', step: 0.1, tooltip: 'The shrink floor for autoFitText, in fontSizeUnit \u2014 the SAME unit as fontSize (there is deliberately no separate unit field for this one, same reasoning as letterSpacingUnit above). 0 means \u201cno explicit floor\u201d: the effective floor is half the authored fontSize.', ...S('Text') },
       fontWeight: { type: 'enum', options: ['normal', 'bold'], tooltip: 'Text weight', ...S('Text') },
@@ -1053,7 +1053,7 @@ export function registerAllTraits() {
       systemFont: { type: 'string', tooltip: 'A plain CSS family name (system-ui, Helvetica, or a stack) \u2014 for a typeface no asset can express. Used only when fontFamily is empty or unresolvable. Leave it empty unless you specifically want the device\u2019s own font.', ...S('Text') },
       lineHeight: { type: 'number', step: 1, tooltip: 'Line height in PIXELS, like fontSize \u2014 not a multiplier. 0 = auto (the browser\u2019s normal). UINode emits it as px deliberately: React leaves a bare number unitless and CSS reads THAT as a font-size multiplier, so authoring 1.4 here would render 1.4px lines and squash wrapped text to nothing.', ...S('Text') },
       letterSpacing: { type: 'number', step: 0.5, tooltip: 'Letter spacing, in letterSpacingUnit (px by default).', ...S('Text') },
-      letterSpacingUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for letterSpacing. Default px.\nMatch it to fontSizeUnit: tracking is only meaningful as a RATIO of the glyph size, so px tracking under a scaling font says something different at every viewport.', ...S('Text') },
+      letterSpacingUnit: { type: 'enum', options: [...UI_LENGTH_UNITS], tooltip: 'Unit for letterSpacing. Default px.\nMatch it to fontSizeUnit: tracking is only meaningful as a RATIO of the glyph size, so px tracking under a scaling font says something different at every viewport.', ...S('Text') },
       textOverflow: { type: 'enum', options: ['clip', 'ellipsis'], tooltip: 'How to handle text overflow', ...S('Text') },
       maxLines: { type: 'number', step: 1, tooltip: 'Max visible lines. 0 = unlimited', ...S('Text') },
 
@@ -1075,13 +1075,13 @@ export function registerAllTraits() {
 
       // ── Size Constraints section (collapsed by default) ──
       minWidth: { type: 'number', step: 1, tooltip: 'Minimum width, in minWidthUnit. 0 = none.\n⚠️ Defaults to px while width/height default to %.', ...S('Size Constraints', { sectionDefaultOpen: false }), sectionDivider: true },
-      minWidthUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for minWidth. Default px.', ...S('Size Constraints') },
+      minWidthUnit: { type: 'enum', options: [...UI_LENGTH_UNITS], tooltip: 'Unit for minWidth. Default px.', ...S('Size Constraints') },
       maxWidth: { type: 'number', step: 1, tooltip: 'Maximum width, in maxWidthUnit. 0 = none.\n⚠️ Defaults to px while width/height default to %.', ...S('Size Constraints') },
-      maxWidthUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for maxWidth. Default px.', ...S('Size Constraints') },
+      maxWidthUnit: { type: 'enum', options: [...UI_LENGTH_UNITS], tooltip: 'Unit for maxWidth. Default px.', ...S('Size Constraints') },
       minHeight: { type: 'number', step: 1, tooltip: 'Minimum height, in minHeightUnit. 0 = none.\n⚠️ Defaults to px while width/height default to %.', ...S('Size Constraints') },
-      minHeightUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for minHeight. Default px.', ...S('Size Constraints') },
+      minHeightUnit: { type: 'enum', options: [...UI_LENGTH_UNITS], tooltip: 'Unit for minHeight. Default px.', ...S('Size Constraints') },
       maxHeight: { type: 'number', step: 1, tooltip: 'Maximum height, in maxHeightUnit. 0 = none.\n⚠️ Defaults to px while width/height default to %.', ...S('Size Constraints') },
-      maxHeightUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], tooltip: 'Unit for maxHeight. Default px.', ...S('Size Constraints') },
+      maxHeightUnit: { type: 'enum', options: [...UI_LENGTH_UNITS], tooltip: 'Unit for maxHeight. Default px.', ...S('Size Constraints') },
 
       // ── Margin section (collapsed by default) ──
       // ⚠️ Collapsed ON PURPOSE — margin is deliberately de-emphasised here (owner, 2026-09-05):
@@ -1093,13 +1093,13 @@ export function registerAllTraits() {
       // discarded (#757). The Inspector greys these fields out and says which anchor is responsible
       // (`inertMarginTooltip`), and the scene validator reports an authored non-zero one.
       marginTop: { type: 'number', step: 1, tooltip: 'Outer spacing top — flow layout only; an anchored element discards all four margins (use the UIAnchor offsets instead)', ...S('Margin', { sectionDefaultOpen: false }) },
-      marginTopUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], ...S('Margin') },
+      marginTopUnit: { type: 'enum', options: [...UI_LENGTH_UNITS], ...S('Margin') },
       marginRight: { type: 'number', step: 1, tooltip: 'Outer spacing right — flow layout only; an anchored element discards all four margins (use the UIAnchor offsets instead)', ...S('Margin') },
-      marginRightUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], ...S('Margin') },
+      marginRightUnit: { type: 'enum', options: [...UI_LENGTH_UNITS], ...S('Margin') },
       marginBottom: { type: 'number', step: 1, tooltip: 'Outer spacing bottom — flow layout only; an anchored element discards all four margins (use the UIAnchor offsets instead)', ...S('Margin') },
-      marginBottomUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], ...S('Margin') },
+      marginBottomUnit: { type: 'enum', options: [...UI_LENGTH_UNITS], ...S('Margin') },
       marginLeft: { type: 'number', step: 1, tooltip: 'Outer spacing left — flow layout only; an anchored element discards all four margins (use the UIAnchor offsets instead)', ...S('Margin') },
-      marginLeftUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'], ...S('Margin') },
+      marginLeftUnit: { type: 'enum', options: [...UI_LENGTH_UNITS], ...S('Margin') },
 
       // ── Input section (collapsed by default) ──
       elementType: { type: 'enum', options: ['div', 'input', 'range'], tooltip: 'div: plain container. input: text input (pair with UIBinding.inputBinding + a UIAction change/submit binding). range: slider (pair with UIBinding.inputBinding + a UIAction change binding; payload is a number).', ...S('Input', { sectionDefaultOpen: false }), sectionDivider: true },
@@ -1453,13 +1453,13 @@ export function registerAllTraits() {
       anchor: { type: 'enum', options: ['stretch', 'top', 'top-stretch', 'bottom', 'bottom-stretch', 'left', 'left-stretch', 'right', 'right-stretch', 'top-left', 'top-right', 'bottom-left', 'bottom-right', 'center', 'h-stretch', 'v-stretch'],
         tooltip: 'Screen anchor preset. Sets position: absolute.\nstretch = fill parent\ntop/bottom/left/right = pin to edge\n*-stretch = pin to edge + stretch the cross axis\nh-stretch/v-stretch = stretch one axis, center the other\ncorners = pin to corner\ncenter = centered with translate' },
       top: { type: 'number', step: 1, tooltip: 'Offset from top edge (or inset for stretch)' },
-      topUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'] },
+      topUnit: { type: 'enum', options: [...UI_LENGTH_UNITS] },
       left: { type: 'number', step: 1, tooltip: 'Offset from left edge (or inset for stretch)' },
-      leftUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'] },
+      leftUnit: { type: 'enum', options: [...UI_LENGTH_UNITS] },
       right: { type: 'number', step: 1, tooltip: 'Offset from right edge (or inset for stretch)' },
-      rightUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'] },
+      rightUnit: { type: 'enum', options: [...UI_LENGTH_UNITS] },
       bottom: { type: 'number', step: 1, tooltip: 'Offset from bottom edge (or inset for stretch)' },
-      bottomUnit: { type: 'enum', options: ['px', '%', 'vw', 'vh', 'vmin', 'vmax'] },
+      bottomUnit: { type: 'enum', options: [...UI_LENGTH_UNITS] },
       pivotX: { type: 'number', step: 0.1, tooltip: 'Horizontal pivot (0 = left edge, 0.5 = center, 1 = right edge).\nShifts which point of this element sits at the anchor position.' },
       pivotY: { type: 'number', step: 0.1, tooltip: 'Vertical pivot (0 = top edge, 0.5 = center, 1 = bottom edge).\nShifts which point of this element sits at the anchor position.' },
       safeArea: { type: 'boolean', tooltip: 'Inset this element away from the device notch, Dynamic Island and home indicator.\nOn a POINT anchor this OFFSETS the element (it is not padding).\n\u26a0\ufe0f Set it on the outermost anchored box only \u2014 a nested child takes the FULL device inset relative to its\nparent, not to the screen, so four pads inside one container each get pushed inward.' },

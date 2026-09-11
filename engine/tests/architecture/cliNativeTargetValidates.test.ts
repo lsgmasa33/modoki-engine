@@ -26,6 +26,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readScannedSource } from '@modoki/engine/testing';
 import { projectConfigUnionErrors, validateBuildConfig, loadProjectConfig, loadProjectUserConfig } from '../../plugins/load-project-config';
+import { hasInternalGames } from '../helpers/repoLayout';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const scriptPath = path.join(repoRoot, 'engine', 'scripts', 'add-native-targets.mjs');
@@ -73,9 +74,13 @@ describe('the two-part project-config validation actually rejects bad configs (#
     expect(errors).toEqual([]);
   });
 
-  it('a real shipped project (games/sling) also produces no errors', () => {
+  // Gated on the predicate (#1071). The hand-rolled `existsSync` return this replaced reported PASS
+  // wherever sling was absent — the snapshot, but also a private clone where sling had been renamed.
+  it.skipIf(!hasInternalGames())('a real shipped project (games/sling) also produces no errors', () => {
     const slingRoot = path.join(repoRoot, 'games', 'sling');
-    if (!fs.existsSync(path.join(slingRoot, 'project.config.json'))) return; // fixture absent on this checkout
+    // Asserted first: a MISSING config resolves to the defaults, which validate clean — so without
+    // this, a renamed sling would pass this test vacuously instead of skipping or failing.
+    expect(fs.existsSync(path.join(slingRoot, 'project.config.json')), 'games/sling moved — repoint this test').toBe(true);
     const errors = errorsFor(slingRoot);
     expect(errors).toEqual([]);
   });

@@ -263,20 +263,16 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
   );
 
   // ── OTA publish (SSE consumed to completion) + status/keygen (JSON) ──
-  // The editor DOES have menu entries for the open project's own shell bundle — Build →
-  // "Publish OTA Update…" and Build → "OTA Keys…" (`engine/app/editor/setup.ts`). What has no
-  // editor path is publishing a SUB-GAME bundle (issue #837), which still means invoking
-  // `build-subgame.mjs` + `ota-publish.mjs` by hand. So this tool surface is a first-class
-  // consumer rather than an afterthought, and for the sub-game case it is the only alternative
-  // to the CLIs. See docs/ota-updates.md.
-  // ⚠️ This comment claimed "no editor menu entry exists yet for any of these" until 2026-09-07;
-  // that was false and had been for some time — the dialogs it describes cite their own Build
-  // menu entries in their headers.
+  // Build → "Publish OTA Update…" and this tool drive the same route. Since #837 it publishes either
+  // the open project as itself, or a sub-game listed in the open project's ota.subgames, built from
+  // that sub-game's own project with build-subgame.mjs. See docs/ota-updates.md.
   tool(
     'modoki_ota_publish',
     'Publish an OTA update for the open project (docs/ota-updates.md): builds FRESH from the ' +
       "current project.config.json (never a stale dist/), verifies/sets the bucket's CORS, then " +
-      'runs ota-publish.mjs. Republishing a version string is decided by CONTENT, not by whether ' +
+      'runs ota-publish.mjs. bundleName may instead name a sub-game listed in ota.subgames, which ' +
+      'is built from its own project and published into this project\'s bucket (see bundleName). ' +
+      'Republishing a version string is decided by CONTENT, not by whether ' +
       'the version exists: an already-published version with IDENTICAL contents RESUMES (so ' +
       'retrying a publish that died partway is safe and expected), one with DIFFERENT contents is ' +
       'refused with a next-free-vN hint, and a bucket that cannot be read fails loudly rather than ' +
@@ -288,7 +284,7 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
     {
       version: z.string().describe('New version string, e.g. "v18". Reusing one already published for this bundleName is refused UNLESS the publish would produce byte-identical contents, in which case it resumes as a retry.'),
       mandatory: z.boolean().optional().describe('Mandatory update: blocks with a restart-to-continue gate instead of applying next launch. true sets it, false CLEARS it, omitted INHERITS the current release\'s mandatory flag (sticky).'),
-      bundleName: z.string().optional().describe('Must equal (or be omitted, defaulting to) this project\'s own project.config.json ota.bundleName — the server refuses any other value. This route always builds the CURRENTLY OPEN project as a normal web build and publishes it as itself; it does NOT build/publish a Phase 4 sub-game module bundle (that needs build-subgame.mjs + a manual publish, not this tool). To publish a sub-game, open ITS OWN project and call this tool there.'),
+      bundleName: z.string().optional().describe('Omit it (or pass this project\'s own ota.bundleName) to build and publish the open project as itself. Pass a project id listed in this project\'s ota.subgames to build THAT project as a sub-game module (build-subgame.mjs) and publish it into this project\'s bucket under that id: its engine API is read from what its build stamps, and the publish is refused unless it equals this project\'s ota.engineApi, since a device loads a sub-game only on an exact match. Any other value is refused.'),
       key: z.string().optional().describe('Signing key name under build/ota-keys/<key>.json (default "default").'),
       bucket: z.string().optional().describe('gs://bucket[/prefix] override — only needed when ota.baseUrl is a custom CDN domain that cannot be reverse-derived to its gs:// form.'),
       force: unsavedForceParam,

@@ -58,9 +58,20 @@ function setEnabled(next: boolean): void {
 }
 
 export function registerHapticControls(): void {
-  registerUIAction('haptics.play', ({ params, payload }) => {
-    const pattern = params?.pattern ?? payload;
-    playHaptic(typeof pattern === 'string' && pattern ? pattern : DEFAULT_PATTERN);
+  registerUIAction('haptics.play', {
+    params: {
+      // A STRING, not an enum: a game registers its own pattern names (`registerHapticPatterns`), so
+      // the engine's default set is not the vocabulary. Declared, so an empty `pattern` is dropped at
+      // dispatch (#1075) and the event value gets its turn before the default does.
+      pattern: {
+        type: 'string',
+        tooltip: "Pattern name — an engine default such as 'select' or 'success', or one the game registered. Empty takes the event value, else 'select'.",
+      },
+    },
+    handler: ({ params, payload }) => {
+      const pattern = params?.pattern ?? payload;
+      playHaptic(typeof pattern === 'string' && pattern ? pattern : DEFAULT_PATTERN);
+    },
   });
 
   registerUIAction('haptics.toggle', () => {

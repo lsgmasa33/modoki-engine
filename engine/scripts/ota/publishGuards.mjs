@@ -66,6 +66,32 @@ export function otaBundleDistKindRefusal({ bundleName, projectBundleName, distIs
   return null;
 }
 
+/** The engine-API value a SUB-GAME publish stamps, or why it must be REFUSED (#837).
+ *
+ *  A device loads a sub-game only when its manifest's `engineApi` EXACTLY equals the running shell's
+ *  `ENGINE_API_VERSION` (`engine/app/subgameLoader.ts`, never `>=`) and refuses anything else — but
+ *  on the device, long after the publish reported success. So the value comes from what the build
+ *  actually stamped (`subgame.json.engineApi`), a flag may only agree with it, and it must equal the
+ *  SHELL project's own `ota.engineApi`, the value that shell's builds declare they run.
+ *
+ *   - `stamped`: `subgame.json`'s `engineApi` as parsed (any value).
+ *   - `requested`: the `--engine-api` flag as a number, or `undefined` when it was omitted.
+ *   - `shellEngineApi`: the shell project's `ota.engineApi`, with an absent key already resolved to
+ *     {@link OTA_DEFAULT_ENGINE_API}.
+ *
+ *  Returns `{ engineApi }` when publishable, else `{ refusal }`. Pure. */
+export function otaSubgameEngineApi({ stamped, requested, shellEngineApi }) {
+  if (!Number.isInteger(stamped) || stamped < 1) return { refusal: 'stamped-invalid' };
+  if (requested !== undefined && requested !== stamped) return { refusal: 'flag-mismatch' };
+  if (stamped !== shellEngineApi) return { refusal: 'shell-mismatch' };
+  return { engineApi: stamped };
+}
+
+/** The engine-API value `project.config.json`'s `ota.engineApi` resolves to when the key is ABSENT.
+ *  MUST equal `DEFAULT_PROJECT_CONFIG.ota.engineApi` — the same deliberate second authored copy as
+ *  {@link OTA_DEFAULT_BUNDLE_NAME} below, for the same reason, pinned by the same test file. */
+export const OTA_DEFAULT_ENGINE_API = 1;
+
 /** The bundle name `project.config.json`'s `ota.bundleName` resolves to when the key is
  *  ABSENT from the raw file. MUST equal `DEFAULT_PROJECT_CONFIG.ota.bundleName` in
  *  `engine/project-config.ts` — a `.mjs` script cannot import that TS module, so this is a

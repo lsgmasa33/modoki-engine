@@ -119,8 +119,10 @@ describe('scene content budgets (demos/)', () => {
   // A checkout without demos (the OSS snapshot ships them, but a stripped one need not) legitimately
   // has nothing to check. A checkout WITH projects that matched no budget is a broken guard wearing
   // a green tick — the same "always false predicate" failure `repoLayout.ts` exists to prevent.
-  it('checks at least one scene when this checkout has projects at all', () => {
-    if (!hasAnyProject()) return;
+  // A SKIP where there are no projects, not a bare `return` — which reported PASS for a check that
+  // never ran (#1071; the ledger now fails on that shape).
+  it('checks at least one scene when this checkout has projects at all', (ctx) => {
+    if (!hasAnyProject()) { ctx.skip(); return; }
     expect(entries.length).toBeGreaterThan(0);
   });
 

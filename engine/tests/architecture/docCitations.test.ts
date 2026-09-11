@@ -43,7 +43,7 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { repoFiles as repoCorpusFiles } from '../../scripts/repoCorpus.mjs';
-import { hasInternalGames } from '../helpers/repoLayout';
+import { hasInternalGames, hasPrivateDocs } from '../helpers/repoLayout';
 import {
   citesALine,
   citesALineByMarker,
@@ -245,7 +245,7 @@ function docRootsFor(relFile: string): string[] {
   return m ? [...DOC_ROOTS, m[1]] : DOC_ROOTS;
 }
 
-/** True only where the FULL `docs/` tree is present.
+/*  The PRIVATE-DOCS gate: `hasPrivateDocs()` from helpers/repoLayout.
  *
  *  The OSS snapshot trims docs as well as games: `docs/plans/`, `docs/reviews/` and the private
  *  top-level docs are all dropped by publish-engine-oss.sh, whose `grep -vE` chain is the
@@ -257,11 +257,11 @@ function docRootsFor(relFile: string): string[] {
  *
  *  Gated on the docs tree rather than on project presence deliberately. Both happen to be false in
  *  the snapshot, but "are the private docs here" is what this rule actually depends on, and the
- *  repoLayout helpers warn in as many words against gating on a proxy that merely correlates. */
-function hasFullDocsTree(): boolean {
-  return fs.existsSync(path.join(repoRoot, 'docs/todo.md'))
-    && fs.existsSync(path.join(repoRoot, 'docs/plans'));
-}
+ *  repoLayout helpers warn in as many words against gating on a proxy that merely correlates.
+ *
+ *  This file used to roll its own `hasPrivateDocs()` for it — an `existsSync` of `docs/todo.md` and
+ *  `docs/plans` — which the layout ledger could not see, because the probe sat inside a function
+ *  (#1071). */
 
 /** Every markdown link target on `line` that names a `.md` file the filesystem can answer for.
  *
@@ -620,7 +620,7 @@ describe('cited doc paths resolve (#194)', () => {
   });
 
   it('every docs/**.md path mentioned anywhere in the repo exists', (ctx) => {
-    if (!hasFullDocsTree()) {
+    if (!hasPrivateDocs()) {
       ctx.skip();
       return;
     }
@@ -790,7 +790,7 @@ describe('cited doc paths resolve (#194)', () => {
     // docs/plans/ is stripped from the OSS snapshot, so docs/plans/profiler.md — the live file
     // that makes `profiler.md` ambiguous — is absent there, and this pin would fail for a reason
     // that has nothing to do with citations.
-    if (!hasFullDocsTree()) {
+    if (!hasPrivateDocs()) {
       ctx.skip();
       return;
     }
@@ -835,7 +835,7 @@ describe('cited doc paths resolve (#194)', () => {
     // this file are for: if "the enumeration found the repo" above and the `bareNameMentions`
     // synthetic-fixture test are both green, the matcher and the enumeration are proven alive, and
     // a zero here is the healthy case — not a regression to chase.
-    if (!hasFullDocsTree() || !hasInternalGames()) {
+    if (!hasPrivateDocs() || !hasInternalGames()) {
       ctx.skip();
       return;
     }
@@ -884,7 +884,7 @@ describe('cited doc paths resolve (#194)', () => {
     // grep list in a shell script, in another language, that nobody here would think to check
     // before editing. (The first draft omitted this and its commit message claimed otherwise; the
     // staged-snapshot check could not tell, because the snapshot fails both predicates at once.)
-    if (!hasFullDocsTree() || !hasInternalGames()) {
+    if (!hasPrivateDocs() || !hasInternalGames()) {
       ctx.skip();
       return;
     }
@@ -942,7 +942,7 @@ describe('cited doc paths resolve (#194)', () => {
     // of file; distinguishing a NEW prose pointer from an old one in an already-citing file would
     // still mean guessing at prose, which is the approach measured and rejected in that rule's
     // comment.
-    if (!hasFullDocsTree() || !hasInternalGames()) {
+    if (!hasPrivateDocs() || !hasInternalGames()) {
       ctx.skip();
       return;
     }
@@ -1028,7 +1028,7 @@ describe('cited doc paths resolve (#194)', () => {
     // "three rounds of review on this file have now found a stale one" on the citedBy test above):
     // running `scanBareNameCitations()` is how you get the current number, not reading one here —
     // this very paragraph used to quote one, and it was stale on arrival.
-    if (!hasFullDocsTree() || !hasInternalGames()) {
+    if (!hasPrivateDocs() || !hasInternalGames()) {
       ctx.skip();
       return;
     }
@@ -1108,10 +1108,10 @@ describe('cited doc paths resolve (#194)', () => {
     // docs/todo.md, docs/engine-oss-publishing.md) — all trimmed from the public OSS snapshot by
     // publish-engine-oss.sh, same as the OTHER GATED test in this block (the one above this reads
     // only `e.cited`, asserting ABSENCE — which the snapshot satisfies just as well, gated or not).
-    // Gate on BOTH here: the targets span the private docs tree AND games/, and hasFullDocsTree()
+    // Gate on BOTH here: the targets span the private docs tree AND games/, and hasPrivateDocs()
     // alone would still fail on a snapshot-shaped checkout (no games/) while it happens to keep the
     // full docs/ tree.
-    if (!hasFullDocsTree() || !hasInternalGames()) {
+    if (!hasPrivateDocs() || !hasInternalGames()) {
       ctx.skip();
       return;
     }
@@ -1341,18 +1341,19 @@ describe('docs cite by SYMBOL, never by line number (#686)', () => {
     // Collection, not assertion. A perfect assertion over an empty collection is green and
     // worthless, and `featureDocs` reads ONE directory by name.
     //
-    // ⚠️ This used to gate on `hasFullDocsTree()`, which requires `docs/plans` — a directory the
-    // OSS snapshot deliberately EXCLUDES. So on the public runner both of these tests returned
-    // early and passed vacuously, over exactly the durable docs that DO ship there. Gate on what
-    // the rule actually needs: some docs to read.
+    // ⚠️ This used to gate on a private-docs probe (`docs/plans` — a directory the OSS snapshot
+    // deliberately EXCLUDES). So on the public runner both of these tests returned early and
+    // passed vacuously, over exactly the durable docs that DO ship there. Gate on what the rule
+    // actually needs: some docs to read.
     expect(featureDocs().length).toBeGreaterThan(0);
     // The full private tree carries far more; only a broken collection trips this.
-    if (hasFullDocsTree()) expect(featureDocs().length).toBeGreaterThan(20);
+    if (hasPrivateDocs()) expect(featureDocs().length).toBeGreaterThan(20);
   });
 
   it('no doc cites a source location by line', () => {
     const docs = featureDocs();
-    if (docs.length === 0) return; // no docs shipped in this tree at all
+    // Asserted, not returned on (#1071): a bare return here reported PASS over no docs at all.
+    expect(docs.length, 'no feature docs found — the enumeration broke').toBeGreaterThan(0);
     const offenders: string[] = [];
     const allowed = (
       list: ReadonlyArray<{ file: string; token: string }>,
@@ -1595,8 +1596,10 @@ function isKnownDangling(citedDocRel: string, rawTitle: string): boolean {
 }
 
 describe('cited doc SECTION TITLES resolve (#328)', () => {
-  it('every `<doc>.md § "Title"` names a heading that doc defines', () => {
-    if (!hasFullDocsTree()) return; // OSS snapshot trims docs/plans + games.
+  // A SKIP, not the bare `return` these three used to have (#1071): a return reports PASS for a
+  // check that never ran, and a skip is at least counted.
+  it('every `<doc>.md § "Title"` names a heading that doc defines', (ctx) => {
+    if (!hasPrivateDocs()) { ctx.skip(); return; } // OSS snapshot trims docs/plans + games.
 
     const offenders: string[] = [];
     let checked = 0;
@@ -1635,8 +1638,8 @@ describe('cited doc SECTION TITLES resolve (#328)', () => {
     ).toEqual([]);
   });
 
-  it('every KNOWN_DANGLING_TITLES entry still dangles — fixed ones must be removed', () => {
-    if (!hasFullDocsTree()) return;
+  it('every KNOWN_DANGLING_TITLES entry still dangles — fixed ones must be removed', (ctx) => {
+    if (!hasPrivateDocs()) { ctx.skip(); return; }
     const stale: string[] = [];
     for (const e of KNOWN_DANGLING_TITLES) {
       const abs = path.join(repoRoot, e.doc);
@@ -1651,8 +1654,8 @@ describe('cited doc SECTION TITLES resolve (#328)', () => {
 });
 
 describe('cited doc SECTIONS resolve', () => {
-  it('every `<doc>.md § N` names a heading that doc defines', () => {
-    if (!hasFullDocsTree()) return; // OSS snapshot trims docs/plans + games; nothing to check.
+  it('every `<doc>.md § N` names a heading that doc defines', (ctx) => {
+    if (!hasPrivateDocs()) { ctx.skip(); return; } // OSS snapshot trims docs/plans + games.
 
     const offenders: string[] = [];
     let checked = 0;

@@ -8,6 +8,8 @@
  *  to 0.1, `px` results round to whole pixels and clamp resizes at 0 — matching the
  *  original inline behavior byte-for-byte. */
 
+import { VIEWPORT_UNIT_AXIS, isViewportLengthUnit } from '../../runtime/traits/uiLength';
+
 export interface Size { width: number; height: number }
 export interface Rect { left: number; top: number; width: number; height: number }
 export interface BoxEdges { left: number; right: number; top: number; bottom: number }
@@ -214,9 +216,8 @@ export interface MoveAnchorStart {
 
 const round1 = (n: number) => Math.round(n * 10) / 10;
 
-const VIEWPORT_UNITS = ['vw', 'vh', 'vmin', 'vmax'];
 /** px-based units (no parent/viewport conversion). */
-const isPxUnit = (unit: string) => unit !== '%' && !VIEWPORT_UNITS.includes(unit);
+const isPxUnit = (unit: string) => unit !== '%' && !isViewportLengthUnit(unit);
 /** Round a drag result in its unit: whole px, else 0.1 (matches the original %-path). */
 const roundU = (v: number, unit: string) => (isPxUnit(unit) ? Math.round(v) : round1(v));
 
@@ -240,13 +241,10 @@ function deltaToUnit(delta: number, unit: string, parentAxis: number, viewport: 
   if (unit === '%') return parentAxis > 0 ? (delta / parentAxis) * 100 : 0;
   const layoutDelta = ancestorScale > 0 ? delta / ancestorScale : delta;
   const pct = (total: number) => (total > 0 ? (layoutDelta / total) * 100 : 0);
-  switch (unit) {
-    case 'vw':   return pct(viewport.width);
-    case 'vh':   return pct(viewport.height);
-    case 'vmin': return pct(Math.min(viewport.width, viewport.height));
-    case 'vmax': return pct(Math.max(viewport.width, viewport.height));
-    default:     return layoutDelta; // px
-  }
+  // The same table `resolveLengthPx` resolves forward through (#1064), so the drag inverse cannot
+  // disagree with the layout about what a unit is a percentage of.
+  if (isViewportLengthUnit(unit)) return pct(VIEWPORT_UNIT_AXIS[unit](viewport.width, viewport.height));
+  return layoutDelta; // px
 }
 
 const NO_VIEWPORT: Size = { width: 0, height: 0 };

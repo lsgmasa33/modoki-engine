@@ -131,7 +131,10 @@ describe.skipIf(!hasGames)('committed scenes stay in the current serializer shap
   // every project created from that day on back onto the legacy shape.
   it('the scaffolder template is canonical (it seeds every new project)', () => {
     const tpl = path.join(REPO, 'engine/templates/starter/runtime/assets/scenes/main.scene.json');
-    if (!fs.existsSync(tpl)) return; // template moved — the scan test above still covers scenes
+    // An assertion, not the early return it replaced (#1071): the template is TRACKED and ships in
+    // every checkout, so its absence is a move — and the scan above only reads the template dir
+    // when it exists, so "the scan still covers scenes" did not cover this one.
+    expect(fs.existsSync(tpl), 'engine/templates/starter moved — repoint this guard').toBe(true);
     expect(legacyMarkers(tpl), 'engine/templates/starter is stamped with the current scene '
       + 'version but holds pre-v12 content, so every scaffolded project starts life needing a '
       + 're-save. Regenerate it by scaffolding a throwaway project, re-saving it through the '

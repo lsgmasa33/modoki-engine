@@ -22,8 +22,9 @@
  *  fixture would need its own scene + `UIEntries` view + prefab file just to reconstruct what
  *  already exists here. `games/court` is a private, never-published game (root CLAUDE.md), so it
  *  is absent only from the public OSS snapshot's CI (`games/` is not part of that snapshot) —
- *  this whole spec is a clean skip there, guarded by an on-disk existence check rather than
- *  `pickHostProject()` (which only proves *some* project exists, not this specific pairing).
+ *  this whole spec is a clean skip there, gated on `hasInternalGames()` rather than
+ *  `pickHostProject()` (which only proves *some* project exists), with the specific pairing then
+ *  ASSERTED inside each test.
  *
  *  The negative case reuses `level-tile.prefab.json` (`LevelTile`) — NOT a prefab with zero
  *  references, but one referenced a DIFFERENT way: `LevelPage`'s own `Tile0`..`Tile15` rows spawn
@@ -51,18 +52,25 @@ const NON_ENTRY_PREFAB_ROOT_NAME = 'LevelTile'; // level-tile.prefab.json's own 
 // has no `games/`.
 //
 // So the presence question goes through the sanctioned predicate (`hasInternalGames()`), and the
-// FIXTURE question is a plain path probe off `REPO_ROOT` — `existsSync` returns false rather than
-// throwing, so the worst case here is a skip. Both are needed and they ask different things:
-// `hasInternalGames()` says this checkout ships `games/` at all, the probes say THIS pairing is
-// still where the spec thinks it is (a renamed prefab should skip loudly, not fail deep inside a
-// double-click).
+// FIXTURE question is asked separately. Both are needed and they ask different things:
+// `hasInternalGames()` says this checkout ships `games/` at all, the fixture check says THIS
+// pairing is still where the spec thinks it is.
+//
+// ⚠️ The fixture check is an ASSERTION at the top of each test, not part of the skip (#1071). It
+// used to be `hasInternalGames() && existsSync(…)` in the skip, on the reasoning that "a renamed
+// prefab should skip loudly" — but no runner reads skip counts, so a rename skipped this spec in
+// every private clone and read as green. An assertion still fails before the double-click, with
+// the prefab's name in the message, which keeps the part of that reasoning that was right. It is
+// NOT a module-scope `expect`: that would throw at collection and take every other spec down.
 const courtPrefab = (file: string) =>
   path.join(REPO_ROOT, 'games', 'court', 'runtime', 'assets', 'prefabs', file);
-const HAS_FIXTURES = hasInternalGames()
-  && fs.existsSync(courtPrefab('level-page.prefab.json'))
-  && fs.existsSync(courtPrefab('level-tile.prefab.json'));
+const expectFixtures = () => {
+  for (const file of ['level-page.prefab.json', 'level-tile.prefab.json']) {
+    expect(fs.existsSync(courtPrefab(file)), `games/court/…/prefabs/${file} is gone — this spec reuses it`).toBe(true);
+  }
+};
 
-test.skip(!HAS_FIXTURES, 'editor-prefab-entry-note: this snapshot ships no games/court (its LevelScroll → level-page.prefab.json pairing) to reuse');
+test.skip(!hasInternalGames(), 'editor-prefab-entry-note: this snapshot ships no games/court (its LevelScroll → level-page.prefab.json pairing) to reuse');
 
 /** Category groups collapse by default, so seed the expanded set to get rows. Mirrors
  *  `gotoEditorWithAssets` in editor-assets.spec.ts / editor-find-references.spec.ts.
@@ -110,6 +118,7 @@ async function openPrefabAndWaitForRoot(page: Page, assetUrl: string, rootName: 
 }
 
 test('double-clicking an entry prefab and selecting its root shows the entry-prefab note (#671)', async ({ page }) => {
+  expectFixtures();
   await gotoEditorWithAssets(page);
   const root = await openPrefabAndWaitForRoot(page, ENTRY_PREFAB_URL, ENTRY_PREFAB_ROOT_NAME);
   await root.click(); // select it — the note's useEffect gates on singleSelectedId
@@ -125,6 +134,7 @@ test('double-clicking an entry prefab and selecting its root shows the entry-pre
 });
 
 test('a prefab referenced elsewhere but NOT as an entry kind shows no note (#671)', async ({ page }) => {
+  expectFixtures();
   await gotoEditorWithAssets(page);
   const root = await openPrefabAndWaitForRoot(page, NON_ENTRY_PREFAB_URL, NON_ENTRY_PREFAB_ROOT_NAME);
 

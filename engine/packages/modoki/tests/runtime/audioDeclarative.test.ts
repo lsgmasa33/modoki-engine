@@ -121,6 +121,13 @@ describe('built-in audio.* actions', () => {
     expect(e.get(AudioSource)!.playing).toBe(true);
   });
 
+  it('audio.setClip with an EMPTY `clip` takes the event value (#1075)', () => {
+    const clip = mintClip();
+    const e = world!.spawn(AudioSource({ clip: '', playing: false }), EntityAttributes({ guid: newGuid() }));
+    dispatchUIAction('audio.setClip', { target: e, params: { clip: '' }, payload: clip });
+    expect(e.get(AudioSource)!.clip).toBe(clip);
+  });
+
   it('audio.setClip resolves a bank KEY → ref on the target', () => {
     const groove = mintClip(), prefunk = mintClip();
     const e = world!.spawn(
@@ -161,6 +168,12 @@ describe('built-in audio.* actions', () => {
     expect(e.get(AudioSource)!.crossfadeSec).toBe(1.2);
     dispatchUIAction('audio.toggleCrossfade', { target: e, params: { seconds: 1.2 } });
     expect(e.get(AudioSource)!.crossfadeSec).toBe(0);
+  });
+
+  it('audio.setBusVolume with an EMPTY `value` takes the slider payload (#1075)', () => {
+    // 25, not a value an earlier test in this file leaves in the (global) mixer store.
+    dispatchUIAction('audio.setBusVolume', { params: { bus: 'music', value: '' }, payload: 25 });
+    expect(useAudioMixStore.getState().audioMusic).toBe(25);
   });
 
   it('audio.setBusVolume updates the mixer store + logs the bus change', () => {

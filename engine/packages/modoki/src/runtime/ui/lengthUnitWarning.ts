@@ -37,9 +37,10 @@
  *  heuristic to catch the common mistake, not a proof of one; it only ever runs in
  *  DEV. */
 
-import { readUILength } from '../traits/uiLength';
+import { readUILength, UI_LENGTH_UNITS } from '../traits/uiLength';
 
-export const RELATIVE_LENGTH_UNITS = new Set(['%', 'vw', 'vh', 'vmin', 'vmax']);
+/** Every unit that is not a fixed px — derived from the one list rather than restated (#1064). */
+export const RELATIVE_LENGTH_UNITS: ReadonlySet<string> = new Set(UI_LENGTH_UNITS.filter((u) => u !== 'px'));
 
 /** A min/max px value at or below this is "small enough to plausibly be a stray
  *  percentage/vh/vmin number" rather than an intentional pixel constraint. */

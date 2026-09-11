@@ -13,4 +13,14 @@ export function otaBundleDistKindRefusal(o: {
   distIsSubgameModule: boolean;
 }): 'subgame-name-with-shell-dist' | 'shell-name-with-subgame-dist' | null;
 
+export function otaSubgameEngineApi(o: {
+  stamped: unknown;
+  requested: number | undefined;
+  shellEngineApi: unknown;
+}):
+  | { engineApi: number; refusal?: undefined }
+  | { refusal: 'stamped-invalid' | 'flag-mismatch' | 'shell-mismatch'; engineApi?: undefined };
+
+export const OTA_DEFAULT_ENGINE_API: number;
+
 export const OTA_DEFAULT_BUNDLE_NAME: string;

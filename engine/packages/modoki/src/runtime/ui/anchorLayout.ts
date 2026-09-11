@@ -3,6 +3,7 @@
  *  UIAnchor positions to pixel coordinates within a viewport. */
 
 import type { AnchorMode } from '../traits/UIAnchor';
+import { VIEWPORT_UNIT_AXIS, isViewportLengthUnit } from '../traits/uiLength';
 
 /** Which anchor modes pin BOTH edges of an axis. Load-bearing beyond pivot: on a
  *  stretched axis an offset INSETS its own edge (the box shrinks) rather than shifting
@@ -62,25 +63,20 @@ export const ZERO_INSETS: Readonly<SafeAreaPx> = Object.freeze({ top: 0, right: 
 /** Resolve a length (value + unit) to LOGICAL pixels. THE shared resolver for every
  *  pixel-space path (anchor offsets, Canvas2D sizing, SceneView).
  *   - `%`              → percent of `axisTotal` (the length's own axis)
- *   - `vw`/`vh`        → percent of the viewport width/height
- *   - `vmin`/`vmax`    → percent of the smaller/larger viewport axis
+ *   - a viewport unit  → percent of the viewport dimension `VIEWPORT_UNIT_AXIS` names for it
  *   - anything else    → treated as `px`
- *  vmin/vmax are computed from the LOGICAL device viewport (`vpW`/`vpH`) so they
- *  stay device-resolution-aware in both GameView and SceneView. Mirrors `cssVal`
- *  (UINode.tsx) and the anchor CSS emitter (anchorCss.ts) — keep all three in sync. */
+ *  Viewport units are computed from the LOGICAL device viewport (`vpW`/`vpH`) so they
+ *  stay device-resolution-aware in both GameView and SceneView. The CSS readers (`cssVal`,
+ *  anchorCss.ts) and the `--ui-*` publisher (UIRenderer.tsx) resolve through the same table, so
+ *  there is nothing here to keep in sync by hand (#1064). */
 export function resolveLengthPx(
   value: number, unit: string | undefined,
   axisTotal: number, vpW: number, vpH: number,
 ): number {
   if (!value) return 0;
-  switch (unit) {
-    case '%':    return axisTotal * value / 100;
-    case 'vw':   return vpW * value / 100;
-    case 'vh':   return vpH * value / 100;
-    case 'vmin': return Math.min(vpW, vpH) * value / 100;
-    case 'vmax': return Math.max(vpW, vpH) * value / 100;
-    default:     return value; // px
-  }
+  if (unit === '%') return axisTotal * value / 100;
+  if (isViewportLengthUnit(unit)) return VIEWPORT_UNIT_AXIS[unit](vpW, vpH) * value / 100;
+  return value; // px
 }
 
 /** Resolve a UIAnchor to a pixel rect within a viewport of size vpW×vpH.

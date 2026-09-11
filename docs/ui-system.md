@@ -42,7 +42,13 @@ Field groups (representative fields, verified against `UIElement.ts`):
   line read `'px' | '%'` until 2026-08-07, contradicting the viewport-units paragraph below and the
   type itself; a game had already written a three-way unit resolver that silently treated `vw` and
   `vmax` as `vmin`, which is wrong on any non-square host. **Resolve units through a map that is
-  total over the union, not a ternary chain with a fall-through.** Also:
+  total over the union, not a ternary chain with a fall-through.** The engine's own copies do
+  (#1064): the type is derived from the `UI_LENGTH_UNITS` tuple in `runtime/traits/uiLength.ts`, the
+  Inspector dropdown and every `registerTraits` unit enum spread that tuple, and every resolver —
+  `resolveLengthPx`, the editor's drag inverse, both CSS readers, and `UIRenderer`, which PUBLISHES
+  the `--ui-*` vars — reads `VIEWPORT_UNIT_AXIS`, a `Record` over the viewport units. A new unit
+  therefore fails to compile until it resolves, instead of depending on a comment that listed five
+  of the nine copies and left out the publisher. Also:
   `flexDirection`, `flexWrap`, `justifyContent`, `alignItems`, `gap` + `gapUnit`, `flexGrow`,
   `flexShrink`, per-edge `padding*`/`margin*` (each with its own `*Unit`),
   `minWidth`/`maxWidth`/`minHeight`/`maxHeight`, `alignSelf`, `zIndex`, `rotation` (see below),
@@ -550,6 +556,19 @@ number straight into a field with zero game code.
 **throws in dev** and warns in production, so typo'd action names surface immediately.
 (Bindings are inert unless the game is running — `applyBindings` early-returns when the
 sim is stopped, so editor Stopped/Paused states never mutate the scene.)
+
+⚠️ **A declared param that arrives as `''` reaches the handler as ABSENT** (#1075). `''` is what
+every authoring route sends for "nothing chosen" — the Inspector when "use event value" is unticked
+on a string or enum param, a cleared text field, an empty input's `$value`, `modoki_dispatch_action`
+— and `params.x ?? fallback` cannot see it, so thirteen reads across nine handlers kept the empty
+string and skipped their fallback (one froze time). `dispatchUIAction` and `dispatchGameAction` drop it once, for every
+route, in `normaliseParams` (`runtime/core/actionRegistry.ts`). Only params the action DECLARES are
+touched — an undeclared key, and the schema-less `params.payload` convention, pass through as
+authored — and a string param whose empty value genuinely means empty text declares
+`allowEmpty: true`. So: **declare what your handler reads.** A schema-less handler still gets `''`
+verbatim and must handle it itself. One behaviour this deliberately gives up: a string param can no
+longer be CLEARED to `''` by authoring an empty value unless it declares `allowEmpty` — no authored
+binding or marker in the repo did that when the rule landed.
 
 ⚠️ **A click only fires a node's bindings when the PRESS that produced it also started on that
 node** (`pressOrigin.ts`, #664). A DOM `click` fires on the nearest common ancestor of the

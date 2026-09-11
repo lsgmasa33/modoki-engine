@@ -84,6 +84,11 @@ export {
 export {
   installGlobalErrorHandlers, captureToCrashlytics, reportReactError, type CaptureKind,
 } from './core/globalErrors';
+// The plugin payload a game's CrashlyticsService must send, carrying each report's group (#1063).
+export {
+  crashlyticsGroup, crashlyticsExceptionOptions,
+  type CrashlyticsExceptionOptions, type CrashlyticsStackFrame,
+} from './core/crashlyticsGroup';
 // Deliberate NATIVE fault triggers (#278) — the half of the crash pipeline JS cannot reach.
 // The app shell installs the implementation over capacitor-game-debug; the engine only owns the seam.
 export {
@@ -169,6 +174,8 @@ export {
   type MeshAsset, type MaterialAsset, type SpriteClip, type BodyType2D, type ColliderShape2D, type JointType2D,
   type BodyType3D, type ColliderShape3D, type JointType3D,
 } from './traits';
+// The one list of UI length units (#1064) — `registerTraits` spreads it into every `*Unit` enum.
+export { UI_LENGTH_UNITS } from './traits/uiLength';
 // Particle schema + loader. The schema/types are pure (no THREE); the rendering backend
 // lives behind `@modoki/engine/runtime/rendering` so the top-level runtime entry stays
 // free of the `three/webgpu` import.

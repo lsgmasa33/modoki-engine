@@ -20,7 +20,6 @@
  *  never matches the registry's specifier-keyed `modules` map. */
 
 import type { Plugin } from 'vite';
-import path from 'node:path';
 import { findGamesEntry } from './findGamesEntry';
 import { SUBGAME_SHARED_KEYS } from '../app/sharedRegistryKeys';
 import { SUBGAME_MANIFEST_SCHEMA_VERSION } from '../packages/modoki/src/runtime/core/version';
@@ -32,8 +31,9 @@ const SHARED_KEY_SET = new Set(SUBGAME_SHARED_KEYS);
 
 export interface SubgameManifest {
   schema: 1;
-  /** Stamped from ENGINE_API_VERSION at build time — the shell checks this for
-   *  EXACT equality (never `>=`) before registering the game. */
+  /** Stamped at build time from the sub-game project's `ota.engineApi` (vite.config.ts), whose
+   *  default is pinned to ENGINE_API_VERSION — the shell checks this for EXACT equality (never
+   *  `>=`) against its own ENGINE_API_VERSION before registering the game. */
   engineApi: number;
   /** The SHARED ids this specific bundle actually imports — NOT the full
    *  SUBGAME_SHARED_KEYS list, so the shell's ensure() doesn't eager-load a
@@ -45,8 +45,9 @@ export interface SubgameManifest {
 export interface SubgameBuildOptions {
   /** The project root whose game.ts is being built as a sub-game bundle. */
   projectRoot: string;
-  /** Stamped into subgame.json — must equal ENGINE_API_VERSION (checked by the
-   *  caller; this plugin just carries the value through). */
+  /** Stamped into subgame.json and the module. vite.config.ts passes the sub-game project's
+   *  `ota.engineApi`; this plugin just carries the value through. A mismatch with the receiving
+   *  shell is refused by `ota-publish.mjs` at publish time (#837) and by the shell at load time. */
   engineApi: number;
 }
 
@@ -110,11 +111,6 @@ export function subgameBuildPlugin(opts: SubgameBuildOptions): Plugin {
 }
 
 export { SUBGAME_ENTRY_VIRTUAL_ID };
-export const SUBGAME_DIST_DIRNAME = 'subgame-dist';
-
-/** The output directory for a project's sub-game build — a THIRD build output next
- *  to `dist/` (normal web) and `ads/` (playable), so building a sub-game bundle never
- *  clobbers either. */
-export function subgameOutDir(projectRoot: string): string {
-  return path.join(projectRoot, SUBGAME_DIST_DIRNAME);
-}
+// Defined in a leaf module so the publish route can import it without this file's shared-key list
+// reaching the Electron main bundle — see subgameOutDir.ts.
+export { SUBGAME_DIST_DIRNAME, subgameOutDir } from './subgameOutDir';

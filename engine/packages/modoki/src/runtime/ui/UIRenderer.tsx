@@ -14,6 +14,7 @@ import { getCurrentWorld } from '../core/ecs/world';
 import { registerPointerBlocker } from '../core/pointerBlockers';
 import { installPressOriginTracking } from './pressOrigin';
 import { UI_ROOT_ATTR } from '../traits/TouchControl';
+import { VIEWPORT_LENGTH_UNITS, VIEWPORT_UNIT_AXIS, viewportUnitVar } from '../traits/uiLength';
 
 interface UIRendererProps {
   /** Store state object for binding resolution (typically from useGameStore) */
@@ -98,14 +99,12 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
       const w = el.clientWidth;
       const h = el.clientHeight;
       if (w > 0 && h > 0) {
-        const vw = w / 100;
-        const vh = h / 100;
-        setVpVars({
-          '--ui-vw': `${vw}px`,
-          '--ui-vh': `${vh}px`,
-          '--ui-vmin': `${Math.min(vw, vh)}px`,
-          '--ui-vmax': `${Math.max(vw, vh)}px`,
-        });
+        // One var per viewport unit, from the SAME table every resolver reads (#1064). A unit added
+        // there is published here by construction — the hand-written four this replaced were the
+        // one copy the old "update these files" comment forgot, and a reader of an unpublished var
+        // silently falls back to the browser's own `1vw`, a different number in the editor preview.
+        setVpVars(Object.fromEntries(VIEWPORT_LENGTH_UNITS.map((u) =>
+          [viewportUnitVar(u), `${VIEWPORT_UNIT_AXIS[u](w, h) / 100}px`])));
       }
       // Safe-area insets for GAME CODE (`runtime/ui/safeArea.ts`) — REGISTERED from here, so the
       // measurement happens inside THIS container's cascade and reads the editor preview's

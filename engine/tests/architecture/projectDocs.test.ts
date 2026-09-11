@@ -22,6 +22,7 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { hasPrivateDocs } from '../helpers/repoLayout';
 
 const repoRoot = path.resolve(__dirname, '../../..');
 const TEMPLATE = 'engine/templates/starter/CLAUDE.md';
@@ -269,11 +270,15 @@ describe('docs/projects.md enumerates every project (#195)', () => {
     // publish-engine-oss.sh reasons about repoLayoutGuard: "this content is absent" is what the
     // snapshot IS, so a rule about that content cannot self-gate there. It still runs on every
     // real clone, which is where the table is edited.
-    const rosterDoc = path.join(repoRoot, 'docs/projects.md');
-    if (!fs.existsSync(rosterDoc)) {
+    //
+    // Gated on `hasPrivateDocs()`, not on this doc's own existence (#1071): a predicate that reads
+    // a different excluded doc means a rename of projects.md lands as a RED read below instead of
+    // switching this guard off in every clone.
+    if (!hasPrivateDocs()) {
       ctx.skip();
       return;
     }
+    const rosterDoc = path.join(repoRoot, 'docs/projects.md');
     const roster = fs.readFileSync(rosterDoc, 'utf8');
     const linked = new Set<string>();
     // Paths are written relative to docs/, i.e. `../games/<id>/CLAUDE.md`.

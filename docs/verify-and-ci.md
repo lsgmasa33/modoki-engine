@@ -281,17 +281,64 @@ caught both defects above. A self-hosted Actions runner on the Windows box was c
 than the gap is worth. The honest position is that this stays **discipline-guarded, not gated** —
 the same acceptance #968 made, now with a price tag attached.
 
-What IS gated: `engine/tests/architecture/layoutConditionalTestLedger.test.ts` pins the **66
-test files whose execution is conditional on this checkout** — every one importing
-`helpers/repoLayout.ts`, plus any test gating a skip on a raw `existsSync` — and for each, the
-predicates its gates call **with their sense** (`!hasInternalGames` = skips when `games/` is absent;
-unsigned = the gate is inverted). Membership is the IMPORT, not a skip shape: review
-mutation-proved a shape-based detector blind to `describe.runIf(...)`, to an aliased
-`const present = fs.existsSync(...)`, to `if (!pred()) { ctx.skip(); }` (which `docCitations.test.ts`
-uses nine times), and to a `repoLayout.js` import specifier — `showRefsCorpus.test.ts` skips its
-whole suite on the snapshot and went unledgered for exactly that reason. The measurement lives in
-`engine/tests/helpers/layoutConditionalScan.ts`, imported by both the guard and the generator that
-writes the table, so the two cannot drift.
+What IS gated: `engine/tests/architecture/layoutConditionalTestLedger.test.ts` pins the **72
+test files whose execution is conditional on this checkout** — every `*.test.ts` and Playwright
+`*.spec.ts` importing `helpers/repoLayout.ts`, plus any test gating a skip on a raw filesystem
+probe — and for each, the predicates its gates call **with their sense** (`!hasInternalGames` =
+skips when `games/` is absent; unsigned = the gate is inverted). Membership is the IMPORT, not a
+skip shape: review mutation-proved a shape-based detector blind to `describe.runIf(...)`, to an
+aliased `const present = fs.existsSync(...)`, to `if (!pred()) { ctx.skip(); }` (the shape
+`docCitations.test.ts` uses throughout), and to a `repoLayout.js` import specifier —
+`showRefsCorpus.test.ts` skips its whole suite on the snapshot and went unledgered for exactly
+that reason. The measurement lives in `engine/tests/helpers/layoutConditionalScan.ts`, imported by
+both the guard and the generator that writes the table, so the two cannot drift.
+
+**The raw-probe half missed three spellings, and that was the rule's THIRD under-enforcement
+(#98 → #1054 → #1071).** It matched a literal `existsSync(` in a gate expression, so it could not
+see a probe wrapped in a same-file function (`docCitations`' own `hasFullDocsTree()`), a
+`readdirSync` in a `try`, a bare `if (!exists) return` that reports PASS for a check that never ran
+(four in `docCitations`, one each in four more files), or any Playwright spec. #1071 widened the
+detector to all of those — with the detector's own accept/reject cases in the ledger file,
+mutation-checked branch by branch — and routed every member through a `repoLayout.ts` predicate
+(`hasPrivateDocs()` and `hasAgentSettings()` are new). Two boundaries were drawn on purpose and
+are worth keeping:
+
+- **A probe is resolved by CALL, not by data flow.** Resolving every mention flagged Court's
+  `labels.length < 2` — a puzzle's region count, from a level that was read off disk. The question
+  is "does this condition ask whether a path is there", and a value derived from file content does
+  not.
+- **A presence gate on TRACKED content is not a layout question, so it becomes an assertion, not a
+  predicate.** `engine/packages/capacitor-*` and the starter template ship in the snapshot too, so
+  a gate on them could only ever fire on a move — and answered one by skipping every check and
+  reporting green.
+
+The same pass found the bare return's other half — a PREDICATE answered with `if (!hasAnyProject())
+return;` (`sceneContentBudgets.test.ts`) — and the ledger now fails on that shape too: a predicate
+is the right question, but only `ctx.skip()` makes the answer countable.
+
+The raw-probe allowlist is keyed per gate SITE — file, gate text and a count — not per file, so
+blessing one legitimate probe (a build artifact, a case-folding capability check, a file a sibling
+test already reports) cannot hide a second one added beside it, not even a copy-pasted identical
+one.
+
+**What the scan deliberately does not reach**, so nobody reads its silence as coverage:
+
+- **Same-file only.** A probe inside an imported helper is invisible — `e2e/hostProject.ts`'s
+  `pickHostProject()` (`discoverProjects(process.cwd())`, gating six specs) is the live example,
+  sanctioned by `projectPresencePredicate.test.ts`.
+- **One call hop.** `const x = helper()` counts when `helper` itself probes, not when it calls
+  something that does. Following calls to a fixpoint turned every variable holding a log's TEXT in
+  `fileLogWarnings.test.ts` into a "probe": the further a value is from its `existsSync`, the more
+  likely it is content rather than presence.
+- **JSX.** The literal blanker is a heuristic, and a closing tag's `/` or an apostrophe in JSX text
+  can make it drop a closing bracket, which shifts nesting for the rest of a `.tsx` file and can
+  hide a gate below it. No `.tsx` test probes the filesystem or imports `repoLayout` today; a real
+  tokenizer measured ~10 s over the corpus against the scan's ~0.2 s, so it is a stated limit.
+
+The scan reads literal-blanked source (string, template and regex contents replaced by spaces,
+positions kept). #1071's close-out found a bracket inside a string making one declaration's
+"initializer" run on for ~200 lines in three real test files, which is what blanking fixed; an
+earlier version of this paragraph called that a harmless limit because no verdict had changed yet.
 
 It closes the silence, not the coverage.
 

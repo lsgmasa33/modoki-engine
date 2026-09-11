@@ -15,8 +15,11 @@ import { loadProjectConfig, loadProjectUserConfig, validateBuildConfig, projectC
 import { stripPrivateBuildFields } from '../project-config';
 import { resolveModules } from './detect-modules';
 import { findGamesEntry } from './findGamesEntry';
+// The leaf module, not './subgameBuild': that file's shared-key list would reach the Electron main bundle (#1035).
+import { subgameOutDir } from './subgameOutDir';
+import { samePath } from '../scripts/pathIdentity.mjs';
 import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './backend/gcloud';
-import { projectAssetRoots } from '../scripts/projectRoots.mjs';
+import { projectAssetRoots, discoverProjects, PROJECT_ROOT_DIRS } from '../scripts/projectRoots.mjs';
 import { describeUnreadablePackageJsonWarning } from '../scripts/staleNodeModulesWarning.mjs';
 import { listAndroidDevices, resolveBuildAndroidSerial } from './backend/androidDevices';
 // Through the typed shell, not the .mjs directly: TypeScript consumers all enter the claim store
@@ -632,13 +635,141 @@ export function planIosInstall(o: { iosDeviceId: string; iosDevicectlId: string;
   return { ok: true, mode: o.goIos ? 'go-ios' : 'xcode-handoff' };
 }
 
-/** /api/ota/publish only ever builds+publishes the CURRENTLY OPEN project as ITSELF — see
- *  the route's own comment and ota-updates.md's Gotchas for why an override to a different
- *  bundleName used to be a silent publish-corruption risk (it would ship this project's
- *  plain shell dist/ under a DIFFERENT bundle's identity). Pure — extracted so this
- *  invariant is unit-testable without a live editor/gcloud. */
-export function otaPublishBundleNameAllowed(requestedBundleName: string, projectOtaBundleName: string): boolean {
-  return requestedBundleName === projectOtaBundleName;
+/** What `/api/ota/publish` builds for a requested bundle name, or null when it must refuse (#837).
+ *
+ *  The route builds exactly two kinds of thing, and the bundle NAME picks between them:
+ *   - the open project's own `ota.bundleName` → a shell build (`build-web.mjs`) of THIS project;
+ *   - an id listed in `ota.subgames` → a sub-game module build (`build-subgame.mjs`) of THAT
+ *     project, published into this project's bucket under its id.
+ *  Anything else is refused. That refusal is the job the equality-only `otaPublishBundleNameAllowed`
+ *  did before this: an arbitrary name used to ship this project's plain shell dist under another
+ *  bundle's identity (ota-updates.md § Gotchas). A name that is BOTH the shell's and a listed
+ *  sub-game's is refused too, since it cannot say which build it means. Pure. */
+export type OtaPublishTarget = { kind: 'shell' } | { kind: 'subgame'; id: string };
+
+export function otaPublishTarget(
+  requestedBundleName: string,
+  ota: { bundleName: string; subgames: readonly string[] },
+): OtaPublishTarget | null {
+  const isShell = requestedBundleName === ota.bundleName;
+  const isSubgame = ota.subgames.includes(requestedBundleName);
+  if (isShell && isSubgame) return null;
+  if (isShell) return { kind: 'shell' };
+  if (isSubgame) return { kind: 'subgame', id: requestedBundleName };
+  return null;
+}
+
+type OtaSubgameDirResult =
+  | { ok: true; dir: string }
+  | { ok: false; reason: 'not-found' | 'no-game-entry' | 'ambiguous' | 'shell-itself'; error: string };
+
+/** Resolve a listed sub-game id to its project folder among ONE set of projects (#837). By folder
+ *  name, never a path: a game must stay self-contained. Only folders with a game entry are
+ *  candidates, so a plain folder that shares the name can neither be picked nor make the id look
+ *  ambiguous. Refuses the shell project itself. Pure over its inputs; `reason` lets
+ *  {@link otaResolveSubgameDir} move on to its next set after a miss. */
+export function otaSubgameProjectDir(
+  id: string,
+  projects: readonly { name: string; dir: string }[],
+  shellProjectRoot: string,
+  hasGameEntry: (dir: string) => boolean,
+): OtaSubgameDirResult {
+  const named = projects.filter((p) => p.name === id);
+  if (named.some((p) => samePath(p.dir, shellProjectRoot))) {
+    return { ok: false, reason: 'shell-itself', error: `ota.subgames lists "${id}", which is this shell project itself. A project publishes itself under its own ota.bundleName.` };
+  }
+  if (named.length === 0) {
+    return { ok: false, reason: 'not-found', error: `ota.subgames lists "${id}", but no project of that name exists next to this shell project, or under ${PROJECT_ROOT_DIRS.map((r) => `${r}/`).join(' or ')} of this repo. A sub-game is named by its project folder name.` };
+  }
+  const games = named.filter((p) => hasGameEntry(p.dir));
+  if (games.length === 0) {
+    return { ok: false, reason: 'no-game-entry', error: `ota.subgames lists "${id}", but ${named.map((p) => p.dir).join(', ')} has no game.ts or game.tsx for build-subgame.mjs to build.` };
+  }
+  if (games.length > 1) {
+    return { ok: false, reason: 'ambiguous', error: `ota.subgames lists "${id}", which names ${games.length} projects (${games.map((h) => h.dir).join(', ')}). Rename one so the id is unambiguous.` };
+  }
+  return { ok: true, dir: games[0].dir };
+}
+
+/** Resolve a listed sub-game id for the publish route (#837), searching TWO places in order:
+ *   1. **the folder of that name NEXT TO the shell project** — a shell and its sub-games travel
+ *      together, and this is the only place a packaged editor (its root is `app.asar.unpacked`,
+ *      which ships no `games/`) or a project outside the repo can find one;
+ *   2. **the `games/` and `demos/` projects under the editor's root** — a `demos/` sub-game of a
+ *      `games/` shell.
+ *  The first place holding a matching GAME wins, so the shell's own neighbour beats a same-named
+ *  project in whichever clone the editor runs from. A real refusal (the shell itself, two games of
+ *  one name in one place) stops the search. Step 1 reads the parent's names ONCE and accepts only an
+ *  EXACT match — the parent may be a home directory, so there is no per-entry work, and `statSync`
+ *  alone ignores case on macOS and Windows (`Mini` would resolve to `mini` there, not on Linux). The
+ *  same exact match is what keeps an id inside the parent: a listed name never contains a separator
+ *  and is never `.` or `..`, so no separate guard is needed (a second one could not be tested). */
+export function otaResolveSubgameDir(
+  id: string,
+  editorRoot: string,
+  shellProjectRoot: string,
+  hasGameEntry: (dir: string) => boolean,
+): OtaSubgameDirResult {
+  const siblings: { name: string; dir: string }[] = [];
+  const parent = path.dirname(shellProjectRoot);
+  try {
+    if (fs.readdirSync(parent).includes(id)) {
+      const dir = path.join(parent, id);
+      if (fs.statSync(dir).isDirectory()) siblings.push({ name: id, dir });
+    }
+  } catch { /* nothing of that name beside the shell */ }
+  let miss: OtaSubgameDirResult | undefined;
+  for (const projects of [siblings, discoverProjects(editorRoot)]) {
+    const r = otaSubgameProjectDir(id, projects, shellProjectRoot, hasGameEntry);
+    if (r.ok || (r.reason !== 'not-found' && r.reason !== 'no-game-entry')) return r;
+    // Keep the more specific miss: "a folder exists but is not a game" beats "nothing there".
+    if (!miss || (!miss.ok && miss.reason === 'not-found')) miss = r;
+  }
+  return miss as OtaSubgameDirResult;
+}
+
+/** The build and publish commands `/api/ota/publish` runs for one target (#837). Pure, so which
+ *  script builds which folder, and which dist is uploaded under which name, is unit-testable without
+ *  spawning a build or touching gcloud.
+ *
+ *  ⚠️ **A sub-game's publish passes NO `--engine-api`.** `ota-publish.mjs` reads the value its build
+ *  stamped into `subgame.json`, the number a device actually compares. Passing the shell's value here
+ *  would reintroduce the flag-versus-module disagreement that check exists to refuse. */
+export function otaPublishSteps(o: {
+  target: OtaPublishTarget;
+  projectRoot: string;
+  subgameDir?: string;
+  gcloudEnv: NodeJS.ProcessEnv;
+  buildCwd: string;
+  bucket: string;
+  bundleName: string;
+  version: string;
+  keyName: string;
+  shellEngineApi: number;
+  mandatory: boolean | undefined;
+}): { buildLabel: string; buildCmd: string; buildEnv: NodeJS.ProcessEnv; distDir: string; publishCmd: string } {
+  const mandatoryFlag = o.mandatory === true ? ' --mandatory' : o.mandatory === false ? ' --no-mandatory' : '';
+  const tail = `--bucket ${JSON.stringify(o.bucket)} --name ${JSON.stringify(o.bundleName)} --version ${JSON.stringify(o.version)} ` +
+    `--key ${JSON.stringify(o.keyName)} --repo-root ${JSON.stringify(o.buildCwd)} --project ${JSON.stringify(o.projectRoot)}${mandatoryFlag}`;
+  if (o.target.kind === 'subgame') {
+    if (!o.subgameDir) throw new Error('otaPublishSteps: a sub-game target needs its resolved project dir');
+    const distDir = subgameOutDir(o.subgameDir);
+    return {
+      buildLabel: `Building sub-game ${o.target.id}...`,
+      buildCmd: 'node engine/scripts/build-subgame.mjs',
+      buildEnv: { ...o.gcloudEnv, MODOKI_PROJECT: o.subgameDir },
+      distDir,
+      publishCmd: `node engine/scripts/ota-publish.mjs --dist ${JSON.stringify(distDir)} ${tail}`,
+    };
+  }
+  const distDir = path.join(o.projectRoot, 'dist');
+  return {
+    buildLabel: 'Building web assets...',
+    buildCmd: 'node engine/scripts/build-web.mjs --target native',
+    buildEnv: otaPublishBuildStepEnv(o.gcloudEnv, o.projectRoot),
+    distDir,
+    publishCmd: `node engine/scripts/ota-publish.mjs --dist ${JSON.stringify(distDir)} --engine-api ${o.shellEngineApi} ${tail}`,
+  };
 }
 
 // otaSigningKeyRefusal moved to engine/scripts/ota/publishGuards.mjs (#582) — it now runs in
@@ -3344,20 +3475,17 @@ export function assetScannerPlugin(): Plugin {
             res.end(JSON.stringify({ error: `bundleName/key must match ${OTA_SAFE_TOKEN}` }));
             return;
           }
-          // This route only ever builds via build-web.mjs (a normal standalone web build)
-          // and publishes the CURRENTLY OPEN project's own dist/ — never build-subgame.mjs's
-          // special sub-game-module format (subgame.json + globalThis.__MODOKI_SUBGAME__
-          // IIFE) that subgameLoader.ts actually expects to fetch. Overriding `bundleName`
-          // to anything other than this project's own configured name would silently
-          // publish this project's plain shell dist/ under a DIFFERENT bundle's identity —
-          // e.g. a sub-game's manifest/files overwritten with unrelated shell content, with
-          // no error until every device that loads it fails belt-and-suspenders check #2 (or
-          // worse, doesn't). Automated sub-game build+publish isn't wired into this route yet
-          // (docs/ota-subgame-modules.md) — refuse rather than proceed with the wrong
-          // bytes under someone else's name.
-          if (!otaPublishBundleNameAllowed(bundleName, cfg.ota.bundleName)) {
+          // What gets built is decided by the bundle NAME (#837). This project's own ota.bundleName
+          // builds this project as itself (build-web.mjs); an id listed in ota.subgames builds THAT
+          // project as a sub-game module (build-subgame.mjs, the subgame.json +
+          // globalThis.__MODOKI_SUBGAME__ format subgameLoader.ts fetches) and publishes it here
+          // under its id. Any other name is refused, which is the fix this block always carried:
+          // before it, overriding bundleName shipped this project's plain shell dist/ under another
+          // bundle's identity, with no error until every device that loaded it failed.
+          const target = otaPublishTarget(bundleName, cfg.ota);
+          if (!target) {
             res.statusCode = 400;
-            res.end(JSON.stringify({ error: `bundleName ("${bundleName}") does not match this project's own ota.bundleName ("${cfg.ota.bundleName}"). This route only builds+publishes the CURRENTLY OPEN project as itself — publishing under a different bundle name would ship this project's plain web build under that bundle's identity, not a real sub-game module build. Open the sub-game's own project to publish it, or build it via build-subgame.mjs and publish by hand.` }));
+            res.end(JSON.stringify({ error: `bundleName ("${bundleName}") is neither this project's own ota.bundleName ("${cfg.ota.bundleName}") nor a sub-game listed in its ota.subgames (${JSON.stringify(cfg.ota.subgames)}). This route publishes the open project as itself, or a listed sub-game built as a sub-game module, never a plain build under another bundle's name. To publish a sub-game from here, add its project id under Project Settings → OTA → Sub-games.` }));
             return;
           }
           if (!bucket || !OTA_SAFE_BUCKET.test(bucket)) {
@@ -3410,6 +3538,27 @@ export function assetScannerPlugin(): Plugin {
               return;
             }
           }
+          // A listed sub-game (#837): resolve its project by id, then fail its engine API early. The
+          // authoritative check is ota-publish.mjs's, against what the build actually stamps into
+          // subgame.json. This one compares the same number from the config it is stamped from
+          // (vite.config.ts reads the sub-game's own ota.engineApi), so it cannot refuse anything
+          // that check would allow. It exists only to answer with a 400 before a multi-minute build.
+          let subgameDir: string | undefined;
+          if (target.kind === 'subgame') {
+            const resolved = otaResolveSubgameDir(target.id, buildCwd, projectRoot, (dir) => findGamesEntry(dir) !== null);
+            if (!resolved.ok) {
+              res.statusCode = 400;
+              res.end(JSON.stringify({ error: resolved.error }));
+              return;
+            }
+            subgameDir = resolved.dir;
+            const subgameEngineApi = loadProjectConfig(subgameDir).ota.engineApi;
+            if (subgameEngineApi !== cfg.ota.engineApi) {
+              res.statusCode = 400;
+              res.end(JSON.stringify({ error: `Sub-game "${target.id}" would be built against engine API ${subgameEngineApi} (its own ota.engineApi), but this shell's ota.engineApi is ${cfg.ota.engineApi}. A device loads a sub-game only when the two are EXACTLY equal, so every device would refuse this bundle. Align the two before publishing.` }));
+              return;
+            }
+          }
           const user = loadProjectUserConfig(projectRoot);
           const gcloudDir = resolveGcloudDir(user.sdk.gcloudPath);
           if (!gcloudDir) {
@@ -3451,7 +3600,10 @@ export function assetScannerPlugin(): Plugin {
 
           const baseEnv = await buildStepEnv({ MODOKI_PROJECT: projectRoot });
           const gcloudEnv = { ...baseEnv, PATH: `${gcloudDir}:${baseEnv.PATH ?? ''}` };
-          const distDir = path.join(projectRoot, 'dist');
+          const steps = otaPublishSteps({
+            target, projectRoot, subgameDir, gcloudEnv, buildCwd, bucket, bundleName, version, keyName,
+            shellEngineApi: cfg.ota.engineApi, mandatory: mandatoryParam,
+          });
 
           let activeProc: ReturnType<typeof spawn> | null = null;
           let aborted = false;
@@ -3478,10 +3630,21 @@ export function assetScannerPlugin(): Plugin {
             // `--target native` despite the GCS upload below: an OTA bundle replaces the web
             // content INSIDE an installed native app, so it is served from the app root — never
             // `--target web`, which would bake in the project's sub-path webBasePath (#40).
-            sendStatus('Building web assets...');
-            const build = await runStep('Building web assets...', 'node engine/scripts/build-web.mjs --target native', buildCwd, otaPublishBuildStepEnv(gcloudEnv, projectRoot));
+            // A listed sub-game builds from ITS project with build-subgame.mjs instead (#837).
+            sendStatus(steps.buildLabel);
+            const build = await runStep(steps.buildLabel, steps.buildCmd, buildCwd, steps.buildEnv);
             if (aborted) return;
-            if (!build.ok) { sendStatus(`FAILED:Building web assets\n${build.output.slice(-1500)}`); res.end(); return; }
+            if (!build.ok) { sendStatus(`FAILED:${steps.buildLabel.replace(/\.\.\.$/, '')}\n${build.output.slice(-1500)}`); res.end(); return; }
+            // #837: show which engine API the sub-game build stamped, BEFORE the upload, rather than
+            // leaving it defaulted and unseen. ota-publish.mjs is what refuses a mismatch; this line is
+            // how whoever reads the log sees the number that decision was made on.
+            if (target.kind === 'subgame') {
+              let stamped: unknown = '<unreadable>';
+              try {
+                stamped = (JSON.parse(fs.readFileSync(path.join(steps.distDir, 'subgame.json'), 'utf8')) as { engineApi?: unknown }).engineApi;
+              } catch { /* shown as unreadable; ota-publish.mjs refuses an unreadable subgame.json */ }
+              send(`Sub-game "${target.id}" engine API: ${JSON.stringify(stamped)} (stamped by its build from its own ota.engineApi). This shell's ota.engineApi: ${cfg.ota.engineApi}. A mismatch is refused before anything is uploaded.`);
+            }
 
             // Step 2: verify/set bucket CORS (GCS sets none by default; `gcloud`/`curl`
             // ignore CORS entirely, so nothing catches a missing policy until a real
@@ -3525,13 +3688,7 @@ export function assetScannerPlugin(): Plugin {
             // the manifest, canonicalize) to compare against — i.e. re-implement the script
             // — and the two implementations drifting is this bug. Don't re-add it.
             sendStatus('Publishing...');
-            const mandatoryFlag = mandatoryParam === true ? ' --mandatory' : mandatoryParam === false ? ' --no-mandatory' : '';
-            const publish = await runStep(
-              'Publishing OTA bundle...',
-              `node engine/scripts/ota-publish.mjs --dist ${JSON.stringify(distDir)} --bucket ${JSON.stringify(bucket)} --name ${JSON.stringify(bundleName)} --version ${JSON.stringify(version)} --engine-api ${cfg.ota.engineApi} --key ${JSON.stringify(keyName)} --repo-root ${JSON.stringify(buildCwd)} --project ${JSON.stringify(projectRoot)}${mandatoryFlag}`,
-              buildCwd,
-              gcloudEnv,
-            );
+            const publish = await runStep('Publishing OTA bundle...', steps.publishCmd, buildCwd, gcloudEnv);
             if (aborted) return;
             if (!publish.ok) { sendStatus(`FAILED:Publishing\n${publish.output.slice(-1500)}`); res.end(); return; }
 
@@ -3550,7 +3707,8 @@ export function assetScannerPlugin(): Plugin {
             sendStatus('DONE');
             const mandatoryIntent = mandatoryParam === true ? 'set' : mandatoryParam === false ? 'cleared' : 'unchanged';
             send(
-              `\n✅ Published — effective parameters: bundleName=${bundleName} version=${version} ` +
+              `\n✅ Published — effective parameters: bundleName=${bundleName} ` +
+              `(${target.kind === 'subgame' ? `sub-game built from ${path.relative(buildCwd, subgameDir ?? '')}` : 'this project'}) version=${version} ` +
               `mandatory=${mandatoryIntent} key=${keyName} bucket=${bucket}. ` +
               `Verify with modoki_ota_status.`,
             );

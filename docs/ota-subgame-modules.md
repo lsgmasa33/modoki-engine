@@ -110,32 +110,34 @@ games/<id>/subgame-dist/
   assets/**             # its own converted assets
 ```
 
-**Publishing a sub-game module is a hand invocation of `ota-publish.mjs`, and it now enforces
-its own identity guards on that dist** (#582) — it already hashes whatever `dist` directory
-it's given, so a sub-game bundle is just another `bundles/<name>` entry with `--dist
-games/<id>/subgame-dist` instead of `--dist games/<id>/dist`, but `--project` is now REQUIRED
-and must point at the **shell project whose app receives the release** (the one that will
-`fetch`/verify it at runtime), e.g.:
+**Publishing a sub-game module: list it on the shell, then publish from the shell** (#837).
+1. Add the sub-game's project id to the SHELL's `ota.subgames` (Project Settings → OTA →
+   Sub-games). `games/ota-test` lists `ota-subgame-test` this way.
+2. In the shell project, Publish OTA Update… offers the id as a Bundle, and `modoki_ota_publish`
+   accepts it as `bundleName`.
+
+The route builds that project with `build-subgame.mjs` and uploads its `subgame-dist/` into the
+shell's bucket under the id, signed with the shell's key. The engine API it publishes is what the
+build stamped into `subgame.json`, refused unless it equals the shell's `ota.engineApi` (§4). The
+guards and the reasoning: ota-updates.md § Publishing.
+
+By hand it is the same two steps, and `ota-publish.mjs` enforces the same guards (#582, #837). A
+sub-game bundle is just another `bundles/<name>` entry with `--dist games/<id>/subgame-dist`.
+`--project` is REQUIRED and must point at the **shell project whose app receives the release**
+(the one that will `fetch`/verify it at runtime). Omit `--engine-api`: it is read from
+`subgame.json`, and a flag that disagrees is refused.
 
 ```
 node engine/scripts/ota-publish.mjs \
   --dist games/ota-subgame-test/subgame-dist --bucket gs://modoki-ota/ota-test \
-  --name ota-subgame-test --version v1 --engine-api 1 --key default \
+  --name ota-subgame-test --version v1 --key default \
   --project games/ota-test
 ```
 
 The dist must be a REAL `subgame-dist/` (i.e. `build-subgame.mjs`'s output, containing
 `subgame.json`) — the script refuses a plain shell `dist/` published under a sub-game name (see
 ota-updates.md's #582 Gotchas entry for why, and why that guard is not simply the route's
-bundleName-equality check ported over). **What is NOT built yet: automated end-to-end sub-game
-publish.** The editor's `Publish OTA Update…` dialog and the `/api/ota/publish` route always
-run `build-web.mjs` (the normal shell build) and always publish the currently-open project's
-own `dist/` — never `build-subgame.mjs`/`subgame-dist/`. The route explicitly refuses a
-`bundleName` that doesn't match the open project's own `ota.bundleName` (rather than silently
-publishing plain shell content under a different bundle's identity — a real bug a code review
-caught: see ota-updates.md's Gotchas). Publishing a sub-game today means running
-`build-subgame.mjs` + `ota-publish.mjs` by hand, the way `games/ota-subgame-test` was verified;
-wiring that into the editor/route is a real follow-up, not done.
+bundle-name check ported over).
 
 **Asset paths.** The scanner emits root-absolute paths (`/assets/x.png`), which would collide
 across sub-games. `loadManifestJson(json, opts?: {pathPrefix})` in `assetManifest.ts` prefixes
@@ -359,9 +361,12 @@ this device's disk, not about what was published.
 `ENGINE_API_VERSION` (`engine/packages/modoki/src/runtime/core/version.ts`) is the single source of
 truth; `project-config.ts`'s `ota.engineApi` default is pinned to it by a vitest.
 
-A sub-game declares its expected version **twice, both build-stamped from
-`ENGINE_API_VERSION`**, never hand-written: `subgame.json.engineApi` and a static `engineApi`
-export in the module. The shell checks both, after evaluation and **before** registering the
+A sub-game declares its expected version **twice, both build-stamped**, never hand-written:
+`subgame.json.engineApi` and a static `engineApi` export in the module. ⚠️ The stamped value is the
+sub-game PROJECT's `ota.engineApi` (`vite.config.ts` passes it to `subgameBuild.ts`), not the
+constant itself; it equals `ENGINE_API_VERSION` only while that config is at its pinned default.
+That is why the publish path compares it with the receiving shell's `ota.engineApi` and refuses a
+mismatch before upload (#837, `otaSubgameEngineApi`). The shell checks both, after evaluation and **before** registering the
 game or touching the world:
 
 ```

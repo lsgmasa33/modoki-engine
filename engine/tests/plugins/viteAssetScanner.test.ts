@@ -20,7 +20,7 @@ import {
   handleExitRequest, scanAllAssets, resolveModokiAssetsDir, filterKeptAssets, gamesModuleSource,
   isUnderAssetRoot, absToAssetUrl, pathToClassifyForChange, isSiblingRaisedChange,
   isValidBuildPlatform, BUILD_PLATFORMS, playableBuildSteps,
-  otaPublishBundleNameAllowed, otaSigningKeyRefusal,
+  otaPublishTarget, otaSubgameProjectDir, otaResolveSubgameDir, otaPublishSteps, otaSigningKeyRefusal,
   otaPublishBuildStepEnv,
   type AssetRoot,
 } from '../../plugins/vite-asset-scanner';
@@ -1552,20 +1552,177 @@ describe('the Electron watcher must not re-implement classifySceneChange', () =>
   });
 });
 
-describe('otaPublishBundleNameAllowed (/api/ota/publish bundle-identity guard)', () => {
-  it('allows publishing the project as its own configured bundle', () => {
-    expect(otaPublishBundleNameAllowed('shell', 'shell')).toBe(true);
+describe('otaPublishTarget (/api/ota/publish: which build a bundle name selects, #837)', () => {
+  const ota = { bundleName: 'shell', subgames: ['ota-subgame-test'] };
+
+  it('the project\'s own bundle name builds the project as itself', () => {
+    expect(otaPublishTarget('shell', ota)).toEqual({ kind: 'shell' });
   });
 
-  it('refuses a bundleName that differs from the project\'s own — the publish-corruption fix', () => {
-    // Before this guard, publishing "shell" content under "ota-subgame-test"'s name would
-    // silently ship the wrong bytes under someone else's identity. See ota-updates.md's
-    // Gotchas for the full failure scenario a code review caught.
-    expect(otaPublishBundleNameAllowed('ota-subgame-test', 'shell')).toBe(false);
+  it('a listed sub-game id builds that sub-game', () => {
+    expect(otaPublishTarget('ota-subgame-test', ota)).toEqual({ kind: 'subgame', id: 'ota-subgame-test' });
+  });
+
+  it('refuses an unlisted name — still the publish-corruption fix: shell content under another bundle\'s identity', () => {
+    // Before the original guard, publishing "shell" content under "ota-subgame-test"'s name
+    // silently shipped the wrong bytes under someone else's identity. Listing is now the only way
+    // a second name is accepted, and it selects a real sub-game build (see ota-updates.md § Gotchas).
+    expect(otaPublishTarget('ota-subgame-test', { bundleName: 'shell', subgames: [] })).toBeNull();
+    expect(otaPublishTarget('other', ota)).toBeNull();
   });
 
   it('is case-sensitive (no accidental leniency)', () => {
-    expect(otaPublishBundleNameAllowed('Shell', 'shell')).toBe(false);
+    expect(otaPublishTarget('Shell', ota)).toBeNull();
+    expect(otaPublishTarget('OTA-subgame-test', ota)).toBeNull();
+  });
+
+  it('refuses a name that is BOTH the shell\'s and a listed sub-game\'s — it cannot say which build it means', () => {
+    expect(otaPublishTarget('shell', { bundleName: 'shell', subgames: ['shell'] })).toBeNull();
+  });
+});
+
+describe('otaSubgameProjectDir (#837)', () => {
+  const projects = [
+    { name: 'ota-test', dir: '/repo/games/ota-test' },
+    { name: 'ota-subgame-test', dir: '/repo/games/ota-subgame-test' },
+    { name: 'twin', dir: '/repo/games/twin' },
+    { name: 'twin', dir: '/repo/demos/twin' },
+  ];
+  const hasEntry = () => true;
+  const errorOf = (r: ReturnType<typeof otaSubgameProjectDir>) => (r.ok ? '' : r.error);
+
+  it('resolves a listed id to its project folder', () => {
+    expect(otaSubgameProjectDir('ota-subgame-test', projects, '/repo/games/ota-test', hasEntry))
+      .toEqual({ ok: true, dir: '/repo/games/ota-subgame-test' });
+  });
+
+  it('refuses an id with no project', () => {
+    expect(errorOf(otaSubgameProjectDir('nope', projects, '/repo/games/ota-test', hasEntry))).toMatch(/no project of that name/);
+  });
+
+  it('refuses an id found under two roots', () => {
+    expect(errorOf(otaSubgameProjectDir('twin', projects, '/repo/games/ota-test', hasEntry))).toMatch(/names 2 projects/);
+  });
+
+  it('refuses the shell project itself', () => {
+    expect(errorOf(otaSubgameProjectDir('ota-test', projects, '/repo/games/ota-test', hasEntry))).toMatch(/this shell project itself/);
+  });
+
+  it('refuses a folder with no game entry for build-subgame.mjs', () => {
+    expect(errorOf(otaSubgameProjectDir('ota-subgame-test', projects, '/repo/games/ota-test', () => false))).toMatch(/no game\.ts/);
+  });
+});
+
+describe('otaResolveSubgameDir (#837 close-out: where the publish route looks for a listed sub-game)', () => {
+  let tmp: string;
+  beforeEach(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-subgame-resolve-')); });
+  afterEach(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
+  const mk = (...parts: string[]) => { const d = path.join(tmp, ...parts); fs.mkdirSync(d, { recursive: true }); return d; };
+  const game = (...parts: string[]) => { const d = mk(...parts); fs.writeFileSync(path.join(d, 'game.ts'), ''); return d; };
+  const hasGame = (d: string) => fs.existsSync(path.join(d, 'game.ts'));
+
+  it('finds a sub-game NEXT TO the shell when the editor root has no games/ (a packaged editor)', () => {
+    const editorRoot = mk('app.asar.unpacked');
+    const shell = game('MyGames', 'shell');
+    const mini = game('MyGames', 'mini');
+    expect(otaResolveSubgameDir('mini', editorRoot, shell, hasGame)).toEqual({ ok: true, dir: mini });
+  });
+
+  it('prefers the shell\'s own neighbour over a same-named game in the clone the editor runs from', () => {
+    game('repoA', 'games', 'mini');
+    const shell = game('repoB', 'games', 'shell');
+    const mine = game('repoB', 'games', 'mini');
+    expect(otaResolveSubgameDir('mini', path.join(tmp, 'repoA'), shell, hasGame)).toEqual({ ok: true, dir: mine });
+  });
+
+  it('reaches a demos/ sub-game of a games/ shell through the repo', () => {
+    const shell = game('repo', 'games', 'shell');
+    const mini = game('repo', 'demos', 'mini');
+    expect(otaResolveSubgameDir('mini', path.join(tmp, 'repo'), shell, hasGame)).toEqual({ ok: true, dir: mini });
+  });
+
+  it('skips a plain folder beside the shell that shares the name, rather than picking it or calling the id ambiguous', () => {
+    const shell = game('Out', 'shell');
+    mk('Out', 'mini'); // not a game
+    const repoMini = game('repo', 'games', 'mini');
+    expect(otaResolveSubgameDir('mini', path.join(tmp, 'repo'), shell, hasGame)).toEqual({ ok: true, dir: repoMini });
+  });
+
+  it('says a same-named folder is not a game, over a bare "not found", when nothing better exists', () => {
+    const shell = game('Out', 'shell');
+    mk('Out', 'mini');
+    const r = otaResolveSubgameDir('mini', mk('emptyRoot'), shell, hasGame);
+    expect(r.ok).toBe(false);
+    expect(!r.ok && r.reason).toBe('no-game-entry');
+  });
+
+  it('refuses an id that would leave the shell\'s parent, and the shell itself', () => {
+    const shell = game('Out', 'shell');
+    const up = otaResolveSubgameDir('..', mk('emptyRoot'), shell, hasGame);
+    expect(!up.ok && up.reason).toBe('not-found');
+    const self = otaResolveSubgameDir('shell', mk('emptyRoot2'), shell, hasGame);
+    expect(!self.ok && self.reason).toBe('shell-itself');
+  });
+
+  it('never looks up an id containing a path separator beside the shell', () => {
+    const shell = game('Out', 'shell');
+    game('Out', 'nested', 'mini'); // reachable only if the separator guard were gone
+    const r = otaResolveSubgameDir('nested/mini', mk('emptyRoot'), shell, hasGame);
+    expect(!r.ok && r.reason).toBe('not-found');
+  });
+
+  it('matches the sibling name EXACTLY — a case variant is not found, on every platform', () => {
+    const shell = game('Out', 'shell');
+    game('Out', 'mini');
+    const r = otaResolveSubgameDir('Mini', mk('emptyRoot'), shell, hasGame);
+    expect(!r.ok && r.reason).toBe('not-found');
+  });
+
+  it('is what the publish route actually calls, with the real game-entry probe — a reverted call site would leave every case above green', () => {
+    // Comments are stripped by readScannedSource, so a commented-out call cannot satisfy this.
+    const src = readScannedSource(path.join(PROJECT_ROOT, 'engine/plugins/vite-asset-scanner.ts')).code;
+    expect(src).toMatch(/otaResolveSubgameDir\(target\.id, buildCwd, projectRoot, \(dir\) => findGamesEntry\(dir\) !== null\)/);
+    expect(src).not.toMatch(/otaSubgameProjectDir\(target\.id,/);
+  });
+});
+
+describe('otaPublishSteps (#837)', () => {
+  const base = {
+    projectRoot: '/repo/games/ota-test', gcloudEnv: { PATH: '/gcloud/bin' }, buildCwd: '/repo',
+    bucket: 'gs://b/p', bundleName: 'shell', version: 'v2', keyName: 'ota-test', shellEngineApi: 4, mandatory: undefined,
+  };
+
+  it('a shell target builds this project with build-web.mjs and publishes its dist/ with the shell engine API', () => {
+    const s = otaPublishSteps({ ...base, target: { kind: 'shell' } });
+    expect(s.buildCmd).toBe('node engine/scripts/build-web.mjs --target native');
+    expect(s.buildEnv.MODOKI_PROJECT).toBe('/repo/games/ota-test');
+    expect(s.distDir).toBe(path.join('/repo/games/ota-test', 'dist'));
+    expect(s.publishCmd).toContain(`--dist ${JSON.stringify(path.join('/repo/games/ota-test', 'dist'))}`);
+    expect(s.publishCmd).toContain('--engine-api 4');
+    expect(s.publishCmd).toContain('--project "/repo/games/ota-test"');
+  });
+
+  it('a sub-game target builds THAT project, uploads its subgame-dist under its id into the SHELL project, and passes no --engine-api', () => {
+    const s = otaPublishSteps({
+      ...base, bundleName: 'ota-subgame-test', target: { kind: 'subgame', id: 'ota-subgame-test' }, subgameDir: '/repo/games/ota-subgame-test',
+    });
+    expect(s.buildCmd).toBe('node engine/scripts/build-subgame.mjs');
+    expect(s.buildEnv.MODOKI_PROJECT).toBe('/repo/games/ota-subgame-test');
+    expect(s.distDir).toBe(path.join('/repo/games/ota-subgame-test', 'subgame-dist'));
+    expect(s.publishCmd).toContain(`--dist ${JSON.stringify(path.join('/repo/games/ota-subgame-test', 'subgame-dist'))}`);
+    expect(s.publishCmd).toContain('--name "ota-subgame-test"');
+    expect(s.publishCmd).toContain('--project "/repo/games/ota-test"');
+    expect(s.publishCmd).not.toContain('--engine-api');
+  });
+
+  it('a sub-game target without its resolved folder throws rather than building the shell by accident', () => {
+    expect(() => otaPublishSteps({ ...base, target: { kind: 'subgame', id: 'x' } })).toThrow(/resolved project dir/);
+  });
+
+  it('carries the tri-state mandatory flag through to both targets', () => {
+    expect(otaPublishSteps({ ...base, target: { kind: 'shell' }, mandatory: true }).publishCmd).toMatch(/ --mandatory$/);
+    expect(otaPublishSteps({ ...base, target: { kind: 'shell' }, mandatory: false }).publishCmd).toMatch(/ --no-mandatory$/);
+    expect(otaPublishSteps({ ...base, target: { kind: 'shell' } }).publishCmd).not.toMatch(/mandatory/);
   });
 });
 
@@ -1671,13 +1828,29 @@ describe('/api/ota/publish route has no collision guard of its own (#577)', () =
    *  A line that opens `/*` and closes it before real code (`/* c8 ignore next *​/ execFile…`)
    *  is dropped whole and WOULD evade both assertions — that is the false-negative shape to
    *  watch; `^\s*\/\*.*\*\/\s*\S` currently matches nowhere in the plugin sources. */
-  const routeCode = (): string => routeBody()
+  /** Since #837 the commands the handler runs live in `otaPublishSteps`, one helper away. So the
+   *  scanned region is the handler PLUS that helper: a preflight re-added in either place is inside
+   *  it. Same throw-rather-than-shrink rule as `routeBody`. */
+  const HELPER_START = 'export function otaPublishSteps(';
+  const helperBody = (): string => {
+    const startIdx = source.indexOf(HELPER_START);
+    const endIdx = startIdx === -1 ? -1 : source.indexOf('\n}\n', startIdx);
+    if (startIdx === -1 || endIdx === -1) {
+      throw new Error(`#577 regression test: could not isolate otaPublishSteps in vite-asset-scanner.ts (anchor ${JSON.stringify(HELPER_START)}). Re-point it.`);
+    }
+    return source.slice(startIdx, endIdx + 2);
+  };
+
+  const routeCode = (): string => `${routeBody()}\n${helperBody()}`
     .split('\n')
     .filter((line) => !/^\s*(\/\/|\/\*|\*)/.test(line))
     .join('\n');
 
   it('isolates the route handler body between stable start/end anchors', () => {
     expect(routeBody().length).toBeGreaterThan(0);
+    // The handler must still run the helper's command, or scanning the helper covers nothing it does.
+    expect(routeBody()).toContain('steps.publishCmd');
+    expect(helperBody()).toContain('ota-publish.mjs');
     // The strip must not eat the body whole — a `routeCode()` of nothing would pass every
     // assertion below for the wrong reason.
     expect(routeCode()).toContain('ota-publish.mjs');

@@ -96,12 +96,6 @@ const numArg = (raw: unknown): number | null => {
   return Number.isFinite(v) ? v : null;
 };
 
-/** A string param where `''` means UNSET — the reading `resolveClip` already gives `key`. A bare
- *  `params.x ?? fallback` cannot express it: `''` is not nullish, so the fallback never runs
- *  (#1074; the empty-string form of `docs/format-versioning.md` § 4b-ter's `??` row). */
-const unsetIfEmpty = (raw: unknown): string | undefined =>
-  raw == null || raw === '' ? undefined : String(raw);
-
 /** The clip a `setClip`/`playOneShot` should act on: a `key` looked up in the
  *  target's bank (`AudioSource.clips`, a JSON-string) takes precedence; else a
  *  literal `clip` GUID (param or payload) for the bank-less shorthand. */
@@ -161,7 +155,9 @@ export function registerAudioControls(): void {
       value: { type: 'number', min: 0, max: 100, tooltip: '0..100 (from a slider). $value binds the slider value.' },
     },
     handler: ({ params, payload }) => {
-      const bus = unsetIfEmpty(params?.bus) ?? 'master';
+      // `bus: ''` never arrives: the registry drops a declared param's empty string (#1075 — #1074
+      // first fixed this read locally, with a helper this file no longer needs).
+      const bus = String(params?.bus ?? 'master');
       const v = numArg(params?.value ?? payload);
       if (v == null) return;
       const clamped = Math.max(0, Math.min(100, v));
@@ -182,10 +178,11 @@ export function registerAudioControls(): void {
     handler: ({ target, params, payload }) => {
       const clip = resolveClip(target, params, payload);
       if (!clip) return;
-      // `unsetIfEmpty`, not a bare `??` (#1074): `''` is not nullish, so it skipped the target's bus
-      // and reached `resolveBus('')`, which warned and played it on sfx. An unknown NON-empty bus
+      // A bare `??` is correct here because `bus: ''` never arrives — the registry drops a declared
+      // param's empty string before dispatch (#1075). Before that, `''` skipped the target's bus and
+      // reached `resolveBus('')`, which warned and played it on sfx (#1074). An unknown NON-empty bus
       // still goes to `resolveBus`, which falls back with a warning — deliberately, see its comment.
-      const bus = (unsetIfEmpty(params?.bus) ?? target?.get(AudioSource)?.bus ?? 'sfx') as BusName;
+      const bus = String(params?.bus ?? target?.get(AudioSource)?.bus ?? 'sfx') as BusName;
       cueClip(clip, { bus });
     },
   });

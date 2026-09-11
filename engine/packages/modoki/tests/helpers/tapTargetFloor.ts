@@ -53,6 +53,7 @@ import { describe, expect, it } from 'vitest';
 // this file lives INSIDE the package — a self-referencing specifier would also have to resolve
 // under the package's own vitest config, which aliases three/react/koota and not itself.
 import { UIElement } from '../../src/runtime/traits/UIElement';
+import { VIEWPORT_UNIT_AXIS, isViewportLengthUnit } from '../../src/runtime/traits/uiLength';
 import { traitFieldOrDefault } from '../../src/runtime/core/ecs/traitSchema';
 import { DEVICE_PRESETS, SHIPPING_DEVICE_CATEGORIES } from '../../src/editor/scene/devicePresets';
 import { prefabInstances, prefabLookup, type InstanceMember } from './prefabInstances';
@@ -174,14 +175,10 @@ export type Axis =
 
 /** pt per unit at one viewport, or `null` for a unit that is parent-relative. */
 export function ptPerUnit(unit: string, vp: Viewport): number | null {
-  switch (unit) {
-    case 'px': return 1;
-    case 'vw': return vp.w / 100;
-    case 'vh': return vp.h / 100;
-    case 'vmin': return Math.min(vp.w, vp.h) / 100;
-    case 'vmax': return Math.max(vp.w, vp.h) / 100;
-    default: return null;   // '%' — parent-relative
-  }
+  if (unit === 'px') return 1;
+  // The runtime's own table (#1064), so this helper cannot model a viewport unit the layout does not.
+  if (isViewportLengthUnit(unit)) return VIEWPORT_UNIT_AXIS[unit](vp.w, vp.h) / 100;
+  return null;   // '%' — parent-relative
 }
 
 /**

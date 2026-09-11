@@ -1,5 +1,7 @@
-/** The three CLI scripts that write `<project>/dist` — `build-web.mjs`, `add-native-targets.mjs`,
- *  `ota-publish.mjs` — must each take the cross-process build claim (#650) BEFORE mutating
+/** The CLI scripts that write or upload a project's build output — `build-web.mjs`,
+ *  `add-native-targets.mjs` and `ota-publish.mjs` (`<project>/dist`), and `build-subgame.mjs`
+ *  (`<project>/subgame-dist`, which the editor's OTA publish uploads since #837) — must each take the
+ *  cross-process build claim (#650) BEFORE mutating
  *  anything, and give it back on every exit path. `buildLock.ts`'s in-process slot is invisible to
  *  a CLI script (a separate process), so without this a hand-run one of these can race the
  *  editor's own build/publish/scaffold into the SAME `<project>/dist`, producing a torn bundle.
@@ -24,6 +26,7 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../
 const buildWeb = path.join(repoRoot, 'engine', 'scripts', 'build-web.mjs');
 const addNativeTargets = path.join(repoRoot, 'engine', 'scripts', 'add-native-targets.mjs');
 const otaPublish = path.join(repoRoot, 'engine', 'scripts', 'ota-publish.mjs');
+const buildSubgame = path.join(repoRoot, 'engine', 'scripts', 'build-subgame.mjs');
 
 describe('build-web.mjs takes the cross-process build claim (#650)', () => {
   const src = readScannedSource(buildWeb).code;
@@ -148,11 +151,64 @@ describe('ota-publish.mjs takes the cross-process build claim (#650)', () => {
     expect(acquireIdx).toBeLessThan(uploadIdx);
   });
 
+  it('ALSO claims a sub-game dist\'s own project before hashing it, and releases that claim too (#837)', () => {
+    // build-subgame.mjs claims the SUB-GAME project; claiming only --project (the shell) left the
+    // dist it uploads unguarded against a second build of that sub-game.
+    const distClaimIdx = src.indexOf('acquireBuildClaim(distProjectDir,');
+    const hashIdx = src.indexOf('await buildManifestFiles(distDir)');
+    expect(distClaimIdx).toBeGreaterThan(-1);
+    expect(distClaimIdx).toBeLessThan(hashIdx);
+    expect(src).toMatch(/\}\s*finally\s*\{\s*buildClaim\.release\(\);\s*distClaim\?\.release\(\);/);
+  });
+
   it('does NOT touch the heal/vendor family, and still parses project.config.json raw (unchanged by #650)', () => {
     // The brief for #650 explicitly calls this out: ota-publish.mjs reaches nothing from the
     // heal/vendor family on purpose (#582) — only the claim was added, not a new dependency on it.
     expect(src).not.toMatch(/healNativeConfig|ensureCapacitorDeps|vendorEnginePlugins|loadEnginePluginModule/);
     expect(src).toMatch(/JSON\.parse\(readFileSync\(projectConfigPath, 'utf8'\)\)/);
+  });
+});
+
+describe('build-subgame.mjs takes the cross-process build claim (#650, #837)', () => {
+  // It had none: nothing ran it but a human until #837 wired it into the editor's OTA publish, which
+  // uploads the `subgame-dist` it writes. A hand-run copy racing that publish would ship a torn module.
+  const src = readScannedSource(buildSubgame).code;
+
+  it('imports acquireBuildClaim from buildClaimsStore.mjs', () => {
+    expect(src).toMatch(/import\s*\{[^}]*acquireBuildClaim[^}]*\}\s*from\s*'\.\/buildClaimsStore\.mjs'/);
+  });
+
+  it('claims the RESOLVED sub-game project, marking itself a CLI holder', () => {
+    const idx = src.indexOf('acquireBuildClaim(');
+    expect(idx).toBeGreaterThan(-1);
+    expect(src.slice(idx, idx + 200)).toMatch(/acquireBuildClaim\(abs,/);
+    expect(src.slice(idx, idx + 200)).toMatch(/kind:\s*'cli'/);
+  });
+
+  it('refuses and exits non-zero on a held claim, without blocking/waiting', () => {
+    const acquireIdx = src.indexOf('const claimed = acquireBuildClaim(');
+    expect(acquireIdx).toBeGreaterThan(-1);
+    const chunk = src.slice(acquireIdx, acquireIdx + 300);
+    expect(chunk).toMatch(/!claimed\.ok/);
+    expect(chunk).toMatch(/process\.exit\(1\)/);
+    expect(chunk).not.toMatch(/setTimeout|while\s*\(/);
+  });
+
+  it('releases the claim on the failure exit AND after a successful build', () => {
+    // `process.exit()` skips `finally`, so both paths release explicitly.
+    expect(src.match(/buildClaim\?\.\s*release\(\)/g) ?? []).toHaveLength(2);
+    const failIdx = src.indexOf('buildClaim?.release();\n  process.exit(1);');
+    expect(failIdx).toBeGreaterThan(-1);
+  });
+
+  it('acquires BEFORE its first write (the scoped tsconfig) and before the vite build', () => {
+    const acquireIdx = src.indexOf('acquireBuildClaim(');
+    const writeIdx = src.indexOf('writeFileSync(scopedPath');
+    const viteIdx = src.indexOf('build --config');
+    expect(writeIdx).toBeGreaterThan(-1);
+    expect(viteIdx).toBeGreaterThan(-1);
+    expect(acquireIdx).toBeLessThan(writeIdx);
+    expect(acquireIdx).toBeLessThan(viteIdx);
   });
 });
 

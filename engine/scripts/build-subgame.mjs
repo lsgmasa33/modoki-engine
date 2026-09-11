@@ -13,6 +13,7 @@ import { writeFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { chooseViteConfig } from './viteConfigChoice.mjs';
 import { isProjectDir } from './projectRoots.mjs';
+import { acquireBuildClaim } from './buildClaimsStore.mjs';
 
 const repoRoot = process.cwd();
 const engineDir = path.join(repoRoot, 'engine');
@@ -25,6 +26,27 @@ if (!proj) {
 
 const include = ['app'];
 const abs = path.resolve(repoRoot, proj);
+
+// Cross-process build claim (#650), taken before this script's first write (the scoped tsconfig
+// below). It writes `<project>/subgame-dist`, which since #837 the editor's Publish OTA Update…
+// uploads. This claim covers only the BUILD; `ota-publish.mjs` claims the same project again while
+// it hashes and uploads, so a second build of this sub-game cannot empty the folder under a live
+// upload. In the gap between the two, a racing build makes the publish REFUSE rather than tear.
+// Refuses rather than waits: a scripted build must not hang on an interactive editor.
+// `process.exit()` skips `finally`, so every exit path below releases explicitly, with the store's
+// own exit hook as the backstop.
+let buildClaim = null;
+try {
+  const claimed = acquireBuildClaim(abs, `sub-game build (CLI): ${path.basename(abs)}`, { kind: 'cli' });
+  if (!claimed.ok) {
+    console.error(`[build-subgame] ${claimed.message}`);
+    process.exit(1);
+  }
+  buildClaim = claimed;
+} catch (e) {
+  console.error(`[build-subgame] could not take the build claim: ${e instanceof Error ? e.message : String(e)}`);
+  process.exit(1);
+}
 if (isProjectDir(repoRoot, abs)) {
   include.push(path.relative(engineDir, abs).split(path.sep).join('/'));
 }
@@ -61,5 +83,7 @@ try {
   // is exactly how it would have shipped the moment that gets wired to a button.
   run(`${q(node)} ${q(viteBin)} build --config ${chooseViteConfig(engineDir)}`);
 } catch {
+  buildClaim?.release();
   process.exit(1);
 }
+buildClaim?.release();

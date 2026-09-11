@@ -31,6 +31,7 @@ import { shrinkWrapAlign, uiTextAnimation, ensureUITextAnimStyles } from './uiTe
 import { useFocusStore } from './focusManager';
 import { isTouchDevice } from '../core/formFactor';
 import { TOUCH_ATTR, TOUCH_OPACITY_ATTR } from '../traits/TouchControl';
+import { isViewportLengthUnit, viewportUnitVar } from '../traits/uiLength';
 import { UI_PAINT_ATTR } from './uiPaintMarker';
 import { UI_PRESS_ORIGIN_ATTR, UI_TAP_ZONE_ATTR, pressBelongsTo, clearPressOrigin } from './pressOrigin';
 import { scrollViewStyle, writeScrollState, clearScrollRequest, pendingScrollTo, readScrollMeasurement, readPreciseBoxSize } from './scrollViewDom';
@@ -409,19 +410,15 @@ const AutoFitText = React.memo(function AutoFitText(
 });
 
 /** Convert a numeric value + unit string to a CSS value. Returns undefined if value is 0/falsy.
- *  Viewport units (vw/vh/vmin/vmax) use CSS custom properties set by UIRenderer so they
- *  resolve relative to the UI container, not the browser window. This is critical for the
- *  editor's simulated device viewport. */
+ *  Viewport units use CSS custom properties set by UIRenderer so they resolve relative to the UI
+ *  container, not the browser window. This is critical for the editor's simulated device viewport.
+ *  The variable's NAME comes from `viewportUnitVar` — the same rule UIRenderer publishes with — so
+ *  a reader cannot ask for a variable nobody sets (#1064). */
 export function cssVal(value: number, unit: string): string | number | undefined {
   if (!value) return undefined;
-  switch (unit) {
-    case '%':    return `${value}%`;
-    case 'vw':   return `calc(${value} * var(--ui-vw, 1vw))`;
-    case 'vh':   return `calc(${value} * var(--ui-vh, 1vh))`;
-    case 'vmin': return `calc(${value} * var(--ui-vmin, 1vmin))`;
-    case 'vmax': return `calc(${value} * var(--ui-vmax, 1vmax))`;
-    default:     return value; // px
-  }
+  if (unit === '%') return `${value}%`;
+  if (isViewportLengthUnit(unit)) return `calc(${value} * var(${viewportUnitVar(unit)}, 1${unit}))`;
+  return value; // px
 }
 
 /** Warn ONCE per entity that a UIToggle can never move: it carries no binding on an

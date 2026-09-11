@@ -19,8 +19,8 @@
  *  or picker), falling back to an authored `params.payload` for the schema-less one-value
  *  convention. A handler that reads `payload.tier` therefore receives `undefined` from every
  *  authorable binding and silently does nothing — an action that exists, registers, dispatches
- *  and has no effect. (That shape is live in `hapticControls.ts`, whose `haptics.play` reads
- *  `payload.pattern`; no scene, test or caller in the repo exercises it. See #188's close-out.)
+ *  and has no effect. (That shape was live in `hapticControls.ts`'s `haptics.play` until it was
+ *  fixed alongside this action — see #188's close-out.)
  *
  *  So both authorings work, and both are things a real settings screen wants:
  *
@@ -33,6 +33,11 @@
  *  `params.tier` is preferred; `payload` is the fallback, so a control that emits its value
  *  directly needs no wrapper param.
  *
+ *  `tier` is DECLARED — an enum of `'auto'` plus `TIER_ORDER`, derived rather than restated — so the
+ *  editor renders a picker, and the registry drops an EMPTY `tier` before this runs (#1075). An
+ *  unticked picker therefore falls back to `payload` instead of reading `''` as a garbage tier and
+ *  doing nothing.
+ *
  *  Goes through `choosePlayerQualityTier` ONLY — it persists the choice to PlayerPrefs AND applies
  *  it live in one call, and keeping that pairing in one path is deliberate (see its own doc). A
  *  second writer calling `setPlayerQualityTier`/`applyQualityTier` separately could apply without
@@ -41,24 +46,32 @@
 
 import { registerUIAction } from '../core/actionRegistry';
 import { choosePlayerQualityTier } from '../rendering/playerQualityTier';
-import { isQualityTier } from '../rendering/qualityTier';
+import { isQualityTier, TIER_ORDER } from '../rendering/qualityTier';
 
 /** What an "Auto" option writes: no override, back to the project setting + calibration. It is a
  *  SETTING and not a tier, which is why `isQualityTier('auto')` is false and it is matched here. */
 const AUTO = 'auto';
 
 export function registerQualityControls(): void {
-  registerUIAction('quality.set', ({ params, payload }) => {
-    const chosen = params?.tier ?? payload;
-    if (chosen === AUTO) {
-      choosePlayerQualityTier(null);
-      return;
-    }
-    // Through `isQualityTier`, never a hand-written union — see playerQualityTier.ts's header for
-    // why a second copy of the valid set is a real bug shape (a newly added tier persists fine and
-    // reads back as "no choice"). Also covers a missing/malformed value: authored scene data —
-    // validated, never trusted.
-    if (!isQualityTier(chosen)) return;
-    choosePlayerQualityTier(chosen);
+  registerUIAction('quality.set', {
+    params: {
+      tier: {
+        type: 'enum', options: [AUTO, ...TIER_ORDER],
+        tooltip: "'auto' hands control back to the project setting + calibration; a tier pins it. Leave empty to take the event value.",
+      },
+    },
+    handler: ({ params, payload }) => {
+      const chosen = params?.tier ?? payload;
+      if (chosen === AUTO) {
+        choosePlayerQualityTier(null);
+        return;
+      }
+      // Through `isQualityTier`, never a hand-written union — see playerQualityTier.ts's header for
+      // why a second copy of the valid set is a real bug shape (a newly added tier persists fine and
+      // reads back as "no choice"). Also covers a missing/malformed value: authored scene data —
+      // validated, never trusted.
+      if (!isQualityTier(chosen)) return;
+      choosePlayerQualityTier(chosen);
+    },
   });
 }

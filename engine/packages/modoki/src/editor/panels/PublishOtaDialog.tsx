@@ -11,10 +11,11 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import { backendFetch, backendEventSource } from '../backend/editorBackend';
+import { otaBundleChoices, otaEngineApiNote, type OtaBundleChoice } from './publishOtaTargets';
 
 interface ReleaseInfo { bundles?: Record<string, string>; mandatory?: boolean; minEngineApi?: number }
 interface StatusResponse { ok: boolean; bucket?: string; release?: ReleaseInfo | null; error?: string }
-interface SettingsResponse { ota?: { enabled?: boolean; bundleName?: string; engineApi?: number } }
+interface SettingsResponse { ota?: { enabled?: boolean; bundleName?: string; engineApi?: number; subgames?: unknown[] } }
 
 /** "v17" -> "v18"; anything else is left alone (the server suggests a fix on collision). */
 function nextVersion(v: string | undefined): string {
@@ -44,6 +45,9 @@ export default function PublishOtaDialog() {
   const [enabled, setEnabled] = useState(true);
 
   const [bundleName, setBundleName] = useState('shell');
+  // The shell plus each sub-game listed in ota.subgames (#837); see publishOtaTargets.ts.
+  const [choices, setChoices] = useState<OtaBundleChoice[]>([{ bundleName: 'shell', kind: 'shell' }]);
+  const [shellEngineApi, setShellEngineApi] = useState<number | undefined>(undefined);
   const [version, setVersion] = useState('');
   // Tri-state, matching the server's sticky-mandatory contract (ota-publish.mjs):
   // 'unchanged' sends no `mandatory` param (inherits the live release's value), 'set'
@@ -69,7 +73,10 @@ export default function PublishOtaDialog() {
       ]);
       const statusJson = await statusRes.json() as StatusResponse;
       const settings = await settingsRes.json() as SettingsResponse;
-      const defaultBundle = settings.ota?.bundleName || 'shell';
+      const nextChoices = otaBundleChoices(settings.ota);
+      const defaultBundle = nextChoices[0].bundleName;
+      setChoices(nextChoices);
+      setShellEngineApi(settings.ota?.engineApi);
       setEnabled(settings.ota?.enabled !== false);
       if (!statusRes.ok || !statusJson.ok) {
         // A bucket that can't be read yet (nothing published, or gcloud/derivation
@@ -102,6 +109,7 @@ export default function PublishOtaDialog() {
   if (!open) return null;
 
   const liveVersion = release?.bundles?.[bundleName];
+  const choice = choices.find((c) => c.bundleName === bundleName) ?? choices[0];
 
   const publish = () => {
     if (!version.trim()) return;
@@ -186,8 +194,25 @@ export default function PublishOtaDialog() {
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 10 }}>
           <div>
             <div style={{ color: '#aaa', fontSize: 11, marginBottom: 3 }}>Bundle</div>
-            <input type="text" style={{ ...inputStyle, opacity: 0.6, cursor: 'not-allowed' }} value={bundleName} disabled
-              title="This dialog always builds + publishes the CURRENTLY OPEN project as its own configured ota.bundleName — the server refuses any other value. Automated sub-game bundle publish isn't wired up yet; open the sub-game's own project to publish it." readOnly />
+            <select
+              data-ui-id="ota.publish.bundle" data-ui-kind="select" data-ui-label="Bundle" data-ui-state={bundleName}
+              style={inputStyle} value={bundleName} disabled={publishing || choices.length < 2}
+              title={choices.length < 2
+                ? 'Only this project\'s own bundle. List sub-game project ids in Project Settings → OTA → Sub-games to publish them from here.'
+                : 'This project as itself, or a listed sub-game built from its own project with build-subgame.mjs.'}
+              onChange={(e) => {
+                const next = e.target.value;
+                setBundleName(next);
+                setVersion(nextVersion(release?.bundles?.[next]));
+              }}
+            >
+              {choices.map((c) => (
+                <option key={c.bundleName} value={c.bundleName}>{c.kind === 'subgame' ? `${c.bundleName} (sub-game)` : c.bundleName}</option>
+              ))}
+            </select>
+            <div data-ui-id="ota.publish.engineApi" style={{ color: '#777', fontSize: 10, marginTop: 3 }}>
+              {otaEngineApiNote(choice, shellEngineApi)}
+            </div>
           </div>
           <div>
             <div style={{ color: '#aaa', fontSize: 11, marginBottom: 3 }}>

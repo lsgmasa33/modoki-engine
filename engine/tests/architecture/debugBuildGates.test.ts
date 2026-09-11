@@ -35,6 +35,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { healNativeConfig } from '../../plugins/healNativeConfig';
 import { PROJECT_ROOT_DIRS } from '../../scripts/projectRoots.mjs';
+import { hasNativeProjects } from '../helpers/repoLayout';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 
@@ -100,11 +101,16 @@ describe('build.debugBuild is the single gate — committed native projects (#11
 
   // The OSS snapshot ships no projects with native folders, so there is nothing to check there.
   // Skipping is correct; passing vacuously without saying so is how a guard rots unnoticed.
-  it.skipIf(projects.length === 0)('finds native game-debug projects to check', () => {
+  //
+  // ⚠️ Gated on the PREDICATE, not on `projects.length === 0` (#1071). An emptiness gate cannot
+  // tell "this checkout has no native projects" from "the finder above broke" — a renamed
+  // dependency key or a moved root reads as the first and skips all three tests, including the
+  // one whose whole job is to catch it.
+  it.skipIf(!hasNativeProjects())('finds native game-debug projects to check', () => {
     expect(projects.length).toBeGreaterThan(0);
   });
 
-  it.skipIf(projects.length === 0)('every native debug surface matches the project\'s own flag', () => {
+  it.skipIf(!hasNativeProjects())('every native debug surface matches the project\'s own flag', () => {
     const wrong: string[] = [];
     for (const p of projects) {
       for (const m of NATIVE_MARKERS) {
@@ -126,7 +132,7 @@ describe('build.debugBuild is the single gate — committed native projects (#11
     ).toEqual([]);
   });
 
-  it.skipIf(projects.length === 0)('no project has resurrected a build-configuration gate', () => {
+  it.skipIf(!hasNativeProjects())('no project has resurrected a build-configuration gate', () => {
     const found: string[] = [];
     for (const p of projects) {
       for (const g of RETIRED_GATES) {

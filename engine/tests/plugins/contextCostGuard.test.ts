@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { hasAgentSettings } from '../helpers/repoLayout';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..', '..');
 const guard = path.join(repoRoot, 'engine/scripts/context-cost-guard.mjs');
@@ -421,9 +422,10 @@ describe('context-cost-guard — failure modes', () => {
 
 describe('context-cost-guard — settings registration', () => {
   // `.claude/` is deliberately excluded from the public OSS snapshot (see
-  // engine/scripts/claim-guard.mjs), so this file is absent there — skip rather than crash.
+  // engine/scripts/claim-guard.mjs), so this file is absent there — skip rather than crash, through
+  // the predicate rather than a hand-rolled `existsSync` (#1071).
   const settingsPath = path.join(repoRoot, '.claude/settings.json');
-  it.skipIf(!fs.existsSync(settingsPath))(
+  it.skipIf(!hasAgentSettings())(
     'is registered on both Bash and Read, and claim-guard.mjs is still registered on Bash',
     () => {
     const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));

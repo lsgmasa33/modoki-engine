@@ -163,7 +163,10 @@ describe('#981 plugin-class leg coverage', () => {
     // ota-test is the ONE project that hand-wires this plugin (healNativeConfig generates the
     // game-debug half only — see docs/native-and-sdks.md § iOS SPM static-linking gotcha).
     const pbx = path.join(repoRoot, 'games/ota-test/ios/App/App.xcodeproj/project.pbxproj')
-    if (!fs.existsSync(pbx)) return   // the plugin is not wired here; nothing to compare against
+    // An assertion, not an early return (#1071). The pbxproj is TRACKED, so under the
+    // `hasInternalGames()` gate above it is always here — the `return` this replaced could only
+    // ever fire on a move or rename, and then it reported PASS for a comparison it never made.
+    expect(fs.existsSync(pbx), `${path.relative(repoRoot, pbx)} is gone — repoint this guard at the project that now hand-wires the plugin`).toBe(true)
 
     for (const leg of legs.filter((l) => l.shape === 'flat')) {
       const pkg = path.basename(leg.dir)

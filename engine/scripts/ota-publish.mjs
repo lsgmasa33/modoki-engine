@@ -7,11 +7,12 @@
  *  shared by every version ever published; deleting would strand clients still on an
  *  older version), then merges/signs/uploads `release.json`.
  *
- *  It takes its bucket/dist/version/engine-api as explicit arguments so it can be exercised
- *  and tested independently of the editor build UI. It DOES read the target project's
- *  `project.config.json` (via `--project`), but for exactly two publish-identity guards —
- *  the signing key and the dist kind, below — never for the bucket/version/engine-api
- *  themselves, which stay explicit CLI arguments.
+ *  It takes its bucket/dist/version as explicit arguments so it can be exercised and tested
+ *  independently of the editor build UI. It DOES read the target project's `project.config.json`
+ *  (via `--project`), but only for its publish guards — the signing key, the dist kind, and
+ *  (#837) a sub-game's engine API against the shell's `ota.engineApi`, below — never for the
+ *  bucket or version themselves. A shell dist's engine API is still an explicit argument; a
+ *  sub-game dist's comes from its own `subgame.json`.
  *
  *  #582: these two guards used to exist ONLY in the editor's `/api/ota/publish` route, but
  *  that route's own refusal message sends a human here BY HAND for a sub-game publish
@@ -24,6 +25,10 @@
  *      --dist games/<id>/dist --bucket gs://modoki-ota/<id> \
  *      --name shell --version v13 --engine-api 1 --key default --project games/<id> \
  *      [--mandatory | --no-mandatory]
+ *
+ *  `--engine-api` is required for a SHELL dist. A SUB-GAME dist (one carrying `subgame.json`) takes
+ *  its engine API from that file instead, so omit the flag there; a flag that disagrees with it, or
+ *  a stamped value that differs from the shell project's `ota.engineApi`, is refused (#837).
  *
  *  `mandatory` is STICKY across publishes: `--mandatory` sets it true, `--no-mandatory`
  *  clears it, and passing NEITHER flag inherits the existing release's `mandatory` value
@@ -51,11 +56,12 @@ import { fileURLToPath } from 'node:url';
 import { buildManifestFiles } from './ota/buildManifest.mjs';
 import { isGcloudObjectNotFoundError } from './ota/gcloud.mjs';
 import { createManifest, createRelease, manifestHashPayload, validateManifest, validateRelease } from './ota/schema.mjs';
-import { OTA_DEFAULT_BUNDLE_NAME, otaBundleDistKindRefusal, otaSigningKeyRefusal } from './ota/publishGuards.mjs';
+import { OTA_DEFAULT_BUNDLE_NAME, OTA_DEFAULT_ENGINE_API, otaBundleDistKindRefusal, otaSigningKeyRefusal, otaSubgameEngineApi } from './ota/publishGuards.mjs';
 import { OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './ota/otaSafeTokens.mjs';
 import { signRelease } from './ota/signing.mjs';
 import { buildZipFromDir } from './ota/zip.mjs';
 import { acquireBuildClaim } from './buildClaimsStore.mjs';
+import { samePath } from './pathIdentity.mjs';
 
 const defaultRepoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 // Wraps a value for interpolation into the `execSync` calls below, each of which runs through
@@ -122,7 +128,8 @@ async function main() {
   const bucket = args.bucket?.replace(/\/+$/, '');
   const name = args.name;
   const version = args.version;
-  const engineApi = Number(args.engineApi);
+  // `undefined` when omitted: a sub-game dist takes its engine API from its own subgame.json (#837).
+  const engineApiFlag = args.engineApi === undefined ? undefined : Number(args.engineApi);
   const projectDir = args.project ? path.resolve(repoRoot, args.project) : null;
 
   if (!distDir || !existsSync(distDir)) fail(`--dist is required and must exist (got ${args.dist})`);
@@ -147,7 +154,7 @@ async function main() {
   }
   if (!version) fail('--version is required (e.g. "v13")');
   if (!OTA_SAFE_TOKEN.test(version)) fail(`--version must match ${OTA_SAFE_TOKEN} (got ${JSON.stringify(version)})`);
-  if (!Number.isInteger(engineApi) || engineApi < 1) fail('--engine-api must be a positive integer');
+  if (engineApiFlag !== undefined && (!Number.isInteger(engineApiFlag) || engineApiFlag < 1)) fail('--engine-api must be a positive integer');
   // --key is the FOURTH tainted input, and both route surfaces validate it (`keyName`) with the
   // same token. The first cut of this fix validated three of the four, which is the very asymmetry
   // it exists to close — caught in review. Unlike the other three this one is never
@@ -214,6 +221,39 @@ async function main() {
   if (kindRefusal === 'shell-name-with-subgame-dist') {
     fail(`--name "${name}" matches ${projectConfigPath}'s own ota.bundleName, but ${path.relative(repoRoot, distDir)} is a sub-game module dist (subgame.json present) — publishing it under "${name}" would replace this project's shell bundle with a module the OTA client cannot boot standalone. Publish it under its own sub-game --name instead.`);
   }
+
+  // Engine API (#837). A SHELL dist states it with --engine-api, which stays required. A SUB-GAME
+  // dist already carries the value its build stamped into subgame.json, and that is exactly what a
+  // device compares against its own ENGINE_API_VERSION, for EXACT equality (subgameLoader.ts). So
+  // it is read from the dist, a flag may only agree with it, and it must equal the shell project's
+  // own ota.engineApi. Before this, a disagreeing --engine-api published a manifest saying one
+  // number over a module saying another: every device refused it while this script reported
+  // success. Like the identity guards above, it runs before the claim and before any upload.
+  let engineApi;
+  if (!distIsSubgameModule) {
+    if (engineApiFlag === undefined) fail('--engine-api is required for a shell dist (a sub-game dist takes its engine API from its own subgame.json).');
+    engineApi = engineApiFlag;
+  } else {
+    const subgameJsonPath = path.join(distDir, 'subgame.json');
+    let subgameMeta;
+    try {
+      subgameMeta = JSON.parse(readFileSync(subgameJsonPath, 'utf8'));
+    } catch (e) {
+      fail(`${subgameJsonPath} could not be parsed as JSON (${e.message}) — cannot tell which engine API this sub-game was built against.`);
+    }
+    const shellEngineApi = ota.engineApi === undefined ? OTA_DEFAULT_ENGINE_API : ota.engineApi;
+    const stamped = subgameMeta?.engineApi;
+    const resolved = otaSubgameEngineApi({ stamped, requested: engineApiFlag, shellEngineApi });
+    if (resolved.refusal) {
+      fail({
+        'stamped-invalid': `${subgameJsonPath} has no positive-integer engineApi (got ${JSON.stringify(stamped)}) — rebuild the sub-game with build-subgame.mjs.`,
+        'flag-mismatch': `--engine-api ${engineApiFlag} disagrees with ${subgameJsonPath}, which was built against engine API ${stamped}. The manifest would contradict its own module and every device would refuse it. Omit --engine-api for a sub-game dist.`,
+        'shell-mismatch': `Sub-game "${name}" was built against engine API ${stamped} (${subgameJsonPath}), but ${projectConfigPath}'s ota.engineApi is ${JSON.stringify(shellEngineApi)}. A device loads a sub-game only when its engine API EXACTLY equals the running shell's, so every device would refuse this bundle. Rebuild the sub-game against this shell's engine API, or publish it into a shell that runs ${stamped}.`,
+      }[resolved.refusal]);
+    }
+    engineApi = resolved.engineApi;
+    console.log(`[ota-publish] Sub-game engine API ${engineApi}, read from ${path.relative(repoRoot, subgameJsonPath)}; matches the shell's ota.engineApi.`);
+  }
   const keyRefusal = otaSigningKeyRefusal(keypair.publicKey ?? null, ota.publicKey);
   if (keyRefusal) {
     const why = {
@@ -236,6 +276,22 @@ async function main() {
   // editor, matching what the editor's own `/api/ota/publish` route already does.
   const buildClaim = acquireBuildClaim(projectDir, `OTA publish (CLI): ${name}@${version}`, { kind: 'cli' });
   if (!buildClaim.ok) fail(buildClaim.message);
+  // #837 close-out: a SUB-GAME dist belongs to a DIFFERENT project than --project (the shell), and
+  // build-subgame.mjs claims THAT project while it writes the dist. Claiming only the shell left the
+  // dist unguarded for the whole hash-and-upload below, so a build of the same sub-game started
+  // meanwhile would empty the folder mid-read and upload a torn module. Claim the dist's own project
+  // too. A build already running there makes this publish refuse, loudly, instead. Skipped when the
+  // dist sits inside --project itself: a second claim on one root from one process is refused.
+  let distClaim = null;
+  const distProjectDir = path.dirname(distDir);
+  if (distIsSubgameModule && !samePath(distProjectDir, projectDir)) {
+    const claimed = acquireBuildClaim(distProjectDir, `OTA publish (CLI): ${name}@${version} (sub-game dist)`, { kind: 'cli' });
+    if (!claimed.ok) {
+      buildClaim.release();
+      fail(claimed.message);
+    }
+    distClaim = claimed;
+  }
 
   try {
     console.log(`[ota-publish] Hashing ${path.relative(repoRoot, distDir)}...`);
@@ -494,6 +550,7 @@ async function main() {
     }
   } finally {
     buildClaim.release();
+    distClaim?.release();
   }
 }
 

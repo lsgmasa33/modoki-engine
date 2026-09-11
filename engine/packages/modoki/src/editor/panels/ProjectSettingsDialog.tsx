@@ -20,6 +20,7 @@ import SceneListEditor from './SceneListEditor';
 import ModuleTogglesEditor from './ModuleTogglesEditor';
 import QualityTiersEditor from './QualityTiersEditor';
 import { committedPathWarning, imagePreviewPath, shouldAcceptSettingsDrop } from './projectSettingsPaths';
+import { parseStringList, stringListText } from './stringListText';
 import { Info } from './fields';
 import { fileToBase64 } from './fileBytes';
 import { backendFetch, backendPostJson } from '../backend/editorBackend';
@@ -308,6 +309,32 @@ function PathField({ field, value, onChange, onPick, label, uiId }: {
   );
 }
 
+/** A `string-list` field's textarea. Its TEXT is local state and the value is derived from it; see
+ *  `stringListText.ts` for why rendering the text back from the value swallowed Enter (#837). */
+function StringListTextarea({ field, value, onChange, uiId }: {
+  field: ProjectSettingsField;
+  value: unknown;
+  onChange: (v: unknown) => void;
+  uiId: string;
+}) {
+  const list = Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
+  const joined = list.join('\n');
+  const [text, setText] = useState(joined);
+  // Follow a change from OUTSIDE (a reload, a reset) without clobbering what is being typed.
+  useEffect(() => {
+    setText((current) => stringListText(current, parseStringList(joined)));
+  }, [joined]);
+  return (
+    <textarea data-ui-id={uiId} data-ui-kind="field" data-ui-label={field.label} style={{ ...inputStyle, minHeight: 56, resize: 'vertical' }}
+      value={text}
+      placeholder={field.placeholder ?? 'one per line'}
+      onChange={(e) => {
+        setText(e.target.value);
+        onChange(parseStringList(e.target.value));
+      }} />
+  );
+}
+
 function FieldControl({ field, value, onChange, onPick }: {
   field: ProjectSettingsField;
   value: unknown;
@@ -374,10 +401,7 @@ function FieldControl({ field, value, onChange, onPick }: {
     case 'string-list':
       return (
         <div>{label}
-          <textarea data-ui-id={uiId} data-ui-kind="field" data-ui-label={field.label} style={{ ...inputStyle, minHeight: 56, resize: 'vertical' }}
-            value={Array.isArray(value) ? value.join('\n') : ''}
-            placeholder={field.placeholder ?? 'one per line'}
-            onChange={(e) => onChange(e.target.value.split('\n').map((s) => s.trim()).filter(Boolean))} />
+          <StringListTextarea field={field} value={value} onChange={onChange} uiId={uiId} />
         </div>
       );
     case 'path':

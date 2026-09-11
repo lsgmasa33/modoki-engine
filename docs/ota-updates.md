@@ -564,11 +564,11 @@ wrapped by a safety-railed pipeline reachable two ways:
 - **Editor UI** — Build menu → **Publish OTA Update…** (`PublishOtaDialog.tsx`) and **OTA
   Keys…** (`OtaKeysDialog.tsx`), both gated by `editorStore` open/close pairs.
 - **MCP tools** — `modoki_ota_publish` / `modoki_ota_status` / `modoki_ota_keygen`
-  (`engine/tools/modoki-mcp/src/index.ts`), thin wrappers over the same backend routes.
+  (`engine/tools/modoki-mcp/src/tools/project.ts`), thin wrappers over the same backend routes.
 
 Both surfaces hit `GET /api/ota/publish` (SSE, `engine/plugins/vite-asset-scanner.ts`) which:
-(1) builds **fresh** from the currently-open project's `project.config.json` via
-`build-web.mjs` — never accepts a stale pre-built `dist/`; (2) verifies/sets bucket CORS as a
+(1) builds **fresh**, the currently-open project via `build-web.mjs` or a sub-game listed in its
+`ota.subgames` via `build-subgame.mjs` (#837) — never accepts a stale pre-built dist; (2) verifies/sets bucket CORS as a
 non-fatal preflight; (3) runs `ota-publish.mjs --project <projectRoot>`. The route deliberately
 carries **no version-collision guard of its own** — that decision belongs entirely to
 `ota-publish.mjs` (see "Republishing a version string" below, and the #577 Gotchas entry for
@@ -594,15 +594,45 @@ presence and `--bucket` for a `gs://` prefix, and no charset check existed anywh
 `gcloud.ts` now re-exports from the `.mjs`, so all three entry points share ONE definition and
 `editorBackendRouter.ts` / `vite-asset-scanner.ts` / `otaGcloud.test.ts` import as before.
 
-**This pipeline only ever builds and publishes the shell bundle** — see the Gotchas entry
-below on the bundleName restriction; publishing a sub-game bundle is still a manual
-`build-subgame.mjs` + `ota-publish.mjs` invocation, not wired into the UI/MCP surface. That
-by-hand path is guarded identically to the route now (#582): `ota-publish.mjs` requires
-`--project <dir>` and reads its `project.config.json` itself to enforce both the signing-key
-guard above and a dist-kind guard (a plain shell `dist/` may only publish under the project's
-own `ota.bundleName`; a `subgame-dist/` — `build-subgame.mjs`'s output — may only publish under
-a DIFFERENT name). See the #582 Gotchas entry for why that guard is not a port of the route's
-`otaPublishBundleNameAllowed`.
+**Publishing a sub-game from the editor or MCP (#837).** The shell lists its sub-games by project
+id in `ota.subgames` (Project Settings → OTA → Sub-games). Each id is then a Bundle choice in
+Publish OTA Update… and a valid `bundleName` for `modoki_ota_publish`. The route
+(`otaPublishTarget`) resolves the name to one of two builds:
+- the shell's own `ota.bundleName` builds this project with `build-web.mjs`;
+- a listed id builds THAT project with `build-subgame.mjs`, and its `subgame-dist/` is uploaded
+  under the id into the shell's bucket, signed with the shell's key. `otaResolveSubgameDir` looks
+  for the id in two places, in order: the folder of that name NEXT TO the shell project, then the
+  `games/` and `demos/` projects under the editor's root. The first is the only place a packaged
+  editor, or a project outside the repo, has. The first place holding a matching game wins, so the
+  shell's neighbour beats a same-named project in another clone, and a plain folder that is not a
+  game is never picked. It refuses the shell itself, and two games of one name in the same place.
+- **`ota-publish.mjs` claims a sub-game dist's own project while it hashes and uploads**, as well as
+  the shell. `build-subgame.mjs` claims that project only while it builds, so without the second
+  claim a build of the same sub-game started mid-upload could empty the folder under it. A build
+  racing in the gap between the two makes the publish refuse instead.
+
+Any other name is still refused (see the Gotchas entry on the bundleName restriction). Three
+things that are not obvious:
+- ⚠️ **The engine API a sub-game publishes is what its build stamped, never a flag.** A device
+  loads a sub-game only when its engine API EXACTLY equals the shell's (`subgameLoader.ts`). So
+  `ota-publish.mjs` reads `subgame.json`'s `engineApi`, refuses a `--engine-api` that disagrees with
+  it, and refuses a stamped value that differs from the shell project's `ota.engineApi`
+  (`otaSubgameEngineApi`, `ota/publishGuards.mjs`). The route passes no `--engine-api` for a
+  sub-game, logs the stamped value before uploading, and answers 400 up front when the sub-game's
+  config already disagrees with the shell's. The dialog states the value the sub-game must equal.
+  Before this, a hand publish could stamp a manifest contradicting its own module, which every
+  device refused while the publish reported success.
+- **`build-subgame.mjs` takes the cross-process build claim** on the sub-game's project, as
+  `build-web.mjs` does on the shell's, because the publish now uploads the folder it writes.
+- **The sub-game build does not get `MODOKI_OTA_PUBLISH=1`.** It runs exactly as the by-hand path
+  that verified `games/ota-subgame-test` did; whether a sub-game should also emit texture tier
+  variants was not decided here.
+
+The by-hand path still works and is guarded identically (#582): `ota-publish.mjs` requires
+`--project <dir>` and reads its `project.config.json` itself to enforce the signing-key guard above,
+a dist-kind guard (a plain shell `dist/` may only publish under the project's own `ota.bundleName`;
+a `subgame-dist/` only under a DIFFERENT name), and the engine-API check above. See the #582 Gotchas
+entry for why the dist-kind guard is not a port of the route's name check.
 
 **Republishing a version string: identical is fine, different is refused.** `ota-publish.mjs`
 owns this decision — it is the **only** collision guard in the repo, and it decides by CONTENT
@@ -720,19 +750,19 @@ questions, recorded so they are not re-opened by accident.
 - **Out of scope by construction:** a bundle that boots fine and breaks hours later in a
   gameplay path. Catching that needs crash-loop telemetry against an already-confirmed
   version and N-2 fallback retention — a boot-time watchdog cannot see it.
-- **`/api/ota/publish`'s `bundleName` must equal the currently-open project's own
-  `ota.bundleName`** (fixed 2026-07-26). A fresh-eyes review caught that the route always
-  builds via `build-web.mjs` (a normal shell build) and always publishes the open project's
-  own `dist/` — it never runs `build-subgame.mjs`. Before this was guarded, overriding
-  `bundleName` to a different bundle (e.g. a sub-game's) would silently publish this
-  project's plain shell content under that OTHER bundle's identity, corrupting it with no
-  error at publish time. The route (and `PublishOtaDialog`'s now-disabled Bundle field)
-  refuse any mismatch instead. Publishing a sub-game bundle still needs a manual
-  `build-subgame.mjs` + `ota-publish.mjs` invocation — see ota-subgame-modules.md. The
-  check itself is `otaPublishBundleNameAllowed` (`vite-asset-scanner.ts`) — extracted as a
-  pure function, same convention as this file's other route-logic helpers
-  (`isValidBuildPlatform`, `isSseRoute`, …), so it's unit-tested without needing a live
-  editor/gcloud (`viteAssetScanner.test.ts`).
+- **`/api/ota/publish` refuses any `bundleName` it cannot build AS that bundle** (fixed
+  2026-07-26, widened by #837). A fresh-eyes review caught that the route always built via
+  `build-web.mjs` and published the open project's own `dist/`, so overriding `bundleName` to a
+  different bundle (e.g. a sub-game's) silently published this project's plain shell content
+  under that OTHER bundle's identity, corrupting it with no error at publish time. The first fix
+  was strict equality with the project's own `ota.bundleName` (`otaPublishBundleNameAllowed`),
+  and it disabled the dialog's Bundle field. #837 replaced it with `otaPublishTarget`: a second
+  name is accepted only when it is listed in `ota.subgames`, and then it selects a real
+  `build-subgame.mjs` build of that project, never the shell's `dist/`. Every other name is still
+  refused, and so is a name that is both the shell's and a listed sub-game's. The route logic
+  lives in pure functions (`otaPublishTarget`, `otaSubgameProjectDir`, `otaPublishSteps`), same
+  convention as this file's other helpers (`isValidBuildPlatform`, `isSseRoute`, …), unit-tested
+  in `viteAssetScanner.test.ts` without a live editor or gcloud.
 - **`release.json`'s read-merge-write is now an optimistic-concurrency loop** (fixed
   2026-07-26). Two publishes racing for different bundle names (e.g. `shell` and a sub-game)
   used to be able to both read the same pre-publish `release.json`, with the second writer's
@@ -784,14 +814,14 @@ questions, recorded so they are not re-opened by accident.
   duplicate ran a DIFFERENT, weaker decision procedure FIRST and refused a case the real one
   allowed; this is the identical pure function over the identical inputs, so the route's copy
   can never refuse anything the script would allow — it stays only for a fast HTTP 400 before
-  the SSE stream). `otaPublishBundleNameAllowed` was deliberately **not** ported — it's a
-  strict equality guard that's correct only because the route always builds a plain shell
-  `dist/`; porting it into the CLI verbatim would refuse the sub-game publish the route sends
+  the SSE stream). `otaPublishBundleNameAllowed` (replaced by `otaPublishTarget` in #837) was
+  deliberately **not** ported — it was a strict equality guard, correct only because the route then
+  always built a plain shell `dist/`; porting it into the CLI verbatim would refuse the sub-game publish the route sends
   people here for. `ota-publish.mjs` instead gained a NEW guard, `otaBundleDistKindRefusal`
   (same module): the dist's KIND (plain shell vs. a `subgame-dist/`, detected by
   `subgame.json`'s presence) must match the identity it's published under. `--project <dir>` is
-  now a required flag, read for exactly these two checks (never for bucket/version/engine-api,
-  which stay explicit args) — an unreadable/malformed `project.config.json` aborts loudly
+  now a required flag, read for these checks (never for bucket or version, which stay explicit
+  args; #837 added a third check, a sub-game's engine API against the shell's `ota.engineApi`) — an unreadable/malformed `project.config.json` aborts loudly
   rather than degrading to "unguarded". `engine/scripts/ota-keygen.mjs` also gained an explicit
   `--repo-root` (mirroring `ota-publish.mjs`'s own flag), and `/api/ota/keygen` now passes it as
   `ctx.editorRoot || ctx.projectRoot` — the SAME expression `/api/ota/keys` reads back with —

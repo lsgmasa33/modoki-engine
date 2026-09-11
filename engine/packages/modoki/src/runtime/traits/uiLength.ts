@@ -26,15 +26,54 @@
  *  differ on an EMPTY unit string: this reader treats `''` as absent (as every fallback it replaced did),
  *  `traitFieldOrDefault` only `undefined`. No tracked scene or prefab authors an empty unit. */
 
-/** Length units for UIElement/UIAnchor fields. `px`/`%` plus the four viewport
- *  units (resolved against the LOGICAL device viewport — see resolveLengthPx /
- *  cssVal). Adding a unit here means updating: resolveLengthPx (anchorLayout.ts),
- *  cssVal (UINode.tsx), the anchor CSS emitter (anchorCss.ts), the inspector
- *  dropdown + registerTraits enums, and uiResizeMath. */
-export type UILengthUnit = 'px' | '%' | 'vw' | 'vh' | 'vmin' | 'vmax';
+/** Every length unit a `UIElement`/`UIAnchor` `*Unit` field accepts — THE one list (#1064). The
+ *  type is derived from it, and so is every runtime copy: `registerTraits`' unit enums, the
+ *  Inspector's unit dropdown, `lengthUnitWarning`'s relative set.
+ *
+ *  ⚠️ This used to be a type with no runtime tuple, plus a docblock naming the places to update by
+ *  hand when a unit was added — and it named five of nine, omitting `UIRenderer`, the one that
+ *  PUBLISHES the `--ui-*` vars every CSS reader falls back without. A list in a comment is not a
+ *  mechanism, so there is no such list here any more: adding a unit fails to COMPILE at
+ *  `VIEWPORT_UNIT_AXIS` below until it says how it resolves, and every resolver and the publisher
+ *  take their answer from that table. */
+export const UI_LENGTH_UNITS = ['px', '%', 'vw', 'vh', 'vmin', 'vmax'] as const;
+export type UILengthUnit = (typeof UI_LENGTH_UNITS)[number];
 
-/** The four units that resolve against the device VIEWPORT rather than a parent or a fixed px. */
-export const VIEWPORT_LENGTH_UNITS: ReadonlySet<string> = new Set(['vw', 'vh', 'vmin', 'vmax']);
+/** The units that resolve against the device VIEWPORT rather than a parent (`%`) or a fixed `px`.
+ *  Defined as "every unit but those two", so a new unit lands here by default — and then fails to
+ *  compile at `VIEWPORT_UNIT_AXIS` until it names what it is a percentage of. */
+export type ViewportLengthUnit = Exclude<UILengthUnit, 'px' | '%'>;
+
+/** For each viewport unit, the viewport dimension it is a PERCENTAGE of, given the LOGICAL device
+ *  viewport `w`×`h`. The table returns the DIMENSION, not px-per-unit, so every reader keeps its
+ *  arithmetic as `axis * value / 100` exactly as the hand-written switches it replaced had it — the
+ *  resolved lengths and the published vars are bit-identical, not merely close.
+ *
+ *  Read by `resolveLengthPx` (anchorLayout.ts), `uiResizeMath`'s drag inverse, `UIRenderer`'s
+ *  `--ui-*` publisher and the tap-target test helper. */
+export const VIEWPORT_UNIT_AXIS: Readonly<Record<ViewportLengthUnit, (w: number, h: number) => number>> = {
+  vw: (w) => w,
+  vh: (_w, h) => h,
+  vmin: (w, h) => Math.min(w, h),
+  vmax: (w, h) => Math.max(w, h),
+};
+
+/** The viewport units, in table order — derived from `VIEWPORT_UNIT_AXIS`, not restated. */
+export const VIEWPORT_LENGTH_UNITS = Object.keys(VIEWPORT_UNIT_AXIS) as readonly ViewportLengthUnit[];
+
+/** Is `unit` a viewport unit? An OWN-property check, never `unit in VIEWPORT_UNIT_AXIS` or a
+ *  truthiness read: the unit is a document string, and `'constructor' in {}` is true (#993,
+ *  docs/format-versioning.md § 4b-ter). */
+export function isViewportLengthUnit(unit: unknown): unit is ViewportLengthUnit {
+  return typeof unit === 'string' && Object.prototype.hasOwnProperty.call(VIEWPORT_UNIT_AXIS, unit);
+}
+
+/** The CSS custom property `UIRenderer` publishes for a viewport unit and every CSS reader resolves
+ *  it through — `--ui-vw`, `--ui-vmin`, … One naming rule, so the publisher and a reader cannot spell
+ *  the same unit's variable two ways. */
+export function viewportUnitVar(unit: ViewportLengthUnit): `--ui-${ViewportLengthUnit}` {
+  return `--ui-${unit}`;
+}
 
 interface LengthSpec { readonly value: number; readonly unit: UILengthUnit }
 

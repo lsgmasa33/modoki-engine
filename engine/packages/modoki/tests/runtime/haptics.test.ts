@@ -291,6 +291,15 @@ describe('the declarative actions (hapticControls)', () => {
     expect(rec.played[0]).toBe('impact.heavy');
   });
 
+  // #1075: an empty `pattern` field is '' — declared, so dropped at dispatch, so the event value is
+  // played. Before, `'' ?? payload` kept the '' and the handler fell through to 'select'.
+  it('an EMPTY `pattern` takes the event value, not the default (#1075)', () => {
+    registerHapticPatterns({ 'test.buzz': [{ preset: 'impact.heavy', delayMs: 0 }] });
+    dispatchUIAction('haptics.play', { params: { pattern: '' }, payload: 'test.buzz' });
+    vi.runAllTimers();
+    expect(rec.played[0]).toBe('impact.heavy');
+  });
+
   it('falls back to `select` only when nothing was authored', () => {
     dispatchUIAction('haptics.play', {});
     vi.runAllTimers();

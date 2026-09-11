@@ -20,7 +20,11 @@
 
 import { notifyListeners } from './notifyListeners';
 
-/** Crash reporting hooks the engine shell calls (ErrorBoundary, gameStore). */
+/** Crash reporting hooks the engine shell calls (ErrorBoundary, gameStore).
+ *
+ *  ⚠️ An implementation's `recordError` must send `crashlyticsExceptionOptions(message, platform)` to
+ *  the plugin's `recordException`, never a bare `{ message }`. The message carries the report's group,
+ *  and that helper turns it into the inputs each platform groups by (#1063). */
 export interface CrashlyticsService {
   recordError(message: string): void;
   log(message: string): void;
