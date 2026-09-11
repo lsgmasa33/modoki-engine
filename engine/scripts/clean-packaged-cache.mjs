@@ -55,7 +55,7 @@ import { findDeleteBoundaries, describeBoundary } from './deleteBoundary.mjs';
 // The ONE 'does this look like a toolchain root?' check, shared with toolchain/index.ts (#1005).
 import { toolchainRootRefusal, describeToolchainRootRefusal } from './toolchainRoot.mjs';
 // The ONE 'is a packaged editor living in what I am about to delete?' check (#1037).
-import { findBlockingEditors, sharedStatePaths, stagingRoots } from './livePackagedEditor.mjs';
+import { findBlockingEditors, sharedStatePaths, stagingRoots, editorHomeDir } from './livePackagedEditor.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(__dirname, '..', '..');
@@ -191,7 +191,10 @@ function blockingEditors() {
     // `packagedUserData()`, not a second spelling of it (close-out review): this file already
     // imports the module that owns where packaged state lives, and a hand-re-derivation here would
     // keep checking the old location the day that moves — the guard then silently stops blocking.
-    defaultUserData: packagedUserData(),
+    // ⚠️ Resolved against the home the EDITOR uses, not this process's `$HOME` — on darwin they
+    // differ whenever `$HOME` is redirected, and reading ours attributed every flagless packaged
+    // editor on the machine to a sandbox fixture (#1037, reopened). See `editorHomeDir`.
+    defaultUserData: packagedUserData(editorHomeDir()),
   });
 }
 

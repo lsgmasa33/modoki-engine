@@ -233,6 +233,105 @@ describe('clean-packaged-cache: a process merely MENTIONING the bundle does not 
   });
 });
 
+/** #1037 REOPENED — a packaged editor that is NOT staged and carries NO `--user-data-dir`: a sibling
+ *  clone's `release/` build, or its Squirrel `ShipIt`. The guard gives such a process the packaged
+ *  default userData, and that default was derived from `os.homedir()` — this process's `$HOME`, which
+ *  `sandboxEnv` points at the fixture. So the editor read as "using `<fixture>/…/Modoki Editor`" and
+ *  both the decoy case above and the #883 second-run case went red (observed, and reproduced on
+ *  purpose). Electron on darwin resolves its default from the PASSWD home whatever `$HOME` says —
+ *  measured — so that is now what the guard models (`editorHomeDir`).
+ *
+ *  ⚠️ **The stand-in is an `argv0` spoof, not a bundle.** macOS `ps -o comm=` reports `argv[0]` as
+ *  exec'd, so `node` spawned with `argv0: <…/Modoki Editor.app/Contents/MacOS/Modoki Editor>` is,
+ *  to `listProcesses`, a packaged editor — with nothing written to disk. A copied system binary in a
+ *  fake `.app` is killed by code signing on launch and raises a Finder "damaged" dialog on the
+ *  developer's screen (both seen); do not go back to that. darwin-only: linux `comm` is the 15-char
+ *  task name, so the spoof would not read as an executable path and the accept case would be vacuous.
+ *
+ *  ⚠️ **Both stand-ins are, for their ~1 s life, a real blocker to anyone ELSE on this machine** — a
+ *  clone still on the pre-fix guard reddens its suite, and a genuine un-sandboxed
+ *  `clean-packaged-cache` run refuses, because an unstaged packaged process holds the bundle-id-keyed
+ *  shared state whatever `--user-data-dir` it carries (close-out review). Both are killed in
+ *  `finally`; that window is the whole cost, and the only real run it can hit is a manual one. */
+// Skipped as ROOT too: a root run deliberately follows $HOME (sudo -E safety, `editorHomeDir`), which
+// is the sandbox here — so the accept case's premise does not hold for a root runner.
+describe.skipIf(process.platform !== 'darwin' || process.getuid?.() === 0)('clean-packaged-cache: a flagless packaged editor is attributed to ITS home, not the run\'s $HOME (#1037)', () => {
+  const NAME = 'Modoki Editor';
+  const exeFor = (tag: string) => `/nonexistent-cpc-${tag}-${process.pid}/${NAME}.app/Contents/MacOS/${NAME}`;
+
+  /** Spawn the stand-in and wait until `ps` reports it as the packaged executable. Returns what `ps`
+   *  last said, so the caller can assert the control rather than assume it.
+   *
+   *  ⚠️ Extra args go after `--`. Without it `node` parses `--user-data-dir=…` as one of its OWN
+   *  options, prints "bad option" and exits — AFTER `ps` has already seen it, so the comm control
+   *  passes and the process is gone by the time the CLI looks. That shipped in this case's first
+   *  draft as a reject case that could not reject; `stillLive` below is the control that catches it. */
+  function holdOpen(exe: string, extraArgs: string[] = []): { child: ReturnType<typeof spawn>; comm: string } {
+    const args = ['-e', 'setTimeout(() => {}, 20000)', ...(extraArgs.length > 0 ? ['--', ...extraArgs] : [])];
+    const child = spawn(process.execPath, args, { argv0: exe, stdio: 'ignore' });
+    const deadline = Date.now() + 5000;
+    let comm = '';
+    while (Date.now() < deadline && comm !== exe) {
+      try { comm = execFileSync('ps', ['-o', 'comm=', '-p', String(child.pid)], { encoding: 'utf8' }).trim(); } catch { comm = ''; }
+    }
+    return { child, comm };
+  }
+
+  /** Was the stand-in still RUNNING when the CLI looked? Read from `ps` state, not `kill -0`: this
+   *  worker never yields to the event loop mid-case, so a child that exited is an unreaped zombie
+   *  and `kill -0` still succeeds on it. */
+  function stillLive(pid: number | undefined): boolean {
+    try {
+      const stat = execFileSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' }).trim();
+      return stat !== '' && !stat.startsWith('Z');
+    } catch {
+      return false;
+    }
+  }
+
+  /** THE case. Mutation-checked: `defaultUserData: packagedUserData()` (this process's `$HOME`)
+   *  turns it red with the observed refusal text. */
+  it('does NOT refuse a sandboxed run while one is live elsewhere, flagless and not staged', () => {
+    const exe = exeFor('accept');
+    const { child, comm } = holdOpen(exe);
+    try {
+      expect(comm, 'ps never reported the stand-in as the packaged executable — the case would be vacuous').toBe(exe);
+      const base = makeFixtureRoot('cpc-installed-');
+      const tc = path.join(base, 'tc');
+      fs.mkdirSync(tc, { recursive: true });
+      const { out, status } = runForReal(tc, base);
+      expect(stillLive(child.pid), 'the stand-in exited before the CLI ran — the case would be vacuous').toBe(true);
+      expect(out, 'an editor using the passwd home is not using the fixture').not.toMatch(RUNNING);
+      expect(status, `expected a clean run, got ${status}:\n${out}`).toBe(0);
+    } finally {
+      child.kill('SIGKILL');
+    }
+  });
+
+  /** The reject side, END TO END — which the unit suite's header records as the gap it could not
+   *  close without a signed bundle. The same stand-in, now DECLARING the fixture's userData, must
+   *  block the real run and name itself. Without this the case above passes for a guard that never
+   *  blocks. */
+  it('DOES refuse when that editor declares the state this run would delete', () => {
+    const base = makeFixtureRoot('cpc-installed-held-');
+    const tc = path.join(base, 'tc');
+    fs.mkdirSync(tc, { recursive: true });
+    const held = path.join(appSupportRootUnder(base), NAME);
+    const exe = exeFor('reject');
+    const { child, comm } = holdOpen(exe, [`--user-data-dir=${held}`]);
+    try {
+      expect(comm, 'ps never reported the stand-in as the packaged executable — the case would be vacuous').toBe(exe);
+      const { out, status } = runForReal(tc, base);
+      expect(stillLive(child.pid), 'the stand-in exited before the CLI ran — the case would be vacuous').toBe(true);
+      expect(status, `expected a refusal, got a clean run:\n${out}`).not.toBe(0);
+      expect(out).toMatch(RUNNING);
+      expect(out).toContain(`pid ${child.pid}`);
+    } finally {
+      child.kill('SIGKILL');
+    }
+  });
+});
+
 describe('clean-packaged-cache: --dry-run is never gated on liveness (#1037)', () => {
   function spawnWithoutPath(args: string[], sandbox: string): { out: string; status: number } {
     const env = { ...sandboxEnv(sandbox), PATH: '', Path: '' };

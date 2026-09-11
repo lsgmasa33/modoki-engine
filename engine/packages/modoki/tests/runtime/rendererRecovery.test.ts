@@ -233,12 +233,10 @@ describe('rendererRecovery — a failed rebuild is retried (#156)', () => {
   // The test pins the HAZARD, not the fix: this is what recovery does when handed an unbounded
   // rebuild, so nobody re-introduces one thinking recovery will cope.
   //
-  // ⚠️ Be clear about what this does NOT prove. It says nothing about whether `Scene3D` actually
-  // passes a bound, or adopts a late renderer — those decisions live inside a `useEffect` closure
-  // with no seam, and are UNTESTED. Deleting `Scene3D`'s `withTimeout` argument, its supersession
-  // token or its `adoptRenderer` call breaks nothing in `verify`. Extracting that decision into a
-  // `.ts` beside `Scene3D.tsx`, the way the 2D pool's lives in `canvas2DPool.ts`, is what would
-  // close it.
+  // ⚠️ Be clear about what this does NOT prove: whether `Scene3D` passes a bound, or adopts a late
+  // renderer. Those decisions were effect-local in `Scene3D.tsx` and deleting them broke nothing in
+  // `verify` (#824); they now live in `scene3DBringUp.ts` and are pinned by
+  // `scene3DBringUp.test.ts`, including this module driven with a hanging `createRenderer`.
   it('a rebuild that never settles latches recovery — the reason bring-up must be bounded', async () => {
     const rebuild = vi.fn(() => new Promise<void>(() => { /* never settles: a hung bring-up */ }));
     const onError = vi.fn();

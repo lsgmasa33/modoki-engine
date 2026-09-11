@@ -61,7 +61,14 @@ export interface EntryPrefabProvider {
    *  its OWN unit — a root authored `width: 50, widthUnit: '%'` must resolve against the
    *  viewport exactly like the view's own authored `entryWidth`, not get pinned to a raw px
    *  number (#765). */
-  rootSize(prefabGuid: string): { width: number; widthUnit: 'px' | '%'; height: number; heightUnit: 'px' | '%' };
+  rootSize(prefabGuid: string): {
+    width: number; widthUnit: 'px' | '%'; height: number; heightUnit: 'px' | '%';
+    /** Set when the root authors that axis in a unit a pooled row cannot resolve — a viewport unit
+     *  (`vw`/`vh`/`vmin`/`vmax`) or any other non-px/% string. The axis then reads 0: the owner's
+     *  decision on #840 was to REFUSE such a root, not to guess a size for it. See `warnRefusedRootUnit`. */
+    refusedWidthUnit?: string;
+    refusedHeightUnit?: string;
+  };
   /** The prefab root's authored `UIElement` record verbatim (`undefined` when the prefab is not
    *  cached or its root has no `UIElement`) — **the operand every "did an author write this?"
    *  question must use** (#1026).
@@ -206,7 +213,7 @@ interface ViewState {
   uncachedTicks: number;
 }
 const viewStates = new Map<string, ViewState>();
-onWorldSwap(() => { viewStates.clear(); warnedUncached.clear(); warnedOverridden.clear(); });
+onWorldSwap(() => { viewStates.clear(); warnedUncached.clear(); warnedOverridden.clear(); warnedRefusedUnit.clear(); });
 
 /** Views already warned about an AUTHORING mistake (see `diagnoseBlankView`), so a per-frame
  *  system does not spam the console.
@@ -238,6 +245,11 @@ const warnedUncached = new Set<string>();
  *  has different views, so every entry is dead weight that would otherwise grow forever. */
 const warnedOverridden = new Set<string>();
 
+/** View+axis pairs already warned about a prefab ROOT sized in a unit the pool cannot resolve (#840 —
+ *  see `warnRefusedRootUnit`). Cleared on a world swap like `warnedUncached`: a scene load changes the
+ *  views, and so the answer. */
+const warnedRefusedUnit = new Set<string>();
+
 /** How many consecutive pipeline ticks a prefab may stay uncached before the system says so.
  *  120 ticks is ~2s at 60fps, and matches the established `Canvas2DMount` precedent for exactly
  *  this shape of diagnostic ("canvas still 0x0 after 120 frames"). It is a WARN, not an error:
@@ -246,7 +258,7 @@ const UNCACHED_WARN_TICKS = 120;
 
 /** Reset module state — tests and teardown. */
 export function resetEntriesSystem(): void {
-  viewStates.clear(); warned.clear(); warnedUncached.clear(); warnedOverridden.clear();
+  viewStates.clear(); warned.clear(); warnedUncached.clear(); warnedOverridden.clear(); warnedRefusedUnit.clear();
 }
 
 /** Say WHY a pooled view is blank when the cause is the PREFAB rather than the authoring.
@@ -264,7 +276,7 @@ function tickUncachedPrefab(viewGuid: string, prefabGuid: string, isFrameTick: b
     // wrong: `fetchPrefab` (meshTemplateCache.ts) never inspects `version`, and the editor's own
     // serializer WRITES 2 for a prefab containing nested instances. That advice would have had
     // authors break a legitimate format marker while the real cause went unfound.
-    console.warn(`[UIEntries] view ${viewGuid}: entry prefab ${prefabGuid} is STILL not cached after ${UNCACHED_WARN_TICKS} frames, so the pool cannot spawn and the view stays blank. Check, in this order: is that GUID the one the prefab file actually declares as its 'id'; is the prefab reachable from the scene's 'resources' (directly, or through a prefab that is); and did its fetch fail (a 404 or an unparseable file logs '[MeshCache] Failed to load prefab').`);
+    console.warn(`[UIEntries] view ${viewGuid}: entry prefab ${prefabGuid} is STILL not cached after ${UNCACHED_WARN_TICKS} frames, so the pool cannot spawn and the view stays blank. Check, in this order: is that GUID the one the prefab file actually declares as its 'id'; is the prefab reachable from the scene's 'resources' (directly, or through a prefab that is) — and if its ROOT row nests another prefab, is THAT one cached too; does the file's 'rootLocalId' name a row that actually exists (the pool cannot size or spawn a root it cannot resolve); and did its fetch fail (a 404 or an unparseable file logs '[MeshCache] Failed to load prefab').`);
   }
   return ticks;
 }
@@ -297,8 +309,26 @@ function diagnoseBlankView(viewGuid: string, countX: number, countY: number, sou
 /** The entry prefab's own authored root size, for the `entryWidth/Height = 0` case ("read it
  *  from the prefab"). Returns 0 (px) when the prefab is not cached yet — the caller then has no
  *  size and renders nothing this frame rather than guessing one. */
-export function prefabRootSize(prefabGuid: string): { width: number; widthUnit: 'px' | '%'; height: number; heightUnit: 'px' | '%' } {
+export function prefabRootSize(prefabGuid: string): ReturnType<EntryPrefabProvider['rootSize']> {
   return provider?.rootSize(prefabGuid) ?? { width: 0, widthUnit: 'px', height: 0, heightUnit: 'px' };
+}
+
+/** Say why a delegated axis is 0 when the prefab ROOT authored it in a unit the pool refuses (#840).
+ *
+ *  A pooled row's size resolves against the SCROLL VIEW, and nothing on that path can see the device
+ *  viewport, so a root sized `50vh` has no honest px answer — it used to be read, silently, as 50% of
+ *  the view. The owner chose to REFUSE it: `rootSize` reports the axis as 0 and names the unit, and
+ *  this says so — once per view per axis, and only when the view DELEGATES that axis
+ *  (`entry{Width,Height} = 0`), the one case where the prefab's size is actually used. */
+function warnRefusedRootUnit(
+  viewGuid: string, prefabGuid: string, axis: 'width' | 'height', authored: number | undefined, refusedUnit: string | undefined,
+): void {
+  if (refusedUnit === undefined || (authored ?? 0) !== 0) return;
+  const key = `${viewGuid}:${axis}`;
+  if (warnedRefusedUnit.has(key)) return;
+  warnedRefusedUnit.add(key);
+  const field = axis === 'width' ? 'entryWidth' : 'entryHeight';
+  console.warn(`[UIEntries] view ${viewGuid}: entry prefab ${prefabGuid} sizes its root ${axis} in '${refusedUnit}', which a pooled row cannot use — the row is sized against the scroll view, so only px and % resolve. That axis is 0 until the prefab root authors px/% or the view authors a non-zero ${field}.`);
 }
 
 /** The entry prefab root's authored `UIElement`, for the pooled-row authoring warnings (#1026).
@@ -426,6 +456,8 @@ function driveView(
   // Entry size. `0` means "read it from the prefab" — the single-source-of-truth rule, so a
   // fixed-size entry is not a second copy of what the prefab root already states.
   const fromPrefab = prefabRootSize(kinds[0].prefab);
+  warnRefusedRootUnit(viewGuid, kinds[0].prefab, 'width', en.entryWidth as number, fromPrefab.refusedWidthUnit);
+  warnRefusedRootUnit(viewGuid, kinds[0].prefab, 'height', en.entryHeight as number, fromPrefab.refusedHeightUnit);
   const entryW = resolveEntrySize(en.entryWidth as number, en.entryWidthUnit as 'px' | '%', sv.viewportWidth, fromPrefab.width, fromPrefab.widthUnit);
   const entryH = resolveEntrySize(en.entryHeight as number, en.entryHeightUnit as 'px' | '%', sv.viewportHeight, fromPrefab.height, fromPrefab.heightUnit);
 

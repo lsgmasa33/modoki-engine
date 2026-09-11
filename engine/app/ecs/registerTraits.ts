@@ -1439,6 +1439,8 @@ export function registerAllTraits() {
       enabled: { type: 'boolean', tooltip: 'Route the 3D render through the post-FX stack\'s GTAO stage. Runs on WebGPU and its WebGL2 fallback alike (only FXAA is WebGPU-only); composes with NPR/Bloom/Vignette/DOF. Adds a normal buffer to the scene pass (same one NPR uses) — a custom-shader material combined with AO must emit both MRT targets or its draw is dropped.' },
       radius: { type: 'number', step: 0.05, min: 0.01, max: 2, tooltip: 'World-space sample radius for the occlusion horizon search.' },
       intensity: { type: 'number', step: 0.05, min: 0, max: 1, tooltip: '0 = no darkening, 1 = full raw occlusion.' },
+      resolutionScale: { type: 'number', step: 0.05, min: 0.1, max: 1, tooltip: 'Fraction of the screen resolution the AO pass renders at — its biggest cost on a phone. 1 = full resolution (default); 0.5 = a quarter of the pixels, usually hard to tell apart. Lower is softer and blockier.' },
+      samples: { type: 'number', step: 1, min: 1, max: 32, tooltip: 'Horizon samples per pixel (default 16). Fewer is cheaper and noisier. Below 30 the search uses 3 directions; from 30 it uses 5.' },
     },
   });
 

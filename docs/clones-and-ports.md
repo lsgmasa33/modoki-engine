@@ -304,12 +304,38 @@ every other clone at yours.**
     ⚠️ Deliberately phrased without a `~/Projects/<clone>` + port pair: the guard that keeps this
     file honest parses any such line as a RULE 2 table row, and an earlier draft of this very
     paragraph reddened it. Prose about the table must not look like the table.
-  - **The HASHED lane converges rather than moving.** `clonePort.mjs` hashes `repoRoot` raw, and
-    its own `defaultRepoRoot()` is already physical (Node realpaths `import.meta.url`) — so the
-    launcher passing bash's logical `pwd` DISAGREED with every other caller of that hash (measured
-    through a symlinked clone: 9249 from the launcher, 9254 everywhere else). Passing the physical
-    spelling removes that divergence. `clonePort.mjs` itself is unchanged, and must stay so: it is
-    the one module allowed to import nothing but `node:` builtins.
+  - **The HASHED lane converges rather than moving.** `defaultRepoRoot()` is already physical (Node
+    realpaths `import.meta.url`), so the launcher passing bash's logical `pwd` DISAGREED with every
+    other caller of that hash (measured through a symlinked clone: 9249 from the launcher, 9254
+    everywhere else). Passing the physical spelling removes that divergence. `clonePort.mjs` may
+    import nothing but `node:` builtins, and that restriction still holds.
+
+    ⚠️ **On Windows the physical spelling was not enough, and `clonePort` now normalises.** Git Bash
+    hands `$REPO` to `node` as an argv token and MSYS rewrites the drive in transit
+    (`/e/Projects/modoki` → `E:/Projects/modoki`) while leaving the separators — so the launcher
+    hashed `E:/…` and every in-process caller `E:\…`. Measured on `win`: **9268** from the argv
+    spelling, **9254** from the native one — one directory, two keys, depending which side of the
+    bash→`node` seam you asked. `clonePortOffset` therefore hashes
+    `path.normalize`'d input (trailing separator folded, never past the root). On POSIX that is a
+    no-op for a clean absolute path, so no Mac/Linux port moved. It deliberately does NOT map
+    `/e/…` → `E:\…`: that needs MSYS's mount table, and `/e/Projects` is an ordinary directory on a
+    real POSIX box.
+
+    ⚠️ **Latent, not live — and the first version of this entry got that wrong.** It said the launch
+    banner advertised a debug port no tool would aim at. It did not. `unpinnedCdpPort` has exactly
+    one caller (`launch-editor.sh`'s `cdp-unpinned`), reached only when `BACKEND_PORT` is empty —
+    never on a clone whose basename is a row in the table above, which `modoki` is — and even in the
+    unpinned case the same `$CDP_PORT` is handed to Chromium AND printed, so the banner cannot
+    disagree with what binds. The 9268 was produced by running the CLI by hand, and the consequence
+    was narrated rather than observed. Every hashed lane (9240, 38600, 38900, 38800, 38173) derives
+    on only ONE side of its seam today. The fix is worth having because the next consumer to read
+    both sides is then correct by construction — not because anything was broken.
+
+    ⚠️ **The guard could not have caught this, and that is the transferable part.** It hashed
+    bash's string IN-PROCESS, skipping the argv rewrite the launcher actually goes through — so it
+    agreed with the product on macOS by coincidence. It now drives the real CLI. Re-typing the
+    normalisation into the test instead would have been worse: the test would assert its own copy,
+    and `clonePort` could lose the fix and stay green.
 
   ⚠️ The launch banner therefore prints the PHYSICAL path and `CLONE_NAME` is the physical
   basename. Deliberate: that is the name the port table keys on, so banner and port derivation now

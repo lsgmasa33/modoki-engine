@@ -99,10 +99,14 @@ const buildViewZNodeSpy = vi.fn((depthTextureNode: unknown, isOrthographic: bool
 
 // Real GTAONode owns an RT + material and has a dispose(); `radius` is a live
 // uniform-like field set directly (not passed through the factory args).
+// `samples` (a uniform, default 16) and `resolutionScale` (a plain field, default 1,
+// read by setSize every frame) mirror three's own defaults — the #962 cost knobs.
 function makeAoNode(depthNode: unknown, normalNode: unknown) {
   return {
     __ao: [depthNode, normalNode],
     radius: { value: 0 },
+    samples: { value: 16 },
+    resolutionScale: 1,
     getTextureNode: vi.fn(() => ({ __aoTexture: true, r: { __aoTextureR: true } })),
     dispose: vi.fn(),
   };
@@ -227,8 +231,8 @@ const vignetteCfg = (over: Partial<{ intensity: number; smoothness: number }> = 
 const dofCfg = (over: Partial<{ focusDistance: number; focalLength: number; bokehScale: number }> = {}) => ({
   focusDistance: 10, focalLength: 1, bokehScale: 1, ...over,
 });
-const aoCfg = (over: Partial<{ radius: number; intensity: number }> = {}) => ({
-  radius: 0.25, intensity: 1, ...over,
+const aoCfg = (over: Partial<{ radius: number; intensity: number; resolutionScale: number; samples: number }> = {}) => ({
+  radius: 0.25, intensity: 1, resolutionScale: 1, samples: 16, ...over,
 });
 
 describe('PostFXStack — chain assembly', () => {
@@ -301,6 +305,38 @@ describe('PostFXStack — AO (GTAO) stage', () => {
     expect(stack.setConfig({ ao: aoCfg({ radius: 0.8, intensity: 0.2 }) } as never)).toBe(false);
     expect(aoNode.radius.value).toBe(0.8);
     expect(intensityU.value).toBe(0.2);
+  });
+
+  /** #962 — the cost knobs reach the GTAO node at BUILD. Without this, a scene authoring
+   *  `resolutionScale: 0.5` still renders full-resolution AO until something else changes. */
+  it('applies the authored resolutionScale and samples to the ao node when the stage is built', async () => {
+    await makeStack({ ao: aoCfg({ resolutionScale: 0.5, samples: 8 }) });
+    const aoNode = aoSpy.mock.results[0].value;
+    expect(aoNode.resolutionScale).toBe(0.5);
+    expect(aoNode.samples.value).toBe(8);
+  });
+
+  /** The knobs are LIVE: the owner moves them in the Inspector and the same node follows, with no
+   *  rebuild (GTAONode re-reads `resolutionScale` in its per-frame `setSize`; `samples` is a uniform). */
+  it('setConfig pushes new resolutionScale/samples into the same node without a rebuild', async () => {
+    const stack = await makeStack({ ao: aoCfg() });
+    const aoNode = aoSpy.mock.results[0].value;
+    expect(stack.setConfig({ ao: aoCfg({ resolutionScale: 0.25, samples: 4 }) } as never)).toBe(false);
+    expect(aoSpy).toHaveBeenCalledTimes(1);
+    expect(aoNode.resolutionScale).toBe(0.25);
+    expect(aoNode.samples.value).toBe(4);
+  });
+
+  /** The stack applies `aoPassSettings`, not the raw fields — a hand-edited scene value outside
+   *  the Inspector's range must not size the AO target to nothing or feed a fractional loop bound. */
+  it('clamps out-of-range knobs before they reach the node', async () => {
+    // The exact floor, not `> 0`: the mock node starts at 1, so a looser assertion stays green when
+    // the knob is never applied at all (mutation-checked: dropping the resolutionScale write).
+    const { AO_MIN_RESOLUTION_SCALE } = await import('../../src/runtime/rendering/postfx/stackPlan');
+    await makeStack({ ao: aoCfg({ resolutionScale: 0, samples: 7.6 }) });
+    const aoNode = aoSpy.mock.results[0].value;
+    expect(aoNode.resolutionScale).toBe(AO_MIN_RESOLUTION_SCALE);
+    expect(aoNode.samples.value).toBe(8);
   });
 
   it('is ordered before dof/bloom/vignette (AO -> DOF -> bloom -> vignette)', async () => {

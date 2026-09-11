@@ -18,4 +18,12 @@ export const AmbientOcclusionPostFX = trait({
   radius: 0.25,
   /** 0 = no darkening, 1 = full raw occlusion. */
   intensity: 1,
+  /** Fraction of the drawing buffer the GTAO pass renders at — its dominant cost on a mobile GPU
+   *  (#962: full-resolution GTAO made postfx-demo slow on an Adreno 730). 1 = full resolution,
+   *  three's own default and today's behaviour; 0.5 renders a quarter of the pixels, which three
+   *  documents as sufficient for most scenes. Live — no stack rebuild. */
+  resolutionScale: 1,
+  /** Horizon samples per pixel (three's default 16). Fewer is cheaper and noisier; below 30 three
+   *  searches 3 directions, from 30 it searches 5. Live — it is a uniform. */
+  samples: 16,
 });

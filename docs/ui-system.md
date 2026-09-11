@@ -136,11 +136,24 @@ Field groups (representative fields, verified against `UIElement.ts`):
   3.5% wide" — clamps to 3.5 **pixels**. Nothing errors and the element silently collapses;
   Court's `RulesClose` shipped that way and drew its label entirely outside itself (#529).
 
+  ⚠️ **Reading a length from authored data: read the PAIR, never the number alone, and never with a
+  hand-written unit fallback** (#840). A save strips a unit equal to its default, so an absent unit is
+  the normal on-disk shape — and what it means depends on the FIELD, so any blanket fallback
+  (a px or a % written in after the unit) is right for some lengths and wrong for the rest. Engine code
+  calls `readUILength(bag, field)` / `readUIAnchorLength(bag, field)` from `runtime/traits/uiLength.ts`,
+  which return `{ value, unit }` with each absent half resolved to that field's own default; game code
+  calls the public `traitFieldOrDefault(UIElement, bag, 'widthUnit')`. `UIElement` and `UIAnchor` take
+  their schema defaults FROM that table, so the schema and the reader cannot drift apart, and
+  `engine/tests/architecture/uiLengthFallback.test.ts` fails on a literal unit fallback in any
+  script under `engine/`, `games/` or `demos/`. The two readers differ in one place: `readUILength` treats an
+  EMPTY unit string as absent, `traitFieldOrDefault` only `undefined` — no tracked file authors one. It cannot see a NUMBER read with its unit ignored altogether — Court's tap-zone guard read
+  `minTapSize` that way — so that half stays a review question.
+
   The defaults are deliberately NOT aligned: of the 50 authored `min*`/`max*` values in the repo
   that rely on the px default, ~47 are genuinely pixels (`maxWidth: 460`, the `minWidth: 44` tap
   targets), so flipping them would break the many to rescue the few — and would break scenes
   authored outside this repo. What was actually broken is that the four `*Unit` companions were
-  read by the renderer (`UINode.tsx`, `canvas2DLayout.ts`) but registered in **no trait metadata**,
+  read by the renderer (`UINode.tsx`) but registered in **no trait metadata**,
   so the Inspector never showed them and no author could change one; the value fields' tooltips
   meanwhile asserted "(px)", false at the 114 sites using `vh`/`%`/`vmin`. #549 registered them and
   added them to `UNIT_FIELD_MAPS`, so they now render inline with their value like every other
@@ -1163,9 +1176,12 @@ The two also answer different questions (self-placement vs. margin) and may legi
 Caught in #757's own close-out review, after the first cut of this section claimed the guarantee it
 did not yet have.
 
-⚠️ **An absent length unit in scene JSON means `%`, not `px`** — every `UIElement` length unit
-defaults to `'%'` and a scene save strips a field equal to its default, so the number-with-no-unit is
-the common on-disk shape for a percentage. The validator read it as `px` until #757's close-out,
+⚠️ **An absent length unit in scene JSON means THAT FIELD's default — for a size or margin, `%`, not
+`px`.** The default is per field: `width`/`height`/`padding*`/`margin*` default their unit to `'%'`,
+while `gap`, `min*`/`max*`, `minTapSize`, `fontSize`, `letterSpacing` and every `UIAnchor` offset
+default to `'px'` (the one table is `runtime/traits/uiLength.ts`, #840). A scene save strips a field
+equal to its default, so for a size the number-with-no-unit is the common on-disk shape for a
+percentage. The validator read it as `px` until #757's close-out,
 which made `isNeutralSize` miss `width: 100` and produced **10 false positives across the 143
 tracked scene/prefab files** — four in `games/court`, three in `games/sling`, two in
 `games/wordweave`, one in `demos/particle-demo`, every one of them a full-bleed `100` the editor
@@ -1384,6 +1400,12 @@ derived from.
 **Between two tappable neighbours, a control's reachable target is `artwork + gap` — never the
 authored `minTapSize`.** The two rules above are the same rule seen from opposite ends: the zone
 overhangs the neighbour, and the veto then hands that overhang straight back. Safe, and capped.
+
+⚠️ **The ceiling presupposes a ZONE.** With no `minTapSize` there is nothing to spread into the gap —
+a press there lands on the container and does nothing — so the reachable target is the ARTWORK alone,
+however wide the gap. #1047's first write-up read "tiles are contiguous, so `artwork + gap` likely
+delivers more" onto 31 controls that authored no zone, and none of them did. A gap only helps a control
+that has a zone to put in it.
 
 The consequence is the one that catches authors: **`minTapSize` cannot deliver a floor in a dense
 row or grid.** Set 48 on a 26pt control with a 6pt gap and you get ~32pt across, not 48. The axis
@@ -2308,9 +2330,10 @@ and the prefab's did not — on the one branch whose entire purpose is deferring
 future call site silently keep the bug) and both branches convert through one shared helper, so
 the view's axis and the prefab's axis cannot drift apart again.
 
-⚠️ **An ABSENT unit here means `%`, not px** — every `UIElement` length unit defaults to `'%'` and
-a save strips a field equal to its default, so number-with-no-unit is the ordinary on-disk shape
-for a percentage. `wordweave`'s `dictionary-card` root is exactly that (`width: 100` with no unit
+⚠️ **An ABSENT unit here means `%`, not px** — `width`/`height` default their unit to `'%'` (per field,
+not for every length: `gap` and `min*`/`max*` default to `px`; the one table is
+`runtime/traits/uiLength.ts`, #840) and a save strips a field equal to its default, so
+number-with-no-unit is the ordinary on-disk shape for a percentage. `wordweave`'s `dictionary-card` root is exactly that (`width: 100` with no unit
 keys, i.e. `100%`); it never tripped the bug only because `DictionaryPager` authors both axes
 explicitly at `100%`, so the `0` branch is never taken. Deleting those two redundant fields — which
 is precisely what the single-source-of-truth rule above tells an author to do — would have turned
@@ -2321,6 +2344,23 @@ one test touching the real one (`resourceRefcount.test.ts`) said so in its own d
 now fixtures driving the REAL `entryPrefabProvider.rootSize` against a `%`-unit root, a no-unit-key
 root and an explicit-px root. A fake that models behaviour the real dependency lacks makes the
 guard defend the bug.
+
+⚠️ **"The prefab root" means the root a spawned instance would HAVE, not the root row in the file**
+(#1031). When that row is a nested-instance reference, its own `traits` hold little more than
+`EntityAttributes`; the size is the child prefab's root plus the row's overrides. The provider and
+the validator both resolve it through `effectivePrefabRootTraits`, which mirrors the spawner — see
+[prefabs.md](prefabs.md) § Nested prefabs — and a root that cannot resolve (its child not cached
+yet) reports the prefab **not cached**, so the never-caches warning names it instead of the view
+silently sizing to 0.
+
+⚠️ **On a delegated axis only `px` and `%` survive — a viewport unit is REFUSED** (#840, owner
+decision). The row resolves against the scroll view, and nothing on that path can see the device
+viewport, so a root authored `50vh` has no honest answer; before #840 it was folded into `%` and read,
+silently, as 50% of the VIEW. Now `rootSize` reports that axis as 0 and names the unit
+(`refusedWidthUnit` / `refusedHeightUnit`), the pool warns once per view per axis — only when the view
+actually delegates it — and the validator reports it at author time as `is unsupported`. The fix is
+px/% on the root, or a non-zero `entryWidth`/`entryHeight` on the view. Supporting viewport units here
+would need a device-viewport seam into `entriesSystem`, which was considered and declined.
 
 ### Motion is CSS, and the vocabulary matches
 

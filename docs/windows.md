@@ -666,6 +666,18 @@ load-bearing and commented as such).
   just non-`C`.
 - **MSYS/Git-Bash hands native `.exe`s a MIXED-mode path** (`E:/a/b`), *not* the backslash form
   `cygpath -w` returns. Code matching process command lines must handle both spellings.
+  ⚠️ **Matching is not the only consumer — anything that treats a path as an IDENTITY is exposed
+  too**, and there the symptom is silent divergence rather than a failed match. `clonePort` hashed
+  the repo root raw, so a path arriving through bash's argv (`E:/Projects/modoki`) and the same
+  directory derived in-process (`E:\Projects\modoki`) hashed as two different clones: **9268** vs
+  **9254**, measured. Fixed by normalising at the hash. **The general rule: normalise a path the
+  moment it crosses the bash→`node` argv seam, before anything derives a key, a port or a cache
+  entry from it.** Note the fix cannot be "convert to POSIX" — see the mount-table trap above at
+  `cygpath -u`.
+  ⚠️ **That one was LATENT, and the entry first claimed it was live** — that the launch banner named
+  a port nothing would aim at. It cannot: the only consumer of that hashed lane derives it on one
+  side of the seam and both prints and binds the same value. The 9268 came from invoking the CLI by
+  hand. Worth keeping as the class's clearest measurement, not as an incident.
 - Vite `/@fs/` URLs, `:`-joined PATH assumptions, and `chmod 0600` are the other members of this
   family. The repo has had a steady trickle of these; they are readable from any machine once you
   know to look, unlike the process-behaviour class below.

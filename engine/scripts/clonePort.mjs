@@ -27,11 +27,69 @@ import { fileURLToPath } from 'node:url';
  *  into a port that means something else. */
 export const DEFAULT_SLOTS = 200;
 
+/** One directory, one hash input — whatever SEPARATORS the caller's shell spelled it with.
+ *
+ *  ⚠️ The hash used to run on the RAW string, so one directory had two keys depending on which
+ *  side of the bash→`node` seam you asked. `launch-editor.sh` derives `$REPO` in Git Bash and
+ *  passes it to `node` as an argv token; MSYS rewrites the drive in transit
+ *  (`/e/Projects/modoki` → `E:/Projects/modoki`) but leaves the separators alone, while every
+ *  in-process caller derives `E:\Projects\modoki` from `defaultRepoRoot()`. Measured on the `win`
+ *  clone: **9268** from the argv spelling, **9254** from the native one. Invisible on macOS, where
+ *  the two are byte-identical — and the guard that catches it (`editorPorts.test.ts`) is skipped on
+ *  the public snapshot, which ships no `engine/scripts/`.
+ *
+ *  ⚠️ **No consumer pair reads both sides TODAY — this hardens a latent divergence rather than
+ *  repairing a live one, and an earlier draft of this comment claimed otherwise.** It said the
+ *  launch banner advertised a CDP port no tool would aim at. It does not: `unpinnedCdpPort` has
+ *  exactly one caller (`launch-editor.sh`'s `cdp-unpinned`), that arm is reached only when
+ *  `BACKEND_PORT` is empty — never on a clone whose basename is a `CLONE_BACKEND_PORTS` row, which
+ *  `modoki` is — and even in the unpinned case the same `$CDP_PORT` is both handed to Chromium and
+ *  printed, so the banner cannot disagree with what binds. The 9268 came from running the CLI by
+ *  hand. Every other hashed lane (38600, 38900, 38800, 38173) derives on only ONE side of its seam.
+ *  The value here is that the next consumer to read both sides is correct by construction.
+ *
+ *  `path.normalize` is the whole fix and it is deliberately no more than that: on POSIX it is a
+ *  no-op for an already-clean absolute path, so no existing Mac/Linux port moves. It also cannot
+ *  and MUST NOT map `/e/…` → `E:\…` — that needs MSYS's mount table, and `/e/Projects` is a
+ *  perfectly ordinary directory on a real POSIX box. What reaches this function from the launcher
+ *  is already drive-spelled; only the separators were left to reconcile.
+ *
+ *  The trailing separator is stripped for the same reason — `…/modoki` and `…/modoki/` are one
+ *  directory — but never past the root, so `/` and `E:\` still hash as themselves.
+ *
+ *  ⚠️ **Separator spelling only — CASE is deliberately out of scope.** `e:\Projects\modoki` and
+ *  `E:\Projects\modoki` are still two keys (measured: 9266 vs 9250). The sibling lane DOES fold
+ *  case, because `backendPortForClone` goes through `pathIdentity.mjs`'s `pathCaseKey` after #881
+ *  measured `E:/Projects/MODOKI` as a real miss — and #910 forbids importing that here (below).
+ *  Left unfolded rather than hand-rolled: no live caller emits a lowercase drive (MSYS argv
+ *  conversion and `defaultRepoRoot()` both yield `E:`), and a second private copy of the
+ *  case-folding rule is exactly the drift that helper exists to prevent. If a caller ever does,
+ *  fold it THERE, at the caller, and say why.
+ *
+ *  ⚠️ **Yes, `engine/scripts/pathIdentity.mjs` already owns path identity, and NO, this cannot
+ *  import it** — `entryPoint.test.ts` § "clonePort.mjs stays import-free (#910)" asserts this file
+ *  imports nothing but `node:` builtins, so reaching for `canonicalPath` here reddens that guard.
+ *  The duplication is structural, not an oversight; do not "consolidate" it.
+ *
+ *  ⚠️ It would also be WRONG on the merits, which is the more interesting half. `canonicalPath`
+ *  resolves symlinks, and this hash deliberately does not: `editorPorts.test.ts` pins that the
+ *  LOGICAL (symlinked) spelling of a clone hashes DIFFERENTLY from the canonical one, which is the
+ *  control that lets the launcher-agreement assertion fail at all. Hence the split between the two
+ *  lanes — `backendPortForClone` canonicalises through links (#881) because it CAN import; this
+ *  one reconciles spelling only. Normalising separators is not a step toward resolving links.
+ */
+export function canonicalRepoKey(repoRoot) {
+  const normalized = path.normalize(repoRoot);
+  const { root } = path.parse(normalized);
+  if (normalized.length <= root.length) return normalized;
+  return normalized.replace(/[\\/]+$/, '');
+}
+
 /** Stable offset in `0 .. slots-1` for an absolute repo path. Same clone → same port on
  *  every run (so `lsof -ti :<port>` stays a usable habit); different clones → almost
  *  certainly different ports. */
 export function clonePortOffset(repoRoot, slots = DEFAULT_SLOTS) {
-  const digest = createHash('sha256').update(repoRoot).digest('hex').slice(0, 8);
+  const digest = createHash('sha256').update(canonicalRepoKey(repoRoot)).digest('hex').slice(0, 8);
   return parseInt(digest, 16) % slots;
 }
 

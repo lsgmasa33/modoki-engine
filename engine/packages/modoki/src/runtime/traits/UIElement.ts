@@ -1,11 +1,9 @@
 import { trait } from 'koota';
+import { UI_ELEMENT_LENGTHS as L, type UILengthUnit } from './uiLength';
 
-/** Length units for UIElement/UIAnchor fields. `px`/`%` plus the four viewport
- *  units (resolved against the LOGICAL device viewport — see resolveLengthPx /
- *  cssVal). Adding a unit here means updating: resolveLengthPx (anchorLayout.ts),
- *  cssVal (UINode.tsx), the anchor CSS emitter (anchorCss.ts), the inspector
- *  dropdown + registerTraits enums, and uiResizeMath. */
-export type UILengthUnit = 'px' | '%' | 'vw' | 'vh' | 'vmin' | 'vmax';
+/** Defined in `uiLength.ts`, beside the per-field default table every length on this trait takes
+ *  its value and unit defaults FROM (#840). Re-exported because this is where callers import it. */
+export type { UILengthUnit } from './uiLength';
 
 /** UIElement — consolidated UI trait: layout, style, text, and image. */
 export const UIElement = trait({
@@ -17,17 +15,17 @@ export const UIElement = trait({
    *  that same box) and is never warned about; only a `px` value that disagrees with the resolved
    *  box is. Mechanism, why, and what the warning/Inspector note do and do not reach:
    *  `docs/ui-system.md` § "The engine OWNS a pooled row's box" (#651, widened #761). */
-  width: 0,   // 0 = auto
-  height: 0,  // 0 = auto
+  width: L.width.value as number,   // 0 = auto
+  height: L.height.value as number,  // 0 = auto
   /** ⚠️ Also pinned on a pooled `UIEntries` row root, to `'px'` — see the note on `width` above:
    *  the resolved box is always written in px, whatever unit was authored. */
-  widthUnit: '%' as UILengthUnit,
-  heightUnit: '%' as UILengthUnit,
+  widthUnit: L.width.unit as UILengthUnit,
+  heightUnit: L.height.unit as UILengthUnit,
   flexDirection: 'column' as 'row' | 'column',
   flexWrap: 'nowrap' as 'nowrap' | 'wrap',
   justifyContent: 'flex-start' as 'flex-start' | 'center' | 'flex-end' | 'space-between' | 'space-around',
   alignItems: 'stretch' as 'flex-start' | 'center' | 'flex-end' | 'stretch',
-  gap: 0,
+  gap: L.gap.value as number,
   /** Unit for `gap`. Defaults to 'px', which is what gap silently WAS before this existed.
    *
    *  ⚠️ Every other length on this trait carries a unit; gap did not, and a wrap-based grid whose
@@ -35,7 +33,7 @@ export const UIElement = trait({
    *  reflows onto the next row. Court's 5x5 attack reference did exactly that: 5 cells of 5vh plus
    *  4 gaps of 4px needed 98.95px of a 98.26px row once the window got short enough, so it drew as
    *  4-wide and 7 rows deep. Nothing was wrong with the data — only with mixing the two units. */
-  gapUnit: 'px' as UILengthUnit,
+  gapUnit: L.gap.unit as UILengthUnit,
   flexGrow: 0,
   /** ⚠️ **Pinned to `0` on a pooled `UIEntries` row root — authoring `flexShrink` there does
    *  nothing.** Not the row's own trait default (`1`) — the pool needs the row NOT to shrink, or
@@ -45,14 +43,14 @@ export const UIElement = trait({
    *  checks against the default too, so only a genuinely AUTHORED `flexShrink` warns. See
    *  `docs/ui-system.md` § "The engine OWNS a pooled row's box" (#651, widened #761). */
   flexShrink: 1,
-  paddingTop: 0,
-  paddingTopUnit: '%' as UILengthUnit,
-  paddingLeft: 0,
-  paddingLeftUnit: '%' as UILengthUnit,
-  paddingRight: 0,
-  paddingRightUnit: '%' as UILengthUnit,
-  paddingBottom: 0,
-  paddingBottomUnit: '%' as UILengthUnit,
+  paddingTop: L.paddingTop.value as number,
+  paddingTopUnit: L.paddingTop.unit as UILengthUnit,
+  paddingLeft: L.paddingLeft.value as number,
+  paddingLeftUnit: L.paddingLeft.unit as UILengthUnit,
+  paddingRight: L.paddingRight.value as number,
+  paddingRightUnit: L.paddingRight.unit as UILengthUnit,
+  paddingBottom: L.paddingBottom.value as number,
+  paddingBottomUnit: L.paddingBottom.unit as UILengthUnit,
   /** ⚠️ **Pinned to 0 on a pooled `UIEntries` row root — authoring these there does nothing.**
    *  Mechanism, why, and what the warning/Inspector note do and do not reach:
    *  `docs/ui-system.md` § "The engine OWNS a pooled row's box" (#651).
@@ -60,23 +58,23 @@ export const UIElement = trait({
    *  NOT a row of the gated-colour table below: that trap is an authored value gated by a
    *  companion FIELD defaulting to 0, and this has no gating field at all — the gate is whether
    *  the entity happens to be a scroll view's row. Cited here so nobody adds a wrong row. */
-  marginTop: 0,
-  marginTopUnit: '%' as UILengthUnit,
-  marginRight: 0,
-  marginRightUnit: '%' as UILengthUnit,
-  marginBottom: 0,
-  marginBottomUnit: '%' as UILengthUnit,
-  marginLeft: 0,
-  marginLeftUnit: '%' as UILengthUnit,
+  marginTop: L.marginTop.value as number,
+  marginTopUnit: L.marginTop.unit as UILengthUnit,
+  marginRight: L.marginRight.value as number,
+  marginRightUnit: L.marginRight.unit as UILengthUnit,
+  marginBottom: L.marginBottom.value as number,
+  marginBottomUnit: L.marginBottom.unit as UILengthUnit,
+  marginLeft: L.marginLeft.value as number,
+  marginLeftUnit: L.marginLeft.unit as UILengthUnit,
   /** ⚠️ Also pinned to 0 on a pooled `UIEntries` row — see the margin note above. */
-  minWidth: 0,   // 0 = none
-  minWidthUnit: 'px' as UILengthUnit,
-  maxWidth: 0,   // 0 = none
-  maxWidthUnit: 'px' as UILengthUnit,
-  minHeight: 0,  // 0 = none
-  minHeightUnit: 'px' as UILengthUnit,
-  maxHeight: 0,  // 0 = none
-  maxHeightUnit: 'px' as UILengthUnit,
+  minWidth: L.minWidth.value as number,   // 0 = none
+  minWidthUnit: L.minWidth.unit as UILengthUnit,
+  maxWidth: L.maxWidth.value as number,   // 0 = none
+  maxWidthUnit: L.maxWidth.unit as UILengthUnit,
+  minHeight: L.minHeight.value as number,   // 0 = none
+  minHeightUnit: L.minHeight.unit as UILengthUnit,
+  maxHeight: L.maxHeight.value as number,   // 0 = none
+  maxHeightUnit: L.maxHeight.unit as UILengthUnit,
   alignSelf: 'auto' as 'auto' | 'flex-start' | 'center' | 'flex-end' | 'stretch',
   /**
    * Stacking order among siblings.
@@ -297,8 +295,8 @@ export const UIElement = trait({
    *
    * Reference, and the two fix shapes that were rejected: `docs/ui-system.md` § "Tap zones".
    */
-  minTapSize: 0,
-  minTapSizeUnit: 'px' as UILengthUnit,
+  minTapSize: L.minTapSize.value as number,
+  minTapSizeUnit: L.minTapSize.unit as UILengthUnit,
 
   // ── Style (box visuals) ──
   /** Background fill colour. ⚠️ **Inert on its own** — see `backgroundOpacity` below, which
@@ -380,7 +378,7 @@ export const UIElement = trait({
    * unresolvable; a font stack (`"Iowan Old Style", serif`) is legal here, as in CSS.
    */
   systemFont: '' as string,
-  fontSize: 16,
+  fontSize: L.fontSize.value as number,
   /**
    * Unit for `fontSize`. Defaults to `'px'`, which is what fontSize silently WAS before this
    * existed — so every authored value keeps its meaning and nothing re-lays-out.
@@ -405,7 +403,7 @@ export const UIElement = trait({
    * a scaling `fontSize` with an authored `lineHeight` will drift. Author `lineHeight` 0 (auto)
    * alongside a non-px `fontSize` until that follows.
    */
-  fontSizeUnit: 'px' as UILengthUnit,
+  fontSizeUnit: L.fontSize.unit as UILengthUnit,
   /**
    * Shrink-to-fit (#614): when true, the effective font size is reduced — never grown past the
    * authored `fontSize` — until the text fits its box on ONE line, down to `fontSizeMin`. Below
@@ -447,7 +445,7 @@ export const UIElement = trait({
   textOpacity: 1,        // text color alpha (folded into the textColor picker)
   textAlign: 'left' as 'left' | 'center' | 'right',
   lineHeight: 0,         // 0 = auto/normal
-  letterSpacing: 0,
+  letterSpacing: L.letterSpacing.value as number,
   /**
    * Unit for `letterSpacing`. Defaults to `'px'` — what it silently was before this existed.
    *
@@ -457,7 +455,7 @@ export const UIElement = trait({
    * size and 0.261em at a 480px window — the same authored 7px, twice the optical gap, because
    * only the font shrank. Author both in the same unit.
    */
-  letterSpacingUnit: 'px' as UILengthUnit,
+  letterSpacingUnit: L.letterSpacing.unit as UILengthUnit,
   /** ⚠️ **Inert on its own** — gated by `textShadowBlur`/`textShadowOffsetX`/
    *  `textShadowOffsetY`, all of which default to 0. The THIRD instance of the trap
    *  documented on `backgroundOpacity` above; read that comment, don't restate it. */

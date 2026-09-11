@@ -8,9 +8,9 @@
  *  `sceneChrome`'s `findByName` (`runtime/ui/sceneChrome.ts`) resolves a chrome entity by a
  *  single FLAT name, scanning every `EntityAttributes` entity in the world for the first match —
  *  deliberately scoped to TOP-LEVEL scene entities only (see that module's own banner). It has no
- *  notion of "inside instance X": on a page prefab holding 25 nested tile instances, all of whose
- *  members share names like `Num`/`Mark`/`Solved` across instances, a flat scan cannot tell them
- *  apart. `resolveMemberPath` exists for exactly that case — reaching a member INSIDE one
+ *  notion of "inside instance X": on a page prefab holding a grid of nested tile instances, all of
+ *  whose members share names like `Num`/`Mark`/`Solved` across instances, a flat scan cannot tell
+ *  them apart. `resolveMemberPath` exists for exactly that case — reaching a member INSIDE one
  *  particular instantiated subtree, by walking `EntityAttributes.parentId` from a known root,
  *  which is agnostic to how many prefab boundaries the path crosses and is exactly what a
  *  compound entry needs.

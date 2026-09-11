@@ -280,6 +280,22 @@ describe.skipIf(skip)('launch-editor.sh hands the port derivation the PHYSICAL s
     expect(src).not.toMatch(/REPO_PHYS/);
   });
 
+  /** The port the LAUNCHER really lands on for a given `$REPO`, driven through the seam production
+   *  actually uses: `launch-editor.sh` hands the string to `node` as an ARGV TOKEN, and on Windows
+   *  MSYS rewrites the drive in transit (`/e/Projects/modoki` → `E:/Projects/modoki`).
+   *
+   *  ⚠️ Hashing bash's string in-process — which this case did until the `win` clone ran it —
+   *  skips that rewrite and asks a question the launcher never asks. It agreed with the product on
+   *  macOS, where the two spellings are byte-identical, and disagreed with it on Windows for a
+   *  reason that had nothing to do with the property under test. Re-typing the product's own
+   *  normalisation here instead would be worse still: the test would assert its own copy of the
+   *  fix, and `clonePort` could lose it and stay green. */
+  const launchedPortFor = (bashRoot: string): number => Number(execFileSync(
+    'bash',
+    ['-c', 'node "$1/engine/scripts/editorPorts.mjs" cdp-unpinned "$1"', '_', bashRoot],
+    { encoding: 'utf8' },
+  ).trim());
+
   it('makes the launcher AGREE with clonePort.defaultRepoRoot() through a symlinked clone', (ctx) => {
     // The behavioural half. `cloneRootSpellings` runs the same `pwd` / `pwd -P` pair the shell
     // scripts do, so this drives the real derivation rather than a re-typed copy of it.
@@ -297,7 +313,7 @@ describe.skipIf(skip)('launch-editor.sh hands the port derivation the PHYSICAL s
       try { makeDirLink(REPO, link); }
       catch { rmSync(base, { recursive: true, force: true }); ctx.skip('cannot create a directory symlink here'); return; }
       ({ logical, physical } = cloneRootSpellings(link));
-      if (logical !== physical && clonePort(logical, 9240, 40) !== clonePort(physical, 9240, 40)) break;
+      if (logical !== physical && launchedPortFor(logical) !== launchedPortFor(physical)) break;
       rmSync(base, { recursive: true, force: true });
     }
     expect(drew, 'could not draw a fixture whose two spellings hash apart — investigate, do not skip')
@@ -318,14 +334,19 @@ describe.skipIf(skip)('launch-editor.sh hands the port derivation the PHYSICAL s
 
       const canonical = clonePort(defaultRepoRoot(), 9240, 40);
       // What the launcher passes NOW: physical → the same port every other caller derives.
-      expect(clonePort(asLaunched, 9240, 40)).toBe(canonical);
-      expect(clonePort(physical, 9240, 40)).toBe(canonical);
+      expect(launchedPortFor(asLaunched)).toBe(canonical);
+      expect(launchedPortFor(physical)).toBe(canonical);
 
-      // ⚠️ The control, on the FIXTURE's own two spellings — which the loop above guaranteed hash
-      // apart, so this is deterministic rather than a 1-in-40 coin flip in either direction. It is
-      // what makes the assertion above able to FAIL: revert the launcher to logical `pwd` and
-      // `asLaunched` becomes `logical`, whose port this line pins as different from `canonical`.
-      expect(clonePort(logical, 9240, 40)).not.toBe(canonical);
+      // The control, on the FIXTURE's own two spellings — which the loop above guaranteed hash
+      // apart, so this is deterministic rather than a 1-in-40 coin flip in either direction.
+      //
+      // ⚠️ It does NOT do what its previous comment claimed. It said this line is "what makes the
+      // assertion above able to FAIL", and that credit belongs to `expect(asLaunched).toBe(physical)`
+      // above: revert the launcher to logical `pwd` and THAT goes red first, before any port is
+      // derived. Given the draw loop's exit condition, this line is very nearly tautological. It is
+      // kept because it states the property in the units the bug was measured in — a port — and a
+      // future edit that makes the two spellings converge (resolving symlinks, say) reddens here.
+      expect(launchedPortFor(logical)).not.toBe(canonical);
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

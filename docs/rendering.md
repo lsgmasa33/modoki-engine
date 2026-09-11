@@ -4385,11 +4385,38 @@ stage bar FXAA, working on the WebGL2 backend too (see the stack's gate above).
 
 ## Ambient Occlusion (GTAO)
 
-`AmbientOcclusionPostFX` `{enabled, radius, intensity}`, off by default, WebGL2 backend included
-(see the stack's gate above). Uses
+`AmbientOcclusionPostFX` `{enabled, radius, intensity, resolutionScale, samples}`, off by default,
+WebGL2 backend included (see the stack's gate above). Uses
 `ao(depthNode, normalNode, camera)` from `three/examples/jsm/tsl/display/GTAONode.js`, which
 returns a `GTAONode`; its output texture's `.r` (raw 0..1 occlusion) is lerped toward `1` by
 `intensity` (GTAO has no strength knob of its own) and multiplied into the incoming color.
+
+⚠️ **Cost is AUTHORED, not tiered — `resolutionScale` and `samples` are the knobs (#962).** GTAO at
+three's defaults renders at **full drawing-buffer resolution with 16 samples and no denoise**, and
+that made `demos/postfx-demo` slow on a Galaxy S22 (Adreno 730) on both three 0.184 and 0.185 — a
+cost, not a leak. A quality tier cannot help there: tiers can only switch AO on or off, a project
+cannot author a `high` tier, and the S22 resolves to `high`; calibration demotes on main-thread CPU
+only, so GPU-side AO cost never demotes it either. So the cost lives on the trait, where the owner
+tunes it in the Inspector: `resolutionScale` (1 = full res; three documents 0.5 as enough for most
+scenes, a quarter of the pixels) and `samples` (below 30 three searches 3 directions, from 30 it
+searches 5). Both apply live — `samples` is a uniform and GTAONode re-reads `resolutionScale` in
+its per-frame `setSize` — and both are clamped by `stackPlan.ts`'s `aoPassSettings`, because a scene
+file can hold what the Inspector would refuse. Defaults equal three's, so a project that never sets
+them renders exactly as before.
+
+**Measured 2026-09-11, Galaxy S22 (Adreno 730, WebGPU, 720×1410 buffer), `demos/postfx-demo` with AO
+the ONLY effect, tour frozen at timeScale 0, input driven, GPU timestamps on — A/B/A in one run:**
+
+| `resolutionScale` | fps | GPU frame median | GTAO pass median |
+|---|---|---|---|
+| 1 (three's default) | 28.2 | 35.9 ms | 31.1 ms |
+| 0.5 | 59.9 (vsync-bound) | 14.5 ms | 9.6 ms |
+| 1 again (control) | 28.2 | 35.8 ms | 31.0 ms |
+
+The pass is ~85% of the GPU frame at full resolution; halving the resolution takes the S22 from 28 fps
+to its 60 fps cap. The same perturbation in the desktop editor (1600×909) moved the GPU frame 8.2 →
+3.9 ms, and `samples` 16 → 4 at full resolution moved it 8.2 → ~4.0 ms — so both knobs reach
+GTAONode live. Not measured: the look at 0.5 on a phone, which is the owner's call.
 
 ⚠️ **Always passes a REAL normal buffer — the "nullable normalNode" cheap path is broken here.**
 `ao()`'s `normalNode` argument is documented as nullable (GTAO reconstructs normals from depth

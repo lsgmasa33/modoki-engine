@@ -3,6 +3,11 @@
 
 export declare const DEFAULT_SLOTS: number;
 
+/** The hash INPUT for a repo path: one directory → one key, whatever separators the caller's
+ *  shell spelled it with. Exported so its three behaviours are testable on every platform —
+ *  through `clonePortOffset` alone they are only falsifiable on win32. */
+export declare function canonicalRepoKey(repoRoot: string): string;
+
 /** Stable offset in `0 .. slots-1` for an absolute repo path. */
 export declare function clonePortOffset(repoRoot: string, slots?: number): number;
 

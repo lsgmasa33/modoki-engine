@@ -9,6 +9,10 @@ import type { World } from 'koota';
 import { setEntryPrefabProvider, type EntryPrefabProvider } from '../ui/entriesSystem';
 import { spawnPrefabInstance } from './loadSceneFile';
 import { getCachedPrefab } from './meshTemplateCache';
+import { effectivePrefabRootTraits } from './prefabOverrides';
+import { getTraitByName } from '../core/ecs/traitRegistry';
+import { isPersistentTraitField } from '../core/ecs/traitSchema';
+import { readUILength } from '../traits/uiLength';
 
 interface CachedPrefab {
   entities: { localId?: number; traits?: Record<string, unknown> }[];
@@ -26,74 +30,94 @@ function cached(prefabGuid: string): CachedPrefab | null {
   return (getCachedPrefab(prefabGuid) as CachedPrefab | null) ?? null;
 }
 
-/** The unit a prefab root's `UIElement` length ACTUALLY has, narrowed to the two units
- *  `resolveEntrySize` understands (matching `en.entryWidthUnit`/`entryHeightUnit`, which are
- *  themselves typed `'px' | '%'` at the `entriesSystem.ts` call site).
+/** One axis of the prefab root's size, as the pool can use it.
  *
- *  ⚠️ **An absent unit means `'%'`, not `'px'`.** Every `UIElement` length unit defaults to `'%'`
- *  (`runtime/traits/UIElement.ts`) and a scene/prefab save strips a field equal to its default, so
- *  a bare number with no unit key is the common on-disk shape for a percentage — mirrors
- *  `unitOrDefault` in `sceneValidation.ts`. Only an explicit `'px'` reads as px. */
-function rootUnit(unit: unknown): 'px' | '%' {
-  return unit === 'px' ? 'px' : '%';
+ *  The value and its unit are read TOGETHER, through the one length table (`readUILength`, #840), so
+ *  an absent unit is that field's own default — `%` for `width`/`height`, the common on-disk shape
+ *  once a save strips a default-valued unit key.
+ *
+ *  ⚠️ **Only `px` and `%` survive.** A pooled row's size resolves against the SCROLL VIEW
+ *  (`resolveEntrySize`), and nothing on that path can see the device viewport — so a root authored
+ *  `50vh` has no honest px answer here. Before #840 it was folded into `%` and silently read as 50% of
+ *  the view. **The owner's decision was to REFUSE it, not guess:** the axis reads 0 (the row visibly
+ *  has no size on it) and `refusedUnit` carries the authored unit, which `entriesSystem` names in a
+ *  warning when a view actually delegates that axis to the prefab. Any other non-px/% string is
+ *  refused the same way. */
+function rootAxis(ui: unknown, axis: 'width' | 'height'): { value: number; unit: 'px' | '%'; refusedUnit?: string } {
+  const { value, unit } = readUILength(ui as object | undefined, axis);
+  if (unit === 'px' || unit === '%') return { value, unit };
+  // A ZERO is no size in any unit. Refusing it would warn that the axis is 0 until the root authors
+  // px/% (false advice: 0px is still 0) and disagree with the validator, which is silent on 0. A save
+  // strips a zero height, so a root left at a bare viewport unit key by a dropdown pick is a real shape
+  // (#840 close-out review).
+  if (value === 0) return { value: 0, unit: 'px' };
+  return { value: 0, unit: 'px', refusedUnit: unit };
 }
 
-/** The prefab ROOT's trait bag, or `null` when the prefab is not cached (⚠️ which is a different
- *  answer from "cached with no traits" — `rootSize`'s two branches below depend on telling those
- *  apart, so this must keep returning `null` only for the uncached case).
+/** The spawner's field filter: an override field counts when its trait PERSISTS it. */
+function acceptPersistentField(traitName: string, field: string): boolean {
+  const meta = getTraitByName(traitName);
+  return !!meta && isPersistentTraitField(meta, field);
+}
+
+/** The spawner's trait-NAME rule: an override adds a tag as a tag and a component as a component —
+ *  even one with no accepted field — and skips a name the registry does not know. */
+function registryTraitKind(traitName: string): 'component' | 'tag' | undefined {
+  const meta = getTraitByName(traitName);
+  return meta ? (meta.category === 'tag' ? 'tag' : 'component') : undefined;
+}
+
+/** The trait bag a spawned instance's ROOT entity carries, or `null` when no root would be spawned
+ *  — the prefab is not cached, or it is but its root does not resolve (a nested-instance root whose
+ *  child prefab is not cached, or no row at `rootLocalId`). ⚠️ `null` is a different answer from
+ *  "cached with no traits" (`{}`): `rootSize`'s two branches and `isCached` depend on telling those
+ *  apart.
  *
- *  Extracted in #1026 because `rootAuthoredUI` needs the same root resolution `rootSize` does, and
- *  a second copy of "`rootLocalId`, falling back to `entities[0]`" is exactly the drift
- *  `sceneValidation.ts`'s own root resolution already has to keep in step with by hand.
+ *  Composed by `effectivePrefabRootTraits`, the same function `sceneValidation.ts` uses, so the
+ *  validator, the pool and the spawned entity all describe one root (#1031). Before that, both read
+ *  the root ROW's own `traits` — blind to a nested-instance root, whose row carries little more than
+ *  `EntityAttributes` while the real `UIElement` lives in the child prefab plus the row's overrides.
+ *  That reported a 0 size and no authored record, silencing every pooled-row authoring warning.
  *
- *  ⚠️ **BLIND TO A NESTED-INSTANCE ROOT, and both callers inherit that.** This reads the prefab
- *  FILE row's own `traits`. If `rootLocalId` names a nested-instance row (one carrying
- *  `entry.prefab` — see `loadSceneFile`'s prefab instantiation), the effective root's `UIElement`
- *  lives in the CHILD prefab plus that row's `entry.overrides`, and the row itself carries little
- *  more than `EntityAttributes`. Such a prefab therefore reports no authored size (`rootSize`
- *  answers 0 — a pre-existing blindness) and no authored record at all (`rootAuthoredUI` answers
- *  `undefined`), which collapses every pooled-row authoring warning to the trait defaults and
- *  silences them permanently — including the real `width: 200px` trap the warnings exist for.
- *
- *  **Latent, not live**: all six entry prefabs referenced by a `UIEntries` in `games/` are
- *  `rootLocalId: 1` on a plain row. Filed rather than fixed here because resolving a nested root
- *  means composing the child prefab with the row's overrides, which is `rootSize`'s bug too and is
- *  a change to both answers, not a guard on one. **#1031.** ⚠️ Do NOT "fix" it by falling back to
- *  the pooled entity's live `UIElement` — that is the #1026 defect this file exists to remove. */
+ *  ⚠️ Do NOT "fix" an unresolvable root by falling back to the pooled entity's live `UIElement` —
+ *  that is the #1026 defect this file exists to remove. And never mutate the result: it can alias the
+ *  prefab CACHE's own objects. */
 function rootTraits(prefabGuid: string): Record<string, unknown> | null {
   const prefab = cached(prefabGuid);
   if (!prefab?.entities?.length) return null;
-  const rootLocal = prefab.rootLocalId ?? prefab.entities[0].localId;
-  const root = prefab.entities.find(e => e.localId === rootLocal) ?? prefab.entities[0];
-  return (root.traits ?? {}) as Record<string, unknown>;
+  return effectivePrefabRootTraits(prefab, (ref) => getCachedPrefab(ref), {
+    acceptField: acceptPersistentField,
+    traitKind: registryTraitKind,
+  });
 }
 
 export const entryPrefabProvider: EntryPrefabProvider = {
   rootSize(prefabGuid) {
     const traits = rootTraits(prefabGuid);
-    // No cached prefab yet: 0 in either unit is the same 0, but `'px'` is the honest label —
+    // No resolvable root yet: 0 in either unit is the same 0, but `'px'` is the honest label —
     // there is no authored unit to report.
     if (!traits) return { width: 0, widthUnit: 'px', height: 0, heightUnit: 'px' };
-    const ui = traits['UIElement'] as
-      { width?: number; height?: number; widthUnit?: string; heightUnit?: string } | undefined;
+    const ui = traits['UIElement'];
+    const w = rootAxis(ui, 'width');
+    const h = rootAxis(ui, 'height');
     return {
-      width: ui?.width ?? 0,
-      widthUnit: rootUnit(ui?.widthUnit),
-      height: ui?.height ?? 0,
-      heightUnit: rootUnit(ui?.heightUnit),
+      width: w.value, widthUnit: w.unit,
+      height: h.value, heightUnit: h.unit,
+      ...(w.refusedUnit !== undefined ? { refusedWidthUnit: w.refusedUnit } : {}),
+      ...(h.refusedUnit !== undefined ? { refusedHeightUnit: h.refusedUnit } : {}),
     };
   },
   rootAuthoredUI(prefabGuid) {
     return rootTraits(prefabGuid)?.['UIElement'] as Record<string, unknown> | undefined;
   },
-  // ⚠️ "Cached" means SPAWNABLE, which is a hair stricter than `spawnInstance`'s own guard and
-  // deliberately so. That guard is `!prefab?.entities`, and `[]` is truthy — so a prefab file
-  // with an empty `entities` passes it, reaches `spawnPrefabInstance`, gets `0` back from
-  // `instantiatePrefabIntoWorld` (no root to return), and lands in the silent-retry-forever hole
-  // this whole diagnostic exists to light up. Reporting it "cached" would suppress the warning
-  // for precisely that case. Agreement with the spawn path is the invariant here, and it is
-  // agreement about the OUTCOME — can this produce an instance — not about the expression.
-  isCached(prefabGuid) { return (cached(prefabGuid)?.entities?.length ?? 0) > 0; },
+  // ⚠️ "Cached" means SPAWNABLE — can `spawnInstance` produce an instance — and agreement with the
+  // spawn path about that OUTCOME is the invariant, not agreement about an expression. So it asks
+  // whether the ROOT resolves, which is stricter than `spawnInstance`'s own `!prefab?.entities`
+  // guard in two ways, both deliberate: `[]` is truthy, and a nested-instance root whose child
+  // prefab is not cached yet (#1031) both pass that guard and then get `0` back from
+  // `instantiatePrefabIntoWorld`. Reporting either "cached" would suppress `entriesSystem`'s
+  // never-caches warning for precisely the case it exists to light up.
+  isCached(prefabGuid) { return rootTraits(prefabGuid) !== null; },
   spawnInstance(world: World, prefabGuid, opts) {
     const prefab = cached(prefabGuid);
     // Not cached yet is NORMAL on the first frames of a scene — the caller retries rather than

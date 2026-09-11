@@ -124,9 +124,13 @@ export function defaultToolchainDir() {
  *
  *  Deliberately packaged-ONLY: the old hardcoded "modoki-app" cleared the dev cache
  *  instead, and clearing it is not harmless — a dev editor may be running in another
- *  clone, and pulling its dep-cache out from under it breaks that session. */
-export function packagedUserData() {
-  return path.join(appSupportRoot(), productName());
+ *  clone, and pulling its dep-cache out from under it breaks that session.
+ *
+ *  `home` defaults to this process's `os.homedir()` (which honours `$HOME`). A caller asking where a
+ *  RUNNING editor keeps its state passes the editor's home instead — see `editorHomeDir` in
+ *  `livePackagedEditor.mjs` for why those differ on darwin. */
+export function packagedUserData(home = os.homedir()) {
+  return path.join(appSupportRoot(process.platform, process.env, home), productName());
 }
 
 /** Drop the packaged Vite dep-cache. It is baked against whichever tree last ran, and

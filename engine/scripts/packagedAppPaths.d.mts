@@ -17,8 +17,10 @@ export declare function resolvePackagedApp(outDir: string, name?: string): Resol
 /** The executable inside an already-known app dir (`.app` bundle on macOS, unpacked dir elsewhere). */
 export declare function binInAppDir(appDir: string, name?: string, platform?: NodeJS.Platform): string;
 
-/** The packaged editor's userData dir — `<app support root>/<productName>`. */
-export declare function packagedUserData(): string;
+/** The packaged editor's userData dir — `<app support root>/<productName>`. `home` defaults to
+ *  `os.homedir()` (honours `$HOME`); pass `editorHomeDir()` when asking where a RUNNING editor keeps
+ *  its state (#1037). */
+export declare function packagedUserData(home?: string): string;
 
 /** Drop the packaged Vite dep-cache; returns the paths removed (empty if there was none). */
 export declare function clearViteCache(): string[];

@@ -202,10 +202,19 @@ describe.runIf(process.platform === 'win32')('buildStepShell — killBuildProces
       .split(/\s+/).filter(Boolean).map(Number)
   // Batched into ONE powershell call: each invocation costs ~300-600ms, and polling per-pid
   // would dominate the test's runtime.
+  /** Liveness is a SET question — "which of these are still up" — so give it a canonical order.
+   *
+   *  ⚠️ `Get-Process -Id a,b` does NOT promise to echo the input order, and a `toEqual` against
+   *  the unsorted `kids` is therefore an ordering assertion nobody meant to write. It held for
+   *  weeks and then reddened the whole gate under full-suite load with the same two PIDs
+   *  transposed (`[24516, 3432]` vs `[3432, 24516]`) — a false red in the one lane that runs this
+   *  file at all. Sorting here and at the comparison keeps membership exact while dropping the
+   *  order, which is the property the callers actually assert. */
+  const byId = (pids: number[]): number[] => [...pids].sort((a, b) => a - b)
   const alivePids = (pids: number[]): number[] => {
     if (pids.length === 0) return []
-    return ps(`Get-Process -Id ${pids.join(',')} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id`)
-      .split(/\s+/).filter(Boolean).map(Number)
+    return byId(ps(`Get-Process -Id ${pids.join(',')} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id`)
+      .split(/\s+/).filter(Boolean).map(Number))
   }
   const poll = async <T,>(fn: () => T, done: (v: T) => boolean, deadlineMs: number): Promise<T> => {
     const stop = Date.now() + deadlineMs
@@ -255,7 +264,7 @@ describe.runIf(process.platform === 'win32')('buildStepShell — killBuildProces
     proc.kill() // the pre-#176 abort: signal the pid we spawned
     await exited
 
-    expect(alivePids(kids), 'the orphan this bug is about — still running after `exit`').toEqual(kids)
+    expect(alivePids(kids), 'the orphan this bug is about — still running after `exit`').toEqual(byId(kids))
   }, 60_000)
 
   it('CONTROL: `close` is DEFERRED until the orphan dies, because it inherited the stdio pipes', async () => {
@@ -282,7 +291,7 @@ describe.runIf(process.platform === 'win32')('buildStepShell — killBuildProces
 
     // The load-bearing assertion: cmd.exe is gone, yet `close` has NOT fired — because the orphan
     // still holds the pipes. This is the step loop being left hanging.
-    expect(alivePids(kids), 'the orphan is still running').toEqual(kids)
+    expect(alivePids(kids), 'the orphan is still running').toEqual(byId(kids))
     expect(closeFired, '`close` must NOT fire while the orphan holds the inherited pipes').toBe(false)
 
     // Now kill the orphan — and only now can `close` arrive.

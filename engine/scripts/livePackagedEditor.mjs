@@ -25,10 +25,15 @@
  *  Two questions, in order, and the second is the one the old predicate could not express:
  *
  *   1. **Is this process EXECUTING the packaged bundle?** Decided from the executable path, never
- *      from argv. A shell, a grep or an agent session quoting the path is then structurally
- *      unmatchable. This is `killPackaged`'s discipline in `packagedAppPaths.mjs`, which anchors
- *      its reap to `<appDir>/Contents/` for exactly this reason and which this site never
- *      inherited — #899/#913's shape again, a fix that did not generalise to the site beside it.
+ *      from the rest of argv. A shell, a grep or an agent session quoting the path is then
+ *      structurally unmatchable. This is `killPackaged`'s discipline in `packagedAppPaths.mjs`,
+ *      which anchors its reap to `<appDir>/Contents/` for exactly this reason and which this site
+ *      never inherited — #899/#913's shape again, a fix that did not generalise to the site beside
+ *      it. ⚠️ "Executable path" is what `ps -o comm=` reports, and on macOS that is **`argv[0]` as
+ *      exec'd**, not the resolved image — measured: a `node` spawned with `argv0` set to a
+ *      nonexistent `…/Modoki Editor.app/Contents/MacOS/Modoki Editor` reports exactly that. Every
+ *      launcher passes the real path, so nothing incidental matches; it is also what lets a test
+ *      stand in for a packaged editor without a signed bundle on disk.
  *   2. **Is it THIS installation?** Its `--user-data-dir` (or, absent one, the packaged default)
  *      under one of the paths this run would delete. A sibling clone's smoke points at its own
  *      session scratchpad and is therefore none of our business; the developer's real editor
@@ -195,7 +200,8 @@ export function blockingEditors(rows, opts) {
 /** The paths a live INSTALLED editor holds regardless of its `--user-data-dir`, because they are
  *  keyed on the bundle id (or, on win32, the product name) rather than on a data dir.
  *
- *  ⚠️ **Resolved against the REAL home, not `$HOME`.** `os.userInfo().homedir` reads the passwd
+ *  ⚠️ **Resolved against the REAL home, not `$HOME` — except as ROOT, where it follows `$HOME`; the
+ *  rule and its reason live in `invokingUserHome`.** `os.userInfo().homedir` reads the passwd
  *  entry — verified: with `HOME=/tmp/fake-home`, `os.homedir()` returns the fake and this returns
  *  the real one. That difference is the entire mechanism that keeps a SANDBOXED run unblocked: its
  *  candidates move with `$HOME` and so can never overlap these. ⚠️ The redirect is therefore
@@ -205,9 +211,8 @@ export function blockingEditors(rows, opts) {
  *  ⚠️ `os.userInfo()` THROWS (`ERR_SYSTEM_ERROR`, `uv_os_get_passwd`) when the uid has no passwd
  *  entry — a container run as `--user 1000:1000`. Caught, because dying with a stack trace instead
  *  of this script's own refusal helps nobody. */
-export function sharedStatePaths(appId, productName, platform = process.platform) {
-  let home;
-  try { home = os.userInfo().homedir; } catch { return []; }
+export function sharedStatePaths(appId, productName, platform = process.platform, uid = process.getuid?.()) {
+  const home = invokingUserHome(uid);
   if (!home) return [];
   if (platform === 'darwin') {
     return [
@@ -228,6 +233,60 @@ export function sharedStatePaths(appId, productName, platform = process.platform
     return [path.join(local, productName), path.join(local, `${productName}-updater`)];
   }
   return [path.join(home, '.cache', productName)];
+}
+
+/** The home a packaged editor resolves its OWN default state against — the input for "where does
+ *  a flagless editor keep its userData", which `blockingEditors` needs as `defaultUserData`.
+ *
+ *  ⚠️ **On darwin that is the passwd home, NOT `$HOME`.** Measured 2026-09-11 with the dev Electron
+ *  binary and a `main.js` printing `app.getPath(...)`: under `HOME=/tmp/fakehome`, `home` and
+ *  `appData` both still report `/Users/<user>` — as do Foundation's `NSHomeDirectory()` and
+ *  `NSSearchPathForDirectoriesInDomains`, which Chromium's `DIR_APP_DATA` is built on. Node's
+ *  `os.homedir()` DOES honour `$HOME`, so deriving the default from it attributes every flagless
+ *  packaged editor on the machine to whatever `$HOME` this process was given.
+ *
+ *  That is #1037 reopened: the guard suite's `sandboxEnv` redirects `$HOME` into a fixture, so a
+ *  sibling clone's `release/` build (flagless, not staged) read as "using `<fixture>/Library/
+ *  Application Support/Modoki Editor`" and reddened `verify`. In production `$HOME` is the passwd
+ *  home and nothing changes.
+ *
+ *  ⚠️ **win32/linux: unchanged, and that is a stated gap, not a finding.** Chromium on linux reads
+ *  `$HOME`/`XDG_CONFIG_HOME` (so `os.homedir()` is the right model there); on win32 it reads the
+ *  known-folder API rather than `%APPDATA%`, which would make `appSupportRoot`'s env read the same
+ *  mismatch — but that is source-reading, not a measurement, and a Windows path hazard is not
+ *  diagnosable from a Mac. `sharedStatePaths`' win32 `process.env.LOCALAPPDATA` read is the same
+ *  shape. Measure on `win` before changing either.
+ *
+ *  ⚠️ **Only when this process runs as the SAME user as the editor it is asking about — so never as
+ *  root.** `os.userInfo()` is the passwd entry of THIS process's uid. Under `sudo -E` (and any sudo
+ *  that keeps `$HOME`) the script is uid 0 while `$HOME` — and therefore `targets()` — is still the
+ *  invoking user's: the passwd home is then `/var/root`, a flagless live editor's userData would be
+ *  attributed there, match no candidate, and the wipe would proceed under it (close-out review of
+ *  #1037). For uid 0 this returns `os.homedir()`, the pre-#1037 derivation, which is correct there
+ *  for the only editor that matters: the invoking user's, whose home IS that `$HOME`. The same rule
+ *  governs `sharedStatePaths` — both go through `invokingUserHome`, so they cannot disagree.
+ *
+ *  `os.userInfo()` throws for a uid with no passwd entry; this then falls back to `os.homedir()`, the
+ *  pre-#1037 derivation. */
+export function editorHomeDir(platform = process.platform, uid = process.getuid?.()) {
+  if (platform !== 'darwin') return os.homedir();
+  return invokingUserHome(uid) ?? os.homedir();
+}
+
+/** The home of the user this process is acting FOR — the one whose `targets()` a run deletes, and so
+ *  the one whose live editor matters. Shared by `editorHomeDir` and `sharedStatePaths` so the two
+ *  cannot disagree about it: they did once, and `sharedStatePaths` still failed OPEN as root after
+ *  `editorHomeDir` had been fixed (close-out review of #1037 — an installed editor launched with a
+ *  foreign `--user-data-dir` stopped blocking the bundle-id-keyed caches under `sudo -E`).
+ *
+ *  - Not root: the passwd home (`os.userInfo()`), which ignores `$HOME` — what Electron uses on
+ *    darwin, and what keeps a sandboxed run's redirected candidates from matching.
+ *  - Root (`uid === 0`, e.g. `sudo -E`): `os.homedir()`, i.e. `$HOME` — the invoking user's, since the
+ *    passwd home would be `/var/root` while `targets()` are still under `$HOME`.
+ *  - `null` when the passwd entry cannot be read (`os.userInfo()` throws for a uid with none). */
+function invokingUserHome(uid) {
+  if (uid === 0) return os.homedir() || null;
+  try { return os.userInfo().homedir || null; } catch { return null; }
 }
 
 /** Roots under which a packaged bundle is a STAGED copy rather than an install.

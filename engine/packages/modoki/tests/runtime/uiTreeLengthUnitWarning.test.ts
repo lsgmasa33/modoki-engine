@@ -34,9 +34,9 @@ const RUI = { id: 'RenderableUI' };
 const UIEL = { id: 'UIElement' };
 const ATTR = { id: 'EntityAttributes' };
 
-// UIElement.width/height default their UNIT to '%' (the trait's own koota default) —
-// matched here, unlike buildTree's `ui.widthUnit || 'px'` fallback (a safety net for a
-// genuinely missing field, never hit in production since the trait always supplies one).
+// UIElement.width/height default their UNIT to '%' (the trait's own koota default) — matched here.
+// buildTree reads every unit through `readUILength` (#840), which resolves a genuinely missing one to
+// THAT field's own default; production never hits it, since the live trait always supplies the field.
 const UI_DEFAULTS = {
   width: 100, height: 40, widthUnit: '%', heightUnit: '%',
   flexDirection: 'row', flexWrap: 'nowrap', justifyContent: 'flex-start', alignItems: 'stretch',

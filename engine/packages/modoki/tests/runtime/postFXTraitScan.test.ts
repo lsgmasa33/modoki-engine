@@ -105,6 +105,15 @@ describe('scanPostFXTraits — what the live path reads', () => {
     expect(scan.bloom).toEqual({ strength: 0.5, radius: 0.25, threshold: 0.75 });
   });
 
+  /** #962 — the two AO cost knobs are READ, not just authored. An authored field nothing reads is
+   *  an Inspector knob that does nothing (CLAUDE.md § author values in the scene). Non-default values
+   *  on purpose: a default-valued field cannot tell "read" from "ignored". */
+  it('reads every AO field, including the cost knobs resolutionScale and samples', () => {
+    const w = createWorld();
+    w.spawn(AmbientOcclusionPostFX({ enabled: true, radius: 0.1, intensity: 0.7, resolutionScale: 0.5, samples: 8 }));
+    expect(scanPostFXTraits(w).ao).toEqual({ radius: 0.1, intensity: 0.7, resolutionScale: 0.5, samples: 8 });
+  });
+
   it('reports a disabled trait as present but NOT configured — the two halves are independent', () => {
     const w = createWorld();
     w.spawn(BloomPostFX({ enabled: false, strength: 0.5, radius: 0.25, threshold: 0.75 }));

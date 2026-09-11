@@ -61,6 +61,7 @@ import { getUIActionNames } from '../../runtime/core/actionRegistry';
 import { getPhysicsLayerNames } from '../../runtime/physics/physicsLayers';
 import { getClipNames, getBoneNames, getNodeMaterials } from '../../runtime/loaders/riggedModelCache';
 import { EntityAttributes } from '../../runtime/traits';
+import { readUILength, readUIAnchorLength, type UIElementLengthField, type UIAnchorLengthField } from '../../runtime/traits/uiLength';
 import { registerFrameCallback, unregisterFrameCallback, startFrameDriver, stopFrameDriver } from '../../runtime/rendering/frameDriver';
 import type { SelectedAsset } from '../store/editorStore';
 
@@ -1037,7 +1038,12 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
     const unitFieldMap = UNIT_FIELD_MAPS[meta.name] ?? {};
     if (unitFieldMap[key]) {
       const unitKey = unitFieldMap[key];
-      const unit = (data[unitKey] as string) || 'px';
+      // Through the one length table (#840): an absent unit is THIS field's own default — '%' for a
+      // size or margin, px for min/max and the anchor offsets — not a blanket px. `UNIT_FIELD_MAPS` only
+      // names UIElement and UIAnchor pairs, so those are the two readers.
+      const unit = meta.name === 'UIAnchor'
+        ? readUIAnchorLength(data, key as UIAnchorLengthField).unit
+        : readUILength(data, key as UIElementLengthField).unit;
       // A stretched axis SIZES ITSELF from the two offsets, so the authored
       // width/height on that axis is inert (applyAnchorStyle/resolveAnchorRect both
       // overwrite it). Gate the axes INDEPENDENTLY — a top-stretch element has an

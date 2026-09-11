@@ -124,7 +124,7 @@ export function scanPostFXTraits(world: World): PostFXTraitScan {
     if (aoFound) return;
     aoFound = true;
     scan.present.ao = true;
-    if (fx.enabled) scan.ao = { radius: fx.radius, intensity: fx.intensity };
+    if (fx.enabled) scan.ao = { radius: fx.radius, intensity: fx.intensity, resolutionScale: fx.resolutionScale, samples: fx.samples };
   });
 
   return scan;
@@ -201,7 +201,7 @@ export function worldWillUseStack(world: World, opts: { isWebGPU: boolean }): bo
   return planStages(maskPostFXRequest(req, getActiveTierOverrides())).length > 0;
 }
 
-const PRESENCE_PLACEHOLDER_AO: AoStageConfig = Object.freeze({ radius: 0, intensity: 0 });
+const PRESENCE_PLACEHOLDER_AO: AoStageConfig = Object.freeze({ radius: 0, intensity: 0, resolutionScale: 0, samples: 0 });
 const PRESENCE_PLACEHOLDER_DOF: DofStageConfig = Object.freeze({ focusDistance: 0, focalLength: 0, bokehScale: 0 });
 const PRESENCE_PLACEHOLDER_BLOOM: BloomStageConfig = Object.freeze({ strength: 0, radius: 0, threshold: 0 });
 const PRESENCE_PLACEHOLDER_VIGNETTE: VignetteStageConfig = Object.freeze({ intensity: 0, smoothness: 0 });

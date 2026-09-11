@@ -26,7 +26,7 @@
  *  `pickHostProject()` (which only proves *some* project exists, not this specific pairing).
  *
  *  The negative case reuses `level-tile.prefab.json` (`LevelTile`) — NOT a prefab with zero
- *  references, but one referenced a DIFFERENT way: `LevelPage`'s own `Tile0`..`Tile24` rows spawn
+ *  references, but one referenced a DIFFERENT way: `LevelPage`'s own `Tile0`..`Tile15` rows spawn
  *  it as a nested `PrefabInstance` (`via: 'prefab'`), a real reference the tree-shaker would
  *  keep, just not an entry-kind USE. Without this the spec would pass on a note that always
  *  renders once ANY reference exists — the same "cannot tell clean from not-running" failure

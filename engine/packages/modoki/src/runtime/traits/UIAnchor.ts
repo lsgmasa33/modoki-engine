@@ -1,5 +1,5 @@
 import { trait } from 'koota';
-import type { UILengthUnit } from './UIElement';
+import { UI_ANCHOR_LENGTHS as L, type UILengthUnit } from './uiLength';
 
 /** The 16 anchor placements. Exported so the layout modules that CONSUME an anchor
  *  (`ui/anchorLayout.ts`, `ui/anchorCss.ts`) can narrow to it instead of widening to
@@ -15,14 +15,17 @@ export type AnchorMode =
 /** UIAnchor — screen positioning and safe area for root UI containers. */
 export const UIAnchor = trait({
   anchor: 'stretch' as AnchorMode,
-  top: 0,
-  topUnit: 'px' as UILengthUnit,
-  left: 0,
-  leftUnit: 'px' as UILengthUnit,
-  right: 0,
-  rightUnit: 'px' as UILengthUnit,
-  bottom: 0,
-  bottomUnit: 'px' as UILengthUnit,
+  // The four offsets take their value AND unit defaults from the one length table (#840), so an
+  // authored-data reader (`readUIAnchorLength`) cannot disagree with this schema about what an
+  // absent unit means. See `uiLength.ts`.
+  top: L.top.value as number,
+  topUnit: L.top.unit as UILengthUnit,
+  left: L.left.value as number,
+  leftUnit: L.left.unit as UILengthUnit,
+  right: L.right.value as number,
+  rightUnit: L.right.unit as UILengthUnit,
+  bottom: L.bottom.value as number,
+  bottomUnit: L.bottom.unit as UILengthUnit,
   pivotX: 0,
   pivotY: 0,
   safeArea: true as boolean,

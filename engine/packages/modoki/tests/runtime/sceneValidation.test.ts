@@ -737,6 +737,27 @@ describe('validateSceneData — UIElement size inert under a stretched UIAnchor,
     expect(res.warnings.filter((w) => /is inert/.test(w))).toEqual([]);
   });
 
+  /** #1031 review F1 — the override targets a member that is a NESTED-INSTANCE reference row. That row
+   *  carries only `EntityAttributes`; the anchor the override has to fight is the CHILD prefab's root
+   *  anchor. The pass used to read raw rows, found no anchor at localId 3, and said nothing. */
+  it('warns for an override on a NESTED member, reading its anchor from the child prefab (#1031)', () => {
+    const CHILD_GUID = 'c3d4e5f6-1111-2222-3333-444455556666';
+    const host = {
+      id: PREFAB_GUID, version: 2, name: 'Host', rootLocalId: 1,
+      entities: [
+        { localId: 1, name: 'Root', traits: { EntityAttributes: { name: 'Root', parentId: 0 } } },
+        { localId: 3, name: 'Ref', prefab: CHILD_GUID, traits: { EntityAttributes: { name: 'Ref', parentId: 1 } } },
+      ],
+    };
+    const child = {
+      id: CHILD_GUID, version: 2, name: 'Child', rootLocalId: 1,
+      entities: [{ localId: 1, name: 'ChildRoot', traits: { UIAnchor: { anchor: 'bottom-stretch' } } }],
+    };
+    const getPrefab: PrefabResolver = (ref) => (ref === PREFAB_GUID ? host : ref === CHILD_GUID ? child : undefined);
+    const res = validateSceneData(instance({ 3: { UIElement: { width: 90, widthUnit: '%' } } }), undefined, getPrefab);
+    expect(res.warnings.join('\n')).toMatch(/overrides\[3\]\.UIElement\.width is inert.*bottom-stretch.*from its prefab, localId 3/s);
+  });
+
   it('warns with NO resolver at all when anchor AND size are both in the same override group', () => {
     const res = validateSceneData(instance({
       1: { UIAnchor: { anchor: 'bottom-stretch' }, UIElement: { width: 90, widthUnit: '%' } },
@@ -1368,6 +1389,25 @@ describe('entryPrefabRootWarnings (#671)', () => {
     expect(out.join('\n')).toMatch(/UIElement\.height is inert/);
   });
 
+  /** #840 (owner decision: refuse) — a pooled row resolves a DELEGATED axis against the scroll view,
+   *  so a viewport unit on the prefab root has no honest answer and the runtime reads that axis as 0.
+   *  This is the author-time half of that refusal. */
+  it('a DELEGATED axis authored in a viewport unit is reported as unsupported — px, % and an absent unit are not (#840)', () => {
+    const unsupported = (out: string[]) => out.filter((w) => /is unsupported/.test(w));
+    const vh = entryPrefabRootWarnings(use(true, true), root({ height: 50, heightUnit: 'vh' }), 'X');
+    expect(unsupported(vh).join('\n')).toMatch(/UIElement\.height is unsupported.*entryHeight is 0.*50vh/);
+    expect(unsupported(entryPrefabRootWarnings(use(true, true), root({ width: 30, widthUnit: 'vmin' }), 'X'))).toHaveLength(1);
+    expect(unsupported(entryPrefabRootWarnings(use(true, true), root({ height: 50, heightUnit: 'px' }), 'X'))).toEqual([]);
+    expect(unsupported(entryPrefabRootWarnings(use(true, true), root({ height: 50, heightUnit: '%' }), 'X'))).toEqual([]);
+    // Absent unit = the field's own default, which for height is `%` — supported.
+    expect(unsupported(entryPrefabRootWarnings(use(true, true), root({ height: 50 }), 'X'))).toEqual([]);
+    // Zero is "no size authored", not a size in a refused unit.
+    expect(unsupported(entryPrefabRootWarnings(use(true, true), root({ height: 0, heightUnit: 'vh' }), 'X'))).toEqual([]);
+    // On a NON-delegated axis the view's own size wins, so the root's unit is moot — the existing
+    // "inert" warning covers it, not this one.
+    expect(unsupported(entryPrefabRootWarnings(use(false, false), root({ height: 50, heightUnit: 'vh' }), 'X'))).toEqual([]);
+  });
+
   it('no rootTraits, or a root with no UIElement: no warnings, no throw', () => {
     expect(entryPrefabRootWarnings(use(false, false), null, 'X')).toEqual([]);
     expect(entryPrefabRootWarnings(use(false, false), {}, 'X')).toEqual([]);
@@ -1392,6 +1432,58 @@ describe('validateSceneData — entry-kind pass (#671)', () => {
     const res = validateSceneData(scene([sceneWithView('LevelScroll')]), undefined, getPrefab);
     expect(res.warnings.join('\n')).toMatch(/entry prefab '.*'\.UIElement\.marginBottom is inert/);
     expect(res.warnings.join('\n')).toMatch(/entry kind 'page'/);
+  });
+
+  /** #1031 — a NESTED-INSTANCE root. The entry prefab's root row is a reference to a child prefab
+   *  and carries only `EntityAttributes`; the margin the pool discards is the child's root plus the
+   *  row's override. The pre-#1031 resolution read the row's own traits, found no `UIElement`, and
+   *  stayed silent. */
+  const CHILD_GUID = 'd0e1f2a3-1111-2222-3333-444455556666';
+  const nestedRootPrefab = {
+    id: PREFAB_GUID, version: 2, name: 'EntryPrefab', rootLocalId: 1,
+    entities: [{
+      localId: 1, name: 'Root', prefab: CHILD_GUID, traits: { EntityAttributes: { name: 'Root', parentId: 0 } },
+      overrides: { 1: { UIElement: { marginBottom: 8 } } },
+    }],
+  };
+  const childPrefab = {
+    id: CHILD_GUID, version: 2, name: 'Child', rootLocalId: 1,
+    entities: [{ localId: 1, name: 'ChildRoot', traits: { UIElement: { width: 100, widthUnit: '%' } } }],
+  };
+  const nestedResolver: PrefabResolver = (ref) =>
+    (ref === PREFAB_GUID ? nestedRootPrefab : ref === CHILD_GUID ? childPrefab : undefined);
+
+  it('reads a NESTED-INSTANCE root through its child prefab plus the row override (#1031)', () => {
+    const res = validateSceneData(scene([sceneWithView('LevelScroll')]), undefined, nestedResolver);
+    expect(res.warnings.join('\n')).toMatch(/entry prefab '.*'\.UIElement\.marginBottom is inert/);
+  });
+
+  it('a nested root whose child cannot be resolved is NOT read from the reference row\'s own traits (#1031)', () => {
+    // ⚠️ The reference row carries a `UIElement` of its own here, deliberately. Without one this case
+    // was green on the pre-#1031 code too (there was nothing on the row to warn about), so it proved
+    // only "no throw". The spawner reads nothing but `parentId` from a reference row, so an
+    // unresolvable child means NO root — not the row standing in for it.
+    const rowWithOwnUI = {
+      ...nestedRootPrefab,
+      entities: [{
+        ...nestedRootPrefab.entities[0],
+        traits: { EntityAttributes: { name: 'Root', parentId: 0 }, UIElement: { marginBottom: 8 } },
+      }],
+    };
+    const parentOnly: PrefabResolver = (ref) => (ref === PREFAB_GUID ? rowWithOwnUI : undefined);
+    const res = validateSceneData(scene([sceneWithView('LevelScroll')]), undefined, parentOnly);
+    expect(res.warnings.filter((w) => /entry kind/.test(w))).toEqual([]);
+  });
+
+  it('with a schema, an override field the trait does not declare is dropped — the spawner drops it too (#1031)', () => {
+    const declaring = (fields: Record<string, unknown>) =>
+      ({ traits: { UIElement: { category: 'component', fields } } }) as unknown as SceneSchema;
+    const declared = validateSceneData(scene([sceneWithView('LevelScroll')]),
+      declaring({ marginBottom: { default: 0 }, width: { default: 0 } }), nestedResolver);
+    expect(declared.warnings.join('\n')).toMatch(/UIElement\.marginBottom is inert/);
+    const undeclared = validateSceneData(scene([sceneWithView('LevelScroll')]),
+      declaring({ width: { default: 0 } }), nestedResolver);
+    expect(undeclared.warnings.join('\n')).not.toMatch(/UIElement\.marginBottom is inert/);
   });
 
   it('stays silent with NO getPrefab — the BYOD path', () => {

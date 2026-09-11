@@ -50,8 +50,8 @@ import { ParticlePassNode } from '../npr/ParticlePassNode';
 import { ensureLineColorOnMaterials, computeNprTexelSize } from '../npr/NPRPostProcess';
 import { PARTICLE_LAYER } from '../layers';
 import {
-  planStages, requiredMrtTargets, needsRebuild,
-  type PostFXRequest, type StageKind,
+  planStages, requiredMrtTargets, needsRebuild, aoPassSettings,
+  type PostFXRequest, type StageKind, type AoStageConfig,
 } from './stackPlan';
 import { pinPassCallDepth, observePassCallDepth, getPassCallDepth } from './passCompileContext';
 import {
@@ -417,7 +417,18 @@ export class PostFXStack {
         // native WGSL compiler diagnostic — see stackPlan.ts's requiredMrtTargets
         // doc for the full trail). Not a wiring choice; the null path doesn't work here.
         const aoPass = ao(ctx.depthTextureNode as never, ctx.normalTextureNode as never, ctx.camera);
-        aoPass.radius.value = cfg.radius;
+        // #962 — the two cost knobs, clamped by `aoPassSettings` because a scene file can hold what
+        // the Inspector would refuse. Both are LIVE: `samples` is a uniform, and `resolutionScale`
+        // is a plain field GTAONode reads in `setSize`, which its own `updateBefore` calls every
+        // frame — so a change lands on the next frame with no rebuild. Left at three's defaults
+        // (1 / 16) this pass renders at full resolution, which is what made an Adreno 730 slow.
+        const applyAoKnobs = (c: AoStageConfig) => {
+          const s = aoPassSettings(c);
+          aoPass.radius.value = c.radius;
+          (aoPass as unknown as { resolutionScale: number }).resolutionScale = s.resolutionScale;
+          (aoPass as unknown as { samples: { value: number } }).samples.value = s.samples;
+        };
+        applyAoKnobs(cfg);
         const aoTex = (aoPass as unknown as { getTextureNode(): ColorNode }).getTextureNode();
         // GTAONode outputs a raw 0..1 occlusion factor with no strength control
         // of its own (three's own doc example multiplies it straight into
@@ -432,7 +443,7 @@ export class PostFXStack {
             applyConfig: (r) => {
               const c = r.ao;
               if (!c) return;
-              aoPass.radius.value = c.radius;
+              applyAoKnobs(c);
               intensityU.value = c.intensity;
             },
             // GTAONode owns its own render target + material (GTAONode.js's

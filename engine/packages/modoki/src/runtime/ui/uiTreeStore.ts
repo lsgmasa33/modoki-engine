@@ -21,6 +21,7 @@ import { UISettings } from '../traits/UISettings';
 import { scrollSnapChildStyle } from './scrollViewDom';
 import { NO_BEHAVIOR_REQUEST } from '../traits/UIScrollView';
 import { findLengthUnitSuspects, formatLengthUnitWarning, lengthUnitWarningKey } from './lengthUnitWarning';
+import { readUILength, readUIAnchorLength } from '../traits/uiLength';
 export { onEditorDirty, setEditorDirtyCallback, markUIDirty } from '../core/uiDirty';
 import type { World } from 'koota';
 import type { UIActionBinding } from './bindings';
@@ -400,22 +401,22 @@ function buildTree(world: World): UINodeData[] | null {
         guid: '',
         generation: entity.generation(),
         width: ui.width, height: ui.height,
-        widthUnit: ui.widthUnit || 'px', heightUnit: ui.heightUnit || 'px',
+        widthUnit: readUILength(ui, 'width').unit, heightUnit: readUILength(ui, 'height').unit,
         flexDirection: ui.flexDirection, flexWrap: ui.flexWrap || 'nowrap', justifyContent: ui.justifyContent,
-        alignItems: ui.alignItems, gap: ui.gap, gapUnit: ui.gapUnit || 'px',
+        alignItems: ui.alignItems, gap: ui.gap, gapUnit: readUILength(ui, 'gap').unit,
         flexGrow: ui.flexGrow, flexShrink: ui.flexShrink,
-        paddingTop: ui.paddingTop, paddingTopUnit: ui.paddingTopUnit || 'px',
-        paddingLeft: ui.paddingLeft, paddingLeftUnit: ui.paddingLeftUnit || 'px',
-        paddingRight: ui.paddingRight, paddingRightUnit: ui.paddingRightUnit || 'px',
-        paddingBottom: ui.paddingBottom, paddingBottomUnit: ui.paddingBottomUnit || 'px',
-        marginTop: ui.marginTop || 0, marginTopUnit: ui.marginTopUnit || 'px',
-        marginRight: ui.marginRight || 0, marginRightUnit: ui.marginRightUnit || 'px',
-        marginBottom: ui.marginBottom || 0, marginBottomUnit: ui.marginBottomUnit || 'px',
-        marginLeft: ui.marginLeft || 0, marginLeftUnit: ui.marginLeftUnit || 'px',
-        minWidth: ui.minWidth || 0, minWidthUnit: ui.minWidthUnit || 'px',
-        maxWidth: ui.maxWidth || 0, maxWidthUnit: ui.maxWidthUnit || 'px',
-        minHeight: ui.minHeight || 0, minHeightUnit: ui.minHeightUnit || 'px',
-        maxHeight: ui.maxHeight || 0, maxHeightUnit: ui.maxHeightUnit || 'px',
+        paddingTop: ui.paddingTop, paddingTopUnit: readUILength(ui, 'paddingTop').unit,
+        paddingLeft: ui.paddingLeft, paddingLeftUnit: readUILength(ui, 'paddingLeft').unit,
+        paddingRight: ui.paddingRight, paddingRightUnit: readUILength(ui, 'paddingRight').unit,
+        paddingBottom: ui.paddingBottom, paddingBottomUnit: readUILength(ui, 'paddingBottom').unit,
+        marginTop: ui.marginTop || 0, marginTopUnit: readUILength(ui, 'marginTop').unit,
+        marginRight: ui.marginRight || 0, marginRightUnit: readUILength(ui, 'marginRight').unit,
+        marginBottom: ui.marginBottom || 0, marginBottomUnit: readUILength(ui, 'marginBottom').unit,
+        marginLeft: ui.marginLeft || 0, marginLeftUnit: readUILength(ui, 'marginLeft').unit,
+        minWidth: ui.minWidth || 0, minWidthUnit: readUILength(ui, 'minWidth').unit,
+        maxWidth: ui.maxWidth || 0, maxWidthUnit: readUILength(ui, 'maxWidth').unit,
+        minHeight: ui.minHeight || 0, minHeightUnit: readUILength(ui, 'minHeight').unit,
+        maxHeight: ui.maxHeight || 0, maxHeightUnit: readUILength(ui, 'maxHeight').unit,
         alignSelf: ui.alignSelf || 'auto', zIndex: ui.zIndex || 0, rotation: ui.rotation || 0,
         // `?? 1`, NOT `|| 1`: 0 is a legitimate authored scale (a pop-in clip's first keyframe),
         // and `||` would silently promote it to full size — the animation would start already-open.
@@ -423,7 +424,7 @@ function buildTree(world: World): UINodeData[] | null {
         overflow: ui.overflow, isVisible: ui.isVisible,
         pointerThrough: ui.pointerThrough === true,
         swallowClicks: ui.swallowClicks === true,
-        minTapSize: ui.minTapSize || 0, minTapSizeUnit: ui.minTapSizeUnit || 'px',
+        minTapSize: ui.minTapSize || 0, minTapSizeUnit: readUILength(ui, 'minTapSize').unit,
         scrollbarStyle: ui.scrollbarStyle || 'auto',
         scrollbarThumbColor: ui.scrollbarThumbColor ?? 0x888888,
         scrollbarTrackColor: ui.scrollbarTrackColor ?? 0xdddddd,
@@ -443,11 +444,11 @@ function buildTree(world: World): UINodeData[] | null {
         // fix" and "eleven borders in a shipped project got darker" are the same edit.
         borderColor: ui.borderColor ?? 0x333333, borderOpacity: ui.borderOpacity ?? 1, opacity: ui.opacity ?? 1,
         text: ui.text || '', fontFamily: resolveUIFontFamily(ui.fontFamily as string, ui.systemFont as string),
-        fontSize: ui.fontSize || 16, fontSizeUnit: ui.fontSizeUnit || 'px', fontWeight: ui.fontWeight || 'normal',
+        fontSize: ui.fontSize || 16, fontSizeUnit: readUILength(ui, 'fontSize').unit, fontWeight: ui.fontWeight || 'normal',
         autoFitText: ui.autoFitText === true, fontSizeMin: ui.fontSizeMin || 0,
         fontStyle: ui.fontStyle || 'normal', textColor: ui.textColor ?? 0xffffff, textOpacity: ui.textOpacity ?? 1,
         textAlign: ui.textAlign || 'left',
-        lineHeight: ui.lineHeight || 0, letterSpacing: ui.letterSpacing || 0, letterSpacingUnit: ui.letterSpacingUnit || 'px',
+        lineHeight: ui.lineHeight || 0, letterSpacing: ui.letterSpacing || 0, letterSpacingUnit: readUILength(ui, 'letterSpacing').unit,
         textShadowColor: ui.textShadowColor || 0, textShadowOpacity: ui.textShadowOpacity ?? 1, textShadowOffsetX: ui.textShadowOffsetX || 0,
         textShadowOffsetY: ui.textShadowOffsetY || 0, textShadowBlur: ui.textShadowBlur || 0,
         textStrokeColor: ui.textStrokeColor || 0, textStrokeOpacity: ui.textStrokeOpacity ?? 1, textStrokeWidth: ui.textStrokeWidth || 0,
@@ -503,10 +504,10 @@ function buildTree(world: World): UINodeData[] | null {
         const anc = entity.get(_anchorMeta.trait) as any;
         node.anchor = {
           anchor: anc.anchor,
-          top: anc.top || 0, topUnit: anc.topUnit || 'px',
-          right: anc.right || 0, rightUnit: anc.rightUnit || 'px',
-          bottom: anc.bottom || 0, bottomUnit: anc.bottomUnit || 'px',
-          left: anc.left || 0, leftUnit: anc.leftUnit || 'px',
+          top: anc.top || 0, topUnit: readUIAnchorLength(anc, 'top').unit,
+          right: anc.right || 0, rightUnit: readUIAnchorLength(anc, 'right').unit,
+          bottom: anc.bottom || 0, bottomUnit: readUIAnchorLength(anc, 'bottom').unit,
+          left: anc.left || 0, leftUnit: readUIAnchorLength(anc, 'left').unit,
           pivotX: anc.pivotX || 0, pivotY: anc.pivotY || 0,
           safeArea: anc.safeArea,
         };

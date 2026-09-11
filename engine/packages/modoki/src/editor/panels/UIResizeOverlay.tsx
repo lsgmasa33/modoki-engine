@@ -11,6 +11,7 @@ import { notifyFieldEdited } from '../animation/recording';
 import { useEditorStore } from '../store/editorStore';
 import { anchorRefPoint, anchorDragAxes, accumulateAncestorScale, computeMoveOffsets, computeResize, containingBlockSize, frameToLogicalRect, paddingBoxRect } from '../scene/uiResizeMath';
 import { resolveLengthPx } from '../../runtime/ui/anchorLayout';
+import { readUILength, readUIAnchorLength } from '../../runtime/traits/uiLength';
 import { registerHandleProvider, type InteractionHandle } from '../../runtime/rendering/interactionHandles';
 
 export type UIResizeHandle =
@@ -108,11 +109,11 @@ function readUIElement(entityId: number): {
   const data = entity.get(uiElMeta.trait) as any;
   return {
     width: data.width, height: data.height,
-    widthUnit: data.widthUnit || 'px', heightUnit: data.heightUnit || 'px',
+    widthUnit: readUILength(data, 'width').unit, heightUnit: readUILength(data, 'height').unit,
     marginTop: data.marginTop || 0, marginRight: data.marginRight || 0,
     marginBottom: data.marginBottom || 0, marginLeft: data.marginLeft || 0,
-    marginTopUnit: data.marginTopUnit || 'px', marginRightUnit: data.marginRightUnit || 'px',
-    marginBottomUnit: data.marginBottomUnit || 'px', marginLeftUnit: data.marginLeftUnit || 'px',
+    marginTopUnit: readUILength(data, 'marginTop').unit, marginRightUnit: readUILength(data, 'marginRight').unit,
+    marginBottomUnit: readUILength(data, 'marginBottom').unit, marginLeftUnit: readUILength(data, 'marginLeft').unit,
   };
 }
 
@@ -140,8 +141,8 @@ function readUIAnchor(entityId: number): {
   const data = entity.get(anchorMeta.trait) as any;
   return {
     anchor: data.anchor || 'stretch', pivotX: data.pivotX || 0, pivotY: data.pivotY || 0,
-    top: data.top || 0, topUnit: data.topUnit || 'px', left: data.left || 0, leftUnit: data.leftUnit || 'px',
-    right: data.right || 0, rightUnit: data.rightUnit || 'px', bottom: data.bottom || 0, bottomUnit: data.bottomUnit || 'px',
+    top: data.top || 0, topUnit: readUIAnchorLength(data, 'top').unit, left: data.left || 0, leftUnit: readUIAnchorLength(data, 'left').unit,
+    right: data.right || 0, rightUnit: readUIAnchorLength(data, 'right').unit, bottom: data.bottom || 0, bottomUnit: readUIAnchorLength(data, 'bottom').unit,
   };
 }
 

@@ -35,6 +35,30 @@ export interface AoStageConfig {
    *  own (it outputs a raw 0..1 occlusion factor) — this lerps toward it so the
    *  effect doesn't crush shadows at full strength by default. */
   intensity: number;
+  /** Fraction of the drawing buffer the pass renders at (GTAONode `resolutionScale`) —
+   *  the pass's dominant cost on a mobile GPU (#962). */
+  resolutionScale: number;
+  /** Horizon samples per pixel (GTAONode `samples`). */
+  samples: number;
+}
+
+/** The smallest AO resolution scale the stack will apply. Below this the AO target is a handful of
+ *  pixels stretched over the screen — never a look anyone authors on purpose. */
+export const AO_MIN_RESOLUTION_SCALE = 0.1;
+
+/** The AO cost knobs as GTAONode must receive them: `resolutionScale` in
+ *  [AO_MIN_RESOLUTION_SCALE, 1], `samples` a whole number ≥ 1.
+ *
+ *  A scene file can hold anything the Inspector's min/max would refuse — a hand-edited `0` sizes the
+ *  AO render target to nothing, and a fractional sample count feeds GTAO's direction/step loop
+ *  counts. So the stack applies THESE, never the raw fields. A non-finite value falls back to three's
+ *  own default (1 / 16), which is also the trait default — i.e. to today's behaviour. */
+export function aoPassSettings(c: Pick<AoStageConfig, 'resolutionScale' | 'samples'>): { resolutionScale: number; samples: number } {
+  const resolutionScale = Number.isFinite(c.resolutionScale)
+    ? Math.min(1, Math.max(AO_MIN_RESOLUTION_SCALE, c.resolutionScale))
+    : 1;
+  const samples = Number.isFinite(c.samples) ? Math.max(1, Math.round(c.samples)) : 16;
+  return { resolutionScale, samples };
 }
 
 /** FXAA tail-AA stage. Phase 3 moved FXAA OUT of NPR (where it reasoned about
@@ -140,7 +164,9 @@ function serializeDof(c: DofStageConfig): string {
 }
 
 function serializeAo(c: AoStageConfig): string {
-  return `${c.radius}:${c.intensity}`;
+  // Every live field belongs here: Scene3D only calls `applyConfig` when this signature changes, so
+  // a field left out is an Inspector knob that does nothing until something ELSE changes (#962).
+  return `${c.radius}:${c.intensity}:${c.resolutionScale}:${c.samples}`;
 }
 
 function serializeNpr(c: NprStageConfig): string {

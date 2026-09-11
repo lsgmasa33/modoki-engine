@@ -404,9 +404,20 @@ none of the operations we bound accepts an `AbortSignal`: a Pixi `Application.in
 whose late result you then THROW AWAY is strictly worse than not bounding it: a slow-but-alive
 bring-up that used to succeed at 8.5 s instead exhausts its retries and leaves a permanently black
 surface. Both sites therefore route the late arrival back into the same success path the on-time one
-takes — `initSlotApp`'s cure for 2D, `adoptRenderer` for 3D — with a supersession token deciding
-whether it is still wanted. **If you add a bound, say where the late result goes before you add
-it.**
+takes — `initSlotApp`'s cure for 2D, `adopt` in `rendering/scene3DBringUp.ts` for 3D — with a
+supersession token deciding whether it is still wanted. **If you add a bound, say where the late
+result goes before you add it.**
+
+⚠️ **A fix that lives in a component closure is a fix nothing pins.** #819 and #820 landed inside
+`Scene3D.tsx`'s effect; deleting all three changes (the bound, the token, the retirement) left 18,116
+tests passing (#824). They were extracted to `scene3DBringUp.ts` — `boot()`/`rebuild()`,
+`boundedCaptureReadback` — and `scene3DBringUp.test.ts` now pins each, including a
+`rendererRecovery` run where every attempt hangs and the LAST late renderer is adopted.
+⚠️ **Extraction moves the gap one layer out, it does not close it on its own**: the module's tests
+cannot see how `Scene3D.tsx` wires it, and the close-out review measured `rebuild: bringUp.boot` and
+a no-op capture slot leaving 144 tests green. `tests/architecture/scene3DBringUpWired.test.ts`
+source-scans that wiring; pair any future extraction with the same. The same
+shape is still open in the editor's `SceneView.tsx`, whose rebuild has no bound at all (#1052).
 
 ### The rule
 
@@ -422,7 +433,7 @@ Three answers, and you must write one down:
 |---|---|---|
 | `{ adopt: why }` | a late settlement is handled on its OWN path | `canvas2DPool` — `initSlotApp` cures whichever attempt wins |
 | `{ discard: why }` | the late value owns nothing reclaimable | `gpuClock`'s stale duration; `handleEval`'s uncancellable agent code |
-| `{ onSettled }` | it holds something that must be released | `Scene3D` disposing a late renderer; `msdfGenerate` disposing a late worker |
+| `{ onSettled }` | it holds something that must be released | `scene3DBringUp` disposing a superseded late renderer; `msdfGenerate` disposing a late worker |
 
 `adopt` and `discard` are both runtime no-ops. The distinction is type-level and load-bearing **at the
 source line**: the string is a written justification the next author gets for free instead of
@@ -441,7 +452,8 @@ coverage — this is a real hole in the family, not a solved member.
 wait for the abandoned generation (that restores the wedge the timeout exists to remove) and cannot
 cancel it (`MSDF.dispose()` awaits a comlink round-trip *before* `terminate()`, so it queues behind
 the very call that is stuck). It retires the generator instead: the next call builds a fresh Worker,
-and the window is per-worker. `Scene3D` does the same with its pooled render target.
+and the window is per-worker. `Scene3D` does the same with its pooled render target
+(`boundedCaptureReadback` in `scene3DBringUp.ts`).
 
 ### When a hand-rolled deadline is the RIGHT answer
 

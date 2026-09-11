@@ -56,8 +56,17 @@ export declare function blockingEditors(
 /** The paths a live INSTALLED editor holds regardless of its `--user-data-dir` — bundle-id-keyed
  *  on darwin, product-name-keyed on win32. ⚠️ Resolved against the REAL home (`os.userInfo()`,
  *  which ignores `$HOME`), which is what keeps a sandboxed run — whose candidates move with `$HOME`
- *  — unable to match them. Returns `[]` rather than throwing when the uid has no passwd entry. */
-export declare function sharedStatePaths(appId: string, productName: string, platform?: string): string[];
+ *  — unable to match them; as ROOT (`uid === 0`, e.g. `sudo -E`) it follows `$HOME` instead, so the
+ *  invoking user's live editor still blocks. Returns `[]` rather than throwing when the uid has no
+ *  passwd entry. */
+export declare function sharedStatePaths(appId: string, productName: string, platform?: string, uid?: number): string[];
+
+/** The home a packaged editor resolves its OWN default state against — the input for a flagless
+ *  editor's `defaultUserData`. ⚠️ On darwin that is the passwd home, NOT `$HOME`: Electron's
+ *  `app.getPath('home'|'appData')` ignore `$HOME` there (measured), while `os.homedir()` honours it.
+ *  Other platforms — and a process running as ROOT (`uid === 0`, e.g. `sudo -E`, where the passwd
+ *  home is `/var/root` but `$HOME` is still the invoking user's) — return `os.homedir()`. */
+export declare function editorHomeDir(platform?: string, uid?: number): string;
 
 /** Roots under which a packaged bundle is a STAGED copy (a smoke) rather than an install. */
 export declare function stagingRoots(): string[];

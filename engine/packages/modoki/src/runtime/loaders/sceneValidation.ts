@@ -22,6 +22,10 @@ import {
 // time and this one is deliberately dependency-light (see module docs above).
 import { parseEntryPrefabs } from '../traits/entryPrefabBank';
 import { hasDocKey } from '../core/docKeys';
+import { readUILength, type UIElementLengthField } from '../traits/uiLength';
+import {
+  effectivePrefabRootTraits, effectivePrefabMemberTraits, type EffectiveMemberOptions,
+} from './prefabOverrides';
 
 /** Asset-reference fields, keyed by the trait they live on. A value in one of
  *  these fields must be a GUID or an external URL — never a project-internal
@@ -231,15 +235,19 @@ export function makeAssetRefResolver(guids: Iterable<unknown>): AssetRefResolver
  *  kept because it is the evidence for the noise budget, not a current inventory. Do not read a
  *  quiet sweep as this check being broken — verify by perturbing a value (a `90` under a
  *  `bottom-stretch` anchor still reports), which is what the tests do. */
-function isNeutralSize(v: unknown, unit: unknown): boolean {
-  return v === 0 || (v === 100 && unitOrDefault(unit) === '%');
+function isNeutralSize(v: unknown, unit: unknown, axis: 'width' | 'height'): boolean {
+  return v === 0 || (v === 100 && unitOf(axis, unit) === '%');
 }
 
 /** The unit a UIElement length field ACTUALLY has, given what the scene JSON carries.
  *
- *  ⚠️ **An absent unit means `'%'`, not `'px'`.** Every `UIElement` length unit defaults to `'%'`
- *  (`runtime/traits/UIElement.ts`) and a scene save STRIPS any field equal to its trait default, so
- *  the common on-disk shape for a percentage is the number with no unit beside it. Reading that as
+ *  Resolved through the one length table (`runtime/traits/uiLength.ts`, #840), so it needs the FIELD.
+ *
+ *  ⚠️ **An absent unit means that field's own default** — `'%'` for every field this module reads it
+ *  for (`width`/`height`/`margin*`), but `'px'` for others (`gap`, `min*`/`max*`). This used to be a
+ *  blanket `'%'` whatever the field: right for every caller it had, and wrong for the first one to hand
+ *  it a px-default field. A scene save STRIPS any field equal to its trait default, so for a size the
+ *  common on-disk shape for a percentage is the number with no unit beside it. Reading that as
  *  `px` was wrong twice over: it made `isNeutralSize` miss `width: 100` (a full-bleed box the
  *  editor itself writes), and it made the message quote a unit the author never chose.
  *
@@ -248,8 +256,8 @@ function isNeutralSize(v: unknown, unit: unknown): boolean {
  *  `AdBannerSlot` in `games/wordweave`'s — each reported as "the authored 100px" when the author
  *  wrote 100%. Against a noise budget whose whole point was 3 real findings versus 102 false ones,
  *  six is not a rounding error. */
-function unitOrDefault(unit: unknown): string {
-  return typeof unit === 'string' && unit ? unit : '%';
+function unitOf(field: UIElementLengthField, unit: unknown): string {
+  return readUILength({ [`${field}Unit`]: unit }, field).unit;
 }
 
 /**
@@ -355,10 +363,10 @@ export function inertLayoutWarnings(traits: unknown, label: string): string[] {
     for (const axis of ['width', 'height'] as const) {
       const v = (uel as Record<string, unknown>)[axis];
       const unit = (uel as Record<string, unknown>)[`${axis}Unit`];
-      if (typeof v === 'number' && !isNeutralSize(v, unit) && isSizeInert(anchor, axis)) {
+      if (typeof v === 'number' && !isNeutralSize(v, unit, axis) && isSizeInert(anchor, axis)) {
         // Echo the value WITH its unit — '90%' is what the author sees in the Inspector, so a
         // bare '90' makes them hunt for which field is meant.
-        const authored = `${v}${unitOrDefault(unit)}`;
+        const authored = `${v}${unitOf(axis, unit)}`;
         out.push(
           `${label}.UIElement.${axis} is inert: the '${anchor}' anchor sizes that axis from its `
           + `${axis === 'width' ? 'left/right' : 'top/bottom'} offsets, which overwrite the authored ${authored}`,
@@ -390,7 +398,7 @@ export function inertLayoutWarnings(traits: unknown, label: string): string[] {
       const v = (uel as Record<string, unknown>)[key];
       if (typeof v !== 'number' || v === 0) continue;
       const unit = (uel as Record<string, unknown>)[`${key}Unit`];
-      const authored = `${v}${unitOrDefault(unit)}`;
+      const authored = `${v}${unitOf(key as UIElementLengthField, unit)}`;
       out.push(
         `${label}.UIElement.${key} is inert: the '${marginAnchorMode}' anchor positions this `
         + `element from its own offsets, which overwrite all four margins — the authored ${authored} `
@@ -697,15 +705,30 @@ export function entryPrefabRootWarnings(
   // Size: discarded ONLY on an axis the view does not delegate.
   for (const axis of ['width', 'height'] as const) {
     const delegated = axis === 'width' ? use.delegatesWidth : use.delegatesHeight;
-    if (delegated) continue;
     const v = el[axis];
     const unit = el[`${axis}Unit`];
-    if (typeof v !== 'number' || isNeutralSize(v, unit)) continue;
+    if (delegated) {
+      // The view READS this axis from the prefab root, and a pooled row resolves it against the SCROLL
+      // VIEW — so only px and % can be honoured. Anything else (a viewport unit) is refused at runtime,
+      // where the axis reads 0 (#840, owner decision). Say so here, where the author is.
+      const resolved = unitOf(axis, unit);
+      if (typeof v === 'number' && v !== 0 && resolved !== 'px' && resolved !== '%') {
+        const entryField = axis === 'width' ? 'entryWidth' : 'entryHeight';
+        out.push(
+          `${label}.UIElement.${axis} is unsupported: this prefab is ${via}, and that view reads the row's `
+          + `${axis} from this root (${entryField} is 0), but a pooled row resolves it against the scroll `
+          + `view, so only px and % are honoured — the authored ${v}${resolved} leaves the row 0 on that `
+          + `axis. Author px or % on the root, or a non-zero ${entryField} on the view.`,
+        );
+      }
+      continue;
+    }
+    if (typeof v !== 'number' || isNeutralSize(v, unit, axis)) continue;
     const entryField = axis === 'width' ? 'entryWidth' : 'entryHeight';
     out.push(
       `${label}.UIElement.${axis} is inert: this prefab is ${via}, and that view authors a `
       + `non-zero ${entryField}, so the row's ${axis} comes from the view — the authored `
-      + `${v}${unitOrDefault(unit)} is discarded. Set ${entryField} to 0 if you want the view to `
+      + `${v}${unitOf(axis, unit)} is discarded. Set ${entryField} to 0 if you want the view to `
       + `read this prefab's own size instead.`,
     );
   }
@@ -903,22 +926,27 @@ export function validateSceneData(
         if (typeof src === 'string' && src && getPrefab) {
           try { prefab = getPrefab(src); } catch { prefab = undefined; }
         }
-        // Build a localId → traits lookup from the resolved prefab, tolerating any
-        // malformed shape by falling back to "unresolved" (no throw).
-        let prefabTraitsByLocalId: Map<number, Record<string, unknown>> | undefined;
-        try {
-          const entities = (prefab as { entities?: unknown } | undefined)?.entities;
-          if (Array.isArray(entities)) {
-            prefabTraitsByLocalId = new Map();
-            for (const pe of entities) {
-              const localId = (pe as { localId?: unknown } | null)?.localId;
-              const traits = (pe as { traits?: unknown } | null)?.traits;
-              if (typeof localId === 'number' && traits && typeof traits === 'object') {
-                prefabTraitsByLocalId.set(localId, traits as Record<string, unknown>);
-              }
-            }
+        // The traits each prefab MEMBER would carry, composed the way the spawner builds it
+        // (`effectivePrefabMemberTraits`, #1031) — NOT the row's own `traits`. A row that is a
+        // nested-instance reference carries little more than `EntityAttributes`; the entity it
+        // produces is the child prefab's root plus the row's overrides, and reading the row made this
+        // pass blind to that child's `UIAnchor`, so a scene override sizing a stretched nested member
+        // warned nothing. Any malformed shape reads as "unresolved" (no throw). Memoised per localId,
+        // because several override groups can address one member.
+        const memberOpts = schemaMemberOptions(schema);
+        const memberTraits = new Map<number, Record<string, unknown> | undefined>();
+        const prefabTraitsOf = (localId: number): Record<string, unknown> | undefined => {
+          if (!memberTraits.has(localId)) {
+            let traits: Record<string, unknown> | undefined;
+            try {
+              traits = prefab && getPrefab
+                ? effectivePrefabMemberTraits(prefab, localId, getPrefab, memberOpts) ?? undefined
+                : undefined;
+            } catch { traits = undefined; }
+            memberTraits.set(localId, traits);
           }
-        } catch { prefabTraitsByLocalId = undefined; }
+          return memberTraits.get(localId);
+        };
 
         for (const [localIdKey, traitOverridesRaw] of Object.entries(overrides as Record<string, unknown>)) {
           if (!traitOverridesRaw || typeof traitOverridesRaw !== 'object') continue;
@@ -937,7 +965,7 @@ export function validateSceneData(
           const ovUan = traitOverrides.UIAnchor;
           const ovUanObj = ovUan && typeof ovUan === 'object' ? (ovUan as Record<string, unknown>) : undefined;
 
-          const prefabTraits = prefabTraitsByLocalId?.get(Number(localIdKey));
+          const prefabTraits = prefabTraitsOf(Number(localIdKey));
           const prefabUel = prefabTraits?.UIElement as Record<string, unknown> | undefined;
           const prefabUan = prefabTraits?.UIAnchor as Record<string, unknown> | undefined;
 
@@ -961,8 +989,8 @@ export function validateSceneData(
               if (!(axis in ovUelObj) && !(unitField in ovUelObj)) continue;
               const v = axis in ovUelObj ? ovUelObj[axis] : prefabUel?.[axis];
               const unit = unitField in ovUelObj ? ovUelObj[unitField] : prefabUel?.[unitField];
-              if (typeof v === 'number' && !isNeutralSize(v, unit) && isSizeInert(anchor, axis)) {
-                const authored = `${v}${unitOrDefault(unit)}`;
+              if (typeof v === 'number' && !isNeutralSize(v, unit, axis) && isSizeInert(anchor, axis)) {
+                const authored = `${v}${unitOf(axis, unit)}`;
                 warnings.push(
                   `${label}.overrides[${localIdKey}].UIElement.${axis} is inert: the '${anchor}' anchor `
                   + `${anchorFromPrefab ? `(from its prefab, localId ${localIdKey}) ` : ''}`
@@ -992,7 +1020,7 @@ export function validateSceneData(
               const v = key in ovUelObj ? ovUelObj[key] : prefabUel?.[key];
               if (typeof v !== 'number' || v === 0) continue;
               const unit = unitField in ovUelObj ? ovUelObj[unitField] : prefabUel?.[unitField];
-              const authored = `${v}${unitOrDefault(unit)}`;
+              const authored = `${v}${unitOf(key as UIElementLengthField, unit)}`;
               warnings.push(
                 `${label}.overrides[${localIdKey}].UIElement.${key} is inert: the '${marginAnchorMode}' anchor `
                 + `${anchorFromPrefab ? `(from its prefab, localId ${localIdKey}) ` : ''}`
@@ -1026,7 +1054,7 @@ export function validateSceneData(
       seen.add(key);
       let prefab: unknown;
       try { prefab = getPrefab(use.prefabGuid); } catch { prefab = undefined; }
-      const root = prefabRootTraits(prefab);
+      const root = prefabRootTraits(prefab, getPrefab, schema);
       if (!root) continue; // unresolved — the bank check above already reports a dangling GUID
       warnings.push(...entryPrefabRootWarnings(use, root, `entry prefab '${use.prefabGuid}'`, schema));
     }
@@ -1035,19 +1063,51 @@ export function validateSceneData(
   return { warnings, schemaApplied };
 }
 
-/** The traits bag of a resolved prefab's ROOT entity, or undefined for any malformed shape.
+/** The traits bag a spawned instance of `prefab` would carry on its ROOT entity, or undefined when
+ *  no root resolves (a malformed shape, no row at `rootLocalId`, or a nested-instance root whose
+ *  child prefab `getPrefab` cannot supply).
  *
- *  Mirrors `entryPrefabProvider.rootSize`'s own root resolution (`rootLocalId`, falling back to
- *  the first entity) deliberately: if these two disagreed about which entity is the root, the
- *  validator would warn about a different element than the one the runtime pins. */
-function prefabRootTraits(prefab: unknown): Record<string, unknown> | undefined {
-  const entities = (prefab as { entities?: unknown } | undefined)?.entities;
-  if (!Array.isArray(entities) || entities.length === 0) return undefined;
-  const rootLocal = (prefab as { rootLocalId?: unknown }).rootLocalId
-    ?? (entities[0] as { localId?: unknown } | null)?.localId;
-  const root = entities.find((e) => (e as { localId?: unknown } | null)?.localId === rootLocal) ?? entities[0];
-  const traits = (root as { traits?: unknown } | null)?.traits;
-  return traits && typeof traits === 'object' ? traits as Record<string, unknown> : undefined;
+ *  Composed by `effectivePrefabRootTraits` — the SAME function `entryPrefabProvider` uses, so the
+ *  validator cannot warn about a different element than the one the runtime pins. Before #1031
+ *  each file carried its own copy of "read the root row's `traits`", and both were blind to a
+ *  nested-instance root: its row holds little more than `EntityAttributes`, while the real
+ *  `UIElement` is the child prefab's root plus the row's overrides. */
+function prefabRootTraits(
+  prefab: unknown, getPrefab: PrefabResolver, schema?: SceneSchema,
+): Record<string, unknown> | undefined {
+  return effectivePrefabRootTraits(prefab, getPrefab, schemaMemberOptions(schema)) ?? undefined;
+}
+
+/** The spawner's override rules, rebuilt from a `SceneSchema` because this module has no trait
+ *  registry.
+ *
+ *  - **Trait names** (`traitKind`): a trait the schema lists is a tag or a component by its category,
+ *    and one it does NOT list is unknown and skipped — as the spawner skips a name its registry lacks.
+ *    With no schema at all, every name is treated as a known component.
+ *  - **Fields** (`acceptField`): a field counts when the schema lists it for that trait, or when the
+ *    schema cannot answer at all (no schema, the trait not listed, no declared fields).
+ *
+ *  ⚠️ **Not an exact mirror, and the direction matters.** The spawner accepts ANY field of an AoS trait
+ *  (`isPersistentTraitField`: its `soaSchema` is null), but `buildSceneSchema` lists an AoS trait's
+ *  factory fields, so for an AoS trait this filter is STRICTER than the spawner and can under-report an
+ *  override on a field outside that list. Both callers read only `UIElement`/`UIAnchor`, which are SoA,
+ *  so the gap is recorded rather than modelled — a caller reading an AoS trait must close it first. */
+function schemaMemberOptions(schema?: SceneSchema): EffectiveMemberOptions {
+  if (!schema?.traits) return {};
+  const traits = schema.traits;
+  // `hasOwnProperty`: trait and field names come from a file (#986).
+  const traitOf = (name: string) => (Object.prototype.hasOwnProperty.call(traits, name) ? traits[name] : undefined);
+  return {
+    traitKind: (name) => {
+      const t = traitOf(name);
+      return t ? (t.category === 'tag' ? 'tag' : 'component') : undefined;
+    },
+    acceptField: (name, field) => {
+      const fields = traitOf(name)?.fields;
+      if (!fields || Object.keys(fields).length === 0) return true;
+      return Object.prototype.hasOwnProperty.call(fields, field);
+    },
+  };
 }
 
 /** Read an entity's serialized EntityAttributes object, or undefined. */

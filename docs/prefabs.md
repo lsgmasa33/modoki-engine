@@ -494,6 +494,56 @@ the file.**
 - **Caching:** the editor's sync instantiate reads nested children from the
   editor `prefabCache`; async entry points call `preloadNestedPrefabs()` first so
   they're present (also why edit-mode save references rather than flattens).
+- **A prefab's effective ROOT, without spawning** (#1031): `effectivePrefabRootTraits`
+  in `runtime/loaders/prefabOverrides.ts` answers "what traits would a spawned
+  instance's root carry?" — for code that must not spawn: the `UIEntries` pool
+  provider (`rootSize`, `rootAuthoredUI`, `isCached`) and the scene validator's
+  entry-prefab pass. It mirrors `instantiatePrefabIntoWorld` step for step:
+  - the root is `rootLocalId ?? 1` — **not** "the first row", which the provider and
+    the validator used to fall back to and the spawner never did;
+  - a **nested-instance root row** resolves to the CHILD prefab's root, with the row's
+    `overrides` merged UNDER whatever an outer layer addresses at that row (outer
+    wins), its `nestedOverrides` threaded on, and its `removedTraits` applied in the
+    child. The row's own `traits` are not part of the answer — the spawner reads
+    only `parentId` there;
+  - the outer layer's `overrides` for the root fold on after that, then its
+    `removedTraits` — the spawner's order (overrides, then structure);
+  - no root would spawn (an uncached child, no row at the root localId, a cycle)
+    → `null`, and the provider reports the prefab **not cached**, because
+    `spawnInstance` would return 0.
+
+  **Any member, not just the root:** `effectivePrefabMemberTraits(prefab, localId, …)`
+  is the general form (the root is `localId = rootLocalId ?? 1`). The validator's
+  instance-override pass uses it to read the base `UIElement`/`UIAnchor` a scene
+  override lands on — a nested member's base is its child prefab's root, which the
+  pass could not see while it read raw rows.
+
+  ⚠️ **Why a separate module rather than a helper in `loadSceneFile.ts`:** the
+  validator runs in the Node Vite plugin with no trait registry, imports nothing that
+  calls `trait({...})`, and is itself imported by `loadSceneFile.ts`. So the override
+  helpers (`mergeOverrideMaps`, `descendNestedOverrides`, `mergeNestedOverridePaths`)
+  and the per-trait fold (`foldTraitOverride`, which the spawner's
+  `applyOverridesByLocalToEcs` now calls too) live there, re-exported from
+  `loadSceneFile.ts`. The two override RULES are **injected**: `acceptField` (which
+  fields count) and `traitKind` (what a name is — the spawner ADDS a known trait an
+  override names even when no field of it is accepted, a tag as a tag, and skips a
+  name it does not know). The provider passes the registry's answers; the validator
+  rebuilds both from its `SceneSchema`, which is stricter than the spawner for AoS
+  traits (it lists their factory fields, the spawner accepts any) — neither pass reads
+  one. The merge ORDER is control flow in the spawner and cannot be shared, so
+  `tests/runtime/prefabOverrides.test.ts` spawns every fixture through the real
+  spawner and requires field-by-field agreement.
+
+  Before #1031 both callers read the root row's own `traits`, so a nested-instance
+  root reported a 0 size and no authored `UIElement`, silencing every pooled-row
+  authoring warning. **Latent, and not a shape the editor writes** — no prefab in
+  `games/` or `demos/` has a nested-instance root, and the prefab serializer never
+  collapses the selection root into a reference row (`editor/scene/prefab.ts`), so it
+  arises only from hand- or agent-written JSON. That is why it was fixed by
+  construction rather than observed. Its cycle guard is keyed on each level's `id` AND the ref it was reached
+  by, registered once on entry: a first draft registered the child's ref in the
+  parent before recursing, and since a real prefab's `id` IS that ref, every nested
+  child resolved to `null` as a self-cycle.
 
 **Not yet done — stated honestly:**
 

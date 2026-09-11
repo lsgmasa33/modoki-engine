@@ -196,9 +196,21 @@ Five sightings across four clones, and it reds **`verify:publish`** too — the 
 a private value reaching the public mirror.
 
 `engine/scripts/livePackagedEditor.mjs` now asks two questions instead: is this process **executing**
-the bundle (from the executable path, never argv), and is it **this installation** (its
+the bundle (from the executable path, never the rest of argv), and is it **this installation** (its
 `--user-data-dir`, or the packaged default, under one of the paths the run would delete). A sibling's
 smoke points at its own scratchpad and no longer blocks; the developer's real editor still does.
+
+⚠️ **Reopened 2026-09-11 — a flagless editor's "packaged default" was computed from the wrong home.**
+A sibling clone's `release/mac-arm64/Modoki Editor.app` (and its Squirrel `ShipIt`) carries no
+`--user-data-dir` and is not under a staging root, so the guard attributed it to the default userData
+— derived from `os.homedir()`, which honours `$HOME`. The guard suite redirects `$HOME` into a
+fixture, so that editor read as "using `<fixture>/Library/Application Support/Modoki Editor`" and
+`verify` went red again. **Electron on darwin ignores `$HOME`**: measured with `HOME=/tmp/fakehome`,
+`app.getPath('home')` and `app.getPath('appData')` still report the passwd home. The default is now
+resolved from that home (`editorHomeDir`), so production is unchanged and a sandboxed run is no
+longer anyone's business but its own. win32/linux keep the old derivation as a stated gap — see the
+docblock. Reproduced and pinned end-to-end without a signed bundle: macOS `ps -o comm=` reports a
+process's `argv[0]`, so a `node` spawned with `argv0` set to a bundle path stands in for the editor.
 
 ⚠️ **The remaining reason to read this section is that `--toolchain` still cannot see a live DEV
 editor** — the toolchain is machine-shared, and that gap is deliberate (owner, 2026-09-10): nobody

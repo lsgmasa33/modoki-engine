@@ -20,19 +20,66 @@
  *     (`…/modoki-pkg-smoke-modoki-qa/mac-arm64/Modoki Editor.app/Contents/MacOS/Modoki Editor`),
  *     matches the `/${NAME}.app/Contents/` anchor.
  *
- *  A genuine end-to-end reject case needs a real signed bundle to launch — a copied system binary
- *  will not run under macOS code signing (tried). The cheapest honest way to close it is a
- *  `smoke:packaged` build, which stages exactly that; it was not worth minutes of build time here,
- *  but it IS the thing to do if this predicate is ever changed.
+ *  A genuine end-to-end reject case does NOT need a signed bundle after all (2026-09-11): a copied
+ *  system binary will not run under macOS code signing (tried, twice), but macOS `ps -o comm=`
+ *  reports `argv[0]`, so `node` spawned with `argv0` set to a bundle path IS a packaged editor to
+ *  `listProcesses`. `cleanPackagedCacheLinkGuard.test.ts` now drives both sides that way through the
+ *  real CLI (darwin only).
  */
 
 import { describe, it, expect } from 'vitest';
 import path from 'node:path';
 import os from 'node:os';
+import { execFileSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import {
   userDataDirCandidatesFromCommand, isPackagedExecutable, blockingEditors, listProcesses, findBlockingEditors,
-  sharedStatePaths, stagingRoots,
+  sharedStatePaths, stagingRoots, editorHomeDir,
 } from '../../scripts/livePackagedEditor.mjs';
+
+/** #1037 reopened — the input `defaultUserData` is derived from. Asked in a CHILD carrying a
+ *  redirected `$HOME`, because that redirect is the whole subject and this worker's env is shared. */
+describe('editorHomeDir — the EDITOR\'s home, not this process\'s $HOME (#1037)', () => {
+  function inChildWithHome(home: string): { darwin: string; linux: string } {
+    const mod = pathToFileURL(path.resolve(__dirname, '../../scripts/livePackagedEditor.mjs')).href;
+    const code = `import(${JSON.stringify(mod)}).then((m) => process.stdout.write(JSON.stringify({ darwin: m.editorHomeDir('darwin'), linux: m.editorHomeDir('linux') })))`;
+    return JSON.parse(execFileSync(process.execPath, ['-e', code], { encoding: 'utf8', env: { ...process.env, HOME: home } }));
+  }
+
+  /** Electron on darwin reports the passwd home under `HOME=/tmp/fakehome` (measured with the dev
+   *  binary, `app.getPath('home'|'appData')`). Mutation-checked: `return os.homedir()` on darwin
+   *  turns this red. */
+  // Skipped as ROOT: there the darwin branch deliberately follows $HOME (next case), so this one's
+  // premise — the passwd home wins — does not apply to a root runner.
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('ignores a redirected $HOME on darwin, as Electron does — and honours it on linux, as Chromium does there', () => {
+    const got = inChildWithHome('/tmp/cpc-fake-home');
+    expect(got.darwin).toBe(os.userInfo().homedir);
+    expect(got.linux).toBe('/tmp/cpc-fake-home');
+  });
+
+  /** Close-out review of #1037: under `sudo -E` the script is uid 0 with `$HOME` still the user's, so
+   *  the passwd home is `/var/root` and a live editor's state would be attributed away from every
+   *  candidate — failing OPEN, through BOTH `editorHomeDir` and `sharedStatePaths`.
+   *
+   *  ⚠️ Root is faked by replacing `process.getuid` in the child and calling with NO `uid` argument —
+   *  the path `clean-packaged-cache.mjs` actually takes. The first version passed `uid: 0` explicitly,
+   *  and the scoped review showed `uid = process.getuid` (never called, so never `=== 0`) left it
+   *  green while the CLI's own call failed open. Mutation-checked: that default, and dropping the
+   *  root branch of `invokingUserHome`, each redden this. */
+  it.skipIf(process.platform === 'win32')('as ROOT (default uid), both derivations follow $HOME — sudo -E must not fail open', () => {
+    const mod = pathToFileURL(path.resolve(__dirname, '../../scripts/livePackagedEditor.mjs')).href;
+    const code = `process.getuid = () => 0; import(${JSON.stringify(mod)}).then((m) => process.stdout.write(JSON.stringify({ home: m.editorHomeDir('darwin'), shared: m.sharedStatePaths('com.example.app', 'Modoki Editor', 'darwin') })))`;
+    const got = JSON.parse(execFileSync(process.execPath, ['-e', code], { encoding: 'utf8', env: { ...process.env, HOME: '/tmp/cpc-invoking-user-home' } }));
+    expect(got.home).toBe('/tmp/cpc-invoking-user-home');
+    expect(got.shared.length).toBeGreaterThan(0);
+    for (const p of got.shared) expect(p.startsWith('/tmp/cpc-invoking-user-home/')).toBe(true);
+  });
+
+  it('is this process\'s home when $HOME is not redirected — production is unchanged', () => {
+    if (process.platform === 'darwin') expect(editorHomeDir('darwin')).toBe(os.homedir());
+    expect(editorHomeDir('linux')).toBe(os.homedir());
+  });
+});
 
 const NAME = 'Modoki Editor';
 const SUPPORT = '/Users/dev/Library/Application Support';

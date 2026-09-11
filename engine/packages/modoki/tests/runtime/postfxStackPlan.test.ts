@@ -8,13 +8,15 @@
 import { describe, it, expect } from 'vitest';
 import {
   planStages, requiredMrtTargets, stackSignature, needsRebuild, planFxaaEnabled,
+  aoPassSettings, AO_MIN_RESOLUTION_SCALE,
   type PostFXRequest,
 } from '../../src/runtime/rendering/postfx/stackPlan';
 
 const bloom = () => ({ strength: 0.8, radius: 0.6, threshold: 0 });
 const vignette = () => ({ intensity: 0.4, smoothness: 0.5 });
 const dof = () => ({ focusDistance: 10, focalLength: 1, bokehScale: 1 });
-const ao = () => ({ radius: 0.25, intensity: 1 });
+const ao = (over: Partial<{ radius: number; intensity: number; resolutionScale: number; samples: number }> = {}) =>
+  ({ radius: 0.25, intensity: 1, resolutionScale: 1, samples: 16, ...over });
 const fxaa = () => ({ edgeThreshold: 0.125, edgeThresholdMin: 0.0312, blendStrength: 4 });
 const npr = (over: Record<string, unknown> = {}) => ({
   isOrthographic: false, superSampleScale: 1, fillMode: 'grayscale' as const,
@@ -99,7 +101,49 @@ describe('stackSignature', () => {
 
   it('changes when the AO intensity changes (a param-only edit, not just radius)', () => {
     const base = stackSignature({ ao: ao() });
-    expect(stackSignature({ ao: { radius: 0.25, intensity: 0.5 } })).not.toBe(base);
+    expect(stackSignature({ ao: ao({ intensity: 0.5 }) })).not.toBe(base);
+  });
+
+  /** #962 — Scene3D only calls `applyConfig` when this signature changes, so a knob left out of it
+   *  does nothing when the owner moves it in the Inspector. Mutation-checked: dropping either field
+   *  from `serializeAo` reddens its row. */
+  it.each([
+    ['resolutionScale', { resolutionScale: 0.5 }],
+    ['samples', { samples: 8 }],
+  ])('changes when the AO %s changes — the cost knobs are live edits too', (_label, over) => {
+    expect(stackSignature({ ao: ao(over) })).not.toBe(stackSignature({ ao: ao() }));
+  });
+
+  it('an AO cost-knob change is a LIVE update, never a rebuild', () => {
+    expect(needsRebuild({ ao: ao() }, { ao: ao({ resolutionScale: 0.5, samples: 8 }) })).toBe(false);
+  });
+});
+
+/** #962 — what GTAONode actually receives. A scene file can hold what the Inspector refuses. */
+describe('aoPassSettings', () => {
+  it('passes authored values through when they are in range', () => {
+    expect(aoPassSettings({ resolutionScale: 0.5, samples: 8 })).toEqual({ resolutionScale: 0.5, samples: 8 });
+  });
+
+  it('keeps the defaults exactly — a project that never sets the knobs renders as before', () => {
+    expect(aoPassSettings(ao())).toEqual({ resolutionScale: 1, samples: 16 });
+  });
+
+  it.each([
+    ['a hand-edited 0, which would size the AO target to nothing', 0, AO_MIN_RESOLUTION_SCALE],
+    ['a negative scale', -1, AO_MIN_RESOLUTION_SCALE],
+    ['a scale above full resolution, which would only cost more', 2, 1],
+    ['NaN', Number.NaN, 1],
+  ])('clamps resolutionScale: %s', (_label, input, expected) => {
+    expect(aoPassSettings({ resolutionScale: input, samples: 16 }).resolutionScale).toBe(expected);
+  });
+
+  it.each([
+    ['a fractional count, which GTAO feeds into its loop bounds', 7.6, 8],
+    ['zero', 0, 1],
+    ['NaN', Number.NaN, 16],
+  ])('normalises samples: %s', (_label, input, expected) => {
+    expect(aoPassSettings({ resolutionScale: 1, samples: input }).samples).toBe(expected);
   });
 });
 
@@ -142,7 +186,7 @@ describe('needsRebuild', () => {
 
   it('is false for an AO intensity edit — GTAONode has no MRT/dispose cost from a param change', () => {
     const prev: PostFXRequest = { ao: ao() };
-    const next: PostFXRequest = { ao: { radius: 0.25, intensity: 0.5 } };
+    const next: PostFXRequest = { ao: ao({ intensity: 0.5 }) };
     expect(needsRebuild(prev, next)).toBe(false);
   });
 });

@@ -1867,6 +1867,46 @@ skipping the whole awaited teardown — including `releaseDeviceResourcesOnExit(
 every later quit, hours after the update failed and with nothing on screen connecting the two. The
 `error` handler releases it and says "Update Install Failed".
 
+### The win32 short-circuit is MEASURED, not merely reasoned (#1049)
+
+`installableNow()` returns true immediately off darwin, and the risk that justified a ticket was that
+a wrong or lost short-circuit would make Windows wait for a native emitter that never fires — **no
+prompt at all**, a worse failure than the macOS one #1033 fixed, and invisible to every gate we run.
+Driven end-to-end on the `win` clone on 2026-09-11 against the real GitHub feed:
+
+```
+main.log  2026-09-11T00:28:51.089Z  [auto-update] downloaded: 0.7.0
+window            09:28:51.225      "Update Ready"        ← +136 ms (clocks are 9h apart)
+```
+
+**136 ms is an upper bound** — the window poller ran at 250 ms — against the macOS baseline of
+**~5.0 s** in the same flow. "Restart Now" then quit and ran the real NSIS installer, and the app
+came back as 0.7.0. So the two platforms differ exactly as the code claims, and the gap is not a
+race that happens to be short: on Windows there is nothing to wait for.
+
+⚠️ **The measurement is only worth something because the instrument was proved first.** A window
+detector that sees nothing and a prompt that never appears are the same observation, and the FAIL
+this ticket hunts is precisely "nothing appeared" — so a blind probe fabricates the headline. The
+`Update Available` dialog is the positive control: it is the same `dialog.showMessageBox` code path,
+it necessarily comes first, and the detector caught **and drove** it (`ENTER` → Download & Install)
+before being trusted on `Update Ready`. Never read a FAIL out of a run that saw neither dialog.
+
+Three things a repeat run needs, all of which cost the first one time:
+
+- **The log is NOT at `%APPDATA%\Modoki Editor\logs\main.log`.** It is nested under an install hash
+  AND a project hash — `%APPDATA%\Modoki Editor\<installHash>\<project>-<hash>\logs\main.log`
+  (measured: `66ca4fef\3d-test-59a376d1\`). Looking at the shallow path finds no file at all, which
+  reads like "the app never logged" rather than "you are looking in the wrong place".
+- **There is no Windows signing, and the update works anyway.** No cert is configured, so SmartScreen
+  blocks the test build on first launch (a human must click through) — but `app-update.yml` carries
+  no `publisherName`, and `NsisUpdater.verifySignature` returns early on `publisherName == null`, so
+  the downloaded installer is never signature-checked. Do not "fix" the ticket's instruction to cut a
+  *signed* build by hunting for a certificate; there is none to find.
+- **A `/S` install can still land in `C:\Program Files`.** `perMachine: false` is the *preference*,
+  not a guarantee — accept the elevation prompt and NSIS takes the machine-wide path, after which the
+  update's own install needs elevation too. Per-user vs per-machine changes who can apply an update,
+  so note which one a run actually produced rather than assuming the config.
+
 ## CLI recipes
 
 The examples use `games/<id>`; substitute the project and its appId. Note the **project-dir cwd**

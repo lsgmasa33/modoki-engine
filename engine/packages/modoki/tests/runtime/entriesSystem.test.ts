@@ -352,6 +352,37 @@ describe('entriesSystem', () => {
     expect(isVisibleWarnings).toHaveLength(0);
   });
 
+  /** #840 (owner decision: refuse) — a prefab root sized in a viewport unit on an axis the view
+   *  DELEGATES has no honest px answer, because the row resolves against the scroll view. The provider
+   *  reports that axis as 0 and names the unit; this is the warning that says why the row has no size. */
+  describe('a prefab root sized in a unit the pool refuses (#840)', () => {
+    const refusing = (provider: ReturnType<typeof makeProvider>) => ({
+      ...provider,
+      rootSize: () => ({ width: 0, widthUnit: 'px' as const, height: 0, heightUnit: 'px' as const, refusedHeightUnit: 'vh' }),
+    });
+
+    it('warns ONCE when the view delegates that axis, naming the unit and the field that fixes it', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { sys, src, provider } = await setup({ entryHeight: 0 });
+      sys.setEntryPrefabProvider(refusing(provider));
+      src.registerEntrySource('test.rows', () => ({ members: {} }));
+      sys.entriesSystem(testWorld);
+      sys.entriesSystem(testWorld);
+      const refused = warn.mock.calls.filter((c) => String(c[0]).includes("sizes its root height in 'vh'"));
+      expect(refused).toHaveLength(1);
+      expect(String(refused[0][0])).toMatch(/non-zero entryHeight/);
+    });
+
+    it('stays silent when the view authors its own size on that axis — the root size is never used there', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { sys, src, provider } = await setup({ entryHeight: 80 });
+      sys.setEntryPrefabProvider(refusing(provider));
+      src.registerEntrySource('test.rows', () => ({ members: {} }));
+      sys.entriesSystem(testWorld);
+      expect(warn.mock.calls.filter((c) => String(c[0]).includes('sizes its root'))).toEqual([]);
+    });
+  });
+
   /** #1026 — the pin OVERWRITES the entity's own UIElement, so a guard reading the live trait back
    *  is asking the pin about its own handiwork. Every case below is silent on the FIRST tick (the
    *  spawned trait still carries what the prefab authored) and only diverges once the pin has run,
