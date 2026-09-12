@@ -34,7 +34,11 @@ export function iconColorArgs() {
  *      iOS tinted variant (1024²)     1.20 MB → 0.85 MB (-29%)
  *
  *  All LOSSLESS — same pixels, no quality decision to make and nothing to review. The splash case
- *  alone was 163 MB of committed binaries before this.
+ *  alone was 163 MB of committed binaries before this. Palette-256 measured no better, and 128
+ *  colours only wins by risking banding — an art decision, not one a build step makes silently.
+ *  Pin this with a MEASUREMENT (output smaller than the same pixels through the default encoder),
+ *  never by grepping for the constant: a source check passes on a call site that imports it and
+ *  ignores it.
  *
  *  Deliberately shared rather than restated per call site: the splash path was fixed first and the
  *  icon-variant path kept the default for a while, which is exactly the drift a shared constant

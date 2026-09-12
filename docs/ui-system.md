@@ -25,7 +25,10 @@ node when it has the `RenderableUI` tag plus `UIElement`; the rest — `UIBindin
 controller/keyboard focus nav — opt-in, resolved per active scope by `uiFocusSystem`),
 `UIToggle` (renders the element as an on/off switch) and `Canvas2D` (marks a `UIElement`
 as hosting a 2D PixiJS canvas; child `Renderable2D` entities render into it) — are
-optional add-ons.
+optional add-ons. ⚠️ An entity missing `RenderableUI` is skipped by `buildTree()` silently —
+`get_scene_state` shows it visible and updating, nothing logs, and only
+`document.querySelector('[data-entity-id="N"]')` reveals there is no DOM node. The fast diagnostic
+is to diff its trait KEYS against a working sibling.
 
 ### `UIElement` — the consolidated element trait
 
@@ -693,6 +696,13 @@ in `NavigationManager`, which owns the history stack (see
 activation anywhere in the UI is swallowed whole — before the click cue, so a blocked
 second tap makes no sound. Not per-button: a fast tap on a different button is also
 swallowed, by design.
+
+Why it is global and gates on the action rather than a timer (owner, 2026-09-01): *"when I
+implement this, I usually wait for the button action to be done, instead of the time. also I will
+disable all the inputs not only for buttons."* The model is "the UI is busy", not "this button is
+debounced" — a per-button debounce still lets a fumbled tap hit the neighbouring button while a
+purchase is in flight. This overruled #466's own design notes, which had required a fast tap on a
+different button to still fire.
 
 The click cue is gated on the **same** discrete/continuous predicate as the lock, not on
 the event name (#528) — it used to test `event === 'click'`, which silenced every

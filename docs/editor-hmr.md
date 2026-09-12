@@ -21,6 +21,19 @@ Related: [editor-input.md](./editor-input.md) (the keymap contract), [debug-tool
 | `runtime/rendering/npr/**` | **Full page reload** (TSL nodes bake into compiled WGSL) |
 | Any other engine/editor source | Normal React Fast Refresh |
 
+⚠️ **"The world reloads" does not mean every cached ASSET is re-read.** Per-kind invalidation on an
+external write lives in `ASSET_CACHE_INVALIDATORS` (`engine/app/debug/agentBridge.ts`) —
+animation, timeline, particle, spriteanim, rig2d, animset, material, shader — and **`prefab` is not
+in it**. A `.prefab.json` written on disk from outside the editor falls through to the scene
+hot-reload, which reloads the current scene path — and the reload keeps the OLD prefab, because a
+scene load acquires before it releases: the new scene id finds the entry still owned by the old id,
+so `fetchPrefab` returns on the cache hit, and when the old id releases, the new one already owns it
+(`invalidatePrefab` is called only by the editor's own prefab writes). Read from code, not
+reproduced live. `load_scene` on the path already open behaves the same way. Swapping to a
+different scene and back re-reads the prefab only if that other scene does NOT also use it — a
+shared prefab stays owned across the swap, by design. **Verify any disk edit by querying the live spawned entity, never by re-reading the
+file you wrote.**
+
 ### A shader is TWO files, and only one of them used to be watched
 
 A shader is authored as a `.shader.json` descriptor plus a sibling `.glsl`/`.wgsl` carrying the

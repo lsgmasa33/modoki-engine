@@ -388,8 +388,9 @@ projects:
   measurement showing the hazard its first draft cited does not currently exist.
   ⚠️ Consequence worth knowing: prune used to double as a scrubber of unrecognised
   top-level junk in the committed file, and no longer does — a stray key now survives Apply.
-  ⚠️ **So a default-valued field is ABSENT from the file, and every raw-JSON reader must resolve
-  it.** A project that enables OTA and leaves the bundle name at `shell` gets an `ota` block with
+  ⚠️ **A default-valued field the file never carried is ABSENT, so every raw-JSON reader must
+  resolve it** (the prune rule above keeps a default-valued key only when the file already had
+  it). A project that enables OTA and leaves the bundle name at `shell` gets an `ota` block with
   no `bundleName` key — a valid config. A `.mjs` script cannot import `loadProjectConfig`, so it
   must map absent → default itself and refuse only a present-but-wrong-typed value. Decide per
   field by what the default MEANS: `bundleName`'s `'shell'` is a real value, while `publicKey`'s
@@ -2893,6 +2894,11 @@ Two things that look like they should stop an editor and do not (#129):
   `devServer.ts` passes, skips it, and says so. (Guarded by
   `engine/tests/architecture/devStopEditorCarveOut.test.ts`, because that flag exists for a
   packaging reason and nothing else would notice if it went away.)
+  **The tell, when an editor looks broken:** read `modoki_get_console_logs` FIRST, before
+  reproducing a game-logic theory. `[vite] server connection lost. Polling for restart...` with a
+  live backend but a dead Vite port means the tooling was stopped, not that the game broke — confirm
+  with `curl 127.0.0.1:<vitePort>`. (The incident: the owner was *playing* with nothing unsaved when
+  the dev server died, so `unsavedChanges: false` does not mean nobody is using the editor.)
 - **`POST <backend>/api/exit`** 404s. `/api/exit` is a *Vite dev-server* route, so it answers on
   the Vite port (5175), not on the backend port that `MODOKI_BACKEND` and the launch banner
   advertise — aiming it at the port you were told to use cannot work.
