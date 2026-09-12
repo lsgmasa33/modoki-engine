@@ -1992,6 +1992,66 @@ tooltips. Registering it in the engine would delete it from the registry with no
 
 ⚠️ **`role` defaults to `''` deliberately** — a scene save omits every field equal to its trait
 default, so a real role name as the default would delete that band's identity on the next save.
+Because that default is reachable, **a band still holding `''` is REPORTED** (#1089): it means a band
+was dropped in the Inspector and never named, which `require` structurally cannot detect, since no
+declared role went missing.
+
+### Who judges a mis-authored stack (#1089)
+
+**`readScreenBands` is the one place a stack is judged. Downstream code may absorb a bad stack; it
+does not get to decide whether one is worth mentioning.** Four sites had four different policies —
+`panels()` threw, the reader warned, and two others returned silently — so whether a mis-authored
+stack told you anything depended on which function noticed it first.
+
+⚠️ **This states the rule; it does not unify the sites.** `panels()` still throws on an absent
+crossword or board (a missing panel has no sane rectangle, and a throw is right there);
+`giveBoardSlackToCrossword` still returns its input unchanged; `solveBands`' own `byRole` still
+keeps the first of a duplicated pair without comment. What changed is that the reader now catches
+each of those upstream, so the silent branches are no longer the only thing standing between an
+author and a wrong layout.
+
+| Authoring mistake | What happens | Falls back? |
+|---|---|---|
+| A required role is missing | reported, naming the consequence | **yes** — wholesale |
+| Two bands claim the same role | reported; the duplicate is dropped before the solver | no |
+| A band has no role picked (`''`) | reported | only if it leaves no usable band |
+| A `requireOrder` pair is stacked the wrong way | reported | no |
+| A role outside `accept` | **silently skipped** — deliberate | only if it leaves no usable band |
+
+⚠️ **The table describes a world that authors at least one usable band.** A world with none — a
+headless `createTestWorld`, a scene predating the authoring surface — is the *no-scene* case: it
+takes the fallback and reports NOTHING, deliberately, or every headless test in the repo would warn.
+That is why rows 3 and 5 fall back only "if it leaves no usable band", and why row 1 does not fire
+for an empty world even though such a world is missing every required role.
+
+Two rules hold the rest together. **Report, but do not refuse, what is merely degraded**: only a
+missing required role justifies discarding every authored value for the caller's fallback. And
+**an out-of-vocabulary role stays silent on purpose** — a game may carry a decorative band this
+reader is not meant to know about, which is the whole reason `accept` exists.
+
+⚠️ **The caller's warn latch must be per MESSAGE, not per world.** Both games latch to keep a
+per-frame read from flooding the console, and a per-world latch looks equivalent — it is not, once
+`role: ''` became reportable. Every band a human adds passes through that state, so the transient
+mistake fires first and closes the latch, and the durable problem discovered a minute later is
+swallowed for the life of the world. In Court the same latch also carries the zero-height-board
+diagnostic, so the cost was a blank board with an empty console.
+
+⚠️ **`requireOrder` is a stacking dependency the GAME declares** — EVERY pair in the list, not just
+adjacent ones (with `['a','b','c']` and `b` absent, a consecutive-only walk would never compare `a`
+with `c`), and checked only when both of a pair's roles are present. An `order` TIE counts as broken:
+`solveBands` sorts by `order`, ties are unspecified, so equal orders leave the sequence falling out
+of entity spawn order. Every role listed must also be in `accept`, or its pair is indistinguishable
+from an absent band and the dependency is unenforceable. wordweave passes `['crossword', 'board']` because its board-slack transfer
+(#1080) is a silent no-op when the board is authored above the crossword — and `order` is an
+ordinary Inspector field, so a drag in the editor is enough to switch the mechanism off. It is
+**not** the deleted `stampOrder`: that WROTE `order` onto authored data and gave `accept` a second
+meaning as a sequence; this only reads the authored order and reports on it.
+
+⚠️ **Every problem found in one read goes in ONE message.** The latch above is per message, so two
+faults reported separately would be two messages and both would survive — but they would also be
+two console lines a frame apart describing one broken stack, and the first one read would look like
+the whole story. Assembling them means the reader sees the stack's full state at the moment it was
+judged, rather than the first thing that was wrong with it.
 
 Extracted in #800 from two independently-written, arithmetically identical copies (wordweave #773,
 court #791); `engine/tests/architecture/screenBandsAreShared.test.ts` fails a third.

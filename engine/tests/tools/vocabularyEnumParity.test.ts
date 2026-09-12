@@ -76,6 +76,21 @@ describe('editor MCP tool enums == the runtime tables', () => {
     expect(described).toContain(KEY_ARG_DESCRIPTION);
   });
 
+  // ⚠️ The DEVICE half, and it needs saying why it is a separate block rather than more rows above:
+  // `device_press_key`/`device_type_text` live in a DIFFERENT package with its own registry, and
+  // they derive from the same `KEY_ARG_DESCRIPTION` — so a hand-edit there drifts from the table
+  // exactly as one here would, with nothing to catch it. Raised by the #1094 close-out review and
+  // initially left unpinned; the two tools enforce one vocabulary, so they get one guard.
+  it.each([
+    { tool: 'device_press_key', param: 'key' },
+    { tool: 'device_type_text', param: 'submitKey' },
+  ])('$tool $param advertises the derived key vocabulary', async ({ tool, param }) => {
+    device = await loadDeviceSurface();
+    const described = device.shapeFor(tool)[param]?.description;
+    if (!described) throw new Error(`${tool}.${param} has no description in the registered shape`);
+    expect(described).toContain(KEY_ARG_DESCRIPTION);
+  });
+
   it('modoki_create_entity.kind offers every runtime kind except `environment`', () => {
     surface = loadSurface();
     const offered = enumOf(surface, 'modoki_create_entity', 'kind');

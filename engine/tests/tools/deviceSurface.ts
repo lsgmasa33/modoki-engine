@@ -34,6 +34,11 @@ export type DeviceSurface = {
    *  editor harness has had this since the audit; the device surface needs it for the same reason,
    *  since a description is the only thing standing between an agent and a wrong tool. */
   descriptionOf: (name: string) => string;
+  /** The registered zod shape, so a test can read a PARAMETER's advertised description — the
+   *  editor twin gets this from `schemaFor` + zodToJsonSchema. Needed for the vocabularies that
+   *  cannot be a `z.enum` (#1094's `key`), where parity lives in the description rather than in a
+   *  list of members, and the device half would otherwise be pinned by nothing. */
+  shapeFor: (name: string) => Record<string, { description?: string }>;
   /** Requests excluding the once-per-process `/api/identity` probe. */
   real: () => StubRequest[];
   last: () => StubRequest | undefined;
@@ -92,6 +97,11 @@ export async function loadDeviceSurface(responder?: Responder): Promise<DeviceSu
       const entry = getDeviceTool(name);
       if (!entry) throw new Error(`device tool '${name}' is not registered — have: ${deviceToolNames().join(', ')}`);
       return entry.description;
+    },
+    shapeFor: (name: string) => {
+      const entry = getDeviceTool(name);
+      if (!entry) throw new Error(`device tool '${name}' is not registered — have: ${deviceToolNames().join(', ')}`);
+      return entry.shape as unknown as Record<string, { description?: string }>;
     },
     text,
     real: () => requests.filter((r) => r.path !== '/api/identity'),

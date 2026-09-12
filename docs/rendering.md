@@ -4497,6 +4497,68 @@ exactly as `contain` does. Only the reference WIDTH changes the answer.
 own size — `contentRect = refW * scaleX`, a design-space centre at `refW / 2` — must read those,
 not its own input, or it describes a box that is not the one on screen.
 
+### `maxReferenceHeight` — the vertical twin (#1087)
+
+The same feature on the other axis: a host TALLER than the design aspect letterboxes, and on a
+1080x1920 box that is every recent phone — about 32pt a side on an iPhone 16 Pro. Set
+`maxReferenceHeight` and the box grows toward the host aspect instead, turning the strip into
+addressable design space.
+
+```
+effectiveRefH = clamp(referenceWidth / hostAspect, referenceHeight, maxReferenceHeight)
+```
+
+⚠️ **At most ONE axis ever adapts, and it falls out of the clamps — there is no tie-break to get
+wrong.** A host is either wider than the design aspect or taller than it, never both. On a wide host
+`referenceWidth / hostAspect <= referenceHeight`, so the height clamps back to its authored value;
+on a tall host `referenceHeight x hostAspect <= referenceWidth`, so the width clamps back. That is
+why `effectiveRefW` is derived from the RAW `referenceHeight` and `effectiveRefH` from the RAW
+`referenceWidth`: deriving either from the other's effective value would be mutually recursive, and
+whichever axis did not grow still equals its raw value, so each formula's raw input already IS the
+effective one.
+
+⚠️ **Under `contain` this does not change `scale` at all — and that is what makes this axis safe
+where the width half was not.** Widening the box LOWERS `scale`, which is how #774 produced #806: a
+`vmin`-anchored control does not move with `scale`, so host-space chrome drifted against design-space
+content until an owner bug report caught it, and #815 closed it with `ratio = vmin / (1080 x scale)`.
+Growing the HEIGHT to `referenceWidth / hostAspect` makes `actualH / effectiveRefH` equal
+`actualW / referenceWidth`, so the `contain` min is taken between two equal terms and lands exactly
+where it does today; past the cap the width term wins and it is unchanged again. So that ratio stays
+exactly 1.000 on every 9:16-or-taller phone and chrome cannot drift.
+`engine/packages/modoki/tests/runtime/canvas2DAdaptiveHeight.test.ts` asserts this directly on four
+phone shapes, paired with an assertion that the box really grew so the claim cannot pass vacuously.
+
+⚠️ **`fitH` is the exception**: it matches the host height by definition, so there the scale DOES
+move with the effective height. The "scale is unchanged" property is about `contain`/`cover`, not
+about every mode.
+
+⚠️ **The cap is load-bearing here too.** Uncapped, a very tall window — a narrow desktop browser, a
+split-screen tablet, the editor's free-size Game panel — would stretch the box without bound.
+`games/wordweave` authors `2560`, which covers every shipping phone with headroom (the tallest,
+a Galaxy A23 at 412x915, needs 2399; a 21:9 handset needs 2520) and letterboxes beyond.
+
+⚠️ **Every design<->host mapping site must take the new argument.** #806 exists because one such site
+was left behind when the width adapted. In `games/wordweave/runtime/systems.ts` that is eight call
+sites plus `geometrySignature` — a value measured against the live host, so it changes on a rotation
+or a device-preset switch with nothing in the config moving, and omitting it from the signature would
+compute the right height every frame and apply it never.
+
+⚠️ **`games/court` passes NEITHER cap to the scaler, and that is a trap waiting on one edit.**
+Court's three `computeCanvasScale` calls (`games/court/runtime/systems.ts`, in `layoutBoard` and
+the two chrome syncs) omit the `maxRefW`/`maxRefH` arguments entirely, so they always compute the
+UNADAPTED box. That is harmless only because Court's scene authors neither cap —
+`games/wordweave/.../main.scene.json` is the only author of either in the repo. The day Court
+authors one, its own layout math silently disagrees with what `Scene2D` renders, and the symptom is
+a board offset against its own chrome with nothing erroring. Fix the three call sites in the same
+change that authors the cap, not afterwards.
+
+⚠️ **And the design box's EXTENT is not `referenceHeight` any more.** Anything that measures a
+distance to the box's bottom edge must read `CanvasScale.refH`. wordweave's ad-banner reserve did
+not, and the letter board rendered under an opaque banner on every tall phone — the reserve came out
+short by exactly half the reclaim. Related: because `contain` CENTRES the box, growing it by `extra`
+adds `extra/2` above the old top edge and `extra/2` below, so a game with bottom-anchored host chrome
+can only address the top half.
+
 ⚠️ **Adaptation is opt-in because a game may DEPEND on the pillarbox.** `games/court` authors
 `contain` and clamps `ChromeRoot`, `NarrationBand` and `BoardPage` to `maxWidth: 56.25vh`
 (= `100 x refW/refH`) so its chrome shrinks to meet the board instead of spanning an iPad's full

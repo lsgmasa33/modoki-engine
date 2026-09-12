@@ -1146,22 +1146,25 @@ interface Scene2DInteractionOpts {
 // A Canvas2D's reference resolution + scale mode (trait defaults), independent of any renderer.
 // Used by computeScale2DFor AND the chrome overlay's boundary rect. ⚠️ The boundary must be
 // stroked from `CanvasScale.refW/refH` (the EFFECTIVE box), never from the raw pair this
-// returns — those differ the moment `maxReferenceWidth` adapts the box (#774), and the overlay
-// would then outline the box the scene USED to have while the content fills the real one.
-function readCanvas2DRefDims(canvasEntityId: number, fallbackW: number, fallbackH: number): { refW: number; refH: number; scaleMode: 'fitW' | 'fitH' | 'fill' | 'none'; maxRefW: number } {
+// returns — those differ the moment `maxReferenceWidth` adapts the box (#774) or
+// `maxReferenceHeight` grows it (#1087), and the overlay would then outline the box the scene
+// USED to have while the content fills the real one.
+function readCanvas2DRefDims(canvasEntityId: number, fallbackW: number, fallbackH: number): { refW: number; refH: number; scaleMode: 'fitW' | 'fitH' | 'fill' | 'none'; maxRefW: number; maxRefH: number } {
   let refW = fallbackW || 1, refH = fallbackH || 1;
   let scaleMode: 'fitW' | 'fitH' | 'fill' | 'none' = 'fitH';
   let maxRefW = 0;
+  let maxRefH = 0;
   const c2dMeta = getAllTraits().find((t) => t.name === 'Canvas2D');
   const canvasEntity = findEntity(canvasEntityId);
   if (c2dMeta && canvasEntity?.has(c2dMeta.trait)) {
-    const c2d = canvasEntity.get(c2dMeta.trait) as { referenceWidth?: number; referenceHeight?: number; scaleMode?: 'fitW' | 'fitH' | 'fill' | 'none'; maxReferenceWidth?: number };
+    const c2d = canvasEntity.get(c2dMeta.trait) as { referenceWidth?: number; referenceHeight?: number; scaleMode?: 'fitW' | 'fitH' | 'fill' | 'none'; maxReferenceWidth?: number; maxReferenceHeight?: number };
     refW = c2d.referenceWidth || 1080;
     refH = c2d.referenceHeight || 1920;
     scaleMode = c2d.scaleMode || 'fitH';
     maxRefW = c2d.maxReferenceWidth || 0;
+    maxRefH = c2d.maxReferenceHeight || 0;
   }
-  return { refW, refH, scaleMode, maxRefW };
+  return { refW, refH, scaleMode, maxRefW, maxRefH };
 }
 
 // Install the capture-phase 2D pointer handlers on opts.getTargetEl(). Returns a cleanup fn.
@@ -2401,8 +2404,8 @@ function Scene2DChromeOverlay({ canvasEntityId, showBoundary = false, viewZoom =
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
       ctx.clearRect(0, 0, pw, ph);
-      const { refW, refH, scaleMode, maxRefW } = readCanvas2DRefDims(canvasEntityId, pw, ph);
-      const cs = computeCanvasScale(refW, refH, pw, ph, scaleMode, maxRefW);
+      const { refW, refH, scaleMode, maxRefW, maxRefH } = readCanvas2DRefDims(canvasEntityId, pw, ph);
+      const cs = computeCanvasScale(refW, refH, pw, ph, scaleMode, maxRefW, maxRefH);
       canvasScaleRef.current = cs;
       const rectW = canvas.getBoundingClientRect().width;
       gizmoScreenScaleRef.current = (rectW > 0 && cs.scale > 0) ? pw / (cs.scale * rectW) : 1;

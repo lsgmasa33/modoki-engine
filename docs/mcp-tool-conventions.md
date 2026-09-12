@@ -481,6 +481,18 @@ Rules:
     inserts nothing — so `type_text {submitKey:'Retrun'}` answered `ok, typed:3` having submitted
     nothing. On the DEVICE side it is worse: `new KeyboardEvent({key:'Excape'})` is well-formed and
     carries the typo, so there is no signal at all and only the table can catch it.
+  - **SWEPT AND CLEARED, so the next sweep does not re-derive it: `modoki_handles`' `editor`/`kind`.**
+    They look like the last unrefused vocabulary on this surface — free-form strings that FILTER a
+    read, where an unknown value would yield an empty list and the tool's own description says an
+    empty result should "read as a correct negative answer". **Driven live (2026-09-12), and it does
+    not conflate:** `GET /api/enact-handles?editor=zzzzz` answers `count:0` with
+    `hint: "no handle matches editor=zzzzz. Live now: editor ∈ {chrome}, kind ∈ {button, span} —
+    check the spelling, or drop the filter for counts."` It names the live vocabulary and says to
+    check the spelling, which is the recovery information a refusal would have carried. A closed
+    table would also be WRONG here: the legal set is what is currently mounted, so `editor:'sprite'`
+    is a correct spelling that is legitimately empty whenever the Sprite Editor is shut — refusing it
+    would be the #285 carve-out, a refusal the caller cannot satisfy. Listed the way #731 listed its
+    clean sites: the ambiguity is real and the consumer makes it harmless.
   - **On a GET, the refusal needs a CODE.** `getJson` does not run `isFailureBody` on a plain read,
     so an uncoded `{ok:false}` reaches the agent as a SUCCESS; a coded envelope leaves `relayJson`
     as a 400. (`/api/watch/read` is safe without one only because its route re-codes the op's

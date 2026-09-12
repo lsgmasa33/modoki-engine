@@ -206,6 +206,12 @@ function isNonCitingSource(relFile: string): boolean {
   // fixing it means fixing the source doc. Failing on the copy would report every defect twice
   // and, worse, invite someone to "fix" a file the next build overwrites.
   if (relFile.startsWith('site/docs/reference/')) return true;
+  // The unit cover for the citation SYNTAX itself. Its fixtures are citation-shaped by
+  // construction — a deliberately dangling `§ 5A`, a `docs/thing.md` that must not exist, a
+  // relative link that resolves from a case file and not from here — because they exist to pin
+  // what `SECTION_CITE` captures, not to point at anything. Scanning them asks this guard to
+  // resolve strings whose whole purpose is to be parsed rather than followed.
+  if (relFile === 'engine/tests/architecture/docSections.test.ts') return true;
   return false;
 }
 

@@ -33,12 +33,19 @@ export interface CanvasScale {
  *                  wider than the design aspect, the effective design width widens from
  *                  `refW` up to `maxRefW` (never past it, never below `refW`). `0` (the
  *                  default) or any value <= `refW` disables adaptation — the result is
- *                  then byte-identical to omitting this parameter. */
+ *                  then byte-identical to omitting this parameter.
+ *  @param maxRefH  Opt-in adaptive HEIGHT cap (`Canvas2D.maxReferenceHeight`, #1087) — the
+ *                  vertical twin. On a host TALLER than the design aspect, the effective
+ *                  design height grows from `refH` up to `maxRefH`, reclaiming the letterbox
+ *                  strip. `0` (the default) or any value <= `refH` disables it.
+ *
+ *                  ⚠️ At most one axis ever adapts — see the note at `effectiveRefH` below. */
 export function computeCanvasScale(
   refW: number, refH: number,
   actualW: number, actualH: number,
   mode: Canvas2DScaleMode,
   maxRefW = 0,
+  maxRefH = 0,
 ): CanvasScale {
   if (refW <= 0 || refH <= 0 || actualW <= 0 || actualH <= 0) {
     return { scale: 1, scaleX: 1, scaleY: 1, offsetX: 0, offsetY: 0, compensateX: 1, compensateY: 1, refW, refH };
@@ -51,6 +58,21 @@ export function computeCanvasScale(
     ? Math.min(Math.max(refH * (actualW / actualH), refW), maxRefW)
     : refW;
 
+  // Adaptive height (#1087): the mirror image — on a host TALLER than the design aspect, grow
+  // the effective reference height so the letterbox strip becomes usable design space.
+  //
+  // ⚠️ **Both are derived from the RAW opposite axis, never from the other's effective value,
+  // and that is not an oversight.** Deriving each from the other would be mutually recursive
+  // with no defined evaluation order. It is also unnecessary: at most ONE of them can differ
+  // from its input, because the host is either wider than the design aspect or taller than it.
+  // The lower clamp is what enforces that — on a wide host `refW / hostAspect <= refH`, so the
+  // height clamps back to `refH`; on a tall host `refH * hostAspect <= refW`, so the width
+  // clamps back to `refW`. Whichever axis did NOT grow still equals its raw value, so each
+  // formula's raw input IS the effective one.
+  const effectiveRefH = maxRefH > refH
+    ? Math.min(Math.max(refW / (actualW / actualH), refH), maxRefH)
+    : refH;
+
   let scaleX: number;
   let scaleY: number;
   switch (mode) {
@@ -62,8 +84,9 @@ export function computeCanvasScale(
       break;
     }
     case 'fitH': {
-      // Match height exactly — may crop or letterbox horizontally
-      const s = actualH / refH;
+      // Match height exactly — may crop or letterbox horizontally. ⚠️ Unlike `contain`, this
+      // mode DOES change scale when the height adapts: it keys off the height by definition.
+      const s = actualH / effectiveRefH;
       scaleX = s;
       scaleY = s;
       break;
@@ -71,14 +94,14 @@ export function computeCanvasScale(
     case 'contain': {
       // Uniform scale to fit the reference ENTIRELY inside — letterboxes the
       // axis with the larger reference extent.
-      const s = Math.min(actualW / effectiveRefW, actualH / refH);
+      const s = Math.min(actualW / effectiveRefW, actualH / effectiveRefH);
       scaleX = s;
       scaleY = s;
       break;
     }
     case 'cover': {
       // Uniform scale to COVER the canvas — the overflowing axis is cropped.
-      const s = Math.max(actualW / effectiveRefW, actualH / refH);
+      const s = Math.max(actualW / effectiveRefW, actualH / effectiveRefH);
       scaleX = s;
       scaleY = s;
       break;
@@ -86,7 +109,7 @@ export function computeCanvasScale(
     case 'fill':
       // Non-uniform: stretch to fill canvas exactly (no cropping, no letterbox)
       scaleX = actualW / effectiveRefW;
-      scaleY = actualH / refH;
+      scaleY = actualH / effectiveRefH;
       break;
     case 'none':
       scaleX = 1;
@@ -104,14 +127,17 @@ export function computeCanvasScale(
   // corner (matches the Canvas2D trait doc "none = 1:1 pixels, centered"). `fill`
   // covers exactly so the offsets resolve to 0.
   const offsetX = (actualW - effectiveRefW * scaleX) / 2;
-  const offsetY = (actualH - refH * scaleY) / 2;
+  const offsetY = (actualH - effectiveRefH * scaleY) / 2;
   // Uniform scale for object shapes — use the smaller axis
   const scale = Math.min(scaleX, scaleY);
   // Compensation: undo the non-uniform stretch so shapes stay uniform
   const compensateX = scale / scaleX;
   const compensateY = scale / scaleY;
 
-  return { scale, scaleX, scaleY, offsetX, offsetY, compensateX, compensateY, refW: effectiveRefW, refH };
+  return {
+    scale, scaleX, scaleY, offsetX, offsetY, compensateX, compensateY,
+    refW: effectiveRefW, refH: effectiveRefH,
+  };
 }
 
 /** Client (CSS) coords → canvas rendering-space px (the space `computeCanvasScale`'s
@@ -195,12 +221,12 @@ export function clientToDesign2D(
   canvas: HTMLCanvasElement,
   clientX: number, clientY: number,
   refW: number, refH: number, mode: Canvas2DScaleMode,
-  maxRefW = 0,
+  maxRefW = 0, maxRefH = 0,
 ): { x: number; y: number } | null {
   if (!canvas.isConnected) return null;
   const rect = canvas.getBoundingClientRect();
   if (rect.width <= 0 || rect.height <= 0 || canvas.width <= 0 || canvas.height <= 0) return null;
-  const cs = computeCanvasScale(refW, refH, canvas.width, canvas.height, mode, maxRefW);
+  const cs = computeCanvasScale(refW, refH, canvas.width, canvas.height, mode, maxRefW, maxRefH);
   return screenToReference2D(clientX, clientY, rect, canvas.width, canvas.height, cs);
 }
 
@@ -211,11 +237,11 @@ export function designToClient2D(
   canvas: HTMLCanvasElement,
   refX: number, refY: number,
   refW: number, refH: number, mode: Canvas2DScaleMode,
-  maxRefW = 0,
+  maxRefW = 0, maxRefH = 0,
 ): { x: number; y: number } | null {
   if (!canvas.isConnected) return null;
   const rect = canvas.getBoundingClientRect();
   if (rect.width <= 0 || rect.height <= 0 || canvas.width <= 0 || canvas.height <= 0) return null;
-  const cs = computeCanvasScale(refW, refH, canvas.width, canvas.height, mode, maxRefW);
+  const cs = computeCanvasScale(refW, refH, canvas.width, canvas.height, mode, maxRefW, maxRefH);
   return referenceToScreen2D(refX, refY, rect, canvas.width, canvas.height, cs);
 }

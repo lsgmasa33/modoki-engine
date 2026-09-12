@@ -2644,13 +2644,13 @@ describeCases('QA case references', () => {
     const dangling: string[] = [];
     let checked = 0;
     const sections = headingIds(readFileSync(join(REPO_ROOT, 'qa/knowledge.md'), 'utf8'));
-    // The corpus cites 12 distinct sections today; a parse that stopped matching headings would
+    // A parse that stopped matching headings would
     // make every entry dangle, so floor the INPUT set as well as the checked one.
     expect(sections.size).toBeGreaterThan(20);
     for (const c of cases) {
       for (const entry of restoresEntries(c.fm?.fields.cites)) {
         checked++;
-        const m = typeof entry === 'string' && /^knowledge\.md#([0-9]+[a-z]?(?:-bis)?)$/.exec(entry);
+        const m = typeof entry === 'string' && /^knowledge\.md#([0-9]+[a-zA-Z]*(?:-bis)?)$/.exec(entry);
         if (!m) {
           dangling.push(`${c.rel}: cites: ${JSON.stringify(entry)} — want knowledge.md#<section>`);
         } else if (!sections.has(m[1])) {
