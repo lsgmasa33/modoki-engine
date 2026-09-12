@@ -123,21 +123,31 @@ const UNSCANNED_ROOTS: readonly string[] = deriveUnscannedRoots(SCAN_DIRS);
 const expectedOutsideRows = (): string[] =>
   expectedLedgerRows(KNOWN_OUTSIDE_SCAN_DIRS, UNSCANNED_ROOTS);
 
-/** ⚠️ **`UNSCANNED_ROOTS` OVERLAPS `SCAN_DIRS`, so the outside scan must re-filter.** Not a
- *  hypothesis — measured while mutation-checking this file: hand-rolling the loop back into
- *  `runtime/debug/widgetStore.ts` made it appear in BOTH the in-SCAN_DIRS list and the "roots this
- *  guard does NOT scan" list, under a message telling the reader to go look in `games/`.
+/** ⚠️ **The outside scan re-filters `UNSCANNED_ROOTS` against `SCAN_DIRS`, and the CAUSE that made
+ *  that necessary is fixed — this is now defence in depth, not the load-bearing guard it was.**
  *
- *  Cause: `deriveUnscannedRoots` descends until no scanDir reaches deeper, but when it runs out of
- *  path segments it keeps the last directory it computed. `engine/vite.config.ts` therefore yields
- *  the root `engine` — which contains all three SCAN_DIRS — so the complement re-scans everything
- *  the guard already policed.
+ *  The observation still stands: hand-rolling the loop back into `runtime/debug/widgetStore.ts` once
+ *  made it appear in BOTH the in-SCAN_DIRS list and the "roots this guard does NOT scan" list, under
+ *  a message telling the reader to go look in `games/`.
  *
- *  The same helper backs `abandonmentIsShared` and `livenessTokenIsShared`, which are green only
- *  because neither currently has an offender inside its own SCAN_DIRS to be double-reported. Left
- *  as a filter HERE rather than a fix THERE on purpose: reshaping a shared helper would move both
- *  siblings' root lists and their ledgers with them, which is a change those guards' owners should
- *  make deliberately. Filed separately. */
+ *  ⚠️ **Two claims this docblock used to make are RETRACTED (#1123 close-out, 2026-09-12).**
+ *
+ *  1. *"`deriveUnscannedRoots` … keeps the last directory it computed, so `engine/vite.config.ts`
+ *     yields the root `engine`."* That was **#950, and #950 landed.** When the walk exhausts the
+ *     helper now returns the FILE itself, and `helpers/unscannedRoots.ts` — which OWNS this fact,
+ *     so read it there rather than trusting a second copy here — records the measurement: the
+ *     "a returned root contains a scanDir" set is empty. This file was never updated, which is how
+ *     the filter below came to read as covering a live hole.
+ *  2. *"`abandonmentIsShared` and `livenessTokenIsShared` … are green only because neither currently
+ *     has an offender inside its own SCAN_DIRS to be double-reported."* No longer true, and the
+ *     evidence is direct: #1123 removed `abandonmentIsShared`'s file-level exempt skip, so
+ *     `engine/packages/modoki/src/editor/createEditor.tsx :: reject` **is** an offender inside its
+ *     own SCAN_DIRS — and that guard is green, with no double report. It is green because the
+ *     derivation is right, not because it is unexercised.
+ *
+ *  The filter stays: it is four cheap call sites, it costs nothing, and it keeps this guard honest
+ *  if the helper's exhaustion branch ever regresses. But it is no longer the thing standing between
+ *  this guard and a double report. */
 const insideScanDirs = (rel: string): boolean =>
   SCAN_DIRS.some((d) => rel === d || rel.startsWith(`${d}/`));
 
