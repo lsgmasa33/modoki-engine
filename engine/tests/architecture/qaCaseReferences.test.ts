@@ -3182,11 +3182,163 @@ describeCases('QA case references', () => {
     expect(playing.sort()).toEqual([...LEAVES_EDITOR_PLAYING].sort());
   });
 
+  /**
+   * The COST of `TOOLBAR`'s call anchor, guarded rather than left as a comment.
+   *
+   * Counting transport only inside a `data-ui-id` selector makes a Play written as PROSE invisible
+   * — a false negative, the direction that hides a real defect. Exactly one case did that
+   * (`rendering/group-alpha-reaches-2d-particle-emitters.md` step 10, *"**Play** again
+   * (`gameView.toolbar.play`), wait ~3s"*) and was rewritten to the braced form in #1121.
+   *
+   * ⚠️ **This deliberately does NOT look at line shape, and the first draft did.** That draft asked
+   * whether the id sat on a line starting `N. ` — and only **3 of the corpus's 12 toolbar calls do**.
+   * The rest are continuation lines under a step, and transport also appears in bulleted (`- `) and
+   * table-row steps, so the check was very nearly vacuous for the thing it was written to stop:
+   * rewriting group-alpha's step 10 with the id one line further down left the case genuinely
+   * ending Playing with the whole suite green.
+   *
+   * So the question is not "does this line look like a step" but "is every toolbar id in the
+   * PROCEDURE a real call" — and the handful that are not are ledgered per file **with a count**,
+   * the convention this file already uses (`LINE_REF_ALLOWED`, `CLONE_PORT_ALLOWED`,
+   * `PLAY_WRITE_ALLOWED`). A count, not a boolean, because a per-file boolean cannot see a SECOND
+   * bare mention appearing in a file that already has one (#1128 is that class).
+   *
+   * Both halves bite: a new prose mention fails, and so does a ledger row whose wording matches
+   * nothing — so a case that CLEANS UP its prose must drop the row in the same commit.
+   *
+   * **The allowlist was measured before this granularity was chosen, not discovered after.** On
+   * `work-qa` at the tree that added this: 18 mentions of `gameView.toolbar.(play|stop)` corpus-wide,
+   * 12 inside a `modoki_tap` call and 6 not; 16 of those sit inside a procedure region, 11 taps and
+   * 5 prose, which is the 4 rows below (one row covers two mentions on a single line). No
+   * granularity removes the allowlist — the 5 are genuine documentation, and a predicate that
+   * excluded them would also excuse a press written as prose, which is the whole defect.
+   *
+   * ⚠️ **What it cannot see**, stated so a green run is not read as more than it is:
+   * - `gameView.toolbar.pause`/`.step` are not modelled. Deliberate — only `stop` transitions out of
+   *   the hazard, and a case that pauses still reads as `endsPlaying`.
+   * - Anything before the FIRST procedure heading is outside the region, prose and taps alike.
+   *   `editor/ai-capture-contact-on-play-wiring.md` quotes the play selector in its Preconditions
+   *   and is neither counted nor ledgered.
+   * - A case with no procedure heading is skipped entirely; the coverage floor above is what stops
+   *   that hiding a case which presses Play.
+   */
+  const TOOLBAR_PROSE_ALLOWED: { file: string; near: string; reason: string }[] = [
+    {
+      file: 'qa/cases/gameview/first-click-into-game-panel-reaches-the-game.md',
+      near: 'the game area itself carries no',
+      reason:
+        'Its subject IS the tagging: the line enumerates the ids the toolbar carries in order to ' +
+        'say the game AREA carries none. Naming them is the finding.',
+    },
+    {
+      file: 'qa/cases/editor/cmd-s-during-play-saves-assets-not-scene.md',
+      near: 'an unselected tab has never rendered',
+      reason: 'Explains that the id does not RESOLVE while its tab is unrendered — the opposite of pressing it.',
+    },
+    {
+      file: 'qa/cases/editor/cmd-s-during-play-saves-assets-not-scene.md',
+      near: 'and are used directly',
+      reason:
+        'Its closing `## Note on selectors`. This is the case #1121 falsely accused — it Stops twice.',
+    },
+    {
+      file: 'qa/cases/editor/ai-capture-contact-on-play-wiring.md',
+      near: 'are real `data-ui-id`s',
+      reason:
+        'Its closing `## Note on selectors` names `.play` and `.stop` in one sentence. Under the old ' +
+        'bare-name matcher those two cancelled each other, which is the only reason this case did ' +
+        'not read as an offender too.',
+    },
+  ];
+
+  it('every toolbar transport id in a procedure is a real PRESS, or is ledgered prose (#1121)', () => {
+    const offenders: string[] = [];
+    const stale: string[] = [];
+    const used = new Set<string>();
+    let pressesSeen = 0;
+    const WINDOW = 160;
+    for (const c of cases) {
+      const region = procedureRegion(c.body);
+      if (region === null) continue;
+      const presses = [...region.matchAll(TOOLBAR('play')), ...region.matchAll(TOOLBAR('stop'))].map(
+        (m) => [m.index ?? 0, (m.index ?? 0) + m[0].length] as const,
+      );
+      pressesSeen += presses.length;
+      for (const m of region.matchAll(TOOLBAR_ANY())) {
+        const at = m.index ?? 0;
+        if (presses.some(([s, e]) => at >= s && at < e)) continue; // part of a real tap
+        const ctx = region.slice(Math.max(0, at - WINDOW), at + WINDOW);
+        const row = TOOLBAR_PROSE_ALLOWED.find((a) => a.file === c.rel && ctx.includes(a.near));
+        if (!row) {
+          offenders.push(
+            `${c.rel}: a toolbar id that is not a press — ${JSON.stringify(ctx.slice(WINDOW - 40, WINDOW + 40))}. ` +
+              "A press is `modoki_tap {selector: '[data-ui-id=\"gameView.toolbar.play\"]'}`; the scan reads " +
+              'the TAP, not the id, so transport written any other way does nothing. If this is genuinely ' +
+              'prose, ledger it in TOOLBAR_PROSE_ALLOWED with a nearby snippet and a reason.',
+          );
+          continue;
+        }
+        used.add(`${row.file}::${row.near}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+    // A row whose snippet no longer sits beside a bare mention has outlived what it excused —
+    // including one naming a file that was renamed or deleted. Without this, a case that cleans up
+    // its prose leaves a row that silently excuses the NEXT mention to appear near that text.
+    for (const a of TOOLBAR_PROSE_ALLOWED) {
+      if (!used.has(`${a.file}::${a.near}`)) stale.push(`${a.file}: ledger row ${JSON.stringify(a.near)} matched nothing`);
+    }
+    if (HAS_CASES) expect(stale).toEqual([]);
+    // ⚠️ Anti-vacuity, and the ONLY corpus-level check that can see `TOOLBAR` stop matching: the
+    // frozen baseline is drained to `[]`, so it reads `[] === []` and survives a dead detector, and
+    // `HAS_A_PLAY`'s floor survives on its `play_control` alternative alone. A RATCHET, not slack —
+    // 11 presses today, no case contributes fewer than 2, so removing one deliberately means
+    // lowering this number deliberately.
+    if (HAS_CASES) expect(pressesSeen).toBeGreaterThanOrEqual(11);
+  });
+
 });
 
+/**
+ * A toolbar transport CALL — the `data-ui-id` selector a real `modoki_tap` always carries — and
+ * NOT a prose mention of the same id (#1121).
+ *
+ * This is the brace rule below applied to the other event kind. Transport used to be matched by
+ * bare name (`/gameView\.toolbar\.play/`), which read a case's documentation as if it were a
+ * button press: cases NAME these ids in prose — two CASES do so in a trailing `## Note on selectors`
+ * section (three mentions between them), the rest in a sentence about what the toolbar carries.
+ * Measured over all 266 cases AFTER the corpus edit below: 18 mentions, of which 12 sit inside a
+ * `modoki_tap` call and 6 do not. ⚠️ Counting the SELECTOR rather than the tap is not enough — see
+ * the guard's own ledger for the prose-in-selector-form hole that cost.
+ *
+ * It went wrong in both directions at once. `editor/cmd-s-during-play-saves-assets-not-scene.md`
+ * Stops twice and was still listed as leaving the editor Playing, because its closing note names
+ * `.play` last; and `editor/ai-capture-contact-on-play-wiring.md` read CLEAN only because its own
+ * note happens to name `.play` before `.stop`, so two false events cancelled — reordering two
+ * words in that sentence would have switched its check off silently.
+ *
+ * ⚠️ The cost was paid in the CORPUS, not hidden here. `rendering/group-alpha-reaches-2d-particle-
+ * emitters.md` step 10 was a genuine Play written as prose (``**Play** again (`gameView.toolbar.
+ * play`)``) and is now a braced call like every other transport step, because a regex cannot tell
+ * "I pressed this" from "this exists" and guessing would have traded a false accusation for a
+ * false NEGATIVE — the direction that hides a real defect.
+ */
+const TOOLBAR_SELECTOR = (id: 'play' | 'stop' | '(?:play|stop)') =>
+  `data-ui-id=\\\\?["']gameView\\.toolbar\\.${id}\\\\?["']`;
+
+/** ANY mention of a transport id, pressed or merely described. Derived from the same literal as
+ *  `TOOLBAR`, so renaming the id namespace cannot update one and leave the other behind. */
+const TOOLBAR_ANY = () => new RegExp(`gameView\\.toolbar\\.(?:play|stop)`, 'g');
+
+const TOOLBAR = (id: 'play' | 'stop') =>
+  new RegExp(`modoki_tap[^}]{0,80}?${TOOLBAR_SELECTOR(id)}`, 'g');
+
 /** Case bodies that press Play. Shared by the scan and by its coverage floor, so the floor cannot
- *  pass because the detector drifted. */
-const HAS_A_PLAY = /play_control[^}]{0,80}?["']?action["']?\s*:\s*["']play["']|gameView\.toolbar\.play/;
+ *  pass because the detector drifted — including the `TOOLBAR` form, which must stay the SAME
+ *  shape here or the floor would demand scannability for cases the scan no longer reads. */
+const HAS_A_PLAY = new RegExp(
+  `play_control[^}]{0,80}?["']?action["']?\\s*:\\s*["']play["']|${TOOLBAR('play').source}`,
+);
 
 /**
  * Cases allowed to write the scene while Playing, with the reason — the convention every other
@@ -3202,20 +3354,15 @@ const PLAY_WRITE_ALLOWED: Record<string, string> = {};
 /**
  * Cases that end their procedure with the editor still Playing (#1121). Frozen so a NEW one fails
  * and a DRAINED one must be removed in the same commit.
+ *
+ * **Empty — fully drained.** Ten cases gained a trailing `## Cleanup` Stop. The eleventh,
+ * `editor/cmd-s-during-play-saves-assets-not-scene.md`, was never an offender: it Stops at step 10
+ * and again in its own Cleanup, and was listed only because the scan read the `## Note on
+ * selectors` line at the foot of the file as a button press. It left this list when `TOOLBAR` got
+ * its call anchor, with no edit to the case — adding a third redundant Stop to a compliant case to
+ * satisfy a defective scanner would have been fixing the measurement to match the instrument.
  */
-const LEAVES_EDITOR_PLAYING = [
-  'qa/cases/audio/action-dispatch-observable-effect.md',
-  'qa/cases/audio/timescale-and-lifecycle.md',
-  'qa/cases/determinism/journal-tick-stamps-and-summary-agree.md',
-  'qa/cases/determinism/sim-vs-visual-delta-freeze-together.md',
-  'qa/cases/determinism/stepping-is-wall-clock-free.md',
-  'qa/cases/editor/cmd-s-during-play-saves-assets-not-scene.md',
-  'qa/cases/gameview/step-advances-exactly-one-tick.md',
-  'qa/cases/physics/contact-event-fires-once-per-contact.md',
-  'qa/cases/physics/timescale-freezes-physics-contacts-stay-fresh.md',
-  'qa/cases/video/2d-sprite-path-decodes-and-paints.md',
-  'qa/cases/video/3d-screen-playback-timescale-pause.md',
-];
+const LEAVES_EDITOR_PLAYING: string[] = [];
 
 /** A procedure section. `qa/README.md` calls the headings a CONVENTION, so this accepts the four
  *  spellings the corpus actually uses (`## Steps`, `## Steps — Part A`, `### Steps`, `## Part A`)
@@ -3260,6 +3407,11 @@ export interface PlayOrderingScan {
  *   name match would flag as the defect it warns about. The cost is a false NEGATIVE on a braceless
  *   prose call; `video/delivery-bundled-and-remote-cache.md` step 11 has one and is CORRECT (it
  *   Stops first, and says why).
+ * - TRANSPORT obeys that same rule, and for the same reason — see `TOOLBAR` above. `play_control`
+ *   is self-anchoring (the verb only appears inside the call's own arguments), but the toolbar ids
+ *   are bare identifiers that four cases document in prose, so they count only inside a
+ *   `data-ui-id` selector. This symmetry was missing for a while and cost one false accusation and
+ *   one near-miss in the masking direction (#1121).
  * - `modoki_save_all` is out of scope. It is blocked during Play too, but by `editorAction`
  *   ('save-all'), NOT by this 409 — and it takes no arguments, so cases write it bare far more often
  *   than braced: the brace rule would give it near-zero coverage and the bare rule would flag every
@@ -3270,11 +3422,17 @@ export interface PlayOrderingScan {
  * - Timeline `preview`/`scrub` run modes collapse to `stopped` in the `playState` the route reads,
  *   so a mutate during a preview does not hit this 409 and is correctly not modelled here.
  */
-export function scanPlayOrdering(body: string): PlayOrderingScan {
+/** The scanned procedure region, or null when the case has no procedure heading. Shared with the
+ *  toolbar-prose guard so the two cannot drift into asserting about different spans of the file. */
+export function procedureRegion(body: string): string | null {
   const lines = body.split(/\r?\n/);
   const start = lines.findIndex((l) => PROCEDURE_HEADING.test(l));
-  if (start < 0) return { scannable: false, offenders: [], endsPlaying: false };
-  const region = lines.slice(start + 1).join('\n');
+  return start < 0 ? null : lines.slice(start + 1).join('\n');
+}
+
+export function scanPlayOrdering(body: string): PlayOrderingScan {
+  const region = procedureRegion(body);
+  if (region === null) return { scannable: false, offenders: [], endsPlaying: false };
 
   // `[^}]` cannot cross a `}`, so nested braces in `{ops:[{op:'setTrait'…}]}` cannot bleed into the
   // next call and two adjacent calls cannot be spanned as one. The window is bounded rather than
@@ -3288,9 +3446,9 @@ export function scanPlayOrdering(body: string): PlayOrderingScan {
     for (const m of region.matchAll(re)) events.push({ at: m.index ?? 0, kind });
   };
   add(TRANSPORT('play'), 'play');
-  add(/gameView\.toolbar\.play/g, 'play');
+  add(TOOLBAR('play'), 'play');
   add(TRANSPORT('stop'), 'stop');
-  add(/gameView\.toolbar\.stop/g, 'stop');
+  add(TOOLBAR('stop'), 'stop');
   add(/\b(?:modoki_)?(?:load_scene|new_scene)`?\s*\{/g, 'stop');
   for (const m of region.matchAll(/\b(modoki_mutate_scene|modoki_set_transform)`?\s*\{/g)) {
     events.push({ at: m.index ?? 0, kind: 'write', text: m[1] });
@@ -3443,5 +3601,82 @@ describe('scanPlayOrdering', () => {
         wrap("1. `modoki_play_control {action:'play'}`.\n2. `modoki_play_control {action:'stop'}`."),
       ).endsPlaying,
     ).toBe(false);
+  });
+
+  /**
+   * The four below pin `TOOLBAR`'s call anchor, in both directions. Before it, transport was a bare
+   * name match and the first of these read `endsPlaying: true` for a case that Stops twice.
+   */
+  it('does NOT read a prose mention of the play id as a button press — the `## Note on selectors` shape (#1121)', () => {
+    const r = scanPlayOrdering(
+      wrap(
+        '1. `modoki_tap {selector:\'[data-ui-id="gameView.toolbar.play"]\'}`.\n' +
+          '2. `modoki_tap {selector:\'[data-ui-id="gameView.toolbar.stop"]\'}` — back to stopped.\n\n' +
+          '## Note on selectors\n\n`gameView.toolbar.play` · `.stop` exist (`GameView.tsx`).',
+      ),
+    );
+    expect(r.endsPlaying).toBe(false);
+  });
+
+  it('still reads a real toolbar TAP as a Play — the accept side, without which the test above passes by measuring nothing', () => {
+    expect(
+      scanPlayOrdering(wrap('1. `modoki_tap {selector:\'[data-ui-id="gameView.toolbar.play"]\'}`.')).endsPlaying,
+    ).toBe(true);
+  });
+
+  it('does NOT let a prose mention of the STOP id clear a real Play — the MASKING direction (#1121)', () => {
+    // `editor/ai-capture-contact-on-play-wiring.md` read clean only because its own closing note
+    // names `.play` before `.stop`, so two false events cancelled. Reordering two words in that
+    // sentence would have switched its check off with nothing going red.
+    // ⚠️ The prose must name ONLY `.stop`. A first draft named `.stop` / `.play`, which the OLD
+    // bare-name matcher also scored as `true` (stop then play) — so the test passed under the very
+    // bug it was written to catch, and the mutation check is what said so.
+    const r = scanPlayOrdering(
+      wrap(
+        "1. `modoki_play_control {action:'play'}`.\n\n" +
+          '## Note on selectors\n\n`gameView.toolbar.stop` is a real `data-ui-id` (`GameView.tsx`).',
+      ),
+    );
+    expect(r.endsPlaying).toBe(true);
+  });
+
+  it('accepts the ESCAPED selector spelling, when it is a real tap', () => {
+    // Future-proofing rather than an observed shape: no case writes an escaped `.play`/`.stop`
+    // selector today (the escaped spelling appears only for `.step`/`.pause`, which TOOLBAR does
+    // not match). The tolerance is kept so the first one is read rather than silently ignored.
+    expect(
+      scanPlayOrdering(wrap('1. `modoki_tap {selector: "[data-ui-id=\\"gameView.toolbar.play\\"]"}`.'))
+        .endsPlaying,
+    ).toBe(true);
+  });
+
+  it('does NOT let a selector NAMED in prose clear a real Play — the masking hole that survived the first fix', () => {
+    // The review's own repro, which was GREEN against the first draft: call-anchoring on the
+    // SELECTOR alone made a prose sentence in selector form both invisible to the ledger (it
+    // counted as a call, so `bare` stayed 0) and a phantom Stop. A case could then say in so many
+    // words that it leaves the editor Playing and pass. The press is the TAP, not the id.
+    const r = scanPlayOrdering(
+      wrap(
+        "1. `modoki_play_control {action:'play'}`.\n" +
+          '2. **Leave the world Playing** for the follow-up case. The Stop button is tagged\n' +
+          '   `[data-ui-id="gameView.toolbar.stop"]` if you need it — do NOT press it here.',
+      ),
+    );
+    expect(r.endsPlaying).toBe(true);
+  });
+
+  it('does NOT read a selector that is merely QUERIED as a press — the phantom-transport shape', () => {
+    // `gameview/toolbar-buttons-drive-play-pause-step-stop.md` reads a button's `disabled`/`title`
+    // through `querySelector('[data-ui-id="gameView.toolbar.step"]')` five times. Those are
+    // `.step`/`.pause` so TOOLBAR ignores them, but the first case to inspect `.play`/`.stop` state
+    // the same way would otherwise gain a transport event in whichever direction it happened to
+    // query — a Stop that nobody pressed silently clears the hazard.
+    const r = scanPlayOrdering(
+      wrap(
+        "1. `modoki_play_control {action:'play'}`.\n" +
+          '2. `modoki_eval {js: "document.querySelector(\'[data-ui-id=\\"gameView.toolbar.stop\\"]\').disabled"}`.',
+      ),
+    );
+    expect(r.endsPlaying).toBe(true);
   });
 });

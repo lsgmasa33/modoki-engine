@@ -60,6 +60,7 @@
 import { describe, it, expect } from 'vitest';
 import path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { deriveUnscannedRoots, expectedLedgerRows } from '../helpers/unscannedRoots';
 
@@ -175,8 +176,35 @@ function timerRejects(src: string, rejector: string): boolean {
  *
  *  ⚠️ Exactly ONE entry, asserted below. A second is a signal that either the primitive needs a
  *  conditional variant or the exemption is being used to dodge a migration. Decide that
- *  deliberately; do not append to this list. */
-const EXEMPT = ['engine/packages/modoki/src/editor/createEditor.tsx'];
+ *  deliberately; do not append to this list.
+ *
+ *  ⚠️ **Keyed `<file> :: <rejector>` rather than by FILE (#1123).** A bare file key skipped
+ *  `createEditor.tsx` out of the scan entirely, so a DIFFERENTLY-named hand-rolled timeout added
+ *  beside the exempt one was pardoned by a reason written about the renderer bring-up.
+ *
+ *  ⚠️ **`KNOWN_OUTSIDE_SCAN_DIRS` above is NOT already this shape** — an earlier draft of this note
+ *  claimed it was. Its rows are `<file> :: rejects via <comma-joined rejectors>`, which is per-FILE
+ *  with a list glued on: because `scan()` dedupes with `new Set(rejectors)`, adding a SECOND
+ *  same-named rejector to a ledgered file leaves the joined string identical and its exact-set
+ *  assertion green. That list carries the same defect, one root over, and is #1128's.
+ *
+ *  ⚠️ **Stated limit, because the detector cannot go finer.** `timerRejects` is a per-NAME
+ *  predicate and `scan` dedupes with `new Set(rejectors)`, so `createEditor.tsx`'s TWO
+ *  `new Promise((_, reject))` declarations — both spelled `reject` — are one row and one
+ *  occurrence. A third timeout in that file also spelled `reject` is still pardoned. Closing that
+ *  needs `timerRejects` to return SITES rather than a boolean, which is #1128's work, not a row
+ *  shape. It is the blind spot `notifyIsShared`'s header documents for the identical row shape. */
+const EXEMPT = [
+  {
+    item: 'engine/packages/modoki/src/editor/createEditor.tsx :: reject',
+    reason: 'A pattern the helper CANNOT EXPRESS — which is this list\'s stated bar, and the half a '
+      + 'reader needs: it is a multi-way race over THREE timers with conditional arming, where '
+      + '`withTimeout` wraps one promise with one deadline. The already-correct half, which on its '
+      + 'own would mean MIGRATE rather than exempt: it holds nothing the caller must reclaim (the '
+      + 'renderer registers itself through setActiveRenderer whenever it arrives) and all three '
+      + 'timers are cleared in a finally.',
+  },
+] as const;
 
 interface Scanned { file: string; rejectors: string[]; offenders: string[] }
 
@@ -188,7 +216,10 @@ function scan(roots: readonly string[] = SCAN_DIRS): Scanned[] {
     // exists to remove. ⚠️ It preserves source OFFSETS — see `timerRejects`'s window.
     const src = readScannedSource(abs).code;
     const rejectors = [...src.matchAll(REJECTORS)].map((m) => m[1]);
-    const offenders = abs === HELPER || EXEMPT.includes(rel)
+    // ⚠️ Only the HELPER is skipped structurally (it IS the implementation). The EXEMPT row used to
+    // be skipped here too, which is what made its pardon file-wide — it is now spent by the ledger
+    // at the assertion instead, so a differently-named timeout in the same file is visible (#1123).
+    const offenders = abs === HELPER
       ? []
       : [...new Set(rejectors)].filter((r) => timerRejects(src, r));
     results.push({ file: rel, rejectors, offenders });
@@ -282,11 +313,19 @@ describe('the shared abandonment helper is the only timeout implementation (#801
   it('no file hand-rolls a promise timeout', () => {
     const offenders = scan()
       .filter((r) => r.offenders.length > 0)
-      .map((r) => `${r.file} :: rejects via ${r.offenders.join(', ')}`);
+      .flatMap((r) => r.offenders.map((rej) => `${r.file} :: ${rej}`));
 
-    expect(
-      offenders,
-      offenders.length === 0 ? '' : [
+    assertExemptionLedger({
+      label: 'EXEMPT in abandonmentIsShared',
+      population: offenders.map((item) => ({ item, site: `${item} (rejects from a setTimeout)` })),
+      exempt: EXEMPT,
+      // 1 measured 2026-09-12 on work-ai2, which is also the pardon. The detector-broke checks are the sibling
+      // tests: SCAN_DIRS non-vacuity, and the rejector census floored at >20 files with timers.
+      // ⚠️ Because the helper checks `floor` BEFORE `over-blessed`, MIGRATING this one site reports
+      // "the detector has stopped matching" rather than "blesses 1, found 0". Always red, never
+      // fail-open — but read it as success, and delete the row.
+      floor: 1,
+      fix: [
         'These files build their own timeout by rejecting from a setTimeout. There is ONE',
         'implementation, and it exists because a timeout REJECTS THE CALLER without CANCELLING the',
         'operation underneath — which none of our operations supports:',
@@ -302,7 +341,8 @@ describe('the shared abandonment helper is the only timeout implementation (#801
         'If this is NOT a timeout (a soft resolve-with-fallback, or a real AbortSignal), it should',
         'not reject from a timer — say so in review rather than widening this guard.',
       ].join('\n'),
-    ).toEqual([]);
+    });
+
   });
 
   // CENSUS — the backstop, modelled on the sibling guard's. A scanner that stops recognising its
@@ -331,14 +371,11 @@ describe('the shared abandonment helper is the only timeout implementation (#801
   // The exemption is load-bearing in both directions: it must stay a single entry, and the file it
   // names must still trip the detector. An exemption for a file that no longer matches is dead
   // weight that silently grants cover to whatever gets written there next.
-  it('the one exemption is still exactly one, and still needed', () => {
+  it('the one exemption is still exactly one', () => {
+    // Review pressure only. "Still needed" is now the ledger's over-blessed arm, which is stronger:
+    // the old check asked whether the file still had SOME rejector tripping the detector, so
+    // migrating the exempt one while adding a different one kept it green.
     expect(EXEMPT).toHaveLength(1);
-    const src = readScannedSource(path.join(REPO, EXEMPT[0])).code;
-    const rejectors = [...src.matchAll(new RegExp(REJECTORS.source, 'g'))].map((m) => m[1]);
-    expect(
-      rejectors.some((r) => timerRejects(src, r)),
-      `${EXEMPT[0]} no longer hand-rolls a timeout — delete the exemption rather than leaving it`,
-    ).toBe(true);
   });
 
   // The detector is unit-tested against fixtures because NARROWING it is otherwise invisible:

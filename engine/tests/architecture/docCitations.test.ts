@@ -43,6 +43,7 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { repoFiles as repoCorpusFiles } from '../../scripts/repoCorpus.mjs';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { hasInternalGames, hasPrivateDocs } from '../helpers/repoLayout';
 import { SECTION_CITE, headingIds } from '../helpers/docSections';
 import {
@@ -99,22 +100,63 @@ const exists = (p: string) => fs.existsSync(path.join(repoRoot, p));
 
 /* ------------------------------------------------------------------ Rule 1 */
 
-/** Files whose `docs/**.md` mentions are NOT citations. Each needs a reason — an entry here is
- *  a hole in the guard, so it should be obviously-correct, not merely convenient. */
-const DOC_CITATION_EXEMPT: ReadonlyArray<{ file: string; reason: string }> = [
-  {
-    file: 'engine/tests/assets/scanPublishSafety.test.ts',
-    reason:
-      'Writes temp FIXTURE files under a scratch dir to exercise the publish scanner. Those are '
-      + 'inputs it creates, not pointers to real docs.',
-  },
-  {
-    file: 'engine/tests/architecture/docCitations.test.ts',
-    reason:
-      'This file. Its exemption reasons and error strings necessarily quote doc paths, including '
-      + 'absent ones — a guard that fails on its own explanation of why something is absent.',
-  },
+/** ⚠️ **This replaces `DOC_CITATION_EXEMPT`, a bare-FILE list that three different rules
+ *  consumed with no staleness check of any kind (#1123).** It held two rows and was read at three
+ *  call sites — rule 1 (doc-path citations), rule 2 (bare-name citations) and the markdown-link
+ *  rule — so one reason written about one rule excused a file in all three. Measured 2026-09-12 on work-ai2:
+ *  this file held **164** `docs/**.md` mentions and `scanPublishSafety.test.ts` **7**, all pardoned
+ *  wholesale, and nothing ever re-checked either row. Its docblock asked for entries that are
+ *  "obviously-correct, not merely convenient" — the grain was what made that unverifiable.
+ *
+ *  The replacement splits the two rows by what they actually are:
+ *
+ *  - **`SELF_QUOTING`** — this file. A guard whose error strings and exemption reasons must quote
+ *    doc paths, including absent ones, cannot be asked not to; any number of them is correct. That
+ *    is STRUCTURAL, not a reviewed exception, so it is not a ledger row — the split
+ *    `clientJsonWriteSeam.test.ts` makes, and the one `corpusProducerIsShared.test.ts` makes for
+ *    `repoCorpus.mjs` "structurally, not via EXEMPT".
+ *    ⚠️ **Stated hole:** a genuinely dangling citation added to THIS file is still invisible.
+ *    The alternative is 164 ledger rows, which nobody would read. Accepted knowingly.
+ *  - **`RULE1_FIXTURE_PATHS`** — named per cited PATH, so a new fixture path is a decision.
+ *
+ *  ⚠️ **And the other two rules now pardon `scanPublishSafety.test.ts` for nothing, because it
+ *  was pardoning nothing.** Measured by deleting its row and running the file: 23 of 24 tests stayed
+ *  green and only rule 1 reddened. Its pardon in rules 2 and 3 was inert — the cross-ban defect in
+ *  its mildest form, and the reason a row must belong to ONE rule. */
+const SELF_QUOTING: readonly string[] = [
+  'engine/tests/architecture/docCitations.test.ts',
 ];
+
+/** Fixture doc paths `engine/tests/assets/scanPublishSafety.test.ts` WRITES into a scratch dir to
+ *  exercise the publish scanner, then asserts on. They are inputs it creates, not pointers to real
+ *  docs — so they must not exist in the tree, which is the opposite of what rule 1 wants.
+ *
+ *  One row per cited PATH rather than per mention: the path is the identity, and three `w()` calls
+ *  plus four `expect`s naming the same fixture are one fact. A NEW fixture path is what has to be
+ *  looked at, and that is what goes red. */
+const RULE1_FIXTURE_PATHS = [
+  { item: 'engine/tests/assets/scanPublishSafety.test.ts::docs/history.md',
+    reason: "scratch fixture for that file's hard-FAIL case — see the `w('docs/history.md', …)` "
+      + 'call there for its content' },
+  { item: 'engine/tests/assets/scanPublishSafety.test.ts::docs/team.md',
+    reason: "scratch fixture for that file's review-but-not-hard-fail case — see the "
+      + "`w('docs/team.md', …)` call there" },
+  { item: 'engine/tests/assets/scanPublishSafety.test.ts::docs/unquoted-prose.md',
+    reason: "scratch fixture pinning that the scanner's ^/$ anchors do the work on a credential-"
+      + 'shaped token in prose' },
+] as const;
+
+/* ⚠️ **Those reasons name the fixtures by PATH and deliberately do not quote their CONTENT.** The
+ *  first cut did, and it was a publish blocker: `scanPublishSafety.test.ts` is one of seven files
+ *  the OSS manifest EXCLUDES (`scripts/publish-engine-oss.sh`), precisely because its fixtures embed
+ *  a real third-party brand name for the scanner to catch — and THIS file ships. Quoting the fixture
+ *  here carried that string from an excluded path to a published one, and
+ *  `scripts/scan-publish-safety.mjs` aborted the publish with a BLOCKING finding. Caught by review
+ *  on the close-out, not by `npm run verify`, which does not run the publish scanner.
+ *
+ *  The general rule, which is easy to get wrong in exactly this direction: **a ledger row that moves
+ *  a quotation across a publish boundary moves whatever the quotation contains.** Cite the fixture,
+ *  never its bytes. */
 
 /** Retired docs that are still NAMED on purpose, and the doc that absorbed each.
  *
@@ -136,7 +178,7 @@ const DOC_CITATION_EXEMPT: ReadonlyArray<{ file: string; reason: string }> = [
  *  free-form ("X — landed…", "X + Y; the superseded plan is preserved…",
  *  "games/court/{hints,levels,tutorial}.md"), and regex-guessing the live target back out of it
  *  would be exactly the kind of "merely convenient, not obviously correct" hole the comment on
- *  `DOC_CITATION_EXEMPT` above warns against.
+ *  `SELF_QUOTING` / `RULE1_FIXTURE_PATHS` above warns against.
  *
  *  ⚠️ NOT the same shape as `absorbedBy` itself — an entry whose prose STARTS "nothing" (no doc
  *  directly absorbed this one) can still have a non-empty `absorbedByPaths`, when the prose goes on
@@ -312,7 +354,7 @@ function markdownLinkTargets(line: string): string[] {
  *
  *  Returns cited-path → the `file:line` sites that named it. */
 function scanDocPathCitations(historical: ReadonlySet<string>): Map<string, Set<string>> {
-  const exempt = new Set(DOC_CITATION_EXEMPT.map((e) => e.file));
+  const exempt = new Set(SELF_QUOTING);
   const offenders = new Map<string, Set<string>>();
   for (const file of repoFiles()) {
     const relFile = rel(file);
@@ -557,9 +599,10 @@ function scanDocPathCitationsUnfiltered(): Map<string, Set<string>> {
 
 /** Rule 1's bare-name companion (#621): every retired basename mentioned WITHOUT its `docs/`
  *  prefix, repo-wide. Bases = the retired basenames minus `ambiguousRetiredBasenames()`. Skips the
- *  same two things `scanDocPathCitations` skips, for the same reasons: `DOC_CITATION_EXEMPT` (this
- *  guard file must be able to quote bare names in its own explanations — this file does, in the
- *  `bareNameMentions` docblock above)
+ *  same two things `scanDocPathCitations` skips, for the same reasons: `SELF_QUOTING` (this guard
+ *  file must be able to quote bare names in its own explanations — this file does, in the
+ *  `bareNameMentions` docblock above; it is NOT pardoned for `scanPublishSafety.test.ts`, whose old
+ *  blanket row pardoned nothing under this rule — #1123)
  *  and `isNonCitingSource` (a review is a dated snapshot; the generated `site/docs/reference/`
  *  copy inherits whatever staleness the source doc has).
  *
@@ -574,7 +617,7 @@ function scanDocPathCitationsUnfiltered(): Map<string, Set<string>> {
 let scanBareNameCitationsCache: Map<string, Set<string>> | undefined;
 function scanBareNameCitations(): Map<string, Set<string>> {
   if (scanBareNameCitationsCache) return scanBareNameCitationsCache;
-  const exempt = new Set(DOC_CITATION_EXEMPT.map((e) => e.file));
+  const exempt = new Set(SELF_QUOTING);
   const ambiguous = ambiguousRetiredBasenames();
   const bases = new Set(
     RETIRED_DOCS_NAMED_ON_PURPOSE
@@ -635,17 +678,43 @@ describe('cited doc paths resolve (#194)', () => {
       new Set(RETIRED_DOCS_NAMED_ON_PURPOSE.map((e) => e.cited)),
     );
 
-    const report = [...offenders.entries()]
-      .sort()
-      .map(([p, sites]) => `${p}\n    cited by: ${[...sites].sort().join(', ')}`);
+    // One population entry per (citing file, cited path) — not per mention, because the path is
+    // the identity. `site` keeps every line for the message, which is what a reader needs.
+    const byFileAndPath = new Map<string, { item: string; site: string }>();
+    for (const [cited, sites] of [...offenders.entries()].sort()) {
+      for (const site of [...sites].sort()) {
+        const item = `${site.replace(/:\d+$/, '')}::${cited}`;
+        const seen = byFileAndPath.get(item);
+        if (seen) seen.site += `, ${site}`;
+        else byFileAndPath.set(item, { item, site: `${cited}\n    cited by: ${site}` });
+      }
+    }
 
-    expect(
-      report,
-      'these docs were deleted or renamed without repointing their citations. '
+    assertExemptionLedger({
+      label: 'RULE1_FIXTURE_PATHS in docCitations (rule 1)',
+      population: [...byFileAndPath.values()].sort((a, b) => a.item.localeCompare(b.item)),
+      exempt: RULE1_FIXTURE_PATHS,
+      // ⚠️ A floor of 3 is the ledgered fixtures and nothing else, because on a clean tree
+      // rule 1's population IS exactly the pardons — there are no other offenders, by design. So
+      // this is the one place in this change where the floor necessarily equals the population, and
+      // FIXING a fixture reports "stopped matching" rather than "blesses 1, found 0". Read it that
+      // way. The real detector-broke check is the sibling test that floors repoFiles() at 200 and
+      // citing markdown files at 20; this floor only stops the ledger meeting an empty scan.
+      //
+      // ⚠️ **And the whole population lives in ONE file the OSS publish manifest STRIPS**
+      // (`engine/tests/assets/scanPublishSafety.test.ts`), while `verify:publish` runs
+      // `engine/tests/architecture/` against the stage. This floor is green there only because the
+      // test `ctx.skip()`s on `hasPrivateDocs()` — which reads a DIFFERENT excluded file, for
+      // reasons that have nothing to do with this rule. So the dependency is real and incidental: if
+      // `hasPrivateDocs()` ever becomes true on the stage, this floor reddens the free public CI,
+      // and the fix is to gate on the file the floor actually counts. The #1014/#1015 shape, and it
+      // did not exist before this floor did. Flagged by review.
+      floor: 3,
+      fix: 'these docs were deleted or renamed without repointing their citations. '
         + 'doc-conventions.md: repoint every citation in the SAME commit that moves the doc — '
         + 'fold the content into the feature doc and point there, or drop the pointer if the '
         + 'surrounding text stands on its own.',
-    ).toEqual([]);
+    });
   });
 
   it('documentLinkTargets: a fence hides its own contents and nothing after it (#578)', () => {
@@ -1048,11 +1117,12 @@ describe('cited doc paths resolve (#194)', () => {
     // reader follows them into a 404 — but that belongs to the publish scanner, not here.
     const offenders: string[] = [];
     let checked = 0;
-    // DOC_CITATION_EXEMPT applies here for the reason each of its entries already states: a file
-    // that must QUOTE broken citations to explain them. This rule proved that immediately — the
+    // SELF_QUOTING applies here for the reason it states: a file that must QUOTE broken citations
+    // to explain them. ⚠️ It is this file ONLY — the old blanket list also pardoned
+    // `scanPublishSafety.test.ts` here, and measurement showed that pardoned nothing (#1123). This rule proved that immediately — the
     // paragraph below explaining why `oss/**` is excluded quotes `](CLA.md)`, and the guard
     // reported its own explanation as a defect.
-    const exempt = new Set(DOC_CITATION_EXEMPT.map((e) => e.file));
+    const exempt = new Set(SELF_QUOTING);
     for (const file of repoFiles()) {
       const relFile = rel(file);
       if (exempt.has(relFile) || isNonCitingSource(relFile)) continue;

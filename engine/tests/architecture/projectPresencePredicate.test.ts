@@ -22,9 +22,10 @@
  * predicate from `engine/tests/helpers/repoLayout.ts`. Do not add a third.
  */
 import { describe, it, expect } from 'vitest';
-import fs from 'node:fs';
 import path from 'node:path';
 import { REPO_ROOT } from '../helpers/repoLayout';
+import { readScannedSource } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 /** Every test root in the repo, not the two somebody listed (#830). The claim this guard makes is
@@ -39,19 +40,40 @@ const TEST_DIRS = [
   path.join(REPO_ROOT, 'demos'),
 ];
 
-/** The helper is the one legitimate place to compute this. This guard is excluded because it
- *  must SPELL OUT the shapes it forbids — its `what:` labels below literally contain
- *  `discoverProjects(...).some(...)`, so it flags itself otherwise. (It did, first run.) A guard
- *  that reports its own documentation as a violation is one people learn to ignore. */
-// Repo-relative POSIX literals — matched against `rel` (git's own repo-relative string), never
-// against an independently `path.join`-built absolute path (#849).
-const ALLOWED = new Set([
+/** ⚠️ **One bare-file `ALLOWED` Set used to serve BOTH rules in this file, and two of its three
+ *  entries were never exemptions at all (#1123).** `repoLayout.ts` is the one legitimate
+ *  implementation and this guard must SPELL OUT the shapes it forbids — its `what:` labels
+ *  literally contain `discoverProjects(...).some(...)`, so it flags itself otherwise (it did, first
+ *  run). Neither is a decision anybody should re-review, so neither is a ledger row: they are
+ *  `SANCTIONED`, the split `clientJsonWriteSeam.test.ts` makes.
+ *
+ *  The third, `e2e/hostProject.ts`, is the real reasoned exemption — and it belonged to rule 2
+ *  ONLY. Measured 2026-09-12 on work-ai2: it matches rule 1's `INLINE_PATTERNS` **zero** times, so its rule-1
+ *  pardon was inert and covered whatever inline check somebody added there later. One row, one rule.
+ *
+ *  Repo-relative POSIX literals — matched against `rel` (git's own repo-relative string), never
+ *  against an independently `path.join`-built absolute path (#849). */
+const SANCTIONED: readonly string[] = [
   'engine/tests/helpers/repoLayout.ts',
   'engine/tests/architecture/projectPresencePredicate.test.ts',
-  // The e2e host-project pick — the one legitimate `discoverProjects` call under e2e/. See the
-  // E2E_* describe block below for why every OTHER spec is forbidden from making it.
-  'engine/tests/e2e/hostProject.ts',
-]);
+];
+
+/* ⚠️ **`sanctioned` is file-grained and carries no count, so this RECLASSIFIES rule 1's pardons
+ *  rather than closing #1123 for them** — a new inline presence check added to either file is still
+ *  green. Deliberate, and defensible only because a second guard covers it:
+ *  `architecture/layoutConditionalTestLedger.test.ts` pins this file's conditional-gate list as
+ *  empty, so a real `existsSync(path.join(REPO_ROOT, 'games'))` here would redden THERE. Do not copy
+ *  the pattern to a guard with no such backstop — give those a counted row instead. */
+
+/** The one legitimate `discoverProjects` call under `e2e/` — rule 2's single pardon. */
+const E2E_EXEMPT = [
+  {
+    item: 'engine/tests/e2e/hostProject.ts',
+    reason: 'pickHostProject() is the one place an e2e run may ask. It returns null instead of '
+      + 'throwing, so a spec test.skip()s rather than killing COLLECTION for the whole suite — see '
+      + 'the describe block below for the release that cost.',
+  },
+] as const;
 
 /** Inline computations of project presence — the shapes that have actually appeared. */
 const INLINE_PATTERNS: { re: RegExp; what: string }[] = [
@@ -81,21 +103,34 @@ describe('project-presence is asked in exactly one place (#98)', () => {
   });
 
   it('no test computes project presence inline — import from helpers/repoLayout instead', () => {
-    const offenders: string[] = [];
+    // ⚠️ `readScannedSource` replaces a hand-rolled "skip lines that look like comments" filter
+    // (`/^\s*(\/\/|\*|\/\*)/`), which is the shape `commentStripperIsShared.test.ts` exists to
+    // remove: it misses a trailing `// …` and a block comment opened mid-line. The shared reader
+    // matters more now that rows carry counts — a prose mention would inflate the number a row has
+    // to match. Measured both ways 2026-09-12: 5 occurrences either way, so no verdict moves. The
+    // `what:` labels are STRING literals, not comments, so this guard still matches itself and is
+    // still SANCTIONED.
+    const hits: Array<{ item: string; site: string }> = [];
     for (const { rel, abs } of files) {
-      if (ALLOWED.has(rel)) continue;
-      const src = fs.readFileSync(abs, 'utf8');
-      for (const { re, what } of INLINE_PATTERNS) {
-        // Ignore matches inside comment lines — the rule gets DESCRIBED in prose, and a guard
-        // that flags its own documentation trains people to ignore it.
-        const hit = src
-          .split('\n')
-          .some((line) => !/^\s*(\/\/|\*|\/\*)/.test(line) && re.test(line));
-        if (hit) offenders.push(`${rel} — ${what}`);
-      }
+      const code = readScannedSource(abs).code;
+      code.split('\n').forEach((line, i) => {
+        for (const { re, what } of INLINE_PATTERNS) {
+          if (re.test(line)) hits.push({ item: rel, site: `${rel}:${i + 1} — ${what}` });
+        }
+      });
     }
-    expect(offenders, 'inline project-presence checks (use hasInternalGames() / hasAnyProject())')
-      .toEqual([]);
+    assertExemptionLedger({
+      label: 'INLINE_PATTERNS in projectPresencePredicate (rule 1)',
+      population: hits,
+      sanctioned: SANCTIONED,
+      // 5 measured 2026-09-12, ALL of them in the two sanctioned files — so a reasoned pardon here
+      // is zero, which is the point: nothing outside the implementation and this file's own prose
+      // asks the question inline. Floored under 5 so the sanctioned rows' staleness is what reports
+      // a removal, rather than this.
+      floor: 4,
+      fix: 'inline project-presence checks: use hasInternalGames() / hasAnyProject() from '
+        + 'engine/tests/helpers/repoLayout.ts.',
+    });
   });
 });
 
@@ -117,17 +152,29 @@ describe('e2e specs never discover projects themselves (#326 follow-up)', () => 
   const E2E_DIR = path.join(REPO_ROOT, 'engine', 'tests', 'e2e');
 
   it('no spec under engine/tests/e2e calls discoverProjects — pickHostProject() does', () => {
-    const offenders: string[] = [];
+    const calls: Array<{ item: string; site: string }> = [];
     let scanned = 0;
     for (const { rel, abs } of walkTests(E2E_DIR, 15)) {
-      if (ALLOWED.has(rel)) continue;
       scanned++;
-      if (/\bdiscoverProjects\s*\(/.test(fs.readFileSync(abs, 'utf8'))) {
-        offenders.push(rel);
-      }
+      readScannedSource(abs).code.split('\n').forEach((line, i) => {
+        for (let n = (line.match(/\bdiscoverProjects\s*\(/g) ?? []).length; n > 0; n -= 1) {
+          calls.push({ item: rel, site: `${rel}:${i + 1}` });
+        }
+      });
     }
-    expect(offenders).toEqual([]);
-    // Non-vacuous: if the walk ever stops finding e2e files, the check above passes for free.
+    // Non-vacuous: if the walk ever stops finding e2e files, the check below passes for free.
     expect(scanned).toBeGreaterThan(5);
+    assertExemptionLedger({
+      label: 'E2E_EXEMPT in projectPresencePredicate (rule 2)',
+      population: calls,
+      exempt: E2E_EXEMPT,
+      // 1 measured 2026-09-12, which is also the pardon; `scanned > 5` above is the detector-broke
+      // check, so this floor only stops the ledger meeting an empty scan.
+      // ⚠️ `floor` is checked BEFORE `over-blessed`, so migrating this one call reports "the detector
+      // has stopped matching" rather than "blesses 1, found 0". Read it as success; delete the row.
+      floor: 1,
+      fix: 'a spec must not discover projects itself — a module-scope throw kills COLLECTION for '
+        + 'the entire run, not just that spec. Call pickHostProject() and test.skip() on null.',
+    });
   });
 });

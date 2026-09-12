@@ -122,3 +122,12 @@ export function assertDeclaredListIsComplete(check: DeclaredListCheck): void {
     + 'that matches nothing is a scope claim with no subject.',
   ).toEqual([]);
 }
+
+/** ⚠️ **The multiplicity sibling of this helper is NOT here** — `assertExemptionLedger` lives at
+ *  `engine/packages/modoki/tests/helpers/exemptionLedger.ts`, exported as
+ *  `@modoki/engine/testing/exemptionLedger` (#1123). It answers "how many occurrences does one
+ *  exemption row pardon?", where this file answers "does the hand-list cover the population?".
+ *
+ *  It is in the package because its callers include this package's own guards AND a project's own
+ *  `tests/**`, and a published demo carries no `engine/tests/`. Import it by that specifier from
+ *  here too — not by a relative path, which would only resolve inside the monorepo. */

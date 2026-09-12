@@ -339,7 +339,9 @@ one.
 
 - **Same-file only.** A probe inside an imported helper is invisible — `e2e/hostProject.ts`'s
   `pickHostProject()` (`discoverProjects(process.cwd())`, gating six specs) is the live example,
-  sanctioned by `projectPresencePredicate.test.ts`.
+  carried as `projectPresencePredicate.test.ts`'s one `E2E_EXEMPT` row. ⚠️ Not its `SANCTIONED` list —
+  that is a separate, adjacent list in the same file for structural exclusions, and since #1123 the
+  two words mean different things there.
 - **One call hop.** `const x = helper()` counts when `helper` itself probes, not when it calls
   something that does. Following calls to a fixpoint turned every variable holding a log's TEXT in
   `fileLogWarnings.test.ts` into a "probe": the further a value is from its `existsSync`, the more
@@ -984,9 +986,8 @@ a long history (`git rev-list HEAD` being large, a previous tag existing) does n
 ⚠️ **A file-level exemption is fail-open, and this guard shipped that way for one commit.**
 Exempting `repoCorpus.mjs` for its one `rev-parse` also pardoned its two `ls-files` reads, so
 deleting `maxBuffer` from the corpus producer left the guard GREEN — a guard for fail-open guards,
-failing open, found only because the mutation check was run. Hence the count. The general lesson is
-in [falsifiable-tests.md](falsifiable-tests.md): an allowlist keyed coarser than the thing it
-pardons widens silently.
+failing open, found only because the mutation check was run. Hence the count. That instance turned out
+to be one of **16** (#1123) — the general rule is "Exemption GRAIN" below.
 
 ### Source-scanning guards, and the ONE comment scanner they share
 
@@ -1139,11 +1140,93 @@ outside it.
 | **Derive** — delete the list | the subject is enumerable by a marker, or the type checker can enumerate it | `NumberField.dataUiId` made REQUIRED, so `tsc` names every call site (#772) |
 | **Widen + migrate** | the scope is a directory bound, so there is no list to assert | `corpusProducerIsShared`'s `under` → the repo (#814) |
 | **Assert completeness** | the list must stay, so make its gap RED | `assertDeclaredListIsComplete` (#830) |
+| **Fix the GRAIN** | the list is complete, but a ROW pardons more than its reason argues for | `assertExemptionLedger` (#1123) — see below |
 
 `engine/tests/helpers/declaredList.ts` is the shared helper for the third: *enumerate the population
 by its marker, assert the hand-list equals it*, with a reasoned exemption ledger whose every row
 must CURRENTLY be flagged. `testFilesAreCollected.test.ts` is the older, hand-written instance of
 the same idea and is worth reading as the reference.
+
+### Exemption GRAIN — a row must pardon the OCCURRENCE, not the file it lives in
+
+The table above is about the LIST versus the POPULATION. This is the question one level in, and it is
+a different defect: **once a row exists, how many things does it pardon?**
+
+**The rule: key a row at the same grain the rule is evaluated at.** A guard that bans a per-OCCURRENCE
+pattern — a line, a call, a literal — and keys its pardon by the FILE has granted a pardon whose scope
+is not the occurrence its `reason` argues for; it is every occurrence that file will ever contain. The
+guard is then blind exactly where somebody already had a reason to look, and no green run can show it.
+
+Measured 2026-09-12 (#1123): **16 guards, 9 of them already holding an exempt file with more
+occurrences than its reason covers.** `determinismGuard` — the guard `CLAUDE.md` § Time cites as what
+keeps game state deterministic — had three file-keyed allowlists and **no staleness re-check at all**.
+`importSettingSelectsSpliced` was worse than file-keyed: its rows were bare expression text with no
+file, so one `'options'` row pardoned two different components and would have pardoned the next
+`options`-named select anywhere in the tree.
+
+**`assertExemptionLedger` (`@modoki/engine/testing/exemptionLedger`) is the shared helper.** It is in
+the PACKAGE rather than beside `declaredList.ts`, because the guards that need it span
+`engine/tests/**`, the package's own `tests/**` and a project's own `tests/**` — and a game copied out
+of the monorepo, or a demo published by snapshot, cannot reach `engine/tests/…` at all. What it
+enforces:
+
+- **Rows are SPENT, not matched.** `population` is one entry per occurrence; each `exempt` row spends
+  `count` (default 1) of them, and the next occurrence is an offender. Matching with `.some()` instead
+  is the trap `qaCaseReferences`'s otherwise-correct `{file, token}` rows still carry.
+- **A row that blesses more than exists is an error too** (`"blesses N, found M"`), so a fix must
+  deduct from its row in the same commit. The `>= 1 occurrence survives` form — which
+  `corpusProducerIsShared` and others carry — cannot see this: `>= 1` stays true however many extra
+  occurrences appear.
+- **Measure per ITEM against the SUMMED budget.** Two rows for one item that jointly over-bless are
+  the same fail-open one level down; the helper shipped that way for one commit and review caught it.
+- **`count` must be positive and `floor` at least 1.** `count: 0` writes a pardon that can never be
+  stale; `floor: 0` gives back the vacuity the field is required for.
+- **`sanctioned` is for STRUCTURAL exclusions only** — the one legitimate implementer, or a guard that
+  must quote its own subject to explain itself. Reason-free, because nobody should re-review it, but
+  still staleness-checked. Keeping those out of the reviewed list is what stops 164 self-citations
+  diluting the three rows a reader is meant to read (`docCitations`), and `clientJsonWriteSeam` made
+  this split by hand first.
+
+⚠️ **Compose `item` as `file::token` wherever the detector can tell two occurrences apart — a bare
+count still fails open WITHIN a file.** Measured in #1120: with `count: 1`, binding the `rev-parse`
+while unbinding one `ls-files` keeps the count at 1 and stays green. Naming the occurrence closes both
+directions.
+
+⚠️ **One ledger per BAN, never one ledger for two rules.** Three of the 16 served two independent bans
+from one row, so a reason written about one excused the other — `commentStripperIsShared`'s staleness
+check is `blockStripper || lineStripper`, so dropping one while keeping the other stays green, and
+`docCitations`' single list was read at three call sites where it pardoned nothing in two of them.
+
+⚠️ **The falsifying mutation is ADDING a second occurrence to an already-exempt file, not deleting the
+only one.** Deletion exercises the staleness arm; only addition exercises the grain.
+
+⚠️ **And there is a THIRD direction the first two miss: LOOSENING THE CLASSIFIER.** A guard that
+decides "offender or not" inside a window, a lookahead or a threshold can be disarmed by widening that
+constant alone — every offender reads as compliant, and a non-vacuity floor phrased as `>=` cannot see
+it, because the counts only go UP. Measured on `editorAssetJsonGuard`: a real offender reddens at
+`LOOKAHEAD = 400` and PASSES at 4000. Pin such a constant with synthetic fixtures that bracket it from
+outside — and ⚠️ **write the distances as literals, not as `THRESHOLD ± n`**, or the fixture scales
+with the constant and cannot fail (that is [falsifiable-tests.md](falsifiable-tests.md)'s Shape (E),
+and it happened in the very commit that added these fixtures). Keep the thing being CLASSIFIED inside
+the window and move only the classifier: a fixture that drops both out of view passes for the wrong
+reason. A migration
+mutation-checked by deletion alone ships this defect again under a green gate, which is how it got
+here. And **count on the source the DETECTOR sees**: every guard in this family strips comments first,
+and #1123 was filed with `grep` figures that were inflated by docblock mentions in 7 of its 16 rows —
+its title said an exempt file held 8 wall-clock reads where the detector sees 2.
+
+Progress: **eight guards are on the ledger** — `determinismGuard`, `docCitations` and
+`importSettingSelectsSpliced` (Phase 1), plus `assetJsonGuard`, `handleProviderOwner`,
+`abandonmentIsShared`, `keymapOwnership` and `projectPresencePredicate` (Phase 2). A ninth,
+`editorAssetJsonGuard`, has **no ledger at all**: its single row pardoned zero occurrences, so it was
+deleted and replaced with the non-vacuity floor the guard had always lacked — which is the right
+outcome when a pardon turns out to be inert, and worth knowing before you reach for a row.
+
+The rest is **#1128**: eight per-file-boolean detectors that must learn to count, the enforcement
+guard that makes the helper non-optional, and ~30 exemption ledgers nobody has examined. ⚠️ Do not
+quote a remaining count from a marker that greps for `ALLOW*`/`EXEMPT*` names: migrating a guard makes
+it DISAPPEAR from such a census (measured 43 → 42 → 40 across the two phases, by a rename, a deletion
+and a split), so the number falls for reasons unrelated to progress.
 
 ⚠️ **The marker is the judgement; the helper only makes the comparison honest.** A marker that is
 subtly too narrow re-creates the defect one level down with every test still green. Two ways that

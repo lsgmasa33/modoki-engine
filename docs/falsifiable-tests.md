@@ -572,6 +572,24 @@ neither side is.**
 which does nothing here, where both sides may be perfectly faithful and merely dependent. A shape
 whose remedy applies to half its instances is worse than two shapes.
 
+### Shape (F): the EXEMPTION is keyed coarser than the ban it pardons (#1123)
+
+A guard bans a per-occurrence pattern and pardons per FILE, so the row's scope is every occurrence
+that file will ever contain rather than the one its `reason` argues for. The guard then cannot fail on
+the thing it was written to catch, and no green run can show it — the mutation check is the only
+instrument that sees it, and **the mutation has to ADD a second occurrence to an exempt file**, not
+delete the only one. Deleting exercises the staleness arm instead, which is why this survived 16
+guards.
+
+Measured across 16 guards; 9 already had an exempt file holding more than its reason covered. The rule,
+the shared helper (`assertExemptionLedger`) and the four arms it enforces live in
+[verify-and-ci.md](verify-and-ci.md) § "Exemption GRAIN" — not restated here, because this page owns
+the FALSIFIABILITY framing and that one owns the guard conventions.
+
+⚠️ Related but distinct, and bending one fix across both serves neither: a guard with no non-vacuity
+FLOOR (#1105) has a fine population and greens on zero inputs, and a guard whose SCOPE is narrower
+than its claim (#830, #1124) never reaches the population at all.
+
 ## Gotchas
 
 ⚠️ **`onWorldSwap` is a re-export, and that is what makes this invisible.** It is defined in

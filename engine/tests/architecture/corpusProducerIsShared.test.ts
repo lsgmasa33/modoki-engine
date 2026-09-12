@@ -199,7 +199,9 @@ const EXEMPT: ReadonlyArray<{ file: string; rule: 'ls-files' | 'walker'; reason:
     reason: 'This file. Its own rule-1 docblock and `reason` strings necessarily discuss '
       + `"${LS_FILES_MARKER}" in prose that is NOT a comment (a JS string literal, unlike a `
       + 'comment, is not blanked by stripComments) — the same self-reference '
-      + 'docCitations.test.ts\'s own DOC_CITATION_EXEMPT entry explains for its rule.',
+      + 'docCitations.test.ts\'s own SELF_QUOTING list explains for its rule. (That list was '
+      + 'DOC_CITATION_EXEMPT until #1123 split it into a structural exclusion and a per-path '
+      + 'ledger; this pointer is to the structural half, which is the half that matches.)',
   },
   {
     file: 'engine/scripts/typecheck-projects.mjs', rule: 'ls-files',

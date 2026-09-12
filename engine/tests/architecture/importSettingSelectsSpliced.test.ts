@@ -13,9 +13,21 @@
  *  about the call sites, and the call sites are where every instance of this bug has been.
  *
  *  The rule: an option-producing `.map()` in `assetViews/**` either wraps its list in
- *  `withCurrentValue(...)`, or its mapped expression appears in EXEMPT below with a reason.
- *  Exemptions are keyed by expression text rather than file:line so they survive an edit
- *  above them, and a genuinely new control cannot inherit one by accident.
+ *  `withCurrentValue(...)`, or the pair `<file>::<mapped expression>` appears in EXEMPT below with a
+ *  reason, and pardons exactly one site.
+ *
+ *  ⚠️ **Exemptions were keyed by expression text with NO FILE, and this header claimed that meant
+ *  "a genuinely new control cannot inherit one by accident". That was false for a GENERIC name
+ *  (#1123).** `'options'` is what a caller-supplied list is called in every generic control, so that
+ *  one row pardoned `MaterialAssetView.tsx:206` AND `widgets.tsx:223` — two different components —
+ *  and would have pardoned the next `options`-named select anywhere under `assetViews/**`, in any
+ *  file, forever. The claim held only for distinctive names like `VIDEO_PRESETS`, which is why it
+ *  read as true.
+ *
+ *  Keying `file::expr` keeps what the old key was RIGHT about — a row survives an edit above it,
+ *  unlike `file:line` — while costing the two `options` sites one reason each, which is the sentence
+ *  a file-less key never made anybody write. Spending rows one at a time (`assertExemptionLedger`)
+ *  is what makes a copy-pasted second identical select in the SAME file an offender too.
  *
  *  Scope, stated so this is not mistaken for more than it is: the exemptions are all
  *  STRING-valued or dynamically-built lists. A string select can technically hit the same
@@ -25,24 +37,45 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 
 const viewsDir = path.resolve(__dirname, '../../packages/modoki/src/editor/panels/assetViews');
 
-/** Mapped expressions that legitimately need no splice, each with why. */
-const EXEMPT = new Map<string, string>([
-  ['(Object.keys(LOAD_TYPE_LABELS) as AudioLoadType[])', 'string union, keyed off its own label map'],
-  ['AUDIO_FORMATS', 'string union (mp3/aac/opus/wav/flac)'],
-  ['FIELD_TYPE_OPTIONS', 'string-valued {value,label} list'],
-  ['TEXTURE_TYPE_OPTIONS', 'string-valued {value,label} list'],
-  ['FORMAT_OPTIONS_BY_TYPE[type]', 'string-valued {value,label} list, keyed by texture type'],
-  ['VIDEO_PRESETS', 'string union (x264 preset names)'],
-  ['(Object.keys(DELIVERY_LABELS) as VideoDelivery[])', 'string union'],
-  ['(Object.keys(POLICY_LABELS) as VideoDeliveryPolicy[])', 'string union'],
-  ['(Object.keys(RESIZE_LABELS) as VideoResizeMode[])', 'string union'],
-  ['(Object.keys(AUDIO_LABELS) as VideoAudioMode[])', 'string union'],
-  ['postprocessorIds', 'built at runtime from the registry — not a preset list'],
-  ['options', 'generic DropdownField / MaterialAssetView — list supplied by the caller'],
-]);
+/** Sites that legitimately need no splice, each `<file>::<mapped expression>` with why. All
+ *  13 measured 2026-09-12 on work-ai2 via the detector below; every row is one site.
+ *
+ *  Scope, stated so this is not mistaken for more than it is: every row is a STRING-valued or
+ *  dynamically-built list. A string select can technically hit the same behaviour, but a
+ *  hand-authored string is rejected upstream by the converters' union types, and no instance has
+ *  ever been measured — where every measured instance has been numeric. */
+const EXEMPT = [
+  { item: 'AudioAssetView.tsx::(Object.keys(LOAD_TYPE_LABELS) as AudioLoadType[])',
+    reason: 'string union, keyed off its own label map' },
+  { item: 'AudioAssetView.tsx::AUDIO_FORMATS', reason: 'string union (mp3/aac/opus/wav/flac)' },
+  { item: 'FontAssetView.tsx::FIELD_TYPE_OPTIONS', reason: 'string-valued {value,label} list' },
+  { item: 'TextureAssetView.tsx::TEXTURE_TYPE_OPTIONS', reason: 'string-valued {value,label} list' },
+  { item: 'TextureAssetView.tsx::FORMAT_OPTIONS_BY_TYPE[type]',
+    reason: 'string-valued {value,label} list, keyed by texture type' },
+  { item: 'VideoAssetView.tsx::VIDEO_PRESETS', reason: 'string union (x264 preset names)' },
+  { item: 'VideoAssetView.tsx::(Object.keys(DELIVERY_LABELS) as VideoDelivery[])',
+    reason: 'string union' },
+  { item: 'VideoAssetView.tsx::(Object.keys(POLICY_LABELS) as VideoDeliveryPolicy[])',
+    reason: 'string union' },
+  { item: 'VideoAssetView.tsx::(Object.keys(RESIZE_LABELS) as VideoResizeMode[])',
+    reason: 'string union' },
+  { item: 'VideoAssetView.tsx::(Object.keys(AUDIO_LABELS) as VideoAudioMode[])',
+    reason: 'string union' },
+  { item: 'ModelBatchView.tsx::postprocessorIds',
+    reason: 'built at runtime from the registry — not a preset list' },
+  // ⚠️ The two halves of what used to be ONE file-less `'options'` row. Same expression, different
+  // components, and each now has to argue for itself.
+  { item: 'MaterialAssetView.tsx::options',
+    reason: 'the shader-property enum dropdown: a {value,label} list the CALLER builds from the '
+      + 'shader schema, so the bound value is always one of them by construction' },
+  { item: 'widgets.tsx::options',
+    reason: 'generic DropdownField — a bare string list supplied by the caller. Nothing here knows '
+      + 'the value domain, so splicing would be the wrong layer to do it at' },
+] as const;
 
 interface Site { file: string; line: number; expr: string; spliced: boolean }
 
@@ -73,15 +106,22 @@ function optionSites(): Site[] {
 
 describe('asset-inspector preset selects are honest (#131)', () => {
   it('every option list is either spliced or a declared exemption', () => {
-    const offenders = optionSites()
-      .filter((s) => !s.spliced && !EXEMPT.has(s.expr))
-      .map((s) => `${s.file}:${s.line} — ${s.expr}`);
-    expect(
-      offenders,
-      'a numeric preset <select> that does not splice its bound value will silently display '
+    assertExemptionLedger({
+      label: 'EXEMPT in importSettingSelectsSpliced',
+      population: optionSites()
+        .filter((s) => !s.spliced)
+        .map((s) => ({ item: `${s.file}::${s.expr}`, site: `${s.file}:${s.line} — ${s.expr}` })),
+      exempt: EXEMPT,
+      // ⚠️ A low secondary floor on purpose: the REAL detector-broke check is the next test, which
+      // floors total sites at 25 and spliced ones at 14. Sized under the 13 measured so that
+      // SPLICING one of these reaches the over-blessed arm ("blesses 1, found 0") — which is the
+      // message that tells the author to delete the row — instead of being reported here as a
+      // matcher that stopped matching.
+      floor: 6,
+      fix: 'a numeric preset <select> that does not splice its bound value will silently display '
         + 'its FIRST option when a .meta.json holds an off-list number. Wrap the list in '
-        + 'withCurrentValue(list, boundValue), or add the expression to EXEMPT with a reason.',
-    ).toEqual([]);
+        + 'withCurrentValue(list, boundValue).',
+    });
   });
 
   it('finds the call sites at all — a regex that matches nothing would pass vacuously', () => {
@@ -97,9 +137,8 @@ describe('asset-inspector preset selects are honest (#131)', () => {
     expect(sites.filter((s) => !s.spliced && s.expr === '<unparsed>')).toEqual([]);
   });
 
-  it('carries no exemption that no longer matches a call site', () => {
-    const live = new Set(optionSites().map((s) => s.expr));
-    const stale = [...EXEMPT.keys()].filter((e) => !live.has(e));
-    expect(stale, 'a stale exemption silently pre-approves a future control').toEqual([]);
-  });
+  // The stale-exemption test that used to sit here is gone: `assertExemptionLedger`'s over-blessed
+  // arm is strictly stronger. The old one asked whether each expression still matched SOMEWHERE in
+  // the tree, so splicing `MaterialAssetView.tsx`'s `options` left the row green on `widgets.tsx`'s
+  // — a stale pardon, reported by nothing. The ledger asks per site.
 });

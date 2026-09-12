@@ -25,7 +25,8 @@
     "./testing/tapTargetFloor": "./tests/helpers/tapTargetFloor.ts",
     "./testing/authoredTextBudget": "./tests/helpers/authoredTextBudget.ts",
     "./testing/fontMetrics": "./tests/helpers/fontMetrics.ts",
-    "./testing/prefabInstances": "./tests/helpers/prefabInstances.ts"
+    "./testing/prefabInstances": "./tests/helpers/prefabInstances.ts",
+    "./testing/exemptionLedger": "./tests/helpers/exemptionLedger.ts"
   },
   "scripts": {
     "test": "vitest run",

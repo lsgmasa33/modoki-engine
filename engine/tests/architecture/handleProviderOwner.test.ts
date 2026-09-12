@@ -24,28 +24,62 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 
 const SRC_ROOTS = [
   join(__dirname, '../../packages/modoki/src'),
   join(__dirname, '../../app'),
 ];
 
-/** Providers that deliberately stay unchecked, each with the reason it would LIE if wired.
- *  Keyed by the file's repo-relative suffix. */
-const EXEMPT: Record<string, string> = {
-  'editor/panels/UIResizeOverlay.tsx':
-    'the 8 resize handles sit ON the entity element but are DRIVEN by sibling overlay divs '
-    + 'drawn on top of it; owning the entity element would report every handle as occluded by '
-    + 'its own grab affordance. Wiring it needs the overlay divs themselves, which the provider '
-    + 'does not hold.',
-};
+/** Handle literals that deliberately stay unchecked, each with the reason it would LIE if wired.
+ *
+ *  ⚠️ **Keyed `<file>::<kind>` and pardoning ONE literal each (#1123).** This was a
+ *  `Record<fileSuffix, reason>`, and the enforcement was INVERTED: an exempt file had to have every
+ *  literal LACK `owner:`. That is exact against a stale exemption — wiring the handle turns it red
+ *  immediately, better than most guards manage — but it is **perverse under a PARTIAL fix**. A file
+ *  with two literals that wires one goes RED, so the cheapest way to stay green is to wire neither;
+ *  and a SECOND, unrelated unowned literal added to that file passed silently, which is the grain
+ *  defect. Measured 2026-09-12 on work-ai2: 21 literals, exactly one without `owner:`.
+ *
+ *  The ledger gets both directions without the perversity: wiring the exempt literal makes its row
+ *  over-blessed ("blesses 1, found 0"), and a new unowned literal anywhere — including in this same
+ *  file — is unexcused. */
+const EXEMPT = [
+  {
+    item: "engine/packages/modoki/src/editor/panels/UIResizeOverlay.tsx::'resize-handle'",
+    reason: 'the 8 resize handles sit ON the entity element but are DRIVEN by sibling overlay divs '
+      + 'drawn on top of it; owning the entity element would report every handle as occluded by '
+      + 'its own grab affordance. Wiring it needs the overlay divs themselves, which the provider '
+      + 'does not hold. (One LITERAL, inside a HANDLES.map() that yields the 8 runtime handles.)',
+  },
+] as const;
+
+/** The `kind:` string a literal declares — what distinguishes two literals in one file. */
+function kindOf(lit: string): string {
+  // ⚠️ `?? [, 'x']` is a SPARSE array and `no-sparse-arrays` is an eslint ERROR here, not a warning —
+  // green under vitest and red only in the lint leg. `<unparsed>` matches no row, so an unreadable
+  // literal fails loudly as unexcused rather than slipping through; `handleLiterals` already requires
+  // a string `kind`, so it should be unreachable.
+  return /\bkind: ('[^']*')/.exec(lit)?.[1] ?? '<unparsed>';
+}
 
 /** Every `.ts`/`.tsx` under `SRC_ROOTS`, via the shared corpus producer (#799/#771/#805 Phase 4).
  *  Floored well under the 855 measured today. */
-function sourceFiles(): string[] {
+/** ⚠️ Returns `repoFiles()`'s own `rel` alongside `abs`, and the ledger keys on `rel`.
+ *
+ *  The first cut derived a key by stripping whichever `SRC_ROOTS` prefix matched an ABSOLUTE path.
+ *  Two problems, both flagged by review. (1) It swapped a repo-relative SUFFIX match for an
+ *  absolute-root PREFIX match, which is newly sensitive to things the suffix was immune to: `abs`'s
+ *  root comes from `git rev-parse --show-toplevel` while the root came from `__dirname`, and a
+ *  drive-letter case difference or an 8.3 form on the `win` clone breaks a prefix and not a suffix —
+ *  the 2026-08-18 Windows incident shape. (2) The two `SRC_ROOTS` can yield the SAME root-relative
+ *  key (`debug/x.tsx` from both `engine/app/debug/` and `packages/modoki/src/debug/`), so one row
+ *  would pardon both files and a failure could not say which it meant. `rel` is already POSIX and
+ *  repo-unique, and it is what `keymapOwnership` and `abandonmentIsShared` key on. */
+function sourceFiles(): Array<{ rel: string; abs: string }> {
   return repoFiles({
     under: SRC_ROOTS, match: /\.tsx?$/, exclude: ['node_modules', 'dist'], floor: 600,
-  }).map(({ abs }) => abs);
+  });
 }
 
 /** Every object literal that builds an InteractionHandle, found by anchoring on the `kind:`
@@ -85,12 +119,12 @@ function handleLiterals(src: string): string[] {
 describe('interaction-handle providers name their owning element', () => {
   const files = sourceFiles()
     // The registry declares the field; the dump reads it. Neither builds a handle.
-    .filter((f) => !/interactionHandles\.ts$|handlesDump\.ts$/.test(f))
-    .map((f) => ({ file: f, src: readFileSync(f, 'utf8') }))
+    .filter(({ rel }) => !/interactionHandles\.ts$|handlesDump\.ts$/.test(rel))
+    .map(({ rel, abs }) => ({ rel, src: readFileSync(abs, 'utf8') }))
     // Only a file that names the type builds one — cheap prefilter, and it keeps the
     // brace-walk away from unrelated panels entirely.
     .filter(({ src }) => src.includes('InteractionHandle'))
-    .map(({ file, src }) => ({ file, literals: handleLiterals(src) }))
+    .map(({ rel, src }) => ({ rel, literals: handleLiterals(src) }))
     .filter(({ literals }) => literals.length > 0);
 
   it('finds the handle literals at all (a refactor must not make this vacuous)', () => {
@@ -98,16 +132,23 @@ describe('interaction-handle providers name their owning element', () => {
     expect(files.reduce((n, f) => n + f.literals.length, 0)).toBeGreaterThanOrEqual(15);
   });
 
-  it.each(files.map(({ file }) => file))('%s', (file) => {
-    const { literals } = files.find((f) => f.file === file)!;
-    // `join` yields backslashes on Windows while EXEMPT is keyed with `/` — compare on a
-    // normalized path, or every exemption silently stops applying there (CI, 2026-08-18).
-    const posix = file.replace(/\\/g, '/');
-    const exemptKey = Object.keys(EXEMPT).find((k) => posix.endsWith(k));
-    for (const lit of literals) {
-      // An exemption that has since been wired is stale — delete the EXEMPT entry.
-      if (exemptKey) expect(lit).not.toContain('owner:');
-      else expect(lit).toContain('owner:');
-    }
+  it('every handle literal names its owning element', () => {
+    // ⚠️ Rows key on `repoFiles()`'s `rel` — already POSIX, already repo-unique. The old per-file
+    // compare had to normalise separators by hand because it built its own path; see `sourceFiles()`
+    // for why deriving one is the wrong move here (CI, 2026-08-18).
+    assertExemptionLedger({
+      label: 'EXEMPT in handleProviderOwner',
+      population: files.flatMap(({ rel, literals }) => literals
+        .filter((lit) => !lit.includes('owner:'))
+        .map((lit) => ({ item: `${rel}::${kindOf(lit)}`, site: `${rel} — kind ${kindOf(lit)}` }))),
+      exempt: EXEMPT,
+      // 1 measured 2026-09-12, which is also the pardon — so wiring it trips this floor rather than
+      // the over-blessed arm. Read it that way. The detector-broke check is the sibling test above,
+      // which floors total literals at 15 and providing files at 9.
+      floor: 1,
+      fix: 'a provider that omits `owner` gets occlusionChecked:false, so its handles are never '
+        + 'hit-tested and a covered handle reports as clickable — which cost a wrong bug report '
+        + '(QA-SVIEW-0003). Pass the DOM element the handles live in as `owner`.',
+    });
   });
 });
