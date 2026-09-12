@@ -971,6 +971,16 @@ The one number here with neither a measurement nor a carry-forward is the **1024
 ceiling**: 512 is measured unusable and 2048 is what projects author, so it is the step between.
 Worst case it renders coarser shadows than intended, which costs quality and not the frame.
 
+⚠️ **On any device measurement, read the RESOLVED tier before believing a null result.** Tiers
+resolve per DEVICE, so a low-end device (exactly where you go to reproduce a low-end bug) can
+switch off the very feature under test. Reproducing #956 (the r185 iOS black screen) on the iPhone
+8 with `demos/postfx-demo`, the app "rendered fine" on the suspect version — but `qualityTier` was
+unset → `auto` → resolved `mid` (`[qualityTier] mid via model — iPhone10,1` in the device console),
+and that project's authored `mid` sets `npr:false, ao:false, dof:false`. GTAO, NPR and DOF, the
+pipelines whose compile failures were captured on the failing device, never compiled. Check what
+the resolved tier disables, and pin `qualityTier` in the project config so the feature actually
+runs.
+
 #### A frame time measured on a big.LITTLE phone is a LITTLE-core number — and that is the shipping budget
 
 Every CPU figure above from the Galaxy A23 was produced with the **big cores idle**. Sampling the
@@ -2890,6 +2900,28 @@ Each cost a session or more.
   Game panel only) or move the camera; for the true framebuffer use CDP `Page.captureScreenshot`.
   The corollary: if a device surface ever goes on-demand, the same trap arrives with it.
 - **Tooling**: Android over `adb`; iOS 15/16 via `libimobiledevice`, iOS 17+ via `xcrun devicectl`.
+- **Measuring a 1–2 frame flash in a WEB build** (the browser twin of the `adb screenrecord` +
+  `ffmpeg signalstats` method in [particles.md](./particles.md)):
+  1. Launch a Chrome with its OWN `--user-data-dir` and a `--remote-debugging-port`. The fresh
+     profile is what makes "first load" reproducible — the GPU shader cache and HTTP cache both
+     live in the profile — and it leaves the owner's normal Chrome untouched.
+  2. Drive it with a plain Node CDP client (`WebSocket` is global in Node 22+):
+     `Target.createTarget` → `Target.attachToTarget {flatten:true}` →
+     `Page.addScriptToEvaluateOnNewDocument` (in-page probe) → `Page.startScreencast
+     {format:'jpeg'}`, saving and acking each `Page.screencastFrame`. Then
+     `ffmpeg -f image2 -i f%05d.jpg -vf signalstats,metadata=print:file=- -f null -` gives per-frame
+     `YAVG`.
+  3. **Amplify the race instead of chasing it.** A localhost fetch always wins, so serve through a
+     tiny handler that sleeps on `*.ktx2|png|webp` (800 ms made it present on every run, and absent
+     on every run after the fix). That before/after pair is the evidence, not a lucky capture.
+
+  ⚠️ **In-page readback of a three WebGPU canvas returns transparent black.** `drawImage`,
+  `createImageBitmap` and `getImageData` all see `a=0, rgb>0` (the renderer clears with alpha 0 and
+  additive blending never raises it), so every 2D-canvas path unpremultiplies by zero, while the
+  compositor shows the RGB. `toDataURL()` returns a large PNG, which looks like proof of content and
+  is not. Use the compositor's frames (screencast or `Page.captureScreenshot`). And put every
+  timestamp on ONE clock (`Date.now()` in the probe; CDP frame `metadata.timestamp` is epoch
+  seconds) — mixing in `performance.now()` cost an hour of "was this before or after the fetch".
 
 #### More reference measurements
 
@@ -3020,7 +3052,21 @@ geometries + 39 textures resident on it.
 one — the only way to kill the device is `device.destroy()`, and that reports
 `reason: 'destroyed'`, which the detection layer deliberately filters as orderly teardown. So a
 WebGPU device is best exercised by dispatching a synthetic `webglcontextlost` on the canvas, which
-drives the same rebuild path but is not a real loss.
+drives the same rebuild path but is not a real loss (the canvas listener is attached whatever the
+backend — `SceneView.tsx` and `Scene3D.tsx` pass `renderer.domElement` alongside the device).
+
+⚠️ **Do not try `device.destroy()` from `modoki_eval` as a "real" WebGPU loss** (#1052,
+2026-09-11). Destroying SceneView's device (reached via `GPUCanvasContext.getConfiguration()`)
+with `navigator.gpu.requestAdapter` patched to hang produced total silence and zero adapter calls:
+`makeViewportLossPolicy` filters `'destroyed'` in both `describe` and `onLost`, by design. Two
+remount levers tried in the same session also failed, each observed:
+`modoki_set_scene_view_mode` 3d↔ui does **not** remount SceneView's 3D viewport (the same canvas
+survived), but it **does** remount the Scene panel's `Canvas2DMount`s — which then failed Pixi init
+against the patched adapter, i.e. patching a global broke unrelated surfaces. Relaunch the editor
+after patching globals like `navigator.gpu`. When a few levers fail, stop escalating side effects
+in the live editor, report "attempted, could not trigger", and verify through the extracted
+module's fake-timer tests plus a wiring guard. (Why maximizing another tabset does not unmount a
+panel either: [editor.md](./editor.md), the tab-mounting section under #1015.)
 
 ⚠️ **Do not "simplify" the two detection paths into three's single `renderer.onDeviceLost(info)`
 hook without preserving the false-positive filters.** Unifying them is a real and worthwhile
@@ -4578,6 +4624,19 @@ Why it is a rule and not a preference: a divergent re-derivation WAS the coordin
 - **Primitive keyword** — `square` / `triangle` / `circle` (empty ⇒ circle) → a PixiJS `Graphics` tinted by `Renderable2D.color`, vertices from `computeShapeGeometry` (`render2DUtils.ts`).
 - **Image ref** (GUID / path / URL) → a PixiJS `Sprite`; textures load async through the GLOBAL `Assets` cache (KTX2 decoded for the 2D path — see [Materials & Textures](./textures.md)) and are preloaded before a scene swap so there's no pop-in. A sliced sprite / atlas frame gets a per-slot framed Texture WRAPPER (sub-rect of the shared source); a sprite-sheet frame swap that keeps the same base texture swaps the sub-rect IN PLACE (no texture-unload churn).
 - **`collider`** sentinel → draws the entity's OWN `Collider2D` shape as a filled (open polyline: stroked) body — for polygon/polyline/concave colliders that have no primitive form.
+
+⚠️ **An image sprite on an entity that is despawned and respawned every frame never renders.** Each
+respawn builds a new Pixi sprite, and an uncached texture's async load is always beaten by the next
+despawn — permanently blank, while the entity reads back with correct sprite/position/visibility.
+**The tell:** swap the sprite for `'square'`; primitives draw synchronously, so if the square
+appears it is this bug, not position/Z/parent/opacity. **The fix is a persistent entity that is
+MOVED each frame.** Adding the texture to the scene `resources` manifest is the tempting wrong fix:
+it starts the load earlier without making it win, so the art renders only when the HTTP cache is
+warm and reads as fixed once, then regresses (Court's tutorial hand, 2026-08-04, took two owner
+reports because the first fix was that one). Two traps from the same hunt: entity ids are
+**recycled**, so a stale root id can despawn an innocent bystander (passes alone, fails in suite);
+and `Time.delta` keeps the last step's value, so ticking a system in a test to "force a sync" also
+ages its animation by a frame.
 
 Shared placement knobs: `width`/`height` (half-extents), `pivotX`/`pivotY` (0 = edge, 0.5 = center), `keepAspect` (uniform sprite scale = `min(scaleX, scaleY)`), `flipX`/`flipY` (render-only mirror about the pivot — a sign flip on scale that never touches the transform, mirrors no children, and is invisible to the physics collider), `opacity` (alpha), and `isVisible` (per-renderer hide, ANDed with the entity's `isActive`).
 

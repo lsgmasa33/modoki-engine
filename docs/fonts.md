@@ -290,6 +290,14 @@ chunked to fit it.
 
 ## 6. Debugging text that looks wrong
 
+- **A codepoint missing from the bake is measured at a flat 0.5em** (`FALLBACK_ADVANCE_EM` in
+  `layoutText.ts`). The Arimo bake has no em dash (U+2014, ~1.0em in real faces) and no ellipsis
+  (U+2026), so text containing them is modelled too NARROW — optimistic, the one direction a width
+  budget must never err. #362: a Court refusal modelled at 276.9px against a 294.1px budget while
+  really needing ~286.9. When fitting text to a budget, REFUSE characters the bake lacks rather than
+  measuring them (Court's `unmeasurableChars` in `games/court/tests/hintPanelFitKit.ts`), and prefer
+  a separator the bake carries (a colon) in any string that has to fit.
+
 - **Measure the PROVIDER, not the served bytes.** `getLoadedFont(guid).metrics` +
   `.getGlyph(cp).advance` is the ground truth for *which typeface actually got rasterized*.
   Vertical metrics are the cheapest fingerprint separating two faces, and they do not move

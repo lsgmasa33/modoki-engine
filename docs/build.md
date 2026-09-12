@@ -406,6 +406,19 @@ much it reads like one: `generate-icons.mjs` COPIES the resolved source there be
 Editing that file changes nothing and is overwritten on the next run — put the master somewhere
 tracked (`games/court/art/icon-app-master.png` is the worked example) and point `iconSource` at it.
 
+**The demo icon family is the house style** (owner-approved 2026-09-10, after seeing the icons
+extracted from the APKs on an S22). The six `demos/<id>` icons are **flat two-colour line art,
+cream (~`#f2ded0`) on dark navy, one motif per demo** (pendulum, stacked cubes, particle burst,
+camera aperture, play button), with masters at `demos/<id>/art/icon-app-master.png` wired through
+`iconSource`. They were generated with 3D AI Studio at **1K**, which is exactly `@capacitor/assets`'
+source size; a 2K request returns `400 INVALID_ARGUMENT`. Two consequences:
+- **The other projects still ship the bundled default.** The owner scoped the icon work to "6
+  demos only", so authoring icons for the rest is a fresh decision, not an implied one. If it is
+  made, match this style rather than inventing a new direction.
+- **A generated icon is not CC0.** Each demo's `ATTRIBUTION.md` had to narrow "every asset is
+  CC0" to "every THIRD-PARTY asset" — see [art-tools-3daistudio.md](./art-tools-3daistudio.md)
+  for the license terms.
+
 **Keep the committed value project-relative** (#394). `project.config.json` is tracked, so
 `/Users/<name>/Projects/modoki/games/court/art/…` is dead on every other clone, dead on `win`, and
 dead in a copied-out `games/<id>` (#29) — besides being a home path in a file `demos/`' publish
@@ -2012,6 +2025,10 @@ the SAME command run for an iOS/Android pre-`cap sync` build must say `--target 
 (base `"/"`, since Capacitor serves the dist from the app root). There is no default in either
 direction: defaulting would be silently wrong for one of the two callers.
 
+⚠️ **A web build must be SERVED over HTTP.** Opening `games/<id>/dist/index.html` as `file://`
+fails with module, CORS and asset-fetch errors that look exactly like build bugs, and that
+misreading has cost time. Serve the `dist/` folder (any static server) before diagnosing anything.
+
 #### `--target native` runs the same in-process heals as the editor (#148, #150), then verifies (#685)
 
 Before its shell steps, `build-web.mjs` runs the SAME three in-process heals as the editor's
@@ -2177,6 +2194,26 @@ nothing and is not the way to reproduce this. The bookkeeping then says tarball 
 Measured: that heals. It is also exactly what `vendorEnginePlugins` does after an in-place re-pack
 (`invalidateLockfileEntry`, then the plain `npm install` both native build paths already run), which
 is why that path genuinely re-resolves.
+
+⚠️ **This is not specific to plugin tarballs — any dependency bump can land in the same state.**
+Measured 2026-09-05 (npm 11.12.1 / node v26) on a transitive security bump: after `npm install`
+exited 0 with "found 0 vulnerabilities", `fast-uri` was 3.1.5 on disk where the lockfile said
+3.1.7, and `@xmldom/xmldom` 0.8.13 where it said 0.8.15. `--ignore-scripts` behaves like PLO. What
+makes it dangerous is that **no npm command reports the truth**:
+- `npm audit` reads `package-lock.json`, not the disk, so it calls a stale tree clean.
+- `npm ls` reads the hidden `node_modules/.package-lock.json` and tells the same lie — measured
+  `qs@6.16.0` from `npm ls` while `node_modules/qs/package.json` said 6.15.2.
+- `npm install --dry-run` says "up to date", and a real `npm install` agrees and does nothing.
+
+**Detect by reading the package's own file**, the one source that cannot lie:
+`node -e 'console.log(require("./node_modules/<pkg>/package.json").version)'`, compared against
+the lockfile's `version`. **Fix** by forcing re-extraction: `rm -rf node_modules/<pkg>` (and any
+nested `node_modules/<parent>/node_modules/<pkg>` copy), then `npm install`, which reports "added N
+packages". `npm ci` also works but rebuilds the whole tree. ⚠️ **The state is per npm ROOT**:
+repairing the repo root fixes only the root, and every `games/*`, `demos/*`, `engine/tools/*` and
+`site/` keeps its own stale tree, so a sweep that bumps N lockfiles must check N trees. This is the
+general form of #215 ("present-but-STALE makes 'already installed' true and wrong") — a green
+install is not evidence the tree changed.
 
 ⚠️ **Do not confuse step 3 above with the SUPERSEDED recipe** — the one this doc and the guards
 printed until 2026-09-05, whose step 2 was `npm install --package-lock-only`. That one also ended

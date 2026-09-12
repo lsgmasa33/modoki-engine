@@ -105,7 +105,6 @@ const RETRACTED_CLAIMS: ReadonlyArray<{
       { file: 'engine/packages/modoki/tests/runtime/offscreenCaptureSurface.test.ts', why: 'names the claim it exists to disprove' },
       { file: 'qa/cases/sceneview/render-on-demand-geometry-change.md', why: 'quotes the stale line and tells the runner not to believe it' },
       { file: 'docs/doc-conventions.md', why: 'names it as the worked example of a retracted fact, in the rule it broke' },
-      { file: '.agent-memory/renderer-module-edits-need-a-relaunch.md', why: 'records that this memory itself used to assert it (#1014)' },
     ],
   },
   {

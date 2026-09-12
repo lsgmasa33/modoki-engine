@@ -387,6 +387,12 @@ oversight.
   "first assignment wins". `applyChangesToDocument` warns (`[model-convert]
   Shared primitive carries divergent post-fixup state …`) rather than cloning
   the primitive + re-pointing the node.
+- **Reimporting a GLB does not register sub-meshes added since the first import** (observed in a
+  session; not re-traced in `reimport-model.ts`). The per-sub-mesh `.mesh.json` files are minted by
+  the initial `modoki_import_file`; `modoki_reimport_asset` refreshes what exists and reports
+  success, so a ref to the new sub-mesh resolves to no GUID and renders nothing — which reads as a
+  bad export. After adding a sub-mesh, confirm its `.mesh.json` appeared (`modoki_list_assets`);
+  if not, re-import the FILE rather than reimporting the asset.
 - **`transparent + alphaTest`** collapses to a single alpha mode — the
   adapter maps `transparent → BLEND`, else `alphaTest > 0 → MASK`, else
   `OPAQUE`, so a material that is both blended and masked loses the mask.

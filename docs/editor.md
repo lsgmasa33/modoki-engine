@@ -388,6 +388,17 @@ projects:
   measurement showing the hazard its first draft cited does not currently exist.
   ⚠️ Consequence worth knowing: prune used to double as a scrubber of unrecognised
   top-level junk in the committed file, and no longer does — a stray key now survives Apply.
+  ⚠️ **So a default-valued field is ABSENT from the file, and every raw-JSON reader must resolve
+  it.** A project that enables OTA and leaves the bundle name at `shell` gets an `ota` block with
+  no `bundleName` key — a valid config. A `.mjs` script cannot import `loadProjectConfig`, so it
+  must map absent → default itself and refuse only a present-but-wrong-typed value. Decide per
+  field by what the default MEANS: `bundleName`'s `'shell'` is a real value, while `publicKey`'s
+  `''` means "unset" and must still refuse. A default duplicated into `.mjs` is acceptable only
+  when a guard pins it to `DEFAULT_PROJECT_CONFIG` (`OTA_DEFAULT_BUNDLE_NAME`). And **build test
+  fixtures through `mergeProjectConfig`/`pruneProjectConfig`, never by hand** — #582 added an
+  absent-is-fatal check that passed review twice because every fixture hand-wrote the field, a
+  shape the writer never emits; it would have died in the spawned CLI after the build had run
+  (full incident: [ota-updates.md](./ota-updates.md) § "Gotchas").
 - **Reading COERCES a bad string-union value; writing ROUND-TRIPS it.** `mergeProjectConfig`
   falls an out-of-union value back to the default and warns, for EVERY string-union field in
   the config — not just `rendering.web.sizeMode` / the three/pixi `backend`s (#39) — so the

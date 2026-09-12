@@ -136,7 +136,7 @@ export function SceneViewGizmo() {
           style={{ cursor: 'pointer' }}
           onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); toggleEditorProjection(); setHover(null); }}
           // Custom hover label (below) — an SVG <title> tooltip does NOT render in the Electron
-          // editor (native-tooltip mechanism; see memory electron-native-title-tooltips-dead).
+          // editor (native-tooltip mechanism; see docs/editor.md, the `help` / `(i)` bullet).
           onPointerEnter={() => setHover(HUB_HOVER)}
           onPointerLeave={() => setHover(h => (h === HUB_HOVER ? null : h))}
         >

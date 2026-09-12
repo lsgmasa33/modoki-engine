@@ -609,6 +609,17 @@ variance is machine-readable while it lasts.
   leaves the renderer's particle cache stale, so a read-back returns the pre-write def as live truth
   and a read→modify→write round-trip silently reverts the file (S1) — the bug already fixed for
   `.anim.json`, unfixed for particles.
+- **Never expose a tool option no HUMAN path in the editor uses** (#288). A parameter on an
+  internal function is a seam for its callers; a parameter on an agent tool is a *published
+  capability*, and an agent has no UI affordance telling it which values are sane. Before exposing
+  one, grep every call site of the underlying function and ask, in order: *does a human path pass
+  this value?* and, if not, *what does it do that the human path deliberately avoids?* If the answer
+  is "the thing the surrounding machinery exists to prevent", leave it out — not behind a flag or a
+  confirm. Scar (2026-08-21): `modoki_exit_pose_envelope` shipped `restore:false`, mirroring
+  `endTimelinePreviewSession`; all eight `AnimationEditor`/`TimelineEditor` call sites pass
+  `restore:true`, and `false` only bakes a preview pose into the authored world — the damage the
+  envelope exists to prevent, which had cost the owner data two days earlier. The option has since
+  been removed. `create_registered_asset {kind:'scene'}` was refused for the same reason.
 
 ## 9. Cross-surface parity
 
@@ -716,6 +727,15 @@ site must apply `ctx.htmlFallthrough`/`ctx.noSuchRoute` itself.
   months with T1 and T2 green. The repo owner does not drive MCP tools — the surface exists for the
   agent — so "someone will notice" is not a safety net. Run it after any change to
   `engine/tools/**`, an `/api/*` route, or an agent op.
+  ⚠️ **A `SMOKE INCOMPLETE` exit 1 can be a precondition, not your change.** The smoke half skips
+  UC3 unless the editor's `surfaces` include `scene-view`, and a default launch comes up with
+  `['game-2d','game-3d']` — relaunching does not change that; T3 passes regardless. Mount the Scene
+  tab through `/api/eval` (measured 2026-09-09):
+  `[...document.querySelectorAll(".flexlayout__tab_button_content")].find(e => e.textContent === "Scene" && e.getBoundingClientRect().y > 0).closest(".flexlayout__tab_button").click(); return "clicked"`.
+  Filter on `y > 0` because FlexLayout renders a duplicate tab strip offscreen at y≈-9960; an
+  untrusted `.click()` is enough for React's `onClick`, whereas `/api/input/tap` at the tab's
+  coordinates reports `ok:true` and does not switch the tab. `/api/eval` needs an explicit
+  `return` — a bare expression answers `{}`.
 - **What T3 cannot reach is DECLARED, not implied.** A sweep must not damage the human's open project,
   so ~39 mutating tools (`build`, `press_key`, `menu`, `eval`, …) are listed in
   `src/liveCoverage.ts` with the reason each is un-sweepable, and a CI-safe guard asserts the split

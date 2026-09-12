@@ -131,6 +131,18 @@ every origin fetch means the edge absorbs repeat traffic for a given `cacheTtl` 
 Worker invocations should sit well under the cap — but exceeding it **errors rather than
 degrades**, so it's worth an occasional glance at Cloudflare analytics if traffic grows.
 
+## What the project actually pays for
+
+- **GitHub releases are free and never expire**, and the public `modoki-engine` repo is free
+  entirely, CI included — so hosting editor downloads there costs nothing.
+- **The load balancer above was the real GCP spend, not storage.** It was found only after the
+  survey widened from buckets / Cloud Run / Artifact Registry to the **networking line items**,
+  which are the ones with no obvious owner. Survey those first next time.
+- **What recurs is billed CI minutes on the private repo, not bytes.** Cost control is "don't
+  trigger billed runs" (see [verify-and-ci.md](./verify-and-ci.md)), not "clean up artifacts".
+- Don't quote monthly figures from an old note — earlier numbers were flagged in their own text as
+  an anomaly rather than steady state. Read the billing console.
+
 ## What is NOT affected
 
 **OTA.** `games/ota-test/project.config.json` pins

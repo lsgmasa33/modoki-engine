@@ -200,6 +200,12 @@ Field groups (representative fields, verified against `UIElement.ts`):
   ⚠️ `lineHeight` is still px-only — leave it `0` (auto) alongside a scaling `fontSize`. So are
   `textStrokeWidth`, `textShadowOffset{X,Y}`/`textShadowBlur`, `borderWidth` and `borderRadius`;
   each has the same shape and will drift under a scaling font, and none is wired yet.
+  ⚠️ **The habitual CSS `lineHeight: 1.4` means `1.4px`** (`UINode.tsx` emits `${lineHeight}px`),
+  and every wrapped line collapses onto the next with no error — it reads as a flex bug, and it is
+  easy to miss because neighbouring length fields have a `*Unit` companion and this one does not.
+  Measured porting wordweave's dictionary: a ~12-line definition reported 17.5 px tall and a
+  3-line attribution 4.19 px, both ≈ `lines × 1.4`. Diagnose with `get_layout_bounds` — compare
+  the text block's height with `lines × fontSize`.
 - **Style (box visuals)** — `backgroundColor` (packed hex int, `0` = transparent),
   `backgroundOpacity`, `borderRadius`, `borderWidth`, `borderColor`, `borderOpacity`
   (border color alpha, folded into the `borderColor` picker), `opacity`.

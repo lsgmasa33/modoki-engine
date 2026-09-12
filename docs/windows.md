@@ -1307,6 +1307,16 @@ the old `engine/packages/` path is a relocation, not a dropped SDK; only the loc
   one as a hang, and re-measure rather than trusting any number written down, this doc included.
   (This bullet said the opposite until 2026-08-20 — "Windows does not get the cap, and that is
   correct for a homogeneous CPU". It was wrong: see the measurement below.)
+- **The ~2.5–4.5x gap to the Mac is settled — do not re-propose these two levers** (owner chose
+  "leave it alone"). ① `engine/vite.config.ts` sets `environment: 'jsdom'` globally, so DOM-free
+  app-suite files pay ~1.5 s each: on 66 files (`tests/plugins` + `tests/assets`),
+  `--environment=node` took 22 s → 10 s and cumulative environment time 98.57 s → 19 ms with all 745
+  tests green (the engine package is already node, ~0.1 s/file). The jsdom split was NOT
+  implemented. ② `--pool=threads` measured 60 s → 41 s but breaks 2 tests in
+  `tests/plugins/toolchainResolve.test.ts` (they fail on that file alone, so it is module
+  isolation, not env leakage). Antivirus is ruled out — `fsutil devdrv query E:` shows a trusted
+  Dev Drive with no filters — so the residual gap is `CreateProcess` vs `fork()` and syscall-heavy
+  module resolution, not something configurable away.
 - **Do not run the two vitest suites concurrently by hand.** Under contention a file reads far
   slower, and the first casualties are the tests sitting closest to `testTimeout` — they fail as
   *timeouts*, not assertions, which is indistinguishable from a real regression until you re-run

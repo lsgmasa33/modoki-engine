@@ -97,6 +97,11 @@ const WRAPPER_NETWORK = /^Exception in thread "main" java\.net\.(?:UnknownHost|C
  *     from a real Gradle 8.14.3 run);
  *   - the resolve step's `MODOKI-UNRESOLVED` cause naming a network failure;
  *   - the wrapper's own `java.net` exception at column 0.
+ *
+ * OBSERVE the SKIP path rather than reasoning about it: a dead proxy in an empty
+ * `GRADLE_USER_HOME/gradle.properties` (`systemProp.https.proxyHost=127.0.0.1`, port 9) plus
+ * `MODOKI_GRADLE` pointed at the cached distribution binary reproduces "offline" without touching
+ * the machine's network.
  */
 export function networkFailureCause(output) {
   for (const line of String(output ?? '').split('\n')) {

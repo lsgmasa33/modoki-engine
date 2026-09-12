@@ -186,6 +186,18 @@ GUID now, with a separate `systemFont` field for a typeface no asset can express
 guarded by `tests/assets/assetRefIntegrity.test.ts`.
 See [textures.md](./textures.md) and [scene-loading.md](./scene-loading.md).
 
+⚠️ **Copying an asset WITH its `.meta.json` into another project can re-key a GUID — possibly the
+original's.** The dev scanner scans every project root, so the copy is a GUID collision, and
+`buildManifest`'s dev-time heal keeps the id on the path that sorts FIRST and mints a new one for
+the other (`demos/` sorts before `games/`, so the side that loses is not necessarily the copy).
+Any ref authored against the old id before the heal is dead after the next reload — a model logs
+`[RiggedCache] Unknown asset guid` and draws nothing while a sibling primitive still draws; an
+audio cue logs `[AudioCache] Unknown asset guid` and plays nothing while its `@cue` journal event
+still fires, so data-only verification looks fine. Seen for a model and an audio clip from one
+copy. After copying, re-read `modoki_list_assets` for BOTH projects, repoint every holder (trait
+field, scene `resources`, timeline cue), and verify with `modoki_diagnose` (`refs.issues: []`), a
+real `modoki_render_scene` and the console — not `get_scene_state` alone.
+
 ### World
 A **world** holds all entities and their traits. modoki uses **two-world
 isolation** for scene swaps: the next scene is built in a staging world, then

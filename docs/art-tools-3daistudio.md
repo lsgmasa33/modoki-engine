@@ -103,9 +103,9 @@ repo has actually produced through the service, so §2a's table stops being vend
   list — **`generate_p2`**, **`generate_material`**, **`material_from_image`**. Re-read the live
   surface rather than the table before planning a 3D or material job.
 - **Connection gotcha, cost a session's time:** the §2 recipe's `--scope local` writes to whichever
-  config dir is active. This machine runs `CLAUDE_CONFIG_DIR=~/.claude-b`, so an entry registered
-  under `~/.claude.json` or `~/.claude/.claude.json` is **invisible** to a session started with that
-  variable set — `claude mcp list` simply does not show the server. Re-add it with
+  Claude config root is active (set per launch by `CLAUDE_CONFIG_DIR`). An entry registered under
+  one Claude config root is **invisible** to a session started under another — `claude mcp list`
+  simply does not show the server. Re-add it with
   `claude mcp add --transport http --scope user 3daistudio https://mcp.3daistudio.com/mcp`, which
   lands in the ACTIVE dir, then authenticate with `/mcp`. The stored entry is only `{type, url}` —
   the OAuth credential is not in the file, so nothing sensitive moves between config dirs.
@@ -183,6 +183,15 @@ Costs 3 credits (GPT Image 2) to 14 (Nano Banana Pro).
 **Also:** Sketch to Image, AI Pose Transfer, Image to Prompt (recover a prompt from an image),
 and video (Veo 3, Kling, Seedance).
 
+**Video, in more detail** ([vendor docs](https://docs.3daistudio.com/image-studio/video), paid tiers
+only — the public pricing page omits it; the owner confirmed it exists on 2026-08-03). Engines
+include Veo 3 Fast/Standard, Kling (with O1 frame-transition and Motion Control) and Lucy 14B, at
+40–200 credits per clip, in text-to-video, image-to-video, frame-transition and motion-transfer
+modes. ⚠️ **Clips are only 3–5 seconds** — fine for a looping screen or sprite, too short for a
+cutscene, so a longer sequence means stitching with ffmpeg or rendering in-engine with
+`modoki_render_sequence`. The docs state no resolution, aspect ratio, codec or audio behaviour;
+read those off a real generation.
+
 Output: JPEG, PNG or WebP. Typical cost 2–6 credits per generation.
 
 ## 4. The 3D half
@@ -220,6 +229,21 @@ road in, and the engine already imports GLB with LOD.)
 Studio is the tier gated to "all creative and production tools" and faster generation. Note the
 free tier's **download restriction on at least Character Sheet** — preview-only — so free is for
 evaluating, not for producing committed assets.
+
+### Licensing — why a PAID tier is what makes the output publishable
+
+From the vendor's terms ([AGB](https://www.3daistudio.com/AGB)); note the vendor is **3daistudio.com**,
+not the separately owned, similarly named `3d-ai.studio`:
+- **Paid tiers** grant a "transferable, and sublicensable" license to "copy, reproduce, distribute,
+  publicly perform or publicly display" the output — so shipping it in a public repo or a
+  `demos/<id>` snapshot is permitted. No attribution is required.
+- **The free tier** is "personal, non-transferable, non-sublicensable" — redistribution is
+  prohibited, so free-tier output must never be committed.
+- **Output may not be used to train or improve any ML/AI model.** That is why generated assets are
+  **not CC0**: we cannot grant downstream recipients a right we do not hold. A demo shipping them
+  needs its own provenance wording in `ATTRIBUTION.md`, not a copy of the CC0 line.
+- Output "may incorporate or be based upon third-party content, libraries, or open-source
+  components" — worth a per-asset glance before committing one.
 
 ## 6. What we would actually use it for in Court
 

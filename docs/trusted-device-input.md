@@ -621,6 +621,15 @@ The honest check for any claim here is the one this whole feature is about: **di
 infer it?** Three separate defects in this work were invisible to a green suite and appeared only on
 a phone.
 
+**An independent trusted channel on Android: `adb shell input`.** `adb shell input tap <x> <y>` and
+`input swipe <x1> <y1> <x2> <y2> <ms>` inject at the OS level, so the WebView sees `isTrusted: true`
+without the MCP/CDP stack at all — use it to validate the `trusted-cdp` path itself, or for the ops
+that stay synthetic (`device_pointer`, `device_type_text`). Coordinates are DEVICE pixels
+(`adb shell wm size`), not the CSS pixels the aim tools use. Read the result as data
+(`device_get_scene_state` on a transform), and pair it with an unfixed control build on the same
+install path: verifying #299, the camera `ry` stayed at exactly -0.473008589 across two real swipes
+on the control and moved on the fix. Android only.
+
 ## Non-goals
 
 - iOS Simulator support (the device lease is built around a physical target).

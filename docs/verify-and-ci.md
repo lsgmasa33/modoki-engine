@@ -765,6 +765,15 @@ Paying for it locally on every push buys ordering, not coverage. So:
 - **Always run it before a release** — `verify:all` is still the mandatory gate in the
   `release-version` skill, and a release is exactly where "fix it forward" is not available.
 
+⚠️ **A `@playwright/test` bump silently disarms the local run until the browsers are reinstalled.**
+1.60.0 → 1.62.1 (#57) expected `chromium_headless_shell-1234` while the machine had `-1223`, and
+**all 47 e2e specs failed** with `browserType.launch: Executable doesn't exist at …` — which reads
+like the merge broke the editor, not like a missing binary. After any merge that moves
+`@playwright/test`, run `npx playwright install chromium` before believing a red local run. The
+Windows clone sets `PLAYWRIGHT_BROWSERS_PATH=E:\dev-cache\playwright`, so one install covers every
+clone on that box. Open follow-up (proposed on #57, not done): chain `playwright install` into the
+root `postinstall`, so "run `npm install` after a lockfile change" is actually sufficient.
+
 Deliberately accepted: a broken spec can now reach `main` and surface on `ci/main` minutes later,
 to be fixed forward. That is the trade — the suite is no longer a pre-push cost on four clones,
 and nothing rots unseen because the remote leg watches every `main` push.
