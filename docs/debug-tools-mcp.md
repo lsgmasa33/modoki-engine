@@ -518,6 +518,14 @@ logs it already has. The response says which read you got (`logcat dump, backwar
 forward for Ns`), because an empty result means *"nothing was logged"* in one case and *"nothing
 happened while I watched"* in the other, and those lead to opposite next moves.
 
+⚠️ **On the iOS forward path, `seconds` is a window of SYSLOG and starts when `ios syslog` is UP** —
+not when the route asked for it. Host fork/exec latency used to be billed against the caller's window,
+which is invisible on an idle Mac and load-dependent everywhere else: a 1 s capture could return an
+empty array because the window had elapsed before the child wrote a byte. That is the one failure this
+surface must never produce, because the table above turns an empty result into a diagnosis — it would
+have read as *"nothing happened while I watched"* when the truth was *"I never watched."* The timer is
+armed on the child's `spawn` event for that reason; `capturedFor` still reports the window asked for.
+
 **The `system` source exists for the three questions the app path cannot answer even in principle**
 — why it CRASHED (the process that would have replied is gone), what happened during LAUNCH before
 the bridge attached, and system-side kills (jetsam/OOM, watchdog, sandbox denials), which our
@@ -1833,7 +1841,31 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   `tryDeviceCdpInput`/`tryDeviceWdaInput` return before anything in `app/debug/bridge.ts` is
   reached: a guard in the page would have covered the synthetic path only, and missed `press-key`
   entirely (CDP dispatches it with no coordinate resolution at all). It fails OPEN on an unreadable
-  reply — an old bridge or a transport hiccup must not block input. Frame-fed READS
+  reply — an old bridge or a transport hiccup must not block input.
+
+  ⚠️ **Failing open is right; failing open SILENTLY was the defect (#1096).** Four of the probe's
+  five "no refusal" paths meant *could not check*, and the caller's truthiness branch could not tell
+  them from a healthy frame loop — so the guard against silent success succeeded silently itself,
+  which is #682's own failure mode reproduced inside #682's own guard. The polarity is unchanged (a
+  refused tap is a broken tool); what changed is that "could not check" is now SAYABLE, and rides
+  the reply on the channel `inputFidelityWarning` already uses. The editor-side twin
+  (`inputRoutes.ts`'s `inputDeliverability`, which gates all eight `/api/input/*` routes from one
+  chokepoint) had the identical hole and is fixed the same way.
+
+  Two rules that fell out of it, both worth copying to any guard that fails open:
+  - **The note goes only on a reply that reports SUCCESS.** Its claim is *"a success here is not
+    evidence the game received it"*; fronting an ERROR with it states the opposite of what happened.
+    Caught by #1077's lease-ended test, which the first cut of the fix prefixed with "it was
+    dispatched anyway" about a call that dispatched nothing.
+  - **ABSENT is not UNKNOWN, and the discriminator is whether a healthy answer would have looked
+    different.** A parsed reply with no `frameLoop` is an app build that CANNOT report frame-loop
+    health — nothing to check, and never will be for that build — so it stays silent, exactly as
+    #731's ENOENT case does. A throw, an unparseable reply or an error answer is a device that
+    should have been able to answer and did not, and that is the genuine unknown. Getting this
+    backwards is over-reporting, which is the failure mode this fix shape actually has: #731 shipped
+    it and its own review caught it.
+
+  Frame-fed READS
   (`world`/`bounds`, `layout_bounds`, `hit_regions`, `scene_query`, profiler, watch, and the
   enact/resolve-point ops the trusted routes aim from) carry a staleness note on the existing
   `warnings` array rather than a new payload shape.

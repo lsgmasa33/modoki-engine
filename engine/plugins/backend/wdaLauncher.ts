@@ -73,9 +73,31 @@ export interface IosDevice {
  *     own connection). Filtering on it rejected a perfectly reachable phone and reported "no iOS
  *     device is connected" with the device sitting right there. So every paired iOS device is a
  *     candidate, and `connected` only breaks ties. */
+/** The iOS device listing, plus the sources that could not answer (#1096). */
+export interface IosDeviceListing {
+  devices: IosDevice[];
+  /** Human-readable, one per source that FAILED. Empty when every source answered — including when
+   *  a source is simply not installed, which is absent rather than unknown. */
+  unavailable: string[];
+}
+
 export function parseIosDevices(devicectlJson: string): IosDevice[] {
+  return parseIosDevicesResult(devicectlJson).devices;
+}
+
+/** {@link parseIosDevices} plus WHETHER the document could be read at all (#1096).
+ *
+ *  `[]` used to mean both "this Mac has no paired iPhone" and "the JSON did not parse", and
+ *  `resolveIosDevice` turns the empty list into the definite claim *"no iOS device is paired with
+ *  this Mac"* — which `ensureWdaRunning` then LATCHES into `lastFailure` for the rest of the lease.
+ *  This module's own `devicectlOutPath` docblock already described that consequence: a torn read
+ *  makes trusted iOS input look degraded for the session, exactly like an unplugged phone.
+ *
+ *  `malformed` is only ever true for a document that EXISTS and will not parse. An absent one is
+ *  the caller's `listDevices()` throwing, which is a different case and stays the caller's. */
+export function parseIosDevicesResult(devicectlJson: string): { devices: IosDevice[]; malformed: boolean } {
   let parsed: unknown;
-  try { parsed = JSON.parse(devicectlJson); } catch { return []; }
+  try { parsed = JSON.parse(devicectlJson); } catch { return { devices: [], malformed: true }; }
   const devices = (parsed as { result?: { devices?: unknown[] } })?.result?.devices ?? [];
   const out: IosDevice[] = [];
   for (const raw of devices) {
@@ -97,7 +119,7 @@ export function parseIosDevices(devicectlJson: string): IosDevice[] {
       });
     }
   }
-  return out;
+  return { devices: out, malformed: false };
 }
 
 /** Pull iOS devices out of `xcrun xctrace list devices` — the LEGACY listing, and the only one
@@ -249,10 +271,11 @@ export const wdaLauncherExec = {
    *  source, so an Xcode without `xctrace` must leave the devicectl path working exactly as
    *  before, not break device selection outright. Bounded like every other exec here. */
   async listLegacyDevices(): Promise<string> {
-    try {
-      const { stdout } = await execFileAsync('xcrun', XCTRACE_ARGV, { timeout: 20000, encoding: 'utf8' });
-      return stdout;
-    } catch { return ''; }
+    // #1096: the catch that used to turn a failure into `''` moved to `computeIosDeviceListing`,
+    // which RECORDS it. The guarantee this docblock promises is unchanged — the caller still keeps
+    // going — but "xctrace broke" is no longer spelled the same as "xctrace listed nothing".
+    const { stdout } = await execFileAsync('xcrun', XCTRACE_ARGV, { timeout: 20000, encoding: 'utf8' });
+    return stdout;
   },
   /** THE THIRD SOURCE (#ca0A0LZ4knjvVNzclLRl) — what go-ios can reach, asked of go-ios.
    *
@@ -272,11 +295,14 @@ export const wdaLauncherExec = {
    *  polls every 2.5 s would be a surprising network fetch on a UI refresh. If go-ios is not
    *  already here this returns [] and the listing is exactly what it was before. */
   async listGoIosUdids(): Promise<string[]> {
-    try {
-      const found = detectTool('go-ios');
-      if (!found.present || !found.command) return [];
-      return await listGoIosUdids(found.command);
-    } catch { return []; }
+    // ⚠️ The two cases are NOT the same and no longer read the same (#1096). go-ios ABSENT is
+    // ordinary and stays a silent `[]` — this never provisions, per the note above. go-ios PRESENT
+    // and failing THROWS, for `computeIosDeviceListing` to record: that is the case that matters,
+    // because an iOS <=16 device is the one that NEEDS go-ios, and its row going missing is the
+    // exact "silently absent, with nothing saying why" this source was added to fix.
+    const found = detectTool('go-ios');
+    if (!found.present || !found.command) return [];
+    return await listGoIosUdids(found.command);
   },
   /** Name + product type for a device only go-ios can see, so its row reads like the others
    *  instead of as a bare UDID. Called ONLY for the devices the Apple listings missed — usually
@@ -315,10 +341,12 @@ export const wdaLauncherExec = {
       try { fs.rmSync(out, { force: true }); } catch { /* best-effort */ }
     }
   },
+  /** ⚠️ Mirrors the async twin (#1096): the failure THROWS for `ensureWdaRunning` to record, rather
+   *  than becoming an `''` that parses to "no legacy devices". This is the source that sees iOS <=16,
+   *  so swallowing it here is what made the iPhone 8 — the device that NEEDS this listing — come back
+   *  as "no iOS device is paired with this Mac", latched for the whole lease. */
   listLegacyDevicesSync(): string {
-    try {
-      return execFileSync('xcrun', XCTRACE_ARGV, { timeout: 20000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-    } catch { return ''; }
+    return execFileSync('xcrun', XCTRACE_ARGV, { timeout: 20000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
   },
 };
 
@@ -339,8 +367,18 @@ export const wdaLauncherExec = {
  *
  *  macOS-only in practice — both commands are `xcrun`. The caller gates on the platform. */
 export async function listIosDevicesForSelection(): Promise<IosDevice[]> {
+  return (await listIosDevicesForSelectionResult()).devices;
+}
+
+/** {@link listIosDevicesForSelection} plus WHICH sources could not answer (#1096).
+ *
+ *  Three sources feed this listing and all three used to fail into the same `[]` the empty case
+ *  uses, so "no iPhone is paired with this Mac" and "every way of asking broke" were one answer.
+ *  `unavailable` is empty on the ordinary path — a source that is simply NOT INSTALLED is absent,
+ *  not unknown, and says nothing here. */
+export async function listIosDevicesForSelectionResult(): Promise<IosDeviceListing> {
   const now = Date.now();
-  if (iosListCache && now - iosListCache.at < IOS_LIST_TTL_MS) return iosListCache.devices;
+  if (iosListCache && now - iosListCache.at < IOS_LIST_TTL_MS) return iosListCache.listing;
   // COALESCE CONCURRENT MISSES onto one listing. The AI panel polls this every 2.5s while each
   // uncached call spawns up to four bounded subprocesses (devicectl 20s, xctrace 20s, and now
   // `ios list` + `ios info` at 10s each) — so a slow or wedged tool made every poll during that
@@ -351,12 +389,34 @@ export async function listIosDevicesForSelection(): Promise<IosDevice[]> {
   return iosListPending;
 }
 
-async function computeIosDeviceListing(now: number): Promise<IosDevice[]> {
+const failureText = (e: unknown): string => (e instanceof Error ? e.message : String(e)).split('\n')[0].slice(0, 200);
+
+async function computeIosDeviceListing(now: number): Promise<IosDeviceListing> {
+  // Every source's failure is collected rather than swallowed. NOT surfaced unconditionally: a
+  // consumer only reads it when the listing came back EMPTY, because that is the only time `[]`
+  // gets turned into a claim about the hardware.
+  const unavailable: string[] = [];
   let primary: IosDevice[] = [];
-  try { primary = parseIosDevices(await wdaLauncherExec.listDevices()); } catch { /* no Xcode / devicectl */ }
-  const appleListed = mergeIosDevices(primary, parseXctraceDevices(await wdaLauncherExec.listLegacyDevices()));
+  try {
+    const parsed = parseIosDevicesResult(await wdaLauncherExec.listDevices());
+    primary = parsed.devices;
+    if (parsed.malformed) unavailable.push('devicectl answered, but its JSON did not parse (a torn or interleaved read)');
+  } catch (e) {
+    // Covers both "no Xcode at all" and "devicectl broke". Recorded with the message rather than
+    // split here: the two are not reliably distinguishable from the error, and the message itself
+    // is what tells the reader which one it was.
+    unavailable.push(`devicectl could not be run (${failureText(e)})`);
+  }
+  let legacy = '';
+  try { legacy = await wdaLauncherExec.listLegacyDevices(); } catch (e) {
+    unavailable.push(`xctrace could not be run (${failureText(e)}) — the only listing that sees iOS 16 and older`);
+  }
+  const appleListed = mergeIosDevices(primary, parseXctraceDevices(legacy));
   // Ask go-ios for whatever Apple's two listings missed — see `wdaLauncherExec.listGoIosUdids`.
-  const goIosUdids = await wdaLauncherExec.listGoIosUdids();
+  let goIosUdids: string[] = [];
+  try { goIosUdids = await wdaLauncherExec.listGoIosUdids(); } catch (e) {
+    unavailable.push(`go-ios is installed but its device listing failed (${failureText(e)})`);
+  }
   const known = new Set(appleListed.map((d) => d.udid));
   // `new Set` because `ios list` can repeat a UDID — measured returning the iPhone 8 twice in one
   // call. `mergeGoIosDevices` dedupes the rows anyway; deduping HERE is what stops the duplicate
@@ -364,8 +424,9 @@ async function computeIosDeviceListing(now: number): Promise<IosDevice[]> {
   const missing = [...new Set(goIosUdids)].filter((u) => !known.has(u));
   const enriched = await Promise.all(missing.map(async (udid) => ({ udid, ...(await wdaLauncherExec.goIosInfo(udid)) })));
   const devices = mergeGoIosDevices(appleListed, enriched);
-  iosListCache = { at: now, devices };
-  return devices;
+  const listing = { devices, unavailable };
+  iosListCache = { at: now, listing };
+  return listing;
 }
 
 /** Briefly cached, because this is TWO `xcrun` shell-outs and the AI panel's device picker polls
@@ -377,9 +438,9 @@ async function computeIosDeviceListing(now: number): Promise<IosDevice[]> {
  *  the same "why isn't it listed" confusion this whole feature exists to remove. Ten seconds is
  *  below the threshold where a human re-checks, and four polls out of five now cost nothing. */
 const IOS_LIST_TTL_MS = 10_000;
-let iosListCache: { at: number; devices: IosDevice[] } | null = null;
+let iosListCache: { at: number; listing: IosDeviceListing } | null = null;
 /** The listing currently in flight, so concurrent misses share it — see `listIosDevicesForSelection`. */
-let iosListPending: Promise<IosDevice[]> | null = null;
+let iosListPending: Promise<IosDeviceListing> | null = null;
 
 /** Test seam — drop the cached listing so a test can change what `xcrun` reports. Also drops any
  *  IN-FLIGHT listing, or a test that swapped the exec seam would still be handed the previous
@@ -449,14 +510,26 @@ export interface IosDeviceChoice { device: IosDevice; unverified?: string }
  *  on the phone is redeployed. So the guess is kept and SAID: `unverified` carries the reason, the
  *  caller surfaces it, and the pin remains the way to make it certain. */
 export function resolveIosDevice(
-  devices: IosDevice[], env: NodeJS.ProcessEnv = process.env, lease?: LeaseHardware,
+  devices: IosDevice[], env: NodeJS.ProcessEnv = process.env, lease?: LeaseHardware, unavailable: string[] = [],
 ): IosDeviceChoice | { error: string } {
   const pinned = env.MODOKI_IOS_DEVICE_UDID?.trim();
   if (pinned) {
     const hit = devices.find((d) => d.udid === pinned);
     return hit ? { device: hit } : { error: `MODOKI_IOS_DEVICE_UDID=${pinned} matches none of this Mac's paired iOS devices` };
   }
-  if (devices.length === 0) return { error: 'no iOS device is paired with this Mac' };
+  // ⚠️ EMPTY is only "no iPhone is paired" when every source actually ANSWERED (#1096). This is the
+  // one line that turns `[]` into a claim about the hardware, and the claim is what the user is
+  // told and what `ensureWdaRunning` latches — so when a source broke, say THAT instead. The
+  // distinction is load-bearing: "no iOS device is paired" tells you to plug a phone in, which is
+  // useless and misleading advice when the phone is already plugged in and the listing is what broke.
+  if (devices.length === 0) {
+    return {
+      error: unavailable.length
+        ? `could not tell whether an iOS device is paired with this Mac — ${unavailable.join('; ')}. `
+          + 'This is NOT the same as "no phone is connected": a source that should have answered did not.'
+        : 'no iOS device is paired with this Mac',
+    };
+  }
 
   let pool = devices;
   let unverified: string | undefined;
@@ -899,9 +972,22 @@ export async function ensureWdaRunning(opts: EnsureWdaRunningOpts): Promise<{ ru
   // A seam that is injectable only halfway is worse than none: it makes unit tests depend on which
   // phones happen to be plugged in.
   const legacyDefault = opts.listDevices ? () => '' : wdaLauncherExec.listLegacyDevicesSync;
-  const legacy = (opts.listLegacyDevices ?? legacyDefault)();
+  // #1096: EVERY source's failure is collected, exactly as the async path does it — a devicectl
+  // document that EXISTS and will not parse, and an xctrace that could not run at all. Both used to
+  // arrive as "no phone". `devicectlOutPath`'s own docblock names the consequence: the read can be
+  // torn or already unlinked, and `lastFailure` LATCHES whatever comes out of here for the rest of
+  // the lease, so a one-off file race read as "trusted iOS input is degraded" all session.
+  const unavailable: string[] = [];
+  // devicectl first, then xctrace — the SAME order as `computeIosDeviceListing`, so the two paths
+  // report one failure set in one order rather than reading as two different diagnoses.
+  const primary = parseIosDevicesResult(listing);
+  if (primary.malformed) unavailable.push('devicectl answered, but its JSON did not parse (a torn or interleaved read)');
+  let legacy = '';
+  try { legacy = (opts.listLegacyDevices ?? legacyDefault)(); } catch (e) {
+    unavailable.push(`xctrace could not be run (${describeExecFailure(e)}) — the only listing that sees iOS 16 and older`);
+  }
   const resolved = resolveIosDevice(
-    mergeIosDevices(parseIosDevices(listing), parseXctraceDevices(legacy)), process.env, opts.lease,
+    mergeIosDevices(primary.devices, parseXctraceDevices(legacy)), process.env, opts.lease, unavailable,
   );
   if ('error' in resolved) {
     lastFailure = `cannot start WebDriverAgent — ${resolved.error}`;

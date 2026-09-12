@@ -18,7 +18,7 @@ import { identityMismatch, tokenMismatchWarning, describeIdentity, type BackendI
 // Single-sourced with the DEVICE side (`agentBridge.ts`'s `sim-step` op) so this tool's outbound
 // `timeoutMs` and the device's own internal step budget can never independently drift (#822).
 import { simStepDefaultTimeout } from '../../shared/simStepTiming.js';
-import { DEVICE_KEY_MODIFIERS, MOUSE_BUTTONS, POINTER_ACTIONS } from '../../shared/inputVocabulary.js';
+import { DEVICE_KEY_MODIFIERS, KEY_ARG_DESCRIPTION, MOUSE_BUTTONS, POINTER_ACTIONS } from '../../shared/inputVocabulary.js';
 import { z } from 'zod';
 import { writeFileSync, readFileSync, unlinkSync, statSync } from 'fs';
 import { execFile } from 'child_process';
@@ -211,6 +211,9 @@ type DeviceListReply = {
   /** Present only when adb is absent — "no adb" and "no Android devices" are different problems
    *  with different fixes, so this is a field, not folded into an empty `android` array. */
   note?: string;
+  /** The iOS counterpart (#1096): present only when `ios` is EMPTY *and* a listing source broke, so
+   *  an empty list is never reported as "no iPhone attached" when nobody actually managed to look. */
+  iosNote?: string;
 };
 
 /** WHY the lease is stamped onto a measurement at all.
@@ -732,8 +735,15 @@ export function registerTools(server: McpServer) {
         // Say it plainly rather than leaving the reader to infer "nothing" from a run of headers
         // that never printed — three empty sections in a row reads like a broken tool, not a quiet
         // desk.
+        // #1096: an empty iOS list with a reason behind it is NOT "no iPhone attached" — say which.
+        if (r.iosNote) lines.push(`iOS: ${r.iosNote}`);
         if (r.android.length === 0 && r.ios.length === 0 && r.otherClaims.length === 0) {
-          lines.push(r.adb.present ? 'No devices attached, and no claims on record.' : 'No devices could be checked, and no claims on record.');
+          // Scoped per platform: with adb working and zero phones, Android genuinely WAS checked, so
+          // a blanket "no devices could be checked" trades a falsehood about iOS for one about
+          // Android. The `iOS:` line above already carries the iOS half.
+          lines.push(r.adb.present
+            ? (r.iosNote ? 'No Android devices attached and no claims on record; the iOS listing is above.' : 'No devices attached, and no claims on record.')
+            : 'No devices could be checked, and no claims on record.');
         }
         return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
       } catch (e) {
@@ -1934,7 +1944,7 @@ export function registerTools(server: McpServer) {
       'stays SYNTHETIC by design — a WebDriverAgent key reaches only a FOCUSED element, so it would ' +
       'do nothing with a game canvas focused (#32). Check device_status\'s input-mechanism line.',
     {
-      key: z.string().describe('KeyboardEvent.key, e.g. "F12", "Escape", "ArrowLeft", "a".'),
+      key: z.string().describe(KEY_ARG_DESCRIPTION),
       modifiers: z.array(z.enum(DEVICE_KEY_MODIFIERS)).optional().describe('Held modifiers, e.g. ["meta"] for Cmd+key.'),
     },
     async ({ key, modifiers }) => enactCall('device_press_key', 'press-key', { key, ...(modifiers ? { modifiers } : {}) }, (r) => r.replace(/^ok /, 'Pressed ')),
@@ -1966,7 +1976,7 @@ export function registerTools(server: McpServer) {
     {
       text: z.string().describe('Text to type into the focused input.'),
       clearFirst: z.boolean().optional().describe('Empty the field before typing (replace vs append).'),
-      submitKey: z.string().optional().describe("Terminal key chord dispatched after typing: 'Enter', 'Tab', or 'Escape'. Fires the app's key handlers; does NOT move focus or submit natively (synthetic events don't drive the browser's focus management) — measured on-device."),
+      submitKey: z.string().optional().describe(`Terminal key chord dispatched after typing. Fires the app's key handlers; does NOT move focus or submit natively (synthetic events don't drive the browser's focus management) — measured on-device. ${KEY_ARG_DESCRIPTION}`),
     },
     async ({ text, clearFirst, submitKey }) => {
       const what = 'type text into the focused element on the device';

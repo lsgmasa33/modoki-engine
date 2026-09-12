@@ -44,6 +44,7 @@
 
 import { execFileSync } from 'child_process';
 import { adbArgs, adbBinary, forwardOwner } from './androidDevices';
+import { domCodeForKey, normalizeKeyName } from '../../tools/shared/inputVocabulary';
 
 import {
   decodeAimReply, resolveAimViaDevice, aimAsResolved, STALE_APP_REASON,
@@ -371,12 +372,6 @@ export async function cdpDrag(
   await sender.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
 }
 
-/** e.code for a bare key: single letters → `KeyX`, else the key itself — same convention as
- *  bridge.ts's `keyToCode` (duplicated rather than imported: bridge.ts is a browser bundle that
- *  pulls in `@capacitor/core`, which does not resolve in this Node backend). */
-function keyToCdpCode(key: string): string {
-  return key.length === 1 && /[a-z]/i.test(key) ? `Key${key.toUpperCase()}` : key;
-}
 
 /** CDP `Input.dispatchKeyEvent`'s modifier bitmask: Alt=1, Ctrl=2, Meta/Command=4, Shift=8. */
 function cdpModifierBits(modifiers: string[]): number {
@@ -386,8 +381,13 @@ function cdpModifierBits(modifiers: string[]): number {
     | (modifiers.includes('shift') ? 8 : 0);
 }
 
+/** The modifier this key IS, if any — a modifier keydown reports itself as held (see `bridge.ts`). */
+const SELF_MODIFIER: Record<string, string> = { Control: 'ctrl', Shift: 'shift', Alt: 'alt', Meta: 'meta' };
+
 export async function cdpPressKey(sender: CdpSender, key: string, modifiers: string[] = [], code?: string): Promise<void> {
-  const init = { key, code: code || keyToCdpCode(key), modifiers: cdpModifierBits(modifiers) };
+  const self = Object.prototype.hasOwnProperty.call(SELF_MODIFIER, key) ? SELF_MODIFIER[key] : undefined;
+  const held = self && !modifiers.includes(self) ? [...modifiers, self] : modifiers;
+  const init = { key, code: code || domCodeForKey(key), modifiers: cdpModifierBits(held) };
   await sender.send('Input.dispatchKeyEvent', { type: 'keyDown', ...init });
   await sender.send('Input.dispatchKeyEvent', { type: 'keyUp', ...init });
 }
@@ -660,8 +660,14 @@ export async function tryDeviceCdpInput(method: string, params: Record<string, u
         return { handled: true, reply: `ok (cdp touch) css(${Math.round(from.aim.x)},${Math.round(from.aim.y)})→(${Math.round(to.aim.x)},${Math.round(to.aim.y)}) [input:${TRUSTED_CDP_MECHANISM}]${supersededDrag}` };
       }
       case 'press-key': {
-        const key = params.key as string;
-        if (!key) return { handled: true, reply: 'Error: press-key needs a key' };
+        const requested = params.key as string;
+        if (!requested) return { handled: true, reply: 'Error: press-key needs a key' };
+        // Canonical, so this transport and the bridge send the same key for the same request
+        // (#1094). The membership refusal already ran at `/api/device/request`, before a transport
+        // was chosen — CDP never reaches the bridge handler, so that is the only place it can run.
+        // `?? requested` is the belt on a direct caller that skipped the relay, not a coercion:
+        // an unrecognised name reaching here is a programming error, not agent input.
+        const key = normalizeKeyName(requested) ?? requested;
         const modifiers = (params.modifiers as string[]) ?? [];
         await cdpPressKey(counting, key, modifiers, params.code as string | undefined);
         return { handled: true, reply: `ok (cdp key ${key}${modifiers.length ? ' +' + modifiers.join('+') : ''}) [input:${TRUSTED_CDP_MECHANISM}]` };

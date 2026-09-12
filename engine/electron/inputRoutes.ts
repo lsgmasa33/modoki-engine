@@ -33,8 +33,8 @@ import { NOTHING_AT_POINT } from '../app/debug/domPointContract';
 import type { EntityPointSpec, EntityPointResolution, OcclusionScope, AimedAt } from '../app/debug/entityPointContract';
 import type { ErrorCode } from '../tools/shared/mcpResult';
 import {
-  EDITOR_INPUT_MODIFIERS, MOUSE_BUTTONS, POINTER_ACTIONS, refuseUnknownValue, refuseUnknownValues,
-  type VocabularyRefusal,
+  EDITOR_INPUT_MODIFIERS, MOUSE_BUTTONS, POINTER_ACTIONS, normalizeKeyName, refuseUnknownKey,
+  refuseUnknownValue, refuseUnknownValues, type VocabularyRefusal,
 } from '../tools/shared/inputVocabulary';
 
 /** The trusted-input primitives, pre-bound to the live window by the caller. */
@@ -372,13 +372,26 @@ export interface InputDeliverability { visibilityState?: string; hasFocus?: bool
  *
  *  Exported because `/api/input/*` is NOT the only route that dispatches trusted input —
  *  `/api/capture-gesture` drives its own drag through `rendererOps` — and a gate only one of
- *  them passes through is a gate with a hole in it. */
-export async function inputDeliverability(
+ *  them passes through is a gate with a hole in it.
+ *
+ *  Returns WHY it could not answer (#1096) — the same conflation, and the same fix, as the device
+ *  router's `probeInputDeliverability` one module over. A bare `null` meant both "the page answered,
+ *  and it is fine" and "I could not ask", and every consumer reads the first. The POLARITY is
+ *  unchanged and deliberate (above: a refused tap is a broken tool); what changes is that the second
+ *  case is now sayable, so a dispatch that could not be qualified says so instead of looking checked.
+ *
+ *  A `null` REPLY counts as unchecked too: the op answers an object, so nothing is not an answer. */
+export async function inputDeliverabilityResult(
   requestRenderer: InputRouteDeps['requestRenderer'],
-): Promise<InputDeliverability | null> {
+): Promise<{ live: InputDeliverability | null; unchecked: string | null }> {
   try {
-    return (await requestRenderer('input-deliverability', {})) as InputDeliverability | null;
-  } catch { return null; }
+    const live = (await requestRenderer('input-deliverability', {})) as InputDeliverability | null;
+    return live
+      ? { live, unchecked: null }
+      : { live: null, unchecked: 'the renderer answered nothing' };
+  } catch (e) {
+    return { live: null, unchecked: e instanceof Error ? e.message : String(e) };
+  }
 }
 
 /** The 409 for a hidden window, or null when the input can go ahead (including the
@@ -587,7 +600,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
     // letting `dispatchInput`'s trailing `return null` decide keeps that true: the gate below
     // would otherwise answer 409 for a path this file does not own.
     if (!DISPATCHED_INPUT_ROUTES.has(urlPath)) return null;
-    const live = await inputDeliverability(requestRenderer);
+    const { live, unchecked } = await inputDeliverabilityResult(requestRenderer);
     // `/api/input/focus` is exempt: it is the one route here that dispatches NO OS input —
     // `focusElement` is `wc.focus()` plus `executeJavaScript`, which a hidden window still runs.
     // Refusing it would state a reason ("Chromium would drop this input") that is untrue for it,
@@ -609,6 +622,31 @@ export function createInputRoutes(deps: InputRouteDeps) {
     // commit-on-blur field is the classic). Reported, not refused: the input itself is real.
     if (r && r.kind === 'json' && live && live.hasFocus === false && r.body && typeof r.body === 'object' && !Array.isArray(r.body)) {
       (r.body as Record<string, unknown>).windowFocused = false;
+    }
+    // #1096: same shape as `windowFocused` above, for the case where the probe could not answer at
+    // all. The input WAS dispatched (the gate fails open on purpose), but neither the hidden-window
+    // refusal nor the focus hint above could run — so an `ok` here is not the qualified `ok` it
+    // looks like, and this is the one line that says so for all eight dispatched routes.
+    // ⚠️ SUCCESS ONLY, the same rule the device router follows. The note's claim is that something
+    // WAS dispatched unqualified; stamping it on a 400 (`bad()` — a vocabulary refusal, a bad aim)
+    // or on an `ok:false` type-text reply says the opposite of what happened, about a call that
+    // dispatched nothing. `status` is set only by `bad()`/refusals here, so its absence plus a
+    // non-false `ok` is what "this reply reports success" means at this seam.
+    // Two clauses, and exactly two: an HTTP error status (every `bad()` refusal) or `ok:false` (the
+    // type-text no-editable-target reply). A third clause testing `error === undefined` was dropped
+    // — it caught BOTH of those as a side effect, which made all three mutually redundant and left
+    // every one of them individually unfalsifiable. With just these, breaking either goes red.
+    // `/api/input/focus` is exempt from the hidden-window refusal 35 lines above, so the note's own
+    // words — "a hidden page would have been refused" — are FALSE for it. The same reason that route
+    // is exempt there makes it exempt here; stating a cause that does not apply is worse than silence.
+    const dispatched = urlPath !== '/api/input/focus'
+      && r && r.kind === 'json' && r.status === undefined
+      && r.body && typeof r.body === 'object' && !Array.isArray(r.body)
+      && (r.body as { ok?: unknown }).ok !== false;
+    if (unchecked && dispatched) {
+      (r!.body as Record<string, unknown>).deliverabilityUnchecked =
+        `the renderer could not be asked whether this input is deliverable (${unchecked}), so it was `
+        + 'dispatched unqualified — a hidden page would have been refused, and was not checked for here.';
     }
     return r;
   }) as InputRoutesHandler;
@@ -841,8 +879,15 @@ export function createInputRoutes(deps: InputRouteDeps) {
       const { key, modifiers, panel } = (body ?? {}) as { key?: string; modifiers?: InputModifier[]; panel?: string };
       if (typeof key !== 'string' || !key) return bad('key is a required string');
       // Before the focus-scope change and the reach probe: a refused press must move nothing.
-      const unknownVocab = refuseVocabulary(refuseUnknownValues('key modifiers', modifiers, EDITOR_INPUT_MODIFIERS));
+      const unknownVocab = refuseVocabulary(
+        refuseUnknownValues('key modifiers', modifiers, EDITOR_INPUT_MODIFIERS),
+        refuseUnknownKey('key', key),
+      );
       if (unknownVocab) return unknownVocab;
+      // Everything below this line speaks the CANONICAL name (#1094): `Esc` and `escape` both become
+      // `Escape`, so the reach probe resolves the chord the press will actually send, and the device
+      // relay one module over accepts the same spellings. Non-null — `refuseUnknownKey` just passed.
+      const canonicalKey = normalizeKeyName(key)!;
       // Panel-scoped chords resolve against the FOCUSED panel, so a bare `w` sent with the
       // wrong panel focused does nothing — silently, since the dispatcher yields rather than
       // erroring. `panel` sets the keyboard scope first so the caller can steer a chord
@@ -860,7 +905,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
       // whether a warning rides along. Same policy as withAgentAttribution above.
       let reach: KeyReachReply = null;
       try {
-        reach = (await requestRenderer('probe-key-reach', { key, modifiers })) as KeyReachReply;
+        reach = (await requestRenderer('probe-key-reach', { key: canonicalKey, modifiers })) as KeyReachReply;
       } catch { /* unreachable renderer — press anyway, unwarned */ }
       // Echo the scope on EVERY press, not only when the caller set it. Not knowing where the
       // scope was is what made QA-PHYS-0003 unanswerable from the responses alone: 80 presses
@@ -868,7 +913,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
       if (focusedPanel === undefined && reach && typeof reach === 'object' && 'focusedPanel' in reach) {
         focusedPanel = reach.focusedPanel ?? null;
       }
-      const r = await ops.pressKey(key, modifiers);
+      const r = await ops.pressKey(canonicalKey, modifiers);
       // The key IS dispatched (DOM hotkeys fire regardless), so this stays ok:true — but if a
       // field is focused the GAME never samples it, so surface that so a silent no-reach is
       // visible. (C7 re-audit.)
@@ -901,7 +946,12 @@ export function createInputRoutes(deps: InputRouteDeps) {
         warnings.push(`the editor keyboard scope is ${JSON.stringify(reach!.focusedPanel ?? null)}, so the input gate blocked this key from the RUNNING GAME — it moved nothing there. Pass panel:"game" if you meant to drive the game. A bare modoki_focus {} does NOT do this: it clears DOM focus only, and the keyboard scope is separate state. (Editor shortcuts scoped to that panel are unaffected and may still have fired.)`);
       }
       return json({
-        ok: true, pressed: { key, modifiers: modifiers ?? [] }, activeElement: r.activeElement,
+        // Echo what was DISPATCHED, not what was asked for: `{key:'Esc'}` presses `Escape`, and a
+        // reply that echoed `Esc` back would leave the caller unable to tell a rewrite from a
+        // pass-through. `normalizedFrom` rides along only when the two differ (#1094).
+        ok: true,
+        pressed: { key: canonicalKey, modifiers: modifiers ?? [], ...(canonicalKey !== key ? { normalizedFrom: key } : {}) },
+        activeElement: r.activeElement,
         ...(focusedPanel !== undefined ? { focusedPanel } : {}),
         // The resolved chord rides along ONLY with the scope warning. `keyReach` computes it
         // either way and this used to drop it on the floor while the field's own docstring
@@ -917,7 +967,14 @@ export function createInputRoutes(deps: InputRouteDeps) {
     if (urlPath === '/api/input/type') {
       const { text, clearFirst, submitKey } = (body ?? {}) as { text?: string; clearFirst?: boolean; submitKey?: string };
       if (typeof text !== 'string') return bad('text is a required string');
-      const r = await ops.typeText(text, { clearFirst, submitKey });
+      // #1094: `submitKey` named exactly three legal values in its own tool description and enforced
+      // none of them. An unrecognised one is not an error downstream — it becomes a keydown with an
+      // EMPTY `key`, so `{text:'abc', submitKey:'Retrun'}` answered `ok, typed:3` having submitted
+      // nothing. Refused BEFORE the text is typed, so a refusal leaves the field untouched rather
+      // than half-done.
+      const unknownSubmit = refuseVocabulary(refuseUnknownKey('submitKey', submitKey));
+      if (unknownSubmit) return unknownSubmit;
+      const r = await ops.typeText(text, { clearFirst, submitKey: submitKey ? normalizeKeyName(submitKey)! : undefined });
       // Nothing editable focused ⇒ the chars went nowhere. Report ok:false (isFailureBody surfaces
       // it) with WHERE focus actually is, instead of the old {ok:true, typed:N} into the void. (C7 re-audit.)
       if (!r.editable) {

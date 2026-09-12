@@ -90,6 +90,46 @@ describe('a listing that could not be read is not "no devices"', () => {
     const rows = iosTargetRows(listWith({ ios: [] }), noTarget, 'darwin');
     expect(rows[0].label).toMatch(/No iOS device paired/);
   });
+
+  // #1096 — the third case, between the two above: the listing WAS read, and every source that
+  // could have found a phone failed. "Plug one in and unlock it" is then actively wrong advice,
+  // because the phone is already plugged in and the LISTING is what broke.
+  it('an empty listing WITH a reason shows the reason, not "plug one in"', () => {
+    const rows = iosTargetRows(
+      listWith({ ios: [], iosNote: 'an empty iOS list here does NOT mean no iPhone is paired — xctrace could not be run (boom).' }),
+      noTarget, 'darwin',
+    );
+    expect(rows[0].label).toMatch(/does NOT mean no iPhone is paired/);
+    expect(rows[0].label).not.toMatch(/plug one in/);
+    expect(rows[0].disabled).toBe(true);
+  });
+
+  it('⚠️ the CONFIGURED-target row carries the reason too — the branch a real user reaches', () => {
+    // The first cut put the note only in the no-rows fallback, which a user who has already picked
+    // their build phone can never reach: `iosDeviceId` set + not listed pushes a "— not attached"
+    // row and returns early. "not attached" is the same false hardware claim as "plug one in".
+    const rows = iosTargetRows(
+      listWith({ ios: [], iosNote: 'xctrace could not be run (boom).' }),
+      { ...noTarget, iosDeviceId: '00008020-ABC' }, 'darwin',
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].label).toContain('xctrace could not be run');
+    expect(rows[0].label).not.toMatch(/not attached/);
+  });
+
+  it('ACCEPT: with no reason, the configured-target row still says "not attached"', () => {
+    const rows = iosTargetRows(listWith({ ios: [] }), { ...noTarget, iosDeviceId: '00008020-ABC' }, 'darwin');
+    expect(rows[0].label).toMatch(/not attached/);
+  });
+
+  it('ACCEPT: a note is ignored once devices WERE found — it only speaks for an empty list', () => {
+    const rows = iosTargetRows(
+      listWith({ ios: [{ udid: 'AAA', name: 'iPhone8', connected: true, claim: null }], iosNote: 'should not appear' }),
+      noTarget, 'darwin',
+    );
+    expect(rows.some((r) => r.label.includes('should not appear'))).toBe(false);
+    expect(rows[0].label).toContain('iPhone8');
+  });
 });
 
 describe('iosTargetRows', () => {

@@ -13,6 +13,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createInputRoutes, resolvePoint, HELD_POINTER_IDLE_MS, type InputOps } from '../../electron/inputRoutes';
+import { INPUT_KEYS } from '../../tools/shared/inputVocabulary';
 
 /** Ordered log of everything that happened, so we can assert on sequence.
  *  Actor-lease traffic is recorded SEPARATELY (`leaseCalls`) — it brackets every route, so
@@ -1752,5 +1753,194 @@ describe('an unknown input vocabulary value is REFUSED before anything resolves 
     const res = await post(route, { ...body, modifiers: ['meta'] }) as { status?: number };
     expect(res.status ?? 200).toBe(200);
     expect(Object.values(ops).some((op) => (op as ReturnType<typeof vi.fn>).mock.calls.length > 0)).toBe(true);
+  });
+});
+
+describe('a renderer that cannot answer the deliverability probe says so (#1096)', () => {
+  // The editor-side twin of the device router's probe, and the same conflation: `null` meant both
+  // "the page answered, and it is not hidden" and "I could not ask", and `hiddenWindowRefusal`
+  // reads the first. The POLARITY is deliberate and unchanged — a renderer that cannot answer must
+  // never fail the input — so this asserts the input STILL DISPATCHES and merely stops looking
+  // qualified. One chokepoint covers all eight dispatched routes.
+
+  /** A renderer that throws for `input-deliverability` only, and behaves normally otherwise. */
+  function rendererWithDeadProbe() {
+    const base = makeRenderer();
+    return vi.fn(async (op: string, params: unknown) => {
+      if (op === 'input-deliverability') throw new Error('renderer went away');
+      return base(op, params);
+    });
+  }
+
+  it('the reply carries the unchecked note, and the input was still dispatched', async () => {
+    routes = createInputRoutes({ ops, requestRenderer: rendererWithDeadProbe() });
+    const res = await post('/api/input/key', { key: 'Escape' }) as { body: Record<string, unknown> };
+    expect(res.body.ok).toBe(true);
+    expect(ops.pressKey).toHaveBeenCalledWith('Escape', undefined);
+    expect(String(res.body.deliverabilityUnchecked)).toMatch(/could not be asked whether this input is deliverable/);
+    expect(String(res.body.deliverabilityUnchecked)).toMatch(/renderer went away/);
+  });
+
+  it('a renderer that answers NOTHING is unchecked too — nothing is not an answer', async () => {
+    const base = makeRenderer();
+    const renderer = vi.fn(async (op: string, params: unknown) => (op === 'input-deliverability' ? null : base(op, params)));
+    routes = createInputRoutes({ ops, requestRenderer: renderer });
+    const res = await post('/api/input/tap', { x: 5, y: 6 }) as { body: Record<string, unknown> };
+    expect(res.body.ok).toBe(true);
+    expect(String(res.body.deliverabilityUnchecked)).toMatch(/the renderer answered nothing/);
+  });
+
+  it('it is ONE gate for every dispatched route, not a per-route hint', async () => {
+    routes = createInputRoutes({ ops, requestRenderer: rendererWithDeadProbe() });
+    for (const [route, body] of [
+      ['/api/input/tap', { x: 5, y: 6 }], ['/api/input/hover', { x: 5, y: 6 }],
+      ['/api/input/scroll', { x: 5, y: 6, deltaY: 120 }], ['/api/input/type', { text: 'x' }],
+    ] as Array<[string, Record<string, unknown>]>) {
+      const res = await post(route, body) as { body: Record<string, unknown> };
+      expect(res.body.deliverabilityUnchecked, route).toBeDefined();
+    }
+  });
+
+  // ACCEPT SIDE: a note that rode on every reply would pass all three cases above.
+  it('ACCEPT: a renderer that ANSWERS adds no note', async () => {
+    const res = await post('/api/input/key', { key: 'Escape' }) as { body: Record<string, unknown> };
+    expect(res.body.ok).toBe(true);
+    expect(res.body).not.toHaveProperty('deliverabilityUnchecked');
+  });
+
+  // ⚠️ The review finding: the device router applies a success-only rule and this twin did not, so
+  // the note landed on 400s too — claiming "it was dispatched unqualified" about a call that
+  // dispatched NOTHING. The docs state the rule as landed on both sides; it has to be true on both.
+  it('a REFUSED call is never annotated — nothing was dispatched to be unqualified about', async () => {
+    routes = createInputRoutes({ ops, requestRenderer: rendererWithDeadProbe() });
+    const refused = await post('/api/input/key', { key: 'Retrun' }) as { status?: number; body: Record<string, unknown> };
+    expect(refused.status).toBe(400);
+    expect(refused.body).not.toHaveProperty('deliverabilityUnchecked');
+    for (const op of Object.values(ops)) expect(op).not.toHaveBeenCalled();
+  });
+
+  it('⚠️ /api/input/focus is never annotated — the note\'s own words are false for it', async () => {
+    // That route is explicitly exempt from the hidden-window refusal ("refusing it would state a
+    // reason that is untrue for it"), so "a hidden page would have been refused" is a claim about a
+    // refusal that could never have applied. The success-only fix re-read that exact statement and
+    // left the false half standing.
+    routes = createInputRoutes({ ops, requestRenderer: rendererWithDeadProbe() });
+    const res = await post('/api/input/focus', { selector: '#kebab' }) as { body: Record<string, unknown> };
+    expect(res.body.ok).toBe(true);
+    expect(ops.focusElement).toHaveBeenCalled();
+    expect(res.body).not.toHaveProperty('deliverabilityUnchecked');
+  });
+
+  it('an ok:false reply is not annotated either', async () => {
+    ops.typeText = vi.fn(async () => ({ typed: 0, editable: false, activeElement: null }));
+    routes = createInputRoutes({ ops, requestRenderer: rendererWithDeadProbe() });
+    const res = await post('/api/input/type', { text: 'x' }) as { body: Record<string, unknown> };
+    expect(res.body.ok).toBe(false);
+    expect(res.body).not.toHaveProperty('deliverabilityUnchecked');
+  });
+});
+
+describe('an unrecognised KEY NAME is refused, and a recognised one is normalised (#1094)', () => {
+  // #1076 fixed `button`, `action` and `modifiers` and left `key` an open `z.string()` — its own
+  // design said so. What an unrecognised name actually does was MEASURED on Electron 43.2.0
+  // (2026-09-12) rather than assumed: Chromium turns it into a keydown whose `key` is the EMPTY
+  // STRING, so it matches no handler, inserts nothing, and every layer answers `ok`. That is why
+  // these assert "nothing was dispatched" rather than anything about what got typed — through the
+  // shipped routes an unknown name types nothing at all.
+
+  const expectNothingHappened = () => {
+    expect(calls).toEqual([]);
+    for (const op of Object.values(ops)) expect(op).not.toHaveBeenCalled();
+  };
+
+  it('/api/input/key refuses the OBSERVED bad input `NumpadEnter`, naming the key/code confusion', async () => {
+    const res = await post('/api/input/key', { key: 'NumpadEnter' }) as { status?: number; body: Record<string, unknown> };
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ code: 'REFUSED_BY_OP' });
+    expect(res.body.error).toMatch(/key: unrecognised key name "NumpadEnter" — nothing was dispatched/);
+    // The recovery hint is the point: `NumpadEnter` is a `code`, and the caller wants `Enter`.
+    expect(res.body.error).toMatch(/KeyboardEvent\.key, not \.code/);
+    expect(res.body.options).toContain('Enter');
+    expectNothingHappened();
+  });
+
+  it.each(['Excape', 'Enterr', 'zzz', 'F25', 'Del'])('/api/input/key refuses %s', async (key) => {
+    const res = await post('/api/input/key', { key }) as { status?: number };
+    expect(res.status).toBe(400);
+    expectNothingHappened();
+  });
+
+  // ⚠️ `constructor` and `__proto__` specifically, NOT `toString`: the lookup lower-cases before it
+  // reads, so `'toString'` misses an object's inherited key anyway and a test using it stays green
+  // even with the Map swapped for an object literal — it cannot fail, so it proves nothing. These
+  // two survive lower-casing, so they are the ones that discriminate (mutation-checked).
+  it.each(['constructor', '__proto__'])('a prototype key is not a key name: %s', async (key) => {
+    const res = await post('/api/input/key', { key }) as { status?: number };
+    expect(res.status).toBe(400);
+    expectNothingHappened();
+  });
+
+  it('/api/input/type refuses an unrecognised submitKey WITHOUT typing the text first', async () => {
+    const res = await post('/api/input/type', { text: 'abc', submitKey: 'Retrun' }) as { status?: number; body: Record<string, unknown> };
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/submitKey: unrecognised key name "Retrun"/);
+    // The measured defect was `ok, typed:3` having submitted nothing. A refusal that typed the text
+    // and then refused would leave the field half-done, which is worse than either outcome.
+    expect(ops.typeText).not.toHaveBeenCalled();
+    expectNothingHappened();
+  });
+
+  it('dispatches the CANONICAL key, and says what it rewrote', async () => {
+    const res = await post('/api/input/key', { key: 'Esc' }) as { body: { pressed: Record<string, unknown> } };
+    expect(ops.pressKey).toHaveBeenCalledWith('Escape', undefined);
+    expect(res.body.pressed).toMatchObject({ key: 'Escape', normalizedFrom: 'Esc' });
+  });
+
+  it.each([['Return', 'Enter'], ['Up', 'ArrowUp'], ['Down', 'ArrowDown'], ['Left', 'ArrowLeft'], ['Right', 'ArrowRight'], ['Space', ' '], ['escape', 'Escape'], ['ARROWUP', 'ArrowUp']])(
+    'normalises %s to %s', async (sent, canonical) => {
+      await post('/api/input/key', { key: sent });
+      expect(ops.pressKey).toHaveBeenCalledWith(canonical, undefined);
+    });
+
+  it('a canonical name is NOT reported as rewritten', async () => {
+    const res = await post('/api/input/key', { key: 'Escape' }) as { body: { pressed: Record<string, unknown> } };
+    expect(res.body.pressed).toEqual({ key: 'Escape', modifiers: [] });
+    expect(res.body.pressed).not.toHaveProperty('normalizedFrom');
+  });
+
+  it('a single character is verbatim and CASE-SIGNIFICANT — `W` is not `w`', async () => {
+    await post('/api/input/key', { key: 'W' });
+    expect(ops.pressKey).toHaveBeenCalledWith('W', undefined);
+  });
+
+  it('the reach probe is asked about the key that will actually be sent', async () => {
+    await post('/api/input/key', { key: 'Up' });
+    expect(requestRenderer).toHaveBeenCalledWith('probe-key-reach', { key: 'ArrowUp', modifiers: undefined });
+  });
+
+  it('submitKey is normalised on the way to typeText', async () => {
+    await post('/api/input/type', { text: 'x', submitKey: 'Return' });
+    expect(ops.typeText).toHaveBeenCalledWith('x', { clearFirst: undefined, submitKey: 'Enter' });
+  });
+
+  it('an absent submitKey is not a refusal', async () => {
+    const res = await post('/api/input/type', { text: 'x' }) as { status?: number };
+    expect(res.status ?? 200).toBe(200);
+    expect(ops.typeText).toHaveBeenCalledWith('x', { clearFirst: undefined, submitKey: undefined });
+  });
+
+  // ACCEPT SIDE. A predicate that refused everything would pass every case above, and the table and
+  // the predicate drifting apart is the failure this catches: every name the refusal ADVERTISES as
+  // valid must actually be dispatched.
+  it.each([...INPUT_KEYS])('ACCEPT: %s is dispatched', async (key) => {
+    const res = await post('/api/input/key', { key }) as { status?: number };
+    expect(res.status ?? 200).toBe(200);
+    expect(ops.pressKey).toHaveBeenCalledWith(key, undefined);
+  });
+
+  it.each(['w', 'z', '1', '+', ' ', '😀'])('ACCEPT: the single character %s is dispatched', async (key) => {
+    const res = await post('/api/input/key', { key }) as { status?: number };
+    expect(res.status ?? 200).toBe(200);
+    expect(ops.pressKey).toHaveBeenCalledWith(key, undefined);
   });
 });

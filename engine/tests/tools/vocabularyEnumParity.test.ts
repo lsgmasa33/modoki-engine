@@ -14,7 +14,7 @@ import { loadDeviceSurface, type DeviceSurface } from './deviceSurface';
 import { CREATE_ENTITY_KINDS, LIGHT_KINDS, JOURNAL_LEVELS } from '../../packages/modoki/src/runtime/index';
 import { UI_PRESET_NAMES } from '../../packages/modoki/src/runtime/ui/uiAuthoring';
 import { EDITOR_JOURNAL_SOURCES } from '../../packages/modoki/src/editor/editorJournal';
-import { DEVICE_KEY_MODIFIERS, EDITOR_INPUT_MODIFIERS, MOUSE_BUTTONS, POINTER_ACTIONS } from '../../tools/shared/inputVocabulary';
+import { DEVICE_KEY_MODIFIERS, EDITOR_INPUT_MODIFIERS, KEY_ARG_DESCRIPTION, MOUSE_BUTTONS, POINTER_ACTIONS } from '../../tools/shared/inputVocabulary';
 
 let surface: Surface | undefined;
 let device: DeviceSurface | undefined;
@@ -59,6 +59,22 @@ describe('editor MCP tool enums == the runtime tables', () => {
       if (!values) throw new Error(`${tool}.modifiers is not a list of an enum in the advertised schema`);
       expect(sorted(values)).toEqual(sorted(EDITOR_INPUT_MODIFIERS));
     });
+
+  // #1094 — `key` is the one input vocabulary that CANNOT be a z.enum: a single character is legal
+  // and enumerating every character is not. So the advertised/enforced pin is carried by the
+  // DESCRIPTION instead, derived from the same table the routes refuse against. This reads the
+  // PUBLISHED schema, which the constant's own unit test cannot: it catches a description edited by
+  // hand back into a literal.
+  it.each([
+    { tool: 'modoki_press_key', param: 'key' },
+    { tool: 'modoki_type_text', param: 'submitKey' },
+  ])('$tool $param advertises the derived key vocabulary', ({ tool, param }) => {
+    surface = loadSurface();
+    const json = zodToJsonSchema(surface.schemaFor(tool) as never) as { properties?: Record<string, { description?: string }> };
+    const described = json.properties?.[param]?.description;
+    if (!described) throw new Error(`${tool}.${param} has no description in the advertised schema`);
+    expect(described).toContain(KEY_ARG_DESCRIPTION);
+  });
 
   it('modoki_create_entity.kind offers every runtime kind except `environment`', () => {
     surface = loadSurface();

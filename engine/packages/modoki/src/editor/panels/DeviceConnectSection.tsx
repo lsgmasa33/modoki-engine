@@ -319,7 +319,11 @@ export default function DeviceConnectSection(): React.ReactElement {
           choice through go-ios and refuses a device usbmuxd cannot see. */}
       {useUsb && deviceList && (
         deviceList.ios.length === 0
-          ? <div style={{ color: '#888', marginBottom: 8 }}>No iOS devices attached.</div>
+          // #1096: an empty list with a REASON is not "no iPhone attached" — mirrors the adb arm
+          // above, which has always drawn this distinction with `note`.
+          ? <div style={{ color: deviceList.iosNote ? '#c99' : '#888', marginBottom: 8 }}>
+            {deviceList.iosNote ?? 'No iOS devices attached.'}
+          </div>
           : <DevicePicker rows={iosRows} selected={udid} disabled={busy || summary.connected} ariaLabel="iOS device" onSelect={onUdidChange} />
       )}
 

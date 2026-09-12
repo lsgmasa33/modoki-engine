@@ -96,3 +96,76 @@ describe('handlePressKey modifier vocabulary (#1076)', () => {
     expect(downs.map((e) => [e.key, e.metaKey])).toEqual([['z', true]]);
   });
 });
+
+describe('handlePressKey KEY-NAME vocabulary (#1094)', () => {
+  /** Press `key` and report the reply plus every keydown the window saw. */
+  async function pressKeyName(key: unknown): Promise<{ reply: string; downs: KeyboardEvent[] }> {
+    const downs: KeyboardEvent[] = [];
+    const onDown = (e: Event) => { downs.push(e as KeyboardEvent); };
+    window.addEventListener('keydown', onDown);
+    try {
+      return { reply: await handlePressKey({ key }), downs };
+    } finally {
+      window.removeEventListener('keydown', onDown);
+    }
+  }
+
+  // ⚠️ The DEVICE side is worse than the editor's, and that is why this file needs its own case.
+  // On Electron, Chromium at least blanks an unrecognised name; here `new KeyboardEvent({key:'Excape'})`
+  // is a perfectly well-formed event CARRYING the typo, so it bubbles to window, matches no listener,
+  // and the reply said `ok (key Excape)`. Nothing downstream could tell it from a real press.
+  it('an unrecognised key name is refused, and no key is pressed', async () => {
+    const { reply, downs } = await pressKeyName('Excape');
+    expect(reply).toMatch(/^Error: press-key key: unrecognised key name "Excape" — nothing was dispatched/);
+    expect(downs).toEqual([]);
+  });
+
+  it('`NumpadEnter` — a DOM `code` where a `key` was wanted — is refused and told so', async () => {
+    const { reply, downs } = await pressKeyName('NumpadEnter');
+    expect(reply).toMatch(/KeyboardEvent\.key, not \.code/);
+    expect(downs).toEqual([]);
+  });
+
+  // The divergence #1094 filed: `Up` drove the editor (KEYCODE_ALIAS) and did nothing here.
+  it('an alias is NORMALISED, so the same request drives the device and the editor alike', async () => {
+    const { reply, downs } = await pressKeyName('Up');
+    expect(reply).toMatch(/^ok \(key ArrowUp\)/);
+    expect(downs.map((e) => [e.key, e.code])).toEqual([['ArrowUp', 'ArrowUp']]);
+  });
+
+  it('ACCEPT: a canonical name and a single character both still reach the event', async () => {
+    expect((await pressKeyName('Escape')).downs.map((e) => e.key)).toEqual(['Escape']);
+    expect((await pressKeyName('w')).downs.map((e) => [e.key, e.code])).toEqual([['w', 'KeyW']]);
+  });
+
+  // ⚠️ The review finding the first cut of these tests MISSED, because they asserted [key, code] for
+  // `Up` and only `key` for everything else. #1094's normalisation rewrites `Space` to the canonical
+  // DOM key `' '`, and `code` was derived from `key` — so it fixed `e.key` and BROKE `e.code` on the
+  // same call. `e.code === 'Space'` is the idiomatic spacebar test precisely because `e.key` is an
+  // easily-missed single space, so this is the assertion that matters for a spacebar binding.
+  it('the spacebar keeps code "Space" under both spellings', async () => {
+    expect((await pressKeyName('Space')).downs.map((e) => [e.key, e.code])).toEqual([[' ', 'Space']]);
+    expect((await pressKeyName(' ')).downs.map((e) => [e.key, e.code])).toEqual([[' ', 'Space']]);
+  });
+
+  it('a bare modifier press reports the side, as a real keyboard does', async () => {
+    expect((await pressKeyName('Shift')).downs.map((e) => [e.key, e.code])).toEqual([['Shift', 'ShiftLeft']]);
+    expect((await pressKeyName('Meta')).downs.map((e) => [e.key, e.code])).toEqual([['Meta', 'MetaLeft']]);
+  });
+
+  // ⚠️ …and reports ITSELF as held. The first cut asserted `[key, code]` only and was green while
+  // `{key:'Shift'}` sent `shiftKey:false` — so a game latching `shift = e.shiftKey` on keydown got
+  // the OPPOSITE of the key it was sent. `rendererOps.ts` already states this rule for drags.
+  it.each([
+    ['Shift', 'shiftKey'], ['Control', 'ctrlKey'], ['Alt', 'altKey'], ['Meta', 'metaKey'],
+  ] as const)('%s reports %s true on its own keydown', async (key, flag) => {
+    const { downs } = await pressKeyName(key);
+    expect(downs).toHaveLength(1);
+    expect(downs[0][flag]).toBe(true);
+  });
+
+  it('ACCEPT: a non-modifier key reports none of them held', async () => {
+    const { downs } = await pressKeyName('Escape');
+    expect([downs[0].shiftKey, downs[0].ctrlKey, downs[0].altKey, downs[0].metaKey]).toEqual([false, false, false, false]);
+  });
+});

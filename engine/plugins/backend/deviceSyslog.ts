@@ -139,7 +139,17 @@ export function captureIosSyslog(opts: {
       else resolve({ lines: [...ring], capturedFor: seconds, truncated });
     };
 
-    const timer = setTimeout(() => finish(), seconds * 1000);
+    // START THE WINDOW WHEN THE CHILD IS UP, not when we asked for it. `seconds` is a window of
+    // SYSLOG, and process launch is not syslog: counting fork/exec against it silently shortens
+    // every capture by however long the host took to start the binary. That is invisible on an idle
+    // machine and load-dependent everywhere else — under a loaded `npm run verify` a 1 s capture
+    // could return EMPTY because the whole window elapsed before the child ran a single write, which
+    // is indistinguishable from "the device logged nothing" (the one answer this module is careful
+    // not to fake). Node emits 'spawn' before any other child event and before any stdout, so no
+    // line can be missed by waiting for it; if the spawn fails, 'error' fires instead, `timer` stays
+    // undefined and `clearTimeout(undefined)` is a no-op.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    child.on('spawn', () => { timer = setTimeout(() => finish(), seconds * 1000); });
 
     child.stdout.on('data', (buf: Buffer) => {
       pending += buf.toString();

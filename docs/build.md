@@ -101,7 +101,18 @@ A game with no `ios/`/`android/` yet is **auto-scaffolded on the first native bu
 `capacitor.config.json` + vendor plugins → `npm install` → web build → `npx cap add` → heal.
 It then continues into the build, pausing first only if the scaffold surfaces a warning you
 must act on (e.g. missing Firebase config). The explicit **Add … Target** menu items do just
-the scaffold. **A folder left behind by an interrupted scaffold** (editor killed / dialog closed
+the scaffold.
+
+⚠️ **That pause is what made an unreadable `package.json` dangerous (#1096).**
+`detectMissingFirebase` read the project's manifest to decide whether Firebase is in use, and a
+single `catch` returned `[]` for *"no Firebase"* and *"could not read the manifest"* alike. `[]`
+means no warning, no warning means no pause, so a truncated or merge-conflicted `package.json` in a
+project that DOES use Firebase let the build run to completion and ship an app that crashes on
+launch in `FirebaseApp.configure` — with a `✅` on the console. It now reports the unreadable case
+as its own warning, which pauses the build the same way a genuinely missing
+`GoogleService-Info.plist` does. A **missing** `package.json` stays silent: several projects in this
+repo legitimately have none, and treating absent as unknown was the error #731's review caught at
+the twin site. **A folder left behind by an interrupted scaffold** (editor killed / dialog closed
 mid-`cap add`) **is detected as incomplete and repaired automatically on the next attempt**,
 rather than being permanently misread as "already scaffolded" (#581) —
 `isNativeTargetScaffolded` in `addNativeTarget.ts` is the authoritative check, not folder

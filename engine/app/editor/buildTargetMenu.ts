@@ -143,10 +143,25 @@ export function iosTargetRows(list: DeviceListReply | null, target: DeviceTarget
     patch: { iosDeviceId: d.udid, iosDevicectlId: d.devicectl ? d.udid : '' },
   }));
   if (target.iosDeviceId && !devices.some((d) => d.udid === target.iosDeviceId)) {
-    rows.push({ label: `${target.iosDeviceId} — not attached`, checked: true, disabled: true });
+    // ⚠️ "not attached" is the same false hardware claim as "plug one in", and this row is what a
+    // user who has ALREADY picked their build phone sees — so the note has to reach here too, not
+    // only the no-rows fallback below (#1096; the first cut put it only in the fallback, which that
+    // user can never reach).
+    rows.push({
+      label: list?.iosNote ? `${target.iosDeviceId} — ${list.iosNote}` : `${target.iosDeviceId} — not attached`,
+      checked: true,
+      disabled: true,
+    });
   }
   if (!rows.length) {
-    return [{ label: 'No iOS device paired — plug one in and unlock it', checked: false, disabled: true }];
+    // #1096: "plug one in" is FALSE ADVICE when the phone is already plugged in and the LISTING is
+    // what broke, which is exactly the case `iosNote` reports. Mirrors the adb arm below, which has
+    // always drawn this distinction with `list.note`.
+    return [{
+      label: list?.iosNote ?? 'No iOS device paired — plug one in and unlock it',
+      checked: false,
+      disabled: true,
+    }];
   }
   return rows;
 }

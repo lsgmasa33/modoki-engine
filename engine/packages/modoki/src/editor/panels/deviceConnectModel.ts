@@ -122,6 +122,11 @@ export interface DeviceListReply {
   /** Set when adb itself is missing, so the panel can say THAT instead of rendering an empty list
    *  that reads as "no devices attached". */
   note?: string;
+  /** The iOS counterpart of `note` (#1096): set only when `ios` came back EMPTY *and* a listing
+   *  source (devicectl / xctrace / go-ios) failed, so a picker can say "could not check" instead of
+   *  "no iPhone is paired". Every consumer of `note` must render this too — an empty iOS list with
+   *  a reason nobody shows is the same silent absence #1096 exists to remove. */
+  iosNote?: string;
 }
 
 export async function fetchDeviceList(signal?: AbortSignal): Promise<DeviceListReply | null> {

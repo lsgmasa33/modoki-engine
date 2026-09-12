@@ -6,10 +6,10 @@ import path from 'node:path';
 import { reapDeps } from '../../plugins/backend/iosUsbForward';
 import { readScannedSource } from '@modoki/engine/testing';
 import {
-  parseIosDevices, resolveIosDevice, ensureWdaRunning, stopWda,
+  parseIosDevices, parseIosDevicesResult, resolveIosDevice, ensureWdaRunning, stopWda,
   isWdaProcessRunning, _resetWdaLauncherForTests, WDA_PROBE_TIMEOUT_MS,
   parseXctraceDevices, mergeIosDevices, mergeGoIosDevices, pickWdaFailureLine, describeExecFailure,
-  _devicectlOutPath, listIosDevicesForSelection, wdaLauncherExec, _clearIosListCache,
+  _devicectlOutPath, listIosDevicesForSelection, listIosDevicesForSelectionResult, wdaLauncherExec, _clearIosListCache,
   reapRecordedWdaAgent, killWdaChildOnExit, WDA_RECORD_FILE,
 } from '../../plugins/backend/wdaLauncher';
 
@@ -74,6 +74,94 @@ describe('parseIosDevices', () => {
     expect(parseIosDevices(listing([{ udid: 'W', name: 'Watch', platform: 'watchOS' }]))).toEqual([]);
     expect(parseIosDevices('not json')).toEqual([]);
     expect(parseIosDevices('{}')).toEqual([]);
+  });
+});
+
+describe('a broken iOS listing does not read as "no phone is paired" (#1096)', () => {
+  // #731's mechanism: `[]` meant both "this Mac has no paired iPhone" and "the listing broke", and
+  // `resolveIosDevice` turns the empty list into a definite claim about the hardware that
+  // `ensureWdaRunning` LATCHES for the rest of the lease. The module's own `devicectlOutPath`
+  // docblock already recorded the consequence — a torn read making trusted iOS input look degraded
+  // all session, exactly like an unplugged phone.
+
+  it('a devicectl document that will not parse is MALFORMED, not empty', () => {
+    const torn = parseIosDevicesResult('{"result": {"devices": [{"hardwarePro');
+    expect(torn).toEqual({ devices: [], malformed: true });
+  });
+
+  it('ACCEPT: a well-formed document with no iOS devices is NOT malformed — the case that must stay quiet', () => {
+    expect(parseIosDevicesResult('{"result":{"devices":[]}}')).toEqual({ devices: [], malformed: false });
+    // A document listing only a non-iOS device is also a clean, complete answer.
+    expect(parseIosDevicesResult('{"result":{"devices":[{"hardwareProperties":{"platform":"macOS","udid":"x"}}]}}'))
+      .toEqual({ devices: [], malformed: false });
+  });
+
+  it('the plain parse still answers exactly as before, for every caller that does not branch', () => {
+    expect(parseIosDevices('{"result": {"devices": [{"hardwarePro')).toEqual([]);
+  });
+
+  it('resolveIosDevice says "could not tell" when a source failed, not "no iOS device is paired"', () => {
+    const r = resolveIosDevice([], {}, undefined, ['devicectl could not be run (spawn xcrun ENOENT)']) as { error: string };
+    expect(r.error).toMatch(/could not tell whether an iOS device is paired/);
+    expect(r.error).toMatch(/devicectl could not be run/);
+    // The distinction is the whole value: the old message told you to plug a phone in, which is
+    // wrong and unhelpful advice when the phone is already plugged in and the LISTING is what broke.
+    expect(r.error).not.toMatch(/^no iOS device is paired/);
+  });
+
+  it('ACCEPT: with every source answering, an empty list still means exactly what it says', () => {
+    expect((resolveIosDevice([], {}) as { error: string }).error).toBe('no iOS device is paired with this Mac');
+    expect((resolveIosDevice([], {}, undefined, []) as { error: string }).error).toBe('no iOS device is paired with this Mac');
+  });
+
+  it('the SYNC path (ensureWdaRunning) records its source failures too, not just the async one', async () => {
+    // ⚠️ The review finding. The async listing was fixed and the sync twin was not, so the exact
+    // case #1096 names — xctrace broken, an iOS <=16 phone attached, devicectl legitimately empty —
+    // still came back "no iOS device is paired with this Mac", latched into `lastFailure` for the
+    // whole lease. xctrace is the ONLY source that sees that device, which is what makes this the
+    // one that mattered.
+    _resetWdaLauncherForTests();
+    const r = await ensureWdaRunning({
+      host: 'd', port: 8100, platform: 'darwin', sleep: async () => {}, probe: async () => false,
+      xctestrun: '/fake/WDA.xctestrun',
+      listDevices: () => '{"result":{"devices":[]}}',
+      listLegacyDevices: () => { throw new Error('xctrace exploded'); },
+    });
+    expect(r.running).toBe(false);
+    expect(r.reason).toMatch(/could not tell whether an iOS device is paired/);
+    expect(r.reason).toMatch(/xctrace could not be run/);
+    expect(r.reason).not.toMatch(/no iOS device is paired with this Mac/);
+  });
+
+  it('⚠️ the sync listing helpers do not SWALLOW — the injected-seam test above cannot see this', async () => {
+    // Review finding, and worth stating precisely: the test below injects `opts.listLegacyDevices`,
+    // so it exercises `ensureWdaRunning`'s collection and never runs `listLegacyDevicesSync` at all.
+    // Re-adding that helper's `catch { return ''; }` reinstates the #1096 bug verbatim with the whole
+    // suite green — measured. The helper has no other caller and cannot be stubbed (it is called
+    // through `legacyDefault`, not through `opts`), so the guard is on the SOURCE, the same shape
+    // this file already uses for DEVICECTL_ARGV.
+    const src = readScannedSource(path.join(__dirname, '../../plugins/backend/wdaLauncher.ts')).code;
+    const body = /listLegacyDevicesSync\(\): string \{([\s\S]*?)\n {2}\},/.exec(src)?.[1];
+    expect(body, 'listLegacyDevicesSync is gone — this guard no longer guards anything').toBeDefined();
+    expect(body!, 'a swallowed xctrace failure reads as "no legacy devices", which is #1096').not.toMatch(/catch/);
+  });
+
+  it('ACCEPT: with both sync sources answering, an empty listing still says "no iOS device is paired"', async () => {
+    _resetWdaLauncherForTests();
+    const r = await ensureWdaRunning({
+      host: 'd', port: 8100, platform: 'darwin', sleep: async () => {}, probe: async () => false,
+      xctestrun: '/fake/WDA.xctestrun',
+      listDevices: () => '{"result":{"devices":[]}}',
+      listLegacyDevices: () => '',
+    });
+    expect(r.reason).toMatch(/no iOS device is paired with this Mac/);
+  });
+
+  it('a source failure is NOT reported when devices were still found — it would be noise', () => {
+    const found = resolveIosDevice(
+      [{ udid: 'AAA', name: 'iPhone8', connected: true }], {}, undefined, ['xctrace could not be run (boom)'],
+    );
+    expect('error' in found).toBe(false);
   });
 });
 
@@ -1021,23 +1109,33 @@ describe('the iOS listing coalesces concurrent misses', () => {
     }
   });
 
-  it('a FAILED listing does not wedge every later call', async () => {
-    // The in-flight slot must be released on rejection too, or one bad listing poisons the picker
-    // for the life of the process.
+  it('a listing whose sources ALL failed resolves empty and NAMES them, and does not wedge later calls', async () => {
+    // #1096: the empty list must carry its reasons, or it reads as "this Mac has no iPhone".
     const real = { d: wdaLauncherExec.listDevices, g: wdaLauncherExec.listLegacyDevices, l: wdaLauncherExec.listGoIosUdids };
     try {
       _clearIosListCache();
       wdaLauncherExec.listDevices = async () => { throw new Error('no devicectl'); };
       wdaLauncherExec.listLegacyDevices = async () => { throw new Error('boom'); };
       wdaLauncherExec.listGoIosUdids = async () => [];
-      // The stub REPLACES `listLegacyDevices`' own try/catch, so this rejection reaches the
-      // listing — which is precisely the case worth pinning: `.finally()` must release the
-      // in-flight slot on the failure path too.
-      await expect(listIosDevicesForSelection()).rejects.toThrow('boom');
-      // ⚠️ NO `_clearIosListCache()` here, deliberately. That helper nulls the in-flight slot
-      // itself, so clearing between the two calls would exercise the helper instead of the
-      // `.finally()` release and the assertion would pass with the release deleted — it did, on
-      // the first draft of this test.
+      // ⚠️ REWRITTEN for #1096, and the change of contract is the point. This used to assert the
+      // listing REJECTED — `listLegacyDevices` let its failure escape, so one broken source took the
+      // whole picker down. It no longer can: a source that fails is RECORDED, not propagated and not
+      // swallowed, so the call resolves to an empty list that SAYS why it is empty. The in-flight
+      // slot release this test exists for is still proven, by the un-wedged second call below.
+      const failed = await listIosDevicesForSelectionResult();
+      expect(failed.devices).toEqual([]);
+      expect(failed.unavailable.join(' ')).toMatch(/xctrace could not be run \(boom\)/);
+      // Both broken sources are named, not just the first — a reader chasing "why is my phone
+      // missing" needs every reason, and reporting one would send them to fix half of it.
+      expect(failed.unavailable.join(' ')).toMatch(/devicectl could not be run \(no devicectl\)/);
+      // ⚠️ The old version asserted here WITHOUT clearing the cache, because a rejected listing
+      // cached nothing. A recorded failure resolves, so it caches like any other answer and the
+      // second call is served from it — meaning the `.finally()` slot release can no longer be
+      // observed from this path at all. Said plainly rather than left as a test that looks like it
+      // still proves it: source failures no longer reject, so there is no rejection to release on.
+      // The 10s TTL is the deliberate cost — a transient failure answers for at most one cache
+      // window, where before it answered "no iOS device is paired" with nothing saying why.
+      _clearIosListCache();
       wdaLauncherExec.listLegacyDevices = async () => '';
       wdaLauncherExec.listGoIosUdids = async () => ['BBB'];
       const second = await listIosDevicesForSelection();

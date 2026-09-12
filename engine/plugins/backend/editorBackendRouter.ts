@@ -209,7 +209,7 @@ import { UNCLAMPED_OVERRIDES } from '../../packages/modoki/src/runtime/rendering
 // (even `import type`) pulls its whole `document`/`requestAnimationFrame`-using file into that
 // program and fails `tsc -b engine` (confirmed: `document`/`DOMHighResTimeStamp`/etc. unresolvable
 // there). See `frameLoopStatus.ts`'s header for the full story. Its whole purpose here is
-// `refuseUndeliverableDeviceInput`'s `InputDeliverabilityReply.frameLoop.status` field below, which
+// `probeInputDeliverability`'s `InputDeliverabilityReply.frameLoop.status` field below, which
 // used to be a locally re-declared `string` — see that interface's comment for why a bare `string`
 // silently disarms the guard on a rename that `bridge.ts`'s type-checked twin would catch.
 import type { FrameLoopStatus } from '../../packages/modoki/src/runtime/rendering/frameLoopStatus';
@@ -234,7 +234,7 @@ import { adbDeviceId, iosDeviceId, listClaims, type DeviceClaim } from './device
 import { tryDeviceCdpInput, isDeviceCdpAvailable, synthFallbackBanner, TRUSTED_CDP_MECHANISM, isCdpRoutableMethod } from './deviceCdp';
 import { tryDeviceWdaInput, isDeviceWdaAvailable, tryDeviceWdaScreenshot, captureDeviceWdaLease, isWdaRoutableMethod, TRUSTED_WDA_MECHANISM, WDA_NOT_IOS_REASON, WDA_NEEDS_WIFI_REASON, NO_WDA_ON_THIS_DEVICE } from './deviceWda';
 import { isDeviceFailureReply } from './deviceAim';
-import { listIosDevicesForSelection } from './wdaLauncher';
+import { listIosDevicesForSelectionResult } from './wdaLauncher';
 import { captureIosSyslog, resolveGoIos } from './deviceSyslog';
 import { resolveGoIosDevice, listGoIosUdids, pickHostSidePlatform, leaseForIosOps } from './goIosDevice';
 import { readAndroidDiagnostics, readAndroidSystemLog } from './deviceAndroidDiag';
@@ -692,8 +692,25 @@ interface InputDeliverabilityReply {
   frameLoop?: { status?: FrameLoopStatus; unrecoverable?: boolean; detail?: string; msSinceLastFrame?: number };
 }
 
-async function refuseUndeliverableDeviceInput(method: string, deadlineMs?: number): Promise<string | null> {
-  if (!isCdpRoutableMethod(method)) return null;
+/** What the deliverability probe actually learned — #731's additive `…Result` shape (#1096).
+ *
+ *  The four `unchecked` causes used to be indistinguishable from `deliverable`: both were `null`, and
+ *  the caller's bare truthiness branch dispatched. So the guard whose own message says *"Dispatching
+ *  this input now would report success while the game never receives it"* turned ITSELF off, silently,
+ *  on a flaky probe — #682's failure mode reproduced inside #682's own guard.
+ *
+ *  ⚠️ The POLARITY does not change, and that is deliberate. Fail-open is the documented rule above
+ *  (`releaseHeldBeforeTrustedGesture` follows it too): a refused tap is a broken tool, where an
+ *  unqualified one is only a missing hint. What changes is that "could not check" is now SAYABLE, so
+ *  the caller can dispatch AND say so, instead of dispatching while looking certain. */
+type DeliverabilityProbe =
+  | { kind: 'not-applicable' }
+  | { kind: 'deliverable' }
+  | { kind: 'refuse'; error: string }
+  | { kind: 'unchecked'; reason: string };
+
+async function probeInputDeliverability(method: string, deadlineMs?: number): Promise<DeliverabilityProbe> {
+  if (!isCdpRoutableMethod(method)) return { kind: 'not-applicable' };
   let raw: unknown;
   // `deadlineMs` is the SAME op-sized transport deadline `/api/device/request`'s own `proxy`
   // helper already computes (#153) from the request's `params.timeoutMs` (line ~1014 above) —
@@ -702,15 +719,41 @@ async function refuseUndeliverableDeviceInput(method: string, deadlineMs?: numbe
   // `timeoutMs`, so `deadlineMs` is `undefined` for every real caller today and this probe still
   // rides the flat 5000ms default — the extra-round-trip cost this comment describes only bites a
   // caller that supplies `timeoutMs` (LOW 5, #682 close-out round 3).
-  try { raw = await deviceConnection.proxy('input-deliverability', {}, deadlineMs); } catch { return null; }
-  if (isDeviceFailureReply(raw)) return null; // old bridge, or the op genuinely errored — fall through
+  try { raw = await deviceConnection.proxy('input-deliverability', {}, deadlineMs); } catch (e) {
+    return { kind: 'unchecked', reason: `the probe threw (${e instanceof Error ? e.message : String(e)})` };
+  }
+  // ⚠️ `Unknown method:` is the op being ABSENT — an app build predating `input-deliverability`
+  // answers exactly that — and absent is not unknown, so it is silent for the same reason the
+  // missing `frameLoop` field below is. Without this split the banner rides EVERY tap/drag/
+  // press-key/hover/scroll for the life of that build: permanent and unactionable, which is the
+  // failure the `!fl` comment promises not to commit. `deviceAim.ts:72` already draws this exact
+  // line (`Unknown method:` → `unsupported`, `Error:` → a real refusal); `isDeviceFailureReply`
+  // deliberately matches BOTH prefixes, so testing it alone cannot tell them apart.
+  if (typeof raw === 'string' && raw.startsWith('Unknown method:')) return { kind: 'not-applicable' };
+  if (isDeviceFailureReply(raw)) {
+    return { kind: 'unchecked', reason: 'the device answered an error to the probe' };
+  }
   let obj: InputDeliverabilityReply;
-  try { obj = (typeof raw === 'string' ? JSON.parse(raw) : raw) as InputDeliverabilityReply; } catch { return null; }
+  try { obj = (typeof raw === 'string' ? JSON.parse(raw) : raw) as InputDeliverabilityReply; } catch {
+    return { kind: 'unchecked', reason: 'the reply did not parse as JSON' };
+  }
   const fl = obj?.frameLoop;
-  if (!fl || (fl.status !== 'stalled' && !fl.unrecoverable)) return null;
-  return `Error: refusing ${method} — ${fl.detail ?? `the frame loop has not ticked for ${fl.msSinceLastFrame}ms`} `
-    + 'Dispatching this input now would report success while the game never receives it.';
+  // ⚠️ A parsed reply with NO `frameLoop` is ABSENT, not unknown, and stays SILENT — this is #731's
+  // ENOENT split, and getting it wrong in the other direction is #731's own recorded scar. An app
+  // build predating the field cannot report frame-loop health at all, so there is nothing to check
+  // here and never will be for that build; announcing "could not check" on every input op against
+  // it would be a permanent, unactionable banner. The cases below it — a throw, an unparseable
+  // reply, an error answer — are a device that SHOULD be able to answer and did not, which is the
+  // genuine unknown this discriminant exists for.
+  if (!fl) return { kind: 'not-applicable' };
+  if (fl.status !== 'stalled' && !fl.unrecoverable) return { kind: 'deliverable' };
+  return {
+    kind: 'refuse',
+    error: `Error: refusing ${method} — ${fl.detail ?? `the frame loop has not ticked for ${fl.msSinceLastFrame}ms`} `
+      + 'Dispatching this input now would report success while the game never receives it.',
+  };
 }
+
 
 /**
  * Dispatch a backend request. Returns a BackendResult, or `null` if the path is
@@ -1447,9 +1490,15 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     // `await`ed, not fired sync: this route runs inside the Electron main process and the AI panel
     // polls it every 2.5s, so a sync exec here froze the whole editor's input for ~1.4s every ~10s
     // (#168) — `listIosDevicesForSelection`/`wdaLauncherExec` now shell out via async `execFile`.
-    const ios = process.platform === 'darwin'
-      ? (await listIosDevicesForSelection()).map((d) => ({ ...d, claim: claimFor(iosDeviceId(d.udid)) ?? null }))
-      : [];
+    // #1096: `iosUnavailable` is what stops an EMPTY `ios` reading as "this Mac has no iPhone". The
+    // adb arm below has always drawn that distinction (`note:` when adb is missing); the iOS arm
+    // had no equivalent, so a broken devicectl/xctrace/go-ios listing rendered as a picker with no
+    // iOS rows and nothing saying why — which is precisely how an iOS <=16 device went missing from
+    // its own picker (see `wdaLauncherExec.listGoIosUdids`).
+    const iosListing = process.platform === 'darwin'
+      ? await listIosDevicesForSelectionResult()
+      : { devices: [], unavailable: [] };
+    const ios = iosListing.devices.map((d) => ({ ...d, claim: claimFor(iosDeviceId(d.udid)) ?? null }));
     // A WiFi lease claims by ADDRESS, so its claim matches no hardware entry above. Surfaced
     // separately rather than dropped: "someone holds 192.168.1.42" is exactly the collision a
     // second session needs to see, and it is invisible in either hardware list.
@@ -1465,6 +1514,11 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       // to select it. `clone`+`pid` are the two fields a claim carries that identify a holder.
       self: { clone: process.cwd(), pid: process.pid },
       ...(adbPath ? {} : { note: 'adb is not installed, so Android devices cannot be listed — install the Android SDK from Build Support (or set ANDROID_HOME).' }),
+      // Only when the listing came back EMPTY: a source that broke while others still found phones
+      // costs nothing to stay quiet about, and reporting it on every poll would be noise.
+      ...(iosListing.unavailable.length && ios.length === 0
+        ? { iosNote: `an empty iOS list here does NOT mean no iPhone is paired — ${iosListing.unavailable.join('; ')}.` }
+        : {}),
     });
   }
   if (urlPath === '/api/device/connect' && method === 'POST') {
@@ -1492,10 +1546,11 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
   if (urlPath === '/api/device/request' && method === 'POST') {
     const b = (body ?? {}) as { method?: string; params?: Record<string, unknown> };
     if (!b.method) return json({ error: 'method required' }, 400);
-    // An unknown input VOCABULARY value (#1076) — `pointer`'s button/action, `press-key`'s modifiers —
-    // is refused here, before any transport is chosen: CDP dispatches `press-key` itself and never
+    // An unknown input VOCABULARY value (#1076) — `pointer`'s button/action, `press-key`'s modifiers
+    // and (#1094) the KEY NAME on `press-key`/`type-text` — is refused here, before any transport is
+    // chosen: CDP dispatches `press-key` itself and never
     // reaches the bridge handler, and the device's own build may predate the handler's refusal. The
-    // same shape as `refuseUndeliverableDeviceInput`'s reply, so the tools read it as a failure.
+    // same shape as `probeInputDeliverability`'s refusal, so the tools read it as a failure.
     const unknownVocab = refuseDeviceInputVocabulary(b.method, b.params ?? {});
     if (unknownVocab) return json({ result: `Error: ${unknownVocab.error}` });
     try {
@@ -1800,11 +1855,39 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       }
       // #682 close-out (HIGH 1): ask BEFORE any CDP/WDA session discovery, so a dead frame loop
       // costs one cheap round trip instead of a wasted adb/WDA probe as well. See
-      // `refuseUndeliverableDeviceInput`'s docblock for why this dispatch — not `handleResolveAim`
+      // `probeInputDeliverability`'s docblock for why this dispatch — not `handleResolveAim`
       // — is the chokepoint that provably covers all five CDP-routable methods, `press-key`
       // included.
-      const undeliverable = await refuseUndeliverableDeviceInput(b.method, deadline);
-      if (undeliverable) return json({ result: undeliverable });
+      const deliverability = await probeInputDeliverability(b.method, deadline);
+      if (deliverability.kind === 'refuse') return json({ result: deliverability.error });
+      // #1096: a probe that could not answer keeps dispatching (the polarity is deliberate — see
+      // `probeInputDeliverability`), but it no longer looks like a clean bill of health. Carried on
+      // the reply the same way `inputFidelityWarning` carries the synthetic-fallback banner below,
+      // because that is the channel the device tools already read.
+      const uncheckedNote = deliverability.kind === 'unchecked'
+        ? `⚠️ could not confirm this device can deliver input — ${deliverability.reason}. `
+          + 'It was dispatched anyway (a probe that cannot answer must never refuse the input), so a '
+          + 'success below is NOT evidence the game received it.'
+        : null;
+      // ⚠️ Only onto a reply that reports SUCCESS. The note's whole claim is "a success below is not
+      // evidence the game received it" — fronting an ERROR with it states the opposite of what
+      // happened (nothing was dispatched, and the reply already says why), which is worse than
+      // staying quiet. Caught by #1077's lease-ended test, which this change had prefixed with
+      // "it was dispatched anyway" about a call that dispatched nothing.
+      // ⚠️ `failed` is judged on the RAW reply, never on the composed string. The synthetic-fallback
+      // path hands this `${banner}\n${synthetic}`, and with the banner in front an `Error: …` reply
+      // no longer starts with `Error:` — so testing the composed value silently let the note back
+      // onto exactly the failures it must stay off.
+      // STRING replies only, and that is the whole domain rather than a limitation: `uncheckedNote`
+      // is non-null only for a CDP-routable method, and all five (tap/drag/press-key/hover/scroll)
+      // answer with a string — `type-text`, the one device op returning an object, is not routable.
+      // An earlier cut carried an object branch with its own `ok === false` suppression; it could
+      // never execute, and dead code that LOOKS like a guard is how the next reader concludes the
+      // case is handled. A non-string passes through untouched instead.
+      const withNote = (result: unknown, failed = isDeviceFailureReply(result)): unknown => {
+        if (!uncheckedNote || failed || typeof result !== 'string') return result;
+        return `${uncheckedNote}\n${result}`;
+      };
       // GATED ON THE DEVICE BEING ANDROID, and on the CDP target being THIS lease's app (#142).
       // The mirror of the iOS gate below, and it was missing: CDP discovery runs entirely through
       // adb (`/proc/net/unix` → `adb forward`) and knows nothing about the lease, so "a CDP route
@@ -1862,7 +1945,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
         // the caller's banner should name the cause, and "not a WDA op" is not the cause.
         if (wda.handled || wda.reason) outcome = wda;
       }
-      if (outcome.handled) return json({ result: outcome.reply });
+      if (outcome.handled) return json({ result: withNote(outcome.reply) });
       // The op's own deadline applies here too — this is the path a `device_eval` actually takes.
       const synthetic = await deviceConnection.proxy(b.method, b.params ?? {}, deadline);
       // An INPUT op that could have been trusted but wasn't: front the reply with a loud banner
@@ -1873,12 +1956,12 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
         // Two reply shapes to carry it on: the string handlers get a PREFIX; `type-text` returns an
         // object, so it gets a field. Without the object case that op would warn about nothing —
         // the same silent-synthetic gap, just hidden behind a different return type.
-        if (typeof synthetic === 'string') return json({ result: `${banner}\n${synthetic}` });
+        if (typeof synthetic === 'string') return json({ result: withNote(`${banner}\n${synthetic}`, isDeviceFailureReply(synthetic)) });
         if (synthetic && typeof synthetic === 'object') {
-          return json({ result: { ...(synthetic as Record<string, unknown>), inputFidelityWarning: banner } });
+          return json({ result: withNote({ ...(synthetic as Record<string, unknown>), inputFidelityWarning: banner }) });
         }
       }
-      return json({ result: synthetic });
+      return json({ result: withNote(synthetic) });
     }
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, 502); }
   }

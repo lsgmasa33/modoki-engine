@@ -9,7 +9,7 @@ import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
 import { ALLOW_OCCLUDED_BASE, MODIFIERS_BASE, allowOccludedParam, makeEntitySpec, modifierEnum, makePointSpec } from '../shapes.js';
-import { MOUSE_BUTTONS, POINTER_ACTIONS } from '../../../shared/inputVocabulary.js';
+import { KEY_ARG_DESCRIPTION, MOUSE_BUTTONS, POINTER_ACTIONS } from '../../../shared/inputVocabulary.js';
 
 export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
   const { getJson, postJson, evalRenderer, editorAction } = ctx;
@@ -240,7 +240,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'Windows/Linux F12) reaches page handlers here but behaves differently for a human. ' +
       'Requires the Electron editor.',
     {
-      key: z.string().describe("Electron keyCode, e.g. 'Escape', 'Delete', 'ArrowLeft', 'w', 'z'."),
+      key: z.string().describe(KEY_ARG_DESCRIPTION),
       modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}, e.g. ['meta'] for Cmd+key.`),
       panel: z.string().optional().describe(
         'Focus this panel BEFORE pressing, so a panel-scoped chord resolves there. Ids (CASE-'
@@ -456,7 +456,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
     {
       text: z.string().describe('Text to type into the focused input.'),
       clearFirst: z.boolean().optional().describe('Empty the field before typing (replace vs append). A field it could not empty is reported as an ERROR naming what is still in it, never a silent append.'),
-      submitKey: z.string().optional().describe("Terminal key after typing: 'Enter', 'Tab', or 'Escape'."),
+      submitKey: z.string().optional().describe(`Terminal key pressed after typing ('Enter' submits; 'Tab'/'Escape' blur). ${KEY_ARG_DESCRIPTION}`),
     },
     async ({ text, clearFirst, submitKey }) => postJson('/api/input/type', { text, clearFirst, submitKey }),
   );

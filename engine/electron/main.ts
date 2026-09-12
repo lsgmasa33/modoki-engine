@@ -253,7 +253,7 @@ import { startBackendServer, type BackendServerHandle, type HostRoutes } from '.
 import type { LiveReloadKind } from '../plugins/vite-asset-scanner';
 import { captureViewport, CaptureUnavailableError, captureRefusalBody, tap, drag, hover, scroll, pointerDown, pointerMove, pointerUp, pressKey, typeText, focusElement, captureGesture } from './rendererOps';
 import type { RenderSurfaceFacts } from './rendererOps';
-import { createInputRoutes, inputDeliverability, hiddenWindowRefusal } from './inputRoutes';
+import { createInputRoutes, inputDeliverabilityResult, hiddenWindowRefusal } from './inputRoutes';
 import { reportFatalStartup } from './fatalDialog';
 import { showMessageBox, resolveDialogParent } from './mainDialog';
 import { serializeMenu, triggerMenuItem, type MenuItemLike } from './menuActions';
@@ -1647,7 +1647,10 @@ app.whenReady().then(async () => {
       // The same gate `/api/input/*` applies, reached through the shared helper rather than a
       // second copy of the rule (this route drives its own drag through rendererOps, so it does
       // not pass through createInputRoutes).
-      const gestureRefusal = hiddenWindowRefusal(await inputDeliverability(requestRenderer), 'the drag this samples');
+      // #1096: the Result twin, so a probe that could not answer is distinguishable here too — this
+      // is the one trusted-input path that does NOT go through `/api/input/*`'s chokepoint.
+      const gestureProbe = await inputDeliverabilityResult(requestRenderer);
+      const gestureRefusal = hiddenWindowRefusal(gestureProbe.live, 'the drag this samples');
       if (gestureRefusal) return gestureRefusal;
       // …and for the same reason it borrows that gate: this drag is a mouse gesture, so it cannot
       // coexist with a sustained `/api/input/pointer` press. The routes that DO flow through

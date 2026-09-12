@@ -276,12 +276,33 @@ export function ensureCapacitorConfig(projectRoot: string, cfg: ProjectConfig): 
  *  the app will crash on launch (FirebaseApp.configure throws). Returns
  *  human-readable warnings (empty = nothing missing / no Firebase). */
 export function detectMissingFirebase(projectRoot: string, platform: NativePlatform): string[] {
+  return detectMissingFirebaseResult(projectRoot, platform).warnings;
+}
+
+/** {@link detectMissingFirebase} plus WHETHER the project's `package.json` could be read (#1096).
+ *
+ *  The docblock above promises `empty = nothing missing / no Firebase`, and the old single `catch`
+ *  could not keep it: an unreadable `package.json` also returned `[]`. That matters because of what
+ *  the caller does with the list — `vite-asset-scanner`'s build path PAUSES the build on a non-empty
+ *  one, so `[]` from a truncated or merge-conflicted manifest let a Firebase build run to completion
+ *  and ship an app that crashes on launch in `FirebaseApp.configure`, with a `✅` on the console.
+ *
+ *  ⚠️ A MISSING `package.json` is a THIRD case — ABSENT, not unknown — and stays SILENT
+ *  (`reason: null`). Several real projects genuinely have none, and #731's own review found that
+ *  reporting "could not check" for those was false. Only a manifest that EXISTS and will not
+ *  read/parse is the genuine unknown. Same split, same reason, as `verifyInstalledMatchesTarballResult`. */
+export function detectMissingFirebaseResult(
+  projectRoot: string, platform: NativePlatform,
+): { warnings: string[]; reason: null | 'unreadable-package-json' } {
   let deps: Record<string, string>;
   try {
     deps = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8')).dependencies ?? {};
-  } catch { return []; }
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return { warnings: [], reason: null };
+    return { warnings: [], reason: 'unreadable-package-json' };
+  }
   const usesFirebase = Object.keys(deps).some((d) => d.startsWith('@capacitor-firebase/'));
-  if (!usesFirebase) return [];
+  if (!usesFirebase) return { warnings: [], reason: null };
 
   const warnings: string[] = [];
   if (platform === 'ios') {
@@ -302,7 +323,7 @@ export function detectMissingFirebase(projectRoot: string, platform: NativePlatf
       );
     }
   }
-  return warnings;
+  return { warnings, reason: null };
 }
 
 /** Scaffold one native target end-to-end: deps + capacitor.config.json + vendored engine
@@ -432,5 +453,19 @@ export async function scaffoldNativeTarget(opts: {
   if (!(await runShell(`cap add ${platform}`, `npx cap add ${platform}`, projectRoot))) throw new Error(`cap add ${platform} failed`);
   // 5. Heal native config (local.properties / DEVELOPMENT_TEAM) + flag missing Firebase.
   for (const n of healNativeConfig(projectRoot).notes) send(n);
-  return { warnings: detectMissingFirebase(projectRoot, platform) };
+  // #1096: the caller PAUSES the build on a non-empty list, so an unreadable manifest must not
+  // reach it as an empty one. Surfaced as a warning, not a throw — "warn, never throw" (owner,
+  // 2026-09-06, #731) — but it is a warning the caller treats exactly like a real finding, because
+  // the thing it is uncertain about is whether the app crashes on launch.
+  const firebase = detectMissingFirebaseResult(projectRoot, platform);
+  return {
+    warnings: firebase.reason === 'unreadable-package-json'
+      // Worded to what the check ESTABLISHES. Only ENOENT is split out above, so this branch also
+      // covers ENOTDIR (projectRoot is a file) and EACCES — "exists but did not parse" would be a
+      // claim the code has not earned in those two cases.
+      ? [`could not check this project for Firebase config: its package.json could not be read or parsed. `
+        + `If it does use Firebase and its ${platform === 'ios' ? 'GoogleService-Info.plist' : 'google-services.json'} `
+        + 'is missing, the app will crash on launch — fix the manifest and run this again.']
+      : firebase.warnings,
+  };
 }

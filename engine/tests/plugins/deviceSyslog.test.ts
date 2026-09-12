@@ -32,9 +32,20 @@ describe.skipIf(process.platform === 'win32')('deviceSyslog — captureIosSyslog
   }
   const line = (msg: string) => `echo '${JSON.stringify({ msg })}'`
 
+  /**
+   * The window every output-dependent case below asks for. Deliberately NOT 1 — that is the module's
+   * own clamped FLOOR (`Math.max(1, …)`), so a test sitting on it has zero headroom: the capture is a
+   * real wall-clock timer racing a real `/bin/sh`, and under a loaded `npm run verify` (two suites,
+   * ~22.5k tests) the window could elapse before the stub wrote a byte. That failed as `expected []`
+   * on a DIFFERENT case each run — the signature of a load race, not a logic defect, and it red-gated
+   * the hub on a file no change had touched. `deviceSyslog.ts` now starts the timer on the child's
+   * 'spawn' so launch latency is outside the window; this leaves margin for the writes themselves.
+   */
+  const CAPTURE_WINDOW = 2
+
   it('returns the device lines, unwrapped from go-ios JSON', async () => {
     const goIos = stubGoIos([line('Aug 13 10:00:00 iPhone8 App[1] <Notice>: hello'), line('Aug 13 10:00:01 iPhone8 App[1] <Notice>: world')].join('\n'))
-    const cap = await captureIosSyslog({ udid: 'x', seconds: 1, goIos })
+    const cap = await captureIosSyslog({ udid: 'x', seconds: CAPTURE_WINDOW, goIos })
     expect(cap.lines).toEqual([
       'Aug 13 10:00:00 iPhone8 App[1] <Notice>: hello',
       'Aug 13 10:00:01 iPhone8 App[1] <Notice>: world',
@@ -44,7 +55,7 @@ describe.skipIf(process.platform === 'win32')('deviceSyslog — captureIosSyslog
 
   it('filters case-insensitively, like the in-app path', async () => {
     const goIos = stubGoIos([line('backboardd: unrelated'), line('App[1]: JETSAM kill'), line('App[1]: fine')].join('\n'))
-    const cap = await captureIosSyslog({ udid: 'x', seconds: 1, filter: 'jetsam', goIos })
+    const cap = await captureIosSyslog({ udid: 'x', seconds: CAPTURE_WINDOW, filter: 'jetsam', goIos })
     expect(cap.lines).toEqual(['App[1]: JETSAM kill'])
   })
 
@@ -52,7 +63,7 @@ describe.skipIf(process.platform === 'win32')('deviceSyslog — captureIosSyslog
     // Silent truncation would read as "that is all the device logged" — the opposite of the truth,
     // and the reason the caller is told rather than left to infer it from a suspiciously round count.
     const goIos = stubGoIos([line('a'), line('b'), line('c')].join('\n'))
-    const cap = await captureIosSyslog({ udid: 'x', seconds: 1, limit: 2, goIos })
+    const cap = await captureIosSyslog({ udid: 'x', seconds: CAPTURE_WINDOW, limit: 2, goIos })
     expect(cap.lines).toEqual(['b', 'c'])
     expect(cap.truncated).toBe(true)
   })
@@ -61,14 +72,14 @@ describe.skipIf(process.platform === 'win32')('deviceSyslog — captureIosSyslog
     // The whole risk of a forward capture inside a backend route: `ios syslog` never exits on its
     // own, so without the timer this hangs the editor's request until the socket dies.
     const goIos = stubGoIos(line('still going'))
-    const cap = await captureIosSyslog({ udid: 'x', seconds: 1, goIos })
+    const cap = await captureIosSyslog({ udid: 'x', seconds: CAPTURE_WINDOW, goIos })
     // ⚠️ NO WALL-CLOCK BOUND HERE, deliberately (#751). This ran a REAL 1 s timer plus a process
     // spawn against a 5 s assertion — 5x headroom on an I/O-shaped wait, the thinnest margin of the
     // four sites #751's sweep found. It could not catch anything the harness does not already catch
     // (`testTimeout` is 20 s, 60 s on Windows, so a stream that never ends fails as a timeout), and
     // the two assertions below are what actually prove the capture was BOUNDED: it came back, with
     // the window it used and the lines it read.
-    expect(cap.capturedFor).toBe(1)
+    expect(cap.capturedFor).toBe(CAPTURE_WINDOW)
     expect(cap.lines).toEqual(['still going'])
   })
 
@@ -100,8 +111,12 @@ describe.skipIf(process.platform === 'win32')('deviceSyslog — captureIosSyslog
     // how fast the child happens to die; it self-terminates after ~4s so nothing is orphaned. Under
     // the old code this test grows `cap.lines` after the await and fails.
     const goIos = stubGoIos(`trap '' TERM; i=0; while [ $i -lt 80 ]; do ${line('tick')}; sleep 0.05; i=$((i+1)); done`)
-    const cap = await captureIosSyslog({ udid: 'x', seconds: 1, limit: 500, goIos })
+    const cap = await captureIosSyslog({ udid: 'x', seconds: CAPTURE_WINDOW, limit: 500, goIos })
     const atResolve = cap.lines.length
+    // Without this the case is VACUOUS: a capture that landed nothing resolves `[]`, and `0` is
+    // still `0` after the wait — so it would pass just as happily against the by-reference bug it
+    // exists to catch. The stub ticks every 50ms, so a window that worked has many lines.
+    expect(atResolve).toBeGreaterThan(0)
     await new Promise((r) => setTimeout(r, 600))
     expect(cap.lines.length).toBe(atResolve)
   })
@@ -112,7 +127,7 @@ describe.skipIf(process.platform === 'win32')('deviceSyslog — captureIosSyslog
     // the default 50 so the two behaviours are distinguishable — an earlier version of this test
     // emitted 3 lines and asserted `<= 50`, which passed either way and proved nothing.
     const goIos = stubGoIos(Array.from({ length: 60 }, (_, i) => line(`l${i}`)).join('\n'))
-    const cap = await captureIosSyslog({ udid: 'x', seconds: 1, limit: 'nonsense' as unknown as number, goIos })
+    const cap = await captureIosSyslog({ udid: 'x', seconds: CAPTURE_WINDOW, limit: 'nonsense' as unknown as number, goIos })
     expect(cap.lines).toHaveLength(50)
     expect(cap.truncated).toBe(true)
   })

@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
-import { ensureCapacitorDeps, ensureCapacitorConfig, detectMissingFirebase, isPlausibleProjectDir, isNativeTargetScaffolded, scaffoldNativeTarget } from '../../plugins/addNativeTarget';
+import { ensureCapacitorDeps, ensureCapacitorConfig, detectMissingFirebase, detectMissingFirebaseResult, isPlausibleProjectDir, isNativeTargetScaffolded, scaffoldNativeTarget } from '../../plugins/addNativeTarget';
 import { mergeProjectConfig } from '../../project-config';
 import { makeDirLink } from '../helpers/linkFixture';
 
@@ -579,6 +579,40 @@ describe('detectMissingFirebase', () => {
     const dir = path.join(root, 'ios', 'App', 'App');
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'GoogleService-Info.plist'), '<plist/>');
+    expect(detectMissingFirebase(root, 'ios')).toEqual([]);
+  });
+});
+
+describe('an UNREADABLE package.json is not "no Firebase" (#1096)', () => {
+  // The docblock promised `empty = nothing missing / no Firebase` and one `catch` could not keep it.
+  // It matters because of what the caller does with the list: `vite-asset-scanner`'s build path
+  // PAUSES on a non-empty one, so `[]` from a truncated manifest let a Firebase build run to the end
+  // and ship an app that crashes on launch in FirebaseApp.configure, with a `✅` on the console.
+
+  it('a package.json that EXISTS and will not parse is reported as unknown', () => {
+    fs.writeFileSync(path.join(root, 'package.json'), '{"dependencies": {"@capacitor-firebase/analytics"');
+    expect(detectMissingFirebaseResult(root, 'ios')).toEqual({ warnings: [], reason: 'unreadable-package-json' });
+  });
+
+  it('⚠️ a MISSING package.json stays SILENT — absent is not unknown', () => {
+    // #731's own review found the opposite error at the twin site: reporting "could not check" for a
+    // file that legitimately does not exist was FALSE for four real projects in this repo. Only a
+    // manifest that exists and will not read is the genuine unknown.
+    expect(fs.existsSync(path.join(root, 'package.json'))).toBe(false);
+    expect(detectMissingFirebaseResult(root, 'ios')).toEqual({ warnings: [], reason: null });
+  });
+
+  it('ACCEPT: a readable manifest reports reason null, whether or not it uses Firebase', () => {
+    writePkg({ '@capacitor/core': '^8' });
+    expect(detectMissingFirebaseResult(root, 'ios')).toEqual({ warnings: [], reason: null });
+    writePkg({ '@capacitor-firebase/analytics': '^8' });
+    const used = detectMissingFirebaseResult(root, 'ios');
+    expect(used.reason).toBeNull();
+    expect(used.warnings).toHaveLength(1);
+  });
+
+  it('the plain helper still answers exactly as before, for callers that do not branch', () => {
+    fs.writeFileSync(path.join(root, 'package.json'), 'not json');
     expect(detectMissingFirebase(root, 'ios')).toEqual([]);
   });
 });

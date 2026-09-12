@@ -895,4 +895,122 @@ describe('/api/device/request refuses trusted input when the frame loop cannot d
       await device.close();
     }
   });
+
+  // #1096 — failing open is correct; failing open SILENTLY is the defect. Every case above still
+  // dispatches (the polarity is deliberate), but a caller could not tell a healthy frame loop from
+  // a probe that never answered, so the guard against silent success succeeded silently itself.
+  it('a probe whose reply will not parse says so on the dispatched reply', async () => {
+    const authority = new DeviceLeaseAuthority();
+    // ⚠️ `tap` is canned to SUCCEED. Without it this harness answers `{ok:false, reason:'not-owner'}`
+    // for every dispatch, the note is correctly suppressed on a failure reply, and all three tests
+    // below would pass while asserting nothing — the note's presence must be the only variable.
+    const device = await startMockDevice(authority, { 'input-deliverability': '{"frameLoop": {', tap: 'ok (tapped)' });
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      const req = await post('/api/device/request', { method: 'tap', params: { x: 1, y: 2 } });
+      const result = JSON.stringify(bodyOf(req).result);
+      // Still dispatched…
+      expect(result).not.toMatch(/^"?Error:/);
+      // …but no longer indistinguishable from a clean bill of health.
+      expect(result).toContain('could not confirm this device can deliver input');
+      expect(result).toContain('NOT evidence the game received it');
+      // And it fronts the reply, so a reader sees the caveat before the result it qualifies.
+      expect(result.indexOf('could not confirm')).toBeLessThan(result.indexOf('ok (tapped)'));
+    } finally {
+      await device.close();
+    }
+  });
+
+  it('ACCEPT: a HEALTHY probe adds no note — it was checked, and it passed', async () => {
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority, {
+      'input-deliverability': {
+        visibilityState: 'visible', hasFocus: true,
+        frameLoop: frameLoopReply('running', { unrecoverable: false, msSinceLastFrame: 16 }),
+      },
+      tap: 'ok (tapped)',
+    });
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      const req = await post('/api/device/request', { method: 'tap', params: { x: 1, y: 2 } });
+      expect(JSON.stringify(bodyOf(req).result)).toContain('ok (tapped)');
+      expect(JSON.stringify(bodyOf(req).result)).not.toContain('could not confirm');
+    } finally {
+      await device.close();
+    }
+  });
+
+  it('⚠️ ACCEPT: an `Unknown method` reply adds no note — the OP is absent, not the answer', async () => {
+    // The review finding: `isDeviceFailureReply` matches `Unknown method:` AND `Error:`, and a build
+    // predating the op answers exactly the former. Treating that as "could not check" put the banner
+    // on EVERY tap/drag/press-key/hover/scroll for the life of that build — permanent and
+    // unactionable, the failure the absent-vs-unknown split exists to prevent. `deviceAim.ts` already
+    // draws this line; the probe now draws it too.
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority, {
+      'input-deliverability': 'Unknown method: input-deliverability', tap: 'ok (tapped)',
+    });
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      const req = await post('/api/device/request', { method: 'tap', params: { x: 1, y: 2 } });
+      expect(JSON.stringify(bodyOf(req).result)).toContain('ok (tapped)');
+      expect(JSON.stringify(bodyOf(req).result)).not.toContain('could not confirm');
+    } finally {
+      await device.close();
+    }
+  });
+
+  it('an `Error:` reply IS still unknown — the device answered, and the answer was a failure', async () => {
+    // The other side of the split above: this one must keep reporting, or the two collapse again.
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority, {
+      'input-deliverability': 'Error: the op blew up', tap: 'ok (tapped)',
+    });
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      const req = await post('/api/device/request', { method: 'tap', params: { x: 1, y: 2 } });
+      expect(JSON.stringify(bodyOf(req).result)).toContain('could not confirm');
+    } finally {
+      await device.close();
+    }
+  });
+
+  it('a FAILED dispatch is never fronted with the note, even behind the synthetic banner', async () => {
+    // The review finding: the note is suppressed on a reply starting `Error:`, but the synthetic
+    // path composes `${banner}\n${synthetic}` — so with the banner in front the failed reply no
+    // longer starts with `Error:` and the suppression missed. The note would then claim "it was
+    // dispatched anyway" about a call that dispatched nothing.
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority, {
+      'input-deliverability': '{"frameLoop": {', tap: 'Error: nothing at (1,2)',
+    });
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      const req = await post('/api/device/request', { method: 'tap', params: { x: 1, y: 2 } });
+      const result = JSON.stringify(bodyOf(req).result);
+      expect(result).toContain('nothing at (1,2)');
+      expect(result).not.toContain('could not confirm');
+    } finally {
+      await device.close();
+    }
+  });
+
+  it('⚠️ ACCEPT: a parsed reply with NO frameLoop adds no note either — ABSENT is not unknown', async () => {
+    // An app build predating the field CANNOT report frame-loop health, so there is nothing to check
+    // and never will be for that build. Announcing "could not check" on every input op against it
+    // would be a permanent, unactionable banner — #731's over-reporting scar, in this module.
+    const authority = new DeviceLeaseAuthority();
+    const device = await startMockDevice(authority, {
+      'input-deliverability': { visibilityState: 'visible', hasFocus: true },
+      tap: 'ok (tapped)',
+    });
+    try {
+      await post('/api/device/connect', { ip: '127.0.0.1', port: device.port });
+      const req = await post('/api/device/request', { method: 'tap', params: { x: 1, y: 2 } });
+      expect(JSON.stringify(bodyOf(req).result)).toContain('ok (tapped)');
+      expect(JSON.stringify(bodyOf(req).result)).not.toContain('could not confirm');
+    } finally {
+      await device.close();
+    }
+  });
 });

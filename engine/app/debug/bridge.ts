@@ -17,7 +17,7 @@ import { setJournalEnabled, getFrameLoopHealth, hasDocKey } from '@modoki/engine
 import { createSupersessionToken, createTeardownToken } from '@modoki/engine/runtime/core/liveness';
 import { consoleRing, installDeviceConsoleCapture, unpatchedLog } from './deviceConsoleCapture';
 import { getConsoleRingDropped } from '@modoki/engine/runtime/core/consoleRing';
-import { refuseDeviceInputVocabulary } from '../../tools/shared/inputVocabulary';
+import { domCodeForKey, normalizeKeyName, refuseDeviceInputVocabulary } from '../../tools/shared/inputVocabulary';
 import {
   safeStringify,
   describeShape,
@@ -1010,11 +1010,6 @@ export async function handlePointer(params: Record<string, unknown>): Promise<st
 
 // --- Type text into the focused element (#31) ---
 
-/** e.code for a submitKey (Enter/Tab/Escape already match; reuse the tap-key helper otherwise). */
-function typeCode(key: string): string {
-  return keyToCode(key);
-}
-
 /** Set a form element's value through its NATIVE property setter and fire a real `input` event.
  *
  *  React patches `HTMLInputElement.prototype.value`'s setter on the instance so it can detect a
@@ -1078,6 +1073,11 @@ export async function handleType(params: Record<string, unknown>): Promise<{ ok:
   if (refusal) return { ok: false, typed: 0, activeElement: null, error: refusal };
   const text = params.text;
   if (typeof text !== 'string') return { ok: false, typed: 0, activeElement: null, error: 'type-text needs a `text` string' };
+  // BEFORE anything is typed (#1094): an unrecognised `submitKey` is not an error downstream — the
+  // keyup/keydown below carry the typo and fire nothing — so without this the call types the text,
+  // submits nothing and reports ok. Refusing first leaves the field untouched rather than half-done.
+  const unknownSubmit = refuseDeviceInputVocabulary('type-text', params);
+  if (unknownSubmit) return { ok: false, typed: 0, activeElement: null, error: unknownSubmit.error };
 
   const { typable, descriptor, el } = typableFocus();
   if (!typable || !el) {
@@ -1101,9 +1101,11 @@ export async function handleType(params: Record<string, unknown>): Promise<{ ok:
   }
   const after = readFocusedValue(el) ?? '';
 
-  const submitKey = params.submitKey;
-  if (typeof submitKey === 'string' && submitKey) {
-    const init: KeyboardEventInit = { key: submitKey, code: typeCode(submitKey), bubbles: true, cancelable: true };
+  const submitKey = typeof params.submitKey === 'string' && params.submitKey
+    ? normalizeKeyName(params.submitKey) // non-null: refused above
+    : null;
+  if (submitKey) {
+    const init: KeyboardEventInit = { key: submitKey, code: domCodeForKey(submitKey), bubbles: true, cancelable: true };
     el.dispatchEvent(new KeyboardEvent('keydown', init));
     el.dispatchEvent(new KeyboardEvent('keyup', init));
   }
@@ -1153,10 +1155,6 @@ async function domDrag(el: HTMLElement, from: { x: number; y: number }, to: { x:
   return `ok (dom drag ${el.tagName.toLowerCase()}) css(${Math.round(from.x)},${Math.round(from.y)})→(${Math.round(to.x)},${Math.round(to.y)})`;
 }
 
-/** e.code for a bare key: single letters → `KeyX`, else the key itself (Fn keys, arrows already match). */
-function keyToCode(key: string): string {
-  return key.length === 1 && /[a-z]/i.test(key) ? `Key${key.toUpperCase()}` : key;
-}
 
 /** Press a key chord (keydown, hold ~1–2 frames, keyup) — open the debug menu (F12), Escape a modal,
  *  drive gameplay keys. Dispatched on the focused element (bubbles to `window`, where the menu +
@@ -1164,15 +1162,28 @@ function keyToCode(key: string): string {
 export async function handlePressKey(params: Record<string, unknown>): Promise<string> {
   const refusal = frameLoopRefusal('press-key');
   if (refusal) return refusal;
-  const key = params.key as string;
-  if (!key) return 'Error: press-key needs a key';
-  // An unknown modifier used to be dropped from the chord while the reply echoed it (#1076).
+  const requested = params.key as string;
+  if (!requested) return 'Error: press-key needs a key';
+  // An unknown modifier used to be dropped from the chord while the reply echoed it (#1076); an
+  // unknown KEY NAME used to be dispatched verbatim, and here — unlike the Electron side, where
+  // Chromium at least blanks it — `new KeyboardEvent({key:'Excape'})` is a perfectly well-formed
+  // event carrying the typo, so it matches no listener and the reply still said ok (#1094).
   const unknownVocab = refuseDeviceInputVocabulary('press-key', params);
   if (unknownVocab) return `Error: ${unknownVocab.error}`;
+  // Canonical from here down, so `Up`/`Esc`/`escape` drive the device exactly as they drive the
+  // editor. Non-null — the refusal above just passed.
+  const key = normalizeKeyName(requested)!;
   const mods = (params.modifiers as string[]) ?? [];
   const init: KeyboardEventInit = {
-    key, code: (params.code as string) || keyToCode(key), bubbles: true, cancelable: true,
-    ctrlKey: mods.includes('ctrl'), shiftKey: mods.includes('shift'), altKey: mods.includes('alt'), metaKey: mods.includes('meta'),
+    key, code: (params.code as string) || domCodeForKey(key), bubbles: true, cancelable: true,
+    // ⚠️ INCLUDING ITSELF — what a real keyboard does, and the rule `rendererOps.ts`'s drag path
+    // already states for the editor side. Without it `device_press_key {key:'Shift'}` reports
+    // `shiftKey:false`, so a game latching `shift = e.shiftKey` on keydown gets the OPPOSITE of the
+    // key it was sent (found in review; the bare modifiers only became pressable this close-out).
+    ctrlKey: mods.includes('ctrl') || key === 'Control',
+    shiftKey: mods.includes('shift') || key === 'Shift',
+    altKey: mods.includes('alt') || key === 'Alt',
+    metaKey: mods.includes('meta') || key === 'Meta',
   };
   const target: EventTarget = (document.activeElement && document.activeElement !== document.body) ? document.activeElement : window;
   target.dispatchEvent(new KeyboardEvent('keydown', init));

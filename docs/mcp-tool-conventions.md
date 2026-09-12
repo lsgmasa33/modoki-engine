@@ -449,6 +449,38 @@ Rules:
     refuse against it before resolving the aim (a 400 with `REFUSED_BY_OP` + `options`), and
     `/api/device/request` refuses before choosing a transport — CDP dispatches `press-key` itself and
     never reaches the bridge handler, which refuses with the same predicate.
+  - **A vocabulary that is not a closed list still gets a table — and the table is the one that gets
+    ADVERTISED** (#1094). `key`/`submitKey` were the last open ones: `z.string()` everywhere, with the
+    legal values named only in prose. The rule is "a single character, or a name from `INPUT_KEYS`",
+    matched case-insensitively, so it cannot be a `z.enum` — enumerating every character is not a
+    list. Two consequences worth copying:
+    - **Refuse AND normalise.** The predicate returns the canonical DOM `key` (`Esc`→`Escape`,
+      `Up`→`ArrowUp`), which is what closed the divergence half of the bug: the editor aliased four
+      arrow names and the device aliased none, so the same request drove one host and did nothing on
+      the other. A vocabulary with aliases must canonicalise at the shared predicate, not per host.
+    - **Parity moves to the DESCRIPTION.** `vocabularyEnumParity.test.ts` pins each `z.enum` to its
+      runtime tuple; here it pins each tool's advertised description to `KEY_ARG_DESCRIPTION`, which
+      is DERIVED from the table. Same anti-drift job, different axis.
+    - ⚠️ **Canonicalising an input breaks whatever was DERIVED from it, one layer down.** Both device
+      transports computed the DOM `code` from `key` with a single-letter rule; normalising `Space` to
+      the canonical key `' '` therefore fixed `e.key` and silently broke `e.code`, and
+      `e.code === 'Space'` is the idiomatic spacebar test precisely because `e.key` is an
+      easily-missed space. The derived value needs its own measured table (`domCodeForKey`), in the
+      SAME shared module — derived per host it re-opens the divergence the canonicalisation just
+      closed. Found by review, not by the tests, which asserted `[key, code]` for one alias and only
+      `key` for the rest.
+    ⚠️ **Pick the table by who CALLS the tool, not by what the host accepts.** Measured on Electron
+    43.2.0 (2026-09-12): `sendInputEvent` takes Electron's Accelerator dialect case-insensitively, so
+    `VolumeUp` and `numadd` work and are now refused. That is deliberate — the caller is an agent,
+    which reaches for DOM names because that is what web code looks like, and a table that IS the
+    accepted set can print `Valid: …` truthfully where a hint cannot. The aliases that survive were
+    MEASURED, not reasoned: `Del` is rejected by Chromium where `Delete` works, so the accepted set
+    is not guessable.
+    ⚠️ **An unrecognised name is not an error anywhere downstream, which is why nothing caught this.**
+    Chromium turns it into a keydown whose `key` is the EMPTY STRING — it matches no handler and
+    inserts nothing — so `type_text {submitKey:'Retrun'}` answered `ok, typed:3` having submitted
+    nothing. On the DEVICE side it is worse: `new KeyboardEvent({key:'Excape'})` is well-formed and
+    carries the typo, so there is no signal at all and only the table can catch it.
   - **On a GET, the refusal needs a CODE.** `getJson` does not run `isFailureBody` on a plain read,
     so an uncoded `{ok:false}` reaches the agent as a SUCCESS; a coded envelope leaves `relayJson`
     as a 400. (`/api/watch/read` is safe without one only because its route re-codes the op's
