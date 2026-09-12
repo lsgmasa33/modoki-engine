@@ -1084,6 +1084,21 @@ of it. Read this before touching a measurement there.
 | Layout px | `clientWidth`/`offsetWidth`, `getComputedStyle` padding/border | **every** transform |
 | Frame-logical px | what `toLogicalDelta` produces | only the FRAME's transform is divided out |
 
+⚠️ **And a fourth trap that is not a transform at all: the GAME panel's device frame carries a
+1 px border, so its CLIENT box is 2 px narrower than the device it claims to preview** (found
+measuring #1119's label budget, 2026-09-12). At the iPhone SE preset the frame lays out at
+`offsetWidth: 375` with `box-sizing: border-box`, and every `%`-width UI root inside it therefore
+resolves against **373**, not 375. **SceneView's frame has no such border**, so the two panels
+measure the SAME entity about 0.5% apart — at scale `0.869333`, a full-width root reads `326.0`
+(375 x 0.869333, exact) in SceneView and `324.261` (373 x 0.869333) in the Game panel. Neither is
+wrong; they are previewing boxes of different widths.
+
+Two consequences. **A live measurement checked against an authored `%` is off by 0.5% unless you
+divide by the client width rather than the preset's name** — small enough to read as rounding, big
+enough to sink a budget check sitting on a few px of headroom. And **the error does not exist on a
+real device**, so a discrepancy this size between a panel measurement and a device one is expected
+rather than a defect to chase.
+
 Two separate transforms stack between the frame and an element. `SceneView` lays the preview
 frame out at the logical device size and applies `transform: scale(uiScale)`; **and**
 `applyRotationStyle` (`runtime/ui/anchorCss.ts`) emits a second `transform: scale(s)` on any node

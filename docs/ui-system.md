@@ -1651,6 +1651,80 @@ them out of `safeArea`, taking clearance to 26 px on every screen while staying 
 section's second defect for its first. A clearance guard should assert the size floor alongside the
 gap for exactly that reason.
 
+#### A row child's TEXT has no width bound — `min-width: 0` is unauthorable (#1119)
+
+**`flexShrink` is not the lever, and that is the whole trap.** `cssVal` returns `undefined` for `0`
+(`runtime/ui/UINode.tsx`), so **`min-width: 0` is never emitted** and every flex item keeps CSS's
+automatic minimum size. Shrinking a row child therefore floors at **min-content** — it buys exactly
+what word-wrapping can give back, and nothing more. A label that cannot wrap overflows its row
+whatever `flexShrink` says, and where the row authors `justifyContent: center` it spills past
+**both** edges.
+
+⚠️ **Making `minWidth: 0` authorable is REJECTED, not pending.** `UIElement.minWidth` defaults to `0`
+and `cssVal` drops falsy values, so an author cannot express it — but emitting `0` would strip the
+automatic minimum from **every flex item in every game**, a blast radius far past the problem. (The
+engine already reasons about that floor deliberately elsewhere: `UINode.tsx`'s `autoFitText` scaffold
+pins `min-width: max-content` *because* the auto-minimum was silently doing that job, and #727's
+review found a `minWidth: 0` on the single-line clamp path that was a no-op for the same reason.)
+
+**Measured behaviour, so the two cases are not conflated** (live at 375x667, wordweave's `LevelTabs`):
+
+| the label | what happens |
+|---|---|
+| multiple words | **wraps** to min-content (the longest word) inside its own box — no spill, but N lines in a fixed-height row |
+| a single long word | **spills**, because min-content IS max-content. Observed: tabs at `123.408..390.59` against a row at `129.969..384.018` |
+
+**The remedy is a WIDTH BUDGET over the authored string, not a rendering change** (owner, 2026-09-12:
+*refuse, do not accommodate* — the same answer #1080 gave for the HUD). Two engine-owned testing
+helpers exist for it, on the `tapTargetFloor` pattern of a shared resolver plus per-game data:
+
+- **`@modoki/engine/testing/authoredTextBudget`** — walks the parent chain to a real px width,
+  resolving units through `uiLength`'s own table, and answers whether a string fits its row on one
+  line at a given viewport. `worstTextFit` takes `SHIPPING_VIEWPORTS` rather than one constant,
+  because **no single viewport is the worst case**: a row sized in `%` is worst on the narrowest
+  screen, while one whose siblings are sized in `vh` is worst on the TALLEST screen of that width.
+- **`@modoki/engine/testing/fontMetrics`** — reads real glyph advances out of a shipped `.ttf`, so a
+  budget measures **the string** rather than a calibrated `EM_PER_CHAR`. That constant is the wrong
+  instrument whenever the strings are not from the distribution it was calibrated on: Klee One runs
+  0.470 em/char on `Vibration` and 0.607 on `Medium`, and a HUD-weighted 0.586 over-states a
+  mixed-case label by ~15%.
+
+⚠️ **`autoFitText` and `textOverflow: 'ellipsis'` were both DECLINED for this, and the reason is
+adoption as much as feel**: no scene in `games/` or `demos/` authors either, so either would be the
+first shipping use of a field exercised only by e2e fixtures — and #725 records that `ellipsis` is
+inert under `autoFitText`, so they do not compose.
+
+**There are TWO mechanisms here, and a guard that models one leaves the other open.**
+
+| | what overflows | who it applies to |
+|---|---|---|
+| `worstTextFit` | the ROW | a child with NO authored width — it is floored at min-content, so it pushes its siblings out |
+| `worstTextFitInOwnBox` | the CHILD ITSELF | a child WITH a definite width — the width caps the flex automatic minimum, so the row is safe and the text paints past its own rounded edge |
+
+⚠️ **The second is easy to talk yourself out of, and that is how it was missed.** "A child with its
+own authored width cannot be squeezed by its text" is true of the row and irrelevant to the child:
+wordweave's `SettingsHapticsValue` gives an owner-editable On/Off word an authored `width: 88` at
+`fontSize: 18`, where `"On"` needs 23.99 px and about ten characters is the ceiling — so
+`settingsOnLabel = "Vibration on"` (~103 px) spills out of its own box with nothing clipping. A
+row-only guard drops it from the population and stays green.
+
+⚠️ **`worstTextFitInOwnBox` returns `null` — "cannot tell" — for an item flex layout can RESIZE**,
+which is any item on the main axis of a row with a non-zero `flexGrow` or `flexShrink`. Its authored
+width is then the flex BASE size, not the used width: measured on wordweave's two
+`TutorialSkip{Confirm,Cancel}` buttons (`width: 50%`, `flexGrow: 1`, in a 12 px-gap row at 360 px
+wide) the base is 125.2 px and the used width ~119.2 px, so budgeting against the authored number
+would have called a 124.96 px label FITTING while it overflowed by ~5.8 px — wrong in the one
+direction a refuse-don't-accommodate gate must never be wrong. Recovering those cases needs the flex
+resolution modelled (every sibling's base, min-content floor and grow/shrink factor), which is a
+layout engine rather than a budget; tracked in #1126.
+
+**Only owner-authored strings are enumerable at test time, so only they can be budgeted this way.**
+A store-localized price (#1125) and an unbounded runtime number have no authored maximum, and need a
+different answer. The class across all six projects, and the three string sources, is **#1126**; the
+one worked instance is `games/wordweave/tests/authoredLabelBudget.test.ts`, documented in
+[../games/wordweave/docs/menu.md](../games/wordweave/docs/menu.md) § "Every owner-editable label is
+budgeted against its row".
+
 #### The engine owns the SIZE gate now — `@modoki/engine/testing/tapTargetFloor` (#1024)
 
 Three passes found under-floor controls by hand — #948 and #969 in Court, #1017 in wordweave — each

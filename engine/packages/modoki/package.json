@@ -23,6 +23,8 @@
     "./three": "./src/three/index.ts",
     "./testing": "./tests/helpers/sourceScanner.ts",
     "./testing/tapTargetFloor": "./tests/helpers/tapTargetFloor.ts",
+    "./testing/authoredTextBudget": "./tests/helpers/authoredTextBudget.ts",
+    "./testing/fontMetrics": "./tests/helpers/fontMetrics.ts",
     "./testing/prefabInstances": "./tests/helpers/prefabInstances.ts"
   },
   "scripts": {
