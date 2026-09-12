@@ -3114,4 +3114,334 @@ describeCases('QA case references', () => {
     }
     expect(unknown).toEqual([]);
   });
+
+  /**
+   * No case may write the SCENE while the editor is Playing — the refusal is invisible in the
+   * case's own assertions.
+   *
+   * WHY THIS GUARD EXISTS
+   * ---------------------
+   * `POST /api/scene-mutate` refuses unconditionally while `playState` is `playing` or `paused`
+   * (409, *"stop the game (press Stop) before editing the scene"*). A case whose procedure issues
+   * one there has a step that never ran — and this fails in the worst way available: the
+   * measurement that step was setting up is simply absent, while the Expected block can still pass.
+   *
+   * QA-TIMELINE-0002 paused a `Director` this way and sat `blocked` for three weeks; worse, its two
+   * idempotence reads AGREED, because a playhead that was never paused reads the same time twice —
+   * so a false PASS was exactly as likely as a fail (#1093).
+   *
+   * It is not a one-off. `qa/knowledge.md` § 4 records an audit on 2026-08-20 that found EIGHT
+   * cases of this shape (QA-ZONE-0001/0002, QA-AUDIO-0002, QA-VIDEO-0002, QA-UI-0002 among them),
+   * every one repaired by hand. This is the mechanical check that stops the ninth.
+   */
+  it('no case writes the scene while Playing (the 409 is invisible in its own assertions)', () => {
+    const offenders = cases.flatMap((c) =>
+      PLAY_WRITE_ALLOWED[c.rel] ? [] : scanPlayOrdering(c.body).offenders.map((w) => `${c.rel}: ${w}`),
+    );
+    expect(offenders).toEqual([]);
+  });
+
+  /**
+   * The COVERAGE FLOOR for the check above, and it is not decoration.
+   *
+   * `expect(offenders).toEqual([])` is satisfied identically by a working scanner and by one that
+   * skipped every file — the exact "a guard that passes while measuring nothing" shape this repo
+   * keeps hitting (docs/falsifiable-tests.md). The procedure region is found by HEADING, and
+   * `qa/README.md` calls those headings a *convention*, not a contract: renaming `## Steps` to
+   * `## Steps — Part A` for readability would silently drop that case from the guard forever, with
+   * nothing going red. So assert the reach directly — every case that presses Play must be
+   * scannable.
+   *
+   * Measured 2026-09-12: 52 of 266 cases press Play, and all 52 are scannable. The first draft of
+   * this guard matched `/^##\s+Steps\s*$/` exactly and silently missed 4 of them, including
+   * `inspector/resource-trait-hot-reload.md` — long, interleaving Play with scene writes, and
+   * documenting this very 409 in its own prose.
+   */
+  it('every case that presses Play is actually reachable by the play-ordering scan', () => {
+    const unreachable = cases
+      .filter((c) => HAS_A_PLAY.test(c.body) && !scanPlayOrdering(c.body).scannable)
+      .map((c) => c.rel);
+    expect(unreachable).toEqual([]);
+    if (HAS_CASES) {
+      // A floor on the floor: if the play detector itself stopped matching, `unreachable` would be
+      // empty for the wrong reason.
+      expect(cases.filter((c) => HAS_A_PLAY.test(c.body)).length).toBeGreaterThan(40);
+    }
+  });
+
+  /**
+   * A case that leaves the editor PLAYING hands the next case a world in which its own first
+   * mutate 409s — `qa/knowledge.md` § 4 names a trailing `stop` as suite convention, and the
+   * failure is #1093's mechanism displaced one case later, where it is even harder to attribute.
+   *
+   * RATCHET, not a hard rule, because 11 cases predate the check (#1121). The set is frozen: a NEW
+   * offender fails, and so does a STALE entry, so draining the list cannot be undone silently.
+   */
+  it('the set of cases that leave the editor Playing is exactly the frozen baseline', () => {
+    const playing = cases.filter((c) => scanPlayOrdering(c.body).endsPlaying).map((c) => c.rel);
+    expect(playing.sort()).toEqual([...LEAVES_EDITOR_PLAYING].sort());
+  });
+
+});
+
+/** Case bodies that press Play. Shared by the scan and by its coverage floor, so the floor cannot
+ *  pass because the detector drifted. */
+const HAS_A_PLAY = /play_control[^}]{0,80}?["']?action["']?\s*:\s*["']play["']|gameView\.toolbar\.play/;
+
+/**
+ * Cases allowed to write the scene while Playing, with the reason — the convention every other
+ * check in this file follows (`LINE_REF_ALLOWED`, `PROSE_ALLOWED`, `CLONE_PORT_ALLOWED`).
+ *
+ * Empty today, and it exists because the legitimate case is easy to name: a case whose SUBJECT is
+ * the 409 itself ("mutate during Play, EXPECT 409, confirm nothing was written") is correct and
+ * desirable, and without this its only exits would be editing the test or rewording the step into
+ * a braceless prose call — i.e. hiding a real assertion from the guard by accident.
+ */
+const PLAY_WRITE_ALLOWED: Record<string, string> = {};
+
+/**
+ * Cases that end their procedure with the editor still Playing (#1121). Frozen so a NEW one fails
+ * and a DRAINED one must be removed in the same commit.
+ */
+const LEAVES_EDITOR_PLAYING = [
+  'qa/cases/audio/action-dispatch-observable-effect.md',
+  'qa/cases/audio/timescale-and-lifecycle.md',
+  'qa/cases/determinism/journal-tick-stamps-and-summary-agree.md',
+  'qa/cases/determinism/sim-vs-visual-delta-freeze-together.md',
+  'qa/cases/determinism/stepping-is-wall-clock-free.md',
+  'qa/cases/editor/cmd-s-during-play-saves-assets-not-scene.md',
+  'qa/cases/gameview/step-advances-exactly-one-tick.md',
+  'qa/cases/physics/contact-event-fires-once-per-contact.md',
+  'qa/cases/physics/timescale-freezes-physics-contacts-stay-fresh.md',
+  'qa/cases/video/2d-sprite-path-decodes-and-paints.md',
+  'qa/cases/video/3d-screen-playback-timescale-pause.md',
+];
+
+/** A procedure section. `qa/README.md` calls the headings a CONVENTION, so this accepts the four
+ *  spellings the corpus actually uses (`## Steps`, `## Steps — Part A`, `### Steps`, `## Part A`)
+ *  rather than the one the spec suggests — matching only `## Steps` missed 4 of the 52 cases that
+ *  press Play, silently. */
+const PROCEDURE_HEADING = /^#{2,3}\s+(?:.*\bSteps\b|Part\b)/i;
+
+export interface PlayOrderingScan {
+  /** false when no procedure heading was found — the state the coverage floor exists to catch. */
+  scannable: boolean;
+  /** One entry per scene write issued while Playing. */
+  offenders: string[];
+  /** True when the procedure ends without returning to Stopped (#1121). */
+  endsPlaying: boolean;
+}
+
+/**
+ * Play/Stop/scene-write ordering scanner for the guards above.
+ *
+ * Scans from the FIRST procedure heading to the END of the body, not one `## Steps` block: the
+ * corpus has multi-part cases (`## Steps — Part A` / `Part B`) and cases whose Play/mutate pair
+ * lives in a later section entirely (`assets/sprite-anim-editor-clip-authoring.md`). It must NOT
+ * start earlier than that, though — `rendering/postfx-stack-composes.md` mentions a Play in its
+ * `## Preconditions`, before the Steps' deliberately pre-Play mutate, so scanning the whole body
+ * false-positives on a correct case.
+ *
+ * Ordering is by match POSITION, not line by line: the original defective step wrapped between
+ * `modoki_mutate_scene` and its `{ops:`, so a line scanner would have missed the very thing this
+ * guards. Position ordering also makes a same-line "Stop FIRST, then mutate" read correctly.
+ *
+ * TRANSPORT IS NOT JUST `play_control`. Six cases drive it by tapping the Game panel's toolbar,
+ * whose own case title says that button "drives the same play-state machine"; and `load_scene` /
+ * `new_scene` return to Stopped (their tool descriptions say so). Missing the tap forms cost
+ * accuracy in BOTH directions — a missed Play hides a real defect, but a missed STOP flags a
+ * correct case, which is the direction that gets a guard disabled.
+ *
+ * ⚠️ DELIBERATELY CONSERVATIVE, with the bounds stated rather than left to be discovered:
+ *
+ * - A write counts only where the tool name is followed by an opening BRACE, i.e. an actual call.
+ *   Cases legitimately NAME these tools in prose, including to warn against them —
+ *   QA-TIMELINE-0002's own step 5 reads *"Do NOT fall back to `modoki_mutate_scene`"*, which a bare
+ *   name match would flag as the defect it warns about. The cost is a false NEGATIVE on a braceless
+ *   prose call; `video/delivery-bundled-and-remote-cache.md` step 11 has one and is CORRECT (it
+ *   Stops first, and says why).
+ * - `modoki_save_all` is out of scope. It is blocked during Play too, but by `editorAction`
+ *   ('save-all'), NOT by this 409 — and it takes no arguments, so cases write it bare far more often
+ *   than braced: the brace rule would give it near-zero coverage and the bare rule would flag every
+ *   prose mention.
+ * - `pause` does not clear the hazard (the route refuses `paused` as well as `playing`), and
+ *   `resume` cannot reach an accepting state either (`resume` from stopped is itself refused), so
+ *   only `stop` transitions out.
+ * - Timeline `preview`/`scrub` run modes collapse to `stopped` in the `playState` the route reads,
+ *   so a mutate during a preview does not hit this 409 and is correctly not modelled here.
+ */
+export function scanPlayOrdering(body: string): PlayOrderingScan {
+  const lines = body.split(/\r?\n/);
+  const start = lines.findIndex((l) => PROCEDURE_HEADING.test(l));
+  if (start < 0) return { scannable: false, offenders: [], endsPlaying: false };
+  const region = lines.slice(start + 1).join('\n');
+
+  // `[^}]` cannot cross a `}`, so nested braces in `{ops:[{op:'setTrait'…}]}` cannot bleed into the
+  // next call and two adjacent calls cannot be spanned as one. The window is bounded rather than
+  // brace-anchored so the forms the corpus already uses all match: JSON-quoted keys
+  // (`{"action":"stop"}`, the style inside `modoki_batch`), spaces around the colon, a
+  // batch-wrapped `{tool:'modoki_play_control', args:{action:'stop'}}`, and an intervening backtick.
+  const TRANSPORT = (verb: string) =>
+    new RegExp(`play_control[^}]{0,80}?["']?action["']?\\s*:\\s*["']${verb}["']`, 'g');
+  const events: { at: number; kind: 'play' | 'stop' | 'write'; text?: string }[] = [];
+  const add = (re: RegExp, kind: 'play' | 'stop') => {
+    for (const m of region.matchAll(re)) events.push({ at: m.index ?? 0, kind });
+  };
+  add(TRANSPORT('play'), 'play');
+  add(/gameView\.toolbar\.play/g, 'play');
+  add(TRANSPORT('stop'), 'stop');
+  add(/gameView\.toolbar\.stop/g, 'stop');
+  add(/\b(?:modoki_)?(?:load_scene|new_scene)`?\s*\{/g, 'stop');
+  for (const m of region.matchAll(/\b(modoki_mutate_scene|modoki_set_transform)`?\s*\{/g)) {
+    events.push({ at: m.index ?? 0, kind: 'write', text: m[1] });
+  }
+  events.sort((a, b) => a.at - b.at);
+
+  const offenders: string[] = [];
+  let playing = false;
+  for (const e of events) {
+    if (e.kind === 'play') playing = true;
+    else if (e.kind === 'stop') playing = false;
+    else if (playing) {
+      offenders.push(
+        `${e.text} is called while Playing — /api/scene-mutate answers 409 there, so that step ` +
+          `never runs. Write the value BEFORE the Play, or Stop first (qa/knowledge.md § 4). To ` +
+          `drive a Director mid-Play use engine.director. A case whose SUBJECT is the 409 belongs ` +
+          `in PLAY_WRITE_ALLOWED with a reason.`,
+      );
+    }
+  }
+  return { scannable: true, offenders, endsPlaying: playing };
+}
+
+/**
+ * The scanner's OWN accept and reject sides. Not gated on `HAS_CASES`: the corpus assertions are
+ * green today, so they prove nothing about whether the scanner works — only these do, and they must
+ * keep working in the OSS snapshot, which ships `tests/**` without `qa/`.
+ */
+describe('scanPlayOrdering', () => {
+  const wrap = (steps: string, heading = '## Steps') => `## Preconditions\n\np\n\n${heading}\n\n${steps}\n`;
+  const offenders = (steps: string, heading?: string) => scanPlayOrdering(wrap(steps, heading)).offenders;
+
+  it('FLAGS a mutate issued after Play — the defect itself (#1093)', () => {
+    const found = offenders("1. `modoki_play_control {action:'play'}`.\n2. `modoki_mutate_scene {ops:[]}`.");
+    expect(found).toHaveLength(1);
+    expect(found[0]).toContain('modoki_mutate_scene');
+  });
+
+  it('FLAGS it when the brace wraps to the next line, as the original step 5 did', () => {
+    expect(
+      offenders("1. `modoki_play_control {action:'play'}`.\n2. then `modoki_mutate_scene\n   {ops:[]}`."),
+    ).toHaveLength(1);
+  });
+
+  it('FLAGS a mutate after a PAUSE — the route refuses `paused` as well as `playing`', () => {
+    expect(
+      offenders(
+        "1. `modoki_play_control {action:'play'}`.\n2. `modoki_play_control {action:'pause'}`.\n" +
+          '3. `modoki_mutate_scene {ops:[]}`.',
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('FLAGS a mutate after Play entered by TAPPING the Game toolbar', () => {
+    expect(
+      offenders(
+        '1. `modoki_tap {selector:\'[data-ui-id="gameView.toolbar.play"]\'}`.\n' +
+          '2. `modoki_mutate_scene {ops:[]}`.',
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('FLAGS it inside a `## Steps — Part B` section, which the first draft could not see', () => {
+    expect(
+      offenders("1. `modoki_play_control {action:'play'}`.\n2. `modoki_mutate_scene {ops:[]}`.", '## Steps — Part A'),
+    ).toHaveLength(1);
+  });
+
+  it('accepts a mutate BEFORE the Play — the shape qa/knowledge.md § 4 prescribes', () => {
+    expect(offenders("1. `modoki_mutate_scene {ops:[]}`.\n2. `modoki_play_control {action:'play'}`.")).toEqual([]);
+  });
+
+  it('accepts a Stop written with JSON-quoted keys, as `modoki_batch` steps are', () => {
+    expect(
+      offenders(
+        "1. `modoki_play_control {action:'play'}`.\n2. `modoki_play_control {\"action\":\"stop\"}`.\n" +
+          '3. `modoki_mutate_scene {ops:[]}`.',
+      ),
+    ).toEqual([]);
+  });
+
+  it('accepts a Stop wrapped in a `modoki_batch` step', () => {
+    expect(
+      offenders(
+        "1. `modoki_play_control {action:'play'}`.\n" +
+          "2. `modoki_batch {steps:[{tool:'modoki_play_control', args:{action:'stop'}}]}`.\n" +
+          '3. `modoki_mutate_scene {ops:[]}`.',
+      ),
+    ).toEqual([]);
+  });
+
+  it('accepts a Stop performed by TAPPING the toolbar — the false-positive direction', () => {
+    expect(
+      offenders(
+        "1. `modoki_play_control {action:'play'}`.\n" +
+          '2. `modoki_tap {selector:\'[data-ui-id="gameView.toolbar.stop"]\'}`.\n' +
+          '3. `modoki_mutate_scene {ops:[]}`.',
+      ),
+    ).toEqual([]);
+  });
+
+  it('accepts a mutate after a `load_scene`, which returns to Stopped', () => {
+    expect(
+      offenders(
+        "1. `modoki_play_control {action:'play'}`.\n2. `modoki_load_scene {path:'/a.scene.json'}`.\n" +
+          '3. `modoki_mutate_scene {ops:[]}`.',
+      ),
+    ).toEqual([]);
+  });
+
+  it('accepts a mutate after an intervening Stop, even on the same line', () => {
+    expect(
+      offenders(
+        "1. `modoki_play_control {action:'play'}`.\n" +
+          "2. `modoki_play_control {action:'stop'}` FIRST, then `modoki_mutate_scene {ops:[]}`.",
+      ),
+    ).toEqual([]);
+  });
+
+  it('does NOT flag a prose WARNING against the tool — QA-TIMELINE-0002 step 5 says exactly this', () => {
+    expect(
+      offenders(
+        "1. `modoki_play_control {action:'play'}`.\n" +
+          '2. ⚠️ **Do NOT fall back to `modoki_mutate_scene`** — it 409s during Play by design.',
+      ),
+    ).toEqual([]);
+  });
+
+  it('does NOT read a Play mentioned in Preconditions, before the procedure begins', () => {
+    // postfx-stack-composes.md is exactly this: a Play in Preconditions, a deliberate pre-Play
+    // mutate in step 2. Scanning the whole body would flag a correct case.
+    expect(
+      scanPlayOrdering(
+        "## Preconditions\n\n- `modoki_play_control {action:'play'}` first.\n\n## Steps\n\n" +
+          '1. `modoki_mutate_scene {ops:[]}` while STOPPED.\n',
+      ).offenders,
+    ).toEqual([]);
+  });
+
+  it('reports `scannable:false` for a body with no procedure heading — the coverage floor case', () => {
+    const r = scanPlayOrdering('## Why this case exists\n\nprose only.\n');
+    expect(r.scannable).toBe(false);
+    expect(r.offenders).toEqual([]);
+  });
+
+  it('reports `endsPlaying` for a procedure that never returns to Stopped (#1121)', () => {
+    expect(scanPlayOrdering(wrap("1. `modoki_play_control {action:'play'}`.")).endsPlaying).toBe(true);
+    expect(
+      scanPlayOrdering(
+        wrap("1. `modoki_play_control {action:'play'}`.\n2. `modoki_play_control {action:'stop'}`."),
+      ).endsPlaying,
+    ).toBe(false);
+  });
 });
