@@ -18,7 +18,7 @@
 
 import { describe, expect, it } from 'vitest';
 import {
-  indexScene, resolveBoxWidthPx, resolveContentWidthPx, measureTextFitInOwnBox,
+  indexScene, resolveBoxWidthPx, resolveContentWidthPx, measureTextFitInOwnBox, MAX_DEPTH,
   type AuthoredEntity, type BudgetContext, type Viewport,
 } from '../../packages/modoki/tests/helpers/authoredTextBudget';
 
@@ -42,6 +42,9 @@ const ent = (
  * perverse. They were also load-sensitive. Cost is asserted by counting parent lookups instead.
  */
 describe('a parentId CYCLE terminates instead of hanging (#1119 close-out)', () => {
+  /** Parent lookups a two-entity cycle may cost. `seen` makes it ~2; the depth cap alone, ~65. */
+  const CYCLE_LOOKUP_BOUND = 8;
+
   /** Two entities whose parents are each other, both with a definite px width. */
   const pxCycle = () => indexScene([
     ent('A', { width: 100, widthUnit: 'px' }, 'g-B'),
@@ -97,10 +100,21 @@ describe('a parentId CYCLE terminates instead of hanging (#1119 close-out)', () 
       } as unknown as typeof base.byGuid,
     };
     resolveContentWidthPx(a, counting, VP);
-    // With `seen`: the parent is looked up, recognised as already on the path, and the walk stops.
-    // Without it: the walk runs to MAX_DEPTH (65+ lookups).
+
+    /**
+     * ⚠️ **The bound below only separates the two fixes while `MAX_DEPTH` stays far above it**, and
+     * that coupling was implicit until a close-out review pointed at it. With `seen` a cycle costs
+     * ~2 lookups; without it the walk runs to the cap, ~65. Lower the cap to 4 and `lookups < 8`
+     * holds for the WRONG REASON — the depth cap stopping it — silently voiding the only case that
+     * pins `seen`, in the test written because that guard had zero coverage. So assert the premise,
+     * not just the consequence: this reds loudly if the cap is ever brought down near the bound.
+     */
+    expect(MAX_DEPTH, `MAX_DEPTH is ${MAX_DEPTH}, too close to this case's ${CYCLE_LOOKUP_BOUND}-`
+      + 'lookup bound for that bound to mean anything. Either raise it back, or re-express this '
+      + 'case so it still distinguishes the seen-set guard from the depth cap')
+      .toBeGreaterThanOrEqual(CYCLE_LOOKUP_BOUND * 4);
     expect(lookups, `a cyclic chain cost ${lookups} parent lookups — the seen-set guard is not `
-      + 'stopping it, and only the depth cap is').toBeLessThan(8);
+      + 'stopping it, and only the depth cap is').toBeLessThan(CYCLE_LOOKUP_BOUND);
   });
 
   it('walks an acyclic chain ONCE per level, not twice', () => {

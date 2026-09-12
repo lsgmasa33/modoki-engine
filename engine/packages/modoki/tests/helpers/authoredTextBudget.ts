@@ -102,8 +102,14 @@ export function indexScene(entities: readonly AuthoredEntity[]): SceneIndex {
  * threads it down (linear, not exponential), and `seen` below makes a revisited entity return
  * `null` immediately. The cap survives only for a chain that is pathologically deep without being
  * cyclic.
+ *
+ * ⚠️ **Exported so a test can assert AGAINST it.** A cycle costs ~2 parent lookups with `seen` and
+ * ~65 without, so a test bounding the lookups at a small number is what distinguishes the two
+ * fixes — but only while this cap stays far above that bound. Lower it to 4 and the bound holds for
+ * the wrong reason, silently voiding the one case that pins `seen`. The engine test reads this
+ * value rather than assuming it.
  */
-const MAX_DEPTH = 64;
+export const MAX_DEPTH = 64;
 
 /**
  * One authored length in px, resolving its unit through the engine's own table.
