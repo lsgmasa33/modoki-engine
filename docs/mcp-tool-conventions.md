@@ -823,11 +823,31 @@ Three things about it are load-bearing:
   `main`; its only lever *disables* the check), so a typo like `'Main'` would be invisible to
   `verify`, to CI and to every worker, and would first execute on the hub — once — seeding the file
   it exists to prevent.
-- ⚠️ **A row is not authorship.** It says *this tool measured N bytes on this clone on this date,
-  having moved D since this clone last looked*. A worker merges `origin/main` before pushing, so an
-  observed delta may be work that arrived from another clone entirely. `sha` is what turns an
-  interesting row into an answer; the ledger's job is to make you read four rows instead of an
-  anonymous 4 KB.
+- ⚠️ **A row says what a lane SPENT — since #1103, and not before it.** It reads *this tool
+  measured N bytes on this clone on this date, having moved D since ANYONE last looked at a commit
+  in this clone's history*. The baseline is the whole `ledger/*.csv` corpus, not this clone's own
+  file, so **work that merely arrived via `git merge` books nothing** and a clone's column sums to
+  what that lane actually spent — which is the question #894 created the ledger to answer.
+
+  ⚠️ **This bullet said the OPPOSITE until 2026-09-12** — *"a worker merges `origin/main` before
+  pushing, so an observed delta may be work that arrived from another clone entirely"* — which
+  stated the defect as a guarantee. #1103 fixed it in `surfaceLedger.ts` and rewrote the module's
+  own docblock; the retraction never reached this doc, so for two days § 10a taught the invariant
+  the code had just stopped having. Two limits DO survive: two clones changing the same tool
+  concurrently still book against whoever runs second, and **rows dated on or before 2026-09-12
+  pre-date the fix**, so any sum reaching back past that date still double-counts every merged
+  change. Those were left uncorrected deliberately — the CSV is automated on purpose, and a
+  hand-edited ledger is worse than a wrong one.
+- ⚠️ **"Latest" is ANCESTRY, and it can genuinely have no answer** (#1114). #1103 ordered the corpus
+  by position in `git rev-list HEAD` and called that ancestry; it is not, it is committer DATE —
+  measured at 8,822 commits, monotonic across the whole listing with zero inversions. Rows on
+  divergent branches are **incomparable, permanently**, so the baseline takes the ancestry maxima
+  and breaks a tie on the CURRENT measurement, which is ground truth about the tree you are standing
+  in. An equidistant residual errs toward **under-booking**, and an ambiguity **warns and never
+  gates**. Mechanism, the two fixes that do not work, and why refusing is not an option:
+  `corpusBaseline`'s docblock in `engine/tools/modoki-mcp/surfaceLedger.ts`.
+- `sha` is what turns an interesting row into an answer (`git log`/`git blame` from there); the
+  ledger's job is to make you read four rows instead of an anonymous 4 KB.
 
 ⚠️ **The measurement is shared, and must stay shared.**
 `engine/tools/modoki-mcp/surfaceBytes.ts` owns the walk; both the pin test and the ledger script call

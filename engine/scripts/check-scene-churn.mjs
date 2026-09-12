@@ -34,7 +34,8 @@
 // re-save that closed #123 swapped a legacy page-texture GUID for the sprite GUID the scene
 // actually references, and this gate said "0 semantic changes". A count is the one property a
 // dropped ref can preserve while still being a drop.
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
+import { isGitVerdict } from './gitError.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -69,8 +70,31 @@ for (const proj of process.argv.slice(2)) {
     const rel = path.relative(ROOT, path.join(dir, f)).split(path.sep).join('/');
     totalScenes++;
     let old;
-    try { old = execSync(`git show HEAD:"${rel}"`, { cwd: ROOT, encoding: 'utf8' }); }
-    catch { console.log(`  ${rel}: NEW FILE (untracked)`); continue; }
+    // ⚠️ `maxBuffer`: Node defaults to 1 MiB, and the largest tracked scene is
+    // already games/court's main.scene.json at 369,684 B — 35% of it, and up 2.5x in the
+    // month to 2026-09-12. 64 MiB is the figure `repoCorpus.mjs` already uses for git reads.
+    // ⚠️ `execFileSync` with an argv array, never `execSync` with a shell string. Two reasons, and
+    // the first was found by review AFTER the #1120 fix landed: through a shell, a MISSING git
+    // makes the shell exit 127 — a NUMERIC status — so `isGitVerdict` reads it as a verdict, the
+    // throw is swallowed, and every committed file prints "NEW FILE (untracked)". That is the exact
+    // silent-blind gate this fix exists to close, reintroduced by the fix. Without a shell the
+    // failure is ENOENT with `status: null`, which is not a verdict. Second: no shell means no
+    // quoting, which is the Windows hazard the note above records (`repoCorpus.mjs` § execSync).
+    try { old = execFileSync('git', ['show', `HEAD:${rel}`], { cwd: ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }); }
+    catch (e) {
+      // ⚠️ ONLY a completed-but-failed git run may be read as "this file is not in HEAD". A throw
+      // with no numeric `status` means the process never returned a verdict at all — measured:
+      // exceeding maxBuffer gives `code:'ENOBUFS', status:null`, while git saying no gives
+      // `status:128`. Swallowing the first reported a long-committed scene as untracked and
+      // SKIPPED ITS DIFF, so the review gate went blind on the largest file it has to read. That
+      // is the same silent-stop this file's own note above already records for the Windows-quoting
+      // cause (#1120).
+      if (!isGitVerdict(e)) {
+        throw new Error(`${rel}: \`git show\` did not complete (${e.code ?? e.message}) — refusing to `
+          + 'report a committed file as untracked and skip its diff.', { cause: e });
+      }
+      console.log(`  ${rel}: NEW FILE (untracked)`); continue;
+    }
     const cur = fs.readFileSync(path.join(dir, f), 'utf8');
     if (old === cur) continue;
     totalChanged++;

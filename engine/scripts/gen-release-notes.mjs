@@ -13,6 +13,7 @@
 // before this so the shallow tag checkout can see prior tags + history.
 
 import { execFileSync } from 'node:child_process';
+import { isGitVerdict } from './gitError.mjs';
 import { writeFileSync } from 'node:fs';
 
 const tag = process.argv[2] || process.env.GITHUB_REF_NAME;
@@ -23,9 +24,21 @@ if (!tag) {
   process.exit(1);
 }
 
-const git = (...args) => execFileSync('git', args, { encoding: 'utf8' }).trim();
+// ⚠️ `maxBuffer`: the `log --no-merges --pretty=format:%s` below is 636,333 B over the FULL
+// history on 2026-09-12 — and the full history is exactly what it reads when `describe` finds no
+// previous tag (the first tag on a line), i.e. 61% of Node's 1 MiB default. 64 MiB matches
+// `repoCorpus.mjs`.
+const git = (...args) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).trim();
 const gitSafe = (...args) => {
-  try { return git(...args); } catch { return ''; }
+  try { return git(...args); } catch (e) {
+    // ⚠️ Only a git VERDICT is swallowed. `describe` legitimately fails with status 128 when there
+    // is no previous tag, which is what this wrapper exists for — but a throw with no numeric
+    // `status` means the command never ran to a verdict (measured: maxBuffer overflow gives
+    // `code:'ENOBUFS', status:null`; git saying no gives `status:128`). Returning '' for THAT
+    // emitted empty release notes and exited 0 (#1120).
+    if (!isGitVerdict(e)) throw e;
+    return '';
+  }
 };
 
 // Previous tag = the closest annotated/lightweight tag reachable from this tag's parent.

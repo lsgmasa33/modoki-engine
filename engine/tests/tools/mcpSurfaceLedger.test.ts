@@ -11,8 +11,9 @@
 
 import { describe, it, expect } from 'vitest';
 import {
-  LEDGER_HEADER, parseLedger, lastKnownSizes, corpusBaseline, ledgerDelta, renderLedger,
-  appendChunk, assertCsvSafe, ledgerSkipReason, type LedgerRow,
+  LEDGER_HEADER, parseLedger, lastKnownSizes, buildAncestry, corpusBaseline, ledgerDelta,
+  renderLedger, appendChunk, assertCsvSafe, ledgerSkipReason,
+  type LedgerRow, type BaselineAmbiguity,
 } from '../../tools/modoki-mcp/surfaceLedger';
 
 const row = (over: Partial<LedgerRow> = {}): LedgerRow => ({
@@ -229,99 +230,319 @@ describe('MCP surface ledger (#894)', () => {
   });
 });
 
-describe('the baseline is the CORPUS, so a merge books nothing (#1103)', () => {
-  /** The numbers here are the REAL ones from the committed corpus on 2026-09-12, because the bug
-   *  was found there and a synthetic pair would not show that the same bytes were booked three
-   *  times: `work-ai3` authored `modoki_press_key`'s +361 at `0d034e370` (2473 -> 2834), and
-   *  `work-ai2` and `work-qa` each booked the identical 361 after merely merging it. */
+describe('the baseline is the CORPUS, ordered by ANCESTRY (#1103, corrected by #1114)', () => {
+  /** Real numbers from the committed corpus on 2026-09-12, because the bug was found there and a
+   *  synthetic pair would not show that the same bytes were booked three times: `work-ai3` authored
+   *  `modoki_press_key`'s +361 at `0d034e370` (2473 -> 2834), and `work-ai2` and `work-qa` each
+   *  booked the identical 361 after merely merging it. */
   const PRESS_BEFORE = 2473;
   const PRESS_AFTER = 2834;
+  const TOOL = 'modoki_press_key';
 
-  /** Rank 0 is HEAD, larger is older — the shape `gen-surface-ledger.ts` builds from `git rev-list`. */
-  const order = (pairs: Record<string, number>) => new Map(Object.entries(pairs));
+  /** `git rev-list --topo-order --parents` text for a hand-written DAG, children first: each entry
+   *  is `[commit, ...parents]`. ⚠️ Everything in this block runs off text like this and never
+   *  touches a git repo — that IS #1114's second half. #1103 put this predicate in
+   *  `gen-surface-ledger.ts`, the thin shell with no tests, where nothing could drive it. */
+  const dag = (...entries: string[][]) => entries.map((e) => e.join(' ')).join('\n');
+  const anc = (revListParents: string, ...shas: string[]) =>
+    buildAncestry({ revListParents, shas });
 
-  it('does NOT re-book a tool whose change arrived by merge', () => {
-    // work-qa's own file stops at the pre-change size; work-ai3's row (newer commit) carries the
-    // change, and arrived in work-qa's tree with the merge.
+  /** 100 -> 200 -> 150, newest first. Every pair is comparable, so the tie-break never runs. */
+  const LINEAR = dag(['ccccc33', 'ccccc22'], ['ccccc22', 'ccccc11'], ['ccccc11']);
+
+  /** One merge over two divergent tips. `TIP_RECENT` is the tip a DATE order ranks first — #1103's
+   *  `rev-list` position — and `TIP_OLDER` the other. Neither descends from the other, and a merge
+   *  never makes them comparable, so this ambiguity is permanent. */
+  const TIP_RECENT = 'recent1';
+  const TIP_OLDER = 'older11';
+  const DIVERGENT = dag(
+    ['merge11', TIP_RECENT, TIP_OLDER],
+    [TIP_RECENT, 'base111'],
+    [TIP_OLDER, 'base111'],
+    ['base111'],
+  );
+
+  it('buildAncestry reads the DAG from TEXT alone — no git, no repo (#1114)', () => {
+    const a = anc(LINEAR, 'ccccc11', 'ccccc22', 'ccccc33');
+    expect(a.size).toBe(3);
+    expect(a.isAncestor('ccccc11', 'ccccc33')).toBe(true);    // older is an ancestor of newer
+    expect(a.isAncestor('ccccc33', 'ccccc11')).toBe(false);   // and not the other way round
+    expect(a.isAncestor('ccccc22', 'ccccc22')).toBe(true);    // reflexive
+  });
+
+  it('two divergent tips are incomparable — FALSE in both directions, permanently', () => {
+    // MUTATION CHECK: make `isAncestor` return true unconditionally -> red here.
+    //
+    // ⚠️ This is why "refuse to choose when incomparable" is not an available answer, and why the
+    // issue's scope question rested on a premise that does not hold: #1103's own headline case has
+    // exactly this shape, so a design that bails here bails on it, forever.
+    const a = anc(DIVERGENT, TIP_RECENT, TIP_OLDER);
+    expect(a.isAncestor(TIP_RECENT, TIP_OLDER)).toBe(false);
+    expect(a.isAncestor(TIP_OLDER, TIP_RECENT)).toBe(false);
+  });
+
+  it('a LINEAR history takes the latest ancestor, even when an older row is NEARER the current size', () => {
+    // 100 -> 200 -> 150, measuring 190 now. Nearest-to-current alone picks 200; the answer is 150,
+    // because 150 is simply the latest observation and nothing here is ambiguous.
+    //
+    // MUTATION CHECK: delete the maxima filter, keeping only the nearest-to-current sort -> red
+    // (picks 200). This is the test that proves the ancestry half is not decorative.
     const rows = [
-      row({ clone: 'work-qa', tool: 'modoki_press_key', toolBytesAfter: PRESS_BEFORE, sha: 'old11111' }),
-      row({ clone: 'work-ai3', tool: 'modoki_press_key', toolBytesAfter: PRESS_AFTER, sha: 'new22222' }),
+      row({ tool: TOOL, toolBytesAfter: 100, sha: 'ccccc11' }),
+      row({ tool: TOOL, toolBytesAfter: 200, sha: 'ccccc22' }),
+      row({ tool: TOOL, toolBytesAfter: 150, sha: 'ccccc33' }),
     ];
     const lastKnown = corpusBaseline({
-      rows, order: order({ old11111: 9, new22222: 3 }), fallbackClone: 'work-qa',
+      rows,
+      ancestry: anc(LINEAR, 'ccccc11', 'ccccc22', 'ccccc33'),
+      current: new Map([[TOOL, 190]]),
+      fallbackClone: 'work-qa',
     });
-    expect(lastKnown.get('modoki_press_key')).toBe(PRESS_AFTER);
+    expect(lastKnown.get(TOOL)).toBe(150);
+  });
+
+  it("#1103's case: a change that arrived by MERGE is not re-booked", () => {
+    // work-qa's own file stops at the pre-change size; work-ai3's row carries the change and
+    // arrived in work-qa's tree with the merge. The correct row is ALSO the later-dated one here,
+    // which is exactly why #1103's date ordering worked on this case and was never caught.
+    //
+    // MUTATION CHECK: swap the tie-break to "later committer date" (i.e. prefer TIP_RECENT) ->
+    // STAYS GREEN. Paired with the hazard test below — same mutation, goes RED — that is the pair
+    // that tells the two cases apart. Neither test alone can.
+    const rows = [
+      row({ clone: 'work-ai3', tool: TOOL, toolBytesAfter: PRESS_AFTER, sha: TIP_RECENT }),
+      row({ clone: 'work-qa', tool: TOOL, toolBytesAfter: PRESS_BEFORE, sha: TIP_OLDER }),
+    ];
+    const lastKnown = corpusBaseline({
+      rows,
+      ancestry: anc(DIVERGENT, TIP_RECENT, TIP_OLDER),
+      current: new Map([[TOOL, PRESS_AFTER]]),
+      fallbackClone: 'work-qa',
+    });
+    expect(lastKnown.get(TOOL)).toBe(PRESS_AFTER);
 
     const added = ledgerDelta({
-      perTool: new Map([['modoki_press_key', PRESS_AFTER]]),
-      lastKnown, date: '2026-09-12', clone: 'work-qa', sha: 'merge333',
+      perTool: new Map([[TOOL, PRESS_AFTER]]),
+      lastKnown, date: '2026-09-12', clone: 'work-qa', sha: 'merge11',
     });
-    expect(added).toEqual([]); // the pre-#1103 answer was one row booking +361 against work-qa
+    expect(added).toEqual([]);   // the pre-#1103 answer was one row booking +361 against work-qa
+  });
+
+  it("#1114's hazard: the later-DATED row is the STALE one, and date ordering inverts it", () => {
+    // `win` seeds a row at a later-dated commit that predates work-ai's change, on a divergent
+    // branch. Rank-by-date reverts the baseline BELOW what was already recorded, so the next run
+    // books the same bytes a second time — the exact double-count #1103 removed.
+    //
+    // MUTATION CHECK: swap the tie-break to "later committer date" -> RED (picks 100).
+    const rows = [
+      row({ clone: 'win', tool: TOOL, toolBytesAfter: 100, sha: TIP_RECENT }),
+      row({ clone: 'work-ai', tool: TOOL, toolBytesAfter: 461, sha: TIP_OLDER }),
+    ];
+    const lastKnown = corpusBaseline({
+      rows,
+      ancestry: anc(DIVERGENT, TIP_RECENT, TIP_OLDER),
+      current: new Map([[TOOL, 461]]),
+      fallbackClone: 'work-ai',
+    });
+    expect(lastKnown.get(TOOL)).toBe(461);
+
+    const added = ledgerDelta({
+      perTool: new Map([[TOOL, 461]]),
+      lastKnown, date: '2026-09-12', clone: 'work-ai', sha: 'merge11',
+    });
+    expect(added).toEqual([]);   // rank-by-date would have booked +361 against work-ai again
+  });
+
+  it('resolves the SHRINK direction too — a larger stale candidate does not win', () => {
+    // MUTATION CHECK: change the tie-break to "always take the larger recorded size" -> red.
+    const rows = [
+      row({ clone: 'win', tool: TOOL, toolBytesAfter: 461, sha: TIP_RECENT }),     // stale
+      row({ clone: 'work-ai', tool: TOOL, toolBytesAfter: 100, sha: TIP_OLDER }),  // merged in
+    ];
+    const lastKnown = corpusBaseline({
+      rows,
+      ancestry: anc(DIVERGENT, TIP_RECENT, TIP_OLDER),
+      current: new Map([[TOOL, 100]]),
+      fallbackClone: 'work-ai',
+    });
+    expect(lastKnown.get(TOOL)).toBe(100);
+  });
+
+  it('an equidistant tie is deterministic, books the SMALLER delta, and WARNS', () => {
+    // Owner, 2026-09-12: the residual arbitrary choice errs toward UNDER-booking. The CSV is
+    // automated and never hand-corrected, so the error is permanent either way, and a permanent
+    // over-bill is the exact defect #1103 removed.
+    //
+    // MUTATION CHECK: drop the `onAmbiguity?.(...)` call -> red on `seen`. Flip the byte
+    // comparator to ascending -> red on the 300.
+    const seen: BaselineAmbiguity[] = [];
+    const rows = [
+      row({ clone: 'win', tool: TOOL, toolBytesAfter: 100, sha: TIP_RECENT }),
+      row({ clone: 'work-ai', tool: TOOL, toolBytesAfter: 300, sha: TIP_OLDER }),
+    ];
+    const lastKnown = corpusBaseline({
+      rows,
+      ancestry: anc(DIVERGENT, TIP_RECENT, TIP_OLDER),
+      current: new Map([[TOOL, 200]]),   // exactly 100 from each candidate
+      fallbackClone: 'work-ai',
+      onAmbiguity: (a) => seen.push(a),
+    });
+    expect(lastKnown.get(TOOL)).toBe(300);
+    expect(seen).toHaveLength(1);
+    expect(seen[0].tool).toBe(TOOL);
+    expect(seen[0].chosen).toBe(300);
+    expect(seen[0].current).toBe(200);
+    expect(seen[0].candidates.map((c) => c.bytes).sort((x, y) => x - y)).toEqual([100, 300]);
+  });
+
+  it('a SETTLED baseline does not warn — the ambiguity line has to mean something', () => {
+    // ⚠️ Non-vacuity for the test above: without this, "it warns" passes just as well on an
+    // implementation that warns on every tool, and the close-out log would be noise nobody reads.
+    //
+    // MUTATION CHECK: fire `onAmbiguity` unconditionally -> red.
+    const seen: BaselineAmbiguity[] = [];
+    corpusBaseline({
+      rows: [row({ tool: TOOL, toolBytesAfter: 150, sha: 'ccccc33' })],
+      ancestry: anc(LINEAR, 'ccccc33'),
+      current: new Map([[TOOL, 150]]),
+      fallbackClone: 'work-qa',
+      onAmbiguity: (a) => seen.push(a),
+    });
+    expect(seen).toEqual([]);
+  });
+
+  it('two SPELLINGS of one commit do not annihilate each other (they are not strict descendants)', () => {
+    // ⚠️ Found by review, not by the gate. Abbreviation length is not fixed — `rev-parse --short`
+    // picks it from the LOCAL object count — so two clones can spell one commit 9 and 10 chars.
+    // Those are different `sha` STRINGS resolving to one commit, so each is an ancestor of the
+    // other. The maxima filter eliminated `r` whenever any `o` with a different STRING was an
+    // ancestor of it, so both rows eliminated each other, `maxima` came out EMPTY, and
+    // `ranked[0].toolBytesAfter` threw a TypeError — an uncaught crash in /close-out § 6, in the
+    // one sub-case the code's own comment claimed to handle.
+    //
+    // MUTATION CHECK: restore the filter to `o.sha !== r.sha && ancestry.isAncestor(r.sha, o.sha)`
+    // (i.e. drop the strictness) -> red with that TypeError.
+    const FULL = 'abc1234def5678';
+    const ancestry = buildAncestry({
+      revListParents: dag([FULL, 'base111'], ['base111']),
+      shas: ['abc1234', 'abc1234d'],
+    });
+    expect(ancestry.isAncestor('abc1234', 'abc1234d')).toBe(true);   // both directions, because
+    expect(ancestry.isAncestor('abc1234d', 'abc1234')).toBe(true);   // they are the same commit
+
+    const rows = [
+      row({ clone: 'work-ai', tool: TOOL, toolBytesAfter: 500, sha: 'abc1234' }),
+      row({ clone: 'work-qa', tool: TOOL, toolBytesAfter: 500, sha: 'abc1234d' }),
+    ];
+    const lastKnown = corpusBaseline({
+      rows, ancestry, current: new Map([[TOOL, 500]]), fallbackClone: 'work-ai',
+    });
+    expect(lastKnown.get(TOOL)).toBe(500);   // agreed measurement, no crash, no ambiguity
+  });
+
+  it('two spellings of one commit that DISAGREE are settled, not crashed', () => {
+    // The same shape where the bytes differ — reachable only via a hand-edit or a
+    // non-deterministic measurement, but it must resolve rather than throw.
+    const FULL = 'abc1234def5678';
+    const seen: BaselineAmbiguity[] = [];
+    const rows = [
+      row({ clone: 'work-ai', tool: TOOL, toolBytesAfter: 500, sha: 'abc1234' }),
+      row({ clone: 'work-qa', tool: TOOL, toolBytesAfter: 600, sha: 'abc1234d' }),
+    ];
+    const lastKnown = corpusBaseline({
+      rows,
+      ancestry: buildAncestry({
+        revListParents: dag([FULL, 'base111'], ['base111']),
+        shas: ['abc1234', 'abc1234d'],
+      }),
+      current: new Map([[TOOL, 600]]),
+      fallbackClone: 'work-ai',
+      onAmbiguity: (a) => seen.push(a),
+    });
+    expect(lastKnown.get(TOOL)).toBe(600);   // nearest to the current measurement
+    expect(seen).toHaveLength(1);
+  });
+
+  it('resolves an ABBREVIATED sha by prefix, and reads a too-short one as UNKNOWN', () => {
+    // Abbreviation length is not fixed — git widens it as a repo grows — so full shas are indexed
+    // on 7 chars and prefix-matched. A sha too short to disambiguate must read as unknown, never as
+    // a match: a relation that silently resolves nothing is indistinguishable from a clean tree,
+    // and the run would book the entire ~150 KB surface against whoever hit it.
+    const FULL = '1234567abcdef';
+    const a = buildAncestry({
+      revListParents: dag([FULL, 'base111'], ['base111']),
+      shas: [FULL.slice(0, 7), FULL.slice(0, 6)],
+    });
+    expect(a.has('1234567')).toBe(true);
+    expect(a.has('123456')).toBe(false);
+    expect(a.isAncestor('1234567', '1234567')).toBe(true);
   });
 
   it('books only what THIS clone added on top of what it inherited', () => {
     const rows = [
-      row({ clone: 'work-qa', tool: 'modoki_press_key', toolBytesAfter: PRESS_BEFORE, sha: 'old11111' }),
-      row({ clone: 'work-ai3', tool: 'modoki_press_key', toolBytesAfter: PRESS_AFTER, sha: 'new22222' }),
+      row({ clone: 'work-qa', tool: TOOL, toolBytesAfter: PRESS_BEFORE, sha: TIP_OLDER }),
+      row({ clone: 'work-ai3', tool: TOOL, toolBytesAfter: PRESS_AFTER, sha: TIP_RECENT }),
     ];
     const lastKnown = corpusBaseline({
-      rows, order: order({ old11111: 9, new22222: 3 }), fallbackClone: 'work-qa',
+      rows,
+      ancestry: anc(DIVERGENT, TIP_RECENT, TIP_OLDER),
+      current: new Map([[TOOL, 3170]]),
+      fallbackClone: 'work-qa',
     });
     const added = ledgerDelta({
-      perTool: new Map([['modoki_press_key', 3170]]),
-      lastKnown, date: '2026-09-12', clone: 'work-qa', sha: 'mine4444',
+      perTool: new Map([[TOOL, 3170]]),
+      lastKnown, date: '2026-09-12', clone: 'work-qa', sha: 'mine444',
     });
     // 3170 - 2834 (inherited), NOT 3170 - 2473 (this clone's own last row).
     expect(added).toHaveLength(1);
     expect(added[0].deltaBytes).toBe(336);
   });
 
-  it('orders by ANCESTRY, not by position in the file', () => {
-    // The NEWER commit is listed FIRST, so a "later row wins" reader picks the stale 2473.
-    const rows = [
-      row({ clone: 'work-ai3', tool: 'modoki_press_key', toolBytesAfter: PRESS_AFTER, sha: 'newaaaa' }),
-      row({ clone: 'work-ai2', tool: 'modoki_press_key', toolBytesAfter: PRESS_BEFORE, sha: 'oldbbbb' }),
-    ];
-    const lastKnown = corpusBaseline({
-      rows, order: order({ newaaaa: 2, oldbbbb: 40 }), fallbackClone: 'work-ai2',
-    });
-    expect(lastKnown.get('modoki_press_key')).toBe(PRESS_AFTER);
-  });
-
   it('ignores a row whose commit is NOT in this tree — it describes a tree we do not have', () => {
     const rows = [
-      row({ clone: 'work-qa', tool: 'modoki_press_key', toolBytesAfter: PRESS_BEFORE, sha: 'inhist1' }),
-      row({ clone: 'win', tool: 'modoki_press_key', toolBytesAfter: 99999, sha: 'unmerged' }),
+      row({ clone: 'work-qa', tool: TOOL, toolBytesAfter: PRESS_BEFORE, sha: TIP_OLDER }),
+      row({ clone: 'win', tool: TOOL, toolBytesAfter: 99999, sha: 'unmerg1' }),
     ];
     const lastKnown = corpusBaseline({
-      rows, order: order({ inhist1: 5 }), fallbackClone: 'work-qa',   // 'unmerged' unranked
+      rows,
+      ancestry: anc(DIVERGENT, TIP_OLDER, 'unmerg1'),   // 'unmerg1' appears in no DAG line
+      current: new Map([[TOOL, PRESS_BEFORE]]),
+      fallbackClone: 'work-qa',
     });
-    expect(lastKnown.get('modoki_press_key')).toBe(PRESS_BEFORE);
+    expect(lastKnown.get(TOOL)).toBe(PRESS_BEFORE);
   });
 
-  it('falls back to this clone\'s own file, in file order, when git could not be asked', () => {
-    // ⚠️ An EMPTY order means "could not rank anything", not "nothing is an ancestor". Treating it
-    // as the latter would leave the baseline empty, which reads as a clean tree — and the run would
-    // book the entire surface against whoever hit the git failure.
+  it("falls back to this clone's own file, in file order, when git could not be asked", () => {
+    // ⚠️ An EMPTY relation means "could not resolve anything", not "nothing is an ancestor".
+    // Treating it as the latter would leave the baseline empty, which reads as a clean tree — and
+    // the run would book the entire surface against whoever hit the git failure.
     const rows = [
-      row({ clone: 'work-qa', tool: 'modoki_press_key', toolBytesAfter: PRESS_BEFORE, sha: 'a' }),
-      row({ clone: 'work-ai3', tool: 'modoki_press_key', toolBytesAfter: PRESS_AFTER, sha: 'b' }),
+      row({ clone: 'work-qa', tool: TOOL, toolBytesAfter: PRESS_BEFORE, sha: 'aaaaaa1' }),
+      row({ clone: 'work-ai3', tool: TOOL, toolBytesAfter: PRESS_AFTER, sha: 'bbbbbb1' }),
     ];
-    const lastKnown = corpusBaseline({ rows, order: new Map(), fallbackClone: 'work-qa' });
-    expect(lastKnown.get('modoki_press_key')).toBe(PRESS_BEFORE); // work-qa's own row, not the corpus
+    const lastKnown = corpusBaseline({
+      rows,
+      ancestry: buildAncestry({ revListParents: '', shas: [] }),
+      current: new Map([[TOOL, PRESS_AFTER]]),
+      fallbackClone: 'work-qa',
+    });
+    expect(lastKnown.get(TOOL)).toBe(PRESS_BEFORE);   // work-qa's own row, not the corpus
   });
 
   it('seeds only on a genuinely EMPTY corpus, not on a fresh clone joining an established one', () => {
     const established = [
-      row({ clone: 'work-ai3', tool: 'modoki_press_key', toolBytesAfter: PRESS_AFTER, sha: 'seen111' }),
+      row({ clone: 'work-ai3', tool: TOOL, toolBytesAfter: PRESS_AFTER, sha: 'ccccc33' }),
     ];
     const inherited = corpusBaseline({
-      rows: established, order: order({ seen111: 1 }), fallbackClone: 'work-ai',
+      rows: established,
+      ancestry: anc(LINEAR, 'ccccc33'),
+      current: new Map([[TOOL, 3170]]),
+      fallbackClone: 'work-ai',
     });
-    expect(inherited.size).toBe(1); // a brand-new clone still has a baseline…
+    expect(inherited.size).toBe(1);   // a brand-new clone still has a baseline…
 
     const added = ledgerDelta({
-      perTool: new Map([['modoki_press_key', 3170]]),
+      perTool: new Map([[TOOL, 3170]]),
       lastKnown: inherited, date: '2026-09-12', clone: 'work-ai', sha: 'fresh22',
       seeding: inherited.size === 0,
     });
@@ -329,7 +550,12 @@ describe('the baseline is the CORPUS, so a merge books nothing (#1103)', () => {
     expect(added).toHaveLength(1);
     expect(added[0].deltaBytes).toBe(336);
 
-    const empty = corpusBaseline({ rows: [], order: new Map(), fallbackClone: 'work-ai' });
-    expect(empty.size).toBe(0); // and a truly empty corpus still seeds
+    const empty = corpusBaseline({
+      rows: [],
+      ancestry: buildAncestry({ revListParents: '', shas: [] }),
+      current: new Map(),
+      fallbackClone: 'work-ai',
+    });
+    expect(empty.size).toBe(0);   // and a truly empty corpus still seeds
   });
 });

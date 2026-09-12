@@ -120,7 +120,14 @@ if (!existsSync(tscBin)) {
  *  never "nothing changed" — every caller maps it to a full sweep. */
 function git(...args) {
   try {
-    return execFileSync('git', args, { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    // ⚠️ `maxBuffer`: the widest read here is `ls-files` over every project dir — 411,337 B on
+    // 2026-09-12, 38% of Node's 1 MiB default, and it grows with the corpus. 64 MiB matches
+    // `repoCorpus.mjs`, and this file already passes that figure for `tsc --listFiles` below.
+    // Overflowing would return `null` here, which every caller reads as "could not tell" and
+    // answers with a full sweep — safe, but for a reason that is not true (#1120).
+    return execFileSync('git', args, {
+      cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024,
+    });
   } catch {
     return null;
   }

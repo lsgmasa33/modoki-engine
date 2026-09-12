@@ -44,7 +44,10 @@ import { repoFiles } from './repoCorpus.mjs';
 import { toPosix } from './pathPosix.mjs';
 import { isEntryPoint } from './entryPoint.mjs';
 
-const git = (...args) => execFileSync('git', args, { encoding: 'utf8' });
+// ⚠️ `maxBuffer`: `git show HEAD:<scene>` below reads whole scene blobs — 369,684 B for the
+// largest on 2026-09-12, 35% of Node's 1 MiB default. This helper has no catch, so overflowing
+// throws rather than lying; the bound is still owed (#1120).
+const git = (...args) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
 const postTo = (backend) => async (path, body) => {
   const res = await fetch(`${backend}${path}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),

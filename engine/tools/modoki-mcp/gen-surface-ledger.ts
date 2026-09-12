@@ -21,13 +21,25 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { perToolBytes } from './surfaceBytes.js';
 import {
-  parseLedger, corpusBaseline, ledgerDelta, renderLedger, appendChunk, assertCsvSafe,
+  parseLedger, buildAncestry, corpusBaseline, ledgerDelta, renderLedger, appendChunk, assertCsvSafe,
   ledgerSkipReason, LEDGER_HEADER,
 } from './surfaceLedger.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
+// ⚠️ An explicit `maxBuffer`: Node defaults to 1 MiB and throws ENOBUFS above it, and the
+// `rev-list --topo-order --parents HEAD` read below is the largest thing this script asks for —
+// **774,695 B on 2026-09-12 at 8,822 commits, already 74% of that default**. 16 MiB leaves room for
+// roughly 20x this history. Same mechanism as the #1120 class, and the reason this one is not ON
+// that list.
+//
+// ⚠️ A git failure here now PROPAGATES rather than degrading. #1103 wrapped the rev-list in
+// `catch { return ranks }`, which turned an unreadable history into an empty relation — the
+// pre-#1103 fallback — and an ENOBUFS would have been indistinguishable from "git said no". That
+// catch is gone on purpose: the three `git()` calls above it (`branch`, `rev-parse`, `status`)
+// are all unguarded already, so this script has never been able to run without git, and a fourth
+// call pretending otherwise only bought a silent wrong answer. Loud is the right failure.
 const git = (...args: string[]) =>
-  execFileSync('git', args, { cwd: here, encoding: 'utf8' }).trim();
+  execFileSync('git', args, { cwd: here, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }).trim();
 
 const clone = process.env.MODOKI_LEDGER_CLONE || git('branch', '--show-current');
 if (!clone) throw new Error('cannot determine the clone: no current branch and no MODOKI_LEDGER_CLONE');
@@ -83,40 +95,40 @@ const corpusRows = [
     }),
 ];
 
-/** Rank every corpus sha by where it sits in THIS tree's history — 0 = HEAD, larger = older, absent
- *  = not an ancestor. One `git rev-list` rather than a `merge-base --is-ancestor` per sha.
- *
- *  ⚠️ CSV shas are ABBREVIATED and the abbreviation length is not fixed (git widens it as a repo
- *  grows), so this indexes the full shas by a 7-char prefix and then prefix-matches. Keying the map
- *  on a guessed length would silently rank nothing on the day git moved to 10 characters — and a
- *  baseline of nothing is indistinguishable from a clean tree, so the run would book the entire
- *  surface against this clone rather than fail. */
-function rankShas(shas: readonly string[]): Map<string, number> {
-  const ranks = new Map<string, number>();
-  if (shas.length === 0) return ranks;
-  let history: string[];
-  try { history = git('rev-list', 'HEAD').split('\n').filter(Boolean); } catch { return ranks; }
-  const byPrefix = new Map<string, { full: string; rank: number }[]>();
-  history.forEach((full, rank) => {
-    const key = full.slice(0, 7);
-    const bucket = byPrefix.get(key);
-    if (bucket) bucket.push({ full, rank }); else byPrefix.set(key, [{ full, rank }]);
-  });
-  for (const short of new Set(shas)) {
-    if (short.length < 7) continue;   // too short to disambiguate — treat as unknown, not as HEAD
-    const hit = (byPrefix.get(short.slice(0, 7)) ?? []).find((c) => c.full.startsWith(short));
-    if (hit) ranks.set(short, hit.rank);
-  }
-  return ranks;
-}
-
-const order = rankShas(corpusRows.map((r) => r.sha));
-if (order.size === 0 && corpusRows.length > 0) {
+// The real ancestry DAG, not a position in `git rev-list` (#1114 — that listing is ordered by
+// committer DATE, so it decided divergent-branch rows by whichever machine's clock ran later). The
+// parsing, prefix resolution and the partial order all live in `surfaceLedger.ts` where the tests
+// drive them directly; this is the one line that has to touch git.
+const ancestry = buildAncestry({
+  revListParents: git('rev-list', '--topo-order', '--parents', 'HEAD'),
+  shas: corpusRows.map((r) => r.sha),
+});
+if (ancestry.size === 0 && corpusRows.length > 0) {
   // Not fatal, but it silently reverts this run to the pre-#1103 behaviour, so it must be visible.
-  console.warn('ledger: could not rank any recorded sha against HEAD — falling back to this '
+  console.warn('ledger: could not resolve any recorded sha against HEAD — falling back to this '
     + "clone's own file, which re-books anything that arrived by merge.");
 }
-const lastKnown = corpusBaseline({ rows: corpusRows, order, fallbackClone: clone });
+
+// The CURRENT measurement is the tie-break's ground truth when two unordered observations
+// disagree about a tool's size, so it is taken once here and used for that and for the delta below.
+const current = perToolBytes();
+const lastKnown = corpusBaseline({
+  rows: corpusRows,
+  ancestry,
+  current,
+  fallbackClone: clone,
+  // ⚠️ WARNS, never gates (owner, 2026-09-12). Two clones diverging is legitimate; failing here
+  // would redden the gate for whichever clone ran next, over a condition it neither caused nor can
+  // clear. See `corpusBaseline`'s docblock for why a `verify` canary was declined.
+  onAmbiguity: (a) => {
+    const pairs = a.candidates.map((c) => c.bytes + ' B @ ' + c.sha).join(' vs ');
+    console.warn(
+      'ledger: ' + a.tool + ' has observations ancestry cannot order '
+      + 'them — ' + pairs + '. Measured now: ' + (a.current ?? 'gone') + '; using '
+      + a.chosen + ' B (the nearest to the current measurement; ties book the smaller delta).',
+    );
+  },
+});
 
 // Seeding is now a property of the CORPUS, not of this clone's file: a new clone joining an
 // established repo inherits real baselines instead of booking the whole 150 KB surface as its own
@@ -124,7 +136,7 @@ const lastKnown = corpusBaseline({ rows: corpusRows, order, fallbackClone: clone
 const seeding = lastKnown.size === 0;
 
 const added = ledgerDelta({
-  perTool: perToolBytes(), lastKnown, date, clone, sha, seeding,
+  perTool: current, lastKnown, date, clone, sha, seeding,
 });
 for (const row of added) assertCsvSafe(row);
 

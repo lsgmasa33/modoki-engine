@@ -938,6 +938,56 @@ offenders survive counts down to zero as the migration succeeds, which is a coun
 outside it — including five guards in the `engine/packages/modoki/tests` project and
 `scripts/scan-publish-safety.mjs` — tracked as **#814**. A green run is not "none exist".
 
+### Every git read passes an explicit `maxBuffer` — and ENOBUFS is never "git said no"
+
+Node caps a `child_process` read at **1 MiB** by default and throws `ENOBUFS` above it. Pass
+`maxBuffer` on every `execFileSync`/`execSync`/`spawnSync` that reads git, and **derive the number
+from a measurement, with the measurement in the comment** — a round number nobody can justify only
+proves that a number is present. Enforced by
+`engine/tests/architecture/gitReadIsBounded.test.ts`, whose `EXEMPT` ledger is the backlog: each
+row names a file, the COUNT of unbounded reads it is allowed, and why each is bounded by something
+other than the repo's size.
+
+⚠️ **Size is the easy half. The half that bites is the `catch`.** Every one of these sites turns a
+throw into a semantic answer, so an overflow arrives as a fact about the repo: before #1120,
+`check-scene-churn.mjs` reported a long-committed scene as `NEW FILE (untracked)` and **skipped its
+diff**, and `gen-release-notes.mjs` emitted **empty release notes at exit 0**. So ask
+`isGitVerdict` (`engine/scripts/gitError.mjs`) before swallowing: a NUMERIC `status` means git ran
+and chose that exit code; anything else means no verdict was returned at all. Measured — overflow
+gives `code:'ENOBUFS', status:null`, git saying no gives `status:128`, a missing binary gives
+`ENOENT`. It asks about `status` rather than `code === 'ENOBUFS'` on purpose: the class is "never
+ran", not the one member that prompted it.
+
+⚠️ **Size the hazard by what the read GROWS with, not by commit count.** #1114 sized its own
+instance at ~25,575 commits (the repo is at 8,822) — years away, and the wrong axis. The nearest
+sites are fed by an authored asset: `games/court`'s `main.scene.json` went 148,417 B -> 369,684 B in
+the month to 2026-09-12, **2.5x, and 35% of the default**, and it is the input to three separate
+`git show` reads.
+
+⚠️ **Never run git through a SHELL — `execFileSync` with an argv array, never `execSync` with a
+command string.** Beyond the Windows quoting hazard `repoCorpus.mjs` already documents, a shell
+**breaks `isGitVerdict`**: a shell that cannot find git exits **127** (9009 on `cmd.exe`), which is
+a NUMERIC status, so the "did git actually answer?" test reads a missing git as a verdict and
+swallows it. Measured — `execSync('git …')` with git off PATH gives `status:127`, while
+`execFileSync('git', …)` gives `code:'ENOENT', status:null`. The scene/prefab churn gates shipped
+this for one commit, which would have printed `NEW FILE (untracked)` for every committed file on a
+machine without git.
+
+⚠️ **A non-vacuity floor must clear the SNAPSHOT's file count, not this clone's.** A guard that
+filters the corpus before asserting its floor can be green on every local run and red on the free
+3-OS public CI. `gitReadIsBounded` sized a floor at 1,500 against 1,518 local files while the
+snapshot leg has 1,145. `corpusProducerIsShared.test.ts`'s own note owns this rule — it is "a fact
+to MEASURE rather than to reason to" — and #1014/#1015 are the scar. Related: the public CI clones
+with `actions/checkout` and **no `fetch-depth`**, so history is depth-1 and any probe that assumes
+a long history (`git rev-list HEAD` being large, a previous tag existing) does not hold there.
+
+⚠️ **A file-level exemption is fail-open, and this guard shipped that way for one commit.**
+Exempting `repoCorpus.mjs` for its one `rev-parse` also pardoned its two `ls-files` reads, so
+deleting `maxBuffer` from the corpus producer left the guard GREEN — a guard for fail-open guards,
+failing open, found only because the mutation check was run. Hence the count. The general lesson is
+in [falsifiable-tests.md](falsifiable-tests.md): an allowlist keyed coarser than the thing it
+pardons widens silently.
+
 ### Source-scanning guards, and the ONE comment scanner they share
 
 A large family of guards works by reading source off disk and asserting that a forbidden pattern

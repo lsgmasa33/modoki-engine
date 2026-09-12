@@ -102,82 +102,278 @@ export function lastKnownSizes(rows: readonly LedgerRow[]): Map<string, number> 
   return out;
 }
 
-/** Where each row's commit sits in THIS tree's history: 0 = HEAD, larger = older, absent = not an
- *  ancestor. Keyed by the sha exactly as the CSV spells it, so the pure function never has to know
- *  about abbreviation lengths — resolving that is the writer's job (`gen-surface-ledger.ts`). */
-export type ShaRank = ReadonlyMap<string, number>;
+/** How many leading characters of a sha the corpus index is keyed on. Git's own default
+ *  abbreviation floor, and the shortest prefix `buildAncestry` will attempt to resolve. */
+const PREFIX_LEN = 7;
 
-/** The baseline the next diff is taken against: the most recent size ANY clone recorded for each
- *  tool, among rows whose commit is in this tree's history (#1103).
+/** Ancestry among the shas the ledger corpus records, resolved against THIS tree.
+ *
+ *  Replaces #1103's `ShaRank` — a position in `git rev-list HEAD`, which was a TOTAL order by
+ *  committer date wearing an ancestry name (#1114). */
+export type ShaAncestry = {
+  /** Is this sha in this tree at all? One that is not describes a tree we do not have. */
+  has(sha: string): boolean;
+  /** Is `a` an ancestor of `b`? REFLEXIVE — a sha is its own ancestor. Two shas on divergent
+   *  branches are incomparable: FALSE IN BOTH DIRECTIONS, which is the case `corpusBaseline`'s
+   *  tie-break exists to handle, and the case that has no "later". */
+  isAncestor(a: string, b: string): boolean;
+  /** How many recorded shas resolved. Zero means "could not ask git", never "nothing is an
+   *  ancestor" — `corpusBaseline` keys its fallback off this and the writer warns on it. */
+  readonly size: number;
+};
+
+/** Build the ancestry relation for `shas` from the raw text of
+ *  `git rev-list --topo-order --parents HEAD`.
+ *
+ *  Pure: it takes git's OUTPUT, not git. That is the point of #1114. This predicate is the one
+ *  tricky piece of #1103 and it shipped inside `gen-surface-ledger.ts` — the thin shell with no
+ *  tests, where nothing could drive it. `appendChunk`'s docblock below states the rule it broke
+ *  (conventions §9: the script is a thin shell, so logic put there is logic nothing can drive).
+ *  The writer now keeps exactly one line of this: the spawn.
+ *
+ *  ⚠️ **Why the DAG and not `git rev-list` POSITION.** #1103 ranked shas by index in
+ *  `git rev-list HEAD` and called it ancestry. It is not. That listing is reverse-CHRONOLOGICAL:
+ *  measured on this repo at 8,822 commits, committer date decreases monotonically across the entire
+ *  listing, merge commits included, with **zero** inversions. Within one line of history the two
+ *  agree. For two rows on DIVERGENT branches — the only case a six-clone corpus really poses —
+ *  position is decided by committer DATE, across machines, including the Windows clone's clock.
+ *  `--parents` costs one extra flag on a spawn that already happens and yields the real partial
+ *  order; the measured alternative was 441 `merge-base --is-ancestor` spawns at 2.01s, growing
+ *  O(N²) as the corpus adds shas.
+ *
+ *  ⚠️ **`--topo-order` is load-bearing, not tidiness.** Default `rev-list` order is by date, so a
+ *  commit whose parent carries a LATER timestamp — clock skew across six machines, which this repo
+ *  has by construction — can be listed BEFORE that parent. Nothing here reads the order (the walk
+ *  below follows parent edges explicitly), but a future edit reaching for "the first line is HEAD"
+ *  must not find a listing where that is only usually true.
+ *
+ *  ⚠️ **Recorded shas are ABBREVIATED and the length is not fixed** (git widens it as a repo
+ *  grows), so full shas are indexed by a `PREFIX_LEN` prefix and then prefix-matched. Keying on a
+ *  guessed length would silently resolve nothing the day git moves to 10 characters — and a
+ *  relation that knows nothing is indistinguishable from a clean tree, so the run would book the
+ *  entire ~150 KB surface against whoever hit it. An ambiguous prefix takes the FIRST match in
+ *  listing order; measured 0 collisions in 8,822 commits, and a collision would have to fall
+ *  between two commits that BOTH appear in the ledger before it could matter. */
+export function buildAncestry(args: {
+  revListParents: string;
+  shas: readonly string[];
+}): ShaAncestry {
+  const { revListParents, shas } = args;
+  const parents = new Map<string, string[]>();
+  const byPrefix = new Map<string, string[]>();
+  for (const line of revListParents.split('\n')) {
+    const ids = line.trim().split(/\s+/).filter(Boolean);
+    if (ids.length === 0) continue;
+    const [commit, ...rest] = ids;
+    parents.set(commit, rest);
+    const key = commit.slice(0, PREFIX_LEN);
+    const bucket = byPrefix.get(key);
+    if (bucket) bucket.push(commit); else byPrefix.set(key, [commit]);
+  }
+
+  // Resolve each recorded sha to a full one. A sha too short to disambiguate is treated as
+  // UNKNOWN rather than as a match, so it can never silently resolve to HEAD.
+  const full = new Map<string, string>();
+  for (const short of new Set(shas)) {
+    if (short.length < PREFIX_LEN) continue;
+    const hit = (byPrefix.get(short.slice(0, PREFIX_LEN)) ?? []).find((c) => c.startsWith(short));
+    if (hit !== undefined) full.set(short, hit);
+  }
+  // Two recorded spellings can resolve to the SAME commit (different abbreviation lengths across
+  // clones), so the reverse index is one-to-many.
+  const recordedAt = new Map<string, string[]>();
+  for (const [short, f] of full) {
+    const b = recordedAt.get(f);
+    if (b) b.push(short); else recordedAt.set(f, [short]);
+  }
+
+  // Ancestors of each recorded sha, expressed in recorded shas. One parent-edge walk per recorded
+  // sha: the corpus holds tens of distinct shas against thousands of commits, so this is linear in
+  // practice and needs no bitset. Walking from the row we are asking ABOUT yields its ancestors.
+  const ancestorsOf = new Map<string, Set<string>>();
+  for (const [short, start] of full) {
+    const found = new Set<string>();
+    const seen = new Set<string>([start]);
+    const stack: string[] = [start];
+    while (stack.length > 0) {
+      const cur = stack.pop() as string;
+      for (const s of recordedAt.get(cur) ?? []) found.add(s);
+      for (const p of parents.get(cur) ?? []) {
+        if (seen.has(p)) continue;
+        seen.add(p);
+        stack.push(p);
+      }
+    }
+    ancestorsOf.set(short, found);
+  }
+
+  return {
+    size: full.size,
+    has: (sha) => full.has(sha),
+    isAncestor: (a, b) => ancestorsOf.get(b)?.has(a) ?? false,
+  };
+}
+
+/** One tool whose baseline could not be settled by ancestry alone: two or more recorded
+ *  observations on divergent branches, disagreeing about the size. Reported so a human sees it —
+ *  deliberately NOT a gate, see `corpusBaseline`. */
+export type BaselineAmbiguity = {
+  tool: string;
+  /** The incomparable maxima, sha-sorted so the message is stable across runs. */
+  candidates: { sha: string; bytes: number }[];
+  /** What the tool measures in THIS tree right now — the tie-break's ground truth. `undefined`
+   *  when the tool no longer exists. */
+  current: number | undefined;
+  chosen: number;
+};
+
+/** The baseline the next diff is taken against: for each tool, the size recorded by the LATEST
+ *  observation in this tree's history, across every clone's CSV (#1103, corrected by #1114).
  *
  *  ⚠️ **Why the corpus and not this clone's own file.** `lastKnownSizes` above diffs against what
  *  THIS clone last saw, which is correct for local work and wrong across a merge: everything
  *  another clone landed since your last run arrives in your tree at once and is booked again under
- *  you, with the MERGE COMMIT as the sha. Measured on the committed corpus before this fix, the
- *  same 361 B of `modoki_press_key` was booked by THREE clones on one day (`work-ai3` authored it;
+ *  you, with the MERGE COMMIT as the sha. Measured on the committed corpus before #1103, the same
+ *  361 B of `modoki_press_key` was booked by THREE clones on one day (`work-ai3` authored it;
  *  `work-ai2` and `work-qa` each merged it), and `modoki_type_text` and `modoki_ota_publish` the
  *  same. Summing a clone's column to ask "what has this lane spent" therefore over-reported every
- *  lane that merges often — which is the question #894 created the ledger to answer.
+ *  lane that merges often — the question #894 created the ledger to answer.
  *
  *  The fix works because **each clone's CSV travels with its commits**: the merge that brings in
  *  another clone's tool change also brings in the row that booked it, so the information needed to
  *  not re-book is already in the tree when the writer runs.
  *
- *  ⚠️ **Ordered by `git rev-list HEAD` position — which is reverse-CHRONOLOGICAL, not a topological
- *  ancestry order.** An earlier version of this docblock claimed ancestry; that is wrong and the
- *  difference bites exactly where it matters. Within one line of history the two agree. For two rows
- *  on DIVERGENT branches — the only case the corpus really poses — rank is decided by committer
- *  DATE, across machines, including the Windows clone's clock.
+ *  ## "Latest" is a PARTIAL order, and it can genuinely have no answer
  *
- *  What the rank IS still good for: a sha absent from the map is not in this tree at all, so the row
- *  describes a tree this clone does not have and cannot be its baseline. That half is sound.
+ *  `buildAncestry` gives real ancestry, so "latest" means **maximal**: a row no other row descends
+ *  from. In a single line of history there is exactly one, and the tie-break below never runs.
  *
- *  ⚠️ **The date ordering creates one hazard, and it is NOT guarded — see the paragraph below.** A
- *  clone can book a change at X, another clone can seed later-dated rows at W that predate X's
- *  content, and after a merge rank(W) < rank(X) would revert the baseline BELOW what this clone
- *  already recorded — re-booking its own bytes a second time, the exact double-count #1103 removes.
- *  Measured over the committed corpus at the time of the fix: 543 rows, 17 shas, **zero live
- *  instances** — a structural hazard, not a present miscount.
+ *  Two rows on divergent branches are incomparable — neither is later — and after a merge they stay
+ *  incomparable FOREVER, because a merge never makes two divergent commits ancestors of each other.
+ *  So **refusing to choose is not an available answer**: it would stall permanently, and refusing by
+ *  omitting the baseline is worse still, because `ledgerDelta` reads `before ?? 0` and would book
+ *  the tool's ENTIRE size against whoever ran next.
  *
- *  ⚠️ **Deliberately NOT guarded, and a "floor at this clone's own latest row" is the wrong fix —
- *  it was written, tested and reverted.** The two cases are indistinguishable by rank: #1103's
- *  case is *my row old, their merged row new* and the hazard is *my row new, their later-dated row
- *  old*, and in both the wanted answer is the newer OBSERVATION. Rank is committer date, which
- *  settles the first and inverts the second; a rank floor gets the second right by breaking the
- *  first. Telling them apart needs a real ancestry partial order (`merge-base --is-ancestor`),
- *  which `git rev-list` position is not. Tracked as its own issue rather than half-fixed here.
+ *  ⚠️ **#1103's own headline case is one of these.** Its two rows sit on a `work-qa` branch commit
+ *  and a `work-ai3` branch commit; after the merge both are ancestors of HEAD and neither descends
+ *  from the other. Any design that bails on incomparability bails on the case the ledger was fixed
+ *  for.
  *
- *  ⚠️ **An empty `order` falls back to this clone's own file, in file order — the pre-#1103
- *  behaviour.** The point is that a baseline of NOTHING is indistinguishable from a clean tree, so
- *  treating "no ranks" as "nothing is known" would book the entire 150 KB surface against whoever
- *  hit it. Degrading to the old known behaviour is the right failure.
+ *  ## The tie-break: the CURRENT measurement, which is ground truth
  *
- *  ⚠️ **This function cannot tell WHY the map is empty, and an earlier docblock claimed it could.**
- *  The writer returns an empty map both when `git` throws and when no recorded sha prefix-matches
- *  (a branch cut from an old base, a reset past every recorded sha). The second case is the nastier
- *  one: the fallback then trusts rows describing a tree this clone no longer has, so the next delta
- *  can be measured against a FUTURE measurement and book a spurious negative. The writer warns on
- *  an empty map for exactly this reason — read its stderr before trusting a run that printed one. */
+ *  Among incomparable maxima, take the one nearest to what the tool measures in this tree RIGHT
+ *  NOW. That is the discriminator by construction — the candidate agreeing with what we can measure
+ *  is the one whose content is already in our tree, hence already booked. It settles all three
+ *  directions with one rule:
+ *
+ *  | | candidates | current | picks | books |
+ *  |---|---|---|---|---|
+ *  | #1103's case | qa 2473 (stale), ai3 2834 (merged in) | 2834 | 2834 | 0 |
+ *  | #1114's hazard | ai 461 (merged in), win 100 (later-DATED, stale) | 461 | 461 | 0 |
+ *  | a shrink | X 100 (merged in), W 461 (stale) | 100 | 100 | 0 |
+ *
+ *  **Both halves are load-bearing.** Ancestry alone cannot do it (it leaves the ambiguity). Nearest-
+ *  to-current alone cannot either: in a LINEAR history 100 → 200 → 150 with current 190, it picks
+ *  200, but 150 is simply the latest and the corpus sum breaks. Maxima first, then nearest.
+ *
+ *  ⚠️ **This makes the baseline depend on the PRESENT, not only the past** — a real semantic shift,
+ *  and the thing to check in review. It cannot mask a change: it runs only in the ambiguous branch,
+ *  and it only ever chooses BETWEEN observations somebody already recorded. It can never invent a
+ *  baseline that was not booked.
+ *
+ *  ⚠️ **The residual arbitrary choice errs toward UNDER-booking** (owner, 2026-09-12). Equidistant
+ *  candidates — or a tool that no longer exists, so there is nothing to be near — take the LARGER
+ *  recorded size, which books the smaller delta; sha breaks what is left, only for determinism. The
+ *  CSV is automated and never hand-corrected, so whichever way this falls is permanent, and a
+ *  permanent OVER-bill is the exact defect #1103 removed.
+ *
+ *  ⚠️ **An ambiguity WARNS; it is never a gate** (owner, 2026-09-12). `onAmbiguity` fires per tool
+ *  and the writer prints it. A canary in `npm run verify` was considered and declined: two clones
+ *  diverging is legitimate, so it would redden the gate for whichever clone ran next, over a
+ *  condition it did not cause and cannot clear — the ambiguity only resolves when the tool changes
+ *  again. The ledger never votes. The consequence, stated plainly rather than papered over: **the
+ *  tie-break branch is driven by unit tests and by nothing else**, since zero tools in the committed
+ *  corpus are ambiguous today (re-measured 2026-09-12: 550 rows, 21 shas, 105 tools, 18 incomparable
+ *  sha pairs, 0 ambiguous tools).
+ *
+ *  ## Two fixes that do NOT work, so they are not re-proposed
+ *
+ *  - **A floor at this clone's own latest row** — written, tested and REVERTED in #1103's close-out.
+ *    #1103's case is *my row old, their merged row new*; #1114's hazard is *my row new, their
+ *    later-dated row old*. Both want the newer OBSERVATION. A rank floor gets the second right by
+ *    breaking the first. Rescoping it to only the ambiguous bucket does not help — #1103's case
+ *    lives in that bucket.
+ *  - **Committer date as the tie-break inside the ambiguous bucket** — settles #1103's case and
+ *    inverts #1114's. That is #1103's rank wearing a smaller hat.
+ *
+ *  ⚠️ **An empty `ancestry` falls back to this clone's own file, in file order — the pre-#1103
+ *  behaviour.** A baseline of NOTHING is indistinguishable from a clean tree, so treating "nothing
+ *  resolved" as "nothing is known" would book the entire surface against whoever hit it. Degrading
+ *  to the old known behaviour is the right failure.
+ *
+ *  ⚠️ **This function cannot tell WHY the relation is empty.** The writer builds an empty one both
+ *  when `git` throws and when no recorded sha prefix-matches (a branch cut from an old base, a reset
+ *  past every recorded sha). The second is the nastier: the fallback then trusts rows describing a
+ *  tree this clone no longer has, so the next delta can be measured against a FUTURE measurement and
+ *  book a spurious negative. The writer warns on it — read its stderr before trusting such a run. */
 export function corpusBaseline(args: {
   rows: readonly LedgerRow[];
-  order: ShaRank;
+  ancestry: ShaAncestry;
+  current: ReadonlyMap<string, number>;
   fallbackClone: string;
+  onAmbiguity?: (a: BaselineAmbiguity) => void;
 }): Map<string, number> {
-  const { rows, order, fallbackClone } = args;
-  if (order.size === 0) {
+  const { rows, ancestry, current, fallbackClone, onAmbiguity } = args;
+  if (ancestry.size === 0) {
     return lastKnownSizes(rows.filter((r) => r.clone === fallbackClone));
   }
-  const best = new Map<string, { rank: number; bytes: number }>();
+  const byTool = new Map<string, LedgerRow[]>();
   for (const row of rows) {
-    const rank = order.get(row.sha);
-    if (rank === undefined) continue;   // not in this tree at all
-    const prev = best.get(row.tool);
-    // Strictly-less, so the FIRST row wins a tie. A tie means two clones recorded at the same
-    // commit, where the measured size is the same by construction — there is nothing to choose.
-    if (prev === undefined || rank < prev.rank) best.set(row.tool, { rank, bytes: row.toolBytesAfter });
+    if (!ancestry.has(row.sha)) continue;   // not in this tree at all
+    const bucket = byTool.get(row.tool);
+    if (bucket) bucket.push(row); else byTool.set(row.tool, [row]);
   }
+
   const out = new Map<string, number>();
-  for (const [tool, { bytes }] of best) out.set(tool, bytes);
+  for (const [tool, group] of byTool) {
+    // Maximal under ancestry: nothing else in the group STRICTLY descends from it.
+    //
+    // ⚠️ **"Strictly" is load-bearing, and a `sha !==` guard is not enough.** Abbreviation length
+    // is not fixed — `git rev-parse --short` picks it from the LOCAL object count — so two clones
+    // can spell one commit 9 and 10 characters. Those are different `sha` STRINGS resolving to the
+    // same commit, so each is an ancestor of the other; with only the string guard they eliminated
+    // each other, `maxima` came out EMPTY, and `ranked[0]` threw a TypeError — in the one
+    // sub-case the old comment here claimed to handle, and as an uncaught crash in `/close-out`
+    // § 6 now that #1103's catch is gone. Requiring the relation to be one-directional makes
+    // same-commit rows incomparable instead, so they both stand and the tie-break settles them.
+    const strictlyDescends = (a: string, b: string) =>
+      ancestry.isAncestor(a, b) && !ancestry.isAncestor(b, a);
+    const maxima = group.filter((r) => !group.some(
+      (o) => o.sha !== r.sha && strictlyDescends(r.sha, o.sha),
+    ));
+    const distinct = [...new Set(maxima.map((m) => m.toolBytesAfter))];
+    if (distinct.length === 1) { out.set(tool, distinct[0]); continue; }
+
+    const now = current.get(tool);
+    const ranked = [...maxima].sort((a, b) => {
+      if (now !== undefined) {
+        const byNear = Math.abs(a.toolBytesAfter - now) - Math.abs(b.toolBytesAfter - now);
+        if (byNear !== 0) return byNear;
+      }
+      if (a.toolBytesAfter !== b.toolBytesAfter) return b.toolBytesAfter - a.toolBytesAfter;
+      return a.sha < b.sha ? -1 : a.sha > b.sha ? 1 : 0;
+    });
+    const chosen = ranked[0].toolBytesAfter;
+    out.set(tool, chosen);
+    onAmbiguity?.({
+      tool,
+      candidates: maxima
+        .map((m) => ({ sha: m.sha, bytes: m.toolBytesAfter }))
+        .sort((a, b) => (a.sha < b.sha ? -1 : a.sha > b.sha ? 1 : 0)),
+      current: now,
+      chosen,
+    });
+  }
   return out;
 }
 
