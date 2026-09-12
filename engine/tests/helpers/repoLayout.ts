@@ -102,6 +102,23 @@ export function hasPrivateDocs(): boolean {
   return fs.existsSync(path.join(REPO_ROOT, 'docs', 'task-claiming.md'));
 }
 
+/** True when this checkout carries the QA suite (`qa/**`).
+ *
+ *  ⚠️ **`qa/` is absent from the snapshot by a DIFFERENT mechanism from the private docs, which is
+ *  why `hasPrivateDocs()` is the wrong proxy for it.** Those are dropped by an explicit exclusion;
+ *  `qa/` is simply not among the roots `scripts/publish-engine-oss.sh` stages (`git ls-files --
+ *  engine build docs` plus named root files and `demos/<id>`), so it is not excluded from the
+ *  manifest — it was never in it. Nothing would catch a change to one exclusion list silently
+ *  altering the other, because they are not the same list.
+ *
+ *  ⚠️ **Reads `qa/README.md`, which no consumer gates on** — the `hasPrivateDocs()` rule directly
+ *  above, for the same reason: `editorPorts.test.ts` needs `qa/knowledge.md`, so a predicate keyed
+ *  on that file would let a rename switch off the very guard that should have gone red. Added for
+ *  #1102, replacing a hand-rolled `existsSync` that `layoutConditionalTestLedger.test.ts` caught. */
+export function hasQaSuite(): boolean {
+  return fs.existsSync(path.join(REPO_ROOT, 'qa', 'README.md'));
+}
+
 /** True when this checkout carries the committed Claude Code project settings,
  *  `.claude/settings.json` — where the PreToolUse hooks are registered. The snapshot ships no
  *  `.claude/` at all.

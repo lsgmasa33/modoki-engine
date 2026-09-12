@@ -25,6 +25,7 @@ import {
   backendPortForClone,
   vitePortForBackend,
   cdpPortForBackend,
+  editorCdpPortForBackend,
 } from '../../scripts/editorPorts.mjs';
 
 const CLI = path.resolve(__dirname, '../../scripts/editorPorts.mjs');
@@ -78,10 +79,24 @@ describe('editorPorts.mjs CLI — the bash seam (#349)', () => {
       ['backend', backendPortForClone(KNOWN)],
       ['vite', vitePortForBackend(backendPortForClone(KNOWN)!)],
       ['cdp', cdpPortForBackend(backendPortForClone(KNOWN)!)],
+      ['editor-cdp', editorCdpPortForBackend(backendPortForClone(KNOWN)!)],
     ] as const) {
       expect(Number(run([cmd, KNOWN]).out)).toBe(expected);
     }
     expect(run(['url', KNOWN]).out).toBe('http://127.0.0.1:5182');
+  });
+
+  it('`editor-cdp` and `cdp` are DIFFERENT numbers, and the help line offers both (#1102)', () => {
+    // The whole reason the verb exists. `cdp` prints the launcher's fallback derivation; on every
+    // clone the editor is actually on the 932x override, which bash could not ask for at all —
+    // so each consumer that needed it re-derived `9322 + (backend - 5179)` by hand.
+    const cdp = Number(run(['cdp', KNOWN]).out);
+    const editorCdp = Number(run(['editor-cdp', KNOWN]).out);
+    expect(cdp).toBe(9225);
+    expect(editorCdp).toBe(9325);
+    expect(editorCdp).not.toBe(cdp);
+    // A verb missing from the help line is a verb nobody finds.
+    expect(run(['bogus', KNOWN]).err).toContain('editor-cdp');
   });
 
   it('an UNKNOWN clone prints nothing on stdout, warns on stderr, and exits 0', () => {

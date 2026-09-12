@@ -68,6 +68,7 @@ import {
   CLONE_BACKEND_PORTS,
   vitePortForBackend,
   cdpPortForBackend,
+  editorCdpPortForBackend,
 } from '../../scripts/editorPorts.mjs';
 
 const toPosix = (p: string) => p.replace(/\\/g, '/');
@@ -2760,7 +2761,11 @@ describeCases('QA case references', () => {
       // four CDP probes). Deriving only the 922x series left the guard covering ports nothing on
       // this machine binds while the real ones walked past: measured — a re-introduced `9326`
       // passed, a `5177` failed. The offset is the same; only the base differs.
-      9322 + (backend - CLONE_BACKEND_PORTS.modoki),
+      //
+      // ⚠️ ASKED of `editorPorts.mjs`, not re-derived here (#1102). This line used to spell the
+      // arithmetic out, which made it the third copy of a series that was authored nowhere — the
+      // same restated-fact mechanism the `qa/knowledge.md` half of #1102 is about.
+      editorCdpPortForBackend(backend),
     ]);
     // A guard over an empty port list would pass over any corpus at all. This is the input set,
     // so it is floored HERE and not only at the case count (#680 review: mutate where the guard

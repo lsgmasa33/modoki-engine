@@ -26,7 +26,7 @@ import { existsSync, mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
-import { hasPrivateDocs } from '../helpers/repoLayout';
+import { hasPrivateDocs, hasQaSuite } from '../helpers/repoLayout';
 import { readScannedSource } from '@modoki/engine/testing';
 import {
   CLONE_BACKEND_PORTS,
@@ -34,11 +34,13 @@ import {
   backendPortForClone,
   vitePortForBackend,
   cdpPortForBackend,
+  editorCdpPortForBackend,
   backendUrlForClone,
 } from '../../scripts/editorPorts.mjs';
 import { pathCaseKey } from '../../scripts/pathIdentity.mjs';
 import { makeDirLink, cloneRootSpellings } from '../helpers/linkFixture';
 import { clonePort, defaultRepoRoot } from '../../scripts/clonePort.mjs';
+import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 /** Mirrors `pathIdentity.mjs`'s own platform test. Asked of the module rather than re-derived,
  *  so this file cannot drift from the rule it is pinning. */
@@ -66,7 +68,10 @@ const readDoc = (rel: string) => readScannedSource(path.join(REPO, rel), {
 //
 // So each block now gates on what it READS, per `helpers/repoLayout.ts`'s own rule and #1071's
 // precedent: the three that read only shipped `engine/scripts/**` + `package.json` run everywhere,
-// and only the doc-table block gates — on `hasPrivateDocs()`, which is what it actually needs.
+// and only the doc-table block gates. Since #1102 that block reads `qa/` as well, so its gate is
+// `hasPrivateDocs()` AND `hasQaSuite()` — two predicates because the snapshot drops the two by
+// different mechanisms: `docs/clones-and-ports.md` is an explicit exclusion, while `qa/` is simply
+// not among the roots `publish-engine-oss.sh` stages.
 
 /** Every `| ~/Projects/<dir> … | <port> |` row of a markdown table, as dir → first port cell.
  *  Both CLAUDE.md § Clones and docs/clones-and-ports.md § RULE 2 use this shape; the port is
@@ -363,36 +368,194 @@ describe('launch-editor.sh hands the port derivation the PHYSICAL spelling (#961
 
 // Gated on what it READS: `CLAUDE.md` is not in the snapshot manifest, and `docs/clones-and-ports.md`
 // is a private doc since #907 — so the snapshot carries neither, whatever `.mcp.json` says.
+/** Strip fenced code blocks. A doc TEACHING the row shape shows a counter-example, and #1102 added
+ *  exactly that prose to `qa/knowledge.md` § 1 and `docs/clones-and-ports.md` § RULE 2 — so the
+ *  next author to illustrate a WRONG table would have turned this guard red with a message telling
+ *  them to fix a table that is deliberately wrong and is not a copy of anything. */
+function withoutFencedBlocks(src: string): string {
+  return src.replace(/^[ \t]*```[\s\S]*?^[ \t]*```/gm, '');
+}
+
+/**
+ * The clone directories a markdown TEXT maps to ports in a table. Pure, so it can be tested
+ * against fixtures — `layoutConditionalTestLedger.test.ts`'s header states the reason: "a detector
+ * with no fixtures of its own is how the first version missed three spellings (#1071)". The
+ * corpus-reading wrapper below has no fixtures by construction.
+ */
+export function clonePortDirsIn(src: string): Set<string> {
+  // ⚠️ Port-SHAPED, deliberately not "one of the ports we know" — caught by mutating the guard,
+  // not by writing it. The first version matched a row only if it ALREADY carried a correct port,
+  // which made the detector blind to precisely the copy that matters: a doc tabling
+  // `~/Projects/modoki-qa | 5199` was invisible, so a table handing a human the WRONG lane escaped
+  // while one that agreed with the code was policed — an inversion of #349's whole point.
+  // 5xxx/9xxx are the two families this table uses, which stops a four-digit YEAR reading as a port.
+  const portish = (line: string) => /(^|[^0-9.])(5\d{3}|9\d{3})\b/.test(line);
+
+  // ⚠️ The clone must be the row's KEY CELL, not merely somewhere in the line. `modoki` appears
+  // mid-sentence in plenty of table cells — `docs/reviews/2026-07-30-mcp-tool-audit.md:18` has
+  // `engine/packages/modoki test | 443 files · 5389 passed`, a clone name and a 5xxx number in one
+  // row that is not a port table at all. Keying on the cell excludes it without a ledger entry.
+  // Backticks, bold and a trailing `(main)` / `(work-ai)` parenthetical are all stripped, and both
+  // the bare name and the `~/Projects/` spelling count — a copy written EITHER way must be seen,
+  // because catching the bare-name shape is what makes the parser-mismatch assertion possible.
+  const isKeyCell = (cell: string, dir: string) => {
+    const t = cell.replace(/[`*]/g, '').replace(/\([^)]*\)/g, '').trim();
+    return t === dir || t === `~/Projects/${dir}`;
+  };
+
+  const dirs = new Set<string>();
+  for (const line of withoutFencedBlocks(src).split('\n')) {
+    if (!line.trimStart().startsWith('|') || !portish(line)) continue;
+    const cells = line.split('|');
+    for (const dir of Object.keys(CLONE_BACKEND_PORTS)) {
+      if (cells.some((c) => isKeyCell(c, dir))) dirs.add(dir);
+    }
+  }
+  return dirs;
+}
+
+function docsWithClonePortTable(): Map<string, Set<string>> {
+  const found = new Map<string, Set<string>>();
+  // Through `repoFiles()`, never a direct `git ls-files` — `corpusProducerIsShared.test.ts`. Its
+  // mandatory `floor` is the corpus-level non-vacuity check: an enumeration that silently returned
+  // nothing would make every assertion below pass over an empty set, so the producer refuses.
+  for (const { rel } of repoFiles({ match: /\.md$/, floor: 400 })) {
+    // No existsSync guard: a path the corpus producer hands back that cannot be READ is its
+    // problem, and skipping it here would be one more silent way for this guard to cover less
+    // than it claims — the defect the whole change is about.
+    //
+    // ⚠️ ONE clone is enough. The threshold was 2, on the reasoning that a copy is caught at its
+    // second row — but a SINGLE-clone table is the likeliest next copy (a per-game CLAUDE.md, a
+    // runbook noting "this clone's lane"), and at 2 one measured escape was a row reading
+    // `| ~/Projects/modoki-qa | 5177 | 5183 |` — backend and Vite swapped, i.e. a human handed the
+    // Vite port as their MCP target, passing every assertion. The key-cell rule above is what makes
+    // 1 affordable: measured over the 758-file corpus, threshold 1 returns these same three files
+    // and nothing else.
+    const dirs = clonePortDirsIn(readDoc(rel));
+    if (dirs.size >= 1) found.set(rel, dirs);
+  }
+  return found;
+}
+
+/** Fixtures for the DETECTOR itself. `docsWithClonePortTable()` reads the corpus, so it has no
+ *  fixtures by construction — and a detector with none is how a first version misses a spelling
+ *  (`layoutConditionalTestLedger.test.ts`, #1071). Every case below is a shape that has actually
+ *  been argued about, not an invented one. */
+describe('clonePortDirsIn — the detector, against fixtures (#1102)', () => {
+  it('reads the `~/Projects/<dir>` shape CLAUDE.md and clones-and-ports.md use', () => {
+    expect([...clonePortDirsIn('| `~/Projects/modoki-qa` (work-qa) | 5183 | 5177 |')])
+      .toEqual(['modoki-qa']);
+  });
+
+  it('reads the BARE clone-name shape too — the one the parser cannot key on', () => {
+    // Detecting this is what makes the parser-mismatch assertion possible: the detector sees the
+    // row, the parser reads nothing from it, and the difference is the error message.
+    expect([...clonePortDirsIn('| `modoki-ai2` | 5181 | 5175 | 9324 |')]).toEqual(['modoki-ai2']);
+  });
+
+  it('catches a ONE-clone table — the likeliest next copy', () => {
+    // At the old threshold of 2 this exact row passed everything, with backend and Vite swapped,
+    // i.e. a human handed the Vite port as their MCP target.
+    expect([...clonePortDirsIn('| ~/Projects/modoki-qa | 5177 | 5183 | 9226 |')])
+      .toEqual(['modoki-qa']);
+  });
+
+  it('does NOT read a clone name that is merely inside a cell', () => {
+    // docs/reviews/2026-07-30-mcp-tool-audit.md:18 — a clone name and a 5xxx number in one table
+    // row that is not a port table. Excluded by the key-cell rule, with no ledger entry.
+    expect([...clonePortDirsIn('| `npm --prefix engine/packages/modoki test` | 443 files · 5389 passed |')])
+      .toEqual([]);
+  });
+
+  it('does NOT read a FENCED counter-example', () => {
+    // #1102 added prose to two docs teaching this row shape, so the next author illustrating a
+    // WRONG one would otherwise turn the guard red, told to fix a table that is wrong on purpose.
+    const doc = ['Do not write it like this:', '', '```markdown', '| `modoki-qa` | **5183** |',
+      '```', '', 'Write it with the path instead.'].join('\n');
+    expect([...clonePortDirsIn(doc)]).toEqual([]);
+  });
+
+  it('does NOT read prose, only table rows', () => {
+    // enact.md, a memory file and a review doc each name three clones with ports in running text.
+    // They are examples, not copies; ledgering them would rebuild the hand list this replaced.
+    expect([...clonePortDirsIn('The hub is on ~/Projects/modoki at 5179, work-ai at 5180.')])
+      .toEqual([]);
+  });
+
+  it('does not confuse `modoki` with `modoki-ai2` — prefix, not token', () => {
+    expect([...clonePortDirsIn('| `~/Projects/modoki-ai2` | 5181 |')]).toEqual(['modoki-ai2']);
+  });
+
+  it('ignores a row with a clone but no port-shaped number', () => {
+    // clones-and-ports.md's OTHER table (Directory / Branch / Role) has no port column, and a
+    // four-digit YEAR must not read as one.
+    expect([...clonePortDirsIn('| `~/Projects/modoki-qa` | work-qa | Engine + QA |')]).toEqual([]);
+    expect([...clonePortDirsIn('| `~/Projects/modoki-qa` | added 2026 | notes |')]).toEqual([]);
+  });
+});
+
 describe.skipIf(!hasPrivateDocs())('the docs still say what the table says', () => {
   // The drift this catches is not cosmetic: a human reads the doc table to decide what to pass
   // to MODOKI_BACKEND_PORT, so a doc that disagrees with the code hands them a sibling's lane.
-  for (const [doc, section] of [
-    ['CLAUDE.md', '§ Clones'],
-    ['docs/clones-and-ports.md', '§ RULE 2'],
-  ] as const) {
-    it(`${doc} ${section} lists the same clone → backend port pairs`, () => {
-      const documented = portsFromMarkdownTable(readDoc(doc));
+  //
+  // Gated on what it READS (#1071). ⚠️ The DESCRIBE gates only on `hasPrivateDocs()`, and the one
+  // assertion that needs `qa/` carries its own `it.skipIf(!hasQaSuite())`. An earlier version put
+  // `|| !hasQaSuite()` on the describe, which was a real regression and measured as one: with
+  // `qa/README.md` moved aside, flipping CLAUDE.md's modoki-qa row to 5999 left the suite fully
+  // GREEN — a missing `qa/` silently retired the CLAUDE.md and clones-and-ports port guards, which
+  // have nothing to do with `qa/`. Not exotic either: `qa/` relocating is a live possibility (the
+  // Testboard is already its own repo).
+  //
+  // Both predicates are SHARED, from `helpers/repoLayout` — not a local `existsSync`. The first
+  // version probed `qa/knowledge.md` by hand and `layoutConditionalTestLedger.test.ts` caught it,
+  // correctly: a raw probe on the file the guard READS lets a rename switch the guard off instead
+  // of turning it red.
+  it('every doc that TABLES clone ports is parseable, and agrees with the code (#1102)', () => {
+    const docs = docsWithClonePortTable();
+    // Non-vacuity, as a NAMED-FILE floor rather than a count — `cliToolchainRecipes.test.ts`'s
+    // idiom ("<file> is no longer scanned"), because a bare `>= 3` cannot say WHICH copy stopped
+    // being seen, and it misfires on a copy that is legitimately retired (which the new prose in
+    // docs/clones-and-ports.md § RULE 2 actively encourages: "link here" rather than copy).
+    // Existence-filtered so the floor shrinks honestly on a checkout without `qa/` instead of
+    // demanding a file that is not there.
+    for (const known of ['CLAUDE.md', 'docs/clones-and-ports.md', 'qa/knowledge.md']) {
+      if (!existsSync(path.join(REPO, known))) continue;
       expect(
-        Object.keys(documented).length,
-        `${doc} — parsed no \`~/Projects/<clone>\` table rows at all. Either the table moved or its `
-        + 'shape changed; fix the parser here rather than deleting the assertion, or this guard '
-        + 'starts passing vacuously (which is how the old comment-only convention failed).',
-      ).toBeGreaterThanOrEqual(5);
-      expect(documented).toEqual(
-        // Only the clones the doc actually lists — the Windows clone has a row but no
-        // `~/Projects/` path and no assigned port, so it is absent from both sides.
-        Object.fromEntries(Object.entries(CLONE_BACKEND_PORTS).filter(([dir]) => dir in documented)),
-      );
-      // …and nothing documented is missing from the code table.
-      for (const dir of Object.keys(documented)) {
+        [...docs.keys()],
+        `${known} carries a clone → port table and the detector no longer sees it. Fix the `
+        + 'detector rather than deleting this line — if that table was deliberately retired, '
+        + 'remove it from this list in the same commit.',
+      ).toContain(known);
+    }
+
+    for (const [doc, dirs] of docs) {
+      const documented = portsFromMarkdownTable(readDoc(doc));
+      // Per-file floor, and it SIZES ITSELF: every clone the detector saw in a table row must be
+      // one the parser could actually read. A fixed `>= 5` would be wrong for a doc that
+      // legitimately tables two clones, and — worse — says nothing about the rows it missed.
+      expect(
+        new Set(Object.keys(documented)),
+        `${doc} — the detector found clone → port table rows for [${[...dirs].sort().join(', ')}] `
+        + `but the parser could only read [${Object.keys(documented).sort().join(', ')}]. Every `
+        + 'row needs a `~/Projects/<dir>` cell and an UNBOLDED 4-digit port cell after it '
+        + '(`**5183**` does not begin with a digit). Fix the table or teach '
+        + '`portsFromMarkdownTable` the new shape — do not delete this assertion.',
+      ).toEqual(dirs);
+
+      for (const [dir, port] of Object.entries(documented)) {
         expect(
           CLONE_BACKEND_PORTS[dir],
           `${doc} documents clone '${dir}' but editorPorts.mjs does not know it — add it to `
           + 'CLONE_BACKEND_PORTS, or that clone gets AUTO ports and no stable MCP target.',
         ).toBeDefined();
+        expect(
+          port,
+          `${doc} puts '${dir}' on ${port}; editorPorts.mjs says ${CLONE_BACKEND_PORTS[dir]}. `
+          + 'The code wins — a doc that disagrees hands a human a sibling clone\'s lane.',
+        ).toBe(CLONE_BACKEND_PORTS[dir]);
       }
-    });
-  }
+    }
+  });
 
   it('docs/clones-and-ports.md § RULE 2 also agrees on the derived Vite and CDP columns', () => {
     const src = readDoc('docs/clones-and-ports.md');
@@ -417,6 +580,36 @@ describe.skipIf(!hasPrivateDocs())('the docs still say what the table says', () 
     // above would catch that same edit — a guard that depends on a sibling guard to not be
     // hollow is the shape of guard this whole file exists to replace.
     expect(checked, 'parsed no RULE 2 rows to check — fix the parser, do not delete the test')
+      .toBe(Object.keys(CLONE_BACKEND_PORTS).length);
+  });
+
+  /** The twin of the test above, for the OTHER CDP series — and the two genuinely differ, which
+   *  is why this is a second explicit test rather than a column added to the derived sweep.
+   *
+   *  `docs/clones-and-ports.md` § RULE 2 documents `cdpPortForBackend` (922x, the derivation
+   *  `launch-editor.sh` falls back to). `qa/knowledge.md` § 1 documents the 932x OVERRIDE the
+   *  `editor-*` shell functions actually set, because a QA runner needs the port the editor is on,
+   *  not the one it would have chosen. Both docs are correct; a single generic column assertion
+   *  would have to call one of them wrong. */
+  it.skipIf(!hasQaSuite())('qa/knowledge.md § 1 agrees on Vite and on the 932x CDP OVERRIDE (#1102)', () => {
+    const src = readDoc('qa/knowledge.md');
+    let checked = 0;
+    for (const line of src.split('\n')) {
+      const dir = /~\/Projects\/([A-Za-z0-9._-]+)/.exec(line)?.[1];
+      if (!dir || !(dir in CLONE_BACKEND_PORTS)) continue;
+      const nums = [...line.matchAll(/\b(\d{4})\b/g)].map((m) => Number(m[1]));
+      const [backend, vite, cdp] = nums;
+      if (backend !== CLONE_BACKEND_PORTS[dir]) continue;
+      expect({ dir, vite, cdp }).toEqual({
+        dir,
+        vite: vitePortForBackend(backend),
+        // ⚠️ NOT `cdpPortForBackend`. On modoki-qa that returns 9226 and this table says 9326 —
+        // the shell override, which is what actually binds. See `editorCdpPortForBackend`.
+        cdp: editorCdpPortForBackend(backend),
+      });
+      checked++;
+    }
+    expect(checked, 'parsed no § 1 rows to check — fix the parser, do not delete the test')
       .toBe(Object.keys(CLONE_BACKEND_PORTS).length);
   });
 });

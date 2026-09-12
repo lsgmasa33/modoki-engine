@@ -168,6 +168,32 @@ export function cdpPortForBackend(backendPort) {
 }
 
 /**
+ * The CDP port the editor ACTUALLY binds on the main Mac: `9322 + (backend - 5179)`.
+ *
+ * ⚠️ This is not a second opinion about `cdpPortForBackend` — it is the OVERRIDE, and both are
+ * real. The `editor-*` shell functions set `MODOKI_CDP_PORT` to the 932x series by hand so the
+ * editor cannot collide with the `chrome-devtools` MCP's own 9222, and `launch-editor.sh` honours
+ * an explicit value ahead of its derivation. So `cdpPortForBackend` describes the fallback and
+ * this describes the environment: on `modoki-qa`, the former says 9226 and the editor is on 9326.
+ *
+ * It lives here because it was already being restated everywhere it was needed and nowhere
+ * authored (#1102) — inline arithmetic in `qaCaseReferences.test.ts`, a literal column in
+ * `qa/knowledge.md` § 1, and the shell functions themselves, which are outside the repo and are
+ * the only executable copy. A value with no home gets restated by each consumer, which is the
+ * mechanism behind #900/#1095/#1098 as well.
+ *
+ * ⚠️ The shell functions remain the real source: this cannot bind a port, only predict one. If
+ * they are ever changed, THIS is the line that has to follow them — the guard in
+ * `editorPorts.test.ts` pins the docs to this function, not to the shell.
+ *
+ * @param {number} backendPort
+ * @returns {number}
+ */
+export function editorCdpPortForBackend(backendPort) {
+  return 9322 + (backendPort - HUB_BACKEND_PORT);
+}
+
+/**
  * The CDP port for a SINGLE-INSTANCE launch with no pinned backend — i.e. an unknown
  * clone directory, which also covers the Windows machine (it holds exactly one clone,
  * so nothing there can collide; owner, 2026-08-26).
@@ -266,9 +292,15 @@ if (invokedDirectly) {
     process.stdout.write(String(vitePortForBackend(port)));
   } else if (cmd === 'cdp') {
     process.stdout.write(String(cdpPortForBackend(port)));
+  } else if (cmd === 'editor-cdp') {
+    // The port the editor ACTUALLY binds here, as opposed to `cdp`'s fallback derivation. Without
+    // this verb the 932x series was unaskable from bash — `cdp` prints a number `qa/knowledge.md`
+    // § 1 explicitly tells a runner is wrong on this clone — which is precisely why every consumer
+    // that needed it wrote the arithmetic out again (#1102).
+    process.stdout.write(String(editorCdpPortForBackend(port)));
   } else if (cmd === 'url') {
     process.stdout.write(`http://127.0.0.1:${port}`);
   } else {
-    process.stderr.write(`[editor-ports] unknown command '${cmd ?? ''}' — want: backend | vite | cdp | cdp-unpinned | url\n`);
+    process.stderr.write(`[editor-ports] unknown command '${cmd ?? ''}' — want: backend | vite | cdp | editor-cdp | cdp-unpinned | url\n`);
   }
 }

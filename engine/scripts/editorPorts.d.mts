@@ -20,6 +20,10 @@ export declare function vitePortForBackend(backendPort: number): number;
 /** CDP remote-debugging port derived from a backend port: `9222 + (backend - 5179)`. */
 export declare function cdpPortForBackend(backendPort: number): number;
 
+/** The CDP port the editor ACTUALLY binds on the main Mac: `9322 + (backend - 5179)` — the
+ *  `editor-*` shell functions' override, not `cdpPortForBackend`'s fallback. Both are real. */
+export declare function editorCdpPortForBackend(backendPort: number): number;
+
 /** CDP port for a single-instance launch with no pinned backend (an unknown clone). */
 export declare function unpinnedCdpPort(repoRoot: string): number;
 
