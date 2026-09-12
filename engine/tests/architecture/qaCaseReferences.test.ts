@@ -63,6 +63,12 @@ import {
 // The panel's OWN slug function, so a derived id and the rendered one cannot drift apart.
 import { particleFieldSlug } from '../../packages/modoki/src/editor/panels/particle/fieldIds.js';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { SECTION_CITE, headingIds } from '../helpers/docSections';
+import {
+  CLONE_BACKEND_PORTS,
+  vitePortForBackend,
+  cdpPortForBackend,
+} from '../../scripts/editorPorts.mjs';
 
 const toPosix = (p: string) => p.replace(/\\/g, '/');
 
@@ -316,8 +322,101 @@ function suiteDocs(): Array<{ rel: string; body: string }> {
     .map((f) => ({ rel: `qa/${f}`, body: readFileSync(join(dir, f), 'utf8') }));
 }
 
+/** The three answers to "does a save EXECUTE, and at what run mode" (#1095). Mirrored in
+ *  `qa/README.md` § Format; the guard below pins every case that needs one to this list. */
+const SCENE_WRITE_VALUES = ['saves', 'refused', 'never'];
+
+/** `restores:` entries, however the author spelled the field.
+ *
+ *  ⚠️ A SCALAR (`restores: games/x/y.json`) is valid YAML and the frontmatter parser stores it as a
+ *  string. The first draft did `if (!Array.isArray(restores)) continue`, so a scalar — typo'd or
+ *  not — was checked by nothing at all on a `never`/`refused` case. Coerced rather than rejected:
+ *  the one-path spelling is the natural thing to write, and refusing it would teach the author
+ *  that the field is fussy rather than that their path is wrong. */
+function restoresEntries(v: unknown): unknown[] {
+  if (v === undefined || v === null) return [];
+  return Array.isArray(v) ? v : [v];
+}
+
 const PROSE_ALLOWED: ReadonlyArray<{ file: string; token: string }> = [
   { file: 'qa/cases/persistence/cloud-sync-two-device-progress-fork.md', token: 'line 123' },
+];
+
+/**
+ * Cases that may name a per-clone port literally, keyed `{file, port}` — never a whole file, so a
+ * case allowed its own subject's port still cannot quietly acquire a DIFFERENT clone's lane.
+ *
+ * #1098: 220 cases hardcoded `5183` — `modoki-qa`'s lane — into their launch recipe, MCP-target
+ * preconditions and prose, because `qa/knowledge.md` § 1's recipe carried the pin and every case
+ * copied it. An explicit `MODOKI_BACKEND_PORT` OVERRIDES the launcher's per-clone derivation
+ * (`launch-editor.sh`, the `:-` default around `editorPorts.mjs backend`), so a runner on any other
+ * clone followed those cases into a port their clone does not own. It was invisible from `work-qa`,
+ * where the corpus is written and where `5183` is right — which is how it survived 220 files.
+ *
+ * ⚠️ Two of the derived numbers are also GENERIC defaults: `vitePortForBackend(5179)` is 5173,
+ * Vite's own, and `cdpPortForBackend(5179)` is 9222, the `chrome-devtools` MCP's — which is
+ * precisely why the ai-panel row below exists. A future case documenting either in its ordinary
+ * sense will be flagged as naming a clone lane and will need a row here; write the REAL reason on
+ * it ("Vite's own default, not the hub's lane") rather than a lane reason that is not true.
+ */
+const CLONE_PORT_ALLOWED: ReadonlyArray<{ file: string; port: number; reason: string }> = [
+  {
+    file: 'qa/cases/packaged/reap-is-clone-and-app-scoped.md',
+    port: 5180,
+    reason: "another clone's lane IS the subject — the case proves a reap does not cross clones",
+  },
+  {
+    file: 'qa/cases/editor/ai-panel-reports-this-editors-ports.md',
+    port: 5179,
+    reason: 'quotes the committed `${MODOKI_BACKEND:-http://127.0.0.1:5179}` default verbatim',
+  },
+  {
+    file: 'qa/cases/packaged/clean-install-renders.md',
+    port: 5179,
+    reason:
+      "names the HUB's lane as the failure mode of an empty pin — the unpinned ladder's first " +
+      'candidate (`DEFAULT_BACKEND_PORT`), which is what the case warns its runner about',
+  },
+  {
+    file: 'qa/cases/packaged/electron-only-surfaces-respond.md',
+    port: 5179,
+    reason: "quotes the launcher's own `9222 + (backend − 5179)` CDP derivation",
+  },
+  {
+    file: 'qa/cases/packaged/electron-only-surfaces-respond.md',
+    port: 9222,
+    reason: "quotes the launcher's own `9222 + (backend − 5179)` CDP derivation",
+  },
+  {
+    file: 'qa/cases/editor/ai-panel-reports-this-editors-ports.md',
+    port: 9222,
+    reason: "quotes the source comment about a packaged editor showing another process's CDP 9222",
+  },
+  // Both halves of the launcher's CDP formula are ledgered per file: the base (9222) and the hub
+  // backend it offsets from (5179). Quoting a derivation is the opposite of hardcoding a lane —
+  // but the guard reads numbers, not intent, so the exception is written down rather than
+  // pattern-matched. A regex that tried to recognise "this is a formula" is the false positive
+  // surface #680's review spent a round on.
+  {
+    file: 'qa/cases/tooling/wrong-backend-detected-by-identity.md',
+    port: 5179,
+    reason: "quotes the launcher's own `9222 + (backend − 5179)` CDP derivation",
+  },
+  {
+    file: 'qa/cases/tooling/wrong-backend-detected-by-identity.md',
+    port: 9222,
+    reason: "quotes the launcher's own `9222 + (backend − 5179)` CDP derivation",
+  },
+  {
+    file: 'qa/cases/platform/win-vite-port-collision-banner.md',
+    port: 5179,
+    reason: "quotes the launcher's own `9222 + (BACKEND_PORT − 5179)` CDP derivation",
+  },
+  {
+    file: 'qa/cases/platform/win-vite-port-collision-banner.md',
+    port: 9222,
+    reason: "quotes the launcher's own `9222 + (BACKEND_PORT − 5179)` CDP derivation",
+  },
 ];
 
 const LINE_REF_ALLOWED: ReadonlyArray<{ file: string; token: string }> = [
@@ -2392,6 +2491,305 @@ describeCases('QA case references', () => {
     // guards against is the field vanishing entirely, not shrinking.
     expect(checked).toBeGreaterThan(0);
     expect(residue).toEqual([]);
+  });
+
+  /**
+   * The CLEANUP CONTRACT (#1095, #900, #1086) — three rules, none of which reads English.
+   *
+   * The defect: a case's claim about the working tree was PROSE, and nothing linked it to the rule
+   * that decides whether the claim is true. So when the rule moved, every copy went stale silently
+   * and each one became a runner filing a false finding against a healthy tree. It happened twice —
+   * `SCENE_FORMAT_VERSION` 12→13 stranded 21 cases asserting an empty tree (#900), and the
+   * cloud-sync dirty/clean read stranded two more (#1086).
+   *
+   * ⚠️ **The version is deliberately NOT part of these rules**, though #1095 proposed keying on it.
+   * `saveScene` has no dirty check: at `runMode: 'stopped'` it re-serializes and WRITES the scene
+   * whether or not anything changed. Whether that write also DIRTIES the file depends on the bytes
+   * round-tripping — on a fixture already at the current format version with no content change it
+   * may not, and 5 of the 30 `saves` fixtures are at 13 today (25 are at 12). The rule is stated on
+   * the write, not the dirt, because the write is the part that is always true: "a case that saves
+   * must restore" holds across the next format change, whatever it touches, whereas a
+   * version-keyed rule answers only "is this stale TODAY" and must be re-derived at each bump —
+   * the same half-life as the prose it replaces, which is the failure this issue exists to stop.
+   * The cost of stating it on the write is a `restores:` that is occasionally a no-op. That is the
+   * cheap direction.
+   *
+   * `scene_write` is the author's answer to the one question no text search can answer — does a
+   * save EXECUTE, and at what run mode:
+   *   `saves`   — a save runs at `runMode: 'stopped'`; the scene file IS written, even when the
+   *               case only cares about an asset (QA-ASSET-0013's three `modoki_save_all` calls,
+   *               at its steps 4, 12 and 13, touch a scene its assertions never look at).
+   *   `refused` — a save runs, but `saveScene` refuses the scene half because run mode is
+   *               `scrub`/`playing` (QA-ANIM-0012's preview envelope, QA-EDITOR-0015's Cmd+S
+   *               during Play).
+   *   `never`   — no save executes. Most cases that MENTION a save mention it to forbid one.
+   */
+  it('every case that can write its fixture scene declares it (#1095)', () => {
+    const undeclared: string[] = [];
+    let checked = 0;
+    // `Cmd+S` needs the boundary: without it the pattern also matches `Cmd+Shift+Z`, which earns a
+    // case a `scene_write` declaration that means nothing and that a later reader would trust.
+    const TOOL_SAVE = /modoki_save_all|save_all/;
+    const HUMAN_SAVE = /Cmd\+S(?![A-Za-z])|⌘S(?![A-Za-z])/;
+    let viaHumanSaveOnly = 0;
+    for (const c of cases) {
+      if (typeof c.fm?.fields.fixture_scene !== 'string') continue;
+      const tool = TOOL_SAVE.test(c.body);
+      const human = HUMAN_SAVE.test(c.body);
+      if (!tool && !human) continue;
+      checked++;
+      if (human && !tool) viaHumanSaveOnly++;
+      const v = c.fm.fields.scene_write;
+      if (typeof v !== 'string' || !SCENE_WRITE_VALUES.includes(v)) {
+        undeclared.push(
+          `${c.rel}: names a fixture_scene and mentions a save, so it must declare ` +
+            `scene_write: ${SCENE_WRITE_VALUES.join(' | ')} (got ${JSON.stringify(v)})`,
+        );
+      }
+    }
+    // The DEMAND side is detected from text, and that is deliberate: a false positive here costs
+    // one word of frontmatter, never a wrong verdict. The verdict itself is always the author's.
+    expect(checked).toBeGreaterThan(50);
+    // ⚠️ A single total floor cannot tell the two halves of the detector apart — measured, deleting
+    // the `Cmd+S` alternative drops the population from 129 to 122, clearing any floor of 50 while
+    // silently un-demanding seven cases, THREE of which are `saves` and match on nothing else
+    // (menubar/keyboard-accelerators, assets/rename-moves-parked-asset-write,
+    // assets/undo-after-save-reparks-asset-edit). The human-accelerator half is the one that
+    // catches a case pressing Cmd+S to prove a negative, so it gets its own floor.
+    expect(viaHumanSaveOnly).toBeGreaterThanOrEqual(3);
+    expect(undeclared).toEqual([]);
+  });
+
+  it('a case that writes its fixture scene restores it (#1095)', () => {
+    const offenders: string[] = [];
+    let checked = 0;
+    for (const c of cases) {
+      if (c.fm?.fields.scene_write !== 'saves') continue;
+      checked++;
+      const scene = c.fm.fields.fixture_scene;
+      const restores = c.fm.fields.restores;
+      // A whole-directory restore (`git checkout -- games/anim-bug`) covers the scene inside it —
+      // via this file's own `isUnder`, not a second copy of the same predicate.
+      const covered = restoresEntries(restores).some(
+        (p) => typeof p === 'string' && isUnder(String(scene), p),
+      );
+      if (!covered) {
+        offenders.push(
+          `${c.rel}: scene_write: saves, so restores: must cover ${scene} — a save at 'stopped' ` +
+            're-serializes and writes the scene whether or not anything changed',
+        );
+      }
+    }
+    expect(checked).toBeGreaterThan(0);
+    expect(offenders).toEqual([]);
+  });
+
+  it('every `restores:` path is repo-relative and TRACKED (#1095)', () => {
+    const bad: string[] = [];
+    let checked = 0;
+    // The mirror of `creates:`, which requires its paths to be ABSENT. A restore names something
+    // the case puts BACK, so it must exist and be tracked — an untracked path cannot be restored
+    // by git, and a typo'd one silently restores nothing.
+    // Through `repoFiles`, never a direct `git ls-files` — `corpusProducerIsShared.test.ts`
+    // Rule 1 forbids a second enumeration, and it caught this rule's first draft doing exactly
+    // that. `includeUntracked: false` is the `--cached` view, i.e. tracked-only, which is the
+    // question this rule asks.
+    const tracked = new Set(repoFiles({ includeUntracked: false, floor: 0 }).map((f) => f.rel));
+    const trackedDirs = new Set<string>();
+    for (const p of tracked) {
+      const parts = p.split('/');
+      for (let i = 1; i < parts.length; i++) trackedDirs.add(parts.slice(0, i).join('/'));
+    }
+    for (const c of cases) {
+      const restores = restoresEntries(c.fm?.fields.restores);
+      for (const entry of restores) {
+        checked++;
+        if (typeof entry !== 'string' || /[<>{}*$\s]/.test(entry)) {
+          bad.push(`${c.rel}: restores: ${JSON.stringify(entry)} is a placeholder, not a real path`);
+        } else if (!tracked.has(entry) && !trackedDirs.has(entry)) {
+          bad.push(`${c.rel}: restores: "${entry}" is not a tracked file or directory`);
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(0);
+    expect(bad).toEqual([]);
+  });
+
+  /**
+   * `cites:` — the LINK from a case to the rule it depends on (#1095).
+   *
+   * The defect this closes is not "a case says something wrong"; it is that **nothing could answer
+   * *which cases depend on § 23?*** when § 23 changed. #900 and #1086 were both found by a runner
+   * hitting the stale copy, and #900's own close-out concluded the population was "three questions
+   * no text search answers". A declaration turns that into one query.
+   *
+   * Two rules: every entry resolves to a real section, and every qualified citation in the body is
+   * declared. The second is what keeps it COMPLETE — a `cites:` that lists one of a case's three
+   * dependencies is worse than none, because it reads as exhaustive.
+   *
+   * Not redundant with `docCitations.test.ts`, which also resolves `<doc>.md § N` — that one reads
+   * PROSE across the whole repo and answers "does this pointer still resolve"; these two read
+   * FRONTMATTER and answer "is the dependency list complete". Prose citations are covered by both,
+   * which is how the README's own explanation of this rule got caught: it described an
+   * unqualified `§ 4b` in a sentence that read as a citation to a section the field manual does
+   * not define, and the doc gate went red on the phase that introduced it.
+   *
+   * ⚠️ **Only QUALIFIED citations count — the ones that name `knowledge.md` near the section mark.**
+   * A bare `§ 4b` does not say WHICH document: measured, `packaged/signed-release-artifact-installs-
+   * clean.md` cites `§ 4b`/`§ 4c` of the **release-version skill**, which really does have those
+   * sections while `knowledge.md` does not. A guard reading bare marks would have called those two
+   * dangling and sent someone to "fix" a correct citation.
+   */
+  it('every `cites:` entry names a real qa/knowledge.md section (#1095)', () => {
+    const dangling: string[] = [];
+    let checked = 0;
+    const sections = headingIds(readFileSync(join(REPO_ROOT, 'qa/knowledge.md'), 'utf8'));
+    // The corpus cites 12 distinct sections today; a parse that stopped matching headings would
+    // make every entry dangle, so floor the INPUT set as well as the checked one.
+    expect(sections.size).toBeGreaterThan(20);
+    for (const c of cases) {
+      for (const entry of restoresEntries(c.fm?.fields.cites)) {
+        checked++;
+        const m = typeof entry === 'string' && /^knowledge\.md#([0-9]+[a-z]?(?:-bis)?)$/.exec(entry);
+        if (!m) {
+          dangling.push(`${c.rel}: cites: ${JSON.stringify(entry)} — want knowledge.md#<section>`);
+        } else if (!sections.has(m[1])) {
+          dangling.push(`${c.rel}: cites: "${entry}" names no section in qa/knowledge.md`);
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(50);
+    expect(dangling).toEqual([]);
+  });
+
+  it('every qa/knowledge.md section a case cites in prose is declared in `cites:` (#1095)', () => {
+    const undeclared: string[] = [];
+    let checked = 0;
+    for (const c of cases) {
+      const declared = new Set(
+        restoresEntries(c.fm?.fields.cites)
+          .filter((e): e is string => typeof e === 'string')
+          .map((e) => e.replace(/^knowledge\.md#/, '')),
+      );
+      // One definition of "a citation", shared with `docCitations` — then keep only the ones whose
+      // DOC is the field manual, since a case legitimately cites other documents' sections too.
+      const cited = new Set(
+        [...c.body.matchAll(SECTION_CITE)]
+          .filter(([, doc]) => doc.endsWith('knowledge.md'))
+          .map(([, , section]) => section),
+      );
+      for (const m of cited) {
+        checked++;
+        if (!declared.has(m)) {
+          undeclared.push(
+            `${c.rel}: cites qa/knowledge.md § ${m} in prose but does not declare ` +
+              `knowledge.md#${m} — the declaration is how "who depends on § ${m}?" gets answered`,
+          );
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(100);
+    expect(undeclared).toEqual([]);
+  });
+
+  /**
+   * Every `git checkout` of a repo path in a case body is DECLARED in `restores:` (#1095 review).
+   *
+   * `restores:` started life covering only the fixture scene, which made `qa/knowledge.md` § 8's
+   * new instruction — "restore what the frontmatter declares" — false for 20 cases that restore
+   * something else: a rig, a `.particle.json`, a `.png.meta.json`, a `project.config.json`, even a
+   * `runtime/config.ts`. A runner following § 8 would restore the scene, run `git status`, and see
+   * a modified file the frontmatter never mentioned — which is #900's failure one grain finer.
+   *
+   * This rule is what keeps the declaration COMPLETE rather than merely present. The body is the
+   * source of truth here precisely because a `git checkout` is unambiguous: it names a path, and
+   * the only reason to name it is to put it back.
+   *
+   * ⚠️ What this canNOT see: a case that overwrites a committed file and restores it some OTHER
+   * way, or not at all. QA-INSP-0006 was exactly that — it "restored" by writing the old value
+   * back, left a stray key, and made no tree claim, so nothing mechanical was ever going to catch
+   * it. It was found by reading. This rule narrows that gap; it does not close it.
+   */
+  it('every `git checkout` a case performs is declared in `restores:` (#1095)', () => {
+    const undeclared: string[] = [];
+    let checked = 0;
+    const CHECKOUT = /git checkout(?: --)?\s+`?([^\s`'"|)]+)/g;
+    for (const c of cases) {
+      const declared = restoresEntries(c.fm?.fields.restores).filter(
+        (p): p is string => typeof p === 'string',
+      );
+      for (const m of c.body.matchAll(CHECKOUT)) {
+        const path = m[1].trim();
+        if (!REPO_TOP_LEVEL.test(path)) continue;
+        checked++;
+        if (!declared.some((d) => isUnder(path, d))) {
+          undeclared.push(
+            `${c.rel}: restores \`${path}\` in its body but does not declare it in restores: — ` +
+              'a runner following knowledge.md § 8 restores only what is declared',
+          );
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(20);
+    expect(undeclared).toEqual([]);
+  });
+
+  /**
+   * No case names a per-clone port — the launcher DERIVES it (#1098, #349).
+   *
+   * The ports come from `editorPorts.mjs`, the one authored table, for the same reason
+   * `clonePortHardcoding.test.ts` derives them: a hand-listed copy here would go stale exactly the
+   * way the corpus did, in the guard whose job is to notice. Backend, Vite and CDP all count — a
+   * case telling its runner to read `http://127.0.0.1:<vite>/#/editor` is as clone-specific as one
+   * pinning the backend, and 25 cases did that too.
+   *
+   * Deliberately scoped to `qa/cases/**`, NOT `suiteDocs()`: `qa/knowledge.md` § 1 carries the
+   * per-clone table on purpose, marked as a copy of `editorPorts.mjs`.
+   */
+  it('no case hardcodes a per-clone port — the launcher derives it (#1098)', () => {
+    const offenders: string[] = [];
+    const clonePorts = Object.values(CLONE_BACKEND_PORTS).flatMap((backend) => [
+      backend,
+      vitePortForBackend(backend),
+      cdpPortForBackend(backend),
+      // ⚠️ The 932x OVERRIDE, and it is the series that actually matters here. `cdpPortForBackend`
+      // derives 9222..9226, but the `editor-*` shell functions on the main Mac set
+      // `MODOKI_CDP_PORT` to 932x by hand so it cannot collide with the `chrome-devtools` MCP's
+      // 9222 — and `launch-editor.sh` honours an explicit value ahead of its own derivation, so
+      // 932x is what a runner's environment holds and what the corpus had baked in (`9326`, in
+      // four CDP probes). Deriving only the 922x series left the guard covering ports nothing on
+      // this machine binds while the real ones walked past: measured — a re-introduced `9326`
+      // passed, a `5177` failed. The offset is the same; only the base differs.
+      9322 + (backend - CLONE_BACKEND_PORTS.modoki),
+    ]);
+    // A guard over an empty port list would pass over any corpus at all. This is the input set,
+    // so it is floored HERE and not only at the case count (#680 review: mutate where the guard
+    // COLLECTS, not only where it reads).
+    expect(clonePorts.length).toBeGreaterThanOrEqual(20);
+    const hits = new Set<string>();
+    for (const c of cases) {
+      for (const port of clonePorts) {
+        if (!new RegExp(`\\b${port}\\b`).test(c.body)) continue;
+        hits.add(`${c.rel}:${port}`);
+        if (CLONE_PORT_ALLOWED.some((a) => a.file === c.rel && a.port === port)) continue;
+        offenders.push(
+          `${c.rel}: names port ${port} — derive it (bare \`launch-editor.sh\`, or ` +
+            '`node engine/scripts/editorPorts.mjs backend .`), or ledger it in CLONE_PORT_ALLOWED',
+        );
+      }
+    }
+    expect(cases.length).toBeGreaterThan(0);
+    // Every allowance still describes a real occurrence. Without this a ledger row outlives the
+    // literal it excused, and the next case to name that port in that file inherits a pass nobody
+    // granted it — the staleness `clonePortHardcoding.test.ts`'s DERIVATION_EXEMPT ratchet exists
+    // to stop.
+    const stale = CLONE_PORT_ALLOWED.filter((a) => !hits.has(`${a.file}:${a.port}`)).map(
+      (a) => `${a.file}:${a.port} (reason: ${a.reason})`,
+    );
+    // Asserted TOGETHER, not one after the other: with two sequential expects the first failure
+    // hides the second, so a run that is both offending and stale reports half its problem and
+    // costs a second full cycle to find the rest.
+    expect({ offenders, stale }).toEqual({ offenders: [], stale: [] });
   });
 
   /**

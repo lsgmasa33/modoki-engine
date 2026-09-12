@@ -44,6 +44,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { repoFiles as repoCorpusFiles } from '../../scripts/repoCorpus.mjs';
 import { hasInternalGames, hasPrivateDocs } from '../helpers/repoLayout';
+import { SECTION_CITE, headingIds } from '../helpers/docSections';
 import {
   citesALine,
   citesALineByMarker,
@@ -1515,17 +1516,8 @@ describe('source paths cited in docs and CLAUDE.md resolve (#194, second face; #
  *    real and is stated in the report rather than hidden: a dangling `§` in an UNNUMBERED doc
  *    is not caught here.
  */
-const SECTION_CITE = /([A-Za-z0-9_./-]+\.md)\)?[^\n§]{0,60}§\s*([0-9]+[a-z]*(?:-bis)?)(?![.\d])/g;
-
-/** Heading ids a markdown doc actually defines: `## 6. …`, `### 8a-bis. …`, `## ⚠️ 0. …`. */
-function headingIds(absDoc: string): Set<string> {
-  const ids = new Set<string>();
-  for (const line of fs.readFileSync(absDoc, 'utf8').split('\n')) {
-    const m = /^#{2,4}\s+(?:[^\w\s]+\s+)*([0-9]+[a-z]*(?:-bis)?)\./.exec(line);
-    if (m) ids.add(m[1]);
-  }
-  return ids;
-}
+// SECTION_CITE + headingIds moved to ../helpers/docSections (#1095 review): `qaCaseReferences`
+// asks the same syntax question about QA frontmatter and had written its own, narrower, copy.
 
 /** Rule 4: a `<doc>.md § "Quoted Title"` citation names a heading that doc really defines.
  *
@@ -1676,7 +1668,7 @@ describe('cited doc SECTIONS resolve', () => {
         ];
         const target = candidates.find((c) => fs.existsSync(c) && c.endsWith('.md'));
         if (!target) continue; // rule 1 owns unresolvable paths; don't double-report them.
-        const ids = headingIds(target);
+        const ids = headingIds(fs.readFileSync(target, 'utf8'));
         if (ids.size === 0) continue; // doc does not number its headings — see the scope note.
         checked++;
         if (!ids.has(section)) {
