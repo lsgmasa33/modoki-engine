@@ -1014,6 +1014,26 @@ registerAgentOp('dispatch-action', (params) => {
       }
     }
   }
+  // engine.director: the same phantom-TARGET case C7/F5 closed for engine.playClip. The handler
+  // console.warns and returns when the target carries no Director, which this op used to report as
+  // dispatched:true — so an agent pausing a cutscene got a success for a pause that never happened,
+  // and the only way to find out was to read the playhead back and notice it still moving. A
+  // missing trait is unambiguous (unlike an empty clip list, which may just not have loaded), so it
+  // is safe to fail here rather than disclose.
+  //
+  // ⚠️ 'Director' is a trait NAME matched as a string, like ANIMATOR_CLIP_TRAITS above. A typo
+  // would not error — it would simply never match, leaving this guard permanently silent while
+  // looking present. `engine/tests/framework/dispatchActionOp.test.ts` asserts BOTH that the reject
+  // fires and that a target WITH a Director still dispatches — the second is the only thing that
+  // can catch a typo, since a typo'd name makes every target look Director-less and the reject
+  // test alone would still pass.
+  if (p.name === 'engine.director' && p.targetGuid) {
+    const entityId = findEntityByGuid(p.targetGuid)?.id();
+    const ent = entityId != null ? getAllEntities().find((e) => e.id === entityId) : undefined;
+    if (ent && !ent.traits.includes('Director')) {
+      return { ok: false, dispatched: false, reason: `target '${p.targetGuid}' has no Director trait — engine.director has nothing to drive. Directors live on the entity that owns the timeline; re-read the scene with get_scene_state to find it.`, simRunning: true };
+    }
+  }
   dispatchUIAction(p.name, { payload: p.payload, params: p.params, targetGuid: p.targetGuid });
   return { dispatched: true, simRunning: true, ...(p.targetGuid ? { targetResolved: true } : {}) };
 });

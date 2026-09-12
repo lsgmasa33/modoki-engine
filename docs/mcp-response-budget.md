@@ -515,6 +515,38 @@ empty tool list (`{"version":0,"tools":[]}`) — the agent bridge answers before
 re-registers its tools. Both doors now share the same grace, so a spurious teardown (which costs a
 whole conversation's cache) doesn't fire on a sub-second blip.
 
+### The churn cost, measured (2026-09-12, #1104)
+
+Everything above rests on a stated gap — *"Its saving can't be sized from inside a session (no
+access to `cache_read_input_tokens`)."* That is true of a session and false of the machine: Claude
+Code writes every turn's usage block to `~/.claude/projects/<slug>/*.jsonl`.
+`engine/scripts/token-spend-report.mjs` reads them. Measured across **635 sessions / 94,450 turns**
+on all five Mac clones:
+
+- **A prefix reset costs 2.83% of total spend** — 289 events, 81.6M re-created tokens. That is the
+  ceiling on everything in this section, because it counts *every* cause together: session resumes,
+  context compactions and any `tools/list` change alike.
+- **The `tools/list` share of that is at most ~0.07%.** Classifying by shape, all but 4 of the 289
+  land back at the bare-prefix floor after an idle gap or a compaction; 3 of the remaining 4 are one
+  session hitting the identical floor three times in under a minute, which is compaction, not tool
+  churn. So the worst honest reading is 2.1M re-created tokens — **0.07% of spend**.
+- For contrast, from the same run: cache **reads** are 80.6% of spend, and `Bash` output alone is
+  71.3% of what gets written into the prefix to be re-read.
+
+⚠️ **So the churn argument is sound in mechanism and ~1000x too small to act on.** Everything in
+this section is correct — a `tools/list` change really does invalidate the whole prefix, and the
+hysteresis fix really did remove a spurious teardown. It just is not where the money goes. Two
+concrete consequences:
+
+- **The stable-pair reopen trigger is now measurable, and not met.** It was parked on "reopens if
+  project swaps rise to ~10+ per session", with the saving unsizable. It is sizable now, and at 4
+  mid-flow resets across 635 sessions the redesign would buy under a tenth of a percent — **do not
+  re-propose it on cost grounds.** If it comes back it will be for a different reason.
+- **CLAUDE.md § Editor's "don't churn the editor" survives on its OTHER justification** — a live
+  editor breaks a concurrent `verify`, and a relaunch invalidates measurements. The cache-cost half
+  of that sentence is real but negligible; do not let a future session delete the rule when it
+  rediscovers that, and do not let one cite the cache as the main reason either.
+
 **Declined, and why, so none of these get re-proposed:**
 - **`$defs`/`$ref` dedup of the shared aim shapes.** Forbidden by conventions §1 and guarded by
   `mcpSchemaNoRef.test.ts` — a shared-object schema gets collapsed to a bare `$ref` with no `type`,

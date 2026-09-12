@@ -627,6 +627,27 @@ Four stateless lifecycle/animator handlers are registered once at startup by
   binding's typed `clip` param (or the event `$value`); keyframe/sprite validate the name
   synchronously against their clip bank and no-op+warn on an unknown one, while skeletal
   clips are validated at the render layer (unknown names are ignored there).
+- **`engine.director`** — play / pause / toggle / restart the target's `Director`, with optional
+  `time` (seek, seconds) and `speed` (rate multiplier). The cutscene twin of
+  `engine.toggleAnimator`: the same `playing` field, on the timeline's own player. `action` is a
+  typed enum param, so the Inspector renders a dropdown rather than free text; omitting it means
+  `toggle`, which is what a bare Pause button wants.
+
+  ⚠️ **`restart` and a seek to 0 are NOT the same thing, and the difference is the once-only
+  sequence-start fan-out.** `restart` rewinds and clears `Director.started`, so `@sequence`
+  `phase:'start'` (and every `t=0` marker edge) fires again; a plain `time` seek deliberately does
+  not, because scrubbing moves *within* a playthrough and re-firing start on every scrub is worse
+  than not firing it. Passing both (`{action:'restart', time: 3}`) starts the playthrough over from
+  3s — the seek applies last and wins, which is the only reading under which both arguments
+  survive. Seeking past the end is left to the system, which already clamps or wraps per `loop`.
+
+  ⚠️ **Why this exists (#1093).** Before it, the `Director` was the only playable component in the
+  engine with no runtime affordance, so the only way to pause a cutscene was a scene edit — and
+  `/api/scene-mutate` refuses those while the game is Playing (by design: edits during Play are
+  discarded on Stop). That left a running cutscene unpausable by an agent, by a device, **and by a
+  Pause button authored into the game**. The last of those is why this is an engine action rather
+  than a new MCP tool: `modoki_dispatch_action` / `device_dispatch_action` reach every registered
+  action for free, but nothing reaches an MCP tool from a scene binding.
 
 Scene navigation (`engine.loadScene` / `engine.navigateBack`) is **not** here — it lives
 in `NavigationManager`, which owns the history stack (see

@@ -11,8 +11,8 @@
 
 import { describe, it, expect } from 'vitest';
 import {
-  LEDGER_HEADER, parseLedger, lastKnownSizes, ledgerDelta, renderLedger, appendChunk, assertCsvSafe,
-  ledgerSkipReason, type LedgerRow,
+  LEDGER_HEADER, parseLedger, lastKnownSizes, corpusBaseline, ledgerDelta, renderLedger,
+  appendChunk, assertCsvSafe, ledgerSkipReason, type LedgerRow,
 } from '../../tools/modoki-mcp/surfaceLedger';
 
 const row = (over: Partial<LedgerRow> = {}): LedgerRow => ({
@@ -226,5 +226,110 @@ describe('MCP surface ledger (#894)', () => {
     expect(renderLedger([row()], { withHeader: false }).startsWith('2026-09-10,')).toBe(true);
     expect(renderLedger([], { withHeader: false })).toBe('');
     expect(renderLedger([], { withHeader: true })).toBe(`${LEDGER_HEADER}\n`);
+  });
+});
+
+describe('the baseline is the CORPUS, so a merge books nothing (#1103)', () => {
+  /** The numbers here are the REAL ones from the committed corpus on 2026-09-12, because the bug
+   *  was found there and a synthetic pair would not show that the same bytes were booked three
+   *  times: `work-ai3` authored `modoki_press_key`'s +361 at `0d034e370` (2473 -> 2834), and
+   *  `work-ai2` and `work-qa` each booked the identical 361 after merely merging it. */
+  const PRESS_BEFORE = 2473;
+  const PRESS_AFTER = 2834;
+
+  /** Rank 0 is HEAD, larger is older — the shape `gen-surface-ledger.ts` builds from `git rev-list`. */
+  const order = (pairs: Record<string, number>) => new Map(Object.entries(pairs));
+
+  it('does NOT re-book a tool whose change arrived by merge', () => {
+    // work-qa's own file stops at the pre-change size; work-ai3's row (newer commit) carries the
+    // change, and arrived in work-qa's tree with the merge.
+    const rows = [
+      row({ clone: 'work-qa', tool: 'modoki_press_key', toolBytesAfter: PRESS_BEFORE, sha: 'old11111' }),
+      row({ clone: 'work-ai3', tool: 'modoki_press_key', toolBytesAfter: PRESS_AFTER, sha: 'new22222' }),
+    ];
+    const lastKnown = corpusBaseline({
+      rows, order: order({ old11111: 9, new22222: 3 }), fallbackClone: 'work-qa',
+    });
+    expect(lastKnown.get('modoki_press_key')).toBe(PRESS_AFTER);
+
+    const added = ledgerDelta({
+      perTool: new Map([['modoki_press_key', PRESS_AFTER]]),
+      lastKnown, date: '2026-09-12', clone: 'work-qa', sha: 'merge333',
+    });
+    expect(added).toEqual([]); // the pre-#1103 answer was one row booking +361 against work-qa
+  });
+
+  it('books only what THIS clone added on top of what it inherited', () => {
+    const rows = [
+      row({ clone: 'work-qa', tool: 'modoki_press_key', toolBytesAfter: PRESS_BEFORE, sha: 'old11111' }),
+      row({ clone: 'work-ai3', tool: 'modoki_press_key', toolBytesAfter: PRESS_AFTER, sha: 'new22222' }),
+    ];
+    const lastKnown = corpusBaseline({
+      rows, order: order({ old11111: 9, new22222: 3 }), fallbackClone: 'work-qa',
+    });
+    const added = ledgerDelta({
+      perTool: new Map([['modoki_press_key', 3170]]),
+      lastKnown, date: '2026-09-12', clone: 'work-qa', sha: 'mine4444',
+    });
+    // 3170 - 2834 (inherited), NOT 3170 - 2473 (this clone's own last row).
+    expect(added).toHaveLength(1);
+    expect(added[0].deltaBytes).toBe(336);
+  });
+
+  it('orders by ANCESTRY, not by position in the file', () => {
+    // The NEWER commit is listed FIRST, so a "later row wins" reader picks the stale 2473.
+    const rows = [
+      row({ clone: 'work-ai3', tool: 'modoki_press_key', toolBytesAfter: PRESS_AFTER, sha: 'newaaaa' }),
+      row({ clone: 'work-ai2', tool: 'modoki_press_key', toolBytesAfter: PRESS_BEFORE, sha: 'oldbbbb' }),
+    ];
+    const lastKnown = corpusBaseline({
+      rows, order: order({ newaaaa: 2, oldbbbb: 40 }), fallbackClone: 'work-ai2',
+    });
+    expect(lastKnown.get('modoki_press_key')).toBe(PRESS_AFTER);
+  });
+
+  it('ignores a row whose commit is NOT in this tree — it describes a tree we do not have', () => {
+    const rows = [
+      row({ clone: 'work-qa', tool: 'modoki_press_key', toolBytesAfter: PRESS_BEFORE, sha: 'inhist1' }),
+      row({ clone: 'win', tool: 'modoki_press_key', toolBytesAfter: 99999, sha: 'unmerged' }),
+    ];
+    const lastKnown = corpusBaseline({
+      rows, order: order({ inhist1: 5 }), fallbackClone: 'work-qa',   // 'unmerged' unranked
+    });
+    expect(lastKnown.get('modoki_press_key')).toBe(PRESS_BEFORE);
+  });
+
+  it('falls back to this clone\'s own file, in file order, when git could not be asked', () => {
+    // ⚠️ An EMPTY order means "could not rank anything", not "nothing is an ancestor". Treating it
+    // as the latter would leave the baseline empty, which reads as a clean tree — and the run would
+    // book the entire surface against whoever hit the git failure.
+    const rows = [
+      row({ clone: 'work-qa', tool: 'modoki_press_key', toolBytesAfter: PRESS_BEFORE, sha: 'a' }),
+      row({ clone: 'work-ai3', tool: 'modoki_press_key', toolBytesAfter: PRESS_AFTER, sha: 'b' }),
+    ];
+    const lastKnown = corpusBaseline({ rows, order: new Map(), fallbackClone: 'work-qa' });
+    expect(lastKnown.get('modoki_press_key')).toBe(PRESS_BEFORE); // work-qa's own row, not the corpus
+  });
+
+  it('seeds only on a genuinely EMPTY corpus, not on a fresh clone joining an established one', () => {
+    const established = [
+      row({ clone: 'work-ai3', tool: 'modoki_press_key', toolBytesAfter: PRESS_AFTER, sha: 'seen111' }),
+    ];
+    const inherited = corpusBaseline({
+      rows: established, order: order({ seen111: 1 }), fallbackClone: 'work-ai',
+    });
+    expect(inherited.size).toBe(1); // a brand-new clone still has a baseline…
+
+    const added = ledgerDelta({
+      perTool: new Map([['modoki_press_key', 3170]]),
+      lastKnown: inherited, date: '2026-09-12', clone: 'work-ai', sha: 'fresh22',
+      seeding: inherited.size === 0,
+    });
+    // …so its first run books its real 336, not a fictional 3170-byte "first observation".
+    expect(added).toHaveLength(1);
+    expect(added[0].deltaBytes).toBe(336);
+
+    const empty = corpusBaseline({ rows: [], order: new Map(), fallbackClone: 'work-ai' });
+    expect(empty.size).toBe(0); // and a truly empty corpus still seeds
   });
 });

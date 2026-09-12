@@ -7,7 +7,8 @@
  *
  *  DETERMINISM: the playhead advances on `getSimDelta` (raw × timeScale, 0 when not
  *  running) and every discrete event (marker / audio cue / activation edge / sequence
- *  start-end / skeletal clip trigger) is edge-detected from stored `lastTime` vs `time` —
+ *  start-end / skeletal clip trigger) is edge-detected over `(time-before-advance, time-after]` —
+ *  NOT from `lastTime`, which this line used to name and which nothing reads (#1093) —
  *  a pure `prev < t <= cur` crossing (with an explicit loop-wrap branch). No wall-clock,
  *  no `Math.random`. Verifiable headless via the `@sequence`/`@marker` journal.
  *

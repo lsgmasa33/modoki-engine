@@ -108,3 +108,5 @@ date,clone,tool,delta_bytes,tool_bytes_after,surface_bytes_after,sha
 2026-09-11,work-ai,modoki_set_game_view_device,-2,1953,153258,bb65c659a
 2026-09-11,work-ai,modoki_ota_publish,213,2676,153471,9f3f674b9
 2026-09-12,work-ai,modoki_type_text,281,1584,153752,b19f419cb
+2026-09-12,work-ai,modoki_press_key,697,3170,154869,755c15078
+2026-09-12,work-ai,modoki_type_text,420,2004,154869,755c15078

@@ -62,6 +62,11 @@ discipline as `animationSystem` and `zoneTriggerCore`).
 ### Three ways a Director stops advancing — they mean different things
 
 - **`Director.playing = false`** — PAUSE. The entity is still live; you're holding the playhead.
+  Drive it at runtime with the **`engine.director`** UIAction (play/pause/toggle/restart + seek and
+  speed — [UI system](./ui-system.md) § built-in actions), which is reachable from an authored
+  button, from `modoki_dispatch_action` and from its device twin. ⚠️ **A scene edit is NOT a way to
+  pause a running Director**: `/api/scene-mutate` refuses every edit while the game is Playing, so
+  writing `Director.playing` that way returns 409 and the flag never moves (#1093).
 - **`EntityAttributes.isActive = false`** — DISABLE. Deactivating an entity FREEZES its Director,
   the same way deactivating a mesh hides it (self or any ancestor — the cascade counts). `time` and
   `started` are untouched, so reactivating **resumes from where it stopped**; no markers fire while
@@ -179,7 +184,7 @@ preview stop, so the frozen-resume is a preview artifact there, not persisted st
 The playhead advances on **`getSimDelta`** (raw × `timeScale`, `0` when the sim isn't running), so
 it's gated off automatically when stopped/paused (`149 < TRANSFORM(200)`) and is byte-reproducible
 under `stepSimulation`. Every discrete event (marker / cue / activation edge / start / end / skeletal
-trigger / control spawn+despawn) is edge-detected from stored `lastTime` vs `time` by a pure
+trigger / control spawn+despawn) is edge-detected over `(playhead-before-advance, playhead-after]` by a pure
 `crossed()` test — no wall-clock, no `Math.random`. Control spawn/despawn journal `@control` on the
 edge regardless of whether the prefab was loaded, so it's a reliable headless trace. Assert on the
 `@sequence` / `@marker` / `@cue` / `@control` journal, not pixels.

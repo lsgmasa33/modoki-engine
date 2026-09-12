@@ -1,4 +1,4 @@
-/** Engine built-in UIActions — app lifecycle (reload / quit) + animator control.
+/** Engine built-in UIActions — app lifecycle (reload / quit) + animator and Director control.
  *
  *  Scene navigation (engine.loadScene / engine.navigateBack) lives in
  *  NavigationManager, which owns the history stack. These lifecycle actions have
@@ -9,6 +9,7 @@ import { shutdownRealmThenReload } from '../core/realmShutdown';
 import { SkeletalAnimator } from '../traits/SkeletalAnimator';
 import { Animator } from '../traits/Animator';
 import { SpriteAnimator } from '../traits/SpriteAnimator';
+import { Director } from '../traits/Director';
 import { animatorHasClip } from '../animation/animClipBank';
 import { spriteAnimHasClip } from '../loaders/spriteAnimCache';
 import { scrollToEntry } from '../ui/scrollApi';
@@ -135,6 +136,96 @@ export function registerEngineActions(): void {
 
       if (!hasAnimator) console.warn('[engine.playClip] target has no Animator / SpriteAnimator / SkeletalAnimator trait');
       else if (!switched) console.warn(`[engine.playClip] no clip named "${name}" on the target's animator(s)`);
+    },
+  });
+
+  // engine.director — play / pause / toggle / restart the target's Director, and optionally seek
+  //  or change its rate. The Director is the timeline's own player, so this is the cutscene twin
+  //  of engine.toggleAnimator: same `playing` flag, same "write the field, the system picks it up
+  //  next frame" shape.
+  //
+  //  ⚠️ **Why this action has to exist at all** (#1093). It was the ONE playable component with no
+  //  runtime affordance — every animator flavour had two, and a Director had none — so the only
+  //  lever on a running cutscene was a scene edit. `/api/scene-mutate` refuses those while the game
+  //  is Playing (by design: edits during Play are discarded on Stop), which left a cutscene
+  //  unpausable by an agent, by a device, AND by a Pause button somebody authors into the game.
+  //  That last one is the reason this is an engine action rather than agent tooling.
+  //
+  //  ⚠️ `restart` clears `started`, and that IS load-bearing: `timelineSystem` reads
+  //  `justStarted = !dir.started` to fire the once-only sequence-start fan-out, and skips a
+  //  non-advancing first frame via `if (advanced <= 0 && !dir.started) return`. Rewinding `time`
+  //  alone would replay the sequence with its start events silently missing.
+  //
+  //  ⚠️ It also rewrites `lastTime`, and that is NOT load-bearing — purely keeping the read-back
+  //  coherent. `Director.lastTime` is written by the system and read by NOTHING (verified
+  //  repo-wide, #1093); the edge-detection window is `(dir.time, advance(dir.time, …)]`, taken from
+  //  `time`, never from `lastTime`. Two docblocks claimed otherwise and were corrected in the same
+  //  change — do not reintroduce a seek "fix" that resets `lastTime` to prevent a replay it cannot
+  //  cause.
+  registerUIAction('engine.director', {
+    params: {
+      action: {
+        type: 'enum', options: ['play', 'pause', 'toggle', 'restart'],
+        tooltip: 'play = resume, pause = hold, toggle = flip, restart = rewind to 0 and play (re-fires the sequence-start events)',
+      },
+      time: { type: 'number', tooltip: 'Optional: seek the playhead to this time in seconds. Does NOT re-fire sequence-start — use restart for that.' },
+      speed: { type: 'number', tooltip: 'Optional: playback rate multiplier (1 = normal, 0.5 = half speed). Forward only — a negative rate is clamped to 0, because reverse playback is not supported.' },
+    },
+    handler: ({ target, params, payload }) => {
+      if (!target) {
+        console.warn('[engine.director] no target entity — set the binding target to an entity carrying a Director');
+        return;
+      }
+      const dir = target.get(Director);
+      if (!dir) {
+        console.warn('[engine.director] target has no Director trait');
+        return;
+      }
+      const action = (typeof params?.action === 'string' && params.action) ? params.action
+        : (typeof payload === 'string' && payload ? payload : 'toggle');
+      const next = { ...dir };
+      switch (action) {
+        case 'play': next.playing = true; break;
+        case 'pause': next.playing = false; break;
+        case 'toggle': next.playing = !dir.playing; break;
+        case 'restart':
+          next.time = 0;
+          next.lastTime = 0;
+          next.started = false;   // see the docblock — this is what re-arms the start fan-out
+          next.playing = true;
+          break;
+        default:
+          console.warn(`[engine.director] unknown action "${action}" (expected play|pause|toggle|restart)`);
+          return;
+      }
+      // Seeking is orthogonal to the transport action, so it applies AFTER and wins — `{action:
+      // 'restart', time: 3}` means "start this playthrough over, from 3s", which is the only
+      // reading under which both arguments survive.
+      //
+      // ⚠️ `started` is deliberately NOT cleared here. Seeking moves the playhead WITHIN a
+      // playthrough; re-firing the once-only start fan-out on every scrub would make a timeline
+      // scrubbed backwards fire its start events repeatedly. `restart` above is the way to ask
+      // for that, and it says so in its tooltip.
+      if (typeof params?.time === 'number' && Number.isFinite(params.time)) {
+        // Only the floor is enforced: a negative playhead has no meaning, while seeking PAST the
+        // end is left to `advance()`, which already clamps (or wraps, when the Director loops) —
+        // duplicating that rule here is exactly the shadowing copy that goes stale.
+        next.time = Math.max(0, params.time);
+        next.lastTime = next.time;
+      }
+      // ⚠️ Clamped at 0: REVERSE PLAYBACK IS NOT SUPPORTED, and failing silently is worse than
+      // refusing. `timelineSystem` calls it explicitly deferred, and its `crossed()` edge test
+      // returns false for every tick where `advanced <= 0` — so a negative rate rewinds the
+      // playhead while markers, audio cues, activation edges, skeletal triggers and `@sequence`
+      // all stay silent, and anything latched on the way forward stays latched. An authored
+      // rewind button would look like it worked and leave the scene wrong.
+      if (typeof params?.speed === 'number' && Number.isFinite(params.speed)) {
+        if (params.speed < 0) {
+          console.warn(`[engine.director] speed ${params.speed} clamped to 0 — reverse playback is not supported (timelineSystem defers it; markers and cues do not fire while rewinding)`);
+        }
+        next.speed = Math.max(0, params.speed);
+      }
+      target.set(Director, next);
     },
   });
 }

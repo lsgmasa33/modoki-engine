@@ -68,12 +68,13 @@ interface GuardResult {
   parsed: Record<string, unknown> | null;
 }
 
-function runGuard(toolName: string, toolInput: Record<string, unknown>, sid = freshSid()): GuardResult {
+function runGuard(toolName: string, toolInput: Record<string, unknown>, sid = freshSid(), transcriptPath?: string): GuardResult {
   const payload = JSON.stringify({
     session_id: sid,
     hook_event_name: 'PreToolUse',
     tool_name: toolName,
     tool_input: toolInput,
+    ...(transcriptPath ? { transcript_path: transcriptPath } : {}),
   });
   const res = spawnSync(process.execPath, [guard], { input: payload, encoding: 'utf8' });
   const out = (res.stdout ?? '').trim();
@@ -394,8 +395,16 @@ describe('context-cost-guard — Bash path', () => {
 
   it('caps repeated warnings for the same rule within one session', () => {
     const sid = freshSid();
+    // ⚠️ The `npm test` between each probe is LOAD-BEARING, not filler. `git log` is a read-only
+    // probe, so three in a row is a chain (#1107) — and the chain rule is checked FIRST, so it
+    // would answer calls 2 and 3 and this test would never observe the `gitlog` rule's own cap at
+    // all. Breaking the run keeps each `git log` a fresh probe #1, which is the only way the
+    // per-rule cap stays visible. Do not "simplify" this by removing the interleave.
+    const breakRun = () => runGuard('Bash', { command: 'npm test' }, sid);
     const r1 = runGuard('Bash', { command: 'git log --oneline' }, sid);
+    breakRun();
     const r2 = runGuard('Bash', { command: 'git log --oneline' }, sid);
+    breakRun();
     const r3 = runGuard('Bash', { command: 'git log --oneline' }, sid);
     expectNeverBlocks(r1);
     expectNeverBlocks(r2);
@@ -444,3 +453,271 @@ describe('context-cost-guard — settings registration', () => {
   );
 });
 
+
+describe('context-cost-guard — chain rule (#1107)', () => {
+  /** The chain rule is the ONLY rule here whose subject is the TURN rather than the command, so
+   *  these share one sid AND supply a real transcript — `freshSid()` per call resets the run, and
+   *  without a transcript the rule cannot tell a batched call from a wasted turn and stays silent
+   *  by design. Both omissions make every assertion below vacuous, which is what this suite is most
+   *  at risk of. */
+
+  /** A minimal Claude Code transcript whose LAST assistant record carries `turnId` — the hook reads
+   *  its tail to identify the turn a tool call belongs to.
+   *
+   *  ⚠️ ONE FILE PER AGENT, appended to — not a new file per turn. A real agent has a single
+   *  transcript whose last assistant record changes as it works, and the hook now keys its state on
+   *  that path. A fixture that minted a fresh file per turn gave every turn its own state, so runs
+   *  never accumulated and most of this suite went red for a reason that existed only in the test. */
+  function transcriptAtTurn(turnId: string, agent = 'main'): string {
+    const file = path.join(tmpDir, `transcript-${agent}.jsonl`);
+    if (!fs.existsSync(file)) {
+      fs.writeFileSync(file, JSON.stringify({ type: 'user', message: { role: 'user', content: 'x' } }) + '\n');
+    }
+    fs.appendFileSync(file, JSON.stringify({ type: 'assistant', message: { id: turnId, role: 'assistant', content: [] } }) + '\n');
+    return file;
+  }
+
+  const inTurn = (cmd: string, sid: string, turnId: string, agent = 'main') =>
+    runGuard('Bash', { command: cmd }, sid, transcriptAtTurn(turnId, agent));
+
+  it('stays silent on the FIRST read-only probe', () => {
+    const r = inTurn('git status --porcelain', freshSid(), 'msg_a');
+    expectNeverBlocks(r);
+    expect(r.stdout).toBe('');
+  });
+
+  it('warns on the SECOND consecutive read-only probe in a SEPARATE turn', () => {
+    const sid = freshSid();
+    const first = inTurn('git status --porcelain', sid, 'msg_1');
+    const second = inTurn('ls engine/scripts', sid, 'msg_2');
+    expectNeverBlocks(first);
+    expectNeverBlocks(second);
+    expect(first.stdout).toBe('');
+    expect(second.parsed?.systemMessage).toMatch(/2 read-only shell probes in separate turns/);
+    const ctx = (second.parsed?.hookSpecificOutput as Record<string, unknown>)?.additionalContext;
+    expect(String(ctx)).toMatch(/ONE call/);
+  });
+
+  /** ⚠️ THE ONE THE REVIEW FOUND. Parallel tool calls share an assistant message, so they cost ZERO
+   *  extra turns — and the pre-fix rule nudged them anyway, telling their author to "put them in ONE
+   *  call" about calls that were already in one call. That is the harness's own batching instruction
+   *  being punished by a rule whose whole premise is turn count. Measured before the fix: 8 parallel
+   *  `ls` calls produced 5 nudges. */
+  it('says NOTHING about parallel calls in the SAME turn, however many there are', () => {
+    const sid = freshSid();
+    const outs = ['ls', 'pwd', 'git status', 'ls engine', 'wc -l package.json']
+      .map((c) => inTurn(c, sid, 'msg_same'));
+    outs.forEach(expectNeverBlocks);
+    expect(outs.map((r) => r.stdout)).toEqual(['', '', '', '', '']);
+  });
+
+  /** ⚠️ The case that makes the two same-turn mechanisms separately testable — and the reason this
+   *  test exists at all. Every other parallel case here starts from run=1, where SUPPRESSING the
+   *  warn and CARRYING the run length are indistinguishable: either alone keeps the batch quiet, so
+   *  neither mutation bites and the tests vouch for code they cannot check. Entering the batch with
+   *  a run ALREADY at 2 separates them — drop the suppression and the batch re-warns; drop the
+   *  carry and the run resets, so the probe after it reports 2 instead of 3. */
+  it('a parallel batch advances the run by exactly ONE, however many calls it holds', () => {
+    const sid = freshSid();
+    inTurn('ls', sid, 'r1');
+    expect(inTurn('pwd', sid, 'r2').stdout).not.toBe('');          // run 2, warned
+    // A batch's FIRST call is a genuine new turn, so it counts — and warns as run 3.
+    expect(inTurn('git status', sid, 'r3batch').parsed?.systemMessage).toMatch(/3 read-only shell probes/);
+    // Its SECOND call shares that turn: free, and silent.
+    expect(inTurn('wc -l package.json', sid, 'r3batch').stdout).toBe('');
+    expect(inTurn('file package.json', sid, 'r3batch').stdout).toBe('');
+    // …and the run was CARRIED across the batch rather than reset, so the next turn is 4, not 2.
+    expect(inTurn('ls engine', sid, 'r4').parsed?.systemMessage).toMatch(/4 read-only shell probes/);
+  });
+
+  it('still warns on the next SEQUENTIAL probe after a parallel batch', () => {
+    const sid = freshSid();
+    inTurn('ls', sid, 'msg_batch');
+    inTurn('pwd', sid, 'msg_batch');          // same turn — free
+    const later = inTurn('git status', sid, 'msg_next');   // a real extra turn
+    expect(later.parsed?.systemMessage).toMatch(/read-only shell probes in separate turns/);
+  });
+
+  /** ⚠️ THE SUBAGENT SEAM — the defect the turn fix shipped with, found by the §2d review and
+   *  reproduced in a live session. A subagent's hook payload carries the PARENT's `session_id` but
+   *  its OWN transcript. With state keyed on the sid alone, parent and subagent shared one
+   *  `lastBash` slot while drawing turn ids from disjoint namespaces, so `sameTurn` could never be
+   *  true across them and each clobbered the other's `prev.turn` — an already-batched parent call
+   *  got nudged anyway, which is verbatim the defect the fix exists to remove. This repo MANDATES
+   *  subagents, so it was the normal case. Two transcripts, one sid, interleaved. */
+  it('does not let a concurrent SUBAGENT break the parent\'s same-turn batching', () => {
+    const sid = freshSid();
+    inTurn('ls', sid, 'msg_parent', 'parent');            // parent probe #1
+    inTurn('git status', sid, 'msg_sub', 'subagent');     // a subagent probes in between
+    // The parent's SECOND call shares its first turn, so it costs no extra turn and must be silent.
+    const parent2 = runGuard('Bash', { command: 'pwd' }, sid,
+      path.join(tmpDir, 'transcript-parent.jsonl'));
+    expectNeverBlocks(parent2);
+    expect(parent2.stdout).toBe('');
+  });
+
+  it('gives a subagent its own nag budget rather than spending the parent\'s', () => {
+    const sid = freshSid();
+    // Burn the subagent's chain budget entirely.
+    for (let i = 0; i < 6; i++) {
+      inTurn('npm test', sid, `msg_s${i}x`, 'subagent');
+      inTurn('ls', sid, `msg_s${i}a`, 'subagent');
+      inTurn('pwd', sid, `msg_s${i}b`, 'subagent');
+    }
+    // The parent's own first run must still be able to warn — its budget is not the subagent's.
+    inTurn('ls', sid, 'msg_p1', 'parent');
+    expect(inTurn('pwd', sid, 'msg_p2', 'parent').stdout).not.toBe('');
+  });
+
+  it('stays silent when it cannot identify the turn — a wrong nudge is worse than none', () => {
+    const sid = freshSid();
+    runGuard('Bash', { command: 'ls' }, sid);       // no transcript_path
+    const second = runGuard('Bash', { command: 'pwd' }, sid);
+    expect(second.stdout).toBe('');
+  });
+
+  it('counts the run UP, so the third probe reports 3 rather than repeating 2', () => {
+    const sid = freshSid();
+    inTurn('ls', sid, 'm1');
+    inTurn('pwd', sid, 'm2');
+    const third = inTurn('git log -n 5 --oneline', sid, 'm3');
+    expect(third.parsed?.systemMessage).toMatch(/3 read-only shell probes in separate turns/);
+  });
+
+  it('BREAKS the run on a non-probe command, so the probe after it is a fresh first', () => {
+    const sid = freshSid();
+    inTurn('ls', sid, 'm1');
+    const mutating = inTurn('npm test', sid, 'm2');
+    const after = inTurn('ls', sid, 'm3');
+    expectNeverBlocks(mutating);
+    expect(after.stdout).toBe('');
+  });
+
+  it('treats a write redirection as mutating even behind a read-only head', () => {
+    const sid = freshSid();
+    inTurn('ls', sid, 'm1');
+    inTurn('ls engine > /tmp/manifest.txt', sid, 'm2');
+    const after = inTurn('ls', sid, 'm3');
+    expect(after.stdout).toBe('');
+  });
+
+  /** ⚠️ Review finding: the old redirect guard required WHITESPACE before `>`, so a stderr redirect
+   *  slipped through as read-only and the chain kept counting across a command that wrote a file. */
+  it('treats `2> file` as mutating too — the redirect needs no space in front of it', () => {
+    const sid = freshSid();
+    inTurn('ls', sid, 'm1');
+    inTurn('ls engine 2> /tmp/err.log', sid, 'm2');
+    const after = inTurn('ls', sid, 'm3');
+    expect(after.stdout).toBe('');
+  });
+
+  /** ⚠️ Review finding: `splitSegments` keeps pipes inside one segment, so the HEAD decided the whole
+   *  pipeline and `cat patch.diff | git apply` classified as a read-only probe. A chain containing a
+   *  write is precisely where the later command DOES depend on the earlier, so the nudge was wrong. */
+  it.each([
+    ["sed -i '' 's/a/b/' src/foo.ts", 'in-place sed'],
+    ['find . -name "*.tmp" -delete', 'find -delete'],
+    ['grep -rl foo . | xargs sed -i \'\' \'s/foo/bar/\'', 'xargs into a write'],
+    ['ls engine | tee /tmp/manifest.txt', 'tee'],
+    ['cat patch.diff | git apply', 'git apply behind a cat'],
+    ['sort -o data.txt data.txt', 'sort -o'],
+  ])('does not treat a WRITE as a read-only probe: %s', (cmd) => {
+    const sid = freshSid();
+    inTurn('ls', sid, 'm1');
+    inTurn(cmd, sid, 'm2');
+    const after = inTurn('ls', sid, 'm3');
+    expect(after.stdout).toBe('');
+  });
+
+  /** ⚠️ `2>&1` DUPLICATES a descriptor and creates no file, so the redirect guard's rationale
+   *  ("produces a file a later command can depend on") does not apply. The first version of the
+   *  digit fix broke this — and it is the commonest stderr idiom in this repo's own commands. */
+  it('does NOT let `2>&1` break the chain — it duplicates a descriptor, it writes nothing', () => {
+    const sid = freshSid();
+    inTurn('ls', sid, 'm1');
+    const second = inTurn('git status 2>&1', sid, 'm2');
+    expect(second.parsed?.systemMessage).toMatch(/read-only shell probes in separate turns/);
+  });
+
+  it('treats `sed --in-place` as a write, not just the short `-i`', () => {
+    const sid = freshSid();
+    inTurn('ls', sid, 'm1');
+    inTurn("sed --in-place 's/a/b/' engine/foo.ts", sid, 'm2');
+    const after = inTurn('ls', sid, 'm3');
+    expect(after.stdout).toBe('');
+  });
+
+  it('does NOT let `> /dev/null` break the chain — it discards output rather than producing a file', () => {
+    const sid = freshSid();
+    inTurn('ls', sid, 'm1');
+    const second = inTurn('grep -q foo docs/README.md > /dev/null', sid, 'm2');
+    expect(second.parsed?.systemMessage).toMatch(/read-only shell probes in separate turns/);
+  });
+
+  it('keeps `echo` labels neutral, so a compound probe still counts as one', () => {
+    const sid = freshSid();
+    inTurn('ls', sid, 'm1');
+    const second = inTurn('git status && echo "===" && git log -n 3', sid, 'm2');
+    expect(second.parsed?.systemMessage).toMatch(/read-only shell probes in separate turns/);
+  });
+
+  /** ⚠️ Review finding: the global CLAUDE.md MANDATES `git -C <path>` for a repo outside the cwd, and
+   *  the pair builder blanked the flag, so every such call fell out of the probe list — the rule was
+   *  blind to the spelling the rules require. */
+  it('recognises `git -C <path> status` as a probe', () => {
+    const sid = freshSid();
+    inTurn('ls', sid, 'm1');
+    const second = inTurn('git -C /tmp/other status --porcelain', sid, 'm2');
+    expect(second.parsed?.systemMessage).toMatch(/read-only shell probes in separate turns/);
+  });
+
+  it('does not treat a git WRITE subcommand as a probe, though `git` heads several probes', () => {
+    const sid = freshSid();
+    inTurn('git status', sid, 'm1');
+    inTurn('git commit -m wip', sid, 'm2');
+    const after = inTurn('git status', sid, 'm3');
+    expect(after.stdout).toBe('');
+  });
+
+  it('does not treat `node -e` as a probe — it can write, and reads nothing predictable', () => {
+    const sid = freshSid();
+    inTurn('ls', sid, 'm1');
+    inTurn('node -e "console.log(1)"', sid, 'm2');
+    const after = inTurn('ls', sid, 'm3');
+    expect(after.stdout).toBe('');
+  });
+
+  it('caps the nudge so a long session is not nagged on every run', () => {
+    const sid = freshSid();
+    const warned: boolean[] = [];
+    let t = 0;
+    for (let i = 0; i < 4; i++) {
+      inTurn('npm test', sid, `b${t++}`);   // break the previous run
+      inTurn('ls', sid, `b${t++}`);
+      warned.push(inTurn('pwd', sid, `b${t++}`).stdout !== '');
+    }
+    expect(warned).toEqual([true, true, true, false]);
+  });
+
+  it('takes precedence over a size rule, because the turn is the larger share', () => {
+    const sid = freshSid();
+    inTurn('ls', sid, 'm1');
+    const second = inTurn('git log', sid, 'm2');
+    expect(second.parsed?.systemMessage).toMatch(/read-only shell probes in separate turns/);
+    expect(second.parsed?.systemMessage).not.toMatch(/Unbounded command/);
+  });
+
+  it('hands the floor back to the size rules once the chain cap is spent', () => {
+    const sid = freshSid();
+    let t = 0;
+    for (let i = 0; i < 3; i++) {
+      inTurn('npm test', sid, `c${t++}`);
+      inTurn('ls', sid, `c${t++}`);
+      expect(inTurn('pwd', sid, `c${t++}`).stdout).not.toBe('');
+    }
+    inTurn('ls', sid, 'c98');
+    const sized = inTurn('git log', sid, 'c99');
+    expectNeverBlocks(sized);
+    expect(sized.parsed?.systemMessage).toMatch(/gitlog/);
+  });
+});

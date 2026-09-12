@@ -9,7 +9,7 @@
  *  console.warned. Both are now `{ok:false, dispatched:false}`. */
 
 import { describe, it, expect, afterEach } from 'vitest';
-import { createTestWorld, type TestWorld, Transform, EntityAttributes } from '@modoki/engine/runtime';
+import { createTestWorld, type TestWorld, Transform, EntityAttributes, Director } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { runAgentOp } from '../../app/debug/agentBridge';
 
@@ -55,5 +55,31 @@ describe('dispatch-action: engine.playClip requires an animator (F5)', () => {
     expect(r.ok).toBe(false);
     expect(r.dispatched).toBe(false);
     expect(r.reason).toMatch(/animator/i);
+  });
+});
+
+describe('dispatch-action: engine.director requires a Director (#1093)', () => {
+  it('a target with NO Director trait → ok:false, dispatched:false, reason names the Director', async () => {
+    game = createTestWorld({ actions: { 'engine.director': () => {} } });
+    game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'nodir', name: 'NoDir' }));
+    const r = await runAgentOp('dispatch-action', { name: 'engine.director', targetGuid: 'nodir', params: { action: 'pause' } }) as DispatchReply;
+    expect(r.ok).toBe(false);
+    expect(r.dispatched).toBe(false);
+    expect(r.reason).toMatch(/Director/);
+  });
+
+  /** ⚠️ The POSITIVE control, and the only thing that can catch the real hazard here. The guard
+   *  matches the trait NAME as a string (`ent.traits.includes('Director')`), exactly like
+   *  ANIMATOR_CLIP_TRAITS above. A typo would not error — it would never match, so the reject above
+   *  would still pass (everything looks Director-less) while the guard had silently become a wall
+   *  that refuses EVERYTHING. Only dispatching against a real Director tells the two apart. */
+  it('a target that HAS a Director dispatches — the name guard is not refusing everything', async () => {
+    let hits = 0;
+    game = createTestWorld({ actions: { 'engine.director': () => { hits++; } } });
+    game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'hasdir', name: 'HasDir' }), Director({ timeline: 'x' }));
+    const r = await runAgentOp('dispatch-action', { name: 'engine.director', targetGuid: 'hasdir', params: { action: 'pause' } }) as DispatchReply;
+    expect(r.dispatched).toBe(true);
+    expect(r.ok).not.toBe(false);
+    expect(hits).toBe(1);
   });
 });

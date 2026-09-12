@@ -1332,10 +1332,10 @@ export function registerAllTraits() {
     fields: {
       timeline: { type: 'string', accept: ['.timeline.json'], tooltip: 'Timeline sequence (.timeline.json) — tracks/clips that drive descendants by relative name-path. Drag one from the Assets panel; double-click the asset to edit it.' },
       time: { type: 'number', step: 0.05, min: 0, tooltip: 'Playhead (seconds)' },
-      speed: { type: 'number', step: 0.1, tooltip: 'Playback rate multiplier' },
-      playing: { type: 'boolean' },
+      speed: { type: 'number', min: 0, step: 0.1, tooltip: 'Playback rate multiplier (1 = normal, 0.5 = half speed). Forward only — reverse playback is not supported: the playhead would rewind while markers, cues and sequence events all stay silent.' },
+      playing: { type: 'boolean', tooltip: 'Pause/resume the playhead. Drive it at runtime with the engine.director UIAction — a scene edit cannot, because /api/scene-mutate refuses edits while the game is Playing.' },
       loop: { type: 'boolean', tooltip: 'Repeat vs. clamp at the timeline duration' },
-      lastTime: { type: 'number', group: 'Read-back', readOnly: true, runtimeOnly: true, tooltip: 'Previous frame\'s playhead (edge detection) — read-back' },
+      lastTime: { type: 'number', group: 'Read-back', readOnly: true, runtimeOnly: true, tooltip: 'Previous frame\'s playhead — inspection only; nothing reads it (the edge window comes from `time`)' },
       started: { type: 'boolean', group: 'Read-back', readOnly: true, runtimeOnly: true, tooltip: 'Whether the sequence-start fan-out has fired this playthrough — read-back' },
     },
   });
