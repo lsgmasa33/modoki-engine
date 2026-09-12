@@ -783,6 +783,18 @@ naming the remedy.
   issue was filed about.
 - Out of scope on purpose: `ssh host "adb …"` runs on ANOTHER machine, and a per-machine claim cannot
   speak for that phone.
+- ⚠️ **KNOWN GAP, deliberate: a substitution inside DOUBLE quotes is not lifted.** A real shell
+  expands `"$(adb …)"`, so this is a hole rather than a definition. Lifting it was implemented and
+  **reverted within the minute**: it immediately refused a `node -e '…'` probe that merely CONTAINED
+  that text inside a JS string, because the parser cannot track quoting through a nested payload and
+  saw a command where the shell sees text. Firing on TEXT is the failure this page's own history
+  records — it once "blocked two consecutive attempts to write this very module's tests" — so the gap
+  is accepted and pinned by a test. Re-adding it needs a way to know the span is a command position.
+- ⚠️ **Open question, raised by review and unresolved**: is any `opaque` input one that would actually
+  RUN a device command? An unterminated heredoc hands the line to `cat` as data; the other inputs that
+  still report opaque treat `adb` as a script filename. If that holds, the refusal costs friction and
+  catches nothing. Carried as an `it.todo` in `deviceCommandTargets.test.ts` rather than assumed away
+  in either direction.
 
 A different `PreToolUse` hook, `engine/scripts/context-cost-guard.mjs`, warns (never blocks) on a
 large unbounded `Read` or an unbounded verbose `Bash` call — see
