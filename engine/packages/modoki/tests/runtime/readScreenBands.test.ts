@@ -165,6 +165,9 @@ describe('`order` is READ, never derived from the role vocabulary', () => {
     // in any other order would have got a silently wrong stack from one boolean.
     authorFullStack();
     const byRole = Object.fromEntries(read().map((b) => [b.role, b]));
+    // ⚠️ These two do NOT discriminate, and are kept only as a sanity check on the fixture: the
+    // full stack authors hud=0 and board=3, which are exactly `accept.indexOf(role)` — so they
+    // pass under both hypotheses. The authored 7 below is the whole discriminator.
     expect(byRole.hud.order).toBe(0);
     expect(byRole.board.order).toBe(3);
 

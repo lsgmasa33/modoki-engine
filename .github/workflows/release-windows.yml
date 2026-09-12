@@ -211,14 +211,25 @@ jobs:
       # Run-scoped artifact — and since #1085 the ONLY way to get the installer off a
       # non-tag build: the rolling prerelease that used to back it up is gone.
       #
-      # ⚠️ **NOT continue-on-error any more, and that flag must not come back.** It was
-      # set so a quota failure could not block the prerelease publish that used to sit
-      # below. With that publish deleted, swallowing the failure would leave a GREEN run
-      # with nothing to download and a release runbook whose only instruction is "re-run
-      # the Windows workflow" — i.e. a wedge, with the run page reporting success.
-      # The account's artifact-storage quota HAS been exhausted before, so this step
-      # failing is a real and expected outcome: free storage, then re-run. Visible.
+      # ⚠️ **NON-TAG ONLY, and NOT continue-on-error — the two go together.**
+      #
+      # It used to be unconditional + continue-on-error, so a quota failure could not block
+      # the prerelease publish that sat below. #1085 deleted that publish, so swallowing the
+      # failure would leave a GREEN run with nothing to download and a runbook whose only
+      # instruction is "re-run" — a wedge reporting success. Hence the flag is gone.
+      #
+      # ⚠️ But dropping the flag ALONE re-opened a worse hole, caught in close-out review: a
+      # step's `if:` is implicitly `success() && …`, so on a TAG run a failed upload SKIPS
+      # "Generate release notes" and "Attach to GitHub Release" below — shipping a tagged
+      # release with no .exe and no latest.yml, which is exactly the v0.3.0-v0.3.5 defect
+      # documented at those steps. The artifact is redundant on the tag path (the Release
+      # carries the installer), so it simply does not run there.
+      #
+      # Net: on a dispatch this is the ONLY way to get the installer, so its failure is loud;
+      # on a tag it cannot block the Release. The account's artifact-storage quota HAS been
+      # exhausted before, so a dispatch failing here is expected — free storage and re-run.
       - name: Upload installer artifact
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         uses: actions/upload-artifact@v7
         with:
           name: modoki-editor-windows

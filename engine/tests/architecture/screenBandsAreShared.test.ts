@@ -11,11 +11,18 @@
  * clone that wrote it — rather than being found by whoever next reads both games side by side.
  * Same shape and same reason as `abandonmentIsShared.test.ts` (#801).
  *
- * ⚠️ **It does NOT catch a re-implementation under a different name.** It matches the literal
- * identifiers `solveBands` and `SCREEN_BAND_DEFAULTS`, so a third copy called `solveStack` is
- * invisible to it. That limit is stated rather than papered over: what it reliably catches is the
- * COPY-PASTE, which is how both existing copies actually arose — wordweave's was written first and
- * Court's was written against it three days later.
+ * ⚠️ **Three limits, stated rather than papered over.** What it reliably catches is the COPY-PASTE,
+ * which is how both existing copies actually arose — wordweave's was written first and Court's was
+ * written against it three days later.
+ *
+ *  1. **A rename defeats it.** It matches the literal identifiers `solveBands` and
+ *     `SCREEN_BAND_DEFAULTS`, so a third copy called `solveStack` is invisible.
+ *  2. **Import-AND-declare passes.** A file that imports the engine's `solveBands` (under any
+ *     alias) and also declares its own satisfies the delegation check. That is the shape a copy in
+ *     `court/layout.ts` would be forced into, since it already imports the name.
+ *  3. **A namespace import reads as no-import** (`import * as engine from …` + `engine.solveBands`)
+ *     and would FAIL a legitimate delegator. Nothing in the repo does this today, and a false
+ *     failure is the safe direction — it argues with an author rather than waving a copy through.
  *
  * ── What it checks, and why it is DELEGATION rather than absence ─────────────────────────────────
  *
@@ -56,7 +63,13 @@ function gameRuntimeFiles(): { abs: string; rel: string }[] {
   return repoFiles({ under: ['games', 'demos'], match: /\.tsx?$/, floor: 10 })
     .filter(({ rel }) => rel.includes('/runtime/') || /\/packages\/[^/]+\/src\//.test(rel))
     .filter(({ rel }) => !rel.includes('/ios/') && !rel.includes('/android/'))
-    .filter(({ rel }) => !rel.includes('/tests/') && !rel.includes('/node_modules/'));
+    // ⚠️ BOTH spellings of "a test". `/tests/` catches each game's own suite directory; the
+    // filename check catches COLOCATED tests, which the widened population brought in — Court
+    // alone ships five (`packages/app-services/src/*.test.ts`). Without it the banner's "tests are
+    // excluded deliberately" was false for half the new population, and a colocated test with a
+    // local `solveBands` stub would have been failed and told to import the engine's.
+    .filter(({ rel }) => !rel.includes('/tests/') && !rel.includes('/node_modules/')
+      && !/\.(test|spec)\.tsx?$/.test(rel));
 }
 
 const DECLARES_SOLVE = /(?:export\s+)?(?:function|const)\s+solveBands\b/;
@@ -68,7 +81,7 @@ const DECLARES_SOLVE = /(?:export\s+)?(?:function|const)\s+solveBands\b/;
  * mentioning `solveBands` sitting above any unrelated `@modoki/engine` import satisfied it, and a
  * hand-rolled solver in such a file would have passed (found in review).
  */
-const IMPORTS_ENGINE_SOLVE = /import\s*\{[^}]*\bsolveBands\b[^}]*\}\s*from\s*'@modoki\/engine/;
+const IMPORTS_ENGINE_SOLVE = /import\s*\{[^}]*\bsolveBands\b[^}]*\}\s*from\s*['"]@modoki\/engine/;
 const DECLARES_TRAIT_SCHEMA = /(?:export\s+)?const\s+SCREEN_BAND_DEFAULTS\s*=\s*\{/;
 
 describe.skipIf(!hasInternalGames())('the band model is not re-implemented per game (#800)', () => {

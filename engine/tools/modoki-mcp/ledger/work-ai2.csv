@@ -105,3 +105,5 @@ date,clone,tool,delta_bytes,tool_bytes_after,surface_bytes_after,sha
 2026-09-11,work-ai2,modoki_write_asset_meta,0,2860,153258,4eec34867
 2026-09-11,work-ai2,modoki_write_player_prefs,0,2389,153258,4eec34867
 2026-09-11,work-ai2,modoki_ota_publish,213,2676,153471,a56e7b284
+2026-09-12,work-ai2,modoki_press_key,361,2834,154113,c8433fd7f
+2026-09-12,work-ai2,modoki_type_text,281,1584,154113,c8433fd7f
