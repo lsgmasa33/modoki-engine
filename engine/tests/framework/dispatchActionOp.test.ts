@@ -9,14 +9,14 @@
  *  console.warned. Both are now `{ok:false, dispatched:false}`. */
 
 import { describe, it, expect, afterEach } from 'vitest';
-import { createTestWorld, type TestWorld, Transform, EntityAttributes, Director } from '@modoki/engine/runtime';
+import { createTestWorld, type TestWorld, Transform, EntityAttributes, Director, setTimeline, clearTimelineCache, normalizeTimeline } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { runAgentOp } from '../../app/debug/agentBridge';
 
 registerAllTraits();
 
 let game: TestWorld | undefined;
-afterEach(() => { game?.dispose(); game = undefined; });
+afterEach(() => { game?.dispose(); game = undefined; clearTimelineCache(); });
 
 type DispatchReply = { ok?: boolean; dispatched: boolean; reason?: string; known?: string[] };
 
@@ -78,6 +78,58 @@ describe('dispatch-action: engine.director requires a Director (#1093)', () => {
     game = createTestWorld({ actions: { 'engine.director': () => { hits++; } } });
     game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'hasdir', name: 'HasDir' }), Director({ timeline: 'x' }));
     const r = await runAgentOp('dispatch-action', { name: 'engine.director', targetGuid: 'hasdir', params: { action: 'pause' } }) as DispatchReply;
+    expect(r.dispatched).toBe(true);
+    expect(r.ok).not.toBe(false);
+    expect(hits).toBe(1);
+  });
+});
+
+describe('dispatch-action: engine.director on a SLAVED sub-director (#1112)', () => {
+  /** A Director slaved to a parent's `subdirector` clip has a playhead recomputed from the parent's
+   *  every in-span frame, so no transport verb can move it. The HANDLER refuses (that is what covers
+   *  an authored button), but a `console.warn` is invisible to an agent — this op answering
+   *  `{dispatched:true, targetResolved:true}` for a pause that never happened is the whole issue. */
+  const PARENT_TL = 'bridge-parent.timeline.json';
+  const CHILD_TL = 'bridge-child.timeline.json';
+
+  function authorNested(muted = false) {
+    setTimeline(PARENT_TL, normalizeTimeline({
+      id: 'p', name: 'Parent', duration: 6, frameRate: 30,
+      tracks: [{ id: 'ctl', name: 'Sub', target: 'Child', type: 'control', muted, clips: [{ start: 2, subdirector: true }] }],
+    }));
+    setTimeline(CHILD_TL, normalizeTimeline({ id: 'c', name: 'Child', duration: 3, frameRate: 30, tracks: [] }));
+  }
+
+  it('→ ok:false, dispatched:false, and slavedTo carries the parent guid so the retry is mechanical', async () => {
+    let hits = 0;
+    game = createTestWorld({ actions: { 'engine.director': () => { hits++; } } });
+    authorNested();
+    const parent = game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'p-guid', name: 'Parent' }), Director({ timeline: PARENT_TL }));
+    game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'c-guid', name: 'Child', parentId: parent.id() }), Director({ timeline: CHILD_TL }));
+
+    const r = await runAgentOp('dispatch-action', {
+      name: 'engine.director', targetGuid: 'c-guid', params: { action: 'pause' },
+    }) as DispatchReply & { slavedTo?: string };
+
+    expect(r.ok).toBe(false);
+    expect(r.dispatched).toBe(false);
+    expect(r.reason).toMatch(/SLAVED/);
+    expect(r.slavedTo).toBe('p-guid');
+    // The refusal must happen BEFORE dispatch, not alongside it.
+    expect(hits).toBe(0);
+  });
+
+  it('ACCEPT SIDE: the PARENT of that same pair dispatches — the guard refuses the child, not everything', async () => {
+    let hits = 0;
+    game = createTestWorld({ actions: { 'engine.director': () => { hits++; } } });
+    authorNested();
+    const parent = game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'p-guid', name: 'Parent' }), Director({ timeline: PARENT_TL }));
+    game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'c-guid', name: 'Child', parentId: parent.id() }), Director({ timeline: CHILD_TL }));
+
+    const r = await runAgentOp('dispatch-action', {
+      name: 'engine.director', targetGuid: 'p-guid', params: { action: 'pause' },
+    }) as DispatchReply;
+
     expect(r.dispatched).toBe(true);
     expect(r.ok).not.toBe(false);
     expect(hits).toBe(1);

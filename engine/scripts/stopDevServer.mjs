@@ -23,6 +23,7 @@
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { canonicalPath } from './pathIdentity.mjs';
+import { parsePidRows } from './subprocessText.mjs';
 
 const repoRoot = process.argv[2] ?? process.cwd();
 
@@ -45,10 +46,10 @@ function listProcesses() {
     return rows.map((r) => ({ pid: Number(r.ProcessId), cmd: r.CommandLine ?? '' }));
   }
   const out = execFileSync('ps', ['-Ao', 'pid=,args='], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
-  return out.split('\n').map((line) => {
-    const m = line.match(/^\s*(\d+)\s+(.*)$/);
-    return m ? { pid: Number(m[1]), cmd: m[2] } : null;
-  }).filter(Boolean);
+  // The `pid=,args=` row shape is parsed in ONE place for all three `ps` callers in this directory
+  // (#1118) — and that place is not this file, because this script runs its main on import, so a
+  // test reaching in here would try to stop the dev server.
+  return parsePidRows(out).map(({ pid, rest }) => ({ pid, cmd: rest }));
 }
 
 function kill(pid, force) {

@@ -38,6 +38,17 @@ export interface BlockingEditorOptions {
  *  `[]` means "use the platform default" — absent, valueless, or empty — never "no state". */
 export declare function userDataDirCandidatesFromCommand(command: string | null | undefined): string[];
 
+/** Two `ps -Ao pid=,<col>=` captures (executable paths, then full argv) joined by pid.
+ *
+ *  Exported and PURE so a CRLF fixture can reach it — `listProcesses` execs `ps` twice, so nothing
+ *  could test this join before (#1118). A pid present in the first capture but missing from the
+ *  second keeps an empty `command`: the two calls are separate `ps` invocations, so churn between
+ *  them is normal and a missing column is not a reason to forget the pid exists. */
+export declare function joinPidColumns(
+  exeOut: string | null | undefined,
+  cmdOut: string | null | undefined,
+): ProcessRow[];
+
 /** Does this EXECUTABLE path belong to the packaged app? Anchored to `<name>.app/Contents/` on
  *  posix and to the exact `<name>.exe` leaf on win32, so a dev editor's `Electron.app` cannot
  *  match and neither can a process that merely mentions the path. */

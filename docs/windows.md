@@ -103,8 +103,52 @@ phone that had just crashed** (fixed in `5fb7f3b1`; the `trimEnd()` in
 [engine/plugins/backend/deviceAndroidDiag.ts](../engine/plugins/backend/deviceAndroidDiag.ts) is
 load-bearing and commented as such).
 
-- **Normalize once, at the boundary.** Three separate places in the Android diagnostics know
-  about line endings; that is two too many. Prefer trimming where the subprocess output enters.
+- **Normalize once, at the boundary — and the boundary has a name now.**
+  [engine/scripts/subprocessText.mjs](../engine/scripts/subprocessText.mjs) is it for
+  `engine/scripts/**`: `outputLines(out)` splits on `\r\n`, `\n` **and a lone `\r`**, so its
+  postcondition is the thing every `$`-anchored pattern needs — *no line it returns contains a
+  `\r`*. (A lone `\r` counts because `ps` prints a process's own argv: a CR mid-argument makes an
+  end-anchored capture drop the row WHOLESALE, pid included. Breaking at the CR costs the tail of
+  one exotic row instead.) `parsePidRows(out)` then parses the `pid=,<col>=` shape once, where
+  three copies of the same regex used to live.
+- ⚠️ **The invariant these parses actually depended on was a CONTROL-FLOW ACCIDENT** (#1118). Three
+  `ps` parsers in `engine/scripts/**` carried `parseLogcatLine`'s exact end-anchored shape and were
+  safe only because a `win32` branch returned before them — nothing said so anywhere, and
+  `livePackagedEditor.mjs` disagreed with itself about it (Windows half `/\r?\n/`, POSIX half
+  `'\n'`, one function, no comment). None of it was ever observed failing and, with those branches
+  in place, none of it could be. The sites were one edit from reachable; the normalisation is
+  cheaper than the invariant.
+- **`joinCapturedStreams` is NOT part of that boundary, deliberately.** It protects a `^`-anchored
+  pattern from a GLUED stream boundary and **preserves `\r\n` on purpose** (its text goes to the
+  console as well as the classifier), so it stays in
+  [engine/scripts/nativePluginLegs.mjs](../engine/scripts/nativePluginLegs.mjs) next to the patterns
+  it exists to protect. Two opposite rules, two homes, one cross-reference each — one helper doing
+  both would need a flag, which is how a caller ends up on the wrong side of it.
+- **A game cannot use the shared helper, and that is the rule working.**
+  `games/court/tests/changedLevels.ts` normalises in its own `git()` because a project is opened
+  standalone and copied OUT of the repo (#29), and `gamePortability.test.ts` enumerates
+  `games/<id>/tests/**` too. Its comment says so, so the duplicate is not "cleaned up" into a gate
+  failure.
+- **Guarded by** `engine/tests/architecture/subprocessLineEndings.test.ts`: a line from a bare
+  `'\n'` split must not meet an end-anchored capture, over `engine/{scripts,tests,tools,plugins,
+  electron}`, `scripts/`, `games/` and `demos/`. ⚠️ It keys on the SHAPE, not on "is this a
+  subprocess" — that is a data-flow question no regex answers. The file-level approximation was
+  measured first and rejected: on the PRE-FIX tree, `spawn + bare '\n' split + any $-anchor` matched
+  **14** files, only **2** of which carried an unprotected defect — the other 12 being end-anchored
+  regexes on FILE PATHS (`/\.json$/`) or parses already protected by a `trimEnd()`
+  (`deviceAndroidDiag.ts`). A 12-entry allowlist, and an allowlisted guard rots. (Re-run after the
+  fix it matches 12, all false — the two real ones no longer split on a bare `'\n'`. Quote this
+  figure with the tree it was taken on; it moves when the fix lands. ⚠️ The three predicates are
+  spelled out as regexes in the guard's own docblock — a reviewer could not reproduce this count
+  from the prose description, having tried six plausible spellings.)
+- The guard's population is **five sites, all fixed**, so it ships with no allowlist:
+  `livePackagedEditor.mjs` ×2, `stopDevServer.mjs`, `agentDefinitions.test.ts` and
+  `gen-memory-index.mjs`. It carries no allowlist — only a one-entry SELF exclusion, because the
+  file spells the offending shapes as fixtures and `readScannedSource` blanks comments but preserves
+  string literals. ⚠️ Court's `changedLevels.ts` is a **sixth instance of the mechanism that
+  this guard cannot see** — its consumer is `.endsWith('.court.json')`, not a regex, so no anchor
+  appears anywhere near the split. It is covered by its own unit tests instead. A guard keyed on a
+  shape only sees that shape; the mechanism is wider than the shape.
 - **Keep captured-device fixtures byte-faithful** — [.gitattributes](../.gitattributes) pins
   `*.txt text eol=lf` so real logcat captures are not rewritten into a shape no device emits.
 - A test proving the parser handles a `\r` *you typed* is weaker evidence than one real phone.

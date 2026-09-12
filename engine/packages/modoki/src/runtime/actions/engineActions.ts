@@ -10,6 +10,8 @@ import { SkeletalAnimator } from '../traits/SkeletalAnimator';
 import { Animator } from '../traits/Animator';
 import { SpriteAnimator } from '../traits/SpriteAnimator';
 import { Director } from '../traits/Director';
+import { findSlavingParent } from '../timeline/timelineSystem';
+import { findEntityById } from '../core/ecs/world';
 import { animatorHasClip } from '../animation/animClipBank';
 import { spriteAnimHasClip } from '../loaders/spriteAnimCache';
 import { scrollToEntry } from '../ui/scrollApi';
@@ -20,6 +22,17 @@ import { EntityAttributes } from '../core/traits/EntityAttributes';
 function guidOfEntity(target: { has(t: unknown): boolean; get(t: unknown): unknown }): string {
   if (!target.has(EntityAttributes)) return '';
   return ((target.get(EntityAttributes) as { guid?: string }).guid) || '';
+}
+
+/** `name (guid)` for a warn message — the two addresses a human and an agent respectively need to
+ *  find the entity again. Falls back to the runtime id when neither is authored, which is better
+ *  than an empty string even though ids are reassigned on every scene reload. */
+function describeEntity(entity: { has(t: unknown): boolean; get(t: unknown): unknown; id(): number }): string {
+  const attr = entity.has(EntityAttributes)
+    ? (entity.get(EntityAttributes) as { name?: string; guid?: string })
+    : undefined;
+  const name = attr?.name || `entity ${entity.id()}`;
+  return attr?.guid ? `'${name}' (${attr.guid})` : `'${name}'`;
 }
 
 let registered = false;
@@ -171,7 +184,7 @@ export function registerEngineActions(): void {
       time: { type: 'number', tooltip: 'Optional: seek the playhead to this time in seconds. Does NOT re-fire sequence-start — use restart for that.' },
       speed: { type: 'number', tooltip: 'Optional: playback rate multiplier (1 = normal, 0.5 = half speed). Forward only — a negative rate is clamped to 0, because reverse playback is not supported.' },
     },
-    handler: ({ target, params, payload }) => {
+    handler: ({ target, params, payload, world }) => {
       if (!target) {
         console.warn('[engine.director] no target entity — set the binding target to an entity carrying a Director');
         return;
@@ -179,6 +192,32 @@ export function registerEngineActions(): void {
       const dir = target.get(Director);
       if (!dir) {
         console.warn('[engine.director] target has no Director trait');
+        return;
+      }
+      // ⚠️ REFUSE on a parent-driven child, before any transport verb is interpreted (#1112).
+      //
+      //  A Director slaved to a parent's `subdirector` clip has a playhead that is a pure FUNCTION
+      //  of the parent's — `driveSubdirector` writes `time = parentTime − clip.start` back onto it
+      //  every in-span frame — so `playing`/`speed` here would never be read and `time`/`started`
+      //  would be overwritten on the next frame. Writing them anyway is what this issue was: the
+      //  flag moved, the agent bridge answered `dispatched:true`, and the cutscene kept playing,
+      //  with the still-moving playhead as the only symptom.
+      //
+      //  ALL SIX verbs refuse, uniformly (owner, 2026-09-12), rather than forwarding the transport
+      //  ones to the parent: forwarding is coherent only for play/pause/toggle — a forwarded `time`
+      //  would have to be re-expressed as `clip.start + t` on the parent, and a forwarded `speed`
+      //  would re-rate every OTHER track on the parent's timeline, not just this child. So the
+      //  caller is handed the parent's address and decides for itself.
+      //
+      //  This is the choke point all three surfaces share (an authored button, the agent bridge's
+      //  dispatch-action op, and its device twin), which is why the refusal lives HERE and not only
+      //  in the bridge — a Pause button wired to a nested cutscene reaches none of the bridge's
+      //  pre-flight checks.
+      const slaving = findSlavingParent(world, target.id());
+      if (slaving) {
+        const parent = findEntityById(slaving.parentId, world);
+        const where = parent ? describeEntity(parent) : `entity ${slaving.parentId}`;
+        console.warn(`[engine.director] ${describeEntity(target)} is DRIVEN by a parent's subdirector clip (parent ${where}, track '${slaving.trackId}') — its playhead is computed from the parent's every frame, so play/pause/toggle/restart/seek/speed on it cannot take effect. Refused, nothing written. Target the parent instead.`);
         return;
       }
       const action = (typeof params?.action === 'string' && params.action) ? params.action

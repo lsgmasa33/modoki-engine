@@ -94,6 +94,7 @@ import {
   raycast3D, shapeCast3D, pointQuery3D, hasPhysics3D,
   findEntityById,
   EntityAttributes,
+  findSlavingParent,
   makeAssetRefResolver,
   getParticleEffect,
   getAnimationClip,
@@ -1032,6 +1033,32 @@ registerAgentOp('dispatch-action', (params) => {
     const ent = entityId != null ? getAllEntities().find((e) => e.id === entityId) : undefined;
     if (ent && !ent.traits.includes('Director')) {
       return { ok: false, dispatched: false, reason: `target '${p.targetGuid}' has no Director trait — engine.director has nothing to drive. Directors live on the entity that owns the timeline; re-read the scene with get_scene_state to find it.`, simRunning: true };
+    }
+    // A Director that HAS the trait can still be undrivable: one slaved to a parent's `subdirector`
+    // clip has a playhead computed from the parent's every frame, so every transport verb is inert
+    // on it. The handler refuses too (that is what covers an authored button), but a `console.warn`
+    // is invisible to an agent — and this op answering `{dispatched:true, targetResolved:true}` for
+    // a pause that never happened is the whole of #1112. The `slavedTo` guid is here so the retry
+    // is mechanical rather than a re-read: dispatch the same action at THAT entity.
+    if (entityId != null && ent) {
+      const slaving = findSlavingParent(getCurrentWorld(), entityId);
+      if (slaving) {
+        const parent = findEntityById(slaving.parentId);
+        const pAttr = parent?.has(EntityAttributes) ? (parent.get(EntityAttributes) as { name?: string; guid?: string }) : undefined;
+        const pGuid = pAttr?.guid || '';
+        // ⚠️ NEVER fall back to the runtime id as the parent's ADDRESS — ids are reassigned on every
+        // scene hot-reload, so an agent retrying against one drives whatever now holds that id. A
+        // guid-less Director is possible in principle (spawned from code, or by a control clip),
+        // and unreachable in every scene-load path checked — so say the address is missing rather
+        // than inventing one (review, un-killed hypothesis).
+        const pName = pAttr?.name || '(unnamed)';
+        const pAddr = pGuid ? ` (${pGuid})` : ' — which carries no guid, so re-read the hierarchy with get_scene_state to aim at it';
+        return {
+          ok: false, dispatched: false, simRunning: true,
+          reason: `target '${p.targetGuid}' is a SLAVED sub-director: it is driven by parent '${pName}'${pAddr} via a subdirector clip on track '${slaving.trackId}', so its playhead is recomputed from the parent's on every frame and NO engine.director verb can move it (play/pause/toggle/restart/seek/speed alike). Dispatch at the parent instead.`,
+          ...(pGuid ? { slavedTo: pGuid } : {}),
+        };
+      }
     }
   }
   dispatchUIAction(p.name, { payload: p.payload, params: p.params, targetGuid: p.targetGuid });

@@ -45,6 +45,7 @@
  *  installation; it is not a licence to delete the others out from under it.
  */
 
+import { outputLines, parsePidRows } from './subprocessText.mjs';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
@@ -323,7 +324,7 @@ export function listProcesses(platform = process.platform) {
       const out = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], {
         encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
       });
-      return out.split(/\r?\n/).map((line) => {
+      return outputLines(out).map((line) => {
         const [pid, exe, ...rest] = line.split('\t');
         return { pid: Number(pid), exe: exe ?? '', command: rest.join('\t') };
       // ⚠️ A row with NO `ExecutablePath` is one this user cannot open — unknown, not "not an
@@ -337,24 +338,36 @@ export function listProcesses(platform = process.platform) {
     // and reddened the public ubuntu leg while every Mac gate stayed green. `x` buys nothing on
     // macOS either: it only lifts the must-have-a-tty restriction that `-A` has already lifted —
     // measured, the pid sets differ only by process churn between the two calls, symmetrically.
-    const exeOut = execFileSync('ps', ['-Ao', 'pid=,comm='], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-    const cmdOut = execFileSync('ps', ['-Ao', 'pid=,command='], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-    const commands = new Map();
-    for (const line of cmdOut.split('\n')) {
-      const m = line.match(/^\s*(\d+)\s+(.*)$/);
-      if (m) commands.set(Number(m[1]), m[2]);
-    }
-    const rows = [];
-    for (const line of exeOut.split('\n')) {
-      const m = line.match(/^\s*(\d+)\s+(.*)$/);
-      if (!m) continue;
-      const pid = Number(m[1]);
-      rows.push({ pid, exe: m[2], command: commands.get(pid) ?? '' });
-    }
-    return rows;
+    // ⚠️ `maxBuffer`, following #1120's rule for git reads — the mechanism is identical here.
+    // Node's default is 1 MiB and `pid=,command=` carries FULL argv: measured on this Mac, 874
+    // processes render ~87 KB for `comm=`, but a machine with long command lines is the same
+    // distance from the cap as Court's scene was. The sibling `stopDevServer.mjs` has been bounded
+    // all along, so this was the inconsistent one.
+    //
+    // ⚠️ NOT the same severity as #1120's sites, and the difference is worth stating: overflow
+    // throws, the `catch` below answers `null`, and `null` means "could not ASK" — which this
+    // module's caller must not read as "nothing is running". So it fails SAFE (the packaged smoke
+    // refuses rather than deleting a live editor's state); what it loses is the CAUSE, reported as
+    // "could not enumerate" when the truth is "the output outgrew the pipe".
+    const exeOut = execFileSync('ps', ['-Ao', 'pid=,comm='], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 32 * 1024 * 1024 });
+    const cmdOut = execFileSync('ps', ['-Ao', 'pid=,command='], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 32 * 1024 * 1024 });
+    return joinPidColumns(exeOut, cmdOut);
   } catch {
     return null; // could not ASK — not the same as "nothing is running"
   }
+}
+
+/** Two `ps -Ao pid=,<col>=` captures joined by pid → `[{ pid, exe, command }]`.
+ *
+ *  Exported and PURE so a CRLF fixture can reach it: `listProcesses` above execs `ps` twice, so
+ *  nothing could test this join before (#1118). A pid present in the `comm=` capture but absent
+ *  from `command=` keeps an empty `command` rather than being dropped — the two calls are separate
+ *  `ps` invocations, so process churn between them is normal and a missing column is not a reason
+ *  to forget the pid exists. */
+export function joinPidColumns(exeOut, cmdOut) {
+  const commands = new Map();
+  for (const { pid, rest } of parsePidRows(cmdOut)) commands.set(pid, rest);
+  return parsePidRows(exeOut).map(({ pid, rest }) => ({ pid, exe: rest, command: commands.get(pid) ?? '' }));
 }
 
 /** The question the CLI actually asks. See the module header.

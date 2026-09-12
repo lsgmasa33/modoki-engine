@@ -59,7 +59,7 @@ Advances every `Director` playhead, then applies each track. **Collect-then-appl
 `emit` run *after* the query (those touch other entities / run their own queries — the same
 discipline as `animationSystem` and `zoneTriggerCore`).
 
-### Three ways a Director stops advancing — they mean different things
+### Ways a Director stops advancing — they mean different things
 
 - **`Director.playing = false`** — PAUSE. The entity is still live; you're holding the playhead.
   Drive it at runtime with the **`engine.director`** UIAction (play/pause/toggle/restart + seek and
@@ -82,6 +82,29 @@ discipline as `animationSystem` and `zoneTriggerCore`).
   switching a parent off doesn't UN-slave its children and set them running free.
 - **The sim isn't running** (stopped/paused editor, `timeScale = 0`) — `getSimDelta` returns 0, so
   the whole system is inert. See below.
+- **The `Paused` tag trait** — PASS 1's first guard (`timelineSystem.ts`, `if (entity.has(Paused))
+  return;`). A tag, so it is all-or-nothing and carries no fields; `time`/`started` are untouched, as
+  with `isActive`. This is the engine-wide pause marker, not a timeline concept, which is why it sits
+  outside the `playing` flag — and it was missing from this list until #1112.
+- **It is SLAVED to a parent's `subdirector` clip** — the parent OWNS it, and the child's playhead is
+  a pure function of the parent's. Not a stop so much as a change of authority: the child advances
+  when (and only when) the parent's clip is in span, at the parent's rate. ⚠️ **Transport on a slaved
+  child is REFUSED**, not queued — see § "Sub-directors (Phase F)" below for why there is no state to queue it
+  in.
+- **It has nowhere to go** — three cases that are not a deliberate "stop" at all but hold the
+  playhead every bit as firmly, and are the usual answer when all four above check out:
+  **`Director.speed = 0`** (the delta is scaled by `speed`, so zero advances nothing — and
+  `engine.director` is what SETS it, two bullets up, so a slow-mo dispatch that reached 0 is
+  indistinguishable from a hang); **a non-looping timeline that has reached `duration`** (measured:
+  `time` sits at the duration with `playing` still `true`); and **`Director.timeline` resolving to
+  no def** — `if (!def) return; // lazy — retry next frame` — so a missing or not-yet-loaded
+  timeline GUID reads `time: 0, playing: true, started: false` indefinitely, which looks exactly
+  like a Director that is running and stuck.
+
+⚠️ **This heading deliberately carries no COUNT.** It said "three" when there were five, and "five"
+when there were eight; a total is a completeness claim about every early return in PASS 1, and it
+goes stale the next time one is added — while reading as authoritative to someone debugging a
+cutscene that will not move.
 
 ### Muting a track
 
@@ -241,7 +264,9 @@ touch the emitter's live `IParticleBackend` handle from the deterministic pipeli
 `@control` event (`phase: 'particle' | 'particle-pause'`) — the registry carries only the visual
 effect, so headless tests assert on the journal exactly as for prefab spawn/despawn.
 
-**Sub-directors (Phase F) nest one timeline inside another.** A `subdirector:true` control clip binds
+### Sub-directors (Phase F) — nesting one timeline inside another
+
+A `subdirector:true` control clip binds
 the control track's target — an entity carrying its OWN `Director` — and drives it SYNCED to the clip:
 the child's local time = parentTime − `clip.start`, playing across `[start, start + (duration ??
 childDuration)]`. So the child's markers / audio / activation / `@sequence` fire at the correct GLOBAL
@@ -251,7 +276,27 @@ ticks and compose reusable sub-cutscenes. Three mechanisms make it deterministic
   skipped in the self-advance PASS 1 (it never runs on its own clock — the parent owns it). Scanning is
   memoized per `TimelineDef` (`timelineHasSubdirector`) so a timeline with no nesting pays only an O(1)
   probe. A **muted** subdirector track does NOT slave its child: muting means the parent stops driving
-  it, so the child runs on its own clock rather than freezing.
+  it, so the child runs on its own clock rather than freezing. ⚠️ That muted rule lives in exactly ONE
+  place, `forEachSlavingEdge` — the memoized probe deliberately ignores `muted` (it answers "does this
+  def nest at all", which is the only question its per-def cache can soundly answer, since `muted` is
+  re-read every frame). It was in both for a while, and the duplicate made the real one impossible to
+  test: deleting it changed nothing, because the probe short-circuited first (#1112).
+
+  ⚠️ **A slaved child's playhead is a pure FUNCTION of its parent's, so transport on the child is
+  REFUSED** (#1112). `driveSubdirector` writes `time = parentTime − clip.start` back onto the child on
+  every in-span frame, which means there is no state in which "child paused, parent playing" can be
+  *represented* — holding the child would require it to carry an offset from its parent's clip
+  position, and that is exactly the single-authority invariant this whole section is about. So
+  `engine.director` refuses **all six** verbs (play / pause / toggle / restart / seek / speed) on a
+  slaved child, writes nothing, and names the parent to aim at; the agent bridge answers
+  `{ok:false, dispatched:false, slavedTo:'<parent guid>'}`. Before that it wrote the field and
+  reported success, and the cutscene carried on playing: measured `before=1.0000`, flag written
+  `playing=false`, 30 ticks later `time=2.0000`. Ask `findSlavingParent(world, id)` if you need the
+  answer yourself — it is derived on demand from the parent's authored clip, deliberately not cached
+  on the child. Forwarding the transport verbs to the parent instead was considered and declined
+  (owner, 2026-09-12): it is coherent only for play/pause/toggle, since a forwarded seek would have to
+  be re-expressed as `clip.start + t` and a forwarded `speed` would re-rate every other track on the
+  parent's timeline.
 - **Cycle guard** — the parent's `applyDirectorFrame` recursively runs the child's frame with the same
   pose/trigger opts, guarded by a per-chain `visited` set against self-reference and A→…→A cycles.
 - **Drive-once** — a *frame-global* `driven` set (distinct from `visited`) ensures a child reached by

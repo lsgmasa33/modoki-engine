@@ -391,6 +391,7 @@
   "findEntityByGuid",
   "findEntityById",
   "findKeyIndex",
+  "findSlavingParent",
   "findUnrenderable2D",
   "fireDirtyListeners",
   "focusedGuid",

@@ -195,3 +195,111 @@ describe('engine.director — refusals', () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('unknown action'));
   });
 });
+
+/** #1112 — a Director SLAVED to a parent's `subdirector` clip.
+ *
+ *  ⚠️ **These do NOT assert a frozen playhead, and that is the point.** The issue as filed proposed
+ *  "pause the child, step, assert the playhead did not advance" — an assertion that can only pass
+ *  under a semantics the engine cannot represent. The child's time is RECOMPUTED from the parent's
+ *  every in-span frame (`driveSubdirector`: `time = parentTime − clip.start`), so a paused child
+ *  would have to carry an offset from its parent's clip position, which is exactly the
+ *  single-authority invariant nesting rests on. The fix therefore REFUSES the write; the playhead
+ *  keeps following the parent, correctly, and the test below pins that too so nobody "fixes" it
+ *  back into an offset. */
+const PARENT_PATH = 'director-action-parent.timeline.json';
+const CHILD_PATH = 'director-action-child.timeline.json';
+const PARENT_GUID = 'dir-parent-0001';
+const CHILD_GUID = 'dir-child-0001';
+
+/** Parent (6 s) with a subdirector clip at start=2 targeting "Child"; Child (3 s), playing. In-span
+ *  from global t=2, so the child's local time is `parentTime − 2`. `muted: true` un-slaves it. */
+function setupNested(opts: { muted?: boolean } = {}) {
+  registerEngineActions();
+  tw = createTestWorld({ dt: DT, systems: [TIMELINE] });
+  setTimeline(PARENT_PATH, normalizeTimeline({
+    id: 'p', name: 'Parent', duration: 6, frameRate: 30,
+    tracks: [{
+      id: 'ctl', name: 'Sub', target: 'Child', type: 'control', muted: opts.muted === true,
+      clips: [{ start: 2, subdirector: true }],
+    }],
+  }));
+  setTimeline(CHILD_PATH, normalizeTimeline({ id: 'c', name: 'Child', duration: 3, frameRate: 30, tracks: [] }));
+  const parent = tw!.spawn(EntityAttributes({ name: 'Parent', guid: PARENT_GUID }), Director({ timeline: PARENT_PATH }));
+  const child = tw!.spawn(
+    EntityAttributes({ name: 'Child', guid: CHILD_GUID, parentId: parent.id() }),
+    Director({ timeline: CHILD_PATH, playing: true }),
+  );
+  return { parent, child };
+}
+
+describe('engine.director — a slaved sub-director refuses transport (#1112)', () => {
+  it('refuses pause: the flag is UNCHANGED, not written-then-ignored', () => {
+    const { child } = setupNested();
+    tw!.step(75); // global t = 2.5 → parent in span, child local ≈ 0.5
+    expect(timeOf(child)).toBeGreaterThan(0.4);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    dispatchUIAction('engine.director', { targetGuid: CHILD_GUID, params: { action: 'pause' } });
+
+    // Before the fix this was `false` — the write landed, and the playhead kept moving anyway.
+    expect(dir(child).playing).toBe(true);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("DRIVEN by a parent's subdirector clip"));
+    // The message must carry the address of the thing that CAN be driven, or the caller is stuck.
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('Parent'));
+  });
+
+  it('keeps the playhead following the parent after the refusal — a refusal is not a freeze', () => {
+    const { child } = setupNested();
+    tw!.step(75);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    dispatchUIAction('engine.director', { targetGuid: CHILD_GUID, params: { action: 'pause' } });
+
+    const before = timeOf(child);
+    tw!.step(15); // +0.5 s of parent time
+    expect(timeOf(child)).toBeCloseTo(before + 0.5, 2);
+  });
+
+  it('refuses EVERY verb, not only pause — including a bare seek and a speed change', () => {
+    const { child } = setupNested();
+    tw!.step(75);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const before = { ...(child.get(Director) as object) } as Record<string, unknown>;
+
+    // No stepping between dispatches: anything that changes here was changed by the ACTION.
+    for (const params of [
+      { action: 'play' }, { action: 'pause' }, { action: 'toggle' }, { action: 'restart' },
+      { time: 0.25 }, { speed: 0.5 }, { action: 'restart', time: 1 },
+    ]) {
+      dispatchUIAction('engine.director', { targetGuid: CHILD_GUID, params });
+    }
+
+    expect({ ...(child.get(Director) as object) }).toEqual(before);
+  });
+
+  it('ACCEPT SIDE: a MUTED subdirector track does not slave, so pause still works there', () => {
+    // The guard must not over-refuse into "has a parent with a control track". Muting means the
+    // parent stops driving, so the child runs on its OWN clock and is drivable like any Director.
+    const { child } = setupNested({ muted: true });
+    tw!.step(15);
+    const selfRan = timeOf(child);
+    expect(selfRan).toBeGreaterThan(0); // proves the mute really un-slaved it
+
+    dispatchUIAction('engine.director', { targetGuid: CHILD_GUID, params: { action: 'pause' } });
+    expect(dir(child).playing).toBe(false);
+    tw!.step(15);
+    expect(timeOf(child)).toBeCloseTo(selfRan, 5); // held — the pause was honoured
+  });
+
+  it('ACCEPT SIDE: pausing the PARENT is the way that works, and it freezes the child with it', () => {
+    const { parent, child } = setupNested();
+    tw!.step(75);
+    const pAt = timeOf(parent);
+    const cAt = timeOf(child);
+
+    dispatchUIAction('engine.director', { targetGuid: PARENT_GUID, params: { action: 'pause' } });
+    tw!.step(30);
+
+    expect(timeOf(parent)).toBeCloseTo(pAt, 5);
+    expect(timeOf(child)).toBeCloseTo(cAt, 5);
+  });
+});

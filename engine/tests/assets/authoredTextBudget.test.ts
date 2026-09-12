@@ -34,6 +34,13 @@ const ent = (
   },
 });
 
+/**
+ * ⚠️ **No wall-clock assertions in here, deliberately.** Two `Date.now() - started < 1000` bounds
+ * lived in these cases and could not fail on any single regression (deleting `seen` costs ~65
+ * lookups, i.e. ~0 ms; reverting linearity alone stops a cycle at depth 2) — and if BOTH regressed
+ * they would HANG rather than fail, which is the exact shape the 16-level rewrite below removed as
+ * perverse. They were also load-sensitive. Cost is asserted by counting parent lookups instead.
+ */
 describe('a parentId CYCLE terminates instead of hanging (#1119 close-out)', () => {
   /** Two entities whose parents are each other, both with a definite px width. */
   const pxCycle = () => indexScene([
@@ -41,18 +48,15 @@ describe('a parentId CYCLE terminates instead of hanging (#1119 close-out)', () 
     ent('B', { width: 100, widthUnit: 'px' }, 'g-A'),
   ]);
 
-  it('resolves a px width without walking the cycle at all', () => {
+  it('resolves a px width, and survives the cycle it DOES walk', () => {
     const idx = pxCycle();
-    const started = Date.now();
     // ⚠️ The cycle IS entered — `boxWidthOf` resolves `containing` before `boxWidthFrom` looks at
     // the unit, so the walk runs even for a px width that will not use the answer. (An earlier
-    // comment here claimed the opposite and would have let a reader believe the px path is
-    // cycle-proof by construction. It is not; `seen` is what saves it.)
+    // version of this case was NAMED "without walking the cycle at all", which is what CI output
+    // and `vitest -t` carry, so the name went on asserting the falsehood after the comment was
+    // fixed.) `seen` is what saves it; the COST is asserted by the counting case below, not here.
     expect(resolveBoxWidthPx(idx.byName.get('A')!, idx, VP)).toBe(100);
     expect(resolveContentWidthPx(idx.byName.get('A')!, idx, VP)).toBe(100);
-    expect(Date.now() - started,
-      'a cyclic chain must not be walked exponentially — this took over 2 minutes before the fix')
-      .toBeLessThan(1000);
   });
 
   it('returns null for a % width whose containing block is inside the cycle', () => {
@@ -60,10 +64,8 @@ describe('a parentId CYCLE terminates instead of hanging (#1119 close-out)', () 
       ent('P', { width: 50, widthUnit: '%' }, 'g-Q'),
       ent('Q', { width: 50, widthUnit: '%' }, 'g-P'),
     ]);
-    const started = Date.now();
     expect(resolveBoxWidthPx(idx.byName.get('P')!, idx, VP)).toBeNull();
     expect(resolveContentWidthPx(idx.byName.get('P')!, idx, VP)).toBeNull();
-    expect(Date.now() - started).toBeLessThan(1000);
   });
 
   it('returns null for a self-parented entity', () => {

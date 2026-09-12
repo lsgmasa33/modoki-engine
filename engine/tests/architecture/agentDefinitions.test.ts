@@ -55,10 +55,18 @@ function parseAgents(): Def[] {
     .filter((f) => f.endsWith('.md'))
     .map((file) => {
       const raw = readScannedSource(path.join(AGENT_DIR, file), AGENT_MD_AS_PROSE).raw;
-      const m = /^---\n([\s\S]*?)\n---\n([\s\S]*)$/.exec(raw);
+      // `\r?\n`, not `\n`, and ⚠️ **NOT for the reason an earlier version of this comment gave.**
+      // It claimed core.autocrlf checks these .md files out as CRLF on Windows; it does not —
+      // `.gitattributes:15` pins `*.md text eol=lf`, so a COMMITTED .md is LF on every platform
+      // (`git check-attr text eol -- .claude/agents/*.md` → `eol: lf`). The reachable path is an
+      // UNCOMMITTED local edit written by an editor that emits CRLF, or a future weakening of that
+      // pin. Kept anyway, cheaply, because of what the failure LOOKS like: the fence and the
+      // `(.*)$` capture both fail on every line, `fm` comes back empty, and every assertion over
+      // it passes VACUOUSLY — a guard that stops guarding while staying green (#1118).
+      const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/.exec(raw);
       if (!m) return { file, name: '', body: '', fm: {} };
       const fm: Record<string, string> = {};
-      for (const line of m[1].split('\n')) {
+      for (const line of m[1].split(/\r?\n/)) {
         const kv = /^([a-zA-Z_]+):\s*(.*)$/.exec(line);
         if (kv) fm[kv[1]] = kv[2].trim().replace(/^["']|["']$/g, '');
       }

@@ -388,6 +388,15 @@ export function measureTextFit(
  * ⚠️ Modelling the flex resolution itself would recover these cases. It is deliberately NOT done
  * here: it needs every sibling's base, min-content floor and grow/shrink factor, which is a
  * layout engine, not a budget.
+ *
+ * ⚠️ **Consequence worth knowing before you add a row label to an own-box budget: `flexShrink`
+ * DEFAULTS to 1** (`runtime/traits/UIElement.ts`), so every row child that does not explicitly
+ * author `flexShrink: 0` is refused here. The budget is therefore effectively opt-in via a scene
+ * field, and the next authored-width row label will fail with "own width is not resolvable" until
+ * someone either authors `flexShrink: 0` — **a render-affecting edit, so do not make it merely to
+ * satisfy a test** — or records the label as flex-sized instead. The direction is safe (a refusal,
+ * never a wrong number), and a caller's own skip-set assertion is what stops the refusal being
+ * mistaken for coverage.
  */
 function flexesOnWidth(e: AuthoredEntity, idx: SceneIndex): boolean {
   const parentUi = parentUiOf(e, idx);

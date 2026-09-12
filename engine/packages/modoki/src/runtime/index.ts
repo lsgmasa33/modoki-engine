@@ -221,7 +221,7 @@ export {
 export {
   getTimeline, setTimeline, invalidateTimeline, clearTimelineCache, loadTimelineNow,
 } from './loaders/timelineCache';
-export { timelineSystem, resolveTimelineAt, applyTimelineState, previewTimelineAt, previewTimelineStep } from './timeline/timelineSystem';
+export { timelineSystem, resolveTimelineAt, applyTimelineState, previewTimelineAt, previewTimelineStep, findSlavingParent } from './timeline/timelineSystem';
 export { requestSkeletalSeek, getSkeletalSeek, clearSkeletalSeeks, hasSkeletalSeeks } from './core/skeletalSeek';
 export { setTimelinePreviewActive, isTimelinePreviewActive } from './core/timelinePreview';
 export { clearControlSpawns } from './timeline/controlSpawnRegistry';

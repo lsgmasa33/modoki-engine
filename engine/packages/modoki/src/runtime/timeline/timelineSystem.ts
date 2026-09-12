@@ -637,17 +637,27 @@ function activationBaseKey(targetId: number, targetGeneration: number): string {
   return `${_trackMutedEpoch}:${targetId}:${targetGeneration}`;
 }
 
-/** Memoized "does this timeline have ANY sub-director control clip?" A `.timeline.json` is immutable
- *  once loaded (a re-import replaces the def object), so a WeakMap keyed on the def is a stable,
- *  self-evicting cache. Lets the per-frame slaving scan skip the O(tracks×clips) walk for the common
- *  case (no nested timelines) — a plain O(1) lookup instead (review C9). */
+/** Memoized "does this timeline contain ANY sub-director control clip?" A `.timeline.json` is
+ *  immutable once loaded (a re-import replaces the def object), so a WeakMap keyed on the def is a
+ *  stable, self-evicting cache. Lets the per-frame slaving scan skip the O(tracks×clips) walk for
+ *  the common case (no nested timelines) — a plain O(1) lookup instead (review C9).
+ *
+ *  ⚠️ **Deliberately IGNORES `track.muted`, unlike the walk that calls it**, and the two reasons are
+ *  really one. `muted` is re-read every frame (`docs/timeline.md` § Muting a track), so it is not a
+ *  property of the DEF — caching a value derived from it under a key that only changes when the def
+ *  object does would be caching a mutable fact, whereas "does this def nest at all" genuinely cannot
+ *  change for a given def, which is what makes the memo sound. And it leaves the
+ *  muted-does-not-slave rule with ONE home (`forEachSlavingEdge`): it used to live here as well,
+ *  which made the copy in the walk UNTESTABLE — a mutation deleting it could not be detected,
+ *  because this gate short-circuited first for a timeline whose only subdirector track was muted
+ *  (found by mutation-checking #1112's accept-side case). */
 const _hasSubdir = new WeakMap<TimelineDef, boolean>();
 function timelineHasSubdirector(def: TimelineDef): boolean {
   const memo = _hasSubdir.get(def);
   if (memo !== undefined) return memo;
   let has = false;
   for (const track of def.tracks) {
-    if (track.type !== 'control' || track.muted) continue;
+    if (track.type !== 'control') continue;
     if (track.clips.some((c) => c.subdirector)) { has = true; break; }
   }
   _hasSubdir.set(def, has);
@@ -655,6 +665,33 @@ function timelineHasSubdirector(def: TimelineDef): boolean {
 }
 
 const _EMPTY_SLAVED: ReadonlySet<number> = new Set();
+
+/** Walk every slaving EDGE: `visit(parentId, childId, trackId)` once per non-muted `subdirector`
+ *  control clip whose track resolves to a Director other than the parent itself.
+ *
+ *  This is the ONE authority on slaving, and it is a walk rather than a set so that both questions
+ *  the engine asks of it share these rules: *which children must not self-advance* (per frame,
+ *  `collectSlavedDirectors` below) and *who owns this child* (once per user/agent action,
+ *  `findSlavingParent`, #1112). Two implementations would drift, and the two rules most easily
+ *  re-derived wrongly are both load-bearing — see the docblocks below for muted tracks and for
+ *  scanning ALL directors rather than only the playing ones. */
+function forEachSlavingEdge(
+  world: World, index: EntityIndex,
+  visit: (parentId: number, childId: number, trackId: string) => void,
+): void {
+  world.query(Director).updateEach(([dir], entity) => {
+    const def = getTimeline((dir as { timeline: string }).timeline);
+    if (!def || !timelineHasSubdirector(def)) return; // O(1) skip for non-nesting timelines
+    for (const track of def.tracks) {
+      if (track.type !== 'control' || track.muted) continue; // muted → don't slave (child stays free)
+      for (const clip of track.clips) {
+        if (!clip.subdirector) continue;
+        const childId = resolveTrackTarget(index, entity.id(), track.target);
+        if (childId !== null && childId !== entity.id()) visit(entity.id(), childId, track.id);
+      }
+    }
+  });
+}
 
 /** The set of child Director entity ids that are SLAVED — i.e. a non-muted `subdirector` control clip
  *  in some parent Director's timeline targets them. A slaved child must NOT self-advance in the normal
@@ -674,19 +711,38 @@ const _EMPTY_SLAVED: ReadonlySet<number> = new Set();
  *  when no timeline nests, the common case. */
 function collectSlavedDirectors(world: World, index: EntityIndex): ReadonlySet<number> {
   let slaved: Set<number> | undefined;
-  world.query(Director).updateEach(([dir], entity) => {
-    const def = getTimeline((dir as { timeline: string }).timeline);
-    if (!def || !timelineHasSubdirector(def)) return; // O(1) skip for non-nesting timelines
-    for (const track of def.tracks) {
-      if (track.type !== 'control' || track.muted) continue; // muted → don't slave (child stays free)
-      for (const clip of track.clips) {
-        if (!clip.subdirector) continue;
-        const childId = resolveTrackTarget(index, entity.id(), track.target);
-        if (childId !== null && childId !== entity.id()) (slaved ??= new Set()).add(childId);
-      }
-    }
-  });
+  forEachSlavingEdge(world, index, (_parentId, childId) => { (slaved ??= new Set()).add(childId); });
   return slaved ?? _EMPTY_SLAVED;
+}
+
+/** Who DRIVES this Director — the parent whose non-muted `subdirector` clip targets it, or `null`
+ *  when it runs on its own clock. Public because the answer changes what a TRANSPORT REQUEST means,
+ *  and the surfaces that receive those requests sit outside this module (#1112).
+ *
+ *  ⚠️ **A slaved child's playhead is a pure FUNCTION of its parent's** — `driveSubdirector` writes
+ *  `time = parentTime − clip.start` back onto the child every in-span frame — so there is no state
+ *  in which "child paused, parent playing" can be REPRESENTED. Holding the child would require it
+ *  to carry an offset from its parent's clip position, which is exactly the single-authority
+ *  invariant the whole nesting model rests on. That is why callers REFUSE a transport write on a
+ *  slaved child rather than queueing or honouring it: `playing`/`speed` would never be read, and
+ *  `time`/`lastTime`/`started` are overwritten on the next in-span frame.
+ *
+ *  Derived on demand, deliberately: slaving lives in the PARENT's authored clip, so caching it on
+ *  the child (a tag, or a `Director.slavedTo` field written per frame) would be a second copy of an
+ *  authored fact — the shape #1042 catalogues. Cost is one `buildEntityIndex` + one Director scan
+ *  per call, which is a user action, not a frame. It builds its OWN index rather than taking one:
+ *  the only caller that HAS an index is the per-frame pass, and that goes through
+ *  `forEachSlavingEdge` directly — so an `index` parameter here was an affordance nothing reached.
+ *  Add it back if a caller ever appears that both holds an index and asks this question. */
+export function findSlavingParent(
+  world: World, childId: number,
+): { parentId: number; trackId: string } | null {
+  let found: { parentId: number; trackId: string } | null = null;
+  forEachSlavingEdge(world, buildEntityIndex(world), (parentId, cId, trackId) => {
+    if (found || cId !== childId) return; // first edge wins; two parents slaving one child is authoring error
+    found = { parentId, trackId };
+  });
+  return found;
 }
 
 /** Drive the track target's nested `Director` synced to a `subdirector` clip (Phase F). The child's
@@ -886,8 +942,11 @@ function applyDirectorFrame(world: World, p: Pending, index: EntityIndex, opts: 
         for (let ci = 0; ci < track.clips.length; ci++) {
           const clip = track.clips[ci];
           if (clip.subdirector) {
-            // Muting a subdirector clip means the PARENT stops driving the child (docs/timeline.md
-            // :152) — the child then runs on its own clock instead of freezing. This is existing,
+            // Muting a subdirector clip means the PARENT stops driving the child
+            // (docs/timeline.md § "Sub-directors (Phase F)") — the child then runs on its own clock
+            // instead of freezing. Cited by HEADING, not by line: this said `:152` and the statement
+            // was at `:253`, then at `:266` after an edit moved it — and docCitations.test.ts scans
+            // docs/** only, so a line citation in SOURCE is checked by nothing. This is existing,
             // documented behaviour, unrelated to the new muted handling below: preserve it as-is.
             if (track.muted) continue;
             if (opts.driveSubdirectors) driveSubdirector(world, p, index, opts, track, clip, visited, driven);

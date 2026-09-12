@@ -439,6 +439,32 @@ repo path (the stagers' module-level `BIN_DIR`), a unit test would write into th
 end-to-end claim belongs to `verify:packaged` and stays open until a pack fixture exists. Say which
 half you covered.
 
+#### (C1) The MUTATION CHECK drives the wrong copy — a worktree's symlinked `node_modules`
+
+Every instance above is a *test* running the wrong copy. This one is worse, because it corrupts the
+thing that validates every other entry in this file: **a mutation check run from a git worktree can
+report a false green.**
+
+A worktree created by `Agent(isolation: "worktree")` gets its `node_modules` as a symlink, so
+`node_modules/@modoki/engine -> ../../engine/packages/modoki` resolves **back into the parent
+clone**. Mutate `engine/packages/modoki/tests/helpers/<x>.ts` inside the worktree, run a suite that
+imports it through the `@modoki/engine/...` specifier, and the suite loads the PARENT's unmutated
+file. The mutation is real, the run is real, and the green is meaningless.
+
+⚠️ **It fails in the safe-looking direction, which is why it is dangerous.** A false RED would be
+investigated. A false green reads as "the mechanism is pinned" and retires the question.
+
+Found 2026-09-12, reviewing #1119's label budget: a reviewer's first pass at mutating
+`tests/helpers/authoredTextBudget.ts` appeared not to reach the wordweave suite at all, and every
+helper-level finding had to be re-derived after rebuilding the link inside the worktree.
+
+**So: before trusting any mutation check of a file imported through a package specifier, establish
+which copy the suite loaded** — point the worktree's link inside itself, or run the check in the
+clone. Two shapes are affected and one is not: a change under `engine/packages/modoki/**` imported
+as `@modoki/engine/...` is exposed, a change to a test file the suite loads by relative path is not.
+This is also the one case where "I ran the mutation and it stayed green" should make you check the
+setup before concluding the test is vacuous — the usual inference runs the other way.
+
 ### Shape (D): the STUB or FAKE is more capable than the thing it stands in for
 
 Shapes (A)-(C) are about how many instances a suite builds, and which copy it runs. This one is

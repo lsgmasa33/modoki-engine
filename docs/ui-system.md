@@ -633,13 +633,40 @@ Four stateless lifecycle/animator handlers are registered once at startup by
   typed enum param, so the Inspector renders a dropdown rather than free text; omitting it means
   `toggle`, which is what a bare Pause button wants.
 
+  ⚠️ **It REFUSES on a sub-director** (#1112). If the target is driven by a parent's
+  `subdirector:true` control clip, its playhead is recomputed from the parent's on every in-span
+  frame, so none of the six verbs can take effect — the action writes nothing, warns with the
+  parent's name and guid, and the agent bridge answers `{ok:false, dispatched:false,
+  slavedTo:'<parent guid>'}`. **Aim a nested cutscene's Pause button at the PARENT.** Mechanism and
+  why forwarding was declined: [timeline](./timeline.md) § "Sub-directors (Phase F)".
+
   ⚠️ **`restart` and a seek to 0 are NOT the same thing, and the difference is the once-only
   sequence-start fan-out.** `restart` rewinds and clears `Director.started`, so `@sequence`
   `phase:'start'` (and every `t=0` marker edge) fires again; a plain `time` seek deliberately does
   not, because scrubbing moves *within* a playthrough and re-firing start on every scrub is worse
   than not firing it. Passing both (`{action:'restart', time: 3}`) starts the playthrough over from
   3s — the seek applies last and wins, which is the only reading under which both arguments
-  survive. Seeking past the end is left to the system, which already clamps or wraps per `loop`.
+  survive.
+
+  ⚠️ **Seeking past the end is left to the system only while the Director is PLAYING.** `advance()`
+  clamps (or wraps, per `loop`) on the next frame it runs, and it does not run for a paused Director
+  — PASS 1 returns on `!dir.playing` before the playhead is integrated. So the out-of-range value
+  SURVIVES the whole paused window: measured on a 4 s timeline, `{action:'pause', time: 999}` reads
+  back 999 immediately and still 999 after 120 paused ticks, then clamps to `4.0000` on the FIRST
+  frame after `play` (2026-09-12, `work-ai3`). So it is not permanent — it is unclamped for exactly
+  as long as you stay paused, and reading `Director.time` in that window gets you a number outside
+  the timeline. An earlier version of this line said the clamp was unconditional; it is not (#1113,
+  whose own fix — what a paused seek should re-POSE — is a separate open decision that does not
+  change this sentence whichever way it goes).
+
+  ⚠️ **And resuming from out of range SWALLOWS the end fan-out** — the half that actually breaks a
+  game. `justEnded` is `!loop && prev < duration && cur >= duration`, so with `prev = 999` the
+  `999 < 4` test is false and no `@sequence` `phase:'end'` fires; every `crossed()` marker / audio /
+  activation edge is likewise computed over the empty window `(999, 4]`. Measured on a 1 s timeline:
+  playing straight through gives phases `['start','end']`, while pause → seek 999 → resume gives
+  `['start']`, with the playhead landing on `duration` and `playing` still true. So a cutscene whose
+  `OnSequence.onEnd` re-enables the HUD ends with the HUD locked. Pre-existing, not caused by the
+  seek clamp above, and part of what #1113 has to decide.
 
   ⚠️ **Why this exists (#1093).** Before it, the `Director` was the only playable component in the
   engine with no runtime affordance, so the only way to pause a cutscene was a scene edit — and
