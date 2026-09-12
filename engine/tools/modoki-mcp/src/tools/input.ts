@@ -213,7 +213,11 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
   // ── press_key — standalone trusted key chord (Electron editor only) ──
   tool(
     'modoki_press_key',
-    'Press a single trusted key chord (keyDown+keyUp) into the focused element — the ' +
+    'Press a single trusted key chord into the focused element — keyDown+keyUp, plus a `char` ' +
+      'event for Enter/Return so the press can actually INSERT: a bare keyDown/keyUp pair carries ' +
+      'no text for ANY spelling (measured, Electron 43.2.0), which is why pressing Enter in a ' +
+      'textarea used to do nothing at all. ⚠️ A MODIFIED Enter sends no char — Cmd/Ctrl+Enter is ' +
+      '"commit, do not insert" — and Shift+Enter therefore does not soft-break either. The ' +
       'standalone keys typeText can only send as a terminal submitKey: Escape (close modal/' +
       'picker), Delete/Backspace, arrows (nudge), and editor hotkeys (W/E/R gizmo mode, F ' +
       "frame, X space, Cmd+Z undo). `key` is an Electron keyCode ('Escape', 'Delete', " +

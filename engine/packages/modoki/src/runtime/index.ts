@@ -59,6 +59,13 @@ export { resolveTapZoneVeto, UI_TAP_ZONE_ATTR, UI_PRESS_ORIGIN_ATTR } from './ui
 // guard cannot use at all.
 export { resolveAnchorRect, ZERO_INSETS, type AnchorData, type SafeAreaPx }
   from './ui/anchorLayout';
+// The vertical band stack (#800), extracted from two identical per-game copies. The SOLVER is L0
+// arithmetic with no world; the READER needs one. ⚠️ `ScreenBand` is exported but deliberately NOT
+// registered by the engine — each game calls `registerTrait` with this object and its own role
+// vocabulary and tooltips. The trait's own banner says what registering it here would break.
+export { solveBands, type Band, type SolvedBand, type SolvedBands } from './core/screenBands';
+export { ScreenBand, SCREEN_BAND_DEFAULTS } from './traits/ScreenBand';
+export { readScreenBands, type ReadScreenBandsOptions } from './ui/readScreenBands';
 // `AnchorData.anchor` is typed `AnchorMode`, so exporting the interface without it leaves a public
 // type whose own field type is unreachable — `npm run docs:api` says so out loud ("referenced by
 // index.AnchorData.anchor but not included in the documentation"), and a caller building an

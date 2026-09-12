@@ -1953,6 +1953,49 @@ offset bug survived. So that suite also asserts the resolved rect outright (a 5%
 
 ---
 
+## Screen bands (`solveBands` + `ScreenBand`)
+
+A **band** is an authored claim on vertical space: `minHeight` is a floor it never goes below, and
+`flex` is its share of whatever height is left once every floor is paid (`flex: 0` is rigid). A game
+authors one `ScreenBand` entity per band and solves the stack into design-space extents.
+
+The point of the model, rather than a chain of subtractions, is that it makes **which band absorbs a
+per-device reserve an authored decision instead of an accident of arithmetic**. Both shipping games
+have exactly that reserve — the ad banner — and it swings 18-178 design px across the device set. In
+a subtraction the residual band silently paid all of it; with `flex`, whoever holds the flex pays,
+and moving it is an Inspector edit.
+
+- **`solveBands`** (`runtime/core/screenBands.ts`) is L0 arithmetic: no world, no traits, nothing
+  imported. Generic over the role string, so each game keeps its own role union end to end.
+- **`readScreenBands`** (`runtime/ui/readScreenBands.ts`) reads the authored stack out of a world.
+- **`ScreenBand`** (`runtime/traits/ScreenBand.ts`) is the trait schema.
+
+⚠️ **The reserve is subtracted BEFORE any band is paid, because it is not a band** — it is not
+authored at all, it is a per-device measurement, so it cannot take part in the flex split. A rigid
+band's height must therefore never move with the reserve.
+
+⚠️ **Every band's `minHeight` must already be RESOLVED by the caller.** A game whose floor is a
+measured quantity (Court's top band is its measured caption bottom) substitutes the number first.
+That is what keeps the solver pure arithmetic and testable without a renderer.
+
+⚠️ **`accept` and `require` are separate lists.** A role outside `accept` is skipped, never coerced;
+a missing `require` role refuses the whole authored stack in favour of the caller's fallback, because
+half an authored stack mixed with half a code one is the hardest version of this to diagnose. The two
+lists differ per game — Court requires all four of its roles, wordweave only `crossword` and `board`
+of its five.
+
+⚠️ **The engine does NOT register `ScreenBand`; each game does, with its own fields.**
+`registerTrait` silently evicts a previously-registered Trait object when the same name arrives with
+a different one, and nothing lets a game attach Inspector metadata to an engine-registered trait. So
+a game imports the trait object and calls `registerTrait` itself with its own role vocabulary and
+tooltips. Registering it in the engine would delete it from the registry with no diagnostic.
+
+⚠️ **`role` defaults to `''` deliberately** — a scene save omits every field equal to its trait
+default, so a real role name as the default would delete that band's identity on the next save.
+
+Extracted in #800 from two independently-written, arithmetically identical copies (wordweave #773,
+court #791); `engine/tests/architecture/screenBandsAreShared.test.ts` fails a third.
+
 ## Directional focus navigation (controller / keyboard)
 
 `UIFocusable` opts an element into pointer-free navigation — a controller or keyboard

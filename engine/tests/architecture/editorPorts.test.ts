@@ -26,7 +26,7 @@ import { existsSync, mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
-import { hasPrivateDocs, hasPrivateTooling } from '../helpers/repoLayout';
+import { hasPrivateDocs } from '../helpers/repoLayout';
 import { readScannedSource } from '@modoki/engine/testing';
 import {
   CLONE_BACKEND_PORTS,
@@ -56,12 +56,17 @@ const readDoc = (rel: string) => readScannedSource(path.join(REPO, rel), {
   comments: 'include',
   reason: 'the assertions are about the port TABLES written in this doc — prose is the subject',
 }).raw;
-// ⚠️ A PROXY, and the reason once written here was false: this said the public snapshot ships no
-// `engine/scripts/**`, but its manifest is `git ls-files -- engine`, so `editorPorts.mjs` and
-// `launch-editor.sh` DO ship. The `.mcp.json` probe skips every block below on the public leg
-// anyway — a known coverage gap, deliberately not widened in #907 (un-gating runs the launcher and
-// symlink fixtures on the public 3-OS matrix). The doc-table block ALSO needs the private docs.
-const skip = !hasPrivateTooling();
+// ⚠️ There is no file-presence gate in this file any more, and the history is worth keeping (#1084).
+// Every block below USED to skip on `!hasPrivateTooling()` — `.mcp.json exists` — a PROXY for "this
+// is a developer clone". The reason written beside it was false: it claimed the public snapshot
+// ships no `engine/scripts/**`, but the manifest is `git ls-files -- engine` with no exclusion under
+// `engine/scripts/`, so `editorPorts.mjs`, `launch-editor.sh` and `lib/repo-reap.sh` all DO ship.
+// The proxy nevertheless skipped all four blocks on the public 3-OS leg — including on WINDOWS,
+// where this file's subject (path spelling, #961) is most likely to differ.
+//
+// So each block now gates on what it READS, per `helpers/repoLayout.ts`'s own rule and #1071's
+// precedent: the three that read only shipped `engine/scripts/**` + `package.json` run everywhere,
+// and only the doc-table block gates — on `hasPrivateDocs()`, which is what it actually needs.
 
 /** Every `| ~/Projects/<dir> … | <port> |` row of a markdown table, as dir → first port cell.
  *  Both CLAUDE.md § Clones and docs/clones-and-ports.md § RULE 2 use this shape; the port is
@@ -86,7 +91,7 @@ function portsFromMarkdownTable(src: string): Record<string, number> {
   return out;
 }
 
-describe.skipIf(skip)('editorPorts.mjs is the one home for the clone → backend port table (#349)', () => {
+describe('editorPorts.mjs is the one home for the clone → backend port table (#349)', () => {
   it('resolves each known clone directory to its pinned port', () => {
     expect(backendPortForClone('/Users/someone/Projects/modoki')).toBe(5179);
     expect(backendPortForClone('/Users/someone/Projects/modoki-ai')).toBe(5180);
@@ -227,7 +232,7 @@ describe.skipIf(skip)('editorPorts.mjs is the one home for the clone → backend
  *  `clonePort.mjs` hashes `repoRoot` raw, while its own `defaultRepoRoot()` is already physical
  *  (Node realpaths `import.meta.url`). So a launcher passing bash's LOGICAL `pwd` disagreed with
  *  every other caller of the same hash. */
-describe.skipIf(skip)('launch-editor.sh hands the port derivation the PHYSICAL spelling (#961)', () => {
+describe('launch-editor.sh hands the port derivation the PHYSICAL spelling (#961)', () => {
   const LAUNCHER = path.join(REPO, 'engine/scripts/launch-editor.sh');
   const REAP_LIB = path.join(REPO, 'engine/scripts/lib/repo-reap.sh');
 
@@ -358,7 +363,7 @@ describe.skipIf(skip)('launch-editor.sh hands the port derivation the PHYSICAL s
 
 // Gated on what it READS: `CLAUDE.md` is not in the snapshot manifest, and `docs/clones-and-ports.md`
 // is a private doc since #907 — so the snapshot carries neither, whatever `.mcp.json` says.
-describe.skipIf(skip || !hasPrivateDocs())('the docs still say what the table says', () => {
+describe.skipIf(!hasPrivateDocs())('the docs still say what the table says', () => {
   // The drift this catches is not cosmetic: a human reads the doc table to decide what to pass
   // to MODOKI_BACKEND_PORT, so a doc that disagrees with the code hands them a sibling's lane.
   for (const [doc, section] of [
@@ -416,7 +421,7 @@ describe.skipIf(skip || !hasPrivateDocs())('the docs still say what the table sa
   });
 });
 
-describe.skipIf(skip)('no shared script re-introduces a hardcoded hub-port default', () => {
+describe('no shared script re-introduces a hardcoded hub-port default', () => {
   /** Files every clone runs, which USED to bake in a port. Listed explicitly (not globbed) so
    *  that deleting one from this list is a visible act rather than a silent loss of coverage. */
   const SHARED = [

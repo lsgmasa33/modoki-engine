@@ -663,6 +663,16 @@ describe('parseDeviceCommand — a device command inside a wrapper (#1083)', () 
     expect(r.tools).toEqual([]);      // nothing was parsed out of it — that IS the point
   });
 
+  it.todo(
+    'OPEN QUESTION: is any opaque input one that would actually RUN a device command? '
+    + 'An unterminated heredoc hands the adb line to `cat` as DATA — the phone is never touched — '
+    + 'and the other inputs that still come back opaque (`sh -i adb …`, `bash --noprofile adb …`) '
+    + 'treat adb as a script FILENAME. The unmodelled-launcher arm now re-dispatches instead of '
+    + 'going opaque. If that holds, this refusal fires only on harmless commands and its cost is '
+    + 'all friction — raised by review, unresolved, and left as a question rather than a silent '
+    + 'assumption in either direction.',
+  );
+
   it('an expansion inside a real device command does not cut it in half', () => {
     // The fail-open this change introduced and its own review caught: splitting on `(`/`{` moved the
     // VERB into another segment, so `uninstall` vanished and the verdict flipped to non-destructive —
@@ -738,11 +748,77 @@ describe('parseDeviceCommand — a device command inside a wrapper (#1083)', () 
     // `find` is both a launcher and a searcher, which is why the two cases are pinned together: the
     // exec flag is the half that runs anything.
     expect(parseDeviceCommand(`find . -exec ${D} \\;`)).toMatchObject({ destructive: true, ids: ['adb:RFTESTSERIAL1'] });
+    // …and through a shell the exec'd command opens, too.
+    expect(parseDeviceCommand(`find . -exec sh -c "${D}" \\;`)).toMatchObject({ destructive: true, ids: ['adb:RFTESTSERIAL1'] });
+  });
+
+  it('an exec flag EARLIER in the find does not make its search argument a command', () => {
+    // Asking "is there an exec flag anywhere before the token" refused
+    // `find . -name '*.ts' -exec grep -l adb {} \;`, where the exec'd command is grep and `adb` is
+    // merely what it searches for. The device token has to BE the command the exec flag runs.
+    for (const cmd of [
+      `find . -name "*.ts" -exec grep -l adb {} \\;`,
+      `find . -name "*.md" -exec grep -l adb {} +`,
+    ]) {
+      expect(parseDeviceCommand(cmd), cmd).toEqual({ ids: [], destructive: false, untargeted: false, tools: [] });
+    }
+  });
+
+  it('a MODELLED launcher followed by one of its own options still refuses', () => {
+    // The launcher signal used to read the word the hop loop STOPPED on, which by construction is
+    // never a modelled launcher — so three quarters of the launcher set was dead and every one of
+    // these dropped from refuse to ALLOW. `xcrun --sdk iphoneos devicectl …` is a real iOS install
+    // shape, and `xcrun devicectl` is the example the launcher table is written around.
+    for (const cmd of [
+      'xcrun --sdk iphoneos devicectl device install app ./App.app',
+      'stdbuf -oL adb install app.apk',
+      'time -p adb uninstall com.foo',
+      'nohup -- adb install app.apk',
+      'command -p adb uninstall com.foo',
+      'exec -a foo adb uninstall com.foo',
+      'parallel adb uninstall ::: com.foo',
+    ]) {
+      expect(parseDeviceCommand(cmd).destructive, cmd).toBe(true);
+    }
+  });
+
+  it('a substitution is re-SPLIT, so its own separators and nesting stay visible', () => {
+    // Appending the inside raw left `$(adb` as a token whose basename is not `adb`, so a nested
+    // substitution vanished — and a `;`/`&&` inside one was never split at all.
+    expect(parseDeviceCommand(`echo $(foo $(${D}))`)).toMatchObject({ destructive: true, ids: ['adb:RFTESTSERIAL1'] });
+    for (const cmd of [
+      'echo $(cd /tmp && adb uninstall com.foo)',
+      'echo $(true; adb uninstall com.foo)',
+      'echo `cd /tmp && adb uninstall com.foo`',
+    ]) {
+      expect(parseDeviceCommand(cmd).destructive, cmd).toBe(true);
+    }
   });
 
   it('a device NAMED in the re-parse is enough on its own, launcher or not', () => {
     // The second accept signal: a search for a word does not carry a serial, so an id is near
     // impossible to hit by accident — it keeps unmodelled launchers covered without a bare-word scan.
     expect(parseDeviceCommand(`myrunner --wrap ${D}`)).toMatchObject({ destructive: true, ids: ['adb:RFTESTSERIAL1'] });
+  });
+
+  it('PLACEHOLDER: a serial lifted out of the command is not an id anyone can claim', () => {
+    // `adb -s $(cat serial.txt) install foo.apk` produced `adb:SUBST`, and the guard then refused
+    // with "Nothing holds adb:SUBST" plus a `device:claim adb:SUBST` remedy nobody can follow.
+    // Untargeted is what the command actually IS, and that refusal already says the useful thing.
+    const r = parseDeviceCommand('adb -s $(cat serial.txt) install foo.apk');
+    expect(r.destructive).toBe(true);
+    expect(r.untargeted, 'no device is named once the substitution is lifted').toBe(true);
+    expect(r.ids).toEqual([]);
+  });
+
+  it('KNOWN GAP, pinned so it cannot be mistaken for an accident: a substitution in DOUBLE quotes', () => {
+    // A real shell expands `"$(…)"`, so this IS a hole. Lifting it was tried and reverted within the
+    // minute: it refused a `node -e '…'` probe that merely CONTAINED that text inside a JS string,
+    // because this parser cannot track quoting through a nested payload. Firing on text is the
+    // failure that gets a guard routed around — see the module header's heredoc history. The single-
+    // quoted form is correctly untouched either way, and the unquoted form is caught.
+    expect(parseDeviceCommand(`echo "$(${D})"`).tools, 'the known gap').toEqual([]);
+    expect(parseDeviceCommand(`echo '$(${D})'`).tools, 'correct — no expansion inside single quotes').toEqual([]);
+    expect(parseDeviceCommand(`echo $(${D})`)).toMatchObject({ destructive: true, ids: ['adb:RFTESTSERIAL1'] });
   });
 });

@@ -98,12 +98,17 @@ describe('clonePort.mjs CLI (#69)', () => {
  *
  *  ⚠️ **Lives HERE, not in `editorPorts.test.ts`, and that is the whole point.** The bug this
  *  mechanism exists for is a win32 one (Git Bash hands `node` `E:/…` while `defaultRepoRoot()`
- *  gives `E:\…`), so the natural home is the suite that caught it — which is
- *  `describe.skipIf(!hasPrivateTooling())` and skips its whole file on the public snapshot. Cover
- *  it only there and all three behaviours below are green-when-deleted on macOS, on Linux, and on
- *  the public CI: the review that found this measured `canonicalRepoKey = (p) => p` as green in
- *  EVERY suite except that one file on that one platform. This file runs everywhere (its CLI
- *  output is in the public windows-latest log), so the mechanism is falsifiable everywhere.
+ *  gives `E:\…`), so the natural home is the suite that caught it — and cover it ONLY there and all
+ *  three behaviours below are green-when-deleted on macOS and on Linux: the review that found this
+ *  measured `canonicalRepoKey = (p) => p` as green in EVERY suite except that one file on that one
+ *  platform. This file runs everywhere, so the mechanism is falsifiable everywhere.
+ *
+ *  ⚠️ **This comment used to add "and skips its whole file on the public snapshot", which #1084
+ *  made false.** `editorPorts.test.ts` gated every block on `!hasPrivateTooling()` — a proxy for
+ *  "private clone" — even though the scripts it reads all ship; its port blocks now run on the
+ *  public 3-OS matrix, and only its doc-table block still gates (on `hasPrivateDocs()`). So that
+ *  suite is no longer public-blind, and the reason to keep this coverage here is the one above:
+ *  this file asserts the KEY rather than a port, and it was already unconditional.
  *
  *  Asserting on the KEY rather than the port: the port is a hash mod slots, so a broken key
  *  collides with the right answer about 1 run in `slots` and the test passes for the wrong reason. */

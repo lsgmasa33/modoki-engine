@@ -281,6 +281,20 @@ caught both defects above. A self-hosted Actions runner on the Windows box was c
 than the gap is worth. The honest position is that this stays **discipline-guarded, not gated** —
 the same acceptance #968 made, now with a price tag attached.
 
+⚠️ **#1084 narrowed this gap by three files, and it is the shape to copy.** `editorPorts.test.ts`,
+`editorPortsCli.test.ts` and `clonePortHardcoding.test.ts` skipped on `!hasPrivateTooling()` —
+"`.mcp.json` exists", a PROXY for "private clone" — while everything those blocks read
+(`engine/scripts/editorPorts.mjs`, `launch-editor.sh`, `lib/repo-reap.sh`, the six packaged-app
+spawners, `package.json`) ships in the snapshot: the manifest is `git ls-files -- engine` with no
+exclusion under `engine/scripts/`. So the suite whose subject is path SPELLING — the exact class both
+2026-09-11 defects belong to — was skipping on the only Windows runner there is. Each block now gates
+on what it READS: the port blocks are unconditional, `editorPorts.test.ts`'s doc-table block keeps
+`hasPrivateDocs()`, and `clonePortHardcoding.test.ts`'s `.mcp.json` block keeps
+`hasPrivateTooling()`. Verified locally by running the four files with `.mcp.json` moved aside —
+103 passed, 1 skipped, where previously every block skipped. **The lesson generalises: before
+accepting a file into the list below, check whether its inputs actually fail to ship, rather than
+whether its gate says so.**
+
 What IS gated: `engine/tests/architecture/layoutConditionalTestLedger.test.ts` pins the **72
 test files whose execution is conditional on this checkout** — every `*.test.ts` and Playwright
 `*.spec.ts` importing `helpers/repoLayout.ts`, plus any test gating a skip on a raw filesystem

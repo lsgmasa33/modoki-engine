@@ -1031,7 +1031,13 @@ export async function typeText(
   if (before === null || after === null) {
     const error = withNote(clearError ?? '');
     return {
-      typed: text.length, editable: true, activeElement: active.descriptor, valueAfter: after,
+      // Not `text.length` (#1081 review): on the unreadable path there is nothing to measure, so this
+      // falls back to the request — but characters this tool REFUSED to send were never part of it,
+      // and counting them contradicts the error in the same reply.
+      typed: text.length - unsendable.length,
+      editable: true,
+      activeElement: active.descriptor,
+      valueAfter: after,
       ...(error ? { error } : {}),
     };
   }

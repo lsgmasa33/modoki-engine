@@ -310,6 +310,10 @@ describe('typeText and the keys that are not characters (#1081)', () => {
     const r = await typeText(win, `a${String.fromCharCode(0)}b`);
     expect(r.error).toMatch(/could not be SENT at all/);
     expect(r.error).toMatch(/THIS TOOL's limit/);
+    // …and the count must not contradict the error in the same reply. There is nothing to measure on
+    // this path, so `typed` falls back to the request — but a character this tool REFUSED to send was
+    // never part of what it typed. 3 requested, 1 unsendable, 2 reported.
+    expect(r.typed, 'the refused character must not be counted as typed').toBe(2);
   });
 
   it('reports BOTH a clearFirst failure and an unsendable character', async () => {

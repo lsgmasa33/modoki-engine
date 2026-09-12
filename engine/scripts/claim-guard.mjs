@@ -129,8 +129,8 @@ function main() {
   // that NAME a device CLI outside quotes, so ordinary Bash is untouched.
   if (targets.opaque) {
     return deny(`Refused: ${command.slice(0, 120)}\n\nThis names a device CLI inside something this `
-      + 'guard cannot re-parse (a heredoc payload, `env -S`, a `$(…)`/backtick substitution, or a '
-      + 'launcher it does not model), so it cannot tell WHICH phone the command would reach — and an '
+      + 'guard cannot re-parse (a heredoc payload, `env -S`, or a launcher it does not model), so it '
+      + 'cannot tell WHICH phone the command would reach — and an '
       + 'unreadable command aimed at a phone is exactly what this guard is for.\n\nRun the device '
       + 'command directly rather than through a wrapper, or `npm run device:run -- <command>`, which '
       + 'takes the claim itself.');

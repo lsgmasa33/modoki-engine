@@ -208,13 +208,17 @@ jobs:
           set -euo pipefail
           bash engine/scripts/assert-app-renders.sh release/win-unpacked "$RUNNER_TEMP/smoke"
 
-      # Run-scoped artifact — the simplest download when Actions artifact storage has
-      # room. continue-on-error: the account's artifact-storage quota is currently
-      # exhausted, and a quota failure here must NOT fail the run or block the
-      # prerelease publish below (which uses a SEPARATE storage quota). Once storage is
-      # freed, this uploads normally and the artifact is downloadable from the run.
+      # Run-scoped artifact — and since #1085 the ONLY way to get the installer off a
+      # non-tag build: the rolling prerelease that used to back it up is gone.
+      #
+      # ⚠️ **NOT continue-on-error any more, and that flag must not come back.** It was
+      # set so a quota failure could not block the prerelease publish that used to sit
+      # below. With that publish deleted, swallowing the failure would leave a GREEN run
+      # with nothing to download and a release runbook whose only instruction is "re-run
+      # the Windows workflow" — i.e. a wedge, with the run page reporting success.
+      # The account's artifact-storage quota HAS been exhausted before, so this step
+      # failing is a real and expected outcome: free storage, then re-run. Visible.
       - name: Upload installer artifact
-        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: modoki-editor-windows
@@ -229,25 +233,18 @@ jobs:
       # electron-updater reads latest.yml + the .exe from THIS repo's Release assets,
       # attached by the steps below.
 
-      # Rolling prerelease for non-tag builds (workflow_dispatch / editor-shipping).
-      # Release-ASSET storage is a separate quota from Actions artifacts, so this
-      # sidesteps the artifact-storage limit and gives a stable download URL. The
-      # `win-nightly` tag doesn't match either workflow's `v*` trigger, so publishing
-      # it can't loop. Unsigned test build — SmartScreen will warn.
-      - name: Publish installer to rolling prerelease (non-tag builds)
-        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: win-nightly
-          name: Modoki Editor — Windows (nightly, unsigned)
-          prerelease: true
-          body: |
-            Unsigned Windows x64 installer built from `${{ github.sha }}` (branch `${{ github.ref_name }}`).
-            SmartScreen will warn on first run (no code signing yet). For testing/internal use.
-          files: |
-            release/*.exe
-            release/*.blockmap
-            release/latest.yml
+      # ⚠️ The rolling `win-nightly` prerelease step is GONE (#1085, owner 2026-09-12).
+      #
+      # It published every non-tag Windows build to a public prerelease, and the release runbook
+      # fell back to downloading from it whenever the Actions artifact upload hit the storage
+      # quota. The fallback had been broken for some time and nobody noticed: the step WORKED
+      # (its logs read "Creating new GitHub release for tag win-nightly … Release ready"), and the
+      # release was then deleted afterwards — by the owner, who does not want an unsigned build
+      # sitting publicly on the OSS mirror. So the runbook pointed at a resource that was
+      # re-created on every run and removed again, and re-creating it would only decay the same way.
+      #
+      # A missing artifact is now a HARD STOP: re-run the Windows build. Do not re-add a fallback
+      # that depends on a public prerelease.
 
       # Same curated notes as the macOS workflow — both attach to the SAME Release and
       # set body_path; identical tag+repo → byte-identical body, so the order they finish
@@ -270,8 +267,9 @@ jobs:
           # electron-updater on Windows fetches latest.yml from the release assets to
           # discover the new version. Without it every update check 404s, so an installed
           # editor can never self-update — it was omitted here while the win-nightly step
-          # above attached it, so the nightly channel worked and every STABLE release
-          # (v0.3.0 → v0.3.5) shipped an .exe no installed editor could ever find.
+          # that used to sit above attached it (removed in #1085), so the nightly channel
+          # worked and every STABLE release (v0.3.0 → v0.3.5) shipped an .exe no installed
+          # editor could ever find.
           # The macOS twin attaches its latest-mac.yml for exactly this reason.
           #
           # fail_on_unmatched_files: softprops' default is to WARN on an unmatched pattern,

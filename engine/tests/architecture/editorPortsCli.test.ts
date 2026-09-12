@@ -20,7 +20,6 @@
 import { describe, it, expect } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import path from 'node:path';
-import { hasPrivateTooling } from '../helpers/repoLayout';
 import { readScannedSource } from '@modoki/engine/testing';
 import {
   backendPortForClone,
@@ -29,20 +28,20 @@ import {
 } from '../../scripts/editorPorts.mjs';
 
 const CLI = path.resolve(__dirname, '../../scripts/editorPorts.mjs');
-// Skipped where the CLONE TABLE has no meaning — NOT because the CLI is missing. `engine/scripts/**`
-// DOES ship in the public snapshot (`git ls-files -- engine`, publish-engine-oss.sh:127, with no
-// exclusion), and it must: this file's top-level import of `../../scripts/editorPorts.mjs` would
-// throw before any `skipIf` could run. An earlier draft of this comment claimed the opposite, copied
-// from the same premise in editorPorts.test.ts — worth stating plainly, because that false reason is
-// what would mislead whoever next decides to un-skip.
+// ⚠️ NOT gated, deliberately, and the reasoning it replaces is worth keeping (#1084). This file used
+// to skip entirely on `!hasPrivateTooling()` — `.mcp.json exists` — which meant it never ran on the
+// public 3-OS leg. `engine/scripts/**` DOES ship in the public snapshot (`git ls-files -- engine`,
+// with no exclusion), and it must: the top-level import of `../../scripts/editorPorts.mjs` would
+// throw before any `skipIf` could run.
 //
-// The real reason: the OSS publish gate STAGES the snapshot into `$(mktemp -d …/modoki-oss-XXXXXX)`
-// and runs `engine/tests/architecture/` from inside it (publish-engine-oss.sh:102,635). That
-// directory is not one of the five clones, so every assertion of the form "the repo I am running in
-// has a pinned port" is false there. `hasPrivateTooling()` is `.mcp.json exists`, which the snapshot
-// lacks — a PROXY that happens to coincide, so the tests below are ALSO written to hold when the
-// port is null, rather than resting on the proxy alone.
-const skip = !hasPrivateTooling();
+// The stated reason was that the OSS publish gate STAGES the snapshot into
+// `$(mktemp -d …/modoki-oss-XXXXXX)` and runs `engine/tests/architecture/` from inside it, and that
+// directory is not one of the five clones — so "the repo I am running in has a pinned port" is false
+// there. True, and it gates nothing: ten of the tests below drive the CLI with SYNTHETIC clone paths
+// (`KNOWN`/`UNKNOWN` and the spaced/non-ASCII pair), which resolve by basename and hold in any
+// checkout, and the two that read the real root are written null-tolerant on purpose — see the
+// comments at their `backendPortForClone(...) === null` branches. A gate on top of that bought
+// nothing but silence on the one platform (Windows) where this seam is most likely to break.
 const KNOWN = '/Users/dev/Projects/modoki-ai3';
 const UNKNOWN = '/Users/dev/Projects/some-scratch-clone';
 
@@ -64,7 +63,7 @@ function run(args: string[]): { out: string; err: string; status: number } {
   return { out: r.stdout ?? '', err: r.stderr ?? '', status: r.status ?? -1 };
 }
 
-describe.skipIf(skip)('editorPorts.mjs CLI — the bash seam (#349)', () => {
+describe('editorPorts.mjs CLI — the bash seam (#349)', () => {
   it('prints a BARE integer on stdout for a known clone', () => {
     const { out, err, status } = run(['backend', KNOWN]);
     expect(status).toBe(0);

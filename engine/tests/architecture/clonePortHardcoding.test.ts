@@ -30,8 +30,12 @@ import { assertDeclaredListIsComplete } from '../helpers/declaredList';
 
 const REPO = path.resolve(__dirname, '../../..');
 const read = (rel: string) => readScannedSource(path.join(REPO, rel)).code;
-// The public engine snapshot ships neither the committed agent-CLI config
-// (.mcp.json) nor engine/scripts/** — both are private-repo-only.
+// ⚠️ This gate covers the MCP-config block ONLY, and its old comment was half false (#1084): it
+// claimed the public engine snapshot ships neither `.mcp.json` nor `engine/scripts/**`. The first
+// half is right — `.mcp.json` is private, so the block that parses it must skip. The second is
+// wrong: the snapshot manifest is `git ls-files -- engine` with no exclusion under
+// `engine/scripts/`, so every script the SPAWNERS block reads does ship, and that block now runs
+// unconditionally rather than being skipped on a proxy for a file it never opens.
 const skip = !hasPrivateTooling();
 
 /** The single committed file that configures an MCP server for an agent CLI — `.mcp.json`, the one
@@ -76,7 +80,7 @@ describe.skipIf(skip)('committed MCP configs do not hardcode a per-clone port (#
   }
 });
 
-describe.skipIf(skip)('every harness that SPAWNS the packaged app pins a per-clone backend port (#68)', () => {
+describe('every harness that SPAWNS the packaged app pins a per-clone backend port (#68)', () => {
   /** Scripts that launch the packaged binary.
    *
    *  ⚠️ **The comment here used to claim this set was "found by the marker … rather than by a

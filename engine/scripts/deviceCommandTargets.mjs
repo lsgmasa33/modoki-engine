@@ -137,7 +137,13 @@ function mentionsDeviceCli(tokens) {
  * `destructive && ids.length === 0` with no separate bookkeeping.
  */
 function finalize(ids, destructive, tool) {
-  return { ids, destructive, untargeted: destructive && ids.length === 0, tools: [tool] };
+  // (#1083 review) An id whose value came from a lifted substitution is not a device anyone holds:
+  // `adb -s $(cat serial.txt) install foo.apk` produced `adb:SUBST`, and the guard then refused with
+  // "Nothing holds adb:SUBST on this machine" and told the reader to run `device:claim adb:SUBST` —
+  // a remedy that cannot be followed. Dropping it makes the command UNTARGETED, which is exactly what
+  // it is, and the untargeted refusal already says the useful thing: name the device literally.
+  const literal = ids.filter((id) => !id.endsWith(`:${SUBST_PLACEHOLDER}`));
+  return { ids: literal, destructive, untargeted: destructive && literal.length === 0, tools: [tool] };
 }
 
 // ---- adb -------------------------------------------------------------
@@ -508,12 +514,24 @@ function analyzeSegmentTokens(tokens, envVars) {
       //   - the command word is a LAUNCHER, i.e. something whose job is to run another command.
       // `opaque` propagates regardless: an unreadable payload stays unreadable.
       const namesADevice = reparsed.ids.length > 0;
-      // ⚠️ `find` is BOTH a launcher and a searcher — `-exec adb …` runs one, `-name adb` looks for a
-      // FILE called adb — so membership alone refused `find . -name adb -print`. Its launcher signal
-      // counts only after an exec flag; `-exec` is the half that runs anything.
+      // ⚠️ Ask about the launcher words the hop loop CONSUMED — not about `first`, which is the word
+      // that ENDED that loop and therefore can never be a modelled launcher. Testing `first` made
+      // three quarters of LAUNCHER_WORDS dead code and dropped every modelled launcher followed by an
+      // option from refuse to ALLOW: `xcrun --sdk iphoneos devicectl device install app ./App.app` —
+      // a real iOS install shape, and the very example PLAIN_LAUNCHERS is written around — walked
+      // past this guard. Found by review, and confirmed the way a dead condition always can be:
+      // deleting the union from LAUNCHER_WORDS left all 177 tests green.
+      const before = tokens.slice(0, idx + at);
+      const launcherAt = before.findIndex((t) => LAUNCHER_WORDS.has(basenameOf(t)));
+      const launcherWord = launcherAt === -1 ? null : basenameOf(before[launcherAt]);
+      // ⚠️ `find` is BOTH a launcher and a searcher — `-exec adb …` RUNS one, `-name adb` looks for a
+      // FILE called adb. Asking "is there an exec flag anywhere before the token" refused
+      // `find . -name '*.ts' -exec grep -l adb {} \;`, where the exec'd command is grep and `adb` is
+      // merely its argument. So the device token must be the command the exec flag RUNS: the very
+      // next token. (`find . -exec sh -c '… adb …' \;` still lands, via the wrapper at that position.)
       const execFlag = /^-(exec|execdir|ok|okdir)$/;
-      const launcherHead = LAUNCHER_WORDS.has(first)
-        && (first !== 'find' || rest.slice(0, at).some((t) => execFlag.test(stripQuotes(t))));
+      const launcherHead = launcherWord !== null
+        && (launcherWord !== 'find' || execFlag.test(stripQuotes(tokens[idx + at - 1] ?? '')));
       if (reparsed.opaque || namesADevice || (reparsed.destructive && launcherHead)) {
         return reparsed;
       }
@@ -596,16 +614,50 @@ function stripHeredocBodies(command) {
   return { text: out.join('\n'), unterminated };
 }
 
-function splitSegments(command) {
+function splitSegments(command, depth = 0) {
   const out = [];
   let cur = '';
   let quote = null;
   /** Command substitutions lifted OUT of the command they sit in, each parsed as its own segment.
    *  Appended after the outer segments, so the outer command keeps its own shape and its verb. */
   const subs = [];
+
+  /** Lift the `$( … )` or backtick substitution starting at `i` — its inside becomes segments of its
+   *  own — and answer with the index of its closing delimiter, or -1 when there is none here.
+   *
+   *  ⚠️ The inside is RE-SPLIT, not appended raw. Appending it raw left its own separators and any
+   *  nested substitution invisible, because `$(adb` is not a token whose basename is `adb`:
+   *  `echo $(foo $(adb -s X uninstall …))`, `echo $(cd /tmp && adb uninstall …)` and
+   *  ``echo `cd /tmp && adb uninstall …` `` all went from refused to ALLOWED. Found by review.
+   *  Bounded, because a substitution nested past a few levels is not a command anyone writes. */
+  const liftSubstitution = (i) => {
+    let inner = null;
+    let end = -1;
+    if (command[i] === '$' && command[i + 1] === '(') {
+      const close = matchingClose(command, i + 1);
+      end = close === -1 ? command.length : close;
+      inner = command.slice(i + 2, end);
+    } else if (command[i] === '`') {
+      const close = command.indexOf('`', i + 1);
+      end = close === -1 ? command.length : close;
+      inner = command.slice(i + 1, end);
+    }
+    if (inner === null) return -1;
+    subs.push(...(depth < 4 ? splitSegments(inner, depth + 1) : [inner]));
+    return end;
+  };
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
     if (quote) {
+      // ⚠️ KNOWN GAP, kept deliberately: a substitution inside DOUBLE quotes is NOT lifted, even
+      // though a real shell expands it. Lifting it was tried and reverted within the minute, because
+      // it immediately refused a `node -e '…'` probe that merely CONTAINED the text
+      // `"$(adb -s … uninstall …)"` inside a JS string literal — this parser cannot track quoting
+      // through a nested payload, so it saw a command where the shell sees text. That is the exact
+      // failure this module's header records, where over-refusal "blocked two consecutive attempts to
+      // write this very module's tests". Firing on text is the failure that gets a guard routed
+      // around; a missed `"$(…)"` is a gap that leaves the rest of the guard trusted. Do not re-add
+      // this without a way to know the span is a command position rather than a string.
       cur += ch;
       // A backslash-escaped quote inside a double-quoted span does not close it. Single-quoted
       // spans have no escapes at all, per POSIX.
@@ -632,19 +684,9 @@ function splitSegments(command) {
     // So the substitution is EXTRACTED instead: its inside becomes a segment of its own, and the
     // outside keeps a placeholder token, which leaves `-s` with a value and the rest of the command
     // attached to its verb.
-    if (ch === '$' && command[i + 1] === '(') {
-      const close = matchingClose(command, i + 1);
-      subs.push(command.slice(i + 2, close === -1 ? command.length : close));
-      cur += SUBST_PLACEHOLDER;
-      i = close === -1 ? command.length : close;
-      continue;
-    }
-    if (ch === '`') {
-      const close = command.indexOf('`', i + 1);
-      subs.push(command.slice(i + 1, close === -1 ? command.length : close));
-      cur += SUBST_PLACEHOLDER;
-      i = close === -1 ? command.length : close;
-      continue;
+    {
+      const end = liftSubstitution(i);
+      if (end !== -1) { cur += SUBST_PLACEHOLDER; i = end; continue; }
     }
     // A single `&` backgrounds what precedes it, and a bare parenthesis groups commands — a command
     // position opens after both. ⚠️ `{` and `}` are deliberately NOT separators: `${SERIAL}` is one
@@ -700,7 +742,7 @@ function matchingClose(s, openIdx) {
  *  Union of the launchers already modelled above, plus the ones measured walking past this guard. */
 const LAUNCHER_WORDS = new Set([
   ...PLAIN_LAUNCHERS, ...Object.keys(OPTION_LAUNCHERS), ...SHELL_WRAPPERS,
-  'timeout', 'gtimeout', 'watch', 'script', 'find', 'eval', 'setsid', 'ionice', 'chrt',
+  'timeout', 'gtimeout', 'watch', 'script', 'find', 'eval', 'setsid', 'ionice', 'chrt', 'parallel',
 ]);
 
 /** The value of a CLUSTERED short-flag group ending in `c` — `-lc`, `-ec`, `-ic` — whose next token

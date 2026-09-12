@@ -579,6 +579,11 @@ describe('gitignored paths under engine/ are classified, not defaulted (#1050)',
  * every STABLE release (v0.3.0 → v0.3.5) stranded users on whatever they had. It
  * surfaced as a user on v0.3.4 who could not update to the v0.3.5 that fixed his bug.
  *
+ * ⚠️ That win-nightly step no longer exists (#1085) — so the asymmetry that masked the
+ * bug is gone, and this guard is now the only thing standing between a dropped
+ * manifest and a silently un-updatable release. Do not relax it on the grounds that
+ * "both workflows look the same now": that is exactly the state the bug shipped from.
+ *
  * Asserted as a PAIR — the two workflows are twins and the bug was exactly one of
  * them drifting from the other, which a single-platform test cannot catch.
  */
@@ -602,8 +607,10 @@ describe.skipIf(!hasOssOverlay())('OSS release workflows attach the electron-upd
         const uses = String(s.uses ?? '');
         const cond = String(s.if ?? '');
         const withBlock = (s.with ?? {}) as { tag_name?: string };
-        // Exclude the rolling win-nightly prerelease: it pins its own tag_name and
-        // already attaches the manifest, which is what masked the bug.
+        // Excludes any step pinning its own tag_name. That was the rolling win-nightly
+        // prerelease, which attached the manifest and so masked the bug; the step is gone
+        // (#1085) and the clause is kept as the rule — a step publishing to a FIXED tag is
+        // never the versioned release this guard is about.
         return uses.includes('action-gh-release') && cond.includes('refs/tags/v') && !withBlock.tag_name;
       });
       expect(tagged.length).toBe(1);
