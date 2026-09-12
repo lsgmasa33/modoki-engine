@@ -26,7 +26,7 @@ import { fileURLToPath } from 'node:url'
 import { readScannedSource } from '@modoki/engine/testing'
 import { hasInternalGames } from '../helpers/repoLayout'
 // @ts-expect-error — .mjs script module, no type declarations by design (it is a build script).
-import { PLUGIN_CLASS_LEGS, discoverPluginPackages, legLabel, networkFailureCause, relKey, schemeFor } from '../../scripts/nativePluginLegs.mjs'
+import { PLUGIN_CLASS_LEGS, discoverPluginPackages, joinCapturedStreams, legLabel, networkFailureCause, relKey, schemeFor } from '../../scripts/nativePluginLegs.mjs'
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 
@@ -269,6 +269,122 @@ describe('#981 plugin-class leg coverage', () => {
       ['no output at all', ''],
     ])('FAIL: %s', (_label, out) => {
       expect(networkFailureCause(out)).toBeNull()
+    })
+
+    // Every fixture above is LF, so none of them can tell a start-anchored pattern from an
+    // end-anchored one — and on Windows the end-anchored version fails on EVERY line.
+    // Measured on the `win` clone 2026-09-12 (#1079): all 334 lines of a real `gradlew.bat` run
+    // are CRLF, so this is the shape the classifier sees on every Windows run, not an edge case.
+    // `\r` is a JS line terminator: `.` does not match it and `$` anchors BEFORE it.
+    // `parseLogcatLine` shipped exactly this bug and reported "no crashes" about a phone that had
+    // just crashed — docs/windows.md § Line endings.
+    describe('the same decisions under Windows CRLF (#1079)', () => {
+      // ⚠️ The trailing `\n` is load-bearing. `join('\n')` leaves the LAST line without a
+      // separator, so converting separators alone leaves the final line with no `\r` — and every
+      // cause line below is the last one. A mutation check caught this: with the `.trim()` deleted
+      // from networkFailureCause, these tests still passed, because no `\r` was ever adjacent to
+      // the match. A real gradlew run terminates its last line like every other one.
+      const crlf = (s: string) => `${s}\n`.replace(/\n/g, '\r\n')
+
+      it.each([
+        ['a cause line reached via `> `', whatWentWrong(
+          "> MODOKI-UNRESOLVED com.applovin:applovin-sdk:13.5.1: Could not resolve com.applovin:applovin-sdk:13.5.1. <- Could not GET 'https://dl.google.com/…/applovin-sdk-13.5.1.pom'.")],
+        // OBSERVED on `win` 2026-09-12 (#1079), dead-proxy run: the only cause line Gradle
+        // emitted was `> Could not get resource '…'` — no `Could not GET` line appeared, and all
+        // eight android/class legs classified from this shape. Why Gradle chose that wording is
+        // not pinned here (`get resource` is its outer cause for any fetch failure, refused
+        // connections included), so this fixture records the SHAPE, not a mechanism.
+        ['the `get resource` branch a real offline run took', [
+          '* What went wrong:', "Execution failed for task ':plugin:modokiResolveCompileClasspath'.",
+          "> Could not get resource 'https://dl.google.com/dl/android/maven2/com/android/tools/build/gradle/8.13.0/gradle-8.13.0.pom'.",
+        ].join('\n')],
+        // Anchored at column 0 rather than after `> `, so it exercises a different anchor.
+        ['the wrapper exception at column 0', [
+          'Downloading https://services.gradle.org/distributions/gradle-8.14.3-all.zip',
+          'Exception in thread "main" java.net.UnknownHostException: services.gradle.org',
+        ].join('\n')],
+      ])('SKIP survives CRLF: %s', (_label, out) => {
+        const cause = networkFailureCause(crlf(out))
+        expect(cause).not.toBeNull()
+        // The reason is reported to a human and compared in the leg summary, so a surviving `\r`
+        // would corrupt it even where the MATCH succeeded. This pins the trim, not just the regex.
+        expect(cause).not.toMatch(/\r/)
+        expect(cause).toBe(cause!.trim())
+      })
+
+      it('a compile error stays a FAIL under CRLF — the SKIP/FAIL split is what CRLF could invert', () => {
+        const out = [
+          'GameDebugPlugin.java:40: error: cannot find symbol',
+          '        } catch (UnknownHostException e) { call.reject("Read timed out"); }',
+          '* What went wrong:', "Execution failed for task ':plugin:compileReleaseJavaWithJavac'.",
+          '> Compilation failed; see the compiler error output for details.',
+        ].join('\n')
+        expect(networkFailureCause(crlf(out))).toBeNull()
+      })
+
+      // gradleCapture concatenates the two captured streams. The gradle WRAPPER prints
+      // `Downloading <url>` and then progress dots with NO newline until the download completes,
+      // so a distribution download that dies mid-body leaves stdout ending mid-dots and the
+      // exception glued onto it — costing the `^`-anchored WRAPPER_NETWORK its anchor and turning
+      // a SKIP into a FAIL. Found by the #1079 close-out review; test-native.mjs now joins the
+      // streams on a newline when stdout does not already end with one.
+      it('a stderr stream glued onto an unterminated stdout still classifies (the gradleCapture seam)', () => {
+        const stdout = 'Downloading https://services.gradle.org/x.zip\r\n.........10%.........20%'
+        const stderr = 'Exception in thread "main" java.net.SocketTimeoutException: Read timed out\r\n'
+        // Drive the REAL joiner test-native.mjs uses — asserting on a hand-joined string would
+        // pin the classifier's contract and leave the fix itself untested (it would stay green
+        // with joinCapturedStreams reverted to plain concatenation).
+        expect(networkFailureCause(joinCapturedStreams(stdout, stderr))).toMatch(/SocketTimeoutException/)
+        // Plain concatenation is exactly the shape that loses the anchor — this is the defect the
+        // joiner exists to prevent, kept here so the reason stays visible.
+        expect(networkFailureCause(`${stdout}${stderr}`)).toBeNull()
+      })
+
+      it('joinCapturedStreams adds a separator ONLY when one is missing — the console output is this text too', () => {
+        expect(joinCapturedStreams('a', 'b')).toBe('a\nb')       // the only case that needs one
+        expect(joinCapturedStreams('a\n', 'b')).toBe('a\nb')
+        // ⚠️ CRLF-terminated stdout is the PRODUCTION shape on Windows (334/334 lines of a real
+        // gradlew run), so an implementation that only recognises a bare '\n' terminator would
+        // pass every other assertion here while emitting a spurious blank line on every Windows
+        // leg — the exact thing this test's title claims to protect.
+        expect(joinCapturedStreams('a\r\n', 'b')).toBe('a\r\nb')
+        expect(joinCapturedStreams('a', '\nb')).toBe('a\nb')     // stderr already opens on one
+        expect(joinCapturedStreams('a', '\r\nb')).toBe('a\r\nb')
+        expect(joinCapturedStreams('a', '')).toBe('a')
+        expect(joinCapturedStreams('', 'b')).toBe('b')
+        expect(joinCapturedStreams(undefined, undefined)).toBe('')
+      })
+
+      // ⚠️ Everything above imports the helper directly, so all of it stays GREEN if gradleCapture
+      // stops calling it — the helper would be tested, documented and bypassed. That is this
+      // repo's recurring shape (#993: "the helpers were tested; their CALL SITES were not"), and
+      // the mutation check that reverted the helper could not see it either. This asserts the
+      // WIRING, against the runner's own source, because test-native.mjs runs the whole gate at
+      // import time and cannot be imported by a test.
+      it('gradleCapture actually CALLS joinCapturedStreams — the wiring, not just the helper', () => {
+        const runner = readScannedSource(path.join(repoRoot, 'engine', 'scripts', 'test-native.mjs')).code
+        // A floor first: readScannedSource returning '' would make both assertions below pass
+        // vacuously, which is the failure mode this whole block exists to avoid.
+        expect(runner.length, 'test-native.mjs read as empty — the path or the reader changed').toBeGreaterThan(5000)
+        expect(runner, 'gradleCapture no longer routes its two streams through joinCapturedStreams').toContain('joinCapturedStreams(r.stdout, r.stderr)')
+        // And the defective shape is gone, not merely joined by a second code path.
+        expect(runner, 'the glued stdout+stderr concatenation is back in test-native.mjs').not.toContain("${r.stdout ?? ''}${r.stderr ?? ''}")
+      })
+
+      it('CRLF and LF classify identically across every fixture shape', () => {
+        const shapes = [
+          whatWentWrong("> Could not GET 'https://repo.example/x.pom'."),
+          whatWentWrong('> MODOKI-UNRESOLVED com.x:y:1.0: No cached version of com.x:y:1.0 available for offline mode.'),
+          whatWentWrong('> MODOKI-UNRESOLVED com.x:y:1.0: Could not find com.x:y:1.0.'),
+          'Exception in thread "main" java.net.ConnectException: repo.example',
+          '',
+        ]
+        for (const s of shapes) {
+          const lf = networkFailureCause(s)
+          const cr = networkFailureCause(crlf(s))
+          expect(cr).toBe(lf === null ? null : lf)
+        }
+      })
     })
   })
 

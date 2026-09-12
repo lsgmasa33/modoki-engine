@@ -110,6 +110,69 @@ load-bearing and commented as such).
 - A test proving the parser handles a `\r` *you typed* is weaker evidence than one real phone.
   Both are worth having; only the phone proves adb's actual output shape.
 
+### Gradle emits CRLF too — and the shape of the regex decides whether that matters
+
+**Measured on `win` 2026-09-12 (#1079): every one of the 334 output lines from a real
+`gradlew.bat` run is CRLF.** So `test:native`'s SKIP-vs-FAIL classifier
+(`networkFailureCause`, [engine/scripts/nativePluginLegs.mjs](../engine/scripts/nativePluginLegs.mjs))
+parses CRLF on every Windows run, not as an edge case.
+
+It survives where `parseLogcatLine` did not, and the difference is structural rather than luck:
+**none of its four patterns carries `$`**, so a trailing `\r` sits harmlessly past the match, and
+the cause is `.trim()`ed before it is reported. (Three are start-anchored line shapes;
+`NETWORK_FAILURE` is a deliberate phrase-anywhere match with no `^`, gated by `RESOLVE_TASK_CAUSE`
+— the looseness its own comment block warns about twice. The CRLF-relevant half is the absent `$`,
+not the `^`.) The adb parser broke because it ended in `(.*)$`.
+
+**The generalizable rule: never end-anchor a subprocess-output regex without `/m`, and trim at the
+boundary.** ⚠️ State the mechanism precisely, because the intuitive version is backwards —
+measured in Node:
+
+| pattern | against `"x\r"` | |
+|---|---|---|
+| `/^x$/` | `false` | no `/m`: `$` does **not** match before `\r`, so the match fails outright |
+| `/^x$/m` | `true` | with `/m`, `$` **does** match before `\r` — end-anchoring is CRLF-safe here |
+| `/^(.*)$/` | `null` | `.` never crosses `\r`, and `$` then cannot match |
+| `/^(.*)$/m` | `["x","x"]` | |
+
+So it is not that "`$` anchors before the `\r`" — without `/m` it never matches at all, and a
+`/m`-flagged end-anchor is fine. `parseLogcatLine` carried no `/m`.
+
+⚠️ `/m` makes an end-anchor safe for a `test()`/`exec()` classifier, **not** for a line splitter:
+`'a\r\nb'.match(/^(.*)$/gm)` returns `["a", "", "b"]`, because `^` and `$` both see the `\r` as a
+terminator and a phantom empty line falls out between them. Inert when you are asking "does any
+line match"; wrong when you are enumerating lines.
+
+⚠️ **Confirm CRLF is actually PRESENT before crediting a parser with handling it.** "No CRLF bug"
+proves nothing if the stream was LF all along — the 334/334 count above is what makes the
+classifier's correctness an observation instead of a hope.
+
+Pinned by `describe('the same decisions under Windows CRLF (#1079)')` in
+[engine/tests/architecture/nativePluginLegCoverage.test.ts](../engine/tests/architecture/nativePluginLegCoverage.test.ts).
+Every other fixture in that file is LF, so none of them could tell a start-anchored pattern from an
+end-anchored one — end-anchoring `WRAPPER_NETWORK` leaves the LF suite fully green and reddens only
+the CRLF block. ⚠️ **A CRLF fixture built by converting separators alone is VACUOUS**: `join('\n')`
+leaves the last line unterminated, and if the cause line is last it carries no `\r` to trip over.
+That test passed with the classifier's `.trim()` deleted until the fixture appended a trailing
+newline — caught by mutation check, and the reason the helper adds one.
+
+### A CRLF checkout cannot reach the sources the native gates read
+
+[.gitattributes](../.gitattributes) pins `*.ts`, `*.java`, `*.kt`, `*.swift` and `*.gradle` to
+`eol=lf`, and an explicit `eol=lf` **overrides `core.autocrlf=true`**. Those pins cover every type
+`pluginMethodParity.test.ts` scans — `.ts` for the definitions, `.java`/`.kt` for Android, `.swift`
+for iOS (it reads no `.gradle`; that pin matters to the Gradle legs, not to this test) — so the
+CRLF-checkout failure it was feared to have is structurally impossible, not merely unobserved.
+⚠️ `eol=lf` stops CRLF being ADDED on checkout; it does not strip CRLF already committed in a blob.
+`git ls-files --eol engine/packages` shows 0 non-`i/lf` entries among those extensions, so there is
+no counterexample in tree — but that is a fact to re-check, not an invariant git enforces.
+
+Verified on `win` 2026-09-12 (#1079) by cloning with `core.autocrlf=true` genuinely set and
+counting line endings per extension: `.java` 12, `.kt` 1, `.swift` 22, `.ts` 18 and `.gradle` 8 all
+LF — while the 4 unpinned `.gitignore` files **did** convert to CRLF. That last row is the control:
+without a file that converts, an all-LF result cannot distinguish "the pin works" from "the
+conversion never engaged".
+
 ## Paths
 
 - ⚠️ **`fs.realpathSync` is NOT the canonicaliser you want on Windows — `fs.realpathSync.native`
@@ -1282,6 +1345,51 @@ the old `engine/packages/` path is a relocation, not a dropped SDK; only the loc
   hardware is a flake with a countdown on it; assert the behaviour, not the clock.
 - Toolchain env vars set with `setx` are **not** picked up by an already-running editor or an
   already-running shell — env is read at process start. Pass them inline until the shell restarts.
+
+### `test:native`'s synthesized Gradle projects clean up — the daemon holds a DIFFERENT directory
+
+Validated on `win` 2026-09-12 (#1079), over four full `npm run test:native` runs: **zero leaked
+`modoki-plugin-class-*` directories in `%TEMP%`, zero cleanup warnings**, and no `build/` left in
+`engine\packages\capacitor-*\android\` or `node_modules\@capacitor\android\capacitor\`.
+
+⚠️ **That is a claim about ONE glob, and it does not generalise to "the gate leaks nothing" —
+`test:native` leaks a different family, one directory per run, on every platform.**
+`test-native.mjs` mkdtemps `modoki-ota-zip-fixture-*` at module scope and never removes it (no
+`finally`, no `removeTempDir`); the four runs above left exactly four such directories behind.
+The measurement could not see it because #1079 asked about `modoki-plugin-class-*` and that is
+what was globbed. **A leak check is only ever as wide as its pattern** — enumerate `%TEMP%` by
+prefix before concluding a gate is clean.
+
+#992 expected the opposite — a Gradle or Kotlin daemon still holding handles under `build/`,
+`.gradle` or `.kotlin` when a leg ends, which is why `removeTempDir()`
+([engine/scripts/test-native.mjs](../engine/scripts/test-native.mjs)) retries and warns instead of
+throwing. **The fear was justified but aimed one directory off.** The daemon does hold handles on
+Windows — deleting a scratch `GRADLE_USER_HOME` immediately after a run failed with `EBUSY` on
+`fileHashes.bin`, `modules-2.lock` and the daemon logs, and succeeded on a retry moments later —
+but those handles live in `GRADLE_USER_HOME`, not in the synthesized project the legs build in. So
+the retry-and-warn is the right shape and its retries are load-bearing; the leg's own temp dir was
+simply never the contended one.
+
+⚠️ Scope that to the directories `removeTempDir()` actually guards. Other cleanups in the same file
+— the derived-project teardown, and the `javac` self-test's `outDir` — call bare
+`fs.rmSync(…, {recursive, force})` with no `maxRetries`, inside a `finally`, so an `EBUSY` there
+throws out of the loop before the summary prints: the exact failure `removeTempDir` exists to
+prevent. The `modoki-java-selftest-*` one runs on Windows. Unobserved so far (0 such dirs left
+after four runs), so this is a known gap rather than a measured defect.
+
+⚠️ Cited by SYMBOL, not line number, on purpose. An earlier draft of this paragraph cited those
+cleanups by line — and the very commit that added the citation shifted one of them two lines down,
+so the doc shipped pointing at an unrelated statement. A hand-synced line number is the
+shadowing-constant failure in prose form, which is why `docCitations.test.ts` (#686) fails the
+build over one. It caught this paragraph, in the draft that was explaining the rule.
+
+⚠️ `%TEMP%` on this box nevertheless held **8,551 `modoki-*` entries (6,788 dirs + 1,763 files)**,
+almost all `mkdtemp` scratch from vitest suites (`claims-vitest`, `recents`, `race-flag`, `scrub`,
+`glb`, …) rather than from builds. File content is negligible (~0.1 KB/dir sampled), though each
+NTFS directory also costs an MFT record of roughly 1 KB, so the real floor is nearer a few MB than
+half of one. The cost that matters is the **entry count**: nothing expires these the way `/tmp`
+does on macOS, so it grows without bound and only a Windows clone ever sees it. `test:native`
+contributes one `modoki-ota-zip-fixture-*` per run (above) and nothing else.
 
 ## Diagnosing a Windows-only failure
 

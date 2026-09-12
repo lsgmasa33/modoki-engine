@@ -106,6 +106,46 @@ export function networkFailureCause(output) {
   return null;
 }
 
+/**
+ * Concatenate a spawn's two captured streams so `networkFailureCause` can still see line starts.
+ *
+ * ⚠️ It lives HERE, next to the patterns, because it exists only to protect them: three of the
+ * four are `^`-anchored, so gluing stderr onto an unterminated stdout costs the FIRST stderr line
+ * its anchor — and the gradle wrapper's `java.net.*Exception` is only ever that first line. That
+ * makes a network failure classify as a compile FAIL where it should SKIP. Demonstrated against
+ * this module in the #1079 close-out review: the glued form returns null, the joined one returns
+ * the cause.
+ *
+ * ⚠️ The SHAPE that reaches it is a hypothesis, not an observation. A stdout that does not end on
+ * a newline is what the gradle wrapper is understood to produce while downloading a distribution
+ * (a `Downloading <url>` line, then progress written without line breaks), but this repo has never
+ * captured it — the one wrapper capture it owns
+ * (nativePluginLegCoverage.test.ts, the 'wrapper dying before Gradle starts' fixture) shows a
+ * blank line before the exception and no progress output at all. The join is cheap and correct
+ * whether or not that shape ever arrives; do not promote it to a measured fact without a capture.
+ *
+ * The separator is added ONLY when it is needed — when stdout is non-empty, does not end on a
+ * line boundary, and stderr does not begin on one — so anything already terminated is
+ * byte-identical to plain concatenation. That matters because this text is written to the console
+ * as well as classified.
+ *
+ * ── SIBLINGS, EXAMINED AND DELIBERATELY NOT ROUTED THROUGH THIS ──────────────────────────
+ * Two other places concatenate the same two streams and then filter by line start:
+ * `verify.mjs` (dropping a `[hooks] no git hooks dir` line) and `scopedTypecheckLib.mjs`'s
+ * `stripFileList` (dropping absolute-path lines). Both DROP the matching line rather than merely
+ * failing to match it, so a glued boundary line would make a real error message vanish — a worse
+ * failure than this one. They are left alone because neither producer can emit the shape:
+ * `console.log` and `tsc` terminate every line, unlike a download progress indicator written
+ * without breaks. ⚠️ If either ever consumes a tool that writes partial lines, route it here
+ * rather than re-deriving the rule.
+ */
+export function joinCapturedStreams(stdout, stderr) {
+  const a = stdout ?? '';
+  const b = stderr ?? '';
+  if (a === '' || b === '' || a.endsWith('\n') || b.startsWith('\n') || b.startsWith('\r\n')) return `${a}${b}`;
+  return `${a}\n${b}`;
+}
+
 /** Repo-relative, forward-slashed — the key both the table and the guard compare on, so the
  *  comparison does not become a Windows path-separator question. */
 export const relKey = (repoRoot, abs) => path.relative(repoRoot, abs).split(path.sep).join('/');

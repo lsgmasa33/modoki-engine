@@ -55,7 +55,7 @@ import { fileURLToPath } from 'node:url';
 import { PROJECT_ROOT_DIRS } from './projectRoots.mjs';
 import { loadEnginePluginModule } from './loadVendorPlugins.mjs';
 import { buildZip } from './ota/zip.mjs';
-import { PLUGIN_CLASS_LEGS, schemeFor, legLabel, networkFailureCause } from './nativePluginLegs.mjs';
+import { PLUGIN_CLASS_LEGS, schemeFor, legLabel, networkFailureCause, joinCapturedStreams } from './nativePluginLegs.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const pluginDir = path.join(repoRoot, 'engine', 'packages', 'capacitor-game-debug');
@@ -143,6 +143,12 @@ try {
   const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-zip-fixture-'));
   otaZipFixturePath = path.join(fixtureDir, 'ota-test.zip');
   fs.writeFileSync(otaZipFixturePath, buildZip(entries));
+  // ⚠️ The fixture has to outlive every leg that reads it, so it cannot be removed inline — but
+  // without this it was removed NOWHERE, and the gate leaked one directory per run on every
+  // platform since #992. Measured on `win` 2026-09-12 (#1079): four runs, four directories left
+  // in %TEMP%. `exit` fires on a normal finish AND on process.exit(), and removeTempDir swallows
+  // its own failure, so this cannot turn a cleanup problem into a gate failure.
+  process.on('exit', () => removeTempDir(fixtureDir));
 } catch (e) {
   // NOT environmental — this machine is fully capable of producing the fixture, so a failure
   // here is a FAIL for the leg that needs it, not a SKIP.
@@ -421,7 +427,9 @@ function gradleCapture(args) {
   const r = spawnSync(sp.command, sp.args, {
     cwd: repoRoot, encoding: 'utf8', shell: sp.shell, env: javaEnv, maxBuffer: 256 * 1024 * 1024,
   });
-  const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+  // Joined on a line boundary, not glued — see joinCapturedStreams in nativePluginLegs.mjs for
+  // why the `^`-anchored patterns depend on it (#1079 close-out review).
+  const out = joinCapturedStreams(r.stdout, r.stderr);
   process.stdout.write(out);
   if (r.error) console.error(`[test:native] ${r.error.message}`);
   return { code: r.error ? 1 : r.status ?? 1, out };

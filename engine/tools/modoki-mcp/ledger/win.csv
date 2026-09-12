@@ -104,3 +104,6 @@ date,clone,tool,delta_bytes,tool_bytes_after,surface_bytes_after,sha
 2026-09-11,win,modoki_write_asset,0,2194,153258,a3bd31ba8
 2026-09-11,win,modoki_write_asset_meta,0,2860,153258,a3bd31ba8
 2026-09-11,win,modoki_write_player_prefs,0,2389,153258,a3bd31ba8
+2026-09-12,win,modoki_ota_publish,213,2676,154869,17f72c0ac
+2026-09-12,win,modoki_press_key,697,3170,154869,17f72c0ac
+2026-09-12,win,modoki_type_text,701,2004,154869,17f72c0ac
