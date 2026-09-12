@@ -41,6 +41,67 @@ user has interacted** (re-muting whenever it scrolls off-screen); it withholds t
 viewable, routes Install through `mraid.open(storeUrl)`, caps a rewarded playable at 30 s, and shows
 the end-card on the cap or a game-dispatched `window 'playable:end'`.
 
+## Per-target assets (`asset-keep.json` → `playable`)
+
+**The module toggles below shrink the CODE. This shrinks the ASSETS, and for a text-heavy game it is
+the larger half.** A playable build already forces WebP textures at 512 and a downscaled HDR, but
+that only makes the kept set *smaller* — it never makes it *different*, and before #934 nothing
+could. `asset-keep.json` was `{ keep?: string[] }`: inclusion-only and target-agnostic, so every
+build of a project shipped the same asset set and the inliner embedded whatever survived.
+
+That is unfixable from the game side when the weight is data rather than pictures. Wordweave's word
+list, definitions blob and 333-level corpus come to **8.63 MiB — 1.73x the 5 MB cap before a byte of
+engine JS** — and they are fetched by PATH from game code, so they are reachable and cannot be
+unreferenced either.
+
+```jsonc
+{
+  "keep": ["/games/<id>/assets/data/words-dictionary.txt"],   // every target, as before
+  "playable": {
+    "keep": ["/games/<id>/assets/levels/playable.json"],      // added ONLY on a playable build
+    "drop": ["/games/<id>/assets/data/words-dictionary.txt"]  // removed from the final set
+  }
+}
+```
+
+- **`drop` applies to the FINISHED set** — everything reachable from a scene, plus the keep-list —
+  not just to the keep-list. Reachability is not a veto, deliberately: a playable's heaviest files
+  are usually the reachable ones.
+- ⚠️ **A `drop` entry that names no file on disk FAILS THE BUILD**, exactly as a stale `keep` entry
+  already does, globs included. Without that, renaming a file silently stops dropping it and the
+  artifact grows past its cap in a build nobody is watching.
+- ⚠️ **What a target drops, that target's code must not fetch.** This is the one rule the engine
+  cannot check for you — a fetch is a string in a `.ts` file — so the game branches on
+  `__MODOKI_PLAYABLE__` and reads a different path. A dropped asset that is still fetched 404s in
+  the ad, where nobody is watching a console.
+- ⚠️ **A dropped asset a surviving SCENE still references by GUID is WARNED about, not refused.**
+  Scene data cannot branch on a build define, so that ref simply resolves to nothing in the ad —
+  but dropping a referenced asset can be deliberate (a decorative model an ad does not need), so
+  it is a warning. `unreachableRefs`, the mechanism that would otherwise catch it, is computed
+  before the drop on purpose and is blind to it.
+- ⚠️ **`keep` is transitive; `drop` is NOT.** A keep-list entry is WALKED — listing a prefab pulls
+  its meshes, materials and textures in with it — while a drop removes exactly the path it names.
+  "Drop the level index and its levels go too" is the natural wrong assumption; list each file.
+- **Only the named target reads its section.** A web or native build ignores `playable` entirely
+  (a stale playable section cannot block them), and so do the editor's Clean Up Unused Assets and
+  Find References — a file the playable drops is not unused, and reporting it as an orphan would
+  invite someone to delete an asset the shipping game needs.
+- Sections are per-target: `playable` is the only one today, and `AssetTarget` is a union of one so
+  that a second target is a deliberate decision rather than a string that happens to parse.
+
+**Reading the byte figures.** The build prints the kept/dropped totals, and until #934 they counted
+only the extensions `TYPEABLE_EXTS` classifies — `.txt` by name and `.bin` by omission contributed
+NOTHING, while the copy loop shipped them regardless. For a text-heavy game that was most of the
+payload (wordweave: 7.46 MB of 8.63 MiB), so dropping all of it moved the summary line not at all.
+The totals now count every kept and every target-dropped file. The orphan report and the per-type
+histograms deliberately still do not: they drive the editor's Clean Up Unused Assets dialog, and a
+word list has never been a candidate for deletion.
+
+Guards: `engine/tests/plugins/assetTreeShaker.test.ts` § "per-target asset rules (#934)" — the
+accept side, the refuse side, the byte accounting (on `.txt`/`.bin` fixtures, because a `.json` one
+cannot fail for the class this feature targets), the guid warning, the keep/drop asymmetry, the
+Unicode-form case, and the back-compat case of a project with no target section at all.
+
 ## Engine module toggles (`build.modules`)
 
 A build can include/exclude the heavy engine SDKs (three.js, PixiJS, Rapier 2D/3D) and the video
@@ -70,6 +131,15 @@ removes nothing" below for the two that were not, and why they are gone rather t
   [editor.md](./editor.md#createeditor--host-configuration)).
 
 ## Gotchas (the load-bearing, hard-won ones)
+
+- ⚠️ **A game must fetch every asset through `assetUrl()`, never a root-absolute path** (#934). A
+  playable serves itself from `file://` with every asset inlined as a `blob:` on
+  `__PLAYABLE_ASSETS__`, so `fetch('/assets/levels/levels.json')` is a CROSS-ORIGIN request there and
+  is refused. The ad then boots to a blank board — under its byte cap, self-extracting correctly,
+  passing every other check. `games/wordweave` shipped exactly that and the smoke below is what
+  caught it; `games/court` already did it right, so this is a convention to follow rather than a new
+  one. It is the same resolution a normal build needs under a non-root `webBasePath`, which is the
+  only reason the bug was invisible outside the playable.
 
 - **Gating `App.tsx`'s entry is NOT enough — one other reachable import re-roots the whole SDK**
   (#214). `games/space-invader` sets `render3d: false`, and the toggle genuinely reached the shell

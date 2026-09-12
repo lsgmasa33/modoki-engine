@@ -23,6 +23,8 @@ interface Fixture {
   writeJson(virtualPath: string, data: unknown): void;
   /** Write the keep-list at project root. */
   writeKeepList(entries: string[]): void;
+  /** Write a WHOLE `asset-keep.json`, for the per-target sections (#934). */
+  writeKeepFile(doc: unknown): void;
   cleanup(): void;
 }
 
@@ -66,6 +68,9 @@ function createFixture(): Fixture {
         path.join(projectRoot, 'asset-keep.json'),
         JSON.stringify({ keep: entries }),
       );
+    },
+    writeKeepFile(doc) {
+      fs.writeFileSync(path.join(projectRoot, 'asset-keep.json'), JSON.stringify(doc));
     },
     cleanup() {
       fs.rmSync(projectRoot, { recursive: true, force: true });
@@ -1720,6 +1725,239 @@ describe('asset-tree-shaker', () => {
 
       expect(result.warnings.filter(w => /failed to parse AudioSource\.clips/i.test(w))).toEqual([]);
       expect(result.kept).toContain('/games/test/assets/audio/music.mp3');
+    });
+  });
+
+  /**
+   * #934 — per-target asset rules.
+   *
+   * ⚠️ **The mechanism exists because `keep` could not say "not on this target".** A playable build
+   * has a hard 5 MB cap; the playable profile shrinks textures but drops nothing, and the inliner
+   * then embeds whatever survives. So a game whose weight is TEXT — wordweave's word list,
+   * definitions blob and 333-level corpus come to 8.63 MiB, 1.73x the cap before a byte of engine JS
+   * — could not reach the cap by any amount of game-side work: those files are fetched by path from
+   * game code, so unreferencing them is not available either.
+   *
+   * The load-bearing case is therefore `drop` removing a REACHABLE asset, which is the one thing in
+   * this walker that can break a running game. The contract is the game's: what a target drops, that
+   * target's code must not fetch.
+   */
+  describe('per-target asset rules (#934)', () => {
+    /**
+     * Two heavy keep-list assets and one the playable adds.
+     *
+     * ⚠️ **`.txt` and `.bin` on purpose, and the first version of this fixture used `.json` — which
+     * made the byte case unable to fail for the exact file class the feature exists to shed.**
+     * `listAllShippableFiles` skips every extension outside `TYPEABLE_EXTS`, so a `.json` fixture
+     * exercises the one shape whose bytes were always counted. Wordweave's payload is 7.46 MB of
+     * `.txt` and `.bin`; a mutation that skipped those in the drop left all 81 cases green.
+     */
+    function writeTargetFixture(): void {
+      fx.writeVirtual('/games/test/assets/data/corpus.bin', 'x'.repeat(4096));
+      fx.writeVirtual('/games/test/assets/data/dictionary.txt', 'y'.repeat(2048));
+      fx.writeVirtual('/games/test/assets/extras/loose.png', 'fake');
+      fx.writeJson('/games/test/assets/scenes/empty.json', { version: 6, entities: [] });
+      fx.writeKeepFile({
+        keep: ['/games/test/assets/data/corpus.bin', '/games/test/assets/data/dictionary.txt'],
+        playable: {
+          keep: ['/games/test/assets/extras/loose.png'],
+          drop: ['/games/test/assets/data/corpus.bin', '/games/test/assets/data/dictionary.txt'],
+        },
+      });
+    }
+
+    it('drops the target section only when that target is asked for', () => {
+      writeTargetFixture();
+
+      const web = computeKeptAssets(fx.projectRoot, fx.roots);
+
+      // No target: the base keep-list applies and NOTHING is dropped. This is the case the editor's
+      // Clean Up dialog and Find References both take, and a file the playable drops must not read
+      // as unused there — that would invite someone to delete an asset the real game needs.
+      expect(web.kept).toContain('/games/test/assets/data/corpus.bin');
+      expect(web.kept).toContain('/games/test/assets/data/dictionary.txt');
+      expect(web.kept).not.toContain('/games/test/assets/extras/loose.png');
+    });
+
+    it('on the playable target, adds that section\'s keep and removes its drop', () => {
+      writeTargetFixture();
+
+      const playable = computeKeptAssets(fx.projectRoot, fx.roots, { target: 'playable' });
+
+      expect(playable.kept).not.toContain('/games/test/assets/data/corpus.bin');
+      expect(playable.kept).not.toContain('/games/test/assets/data/dictionary.txt');
+      expect(playable.kept).toContain('/games/test/assets/extras/loose.png');
+    });
+
+    it('counts a dropped asset\'s bytes as dropped, not kept', () => {
+      // The cap is enforced on BYTES, so a drop that removed a path from the set while still
+      // reporting its size as kept would make every budget reading wrong in the safe-looking
+      // direction. Applied before the stats walk, exactly like the video drop above it.
+      //
+      // ⚠️ Measured as a DIFFERENCE rather than an absolute: `keptBytes` also carries the scene and
+      // the 4-byte png, and an absolute would pin those incidentally.
+      writeTargetFixture();
+
+      const web = computeKeptAssets(fx.projectRoot, fx.roots);
+      const playable = computeKeptAssets(fx.projectRoot, fx.roots, { target: 'playable' });
+
+      // web keeps the two data files (4096 + 2048) and not the png; the playable is the reverse.
+      expect(web.stats.keptBytes - playable.stats.keptBytes).toBe(4096 + 2048 - 4);
+      expect(playable.stats.droppedBytes - web.stats.droppedBytes).toBe(4096 + 2048 - 4);
+      // And the absolute figure includes them at all — the bug this case was rewritten to see.
+      expect(web.stats.keptBytes).toBeGreaterThanOrEqual(4096 + 2048);
+    });
+
+    it('drops an asset a SCENE reaches — reachability is not a veto', () => {
+      // The whole reason the mechanism exists: a playable's heaviest files are reachable ones.
+      const guid = '9a9a9a9a-1111-4222-8333-444444444444';
+      fx.writeVirtual('/games/test/assets/models/hero.glb', 'fake-glb');
+      fx.writeJson('/games/test/assets/models/hero.glb.meta.json', { id: guid, version: 2 });
+      fx.writeJson('/games/test/assets/scenes/main.json', {
+        version: 6,
+        resources: [{ type: 'model', path: '/games/test/assets/models/hero.glb' }],
+        entities: [],
+      });
+      fx.writeKeepFile({ playable: { drop: ['/games/test/assets/models/hero.glb'] } });
+
+      expect(computeKeptAssets(fx.projectRoot, fx.roots).kept)
+        .toContain('/games/test/assets/models/hero.glb');
+      expect(computeKeptAssets(fx.projectRoot, fx.roots, { target: 'playable' }).kept)
+        .not.toContain('/games/test/assets/models/hero.glb');
+    });
+
+    it('fails loudly when a drop names a file that does not exist', () => {
+      // ⚠️ The refuse side is the point of the whole guard. A `drop` that matches nothing is exactly
+      // as dangerous as a `keep` that does: rename the file and the drop silently stops applying,
+      // so the artifact grows past its cap in a build nobody is watching.
+      fx.writeJson('/games/test/assets/scenes/empty.json', { version: 6, entities: [] });
+      fx.writeKeepFile({ playable: { drop: ['/games/test/assets/data/gone.json'] } });
+
+      expect(() => computeKeptAssets(fx.projectRoot, fx.roots, { target: 'playable' }))
+        .toThrow(/playable\.drop: .*gone\.json/);
+    });
+
+    it('fails loudly when a drop GLOB matches nothing', () => {
+      fx.writeJson('/games/test/assets/scenes/empty.json', { version: 6, entities: [] });
+      fx.writeKeepFile({ playable: { drop: ['/games/test/assets/data/*.bin'] } });
+
+      expect(() => computeKeptAssets(fx.projectRoot, fx.roots, { target: 'playable' }))
+        .toThrow(/pattern matched no files/);
+    });
+
+    it('does not read the target section when no target is asked for, even if it is broken', () => {
+      // A web build must not fail on a playable-only path, or a stale playable section would block
+      // every other build of the project.
+      fx.writeJson('/games/test/assets/scenes/empty.json', { version: 6, entities: [] });
+      fx.writeKeepFile({ playable: { keep: ['/games/test/assets/nope.png'], drop: ['/games/test/assets/also-nope.png'] } });
+
+      expect(() => computeKeptAssets(fx.projectRoot, fx.roots)).not.toThrow();
+    });
+
+    it('warns when a SURVIVING file still references a dropped asset by guid', () => {
+      // The documented contract covers a path fetched from a `.ts` file, which a build define can
+      // branch. A scene ref cannot: it is data, it resolves through the guid index, and dropping its
+      // target is a silent 404 in the one build nobody watches a console for.
+      const guid = '7c7c7c7c-1111-4222-8333-444444444444';
+      fx.writeVirtual('/games/test/assets/models/hero.glb', 'fake-glb');
+      fx.writeJson('/games/test/assets/models/hero.glb.meta.json', { id: guid, version: 2 });
+      fx.writeJson('/games/test/assets/scenes/main.json', {
+        version: 6,
+        entities: [{ traits: { MeshRenderer: { mesh: guid } } }],
+      });
+      fx.writeKeepFile({ playable: { drop: ['/games/test/assets/models/hero.glb'] } });
+
+      const web = computeKeptAssets(fx.projectRoot, fx.roots);
+      const playable = computeKeptAssets(fx.projectRoot, fx.roots, { target: 'playable' });
+
+      expect(web.warnings.filter((w) => /still references it by guid/.test(w))).toEqual([]);
+      expect(playable.warnings.some((w) => /hero\.glb.*still references it by guid/.test(w))).toBe(true);
+      // A WARNING, not a throw: dropping a referenced asset can be perfectly deliberate.
+      expect(playable.kept).not.toContain('/games/test/assets/models/hero.glb');
+    });
+
+    it('drops the named path only — a drop is NOT transitive, unlike a keep', () => {
+      // ⚠️ The asymmetry is real and worth pinning: a keep-list entry is WALKED (it pulls its whole
+      // dependency subtree in), while a drop deletes exactly what it names. "Drop the level index
+      // and its levels go too" is the natural wrong assumption.
+      const texGuid = '5b5b5b5b-1111-4222-8333-444444444444';
+      fx.writeVirtual('/games/test/assets/textures/skin.png', 'z'.repeat(9000));
+      fx.writeJson('/games/test/assets/textures/skin.png.meta.json', { id: texGuid, version: 2 });
+      fx.writeJson('/games/test/assets/prefabs/kit.prefab.json', {
+        version: 2,
+        entities: [{ traits: { Sprite2D: { texture: texGuid } } }],
+      });
+      fx.writeJson('/games/test/assets/scenes/empty.json', { version: 6, entities: [] });
+      fx.writeKeepFile({
+        keep: ['/games/test/assets/prefabs/kit.prefab.json'],
+        playable: { drop: ['/games/test/assets/prefabs/kit.prefab.json'] },
+      });
+
+      const playable = computeKeptAssets(fx.projectRoot, fx.roots, { target: 'playable' });
+
+      expect(playable.kept).not.toContain('/games/test/assets/prefabs/kit.prefab.json');
+      expect(playable.kept).toContain('/games/test/assets/textures/skin.png');
+    });
+
+    /**
+     * ⚠️ **The drop's NFC normalisation, which no ASCII fixture can see.**
+     *
+     * The keep-set can hold a path in whichever Unicode form `readdir` returned — a glob-expanded
+     * entry does exactly that — while `asset-keep.json` carries whatever form the author's editor
+     * wrote, normally NFC. A bare `Set.delete` then removes nothing, AND the hard error that is
+     * supposed to catch a stale drop stays silent, because `existsSync` resolves either form on a
+     * normalisation-insensitive filesystem. Silent no-op, no warning, budget unchanged.
+     *
+     * Conditional because the trap itself is: on a filesystem that compares bytes (ext4), the NFC
+     * lookup simply fails and `resolveKeepEntries` throws — correctly. The probe asks the real
+     * filesystem rather than the platform name, since that is the property that matters.
+     */
+    const NFD_NAME = 'cafe\u0301.txt'; // e + combining acute
+    const NFC_NAME = 'caf\u00e9.txt';  // precomposed é
+    const fsFoldsUnicode = (() => {
+      const probeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'shaker-nfc-'));
+      try {
+        fs.writeFileSync(path.join(probeDir, NFD_NAME), 'x');
+        return fs.existsSync(path.join(probeDir, NFC_NAME));
+      } finally {
+        fs.rmSync(probeDir, { recursive: true, force: true });
+      }
+    })();
+
+    it.skipIf(!fsFoldsUnicode)('drops a path the keep-set holds in a different Unicode form', () => {
+      fx.writeVirtual(`/games/test/assets/data/${NFD_NAME}`, 'x'.repeat(4096));
+      fx.writeJson('/games/test/assets/scenes/empty.json', { version: 6, entities: [] });
+      fx.writeKeepFile({
+        // A GLOB, so the kept entry carries the form readdir returned — the real mechanism.
+        keep: ['/games/test/assets/data/*.txt'],
+        playable: { drop: [`/games/test/assets/data/${NFC_NAME}`] },
+      });
+
+      const web = computeKeptAssets(fx.projectRoot, fx.roots);
+      const playable = computeKeptAssets(fx.projectRoot, fx.roots, { target: 'playable' });
+
+      expect(web.stats.keptBytes).toBeGreaterThanOrEqual(4096);
+      expect([...playable.kept].some((p) => p.endsWith('.txt'))).toBe(false);
+      expect(web.stats.keptBytes - playable.stats.keptBytes).toBe(4096);
+    });
+
+    it('refuses an asset-keep.json that is not an object', () => {
+      fx.writeJson('/games/test/assets/scenes/empty.json', { version: 6, entities: [] });
+      fx.writeKeepFile(null);
+
+      expect(() => computeKeptAssets(fx.projectRoot, fx.roots)).toThrow(/must be a JSON object, got null/);
+    });
+
+    it('keeps an asset-keep.json with no target section working unchanged', () => {
+      // Back-compat: every project but one has no `playable` section, and a playable build of those
+      // must behave exactly as it did before #934.
+      fx.writeVirtual('/games/test/assets/extras/loose.png', 'fake');
+      fx.writeJson('/games/test/assets/scenes/empty.json', { version: 6, entities: [] });
+      fx.writeKeepList(['/games/test/assets/extras/loose.png']);
+
+      const playable = computeKeptAssets(fx.projectRoot, fx.roots, { target: 'playable' });
+
+      expect(playable.kept).toContain('/games/test/assets/extras/loose.png');
     });
   });
 });

@@ -861,6 +861,12 @@ becomes editor-editable (drag a texture onto the field to reskin).
 `games/<id>/asset-keep.json` is the escape hatch, and it is a **patch, not a fix**: hand-maintained,
 and nothing fails when someone forgets an entry. That is precisely why the guard below exists.
 
+Its schema is `{ keep?: string[], playable?: { keep?: string[], drop?: string[] } }`. `keep` applies
+to every target; the **per-target section (#934)** is added or removed only on a build of that
+target, and is what lets a playable ship a different asset set rather than merely smaller textures.
+⚠️ A `drop` naming no file on disk fails the build, like a stale `keep`. Contract and the reasoning:
+[playable-export.md](playable-export.md) § "Per-target assets".
+
 **Guard**: `engine/tests/assets/codeAssetRefs.test.ts` (in `npm test`) fails on an asset ref held in
 game code, in either form — a GUID **literal**, or an imported **engine constant** such as
 `DEFAULT_FONT_GUID`. It discriminates by resolving each candidate against the real asset index: a

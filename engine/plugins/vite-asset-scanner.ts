@@ -3788,7 +3788,14 @@ export function assetScannerPlugin(): Plugin {
             .filter((v): v is number => typeof v === 'number' && v > 0),
         ))
         : [];
-      const result = computeKeptAssets(projectRoot, assetRoots, { excludeVideo: !buildModules.video });
+      // #934 — `target` is what lets a playable ship a different asset set, not merely smaller
+      // textures. Without it the keep-list is target-agnostic and a text-heavy game cannot reach the
+      // 5 MB cap by any amount of game-side work. Only a PLAYABLE build passes one; every other
+      // caller of this walk (the editor's Clean Up dialog, Find References) deliberately passes none.
+      const result = computeKeptAssets(projectRoot, assetRoots, {
+        excludeVideo: !buildModules.video,
+        target: playable ? 'playable' : undefined,
+      });
       // Build-time guard (#237): fail rather than ship a ref the structured walk could not see.
       // computeKeptAssets' unreachableRefs is empty on every committed project today — a
       // non-empty entry means probeTraitRefs (plugins/asset-tree-shaker.ts) has a blind spot

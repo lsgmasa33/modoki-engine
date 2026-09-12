@@ -156,6 +156,15 @@ reopen it.
   labels (a shipped bug). **Two clear short functions beat one generic one.** Reopens only if a
   second game gets a player-facing selector — a *product* decision, not an extraction, since it
   needs its own answer to "do this game's levels lock?".
+  ⚠️ **That condition FIRED on 2026-09-12 (#917) and the answer is: still deferred, now with
+  evidence.** Wordweave got its picker, and the owner's answer to the locking question came back
+  DIFFERENT from Court's — bands, not a per-level high-water mark, chosen partly *because* Court's
+  shape carries #383's bug class. So the second consumer shrank the shared surface instead of
+  growing it: the two games now disagree on the one rule an extracted selector would have to own.
+  What was worth copying was the SHAPE, not the code — the owner's brief was literally "copy cat
+  Court" — and `games/wordweave/runtime/levelSelect.ts` reproduces the card/tabs/16-tile-pager
+  layout while importing nothing from Court. **A third game does not reopen this either unless it
+  answers the locking question the same way one of the first two did.**
   ⚠️ Whoever revisits it: the source side is not liftable as-is.
   `games/court/runtime/levelManifest.ts` value-imports the difficulty tables, dragging the whole solver behind anything
   that touches it, while `levelSelect.ts` needs only the frontier function and one entry type,

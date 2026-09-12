@@ -5,7 +5,7 @@ import { useWebCanvasSizing } from './useWebCanvasSizing';
 import { useAudioResumeRearm } from './useAudioResumeRearm';
 import { useBackgroundFlush } from './useBackgroundFlush';
 import { useResumeReload } from './useResumeReload';
-import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, waitForScenePaint, SCENE_PAINT_MAX_WAIT_MS, registerRealmShutdownTask, rearmAudioAutoplay } from '@modoki/engine/runtime';
+import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, InMemoryBackend, waitForScenePaint, SCENE_PAINT_MAX_WAIT_MS, registerRealmShutdownTask, rearmAudioAutoplay } from '@modoki/engine/runtime';
 import { DefaultGameUILayer } from './ui/DefaultGameUILayer';
 import ErrorBoundary from './ui/components/ErrorBoundary';
 import { EditorBootBoundary } from './ui/components/EditorBootBoundary';
@@ -407,7 +407,19 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         // Scene3D, so this await must stay ahead of it — move it after and a player's chosen tier
         // silently reads as null on every launch, falling back to the project setting with no
         // error anywhere.
-        const prefsInit = await PlayerPrefs.init({ namespace: gameId, backend: selectDefaultBackend() });
+        // ⚠️ **A PLAYABLE AD NEVER PERSISTS** (#934). It has no player identity and no second
+        // session that means anything: the CTA end-card's Replay is a `location.reload()`, and an ad
+        // container can serve a second impression into the same origin. With the default backend the
+        // save survives both, so a game that resumes where the player left off reopens the ad
+        // MID-WAY — wordweave's two-board playable came back on board 2, and the opening board the
+        // whole ad was designed around never showed again. A first impression looked correct, which
+        // is why this survived a passing smoke.
+        //
+        // In-memory rather than "wipe at boot": wiping is a write, and it would clear a REAL save if
+        // this ever ran in a context that shares an origin with the shipped game. This backend
+        // cannot reach storage at all, so there is nothing to get wrong.
+        const backend = __MODOKI_PLAYABLE__ ? new InMemoryBackend() : selectDefaultBackend();
+        const prefsInit = await PlayerPrefs.init({ namespace: gameId, backend });
         if (prefsInit.discardedPending.length > 0) {
           console.error(
             `[App] PlayerPrefs.init() discarded pending write(s) while swapping from ` +

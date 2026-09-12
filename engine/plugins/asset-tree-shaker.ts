@@ -72,8 +72,41 @@ export interface TreeShakeStats {
   droppedBytes: number;
 }
 
+/**
+ * A build target that can carry asset rules of its own.
+ *
+ * Only `playable` has any today, and the type is a union of one on purpose: a second target wants a
+ * deliberate decision about what its rules MEAN, not a string that happens to parse. `web` and
+ * `native` ship the same asset set and have no section.
+ */
+export type AssetTarget = 'playable';
+
+/** What one target adds to, and removes from, the asset set. */
+interface TargetAssetRules {
+  keep?: string[];
+  drop?: string[];
+}
+
+/**
+ * `asset-keep.json`.
+ *
+ * ⚠️ **`keep` was inclusion-only and target-agnostic until #934**, which is why a playable build
+ * could not get under its 5 MB cap by any amount of game-side work: the keep-list dragged the full
+ * asset set in whatever the target, and the playable profile then shrank textures without dropping
+ * anything. A per-target section is the engine-owned answer (owner, 2026-09-12); the alternative
+ * was a game-side workaround, which would have been a second, worse copy of this mechanism.
+ */
 interface KeepListFile {
   keep?: string[];
+  playable?: TargetAssetRules;
+}
+
+/** What `loadKeepList` resolved, per section. */
+interface ResolvedKeepList {
+  /** Seeded into the walk — the base `keep` plus the target's own, already de-duplicated. */
+  keep: string[];
+  /** Removed from the FINAL kept set, after the walk. Empty unless a target was asked for. */
+  drop: string[];
 }
 
 // ── File type detection ───────────────────────────────
@@ -985,9 +1018,48 @@ function expandKeepGlob(entry: string, roots: AssetRoot[]): string[] {
     .map((name) => `${dir}/${name}`);
 }
 
-function loadKeepList(projectRoot: string, roots: AssetRoot[]): string[] {
+/**
+ * Resolve one section's entries to virtual paths, collecting anything that names no file on disk.
+ *
+ * ⚠️ **Shared by `keep` and `drop`, and that is the point.** A `drop` entry that matches nothing is
+ * exactly as dangerous as a `keep` entry that does: rename the file and the drop silently stops
+ * applying, so the artifact quietly grows past its cap in a build nobody is watching. Same
+ * resolution, same glob handling, same hard failure — the only difference is which list the survivor
+ * goes into.
+ */
+function resolveKeepEntries(
+  entries: readonly string[],
+  roots: AssetRoot[],
+  section: string,
+  missing: string[],
+): string[] {
+  const resolved: string[] = [];
+  for (const entry of entries) {
+    if (entry.includes('*')) {
+      const matches = expandKeepGlob(entry, roots);
+      if (matches.length === 0) missing.push(`${section}: ${entry} (pattern matched no files)`);
+      else resolved.push(...matches);
+      continue;
+    }
+    const abs = virtualToAbs(entry, roots);
+    if (!abs || !fs.existsSync(abs)) missing.push(`${section}: ${entry}`);
+    else resolved.push(entry);
+  }
+  return resolved;
+}
+
+/**
+ * Read `asset-keep.json`, resolving the base section plus — when a target is named — that target's
+ * own additions and removals.
+ *
+ * ⚠️ **`target` is opt-in and the editor never passes one.** "Clean Up Unused Assets" and Find
+ * References both run this walk, and both must answer about the project as it ships everywhere; a
+ * file dropped from the PLAYABLE is not unused, and reporting it as an orphan would invite someone
+ * to delete an asset the real game needs.
+ */
+function loadKeepList(projectRoot: string, roots: AssetRoot[], target?: AssetTarget): ResolvedKeepList {
   const keepPath = path.join(projectRoot, 'asset-keep.json');
-  if (!fs.existsSync(keepPath)) return [];
+  if (!fs.existsSync(keepPath)) return { keep: [], drop: [] };
 
   const raw = fs.readFileSync(keepPath, 'utf-8');
   let parsed: KeepListFile;
@@ -997,20 +1069,21 @@ function loadKeepList(projectRoot: string, roots: AssetRoot[]): string[] {
     throw new Error(`asset-keep.json is not valid JSON: ${(e as Error).message}`, { cause: e });
   }
 
-  const entries = Array.isArray(parsed.keep) ? parsed.keep : [];
-  const missing: string[] = [];
-  const resolved: string[] = [];
-  for (const entry of entries) {
-    if (entry.includes('*')) {
-      const matches = expandKeepGlob(entry, roots);
-      if (matches.length === 0) missing.push(`${entry} (pattern matched no files)`);
-      else resolved.push(...matches);
-      continue;
-    }
-    const abs = virtualToAbs(entry, roots);
-    if (!abs || !fs.existsSync(abs)) missing.push(entry);
-    else resolved.push(entry);
+  // ⚠️ A file that parses to `null` (or to a number, or a string) is not an object, and the first
+  // dereference below would throw a raw TypeError naming a section the project may not even have.
+  if (parsed === null || typeof parsed !== 'object') {
+    throw new Error(`asset-keep.json must be a JSON object, got ${parsed === null ? 'null' : typeof parsed}`);
   }
+  const rules = target ? parsed[target] : undefined;
+  const missing: string[] = [];
+  const keep = resolveKeepEntries(Array.isArray(parsed.keep) ? parsed.keep : [], roots, 'keep', missing);
+  if (rules) {
+    keep.push(...resolveKeepEntries(Array.isArray(rules.keep) ? rules.keep : [], roots, `${target}.keep`, missing));
+  }
+  const drop = rules
+    ? resolveKeepEntries(Array.isArray(rules.drop) ? rules.drop : [], roots, `${target}.drop`, missing)
+    : [];
+
   if (missing.length > 0) {
     throw new Error(
       `asset-keep.json references files that do not exist:\n  ${missing.join('\n  ')}\n` +
@@ -1018,7 +1091,7 @@ function loadKeepList(projectRoot: string, roots: AssetRoot[]): string[] {
     );
   }
 
-  return resolved;
+  return { keep: [...new Set(keep)], drop: [...new Set(drop)] };
 }
 
 // ── Main entry point ──────────────────────────────────
@@ -1058,6 +1131,11 @@ export function computeKeptAssets(
      *  twice for one query doubles the expensive half of the walk — which is what
      *  `enumerateRefEdges` did before it passed its own index in here. */
     guidIndex?: { index: Map<string, string>; origin: Map<string, GuidOrigin> };
+    /** #934 — the build target, when it has asset rules of its own. Reads that target's section of
+     *  `asset-keep.json`: its `keep` is seeded alongside the base list, and its `drop` is removed
+     *  from the finished set below. Left undefined by every caller that is not a production build
+     *  of that target, so the editor's own queries answer about the project as it ships. */
+    target?: AssetTarget;
   } = {},
 ): TreeShakeResult {
   const guidOrigin = opts.guidIndex?.origin ?? new Map<string, GuidOrigin>();
@@ -1077,15 +1155,15 @@ export function computeKeptAssets(
     onEntity: opts.onEntity,
   };
 
-  // Seed: project keep-list (fails loudly on missing files).
-  let keepList: string[] = [];
+  // Seed: project keep-list (fails loudly on missing files), plus the target's own additions.
+  let keepList: ResolvedKeepList = { keep: [], drop: [] };
   try {
-    keepList = loadKeepList(projectRoot, roots);
+    keepList = loadKeepList(projectRoot, roots, opts.target);
   } catch (e) {
     if (!opts.tolerateBadKeepList) throw e;
     state.warnings.push(`keep-list unusable: ${e instanceof Error ? e.message : String(e)}`);
   }
-  for (const entry of keepList) {
+  for (const entry of keepList.keep) {
     // Keep-list entries are WALKED (queued), not kept as bare leaves: listing a
     // scene / prefab / mesh / material pulls its whole transitive dependency subtree.
     // This is what makes an explicit keep useful for a code-spawned prefab that the
@@ -1286,6 +1364,83 @@ export function computeKeptAssets(
     }
   }
 
+  // #934 — the target's own `drop`, applied to the FINISHED set: reachable ∪ keep-list, minus this.
+  //
+  // ⚠️ **It removes REACHABLE assets, deliberately, and that is the only thing here that can break a
+  // running game.** A playable's whole problem is that its heaviest files are reachable — wordweave's
+  // 5 MB definitions blob is fetched by path from game code, so no amount of unreferencing drops it.
+  // The contract is therefore the game's to hold: whatever a target drops, that target's code must
+  // not fetch, which in practice means branching on the target's own define. Nothing here can check
+  // that, because the fetch is a string in a `.ts` file — so it is stated in `docs/playable-export.md`
+  // and paid for by the build that ships it.
+  //
+  // ⚠️ Applied BEFORE the stats loop below so `droppedBytes` and the orphan report count these as
+  // dropped — the same position, and the same reasoning, as the video drop above. They do land in
+  // `orphans`, which is a slight lie (they are referenced, just not shipped here); harmless because
+  // the only consumer of that list is the editor's Clean Up dialog, which never passes a target.
+  const targetDropped = new Set<string>();
+  if (keepList.drop.length > 0) {
+    // ⚠️ NFC on BOTH sides, like every other membership test in this function. macOS readdir can
+    // return NFD where a JSON ref carried NFC, and a bare `delete` would then quietly remove
+    // nothing — while `resolveKeepEntries`' existence check PASSES either form, so the hard error
+    // that is supposed to catch a stale entry never fires. An accented asset filename is the
+    // trigger; none is committed today, which is what makes this a trap rather than a bug.
+    const keepByNfc = new Map<string, string>();
+    for (const virtual of state.keep) keepByNfc.set(virtual.normalize('NFC'), virtual);
+    let droppedBytesFromTarget = 0;
+    for (const entry of keepList.drop) {
+      const actual = keepByNfc.get(entry.normalize('NFC'));
+      if (actual === undefined || !state.keep.delete(actual)) continue;
+      targetDropped.add(actual);
+      const abs = virtualToAbs(actual, roots);
+      droppedBytesFromTarget += abs ? safeStat(abs) : 0;
+    }
+    // Loud either way, and in BYTES — the number the cap is enforced on, and the number an operator
+    // reads to decide whether the drop did anything. A `drop` that removed nothing is not an error
+    // (the file may simply not have been reachable on this target) but it IS the usual reason a
+    // budget refuses to move.
+    console.log(
+      `[asset-shaker] ${opts.target} target dropped ${targetDropped.size} of ${keepList.drop.length} `
+      + `listed asset(s), ${formatBytes(droppedBytesFromTarget)}`
+      + (targetDropped.size ? `: ${[...targetDropped].join(', ')}` : ''),
+    );
+
+    // ⚠️ **A dropped asset that a SURVIVING file still references by GUID is a silent 404.** The
+    // documented contract — what a target drops, that target's code must not fetch — covers a path
+    // fetched from a `.ts` file, which is the case this feature was built for. It does NOT cover a
+    // scene or prefab ref, and a scene cannot branch on a build define. `unreachableRefs` is the
+    // mechanism that already knows how to find this, but it is computed BEFORE the drop on purpose
+    // (so an excluded video is not reported as a walker blind spot), leaving it blind to exactly
+    // the condition a drop creates. So: the same scan, narrowed to the dropped set, as a WARNING —
+    // not a throw, because dropping a referenced asset can be perfectly deliberate.
+    const droppedGuids = new Map<string, string>(); // guid → the dropped path it names
+    for (const [guid, target] of state.guidIndex) {
+      if (targetDropped.has(target)) droppedGuids.set(guid, target);
+    }
+    if (droppedGuids.size > 0) {
+      const GUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+      const reported = new Set<string>();
+      for (const virtualPath of state.keep) {
+        if (!WALKABLE_TYPES.has(classify(virtualPath))) continue;
+        const abs = virtualToAbs(virtualPath, roots);
+        if (!abs || !fs.existsSync(abs)) continue;
+        let text: string;
+        try { text = fs.readFileSync(abs, 'utf-8'); } catch { continue; }
+        for (const m of text.matchAll(GUID_RE)) {
+          const target = droppedGuids.get(m[0].toLowerCase());
+          if (!target) continue;
+          const key = `${target}|${virtualPath}`;
+          if (reported.has(key)) continue;
+          reported.add(key);
+          state.warnings.push(
+            `${opts.target}.drop removed ${target}, but ${virtualPath} still references it by guid — `
+            + `that ref resolves to nothing in the ${opts.target} build`,
+          );
+        }
+      }
+    }
+  }
+
   // Compute stats + orphan list by enumerating every shippable file under every root.
   // Normalize both sides to NFC because macOS APFS may return NFD filenames from
   // readdir while the walker queued NFC-form paths from JSON references.
@@ -1300,9 +1455,11 @@ export function computeKeptAssets(
   const orphans: string[] = [];
   const orphanDetails: OrphanDetail[] = [];
 
+  const countedNfc = new Set<string>();
   for (const { virtual, abs } of allShippable) {
     const type = classify(virtual);
     if (type === 'meta') continue;
+    countedNfc.add(virtual.normalize('NFC'));
     totalByType[type] = (totalByType[type] ?? 0) + 1;
     const size = safeStat(abs);
     if (keepNfc.has(virtual.normalize('NFC'))) {
@@ -1314,6 +1471,26 @@ export function computeKeptAssets(
       orphanDetails.push({ path: virtual, type, bytes: size });
     }
   }
+
+  // ⚠️ **`listAllShippableFiles` is a narrower population than what the build SHIPS, and the byte
+  // totals must not inherit that.** It skips every extension outside `TYPEABLE_EXTS` — `.txt` by
+  // name, and `.bin` by omission — while the scanner's copy loop iterates `kept` and ships them
+  // regardless. For wordweave that is 7.46 MB of a 8.63 MiB payload (`words-defs.bin` 5.07 MB,
+  // `words-dictionary.txt` 1.53 MB, the index 690 KB, the scores 173 KB) contributing ZERO to a
+  // figure printed as the build's asset size — so dropping all of it moved the summary line not at
+  // all, and the honest reading of that was "the drop did nothing".
+  //
+  // Bytes only, deliberately. `orphans`/`orphanDetails` drive the editor's Clean Up Unused Assets
+  // dialog and the type histograms count files the scanner classifies; a `.txt` has never been a
+  // candidate for either and making it one here would offer the player's word list for deletion.
+  const countExtra = (virtual: string, add: (size: number) => void): void => {
+    if (countedNfc.has(virtual.normalize('NFC'))) return;
+    countedNfc.add(virtual.normalize('NFC'));
+    const abs = virtualToAbs(virtual, roots);
+    if (abs) add(safeStat(abs));
+  };
+  for (const virtual of state.keep) countExtra(virtual, (size) => { keptBytes += size; });
+  for (const virtual of targetDropped) countExtra(virtual, (size) => { droppedBytes += size; });
 
   // Drop any keep-set entries that didn't match a shippable file on disk. The
   // walker may have queued references to nonexistent paths — warnings already
@@ -1427,8 +1604,10 @@ export function enumerateRefEdges(projectRoot: string, roots: AssetRoot[]): RefE
   // The seed set the SHAKE uses, from the same two functions it uses — not a
   // re-derivation. A keep-list that failed to load is already reported in
   // `result.warnings` by the tolerant path above, and simply contributes no seeds.
+  // No target: the reference graph answers about the project as it ships everywhere, so a file the
+  // playable drops still has its edges walked and still counts as referenced.
   let keepList: string[] = [];
-  try { keepList = loadKeepList(projectRoot, roots); } catch { /* already warned */ }
+  try { keepList = loadKeepList(projectRoot, roots).keep; } catch { /* already warned */ }
 
   return {
     edges,
