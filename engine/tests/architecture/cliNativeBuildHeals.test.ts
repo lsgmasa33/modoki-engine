@@ -140,7 +140,7 @@ describe('describeUnreadablePackageJsonWarning (the shared #685/#731 producer)',
   it('names the project root, the #685 check, and why it matters — asserted DIRECTLY, not via a caller', async () => {
     const { describeUnreadablePackageJsonWarning } = await import('../../scripts/staleNodeModulesWarning.mjs');
     const msg = describeUnreadablePackageJsonWarning('/tmp/fixture-project');
-    expect(msg).toContain('/tmp/fixture-project/package.json');
+    expect(msg).toContain(path.join('/tmp/fixture-project', 'package.json'));
     expect(msg).toMatch(/could not be read or parsed/);
     expect(msg).toContain('#685');
     expect(msg).toMatch(/stale-node_modules check did NOT run/);

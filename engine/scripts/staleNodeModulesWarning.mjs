@@ -11,12 +11,16 @@
  *  loaded to be imported. Typed by the paired `staleNodeModulesWarning.d.mts` sidecar. Its text is
  *  tested directly (`cliNativeBuildHeals.test.ts`, "describeUnreadablePackageJsonWarning"). */
 
+import path from 'node:path';
+
 /** `projectRoot` is the resolved project root whose `package.json` could not be read or parsed —
  *  named in the message so a human reading a build log knows which project it's about. The caller's
  *  `warn` port adds any prefix (`build-web.mjs` prepends `[build-web] `; the editor route sends it
- *  into the SSE build log as-is) — this returns only the sentence itself. */
+ *  into the SSE build log as-is) — this returns only the sentence itself. The path is joined with
+ *  `path.join`, not a literal `/`, so a Windows log names `C:\…\proj\package.json` rather than a
+ *  mixed-separator `C:\…\proj/package.json` (public Windows CI caught that). */
 export function describeUnreadablePackageJsonWarning(projectRoot) {
-  return `⚠️ ${projectRoot}/package.json could not be read or parsed, so the #685 `
+  return `⚠️ ${path.join(projectRoot, 'package.json')} could not be read or parsed, so the #685 `
     + 'stale-node_modules check did NOT run for this project — a native build here could ship '
     + 'the wrong plugin bytes undetected.';
 }
