@@ -26,7 +26,7 @@ import { setTimelinePreviewActive } from '../../runtime/core/timelinePreview';
 import { clearSkeletalSeeks } from '../../runtime/core/skeletalSeek';
 import { clearControlSpawns } from '../../runtime/timeline/controlSpawnRegistry';
 import { serializeScene, getCurrentScenePath, type SceneFile } from './serialize';
-import { getEditVersion } from '../undo/undoManager';
+import { getEditVersion, setPreviewUndoSession, clearPreviewUndoSession, whenUndoIdle, beginPreviewRestore, finishPreviewRestore } from '../undo/undoManager';
 import { createTeardownToken } from '../../runtime/core/liveness';
 
 /** Authored-world snapshot captured at the first ▶ of a preview session, plus the scene path it
@@ -36,6 +36,10 @@ let _snapPath: string | null = null;
 /** The scene edit-version when the snapshot was taken, so `previewHasAuthoredEdits` can tell an
  *  authored change made INSIDE the envelope from one that predates it. */
 let _snapEditVersion = 0;
+/** The last preview session id handed to the undo stack (`setPreviewUndoSession`): the scene edits
+ *  pushed while a session was held are the ones its restore makes obsolete (#1148). A plain id
+ *  sequence — `clearPreviewUndoSession(id)` does the "is it still this one" check on the undo side. */
+let _undoSessionSeq = 0;
 /** In-flight `begin`, so concurrent openers share ONE snapshot — see beginTimelinePreviewSession. */
 let _pending: Promise<void> | null = null;
 /** Invalidated by every session END, so a `begin` that was already awaiting cannot seat its
@@ -220,12 +224,22 @@ export async function beginTimelinePreviewSession(): Promise<void> {
   // writes the pre-edit world reporting success. Sampling first can only over-report (refuse a save
   // that would have been fine), which costs a keystroke instead of the edit.
   const version = getEditVersion();
+  // Marked from HERE, before the await, for the same reason `version` is sampled here: an edit
+  // landing during `serializeScene()` may or may not be in the snapshot, and dropping its entry on
+  // restore can only cost an undo, where keeping a stale one writes a posed value on undo.
+  const session = ++_undoSessionSeq;
+  setPreviewUndoSession(session);
   _pending = (async () => {
     const snap = await serializeScene();
     const path = getCurrentScenePath();
     // Only seat it if no session end intervened (see endTimelinePreviewSession).
     if (!_snap && stillLive()) { _snap = snap; _snapPath = path; _snapEditVersion = version; }
-  })().finally(() => { _pending = null; });
+  })().finally(() => {
+    _pending = null;
+    // No snapshot seated (serialize threw, or an end intervened): there is no session for the mark to
+    // belong to, and nothing will ever restore — so edits from here on are authored.
+    if (!_snap) clearPreviewUndoSession(session);
+  });
   return _pending;
 }
 
@@ -248,11 +262,34 @@ export async function endTimelinePreviewSession(opts: { restore: boolean; rebind
   clearControlSpawns(); // preview-spawned prefabs are discarded by the snapshot reload below
   const snap = _snap;
   const snapPath = _snapPath;
+  const session = _undoSessionSeq;
   _snap = null;
   _snapPath = null;
-  if (!opts.restore || !snap) return null;
   const path = getCurrentScenePath();
-  if (snapPath !== path) return null; // snapshot is for a different scene — don't clobber
-  await sceneManager.loadScene(path ?? '', { preloaded: snap as unknown as SceneData });
+  if (!opts.restore || !snap || snapPath !== path) {
+    // No restore (or a snapshot for a different scene — don't clobber): the world keeps the session's
+    // edits, so their entries stay valid, and pushes from here on are authored.
+    clearPreviewUndoSession(session);
+    return null;
+  }
+  // From here until the drop, every undo/redo is refused and the session's mark stays on (#1148
+  // review): an edit pushed while the restore is awaiting lands in the posed world the swap throws
+  // away, so it must be marked and dropped like the rest, and no undo step may start against a world
+  // that is about to be replaced — see `beginPreviewRestore`.
+  beginPreviewRestore(session);
+  let reverted = false;
+  try {
+    // Let an undo/redo that was ALREADY running finish against the posed world — see `whenUndoIdle`.
+    await whenUndoIdle();
+    // ⚠️ Re-check the path AFTER that wait: a scene opened meanwhile must not have this snapshot
+    // loaded over it (the check above ran before the yield).
+    if (getCurrentScenePath() !== snapPath) return null;
+    await sceneManager.loadScene(path ?? '', { preloaded: snap as unknown as SceneData });
+    reverted = true;
+  } finally {
+    // The restore discarded every scene edit made during this session; their undo entries go with
+    // them, or an undo after Exit writes a posed value into the authored scene (#1148).
+    finishPreviewRestore(session, { drop: reverted });
+  }
   return opts.rebind?.() ?? null;
 }

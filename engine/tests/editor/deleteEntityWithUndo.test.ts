@@ -1,6 +1,7 @@
 /** Tests for deleteEntityWithUndo — recursive delete with undo/redo snapshot */
 
 import { describe, it, expect, beforeEach } from 'vitest';
+import { setRunMode } from '@modoki/engine/runtime';
 import { getCurrentWorld, spawnEntity } from '@modoki/engine/runtime';
 import { Transform, Renderable3D, EntityAttributes } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
@@ -10,6 +11,9 @@ import { pushAction, clearHistory, undo, redo, canUndo, undoLabel } from '@modok
 
 registerAllTraits();
 setActionCallback(pushAction);
+
+// Undo/redo refuse outside the authoring mode (#1148), and the runtime defaults to 'playing'.
+beforeEach(() => { setRunMode('stopped'); });
 
 describe('deleteEntity (recursive)', () => {
   it('deletes an entity and all its children', () => {

@@ -4,6 +4,7 @@
  *  fixed name that happens to exist today. */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { setRunMode } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerAgentOp, listAgentOps } from '../../app/debug/agentBridge';
 import { kebabToCamel, makeEvalApi } from '../../app/editor/evalApi';
@@ -20,6 +21,9 @@ vi.mock('@modoki/engine/editor', async (importOriginal) => {
 import { readEditorJournal, clearEditorJournal, editorEmit, setEditorJournalEnabled } from '@modoki/engine/editor';
 
 registerAllTraits();
+
+// Undo/redo refuse outside the authoring mode (#1148), and the runtime defaults to 'playing'.
+beforeEach(() => { setRunMode('stopped'); });
 
 beforeEach(() => {
   mockBackendFetch.mockReset();

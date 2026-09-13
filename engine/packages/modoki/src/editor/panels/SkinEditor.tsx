@@ -39,7 +39,8 @@ import { useEditorStore } from '../store/editorStore';
 import { makeRigPrefabAsset } from '../scene/skinPrefab';
 import { removeBone } from '../../runtime/skinning/rig2dEdit';
 import { activePartOf, withActivePart, partsOf, partCount, addPart, removePart, reorderPart, reorderActiveIndex, renamePart, uvToPosAffine, partAngle, bboxCenter } from './skinParts';
-import { pushAction, undo as gUndo, redo as gRedo, type UndoAction } from '../undo/undoManager';
+import { pushAction, type UndoAction } from '../undo/undoManager';
+import { runUndoCommand } from '../undo/undoCommand';
 import { BufferedNumberInput, inputStyle } from './fields';
 import { getAssetDragInfo, setDragGhostRefusal } from '../utils/dragGhost';
 import { decideSkinPartAssetDrop, skinPartAcceptsAsset } from './assetDropPolicy';
@@ -899,8 +900,8 @@ export default function SkinEditor() {
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6, flexShrink: 0 }}>
         <button data-ui-id="skin.toolbar.autoRig" data-ui-kind="button" data-ui-label="auto-rig active part" onClick={autoRigActive} title="One click: auto-place a bone chain + tessellate + auto-weight the active part from its sprite" style={{ ...btn, background: '#20361f', borderColor: '#3a7a44', color: '#cfe' }}>⚙ Auto-rig</button>
         <div style={{ flex: 1 }} />
-        <button data-ui-id="skin.toolbar.undo" data-ui-kind="button" data-ui-label="undo" onClick={() => gUndo()} title="Undo (⌘Z)" style={btn}>↶</button>
-        <button data-ui-id="skin.toolbar.redo" data-ui-kind="button" data-ui-label="redo" onClick={() => gRedo()} title="Redo (⇧⌘Z)" style={btn}>↷</button>
+        <button data-ui-id="skin.toolbar.undo" data-ui-kind="button" data-ui-label="undo" onClick={() => runUndoCommand('undo')} title="Undo (⌘Z)" style={btn}>↶</button>
+        <button data-ui-id="skin.toolbar.redo" data-ui-kind="button" data-ui-label="redo" onClick={() => runUndoCommand('redo')} title="Redo (⇧⌘Z)" style={btn}>↷</button>
       </div>
 
       {/* Top row — two columns: Parts group (part list) | Bones group (bone list). */}

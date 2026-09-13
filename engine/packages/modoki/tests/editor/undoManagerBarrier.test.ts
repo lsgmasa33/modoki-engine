@@ -2,6 +2,7 @@
  *  (swapHistory). Pure module, no mocks. */
 
 import { describe, it, expect, beforeEach } from 'vitest';
+import { setRunMode } from '../../src/runtime/core/playState';
 import {
   pushAction, undo, redo, canUndo, canRedo, undoLabel,
   undoDepth, truncateUndoTo, swapHistory, _resetHistoryContexts,
@@ -9,6 +10,9 @@ import {
 
 const noop = () => {};
 const act = (label: string) => ({ label, undo: noop, redo: noop });
+
+// Undo/redo refuse outside the authoring mode (#1148), and the runtime defaults to 'playing'.
+beforeEach(() => { setRunMode('stopped'); });
 
 beforeEach(() => { _resetHistoryContexts(); });
 

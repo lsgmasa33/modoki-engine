@@ -1,6 +1,7 @@
 /** Tests for reparentEntity — reparenting with world-preserving transforms + sort order */
 
 import { describe, it, expect, beforeEach } from 'vitest';
+import { setRunMode } from '@modoki/engine/runtime';
 import { getCurrentWorld, spawnEntity } from '@modoki/engine/runtime';
 import { Transform, EntityAttributes } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
@@ -12,6 +13,9 @@ import { worldTransforms } from '@modoki/engine/runtime';
 
 registerAllTraits();
 setActionCallback(pushAction);
+
+// Undo/redo refuse outside the authoring mode (#1148), and the runtime defaults to 'playing'.
+beforeEach(() => { setRunMode('stopped'); });
 
 describe('reparentEntity', () => {
   let parentId: number;

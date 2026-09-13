@@ -2,9 +2,13 @@
  *  feed it (!edit / !select / !undo / !redo). */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { setRunMode } from '../../src/runtime/core/playState';
 import { editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled, withEditorActor, waitForEditorJournal } from '../../src/editor/editorJournal';
 import { pushAction, pushSelectionChange, undo, redo, clearHistory, _setUndoClock } from '../../src/editor/undo/undoManager';
 import { nextCaptureSeq, _resetCaptureSeq } from '../../src/runtime/core/journal';
+
+// Undo/redo refuse outside the authoring mode (#1148), and the runtime defaults to 'playing'.
+beforeEach(() => { setRunMode('stopped'); });
 
 beforeEach(() => {
   clearEditorJournal(); setEditorJournalEnabled(true);

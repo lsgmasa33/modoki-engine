@@ -12,6 +12,7 @@
  *  deep-nest override path and the async undo stack compose correctly. */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { setRunMode } from '../../src/runtime/core/playState';
 import { createWorld, trait } from 'koota';
 
 const Transform = trait({ x: 0, y: 0, z: 0 });
@@ -99,6 +100,9 @@ vi.mock('../../src/runtime/loaders/assetManifest', () => ({
 vi.mock('../../src/runtime/loaders/assetUrl', () => ({ assetUrl: (p: string) => p }));
 vi.mock('../../src/runtime/scene/SceneManager', () => ({ sceneManager: { loadScene: vi.fn(), getLoadedScenes: () => new Map() } }));
 // NB: undoManager is REAL here — this test drives its async undo/redo.
+
+// Undo/redo refuse outside the authoring mode (#1148), and the runtime defaults to 'playing'.
+beforeEach(() => { setRunMode('stopped'); });
 
 beforeEach(async () => {
   testWorld = createWorld(); index.clear(); guidN = 0;

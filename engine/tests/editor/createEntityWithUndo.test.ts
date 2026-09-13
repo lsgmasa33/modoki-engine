@@ -2,6 +2,7 @@
  *  createEntityWithUndo: spawn from trait specs, select, and create/delete undo. */
 
 import { describe, it, expect, beforeEach } from 'vitest';
+import { setRunMode } from '@modoki/engine/runtime';
 import { getAllEntities, getEntityTraits, readTraitData, getTraitByName } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { createEntityWithUndo, setActionCallback } from '@modoki/engine/editor';
@@ -13,6 +14,9 @@ setActionCallback(pushAction);
 /** Capture the most recent selection so we can assert create/undo selects correctly. */
 let selected: number | null = null;
 const select = (id: number | null) => { selected = id; };
+
+// Undo/redo refuse outside the authoring mode (#1148), and the runtime defaults to 'playing'.
+beforeEach(() => { setRunMode('stopped'); });
 
 beforeEach(() => {
   clearHistory();

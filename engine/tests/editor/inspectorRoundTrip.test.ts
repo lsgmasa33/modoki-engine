@@ -8,6 +8,7 @@
  *  A trait/field added to app/ecs/registerTraits.ts is covered automatically. */
 
 import { describe, it, expect, beforeEach } from 'vitest';
+import { setRunMode } from '@modoki/engine/runtime';
 import {
   getAllTraits, readTraitData, getCurrentWorld, getTraitByName, spawnEntity,
   type TraitMeta,
@@ -18,6 +19,9 @@ import { pushAction, clearHistory, undo, redo } from '@modoki/engine/editor';
 
 registerAllTraits();
 setActionCallback(pushAction);
+
+// Undo/redo refuse outside the authoring mode (#1148), and the runtime defaults to 'playing'.
+beforeEach(() => { setRunMode('stopped'); });
 
 beforeEach(() => clearHistory());
 

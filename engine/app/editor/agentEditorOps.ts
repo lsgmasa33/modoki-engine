@@ -28,7 +28,7 @@ import { makeEvalApi } from './evalApi';
 import {
   useEditorStore, type SelectedAsset,
   enterPlay, stopPlay, pausePlay,
-  undo, redo, canUndo, canRedo, undoLabel, redoLabel, getEditVersion, getUndoVersion, getDirtyAssetsVersion,
+  undoStep, canUndo, canRedo, undoLabel, redoLabel, getEditVersion, getUndoVersion, getDirtyAssetsVersion,
   loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses,
   getPendingBaseScenePaths, discardPendingBaseScenes,
   getLastSceneLoadFailureMessage,
@@ -61,7 +61,7 @@ import {
 } from '@modoki/engine/editor';
 import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDITOR_JOURNAL_TAIL_DEFAULT } from '../debug/streamSummary';
 import {
-  getPlayState, setPlayState, getRunMode, isAdvancing, getCurrentFPS, getFrameLoopHealth, getRendererGateHealth, getGpuFaultState, stepOneFrame, getAllEntities, findEntity, findEntityByGuid, deleteEntity, findUnrenderable2D,
+  getPlayState, setPlayState, getRunMode, canEdit, isAdvancing, getCurrentFPS, getFrameLoopHealth, getRendererGateHealth, getGpuFaultState, stepOneFrame, getAllEntities, findEntity, findEntityByGuid, deleteEntity, findUnrenderable2D,
   getAnimationClip, normalizeAnimationClip, validateAssetData, journalEvents, getParticleEffect, mountedSurfaces,
   getTimeline, normalizeTimeline, getGuidForPath, getAssetEntry, getPresentationScale,
   getSpriteAnim, getRig2D, getRig2DSource,
@@ -887,12 +887,18 @@ export function registerEditorAgentOps(): void {
   if (registered) return;
   registered = true;
 
-  // Suppress scene hot-reload while Playing/Paused: a disk edit would reload the
-  // live world but Stop reverts to the Play-press snapshot, discarding it. The
-  // backend also consults this (via editor-state) to refuse mutate-while-playing.
+  // Suppress scene hot-reload whenever the live world is not the authored one: Play/Pause (Stop
+  // reverts to the Play-press snapshot) AND a scrub/preview envelope (Exit reverts to the envelope's
+  // snapshot). A reload there rebuilds the world the snapshot belongs to — and inside an envelope it
+  // tears the human's preview down mid-pose.
+  // ⚠️ `canEdit()`, NOT `getPlayState()` (#1148): the 3-value shim reads a preview as 'stopped', so
+  // this used to let the reload through inside every envelope — #1122's mechanism, one gate over.
   setSceneReloadSuppressor(() => {
-    const s = getPlayState();
-    return s === 'stopped' ? null : `game is ${s} — stop the game (Stop) before editing the scene`;
+    if (canEdit()) return null;
+    const mode = getRunMode();
+    return mode === 'playing'
+      ? `game is ${getPlayState()} — stop the game (Stop) before editing the scene`
+      : `the editor is in ${mode} mode (a preview envelope) — exit the preview before editing the scene`;
   });
 
   // ── State read ──
@@ -1559,8 +1565,19 @@ export function registerEditorAgentOps(): void {
   // legitimate answer, and the state below shows what actually happened. (C7 note: an undo
   // whose target entity was destroyed by a scene hot-reload still pops the entry — see the C7
   // save-state audit in docs/connect-claude-code.md; verify with get_scene_state, not `did`.)
-  registerAgentOp('undo', async () => { const did = await undo(); return { did, ...readEditorState() }; });
-  registerAgentOp('redo', async () => { const did = await redo(); return { did, ...readEditorState() }; });
+  //
+  // ⚠️ REFUSED where `undoRefusedReason` refuses (#1148): Play/Pause, and a SCENE edit inside a
+  // scrub/preview envelope. These ops had no run-state gate at all before — not even Play. The
+  // refusal is read from `undoStep` itself rather than pre-checked, because a step is decided when
+  // it runs: a pre-check races a queued step (a clip undo ahead of it re-poses and opens an
+  // envelope) and would report that refusal as `did:false`, i.e. "the stack was empty".
+  const undoOrRefuse = async (op: 'undo' | 'redo') => {
+    const { did, refused } = await undoStep(op);
+    if (refused !== null) throw new OpRefusal('REFUSED_BY_OP', `${op}: ${refused} Nothing was undone or redone, and the stack is untouched.`);
+    return { did, ...readEditorState() };
+  };
+  registerAgentOp('undo', () => undoOrRefuse('undo'));
+  registerAgentOp('redo', () => undoOrRefuse('redo'));
 
   // ── Scene management ──
   // load-scene / new-scene SWAP THE WORLD, so anything created live and not saved is gone —

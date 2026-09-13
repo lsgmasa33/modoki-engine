@@ -24,6 +24,8 @@ let errorSpy: ReturnType<typeof vi.spyOn>;
 
 beforeEach(async () => {
   vi.resetModules();
+  // Undo/redo refuse outside the authoring mode (#1148); set it on the fresh module instance.
+  (await import('../../src/runtime/core/playState')).setRunMode('stopped');
   errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
   const { clearHistory } = await getUndoManager();
   clearHistory();
@@ -164,6 +166,7 @@ describe('a throwing REPORTER cannot skip the bookkeeping', () => {
       reportUndoFailure: () => {},
       COLLISION_STATUS: 409,
     }));
+    (await import('../../src/runtime/core/playState')).setRunMode('stopped'); // reset above → fresh module
 
     const { pushAction, undo, clearHistory, getUndoVersion, canUndo, canRedo } = await getUndoManager();
     const { readEditorJournal, clearEditorJournal } = await getJournal();

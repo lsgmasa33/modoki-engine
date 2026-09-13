@@ -8,6 +8,9 @@ async function getUndoManager() {
 
 beforeEach(async () => {
   vi.resetModules();
+  // Undo/redo refuse outside the authoring mode (#1148), and the runtime defaults to 'playing'. Set
+  // it on the FRESH module instance — `resetModules` above gives undoManager a new playState too.
+  (await import('../../src/runtime/core/playState')).setRunMode('stopped');
   const { clearHistory } = await getUndoManager();
   clearHistory();
 });

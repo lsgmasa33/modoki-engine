@@ -27,7 +27,8 @@ import { saveAssetDialog } from '../utils/saveDialog';
 import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
 import { AssetRefField } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
-import { pushAction, peekUndo, isExecutingUndoRedo, undo as gUndo, redo as gRedo, type UndoAction } from '../undo/undoManager';
+import { pushAction, peekUndo, isExecutingUndoRedo, type UndoAction } from '../undo/undoManager';
+import { runUndoCommand } from '../undo/undoCommand';
 import { BufferedNumberInput, inputStyle } from './fields';
 import { FrameThumb, TrackNameField, iconBtn, labelStyle } from './SpriteAnimatorSection';
 
@@ -300,8 +301,8 @@ export default function SpriteAnimEditor() {
         )}
         {def && (
           <div style={{ position: 'absolute', left: 8, bottom: 8, display: 'flex', gap: 6 }}>
-            <button data-ui-id="spriteAnim.preview.undo" data-ui-kind="button" data-ui-label="Undo" onClick={() => gUndo()} title="Undo (⌘Z) — shared global undo" style={btn}>↶</button>
-            <button data-ui-id="spriteAnim.preview.redo" data-ui-kind="button" data-ui-label="Redo" onClick={() => gRedo()} title="Redo (⇧⌘Z) — shared global undo" style={btn}>↷</button>
+            <button data-ui-id="spriteAnim.preview.undo" data-ui-kind="button" data-ui-label="Undo" onClick={() => runUndoCommand('undo')} title="Undo (⌘Z) — shared global undo" style={btn}>↶</button>
+            <button data-ui-id="spriteAnim.preview.redo" data-ui-kind="button" data-ui-label="Redo" onClick={() => runUndoCommand('redo')} title="Redo (⇧⌘Z) — shared global undo" style={btn}>↷</button>
           </div>
         )}
       </div>

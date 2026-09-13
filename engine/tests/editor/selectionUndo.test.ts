@@ -1,8 +1,12 @@
 /** Tests for selection undo — separate entries with coalescing */
 
 import { describe, it, expect, beforeEach } from 'vitest';
+import { setRunMode } from '@modoki/engine/runtime';
 import { useEditorStore } from '@modoki/engine/editor';
 import { clearHistory, undo, redo, canUndo, pushAction } from '@modoki/engine/editor';
+
+// Undo/redo refuse outside the authoring mode (#1148), and the runtime defaults to 'playing'.
+beforeEach(() => { setRunMode('stopped'); });
 
 describe('selection undo', () => {
   beforeEach(() => {

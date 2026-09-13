@@ -3022,6 +3022,71 @@ selected at each one.
 
 The undo stack is capped at 200 entries (oldest dropped, warned once per session).
 
+### Undo outside `stopped`: Play refuses, a preview reads the entry on top (#1148)
+
+`undoStep(direction)` (`editor/undo/undoManager.ts`) returns `{ did, refused }`; `undo()`/`redo()`
+are its boolean form. It refuses, **without popping**, whenever `undoRefusedReason(direction)` is
+non-null:
+
+| Run mode | Refused | Why |
+|---|---|---|
+| `stopped` | nothing | the live world IS the authored scene |
+| `playing` (incl. paused) | **every** entry | Stop reverts the world and truncates the during-Play entries (`truncateUndoTo`) |
+| `scrub` / `preview` | a **scene edit from before the preview session** | Exit restores the snapshot. An asset-document edit (`_isFileDirect`) and a selection step are never touched by that restore, and a scene edit made *during* the session belongs to the posed world |
+
+**Exit drops the session's own scene edits from the history.** The undo manager marks each entry with
+the preview session held when it was pushed. `timelinePreview.ts` calls `setPreviewUndoSession` at
+begin, before the snapshot await, and clears it at end. Right after a restore,
+`endTimelinePreviewSession` calls `dropPreviewSceneEdits`. The restore already discarded those edits.
+Undoing one afterwards would write a posed value into the authored scene: a recorded field edit's
+`before` becomes the scene value, or a delete respawns an entity the restore already brought back,
+duplicating its guid. Asset and selection entries stay.
+
+- An end **without** a restore keeps the entries, because the world still holds those edits.
+- **For the length of a restore, every undo/redo is refused** (`beginPreviewRestore` …
+  `finishPreviewRestore`, decided when the step runs). The restore then awaits `whenUndoIdle()`,
+  which by then only waits for a step that was already running. A step pops its entry and then
+  awaits its closure (a prefab re-instantiate respawns asynchronously). Without both halves, an
+  entry could be off both stacks during the drop. The step then pushed it back and applied its edit
+  to the restored world, whether it was running when Exit was pressed or queued a keystroke later.
+- The scene path is re-checked **after** that wait, so a scene opened meanwhile never has the old
+  snapshot loaded over it.
+- The mark stays on **until after the drop**, and a second end during the restore does not clear it.
+  An edit pushed while `loadScene` is awaiting lands in the world the swap discards, so it has to be
+  dropped too.
+  One exception is still open, #1167. A *pose* during the restore can begin a new session over the
+  still-posed world. That new session's mark then replaces the first one's for the rest of that
+  restore. Overlapping restores each drop their own session, because the restoring set holds both.
+- A coalescing chain never crosses the session boundary.
+
+The marks are keyed to the SESSION, not the run mode, for two reasons. The Timeline ▶ begins its
+session *before* entering `preview`. And the mode can reach `stopped` on either side of the restore.
+
+The mode and the entry are read **when the step runs**, not when it was called. A step queued behind
+another can be refused by what that step did, so callers read `refused` from the result instead of
+pre-checking. A pre-check once reported such a refusal as `did:false`, i.e. "the stack was empty".
+
+- **Why the preview rule reads the entry.** The first ruling refused every undo inside the envelope.
+  But an Animation or Timeline clip undo **re-poses**, and a pose re-opens the envelope
+  (`poseClipAtTime` → `enterScrubMode`). So one ⏹ Exit bought exactly one undo, and every Exit
+  reverted the pose. #709's live run had measured the re-entry ("exit → `'stopped'`; first undo →
+  `'scrub'` again"). The owner re-ruled with that known (2026-09-13).
+- **The gate lives in the manager, not at the call sites.** Undo has five entry points: the
+  Cmd+Z / Shift+Cmd+Z chords, Edit ▸ Undo/Redo, the ↶/↷ buttons in the Animation, SpriteAnim,
+  Particle and Skin panels, and the agent `undo`/`redo` ops. Before #1148 only the first two were
+  gated, and both read `getPlayState()`, which calls a preview `'stopped'`. The panels and the agent
+  reached `undo()` directly, and the agent ops were ungated even during Play.
+- **Human paths go through `runUndoCommand`** (`editor/undo/undoCommand.ts`), which toasts
+  `refused`. The Edit menu greys each item on `undoRefusedReason('undo' | 'redo')`, recomputed on
+  `onRunModeChange` and on every stack change. `onPlayStateChange` does not fire when a preview
+  starts.
+- **The agent ops answer `REFUSED_BY_OP`** with the same reason.
+- **Tests that call `undo()` must set `setRunMode('stopped')`.** The runtime defaults to `playing`
+  so a shipped game runs with no setup, which means a bare test is refused.
+- `engine/tests/architecture/playStateIsNotAnAuthoringGate.test.ts` bans comparing `playState` to
+  `'stopped'` in editor code outside a reasoned allowlist, because that comparison is the defect's
+  shape. It shipped three times: #1122, then twice in #1148.
+
 ### Asset delete IS undoable — it is snapshot-backed, not a filesystem one-way door
 
 `Assets` → **Move to Trash** looks irreversible and is not. `executeDeletion` calls

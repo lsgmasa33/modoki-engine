@@ -221,7 +221,13 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'guarantee that the world now looks as it did before, because an entry captured against a ' +
       'PREVIOUS world (anything from before a scene hot-reload, which any file write triggers) ' +
       'undoes against entities that no longer exist. So verify with modoki_get_scene_state rather ' +
-      'than trusting `did` — the same rule as every other mutation on this surface.',
+      'than trusting `did` — the same rule as every other mutation on this surface. ' +
+      'REFUSES (REFUSED_BY_OP, stack untouched) during Play/Pause, and inside a scrub/preview envelope ' +
+      '(runMode scrub|preview) when the entry is a SCENE edit made BEFORE that preview — that world reverts on ' +
+      'Exit. Inside the envelope an asset-document edit (clip, timeline, rig, material), a selection step, and a ' +
+      'scene edit made during the preview still undo. Exit drops the preview\'s own scene edits from the stack ' +
+      '(the restore already discarded them). To undo an older scene edit, Stop the game or end the envelope ' +
+      '(modoki_exit_pose_envelope for an animation-owned one) first.',
     { action: z.enum(['undo', 'redo']).describe('Which direction to move the undo stack. This IS the editor-action op name on the wire.') },
     async ({ action }) => editorAction(action),
   );

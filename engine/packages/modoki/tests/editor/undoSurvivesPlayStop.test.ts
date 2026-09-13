@@ -10,6 +10,7 @@
  *  recording are mocked), so it exercises the actual undo/redo path. */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { setRunMode } from '../../src/runtime/core/playState';
 import { createWorld, trait } from 'koota';
 
 const Transform = trait({ x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
@@ -79,6 +80,9 @@ function rebuildWorldWith(entities: { guid: string; x: number; name?: string }[]
   testWorld = next;
   return byGuid;
 }
+
+// Undo/redo refuse outside the authoring mode (#1148), and the runtime defaults to 'playing'.
+beforeEach(() => { setRunMode('stopped'); });
 
 beforeEach(() => {
   testWorld = createWorld();

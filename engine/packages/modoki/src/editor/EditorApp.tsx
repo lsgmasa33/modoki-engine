@@ -35,10 +35,11 @@ import OtaKeysDialog from './panels/OtaKeysDialog';
 import PanelErrorBoundary from './panels/PanelErrorBoundary';
 import { runSaveAll, toastForSave } from './scene/saveCommand';
 import { enterPlay, pausePlay } from './scene/playMode';
-import { getPlayState, setPlayState, onPlayStateChange } from '../runtime/core/playState';
+import { getPlayState, setPlayState, getRunMode, onRunModeChange } from '../runtime/core/playState';
 import { useEditorStore } from './store/editorStore';
 import { setActionCallback } from './undo/entityActions';
-import { pushAction, undo, redo, canUndo, canRedo, undoLabel, redoLabel, subscribeUndo, getUndoVersion } from './undo/undoManager';
+import { pushAction, canUndo, canRedo, undoLabel, redoLabel, subscribeUndo, getUndoVersion, undoRefusedReason } from './undo/undoManager';
+import { runUndoCommand } from './undo/undoCommand';
 
 import { getGameViewComponent, getCustomPanels, getExtraMenus, getExtraMenusVersion, subscribeExtraMenus, getProjectSettings } from './createEditor';
 import { dockPanel, toDockLocation } from './panelDock';
@@ -320,34 +321,23 @@ export default function EditorApp() {
           else void enterPlay();
         },
       }),
-      // Undo/redo edit the AUTHORED scene; during Play/Pause the live world is a throwaway
-      // snapshot that reverts on Stop, so undoing then would rewrite history against temporary
-      // state. Disabled until Stopped — same rule as Save above.
+      // Undo/redo edit the AUTHORED scene; during Play/Pause, and for a scene edit inside a
+      // scrub/preview envelope, the live world is a throwaway snapshot that reverts on Stop/Exit.
+      // The refusal itself lives in `undoStep` (`undoRefusedReason`, #1148 — this used to read
+      // `getPlayState()`, which calls a preview 'stopped'), and `runUndoCommand` toasts it.
       register({
         id: 'app.undo',
         keys: 'mod+z',
         scope: 'app-chord',
         menu: { path: 'Edit/Undo' },
-        run: () => {
-          if (getPlayState() !== 'stopped') {
-            useEditorStore.getState().showToast('Stop the game to undo — disabled during Play.', 'warn');
-            return;
-          }
-          void undo();
-        },
+        run: () => { void runUndoCommand('undo'); },
       }),
       register({
         id: 'app.redo',
         keys: 'mod+shift+z',
         scope: 'app-chord',
         menu: { path: 'Edit/Redo' },
-        run: () => {
-          if (getPlayState() !== 'stopped') {
-            useEditorStore.getState().showToast('Stop the game to undo — disabled during Play.', 'warn');
-            return;
-          }
-          void redo();
-        },
+        run: () => { void runUndoCommand('redo'); },
       }),
     ]);
     const offDispatch = installKeymapDispatcher();
@@ -627,10 +617,13 @@ export default function EditorApp() {
   // Reactive undo/redo state for the Edit menu — bumps only when the stacks
   // actually change, so the menu memo below doesn't recompute every render. (F3)
   const undoVersion = useSyncExternalStore(subscribeUndo, getUndoVersion, getUndoVersion);
-  // Reactive play state so the Edit menu's Undo/Redo enabled state recomputes on
-  // Play/Stop transitions (undo is disabled while Playing — see the Cmd+Z guard).
-  const playState = useSyncExternalStore(onPlayStateChange, getPlayState, getPlayState);
-  const canEdit = playState === 'stopped';
+  // Reactive RUN MODE so the Edit menu's Undo/Redo enabled state recomputes on every Play/Stop AND
+  // scrub/preview transition. ⚠️ Not `onPlayStateChange`: that fires only when the 3-value shim
+  // changes, and entering a preview does not change it (#1148). `undoRefusedReason` is the same
+  // predicate `undo()` itself refuses on, so the menu cannot offer what the command will refuse. It
+  // reads the entry on TOP of each stack (a clip edit is allowed inside a preview, a scene edit is
+  // not), which the memo also recomputes on — `undoVersion` bumps on every stack change.
+  const runMode = useSyncExternalStore(onRunModeChange, getRunMode, getRunMode);
   // Host-owned menus (Build) can be REPLACED after boot — the device pickers are filled from an
   // async listing that must not block editor start. Bump → rebuild the tree AND re-push the
   // Electron spec, or the OS menu keeps the boot-time labels forever.
@@ -642,6 +635,7 @@ export default function EditorApp() {
   // `menu-structure` send on most renders (toasts, import progress, nonces). (F3)
   const { menus, menuSpecJson, menuActionMap } = useMemo(() => {
     void undoVersion; // dep: undo labels/enabled are read via canUndo()/undoLabel() below
+    void runMode;     // dep: Undo/Redo enabled is read via undoRefusedReason() below, which reads the run mode imperatively
     void extraMenusVersion; // dep: getExtraMenus() below is a module registry, read imperatively
     const menus: Record<string, BarMenuItem[]> = {
     File: [
@@ -663,8 +657,8 @@ export default function EditorApp() {
       } },
     ],
     Edit: [
-      { label: canUndo() ? `Undo ${undoLabel()}` : 'Undo', shortcut: 'Cmd+Z', disabled: !canEdit || !canUndo(), action: undo },
-      { label: canRedo() ? `Redo ${redoLabel()}` : 'Redo', shortcut: 'Cmd+Shift+Z', disabled: !canEdit || !canRedo(), action: redo },
+      { label: canUndo() ? `Undo ${undoLabel()}` : 'Undo', shortcut: 'Cmd+Z', disabled: undoRefusedReason('undo') !== null || !canUndo(), action: () => { void runUndoCommand('undo'); } },
+      { label: canRedo() ? `Redo ${redoLabel()}` : 'Redo', shortcut: 'Cmd+Shift+Z', disabled: undoRefusedReason('redo') !== null || !canRedo(), action: () => { void runUndoCommand('redo'); } },
     ],
     Assets: [
       { label: 'Clean Up Unused Assets…', action: () => useEditorStore.getState().openCleanupAssets() },
@@ -703,7 +697,7 @@ export default function EditorApp() {
     // label, not just its position).
     const { menuSpec, menuActionMap } = buildMenuSpec(menus);
     return { menus, menuSpecJson: JSON.stringify(menuSpec), menuActionMap };
-  }, [layoutName, undoVersion, extraMenusVersion, canEdit, handleSaveLayout, handleSaveLayoutAs, showPanel, isPanelVisible, layoutVersion]);
+  }, [layoutName, undoVersion, extraMenusVersion, runMode, handleSaveLayout, handleSaveLayoutAs, showPanel, isPanelVisible, layoutVersion]);
 
   // Keep the click-relay's action map current with the latest memoized spec.
   menuActionRef.current = menuActionMap;

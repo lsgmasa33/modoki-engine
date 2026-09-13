@@ -34,7 +34,8 @@ import { SectionIdContext, particleFieldSlug, useFieldId } from './particle/fiel
 import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
 import { ParkAdoptedBanner } from './AssetLoadRefusedBanner';
 import { assetWrittenToDisk } from '../scene/dirtyAssets';
-import { pushAction, peekUndo, isExecutingUndoRedo, undo as gUndo, redo as gRedo, type UndoAction } from '../undo/undoManager';
+import { pushAction, peekUndo, isExecutingUndoRedo, type UndoAction } from '../undo/undoManager';
+import { runUndoCommand } from '../undo/undoCommand';
 import CurveEditor from './particle/CurveEditor';
 import { loadParticleEditorShowFloor, saveParticleEditorShowFloor } from './particleEditorPrefs';
 import { DEFAULT_CURVE_POINTS, withCurvePoints, withCurveScale } from './particle/curveMath';
@@ -523,8 +524,8 @@ export default function ParticleEditor() {
           <div style={{ position: 'absolute', left: 8, right: 8, bottom: 8, display: 'flex', alignItems: 'center', gap: 8, background: 'rgba(0,0,0,0.55)', border: '1px solid #333', borderRadius: 4, padding: '6px 8px' }}>
             <button data-ui-id="particle.transport.play" data-ui-kind="button" data-ui-label="play/pause" data-ui-state={playing ? 'playing' : 'paused'} onClick={togglePlay} style={btn}>{playing ? '⏸' : '▶'}</button>
             <button data-ui-id="particle.transport.restart" data-ui-kind="button" data-ui-label="restart" onClick={restart} style={btn}>⟲</button>
-            <button data-ui-id="particle.transport.undo" data-ui-kind="button" data-ui-label="undo" onClick={() => gUndo()} title="Undo (⌘Z) — shared global undo" style={btn}>↶</button>
-            <button data-ui-id="particle.transport.redo" data-ui-kind="button" data-ui-label="redo" onClick={() => gRedo()} title="Redo (⇧⌘Z) — shared global undo" style={btn}>↷</button>
+            <button data-ui-id="particle.transport.undo" data-ui-kind="button" data-ui-label="undo" onClick={() => runUndoCommand('undo')} title="Undo (⌘Z) — shared global undo" style={btn}>↶</button>
+            <button data-ui-id="particle.transport.redo" data-ui-kind="button" data-ui-label="redo" onClick={() => runUndoCommand('redo')} title="Redo (⇧⌘Z) — shared global undo" style={btn}>↷</button>
             <button data-ui-id="particle.transport.floor" data-ui-kind="toggle" data-ui-label="ground plane" data-ui-state={showFloor ? 'on' : 'off'} onClick={() => setShowFloor((v) => !v)} title="Toggle opaque ground plane (occludes particles behind it; use for soft particles / ground reference)" style={{ ...btn, background: showFloor ? '#2d6cdf' : '#2a2a40' }}>▦</button>
             <input data-ui-id="particle.transport.scrub" data-ui-kind="field" data-ui-label="scrub" type="range" min={0} max={def.duration} step={0.01} value={displayElapsed(elapsed, def.duration, def.looping)} onChange={(e) => scrub(+e.target.value)} style={{ flex: 1 }} />
             <span style={{ width: 56, textAlign: 'right', color: '#888' }}>{displayElapsed(elapsed, def.duration, def.looping).toFixed(2)}s</span>

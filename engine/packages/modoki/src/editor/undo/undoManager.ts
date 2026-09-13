@@ -4,6 +4,7 @@ import { editorEmit } from '../editorJournal';
 import { markSceneDirty } from '../scene/sceneDirty';
 import { reportUndoThrew } from './undoFailure';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
+import { canEdit, getRunMode } from '../../runtime/core/playState';
 
 /** Structured diff for a trait-field edit — the machine-readable companion to an
  *  action's human `label`, forwarded into the editor journal's `!edit` event so
@@ -73,7 +74,13 @@ export interface UndoAction {
    *  self-block a follow-up file-direct write via the "unsaved live changes"
    *  guard some of those routes carry). A genuinely-pending unrelated
    *  live-world edit is untouched either way — this flag only opts THIS
-   *  action out of contributing its own bump. */
+   *  action out of contributing its own bump.
+   *
+   *  ⚠️ SECOND ROLE (#1148): `undoRefusedReason` also reads it as "safe to undo inside a
+   *  scrub/preview envelope", because a snapshot restore never touches what such an entry edits.
+   *  That holds for every producer today (asset documents and the parked/editor-state base-scene
+   *  ref) — so a new producer that sets this flag AND writes a scene entity would be let through
+   *  inside an envelope and lost on Exit. Such an action is not file-direct: leave the flag off. */
   _isFileDirect?: boolean;
   /** Scene guids this action's entities belong to (scene-loading.md
    *  Phase 12, M2) — resolved by the CALLER before the mutation runs (a delete/reparent
@@ -111,6 +118,74 @@ const COALESCE_MS = 500;
 
 const undoStack: UndoAction[] = [];
 const redoStack: UndoAction[] = [];
+/** The preview SESSION each entry was pushed during, if any (#1148). A WeakMap rather than a field
+ *  on `UndoAction`: callers build those objects, and a mark they could set or copy would be a mark
+ *  nobody can trust. */
+const _pushedInPreview = new WeakMap<UndoAction, number>();
+/** The preview session whose snapshot is held right now (`setPreviewUndoSession`), or null. */
+let _previewSession: number | null = null;
+function currentPreview(): number | null { return _previewSession; }
+
+/** Tell the undo stack a preview SESSION began (an id) or ended (null) — called only by the session
+ *  controller (`editor/scene/timelinePreview.ts`), at the moment it starts taking the snapshot and
+ *  when it ends the session.
+ *
+ *  Keyed to the SESSION, not the run mode, deliberately: the session's snapshot is what Exit
+ *  restores, so "pushed while this session was held" is exactly "made obsolete by its restore".
+ *  The run mode does not line up with it — the Timeline ▶ begins its session BEFORE entering
+ *  `preview`, and the mode can return to `stopped` before or after the restore. */
+export function setPreviewUndoSession(id: number | null): void {
+  _previewSession = id;
+}
+
+/** End preview session `session`'s marking — a no-op if a newer session already took over, or if
+ *  that session is mid-restore (a second end's early return must not clear the mark the first end
+ *  still needs for its drop). */
+export function clearPreviewUndoSession(session: number): void {
+  if (_restoringSessions.has(session)) return;
+  if (_previewSession === session) _previewSession = null;
+}
+
+/** The preview sessions whose snapshot restore is in progress. While any is, EVERY undo/redo step is
+ *  refused — see `beginPreviewRestore`. A SET, not one slot: a pose during a restore can seat a new
+ *  session and a second Exit restore it while the first is still loading (#1167's path), and a
+ *  single slot let the second overwrite the first so the first's drop never ran. */
+const _restoringSessions = new Set<number>();
+
+/** A restore of preview session `session` is starting — refuse every undo/redo until
+ *  `finishPreviewRestore` (#1148 review).
+ *
+ *  Waiting for idle alone was racy: a step queued AFTER the restore began could still start before
+ *  the swap, outlast it, and push its entry back after the drop (applying its edit to the restored
+ *  world); a scene undo in `stopped` could land in the world being thrown away. A refusal decided at
+ *  run time closes all of it — nothing new starts, and `whenUndoIdle` then only waits for the step
+ *  that was already running. The window is one scene swap long. */
+export function beginPreviewRestore(session: number): void {
+  _restoringSessions.add(session);
+  notifyUndoChanged(); // the Edit menu's enabled state reads the refusal — it must hear it start
+}
+
+/** The restore of `session` finished. `drop` (the world WAS reverted) removes that session's scene
+ *  edits; either way its mark and the restore refusal are cleared. */
+export function finishPreviewRestore(session: number, opts: { drop: boolean }): void {
+  if (!_restoringSessions.delete(session)) return;
+  if (opts.drop) dropPreviewSceneEdits(session);
+  clearPreviewUndoSession(session);
+  // Unconditionally — and not only via a drop that removed something: a restore that dropped nothing
+  // otherwise left the menu greyed out from `beginPreviewRestore` until some unrelated stack change.
+  notifyUndoChanged();
+}
+
+/** Resolves once every queued or running undo/redo step has finished.
+ *
+ *  The session controller awaits this before a restore (#1148). A step pops its entry and then
+ *  AWAITS its closure (a prefab re-instantiate respawns asynchronously), so a restore that ran in
+ *  between would drop nothing — the entry is off both stacks — and the step would then push it back
+ *  and apply its edit to the RESTORED, authored world. ⚠️ Never await this from inside an undo/redo
+ *  closure: the closure is part of the chain it waits for. */
+export function whenUndoIdle(): Promise<void> {
+  return _inFlight.then(() => undefined);
+}
 let _truncationWarned = false;
 
 // ── Change subscription ───────────────────────────────────
@@ -265,6 +340,9 @@ export function pushAction(action: UndoAction) {
     const top = undoStack[undoStack.length - 1];
     const now = _clock();
     if (top && top.coalesceKey === action.coalesceKey
+        // Never across an envelope boundary: a chain begun before the preview would absorb an edit
+        // made inside it, and the merged entry could then be neither kept nor dropped on Exit.
+        && (_pushedInPreview.get(top) ?? null) === currentPreview()
         && _coalesce && _coalesce.key === action.coalesceKey
         && now - _coalesce.at <= COALESCE_MS) {
       top.redo = action.redo;     // advance to the latest value…
@@ -288,6 +366,8 @@ export function pushAction(action: UndoAction) {
   } else {
     _coalesce = null; // a non-coalescing action ends any chain
   }
+  const preview = currentPreview();
+  if (preview !== null) _pushedInPreview.set(action, preview);
   undoStack.push(action);
   redoStack.length = 0;
   if (undoStack.length > MAX_STACK_SIZE) {
@@ -379,28 +459,108 @@ async function runStep(
   return ok;
 }
 
-/** Undo the last action. Serialized: if another undo/redo is in flight, this
- *  one waits its turn (it pops the stack only when it actually runs).
+/** Why the next undo (or redo) is refused right now, or `null` when it may run (#1148).
+ *
+ *  Undo edits the AUTHORED scene, and outside `stopped` the live world is not that scene: Play
+ *  reverts it on Stop, and a scrub/preview envelope reverts it on Exit. An undo of a scene edit there
+ *  applies to a world that is about to be thrown away, pops its entry for good, and leaves the
+ *  history one step past an edit the authored world never saw.
+ *
+ *  - **Play / Pause: every entry is refused**, as the Cmd+Z chord always did (Stop truncates the
+ *    during-Play entries anyway — `truncateUndoTo`).
+ *  - **Inside a scrub/preview envelope, it depends on the entry on top** (owner's rulings,
+ *    2026-09-13). Allowed: an `_isFileDirect` entry — it edits an asset DOCUMENT (a clip, a
+ *    timeline, a rig, a material — parked in the dirty-asset registry) that a snapshot restore
+ *    never touches; a selection entry, which moves no world state; and a scene edit pushed INSIDE
+ *    THIS preview session, whose before/after both belong to the posed world. Refused: a scene edit from
+ *    before the envelope, which would apply to a world about to be reverted. When Exit restores
+ *    the snapshot, `dropPreviewSceneEdits` removes the envelope's own scene entries, since the
+ *    restore already threw their edits away and undoing one afterwards would write a preview value
+ *    into the authored scene.
+ *    The first ruling refused everything, and it cost more than it said: an Animation or Timeline
+ *    clip undo RE-POSES, and a pose re-opens the envelope, so each ⏹ Exit bought exactly one undo
+ *    (measured on #709: "exit → 'stopped'; first undo → 'scrub' again").
+ *
+ *  An EMPTY stack returns `null` — "nothing to undo" is not a refusal, and `undo()` says so itself.
+ *
+ *  ⚠️ Read `canEdit()`, NOT `getPlayState()`: the 3-value shim calls a preview `'stopped'`, which is
+ *  how every Undo gate — and the panel buttons and agent ops, which were never gated at all — said
+ *  "safe" inside an envelope. The gate lives HERE so every caller shares it. */
+export function undoRefusedReason(direction: 'undo' | 'redo' = 'undo'): string | null {
+  const top = direction === 'undo' ? undoStack[undoStack.length - 1] : redoStack[redoStack.length - 1];
+  if (!top) return null; // nothing to undo is never a refusal, whatever the mode
+  if (_restoringSessions.size > 0) return `The preview is closing — ${direction} again once the scene has been restored.`;
+  if (canEdit()) return null;
+  const mode = getRunMode();
+  if (mode === 'playing') return `Stop the game to ${direction} — disabled during Play.`;
+  if (top._isFileDirect || top._isSelection) return null;
+  if (_previewSession !== null && _pushedInPreview.get(top) === _previewSession) return null;
+  return `Exit the preview to ${direction} "${top.label}" — it is a scene edit from before this ${mode} preview, and the previewed world reverts on Exit.`;
+}
+
+/** Remove, from both stacks, the scene edits pushed during preview session `session` (#1148).
+ *
+ *  Called by the session controller right after it restores that envelope's snapshot
+ *  (`endTimelinePreviewSession`). The restore has already discarded those edits, so their entries
+ *  no longer describe the world: undoing one afterwards writes the posed world's `before` value
+ *  into the authored scene (a recorded key's field edit), or respawns an entity the restore brought
+ *  back, duplicating its guid. Asset-document and selection entries from the envelope are KEPT —
+ *  the restore does not touch what they edit. Returns how many entries were removed. */
+export function dropPreviewSceneEdits(session: number): number {
+  const dropped = (a: UndoAction) => _pushedInPreview.get(a) === session && !a._isFileDirect && !a._isSelection;
+  let removed = 0;
+  for (const stack of [undoStack, redoStack]) {
+    const kept = stack.filter((a) => !dropped(a));
+    removed += stack.length - kept.length;
+    stack.length = 0;
+    stack.push(...kept);
+  }
+  if (removed > 0) {
+    _coalesce = null;
+    notifyUndoChanged();
+  }
+  return removed;
+}
+
+/** What one undo/redo step did: `did` — an entry was popped and its closure ran; `refused` — the
+ *  gate's reason when it refused (`did` is then false and neither stack moved). `did:false` with
+ *  `refused:null` is an empty stack or a throwing closure (#310 reports that one itself). */
+export interface UndoStepResult { did: boolean; refused: string | null }
+
+/** Undo or redo one step, reporting a refusal as DATA. Serialized: if another undo/redo is in
+ *  flight, this one waits its turn and pops only when it actually runs.
+ *
+ *  The gate is read when the step RUNS, not when it was called — a step queued behind an in-flight
+ *  one can be refused by what that step did (a clip undo re-poses and opens an envelope, a Play
+ *  pressed meanwhile). So a caller that must say WHY reads `refused` from here; checking
+ *  `undoRefusedReason()` before calling races exactly that window and reports a refusal as an empty
+ *  stack.
  *
  *  A THROWING closure drops the action, loudly (#310) — see `runStep` for why that is the
  *  chosen policy and what still has to happen on the failure path. */
-export function undo(): Promise<boolean> {
+export function undoStep(direction: 'undo' | 'redo'): Promise<UndoStepResult> {
   return serialize(async () => {
-    _coalesce = null; // any explicit undo ends the current edit chain
-    const action = undoStack.pop();
-    if (!action) return false;
-    return runStep('Undo', action, () => action.undo(), redoStack, '!undo');
+    const refused = undoRefusedReason(direction);
+    if (refused !== null) return { did: false, refused };
+    _coalesce = null; // any explicit undo/redo ends the current edit chain
+    const action = (direction === 'undo' ? undoStack : redoStack).pop();
+    if (!action) return { did: false, refused: null };
+    const did = direction === 'undo'
+      ? await runStep('Undo', action, () => action.undo(), redoStack, '!undo')
+      : await runStep('Redo', action, () => action.redo(), undoStack, '!redo');
+    return { did, refused: null };
   });
 }
 
-/** Redo the last undone action. Serialized like `undo`. */
+/** Undo the last action — `undoStep('undo')` as a boolean. `false` covers a refusal too; use
+ *  `undoStep` when the caller has to tell the two apart. */
+export function undo(): Promise<boolean> {
+  return undoStep('undo').then((r) => r.did);
+}
+
+/** Redo the last undone action — `undoStep('redo')` as a boolean. */
 export function redo(): Promise<boolean> {
-  return serialize(async () => {
-    _coalesce = null;
-    const action = redoStack.pop();
-    if (!action) return false;
-    return runStep('Redo', action, () => action.redo(), undoStack, '!redo');
-  });
+  return undoStep('redo').then((r) => r.did);
 }
 
 /** The action currently at the top of the undo stack (next to be undone), if any.

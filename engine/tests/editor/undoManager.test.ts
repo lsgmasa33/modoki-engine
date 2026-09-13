@@ -1,6 +1,7 @@
 /** Tests for the undo/redo system. */
 
 import { describe, it, expect, beforeEach } from 'vitest';
+import { setRunMode } from '@modoki/engine/runtime';
 import { pushAction, undo, redo, canUndo, canRedo, undoLabel, redoLabel, clearHistory } from '@modoki/engine/editor';
 import { getCurrentWorld, spawnEntity } from '@modoki/engine/runtime';
 import { Transform, Renderable3D } from '@modoki/engine/runtime';
@@ -11,6 +12,9 @@ import { writeTraitFieldWithUndo, setActionCallback } from '@modoki/engine/edito
 
 registerAllTraits();
 setActionCallback(pushAction);
+
+// Undo/redo refuse outside the authoring mode (#1148), and the runtime defaults to 'playing'.
+beforeEach(() => { setRunMode('stopped'); });
 
 describe('undoManager', () => {
   beforeEach(() => clearHistory());

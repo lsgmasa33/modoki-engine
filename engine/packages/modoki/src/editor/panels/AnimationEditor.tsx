@@ -27,7 +27,8 @@ import {
   type AnimationClipDef, type AnimationTrack, type TrackValueType,
 } from '../../runtime/animation/types';
 import { useParkedAssetDoc } from './useParkedAssetDoc';
-import { pushAction, peekUndo, isExecutingUndoRedo, undo as gUndo, redo as gRedo, type UndoAction } from '../undo/undoManager';
+import { pushAction, peekUndo, isExecutingUndoRedo, type UndoAction } from '../undo/undoManager';
+import { runUndoCommand } from '../undo/undoCommand';
 import {
   setRecordHook, relativeEntityPath, encodeValue, upsertKey, findTrack, moveKeysInTime,
   trackKey, groupSelection, selRefsFromIds, resolveKeySelection, nextKeyTime,
@@ -1145,7 +1146,7 @@ export default function AnimationEditor() {
           onCopyKeys={copyKeys} canCopyKeys={selectedKeys.size > 0}
           onPasteKeys={pasteKeys} canPasteKeys={hasClipboard}
           onDuplicateKeys={duplicateSelectedKeys} canDuplicateKeys={selectedKeys.size > 0}
-          onUndo={() => gUndo()} onRedo={() => gRedo()}
+          onUndo={() => runUndoCommand('undo')} onRedo={() => runUndoCommand('redo')}
           inPreview={inPreview} onExitPreview={exitPreview}
           dirty={dirty} statusMsg={statusMsg}
         />

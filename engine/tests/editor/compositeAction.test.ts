@@ -6,6 +6,7 @@
  *  batch (it keeps only the FIRST action's undo and silently strands the rest). */
 
 import { describe, it, expect, beforeEach } from 'vitest';
+import { setRunMode } from '@modoki/engine/runtime';
 import {
   getCurrentWorld, getAllEntities, getTraitByName, readTraitData, findEntity,
   EntityAttributes, Transform, spawnEntity,
@@ -45,6 +46,9 @@ function tfX(id: number): number {
 function nameOf(id: number): string | undefined {
   return getAllEntities().find((e) => e.id === id)?.name;
 }
+
+// Undo/redo refuse outside the authoring mode (#1148), and the runtime defaults to 'playing'.
+beforeEach(() => { setRunMode('stopped'); });
 
 beforeEach(() => {
   clearHistory();
