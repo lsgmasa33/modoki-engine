@@ -41,8 +41,9 @@ function run() {
   return spawnSync(process.execPath, [path.join(repo, 'engine', 'scripts', 'bootstrap-game-deps.mjs')], { cwd: repo, env, encoding: 'utf8' });
 }
 
-/** The directories the fake npm was invoked in, one per call. */
-const npmCwds = () => (fs.existsSync(npmLog) ? fs.readFileSync(npmLog, 'utf8').split('\n').filter(Boolean) : []);
+/** The directories the fake npm was invoked in, one per call. Split on `\r?\n`: the `.cmd` twin's
+ *  `echo` writes CRLF, so a bare `\n` split leaves `free\r` on Windows. */
+const npmCwds = () => (fs.existsSync(npmLog) ? fs.readFileSync(npmLog, 'utf8').split(/\r?\n/).filter(Boolean) : []);
 
 beforeEach(() => {
   repo = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-bootstrap-claim-'));
