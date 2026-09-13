@@ -1197,7 +1197,8 @@ export function collectResourceRefsFromEntities(
     // AnimationLibrary — shared cross-model clips (P6), an ARRAY of .animset.json's.
     // Each animset's `source` GLB holds the actual clips; listing the animset keeps
     // both the animset file AND (via the tree-shaker's animset→source follow) the clip
-    // GLB in the build. The source GLB is loaded lazily by the render sync.
+    // GLB in the build. The source GLB is not listed here; `SceneManager`'s animset acquire
+    // loads it under the scene once the set is parsed (#1162).
     const animLib = entry.traits['AnimationLibrary'] as Record<string, unknown> | undefined;
     if (animLib && typeof animLib !== 'boolean') {
       const animSets = animLib.animSets;

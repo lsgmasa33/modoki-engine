@@ -196,14 +196,37 @@ through unchanged. See `runtime/loaders/assetManifest.ts` (`resolveRef`,
 | `.prefab.json` | `acquirePrefab` / `releasePrefab` | parsed prefab JSON |
 | HDR environment | `acquireEnvironment` / `releaseEnvironment` | `THREE.DataTexture` (IBL) |
 
-**Preloaded, not owned:** `.anim.json` clips. The `'animation'` acquire awaits
-`loadAnimationClipNow` before the swap (#1097) so a staged Animator is posed on the spawn frame
-instead of painting authored values until its fetch lands; the clip cache is plain data and is
-not refcounted per scene. (`.timeline.json` defs are ALSO loaded before the swap, but earlier and
-for a different reason: `collectSceneResourceRefs` awaits `loadTimelineNow` to walk their inner refs,
-so their acquire case is a no-op over an already-warm cache.) Every other lazily-read kind
-(`texture`, `particle`, `animset`, `spriteanim`, `rig2d`, `shader`) still returns without loading — see
-`docs/animation.md` § The three asset caches and #1162.
+**Preloaded, not owned: the lazily-cached asset DEFS** — `.anim.json` clips (#1097) and
+`.spriteanim.json`, `.rig2d.json`, `.animset.json`, `.particle.json` (#1162). Each has a per-frame
+consumer that SKIPS the entity while its def is null, so a def still in flight when the world went
+live painted the entity's authored state for as many frames as its fetch took. Each acquire case
+awaits its cache's `load…Now` (all five share `loaders/awaitLazyLoad.ts`) before the swap. The caches
+are plain data, not refcounted per scene, and never cleared in production (only the test-only
+`disposeAllCachedResources` clears them), so the window was the FIRST cold load of a def per session.
+
+| kind, cold, before the preload | measured (editor, local dev server) |
+|---|---|
+| Animator clip | Court's staged chrome at opacity 1 for 3 sim frames (`games/court/intro.md` § the pre-pose window) |
+| 2D rig (`skin-test` Zombie, from a scene without it) | rig def missing 1-2 frames (9-24 ms) after the swap, entity invisible for 2 |
+| animset + its source GLB (`3d-test` `skinned-test`, from `empty`) | set missing 2-3 frames, source GLB 3-4 frames (28-54 ms) |
+
+After: 0 frames for each, in 3 cold runs apiece. Flipbooks and particles are covered headlessly only
+(`engine/tests/ecs/assetDefPreload.test.ts`) — no corpus scene can show a flipbook's gap, because its
+authored sprite equals the clip's first frame.
+
+**The animset case also ACQUIRES the set's `source` GLB** under the loading scene. An
+`AnimationLibrary` merges its clips from that GLB, and the manifest walk does not list it (it lives
+inside the set), so without this a bare rig held its bind pose until the render sync's
+`lazyAcquireRiggedModel` fetched it after the swap.
+
+**What stays lazy, deliberately:** what a def points at in turn — flipbook frames, rig part textures,
+a particle's texture, and a particle's sub-emitter child effects (`subEmitters[].effect`, lazy-loaded
+by `cpuTslBackend`'s `tryBuildChild`, which drops a burst that fires before the child def arrives). 2D textures are never preloaded (`case 'texture'`), so after this a rig or a
+flipbook pops in exactly when a plain sprite does; a textured emitter still waits up to
+`TEXTURE_WAIT_BUDGET_MS`. Also lazy: `shader` (a Scene2D-owned cache the swap clears), `video`
+(streamed), and a prefab spawned by code the manifest never saw. (`.timeline.json` defs are loaded
+before the swap too, but earlier and for a different reason: `collectSceneResourceRefs` awaits
+`loadTimelineNow` to walk their inner refs, so their acquire case is a no-op over a warm cache.)
 
 `acquire*` adds the `sceneId` to the resource's owner set (kicking off the load
 on first owner); `release*` removes it and disposes the GPU resource only when

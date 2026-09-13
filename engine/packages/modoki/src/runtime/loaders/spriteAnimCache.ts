@@ -21,6 +21,7 @@ import { isGuid, registerAsset } from './assetManifest';
 import { emptyDocMap } from '../core/docKeys';
 import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
+import { awaitLazyLoad } from './awaitLazyLoad';
 import { defaultSpriteClip, type SpriteClip } from '../traits/SpriteAnimator';
 import { parseAssetJson } from './assetFetch';
 import { createTeardownToken } from '../core/liveness';
@@ -128,6 +129,18 @@ export function getSpriteAnim(ref: string, opts?: { load?: boolean }): SpriteAni
     loading.set(path, p);
   }
   return null;
+}
+
+/** Resolve a sprite-anim ref, AWAITING its load — the scene acquire's preload (#1162).
+ *  `spriteAnimationSystem` skips an entity while its set is null, so a set still in flight at the
+ *  swap paints the authored `Renderable2D.sprite` instead of the clip's frame. Contract:
+ *  {@link awaitLazyLoad}. */
+export function loadSpriteAnimNow(ref: string): Promise<SpriteAnimDef | null> {
+  return awaitLazyLoad(
+    () => getSpriteAnim(ref),
+    () => { const path = spriteAnimCacheKey(ref); return path ? loading.get(path) : undefined; },
+    () => getSpriteAnim(ref, { load: false }),
+  );
 }
 
 /** Resolve a single named clip within a sprite-anim set, or undefined if the set

@@ -12,6 +12,7 @@
 import { isGuid, registerAsset } from './assetManifest';
 import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
+import { awaitLazyLoad } from './awaitLazyLoad';
 import { normalizeRig2D, type Rig2DFile, type ParsedRig2D } from '../skinning/rig2dTypes';
 import { parseAssetJson } from './assetFetch';
 import { createTeardownToken } from '../core/liveness';
@@ -99,6 +100,19 @@ export function getRig2D(ref: string, opts?: { load?: boolean }): ParsedRig2D | 
     loading.set(path, p);
   }
   return null;
+}
+
+/** Resolve a rig ref, AWAITING its load — the scene acquire's preload (#1162). `skin2DSystem`
+ *  builds no skin buffer while the rig is null, and a `SkinnedSprite2D` has no `Renderable2D` to
+ *  fall back on, so a rig still in flight at the swap leaves the entity INVISIBLE (measured: 1-2
+ *  frames cold on a local dev server). Contract: {@link awaitLazyLoad}. The part textures stay
+ *  lazy, like every 2D texture. */
+export function loadRig2DNow(ref: string): Promise<ParsedRig2D | null> {
+  return awaitLazyLoad(
+    () => getRig2D(ref),
+    () => { const path = rig2dCacheKey(ref); return path ? loading.get(path) : undefined; },
+    () => getRig2D(ref, { load: false }),
+  );
 }
 
 /** The AUTHORED rig doc behind a cached rig — the file's own JSON (or the editor's live,

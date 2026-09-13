@@ -300,21 +300,23 @@ at time 0 and an externally-set `time` (scrubbing) resolves correctly even while
 null/undefined until it resolves (the per-frame driver simply retries next frame), resolves GUIDs
 through the asset manifest, and lets the editor seed/invalidate by path for live preview. A **failed**
 fetch is remembered and NOT retried at runtime — only `invalidate`/`clear` resets it. All three are
-plain DATA (nothing to GPU-dispose); `clear*Cache` bumps a generation so an in-flight load from a
-swapped-away scene is dropped.
+plain DATA (nothing to GPU-dispose); `clear*Cache` bumps a liveness token so an in-flight load is
+dropped. ⚠️ Nothing in production calls `clear*Cache` — only the test-only
+`disposeAllCachedResources` does — so these caches OUTLIVE a scene swap.
 
-⚠️ **`.anim.json` clips are ALSO preloaded before a scene goes live** (#1097) —
-`loadAnimationClipNow` awaits the lazy getter's own in-flight promise, and `SceneManager`'s
-`'animation'` acquire awaits it before the swap. The lazy shape alone is not enough for a keyframe
-Animator: `animationSystem` pushes NO pose for a null clip, so a clip still in flight when the world
-went live left every staged entity painting its AUTHORED values — a fade-in's target at opacity 1 —
-for as many frames as the fetch took (measured in Court: 3 sim frames cold, 0 warm;
+⚠️ **All three (and `rig2dCache`, `particleCache`) are ALSO preloaded before a scene goes live**
+(#1097, #1162). Each exports a `load…Now` built on `loaders/awaitLazyLoad.ts`, which awaits the lazy
+getter's own in-flight promise, and `SceneManager`'s acquire awaits it before the swap. The lazy
+shape alone is not enough: each consumer skips an entity whose def is null. For a keyframe Animator
+that left every staged entity painting its AUTHORED values — a fade-in's target at opacity 1 — for
+as many frames as the fetch took (measured in Court: 3 sim frames cold, 0 warm;
 `games/court/intro.md` § the pre-pose window). ⚠️ This is NOT a "frame after spawn" lag:
 ANIMATION (150) runs before PROJECTION (300) in the same pass, so a cached clip is posed on the
-spawn frame. Still lazy, and so still exposed: a prefab spawned by code that the scene manifest
-never listed, and a preload refused by a mid-flight invalidation (degrades to the old behaviour,
-never blocks the load). `animSetCache`/`spriteAnimCache` (and `rig2d`/`particle`) are NOT
-preloaded — the same gap, deliberately left open: #1162.
+spawn frame. The animset acquire also loads the set's `source` GLB, which a library merges clips
+from. Measurements for the other kinds and what stays lazy: [scene-loading.md](scene-loading.md),
+the "Preloaded, not owned" paragraph. Still lazy, and so still exposed: a prefab spawned by code that the scene
+manifest never listed, and a preload refused by a mid-flight invalidation (degrades to the old
+behaviour, never blocks the load).
 
 ## Gotchas
 

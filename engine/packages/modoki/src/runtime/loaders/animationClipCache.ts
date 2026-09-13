@@ -11,6 +11,7 @@ import { assetUrl } from './assetUrl';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import { normalizeAnimationClip, type AnimationClipDef } from '../animation/types';
 import { createTeardownToken } from '../core/liveness';
+import { awaitLazyLoad } from './awaitLazyLoad';
 
 const cache = new Map<string, AnimationClipDef>();
 const loading = new Map<string, Promise<void>>();
@@ -83,19 +84,14 @@ export function getAnimationClip(ref: string, opts?: { load?: boolean }): Animat
  *  AUTHORED values (a `UIElement` at opacity 1 behind an authored fade-in) until the fetch lands.
  *  Awaiting this before the swap is what makes the first projected frame already posed.
  *
- *  Rides the getter's own in-flight promise, so there is ONE fetch path and a preload racing a
- *  per-frame request never fetches twice. Never throws. Resolves null for an unknown/failed ref, and
- *  also when the load was refused by an invalidation mid-flight — deliberately no retry here (unlike
- *  `loadTimelineNow`): the lazy getter is still read every frame, so a refused preload degrades to
- *  exactly the pre-#1097 behaviour instead of blocking the scene. */
-export async function loadAnimationClipNow(ref: string): Promise<AnimationClipDef | null> {
-  const hit = getAnimationClip(ref);
-  if (hit) return hit;
-  const path = clipCacheKey(ref);
-  const inFlight = path ? loading.get(path) : undefined;
-  if (!inFlight) return null;
-  await inFlight;
-  return cache.get(path!) ?? null;
+ *  The contract (one fetch path, never throws, no retry — unlike `loadTimelineNow`) is
+ *  {@link awaitLazyLoad}'s, shared with the other def caches (#1162). */
+export function loadAnimationClipNow(ref: string): Promise<AnimationClipDef | null> {
+  return awaitLazyLoad(
+    () => getAnimationClip(ref),
+    () => { const path = clipCacheKey(ref); return path ? loading.get(path) : undefined; },
+    () => getAnimationClip(ref, { load: false }),
+  );
 }
 
 /** Directly seed/override a cached clip by path or GUID (editor live-preview + post-save). */

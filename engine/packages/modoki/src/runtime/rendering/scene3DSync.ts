@@ -2158,18 +2158,17 @@ export interface LibraryMergeDeps {
 // lazyAcquireRiggedModel (the field NAME, matching the scene-scoped acquire it defaults
 // to, #747 and #749's adversarial review): an AnimationLibrary's animSet source GLB has
 // no manifest/resources entry of its own (SCALAR_RESOURCE_TYPE_BY_FIELD only covers
-// SkinnedModel.model), so this is its ONLY acquire path — it now rides the current
-// scene's release instead of pinning forever under LAZY_OWNER. The field used to be
+// SkinnedModel.model). Since #1162 `SceneManager`'s animset acquire loads it under the
+// loading scene before the swap, so for a scene-listed library this is the FALLBACK — the
+// path a code-spawned rig takes — and it rides the current scene's release instead of
+// pinning forever under LAZY_OWNER. The field used to be
 // named `ensureRiggedModelLoaded` after the real (session-pinning) function it was
 // carrying at the time; that name outlived the swap to the scene-scoped default, so a
 // future caller wiring its own deps would naturally reach for `ensureRiggedModelLoaded`
 // by name and silently reinstate the pin #747 removed — renamed to close that trap.
-// Known, accepted cost: on a scene swap the model is released with the outgoing scene
-// and re-fetched by the next frame's render sync (a frame of pop-in), instead of staying
-// resident. Only one authored scene uses AnimationLibrary today
-// (games/3d-test/runtime/assets/scenes/skinned-test.scene.json); acquiring animSet
-// sources transitively at scene load is the documented follow-up if that pop-in ever
-// matters.
+// The pop-in this path used to cost on every cold load and swap (measured 3-4 frames on
+// games/3d-test skinned-test) is what the scene-load acquire removed: docs/scene-loading.md
+// § "Preloaded, not owned".
 const DEFAULT_LIBRARY_DEPS: LibraryMergeDeps = { getAnimSet, getRiggedModel, lazyAcquireRiggedModel, retargetClip };
 
 /** P6 — merge an `AnimationLibrary`'s clips into a rig's mixer: own clips ∪

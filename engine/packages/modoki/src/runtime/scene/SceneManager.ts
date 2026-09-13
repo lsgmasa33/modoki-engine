@@ -114,6 +114,10 @@ import { loadFontFamily, loadFontFamilyForRef } from '../loaders/fontLoader';
 import { registerAsset, isGuid, resolveGuidToPath, getAudioLoadType } from '../loaders/assetManifest';
 import { loadTimelineNow } from '../loaders/timelineCache';
 import { loadAnimationClipNow } from '../loaders/animationClipCache';
+import { loadParticleEffectNow } from '../loaders/particleCache';
+import { loadAnimSetNow } from '../loaders/animSetCache';
+import { loadSpriteAnimNow } from '../loaders/spriteAnimCache';
+import { loadRig2DNow } from '../loaders/rig2dCache';
 import { collectTimelineAudioRefs, collectTimelineControlRefs, collectTimelineVideoRefs } from '../timeline/types';
 import { ASSET_FETCH_INIT, parseAssetJson } from '../loaders/assetFetch';
 import { assetUrl } from '../loaders/assetUrl';
@@ -1961,6 +1965,7 @@ function snapshotPersistentEntities(world: World, keptBaseGuids: Set<string> = n
  *  the real work off the end of it. */
 const LOADING_RESOURCE_TYPES: ReadonlySet<string> = new Set([
   'model', 'riggedModel', 'mesh', 'material', 'prefab', 'font', 'environment', 'audio', 'animation',
+  'particle', 'animset', 'spriteanim', 'rig2d',
 ]);
 
 /** Per-resource boot spans (#238). The stall being hunted is per-project and bimodal, and the
@@ -1991,45 +1996,51 @@ async function acquireResourceInner(sceneId: SceneId, ref: SceneResourceRef): Pr
       // same as texture/particle.
       return;
     case 'prefab':   return acquirePrefab(sceneId, ref.path);
+    // ── Lazily-cached asset DEFS: PRELOADED (#1097, #1162) ──────────────────────────────
+    // Each kind below has a per-frame consumer that lazy-loads its def and SKIPS the entity while
+    // the def is null. Left to that alone, a def still in flight at the swap paints the entity's
+    // authored state for as many frames as its fetch takes (measured for Animator clips in
+    // games/court/intro.md § the pre-pose window, and for a 2D rig in docs/scene-loading.md).
+    // Awaiting it here, before the swap, makes the first frame already use it. The lazy getters
+    // stay as the fallback for a prefab spawned by code the manifest never saw. What they depend
+    // on in turn (flipbook frames, rig part textures, particle textures) stays lazy, like every 2D
+    // texture — only the animset's source GLB is acquired, because models are preloaded.
     case 'particle':
-      // `.particle.json` effects referenced by ParticleEmitter entities. The per-frame
-      // particle sync lazy-loads + caches the def via getParticleEffect (retrying until
-      // ready), so no preload is needed here. Listed as a resource so the build
-      // tree-shaker keeps the file; the acquire is a no-op (mirrors texture/font).
+      // `.particle.json` effects referenced by ParticleEmitter entities: no emitter until loaded.
+      await loadParticleEffectNow(ref.path);
       return;
     case 'animation':
-      // `.anim.json` clips referenced by Animator banks. PRELOADED, unlike the other lazily-read
-      // kinds around it (#1097): animationSystem poses nothing until its clip resolves, so a clip
-      // still in flight at the swap leaves every staged entity painting its AUTHORED values — a
-      // fade-in's target at opacity 1 — for as many frames as the fetch takes (measured:
-      // games/court/intro.md § the pre-pose window). Awaiting it here makes the first projected
-      // frame already posed. The lazy getter stays as the fallback for a prefab spawned by code
-      // the manifest never saw. The same gap for spriteanim/rig2d/animset/particle is #1162.
+      // `.anim.json` clips referenced by Animator banks: no pose until loaded (#1097).
       await loadAnimationClipNow(ref.path);
       return;
     case 'timeline':
       // `.timeline.json` sequences referenced by Director entities. Fetched above (the
       // transitive-ref walk) to pull out audio cues; the timelineSystem lazy-loads +
-      // caches the def via getTimeline (retrying until ready), so no preload is needed
-      // here. Listed as a resource for the build tree-shaker (mirrors particle).
+      // caches the def via getTimeline (retrying until ready), and the walk above already
+      // warmed that cache, so nothing is left to load here.
       return;
-    case 'animset':
-      // `.animset.json` per-clip params referenced by SkeletalAnimator entities.
-      // driveAnimator lazy-loads + caches the set via resolveAnimSetParams
-      // (retrying until ready), so no preload is needed. Listed as a resource for
-      // the build tree-shaker (mirrors particle).
+    case 'animset': {
+      // `.animset.json` per-clip params referenced by SkeletalAnimator.animSet and
+      // AnimationLibrary.animSets. Without it clips play at ANIMSET_DEFAULTS, and a library merges
+      // no clips — a bare rig holds its bind pose. A library ALSO needs the set's `source` GLB,
+      // which the manifest walk does not list, so acquire it here under this scene: the render
+      // sync's own `lazyAcquireRiggedModel(source)` would otherwise fetch it after the swap.
+      const set = await loadAnimSetNow(ref.path);
+      // `typeof`: `source` is passed through unchecked from the JSON, and a non-string one would
+      // throw inside the acquire and reject the whole scene load rather than just this rig.
+      if (typeof set?.source === 'string' && set.source) await acquireRiggedModel(sceneId, set.source);
       return;
+    }
     case 'spriteanim':
-      // `.spriteanim.json` flipbook clip sets referenced by SpriteAnimator.clipSet.
-      // spriteAnimationSystem lazy-loads + caches the set via activeSpriteClip
-      // (retrying until ready), so no preload is needed. Listed as a resource for
-      // the build tree-shaker (mirrors animset/particle).
+      // `.spriteanim.json` flipbook clip sets referenced by SpriteAnimator.clipSet: the authored
+      // sprite shows instead of the clip's frame until loaded.
+      await loadSpriteAnimNow(ref.path);
       return;
     case 'rig2d':
-      // `.rig2d.json` 2D skinning rigs referenced by SkinnedSprite2D.rig. skin2DSystem
-      // lazy-loads + caches the rig via getRig2D (retrying until ready), so no preload is
-      // needed. Listed as a resource for the build tree-shaker (mirrors spriteanim). Phase 1:
-      // not yet scene-scoped refcounted (nor is its texture) — a documented follow-up.
+      // `.rig2d.json` 2D skinning rigs referenced by SkinnedSprite2D.rig: no skin buffer, so the
+      // entity is INVISIBLE, until loaded. Not scene-scoped refcounted (nor is its texture) — a
+      // rig is plain data and its cache outlives the swap.
+      await loadRig2DNow(ref.path);
       return;
     case 'shader':
       // `.shader.json` 2D custom materials referenced by Renderable2D.material. Scene2D's

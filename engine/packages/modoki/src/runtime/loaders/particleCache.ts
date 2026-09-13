@@ -8,6 +8,7 @@
 import { isGuid, registerAsset } from './assetManifest';
 import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
+import { awaitLazyLoad } from './awaitLazyLoad';
 import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import { defaultParticleEffect, PARTICLE_FORMAT_VERSION, type ParticleEffectDef, type CollisionConfig } from '../particles/types';
 import { particleDefProvider } from '../particles/particleDefProvider';
@@ -195,6 +196,18 @@ export function getParticleEffect(ref: string, opts?: { load?: boolean }): Parti
     loading.set(path, p);
   }
   return null;
+}
+
+/** Resolve a `.particle.json` ref, AWAITING its load — the scene acquire's preload (#1162). The
+ *  particle syncs create no emitter while the def is null, so an effect still in flight at the
+ *  swap starts late. A textured effect still waits on its texture after this (the backends'
+ *  bounded hidden wait). Contract: {@link awaitLazyLoad}. */
+export function loadParticleEffectNow(ref: string): Promise<ParticleEffectDef | null> {
+  return awaitLazyLoad(
+    () => getParticleEffect(ref),
+    () => { const path = particleCacheKey(ref); return path ? loading.get(path) : undefined; },
+    () => getParticleEffect(ref, { load: false }),
+  );
 }
 
 /** Resolve an editor cache key. The cache is keyed by the resolved path; the

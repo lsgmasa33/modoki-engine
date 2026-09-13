@@ -8,8 +8,8 @@
  * An animset annotates the clips of a rigged GLB with per-clip playback defaults
  * (speed / loop / fadeDuration). The clips themselves still live in the model's
  * GLB (loaded via riggedModelCache); the animset only carries the params. Its
- * `source` (the GLB the clips belong to) is informational in P5 — P6's shared
- * clip library uses it to pull clips from a DIFFERENT GLB.
+ * `source` (the GLB the clips belong to) is what an `AnimationLibrary` pulls clips
+ * from — possibly a DIFFERENT GLB — and the scene acquire loads it (#1162).
  *
  * NOT to be confused with `.anim.json` (animationClipCache): that's transform-
  * track animation for the `Animator` trait; this is skeletal/bone animation for
@@ -19,6 +19,7 @@
 import { isGuid, registerAsset } from './assetManifest';
 import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
+import { awaitLazyLoad } from './awaitLazyLoad';
 import { parseAssetJson } from './assetFetch';
 import { createTeardownToken } from '../core/liveness';
 
@@ -35,7 +36,8 @@ export interface AnimSetClipDef {
 
 export interface AnimSetDef {
   id?: string;
-  /** GLB ref the clips belong to (GUID/path). Informational in P5. */
+  /** GLB ref the clips belong to (GUID/path). An AnimationLibrary merges clips from it, and the
+   *  scene acquire loads it before the swap (#1162). Passed through unchecked from the JSON. */
   source?: string;
   clips: AnimSetClipDef[];
 }
@@ -119,6 +121,18 @@ export function getAnimSet(ref: string, opts?: { load?: boolean }): AnimSetDef |
     loading.set(path, p);
   }
   return null;
+}
+
+/** Resolve an animset ref, AWAITING its load — the scene acquire's preload (#1162). A null set
+ *  plays its clips at `ANIMSET_DEFAULTS`, and an `AnimationLibrary` merges no clips from it, so a
+ *  bare rig driven by a library holds its bind pose. The acquire also loads the set's `source`
+ *  GLB, which this does not. Contract: {@link awaitLazyLoad}. */
+export function loadAnimSetNow(ref: string): Promise<AnimSetDef | null> {
+  return awaitLazyLoad(
+    () => getAnimSet(ref),
+    () => { const path = animSetCacheKey(ref); return path ? loading.get(path) : undefined; },
+    () => getAnimSet(ref, { load: false }),
+  );
 }
 
 /** Resolve the playback params for a named clip within an animset, with engine
