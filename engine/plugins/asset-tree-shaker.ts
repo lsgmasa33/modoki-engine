@@ -1475,8 +1475,8 @@ export function computeKeptAssets(
   // ⚠️ **`listAllShippableFiles` is a narrower population than what the build SHIPS, and the byte
   // totals must not inherit that.** It skips every extension outside `TYPEABLE_EXTS` — `.txt` by
   // name, and `.bin` by omission — while the scanner's copy loop iterates `kept` and ships them
-  // regardless. For wordweave that is 7.46 MB of a 8.63 MiB payload (`words-defs.bin` 5.07 MB,
-  // `words-dictionary.txt` 1.53 MB, the index 690 KB, the scores 173 KB) contributing ZERO to a
+  // regardless. For wordweave that is 10.70 MB of a 11.72 MiB payload (`words-defs.bin` 8.31 MB,
+  // `words-dictionary.txt` 1.53 MB, the index 691 KB, the scores 173 KB) contributing ZERO to a
   // figure printed as the build's asset size — so dropping all of it moved the summary line not at
   // all, and the honest reading of that was "the drop did nothing".
   //

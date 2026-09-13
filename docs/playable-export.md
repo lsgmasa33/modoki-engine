@@ -77,8 +77,10 @@ could. `asset-keep.json` was `{ keep?: string[] }`: inclusion-only and target-ag
 build of a project shipped the same asset set and the inliner embedded whatever survived.
 
 That is unfixable from the game side when the weight is data rather than pictures. Wordweave's word
-list, definitions blob and 333-level corpus come to **8.63 MiB — 1.73x the 5 MB cap before a byte of
-engine JS** — and they are fetched by PATH from game code, so they are reachable and cannot be
+list, definitions blob and 333-level corpus come to **11.72 MiB — 2.34x the 5 MiB cap before a byte of
+engine JS** (8.63 MiB / 1.73x until #983 gave each word up to three senses). ⚠️ Both ratios are
+MiB against MiB; quoting 11.72 MiB against a decimal 5 MB would read 2.46x and is not comparable
+to the 1.73x it replaced — and they are fetched by PATH from game code, so they are reachable and cannot be
 unreferenced either.
 
 ```jsonc
@@ -119,7 +121,7 @@ unreferenced either.
 **Reading the byte figures.** The build prints the kept/dropped totals, and until #934 they counted
 only the extensions `TYPEABLE_EXTS` classifies — `.txt` by name and `.bin` by omission contributed
 NOTHING, while the copy loop shipped them regardless. For a text-heavy game that was most of the
-payload (wordweave: 7.46 MB of 8.63 MiB), so dropping all of it moved the summary line not at all.
+payload (wordweave: 10.70 MB of 11.72 MiB), so dropping all of it moved the summary line not at all.
 The totals now count every kept and every target-dropped file. The orphan report and the per-type
 histograms deliberately still do not: they drive the editor's Clean Up Unused Assets dialog, and a
 word list has never been a candidate for deletion.

@@ -1734,7 +1734,7 @@ describe('asset-tree-shaker', () => {
    * ⚠️ **The mechanism exists because `keep` could not say "not on this target".** A playable build
    * has a hard 5 MB cap; the playable profile shrinks textures but drops nothing, and the inliner
    * then embeds whatever survives. So a game whose weight is TEXT — wordweave's word list,
-   * definitions blob and 333-level corpus come to 8.63 MiB, 1.73x the cap before a byte of engine JS
+   * definitions blob and 333-level corpus come to 11.72 MiB, 2.34x the cap before a byte of engine JS
    * — could not reach the cap by any amount of game-side work: those files are fetched by path from
    * game code, so unreferencing them is not available either.
    *
