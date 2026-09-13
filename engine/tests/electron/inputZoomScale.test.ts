@@ -56,6 +56,19 @@ describe('trusted input scales zoomed-CSS → DIP', () => {
     for (const e of m) { expect(e.x!).toBeGreaterThanOrEqual(20); expect(e.x!).toBeLessThanOrEqual(40); }
   });
 
+  it('drag moves stay on the same sub-pixel grid as the press: an axis the drag does not travel never moves (#1176)', async () => {
+    const { win, events } = fakeWindow(1.0954);
+    await drag(win, { x: 605.1185, y: 451.3283 }, { x: 625.1185, y: 451.3283 }, { steps: 4 });
+    const ys = moves(events).map((e) => e.y);
+    expect(new Set(ys).size).toBe(1);
+  });
+
+  it('captureGesture moves stay on the press grid too (#1176)', async () => {
+    const { win, events } = fakeWindow(1.0954);
+    await captureGesture(win, { from: { x: 605.1185, y: 451.3283 }, to: { x: 625.1185, y: 451.3283 }, steps: 4, sample: async () => null });
+    expect(new Set(moves(events).map((e) => e.y)).size).toBe(1);
+  });
+
   it('scroll scales the wheel target point (deltas are NOT scaled)', async () => {
     const { win, events } = fakeWindow(1.5);
     await scroll(win, 200, 100, 0, 120);

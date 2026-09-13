@@ -1303,13 +1303,13 @@ group math is a single pure module, `editor/scene/multiTransform.ts` (headless-u
   runtime id a hot-reload reassigns — the id only when there is no GUID or no live entity. Never read `.name` off a `findEntity` result: the name lives on the
   `EntityAttributes` trait, and `findEntity` infers `any`, so the read compiles and is always
   `undefined`. Every gizmo, 2D-drag and UI move/resize label read `Entity <id>` that way (#1138).
-- **A 2D drag must CAPTURE the pointer, because it commits in its canvas's `pointerup`** (#1161).
+- **A canvas drag must CAPTURE the pointer, because it ends in its element's `pointerup`** (#1161, #1176).
   The single gizmo, group and Collider2D-vertex drags all listen on the Canvas2D's chrome canvas,
   and all three push their undo entry (with the unsaved flag, and for a gizmo or group drag a
   `!transform`; a vertex drag's is `Edit Collider2D.points`) only in that canvas's `pointerup`. Without capture, a release past the canvas edge, over the toolbar or over
   another panel goes to whatever is under the cursor: the entity has moved, nothing can undo it,
   and the drag ref stays live, so a later hover with NO button held keeps dragging.
-  `bindDragPointerCapture` (`editor/panels/scene2DDragCapture.ts`) captures on a press that claimed
+  `bindDragPointerCapture` (`editor/panels/dragPointerCapture.ts`) captures on a press that claimed
   a drag, as the 3D gizmo always has. A lost capture for that same pointer while the drag is
   still live counts as the release. Per the spec that is the touch/pen `pointercancel` path, and it
   has not been observed live. A second pointer can neither steal the capture nor end the first
@@ -1318,6 +1318,24 @@ group math is a single pure module, `editor/scene/multiTransform.ts` (headless-u
   predicate, or that drag is uncaptured again. The routing is jsdom-unreachable. The automated check is
   the e2e `editor-scene-multiselect.spec.ts` (a single gizmo drag released past the canvas edge), and
   QA-SVIEW-0011 covers all three drag kinds live.
+  The Sprite and Nine-Slice slicer canvases bind the same helper through `useDragPointerCapture`
+  (#1176). They used to END a drag on `onMouseLeave` instead, which does commit, but at the last
+  in-canvas point, so an edge could never be overshot onto the sheet boundary. ⚠️ **Do not
+  "restore" a leave handler as a safety net.** Under capture a leave cannot end a live drag anyway:
+  measured on Electron, the sequence is `pointerup`, `lostpointercapture`, then
+  `pointerout`/`pointerleave`. That is also why `SkinCanvas` and sling's editors, which capture on
+  press, are unaffected by their own `onPointerLeave={onPointerUp}`. A press on a scroll viewport's
+  own scrollbar still reaches its `pointerdown`, so the slicers skip it with `pressIsOnScrollbar`
+  rather than capturing a scrollbar drag as an edit.
+  ⚠️ **In the running editor the GAME's `pointerSource` shadows a panel's capture.** It listens on
+  `window`, so it runs after React's root handler, and on any press that `isPointerBlocked` does not
+  claim it captures the press TARGET (`pointerSource.ts`, "Keep receiving moves…"). For the slicers
+  the target is the canvas, so the canvas ends up holding capture and the release still bubbles to
+  the viewport. Nothing breaks, but **no check that only watches the outcome can tell a panel's
+  capture from none**: measured 2026-09-14, deleting the Sprite Editor's `captureDrag` left an outside
+  release working. With the canvas's own `setPointerCapture` stubbed, the same deletion left the drag
+  live and a buttonless hover resized the slice to 43×43. QA-ASSET-0025 step 5c stubs it for that
+  reason.
 - **Selection state was already array-based** (`selectedEntityIds` + primary `selectedEntityId`) —
   this feature was purely SceneView-viewport wiring; the store, Inspector, Hierarchy, and selection
   undo already supported multi-select.
@@ -2590,6 +2608,22 @@ run of them coalesces into that one step via `panels/coalescedEdit.ts` — opene
 change and closed by an idle timer or by anything else that touches the history, **never by a
 focus event**, which does not fire in an unfocused window (#244; the class, and how to test it,
 is in [editor input](./editor-input.md)). See [Materials & Textures](./textures.md).
+
+**A resize moves each edge the grabbed handle OWNS by the pointer's travel since the press, clamped
+to the sheet** (`resizeSliceRect` in `panels/sliceDrag.ts`; the Nine-Slice guides use
+`dragNineSliceGuide` beside it) (#1176). It used to set the rect from the pointer's ABSOLUTE
+position against the opposite handle's point, which failed twice on an edge-to-edge sheet
+(`catvader_1`, 252×392, measured):
+- a side handle drove the axis it does not own: `e`'s opposite point is the mid-left edge, so a
+  horizontal `e` drag gave `{y: 195, h: 1}`;
+- a corner snapped to wherever the press landed, and every error pointed up-left. A far-edge
+  handle is published 0.72 CSS px inside its canvas (`clampHandleToOwner`), `MouseEvent.clientY`
+  is an integer, and Enact rounded its intermediate moves. So a purely horizontal `se` drag
+  shaved a bottom-row slice's height, `392 → 389`.
+Travel makes all of that irrelevant, because a drag that did not move on an axis cannot change it.
+The canvases read POINTER events (fractional) and keep the drag alive past the canvas (the capture
+bullet under SceneView above). The `move` drag always carried its grab offset. Live coverage:
+QA-ASSET-0025 steps 5 and 5b.
 
 > **A `.meta.json` write REPLACES the file — every writer must read-modify-write.**
 > `/api/write-meta` → `writeMetaSidecar` → `writeJsonAtomic(sidecarPath, committed)`: no merge with

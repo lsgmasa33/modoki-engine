@@ -20,6 +20,8 @@ import { SaveRefusedNotice } from './AssetLoadRefusedBanner';
 import { saveRefusalMessage, saveRefusalConsoleMessage, type SaveRefusal } from './saveRefusal';
 import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { registerHandleProvider, clampHandleToOwner, type InteractionHandle } from '../../runtime/rendering/interactionHandles';
+import { dragNineSliceGuide } from './sliceDrag';
+import { useDragPointerCapture, pressIsOnScrollbar } from './dragPointerCapture';
 
 export interface NineSliceBorder { l: number; r: number; t: number; b: number; }
 
@@ -51,7 +53,10 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
   const [edgeScale, setEdgeScale] = useState(1);   // edge render scale (CSS px per source px)
   const [zoom, setZoom] = useState(1);
   const [viewport, setViewport] = useState({ w: DEFAULT_VIEWPORT_W, h: DEFAULT_VIEWPORT_H });
-  const dragRef = useRef<Edge | null>(null);
+  /** The guide being dragged, with its inset and the pointer's image-space coordinate on that
+   *  guide's axis AT THE PRESS: the guide moves by the pointer's travel from there (#1176). Only the
+   *  dragged inset is snapshotted; the other three are read live on every move, as before. */
+  const dragRef = useRef<{ edge: Edge; startInset: number; press: number } | null>(null);
   const panRef = useRef<{ active: boolean; cx: number; cy: number; sl: number; st: number }>({ active: false, cx: 0, cy: 0, sl: 0, st: 0 });
   const pendingAnchorRef = useRef<{ ix: number; iy: number; vx: number; vy: number } | null>(null);
   // The whole-image sprite EXACTLY as it was when this modal opened (or `null` when the manifest
@@ -293,6 +298,8 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
   const onMouseDown = (e: React.MouseEvent) => {
     const canvas = canvasRef.current, scroll = scrollRef.current;
     if (!canvas || !imgDims) return;
+    // A press on the viewport's own scrollbar is scrolling, not an edit, and must not be captured.
+    if (scroll && pressIsOnScrollbar(scroll, e.clientX, e.clientY)) return;
     if ((e.button === 2 || e.altKey) && scroll) {
       e.preventDefault();
       panRef.current = { active: true, cx: e.clientX, cy: e.clientY, sl: scroll.scrollLeft, st: scroll.scrollTop };
@@ -308,7 +315,10 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
       const d = (edge === 'l' || edge === 'r') ? Math.abs(gc - px) : Math.abs(gc - py);
       if (d < bestDist) { bestDist = d; best = edge; }
     }
-    if (best) dragRef.current = best;
+    if (best) {
+      const ip = screenToImg(px, py);
+      dragRef.current = { edge: best, startInset: border[best], press: best === 'l' || best === 'r' ? ip.x : ip.y };
+    }
   };
 
   const onMouseMove = (e: React.MouseEvent) => {
@@ -317,23 +327,18 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
       if (scroll) { scroll.scrollLeft = p.sl - (e.clientX - p.cx); scroll.scrollTop = p.st - (e.clientY - p.cy); }
       return;
     }
-    const edge = dragRef.current;
-    if (!edge || !imgDims) return;
+    const drag = dragRef.current;
+    if (!drag || !imgDims) return;
     const canvas = canvasRef.current!;
     const rect = canvas.getBoundingClientRect();
     const ip = screenToImg(e.clientX - rect.left, e.clientY - rect.top);
-    setBorder((prev) => {
-      const ix = Math.round(clamp(ip.x, 0, imgDims.w)), iy = Math.round(clamp(ip.y, 0, imgDims.h));
-      switch (edge) {
-        case 'l': return { ...prev, l: clamp(ix, 0, imgDims.w - prev.r - 1) };
-        case 'r': return { ...prev, r: clamp(imgDims.w - ix, 0, imgDims.w - prev.l - 1) };
-        case 't': return { ...prev, t: clamp(iy, 0, imgDims.h - prev.b - 1) };
-        case 'b': return { ...prev, b: clamp(imgDims.h - iy, 0, imgDims.h - prev.t - 1) };
-      }
-    });
+    const pointer = drag.edge === 'l' || drag.edge === 'r' ? ip.x : ip.y;
+    setBorder((prev) => dragNineSliceGuide({ ...prev, [drag.edge]: drag.startInset }, drag.edge, drag.press, pointer, imgDims));
   };
 
   const onMouseUp = () => { panRef.current.active = false; dragRef.current = null; };
+  // #1176: the drag lives until its own release, wherever that lands; see SpriteEditor's twin.
+  const captureDrag = useDragPointerCapture(scrollRef, () => panRef.current.active || !!dragRef.current, onMouseUp);
 
   const setEdge = (edge: Edge, v: number) => setBorder((prev) => {
     if (!imgDims) return { ...prev, [edge]: Math.max(0, v) };
@@ -450,7 +455,8 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
             </div>
             <div
               ref={scrollRef}
-              onMouseDown={onMouseDown} onMouseMove={onMouseMove} onMouseUp={onMouseUp} onMouseLeave={onMouseUp}
+              onPointerDown={(e) => { if (!e.isPrimary) return; onMouseDown(e); captureDrag(e.nativeEvent); }}
+              onPointerMove={(e) => { if (e.isPrimary) onMouseMove(e); }} onPointerUp={(e) => { if (e.isPrimary) onMouseUp(); }}
               onContextMenu={(e) => e.preventDefault()}
               style={{ flex: 1, minHeight: 0, overflow: 'auto', background: '#15151f', border: '1px solid #444' }}
             >

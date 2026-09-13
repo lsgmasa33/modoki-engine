@@ -30,14 +30,16 @@ import { markScene2DDirty } from '../../runtime/rendering/Scene2D';
 import { registerHandleProvider, clampHandleToOwner, type InteractionHandle } from '../../runtime/rendering/interactionHandles';
 import { createCoalescedEdit, type CoalescedEdit } from './coalescedEdit';
 import { BufferedNumberInput } from './fields';
+import { resizeSliceRect, type Handle } from './sliceDrag';
+import { useDragPointerCapture, pressIsOnScrollbar } from './dragPointerCapture';
 
 type DragMode =
   | { kind: 'none' }
   | { kind: 'create'; startX: number; startY: number }
   | { kind: 'move'; guid: string; offX: number; offY: number }
-  | { kind: 'resize'; guid: string; handle: Handle; fixedX: number; fixedY: number };
+  | { kind: 'resize'; guid: string; handle: Handle; startRect: SpriteRect; press: { x: number; y: number } };
 
-export type Handle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
+export type { Handle };
 const HANDLES: Handle[] = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'];
 
 const DEFAULT_VIEWPORT_W = 720;
@@ -475,6 +477,8 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     const canvas = canvasRef.current;
     const scroll = scrollRef.current;
     if (!canvas || !imgDims) return;
+    // A press on the viewport's own scrollbar is scrolling, not an edit, and must not be captured.
+    if (scroll && pressIsOnScrollbar(scroll, e.clientX, e.clientY)) return;
     // Right button (or Alt-modified) = pan by scrolling the viewport, regardless of rect state.
     if ((e.button === 2 || e.altKey) && scroll) {
       e.preventDefault();
@@ -495,8 +499,9 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
       for (const hd of HANDLES) {
         const hp = imgToScreen(...tuple(handlePos(sel.rect, hd)));
         if (Math.abs(hp.x - px) <= HANDLE_HIT && Math.abs(hp.y - py) <= HANDLE_HIT) {
-          const opp = handlePos(sel.rect, opposite(hd));
-          dragRef.current = { kind: 'resize', guid: sel.guid, handle: hd, fixedX: opp.x, fixedY: opp.y };
+          // The press point, not the handle's position: the edge moves by the pointer's travel
+          // from HERE, so where inside the grab tolerance the press landed changes nothing (#1176).
+          dragRef.current = { kind: 'resize', guid: sel.guid, handle: hd, startRect: { ...sel.rect }, press: screenToImg(px, py) };
           return;
         }
       }
@@ -544,7 +549,7 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     } else if (drag.kind === 'resize') {
       setSprites((prev) => prev.map((s) => {
         if (s.guid !== drag.guid) return s;
-        return { ...s, rect: roundRect(rectFromPoints(drag.fixedX, drag.fixedY, ix, iy)) };
+        return { ...s, rect: resizeSliceRect(drag.startRect, drag.handle, drag.press, ip, imgDims) };
       }));
     }
   };
@@ -594,6 +599,18 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
       }
     }
   };
+
+  // #1176: the drag lives until its own release, wherever that lands. Ending it on leave kept an
+  // edge from ever being overshot onto the sheet boundary. Pointer events, not mouse events,
+  // also because `MouseEvent.clientX/Y` are integers: floored, they shaved right/bottom edges.
+  // The canvas props take the PRIMARY pointer only, so a SECOND TOUCH neither starts, moves nor
+  // ends the drag. `isPrimary` is per pointer type, so a pen landing during a mouse drag is still
+  // primary and is not filtered. Not observed live; no touch device here.
+  const captureDrag = useDragPointerCapture(
+    scrollRef,
+    () => panRef.current.active || dragRef.current.kind !== 'none',
+    onMouseUp,
+  );
 
   // ── Selected-sprite field edits ──
   const patchSelected = (patch: Partial<SpriteSlice> | { rect?: Partial<SpriteRect>; pivot?: Partial<SpriteSlice['pivot']> }) => {
@@ -733,7 +750,8 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
             </div>
             <div
               ref={scrollRef}
-              onMouseDown={onMouseDown} onMouseMove={onMouseMove} onMouseUp={onMouseUp} onMouseLeave={onMouseUp}
+              onPointerDown={(e) => { if (!e.isPrimary) return; onMouseDown(e); captureDrag(e.nativeEvent); }}
+              onPointerMove={(e) => { if (e.isPrimary) onMouseMove(e); }} onPointerUp={(e) => { if (e.isPrimary) onMouseUp(); }}
               onContextMenu={(e) => e.preventDefault()}
               style={{ flex: 1, minHeight: 0, overflow: 'auto', background: '#15151f', border: '1px solid #444' }}
             >
@@ -837,10 +855,6 @@ export function handlePos(r: SpriteRect, h: Handle): { x: number; y: number } {
     case 'sw': return { x: r.x, y: r.y + r.h };
     case 'w': return { x: r.x, y: midY };
   }
-}
-export function opposite(h: Handle): Handle {
-  const map: Record<Handle, Handle> = { nw: 'se', n: 's', ne: 'sw', e: 'w', se: 'nw', s: 'n', sw: 'ne', w: 'e' };
-  return map[h];
 }
 export function upsertPreview(prev: SpriteSlice[], guid: string, rect: SpriteRect): SpriteSlice[] {
   const rest = prev.filter((s) => s.guid !== guid);

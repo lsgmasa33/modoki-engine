@@ -969,6 +969,11 @@ The MCP is **parity-plus** with chrome-devtools for the editor, and better on tw
   now take `button` (`right`→context menu, `middle`→orbit-pan), `clickCount` (`2`→double-click), and
   `modifiers` (`shift`/`meta`→multi-select, snap). Full raw-input siblings — `modoki_hover`,
   `modoki_scroll`, `modoki_press_key`, `modoki_dnd` — and the aimed-drag layer are under **Enact** below.
+  - **A drag's intermediate moves are on the SAME sub-pixel grid as its press and release** (#1176).
+    `drag()` and `captureGesture()` used to `Math.round` every move while the mousedown/mouseup
+    stayed fractional, so a drag with `dy: 0` travelled up to half a DIP on its first move. A canvas
+    editor that moves an edge by the pointer's travel reads that as real movement: a horizontal
+    Sprite Editor resize lost 1 px of height at zoom 1.0954. Pinned by `inputZoomScale.test.ts`.
   - **A drag's `modifiers` are genuinely HELD, not just a bit on the mouse events.** `drag()`
     presses each one as a real `keyDown` right after the mousedown and releases it after the
     mouseup, so the key is down across every intermediate move. The distinction is load-bearing:

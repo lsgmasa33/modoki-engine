@@ -7,7 +7,7 @@
  *  The routing itself is covered live (qa/cases/sceneview/gizmo2d-drag-released-off-canvas-commits.md). */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { bindDragPointerCapture } from '../../src/editor/panels/scene2DDragCapture';
+import { bindDragPointerCapture, pressIsOnScrollbar } from '../../src/editor/panels/dragPointerCapture';
 
 let el: HTMLElement;
 let capture: ReturnType<typeof vi.fn>;
@@ -101,5 +101,30 @@ describe('bindDragPointerCapture (#1161)', () => {
     b.dispose();
     loseCapture(7);
     expect(finish).not.toHaveBeenCalled();
+  });
+});
+
+describe('pressIsOnScrollbar (#1176)', () => {
+  /** The slicer viewport as measured live: a 720×552 border box at (245,172), 1 px border, a
+   *  horizontal scrollbar under 718×537 of content (zoomed in on a wide sheet). */
+  function viewport(clientWidth = 718, clientHeight = 537): HTMLElement {
+    const v = document.createElement('div');
+    v.getBoundingClientRect = () => ({ left: 245, top: 172, right: 965, bottom: 724, width: 720, height: 552, x: 245, y: 172, toJSON: () => ({}) });
+    Object.defineProperty(v, 'clientLeft', { value: 1 });
+    Object.defineProperty(v, 'clientTop', { value: 1 });
+    Object.defineProperty(v, 'clientWidth', { value: clientWidth });
+    Object.defineProperty(v, 'clientHeight', { value: clientHeight });
+    return v;
+  }
+
+  it('a press on the horizontal scrollbar is not an edit; the content just above it is', () => {
+    // The live scrollbar drag pressed at (600,717), which reached the drag handler and cleared the selection.
+    expect(pressIsOnScrollbar(viewport(), 600, 717)).toBe(true);
+    expect(pressIsOnScrollbar(viewport(), 600, 709)).toBe(false);
+  });
+
+  it('a press on a vertical scrollbar is not an edit either', () => {
+    expect(pressIsOnScrollbar(viewport(705, 550), 955, 400)).toBe(true);
+    expect(pressIsOnScrollbar(viewport(705, 550), 945, 400)).toBe(false);
   });
 });

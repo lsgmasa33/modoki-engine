@@ -555,8 +555,12 @@ export async function drag(
   await sleep(16);
   for (let i = 1; i <= n; i++) {
     const t = i / n;
-    const x = Math.round(from.x + (to.x - from.x) * t);
-    const y = Math.round(from.y + (to.y - from.y) * t);
+    // NOT rounded: mouseDown/mouseUp carry fractional coordinates, so whole-px moves put the
+    // press and the moves on different grids. A drag with dy:0 then travelled 0.37 CSS px on its
+    // first move, which a canvas editor reads as real travel (#1176: a horizontal slice resize
+    // lost 1 px of height at zoom 1.0954). captureGesture below keeps the same grid for the same reason.
+    const x = from.x + (to.x - from.x) * t;
+    const y = from.y + (to.y - from.y) * t;
     wc.sendInputEvent({ type: 'mouseMove', x, y, button, modifiers: heldModifiers } as unknown as Electron.MouseInputEvent);
     await sleep(16);
   }
@@ -1115,8 +1119,9 @@ export async function captureGesture(
   await sleep(16);
   for (let i = 1; i <= n; i++) {
     const t = i / n;
-    const x = Math.round(from.x + (to.x - from.x) * t);
-    const y = Math.round(from.y + (to.y - from.y) * t);
+    // Unrounded, like drag(): the press and release are fractional, so the moves must be too.
+    const x = from.x + (to.x - from.x) * t;
+    const y = from.y + (to.y - from.y) * t;
     send('mouseMove', x, y, { button: 'left' });
     await sleep(16);
     frames.push({ t, x, y, sample: await opts.sample().catch(() => null) });

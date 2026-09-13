@@ -7,7 +7,7 @@
 
 import { describe, it, expect } from 'vitest';
 import {
-  baseName, clamp, rectFromPoints, roundRect, handlePos, opposite, upsertPreview,
+  baseName, clamp, rectFromPoints, roundRect, handlePos, upsertPreview,
   type Handle,
 } from '../../src/editor/panels/SpriteEditor';
 import type { SpriteRect, SpriteSlice } from '../../src/runtime/loaders/spriteSheet';
@@ -105,28 +105,6 @@ describe('handlePos — where each resize handle sits', () => {
     const z = R(5, 5, 0, 0);
     const all: Handle[] = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'];
     for (const h of all) expect(handlePos(z, h)).toEqual({ x: 5, y: 5 });
-  });
-});
-
-describe('opposite — the anchor a resize drags against', () => {
-  it('maps every handle to its diagonal or facing partner', () => {
-    const pairs: [Handle, Handle][] = [['nw', 'se'], ['n', 's'], ['ne', 'sw'], ['e', 'w']];
-    for (const [a, b] of pairs) {
-      expect(opposite(a)).toBe(b);
-      expect(opposite(b)).toBe(a);
-    }
-  });
-
-  it('is an involution for every handle — opposite(opposite(h)) === h', () => {
-    // If this ever failed, resizing from one handle would anchor against the wrong
-    // corner and the rect would drift across the texture.
-    const all: Handle[] = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'];
-    for (const h of all) expect(opposite(opposite(h))).toBe(h);
-  });
-
-  it('never maps a handle to itself', () => {
-    const all: Handle[] = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'];
-    for (const h of all) expect(opposite(h)).not.toBe(h);
   });
 });
 

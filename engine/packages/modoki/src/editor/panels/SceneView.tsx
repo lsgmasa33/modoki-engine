@@ -133,7 +133,7 @@ import { mark2DDirty, get2DDirtyVersion, ensureCanvas2DListeners } from '../stor
 import { Canvas2DMount } from '../../runtime/rendering/Canvas2DMount';
 import { editorCanvas2DPool, editorScene2DRenderer, editorMarkScene2DDirty } from '../rendering/editorScene2D';
 import { loadSceneViewPrefs, saveSceneViewPrefs, type SceneViewLayers } from './sceneViewPrefs';
-import { bindDragPointerCapture } from './scene2DDragCapture';
+import { bindDragPointerCapture } from './dragPointerCapture';
 
 // Bridge so the 2D Canvas overlay can raycast-pick 2.5D billboards. A billboard renders as a
 // THREE mesh via the game camera in BOTH 3D and 2D mode, so its screen position is a 3D
@@ -1816,7 +1816,7 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
     }
 
     // #1161: capture the pointer once a press claims a drag, so the release that commits it
-    // reaches this canvas wherever it lands — see scene2DDragCapture.ts.
+    // reaches this canvas wherever it lands — see dragPointerCapture.ts.
     const dragCapture = bindDragPointerCapture(
       container,
       () => !!(dragRef.current || groupDragRef.current || vertexDragRef.current),

@@ -190,7 +190,7 @@ test.describe('2D viewport group gizmo drag', () => {
 
   /** #1161 — every 2D drag COMMITS in the pick canvas's pointerup. Without pointer capture a
    *  release off that canvas never reached it: no undo entry, and the drag stayed live, so a
-   *  buttonless move back over the canvas kept dragging. `scene2DDragCapture.test.ts` can only
+   *  buttonless move back over the canvas kept dragging. `dragPointerCapture.test.ts` can only
    *  pin the helper (jsdom does not route by capture); this is the spec that fails when the
    *  SceneView WIRING is wrong: the capture call dropped, or run before the press handler. It
    *  drags ONE entity, so only `dragRef` is exercised; dropping `groupDragRef`/`vertexDragRef`
