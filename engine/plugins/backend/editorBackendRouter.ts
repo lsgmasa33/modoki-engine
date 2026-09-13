@@ -246,6 +246,7 @@ import type { TreeShakeResult, RefEdgeEnumeration } from '../asset-tree-shaker';
 import { buildRefGraph, resolveTarget, findReferences, type FindReferencesResponse } from '../assetRefGraph';
 // The ONE 'same directory / inside it?' comparison (#869, #881) — see engine/scripts/pathIdentity.mjs.
 import { isUnderOrSame, samePath } from '../../scripts/pathIdentity.mjs';
+import type { ModuleUrlResolution, ModuleUrlError } from './moduleUrl';
 
 /** Minimal shape of a manifest entry the router needs (structurally compatible
  *  with the scanner's AssetEntry — avoids an import cycle with the host). */
@@ -309,6 +310,11 @@ export interface BackendContext {
    *  state and must say nothing rather than claim `null` — "not applicable here" and "nothing is
    *  held" are different answers. */
   getHeldPointer?(): { button: string; x: number; y: number; heldMs: number } | null;
+  /** The URL that reaches the running app's OWN instance of a module, from Vite's module graph
+   *  (#1155 — see `moduleUrl.ts`). The Vite host reads its graph; Electron main has none and
+   *  forwards to the child Vite that serves the renderer. Optional: a host with no route to a
+   *  graph omits it, and `/api/module-url` says so instead of guessing a URL. */
+  resolveModuleUrl?(spec: string): Promise<ModuleUrlResolution | ModuleUrlError>;
 }
 
 /** What a handler returns. The host serializes it onto its response object. */
@@ -2020,6 +2026,23 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     // envelope reaches the top level of the response body where a client would read it as one.
     try { return json({ result: await ctx.requestBrowser('eval', { code: b.code, timeoutMs: opTimeout }, relayTimeoutMs) }); }
     catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, relayFailureStatus(e)); }
+  }
+
+  // ── GET /api/module-url (M) ── the URL that reaches the app's own instance of a module (#1155).
+  // Consumed by `modoki.import()` inside an eval and by `modoki_eval`'s second-instance warning;
+  // no tool of its own. A spec that names no file is the caller's error (400); a host with no
+  // module graph is not (503), and it must not answer with a derived URL it cannot vouch for. A
+  // forwarded failure keeps the status its host gave it (`ModuleUrlError.status`).
+  if (urlPath === '/api/module-url' && method === 'GET') {
+    const spec = query.get('path');
+    if (!spec) return json({ error: 'path (query) required — a file path or module URL' }, 400);
+    if (!ctx.resolveModuleUrl) return json({ error: 'this backend host has no Vite module graph to read' }, 503);
+    try {
+      const r = await ctx.resolveModuleUrl(spec);
+      return 'error' in r ? json({ error: r.error }, r.status ?? 400) : json(r);
+    } catch (e) {
+      return json({ error: `module graph unreachable: ${e instanceof Error ? e.message : String(e)}` }, 502);
+    }
   }
 
   // ── GET /api/eval-api (M→R) ── discovery: the generated `modoki` scripting surface eval code
@@ -4835,6 +4858,22 @@ async function describeUnresolvedAgainstLiveWorld(
     if (query.get('merged') === '1' || query.get('merged') === 'true') params.merged = true;
     if (query.get('clear') === '1' || query.get('clear') === 'true') params.clear = true;
     return relayJson(ctx, 'editor-journal', params);
+  }
+
+  // ── POST /api/wait-for {chrome|entity|console|editor, timeoutMs} (M→R) ── #1154: park in the
+  // RENDERER until a condition holds (`app/debug/waitFor.ts`). POST because a condition is a nested
+  // object. A timeout is a NORMAL 200 (`{satisfied:false, timedOut:true, lastObservation}`); an
+  // unevaluable condition is the op's refusal, before it parks. The body is forwarded whole so the
+  // op — not this relay — owns validation, and a field added there cannot be dropped here.
+  //
+  // The relay deadline must clear the op's own, exactly as /api/wait-for-edit below: the clamp
+  // (WAIT_FOR_DEFAULT_MS 5000, [50, 120000] in waitFor.ts) is restated, not imported — plugins/
+  // cannot import app/.
+  if (urlPath === '/api/wait-for' && method === 'POST') {
+    const b = (body ?? {}) as Record<string, unknown>;
+    const t = typeof b.timeoutMs === 'number' && Number.isFinite(b.timeoutMs) ? b.timeoutMs : 5000;
+    const opTimeout = Math.max(50, Math.min(120_000, Math.floor(t)));
+    return relayJson(ctx, 'wait-for', b, opTimeout + 10_000);
   }
 
   // ── GET /api/wait-for-edit[?type=&source=&since=&timeoutMs=] (M→R) ── #28: the long-poll

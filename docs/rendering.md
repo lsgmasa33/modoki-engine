@@ -2778,7 +2778,8 @@ everything else — and both were overtaken:
   ⚠️ **STILL true, and still the rule: not verifiable in the editor.** The seam is in `App.tsx`'s
   `GameShell`, which the editor does not mount. An attempt to read the live tier through CDP
   returned `null`, and that reading is UNTRUSTWORTHY — the `/@fs/` import produced a second module
-  instance (its `tiers` came back `[]`), so it reported a fresh module's state, not the app's.
+  instance (its `tiers` came back `[]`), so it reported a fresh module's state, not the app's
+  (mechanism, and `modoki.import`: [debug-tools-mcp.md](debug-tools-mcp.md) § "Second module instance").
   **Verify on a device build, or via the web build served at `/`.**
 
   ⚠️ **iOS console logs do NOT reach `idevicesyslog` or `log stream`** — a WKWebView's
@@ -4959,7 +4960,9 @@ reached by walking the prototype chain from a live sprite off `window.__2d.getAp
 registering an `onWorldSwap` listener from
 `window.__MODOKI_SHARED__.modules['@modoki/engine/runtime']`, giving an ordered timeline of swap
 vs destroy. ⚠️ **Do not reach for a `/@fs` import here**: it yields a SECOND copy of the module, whose
-prototypes the app never touches, and the probe then measures nothing while looking healthy. Note the
+prototypes the app never touches, and the probe then measures nothing while looking healthy
+([debug-tools-mcp.md](debug-tools-mcp.md) § "Second module instance"; `modoki.import` reaches the
+app's copy). Note the
 bundled class is `_TextureSource`, not `TextureSource`.
 
 #### Incident: the engine destroying its own GPU context (#213, closed 2026-08-13)

@@ -8,7 +8,7 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
-import { ALLOW_OCCLUDED_BASE, MODIFIERS_BASE, allowOccludedParam, makeEntitySpec, makeLabelAimParam, makeWithinParam, modifierEnum, makePointSpec } from '../shapes.js';
+import { ALLOW_OCCLUDED_BASE, MODIFIERS_BASE, TIMEOUT_MS_BASE, allowOccludedParam, makeEntitySpec, makeLabelAimParam, makeWithinParam, modifierEnum, makePointSpec } from '../shapes.js';
 import { KEY_ARG_DESCRIPTION, MOUSE_BUTTONS, POINTER_ACTIONS } from '../../../shared/inputVocabulary.js';
 
 export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
@@ -173,11 +173,13 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       '— a bare `window` or DOM node serializes poorly). A thrown error is reported as a tool error. ' +
       '`await` is allowed (the body is an async function), so several promise-returning modoki.* ops ' +
       'compose in ONE call; an un-awaited promise nested in the result reports itself rather than ' +
-      'serializing to {}. Requires the Electron editor.',
+      'serializing to {}. A literal import(\'/@fs/…\') of an ENGINE file, or any ?query variant, ' +
+      'loads a SECOND module instance whose state the app never sees — use `await modoki.import(path)`; ' +
+      'the result warns when an import misses the app\'s instance. Requires the Electron editor.',
     {
       code: z.string().describe('JavaScript to run in the editor renderer. Use `return` for a value.'),
       timeoutMs: z.number().int().positive().optional().describe(
-        'How long the body may run before it is abandoned. Default 5000, max 25000 (clamped, not ' +
+        `${TIMEOUT_MS_BASE} — the body is abandoned then. Default 5000, max 25000 (clamped, not ` +
         'refused). Raise it when the code awaits something slow — e.g. modoki.waitForEdit(), which ' +
         'parks by design and could never outlive the old fixed budget. The device twin caps LOWER ' +
         '(4500): its TCP transport has a fixed 5s per-request deadline it cannot exceed.',

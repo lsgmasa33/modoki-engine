@@ -8,7 +8,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { spawn, execFileSync } from 'child_process';
 import crypto, { randomUUID } from 'crypto';
-import type { Plugin } from 'vite';
+import { normalizePath, type Plugin } from 'vite';
+import { resolveModuleUrl } from './backend/moduleUrl';
 import { computeKeptAssets, enumerateRefEdges, formatBytes } from './asset-tree-shaker';
 import { assertNoConversionFallback, type ConversionFailure } from './asset-conversion-strict';
 import { loadProjectConfig, loadProjectUserConfig, projectBuildConfigErrors } from './load-project-config';
@@ -17,7 +18,7 @@ import { resolveModules } from './detect-modules';
 import { findGamesEntry } from './findGamesEntry';
 // The leaf module, not './subgameBuild': that file's shared-key list would reach the Electron main bundle (#1035).
 import { subgameOutDir } from './subgameOutDir';
-import { samePath } from '../scripts/pathIdentity.mjs';
+import { samePath, canonicalPath } from '../scripts/pathIdentity.mjs';
 import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN } from './backend/gcloud';
 import { projectAssetRoots, discoverProjects, PROJECT_ROOT_DIRS } from '../scripts/projectRoots.mjs';
 import { listAndroidDevices, resolveBuildAndroidSerial } from './backend/androidDevices';
@@ -2088,6 +2089,21 @@ export function assetScannerPlugin(): Plugin {
             },
             computeUnused: () => computeKeptAssets(projectRoot, assetRoots),
             computeRefEdges: () => enumerateRefEdges(projectRoot, assetRoots),
+            // #1155: the CLIENT environment's graph — the one whose URLs the renderer imported.
+            resolveModuleUrl: async (spec) => resolveModuleUrl(spec, {
+              // Vite's OWN root, not a re-derived one: on Windows Vite resolves it with the JS
+              // realpath (and maps a network share back to its drive letter).
+              viteRoot: server.config.root,
+              repoRoot: editorRoot,
+              // `canonicalPath` (`.native`) for the file: the JS realpath keeps the case a caller
+              // TYPED, so `/users/…/world.ts` missed the graph's `/Users/…` key (#881's rule).
+              // ⚠️ Windows unverified: on a mapped/subst drive Vite may key the graph by the mapped
+              // spelling `.native` unmaps, which would read as inGraph:false (docs/windows.md).
+              modulesByFile: (file) => server.environments.client.moduleGraph.getModulesByFile(normalizePath(file)),
+              browserHash: () => server.environments.client.depsOptimizer?.metadata.browserHash,
+              exists: (file) => fs.existsSync(file),
+              realpath: (file) => canonicalPath(file),
+            }),
           };
           // Read the request body (empty for GET) before dispatch.
           let raw = '';

@@ -247,6 +247,59 @@ describe('/api/eval', () => {
   });
 });
 
+describe('/api/wait-for (#1154)', () => {
+  it('forwards the body whole, and sizes the relay deadline past the op\'s own clamped park', async () => {
+    const requestBrowser = vi.fn(async () => ({ satisfied: true, elapsedMs: 3 }));
+    const body = { chrome: { label: 'OK' }, timeoutMs: 20_000 };
+    const r = (await post('/api/wait-for', body, makeCtx({ requestBrowser }))) as { body: unknown };
+    expect(requestBrowser).toHaveBeenCalledWith('wait-for', body, 30_000);
+    expect(r.body).toEqual({ satisfied: true, elapsedMs: 3 });
+    await post('/api/wait-for', { editor: { runMode: 'x' }, timeoutMs: 999_999 }, makeCtx({ requestBrowser }));
+    expect(requestBrowser).toHaveBeenLastCalledWith('wait-for', expect.anything(), 130_000);
+    await post('/api/wait-for', { editor: { runMode: 'x' } }, makeCtx({ requestBrowser }));
+    expect(requestBrowser).toHaveBeenLastCalledWith('wait-for', expect.anything(), 15_000);
+  });
+});
+
+describe('/api/module-url (#1155)', () => {
+  const answer = { url: '/packages/a.ts', file: '/repo/engine/packages/a.ts', inGraph: true };
+
+  it('400 without a path — before the host is ever asked', async () => {
+    const resolveModuleUrl = vi.fn();
+    const r = (await get('/api/module-url', makeCtx({ resolveModuleUrl }))) as { status?: number };
+    expect(r.status).toBe(400);
+    expect(resolveModuleUrl).not.toHaveBeenCalled();
+  });
+
+  it('503 on a host with no module graph, rather than a derived URL it cannot vouch for', async () => {
+    const r = (await get('/api/module-url?path=/packages/a.ts', makeCtx())) as { status?: number; body: { error: string } };
+    expect(r.status).toBe(503);
+    expect(r.body.error).toMatch(/module graph/);
+  });
+
+  it('passes the spec through and returns the resolution', async () => {
+    const resolveModuleUrl = vi.fn(async () => answer);
+    const r = (await get(`/api/module-url?path=${encodeURIComponent('/@fs/repo/engine/packages/a.ts')}`, makeCtx({ resolveModuleUrl }))) as { status?: number; body: unknown };
+    expect(resolveModuleUrl).toHaveBeenCalledWith('/@fs/repo/engine/packages/a.ts');
+    expect(r.status).toBeUndefined();
+    expect(r.body).toEqual(answer);
+  });
+
+  it('a forwarded failure keeps the status its host gave it', async () => {
+    const r = (await get('/api/module-url?path=/a.ts', makeCtx({ resolveModuleUrl: async () => ({ error: 'module graph unreachable: boom', status: 502 }) }))) as { status?: number; body: unknown };
+    expect(r.status).toBe(502);
+    expect(r.body).toEqual({ error: 'module graph unreachable: boom' });
+  });
+
+  it('a spec that names no file is the caller\'s 400; an unreachable graph is a 502', async () => {
+    const bad = (await get('/api/module-url?path=/nope.ts', makeCtx({ resolveModuleUrl: async () => ({ error: 'no such file: /nope.ts' }) }))) as { status?: number };
+    expect(bad.status).toBe(400);
+    const down = (await get('/api/module-url?path=/a.ts', makeCtx({ resolveModuleUrl: async () => { throw new Error('ECONNREFUSED'); } }))) as { status?: number; body: { error: string } };
+    expect(down.status).toBe(502);
+    expect(down.body.error).toMatch(/ECONNREFUSED/);
+  });
+});
+
 describe('/api/editor-state', () => {
   it('relays the editor-state op', async () => {
     const requestBrowser = vi.fn(async () => ({ playState: 'stopped', selection: { entityId: 3 } }));

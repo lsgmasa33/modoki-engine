@@ -55,6 +55,7 @@ const NO_TOOL_BY_DESIGN: Record<string, string> = {
   '/api/read-meta': "the EDITOR's own disk read of a .meta.json — `readMetaPreferringPark` (renderer) and the /api/asset-meta fallback both call it. The agent's read is `modoki_get_asset_meta` -> /api/asset-meta, which PREFERS a parked Inspector edit; pointing a tool at this one would hand an agent the pre-edit file and call it the answer (#872)",
   '/api/identity': "the once-per-process identity probe in context.ts; `modoki_identity` answers FROM it, which is why that contract declares route:null",
   '/api/dev-server-identity': 'the dev server\'s own identity, for the wrong-clone banner',
+  '/api/module-url': "consumed by modoki_eval's second-module-instance warning and by `modoki.import()` inside an eval (#1155); a standalone tool would only restate what the warning already says at the moment it matters",
   '/api/game-tools': 'the DYNAMIC game-tool tail (#270) — the server polls this to materialize a game\'s own tools, which by construction have no contract entry',
   '/api/game-tool-call': 'the invoke half of the same dynamic tail',
 

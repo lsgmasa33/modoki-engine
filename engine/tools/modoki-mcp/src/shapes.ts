@@ -76,6 +76,10 @@ export const ALLOW_OCCLUDED_BASE =
   + 'refused, because a coordinate is exactly what you asked for';
 export const allowOccludedParam = z.boolean().optional().describe(`${ALLOW_OCCLUDED_BASE}.`);
 
+/** The shared half of every `timeoutMs` description (#1154 made it three tools). Each tool
+ *  CONCATENATES its own default and ceiling, which really do differ. */
+export const TIMEOUT_MS_BASE = 'How long to wait before giving up, in ms';
+
 /** The shared half of every `modifiers` description. A tool that needs to say more CONCATENATES —
  *  `${MODIFIERS_BASE}, e.g. …` — rather than replacing, so the rule reads identically everywhere
  *  and the tool-specific nuance sits after it. Enforced: `mcpRegistry.test.ts` requires every

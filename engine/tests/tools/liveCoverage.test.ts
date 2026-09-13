@@ -226,6 +226,45 @@ describe('T2: modoki_eval\'s own failure shapes (the ones its route can actually
     expect(e.options?.join(' ')).toMatch(/FUNCTION BODY|explicit `return`/);
   });
 
+  describe('second-module-instance warning (#1155)', () => {
+    const FS_SPEC = '/@fs/repo/engine/packages/modoki/src/runtime/core/timelinePreview.ts';
+    const code = `const m = await import('${FS_SPEC}'); return m.isTimelinePreviewActive();`;
+    const moduleUrl = (body: unknown, status = 200) => (req: { path: string }) =>
+      req.path === '/api/eval' ? { body: { result: false } }
+        : req.path.startsWith('/api/module-url?') ? { status, body } : undefined;
+
+    it('appends a warning AFTER the value when a literal import is not the app\'s instance', async () => {
+      const s = (surface = loadSurface(moduleUrl({ url: '/packages/modoki/src/runtime/core/timelinePreview.ts', file: '/repo/x.ts', inGraph: true })));
+      const r = await s.call('modoki_eval', { code });
+      expect(r.isError).toBeFalsy();
+      expect(r.content[0].text).toBe('false'); // the value's own block is unchanged
+      expect(s.text(r)).toMatch(/SECOND instance/);
+      expect(s.text(r)).toContain(`modoki.import('${FS_SPEC}')`);
+    });
+
+    it('adds nothing when the import is canonical', async () => {
+      const s = (surface = loadSurface(moduleUrl({ url: FS_SPEC, file: '/repo/x.ts', inGraph: true })));
+      const r = await s.call('modoki_eval', { code });
+      expect(r.content).toHaveLength(1);
+    });
+
+    it('SAYS it could not check when the lookup fails, instead of reading as a clean result', async () => {
+      const s = (surface = loadSurface(moduleUrl({ error: 'this backend host has no Vite module graph to read' }, 503)));
+      const r = await s.call('modoki_eval', { code });
+      expect(s.text(r)).toMatch(/could not check import\('.*'\) for a second module instance: this backend host has no Vite module graph/);
+    });
+
+    it('carries the warning into a THROWN eval\'s options — a second instance is a likely cause', async () => {
+      const s = (surface = loadSurface((req) =>
+        req.path === '/api/eval' ? { body: { result: 'Error: Cannot read properties of null' } }
+          : req.path.startsWith('/api/module-url?') ? { body: { url: '/packages/x.ts', file: '/repo/x.ts', inGraph: true } } : undefined));
+      const r = await s.call('modoki_eval', { code });
+      expect(r.isError).toBe(true);
+      const e = (JSON.parse(s.text(r)) as { error: { options?: string[] } }).error;
+      expect(e.options?.[0]).toMatch(/SECOND instance/);
+    });
+  });
+
   it('a genuine string RESULT is still a success — the check must not swallow values', async () => {
     const s = (surface = loadSurface((req) =>
       req.path === '/api/eval' ? { body: { result: 'ErrorBoundary' } } : undefined));

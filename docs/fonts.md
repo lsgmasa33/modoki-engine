@@ -302,9 +302,10 @@ chunked to fit it.
   `.getGlyph(cp).advance` is the ground truth for *which typeface actually got rasterized*.
   Vertical metrics are the cheapest fingerprint separating two faces, and they do not move
   with a variation axis. In the dev editor:
-  `await import('/packages/modoki/src/runtime/loaders/fontAtlasLoader.ts')` reaches the app's
-  own module instance — a `/@fs/…` import gives a **second** instance with an empty provider
-  map, which reads as "no fonts are loaded".
+  `await modoki.import('/packages/modoki/src/runtime/loaders/fontAtlasLoader.ts')` reaches the
+  app's own module instance — a hand-written `/@fs/…` import (or a bare `/packages/…` one after a
+  hot update) gives a **second** instance with an empty provider map, which reads as "no fonts are
+  loaded" ([debug-tools-mcp.md](debug-tools-mcp.md) § "Second module instance").
 - **A rect is not a weight measurement.** `get_layout_bounds` returns the quad union, which
   includes the field padding — and the baked and dynamic paths pad differently (msdf-atlas-gen
   uses `-pxpadding` = `pxRange` *plus* `range/2`; the generator uses `floor(range/2)` alone).

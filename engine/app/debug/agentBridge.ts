@@ -383,6 +383,13 @@ function frameStalenessWarning(what: string): string | null {
  *  enough that a generated one can't flood a context window before the agent narrows. */
 export const DEFAULT_INDEX_LIMIT = 200;
 
+/** Why `where` cannot be evaluated (the same parse `dumpSceneState` applies), or null. Lets a caller
+ *  refuse a typo'd predicate up front instead of reading it as "nothing matches" (#1154). */
+export function whereError(where: string): string | null {
+  const r = parseWhere(where, new Map(getAllTraits().map((m) => [m.name, m] as const)));
+  return 'error' in r ? r.error : null;
+}
+
 export function dumpSceneState(params: SceneStateParams = {}) {
   const metaByName = new Map(getAllTraits().map((m) => [m.name, m] as const));
   const readTrait = params.full ? readTraitDataFull : readTraitData;
@@ -1227,9 +1234,10 @@ registerAgentOp('diagnose', (params) => {
   // §6 is summary-first: a per-clip index would grow every caller's payload to answer a question
   // almost none of them asked.
   //
-  // It needs a surface at all because the accessor alone is not reachable. `modoki_eval` runs in
+  // It needed a surface at all because the accessor alone was not reachable. `modoki_eval` runs in
   // the renderer and could import `pipeline.ts` through `/@fs` — but that yields a SECOND module
-  // instance whose slot is null, so it would report "no cache" for a perfectly live one. Before
+  // instance whose slot is null, so it would report "no cache" for a perfectly live one.
+  // (`modoki.import` has reached the app's instance since #1155; this filter stays the typed read.) Before
   // this, QA-VIDEO-0002 patched `window.fetch` to infer a refetch, which measures the network
   // rather than the cache and cannot tell a MISS from a cache that was never wired.
   //

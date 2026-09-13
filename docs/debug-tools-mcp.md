@@ -983,6 +983,33 @@ The MCP is **parity-plus** with chrome-devtools for the editor, and better on tw
     through it. Holding a real key across separate HTTP calls needs the release to be as reliable
     as the press (a missed `up` leaves Chromium with a stuck modifier), so it was left alone — use
     `modoki_drag` when the modifier's LEVEL is what the code under test reads.
+- `modoki_wait_for` — **park until a condition holds, instead of sleeping a guessed number of ms**
+  (#1154). Before it, agents slept: 890 `modoki_eval` bodies hard-coded a `setTimeout`, and 1,061 of
+  4,044 batch steps were the fixed `wait` step with a p90 pinned at its 2 s cap. A sleep is wrong
+  both ways, and the read after it cannot tell "not yet" from "never". Give exactly ONE condition:
+  - `chrome {label|id, absent?, disabled?, value?, checked?, expanded?, mixed?, state?}` — reads the
+    same handles `modoki_handles editor=chrome` reports, so a wait and the read cannot disagree. A
+    STATE test needs exactly one matching control; two is reported as `ambiguous` (aim by `id`), not
+    satisfied by whichever came first.
+  - `entity {guid|name|where, absent?}` — `get_scene_state`'s own filters and `where` grammar.
+  - `console {match, level?, lookbackMs?}` — a ring entry logged AFTER the call started; an earlier
+    line with the same text never satisfies it, unless it falls within `lookbackMs` (≤ 60 s) before
+    the call. That exception exists for `[tap, wait_for console]` in one batch: the tap's handler
+    logs before the wait takes its watermark, so without it the wait can only time out.
+  - `editor {playState|runMode|advancing|scenePath}` — every given field must equal
+    `get_editor_state`'s.
+
+  It checks at once, then polls every 50 ms, which keeps working while `advancing:false` freezes
+  frames. Satisfied → `{satisfied:true, elapsedMs, observation}`; a timeout is a NORMAL result
+  `{satisfied:false, timedOut:true, lastObservation}` — read `lastObservation` for why. A condition
+  that can never be evaluated (no aim, an unknown trait in `where`) is REFUSED before parking. A read
+  that throws mid-poll (a world swapping) is recorded as `readError` and polling continues, since
+  waiting across a scene load is a normal use. `timeoutMs` defaults to 5 s and caps at 120 s.
+  Implementation: `app/debug/waitFor.ts` (the decisions, pure) bound to its readers in
+  `agentEditorOps.ts`. It is also an ordinary `modoki_batch` step and `modoki.waitFor()` in eval —
+  where eval's own 25 s cap bounds it. It registers unattributed, like `wait-for-edit`, so a human
+  edit during the park is not tagged `agent`. The batch `wait` step stays fixed-ms and capped: it is
+  for letting a frame settle, and raising the cap would bless the sleep.
 - `modoki_batch` — run several tools **in order, in one turn**. Reach for it when you already know
   the whole sequence (`create_entity` → `set_transform` → `save_all`, or `tap` → `wait` → capture).
   It exists for two reasons: **ordering cannot be expressed any other way** — issuing several tool
@@ -1082,6 +1109,8 @@ same actions + state a person has in the editor. They relay to the renderer over
     default 5000 / max 25000, `device_eval` default 4000 / **max 20000**. Out-of-range is clamped,
     not refused. Asking for more than the default also lifts the device's transport deadline with it
     (#153); the remaining asymmetry is the device's extra network hop. See the nested-deadline rule below.
+  - **Import a module through `await modoki.import(path)`, never a hand-written path** — see
+    § "Second module instance" below (#1155).
 - **Play/test the game:** `modoki_play_control {play|stop|pause|resume|step}` — press Play, exercise
   with `modoki_tap`/`modoki_drag`, read `get_scene_state`, then stop (reverts the authored snapshot).
 - **Edit like a human (undoable):** `modoki_create_entity` (empty/primitive/2d/ui/camera/light/
@@ -1127,6 +1156,37 @@ Architecture: live-editor ops register into the bridge op registry (`registerAge
 stays out of game web builds. Backend routes live in the shared `editorBackendRouter.ts`
 (`/api/editor-state`, `/api/editor-action` [allowlisted], `/api/scenes`, `/api/import-file`), which
 both the Vite dev server and the Electron main process mount — hence the dev/DMG parity.
+
+### Second module instance
+
+**Import through `await modoki.import(path)` inside `modoki_eval`, never a hand-written path**
+(#1155). An eval body is not served through Vite, so its `import('…')` reaches the browser as
+written, and the browser keys module instances by URL string: any spelling other than the one Vite
+wrote into the app's imports evaluates the module AGAIN, with fresh module-level state the app never
+reads or writes. Measured 2026-09-13: `setTimelinePreviewActive(true)` through
+`/@fs/…/timelinePreview.ts` read `true` there and `false` in the app. Three spellings do it —
+`/@fs/<abs>` for a file under the Vite root (`engine/`), any `?query`, and a bare URL after an HMR
+update (the app's importers were rewritten to `?t=<ts>`; measured: after one hot update the served
+`virtual:modoki-games` imports `game.ts?t=…`, so even a game file's bare `/@fs` URL is then a copy).
+
+- **It is SHALLOW, which is why it fools people.** Only the named module is duplicated; its own
+  imports are Vite-rewritten to canonical URLs. So through `world.ts` via `/@fs`, `getCurrentWorld`
+  IS the app's (re-exported from `worldRegistry.ts`) while `destroyEntity` is not (defined in
+  `world.ts`).
+- **No prefix rule answers it.** A `games/<id>/**` file sits outside the Vite root and is canonical
+  AT `/@fs/<abs>`. `modoki.import` asks Vite's module graph (`GET /api/module-url`,
+  `engine/plugins/backend/moduleUrl.ts`; Electron main forwards to the child Vite) and accepts a
+  repo-relative path, an absolute path or a module URL. It imports through a `Function` body because
+  Vite rewrites a non-literal `import(x)` in served code to `?import` — a third instance.
+  `window.__MODOKI_SHARED__.modules['@modoki/engine/runtime']` also reaches the app's instance, for
+  what the runtime barrel exports.
+- **`modoki_eval` WARNS, it does not refuse**, when a literal `import('…')` misses the app's
+  instance: a trailing ⚠️ block after the value (and the first option of a thrown eval's refusal), or
+  a *"could not check"* line when the lookup failed. A pure helper or a constant is harmless through a
+  copy, and a specifier built at runtime is invisible to the check — so a clean result is not proof,
+  only the absence of a literal miss.
+- **Not on a device.** `device_eval` runs against a native bundle that serves no source URLs at all
+  (`qa/knowledge.md`), so none of this — and no `modoki.import` — exists there.
 
 ## LIVE WORLD vs SCENE FILE — the one rule that makes tools compose
 
@@ -1372,7 +1432,7 @@ Two things the table is worth reading FOR, not just referring to:
 
 <!-- BEGIN GENERATED TOOL CATALOG -->
 
-*105 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
+*106 tools. Generated from `engine/tools/modoki-mcp/src/contracts.ts` — do NOT hand-edit;
 run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fails `npm test`.*
 
 #### Read — answer a question about state (never changes anything)
@@ -1409,6 +1469,7 @@ run `npm --prefix engine/tools/modoki-mcp run gen:catalog`. A drifted table fail
 | `modoki_unused_assets` | GET `/api/unused-assets` | read-only | project | — | *(no args)* |
 | `modoki_validate_prefab` | GET `/api/validate-prefab` | read-only | project | asset | `{"path":"/assets/prefabs/probe.prefab.json"}` |
 | `modoki_validate_scene` | GET `/api/validate-scene` | read-only | project | asset | `{"path":"/assets/scenes/main.scene.json"}` |
+| `modoki_wait_for` | POST `/api/wait-for` | read-only | editor + renderer | — | `{"editor":{"runMode":"stopped"},"timeoutMs":50}` |
 | `modoki_wait_for_edit` | GET `/api/wait-for-edit` | read-only | editor | — | `{"timeoutMs":50}` |
 
 #### Mutate — change scene/world data

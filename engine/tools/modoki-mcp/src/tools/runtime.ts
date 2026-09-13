@@ -309,7 +309,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       'are not.',
     {
       video: z.boolean().optional()
-        .describe('Include the downloaded-video cache index. Default false. This is the only surface that can read it: the singleton lives behind the __MODOKI_MODULE_VIDEO__ flag, and reaching it through modoki_eval + an /@fs import yields a SECOND module instance whose slot is null — i.e. a confident "no cache" for a live one.'),
+        .describe('Include the downloaded-video cache index. Default false. The typed read of it: the singleton lives behind the __MODOKI_MODULE_VIDEO__ flag, and a hand-written /@fs import in modoki_eval yields a SECOND module instance whose slot is null — i.e. a confident "no cache" for a live one.'),
     },
     async ({ video }) => getJson(`/api/diagnose${video ? '?video=1' : ''}`),
   );

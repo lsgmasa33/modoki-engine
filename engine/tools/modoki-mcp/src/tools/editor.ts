@@ -8,7 +8,7 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
-import { DISCARD_UNSAVED_BASE, discardUnsavedParam, flatEntityAlias, foldEntityRef } from '../shapes.js';
+import { DISCARD_UNSAVED_BASE, TIMEOUT_MS_BASE, discardUnsavedParam, flatEntityAlias, foldEntityRef } from '../shapes.js';
 
 export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   const { getJson, postJson, editorAction, fail } = ctx;
@@ -138,6 +138,56 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     },
   );
 
+  // ── wait_for — park until a condition holds (#1154) ──
+  const chromeCond = z.object({
+    label: z.string().optional().describe('Visible label, matched like modoki_tap\'s label aim (normalized, exact).'),
+    id: z.string().optional().describe('The control\'s data-ui-id (from modoki_handles editor=chrome).'),
+    absent: z.boolean().optional().describe('Wait until NO control matches (a dialog closed, a spinner gone).'),
+    disabled: z.boolean().optional(), value: z.string().optional(), checked: z.boolean().optional(),
+    expanded: z.boolean().optional(), mixed: z.boolean().optional(),
+    state: z.string().optional().describe('The control\'s data-ui-state.'),
+  }).strict();
+  const entityCond = z.object({
+    guid: z.string().optional(), name: z.string().optional().describe('Case-insensitive substring, as get_scene_state.'),
+    where: z.string().optional().describe('get_scene_state\'s predicate: "Trait.field <op> value", op ∈ = != > >= < <= ~.'),
+    absent: z.boolean().optional().describe('Wait until NO entity matches (destroyed, filtered out).'),
+  }).strict();
+  tool(
+    'modoki_wait_for',
+    'PARK until a condition holds, instead of sleeping a guessed number of ms (an eval setTimeout, ' +
+      'a batch `wait`). Give EXACTLY ONE of: `chrome` (an editor control appears/goes away or reaches ' +
+      'a state — the same state modoki_handles reports), `entity` (a get_scene_state guid/name/where ' +
+      'matches, or `absent`), `console` (a line containing `match` is logged after the call starts, or ' +
+      'within `lookbackMs` before it — for the batch step that logged it), ' +
+      '`editor` (get_editor_state fields: playState/runMode/advancing/scenePath). Checks at once, then ' +
+      'polls. Satisfied → `{satisfied:true, elapsedMs, observation}`. A timeout is a NORMAL result, not ' +
+      'an error: `{satisfied:false, timedOut:true, lastObservation}` — read `lastObservation` to see ' +
+      'why (e.g. `ambiguous`: a state test needs exactly one control). `timeoutMs` defaults to 5000, ' +
+      'clamped to [50, 120000]. An unevaluable condition (no ' +
+      'label/id, unknown trait) is refused BEFORE parking. Works as a modoki_batch step and as ' +
+      'modoki.waitFor() in eval (whose 25s cap bounds it there).',
+    {
+      chrome: chromeCond.optional().describe('An editor control, aimed by label or id: present (default), `absent`, or reaching the given state fields.'),
+      entity: entityCond.optional().describe('A get_scene_state match by guid/name/where — present, or `absent`.'),
+      console: z.object({
+        match: z.string().describe('Case-sensitive substring of the logged text.'),
+        level: z.enum(['log', 'info', 'warn', 'error']).optional(),
+        lookbackMs: z.number().min(0).max(60_000).optional().describe('Also accept a line logged up to this many ms BEFORE the call — for the batch step that logged it just before this wait.'),
+      }).strict().optional().describe('A renderer console line logged after the call starts (or within lookbackMs before it).'),
+      editor: z.object({
+        playState: z.string().optional(), runMode: z.string().optional(),
+        advancing: z.boolean().optional(), scenePath: z.string().optional(),
+      }).strict().optional().describe('get_editor_state fields that must ALL equal the given values.'),
+      timeoutMs: z.number().optional().describe(`${TIMEOUT_MS_BASE}.`),
+    },
+    async ({ chrome, entity, console: consoleCond, editor, timeoutMs }) => {
+      // Transport must outlast the op's park AND the relay's headroom over it (+10s), or a
+      // legitimate long wait reads as an unreachable backend.
+      const transportTimeoutMs = Math.max(50, Math.min(120_000, timeoutMs ?? 5_000)) + 15_000;
+      return postJson('/api/wait-for', { chrome, entity, console: consoleCond, editor, timeoutMs }, transportTimeoutMs, 'wait for a condition in the editor');
+    },
+  );
+
   // ── wait_for_edit — the long-poll twin of editor_journal (#28) ──
   tool(
     'modoki_wait_for_edit',
@@ -156,7 +206,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       type: z.string().optional().describe('Only wake for this editor event type, e.g. !edit, !select, !transform. Omit to wake on any type.'),
       source: z.enum(['human', 'agent']).optional().describe('Who must have done it. Defaults to "human" — pass "agent" only if you specifically want to notice your own MCP-driven edits.'),
       since: z.number().optional().describe('Forward cursor (a prior `seq`/`nextSeq`). Omit to wait for the NEXT event from now, not to replay history.'),
-      timeoutMs: z.number().optional().describe('How long to park, in ms. Default 30000, clamped to [50, 120000].'),
+      timeoutMs: z.number().optional().describe(`${TIMEOUT_MS_BASE}. Default 30000, clamped to [50, 120000].`),
     },
     async ({ type, source, since, timeoutMs }) => {
       const q = new URLSearchParams();

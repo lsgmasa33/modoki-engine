@@ -14,6 +14,7 @@
 
 import { createFormatter, isFailureBody, ERROR_CODES, type ToolResult, type ToolErrorDetail, type ErrorCode } from './result.js';
 import { identityMismatch, tokenMismatchWarning, describeIdentity, type BackendIdentity } from '../../shared/identity.js';
+import { literalImportSpecs, secondInstanceWarning, type ModuleUrlAnswer } from './evalImports.js';
 
 export type ToolContext = {
   /** Backend base URL, trailing slash stripped. Interpolated into error messages. */
@@ -382,9 +383,33 @@ export function createToolContext(config: { backend: string; token?: string }): 
    *  successful `{ result: "Error: …" }` string rather than a 4xx — detect that prefix and surface
    *  it as a tool error, so a failed eval is never misread as a successful string value (the same
    *  false-success guard device_eval applies via isDeviceError). */
+  /** #1155: one line per literal `import('…')` in `code` that reaches a SECOND instance of its
+   *  module, or that could not be checked. A 400 (the spec names no file) says nothing — the eval's
+   *  own import fails and reports that far better. Any other failure is SAID, not swallowed: a
+   *  check that silently could not run reads exactly like one that found nothing. */
+  async function importWarnings(code: string): Promise<string[]> {
+    const lines = await Promise.all(literalImportSpecs(code).map(async (spec) => {
+      try {
+        const { status, body } = await call(`/api/module-url?path=${encodeURIComponent(spec)}`, undefined, 5000);
+        if (status === 400) return null;
+        if (status >= 400) {
+          const why = (body as { error?: unknown } | null)?.error ?? `HTTP ${status}`;
+          return `could not check import('${spec}') for a second module instance: ${String(why)}`;
+        }
+        return secondInstanceWarning(spec, body as ModuleUrlAnswer);
+      } catch (e) {
+        return `could not check import('${spec}') for a second module instance: ${e instanceof Error ? e.message : String(e)}`;
+      }
+    }));
+    return lines.filter((l): l is string => l !== null);
+  }
+
   async function evalRenderer(code: string, timeoutMs?: number): Promise<ToolResult> {
     try {
       await ensureIdentity();
+      // Checked alongside the eval, not after it: both are reads, and the check must not add the
+      // eval's own duration to the tool's latency.
+      const warningsP = importWarnings(code);
       // THREE nested deadlines, each strictly larger than the one inside it, or the outermost
       // fires first and reports the wrong cause: eval budget (renderer) < relay (backend, +10s)
       // < this client abort (+15s). The client's 30s default was already smaller than a 25s
@@ -397,6 +422,7 @@ export function createToolContext(config: { backend: string; token?: string }): 
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(timeoutMs == null ? { code } : { code, timeoutMs }),
       }, clientTimeout);
+      const warnings = await warningsP;
       if (status >= 400) return httpFailure('evaluate JS in the editor renderer', status, body);
       const result = (body as { result?: unknown } | null)?.result;
       if (typeof result === 'string' && result.startsWith('Error:')) {
@@ -406,12 +432,17 @@ export function createToolContext(config: { backend: string; token?: string }): 
           why: `the code threw: ${result}`,
           got: code.length > 400 ? code.slice(0, 400) + '…' : code,
           options: [
+            // A second instance is a plausible CAUSE of the throw (a null slot, a missing registration).
+            ...warnings,
             'the renderer runs `code` as a FUNCTION BODY — a bare expression needs an explicit `return`',
             'globals available there: window.__3d (runtime GameView), document, the editor stores',
           ],
         });
       }
-      return ok(result);
+      const res = ok(result);
+      // A separate block AFTER the value, so the value's own encoding is byte-for-byte unchanged.
+      if (warnings.length) res.content.push({ type: 'text', text: warnings.map((w) => `⚠️ ${w}`).join('\n') });
+      return res;
     } catch (e) {
       return unreachable(e);
     }

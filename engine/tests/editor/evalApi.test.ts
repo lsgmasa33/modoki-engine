@@ -7,7 +7,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { setRunMode } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerAgentOp, listAgentOps } from '../../app/debug/agentBridge';
-import { kebabToCamel, makeEvalApi } from '../../app/editor/evalApi';
+import { kebabToCamel, makeEvalApi, importAsApp } from '../../app/editor/evalApi';
 import { handleEval } from '../../app/debug/bridgeHelpers';
 
 const mockBackendFetch = vi.fn();
@@ -29,6 +29,37 @@ beforeEach(() => {
   mockBackendFetch.mockReset();
   clearEditorJournal();
   setEditorJournalEnabled(true);
+});
+
+describe('modoki.import (#1155)', () => {
+  const answer = (body: unknown, status = 200) =>
+    mockBackendFetch.mockResolvedValueOnce({ ok: status < 400, status, json: async () => body });
+  // The real loader is a `Function`-body `import()`, which vitest's module VM cannot run ("A dynamic
+  // import callback was not specified") — so the loader is injected here, and the property it
+  // exists for (Vite does not rewrite it to `?import`) is checked live against the editor instead.
+  const load = vi.fn(async (url: string) => ({ loadedFrom: url }));
+  beforeEach(() => load.mockClear());
+
+  it('asks /api/module-url for the canonical URL and imports THAT, not the spec as written', async () => {
+    answer({ url: '/packages/x.ts?t=9', file: '/repo/engine/packages/x.ts', inGraph: true });
+    const mod = await importAsApp('/@fs/repo/engine/packages/x.ts', load);
+    expect(mockBackendFetch).toHaveBeenCalledWith(`/api/module-url?path=${encodeURIComponent('/@fs/repo/engine/packages/x.ts')}`);
+    expect(load).toHaveBeenCalledWith('/packages/x.ts?t=9');
+    expect(mod).toEqual({ loadedFrom: '/packages/x.ts?t=9' });
+  });
+
+  it('throws the route\'s own reason, naming the spec, and loads nothing', async () => {
+    answer({ error: 'no such file: /nope.ts' }, 400);
+    await expect(importAsApp('/nope.ts', load)).rejects.toThrow("modoki.import('/nope.ts'): no such file: /nope.ts");
+    expect(load).not.toHaveBeenCalled();
+  });
+
+  it('is reachable from eval code as modoki.import, and a generated op method cannot shadow it', async () => {
+    registerAgentOp('import', () => 'the op, not the helper');
+    answer({ error: 'reached the helper' }, 400);
+    const out = await handleEval("return await modoki.import('/x.ts')", makeEvalApi());
+    expect(out).toBe("Error: modoki.import('/x.ts'): reached the helper");
+  });
 });
 
 describe('kebabToCamel', () => {
@@ -161,6 +192,20 @@ describe('attribution-observing ops are not bracketed by the eval façade', () =
     const res = (await parked) as { events?: Array<{ source: string }>; timedOut?: boolean };
     expect(res.timedOut).not.toBe(true);
     expect(res.events?.length).toBeGreaterThan(0);
+    expect(res.events?.[0]?.source).toBe('human');
+  });
+
+  it('modoki.waitFor() parks unattributed too — a human edit during it stays source:human', async () => {
+    // wait-for parks for up to 120s; bracketed as 'agent' by this façade, every human edit made
+    // meanwhile would be journaled as the agent's. The op's own registration is unwrapped (pinned
+    // in waitForOp.test.ts) — this pins the SECOND list, ATTRIBUTION_OPS.
+    const { waitForEditorJournal } = await import('@modoki/engine/editor');
+    registerAgentOp('wait-for', () => waitForEditorJournal({ source: 'human' }, 2000));
+    const parked = (makeEvalApi().waitFor as (p?: unknown) => Promise<unknown>)({});
+    await new Promise((r) => setTimeout(r, 30));
+    editorEmit('!select', { id: 2 });
+    const res = (await parked) as { events?: Array<{ source: string }>; timedOut?: boolean };
+    expect(res.timedOut).not.toBe(true);
     expect(res.events?.[0]?.source).toBe('human');
   });
 });

@@ -119,3 +119,8 @@ date,clone,tool,delta_bytes,tool_bytes_after,surface_bytes_after,sha
 2026-09-13,work-qa,modoki_pointer,288,4354,158516,467579aaa
 2026-09-13,work-qa,modoki_scroll,288,3724,158516,467579aaa
 2026-09-13,work-qa,modoki_tap,371,3996,158516,467579aaa
+2026-09-13,work-qa,modoki_batch,95,2621,160956,f2379badf
+2026-09-13,work-qa,modoki_diagnose,-28,1468,160956,f2379badf
+2026-09-13,work-qa,modoki_eval,246,1538,160956,f2379badf
+2026-09-13,work-qa,modoki_wait_for,2110,2110,160956,f2379badf
+2026-09-13,work-qa,modoki_wait_for_edit,17,1361,160956,f2379badf

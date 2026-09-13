@@ -283,6 +283,7 @@ import { environmentReimportHandler } from '../plugins/reimport-environment';
 import { atlasReimportHandler } from '../plugins/reimport-atlas';
 import { videoReimportHandler } from '../plugins/reimport-video';
 import type { BackendContext } from '../plugins/backend/editorBackendRouter';
+import { forwardModuleUrl } from '../plugins/backend/moduleUrl';
 import { releaseDeviceResourcesOnExit } from '../plugins/backend/deviceConnection';
 import type { SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneValidation';
 import { ENGINE_VERSION } from '../packages/modoki/src/runtime/core/version';
@@ -1513,6 +1514,10 @@ app.whenReady().then(async () => {
     invalidateProjectConfig: () => {
       fetch(`${DEV_URL}/api/invalidate-project-config`, { method: 'POST' }).catch(() => { /* Vite unreachable — self-heals on relaunch */ });
     },
+    // #1155: main has no module graph either, and the one that matters is the child Vite's — it
+    // wrote the URLs the renderer imported. Forward to the same route there (status-preserving and
+    // bounded — see forwardModuleUrl).
+    resolveModuleUrl: (spec) => forwardModuleUrl(DEV_URL, spec),
   };
 
   // ── Trusted-input routes. `ops` binds each primitive to the live window lazily —

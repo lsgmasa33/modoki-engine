@@ -19,7 +19,9 @@ import * as THREE from 'three';
 import type { ErrorCode } from '../../tools/shared/mcpResult';
 import { OpRefusal } from '../debug/opRefusal';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
-import { registerAgentOp as _registerAgentOp, type AgentOpHandler, setSceneReloadSuppressor, replaySuppressedSceneReloads, setPrefabSourceRefresher, inferAssetDefType } from '../debug/agentBridge';
+import { registerAgentOp as _registerAgentOp, type AgentOpHandler, setSceneReloadSuppressor, replaySuppressedSceneReloads, setPrefabSourceRefresher, inferAssetDefType, dumpSceneState, whereError } from '../debug/agentBridge';
+import { conditionError, waitForCondition, clampWaitTimeout, type WaitCondition, type WaitReaders } from '../debug/waitFor';
+import { getConsoleRingEntries } from '@modoki/engine/runtime/core/consoleRing';
 import { performDomDnd, type DomDndParams } from '../debug/domDnd';
 import { getHmrStatus } from '../debug/hmrStaleness';
 import { getGameBootFaults } from './gameBootFaults';
@@ -69,7 +71,7 @@ import {
   getAllTraits, resolveCreateEntitySpec, type MutateOp, type MutateEntityRef,
   Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
   type AnimationClipDef, type TrackValueType, type TimelineDef, type TrackDef, type TrackKind,
-  sceneManager, assetUrl, type AssetSchemaType,
+  sceneManager, assetUrl, type AssetSchemaType, collectHandles, rawNow,
 } from '@modoki/engine/runtime';
 
 // ── Reads ─────────────────────────────────────────────────────────────────
@@ -957,6 +959,7 @@ export function registerEditorAgentOps(): void {
       'modoki.ops() — same {op, method} listing as this discovery call, from inside eval code',
       'modoki.api(path, init) — fetch() a host route with no matching op (list_assets, write_asset, import_file, build, add_native_target, the OTA tools, mutate_scene\'s file-direct path, …), routed through backendFetch',
       'modoki.composite(label, fn) — collapse every mutation fn() makes into ONE undo entry',
+      'modoki.import(path) — import a module AS THE APP HOLDS IT (repo-relative path, absolute path or module URL). A hand-written import(\'/@fs/…\') of an engine file, or any ?query variant, is a SECOND instance whose module-level state the app never sees',
     ],
     note: 'Call modoki_eval_api (or GET /api/eval-api) any time to see this listing again.',
   }));
@@ -1067,6 +1070,42 @@ export function registerEditorAgentOps(): void {
     if (p.open) return { id: openActorLease('agent', p.ttlMs) };
     if (typeof p.id === 'number') closeActorLease(p.id);
     return { ok: true };
+  });
+
+  // ── wait-for (#1154) ── park until a CONDITION holds (a chrome control, an entity, a console
+  // line, an editor field) instead of sleeping a guessed number of ms. The decisions live in
+  // `debug/waitFor.ts`; this binds its readers to the resolvers the matching READ tools use.
+  // Unwrapped for wait-for-edit's reason below: it parks, and the agent wrapper would attribute
+  // every human edit made during the park to 'agent'. Listed in evalApi.ts's ATTRIBUTION_OPS too.
+  const waitReaders: WaitReaders = {
+    chrome: ({ label, id }) => collectHandles({ editor: 'chrome', ...(label ? { label } : {}), ...(id ? { ids: [id] } : {}) })
+      .map((h) => ({ id: h.id, label: h.label, meta: h.meta as Record<string, unknown> | undefined })),
+    whereError,
+    entities: ({ guid, name, where }) => {
+      // `trait` narrows the one returned row to the trait the predicate reads, keeping the
+      // observation small; `limit:1` because the wait needs a count and one example, not a dump.
+      const trait = where ? /^\s*(\w+)\./.exec(where)?.[1] : undefined;
+      const r = dumpSceneState({ guid, name, where, ...(trait ? { trait } : {}), limit: 1 }) as { entities: unknown[]; totalCount?: number; entityCount: number };
+      return { count: r.totalCount ?? r.entityCount, first: r.entities[0] };
+    },
+    consoleSince: (seq) => getConsoleRingEntries(seq),
+    consoleWatermark: (lookbackMs) => {
+      const all = getConsoleRingEntries();
+      if (!lookbackMs) return all.at(-1)?.seq ?? 0;
+      // `mono` is the ring's own `rawNow()` stamp, so the cutoff is on the same clock.
+      const cutoff = rawNow() - lookbackMs;
+      let mark = 0;
+      for (const e of all) { if (e.mono < cutoff) mark = e.seq; else break; }
+      return mark;
+    },
+    editorState: () => readEditorState() as unknown as Record<string, unknown>,
+  };
+  _registerAgentOp('wait-for', (params) => {
+    const p = (params ?? {}) as WaitCondition & { timeoutMs?: unknown };
+    const { timeoutMs, ...cond } = p;
+    const why = conditionError(cond, waitReaders);
+    if (why) throw new OpRefusal('REFUSED_BY_OP', `wait-for: ${why} — nothing was waited for.`);
+    return waitForCondition(cond, { readers: waitReaders, timeoutMs: clampWaitTimeout(timeoutMs) });
   });
 
   // ── wait-for-edit (#28) ── long-poll twin of editor-journal: park until the human does

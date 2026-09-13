@@ -355,6 +355,14 @@ const DECLS: Record<string, Decl> = {
     filters: ['type', 'source', 'since', 'limit'],
     notes: 'IMPURE READ, and a mutating GET: clear:true empties the editor-activity buffer via GET.',
   },
+  modoki_wait_for: {
+    kind: 'read', method: 'POST', route: '/api/wait-for', requires: ['editor', 'renderer'],
+    minimalArgs: { editor: { runMode: 'stopped' }, timeoutMs: 50 },
+    notes: 'BLOCKS for up to timeoutMs (default 5s, max 120s); minimalArgs pins 50ms and a condition '
+      + 'that holds on a stopped editor so the live sweep returns at once. A POST read: the condition '
+      + 'is a nested object, and nothing is written. A timeout is a normal {satisfied:false, timedOut:true} '
+      + 'answer, not a failure (#1154).',
+  },
   modoki_wait_for_edit: {
     kind: 'read', method: 'GET', route: '/api/wait-for-edit',
     filters: ['type', 'source', 'since'],
@@ -628,7 +636,7 @@ const DECLS: Record<string, Decl> = {
   },
   modoki_diagnose: {
     kind: 'read', method: 'GET', route: '/api/diagnose', requires: ['editor', 'scene'],
-    notes: 'C7: `ok:false` is an ANSWER (your scene is unhealthy), not a failed call. The `video` param is deliberately NOT declared in `filters`: §6 filters are params that NARROW a response, and this one EXPANDS it (an opt-in video-cache index) — which is what the boolean heuristic already expects, so listing it would be the exact misuse `narrowingFlags` warns against, "a way to bless an expanding flag". Opt-in matters anyway, because diagnose is a swept read: a per-clip index would grow every caller\'s payload to answer a question almost none of them asked. It is the only surface that can read the downloaded-video cache (#288 Phase 6) — the singleton sits behind the __MODOKI_MODULE_VIDEO__ flag, and an /@fs import in modoki_eval yields a second module instance whose slot is null.',
+    notes: 'C7: `ok:false` is an ANSWER (your scene is unhealthy), not a failed call. The `video` param is deliberately NOT declared in `filters`: §6 filters are params that NARROW a response, and this one EXPANDS it (an opt-in video-cache index) — which is what the boolean heuristic already expects, so listing it would be the exact misuse `narrowingFlags` warns against, "a way to bless an expanding flag". Opt-in matters anyway, because diagnose is a swept read: a per-clip index would grow every caller\'s payload to answer a question almost none of them asked. It is the typed read of the downloaded-video cache (#288 Phase 6) — the singleton sits behind the __MODOKI_MODULE_VIDEO__ flag, and a hand-written /@fs import in modoki_eval yields a second module instance whose slot is null (`modoki.import` reaches the app\'s, #1155).',
   },
   modoki_profiler: {
     // `varies:'method'`, not 'both': every action uses the SAME route (`/api/profiler`) and only

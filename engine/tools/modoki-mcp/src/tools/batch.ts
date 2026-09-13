@@ -36,7 +36,8 @@ export function registerBatchTool(tool: ToolDef, ctx: ToolContext): void {
       'and a failure also un-suppresses the steps before it: they already applied, and a batch is ' +
       'NOT a transaction — nothing is rolled back.\n\n' +
       '`{"tool":"wait","args":{"ms":100}}` is a pseudo-step that lets the renderer settle between ' +
-      'an input step and a capture (max ' + MAX_WAIT_MS + 'ms).\n\n' +
+      'an input step and a capture (max ' + MAX_WAIT_MS + 'ms). To wait UNTIL something appears or ' +
+      'changes, use a modoki_wait_for step instead of guessing ms.\n\n' +
       'REFUSED at pre-flight (nothing runs): raw {x,y} aiming on ' + XY_AIMED_TOOLS.join('/') + ' — ' +
       'aim by `entity` ({guid|name|id}), `selector`, a handle id, or (drag_handle) toId/delta, which ' +
       'resolve inside their own call and cannot go stale mid-batch; and ' +
