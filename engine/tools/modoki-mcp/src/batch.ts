@@ -186,12 +186,13 @@ function usesRawXY(tool: string, args: Record<string, unknown>): string | null {
   const hasXY = (o: unknown): boolean =>
     !!o && typeof o === 'object' && typeof (o as { x?: unknown }).x === 'number'
       && typeof (o as { y?: unknown }).y === 'number';
-  // An entity/selector aim WINS over stray coordinates in `resolvePoint`, so coordinates
+  // An entity/selector/label aim WINS over stray coordinates in `resolvePoint`, so coordinates
   // sitting beside one are inert and must not trip this. Only a call that would actually BE
   // coordinate-aimed is refused.
   const aimed = (o: unknown): boolean =>
     !!o && typeof o === 'object'
       && (!!(o as { selector?: string }).selector
+        || typeof (o as { label?: unknown }).label === 'string'
         || (!!(o as { entity?: object }).entity && Object.keys((o as { entity: object }).entity ?? {}).length > 0));
   if (where === 'top') return hasXY(args) && !aimed(args) ? 'x/y' : null;
   // `drag_handle` aims its SOURCE by handle id (never coordinates); only the destination can be

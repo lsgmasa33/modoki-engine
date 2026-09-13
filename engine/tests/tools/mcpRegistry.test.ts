@@ -279,6 +279,10 @@ describe('the real registered surface', () => {
     'path', 'name', 'kind', 'id', 'ids', 'key', 'limit', 'all', 'from', 'to', 'clear', 'since',
     'guid', 'guids', 'quality', 'selector', 'button', 'steps', 'entity', 'parentId',
     'parentGuid', 'action', 'type',
+    // #1152/#1153: an AIM on the input tools ("press the element labelled X") and a FILTER on
+    // modoki_handles ("list the handles labelled X"). Two jobs, deliberately one word: both match by
+    // the same `labelMatches` rule, so the filter previews exactly what the aim would hit.
+    'label',
   ];
 
   it('a param used by 3+ tools means ONE thing, or is declared per-tool', () => {
@@ -590,7 +594,14 @@ describe('the real registered surface', () => {
   // panel repairs for a human and nobody repairs for an agent.
   // ⚠️ The union hazard from the 2026-09-07 note below has NOT gone away: this number was measured
   // on one branch, and the hub may still land past it after merging the others.
-  const DEFINITION_BYTES = 152_065;
+  // 2026-09-13 (#1152/#1153, work-qa): RE-PINNED to 157,944 — measured, not estimated. The merge
+  // base already priced 155,174 (3,109 over the old pin, inside the headroom), and this change adds
+  // 2,770: the `label`/`within` aim on six input tools (seven schema sites, drag's from/to included),
+  // `prefix`/`label` on modoki_handles, and one sentence each telling modoki_tap and modoki_handles
+  // readers that chrome is now aimable by label and readable without modoki_eval — the ~1,900 evals
+  // #1152/#1153 measured are the spend this buys back. The param wording was trimmed once before
+  // pinning (158,364 → 157,776); the close-out then named label/entity in the x/y descriptions (+168).
+  const DEFINITION_BYTES = 157_944;
   const DEFINITION_HEADROOM = 4_000;
 
   // `sumSchemaBytes` itself now lives in `mcpSurface.ts` (imported above), not here — this ledger

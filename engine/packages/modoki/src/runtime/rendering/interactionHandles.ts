@@ -68,6 +68,28 @@ export interface HandleFilter {
   kind?: string;
   /** Restrict to these handle ids. */
   ids?: string[];
+  /** Restrict to ids starting with this string. Chrome ids are `<panel>.<region>.<name>`, so
+   *  `'inspector.'` scopes a read to one panel without paying for every other panel's handles. */
+  prefix?: string;
+  /** Restrict to handles whose label matches, by `labelMatches` — the SAME rule the `label` aim
+   *  resolves with (`domResolve.ts`), so a label that reads a handle is a label that aims at it. */
+  label?: string;
+}
+
+/** Collapse whitespace, trim, lowercase. One normalization for the read filter and the aim, so
+ *  "which handles are labelled X" and "tap the thing labelled X" cannot disagree (#1152/#1153).
+ *
+ *  Case-INSENSITIVE on purpose: an agent types the label it read off a screenshot or a doc, and
+ *  CSS `text-transform` makes the rendered case differ from `textContent`. The cost is more
+ *  collisions — and a collision is a refusal naming both candidates, never a first-match. */
+export function normalizeHandleLabel(s: string): string {
+  return s.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+/** Does a handle's label match the query? Exact after `normalizeHandleLabel` — not a substring,
+ *  because "Save" must not also hit "Save All" and turn every short label into an ambiguity. */
+export function labelMatches(label: string | undefined, query: string): boolean {
+  return label !== undefined && normalizeHandleLabel(label) === normalizeHandleLabel(query);
 }
 
 /** A handle computer. Returns the editor's current handles (empty when it has none
@@ -124,6 +146,8 @@ export function collectHandles(filter?: HandleFilter): InteractionHandle[] {
       if (filter?.editor && h.editor !== filter.editor) continue;
       if (filter?.kind && h.kind !== filter.kind) continue;
       if (idSet && !idSet.has(h.id)) continue;
+      if (filter?.prefix && !h.id.startsWith(filter.prefix)) continue;
+      if (filter?.label !== undefined && !labelMatches(h.label, filter.label)) continue;
       if (seen.has(h.id) && !warnedDuplicates.has(h.id)) {
         warnedDuplicates.add(h.id);
         console.error(`[interactionHandles] duplicate handle id ${JSON.stringify(h.id)} — tap_handle/drag_handle resolve the FIRST match, so the others are unreachable. Give each surface a unique id (a shared component must take its id from the caller).`);

@@ -140,7 +140,7 @@ const norm = (d: Decl): ToolContract => ({
 const TARGET_ENTITY_OCCLUSION_NOTE =
   'A RESOLVABLE aim covered by something else is REFUSED (400, `OCCLUDED`), naming the cover: the '
   + 'input would land on that instead, and reporting ok for it is the false success §0 ranks worst. '
-  + 'This binds BOTH resolvable aims — `entity` and `selector` — and matches the device surface, '
+  + 'This binds EVERY resolvable aim — `entity`, `selector` and `label` — and matches the device surface, '
   + 'which has always refused a covered selector. Raw `{x,y}` is never refused: a coordinate is '
   + 'exactly what was asked for. `allowOccluded:true` dispatches anyway (per-endpoint on `drag`); '
   + "on `pointer` it applies to `action:'down'` only, since a move/up is delivered to whatever "
@@ -308,12 +308,12 @@ const DECLS: Record<string, Decl> = {
   },
   modoki_handles: {
     kind: 'read', method: 'GET', route: '/api/enact-handles', requires: ['editor'],
-    // All THREE filters, not just `kind` — the over-cap hint is built from this list, so a missing
+    // EVERY filter, not just `kind` — the over-cap hint is built from this list, so a missing
     // one is a filter the agent is never told about (S3.10). (This comment used to claim the docs
     // catalog reads `filters` too. It does not — `renderCatalog` emits Tool/Endpoint/Effect/Needs/
     // Aim/Smallest-call and no filters column. Naming a consumer that does not exist is how a
     // declaration gets trusted for a job nothing is doing.)
-    filters: ['editor', 'kind', 'ids'],
+    filters: ['editor', 'kind', 'ids', 'prefix', 'label'],
   },
   modoki_tap_handle: {
     kind: 'input', method: 'POST', route: '/api/input/tap-handle',

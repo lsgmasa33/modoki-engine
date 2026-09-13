@@ -382,3 +382,192 @@ describe('describeOccluder', () => {
     expect(describeOccluder(null)).toBeNull();
   });
 });
+
+/** #1153 — the `label` aim's RULES. The population is the chrome handle set (so the real provider is
+ *  registered), and only on-window candidates are counted. `inputRoutes.test.ts` pins what the
+ *  routes do with each outcome. */
+describe('label aim (#1153)', () => {
+  let unregister: () => void;
+  beforeEach(async () => {
+    const [{ registerHandleProvider }, { chromeHandles }] = await Promise.all([
+      import('@modoki/engine/runtime'), import('../../app/debug/chromeHandles'),
+    ]);
+    unregister = registerHandleProvider(chromeHandles);
+    window.innerWidth = 1200;
+    window.innerHeight = 800;
+  });
+  afterEach(() => { unregister(); });
+
+  /** A tagged control with a rect, optionally inside a parent. */
+  function control(uiId: string, text: string, rect: { left: number; top: number; width: number; height: number }, parent: Element = document.body) {
+    const el = document.createElement('button');
+    el.setAttribute('data-ui-id', uiId);
+    el.textContent = text;
+    parent.appendChild(el);
+    stubRect(el, rect);
+    return el;
+  }
+
+  it('resolves the ONE matching control to its centre, naming it and its data-ui-id', () => {
+    const el = control('layout.tab.console', 'Console', { left: 300, top: 540, width: 60, height: 14 });
+    control('layout.tab.assets', 'Assets', { left: 400, top: 540, width: 60, height: 14 });
+    stubTopmost(el);
+    expect(resolveDomPointReport({ label: 'Console', gesture: 'tap' })).toMatchObject({
+      ok: true, x: 330, y: 547, uiId: 'layout.tab.console',
+      matched: 'button[data-ui-id="layout.tab.console"]', occluded: false,
+    });
+  });
+
+  it('matches whitespace-collapsed and case-insensitively', () => {
+    const el = control('a.b.paste', 'Paste   Values', { left: 10, top: 10, width: 80, height: 20 });
+    stubTopmost(el);
+    expect(resolveDomPointReport({ label: '  paste values ' })).toMatchObject({ ok: true, uiId: 'a.b.paste' });
+  });
+
+  it('never matches a SUBSTRING — but a miss suggests the labels that contain it', () => {
+    control('a.b.saveAll', 'Save All', { left: 10, top: 10, width: 80, height: 20 });
+    const r = resolveDomPointReport({ label: 'Save' });
+    expect(r).toMatchObject({ ok: false, code: 'NOT_FOUND' });
+    expect(r.error).toContain('"Save All"');
+  });
+
+  it('two on-screen matches are AMBIGUOUS, naming both ids — never first-match', () => {
+    control('inspector.footer.cancel', 'Cancel', { left: 10, top: 10, width: 80, height: 20 });
+    control('dialog.saveAs.cancel', 'Cancel', { left: 500, top: 400, width: 80, height: 20 });
+    const r = resolveDomPointReport({ label: 'Cancel' });
+    expect(r).toMatchObject({ ok: false, code: 'AMBIGUOUS' });
+    expect(r.error).toContain('inspector.footer.cancel');
+    expect(r.error).toContain('dialog.saveAs.cancel');
+    expect(r.error).toContain('within');
+  });
+
+  it('`within` scopes the candidates to one container', () => {
+    const dialog = document.createElement('div');
+    dialog.className = 'save-as-dialog';
+    document.body.appendChild(dialog);
+    control('inspector.footer.cancel', 'Cancel', { left: 10, top: 10, width: 80, height: 20 });
+    const inDialog = control('dialog.saveAs.cancel', 'Cancel', { left: 500, top: 400, width: 80, height: 20 }, dialog);
+    stubTopmost(inDialog);
+    expect(resolveDomPointReport({ label: 'Cancel', within: '.save-as-dialog' })).toMatchObject({ ok: true, uiId: 'dialog.saveAs.cancel' });
+    expect(resolveDomPointReport({ label: 'Cancel', within: '.not-open' })).toMatchObject({ ok: false, code: 'NOT_FOUND' });
+    expect(resolveDomPointReport({ label: 'Cancel', within: '[[bad' }).error).toMatch(/invalid CSS selector/);
+  });
+
+  it('an OFF-WINDOW twin is not a second candidate', () => {
+    const real = control('assets.row.a', 'Grass', { left: 20, top: 300, width: 100, height: 18 });
+    control('assets.row.b', 'Grass', { left: 20, top: 1500, width: 100, height: 18 }); // laid out below the window
+    stubTopmost(real);
+    expect(resolveDomPointReport({ label: 'Grass' })).toMatchObject({ ok: true, uiId: 'assets.row.a' });
+  });
+
+  it('matches that exist but are ALL off-window say so, rather than "no such label"', () => {
+    control('assets.row.b', 'Grass', { left: 20, top: 1500, width: 100, height: 18 });
+    const r = resolveDomPointReport({ label: 'Grass' });
+    expect(r).toMatchObject({ ok: false, code: 'NOT_FOUND' });
+    expect(r.error).toMatch(/none is inside the window/);
+  });
+
+  it('a match SCROLLED OUT of its list loses to a visible twin — and alone, is returned as clipped', () => {
+    const list = document.createElement('div');
+    list.style.overflow = 'hidden';
+    document.body.appendChild(list);
+    stubRect(list, { left: 0, top: 0, width: 300, height: 200 });
+    const hidden = control('hierarchy.row.1', 'Player', { left: 10, top: 400, width: 100, height: 18 }, list);
+    const chrome = document.createElement('div');
+    chrome.className = 'flexlayout__splitter';
+    document.body.appendChild(chrome);
+    stubTopmost(chrome);
+    // Alone: returned, so the route can refuse it as SCROLLED OUT instead of NOT_FOUND.
+    expect(resolveDomPointReport({ label: 'Player', gesture: 'tap' })).toMatchObject({ ok: true, uiId: 'hierarchy.row.1', occluded: true, clipped: true });
+    const visible = control('game.hud.player', 'Player', { left: 600, top: 100, width: 100, height: 18 });
+    stubTopmost(visible);
+    expect(resolveDomPointReport({ label: 'Player', gesture: 'tap' })).toMatchObject({ ok: true, uiId: 'game.hud.player' });
+    void hidden;
+  });
+
+  it('a covered label target reports occluded, like a selector aim', () => {
+    control('inspector.header.delete', 'Delete', { left: 10, top: 10, width: 80, height: 20 });
+    const modal = document.createElement('div');
+    modal.className = 'modal';
+    document.body.appendChild(modal);
+    stubTopmost(modal);
+    expect(resolveDomPointReport({ label: 'Delete', gesture: 'tap' })).toMatchObject({ ok: true, occluded: true, hitTarget: 'div.modal' });
+  });
+
+  it('label + selector is AMBIGUOUS, `within` alone is an error, an empty label matches nothing', () => {
+    control('a.b.c', 'Go', { left: 10, top: 10, width: 80, height: 20 });
+    expect(resolveDomPointReport({ label: 'Go', selector: '#x' })).toMatchObject({ ok: false, code: 'AMBIGUOUS' });
+    expect(resolveDomPointReport({ selector: '[data-ui-id="a.b.c"]', within: '.x' }).ok).toBe(false);
+    // The empty-label guard, not the filter: without it '' "matches" nothing yet suggests EVERY label
+    // (a substring of all of them) under a NOT_FOUND code. Asserting only ok:false could not tell.
+    const empty = resolveDomPointReport({ label: '   ' });
+    expect(empty).toMatchObject({ ok: false, error: 'label is empty — nothing to match' });
+    expect(empty.code).toBeUndefined();
+  });
+
+  it('reports whether the resolved element is ADDRESSABLE by its data-ui-id — false when another shares it', () => {
+    // Two crashed panels each render `panel-error.reload-panel`; focus re-finds by id (close-out).
+    const hierarchy = document.createElement('div');
+    hierarchy.setAttribute('data-panel-scope', 'hierarchy');
+    const inspector = document.createElement('div');
+    inspector.setAttribute('data-panel-scope', 'inspector');
+    document.body.append(hierarchy, inspector);
+    control('panel-error.reload-panel', 'Reload Panel', { left: 10, top: 10, width: 80, height: 20 }, hierarchy);
+    const second = control('panel-error.reload-panel', 'Reload Panel', { left: 600, top: 10, width: 80, height: 20 }, inspector);
+    stubTopmost(second);
+    const r = resolveDomPointReport({ label: 'Reload Panel', within: '[data-panel-scope="inspector"]' });
+    expect(r).toMatchObject({ ok: true, uiId: 'panel-error.reload-panel', uiIdAddressable: false });
+    // …and unscoped, the AMBIGUOUS hint does not advise a selector that cannot separate them.
+    const amb = resolveDomPointReport({ label: 'Reload Panel' });
+    expect(amb.code).toBe('AMBIGUOUS');
+    expect(amb.error).toMatch(/SHARE a data-ui-id/);
+    expect(amb.error).not.toMatch(/aim by selector/);
+  });
+
+  it('addressability models focus\'s RAW lookup — a stamp copy that comes first makes the real tab unaddressable', () => {
+    // `/api/input/focus` re-finds by a raw querySelector, so if a copy preceded the real element,
+    // focus WOULD land on the copy. Reporting "addressable" there would be the false success.
+    const stamps = document.createElement('div');
+    stamps.className = 'flexlayout__layout_tab_stamps';
+    document.body.appendChild(stamps);
+    const copy = document.createElement('span');
+    copy.setAttribute('data-ui-id', 'layout.tab.console');
+    stamps.appendChild(copy);
+    stubRect(copy, { left: 0, top: -9864, width: 60, height: 14 });
+    const real = control('layout.tab.console', 'Console', { left: 300, top: 540, width: 60, height: 14 });
+    stubTopmost(real);
+    expect(resolveDomPointReport({ label: 'Console' })).toMatchObject({ ok: true, uiIdAddressable: false });
+  });
+
+  it('a uniquely-id\'d match is addressable', () => {
+    const el = control('layout.tab.console', 'Console', { left: 300, top: 540, width: 60, height: 14 });
+    stubTopmost(el);
+    expect(resolveDomPointReport({ label: 'Console' })).toMatchObject({ ok: true, uiIdAddressable: true });
+  });
+
+  it('a label that exists only OUTSIDE `within` says so, rather than suggesting the label back', () => {
+    control('layout.tab.console', 'Console', { left: 300, top: 540, width: 60, height: 14 });
+    const assets = document.createElement('div');
+    assets.setAttribute('data-panel-scope', 'assets');
+    document.body.appendChild(assets);
+    const r = resolveDomPointReport({ label: 'Console', within: '[data-panel-scope="assets"]' });
+    expect(r).toMatchObject({ ok: false, code: 'NOT_FOUND' });
+    expect(r.error).toMatch(/none is inside/);
+    expect(r.error).not.toMatch(/Labels containing it/);
+  });
+
+  it('only CHROME handles are candidates — a canvas handle with the same label is not a DOM target', async () => {
+    const { registerHandleProvider } = await import('@modoki/engine/runtime');
+    // WITH an owner element, as every real canvas provider sets one (Dopesheet hands out its
+    // container). An owner-less handle would be skipped by the Element check alone and could not
+    // tell whether the `editor:'chrome'` scope is doing anything (mutation-checked).
+    const canvas = document.createElement('canvas');
+    document.body.appendChild(canvas);
+    stubRect(canvas, { left: 0, top: 0, width: 400, height: 300 });
+    stubTopmost(canvas);
+    const off = registerHandleProvider(() => [{ id: 'dope:key:0', kind: 'keyframe', editor: 'dopesheet', x: 50, y: 50, label: 'Console', owner: canvas }]);
+    try {
+      expect(resolveDomPointReport({ label: 'Console' })).toMatchObject({ ok: false, code: 'NOT_FOUND' });
+    } finally { off(); }
+  });
+});

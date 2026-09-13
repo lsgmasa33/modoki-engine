@@ -41,6 +41,39 @@ describe('computeHandles', () => {
     expect(r.handles.find((x) => x.id === 'visible')!.onScreen).toBe(true);
   });
 
+  it('caps a runaway label in the REPORT (moved here from the chrome provider, #1153)', () => {
+    provide(h({ id: 'long', label: 'x'.repeat(200) }), h({ id: 'short', label: 'Save' }));
+    const r = computeHandles();
+    const long = r.handles.find((x) => x.id === 'long')!.label!;
+    expect(long.length).toBe(58); // 57 + ellipsis
+    expect(long.endsWith('…')).toBe(true);
+    expect(r.handles.find((x) => x.id === 'short')!.label).toBe('Save');
+  });
+
+  describe('prefix and label filters (#1152)', () => {
+    it('prefix scopes to ids that START with it — not ids that merely contain it', () => {
+      provide(h({ id: 'inspector.a.b' }), h({ id: 'assets.inspector.c' }), h({ id: 'inspector.d.e' }));
+      expect(computeHandles({ prefix: 'inspector.' }).handles.map((x) => x.id)).toEqual(['inspector.a.b', 'inspector.d.e']);
+    });
+
+    it('label matches the WHOLE label, whitespace-collapsed and case-insensitive — never a substring', () => {
+      provide(
+        h({ id: 'a', label: 'Save' }), h({ id: 'b', label: '  save ' }), h({ id: 'c', label: 'Save All' }),
+        h({ id: 'd', label: 'Paste   Values' }), h({ id: 'e' }),
+      );
+      expect(computeHandles({ label: 'SAVE' }).handles.map((x) => x.id)).toEqual(['a', 'b']);
+      expect(computeHandles({ label: 'paste values' }).handles.map((x) => x.id)).toEqual(['d']);
+    });
+
+    it('label matches the FULL label even when the report caps it', () => {
+      const full = 'A very long confirmation button label that runs well past sixty characters';
+      provide(h({ id: 'long', label: full }));
+      const r = computeHandles({ label: full });
+      expect(r.handles.map((x) => x.id)).toEqual(['long']);
+      expect(r.handles[0].label).not.toBe(full); // …while the report is still capped
+    });
+  });
+
   it('a handle carrying unrelated meta is not counted as disabled', () => {
     provide(h({ id: 'k', meta: { boneName: 'root' } }), h({ id: 'j', meta: { disabled: false } }));
     expect(computeHandles().disabledCount).toBe(0);

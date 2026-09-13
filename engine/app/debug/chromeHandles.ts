@@ -18,8 +18,8 @@
  *  A second resolver here would recreate that fork, and `occluded` would drift too. So the
  *  handle's point, rect, and occlusion all come from `resolveElementPoint`/`isOccluded`. */
 
-import type { InteractionHandle } from '@modoki/engine/runtime';
-import { resolveElementPoint } from './domResolve';
+import { MIXED_PLACEHOLDER, type InteractionHandle } from '@modoki/engine/runtime';
+import { resolveElementPoint, isRenderedChromeCopy } from './domResolve';
 
 /** The attribute that opts an element into agent addressing. */
 export const UI_ID_ATTR = 'data-ui-id';
@@ -48,14 +48,81 @@ function isDisabled(el: Element): boolean {
   return el.getAttribute('data-ui-disabled') === 'true';
 }
 
-/** A short label: the explicit attribute, else the element's own trimmed text, else its
- *  title/aria-label. Capped — a panel's text can be arbitrarily long. */
+/** The label: the explicit attribute, else the element's own trimmed text, else its
+ *  title/aria-label.
+ *
+ *  ⚠️ UNCAPPED here, and that is load-bearing (#1153). The `label` aim and filter match against
+ *  THIS string, so capping it at the provider would make every label past the cap unmatchable by
+ *  its own full text. The cap is a response-budget concern and lives at the serialization
+ *  boundary, `computeHandles`. */
 function labelFor(el: Element): string | undefined {
   const explicit = el.getAttribute(UI_LABEL_ATTR);
   if (explicit) return explicit;
-  const text = (el.textContent ?? '').trim().replace(/\s+/g, ' ');
-  if (text) return text.length > 60 ? text.slice(0, 57) + '…' : text;
+  // A form control's text is not its name: a `<select>`'s textContent is every OPTION run together
+  // (measured live: the SceneView mode select labelled itself "3D2D"), and a textarea's is its
+  // default contents. Harmless while a label was only display; wrong now that it is an aim key.
+  const tag = el.tagName.toLowerCase();
+  const text = tag === 'select' || tag === 'textarea' ? '' : (el.textContent ?? '').trim().replace(/\s+/g, ' ');
+  if (text) return text;
   return el.getAttribute('title') ?? el.getAttribute('aria-label') ?? undefined;
+}
+
+/** A value is capped in the report — a textarea can hold a whole script. */
+const VALUE_CAP = 200;
+/** What a password field reports instead of its contents. */
+export const MASKED_VALUE = '•••';
+
+/** The LIVE form state of a control, read from the element itself (#1152).
+ *
+ *  `data-ui-state` is opt-in and only a handful of components set it, so an Inspector field's
+ *  current value was unreadable without `modoki_eval` walking the DOM — 314 evals did exactly
+ *  that. The element already knows its value; this reads it, so no component has to remember to
+ *  mirror it into an attribute (and none can forget).
+ *
+ *  - `value`   — input / select / textarea. A checkbox or radio reports `checked` instead, since
+ *                its `value` is a constant form token, not state. A password is MASKED: this
+ *                report crosses the agent bridge and lands in a transcript.
+ *  - `checked` — checkbox / radio.
+ *  - `expanded`— `aria-expanded`, the one standard attribute for "is this disclosure open". */
+function formStateFor(el: Element): { value?: string; checked?: boolean; expanded?: boolean; mixed?: true } {
+  const out: { value?: string; checked?: boolean; expanded?: boolean; mixed?: true } = {};
+  const tag = el.tagName.toLowerCase();
+  // ⚠️ MIXED is its own answer, not a value (#1152 close-out). A multi-select whose entities differ
+  // renders a checkbox `checked={false}` + `indeterminate`, a text/number field `value=''` behind the
+  // MIXED_PLACEHOLDER, and a select `value=''` with a MIXED_PLACEHOLDER option — so reading only
+  // checked/value reported a definite `false` and an "empty" field for a state that is neither.
+  //
+  // Keyed on what every mixed control already RENDERS, not on a marker each producer must add: the
+  // first attempt stamped `data-ui-mixed` in `fields.tsx`, and review found the Inspector's main
+  // number field (`NumberField`) and five texture selects render mixed without going through it.
+  // `data-ui-mixed` survives only for a control that CANNOT show the placeholder (a range slider).
+  // A mixed checkbox omits `checked` (a render artifact); a mixed field keeps `value:''`.
+  if (el.getAttribute('data-ui-mixed') === 'true') out.mixed = true;
+  if (tag === 'input') {
+    const input = el as HTMLInputElement;
+    const type = (input.type || 'text').toLowerCase();
+    if (type === 'checkbox' || type === 'radio') {
+      if (input.indeterminate) out.mixed = true;
+      else out.checked = input.checked;
+    }
+    else if (type === 'password') out.value = input.value ? MASKED_VALUE : '';
+    else {
+      out.value = input.value;
+      if (input.value === '' && input.getAttribute('placeholder') === MIXED_PLACEHOLDER) out.mixed = true;
+    }
+  } else if (tag === 'textarea') {
+    const ta = el as HTMLTextAreaElement;
+    out.value = ta.value;
+    if (ta.value === '' && ta.getAttribute('placeholder') === MIXED_PLACEHOLDER) out.mixed = true;
+  } else if (tag === 'select') {
+    const sel = el as HTMLSelectElement;
+    out.value = sel.value;
+    if (sel.value === '' && sel.selectedOptions[0]?.textContent === MIXED_PLACEHOLDER) out.mixed = true;
+  }
+  if (out.value !== undefined && out.value.length > VALUE_CAP) out.value = out.value.slice(0, VALUE_CAP - 1) + '…';
+  const expanded = el.getAttribute('aria-expanded');
+  if (expanded === 'true' || expanded === 'false') out.expanded = expanded === 'true';
+  return out;
 }
 
 /** Walk the DOM for `[data-ui-id]` and turn each into a handle.
@@ -70,10 +137,16 @@ export function chromeHandles(): InteractionHandle[] {
   for (const el of document.querySelectorAll(`[${UI_ID_ATTR}]`)) {
     const id = el.getAttribute(UI_ID_ATTR);
     if (!id) continue;
+    if (isRenderedChromeCopy(el)) continue; // a stamp/drag-image copy, not the control
     const point = resolveElementPoint(el);
     if ('error' in point) continue; // hidden / not laid out — not aimable, so not offered
     const label = labelFor(el); // reads textContent — compute once, not once per use
     const state = el.getAttribute(UI_STATE_ATTR);
+    const meta = {
+      ...(isDisabled(el) ? { disabled: true } : {}),
+      ...(state ? { state } : {}),
+      ...formStateFor(el),
+    };
     out.push({
       id,
       kind: el.getAttribute(UI_KIND_ATTR) ?? el.tagName.toLowerCase(),
@@ -85,9 +158,7 @@ export function chromeHandles(): InteractionHandle[] {
       // of every coordinate-addressed handle, not a chrome feature, so it does not belong here.
       owner: el,
       ...(label ? { label } : {}),
-      ...(isDisabled(el) || state
-        ? { meta: { ...(isDisabled(el) ? { disabled: true } : {}), ...(state ? { state } : {}) } }
-        : {}),
+      ...(Object.keys(meta).length ? { meta } : {}),
     });
   }
   return out;

@@ -56,6 +56,7 @@ function fakeRegistry(): (name: string) => RegisteredTool | undefined {
       name: 'modoki_tap', description: '',
       shape: {
         x: z.number().optional(), y: z.number().optional(), selector: z.string().optional(),
+        label: z.string().optional(), within: z.string().optional(),
         entity: z.object({ guid: z.string().optional(), name: z.string().optional() }).optional(),
       },
       handler: async () => { ran.push('tap'); return okResult('{"ok":true}'); },
@@ -298,6 +299,14 @@ describe('raw {x,y} aiming is refused inside a batch', () => {
     ] });
     expect(isRejection(r)).toBe(false);
     expect(ran).toEqual(['tap', 'tap']);
+  });
+
+  it('a LABEL aim is an aim too — stray x/y beside it do not trip the refusal (#1153)', async () => {
+    const r = await run({ steps: [
+      { tool: 'modoki_tap', args: { label: 'Console', x: 1, y: 2 } },
+      { tool: 'modoki_drag', args: { from: { label: 'Console', x: 1, y: 2 }, to: { selector: '#go' } } },
+    ] });
+    expect(isRejection(r)).toBe(false);
   });
 
   it('does NOT trip on coordinates sitting beside a winning aim', async () => {

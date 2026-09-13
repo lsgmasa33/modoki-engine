@@ -111,6 +111,13 @@ export type HeldLossReason = 'idle' | 'superseded' | 'reload';
  *  callers for no gain). */
 export interface PointSpec {
   x?: number; y?: number; selector?: string; entity?: EntityPointSpec;
+  /** Editor chrome by its LABEL (#1153) — resolved in the renderer over the same set
+   *  `modoki_handles {editor:'chrome'}` lists. Ranks with `selector` (both name a DOM thing), so
+   *  combining it with `selector` or `entity` is REFUSED rather than settled by precedence:
+   *  unlike `selector`-over-`{x,y}` there is no legacy call shape that sends both incidentally. */
+  label?: string;
+  /** CSS selector scoping a `label` aim to one panel or dialog. */
+  within?: string;
   /** Aim at the target even though something covers it. Default false = REFUSE.
    *
    *  A resolvable aim (`entity`, `selector`) names a THING, so a press the surface would deliver
@@ -204,6 +211,17 @@ export async function resolvePoint(
   // have re-introduced the permissive path this parameter exists to remove.
   gesture?: AimGesture,
 ): Promise<{ point: ResolvedPoint } | { error: string; code?: ErrorCode }> {
+  const hasEntity = !!spec?.entity && typeof spec.entity === 'object' && Object.keys(spec.entity).length > 0;
+  if (spec && spec.label !== undefined && (spec.selector || hasEntity)) {
+    return {
+      error: `${which}: give ONE of label, selector or entity — ${spec.selector ? 'label and selector' : 'label and entity'} `
+        + 'are two addresses for one target, and picking one by precedence would silently ignore the other.',
+      code: 'AMBIGUOUS',
+    };
+  }
+  if (spec && spec.within !== undefined && spec.label === undefined) {
+    return { error: `${which}: \`within\` scopes a \`label\` aim and has no meaning without one — pass label, or drop within.`, code: 'REFUSED_BY_OP' };
+  }
   // ── entity: resolve {guid}/{name}/{id} to the entity's LIVE screen rect in the renderer. ──
   // Highest precedence: it is the most specific thing the caller can say, and (unlike a
   // selector) there is no legacy call shape that passes it incidentally.
@@ -285,17 +303,26 @@ export async function resolvePoint(
       },
     };
   }
-  if (spec && typeof spec.selector === 'string' && spec.selector) {
+  // A `label` rides the selector path: both name a DOM element, so the occlusion, scrolled-out and
+  // settling diagnoses below are the same code for both rather than a second copy that drifts (§9).
+  const byLabel = !!spec && spec.label !== undefined;
+  if (spec && ((typeof spec.selector === 'string' && spec.selector) || byLabel)) {
+    const aimName = byLabel ? `label ${JSON.stringify(spec.label)}` : JSON.stringify(spec.selector);
     let res: DomPointResolution | null;
     try {
       // The selector path needs the gesture just as much: `UINode.tsx` stamps `data-entity-id` on
       // every game UI node, so a selector aim reaches game UI and hits the same tap zones (#1016).
-      res = (await requestRenderer('resolve-dom-point', { selector: spec.selector, gesture })) as DomPointResolution | null;
+      res = (await requestRenderer('resolve-dom-point', byLabel
+        ? { label: spec.label, within: spec.within, gesture }
+        : { selector: spec.selector, gesture })) as DomPointResolution | null;
     } catch (e) {
-      return { error: `${which}: renderer could not resolve selector (${e instanceof Error ? e.message : String(e)})` };
+      return { error: `${which}: renderer could not resolve ${byLabel ? 'label' : 'selector'} (${e instanceof Error ? e.message : String(e)})` };
     }
     if (!res || !res.ok || typeof res.x !== 'number' || typeof res.y !== 'number') {
-      return { error: `${which}: ${res?.error ?? 'selector did not resolve'}${await settlingHint(requestRenderer)}` };
+      return {
+        error: `${which}: ${res?.error ?? `${byLabel ? 'label' : 'selector'} did not resolve`}${await settlingHint(requestRenderer)}`,
+        ...(res?.code ? { code: res.code } : {}),
+      };
     }
     if (res.occluded && !spec.allowOccluded) {
       // Two different diagnoses, because they want different actions and the covering element's
@@ -306,11 +333,11 @@ export async function resolvePoint(
       const settling = await settlingHint(requestRenderer);
       return {
         error: (res.clipped
-          ? `${which}: ${JSON.stringify(spec.selector)} is SCROLLED OUT of its own container — its `
+          ? `${which}: ${aimName} is SCROLLED OUT of its own container — its `
             + `rect is real but nothing is drawn there, so the point lands on ${res.hitTarget ?? 'other chrome'} `
             + 'instead. Scroll it into view (modoki_scroll over that panel) or enlarge the panel, then '
             + 're-aim; allowOccluded:true would press the chrome behind it.'
-          : `${which}: ${JSON.stringify(spec.selector)} resolves to a point covered by `
+          : `${which}: ${aimName} resolves to a point covered by `
             + `${res.hitTarget ?? 'something else'} — the input would land on THAT, not on your target. `
             + 'Dismiss/move what covers it (an open menu, a modal, a panel that overlaps), scroll the '
             + 'target clear, or pass allowOccluded:true to aim there anyway and see what happens.') + settling,
@@ -322,7 +349,7 @@ export async function resolvePoint(
   if (spec && typeof spec.x === 'number' && typeof spec.y === 'number') {
     return { point: { x: spec.x, y: spec.y } };
   }
-  return { error: `${which}: provide an entity {guid|name|id}, a selector, or {x,y}` };
+  return { error: `${which}: provide an entity {guid|name|id}, a selector, a label, or {x,y}` };
 }
 
 /** Strip the undefined provenance fields so a coordinate-addressed call's response stays
@@ -692,7 +719,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
   async function dispatchInput({ urlPath, body }: HostRequest): Promise<BackendResult | null> {
 
     if (urlPath === '/api/input/tap') {
-      const { x, y, selector, entity, allowOccluded, button, clickCount, modifiers } = (body ?? {}) as PointSpec & { button?: MouseButton; clickCount?: number; modifiers?: InputModifier[] };
+      const { x, y, selector, label, within, entity, allowOccluded, button, clickCount, modifiers } = (body ?? {}) as PointSpec & { button?: MouseButton; clickCount?: number; modifiers?: InputModifier[] };
       const unknownVocab = refuseVocabulary(
         refuseUnknownValue('tap button', button, MOUSE_BUTTONS),
         refuseUnknownValues('tap modifiers', modifiers, EDITOR_INPUT_MODIFIERS),
@@ -706,7 +733,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
       // `auxclick`) and `pressOrigin.ts` listens on `'click'`, so the runtime does NOT redirect a
       // right-press. Modelling one reports `occluded:false` for a press that then lands on the
       // zone: the false success this whole change exists to prevent, one parameter in.
-      const r = await resolvePoint({ x, y, selector, entity, allowOccluded }, 'tap', requestRenderer,
+      const r = await resolvePoint({ x, y, selector, label, within, entity, allowOccluded }, 'tap', requestRenderer,
         // `== null`: a JSON `button:null` is "not given" (the vocabulary check passes it), so it clicks
         // LEFT and must be modelled as the tap it is, not the stricter press (#1076 close-out).
         button == null || button === 'left' ? 'tap' : 'press');
@@ -755,7 +782,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
     // slingshot pull, a charge meter, a drag-to-aim rubber-band — with get_scene_state / eval /
     // a screenshot mid-gesture, which the atomic drag can't expose.
     if (urlPath === '/api/input/pointer') {
-      const { action, x, y, selector, entity, allowOccluded, button, modifiers } =
+      const { action, x, y, selector, label, within, entity, allowOccluded, button, modifiers } =
         (body ?? {}) as PointSpec & { action?: 'down' | 'move' | 'up'; button?: MouseButton; modifiers?: InputModifier[] };
       if (action !== 'down' && action !== 'move' && action !== 'up') {
         return bad(`pointer: action must be 'down', 'move', or 'up' (got ${JSON.stringify(action)})`, 'REFUSED_BY_OP', [...POINTER_ACTIONS]);
@@ -798,7 +825,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
       const held = action !== 'down';
       const r = await resolvePoint(
         {
-          x, y, selector,
+          x, y, selector, label, within,
           entity: held && entity ? { ...entity, allowOccluded: true } : entity,
           allowOccluded: held ? true : allowOccluded,
         },
@@ -848,20 +875,20 @@ export function createInputRoutes(deps: InputRouteDeps) {
     }
 
     if (urlPath === '/api/input/hover') {
-      const { x, y, selector, entity, allowOccluded, modifiers } = (body ?? {}) as PointSpec & { modifiers?: InputModifier[] };
+      const { x, y, selector, label, within, entity, allowOccluded, modifiers } = (body ?? {}) as PointSpec & { modifiers?: InputModifier[] };
       const unknownVocab = refuseVocabulary(refuseUnknownValues('hover modifiers', modifiers, EDITOR_INPUT_MODIFIERS));
       if (unknownVocab) return unknownVocab;
-      const r = await resolvePoint({ x, y, selector, entity, allowOccluded }, 'hover', requestRenderer, 'hover');
+      const r = await resolvePoint({ x, y, selector, label, within, entity, allowOccluded }, 'hover', requestRenderer, 'hover');
       if ('error' in r) return bad(r.error, r.code);
       await ops.hover(r.point.x, r.point.y, modifiers);
       return json({ ok: true, hovered: { x: r.point.x, y: r.point.y }, ...provenance(r.point) });
     }
 
     if (urlPath === '/api/input/scroll') {
-      const { x, y, selector, entity, allowOccluded, deltaX, deltaY, modifiers } = (body ?? {}) as PointSpec & { deltaX?: number; deltaY?: number; modifiers?: InputModifier[] };
+      const { x, y, selector, label, within, entity, allowOccluded, deltaX, deltaY, modifiers } = (body ?? {}) as PointSpec & { deltaX?: number; deltaY?: number; modifiers?: InputModifier[] };
       const unknownVocab = refuseVocabulary(refuseUnknownValues('scroll modifiers', modifiers, EDITOR_INPUT_MODIFIERS));
       if (unknownVocab) return unknownVocab;
-      const r = await resolvePoint({ x, y, selector, entity, allowOccluded }, 'scroll', requestRenderer, 'scroll');
+      const r = await resolvePoint({ x, y, selector, label, within, entity, allowOccluded }, 'scroll', requestRenderer, 'scroll');
       if ('error' in r) return bad(r.error, r.code);
       // A scroll with no delta is a no-op wearing an action's name (S3.15). `deltaY` documents no
       // default and the tool shape is non-strict about intent — a misspelled `dy` reaches here as
@@ -869,7 +896,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
       // `ok:true, scrolled:{deltaX:0,deltaY:0}`. Refuse, exactly as /api/input/drag and
       // /api/input/drag-handle refuse a zero-length gesture, and for the same reason.
       if (!deltaX && !deltaY) {
-        return bad('scroll is a no-op: neither deltaX nor deltaY is a non-zero number, so no wheel movement would be delivered. Pass deltaY (~120 ≈ one wheel tick down, negative = up) and/or deltaX. Accepted keys: x, y, selector, entity, deltaX, deltaY, modifiers.');
+        return bad('scroll is a no-op: neither deltaX nor deltaY is a non-zero number, so no wheel movement would be delivered. Pass deltaY (~120 ≈ one wheel tick down, negative = up) and/or deltaX. Accepted keys: x, y, selector, label, within, entity, deltaX, deltaY, modifiers.');
       }
       await ops.scroll(r.point.x, r.point.y, deltaX ?? 0, deltaY ?? 0, modifiers);
       return json({ ok: true, scrolled: { x: r.point.x, y: r.point.y, deltaX: deltaX ?? 0, deltaY: deltaY ?? 0, ...(modifiers?.length ? { modifiers } : {}) }, ...provenance(r.point) });
@@ -1002,7 +1029,35 @@ export function createInputRoutes(deps: InputRouteDeps) {
     }
 
     if (urlPath === '/api/input/focus') {
-      const { selector, panel } = (body ?? {}) as { selector?: string; panel?: string };
+      const { selector: rawSelector, panel, label, within } = (body ?? {}) as { selector?: string; panel?: string; label?: string; within?: string };
+      if (label !== undefined && rawSelector !== undefined) {
+        return bad('focus: give a label OR a selector, not both — two addresses for one target.', 'AMBIGUOUS');
+      }
+      if (within !== undefined && label === undefined) {
+        return bad('focus: `within` scopes a `label` aim and has no meaning without one — pass label, or drop within.', 'REFUSED_BY_OP');
+      }
+      // A label resolves through the SAME renderer op every aimed route uses (#1153 — §9: this route
+      // used to be the one with its own resolver), then focuses the element it named by its
+      // data-ui-id. Resolved BEFORE the panel scope moves, so a refused label changes nothing.
+      let selector = rawSelector;
+      if (label !== undefined) {
+        let res: DomPointResolution | null;
+        try {
+          res = (await requestRenderer('resolve-dom-point', { label, within, gesture: 'press' })) as DomPointResolution | null;
+        } catch (e) {
+          return bad(`focus: renderer could not resolve label (${e instanceof Error ? e.message : String(e)})`);
+        }
+        if (!res?.ok || !res.uiId) return bad(`focus: ${res?.error ?? 'label did not resolve'}`, res?.code);
+        // Focus acts on an ELEMENT, found again by id — so an id another element shares would focus
+        // THAT one and report ok (#1153 close-out: every crashed panel renders the same
+        // `panel-error.reload-panel`). Refuse rather than focus the wrong twin.
+        if (res.uiIdAddressable === false) {
+          return bad(`focus: label ${JSON.stringify(label)} resolved to ${res.matched ?? res.uiId}, but its data-ui-id `
+            + `${JSON.stringify(res.uiId)} is shared with another element, so focusing it by id would focus the first `
+            + 'of them instead. Aim at it with modoki_tap {label, within} only if ACTIVATING it is fine — a tap focuses what it lands on, but also presses it (a button runs its action).', 'AMBIGUOUS');
+        }
+        selector = `[data-ui-id=${JSON.stringify(res.uiId)}]`;
+      }
       // `panel` sets the KEYBOARD SCOPE; `selector` sets DOM focus. Genuinely different:
       // clicking a Hierarchy row moves the scope but leaves document.activeElement on
       // <body>. Both may be given — the scope is set first. (P7)

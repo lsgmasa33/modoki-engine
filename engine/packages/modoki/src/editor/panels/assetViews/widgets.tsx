@@ -190,12 +190,17 @@ export function NumberField({ label, value, onChange, step = 0.1, readOnly = fal
           value={mixed ? hint!.min! : parseNumber(localValue)}
           onChange={(e) => handleChange(e.target.value)}
           data-ui-id={dataUiId ? `${dataUiId}.slider` : undefined}
+          // A range input cannot show MIXED_PLACEHOLDER, so it parks at `min` when mixed — say so, or
+          // `modoki_handles` reads that `min` as the real value (#1152 close-out).
+          data-ui-mixed={mixed ? 'true' : undefined}
           style={{ flex: 1, minWidth: 0, accentColor: '#5dade2', cursor: 'pointer' }}
         />
       )}
       <input
         type="number"
-        value={readOnly ? value.toFixed(3) : localValue}
+        // A read-only MIXED field must not show one entity's value as the value — it hid the placeholder
+        // behind the first selection's number, for the human and for modoki_handles alike (#1152 close-out).
+        value={readOnly ? (mixed ? '' : value.toFixed(3)) : localValue}
         placeholder={mixed ? MIXED_PLACEHOLDER : undefined}
         step={step}
         readOnly={readOnly}

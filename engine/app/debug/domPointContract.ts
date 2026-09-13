@@ -60,6 +60,12 @@ export function isClickShaped(gesture: AimGesture | undefined): boolean {
  *  viewport CSS coordinates. */
 export interface DomPointSpec {
   selector?: string;
+  /** Aim at the editor-chrome element whose label is this (#1153) — the SAME population and match
+   *  rule as `modoki_handles {editor:'chrome', label}`, so what a read names an aim can hit.
+   *  Exactly one on-screen match, or the resolution refuses naming the candidates. */
+  label?: string;
+  /** CSS selector scoping a `label` aim to elements inside it (a panel, a dialog). */
+  within?: string;
   x?: number;
   y?: number;
   /** What the caller will do here. Absent on the DnD path, which passes its gesture directly. */
@@ -76,6 +82,17 @@ export interface DomPointResolution {
   ok: boolean;
   /** Present when `ok` is false — why the selector could not be aimed at. */
   error?: string;
+  /** Present on a refusal that has a §5 code of its own: a `label` that matched nothing
+   *  (`NOT_FOUND`) or more than one on-screen element (`AMBIGUOUS`). */
+  code?: 'NOT_FOUND' | 'AMBIGUOUS';
+  /** The `data-ui-id` a `label` aim resolved to — lets a caller that needs the ELEMENT rather than a
+   *  point (`/api/input/focus`) address it by selector. */
+  uiId?: string;
+  /** Whether `[data-ui-id=<uiId>]` addresses THE element the label resolved to — i.e. its first
+   *  match. False when another element shares the id (every crashed panel's
+   *  `panel-error.reload-panel` does), in which case re-finding it by id would act on a different
+   *  element than the one resolved. */
+  uiIdAddressable?: boolean;
   x?: number;
   y?: number;
   /** Descriptor of the element the selector matched (absent for a coordinate spec). */

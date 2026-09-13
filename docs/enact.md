@@ -359,6 +359,37 @@ position and acting on it. Precedence is `entity` → `selector` → `{x,y}`.
 inline-styled div soup, which is exactly why the curated path below addresses by stable id
 instead of CSS path.
 
+### `label` — the curated set, named the way a human reads it (#1153)
+
+Transcripts showed 213 `modoki_eval` calls finding a button by its visible text and calling
+`.click()`. That click is untrusted, bypasses hit-testing, and so skips the occlusion refusal. A
+`label` aim (plus an optional `within` CSS scope) replaces it. Four decisions shape it:
+
+- **Population = the chrome HANDLE set, not all text on the page.** `resolveLabel` in
+  `domResolve.ts` calls `collectHandles({editor:'chrome', label})`: the exact list
+  `modoki_handles {editor:'chrome', label}` returns, matched by the same `labelMatches`. So a
+  label an agent READ is a label it can AIM at. A text scrape would reach untagged elements too,
+  but a paragraph reading "Save" is not a Save button, and first-in-DOM would decide which one
+  got pressed.
+- **Only on-window candidates count.** A label that is off-window, zero-size, or scrolled out of
+  its container behind a visible twin cannot receive a press. Counting it would make ordinary
+  labels `AMBIGUOUS` over things nobody can see. A LONE scrolled-out match is still returned, so
+  the route's SCROLLED OUT refusal fires instead of a misleading `NOT_FOUND`.
+- **Whole label, case-insensitive, never a substring.** Substring matching would make "Save" hit
+  "Save All" and turn every short label into an ambiguity. A miss *suggests* labels that contain
+  the text; it never aims at them.
+- **It rides `resolvePoint`'s selector branch.** Occlusion, scrolled-out and layout-settling
+  diagnoses are the same code for both aims. `label` together with `selector` or `entity` is
+  refused `AMBIGUOUS`. The older `entity` → `selector` → `{x,y}` order is precedence only because
+  legacy calls sent both; nothing ever sent a label alongside another aim. `modoki_focus` resolves
+  a label through the same op and focuses the returned `uiId`.
+
+A label is the element's `data-ui-label`, else its text, else `title`/`aria-label`. A `<select>`
+or `<textarea>` skips its text, because a select's text is every option run together (the
+SceneView mode select labelled itself "3D2D"). The label is **uncapped at the provider** so a
+long one still matches its own full text; `computeHandles` caps it at 60 characters for the
+report only.
+
 ## Editor chrome as handle providers
 
 Surfaces an agent must drive carry a `data-ui-id="<panel>.<region>.<name>"` attribute. The test
@@ -382,6 +413,31 @@ The handle shape carries three fields that make chrome addressing robust:
 - **`rect`** (not just the center point) → overlap between handles is computable.
 - **`meta.disabled`** → a greyed-out Paste is reported as data, not left for the agent to infer
   from a pixel shade.
+- **`meta.value` / `meta.checked` / `meta.expanded`** (#1152) → read from the ELEMENT, not from
+  an attribute a component must remember to set. 314 evals read Inspector and dialog values by
+  walking the DOM, because `data-ui-state` is opt-in and a text field never opted in. A
+  `type=password` value is masked, because the report lands in a transcript. **Mixed is its own
+  answer (`meta.mixed`), not a value.** A differing multi-selection draws a checkbox as
+  `checked={false}` + `indeterminate`, and a text field as `value=''` behind the `----`
+  placeholder. Reading only `checked`/`value` reported a definite false and an "empty" field.
+  - **Checkboxes:** the DOM's `indeterminate` flag.
+  - **Everything else:** keyed on what every mixed control already RENDERS — an empty
+    input/textarea whose placeholder is `MIXED_PLACEHOLDER`, or a select whose selected option is.
+    The constant now lives in `runtime/rendering/mixedPlaceholder.ts` (a side-effect-free module: the
+    first home, `interactionHandles.ts`, runs `onWorldSwap` at load and broke four editor suites that
+    mock `core/ecs/world`), since the reader also
+    runs on device and must not import the editor.
+  - **Why not a per-producer marker:** the first fix used one (`data-ui-mixed` in `fields.tsx`),
+    and review found the Inspector's own `NumberField` and five texture selects render mixed
+    without it. `data-ui-mixed` remains only on `NumberField`'s range slider, which cannot show
+    a placeholder.
+  - **Producer test:** `tests/editor/mixedFieldHandles.test.tsx` renders the real components.
+- **Dock tabs** are tagged through FlexLayout's `onRenderTab`
+  (`editor/layoutTabTag.ts` → `layout.tab.<component>`, `kind:'tab'`, state selected/unselected).
+  FlexLayout puts no attributes on its tab BUTTON, so the tab's content span carries them, and a
+  press on it bubbles to the button. ⚠️ FlexLayout also renders every tab as a *stamp* inside
+  `.flexlayout__layout_tab_stamps` at y≈-9960, through the same hook. Measured live, every
+  `layout.tab.*` id came back twice, so `chromeHandles` skips that container (`RENDERED_COPY_CONTAINERS`).
 - **`meta.state`** (from an optional `data-ui-state` on the element) → the same argument for a
   control that has a CURRENT VALUE rather than just a pressed/not-pressed. A segmented
   Auto | On | Off row renders its active segment as a background colour, which is unreadable in a

@@ -227,6 +227,16 @@ export const DISCARD_UNSAVED_BASE =
   + 'modoki_ota_publish destroys NOTHING, and one word cannot mean both';
 export const discardUnsavedParam = z.boolean().optional().describe(`${DISCARD_UNSAVED_BASE}.`);
 
+/** The `label` aim (#1153): editor chrome by its visible label. Factories, not shared consts, for
+ *  the `$ref`-dedup reason `makePointSpec` documents below — drag's `from`/`to` both carry them. */
+export const makeLabelAimParam = () => z.string().optional().describe(
+  'Editor chrome (data-ui-id control or dock tab) by its WHOLE label, e.g. "Console"; case-insensitive. '
+  + 'Refused unless exactly one on-screen match. Not with selector/entity.',
+);
+export const makeWithinParam = () => z.string().optional().describe(
+  'CSS selector scoping `label`, e.g. \'[data-panel-scope="assets"]\'.',
+);
+
 /** A factory for the same `$ref`-dedup reason as `makeEntitySpec` above — `modoki_drag` uses this
  *  twice (`from`/`to`) in one shape, so a shared instance would dedupe the same way.
  *
@@ -242,6 +252,8 @@ export const makePointSpec = () => z.object({
   x: z.number().optional(),
   y: z.number().optional(),
   selector: z.string().optional(),
+  label: makeLabelAimParam(),
+  within: makeWithinParam(),
   entity: makeEntitySpec().optional(),
   allowOccluded: z.boolean().optional().describe(`${ALLOW_OCCLUDED_BASE}.`),
 });

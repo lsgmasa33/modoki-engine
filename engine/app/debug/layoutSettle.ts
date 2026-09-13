@@ -30,12 +30,16 @@
  *  at — and it is the same sample the #261 measurements used. Cheap (~15 nodes in a live editor).
  */
 
+import { isRenderedChromeCopy } from './domResolve';
+
 /** One frame of layout, keyed so a node appearing or disappearing is itself a change. */
 function snapshot(): Map<string, string> {
   const out = new Map<string, string>();
   for (const el of document.querySelectorAll('[data-ui-id]')) {
     const id = el.getAttribute('data-ui-id');
-    if (!id) continue;
+    // A FlexLayout stamp shares its real tab's id (#1152) and would overwrite that entry, hiding the
+    // real tab's movement — the same copies `chromeHandles` excludes, by the same predicate.
+    if (!id || isRenderedChromeCopy(el)) continue;
     const r = el.getBoundingClientRect();
     out.set(id, `${Math.round(r.left)},${Math.round(r.top)},${Math.round(r.width)},${Math.round(r.height)}`);
   }

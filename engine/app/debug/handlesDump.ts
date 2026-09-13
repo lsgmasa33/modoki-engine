@@ -64,6 +64,15 @@ export interface HandlesDumpResult {
 /** A greyed-out control — present but inert. `meta.disabled` is the convention. */
 const isDisabled = (h: InteractionHandle) => h.meta?.disabled === true;
 
+/** Cap a label for the REPORT. A panel's text can be arbitrarily long, and a chrome element's
+ *  label is its whole `textContent`. Capped here, at serialization, rather than in the provider:
+ *  the `label` filter and aim match the FULL string (#1153), so a provider-side cap would make any
+ *  long label unmatchable by its own text. */
+const LABEL_CAP = 60;
+export function capLabel(label: string): string {
+  return label.length > LABEL_CAP ? label.slice(0, LABEL_CAP - 3) + '…' : label;
+}
+
 const isElement = (v: unknown): v is Element =>
   typeof Element !== 'undefined' && v instanceof Element;
 
@@ -80,7 +89,7 @@ export function computeHandles(params: HandlesDumpParams = {}): HandlesDumpResul
     // the chrome provider. Being un-clickable because something covers you is a property
     // of anything addressed by coordinate, which is what a handle IS. `owner` is a live
     // DOM node, so it must never reach the JSON that crosses the agent bridge.
-    const { owner, ...rest } = h;
+    const { owner, label, ...rest } = h;
     // `'press'` — not click-shaped, so the tap-zone redirect is not consulted (#1016). Stated as a
     // choice rather than inherited from a default.
     //
@@ -96,6 +105,7 @@ export function computeHandles(params: HandlesDumpParams = {}): HandlesDumpResul
     const clipped = inWindow && isElement(owner) && !withinClip(owner, h.x, h.y, clipCache);
     return {
       ...rest,
+      ...(label !== undefined ? { label: capLabel(label) } : {}),
       ...(occludedBy ? { occludedBy } : {}),
       onScreen: inWindow && !clipped,
       ...(clipped ? { clipped: true as const } : {}),

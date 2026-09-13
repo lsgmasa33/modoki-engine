@@ -508,7 +508,7 @@ interface ScriptFile { rel: string; path: string; name: string }
 
 /** What the renderer's `enact-handles` op returns. Only the fields the router summarizes
  *  on are named; everything else (viewport, the occlusion counters) rides through. */
-interface HandlesResponse { handles?: Array<{ editor?: string; kind?: string }>; [k: string]: unknown }
+interface HandlesResponse { handles?: Array<{ id?: string; editor?: string; kind?: string }>; [k: string]: unknown }
 
 /** Recursively collect source files under `rootAbs`: `rel` is the root-relative
  *  POSIX path (for folder-tree building + display), `path` is the /@fs/<abs>
@@ -1330,17 +1330,21 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     return relayJson(ctx, 'layout-bounds', params);
   }
 
-  // ── GET /api/enact-handles[?editor=&kind=&ids=] (M→R) ── numeric handle geometry
+  // ── GET /api/enact-handles[?editor=&kind=&ids=&prefix=&label=] (M→R) ── numeric handle geometry
   // (Enact Phase 2): the draggable handles the Canvas2D/SVG authoring editors offer
   // right now, in viewport CSS px, so drag-handle/tap-handle can aim without pixels. ──
   if (urlPath === '/api/enact-handles' && method === 'GET') {
-    const params: { editor?: string; kind?: string; ids?: string[] } = {};
+    const params: { editor?: string; kind?: string; ids?: string[]; prefix?: string; label?: string } = {};
     const editor = query.get('editor');
     const kind = query.get('kind');
     const ids = query.get('ids');
+    const prefix = query.get('prefix');
+    const label = query.get('label');
     if (editor) params.editor = editor;
     if (kind) params.kind = kind;
     if (ids) params.ids = ids.split(',').map((s) => s.trim()).filter(Boolean);
+    if (prefix) params.prefix = prefix;
+    if (label) params.label = label;
     try {
       const raw = await ctx.requestBrowser('enact-handles', params);
       // ⚠️ A §5 refusal travels as itself rather than as a 200 (#1013).
@@ -1362,7 +1366,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       // A bare call with a Dopesheet open enumerates every key of every track (no windowing
       // in DopesheetView) — ~374 bytes/handle, so 2,000 keys ≈ 187k tokens. Untargeted now
       // reports per-editor/per-kind counts; the geometry needs an editor/kind/ids filter.
-      const bare = !editor && !kind && !(params.ids?.length);
+      const bare = !editor && !kind && !(params.ids?.length) && !prefix && !label;
       if (bare && res && Array.isArray(res.handles)) {
         const byEditor: Record<string, number> = {};
         const byKind: Record<string, number> = {};
@@ -1389,22 +1393,33 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       // unchanged) turns it into "your filter matched nothing, and HERE is what is live".
       if (!bare && res && Array.isArray(res.handles) && res.handles.length === 0) {
         const asked = [editor ? `editor=${editor}` : null, kind ? `kind=${kind}` : null,
-          params.ids?.length ? `ids=[${params.ids.join(',')}]` : null].filter(Boolean).join(', ');
+          params.ids?.length ? `ids=[${params.ids.join(',')}]` : null,
+          prefix ? `prefix=${prefix}` : null, label ? `label=${JSON.stringify(label)}` : null].filter(Boolean).join(', ');
         let all: HandlesResponse | null = null;
         try { all = await ctx.requestBrowser('enact-handles', {}) as HandlesResponse; } catch { /* keep the primary answer */ }
         const byEditor: Record<string, number> = {};
         const byKind: Record<string, number> = {};
+        // #1152: the id prefixes that ARE live, so an empty `prefix=dialog.saveAs.` answers "that
+        // dialog is not open" — and a typo'd one is visibly a typo — instead of an empty list that
+        // reads the same either way. First segment only: that is the panel/dialog, and a full id
+        // list is the unbounded dump the bare-call summary exists to avoid.
+        const idPrefixes = new Set<string>();
         for (const h of all?.handles ?? []) {
           byEditor[h.editor ?? '?'] = (byEditor[h.editor ?? '?'] ?? 0) + 1;
           byKind[h.kind ?? '?'] = (byKind[h.kind ?? '?'] ?? 0) + 1;
+          if ((prefix || label) && h.editor === 'chrome' && typeof h.id === 'string') idPrefixes.add(`${h.id.split('.')[0]}.`);
         }
         const live = Object.keys(byEditor);
+        const prefixNote = idPrefixes.size
+          ? ` Chrome id prefixes live now: {${[...idPrefixes].sort().join(', ')}} — a prefix absent from this set is a panel or dialog that is not open.`
+          : '';
+        const labelNote = label ? ' A label matches the WHOLE label (whitespace-collapsed, case-insensitive), never a substring.' : '';
         return json({
           ...res,
           byEditor,
           byKind,
           hint: live.length
-            ? `no handle matches ${asked}. Live now: editor ∈ {${live.join(', ')}}, kind ∈ {${Object.keys(byKind).join(', ')}} — check the spelling, or drop the filter for counts.`
+            ? `no handle matches ${asked}. Live now: editor ∈ {${live.join(', ')}}, kind ∈ {${Object.keys(byKind).join(', ')}} — check the spelling, or drop the filter for counts.${prefixNote}${labelNote}`
             : `no handle matches ${asked}, and NO editor is currently exposing handles: open the relevant editor + enter its sub-mode first (e.g. set_scene_view_mode ui + set_collider_edit on).`,
         });
       }

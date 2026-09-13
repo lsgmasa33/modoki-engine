@@ -8,7 +8,7 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
-import { ALLOW_OCCLUDED_BASE, MODIFIERS_BASE, allowOccludedParam, makeEntitySpec, modifierEnum, makePointSpec } from '../shapes.js';
+import { ALLOW_OCCLUDED_BASE, MODIFIERS_BASE, allowOccludedParam, makeEntitySpec, makeLabelAimParam, makeWithinParam, modifierEnum, makePointSpec } from '../shapes.js';
 import { KEY_ARG_DESCRIPTION, MOUSE_BUTTONS, POINTER_ACTIONS } from '../../../shared/inputVocabulary.js';
 
 export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
@@ -24,9 +24,10 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_tap',
     'Inject a REAL trusted click — flows through Chromium hit-testing so PixiJS and ' +
-      'Three.js both receive it. THREE WAYS TO AIM, best first: `entity` ({guid|name|id}) for a ' +
-      'scene entity, `selector` (a CSS selector) for editor chrome, or page CSS `x,y` as a last ' +
-      'resort. The first two resolve to a live point INSIDE this call — no read-then-tap race — ' +
+      'Three.js both receive it. FOUR WAYS TO AIM, best first: `entity` ({guid|name|id}) for a ' +
+      'scene entity, `selector` (a CSS selector) or `label` (its visible text, e.g. "Console" for ' +
+      'the tab — no modoki_eval `.click()`) for editor chrome, or page CSS `x,y` as a last ' +
+      'resort. All but x,y resolve to a live point INSIDE this call — no read-then-tap race — ' +
       'so prefer them; `x,y` read from an earlier get_scene_state call is aiming at where the ' +
       'target WAS. The response reports `matched` (what resolved), `hitTarget` (the topmost ' +
       'element at that point). A target something COVERS is REFUSED, naming the cover — the click ' +
@@ -37,19 +38,21 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       "`button:'right'` opens a context menu; `clickCount:2` double-clicks; " +
       "`modifiers:['shift'|'meta']` multi-select on canvas. Requires the Electron editor.",
     {
-      x: z.number().optional().describe('Page CSS x. Required unless `selector` is given.'),
-      y: z.number().optional().describe('Page CSS y. Required unless `selector` is given.'),
+      x: z.number().optional().describe('Page CSS x. Required unless `selector`, `label` or `entity` is given.'),
+      y: z.number().optional().describe('Page CSS y. Required unless `selector`, `label` or `entity` is given.'),
       // The example must name a selector that EXISTS: `inspector.header.kebab` did not (the
       // Inspector has no kebab menu at all), and being the docstring example is exactly how a
       // wrong selector propagates — it was copied into a QA case brief before anyone checked.
       selector: z.string().optional().describe("CSS selector to aim at, e.g. '[data-ui-id=\"inspector.header.delete\"]'. Overrides x/y."),
+      label: makeLabelAimParam(),
+      within: makeWithinParam(),
       entity: makeEntitySpec().optional(),
       button: z.enum(MOUSE_BUTTONS).optional().describe("Mouse button (default 'left')."),
       clickCount: z.number().optional().describe('1 = single (default), 2 = double-click.'),
       modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}.`),
       allowOccluded: allowOccludedParam,
     },
-    async ({ x, y, selector, entity, button, clickCount, modifiers, allowOccluded }) => postJson('/api/input/tap', { x, y, selector, entity, button, clickCount, modifiers, allowOccluded }),
+    async ({ x, y, selector, label, within, entity, button, clickCount, modifiers, allowOccluded }) => postJson('/api/input/tap', { x, y, selector, label, within, entity, button, clickCount, modifiers, allowOccluded }),
   );
 
   // ── drag — trusted gesture (Electron editor only) ──
@@ -66,8 +69,8 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'move. For HTML5 drag-and-drop ' +
       '(asset→slot, reparent) use modoki_dnd, NOT this. Requires the Electron editor.',
     {
-      from: makePointSpec().describe('Drag origin: {entity} | {selector} | {x,y}.'),
-      to: makePointSpec().describe('Drag destination: {entity} | {selector} | {x,y}.'),
+      from: makePointSpec().describe('Drag origin: {entity} | {selector} | {label, within?} | {x,y}.'),
+      to: makePointSpec().describe('Drag destination: {entity} | {selector} | {label, within?} | {x,y}.'),
       steps: z.number().optional().describe('Intermediate move count (default 10).'),
       button: z.enum(MOUSE_BUTTONS).optional().describe("Mouse button (default 'left')."),
       modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}, held for the WHOLE drag as a real keyDown/keyUp around the gesture — so a listener tracking the modifier's LEVEL (the 3D gizmo's snap) sees it down for every intermediate move.`),
@@ -97,16 +100,18 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'Requires the Electron editor.',
     {
       action: z.enum(POINTER_ACTIONS).describe("'down' press+hold, 'move' re-aim the held pointer, 'up' release."),
-      x: z.number().optional().describe('Page CSS x. Required unless `selector` is given.'),
-      y: z.number().optional().describe('Page CSS y. Required unless `selector` is given.'),
+      x: z.number().optional().describe('Page CSS x. Required unless `selector`, `label` or `entity` is given.'),
+      y: z.number().optional().describe('Page CSS y. Required unless `selector`, `label` or `entity` is given.'),
       selector: z.string().optional().describe('CSS selector to aim at (resolved server-side). Overrides x/y.'),
+      label: makeLabelAimParam(),
+      within: makeWithinParam(),
       entity: makeEntitySpec().optional(),
       button: z.enum(MOUSE_BUTTONS).optional().describe("Mouse button for 'down' (default 'left'); ignored on move/up (the held button is reused)."),
       modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}.`),
       allowOccluded: allowOccludedParam.describe(`${ALLOW_OCCLUDED_BASE}. Applies to \`action:'down'\` only — a move/up is delivered to whatever captured the press, so what sits under the destination cannot stop it.`),
     },
-    async ({ action, x, y, selector, entity, button, modifiers, allowOccluded }) =>
-      postJson('/api/input/pointer', { action, x, y, selector, entity, button, modifiers, allowOccluded }),
+    async ({ action, x, y, selector, label, within, entity, button, modifiers, allowOccluded }) =>
+      postJson('/api/input/pointer', { action, x, y, selector, label, within, entity, button, modifiers, allowOccluded }),
   );
 
   // ── hover — trusted bare mouse-move (Electron editor only) ──
@@ -116,14 +121,16 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'hover-to-open submenus that a click or drag-move cannot. Aim with `entity` ' +
       '({guid|name|id}), a CSS `selector`, or page CSS `x,y`. Requires the Electron editor.',
     {
-      x: z.number().optional().describe('Page CSS x. Required unless `selector` is given.'),
-      y: z.number().optional().describe('Page CSS y. Required unless `selector` is given.'),
+      x: z.number().optional().describe('Page CSS x. Required unless `selector`, `label` or `entity` is given.'),
+      y: z.number().optional().describe('Page CSS y. Required unless `selector`, `label` or `entity` is given.'),
       selector: z.string().optional().describe('CSS selector to aim at. Overrides x/y.'),
+      label: makeLabelAimParam(),
+      within: makeWithinParam(),
       entity: makeEntitySpec().optional(),
       modifiers: z.array(modifierEnum).optional().describe(`${MODIFIERS_BASE}.`),
       allowOccluded: allowOccludedParam,
     },
-    async ({ x, y, selector, entity, modifiers, allowOccluded }) => postJson('/api/input/hover', { x, y, selector, entity, modifiers, allowOccluded }),
+    async ({ x, y, selector, label, within, entity, modifiers, allowOccluded }) => postJson('/api/input/hover', { x, y, selector, label, within, entity, modifiers, allowOccluded }),
   );
 
   // ── scroll — trusted mouse-wheel (Electron editor only) ──
@@ -139,9 +146,11 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'A scroll with no non-zero delta is REFUSED (it would deliver nothing while reporting ok) — ' +
       'the same no-op refusal modoki_drag makes. Requires the Electron editor.',
     {
-      x: z.number().optional().describe('Page CSS x. Required unless `selector` is given.'),
-      y: z.number().optional().describe('Page CSS y. Required unless `selector` is given.'),
+      x: z.number().optional().describe('Page CSS x. Required unless `selector`, `label` or `entity` is given.'),
+      y: z.number().optional().describe('Page CSS y. Required unless `selector`, `label` or `entity` is given.'),
       selector: z.string().optional().describe('CSS selector to aim at. Overrides x/y.'),
+      label: makeLabelAimParam(),
+      within: makeWithinParam(),
       entity: makeEntitySpec().optional(),
       deltaX: z.number().optional().describe('Horizontal wheel delta (default 0). At least ONE of deltaX/deltaY must be non-zero — a zero-delta scroll is REFUSED, not dispatched as a silent no-op.'),
       deltaY: z.number().optional().describe('Vertical wheel delta; positive = content down. Default 0, but a call with neither delta non-zero is REFUSED (~120 ≈ one wheel tick).'),
@@ -149,7 +158,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
         .optional().describe(`${MODIFIERS_BASE}, set on the wheel event (e.g. ["control"] or ["meta"] for Ctrl/Cmd+wheel zoom).`),
       allowOccluded: allowOccludedParam,
     },
-    async ({ x, y, selector, entity, deltaX, deltaY, modifiers, allowOccluded }) => postJson('/api/input/scroll', { x, y, selector, entity, deltaX, deltaY, modifiers, allowOccluded }),
+    async ({ x, y, selector, label, within, entity, deltaX, deltaY, modifiers, allowOccluded }) => postJson('/api/input/scroll', { x, y, selector, label, within, entity, deltaX, deltaY, modifiers, allowOccluded }),
   );
 
   // ── eval — evaluate JS in the editor renderer (Electron editor only) ──
@@ -276,7 +285,9 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'exist. Pass `panel` to steer panel-scoped shortcuts; the response echoes `focusedPanel`. ' +
       'Requires the Electron editor.',
     {
-      selector: z.string().optional().describe('CSS selector to focus. Omit to blur the active element.'),
+      selector: z.string().optional().describe('CSS selector to focus. Omit (and label) to blur the active element.'),
+      label: makeLabelAimParam(),
+      within: makeWithinParam(),
       panel: z.string().optional().describe(
         'Set the editor KEYBOARD SCOPE to this panel (independent of DOM focus). Ids (CASE-'
         + 'SENSITIVE — "Game" is not "game"): ' + IDS + '. A game may also register custom '
@@ -285,7 +296,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
         + 'the call is all-or-nothing. `modoki_get_editor_state.openPanels` lists them.',
       ),
     },
-    async ({ selector, panel }) => postJson('/api/input/focus', { selector, panel }),
+    async ({ selector, label, within, panel }) => postJson('/api/input/focus', { selector, label, within, panel }),
   );
 
   // ── dnd — HTML5 drag-and-drop synthesis (dev + DMG) ──
@@ -351,7 +362,12 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'so 2,000 keys ≈ 187k tokens). Counts of 0 ⇒ open the right editor and enter its sub-mode ' +
       '(e.g. Collider-edit) first. A FILTERED call that matches nothing does not just return an ' +
       'empty list: it names what IS live (`byEditor`/`byKind` + a hint), so a typo\'d filter cannot ' +
-      'read as a correct negative answer. Works in dev AND the DMG.',
+      'read as a correct negative answer. EDITOR CHROME (editor:"chrome") is every `data-ui-id` ' +
+      'control plus the dock TABS (kind:"tab", meta.state selected|unselected), and its `meta` ' +
+      'carries LIVE form state — `value` (input/select/textarea; a password reads "•••"), ' +
+      '`checked`, `expanded` — so a field\'s value, a checkbox, or the active tab needs no ' +
+      'modoki_eval. Scope with `prefix` ("inspector.") or `label`; an empty `prefix` result names ' +
+      'the live prefixes, so a closed dialog is distinguishable from a typo. Works in dev AND the DMG.',
     {
       editor: z.string().optional().describe(
         'Filter to one editor, e.g. "collider2d", "dopesheet", "skin". The editor\'s view must be '
@@ -373,12 +389,16 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       ),
       kind: z.string().optional().describe('Filter to one handle kind, e.g. "collider-vertex", "keyframe", "bone-joint".'),
       ids: z.string().optional().describe('Comma-separated handle ids to restrict to.'),
+      prefix: z.string().optional().describe('Restrict to ids starting with this, e.g. "inspector." or "layout.tab." — chrome ids are <panel>.<region>.<name>.'),
+      label: z.string().optional().describe('Restrict to handles whose WHOLE label matches (whitespace-collapsed, case-insensitive; not a substring) — the same rule the `label` aim on modoki_tap uses.'),
     },
-    async ({ editor, kind, ids }) => {
+    async ({ editor, kind, ids, prefix, label }) => {
       const qs = new URLSearchParams();
       if (editor) qs.set('editor', editor);
       if (kind) qs.set('kind', kind);
       if (ids) qs.set('ids', ids);
+      if (prefix) qs.set('prefix', prefix);
+      if (label) qs.set('label', label);
       const q = qs.toString();
       return getJson(`/api/enact-handles${q ? `?${q}` : ''}`);
     },

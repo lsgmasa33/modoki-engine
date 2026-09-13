@@ -3,7 +3,8 @@
 import './EditorApp.css';
 import { backendFetch } from './backend/editorBackend';
 import { useRef, useState, useCallback, useEffect, useMemo, useSyncExternalStore } from 'react';
-import { Layout, Model, TabNode, Actions, DockLocation } from 'flexlayout-react';
+import { Layout, Model, TabNode, Actions, DockLocation, type ITabRenderValues } from 'flexlayout-react';
+import { layoutTabTagAttrs } from './layoutTabTag';
 import 'flexlayout-react/style/dark.css';
 
 import { PanelFocusHost } from './input/PanelFocusHost';
@@ -612,6 +613,13 @@ export default function EditorApp() {
     );
   }, []);
 
+  // Tag each dock tab for the agent surface (#1152/#1153) — see layoutTabTag.ts for why the
+  // CONTENT is wrapped rather than the button.
+  const onRenderTab = useCallback((node: TabNode, renderValues: ITabRenderValues) => {
+    const attrs = layoutTabTagAttrs(node);
+    if (attrs) renderValues.content = <span {...attrs}>{renderValues.content}</span>;
+  }, []);
+
   const model = modelRef.current;
 
   // Reactive undo/redo state for the Edit menu — bumps only when the stacks
@@ -766,6 +774,7 @@ export default function EditorApp() {
         <Layout
           model={model}
           factory={factory}
+          onRenderTab={onRenderTab}
           onModelChange={onModelChange}
         />
       </div>

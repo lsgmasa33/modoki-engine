@@ -1654,6 +1654,32 @@ describe('/api/enact-handles summarizes in the ROUTER, not the op', () => {
     expect(r.body.hint).toContain('dopesheet');              // what exists
   });
 
+  it('prefix/label are FILTERS — they forward to the op and are not summarised as a bare call (#1152)', async () => {
+    const seen: Array<{ op: string; params: unknown }> = [];
+    const spy = makeCtx({
+      requestBrowser: (async (op: string, params: unknown) => { seen.push({ op, params }); return opResult; }) as BackendContext['requestBrowser'],
+    });
+    await get('/api/enact-handles?prefix=inspector.&label=Save', spy);
+    expect(seen[0]).toMatchObject({ op: 'enact-handles', params: { prefix: 'inspector.', label: 'Save' } });
+    const r = (await get('/api/enact-handles?prefix=inspector.', ctx())) as { body: { handles?: unknown[]; byEditor?: unknown } };
+    expect(r.body.handles).toHaveLength(3);
+    expect(r.body.byEditor).toBeUndefined();
+  });
+
+  it('an EMPTY prefix result names the live chrome prefixes — a closed dialog is not a typo (#1152)', async () => {
+    const live = [...HANDLES, { id: 'inspector.header.delete', editor: 'chrome', kind: 'button', x: 1, y: 1 },
+      { id: 'layout.tab.console', editor: 'chrome', kind: 'tab', x: 1, y: 1 }];
+    const ctxMiss = makeCtx({
+      requestBrowser: (async (_op: string, params: { prefix?: string } | undefined) =>
+        params?.prefix ? { ...opResult, count: 0, editors: [], handles: [] } : { ...opResult, handles: live }
+      ) as unknown as BackendContext['requestBrowser'],
+    });
+    const r = (await get('/api/enact-handles?prefix=saveAsDialog.', ctxMiss)) as { body: { hint: string } };
+    expect(r.body.hint).toContain('prefix=saveAsDialog.');
+    expect(r.body.hint).toContain('{a., b., inspector., layout.}');
+    expect(r.body.hint).not.toMatch(/[{ ]c\./); // a dopesheet key is not a chrome prefix
+  });
+
   it('…and when NOTHING is live, the miss says that instead of listing an empty set', async () => {
     const nothing = makeCtx({ requestBrowser: (async () => ({ ...opResult, count: 0, editors: [], handles: [] })) as BackendContext['requestBrowser'] });
     const r = (await get('/api/enact-handles?kind=keyframe', nothing)) as { body: { hint: string } };

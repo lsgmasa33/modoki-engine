@@ -2108,6 +2108,39 @@ Canvas2D/SVG editor, exercise a gesture, open a modal). All are Electron-editor 
   entity first", never "guess the pixels". Adding a surface = add the attribute; a guard test
   (`tests/editor/chromeTagging.test.ts`) fails if a load-bearing id is deleted, and a duplicate id logs a
   loud error (`tap_handle` resolves the first match, so a duplicate silently drives the wrong element).
+- **Editor chrome is READABLE and aimable BY LABEL — no `modoki_eval` DOM walk (#1152, #1153).**
+  - **Live form state.** A chrome handle's `meta` carries `value` (input / select / textarea, read
+    from the element's live property, so a value typed a moment ago shows; a password reads `"•••"`),
+    `checked` (checkbox / radio) and `expanded` (`aria-expanded`), next to `state`/`disabled`.
+    `modoki_handles {ids:'inspector.field.Transform.x'}` answers "what is this field set to now".
+    ⚠️ A multi-selection whose values DIFFER reports **`mixed:true`**. A mixed checkbox then omits
+    `checked`, because its `false` is only how it is drawn. A mixed text field keeps `value:''`,
+    and `mixed:true` beside it is what tells that apart from a genuinely empty field.
+  - **Dock tabs are handles.** Each tab is `layout.tab.<component>` (`kind:'tab'`,
+    `meta.state:'selected'|'unselected'`), so `modoki_handles {prefix:'layout.tab.'}` answers which
+    panels are docked and which one each tabset is showing.
+  - **`prefix` / `label` filters.** `prefix:'inspector.'` scopes a read to one panel. A `prefix`
+    that matches nothing names the live prefixes, so "that dialog is not open" and "typo" read
+    differently.
+  - **`label` aim** on `modoki_tap` / `drag` (`from`/`to`) / `pointer` / `hover` / `scroll` /
+    `focus`: `modoki_tap {label:'Console'}` switches to the Console tab. It matches the WHOLE label
+    (whitespace-collapsed, case-insensitive, never a substring) over exactly the set
+    `modoki_handles {editor:'chrome'}` lists, counting only ON-WINDOW matches.
+  - **Refusals.** No match refuses `NOT_FOUND`, suggesting labels that contain the text. Two or
+    more matches refuse `AMBIGUOUS`, naming each id; narrow with `within:'[data-panel-scope="assets"]'`,
+    since every panel's content sits under `data-panel-scope="<component>"`. Label together with
+    `selector` or `entity` also refuses `AMBIGUOUS`.
+  - **Limits.**
+    - An untagged element has no label to aim at — tag it.
+    - A field is labelled only by its `data-ui-label` (many Inspector fields pass one) or its
+      `title`/`aria-label`. An unlabelled field is aimed at by selector or id.
+    - A control in an UNSELECTED tab is hidden at zero size (FlexLayout keeps it mounted but
+      `display:none`), so it is never a candidate — tap the tab first.
+    - `modoki_focus {label}` re-finds the element by its `data-ui-id`. When another element shares
+      that id (every crashed panel's `panel-error.reload-panel` does), it refuses `AMBIGUOUS`
+      rather than focus the twin.
+    - Not on `device_tap`: the device's DOM carries no `data-ui-id` chrome, so the aim could only
+      ever answer `NOT_FOUND` there.
 - **Aimed input for the Canvas2D/SVG editors (the input twin of `get_layout_bounds`).** These editors
   (Skin bones, Dopesheet/Curves keyframes, Collider2D vertices, particle curve/gradient points, gizmo
   axes, sprite-slice/9-slice/UI-resize handles) have **no DOM accessibility tree** and a downscaled

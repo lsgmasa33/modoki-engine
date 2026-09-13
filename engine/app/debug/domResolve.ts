@@ -22,7 +22,7 @@ import { isClickShaped } from './domPointContract';
 // ⚠️ The RUNTIME's own veto, not a copy of the rule (#1016). `resolveTapZoneVeto` is what
 // `pressOrigin.ts` uses to route a real press, so the aim surface and the router cannot disagree
 // about who gets the click — §9: a rule implemented twice diverges, and this pair already had.
-import { resolveTapZoneVeto, UI_TAP_ZONE_ATTR } from '@modoki/engine/runtime';
+import { resolveTapZoneVeto, UI_TAP_ZONE_ATTR, collectHandles, normalizeHandleLabel } from '@modoki/engine/runtime';
 
 // Re-exported so existing importers (domDnd, agentBridge) keep one import site.
 export type { DomPointSpec, DomPointResolution, DomRect, AimGesture } from './domPointContract';
@@ -78,6 +78,37 @@ export function resolveElementPoint(el: Element): { x: number; y: number; rect: 
     y: r.top + r.height / 2,
     rect: { x: r.left, y: r.top, w: r.width, h: r.height },
   };
+}
+
+/** Containers whose contents are RENDERED COPIES of real chrome, never the chrome itself.
+ *
+ *  FlexLayout mounts a "stamp" of every tab button inside `.flexlayout__layout_tab_stamps`, parked
+ *  at y≈-9960, to measure tabs and build drag images — and it renders those stamps through the same
+ *  `onRenderTab` hook that tags the real buttons (`layoutTabTag.ts`). Measured live 2026-09-13: every
+ *  `layout.tab.*` id came back TWICE, the second copy off-window. A duplicate id is the silent bug
+ *  `collectHandles` warns about (`tap_handle` resolves the FIRST match), and the `label` aim would
+ *  count the copy as a second candidate. The copy is not something anyone can click, so it is not a
+ *  handle — `chromeHandles` excludes it where the handle population is defined, rather than each
+ *  consumer filtering it. (This is also the offscreen "duplicate tab strip" the pre-#1152
+ *  docs/mcp-tool-conventions.md recipe filtered on `y > 0`.) */
+const RENDERED_COPY_CONTAINERS =
+  '.flexlayout__layout_tab_stamps, [data-layout-path="/popup-menu"], [data-layout-path="/drag-rectangle"]';
+
+/** Is this element a rendered COPY of chrome rather than the chrome itself? Exported because every
+ *  walker over `[data-ui-id]` needs the same answer: `chromeHandles.ts` defines the handle population
+ *  with it, `layoutSettle.ts` keys its samples by id (a stamp overwriting the real tab's entry would
+ *  hide the real tab's movement). It lives here, in the resolver core both walkers already import, so no
+ *  import cycle forms. (`uiIdAddressable` deliberately does NOT use it — it models focus's raw lookup.)
+ *
+ *  All three are FlexLayout (0.8.19) rendering a `TabButtonStamp` through `onRenderTab`:
+ *  - the offscreen stamp strip, always mounted;
+ *  - the tabset OVERFLOW menu (`PopupMenu`, `/popup-menu`), mounted while it is open — a hidden
+ *    tab's row there would otherwise be a second `layout.tab.<id>` and make its label AMBIGUOUS;
+ *  - the drag image (`setDragComponent`, `/drag-rectangle`) — only under `onRenderDragRect` or
+ *    Safari, neither of which the Electron editor uses, and removed a tick later. Kept because the
+ *    web editor can run in Safari. */
+export function isRenderedChromeCopy(el: Element): boolean {
+  return el.closest(RENDERED_COPY_CONTAINERS) !== null;
 }
 
 /** Is `top` (the topmost element at a point) the target `el` or something inside it? A
@@ -266,11 +297,123 @@ function describeOccluderContext(el: Element): string | null {
   return null;
 }
 
+type CoreResolution =
+  | { el: Element; x: number; y: number; uiId?: string }
+  | { error: string; matched?: Element; code?: 'NOT_FOUND' | 'AMBIGUOUS' };
+
+const isElementValue = (v: unknown): v is Element => typeof Element !== 'undefined' && v instanceof Element;
+
+/** How many candidates a refusal names before it summarises the rest. */
+const NAMED_CANDIDATES = 8;
+
+/** Resolve a `label` aim to ONE element (#1153).
+ *
+ *  ⚠️ **The population is the chrome HANDLE set, not "any text on the page".** `collectHandles
+ *  ({editor:'chrome', label})` is exactly what `modoki_handles {editor:'chrome', label}` returns, so
+ *  a label an agent READ is a label it can AIM at, and the match rule (`labelMatches`) is the one
+ *  function both use. Matching arbitrary visible text would reach untagged elements too, but a label
+ *  is not a handle (`chromeHandles.ts`): a paragraph saying "Save" is not a Save button, and a
+ *  text-scrape aim would press whichever one came first in the DOM.
+ *
+ *  ⚠️ **Only ON-WINDOW candidates are counted, and never a first-match.** FlexLayout parks a copy of
+ *  every tab ~10000px above the window (excluded at the provider), a collapsed panel keeps its
+ *  tagged controls at zero size (excluded there too), and a panel taller than its dock leaves rows
+ *  laid out past the window edge. None of those can receive a press, so counting them would turn
+ *  every such label into an AMBIGUOUS refusal about things nobody can see. Among on-window
+ *  candidates, one scrolled out of its own container is dropped the same way, but ONLY when a
+ *  visible one remains — a lone scrolled-out match is returned, so the caller gets the
+ *  "SCROLLED OUT, scroll it into view" refusal rather than a misleading NOT_FOUND. */
+function resolveLabel(label: string, within: string | undefined): CoreResolution {
+  if (!normalizeHandleLabel(label)) return { error: 'label is empty — nothing to match' };
+  let inScope: (el: Element) => boolean = () => true;
+  if (within !== undefined) {
+    let scope: Element | null;
+    try { scope = document.querySelector(within); } catch { return { error: `invalid CSS selector in within: ${JSON.stringify(within)}` }; }
+    if (!scope) return { error: `no element matches within: ${JSON.stringify(within)} — that panel or dialog is not open`, code: 'NOT_FOUND' };
+    inScope = (el) => el.closest(within) !== null;
+  }
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const onWindow: Array<{ el: Element; x: number; y: number; id: string; label?: string; clear: boolean }> = [];
+  let offWindow = 0;
+  for (const h of collectHandles({ editor: 'chrome', label })) {
+    if (!isElementValue(h.owner) || !inScope(h.owner)) continue;
+    const p = resolveElementPoint(h.owner);
+    if ('error' in p) { offWindow++; continue; }
+    if (p.x < 0 || p.y < 0 || p.x > vw || p.y > vh) { offWindow++; continue; }
+    onWindow.push({ el: h.owner, x: p.x, y: p.y, id: h.id, label: h.label, clear: withinClip(h.owner, p.x, p.y) });
+  }
+  const asked = `label ${JSON.stringify(label)}${within !== undefined ? ` within ${JSON.stringify(within)}` : ''}`;
+  const visible = onWindow.filter((c) => c.clear);
+  const pick = visible.length === 1 ? visible[0] : (visible.length === 0 && onWindow.length === 1 ? onWindow[0] : null);
+  if (pick) return { el: pick.el, x: pick.x, y: pick.y, uiId: pick.id };
+  if (visible.length > 1 || onWindow.length > 1) {
+    const many = visible.length > 1 ? visible : onWindow;
+    const named = many.slice(0, NAMED_CANDIDATES).map((c) => `${c.id} (${JSON.stringify(c.label)})`).join(', ');
+    const more = many.length > NAMED_CANDIDATES ? ` and ${many.length - NAMED_CANDIDATES} more` : '';
+    // Aiming "by selector at one of these ids" is only advice when the ids DIFFER: two crashed panels'
+    // Reload buttons share `panel-error.reload-panel`, and a selector would take the first (close-out).
+    const sharedId = new Set(many.map((c) => c.id)).size < many.length;
+    return {
+      error: `${asked} matches ${many.length} on-screen chrome elements: ${named}${more}. Narrow it with `
+        + '`within` (a CSS selector for the panel or dialog, e.g. \'[data-panel-scope="inspector"]\')'
+        + (sharedId ? ' — some of these SHARE a data-ui-id, so a selector cannot separate them.' : ', or aim by selector at one of these data-ui-ids.'),
+      code: 'AMBIGUOUS',
+    };
+  }
+  if (offWindow > 0) {
+    return {
+      // Only "past the window edge" can reach here: a collapsed panel's controls are zero-size and an
+      // unselected tab's panel is hidden at zero size (FlexLayout keeps a once-shown tab mounted but
+      // display:none), so `chromeHandles` never offers either (close-out).
+      error: `${asked} matches ${offWindow} chrome element(s), but none is inside the window — laid out past `
+        + 'its edge (a panel taller than its dock). Scroll that panel or enlarge it, then re-aim.',
+      code: 'NOT_FOUND',
+    };
+  }
+  // `within` filtered out every match: say THAT, rather than suggest back the very label the caller
+  // typed as if it did not exist (close-out). Counted over the same unscoped population.
+  if (within !== undefined) {
+    const outside = collectHandles({ editor: 'chrome', label }).filter((h) => isElementValue(h.owner)).length;
+    if (outside > 0) {
+      return {
+        error: `${asked}: ${outside} chrome element(s) have that label, but none is inside ${JSON.stringify(within)}. `
+          + 'Widen or drop `within`, or check which panel it is in with modoki_handles {editor:"chrome", label}. '
+          + 'A control in an UNSELECTED tab is hidden at zero size, so it cannot match until its tab is tapped.',
+        code: 'NOT_FOUND',
+      };
+    }
+  }
+  // Suggest labels that CONTAIN the query, so "Save" → "Save All" is one step away rather than a
+  // blind retry. Substrings are offered, never aimed at: exact is the rule, this is only the hint.
+  const q = normalizeHandleLabel(label);
+  const near = new Set<string>();
+  for (const h of collectHandles({ editor: 'chrome' })) {
+    if (h.label && normalizeHandleLabel(h.label).includes(q)) near.add(JSON.stringify(h.label.length > 60 ? `${h.label.slice(0, 57)}…` : h.label));
+    if (near.size >= NAMED_CANDIDATES) break;
+  }
+  return {
+    error: `no on-screen editor chrome is labelled ${JSON.stringify(label)}${within !== undefined ? ` within ${JSON.stringify(within)}` : ''}. `
+      + 'A label aim matches the WHOLE label of a data-ui-id control or dock tab (whitespace-collapsed, case-insensitive), '
+      + `never a substring.${near.size ? ` Labels containing it: ${[...near].join(', ')}.` : ''} `
+      + 'modoki_handles {editor:"chrome", prefix} lists what is live; a control in an UNSELECTED tab is hidden '
+      + 'at zero size, so tap that tab first.',
+    code: 'NOT_FOUND',
+  };
+}
+
 /** The single place a spec becomes an element + a point. Both public resolvers wrap this,
  *  so the guards (selector miss, zero-size rect, missing target) cannot drift apart between
  *  the DnD path and the trusted-input path. Returns an error as data; the wrappers decide
  *  whether to throw. */
-function resolveCore(spec: DomPointSpec): { el: Element; x: number; y: number } | { error: string; matched?: Element } {
+function resolveCore(spec: DomPointSpec): CoreResolution {
+  if (spec.label !== undefined) {
+    if (spec.selector) {
+      return { error: 'give a label OR a selector, not both — two addresses for one target', code: 'AMBIGUOUS' };
+    }
+    return resolveLabel(spec.label, spec.within);
+  }
+  if (spec.within !== undefined) return { error: '`within` scopes a `label` aim; it has no meaning without one' };
   if (spec.selector) {
     let el: Element | null;
     try {
@@ -305,9 +448,23 @@ export function resolveDomPoint(spec: DomPointSpec, which = 'target'): DomPointH
 export function resolveDomPointReport(spec: DomPointSpec): DomPointResolution {
   const r = resolveCore(spec);
   if ('error' in r) {
-    return { ok: false, error: r.error, ...(r.matched ? { matched: describeElement(r.matched) } : {}) };
+    return {
+      ok: false, error: r.error,
+      ...(r.matched ? { matched: describeElement(r.matched) } : {}),
+      ...(r.code ? { code: r.code } : {}),
+    };
   }
-  return { ok: true, x: r.x, y: r.y, ...aimProvenance(r.el, r.x, r.y, !!spec.selector, spec.gesture) };
+  // A label aim names a THING exactly as a selector does, so it gets the same occlusion verdict.
+  const byName = !!spec.selector || spec.label !== undefined;
+  return {
+    ok: true, x: r.x, y: r.y,
+    // ⚠️ A RAW `querySelector`, deliberately — copies included. `uiIdAddressable` PREDICTS what
+    // `/api/input/focus` will do, and `focusElement` (rendererOps.ts) re-finds by exactly this raw
+    // lookup. Skipping rendered copies here would report "addressable" for an id whose first match is a
+    // stamp, and focus would then land on the stamp (close-out §2d, a reviewer suggestion declined).
+    ...(r.uiId ? { uiId: r.uiId, uiIdAddressable: document.querySelector(`[data-ui-id=${JSON.stringify(r.uiId)}]`) === r.el } : {}),
+    ...aimProvenance(r.el, r.x, r.y, byName, spec.gesture),
+  };
 }
 
 /** The PROVENANCE half of a resolution: what the aim matched, and what is actually on top of it.

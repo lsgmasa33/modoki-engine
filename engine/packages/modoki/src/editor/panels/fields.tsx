@@ -4,6 +4,7 @@
  *  transitive deps (model import, texture resolver, three.js preview, store). */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { MIXED_PLACEHOLDER } from '../../runtime/rendering/mixedPlaceholder';
 
 /** Shared monospace input style for Inspector-style field inputs. */
 export const inputStyle: React.CSSProperties = {
@@ -90,8 +91,9 @@ export function Info({ text }: { text: string }) {
   );
 }
 
-/** Placeholder shown for fields whose value differs across a multi-selection. */
-export const MIXED_PLACEHOLDER = '----';
+/** Placeholder shown for fields whose value differs across a multi-selection — re-exported; declared in the runtime
+ *  handle vocabulary because `modoki_handles` reads it back as `meta.mixed` — see its declaration. */
+export { MIXED_PLACEHOLDER };
 
 /** Local-state input hook: buffers keystrokes while focused so ECS re-renders
  *  don't overwrite in-flight typing. Syncs the ECS value back when not focused.

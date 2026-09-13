@@ -730,12 +730,12 @@ site must apply `ctx.htmlFallthrough`/`ctx.noSuchRoute` itself.
   ⚠️ **A `SMOKE INCOMPLETE` exit 1 can be a precondition, not your change.** The smoke half skips
   UC3 unless the editor's `surfaces` include `scene-view`, and a default launch comes up with
   `['game-2d','game-3d']` — relaunching does not change that; T3 passes regardless. Mount the Scene
-  tab through `/api/eval` (measured 2026-09-09):
-  `[...document.querySelectorAll(".flexlayout__tab_button_content")].find(e => e.textContent === "Scene" && e.getBoundingClientRect().y > 0).closest(".flexlayout__tab_button").click(); return "clicked"`.
-  Filter on `y > 0` because FlexLayout renders a duplicate tab strip offscreen at y≈-9960; an
-  untrusted `.click()` is enough for React's `onClick`, whereas `/api/input/tap` at the tab's
-  coordinates reports `ok:true` and does not switch the tab. `/api/eval` needs an explicit
-  `return` — a bare expression answers `{}`.
+  tab with a trusted tap: `POST /api/input/tap {"label":"Scene"}` (`modoki_tap {label:'Scene'}`).
+  The 2026-09-09 note that a tap at a tab's coordinates "reports ok:true and does not switch the
+  tab" did not reproduce on 2026-09-13: a trusted tap on the Console tab switched it, and a tap on
+  Assets switched it back (#1152). The offscreen copy at y≈-9960 it warned about is real — it is
+  FlexLayout's tab *stamps* — but the label aim counts only on-window matches and the handle
+  provider skips stamps, so no `y > 0` filter is needed.
 - **What T3 cannot reach is DECLARED, not implied.** A sweep must not damage the human's open project,
   so ~39 mutating tools (`build`, `press_key`, `menu`, `eval`, …) are listed in
   `src/liveCoverage.ts` with the reason each is un-sweepable, and a CI-safe guard asserts the split

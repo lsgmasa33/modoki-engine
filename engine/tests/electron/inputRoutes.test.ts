@@ -60,7 +60,17 @@ function makeRenderer(overrides?: Record<string, unknown>) {
     if (op === 'input-deliverability') return overrides?.['input-deliverability'] ?? { visibilityState: 'visible', hasFocus: true };
     calls.push(`renderer:${op}`);
     if (op === 'resolve-dom-point') {
-      const sel = (params as { selector: string }).selector;
+      const { selector: sel, label, within, gesture } = params as { selector: string; label?: string; within?: string; gesture?: string };
+      // #1153 — a label aim. The fake answers the renderer's three outcomes; the rules that PRODUCE
+      // them are domResolve.test.ts's job, this file pins what the ROUTES do with each.
+      if (label !== undefined) {
+        calls.push(`label(${label}${within ? ` within ${within}` : ''},${gesture})`);
+        if (label === 'Reload Panel') return { ok: true, x: 640, y: 20, uiId: 'panel-error.reload-panel', uiIdAddressable: false, matched: 'button[data-ui-id="panel-error.reload-panel"]', hitTarget: 'button[data-ui-id="panel-error.reload-panel"]', occluded: false };
+        if (label === 'Console') return { ok: true, x: 360, y: 546, uiId: 'layout.tab.console', uiIdAddressable: true, matched: 'span[data-ui-id="layout.tab.console"]', hitTarget: 'span[data-ui-id="layout.tab.console"]', occluded: false };
+        if (label === 'Buried') return { ok: true, x: 40, y: 50, uiId: 'inspector.a.buried', matched: 'button[data-ui-id="inspector.a.buried"]', hitTarget: 'div.modal', occluded: true };
+        if (label === 'Save') return { ok: false, code: 'AMBIGUOUS', error: 'label "Save" matches 2 on-screen chrome elements: a.b.save ("Save"), c.d.save ("Save")' };
+        return { ok: false, code: 'NOT_FOUND', error: `no on-screen editor chrome is labelled ${JSON.stringify(label)}` };
+      }
       if (sel === '#kebab') return { ok: true, x: 210, y: 110, matched: 'button#kebab', hitTarget: 'button#kebab', occluded: false };
       if (sel === '#covered') return { ok: true, x: 50, y: 60, matched: 'button#covered', hitTarget: 'div.menu', occluded: true };
       // Scrolled out of its own list: occluded, but by the chrome BEHIND it, not by something on top.
@@ -329,9 +339,9 @@ describe('tap', () => {
     expect(ops.tap).not.toHaveBeenCalled();
   });
 
-  it('400s when given no aim at all — and the message names all three modes', async () => {
+  it('400s when given no aim at all — and the message names every mode', async () => {
     const res = await post('/api/input/tap', {});
-    expect(res).toMatchObject({ status: 400, body: { error: 'tap: provide an entity {guid|name|id}, a selector, or {x,y}' } });
+    expect(res).toMatchObject({ status: 400, body: { error: 'tap: provide an entity {guid|name|id}, a selector, a label, or {x,y}' } });
     expect(ops.tap).not.toHaveBeenCalled();
   });
 
@@ -1942,5 +1952,101 @@ describe('an unrecognised KEY NAME is refused, and a recognised one is normalise
     const res = await post('/api/input/key', { key }) as { status?: number };
     expect(res.status ?? 200).toBe(200);
     expect(ops.pressKey).toHaveBeenCalledWith(key, undefined);
+  });
+});
+
+/** #1153 — the `label` aim. It rides `resolvePoint`'s selector branch, so every aimed route gets it
+ *  and every selector-path diagnosis (occlusion, scrolled-out, settling) applies to it unchanged. */
+describe('label aim (#1153)', () => {
+  it('tap by label resolves in the renderer BEFORE the trusted click, with the tap gesture', async () => {
+    const res = await post('/api/input/tap', { label: 'Console' });
+    expect(calls).toEqual(['renderer:resolve-dom-point', 'label(Console,tap)', 'tap(360,546)']);
+    expect(res).toMatchObject({ body: { ok: true, matched: 'span[data-ui-id="layout.tab.console"]', occluded: false } });
+  });
+
+  it('forwards `within` to the renderer', async () => {
+    await post('/api/input/tap', { label: 'Console', within: '[data-editor-panel="Console"]' });
+    expect(calls).toContain('label(Console within [data-editor-panel="Console"],tap)');
+  });
+
+  for (const [route, body, gesture, dispatched] of [
+    ['/api/input/hover', { label: 'Console' }, 'hover', 'hover(360,546)'],
+    ['/api/input/scroll', { label: 'Console', deltaY: 120 }, 'scroll', 'scroll(360,546,0,120)'],
+    ['/api/input/pointer', { action: 'down', label: 'Console' }, 'press', 'pdown(360,546,left)'],
+    ['/api/input/drag', { from: { label: 'Console' }, to: { x: 600, y: 546 } }, 'drag', 'drag(360,546→600,546)'],
+  ] as const) {
+    it(`${route} aims by label too — one resolver, every route`, async () => {
+      const res = await post(route, body) as { status?: number };
+      expect(res.status ?? 200).toBe(200);
+      expect(calls).toContain(`label(Console,${gesture})`);
+      expect(calls[calls.length - 1]).toBe(dispatched);
+    });
+  }
+
+  it('a renderer NOT_FOUND / AMBIGUOUS keeps its §5 code, and nothing is dispatched', async () => {
+    const miss = await post('/api/input/tap', { label: 'Nope' }) as { status: number; body: { code?: string; error: string } };
+    expect(miss.status).toBe(400);
+    expect(miss.body.code).toBe('NOT_FOUND');
+    const amb = await post('/api/input/tap', { label: 'Save' }) as { status: number; body: { code?: string; error: string } };
+    expect(amb.body.code).toBe('AMBIGUOUS');
+    expect(amb.body.error).toContain('a.b.save');
+    expect(ops.tap).not.toHaveBeenCalled();
+  });
+
+  it('a COVERED label target is refused OCCLUDED, naming the label and the cover', async () => {
+    const r = await post('/api/input/tap', { label: 'Buried' }) as { status: number; body: { code?: string; error: string } };
+    expect(r.body.code).toBe('OCCLUDED');
+    expect(r.body.error).toContain('label "Buried"');
+    expect(r.body.error).toContain('div.modal');
+    expect(ops.tap).not.toHaveBeenCalled();
+  });
+
+  it('label + selector and label + entity are REFUSED as two addresses — never settled by precedence', async () => {
+    const a = await post('/api/input/tap', { label: 'Console', selector: '#kebab' }) as { body: { code?: string } };
+    const b = await post('/api/input/tap', { label: 'Console', entity: { name: 'Puck' } }) as { body: { code?: string } };
+    expect(a.body.code).toBe('AMBIGUOUS');
+    expect(b.body.code).toBe('AMBIGUOUS');
+    expect(calls.filter((c) => c.startsWith('renderer:'))).toEqual([]); // refused before any resolve
+  });
+
+  it('…but stray x/y beside a label are inert, exactly as beside a selector', async () => {
+    await post('/api/input/tap', { label: 'Console', x: 1, y: 1 });
+    expect(calls[calls.length - 1]).toBe('tap(360,546)');
+  });
+
+  it('`within` without a label is refused rather than silently ignored', async () => {
+    const r = await post('/api/input/tap', { selector: '#kebab', within: '.panel' }) as { status: number; body: { code?: string } };
+    expect(r.status).toBe(400);
+    expect(r.body.code).toBe('REFUSED_BY_OP');
+    expect(ops.tap).not.toHaveBeenCalled();
+  });
+
+  describe('focus by label', () => {
+    it('resolves through the SAME renderer op, then focuses the element by its data-ui-id', async () => {
+      await post('/api/input/focus', { label: 'Console' });
+      expect(calls).toContain('label(Console,press)');
+      expect(ops.focusElement).toHaveBeenCalledWith('[data-ui-id="layout.tab.console"]');
+    });
+
+    it('REFUSES when the resolved element\'s data-ui-id is shared — re-finding it by id would focus a twin (close-out)', async () => {
+      const r = await post('/api/input/focus', { label: 'Reload Panel', within: '[data-panel-scope="inspector"]' }) as { status: number; body: { code?: string; error: string } };
+      expect(r.status).toBe(400);
+      expect(r.body.code).toBe('AMBIGUOUS');
+      expect(r.body.error).toMatch(/shared/);
+      expect(ops.focusElement).not.toHaveBeenCalled();
+    });
+
+    it('a label miss is a coded refusal, and focus is never attempted', async () => {
+      const r = await post('/api/input/focus', { label: 'Save' }) as { status: number; body: { code?: string } };
+      expect(r.status).toBe(400);
+      expect(r.body.code).toBe('AMBIGUOUS');
+      expect(ops.focusElement).not.toHaveBeenCalled();
+    });
+
+    it('label + selector is refused, and so is within without a label', async () => {
+      expect((await post('/api/input/focus', { label: 'Console', selector: '#kebab' }) as { body: { code?: string } }).body.code).toBe('AMBIGUOUS');
+      expect((await post('/api/input/focus', { within: '.x' }) as { body: { code?: string } }).body.code).toBe('REFUSED_BY_OP');
+      expect(ops.focusElement).not.toHaveBeenCalled();
+    });
   });
 });

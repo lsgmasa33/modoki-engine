@@ -134,6 +134,7 @@ missing tarball on open.
 | Scene-chrome patching | `engine/packages/modoki/src/runtime/ui/sceneChrome.ts` | See [ui-system.md](./ui-system.md) § "Pushing live values onto scene-authored chrome" |
 | Scroll views / recycled entries | `UIScrollView` + `UIEntries` | `games/scroll-demo` is a deliberate non-Court proof |
 | Trusted clock | `engine/packages/modoki/src/runtime/core/trustedClock.ts` | Server-time/monotonic anchor, promoted in #660. Pure arithmetic, **zero imports**; the GAME owns fetching and persisting. Passes the determinism guard with no allowlist entry. ⚠️ Defends the *instant*, NOT the timezone — see the daily-challenge bullet below |
+| **Daily challenge calendar model** | `engine/packages/modoki/src/runtime/core/dailyCalendar.ts` | Promoted out of `games/court/runtime/daily.ts` in #928 (2026-09-13), when wordweave's daily chose to copy Court's rules. Civil `DateKey`s (LOCAL, never UTC), the high-water "today" (`effectiveNowMs`, #764), the 42-cell `daysForMonth` grid and its seven `DayState`s, the two-month paid window, `pickDailyLevel` and `isDailyUnlocked`. Pure, **zero imports**, takes `nowMs` — reads no clock. ⚠️ **Carries no copy** (month/weekday names stay per game) and **no rating rule**: a game passes `starsOf` to `daysForMonth` — REQUIRED, so a call site that forgets the game's rating rule fails to compile rather than drawing every done cell with 0 stars (a game with no rating passes `() => 0`). ⚠️ Does NOT use `trustedClock.ts` and must not — see the daily-challenge bullet below |
 | **Cloud-save protocol** (the sync-guaranteed GROUP) | `engine/packages/modoki/src/runtime/sync/**` | ⚠️ **This row's absence is what made #658 wrong.** Landed #532 Phase A (2026-09-01); Court moved onto it the same day. Generic over `T` — `SyncGroupSpec<T>` (`fingerprint`/`isFreshAndEmpty`/`merge`/`adopt`/`onFork`/`atomicity`), `GroupStore<T>`, `GroupTransport`, `runCloudSync`, `decideGroup`, `resolveGroupFork`. Firebase-free, clock-free, imports no other L2 folder; one `court` token in the whole folder and it is a docstring. Tested over an anonymous `Content` type (`tests/runtime/syncGroups.test.ts`, 39 tests). **The GAME owns what its save MEANS; the engine owns the protocol** |
 | **Cloud-sync coordinator** (*when* a sync runs) | `engine/.../runtime/sync/coordinator.ts` | Promoted in #658 (2026-09-04). Debounces a burst of progression writes, suppresses further syncs while a fork dialog is unanswered, coalesces overlapping triggers into ONE follow-up rather than a queue, and carries the #506 generation guard for sign-out-mid-sync. Generic over the **fork**, not the save — `CloudSyncCoordinator<TFork extends SyncFork>`, with `resolve`'s document reached as `TFork['serverDoc']`. ⚠️ **It must never read a field off a save document** — that property is the whole basis of the type parameter, and its test's `{ version }` stub document is the tripwire: needing a richer one there means it has stopped being generic |
 | **Account decisions** (provider, state machine, re-auth choice) | `engine/.../runtime/account/**` | Promoted in #675 (2026-09-04, `f3a32f79a`) — `AccountProvider`, `AccountState`, `SignInFailure`, `AvailableProviders`, `reauthProviderFor`. ⚠️ **Carries ZERO player-visible copy, and `tests/runtime/accountNoCopy.test.ts` fails if any lands** — there is no i18n mechanism anywhere in this repo, so an engine module that hardcodes English is a localisation blocker a game cannot reach. The GAME owns every rendered word; the engine owns the vocabulary that UI programs against |
@@ -169,11 +170,14 @@ reopen it.
   `games/court/runtime/levelManifest.ts` value-imports the difficulty tables, dragging the whole solver behind anything
   that touches it, while `levelSelect.ts` needs only the frontier function and one entry type,
   both solver-free. **Split the manifest into a solver-free ladder half first.**
-- **A daily challenge — deferred.** Zero second consumers: the other game's progress model has no
-  date dimension at all, so a daily there would be a new game mode, not parity. Revisit when a
-  second game actually wants one.
+- **A daily challenge — the calendar model is SHARED since #928; the wiring is not.** This was
+  deferred on *"zero second consumers"* until wordweave wanted a daily and chose Court's rules
+  (owner, 2026-09-13), so the pure model moved to the engine (table above). Still per game, on
+  purpose: the pool of boards (Court carves its out of the ladder, wordweave generates a separate
+  one), persistence, the menu/calendar chrome, the price and unlock knobs, the rating, and every
+  player-visible word. The clock reasoning below still applies to both games.
   ⚠️ **Do NOT "ship a trusted clock alongside it" — an earlier version of this line said to, and it
-  does not work.** `trustedNow()` defends the *instant*; `dateKeyOf` (`games/court/runtime/daily.ts`)
+  does not work.** `trustedNow()` defends the *instant*; `dateKeyOf` (`engine/packages/modoki/src/runtime/core/dailyCalendar.ts`)
   converts that instant through the **device timezone** (`getFullYear`/`getMonth`/`getDate`, local by
   deliberate design — a UTC key hands a player east of Greenwich tomorrow's puzzle in the evening).
   A player shifting UTC−11 → UTC+14 moves the local civil CLOCK by 25 hours with a perfectly trusted
@@ -186,7 +190,8 @@ reopen it.
   high-water mark rather than a clock reading. `games/court/daily.md` § "The clock is not trusted"
   carries the split and what is still deliberately open. The raw `Date.now()` the daily is fed
   remains the accepted half, so this work would still **overturn a ruling**, not fill a gap — but
-  the ruling to read is now the newer one.
+  the ruling to read is now the newer one. wordweave took the same accept deliberately rather than
+  inheriting it (#928, 2026-09-10).
 - **Settings + ad policy — deferred on evidence (#661, closed 2026-09-04).** The mechanism in each
   generalizes; the field set does not; and the second consumer the extraction would be written
   against **does not exist and cannot yet**. Measured, not read: the only other shipping-shaped game

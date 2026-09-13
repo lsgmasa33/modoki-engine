@@ -637,9 +637,10 @@ export {
   type PickProvider,
 } from './core/screenPick';
 export {
-  registerHandleProvider, collectHandles, resolveHandle,
+  registerHandleProvider, collectHandles, resolveHandle, normalizeHandleLabel,
   type InteractionHandle, type HandleFilter, type HandleProvider,
 } from './rendering/interactionHandles';
+export { MIXED_PLACEHOLDER } from './rendering/mixedPlaceholder';
 export {
   getAssetSchema, defaultAssetData, validateAssetData, normalizeAssetData,
   type AssetSchemaType, type AssetSchema, type FieldMeta, type AssetFieldType,
@@ -679,6 +680,12 @@ export {
   setTrustedAnchor, trustedNow, hasTrustedAnchor, trustedAnchorSource, clearTrustedAnchor,
   type TrustedClockSource,
 } from './core/trustedClock';
+export {
+  DAYS_PER_MONTH_GRID, dateKeyOf, dayCostsCoins, daysForMonth, effectiveDayKey, effectiveNowMs,
+  isDailyUnlocked, isDateKey, isDayInteractive, isMonthInRange, isRealDateKey, isTodayUnplayed,
+  monthOf, monthsForCalendar, pickDailyLevel, previousMonth, sameMonth,
+  type DailyCompletion, type DailyProgress, type DateKey, type DayCell, type DayState, type MonthRef,
+} from './core/dailyCalendar';
 export { stepSimulation, type StepOptions } from './core/stepSimulation';
 export { seedRng, rngNext, rngFloat, rngInt, rngBool, rngPick } from './core/rng';
 export {
