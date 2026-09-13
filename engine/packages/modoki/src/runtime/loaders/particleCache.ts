@@ -13,6 +13,7 @@ import { defaultParticleEffect, PARTICLE_FORMAT_VERSION, type ParticleEffectDef,
 import { particleDefProvider } from '../particles/particleDefProvider';
 import { resolveColliderShape } from '../particles/colliders';
 import { createTeardownToken } from '../core/liveness';
+import { fireDirtyListeners } from '../core/renderDirty';
 import { classifyFormatVersion } from '../core/formatVersion';
 
 const cache = new Map<string, ParticleEffectDef>();
@@ -184,7 +185,7 @@ export function getParticleEffect(ref: string, opts?: { load?: boolean }): Parti
         // pre-loaded manifest (e.g. a freshly created effect in the editor).
         const id = (json as Partial<ParticleEffectDef>)?.id;
         if (id && isGuid(id)) registerAsset(id, path, 'particle');
-        cache.set(path, normalizeParticleDef(json as Partial<ParticleEffectDef>));
+        storeEffect(path, json as Partial<ParticleEffectDef>);
       })
       .catch((e) => {
         if (stillLive()) failed.add(path);
@@ -210,8 +211,18 @@ function particleCacheKey(refOrPath: string): string | undefined {
 export function setParticleEffect(refOrPath: string, def: ParticleEffectDef): void {
   const path = particleCacheKey(refOrPath);
   if (!path) return;
-  cache.set(path, normalizeParticleDef(def));
+  storeEffect(path, def);
   failed.delete(path);
+}
+
+/** The ONE write into the cache, and it wakes the render loops — same rule as `rig2dCache`'s
+ *  `storeRig` (#1141). An effect def is not an ECS trait, so a write fires nothing on its own, and a
+ *  stopped Game view skips every frame nothing marked dirty. Observed live: `modoki_particle_set`
+ *  adding a t=0 burst to `demos/particle-demo`'s Confetti showed 0 particles, with 0 renders, until
+ *  an unrelated trait write drew all 60. The Particle Editor's own apply goes through here too. */
+function storeEffect(path: string, def: Partial<ParticleEffectDef>): void {
+  cache.set(path, normalizeParticleDef(def));
+  fireDirtyListeners();
 }
 
 /** Drop a cached effect so the next access re-fetches (e.g. after an external edit). */

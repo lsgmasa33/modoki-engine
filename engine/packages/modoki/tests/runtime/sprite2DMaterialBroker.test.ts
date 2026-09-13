@@ -21,6 +21,7 @@ import {
   getEntity2DMaterialShaders,
   hasEntity2DMaterial,
   markEntity2DMaterialDirty,
+  hasAny2DMaterialDirty,
   isEntity2DMaterialDirty,
   clearEntity2DMaterialDirty,
 } from '../../src/runtime/rendering/sprite2DMaterialBroker';
@@ -118,6 +119,15 @@ describe('dirty set', () => {
 
     clearEntity2DMaterialDirty();
     expect(isEntity2DMaterialDirty(X, GEN)).toBe(false);
+  });
+
+  it('hasAny2DMaterialDirty is true exactly while something is marked (#1141 sibling)', () => {
+    clearEntity2DMaterialDirty();
+    expect(hasAny2DMaterialDirty()).toBe(false);
+    markEntity2DMaterialDirty(7, GEN);
+    expect(hasAny2DMaterialDirty()).toBe(true);
+    clearEntity2DMaterialDirty();
+    expect(hasAny2DMaterialDirty()).toBe(false);
   });
 
   it('clearEntity2DMaterialDirty clears all marked entities', () => {

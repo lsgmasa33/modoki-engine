@@ -7,6 +7,7 @@ import {
   getRig2D, getRig2DSource, setRig2D, invalidateRig2D, clearRig2DCache, type Rig2DFile,
 } from '../../src/runtime/loaders/rig2dCache';
 import { clearManifest, newGuid } from '../../src/runtime/loaders/assetManifest';
+import { addDirtyListener } from '../../src/runtime/core/renderDirty';
 
 const MINIMAL_RIG: Rig2DFile = {
   bones: [{ name: 'root', parent: -1, x: 0, y: 0, rot: 0 }],
@@ -99,6 +100,34 @@ describe('rig2dCache', () => {
     await flush();
 
     expect(getRig2D('cross.a.rig2d.json')?.sprite).toBe('a-sprite'); // must be cached
+  });
+});
+
+// #1141: a rig is not an ECS trait, so a cache write fires nothing on its own — and a stopped
+// Scene2D skips every frame nothing marked dirty. Observed live: a Skin-editor weight paint and
+// its undo stayed invisible in the Game view until a bone moved.
+describe('rig2dCache — a cache write wakes the render loops (#1141)', () => {
+  let wakes = 0;
+  let unsub: () => void = () => {};
+  beforeEach(() => { wakes = 0; unsub = addDirtyListener(() => { wakes++; }); });
+  afterEach(() => unsub());
+
+  it('setRig2D fires the dirty listeners (the editor paint / undo path)', () => {
+    setRig2D('wake.rig2d.json', MINIMAL_RIG);
+    expect(wakes).toBe(1);
+  });
+
+  it('a load that resolves fires them too — the rig can land while the editor sits stopped', async () => {
+    let resolve: (v: unknown) => void = () => {};
+    vi.stubGlobal('fetch', vi.fn(() => new Promise((r) => { resolve = r; })));
+    expect(getRig2D('wake.load.rig2d.json')).toBeNull();
+    expect(wakes).toBe(0); // starting a fetch caches nothing, so it must not wake anyone
+
+    resolve(okResponse(MINIMAL_RIG));
+    await flush();
+
+    expect(getRig2D('wake.load.rig2d.json')).not.toBeNull();
+    expect(wakes).toBe(1);
   });
 });
 

@@ -4,6 +4,7 @@
  *  transform (siblings untouched), re-resolving the entity each time. */
 import { describe, it, expect, vi } from 'vitest';
 import { buildTransformUndoAction, buildGroupTransformUndoAction, type UndoEntity } from '../../src/editor/scene/gizmoUndo';
+import { addDirtyListener } from '../../src/runtime/core/renderDirty';
 
 const TRAIT = { name: 'Transform' };
 
@@ -18,6 +19,33 @@ function fakeEntity(initial: Record<string, number>): UndoEntity & { value: Reco
 }
 
 describe('buildTransformUndoAction', () => {
+  // #1141 sibling: the apply is a direct ECS write, which fires no dirty broadcast, and undo/redo has
+  // none of its own — so the Game view kept the pre-undo position of a SceneView 2D drag.
+  it('undo and redo each fire the dirty listeners, so a stopped renderer redraws', () => {
+    const e = fakeEntity({ x: 0 });
+    let wakes = 0;
+    const unsub = addDirtyListener(() => { wakes++; });
+    const action = buildTransformUndoAction({
+      label: 'move', trait: TRAIT, resolve: () => 1, findEntity: () => e, before: { x: 0 }, after: { x: 9 },
+    });
+    action.undo();
+    expect(wakes).toBe(1);
+    action.redo();
+    expect(wakes).toBe(2);
+    unsub();
+  });
+
+  it('fires nothing when the entity is gone — there was no write to show', () => {
+    let wakes = 0;
+    const unsub = addDirtyListener(() => { wakes++; });
+    const action = buildTransformUndoAction({
+      label: 'move', trait: TRAIT, resolve: () => null, findEntity: () => undefined, before: { x: 0 }, after: { x: 9 },
+    });
+    action.undo();
+    expect(wakes).toBe(0);
+    unsub();
+  });
+
   it('undo restores the before-fields, redo restores the after-fields (one action per drag)', () => {
     const e = fakeEntity({ x: 0, y: 0, rz: 0, sx: 1, sy: 1 });
     const action = buildTransformUndoAction({

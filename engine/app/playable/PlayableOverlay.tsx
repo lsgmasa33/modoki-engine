@@ -1,6 +1,8 @@
 /** Playable CTA overlay (Phase 5) — the install call-to-action layered over the game in a
- *  playable ad. A persistent "Install" pill (always tappable) plus an end-card (big Install +
- *  Replay) shown when the rewarded time-cap fires or the game dispatches `playable:end`.
+ *  playable ad. An end-card (Install + Replay), shown when the rewarded time-cap fires or the game
+ *  dispatches `playable:end`. ⚠️ **There is NO persistent pill, and no other always-on affordance**
+ *  (#1139) — the end card is the only route to a click, which is why `capSeconds` is load-bearing
+ *  rather than a backstop. See the comment on the render below for why the pill was removed.
  *
  *  Deliberately NOT ECS UI: it must render even if the game world stalls, and it outlives
  *  scene swaps. Inline styles (no external CSS) so it survives single-file inlining. Never
@@ -39,21 +41,23 @@ export function PlayableOverlay({ clickUrl, capSeconds = 30, onReplay }: Playabl
 
   return (
     <>
-      {/* Persistent CTA pill — always visible + tappable. */}
-      <button
-        type="button"
-        aria-label="Install"
-        onClick={install}
-        style={{
-          position: 'fixed', bottom: 'max(16px, env(safe-area-inset-bottom))', left: '50%', transform: 'translateX(-50%)',
-          zIndex: Z, padding: '12px 28px', border: 'none', borderRadius: 999, cursor: 'pointer',
-          font: '700 17px/1 system-ui, sans-serif', color: '#fff', background: '#2e7d32',
-          boxShadow: '0 4px 16px rgba(0,0,0,.35)', touchAction: 'manipulation',
-        }}
-      >
-        Install
-      </button>
+      {/* ⚠️ **NO persistent CTA pill — removed deliberately (#1139, owner 2026-09-13).** There was
+          one: a fixed `Install` pill at `bottom: max(16px, env(safe-area-inset-bottom))` with this
+          same `Z`. It occupied the bottom 57 CSS px of every playable, which is a DESIGN-space
+          reserve away in the game's own layout — so on a short viewport (320x568, or any
+          landscape) the pill overhung the reserve and sat on the letter board's bottom row, opaque
+          and hit-testable, turning a drag on that row into an exit from the ad.
 
+          The fix chosen was not to publish the pill's footprint for games to clear, but to drop
+          the pill: AppLovin's creative specs require MRAID 2.0, `mraid.open()` click-through, no
+          store redirect on first tap and muted audio until first interaction, and state that
+          AppLovin supplies the close button — **they require no install button, overlay or end
+          card at all**, so the persistent pill was our own choice, not a network requirement.
+          Install now lives ONLY on the end card below.
+
+          ⚠️ **Which makes the end card the ONLY route to a click.** It is reached by
+          `playable:end` or the time cap, so a playable that never fires either is a creative with
+          no call to action. `capSeconds` (default 30) is what guarantees it. */}
       {ended && (
         <div
           role="dialog"
@@ -65,6 +69,12 @@ export function PlayableOverlay({ clickUrl, capSeconds = 30, onReplay }: Playabl
           }}
         >
           <div>Enjoyed it?</div>
+          {/* ⚠️ No `aria-label` — deliberately. One was added here so the smoke gate's existing
+              `button[aria-label="Install"]` selector would keep working after the pill went, which
+              made the accessible name "Install" while the visible label reads "Install Now": a
+              label-in-name mismatch, so a voice-control user saying what they can SEE cannot
+              activate the button. The test selects on text content instead; a selector is not a
+              reason to give a control a second name. */}
           <button
             type="button" onClick={install}
             style={{ padding: '16px 48px', border: 'none', borderRadius: 14, cursor: 'pointer',

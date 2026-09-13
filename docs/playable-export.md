@@ -18,7 +18,7 @@ of `--target playable` is refused, #40). (Grew out of the `advideo-playable-expo
 | `engine/app/main.tsx` | Behind `__MODOKI_PLAYABLE__`, dynamically imports `bootPlayable`; the debug-bridge import is `!__MODOKI_PLAYABLE__`-gated so it DCEs |
 | `engine/app/playable/bootPlayable.tsx` | The runtime entry — audio gate, overlay mount, `playable:end` latch |
 | `engine/app/playable/mraid.ts` | MRAID v2 shim — `whenReady`/`whenViewable`/`onViewableChange`/`installClick`/`startTimeCap`/`isInAdContainer` |
-| `engine/app/playable/PlayableOverlay.tsx` | The CTA — a persistent Install pill + an end-card (Install + Replay) |
+| `engine/app/playable/PlayableOverlay.tsx` | The CTA — an end-card (Install + Replay) only; **no persistent pill** (#1139) |
 | `engine/app/playable/playableEnd.ts` | Latches `window 'playable:end'` so an end fired before the overlay mounts isn't lost |
 | `engine/scripts/smoke-playable.mjs` | `npm run smoke:playable` — the headless-Chromium artifact smoke |
 
@@ -37,9 +37,16 @@ load offline uniformly. `main.tsx` (behind `__MODOKI_PLAYABLE__`) runs `bootPlay
 `registerAppServices()` (no native SDKs in an ad).
 
 **Gating.** `bootPlayable` mutes audio at boot and unmutes only when the ad is **both viewable AND the
-user has interacted** (re-muting whenever it scrolls off-screen); it withholds the CTA overlay until
-viewable, routes Install through `mraid.open(storeUrl)`, caps a rewarded playable at 30 s, and shows
-the end-card on the cap or a game-dispatched `window 'playable:end'`.
+user has interacted** (re-muting whenever it scrolls off-screen); it mounts the overlay only once
+ready + viewable, routes Install through `mraid.open(storeUrl)`, caps a rewarded playable at 30 s,
+and shows the end-card on the cap or a game-dispatched `window 'playable:end'`.
+
+⚠️ **Since #1139 the end card is the ONLY call to action**, so `capSeconds` is load-bearing rather
+than a backstop: a creative that fires neither `playable:end` nor the cap has no way to click
+through at all. The cap arms when the overlay mounts — i.e. on first VIEWABILITY, not on the
+player's first interaction. AppLovin's audio rule is keyed to first interaction; whether their
+timer rule is too is an open question on #1139, and moving the arming point is a behaviour change
+(a player who never taps would never see Install), not a tidy-up.
 
 ## Per-target assets (`asset-keep.json` → `playable`)
 
@@ -144,31 +151,38 @@ removes nothing" below for the two that were not, and why they are gone rather t
 - ⚠️ **A creative must not contain an AD BANNER — and a scene cannot branch on the build target, so
   this is a RUNTIME gate** (#1108). An MRAID creative has no ad SDK and never will, so a banner
   placeholder there is not "an unfilled banner": `games/wordweave` shipped an opaque grey strip
-  labelled `Banner ad — 320x50` across **9.1%** of the ad, with the Install CTA drawn on top of it,
-  and the game *also* gave up that strip as layout reserve — so the creative paid for it twice.
+  labelled `Banner ad — 320x50` across **9.1%** of the ad, with the Install CTA of the day drawn on
+  top of it, and the game *also* gave up that strip as layout reserve — so the creative paid for it
+  twice.
   Nothing build-time can remove it: `asset-keep.json` drops whole FILES, and per the warning above,
   scene data cannot read a define. The fix is `if (__MODOKI_PLAYABLE__)` in the game's own runtime,
   hiding the slot with one `patchUI(..., { isVisible: false })` (`UINode` renders `null` for a falsy
   `isVisible`, so the label subtree goes with it).
 
-  ⚠️ **Hide the placeholder, but do NOT reclaim its space — the CTA lives there.**
-  `PlayableOverlay`'s Install pill is always on, `position: fixed` at `bottom: max(16px,
-  env(safe-area-inset-bottom))`, `zIndex: 2147483000`. wordweave reclaimed the strip for one commit
-  and it was strictly worse than the placeholder: measured at 390x844, the letter board moved down
-  ~77 CSS px and the pill covered a whole tile — `elementFromPoint` at its centre returned the
+  ⚠️ **Hide the placeholder AND reclaim its space — but only because nothing is anchored there
+  any more (#1139).** This flipped twice, so read the history before changing it again.
+  `PlayableOverlay` used to paint an always-on Install pill into exactly that strip (`position:
+  fixed`, `bottom: max(16px, env(safe-area-inset-bottom))`, `zIndex: 2147483000`), and wordweave's
+  first reclaim was strictly worse than the placeholder: measured at 390x844, the letter board moved
+  down ~77 CSS px and the pill covered a whole tile — `elementFromPoint` at its centre returned the
   Install button and a tap fired `mraid.open`, so a letter the level's own target word needed became
-  invisible, undraggable, and an exit from the ad. **On a playable, a bottom banner reserve is CTA
-  clearance.** Keep it; only what occupies it changes.
+  invisible, undraggable, and an exit from the ad. That reclaim was reverted.
 
-  ⚠️ **Keeping it is necessary and NOT sufficient, because the two quantities scale differently.**
-  The pill's demand is fixed CSS px — 41 px tall at `bottom: max(16px, env(safe-area-inset-bottom))`,
-  so **57 px** at zero inset — while a banner reserve is a host PERCENTAGE. For the 9.1% Court and
-  wordweave both author, clearance holds only above a viewport height of about **626 px** (or 451 px
-  once the safe-area inset is ≥ 16 px). Below that the pill overhangs into the game: measured on
-  wordweave's creative, 5 px short at 320x568 and **22 px short at 844x390**, where the bottom
-  letter row's middle glyph sits behind the pill. A project authoring a SMALLER banner percentage
-  crosses that line on a taller screen. The requirement lives in `PlayableOverlay.tsx` (CSS px) and
-  the supply in the scene's `AdBannerSlot.height` (host %), with nothing tying them — #1139.
+  **The owner then removed the pill itself (2026-09-13).** AppLovin's creative specs require MRAID
+  2.0, `mraid.open()` click-through, no store redirect on first tap and muted audio until first
+  interaction, and state that AppLovin supplies the close button — they require no install button,
+  overlay or end card of ours. Install now lives ONLY on the end card, which covers the screen when
+  it shows, so the bottom strip is empty and the reclaim is right after all.
+
+  ⚠️ **The rule is therefore about what OCCUPIES the strip, not about the target.** If a persistent
+  CTA ever comes back, the reclaim goes with it — and it cannot come back as "just clear 57 px",
+  because the two quantities scale differently: a CTA's demand is fixed CSS px (the old pill was
+  41 px tall plus a 16 px inset, so 57 px) while a banner reserve is a host PERCENTAGE. At the 9.1%
+  Court and wordweave both author, clearance held only above about a **626 px** viewport height
+  (451 px once the safe-area inset is ≥ 16 px); below it the pill overhung into the game by 5 px at
+  320x568 and **22 px at 844x390**. A project authoring a smaller percentage crosses that line on a
+  taller screen. Any future always-on CTA needs its footprint PUBLISHED and cleared as
+  `max(reserve, footprint)`, not assumed to fit.
 
   ⚠️ And do not reach for "just zero the reserve" as the reclaim either: in a flex band solver that
   hands the freed height to the split, so the band you were protecting grows too (wordweave
@@ -362,7 +376,8 @@ removes nothing" below for the two that were not, and why they are gone rather t
 
 - **`npm run smoke:playable`** — builds the `space-invader` artifact and drives it in headless Chromium:
   self-extract, WebGL render, the `fflate` fallback, no-autoplay + unmute-on-tap, the MRAID viewable gate,
-  `mraid.open` CTA, orientation reflow, and **no ad-banner placeholder in the creative** (check 1h,
+  `mraid.open` CTA from the END CARD (check 3c/3d; 3b asserts no persistent pill returns — #1139),
+  orientation reflow, and **no ad-banner placeholder in the creative** (check 1h,
   #1108 — matched on rendered TEXT, because a geometry rule cannot tell a fake banner from a
   legitimate bottom HUD row and would need an allowlist on day one; it cannot see an untexted or
   canvas-drawn placeholder). Keep it in the loop for changes under `inlinePlayable.ts`,

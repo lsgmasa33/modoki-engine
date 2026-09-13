@@ -113,6 +113,25 @@ describe('skin2DSystem — sliced-sprite rig', () => {
     expect(part.uvRect).toEqual({ u0: 64 / 256, v0: 32 / 512, uw: 128 / 256, vh: 64 / 512 });
   });
 
+  // #1141 close-out: the retry above used to REBUILD EVERY FRAME while any sprite stayed unresolved.
+  // Each rebuild now takes a fresh buffer version, so a sprite that never resolves (a deleted
+  // texture) made Scene2D re-upload and re-render that canvas on every playing frame.
+  it('a sprite that never resolves does not rebuild (or re-version) the buffer every frame', () => {
+    clearRig2DCache(); clearSkin2DBuffers();
+    setRig2D('gone.rig2d.json', makeRig('dddddddd-0000-4000-8000-00000000dead'));
+    world = createWorld();
+    const root = world.spawn(Transform(), SkinnedSprite2D({ rig: 'gone.rig2d.json' }));
+    world.spawn(Transform(), Bone2D({ name: 'root' }), EntityAttributes({ guid: 'rb', parentId: root.id() }));
+
+    skin2DSystem(world);
+    const buf = getSkin2DBuffer(root.id())!;
+    const v = buf.version;
+    skin2DSystem(world);
+    skin2DSystem(world);
+    expect(getSkin2DBuffer(root.id())).toBe(buf); // not replaced by a rebuild
+    expect(getSkin2DBuffer(root.id())!.version).toBe(v);
+  });
+
   it('carries a uvRect for a member drawn from a BUILT ATLAS page (regression: DarkAssassin)', () => {
     // A rig whose sprite is a packed atlas member resolves to the atlas PAGE (not the
     // source sheet). resolveSprite returns the page rect + page dims as sheetW/H, so the

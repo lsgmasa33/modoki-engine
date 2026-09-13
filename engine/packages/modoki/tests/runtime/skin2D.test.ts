@@ -81,6 +81,22 @@ describe('skin2DSystem — CPU linear-blend skinning', () => {
     expect(getSkin2DBuffer(root.id())!.version).toBe(v1);
   });
 
+  // #1141: Scene2D re-uploads a mesh only when the buffer's version DIFFERS from the one its slot
+  // last uploaded, and that slot outlives a rebuild. Per-buffer counting from 0 put every
+  // rebuild back at 1, so a second weight-paint stroke with no pose change never reached the
+  // screen (observed live). Every rebuild must yield a version no earlier buffer had.
+  it('consecutive rig-data rebuilds with an unchanged pose never repeat a version', () => {
+    const { root } = setup();
+    skin2DSystem(world!);
+    const seen = [getSkin2DBuffer(root.id())!.version];
+    for (let stroke = 0; stroke < 3; stroke++) {
+      setRig2D(RIG, { ...rigDef, skinWeights: [...rigDef.skinWeights] }); // new object → rebuild
+      skin2DSystem(world!);
+      seen.push(getSkin2DBuffer(root.id())!.version);
+    }
+    expect(new Set(seen).size).toBe(seen.length);
+  });
+
   it('drops the buffer when the SkinnedSprite2D entity is removed', () => {
     const { root } = setup();
     skin2DSystem(world!);

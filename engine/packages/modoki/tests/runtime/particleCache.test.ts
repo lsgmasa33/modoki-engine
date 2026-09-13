@@ -347,3 +347,34 @@ describe('particleCache — unresolved guid warns once (parity with animationCli
     expect(String(warn.mock.calls[0][0])).toContain(guid);
   });
 });
+
+// #1141 sibling: an effect def is not an ECS trait, so a cache write fired nothing and a stopped Game
+// view kept drawing the old effect. Observed live: a t=0 burst added via modoki_particle_set showed 0
+// particles, with 0 renders, until an unrelated trait write drew all 60.
+describe('particleCache — a cache write wakes the render loops (#1141)', () => {
+  async function withWakeCounter() {
+    const ctx = await setup();
+    const dirty = await import('../../src/runtime/core/renderDirty'); // same fresh module graph as the cache
+    const counter = { wakes: 0 };
+    const unsub = dirty.addDirtyListener(() => { counter.wakes++; });
+    return { ...ctx, counter, unsub };
+  }
+
+  it('setParticleEffect fires the dirty listeners (the Particle Editor and particle-set path)', async () => {
+    const { cache, types, counter, unsub } = await withWakeCounter();
+    cache.setParticleEffect('fx/wake.particle.json', types.defaultParticleEffect());
+    expect(counter.wakes).toBe(1);
+    unsub();
+  });
+
+  it('a load that resolves fires them too', async () => {
+    const { cache, counter, unsub } = await withWakeCounter();
+    mockFetch(async () => ({ ok: true, json: async () => ({ version: 1, name: 'Late' }) }));
+    expect(cache.getParticleEffect('fx/late.particle.json')).toBeNull();
+    expect(counter.wakes).toBe(0); // starting a fetch caches nothing
+    await flush();
+    expect(cache.getParticleEffect('fx/late.particle.json')).not.toBeNull();
+    expect(counter.wakes).toBe(1);
+    unsub();
+  });
+});

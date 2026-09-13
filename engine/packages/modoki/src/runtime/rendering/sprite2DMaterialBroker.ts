@@ -69,6 +69,17 @@ export function markEntity2DMaterialDirty(id: number, gen: number): void { dirty
  *  left by a dead entity that shared the id reads as false — the generation discriminates. */
 export function isEntity2DMaterialDirty(id: number, gen: number): boolean { return dirtyEntities.get(id) === gen; }
 
+/** Render pass, BEFORE its idle skip: did a driver write any new uniform value this frame?
+ *
+ *  ⚠️ This is what lets a STOPPED renderer see the mark at all (#1141 sibling). The per-entity read
+ *  above sits inside the frame scan, which the idle skip returns before — so a uniform the driver
+ *  wrote while stopped was never drawn. Observed live: after a sprite swap rebuilt a material's
+ *  Shader with its default `uMix = 0`, the driver wrote the authored `1` on the next frame and the
+ *  Game view kept the `0` frame until some unrelated trait write woke it. A mark while stopped is
+ *  rare (a rebuild, a store-driven source), so this does not bring back the per-frame redraws the
+ *  gate exists to avoid: a stopped clock writes no new value and marks nothing. */
+export function hasAny2DMaterialDirty(): boolean { return dirtyEntities.size > 0; }
+
 /** Driver: clear the per-frame dirty set (called once at the top of the driver's frame,
  *  BEFORE it re-marks changed entities — so the flags always reflect only this frame). */
 export function clearEntity2DMaterialDirty(): void { dirtyEntities.clear(); }

@@ -7,7 +7,13 @@
  *  (assert on the `Float32Array`, no renderer) and deterministic.
  *
  *  `version` is bumped only when the deformed positions actually change, so an idle
- *  rig costs the renderer nothing (Scene2D's F1 gate compares versions). */
+ *  rig costs the renderer nothing (Scene2D's F1 gate compares versions).
+ *
+ *  ⚠️ Versions come from ONE module-wide counter, never a per-buffer count from 0 (#1141).
+ *  Scene2D keeps its last-uploaded version on its own slot, which survives a rebuild here, and
+ *  re-uploads only when the two DIFFER. A per-buffer count put every rebuild at 1 again, so two
+ *  rebuilds in a row with no pose change (a second weight-paint stroke) compared equal and never
+ *  uploaded — observed live on `games/skin-test`. Same scheme as `deform2DBuffers.ts`. */
 
 /** One CPU-skinned part of a rig — its own deformed mesh + sprite. A single-part (v1)
  *  rig has exactly one of these; a multi-part (v2) rig has several sharing the skeleton. */
@@ -67,6 +73,8 @@ export function frameSkin2DUVs(uvs: Float32Array, uvRect?: Skin2DPartBuffer['uvR
 }
 
 const buffers = new Map<number, Skin2DBuffer>();
+/** Source of every `version` — see the module docblock for why it is not per-buffer. */
+let versionCounter = 0;
 
 /** Read the buffer for an entity, or undefined if it hasn't been skinned yet. */
 export function getSkin2DBuffer(id: number): Skin2DBuffer | undefined {
@@ -80,7 +88,7 @@ export function getSkin2DDeformVersion(id: number): number {
 }
 
 /** Create or replace an entity's buffer (called when the rig first loads or the
- *  mesh topology/texture changes). Starts at version 0. */
+ *  mesh topology/texture changes). Takes a fresh version, never one a previous buffer had. */
 export function putSkin2DBuffer(id: number, buf: Omit<Skin2DBuffer, 'version' | 'bindMinY' | 'bindMaxY'>): Skin2DBuffer {
   // The buffer is always constructed with BIND-pose positions (skin2DSystem re-skins them
   // in place only afterward), so measuring the vertical extent here captures the stable
@@ -94,14 +102,14 @@ export function putSkin2DBuffer(id: number, buf: Omit<Skin2DBuffer, 'version' | 
     }
   }
   if (!Number.isFinite(bindMinY)) { bindMinY = 0; bindMaxY = 0; }
-  const full: Skin2DBuffer = { ...buf, version: 0, bindMinY, bindMaxY };
+  const full: Skin2DBuffer = { ...buf, version: ++versionCounter, bindMinY, bindMaxY };
   buffers.set(id, full);
   return full;
 }
 
 /** Bump the deform version after `positions` was rewritten in place. */
 export function bumpSkin2DVersion(buf: Skin2DBuffer): void {
-  buf.version++;
+  buf.version = ++versionCounter;
 }
 
 /** Drop an entity's buffer (entity removed / lost its SkinnedSprite2D). */

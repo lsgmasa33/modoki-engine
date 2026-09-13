@@ -942,11 +942,9 @@ export const useEditorStore = create<EditorState>((set, get) => {
     set({ editingSkinDef: def });
   },
   applySkinDef: (path, def) => {
+    // setRig2D wakes every render loop itself (#1141), including the SceneView overlay's
+    // heatmap — ensureCanvas2DListeners subscribes mark2DDirty to that same channel.
     setRig2D(path, def);
-    // Redraw the SceneView: weight edits (auto-weight/paint) change the heatmap even when
-    // the bind-pose mesh positions don't, so nothing else would trigger a repaint until the
-    // next pointer event. Cheap flag set (no React re-render), safe to call per paint move.
-    mark2DDirty();
     set((s) => (s.editingSkinAsset?.path === path ? { editingSkinDef: def } : {}));
   },
   setSkinWeightView: (on) => set({ skinWeightView: on }),

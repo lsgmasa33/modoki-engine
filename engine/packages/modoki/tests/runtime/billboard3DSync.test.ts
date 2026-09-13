@@ -137,13 +137,17 @@ describe('syncBillboardSprites — geometry bridge', () => {
     const scene = new T.Scene();
     sync.syncBillboardSprites(world, scene, state);
     const entry = state.billboards.get(e.id())!;
-    expect(entry.deformVersion).toBe(0);
+    // Relative, not literal: versions come from one module-wide counter (#1141), so the first
+    // put is whatever that counter reached — the contract is "tracks the buffer", not "starts at 0".
+    expect(entry.deformVersion).toBe(buf.version);
+    const built = buf.version;
 
     // Move a vertex + bump: the geometry follows.
     buf.parts[0].positions[4] = 150; // x of vertex 2
     bufs.bumpSkin2DVersion(buf);
     sync.syncBillboardSprites(world, scene, state);
-    expect(entry.deformVersion).toBe(1);
+    expect(entry.deformVersion).toBe(buf.version);
+    expect(entry.deformVersion).not.toBe(built);
     expect(entry.meshes[0].geometry.getAttribute('position').getX(2)).toBe(150);
   });
 

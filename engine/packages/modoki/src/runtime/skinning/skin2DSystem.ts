@@ -42,11 +42,21 @@ const lastDeformVerByEntity = new Map<number, number>();
 // object, so an identity change means the rig DATA changed (re-tessellate / re-weight in
 // the Skin editor) → force a rebuild + reskin even if the bone pose is unchanged.
 const lastRigObjByEntity = new Map<number, ParsedRig2D>();
-// True when the last build left a GUID sprite unresolved (its asset wasn't in the
-// manifest yet — the cold-scene-load race: skin2DSystem runs before the atlas/texture
-// registers). Forces a rebuild each frame until it resolves, so the mesh isn't stuck
-// textureless (url '') behind the idle fast-path until a manual reload.
-const lastBuildUnresolvedByEntity = new Map<number, boolean>();
+// How many GUID sprites the last build left unresolved (their asset wasn't in the manifest
+// yet — the cold-scene-load race: skin2DSystem runs before the atlas/texture registers). A
+// later frame rebuilds once FEWER are unresolved, so the mesh isn't stuck textureless (url '')
+// behind the idle fast-path until a manual reload.
+// ⚠️ A COUNT that must DROP, not a flag that forces a rebuild every frame (#1141 close-out). Each
+// rebuild takes a fresh buffer version now, so a sprite that never resolves (a deleted texture)
+// re-uploaded and re-rendered its canvas every playing frame; under the old per-buffer versions
+// the same loop was invisible only because every rebuild collided on version 1.
+const lastBuildUnresolvedByEntity = new Map<number, number>();
+
+function unresolvedSpriteCount(parsed: ParsedRig2D): number {
+  let n = 0;
+  for (const part of parsed.parts) if (isGuid(part.sprite) && !resolveSprite(part.sprite)?.url) n++;
+  return n;
+}
 const trackedRootIds = new Set<number>();
 
 // Per-frame scratch, reused across frames so an idle rig doesn't re-allocate a Map over
@@ -177,15 +187,16 @@ export function skin2DSystem(world: World) {
       || buf.parts.some((pb, i) => pb.positions.length !== parsed.parts[i].vertCount * 2)
       // A prior build resolved a GUID sprite to nothing (asset not registered yet) —
       // retry until it appears, else the rig stays textureless behind the idle skip.
-      || lastBuildUnresolvedByEntity.get(id);
+      || ((lastBuildUnresolvedByEntity.get(id) ?? 0) > 0
+        && unresolvedSpriteCount(parsed) < lastBuildUnresolvedByEntity.get(id)!);
     if (needBuild) {
-      let unresolved = false;
+      let unresolved = 0;
       buf = putSkin2DBuffer(id, {
         parts: parsed.parts.map((part) => {
           const resolved = resolveSprite(part.sprite);
           // A GUID sprite that didn't resolve means its asset (texture/atlas page) isn't
           // in the manifest yet — flag it so the next frame rebuilds and picks it up.
-          if (isGuid(part.sprite) && !resolved?.url) unresolved = true;
+          if (isGuid(part.sprite) && !resolved?.url) unresolved++;
           // A sliced sprite carries a source-px frame + the sheet dims it was authored against;
           // normalize to a resolution-independent sub-rect the renderer remaps the 0..1 UVs into.
           const f = resolved?.frame;

@@ -1292,9 +1292,12 @@ group math is a single pure module, `editor/scene/multiTransform.ts` (headless-u
   entity to the selection (plain left-drag still orbits/pans; orbit is suppressed only for the
   shift-drag). Both viewports. Shift/Ctrl-click also add/toggle, mirroring the Hierarchy panel.
 - **Undo** — one group drag is a single batched step (`buildGroupTransformUndoAction`) covering
-  every member. Because undo/redo write traits via a direct `entity.set` (no dirty broadcast), the
-  2D overlay AND the Pixi content are both explicitly re-woken on undo (`subscribeUndo` →
-  `mark2DDirty` + `editorMarkScene2DDirty`), else a reverted 2D transform shows stale until refocus.
+  every member. Undo/redo write traits via a direct `entity.set`, so the transform action's apply
+  (`editor/scene/gizmoUndo.ts`) fires `fireDirtyListeners()` itself — without it the Game view kept
+  the pre-undo position (#1141). The SceneView's 2D overlay and Pixi content are ALSO woken
+  explicitly on any undo (`subscribeUndo` → `mark2DDirty` + `editorMarkScene2DDirty`), which covers
+  undo entries that are not transform actions. The live drag follows the same rule: every direct
+  write in `installScene2DInteraction` calls both `mark2DDirty()` and `fireDirtyListeners()`.
 - **Selection state was already array-based** (`selectedEntityIds` + primary `selectedEntityId`) —
   this feature was purely SceneView-viewport wiring; the store, Inspector, Hierarchy, and selection
   undo already supported multi-select.

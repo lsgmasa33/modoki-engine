@@ -15,6 +15,7 @@ import { assetUrl } from './assetUrl';
 import { normalizeRig2D, type Rig2DFile, type ParsedRig2D } from '../skinning/rig2dTypes';
 import { parseAssetJson } from './assetFetch';
 import { createTeardownToken } from '../core/liveness';
+import { fireDirtyListeners } from '../core/renderDirty';
 
 export {
   type Rig2DBone, type Rig2DPart, type Rig2DFile, type ParsedRig2DPart, type ParsedRig2D,
@@ -88,8 +89,7 @@ export function getRig2D(ref: string, opts?: { load?: boolean }): ParsedRig2D | 
         if (cache.has(path)) return;          // editor live-preview seeded it
         const id = (json as Rig2DFile)?.id;
         if (id && isGuid(id)) registerAsset(id, path, 'rig2d');
-        sourceCache.set(path, json as Rig2DFile);
-        cache.set(path, normalizeRig2D(json as Rig2DFile));
+        storeRig(path, json as Rig2DFile);
       })
       .catch((e) => {
         if (stillLive()) failed.add(path);
@@ -116,9 +116,23 @@ export function getRig2DSource(refOrPath: string): Rig2DFile | null {
 export function setRig2D(refOrPath: string, def: Rig2DFile): void {
   const path = rig2dCacheKey(refOrPath);
   if (!path) return;
+  storeRig(path, def);
+  failed.delete(path);
+}
+
+/** The ONE write into the cache, and it wakes the render loops (#1141).
+ *
+ *  A rig is not an ECS trait, so writing one fires nothing on its own. `skin2DSystem` still
+ *  rebuilds the mesh (it runs while stopped), but both Scene2D renderers skip every idle frame
+ *  that nothing marked dirty, so a Skin-editor weight edit or its undo stayed invisible in the
+ *  Game view and the SceneView until a bone moved. The wake lives HERE rather than at the
+ *  editor call site because every writer needs it: paint strokes, undo closures, `loadSkinDef`,
+ *  the bone list, and a load that resolves while the editor is stopped. Same channel
+ *  `registerAsset` uses. */
+function storeRig(path: string, def: Rig2DFile): void {
   sourceCache.set(path, def);
   cache.set(path, normalizeRig2D(def));
-  failed.delete(path);
+  fireDirtyListeners();
 }
 
 /** Drop a cached rig so the next access re-fetches (e.g. after an external edit). */

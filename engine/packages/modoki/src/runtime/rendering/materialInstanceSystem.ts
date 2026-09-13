@@ -228,6 +228,11 @@ function applyOverrides2D(
       }
       continue;
     }
+    // A non-finite value never reaches a uniform (#1141 close-out). A time source authored with
+    // `wrap: 0` yields NaN forever, and `NaN !== NaN` made every frame a "change" — which, now
+    // that a stopped renderer's idle gate honours this dirty mark, redrew that canvas every idle
+    // frame. The uniform keeps its last good value.
+    if (!Number.isFinite(value)) continue;
     for (const sh of shaders) {
       const uniforms = sh.resources?.matUniforms?.uniforms;
       // Only write a uniform the shader actually declares (a stray target would add a dead

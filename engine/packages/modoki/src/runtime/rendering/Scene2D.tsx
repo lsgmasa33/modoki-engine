@@ -64,7 +64,7 @@ import { getSpriteEpoch } from '../loaders/assetManifest';
 import { ensureSpriteMaterial, clearSpriteMaterialCache } from '../loaders/spriteMaterialCache';
 import { makePixiShaderInstance, buildUniformValues, type PixiShaderProgram } from './pixiShaderBuilder';
 import { coerceParamValue } from '../loaders/shaderSchema';
-import { register2DMaterialShaderMap, isEntity2DMaterialDirty } from './sprite2DMaterialBroker';
+import { register2DMaterialShaderMap, isEntity2DMaterialDirty, hasAny2DMaterialDirty } from './sprite2DMaterialBroker';
 import type { Entity2DShaderEntry } from './sprite2DMaterialBroker';
 import { computePaintOrder } from './paintOrder';
 import { computeGroupAlpha } from './groupAlpha';
@@ -1552,7 +1552,9 @@ export class Scene2DRenderer {
 
     // (1) Idle whole-frame skip — while the sim is stopped/paused, 2D only changes
     // via paths that set _externalDirty, so idle + clean ⇒ no ECS scan, no render.
-    if (!isSimRunning() && !this._externalDirty && !previewing2D && !previewChanged2D) return;
+    // A material uniform the driver wrote this frame counts too: its per-entity read is inside the
+    // scan below, which this skip would otherwise make unreachable (#1141 sibling).
+    if (!isSimRunning() && !this._externalDirty && !previewing2D && !previewChanged2D && !hasAny2DMaterialDirty()) return;
     let forceAll = this._externalDirty; // external edit / load / resize / swap ⇒ redraw all
     this._externalDirty = false;
 

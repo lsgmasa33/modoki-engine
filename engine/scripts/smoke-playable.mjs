@@ -79,7 +79,15 @@ const bootState = (page) => page.evaluate(() => ({
   canvas: !!document.querySelector('canvas'),
   canvasW: document.querySelector('canvas')?.width || 0,
   bootErr: (document.body || document.documentElement).getAttribute('data-playable-error'),
-  installPill: !!document.querySelector('button[aria-label="Install"]'),
+  installPill: !!document.querySelector('#playable-overlay button'),
+  // ⚠️ **The overlay HOST, not a button** (#1139 review finding 6). `bootPlayable` awaits
+  // `whenReady()` + `whenViewable()` before mounting, and that gate got MORE load-bearing when the
+  // persistent pill went: the 30 s cap is armed in the overlay's mount effect, and the end card is
+  // now the only route to a click, so mounting early would let the cap burn down off-screen and
+  // show the end card on first sight. With the pill gone, a button probe cannot see any of that —
+  // no button renders before the end card either way, so `3a` passed whether or not the gate
+  // existed. Measured: deleting the `whenViewable()` await left 3a-3d all green.
+  overlayMounted: !!document.getElementById('playable-overlay'),
   // #1108 — an ad placeholder that shipped INSIDE the ad. Matched on rendered text, deliberately:
   // the UI renderer attaches no per-entity attribute, so there is no name selector for the slot,
   // and a geometry rule ("an opaque full-width strip across the bottom") cannot tell a fake banner
@@ -107,7 +115,11 @@ const bootState = (page) => page.evaluate(() => ({
   // The banner is a DOM UI element, so "no DOM UI at all" makes the probe meaningless rather than
   // passing — reported `n/a`, the same way check 1b handles a project that ships no audio.
   uiTextEls: [...document.body.querySelectorAll('*')]
-    .filter((el) => el.getAttribute('aria-label') !== 'Install'
+    // Excluded by CONTAINER, not by label (#1139): the CTA's `aria-label` was dropped — it made
+    // the accessible name disagree with the visible "Install Now" — so an attribute filter no
+    // longer finds it. Everything the overlay renders lives under `#playable-overlay`, and none of
+    // it is the GAME's own DOM UI, which is what this counts.
+    .filter((el) => !el.closest('#playable-overlay')
       && !!(el.textContent || '').trim()
       && ![...el.children].some((c) => (c.textContent || '').trim()))
     .length,
@@ -150,7 +162,7 @@ try {
     // UI never rendered, which is the state it is MOST likely to be in. Wait for DOM UI to appear
     // rather than for a phrase to disappear.
     await page.waitForFunction(() => [...document.body.querySelectorAll('*')]
-      .filter((el) => el.getAttribute('aria-label') !== 'Install'
+      .filter((el) => !el.closest('#playable-overlay')
         && !!(el.textContent || '').trim()
         && ![...el.children].some((c) => (c.textContent || '').trim())).length > 3,
     { timeout: 10000 }).catch(() => {});
@@ -189,13 +201,27 @@ try {
     await page.goto(ART, { waitUntil: 'load' });
     await page.waitForFunction(() => globalThis.__PLAYABLE_ASSETS__, { timeout: 15000 }).catch(() => {});
     await page.waitForTimeout(800);
-    ok('3a CTA withheld while off-screen', (await bootState(page)).canvas && !(await bootState(page)).installPill);
+    const offScreen = await bootState(page);
+    ok('3a overlay withheld while off-screen — the viewable gate holds the time cap',
+      offScreen.canvas && !offScreen.overlayMounted && !offScreen.installPill);
     await page.evaluate(() => { window.__viewable = true; window.mraid.__fire('viewableChange', true); });
-    await page.waitForFunction(() => !!document.querySelector('button[aria-label="Install"]'), { timeout: 5000 }).catch(() => {});
-    ok('3b CTA Install pill appears once viewable', (await bootState(page)).installPill);
-    await page.click('button[aria-label="Install"]').catch(() => {});
+    await page.waitForTimeout(800);
+    // ⚠️ **3b INVERTED by #1139** — it used to assert the persistent Install pill APPEARED here.
+    // The pill is gone: it sat in the bottom 57 CSS px, which is a design-space reserve away in the
+    // game's own layout, so on a short viewport it overhung onto the letter board's bottom row,
+    // opaque and hit-testable. AppLovin requires no install affordance of our own, so this now
+    // guards the pill STAYING gone — the regression is it coming back.
+    const viewable = await bootState(page);
+    ok('3b overlay mounts once viewable, with NO persistent CTA — Install lives only on the end '
+      + 'card (#1139)', viewable.overlayMounted && !viewable.installPill);
+    // The end card is the only route to a click, so the gate must actually reach it. `playable:end`
+    // is the game-driven path; `capSeconds` (30 s) is the other and is not waited on here.
+    await page.evaluate(() => window.dispatchEvent(new Event('playable:end')));
+    await page.waitForFunction(() => !!document.querySelector('#playable-overlay button'), { timeout: 5000 }).catch(() => {});
+    ok('3c end card shows Install once the playable ends', (await bootState(page)).installPill);
+    await page.getByRole('button', { name: 'Install Now' }).click().catch(() => {});
     const opened = await page.evaluate(() => window.__mraidOpen);
-    ok('3c Install routes through mraid.open(storeUrl)', opened === CLICK_URL, `mraid.open(${opened})`);
+    ok('3d Install routes through mraid.open(storeUrl)', opened === CLICK_URL, `mraid.open(${opened})`);
   }
 
   // 4. Orientation reflow.

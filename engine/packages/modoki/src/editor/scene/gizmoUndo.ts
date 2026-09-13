@@ -5,6 +5,7 @@
  *  transform), so undo reverses the whole gesture in one step. */
 
 import type { UndoAction } from '../undo/undoManager';
+import { fireDirtyListeners } from '../../runtime/core/renderDirty';
 
 /** Minimal entity surface the undo closures touch. */
 export interface UndoEntity {
@@ -41,7 +42,11 @@ export function buildTransformUndoAction(opts: TransformUndoOptions): UndoAction
     const id = resolve();
     if (id == null) return;
     const en = findEntity(id);
-    if (en?.has(trait)) en.set(trait, { ...en.get(trait), ...fields });
+    if (!en?.has(trait)) return;
+    en.set(trait, { ...en.get(trait), ...fields });
+    // A direct ECS write fires no dirty broadcast, and undo/redo has none of its own — so without
+    // this the Game view (and anything else listening) kept the pre-undo position (#1141 sibling).
+    fireDirtyListeners();
   };
   const action: UndoAction = { label, undo: () => apply(before), redo: () => apply(after) };
   if (entityGuid) {

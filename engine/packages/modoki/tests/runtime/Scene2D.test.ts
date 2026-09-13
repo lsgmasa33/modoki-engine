@@ -2221,6 +2221,39 @@ describe('Scene2D.renderFrame', () => {
       scene2d.renderFrame(); // frame 4
       expect(render).toHaveBeenCalledTimes(1);
     });
+
+    // #1141 sibling, observed live: a sprite swap rebuilt a material's Shader with its default
+    // uniform, the driver wrote the authored value on the NEXT frame and marked the entity — and the
+    // stopped renderer's idle skip returned before the scan that reads that mark, so the Game view
+    // kept the default-uniform frame until an unrelated trait write woke it.
+    it('redraws a material entity the driver marked, even while stopped and nothing else is dirty', async () => {
+      const { traits, pool, scene2d, world, matReady } = await setup();
+      const { setPlayState } = await import('../../src/runtime/core/playState');
+      const broker = await import('../../src/runtime/rendering/sprite2DMaterialBroker');
+      matReady.add('matGuid');
+      const canvas = spawnCanvas(world, traits);
+      const child = spawnChild(world, traits, canvas.id(), { sprite: 'square', material: 'matGuid' });
+
+      scene2d.renderFrame(); // frame 1: allocates the slot; its Application init is async
+      const slot = pool.getSlot(canvas.id())!;
+      await slot.ready;
+      slot.canvas.width = 320; // renderAll skips an unsized (1x1) slot
+      slot.canvas.height = 480;
+      const render = (slot.app as any).renderer.render as ReturnType<typeof vi.fn>;
+      scene2d.markScene2DDirty();
+      scene2d.renderFrame(); // frame 2: a real render with the material mesh built
+      expect(render).toHaveBeenCalledTimes(1);
+
+      setPlayState('stopped');
+      render.mockClear();
+      scene2d.renderFrame(); // frame 3: stopped and clean — the idle skip is still allowed to skip
+      expect(render).not.toHaveBeenCalled();
+
+      broker.markEntity2DMaterialDirty(child.id(), child.generation()); // the driver's new uniform value
+      scene2d.renderFrame(); // frame 4
+      expect(render).toHaveBeenCalledTimes(1);
+      broker.clearEntity2DMaterialDirty();
+    });
   });
 });
 

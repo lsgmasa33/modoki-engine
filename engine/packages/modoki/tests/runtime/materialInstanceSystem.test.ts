@@ -646,6 +646,19 @@ describe('materialInstanceSystem — 2D materials', () => {
     expect(isEntity2DMaterialDirty(e.id(), e.generation())).toBe(false); // value unchanged this frame → set cleared, not re-marked
   });
 
+  // #1141 close-out: `wrap: 0` makes a time source NaN forever, and NaN !== NaN made every frame a
+  // "change" — harmless while the idle gate ignored this mark, a per-frame redraw once it honours it.
+  it('never writes a non-finite value, so a NaN source neither poisons the uniform nor stays dirty', () => {
+    const world = newWorld();
+    spawnTime(world);
+    const { e, sh } = attach2D(world, [{ target: 'uA', kind: 'uniform', source: { type: 'time', wrap: 0 } } as never], { uA: 0.25 });
+
+    materialInstanceSystem(world);
+    materialInstanceSystem(world);
+    expect(sh.resources.matUniforms.uniforms.uA).toBe(0.25);
+    expect(isEntity2DMaterialDirty(e.id(), e.generation())).toBe(false);
+  });
+
   it('does NOT write an undeclared uniform (avoids dead keys)', () => {
     const world = newWorld();
     spawnTime(world);

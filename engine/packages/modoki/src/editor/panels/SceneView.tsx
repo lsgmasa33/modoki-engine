@@ -1268,7 +1268,7 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
       const ent = findEntity(entityId);
       if (!ent) return;
       ent.set(colMeta.trait as any, { ...(ent.get(colMeta.trait as any) as object), points: str });
-      mark2DDirty();
+      mark2DDirty(); fireDirtyListeners(); // direct ECS write — see the gizmo drag below
     }
     // Commit a points edit (before→after) as one undo entry, applying `after` now.
     function commitPoints(entityId: number, colMeta: { trait: unknown }, beforeStr: string, afterPts: Pt[]) {
@@ -1644,7 +1644,7 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
           // write position too, because a rigid group transform orbits the members.
           me.set(Transform, { ...me.get(Transform), ...groupMemberFields(mode, localNew, clampAngle) });
         });
-        mark2DDirty();
+        mark2DDirty(); fireDirtyListeners(); // direct ECS writes — see the gizmo drag below
         return;
       }
 
@@ -1673,7 +1673,15 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
         const localDelta: Record<string, number> = {};
         for (const k of Object.keys(worldDelta) as (keyof typeof worldDelta)[]) localDelta[k] = localNew[k];
         entity.set(Transform, { ...entity.get(Transform), ...localDelta });
-        mark2DDirty(); // Direct ECS write bypasses writeTraitField
+        // A direct ECS write bypasses writeTraitField, which is what fires the dirty broadcast — so
+        // fire it, as the 3D gizmo drag does. `mark2DDirty` (this interaction's markDirty) reaches
+        // only the SceneView's two gates, and on its own the Game view stayed at the pre-drag
+        // position through the drag AND after release until an unrelated edit woke it (#1141
+        // sibling, observed live: ECS x 515.42, Game view sprite x 110). The SceneView wake stays
+        // explicit rather than riding the broadcast, so the overlay does not depend on
+        // `ensureCanvas2DListeners` having been installed.
+        mark2DDirty();
+        fireDirtyListeners();
         return;
       }
 
