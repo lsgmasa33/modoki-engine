@@ -35,6 +35,12 @@
  *      check knows only that the two disagree, and one reachable cause is a mis-resolved binary
  *      merge where the committed tarball is the wrong one. Auto-extracting it would install wrong
  *      bytes confidently and erase the only signal.
+ *   6. `stripFirebaseAuthFacebook`, when `platforms` includes iOS — AFTER step 4, never before it: an
+ *      install that re-extracts `@capacitor-firebase/authentication` restores its original
+ *      `Package.swift`, which links the Facebook iOS SDK unconditionally (#1062). Idempotent; a no-op
+ *      for a project without the plugin. REFUSES when the manifest cannot be put in the state the
+ *      project needs — shipping the SDK silently is the failure it exists to stop. Skipped for an
+ *      Android-only build, which that manifest cannot affect and must not be refused over.
  *
  *  And one gate before all of them: the caller must HOLD THE BUILD CLAIM on this project
  *  (`holdsBuildClaim`). Every step mutates the project, so a heal running unclaimed lets two
@@ -50,6 +56,7 @@ import { ensureCapacitorDeps, type NativePlatform } from './addNativeTarget';
 import { vendorEnginePlugins, writeVendorMarker, verifyInstalledMatchesTarballResult } from './vendorPlugins';
 import { describeUnreadablePackageJsonWarning } from '../scripts/staleNodeModulesWarning.mjs';
 import { holdsBuildClaim } from '../scripts/buildClaimsStore.mjs';
+import { stripFirebaseAuthFacebook } from './stripFirebaseAuthFacebook';
 
 export interface HealNativeProjectPorts {
   /** A progress line. */
@@ -67,7 +74,10 @@ export type HealNativeProjectResult =
   /** Step 4 failed. Steps 1-3 have already written; step 5 did not run. */
   | { ok: false; reason: 'install-failed'; why: string }
   /** Step 5 found `node_modules` holding the wrong bytes — `lines` is the full diagnosis + remedy. */
-  | { ok: false; reason: 'stale-node-modules'; problems: string[]; lines: string[] };
+  | { ok: false; reason: 'stale-node-modules'; problems: string[]; lines: string[] }
+  /** Step 6: the Firebase auth plugin's manifest is not in the state this project needs (Facebook
+   *  unstrippable, or stripped when the project asks for it) — `lines` says why (#1062). */
+  | { ok: false; reason: 'facebook-sdk-manifest'; lines: string[] };
 
 /** Heal `projectRoot` for a native build of `platforms`, from the engine checkout at `editorRoot`.
  *  `platforms` is an INPUT, not a switch: the route builds one platform, the CLI's `--target
@@ -114,6 +124,13 @@ export async function healNativeProject(
   if (reason === 'unreadable-package-json') ports.warn(describeUnreadablePackageJsonWarning(projectRoot));
   if (problems.length) {
     return { ok: false, reason: 'stale-node-modules', problems, lines: describeStaleNodeModules(projectRoot, problems) };
+  }
+
+  // 6. — iOS only: the manifest is SPM's, and an Android build must not be refused over it.
+  if (platforms.includes('ios')) {
+    const fb = stripFirebaseAuthFacebook(projectRoot);
+    if (!fb.ok) return { ok: false, reason: 'facebook-sdk-manifest', lines: fb.lines };
+    for (const n of fb.notes) ports.log(`[heal] ${n}`);
   }
   return { ok: true };
 }

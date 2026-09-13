@@ -2,11 +2,18 @@
  *  manifest / clip / particle / shader JSON).
  *
  *  In the EDITOR (dev) the same URL is re-fetched after the file changes on disk
- *  — a scene revert, a prefab edit, an asset re-import. The dev server sends
- *  `Cache-Control: no-cache` with a weak ETag, which still lets the browser serve
- *  a stale `304` after a revert (and the editor's "reload scene" / force-reload go
- *  through these fetches). The result: the editor loads a STALE level. `no-store`
- *  bypasses the HTTP cache entirely so every editor load reads the current file.
+ *  — a scene revert, a prefab edit, an asset re-import. The dev server (Vite's static
+ *  middleware) sends `Cache-Control: no-cache` with `ETag: W/"<size>-<mtime ms>"`, so
+ *  the browser revalidates, and a `304` means "keep your copy". An ordinary write
+ *  (an editor save, a `git checkout`) stamps a fresh mtime and gets a `200`; the
+ *  stale `304` needs a SAME-SIZE write that keeps the old mtime (`touch -r`,
+ *  `rsync -t`, an archive extract). Narrow, not impossible, and the result is an
+ *  editor loading a STALE asset with no error. `no-store` bypasses the HTTP cache
+ *  entirely so every editor load reads the current file. (#1165 corrected an earlier
+ *  version of this comment that said a plain revert was enough.)
+ *
+ *  Every `fetch(assetUrl(…))` in runtime/** must pass it — guarded by
+ *  `tests/architecture/assetJsonGuard.test.ts`.
  *
  *  In a PRODUCTION build assets are immutable and cross-session HTTP caching is
  *  valuable (a returning player doesn't re-download a shared mesh/texture), so the

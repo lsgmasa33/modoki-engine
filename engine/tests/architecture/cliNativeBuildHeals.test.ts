@@ -64,6 +64,10 @@ describe('build-web.mjs heals through the ONE shared sequence (#148, #150, #685,
     expect(fnBody).toMatch(/\.healNativeProject\(projectRoot, repoRoot, platforms,/);
   });
 
+  it('derives platforms through nativeHealPlatforms, so the editor\'s per-platform step is honoured (#1062)', () => {
+    expect(fnBody).toMatch(/const platforms = nativeHealPlatforms\(process\.env,/);
+  });
+
   it('calls no step of the sequence directly — anywhere in the script', () => {
     expect(src).not.toMatch(HEAL_STEPS);
   });
@@ -80,9 +84,10 @@ describe('build-web.mjs heals through the ONE shared sequence (#148, #150, #685,
     expect(healCall).toBeLessThan(tscCall);
   });
 
-  it('FAILS the build (throws) on a stale node_modules and on a failed install — never merely logs', () => {
+  it('FAILS the build (throws) on a stale node_modules, a failed install and a Firebase auth manifest refusal (#1062) — never merely logs', () => {
     expect(fnBody).toMatch(/'stale-node-modules'\)\s*throw new Error/);
     expect(fnBody).toMatch(/'install-failed'\)\s*throw new Error/);
+    expect(fnBody).toMatch(/'facebook-sdk-manifest'\)\s*throw new Error/);
   });
 
   it('warns with the reason and RETURNS — never process.exit — when the module cannot load (#714, #731)', () => {
@@ -106,6 +111,20 @@ describe('the editor /api/build heals through the same sequence (#685 parity, #8
 
   it('calls no step of the sequence directly', () => {
     expect(src).not.toMatch(HEAL_STEPS);
+  });
+
+  it('names the platform on BOTH scaffold runners too — the auto-scaffold shift()s the plan\'s own step away (#1062)', () => {
+    const runners = src.match(/env: \{ \.\.\.buildEnv, MODOKI_ICONS_HANDLED: '1', MODOKI_NATIVE_PLATFORM: platform \?\? '' \}/g) ?? [];
+    expect(runners.length, '/api/add-native-target runShell and the /api/build runScaffoldShell').toBe(2);
+  });
+
+  it('names the platform on each per-platform build-web step — or an Android build heals iOS too (#1062)', () => {
+    for (const [plan, platform] of [['iosPrefixSteps', 'ios'], ['androidPrefixSteps', 'android']] as const) {
+      const at = src.indexOf(`const ${plan}: BuildStep[] = [`);
+      expect(at, `${plan} is gone — re-anchor`).toBeGreaterThan(-1);
+      const step = src.slice(at, src.indexOf('},', src.indexOf("build-web.mjs --target native'", at)));
+      expect(step).toContain(`MODOKI_NATIVE_PLATFORM: '${platform}'`);
+    }
   });
 
   it('heals BEFORE the #370 release-file writes — the heal is what gitignores keystore.properties', () => {

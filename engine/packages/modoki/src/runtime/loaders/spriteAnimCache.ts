@@ -23,7 +23,7 @@ import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
 import { awaitLazyLoad } from './awaitLazyLoad';
 import { defaultSpriteClip, type SpriteClip } from '../traits/SpriteAnimator';
-import { parseAssetJson } from './assetFetch';
+import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import { createTeardownToken } from '../core/liveness';
 
 /** The subset of a SpriteAnimator instance the resolvers below read. */
@@ -110,7 +110,7 @@ export function getSpriteAnim(ref: string, opts?: { load?: boolean }): SpriteAni
   if (opts?.load === false) return null;
   if (!loading.has(path)) {
     const stillLive = liveness.capture(path);
-    const p = fetch(assetUrl(path))
+    const p = fetch(assetUrl(path), ASSET_FETCH_INIT)
       .then((r) => {
         return parseAssetJson(r, path);
       })

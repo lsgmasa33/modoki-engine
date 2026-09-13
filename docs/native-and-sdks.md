@@ -1066,12 +1066,12 @@ AppsFlyer 7.0.2, capacitor-swift-pm 8.4 / 8.5):
 
 | Ships its own manifest | Does not |
 |---|---|
-| Capacitor and CapacitorCordova (both empty) · AppsFlyerLib (tracking + domains, UserDefaults, FileTimestamp) · FirebaseCore, CoreInternal, Crashlytics, Auth, Installations, Firestore · GoogleUtilities · GoogleDataTransport · grpc · leveldb · gtm-session-fetcher · nanopb · promises · abseil · AppAuth · GTMAppAuth · GoogleSignIn · Facebook (tracking) | **`@capacitor/preferences`**, which calls `UserDefaults.standard` · the `@capacitor-firebase/*` and `capacitor-appsflyer` wrappers (no required-reason calls) · `capacitor-modoki-iap` · `GameDebugPlugin.swift` · **GoogleAppMeasurement** and GoogleAdsOnDeviceConversion (binary artifacts; no manifest in the checkout or the artifact) |
+| Capacitor and CapacitorCordova (both empty) · AppsFlyerLib (tracking + domains, UserDefaults, FileTimestamp) · FirebaseCore, CoreInternal, Crashlytics, Auth, Installations, Firestore · GoogleUtilities · GoogleDataTransport · grpc · leveldb · gtm-session-fetcher · nanopb · promises · abseil · AppAuth · GTMAppAuth · GoogleSignIn · ~~Facebook (tracking)~~ stripped from the graph by #1062 | **`@capacitor/preferences`**, which calls `UserDefaults.standard` · the `@capacitor-firebase/*` and `capacitor-appsflyer` wrappers (no required-reason calls) · `capacitor-modoki-iap` · `GameDebugPlugin.swift` · **GoogleAppMeasurement** and GoogleAdsOnDeviceConversion (binary artifacts; no manifest in the checkout or the artifact) |
 
 - **Required-reason APIs: UserDefaults `CA92.1` only**, for `@capacitor/preferences`. The app
   target's own Swift uses none. The guard derives this from each game's `package.json`.
-- **Tracking: `false`, with no domains.** The SDKs that track (AppsFlyer; Facebook in Court's graph)
-  declare it in their own manifests.
+- **Tracking: `false`, with no domains.** The SDKs that track (AppsFlyer; Facebook in Court's graph
+  until #1062 stripped it) declare it in their own manifests.
 - **Collected data: only the game's OWN first-party collection** (owner, 2026-09-11). Court declares
   User ID, Gameplay Content and Purchase History (its Firestore cloud save), each linked, App
   Functionality, not tracking. Weaveling declares none today; revisit when #927, #925 or #932 lands.
@@ -1079,11 +1079,32 @@ AppsFlyer 7.0.2, capacitor-swift-pm 8.4 / 8.5):
   nothing in the graph.** That is App Store privacy-label work (#933), not something to paper over
   in the app's manifest. Confirmed in a built Court `App.app`, whose bundle carries ~45 SDK
   manifests and none for it.
-- ⚠️ **Court embeds the Facebook SDK (FBSDKCoreKit, FBSDKLoginKit, FBAEMKit) without offering
-  Facebook sign-in.** `@capacitor-firebase/authentication`'s `Package.swift` links FacebookCore and
-  FacebookLogin unconditionally, and SPM has no optional products, so `providers` in
-  `capacitor.config.json` cannot remove them. Its manifests declare tracking, so Court's privacy
-  report carries that. Observed in a simulator build, 2026-09-11; filed as #1062.
+- ⚠️ **`@capacitor-firebase/authentication` links the Facebook iOS SDK unconditionally, and the
+  build heal strips it (#1062).** Its `Package.swift` lists FacebookCore + FacebookLogin as products
+  of its one target and defines `RGCFA_INCLUDE_FACEBOOK`; SPM has no optional products, so
+  `providers` in `capacitor.config.json` never reached it, and Court shipped FBSDKCoreKit,
+  FBSDKLoginKit, FBAEMKit and their tracking-declaring manifests without offering Facebook sign-in
+  (observed in a simulator build, 2026-09-11). Owner ruling 2026-09-13: strip, with a guard.
+  `engine/plugins/stripFirebaseAuthFacebook.ts` is step 6 of `healNativeProject` — after that
+  sequence's own `npm install`, because an install re-extracts the original manifest — and removes
+  the dependency, both products and the define (every FBSDK use in the plugin's Swift is behind
+  that `#if`). **It refuses the build if any Facebook reference survives**, which is how a plugin
+  upgrade that reshapes the manifest gets re-checked instead of silently shipping the SDK again.
+  A game that lists `facebook.com` in `plugins.FirebaseAuthentication.providers` keeps it. Android
+  needs nothing: the plugin's `build.gradle` already gates Facebook on `rgcfaIncludeFacebook`
+  (default false). The same step drops the now-stale `facebook-ios-sdk` pin from the gitignored
+  `Package.resolved`: with that pin and fresh DerivedData, `xcodebuild` crashed resolving packages
+  (`INTERNAL ERROR … count of array (33) differs from count of index set (32)`, reproduced 2 of 2,
+  gone with the pin absent). It also REFUSES when a project lists `facebook.com` over a manifest an
+  earlier build stripped — the plugin's whole Facebook flow is behind the `#if` with no `#else`, so
+  that build would hang `signInWithFacebook` rather than fail. Skipped for an Android build: the
+  editor's per-platform `build-web.mjs` step names its platform in `MODOKI_NATIVE_PLATFORM`
+  (`nativeHealPlatforms`, `engine/scripts/buildTarget.mjs`), and so do both scaffold runners (the
+  auto-scaffold inside `/api/build` `shift()`s the plan's own step away). A hand-run CLI build still
+  covers every platform folder present, and so does the OTA publish — its bundle is platform-agnostic.
+  ⚠️ **Only a heal-running build is covered** — building straight from Xcode after the plugin is
+  re-extracted (a fresh clone, `npm ci`, a version bump), without the editor or `build-web.mjs
+  --target native`, ships the SDK again.
 - ⚠️ **A re-scaffold refuses to delete an `ios/` that holds this file**, through the same survivor
   guard as `GoogleService-Info.plist` (`engine/plugins/addNativeTarget.ts`). `cap add` cannot
   regenerate it, and a project without it still builds.

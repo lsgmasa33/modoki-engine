@@ -14,7 +14,7 @@ import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
 import { awaitLazyLoad } from './awaitLazyLoad';
 import { normalizeRig2D, type Rig2DFile, type ParsedRig2D } from '../skinning/rig2dTypes';
-import { parseAssetJson } from './assetFetch';
+import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import { createTeardownToken } from '../core/liveness';
 import { fireDirtyListeners } from '../core/renderDirty';
 
@@ -81,7 +81,7 @@ export function getRig2D(ref: string, opts?: { load?: boolean }): ParsedRig2D | 
   if (opts?.load === false) return null;
   if (!loading.has(path)) {
     const stillLive = liveness.capture(path);
-    const p = fetch(assetUrl(path))
+    const p = fetch(assetUrl(path), ASSET_FETCH_INIT)
       .then((r) => {
         return parseAssetJson(r, path);
       })

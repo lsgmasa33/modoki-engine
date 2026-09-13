@@ -14,7 +14,7 @@ import { execSync, spawnSync } from 'node:child_process';
 import { writeFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { isProjectDir } from './projectRoots.mjs';
-import { parseBuildTarget } from './buildTarget.mjs';
+import { parseBuildTarget, nativeHealPlatforms } from './buildTarget.mjs';
 import { scopedTsconfigContent } from './scopedTsconfig.mjs';
 import { chooseViteConfig } from './viteConfigChoice.mjs';
 import { loadEnginePluginModuleResult } from './loadVendorPlugins.mjs';
@@ -258,7 +258,8 @@ async function healNativeProject() {
     );
     return;
   }
-  const platforms = ['ios', 'android'].filter((p) => existsSync(path.join(projectRoot, p)));
+  // The editor's per-platform build names its platform; a hand-run build covers the folders present (#1062).
+  const platforms = nativeHealPlatforms(process.env, (p) => existsSync(path.join(projectRoot, p)));
   const result = await healMod.healNativeProject(projectRoot, repoRoot, platforms, {
     log: (line) => console.log(`[build-web]${line.startsWith('[') ? '' : ' '}${line}`),
     warn: (line) => console.warn(`[build-web] ${line}`),
@@ -275,6 +276,7 @@ async function healNativeProject() {
   if (result.ok) return;
   // No `[build-web]` prefix on these: the top-level `catch` adds it to every in-process throw.
   if (result.reason === 'stale-node-modules') throw new Error(result.lines.join('\n'));
+  if (result.reason === 'facebook-sdk-manifest') throw new Error(result.lines.join('\n'));
   if (result.reason === 'install-failed') throw new Error(`npm install (${result.why}) failed in ${projectRoot} — not building.`);
   throw new Error(result.message);
 }

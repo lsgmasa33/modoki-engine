@@ -7,7 +7,7 @@
  *   - **Required-reason APIs:** UserDefaults (`CA92.1`), because `@capacitor/preferences` calls
  *     `UserDefaults.standard` and ships no manifest. Every other required-reason use in the resolved
  *     graph (FileTimestamp, SystemBootTime, more UserDefaults) is declared by the SDK that makes it.
- *   - **Tracking:** none of the app's own. AppsFlyer (and Facebook, in Court's graph) declare theirs.
+ *   - **Tracking:** none of the app's own. AppsFlyer declares its own (Facebook did, in Court's graph, until #1062 stripped it).
  *   - **Collected data:** the game's OWN first-party collection, decided by the owner (2026-09-11):
  *     Court's cloud save (User ID, Gameplay Content, Purchase History); nothing for Weaveling yet.
  * Coverage table and sources: `docs/native-and-sdks.md` § "iOS privacy manifest".

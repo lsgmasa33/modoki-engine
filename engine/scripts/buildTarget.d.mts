@@ -21,3 +21,11 @@ export declare function parseBuildTarget(
   argv: string[],
   env: Record<string, string | undefined>,
 ): ParseBuildTargetOk | ParseBuildTargetFail;
+
+/** Which native platforms `build-web.mjs --target native` heals for: the platform named in
+ *  `MODOKI_NATIVE_PLATFORM` (set by the editor's per-platform build step), else every platform
+ *  whose folder exists (#1062). */
+export declare function nativeHealPlatforms(
+  env: Record<string, string | undefined>,
+  exists: (platform: 'ios' | 'android') => boolean,
+): Array<'ios' | 'android'>;

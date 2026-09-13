@@ -831,9 +831,11 @@ describe('the editor tells the generator what only it knows (#1011, producer sid
     // Three entries, and the two scaffold ones were missed on the first pass: the build plan's own
     // prefix steps (x2), /api/add-native-target's runShell, and the auto-scaffold's runScaffoldShell
     // — the last of which matters most, because the build then shifts the flag-carrying step away.
-    const planSteps = scanner.match(/build-web\.mjs --target native', env: \{ MODOKI_ICONS_HANDLED: '1' \}/g) ?? [];
+    // `(?:, …)?` — the prefix steps also name their platform (MODOKI_NATIVE_PLATFORM, #1062); what this
+    // pins is only that the icons flag rides along.
+    const planSteps = scanner.match(/build-web\.mjs --target native', env: \{ MODOKI_ICONS_HANDLED: '1'(?:, [^}]*)? \}/g) ?? [];
     expect(planSteps.length, 'both the iOS and Android prefix steps must carry it').toBe(2);
-    const runners = scanner.match(/env: \{ \.\.\.buildEnv, MODOKI_ICONS_HANDLED: '1' \}/g) ?? [];
+    const runners = scanner.match(/env: \{ \.\.\.buildEnv, MODOKI_ICONS_HANDLED: '1'(?:, [^}]*)? \}/g) ?? [];
     expect(runners.length, 'both scaffold runners must carry it').toBe(2);
   });
 

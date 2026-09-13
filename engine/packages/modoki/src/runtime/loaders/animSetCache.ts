@@ -20,7 +20,7 @@ import { isGuid, registerAsset } from './assetManifest';
 import { resolveRefWarnOnce } from './modelGlbUrl';
 import { assetUrl } from './assetUrl';
 import { awaitLazyLoad } from './awaitLazyLoad';
-import { parseAssetJson } from './assetFetch';
+import { ASSET_FETCH_INIT, parseAssetJson } from './assetFetch';
 import { createTeardownToken } from '../core/liveness';
 
 /** Per-clip playback parameters within an animset. All optional — a missing
@@ -102,7 +102,7 @@ export function getAnimSet(ref: string, opts?: { load?: boolean }): AnimSetDef |
   if (opts?.load === false) return null;
   if (!loading.has(path)) {
     const stillLive = liveness.capture(path);
-    const p = fetch(assetUrl(path))
+    const p = fetch(assetUrl(path), ASSET_FETCH_INIT)
       .then((r) => {
         return parseAssetJson(r, path);
       })

@@ -138,3 +138,49 @@ describe('asset JSON is parsed through parseAssetJson, not res.json()', () => {
     }
   });
 });
+
+/** The second half of the same fetch contract: the CACHE POLICY. `ASSET_FETCH_INIT` is `no-store` in
+ *  dev (assetFetch.ts says when a stale 304 is possible) and `{}` in a build. Three of the five
+ *  sibling def caches — spriteAnim, rig2d, animSet — fetched bare while animationClip and particle
+ *  passed it (#1165); nothing but reading them side by side could tell. */
+describe('asset fetches through assetUrl() carry ASSET_FETCH_INIT', () => {
+  /** Every `fetch(assetUrl(…), …)` call in runtime/**, with the text of its argument list. NOT seen:
+   *  a URL built first and fetched by name (`const u = assetUrl(p); fetch(u)`) — none exists today. The
+   *  argument list is found by paren depth, not a line regex, so a call wrapped across lines is
+   *  still read whole. (`stripComments` blanks comments; string contents are irrelevant here — an
+   *  unbalanced paren inside a string literal in a fetch's arguments would mis-scan, and none exists.) */
+  function assetUrlFetches(): Array<{ site: string; args: string }> {
+    const out: Array<{ site: string; args: string }> = [];
+    for (const { abs } of runtimeSources()) {
+      const rel = path.relative(runtimeDir, abs).replace(/\\/g, '/');
+      const raw = fs.readFileSync(abs, 'utf8');
+      const code = stripComments(raw);
+      assertScanIsSane(raw, code, rel);
+      // `plumbing.assetUrl(` too — the provider-injected twin (`pixiShaderBuilder.ts`), whose init
+      // arrives as `plumbing.fetchInit` (registerProviders.ts binds it to ASSET_FETCH_INIT).
+      for (const m of code.matchAll(/\bfetch\s*\(\s*(?:[\w$]+\.)?assetUrl\s*\(/g)) {
+        const open = code.indexOf('(', m.index);
+        let depth = 0;
+        let end = open;
+        for (; end < code.length; end += 1) {
+          if (code[end] === '(') depth += 1;
+          else if (code[end] === ')' && (depth -= 1) === 0) break;
+        }
+        const line = code.slice(0, m.index).split('\n').length;
+        out.push({ site: `${rel}:${line}`, args: code.slice(open + 1, end) });
+      }
+    }
+    return out;
+  }
+
+  it('has no fetch(assetUrl(…)) without the dev no-store init', () => {
+    const calls = assetUrlFetches();
+    // 16 measured 2026-09-13 on work-ai2. Floored well under it: only a detector that stopped
+    // matching can reach this, and that is what would turn the rule below vacuously green.
+    expect(calls.length, 'the fetch(assetUrl(…)) detector matched almost nothing — it is broken').toBeGreaterThan(8);
+    const bare = calls.filter((c) => !/\bASSET_FETCH_INIT\b|\.fetchInit\b/.test(c.args)).map((c) => c.site);
+    expect(bare, 'Pass ASSET_FETCH_INIT from runtime/loaders/assetFetch.ts:\n'
+      + '  fetch(assetUrl(path), ASSET_FETCH_INIT)  or  { signal, ...ASSET_FETCH_INIT }\n'
+      + 'Without it the dev editor can be served a cached copy of the asset (see assetFetch.ts).').toEqual([]);
+  });
+});

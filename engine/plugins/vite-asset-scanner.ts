@@ -2212,7 +2212,11 @@ export function assetScannerPlugin(): Plugin {
             // So `generateNativeIcons` would filter to whatever OTHER platform dir happens to be on
             // disk and regenerate ITS art: adding `ios/` to an android-only project would rewrite
             // `android/**` and stamp it. Never the platform being added, always collateral.
-            const proc = spawnBuildCommand(cmd, { cwd, env: { ...buildEnv, MODOKI_ICONS_HANDLED: '1' } });
+            // ⚠️ MODOKI_NATIVE_PLATFORM, for the same reason: without it build-web's heal covers the
+            // OTHER platform's folder, and an Android scaffold ran the iOS-only #1062 strip — which can
+            // refuse ("web build failed"). The folder being added does not exist yet, so this heals
+            // nothing platform-specific there; the scaffold ran `ensureCapacitorDeps` itself.
+            const proc = spawnBuildCommand(cmd, { cwd, env: { ...buildEnv, MODOKI_ICONS_HANDLED: '1', MODOKI_NATIVE_PLATFORM: platform ?? '' } });
             activeProc = proc;
             proc.stdout?.on('data', (d: Buffer) => send(d.toString().trimEnd()));
             proc.stderr?.on('data', (d: Buffer) => send(d.toString().trimEnd()));
@@ -2702,13 +2706,16 @@ export function assetScannerPlugin(): Plugin {
             // facet A, for the CLI path that had none). This plan has its own `iconStep` below —
             // per-platform, stamp-gated, and able to fall back to the bundled icon — so it tells
             // build-web to stand down rather than paying for both.
-            { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', env: { MODOKI_ICONS_HANDLED: '1' }, cwd: buildCwd },
+            // MODOKI_NATIVE_PLATFORM: build-web's own heal would otherwise cover every platform folder
+            // on disk, so an ANDROID build of a project with `ios/` ran the iOS-only #1062 strip —
+            // which can refuse, failing the Android build (`nativeHealPlatforms`, buildTarget.mjs).
+            { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', env: { MODOKI_ICONS_HANDLED: '1', MODOKI_NATIVE_PLATFORM: 'ios' }, cwd: buildCwd },
             ...(otaEmbedStep ? [otaEmbedStep] : []),
             ...(iosIconStep ? [iosIconStep] : []),
             { label: 'Syncing Capacitor iOS...', cmd: 'npx cap sync ios', cwd: iosCwd },
           ];
           const androidPrefixSteps: BuildStep[] = [
-            { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', env: { MODOKI_ICONS_HANDLED: '1' }, cwd: buildCwd },
+            { label: 'Building web assets...', cmd: 'node engine/scripts/build-web.mjs --target native', env: { MODOKI_ICONS_HANDLED: '1', MODOKI_NATIVE_PLATFORM: 'android' }, cwd: buildCwd },
             ...(otaEmbedStep ? [otaEmbedStep] : []),
             ...(androidIconStep ? [androidIconStep] : []),
             { label: 'Syncing Capacitor Android...', cmd: 'npx cap sync android', cwd: androidCwd },
@@ -3073,7 +3080,9 @@ export function assetScannerPlugin(): Plugin {
             // build then `steps.shift()`s away the flag-carrying build-web step below, so without
             // this an iOS build of an android-only project regenerates Android art and nothing in
             // the plan ever regenerates iOS.
-            const proc = spawnBuildCommand(cmd, { cwd, env: { ...buildEnv, MODOKI_ICONS_HANDLED: '1' } });
+            // MODOKI_NATIVE_PLATFORM rides along for the same `steps.shift()` reason — see the note on
+            // /api/add-native-target's runShell (#1062).
+            const proc = spawnBuildCommand(cmd, { cwd, env: { ...buildEnv, MODOKI_ICONS_HANDLED: '1', MODOKI_NATIVE_PLATFORM: platform ?? '' } });
             activeProc = proc;
             proc.stdout?.on('data', (d: Buffer) => send(d.toString().trimEnd()));
             proc.stderr?.on('data', (d: Buffer) => send(d.toString().trimEnd()));
@@ -3151,6 +3160,9 @@ export function assetScannerPlugin(): Plugin {
                   send('Build failed — could not install the added/updated Capacitor plugin(s).');
                 } else if (heal.reason === 'stale-node-modules') {
                   sendStatus('FAILED:stale node_modules');
+                  send(`\nBuild failed — ${heal.lines.join('\n')}`);
+                } else if (heal.reason === 'facebook-sdk-manifest') {
+                  sendStatus('FAILED:Firebase auth plugin manifest (Facebook SDK)');
                   send(`\nBuild failed — ${heal.lines.join('\n')}`);
                 } else {
                   sendStatus(`FAILED:Build claim not held\n${heal.message}`);

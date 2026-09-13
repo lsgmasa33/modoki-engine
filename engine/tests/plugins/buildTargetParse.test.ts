@@ -3,7 +3,7 @@
  *  this file exhaustively covers the parsing logic itself, including the F1/F2 regressions found
  *  in review. */
 import { describe, it, expect } from 'vitest';
-import { parseBuildTarget, VALID_TARGETS } from '../../scripts/buildTarget.mjs';
+import { parseBuildTarget, VALID_TARGETS, nativeHealPlatforms } from '../../scripts/buildTarget.mjs';
 
 describe('parseBuildTarget', () => {
   it('sanity: VALID_TARGETS is web/native/playable', () => {
@@ -87,5 +87,33 @@ describe('parseBuildTarget', () => {
   it('F1: VITE_PLAYABLE=1 with --target playable is OK (no contradiction)', () => {
     const result = parseBuildTarget(['--target', 'playable'], { VITE_PLAYABLE: '1' });
     expect(result.ok).toBe(true);
+  });
+});
+
+describe('nativeHealPlatforms (#1062) — which platforms build-web.mjs heals for', () => {
+  const both = () => true;
+  const onlyIos = (p: string) => p === 'ios';
+
+  it('with no MODOKI_NATIVE_PLATFORM, covers every platform folder present (a hand-run CLI build)', () => {
+    expect(nativeHealPlatforms({}, both)).toEqual(['ios', 'android']);
+    expect(nativeHealPlatforms({}, onlyIos)).toEqual(['ios']);
+    expect(nativeHealPlatforms({}, () => false)).toEqual([]);
+  });
+
+  it('an editor ANDROID build of a project that also has ios/ heals android ONLY — the iOS strip must not refuse it', () => {
+    expect(nativeHealPlatforms({ MODOKI_NATIVE_PLATFORM: 'android' }, both)).toEqual(['android']);
+  });
+
+  it('an editor iOS build heals ios only', () => {
+    expect(nativeHealPlatforms({ MODOKI_NATIVE_PLATFORM: 'ios' }, both)).toEqual(['ios']);
+  });
+
+  it('a named platform whose folder is absent heals nothing platform-specific', () => {
+    expect(nativeHealPlatforms({ MODOKI_NATIVE_PLATFORM: 'android' }, onlyIos)).toEqual([]);
+  });
+
+  it('an unknown value is ignored — falls back to the folders rather than healing nothing', () => {
+    expect(nativeHealPlatforms({ MODOKI_NATIVE_PLATFORM: 'windows' }, both)).toEqual(['ios', 'android']);
+    expect(nativeHealPlatforms({ MODOKI_NATIVE_PLATFORM: '' }, both)).toEqual(['ios', 'android']);
   });
 });

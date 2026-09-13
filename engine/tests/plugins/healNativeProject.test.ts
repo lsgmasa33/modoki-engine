@@ -2,7 +2,7 @@
  *  native` call (#827).
  *
  *  What is under test is the COMPOSITION: which steps run, in what order, what gates the install,
- *  that the stale check is unconditional, and that nothing runs without the build claim. The three
+ *  that the stale check is unconditional, and that nothing runs without the build claim. The four
  *  leaf modules are mocked because each is covered by its own suite and each really writes a
  *  project (`npm pack`, `package.json`, pbxproj); the claim gate is NOT mocked — it runs against a
  *  real claims file under a per-test `MODOKI_HOME`, so "claimed" means the store says so.
@@ -25,6 +25,7 @@ const state = {
   needsInstall: false,
   problems: [] as string[],
   reason: null as null | 'unreadable-package-json',
+  fb: { ok: true, notes: [] } as { ok: true; notes: string[] } | { ok: false; lines: string[] },
 };
 
 vi.mock('../../plugins/healNativeConfig', () => ({
@@ -51,6 +52,14 @@ vi.mock('../../plugins/vendorPlugins', () => ({
   },
 }));
 
+vi.mock('../../plugins/stripFirebaseAuthFacebook', () => ({
+  stripFirebaseAuthFacebook: (root: string) => {
+    calls.push('stripFacebook');
+    roots.push(`stripFacebook:${root}`);
+    return state.fb;
+  },
+}));
+
 const { healNativeProject, describeStaleNodeModules } = await import('../../plugins/healNativeProject');
 const { acquireBuildClaim, resetBuildClaimsForTests } = await import('../../scripts/buildClaimsStore.mjs');
 
@@ -66,6 +75,7 @@ beforeEach(() => {
   state.needsInstall = false;
   state.problems = [];
   state.reason = null;
+  state.fb = { ok: true, notes: [] };
   home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-home-'));
   prevHome = process.env.MODOKI_HOME;
   process.env.MODOKI_HOME = home;
@@ -115,7 +125,7 @@ describe('healNativeProject — the claim gate', () => {
 });
 
 describe('healNativeProject — the sequence', () => {
-  it('runs config → deps per platform → vendor → verify, in that order, with nothing to install', async () => {
+  it('runs config → deps per platform → vendor → verify → Facebook strip, in that order, with nothing to install', async () => {
     const r = await healNativeProject(project, '/engine', ['ios', 'android'], ports().ports);
     expect(r).toEqual({ ok: true });
     expect(calls).toEqual([
@@ -124,24 +134,32 @@ describe('healNativeProject — the sequence', () => {
       'ensureCapacitorDeps:android',
       'vendorEnginePlugins',
       'verify',
+      'stripFacebook',
     ]);
   });
 
-  it('with NO platforms still heals config, vendors and verifies — only the per-platform deps step is empty', async () => {
+  it('with NO platforms still heals config, vendors and verifies — only the per-platform steps (deps, the iOS Facebook strip) are empty', async () => {
     await healNativeProject(project, '/engine', [], ports().ports);
     expect(calls).toEqual([`healNativeConfig:${path.basename(project)}`, 'vendorEnginePlugins', 'verify']);
+  });
+
+  it('skips the Facebook strip for an ANDROID-only build — an iOS manifest must not refuse it (#1062)', async () => {
+    state.fb = { ok: false, lines: ['would refuse'] };
+    const r = await healNativeProject(project, '/engine', ['android'], ports().ports);
+    expect(r).toEqual({ ok: true });
+    expect(calls).not.toContain('stripFacebook');
   });
 
   it('installs when a DEPS heal changed something, then writes the marker, then verifies', async () => {
     state.depsChanged = { android: true };
     await healNativeProject(project, '/engine', ['ios', 'android'], ports().ports);
-    expect(calls.slice(-3)).toEqual(['install:healed Capacitor plugins', 'writeVendorMarker', 'verify']);
+    expect(calls.slice(-4)).toEqual(['install:healed Capacitor plugins', 'writeVendorMarker', 'verify', 'stripFacebook']);
   });
 
   it('installs when only the VENDOR step needs it — either condition alone is enough', async () => {
     state.needsInstall = true;
     await healNativeProject(project, '/engine', ['ios'], ports().ports);
-    expect(calls.slice(-3)).toEqual(['install:engine plugin changed', 'writeVendorMarker', 'verify']);
+    expect(calls.slice(-4)).toEqual(['install:engine plugin changed', 'writeVendorMarker', 'verify', 'stripFacebook']);
   });
 
   it('a failed install stops: no marker, no verify, and says which install', async () => {
@@ -150,6 +168,7 @@ describe('healNativeProject — the sequence', () => {
     expect(r).toEqual({ ok: false, reason: 'install-failed', why: 'engine plugin changed' });
     expect(calls).not.toContain('writeVendorMarker');
     expect(calls).not.toContain('verify');
+    expect(calls).not.toContain('stripFacebook');
   });
 
   it('the stale check runs UNCONDITIONALLY and refuses on a mismatch even when nothing was installed (#685)', async () => {
@@ -179,7 +198,27 @@ describe('healNativeProject — the sequence', () => {
       `vendorEnginePlugins:${project}|/engine`,
       `writeVendorMarker:${project}`,
       `verify:${project}`,
+      `stripFacebook:${project}`,
     ]);
+  });
+
+  it('strips Facebook AFTER an install, never before it — an install re-extracts the original manifest (#1062)', async () => {
+    state.needsInstall = true;
+    await healNativeProject(project, '/engine', ['ios'], ports().ports);
+    expect(calls.indexOf('stripFacebook')).toBeGreaterThan(calls.indexOf('install:engine plugin changed'));
+  });
+
+  it('REFUSES the build when the Facebook strip cannot complete, passing its diagnosis through (#1062)', async () => {
+    state.fb = { ok: false, lines: ['still references Facebook', '  • .package(url: facebook-ios-sdk'] };
+    const r = await healNativeProject(project, '/engine', ['ios'], ports().ports);
+    expect(r).toEqual({ ok: false, reason: 'facebook-sdk-manifest', lines: state.fb.lines });
+  });
+
+  it('streams the strip\'s notes through log, tagged [heal]', async () => {
+    state.fb = { ok: true, notes: ['stripped the Facebook iOS SDK'] };
+    const p = ports();
+    await healNativeProject(project, '/engine', ['ios'], p.ports);
+    expect(p.log).toContain('[heal] stripped the Facebook iOS SDK');
   });
 
   it('streams every heal note through log, tagged [heal]', async () => {
