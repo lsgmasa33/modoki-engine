@@ -748,6 +748,15 @@ await of the open (provisioning, the install, Vite's own start), so the fix beca
   `state.root`. With opens queued, `state.root` holds the last root an open STARTED, so re-picking
   a project while another was queued was silently dropped.
 
+- A queued open that runs before any window exists reports its progress (including a claim wait)
+  on the splash, not on a title bar nobody can see.
+
+⚠️ **A changed failure mode, on purpose:** when an open queued during launch FAILS, even after the
+launch's own Vite came up, the launch now ends in the fatal "could not open the project" dialog and
+quits. Before #1160 it opened a split editor (Vite on one project, the backend on another) behind a
+"relaunch" dialog. Relaunching reopens the launch project, because a failed open never reaches
+recents.
+
 Residues, accepted: an Open Project picked after the launch's `idle()` but before its window loads
 still races that load; and a newer open whose Vite timed out with the child still alive passes the
 root check, and the window then waits out its own timeout.

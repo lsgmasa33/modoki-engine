@@ -17,7 +17,7 @@ import { projectDepsMissing } from '../../electron/projectDeps';
 import { acquireBuildClaim, resetBuildClaimsForTests, BUILD_CLAIM_ENV_VAR } from '../../scripts/buildClaimsStore.mjs';
 import { readScannedSource } from '@modoki/engine/testing';
 import ts from 'typescript';
-import { calledNames, callsTo, enclosingFunction, findNodes, namedFunctions, objectLiteralKeys, parseSource } from '@modoki/engine/testing/sourceAst';
+import { calledNames, callsTo, declarationOf, enclosingFunction, findNodes, namedFunctions, objectLiteralKeys, parseSource } from '@modoki/engine/testing/sourceAst';
 
 const HELD = { ok: false as const, message: 'a command-line build already holds the build claim', held: { label: 'ios build (CLI)', pid: 4242, kind: 'cli' } };
 
@@ -280,12 +280,37 @@ describe('main.ts wires claimProjectForOpen the way its header requires', () => 
   });
 
   it('Open Project and Open Recent dedupe against the newest REQUESTED root, not state.root (#1160 review)', () => {
-    const dedupes = callsTo(sf, 'samePath').filter((c) => c.arguments[1]?.getText(sf) === 'requestedRoot');
-    expect(dedupes.map((c) => c.arguments[0].getText(sf)).sort()).toEqual(['chosen', 'root']);
-    expect(callsTo(sf, 'samePath').filter((c) => ['chosen', 'root'].includes(c.arguments[0]?.getText(sf) ?? '')
-      && c.arguments[1]?.getText(sf) === 'state.root')).toHaveLength(0);
+    const moduleDecl = findNodes(sf, ts.isVariableDeclaration).filter((d) => ts.isIdentifier(d.name) && d.name.text === 'requestedRoot');
+    expect(moduleDecl, 'expected exactly one requestedRoot declaration').toHaveLength(1);
+    expect(ts.isSourceFile(moduleDecl[0].parent.parent.parent), 'requestedRoot must be module-level').toBe(true);
+    const dedupes = callsTo(sf, 'samePath').filter((c) => ['chosen', 'root'].includes(c.arguments[0]?.getText(sf) ?? ''));
+    expect(dedupes).toHaveLength(2);
+    // The exact guard: a PICK DIFFERENT from the newest request queues. An inverted check, or a local
+    // `requestedRoot` shadowing the module binding, is a different program with the same spelling.
+    const guards = dedupes.map((c) => {
+      let n: ts.Node = c;
+      while (n.parent && !ts.isIfStatement(n.parent)) n = n.parent;
+      return (n.parent as ts.IfStatement).expression.getText(sf);
+    }).sort();
+    expect(guards).toEqual(['!samePath(root, requestedRoot)', 'chosen && !samePath(chosen, requestedRoot)']);
+    for (const c of dedupes) {
+      const id = c.arguments[1];
+      expect(ts.isIdentifier(id) && declarationOf(id)).toBe(moduleDecl[0]);
+    }
+    // Seeded by the launch BEFORE the menu makes Open Project reachable.
     const seeded = findNodes(sf, ts.isBinaryExpression).filter((b) => b.getText(sf) === 'requestedRoot = initialRoot');
     expect(seeded, 'the launch no longer seeds requestedRoot').toHaveLength(1);
+    const launchFn = enclosingFunction(seeded[0]);
+    const firstMenu = callsTo(launchFn, 'rebuildMenu').filter((c) => enclosingFunction(c) === launchFn)[0];
+    expect(firstMenu).toBeDefined();
+    expect(seeded[0].getEnd()).toBeLessThan(firstMenu.getStart(sf));
+  });
+
+  it('a queued open reports progress on the splash when no window exists yet', () => {
+    const decl = findNodes(body('openProject'), ts.isVariableDeclaration).find((d) => ts.isIdentifier(d.name) && d.name.text === 'openStatus');
+    expect(decl, 'openProject lost its status sink').toBeDefined();
+    expect(calledNames(decl!.initializer!).sort()).toEqual(['setSplashStatus', 'setTitle']);
+    expect(callsTo(body('openProject'), 'healAndInstallOnOpen')[0].arguments[2].getText(sf)).toBe('openStatus');
   });
 
   it('releases the claim in a finally that covers the heal and the install', () => {
@@ -358,6 +383,14 @@ describe('main.ts wires claimProjectForOpen the way its header requires', () => 
     expect(ts.isAwaitExpression(idle[0].parent), 'idle() must be AWAITED, or the root check runs before the queued open').toBe(true);
     const rootCheck = findNodes(after[0].thenStatement, ts.isIfStatement).find((n) => findNodes(n.thenStatement, ts.isThrowStatement).length === 1);
     expect(rootCheck?.expression.getText(sf)).toBe('!viteRoot || !samePath(viteRoot, state.root)');
+    // …and viteRoot is the RUNNING server's root: bound to devServerRoot(), not to anything that
+    // would make the comparison trivially true.
+    const viteRootDecl = findNodes(after[0].thenStatement, ts.isVariableDeclaration).filter((d) => ts.isIdentifier(d.name) && d.name.text === 'viteRoot');
+    expect(viteRootDecl).toHaveLength(1);
+    expect(viteRootDecl[0].initializer?.getText(sf)).toBe('devServerRoot()');
+    for (const id of findNodes(rootCheck!.expression, ts.isIdentifier).filter((i) => i.text === 'viteRoot')) {
+      expect(declarationOf(id)).toBe(viteRootDecl[0]);
+    }
     expect(idle[0].getEnd()).toBeLessThan(rootCheck!.getStart(sf));
 
     const noDevServer = findNodes(sf, ts.isIfStatement).filter((n) => n.expression.getText(sf) === "process.env.MODOKI_NO_DEV_SERVER !== '1'" && !!n.elseStatement

@@ -1304,7 +1304,14 @@ async function openProject(newRoot: string, ticket: OpenTicket, opts?: { openSet
       if (app.isPackaged) await ensureNodeProvisioned(); // Core before Vite spawn (see whenReady)
       // False when a later open replaced this one while it waited on a build claim (#1160). That
       // open owns the dev server and the title now, so this one must not touch either.
-      if (!(await healAndInstallOnOpen(newRoot, ticket, (line) => mainWindow?.setTitle(`Modoki Editor ${APP_VERSION} — ${line}`)))) {
+      // Progress goes to the title bar, or to the splash when this open runs queued behind a launch
+      // that has no window yet (macOS: the menu is live first). Otherwise a claim wait would sit
+      // behind a silent splash (#1160 review).
+      const openStatus = (line: string) => {
+        if (mainWindow) mainWindow.setTitle(`Modoki Editor ${APP_VERSION} — ${line}`);
+        else setSplashStatus(line);
+      };
+      if (!(await healAndInstallOnOpen(newRoot, ticket, openStatus))) {
         console.log(`[modoki-electron] open of ${newRoot} superseded by ${state.root}, not starting its dev server`);
         return;
       }
