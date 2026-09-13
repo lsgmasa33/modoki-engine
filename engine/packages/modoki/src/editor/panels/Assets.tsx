@@ -11,7 +11,7 @@ import {
 import { importModel } from '../scene/modelImport';
 import { needsGLBConversion, convertSourceToGLB } from '../scene/convertToGLB';
 import { readMetaPreferringPark } from '../scene/pendingMeta';
-import { useEditorStore } from '../store/editorStore';
+import { useEditorStore, type SelectedAsset } from '../store/editorStore';
 import { pushAction } from '../undo/undoManager';
 import { makePrefabInstantiateAction } from '../undo/prefabInstantiateUndo';
 import { ASSET_ROOT_RE, firstAssetRoot } from './assetRoots';
@@ -26,6 +26,7 @@ import {
   deletionPathsFor, planRename,
 } from './assetOps';
 import { resolveClickSelection, dragPathsFor } from './assetSelection';
+import { createStoreSelectionTracker, revealKeysFor } from './assetReveal';
 import {
   isTextAsset, makeDeleteUndo, makeDuplicateUndo,
   makeRenameUndo, makeEmptyFolderDeleteUndo, makeNewFolderUndo, makeFolderRenameUndo,
@@ -623,8 +624,21 @@ export default function Assets() {
     return firstFromEntries(assets) ?? '/';
   }, [assets, selected]);
 
-  const selectAsset = useEditorStore((s) => s.selectAsset);
-  const setSelectedAssets = useEditorStore((s) => s.setSelectedAssets);
+  // Every selection this panel publishes is marked as its OWN, so the store-sync effect below does not
+  // react to it as an external request (`createStoreSelectionTracker`). Wrapping the two actions here,
+  // rather than marking at each call site, is what keeps a future call site covered.
+  const selectionTrackerRef = useRef<ReturnType<typeof createStoreSelectionTracker> | null>(null);
+  selectionTrackerRef.current ??= createStoreSelectionTracker();
+  const storeSelectAsset = useEditorStore((s) => s.selectAsset);
+  const storeSetSelectedAssets = useEditorStore((s) => s.setSelectedAssets);
+  const selectAsset = useCallback((a: SelectedAsset | null) => {
+    selectionTrackerRef.current!.markOwn([a]);
+    storeSelectAsset(a);
+  }, [storeSelectAsset]);
+  const setSelectedAssets = useCallback((list: SelectedAsset[], primary?: SelectedAsset | null) => {
+    selectionTrackerRef.current!.markOwn([...list, primary]);
+    storeSetSelectedAssets(list, primary);
+  }, [storeSetSelectedAssets]);
   const selectedAsset = useEditorStore((s) => s.selectedAsset);
   const assetsVersion = useEditorStore((s) => s.assetsVersion);
   const setImportStatus = useEditorStore((s) => s.setImportStatus);
@@ -720,35 +734,34 @@ export default function Assets() {
   // can actually handle instead of a hardcoded client constant. (F9.)
   useEffect(() => { void refreshHandlerTypes(); }, []);
 
-  // Sync local selection with store (e.g., when clicking an asset directly)
+  // Sync local selection with store (e.g., when clicking an asset directly). Which reactions a
+  // store change earns — and why expand needs the row to be absent — is `createStoreSelectionTracker`.
   useEffect(() => {
     // Store cleared the asset selection (e.g., user selected an entity) — drop local too
     if (!selectedAsset && selected !== null) {
       setSelected(null);
       setSelection(new Set());
       anchorRef.current = null;
-      return;
     }
-    if (selectedAsset && selectedAsset.path !== selected) {
+    const plan = selectionTrackerRef.current!.next(selectedAsset, selected,
+      (path) => !!document.querySelector(`[data-asset-path="${CSS.escape(path)}"]`));
+    if (!selectedAsset) return;
+    if (plan.syncLocal) {
       setSelected(selectedAsset.path);
       // External (single) selection — collapse the multi-select to just it.
       setSelection(new Set([selectedAsset.path]));
       anchorRef.current = selectedAsset.path;
+    }
+    if (plan.expand) {
       setExpanded((prev) => {
+        const keys = revealKeysFor(selectedAsset);
+        if (keys.every((k) => prev.has(k))) return prev;
         const next = new Set(prev);
-        // Category view: expand the asset's type group
-        next.add(selectedAsset.type);
-        // Folder view: expand all ancestor folders so the asset is visible
-        const lastSlash = selectedAsset.path.lastIndexOf('/');
-        if (lastSlash > 0) {
-          const parts = selectedAsset.path.substring(0, lastSlash).split('/').filter(Boolean);
-          for (let i = 1; i <= parts.length; i++) {
-            next.add('/' + parts.slice(0, i).join('/'));
-          }
-        }
-        next.add('/'); // root folder
+        for (const k of keys) next.add(k);
         return next;
       });
+    }
+    if (plan.scroll) {
       // Double rAF: wait for React to commit expanded state before scrolling
       requestAnimationFrame(() => requestAnimationFrame(() => {
         const el = document.querySelector(`[data-asset-path="${CSS.escape(selectedAsset.path)}"]`);

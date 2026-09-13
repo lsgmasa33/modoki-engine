@@ -2477,6 +2477,25 @@ describeCases('QA case references', () => {
   });
 
   /**
+   * No case taps or drags an Assets row it has not revealed first (#1143). The row exists only
+   * while its group is expanded, and that state is persisted per profile, so an unrevealed tap is
+   * green on one runner and refused on the next. Mechanism, the two accepted reveals and the bounds
+   * of what this proves: `scanAssetRowOpens`.
+   */
+  it('no case opens an Assets row it has not revealed first (#1143)', () => {
+    const offenders: string[] = [];
+    let rowActions = 0;
+    for (const { rel, body } of cases) {
+      const scan = scanAssetRowOpens(body);
+      rowActions += scan.rowActions;
+      for (const o of scan.offenders) offenders.push(`${rel}: ${o}`);
+    }
+    expect(offenders).toEqual([]);
+    // Anti-vacuity: ~30 row actions exist today. If ROW stops matching, zero offenders means nothing.
+    if (HAS_CASES) expect(rowActions).toBeGreaterThan(15);
+  });
+
+  /**
    * The same rule, for line numbers written in PROSE. (#680)
    *
    * `codeTokens` only reads backticked spans, so the check above is blind to "the `onMove` handler
@@ -3740,5 +3759,225 @@ describe('scanPlayOrdering', () => {
       ),
     );
     expect(r.endsPlaying).toBe(true);
+  });
+});
+
+export interface AssetRowOpenScan {
+  /** false when no procedure heading was found. */
+  scannable: boolean;
+  /** One entry per `[data-asset-path]` tap/dnd with no reveal before it. */
+  offenders: string[];
+  /** How many row taps/dnds the scan read — the corpus floor keys off this. */
+  rowActions: number;
+}
+
+/**
+ * Asset-row reveal scanner (#1143). An Assets row, `[data-asset-path="…"]`, is in the DOM only
+ * while its group is expanded, and both halves of that are PERSISTED per profile — `viewMode`
+ * globally, `expanded` per project, defaulting to the top section alone (`assetFolderState.ts`). A
+ * case that taps a row with nothing revealing it first is testing the runner's profile: it passes
+ * wherever an earlier session left the group open and is refused *"no element matches selector"*
+ * everywhere else. `qa/knowledge.md` § 3 prescribes the two reveals this accepts:
+ *
+ * - **`modoki_set_selection {asset: {path…}}` on THAT path.** Keyed by path, because a selection
+ *   expands only its own group: selecting a texture does not reveal a material row.
+ *   A `*=` substring selector counts when the selected path contains the substring. A sliced-sprite
+ *   row `path#sub` needs a selection of THAT path: selecting the parent texture reveals the texture
+ *   row, not its children, which render only while the texture row itself is expanded.
+ * - **The § 3 header probe, or a triangle-expand idiom** — any `^▶`, `[▶▼]` or `'▶'` literal, or
+ *   the probe's return field `` `collapsed` `` backticked (a case citing a sibling's probe).
+ *
+ * Ordering is by match POSITION within the procedure region, as in `scanPlayOrdering`. A row action
+ * or a selection counts only as a CALL, so prose naming a selector (including a warning about exactly
+ * this refusal) is not read as a tap. That means a braced `modoki_tap`/`modoki_dnd`/`modoki_set_selection`,
+ * or the same tool as a `modoki_batch` step (`{"tool":"tap","args":{…}}`, prefix optional).
+ *
+ * ⚠️ **What this does NOT prove, stated so a green result is not over-read.** A probe is not keyed:
+ * it opens ONE group, but this accepts it for every later row, so a case that expands `materials`
+ * and then taps a `meshes` row passes. A backticked `` `collapsed` `` counts as a probe even in a
+ * sentence that only WARNS about the collapsed state. It cannot see a row collapse again between
+ * the reveal and the tap (a relaunch, a project switch), and a call whose selector sits more than
+ * 400 characters into its own braces is not read. And it proves a reveal is WRITTEN, not that it
+ * works — the live run is what shows the row resolves.
+ */
+export function scanAssetRowOpens(body: string): AssetRowOpenScan {
+  const region = procedureRegion(body);
+  if (region === null) return { scannable: false, offenders: [], rowActions: 0 };
+
+  type Ev = { at: number; kind: 'select' | 'probe' | 'row'; path: string; substring?: boolean; call?: string };
+  const events: Ev[] = [];
+  // `[^}]` stops at the first close brace, so `{asset: {path: '…'` is read but a later call is not.
+  // The two call spellings: `modoki_x {…}` in prose-code, and a `modoki_batch` step
+  // `{"tool":"x","args":{…}}` (the `modoki_` prefix is optional there).
+  // A batch `tool` key must sit in OBJECT-KEY position (after `{` or `,`), so prose like "the tool:
+  // 'tap'" or `my-tool:` is not a call. The quotes may be JSON-escaped (`\"tool\"`).
+  const Q = `\\\\?["']`;
+  const CALL = (tools: string) =>
+    `(?:\\b(?:modoki_(${tools}))\`?\\s*\\{|[{,]\\s*(?:${Q})?tool(?:${Q})?\\s*:\\s*${Q}(?:modoki_)?(${tools})${Q})`;
+  // `asset` must be the call's FIRST argument key — `{asset:` directly, or `"args":{"asset":` in a batch —
+  // so a `subasset:` or a later argument is not read as the reveal.
+  const SELECT = new RegExp(
+    `${CALL('set_selection')}(?:\\s*,\\s*(?:${Q})?args(?:${Q})?\\s*:\\s*\\{)?\\s*(?:${Q})?asset(?:${Q})?\\s*:\\s*\\{[^}]*?(?:${Q})?path(?:${Q})?\\s*:\\s*${Q}([^"'\\\\]+)${Q}`,
+    'g',
+  );
+  for (const m of region.matchAll(SELECT)) events.push({ at: m.index ?? 0, kind: 'select', path: m[3] });
+  // The probe's own return field, backticked, is how a case CITES § 3's probe rather than restating it
+  // (`particles/undo-to-opened-value-unparks-asset.md` borrows QA-PARTICLE-0007's).
+  const PROBE = /\^\[?▶|\[▶▼\]|['"]▶['"]|`collapsed`/gu;
+  for (const m of region.matchAll(PROBE)) events.push({ at: m.index ?? 0, kind: 'probe', path: '' });
+  // The selector's own quotes may be escaped (`\"`) when the call sits inside a JSON string.
+  const ROW = new RegExp(`${CALL('tap|dnd')}[^}]{0,400}?data-asset-path(\\*?)=\\\\?["']([^"'\\\\]+)\\\\?["']`, 'g');
+  for (const m of region.matchAll(ROW)) {
+    events.push({ at: m.index ?? 0, kind: 'row', call: `modoki_${m[1] ?? m[2]}`, substring: m[3] === '*', path: m[4] });
+  }
+  events.sort((a, b) => a.at - b.at);
+
+  const selected: string[] = [];
+  let probed = false;
+  let rowActions = 0;
+  const offenders: string[] = [];
+  for (const e of events) {
+    if (e.kind === 'select') selected.push(e.path);
+    else if (e.kind === 'probe') probed = true;
+    else {
+      rowActions += 1;
+      const revealed =
+        probed ||
+        selected.some((p) => (e.substring ? p.includes(e.path) : p === e.path));
+      if (!revealed) {
+        offenders.push(
+          `${e.call} on [data-asset-path${e.substring ? '*' : ''}="${e.path}"] with nothing revealing the row ` +
+            `first — it exists only while its group is expanded, which is persisted profile state. Add ` +
+            `\`modoki_set_selection {asset: {path: '${e.path}', …}}\` before it, or § 3's header probe when ` +
+            `the case needs a different Inspector selection (qa/knowledge.md § 3).`,
+        );
+      }
+    }
+  }
+  return { scannable: true, offenders, rowActions };
+}
+
+/** The scanner's own accept and reject sides — not gated on `HAS_CASES`, same reason as above. */
+describe('scanAssetRowOpens', () => {
+  const wrap = (steps: string) => `## Preconditions\n\np\n\n## Steps\n\n${steps}\n`;
+  const offenders = (steps: string) => scanAssetRowOpens(wrap(steps)).offenders;
+  const TAP = (path: string) => `\`modoki_tap {selector:'[data-asset-path="${path}"]', clickCount:2}\``;
+
+  it('FLAGS a row tap with nothing revealing it — the defect itself (#1143)', () => {
+    const found = offenders(`1. search.\n2. ${TAP('/assets/particles/a.particle.json')}.`);
+    expect(found).toHaveLength(1);
+    expect(found[0]).toContain('/assets/particles/a.particle.json');
+  });
+
+  it('FLAGS a modoki_dnd whose source is an unrevealed row', () => {
+    expect(
+      offenders(`1. \`modoki_dnd {from: {selector: '[data-asset-path="/assets/p.prefab.json"]'}, to: {x: 1, y: 2}}\`.`),
+    ).toHaveLength(1);
+  });
+
+  it('accepts a tap after set_selection on THAT asset — the default reveal', () => {
+    expect(
+      offenders(
+        "1. `modoki_set_selection {asset: {path: '/assets/particles/a.particle.json', type: 'particle', name: 'a'}}`.\n" +
+          `2. ${TAP('/assets/particles/a.particle.json')}.`,
+      ),
+    ).toEqual([]);
+  });
+
+  it('FLAGS a tap after set_selection on a DIFFERENT asset — a selection reveals only its own group', () => {
+    expect(
+      offenders(
+        "1. `modoki_set_selection {asset: {path: '/assets/textures/t.png', type: 'texture', name: 't'}}`.\n" +
+          `2. ${TAP('/assets/materials/m.mat.json')}.`,
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('FLAGS a set_selection that comes AFTER the tap — order, not presence', () => {
+    expect(
+      offenders(
+        `1. ${TAP('/assets/a.json')}.\n` +
+          "2. `modoki_set_selection {asset: {path: '/assets/a.json', type: 'x', name: 'a'}}`.",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('accepts a tap after the § 3 header probe, and after a probe cited by its `collapsed` field', () => {
+    expect(offenders(`1. \`const HDR = /^[▶▼](📁)?particles?\\(\\d+\\)$/i;\`\n2. ${TAP('/assets/a.json')}.`)).toEqual([]);
+    expect(offenders(`1. Use the step-2 probe; tap only if it reports \`collapsed\`.\n2. ${TAP('/assets/a.json')}.`)).toEqual([]);
+  });
+
+  it('accepts a `*=` substring selector after selecting a path that contains it', () => {
+    expect(
+      offenders(
+        "1. `modoki_set_selection {asset: {path: '/assets/materials/grass.mat.json', type: 'material', name: 'grass'}}`.\n" +
+          "2. `modoki_tap {selector:'[data-asset-path*=\"grass.mat.json\"]'}`.",
+      ),
+    ).toEqual([]);
+  });
+
+  it('FLAGS a sliced-sprite row `path#sub` after only its parent texture was selected — that reveals the texture row, not its children', () => {
+    expect(
+      offenders(
+        "1. `modoki_set_selection {asset: {path: '/assets/t/head.png', type: 'texture', name: 'head'}}`.\n" +
+          `2. ${TAP('/assets/t/head.png#default')}.`,
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('FLAGS an unrevealed row tapped inside a `modoki_batch` step, JSON-quoted or not', () => {
+    expect(
+      offenders('1. `modoki_batch {"steps":[{"tool":"modoki_tap","args":{"selector":"[data-asset-path=\\"/assets/a.json\\"]","clickCount":2}}]}`.'),
+    ).toHaveLength(1);
+    expect(offenders("1. `modoki_batch {steps:[{tool:'tap', args:{selector:'[data-asset-path=\"/assets/a.json\"]'}}]}`.")).toHaveLength(1);
+  });
+
+  it('accepts a batch-wrapped set_selection as the reveal for a later tap', () => {
+    expect(
+      offenders(
+        '1. `modoki_batch {"steps":[{"tool":"set_selection","args":{"asset":{"path":"/assets/a.json","type":"x","name":"a"}}}]}`.\n' +
+          `2. ${TAP('/assets/a.json')}.`,
+      ),
+    ).toEqual([]);
+  });
+
+  it('does NOT read prose naming a tool, or a `subasset:` argument, as a call or a reveal', () => {
+    // Neither sentence is a call: no `tool` key in object position, and `asset` is not the first argument.
+    expect(
+      offenders(
+        "1. The tool: 'set_selection' with asset: {path: '/assets/a.json'} would reveal it.\n" +
+          "2. `modoki_set_selection {subasset: {path: '/assets/a.json'}}`.\n" +
+          `3. ${TAP('/assets/a.json')}.`,
+      ),
+    ).toHaveLength(1);
+    expect(scanAssetRowOpens(wrap("1. A my-tool: 'tap' on [data-asset-path=\"/assets/a.json\"] is prose.")).rowActions).toBe(0);
+  });
+
+  it('reads a batch step whose JSON quotes are escaped inside a string', () => {
+    const step = String.raw`{\"tool\":\"tap\",\"args\":{\"selector\":\"[data-asset-path='/assets/a.json']\"}}`;
+    expect(scanAssetRowOpens(wrap(`1. \`modoki_eval {code:"return modoki.batch([${step}])"}\`.`)).offenders).toHaveLength(1);
+  });
+
+  it('reads a tap whose selector comes after other arguments longer than the old 120-character window', () => {
+    const pad = `note: '${'x'.repeat(200)}', `;
+    expect(offenders(`1. \`modoki_tap {${pad}selector:'[data-asset-path="/assets/a.json"]'}\`.`)).toHaveLength(1);
+  });
+
+  it('does NOT read a selector merely NAMED or QUERIED as a tap — the warning shape', () => {
+    const r = scanAssetRowOpens(
+      wrap(
+        '1. ⚠️ if `[data-asset-path="/assets/a.json"]` matches nothing the group is collapsed.\n' +
+          "2. `modoki_eval {code:\"return !!document.querySelector('[data-asset-path=\\\"/assets/a.json\\\"]');\"}`.",
+      ),
+    );
+    expect(r.offenders).toEqual([]);
+    expect(r.rowActions).toBe(0);
+  });
+
+  it('does NOT count a reveal written in Preconditions, before the procedure begins', () => {
+    const body =
+      "## Preconditions\n\n- `modoki_set_selection {asset: {path: '/assets/a.json', type: 'x', name: 'a'}}`\n\n" +
+      `## Steps\n\n1. ${TAP('/assets/a.json')}.\n`;
+    expect(scanAssetRowOpens(body).offenders).toHaveLength(1);
   });
 });
