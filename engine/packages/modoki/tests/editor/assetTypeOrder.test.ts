@@ -53,15 +53,13 @@ describe('ASSET_TYPE_ORDER / ASSET_TYPE_COLORS coherence', () => {
  *  `video`, `level`, `wave`, `timeline` and `court-level` silently fell through: real asset types
  *  that rendered grey ('#888', the unknown-type fallback) with no glyph and sorted last (#417). */
 describe('ASSET_TYPE_ORDER / ASSET_TYPE_COLORS cover every classifier-produced type (#417)', () => {
-  /** Types the classifier can produce that ARE deliberately absent from ORDER/COLORS. Empty
-   *  today — add a type here, with a reason, only when leaving it out is an intentional
-   *  decision, not the same oversight this guard exists to catch. */
-  const DELIBERATELY_UNCOVERED = new Set<string>();
-
+  // ⚠️ No `DELIBERATELY_UNCOVERED` list (#1140 close-out). It was an empty `new Set()` filtering the
+  // produced types, with no staleness check — a type left in it after gaining an ORDER row kept its
+  // pardon. If leaving a type out ever becomes a decision, spend it through `assertExemptionLedger`.
   const producedTypes = [...new Set<string>([
     ...JSON_ASSET_SUFFIX_TYPE.map(([, type]) => type),
     ...Object.values(BINARY_EXT_TYPE),
-  ])].filter((type) => !DELIBERATELY_UNCOVERED.has(type));
+  ])];
 
   it('every produced type appears in ASSET_TYPE_ORDER', () => {
     const missing = producedTypes.filter((type) => !ASSET_TYPE_ORDER.includes(type));
@@ -69,8 +67,8 @@ describe('ASSET_TYPE_ORDER / ASSET_TYPE_COLORS cover every classifier-produced t
       missing,
       'These asset types are produced by the classifier (loaders/assetTypeClassifier.ts) but '
         + 'missing from ASSET_TYPE_ORDER in editor/panels/assetTypeIcons.tsx — they sort last '
-        + 'with no declared display position. Add them to ASSET_TYPE_ORDER, or list them in this '
-        + 'test\'s DELIBERATELY_UNCOVERED with a reason.',
+        + 'with no declared display position. Add them to ASSET_TYPE_ORDER, or, if leaving one out '
+        + 'is a decision, pardon it here through assertExemptionLedger with the reason.',
     ).toEqual([]);
   });
 
@@ -80,8 +78,8 @@ describe('ASSET_TYPE_ORDER / ASSET_TYPE_COLORS cover every classifier-produced t
       missing,
       'These asset types are produced by the classifier but missing from ASSET_TYPE_COLORS in '
         + 'editor/panels/assetTypeIcons.tsx — they render grey (\'#888\', the unknown-type '
-        + 'fallback) in the Assets panel. Add them to ASSET_TYPE_COLORS, or list them in this '
-        + 'test\'s DELIBERATELY_UNCOVERED with a reason.',
+        + 'fallback) in the Assets panel. Add them to ASSET_TYPE_COLORS, or, if leaving one out '
+        + 'is a decision, pardon it here through assertExemptionLedger with the reason.',
     ).toEqual([]);
   });
 });

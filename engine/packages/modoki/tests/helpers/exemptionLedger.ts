@@ -2,13 +2,18 @@ import { expect } from 'vitest';
 
 /** ⚠️ **An exemption must be keyed at the same grain as the rule it pardons (#1123).**
  *
+ *  ⚠️ **Not optional (#1140):** `engine/tests/architecture/exemptionLedgerIsShared.test.ts` fails on a
+ *  hand-rolled membership-test pardon in any test root, so a new guard's exemptions come here.
+ *
  *  ⚠️ **It lives in the PACKAGE, not in `engine/tests/helpers/`, and that is load-bearing** — the
  *  same reason `tapTargetFloor.ts` gives. The guards that need it are spread across three test
  *  surfaces: `engine/tests/**`, this package's own `tests/**` (`determinismGuard` and
- *  `inputSourceGuard` call it today), and a PROJECT's own `tests/**` — where no guard calls it YET.
+ *  `inputSourceGuard` call it today), and a PROJECT's own `tests/**` (Court's `cellMapDiscipline`
+ *  since #1140).
  *  ⚠️ This docblock used to name `keymapHmrEpochGuard`, `games/court/tests/worldSwap.test.ts` and
- *  `games/wordweave/tests/difficulty.test.ts` as users; none of the three calls it (#1128 census) —
- *  they are hand-rolled ledgers still awaiting a verdict, which is a different thing. A game is
+ *  `games/wordweave/tests/difficulty.test.ts` as users; none of the three called it (#1128 census) —
+ *  they were hand-rolled ledgers awaiting a verdict. #1140 gave two of them one: Court's `worldSwap`
+ *  now calls it, and `keymapHmrEpochGuard`'s empty list was deleted. A game is
  *  copied out of the monorepo and a demo is published as a standalone snapshot carrying only its
  *  own `tests/`, so `engine/tests/…` is unreachable from either by construction —
  *  `gitReadIsBounded`'s own EXEMPT row records hitting exactly this wall ("Cannot import the engine
@@ -90,6 +95,16 @@ export interface ExemptionLedgerCheck {
    *  against this clone's — #1014/#1015, and `gitReadIsBounded` sized one at 1,500 against a
    *  snapshot leg of 1,145. */
   floor: number;
+  /** How many things the detector EXAMINED, when `population` holds only the offenders it found.
+   *  When given, `floor` bounds THIS instead of `population.length`.
+   *
+   *  ⚠️ **Needed wherever the goal state is an EMPTY population** (#1140 close-out). A ledger over
+   *  "ids with fewer than three segments" or "mutating reads" exists to shrink to nothing, and a
+   *  floor on the offenders refuses exactly that outcome — "found 0, below the floor of 1. It has
+   *  stopped matching" blames a working detector for the fix it asked for, and `floor` cannot be 0.
+   *  The vacuity the floor guards against lives in the SCAN, so bound the scan: pass the size of the
+   *  set the detector walked (every static id, every registered trait), never a constant. */
+  scanned?: number;
   /** One line telling the reader what to DO about an unexcused occurrence. */
   fix: string;
 }
@@ -98,7 +113,8 @@ export interface ExemptionLedgerCheck {
  * Assert that a guard's exemption ledger pardons no more than it says it does.
  *
  * Fails in four independent directions, each with its own message:
- *  1. **vacuous**      — the population is below `floor`; the detector has broken.
+ *  1. **vacuous**      — the population (or `scanned`, when given) is below `floor`; the detector
+ *                        has broken.
  *  2. **unexcused**    — occurrences no row pays for. *This is the defect.*
  *  3. **over-blessed** — a row blesses more occurrences than exist, so a fix was made without
  *                        deducting it. The mirror of (2), and what makes the ledger exact in BOTH
@@ -106,7 +122,7 @@ export interface ExemptionLedgerCheck {
  *  4. **stale**        — a `sanctioned` name the detector no longer finds.
  */
 export function assertExemptionLedger(check: ExemptionLedgerCheck): void {
-  const { label, population, exempt = [], sanctioned = [], floor, fix } = check;
+  const { label, population, exempt = [], sanctioned = [], floor, scanned, fix } = check;
 
   // ⚠️ **The inputs are validated first, because two values silently DISARM an arm below.** Found by
   // review, not by the gate. `count: 0` made the over-blessed comparison `found(0) < 0` — false — so
@@ -139,16 +155,29 @@ export function assertExemptionLedger(check: ExemptionLedgerCheck): void {
   // "the detector has stopped matching" sends the author to debug a detector that works (#1128
   // close-out review, measured on docCitations and qaCaseReferences). So rows that now find nothing
   // are listed, with what to do about them.
+  if (scanned !== undefined) {
+    expect(
+      scanned >= population.length,
+      `${label}: \`scanned\` (${scanned}) is smaller than the population (${population.length}). It must `
+      + 'count the set the detector walked, of which the offenders are a subset.',
+    ).toBe(true);
+    expect(
+      scanned,
+      `${label}: the detector examined ${scanned} item(s), below the floor of ${floor}. Its scan has `
+      + 'stopped reaching what it guards — every check below would pass having examined nothing.',
+    ).toBeGreaterThanOrEqual(floor);
+  }
   const foundItems = new Set(population.map((o) => o.item));
   const emptyRows = [...new Set(exempt.map((e) => e.item))].filter((item) => !foundItems.has(item)).sort();
-  expect(
+  if (scanned === undefined) expect(
     population.length,
     `${label}: the detector found ${population.length} occurrence(s), below the floor of ${floor}. `
     + 'It has stopped matching — every check below would pass having examined nothing, which is '
     + 'exactly the failure this helper exists to prevent.'
     + (emptyRows.length === 0 ? '' : '\n\nOR every occurrence these rows excused was just fixed — they '
-      + 'now find NOTHING. If so the detector is fine: delete the rows (and resize `floor` if it was '
-      + `sized to them):\n${emptyRows.join('\n')}`),
+      + 'now find NOTHING. If so the detector is fine: delete the rows, and resize `floor` if it was '
+      + 'sized to them — or, when the population is ONLY offenders and empty is the goal, pass '
+      + `\`scanned\` (the size of the set the detector walked) and let \`floor\` bound that:\n${emptyRows.join('\n')}`),
   ).toBeGreaterThanOrEqual(floor);
 
   const occurrences = new Map<string, string[]>();

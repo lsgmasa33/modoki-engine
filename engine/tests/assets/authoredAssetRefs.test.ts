@@ -23,7 +23,7 @@
  * ── THE BASELINE ─────────────────────────────────────────────────────────────────────────
  * A blank asset ref is sometimes legitimate (an intentionally-empty material override slot, a
  * fallback-covered field). Rather than silently ignore those, they are PINNED in `BASELINE` below,
- * one entry per `file:trait.field`, with a two-way staleness check identical in spirit to
+ * one entry per `file:trait.field @ entity`, with a two-way staleness check identical in spirit to
  * `codeAssetRefs.test.ts`'s `PENDING_MIGRATION`: a hit not in the baseline fails ("new blank"), and
  * a baseline entry that no longer hits also fails ("stale exemption"). The baseline is a RECORD of
  * what already existed when this guard landed, not a review or an approval — shrink it as blanks
@@ -52,6 +52,7 @@ import fs from 'fs';
 import { findAssetRoots, readAssetGuid, detectType, type AssetRoot } from '../../plugins/vite-asset-scanner';
 import { hasInternalGames } from '../helpers/repoLayout';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 
 // engine/tests/assets/ → repo root (games/ + demos/ live there).
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
@@ -61,19 +62,25 @@ const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const isGuid = (s: unknown): s is string => typeof s === 'string' && GUID_RE.test(s);
 
 /**
- * Pinned baseline of already-existing blank authored asset-ref fields, keyed `file:trait.field`
- * (the same collapsing granularity `codeAssetRefs.test.ts` uses for `PENDING_MIGRATION` — several
- * blank instances of the same pair in one file are one entry, not several). This is a BASELINE,
- * not an approval: each entry needs a reason a blank is acceptable there, same discipline as
- * `codeAssetRefs.test.ts`'s `ALLOWED`.
+ * Pinned baseline of already-existing blank authored asset-ref fields, keyed
+ * `file:trait.field @ entity` and SPENT. This is a BASELINE, not an approval: each entry needs a
+ * reason a blank is acceptable there.
+ *
+ * ⚠️ **One row per ENTITY, not per `file:trait.field` (#1140).** The key used to collapse every
+ * blank instance of a pair in one file into one row, so a new entity added to a prefab with the
+ * same blank field inherited the first one's reason for free. Measured when it changed: four rows
+ * were silently covering more entities than they named — `Game_Canvas`'s `Renderable2D.material`
+ * held THREE blank entities (Metal, Square 2D, demo) and each of the three enemy prefabs'
+ * `Renderable3DPrimitive.material` held TWO (the body and its `hpbar`). All legitimate once read
+ * (the same optional-slot / flat-primitive reasons), and none written down until then.
  *
  * Regenerate the candidate list with: MODOKI_DUMP_AUTHORED_ASSET_REFS=1 npx vitest run \
  *   --config engine/vite.config.ts engine/tests/assets/authoredAssetRefs.test.ts
  */
-const BASELINE: { key: string; why: string }[] = [
-  { key: '/games/3d-test/assets/models/skinned-test/capsule.prefab.json:SkeletalAnimator.animSet', why: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
-  { key: '/games/3d-test/assets/models/skinned-test/cone.prefab.json:SkeletalAnimator.animSet', why: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
-  { key: '/games/3d-test/assets/models/skinned-test/cylinder.prefab.json:SkeletalAnimator.animSet', why: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
+const BASELINE: ReadonlyArray<{ item: string; count?: number; reason: string }> = [
+  { item: '/games/3d-test/assets/models/skinned-test/capsule.prefab.json:SkeletalAnimator.animSet @ Capsule', reason: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
+  { item: '/games/3d-test/assets/models/skinned-test/cone.prefab.json:SkeletalAnimator.animSet @ Cone', reason: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
+  { item: '/games/3d-test/assets/models/skinned-test/cylinder.prefab.json:SkeletalAnimator.animSet @ Cylinder', reason: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
   // Renderable2D.sprite became a PROVEN ref pair only when the video work authored a video GUID
   // there — the first asset GUID in that field anywhere in the repo (every other 2D entity
   // uses a primitive keyword or a slice name). It was `games/video-test` that first proved it;
@@ -82,29 +89,34 @@ const BASELINE: { key: string; why: string }[] = [
   // of the Renderable3DPrimitive.material entries below: a coloured quad, not a forgotten image.
   // (The SCENE blanks that came with it are gone for the reason in the 2026-08-04 note above —
   // the re-save compacted them out of the file.)
-  { key: '/games/3d-test/assets/prefabs/Game_Canvas.prefab.json:Renderable2D.sprite', why: 'blank sprite = flat coloured primitive quad (Renderable2D.color + width/height), not a missing image' },
+  { item: '/games/3d-test/assets/prefabs/Game_Canvas.prefab.json:Renderable2D.sprite @ demo', reason: 'blank sprite = flat coloured primitive quad (Renderable2D.color + width/height), not a missing image' },
   // Both of these appeared in the 2026-08-06 PREFAB re-save (#125), for the reason in the note
   // above: the prefab writer emits the trait's FULL schema, so `material` — previously absent —
   // is now written as "". Same exemption as the Renderable3DPrimitive.material entries below.
-  { key: '/games/3d-test/assets/prefabs/Game_Canvas.prefab.json:Renderable2D.material', why: 'optional 2D material override slot — blank means "use the default sprite material," not a forgotten material asset' },
-  { key: '/games/alien-animal/assets/models/alien-animal.prefab.json:SkeletalAnimator.animSet', why: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
-  { key: '/games/sling/assets/prefabs/bumper.prefab.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
-  { key: '/games/sling/assets/prefabs/bumper.prefab.json:Collider3D.mesh', why: 'primitive-shaped collider (box/sphere/capsule/etc.) — shape comes from primitive params, mesh is only used for a mesh-collider variant' },
-  { key: '/games/sling/assets/prefabs/cover-enemy.prefab.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
-  { key: '/games/sling/assets/prefabs/cover-enemy.prefab.json:Collider3D.mesh', why: 'primitive-shaped collider (box/sphere/capsule/etc.) — shape comes from primitive params, mesh is only used for a mesh-collider variant' },
-  { key: '/games/sling/assets/prefabs/enemy.prefab.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
-  { key: '/games/sling/assets/prefabs/enemy.prefab.json:Collider3D.mesh', why: 'primitive-shaped collider (box/sphere/capsule/etc.) — shape comes from primitive params, mesh is only used for a mesh-collider variant' },
-  { key: '/games/sling/assets/prefabs/goal-point.prefab.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
+  { item: '/games/3d-test/assets/prefabs/Game_Canvas.prefab.json:Renderable2D.material @ Metal', reason: 'optional 2D material override slot — blank means "use the default sprite material," not a forgotten material asset' },
+  { item: '/games/3d-test/assets/prefabs/Game_Canvas.prefab.json:Renderable2D.material @ Square 2D', reason: 'optional 2D material override slot — blank means "use the default sprite material," not a forgotten material asset' },
+  { item: '/games/3d-test/assets/prefabs/Game_Canvas.prefab.json:Renderable2D.material @ demo', reason: 'optional 2D material override slot — blank means "use the default sprite material," not a forgotten material asset' },
+  { item: '/games/alien-animal/assets/models/alien-animal.prefab.json:SkeletalAnimator.animSet @ Alien_animal', reason: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
+  { item: '/games/sling/assets/prefabs/bumper.prefab.json:Renderable3DPrimitive.material @ Bumper', reason: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
+  { item: '/games/sling/assets/prefabs/bumper.prefab.json:Collider3D.mesh @ Bumper', reason: 'primitive-shaped collider (box/sphere/capsule/etc.) — shape comes from primitive params, mesh is only used for a mesh-collider variant' },
+  { item: '/games/sling/assets/prefabs/cover-enemy.prefab.json:Renderable3DPrimitive.material @ Enemy', reason: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
+  { item: '/games/sling/assets/prefabs/cover-enemy.prefab.json:Renderable3DPrimitive.material @ hpbar', reason: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
+  { item: '/games/sling/assets/prefabs/cover-enemy.prefab.json:Collider3D.mesh @ Enemy', reason: 'primitive-shaped collider (box/sphere/capsule/etc.) — shape comes from primitive params, mesh is only used for a mesh-collider variant' },
+  { item: '/games/sling/assets/prefabs/enemy.prefab.json:Renderable3DPrimitive.material @ Enemy', reason: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
+  { item: '/games/sling/assets/prefabs/enemy.prefab.json:Renderable3DPrimitive.material @ hpbar', reason: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
+  { item: '/games/sling/assets/prefabs/enemy.prefab.json:Collider3D.mesh @ Enemy', reason: 'primitive-shaped collider (box/sphere/capsule/etc.) — shape comes from primitive params, mesh is only used for a mesh-collider variant' },
+  { item: '/games/sling/assets/prefabs/goal-point.prefab.json:Renderable3DPrimitive.material @ GoalPoint', reason: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
   // Appeared in the 2026-08-06 prefab re-save (#125) — see the Game_Canvas.Renderable2D.material
   // entry above: the prefab writer emits the full trait schema, so this optional slot is now present.
-  { key: '/games/sling/assets/prefabs/GreenSlim.prefab.json:Renderable2D.material', why: 'optional 2D material override slot — blank means "use the default sprite material," not a forgotten material asset' },
-  { key: '/games/sling/assets/prefabs/green-enemy.prefab.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
-  { key: '/games/sling/assets/prefabs/green-enemy.prefab.json:Collider3D.mesh', why: 'primitive-shaped collider (box/sphere/capsule/etc.) — shape comes from primitive params, mesh is only used for a mesh-collider variant' },
-  { key: '/games/sling/assets/prefabs/puck.prefab.json:Collider3D.mesh', why: 'primitive-shaped collider (box/sphere/capsule/etc.) — shape comes from primitive params, mesh is only used for a mesh-collider variant' },
-  { key: '/games/sling/assets/prefabs/puck.prefab.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
-  { key: '/games/timeline-demo/assets/models/alien-animal.prefab.json:SkeletalAnimator.animSet', why: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
-  { key: '/games/timeline-demo/assets/prefabs/spark.prefab.json:Renderable3DPrimitive.material', why: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
-  { key: '/demos/forest-camp/assets/models/char_Ranger.prefab.json:SkeletalAnimator.animSet', why: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
+  { item: '/games/sling/assets/prefabs/GreenSlim.prefab.json:Renderable2D.material @ GreenSlim', reason: 'optional 2D material override slot — blank means "use the default sprite material," not a forgotten material asset' },
+  { item: '/games/sling/assets/prefabs/green-enemy.prefab.json:Renderable3DPrimitive.material @ Enemy', reason: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
+  { item: '/games/sling/assets/prefabs/green-enemy.prefab.json:Renderable3DPrimitive.material @ hpbar', reason: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
+  { item: '/games/sling/assets/prefabs/green-enemy.prefab.json:Collider3D.mesh @ Enemy', reason: 'primitive-shaped collider (box/sphere/capsule/etc.) — shape comes from primitive params, mesh is only used for a mesh-collider variant' },
+  { item: '/games/sling/assets/prefabs/puck.prefab.json:Collider3D.mesh @ Puck', reason: 'primitive-shaped collider (box/sphere/capsule/etc.) — shape comes from primitive params, mesh is only used for a mesh-collider variant' },
+  { item: '/games/sling/assets/prefabs/puck.prefab.json:Renderable3DPrimitive.material @ PuckVisual', reason: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
+  { item: '/games/timeline-demo/assets/models/alien-animal.prefab.json:SkeletalAnimator.animSet @ Alien_animal', reason: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
+  { item: '/games/timeline-demo/assets/prefabs/spark.prefab.json:Renderable3DPrimitive.material @ Spark', reason: 'primitive-shape render — blank means "use the flat primitive color," not a forgotten material asset' },
+  { item: '/demos/forest-camp/assets/models/char_Ranger.prefab.json:SkeletalAnimator.animSet @ Char_ranger', reason: 'optional per-instance animset override — blank means "use the rig/prefab default," not a missing ref' },
 ];
 
 /** Every file under an asset root, git-enumerated (#771/#799) rather than a hand-rolled recursive
@@ -255,26 +267,30 @@ const provenPairs = new Set(
  *
  *  ⚠️ And it was worse than inert. The red it suppressed is a genuine tell for the
  *  texture-guid-in-a-sprite-field mistake, so keeping the exemption would silence — repo-wide, for
- *  every game — the one signal that fires when someone makes it. */
-const OPTIONAL_BLANK_PAIRS = new Set(['UIElement.fontFamily']);
+ *  every game — the one signal that fires when someone makes it.
+ *
+ *  ⚠️ **That story is why this is `sanctioned` on the ledger now (#1140), not a bare `Set`.** A
+ *  field-level pardon is the right GRAIN for a field whose blank is its meaning, but the Set had no
+ *  staleness check, so `imageSrc` went inert and was found only by hand. As `sanctioned`, a pair
+ *  that stops being proven, or stops holding any blank, reddens on its own. */
+const OPTIONAL_BLANK_PAIRS: readonly string[] = ['UIElement.fontFamily'];
 
 /** Every instance of a proven asset-ref pair whose value is a blank string. */
 const blanks = allInstances.filter(
-  (i) => provenPairs.has(`${i.trait}.${i.field}`)
-    && !OPTIONAL_BLANK_PAIRS.has(`${i.trait}.${i.field}`)
-    && i.value === '',
+  (i) => provenPairs.has(`${i.trait}.${i.field}`) && i.value === '',
 );
 
-const key = (i: FieldInstance) => `${i.url}:${i.trait}.${i.field}`;
+/** What a BASELINE row keys on — or, for a field whose blank is its meaning, the bare pair, which
+ *  `sanctioned` excludes structurally. */
+const itemOf = (i: FieldInstance) => {
+  const pair = `${i.trait}.${i.field}`;
+  return OPTIONAL_BLANK_PAIRS.includes(pair) ? pair : `${i.url}:${pair} @ ${i.entity}`;
+};
 
 if (process.env.MODOKI_DUMP_AUTHORED_ASSET_REFS) {
-  const byKey = new Map<string, FieldInstance[]>();
-  for (const b of blanks) {
-    const k = key(b);
-    (byKey.get(k) ?? byKey.set(k, []).get(k)!).push(b);
-  }
   console.log(JSON.stringify(
-    [...byKey].map(([k, insts]) => ({ key: k, entities: insts.map((i) => i.entity) })),
+    // A BASELINE-shaped item carries ` @ entity`; a field-level (sanctioned) pair does not.
+    blanks.map(itemOf).filter((item) => item.includes(' @ ')),
     null,
     2,
   ));
@@ -286,31 +302,21 @@ describe('authored asset-ref fields must not be blank (#53)', () => {
     expect(allInstances.length).toBeGreaterThan(0);
   });
 
-  it.skipIf(!hasGames)('no NEW blank in a proven asset-ref field', () => {
-    const baselineKeys = new Set(BASELINE.map((b) => b.key));
-    const offenders = blanks
-      .filter((b) => !baselineKeys.has(key(b)))
-      .map((b) => `${key(b)} → entity "${b.entity}"`);
-    expect(
-      offenders,
-      'This field has held a real asset GUID somewhere else in the repo, which proves it is an '
+  it.skipIf(!hasGames)('no NEW blank in a proven asset-ref field, and the baseline only shrinks', () => {
+    assertExemptionLedger({
+      label: 'BASELINE in authoredAssetRefs',
+      population: blanks.map((b) => ({ item: itemOf(b), site: `${b.url}:${b.trait}.${b.field} → entity "${b.entity}"` })),
+      exempt: BASELINE,
+      sanctioned: OPTIONAL_BLANK_PAIRS,
+      floor: 1,
+      // Over-blessed is the old "still fires" test: an authored field must be deducted here in the
+      // same commit, or the row silently re-permits the blank if it comes back.
+      fix: 'This field has held a real asset GUID somewhere else in the repo, which proves it is an '
         + "asset-ref field — and here it's blank. An unset ref like this is invisible to every OTHER "
         + 'test in the repo (it is neither dangling nor a literal path) and surfaces only in a real '
         + 'production build or on device, per #53\'s close-out comment. If this blank is intentional '
-        + '(an optional override slot, a field with a code fallback), add it to BASELINE with a '
-        + 'reason. Otherwise author the ref in the scene/prefab.',
-    ).toEqual([]);
-  });
-
-  it.skipIf(!hasGames)('every BASELINE entry still fires (no stale exemptions)', () => {
-    const firing = new Set(blanks.map(key));
-    const stale = BASELINE.filter((b) => !firing.has(b.key)).map((b) => b.key);
-    expect(
-      stale,
-      'These entries are baselined as pre-existing blank asset refs but no longer fire — either '
-        + 'the field was authored (good: delete the entry) or the file/trait/field moved. A baseline '
-        + 'that outlives its entries stops being able to tell you what is left, and silently '
-        + 're-permits the blank if it comes back.',
-    ).toEqual([]);
+        + '(an optional override slot, a field with a code fallback), add a `file:trait.field @ entity` '
+        + 'row to BASELINE with a reason. Otherwise author the ref in the scene/prefab.',
+    });
   });
 });

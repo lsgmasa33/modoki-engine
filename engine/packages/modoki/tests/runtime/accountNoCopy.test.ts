@@ -20,6 +20,7 @@ import { join, relative } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { stripComments } from '../helpers/sourceScanner';
+import { assertExemptionLedger } from '../helpers/exemptionLedger';
 
 const ACCOUNT_DIR = join(fileURLToPath(new URL('.', import.meta.url)), '../../src/runtime/account');
 
@@ -35,15 +36,23 @@ export function accountSourceFiles(dir: string): string[] {
 }
 
 /** Every string the type unions in `types.ts` actually use as a member — provider ids, state
- *  `kind`/`what` tags, and failure codes. Anything else found in the module's source is copy. */
-const ALLOWED_LITERALS = new Set<string>([
+ *  `kind`/`what` tags, and failure codes. Anything else found in the module's source is copy.
+ *
+ *  ⚠️ **Passed to the ledger as `sanctioned`, not tested with `.has()` (#1140).** A union member is
+ *  a TOKEN-level pardon on purpose — `'apple'` is never copy however often it appears — so it is not
+ *  counted. What the bare `Set` lacked was any staleness check; `sanctioned` requires each name to
+ *  still appear SOMEWHERE in the module. ⚠️ That is weaker than "still a union member": `types.ts`
+ *  is inside the scan, so a name goes stale only once it is neither declared in a union NOR written
+ *  anywhere else in the module — a member dropped from its union but still spelled as a string in
+ *  `index.ts` keeps its pardon (review, #1140 close-out). */
+const ALLOWED_LITERALS: readonly string[] = [
   // AccountProvider
   'apple', 'google', 'unknown',
   // AccountState kinds + `working.what`
   'signed-out', 'working', 'signing-in', 'signing-out', 'deleting', 'signed-in', 'error',
   // SignInFailure
   'network', 'not-configured', 'credential-in-use', 'failed',
-]);
+];
 
 /** Every quoted/templated string literal in `code` (comments already stripped), excluding
  *  `import`/`export … from '<spec>'` module specifiers — a module path is not copy. */
@@ -66,15 +75,17 @@ describe('the engine account module carries no player-visible copy (#675)', () =
     expect(files.length).toBeGreaterThan(0);
   });
 
-  for (const file of files) {
-    it(`${file}: every string literal is a type-union member, never copy`, () => {
-      const raw = readFileSync(join(ACCOUNT_DIR, file), 'utf8');
-      const code = stripComments(raw);
-      const offenders = stringLiteralsIn(code).filter((s) => !ALLOWED_LITERALS.has(s));
-      expect(offenders, `${file} contains string literal(s) that are not type-union members — this `
-        + `module must carry no player-visible copy (#675):\n${offenders.join('\n')}`).toEqual([]);
+  it('every string literal in the module is a type-union member, never copy — and every member is still used', () => {
+    assertExemptionLedger({
+      label: 'ALLOWED_LITERALS in accountNoCopy',
+      population: files.flatMap((file) => stringLiteralsIn(stripComments(readFileSync(join(ACCOUNT_DIR, file), 'utf8')))
+        .map((literal) => ({ item: literal, site: `${file}: ${JSON.stringify(literal)}` }))),
+      sanctioned: ALLOWED_LITERALS,
+      floor: 1,
+      fix: 'these string literal(s) are not type-union members — the account module must carry no '
+        + 'player-visible copy (#675). Move the string to the game (Court\'s runtime/accountUi.ts).',
     });
-  }
+  });
 });
 
 describe('the sweep does not stop at a subdirectory boundary (regression for the non-recursive hole)', () => {
@@ -90,8 +101,9 @@ describe('the sweep does not stop at a subdirectory boundary (regression for the
       expect(found).toContain(join('copy', 'messages.ts'));
 
       const code = stripComments(readFileSync(nestedFile, 'utf8'));
-      const offenders = stringLiteralsIn(code).filter((s) => !ALLOWED_LITERALS.has(s));
-      expect(offenders).toEqual(['Sign in with Apple']);
+      // The nested file's only literal is copy — not a union member — so the scan must report it.
+      expect(stringLiteralsIn(code)).toEqual(['Sign in with Apple']);
+      expect(ALLOWED_LITERALS).not.toContain('Sign in with Apple');
     } finally {
       rmSync(fixtureDir, { recursive: true, force: true });
     }

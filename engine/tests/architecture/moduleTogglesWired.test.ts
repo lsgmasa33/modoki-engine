@@ -21,15 +21,15 @@
  *     (2.7 MB on demos/video-demo), and absent from the panel, editable only by hand-writing JSON.
  *
  *  What counts as a CONSUMER is deliberately narrow: shipped source under `engine/` that mentions
- *  the define. Test files are excluded (a test naming a define is not a branch), and so are the
- *  four places that DEFINE or DECLARE it — otherwise every key trivially passes on the strength of
- *  its own definition, which is precisely the vacuous check that let #256 through. */
+ *  the define. Test files are excluded (a test naming a define is not a branch), and so is every
+ *  occurrence that DEFINES it (see `readsDefine`) — otherwise every key trivially passes on the
+ *  strength of its own definition, which is precisely the vacuous check that let #256 through. */
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { MODULE_KEYS } from '../../plugins/detect-modules';
 import { REPO_ROOT } from '../helpers/repoLayout';
-import { stripComments, assertScanIsSane, readScannedSource } from '@modoki/engine/testing';
+import { stripComments, stripCommentsAndStrings, assertScanIsSane, readScannedSource } from '@modoki/engine/testing';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 /** `gpuParticles` → `__MODOKI_MODULE_GPU_PARTICLES__`; `render3d` → `__MODOKI_MODULE_RENDER3D__`
@@ -51,12 +51,32 @@ function defineName(key: string): string {
  *  those needs the import graph and an AST, which `render3dBoundary.test.ts` has and this does
  *  not. The gap is narrow and stated rather than papered over. */
 
-/** The files that DEFINE or DECLARE the defines. A mention here is not a consumer. */
-const DEFINITION_SITES = new Set([
-  'engine/vite.config.ts',
-  'engine/plugins/vite-asset-scanner.ts',
-  'engine/packages/modoki/vitest.config.ts',
-]);
+/** Does comment-stripped `code` READ `token`, rather than only DEFINE it?
+ *
+ *  ⚠️ **Derived from the definition's SHAPE, not a hand list of definition files (#1140).** This was
+ *  `DEFINITION_SITES`, three files filtered out of the corpus — and a FOURTH definition site,
+ *  `engine/electron/ssrLoader.ts` (the SSR loader's own `define: { __MODOKI_MODULE_*__: 'true' }`
+ *  block), was never on it. So every key counted ssrLoader.ts as a consumer, and "at least one
+ *  source file branches on its define" could not fail for ANY key: delete every real branch and the
+ *  SSR loader's definition still vouched. That is #256 again, one file over. A definition is the
+ *  token in object-KEY position (`{`/`,`/line start, then `token:`); any other occurrence is a
+ *  read. `.d.ts` declarations are already outside the corpus.
+ *
+ *  ⚠️ **`code` must be stripped of STRINGS as well as comments** (#1140 close-out review). With
+ *  comments alone, three string literals that merely MENTION `__MODOKI_MODULE_VIDEO__` (a `reason`
+ *  in `agentBridge.ts`, a contract `notes` in `contracts.ts`, a `.describe(...)` in the MCP runtime
+ *  tools) counted as consumers — so deleting every real video branch still left the per-key check
+ *  green, #256 once more. Quoted-key definitions vanish with the strings, which is harmless.
+ *
+ *  The key position is matched on ONE line (`[ \t]*`, not `\s*`), so a multi-line ternary
+ *  (`cond ?\n  TOKEN\n  : b`) stays a read, and a computed key (`[TOKEN]:`) counts as a definition.
+ *  Known gap, stated rather than guessed at: `declare const TOKEN: boolean;` in a plain `.ts`
+ *  file reads as a read (no such declaration exists outside `.d.ts` today). */
+function readsDefine(code: string, token: string): boolean {
+  const all = code.split(token).length - 1;
+  const asKey = [...code.matchAll(new RegExp(`(?:^|[{,[])[ \\t]*${token}\\]?[ \\t]*:(?!:)`, 'gm'))].length;
+  return all > asKey;
+}
 
 const SKIP_DIRS = new Set(['node_modules', 'dist', 'coverage', '.git', 'tests', 'e2e']);
 
@@ -71,8 +91,7 @@ const sources = (() => {
     },
     floor: 700,
   })
-    .map(({ rel }) => rel)
-    .filter((rel) => !DEFINITION_SITES.has(rel));
+    .map(({ rel }) => rel);
 })();
 
 describe('build.modules toggles are wired in both directions', () => {
@@ -106,8 +125,8 @@ describe('build.modules toggles are wired in both directions', () => {
 
   it.each(MODULE_KEYS)('%s has at least one source file that branches on its define', (key) => {
     const token = defineName(key);
-    const consumers = sources.filter((rel) =>
-      stripComments(fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8')).includes(token));
+    const consumers = sources.filter((rel) => readsDefine(
+      stripCommentsAndStrings(fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8'), rel), token));
     expect(
       consumers,
       `build.modules.${key} is offered as a toggle but NOTHING reads ${token}, so turning it off ` +
@@ -115,6 +134,28 @@ describe('build.modules toggles are wired in both directions', () => {
       `check must return BEFORE the import, in the same function, or it folds nothing — or delete ` +
       `the toggle from MODULE_KEYS, BuildModules, the defines and ModuleTogglesEditor.`,
     ).not.toHaveLength(0);
+  });
+
+  it('a definition is not a read — the classifier tells them apart, and every real definition site is recognised', () => {
+    const t = '__MODOKI_MODULE_VIDEO__';
+    expect(readsDefine(`export default { define: {\n  ${t}: 'true',\n} };`, t)).toBe(false);
+    expect(readsDefine(`const d = { a: 1, ${t}: JSON.stringify(x) };`, t)).toBe(false);
+    expect(readsDefine(`const d = { [${t}]: 1 };`, t)).toBe(false);
+    expect(readsDefine(`if (${t}) { await import('./video'); }`, t)).toBe(true);
+    expect(readsDefine(`const on = ${t} ? load() : null;`, t)).toBe(true);
+    expect(readsDefine(`const on = cond ?\n  ${t}\n  : fallback;`, t)).toBe(true);
+    // A string that merely MENTIONS the define is not a read — once strings are stripped.
+    const mention = `const reason = 'gated on ${t}';`;
+    expect(readsDefine(stripCommentsAndStrings(mention, 'x.ts'), t)).toBe(false);
+    // The premise: every file that DEFINES the defines — the four known ones, ssrLoader.ts among
+    // them — reads none of them, so none can vouch for a key.
+    for (const rel of ['engine/vite.config.ts', 'engine/plugins/vite-asset-scanner.ts',
+      'engine/packages/modoki/vitest.config.ts', 'engine/electron/ssrLoader.ts']) {
+      const raw = fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8');
+      expect(stripComments(raw).includes(defineName('video')), `${rel} no longer defines the video toggle`).toBe(true);
+      const code = stripCommentsAndStrings(raw, rel);
+      expect(MODULE_KEYS.filter((key) => readsDefine(code, defineName(key))), rel).toEqual([]);
+    }
   });
 
   it('the Engine Modules panel offers exactly the keys MODULE_KEYS resolves', () => {

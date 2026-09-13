@@ -25,6 +25,7 @@ import { describe, it, expect } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readScannedSource } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -33,29 +34,28 @@ const ENGINE_ROOT = path.join(REPO_ROOT, 'engine');
 /** Known non-invocation matches of the raw-string detector below — each INSPECTS a string that
  *  happens to equal the invocation prefix rather than spawning it. Listed explicitly (a narrow
  *  allowlist, per the file header) instead of trying to regex-distinguish "spawn" from
- *  "inspect" generally, which would be unreliable and could hide a real regression. */
-const ALLOWLIST: Array<{ file: string; needle: string; reason: string }> = [
+ *  "inspect" generally, which would be unreliable and could hide a real regression.
+ *
+ *  ⚠️ **Keyed by `file::<the literal the detector matched>` and SPENT (#1140).** This was a
+ *  `.some(file && line.includes(needle))` match that skipped the LINE before detection, with no
+ *  staleness check — so a fixed site left a row pardoning nothing, and a second copy of the same
+ *  literal in the same file was excused by the first one's reason. Keying on the matched literal
+ *  (not the whole line) keeps the old needle's reorder-safety: a trailing comma is not part of it. */
+const ALLOWLIST: ReadonlyArray<{ item: string; count?: number; reason: string }> = [
   {
-    file: 'scripts/scopedTypecheckLib.mjs',
-    // No trailing comma in the needle: baking one in turns the guard red for a non-issue the
-    // day somebody reorders MACHINERY_PATHS so this entry lands last.
-    needle: "'engine/scripts/build-web.mjs'",
+    item: "scripts/scopedTypecheckLib.mjs::'engine/scripts/build-web.mjs'",
     reason: 'a MACHINERY_PATHS entry (#967) — the path is COMPARED against git\'s changed-file ' +
       'list to decide whether the scoped per-project typecheck must escalate to a full sweep, ' +
       'because build-web.mjs is what generates the scoped config shape. It is data being ' +
       'matched, never a command being spawned, so it carries no --target.',
   },
   {
-    file: 'plugins/vite-asset-scanner.ts',
-    needle: "steps[0]?.cmd?.startsWith('node engine/scripts/build-web.mjs')",
-    reason: "checks an already-built step's cmd PREFIX to decide whether to drop it from the " +
-      'scaffold flow — it does not spawn build-web.mjs itself, so it carries no --target.',
+    item: "plugins/vite-asset-scanner.ts::'node engine/scripts/build-web.mjs'",
+    reason: "`steps[0]?.cmd?.startsWith('node engine/scripts/build-web.mjs')` checks an already-" +
+      'built step\'s cmd PREFIX to decide whether to drop it from the scaffold flow — it does not ' +
+      'spawn build-web.mjs itself, so it carries no --target.',
   },
 ];
-
-function isAllowlisted(relFile: string, line: string): boolean {
-  return ALLOWLIST.some((a) => a.file === relFile && line.includes(a.needle));
-}
 
 // Space form (`--target web`) or equals form (`--target=web`) inside one string.
 const SPACE_OR_EQUALS_TARGET_RE = /--target[= ]+(web|native|playable)\b/;
@@ -85,6 +85,8 @@ interface Invocation {
   rel: string;
   lineNo: number;
   line: string;
+  /** The exact literal the detector matched — what an ALLOWLIST row keys on. */
+  literal: string;
   ok: boolean;
 }
 
@@ -96,21 +98,21 @@ function scan(): Invocation[] {
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
       if (!line.includes('build-web.mjs')) continue;
-      if (isAllowlisted(rel, line)) continue;
 
       // Case A: a quoted shell-command string — 'node engine/scripts/build-web.mjs ...'
       const cmdMatch = line.match(/(['"])node engine\/scripts\/build-web\.mjs([^'"]*)\1/);
       if (cmdMatch) {
-        found.push({ rel, lineNo: i + 1, line: line.trim(), ok: hasValidTarget(cmdMatch[2]) });
+        found.push({ rel, lineNo: i + 1, line: line.trim(), literal: cmdMatch[0], ok: hasValidTarget(cmdMatch[2]) });
         continue;
       }
 
       // Case B: an execFileSync/spawn-style args array — ['engine/scripts/build-web.mjs', ...],
       // where --target (if present) is a separate array element within the next few lines.
-      if (/['"]engine\/scripts\/build-web\.mjs['"]/.test(line)) {
+      const pathMatch = line.match(/['"]engine\/scripts\/build-web\.mjs['"]/);
+      if (pathMatch) {
         const windowEnd = Math.min(lines.length, i + 6);
         const windowText = lines.slice(i, windowEnd).join('\n');
-        found.push({ rel, lineNo: i + 1, line: line.trim(), ok: hasValidTarget(windowText) });
+        found.push({ rel, lineNo: i + 1, line: line.trim(), literal: pathMatch[0], ok: hasValidTarget(windowText) });
         continue;
       }
 
@@ -132,12 +134,15 @@ describe('every build-web.mjs invocation passes --target (regression guard)', ()
 
   it('has no invocation missing a valid --target', () => {
     const violations = invocations.filter((inv) => !inv.ok);
-    expect(
-      violations.map((v) => `${v.rel}:${v.lineNo}: ${v.line}`),
-      'New build-web.mjs invocation(s) missing --target — this is exactly the regression class ' +
+    assertExemptionLedger({
+      label: 'ALLOWLIST in buildWebCallSites',
+      population: violations.map((v) => ({ item: `${v.rel}::${v.literal}`, site: `${v.rel}:${v.lineNo}: ${v.line}` })),
+      exempt: ALLOWLIST,
+      floor: 1,
+      fix: 'New build-web.mjs invocation(s) missing --target — this is exactly the regression class ' +
         '#40 exists to prevent (a silently wrong base path). Pass --target web|native|playable ' +
         'explicitly at every call site.',
-    ).toEqual([]);
+    });
   });
 });
 

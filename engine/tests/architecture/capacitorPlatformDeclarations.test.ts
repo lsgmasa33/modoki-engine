@@ -34,6 +34,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { stripSwiftComments } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { hasNativeProjects } from '../helpers/repoLayout';
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
 // @ts-expect-error — .mjs script module, no type declarations by design (it is a build script).
@@ -424,9 +425,14 @@ function spmProjects(): { id: string; dir: string; manifest: string }[] {
  *  second test below asserts the entry is STILL absent, so that when #342 unblocks and
  *  `CapacitorApplovinMax` legitimately returns to the manifest, THIS repo's own test fails loudly
  *  (the exception no longer matches reality) and forces someone to delete the entry — rather than
- *  quietly tolerating either state forever. */
-const KNOWN_MISSING: ReadonlyArray<{ project: string; dep: string }> = [
-  { project: 'games/court', dep: 'capacitor-applovin-max' },
+ *  quietly tolerating either state forever.
+ *
+ *  Spent through `assertExemptionLedger` since #1140. The hand-rolled "still absent" test did not
+ *  check that the dep was still in package.json, so removing the plugin outright left the row
+ *  standing; the over-blessed arm covers both. */
+const KNOWN_MISSING: ReadonlyArray<{ item: string; reason: string }> = [
+  { item: 'games/court::capacitor-applovin-max',
+    reason: '#342 — AppLovin MAX is parked; its SPM product is deliberately absent from the committed Package.swift' },
 ];
 
 describe('committed Package.swift vs package.json — every SPM-iOS capacitor dep is declared (#371)', () => {
@@ -443,40 +449,29 @@ describe('committed Package.swift vs package.json — every SPM-iOS capacitor de
   it.skipIf(!hasNativeProjects())(
     'every SPM-iOS capacitor dep in package.json is declared in Package.swift',
     () => {
-      const offenders: string[] = [];
+      const undeclared: Array<{ item: string; site: string }> = [];
       for (const proj of spmProjects()) {
         const manifestText = fs.readFileSync(proj.manifest, 'utf8');
         for (const dep of iosSpmDeps(proj.dir)) {
-          if (KNOWN_MISSING.some((k) => k.project === proj.id && k.dep === dep)) continue;
           if (!isSpmDepDeclared(dep, manifestText)) {
-            offenders.push(
-              `${proj.id}: ${dep} (expected "${expectedSpmName(dep)}") is not declared in ` +
-                `${path.relative(repoRoot, proj.manifest)} — package.json depends on it and its ` +
-                `own package.json declares capacitor.ios, so \`cap sync ios\` will re-add it on ` +
-                `every build (#371).`,
-            );
+            undeclared.push({
+              item: `${proj.id}::${dep}`,
+              site: `${proj.id}: ${dep} (expected "${expectedSpmName(dep)}") is not declared in `
+                + `${path.relative(repoRoot, proj.manifest)}`,
+            });
           }
         }
       }
-      expect(offenders, offenders.join('; ')).toEqual([]);
-    },
-  );
-
-  it.skipIf(!hasNativeProjects())(
-    'the #342 AppLovin exception is still real — asserted, not just assumed',
-    () => {
-      for (const { project, dep } of KNOWN_MISSING) {
-        const proj = spmProjects().find((p) => p.id === project);
-        expect(proj, `${project}: expected to still have a committed Package.swift`).toBeTruthy();
-        if (!proj) continue;
-        const manifestText = fs.readFileSync(proj.manifest, 'utf8');
-        expect(
-          isSpmDepDeclared(dep, manifestText),
-          `${project}: ${dep} (${expectedSpmName(dep)}) is now declared in Package.swift — #342 ` +
-            `must have unblocked AppLovin's native build. Delete this KNOWN_MISSING entry (see ` +
-            `commit e34e8d8fe) rather than loosening this assertion.`,
-        ).toBe(false);
-      }
+      assertExemptionLedger({
+        label: 'KNOWN_MISSING in capacitorPlatformDeclarations',
+        population: undeclared,
+        exempt: KNOWN_MISSING,
+        floor: 1,
+        fix: 'package.json depends on these and their own package.json declares capacitor.ios, so '
+          + '`cap sync ios` will re-add them on every build (#371). A KNOWN_MISSING row that blesses '
+          + 'more than exists means #342 unblocked (or the plugin was removed): delete the row '
+          + '(see commit e34e8d8fe) rather than loosening this assertion.',
+      });
     },
   );
 

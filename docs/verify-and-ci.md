@@ -1201,6 +1201,12 @@ enforces:
   the same fail-open one level down; the helper shipped that way for one commit and review caught it.
 - **`count` must be positive and `floor` at least 1.** `count: 0` writes a pardon that can never be
   stale; `floor: 0` gives back the vacuity the field is required for.
+- **When the population is ONLY offenders, bound the SCAN with `scanned`.** A ledger over "ids with
+  fewer than three segments" or "mutating reads" exists to shrink to nothing, and a floor on its
+  population refuses exactly that end state — Phase 3 shipped six such ledgers, and the reviewer's fix
+  (rename both legacy ids, delete both rows) went red as "the detector has stopped matching". Pass the
+  size of the set the detector walked (every static id, every contract) as `scanned`, and `floor`
+  bounds that instead. It must be a count of the walk, never a constant.
 - **`sanctioned` is for STRUCTURAL exclusions only** — the one legitimate implementer, or a guard that
   must quote its own subject to explain itself. Reason-free, because nobody should re-review it, but
   still staleness-checked. Keeping those out of the reviewed list is what stops 164 self-citations
@@ -1265,11 +1271,92 @@ Three shapes the Phase 3 migrations kept meeting, recorded so the next one does 
 - **A guard that quotes its own marker in string literals is `sanctioned`, not counted** — its count
   moves with every edit to its own prose (`corpusProducerIsShared`).
 
-The rest is **#1128 Phase 4**: the enforcement guard that makes the helper non-optional, and the
-exemption ledgers nobody has examined. ⚠️ Do not
-quote a remaining count from a marker that greps for `ALLOW*`/`EXEMPT*` names: migrating a guard makes
-it DISAPPEAR from such a census (measured 43 → 42 → 40 across the two phases, by a rename, a deletion
-and a split), so the number falls for reasons unrelated to progress.
+**#1140 Phase 1 re-read the 20 hand-rolled ledgers a shape census sorted as grain mismatches** —
+and re-reading, not the census, is what found the defects. Every one was either put on the helper
+(`pixiApplicationTeardown`, `buildWebCallSites`, `docCitations`' `SOURCE_CITATION_EXEMPT`,
+`adbTargeting`, `codeAssetRefs`' `PENDING_MIGRATION`, `authoredAssetRefs`, `chromeTagging`,
+`userDataDir`, `accountNoCopy`, Court's `cellMapDiscipline`, `appManagerDisposeReachable`'s
+`NOT_A_MANAGER_DECLARATION`), deleted because it was empty (`materialCloneStamp`,
+`updateEachFanoutGuard`, `codeAssetRefs`' `ALLOWED`, `danglingCodeGuids`, `docCitations`'
+`KNOWN_DANGLING_TITLES`), or replaced by a rule that needs no list (`projectDocs` now asks
+`git check-ignore`). What the migrations turned up, because these are the shapes to expect next time:
+
+- **Inert pardons are the commonest finding, and a list with no staleness check hides them
+  indefinitely.** 6 of `cellMapDiscipline`'s 11 function names, all 3 of `projectDocs`'
+  `ABSENT_ON_PURPOSE` rows and one of its two `ABSENT_BY_DESIGN` names, and `docCitations`'
+  inline self-skips in rules 3 and 4 pardoned nothing (each measured).
+- **A pardon can hide a DETECTOR bug.** `adbTargeting`'s row for `androidDevices.ts`' device
+  listing looked load-bearing because the detector's fixed 400-char window reached the NEXT
+  call's `adbArgs(` and misread the un-targeted call as targeted. Spending the row reported
+  "blesses 1, found 0", which is how it surfaced. So an over-blessed report is a question about
+  the detector as much as about the row.
+- **A collapsed key hides written-down-nowhere extras.** `authoredAssetRefs`' `file:trait.field`
+  rows covered four more blank entities than they named (legitimate once read), exactly the
+  "reason nobody re-read" shape Phase 3 found.
+- **`sanctioned` is the right home for a correctly-coarse pardon** — a field whose blank is its
+  meaning, an input-path function, a type-union member, a whole file that must quote its subject.
+  The grain stays; the staleness check is what it gains. `authoredAssetRefs`' `UIElement.imageSrc`
+  had already gone inert once as a bare `Set` and was found by hand.
+- **A structural exclusion read by several scans is several claims.** `docCitations`'
+  `SELF_QUOTING` stays a whole-file exclusion, but a test now requires it to excuse something in
+  EACH of the three scans that apply it.
+
+**#1140 Phase 2 did the same for the lists already keyed at the right grain** (per file, per name)
+and for three that already counted by hand (`gitReadIsBounded`, `layoutConditionalTestLedger`,
+`notifyIsShared`). "Correct grain, no staleness check" sounded like bookkeeping; it was not:
+
+- **A correct-grain pardon still hides a dead detector or a dead reason.** `courtSweepScope`'s and
+  `ktx2CapsGuard`'s only rows pardoned nothing, and `notifyIsShared`'s outside-SCAN_DIRS list and
+  four others were empty. Spending the list is what said so.
+- **An EXCLUSION list can make a REQUIRED-pattern guard unfalsifiable.** `moduleTogglesWired` asks
+  that every build-module toggle has a consumer, and excluded a hand list of definition files from
+  that count. A fourth definition site (`electron/ssrLoader.ts`) was never on it, so it vouched for
+  every toggle — and when that was fixed by shape, three STRING literals mentioning the define still
+  vouched for `video`, until the scan stripped strings too. A hand list of what to exclude fails open
+  on the entry nobody added; derive the exclusion from what the excluded thing IS.
+- **One pardon consulted by two rules.** `invalidatorGranularity`'s per-key exemption `continue`d
+  past the overshoot rule too — the Phase 1 lesson, in a list that looked correctly keyed.
+- **Key a row by the SPELLING its reason is about.** Court's `worldSwap` exemptions argue about a
+  plain reference to a function; keyed by name alone, a later inline-arrow rewrite of that member
+  that never entered the world spent the same row. They are `name::plain` now.
+- **Absent by LAYOUT is not absent by existence.** A row whose file the checkout does not ship is
+  dropped with a layout predicate (`gitReadIsBounded`'s `rootIsPresent`), never with `fs.existsSync`,
+  which would also silence a row whose file was deleted or renamed in a root that ships.
+
+Not everything in the census is a pardon, and forcing one onto the helper would change what it
+means: a two-way exact baseline (`noNewCycles`, `routeCoverage`, `gamePortability`) is already
+exact, and a coverage REGISTRY proven by the test it names (`worldSwapTeardownFalsifiable`'s
+`BASELINE`) must not be spent against the thing it covers.
+
+⚠️ **The helper is non-optional now: `engine/tests/architecture/exemptionLedgerIsShared.test.ts`
+(#1140 Phase 3).** It fails on a hand-rolled pardon anywhere vitest collects tests — `engine/tests/**`,
+the package's `tests/**`, the scaffolder template's `tests/**`, every `games/<id>/tests` and
+`demos/<id>/tests`, and a project's own `packages/**` tests. It detects a SHAPE, never a name: a
+`const` literal collection (no spread, never mutated; an empty `new Set()` counts) consulted by a
+membership test that skips a hit — the condition of an `if` whose branch ends in `continue`, or
+inside a `.filter(…)` callback either negated or the condition of an `if` that ends in
+`return false`. What it cannot see, and the measured false-positive count that chose its breadth,
+are in its docblock. Two things
+to know before you meet it:
+
+- **The breadth was an owner call on a measurement, not a default.** The broad shape matched 55
+  sites (about 30 real pardons, 13 of them in guards no census had listed, and about 25 data lists);
+  matching only lists that carry reasons matched 9 and missed about 20 pardons written as a bare
+  `new Set([...])`. Broad won because a guard that only sees reasoned pardons rewards leaving the
+  reason out. Migrating those 13 first found the usual yield: `mcpRegistry`'s `PER_TOOL_MEANING`
+  pardoned 13 params whose wording had already converged. (The first count said 15: two of them,
+  `action` and `type`, only looked converged because an undescribed param's `''` was taken as the
+  shared base — close-out review.)
+- **A list that selects rather than excuses goes in its `RESIDUE`, with its KIND first** — data,
+  vocabulary, classifier, scan scope, an expected/declared table, a two-way exact baseline, a
+  registry, a structural self-exclusion, a GENERATION skip (a list that skips generating a per-item
+  test has no scan population to spend — give it a check that it is still load-bearing instead, as
+  `deviceToolCoverage`'s routing probe and `liveCoverage`'s `NO_OK_FLAG` test do), or deferred to
+  another lane. A pardon that filters a detector's hits is none of these: put it on the helper.
+
+⚠️ Do not quote a remaining count from a marker that greps for `ALLOW*`/`EXEMPT*` names: migrating a
+guard makes it DISAPPEAR from such a census (measured 43 → 42 → 40 across #1128's two phases, by a
+rename, a deletion and a split), so the number falls for reasons unrelated to progress.
 
 ⚠️ **The marker is the judgement; the helper only makes the comparison honest.** A marker that is
 subtly too narrow re-creates the defect one level down with every test still green. Two ways that

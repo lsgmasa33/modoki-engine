@@ -36,6 +36,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 
 /** The two spellings that throw `rel` away. Built rather than written as one literal so this file
  *  does not trip its own search in a way the self-exclusion below would then have to hide. */
@@ -74,11 +75,15 @@ const SELF = 'engine/tests/architecture/corpusConsumerPins.test.ts';
 /** Consumers that discard `rel` but are NOT guards, so a vacuous run is a no-op rather than a
  *  false green. Migration scripts rewrite files; they assert nothing and vouch for nothing.
  *  ⚠️ This list is for NON-GUARDS only. A guard that "does not need a pin" is the exact reasoning
- *  the two silent instances in #849's mutation matrix were written under. */
-const NOT_A_GUARD = new Set<string>([
-  'engine/scripts/check-prefab-churn.mjs',
-  'engine/scripts/migrate-font-family-refs.mjs',
-]);
+ *  the two silent instances in #849's mutation matrix were written under.
+ *
+ *  Spent through `assertExemptionLedger` since #1140 — it used to be a `Set` filtered out BEFORE
+ *  detection with no staleness check, so a script that gained a pin, stopped discarding `rel`, or
+ *  was deleted kept its row forever. */
+const NOT_A_GUARD: ReadonlyArray<{ item: string; reason: string }> = [
+  { item: 'engine/scripts/check-prefab-churn.mjs', reason: 'a churn report script — it asserts nothing' },
+  { item: 'engine/scripts/migrate-font-family-refs.mjs', reason: 'a one-shot migration — it rewrites files and vouches for nothing' },
+];
 
 describe('#866 corpus consumers that discard rel pin non-vacuity', () => {
   const candidates = repoFiles({
@@ -89,7 +94,7 @@ describe('#866 corpus consumers that discard rel pin non-vacuity', () => {
     match: /.(ts|tsx|mjs)$/,
     floor: 50,
   })
-    .filter(({ rel }) => rel !== SELF && !NOT_A_GUARD.has(rel))
+    .filter(({ rel }) => rel !== SELF)
     .map((row) => ({ rel: row.rel, src: readFileSync(row.abs, 'utf8') }))
     .filter(({ src }) => DISCARDS_REL.some((re) => re.test(src)));
 
@@ -105,18 +110,17 @@ describe('#866 corpus consumers that discard rel pin non-vacuity', () => {
   });
 
   it('every one of them carries a non-vacuity pin', () => {
-    const unpinned = candidates
-      .filter(({ src }) => !PINS.some((re) => re.test(src)))
-      .map(({ rel }) => rel);
-    expect(
-      unpinned,
-      'These files discard git\'s `rel` and rebuild a comparison key from their own root, but '
-      + 'assert nothing about the size of what they scanned — so on Windows, where the two root '
-      + 'derivations can disagree (drive-letter case, a `subst`ed or symlinked checkout, an 8.3 '
-      + 'short path), they pass having matched NOTHING and report green. Add an assertion that the '
-      + 'scanned set — or the allowlist keys it matches against — is non-empty, per '
-      + 'docs/windows.md § Paths. If the file is not a guard at all, add it to NOT_A_GUARD with '
-      + `a reason.\n${unpinned.join('\n')}`,
-    ).toEqual([]);
+    assertExemptionLedger({
+      label: 'NOT_A_GUARD in corpusConsumerPins',
+      population: candidates.filter(({ src }) => !PINS.some((re) => re.test(src))).map(({ rel }) => ({ item: rel, site: rel })),
+      exempt: NOT_A_GUARD,
+      floor: 1,
+      fix: 'These files discard git\'s `rel` and rebuild a comparison key from their own root, but '
+        + 'assert nothing about the size of what they scanned — so on Windows, where the two root '
+        + 'derivations can disagree (drive-letter case, a `subst`ed or symlinked checkout, an 8.3 '
+        + 'short path), they pass having matched NOTHING and report green. Add an assertion that the '
+        + 'scanned set — or the allowlist keys it matches against — is non-empty, per '
+        + 'docs/windows.md § Paths. If the file is not a guard at all, add it to NOT_A_GUARD with a reason.',
+    });
   });
 });

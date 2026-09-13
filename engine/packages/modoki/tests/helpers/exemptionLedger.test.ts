@@ -190,6 +190,40 @@ describe('assertExemptionLedger (#1123)', () => {
     })).toThrow(/floor/);
   });
 
+  describe('`scanned` — a ledger whose population is only offenders, and whose goal is empty (#1140)', () => {
+    const offendersOnly = { label: 'T', fix: 'fix it', floor: 5 };
+
+    it('ACCEPTS the fixed end state: nothing found, nothing pardoned, a scan above the floor', () => {
+      expect(() => assertExemptionLedger({ ...offendersOnly, population: [], exempt: [], scanned: 40 })).not.toThrow();
+    });
+
+    it('REJECTS a scan below the floor, even with offenders present', () => {
+      expect(() => assertExemptionLedger({
+        ...offendersOnly, population: [{ item: 'a', site: 'a' }], exempt: [{ item: 'a', reason: 'r' }], scanned: 4,
+      })).toThrow(/examined 4 item\(s\), below the floor of 5/);
+    });
+
+    it('REJECTS `scanned` smaller than the population — it must count the walked set', () => {
+      expect(() => assertExemptionLedger({
+        ...offendersOnly, floor: 1, population: [{ item: 'a', site: 'a' }, { item: 'b', site: 'b' }], scanned: 1,
+      })).toThrow(/smaller than the population/);
+    });
+
+    it('still spends: over-blessed and unexcused arms run with `scanned` given', () => {
+      expect(() => assertExemptionLedger({
+        ...offendersOnly, population: [], exempt: [{ item: 'gone', reason: 'r' }], scanned: 40,
+      })).toThrow(/blesses 1, found 0/);
+      expect(() => assertExemptionLedger({
+        ...offendersOnly, population: [{ item: 'new', site: 'new.ts' }], exempt: [], scanned: 40,
+      })).toThrow(/pardoned by nothing/);
+    });
+
+    it('without `scanned`, an empty population still fails the floor, and the message offers `scanned`', () => {
+      expect(() => assertExemptionLedger({ ...offendersOnly, floor: 1, population: [], exempt: [{ item: 'x', reason: 'r' }] }))
+        .toThrow(/pass `scanned`/);
+    });
+  });
+
   it('reports the surplus of the RIGHT item when two items both overflow (F8)', () => {
     // The per-item keying of `budget`, asserted directly. Review found the old spare-budget case
     // proved this only by accident: collapsing `budget` into one shared pool reddened a different

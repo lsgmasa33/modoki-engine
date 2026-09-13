@@ -35,6 +35,7 @@
 import { describe, it, expect } from 'vitest';
 import path from 'node:path';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { readScannedSource } from '@modoki/engine/testing';
 
 const PANELS = path.resolve(__dirname, '../../packages/modoki/src/editor/panels');
@@ -54,13 +55,13 @@ function panelFiles(): string[] {
 const read = (rel: string) => readScannedSource(path.join(PANELS, rel)).code;
 
 /** Panels that park a `.meta.json` edit and deliberately render no badge of their own. */
-const EXEMPT: Record<string, string> = {
-  'Inspector.tsx':
+const EXEMPT: ReadonlyArray<{ item: string; reason: string }> = [
+  { item: 'Inspector.tsx', reason:
     'the model-postprocessor row parks `asset.path`, and this same component renders '
     + '<ModelAssetView path={asset.path} …> directly below, which DOES carry the badge for that '
     + 'path. A badge here would put two markers on screen for one edit. This holds because the '
-    + 'badge is keyed on the PATH, not on which control made the edit.',
-};
+    + 'badge is keyed on the PATH, not on which control made the edit.' },
+];
 
 /** `true` if `code` (comment-stripped) CALLS `parkMetaEdit`.
  *
@@ -92,12 +93,17 @@ describe('a parked .meta.json edit is visible in the panel that made it (#870)',
   });
 
   it('every panel that parks a .meta.json edit renders the unsaved badge', () => {
-    const silent = panelFiles()
-      .filter((rel) => !(rel in EXEMPT))
-      .filter((rel) => { const c = read(rel); return parks(c) && !(showsBadge(c) && subscribes(c)); });
-    expect(
-      silent,
-      [
+    // On the shared ledger since #1140. The old staleness pair checked an exemption still PARKED
+    // and named a real file — but not that it was still SILENT, so a panel that gained its own
+    // badge kept a row pardoning nothing. The over-blessed arm covers all three.
+    assertExemptionLedger({
+      label: 'EXEMPT in metaDirtyIndicator',
+      population: panelFiles()
+        .filter((rel) => { const c = read(rel); return parks(c) && !(showsBadge(c) && subscribes(c)); })
+        .map((rel) => ({ item: rel, site: rel })),
+      exempt: EXEMPT,
+      floor: 1,
+      fix: [
         'These panels PARK a .meta.json import-settings edit and show nothing to say it is unsaved.',
         'Since #845 that edit does not reach disk until Cmd+S, so the human who made it gets no',
         'sign it is still pending — and the HMR reload banner, which is the only other surface,',
@@ -106,10 +112,8 @@ describe('a parked .meta.json edit is visible in the panel that made it (#870)',
         'or add an entry to EXEMPT with the reason the human still sees it. BOTH halves are',
         'required: a badge rendered from a constant is dark forever, and a subscription nothing',
         'renders tells the human nothing.',
-        '',
-        ...silent,
       ].join('\n'),
-    ).toEqual([]);
+    });
   });
 
   /** The premise this rule rests on. If nothing parks, the check above is vacuous and would stay
@@ -118,19 +122,6 @@ describe('a parked .meta.json edit is visible in the panel that made it (#870)',
     const parking = panelFiles().filter((rel) => parks(read(rel)));
     expect(parking.length, 'no panel parks a .meta.json edit — has parkMetaEdit been renamed?')
       .toBeGreaterThanOrEqual(8);
-  });
-
-  it('every exemption still parks — a stale exemption hides nothing', () => {
-    const stale = Object.keys(EXEMPT).filter((rel) => !parks(read(rel)));
-    expect(stale, 'These exemptions no longer park a .meta.json edit — drop the entry.').toEqual([]);
-  });
-
-  it('every exemption is a real file this scan enumerates', () => {
-    // A typo'd path exempts nothing while still reading as "handled" — the filter only skips names
-    // that MATCH, so a wrong one protects a file that was never at risk and leaves the real one
-    // unexamined.
-    const known = new Set(panelFiles());
-    expect(Object.keys(EXEMPT).filter((rel) => !known.has(rel))).toEqual([]);
   });
 
   // ⚠️ Both detectors pinned directly. A guard whose detector matches an import rather than a use

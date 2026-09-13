@@ -25,13 +25,20 @@ import { repoFiles } from '../../../../scripts/repoCorpus.mjs';
 
 const RUNTIME = join(fileURLToPath(new URL('.', import.meta.url)), '../../src/runtime');
 
-/** Files permitted to touch the shared KTX2 loader without an in-file `ensureKtx2Caps` call. */
-const ALLOW_UNGATED_KTX2: Set<string> = new Set([
-  // `textureResolver.ts` DEFINES `getKTX2Loader`/`ensureKtx2Caps` — it always contains the
-  // token, but list it explicitly so this allowlist documents every exception rather than
-  // relying on an implicit "well it always matches" accident.
-  'loaders/textureResolver.ts',
-]);
+/* ⚠️ **No allowlist (#1140).** `ALLOW_UNGATED_KTX2` held one row, `loaders/textureResolver.ts`, listed
+ *  "explicitly so this allowlist documents every exception" — but that file DEFINES `ensureKtx2Caps`,
+ *  so the `!ensureKtx2Caps` filter never reported it and the row pardoned nothing. A pardon that can
+ *  never be spent is how a later real exception gets waved through under a reason nobody re-reads;
+ *  the list, and its "stays small" size test, are gone. A genuine exception goes through
+ *  `assertExemptionLedger`, keyed per file and counted. */
+
+/** Does this (comment-stripped) source touch the shared KTX2 loader without gating on
+ *  `ensureKtx2Caps`? Pure, so the synthetic pin below runs the real classifier. */
+function isUngatedKtx2Site(code: string): boolean {
+  return /\bgetKTX2Loader\s*\(/.test(code)
+    && (/\.loadAsync\s*\(/.test(code) || /\bsetKTX2Loader\s*\(/.test(code))
+    && !/\bensureKtx2Caps\b/.test(code);
+}
 
 function tsFiles(dir: string): string[] {
   return repoFiles({
@@ -56,19 +63,19 @@ describe('KTX2-caps guard', () => {
   });
 
   it('every file that touches the shared KTX2 loader also gates on ensureKtx2Caps', () => {
-    const offenders = FILES
-      .filter((f) => /\bgetKTX2Loader\s*\(/.test(f.code))
-      .filter((f) => /\.loadAsync\s*\(/.test(f.code) || /\bsetKTX2Loader\s*\(/.test(f.code))
-      .filter((f) => !/\bensureKtx2Caps\b/.test(f.code))
-      .map((f) => f.rel)
-      .filter((rel) => !ALLOW_UNGATED_KTX2.has(rel));
+    const offenders = FILES.filter((f) => isUngatedKtx2Site(f.code)).map((f) => f.rel);
     expect(
       offenders,
-      `gate this KTX2 load site on ensureKtx2Caps(), or add a reviewed allowlist entry:\n${offenders.join('\n')}`,
+      `gate this KTX2 load site on ensureKtx2Caps():\n${offenders.join('\n')}`,
     ).toEqual([]);
   });
 
-  it('the allowlist itself stays small (review pressure)', () => {
-    expect(ALLOW_UNGATED_KTX2.size).toBeLessThanOrEqual(2);
+  it('the classifier flags an ungated load site and passes a gated one (the clean tree reports zero either way)', () => {
+    const load = 'const l = getKTX2Loader(renderer); await l.loadAsync(url);';
+    const install = 'loader.setKTX2Loader(getKTX2Loader(renderer));';
+    expect(isUngatedKtx2Site(load)).toBe(true);
+    expect(isUngatedKtx2Site(install)).toBe(true);
+    expect(isUngatedKtx2Site(`await ensureKtx2Caps(renderer); ${load}`)).toBe(false);
+    expect(isUngatedKtx2Site('const l = getKTX2Loader(renderer);')).toBe(false); // touches, loads nothing
   });
 });

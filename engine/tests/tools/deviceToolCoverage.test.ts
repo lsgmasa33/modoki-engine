@@ -230,4 +230,51 @@ describe('device tool surface — every tool, table-driven', () => {
       expect(Object.keys(MINIMAL), `${tool} is exempted but not registered`).toContain(tool);
     }
   });
+
+  // ⚠️ **The staleness half the reason-length check could not give (#1140).** An exemption from the
+  // relay loop is a CLAIM about routing, and this file already records one that was false for a year
+  // (`device_native_logs`, above) — nothing re-checked it, so the tool sat outside every assertion.
+  // The claim is now measured: an exempt control-plane tool answers from its own control-plane route,
+  // so it SUCCEEDS with the relay refusing everything, and it reaches the relay only for the ops named
+  // in RELAY_ANNOTATIONS. `device_screenshot` is excluded from THIS probe only because its reason says
+  // it MAY take the adb side channel — it may also use the relay, so either answer is consistent.
+  //
+  // ⚠️ The fixture must be a CONNECTED lease with well-formed control-plane replies (#1140 review).
+  // A bare `{ok:true}` for every path has no `state`, so `device_status` never entered the branch
+  // that calls the relay, and `device_connect`/`device_list` failed parsing before doing anything:
+  // the probe was green on a tool path production never takes. `isError` false is what proves each
+  // tool ran to the end, where a later relay call would have been seen.
+  describe('each control-plane exemption really answers without the lease relay', () => {
+    /** Relay ops a control-plane tool may make as an OPTIONAL annotation whose refusal it tolerates. */
+    const RELAY_ANNOTATIONS: Record<string, string[]> = {
+      device_status: ['app-identity'], // the App/Device lines, omitted when the bridge cannot answer
+    };
+    const lease = { state: 'connected', target: { host: '127.0.0.1', port: 9095 } };
+    // BOTH relay behaviours (#1140 close-out §2d): with the relay refusing, a data-plane call made only
+    // after an annotation SUCCEEDS is never reached — the second review put one in device_status's
+    // success branch and the refusing pass stayed green. The answering pass returns a well-formed
+    // app-identity for every op, so the tool walks its success path to the end.
+    const relays = {
+      refusing: () => deviceReply('Error: the relay refused'),
+      answering: () => deviceReply({ platform: 'android', appId: 'com.example.probe', appName: 'Probe', deviceModel: 'Probe Phone', osVersion: '14' }),
+    };
+    const controlPlane = (relay: () => ReturnType<typeof deviceReply>) => (req: { path: string }) => {
+      if (req.path === '/api/device/status' || req.path === '/api/device/connect') return { body: lease };
+      if (req.path === '/api/device/disconnect') return { body: { state: 'idle' } };
+      if (req.path === '/api/device/list') return { body: { adb: { present: true }, android: [], ios: [], otherClaims: [] } };
+      if (req.path === '/api/device/request') return relay();
+      return undefined;
+    };
+    for (const name of Object.keys(NOT_DATA_PLANE).filter((n) => n !== 'device_screenshot')) for (const [mode, relay] of Object.entries(relays)) {
+      it(`${name} succeeds with the relay ${mode}, reaching it only for its named annotations`, async () => {
+        const s = (surface = await loadDeviceSurface(controlPlane(relay)));
+        const r = await s.call(name, MINIMAL[name] ?? {});
+        expect(r.isError, `${name} failed on a connected lease: ${s.text(r)}`).toBeFalsy();
+        const relayOps = s.real().filter((q) => q.path === '/api/device/request')
+          .map((q) => (q.body as { method?: string } | undefined)?.method);
+        expect(relayOps, `${name} reached the lease relay beyond its annotations — it is data plane, drop the exemption`)
+          .toEqual(RELAY_ANNOTATIONS[name] ?? []);
+      });
+    }
+  });
 });

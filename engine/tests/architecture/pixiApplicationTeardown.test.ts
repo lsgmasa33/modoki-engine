@@ -29,6 +29,7 @@
  *  own prose included — cannot trip it. */
 import { describe, it, expect } from 'vitest';
 import * as path from 'node:path';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { censusRendererSources } from './rendererConstructionCensus';
 
 /** A `destroy` given a bare boolean: `.destroy(true)` / `.destroy(false)`, any whitespace.
@@ -36,27 +37,45 @@ import { censusRendererSources } from './rendererConstructionCensus';
  *  site will spell its variable something else. */
 const BOOLEAN_DESTROY = /\.destroy\s*\(\s*(?:true|false)\s*\)/g;
 
-/** Files whose `.destroy(<boolean>)` calls are a DIFFERENT API with a different parameter —
- *  `Texture.destroy(destroySource)`, `Geometry.destroy(destroyBuffers)`, `Shader.destroy(...)`,
- *  `Container.destroy(options)`. Only `Application.destroy`'s first argument reaches
- *  `AbstractRenderer.destroy`, so those are not this defect and must not be swept in.
+/** Boolean destroys that are a DIFFERENT API with a different parameter — `Texture.destroy
+ *  (destroySource)`, `Geometry.destroy(destroyBuffers)`. Only `Application.destroy`'s first
+ *  argument reaches `AbstractRenderer.destroy`, so those are not this defect.
  *
- *  ⚠️ Listed by FILE, so this allowlist is honest about being coarse: it says "this file's boolean
- *  destroys were read and are not Applications", not "any boolean destroy here is fine". A file
- *  that later gains an `Application` needs re-reading — which the Application census below is what
- *  actually forces. */
-const NON_APPLICATION_DESTROY_FILES = new Set([
-  'packages/modoki/src/runtime/rendering/Scene2D.tsx',            // Texture / Geometry / Shader
-  'packages/modoki/src/runtime/rendering/videoTextureSync2D.ts',  // Texture
-  'packages/modoki/src/runtime/rendering/text/fontTexturePixi.ts',// Texture
-  'packages/modoki/src/runtime/particles/pixiParticleObject.ts',  // Texture
-]);
+ *  ⚠️ **Keyed by `file::receiver.destroy(arg)` and SPENT, not by file (#1140).** This was a
+ *  `Set<file>` that skipped every hit in the file, so an `app.destroy(true)` written into
+ *  `Scene2D.tsx` — a file that holds a Pixi surface's whole render loop — was invisible to the guard
+ *  whose subject it is. Each row below is one call site that was read; a second `tex.destroy(false)`
+ *  needs its row's `count` raised and a sentence saying what that receiver is.
+ *
+ *  ⚠️ `ShaderPreview.tsx` was once a file row here while holding zero boolean destroys — excusing
+ *  the one EDITOR file that constructs an `Application`. The ledger's over-blessed arm now reports
+ *  that shape instead of relying on somebody measuring it. */
+const NON_APPLICATION_DESTROYS: ReadonlyArray<{ item: string; count?: number; reason: string }> = [
+  { item: 'packages/modoki/src/runtime/rendering/Scene2D.tsx::g.destroy(true)',
+    reason: '`releaseGeometry(g: Geometry)` — `destroyBuffers`, not an Application' },
+  { item: 'packages/modoki/src/runtime/rendering/Scene2D.tsx::tex.destroy(false)', count: 2,
+    reason: 'Texture wrappers over a kept source — `destroySource: false`' },
+  { item: 'packages/modoki/src/runtime/rendering/Scene2D.tsx::p.tex.destroy(true)',
+    reason: '`flushPendingMaskDestroy` — the mask RenderTexture queued in `pendingMaskDestroy` (#455)' },
+  { item: 'packages/modoki/src/runtime/rendering/Scene2D.tsx::oldTex.destroy(false)', count: 2,
+    reason: 'a replaced Texture wrapper whose source is still referenced — `destroySource: false`' },
+  { item: 'packages/modoki/src/runtime/rendering/videoTextureSync2D.ts::tex.destroy(true)', count: 2,
+    reason: 'the `pendingDestroy` queue of video Textures — their VideoSource is this module\'s alone' },
+  { item: 'packages/modoki/src/runtime/rendering/videoTextureSync2D.ts::b.texture.destroy(true)',
+    reason: '`disposeVideoTextures2D` — the same per-binding video Texture' },
+  { item: 'packages/modoki/src/runtime/rendering/text/fontTexturePixi.ts::created.destroy(true)',
+    reason: 'the atlas Texture this module constructed over its own CanvasSource' },
+  { item: 'packages/modoki/src/runtime/rendering/text/fontTexturePixi.ts::tex.destroy(true)',
+    reason: 'a cached atlas Texture dropped when its font is invalidated (re-bake / axis flip)' },
+  { item: 'packages/modoki/src/runtime/particles/pixiParticleObject.ts::f.destroy(false)',
+    reason: 'per-frame sub-Texture wrappers; the shared source belongs to the Assets cache' },
+];
 
-// ⚠️ **`ShaderPreview.tsx` was on this list and has been REMOVED.** It contains zero
-// `.destroy(<boolean>)` calls (measured), so the entry protected nothing — while excusing the one
-// EDITOR file that constructs a Pixi `Application`, i.e. the third live surface this whole guard
-// exists for. Adding a file here because it "probably has Texture destroys" is how a guard loses
-// its subject; every entry above was counted first.
+/** The receiver text before `.destroy` — the thing that tells two boolean destroys in one file
+ *  apart. Anchored at the END of the text preceding the match, so `p.tex` is taken whole. */
+function destroyReceiver(before: string): string {
+  return /([\w$]+(?:\??\.[\w$]+)*\??)\s*$/.exec(before)?.[1] ?? '?';
+}
 
 const rel = (file: string) => path.relative(path.resolve(__dirname, '../..'), file).replace(/\\/g, '/');
 
@@ -91,16 +110,26 @@ describe('Pixi Application teardown (#1000)', () => {
   });
 
   it('no Application is destroyed with the boolean form anywhere in the census', () => {
-    const offenders: string[] = [];
+    const population: Array<{ item: string; site: string }> = [];
     for (const { file, stripped } of censusRendererSources()) {
       const r = rel(file);
-      if (NON_APPLICATION_DESTROY_FILES.has(r)) continue;
-      const hits = stripped.match(BOOLEAN_DESTROY);
-      if (hits) offenders.push(`${r}: ${hits.join(', ')}`);
+      for (const m of stripped.matchAll(BOOLEAN_DESTROY)) {
+        const call = m[0].replace(/^\.destroy\s*\(\s*/, '.destroy(').replace(/\s*\)$/, ')');
+        population.push({
+          item: `${r}::${destroyReceiver(stripped.slice(0, m.index))}${call}`,
+          site: `${r}:${stripped.slice(0, m.index).split('\n').length}`,
+        });
+      }
     }
 
-    expect(offenders, 'destroy(true) sweeps Pixi\'s process-global pools for EVERY live surface; '
-      + 'destroy(false) is the same call with the sweep off, and neither says which it meant. Pass '
-      + 'an options object through destroyPixiApplication instead').toEqual([]);
+    assertExemptionLedger({
+      label: 'NON_APPLICATION_DESTROYS in pixiApplicationTeardown',
+      population,
+      exempt: NON_APPLICATION_DESTROYS,
+      floor: 1,
+      fix: 'destroy(true) sweeps Pixi\'s process-global pools for EVERY live surface; destroy(false) '
+        + 'is the same call with the sweep off, and neither says which it meant. Pass an options '
+        + 'object through destroyPixiApplication instead',
+    });
   });
 });

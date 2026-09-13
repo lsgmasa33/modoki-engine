@@ -21,6 +21,8 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import * as os from 'node:os';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { hasPrivateDocs } from '../helpers/repoLayout';
 
@@ -63,89 +65,126 @@ function projects(): string[] {
 
 /* ------------------------------------------------------------------ Rule 1 */
 
-/** Filenames that are ABSENT BY DESIGN in some checkouts, so their absence proves nothing.
- *
- *  This exists because the rule ran green here and red in the OSS snapshot: `project.user.json`
- *  is gitignored (it holds per-machine signing + device values), so it is present on a machine
- *  that has built to hardware and missing everywhere else — including CI and the public snapshot.
- *  A doc that mentions it is documenting a real file the reader is expected to create. Keying the
- *  rule on "is it on disk right now" therefore asks a question whose answer depends on the
- *  checkout, which is the one thing a guard must never do. */
-const ABSENT_BY_DESIGN = new Set([
-  'project.user.json',   // gitignored per-machine config (signing, device ids)
-  'project.config.json', // present in every project, but named generically in prose too
-]);
+/** Lookbehind excludes a leading `.`/`-`/`/`, so a generic extension written in prose
+ *  (`.mat.json`, `.scene.json`, `.mcp.json`) is not mistaken for a filename. Without it the
+ *  rule reports every doc that merely explains the asset naming convention. */
+const CITED_JSON = /(?<![A-Za-z0-9_.\-/])[A-Za-z0-9_][A-Za-z0-9_.-]*\.json(?![A-Za-z0-9])/g;
 
-/** `.json` filenames a project's doc names on purpose despite their absence. Scoped to the
- *  project, because "this file is gone" is a fact about one doc's sentence, not about the name. */
-const ABSENT_ON_PURPOSE: ReadonlyArray<{ project: string; file: string; reason: string }> = [
-  {
-    project: 'demos/forest-camp',
-    file: 'bow.prefab.json',
-    reason: 'named in the write-up of what was DELETED when the baked bow replaced the prefab one',
-  },
-  {
-    project: 'demos/forest-camp',
-    file: 'White.mat.json',
-    reason: 'same sentence — the unique material deleted with the bow prefab',
-  },
-  {
-    project: 'games/sling',
-    file: 'Lvl-000N.json',
-    reason: 'a filename PATTERN standing for the level series, not a file',
-  },
-];
+/** Is `<project>/<name>` a path the REPO's tracked `.gitignore` rules ignore?
+ *
+ *  ⚠️ **Asked with `-v`, filtered to a `.gitignore` source, and that source must be TRACKED (#1140
+ *  close-out review, twice).** `check-ignore --no-index` honours every rule it can find: machine-local
+ *  `.git/info/exclude` and `core.excludesFile`, and ANY `.gitignore` on disk — including one a
+ *  developer created and never committed. Each of those lets a doc citing a missing file pass on
+ *  one machine and fail on every other, a fail-open that depends on the checkout. `-v` names the
+ *  deciding pattern's source; a `!negation` match means NOT ignored (and still exits 0 under `-v`). */
+function isGitIgnored(
+  project: string,
+  name: string,
+  isTracked: (source: string) => boolean = isTrackedInRepo,
+  cwd: string = repoRoot,
+): boolean {
+  const r = spawnSync('git', ['check-ignore', '-v', '--no-index', '--', `${project}/${name}`], {
+    cwd, encoding: 'utf8',
+  });
+  if (r.status === 1) return false;
+  if (r.status !== 0) {
+    throw new Error(`git check-ignore failed for ${project}/${name}: status=${r.status} ${r.stderr ?? ''}`);
+  }
+  const source = gitignoreSourceOf(r.stdout);
+  return source !== null && isTracked(source);
+}
+
+/** The repo's TRACKED `.gitignore` files, through the shared corpus producer (never a raw
+ *  `git ls-files` — `corpusProducerIsShared`). Tracked only: an uncommitted `.gitignore` is exactly
+ *  the checkout-dependent source `isGitIgnored` must not trust. Lazy, since most citations are
+ *  present and never ask. */
+let trackedGitignores: Set<string> | undefined;
+function isTrackedInRepo(source: string): boolean {
+  trackedGitignores ??= new Set(
+    repoFiles({ match: (rel: string) => path.posix.basename(rel) === '.gitignore', includeUntracked: false, floor: 1 })
+      .map((f: { rel: string }) => f.rel),
+  );
+  return trackedGitignores.has(source.split(path.sep).join('/'));
+}
+
+/** `git check-ignore -v` output → the repo-relative `.gitignore` whose (non-negated) pattern ignored
+ *  the path, or null for a machine-local source, an absolute path, or a negation. Line shape:
+ *  `<source>:<line>:<pattern>\t<path>`. Pure, so the synthetic pin runs it; tracked-ness is asked
+ *  separately by the caller. */
+function gitignoreSourceOf(stdout: string): string | null {
+  const m = /^(.*?):\d+:(.*?)\t/.exec(stdout.trim());
+  if (!m) return null;
+  const [, source, pattern] = m;
+  if (pattern.startsWith('!')) return null;
+  return !path.isAbsolute(source) && path.basename(source) === '.gitignore' ? source : null;
+}
+
+/** Rule 1's classifier over one doc's lines: every cited `.json` name that is neither present in
+ *  the project nor a path git ignores, with the lines naming it. Pure over its inputs so the
+ *  synthetic pin below runs the real thing.
+ *
+ *  ⚠️ **"Ignored" replaced two hand-kept lists (#1140), and both were measured first.**
+ *  - `ABSENT_BY_DESIGN` pardoned two NAMES repo-wide with no staleness check. `project.config.json`
+ *    pardoned nothing (every project has one). `project.user.json` pardoned 8 docs, for a reason
+ *    that is exactly a property git already records: it is gitignored, so the enumeration below —
+ *    which excludes ignored files ON PURPOSE (a stray build copy must not vouch for a citation) —
+ *    can never see it on any machine. Asking git answers that for every per-machine file at once,
+ *    rather than for the one somebody remembered to list.
+ *  - `ABSENT_ON_PURPOSE` checked each row's file was still absent but never that it was still
+ *    CITED — and all three rows (forest-camp's `bow.prefab.json` / `White.mat.json`, sling's
+ *    `Lvl-000N.json`) pardoned nothing. A doc naming a file to say it is GONE should write it so
+ *    it does not read as a live filename; there is no pardon to reach for. */
+function citedJsonOffenders(
+  lines: readonly string[],
+  basenames: readonly string[],
+  isIgnored: (name: string) => boolean,
+): Map<string, number[]> {
+  const present = new Set(basenames);
+  // A filename may contain a SPACE (`2D Animation.scene.json`), which the token regex cannot
+  // span without swallowing prose. Handle it by BLANKING every real space-containing name out
+  // of the line before tokenizing, so what remains is only text the doc did not spell
+  // correctly.
+  //
+  // ⚠️ The obvious alternative — accept a token that is the TAIL of a real name — is what this
+  // replaced, and it silently defeated the rule: `Animation.scene.json` is a tail of
+  // `2D Animation.scene.json`, so a citation naming a file that does not exist passed clean
+  // (measured: 6/6 green with a fabricated `Animation.scene.json` in 3d-test's doc). The
+  // relaxation meant to accommodate one file created a false negative on exactly that file.
+  // Blanking asks the right question — "did the doc write the real name?" — instead of the
+  // weaker "does the doc's text resemble part of one?".
+  const spacedNames = basenames.filter((b) => b.includes(' '));
+  const blankSpacedNames = (line: string) => spacedNames.reduce(
+    (acc, name) => acc.split(name).join(' '),
+    line,
+  );
+  const seen = new Map<string, number[]>();
+  const ignored = new Map<string, boolean>();
+  lines.forEach((rawLine, i) => {
+    for (const m of blankSpacedNames(rawLine).match(CITED_JSON) ?? []) {
+      if (present.has(m)) continue;
+      if (!ignored.has(m)) ignored.set(m, isIgnored(m));
+      if (ignored.get(m)) continue;
+      if (!seen.has(m)) seen.set(m, []);
+      seen.get(m)!.push(i + 1);
+    }
+  });
+  return seen;
+}
 
 describe('project CLAUDE.md cites asset filenames that exist (#195)', () => {
   it('every .json filename named in a project CLAUDE.md exists in that project', () => {
-    // Lookbehind excludes a leading `.`/`-`/`/`, so a generic extension written in prose
-    // (`.mat.json`, `.scene.json`, `.mcp.json`) is not mistaken for a filename. Without it the
-    // rule reports every doc that merely explains the asset naming convention.
-    const RE = /(?<![A-Za-z0-9_.\-/])[A-Za-z0-9_][A-Za-z0-9_.-]*\.json(?![A-Za-z0-9])/g;
-
     const offenders: string[] = [];
     for (const project of projects()) {
-      const exempt = new Set(
-        ABSENT_ON_PURPOSE.filter((e) => e.project === project).map((e) => e.file),
-      );
       const basenames = gitFilesUnder(project).map((f) => path.basename(f));
       // Vacuous-pass floor, per the same reasoning ba6aae93 added to docCitations: this rule
       // reports an offender only when a cited name is MISSING from `basenames`, so an enumeration
-      // that returned nothing would make every citation look absent — or, with the exemptions in
-      // front of it, could equally make the whole loop no-op. Either way a broken `git ls-files`
+      // that returned nothing would make every citation look absent. A broken `git ls-files`
       // (wrong cwd, a flag that stops matching) must fail loudly rather than report green. Every
       // project has at least a CLAUDE.md and a project.config.json.
       expect(basenames.length, `${project}: git enumeration returned no files`).toBeGreaterThan(1);
-      const present = new Set(basenames);
-      // A filename may contain a SPACE (`2D Animation.scene.json`), which the token regex cannot
-      // span without swallowing prose. Handle it by BLANKING every real space-containing name out
-      // of the line before tokenizing, so what remains is only text the doc did not spell
-      // correctly.
-      //
-      // ⚠️ The obvious alternative — accept a token that is the TAIL of a real name — is what this
-      // replaced, and it silently defeated the rule: `Animation.scene.json` is a tail of
-      // `2D Animation.scene.json`, so a citation naming a file that does not exist passed clean
-      // (measured: 6/6 green with a fabricated `Animation.scene.json` in 3d-test's doc). The
-      // relaxation meant to accommodate one file created a false negative on exactly that file.
-      // Blanking asks the right question — "did the doc write the real name?" — instead of the
-      // weaker "does the doc's text resemble part of one?".
-      const spacedNames = basenames.filter((b) => b.includes(' '));
-      const blankSpacedNames = (line: string) => spacedNames.reduce(
-        (acc, name) => acc.split(name).join(' '),
-        line,
-      );
-      const doc = path.join(repoRoot, project, 'CLAUDE.md');
-      const lines = fs.readFileSync(doc, 'utf8').split(/\r?\n/);
-      const seen = new Map<string, number[]>();
-      lines.forEach((rawLine, i) => {
-        const line = blankSpacedNames(rawLine);
-        for (const m of line.match(RE) ?? []) {
-          if (present.has(m) || exempt.has(m)) continue;
-          if (ABSENT_BY_DESIGN.has(m)) continue;
-          if (!seen.has(m)) seen.set(m, []);
-          seen.get(m)!.push(i + 1);
-        }
-      });
+      const lines = fs.readFileSync(path.join(repoRoot, project, 'CLAUDE.md'), 'utf8').split(/\r?\n/);
+      const seen = citedJsonOffenders(lines, basenames, (name) => isGitIgnored(project, name));
       for (const [name, at] of [...seen.entries()].sort()) {
         offenders.push(`${project}/CLAUDE.md — "${name}" (lines ${at.join(', ')})`);
       }
@@ -156,16 +195,63 @@ describe('project CLAUDE.md cites asset filenames that exist (#195)', () => {
       'a project CLAUDE.md names a .json file that does not exist in that project. The usual cause '
         + 'is a scene written without its `.scene` infix (`main.json` for `main.scene.json`) — which '
         + 'reads fine but hands an agent a path modoki_load_scene cannot open. If the file is named '
-        + 'to say it is GONE, add it to ABSENT_ON_PURPOSE with a reason.',
+        + 'to say it is GONE, write it so it does not read as a live filename (no pardon list).',
     ).toEqual([]);
   });
 
-  it('every ABSENT_ON_PURPOSE entry names a file that is still absent', () => {
-    const stale = ABSENT_ON_PURPOSE.filter((e) => {
-      const present = new Set(gitFilesUnder(e.project).map((f) => path.basename(f)));
-      return present.has(e.file);
-    }).map((e) => `${e.project}: ${e.file} — now exists; drop this entry (${e.reason})`);
-    expect(stale, 'ABSENT_ON_PURPOSE has entries that are no longer needed').toEqual([]);
+  it('the classifier flags a missing name, and passes present, spaced and gitignored ones', () => {
+    // The clean tree has no offenders, so it cannot tell a working classifier from a dead one.
+    const lines = [
+      'Open main.json first.',                        // missing — the .scene infix dropped
+      'Then main.scene.json and 2D Animation.scene.json.',
+      'A fabricated Animation.scene.json tail.',      // missing — tail of a spaced name
+      'Signing lives in project.user.json.',          // gitignored
+      'The .mat.json convention is prose.',           // generic extension, not a name
+    ];
+    const basenames = ['main.scene.json', '2D Animation.scene.json', 'CLAUDE.md'];
+    const seen = citedJsonOffenders(lines, basenames, (n) => n === 'project.user.json');
+    expect([...seen.entries()].sort()).toEqual([['Animation.scene.json', [3]], ['main.json', [1]]]);
+  });
+
+  it('asks git, and git really ignores the per-machine file (the premise of the classifier)', () => {
+    // A hypothetical project path on purpose: `--no-index` answers from the tracked ignore rules
+    // alone, so the premise holds on every checkout — including one that ships no project at all,
+    // which is why this needs no presence gate.
+    expect(isGitIgnored('games/any-project', 'project.user.json')).toBe(true);
+    expect(isGitIgnored('games/any-project', 'CLAUDE.md')).toBe(false);
+  });
+
+  it('only a repo .gitignore counts — a machine-local exclude, an absolute path or a negation does not', () => {
+    expect(gitignoreSourceOf('.gitignore:152:project.user.json\tgames/x/project.user.json\n')).toBe('.gitignore');
+    expect(gitignoreSourceOf('games/x/.gitignore:3:*.local.json\tgames/x/a.local.json\n')).toBe('games/x/.gitignore');
+    expect(gitignoreSourceOf('.git/info/exclude:7:main.json\tgames/x/main.json\n')).toBeNull();
+    expect(gitignoreSourceOf('/Users/me/.config/git/ignore:1:main.json\tgames/x/main.json\n')).toBeNull();
+    // `core.excludesFile=~/.gitignore` — git expands it, so basename alone would accept it.
+    expect(gitignoreSourceOf('/Users/me/.gitignore:1:main.json\tgames/x/main.json\n')).toBeNull();
+    expect(gitignoreSourceOf('.gitignore:9:!keep.json\tgames/x/keep.json\n')).toBeNull();
+  });
+
+  it('an UNTRACKED .gitignore pardons nothing, and the same file once tracked does', () => {
+    // A throwaway repo, never the real tree: a directory written under games/ mid-suite would be
+    // seen by every concurrent corpus scan and by a live editor watching the project roots.
+    // Tracked-ness is injected (the real one reads the repo's corpus), so both sides are driven
+    // through the same check-ignore call and source filter production uses.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'projectdocs-ignore-'));
+    try {
+      spawnSync('git', ['init', '-q'], { cwd: dir, encoding: 'utf8' });
+      fs.mkdirSync(path.join(dir, 'games', 'p'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'games', 'p', '.gitignore'), 'phantom.json\n');
+      const none = new Set<string>();
+      const tracked = new Set(['games/p/.gitignore']);
+      expect(isGitIgnored('games/p', 'phantom.json', (s) => none.has(s), dir), 'untracked').toBe(false);
+      expect(isGitIgnored('games/p', 'phantom.json', (s) => tracked.has(s), dir), 'tracked').toBe(true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('the real tracked set holds the root .gitignore (the premise the per-machine file rests on)', () => {
+    expect(isTrackedInRepo('.gitignore')).toBe(true);
   });
 });
 

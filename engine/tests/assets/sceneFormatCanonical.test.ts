@@ -58,20 +58,15 @@ function sceneFiles(): string[] {
   return out;
 }
 
-/** Scenes knowingly left on the legacy shape, each with the reason and the issue tracking it.
- *  Two-way, like `authoredAssetRefs.test.ts`'s BASELINE: a NEW legacy scene fails, and an entry
- *  that stops firing also fails (so the list cannot outlive the exceptions it documents). */
-const BASELINE: { file: string; why: string }[] = [
-  // EMPTY, and that is the two-way check working rather than a list nobody maintained.
-  // `games/chess/…/chess.scene.json` sat here because save-all baked its ~70 runtime-spawned
-  // entities into the file (#124) — but #124 is CLOSED: an entity spawned from inside a system
-  // tick is tagged `Transient` at the spawn site and never serialized, and chess's projection
-  // opts into `pauseWhileStopped` so a stopped-mode system cannot rewrite authored state either.
-  // The scene was re-saved in #268 and measured across the round trip: 83 entities before, 83
-  // after, none added or removed, `version` 9 -> 12 the only content change. So the exemption had
-  // outlived its exception, and this test said so — which is the whole point of failing on an
-  // entry that stops firing.
-];
+/* ⚠️ **No BASELINE list (#1140).** It was EMPTY since `games/chess/…/chess.scene.json` left it: that
+ *  scene sat here because save-all baked its ~70 runtime-spawned entities into the file (#124), and
+ *  #124 is CLOSED — an entity spawned from inside a system tick is tagged `Transient` at the spawn
+ *  site and never serialized, and chess's projection opts into `pauseWhileStopped`. It was re-saved
+ *  in #268 (83 entities before and after, `version` 9 -> 12 the only change), and the list's two-way
+ *  check is what said the exemption had outlived its exception. An empty list's first row would
+ *  pardon a whole scene; a scene that genuinely must stay legacy goes through
+ *  `assertExemptionLedger`. With a clean-tree population of zero, `legacyMarkersOf` is pinned on
+ *  synthetic data below. */
 
 /** The markers the current serializer never writes.
  *
@@ -82,7 +77,10 @@ const BASELINE: { file: string; why: string }[] = [
  *  two `"isVisible": true` / `"isActive": true` occurrences inside one such subtree, plus a
  *  surviving `"material": ""`. Scanning text flagged a migrated scene as legacy. */
 function legacyMarkers(file: string): string[] {
-  const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+  return legacyMarkersOf(JSON.parse(fs.readFileSync(file, 'utf8')));
+}
+
+function legacyMarkersOf(data: { entities?: Array<Record<string, unknown>> }): string[] {
   const found: string[] = [];
   const entities: Array<Record<string, unknown>> = data.entities ?? [];
   // v11→v12 stopped writing the per-entity ecs id entirely.
@@ -110,10 +108,8 @@ describe.skipIf(!hasGames)('committed scenes stay in the current serializer shap
     expect(sceneFiles().length).toBeGreaterThan(0);
   });
 
-  it('no scene carries the legacy shape, except the documented baseline', () => {
-    const baselined = new Set(BASELINE.map((b) => b.file));
+  it('no scene carries the legacy shape', () => {
     const offenders = sceneFiles()
-      .filter((f) => !baselined.has(rel(f)))
       .map((f) => ({ file: rel(f), markers: legacyMarkers(f) }))
       .filter((r) => r.markers.length)
       .map((r) => `${r.file} → ${r.markers.join('; ')}`);
@@ -167,19 +163,15 @@ describe.skipIf(!hasGames)('committed scenes stay in the current serializer shap
         + 'step (runtime/core/version.ts + loadSceneFile.ts), or correct the file.',
     ).toEqual([]);
   });
+});
 
-  it('every BASELINE entry still fires (no stale exemptions)', () => {
-    const stale = BASELINE
-      .filter((b) => {
-        const abs = path.join(REPO, b.file);
-        return !fs.existsSync(abs) || legacyMarkers(abs).length === 0;
-      })
-      .map((b) => b.file);
-    expect(
-      stale,
-      'These scenes are baselined as knowingly-legacy but no longer are — either they were '
-        + 'migrated (good: delete the entry, and close the issue it cites) or the file moved. A '
-        + 'baseline that outlives its exceptions silently re-permits them.',
-    ).toEqual([]);
+// Outside the games gate on purpose: the classifier needs no scenes, and inside `skipIf(!hasGames)` the
+// public snapshot would run nothing proving it still works.
+describe('legacyMarkersOf', () => {
+  it('the markers fire on each legacy shape and stay quiet on a canonical one (a clean tree reports zero either way)', () => {
+    expect(legacyMarkersOf({ entities: [{ id: 3, traits: {} }] })).toHaveLength(1);
+    expect(legacyMarkersOf({ entities: [{ traits: { Transform: { isActive: true } } }] })).toHaveLength(1);
+    expect(legacyMarkersOf({ entities: [{ traits: { Renderable: { isVisible: true } } }] })).toHaveLength(1);
+    expect(legacyMarkersOf({ entities: [{ guid: 'g', traits: { Renderable: { isVisible: false } } }] })).toEqual([]);
   });
 });

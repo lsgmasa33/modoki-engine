@@ -3,6 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import realFs from 'node:fs';
 import { readScannedSource } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import {
   resolveUserDataDir,
   resolveToolchainDir,
@@ -453,19 +454,31 @@ describe('main.ts must fix userData before anything reads it', () => {
    *  zoom's is the `--user-data-dir` fallback) — but do not read this guard as covering the
    *  whole class, because its docblock used to imply that. (#1036 §2d review F3.) */
   it('getPath("userData") appears ONLY at sanctioned sites — editor-level files use editorStateDir()', () => {
-    const allowed: [RegExp, string][] = [
-      [/function editorStateDir\(\)/, 'the accessor itself — its fallback when --user-data-dir was passed'],
-      [/'vite-cache'/, "per-PROJECT dep-optimizer cache — correctly scoped to the project profile"],
-      [/'\.vite-cache-build'/, 'the signature file pairing with vite-cache, same scope'],
-      [/mkdirSync\(app\.getPath\('userData'\)/, 'creating that same vite-cache parent'],
+    // ⚠️ **SPENT per LINE, keyed by the line's code (#1140).** These were four regexes tested with
+    // `.some()` and no staleness check, so `/'vite-cache'/` pardoned every line in main.ts that
+    // mentions the cache dir AND reads userData — a second consumer spelled near it inherited the
+    // reason — and a site that moved to editorStateDir() left its regex pardoning nothing, silently.
+    // Keyed on the comment-stripped, trimmed line: a reformat reddens and asks for the row to be
+    // re-read, which is the point.
+    const allowed: ReadonlyArray<{ item: string; count?: number; reason: string }> = [
+      { item: "function editorStateDir(): string { return profileBaseDir ?? app.getPath('userData'); }",
+        reason: 'the accessor itself — its fallback when --user-data-dir was passed' },
+      { item: "const cacheDir = path.join(app.getPath('userData'), 'vite-cache');",
+        reason: 'per-PROJECT dep-optimizer cache — correctly scoped to the project profile' },
+      { item: "const sigFile = path.join(app.getPath('userData'), '.vite-cache-build');",
+        reason: 'the signature file pairing with vite-cache, same scope' },
+      { item: "fs.mkdirSync(app.getPath('userData'), { recursive: true });",
+        reason: 'creating that same vite-cache parent' },
     ];
-    const offenders = src.split('\n')
-      .map((line, i) => ({ line: line.trim(), n: i + 1 }))
-      .filter((x) => /getPath\(\s*'userData'\s*\)/.test(x.line))
-      .filter((x) => !allowed.some(([re]) => re.test(x.line)))
-      .map((x) => `main.ts:${x.n}  ${x.line}`);
-    expect(offenders, 'a new userData consumer: use editorStateDir(), or allowlist it with a reason')
-      .toEqual([]);
+    assertExemptionLedger({
+      label: 'allowed userData consumers in main.ts',
+      population: src.split('\n')
+        .map((line, i) => ({ item: line.trim(), site: `main.ts:${i + 1}  ${line.trim()}` }))
+        .filter((x) => /getPath\(\s*'userData'\s*\)/.test(x.item)),
+      exempt: allowed,
+      floor: 1,
+      fix: 'a new userData consumer: use editorStateDir(), or add its line to `allowed` with a reason',
+    });
   });
 
   /** ⚠️ The subKey-less `base` is what makes `editorStateDir()` and `setUiPrefsDir()` mean

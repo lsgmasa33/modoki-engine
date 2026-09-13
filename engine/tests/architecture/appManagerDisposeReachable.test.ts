@@ -349,9 +349,16 @@ function countScannerAccountedRefs(src: string): number {
  *  Verified by reading each file at the time this census was added (#517 follow-up 2) — every entry
  *  below is a plain type-signature usage (a function accepting/returning `ManagerDef`, or an
  *  `interface X extends ManagerDef` that is a type-only re-export whose actual class declares
- *  `implements ManagerDef` directly and IS caught by the class scanner). */
-const NOT_A_MANAGER_DECLARATION: Record<string, { count: number; reason: string }> = {
-  'engine/packages/modoki/src/runtime/managers/managerRegistry.ts': {
+ *  `implements ManagerDef` directly and IS caught by the class scanner).
+ *
+ *  ⚠️ **Spent through `assertExemptionLedger` since #1140, and that closed a real staleness hole.**
+ *  The hand-rolled comparison `continue`d past any file with ZERO census references, so a row whose
+ *  file lost every reference — deleted, renamed, or refactored — was never checked and stayed
+ *  pardoning `count` references for whatever reappeared at that path. The detector counts rather
+ *  than names references, so the item is the bare file (the documented fallback). */
+const NOT_A_MANAGER_DECLARATION: ReadonlyArray<{ item: string; count: number; reason: string }> = [
+  {
+    item: 'engine/packages/modoki/src/runtime/managers/managerRegistry.ts',
     count: 5,
     reason:
       "the registry's own type signatures — `Entry.def`, `sceneMatches`/`gameMatches`/" +
@@ -365,22 +372,26 @@ const NOT_A_MANAGER_DECLARATION: Record<string, { count: number; reason: string 
       // hazard, not a one-off: it freezes a MEASUREMENT of code another branch is free to change.
       'ADDING to this count needs the same scrutiny as adding a file — say which reference and why.',
   },
-  'engine/packages/modoki/src/runtime/zones/zoneEventBus.ts': {
+  {
+    item: 'engine/packages/modoki/src/runtime/zones/zoneEventBus.ts',
     count: 1,
     reason:
       "`createZoneEventBus`'s return-type annotation (`{ events: ZoneEventBus; manager: ManagerDef }`) " +
       "— the actual declaration is the `const manager: ManagerDef = {` a few lines below, which the " +
       'object-literal scanner already accounts for.',
   },
-  'engine/packages/modoki/src/runtime/physics/physicsEventBus.ts': {
+  {
+    item: 'engine/packages/modoki/src/runtime/physics/physicsEventBus.ts',
     count: 1,
     reason: "`createPhysicsEventBus`'s return-type annotation — same shape as zoneEventBus.ts.",
   },
-  'engine/packages/modoki/src/runtime/timeline/timelineEventBus.ts': {
+  {
+    item: 'engine/packages/modoki/src/runtime/timeline/timelineEventBus.ts',
     count: 1,
     reason: "`createTimelineEventBus`'s return-type annotation — same shape as zoneEventBus.ts.",
   },
-  'engine/packages/modoki/src/runtime/managers/TimeManager.ts': {
+  {
+    item: 'engine/packages/modoki/src/runtime/managers/TimeManager.ts',
     count: 1,
     reason:
       "`export interface TimeManager extends ManagerDef` is a type-only re-export for callers that " +
@@ -389,40 +400,43 @@ const NOT_A_MANAGER_DECLARATION: Record<string, { count: number; reason: string 
       'shape the reviewer flagged as the likely next miss (#517 follow-up) — verified NOT a second, ' +
       'independent manager declaration.',
   },
-  'engine/packages/modoki/src/runtime/managers/NavigationManager.ts': {
+  {
+    item: 'engine/packages/modoki/src/runtime/managers/NavigationManager.ts',
     count: 1,
     reason: '`export interface NavigationManager extends ManagerDef` — same shape as TimeManager.ts.',
   },
-};
+];
 
 describe('every ManagerDef textual reference is accounted for (#517 follow-up 2 — census backstop)', () => {
   it('every ManagerDef reference in runtime/** is either a recognized declaration or a verified non-declaration', () => {
-    const mismatches: string[] = [];
+    const population: Array<{ item: string; site: string }> = [];
+    const overAccounted: string[] = [];
     for (const file of listRuntimeFiles(RUNTIME_DIR)) {
       const rel = path.relative(REPO, file).split(path.sep).join('/');
       const src = stripComments(fs.readFileSync(file, 'utf8'));
       const total = countCensusRefs(src);
       if (total === 0) continue;
-      const accounted = countScannerAccountedRefs(src);
-      const allowed = NOT_A_MANAGER_DECLARATION[rel]?.count ?? 0;
-      const unexplained = total - accounted - allowed;
-      if (unexplained !== 0) {
-        mismatches.push(
-          `${rel}: ${total} textual ManagerDef reference(s), ${accounted} recognized as a ` +
-            `declaration, ${allowed} allowlisted — ${unexplained > 0 ? unexplained : -unexplained} ` +
-            `${unexplained > 0 ? 'UNEXPLAINED' : 'MISSING (allowlist count is now too high — tighten it)'}.`,
-        );
+      const unaccounted = total - countScannerAccountedRefs(src);
+      // A scanner crediting MORE declarations than there are references is a scanner bug, not an
+      // allowlist question — report it on its own rather than letting it cancel an unexplained ref.
+      if (unaccounted < 0) overAccounted.push(`${rel}: scanners account for ${-unaccounted} more reference(s) than exist`);
+      for (let i = 0; i < unaccounted; i++) {
+        population.push({ item: rel, site: `${rel}: ${total} textual ManagerDef reference(s), ${total - unaccounted} recognized as a declaration` });
       }
     }
-    expect(
-      mismatches,
-      'A `ManagerDef` was declared/referenced in a form the scanners above do not recognize — this ' +
+    expect(overAccounted).toEqual([]);
+    assertExemptionLedger({
+      label: 'NOT_A_MANAGER_DECLARATION in appManagerDisposeReachable',
+      population,
+      exempt: NOT_A_MANAGER_DECLARATION,
+      floor: 1,
+      fix: 'A `ManagerDef` was declared/referenced in a form the scanners above do not recognize — this ' +
         'is this guard\'s known weak point (it has been wrong in this exact direction twice before, ' +
         '#517). The fix is to teach the relevant scanner (findObjectLiteralManagers / ' +
         'findClassManagers / scanObjectLiteralDecls / scanClassDecls) that declaration form, NOT to ' +
-        'add the file to NOT_A_MANAGER_DECLARATION unless the reference is verified to genuinely not ' +
+        'raise a NOT_A_MANAGER_DECLARATION count unless the reference is verified to genuinely not ' +
         'be a manager declaration (read the file, same discipline as this guard\'s own scan).',
-    ).toEqual([]);
+    });
   });
 });
 

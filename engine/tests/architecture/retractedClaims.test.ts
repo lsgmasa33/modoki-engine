@@ -44,6 +44,7 @@
 import { describe, it, expect } from 'vitest';
 import { existsSync } from 'node:fs';
 import { readScannedSource } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import path from 'node:path';
 import { repoFiles, repoRoot } from '../../scripts/repoCorpus.mjs';
 import { hasPrivateTooling } from '../helpers/repoLayout';
@@ -189,7 +190,6 @@ describe('a retracted claim is not restated outside its owning doc (#1014/#1015)
 
   for (const claim of RETRACTED_CLAIMS) {
     describe(claim.id, () => {
-      const allowed = new Set(claim.citedBy.map((c) => c.file));
       const restates = (raw: string) => {
         const text = claim.trueOfADifferentSubject
           ? raw.replace(claim.trueOfADifferentSubject, '')
@@ -200,35 +200,34 @@ describe('a retracted claim is not restated outside its owning doc (#1014/#1015)
         .filter((f: { abs: string }) => restates(readScannedSource(f.abs, CLAIMS_LIVE_IN_PROSE).raw))
         .map((f: { rel: string }) => f.rel);
 
-      it('no file outside citedBy restates it', () => {
-        const strays = hits.filter((rel) => !allowed.has(rel));
-        expect(
-          strays,
-          `these file(s) restate a RETRACTED claim:\n  ${strays.join('\n  ')}\n\n`
-          + `THE TRUTH: ${claim.truth}\n`
-          + `It is owned by ${claim.owner} — link there instead of restating it.\n`
-          + 'If a file legitimately QUOTES the claim (to correct or disprove it), add it to '
-          + `citedBy with the reason.`,
-        ).toEqual([]);
-      });
-
-      it('every citedBy entry still matches — no stale allowance', () => {
-        // A row that stopped matching is an allowance covering nothing, and it would keep
-        // "permitting" a file that no longer needs permission — the same rot docCitations'
-        // retired-doc registry guards against. Files absent from this checkout are skipped:
-        // the public snapshot does not carry qa/ or .agent-memory/.
+      it('no file outside citedBy restates it, and every citedBy row still matches', () => {
+        // Spent through the shared ledger since #1140 — the detector is a per-FILE boolean, so a
+        // file-keyed row is the right grain, and the old pair (strays + stale rows) is its
+        // unexcused / over-blessed arms. Rows whose file is absent from this checkout are dropped
+        // first: the public snapshot does not carry qa/ or .agent-memory/.
         // ⚠️ Resolve against the REPO ROOT, never process.cwd(). A bare relative existsSync
         // resolves against the cwd vitest happens to have been launched with; from `engine/`
         // it is false for EVERY row, all of them filter out as "absent from this checkout",
         // and this entire rule goes silently vacuous. Measured: it did.
-        const dead = claim.citedBy
+        const rows = claim.citedBy
           .filter((c) => existsSync(path.join(repoRoot(), c.file)))
-          .filter((c) => !hits.includes(c.file))
-          .map((c) => `${c.file} (${c.why})`);
-        expect(
-          dead,
-          `citedBy entr(ies) that no longer contain the claim — remove them:\n  ${dead.join('\n  ')}`,
-        ).toEqual([]);
+          .map((c) => ({ item: c.file, reason: c.why }));
+        // No file restates it in THIS checkout (a snapshot without the files that do): the ledger's
+        // floor cannot hold, but a present citedBy row is still stale — say so directly.
+        if (hits.length === 0) {
+          expect(rows.map((r) => r.item), 'these citedBy rows match nothing — drop them').toEqual([]);
+          return;
+        }
+        assertExemptionLedger({
+          label: `citedBy for ${claim.id} in retractedClaims`,
+          population: hits.map((rel) => ({ item: rel, site: rel })),
+          exempt: rows,
+          floor: 1,
+          fix: `these file(s) restate a RETRACTED claim.\n\nTHE TRUTH: ${claim.truth}\n`
+            + `It is owned by ${claim.owner} — link there instead of restating it. `
+            + 'If a file legitimately QUOTES the claim (to correct or disprove it), add it to '
+            + 'citedBy with the reason.',
+        });
       });
     });
   }

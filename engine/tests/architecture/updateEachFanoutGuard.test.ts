@@ -42,13 +42,13 @@
  *    above are how that gap is closed for the one call chain known to need it, without making
  *    every guard hit require a fragile cross-file body walk.
  *
- *  ALLOWLIST: EMPTY — #445 removed its two entries when the physics reconcile stopped routing
- *  synthesized exits from inside its query. A stale entry fails this suite by design, so an
- *  entry added here is a debt with an expiry, not a permanent exemption. Entries are matched by
- *  (file, the DIRECT call made from inside the `updateEach` body that starts the offending
- *  chain) so a new, unrelated violation in the same file still surfaces. Mirrors
- *  `editorStoreActionsReachable.test.ts`'s `knownOrphans`: an allowlist entry that stops
- *  matching a real violation fails the suite too, so the list can't rot into cover. */
+ *  NO ALLOWLIST (#1140). It was EMPTY after #445 removed its two entries when the physics
+ *  reconcile stopped routing synthesized exits from inside its query, and an empty ledger has
+ *  nothing to spend while its first row would have pardoned every chain that starts with one
+ *  call in a file. So there is no pardon to reach for: a violation is fixed, not tracked. With a
+ *  clean-tree population of zero, the detector is pinned on SYNTHETIC source instead (the
+ *  "finds a seeded fan-out" test), which is the only way a zero here can mean "clean" rather than
+ *  "the walker stopped matching". */
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -58,9 +58,8 @@ import { repoFiles } from '../../scripts/repoCorpus.mjs';
 const engineRoot = path.resolve(__dirname, '../..');
 const repoRoot = path.resolve(engineRoot, '..');
 
-/** Repo-relative POSIX path — `path.relative` yields backslashes on Windows, and `ALLOWLIST`
- *  entries below are hand-authored with forward slashes. Un-normalised, a single allowlist entry
- *  would go red on `ci/main`'s Windows leg while the Mac gate stayed green. */
+/** Engine-relative POSIX path for the failure message — `path.relative` yields backslashes on
+ *  Windows, and the report should read the same on every leg. */
 function relEngineRoot(file: string): string {
   return path.relative(engineRoot, file).split(path.sep).join('/');
 }
@@ -101,12 +100,6 @@ const SEED_MEMBER_NAMES = new Set([
 /** Catches an un-seeded sibling before it needs a manual add — see the file banner. Applied to
  *  bare identifier calls only (a `.fireEvent()` method on an unrelated object is not this). */
 const SEED_PATTERN = /^(fire|route)[A-Z]/;
-
-/** KNOWN VIOLATIONS, tracked not hidden — see #445. Matched by (file, the direct call made
- *  from inside the offending `updateEach` body). Do NOT add to this to make a red build green:
- *  the fix is #445's, and a new match here needs its own investigation, not a suppression. */
-interface AllowlistEntry { file: string; rootCall: string; reason: string }
-const ALLOWLIST: AllowlistEntry[] = [];
 
 interface Violation { file: string; line: number; chain: string[] }
 
@@ -214,24 +207,28 @@ function sourceFiles(): string[] {
 function findViolations(): Violation[] {
   const violations: Violation[] = [];
   for (const file of sourceFiles()) {
-    const raw = fs.readFileSync(file, 'utf8');
-    const sf = ts.createSourceFile(
-      file, raw, ts.ScriptTarget.Latest, /* setParentNodes */ true,
-      file.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
-    );
-    const localFns = collectLocalFunctions(sf);
-    for (const { call, line } of findUpdateEachCalls(sf)) {
-      const cb = call.arguments[call.arguments.length - 1];
-      if (!cb || !(ts.isArrowFunction(cb) || ts.isFunctionExpression(cb))) continue;
-      const chain = findFanoutChain(cb.body, localFns, new Set());
-      if (chain) violations.push({ file: relEngineRoot(file), line, chain });
-    }
+    violations.push(...violationsInSource(relEngineRoot(file), fs.readFileSync(file, 'utf8')));
   }
   return violations;
 }
 
-// Memoized so both `it`s below run the same scan without one test depending on the other's
-// execution (no beforeAll) — the scan is a full-corpus TS parse, worth not repeating twice.
+/** One file's violations, from its SOURCE TEXT — so the synthetic pin runs the real walker. */
+function violationsInSource(rel: string, raw: string): Violation[] {
+  const violations: Violation[] = [];
+  const sf = ts.createSourceFile(
+    rel, raw, ts.ScriptTarget.Latest, /* setParentNodes */ true,
+    rel.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
+  );
+  const localFns = collectLocalFunctions(sf);
+  for (const { call, line } of findUpdateEachCalls(sf)) {
+    const cb = call.arguments[call.arguments.length - 1];
+    if (!cb || !(ts.isArrowFunction(cb) || ts.isFunctionExpression(cb))) continue;
+    const chain = findFanoutChain(cb.body, localFns, new Set());
+    if (chain) violations.push({ file: rel, line, chain });
+  }
+  return violations;
+}
+
 let cachedViolations: Violation[] | null = null;
 function getViolations(): Violation[] {
   if (!cachedViolations) cachedViolations = findViolations();
@@ -260,9 +257,7 @@ describe('updateEach callbacks never synchronously reach a subscriber fan-out (#
   it('no updateEach callback reaches dispatchGameAction/dispatchUIAction/an event-bus emit/cueClip', () => {
     const violations = getViolations();
 
-    const unexpected = violations.filter((v) => !ALLOWLIST.some(
-      (a) => a.file === v.file && a.rootCall === v.chain[0],
-    ));
+    const unexpected = violations;
     expect(
       unexpected.map((v) => `${v.file}:${v.line}  ${formatChain(v.chain)}\n`
         + `  BUG: koota's updateEach snapshots the queried trait BEFORE this callback runs and writes\n`
@@ -276,17 +271,20 @@ describe('updateEach callbacks never synchronously reach a subscriber fan-out (#
     ).toEqual([]);
   });
 
-  it('every ALLOWLIST entry still matches a real violation (a stale suppression hides the next regression)', () => {
-    const violations = getViolations();
-
-    // Keep the allowlist HONEST: an entry that no longer matches a real violation (fixed, or the
-    // code moved) must leave, or a future real regression could hide behind a stale name.
-    const stale = ALLOWLIST.filter(
-      (a) => !violations.some((v) => v.file === a.file && v.chain[0] === a.rootCall),
-    );
-    expect(
-      stale.map((a) => `${a.file}: rootCall ${JSON.stringify(a.rootCall)} no longer reproduces — delete this allowlist entry (#445)`),
-      'ALLOWLIST entries that are no longer violations',
-    ).toEqual([]);
+  it('the walker finds a seeded fan-out in synthetic source — a clean tree cannot prove it alive', () => {
+    const src = [
+      'function helper() { dispatchGameAction("x"); }',
+      'function sys(world) {',
+      '  world.query(A).updateEach(([a]) => { a.v = 1; });',            // clean
+      '  world.query(B).updateEach(([b]) => { helper(); });',           // same-file chain
+      '  world.query(C).updateEach(([c]) => { bus.__emitZone(c); });', // member seed
+      '  world.query(D).updateEach(([d]) => { fireOnSomething(d); });',// SEED_PATTERN
+      '}',
+    ].join('\n');
+    expect(violationsInSource('synthetic.ts', src).map((v) => `${v.line}: ${v.chain.join(' -> ')}`)).toEqual([
+      '4: helper -> dispatchGameAction',
+      '5: __emitZone',
+      '6: fireOnSomething',
+    ]);
   });
 });

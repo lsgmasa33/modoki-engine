@@ -36,13 +36,11 @@ const CLONE = /(^|[^A-Za-z0-9_])(\w*[Mm]aterial|base|mat)\s*\.clone\(\)/;
  *  the signal that would otherwise be lost by routing sites through a helper. */
 const CLONE_HELPER = /(^|[^A-Za-z0-9_])cloneDerived\s*\(/;
 
-/** Clone sites that do NOT need the stamp on the line, each with the reason. Keyed by
- *  `runtime`-relative path + the distinguishing text of the line. */
-const EXEMPT: Array<{ file: string; contains: string; why: string }> = [
-  // `lightMaskVariants`' own `base.clone()` used to sit here. It is now a `cloneDerived` call
-  // (#325): that site had the very `userData` round-trip this family of bugs is made of, because
-  // `applyLightMask` hands it a `markDerived` clone whenever the mesh is tinted or instanced.
-];
+/* ⚠️ **No EXEMPT list (#1140).** It was empty since #325 moved `lightMaskVariants`' own
+ *  `base.clone()` onto `cloneDerived`, and its match was `file && line.includes(contains)` with no
+ *  staleness — so its first row would have pardoned every clone line in that file carrying the
+ *  text. The one legitimate raw clone is `HELPER_FILE`, excluded structurally below, and the
+ *  "finds the known clone sites" test proves the CLONE detector alive on that line. */
 
 /** Every `.ts`/`.tsx` under `RUNTIME`, RUNTIME-relative POSIX — via the shared corpus producer
  *  (#799/#771/#805 Phase 4). `repoFiles()`'s own `rel` is repo-root-relative
@@ -57,8 +55,9 @@ function runtimeFiles(): Array<{ abs: string; rel: string }> {
     .map(({ abs, rel }) => {
       // ⚠️ THROW rather than tolerate a miss. `indexOf` returns -1 when the marker is absent, and
       // `slice(-1 + MARKER.length)` is a perfectly valid slice — it would hand back a truncated
-      // but plausible-looking path, every EXEMPT key would quietly stop matching, and the guard
-      // would go green having compared nothing. That is a wrong answer with no error, which is the
+      // but plausible-looking path, `HELPER_FILE` would quietly stop matching, and the guard
+      // would report the helper's own raw clone as an offender — or, with the helper renamed, go
+      // green comparing the wrong paths. That is a wrong answer with no error, which is the
       // precise failure this whole family exists to remove; it must not be reintroduced by the
       // change removing it. Unreachable while `under` is RUNTIME, which is why it is a throw and
       // not a fallback: if it ever fires, the assumption changed and the guard should stop.
@@ -103,15 +102,13 @@ describe('material clones carry the derived-base stamp', () => {
       if (rel === HELPER_FILE) continue;
       for (const { n, text } of codeLines(file)) {
         if (!CLONE.test(text)) continue;
-        if (EXEMPT.some((e) => e.file === rel && text.includes(e.contains))) continue;
         raw.push(`${rel}:${n} — ${text.trim()}`);
       }
     }
     expect(raw, 'a material clone bound to a mesh must go through cloneDerived(material, base) — '
       + 'see runtime/rendering/derivedMaterials.ts. A bare .clone() JSON-round-trips userData, '
       + 'which serialises any Material or Texture parked in it and drops the own properties that '
-      + 'make a light-mask variant distinct. If this clone is never bound to a live mesh, add it '
-      + 'to EXEMPT with the reason.').toEqual([]);
+      + 'make a light-mask variant distinct.').toEqual([]);
   });
 
   it('finds the known clone sites — the scan is not vacuously passing', () => {

@@ -3,6 +3,7 @@
  *  mechanism (exercised with an engine-owned fixture, not a demo game). */
 
 import { describe, it, expect } from 'vitest';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { getTraitByName, getAllTraits, type FieldHint } from '@modoki/engine/runtime';
 import { registerTestGameTraits } from './_fixtures/testGame';
@@ -149,39 +150,44 @@ describe('registerTraits (engine + fixture game trait)', () => {
   // not this harness) aren't covered here.
   describe('every id-shaped numeric field is either entityId-remapped or allowlisted (Phase 15 guard)', () => {
     // Prefab-LOCAL ids (unique only within one prefab's own file), not live ecs ids —
-    // remapping them through the world-level `idMap` would be a category error.
-    const ALLOWLIST = new Set(['PrefabInstance.localId', 'PrefabInstance.parentLocalId']);
+    // remapping them through the world-level `idMap` would be a category error. Spent through
+    // `assertExemptionLedger` since #1140: it had no staleness check, so a remapped or renamed field
+    // kept its row.
+    const ALLOWLIST: ReadonlyArray<{ item: string; reason: string }> = [
+      { item: 'PrefabInstance.localId', reason: 'prefab-LOCAL id, unique within one prefab file — not a live ecs id' },
+      { item: 'PrefabInstance.parentLocalId', reason: 'prefab-LOCAL id, unique within one prefab file — not a live ecs id' },
+    ];
 
-    it('flags every /Id$/ numeric field', () => {
-      const offenders: string[] = [];
-      for (const meta of getAllTraits()) {
+    /** Every `/Id$/` numeric field not declared `entityId`, as `Trait.field`. */
+    const undeclaredIdFields = (metas: ReadonlyArray<{ name: string; trait: unknown; fields: Record<string, unknown> }>): string[] => {
+      const out: string[] = [];
+      for (const meta of metas) {
         for (const key of schemaKeys(meta.trait)) {
           if (!/Id$/.test(key)) continue;
-          const hint = meta.fields[key] as FieldHint | undefined;
-          if (hint?.entityId) continue;
-          const qualified = `${meta.name}.${key}`;
-          if (ALLOWLIST.has(qualified)) continue;
-          offenders.push(qualified);
+          if ((meta.fields[key] as FieldHint | undefined)?.entityId) continue;
+          out.push(`${meta.name}.${key}`);
         }
       }
-      expect(offenders).toEqual([]);
+      return out;
+    };
+
+    it('flags every /Id$/ numeric field', () => {
+      assertExemptionLedger({
+        label: 'ALLOWLIST in registerTraits (id-shaped fields)',
+        population: undeclaredIdFields(getAllTraits()).map((f) => ({ item: f, site: f })),
+        exempt: ALLOWLIST,
+        // The FIELDS walked, in the population's own unit — a trait count would stay 82 if schemaKeys read nothing.
+        scanned: getAllTraits().reduce((n, m) => n + schemaKeys(m.trait).length, 0),
+        floor: 300,
+        fix: 'these id-shaped numeric fields are neither entityId-remapped nor allowlisted — declare the '
+          + 'field `entityId: true` so prefab/duplicate/undo remap it, or allowlist it with the reason it is not a live id.',
+      });
     });
 
     it('the guard actually fires — a synthetic undeclared id-shaped field is caught', () => {
       const fakeTrait = { schema: { widgetId: 0 } };
       const fakeMeta = { name: 'FakeTrait', trait: fakeTrait, category: 'component' as const, fields: {} as Record<string, FieldHint> };
-      const offenders: string[] = [];
-      for (const meta of [...getAllTraits(), fakeMeta]) {
-        for (const key of schemaKeys(meta.trait)) {
-          if (!/Id$/.test(key)) continue;
-          const hint = meta.fields[key] as FieldHint | undefined;
-          if (hint?.entityId) continue;
-          const qualified = `${meta.name}.${key}`;
-          if (ALLOWLIST.has(qualified)) continue;
-          offenders.push(qualified);
-        }
-      }
-      expect(offenders).toContain('FakeTrait.widgetId');
+      expect(undeclaredIdFields([...getAllTraits(), fakeMeta])).toContain('FakeTrait.widgetId');
     });
   });
 });

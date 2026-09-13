@@ -56,7 +56,7 @@
  *     existed this was a real hole: one file could hold several identical rows (each event bus did,
  *     one per emitter), so migrating one of a same-named pair while adding a NEW loop with the same
  *     loop variable kept the equality green. With no in-scope ledger the expected set is empty and
- *     `subtractOnce` removes only ONE occurrence per EXEMPT row, so a second same-named loop in an
+ *     each EXEMPT row SPENDS one occurrence (`assertExemptionLedger`), so a second same-named loop in an
  *     exempt file now shows up as an offender. What remains: replacing an exempt loop with a
  *     different, plain fan-out of the SAME identifier in the same file passes. Line numbers would
  *     close that and churn on every unrelated edit above them; the trade was made knowingly.
@@ -92,8 +92,10 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { stripCommentsAndStrings } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
-import { deriveUnscannedRoots, expectedLedgerRows } from '../helpers/unscannedRoots';
+import { deriveUnscannedRoots } from '../helpers/unscannedRoots';
+import { hasInternalGames } from '../helpers/repoLayout';
 
 const REPO = path.resolve(__dirname, '../../..');
 
@@ -103,25 +105,20 @@ const SCAN_DIRS = [
   'engine/app',
 ];
 
-/** Hand-rolled fan-outs known to live OUTSIDE SCAN_DIRS: none, since #953 migrated the last four
- *  (`engine/electron/main.ts`, Court's reload-blocker disposers and cloud-sync resolvers,
- *  `games/llm-test`'s progress callbacks).
- *
- *  Kept as an explicit, EMPTY ledger rather than a bare `toEqual([])` so that a NEW instance
- *  appearing in `games/`, `demos/`, `engine/electron` or `engine/plugins` is a decision someone
- *  makes on purpose: migrate it, or write down why it stays. A game CAN reach the helper; it is a
- *  deep export (`@modoki/engine/runtime/core/notifyListeners`), as `games/sling` and `games/court`
- *  use it. `engine/electron` reaches it by relative path, as `main.ts` already imports engine
- *  source. */
-const KNOWN_OUTSIDE_SCAN_DIRS: readonly string[] = [];
+/* ⚠️ **No `KNOWN_OUTSIDE_SCAN_DIRS` ledger (#1140).** It was EMPTY since #953 migrated the last four
+ *  outside SCAN_DIRS (`engine/electron/main.ts`, Court's reload-blocker disposers and cloud-sync
+ *  resolvers, `games/llm-test`'s progress callbacks), kept so a new instance there would be a
+ *  decision. The shared ledger below makes it one without an empty list: a fan-out in `games/`,
+ *  `demos/`, `engine/electron` or `engine/plugins` is unexcused, so it migrates or argues its way into
+ *  EXEMPT. A game CAN reach the helper — it is a deep export
+ *  (`@modoki/engine/runtime/core/notifyListeners`), as `games/sling` and `games/court` use it;
+ *  `engine/electron` reaches it by relative path, as `main.ts` already imports engine source. */
 
 // There is no in-SCAN_DIRS ledger any more. #888 migrated 36 sites and pinned the remaining ~40
 // row by row as `KNOWN_UNMIGRATED`; #953 migrated or exempted every one, so inside SCAN_DIRS a
 // fan-out-shaped loop is now either on the helper or on `EXEMPT` below, and nothing else is legal.
 
 const UNSCANNED_ROOTS: readonly string[] = deriveUnscannedRoots(SCAN_DIRS);
-const expectedOutsideRows = (): string[] =>
-  expectedLedgerRows(KNOWN_OUTSIDE_SCAN_DIRS, UNSCANNED_ROOTS);
 
 /** ⚠️ **The outside scan re-filters `UNSCANNED_ROOTS` against `SCAN_DIRS`, and the CAUSE that made
  *  that necessary is fixed — this is now defence in depth, not the load-bearing guard it was.**
@@ -351,28 +348,6 @@ function rowsFrom(scanned: Scanned[]): string[] {
   return scanned.flatMap((r) => r.offenders.map((o) => `${r.file} :: ${o}`)).sort();
 }
 
-/** Remove ONE occurrence per exemption, not every row that matches it.
- *
- *  ⚠️ **A `filter` here is a hole, and it was measured as one.** `hitRegions.ts` contains both the
- *  exempt collect query and a migrated publisher, and BOTH bind `fn` — so the rows are identical
- *  strings and `filter` deleted the publisher's too. Un-migrating that publisher back to a
- *  hand-rolled loop, which is precisely what this guard is for, stayed green. Subtracting one
- *  occurrence leaves the second `hitRegions.ts :: fn` standing, and it goes red.
- *
- *  This is the same `path :: identifier` limitation the header's blind-spot list states; with no
- *  in-scope ledger left, subtracting ONE occurrence is what keeps it narrow. */
-function subtractOnce(rows: string[], exemptions: readonly string[]): string[] {
-  const budget = new Map<string, number>();
-  for (const e of exemptions) budget.set(e, (budget.get(e) ?? 0) + 1);
-  const out: string[] = [];
-  for (const r of rows) {
-    const left = budget.get(r) ?? 0;
-    if (left > 0) { budget.set(r, left - 1); continue; }
-    out.push(r);
-  }
-  return out;
-}
-
 /** The offenders in ONE comment-and-string-stripped source: both halves of the detector, exactly as
  *  `scan` runs them. A function of its own so the positive control below exercises the SAME code
  *  `scan` does. A control that re-implements the match is not a control, and the #953 phase-3/4
@@ -458,45 +433,44 @@ describe('every fan-out-shaped loop is migrated or exempt (#888, #953)', () => {
     expect(offendersIn(tsx)).toEqual(['off']);
   });
 
-  it('SCAN_DIRS holds no hand-rolled fan-out outside EXEMPT', () => {
-    const offenders = subtractOnce(rowsFrom(scan()), EXEMPT_ROWS);
-    expect(offenders, 'A callback fan-out was hand-rolled instead of going through '
-      + '`runtime/core/notifyListeners.ts`. That is #888: the publisher mutates its state before '
-      + 'it fans out, so one throwing callback commits the mutation, starves every callback '
-      + 'behind it, and aborts the publisher\'s own tail. Call `notifyListeners(set, label, args)`; '
-      + 'pass a `report` only if the publisher cannot reach `console.error` safely or must name the '
-      + 'failing entry. If the loop genuinely cannot be expressed that way, argue it into EXEMPT '
-      + 'with its kind.')
-      .toEqual([]);
-  });
-
-  it('every EXEMPT row is still DETECTED — an exemption cannot go stale into a licence', () => {
-    // The literal-vs-literal version of this test only pinned the constant: an exemption whose loop
-    // had been deleted or migrated stayed green and kept excusing whatever replaced it. This asks
-    // the DETECTOR instead, so the exemption has to keep earning itself.
-    const detected = new Set([
-      ...rowsFrom(scan()),
-      ...rowsFrom(scan(UNSCANNED_ROOTS, true)),
-    ]);
-    // ⚠️ **A row whose FILE is not in this checkout cannot be re-detected, and that is not a stale
-    // exemption** — it is the public engine snapshot, which ships `engine build docs` and no
-    // `games/`, so `games/wordweave/runtime/stem.ts` is absent by design. Exactly the #830 class
-    // `expectedLedgerRows` exists for, and it went red here at `verify:publish` on the hub merge —
-    // the only place these guards run inside the snapshot. That helper cannot be reused as-is:
-    // most EXEMPT rows sit INSIDE `SCAN_DIRS`, where it throws on purpose.
-    const missing = EXEMPT_ROWS.filter((row) => !fs.existsSync(path.join(REPO, row.split(' :: ')[0]!)));
-    // The floor that stops the filter draining the loop into a no-op: an EXEMPT row inside
-    // SCAN_DIRS is present in ANY checkout that runs this guard at all — the non-vacuity
-    // assertion above already vouches for that corpus — so its absence is a broken checkout
-    // rather than a legitimate subset, and must fail rather than be filtered away.
+  it('no hand-rolled fan-out inside SCAN_DIRS or the unscanned roots beyond EXEMPT — and every row still earns itself', () => {
+    // ⚠️ **One ledger since #1140, replacing three hand-rolled halves**: a `subtractOnce` over the
+    // SCAN_DIRS rows, a "still detected" re-scan for staleness, and a second `subtractOnce` over the
+    // unscanned roots compared for exact equality with an (empty) KNOWN_OUTSIDE_SCAN_DIRS. Spending
+    // EXEMPT against the union of the two scans states every direction at once: a new loop is unexcused
+    // (inside or out), and a migrated/deleted one leaves its row blessing more than exists.
+    // `path :: identifier` rows still collide within a file — the header's blind spot — and the
+    // count is what keeps that narrow (`hitRegions.ts :: fn` binds twice; see `subtractOnce`'s
+    // history in git).
+    // ⚠️ Absent by LAYOUT, not by existence (#1140 close-out review): `fs.existsSync` would also drop a
+    // row whose file was RENAMED or deleted in a root this checkout ships, silencing the very
+    // staleness the ledger is for. Only `games/` is absent from the public snapshot.
+    const missing = EXEMPT_ROWS.filter((row) => !hasInternalGames() && row.startsWith('games/'));
+    // ⚠️ A row whose FILE is not in this checkout cannot be detected, and that is not stale — it is
+    // the public snapshot, which ships no `games/` (`games/wordweave/runtime/stem.ts`). But a row
+    // INSIDE SCAN_DIRS is present in any checkout that runs this guard at all, so its absence is a
+    // broken corpus and must fail rather than be filtered away.
     expect(missing.filter((row) => insideScanDirs(row.split(' :: ')[0]!)),
       'an EXEMPT row INSIDE SCAN_DIRS names a file this checkout does not have — the corpus is '
       + 'broken, and dropping the row would leave this test checking nothing').toEqual([]);
-    for (const row of EXEMPT_ROWS.filter((r) => !missing.includes(r))) {
-      expect(detected.has(row), `EXEMPT row "${row}" is no longer detected — the loop it excuses is `
-        + 'gone or migrated, so the row is now a blanket licence for whatever takes its place. '
-        + 'Delete it.').toBe(true);
-    }
+    const rowBudget = (rows: readonly string[]) => [...new Set(rows)].map((row) => ({
+      item: row, count: rows.filter((r) => r === row).length,
+    }));
+    assertExemptionLedger({
+      label: 'EXEMPT in notifyIsShared',
+      population: [...rowsFrom(scan()), ...rowsFrom(scan(UNSCANNED_ROOTS, true))].map((row) => ({ item: row, site: row })),
+      exempt: [
+        ...rowBudget(EXEMPT_ROWS.filter((r) => !missing.includes(r))).map((e) => ({ ...e, reason: `exempt: ${EXEMPT[e.item]}` })),
+      ],
+      floor: 1,
+      fix: 'A callback fan-out was hand-rolled instead of going through '
+        + '`runtime/core/notifyListeners.ts`. That is #888: the publisher mutates its state before '
+        + 'it fans out, so one throwing callback commits the mutation, starves every callback '
+        + 'behind it, and aborts the publisher\'s own tail. Call `notifyListeners(set, label, args)`; '
+        + 'pass a `report` only if the publisher cannot reach `console.error` safely or must name the '
+        + 'failing entry. If the loop genuinely cannot be expressed that way, argue it into EXEMPT '
+        + 'with its kind. A row blessing more than exists is good news: drop it in the same commit.',
+    });
   });
 
   it('a `}` inside a string literal does not truncate the loop body', () => {
@@ -559,17 +533,9 @@ describe('every fan-out-shaped loop is migrated or exempt (#888, #953)', () => {
       .toBe(false);
   });
 
-  it('the roots this guard does NOT scan hold exactly the KNOWN fan-outs', () => {
-    // The guard's OWN detector over the unscanned roots, so this cannot drift from what the real
-    // check would say. A first instance out there fails here rather than joining a silent
-    // population.
-    const outside = subtractOnce(rowsFrom(scan(UNSCANNED_ROOTS, true)), EXEMPT_ROWS);
+  it('the roots this guard does NOT scan are really scanned — the ledger above is not vacuous there', () => {
     expect(scannedFiles(UNSCANNED_ROOTS).filter(({ rel }) => !insideScanDirs(rel)).length,
-      'the unscanned-roots corpus is empty — this assertion would pass having examined nothing')
+      'the unscanned-roots corpus is empty — the outside half of the ledger would pass having examined nothing')
       .toBeGreaterThan(50);
-    expect(outside, 'The set of hand-rolled notification loops OUTSIDE SCAN_DIRS changed. Decide '
-      + 'deliberately whether the new one migrates onto the shared helper or joins the ledger '
-      + 'with a reason. One DISAPPEARING is good news: drop its ledger entry in the same commit.')
-      .toEqual(expectedOutsideRows());
   });
 });

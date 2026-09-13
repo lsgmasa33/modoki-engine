@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { z } from '../../tools/modoki-mcp/node_modules/zod';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { CONTRACTS, contractFor } from '../../tools/modoki-mcp/src/contracts';
 import { getTool } from '../../tools/modoki-mcp/src/registry';
 import { loadSurface, realRequests, type Surface } from './mcpSurface';
@@ -223,8 +224,15 @@ describe('tool contracts', () => {
     const offenders = Object.entries(CONTRACTS)
       .filter(([, c]) => c.kind === 'read' && c.mutating)
       .map(([n]) => n);
-    expect(offenders.filter((n) => !IMPURE_READS.includes(n)), 'new impure read').toEqual([]);
-    expect(IMPURE_READS.filter((n) => !offenders.includes(n)), 'fixed — delete from IMPURE_READS').toEqual([]);
+    // Two-way exact since it was written; on the shared ledger since #1140 so the rule is stated once.
+    assertExemptionLedger({
+      label: 'IMPURE_READS in mcpToolContracts',
+      population: offenders.map((n) => ({ item: n, site: n })),
+      exempt: IMPURE_READS.map((item) => ({ item, reason: 'a read with an optional destructive clear — Phase 3 decides; the list may only SHRINK' })),
+      scanned: Object.keys(CONTRACTS).length,
+      floor: 50,
+      fix: 'new impure read — a `read` tool must not mutate. A row blessing more than exists was fixed: delete it from IMPURE_READS.',
+    });
   });
 
   it('a tool that DISPATCHES INPUT is never declared a non-mutating read', () => {
@@ -371,9 +379,14 @@ describe('tool contracts', () => {
       // unchecked mutating GET.
       .filter(([, c]) => c.mutating && c.method === 'GET' && !c.varies)
       .map(([n]) => n);
-    expect(offenders.filter((n) => !MUTATING_GETS.includes(n)), 'new mutating GET').toEqual([]);
-    expect(MUTATING_GETS.filter((n) => !offenders.includes(n)),
-      'fixed — delete from MUTATING_GETS').toEqual([]);
+    assertExemptionLedger({
+      label: 'MUTATING_GETS in mcpToolContracts',
+      population: offenders.map((n) => ({ item: n, site: n })),
+      exempt: MUTATING_GETS.map((item) => ({ item, reason: 'a known mutating GET — see the list docblock; it may only SHRINK' })),
+      scanned: Object.keys(CONTRACTS).length,
+      floor: 50,
+      fix: 'new mutating GET — a mutating operation must not hide behind GET. A row blessing more than exists was fixed: delete it from MUTATING_GETS.',
+    });
   });
 
   /** The args that make each non-build MUTATING GET actually mutate. Explicit because "which

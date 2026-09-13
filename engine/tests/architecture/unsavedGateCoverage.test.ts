@@ -22,6 +22,7 @@
 import { describe, it, expect } from 'vitest';
 import path from 'path';
 import { readScannedSource } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const REPO = path.resolve(__dirname, '../../..');
@@ -186,6 +187,19 @@ const EXEMPT: Record<string, { reason: string; registries?: readonly string[] }>
     + 'brand-new path. ⚠️ If it ever grows an overwrite mode, this exemption is void.', },
 };
 
+/** The registries a route's EXEMPT row is scoped to, or undefined for a full (or absent) exemption.
+ *  An EMPTY `registries: []` is refused by its own test below: it would leave the route ledger while
+ *  spending nothing on the pair ledger, a pardon neither side could ever find stale. */
+const scopedRegistries = (route: string): readonly string[] | undefined =>
+  Object.hasOwn(EXEMPT, route) && EXEMPT[route].registries?.length ? EXEMPT[route].registries : undefined;
+
+/** Trigger calls a registry scope cannot speak for: a raw read/write maps to no registry (see
+ *  HELPER_REGISTRIES), and a trigger absent from that table declares none. A route making one must
+ *  gate or be exempt at ROUTE grain, whatever its scoped row says. */
+const unscopedTriggers = (body: string): string[] =>
+  [...body.matchAll(new RegExp(CONTENT_CALLS.source, 'g'))].map((m) => m[1]!)
+    .filter((sym) => !(HELPER_REGISTRIES[sym]?.length));
+
 /** Routes that DO read content the editor can hold unsaved, and are **not fixed yet**.
  *
  *  ⚠️ **This is deliberately NOT part of `EXEMPT`, and the separation is the point.** An exemption
@@ -238,22 +252,36 @@ describe('the sidecar park gate covers every Node route that could clobber a par
   });
 
   it('every sidecar-touching route either gates or is exempt with a reason', () => {
+    // On the shared ledger since #1140: FULL EXEMPT rows and KNOWN_GAPS are SPENT by an ungated
+    // sidecar-touching route, so a row whose route now gates (or left the router) reports as
+    // blessing more than exists. A REGISTRY-SCOPED row is not a route-grain pardon and is not
+    // spent here: it pardons (route, registry) pairs, and it legitimately coexists with a gate for
+    // the registries it does not cover, so spending it against UNGATED routes made a correct
+    // scoped gate impossible to write (#1140 close-out). Its registry-backed calls are answered by the
+    // pair-grain ledger in the next test instead: a scoped row whose route reaches no pardoned
+    // registry is stale there, and deleting the row puts the route back here. A scoped route that
+    // makes a call no registry covers (a raw readFileSync/writeFileSync) STAYS here, because its scope
+    // cannot pardon that — the second review found a raw write in /api/read-meta green otherwise.
     const ungated = blocks
       .filter((b) => CONTENT_CALLS.test(b.body))
       .filter((b) => !/\bunsavedGate\s*\(/.test(b.body))
-      .filter((b) => !(b.route in EXEMPT))
-      .filter((b) => !(b.route in KNOWN_GAPS))
-      .map((b) => b.route);
-
-    expect(
-      ungated,
-      'these routes read project content in the Node process without asking the renderer what it '
-      + 'holds. Three honest resolutions, and only three: call unsavedGate (see /api/write-meta for '
-      + 'the `destroys` shape, /api/duplicate-asset for `stale-write`, /api/unused-assets for '
-      + '`stale-read`); add to EXEMPT if unsaved state genuinely CANNOT be in the way, with that '
-      + 'reason; or add to KNOWN_GAPS with an issue number if it can and is not fixed yet. '
-      + '⚠️ Do NOT put a known gap in EXEMPT — that is how a defect starts reading as a decision.',
-    ).toEqual([]);
+      .filter((b) => !scopedRegistries(b.route) || unscopedTriggers(b.body).length > 0)
+      .map((b) => ({ item: b.route, site: b.route }));
+    assertExemptionLedger({
+      label: 'EXEMPT + KNOWN_GAPS in unsavedGateCoverage (routes)',
+      population: ungated,
+      exempt: [
+        ...Object.entries(EXEMPT).filter(([, e]) => !e.registries).map(([item, e]) => ({ item, reason: e.reason })),
+        ...Object.entries(KNOWN_GAPS).map(([item, g]) => ({ item, reason: `${g.issue}: ${g.reason}` })),
+      ],
+      floor: 1,
+      fix: 'these routes read project content in the Node process without asking the renderer what it '
+        + 'holds. Three honest resolutions, and only three: call unsavedGate (see /api/write-meta for '
+        + 'the `destroys` shape, /api/duplicate-asset for `stale-write`, /api/unused-assets for '
+        + '`stale-read`); add to EXEMPT if unsaved state genuinely CANNOT be in the way, with that '
+        + 'reason; or add to KNOWN_GAPS with an issue number if it can and is not fixed yet. '
+        + '⚠️ Do NOT put a known gap in EXEMPT — that is how a defect starts reading as a decision.',
+    });
   });
 
   it('a gated route DECLARES every registry its own helpers can read (#889)', () => {
@@ -265,26 +293,41 @@ describe('the sidecar park gate covers every Node route that could clobber a par
     // ⚠️ Mutation check for THIS assertion: narrow `/api/duplicate-asset`'s `registries` back to
     // ['pendingMeta'] and it must go red naming `dirtyAsset, pendingBaseScene, liveScene`. If it
     // stays green, `declaredRegistries` has stopped reading the literal — see its docblock.
-    const under: string[] = [];
+    //
+    // On the shared ledger at (route, registry) grain since #1140: every registry a route's helpers
+    // can reach and its gate does not declare is one occurrence, and a registry-scoped EXEMPT row
+    // spends exactly the pairs it names. The population is every GATED route plus every route
+    // carrying a scoped row (gated or not) — the latter is where the previous test hands them.
+    const uncovered: { item: string; site: string }[] = [];
+    let examined = 0;
     for (const b of blocks) {
-      if (!/\bunsavedGate\s*\(/.test(b.body)) continue;
+      const gated = /\bunsavedGate\s*\(/.test(b.body);
+      if (!gated && !scopedRegistries(b.route)) continue;
       const needed = new Set<string>();
       for (const [symbol, registries] of Object.entries(HELPER_REGISTRIES)) {
         if (!new RegExp(`\\b${symbol}\\s*\\(`).test(b.body)) continue;
         for (const r of registries) needed.add(r);
       }
-      const exemptFor = new Set(EXEMPT[b.route]?.registries ?? []);
-      const declared = new Set(declaredRegistries(b.body));
-      const missing = [...needed].filter((r) => !declared.has(r) && !exemptFor.has(r));
-      if (missing.length) under.push(`${b.route}: declares [${[...declared].join(', ')}], needs ${missing.join(', ')}`);
+      const declared = new Set(gated ? declaredRegistries(b.body) : []);
+      for (const r of needed) {
+        examined++;
+        if (!declared.has(r)) uncovered.push({ item: `${b.route}::${r}`, site: `${b.route} declares [${[...declared].join(', ')}]` });
+      }
     }
-    expect(
-      under,
-      'these routes gate, but for FEWER registries than their own helpers can read — so the gate '
-      + 'runs and the uncovered registry is exactly as invisible as before. Widen the `registries` '
-      + 'literal on the unsavedGate call, or narrow HELPER_REGISTRIES if the helper genuinely '
-      + 'cannot reach that registry from here.',
-    ).toEqual([]);
+    assertExemptionLedger({
+      label: 'registry-scoped EXEMPT in unsavedGateCoverage (route::registry)',
+      population: uncovered,
+      exempt: Object.entries(EXEMPT).flatMap(([route, e]) =>
+        (e.registries ?? []).map((r) => ({ item: `${route}::${r}`, reason: e.reason }))),
+      // Every (route, registry) pair a gated or scoped route can reach — covered or not. The
+      // uncovered ones shrink to nothing once every scoped row is gone, and that must stay green.
+      scanned: examined,
+      floor: 5,
+      fix: 'these routes can reach a registry their gate does not declare — so the gate (if any) runs '
+        + 'and the uncovered registry is exactly as invisible as before. Widen the `registries` '
+        + 'literal on the unsavedGate call, narrow HELPER_REGISTRIES if the helper genuinely cannot '
+        + 'reach that registry from here, or scope an EXEMPT row to that registry with its reason.',
+    });
   });
 
   it('declaredRegistries can actually READ the literal — its own positive control', () => {
@@ -318,6 +361,9 @@ describe('the sidecar park gate covers every Node route that could clobber a par
     // blanket exemption wearing a ledger's clothes.
     const unreasoned = Object.entries(EXEMPT).filter(([, e]) => !e.reason.trim()).map(([r]) => r);
     expect(unreasoned, 'an exemption without a reason is not an exemption').toEqual([]);
+    // `registries: []` scopes the exemption to nothing, and would be spent by neither ledger.
+    const emptyScope = Object.entries(EXEMPT).filter(([, e]) => e.registries?.length === 0).map(([r]) => r);
+    expect(emptyScope, 'drop `registries` for a full exemption, or name the registries it covers').toEqual([]);
 
     // KNOWN_GAPS carries the same ledger rules, plus the one that keeps it from decaying into a
     // second EXEMPT: every entry names an issue.
@@ -344,43 +390,58 @@ describe('the sidecar park gate covers every Node route that could clobber a par
     // The files allowed to call these helpers directly. Everything here is either the helper
     // module itself, a build-time/static path with no editor attached, or a re-import handler —
     // which is reached ONLY through `/api/reimport`, and that route is gated.
-    const ALLOWED = new Set([
-      'engine/plugins/meta-sidecar.ts', 'engine/plugins/asset-fs-ops.ts',
-      'engine/plugins/reimport-registry.ts', // declares getReimportHandler; dispatches, never writes
-      'engine/plugins/asset-tree-shaker.ts', 'engine/plugins/vite-asset-scanner.ts',
-      'engine/plugins/backend/editorBackendRouter.ts', 'engine/plugins/backend/staticAssets.ts',
-      'engine/plugins/reimport-atlas.ts', 'engine/plugins/reimport-audio.ts',
-      'engine/plugins/reimport-environment.ts', 'engine/plugins/reimport-font.ts',
-      'engine/plugins/reimport-model.ts', 'engine/plugins/reimport-texture.ts',
-      'engine/plugins/reimport-video.ts',
+    // The files allowed to call these helpers directly — keyed per FILE (whether a file sits behind an
+    // agent route is a property of the file) and spent through the shared ledger since #1140. The
+    // old staleness check only asked a row's file still EXISTED, not that it still read or wrote a
+    // .meta.json, so a file that stopped touching sidecars kept a pardon for whatever it did next.
+    const ALLOWED: ReadonlyArray<{ item: string; reason: string }> = [
+      { item: 'engine/plugins/meta-sidecar.ts', reason: 'the sidecar helper module itself' },
+      { item: 'engine/plugins/asset-fs-ops.ts', reason: 'the sidecar helper module itself' },
+      { item: 'engine/plugins/reimport-registry.ts', reason: 'declares getReimportHandler; dispatches, never writes' },
+      { item: 'engine/plugins/asset-tree-shaker.ts', reason: 'a build-time / static path with no editor attached' },
+      { item: 'engine/plugins/vite-asset-scanner.ts', reason: 'a build-time / static path with no editor attached' },
+      { item: 'engine/plugins/backend/editorBackendRouter.ts', reason: 'the router itself — its sidecar-touching ROUTES are checked one by one by the route-block tests above (unsavedGate, EXEMPT, KNOWN_GAPS)' },
+      { item: 'engine/plugins/backend/staticAssets.ts', reason: 'a build-time / static path with no editor attached' },
+      { item: 'engine/plugins/reimport-atlas.ts', reason: 'a re-import handler — reached ONLY through /api/reimport, and that route is gated' },
+      { item: 'engine/plugins/reimport-audio.ts', reason: 'a re-import handler — reached ONLY through /api/reimport, and that route is gated' },
+      { item: 'engine/plugins/reimport-environment.ts', reason: 'a re-import handler — reached ONLY through /api/reimport, and that route is gated' },
+      { item: 'engine/plugins/reimport-font.ts', reason: 'a re-import handler — reached ONLY through /api/reimport, and that route is gated' },
+      { item: 'engine/plugins/reimport-model.ts', reason: 'a re-import handler — reached ONLY through /api/reimport, and that route is gated' },
+      { item: 'engine/plugins/reimport-texture.ts', reason: 'a re-import handler — reached ONLY through /api/reimport, and that route is gated' },
+      { item: 'engine/plugins/reimport-video.ts', reason: 'a re-import handler — reached ONLY through /api/reimport, and that route is gated' },
       // ── #889's widened trigger nets every Node file that calls readFileSync. These are
       //    BUILD-TIME converters, native-config writers and device tooling: none of them runs
       //    behind an editor route, and none reads a document any panel can hold unsaved. They are
       //    listed individually rather than excluded by a path pattern, because a pattern would
       //    silently absorb a future file that DOES sit behind a route.
-      'engine/plugins/addNativeTarget.ts', 'engine/plugins/audio-convert.ts',
-      'engine/plugins/backend/deviceConnection.ts', 'engine/plugins/backend/deviceCrashReports.ts',
-      // #1065: reads/writes only this clone's `.modoki/ios-forward.json` pid record for the go-ios forward.
-      'engine/plugins/backend/iosUsbForward.ts',
-      'engine/plugins/backend/wdaLauncher.ts', 'engine/plugins/detect-modules.ts',
-      'engine/plugins/env-convert.ts', 'engine/plugins/font-convert.ts',
-      'engine/plugins/font-instance.ts', 'engine/plugins/healNativeConfig.ts',
-      'engine/plugins/iconAssets.ts', 'engine/plugins/inlinePlayable.ts',
-      'engine/plugins/load-project-config.ts', 'engine/plugins/model-convert.ts',
-      'engine/plugins/rigged-model-optimize.ts', 'engine/plugins/texture-convert.ts',
-      'engine/plugins/vendorPlugins.ts', 'engine/plugins/video-convert.ts',
-    ]);
-    const strays = tracked
-      .filter((f) => CONTENT_CALLS.test(source(f)))
-      .filter((f) => !ALLOWED.has(f));
-
-    expect(
-      strays,
-      'a new Node-side file reads or writes a .meta.json. If it is reachable from an agent route, '
-      + 'that route needs unsavedGate; if it is not, add it to ALLOWED with that reasoning.',
-    ).toEqual([]);
-    // …and the ledger does not outlive its entries.
-    expect([...ALLOWED].filter((f) => !tracked.includes(f)), 'delete these — no such file').toEqual([]);
+      { item: 'engine/plugins/addNativeTarget.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
+      { item: 'engine/plugins/audio-convert.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
+      { item: 'engine/plugins/backend/deviceConnection.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
+      { item: 'engine/plugins/backend/deviceCrashReports.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
+      { item: 'engine/plugins/backend/wdaLauncher.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
+      { item: 'engine/plugins/detect-modules.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
+      { item: 'engine/plugins/env-convert.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
+      { item: 'engine/plugins/font-convert.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
+      { item: 'engine/plugins/font-instance.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
+      { item: 'engine/plugins/healNativeConfig.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
+      { item: 'engine/plugins/iconAssets.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
+      { item: 'engine/plugins/inlinePlayable.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
+      { item: 'engine/plugins/load-project-config.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
+      { item: 'engine/plugins/model-convert.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
+      { item: 'engine/plugins/rigged-model-optimize.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
+      { item: 'engine/plugins/texture-convert.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
+      { item: 'engine/plugins/vendorPlugins.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
+      { item: 'engine/plugins/video-convert.ts', reason: '#889 widened trigger: build-time converter / native-config writer / device tooling, behind no editor route' },
+      { item: 'engine/plugins/backend/iosUsbForward.ts', reason: '#1065: reads/writes only this clone\'s .modoki/ios-forward.json pid record for the go-ios forward' },
+    ];
+    assertExemptionLedger({
+      label: 'ALLOWED in unsavedGateCoverage',
+      population: tracked.filter((f) => CONTENT_CALLS.test(source(f))).map((f) => ({ item: f, site: f })),
+      exempt: ALLOWED,
+      floor: 1,
+      fix: 'a new Node-side file reads or writes a .meta.json. If it is reachable from an agent route, '
+        + 'that route needs unsavedGate; if it is not, add it to ALLOWED with that reasoning.',
+    });
   });
 
   it('the registry VOCABULARY is the same four everywhere it is spelled (#889 close-out review)', () => {

@@ -17,6 +17,7 @@ import { describe, it, expect } from 'vitest';
 import path from 'node:path';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { readScannedSource } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 
 const ED = path.resolve(__dirname, '../../packages/modoki/src/editor');
 const read = (rel: string) => readScannedSource(path.join(ED, rel)).code;
@@ -352,15 +353,25 @@ describe('data-ui-id tagging has not rotted', () => {
   // check below rather than left out of REQUIRED entirely, since dropping them from REQUIRED
   // would leave them unguarded. Renaming them is real churn: `qa/cases/**` and `qa/knowledge.md`
   // already address both by selector.
-  const LEGACY_2SEG = new Set(['spriteEditor.cancel', 'spriteEditor.save']);
+  // Spent through `assertExemptionLedger` since #1140 — the Set had no staleness check, so renaming
+  // one of them to three segments would have left its row standing as a pardon for the next.
+  const LEGACY_2SEG: ReadonlyArray<{ item: string; reason: string }> = [
+    { item: 'spriteEditor.cancel', reason: 'predates <panel>.<region>.<name>; qa/cases/** and qa/knowledge.md address it by selector' },
+    { item: 'spriteEditor.save', reason: 'predates <panel>.<region>.<name>; qa/cases/** and qa/knowledge.md address it by selector' },
+  ];
 
   it('every tagged id is dot-namespaced as <panel>.<region>.<name>', () => {
     // Coherence: an agent should be able to guess `assets.toolbar.*` from `hierarchy.toolbar.*`.
-    const statics = REQUIRED.flatMap((r) => r.ids).filter((id) => !id.startsWith('`') && !LEGACY_2SEG.has(id));
+    const statics = REQUIRED.flatMap((r) => r.ids).filter((id) => !id.startsWith('`'));
     expect(statics.length).toBeGreaterThan(15); // this check is worthless if the list is empty
-    for (const id of statics) {
-      expect(id.split('.').length, `"${id}" should have at least 3 dot segments`).toBeGreaterThanOrEqual(3);
-    }
+    assertExemptionLedger({
+      label: 'LEGACY_2SEG in chromeTagging',
+      population: statics.filter((id) => id.split('.').length < 3).map((id) => ({ item: id, site: id })),
+      exempt: LEGACY_2SEG,
+      scanned: statics.length,
+      floor: 40,
+      fix: 'these ids should have at least 3 dot segments (<panel>.<region>.<name>)',
+    });
   });
 
   // --- #724: invert the guard for BufferedNumberInput/BufferedTextInput -------------------
@@ -464,7 +475,13 @@ describe('data-ui-id tagging has not rotted', () => {
     return results;
   }
 
-  const DATA_UI_ID_EXEMPT: Record<string, string[]> = {
+  /** ⚠️ **SPENT per ELEMENT, keyed `file::<tag> <first prop>` (#1140).** This was a
+   *  `Record<file, prefix[]>` matched with `.some(startsWith)` and no staleness check, so a second
+   *  untagged `<BufferedTextInput value={editableEntityName(…)}` in the same file was excused by a
+   *  reason argued about the header field, and a row whose element was since tagged pardoned nothing
+   *  without anyone being told. The key is the element's tag plus its first prop as the scan sees it
+   *  (comment-stripped, whitespace-collapsed) — code, never prose, per the #816 note below. */
+  const DATA_UI_ID_EXEMPT: ReadonlyArray<{ item: string; count?: number; reason: string }> = [
     // The entity-name header field: BufferedTextInput now forwards data-ui-id (#724), but this
     // ONE instance is deliberately left un-passed because the surrounding <span> wrapper already
     // carries `data-ui-id="inspector.header.name"` (asserted above, and load-bearing for
@@ -480,27 +497,36 @@ describe('data-ui-id tagging has not rotted', () => {
     // matching, and an already-tagged field was reported as untagged. An allowlist keyed on prose
     // is disarmed by any change to that prose, including someone simply rewording it. Binding the
     // key to the prop the control actually reads is both stripping-proof and a truer identifier.
-    'engine/packages/modoki/src/editor/panels/Inspector.tsx': ['<BufferedTextInput value={editableEntityName('],
-  };
+    { item: "engine/packages/modoki/src/editor/panels/Inspector.tsx::<BufferedTextInput value={editableEntityName(entityAttr.data['name'])}",
+      reason: 'the entity-name header field — its <span> wrapper already carries data-ui-id="inspector.header.name"; a second id on the input would double-tag one logical field' },
+  ];
+
+  /** The occurrence key for an element: its tag and first prop, from the normalized snippet. */
+  const elementKey = (snippet: string) => snippet.split(' ').slice(0, 2).join(' ');
 
   it('every BufferedNumberInput/BufferedTextInput passes a dataUiId prop (#724)', () => {
-    const missing: string[] = [];
+    const untagged: Array<{ item: string; site: string }> = [];
     let scanned = 0;
     for (const root of SCAN_ROOTS) {
       for (const { abs: file, rel } of listTsxFiles(root)) {
         const src = readScannedSource(file).code;
-        const exempt = DATA_UI_ID_EXEMPT[rel] ?? [];
         for (const hit of findBufferedInputs(src)) {
           scanned++;
           if (hit.hasId) continue;
-          if (exempt.some((prefix) => hit.snippet.startsWith(prefix.replace(/\s+/g, ' ')))) continue;
-          missing.push(`${rel}:${hit.line}  ${hit.snippet}`);
+          untagged.push({ item: `${rel}::${elementKey(hit.snippet)}`, site: `${rel}:${hit.line}  ${hit.snippet}` });
         }
       }
     }
     // This check is worthless if the scan found nothing to check.
     expect(scanned).toBeGreaterThan(30);
-    expect(missing, `untagged BufferedNumberInput/BufferedTextInput — add dataUiId or an entry in DATA_UI_ID_EXEMPT with a reason:\n${missing.join('\n')}`).toEqual([]);
+    assertExemptionLedger({
+      label: 'DATA_UI_ID_EXEMPT in chromeTagging',
+      population: untagged,
+      exempt: DATA_UI_ID_EXEMPT,
+      floor: 1,
+      fix: 'untagged BufferedNumberInput/BufferedTextInput — add dataUiId, or a `file::<tag> <first prop>` '
+        + 'row in DATA_UI_ID_EXEMPT with a reason (only a control addressable through its wrapper earns one).',
+    });
   });
 
   // The other half of #724's coverage — the shared-helper surface the scan above cannot see

@@ -22,6 +22,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { join } from 'node:path';
 import { DEVICE_STATUS_TARGET_FIELDS } from '../../tools/game-debug-mcp/src/mcp-tools';
 import { readScannedSource } from '@modoki/engine/testing';
@@ -70,10 +71,14 @@ describe('device MCP status mirror vs DeviceConnectStatus', () => {
     const reads = [...src.matchAll(/backendGet\('\/api\/device\/status'\)\)\s*as\s+([A-Za-z_$][\w$]*|\{[^;\n]*)/g)]
       .map((m) => m[1].trim());
     expect(reads.length, 'no status reads found — did the route or helper name change?').toBeGreaterThan(0);
-    const ALLOWED = new Set(['DeviceStatusReply', 'LeaseStatus']);
-    expect(
-      reads.filter((t) => !ALLOWED.has(t)),
-      'these reads use an inline object cast; use DeviceStatusReply so an invented field is a compile error',
-    ).toEqual([]);
+    // The two sanctioned typed mirrors — `sanctioned` on the shared ledger (#1140), so a mirror no
+    // status read uses any more reddens instead of standing as a permitted cast for whatever comes next.
+    assertExemptionLedger({
+      label: 'typed status mirrors in deviceStatusShape',
+      population: reads.map((t) => ({ item: t, site: t })),
+      sanctioned: ['DeviceStatusReply', 'LeaseStatus'],
+      floor: 1,
+      fix: 'these reads use an inline object cast; use DeviceStatusReply so an invented field is a compile error',
+    });
   });
 });

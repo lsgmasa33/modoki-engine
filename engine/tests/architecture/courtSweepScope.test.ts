@@ -47,18 +47,12 @@ const AUTHORED = path.join(REPO, 'engine/scripts/courtAuthored.mjs');
 const SWEEP_GATE = path.join(REPO, 'games/court/tests/sweepGate.ts');
 const CHANGED_LEVELS = path.join(REPO, 'games/court/tests/changedLevels.ts');
 
-/** Barrels whose lack of `WATCHED` coverage is deliberate, each with the reason it is safe.
- *  A ledger, not an off-switch: every entry must still be a barrel Court actually imports (asserted
- *  below), so a stale row fails rather than rotting. */
-const COVERAGE_EXEMPT: ReadonlyArray<{ barrel: string; reason: string }> = [
-  {
-    barrel: '@modoki/engine/testing',
-    reason: 'Test INFRASTRUCTURE (tests/helpers/sourceScanner.ts), not engine behaviour Court '
-      + 'measures. A change there breaks Court\'s suite LOUDLY — a scanner that stops stripping '
-      + 'fails its own assertions — rather than silently shifting a measured value, and silent '
-      + 'shifting is the only failure this gate exists to catch.',
-  },
-];
+/* ⚠️ **No COVERAGE_EXEMPT ledger (#1140).** It held one row, `@modoki/engine/testing` ("test
+ *  INFRASTRUCTURE, not engine behaviour Court measures"), and that barrel HAS watched coverage — so
+ *  the row pardoned nothing. Its staleness check asked only that Court still imported the barrel,
+ *  which stays true for an exemption that is no longer needed. Found when the row was put on the
+ *  spending ledger (#1140). A barrel that genuinely cannot shift a measured value takes a counted
+ *  `assertExemptionLedger` row with that reason. */
 
 /** `const WATCHED = [...]` as written in a file. Both copies are plain source, read through the
  *  shared scanner so a commented-out entry cannot be mistaken for a live one. */
@@ -171,26 +165,23 @@ describe.skipIf(!hasInternalGames())('Court sweep scope (#787)', () => {
 
   it('every engine barrel Court\'s tests import has SOME watched coverage', () => {
     const watched = watchedIn(AUTHORED);
-    const exempt = new Map(COVERAGE_EXEMPT.map((e) => [e.barrel, e.reason]));
     const barrels = courtImportedBarrels();
 
     // Non-vacuity: Court imports engine barrels in quantity; an empty read means the scan broke.
     expect(barrels.length, 'no @modoki/engine imports found under games/court/tests — the scan has '
       + 'broken, and every assertion below would pass having examined nothing').toBeGreaterThan(1);
 
-    const uncovered: string[] = [];
+    const uncovered: Array<{ site: string }> = [];
     for (const barrel of barrels) {
-      if (exempt.has(barrel)) continue;
       const dir = barrelSourceDir(barrel);
       if (dir === null) {
-        uncovered.push(`${barrel}  (not in @modoki/engine's exports map — cannot resolve)`);
+        uncovered.push({ site: `${barrel}  (not in @modoki/engine's exports map — cannot resolve)` });
         continue;
       }
-      const covered = watched.some((w) => w === dir || w.startsWith(`${dir}/`));
-      if (!covered) uncovered.push(`${barrel}  ->  ${dir}`);
+      if (!watched.some((w) => w === dir || w.startsWith(`${dir}/`))) uncovered.push({ site: `${barrel}  ->  ${dir}` });
     }
 
-    expect(uncovered, [
+    expect(uncovered.map((u) => u.site), [
       "Court's tests import these engine barrels, and NO `WATCHED` entry in",
       'engine/scripts/courtAuthored.mjs covers any part of them. A clone that changes one of these',
       'surfaces and touches nothing under games/court skips the Court suite entirely — and Court',
@@ -198,20 +189,7 @@ describe.skipIf(!hasInternalGames())('Court sweep scope (#787)', () => {
       '',
       'Fix by adding the specific subdirectory Court depends on to WATCHED in BOTH copies —',
       'NOT the whole barrel: widening WATCHED to `engine/` makes the gate a no-op, which is the',
-      'cost it exists to avoid. If the dependency genuinely cannot shift a measured value, add a',
-      'COVERAGE_EXEMPT row saying why.',
-      '',
-      ...uncovered,
+      'cost it exists to avoid.',
     ].join('\n')).toEqual([]);
-  });
-
-  it('every COVERAGE_EXEMPT row is still a barrel Court imports', () => {
-    // Keeps the ledger load-bearing: an exemption for a barrel nobody imports any more is vouching
-    // for nothing, and would quietly excuse that name if a future test started importing it.
-    const barrels = new Set(courtImportedBarrels());
-    const stale = COVERAGE_EXEMPT.map((e) => e.barrel).filter((b) => !barrels.has(b));
-    expect(stale, 'These COVERAGE_EXEMPT rows name barrels games/court/tests no longer imports. '
-      + 'Delete them — a stale exemption is an unexamined hole waiting for the name to come back.')
-      .toEqual([]);
   });
 });

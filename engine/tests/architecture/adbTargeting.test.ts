@@ -23,49 +23,74 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
+import ts from 'typescript';
 import { readScannedSource } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 
 const BACKEND = path.resolve(__dirname, '../../plugins/backend');
 
-/** Calls that are deliberately GLOBAL — each needs a reason. */
-const ALLOWED_UNTARGETED: Record<string, string> = {
-  'androidDevices.ts:list':
+/** Calls that are deliberately GLOBAL — each needs a reason.
+ *
+ *  ⚠️ **SPENT per call, not matched per function (#1140).** This was a `Record<file:function>`
+ *  looked up with `[near]`, so a SECOND un-targeted adb call written into `listForwards` inherited
+ *  a reason argued about the first, and the staleness test only checked the function still held
+ *  an adb call — not that the call was still un-targeted. Each row now pays for one call; a second
+ *  global call in the same function needs `count: 2` and a sentence. */
+const ALLOWED_UNTARGETED: ReadonlyArray<{ item: string; count?: number; reason: string }> = [
+  { item: 'androidDevices.ts:list', reason:
     'The device LISTING itself. `adb devices -l` enumerates every attached device, so targeting it '
     + 'at one would defeat its entire purpose — this is the call whose OUTPUT the serial is chosen '
-    + 'from, so it cannot already know the serial.',
-  'deviceConnection.ts:listForwards':
+    + 'from, so it cannot already know the serial.' },
+  { item: 'deviceConnection.ts:listForwards', reason:
     'The forward LISTING (#158). `adb forward --list` is daemon-wide and accepts no `-s` at all — '
     + 'and being global is exactly what makes it useful here: it is the only way to ask "which '
     + 'device owns the rule on host port N?", which is the question a serial-scoped removal has to '
-    + 'answer before deleting anything (`--remove` matches on the port spec and IGNORES `-s`).',
-  'deviceCdp.ts:listForwards':
-    'Same call, same reason, for the webview CDP tunnel — see deviceConnection.ts:listForwards.',
-};
+    + 'answer before deleting anything (`--remove` matches on the port spec and IGNORES `-s`).' },
+  { item: 'deviceCdp.ts:listForwards', reason:
+    'Same call, same reason, for the webview CDP tunnel — see deviceConnection.ts:listForwards.' },
+];
 
 /** Every `execFileSync(adbBinary(), …)` with the source window that builds its argv.
  *
- *  Windowed rather than parsed: a real AST walk would be a heavier dependency than the invariant
- *  warrants, and every call site in this repo builds its argv on the same or next line. The window
- *  stops at the call's own closing `)` + option object, which is the shape all of them share. If a
- *  future call site spreads its argv across a long builder, this guard will fail loudly (no
- *  `adbArgs(` in the window) rather than silently pass — the safe direction for a guard to be wrong.
- */
-function adbCallSites(): Array<{ file: string; near: string; window: string }> {
+ *  The window is the call expression's OWN extent, taken from the TypeScript AST — so a long argv
+ *  builder sits inside it and nothing past its closing `)` can.
+ *
+ *  ⚠️ **Parsed, because both text windows before it failed OPEN (#1140).** A fixed 400 chars
+ *  reached the NEXT call: `androidDevices.ts`' un-targeted `adb devices -l` sits three lines above
+ *  `deviceName`'s `adbArgs(serial, …)` and read as targeted, while its allowlist row stayed
+ *  "load-bearing". Its replacement — a hand-balanced paren scan — was then shown by review to
+ *  over-read on a quote inside a regex literal, and a heuristic regex-vs-division rule on top of
+ *  that still over-read on `w! / 2`, `=> /'/`, `+ /'/`, deep indentation and a backtick inside
+ *  `${}`. Every one of those is a private tokenizer being wrong; the AST is not a tokenizer this
+ *  file maintains. (The "an AST walk is too heavy" reason the first version gave does not hold:
+ *  `updateEachFanoutGuard` already parses with `typescript` in this suite.) Pinned below. */
+function adbCallSitesIn(entry: string, src: string): Array<{ file: string; near: string; window: string }> {
   const out: Array<{ file: string; near: string; window: string }> = [];
-  for (const entry of fs.readdirSync(BACKEND)) {
-    if (!entry.endsWith('.ts')) continue;
-    const src = readScannedSource(path.join(BACKEND, entry)).code;
-    const marker = 'execFileSync(adbBinary()';
-    let at = src.indexOf(marker);
-    while (at !== -1) {
-      const window = src.slice(at, at + 400);
+  const sf = ts.createSourceFile(entry, src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const visit = (node: ts.Node) => {
+    if (
+      ts.isCallExpression(node)
+      && node.expression.getText(sf) === 'execFileSync'
+      && node.arguments[0]?.getText(sf) === 'adbBinary()'
+    ) {
+      const at = node.getStart(sf);
       // The enclosing function/method name, for a failure message that says WHERE rather than
       // making the reader count line numbers.
       const before = src.slice(0, at);
       const fnName = [...before.matchAll(/(?:function\s+|^\s{2})([A-Za-z_$][\w$]*)\s*\(/gm)].pop()?.[1] ?? '?';
-      out.push({ file: entry, near: `${entry}:${fnName}`, window });
-      at = src.indexOf(marker, at + marker.length);
+      out.push({ file: entry, near: `${entry}:${fnName}`, window: src.slice(at, node.getEnd()) });
     }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  return out;
+}
+
+function adbCallSites(): Array<{ file: string; near: string; window: string }> {
+  const out: Array<{ file: string; near: string; window: string }> = [];
+  for (const entry of fs.readdirSync(BACKEND)) {
+    if (!entry.endsWith('.ts')) continue;
+    out.push(...adbCallSitesIn(entry, readScannedSource(path.join(BACKEND, entry)).code));
   }
   return out;
 }
@@ -77,31 +102,49 @@ describe('adb targeting — every backend adb call names a device (#149)', () =>
     expect(adbCallSites().length).toBeGreaterThanOrEqual(6);
   });
 
-  it('routes every call through adbArgs(), or allowlists it with a reason', () => {
-    const violations = adbCallSites()
-      .filter((c) => !c.window.includes('adbArgs('))
-      .filter((c) => !ALLOWED_UNTARGETED[c.near])
-      .map((c) => c.near);
-
-    expect(
-      violations,
-      'adb call(s) that do not pass their argv through `adbArgs(serial, …)`:\n'
-      + `  ${violations.join('\n  ')}\n\n`
-      + 'An un-targeted adb call works with one phone attached and fails outright with two '
-      + '("more than one device/emulator"), which is how the whole Android debug surface broke in '
-      + '#149. Take the serial from the LEASE (`DeviceConnectStatus.target.serial`) and pass it '
-      + 'through adbArgs — never resolve one locally, or two calls in a session can drive two '
-      + 'different phones and both report success.\n'
-      + 'If a call is genuinely meant to be global, add it to ALLOWED_UNTARGETED with the reason.',
-    ).toEqual([]);
+  it('the window is the call\'s own argv — a NEXT call\'s adbArgs( cannot vouch for it', () => {
+    const src = [
+      'export const seam = {',
+      '  list(): string {',
+      "    return execFileSync(adbBinary(), ['devices', '-l'], { timeout: 4000 });",
+      '  },',
+      '  type(text: string): void {',
+      "    execFileSync(adbBinary(), ['shell', 'input', 'text', text.replace(/'/g, '')], { timeout: 4000 });",
+      '  },',
+      '  tap(w: number): void {',
+      "    execFileSync(adbBinary(), ['shell', 'input', 'tap', String(w! / 2), `a ${w ? '`' : ''} b`,",
+      "                                                    String(w",
+      "                                                    / 2)].filter((x) => /'/.test(x) || 'a' + /'/.source), {});",
+      '  },',
+      '  name(serial: string): string {',
+      "    return execFileSync(adbBinary(), adbArgs(serial, [",
+      "      'shell', `getprop ${'ro.x'}`,",
+      "    ]), { timeout: 4000, encoding: 'utf8' });",
+      '  },',
+      '};',
+    ].join('\n');
+    expect(adbCallSitesIn('synthetic.ts', src).map((c) => [c.near, c.window.includes('adbArgs(')])).toEqual([
+      ['synthetic.ts:list', false],
+      ['synthetic.ts:type', false], // a quote inside a REGEX literal must not open a string
+      ['synthetic.ts:tap', false],  // `w! / 2`, `=> /'/`, `+ /'/`, deep-indented `/`, backtick in `${}`
+      ['synthetic.ts:name', true],
+    ]);
   });
 
-  it('every allowlist entry still corresponds to a real call site', () => {
-    // A stale allowlist entry is a permission nobody granted on purpose — it would silently exempt
-    // a future function that happens to reuse the name.
-    const found = new Set(adbCallSites().map((c) => c.near));
-    for (const key of Object.keys(ALLOWED_UNTARGETED)) {
-      expect(found, `ALLOWED_UNTARGETED lists "${key}", which no longer exists`).toContain(key);
-    }
+  it('routes every call through adbArgs(), or spends an allowlist row with a reason', () => {
+    assertExemptionLedger({
+      label: 'ALLOWED_UNTARGETED in adbTargeting',
+      population: adbCallSites()
+        .filter((c) => !c.window.includes('adbArgs('))
+        .map((c) => ({ item: c.near, site: c.near })),
+      exempt: ALLOWED_UNTARGETED,
+      floor: 1,
+      fix: 'adb call(s) that do not pass their argv through `adbArgs(serial, …)`. An un-targeted adb '
+        + 'call works with one phone attached and fails outright with two ("more than one '
+        + 'device/emulator"), which is how the whole Android debug surface broke in #149. Take the '
+        + 'serial from the LEASE (`DeviceConnectStatus.target.serial`) and pass it through adbArgs — '
+        + 'never resolve one locally, or two calls in a session can drive two different phones and '
+        + 'both report success.',
+    });
   });
 });

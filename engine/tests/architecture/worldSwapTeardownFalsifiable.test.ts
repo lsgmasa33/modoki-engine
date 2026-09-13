@@ -139,11 +139,11 @@ const BASELINE: Record<string, string> = {
     'engine/packages/modoki/tests/editor/canvas2DDirty.test.ts',
 };
 
-/**
- * Producers whose teardown a test swallows and which owe NO wiring test, each with the reason
- * VERIFIED by reading the site — never on assumption. An entry here without one defeats the guard.
- */
-const ALLOWLIST: Record<string, string> = {};
+/* ⚠️ **No ALLOWLIST (#1140).** "Producers whose teardown a test swallows and which owe NO wiring test"
+ *  was an EMPTY `Record` consulted with `in`. Deleted: a producer that genuinely owes no wiring
+ *  test is a counted `assertExemptionLedger` row with a reason VERIFIED by reading the site.
+ *  BASELINE above is a different kind of list — a coverage REGISTRY whose rows are proven by the
+ *  named wiring test, not spent against the swallowed set — so it stays as it is. */
 
 interface Scanned {
   rel: string;
@@ -536,9 +536,9 @@ describe('world-swap teardowns keep a test that can fail, and a new swallow is f
     ).toEqual([]);
   });
 
-  it('a producer whose teardown a test swallows is in BASELINE (or an explained allowlist)', () => {
+  it('a producer whose teardown a test swallows is in BASELINE', () => {
     const unprotected = [...SWALLOWED.entries()]
-      .filter(([p]) => !(p in BASELINE) && !(p in ALLOWLIST))
+      .filter(([p]) => !(p in BASELINE))
       .map(([p, tests]) => `${p}  <- swallowed by: ${tests.join(', ')}`);
 
     expect(
@@ -559,13 +559,11 @@ describe('world-swap teardowns keep a test that can fail, and a new swallow is f
         + 'still a no-op and is still flagged. See editor/store/selectionRestore.test.ts.\n\n'
         + 'Then MUTATION-CHECK it: delete the `onWorldSwap(...)` line in the source, confirm the '
         + 'test goes red, restore. A test that cannot fail is the defect being fixed here. Full '
-        + 'conventions: docs/falsifiable-tests.md.\n\n'
-        + 'If a producer genuinely owes no wiring test, add it to ALLOWLIST with a reason you '
-        + 'verified by reading the site.',
+        + 'conventions: docs/falsifiable-tests.md.',
     ).toEqual([]);
   });
 
-  it('BASELINE and ALLOWLIST have no stale entries', () => {
+  it('BASELINE has no stale entries', () => {
     const stale: string[] = [];
     for (const producer of Object.keys(BASELINE)) {
       if (!fs.existsSync(path.join(REPO, producer))) {
@@ -573,9 +571,6 @@ describe('world-swap teardowns keep a test that can fail, and a new swallow is f
       } else if (!PRODUCERS.has(moduleKey(producer))) {
         stale.push(`${producer} (BASELINE) — no longer registers an onWorldSwap teardown`);
       }
-    }
-    for (const producer of Object.keys(ALLOWLIST)) {
-      if (!SWALLOWED.has(producer)) stale.push(`${producer} (ALLOWLIST) — nothing swallows it now`);
     }
     expect(stale, 'These entries no longer describe reality — the producer was deleted, its '
       + 'teardown was removed, or the mock that swallowed it is gone. A stale entry hides the next '

@@ -14,13 +14,14 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { getTraitByName } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 
 /** Fields deliberately absent from `meta.fields`, each with the reason it is not a plain row. */
-const EXCLUDED: Record<string, string> = {
-  clips: 'owned by the AudioSourceClips bank editor, a custom Inspector section',
-};
+const EXCLUDED: ReadonlyArray<{ item: string; reason: string }> = [
+  { item: 'clips', reason: 'owned by the AudioSourceClips bank editor, a custom Inspector section' },
+];
 
 describe('AudioSource — every authored field is reachable in the editor', () => {
   it('has an Inspector row for every schema field except the named exclusions', () => {
@@ -30,20 +31,17 @@ describe('AudioSource — every authored field is reachable in the editor', () =
 
     const schema = Object.keys((meta!.trait as unknown as { schema: Record<string, unknown> }).schema);
     const rows = new Set(Object.keys(meta!.fields ?? {}));
-    const missing = schema.filter((f) => !rows.has(f) && !(f in EXCLUDED));
-
-    expect(
-      missing,
-      `these AudioSource fields are authored data with no way to edit them — add a row in `
-      + `registerTraits.ts, or add them to EXCLUDED here with the reason:\n  ${missing.join('\n  ')}`,
-    ).toEqual([]);
-  });
-
-  it('keeps the exclusion list honest — every excluded field still exists', () => {
-    // A renamed or removed field left in EXCLUDED would silently widen the guard's blind spot.
-    registerAllTraits();
-    const meta = getTraitByName('AudioSource');
-    const schema = new Set(Object.keys((meta!.trait as unknown as { schema: Record<string, unknown> }).schema));
-    for (const f of Object.keys(EXCLUDED)) expect(schema.has(f), `EXCLUDED names '${f}', which is gone`).toBe(true);
+    // On the shared ledger since #1140 — the separate "every excluded field still exists" test only
+    // asked the field existed, not that it still had no row; a field that gained a plain Inspector
+    // row kept its exclusion.
+    assertExemptionLedger({
+      label: 'EXCLUDED in audioSourceInspectorCoverage',
+      population: schema.filter((f) => !rows.has(f)).map((f) => ({ item: f, site: `AudioSource.${f}` })),
+      exempt: EXCLUDED,
+      scanned: schema.length,
+      floor: 8,
+      fix: 'these AudioSource fields are authored data with no way to edit them — add a row in '
+        + 'registerTraits.ts, or add them to EXCLUDED here with the reason.',
+    });
   });
 });

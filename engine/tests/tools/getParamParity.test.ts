@@ -23,16 +23,21 @@ import { CONTRACTS } from '../../tools/modoki-mcp/src/contracts';
 import { getTool } from '../../tools/modoki-mcp/src/registry';
 import { loadSurface, realRequests, type Surface } from './mcpSurface';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 
 /** Routes NOT owned by `editorBackendRouter` — the long-running SSE endpoints live in
  *  `vite-asset-scanner.ts` / the Electron host, so this harness cannot reach them and their params
- *  are covered by their own tests. Shrink-only: a route that moves INTO the router should be
- *  deleted from here, and a new entry needs a reason. */
-const NOT_ROUTER_OWNED = new Set<string>([
-  '/api/build',
-  '/api/add-native-target',
-  '/api/ota/publish',
-]);
+ *  are covered by their own tests.
+ *
+ *  ⚠️ Ownership is MEASURED, not read off this list (#1140 close-out): `measure()` asks the real
+ *  router, which answers `null` for a route it does not handle, and these rows are SPENT against
+ *  that. The list used to be the skip condition itself, and its "shrink-only" test compared the
+ *  skipped TOOL names — so a route that moved into the router stayed skipped with that test green. */
+const NOT_ROUTER_OWNED: ReadonlyArray<{ item: string; reason: string }> = [
+  { item: '/api/build', reason: 'SSE build stream, served by vite-asset-scanner / the Electron host' },
+  { item: '/api/add-native-target', reason: 'SSE native-target scaffold stream, served outside the router' },
+  { item: '/api/ota/publish', reason: 'SSE OTA publish stream, served outside the router' },
+];
 
 /** A plausible value per zod type, so every optional param is exercised rather than defaulted
  *  away. A fixture that passes nothing tests nothing — the same rule `minimalArgs` follows, in
@@ -174,14 +179,19 @@ describe('modoki_profiler: the route READS the params the tool sends (the sweep 
   });
 });
 
-async function measure(): Promise<{ rows: Row[]; skipped: string[]; notReached: string[] }> {
+async function measure(): Promise<{ rows: Row[]; skipped: Array<{ item: string; site: string }>; probed: number; notReached: string[] }> {
   const s = (surface = loadSurface());
   const rows: Row[] = [];
-  const skipped: string[] = [];
+  const skipped: Array<{ item: string; site: string }> = [];
+  let probed = 0;
   const notReached: string[] = [];
   for (const [name, c] of Object.entries(CONTRACTS)) {
     if (c.method !== 'GET' || !c.route) continue;
-    if (NOT_ROUTER_OWNED.has(c.route)) { skipped.push(name); continue; }
+    probed++;
+    // A handler that THROWS on an empty query still owns the route; only `null` means "not mine".
+    const owned = await handleBackendRequest(routerCtx(), { method: 'GET', urlPath: c.route, query: new URLSearchParams(), body: undefined })
+      .then((r) => r !== null, () => true);
+    if (!owned) { skipped.push({ item: c.route, site: `${c.route} (${name})` }); continue; }
     const entry = getTool(name)!;
     const args: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(entry.shape)) args[k] = synth(v);
@@ -200,7 +210,7 @@ async function measure(): Promise<{ rows: Row[]; skipped: string[]; notReached: 
     await handleBackendRequest(routerCtx(), { method: 'GET', urlPath: c.route, query: proxy, body: undefined });
     rows.push({ tool: name, route: c.route, sent: keys, unread: keys.filter((k) => !read.has(k)) });
   }
-  return { rows, skipped, notReached };
+  return { rows, skipped, probed, notReached };
 }
 
 describe('GET query-param parity (tool → route)', () => {
@@ -228,10 +238,18 @@ describe('GET query-param parity (tool → route)', () => {
     expect(keys.filter((k) => !read.has(k))).toEqual(['nonsense__']);
   });
 
-  it('the not-router-owned skip list is exactly the long-running SSE routes', async () => {
+  it('the routes the router does not own are exactly NOT_ROUTER_OWNED', async () => {
     // Shrink-only, like MUTATING_GETS: a route that migrates into the router must leave this list
-    // rather than sit here forever exempt.
-    const { skipped } = await measure();
-    expect(skipped.sort()).toEqual(['modoki_add_native_target', 'modoki_build', 'modoki_ota_publish']);
+    // rather than sit here forever exempt — and now it cannot, because its row finds nothing.
+    const { skipped, probed } = await measure();
+    assertExemptionLedger({
+      label: 'NOT_ROUTER_OWNED in getParamParity',
+      population: skipped,
+      exempt: NOT_ROUTER_OWNED,
+      scanned: probed,
+      floor: 10,
+      fix: 'these GET tools call a route the router answers null for, so their params are never checked. '
+        + 'Serve the route from editorBackendRouter, or add it to NOT_ROUTER_OWNED with where it IS served.',
+    });
   });
 });

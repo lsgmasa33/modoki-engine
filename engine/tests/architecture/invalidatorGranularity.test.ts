@@ -54,6 +54,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 
 const REPO = path.resolve(__dirname, '../../..');
 const LOADERS_DIR = path.join(REPO, 'engine/packages/modoki/src/runtime/loaders');
@@ -205,9 +206,15 @@ function scanTeardownBackedInvalidators(): { name: string; file: string; code: s
  *  correct by a DIFFERENT mechanism than a teardown-token key bump. ⚠️ **This list is a licence to
  *  rot if it's ever treated as a place to silence a failure** — a new entry needs the same standard
  *  of proof as the one below: a named alternative mechanism, cited at file:line, not "this one is
- *  fine". The test below asserts this set is EXACTLY `['invalidateTexture']`, so adding (or
- *  removing) a member is a visible edit to THIS file, not a quiet change to a regex elsewhere. */
-const EXEMPT_FROM_PER_KEY_CHECK: ReadonlySet<string> = new Set([
+ *  fine".
+ *
+ *  ⚠️ **It excuses the UNDERSHOOT rule only, and is keyed `file::name` (#1140).** It used to be a
+ *  `Set` of names that `continue`d past BOTH checks — so an `invalidateTexture` that grew an
+ *  `.invalidateAll(` (the #852/#856 overshoot) was pardoned by a reason that argues only about why no
+ *  per-key bump is needed, and a same-named invalidator in another module inherited it too. One
+ *  ledger per ban: the overshoot rule has no pardons at all. Its old self-pin (`toEqual(['invalidate
+ *  Texture'])` plus "still found") is the ledger's over-blessed arm. */
+const EXEMPT_FROM_PER_KEY_CHECK: ReadonlyArray<{ item: string; reason: string }> = [
   // `invalidateTexture` (textureResolver.ts): `loadTexture3D` inserts its cache entry into
   // `texCache` SYNCHRONOUSLY, before any `await` (textureResolver.ts:510,
   // `texCache.set(key, entry)`), and every write that happens AFTER an await identity-checks
@@ -219,8 +226,9 @@ const EXEMPT_FROM_PER_KEY_CHECK: ReadonlySet<string> = new Set([
   // exists to do. `sharedTextureLiveness` (this module's token) is used here only via `.capture()`
   // for a different sequencing guarantee (racing `disposeAllSharedTextures`), never
   // `.invalidateKey(` or `.invalidateAll(`.
-  'invalidateTexture',
-]);
+  { item: 'textureResolver.ts::invalidateTexture',
+    reason: 'no stale-generation window: the cache entry is inserted synchronously and every post-await write identity-checks (see above)' },
+];
 
 describe('every teardown-backed loader invalidator evicts per-key AND never wholesale (#487 -> #852 -> #856/#863)', () => {
   const all = scanTeardownBackedInvalidators();
@@ -231,36 +239,26 @@ describe('every teardown-backed loader invalidator evicts per-key AND never whol
     expect(all.length).toBeGreaterThan(10);
   });
 
-  it('the sanctioned exemption set is exactly the expected one, and every exempted name is real', () => {
-    expect([...EXEMPT_FROM_PER_KEY_CHECK].sort()).toEqual(['invalidateTexture']);
-    const found = new Set(all.map((f) => f.name));
-    for (const name of EXEMPT_FROM_PER_KEY_CHECK) {
-      expect(found.has(name), `exempted name "${name}" was not found by the scan above — a rename ` +
-        'or removal left this exemption pointing at nothing, silently exempting no one').toBe(true);
-    }
+  it("every invalidator's own body calls .invalidateKey( — UNDERSHOOT (#863), pardoned only through EXEMPT_FROM_PER_KEY_CHECK", () => {
+    assertExemptionLedger({
+      label: 'EXEMPT_FROM_PER_KEY_CHECK in invalidatorGranularity',
+      population: all
+        .filter(({ name, code }) => !/\.invalidateKey\(/.test(extractFunctionBody(code, name)))
+        .map(({ name, file }) => ({ item: `${file}::${name}`, site: `${name} (${file})` })),
+      exempt: EXEMPT_FROM_PER_KEY_CHECK,
+      floor: 1,
+      fix: 'body never calls ".invalidateKey(" — UNDERSHOOT (#863): a stale in-flight load for this '
+        + 'exact key that resolves after this eviction has nothing re-checking its liveness, so it '
+        + 're-caches pre-invalidation bytes on top of whatever re-import follows.',
+    });
   });
 
-  it("every non-exempt invalidator's own body calls .invalidateKey( and never .invalidateAll(", () => {
-    const violators: string[] = [];
-    for (const { name, file, code } of all) {
-      if (EXEMPT_FROM_PER_KEY_CHECK.has(name)) continue;
-      const body = extractFunctionBody(code, name);
-      if (!/\.invalidateKey\(/.test(body)) {
-        violators.push(
-          `${name} (${file}): body never calls ".invalidateKey(" — UNDERSHOOT (#863): a stale ` +
-          'in-flight load for this exact key that resolves after this eviction has nothing ' +
-          're-checking its liveness, so it re-caches pre-invalidation bytes on top of whatever ' +
-          're-import follows.',
-        );
-      }
-      if (/\.invalidateAll\(/.test(body)) {
-        violators.push(
-          `${name} (${file}): body calls ".invalidateAll(" — OVERSHOOT (#852/#856): this ` +
-          'supersedes every OTHER in-flight load in the module, not just the one keyed by this ' +
-          'invalidator\'s own argument.',
-        );
-      }
-    }
+  it('no invalidator body calls .invalidateAll( — OVERSHOOT (#852/#856), with no pardons', () => {
+    const violators = all
+      .filter(({ name, code }) => /\.invalidateAll\(/.test(extractFunctionBody(code, name)))
+      .map(({ name, file }) => `${name} (${file}): body calls ".invalidateAll(" — OVERSHOOT (#852/#856): this `
+        + 'supersedes every OTHER in-flight load in the module, not just the one keyed by this '
+        + 'invalidator\'s own argument.');
     expect(violators, violators.join('\n')).toEqual([]);
   });
 });

@@ -19,6 +19,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 
 const REPO = path.resolve(__dirname, '../../..');
 const RUNTIME_SRC = path.join(REPO, 'engine/packages/modoki/src/runtime');
@@ -64,19 +65,25 @@ const WIRED = new Set(invalidatorTableValues(consumerSrc));
  * the call site, not assumed. This is a list of invalidators driven by a DIFFERENT mechanism, NOT a
  * list of exemptions: adding a name here without a verified caller defeats the entire guard, because
  * it makes the test green while the underlying defect (an invalidator nothing calls) still exists.
+ *
+ * Keyed per NAME (a caller drives an invalidator by name, and `WIRED` is by name) and spent through
+ * `assertExemptionLedger` since #1140 — it used to be a `Record` looked up with `in` and NO staleness
+ * check, so a name that became WIRED, or was renamed or deleted, kept its row. ⚠️ That is exactly the
+ * `invalidateMaterial` shape noted below: #842 wired it, and a leftover row would have silently kept
+ * vouching after the wiring was reverted.
  */
-const ALLOWLIST: Record<string, string> = {
+const ALLOWLIST: ReadonlyArray<{ item: string; reason: string }> = [
   // Driven by the agent/editor "invalidate-assets" op (agentBridge.ts registerAgentOp) and directly
   // by editor asset-view panels on manual re-import/edit — not by the live-reload file watcher.
-  invalidateTexture: 'agentBridge.ts registerAgentOp(\'invalidate-assets\') + makeTexture2D.ts, TextureAssetView.tsx, assetViews/reimport.ts, editor/scene/modelImport.ts',
-  invalidateAudio: 'agentBridge.ts registerAgentOp(\'invalidate-assets\') + assetViews/reimport.ts, AudioAssetView.tsx',
-  invalidateModel: 'agentBridge.ts registerAgentOp(\'invalidate-assets\') + assetViews/reimport.ts, ModelAssetView.tsx, editor/scene/modelImport.ts',
-  invalidateEnvironment: 'agentBridge.ts registerAgentOp(\'invalidate-assets\') + assetViews/reimport.ts, EnvironmentAssetView.tsx',
+  { item: 'invalidateTexture', reason: 'agentBridge.ts registerAgentOp(\'invalidate-assets\') + makeTexture2D.ts, TextureAssetView.tsx, assetViews/reimport.ts, editor/scene/modelImport.ts' },
+  { item: 'invalidateAudio', reason: 'agentBridge.ts registerAgentOp(\'invalidate-assets\') + assetViews/reimport.ts, AudioAssetView.tsx' },
+  { item: 'invalidateModel', reason: 'agentBridge.ts registerAgentOp(\'invalidate-assets\') + assetViews/reimport.ts, ModelAssetView.tsx, editor/scene/modelImport.ts' },
+  { item: 'invalidateEnvironment', reason: 'agentBridge.ts registerAgentOp(\'invalidate-assets\') + assetViews/reimport.ts, EnvironmentAssetView.tsx' },
   // Font invalidation has its OWN channel: assetManifest.ts's onFontInvalidated(...) fires these
   // directly (module-load subscriptions in fontAtlasLoader.ts / fontLoader.ts) whenever a font
   // re-import or Font-Inspector mode flip changes the manifest hash — not via the scene-change path.
-  invalidateFont: 'assetManifest.ts onFontInvalidated(...) fires it — subscribed at module load in fontAtlasLoader.ts',
-  invalidateFontFace: 'assetManifest.ts onFontInvalidated(...) fires it — subscribed at module load in fontLoader.ts',
+  { item: 'invalidateFont', reason: 'assetManifest.ts onFontInvalidated(...) fires it — subscribed at module load in fontAtlasLoader.ts' },
+  { item: 'invalidateFontFace', reason: 'assetManifest.ts onFontInvalidated(...) fires it — subscribed at module load in fontLoader.ts' },
   // Prefabs/rigged models are edited through their own Inspector asset-view panels
   // (editor/panels/assetViews/persist.ts wraps the invalidator per asset kind) or the prefab
   // apply/instantiate flow — not the live-reload watcher.
@@ -85,15 +92,15 @@ const ALLOWLIST: Record<string, string> = {
   // comment below: it has an Inspector caller, but that only serves edits made INSIDE the editor.
   // #842 wired it into ASSET_CACHE_INVALIDATORS (agentBridge.ts) too, so it is no longer allowlisted
   // — it must show as WIRED now, and an entry here for it again would silently un-fix #842.
-  invalidatePrefab: 'editor/scene/prefab.ts (prefab apply/instantiate flow)',
-  invalidateRiggedModel: 'editor/scene/modelImport.ts (rigged-model re-import step)',
+  { item: 'invalidatePrefab', reason: 'editor/scene/prefab.ts (prefab apply/instantiate flow)' },
+  { item: 'invalidateRiggedModel', reason: 'editor/scene/modelImport.ts (rigged-model re-import step)' },
   // `invalidatePixiShaderProgram` is never called directly from ASSET_CACHE_INVALIDATORS — it's
   // called FROM `spriteMaterialCache.ts`'s `invalidateShader`, which IS wired (as `shader:`) below
   // (#842). Verified by reading spriteMaterialCache.ts: `invalidateShader` calls it unconditionally,
   // alongside a per-key eviction of the one guid the path resolves to (#852 — it used to be a
   // wholesale `clearSpriteMaterialCache()`, which now runs only on the unresolved-path fallback).
-  invalidatePixiShaderProgram: 'runtime/loaders/spriteMaterialCache.ts\'s invalidateShader (itself wired into ASSET_CACHE_INVALIDATORS as `shader:`)',
-};
+  { item: 'invalidatePixiShaderProgram', reason: 'runtime/loaders/spriteMaterialCache.ts\'s invalidateShader (itself wired into ASSET_CACHE_INVALIDATORS as `shader:`)' },
+];
 
 describe('every invalidator is reachable from production (#74)', () => {
   it('found a plausible number of invalidators (sanity: the parse works, so a pass means something)', () => {
@@ -102,19 +109,19 @@ describe('every invalidator is reachable from production (#74)', () => {
   });
 
   it('every exported invalidator is wired into ASSET_CACHE_INVALIDATORS or verified in the allowlist', () => {
-    const unreachable = INVALIDATORS.filter(
-      (inv) => !WIRED.has(inv.name) && !(inv.name in ALLOWLIST),
-    );
-    expect(
-      unreachable,
-      'These invalidators (name + defining file) have no caller in ASSET_CACHE_INVALIDATORS and no ' +
-        'verified allowlist entry here. The silent symptom: the asset cache holds its PRE-EDIT ' +
-        'contents forever, which reads as "my change was ignored" rather than as a stale cache, and ' +
-        'a read_asset_def → write_asset round-trip reverts the file that was just written (the read ' +
-        'reports the live cache as authoritative). Fix it one of two ways: (1) wire the invalidator ' +
-        'into ASSET_CACHE_INVALIDATORS in engine/app/debug/agentBridge.ts, or (2) if it is genuinely ' +
-        'driven by a different mechanism, add it to the ALLOWLIST above with a one-line reason naming ' +
-        'the REAL caller you verified by reading the call site — never add a name here on assumption.',
-    ).toEqual([]);
+    assertExemptionLedger({
+      label: 'ALLOWLIST in invalidatorsAreReachable',
+      population: INVALIDATORS.filter((inv) => !WIRED.has(inv.name)).map((inv) => ({ item: inv.name, site: `${inv.name} (${inv.file})` })),
+      exempt: ALLOWLIST,
+      floor: 1,
+      fix: 'These invalidators have no caller in ASSET_CACHE_INVALIDATORS and no verified allowlist '
+        + 'entry here. The silent symptom: the asset cache holds its PRE-EDIT contents forever, which '
+        + 'reads as "my change was ignored" rather than as a stale cache, and a read_asset_def → '
+        + 'write_asset round-trip reverts the file that was just written. Fix it one of two ways: (1) '
+        + 'wire the invalidator into ASSET_CACHE_INVALIDATORS in engine/app/debug/agentBridge.ts, or '
+        + '(2) if it is genuinely driven by a different mechanism, add it to the ALLOWLIST above with a '
+        + 'one-line reason naming the REAL caller you verified by reading the call site. A row that '
+        + 'blesses more than exists means the invalidator got wired or went away: delete the row.',
+    });
   });
 });

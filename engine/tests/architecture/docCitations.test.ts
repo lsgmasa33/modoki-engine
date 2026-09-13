@@ -359,48 +359,59 @@ function scanDocPathCitations(historical: ReadonlySet<string>): Map<string, Set<
   for (const file of repoFiles()) {
     const relFile = rel(file);
     if (exempt.has(relFile) || isNonCitingSource(relFile)) continue;
-    const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/);
-    lines.forEach((line, i) => {
-      // The match keeps any PREFIX the citation carries, because a `docs/…` tail can be the end
-      // of a longer, perfectly good relative path — `docs/projects.md` cites
-      // `../games/wordweave/docs/feel.md`, and reading only the `docs/feel.md` tail out of it
-      // asks whether a file exists at the repo root that was never claimed to be there.
-      for (const m of line.match(/(?:[A-Za-z0-9._-]+\/)*docs\/[A-Za-z0-9._/-]+\.md/g) ?? []) {
-        const full = m.replace(/[.,)]+$/, '');
-        const cited = full.slice(full.indexOf('docs/'));
-        if (historical.has(cited)) continue;
-        // A prefixed citation is relative to the CITING file's own directory. `path.relative`
-        // back to a repo-relative path so `exists` (which is repo-root-anchored) can answer.
-        if (full !== cited) {
-          const resolved = path.relative(
-            repoRoot, path.resolve(path.dirname(path.join(repoRoot, relFile)), full),
-          );
-          const ok = !resolved.startsWith('..') && exists(resolved);
-          // ⚠️ An EXPLICITLY relative citation (`./` or `../`) is judged only by that
-          // resolution — it names a path, and a path that does not exist is wrong however many
-          // other files share its tail. Falling through to the root union here was the whole
-          // defect this branch was added to fix, restored one line later: a bogus
-          // `../games/wordweave/docs/rendering.md` in `docs/projects.md` passed, satisfied by
-          // the repo-root `docs/rendering.md` twin. Unlike the documented bare-name blind spot
-          // below, nothing about this case is ambiguous.
-          //
-          // A NON-relative prefix keeps the fallback: `docs/api-reference.md` writes
-          // `site/.vitepress/config.ts` repo-anchored, which resolves under a root rather
-          // than beside the citing file.
-          if (/^\.\.?\//.test(full)) {
-            if (ok) continue;
-            if (!offenders.has(full)) offenders.set(full, new Set());
-            offenders.get(full)!.add(`${relFile}:${i + 1}`);
-            continue;
-          }
-          if (ok) continue;
-        }
-        if (docRootsFor(relFile).some((r) => exists(r ? `${r}/${cited}` : cited))) continue;
-        if (!offenders.has(cited)) offenders.set(cited, new Set());
-        offenders.get(cited)!.add(`${relFile}:${i + 1}`);
-      }
-    });
+    docPathOffendersInFile(relFile, fs.readFileSync(file, 'utf8').split(/\r?\n/), historical, offenders);
   }
+  return offenders;
+}
+
+/** Rule 1's per-FILE body, so the SELF_QUOTING load-bearing check (#1140) runs the same matcher on
+ *  the one file the scan skips, rather than a lookalike. Adds into `offenders` and returns it. */
+function docPathOffendersInFile(
+  relFile: string,
+  lines: readonly string[],
+  historical: ReadonlySet<string>,
+  offenders: Map<string, Set<string>> = new Map(),
+): Map<string, Set<string>> {
+  lines.forEach((line, i) => {
+    // The match keeps any PREFIX the citation carries, because a `docs/…` tail can be the end
+    // of a longer, perfectly good relative path — `docs/projects.md` cites
+    // `../games/wordweave/docs/feel.md`, and reading only the `docs/feel.md` tail out of it
+    // asks whether a file exists at the repo root that was never claimed to be there.
+    for (const m of line.match(/(?:[A-Za-z0-9._-]+\/)*docs\/[A-Za-z0-9._/-]+\.md/g) ?? []) {
+      const full = m.replace(/[.,)]+$/, '');
+      const cited = full.slice(full.indexOf('docs/'));
+      if (historical.has(cited)) continue;
+      // A prefixed citation is relative to the CITING file's own directory. `path.relative`
+      // back to a repo-relative path so `exists` (which is repo-root-anchored) can answer.
+      if (full !== cited) {
+        const resolved = path.relative(
+          repoRoot, path.resolve(path.dirname(path.join(repoRoot, relFile)), full),
+        );
+        const ok = !resolved.startsWith('..') && exists(resolved);
+        // ⚠️ An EXPLICITLY relative citation (`./` or `../`) is judged only by that
+        // resolution — it names a path, and a path that does not exist is wrong however many
+        // other files share its tail. Falling through to the root union here was the whole
+        // defect this branch was added to fix, restored one line later: a bogus
+        // `../games/wordweave/docs/rendering.md` in `docs/projects.md` passed, satisfied by
+        // the repo-root `docs/rendering.md` twin. Unlike the documented bare-name blind spot
+        // below, nothing about this case is ambiguous.
+        //
+        // A NON-relative prefix keeps the fallback: `docs/api-reference.md` writes
+        // `site/.vitepress/config.ts` repo-anchored, which resolves under a root rather
+        // than beside the citing file.
+        if (/^\.\.?\//.test(full)) {
+          if (ok) continue;
+          if (!offenders.has(full)) offenders.set(full, new Set());
+          offenders.get(full)!.add(`${relFile}:${i + 1}`);
+          continue;
+        }
+        if (ok) continue;
+      }
+      if (docRootsFor(relFile).some((r) => exists(r ? `${r}/${cited}` : cited))) continue;
+      if (!offenders.has(cited)) offenders.set(cited, new Set());
+      offenders.get(cited)!.add(`${relFile}:${i + 1}`);
+    }
+  });
   return offenders;
 }
 
@@ -615,15 +626,20 @@ function scanDocPathCitationsUnfiltered(): Map<string, Set<string>> {
  *
  *  Returns basename → the `file:line` sites that named it. */
 let scanBareNameCitationsCache: Map<string, Set<string>> | undefined;
-function scanBareNameCitations(): Map<string, Set<string>> {
-  if (scanBareNameCitationsCache) return scanBareNameCitationsCache;
-  const exempt = new Set(SELF_QUOTING);
+/** The basenames the bare scan looks for: retired basenames minus the ambiguous ones. Its own
+ *  function so the SELF_QUOTING load-bearing check (#1140) asks with the scan's exact bases. */
+function bareNameBases(): Set<string> {
   const ambiguous = ambiguousRetiredBasenames();
-  const bases = new Set(
+  return new Set(
     RETIRED_DOCS_NAMED_ON_PURPOSE
       .map((e) => retiredBasename(e.cited))
       .filter((b) => !ambiguous.has(b)),
   );
+}
+function scanBareNameCitations(): Map<string, Set<string>> {
+  if (scanBareNameCitationsCache) return scanBareNameCitationsCache;
+  const exempt = new Set(SELF_QUOTING);
+  const bases = bareNameBases();
   const offenders = new Map<string, Set<string>>();
   for (const file of repoFiles()) {
     const relFile = rel(file);
@@ -656,6 +672,23 @@ function sitesNamingEntry(
   const out = sitesNaming(scannedPaths, cited);
   for (const s of scannedBare.get(retiredBasename(cited)) ?? []) out.add(s);
   return out;
+}
+
+/** The link rule's per-FILE body: every markdown link target in `abs` that does not resolve.
+ *  Its own function so the SELF_QUOTING load-bearing check (#1140) runs the rule's own matcher. */
+function unresolvedLinksInFile(abs: string): { checked: number; offenders: string[] } {
+  const relFile = rel(abs);
+  const offenders: string[] = [];
+  let checked = 0;
+  for (const { line: lineNo, target } of documentLinkTargets(fs.readFileSync(abs, 'utf8').split(/\r?\n/))) {
+    checked += 1;
+    const resolved = path.relative(repoRoot, path.resolve(path.dirname(abs), target));
+    // A target escaping the repo is wrong for the same reason a missing one is: nothing a
+    // reader can follow. Reported rather than skipped, so `../../../../etc/x.md` cannot hide.
+    if (!resolved.startsWith('..') && exists(resolved)) continue;
+    offenders.push(`${relFile}:${lineNo} → ${target}`);
+  }
+  return { checked, offenders };
 }
 
 describe('cited doc paths resolve (#194)', () => {
@@ -715,6 +748,42 @@ describe('cited doc paths resolve (#194)', () => {
         + 'fold the content into the feature doc and point there, or drop the pointer if the '
         + 'surrounding text stands on its own.',
     });
+  });
+
+  it('SELF_QUOTING is load-bearing in EACH of the three scans that skip it (#1140)', (ctx) => {
+    // SELF_QUOTING is a whole-FILE exclusion on purpose (its docblock states the hole and why), so
+    // it is not spent per occurrence. What it lacked was any staleness check at all — and it is
+    // read by three independent scans, so "load-bearing" is three claims, not one. A scan in which
+    // this file no longer produces anything is a scan the exclusion pardons nothing in, and it
+    // should stop being applied there (rules 3 and 4 carried exactly that: an inline skip of this
+    // file that excused nothing, measured and deleted in #1140).
+    if (!hasPrivateDocs() || !hasInternalGames()) {
+      ctx.skip();
+      return;
+    }
+    const inert: string[] = [];
+    const bases = bareNameBases();
+    const historical = new Set(RETIRED_DOCS_NAMED_ON_PURPOSE.map((e) => e.cited));
+    for (const relFile of SELF_QUOTING) {
+      const abs = path.join(repoRoot, relFile);
+      const lines = fs.readFileSync(abs, 'utf8').split(/\r?\n/);
+      if (docPathOffendersInFile(relFile, lines, historical).size === 0) {
+        inert.push(`${relFile} — rule 1 (docs/**.md paths) finds nothing to excuse in it`);
+      }
+      if (bareNameMentions(lines, bases).length === 0) {
+        inert.push(`${relFile} — the bare-name scan finds nothing to excuse in it`);
+      }
+      if (unresolvedLinksInFile(abs).offenders.length === 0) {
+        inert.push(`${relFile} — the link rule finds nothing to excuse in it`);
+      }
+    }
+    expect(
+      inert,
+      'SELF_QUOTING is applied by a scan in which the file excuses nothing. Stop applying it in that '
+        + 'scan AND remove that scan\'s arm from this test in the same change (or drop the row, and '
+        + 'this test, if all three are listed) — an exclusion that pardons nothing would silently '
+        + 'pardon the first real defect written there.',
+    ).toEqual([]);
   });
 
   it('documentLinkTargets: a fence hides its own contents and nothing after it (#578)', () => {
@@ -1139,17 +1208,9 @@ describe('cited doc paths resolve (#194)', () => {
       // PUBLIC repo, so `](CLA.md)` in a workflow there resolves beside the file it becomes, not
       // beside the file it is. That is a different tree, and this repo cannot answer for it.
       if (relFile.startsWith('oss/')) continue;
-      const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/);
-      for (const { line: lineNo, target } of documentLinkTargets(lines)) {
-        checked += 1;
-        const resolved = path.relative(
-          repoRoot, path.resolve(path.dirname(file), target),
-        );
-        // A target escaping the repo is wrong for the same reason a missing one is: nothing a
-        // reader can follow. Reported rather than skipped, so `../../../../etc/x.md` cannot hide.
-        if (!resolved.startsWith('..') && exists(resolved)) continue;
-        offenders.push(`${relFile}:${lineNo} → ${target}`);
-      }
+      const found = unresolvedLinksInFile(file);
+      checked += found.checked;
+      offenders.push(...found.offenders);
     }
     // Vacuity floor, like every other rule in this file. `offenders` is only ever appended from
     // inside the `markdownLinkTargets` loop, so breaking the MATCHER makes this check zero targets
@@ -1247,34 +1308,39 @@ function projectRoots(): string[] {
 /** Citations that intentionally name a file that does not exist. Every entry states why —
  *  without the reason this list becomes the place stale pointers go to hide.
  *
- *  `in` scopes an entry to ONE citing file. Use it whenever the exemption is a property of the
- *  sentence rather than of the path: a doc that names `runtime/setup.ts` to say the project
- *  *has no such file* is asserting its ABSENCE, which is both true and useful — but exempting
- *  that path repo-wide would green-light a genuinely stale pointer to it in some other doc. */
-const SOURCE_CITATION_EXEMPT: ReadonlyArray<{ cited: string; reason: string; in?: string }> = [
+ *  ⚠️ **Keyed `citingFile::cited` and SPENT (#1140).** This was a `.some()` match on the cited
+ *  path with an OPTIONAL `in` scope, so three of its five rows pardoned that path in every doc in
+ *  the repo — a plan naming its unbuilt file also excused a genuinely stale pointer to the same
+ *  path written into any other doc, which is the case the old `in` field's own docblock warned
+ *  about and then left optional. One row per (citing doc, path), matching rule 1's grain: the path
+ *  is the identity, so two mentions of one absent file in one doc are one fact. The ledger's
+ *  over-blessed arm replaces both old meta-tests — a row whose citation was edited away and a row
+ *  whose file came back each leave it blessing a (doc, path) the scan no longer reports. */
+const SOURCE_CITATION_EXEMPT: ReadonlyArray<{ item: string; reason: string }> = [
   // --- Named to assert the file is ABSENT. The claim is true; there is nothing to repoint.
   {
-    cited: 'runtime/setup.ts',
-    in: 'demos/2d-physics-demo/CLAUDE.md',
+    item: 'demos/2d-physics-demo/CLAUDE.md::runtime/setup.ts',
     reason: '"No runtime/setup.ts, systems.ts, traits.ts, or ui/" — the demo is stock engine traits '
       + 'only, and saying so is the point of the line',
   },
 
   // --- Deleted ON PURPOSE, and the doc's subject IS the deletion.
   {
-    cited: 'scripts/sync-agent-configs.mjs',
-    in: 'docs/todo.md',
+    item: 'docs/todo.md::scripts/sync-agent-configs.mjs',
     reason: 'deleted with the multi-CLI support it generated (#793). The declined-decision record '
       + 'names it to say what existed — a doc describing its own subject\'s deletion, which is '
       + 'the case this list\'s own failure message calls out',
   },
 
   // --- Not built yet. A plan naming its future file is the plan doing its job.
-  { cited: 'editor/inspectorRegistry.ts', reason: 'custom-editor-windows-inspectors plan: proposed, unbuilt' },
-  { cited: 'tests/sling-trait-hygiene.test.ts', reason: 'entity-id-guard plan: proposed, unbuilt' },
+  { item: 'docs/plans/custom-editor-windows-inspectors-plan.md::editor/inspectorRegistry.ts',
+    reason: 'custom-editor-windows-inspectors plan: proposed, unbuilt' },
+  { item: 'docs/plans/entity-id-guard-game-traits-plan.md::tests/sling-trait-hygiene.test.ts',
+    reason: 'entity-id-guard plan: proposed, unbuilt' },
 
   // --- A worked example, not a pointer.
-  { cited: 'scripts/stage-foo.cjs', reason: 'bundle-new-tools.md: placeholder name in a how-to template' },
+  { item: 'docs/bundle-new-tools.md::scripts/stage-foo.cjs',
+    reason: 'bundle-new-tools.md: placeholder name in a how-to template' },
 ];
 
 /** Every `.md` whose source-path citations must resolve: the engine docs, plus every `CLAUDE.md`
@@ -1310,10 +1376,6 @@ function rootsFor(relFile: string): string[] {
   return [...SOURCE_ROOTS, ...projectRoots()];
 }
 
-const isExemptBySourceList = (cited: string, citingFile: string) => SOURCE_CITATION_EXEMPT.some(
-  (e) => e.cited === cited && (e.in === undefined || e.in === citingFile),
-);
-
 /** Rule 2's scan, factored out for the same reason as `scanDocPathCitations` above: the
  *  "is this exemption still load-bearing" check (#578, close-out sweep) has to ask rule 2's OWN
  *  matcher, not a lookalike.
@@ -1327,11 +1389,10 @@ const isExemptBySourceList = (cited: string, citingFile: string) => SOURCE_CITAT
  *  structural rather than lucky, since a divergence would be silent in the worse direction —
  *  reporting an exemption inert while rule 2 is still using it, and inviting its deletion.
  *
- *  `isExempt` is a parameter so the load-bearing check can pass a predicate that exempts nothing.
+ *  It applies NO exemption: `SOURCE_CITATION_EXEMPT` is spent against its output (#1140), which is
+ *  what lets one scan answer both "unexcused" and "pardons nothing any more".
  *  Returns cited-path → the `file:line` sites that named it. */
-function scanSourcePathCitations(
-  isExempt: (cited: string, citingFile: string) => boolean,
-): Map<string, Set<string>> {
+function scanSourcePathCitations(): Map<string, Set<string>> {
   const offenders = new Map<string, Set<string>>();
   // Anchored at a known top-level segment so ordinary prose ("the .ts file") cannot match.
   // `tsx` precedes `ts` and the trailing look-ahead is load-bearing: `ts|tsx` would match the
@@ -1346,7 +1407,6 @@ function scanSourcePathCitations(
     lines.forEach((line, i) => {
       for (const m of line.match(RE) ?? []) {
         const cited = m.replace(/[.,)]+$/, '');
-        if (isExempt(cited, relFile)) continue;
         if (roots.some((r) => exists(r ? `${r}/${cited}` : cited))) continue;
         if (!offenders.has(cited)) offenders.set(cited, new Set());
         offenders.get(cited)!.add(`${relFile}:${i + 1}`);
@@ -1517,64 +1577,31 @@ describe('source paths cited in docs and CLAUDE.md resolve (#194, second face; #
       ctx.skip();
       return;
     }
-    const offenders = scanSourcePathCitations(isExemptBySourceList);
+    const offenders = scanSourcePathCitations();
 
-    const report = [...offenders.entries()]
-      .sort()
-      .map(([p, sites]) => `${p}\n    cited by: ${[...sites].sort().join(', ')}`);
+    // One population entry per (citing doc, cited path) — rule 1's grain; `site` keeps every line.
+    const byDocAndPath = new Map<string, { item: string; site: string }>();
+    for (const [cited, sites] of [...offenders.entries()].sort()) {
+      for (const site of [...sites].sort()) {
+        const item = `${site.replace(/:\d+$/, '')}::${cited}`;
+        const seen = byDocAndPath.get(item);
+        if (seen) seen.site += `, ${site}`;
+        else byDocAndPath.set(item, { item, site: `${cited}\n    cited by: ${site}` });
+      }
+    }
 
-    expect(
-      report,
-      'these docs point at source files that have moved or gone. Repoint them to the real path '
+    assertExemptionLedger({
+      label: 'SOURCE_CITATION_EXEMPT in docCitations (rule 2)',
+      population: [...byDocAndPath.values()].sort((x, y) => x.item.localeCompare(y.item)),
+      exempt: SOURCE_CITATION_EXEMPT,
+      // The rest of the population is exactly the pardons on a clean tree; the detector-alive proof
+      // is "the enumeration found the repo" above, and this only stops the ledger meeting nothing.
+      floor: 1,
+      fix: 'these docs point at source files that have moved or gone. Repoint them to the real path '
         + '(the layering reorg moved much of runtime/* under runtime/core/*), or — if the file '
         + 'is absent on purpose (a plan naming an unbuilt file, a doc describing its own '
-        + 'deletion) — add it to SOURCE_CITATION_EXEMPT above WITH a reason.',
-    ).toEqual([]);
-  });
-
-  it('every exemption is still LOAD-BEARING (#578 sweep)', (ctx) => {
-    // The #578 defect, one list down. The sibling test below asks whether the exempted path is
-    // still absent; nothing asked whether anything still CITES it. Measured when this landed:
-    // 10 of 14 entries exempted nothing — worse than the 9-of-22 in RETIRED_DOCS_NAMED_ON_PURPOSE
-    // that #578 was filed about, and for a traceable reason. Six named files that the retired
-    // `docs/plans/cloud-teardown-and-migration-plan.md` listed as deleted; when that plan was
-    // itself deleted the citations went with it, and the exemptions stayed. Nothing could see it,
-    // because "the file is still absent" stays true forever once a file is gone.
-    //
-    // Same gate as the rule it mirrors — an entry can only be seen as load-bearing where the
-    // citing docs and projects it is exempted in are actually present.
-    if (!hasInternalGames()) {
-      ctx.skip();
-      return;
-    }
-    const wouldFlag = scanSourcePathCitations(() => false);
-    const inert = SOURCE_CITATION_EXEMPT
-      .filter((e) => {
-        const sites = wouldFlag.get(e.cited);
-        if (!sites) return true;
-        if (e.in === undefined) return false;
-        // A scoped entry is load-bearing only where IT is scoped, not wherever the path is named.
-        return ![...sites].some((s) => s.replace(/:\d+$/, '') === e.in);
-      })
-      .map((e) => `${e.cited}${e.in ? ` (scoped to ${e.in})` : ''} — nothing cites it; drop this exemption (${e.reason})`);
-    expect(
-      inert,
-      'SOURCE_CITATION_EXEMPT has entries that exempt no citation — the doc that named the absent '
-        + 'path was itself edited or deleted, so the entry is bookkeeping that reads as '
-        + 'enforcement. Delete it; git holds the history.',
-    ).toEqual([]);
-  });
-
-  it('every exemption names a path that is still absent', () => {
-    // An exemption whose file came back is dead weight that silently stops guarding. Fail so the
-    // list stays honest rather than accumulating entries nobody dares delete.
-    // Resolve each entry the way the rule above would resolve it — a file-scoped entry against
-    // ITS citing file's roots. Checking a scoped entry against the wide root list would call
-    // `runtime/setup.ts` "back" the moment any project has one, which most do.
-    const stale = SOURCE_CITATION_EXEMPT
-      .filter((e) => rootsFor(e.in ?? '').some((r) => exists(r ? `${r}/${e.cited}` : e.cited)))
-      .map((e) => `${e.cited}${e.in ? ` (in ${e.in})` : ''} — now exists; drop this exemption (${e.reason})`);
-    expect(stale, 'exemption list has entries that are no longer needed').toEqual([]);
+        + 'deletion) — add a `citingDoc::path` row to SOURCE_CITATION_EXEMPT above WITH a reason.',
+    });
   });
 });
 
@@ -1645,36 +1672,14 @@ function headingTitles(absDoc: string): string[] {
   return out;
 }
 
-/** Titled section citations that dangle TODAY, ratcheted so no NEW one can land (#328).
- *
- *  ⚠️ **EMPTY, and it must stay that way — the burn-down is done (#329).** All eleven original
- *  entries were repointed rather than deleted, per `docs/doc-conventions.md`: "if the citation
- *  reads as a live pointer, repoint it instead, because that is the defect and not the exception."
- *
- *  What #329 found, which is worth knowing before adding an entry here: **the sections had NOT
- *  been "renamed substantially or folded away" — nine of the eleven pointed at material that was
- *  right there**, written as a **bold lead-in** rather than as a `#### heading`. This guard only
- *  reads headings, so an accurate citation of a bold-styled section dangles. Those were repointed
- *  to the enclosing real heading with the specific phrase kept in prose
- *  (`§ "How it works" (the "A stranded synthetic press" note)`) — the house style already used by
- *  the ABSORBED_BY table above. The other two were not citation defects at all: one was a line
- *  naming TWO docs before the `§` (the regex attributes it to the first, a human reads the
- *  second), and one was a code comment QUOTING a known-bad citation as a historical example,
- *  which rule 4 cannot tell from a live one.
- *
- *  So before ratcheting anything: check whether the target exists as non-heading text, and whether
- *  the citing line names more than one `.md`. Adding an entry to get a rename past the gate is
- *  explicitly forbidden by `docs/doc-conventions.md`; this list only ever shrinks, and the
- *  meta-test below fails if an entry stops dangling.
- */
-const KNOWN_DANGLING_TITLES: ReadonlyArray<{ doc: string; title: string }> = [];
-
-function isKnownDangling(citedDocRel: string, rawTitle: string): boolean {
-  const want = normHeading(rawTitle);
-  return KNOWN_DANGLING_TITLES.some(
-    (e) => citedDocRel.endsWith(e.doc) && normHeading(e.title) === want,
-  );
-}
+/* ⚠️ **`KNOWN_DANGLING_TITLES` is DELETED (#1140), not migrated.** It was the #328 ratchet of
+ *  eleven titled citations that dangled when rule 4 landed, burned down to EMPTY in #329 — and an
+ *  empty ledger has nothing to spend, while its first row would have pardoned a (doc, title) pair
+ *  however many files cited it. So a dangling titled citation now has no pardon at all; repoint it
+ *  (`docs/doc-conventions.md`). What #329 learned before that list emptied is worth keeping: nine
+ *  of the eleven cited material that was right there as a **bold lead-in** rather than a heading,
+ *  and this rule reads headings only — so check for non-heading text, and whether the citing line
+ *  names more than one `.md`, before concluding a section was renamed away. */
 
 describe('cited doc SECTION TITLES resolve (#328)', () => {
   // A SKIP, not the bare `return` these three used to have (#1071): a return reports PASS for a
@@ -1688,7 +1693,6 @@ describe('cited doc SECTION TITLES resolve (#328)', () => {
     for (const abs of repoFiles()) {
       const relFile = rel(abs);
       if (isNonCitingSource(relFile)) continue;
-      if (relFile === 'engine/tests/architecture/docCitations.test.ts') continue; // this file
       const text = fs.readFileSync(abs, 'utf8');
 
       for (const m of text.matchAll(TITLE_CITE)) {
@@ -1702,7 +1706,6 @@ describe('cited doc SECTION TITLES resolve (#328)', () => {
         const want = normHeading(rawTitle);
         if (want.length < 4) continue;
         checked++;
-        if (isKnownDangling(rel(target), rawTitle)) continue;
         if (!headingTitles(target).some((h) => h.includes(want))) {
           const line = text.slice(0, m.index).split('\n').length;
           offenders.push(`${relFile}:${line} cites ${rel(target)} § "${rawTitle}" — no such heading`);
@@ -1718,20 +1721,6 @@ describe('cited doc SECTION TITLES resolve (#328)', () => {
         + 'docs/doc-conventions.md.',
     ).toEqual([]);
   });
-
-  it('every KNOWN_DANGLING_TITLES entry still dangles — fixed ones must be removed', (ctx) => {
-    if (!hasPrivateDocs()) { ctx.skip(); return; }
-    const stale: string[] = [];
-    for (const e of KNOWN_DANGLING_TITLES) {
-      const abs = path.join(repoRoot, e.doc);
-      if (!fs.existsSync(abs)) continue; // rule 1 owns missing docs.
-      const want = normHeading(e.title);
-      if (headingTitles(abs).some((h) => h.includes(want))) {
-        stale.push(`${e.doc} § "${e.title}" resolves now — drop it from KNOWN_DANGLING_TITLES`);
-      }
-    }
-    expect(stale.sort(), 'the ratchet only goes one way').toEqual([]);
-  });
 });
 
 describe('cited doc SECTIONS resolve', () => {
@@ -1744,7 +1733,6 @@ describe('cited doc SECTIONS resolve', () => {
     for (const abs of repoFiles()) {
       const relFile = rel(abs);
       if (isNonCitingSource(relFile)) continue;
-      if (relFile === 'engine/tests/architecture/docCitations.test.ts') continue; // this file
       const text = fs.readFileSync(abs, 'utf8');
 
       for (const m of text.matchAll(SECTION_CITE)) {

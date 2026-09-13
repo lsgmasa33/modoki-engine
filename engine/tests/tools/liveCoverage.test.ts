@@ -78,11 +78,11 @@ describe('T3 live coverage is declared, total, and honest', () => {
    *  `modoki_set_selection` exploited: its only occurrence was inside a batch pre-flight-REFUSED
    *  case, so the step never executed.
    *
-   *  KNOWN_UNCOVERED is a holding pen, not a home: each entry silences this guard for one specific
-   *  tool, so each earns its place with a written reason and the issue tracking the fix. It is
-   *  EMPTY, and the type is kept so the next gap has somewhere honest to sit rather than being
-   *  quietly absorbed. Found 2026-08-31 in #483's close-out review; #496 emptied it in three
-   *  passes, each the same defect wearing a different hat:
+   *  There used to be a `KNOWN_UNCOVERED` holding pen here, one reasoned row per tool. #496 emptied
+   *  it and #1140 deleted the empty list (its staleness check asked only that a row's tool was still
+   *  in COVERED_BY_SMOKE, not that it still lacked a call site); a future gap takes a counted
+   *  `assertExemptionLedger` row with its reason and issue. Found 2026-08-31 in #483's close-out
+   *  review; #496 emptied it in three passes, each the same defect wearing a different hat:
    *    • `modoki_dispatch_action` — no call site at all. Now a real case, gated on a PLAY window,
    *      because a stopped sim refuses a real action and a bogus name identically.
    *    • `modoki_set_selection` — its one occurrence was a step in a batch asserted to be REFUSED
@@ -99,23 +99,13 @@ describe('T3 live coverage is declared, total, and honest', () => {
    *  distinguishes them is a human reading the call site. This guard stops the debt growing; it
    *  cannot audit what is already claimed.
    */
-  const KNOWN_UNCOVERED: Readonly<Record<string, string>> = {};
 
-  it('every COVERED_BY_SMOKE entry has a real call site in test-smoke.mjs (or a written exemption)', () => {
+  it('every COVERED_BY_SMOKE entry has a real call site in test-smoke.mjs', () => {
     const smokeSrc = readScannedSource(join(__dirname, '../../tools/modoki-mcp/test-smoke.mjs')).code;
-    const missing = COVERED_BY_SMOKE.filter((n) => !(n in KNOWN_UNCOVERED) && !smokeSrc.includes(n));
+    const missing = COVERED_BY_SMOKE.filter((n) => !smokeSrc.includes(n));
     expect(missing,
       'COVERED_BY_SMOKE claims a real case exists in test-smoke.mjs for these tools, but the name '
-      + "does not appear there at all — add a real case, or add a KNOWN_UNCOVERED entry with a reason "
-      + 'and a tracked issue.').toEqual([]);
-  });
-
-  it('KNOWN_UNCOVERED does not silently grow stale — every entry still names a real gap', () => {
-    // Each entry here is a claim of its own ("this tool has no real coverage"). If the name stops
-    // appearing in COVERED_BY_SMOKE, or a real case is added, the exemption should be deleted, not
-    // left behind as dead weight.
-    const staleExemptions = Object.keys(KNOWN_UNCOVERED).filter((n) => !COVERED_BY_SMOKE.includes(n));
-    expect(staleExemptions, 'a KNOWN_UNCOVERED entry for a tool no longer in COVERED_BY_SMOKE is dead weight').toEqual([]);
+      + 'does not appear there at all — add a real case, or take the tool out of COVERED_BY_SMOKE.').toEqual([]);
   });
 
   it('the live tier reaches a MAJORITY of the surface (the gap list cannot quietly become the plan)', () => {
@@ -199,6 +189,15 @@ describe('T2: a POST tool never reports a 200 {ok:false} as success', () => {
   // findings. Its two REAL failure shapes are asserted instead: the 500 sweep above, and the
   // `Error:` string below.
   const NO_OK_FLAG = new Set(['modoki_eval']);
+  // The skip is only load-bearing while its tool would otherwise be generated here — a POST with a
+  // route (#1140). A contract change that took it out of this loop would leave the name pardoning
+  // nothing, and waiting for whatever takes the name next.
+  it('every NO_OK_FLAG tool is still a POST route tool — the skip is load-bearing', () => {
+    for (const name of NO_OK_FLAG) {
+      expect(CONTRACTS[name]?.method, `${name} is no longer a POST — drop it from NO_OK_FLAG`).toBe('POST');
+      expect(CONTRACTS[name]?.route, `${name} has no route — drop it from NO_OK_FLAG`).not.toBeNull();
+    }
+  });
   for (const name of names) {
     const c = CONTRACTS[name];
     if (c.method !== 'POST' || c.route === null || NO_OK_FLAG.has(name)) continue;

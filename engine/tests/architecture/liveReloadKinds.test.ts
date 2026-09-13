@@ -66,6 +66,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { ASSET_SCHEMA_TYPES } from '../../packages/modoki/src/runtime/assets/assetSchemas';
 
@@ -108,21 +109,17 @@ describe('live-reload kinds: producer and consumer cannot drift (#74)', () => {
   it('every kind in the union has an explicit branch in classifySceneChange', () => {
     // Every current member (scene, prefab, animation, timeline, particle, spriteanim, rig2d) is
     // returned from its own `type === '<kind>'` comparison — none of them reach `classifySceneChange`
-    // by falling through a default/else. If a future kind legitimately needs another route, it must
-    // be added to this exception list explicitly, not silently exempted.
-    const NO_DIRECT_COMPARISON: string[] = [];
+    // by falling through a default/else. ⚠️ The `NO_DIRECT_COMPARISON` exception list that sat here
+    // was EMPTY and is deleted (#1140): a kind that genuinely reaches classifySceneChange another way
+    // is a counted `assertExemptionLedger` row, not a name list with no staleness check.
     const classifyBody = producerSrc.slice(producerSrc.indexOf('export function classifySceneChange'));
     const fnBody = classifyBody.slice(0, classifyBody.indexOf('\n}'));
-    const missing = PRODUCER.filter(
-      (k) => !NO_DIRECT_COMPARISON.includes(k) && !new RegExp(`type === '${k}'`).test(fnBody),
-    );
+    const missing = PRODUCER.filter((k) => !new RegExp(`type === '${k}'`).test(fnBody));
     expect(
       missing,
       'These LiveReloadKind members have no `type === \'<kind>\'` branch in classifySceneChange, so ' +
         'a file of that kind falls through to `return null` — no broadcast ever fires, and the asset ' +
-        'silently keeps its pre-edit contents forever. Add an explicit branch (or, if it genuinely ' +
-        'reaches classifySceneChange by another route, add it to NO_DIRECT_COMPARISON above with a ' +
-        'comment saying how).',
+        'silently keeps its pre-edit contents forever. Add an explicit branch.',
     ).toEqual([]);
   });
 
@@ -151,26 +148,30 @@ describe('live-reload kinds: producer and consumer cannot drift (#74)', () => {
   it('every kind is HANDLED — a cache invalidator, or an explicit scene-reload kind', () => {
     // `scene` and `prefab` fall through to the scene-reload path on purpose; everything else must
     // have an entry in the invalidator table, or it reaches the renderer and does nothing.
-    const SCENE_RELOAD_KINDS = ['scene', 'prefab'];
+    //
+    // On the shared ledger since #1140: the two kinds are `sanctioned` names, so one that GAINS an
+    // invalidator entry (or leaves the union) reddens instead of keeping a pardon nobody needs.
+    const SCENE_RELOAD_KINDS: readonly string[] = ['scene', 'prefab'];
     const table = consumerSrc.slice(consumerSrc.indexOf('const ASSET_CACHE_INVALIDATORS'));
     const tableBody = table.slice(0, table.indexOf('};'));
-    const unhandled = PRODUCER.filter(
-      (k) => !SCENE_RELOAD_KINDS.includes(k) && !new RegExp(`\\b${k}:`).test(tableBody),
-    );
-    expect(
-      unhandled,
-      'These kinds are broadcast but have no invalidator entry, so the renderer receives them and '
+    assertExemptionLedger({
+      label: 'SCENE_RELOAD_KINDS in liveReloadKinds',
+      population: PRODUCER.filter((k) => !new RegExp(`\\b${k}:`).test(tableBody)).map((k) => ({ item: k, site: k })),
+      sanctioned: SCENE_RELOAD_KINDS,
+      floor: 1,
+      fix: 'These kinds are broadcast but have no invalidator entry, so the renderer receives them and '
         + 'does nothing — the asset keeps its pre-edit contents and a read-modify-write reverts the '
         + 'file. Add them to ASSET_CACHE_INVALIDATORS (or to SCENE_RELOAD_KINDS here if a full '
         + 'scene reload really is intended).',
-    ).toEqual([]);
+    });
   });
 
   /** Asset types this test deliberately does NOT require in `LiveReloadKind`, each with the
    *  reason a broadcast genuinely isn't needed. Add a name here only with a verified reason, never
-   *  to silence a failure. */
-  const NOT_LIVE_RELOADABLE: Record<string, string> = {
-    atlas: 'protected by an ifMatch compare-and-swap checked server-side at write time (#831), ' +
+   *  to silence a failure. Spent through the shared ledger since #1140 — it had no staleness check,
+   *  so a type that JOINED LiveReloadKind kept its "not needed" reason. */
+  const NOT_LIVE_RELOADABLE: ReadonlyArray<{ item: string; reason: string }> = [
+    { item: 'atlas', reason: 'protected by an ifMatch compare-and-swap checked server-side at write time (#831), ' +
       'not by a watcher-driven park-drop — adding it to LiveReloadKind would let ' +
       'dropParkedWriteFor (#439/#469) silently discard a human\'s parked edit, exactly the ' +
       'silent-discard behaviour #831 replaced with a human-resolved fork. ⚠️ The CAS premise is '
@@ -189,8 +190,8 @@ describe('live-reload kinds: producer and consumer cannot drift (#74)', () => {
       + 'without dropParkedWriteFor firing at all. That defuses the silent-discard objection '
       + 'but not the CAS one above, and a `.meta.json` write is a direct write to its own file '
       + 'rather than a sibling-raised one, so the flag would be false for it anyway — it is not '
-      + 'the lever that would make adding this kind safe.',
-  };
+      + 'the lever that would make adding this kind safe.' },
+  ];
 
   it('every agent-writable/parkable asset type is in LiveReloadKind (#842)', () => {
     // `ASSET_SCHEMA_TYPES` is what `/api/asset-write` accepts and what the Inspector can park
@@ -202,19 +203,19 @@ describe('live-reload kinds: producer and consumer cannot drift (#74)', () => {
     // this file stayed green: `material` and `shader` were absent from LiveReloadKind itself, so
     // the producer/consumer cross-checks above — which only ever compare the two sides to EACH
     // OTHER — had nothing to disagree about.
-    const missing = ASSET_SCHEMA_TYPES.filter(
-      (t) => !(t in NOT_LIVE_RELOADABLE) && !PRODUCER.includes(t),
-    );
-    expect(
-      missing,
-      'These ASSET_SCHEMA_TYPES are agent-writable/parkable but missing from LiveReloadKind in ' +
-        'engine/plugins/vite-asset-scanner.ts, so classifySceneChange can never return them, no ' +
-        'modoki:scene-changed broadcast ever fires for them, dropParkedWriteFor never runs, and no ' +
-        'cache is ever invalidated for an external write. Add each one to LiveReloadKind + a ' +
-        '`type === \'<kind>\'` branch in classifySceneChange + SceneChangedKind + ' +
-        'ASSET_CACHE_INVALIDATORS in agentBridge.ts — or, if a broadcast is genuinely not needed, ' +
-        'add it to NOT_LIVE_RELOADABLE above with a verified reason.',
-    ).toEqual([]);
+    assertExemptionLedger({
+      label: 'NOT_LIVE_RELOADABLE in liveReloadKinds',
+      population: ASSET_SCHEMA_TYPES.filter((t) => !PRODUCER.includes(t)).map((t) => ({ item: t, site: t })),
+      exempt: NOT_LIVE_RELOADABLE,
+      floor: 1,
+      fix: 'These ASSET_SCHEMA_TYPES are agent-writable/parkable but missing from LiveReloadKind in '
+        + 'engine/plugins/vite-asset-scanner.ts, so classifySceneChange can never return them, no '
+        + 'modoki:scene-changed broadcast ever fires for them, dropParkedWriteFor never runs, and no '
+        + 'cache is ever invalidated for an external write. Add each one to LiveReloadKind + a '
+        + '`type === \'<kind>\'` branch in classifySceneChange + SceneChangedKind + '
+        + 'ASSET_CACHE_INVALIDATORS in agentBridge.ts — or, if a broadcast is genuinely not needed, '
+        + 'add it to NOT_LIVE_RELOADABLE above with a verified reason.',
+    });
   });
 });
 

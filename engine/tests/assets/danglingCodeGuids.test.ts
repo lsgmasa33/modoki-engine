@@ -24,8 +24,13 @@
  *
  * KNOWN LIMIT: a guid MINTED AT RUNTIME (an entity spawned by code, never serialised)
  * would have no JSON home and would fail here. There is no such case today; if one
- * appears, add it to ALLOWED below with the reason rather than widening the rule — the
- * value of this guard is that "unresolvable" means broken.
+ * appears, give it a JSON home or a counted `assertExemptionLedger` row keyed
+ * `file::guid` — not a repo-wide name list, and not a widened rule. The value of this guard
+ * is that "unresolvable" means broken.
+ *
+ * ⚠️ The `ALLOWED` Map that used to sit here was EMPTY and repo-wide: its first row would have
+ * pardoned one GUID in every game file at once. Deleted in #1140; the classifier is pinned on
+ * synthetic source instead, because a clean tree reports zero either way.
  */
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
@@ -36,10 +41,11 @@ import { repoFiles } from '../../scripts/repoCorpus.mjs';
 const REPO = path.resolve(__dirname, '../../..');
 const GUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 
-/** GUIDs that legitimately resolve to nothing in committed JSON. Each needs a reason. */
-const ALLOWED = new Map<string, string>([
-  // (empty — see KNOWN LIMIT above)
-]);
+/** The GUID literals in `src` that `defined` does not hold — the classifier, pure so it can be
+ *  pinned on synthetic input. Lower-cased, since committed JSON and code disagree on case. */
+function danglingGuidsIn(src: string, defined: ReadonlySet<string>): string[] {
+  return (src.match(GUID_RE) ?? []).map((raw) => raw.toLowerCase()).filter((g) => !defined.has(g));
+}
 
 /** Every file under `root` (a repo-relative POSIX path, e.g. `games`), git-enumerated (#771/#799)
  *  rather than a hand-rolled recursive walk. `ios`/`android` are excluded explicitly because they
@@ -92,10 +98,7 @@ describe('GUID literals in game code resolve to a real asset or entity (#70)', (
     for (const f of files) {
       if (!/\.(ts|tsx)$/.test(f) || /\.test\./.test(f)) continue;
       scanned++;
-      const src = fs.readFileSync(f, 'utf8');
-      for (const raw of src.match(GUID_RE) ?? []) {
-        const guid = raw.toLowerCase();
-        if (defined.has(guid) || ALLOWED.has(guid)) continue;
+      for (const guid of danglingGuidsIn(fs.readFileSync(f, 'utf8'), defined)) {
         dangling.push(`${path.relative(REPO, f)}: ${guid}`);
       }
     }
@@ -108,7 +111,13 @@ describe('GUID literals in game code resolve to a real asset or entity (#70)', (
     expect(
       [...new Set(dangling)],
       'a GUID literal in game code that no committed asset or entity defines is a dangling ref — '
-        + 'delete it, repoint it, or add it to ALLOWED with a reason if it is minted at runtime',
+        + 'delete it or repoint it (see KNOWN LIMIT above if it is minted at runtime)',
     ).toEqual([]);
+  });
+
+  it('the classifier reports an undefined GUID and passes a defined one, case-insensitively', () => {
+    const defined = new Set(['aaaaaaaa-0000-4000-8000-000000000001']);
+    const src = "a('AAAAAAAA-0000-4000-8000-000000000001'); b('bbbbbbbb-0000-4000-8000-000000000002');";
+    expect(danglingGuidsIn(src, defined)).toEqual(['bbbbbbbb-0000-4000-8000-000000000002']);
   });
 });

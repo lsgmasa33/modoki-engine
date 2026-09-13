@@ -22,11 +22,10 @@ import { repoFiles } from '../../../../scripts/repoCorpus.mjs';
 
 const EDITOR = join(fileURLToPath(new URL('.', import.meta.url)), '../../src/editor');
 
-/** Registrars deliberately exempt from the epoch, each for a documented reason.
- *  Empty today — every known registrar is keyed on the epoch. */
-const ALLOW_NO_EPOCH = new Set<string>([
-  // e.g. 'panels/Foo.tsx',  // reason it genuinely cannot go stale
-]);
+/* ⚠️ **No `ALLOW_NO_EPOCH` list (#1140).** It was EMPTY, and its first row would have pardoned a whole
+ *  FILE — every registrar it would ever hold. A registrar that genuinely cannot go stale goes through
+ *  `assertExemptionLedger`, counted. Since the clean tree reports zero either way, the classifier is
+ *  pinned on synthetic source below. */
 
 function walk(dir: string, out: string[] = []): string[] {
   out.push(...repoFiles({
@@ -71,25 +70,31 @@ function depsOf(block: string): string | null {
   return end < 0 ? null : block.slice(open, end + 1);
 }
 
+/** Does this source register keymap bindings from an effect whose DEP ARRAY lacks `hmrEpoch`? */
+function hasEpochlessRegistrar(src: string): boolean {
+  // Only files that actually pull in the keymap registry can register bindings.
+  if (!/from ['"][^'"]*input\/keymap['"]/.test(src)) return false;
+  // Test the DEP ARRAY, not the whole block — the effects carry an explanatory comment mentioning
+  // `hmrEpoch`, so a substring search over the body silently passes even after the dep is
+  // removed. (Caught by mutating a real registrar.)
+  return effectBlocks(src).some((block) => /\bregister\(\s*\{/.test(block) && !/hmrEpoch/.test(depsOf(block) ?? ''));
+}
+
 describe('keymap registrars are HMR-epoch keyed', () => {
+  it('the classifier flags a registrar without the epoch dep, and passes one with it', () => {
+    const head = "import { register } from '../input/keymap';\n";
+    const keyed = `${head}useEffect(() => { register({ id: 'a' }); /* hmrEpoch */ }, [hmrEpoch]);`;
+    const unkeyed = `${head}useEffect(() => { register({ id: 'a' }); /* hmrEpoch */ }, []);`;
+    expect(hasEpochlessRegistrar(keyed)).toBe(false);
+    expect(hasEpochlessRegistrar(unkeyed)).toBe(true);
+    expect(hasEpochlessRegistrar(unkeyed.replace(head, ''))).toBe(false); // no keymap import
+  });
+
   it('every useEffect that calls register() depends on the HMR epoch', () => {
     const offenders: string[] = [];
     for (const file of walk(EDITOR)) {
       const rel = relative(EDITOR, file).split('\\').join('/');
-      if (ALLOW_NO_EPOCH.has(rel)) continue;
-      const src = readFileSync(file, 'utf8');
-      // Only files that actually pull in the keymap registry can register bindings.
-      if (!/from ['"][^'"]*input\/keymap['"]/.test(src)) continue;
-      for (const block of effectBlocks(src)) {
-        if (!/\bregister\(\s*\{/.test(block)) continue;
-        // Test the DEP ARRAY, not the whole block — the effects carry an explanatory
-        // comment mentioning `hmrEpoch`, so a substring search over the body silently
-        // passes even after the dep is removed. (Caught by mutating a real registrar.)
-        if (!/hmrEpoch/.test(depsOf(block) ?? '')) {
-          offenders.push(rel);
-          break;
-        }
-      }
+      if (hasEpochlessRegistrar(readFileSync(file, 'utf8'))) offenders.push(rel);
     }
     expect(
       offenders,

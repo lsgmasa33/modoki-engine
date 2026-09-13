@@ -38,6 +38,7 @@
 import { describe, it, expect } from 'vitest';
 import ts from 'typescript';
 import { readScannedSource } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { hasInternalGames } from '../helpers/repoLayout';
 
@@ -219,50 +220,31 @@ describe('every git read passes an explicit maxBuffer (#1120)', () => {
 
   it('no file spawns git on the default 1 MiB buffer, outside the EXEMPT ledger', () => {
     // MUTATION CHECK: delete `maxBuffer` from `engine/scripts/typecheck-projects.mjs` — a
-    // NON-exempt file — and this goes red naming it.
+    // NON-exempt file — and this goes red naming it. Unbinding a SECOND read in an exempt file
+    // (an `ls-files` in `repoCorpus.mjs`) goes red too, because each row spends one named read.
     //
-    // ⚠️ It has to be a non-exempt file. The comment here first named `repoCorpus.mjs`, which is
-    // EXEMPT and therefore filtered out two lines below, so that mutation reddens the ledger test
-    // instead and this assertion had no falsifying mutation at all. Found by review.
-    const exempt = new Set(EXEMPT.map((e) => e.file));
-    const offenders = spawns
-      .filter((s) => !s.bounded && !exempt.has(s.rel))
-      .map((s) => `${s.rel}:${s.line} (${s.callee})`);
-    expect(
-      offenders,
-      'these spawn git without an explicit `maxBuffer`, so Node caps the output at 1 MiB and '
-        + 'throws ENOBUFS above it — which every catch in this repo reads as "git said no" '
-        + `(#1120):\n${offenders.join('\n')}`,
-    ).toEqual([]);
-  });
-
-  it('every EXEMPT entry still exists and still has EXACTLY the unbounded reads it names', () => {
-    // The mechanism that keeps the ledger honest, in both directions. Bound one of these sites and
-    // its count drops, so the row must be corrected or deleted. Unbind anything ELSE in the same
-    // file and the count rises, so the pardon cannot silently widen to cover it — which is the
-    // fail-open hole the mutation check found here.
-    //
-    // Re-runs the REAL detector rather than a private copy of the pattern: two matchers free to
-    // disagree is how a load-bearing check ends up checking nothing.
-    const byRel = new Map(files.map((f) => [f.rel, f]));
-    const wrong: string[] = [];
-    for (const e of EXEMPT) {
-      const f = byRel.get(e.file);
-      if (!f) {
-        // ABSENT-BY-LAYOUT is not STALE — see `rootIsPresent`.
-        if (rootIsPresent(e.file)) wrong.push(`${e.file} — no longer in the scanned corpus; drop this entry`);
-        continue;
-      }
-      const actual = findGitSpawns(f.code, f.rel).filter((s) => !s.bounded).map((s) => s.read).sort();
-      const declared = [...e.reads].sort();
-      if (actual.join('|') !== declared.join('|')) {
-        wrong.push(
-          `${e.file} — names [${declared.join(', ')}] as its unbounded git read(s), found `
-          + `[${actual.join(', ')}]. Bind the new one; do not widen the row.`,
-        );
-      }
-    }
-    expect(wrong, `EXEMPT ledger out of date:\n${wrong.join('\n')}`).toEqual([]);
+    // ⚠️ **On the shared ledger since #1140.** This was two hand-rolled checks — a `Set<file>`
+    // filter and a sorted-multiset comparison — that together were exact; the helper states the
+    // same two directions (unexcused / over-blessed) once, so the file carries no private copy of
+    // the rule. Rows are `file::read`, a read named twice in one file is `count: 2`, and a row whose
+    // file this checkout does not ship is dropped first (`rootIsPresent` — absent by LAYOUT is not
+    // stale).
+    const exempt = EXEMPT
+      .filter((e) => rootIsPresent(e.file))
+      .flatMap((e) => [...new Set(e.reads)].map((read) => ({
+        item: `${e.file}::${read}`,
+        count: e.reads.filter((r) => r === read).length,
+        reason: e.reason,
+      })));
+    assertExemptionLedger({
+      label: 'EXEMPT in gitReadIsBounded',
+      population: spawns.filter((s) => !s.bounded).map((s) => ({ item: `${s.rel}::${s.read}`, site: `${s.rel}:${s.line} (${s.callee})` })),
+      exempt,
+      floor: 1,
+      fix: 'these spawn git without an explicit `maxBuffer`, so Node caps the output at 1 MiB and '
+        + 'throws ENOBUFS above it — which every catch in this repo reads as "git said no" (#1120). '
+        + 'Bind the new one; do not widen a row.',
+    });
   });
 
   it('the detector tells the cases apart on synthetic input', () => {

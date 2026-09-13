@@ -25,6 +25,7 @@ import path from 'node:path';
 import { hasPrivateTooling } from '../helpers/repoLayout';
 import { CLONE_BACKEND_PORTS, vitePortForBackend, cdpPortForBackend } from '../../scripts/editorPorts.mjs';
 import { readScannedSource } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { assertDeclaredListIsComplete } from '../helpers/declaredList';
 
@@ -109,7 +110,7 @@ describe('every harness that SPAWNS the packaged app pins a per-clone backend po
   /** Spawners that deliberately do NOT derive a per-clone port, with the reason each is safe.
    *  Kept separate from SPAWNERS so the port assertion still RUNS for them and states its verdict,
    *  rather than the script quietly falling out of the list. */
-  const DERIVATION_EXEMPT = new Set([
+  const DERIVATION_EXEMPT: ReadonlyArray<{ item: string; reason: string }> = [
     // `PORT="${PORT:-5188}"` (:47), chosen to sit OUTSIDE every clone lane (5179-5183) rather than
     // inside one: this harness relaunches the packaged app a dozen times in a row, and the comment
     // at :45 is explicit that a run must not be able to drive — or be mistaken for — a live editor.
@@ -119,8 +120,9 @@ describe('every harness that SPAWNS the packaged app pins a per-clone backend po
     // still collide on 5188. That is a real but narrow window (a manual, long-running repro
     // harness), and closing it by deriving would reintroduce the larger hazard above. Pass PORT=
     // explicitly if you need two at once.
-    'engine/scripts/repro-cold-boot.sh',
-  ]);
+    { item: 'engine/scripts/repro-cold-boot.sh',
+      reason: 'PORT="${PORT:-5188}" sits OUTSIDE every clone lane on purpose — see the comment above' },
+  ];
 
   it('the spawner list covers everything that resolves the packaged binary', () => {
     assertDeclaredListIsComplete({
@@ -148,21 +150,27 @@ describe('every harness that SPAWNS the packaged app pins a per-clone backend po
     });
   });
 
-  it('every DERIVATION_EXEMPT row still names a spawner that does NOT derive (#830 review)', () => {
-    // `derives || DERIVATION_EXEMPT.has(rel)` is true either way, so a row survives its own reason:
-    // migrate repro-cold-boot.sh onto clonePort.mjs and the carve-out keeps "exempting" a script
-    // that would now pass on its own. Same rule the EXEMPT ledgers elsewhere carry — an exemption
-    // must currently be load-bearing or it is decoration.
-    const useless = [...DERIVATION_EXEMPT]
-      .filter((rel) => /clonePort|editorPorts/.test(read(rel)))
-      .sort();
-    expect(useless, 'These DERIVATION_EXEMPT rows name scripts that now DO derive their port. '
-      + 'Delete them — the carve-out is vouching for nothing, and would silently excuse the script '
-      + 'if it ever stopped deriving again.').toEqual([]);
-    // And the row must still name a real spawner, or it is excusing a file nothing checks.
-    const orphaned = [...DERIVATION_EXEMPT].filter((rel) => !SPAWNERS.includes(rel)).sort();
-    expect(orphaned, 'These DERIVATION_EXEMPT rows are not in SPAWNERS, so nothing they excuse is '
-      + 'ever tested.').toEqual([]);
+  it('every spawner derives its port per clone, or spends a DERIVATION_EXEMPT row (#830 review, #1140)', () => {
+    // ⚠️ **This marker used to be `/clonePort/` alone, and that was too narrow (#830).** There
+    // are TWO sanctioned derivations, and root CLAUDE.md names the other one as the primary:
+    // "Every launch path derives the backend port from the CLONE DIRECTORY
+    // (engine/scripts/editorPorts.mjs, the one authored table)". `launch-editor.sh:84` and
+    // `test-packaged.sh` both derive correctly through `editorPorts.mjs` and were invisible to
+    // the old guard — it simply never scanned them, so the narrowness never showed. Widening
+    // the SPAWNER list is what exposed it: a marker is only tested by the population it meets.
+    //
+    // On the shared ledger since #1140. The two staleness checks this replaced — a row naming a
+    // script that now DOES derive (`derives || EXEMPT.has(rel)` is true either way, so the row
+    // survived its own reason), and a row naming a non-spawner — are both its over-blessed arm.
+    assertExemptionLedger({
+      label: 'DERIVATION_EXEMPT in clonePortHardcoding',
+      population: SPAWNERS.filter((rel) => !/clonePort|editorPorts/.test(read(rel))).map((rel) => ({ item: rel, site: rel })),
+      exempt: DERIVATION_EXEMPT,
+      floor: 1,
+      fix: 'these must derive their port from clonePort.mjs or editorPorts.mjs (#20/#69/#349 — the '
+        + 'sanctioned implementations), not pick a constant: two clones running one at once would '
+        + 'otherwise collide.',
+    });
   });
 
   for (const rel of SPAWNERS) {
@@ -172,23 +180,6 @@ describe('every harness that SPAWNS the packaged app pins a per-clone backend po
         `${rel} launches the packaged app without pinning MODOKI_BACKEND_PORT, so main.ts's `
         + 'sticky-then-scan binds whatever is free — which is 5179, the main clone\'s editor backend. '
         + 'Derive one with clonePort.mjs (see the note in assert-app-csp.mjs).',
-      ).toBe(true);
-    });
-
-    it(`${rel} derives that port per clone rather than hardcoding one`, () => {
-      // ⚠️ **This marker used to be `/clonePort/` alone, and that was too narrow (#830).** There
-      // are TWO sanctioned derivations, and root CLAUDE.md names the other one as the primary:
-      // "Every launch path derives the backend port from the CLONE DIRECTORY
-      // (engine/scripts/editorPorts.mjs, the one authored table)". `launch-editor.sh:84` and
-      // `test-packaged.sh` both derive correctly through `editorPorts.mjs` and were invisible to
-      // the old guard — it simply never scanned them, so the narrowness never showed. Widening
-      // the SPAWNER list is what exposed it: a marker is only tested by the population it meets.
-      const derives = /clonePort|editorPorts/.test(read(rel));
-      expect(
-        derives || DERIVATION_EXEMPT.has(rel),
-        `${rel} must derive its port from clonePort.mjs or editorPorts.mjs (#20/#69/#349 — the `
-        + 'sanctioned implementations), not pick a constant: two clones running this at once '
-        + 'would otherwise collide.',
       ).toBe(true);
     });
   }
