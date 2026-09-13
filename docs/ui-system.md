@@ -981,8 +981,9 @@ sized by its children) publishes `0px` although the checkbox reads live, and a s
 reserves ~93pt for a 60pt strip. Author a reserving strip with an explicit height and no clamp.
 
 Two strips on one edge take the LARGER (`max(...)`), because both are anchored to that edge and so
-overlap rather than stack. Court still hand-rolls the same result per dialog (`syncDialogInsets`),
-pending a migration onto these fields.
+overlap rather than stack. Both shipping games use these fields for every dialog: wordweave since
+#1159, and Court since #1172, which deleted the per-frame `syncDialogInsets` that hand-rolled the
+same result.
 
 An anchored element is rendered with `position: absolute`; pivot is applied as a CSS
 `translate(-pivotX%, -pivotY%)`. Stretched axes ignore pivot (both edges are pinned).
