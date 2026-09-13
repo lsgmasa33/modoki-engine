@@ -26,6 +26,7 @@ import {
   resumeHandlerFor,
 } from './timelinePreview';
 import { getModeOwner } from './playMode';
+import { beginWorldReplacement } from './authoringSettle';
 
 export interface SaveOutcome {
   /** Parked asset docs written by this save. ALWAYS attempted, whatever the scene half does. */
@@ -157,6 +158,13 @@ async function runSaveAllOnce(): Promise<SaveOutcome> {
   }
   if (preview) {
     const owner = preview.owner;
+    // #1164 review: the suspend returns the run mode to 'stopped', which would settle authoring and
+    // start a deferred hot-reload replay in the middle of this save — the replay loads the external
+    // bytes into the world while the save writes the pre-change world over the file, and the resume's
+    // new snapshot races the replay's load. Held across suspend → save → resume, the token keeps a
+    // change deferred until the envelope that resumes finally exits (or, if nothing resumes, until
+    // this releases with the mode stopped). Both resume handlers re-enter scrub synchronously.
+    const releaseReplacement = beginWorldReplacement();
     try {
       // MUST be awaited: the restore rebuilds the world, and the save serializes it a line later.
       // Inside the try, because a restore that REJECTS (a failed scene load, a throwing rebind)
@@ -183,6 +191,8 @@ async function runSaveAllOnce(): Promise<SaveOutcome> {
     } catch (e) {
       resumeHandlerFor(owner, preview)?.resume();
       throw e;
+    } finally {
+      releaseReplacement();
     }
   }
   return runSaveTargets();

@@ -107,6 +107,7 @@ import {
 const PARKED_SCENE = '/scenes/child.scene.json';
 
 const { runSaveAll } = await import('../../packages/modoki/src/editor/scene/saveCommand');
+const { isWorldReplacementInFlight } = await import('../../packages/modoki/src/editor/scene/authoringSettle');
 
 function makeHandler(tag = 'A', live = true) {
   const h = {
@@ -177,6 +178,28 @@ describe('runSaveAll inside a preview envelope', () => {
     expect(log).toEqual(['suspend:A', 'saveScene', 'resume:A']);
     expect(out.previewCycled).toBe(true);
     expect(out.previewResumed).toBe(true);
+  });
+
+  // #1164 review: `suspend()` returns the run mode to 'stopped', which would settle authoring and start
+  // a deferred hot-reload replay mid-save. The cycle holds a world-replacement token instead, and
+  // the observable is the token at each step — released only once the resume has run.
+  it('holds a world-replacement token across suspend, save and resume (#1164)', async () => {
+    const h = makeHandler();
+    sessionHeld = true; sceneDirty = true; handler = h;
+    const held: boolean[] = [];
+    h.suspend.mockImplementation(async () => { held.push(isWorldReplacementInFlight()); });
+    h.resume.mockImplementation(() => { held.push(isWorldReplacementInFlight()); });
+    await runSaveAll();
+    expect(held, 'suspend, then resume, each saw the token').toEqual([true, true]);
+    expect(isWorldReplacementInFlight(), 'released after the cycle').toBe(false);
+  });
+
+  it('releases the token when the save throws, too', async () => {
+    sessionHeld = true; sceneDirty = true; handler = makeHandler();
+    const { saveAll } = await import('../../packages/modoki/src/editor/scene/serialize');
+    vi.mocked(saveAll).mockRejectedValueOnce(new Error('disk full'));
+    await runSaveAll().catch(() => {});
+    expect(isWorldReplacementInFlight()).toBe(false);
   });
 
   it('resumes through the handler the panel has NOW, not the one captured at the start', async () => {

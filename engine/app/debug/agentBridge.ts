@@ -84,6 +84,7 @@ import {
   invalidateAnimSet,
   invalidateMaterial,
   invalidateShader,
+  invalidatePrefab,
   fireDirtyListeners,
   findEntityByGuid,
   getCachedPrefab,
@@ -591,16 +592,28 @@ const agentOps = new Map<string, AgentOpHandler>();
 /** Optional gate that suppresses scene hot-reload while it would be discarded.
  *  Installed by the EDITOR (lazy path) — in editor Play mode a scene edit would
  *  hot-reload the live world but then be clobbered by the Play-press snapshot on
- *  Stop (see editor/scene/playMode.ts), so we skip the reload and tell the caller
- *  to Stop first. Unset in the shipped game runtime (which has no Stop that could
- *  clobber), so hot-reload there always proceeds. Returns a reason string when
- *  reload should be suppressed, else null. */
+ *  Stop (see editor/scene/playMode.ts), so we hold the reload back and tell the caller
+ *  to Stop first. A held reload is DEFERRED, not dropped (#1164): it replays once
+ *  authoring settles — `replaySuppressedSceneReloads`, docs/editor-hmr.md. Unset in the
+ *  shipped game runtime (which has no Stop that could clobber), so hot-reload there
+ *  always proceeds. Returns a reason string when reload should be suppressed, else null. */
 let _reloadSuppressor: (() => string | null) | null = null;
 
 /** Editor-only: install the hot-reload suppression gate. Called from
  *  `agentEditorOps.ts` at editor startup so game builds never suppress. */
 export function setSceneReloadSuppressor(fn: (() => string | null) | null): void {
   _reloadSuppressor = fn;
+}
+
+/** Editor-only: re-reads the EDITOR's copy of a prefab whose file changed on disk (#1169). The
+ *  runtime cache is evicted here directly; the editor's diff-base copy lives in the editor package,
+ *  which this module must not import, so the editor installs the refresh the way it installs the
+ *  suppressor. */
+let _prefabSourceRefresher: ((urlPath: string) => Promise<void>) | null = null;
+
+/** Editor-only: install the editor-side prefab refresh. Called from `agentEditorOps.ts`. */
+export function setPrefabSourceRefresher(fn: ((urlPath: string) => Promise<void>) | null): void {
+  _prefabSourceRefresher = fn;
 }
 
 /** Why scene hot-reload is currently suppressed (editor Play mode), or null when
@@ -2451,9 +2464,54 @@ async function dropParkedWriteFor(urlPath: string): Promise<void> {
   } catch { /* not an editor context — no registry to clear */ }
 }
 
+type SceneChangedMsg = { urlPath: string; kind: SceneChangedKind; viaSibling?: boolean };
+
+/** Scene/prefab changes that arrived while the reload was suppressed, keyed by `urlPath`, in the
+ *  order of their latest write (#1164). Drained by {@link replaySuppressedSceneReloads}. */
+const _suppressedReloads = new Map<string, SceneChangedMsg>();
+
+/** Replay every scene/prefab change that arrived while the hot reload was suppressed, through the
+ *  same `handleSceneChanged` a live change takes, so a deferred change gets exactly the treatment
+ *  it would have had one frame after Stop. That includes **disk winning over unsaved edits** the
+ *  restored snapshot carried (owner's choice, 2026-09-13, on #1164): a stopped-mode external write
+ *  already behaves that way.
+ *
+ *  Editor-only in practice: the editor calls it on its "authoring settled" signal
+ *  (`agentEditorOps.ts`), which fires only once no restore or scene open is still loading. Calling
+ *  it on a bare run-mode edge is the defect that signal exists to avoid (see `authoringSettle.ts`).
+ *  A no-op while still suppressed, so an early call keeps the entries rather than losing them.
+ *
+ *  ⚠️ SEQUENTIAL, not fired together. Reloads started together supersede each other, and the
+ *  winner does not carry the loser's options: a changed BASE scene reloads with `forceReloadBases`,
+ *  a prefab change without it, so a prefab reload winning over a base reload leaves the base stale
+ *  (measured live: fired together, the scene reload logged "superseded" and the prefab one won).
+ *  A live watcher batch has the same race, but a run collects every write made during it, so
+ *  deferral makes the mix far more likely. Prefab changes need only ONE reload, so they collapse to
+ *  their last entry, replayed last and carrying the others to evict at the same moment. That entry
+ *  runs even after a scene reload, because a scene entry outside the loaded chain reloads nothing.
+ *  Nothing is evicted up front: a replay that finds itself suppressed again part-way (Play pressed
+ *  mid-replay) re-defers what is left, and an eviction already made would then run during Play.
+ *  Resolves with the number of changes replayed. */
+export async function replaySuppressedSceneReloads(): Promise<number> {
+  if (_suppressedReloads.size === 0 || sceneReloadSuppressedReason()) return 0;
+  const pending = [..._suppressedReloads.values()];
+  _suppressedReloads.clear();
+  console.log(`[agentBridge] replaying ${pending.length} scene hot-reload(s) deferred during the run`);
+  for (const m of pending) if (m.kind !== 'prefab') await handleSceneChanged(m);
+  const prefabs = pending.filter((m) => m.kind === 'prefab');
+  const last = prefabs.at(-1);
+  if (last) await handleSceneChanged(last, prefabs.slice(0, -1).map((m) => m.urlPath));
+  return pending.length;
+}
+
+/** Test seam: the deferred changes currently held, as `urlPath`s in replay order. */
+export function peekSuppressedSceneReloads(): string[] {
+  return [..._suppressedReloads.keys()];
+}
+
 /** Hot-reload the active scene when its file (or any prefab) changes on disk.
  *  Shared by the Vite HMR path and the Electron IPC path. */
-async function handleSceneChanged(msg: { urlPath: string; kind: SceneChangedKind; viaSibling?: boolean }): Promise<void> {
+async function handleSceneChanged(msg: SceneChangedMsg, evictAlso: readonly string[] = []): Promise<void> {
   // An asset-def change (.anim/.timeline/.particle/.spriteanim/.rig2d) invalidates just that
   // cache entry and returns — see ASSET_CACHE_INVALIDATORS above for why this is a table and what
   // it prevents. The parked write goes with the cache entry: once the cached def is dropped the
@@ -2486,19 +2544,44 @@ async function handleSceneChanged(msg: { urlPath: string; kind: SceneChangedKind
     fireDirtyListeners();
     return;
   }
-  const current = sceneManager.getCurrent()?.path;
-  if (!current) return;
-  // Suppressed in editor Play mode: reloading now would be discarded by the
-  // Play-press snapshot on Stop, so the edit would silently vanish. Skip and log
-  // — the caller (agent mutate) is told separately to Stop first.
+  // Suppressed during Play/Pause and inside a scrub/preview envelope: a reload now would rebuild the
+  // world the run's snapshot belongs to, and Stop/Exit would restore the pre-write snapshot over it.
+  // DEFERRED, not dropped (#1164) — dropping left the world behind disk after Stop/Exit, and the next
+  // save wrote that stale world over the external change. `replaySuppressedSceneReloads` runs it
+  // once authoring settles. Checked BEFORE `current`, so a change arriving with no scene loaded is
+  // still recorded rather than lost the same way.
+  const defer = (reason: string): void => {
+    const held = [msg, ...evictAlso.map((urlPath): SceneChangedMsg => ({ urlPath, kind: 'prefab' }))];
+    for (const m of held) {
+      _suppressedReloads.delete(m.urlPath); // re-insert, so replay order follows the latest write
+      _suppressedReloads.set(m.urlPath, m);
+    }
+    console.warn(`[agentBridge] scene hot-reload deferred (${msg.kind} change: ${msg.urlPath}) — ${reason}`);
+  };
   const suppressed = sceneReloadSuppressedReason();
-  if (suppressed) {
-    console.warn(`[agentBridge] scene hot-reload skipped (${msg.kind} change: ${msg.urlPath}) — ${suppressed}`);
-    return;
-  }
+  if (suppressed) { defer(suppressed); return; }
+  // #1169: a prefab change must evict the cached prefab BEFORE the scene reload below, or the reload
+  // re-instantiates the OLD prefab: a load acquires before it releases, so the new scene id finds the
+  // entry still owned and `fetchPrefab` returns on the cache hit. BOTH copies: the runtime cache
+  // (evicted), and the editor's own (`_prefabSourceRefresher`, RE-READ — never left empty, see
+  // `refreshPrefabSourceForPath`), which the serializer diffs instances against. Refresh only the
+  // runtime one and the instance is rebuilt from the new prefab while the next save diffs it against
+  // the old, keeping an added trait or entity as a false override. Not in ASSET_CACHE_INVALIDATORS:
+  // that branch runs during Play too, where evicting a prefab breaks the runtime's synchronous
+  // `getCachedPrefab` spawns — so the runtime eviction runs only on this path, once suppression is
+  // over, and as late as possible (see the re-check below). Keyed by the path form the watcher sends.
+  const prefabPaths = msg.kind === 'prefab' ? [msg.urlPath, ...evictAlso] : [...evictAlso];
+  const evictRuntimePrefabs = (): void => { for (const urlPath of prefabPaths) invalidatePrefab(urlPath); };
+  const refreshEditorPrefabs = async (): Promise<void> => {
+    const refresh = _prefabSourceRefresher;
+    if (refresh) await Promise.all(prefabPaths.map((urlPath) => refresh(urlPath).catch(() => {})));
+  };
+  const current = sceneManager.getCurrent()?.path;
+  if (!current) { evictRuntimePrefabs(); await refreshEditorPrefabs(); return; }
   // In prefab-edit mode the active "scene" is a synthetic in-memory scene
-  // (`/__prefab-edit__/<guid>`) with no file on disk — leave it alone.
-  if (current.startsWith('/__prefab-edit__/')) return;
+  // (`/__prefab-edit__/<guid>`) with no file on disk — leave it alone. The editor's prefab copy is
+  // still re-read: the prefab-edit save reads it synchronously for the edited and nested prefabs.
+  if (current.startsWith('/__prefab-edit__/')) { evictRuntimePrefabs(); await refreshEditorPrefabs(); return; }
   // A7 (scene-loading.md): the changed file may be a BASE in the
   // loaded chain, not the primary — match against EVERY loaded scene, not just the
   // primary's path. Without this, editing Base.json on disk (an agent's
@@ -2515,7 +2598,7 @@ async function handleSceneChanged(msg: { urlPath: string; kind: SceneChangedKind
       if (entry.role === 'base') changedBaseGuid = entry.guid;
       break;
     }
-    if (!matchedAny) return; // touches no scene in the currently-loaded chain
+    if (!matchedAny) return; // touches no scene in the currently-loaded chain (a scene change carries no prefabs)
   }
   try {
     // Fetch the fresh file once: validate it AND hand it to loadScene via
@@ -2550,6 +2633,16 @@ async function handleSceneChanged(msg: { urlPath: string; kind: SceneChangedKind
         }
       } catch { /* fall back to loadScene's own fetch */ }
     }
+    // Before the re-check, since it awaits too: the editor copy is re-read in place, so refreshing it
+    // and then deferring leaves nothing stale-and-missing behind.
+    await refreshEditorPrefabs();
+    // ⚠️ Re-check after the awaits (#1164 review). The check above ran before the fetch, and a Play
+    // press, an envelope, or a scene open/restore taking a world-replacement token can all begin
+    // inside it. Loading now would supersede that scene open or land inside the new run, and the
+    // change would be gone from the pending list — so defer it again instead.
+    const lateReason = sceneReloadSuppressedReason();
+    if (lateReason) { defer(lateReason); return; }
+    evictRuntimePrefabs();
     await sceneManager.loadScene(current, {
       ...(preloaded ? { preloaded } : undefined),
       ...(changedBaseGuid ? { forceReloadBases: [changedBaseGuid] } : undefined),

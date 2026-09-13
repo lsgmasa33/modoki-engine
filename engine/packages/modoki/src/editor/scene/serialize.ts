@@ -19,6 +19,7 @@ import { sceneManager } from '../../runtime/scene/SceneManager';
 import { isPrefabEditWorld } from './prefabEditWorld';
 import { useEditorStore } from '../store/editorStore';
 import { setPlayState, getRunMode } from '../../runtime/core/playState';
+import { beginWorldReplacement } from './authoringSettle';
 import { swapHistory, getEditVersion } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
 import { captureInstanceOverrides, captureInstanceStructure, getPrefabSource, getCachedPrefabSync } from './prefab';
@@ -1252,6 +1253,9 @@ export async function loadScene(
   // above a statement that could throw would leak the count, and the `finally` comment would be
   // a lie.)
   _loadsInFlight += 1;
+  // #1164: `setPlayState('stopped')` below is a settle edge, and a hot reload deferred during Play
+  // must not replay into the middle of this load — see `authoringSettle.ts`. Released in `finally`.
+  const releaseReplacement = beginWorldReplacement();
   try {
     setPlayState('stopped'); // a scene load always returns the editor to edit mode
     setSceneLoadStatus({ active: true, loaded: 0, total: 0 });
@@ -1332,6 +1336,9 @@ export async function loadScene(
     // Load-bearing: if anything above throws, this must still return to zero, or every later
     // reader of `isSceneLoadInFlight()` would believe a load is running forever.
     _loadsInFlight -= 1;
+    // Beside the count it mirrors, and above the store call, so a throw there cannot leak the token
+    // (a leaked token means no deferred reload ever replays again).
+    releaseReplacement();
     // Only the latest load owns the modal — a superseded load must not hide the
     // winner's progress bar (its `finally` can run after the winner set active).
     if (stillLive()) useEditorStore.getState().setSceneLoadStatus({ active: false });

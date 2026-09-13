@@ -23,16 +23,78 @@ Related: [editor-input.md](./editor-input.md) (the keymap contract), [debug-tool
 
 ⚠️ **"The world reloads" does not mean every cached ASSET is re-read.** Per-kind invalidation on an
 external write lives in `ASSET_CACHE_INVALIDATORS` (`engine/app/debug/agentBridge.ts`) —
-animation, timeline, particle, spriteanim, rig2d, animset, material, shader — and **`prefab` is not
-in it**. A `.prefab.json` written on disk from outside the editor falls through to the scene
-hot-reload, which reloads the current scene path — and the reload keeps the OLD prefab, because a
-scene load acquires before it releases: the new scene id finds the entry still owned by the old id,
-so `fetchPrefab` returns on the cache hit, and when the old id releases, the new one already owns it
-(`invalidatePrefab` is called only by the editor's own prefab writes). Read from code, not
-reproduced live. `load_scene` on the path already open behaves the same way. Swapping to a
-different scene and back re-reads the prefab only if that other scene does NOT also use it — a
-shared prefab stays owned across the swap, by design. **Verify any disk edit by querying the live spawned entity, never by re-reading the
-file you wrote.**
+animation, timeline, particle, spriteanim, rig2d, animset, material, shader. **`prefab` is
+deliberately NOT in it** — that branch also runs during Play, and evicting a prefab mid-Play breaks the
+runtime's synchronous `getCachedPrefab` spawns. A `.prefab.json` change falls through to the scene
+hot-reload instead, and `handleSceneChanged` evicts **both** prefab caches immediately before that
+reload (#1169): the runtime one is evicted (`invalidatePrefab`), and the editor's own copy is
+**re-read in place** (`refreshPrefabSourceForPath`, installed through `setPrefabSourceRefresher`) —
+it is the base the serializer diffs instances against. Refresh only the runtime cache and an instance
+is rebuilt from the new prefab while the next save diffs it against the old one, keeping a trait or
+entity the new prefab added as an override. ⚠️ Re-read, never merely deleted: that copy has
+synchronous readers that treat a miss as "not a prefab", and in prefab-edit mode no reload follows to
+refill it — a delete made the next prefab-edit save inline a nested prefab and report success
+(caught in review, before it shipped). For the same reason an unreadable file (a half-typed hand edit)
+keeps the old entry, and an entry replaced while the re-read was in flight (an Apply-to-Prefab) is
+not overwritten. The prefab OPEN in prefab-edit mode keeps its copy: its edit world still holds the
+old content, so an external rewrite of that one file is still overwritten by its next save, exactly as
+before #1169 — "disk wins" does not reach that mode, because no reload shows the new file there. The eviction is load-bearing: a scene load acquires before it releases, so without it
+the new scene id finds the entry still owned by the old id, `fetchPrefab` returns on the cache hit, and
+the reload re-instantiates the OLD prefab — observed live on `games/skin-test` with the eviction
+removed: the log said "hot-reloaded scene (prefab change …)" and the head bone kept its pre-write
+scale. `load_scene` on the path already open still behaves that old way (it is an explicit load, not a
+watcher event), and swapping to a different scene and back re-reads the prefab only if that other
+scene does NOT also use it. **Verify any disk edit by querying the live spawned entity, never by
+re-reading the file you wrote.**
+
+### A reload the editor cannot take right now is DEFERRED, not dropped
+
+During Play/Pause and inside a scrub/preview envelope, `sceneReloadSuppressedReason()` blocks the
+scene/prefab hot reload — a reload there rebuilds the world the run's snapshot belongs to, and inside
+an envelope it tears the preview down mid-pose. It also blocks while the editor is stopped but a
+world-replacement token is held (below): a reload then would supersede the scene open, restore or
+save cycle that holds it. Until #1164 the blocked change was simply **dropped**:
+Stop/Exit restored the pre-write snapshot, the world sat behind the file on disk with nothing saying
+so, and the next Cmd+S wrote that stale world over the external change (a hand edit, a `git checkout`).
+
+Now the blocked change is recorded (keyed by path, logged as "scene hot-reload deferred") and
+`replaySuppressedSceneReloads` replays it through the same `handleSceneChanged` a live change takes, so
+it gets exactly the treatment it would have had one frame after Stop. **Disk wins** — including over
+unsaved edits the restored snapshot carried, which is what a stopped-mode external write already does
+(owner's call, 2026-09-13).
+
+Three things about the replay are load-bearing:
+
+- **It fires on "authoring settled", not on the run-mode edge** (`editor/scene/authoringSettle.ts`).
+  `stopPlay` flips to `stopped` BEFORE its snapshot restore loads, and the editor's `loadScene` flips
+  before a scene open loads. A replay keyed on the edge starts its load under theirs and SceneManager
+  supersedes one with the other — the replay is lost again, or it reloads the old scene over the one
+  being opened. So `stopPlay`, `endTimelinePreviewSession`, the `loadScene` wrapper and Cmd+S's
+  suspend → save → resume cycle inside an envelope (`saveCommand.ts`) each hold a world-replacement
+  token, taken synchronously before any mode change, and settle fires only once the count is zero
+  while `canEdit()` holds. A new path that swaps the world after flipping the mode needs a token too.
+- **It checks suppression twice** — before the handler's `fetch` of the scene file and again after
+  it, because a Play press, an envelope or a scene open can begin inside that await. A change that
+  finds itself suppressed late is deferred again, with the prefabs it was carrying.
+- **It runs its reloads one at a time.** Fired together they supersede each other, and the winner does
+  not carry the loser's options: a base-scene reload needs `forceReloadBases`, a prefab reload does
+  not, so a prefab reload winning leaves the base stale. Measured live on the first, fired-together
+  version (the scene replay logged "superseded"). A run batches every write made during it, so the
+  mix is far likelier than in a live watcher batch, which still has that race.
+- **Prefab changes collapse to one reload**: the last one replays last and evicts the others at
+  the same moment. Nothing is evicted up front, so a replay suppressed part-way never leaves a
+  prefab evicted during Play.
+
+Known gaps, left on purpose (found in the #1164 close-out review, none reproduced):
+
+- **World swaps that take no token** — `openPrefabForEditing`, `applyPrefabUndo` and the runtime
+  `load-scene` op call `sceneManager.loadScene` directly, so a live reload can still supersede them.
+  That race predates #1164; the tokens cover the paths that flip the run mode.
+- **A token that is never released** (a load that hangs past every abort checkpoint) now defers every
+  live hot reload while stopped, and the pending set has no editor or MCP surface — only the warning in
+  the console says so.
+- **A deleted prefab** keeps its editor-side copy when the manifest drops the path before the watcher
+  event lands (`getGuidForPath` no longer resolves the GUID key).
 
 ### A shader is TWO files, and only one of them used to be watched
 

@@ -19,6 +19,7 @@ import { getPlayState, setPlayState, getRunMode, setRunMode } from '../../runtim
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { PREFAB_EDIT_SCENE_PREFIX } from './prefabEditWorld';
 import { serializeScene, getCurrentScenePath, sceneLoadGeneration, isSceneLoadInFlight, type SceneFile, type SerializedEntity } from './serialize';
+import { beginWorldReplacement } from './authoringSettle';
 import { undoDepth, truncateUndoTo } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
 import { hasTimelinePreviewSession, endTimelinePreviewSession } from './timelinePreview';
@@ -279,33 +280,41 @@ export async function stopPlay(): Promise<void> {
     if (_entering) _stopRequested = true;
     return;
   }
-  setPlayState('stopped');
-  closeAutoContactCapture(); // if this Play auto-opened @contact, close it — don't leak into edit mode
-  editorEmit('!stop', {});
-  const snap = _snapshot;
-  const snapPath = _snapshotPath;
-  const baseSnaps = _baseSnapshots;
-  _snapshot = null;
-  _snapshotPath = null;
-  _baseSnapshots = null;
-  if (!snap) return;
-  // Guard: if the active scene changed since Play, the snapshot is for a
-  // different scene — reverting it would clobber the current one. Skip.
-  const path = currentSceneKey();
-  if (snapPath !== path) return;
-  // Reload the captured authored scene in place. preloaded skips the fetch, so
-  // disk is never touched; the swap reuses already-resident resources via the
-  // scene refcount. The world is rebuilt (new ECS ids), but undo actions resolve
-  // their targets by stable guid (see entityRef.ts), so PRE-Play history survives
-  // — we only truncate the during-Play edits the revert just discarded.
-  await sceneManager.loadScene(path ?? '', { preloaded: snap as unknown as SceneData });
-  // A5: the reload above CARRIES a kept base rather than re-loading its file, so a
-  // base entity's play-mode drift (Transform, or any other authored field a game
-  // system wrote at runtime) is still sitting on the just-carried live entities.
-  // Replay each base's authored snapshot back onto them, by guid.
-  if (baseSnaps) for (const snapshot of baseSnaps.values()) restoreAuthoredEntities(snapshot.entities);
-  truncateUndoTo(_undoBarrier);
-  _undoBarrier = 0;
+  // Taken BEFORE the mode flips (#1164): `setPlayState('stopped')` below is a settle edge, and a
+  // hot reload deferred during Play must replay only after the snapshot restore has landed, or the
+  // two loads supersede each other — see `authoringSettle.ts`.
+  const releaseReplacement = beginWorldReplacement();
+  try {
+    setPlayState('stopped');
+    closeAutoContactCapture(); // if this Play auto-opened @contact, close it — don't leak into edit mode
+    editorEmit('!stop', {});
+    const snap = _snapshot;
+    const snapPath = _snapshotPath;
+    const baseSnaps = _baseSnapshots;
+    _snapshot = null;
+    _snapshotPath = null;
+    _baseSnapshots = null;
+    if (!snap) return;
+    // Guard: if the active scene changed since Play, the snapshot is for a
+    // different scene — reverting it would clobber the current one. Skip.
+    const path = currentSceneKey();
+    if (snapPath !== path) return;
+    // Reload the captured authored scene in place. preloaded skips the fetch, so
+    // disk is never touched; the swap reuses already-resident resources via the
+    // scene refcount. The world is rebuilt (new ECS ids), but undo actions resolve
+    // their targets by stable guid (see entityRef.ts), so PRE-Play history survives
+    // — we only truncate the during-Play edits the revert just discarded.
+    await sceneManager.loadScene(path ?? '', { preloaded: snap as unknown as SceneData });
+    // A5: the reload above CARRIES a kept base rather than re-loading its file, so a
+    // base entity's play-mode drift (Transform, or any other authored field a game
+    // system wrote at runtime) is still sitting on the just-carried live entities.
+    // Replay each base's authored snapshot back onto them, by guid.
+    if (baseSnaps) for (const snapshot of baseSnaps.values()) restoreAuthoredEntities(snapshot.entities);
+    truncateUndoTo(_undoBarrier);
+    _undoBarrier = 0;
+  } finally {
+    releaseReplacement();
+  }
 }
 
 /** Write each snapshot entry's AUTHORED fields back onto the matching LIVE entity

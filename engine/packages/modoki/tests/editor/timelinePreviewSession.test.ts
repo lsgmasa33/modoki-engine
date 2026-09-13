@@ -54,6 +54,7 @@ import {
   subscribeUndo, beginPreviewRestore, finishPreviewRestore,
 } from '../../src/editor/undo/undoManager';
 import { setRunMode } from '../../src/runtime/core/playState';
+import { onAuthoringSettled } from '../../src/editor/scene/authoringSettle';
 
 afterEach(async () => {
   // End any dangling session so the module-level snapshot doesn't leak to the next test.
@@ -365,5 +366,34 @@ describe('timeline preview session controller', () => {
       setRunMode('stopped');
       expect(canUndo()).toBe(false);
     });
+  });
+});
+
+// #1164: a panel ends the session WITHOUT awaiting and flips the run mode to 'stopped' on the next line
+// (TimelineEditor.tsx). The hot-reload replay listens for "authoring settled", and it loads the scene —
+// so if that flip counted as settled, the replay's load would start under the restore below and one
+// would supersede the other. The end must hold a replacement token until its restore has landed.
+describe('ending a session holds the world-replacement token until the restore lands (#1164)', () => {
+  it('the un-awaited end + immediate stopped flip settles only AFTER the restore load resolves', async () => {
+    setRunMode('scrub');
+    await beginTimelinePreviewSession();
+    let openGate!: () => void;
+    h.loadGate = new Promise<void>((r) => { openGate = r; });
+    let gateOpened = false;
+    const seen: boolean[] = [];
+    const unsubscribe = onAuthoringSettled(() => { seen.push(gateOpened); });
+    try {
+      const ending = endTimelinePreviewSession({ restore: true });
+      setRunMode('stopped'); // exactly what the panel does, synchronously after the un-awaited call
+      expect(seen, 'the stopped flip settled while the restore was still loading').toEqual([]);
+      await vi.waitFor(() => expect(h.loadCalls).toHaveLength(1));
+      expect(seen).toEqual([]);
+      gateOpened = true;
+      openGate();
+      await ending;
+      expect(seen, 'one settle, fired by the token release once the restore load resolved').toEqual([true]);
+    } finally {
+      unsubscribe();
+    }
   });
 });

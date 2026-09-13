@@ -26,6 +26,7 @@ import { setTimelinePreviewActive } from '../../runtime/core/timelinePreview';
 import { clearSkeletalSeeks } from '../../runtime/core/skeletalSeek';
 import { clearControlSpawns } from '../../runtime/timeline/controlSpawnRegistry';
 import { serializeScene, getCurrentScenePath, type SceneFile } from './serialize';
+import { beginWorldReplacement } from './authoringSettle';
 import { getEditVersion, setPreviewUndoSession, clearPreviewUndoSession, whenUndoIdle, beginPreviewRestore, finishPreviewRestore } from '../undo/undoManager';
 import { createTeardownToken } from '../../runtime/core/liveness';
 
@@ -250,6 +251,18 @@ export async function beginTimelinePreviewSession(): Promise<void> {
  *  because BOTH preview panels end sessions here and each resolves its own root. No-op restore
  *  when the scene changed since the snapshot. */
 export async function endTimelinePreviewSession(opts: { restore: boolean; rebind?: () => number | null }): Promise<number | null> {
+  // #1164: taken synchronously, before anything else. Panels call this WITHOUT awaiting and flip the
+  // run mode to 'stopped' on the next line, so without the token that flip would count as settled
+  // and a deferred hot reload would start a load under the restore below — see `authoringSettle.ts`.
+  const releaseReplacement = beginWorldReplacement();
+  try {
+    return await endSessionHoldingReplacement(opts);
+  } finally {
+    releaseReplacement();
+  }
+}
+
+async function endSessionHoldingReplacement(opts: { restore: boolean; rebind?: () => number | null }): Promise<number | null> {
   // ⚠️ Invalidate any in-flight `begin` FIRST. `beginTimelinePreviewSession` seats its snapshot on
   // `if (!_snap)` alone, so a begin still awaiting `serializeScene()` when the envelope is exited
   // used to seat a session AFTERWARDS — and the pose chained onto it then ran with run-mode back at

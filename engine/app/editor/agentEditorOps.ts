@@ -19,7 +19,7 @@ import * as THREE from 'three';
 import type { ErrorCode } from '../../tools/shared/mcpResult';
 import { OpRefusal } from '../debug/opRefusal';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
-import { registerAgentOp as _registerAgentOp, type AgentOpHandler, setSceneReloadSuppressor, inferAssetDefType } from '../debug/agentBridge';
+import { registerAgentOp as _registerAgentOp, type AgentOpHandler, setSceneReloadSuppressor, replaySuppressedSceneReloads, setPrefabSourceRefresher, inferAssetDefType } from '../debug/agentBridge';
 import { performDomDnd, type DomDndParams } from '../debug/domDnd';
 import { getHmrStatus } from '../debug/hmrStaleness';
 import { getGameBootFaults } from './gameBootFaults';
@@ -57,7 +57,7 @@ import {
   describeDeviceSelection, presetDpr, resolveLogicalSize, resolvePhysicalSize, resolveSafeArea,
   type DevicePreset, type Orientation,
   type PrefabFile,
-  causeSpecs, flushParked, getModeOwner,
+  causeSpecs, flushParked, getModeOwner, onAuthoringSettled, isWorldReplacementInFlight, refreshPrefabSourceForPath,
 } from '@modoki/engine/editor';
 import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDITOR_JOURNAL_TAIL_DEFAULT } from '../debug/streamSummary';
 import {
@@ -894,12 +894,26 @@ export function registerEditorAgentOps(): void {
   // ⚠️ `canEdit()`, NOT `getPlayState()` (#1148): the 3-value shim reads a preview as 'stopped', so
   // this used to let the reload through inside every envelope — #1122's mechanism, one gate over.
   setSceneReloadSuppressor(() => {
-    if (canEdit()) return null;
+    // Stopped, but a snapshot restore, a scene open or a save cycle is still swapping the world
+    // (#1164 review): a reload now supersedes that load — a scene open silently fails, or a Stop's
+    // restore is cut short. Defer it; the token's release settles and replays it.
+    if (canEdit()) {
+      return isWorldReplacementInFlight()
+        ? 'a scene load or restore is still landing — the reload replays once it has'
+        : null;
+    }
     const mode = getRunMode();
     return mode === 'playing'
       ? `game is ${getPlayState()} — stop the game (Stop) before editing the scene`
       : `the editor is in ${mode} mode (a preview envelope) — exit the preview before editing the scene`;
   });
+  // …and what that gate held back replays once authoring SETTLES (#1164): stopped, with no snapshot
+  // restore or scene open still loading. Not `onRunModeChange` — Stop flips the mode BEFORE its
+  // restore loads, so a replay there races the restore and is lost again (`authoringSettle.ts`).
+  onAuthoringSettled(() => { void replaySuppressedSceneReloads(); });
+  // The editor's own prefab copy (the override diff base) is re-read with the runtime cache on an
+  // external prefab write (#1169 review) — see `refreshPrefabSourceForPath`.
+  setPrefabSourceRefresher(refreshPrefabSourceForPath);
 
   // ── State read ──
   registerAgentOp('editor-state', () => readEditorState());
