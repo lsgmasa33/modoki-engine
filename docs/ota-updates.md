@@ -572,11 +572,13 @@ Both surfaces hit `GET /api/ota/publish` (SSE, `engine/plugins/vite-asset-scanne
 non-fatal preflight; (3) runs `ota-publish.mjs --project <projectRoot>`. The route deliberately
 carries **no version-collision guard of its own** — that decision belongs entirely to
 `ota-publish.mjs` (see "Republishing a version string" below, and the #577 Gotchas entry for
-what happened when the route had a second, weaker one). It DOES keep its own early
-signing-key-identity check (`otaSigningKeyRefusal`, imported from
-`engine/scripts/ota/publishGuards.mjs`) as a fast HTTP 400 before the SSE stream opens and the
-multi-minute build starts — but `ota-publish.mjs` enforces the SAME check itself now (#582), so
-the route's copy can never refuse anything the script would allow; see the #582 Gotchas entry.
+what happened when the route had a second, weaker one). It DOES run the publish-request
+check itself — **`otaPublishPreflight` (`engine/scripts/ota/publishPreflight.mjs`, #827)**: enabled,
+the four tainted inputs, the bundle identity and publish target, and the signing key — as a fast
+HTTP 400 before the SSE stream opens and the multi-minute build starts. `ota-publish.mjs` runs the
+SAME function, so the route's early answer can never refuse anything the script would allow, and a
+check added there refuses on both. Only the refusal WORDING is per side; each side keys its messages
+by `OTA_PUBLISH_REFUSALS`, and `publishPreflight.test.ts` holds both maps to the full list.
 `GET /api/ota/status` and `POST /api/ota/keygen` are plain JSON, served
 from the transport-agnostic `editorBackendRouter.ts` so they also work in a packaged Electron
 editor. `engine/plugins/backend/gcloud.ts` holds the shared, Vite-import-free helpers both
@@ -596,8 +598,8 @@ presence and `--bucket` for a `gs://` prefix, and no charset check existed anywh
 
 **Publishing a sub-game from the editor or MCP (#837).** The shell lists its sub-games by project
 id in `ota.subgames` (Project Settings → OTA → Sub-games). Each id is then a Bundle choice in
-Publish OTA Update… and a valid `bundleName` for `modoki_ota_publish`. The route
-(`otaPublishTarget`) resolves the name to one of two builds:
+Publish OTA Update… and a valid `bundleName` for `modoki_ota_publish`. The preflight
+(`otaPublishTarget`, inside `otaPublishPreflight`) resolves the name to one of two builds:
 - the shell's own `ota.bundleName` builds this project with `build-web.mjs`;
 - a listed id builds THAT project with `build-subgame.mjs`, and its `subgame-dist/` is uploaded
   under the id into the shell's bucket, signed with the shell's key. `otaResolveSubgameDir` looks
@@ -833,6 +835,14 @@ questions, recorded so they are not re-opened by accident.
   `--dist` belongs to `--project`, so `--dist games/A/subgame-dist --name B` is allowed. Still
   strictly better than the prior no-guard state, and left that way deliberately: a sub-game
   publish legitimately pairs a sub-game's own dist with the shell project it's staged from.
+  ⚠️ **Until #827 the CLI also accepted a sub-game name the shell did not list.** #837 gave the
+  route `otaPublishTarget` (the shell's own name, or an id in `ota.subgames`), and the CLI never
+  gained it — the "not a verbatim port" reasoning above was about the old EQUALITY guard, which
+  refused every sub-game name, and it did not transfer to the listing rule, which allows exactly the
+  listed ones. Measured 2026-09-13: `ota-publish.mjs --name not-listed` with a real `subgame-dist/`
+  reached `gcloud storage rsync`. Both entry points now run `otaPublishPreflight`, so the CLI refuses
+  it; `otaBundleDistKindRefusal` now takes the preflight's target kind rather than re-comparing
+  names.
 - **The regression the #582 fix itself introduced, plus two siblings** (fixed 2026-09-02).
   `ota-publish.mjs`'s new `ota.bundleName` check refused a config with the `ota` block PRESENT
   but no `bundleName` key — but `pruneProjectConfig` (called on every Project Settings save)

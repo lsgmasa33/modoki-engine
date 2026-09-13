@@ -10,7 +10,7 @@ import { SkeletalAnimator } from '../traits/SkeletalAnimator';
 import { Animator } from '../traits/Animator';
 import { SpriteAnimator } from '../traits/SpriteAnimator';
 import { Director } from '../traits/Director';
-import { findSlavingParent } from '../timeline/timelineSystem';
+import { findSlavingParent, seekLandsAt } from '../timeline/timelineSystem';
 import { findEntityById } from '../core/ecs/world';
 import { animatorHasClip } from '../animation/animClipBank';
 import { spriteAnimHasClip } from '../loaders/spriteAnimCache';
@@ -181,7 +181,7 @@ export function registerEngineActions(): void {
         type: 'enum', options: ['play', 'pause', 'toggle', 'restart'],
         tooltip: 'play = resume, pause = hold, toggle = flip, restart = rewind to 0 and play (re-fires the sequence-start events)',
       },
-      time: { type: 'number', tooltip: 'Optional: seek the playhead to this time in seconds. Does NOT re-fire sequence-start — use restart for that.' },
+      time: { type: 'number', tooltip: 'Optional: seek the playhead to this time in seconds, kept inside the timeline (clamped, or wrapped when looping). A paused Director is re-posed at the new time (keyframe + activation tracks). Does NOT re-fire sequence-start or the markers it skips (use restart for that), but a seek onto the end still fires the end once.' },
       speed: { type: 'number', tooltip: 'Optional: playback rate multiplier (1 = normal, 0.5 = half speed). Forward only — a negative rate is clamped to 0, because reverse playback is not supported.' },
     },
     handler: ({ target, params, payload, world }) => {
@@ -246,10 +246,15 @@ export function registerEngineActions(): void {
       // scrubbed backwards fire its start events repeatedly. `restart` above is the way to ask
       // for that, and it says so in its tooltip.
       if (typeof params?.time === 'number' && Number.isFinite(params.time)) {
-        // Only the floor is enforced: a negative playhead has no meaning, while seeking PAST the
-        // end is left to `advance()`, which already clamps (or wraps, when the Director loops) —
-        // duplicating that rule here is exactly the shadowing copy that goes stale.
-        next.time = Math.max(0, params.time);
+        // Wrapped into the timeline AT WRITE (#1113): clamped to [0, duration], or wrapped when the
+        // Director loops. It used to be floored only, leaving the rest to `advance()` — which never
+        // runs for a PAUSED Director, so `{action:'pause', time: 999}` read back 999 for as long as
+        // it stayed paused. `seekLandsAt` is `timelineSystem`'s own wrap rule, not a copy of it.
+        //
+        // What makes a paused seek re-pose, and a seek onto the end still fire `@sequence end`, is
+        // NOT here: `timelineSystem` detects the write itself, so a game system setting
+        // `Director.time` directly gets both too.
+        next.time = seekLandsAt(next.timeline, next.loop, params.time);
         next.lastTime = next.time;
       }
       // ⚠️ Clamped at 0: REVERSE PLAYBACK IS NOT SUPPORTED, and failing silently is worse than

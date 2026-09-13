@@ -165,7 +165,9 @@ describe('ota-publish.mjs takes the cross-process build claim (#650)', () => {
     // The brief for #650 explicitly calls this out: ota-publish.mjs reaches nothing from the
     // heal/vendor family on purpose (#582) — only the claim was added, not a new dependency on it.
     expect(src).not.toMatch(/healNativeConfig|ensureCapacitorDeps|vendorEnginePlugins|loadEnginePluginModule/);
-    expect(src).toMatch(/JSON\.parse\(readFileSync\(projectConfigPath, 'utf8'\)\)/);
+    // Raw since #827 through the shared `readRawOtaBlock` — never the defaulting TS loader.
+    expect(src).toMatch(/readRawOtaBlock\(projectDir\)/);
+    expect(src).not.toMatch(/loadProjectConfig/);
   });
 });
 

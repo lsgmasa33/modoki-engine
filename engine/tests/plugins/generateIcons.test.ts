@@ -24,10 +24,18 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { collect, newFilesOutsideScope, restoreSnapshot, resolveIconInputs, stampExtrasFrom } from '../../scripts/generate-icons.mjs';
+import { collect, newFilesOutsideScope, restoreSnapshot } from '../../scripts/generate-icons.mjs';
+import { resolveIconInputs as resolveIconInputsAt, stampExtrasFrom, iconInputsToArgs } from '../../scripts/iconInputs.mjs';
 import { ICON_COLORS, iconColorArgs, bundledIconPath, BUNDLED_ICON_REL } from '../../scripts/iconAssets.mjs';
 import { DEFAULT_PROJECT_CONFIG } from '../../project-config';
 import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+
+/** The engine checkout these tests run in — what `generate-icons.mjs` passes as `engineRoot`. */
+const ENGINE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+const resolveIconInputs = (args: Record<string, string | undefined>, projectRoot: string, cfg: unknown | null) =>
+  resolveIconInputsAt(args, projectRoot, cfg, ENGINE_ROOT);
+
+const parseArgsLike = (pairs: Array<[string, string]>): Record<string, string> => Object.fromEntries(pairs);
 
 let root: string;
 const PRODUCT = path.join('android', 'app', 'src', 'main', 'res');
@@ -262,6 +270,48 @@ describe('resolveIconInputs (#1011)', () => {
     // '#1027' describe block below.
     expect(resolveIconInputs({}, ROOT, cfgWith({ iconSource: '' })).icon).toBeTruthy();
     expect(resolveIconInputs({}, ROOT, null).icon).toBeUndefined();
+  });
+});
+
+describe('iconInputsToArgs — the editor hands the script EVERYTHING it resolved (#827)', () => {
+  // The packaged editor ships no esbuild, so the spawned generate-icons.mjs reads the config as
+  // `null` there. The flags are then its only source, so the round trip must be lossless: resolve
+  // in-process with the config, serialise, resolve again in the script with NO config — same inputs.
+  const parse = (pairs: Array<[string, string]>) => Object.fromEntries(pairs);
+  const ROOT = path.join(path.sep, 'proj');
+  const configs: Array<[string, unknown]> = [
+    ['every field authored, badge on', {
+      app: {
+        iconSource: 'art/icon.png', splashSource: 'art/splash.png', splashDarkSource: 'art/splash-dark.png',
+        splashTitleSource: 'art/title.png', splashTitleWidthPct: 40, splashTitleOffsetPct: 12, splashBadge: true,
+        iconDarkSource: 'art/d.png', iconTintedSource: 'art/t.png', iconMonochromeSource: 'art/m.png',
+      },
+      capacitor: { orientation: 'landscape' },
+    }],
+    ['nothing authored — bundled icon default, splash cleared, badge off', { app: {}, capacitor: { orientation: 'portrait' } }],
+    ['splash authored, no title, absolute icon', { app: { iconSource: path.join(path.sep, 'abs', 'i.png'), splashSource: 's.png' }, capacitor: {} }],
+  ];
+
+  for (const [label, cfg] of configs) {
+    it(`round-trips losslessly with cfg === null on the far side: ${label}`, () => {
+      const inProcess = resolveIconInputs({ strict: 'true' }, ROOT, cfg);
+      const inScript = resolveIconInputs(parse(iconInputsToArgs(inProcess)), ROOT, null);
+      expect(inScript).toEqual(inProcess);
+    });
+  }
+
+  it('the round trip is not vacuous — a config the script cannot see changes what the editor sends', () => {
+    const a = iconInputsToArgs(resolveIconInputs({}, ROOT, configs[0][1]));
+    const b = iconInputsToArgs(resolveIconInputs({}, ROOT, configs[1][1]));
+    expect(a).not.toEqual(b);
+    expect(parse(a).orientation).toBe('landscape');
+  });
+
+  it('states the booleans POSITIVELY, including false — absent does not mean false once cfg is null', () => {
+    const args = parse(iconInputsToArgs(resolveIconInputs({}, ROOT, { app: { splashSource: 's.png' }, capacitor: {} })));
+    expect(args['splash-cleared']).toBe('false');
+    expect(args.badge).toBe('false');
+    expect(args.strict).toBe('false');
   });
 });
 
@@ -748,29 +798,33 @@ describe('generate-icons reads project.config.json (#1011, at the seam)', () => 
 /** #1011 — the PRODUCER side. `generate-icons.mjs` is thoroughly tested above; the code that decides
  *  what to TELL it was not tested at all, and that is the half where a wrong edit is destructive.
  *
- *  The mutation that made this block necessary: flip `iconStep`'s polarity to
- *  `splashSrcAbs ? 'true' : 'false'`. A packaged-editor build of a project that HAS an authored
- *  splash then sends `--splash-cleared true`; the script stages the splash and immediately deletes
- *  it, and all 26 Android buckets are rebuilt from the icon. Facet B restored, on the one build that
- *  ships, with the whole suite green. Deleting either `MODOKI_ICONS_HANDLED` was likewise invisible.
+ *  The mutation that made this block necessary: `iconStep` used to assemble `--splash-cleared` by hand,
+ *  and flipping it to `splashSrcAbs ? 'true' : 'false'` made a packaged-editor build of a project WITH
+ *  an authored splash stage it and immediately delete it, rebuilding all 26 Android buckets from the
+ *  icon — facet B restored on the one build that ships, with the whole suite green. Since #827 the
+ *  editor resolves every input through `resolveIconInputs` and serialises them with
+ *  `iconInputsToArgs`, whose polarity is tested BEHAVIOURALLY by the round trip above. What is left
+ *  for source to pin is that the editor goes through those two functions and assembles no flag itself.
  *
- *  ⚠️ These read SOURCE, and the reason is worth stating rather than apologising for: `iconStep` and
- *  the two runners are closures inside a 3,000-line Vite plugin bound to a live request, so there is
- *  nothing importable to call. Extracting them is a real refactor and this is a finishing pass. What
- *  a source assertion CAN catch is exactly the two mutations above — a flipped constant and a
- *  deleted property. What it cannot catch is a change that keeps the spelling and breaks the
- *  meaning. Comments are stripped first, so prose cannot satisfy any of it. */
+ *  ⚠️ These read SOURCE: `iconStep` and the two runners are closures inside a Vite plugin bound to a
+ *  live request, so there is nothing importable to call. A source assertion catches a deleted call or
+ *  property; it cannot catch a change that keeps the spelling and breaks the meaning. Comments are
+ *  stripped first, so prose cannot satisfy any of it. */
 describe('the editor tells the generator what only it knows (#1011, producer side)', () => {
   const SCANNER = path.join(path.dirname(fileURLToPath(import.meta.url)),
     '..', '..', 'plugins', 'vite-asset-scanner.ts');
   const rawScanner = fs.readFileSync(SCANNER, 'utf8');
   const scanner = stripComments(rawScanner);
-  assertScanIsSane(rawScanner, scanner, 'vite-asset-scanner.ts', ['iconStep', 'splash-cleared']);
+  assertScanIsSane(rawScanner, scanner, 'vite-asset-scanner.ts', ['iconStep', 'iconInputsToArgs']);
 
-  it('passes --splash-cleared with the polarity that means what it says', () => {
-    // A splash source PRESENT means NOT cleared. Inverting this is a one-token edit that destroys
-    // authored art on the packaged editor, which is the build no test in this repo can drive.
-    expect(scanner).toContain("--splash-cleared ${splashSrcAbs ? 'false' : 'true'}");
+  it('resolves through the shared resolver and emits through its inverse — no flag assembled by hand (#827)', () => {
+    expect(scanner).toMatch(/resolveIconInputs\(\{ strict: 'true' \}, projectRoot, cfg, buildCwd\)/);
+    expect(scanner).toMatch(/iconInputsToArgs\(iconInputs\)/);
+    expect(scanner).toMatch(/stampExtrasFrom\(iconInputs, buildCwd\)/);
+    // Any of these literals back in the scanner is a second resolution beside the shared one.
+    for (const flag of ['--splash', '--orientation', '--title-width', '--badge', '--icon-dark', '--strict']) {
+      expect(scanner, `vite-asset-scanner.ts assembles ${flag} itself`).not.toContain(flag);
+    }
   });
 
   it('tells build-web to stand down on EVERY route that runs it during a native build', () => {
@@ -788,7 +842,10 @@ describe('the editor tells the generator what only it knows (#1011, producer sid
     // BUILD, while a bare hand run of the script stays forgiving. That splits cleanly only if both
     // build callers actually set the flag — drop it from either and that path silently returns to
     // shipping the previously committed art with exit 0, which is the defect, restored, invisibly.
-    expect(scanner, "iconStep must pass --strict").toContain('--strict true');
+    // The editor side: `strict` enters through the resolver, and the round trip above proves
+    // `iconInputsToArgs` emits it; this proves the editor asks for it.
+    expect(scanner, "iconStep must resolve with strict").toMatch(/resolveIconInputs\(\{ strict: 'true' \}/);
+    expect(parseArgsLike(iconInputsToArgs(resolveIconInputs({ strict: 'true' }, '/p', null))).strict).toBe('true');
     const rawBuildWeb = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)),
       '..', '..', 'scripts', 'build-web.mjs'), 'utf8');
     const buildWeb = stripComments(rawBuildWeb);

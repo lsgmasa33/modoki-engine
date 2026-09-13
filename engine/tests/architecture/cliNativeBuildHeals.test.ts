@@ -1,30 +1,25 @@
-/** The CLI native build must run the SAME three in-process heals as the editor's `/api/build`
- *  before its shell steps: `healNativeConfig` → `ensureCapacitorDeps` → `vendorEnginePlugins`
- *  (#148 landed the third alone; #150 closes the remaining gap).
+/** Both native-build entry points must heal through the ONE sequence, `healNativeProject`
+ *  (`engine/plugins/healNativeProject.ts`, #827): the editor's `/api/build` in-process, and
+ *  `build-web.mjs --target native`, which is what `npm run build` runs and what `docs/build.md`
+ *  presents as the manual EQUIVALENT of Build → iOS/Android Device.
  *
- *  Games depend on a content-addressed tarball committed into the project, not on the plugin
- *  source — so a plugin edit reaches a device only once that tarball is re-packed and installed.
- *  Likewise machine/identity settings (iOS DEVELOPMENT_TEAM) and engine-required Capacitor deps
- *  only reach a device once they're healed into the project. The editor's `/api/build` did all
- *  three; `build-web.mjs` (what `npm run build` actually runs, and what `docs/build.md` presents
- *  as the manual EQUIVALENT of Build → iOS/Android Device) did none, then only the vendor step
- *  (#148). Result: the documented CLI recipe could produce an IPA/APK signed with a stale team,
- *  missing a newly-required Capacitor plugin, or containing the PREVIOUS native code — while
- *  every signal reported success. Measured on `games/audio-demo`, whose vendor pin only moved
- *  once `vendor-plugins.mjs` was run by hand.
+ *  The history is why this is a census and not a courtesy. Games depend on a content-addressed
+ *  tarball committed into the project, not on plugin source, so a plugin edit reaches a device only
+ *  once it is re-packed and installed; identity settings and engine-required Capacitor deps likewise
+ *  only reach a device once healed in. The editor did all of it. `build-web.mjs` did none (#148),
+ *  then one step (#150), then lacked the stale-`node_modules` check (#685) — the documented CLI
+ *  recipe could ship an IPA/APK with a stale team, a missing plugin or the PREVIOUS native code
+ *  while every signal reported success. Each fix copied one more step into one more file.
  *
- *  Why a SOURCE assertion rather than a behavioural one. Driving `build-web.mjs` end to end costs
- *  a full tsc + vite build and mutates a real project's `package.json`/`plugins/`/`node_modules`
- *  — far too heavy for `npm test`. `vendoredPluginFreshness.test.ts` already asserts the STATE
- *  this protects (no project pins a stale hash); what has no other guard is the WIRING, and the
- *  wiring is exactly what was missing for as long as the bug existed. Same posture as
- *  `reapScoping.test.ts`, which pins `pkill` patterns by source for the same reason.
+ *  The sequence's BEHAVIOUR — order, install gating, the unconditional stale check, the claim gate,
+ *  the remedy text — is tested once, directly, in `tests/plugins/healNativeProject.test.ts`. What
+ *  this file pins is WIRING: each entry point reaches that function, and neither reaches a step of it
+ *  directly, because a step called beside the sequence is exactly the hand-copy #827 removed.
  *
- *  Kept deliberately loose about HOW (any call shape passes) and strict about the facts that
- *  broke: each heal is reachable at all, gated on the native target, and — for #150's ordering
- *  trap — `ensureCapacitorDeps` runs BEFORE `vendorEnginePlugins` (vendoring rewrites the
- *  placeholder `capacitor-game-debug` spec that `ensureCapacitorDeps` writes; the other order
- *  around, the placeholder is never rewritten). */
+ *  ⚠️ Wiring, not behaviour — a source census proves a call is written, not that it runs on the path
+ *  that matters (`cliBuildClaims.test.ts` carries the scar where one stayed green through a
+ *  deadlock). Driving `build-web.mjs` end to end costs a full tsc + vite build and mutates a real
+ *  project, which is why the behaviour lives in the unit suite instead. */
 
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
@@ -40,314 +35,104 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../
 const buildWeb = path.join(repoRoot, 'engine', 'scripts', 'build-web.mjs');
 const assetScanner = path.join(repoRoot, 'engine', 'plugins', 'vite-asset-scanner.ts');
 
-describe('build-web.mjs heals the native project on --target native (#148, #150)', () => {
+/** The steps of the sequence. An entry point calling any of these itself is composing the sequence
+ *  by hand again. */
+const HEAL_STEPS = /\b(healNativeConfig|ensureCapacitorDeps|vendorEnginePlugins|writeVendorMarker|verifyInstalledMatchesTarball(?:Result)?)\(/;
+
+/** Index of the `}` that closes the brace opened at `openBraceIdx` (which must itself be `{`). */
+function matchingBraceEnd(text: string, openBraceIdx: number): number {
+  let depth = 0;
+  for (let i = openBraceIdx; i < text.length; i++) {
+    if (text[i] === '{') depth++;
+    else if (text[i] === '}') { depth--; if (depth === 0) return i; }
+  }
+  throw new Error('no matching close brace found');
+}
+
+describe('build-web.mjs heals through the ONE shared sequence (#148, #150, #685, #827)', () => {
   const src = readScannedSource(buildWeb).code;
+  const fnStart = src.indexOf('async function healNativeProject()');
+  const fnEnd = fnStart === -1 ? -1 : matchingBraceEnd(src, src.indexOf('{', fnStart));
+  const fnBody = src.slice(fnStart, fnEnd);
 
-  it('imports the generalized engine-plugin loader', () => {
-    expect(src).toMatch(/import\s*\{[^}]*loadEnginePluginModule[^}]*\}\s*from\s*'\.\/loadVendorPlugins\.mjs'/);
+  it('has its heal function (the anchor every assertion below slices from)', () => {
+    expect(fnStart, 'build-web.mjs no longer has `async function healNativeProject()` — re-anchor, do not delete').toBeGreaterThan(-1);
   });
 
-  it('calls healNativeConfig', () => {
-    expect(src).toContain('healNativeConfig(');
+  it('loads healNativeProject.ts through the reason-reporting loader, and calls it', () => {
+    expect(fnBody).toMatch(/loadEnginePluginModuleResult\(repoRoot, path\.join\('plugins', 'healNativeProject\.ts'\)\)/);
+    expect(fnBody).toMatch(/\.healNativeProject\(projectRoot, repoRoot, platforms,/);
   });
 
-  it('calls ensureCapacitorDeps', () => {
-    expect(src).toContain('ensureCapacitorDeps(');
-  });
-
-  it('calls vendorEnginePlugins', () => {
-    expect(src).toContain('vendorEnginePlugins(');
-  });
-
-  it('runs ensureCapacitorDeps BEFORE vendorEnginePlugins (the placeholder-rewrite ordering trap)', () => {
-    // ensureCapacitorDeps writes a PLACEHOLDER capacitor-game-debug spec; vendorEnginePlugins
-    // rewrites that placeholder to the real file: tarball spec. Vendoring first means the
-    // placeholder is never rewritten.
-    const depsCall = src.indexOf('ensureCapacitorDeps(');
-    const vendorCall = src.indexOf('vendorEnginePlugins(');
-    expect(depsCall).toBeGreaterThan(-1);
-    expect(vendorCall).toBeGreaterThan(-1);
-    expect(depsCall).toBeLessThan(vendorCall);
-  });
-
-  it('installs the project when EITHER heal actually changed something', () => {
-    // A fresh tarball or a newly-added dep spec is inert until installed — stopping short of
-    // install would leave the exact stale artifact this is about, one step later. Gating on
-    // only one of the two conditions would silently skip the other's install.
-    expect(src).toMatch(/depsChanged\s*\|\|\s*v\?\.needsInstall/);
-    expect(src).toContain('npm install');
-    expect(src).toContain('writeVendorMarker(');
-  });
-
-  it('does not skip the install just because the VENDOR module could not be loaded', () => {
-    // The install must be gated on what CHANGED, never on which module happened to load. An
-    // early `return` when `vendorEnginePlugins` is unavailable would abandon deps that step 2
-    // had already written into package.json — leaving the project claiming a dependency that is
-    // not on disk, the same silent-success shape as the bug this whole guard is about.
-    const installCall = src.indexOf("execSync('npm install'");
-    const vendorLoad = src.indexOf("loadEnginePluginModuleResult(repoRoot, path.join('plugins', 'vendorPlugins.ts'))");
-    expect(installCall).toBeGreaterThan(-1);
-    expect(vendorLoad).toBeGreaterThan(-1);
-    // Nothing between loading the vendor module and the install may bail out on it being null.
-    expect(src.slice(vendorLoad, installCall)).not.toMatch(/if\s*\(\s*!vendorMod\s*\)\s*return/);
+  it('calls no step of the sequence directly — anywhere in the script', () => {
+    expect(src).not.toMatch(HEAL_STEPS);
   });
 
   it('gates the heal on the NATIVE target', () => {
-    // Every heal here is a native-artifact concern: a web/playable build has nothing to keep
-    // fresh and must not pay the cost (nor mutate the project) for it.
-    expect(src).toMatch(/target\s*!==\s*'native'/);
+    expect(fnBody).toMatch(/target\s*!==\s*'native'/);
   });
 
-  it('runs the heal BEFORE the typecheck', () => {
-    // The typecheck resolves the plugin's types out of the project's node_modules, so a heal
-    // landing after it would be checked against the old copy.
+  it('heals BEFORE the typecheck, which resolves plugin types out of the project node_modules', () => {
     const healCall = src.indexOf('await healNativeProject()');
     const tscCall = src.indexOf('tsconfig.app.scoped.json`');
     expect(healCall).toBeGreaterThan(-1);
     expect(tscCall).toBeGreaterThan(-1);
     expect(healCall).toBeLessThan(tscCall);
   });
-});
 
-// ── #685: node_modules can hold a PREVIOUS tarball's bytes while every signal step 4's `if` gate
-// trusts (the dep spec, the lockfiles, the install marker) agrees the current one is installed —
-// so the gate is false and step 4 does nothing. A check placed INSIDE that `if` could therefore
-// never fire in the one case it exists for: the exact unreachable-mechanism shape #148/#150
-// already burned this file on once (see the file header). This proves the check runs
-// UNCONDITIONALLY — structurally, by matching braces, not merely "the string appears somewhere"
-// (a naive `toContain` would still pass with the call nested inside the `if`).
-describe('build-web.mjs verifies node_modules against the tarball UNCONDITIONALLY, not gated on step 4 (#685)', () => {
-  // Comments stripped (#685 FIX 5), through the shared scanner (#812) — a doc-comment mention of
-  // the call name would otherwise fool the position-based assertions below.
-  const src = readScannedSource(buildWeb).code;
-
-  /** Index of the `}` that closes the brace opened at `openBraceIdx` (which must itself be `{`). */
-  function matchingBraceEnd(text: string, openBraceIdx: number): number {
-    let depth = 0;
-    for (let i = openBraceIdx; i < text.length; i++) {
-      if (text[i] === '{') depth++;
-      else if (text[i] === '}') {
-        depth--;
-        if (depth === 0) return i;
-      }
-    }
-    throw new Error('no matching close brace found');
-  }
-
-  // The check's OWN enclosing block (`if (vendorMod) { … }`), computed once and reused by every
-  // `it` below that needs to scope a slice — not "anywhere later in the file" (an unrelated step
-  // added after this one must not turn a slice red) and not a magic char count (#685 FIX: a
-  // constant window either overruns the block or clips it, depending on unrelated edits nearby).
-  const blockStart = src.indexOf('if (vendorMod) {');
-  const blockEnd = matchingBraceEnd(src, src.indexOf('{', blockStart));
-
-  it('calls verifyInstalledMatchesTarballResult', () => {
-    // #731: switched from the plain verifyInstalledMatchesTarball to the Result variant so this
-    // step can tell "no problems" apart from "could not even read package.json" and warn instead
-    // of reporting the check as clean.
-    expect(src).toContain('verifyInstalledMatchesTarballResult(');
+  it('FAILS the build (throws) on a stale node_modules and on a failed install — never merely logs', () => {
+    expect(fnBody).toMatch(/'stale-node-modules'\)\s*throw new Error/);
+    expect(fnBody).toMatch(/'install-failed'\)\s*throw new Error/);
   });
 
-  it('the call sits AFTER step 4\'s `if (depsChanged || v?.needsInstall)` block closes, not inside it', () => {
-    const ifIdx = src.indexOf('if (depsChanged || v?.needsInstall)');
+  it('warns with the reason and RETURNS — never process.exit — when the module cannot load (#714, #731)', () => {
+    const ifIdx = fnBody.indexOf('if (!healMod)');
     expect(ifIdx).toBeGreaterThan(-1);
-    const openBrace = src.indexOf('{', ifIdx);
-    expect(openBrace).toBeGreaterThan(-1);
-    const closeBrace = matchingBraceEnd(src, openBrace);
-
-    const verifyIdx = src.indexOf('verifyInstalledMatchesTarballResult(');
-    expect(verifyIdx).toBeGreaterThan(-1);
-    expect(verifyIdx).toBeGreaterThan(closeBrace);
-  });
-
-  it('warns (does not throw) when package.json could not be read (#731)', () => {
-    const verifyIdx = src.indexOf('verifyInstalledMatchesTarballResult(');
-    expect(blockStart).toBeGreaterThan(-1);
-    expect(verifyIdx).toBeGreaterThan(blockStart);
-    expect(verifyIdx).toBeLessThan(blockEnd);
-    const nextChunk = src.slice(verifyIdx, blockEnd);
-    expect(nextChunk).toMatch(/unreadable-package-json/);
-    expect(nextChunk).toMatch(/console\.warn/);
-  });
-
-  it('throws (does not merely log), documents the SAFE remedy, and never auto-repairs', () => {
-    const verifyIdx = src.indexOf('verifyInstalledMatchesTarballResult(');
-    expect(blockStart).toBeGreaterThan(-1);
-    expect(verifyIdx).toBeGreaterThan(blockStart);
-    expect(verifyIdx).toBeLessThan(blockEnd);
-    // Scoped to the check's OWN enclosing block (`if (vendorMod) { … }`), not a magic char count —
-    // a constant window either overruns the block (pulling in unrelated later code) or clips it
-    // (#685 FIX).
-    const nextChunk = src.slice(verifyIdx, blockEnd);
-    expect(nextChunk).toMatch(/problems\.length/);
-    expect(nextChunk).toMatch(/throw new Error/);
-    // The remedy is DOCUMENTED in the message, but the script itself must never execute it.
-    // ⚠️ It must be the SAFE remedy: delete the lockfile entry, then a PLAIN `npm install`, with a
-    // conditional rm -rf third step. `npm install --package-lock-only` is what CREATES this state
-    // (#685, measured 2026-09-05) — a message that recommends it as a STEP walks the reader into an
-    // unrecoverable tree, so the only permitted mention of it is a warning not to run it.
-    expect(nextChunk).toMatch(/package-lock\.json/);
-    expect(nextChunk).toMatch(/npm install/);
-    // Robust to SHAPE, not just the one syntactic form the author happened to remove: count every
-    // occurrence of the literal string and require exactly one, and require that the one occurrence
-    // is inside the "Do NOT reach for" warning — never offered as a numbered remedy STEP.
-    const ploCount = (nextChunk.match(/--package-lock-only/g) ?? []).length;
-    expect(ploCount, 'the only permitted mention of --package-lock-only is the "Do NOT reach for" warning — it must never appear as a remedy STEP (#685: it CAUSES this state)').toBe(1);
-    expect(nextChunk).toMatch(/Do NOT reach for[^\n]*--package-lock-only/);
-
-    // ⚠️ The CONDITIONAL third step must survive. Measured (#685 close-out, npm 11.12.1/node v26):
-    // on a PLO-poisoned tree — the state the SUPERSEDED remedy left behind — "delete the entry +
-    // plain npm install" returns `up to date` and never re-extracts; only removing the package dir
-    // repairs it. Dropping step 3 therefore strands exactly the reader who followed the old advice,
-    // and every other assertion here would still pass.
-    expect(nextChunk, 'the remedy must keep its conditional rm -rf third step — the only thing that repairs a PLO-poisoned tree (#685)')
-      .toMatch(/rm -rf node_modules/);
-    expect(nextChunk, 'step 3 must stay CONDITIONAL — an unconditional rm -rf is not the documented remedy')
-      .toMatch(/ONLY if/);
-
-    // An unrelated step added after this one that happens to call execSync() must not turn this red
-    // (#685 FIX 5).
-    const execIdx = src.indexOf('execSync(', verifyIdx);
-    expect(execIdx === -1 || execIdx >= blockEnd).toBe(true);
+    const branch = fnBody.slice(ifIdx, matchingBraceEnd(fnBody, fnBody.indexOf('{', ifIdx)));
+    expect(branch).toMatch(/reason === 'no-esbuild'/);
+    expect(branch).toMatch(/console\.warn/);
+    expect(branch).toMatch(/return;/);
+    expect(branch).not.toMatch(/process\.exit/);
   });
 });
 
-// ── #685 PARITY. The editor's `/api/build` and the CLI `--target native` recipe are documented
-// as equivalent (docs/build.md), and #148 is exactly what a divergence between them costs: the
-// CLI ran NONE of the editor's heals and could ship the PREVIOUS native code with every signal
-// reporting success. A guard added to only ONE path recreates that asymmetry — and the editor's
-// Build menu is the CANONICAL path (root CLAUDE.md), so a CLI-only guard protects the path
-// fewer humans use. This pins both.
-describe('the editor /api/build runs the same #685 check as the CLI, unconditionally', () => {
-  // Comments stripped (#685 FIX 5), through the shared scanner (#812) — a doc-comment mention of
-  // the call name would otherwise fool the position-based assertions below.
+describe('the editor /api/build heals through the same sequence (#685 parity, #827)', () => {
   const src = readScannedSource(assetScanner).code;
 
-  function matchingBraceEnd(text: string, openBraceIdx: number): number {
-    let depth = 0;
-    for (let i = openBraceIdx; i < text.length; i++) {
-      if (text[i] === '{') depth++;
-      else if (text[i] === '}') { depth--; if (depth === 0) return i; }
+  it('imports healNativeProject from the shared module and calls it for the build platform', () => {
+    expect(src).toMatch(/import\s*\{\s*healNativeProject\s*\}\s*from\s*'\.\/healNativeProject'/);
+    expect(src).toMatch(/await healNativeProject\(projectRoot, buildCwd, \[platform\],/);
+  });
+
+  it('calls no step of the sequence directly', () => {
+    expect(src).not.toMatch(HEAL_STEPS);
+  });
+
+  it('heals BEFORE the #370 release-file writes — the heal is what gitignores keystore.properties', () => {
+    // `healNativeConfig` adds `keystore.properties` to a freshly scaffolded `android/.gitignore`;
+    // writing the upload key's passwords first leaves them unignored for as long as the heal takes,
+    // or for good if it refuses.
+    const heal = src.indexOf('await healNativeProject(');
+    for (const write of ['renderKeystoreProperties(', 'renderExportOptionsPlist(']) {
+      const at = src.indexOf(write);
+      expect(at, `${write} is gone — re-anchor`).toBeGreaterThan(-1);
+      expect(heal, `the heal runs after ${write}`).toBeLessThan(at);
     }
-    throw new Error('no matching close brace found');
-  }
-
-  // The check's OWN enclosing block (`if (stale.length) { … }`), computed once and reused below —
-  // not a magic char count (#685 FIX: a constant window either overruns the block or clips it,
-  // depending on unrelated edits nearby).
-  const blockStart = src.indexOf('if (stale.length)');
-  const blockEnd = matchingBraceEnd(src, src.indexOf('{', blockStart));
-
-  it('imports and calls verifyInstalledMatchesTarballResult', () => {
-    // #731: switched from the plain verifyInstalledMatchesTarball to the Result variant — see the
-    // build-web.mjs describe block above for the same change on the CLI side.
-    expect(src).toMatch(/import\s*\{[^}]*verifyInstalledMatchesTarballResult[^}]*\}\s*from\s*'\.\/vendorPlugins'/);
-    expect(src).toContain('verifyInstalledMatchesTarballResult(');
   });
 
-  it("the call sits AFTER the install `if (depHeal.changed || v.needsInstall)` block closes, not inside it", () => {
-    const ifIdx = src.indexOf('if (depHeal.changed || v.needsInstall)');
+  it('installs through the abort-aware scaffold shell, not a blocking exec', () => {
+    const call = src.indexOf('await healNativeProject(');
+    const portsEnd = src.indexOf('});', call);
+    expect(src.slice(call, portsEnd)).toMatch(/install:\s*\(why\)\s*=>\s*runScaffoldShell\(/);
+  });
+
+  it('ENDS the build on every refusal — the block cannot fall through to the build steps', () => {
+    const ifIdx = src.indexOf('if (!heal.ok)');
     expect(ifIdx).toBeGreaterThan(-1);
-    const openBrace = src.indexOf('{', ifIdx);
-    const closeBrace = matchingBraceEnd(src, openBrace);
-    const verifyIdx = src.indexOf('verifyInstalledMatchesTarballResult(');
-    expect(verifyIdx).toBeGreaterThan(-1);
-    expect(verifyIdx).toBeGreaterThan(closeBrace);
-  });
-
-  it('sends a warning (does not fail the build) when package.json could not be read (#731)', () => {
-    const verifyIdx = src.indexOf('verifyInstalledMatchesTarballResult(');
-    expect(verifyIdx).toBeGreaterThan(-1);
-    expect(blockStart).toBeGreaterThan(-1);
-    const chunk = src.slice(verifyIdx, blockStart);
-    expect(chunk).toMatch(/unreadable-package-json/);
-    expect(chunk).toMatch(/send\(/);
-  });
-
-  it('fails the build on a problem, documents the SAFE remedy, and never auto-repairs', () => {
-    const verifyIdx = src.indexOf('verifyInstalledMatchesTarballResult(');
-    expect(blockStart).toBeGreaterThan(-1);
-    // Here the call sits BEFORE its own `if (stale.length) { … }` — unlike the build-web.mjs
-    // block above, whose call is nested inside `if (vendorMod) { … }`.
-    expect(verifyIdx).toBeLessThan(blockStart);
-    expect(blockStart).toBeLessThan(blockEnd);
-    // Scoped to the check's OWN enclosing block, not a magic char count (#685 FIX).
-    const chunk = src.slice(verifyIdx, blockEnd);
-    expect(chunk).toMatch(/stale\.length/);
-    expect(chunk).toMatch(/res\.end\(\)/);   // the build is ENDED, not merely logged
-    expect(chunk).toMatch(/package-lock\.json/); // the remedy is documented to the human…
-    // Robust to SHAPE, not just the one syntactic form the author happened to remove: count every
-    // occurrence of the literal string and require exactly one, inside the "Do NOT reach for"
-    // warning — never offered as a numbered remedy STEP.
-    const ploCount = (chunk.match(/--package-lock-only/g) ?? []).length;
-    expect(ploCount, 'the only permitted mention of --package-lock-only is the "Do NOT reach for" warning — it must never appear as a remedy STEP (#685: it CAUSES this state)').toBe(1);
-    expect(chunk).toMatch(/Do NOT reach for[^\n]*--package-lock-only/);
-
-    // ⚠️ The CONDITIONAL third step must survive. Measured (#685 close-out, npm 11.12.1/node v26):
-    // on a PLO-poisoned tree — the state the SUPERSEDED remedy left behind — "delete the entry +
-    // plain npm install" returns `up to date` and never re-extracts; only removing the package dir
-    // repairs it. Dropping step 3 therefore strands exactly the reader who followed the old advice,
-    // and every other assertion here would still pass.
-    expect(chunk, 'the remedy must keep its conditional rm -rf third step — the only thing that repairs a PLO-poisoned tree (#685)')
-      .toMatch(/rm -rf node_modules/);
-    expect(chunk, 'step 3 must stay CONDITIONAL — an unconditional rm -rf is not the documented remedy')
-      .toMatch(/ONLY if/);
-    // …but never executed: no shell runner between the check and the end of its block.
-    expect(chunk).not.toMatch(/runScaffoldShell\(|spawnBuildCommand\(|execSync\(/);
-  });
-});
-
-// ── #731 equivalence, take 2. The previous version of this block proved the two call sites' own
-// STRING LITERALS matched byte for byte (`eval`-ing each extracted argument expression) — a
-// text-extraction guard that (a) still passed when the `if` guarding either call was defeated
-// (e.g. `if (false && verifyReason === 'unreadable-package-json')` — condition and message both
-// intact, still finds and evals the same literal), (b) broke on an unbounded forward `indexOf`
-// latching onto an unrelated later call of the same name if the real one were ever deleted, and
-// (c) — the fatal one — went RED the moment the fix it was implicitly asking for actually landed:
-// extracting the shared text into ONE function, as `staleNodeModulesWarning.mjs`'s own header
-// explains, leaves no per-file literal for either side to `eval` at all.
-//
-// With the text now living in exactly one place, byte-for-byte drift between the two messages is
-// no longer a reachable failure mode — there is only one copy to drift from. What replaces the old
-// test is REACHABILITY (both files import the shared function and call it, rather than each
-// re-inlining its own string) plus a DIRECT test of the producer's own output, below.
-describe('build-web.mjs and the editor /api/build share ONE stale-package.json warning producer (#731 equivalence)', () => {
-  function matchingBraceEnd(text: string, openBraceIdx: number): number {
-    let depth = 0;
-    for (let i = openBraceIdx; i < text.length; i++) {
-      if (text[i] === '{') depth++;
-      else if (text[i] === '}') { depth--; if (depth === 0) return i; }
-    }
-    throw new Error('no matching close brace found');
-  }
-
-  const buildWebSrc = readScannedSource(buildWeb).code;
-  const scannerSrc = readScannedSource(assetScanner).code;
-
-  it('both files import describeUnreadablePackageJsonWarning from the shared .mjs module', () => {
-    expect(buildWebSrc).toMatch(/import\s*\{\s*describeUnreadablePackageJsonWarning\s*\}\s*from\s*'\.\/staleNodeModulesWarning\.mjs'/);
-    expect(scannerSrc).toMatch(/import\s*\{\s*describeUnreadablePackageJsonWarning\s*\}\s*from\s*'\.\.\/scripts\/staleNodeModulesWarning\.mjs'/);
-  });
-
-  it('build-web.mjs calls the shared producer, inside console.warn, inside its OWN unreadable-package-json branch', () => {
-    const ifIdx = buildWebSrc.indexOf("if (verifyReason === 'unreadable-package-json')");
-    expect(ifIdx).toBeGreaterThan(-1);
-    const openBrace = buildWebSrc.indexOf('{', ifIdx);
-    const closeBrace = matchingBraceEnd(buildWebSrc, openBrace);
-    const branch = buildWebSrc.slice(openBrace, closeBrace);
-    // Nested — not merely present somewhere in the branch — so a call that ignores the producer's
-    // return value (e.g. a stray `describeUnreadablePackageJsonWarning(projectRoot);` beside an
-    // unrelated console.warn) does not pass this.
-    expect(branch).toMatch(/console\.warn\([^)]*describeUnreadablePackageJsonWarning\(projectRoot\)/);
-  });
-
-  it('the editor route calls the shared producer, inside send(), inside its OWN unreadable-package-json branch', () => {
-    const ifIdx = scannerSrc.indexOf("if (staleCheckReason === 'unreadable-package-json')");
-    expect(ifIdx).toBeGreaterThan(-1);
-    const openBrace = scannerSrc.indexOf('{', ifIdx);
-    const closeBrace = matchingBraceEnd(scannerSrc, openBrace);
-    const branch = scannerSrc.slice(openBrace, closeBrace);
-    expect(branch).toMatch(/send\(\s*describeUnreadablePackageJsonWarning\(projectRoot\)\s*\)/);
+    const block = src.slice(ifIdx, matchingBraceEnd(src, src.indexOf('{', ifIdx)));
+    expect(block).toMatch(/sendStatus\(`FAILED:stale node_modules`|sendStatus\('FAILED:stale node_modules'\)/);
+    expect(block).toMatch(/res\.end\(\);\s*return;\s*$/);
+    expect(block).not.toMatch(/runScaffoldShell\(|spawnBuildCommand\(|execSync\(/);
   });
 });
 
@@ -368,7 +153,7 @@ describe('describeUnreadablePackageJsonWarning (the shared #685/#731 producer)',
 describe('build-web.mjs validates project config before it builds anything (#589 sibling)', () => {
   const src = readScannedSource(buildWeb).code;
 
-  // `/api/build` runs projectConfigUnionErrors + validateBuildConfig for EVERY target
+  // `/api/build` runs projectBuildConfigErrors (#827) for EVERY target
   // (web/playable/ios/android alike) before its platform branch — vite-asset-scanner.ts's
   // `/api/build` handler. add-native-targets.mjs (#589) added the identical pair before its
   // scaffold. This is the same check's sibling in the third CLI path that reaches a native
@@ -379,32 +164,40 @@ describe('build-web.mjs validates project config before it builds anything (#589
   // space, an orientation typo) and pass a good one — is already covered by
   // `cliNativeTargetValidates.test.ts`'s first describe block (#589); not duplicated here.
 
-  it('reaches both projectConfigUnionErrors and validateBuildConfig', () => {
-    expect(src).toMatch(/projectConfigUnionErrors\(/);
-    expect(src).toMatch(/validateBuildConfig\(/);
+  it('reaches the shared projectBuildConfigErrors, and neither half of it directly (#827)', () => {
+    expect(src).toMatch(/projectBuildConfigErrors\(/);
+    expect(src).not.toMatch(/projectConfigUnionErrors\(|validateBuildConfig\(/);
   });
 
-  it('runs the check BEFORE the first healNativeConfig( call', () => {
-    // Same technique as the ensureCapacitorDeps-before-vendorEnginePlugins ordering test above:
-    // loose about HOW, strict about the ordering fact that matters — validation must land before
-    // ANY native file gets healed from a config nothing has checked yet.
-    const unionCall = src.indexOf('projectConfigUnionErrors(');
-    const validateCall = src.indexOf('validateBuildConfig(');
-    const healConfigCall = src.indexOf('healNativeConfig(');
-    expect(unionCall).toBeGreaterThan(-1);
+  it('runs the check BEFORE the heal', () => {
+    // Loose about HOW, strict about the ordering fact that matters — validation must land before
+    // ANY native file gets healed from a config nothing has checked yet. Compared at the CALL sites
+    // in the main flow: the two function DEFINITIONS' order in the file says nothing about which runs.
+    const validateCall = src.indexOf('await validateProjectConfig();');
+    const healCall = src.indexOf('await healNativeProject();');
     expect(validateCall).toBeGreaterThan(-1);
-    expect(healConfigCall).toBeGreaterThan(-1);
-    expect(unionCall).toBeLessThan(healConfigCall);
-    expect(validateCall).toBeLessThan(healConfigCall);
+    expect(healCall).toBeGreaterThan(-1);
+    expect(validateCall).toBeLessThan(healCall);
   });
 
   it('exits non-zero on the error path, without a --force-style bypass', () => {
-    const validateCall = src.indexOf('validateBuildConfig(');
+    const validateCall = src.indexOf('projectBuildConfigErrors(');
     const nextChunk = src.slice(validateCall, validateCall + 400);
     expect(nextChunk).toMatch(/cfgErrors\.length/);
     expect(nextChunk).toMatch(/process\.exit\(1\)/);
     // The issue explicitly leaves a bypass as an owner call — this check must not grow one.
     expect(nextChunk).not.toMatch(/--force/);
+  });
+});
+
+describe('both editor routes validate through the shared projectBuildConfigErrors (#589, #827)', () => {
+  const src = readScannedSource(assetScanner).code;
+
+  it('/api/build and /api/add-native-target each call it, and neither calls a half of it', () => {
+    // Two calls: one per route. Fewer means a route stopped validating; a half called directly is
+    // the hand-assembled expression #827 removed, which the next check added to the function misses.
+    expect(src.match(/projectBuildConfigErrors\(projectRoot\)/g) ?? []).toHaveLength(2);
+    expect(src).not.toMatch(/projectConfigUnionErrors\(|validateBuildConfig\(/);
   });
 });
 

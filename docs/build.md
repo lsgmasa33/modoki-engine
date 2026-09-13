@@ -349,7 +349,7 @@ shipped wrong once, in the commit that added the fallback, and caught in review.
 ⚠️ **The bundled icon lives under `engine/assets/`, NOT `build/`.** `electron-builder.yml`'s `files:`
 ships `engine/**` + `dist/**` + `package.json`; `build/` reaches the package only as `build/bin` via
 `extraResources`. A default under `build/` therefore does not exist in the **packaged editor**, where
-`iconStep` passes `--icon ""` and the script silently generates nothing — a third answer for the same
+`iconStep` resolves no icon, passes none, and the script silently generates nothing — a third answer for the same
 project. Identical to the trap that moved the splash badge art out of `build/`. Guarded by
 `engine/tests/plugins/bundledIconExists.test.ts`.
 
@@ -382,11 +382,9 @@ generates everything twice — and since `generateNativeIcons` does BOTH platfor
 exist, an iOS-only editor build also rewrote tracked Android art. `iconStep` wins because it is
 per-platform and has the bundled-icon fallback above.
 
-⚠️ **This is the sixth hand-application of the pattern #827 exists to extract** ("every CLI entry
-point re-implements its editor route's preamble by hand"). Accepted deliberately: the owner was asked
-the fork in plain terms and chose the local fix, because the icon defects were live while #827 has a
-design ready and nothing decaying. #827 stays open with `family/one-entry-point`; #1011 is its eighth
-member.
+#1011 first landed as the sixth hand-application of the pattern #827 existed to extract — the owner's
+call while the icon defects were live. #827 then folded it: `iconStep` and `generate-icons.mjs` now
+resolve through the one `resolveIconInputs` (§ "One entry point per operation").
 
 ### App icons + splash are GENERATED, but still tracked
 
@@ -2029,18 +2027,21 @@ direction: defaulting would be silently wrong for one of the two callers.
 fails with module, CORS and asset-fetch errors that look exactly like build bugs, and that
 misreading has cost time. Serve the `dist/` folder (any static server) before diagnosing anything.
 
-#### `--target native` runs the same in-process heals as the editor (#148, #150), then verifies (#685)
+#### `--target native` heals through the same function as the editor (#148, #150, #685, #827)
 
-Before its shell steps, `build-web.mjs` runs the SAME three in-process heals as the editor's
-`/api/build`, in the same order, for the same reason each exists — and then BOTH paths verify the
-result:
+Before its shell steps, a native build heals the project through **one function,
+`healNativeProject` (`engine/plugins/healNativeProject.ts`)**, and both entry points call it: the
+editor's `/api/build` in-process, and `build-web.mjs --target native` through
+`loadEnginePluginModuleResult`. The steps, in order:
 
-| In-process heal | Editor `/api/build` | CLI `--target native` |
-|---|---|---|
-| `healNativeConfig` — sync `build.appleTeamId` → iOS `DEVELOPMENT_TEAM`, Android `local.properties` | ✅ | ✅ |
-| `ensureCapacitorDeps` — add engine-REQUIRED Capacitor plugins the project predates | ✅ | ✅ |
-| `vendorEnginePlugins` — re-pack + install a changed engine plugin | ✅ | ✅ |
-| `verifyInstalledMatchesTarballResult` — **verification, not a heal** (#685): fail if `node_modules` holds a PREVIOUS tarball's bytes | ✅ | ✅ |
+| Step | What it does |
+|---|---|
+| gate | refuse unless this process (or the build that spawned it) holds the project's **build claim** — every step below writes the project |
+| `healNativeConfig` | sync `build.appleTeamId` → iOS `DEVELOPMENT_TEAM`, Android `local.properties` |
+| `ensureCapacitorDeps`, per platform | add engine-REQUIRED Capacitor plugins the project predates |
+| `vendorEnginePlugins` | re-pack a changed engine plugin's tarball |
+| `npm install` | iff either of the two steps above changed something |
+| `verifyInstalledMatchesTarballResult` | **verification, not a heal** (#685): refuse if `node_modules` holds a PREVIOUS tarball's bytes |
 
 Games don't build `engine/packages/capacitor-*` from source — they depend on a content-addressed
 tarball committed into the project (`"capacitor-game-debug": "file:plugins/…-<hash>.tgz"`). So a
@@ -2050,40 +2051,60 @@ gets one just by building; and `build.appleTeamId` only reaches a device build o
 into the generated native project. On `web`/`playable` none of this runs (every heal here is a
 native-artifact concern; a web build has nothing to keep fresh and must not pay for it).
 
-⚠️ **The fourth row is a CHECK, and it runs UNCONDITIONALLY — not behind the install condition
-the three heals share.** The state it catches is `node_modules` holding a previous tarball's
-contents while the dep spec, both lockfiles and the install marker all agree the current one is
-installed. In that state nothing looks changed, `npm install` reports "up to date", and the install
-step does nothing — so a check gated on "did a heal change something?" could never fire in the one
-case it exists for. It fails the build rather than repairing: an `rm -rf` inside `node_modules`
-mid-build is itself a mutation, and — the load-bearing reason — this check knows only that the
-tarball and `node_modules` DISAGREE, not which side is right. `vendorEnginePlugins` may rewrite a
-tracked lockfile mid-build because it just packed the tarball and knows it is correct; this check
-has no such knowledge, and one of its reachable causes is a mis-resolved `.tgz` merge conflict
-where the committed tarball is the wrong generation. The remedy is printed per plugin — and it is NOT a
-bare `rm -rf <project>/node_modules/<plugin> && npm install`, which leaves the stale integrity in
-place; see the ⚠️ npm-cache-trap block a few sections below for the recipe that actually works.
+**Why one function, and what it replaced.** Every step was always single-sourced; what each entry
+point wrote by hand was *which* steps run and *in what order* — and those copies drifted. The CLI
+ran none of the editor's heals (#148, which added one), then two were still missing (#150), then it
+lacked the stale check (#685); each fix copied one more step into one more file, and following the
+CLI recipe after a plugin edit produced an IPA/APK containing the PREVIOUS native code while every
+signal reported success. A step added to `healNativeProject` now runs on both. The function takes
+its I/O as ports (`log`, `warn`, `install` — the route streams over SSE and aborts with its client,
+the CLI prints and blocks) and nothing else: there is no option that skips a step.
 
-⚠️ **Both paths, deliberately.** A check in only one recreates #148's asymmetry — and the editor's
-Build menu is the canonical path, so a CLI-only guard would protect the path fewer humans use.
-`cliNativeBuildHeals.test.ts` pins the call's position in both, brace-matched rather than by string
-match, so the two cannot drift apart.
+⚠️ **On a dev machine an editor native build heals TWICE, on purpose.** `/api/build` calls the
+function in-process and then spawns `build-web.mjs --target native`, which calls it again. The
+second run is a few idempotent reads. It is not a duplicate to remove: a PACKAGED editor ships no
+esbuild, so the spawned script cannot load the `.ts` module and degrades with a warning — there the
+route's in-process call is the only heal that runs. (That nesting — the editor route *wrapping*
+the CLI script rather than sitting beside it — is the general shape of the build entry points;
+§ "One entry point per operation" below.)
 
-Landed in two steps: #148 added only the third heal, which meant following the CLI recipes after a
-plugin edit produced an IPA/APK containing the PREVIOUS native code while every signal reported
-success; #150 closed the remaining two, using the exact editor semantics — same ordering, same
-install condition — rather than re-deriving them:
-
+- **The heal's claim gate is at the mutation, not in each caller's line order.** `holdsBuildClaim`
+  (`buildClaimsStore.mjs`) is true for the process that took the claim and for a child that
+  inherited its token on `MODOKI_BUILD_CLAIM_TOKEN`. An unreadable claims file reads as NOT held —
+  it answers a gate. Every build entry point already claimed before it healed (measured at #827),
+  so this closed no live race; it makes a build that heals unclaimed refuse instead of racing.
+  ⚠️ It covers `healNativeProject` ONLY. `scaffoldNativeTarget` does not ask, and neither does the
+  Electron heal-on-open (`electron/main.ts`'s `healProjectOnOpen` + `ensureProjectDeps`), which
+  calls `healNativeConfig` and `vendorEnginePlugins` directly with no claim at all — so opening a
+  project in the editor while a CLI native build heals it is an unguarded, pre-existing race.
+  ⚠️ A claim older than `BUILD_CLAIM_TTL_MS` (60 min) reads as not held, so a route whose steps
+  before the heal ran that long would refuse. `/api/build` heals before the go-ios download and the
+  release-file writes for that reason; only an auto-scaffold precedes it.
 - **Order is load-bearing.** `ensureCapacitorDeps` runs BEFORE `vendorEnginePlugins`: when it adds
   `capacitor-game-debug`, it writes a placeholder dep spec (`'*'`), and `vendorEnginePlugins`
   rewrites that placeholder to the real `file:plugins/<name>-<ver>.tgz`. Vendoring first would
   leave the placeholder unrewritten — a project stuck depending on a spec npm can't install.
-- **Install is conditioned on EITHER heal changing something** (`depHeal.changed ||
-  v.needsInstall`), not just the vendor step — a newly-added dep spec is just as inert until
-  installed as a fresh tarball.
-- `ensureCapacitorDeps` needs a platform, and `--target native` covers both; the CLI heals
-  whichever of `ios/`/`android/` the project already has on disk (a project with neither yet is
-  the editor's scaffold-then-build path, which the CLI has no equivalent entry point for).
+- **Install is conditioned on EITHER step changing something**, not just the vendor step — a
+  newly-added dep spec is just as inert until installed as a fresh tarball. The install marker is
+  written only after the install succeeds; a failed install ends the heal before the stale check.
+- ⚠️ **The stale check runs UNCONDITIONALLY — not behind the install condition.** The state it
+  catches is `node_modules` holding a previous tarball's contents while the dep spec, both lockfiles
+  and the install marker all agree the current one is installed. In that state nothing looks
+  changed, `npm install` reports "up to date", and the install step does nothing — so a check gated
+  on "did a heal change something?" could never fire in the one case it exists for. It refuses
+  rather than repairing: this check knows only that the tarball and `node_modules` DISAGREE, not
+  which side is right (`vendorEnginePlugins` may rewrite a tracked lockfile because it just packed
+  the tarball and knows it is correct; one of this check's reachable causes is a mis-resolved `.tgz`
+  merge conflict where the committed tarball is the wrong generation). The remedy text is
+  `describeStaleNodeModules` — one producer, and NOT a bare `rm -rf <project>/node_modules/<plugin>
+  && npm install`, which leaves the stale integrity in place; see the ⚠️ npm-cache-trap block a few
+  sections below.
+- `ensureCapacitorDeps` needs a platform. The route passes the one it is building; `--target native`
+  covers both, so the CLI passes whichever of `ios/`/`android/` the project already has on disk (a
+  project with neither yet is the editor's scaffold-then-build path, which the CLI has no equivalent
+  entry point for).
+- Tests: the sequence's behaviour is `tests/plugins/healNativeProject.test.ts`; that each entry point
+  calls it and calls no step directly is the census in `tests/architecture/cliNativeBuildHeals.test.ts`.
 - ⚠️ **A PACKAGED editor must never let this chain BUILD a plugin, and that is decided by an env
   var, not by the call site.** `vendorEnginePlugins`'s `canBuild` defaults to
   `process.env.MODOKI_PACKAGED !== '1'`; `main.ts` sets `MODOKI_PACKAGED=1` when `app.isPackaged`,
@@ -2303,6 +2324,48 @@ Two notes worth carrying:
   grepping the new source string into `games/<id>/node_modules/<plugin>/...` before trusting a
   device build. A `git status` on `games/<id>/plugins/*.tgz`/`package.json` after re-vendoring
   confirms whether it actually changed.
+
+#### One entry point per operation
+
+**Every build operation has two entry points — an editor route and a CLI script — and every step
+both need is ONE function both call (#827).** The failure this closes was not a missing guard but a
+missing place to put one: each entry point composed its preamble by hand, so a guard or heal added to
+one did not exist on the other. Eight issues in six months were that shape (#148, #150, #582, #589,
+#649, #650, #685, #1011), each fixed by copying one more step into one more file.
+
+| Operation | Editor route | CLI script | Shared function |
+|---|---|---|---|
+| project-config validation | `/api/build`, `/api/add-native-target` | `build-web.mjs`, `add-native-targets.mjs` | `projectBuildConfigErrors` (`load-project-config.ts`) |
+| native heal | `/api/build` | `build-web.mjs --target native` | `healNativeProject` (`healNativeProject.ts`) — § above |
+| native scaffold | `/api/add-native-target` | `add-native-targets.mjs` | `scaffoldNativeTarget` (`addNativeTarget.ts`) |
+| OTA publish-request check | `/api/ota/publish` | `ota-publish.mjs` | `otaPublishPreflight` (`scripts/ota/publishPreflight.mjs`) — wording per side, keyed by `OTA_PUBLISH_REFUSALS` |
+| icon + splash inputs | `/api/build`'s `iconStep` | `generate-icons.mjs` (run by `build-web.mjs --target native`) | `resolveIconInputs` + its flag inverse `iconInputsToArgs` (`scripts/iconInputs.mjs`) |
+
+⚠️ **The route usually WRAPS the script rather than sitting beside it.** `/api/build` runs its own
+preamble and then spawns `build-web.mjs`; `/api/ota/publish` builds and then spawns
+`ota-publish.mjs`; `scaffoldNativeTarget` spawns `build-web.mjs --target native` mid-scaffold. So a
+step lives in the shared function and may run twice on one editor build — that is the price of the
+packaged editor, where a spawned `.mjs` cannot load `.ts` (no esbuild) and only the route's
+in-process call runs. Deleting the "duplicate" in-process call breaks the packaged editor.
+
+**When the script cannot read the config, the route resolves for it.** Icons are the worked
+example: `generate-icons.mjs` reads `project.config.json` itself, but in a packaged editor that read
+fails (no esbuild) and it would see nothing. So `iconStep` resolves the inputs in-process with the
+config it already parsed and passes them ALL as flags through `iconInputsToArgs`, the resolver's
+exact inverse — the script, resolving those flags with no config, gets the same inputs
+(`generateIcons.test.ts` round-trips it). Before #827 `iconStep` assembled fourteen flags by hand
+beside the resolver, and the two had already disagreed once (#1027).
+
+**The claim is the one step that stays per side**, because it genuinely differs: a route takes
+`acquireBuildSlot` (the in-process slot plus the cross-process claim, released together), a script
+takes `acquireBuildClaim` alone. What is shared is the rule — claim before any mutation. The native
+heal enforces it inside itself (`holdsBuildClaim`); the scaffold and the Electron heal-on-open do
+not yet, so for them it is still each caller's line order (§ above).
+
+**The shape a shared step takes**, and the one it must not: a function with its I/O injected
+(`log`, `install`, `send`, `runShell`), never one with booleans that skip steps. A required step
+behind an optional flag is how #150 shipped — `electron/main.ts` calls `healProjectOnOpen`
+explicitly for the same reason. A caller that should not run a step does not call the function.
 
 #### Why the vendored tarball's hash churns, and the fix
 

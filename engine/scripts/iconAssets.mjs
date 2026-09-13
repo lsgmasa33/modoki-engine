@@ -51,7 +51,7 @@ export const GENERATED_PNG = { compressionLevel: 9, effort: 10 };
  *
  *  ⚠️ This lived in exactly one caller and that was #1027. `iconStep`
  *  (`engine/plugins/vite-asset-scanner.ts`) fell back to it; `resolveIconInputs`
- *  (`engine/scripts/generate-icons.mjs`) did not, and reported "nothing to generate; committed
+ *  (then in `engine/scripts/generate-icons.mjs`, now `iconInputs.mjs`) did not, and reported "nothing to generate; committed
  *  icons untouched" instead. So the EDITOR's build plan maintained the icons of the 22 native
  *  projects that author none, and the CLI native build maintained nothing — same project, same
  *  config, two different answers, which is `family/one-entry-point` (#827) by name.

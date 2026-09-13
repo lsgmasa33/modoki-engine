@@ -2,8 +2,8 @@
  *  editor's `/api/add-native-target` route runs before it scaffolds (#589).
  *
  *  Both reach the identical `scaffoldNativeTarget`, but only the route validated the merged
- *  config first — `projectConfigUnionErrors` + `validateBuildConfig`, the pair described at
- *  `vite-asset-scanner.ts` around the `/api/add-native-target` handler. The CLI loaded the
+ *  config first — the two-part check that is now ONE function, `projectBuildConfigErrors` (#827),
+ *  called by both. The CLI loaded the
  *  config and scaffolded straight through it, so a hand-edited `project.config.json` carrying
  *  `"appId": "com.example.my game"` (or `""`) — refused by the editor — was accepted by the
  *  CLI and written into `capacitor.config.json`, then the iOS bundle identifier / Android
@@ -25,7 +25,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readScannedSource } from '@modoki/engine/testing';
-import { projectConfigUnionErrors, validateBuildConfig, loadProjectConfig, loadProjectUserConfig } from '../../plugins/load-project-config';
+import { projectBuildConfigErrors } from '../../plugins/load-project-config';
 import { hasInternalGames } from '../helpers/repoLayout';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -46,15 +46,22 @@ describe('the two-part project-config validation actually rejects bad configs (#
     }
   });
 
-  const errorsFor = (root: string): string[] => {
-    const cfg = loadProjectConfig(root);
-    return [...projectConfigUnionErrors(root), ...validateBuildConfig(cfg, loadProjectUserConfig(root))];
-  };
+  // The shared function itself — not a re-assembly of its two halves here, which would test a
+  // copy of the call-site expression #827 deleted rather than what every entry point now runs.
+  const errorsFor = projectBuildConfigErrors;
 
   it('rejects an appId containing a space', () => {
     const dir = makeProject({ app: { appId: 'com.example.my game' } });
     const errors = errorsFor(dir);
     expect(errors.some((e) => e.includes('appId'))).toBe(true);
+  });
+
+  it('rejects an out-of-union value the RESOLVED config no longer carries — the union pass (#39)', () => {
+    // `validateBuildConfig` alone cannot see this: resolution coerces "potrait" to the default
+    // orientation before it gets the config. Pins that the function runs BOTH passes.
+    const dir = makeProject({ capacitor: { orientation: 'potrait' } });
+    const errors = errorsFor(dir);
+    expect(errors.some((e) => e.includes('capacitor.orientation') && e.includes('potrait'))).toBe(true);
   });
 
   it('rejects an empty appId', () => {
@@ -87,15 +94,14 @@ describe('the two-part project-config validation actually rejects bad configs (#
 });
 
 describe('add-native-targets.mjs wires the validation in before scaffolding (#589)', () => {
-  // ⚠️ `.code`, NOT `fs.readFileSync`. This file's prose says "…SEPARATE from validateBuildConfig
-  // because / validateBuildConfig sees the already-RESOLVED config…" INSIDE the span the binding
-  // check below slices, so a raw read lets a COMMENT satisfy an assertion about a binding. That is
+  // ⚠️ `.code`, NOT `fs.readFileSync`. This file's prose names the validators INSIDE the span the
+  // binding check below slices, so a raw read lets a COMMENT satisfy an assertion about a binding. That is
   // #812's rule, and its `commentStripperIsShared` detector is blind here because the path arrives
   // through a variable rather than an inline repo-rooted literal (documented gap, that file's
   // :235) — the exemption was never signed off in `RAW_READ_ALLOW`, it was just invisible.
   const src = readScannedSource(scriptPath).code;
 
-  it('binds projectConfigUnionErrors and validateBuildConfig from the shared engine-module loader', () => {
+  it('binds projectBuildConfigErrors from the shared engine-module loader', () => {
     // ⚠️ This guard was VACUOUS until #827. It read
     //     src.slice(0, src.indexOf('await loadPluginModules()'))
     // and when #827 removed that private loader, `indexOf` returned -1, `slice(0, -1)` became the
@@ -107,28 +113,28 @@ describe('add-native-targets.mjs wires the validation in before scaffolding (#58
     expect(load, 'the script no longer loads its engine modules through loadVendorPlugins.mjs (#827) '
       + '— re-anchor this guard rather than deleting it').toBeGreaterThan(-1);
 
-    // Both validators must arrive by DESTRUCTURE from that load. The span is the load call up to
+    // The validator must arrive by DESTRUCTURE from that load. The span is the load call up to
     // the destructure's own closing `} = {`, NOT "up to the first call" — a span reaching as far as
     // the first call swallows the intervening prose, and both names appear in it.
     const close = src.indexOf('} = {', load);
     expect(close, 'no destructure follows the load — re-anchor').toBeGreaterThan(-1);
     const binding = src.slice(load, close);
-    expect(binding, 'projectConfigUnionErrors is not bound from the loaded modules')
-      .toMatch(/projectConfigUnionErrors[,\s}]/);
-    expect(binding, 'validateBuildConfig is not bound from the loaded modules')
-      .toMatch(/validateBuildConfig[,\s}]/);
+    expect(binding, 'projectBuildConfigErrors is not bound from the loaded modules')
+      .toMatch(/projectBuildConfigErrors[,\s}]/);
   });
 
-  it('calls both validators', () => {
-    expect(src).toMatch(/projectConfigUnionErrors\(/);
-    expect(src).toMatch(/validateBuildConfig\(/);
+  it('calls the shared validator, and neither half of it directly (#827)', () => {
+    expect(src).toMatch(/projectBuildConfigErrors\(/);
+    // Calling a half directly is the hand-assembled copy #827 removed — the next check added to
+    // `projectBuildConfigErrors` would not reach it.
+    expect(src).not.toMatch(/projectConfigUnionErrors\(|validateBuildConfig\(/);
   });
 
   it('runs the check BEFORE the first scaffoldNativeTarget( call and before the DRY branch', () => {
     // Loose about HOW the check is written; strict about the two facts that were broken —
     // reachable at all, and ordered before the scaffold/dry-run report so `--dry-run` cannot
     // claim a project is scaffoldable that the real run would refuse.
-    const checkCall = src.indexOf('validateBuildConfig(cfg');
+    const checkCall = src.indexOf('projectBuildConfigErrors(projectRoot');
     const scaffoldCall = src.indexOf('scaffoldNativeTarget(');
     const dryBranch = src.indexOf('if (DRY) {');
     expect(checkCall).toBeGreaterThan(-1);
@@ -139,7 +145,7 @@ describe('add-native-targets.mjs wires the validation in before scaffolding (#58
   });
 
   it('skips the project (does not scaffold) when validation fails, without a --force-style bypass', () => {
-    const checkCall = src.indexOf('validateBuildConfig(cfg');
+    const checkCall = src.indexOf('projectBuildConfigErrors(projectRoot');
     const nextChunk = src.slice(checkCall, checkCall + 400);
     expect(nextChunk).toMatch(/cfgErrors\.length/);
     expect(nextChunk).toMatch(/continue/);

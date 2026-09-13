@@ -146,7 +146,7 @@ function readKeyPublicKey(rootDir: string, name = 'default'): string {
  *  guards read. `projectDir` is an ABSOLUTE path (never relative to a `--repo-root` a test
  *  might override), so a test that changes `--repo-root` doesn't accidentally relocate where
  *  the project config is looked for. */
-function writeProjectConfig(projectDir: string, ota: { enabled?: boolean; baseUrl?: string; publicKey?: string; bundleName: string; engineApi?: number }): string {
+function writeProjectConfig(projectDir: string, ota: { enabled?: boolean; baseUrl?: string; publicKey?: string; bundleName: string; engineApi?: number; subgames?: string[] }): string {
   fs.mkdirSync(projectDir, { recursive: true });
   fs.writeFileSync(path.join(projectDir, 'project.config.json'), JSON.stringify({
     ota: { enabled: true, baseUrl: '', engineApi: 1, ...ota },
@@ -751,7 +751,9 @@ describe('ota-publish.mjs publish-identity guards (#582)', () => {
     realPublicKey = readKeyPublicKey(repoRoot);
 
     projectDir = path.join(repoRoot, 'games', 'testproj');
-    writeProjectConfig(projectDir, { bundleName: 'shell', publicKey: realPublicKey });
+    // `subgame-x` is LISTED: since #827 the script refuses a sub-game name the shell does not list,
+    // the same #837 rule the editor route enforces (test q below).
+    writeProjectConfig(projectDir, { bundleName: 'shell', subgames: ['subgame-x'], publicKey: realPublicKey });
   });
 
   afterEach(() => {
@@ -869,15 +871,15 @@ describe('ota-publish.mjs publish-identity guards (#582)', () => {
     expect(bucketIsEmpty()).toBe(true);
   });
 
-  it('e) --name subgame-x with a plain dist (no subgame.json) is refused', () => {
+  it('e) --name subgame-x (listed) with a plain dist (no subgame.json) is refused', () => {
     const result = publish('subgame-x', ['--project', projectDir]);
     expect(result.status).not.toBe(0);
-    expect(result.stderr).toMatch(/does not match/);
+    expect(result.stderr).toMatch(/is a sub-game listed in .*plain shell dist/);
     expect(bucketIsEmpty()).toBe(true);
   });
 
-  it('f) --name subgame-x with a real subgame-dist (subgame.json present) publishes successfully — ' +
-    'a verbatim port of the route\'s equality guard would have wrongly refused this', () => {
+  it('f) --name subgame-x (listed) with a real subgame-dist (subgame.json present) publishes successfully — ' +
+    'the by-hand sub-game path the docs describe', () => {
     const subgameDistDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-guards-subgame-dist-'));
     try {
       fs.writeFileSync(path.join(subgameDistDir, 'index.html'), '<html>subgame</html>');
@@ -899,6 +901,21 @@ describe('ota-publish.mjs publish-identity guards (#582)', () => {
       const result = publish('shell', ['--project', projectDir], subgameDistDir);
       expect(result.status).not.toBe(0);
       expect(result.stderr).toMatch(/matches.*own ota\.bundleName/);
+      expect(bucketIsEmpty()).toBe(true);
+    } finally {
+      fs.rmSync(subgameDistDir, { recursive: true, force: true });
+    }
+  });
+
+  it('q) #827: an UNLISTED sub-game name is refused before any upload — the route\'s #837 rule, which this script lacked', () => {
+    // Measured before the fix (2026-09-13): this exact shape reached `gcloud storage rsync`.
+    const subgameDistDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-guards-unlisted-'));
+    try {
+      fs.writeFileSync(path.join(subgameDistDir, 'index.html'), '<html>subgame</html>');
+      fs.writeFileSync(path.join(subgameDistDir, 'subgame.json'), JSON.stringify({ engineApi: 1 }));
+      const result = publish('not-listed', ['--project', projectDir], subgameDistDir);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toMatch(/"not-listed" is neither .*ota\.bundleName \("shell"\) nor a sub-game listed/);
       expect(bucketIsEmpty()).toBe(true);
     } finally {
       fs.rmSync(subgameDistDir, { recursive: true, force: true });
@@ -928,7 +945,7 @@ describe('ota-publish.mjs publish-identity guards (#582)', () => {
 
   it('j) #837: a sub-game dist with NO --engine-api publishes the engine API its subgame.json stamped', () => {
     // 3 on both sides, not the default 1: a manifest reading 3 can only have come from subgame.json.
-    const shellDir = writeProjectConfig(path.join(repoRoot, 'games', 'testproj-api-3'), { bundleName: 'shell', publicKey: realPublicKey, engineApi: 3 });
+    const shellDir = writeProjectConfig(path.join(repoRoot, 'games', 'testproj-api-3'), { bundleName: 'shell', subgames: ['subgame-x'], publicKey: realPublicKey, engineApi: 3 });
     withSubgameDist(JSON.stringify({ engineApi: 3 }), (dist) => {
       const result = runPublish(['--dist', dist, '--name', 'subgame-x', '--project', shellDir]);
       expect(result.status, result.stderr).toBe(0);
@@ -958,7 +975,7 @@ describe('ota-publish.mjs publish-identity guards (#582)', () => {
   it('m) #837: an ABSENT shell ota.engineApi resolves to the default — it is compared, not skipped', () => {
     const noApiDir = path.join(repoRoot, 'games', 'testproj-no-engineapi');
     fs.mkdirSync(noApiDir, { recursive: true });
-    fs.writeFileSync(path.join(noApiDir, 'project.config.json'), JSON.stringify({ ota: { enabled: true, bundleName: 'shell', publicKey: realPublicKey } }));
+    fs.writeFileSync(path.join(noApiDir, 'project.config.json'), JSON.stringify({ ota: { enabled: true, bundleName: 'shell', subgames: ['subgame-x'], publicKey: realPublicKey } }));
     withSubgameDist(JSON.stringify({ engineApi: 2 }), (dist) => {
       const result = runPublish(['--dist', dist, '--name', 'subgame-x', '--project', noApiDir]);
       expect(result.status).not.toBe(0);

@@ -498,6 +498,29 @@ export function readBuildClaim(projectRoot, opts = {}) {
   return result.claims.filter((c) => !isStale(c, opts)).find((c) => sameProjectRoot(c, root)) ?? null;
 }
 
+/** Does THIS process — or an ancestor that spawned it while holding the claim — hold the live build
+ *  claim on `projectRoot`? The gate a MUTATING step asks before it touches a project (#827):
+ *  `healNativeProject` refuses unless this is true, so "claim before mutate" is enforced at the
+ *  mutation instead of being a line-ordering convention each entry point re-argues.
+ *
+ *  Held means a live claim on the same resolved root whose pid is this process (the route took it
+ *  through `acquireBuildSlot`, the CLI through `acquireBuildClaim`) or whose token this process
+ *  inherited on `BUILD_CLAIM_ENV_VAR` (a build step the claim holder spawned — `build-web.mjs` run
+ *  by `/api/build`). The token clause is the same one `acquireBuildClaim`'s re-entrancy grant keys
+ *  on, minus its `pid !==` half: here the holder asking about its own claim is the normal case.
+ *
+ *  ⚠️ UNKNOWN reads as NOT held. An unreadable claims file cannot prove the caller holds anything,
+ *  and this answers a gate, not a report — the opposite disposition from `readBuildClaim`'s. */
+export function holdsBuildClaim(projectRoot, opts = {}) {
+  const root = path.resolve(projectRoot);
+  const envToken = opts.envToken !== undefined ? opts.envToken : process.env[BUILD_CLAIM_ENV_VAR];
+  const result = readClaimsResult();
+  if (!result.ok) return false;
+  const claim = result.claims.filter((c) => !isStale(c, opts)).find((c) => sameProjectRoot(c, root));
+  if (!claim) return false;
+  return claim.pid === process.pid || (!!envToken && claim.token === envToken);
+}
+
 /** The refusal text — names the project, the label, the holder's kind and pid, and how long ago.
  *  Used verbatim by every caller: the three CLI scripts print it straight to stderr, and
  *  `buildLock.ts`'s `acquireBuildSlot` forwards it as-is for a cross-process refusal (its OWN

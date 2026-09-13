@@ -61,6 +61,10 @@ export declare function acquireBuildClaim(projectRoot: string, label: string, op
 /** The live claim on `projectRoot`, or `null`. */
 export declare function readBuildClaim(projectRoot: string, opts?: { now?: number; alive?: (pid: number) => boolean }): BuildClaim | null;
 
+/** Whether this process, or the ancestor whose token it inherited, holds the live claim on
+ *  `projectRoot`. UNKNOWN (an unreadable claims file) is `false` — it answers a gate. */
+export declare function holdsBuildClaim(projectRoot: string, opts?: { now?: number; alive?: (pid: number) => boolean; envToken?: string }): boolean;
+
 export declare function describeBuildClaimConflict(held: BuildClaim, now?: number): string;
 
 /** Test-only: drop this process's in-memory tracking of what it holds. */

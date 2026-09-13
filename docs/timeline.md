@@ -212,6 +212,89 @@ trigger / control spawn+despawn) is edge-detected over `(playhead-before-advance
 edge regardless of whether the prefab was loaded, so it's a reliable headless trace. Assert on the
 `@sequence` / `@marker` / `@cue` / `@control` journal, not pixels.
 
+### A playhead write the system did not make
+
+`Director.time` has more writers than `timelineSystem`: a seek through `engine.director`, or any game
+code setting the trait. Two behaviours depend on noticing that, and neither the trait nor the edge
+window can supply it on its own (#1113):
+
+- **A paused Director never advances**, so nothing re-poses it after a seek. The playhead reads the new
+  time while the scene stays posed at the old one (data-correct, pixels-wrong).
+- **A playhead that STARTS a frame at `duration`** fails the `prev < duration` crossing test, so a seek
+  onto the end of a non-looping timeline swallowed `@sequence end` for good. A cutscene whose
+  `OnSequence.onEnd` hands control back never handed it.
+
+The system keeps **`_playheadSeen`**, one record per Director keyed `id:generation`:
+
+- **`t`, the value this system last left the playhead at.** On a paused Director, a playhead that
+  differs from `t`, or lies outside the timeline, is wrapped (the same rule `advance()` uses; the
+  action also applies it at write, through `seekLandsAt`) and posed once through `applyTimelineState`.
+  No edges fire.
+- **`endFired`: this playthrough's end has fired, and the playhead has not left the end since.** The
+  non-looping end is DUE whenever an advancing frame leaves the playhead at `duration` and `endFired`
+  is false. For ordinary playback that is exactly the old crossing. The flag stops it re-firing every
+  frame after a natural end. Any frame that sees the playhead below the end clears it, so replaying the
+  tail ends again.
+
+The details that are load-bearing:
+
+- **With no record, `endFired` is resolved the first frame the Director is processed: ended iff it
+  has `started`, sits at the end, and its playhead was not written since first sight.** (A started
+  Director skipped on arrival — root inactive, def loading — and then sought onto the end must end.) Both
+  simple defaults were measured wrong. *False* re-fired the end of every already-ended Director whose
+  record was lost without any seek: a scene load carrying a `Persistent` Director (the snapshot copies
+  `time` and `started`), a Stop→Play, a module hot-patch. An `onEnd` that loads a scene keeping that
+  base then looped. *Arming only on a detected write* lost the end for every seek made before the first
+  record (a seek on the first frame, a def still loading, a root authored inactive, a not-yet-started
+  Director frozen at speed 0), which is the #1113 lock-up in its likeliest shape: a "skip the cutscene"
+  seek as the scene opens. `started` is false in each of those, so they fire.
+- **The record keeps `started` too, to recognise `restart`.** A `started` that went false behind the
+  system's back is a new playthrough, whose end has not fired, even when `restart` is combined with a
+  seek onto the end. `started` alone cannot answer it: `driveSubdirector` writes `started: false` onto a
+  child the frame it ends, so an un-slaved child at its end would read as re-armed and end twice.
+- **`t` defaults to the playhead itself: first sight is not a write**, so a dormant cutscene authored
+  paused (in range) is not posed when its scene opens.
+- **The record is created the first frame the query meets a Director, however that frame is skipped**
+  (inactive, `Paused`, def still loading, a frozen first frame), and carried forward on every skipped
+  frame after. A write that lands while the Director is skipped is seen the frame it is next processed.
+- **The map is cleared on world swap and whenever the run mode leaves `playing`.** The editor restores
+  the scene on Stop, so a remembered pre-Stop playhead would read the restored value as a seek on the
+  first frame of the next Play.
+- **A slaved child is recorded by `driveSubdirector`, after the parent's read-back**, with `endFired`
+  set when the child sits at its own duration. Without that, muting the subdirector track on the frame
+  after the child ended fired the child's end a second time.
+- **A non-finite playhead is wrapped to a finite one** (`+Infinity` → the end when clamping, else 0).
+  NaN never equals itself, so it would otherwise read as a fresh write, and re-pose, every frame.
+
+Consequences to know about:
+
+- **An in-range write to a paused Director made before the system first met it is not posed.** It
+  cannot be told apart from the authored value. An out-of-range playhead is wrapped and posed on its
+  first frame whether a seek or the scene put it there (a shortened timeline asset, a repointed
+  `Director.timeline`).
+- **A seek away from the end and back (4 → 1 → 4) is invisible if it completes while the Director is
+  skipped, or within one frame**, so it does not re-arm the end. Only a processed frame that sees the
+  playhead below the end clears `endFired`.
+- **A seek onto the end of a STARTED Director made before the system first met it** (on the very
+  frame a scene load carries it in) is taken as an end that already fired, for the same reason a
+  carried, ended Director must be. A seek made on any later frame, skipped or not, is seen.
+- **A sub-director un-slaved while sitting at its end** is not fully covered: `driveSubdirector` leaves
+  it at `started: false`, so a `restart` on it does not re-arm the end, a playing one re-fires its
+  start without an end, and losing its record (Stop→Play) fires its end a second time. All three
+  predate #1113; tracked in #1158.
+- **Repointing a playing Director at a shorter timeline it is already past ends that timeline once**:
+  the playhead is wrapped onto the new end, whose end has not fired. Before #1113 it sat there with no
+  end at all.
+- **A non-looping Director authored AT its end fires its end on its first advancing frame**, since
+  nothing distinguishes an authored end position from a seek made before the first frame.
+- **A paused seek does not pose skeletal rigs or nested sub-director timelines.** Play only triggers
+  skeletal clips at a block start; frame-accurate skeletal seek is the editor-only
+  `requestSkeletalSeek` bridge. It also fires none of the markers or cues between the old and new time.
+- **A parent's seek skips a nested child's events, including the child's end**, the same way it skips
+  the parent's own markers. The armed end applies to the timeline being sought, not to what it nests.
+
+Tests: `engine/packages/modoki/tests/runtime/directorAction.test.ts`, the three `#1113` describe blocks.
+
 `crossed()` is **forward-only in v1**: a non-positive per-frame advance (paused, `speed 0`, or reverse
 playback — deferred) crosses nothing. A single frame that advances a **full lap or more** on a looping
 timeline (`speed × simDelta ≥ duration` — reachable via a large `speed`, since `MAX_DELTA = 1/30` caps

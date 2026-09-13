@@ -231,3 +231,20 @@ export function validateBuildConfig(config: ProjectConfig, user: ProjectUserConf
   }
   return errors;
 }
+
+/** Every build-blocking error in the project at `root` — THE check a build, a native scaffold and
+ *  the CLI scripts behind them run before they touch anything (#827). Empty = valid.
+ *
+ *  One function rather than the pair at each call site, because the pair WAS at each call site:
+ *  `build-web.mjs`, `add-native-targets.mjs` and two editor routes each pasted the same two-part
+ *  expression, and #589 was the CLI copy not existing yet. A check added here reaches all of them.
+ *
+ *  Two passes, deliberately (#39): {@link validateBuildConfig} receives the already-RESOLVED
+ *  config, where resolution has coerced a bad union value to its default — so a
+ *  `capacitor.orientation` typo is simply not there to complain about, and would ship rotation
+ *  unlocked. {@link projectConfigUnionErrors} re-resolves the raw file with an issue collector to
+ *  catch exactly that. Load stays forgiving so a typo cannot make a project un-openable; the build
+ *  is where it becomes fatal, because it is the last moment before the value ships. */
+export function projectBuildConfigErrors(root: string): string[] {
+  return [...projectConfigUnionErrors(root), ...validateBuildConfig(loadProjectConfig(root), loadProjectUserConfig(root))];
+}

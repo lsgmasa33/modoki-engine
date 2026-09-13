@@ -657,25 +657,31 @@ Four stateless lifecycle/animator handlers are registered once at startup by
   3s — the seek applies last and wins, which is the only reading under which both arguments
   survive.
 
-  ⚠️ **Seeking past the end is left to the system only while the Director is PLAYING.** `advance()`
-  clamps (or wraps, per `loop`) on the next frame it runs, and it does not run for a paused Director
-  — PASS 1 returns on `!dir.playing` before the playhead is integrated. So the out-of-range value
-  SURVIVES the whole paused window: measured on a 4 s timeline, `{action:'pause', time: 999}` reads
-  back 999 immediately and still 999 after 120 paused ticks, then clamps to `4.0000` on the FIRST
-  frame after `play` (2026-09-12, `work-ai3`). So it is not permanent — it is unclamped for exactly
-  as long as you stay paused, and reading `Director.time` in that window gets you a number outside
-  the timeline. An earlier version of this line said the clamp was unconditional; it is not (#1113,
-  whose own fix — what a paused seek should re-POSE — is a separate open decision that does not
-  change this sentence whichever way it goes).
+  **A seek lands INSIDE the timeline, re-poses a paused Director, and a seek onto the end still
+  ends it** (#1113, owner-settled 2026-09-13):
+  - `time` is wrapped at write (clamped to `[0, duration]`, or wrapped when the Director loops), so
+    `{action:'pause', time: 999}` on a 4 s timeline reads back `4` straight away, provided the timeline
+    has loaded. If it has not, the system wraps it the first frame it holds the def.
+  - A **paused** seek poses the scene at the new time on the next frame: the same idempotent state
+    Play applies (keyframe `Animator` scrub + activation spans), with **no** edges. Markers, audio cues
+    and signals between the old and new time do not fire; a seek moves the playhead, it does not play
+    through.
+  - A seek that lands **on the end** of a non-looping timeline fires `@sequence` `phase:'end'` (and
+    `OnSequence.onEnd`) **once, on the next frame that advances**, paused or playing, including a seek
+    made on the first frame or before the timeline loaded (for a Director that has not yet started; see
+    the limits below for one that has). A `speed 0` or `timeScale 0` frame
+    holds it rather than firing while frozen. Seeking onto an end that already fired does not fire it
+    again; playing or seeking back below the end first, or `restart`, re-arms it (except on an
+    un-slaved sub-director, see below).
 
-  ⚠️ **And resuming from out of range SWALLOWS the end fan-out** — the half that actually breaks a
-  game. `justEnded` is `!loop && prev < duration && cur >= duration`, so with `prev = 999` the
-  `999 < 4` test is false and no `@sequence` `phase:'end'` fires; every `crossed()` marker / audio /
-  activation edge is likewise computed over the empty window `(999, 4]`. Measured on a 1 s timeline:
-  playing straight through gives phases `['start','end']`, while pause → seek 999 → resume gives
-  `['start']`, with the playhead landing on `duration` and `playing` still true. So a cutscene whose
-  `OnSequence.onEnd` re-enables the HUD ends with the HUD locked. Pre-existing, not caused by the
-  seek clamp above, and part of what #1113 has to decide.
+  All three are detected by `timelineSystem`, not by this action, so a game system writing
+  `Director.time` directly gets them too. Limits (skeletal rigs and nested timelines are not posed; an
+  in-range write made before the system first met a paused Director is not posed; a Director authored
+  at its end fires its end once; a seek away and back that completes within one skipped stretch does
+  not re-arm the end; a seek onto the end of a STARTED Director on the very frame a scene load carries
+  it in is taken as already ended; a sub-director un-slaved at its end is not re-armed by `restart`)
+  and the mechanism: [timeline](./timeline.md) § "A playhead write the
+  system did not make".
 
   ⚠️ **Why this exists (#1093).** Before it, the `Director` was the only playable component in the
   engine with no runtime affordance, so the only way to pause a cutscene was a scene edit — and

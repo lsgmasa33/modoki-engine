@@ -29,40 +29,24 @@ export function otaSigningKeyRefusal(keyPublicKey, projectPublicKey) {
   return keyPublicKey === projectPublicKey ? null : 'mismatch';
 }
 
-/** Why an OTA publish must be REFUSED on the dist's KIND vs. the identity it's published
- *  under, or null when it's consistent.
+/** Why an OTA publish must be REFUSED on the dist's KIND vs. the target it's published as, or null
+ *  when they agree. `targetKind` is `otaPublishPreflight`'s answer (`publishPreflight.mjs`): the
+ *  shell's own bundle name, or a sub-game LISTED in `ota.subgames`.
+ *   - A plain shell `dist/` published as a sub-game ships shell content under someone else's identity.
+ *   - A `subgame-dist/` published as the shell REPLACES the shell with a module the OTA client cannot
+ *     boot (it expects `subgame.json` + `globalThis.__MODOKI_SUBGAME__`, not a standalone app).
+ *  Both are silent on the publishing side — they fail only once a device fetches the release. Only
+ *  `ota-publish.mjs` needs this: the editor route builds whatever kind its target names.
  *
- *  This is the CLI's equivalent of the route's `otaPublishBundleNameAllowed` — but it is a
- *  DIFFERENT check, deliberately not a port of that one. `otaPublishBundleNameAllowed` is a
- *  strict `requestedBundleName === projectOtaBundleName` equality guard, and it is
- *  route-specific: the route only ever builds a plain shell `dist/` via `build-web.mjs`, so for
- *  IT any name other than the project's own is definitely wrong. But the route's own refusal
- *  message directs a human to `build-subgame.mjs` plus a hand invocation of THIS CLI for exactly
- *  the case that guard exists to block — publishing a sub-game module under its own bundle
- *  name. Porting the equality guard into the CLI verbatim would refuse the exact use the route
- *  sends people here for.
- *
- *  The invariant the CLI can actually enforce is the one that matters: the dist's KIND must
- *  match the identity it is published under.
- *   - A plain shell `dist/` published under a sub-game's bundle name ships shell content under
- *     someone else's identity — the bug `otaPublishBundleNameAllowed` exists to prevent.
- *   - A `subgame-dist/` published under the project's own shell bundleName REPLACES the shell
- *     with a module the OTA client cannot boot (it expects `subgame.json` +
- *     `globalThis.__MODOKI_SUBGAME__`, not a standalone app).
- *  Both are silent on the publishing side — they fail only once a device fetches the release.
- *
- *  ⚠️ CAVEAT: this pins the dist's kind to the SHAPE of the identity (plain shell vs.
- *  subgame-dist/), not to a SPECIFIC sub-game's identity — `subgame.json` carries no name, and
- *  neither this function nor its caller ever checks that `--dist` belongs to `--project`. So
- *  `--dist games/A/subgame-dist --name B` (A's sub-game content published under B's name) is
- *  allowed. Still strictly better than the pre-#582 no-guard state, and left this way
- *  DELIBERATELY: a sub-game publish legitimately pairs a sub-game's own dist with the shell
- *  project it's staged from (`--dist games/A/subgame-dist --project games/<shell>`), so a
- *  containment check here would refuse the very case this guard exists to allow. See the #582
- *  Gotchas entry in docs/ota-updates.md. */
-export function otaBundleDistKindRefusal({ bundleName, projectBundleName, distIsSubgameModule }) {
-  if (bundleName !== projectBundleName && !distIsSubgameModule) return 'subgame-name-with-shell-dist';
-  if (bundleName === projectBundleName && distIsSubgameModule) return 'shell-name-with-subgame-dist';
+ *  ⚠️ CAVEAT: this pins the dist's kind, not WHICH sub-game it is — `subgame.json` carries no name.
+ *  Since #827 the name must at least be one the shell lists, but `--dist games/A/subgame-dist --name B`
+ *  with B listed still publishes A's content as B. Left that way DELIBERATELY: a sub-game publish
+ *  legitimately pairs a sub-game's own dist with the shell project it is published into
+ *  (`--dist games/A/subgame-dist --project games/<shell>`), so a containment check here would refuse
+ *  the very case this guard exists to allow. See the #582 Gotchas entry in docs/ota-updates.md. */
+export function otaBundleDistKindRefusal({ targetKind, distIsSubgameModule }) {
+  if (targetKind === 'subgame' && !distIsSubgameModule) return 'subgame-name-with-shell-dist';
+  if (targetKind === 'shell' && distIsSubgameModule) return 'shell-name-with-subgame-dist';
   return null;
 }
 

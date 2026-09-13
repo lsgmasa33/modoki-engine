@@ -11,16 +11,15 @@ import crypto, { randomUUID } from 'crypto';
 import type { Plugin } from 'vite';
 import { computeKeptAssets, enumerateRefEdges, formatBytes } from './asset-tree-shaker';
 import { assertNoConversionFallback, type ConversionFailure } from './asset-conversion-strict';
-import { loadProjectConfig, loadProjectUserConfig, validateBuildConfig, projectConfigUnionErrors } from './load-project-config';
+import { loadProjectConfig, loadProjectUserConfig, projectBuildConfigErrors } from './load-project-config';
 import { stripPrivateBuildFields } from '../project-config';
 import { resolveModules } from './detect-modules';
 import { findGamesEntry } from './findGamesEntry';
 // The leaf module, not './subgameBuild': that file's shared-key list would reach the Electron main bundle (#1035).
 import { subgameOutDir } from './subgameOutDir';
 import { samePath } from '../scripts/pathIdentity.mjs';
-import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './backend/gcloud';
+import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN } from './backend/gcloud';
 import { projectAssetRoots, discoverProjects, PROJECT_ROOT_DIRS } from '../scripts/projectRoots.mjs';
-import { describeUnreadablePackageJsonWarning } from '../scripts/staleNodeModulesWarning.mjs';
 import { listAndroidDevices, resolveBuildAndroidSerial } from './backend/androidDevices';
 // Through the typed shell, not the .mjs directly: TypeScript consumers all enter the claim store
 // by one door, so a future caller cannot pick up a differently-typed view of the same rules.
@@ -81,9 +80,8 @@ import { type AtlasCacheBlock } from '../packages/modoki/src/runtime/loaders/spr
 import { type SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneValidation';
 import { handleBackendRequest, assetJsonBytes, type BackendContext, type BackendResult } from './backend/editorBackendRouter';
 import { reclaimStaleDeviceStateAtStartup, shouldReclaimDeviceStateHere } from './backend/deviceConnection';
-import { vendorEnginePlugins, writeVendorMarker, verifyInstalledMatchesTarballResult } from './vendorPlugins';
+import { healNativeProject } from './healNativeProject';
 import { spawnBuildCommand, killBuildProcess, resolveBuildStep, type BuildStep } from './buildStepShell';
-import { healNativeConfig } from './healNativeConfig';
 import {
   parseBuildVariant, keystoreRefusal, renderKeystoreProperties, renderExportOptionsPlist,
   androidReleaseSteps, iosReleaseSteps, debugBuildReleaseWarning,
@@ -91,8 +89,8 @@ import {
 } from './releaseBuild';
 import { PROJECT_USER_CONFIG_FILENAME } from '../project-config';
 import { iconIsUpToDate, iconStampValue } from './iconAssets';
-import { bundledIconPath } from '../scripts/iconAssets.mjs';
-import { ensureCapacitorDeps, scaffoldNativeTarget, isNativeTargetScaffolded, type NativePlatform } from './addNativeTarget';
+import { resolveIconInputs, stampExtrasFrom, iconInputsToArgs } from '../scripts/iconInputs.mjs';
+import { scaffoldNativeTarget, isNativeTargetScaffolded, type NativePlatform } from './addNativeTarget';
 import { discoverSigningTeams, type SigningTeam } from './signingTeams';
 import { serveProjectAsset } from './backend/staticAssets';
 import { writeBackendResult } from './backend/writeResult';
@@ -635,29 +633,10 @@ export function planIosInstall(o: { iosDeviceId: string; iosDevicectlId: string;
   return { ok: true, mode: o.goIos ? 'go-ios' : 'xcode-handoff' };
 }
 
-/** What `/api/ota/publish` builds for a requested bundle name, or null when it must refuse (#837).
- *
- *  The route builds exactly two kinds of thing, and the bundle NAME picks between them:
- *   - the open project's own `ota.bundleName` → a shell build (`build-web.mjs`) of THIS project;
- *   - an id listed in `ota.subgames` → a sub-game module build (`build-subgame.mjs`) of THAT
- *     project, published into this project's bucket under its id.
- *  Anything else is refused. That refusal is the job the equality-only `otaPublishBundleNameAllowed`
- *  did before this: an arbitrary name used to ship this project's plain shell dist under another
- *  bundle's identity (ota-updates.md § Gotchas). A name that is BOTH the shell's and a listed
- *  sub-game's is refused too, since it cannot say which build it means. Pure. */
-export type OtaPublishTarget = { kind: 'shell' } | { kind: 'subgame'; id: string };
-
-export function otaPublishTarget(
-  requestedBundleName: string,
-  ota: { bundleName: string; subgames: readonly string[] },
-): OtaPublishTarget | null {
-  const isShell = requestedBundleName === ota.bundleName;
-  const isSubgame = ota.subgames.includes(requestedBundleName);
-  if (isShell && isSubgame) return null;
-  if (isShell) return { kind: 'shell' };
-  if (isSubgame) return { kind: 'subgame', id: requestedBundleName };
-  return null;
-}
+// `otaPublishTarget` (#837) moved to engine/scripts/ota/publishPreflight.mjs (#827): it is one step of
+// the publish-request check both this route and `ota-publish.mjs` now run, so it lives once, there.
+export { otaPublishTarget, type OtaPublishTarget } from '../scripts/ota/publishPreflight.mjs';
+import { otaPublishPreflight, readRawOtaBlock, type OtaPublishTarget, type OtaPublishRefusal } from '../scripts/ota/publishPreflight.mjs';
 
 type OtaSubgameDirResult =
   | { ok: true; dir: string }
@@ -772,11 +751,10 @@ export function otaPublishSteps(o: {
   };
 }
 
-// otaSigningKeyRefusal moved to engine/scripts/ota/publishGuards.mjs (#582) — it now runs in
-// TWO places (this route's own early check below, and ota-publish.mjs itself, the by-hand path
-// this route's refusal message sends a human to), so it lives once and both import it.
+// otaSigningKeyRefusal lives in engine/scripts/ota/publishGuards.mjs (#582); since #827 it runs only
+// inside `otaPublishPreflight`, which this route and ota-publish.mjs both call. Re-exported for the
+// existing tests that import it from here.
 export { otaSigningKeyRefusal } from '../scripts/ota/publishGuards.mjs';
-import { otaSigningKeyRefusal } from '../scripts/ota/publishGuards.mjs';
 
 /** The build steps for a `playable` target: the single-file inliner build (VITE_PLAYABLE=1 →
  *  games/<id>/ads/index.html) then reveal the ads/ dir. No favicon/deploy/native — the one HTML IS
@@ -2183,11 +2161,7 @@ export function assetScannerPlugin(): Plugin {
           const sendStep = (step: number, total: number) => { try { res.write(`event: step\ndata: ${JSON.stringify({ step, total })}\n\n`); } catch { /* disconnected */ } };
 
           const cfg = loadProjectConfig(projectRoot);
-          // #39: union errors come from a SEPARATE pass because validateBuildConfig sees the
-          // already-resolved config, where a bad value has been coerced to its default and is no
-          // longer visible. Load stays forgiving so a typo can't make a project un-openable; the
-          // build is where it's fatal, because it's the last moment before the value ships.
-          const cfgErrors = [...projectConfigUnionErrors(projectRoot), ...validateBuildConfig(cfg, loadProjectUserConfig(projectRoot))];
+          const cfgErrors = projectBuildConfigErrors(projectRoot);
           if (cfgErrors.length) {
             sendStatus(`FAILED:Invalid project settings\n${cfgErrors.join('\n')}`);
             send('Aborted — fix these Project Settings fields:\n' + cfgErrors.join('\n'));
@@ -2450,11 +2424,7 @@ export function assetScannerPlugin(): Plugin {
           const user = loadProjectUserConfig(projectRoot);
           // These values are interpolated into `bash -c` below — reject anything
           // with shell metacharacters before building any command string.
-          // #39: union errors come from a SEPARATE pass because validateBuildConfig sees the
-          // already-resolved config, where a bad value has been coerced to its default and is no
-          // longer visible. Load stays forgiving so a typo can't make a project un-openable; the
-          // build is where it's fatal, because it's the last moment before the value ships.
-          const cfgErrors = [...projectConfigUnionErrors(projectRoot), ...validateBuildConfig(cfg, user)];
+          const cfgErrors = projectBuildConfigErrors(projectRoot);
           if (cfgErrors.length) {
             sendStatus(`FAILED:Invalid project settings\n${cfgErrors.join('\n')}`);
             send('Build aborted — fix these Project Settings fields:\n' + cfgErrors.join('\n'));
@@ -2593,124 +2563,46 @@ export function assetScannerPlugin(): Plugin {
           const iosXcodeTarget = fs.existsSync(path.join(iosCwd, 'ios/App/App.xcworkspace'))
             ? '-workspace ios/App/App.xcworkspace'
             : '-project ios/App/App.xcodeproj';
-          // App-icon generation: the project's configured source (project-relative
-          // or absolute), else the bundled Modoki icon. `@capacitor/assets` (Easy
-          // Mode) resizes it into every iOS AppIcon / Android mipmap size. The
-          // source is copied to <project>/assets/icon.png (the tool's convention).
-          // ⚠️ This comment used to end "Non-fatal: an icon failure logs a hint but never aborts
-          // the app build." That has been FALSE since #1011 facet C, and was never true the way it
-          // reads: the build runner below aborts on ANY non-zero step, so "non-fatal" was only ever
-          // a property of the SCRIPT choosing to exit 0 — never of this plan tolerating a failure.
-          // #1028 makes that explicit by passing `--strict true` (below), so the four remaining
-          // exit-0 degrades — a failed `npx` fetch, an unreadable splash source, unrestorable
-          // collateral, a post-processing throw — now stop the build instead of shipping stale art.
-          const iconSrcRaw = cfg.app.iconSource.trim();
-          const iconSrcAbs = iconSrcRaw
-            ? (path.isAbsolute(iconSrcRaw) ? iconSrcRaw : path.join(projectRoot, iconSrcRaw))
-            // Default = the bundled 1024² Modoki icon (the editor's own app icon).
-            // ⚠️ #1027: READ from the shared module, not rebuilt here. This was the only place the
-            // default existed, so `generate-icons.mjs` — the CLI native path — had no default at
-            // all and generated nothing for the 22 native projects that author no `iconSource`.
-            // Both callers now resolve it from `scripts/iconAssets.mjs`, which is the one place
-            // that decides what an input is.
-            //
-            // ⚠️ `?? ''` is a corrupt-install fallback and nothing more. An earlier version of this
-            // comment claimed the step would then "fail on an unreadable source and say so" — that
-            // is FALSE: `--icon ""` is empty, so the script takes its "no icon named anywhere"
-            // branch and exits 0 silently. That mattered because the default used to live under
-            // `build/`, which the packaged editor does not ship (see the badge-art note ~30 lines
-            // below, same trap); it now lives under `engine/assets/`, which ships, so the only way
-            // to reach `''` is deleting a tracked engine asset. `bundledIconExists.test.ts` is what
-            // catches that, because this line cannot.
-            : (bundledIconPath(buildCwd) ?? '');
-          // `--<plat>` (a FLAG, not the positional arg) makes the platform list
-          // exclusive — the positional form still tries PWA and fails on a missing
-          // www/manifest.json. The tool version is PINNED (scripts/iconAssets.mjs); the
-          // flag does NOT keep the run inside that platform, which is what the wrapper
-          // below is for.
+          // App-icon + splash generation. Every INPUT is resolved by `resolveIconInputs`
+          // (`engine/scripts/iconInputs.mjs`) — the same function `generate-icons.mjs` calls on its
+          // own config read when `build-web.mjs --target native` runs it (#827). This plan used to
+          // resolve all fourteen inputs here by hand, and the two copies had already disagreed once
+          // (#1027, an empty `iconSource`).
+          //
+          // Resolved HERE, in-process, and handed to the script as flags (`iconInputsToArgs`, its exact
+          // inverse), rather than letting the script read the config itself: the PACKAGED editor
+          // ships no esbuild, so the spawned script cannot load the config there and sees nothing.
+          // This plan is the only place that knows the answer in the build that ships (#1011 facet B:
+          // "absent" and "cleared" splash were indistinguishable to the script, and #236's cleanup was
+          // silently dropped).
+          //
+          // `strict` (#1028): this is a BUILD, so a degraded generation must stop it rather than ship
+          // the previously committed art. A bare hand run of the script keeps the forgiving default.
+          //
           // The staging, the run, the freshness stamp and the SIDE-EFFECT CLEANUP all live in
-          // `engine/scripts/generate-icons.mjs` — one portable Node step instead of two
-          // hand-kept shell variants. It exists because the generator does not stay inside the
-          // platform it is given: `generate --android` also rewrites `ios/…/project.pbxproj`
-          // (mangling `LastUpgradeCheck = 0920` → `920`) and re-serializes AndroidManifest.xml
-          // (#236). The script restores every pre-existing NON-image file the run touched and
-          // reports what it restored; images — its actual product — are left alone.
-          // #396/#397 — the splash master, its dark twin, the title wordmark and the three icon
-          // variant overrides all resolve the same way as `iconSource`: project-relative unless
-          // absolute, and EMPTY MEANS UNSET rather than meaning a default path, so an
-          // unconfigured project generates exactly what it generated before.
-          const projectFile = (raw: string): string | undefined => {
-            const t = raw?.trim();
-            if (!t) return undefined;
-            return path.isAbsolute(t) ? t : path.join(projectRoot, t);
-          };
-          const splashSrcAbs = projectFile(cfg.app.splashSource);
-          const splashDarkSrcAbs = projectFile(cfg.app.splashDarkSource);
-          const titleSrcAbs = projectFile(cfg.app.splashTitleSource);
-          const iconDarkSrcAbs = projectFile(cfg.app.iconDarkSource);
-          const iconTintedSrcAbs = projectFile(cfg.app.iconTintedSource);
-          const iconMonochromeSrcAbs = projectFile(cfg.app.iconMonochromeSource);
-          // Engine-owned badge artwork, committed so no build depends on system fonts.
-          // ⚠️ Under `engine/`, NOT `build/`. `electron-builder.yml`'s `files:` ships
-          // `engine/**` + `dist/**` + `package.json` and nothing else — `build/` reaches the
-          // package only as `build/bin` via extraResources. Resolved under `build/`, these were
-          // MISSING in the packaged editor, and because `overlayLayersFor` builds the title layer
-          // before it reads the badge, one unreadable badge discarded the title too: a packaged
-          // -editor build produced title-less, badge-less splashes.
-          const badgeLightArt = path.join(buildCwd, 'engine/assets/splash-badge-light.png');
-          const badgeDarkArt = path.join(buildCwd, 'engine/assets/splash-badge-dark.png');
-          // The orientation decides the CROP-SAFE box the overlays are placed in, so it is a
-          // generation input, not just a runtime setting — see splashLayout.mjs.
-          const splashOrientation = cfg.capacitor.orientation;
-          // ⚠️ Every one of these is in the stamp. `iconStep` drops itself from the build plan
-          // on a stamp match, so an input the hash cannot see changes nothing until someone
-          // deletes `.cache/icon-stamp-*` by hand — the silent no-op both issues called out.
-          const stampExtras = {
-            splashSrcAbs,
-            splashDarkSrcAbs,
-            titleSrcAbs,
-            badgeArtAbs: cfg.app.splashBadge ? badgeLightArt : undefined,
-            badgeDarkArtAbs: cfg.app.splashBadge ? badgeDarkArt : undefined,
-            iconDarkSrcAbs,
-            iconTintedSrcAbs,
-            iconMonochromeSrcAbs,
-            titleWidthPct: cfg.app.splashTitleWidthPct,
-            titleOffsetPct: cfg.app.splashTitleOffsetPct,
-            badge: cfg.app.splashBadge,
-            orientation: splashOrientation,
-            // Anchors the post-processing-source hash; see splashPipelineVersion.
-            engineRootAbs: buildCwd,
-          };
+          // `engine/scripts/generate-icons.mjs` — it exists because the generator does not stay inside
+          // the platform it is given (`generate --android` also rewrites `ios/…/project.pbxproj`,
+          // #236), and it restores every pre-existing NON-image file the run touched.
+          //
+          // ⚠️ `?? ''` on the icon is a corrupt-install fallback and nothing more: the bundled default
+          // lives under `engine/assets/`, which ships, so reaching `''` means a tracked engine asset
+          // was deleted. `bundledIconExists.test.ts` catches that; this line cannot.
+          const iconInputs = resolveIconInputs({ strict: 'true' }, projectRoot, cfg, buildCwd);
+          const iconSrcAbs = iconInputs.icon ?? '';
+          // ⚠️ Every input is in the stamp. `iconStep` drops itself from the build plan on a stamp
+          // match, so an input the hash cannot see changes nothing until someone deletes
+          // `.cache/icon-stamp-*` by hand — the silent no-op #396/#397 called out.
+          const stampExtras = stampExtrasFrom(iconInputs, buildCwd);
+          const iconArgs = iconInputsToArgs(iconInputs)
+            .map(([flag, value]) => ` --${flag} ${JSON.stringify(value)}`)
+            .join('');
           const iconStep = (plat: 'ios' | 'android'): BuildStep | null => {
             if (iconIsUpToDate(projectRoot, iconSrcAbs, plat, stampExtras)) return null;
             const stamp = iconStampValue(iconSrcAbs, plat, stampExtras);
             const script = path.join(buildCwd, 'engine/scripts/generate-icons.mjs');
-            const opt = (flag: string, value: string | undefined) =>
-              (value ? ` ${flag} ${JSON.stringify(value)}` : '');
             return {
               label: 'Generating app icons...',
-              cmd: `node ${JSON.stringify(script)} --project ${JSON.stringify(projectRoot)} --platform ${plat} --icon ${JSON.stringify(iconSrcAbs)} --stamp ${stamp}`
-                + opt('--splash', splashSrcAbs)
-                // ⚠️ #1011: say POSITIVELY whether the author has cleared the splash, rather than
-                // letting an absent `--splash` mean it. The script cannot infer it here — the
-                // PACKAGED editor ships no esbuild, so the config it would read is unavailable and
-                // "absent" and "cleared" become indistinguishable, which is how #236's cleanup came
-                // to be silently dropped on the one build that ships. This plan has already parsed
-                // the config; passing what it knows is cheaper than making the script guess.
-                + ` --splash-cleared ${splashSrcAbs ? 'false' : 'true'}`
-                // ⚠️ #1028: this is a BUILD, so a degraded generation must stop it rather than
-                // ship the previously committed art. A bare hand run of the script does not pass
-                // this and keeps the forgiving behaviour.
-                + ' --strict true'
-                + opt('--splash-dark', splashDarkSrcAbs)
-                + opt('--title', titleSrcAbs)
-                + ` --title-width ${cfg.app.splashTitleWidthPct} --title-offset ${cfg.app.splashTitleOffsetPct}`
-                + ` --badge ${cfg.app.splashBadge ? 'true' : 'false'}`
-                + (cfg.app.splashBadge ? `${opt('--badge-light', badgeLightArt)}${opt('--badge-dark', badgeDarkArt)}` : '')
-                + ` --orientation ${splashOrientation}`
-                + opt('--icon-dark', iconDarkSrcAbs)
-                + opt('--icon-tinted', iconTintedSrcAbs)
-                + opt('--icon-monochrome', iconMonochromeSrcAbs),
+              cmd: `node ${JSON.stringify(script)} --project ${JSON.stringify(projectRoot)} --platform ${plat} --stamp ${stamp}${iconArgs}`,
               cwd: plat === 'ios' ? iosCwd : androidCwd,
             };
           };
@@ -3231,13 +3123,42 @@ export function assetScannerPlugin(): Plugin {
               if (steps[0]?.cmd?.startsWith('node engine/scripts/build-web.mjs')) steps.shift();
               send(`\n✅ ${platform}/ scaffolded — continuing the build.`);
             }
-            // Re-heal the native config before building so machine/identity settings
-            // edited AFTER the folder was scaffolded actually land in the generated
-            // project — notably iOS DEVELOPMENT_TEAM from build.appleTeamId (else
-            // xcodebuild dies with "Signing … requires a development team"). Idempotent
-            // + cheap; a no-op when nothing changed (or already healed by the scaffold).
+            // Heal the native project on EVERY native build — `healNativeProject`, the ONE sequence
+            // `build-web.mjs --target native` also calls (#827): machine/identity config edited after
+            // the folder was scaffolded (iOS DEVELOPMENT_TEAM, else xcodebuild dies with "Signing …
+            // requires a development team"), engine-required Capacitor plugins a project scaffolded
+            // by an older editor lacks (else `"<Plugin>" plugin is not implemented` at LAUNCH),
+            // re-vendoring a changed engine plugin (#90), and the stale-node_modules check (#685).
+            // The steps, their order and why it is load-bearing live in that module.
+            //
+            // ⚠️ BEFORE the #370 release-file writes below, not after: `healNativeConfig` is what adds
+            // `keystore.properties` to a freshly scaffolded `android/.gitignore`, and one of those
+            // writes is the upload key's passwords.
+            //
+            // ⚠️ The spawned `build-web.mjs` step below runs the same sequence again on a dev
+            // machine. Not a duplicate to remove: a PACKAGED editor ships no esbuild, the script
+            // cannot load the module there, and this in-process call is the only heal that runs.
             if (platform === 'ios' || platform === 'android') {
-              for (const n of healNativeConfig(projectRoot).notes) send(`[heal] ${n}`);
+              const heal = await healNativeProject(projectRoot, buildCwd, [platform], {
+                log: (line) => send(line),
+                warn: (line) => send(line),
+                install: (why) => runScaffoldShell(`npm install (${why})`, 'npm install', projectRoot),
+              });
+              if (aborted) return;
+              if (!heal.ok) {
+                if (heal.reason === 'install-failed') {
+                  sendStatus(`FAILED:npm install (${heal.why})`);
+                  send('Build failed — could not install the added/updated Capacitor plugin(s).');
+                } else if (heal.reason === 'stale-node-modules') {
+                  sendStatus('FAILED:stale node_modules');
+                  send(`\nBuild failed — ${heal.lines.join('\n')}`);
+                } else {
+                  sendStatus(`FAILED:Build claim not held\n${heal.message}`);
+                  send(heal.message);
+                }
+                res.end();
+                return;
+              }
             }
             // #370: write the two GENERATED, GITIGNORED inputs a release build needs. Both are
             // re-derived every run rather than hand-maintained, so the upload key and the Team ID
@@ -3291,77 +3212,6 @@ export function assetScannerPlugin(): Plugin {
                 send(`⚠️  Could not provision go-ios (${e instanceof Error ? e.message : String(e)}) — falling back to the Xcode handoff.`);
               }
               if (aborted) return;
-            }
-            // Heal engine-REQUIRED Capacitor plugins on EVERY native build. A project
-            // scaffolded before an engine feature added a runtime plugin — @capacitor/preferences
-            // (PlayerPrefs), @capacitor/app (App.tsx), @capacitor/keyboard (useKeyboardShift) — or
-            // by an OLDER editor is missing it in its own package.json. The web build still inlines
-            // the plugin's JS proxy (resolved from the editor's node_modules), so the build
-            // SUCCEEDS, but `cap sync` (run in the project dir) never registers a native impl →
-            // `"<Plugin>" plugin is not implemented on <platform>` at LAUNCH. ensureCapacitorDeps is
-            // idempotent (adds only what's missing); if it added anything, vendor + install it so
-            // the cap sync step below registers the native side. This is what makes an EXISTING
-            // native game self-heal (the scaffold path already ran this; existing builds skipped it).
-            if (platform === 'ios' || platform === 'android') {
-              const depHeal = ensureCapacitorDeps(projectRoot, platform as NativePlatform, buildCwd);
-              for (const n of depHeal.notes) send(`[heal] ${n}`);
-              // Re-vendor UNCONDITIONALLY (#90). This used to be gated on `depHeal.changed`, but
-              // `ensureCapacitorDeps` only adds MISSING deps — a plugin already depended on is
-              // never missing, so editing `engine/packages/capacitor-*/**` had NO path into an
-              // existing native game. The build succeeded, the APK installed, and it silently
-              // contained the PREVIOUS native code: a failure in the direction that looks like
-              // success. Measured 2026-08-02 while fixing #88 — the first build compiled the old
-              // Java, caught only by hand-checking the tarball hash.
-              //
-              // Running it every build is safe by design: `vendorEnginePlugins` is idempotent and
-              // content-addressed, so an unchanged plugin maps to the SAME committed tarball and
-              // re-packs nothing. Only a real content change yields a new filename, and only then
-              // does `needsInstall` force the (slow) install.
-              const v = vendorEnginePlugins(projectRoot, buildCwd);
-              if (v.vendored.length) send(`[heal] vendored engine plugin(s): ${v.vendored.join(', ')}`);
-              if (depHeal.changed || v.needsInstall) {
-                const why = depHeal.changed ? 'healed Capacitor plugins' : 'engine plugin changed';
-                if (!(await runScaffoldShell(`npm install (${why})`, 'npm install', projectRoot))) {
-                  if (aborted) return;
-                  sendStatus(`FAILED:npm install (${why})`);
-                  send('Build failed — could not install the added/updated Capacitor plugin(s).');
-                  res.end();
-                  return;
-                }
-                writeVendorMarker(projectRoot, v.expectedVendor);
-              }
-              // ⚠️ UNCONDITIONAL — outside the install `if` above, deliberately (#685). The state
-              // this catches is `node_modules` holding a PREVIOUS tarball's bytes while every
-              // other signal agrees the current one is installed: there `depHeal.changed` is
-              // false AND `v.needsInstall` is false, so the install block does nothing and `npm
-              // install` would report "up to date". A check gated on those flags could never fire
-              // in the one case it exists for.
-              //
-              // This MIRRORS `build-web.mjs`'s step 5. Keep the two in step: the editor's
-              // `/api/build` and the CLI `--target native` recipe are documented as equivalent
-              // (docs/build.md), and #148 is precisely what a divergence between them costs —
-              // a guard in only one path leaves the OTHER able to ship the previous native code.
-              //
-              // ⚠️ `verifyInstalledMatchesTarballResult` (#731): an unreadable `package.json` for
-              // THIS project must not read as "verified clean" — warn and keep going rather than
-              // silently skipping the check, matching build-web.mjs's own warn-not-throw call.
-              const { problems: stale, reason: staleCheckReason } = verifyInstalledMatchesTarballResult(projectRoot);
-              if (staleCheckReason === 'unreadable-package-json') {
-                send(describeUnreadablePackageJsonWarning(projectRoot));
-              }
-              if (stale.length) {
-                sendStatus('FAILED:stale node_modules');
-                send(`\nBuild failed — node_modules is STALE for ${stale.length} vendored plugin(s); this build would ship the WRONG native code (#685):`);
-                for (const problem of stale) send(`  • ${problem}`);
-                send(`\n⚠️ Do NOT reach for \`npm install --package-lock-only\` — measured (#685): it is what CREATES this state, writing the new resolved+integrity into both lockfiles without extracting, and a tree left there is unrecoverable by any plain install. A bare \`npm install\` or \`--force\` will not fix it either.`);
-                send(`Repair, in order:`);
-                send(`  1. delete the plugin's entry from ${projectRoot}/package-lock.json ("node_modules/<plugin>" under "packages")`);
-                send(`  2. (cd ${projectRoot} && npm install)   # a PLAIN install — it now re-resolves AND extracts`);
-                send(`  3. ONLY if step 2 reported "up to date" and this check still fires — then node_modules/.package-lock.json is ahead of the disk and nothing will re-extract:`);
-                send(`     (cd ${projectRoot} && rm -rf node_modules/<plugin> && npm install)`);
-                res.end();
-                return;
-              }
             }
             const total = steps.length;
             for (let i = 0; i < steps.length; i++) {
@@ -3449,7 +3299,7 @@ export function assetScannerPlugin(): Plugin {
         // belongs to ota-publish.mjs alone, not this route (#577) — see Step 3 below.
         if ((req.url === '/api/ota/publish' || req.url?.startsWith('/api/ota/publish?')) && req.method === 'GET') {
           const url = new URL(req.url, 'http://localhost');
-          const version = url.searchParams.get('version');
+          const versionParam = url.searchParams.get('version');
           // Tri-state, matching ota-publish.mjs's own sticky-mandatory contract:
           // "1" sets it, "0" clears it, absent inherits the existing release's value —
           // `mandatoryParam` is `undefined` in that last case, distinct from `false`.
@@ -3458,86 +3308,55 @@ export function assetScannerPlugin(): Plugin {
           const keyName = url.searchParams.get('key') || 'default';
           const cfg = loadProjectConfig(projectRoot);
           const bundleName = url.searchParams.get('bundleName') || cfg.ota.bundleName;
-          const bucket = url.searchParams.get('bucket') ?? deriveGcsBucketFromBaseUrl(cfg.ota.baseUrl);
+          const bucketParam = url.searchParams.get('bucket') ?? deriveGcsBucketFromBaseUrl(cfg.ota.baseUrl);
 
-          if (!cfg.ota.enabled) {
-            res.statusCode = 400;
-            res.end(JSON.stringify({ error: 'ota.enabled is false for this project — turn it on in Project Settings first.' }));
-            return;
-          }
-          if (!version || !OTA_SAFE_TOKEN.test(version)) {
-            res.statusCode = 400;
-            res.end(JSON.stringify({ error: `version is required and must match ${OTA_SAFE_TOKEN}` }));
-            return;
-          }
-          if (!OTA_SAFE_TOKEN.test(bundleName) || !OTA_SAFE_TOKEN.test(keyName)) {
-            res.statusCode = 400;
-            res.end(JSON.stringify({ error: `bundleName/key must match ${OTA_SAFE_TOKEN}` }));
-            return;
-          }
-          // What gets built is decided by the bundle NAME (#837). This project's own ota.bundleName
-          // builds this project as itself (build-web.mjs); an id listed in ota.subgames builds THAT
-          // project as a sub-game module (build-subgame.mjs, the subgame.json +
-          // globalThis.__MODOKI_SUBGAME__ format subgameLoader.ts fetches) and publishes it here
-          // under its id. Any other name is refused, which is the fix this block always carried:
-          // before it, overriding bundleName shipped this project's plain shell dist/ under another
-          // bundle's identity, with no error until every device that loaded it failed.
-          const target = otaPublishTarget(bundleName, cfg.ota);
-          if (!target) {
-            res.statusCode = 400;
-            res.end(JSON.stringify({ error: `bundleName ("${bundleName}") is neither this project's own ota.bundleName ("${cfg.ota.bundleName}") nor a sub-game listed in its ota.subgames (${JSON.stringify(cfg.ota.subgames)}). This route publishes the open project as itself, or a listed sub-game built as a sub-game module, never a plain build under another bundle's name. To publish a sub-game from here, add its project id under Project Settings → OTA → Sub-games.` }));
-            return;
-          }
-          if (!bucket || !OTA_SAFE_BUCKET.test(bucket)) {
-            res.statusCode = 400;
-            res.end(JSON.stringify({ error: `Could not derive a gs:// bucket from ota.baseUrl ("${cfg.ota.baseUrl}"). Pass ?bucket=gs://... explicitly.` }));
-            return;
-          }
           const buildCwd = editorRoot || projectRoot;
-          const keyPath = path.join(buildCwd, 'build', 'ota-keys', `${keyName}.json`);
-          if (!fs.existsSync(keyPath)) {
+          // THE publish-request check — the same `otaPublishPreflight` `ota-publish.mjs` runs (#827):
+          // enabled, the four tainted inputs, the bundle identity, the publish TARGET and the signing
+          // key. `ota-publish.mjs` (spawned below) runs it again, so this copy exists only to answer
+          // with a clean HTTP 400 before the SSE stream opens and a multi-minute build starts. It
+          // matches the script's verdict because it is the same function over the same inputs — the
+          // RAW `ota` block (`readRawOtaBlock`), NOT `cfg.ota`: merging coerces, and a merged block let
+          // a malformed `ota.subgames` past this 400 into a build the script then refused. The
+          // version, key and bucket are the same values this route passes the script's flags. Only
+          // the wording is this route's.
+          //
+          // What gets built is decided by the bundle NAME (#837): this project's own ota.bundleName
+          // builds this project as itself (build-web.mjs); an id listed in ota.subgames builds THAT
+          // project as a sub-game module (build-subgame.mjs). Any other name is refused — before it,
+          // overriding bundleName shipped this project's plain shell dist/ under another bundle's
+          // identity, with no error until every device that loaded it failed.
+          const rawConfig = readRawOtaBlock(projectRoot);
+          const preflight = otaPublishPreflight({ ota: rawConfig.ok ? rawConfig.ota : undefined, name: bundleName, version: versionParam, keyName, bucket: bucketParam, repoRoot: buildCwd });
+          if (!preflight.ok) {
+            const r = preflight;
+            const why: Record<OtaPublishRefusal, string> = {
+              'no-ota-block': rawConfig.ok
+                ? (rawConfig.ota === undefined || rawConfig.ota === null
+                  ? "This project's project.config.json has no ota settings — turn OTA on in Project Settings first."
+                  : "This project's project.config.json has an ota field that is not an object — fix it in project.config.json.")
+                : `This project's project.config.json could not be ${rawConfig.reason === 'missing' ? 'found' : `parsed (${rawConfig.error})`}, so this publish cannot be checked.`,
+              'not-enabled': 'ota.enabled is false for this project — turn it on in Project Settings first.',
+              'bad-version': `version is required and must match ${OTA_SAFE_TOKEN}`,
+              'bad-name': `bundleName must match ${OTA_SAFE_TOKEN}`,
+              'bad-key-name': `key must match ${OTA_SAFE_TOKEN}`,
+              'bad-bucket': `Could not derive a gs:// bucket from ota.baseUrl ("${cfg.ota.baseUrl}"). Pass ?bucket=gs://... explicitly.`,
+              'bad-project-bundle-name': "This project's ota.bundleName is empty — set it in Project Settings → OTA.",
+              'bad-project-subgames': "This project's ota.subgames is not a list of project ids — fix it in Project Settings → OTA → Sub-games.",
+              'ambiguous-bundle': `bundleName ("${bundleName}") is BOTH this project's own ota.bundleName and a sub-game listed in its ota.subgames, so it cannot say which build it means. Rename one.`,
+              'unknown-bundle': `bundleName ("${bundleName}") is neither this project's own ota.bundleName ("${r.bundleName}") nor a sub-game listed in its ota.subgames (${JSON.stringify(r.subgames)}). This route publishes the open project as itself, or a listed sub-game built as a sub-game module, never a plain build under another bundle's name. To publish a sub-game from here, add its project id under Project Settings → OTA → Sub-games.`,
+              'key-missing': `Signing key "${keyName}" not found. Generate one first: POST /api/ota/keygen?name=${keyName}`,
+              'key-unparseable': `Signing key "${keyName}" (${r.keyPath}) could not be parsed as JSON — regenerate it: POST /api/ota/keygen?name=${keyName}`,
+              'no-key-public-half': `Signing key "${keyName}" has no publicKey field — regenerate it: POST /api/ota/keygen?name=${keyName}`,
+              'project-public-key-empty': `This project's ota.publicKey is EMPTY, so no installed app can verify a release. Set it to the signing key's public half ("${r.keyPublicKey}") in Project Settings → OTA, rebuild + ship the native app so the new key is baked in, and publish then.`,
+              mismatch: `Signing key "${keyName}" does NOT match this project's ota.publicKey — every installed app would reject the release as signature-invalid, while this publish reported success. Key "${keyName}" public half: "${r.keyPublicKey}". project.config.json ota.publicKey: "${cfg.ota.publicKey}". Publish with the key that matches (?key=<name>), or — only if you intend to ROTATE the key — set ota.publicKey to the new value and ship a native build carrying it BEFORE publishing, or installed apps will be stranded.`,
+            };
             res.statusCode = 400;
-            res.end(JSON.stringify({ error: `Signing key "${keyName}" not found. Generate one first: POST /api/ota/keygen?name=${keyName}` }));
+            res.end(JSON.stringify({ error: why[r.refusal] }));
             return;
           }
-          // The key must be the one the SHIPPED APP verifies against, not merely a key that
-          // exists (independent review, 2026-07-30). `ota.publicKey` is baked into the binary and
-          // is the ONLY key `verifyReleaseSignature` will accept. Signing with any other keypair
-          // produces a perfectly well-formed, signed release.json that every installed app
-          // silently refuses (`outcome: 'signature-invalid'`) — while this route reported success
-          // and `/api/ota/status` then CONFIRMED the version as published. A release that no
-          // device can install, reported as a successful ship, is the worst failure this route
-          // has: it is remote, silent, and looks fine from here.
-          //
-          // #582: `ota-publish.mjs` (spawned below) now enforces this SAME refusal from the same
-          // pure `otaSigningKeyRefusal` — this is NOT the #577 duplicate-guard shape. #577's
-          // duplicate was a DIFFERENT decision procedure (existence vs content) that ran FIRST
-          // and refused a case the real guard allows. This is the identical pure function over
-          // the identical two inputs (the same key file, the same project.config.json), so it
-          // cannot refuse anything ota-publish.mjs would allow — it stays here only to return a
-          // clean HTTP 400 before the SSE stream opens and the multi-minute build starts.
-          {
-            let keyPub: string | null;
-            try {
-              keyPub = (JSON.parse(fs.readFileSync(keyPath, 'utf8')) as { publicKey?: string }).publicKey ?? null;
-            } catch {
-              res.statusCode = 400;
-              res.end(JSON.stringify({ error: `Signing key "${keyName}" (${keyPath}) could not be parsed as JSON — regenerate it: POST /api/ota/keygen?name=${keyName}` }));
-              return;
-            }
-            const cfgPub = cfg.ota.publicKey;
-            const refusal = otaSigningKeyRefusal(keyPub, cfgPub);
-            if (refusal) {
-              const why = {
-                'no-key-public-half': `Signing key "${keyName}" has no publicKey field — regenerate it: POST /api/ota/keygen?name=${keyName}`,
-                'project-public-key-empty': `This project's ota.publicKey is EMPTY, so no installed app can verify a release. Set it to the signing key's public half ("${keyPub}") in Project Settings → OTA, rebuild + ship the native app so the new key is baked in, and publish then.`,
-                mismatch: `Signing key "${keyName}" does NOT match this project's ota.publicKey — every installed app would reject the release as signature-invalid, while this publish reported success. Key "${keyName}" public half: "${keyPub}". project.config.json ota.publicKey: "${cfgPub}". Publish with the key that matches (?key=<name>), or — only if you intend to ROTATE the key — set ota.publicKey to the new value and ship a native build carrying it BEFORE publishing, or installed apps will be stranded.`,
-              }[refusal];
-              res.statusCode = 400;
-              res.end(JSON.stringify({ error: why }));
-              return;
-            }
-          }
+          // The CHECKED values — narrowed by the preflight, used from here on.
+          const { target, version, bucket } = preflight;
           // A listed sub-game (#837): resolve its project by id, then fail its engine API early. The
           // authoritative check is ota-publish.mjs's, against what the build actually stamps into
           // subgame.json. This one compares the same number from the config it is stamped from

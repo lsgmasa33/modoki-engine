@@ -41,24 +41,24 @@ describe('OTA_DEFAULT_ENGINE_API', () => {
 });
 
 describe('otaBundleDistKindRefusal (ota-publish.mjs dist-kind identity guard)', () => {
-  it('allows a plain shell dist published under the project\'s own bundle name', () => {
-    expect(otaBundleDistKindRefusal({ bundleName: 'shell', projectBundleName: 'shell', distIsSubgameModule: false })).toBeNull();
+  it('allows a plain shell dist published as the SHELL target', () => {
+    expect(otaBundleDistKindRefusal({ targetKind: 'shell', distIsSubgameModule: false })).toBeNull();
   });
 
-  it('allows a sub-game module dist published under a DIFFERENT (sub-game) bundle name', () => {
-    expect(otaBundleDistKindRefusal({ bundleName: 'subgame-x', projectBundleName: 'shell', distIsSubgameModule: true })).toBeNull();
+  it('allows a sub-game module dist published as a SUB-GAME target', () => {
+    expect(otaBundleDistKindRefusal({ targetKind: 'subgame', distIsSubgameModule: true })).toBeNull();
   });
 
-  it('refuses a plain shell dist published under a DIFFERENT (sub-game) bundle name', () => {
-    // The bug otaPublishBundleNameAllowed exists to prevent, reached via a different route:
-    // this would ship the project's own shell content under someone else's identity.
-    expect(otaBundleDistKindRefusal({ bundleName: 'subgame-x', projectBundleName: 'shell', distIsSubgameModule: false }))
+  it('refuses a plain shell dist published as a SUB-GAME target', () => {
+    // Would
+    // ship the project's own shell content under someone else's identity.
+    expect(otaBundleDistKindRefusal({ targetKind: 'subgame', distIsSubgameModule: false }))
       .toBe('subgame-name-with-shell-dist');
   });
 
-  it('refuses a sub-game module dist published under the project\'s own (shell) bundle name', () => {
+  it('refuses a sub-game module dist published as the SHELL target', () => {
     // Would replace the shell bundle with a module the OTA client cannot boot standalone.
-    expect(otaBundleDistKindRefusal({ bundleName: 'shell', projectBundleName: 'shell', distIsSubgameModule: true }))
+    expect(otaBundleDistKindRefusal({ targetKind: 'shell', distIsSubgameModule: true }))
       .toBe('shell-name-with-subgame-dist');
   });
 });

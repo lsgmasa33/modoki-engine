@@ -8,8 +8,7 @@ export function otaSigningKeyRefusal(
 ): 'no-key-public-half' | 'project-public-key-empty' | 'mismatch' | null;
 
 export function otaBundleDistKindRefusal(o: {
-  bundleName: string;
-  projectBundleName: string;
+  targetKind: 'shell' | 'subgame';
   distIsSubgameModule: boolean;
 }): 'subgame-name-with-shell-dist' | 'shell-name-with-subgame-dist' | null;
 

@@ -121,8 +121,10 @@ shell's bucket under the id, signed with the shell's key. The engine API it publ
 build stamped into `subgame.json`, refused unless it equals the shell's `ota.engineApi` (§4). The
 guards and the reasoning: ota-updates.md § Publishing.
 
-By hand it is the same two steps, and `ota-publish.mjs` enforces the same guards (#582, #837). A
-sub-game bundle is just another `bundles/<name>` entry with `--dist games/<id>/subgame-dist`.
+By hand it is the same two steps, and `ota-publish.mjs` runs the same publish-request check
+(`otaPublishPreflight`, #827) — so **the shell must list the sub-game in `ota.subgames` first**, exactly
+as for the editor; an unlisted `--name` is refused before anything is uploaded. A sub-game bundle is
+just another `bundles/<name>` entry with `--dist games/<id>/subgame-dist`.
 `--project` is REQUIRED and must point at the **shell project whose app receives the release**
 (the one that will `fetch`/verify it at runtime). Omit `--engine-api`: it is read from
 `subgame.json`, and a flag that disagrees is refused.

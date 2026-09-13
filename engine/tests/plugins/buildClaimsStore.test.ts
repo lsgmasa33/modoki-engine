@@ -23,6 +23,7 @@ import {
   isStale,
   acquireBuildClaim,
   readBuildClaim,
+  holdsBuildClaim,
   describeBuildClaimConflict,
   resetBuildClaimsForTests,
   BUILD_CLAIM_TTL_MS,
@@ -486,6 +487,52 @@ describe('acquireBuildClaim — a corrupt/unreadable claims file is UNKNOWN, not
     fs.mkdirSync(home, { recursive: true });
     fs.writeFileSync(claimsFilePath(), '{ not valid json');
     expect(readBuildClaim('/proj/corrupt-e')).toBeNull();
+  });
+});
+
+describe('holdsBuildClaim — the gate a mutating step asks before it touches a project (#827)', () => {
+  // `envToken` is passed explicitly everywhere: `acquireBuildClaim` publishes onto the REAL
+  // process.env, so an earlier test's leftover token would otherwise decide these.
+  const writeClaim = (root: string, pid: number, token: string) => {
+    fs.mkdirSync(home, { recursive: true });
+    const c: BuildClaim = { projectRoot: path.resolve(root), pid, at: Date.now(), label: 'ios build', kind: 'editor', token };
+    fs.writeFileSync(claimsFilePath(), JSON.stringify({ claims: [c] }));
+  };
+
+  it('true for the process that took the claim', () => {
+    const r = acquireBuildClaim('/proj/holds-own', 'ios build');
+    expect(r.ok).toBe(true);
+    expect(holdsBuildClaim('/proj/holds-own', { envToken: '' })).toBe(true);
+  });
+
+  it('true for a CHILD that inherited the holder\'s token (build-web.mjs under /api/build)', () => {
+    writeClaim('/proj/holds-child', 999_999, 'ancestor-token');
+    expect(holdsBuildClaim('/proj/holds-child', { envToken: 'ancestor-token', alive: () => true })).toBe(true);
+  });
+
+  it('false when nobody holds a claim on that root', () => {
+    expect(holdsBuildClaim('/proj/holds-nobody', { envToken: '' })).toBe(false);
+  });
+
+  it('false when SOMEONE ELSE holds it — a live claim is not the caller\'s claim', () => {
+    writeClaim('/proj/holds-foreign', 999_999, 'their-token');
+    expect(holdsBuildClaim('/proj/holds-foreign', { envToken: 'my-token', alive: () => true })).toBe(false);
+  });
+
+  it('false for a claim on a DIFFERENT root, even with the matching token', () => {
+    writeClaim('/proj/holds-other', 999_999, 'ancestor-token');
+    expect(holdsBuildClaim('/proj/holds-elsewhere', { envToken: 'ancestor-token', alive: () => true })).toBe(false);
+  });
+
+  it('false for a STALE claim of our own token (its holder is dead)', () => {
+    writeClaim('/proj/holds-stale', 999_999, 'ancestor-token');
+    expect(holdsBuildClaim('/proj/holds-stale', { envToken: 'ancestor-token', alive: () => false })).toBe(false);
+  });
+
+  it('false — not a throw, not true — when the claims file is unreadable (UNKNOWN answers a gate)', () => {
+    fs.mkdirSync(home, { recursive: true });
+    fs.writeFileSync(claimsFilePath(), '{ not valid json');
+    expect(holdsBuildClaim('/proj/holds-corrupt', { envToken: 'anything' })).toBe(false);
   });
 });
 
