@@ -162,14 +162,27 @@ Everything then worked anyway, because `setCurrentWorld` throws that world away 
 rebuilds under the real canvas, so the only visible symptom was a wall of `[Scene2D]` orphan warnings
 naming entities that were plainly on screen (a later generation of them, under the same names).
 
-**So: gate on the authored thing you need, not on a clock or a frame count.** wordweave now refuses
-to build while `hostCanvasId(world) === 0`. Two riders learned with it:
+**So: gate on the authored thing you need, not on a clock or a frame count.** wordweave refused to
+build while it had no host (#1110), and every 2D game now does the same through one engine seam.
+Two riders learned with it:
 
-- ⚠️ **Surface the refusal, but only where it is actually wrong.** Skipping work in the pre-scene
-  window is routine and must stay silent; a scene that genuinely lacks the entity is an authoring
-  defect and has to say so, or the fix is a net loss in diagnosability (before the gate, the engine
-  reported it 38 times). Discriminate with a **scene-authored singleton** — wordweave keys off
-  `WordweaveConfig`, whose presence means the scene loaded.
+- ⚠️ **Surface the refusal, but only where it is actually wrong** — and let the ENGINE decide which
+  case that is (#1135). Skipping work in the pre-scene window is routine and must stay silent; a
+  scene that genuinely lacks the entity is an authoring defect and has to say so, or the fix is a
+  net loss in diagnosability (before the gate, the engine reported it 38 times). Three games once
+  answered that three ways — Court said nothing, space-invader counted 60 frames (a timer: it fires
+  on a slow device whose scene merely took longer, and stays silent on a fast one whose scene never
+  loads), wordweave keyed off its own `WordweaveConfig` singleton (right, but only for a game that
+  nominates one). The engine's answer is **"the scene finished loading and still has none"**:
+  `SceneManager.loadScene` marks the world it promotes, just BEFORE `setCurrentWorld`
+  (`runtime/core/ecs/sceneLoaded.ts`, read with `loadedScenePath(world)`), and
+  `resolveCanvas2DHost(world, { report, prefer? })` (`runtime/scene/canvas2DHost.ts`) returns the
+  host or reports its absence once per world per report name. Only a scene FILE marks (`isSceneFilePath`) — an editor
+  Create Scene world, an untitled scene's Play/Stop snapshot reload (path `''`) and the prefab-edit
+  world do not, or every game system would call a blank scene an authoring defect —
+  and a headless test opts in with `createTestWorld({ scenePath })`. A game resolving some OTHER
+  authored entity should gate on `loadedScenePath` the same way rather than invent a fourth answer.
+  `games/chess` still finds its host by name and waits silently, deliberately not migrated.
 - ⚠️ **Test fixtures reproduce this state by accident, and then pin it.** Fourteen wordweave
   fixtures built the board into a canvas-less test world and passed, because nothing asserted where
   the entities landed — which is exactly why the production defect survived a 7105-test suite. A

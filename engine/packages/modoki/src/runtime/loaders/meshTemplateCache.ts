@@ -35,6 +35,7 @@ import { clearTimelineCache } from './timelineCache';
 import { clearControlSpawns } from '../timeline/controlSpawnRegistry';
 import { clearAnimSetCache } from './animSetCache';
 import { clearSpriteAnimCache } from './spriteAnimCache';
+import { clearRig2DCache } from './rig2dCache';
 import { releaseRiggedModelsForScene, disposeAllRiggedModels, getRiggedOwnerCounts } from './riggedModelCache';
 import { releaseAudioForScene, disposeAllAudioBuffers } from './audioBufferCache';
 import { releaseFontsForScene, disposeAllFonts } from './fontAtlasLoader';
@@ -1621,6 +1622,7 @@ export function disposeAllCachedResources() {
   clearControlSpawns(); // control-track spawns belonged to the world being torn down
   clearAnimSetCache();
   clearSpriteAnimCache();
+  clearRig2DCache(); // #1171: the sixth def cache — it was the one this full teardown missed
 
   // Rigged GLBs (skeletal models) live in a parallel cache with their own GPU
   // resources — dispose them on full teardown too.

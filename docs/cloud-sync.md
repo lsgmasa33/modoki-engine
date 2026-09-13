@@ -354,9 +354,21 @@ protects — which is right for the sync fork question but reopens the local-tor
 old co-location answered for free, since the marker no longer shares a document with the coins.
 
 **The fix is write ORDER, not a shared document**: write the guard and the marker together in one
-atomic write, confirm it durable, and only THEN credit the coins. A rejected write then records
-nothing and credits nothing, so a retry pays exactly once — strictly better than the old scheme,
-which merely stopped a *repeat* payout rather than preventing a *missed* one. The residual this
+atomic write, confirm it durable, and only THEN credit the coins. A rejected write credits nothing,
+and the payout is OWED until the write is confirmed — strictly better than the old scheme, which
+merely stopped a *repeat* payout rather than preventing a *missed* one.
+
+⚠️ **"A rejected write records nothing" was false, and this section said it for two weeks (#1168).**
+PlayerPrefs keeps a rejected value in its cache and re-queues it — any later `set` resets the retry
+budget, and Court flushes after nearly every write — so the guard and marker read as SET for the rest
+of the session and usually land late. A replay therefore paid 0, and a late landing lost the coins
+permanently; the only path that paid was "never lands AND the app relaunches". The refusal now
+records the payout in a session-scoped owed map, and `tickOwedSolvePayouts` credits it the frame
+`court.progress` is confirmed — provided the save still carries the marker (a wipe or a sync adopt
+that replaced it pays nothing) and neither a wipe nor a PlayerPrefs namespace swap intervened. The
+same shape as #1163's daily purchase and #1166's login bonus: **when a durability gate refuses, the
+pre-gate that would retry it reads the optimistic cache, so the owed follow-up must live somewhere
+the cache cannot answer for it.** What the player sees depends on when it lands: before the solved dialog has run its coin fly (the commonest case — a false refusal confirms on the next frame) the credit is handed back to that celebration; after it, a "+N" toast under the purse announces it, held while the menu is up because the HUD is faded out there. The residual this
 does not cover — the progress document going missing *after* the coins already landed, so the
 marker disappears with it and a retry pays again — is accepted and recorded in a comment on
 `settleSolvePayout`, not silently absorbed. See `games/court/ads.md` § "A first-solve payout that

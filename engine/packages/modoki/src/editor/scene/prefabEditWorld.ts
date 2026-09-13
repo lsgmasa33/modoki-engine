@@ -10,8 +10,10 @@
 import { sceneManager } from '../../runtime/scene/SceneManager';
 
 /** Synthetic scene path for the isolated prefab-edit world: `<prefix><prefab guid>`. Not a FILE —
- *  nothing may try to fetch, load or save it. */
-export const PREFAB_EDIT_SCENE_PREFIX = '/__prefab-edit__/';
+ *  nothing may try to fetch, load or save it. Defined in the runtime since #1135, which must not mark
+ *  that world as a loaded scene. */
+import { PREFAB_EDIT_SCENE_PREFIX } from '../../runtime/core/ecs/sceneLoaded';
+export { PREFAB_EDIT_SCENE_PREFIX };
 
 /**
  * True when the loaded scene is a prefab-edit world.

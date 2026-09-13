@@ -205,6 +205,40 @@ describe('meshTemplateCache', () => {
       disposeAllCachedResources();
       // No assertion needed — just verifying no crash
     });
+
+    // #1171: this full teardown cleared five of the six def caches and missed rig2d. One test per
+    // cache, seeded through its own `set*` (no fetch) and peeked with `{load:false}` (no fetch), so a
+    // cache dropped from the teardown list turns exactly its own row red.
+    const defCaches: Array<[string, () => Promise<{ seed: () => void; peek: () => unknown }>]> = [
+      ['rig2d', async () => {
+        const m = await import('../../src/runtime/loaders/rig2dCache');
+        return {
+          seed: () => m.setRig2D('t.rig2d.json', {
+            bones: [{ name: 'root', parent: -1, x: 0, y: 0, rot: 0 }], sprite: 'sp1',
+            mesh: { verts: [[0, 0]], uvs: [[0, 0]], tris: [] }, skinIndices: [0], skinWeights: [1],
+          }),
+          peek: () => m.getRig2D('t.rig2d.json', { load: false }),
+        };
+      }],
+      ['spriteanim', async () => {
+        const m = await import('../../src/runtime/loaders/spriteAnimCache');
+        return { seed: () => m.setSpriteAnim('t.spriteanim.json', {}), peek: () => m.getSpriteAnim('t.spriteanim.json', { load: false }) };
+      }],
+      ['animset', async () => {
+        const m = await import('../../src/runtime/loaders/animSetCache');
+        return { seed: () => m.setAnimSet('t.animset.json', {}), peek: () => m.getAnimSet('t.animset.json', { load: false }) };
+      }],
+    ];
+    for (const [kind, load] of defCaches) {
+      it(`drops the ${kind} def cache`, async () => {
+        const { disposeAllCachedResources } = await getCache();
+        const cache = await load();
+        cache.seed();
+        expect(cache.peek()).not.toBeNull();
+        disposeAllCachedResources();
+        expect(cache.peek()).toBeNull();
+      });
+    }
   });
 
   describe('invalidateModel', () => {

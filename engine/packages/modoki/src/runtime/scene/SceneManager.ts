@@ -93,6 +93,7 @@ import { getAllTraits } from '../core/ecs/traitRegistry';
 import { resolveKootaSchema } from './sceneSchema';
 import { resolveSceneChain, type SceneRef, type FetchSceneMeta } from './sceneChain';
 import { emit } from '../core/journal';
+import { markSceneLoaded, isSceneFilePath } from '../core/ecs/sceneLoaded';
 import { beginBootSpan, endBootSpan, bootSpanAsync } from '../core/bootTimeline';
 import { clearAllOverrideMarks, getOverrideMarkSet, markOverride } from '../loaders/overrideMarks';
 import { clearAuthoredWritesWhileStopped } from '../core/ecs/authoredWrites';
@@ -1073,6 +1074,10 @@ class SceneManagerImpl implements SceneManager {
       this.currentBaseScene = data.baseScene;
       this.nextLoad = null;
 
+      // #1135 — BEFORE the promote, so the first GAME tick against this world already knows its scene
+      // is here, and a host-resolving system cannot mistake it for the pre-scene boot window. Only a
+      // scene FILE: an untitled snapshot reload or the prefab-edit world is not one (`isSceneFilePath`).
+      if (isSceneFilePath(path)) markSceneLoaded(promotedWorld, path);
       setCurrentWorld(promotedWorld); // fires onWorldSwap → renderers clear caches
       nextWorld = null; // ownership transferred to current; do not destroy in catch
       // From here on, `allocatedSceneIds` is owned by `loadedScenes` (already

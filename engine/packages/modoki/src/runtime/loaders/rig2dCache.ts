@@ -37,8 +37,11 @@ const cache = new Map<string, ParsedRig2D>();
  *  THE COST, stated rather than discovered: this retains the parsed JSON for every loaded rig, on
  *  the same lifetime as the parsed form (both are dropped together by `invalidateRig2D` /
  *  `clearRig2DCache`), in a shipped game as well as the editor. Bounded by the rig files
- *  themselves — 11 KB for `bar.rig2d.json`, 208 KB for `zombie.rig2d.json`, and a scene's rigs are
- *  released at the swap. Accepted over gating it on `__MODOKI_EDITOR__`: no `runtime/**` module
+ *  themselves — 11 KB for `bar.rig2d.json`, 208 KB for `zombie.rig2d.json`. ⚠️ **It is bounded by
+ *  every rig the SESSION has loaded, not by one scene's**: a scene swap does NOT clear this cache
+ *  (#1171 — no def cache is cleared at a swap, because #1162 preloads the next scene's defs BEFORE
+ *  it; see `SceneManager.acquireResourceInner`'s `rig2d` case). This once said "a scene's rigs are
+ *  released at the swap", which nothing did. Accepted over gating it on `__MODOKI_EDITOR__`: no `runtime/**` module
  *  references that global, and it resolves TRUE under vitest AND a plain `npm run dev`, so the
  *  gate would be wrong exactly where a developer runs their own game (the reasoning
  *  `tierCalibration.setTierFrameCapEnabled` records for the same trap). If rig memory ever
@@ -165,7 +168,8 @@ export function invalidateRig2D(refOrPath: string): void {
   loading.delete(path);
 }
 
-/** Drop ALL cached rigs (scene swap / full resource disposal / test teardown). */
+/** Drop ALL cached rigs (`disposeAllCachedResources`'s full teardown / test teardown) — NOT called at a
+ *  scene swap, which would wipe the rigs the next scene just preloaded (#1171). */
 export function clearRig2DCache(): void {
   liveness.invalidateAll();
   cache.clear();

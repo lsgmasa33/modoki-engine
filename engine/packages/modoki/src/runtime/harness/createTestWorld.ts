@@ -28,6 +28,7 @@ import { advanceFixedSteps } from '../core/stepSimulation';
 import { resetTimeBaseline } from '../core/timeSystem';
 import { getPlayState, setPlayState, type PlayState } from '../core/playState';
 import { seedRng } from '../core/rng';
+import { markSceneLoaded } from '../core/ecs/sceneLoaded';
 import { clearJournal, journalEvents, _resetCaptureSeq, setVerboseCapture, verboseCaptureState, type GameEvent } from '../core/journal';
 import {
   registerUIAction, unregisterUIAction, dispatchUIAction,
@@ -59,6 +60,10 @@ export interface CreateTestWorldOptions {
   systems?: TestSystemDef[];
   /** Named actions dispatchable via `.dispatch(name, payload)`. */
   actions?: Record<string, UIActionHandler | UIActionDef>;
+  /** Mark the world as holding this fully loaded scene, the way `SceneManager.loadScene` does
+   *  (`core/ecs/sceneLoaded.ts`). Omitted: the world models the pre-scene boot window, where a system
+   *  missing an authored entity must stay silent. */
+  scenePath?: string;
 }
 
 export interface TestWorld {
@@ -92,6 +97,7 @@ export function createTestWorld(opts: CreateTestWorldOptions = {}): TestWorld {
   const prevPlay: PlayState = getPlayState();
 
   const world = createWorld();
+  if (opts.scenePath !== undefined) markSceneLoaded(world, opts.scenePath);
   setCurrentWorld(world);
   setPlayState('playing');           // sim tiers run; dispatchUIAction is live
   seedRng(opts.seed ?? 1, world);    // reproducible; world-scoped (F1)
