@@ -23,7 +23,7 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
-import ts from 'typescript';
+import { callsTo, parseSource } from '@modoki/engine/testing/sourceAst';
 import { readScannedSource } from '@modoki/engine/testing';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 
@@ -62,27 +62,21 @@ const ALLOWED_UNTARGETED: ReadonlyArray<{ item: string; count?: number; reason: 
  *  over-read on a quote inside a regex literal, and a heuristic regex-vs-division rule on top of
  *  that still over-read on `w! / 2`, `=> /'/`, `+ /'/`, deep indentation and a backtick inside
  *  `${}`. Every one of those is a private tokenizer being wrong; the AST is not a tokenizer this
- *  file maintains. (The "an AST walk is too heavy" reason the first version gave does not hold:
+ *  file maintains, and it is parsed through `sourceAst`, the shared node-not-window helper #1144
+ *  extracted from this fix. (The "an AST walk is too heavy" reason the first version gave does not hold:
  *  `updateEachFanoutGuard` already parses with `typescript` in this suite.) Pinned below. */
 function adbCallSitesIn(entry: string, src: string): Array<{ file: string; near: string; window: string }> {
   const out: Array<{ file: string; near: string; window: string }> = [];
-  const sf = ts.createSourceFile(entry, src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-  const visit = (node: ts.Node) => {
-    if (
-      ts.isCallExpression(node)
-      && node.expression.getText(sf) === 'execFileSync'
-      && node.arguments[0]?.getText(sf) === 'adbBinary()'
-    ) {
-      const at = node.getStart(sf);
-      // The enclosing function/method name, for a failure message that says WHERE rather than
-      // making the reader count line numbers.
-      const before = src.slice(0, at);
-      const fnName = [...before.matchAll(/(?:function\s+|^\s{2})([A-Za-z_$][\w$]*)\s*\(/gm)].pop()?.[1] ?? '?';
-      out.push({ file: entry, near: `${entry}:${fnName}`, window: src.slice(at, node.getEnd()) });
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(sf);
+  const sf = parseSource(src, entry);
+  for (const node of callsTo(sf, 'execFileSync')) {
+    if (node.arguments[0]?.getText(sf) !== 'adbBinary()') continue;
+    const at = node.getStart(sf);
+    // The enclosing function/method name, for a failure message that says WHERE rather than
+    // making the reader count line numbers.
+    const before = src.slice(0, at);
+    const fnName = [...before.matchAll(/(?:function\s+|^\s{2})([A-Za-z_$][\w$]*)\s*\(/gm)].pop()?.[1] ?? '?';
+    out.push({ file: entry, near: `${entry}:${fnName}`, window: src.slice(at, node.getEnd()) });
+  }
   return out;
 }
 

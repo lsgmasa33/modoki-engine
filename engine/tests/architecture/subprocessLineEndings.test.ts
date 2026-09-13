@@ -15,7 +15,12 @@
  *     narrow: see the docblock on `crFragileLineParses` for what it can and cannot see.
  */
 import { describe, it, expect } from 'vitest';
+import ts from 'typescript';
 import { readScannedSource } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
+import {
+  boundIdentifier, callsTo, declarationOf, parseSource, readsOf, unwrapValue, valueCarrier,
+} from '@modoki/engine/testing/sourceAst';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { outputLines, parsePidRows } from '../../scripts/subprocessText.mjs';
 import { joinPidColumns } from '../../scripts/livePackagedEditor.mjs';
@@ -33,8 +38,13 @@ const SELF = 'engine/tests/architecture/subprocessLineEndings.test.ts';
  * matches **14** files in this corpus, 11 of them false positives (an end-anchored regex on a FILE
  * PATH, e.g. `/\.json$/`), which would force an 11-entry allowlist — and an allowlisted guard rots
  * (this repo has a whole `family/derived-corpus` for that). So this one keys on the SHAPE instead:
- * the split's own element meeting a `)$`-style capture. It therefore cannot see a parse whose split
- * and match are far apart, or one that goes through an intermediate variable.
+ * the split's own element meeting a `)$`-style capture, read from the AST (#1144): the loop or callback
+ * that iterates the lines bounds where the match may sit, never a character count. It follows ONE
+ * `const lines = x.split('\n')` binding and a same-elements chain (`.filter(…)`), and resolves a
+ * `const RE = /…/` by scope; it cannot see lines passed to another function, a parse that joins and
+ * re-splits, `RE.test(line)`, an index loop, or `.entries()`. ⚠️ It also no longer follows lines
+ * through `.map(…)` — the windowed version happened to catch `.map((s) => s.replace(…))` loops —
+ * because a `.map((l) => l.trim())` is exactly the remedy, and a map's result is not the lines.
  *
  * ACCEPTED on purpose (all three are correct, and all three appear in this corpus):
  * `\s*$` before the anchor — `\s` matches `\r`, so the anchor is reached either way;
@@ -57,24 +67,106 @@ const SELF = 'engine/tests/architecture/subprocessLineEndings.test.ts';
 // protected by a trimEnd() (deviceAndroidDiag.ts). Re-run on the FIXED tree it matches 12, all
 // false, because the two real ones no longer split on a bare newline. Quote the figure with the
 // tree it was taken on; it moves when the fix lands.
-export function crFragileLineParses(code: string): string[] {
-  const ITER = /(?:for\s*\(\s*const\s+(\w+)\s+of\s+[^;]*?\.split\(\s*['"]\\n['"]\s*\)|\.split\(\s*['"]\\n['"]\s*\)\s*\.(?:map|filter|forEach|flatMap)\(\s*\(?\s*(\w+)\s*\)?\s*=>)/g;
-  // An end-anchored regex literal, no /m flag, whose `$` is preceded by a capture close rather
-  // than by `\s*` (which would absorb the CR).
-  const ENDANCH = /\/[^/\n]*\)\$\/(?![a-z]*m)[a-z]*/g;
+export function crFragileLineParses(code: string, label = 'source.ts'): string[] {
+  const sf = parseSource(code, label);
   const out: string[] = [];
-  for (const m of code.matchAll(ITER)) {
-    const v = m[1] ?? m[2];
-    if (!v) continue;
-    const tail = code.slice(m.index! + m[0].length, m.index! + m[0].length + 900);
-    for (const rm of tail.matchAll(ENDANCH)) {
-      const seg = tail.slice(Math.max(0, rm.index! - 90), rm.index! + rm[0].length + 90);
-      const used = new RegExp(`\\b${v}\\s*\\.\\s*match\\s*\\(`).test(seg) || new RegExp(`exec\\(\\s*${v}\\b`).test(seg);
-      const trimmed = new RegExp(`\\b${v}\\s*\\.\\s*trim(End)?\\(\\)`).test(seg);
-      if (used && !trimmed) { out.push(rm[0]); break; }
-    }
+  for (const split of callsTo(sf, 'split')) {
+    const [sep] = split.arguments;
+    if (split.arguments.length !== 1 || !ts.isStringLiteralLike(sep) || sep.text !== '\n') continue;
+    for (const { line, body } of lineIterations(split)) out.push(...fragileMatchesIn(body, line));
   }
   return out;
+}
+
+/** Array methods whose callback's first parameter is one ELEMENT, i.e. one line. */
+const PER_ELEMENT = new Set(['map', 'filter', 'forEach', 'flatMap', 'some', 'every', 'find', 'findIndex']);
+/** Methods that hand the SAME lines on, so a chain through them still iterates lines. */
+const SAME_ELEMENTS = new Set(['filter', 'slice', 'reverse', 'toReversed', 'sort', 'toSorted']);
+
+/**
+ * Every place `split`'s lines are iterated, each as the line's own binding and the node that bounds
+ * it — the loop statement or the callback's body. ⚠️ **That node is the whole point (#1144):** the
+ * windowed version searched 900 chars after the split and then ±90 around each regex, so the NEXT
+ * loop's `line.trim()` excused this loop's bare `line.match(/…)$/)`.
+ *
+ * Follows the lines through a same-elements chain (`.filter(Boolean).map(…)`) and through ONE
+ * `const lines = x.split('\n')` binding into the loops that read it.
+ */
+function lineIterations(split: ts.CallExpression): Array<{ line: string; body: ts.Node }> {
+  const out: Array<{ line: string; body: ts.Node }> = [];
+  const fromValue = (value: ts.Expression, followBinding: boolean): void => {
+    let cur = valueCarrier(value);
+    for (;;) {
+      const access = cur.parent;
+      const call = access?.parent;
+      if (!access || !ts.isPropertyAccessExpression(access) || access.expression !== cur
+        || !call || !ts.isCallExpression(call) || call.expression !== access) break;
+      const method = access.name.text;
+      const fn = call.arguments[0];
+      if (PER_ELEMENT.has(method) && fn && (ts.isArrowFunction(fn) || ts.isFunctionExpression(fn))) {
+        const param = fn.parameters[0]?.name;
+        if (param && ts.isIdentifier(param)) out.push({ line: param.text, body: fn.body });
+      }
+      if (!SAME_ELEMENTS.has(method)) return;
+      cur = valueCarrier(call);
+    }
+    const loop = cur.parent;
+    if (loop && ts.isForOfStatement(loop) && loop.expression === cur && ts.isVariableDeclarationList(loop.initializer)) {
+      const name = loop.initializer.declarations[0]?.name;
+      if (name && ts.isIdentifier(name)) out.push({ line: name.text, body: loop.statement });
+      return;
+    }
+    const bound = followBinding ? boundIdentifier(cur) : undefined;
+    if (bound) for (const read of readsOf(bound)) fromValue(read, false);
+  };
+  fromValue(split, true);
+  return out;
+}
+
+/** The end-anchored pattern text of a regex literal whose `$` is reached directly by a capture
+ *  close and that has no `m` flag — or `undefined`. */
+function endAnchoredCapture(re: ts.Node | undefined): string | undefined {
+  if (!re || re.kind !== ts.SyntaxKind.RegularExpressionLiteral) return undefined;
+  const text = re.getText(re.getSourceFile());
+  const close = text.lastIndexOf('/');
+  const [pattern, flags] = [text.slice(1, close), text.slice(close + 1)];
+  return pattern.endsWith(')$') && !flags.includes('m') ? text : undefined;
+}
+
+/** A regex argument as its literal: the literal itself, or the `const RE = /…/` its name RESOLVES
+ *  to (by scope — a same-named const in another function is a different regex). */
+function regexLiteralOf(arg: ts.Expression | undefined): ts.Node | undefined {
+  if (!arg) return undefined;
+  const e = unwrapValue(arg);
+  if (e.kind === ts.SyntaxKind.RegularExpressionLiteral) return e;
+  if (!ts.isIdentifier(e)) return undefined;
+  const decl = declarationOf(e);
+  const init = decl && ts.isVariableDeclaration(decl) && decl.initializer ? unwrapValue(decl.initializer) : undefined;
+  return init?.kind === ts.SyntaxKind.RegularExpressionLiteral ? init : undefined;
+}
+
+/**
+ * Inside `body` only: EVERY `line.match(RE)` or `RE.exec(line)` with `RE` an end-anchored capture,
+ * where `line` is the bare binding. `line.trimEnd().match(RE)` has a call for its receiver, not the
+ * binding, so it is not reported — that is the "trim first" remedy, read structurally.
+ *
+ * ⚠️ **Every match, one entry each (#1144 close-out).** The first version returned the first hit
+ * per body, so a ledger row for one match pardoned the whole loop: a second fragile match planted
+ * beside the pardoned one in `gen-memory-index.mjs` left the corpus guard green.
+ */
+function fragileMatchesIn(body: ts.Node, line: string): string[] {
+  const hits: string[] = [];
+  const isLine = (e: ts.Expression | undefined): boolean => !!e && ts.isIdentifier(unwrapValue(e))
+    && (unwrapValue(e) as ts.Identifier).text === line;
+  for (const call of callsTo(body, 'match', 'exec')) {
+    const access = call.expression;
+    if (!ts.isPropertyAccessExpression(access)) continue;
+    const hit = access.name.text === 'match'
+      ? isLine(access.expression) && endAnchoredCapture(regexLiteralOf(call.arguments[0]))
+      : isLine(call.arguments[0]) && endAnchoredCapture(regexLiteralOf(access.expression));
+    if (hit) hits.push(hit);
+  }
+  return hits;
 }
 
 describe('outputLines — no line it returns can contain a \\r (#1118)', () => {
@@ -157,12 +249,64 @@ describe('joinPidColumns — two ps captures joined by pid (#1118)', () => {
   });
 });
 
+/**
+ * Bare splits that ARE safe, because CRLF cannot reach the match — each for a reason stated at the
+ * site, spent one row per occurrence.
+ *
+ * ⚠️ **Found by #1144, and the old guard was green on it for a FALSE reason.** The windowed detector
+ * excused `parseFrontmatter`'s `line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/)` because
+ * `if (!line.trim()) continue;` sat within 90 chars — a `trim()` whose result is discarded, which
+ * protects nothing. The site is safe for a different reason entirely, and it says so in its own
+ * comment: the function throws on a file that does not start `'---\n'`, so a CRLF file never
+ * reaches the split. Pardoned for THAT, by name.
+ */
+const CR_SAFE_UPSTREAM: ReadonlyArray<{ item: string; count?: number; reason: string }> = [
+  {
+    item: 'scripts/gen-memory-index.mjs::/^([A-Za-z0-9_-]+):\\s*(.*)$/',
+    reason: 'parseFrontmatter throws on a file not starting \'---\\n\' before it splits, so no CRLF line reaches the match (the site\'s own comment; #1118 briefly made it CRLF-tolerant downstream of that rejection, which was dead code).',
+  },
+  {
+    item: 'scripts/gen-memory-index.mjs::/^\\s+([A-Za-z0-9_-]+):\\s*(.*)$/',
+    reason: 'the indented metadata line in the same parseFrontmatter loop — same upstream CRLF rejection. Uncounted until matches were collected per occurrence rather than first-per-loop.',
+  },
+];
+
 describe('the SHAPE cannot come back — corpus guard (#1118)', () => {
   it('flags the three forms that actually shipped', () => {
     // The exact text of the three sites this issue fixed.
     expect(crFragileLineParses(`for (const line of out.split('\\n')) {\n  const m = line.match(/^\\s*(\\d+)\\s+(.*)$/);\n}`)).toHaveLength(1);
     expect(crFragileLineParses(`out.split('\\n').map((line) => {\n  const m = line.match(/^\\s*(\\d+)\\s+(.*)$/);\n})`)).toHaveLength(1);
     expect(crFragileLineParses(`for (const l of x.split("\\n")) {\n  const kv = /^([a-z]+):\\s*(.*)$/.exec(l);\n}`)).toHaveLength(1);
+  });
+
+  it('classifies inside the LOOP\'s own body — a neighbour\'s trim() does not vouch (#1144)', () => {
+    // Observed on the windowed version: this pair returned [] because the SECOND loop's
+    // `line.trim()` sat within its ±90-char segment.
+    const bare = "for (const line of a.split('\\n')) { const m = line.match(/(\\d+)$/); use(m); }";
+    const neighbour = "for (const line of b.split('\\n')) { const t = line.trim(); use(t); }";
+    expect(crFragileLineParses(bare)).toEqual(['/(\\d+)$/']);
+    expect(crFragileLineParses(`${bare}\n${neighbour}`)).toEqual(['/(\\d+)$/']);
+    expect(crFragileLineParses(`${neighbour}\n${bare}`)).toEqual(['/(\\d+)$/']);
+    // The live instance: a trim whose RESULT is discarded protects nothing (gen-memory-index.mjs).
+    expect(crFragileLineParses(
+      "for (const line of a.split('\\n')) {\n  if (!line.trim()) continue;\n  const m = line.match(/^(\\w+):\\s*(.*)$/);\n}",
+    )).toEqual(['/^(\\w+):\\s*(.*)$/']);
+  });
+
+  it('follows the lines through a same-elements chain, a binding, and a named regex', () => {
+    expect(crFragileLineParses("x.split('\\n').filter(Boolean).forEach((l) => { l.match(/(\\d+)$/); });")).toHaveLength(1);
+    expect(crFragileLineParses("const lines = x.split('\\n');\nfor (const l of lines) { l.match(/(\\d+)$/); }")).toHaveLength(1);
+    expect(crFragileLineParses("const ROW = /^(\\d+)\\s+(.*)$/;\nfor (const l of x.split('\\n')) { const m = ROW.exec(l); }")).toHaveLength(1);
+    // EVERY match in a body is its own entry — a ledger row for one must not pardon its neighbour.
+    expect(crFragileLineParses("for (const l of x.split('\\n')) { l.match(/^(a)$/); l.match(/^(b)$/); }"))
+      .toEqual(['/^(a)$/', '/^(b)$/']);
+    // A regex NAME resolves by scope: another function's same-named const is a different value.
+    expect(crFragileLineParses("function a() { const RE = /(\\d+)$/; }\nfunction b(s: string) { const RE = /x/; for (const l of s.split('\\n')) RE.exec(l); }")).toEqual([]);
+    expect(crFragileLineParses("function a() { const RE = 'x'; }\nfunction b(s: string) { const RE = /(\\d+)$/; for (const l of s.split('\\n')) RE.exec(l); }")).toHaveLength(1);
+    // ...and a regex on a DIFFERENT value in the same body is not this line's match.
+    expect(crFragileLineParses("for (const l of x.split('\\n')) { name.match(/(\\d+)$/); }")).toEqual([]);
+    // `.map` changes the elements, so a chain past it is no longer iterating lines.
+    expect(crFragileLineParses("x.split('\\n').map((l) => l.length).forEach((n) => { n.match(/(\\d+)$/); });")).toEqual([]);
   });
 
   it('ACCEPTS the three correct forms — this guard must not read as "no $ anchors anywhere"', () => {
@@ -185,19 +329,29 @@ describe('the SHAPE cannot come back — corpus guard (#1118)', () => {
     });
     expect(files.length, 'corpus collapsed — the scan below would pass vacuously').toBeGreaterThan(200);
 
-    const offenders: string[] = [];
+    const population: Array<{ item: string; site: string }> = [];
     for (const { rel, abs } of files) {
       if (rel === SELF) continue;
       const { code } = readScannedSource(abs);
-      for (const pat of crFragileLineParses(code)) offenders.push(`${rel} — ${pat}`);
+      for (const pat of crFragileLineParses(code, rel)) population.push({ item: `${rel}::${pat}`, site: rel });
     }
-    expect(offenders, 'a line from a bare `\'\\n\'` split must not meet an end-anchored capture: '
-      + 'split through `outputLines` (engine/scripts/subprocessText.mjs), or on /\\r?\\n/, or trim '
-      + 'the line first. `\\r` is a JS line terminator, so the capture fails on EVERY line and '
-      + 'returns null — silently. ⚠️ BUT NOT IF THE FILE ROUND-TRIPS THE TEXT: where lines are '
-      + 'split, edited and rejoined back to disk (healNativeConfig.ts does this to a pbxproj, and '
-      + '*.pbxproj is not eol-pinned), a bare split is LOAD-BEARING — it preserves the file\'s CRLF '
-      + 'on a Windows clone, and every remedy above would rewrite the whole file\'s line endings. '
-      + 'Normalise a COPY for the comparison there, and keep writing the original lines.').toEqual([]);
+    const scanned = new Set(files.map((f) => f.rel));
+    assertExemptionLedger({
+      label: 'CR_SAFE_UPSTREAM in subprocessLineEndings',
+      population,
+      // A row counts only where its file is in the corpus — `scripts/gen-memory-index.mjs` is not in
+      // the OSS snapshot, and a row for an absent file would read as over-blessed there.
+      exempt: CR_SAFE_UPSTREAM.filter((row) => scanned.has(row.item.split('::')[0])),
+      scanned: files.length,
+      floor: 200,
+      fix: 'a line from a bare `\'\\n\'` split must not meet an end-anchored capture: '
+        + 'split through `outputLines` (engine/scripts/subprocessText.mjs), or on /\\r?\\n/, or trim '
+        + 'the line first. `\\r` is a JS line terminator, so the capture fails on EVERY line and '
+        + 'returns null — silently. ⚠️ BUT NOT IF THE FILE ROUND-TRIPS THE TEXT: where lines are '
+        + 'split, edited and rejoined back to disk (healNativeConfig.ts does this to a pbxproj, and '
+        + '*.pbxproj is not eol-pinned), a bare split is LOAD-BEARING — it preserves the file\'s CRLF '
+        + 'on a Windows clone, and every remedy above would rewrite the whole file\'s line endings. '
+        + 'Normalise a COPY for the comparison there, and keep writing the original lines.',
+    });
   });
 });

@@ -3,6 +3,7 @@
  *  preventDefault+stopPropagation, the send payload, and (the regression fix) that a surface
  *  marked data-modki-wheel-zoom (the animation Curve Editor's value-axis zoom) is NOT hijacked. */
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import { readScannedSource } from '../helpers/sourceScanner';
 import { forwardZoomWheel } from '../../src/editor/input/zoomWheel';
 
 afterEach(() => { document.body.innerHTML = ''; });
@@ -66,12 +67,10 @@ describe('forwardZoomWheel', () => {
    *  EditorApp is a large component whose effect needs an electronBridge, and the invariant is one
    *  line of options. */
   it('EditorApp attaches the wheel listener non-passively (else preventDefault is ignored)', async () => {
-    const fs = await import('node:fs');
     const path = await import('node:path');
-    const src = fs.readFileSync(
+    const src = readScannedSource(
       path.resolve(__dirname, '../../src/editor/EditorApp.tsx'),
-      'utf8',
-    );
+    ).code;
     const attach = src.match(/addEventListener\(\s*'wheel'[^)]*\)/)?.[0];
     expect(attach, "EditorApp no longer attaches a 'wheel' listener — has the zoom moved?").toBeDefined();
     expect(attach, 'a wheel listener on window is passive BY DEFAULT; without an explicit ' +

@@ -25,8 +25,10 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import ts from 'typescript';
 import { assertScanIsSane, readScannedSource } from '@modoki/engine/testing';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
+import { boundIdentifier, callsTo, parseSource, readsOf, valueCarrier } from '@modoki/engine/testing/sourceAst';
 import { REPO_ROOT } from '../helpers/repoLayout';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
@@ -200,7 +202,7 @@ describe('there is ONE comment scanner, and tests import it (#419)', () => {
  * one level up.
  *
  * ⚠️ **That argument was true about the FILES and wrong about the RULE.** The exclusions below
- * (`WRAPPED_BEFORE`, `WRAPPED_AFTER`, `MARKDOWN_READ`) already discriminate a fixture read from a
+ * (`isWrapped`, `MARKDOWN_READ`) already discriminate a fixture read from a
  * source scan by WHAT IT IS; the directory was standing in for a test that had already been
  * written. Widening the roots needed no allowlist at all and found 28 real source-scanning guards
  * outside the original directory — in `assets`, `editor`, `electron`, `plugins`, `tools` and the
@@ -215,8 +217,8 @@ describe('there is ONE comment scanner, and tests import it (#419)', () => {
  * ⚠️ **This started as `engine/tests/architecture/` alone, and the narrowing was wrong.** The
  * argument was that of 1,234 test files only a minority scan repo source, so a repo-wide rule
  * would need a ~55-entry allowlist of files that legitimately read back their own fixtures. That
- * is true and it is not a reason to stop looking: the exclusions below (`WRAPPED_BEFORE`,
- * `WRAPPED_AFTER`, `MARKDOWN_READ`) do the discriminating, so a fixture read is excused by WHAT IT
+ * is true and it is not a reason to stop looking: the exclusions below (`isWrapped`,
+ * `MARKDOWN_READ`) do the discriminating, so a fixture read is excused by WHAT IT
  * IS rather than by which directory it happens to sit in. Widening the roots found real
  * source-scanning guards in every one of them.
  *
@@ -246,17 +248,30 @@ const SCANNED_ROOTS: string[] = (() => {
 })();
 
 /**
- * Every `readFileSync(…, 'utf8')` call, as source text.
+ * A `readFileSync`/`readFile` call that DECODES to text — `'utf8'`/`'utf-8'` as an argument, an
+ * `{ encoding: 'utf8' }` options object, or `.toString()` on the Buffer it returns — or `undefined`
+ * for a Buffer read. Returns the node carrying the decoded VALUE (the `.toString()` call where
+ * there is one), which is what a wrapper must receive.
  *
- * ⚠️ **Two steps, not one regex, and the one-regex version was WRONG.** An attempt to require the
- * repo-root token inside the call in a single pattern could not match `readFileSync(path.join(
- * repoRoot, 'engine/…'), 'utf8')` at all: a paren-balancing alternation has to consume
- * `path.join(…)` whole, which swallows the very token it then looks for. It reported zero
- * offenders against thirteen known ones — the silent-green direction, in the guard written to stop
- * exactly that.
+ * ⚠️ **From the call's own arguments (#1144).** This was `READ_CALL`, a regex that reached for the
+ * `'utf8'` across `[\s\S]{0,300}?` — a window, so a Buffer read three lines above a neighbour's
+ * `'utf8')` matched as one read spanning both. Its first version before that could not match
+ * `readFileSync(path.join(repoRoot, …), 'utf8')` at all: a paren-balancing alternation has to
+ * consume `path.join(…)` whole, which swallows the root token it then looks for. Both were the
+ * text standing in for the call; the parser has the call.
  */
-const READ_CALL =
-  /\bread(?:FileSync|File)\([\s\S]{0,300}?(?:['"]utf-?8['"]\s*\)|encoding\s*:\s*['"]utf-?8['"][\s\S]{0,40}?\)|\)\s*\.\s*toString\(\))/g;
+function decodedRead(call: ts.CallExpression): ts.Expression | undefined {
+  const isUtf8 = (e: ts.Expression): boolean => ts.isStringLiteralLike(e) && /^utf-?8$/i.test(e.text);
+  const decodes = call.arguments.some((arg) => isUtf8(arg) || (ts.isObjectLiteralExpression(arg) && arg.properties.some(
+    (p) => ts.isPropertyAssignment(p) && p.name.getText() === 'encoding' && isUtf8(p.initializer),
+  )));
+  if (decodes) return call;
+  const access = valueCarrier(call).parent;
+  const toString = access?.parent;
+  if (access && ts.isPropertyAccessExpression(access) && access.name.text === 'toString'
+    && toString && ts.isCallExpression(toString) && toString.expression === access) return toString;
+  return undefined;
+}
 
 /**
  * A path built from a repo-root token — what separates scanning the repo's own source from
@@ -290,38 +305,60 @@ const REPO_ROOTED =
  * gets its allowlist grown until it means nothing, which is how the thing it guards comes back.
  *
  * - `JSON.parse(readFileSync(…))` — parsed as DATA, never pattern-matched. Not a source scan.
+ *   `yaml.load`/`yaml.parse` too: `packagingManifest` reads electron-builder.yml straight into one
+ *   and was reported for it. A parser is a parser; the list is about SHAPE, not library.
  * - `stripComments(readFileSync(…))` — already stripped by hand at the call site. Routing it
  *   through the reader is tidier, but it is not fail-open, so it is not this guard's business.
+ *   `assertScanIsSane(raw, …)` is the same statement about a read.
  * - a `.md` path — Markdown has no code/comment distinction for a scan to be defeated by, and the
  *   guards reading it (`skillReferences`, `qaCaseReferences`' case bodies, `docCitations`) are
  *   scanning prose because prose is the subject.
  */
-const WRAPPED_BEFORE = [
-  // ⚠️ `\s*(?:[\w$]+\s*\.\s*)?$`, not `$`. Both wrappers are routinely written with the read on
-  // the NEXT line, and the read itself is usually `fs.readFileSync` — so the text between the
-  // wrapper and the match is a newline, indentation AND a `fs.` qualifier. Requiring adjacency made
-  // this exclusion match almost nothing, and the rule reported fifteen correct files as offenders.
-  /JSON\s*\.\s*parse\s*\(\s*(?:[\w$]+\s*\.\s*)?$/,
-  // ⚠️ `yaml.load` is `JSON.parse` for a different format — `packagingManifest` reads
-  // electron-builder.yml straight into it and was reported as an offender for it. A parser is a
-  // parser; the list is about SHAPE, not about which library.
-  /yaml\s*\.\s*(?:load|parse)\s*\(\s*(?:[\w$]+\s*\.\s*)?$/,
-  /strip(?:Comments|CommentsAndStrings)\s*\(\s*(?:[\w$]+\s*\.\s*)?$/,
-];
+const WRAPPERS = new Set(['JSON.parse', 'yaml.load', 'yaml.parse', 'stripComments', 'stripCommentsAndStrings', 'assertScanIsSane']);
 
 /**
- * The same two wrappers applied to the read's RESULT a line or two later, which is how most of
- * these are actually written:
+ * `value` goes STRAIGHT into a wrapper — as a direct argument, through nothing but parentheses,
+ * `as`, `!` or `await`.
+ *
+ * ⚠️ **Direct, not "somewhere inside the arguments".** `JSON.parse(summarise(raw))` parses what
+ * `summarise` returned, and `summarise` may well have pattern-matched the raw text first.
+ */
+const passedToWrapper = (value: ts.Expression): boolean => {
+  const carrier = valueCarrier(value);
+  const call = carrier.parent;
+  // No `arguments.includes(carrier)`: a read's carrier whose parent is a wrapper CALL can only be
+  // one of its arguments — as the callee it would BE the wrapper name. Mutation-checked redundant.
+  return !!call && ts.isCallExpression(call) && WRAPPERS.has(call.expression.getText().replace(/\s+/g, ''));
+};
+
+/**
+ * A read is WRAPPED when its value is passed to a wrapper directly, or bound to a `const` EVERY one
+ * of whose reads is passed to a wrapper — the two ways these are actually written:
+ *
+ *     const cfg = JSON.parse(readFileSync(join(repoRoot, rel), 'utf8'));
  *
  *     const raw = readFileSync(join(repoRoot, rel), 'utf8');
  *     const cfg = JSON.parse(raw);
  *
- * ⚠️ A deliberate false NEGATIVE: a read followed by an unrelated `JSON.parse` within the window
- * is excused. That is the conservative direction for a rule whose false POSITIVES are what get its
- * allowlist grown until it means nothing.
+ * ⚠️ **Along the read's OWN binding (#1144).** This was two text windows: 40 chars before the read
+ * for the first form, and 400 AFTER it for the second, matched against any wrapper token. So a
+ * NEIGHBOURING read's `JSON.parse(` excused this one — observed: a lone
+ * `const raw = fs.readFileSync(path.join(REPO_ROOT, 'engine/scripts/repoCorpus.mjs'), 'utf8');` was
+ * reported, and adding `const pkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'package.json'),
+ * 'utf8'));` on the next line turned the guard green. The window was documented as "a deliberate
+ * false NEGATIVE", the right direction to be wrong in only while nothing could be exact.
+ *
+ * ⚠️ **EVERY read, not any (#1144 close-out).** "Some read is wrapped" still let one use vouch for
+ * another use of the same text: `manifestBlockPlumbing` stripped its read once for the interface
+ * fields and ran three `src.match(…)` on the RAW text beside it, and was excused. Reads are resolved
+ * by symbol (`readsOf`), so a sibling function's same-named parameter is not one of them.
  */
-const WRAPPED_AFTER =
-  /\b(?:JSON\s*\.\s*parse|yaml\s*\.\s*(?:load|parse)|strip(?:Comments|CommentsAndStrings)|assertScanIsSane)\s*\(/;
+const isWrapped = (value: ts.Expression): boolean => {
+  if (passedToWrapper(value)) return true;
+  const bound = boundIdentifier(value);
+  const reads = bound ? readsOf(bound) : [];
+  return reads.length > 0 && reads.every(passedToWrapper);
+};
 
 /**
  * Identifiers this file assigns from `mkdtemp`/`tmpdir` — scratch paths wearing a repo-root NAME.
@@ -343,32 +380,28 @@ const scratchRootIdents = (code: string): string[] =>
     .concat([...code.matchAll(/(?:const|let|var)\s+([\w$]+)\s*(?::[^=]*)?=\s*(?:await\s+)?makeScratch[\w$]*\s*\(/g)]
       .map((m) => m[1]));
 
-/** `.md` names a file with no comment syntax these guards can be blinded by. */
-const MARKDOWN_READ = /\.md['"]|\bMD\b|markdown/i;
+/** `.md` and `.txt` name files with no comment syntax these guards can be blinded by — prose, or
+ *  a data list like wordweave's `words-dictionary.txt` (#1144: two such reads were invisible to
+ *  this rule behind a trailing comma, and are data, not scans). */
+const MARKDOWN_READ = /\.(?:md|txt)['"]|\bMD\b|markdown/i;
 
 /**
- * The raw reads of repo source in one file, as matched text (empty when the file is clean).
- *
- * `before` is the text immediately preceding the read, which is where a `JSON.parse(` or
- * `stripComments(` wrapper sits.
+ * The raw reads of repo source in one file, as the calls' source text (empty when the file is
+ * clean). Throws when `code` does not parse — a stump would report no reads and pass.
  */
-const rawSourceReads = (code: string): string[] => {
+export const rawSourceReads = (code: string, label = 'guard.ts'): string[] => {
   const scratch = scratchRootIdents(code);
   const usesScratch = (call: string): boolean =>
     scratch.some((id) => new RegExp(`(^|[^\\w$])${id}\\b`).test(call));
-  return [...code.matchAll(READ_CALL)]
-    .filter((m) => REPO_ROOTED.test(m[0]))
-    .filter((m) => !usesScratch(m[0]))
-    .filter((m) => !MARKDOWN_READ.test(m[0]))
-    .filter((m) => {
-      const before = code.slice(Math.max(0, m.index - 40), m.index);
-      if (WRAPPED_BEFORE.some((re) => re.test(before))) return false;
-      // 400, not 150: the wrapper often sits past a blanked comment or a multi-line type
-      // annotation, and at 150 two correct files were still reported.
-      const after = code.slice(m.index + m[0].length, m.index + m[0].length + 400);
-      return !WRAPPED_AFTER.test(after);
-    })
-    .map((m) => m[0]);
+  const sf = parseSource(code, label);
+  return callsTo(sf, 'readFileSync', 'readFile')
+    .map((call) => ({ text: call.getText(sf), value: decodedRead(call) }))
+    .filter((r): r is { text: string; value: ts.Expression } => r.value !== undefined)
+    .filter((r) => REPO_ROOTED.test(r.text))
+    .filter((r) => !usesScratch(r.text))
+    .filter((r) => !MARKDOWN_READ.test(r.text))
+    .filter((r) => !isWrapped(r.value))
+    .map((r) => r.text);
 };
 
 /**
@@ -524,6 +557,37 @@ describe('an architecture guard reads source through the shared reader (#812)', 
     ].join('\n')), 'a tmpdir FALLBACK does not make a root scratch').toBe(1);
   });
 
+  it('classifies each read along its OWN binding — a neighbour\'s wrapper does not vouch (#1144)', () => {
+    const READ = 'read' + 'FileSync(';
+    const fires = (s: string): number => rawSourceReads(s).length;
+    const bare = `const raw = fs.${READ}path.join(REPO_ROOT, 'engine/scripts/repoCorpus.mjs'), 'utf8');`;
+    const parsedNeighbour = `const pkg = JSON.parse(fs.${READ}path.join(REPO_ROOT, 'package.json'), 'utf8'));`;
+    // Observed on the windowed version: 1 alone, 0 once the neighbour's `JSON.parse(` sat within 400.
+    expect(fires(bare)).toBe(1);
+    expect(fires(`${bare}\n${parsedNeighbour}`), 'the next line\'s JSON.parse is not this read\'s').toBe(1);
+    expect(fires(`${parsedNeighbour}\n${bare}`), 'nor the previous line\'s').toBe(1);
+    // The binding's own wrapper still excuses it, however far away — and only that binding's.
+    expect(fires(`${bare}\n${'const pad = 1;\n'.repeat(40)}const cfg = JSON.parse(raw);`)).toBe(0);
+    expect(fires(`${bare}\nconst other = '{}';\nconst cfg = JSON.parse(other);`)).toBe(1);
+    // Direct, not somewhere inside the wrapper's arguments: this parses what `summarise` returned.
+    expect(fires(`${bare}\nconst cfg = JSON.parse(summarise(raw));`)).toBe(1);
+    // EVERY read of the binding: one stripped use does not excuse a raw match beside it.
+    expect(fires(`${bare}\nconst code = stripComments(raw);\nexpect(raw).toMatch(/x/);`)).toBe(1);
+    // By symbol: a sibling function's parameter named `raw` is not a read of this `raw`.
+    expect(fires(`${bare}\nexpect(raw).toMatch(/x/);\nfunction parse(raw: string) { return JSON.parse(raw); }`)).toBe(1);
+  });
+
+  it('sees a read a formatter WRAPPED with a trailing comma — and the encoding from the call itself (#1144)', () => {
+    const READ = 'read' + 'FileSync(';
+    const fires = (s: string): number => rawSourceReads(s).length;
+    // Invisible to the old text pattern, which required `'utf8'` to be followed by `)`. Twenty-one
+    // real reads in eleven files were written this way and never reported: 19 of repo source in nine
+    // (18 migrated, 1 deleted) and 2 of wordweave's `.txt` dictionary, now excused as data.
+    expect(fires(`const src = fs.${READ}\n  path.join(__dirname, '../../src/x.ts'),\n  'utf8',\n);`)).toBe(1);
+    // A Buffer read has no encoding of its OWN; a neighbour's `'utf8')` does not lend it one.
+    expect(fires(`const buf = fs.${READ}path.join(REPO_ROOT, 'engine/x.png'));\nconst s = fs.${READ}tmpFile, 'utf8');`)).toBe(0);
+  });
+
   it('THE RULE IS WIRED: a planted offender is reported', () => {
     // ⚠️ Found by mutation: replacing the filter below with `() => false` left all nine tests in
     // this file GREEN. The detector had its own positive control, but nothing checked that the
@@ -533,7 +597,7 @@ describe('an architecture guard reads source through the shared reader (#812)', 
     const planted = { rel: 'engine/tests/architecture/__planted.test.ts',
       code: `const s = fs.${READ}path.join(REPO_ROOT, 'engine/x.ts'), 'utf8');\nexpect(s).toMatch(/x/);` };
     const reported = [...archFiles, planted]
-      .filter((f) => rawSourceReads(f.code).length > 0)
+      .filter((f) => rawSourceReads(f.code, f.rel).length > 0)
       .map((f) => f.rel);
     expect(reported, 'the offender rule no longer reports a file that plainly matches the shape')
       .toContain(planted.rel);
@@ -541,7 +605,7 @@ describe('an architecture guard reads source through the shared reader (#812)', 
 
   it('no architecture guard matches a pattern against unstripped repo source', () => {
     const offenders = archFiles
-      .filter((f) => rawSourceReads(f.code).length > 0)
+      .filter((f) => rawSourceReads(f.code, f.rel).length > 0)
       .map((f) => f.rel);
     expect(
       offenders,

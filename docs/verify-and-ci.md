@@ -1242,6 +1242,30 @@ here. And **count on the source the DETECTOR sees**: every guard in this family 
 and #1123 was filed with `grep` figures that were inflated by docblock mentions in 7 of its 16 rows —
 its title said an exempt file held 8 wall-clock reads where the detector sees 2.
 
+⚠️ **And the classifier's window must be the OCCURRENCE ITSELF — a CODE occurrence is classified
+inside its own AST node, never by distance (#1144).** A window chosen by character count
+(`src.slice(at, at + 400)`, `[\s\S]{0,300}`, ±90 around a match, "bounded by the next occurrence")
+is not the occurrence's extent even when nobody widens it, so it fails both ways. **Too wide:** a
+NEIGHBOUR's token vouches — `adbTargeting` read an un-targeted adb call as targeted because the next
+call's `adbArgs(` was within 400 chars (#1140); `rawSourceReads` excused a raw read because the next
+line's `JSON.parse(` was; `crFragileLineParses` excused a match because the next loop's `line.trim()`
+was, and it was green that way on a real file (`gen-memory-index.mjs`, whose nearby `trim()` result is
+discarded). **Too narrow:** a formatter-wrapped occurrence escapes — `rawSourceReads`' text pattern
+required `'utf8'` then `)`, so 21 reads in 11 files written with a trailing comma were never checked.
+The shared helper is `@modoki/engine/testing/sourceAst` (`parseSource` throws on a stump parse;
+`callsTo`, `boundIdentifier`, `readsOf`/`declarationOf` resolve by SYMBOL, `enclosingFunction`).
+⚠️ **Parse — do not write a tokenizer:** #1140's hand-balanced paren scan and the regex-vs-division
+heuristic after it were each broken by review. And the node is only half of it — **its adjuncts must
+be the occurrence's too**, which is where #1144's own first cut still failed open, four ways:
+- a ledger row keyed per loop, because the detector returned the FIRST match per body;
+- "some call has a refusal" instead of every call;
+- a refusal found inside a nested function nobody calls;
+- a raw read excused because ONE of its variable's uses was wrapped — `manifestBlockPlumbing` stripped
+  once and matched the raw text three times beside it.
+
+Comments and Markdown prose have no AST; collapsing whitespace in a matched span stays the right tool
+there.
+
 Progress: **seventeen guards are on the ledger** — `determinismGuard`, `docCitations` and
 `importSettingSelectsSpliced` (Phase 1); `assetJsonGuard`, `handleProviderOwner`,
 `abandonmentIsShared`, `keymapOwnership` and `projectPresencePredicate` (Phase 2); and the nine whose

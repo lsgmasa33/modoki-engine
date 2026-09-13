@@ -6,7 +6,7 @@
  *  call sites to the shared factory. */
 
 import { describe, it, expect } from 'vitest';
-import * as fs from 'node:fs';
+import { readScannedSource } from '../helpers/sourceScanner';
 import * as path from 'node:path';
 import { registerBuiltinCreatableAssets } from '../../src/editor/panels/builtinCreatableAssets';
 import { getCreatableAssets } from '../../src/editor/panels/creatableAssets';
@@ -33,10 +33,9 @@ describe('spriteanim create-flow parity (#417)', () => {
   // positive check without the code actually doing it. A false FAILURE here (the literal shape
   // reappearing inside a comment, say) is the safe direction: loud, not silent.
   it('SpriteAnimEditor.newSpriteAnim no longer inlines its own sprite-anim-document literal', () => {
-    const src = fs.readFileSync(
+    const src = readScannedSource(
       path.join(__dirname, '../../src/editor/panels/SpriteAnimEditor.tsx'),
-      'utf8',
-    );
+    ).code;
     expect(src).not.toMatch(/clips:\s*\{\s*idle:\s*defaultSpriteClip\(\)\s*\}/);
   });
 });

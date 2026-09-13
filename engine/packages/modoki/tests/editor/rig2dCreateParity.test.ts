@@ -5,7 +5,7 @@
  *  "duplicated". This file pins the two editor call sites to the shared factory. */
 
 import { describe, it, expect } from 'vitest';
-import * as fs from 'node:fs';
+import { readScannedSource } from '../helpers/sourceScanner';
 import * as path from 'node:path';
 import { registerBuiltinCreatableAssets } from '../../src/editor/panels/builtinCreatableAssets';
 import { getCreatableAssets } from '../../src/editor/panels/creatableAssets';
@@ -33,10 +33,9 @@ describe('rig2d create-flow parity (#417)', () => {
   // (the literal shape reappearing inside a comment, say) is the safe direction: loud, not
   // silent.
   it('SkinEditor.newRig no longer inlines its own rig-document literal', () => {
-    const src = fs.readFileSync(
+    const src = readScannedSource(
       path.join(__dirname, '../../src/editor/panels/SkinEditor.tsx'),
-      'utf8',
-    );
+    ).code;
     expect(src).not.toMatch(/bones:\s*\[\s*\{\s*name:\s*'root'/);
   });
 
@@ -57,10 +56,9 @@ describe('rig2d create-flow parity (#417)', () => {
   // ruling is untouched; only the branch it governs got smaller. (The peers named above route
   // load-failure through their factory on the MISSING branch only, for the same reason.)
   it('SkinEditor keeps the deliberate empty-bones shape for a MISSING rig', () => {
-    const src = fs.readFileSync(
+    const src = readScannedSource(
       path.join(__dirname, '../../src/editor/panels/SkinEditor.tsx'),
-      'utf8',
-    );
+    ).code;
     expect(src).toMatch(
       /console\.warn\('\[SkinEditor\] load failed \(asset missing\), starting empty', e\);[\s\S]{0,800}?const fb: Rig2DFile = \{ bones: \[\], mesh: \{ verts: \[\], uvs: \[\], tris: \[\] \}, skinIndices: \[\], skinWeights: \[\] \};/,
     );
@@ -77,10 +75,9 @@ describe('rig2d create-flow parity (#417)', () => {
   // every failure. (`assetEditorRefusesUnreadableDoc.test.ts` guards that the classifier is
   // CALLED across all five editors; this pins what SkinEditor does with the answer.)
   it('SkinEditor refuses an UNREADABLE rig before building any fallback (#896)', () => {
-    const src = fs.readFileSync(
+    const src = readScannedSource(
       path.join(__dirname, '../../src/editor/panels/SkinEditor.tsx'),
-      'utf8',
-    );
+    ).code;
     expect(src).toMatch(
       /const failure = classifyAssetDocFetchFailure\(e\);[\s\S]{0,400}?if \(failure\.kind !== 'missing'\) \{[\s\S]{0,400}?setLoadState\('failed'\);[\s\S]{0,80}?return;[\s\S]{0,400}?const fb: Rig2DFile/,
     );

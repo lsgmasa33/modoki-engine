@@ -19,7 +19,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import ts from 'typescript';
 import { readScannedSource } from '@modoki/engine/testing';
+import { boundIdentifier, callsTo, declarationOf, enclosingFunction, findNodes, parseSource, readsOf } from '@modoki/engine/testing/sourceAst';
 import { acquireBuildClaim, readBuildClaim, resetBuildClaimsForTests } from '../../scripts/buildClaimsStore.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -28,6 +30,164 @@ const addNativeTargets = path.join(repoRoot, 'engine', 'scripts', 'add-native-ta
 const otaPublish = path.join(repoRoot, 'engine', 'scripts', 'ota-publish.mjs');
 const buildSubgame = path.join(repoRoot, 'engine', 'scripts', 'build-subgame.mjs');
 
+/** One `acquireBuildClaim(…)` call, read from ITS OWN node (#1144).
+ *
+ *  ⚠️ These asserts used to slice a fixed window after the FIRST `acquireBuildClaim(` (`+ 200`) or
+ *  after `const claimed = acquireBuildClaim(` (`+ 300`/`+ 400`) and match `kind: 'cli'`,
+ *  `!claimed.ok` and `process.exit(1)` inside it. A window is not the call: a second call, or a
+ *  neighbouring refusal, inside the reach satisfied it for a call that had neither, and a call whose
+ *  arguments ran long failed closed. So each fact is read where it lives, for EVERY call:
+ *  - `kind` from this call's own options object;
+ *  - the refusal from the `if (!<binding>.ok)` that tests THIS call's result, in the function the call
+ *    runs in — ⚠️ not merely somewhere in its block (#1144 close-out: an `if` moved into a nested
+ *    function nobody calls still satisfied a block-wide search);
+ *  - the release from a `finally` that runs after the call in that same function and releases this
+ *    call's claim — its binding, or the variable the binding is handed to (`claim = claimed`).
+ *    ⚠️ The first version accepted ANY `finally` in the file releasing a hardcoded name. */
+interface ClaimCall {
+  target: string | undefined;
+  kind: string | undefined;
+  /** The then-branch of `if (!<binding>.ok)` in the call's own function, when there is one. */
+  refusal: ts.Statement | undefined;
+  /** A `finally` after the call, in the same function, releases this claim. */
+  releasedInFinally: boolean;
+}
+
+function claimCalls(src: string, label: string): ClaimCall[] {
+  const sf = parseSource(src, label);
+  return callsTo(sf, 'acquireBuildClaim').map((call) => {
+    const opts = call.arguments.slice(1).filter(ts.isObjectLiteralExpression).pop();
+    const kindProp = opts?.properties.find(
+      (p): p is ts.PropertyAssignment => ts.isPropertyAssignment(p) && p.name.getText(sf) === 'kind',
+    );
+    const fn = enclosingFunction(call);
+    const inFn = (n: ts.Node): boolean => enclosingFunction(n) === fn;
+    const id = boundIdentifier(call);
+    const reads = id ? readsOf(id) : [];
+    // By symbol: `reads` are the identifiers resolving to THIS call's binding, so a same-named
+    // `claimed` in an inner block is not it — and nothing before the declaration can resolve to it.
+    const refusal = findNodes(fn, ts.isIfStatement).find((st) => {
+      const cond = st.expression;
+      return inFn(st)
+        && ts.isPrefixUnaryExpression(cond) && cond.operator === ts.SyntaxKind.ExclamationToken
+        && ts.isPropertyAccessExpression(cond.operand) && cond.operand.name.text === 'ok'
+        && ts.isIdentifier(cond.operand.expression) && reads.includes(cond.operand.expression);
+    })?.thenStatement;
+    // The DECLARATIONS this claim is held under: its binding, and any variable the binding is handed
+    // to (`claim = claimed`, `let claim = claimed`). Compared by declaration, not by spelling.
+    const holders = new Set<ts.Declaration>(id ? [id.parent as ts.Declaration] : []);
+    for (const r of reads) {
+      const p = r.parent;
+      if (ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.EqualsToken && p.right === r
+        && ts.isIdentifier(p.left)) {
+        const d = declarationOf(p.left);
+        if (d) holders.add(d);
+      }
+      if (ts.isVariableDeclaration(p) && p.initializer === r) holders.add(p);
+    }
+    // A `finally` that runs after the call — one that follows it, or one whose `try` encloses it —
+    // in the call's own function, releasing a holder DIRECTLY: a `release()` inside a function the
+    // `finally` merely defines is not run by it (#1144 close-out re-review).
+    const releasedInFinally = findNodes(fn, ts.isTryStatement).some((t) => inFn(t)
+      && !!t.finallyBlock && t.finallyBlock.pos > call.end
+      && callsTo(t.finallyBlock, 'release').some((c) => {
+        const callee = c.expression;
+        return enclosingFunction(c) === fn && ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.expression)
+          && holders.has(declarationOf(callee.expression)!);
+      }));
+    return {
+      target: call.arguments[0]?.getText(sf),
+      kind: kindProp && ts.isStringLiteralLike(kindProp.initializer) ? kindProp.initializer.text : undefined,
+      refusal,
+      releasedInFinally,
+    };
+  });
+}
+
+/** What a refusal branch DOES, from its own statements: the calls it makes by text, whether it
+ *  `continue`s, and whether it waits (a timer or a loop). */
+function refusalShape(branch: ts.Statement): { calls: string[]; continues: boolean; waits: boolean } {
+  const sf = branch.getSourceFile();
+  return {
+    calls: findNodes(branch, ts.isCallExpression).map((c) => c.getText(sf)),
+    continues: findNodes(branch, ts.isContinueStatement).length > 0,
+    waits: callsTo(branch, 'setTimeout', 'setInterval').length > 0
+      || findNodes(branch, (n): n is ts.IterationStatement => ts.isIterationStatement(n, false)).length > 0,
+  };
+}
+
+/** Every claim call's refusal, asserted per call — never "some call has one". */
+function refusalsOf(calls: ClaimCall[]): Array<{ target: string | undefined; shape: ReturnType<typeof refusalShape> }> {
+  expect(calls.length, 'no acquireBuildClaim call found — the scan would pass vacuously').toBeGreaterThan(0);
+  return calls.map((c) => {
+    expect(c.refusal, `the claim on ${c.target} has no \`if (!<claim>.ok)\` on its own result, in its own function`).toBeDefined();
+    return { target: c.target, shape: refusalShape(c.refusal!) };
+  });
+}
+
+describe('claimCalls reads each call from its own node, not a window (#1144)', () => {
+  it('a NEIGHBOURING call\'s `kind: \'cli\'`, refusal and release do not vouch for a call that has none', () => {
+    const src = [
+      "const first = acquireBuildClaim(root, 'a');",
+      'doSomething(first);',
+      'let claim = null;',
+      "const claimed = acquireBuildClaim(other, 'b', { kind: 'cli' });",
+      'if (!claimed.ok) {',
+      '  process.exit(1);',
+      '}',
+      'claim = claimed;',
+      'try { build(); } finally { claim?.release(); }',
+    ].join('\n');
+    expect(claimCalls(src, 'synthetic.mjs').map((c) => [c.target, c.kind, !!c.refusal, c.releasedInFinally])).toEqual([
+      ['root', undefined, false, false],
+      ['other', 'cli', true, true],
+    ]);
+  });
+
+  it('refusalsOf asserts EVERY call — one call\'s refusal does not cover a second call with none (#1144 close-out)', () => {
+    const src = "const claimed = acquireBuildClaim(root, 'a', { kind: 'cli' });\nif (!claimed.ok) process.exit(1);\n"
+      + "const second = acquireBuildClaim(sub, 'b', { kind: 'cli' });";
+    expect(() => refusalsOf(claimCalls(src, 'synthetic.mjs'))).toThrow(/the claim on sub has no/);
+  });
+
+  it('a refusal inside a nested function nobody calls is not this call\'s refusal (#1144 close-out)', () => {
+    const src = "const claimed = acquireBuildClaim(root, 'a', { kind: 'cli' });\nfunction never() { if (!claimed.ok) process.exit(1); }";
+    expect(claimCalls(src, 'synthetic.mjs')[0]!.refusal).toBeUndefined();
+  });
+
+  it('a finally BEFORE the call, or one releasing a different claim, does not release it', () => {
+    const before = "try { a(); } finally { claimed?.release(); }\nconst claimed = acquireBuildClaim(root, 'a');";
+    const other = "const claimed = acquireBuildClaim(root, 'a');\ntry { a(); } finally { otherClaim?.release(); }";
+    expect(claimCalls(before, 'synthetic.mjs')[0]!.releasedInFinally).toBe(false);
+    expect(claimCalls(other, 'synthetic.mjs')[0]!.releasedInFinally).toBe(false);
+  });
+
+  it('a release in a function the finally only DEFINES, or on a same-named shadow, is not a release (#1144 re-review)', () => {
+    const nested = "const claimed = acquireBuildClaim(root, 'a');\ntry { a(); } finally { const later = () => claimed.release(); }";
+    const shadow = "const claimed = acquireBuildClaim(root, 'a');\n{ const claimed = other(); try { a(); } finally { claimed.release(); } }";
+    expect(claimCalls(nested, 'synthetic.mjs')[0]!.releasedInFinally).toBe(false);
+    expect(claimCalls(shadow, 'synthetic.mjs')[0]!.releasedInFinally).toBe(false);
+  });
+
+  it('a finally whose try ENCLOSES the call releases it; a holder bound by declaration counts too', () => {
+    const enclosing = "let claim;\ntry { const claimed = acquireBuildClaim(root, 'a'); if (!claimed.ok) process.exit(1); claim = claimed; build(); } finally { claim?.release(); }";
+    const declared = "const claimed = acquireBuildClaim(root, 'a');\nlet held = claimed;\ntry { a(); } finally { held.release(); }";
+    expect(claimCalls(enclosing, 'synthetic.mjs')[0]!.releasedInFinally).toBe(true);
+    expect(claimCalls(declared, 'synthetic.mjs')[0]!.releasedInFinally).toBe(true);
+  });
+
+  it('the refusal tests THIS binding by symbol — an inner same-named `claimed` is a different claim', () => {
+    const src = "const claimed = acquireBuildClaim(root, 'a');\n{ const claimed = other(); if (!claimed.ok) process.exit(1); }";
+    expect(claimCalls(src, 'synthetic.mjs')[0]!.refusal).toBeUndefined();
+  });
+
+  it('a call whose arguments run long is still read whole (the window failed CLOSED here)', () => {
+    const src = `const claimed = acquireBuildClaim(root, \`${'x'.repeat(300)}\`, { kind: 'cli' });\nif (!claimed.ok) process.exit(1);`;
+    const [c] = claimCalls(src, 'synthetic.mjs');
+    expect([c!.kind, refusalShape(c!.refusal!).calls]).toEqual(['cli', ['process.exit(1)']]);
+  });
+});
+
 describe('build-web.mjs takes the cross-process build claim (#650)', () => {
   const src = readScannedSource(buildWeb).code;
 
@@ -35,24 +195,23 @@ describe('build-web.mjs takes the cross-process build claim (#650)', () => {
     expect(src).toMatch(/import\s*\{[^}]*acquireBuildClaim[^}]*\}\s*from\s*'\.\/buildClaimsStore\.mjs'/);
   });
 
+  const calls = claimCalls(src, 'build-web.mjs');
+
   it('calls acquireBuildClaim, marking itself a CLI holder', () => {
-    const idx = src.indexOf('acquireBuildClaim(');
-    expect(idx).toBeGreaterThan(-1);
-    expect(src.slice(idx, idx + 200)).toMatch(/kind:\s*'cli'/);
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.map((c) => c.kind)).toEqual(calls.map(() => 'cli'));
   });
 
   it('refuses and exits non-zero on a held claim, without blocking/waiting', () => {
-    const acquireIdx = src.indexOf('const claimed = acquireBuildClaim(');
-    expect(acquireIdx).toBeGreaterThan(-1);
-    const chunk = src.slice(acquireIdx, acquireIdx + 400);
-    expect(chunk).toMatch(/!claimed\.ok/);
-    expect(chunk).toMatch(/process\.exit\(1\)/);
-    // No retry/wait loop near the refusal — a scripted build must not hang on an interactive editor.
-    expect(chunk).not.toMatch(/setTimeout|while\s*\(/);
+    for (const { shape } of refusalsOf(calls)) {
+      expect(shape.calls).toContain('process.exit(1)');
+      // No retry/wait loop in the refusal — a scripted build must not hang on an interactive editor.
+      expect(shape.waits).toBe(false);
+    }
   });
 
-  it('releases the claim (via .release())', () => {
-    expect(src).toMatch(/buildClaim\?\.\s*release\(\)/);
+  it('releases the claim in a finally after it is taken', () => {
+    expect(calls.map((c) => c.releasedInFinally)).toEqual(calls.map(() => true));
   });
 
   it('acquires BEFORE validateProjectConfig — the first thing the build pipeline does', () => {
@@ -71,27 +230,24 @@ describe('add-native-targets.mjs takes the cross-process build claim (#650)', ()
     expect(src).toMatch(/import\s*\{[^}]*acquireBuildClaim[^}]*\}\s*from\s*'\.\/buildClaimsStore\.mjs'/);
   });
 
+  const calls = claimCalls(src, 'add-native-targets.mjs');
+
   it('calls acquireBuildClaim, marking itself a CLI holder', () => {
-    const idx = src.indexOf('acquireBuildClaim(');
-    expect(idx).toBeGreaterThan(-1);
-    expect(src.slice(idx, idx + 200)).toMatch(/kind:\s*'cli'/);
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.map((c) => c.kind)).toEqual(calls.map(() => 'cli'));
   });
 
   it('refuses (continues to the next project) rather than blocking, and marks the batch non-zero', () => {
-    const acquireIdx = src.indexOf('const claimed = acquireBuildClaim(');
-    expect(acquireIdx).toBeGreaterThan(-1);
-    const chunk = src.slice(acquireIdx, acquireIdx + 400);
-    expect(chunk).toMatch(/!claimed\.ok/);
-    expect(chunk).toMatch(/continue/);
-    expect(chunk).not.toMatch(/setTimeout|while\s*\(/);
+    for (const { shape } of refusalsOf(calls)) {
+      expect(shape.continues).toBe(true);
+      expect(shape.waits).toBe(false);
+    }
     expect(src).toMatch(/REFUSED/);
     expect(src).toMatch(/s\.startsWith\('FAILED'\)\s*\|\|\s*s\.startsWith\('REFUSED'\)/);
   });
 
   it('releases the claim in a finally, so every SKIP path (continue) still releases it', () => {
-    const finallyIdx = src.indexOf('} finally {');
-    expect(finallyIdx).toBeGreaterThan(-1);
-    expect(src.slice(finallyIdx, finallyIdx + 400)).toMatch(/claim\?\.\s*release\(\)/);
+    expect(calls.map((c) => c.releasedInFinally)).toEqual(calls.map(() => true));
   });
 
   it('acquires BEFORE reading project.config.json (any mutation, including scaffoldNativeTarget\'s own heals, follows)', () => {
@@ -121,23 +277,22 @@ describe('ota-publish.mjs takes the cross-process build claim (#650)', () => {
     expect(src).toMatch(/import\s*\{[^}]*acquireBuildClaim[^}]*\}\s*from\s*'\.\/buildClaimsStore\.mjs'/);
   });
 
-  it('calls acquireBuildClaim, marking itself a CLI holder', () => {
-    const idx = src.indexOf('acquireBuildClaim(');
-    expect(idx).toBeGreaterThan(-1);
-    expect(src.slice(idx, idx + 200)).toMatch(/kind:\s*'cli'/);
+  const calls = claimCalls(src, 'ota-publish.mjs');
+
+  it('calls acquireBuildClaim, marking itself a CLI holder — EVERY call, the sub-game dist\'s included', () => {
+    expect(calls.length).toBe(2);
+    expect(calls.map((c) => c.kind)).toEqual(['cli', 'cli']);
   });
 
-  it('refuses via fail() (which exits non-zero) rather than blocking/waiting', () => {
-    const acquireIdx = src.indexOf('const buildClaim = acquireBuildClaim(');
-    expect(acquireIdx).toBeGreaterThan(-1);
-    const chunk = src.slice(acquireIdx, acquireIdx + 200);
-    expect(chunk).toMatch(/!buildClaim\.ok/);
-    expect(chunk).toMatch(/fail\(/);
-    expect(chunk).not.toMatch(/setTimeout|while\s*\(/);
+  it('refuses via fail() (which exits non-zero) rather than blocking/waiting — on EVERY claim', () => {
+    for (const { shape } of refusalsOf(calls)) {
+      expect(shape.calls.some((t) => t.startsWith('fail('))).toBe(true);
+      expect(shape.waits).toBe(false);
+    }
   });
 
-  it('releases the claim in a finally', () => {
-    expect(src).toMatch(/\}\s*finally\s*\{\s*buildClaim\.release\(\);/);
+  it('releases EVERY claim in a finally after it is taken', () => {
+    expect(calls.map((c) => [c.target, c.releasedInFinally])).toEqual(calls.map((c) => [c.target, true]));
   });
 
   it('acquires BEFORE hashing/reading distDir (buildManifestFiles) and before any upload', () => {
@@ -180,20 +335,18 @@ describe('build-subgame.mjs takes the cross-process build claim (#650, #837)', (
     expect(src).toMatch(/import\s*\{[^}]*acquireBuildClaim[^}]*\}\s*from\s*'\.\/buildClaimsStore\.mjs'/);
   });
 
+  const calls = claimCalls(src, 'build-subgame.mjs');
+
   it('claims the RESOLVED sub-game project, marking itself a CLI holder', () => {
-    const idx = src.indexOf('acquireBuildClaim(');
-    expect(idx).toBeGreaterThan(-1);
-    expect(src.slice(idx, idx + 200)).toMatch(/acquireBuildClaim\(abs,/);
-    expect(src.slice(idx, idx + 200)).toMatch(/kind:\s*'cli'/);
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.map((c) => [c.target, c.kind])).toEqual(calls.map(() => ['abs', 'cli']));
   });
 
   it('refuses and exits non-zero on a held claim, without blocking/waiting', () => {
-    const acquireIdx = src.indexOf('const claimed = acquireBuildClaim(');
-    expect(acquireIdx).toBeGreaterThan(-1);
-    const chunk = src.slice(acquireIdx, acquireIdx + 300);
-    expect(chunk).toMatch(/!claimed\.ok/);
-    expect(chunk).toMatch(/process\.exit\(1\)/);
-    expect(chunk).not.toMatch(/setTimeout|while\s*\(/);
+    for (const { shape } of refusalsOf(calls)) {
+      expect(shape.calls).toContain('process.exit(1)');
+      expect(shape.waits).toBe(false);
+    }
   });
 
   it('releases the claim on the failure exit AND after a successful build', () => {

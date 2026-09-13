@@ -10,7 +10,7 @@
  *  at all — the plan exists because a previous fix was shipped against the wrong bottleneck. */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import * as fs from 'node:fs';
+import { readScannedSource } from '../helpers/sourceScanner';
 import * as path from 'node:path';
 import {
   recordFrame, getFrameProfile, resetFrameProfile, setProfilerFrameCap, getWorstStallWindow,
@@ -321,10 +321,9 @@ describe('frameProfiler — the two tolerances are separate numbers (#417)', () 
   // Negative-only where a comment could forge a pass: the bare-literal ban is a `not.toMatch`,
   // so a `1.2` reappearing inside a comment fails loudly, which is the safe direction.
   it('each branch of isVsyncBound names its own constant — no bare literal returns', () => {
-    const src = fs.readFileSync(
+    const src = readScannedSource(
       path.join(__dirname, '../../src/runtime/core/frameProfiler.ts'),
-      'utf8',
-    );
+    ).code;
     const fn = src.slice(src.indexOf('function isVsyncBound'));
     const body = fn.slice(0, fn.indexOf('\n}'));
     expect(body, 'the engine-cap branch must divide at the same constant as budgetMs')

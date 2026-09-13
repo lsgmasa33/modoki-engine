@@ -25,6 +25,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { readScannedSource } from '@modoki/engine/testing';
 import os from 'os';
 import fs from 'fs';
 import path from 'path';
@@ -343,9 +344,9 @@ describe("the dev server's no-client rejection stays DEFINITIVE, not ambiguous",
   // The string is read out of the source rather than copied here, so a reword is CHECKED rather
   // than silently duplicated — a hand-copy of a matcher input is the #867 hazard one layer out.
   it('the message it emits classifies as a definitively absent renderer', () => {
-    const src = fs.readFileSync(
-      path.join(__dirname, '../../plugins/vite-asset-scanner.ts'), 'utf-8',
-    );
+    const src = readScannedSource(
+      path.join(__dirname, '../../plugins/vite-asset-scanner.ts'),
+    ).code;
     const m = /Promise\.reject\(new Error\(`(no renderer connected[^`]*)`\)\)/.exec(src);
     expect(m, 'the no-client fast reject is gone from requestBrowser — headless callers now wait '
       + 'out a timeout, which every classifier must treat as AMBIGUOUS').not.toBeNull();

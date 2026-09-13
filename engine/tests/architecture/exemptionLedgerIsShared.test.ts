@@ -40,7 +40,8 @@
  *  (`assetTypeOrder`) and a skip branch of more than one statement (`getParamParity`, where a route
  *  that moved into the router would have stayed skipped) — so those arms were widened, and the
  *  `if (…) return false` form inside `.filter` with them. Both pardons were migrated; the widening
- *  added four non-pardons to RESIDUE (two scanner classifiers, one #1144 window, one Court partition).
+ *  added four non-pardons to RESIDUE (two scanner classifiers, one #1144 window — deleted when #1144
+ *  moved that classifier onto the AST — and one Court partition).
  *
  *  ## What it does NOT see — stated, not implied
  *
@@ -205,7 +206,6 @@ const RESIDUE: ReadonlyArray<{ item: string; count?: number; reason: string }> =
   { item: 'engine/tests/architecture/corpusConsumerPins.test.ts::PINS', reason: 'CLASSIFIER — the patterns that count as a non-vacuity pin' },
   { item: 'engine/packages/modoki/tests/helpers/sourceScanner.ts::REGEX_PRECEDERS', reason: 'CLASSIFIER — the characters after which `/` opens a regex literal; the branch that ends in `continue` CONSUMES it' },
   { item: 'engine/packages/modoki/tests/helpers/sourceScanner.ts::REGEX_KEYWORDS', reason: 'CLASSIFIER — the keywords after which `/` opens a regex literal; same branch as REGEX_PRECEDERS' },
-  { item: 'engine/tests/architecture/commentStripperIsShared.test.ts::WRAPPED_BEFORE', reason: 'CLASSIFIER — the call shapes that make a raw read already routed; a fixed-width window, which is #1144\'s class, not this one' },
   { item: 'engine/tests/architecture/pluginMethodParity.test.ts::BUILTIN_LISTENER_METHODS', reason: 'VOCABULARY — Capacitor\'s built-in listener methods, never plugin methods to pair' },
   { item: 'engine/tests/architecture/qaCaseReferences.test.ts::DERIVED_FAMILY_TEMPLATES', reason: 'CLASSIFIER — id templates whose members are derived rather than typed' },
   { item: 'engine/tests/architecture/qaCaseReferences.test.ts::PROJECT_SETTINGS_UNTAGGED_CONTROL_KINDS', reason: 'MODEL — control kinds handed whole to a sub-editor with no uiId, so they emit no id' },

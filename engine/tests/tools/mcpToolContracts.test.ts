@@ -12,10 +12,10 @@
  *  an observation alone has nothing to check against.
  */
 
-import fs from 'node:fs';
 import path from 'node:path';
 import { z } from '../../tools/modoki-mcp/node_modules/zod';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { readScannedSource } from '@modoki/engine/testing';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { CONTRACTS, contractFor } from '../../tools/modoki-mcp/src/contracts';
 import { getTool } from '../../tools/modoki-mcp/src/registry';
@@ -307,9 +307,9 @@ describe('tool contracts', () => {
    *  (the entity ops go through the editor store), and asserting that way round would produce false
    *  failures instead of catching real ones. */
   it('an agent op that pushes an undo entry is DECLARED undoable', () => {
-    const opsSrc = fs.readFileSync(
-      path.join(__dirname, '../../app/editor/agentEditorOps.ts'), 'utf-8',
-    );
+    const opsSrc = readScannedSource(
+      path.join(__dirname, '../../app/editor/agentEditorOps.ts'),
+    ).code;
     // Split on the op registrations: each chunk runs from one op's name to the next registration,
     // so it IS that op's body. `.slice(1)` drops the preamble, which is where `pushAssetUndo` is
     // DEFINED — counting its own definition would mark the first op as pushing.

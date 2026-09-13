@@ -1656,10 +1656,9 @@ describe('qa case guard helpers', () => {
       // real panel rather than a hand-typed fixture is what gives this teeth: if the row's
       // spelling changes again, this goes red instead of the guard silently forgetting the
       // family. Same argument as the `useFieldId` test above.
-      const panel = readFileSync(
+      const panel = readScannedSource(
         join(REPO_ROOT, 'engine/packages/modoki/src/editor/panels/Hierarchy.tsx'),
-        'utf8',
-      );
+      ).code;
       const { prefixes, patterns } = knownUiIds([panel]);
       expect(prefixes).toContain('hierarchy.entity.');
       const known = (id: string) => patterns.some((p) => p.test(id));
@@ -1806,10 +1805,9 @@ describe('qa case guard helpers', () => {
     });
 
     it('animation.viewMode — from the REAL TrackList tuple', () => {
-      const src = readFileSync(
+      const src = readScannedSource(
         join(REPO_ROOT, 'engine/packages/modoki/src/editor/panels/animation/TrackList.tsx'),
-        'utf8',
-      );
+      ).code;
       const { ids, patterns } = knownUiIds([src]);
       const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
       expect(known('animation.viewMode.dopesheet')).toBe(true);
@@ -1818,10 +1816,9 @@ describe('qa case guard helpers', () => {
     });
 
     it('sceneView.toolbar.gizmo — from the REAL gizmoModes array', () => {
-      const src = readFileSync(
+      const src = readScannedSource(
         join(REPO_ROOT, 'engine/packages/modoki/src/editor/panels/SceneView.tsx'),
-        'utf8',
-      );
+      ).code;
       const { ids, patterns } = knownUiIds([src]);
       const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
       expect(known('sceneView.toolbar.gizmo.translate')).toBe(true);
@@ -1831,10 +1828,9 @@ describe('qa case guard helpers', () => {
     });
 
     it('gameView.devicePicker.device — from the REAL device catalog', () => {
-      const src = readFileSync(
+      const src = readScannedSource(
         join(REPO_ROOT, 'engine/packages/modoki/src/editor/scene/devicePresets.ts'),
-        'utf8',
-      );
+      ).code;
       const { ids, patterns } = knownUiIds([src]);
       const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
       expect(known('gameView.devicePicker.device.Free')).toBe(true);
@@ -1845,10 +1841,9 @@ describe('qa case guard helpers', () => {
     });
 
     it('module-toggles — from the REAL MODULES × OPTIONS arrays', () => {
-      const src = readFileSync(
+      const src = readScannedSource(
         join(REPO_ROOT, 'engine/packages/modoki/src/editor/panels/ModuleTogglesEditor.tsx'),
-        'utf8',
-      );
+      ).code;
       const { ids, patterns } = knownUiIds([src]);
       const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
       expect(known('module-toggles.render3d.auto')).toBe(true);
@@ -1858,14 +1853,12 @@ describe('qa case guard helpers', () => {
     });
 
     it('quality-tiers.* — from the REAL editor + model files, mutation-checked exactly as named in the brief', () => {
-      const editorSrc = readFileSync(
+      const editorSrc = readScannedSource(
         join(REPO_ROOT, 'engine/packages/modoki/src/editor/panels/QualityTiersEditor.tsx'),
-        'utf8',
-      );
-      const modelSrc = readFileSync(
+      ).code;
+      const modelSrc = readScannedSource(
         join(REPO_ROOT, 'engine/packages/modoki/src/editor/panels/qualityTiersModel.ts'),
-        'utf8',
-      );
+      ).code;
       const { ids, patterns } = knownUiIds([editorSrc, modelSrc]);
       const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
       expect(known('quality-tiers.field.mid.pixelRatioCap')).toBe(true);
@@ -1965,10 +1958,9 @@ describe('qa case guard helpers', () => {
 
       // I: a quote-bearing device name (`iPad Pro 11"`) — CITED_UI_ID_RE only, not `knownUiIds`
       // itself, so exercised against the REAL device catalog + the regex directly.
-      const devicePresetsSrc = readFileSync(
+      const devicePresetsSrc = readScannedSource(
         join(REPO_ROOT, 'engine/packages/modoki/src/editor/scene/devicePresets.ts'),
-        'utf8',
-      );
+      ).code;
       const { ids: deviceIds, patterns: devicePatterns } = knownUiIds([devicePresetsSrc]);
       const knownDevice = (id: string) => deviceIds.has(id) || devicePatterns.some((p) => p.test(id));
       expect(knownDevice('gameView.devicePicker.device.iPad Pro 11"')).toBe(true);
@@ -1982,10 +1974,9 @@ describe('qa case guard helpers', () => {
       // then returns [], and because `DERIVED_FAMILY_TEMPLATES` already removed the shape
       // pattern, a previously-good citation must now be UNKNOWN rather than quietly still passing
       // on the shape it used to fall back to. This is rule 1's whole point: fail closed, not open.
-      const renamed = readFileSync(
+      const renamed = readScannedSource(
         join(REPO_ROOT, 'engine/packages/modoki/src/editor/panels/SceneView.tsx'),
-        'utf8',
-      ).replace(/gizmoModes/g, 'renamedGizmoModes');
+      ).code.replace(/gizmoModes/g, 'renamedGizmoModes');
       const { ids, patterns } = knownUiIds([renamed]);
       const known = (id: string) => ids.has(id) || patterns.some((p) => p.test(id));
       expect(sceneViewGizmoIds(renamed)).toEqual([]);

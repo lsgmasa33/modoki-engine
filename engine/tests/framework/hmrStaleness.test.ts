@@ -16,6 +16,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { readScannedSource } from '@modoki/engine/testing';
 import type { HotLike } from '../../app/debug/hmrStaleness';
 
 // Type-only reference (not a value import) — keeps this test file, like the module it covers,
@@ -341,12 +342,10 @@ describe('the countdown names the ACTUAL cause, not a fixed one (#850)', () => {
 
 describe('layering — this module has no direct editor-state import (#850)', () => {
   it('imports @modoki/engine only via the guarded dynamic import, never statically', async () => {
-    const fs = await import('node:fs');
     const path = await import('node:path');
-    const src = fs.readFileSync(
+    const src = readScannedSource(
       path.join(__dirname, '../../app/debug/hmrStaleness.ts'),
-      'utf8',
-    );
+    ).code;
 
     // Positive control: the dynamic imports must actually be present in the source — a check
     // that would pass just as well against a file importing nothing proves nothing.

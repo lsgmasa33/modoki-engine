@@ -15,7 +15,6 @@
  *  Asserted on the plain decision function rather than a mounted dialog, per `docs/editor.md`
  *  § Panels: mounting a modal in jsdom asserts the mock. */
 import { describe, it, expect } from 'vitest';
-import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
 import { readUnusedStaleness } from '@modoki/engine/editor';
@@ -120,19 +119,17 @@ describe('the CONSUMER is wired — the half a pure-function test cannot reach',
     // and the orphan list holds a minHeight, so on a busy editor an uncapped banner pushes the
     // footer outside the box with nothing to scroll. The `warnings` block below it caps itself for
     // exactly this reason; this one must too.
-    // ⚠️ RAW source here, not the comment-stripped `dialog` above — this assertion is about a
-    // STYLE PROPERTY, and stripping shifts offsets by however much prose the style block carries,
-    // which made a fixed window miss it. The two assertions below name properties no comment in
-    // that block uses, so the raw read costs nothing.
-    const raw = fs.readFileSync(
-      path.join(REPO, 'engine/packages/modoki/src/editor/panels/CleanupAssetsDialog.tsx'), 'utf-8',
-    );
-    const at = raw.indexOf('data-testid="cleanup-stale"');
+    // The comment-stripped `dialog` above, not a second raw read (#1144). A raw read was here on the
+    // belief that stripping "shifts offsets by however much prose the style block carries" — it
+    // does not: the strip blanks comments in place and preserves length. The raw read only let a
+    // comment's `}}` or `>` end the banner early, and it hid from the raw-read rule behind a
+    // trailing comma after `'utf-8'`.
+    const at = dialog.indexOf('data-testid="cleanup-stale"');
     expect(at, 'the stale banner is gone or renamed — re-point this guard').toBeGreaterThan(-1);
     // Its own element only. Bounded on purpose rather than scanning the file: the `warnings` block
     // further down carries both properties, so a file-wide match would pass for a banner with
     // neither — the guard would be green about the wrong element.
-    const banner = raw.slice(at, raw.indexOf('>', raw.indexOf('}}', at)));
+    const banner = dialog.slice(at, dialog.indexOf('>', dialog.indexOf('}}', at)));
     expect(/maxHeight/.test(banner), 'the banner needs a maxHeight').toBe(true);
     expect(/overflowY/.test(banner), 'and something to scroll with').toBe(true);
   });
