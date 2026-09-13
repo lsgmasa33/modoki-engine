@@ -100,6 +100,22 @@ describe('assertExemptionLedger (#1123)', () => {
     })).toThrow(/below the floor of 2/);
   });
 
+  it('names the rows that now find NOTHING when the population falls below the floor (#1128)', () => {
+    // The OTHER cause of a floor failure: every exempt occurrence was fixed. "The detector stopped
+    // matching" alone sends the author to debug a working detector — the message must also say
+    // "delete these rows", naming them. And it must NOT name a row that still finds something.
+    const fixedEverything = (): void => assertExemptionLedger({
+      ...ledger,
+      population: [at('kept.ts', 'kept.ts:4')],
+      exempt: [
+        { item: 'gone.ts', reason: 'its one occurrence was just fixed' },
+        { item: 'kept.ts', reason: 'still present' },
+      ],
+    });
+    expect(fixedEverything).toThrow(/delete the rows[^]*gone\.ts/);
+    expect(fixedEverything).not.toThrow(/delete the rows[^]*kept\.ts/);
+  });
+
   it('ACCEPTS a sanctioned item without a reason, and does not count it against anything', () => {
     expect(() => assertExemptionLedger({
       ...ledger,

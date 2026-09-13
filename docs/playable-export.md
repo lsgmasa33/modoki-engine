@@ -141,6 +141,39 @@ removes nothing" below for the two that were not, and why they are gone rather t
   one. It is the same resolution a normal build needs under a non-root `webBasePath`, which is the
   only reason the bug was invisible outside the playable.
 
+- ⚠️ **A creative must not contain an AD BANNER — and a scene cannot branch on the build target, so
+  this is a RUNTIME gate** (#1108). An MRAID creative has no ad SDK and never will, so a banner
+  placeholder there is not "an unfilled banner": `games/wordweave` shipped an opaque grey strip
+  labelled `Banner ad — 320x50` across **9.1%** of the ad, with the Install CTA drawn on top of it,
+  and the game *also* gave up that strip as layout reserve — so the creative paid for it twice.
+  Nothing build-time can remove it: `asset-keep.json` drops whole FILES, and per the warning above,
+  scene data cannot read a define. The fix is `if (__MODOKI_PLAYABLE__)` in the game's own runtime,
+  hiding the slot with one `patchUI(..., { isVisible: false })` (`UINode` renders `null` for a falsy
+  `isVisible`, so the label subtree goes with it).
+
+  ⚠️ **Hide the placeholder, but do NOT reclaim its space — the CTA lives there.**
+  `PlayableOverlay`'s Install pill is always on, `position: fixed` at `bottom: max(16px,
+  env(safe-area-inset-bottom))`, `zIndex: 2147483000`. wordweave reclaimed the strip for one commit
+  and it was strictly worse than the placeholder: measured at 390x844, the letter board moved down
+  ~77 CSS px and the pill covered a whole tile — `elementFromPoint` at its centre returned the
+  Install button and a tap fired `mraid.open`, so a letter the level's own target word needed became
+  invisible, undraggable, and an exit from the ad. **On a playable, a bottom banner reserve is CTA
+  clearance.** Keep it; only what occupies it changes.
+
+  ⚠️ **Keeping it is necessary and NOT sufficient, because the two quantities scale differently.**
+  The pill's demand is fixed CSS px — 41 px tall at `bottom: max(16px, env(safe-area-inset-bottom))`,
+  so **57 px** at zero inset — while a banner reserve is a host PERCENTAGE. For the 9.1% Court and
+  wordweave both author, clearance holds only above a viewport height of about **626 px** (or 451 px
+  once the safe-area inset is ≥ 16 px). Below that the pill overhangs into the game: measured on
+  wordweave's creative, 5 px short at 320x568 and **22 px short at 844x390**, where the bottom
+  letter row's middle glyph sits behind the pill. A project authoring a SMALLER banner percentage
+  crosses that line on a taller screen. The requirement lives in `PlayableOverlay.tsx` (CSS px) and
+  the supply in the scene's `AdBannerSlot.height` (host %), with nothing tying them — #1139.
+
+  ⚠️ And do not reach for "just zero the reserve" as the reclaim either: in a flex band solver that
+  hands the freed height to the split, so the band you were protecting grows too (wordweave
+  measured board +91, crossword +84 of 175). Two failures from one simplification.
+
 - **Gating `App.tsx`'s entry is NOT enough — one other reachable import re-roots the whole SDK**
   (#214). `games/space-invader` sets `render3d: false`, and the toggle genuinely reached the shell
   (the built bundle folds the boot condition, `Scene3D` really is `null`) — yet it still shipped a
@@ -329,7 +362,10 @@ removes nothing" below for the two that were not, and why they are gone rather t
 
 - **`npm run smoke:playable`** — builds the `space-invader` artifact and drives it in headless Chromium:
   self-extract, WebGL render, the `fflate` fallback, no-autoplay + unmute-on-tap, the MRAID viewable gate,
-  `mraid.open` CTA, and orientation reflow. Keep it in the loop for changes under `inlinePlayable.ts`,
+  `mraid.open` CTA, orientation reflow, and **no ad-banner placeholder in the creative** (check 1h,
+  #1108 — matched on rendered TEXT, because a geometry rule cannot tell a fake banner from a
+  legitimate bottom HUD row and would need an allowlist on day one; it cannot see an untexted or
+  canvas-drawn placeholder). Keep it in the loop for changes under `inlinePlayable.ts`,
   `app/playable/**`, or the `VITE_PLAYABLE` path in `vite.config.ts` — it has caught bugs the unit suite missed.
 - **Unit:** `inlinePlayable.test.ts`, `bootPlayable.test.tsx`, `mraid.test.ts`, `playableOverlay.test.tsx`,
   `hostCanvas.test.tsx`, `audioCueRetry.test.ts`.

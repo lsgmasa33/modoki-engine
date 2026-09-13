@@ -35,6 +35,7 @@ import { describe, it, expect } from 'vitest';
 import path from 'node:path';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { readScannedSource } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 
 const SRC = path.resolve(__dirname, '../../packages/modoki/src/editor');
 const read = (rel: string) => readScannedSource(path.join(SRC, rel)).code;
@@ -75,6 +76,14 @@ const HELPER_FILE = 'scene/pendingMeta.ts';
 interface Exemption {
   /** Why this file cannot route its read through `readMetaPreferringPark`. */
   reason: string;
+  /** How many raw `/api/read-meta` reaches this row pardons (default 1) — #1128.
+   *
+   *  ⚠️ **The one declared property this interface never made.** Every other field here is
+   *  checked, but the file itself was skipped whole (`rel in EXEMPT`), so a SECOND raw read added to
+   *  `VideoAssetView.tsx` — one that seeds nothing and stamps nothing — was green, vouched for by
+   *  `baseline`/`fallback`/`readPath` values that only ever described the first. Now each reach is
+   *  spent against this count, so a second one has to be declared, and read against these fields. */
+  count?: number;
   /** `'seeds'` — this file still records the CAS baseline itself, via `noteMetaReadResult`
    *  (asserted below). `'none'` — it establishes no baseline, and `costs` says why that is safe. */
   baseline: 'seeds' | 'none';
@@ -162,7 +171,16 @@ const EXEMPT: Record<string, Exemption> = {
  *  would never match either shape, which is exactly the false-negative direction that makes a
  *  forbidden-pattern guard useless. */
 function hasRawReadMetaFetch(code: string): boolean {
-  return code.includes('/api/read-meta');
+  return rawReadMetaFetchCount(code) > 0;
+}
+
+/** How many raw `/api/read-meta` literals `code` holds — the per-occurrence form the ledger spends
+ *  (#1128). ⚠️ The ban counts THROUGH this and `hasRawReadMetaFetch` is its non-emptiness, so the
+ *  accept/reject pins below exercise the detector the ban actually uses: a widened detector cannot
+ *  move those pins while the ban stays put (close-out review). Counts literals, not requests — a
+ *  helper holding one literal and called twice is one. */
+function rawReadMetaFetchCount(code: string): number {
+  return code.split('/api/read-meta').length - 1;
 }
 
 /** `true` if `code` (already comment-stripped) CALLS `noteMetaReadResult` (#871).
@@ -206,37 +224,36 @@ describe('.meta.json reads prefer the pending park (#845 close-out)', () => {
     expect(editorSourceFiles().length).toBeGreaterThan(150);
   });
 
-  it('every raw /api/read-meta fetch is the helper file or a declared exemption', () => {
-    const offenders = editorSourceFiles()
-      .filter((rel) => rel !== HELPER_FILE && !(rel in EXEMPT))
-      .filter((rel) => hasRawReadMetaFetch(read(rel)));
-    expect(
-      offenders,
-      [
-        'These files fetch /api/read-meta directly instead of through readMetaPreferringPark',
-        '(scene/pendingMeta.ts), so a still-parked edit for the same path is invisible to them —',
-        'either the decision they make from it, or the full document they write back, silently',
+  it('every raw /api/read-meta fetch is the helper file or a declared exemption — counted per reach', () => {
+    const reaches: Array<{ item: string; site: string }> = [];
+    for (const rel of editorSourceFiles()) {
+      read(rel).split('\n').forEach((line, i) => {
+        for (let n = rawReadMetaFetchCount(line); n > 0; n--) reaches.push({ item: rel, site: `${rel}:${i + 1}` });
+      });
+    }
+    assertExemptionLedger({
+      label: 'EXEMPT in metaReadPreferringPark',
+      population: reaches,
+      exempt: Object.entries(EXEMPT).map(([item, ex]) => ({ item, count: ex.count, reason: ex.reason })),
+      sanctioned: [HELPER_FILE],
+      // Liveness is the helper's own reach (`sanctioned` is staleness-checked, and the premise test
+      // below pins it separately); an exact floor would report every legitimate fix as a dead
+      // detector instead of as the over-blessed row it is.
+      floor: 1,
+      fix: [
+        'This fetches /api/read-meta directly instead of through readMetaPreferringPark',
+        '(scene/pendingMeta.ts), so a still-parked edit for the same path is invisible to it —',
+        'either the decision it makes from it, or the full document it writes back, silently',
         'reverts to the pre-edit disk state the moment a park exists for the same path. Route the',
         'read through readMetaPreferringPark, or add a verified exemption to EXEMPT above.',
-        '',
-        ...offenders,
       ].join('\n'),
-    ).toEqual([]);
+    });
   });
 
   it('the helper file really does carry the one raw fetch — the premise this rule rests on', () => {
     // A guard whose "forbidden" side is vacuous because its own reference case was never real
     // proves nothing — same lesson as metaMergeNotClobber's "the server really does REPLACE" check.
     expect(hasRawReadMetaFetch(read(HELPER_FILE))).toBe(true);
-  });
-
-  it('every exemption still has a raw fetch to exempt — a stale exemption hides nothing', () => {
-    const stale = Object.keys(EXEMPT).filter((rel) => !hasRawReadMetaFetch(read(rel)));
-    expect(
-      stale,
-      'These exemptions no longer have a raw /api/read-meta fetch — either the file was already '
-      + 'migrated to the helper (drop the entry) or this points at the wrong file.',
-    ).toEqual([]);
   });
 
   /** #871 — the assertion the prose reason could not make.

@@ -17,6 +17,7 @@ import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { stripComments, assertScanIsSane } from '../helpers/sourceScanner';
+import { assertExemptionLedger } from '../helpers/exemptionLedger';
 import { repoFiles } from '../../../../scripts/repoCorpus.mjs';
 
 const HERE = fileURLToPath(new URL('.', import.meta.url));
@@ -35,18 +36,52 @@ const FORBIDDEN = /navigator\.getGamepads|\bgetGamepads\s*\(|addEventListener\(\
  *  needs pointer input reads the Input accessors (`pointerPressed`/`pointerDrag`/…). */
 const FORBIDDEN_POINTER = /addEventListener\(\s*['"](pointer|mouse|touch)/;
 
-/** Repo-relative files permitted to read raw input, each for a documented reason.
+/** Raw input reads (the `FORBIDDEN` ban) permitted in a file, each for a documented reason.
  *  Keep this SMALL — a new gameplay/UI entry almost certainly means input should be
- *  routed through the Input resource instead. */
-const ALLOW = new Set<string>([
-  // Dev-only debug menu toggled by Ctrl/Cmd+Shift+D — editor tooling, not gameplay
-  // input feeding traits, so it stays a direct window listener.
-  'games/3d-test/runtime/ui/DebugMenu.tsx',
-  // Engine in-game debug menu, toggled by F12 / 3-finger tap — a debug-overlay UI
-  // gesture (build-flag-gated, tree-shaken out when off), not gameplay input feeding
-  // traits, so it stays a direct window listener. See docs/debug-menu.md.
-  'engine/packages/modoki/src/runtime/debug/DebugMenu.tsx',
-]);
+ *  routed through the Input resource instead.
+ *
+ *  ⚠️ **Per OCCURRENCE and per BAN (#1123/#1128).** This was one `Set<file>` consulted by BOTH
+ *  guards below, so a row reasoned about a keyboard toggle also pardoned any raw POINTER listener
+ *  added to the same file, and either file could gain a second, gameplay-feeding key listener under
+ *  a reason about a debug menu. Rows now key `file::token`, carry a count, and apply to
+ *  `FORBIDDEN` only; `FORBIDDEN_POINTER` has no pardons at all. */
+const ALLOW: ReadonlyArray<{ item: string; count?: number; reason: string }> = [
+  {
+    item: "games/3d-test/runtime/ui/DebugMenu.tsx::addEventListener('keydown'",
+    reason: 'Dev-only debug menu toggled by Ctrl/Cmd+Shift+D — editor tooling, not gameplay input '
+      + 'feeding traits, so it stays a direct window listener.',
+  },
+  {
+    item: "engine/packages/modoki/src/runtime/debug/DebugMenu.tsx::addEventListener('keydown'",
+    reason: 'Engine in-game debug menu, toggled by F12 / 3-finger tap — a debug-overlay UI gesture '
+      + '(build-flag-gated, tree-shaken out when off), not gameplay input feeding traits, so it '
+      + 'stays a direct window listener. See docs/debug-menu.md.',
+  },
+];
+
+/** The FILE a row names — for the snapshot filter and the "reached" pin below. */
+const rowFile = (item: string): string => item.slice(0, item.indexOf('::'));
+
+/** Every match of `re` in `f.code`, one entry per occurrence. The token is the match with its
+ *  whitespace dropped and quotes spelled `'`, so a re-spelling cannot dodge a row.
+ *
+ *  ⚠️ **Matched over the WHOLE file, never line by line.** Both bans rely on `\s*` after the `(`,
+ *  which must cross a newline: a formatter wraps `addEventListener(\n  'keydown',` routinely. The
+ *  first per-occurrence version split on `\n` first and went green on exactly that shape, where the
+ *  old whole-file `.test()` had been red (close-out review of #1128). The line is derived from the
+ *  match offset instead. */
+function occurrences(files: { rel: string; code: string }[], re: RegExp): Array<{ item: string; site: string }> {
+  const all = new RegExp(re.source, 'g');
+  const out: Array<{ item: string; site: string }> = [];
+  for (const f of files) {
+    for (const m of f.code.matchAll(all)) {
+      const token = m[0].replace(/\s+/g, '').replace(/"/g, "'");
+      const line = f.code.slice(0, m.index).split('\n').length;
+      out.push({ item: `${f.rel}::${token}`, site: `${f.rel}:${line} — ${token}` });
+    }
+  }
+  return out;
+}
 
 // Comment stripping is the shared scanner (#419) — see sourceScanner.ts.
 
@@ -97,25 +132,48 @@ describe('input source guard (Part A6)', () => {
   });
 
   it('no raw DOM/gamepad input reads outside runtime/input/ sources', () => {
-    const offenders = [...engine, ...games]
-      .filter((f) => FORBIDDEN.test(f.code))
-      .map((f) => f.rel)
-      .filter((rel) => !ALLOW.has(rel));
-    expect(
-      offenders,
-      `read input from the Input ECS resource instead, or (if genuinely a source) put it under runtime/input/. Reviewed exceptions go in ALLOW:\n${offenders.join('\n')}`,
-    ).toEqual([]);
+    assertExemptionLedger({
+      label: 'ALLOW in inputSourceGuard',
+      population: occurrences([...engine, ...games], FORBIDDEN),
+      // A checkout with no `games/` (the public OSS snapshot) reaches no games file, so a games row
+      // there is not over-blessed — it names a root this checkout does not have.
+      exempt: ALLOW.filter((r) => (rowFile(r.item).startsWith('games/') ? games.length > 0 : true)),
+      // The engine DebugMenu's own listener is always present, snapshot included; liveness beyond
+      // that is the engine-scan pin below.
+      floor: 1,
+      fix: 'read input from the Input ECS resource instead, or (if genuinely a source) put it under '
+        + 'runtime/input/. A reviewed exception goes in ALLOW, per occurrence, with its reason.',
+    });
   });
 
   it('no raw pointer/mouse/touch listeners in game runtimes (use the Input pointer source)', () => {
-    const offenders = games
-      .filter((f) => FORBIDDEN_POINTER.test(f.code))
-      .map((f) => f.rel)
-      .filter((rel) => !ALLOW.has(rel));
+    // No ledger: nothing is pardoned from this ban, and a pardon for it must be written as its OWN
+    // row set — never borrowed from `ALLOW`, which is how a keyboard reason used to cover it.
+    const offenders = occurrences(games, FORBIDDEN_POINTER).map((o) => o.site);
     expect(
       offenders,
       `read tap/drag from the Input resource (pointerPressed/pointerDown/pointerDrag/…) instead of adding raw pointer listeners:\n${offenders.join('\n')}`,
     ).toEqual([]);
+  });
+
+  it('the pointer detector is alive — it flags a raw listener and ignores the Input accessors (synthetic)', () => {
+    // The ban above has no population on a clean tree, so its detector could stop matching with
+    // nothing going red. Pin both sides on synthetic input instead of a count of survivors.
+    const raw = [{ rel: 'games/x/runtime/a.ts', code: "el.addEventListener( \"pointerdown\", f);\nel.addEventListener('touchmove', g);" }];
+    expect(occurrences(raw, FORBIDDEN_POINTER).map((o) => o.item)).toEqual([
+      "games/x/runtime/a.ts::addEventListener('pointer",
+      "games/x/runtime/a.ts::addEventListener('touch",
+    ]);
+    expect(occurrences([{ rel: 'games/x/runtime/b.ts', code: 'if (pointerPressed(world)) jump();' }], FORBIDDEN_POINTER)).toEqual([]);
+  });
+
+  it('both detectors see a listener a formatter WRAPPED across lines (synthetic)', () => {
+    // The shape a per-line match cannot see — see `occurrences`. Same token as the one-line spelling,
+    // so a wrapped call spends (or fails) the same row rather than dodging it.
+    const wrapped = "window.addEventListener(\n  'keydown',\n  onKey,\n);\nel.addEventListener(\n  \"pointerup\", f);";
+    const f = [{ rel: 'games/x/runtime/c.ts', code: wrapped }];
+    expect(occurrences(f, FORBIDDEN).map((o) => o.site)).toEqual(["games/x/runtime/c.ts:1 — addEventListener('keydown'"]);
+    expect(occurrences(f, FORBIDDEN_POINTER).map((o) => o.site)).toEqual(["games/x/runtime/c.ts:5 — addEventListener('pointer"]);
   });
 
   // ── (#866) Non-vacuity pins ────────────────────────────────────────────────────────────────
@@ -138,7 +196,7 @@ describe('input source guard (Part A6)', () => {
     const scanned = new Set([...engine, ...games].map((f) => f.rel));
     // A checkout with no `games/` (the public OSS snapshot) legitimately reaches no games file, so
     // only the keys whose root was actually scanned are required to match.
-    const required = [...ALLOW].filter((k) => (k.startsWith('games/') ? games.length > 0 : true));
+    const required = ALLOW.map((r) => rowFile(r.item)).filter((k) => (k.startsWith('games/') ? games.length > 0 : true));
     const unmatched = required.filter((k) => !scanned.has(k));
     expect(
       unmatched,
@@ -149,6 +207,6 @@ describe('input source guard (Part A6)', () => {
   });
 
   it('the allowlist stays small (review pressure)', () => {
-    expect(ALLOW.size).toBeLessThanOrEqual(2);
+    expect(ALLOW.reduce((n, r) => n + (r.count ?? 1), 0)).toBeLessThanOrEqual(2);
   });
 });

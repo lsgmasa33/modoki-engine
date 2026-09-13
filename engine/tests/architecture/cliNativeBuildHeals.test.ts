@@ -33,6 +33,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readScannedSource } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -476,25 +477,37 @@ describe('build-web.mjs warns (never silently) when the project-config gate cann
  *
  *  The allowlist is a CLAIM too, so each entry states why it is not a loader rather than just
  *  naming a file. */
-const DIRECT_ESBUILD_ALLOWED = new Map([
-  ['engine/scripts/loadVendorPlugins.mjs',
-    'IS the seam — the one bundle-to-temp-and-import in the repo.'],
-  ['engine/scripts/build-electron.mjs',
-    'Not a loader: it esbuild-BUNDLES Electron main + the MCP entry to shippable `outfile`s. It '
-    + 'never imports what it builds, so there is nothing here to route through the seam.'],
-  ['engine/scripts/stage-vite-config.cjs',
-    'Not a loader, same category as build-electron.mjs: it esbuild-BUNDLES engine/vite.config.ts to '
-    + 'a persistent, shipped engine/vite.config.cjs for the packaged editor (#326). It never '
-    + 'imports what it builds.'],
-  ['engine/scripts/migrate-meta-sidecars.mjs',
-    'IS a third copy of the mechanism, not merely a third shape — its `execFileSync("npx", '
-    + '["esbuild", …])` writes a temp `outFile` which it then `await import(pathToFileURL(outFile))`s: '
-    + 'the same bundle-to-temp-and-import, driven through a subprocess. (Cited by SYMBOL, not line '
-    + 'number — this branch ruled in a8fb0dfca that a line number rots silently, and docCitations '
-    + 'only enforces that under docs/.) Left out of #827 DELIBERATELY (a '
-    + 'one-off migration with no preamble and no build claim), which is a scope call, not an '
-    + 'absolution: this entry exists so the next sweep reads "deferred", never "not an instance".'],
-]);
+/** The seam itself — structural, not a pardon: `loadVendorPlugins.mjs` IS the one
+ *  bundle-to-temp-and-import in the repo, so its specifier is the thing every other script routes
+ *  through. Still staleness-checked, which is also what proves the detector is alive. */
+const SEAM_SPECIFIERS: readonly string[] = ['engine/scripts/loadVendorPlugins.mjs::esbuild'];
+
+/** Keyed `file::specifier` and counted (#1128) — one row per esbuild specifier a script may name,
+ *  measured at ONE each on 2026-09-13. */
+const DIRECT_ESBUILD_ALLOWED: ReadonlyArray<{ item: string; count?: number; reason: string }> = [
+  {
+    item: 'engine/scripts/build-electron.mjs::esbuild',
+    reason: 'Not a loader: it esbuild-BUNDLES Electron main + the MCP entry to shippable `outfile`s. It '
+      + 'never imports what it builds, so there is nothing here to route through the seam.',
+  },
+  {
+    item: 'engine/scripts/stage-vite-config.cjs::esbuild',
+    reason: 'Not a loader, same category as build-electron.mjs: it esbuild-BUNDLES engine/vite.config.ts to '
+      + 'a persistent, shipped engine/vite.config.cjs for the packaged editor (#326). It never '
+      + 'imports what it builds.',
+  },
+  {
+    item: 'engine/scripts/migrate-meta-sidecars.mjs::esbuild',
+    reason: 'IS a third copy of the mechanism, not merely a third shape — its `execFileSync("npx", '
+      + '["esbuild", …])` writes a temp `outFile` which it then `await import(pathToFileURL(outFile))`s: '
+      + 'the same bundle-to-temp-and-import, driven through a subprocess. (Cited by SYMBOL, not line '
+      + 'number — this branch ruled in a8fb0dfca that a line number rots silently, and docCitations '
+      + 'only enforces that under docs/.) Left out of #827 DELIBERATELY (a '
+      + 'one-off migration with no preamble and no build claim), which is a scope call, not an '
+      + 'absolution: this entry exists so the next sweep reads "deferred", never "not an instance".',
+  },
+];
+
 
 describe('no engine/scripts/*.mjs rolls its own esbuild module loader (#827)', () => {
   // Enumerated through git, not a filesystem walk — an untracked stray must not silently widen or
@@ -535,9 +548,7 @@ describe('no engine/scripts/*.mjs rolls its own esbuild module loader (#827)', (
     expect(rels.some((r) => r.endsWith('.cjs')), 'the .cjs half of the match stopped matching').toBe(true);
   });
 
-  it.each(scripts.map((f) => f.rel))('%s does not name esbuild in code', (rel) => {
-    if (DIRECT_ESBUILD_ALLOWED.has(rel)) return;
-    const code = readScannedSource(path.join(repoRoot, rel)).code;
+  it('no script names esbuild in code beyond what its allowlist row pays for — counted per specifier (#1128)', () => {
     // ⚠️ Matches the SPECIFIER, not an import STATEMENT, and that is the whole point. The first
     // version of this assertion was
     //     /(?:import|require)\s*\(?\s*\{?[^}\n]*\}?\s*(?:from\s*)?['"]esbuild['"]/
@@ -557,22 +568,39 @@ describe('no engine/scripts/*.mjs rolls its own esbuild module loader (#827)', (
     // variable-held specifier still evade, and no regex closes that. This is a tripwire against
     // the shape that actually recurred twice (a plain import someone reached for because the seam
     // degraded), not a proof of absence.
-    expect(code, `${rel} names esbuild in code. Load engine TypeScript through loadVendorPlugins.mjs `
-      + '(loadEnginePluginModuleResult, or loadRequiredEngineModules when the caller cannot '
-      + 'degrade) — a private copy is #827. A genuine non-loader use goes on the allowlist above, '
-      + 'with its reason.')
-      .not.toMatch(/['"`]esbuild(?:-wasm)?(?:\/[^'"`]*)?['"`]/);
-  });
-
-  it('every allowlisted script still exists and still uses esbuild', () => {
-    // An allowlist entry for a file that stopped using esbuild is a licence nobody needs, and one
-    // for a deleted file hides the next real instance behind a stale name.
-    for (const [rel, why] of DIRECT_ESBUILD_ALLOWED) {
-      const abs = path.join(repoRoot, rel);
-      expect(fs.existsSync(abs), `${rel} is allowlisted but gone — drop the entry (${why})`).toBe(true);
-      expect(readScannedSource(abs).code, `${rel} no longer uses esbuild — drop the entry`)
-        .toMatch(/esbuild/);
+    //
+    // ⚠️ **Counted per SPECIFIER, and the staleness check uses THIS detector (#1128).** The allowlist
+    // used to skip a file whole (`.has(rel)`), so a second esbuild specifier added to
+    // `build-electron.mjs` — whose reason is "never imports what it builds" — was green; now it is
+    // an unexcused occurrence. ⚠️ What the count still CANNOT see: a private loader built on the
+    // file's EXISTING `import esbuild from 'esbuild'` (`await esbuild.build({ outfile }); return
+    // import(url)`) adds no new specifier, and stays green — confirmed by review. That is the
+    // tripwire limit stated above, not something a count closes. And its staleness check matched
+    // a bare `/esbuild/`, LOOSER than the ban: a file that lost its real import but kept the word in
+    // a string stayed "still uses esbuild". The ledger's over-blessed arm now runs on the same
+    // population as the ban, so the two cannot disagree.
+    const SPECIFIER = /['"`]esbuild(?:-wasm)?(?:\/[^'"`]*)?['"`]/g;
+    const uses: Array<{ item: string; site: string }> = [];
+    for (const { rel } of scripts) {
+      readScannedSource(path.join(repoRoot, rel)).code.split('\n').forEach((line, i) => {
+        for (const m of line.matchAll(SPECIFIER)) {
+          const spec = m[0].slice(1, -1);
+          uses.push({ item: `${rel}::${spec}`, site: `${rel}:${i + 1} — ${spec}` });
+        }
+      });
     }
+    assertExemptionLedger({
+      label: 'DIRECT_ESBUILD_ALLOWED in cliNativeBuildHeals',
+      population: uses,
+      exempt: DIRECT_ESBUILD_ALLOWED,
+      sanctioned: SEAM_SPECIFIERS,
+      // Liveness is the seam's own specifier (`sanctioned` is staleness-checked); an exact floor
+      // would report every legitimate removal as a dead detector.
+      floor: 1,
+      fix: 'Load engine TypeScript through loadVendorPlugins.mjs (loadEnginePluginModuleResult, or '
+        + 'loadRequiredEngineModules when the caller cannot degrade) — a private copy is #827. A '
+        + 'genuine non-loader use goes on the allowlist above, with its reason.',
+    });
   });
 });
 

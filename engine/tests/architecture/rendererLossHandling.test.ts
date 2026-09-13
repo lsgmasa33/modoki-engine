@@ -41,6 +41,7 @@
  *  this is a known, accepted shape here, not a hypothetical (adversarial review of #795). */
 import { describe, it, expect } from 'vitest';
 import * as path from 'node:path';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { censusRendererSources } from './rendererConstructionCensus';
 
 // The three renderer/app classes this family of surfaces constructs, plus the TWO factories that
@@ -59,14 +60,14 @@ const ATTACH_RE = /\battach(?:RendererLossHandling|ContextLossListeners|DeviceLo
 // guard: `@monogrid/gainmap-js`'s `encodeAndCompress` constructs its own throwaway WebGLRenderer
 // internally when none is passed, which never appears in this file as a literal `new
 // WebGLRenderer(`/`makeWebGPURenderer(`/etc. — so `CONSTRUCT_RE` can never match it and it can
-// never reach the offenders list either way. It is NOT in `ALLOWLIST` below (adversarial review
+// never reach the offenders list either way. It is NOT in `EXEMPT` below (adversarial review
 // of #795 found it there, inert — an allowlist entry a construction-site scan can never even
 // test is not doing the job an allowlist entry implies). `glContextRelease.test.ts` documents the
 // same fact for the same reason.
 
 // Genuinely transient probes — a construction site with no lasting surface to go blank, or one
 // invisible to our own tracking:
-const ALLOWLIST = new Map<string, string>([
+const EXEMPT: ReadonlyArray<{ item: string; count?: number; reason: string }> = [
   // `capsProbeRenderer.ts` BUILDS the probe renderer and hands it back — it is the CALLER
   // (`ensureKtx2Caps` in `textureResolver.ts`) that disposes it, immediately after
   // `detectSupport()` returns, within the same call chain. Either way there is no lasting
@@ -74,7 +75,10 @@ const ALLOWLIST = new Map<string, string>([
   // for. Named as an exception in the #795 design brief; reason corrected in the adversarial
   // review of #795 — the original text claimed this file disposes it, which the file's own doc
   // comment ("the returned renderer is the caller's to dispose") contradicts.
-  ['runtime/rendering/capsProbeRenderer.ts', 'built here, disposed by the caller right after use — no lasting surface either way'],
+  {
+    item: 'runtime/rendering/capsProbeRenderer.ts::makeWebGPURenderer',
+    reason: 'the one probe renderer, built here and disposed by the caller right after use — no lasting surface either way',
+  },
   // #802 migrated `editor/panels/SceneView.tsx` and `runtime/rendering/Scene3D.tsx` onto the
   // shared module — each now calls `attachRendererLossHandling` directly instead of relying on
   // `setActiveRenderer` -> `core/activeRenderer.ts`'s old single-slot `attachGpuFaultListeners`
@@ -90,7 +94,19 @@ const ALLOWLIST = new Map<string, string>([
   // is `Scene3D.tsx` (`createRenderer(container, ...)`), which is where the real attach call now
   // lives — wiring a SECOND, functionally redundant attach here would double-fire every loss for
   // the one GameView renderer, not satisfy anything the guard is actually checking for.
-  ['runtime/rendering/scene3DSync.ts', 'createRenderer/makeWebGPURenderer match their own declarations here — real detection is wired at the one caller, Scene3D.tsx'],
+  //
+  // Measured 2026-09-13: THREE matches — the two declarations, plus `createRenderer`'s own inner
+  // `makeWebGPURenderer(container, …)` call, which is the factory delegating to the other factory
+  // and returns straight to the same caller. None of the three is a surface of its own.
+  {
+    item: 'runtime/rendering/scene3DSync.ts::makeWebGPURenderer',
+    count: 2,
+    reason: 'its own declaration, and createRenderer delegating to it — both return the renderer to Scene3D.tsx, where detection is attached',
+  },
+  {
+    item: 'runtime/rendering/scene3DSync.ts::createRenderer',
+    reason: 'its own declaration — the one caller, Scene3D.tsx, attaches detection to what it returns',
+  },
   // #824 extracted Scene3D's bring-up DECISIONS into `viewportBringUp.ts`, which calls an INJECTED
   // `deps.createRenderer(kind)` — `CONSTRUCT_RE` matches that call by name, the same structural false
   // match as `scene3DSync.ts` above. It constructs nothing itself: the module is DOM- and three-free
@@ -99,25 +115,45 @@ const ALLOWLIST = new Map<string, string>([
   // `attachRendererLossHandling` call live: `Scene3D.tsx` (`createRenderer(container, …)`) and, since
   // #1052, the editor's `SceneView.tsx` (`makeWebGPURenderer(container)` via its container lease).
   // A real construction added to this file would break its contract before it broke this guard.
-  ['runtime/rendering/viewportBringUp.ts', 'calls the renderer factory its callers inject — the real construction and its attach live in Scene3D.tsx and SceneView.tsx'],
-]);
+  {
+    item: 'runtime/rendering/viewportBringUp.ts::createRenderer',
+    reason: 'the one call to the factory its callers inject — the real construction and its attach live in Scene3D.tsx and SceneView.tsx',
+  },
+];
+
+/** The construction a match names, spelled one way: `new THREE.WebGLRenderer (` and
+ *  `new WebGLRenderer(` are the same token, so a row cannot be dodged by re-spelling the call. */
+const constructionToken = (match: string): string =>
+  match.replace(/\s*\($/, '').replace(/\s+/g, ' ').replace('THREE.', '');
 
 describe('Renderer loss handling — every renderer/app construction site wires loss DETECTION', () => {
   it('every WebGLRenderer / WebGPURenderer / Pixi Application construction site attaches loss handling', () => {
-    const offenders: string[] = [];
+    const unattached: Array<{ item: string; site: string }> = [];
     let sites = 0;
+    const constructAll = new RegExp(CONSTRUCT_RE.source, 'g');
     for (const { file, stripped } of censusRendererSources()) {
       if (!CONSTRUCT_RE.test(stripped)) continue;
       sites++;
+      // The PAIRING stays file-granular on purpose (header, last paragraph) — what is per
+      // occurrence is the pardon for a file that attaches nothing.
       if (ATTACH_RE.test(stripped)) continue;
       const rel = path.relative(path.resolve(__dirname, '../../packages/modoki/src'), file).split(path.sep).join('/');
-      if (ALLOWLIST.has(rel)) continue;
-      offenders.push(path.relative(process.cwd(), file));
+      for (const m of stripped.matchAll(constructAll)) {
+        const line = stripped.slice(0, m.index).split('\n').length;
+        unattached.push({ item: `${rel}::${constructionToken(m[0])}`, site: `${rel}:${line} — ${constructionToken(m[0])}` });
+      }
     }
     // The guard is worthless if the query stopped matching anything — pin that it still finds the
     // surfaces it is meant to police (canvas2DPool, the three preview panels, the two 3D
     // viewports' shared factories, and the one allowlisted probe today).
     expect(sites).toBeGreaterThanOrEqual(6);
-    expect(offenders).toEqual([]);
+    assertExemptionLedger({
+      label: 'EXEMPT in rendererLossHandling',
+      population: unattached,
+      exempt: EXEMPT,
+      floor: 1,
+      fix: 'a renderer built with no loss detection leaves its surface permanently blank on a lost '
+        + 'context, with no error anywhere (#795). Call `attachRendererLossHandling` for it.',
+    });
   });
 });

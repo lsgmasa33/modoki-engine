@@ -45,6 +45,19 @@ afterEach(() => {
   spriteUrlRedirects.clear();
   for (const w of createdWorlds) { try { w.destroy(); } catch { /* already disposed */ } }
   createdWorlds.length = 0;
+  // ⚠️ **Several tests here spy `console.warn` and do not restore it** (#1110 close-out finding
+  // F4). `vi.spyOn` on an already-spied method hands back the EXISTING spy with its calls still
+  // attached, so a leaked spy makes the NEXT `[Scene2D]`-warning test count its predecessor's
+  // warnings as its own — the prune test below really did expect 2 where it wanted 1. Restoring
+  // per-test fixed one direction only: the tests were then correct because of their ORDER, and
+  // inserting or reordering one would recreate it. This closes it for the file.
+  vi.restoreAllMocks();
+  // ⚠️ **The restore above is otherwise unfalsifiable** — deleting it turns nothing red, which is
+  // precisely the bug's nature (a leaked spy only hurts the NEXT test that spies the same method).
+  // Measured both ways: with this probe, deleting the restore turns 8+ tests red; keeping both is
+  // 117/117 green.
+  expect(vi.isMockFunction(console.warn), 'a console.warn spy leaked past the file afterEach — the '
+    + 'next test to spy it would inherit these calls').toBe(false);
 });
 
 // ── PixiJS mock ────────────────────────────────────────────────────────────
@@ -1933,6 +1946,65 @@ describe('Scene2D.renderFrame', () => {
   // tested mechanism never fire in production. This drives it through the REAL frame path
   // (spawn → renderFrame → destroy → renderFrame → respawn → renderFrame), not a direct
   // `orphan2D.prune(...)` call, so it also proves the frame loop calls it with the right set.
+  it('⭐ warns about the orphan and NOT its correctly-parented sibling — the false-positive control',
+    async () => {
+      // ⚠️ **Nothing in this suite could fail on a false positive before this** (#1110 review).
+      // Every runtime-path orphan test spawns ONLY orphans — `spawnOrphan` below is `parentId: 0`
+      // in all of them — so they prove the warning FIRES and say nothing about whether it fires on
+      // healthy entities. The one positive control that exists is on the pure `findUnrenderable2D`
+      // helper, which is a different code path from `noteOrphan2D`.
+      //
+      // That gap is why #1110 took a live probe to resolve: the issue reported ~20 warnings on
+      // entities that were visibly on screen and there was no test that could say whether the
+      // check was wrong. (It was not — those entities really were parented to the world root, in a
+      // boot world that was then discarded. But the suite could not rule the other way out.)
+      //
+      // A warning that fires on a healthy scene is worse than the bug it detects: the grace window
+      // is 1 frame and it warns once per entity, so a false positive would be permanent and the
+      // whole log gets tuned out.
+      const { traits, scene2d, world } = await setup();
+      // ⚠️ Restored in a `finally`. `vi.spyOn` on an already-spied method hands back the EXISTING
+      // spy with its calls still on it, so leaking this one made the neighbouring prune test count
+      // this test's warning as its own and expect 2 where it wanted 1. Found exactly that way.
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const orphanWarns = () => warnSpy.mock.calls
+          .filter((c) => typeof c[0] === 'string' && c[0].startsWith('[Scene2D]'))
+          .map((c) => String(c[0]));
+
+        const canvas = spawnCanvas(world, traits);
+        const sprite = (parentId: number) => world.spawn(
+          traits.Transform({}),
+          traits.Renderable2D({ sprite: 'square', color: 0xffffff, width: 10, height: 10 }),
+          traits.EntityAttributes({ name: 'sprite', parentId, sortOrder: 0, layer: '2d', guid: '' }),
+        );
+
+        // Both spawned in the same frame, so the only thing separating them is the parent.
+        const drawnId = sprite(canvas.id()).id();
+        const orphanId = sprite(0).id();
+        scene2d.renderFrame();
+
+        // ⚠️ Identified by ID, not by name: `setup()` registers EntityAttributes with `fields: {}`,
+        // so `readTraitData` returns `{}` and every warning reads `"entity <id>" (id:<id>)`
+        // regardless of the authored name (the prune test below re-registers the trait with real
+        // field hints precisely because it needs guid identities; this one does not). The id is
+        // exactly as discriminating and needs none of that setup.
+        const warns = orphanWarns();
+        expect(warns, 'exactly one of the two is unrenderable').toHaveLength(1);
+        expect(warns[0], 'and it is the orphan').toContain(`id:${orphanId}`);
+        expect(warns[0], 'the parented one must never be named').not.toContain(`id:${drawnId}`);
+
+        // Held across further frames: the check warns once per entity, so a false positive would
+        // not show up as a repeat — it would show up here, as the healthy entity finally being
+        // named.
+        scene2d.renderFrame();
+        scene2d.renderFrame();
+        expect(orphanWarns(), 'still just the orphan, three frames in').toHaveLength(1);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
   it('forgets a dead orphaned entity through the real renderFrame path, unblocking its recycled id (prune wiring)', async () => {
     const { traits, scene2d, world, registerTrait } = await setup();
     // The harness registers EntityAttributes with `fields: {}` (setup() above), so

@@ -29,6 +29,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { stripComments } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const REPO = path.resolve(__dirname, '../../..');
@@ -271,21 +272,35 @@ function scanForMatch(re: RegExp): boolean {
  * bar is to assert the teardown observes `registered === true`, not merely that it was called.
  * Reasoning: docs/managers-and-systems.md.
  */
-const APP_LIFETIME_BY_DESIGN: Record<string, string> = {
+/* ⚠️ **Keyed by DECLARATION — file and manager name — and SPENT (#1123/#1128).** This was a
+ * `Record<name, reason>` checked with `name in`, which had two holes: a SECOND manager declared
+ * under one of these names in any other file was pardoned by a reason about the first, and a row
+ * whose manager became reachable (or vanished) stayed forever — there was no staleness check at
+ * all. The file used to live only in the prose value; it is now the key. */
+const APP_LIFETIME_BY_DESIGN: ReadonlyArray<{ item: string; count?: number; reason: string }> = [
   // Window-level input listeners (keyboard/gamepad/pointer/touch-control/gesture) are one fixed
   // set for the whole process. `dispose` exists for the `ManagerDef` contract and for
   // `__resetManagersForTesting`. Nothing in production unregisters it, and nothing should — see
   // the block above (#517, re-measured and settled in #534).
-  Input: 'engine/packages/modoki/src/runtime/input/inputSources.ts — verified app-lifetime, #517/#534',
+  {
+    item: 'engine/packages/modoki/src/runtime/input/inputSources.ts::Input',
+    reason: 'verified app-lifetime, #517/#534',
+  },
   // dispose() unsubscribes the onPlayStateChange/onWorldSwap listeners init() installed and drops
   // its three read sources (deltaTime, timeSinceGameStart, timeSinceSceneLoad) — process-global
   // state, same shape as 'Input'.
-  'engine.time':
-    'engine/packages/modoki/src/runtime/managers/TimeManager.ts — verified app-lifetime, #517/#534',
+  {
+    item: 'engine/packages/modoki/src/runtime/managers/TimeManager.ts::engine.time',
+    reason: 'verified app-lifetime, #517/#534',
+  },
   // dispose() drops the 'canGoBack' read source and clears the history stack — again process-global.
-  'engine.navigation':
-    'engine/packages/modoki/src/runtime/managers/NavigationManager.ts — verified app-lifetime, #517/#534',
-};// ── CENSUS: every textual `ManagerDef` reference must be accounted for (#517 follow-up 2) ────────
+  {
+    item: 'engine/packages/modoki/src/runtime/managers/NavigationManager.ts::engine.navigation',
+    reason: 'verified app-lifetime, #517/#534',
+  },
+];
+
+// ── CENSUS: every textual `ManagerDef` reference must be accounted for (#517 follow-up 2) ────────
 //
 // The two scanners above only recognize two specific declaration SHAPES. Any OTHER shape — a
 // sub-interface (`interface FooManager extends ManagerDef`) with `class X implements FooManager`,
@@ -419,19 +434,25 @@ describe('every app-scoped ManagerDef.dispose is reachable from production (#517
   });
 
   it('every app-scoped manager.dispose is wired to unregisterManager or verified in the allowlist', () => {
-    const unreachable = found.filter(
-      (mgr) =>
-        !(mgr.name in APP_LIFETIME_BY_DESIGN) && !hasProductionUnregisterCaller(mgr.name, mgr.idents, mgr.kind),
-    );
-    expect(
-      unreachable,
-      'These app-scoped ManagerDefs (name + defining file) declare a `dispose` that nothing in ' +
-        'production reaches: managerRegistry.deactivate() only runs dispose via unregisterManager(name) ' +
-        'or a re-register of the same name, and an app-scoped manager has no other teardown trigger. ' +
-        'Fix it one of two ways: (1) wire a real `unregisterManager(\'<name>\')` call into the ' +
-        'appropriate app-teardown path, or (2) if the manager is genuinely app-lifetime by design, add ' +
-        'it to APP_LIFETIME_BY_DESIGN above with a one-line verified reason — never add a name on ' +
-        'assumption.',
-    ).toEqual([]);
+    assertExemptionLedger({
+      label: 'APP_LIFETIME_BY_DESIGN in appManagerDisposeReachable',
+      population: found
+        .filter((mgr) => !hasProductionUnregisterCaller(mgr.name, mgr.idents, mgr.kind))
+        .map((mgr) => {
+          // POSIX, because the rows are: `findAppScopedManagersWithDispose` keeps `path.relative`'s
+          // native separator, which on Windows would stale every row and pardon nothing.
+          const rel = mgr.file.split(path.sep).join('/');
+          return { item: `${rel}::${mgr.name}`, site: `${rel} — ${mgr.name}` };
+        }),
+      exempt: APP_LIFETIME_BY_DESIGN,
+      // The three rows are permanent by design (#534, above), so the population never reaches 0.
+      floor: 1,
+      fix: 'This app-scoped ManagerDef declares a `dispose` that nothing in production reaches: '
+        + 'managerRegistry.deactivate() only runs dispose via unregisterManager(name) or a re-register '
+        + 'of the same name, and an app-scoped manager has no other teardown trigger. Fix it one of two '
+        + "ways: (1) wire a real `unregisterManager('<name>')` call into the appropriate app-teardown "
+        + 'path, or (2) if the manager is genuinely app-lifetime by design, add it to '
+        + 'APP_LIFETIME_BY_DESIGN above with a one-line verified reason — never add a name on assumption.',
+    });
   });
 });

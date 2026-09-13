@@ -12,8 +12,14 @@
  *
  *  Both now ask `isGitVerdict` first. This file pins the measurement that predicate rests on, using
  *  REAL spawns rather than a hand-built error object — a fake would model whatever shape we
- *  happened to believe, which is precisely the assumption under test. If a future Node gives an
- *  overflow a numeric `status`, the fix silently reverts to the old behaviour and this goes red. */
+ *  happened to believe, which is precisely the assumption under test.
+ *
+ *  ⚠️ **#1120's version of this file asserted a RACE as if it were a fact (#1127).** It pinned
+ *  `typeof e.status !== 'number'` on an overflow, measured 300/300, and `isGitVerdict` was that
+ *  same expression — so the one red `verify:publish` run it produced was the shipped predicate
+ *  failing, not a flaky test. A child that has already exited when the overflow is detected
+ *  carries its real exit code. The cases below therefore FORCE each branch instead of sampling,
+ *  and assert the invariant (`isGitVerdict === false`) rather than the premise. */
 
 import { describe, it, expect } from 'vitest';
 import { execFileSync, execSync } from 'node:child_process';
@@ -23,17 +29,17 @@ import { repoRoot } from '../../scripts/repoCorpus.mjs';
 
 /** Run `fn`, return whatever it threw. Fails loudly if it did not throw — a test that silently
  *  passes on "no error" would assert nothing at all. */
-const thrown = (fn: () => unknown): NodeJS.ErrnoException & { status?: unknown } => {
+const thrown = (fn: () => unknown): NodeJS.ErrnoException & { status?: unknown; signal?: unknown } => {
   try {
     fn();
   } catch (e) {
-    return e as NodeJS.ErrnoException & { status?: unknown };
+    return e as NodeJS.ErrnoException & { status?: unknown; signal?: unknown };
   }
   throw new Error('expected this to throw, and it did not — the case under test did not happen');
 };
 
-describe('an overflowing git read is not mistaken for a git verdict (#1120)', () => {
-  it('exceeding maxBuffer throws WITHOUT a numeric status — so it is not a verdict', () => {
+describe('an overflowing git read is not mistaken for a git verdict (#1120, #1127)', () => {
+  it('exceeding maxBuffer while the child is still writing is not a verdict', () => {
     // MUTATION CHECK: make `isGitVerdict` return true unconditionally -> red here.
     //
     // ⚠️ **The overflow is generated, not read out of this repo, and that is deliberate.** The
@@ -46,12 +52,42 @@ describe('an overflowing git read is not mistaken for a git verdict (#1120)', ()
     //
     // What is under test is a `child_process` property — the SHAPE of an overflow error — which is
     // what `isGitVerdict` consumes, and it does not depend on which binary produced it.
+    //
+    // ⚠️ Deliberately NO assertion on `status` here. This child USUALLY loses the race (node's
+    // teardown is slow, so the kill lands first and `status` is null), but "usually" is exactly the
+    // premise #1127 disproved. The branch where it wins is forced by the next case.
     const e = thrown(() => execFileSync(
       process.execPath, ['-e', 'process.stdout.write("x".repeat(5000))'],
       { encoding: 'utf8', maxBuffer: 64 },
     ));
     expect(e.code).toBe('ENOBUFS');
-    expect(typeof e.status).not.toBe('number');
+    expect(isGitVerdict(e)).toBe(false);
+  });
+
+  it('exceeding maxBuffer AFTER the child exited carries a numeric status — and is still not a verdict (#1127)', () => {
+    // MUTATION CHECK: revert `isGitVerdict` to `typeof error?.status === 'number'` (#1120's
+    // version) -> red here, and ONLY here among the predicate cases.
+    //
+    // The race, forced rather than sampled. The child hands its stdout to a grandchild and exits at
+    // once; the grandchild writes the overflowing output later. `spawnSync` waits for the pipe to
+    // close, so the child's exit is reaped long before the overflow is detected — and the error
+    // carries BOTH `code: 'ENOBUFS'` and the child's real exit code. Measured 30/30 (and with
+    // `exit(3)`, `status: 3` 10/10). Sampling was how #1120 got this wrong: `/bin/sh -c printf`
+    // lands here 1000/1000 and a `node -e` writer 0/100, so which one a probe happened to use
+    // decided the "measurement". Git reaches this branch whenever its output exceeds `maxBuffer`
+    // by less than one pipe buffer: it writes its last chunk and exits before the parent overflows.
+    //
+    // No shell and no POSIX binary, so it runs on every leg of the 3-OS gate. The grandchild is left
+    // to die on its own: once the parent closes the pipe its write fails and it exits.
+    const handOff = 'const { spawn } = require("node:child_process");'
+      + ' spawn(process.execPath, ["-e", "setTimeout(() => process.stdout.write(\\"x\\".repeat(5000)), 250)"],'
+      + ' { stdio: ["ignore", "inherit", "ignore"] }).unref();'
+      + ' process.exit(0);';
+    const e = thrown(() => execFileSync(process.execPath, ['-e', handOff], { encoding: 'utf8', maxBuffer: 64 }));
+    expect(e.code).toBe('ENOBUFS');
+    // The premise, pinned rather than assumed: if this stops holding, the case no longer exercises
+    // the branch it exists for, and it must say so rather than pass on the other one.
+    expect(e.status).toBe(0);
     expect(isGitVerdict(e)).toBe(false);
   });
 
@@ -70,10 +106,30 @@ describe('an overflowing git read is not mistaken for a git verdict (#1120)', ()
   });
 
   it('a binary that does not exist is not a verdict either', () => {
-    // Why the predicate asks about `status` rather than `code === 'ENOBUFS'`: it has to catch the
-    // whole class of "never ran", not the one member that prompted it.
+    // Why the predicate asks for the ABSENCE of a `code` rather than `code === 'ENOBUFS'`: it has
+    // to catch the whole class of "never ran", not the one member that prompted it.
     const e = thrown(() => execFileSync('modoki-no-such-binary-1120', [], { encoding: 'utf8' }));
     expect(e.code).toBe('ENOENT');
+    expect(isGitVerdict(e)).toBe(false);
+  });
+
+  it.skipIf(process.platform === 'win32')('a child killed by a signal has a NULL status — why the predicate needs no signal arm', () => {
+    // `isGitVerdict` asks about `status` and `code` only. That is sound only while a signal death
+    // never comes with a numeric `status` — a kill carries no `code`, so the `status` arm is the
+    // one refusing it. Measured on a bare kill, a timeout kill and an overflow kill: `status: null`
+    // every time. Pinned here so a Node that changes it goes red instead of turning a killed git
+    // into a verdict.
+    //
+    // MUTATION CHECK: make `isGitVerdict` ignore `status` (`error?.code === undefined`) -> red here.
+    //
+    // ⚠️ Skipped on Windows: signals are emulated there and this shape is unmeasured on that leg,
+    // so asserting it would be a guess (docs/windows.md — no Windows hypotheses from a Mac).
+    const e = thrown(() => execFileSync(
+      process.execPath, ['-e', 'process.kill(process.pid, "SIGTERM")'], { encoding: 'utf8' },
+    ));
+    expect(e.signal).toBe('SIGTERM');
+    expect(e.code).toBeUndefined();
+    expect(e.status).toBeNull();
     expect(isGitVerdict(e)).toBe(false);
   });
 

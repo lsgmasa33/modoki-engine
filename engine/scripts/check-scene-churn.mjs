@@ -83,12 +83,12 @@ for (const proj of process.argv.slice(2)) {
     try { old = execFileSync('git', ['show', `HEAD:${rel}`], { cwd: ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }); }
     catch (e) {
       // ⚠️ ONLY a completed-but-failed git run may be read as "this file is not in HEAD". A throw
-      // with no numeric `status` means the process never returned a verdict at all — measured:
-      // exceeding maxBuffer gives `code:'ENOBUFS', status:null`, while git saying no gives
-      // `status:128`. Swallowing the first reported a long-committed scene as untracked and
-      // SKIPPED ITS DIFF, so the review gate went blind on the largest file it has to read. That
-      // is the same silent-stop this file's own note above already records for the Windows-quoting
-      // cause (#1120).
+      // carrying a `code` means the process never returned a verdict at all — measured:
+      // exceeding maxBuffer gives `code:'ENOBUFS'` (with `status` null OR a real exit code — a
+      // race, #1127), while git saying no gives a bare `status:128`. Swallowing the first reported a
+      // long-committed scene as untracked and SKIPPED ITS DIFF, so the review gate went blind on
+      // the largest file it has to read. That is the same silent-stop this file's own note above
+      // already records for the Windows-quoting cause (#1120).
       if (!isGitVerdict(e)) {
         throw new Error(`${rel}: \`git show\` did not complete (${e.code ?? e.message}) — refusing to `
           + 'report a committed file as untracked and skip its diff.', { cause: e });

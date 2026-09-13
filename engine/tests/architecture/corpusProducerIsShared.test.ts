@@ -51,6 +51,7 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import ts from 'typescript';
 import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { hasInternalGames, hasPublishScripts } from '../helpers/repoLayout';
 
@@ -154,6 +155,13 @@ function bodyCallsOwnName(fnNode: ts.Node, name: string): boolean {
  *  (comment-stripped, so a docblock discussing this shape is not itself a hit) with the
  *  TypeScript compiler, the same tool `mjsTypeSidecars.test.ts` uses to read a plain `.mjs`. */
 function hasRecursiveReaddirWalker(code: string, label: string): boolean {
+  return recursiveReaddirWalkers(code, label).length > 0;
+}
+
+/** The NAME of every such walker in `code`, one entry per function — the per-occurrence form the
+ *  ledger spends (#1128). `hasRecursiveReaddirWalker` is this list's non-emptiness, so the ban, the
+ *  ledger and the synthetic pins below all run one detector. */
+function recursiveReaddirWalkers(code: string, label: string): string[] {
   let sf: ts.SourceFile;
   try {
     sf = ts.createSourceFile(
@@ -161,9 +169,11 @@ function hasRecursiveReaddirWalker(code: string, label: string): boolean {
       label.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
     );
   } catch {
-    return false;
+    return [];
   }
-  return collectNamedFunctions(sf).some((fn) => bodyCallsReaddir(fn.node) && bodyCallsOwnName(fn.node, fn.name));
+  return collectNamedFunctions(sf)
+    .filter((fn) => bodyCallsReaddir(fn.node) && bodyCallsOwnName(fn.node, fn.name))
+    .map((fn) => fn.name);
 }
 
 /* ------------------------------------------------------------------------------- The ledger */
@@ -189,22 +199,30 @@ function hasRecursiveReaddirWalker(code: string, label: string): boolean {
  *  - A handful of genuinely NEITHER, each with its own one-line reason below.
  */
 
-const EXEMPT: ReadonlyArray<{ file: string; rule: 'ls-files' | 'walker'; reason: string }> = [
+/** ⚠️ **Rows are SPENT per occurrence, not matched per file (#1123/#1128).** Each rule used to skip
+ *  an exempt file whole (`exempt.has(rel)`), and the staleness check asked only whether the file
+ *  still tripped the rule AT ALL — the `>= 1 survives` form #1120 disproved. So a second, real
+ *  corpus walker added to `generate-icons.mjs` (exempt for walking native OUTPUT) was green, and so
+ *  was a real `ls-files` enumeration added beside `connectClaude.ts`'s one `--error-unmatch`
+ *  predicate. Now:
+ *   - an `ls-files` row pardons `count` (default 1) occurrences of the marker in its file — the
+ *     marker is the same text at every spawn, so the key is the bare file;
+ *   - a `walker` row names the WALKER FUNCTION it pardons (`walker`), because the detector can tell
+ *     two walkers apart by name — a second walker is a different key, not a higher count. */
+type ExemptRow = {
+  file: string; reason: string; count?: number;
+} & ({ rule: 'ls-files'; walker?: never } | { rule: 'walker'; walker: string });
+
+const EXEMPT: ReadonlyArray<ExemptRow> = [
   /* ---------------------------------------------------------------- Rule 1: git ls-files spawns.
-   * `engine/scripts/repoCorpus.mjs` itself is EXCLUDED STRUCTURALLY below (the filter that builds
-   * `files`), not listed here — it is the one sanctioned caller, not a producer awaiting
-   * migration onto itself. */
+   * Two files are NOT rows here, because they are structural — both are `sanctioned` in Rule 1's
+   * ledger call below. `engine/scripts/repoCorpus.mjs` is the one legitimate caller, not a producer
+   * awaiting migration onto itself. And THIS file discusses the marker in string literals (reasons,
+   * messages, fixtures) that stripComments does not blank — the same self-reference
+   * docCitations.test.ts's SELF_QUOTING list is the structural half of. It was a counted row until
+   * #1128; as `sanctioned` too, that row could only ever fail, never pardon. */
   {
-    file: 'engine/tests/architecture/corpusProducerIsShared.test.ts', rule: 'ls-files',
-    reason: 'This file. Its own rule-1 docblock and `reason` strings necessarily discuss '
-      + `"${LS_FILES_MARKER}" in prose that is NOT a comment (a JS string literal, unlike a `
-      + 'comment, is not blanked by stripComments) — the same self-reference '
-      + 'docCitations.test.ts\'s own SELF_QUOTING list explains for its rule. (That list was '
-      + 'DOC_CITATION_EXEMPT until #1123 split it into a structural exclusion and a per-path '
-      + 'ledger; this pointer is to the structural half, which is the half that matches.)',
-  },
-  {
-    file: 'engine/scripts/typecheck-projects.mjs', rule: 'ls-files',
+    file: 'engine/scripts/typecheck-projects.mjs', rule: 'ls-files', count: 2,
     reason: 'Change DETECTION, not corpus enumeration (#967). It spawns '
       + `\`git ${LS_FILES_MARKER} --others --exclude-standard\` under a PATHSPEC to answer "is `
       + 'there an untracked file under games/<id> or demos/<id>" — the one signal that makes a '
@@ -213,8 +231,14 @@ const EXEMPT: ReadonlyArray<{ file: string; rule: 'ls-files' | 'walker'; reason:
       + 'immediately to a set of project DIRECTORIES; no file it returns is ever read or scanned, '
       + 'so there is no second corpus definition here to drift from repoFiles(). repoFiles() could '
       + 'answer it only as the difference between its includeUntracked true and false '
-      + 'enumerations — two whole-repo walks standing in for one pathspec-restricted query. Not '
-      + 'awaiting migration.',
+      + 'enumerations — two whole-repo walks standing in for one pathspec-restricted query. '
+      + 'The SECOND spawn (projectsWithSources, `--cached --others` under the same project '
+      + 'pathspecs) is the same kind of question — "does this project have ANY TypeScript git '
+      + 'knows about" — collapsed at once to a set of project directories, and it returns null '
+      + 'when git cannot answer so the caller declines the dead-gate verdict rather than guessing; '
+      + 'repoFiles() throws instead, which would turn that decline into a crash. (Count measured '
+      + '2026-09-13 by #1128; the row described only the first spawn until then.) Not awaiting '
+      + 'migration.',
   },
   {
     file: 'engine/tests/architecture/repoCorpus.test.ts', rule: 'ls-files',
@@ -228,12 +252,12 @@ const EXEMPT: ReadonlyArray<{ file: string; rule: 'ls-files' | 'walker'; reason:
   /* --------------------------------------------------------- Rule 2: hand-rolled readdir walkers,
    * project-corpus-shaped (reach games/demos). */
   {
-    file: 'engine/tests/electron/newProject.test.ts', rule: 'walker',
+    file: 'engine/tests/electron/newProject.test.ts', rule: 'walker', walker: 'walk',
     reason: 'walk(target) walks an mkdtemp SCRATCH dir the test scaffolds into and deletes — '
       + 'ephemeral test output, not repo/tracked content at all.',
   },
   {
-    file: 'engine/tests/electron/scaffoldCliParity.test.ts', rule: 'walker',
+    file: 'engine/tests/electron/scaffoldCliParity.test.ts', rule: 'walker', walker: 'walk',
     reason: 'Same shape as newProject.test.ts above, for the same reason: tree() walks the two '
       + 'mkdtemp SCRATCH dirs the CLI and the API scaffold into, to diff them against each other '
       + '(#945 B2). Ephemeral test output, not repo/tracked content — repoFiles() enumerates '
@@ -245,36 +269,43 @@ const EXEMPT: ReadonlyArray<{ file: string; rule: 'ls-files' | 'walker'; reason:
    * it could never stand in for any of these even after a hypothetical Phase 5 — the corpus these
    * walk simply isn't the kind repoCorpus.mjs produces. */
   {
-    file: 'engine/scripts/assertBundleUnchanged.mjs', rule: 'walker',
+    file: 'engine/scripts/assertBundleUnchanged.mjs', rule: 'walker', walker: 'walk',
     reason: 'Walks a packaged app BUNDLE dir (a CLI arg, e.g. a signed .app) to diff its file list '
       + 'before/after a run — not repo content.',
   },
   {
-    file: 'engine/scripts/clean-texture-cache.mjs', rule: 'walker',
-    reason: 'Walks the local BUILD CACHE (.cache/modoki-textures) — not tracked/repo content.',
+    file: 'engine/scripts/clean-texture-cache.mjs', rule: 'walker', walker: 'walkSourceDirs',
+    reason: 'walkSourceDirs(CACHE_DIR) walks the local BUILD CACHE (.cache/modoki-textures) — its '
+      + '"source dirs" are the per-source-texture folders INSIDE the cache, not repo sources. Not '
+      + 'tracked/repo content.',
   },
   {
-    file: 'engine/scripts/generate-icons.mjs', rule: 'walker',
+    file: 'engine/scripts/clean-texture-cache.mjs', rule: 'walker', walker: 'dirSize',
+    reason: 'Sums the byte size of one cache folder walkSourceDirs() yielded, to report what the '
+      + 'clean freed — the same build cache, measured rather than enumerated.',
+  },
+  {
+    file: 'engine/scripts/generate-icons.mjs', rule: 'walker', walker: 'collect',
     reason: 'Walks a project\'s own native ios/android OUTPUT tree to snapshot build collateral '
       + 'for equality-checking around the generator\'s product dir — not a source corpus.',
   },
   {
-    file: 'engine/scripts/ota/buildManifest.mjs', rule: 'walker',
+    file: 'engine/scripts/ota/buildManifest.mjs', rule: 'walker', walker: 'walk',
     reason: 'Walks a built dist/ directory (build output) to hash files for the OTA manifest — '
       + 'not repo/tracked content.',
   },
   {
-    file: 'engine/scripts/scaffold-project.mjs', rule: 'walker',
+    file: 'engine/scripts/scaffold-project.mjs', rule: 'walker', walker: 'walk',
     reason: 'Walks the freshly-scaffolded PROJECT OUTPUT it just copied, to token-substitute — '
       + 'ephemeral and not yet tracked at the point this runs.',
   },
   {
-    file: 'engine/scripts/smoke-debug-build-flag.mjs', rule: 'walker',
+    file: 'engine/scripts/smoke-debug-build-flag.mjs', rule: 'walker', walker: 'walk',
     reason: 'Walks a project\'s build dist/ output for a debug-marker sweep — build output, not '
       + 'repo/tracked content.',
   },
   {
-    file: 'engine/scripts/upload-dsyms.mjs', rule: 'walker',
+    file: 'engine/scripts/upload-dsyms.mjs', rule: 'walker', walker: 'walk',
     reason: 'Walks a depth-capped (3) DerivedData/build-product tree hunting `.dSYM` bundles — '
       + 'build output, not repo content, and already bounded rather than a general corpus walk.',
   },
@@ -306,24 +337,24 @@ const EXEMPT: ReadonlyArray<{ file: string; rule: 'ls-files' | 'walker'; reason:
    * WATCHED, and the same one `projectRoots.mjs` documents. Not a backlog: there is nothing to
    * migrate TO from inside a game. */
   {
-    file: 'games/court/tests/courtCache.ts', rule: 'walker',
+    file: 'games/court/tests/courtCache.ts', rule: 'walker', walker: 'walk',
     reason: 'Hashes Court\'s own source to key the sweep cache. Tracked content, but a game '
       + 'cannot import engine/scripts/repoCorpus.mjs (#29 portability, gamePortability.test.ts). '
       + 'Its HASH_ROOTS scope is a separate open question — see #830.',
   },
   {
-    file: 'games/court/tests/uiFontRoots.test.ts', rule: 'walker',
+    file: 'games/court/tests/uiFontRoots.test.ts', rule: 'walker', walker: 'walk',
     reason: 'Walks Court\'s asset tree to resolve font GUIDs. Same #29 bar as courtCache.ts.',
   },
   {
-    file: 'games/court/tests/sceneChrome.test.ts', rule: 'walker',
+    file: 'games/court/tests/sceneChrome.test.ts', rule: 'walker', walker: 'walk',
     reason: 'Walks Court\'s runtime/ to parse every patchUI call site against the scene (#804). '
       + 'The walk REPLACED a hand-listed pair of files, which was the narrowing surface a close-out '
       + 'review flagged: palette.ts calls patchUI and was not read at all. Same #29 bar as '
       + 'courtCache.ts — a game cannot import engine/scripts/repoCorpus.mjs.',
   },
   {
-    file: 'games/court/tests/courtConfigFields.test.ts', rule: 'walker',
+    file: 'games/court/tests/courtConfigFields.test.ts', rule: 'walker', walker: 'walk',
     reason: 'Walks Court\'s own runtime/ + packages/ to prove every CourtConfig field is READ '
       + '(#804). Landed USING repoFiles() and had to be reverted: gamePortability.test.ts failed '
       + 'on the ../../../engine/scripts/ reach. Same #29 bar as courtCache.ts — the two gates '
@@ -331,18 +362,18 @@ const EXEMPT: ReadonlyArray<{ file: string; rule: 'ls-files' | 'walker'; reason:
       + 'from inside a game.',
   },
   {
-    file: 'games/sling/tests/sling-assets.test.ts', rule: 'walker',
+    file: 'games/sling/tests/sling-assets.test.ts', rule: 'walker', walker: 'walk',
     reason: 'Walks games/sling/runtime/assets to build a GUID->path map. Same #29 bar.',
   },
   {
-    file: 'games/sling/tests/slingConfigFields.test.ts', rule: 'walker',
+    file: 'games/sling/tests/slingConfigFields.test.ts', rule: 'walker', walker: 'walk',
     reason: 'Walks games/sling\'s own runtime/ + packages/ to prove every SlingConfig field is '
       + 'READ (#1018) — the sibling of courtConfigFields.test.ts above, and exempt for the same '
       + '#29 reason: a game is copied OUT of the monorepo, so a reach into engine/scripts/ '
       + 'resolves only while it sits here and gamePortability.test.ts fails the build for it.',
   },
   {
-    file: 'demos/forest-camp/tests/forestCampConfigFields.test.ts', rule: 'walker',
+    file: 'demos/forest-camp/tests/forestCampConfigFields.test.ts', rule: 'walker', walker: 'walk',
     reason: 'Walks demos/forest-camp\'s own runtime/ + packages/ to prove every ForestCampConfig '
       + 'field is READ (#1018). Same #29 bar as the two above, and slightly harder: a DEMO is '
       + 'published to its own public repo by curated snapshot, so a path into engine/ would not '
@@ -355,38 +386,46 @@ const EXEMPT: ReadonlyArray<{ file: string; rule: 'ls-files' | 'walker'; reason:
    * principle: the directory each one walks is handed to it at build/run time and is frequently
    * outside the repo entirely (an opened project, a dist/, a scaffold target). */
   {
-    file: 'engine/electron/newProject.ts', rule: 'walker',
+    file: 'engine/electron/newProject.ts', rule: 'walker', walker: 'walkFiles',
     reason: 'Walks the freshly-scaffolded project OUTPUT it just copied, to token-substitute — '
       + 'ephemeral and not yet tracked. Production twin of the newProject.test.ts entry above.',
   },
   {
-    file: 'engine/plugins/asset-tree-shaker.ts', rule: 'walker',
+    file: 'engine/plugins/asset-tree-shaker.ts', rule: 'walker', walker: 'listFilesUnder',
     reason: 'Build-time walk of the OPEN PROJECT\'s asset tree to decide what ships. The project '
       + 'may live outside this repo (a game copied out, #29), where repoFiles() sees nothing.',
   },
   {
-    file: 'engine/plugins/backend/editorBackendRouter.ts', rule: 'walker',
-    reason: 'walkScripts() serves the editor backend at RUNTIME over the open project\'s dir — '
-      + 'again possibly outside this repo. A git enumeration is the wrong instrument for "what is '
-      + 'on disk right now" in a live editor.',
+    file: 'engine/plugins/backend/editorBackendRouter.ts', rule: 'walker', walker: 'walk', count: 2,
+    reason: 'TWO walkers, both named walk, both at editor RUNTIME. (1) walkScripts() serves the '
+      + 'open project\'s dir — possibly outside this repo; a git enumeration is the wrong instrument '
+      + 'for "what is on disk right now" in a live editor. (2) plannedMoveLandings() walks the FOLDER '
+      + 'a move is relocating, to mark each child\'s old and new path against the watcher (#867) — '
+      + 'a subtree the human just picked, mid-move, not a corpus. (Count measured 2026-09-13 by '
+      + '#1128; the row named only the first until then.)',
   },
   {
-    file: 'engine/plugins/detect-modules.ts', rule: 'walker',
+    file: 'engine/plugins/detect-modules.ts', rule: 'walker', walker: 'collectSceneFiles',
     reason: 'Build-time collectSceneFiles() over the open project\'s scenes/ subtree, to decide '
       + 'which engine modules to bundle. Project dir, not repo corpus.',
   },
   {
-    file: 'engine/plugins/inlinePlayable.ts', rule: 'walker',
-    reason: 'Walks the playable BUILD OUTPUT to inline and then prune it — build output, never '
-      + 'tracked.',
+    file: 'engine/plugins/inlinePlayable.ts', rule: 'walker', walker: 'walk',
+    reason: 'walk() collects every file of the playable BUILD OUTPUT (dist/) to inline it — build '
+      + 'output, never tracked.',
   },
   {
-    file: 'engine/plugins/vite-asset-scanner.ts', rule: 'walker',
+    file: 'engine/plugins/inlinePlayable.ts', rule: 'walker', walker: 'pruneEmpty',
+    reason: 'Deletes the directories left EMPTY under dist/assets after inlining — the same build '
+      + 'output as walk() above, and a deletion rather than a read, so there is no corpus at all.',
+  },
+  {
+    file: 'engine/plugins/vite-asset-scanner.ts', rule: 'walker', walker: 'scanDir',
     reason: 'Build-time scanDir() over the open project\'s assets to emit the manifest. Project '
       + 'dir, not repo corpus.',
   },
   {
-    file: 'scripts/scan-publish-safety.mjs', rule: 'walker',
+    file: 'scripts/scan-publish-safety.mjs', rule: 'walker', walker: 'walk',
     reason: 'Walks the assembled SNAPSHOT STAGE, not the repo — publish-engine-oss.sh:568 invokes '
       + 'it as `scan-publish-safety.mjs "$STAGE"`, and $STAGE is rsynced (:167) from that script\'s '
       + 'OWN `git ls-files` manifest. So it is downstream of the enumeration, not a second one. '
@@ -395,7 +434,7 @@ const EXEMPT: ReadonlyArray<{ file: string; rule: 'ls-files' | 'walker'; reason:
       + 'but NOT walked = 0.',
   },
   {
-    file: 'site/gen-sitemap.mjs', rule: 'walker',
+    file: 'site/gen-sitemap.mjs', rule: 'walker', walker: 'walk',
     reason: 'Walks site/.vitepress/dist — VitePress BUILD OUTPUT, gitignored, to emit sitemap.xml.',
   },
 ];
@@ -434,78 +473,46 @@ describe('corpus producers use the shared repoFiles()/repoCorpus.mjs (#799/#771/
     for (const f of files) assertScanIsSane(f.raw, f.code, f.rel);
   });
 
-  it(
-    'Rule 1: no file spawns `git ls-files` directly, outside the one sanctioned caller',
-    () => {
-      const exempt = new Set(
-        EXEMPT.filter((e) => e.rule === 'ls-files').map((e) => e.file),
-      );
-      const offenders = files
-        // repoCorpus.mjs is the ONE sanctioned caller — excluded structurally, not via EXEMPT,
-        // because it is not a producer awaiting migration onto itself.
-        .filter((f) => f.rel !== 'engine/scripts/repoCorpus.mjs')
-        .filter((f) => !exempt.has(f.rel))
-        .filter((f) => f.code.includes(LS_FILES_MARKER))
-        .map((f) => f.rel);
-      expect(
-        offenders,
-        `these files spawn \`git ${LS_FILES_MARKER}\` directly instead of importing repoFiles() `
-          + `from engine/scripts/repoCorpus.mjs (#799/#771/#805):\n${offenders.join('\n')}`,
-      ).toEqual([]);
-    },
-  );
+  /** A row whose file sits under a root (or an unpublished demo) this checkout does not ship is
+   *  ABSENT-BY-LAYOUT, not stale — six rows name games//site//scripts/ files the OSS snapshot does
+   *  not carry, and a curated demo subset ships under a present `demos/` root. Such a row is left
+   *  out of the ledger here; every other row is spent, so a present file that vanished or stopped
+   *  tripping its rule is reported over-blessed — the ledger IS the staleness check now, replacing
+   *  the per-file `stillFlags` loop and its `>= 1 survives` form. */
+  const shipped = (e: ExemptRow): boolean =>
+    rootIsPresent(e.file) && demoProjectIsPresent(e.file, files.map((f) => f.rel));
 
-  it('Rule 2: no file hand-rolls a recursive readdir walker', () => {
-    const exempt = new Set(EXEMPT.filter((e) => e.rule === 'walker').map((e) => e.file));
-    const offenders = files
-      .filter((f) => !exempt.has(f.rel))
-      .filter((f) => hasRecursiveReaddirWalker(f.code, f.rel))
-      .map((f) => f.rel);
-    expect(
-      offenders,
-      'these files hand-roll a recursive readdirSync walker instead of importing repoFiles() '
-        + `from engine/scripts/repoCorpus.mjs (#799/#771/#805):\n${offenders.join('\n')}`,
-    ).toEqual([]);
+  it('Rule 1: no file spawns `git ls-files` directly, outside the one sanctioned caller', () => {
+    assertExemptionLedger({
+      label: 'EXEMPT (rule: ls-files) in corpusProducerIsShared',
+      population: files.flatMap((f) => f.code.split('\n').flatMap((line, i) =>
+        Array.from({ length: line.split(LS_FILES_MARKER).length - 1 }, () => ({ item: f.rel, site: `${f.rel}:${i + 1}` })))),
+      exempt: EXEMPT.filter((e) => e.rule === 'ls-files' && shipped(e))
+        .map((e) => ({ item: e.file, count: e.count, reason: e.reason })),
+      // repoCorpus.mjs is the ONE sanctioned caller — structural, not a producer awaiting migration
+      // onto itself. Its staleness check doubles as detector liveness, beside the synthetic pin below.
+      // This guard file quotes its own marker in string literals (reasons, messages, fixtures), which
+      // stripComments does not blank — the helper's "guard quoting its own subject" case. Its count
+      // moves with every edit to the prose, so it is structural, not a row with a number.
+      sanctioned: ['engine/scripts/repoCorpus.mjs', 'engine/tests/architecture/corpusProducerIsShared.test.ts'],
+      floor: 1,
+      fix: `spawn \`git ${LS_FILES_MARKER}\` through repoFiles() from engine/scripts/repoCorpus.mjs `
+        + '(#799/#771/#805), not directly.',
+    });
   });
 
-  /* ---------------------------------------------------------- The load-bearing property (⚠️). */
-
-  it('every EXEMPT entry is still ACTUALLY FLAGGED by the rule it claims (#799/#771/#805 Phase 2)', () => {
-    // This is the mechanism that keeps the ledger honest. When Phase 3/4 migrates a walker onto
-    // repoFiles(), its entry here goes STALE — the file no longer trips the rule — and this test
-    // must go RED until the entry is deleted. Without this check the ledger degrades into
-    // decoration: an entry that once meant something keeps "exempting" a file that would pass on
-    // its own, exactly like a `docs/` allowlist entry nobody re-checks (#578's whole lesson).
-    // Deliberately re-runs the REAL detectors (not a private re-implementation of the pattern) —
-    // two matchers free to disagree is how a load-bearing check ends up checking nothing.
-    const byRel = new Map(files.map((f) => [f.rel, f]));
-    const stale: string[] = [];
-    for (const e of EXEMPT) {
-      const f = byRel.get(e.file);
-      if (!f) {
-        // ⚠️ ABSENT-BY-LAYOUT is not STALE. Six rows name files under games//site//scripts/,
-        // which the OSS snapshot does not ship — reporting those as stale there would demand
-        // deleting rows that are load-bearing in the private repo. Only a file whose ROOT is
-        // present and which has nonetheless vanished is a real stale entry.
-        // `demos/` needs the second, per-PROJECT check: the snapshot ships a CURATED SUBSET of
-        // it, so the root is present while an unpublished demo under it is not.
-        if (rootIsPresent(e.file) && demoProjectIsPresent(e.file, byRel.keys())) {
-          stale.push(`${e.file} — no longer exists in the scanned corpus; drop this entry`);
-        }
-        continue;
-      }
-      const stillFlags = e.rule === 'ls-files'
-        ? f.code.includes(LS_FILES_MARKER)
-        : hasRecursiveReaddirWalker(f.code, f.rel);
-      if (!stillFlags) {
-        stale.push(`${e.file} (rule: ${e.rule}) — no longer trips this rule; drop this entry`);
-      }
-    }
-    expect(
-      stale,
-      'a Phase 3/4 migration landed and its EXEMPT entry is now stale bookkeeping — delete the '
-        + `entry (that IS the migration ledger updating itself):\n${stale.join('\n')}`,
-    ).toEqual([]);
+  it('Rule 2: no file hand-rolls a recursive readdir walker — counted per walker function', () => {
+    assertExemptionLedger({
+      label: 'EXEMPT (rule: walker) in corpusProducerIsShared',
+      population: files.flatMap((f) => recursiveReaddirWalkers(f.code, f.rel)
+        .map((fn) => ({ item: `${f.rel}::${fn}`, site: `${f.rel} — ${fn}()` }))),
+      exempt: EXEMPT.filter((e): e is ExemptRow & { rule: 'walker' } => e.rule === 'walker' && shipped(e))
+        .map((e) => ({ item: `${e.file}::${e.walker}`, count: e.count, reason: e.reason })),
+      // engine/scripts/ walkers ship in every layout; liveness proper is the synthetic pin below.
+      floor: 1,
+      fix: 'import repoFiles() from engine/scripts/repoCorpus.mjs (#799/#771/#805) instead of '
+        + 'hand-rolling a recursive readdirSync walker.',
+    });
   });
 
   /* ---------------------------------------------------------------------------- Non-vacuity. */

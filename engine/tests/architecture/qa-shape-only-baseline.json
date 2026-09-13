@@ -1,4 +1,5 @@
 {
+  "assetView.atlas.member.23.sprite": "Authored array index (`assetView.atlas.member.${i}.sprite`) — the 24th slot QA-ASSET-0013 appends to a 23-member atlas; no finite source-side vocabulary to derive from, same as particle.bursts.row.0.count above. Observed resolving live 2026-09-13 (#710).",
   "contextmenu.item.Move to Trash": "Interpolated context-menu label built from live project data (a folder/asset name), not a finite source-side literal — contextMenuItemIds's docblock explains why interpolated labels are deliberately not derived.",
   "contextmenu.item.Remove GroupAlpha": "Interpolated context-menu label (`Remove ${title}`), built from live project data — same as contextmenu.item.Move to Trash above.",
   "particle.bursts.row.0.count": "Authored array index (a `*.row.${i}.*` id) — no finite source-side vocabulary to derive from; see the 'Families with NO deriver' note above particleFieldIds.",

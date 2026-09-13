@@ -4,9 +4,11 @@ import { expect } from 'vitest';
  *
  *  ⚠️ **It lives in the PACKAGE, not in `engine/tests/helpers/`, and that is load-bearing** — the
  *  same reason `tapTargetFloor.ts` gives. The guards that need it are spread across three test
- *  surfaces: `engine/tests/**`, this package's own `tests/**` (`determinismGuard`,
- *  `inputSourceGuard`, `keymapHmrEpochGuard`), and a PROJECT's own `tests/**`
- *  (`games/court/tests/worldSwap.test.ts`, `games/wordweave/tests/difficulty.test.ts`). A game is
+ *  surfaces: `engine/tests/**`, this package's own `tests/**` (`determinismGuard` and
+ *  `inputSourceGuard` call it today), and a PROJECT's own `tests/**` — where no guard calls it YET.
+ *  ⚠️ This docblock used to name `keymapHmrEpochGuard`, `games/court/tests/worldSwap.test.ts` and
+ *  `games/wordweave/tests/difficulty.test.ts` as users; none of the three calls it (#1128 census) —
+ *  they are hand-rolled ledgers still awaiting a verdict, which is a different thing. A game is
  *  copied out of the monorepo and a demo is published as a standalone snapshot carrying only its
  *  own `tests/`, so `engine/tests/…` is unreachable from either by construction —
  *  `gitReadIsBounded`'s own EXEMPT row records hitting exactly this wall ("Cannot import the engine
@@ -131,11 +133,22 @@ export function assertExemptionLedger(check: ExemptionLedgerCheck): void {
     + 'matching cannot green every check below it, and 0 is the one value that gives that back.',
   ).toBeGreaterThanOrEqual(1);
 
+  // ⚠️ **Below the floor has TWO causes, and the message must name the second when it applies.** The
+  // floor arm runs before over-blessed on purpose (a dead detector makes every later arm vacuous),
+  // but a population also falls below it when every exempt occurrence was just FIXED — and then
+  // "the detector has stopped matching" sends the author to debug a detector that works (#1128
+  // close-out review, measured on docCitations and qaCaseReferences). So rows that now find nothing
+  // are listed, with what to do about them.
+  const foundItems = new Set(population.map((o) => o.item));
+  const emptyRows = [...new Set(exempt.map((e) => e.item))].filter((item) => !foundItems.has(item)).sort();
   expect(
     population.length,
     `${label}: the detector found ${population.length} occurrence(s), below the floor of ${floor}. `
     + 'It has stopped matching — every check below would pass having examined nothing, which is '
-    + 'exactly the failure this helper exists to prevent.',
+    + 'exactly the failure this helper exists to prevent.'
+    + (emptyRows.length === 0 ? '' : '\n\nOR every occurrence these rows excused was just fixed — they '
+      + 'now find NOTHING. If so the detector is fine: delete the rows (and resize `floor` if it was '
+      + `sized to them):\n${emptyRows.join('\n')}`),
   ).toBeGreaterThanOrEqual(floor);
 
   const occurrences = new Map<string, string[]>();

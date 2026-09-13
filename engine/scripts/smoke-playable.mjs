@@ -80,6 +80,37 @@ const bootState = (page) => page.evaluate(() => ({
   canvasW: document.querySelector('canvas')?.width || 0,
   bootErr: (document.body || document.documentElement).getAttribute('data-playable-error'),
   installPill: !!document.querySelector('button[aria-label="Install"]'),
+  // #1108 — an ad placeholder that shipped INSIDE the ad. Matched on rendered text, deliberately:
+  // the UI renderer attaches no per-entity attribute, so there is no name selector for the slot,
+  // and a geometry rule ("an opaque full-width strip across the bottom") cannot tell a fake banner
+  // from a legitimate bottom HUD row — it would need an allowlist on day one. This needs none.
+  // ⚠️ What it cannot see: a placeholder with no text, one drawn as an image or on the canvas, or
+  // one positioned off the bottom edge. And it is a repo-wide ban on the PHRASE, so a creative
+  // whose legitimate copy says "no banner ads" would fail it and need an allowlist then.
+  adPlaceholder: (() => {
+    const m = /^.*\bbanner ad\b.*$/im.exec(document.body?.innerText || '');
+    return m ? m[0].trim().slice(0, 80) : null;
+  })(),
+  // ⚠️ **The positive control for the check above, and it is load-bearing** (#1108 close-out
+  // findings F2 + round-2 finding 6). `adPlaceholder` is an ABSENCE, and an absence is trivially
+  // true before the game's UI exists: measured on a banner-carrying build, `innerText` at the
+  // moment `__PLAYABLE_ASSETS__ && canvas` resolves is just "Loading… | Install" and the match is
+  // null. Only the fixed 1500 ms sleep stood between that and a vacuous PASS.
+  //
+  // ⚠️ **The first fix for that was ALSO an absence** — `!/Loading/.test(innerText)` — which is
+  // true of an EMPTY body, so a bundle that throws before React mounts still printed PASS
+  // (measured: `t=6ms {booted:true, txt:""}`). And it double-banned a phrase: `games/court` renders
+  // 'Loading…' in its own store panel, so a court creative showing that panel would have FAILED.
+  // Both gone: this counts RENDERED DOM UI instead, which is what a text probe for the banner
+  // actually depends on.
+  //
+  // The banner is a DOM UI element, so "no DOM UI at all" makes the probe meaningless rather than
+  // passing — reported `n/a`, the same way check 1b handles a project that ships no audio.
+  uiTextEls: [...document.body.querySelectorAll('*')]
+    .filter((el) => el.getAttribute('aria-label') !== 'Install'
+      && !!(el.textContent || '').trim()
+      && ![...el.children].some((c) => (c.textContent || '').trim()))
+    .length,
 }));
 
 // `channel:'chromium'` uses the full Chromium build (no chrome-headless-shell dependency).
@@ -111,6 +142,26 @@ try {
     ok('1c WebGL canvas renders', s.canvas && s.canvasW > 0, `canvas w=${s.canvasW}`);
     ok('1d no bootstrap error', !s.bootErr, s.bootErr || '');
     ok('1e no console/page errors', errors.length === 0, errors.slice(0, 2).join(' | '));
+    // An MRAID creative has no ad SDK and can never fill a banner, so a banner placeholder in it is
+    // not "unfilled" — it is dead pixels the creative paid for, and it sits under the Install CTA.
+    // wordweave shipped one across 9.1% of the ad (#1108) and this script, which already drove the
+    // artifact, was the only thing in the repo positioned to catch it.
+    // ⚠️ The presence half is not a nicety: without it this check cannot fail on a creative whose
+    // UI never rendered, which is the state it is MOST likely to be in. Wait for DOM UI to appear
+    // rather than for a phrase to disappear.
+    await page.waitForFunction(() => [...document.body.querySelectorAll('*')]
+      .filter((el) => el.getAttribute('aria-label') !== 'Install'
+        && !!(el.textContent || '').trim()
+        && ![...el.children].some((c) => (c.textContent || '').trim())).length > 3,
+    { timeout: 10000 }).catch(() => {});
+    const sBoot = await bootState(page);
+    if (sBoot.uiTextEls > 3) {
+      ok('1h no ad-banner placeholder in the creative', !sBoot.adPlaceholder, sBoot.adPlaceholder || '');
+    } else {
+      console.log(`n/a   1h no ad-banner placeholder — ${project} rendered ${sBoot.uiTextEls} DOM `
+        + 'text elements, so a text probe cannot see a banner either way (1c/1d/1e cover a '
+        + 'creative that failed to render at all)');
+    }
     // Audio must NOT auto-play on load: muted until the FIRST user gesture (even standalone, where
     // the ad is "viewable" immediately). Then a tap unmutes it.
     const mutedOnLoad = await page.evaluate(() => globalThis.__playableAudioMuted?.() ?? null);

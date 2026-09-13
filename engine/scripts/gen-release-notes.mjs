@@ -32,10 +32,11 @@ const git = (...args) => execFileSync('git', args, { encoding: 'utf8', maxBuffer
 const gitSafe = (...args) => {
   try { return git(...args); } catch (e) {
     // ⚠️ Only a git VERDICT is swallowed. `describe` legitimately fails with status 128 when there
-    // is no previous tag, which is what this wrapper exists for — but a throw with no numeric
-    // `status` means the command never ran to a verdict (measured: maxBuffer overflow gives
-    // `code:'ENOBUFS', status:null`; git saying no gives `status:128`). Returning '' for THAT
-    // emitted empty release notes and exited 0 (#1120).
+    // is no previous tag, which is what this wrapper exists for — but a throw carrying a `code`
+    // means the command never ran to a verdict (measured: maxBuffer overflow gives
+    // `code:'ENOBUFS'`, with `status` null OR a real exit code depending on a race, #1127; git
+    // saying no gives a bare `status:128`). Returning '' for THAT emitted empty release notes and
+    // exited 0 (#1120).
     if (!isGitVerdict(e)) throw e;
     return '';
   }

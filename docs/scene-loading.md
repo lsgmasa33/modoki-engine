@@ -142,6 +142,39 @@ Two constraints on any future caller:
   world they replace through the one `destroyWorldWhenSafe` helper, so the 16-world cap is no longer
   the argument here.
 
+### GAME systems tick before the first scene exists (#1110)
+
+⚠️ **A game system runs from the app's FIRST frame, several frames before `loadScene` — so a world
+with none of your authored entities in it is a state every game system must tolerate.** This is not
+an edge case on a slow device; it is every boot.
+
+`App.tsx` registers the ECS pipeline as a plain hook, and the run mode defaults to `playing`
+(`runtime/core/playState.ts`), so `SYSTEM_PRIORITY.GAME` systems are already ticking while the boot
+effect awaits, in order: `registerSystems()` → app services → `PlayerPrefs.init` → `loadConfig` →
+tier resolve → mount the renderers → **wait two frames** → `ensureManifestLoaded` →
+`checkAppOtaUpdate()` → and only then `sceneManager.loadScene`.
+
+The failure it produces is silent, and the shape is always the same: the system reads a scene-authored
+entity, gets nothing, and treats "nothing" as a legitimate value rather than as "not yet".
+`games/wordweave` spawned its entire board — 38 visible entities — parented to the world ROOT,
+because `world.queryFirst(Canvas2D)` returned nothing and its spawn helper took `0` as a parent id.
+Everything then worked anyway, because `setCurrentWorld` throws that world away and the real scene
+rebuilds under the real canvas, so the only visible symptom was a wall of `[Scene2D]` orphan warnings
+naming entities that were plainly on screen (a later generation of them, under the same names).
+
+**So: gate on the authored thing you need, not on a clock or a frame count.** wordweave now refuses
+to build while `hostCanvasId(world) === 0`. Two riders learned with it:
+
+- ⚠️ **Surface the refusal, but only where it is actually wrong.** Skipping work in the pre-scene
+  window is routine and must stay silent; a scene that genuinely lacks the entity is an authoring
+  defect and has to say so, or the fix is a net loss in diagnosability (before the gate, the engine
+  reported it 38 times). Discriminate with a **scene-authored singleton** — wordweave keys off
+  `WordweaveConfig`, whose presence means the scene loaded.
+- ⚠️ **Test fixtures reproduce this state by accident, and then pin it.** Fourteen wordweave
+  fixtures built the board into a canvas-less test world and passed, because nothing asserted where
+  the entities landed — which is exactly why the production defect survived a 7105-test suite. A
+  fixture that omits an entity the real scene always authors is modelling the bug.
+
 ## Resource cache with refcounting
 
 `runtime/loaders/meshTemplateCache.ts` is a content cache keyed by the resolved

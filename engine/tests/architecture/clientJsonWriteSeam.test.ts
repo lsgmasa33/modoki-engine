@@ -41,6 +41,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles, repoRoot } from '../../scripts/repoCorpus.mjs';
 
 /** The one thing every reach of the route has in common, regardless of how the call composed
@@ -58,16 +59,27 @@ const SANCTIONED = 'engine/packages/modoki/src/editor/backend/editorBackend.ts';
 
 /** Every OTHER file whose CODE (comment-stripped) still reaches the route directly, with the
  *  reason it is not a JSON call site awaiting migration onto `writeAssetFile`/`jsonFileBody`.
- *  Keep this SHORT and reasoned — an entry is a claim that the write is genuinely binary. */
-const EXEMPT: ReadonlyArray<{ file: string; reason: string }> = [
+ *  Keep this SHORT and reasoned — an entry is a claim that the write is genuinely binary.
+ *
+ *  ⚠️ **A row pardons a COUNT of route reaches, not the file (#1123/#1128).** It used to be skipped
+ *  whole with `exempt.has(rel)`, so a JSON writer added beside `modelImport.ts`'s one binary write
+ *  was green — in the very file whose reason already argues about ONE write among several. The
+ *  route string is the same at every reach, so the key is the bare file and the multiplicity lives
+ *  in `count`.
+ *
+ *  ⚠️ It counts route STRINGS, not requests (close-out review). A second literal is caught; a local
+ *  helper holding the one literal and called twice is not, and neither is swapping the one binary
+ *  write for a JSON write in place — same file, same count. The count bounds how many reaches a row
+ *  can hide; the reason still has to be true of the one it names. */
+const EXEMPT: ReadonlyArray<{ item: string; count?: number; reason: string }> = [
   {
-    file: 'engine/packages/modoki/src/editor/panels/assetViews/EnvironmentAssetView.tsx',
+    item: 'engine/packages/modoki/src/editor/panels/assetViews/EnvironmentAssetView.tsx',
     reason: 'Writes a browser-encoded UltraHDR JPEG as base64 (`bytesToBase64(jpeg)`) — binary, '
       + 'never JSON. `jsonFileBody` must never touch this content or it gains a spurious '
       + 'trailing byte and corrupts the asset.',
   },
   {
-    file: 'engine/packages/modoki/src/editor/scene/modelImport.ts',
+    item: 'engine/packages/modoki/src/editor/scene/modelImport.ts',
     reason: 'Writes a PNG texture extracted from the imported model, base64-encoded — binary, '
       + 'never JSON. The two JSON writers in this same file (material/mesh docs, via '
       + '`writeAssetFileOrAbort`) DO route through `jsonFileBody`; only this one binary write '
@@ -77,7 +89,7 @@ const EXEMPT: ReadonlyArray<{ file: string; reason: string }> = [
       + 'behaviour change this commit does not make).',
   },
   {
-    file: 'engine/packages/modoki/src/editor/scene/convertToGLB.ts',
+    item: 'engine/packages/modoki/src/editor/scene/convertToGLB.ts',
     reason: 'Writes a converted GLB (OBJ/FBX/DAE → GLB) as base64 — binary, never JSON.',
   },
 ];
@@ -105,32 +117,33 @@ function clientSources() {
 
 describe('every client-side reach of /api/write-file goes through the one wrapper (#835)', () => {
   it('no file outside the sanctioned wrapper (or an EXEMPT binary writer) reaches the route directly', () => {
-    const exempt = new Map(EXEMPT.map((e) => [e.file, e.reason]));
-    const offenders: string[] = [];
+    const reaches: Array<{ item: string; site: string }> = [];
     for (const { rel, abs } of clientSources()) {
-      if (rel === SANCTIONED || exempt.has(rel)) continue;
       const { code } = readScannedSource(abs);
-      if (code.includes(ROUTE)) offenders.push(rel);
+      const lines = code.split('\n');
+      lines.forEach((line, i) => {
+        for (let n = line.split(ROUTE).length - 1; n > 0; n--) reaches.push({ item: rel, site: `${rel}:${i + 1}` });
+      });
     }
-    expect(
-      offenders,
-      `these files reach ${ROUTE} directly instead of routing through writeAssetFile/jsonFileBody `
-        + `(editor/backend/editorBackend.ts, #835) — either move the write onto the shared wrapper, `
-        + `or add it to EXEMPT in this file with the reason it is genuinely binary:\n`
-        + offenders.join('\n'),
-    ).toEqual([]);
+    assertExemptionLedger({
+      label: 'EXEMPT in clientJsonWriteSeam',
+      population: reaches,
+      exempt: EXEMPT,
+      sanctioned: [SANCTIONED],
+      // 4 reaches measured 2026-09-13 (the sanctioned wrapper's one + the three binary writers), but
+      // the floor is 1 on purpose: an exact floor makes every legitimate FIX report "the detector
+      // stopped matching" instead of the over-blessed row it really is. Detector liveness is
+      // carried by `sanctioned` — its staleness check fails if the wrapper's own reach is not found.
+      floor: 1,
+      fix: `this reaches ${ROUTE} directly instead of routing through writeAssetFile/jsonFileBody `
+        + '(editor/backend/editorBackend.ts, #835), so a JSON write loses the trailing newline the '
+        + 'corpus carries. Move it onto the shared wrapper; only a genuinely BINARY write is exempt.',
+    });
   });
 
-  /** The exemption ledger must not rot into a place to silence the guard: every entry has to
-   *  name a file that still exists and still reaches the route — see `corpusProducerIsShared
-   *  .test.ts`'s identical check for why a stale entry is a hole nobody can see. */
-  it('every EXEMPT entry still exists and still reaches the route', () => {
-    for (const { file, reason } of EXEMPT) {
-      const abs = path.join(repoRoot(), file);
-      expect(fs.existsSync(abs), `EXEMPT file no longer exists: ${file}`).toBe(true);
-      const { code } = readScannedSource(abs);
-      expect(code.includes(ROUTE), `${file} no longer reaches ${ROUTE} — drop it from EXEMPT`).toBe(true);
-      expect(reason.length, `${file} needs a real reason`).toBeGreaterThan(40);
+  it('every EXEMPT reason is a real reason', () => {
+    for (const { item, reason } of EXEMPT) {
+      expect(reason.length, `${item} needs a real reason`).toBeGreaterThan(40);
     }
   });
 

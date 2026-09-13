@@ -36,6 +36,7 @@ import { describe, expect, it } from 'vitest';
 // below to compute brace/bracket DEPTH safely, so a stray `(`/`{`/`[` inside a tooltip string
 // cannot desync a balanced-span scan (#723 review finding H).
 import { stripComments, stripCommentsAndStrings, findDamagedCodeTokens, readScannedSource } from '@modoki/engine/testing';
+import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 
 /** `qa/README.md` is read as PROSE — the format spec's own tables and sentences are what these
  *  assertions are about, and Markdown has no comment syntax for a scan to be blinded by. */
@@ -339,8 +340,13 @@ function restoresEntries(v: unknown): unknown[] {
   return Array.isArray(v) ? v : [v];
 }
 
-const PROSE_ALLOWED: ReadonlyArray<{ file: string; token: string }> = [
-  { file: 'qa/cases/persistence/cloud-sync-two-device-progress-fork.md', token: 'line 123' },
+const PROSE_ALLOWED: ReadonlyArray<{ file: string; token: string; count?: number; reason: string }> = [
+  {
+    file: 'qa/cases/persistence/cloud-sync-two-device-progress-fork.md',
+    token: 'line 123',
+    reason: 'the ONE paragraph explaining the cite-the-symbol convention, which cannot make its point '
+      + 'without naming a line — an example, not a citation',
+  },
 ];
 
 /**
@@ -360,16 +366,25 @@ const PROSE_ALLOWED: ReadonlyArray<{ file: string; token: string }> = [
  * sense will be flagged as naming a clone lane and will need a row here; write the REAL reason on
  * it ("Vite's own default, not the hub's lane") rather than a lane reason that is not true.
  */
-const CLONE_PORT_ALLOWED: ReadonlyArray<{ file: string; port: number; reason: string }> = [
+const CLONE_PORT_ALLOWED: ReadonlyArray<{ file: string; port: number; count?: number; reason: string }> = [
   {
     file: 'qa/cases/packaged/reap-is-clone-and-app-scoped.md',
     port: 5180,
-    reason: "another clone's lane IS the subject — the case proves a reap does not cross clones",
+    count: 7,
+    reason: "another clone's lane IS the subject — the case proves a reap does not cross clones, so "
+      + 'the SIBLING clone (work-ai, 5180) is named once as the precondition and then addressed '
+      + 'directly at every step that must reach it: identity curls before and after the reap, its '
+      + 'editor-state curl, and the warning that modoki_identity "against 5180" answers from this '
+      + "clone instead. Every one is the other clone's port on purpose; none is this runner's lane",
   },
   {
     file: 'qa/cases/editor/ai-panel-reports-this-editors-ports.md',
     port: 5179,
-    reason: 'quotes the committed `${MODOKI_BACKEND:-http://127.0.0.1:5179}` default verbatim',
+    count: 5,
+    reason: 'quotes the committed `${MODOKI_BACKEND:-http://127.0.0.1:5179}` default verbatim — '
+      + 'three times (the context, the precondition, the pass criterion) — and names 5179 as the '
+      + "HUB twice around it, because the case's subject is the default resolving to the hub's "
+      + 'lane. It is the failure being tested for, never a port the runner uses',
   },
   {
     file: 'qa/cases/packaged/clean-install-renders.md',
@@ -386,12 +401,17 @@ const CLONE_PORT_ALLOWED: ReadonlyArray<{ file: string; port: number; reason: st
   {
     file: 'qa/cases/packaged/electron-only-surfaces-respond.md',
     port: 9222,
-    reason: "quotes the launcher's own `9222 + (backend − 5179)` CDP derivation",
+    count: 2,
+    reason: "one line, two meanings, both not a lane: the `chrome-devtools` MCP's own default 9222 "
+      + "(which the case says NOT to aim at), and the base of the launcher's `9222 + (backend − "
+      + "5179)` CDP derivation it contrasts that with",
   },
   {
     file: 'qa/cases/editor/ai-panel-reports-this-editors-ports.md',
     port: 9222,
-    reason: "quotes the source comment about a packaged editor showing another process's CDP 9222",
+    count: 2,
+    reason: "quotes the source comment about a packaged editor showing 'CDP 9222' green while 9222 "
+      + "was another process's — the one quoted sentence names the port twice",
   },
   // Both halves of the launcher's CDP formula are ledgered per file: the base (9222) and the hub
   // backend it offsets from (5179). Quoting a derivation is the opposite of hardcoding a lane —
@@ -420,9 +440,51 @@ const CLONE_PORT_ALLOWED: ReadonlyArray<{ file: string; port: number; reason: st
   },
 ];
 
-const LINE_REF_ALLOWED: ReadonlyArray<{ file: string; token: string }> = [
-  { file: 'qa/cases/persistence/cloud-sync-two-device-progress-fork.md', token: 'file.ts:123' },
+const LINE_REF_ALLOWED: ReadonlyArray<{ file: string; token: string; count?: number; reason: string }> = [
+  {
+    file: 'qa/cases/persistence/cloud-sync-two-device-progress-fork.md',
+    token: 'file.ts:123',
+    reason: 'the same convention paragraph, which spells the forbidden shape once as a placeholder '
+      + '(`file.ts`, not a real file) to show what not to write',
+  },
 ];
+
+/**
+ * Spend `rows` against `population` through `assertExemptionLedger` (#1128) — the one place this
+ * file's `{file, token}` ledgers are checked, so none of them can drift back to `.some()` MATCHING.
+ *
+ * ⚠️ **Matched rows pardoned every occurrence, and that is what this replaced.** `LINE_REF_ALLOWED`,
+ * `PROSE_ALLOWED` and `TOOLBAR_PROSE_ALLOWED` were each consulted with `.some`/`.find`, so a SECOND
+ * `file.ts:123` in the one exempt case — or a second bare toolbar id beside a ledgered snippet — was
+ * green (proven by addition on `work-qa`, #1134 → #1128). A row now spends `count` (default 1).
+ *
+ * ⚠️ **Every row is spent — none is filtered by whether its case exists.** The first cut dropped rows
+ * whose file was absent, "for the checkout with no corpus"; but every caller sits inside
+ * `describeCases`, which is `describe.skip` there, so that branch was unreachable and the filter's
+ * only real effect was to HIDE a row for a deleted case — green, where the matched form it replaced
+ * went red with "matched nothing" (close-out review, confirmed). A row naming a gone case now reports
+ * over-blessed, and would otherwise pre-approve whatever is next written at that path.
+ * With no rows at all, nothing is pardoned and the population must be empty outright, since
+ * `assertExemptionLedger`'s `floor >= 1` cannot hold over a population that is legitimately 0.
+ */
+function spendLedger(
+  label: string,
+  population: ReadonlyArray<{ item: string; site: string }>,
+  rows: ReadonlyArray<{ file: string; key: string; count?: number; reason: string }>,
+  fix: string,
+): void {
+  if (rows.length === 0) {
+    expect(population.map((o) => o.site), `${label}: pardoned by nothing.\n\n${fix}`).toEqual([]);
+    return;
+  }
+  assertExemptionLedger({
+    label,
+    population,
+    exempt: rows.map((r) => ({ item: `${r.file}::${r.key}`, count: r.count, reason: r.reason })),
+    floor: 1,
+    fix,
+  });
+}
 
 /**
  * Every `data-ui-id="…"` a case or doc cites.
@@ -2312,6 +2374,8 @@ describeCases('QA case references', () => {
    */
   it('no citation carries a line number — they rot silently, so cite the symbol (#680)', () => {
     const offenders: string[] = [];
+    // `citesALine` hits, one per occurrence, SPENT against LINE_REF_ALLOWED below (#1128).
+    const lineRefs: Array<{ item: string; site: string }> = [];
     // Anti-vacuity, same reasoning as the knowledge.md check: a detector that silently stops
     // matching would leave this passing forever over a suite full of line refs.
     let scanned = 0;
@@ -2327,8 +2391,7 @@ describeCases('QA case references', () => {
         if (REPO_TOP_LEVEL.test(stripLineRef(token))) scanned += 1;
         if (!citesALine(token)) continue;
         const t = token.replace(/[.,;)\]]+$/, '').trim();
-        if (LINE_REF_ALLOWED.some((a) => a.file === rel && a.token === t)) continue;
-        offenders.push(`${rel}: "${t}"`);
+        lineRefs.push({ item: `${rel}::${t}`, site: `${rel}: "${t}"` });
       }
       for (const span of codeSpans(body)) {
         if (isBareLineSpan(span)) offenders.push(`${rel}: "${span.trim()}"`);
@@ -2337,9 +2400,7 @@ describeCases('QA case references', () => {
       // heading, a link label or a table cell is invisible to it. Same blind spot the docs gate had.
       for (const token of nonCodeText(body).split(/\s+/)) {
         const t = token.replace(/[.,;)\]]+$/, '').trim();
-        if (citesALine(token) && !LINE_REF_ALLOWED.some((a) => a.file === rel && a.token === t)) {
-          offenders.push(`${rel}: "${t}"`);
-        }
+        if (citesALine(token)) lineRefs.push({ item: `${rel}::${t}`, site: `${rel}: "${t}"` });
       }
       // The `~L202` marker rots here exactly as it does in docs/ — it was only found there first.
       // Wiring it into one gate and not the other is how a shape comes back through the door the
@@ -2347,6 +2408,12 @@ describeCases('QA case references', () => {
       for (const m of citesALineByMarker(body)) offenders.push(`${rel}: "${m}"`);
     }
     expect(offenders).toEqual([]);
+    spendLedger(
+      'LINE_REF_ALLOWED in qaCaseReferences',
+      lineRefs,
+      LINE_REF_ALLOWED.map((a) => ({ file: a.file, key: a.token, count: a.count, reason: a.reason })),
+      'Cite the SYMBOL, not the line (#680) — name the function, export, action id or route.',
+    );
     // The suite cites thousands of code tokens; 500 is a floor no accident meets.
     if (HAS_CASES) expect(scanned).toBeGreaterThan(500);
   });
@@ -2429,23 +2496,26 @@ describeCases('QA case references', () => {
    * because README's own table quotes `saveSync.ts:1745` to explain the rule.
    */
   it('no citation writes a line number in prose either (#680)', () => {
-    const offenders: string[] = [];
     const docs: Array<{ rel: string; body: string }> = [
       ...cases.map((c) => ({ rel: c.rel, body: c.body })),
       ...suiteDocs(),
     ];
+    const proseRefs: Array<{ item: string; site: string }> = [];
     for (const { rel, body } of docs) {
       // Keyed file+TOKEN, exactly like LINE_REF_ALLOWED. It exempted the whole FILE first, which
       // was strictly wider for no reason: this is one of the most internals-heavy cases in the
       // suite, so "the merge branch at line 812 of saveSync.ts" appearing in it later would have
       // been invisible to both rules. The one legitimate occurrence is the paragraph explaining
       // this convention, which cannot make its point without naming a line.
-      for (const m of citesALineInProse(body)) {
-        if (PROSE_ALLOWED.some((a) => a.file === rel && a.token === m)) continue;
-        offenders.push(`${rel}: "${m}"`);
-      }
+      // Spent, not matched (#1128): a second `line 123` in the same case is an offender.
+      for (const m of citesALineInProse(body)) proseRefs.push({ item: `${rel}::${m}`, site: `${rel}: "${m}"` });
     }
-    expect(offenders).toEqual([]);
+    spendLedger(
+      'PROSE_ALLOWED in qaCaseReferences',
+      proseRefs,
+      PROSE_ALLOWED.map((a) => ({ file: a.file, key: a.token, count: a.count, reason: a.reason })),
+      'Cite the SYMBOL, not the line, in prose too (#680).',
+    );
     // Anti-vacuity: this rule had NONE, which made it unfalsifiable — see `citesALineInProse`.
     // The exempt paragraph is the one prose line reference the suite is allowed to contain, so
     // seeing exactly it proves the detector still fires.
@@ -2748,7 +2818,6 @@ describeCases('QA case references', () => {
    * per-clone table on purpose, marked as a copy of `editorPorts.mjs`.
    */
   it('no case hardcodes a per-clone port — the launcher derives it (#1098)', () => {
-    const offenders: string[] = [];
     const clonePorts = Object.values(CLONE_BACKEND_PORTS).flatMap((backend) => [
       backend,
       vitePortForBackend(backend),
@@ -2771,30 +2840,26 @@ describeCases('QA case references', () => {
     // so it is floored HERE and not only at the case count (#680 review: mutate where the guard
     // COLLECTS, not only where it reads).
     expect(clonePorts.length).toBeGreaterThanOrEqual(20);
-    const hits = new Set<string>();
+    expect(cases.length).toBeGreaterThan(0);
+    // ⚠️ **One population entry per LITERAL, not per file (#1128).** The detector was
+    // `RegExp.test(body)` — presence per `{file, port}` — so a row keyed `{file, port}` could not
+    // carry a count, and a SECOND `5179` added to a case allowed one quoted default was green. The
+    // staleness half is now the ledger's over-blessed arm, on the same population as the ban.
+    const literals: Array<{ item: string; site: string }> = [];
     for (const c of cases) {
       for (const port of clonePorts) {
-        if (!new RegExp(`\\b${port}\\b`).test(c.body)) continue;
-        hits.add(`${c.rel}:${port}`);
-        if (CLONE_PORT_ALLOWED.some((a) => a.file === c.rel && a.port === port)) continue;
-        offenders.push(
-          `${c.rel}: names port ${port} — derive it (bare \`launch-editor.sh\`, or ` +
-            '`node engine/scripts/editorPorts.mjs backend .`), or ledger it in CLONE_PORT_ALLOWED',
-        );
+        const n = c.body.match(new RegExp(`\\b${port}\\b`, 'g'))?.length ?? 0;
+        for (let i = 1; i <= n; i++) literals.push({ item: `${c.rel}::${port}`, site: `${c.rel} — port ${port} (#${i})` });
       }
     }
-    expect(cases.length).toBeGreaterThan(0);
-    // Every allowance still describes a real occurrence. Without this a ledger row outlives the
-    // literal it excused, and the next case to name that port in that file inherits a pass nobody
-    // granted it — the staleness `clonePortHardcoding.test.ts`'s DERIVATION_EXEMPT ratchet exists
-    // to stop.
-    const stale = CLONE_PORT_ALLOWED.filter((a) => !hits.has(`${a.file}:${a.port}`)).map(
-      (a) => `${a.file}:${a.port} (reason: ${a.reason})`,
-    );
-    // Asserted TOGETHER, not one after the other: with two sequential expects the first failure
-    // hides the second, so a run that is both offending and stale reports half its problem and
-    // costs a second full cycle to find the rest.
-    expect({ offenders, stale }).toEqual({ offenders: [], stale: [] });
+    assertExemptionLedger({
+      label: 'CLONE_PORT_ALLOWED in qaCaseReferences',
+      population: literals,
+      exempt: CLONE_PORT_ALLOWED.map((a) => ({ item: `${a.file}::${a.port}`, count: a.count, reason: a.reason })),
+      floor: 1,
+      fix: 'derive the port (bare `launch-editor.sh`, or `node engine/scripts/editorPorts.mjs backend .`), '
+        + 'or ledger it in CLONE_PORT_ALLOWED — per literal, with a reason that argues for each one.',
+    });
   });
 
   /**
@@ -3135,9 +3200,7 @@ describeCases('QA case references', () => {
    * every one repaired by hand. This is the mechanical check that stops the ninth.
    */
   it('no case writes the scene while Playing (the 409 is invisible in its own assertions)', () => {
-    const offenders = cases.flatMap((c) =>
-      PLAY_WRITE_ALLOWED[c.rel] ? [] : scanPlayOrdering(c.body).offenders.map((w) => `${c.rel}: ${w}`),
-    );
+    const offenders = cases.flatMap((c) => scanPlayOrdering(c.body).offenders.map((w) => `${c.rel}: ${w}`));
     expect(offenders).toEqual([]);
   });
 
@@ -3198,10 +3261,14 @@ describeCases('QA case references', () => {
    * ending Playing with the whole suite green.
    *
    * So the question is not "does this line look like a step" but "is every toolbar id in the
-   * PROCEDURE a real call" — and the handful that are not are ledgered per file **with a count**,
-   * the convention this file already uses (`LINE_REF_ALLOWED`, `CLONE_PORT_ALLOWED`,
-   * `PLAY_WRITE_ALLOWED`). A count, not a boolean, because a per-file boolean cannot see a SECOND
-   * bare mention appearing in a file that already has one (#1128 is that class).
+   * PROCEDURE a real call" — and the handful that are not are ledgered by file and NEARBY WORDING,
+   * each row SPENT per mention through `spendLedger` (#1128). ⚠️ This comment used to say they were
+   * "ledgered per file with a count, the convention this file already uses" — none of the rows it
+   * named carried a count, and these were `.find()`-matched, so a second bare mention beside a
+   * ledgered snippet was green (proven by addition, #1134). The wording key blocks a SUBSTITUTION
+   * placed more than the ±160-char window away from the snippet; only the count blocks an ADDITION.
+   * ⚠️ A substitution INSIDE the window — the ledgered mention removed, a press-written-as-prose added
+   * beside the same snippet — is still billed to the row and stays green, as it did before #1128.
    *
    * Both halves bite: a new prose mention fails, and so does a ledger row whose wording matches
    * nothing — so a case that CLEANS UP its prose must drop the row in the same commit.
@@ -3222,7 +3289,7 @@ describeCases('QA case references', () => {
    * - A case with no procedure heading is skipped entirely; the coverage floor above is what stops
    *   that hiding a case which presses Play.
    */
-  const TOOLBAR_PROSE_ALLOWED: { file: string; near: string; reason: string }[] = [
+  const TOOLBAR_PROSE_ALLOWED: { file: string; near: string; count?: number; reason: string }[] = [
     {
       file: 'qa/cases/gameview/first-click-into-game-panel-reaches-the-game.md',
       near: 'the game area itself carries no',
@@ -3244,6 +3311,7 @@ describeCases('QA case references', () => {
     {
       file: 'qa/cases/editor/ai-capture-contact-on-play-wiring.md',
       near: 'are real `data-ui-id`s',
+      count: 2,
       reason:
         'Its closing `## Note on selectors` names `.play` and `.stop` in one sentence. Under the old ' +
         'bare-name matcher those two cancelled each other, which is the only reason this case did ' +
@@ -3252,9 +3320,7 @@ describeCases('QA case references', () => {
   ];
 
   it('every toolbar transport id in a procedure is a real PRESS, or is ledgered prose (#1121)', () => {
-    const offenders: string[] = [];
-    const stale: string[] = [];
-    const used = new Set<string>();
+    const mentions: Array<{ item: string; site: string }> = [];
     let pressesSeen = 0;
     const WINDOW = 160;
     for (const c of cases) {
@@ -3268,27 +3334,24 @@ describeCases('QA case references', () => {
         const at = m.index ?? 0;
         if (presses.some(([s, e]) => at >= s && at < e)) continue; // part of a real tap
         const ctx = region.slice(Math.max(0, at - WINDOW), at + WINDOW);
-        const row = TOOLBAR_PROSE_ALLOWED.find((a) => a.file === c.rel && ctx.includes(a.near));
-        if (!row) {
-          offenders.push(
-            `${c.rel}: a toolbar id that is not a press — ${JSON.stringify(ctx.slice(WINDOW - 40, WINDOW + 40))}. ` +
-              "A press is `modoki_tap {selector: '[data-ui-id=\"gameView.toolbar.play\"]'}`; the scan reads " +
-              'the TAP, not the id, so transport written any other way does nothing. If this is genuinely ' +
-              'prose, ledger it in TOOLBAR_PROSE_ALLOWED with a nearby snippet and a reason.',
-          );
-          continue;
-        }
-        used.add(`${row.file}::${row.near}`);
+        // The KEY is the ledgered wording this mention sits beside, when there is one — so a row is
+        // spent per mention near its snippet, and a mention near no snippet is its own unpardonable
+        // key. The row list only NAMES the wording; how many mentions sit beside it is counted.
+        const near = TOOLBAR_PROSE_ALLOWED.find((a) => a.file === c.rel && ctx.includes(a.near))?.near;
+        const site = `${c.rel}: ${JSON.stringify(ctx.slice(WINDOW - 40, WINDOW + 40))}`;
+        mentions.push({ item: `${c.rel}::${near ?? `unledgered@${at}`}`, site });
       }
     }
-    expect(offenders).toEqual([]);
-    // A row whose snippet no longer sits beside a bare mention has outlived what it excused —
-    // including one naming a file that was renamed or deleted. Without this, a case that cleans up
-    // its prose leaves a row that silently excuses the NEXT mention to appear near that text.
-    for (const a of TOOLBAR_PROSE_ALLOWED) {
-      if (!used.has(`${a.file}::${a.near}`)) stale.push(`${a.file}: ledger row ${JSON.stringify(a.near)} matched nothing`);
-    }
-    if (HAS_CASES) expect(stale).toEqual([]);
+    // Staleness is the ledger's over-blessed arm now: a row whose wording no longer sits beside a
+    // bare mention — including one naming a deleted or renamed case — blesses more than it finds.
+    spendLedger(
+      'TOOLBAR_PROSE_ALLOWED in qaCaseReferences',
+      mentions,
+      TOOLBAR_PROSE_ALLOWED.map((a) => ({ file: a.file, key: a.near, count: a.count, reason: a.reason })),
+      "a toolbar id that is not a press. A press is `modoki_tap {selector: '[data-ui-id=\"gameView.toolbar.play\"]'}`; "
+        + 'the scan reads the TAP, not the id, so transport written any other way does nothing. If this is '
+        + 'genuinely prose, ledger it in TOOLBAR_PROSE_ALLOWED with a nearby snippet, a count and a reason.',
+    );
     // ⚠️ Anti-vacuity, and the ONLY corpus-level check that can see `TOOLBAR` stop matching: the
     // frozen baseline is drained to `[]`, so it reads `[] === []` and survives a dead detector, and
     // `HAS_A_PLAY`'s floor survives on its `play_control` alternative alone. A RATCHET, not slack —
@@ -3340,16 +3403,15 @@ const HAS_A_PLAY = new RegExp(
   `play_control[^}]{0,80}?["']?action["']?\\s*:\\s*["']play["']|${TOOLBAR('play').source}`,
 );
 
-/**
- * Cases allowed to write the scene while Playing, with the reason — the convention every other
- * check in this file follows (`LINE_REF_ALLOWED`, `PROSE_ALLOWED`, `CLONE_PORT_ALLOWED`).
- *
- * Empty today, and it exists because the legitimate case is easy to name: a case whose SUBJECT is
- * the 409 itself ("mutate during Play, EXPECT 409, confirm nothing was written") is correct and
- * desirable, and without this its only exits would be editing the test or rewording the step into
- * a braceless prose call — i.e. hiding a real assertion from the guard by accident.
+/*
+ * ⚠️ **No `PLAY_WRITE_ALLOWED` — deleted rather than migrated (#1128).** It was an EMPTY
+ * `Record<file, reason>` that skipped `scanPlayOrdering` for a whole case, and its docblock called
+ * that unspent, file-wide shape "the convention every other check in this file follows" — which was
+ * false (#1121 wrote it; the other ledgers were keyed file+token). Its first row would have
+ * pardoned every write-while-Playing in that case, not the one 409 the case is about. A case whose
+ * SUBJECT is the 409 gets a counted row through `spendLedger` when it exists; the detector is
+ * pinned on synthetic input by the `scanPlayOrdering` cases at the bottom of this file.
  */
-const PLAY_WRITE_ALLOWED: Record<string, string> = {};
 
 /**
  * Cases that end their procedure with the editor still Playing (#1121). Frozen so a NEW one fails
@@ -3464,8 +3526,8 @@ export function scanPlayOrdering(body: string): PlayOrderingScan {
       offenders.push(
         `${e.text} is called while Playing — /api/scene-mutate answers 409 there, so that step ` +
           `never runs. Write the value BEFORE the Play, or Stop first (qa/knowledge.md § 4). To ` +
-          `drive a Director mid-Play use engine.director. A case whose SUBJECT is the 409 belongs ` +
-          `in PLAY_WRITE_ALLOWED with a reason.`,
+          `drive a Director mid-Play use engine.director. A case whose SUBJECT is the 409 needs a ` +
+          `counted ledger row (spendLedger) with a reason — none exists today.`,
       );
     }
   }

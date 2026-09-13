@@ -963,11 +963,21 @@ other than the repo's size.
 throw into a semantic answer, so an overflow arrives as a fact about the repo: before #1120,
 `check-scene-churn.mjs` reported a long-committed scene as `NEW FILE (untracked)` and **skipped its
 diff**, and `gen-release-notes.mjs` emitted **empty release notes at exit 0**. So ask
-`isGitVerdict` (`engine/scripts/gitError.mjs`) before swallowing: a NUMERIC `status` means git ran
-and chose that exit code; anything else means no verdict was returned at all. Measured — overflow
-gives `code:'ENOBUFS', status:null`, git saying no gives `status:128`, a missing binary gives
-`ENOENT`. It asks about `status` rather than `code === 'ENOBUFS'` on purpose: the class is "never
-ran", not the one member that prompted it.
+`isGitVerdict` (`engine/scripts/gitError.mjs`) before swallowing: a numeric `status` with NO `code`
+means git ran and chose that exit code; anything else means no verdict was returned
+at all. Measured — git saying no gives a bare `status:128`, a missing binary gives `ENOENT`, and an
+overflow gives `code:'ENOBUFS'`. It asks for the absence of `code` rather than
+`code === 'ENOBUFS'` on purpose: the class is "never ran", not the one member that prompted it.
+
+⚠️ **A measured error shape can be ONE BRANCH OF A RACE (#1127).** The first `isGitVerdict` asked
+about `status` alone, because 300/300 overflows measured `status:null, signal:'SIGTERM'`. But the
+parent's overflow detection races the child's exit: a child that exits straight after its last write
+is reaped first, and the error carries `code:'ENOBUFS'` **and** `status:0`. The probe was a `node -e`
+child, whose slow teardown always loses; `/bin/sh -c printf` wins 1000/1000, and git wins whenever its
+output exceeds `maxBuffer` by less than one pipe buffer. It surfaced as one red `verify:publish` run
+that went green on re-run — a flake whose assertion mirrored the shipped predicate, so it was the
+predicate failing. Agreeing samples cannot establish that a shape is deterministic; drive the other
+branch on purpose, and assert the invariant rather than the premise.
 
 ⚠️ **Size the hazard by what the read GROWS with, not by commit count.** #1114 sized its own
 instance at ~25,575 commits (the repo is at 8,822) — years away, and the wrong axis. The nearest
@@ -1181,10 +1191,11 @@ enforces:
 
 - **Rows are SPENT, not matched.** `population` is one entry per occurrence; each `exempt` row spends
   `count` (default 1) of them, and the next occurrence is an offender. Matching with `.some()` instead
-  is the trap `qaCaseReferences`'s otherwise-correct `{file, token}` rows still carry.
+  is the trap `qaCaseReferences`' otherwise-correct `{file, token}` and `{file, near}` rows carried until #1128 — a second
+  copy of an exempt line-citation example, or a bare toolbar id beside an exempt one, was green.
 - **A row that blesses more than exists is an error too** (`"blesses N, found M"`), so a fix must
   deduct from its row in the same commit. The `>= 1 occurrence survives` form — which
-  `corpusProducerIsShared` and others carry — cannot see this: `>= 1` stays true however many extra
+  `corpusProducerIsShared` carried until #1128 — cannot see this: `>= 1` stays true however many extra
   occurrences appear.
 - **Measure per ITEM against the SUMMED budget.** Two rows for one item that jointly over-bless are
   the same fail-open one level down; the helper shipped that way for one commit and review caught it.
@@ -1203,7 +1214,8 @@ directions.
 
 ⚠️ **One ledger per BAN, never one ledger for two rules.** Three of the 16 served two independent bans
 from one row, so a reason written about one excused the other — `commentStripperIsShared`'s staleness
-check is `blockStripper || lineStripper`, so dropping one while keeping the other stays green, and
+check was `blockStripper || lineStripper`, so dropping one while keeping the other stayed green;
+`inputSourceGuard`'s one `Set<file>` let a keyboard-toggle reason pardon a raw POINTER listener; and
 `docCitations`' single list was read at three call sites where it pardoned nothing in two of them.
 
 ⚠️ **The falsifying mutation is ADDING a second occurrence to an already-exempt file, not deleting the
@@ -1224,15 +1236,37 @@ here. And **count on the source the DETECTOR sees**: every guard in this family 
 and #1123 was filed with `grep` figures that were inflated by docblock mentions in 7 of its 16 rows —
 its title said an exempt file held 8 wall-clock reads where the detector sees 2.
 
-Progress: **eight guards are on the ledger** — `determinismGuard`, `docCitations` and
-`importSettingSelectsSpliced` (Phase 1), plus `assetJsonGuard`, `handleProviderOwner`,
-`abandonmentIsShared`, `keymapOwnership` and `projectPresencePredicate` (Phase 2). A ninth,
+Progress: **seventeen guards are on the ledger** — `determinismGuard`, `docCitations` and
+`importSettingSelectsSpliced` (Phase 1); `assetJsonGuard`, `handleProviderOwner`,
+`abandonmentIsShared`, `keymapOwnership` and `projectPresencePredicate` (Phase 2); and the nine whose
+DETECTORS had to learn to count first (#1128 Phase 3) — `rendererLossHandling`, `clientJsonWriteSeam`,
+`metaReadPreferringPark`, `cliNativeBuildHeals`, `inputSourceGuard`, `commentStripperIsShared`,
+`corpusProducerIsShared`, `appManagerDisposeReachable` and `qaCaseReferences`' `CLONE_PORT_ALLOWED`.
+Every one of Phase 3's was mutation-checked by ADDITION and red where the file-keyed form was green.
+Counting also surfaced **four exempt files holding more than their reason covered** — all legitimate
+once read, none written down: a second `ls-files` spawn in `typecheck-projects.mjs`, a second walker
+in `editorBackendRouter.ts`, `inlinePlayable.ts`'s `pruneEmpty`, `clean-texture-cache.mjs`'s `dirSize`.
+That is the grain defect's usual shape — not an offender hiding, but a reason nobody re-read. A tenth,
 `editorAssetJsonGuard`, has **no ledger at all**: its single row pardoned zero occurrences, so it was
 deleted and replaced with the non-vacuity floor the guard had always lacked — which is the right
 outcome when a pardon turns out to be inert, and worth knowing before you reach for a row.
 
-The rest is **#1128**: eight per-file-boolean detectors that must learn to count, the enforcement
-guard that makes the helper non-optional, and ~30 exemption ledgers nobody has examined. ⚠️ Do not
+Three shapes the Phase 3 migrations kept meeting, recorded so the next one does not rediscover them:
+
+- **An EMPTY ledger is deleted, not migrated.** It has nothing to spend, and its first row would have
+  pardoned a whole file (`commentStripperIsShared`'s `RAW_READ_ALLOW`). A ban with no pardons is a
+  plain `toEqual([])`; since its clean-tree population is 0 and `floor` cannot be, pin its detector on
+  SYNTHETIC input instead (`inputSourceGuard`'s pointer ban).
+- **Keep `floor` at 1 and let `sanctioned` carry liveness.** A floor equal to the measured count
+  reports every legitimate FIX as "the detector has stopped matching" (the floor arm runs before
+  over-blessed). Where the one implementer is sanctioned, its staleness check already proves the
+  detector alive. Where the only occurrence is a pardon, removing it will trip the floor — still red,
+  read it as the row going stale.
+- **A guard that quotes its own marker in string literals is `sanctioned`, not counted** — its count
+  moves with every edit to its own prose (`corpusProducerIsShared`).
+
+The rest is **#1128 Phase 4**: the enforcement guard that makes the helper non-optional, and the
+exemption ledgers nobody has examined. ⚠️ Do not
 quote a remaining count from a marker that greps for `ALLOW*`/`EXEMPT*` names: migrating a guard makes
 it DISAPPEAR from such a census (measured 43 → 42 → 40 across the two phases, by a rename, a deletion
 and a split), so the number falls for reasons unrelated to progress.

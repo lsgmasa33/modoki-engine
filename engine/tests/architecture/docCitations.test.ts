@@ -1384,21 +1384,28 @@ describe('docs cite by SYMBOL, never by line number (#686)', () => {
    * enough to have a line 8100 exists in this repo too. Allowlisting is the narrow instrument;
    * mangling the value to satisfy the tool is the outcome this whole convention exists to avoid.
    */
-  const BARE_ALLOWED: ReadonlyArray<{ file: string; token: string }> = [
-    { file: 'docs/trusted-device-input.md', token: ':8100' },
+  const BARE_ALLOWED: ReadonlyArray<{ file: string; token: string; count: number; reason: string }> = [
+    {
+      file: 'docs/trusted-device-input.md',
+      token: ':8100',
+      // Measured 2026-09-13 (#1128). It was `.some()`-matched, so a FIFTH `:8100` added here was
+      // green (proven by addition on work-qa, #1134) — as would a real `:8100` line citation have
+      // been, under a reason about a port.
+      count: 4,
+      reason: "WebDriverAgent's HTTP port, named in four places the doc explains WDA provisioning and "
+        + 'reaching it — a port, never a line number',
+    },
   ];
 
-  /**
-   * Exceptions for the token and prose forms. Empty today, and present anyway.
-   *
-   * Without them the only way to excuse one legitimate citation in one doc is to widen a detector
-   * in `helpers/lineCitations.ts` — which is SHARED with the `qa/` gate, so a `docs/` exception
-   * would silently punch a hole in the rule covering every QA case. An allowlist keyed file+token
-   * is the narrow instrument; the detector is not.
+  /*
+   * ⚠️ **No TOKEN / PROSE / MARKER allowlists — deleted, not left empty (#1128).** They were empty
+   * `{file, token}` lists consulted with `.some()`, so their first row would have MATCHED — pardoning
+   * every repeat of that token in that doc. The reason they existed still holds: never excuse a doc
+   * by widening a detector in `helpers/lineCitations.ts`, which the `qa/` gate shares. So if one of
+   * those forms ever needs an exception, add a counted ledger shaped like `BARE_ALLOWED` below —
+   * not a matched list. The detectors themselves are pinned on synthetic input by
+   * `lineCitationsGuard.test.ts`.
    */
-  const TOKEN_ALLOWED: ReadonlyArray<{ file: string; token: string }> = [];
-  const PROSE_ALLOWED: ReadonlyArray<{ file: string; token: string }> = [];
-  const MARKER_ALLOWED: ReadonlyArray<{ file: string; token: string }> = [];
 
   function featureDocs(): Array<{ rel: string; body: string }> {
     const dir = path.join(repoRoot, 'docs');
@@ -1432,11 +1439,7 @@ describe('docs cite by SYMBOL, never by line number (#686)', () => {
     // Asserted, not returned on (#1071): a bare return here reported PASS over no docs at all.
     expect(docs.length, 'no feature docs found — the enumeration broke').toBeGreaterThan(0);
     const offenders: string[] = [];
-    const allowed = (
-      list: ReadonlyArray<{ file: string; token: string }>,
-      rel: string,
-      tok: string,
-    ) => list.some((a) => a.file === rel && a.token === tok.trim());
+    const bareSpans: Array<{ item: string; site: string }> = [];
     for (const { rel, body } of docs) {
       // `codeTokens`, NOT a whitespace split. `citesALine`'s contract is a code-span token, and
       // feeding it raw whitespace tokens broke it in both directions:
@@ -1448,9 +1451,7 @@ describe('docs cite by SYMBOL, never by line number (#686)', () => {
       //             (`` `ok:true`/`changed:1` ``), hitting the path shortcut. `codeTokens` splits
       //             INSIDE each span, so this false positive exists only for the split.
       for (const token of codeTokens(body)) {
-        if (citesALine(token) && !allowed(TOKEN_ALLOWED, rel, token)) {
-          offenders.push(`${rel}: "${token}"`);
-        }
+        if (citesALine(token)) offenders.push(`${rel}: "${token}"`);
       }
       // …and the PROSE, because `codeTokens` reads only spans and fences. Switching to it fixed a
       // false positive but silently narrowed the gate: an UNBACKTICKED `saveSync.ts:1745` in a
@@ -1458,32 +1459,44 @@ describe('docs cite by SYMBOL, never by line number (#686)', () => {
       // `nonCodeText` blanks the spans first, so this recovers those without re-fusing adjacent
       // spans into one slash-bearing token.
       for (const token of nonCodeText(body).split(/\s+/)) {
-        if (citesALine(token) && !allowed(TOKEN_ALLOWED, rel, token)) {
-          offenders.push(`${rel}: "${token}"`);
-        }
+        if (citesALine(token)) offenders.push(`${rel}: "${token}"`);
       }
       for (const span of codeSpans(body)) {
-        if (isBareLineSpan(span) && !allowed(BARE_ALLOWED, rel, span)) {
-          offenders.push(`${rel}: "${span}"`);
-        }
+        if (isBareLineSpan(span)) bareSpans.push({ item: `${rel}::${span.trim()}`, site: `${rel}: "${span.trim()}"` });
       }
-      for (const m of citesALineInProse(body)) {
-        if (!allowed(PROSE_ALLOWED, rel, m)) offenders.push(`${rel}: "${m}"`);
-      }
+      for (const m of citesALineInProse(body)) offenders.push(`${rel}: "${m}"`);
       // The `~L202` marker — invisible to both detectors above (no filename attached after a
       // whitespace split, and no literal "line" for the prose rule).
-      for (const m of citesALineByMarker(body)) {
-        if (!allowed(MARKER_ALLOWED, rel, m)) offenders.push(`${rel}: "${m}"`);
-      }
+      for (const m of citesALineByMarker(body)) offenders.push(`${rel}: "${m}"`);
     }
     expect(
       offenders,
       'Cite the SYMBOL, not the line (#686) — name the function, export, action id or route ' +
         'instead of a line number, which rots silently and no test can check. If a hit is ' +
-        'legitimate, add it to this file\'s TOKEN_ALLOWED / BARE_ALLOWED / PROSE_ALLOWED / ' +
-        'MARKER_ALLOWED with a reason; do NOT loosen helpers/lineCitations.ts, which another gate ' +
-        'shares. (Rationale lives in docs/doc-conventions.md, which is not in the OSS snapshot.)',
+        'legitimate, add a COUNTED ledger row with a reason (see BARE_ALLOWED); do NOT loosen ' +
+        'helpers/lineCitations.ts, which another gate shares. (Rationale lives in ' +
+        'docs/doc-conventions.md, which is not in the OSS snapshot.)',
     ).toEqual([]);
+    // Spent, not matched (#1128). A row whose doc this checkout does not ship is left out — the
+    // snapshot publishes a curated subset of docs/ — and with none left the bare spans must be
+    // empty outright, because the ledger's `floor >= 1` cannot hold over a population of 0.
+    // ⚠️ The cost of that filter, stated: it cannot tell "not shipped here" from "deleted", so a row
+    // for a DELETED doc goes silently dead rather than over-blessed (close-out review). This ledger
+    // never had a staleness check before #1128, so that is not a regression — but it is a hole.
+    const present = new Set(docs.map((d) => d.rel));
+    const live = BARE_ALLOWED.filter((r) => present.has(r.file));
+    if (live.length === 0) {
+      expect(bareSpans.map((b) => b.site), 'a bare span that is a line number — cite the symbol (#686)').toEqual([]);
+    } else {
+      assertExemptionLedger({
+        label: 'BARE_ALLOWED in docCitations',
+        population: bareSpans,
+        exempt: live.map((r) => ({ item: `${r.file}::${r.token}`, count: r.count, reason: r.reason })),
+        floor: 1,
+        fix: 'Cite the SYMBOL, not the line (#686). A bare span that is genuinely not a line number (a '
+          + 'port) gets a counted BARE_ALLOWED row, with a reason that covers every occurrence.',
+      });
+    }
   });
 });
 
