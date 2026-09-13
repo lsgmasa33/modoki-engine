@@ -58,6 +58,9 @@ const codeSpans = (text: string): string[] => [...text.matchAll(/`([^`\n]+)`/g)]
 
 const FILE_EXT = /\.(ts|tsx|mjs|cjs|sh|ps1|md|json|yml|yaml)$/;
 
+/** This repo's section-citation idiom: a backticked `.md` path, `§`, then a quoted heading. */
+const SECTION_CITATION = /`([^`\n]+\.md)`\s*§\s*"([^"\n]+)"/g;
+
 /** A repo-relative path: has a separator, a known extension, and no glob/placeholder/URL.
  *  ⚠️ `~/…` is excluded for the same reason `/…` is — it is ABSOLUTE, in the user's home, and
  *  resolving it against REPO_ROOT invents a path nobody wrote. Skills legitimately cite machine
@@ -76,13 +79,20 @@ const isRepoPath = (tok: string): boolean =>
 describe.skipIf(!HAS_SKILLS)('skill references', () => {
   it('every repo-relative path a skill cites exists', () => {
     const dangling: string[] = [];
+    let checked = 0;
     for (const file of skillFiles()) {
       const rel = toPosix(file.slice(REPO_ROOT.length + 1));
       for (const tok of new Set(codeSpans(readScannedSource(file, DOC_AS_PROSE).raw).filter(isRepoPath))) {
+        checked++;
         if (!existsSync(join(REPO_ROOT, tok))) dangling.push(`${rel} cites missing path: ${tok}`);
       }
     }
     expect(dangling).toEqual([]);
+    // Non-vacuity floor (#1105): an empty `dangling` is also what a `codeSpans`/`isRepoPath` that
+    // stopped matching produces. Only reached where `.claude/skills` exists, so it is sized to
+    // this corpus, not the public snapshot's (which skips the whole describe).
+    expect(checked, 'no repo-path citations found in any SKILL.md — the matcher is broken; fix it, do not delete this assertion')
+      .toBeGreaterThan(5);
   });
 
   /**
@@ -115,7 +125,7 @@ describe.skipIf(!HAS_SKILLS)('skill references', () => {
     for (const file of skillFiles()) {
       const rel = toPosix(file.slice(REPO_ROOT.length + 1));
       const text = readScannedSource(file, DOC_AS_PROSE).raw;
-      for (const m of text.matchAll(/`([^`\n]+\.md)`\s*§\s*"([^"\n]+)"/g)) {
+      for (const m of text.matchAll(SECTION_CITATION)) {
         const [, path, heading] = m;
         if (!isRepoPath(path) || !existsSync(join(REPO_ROOT, path))) continue; // covered above
         const headings = [...readScannedSource(join(REPO_ROOT, path), DOC_AS_PROSE).raw.matchAll(/^#{1,6}\s+(.*)$/gm)].map(
@@ -127,5 +137,21 @@ describe.skipIf(!HAS_SKILLS)('skill references', () => {
       }
     }
     expect(dangling).toEqual([]);
+  });
+
+  it('SECTION_CITATION matches the citation idiom, and not a markdown link or a bare path', () => {
+    // Pinned by a self-test rather than a yield floor (#1105): the skills hold ONE such citation
+    // today, so a floor would go red on an ordinary skill edit and blame the matcher for it.
+    // The section sign is written as a unicode escape, so no `.md` in this file's SOURCE is followed
+    // by a literal one: docCitations' title rule needs no backticks and spans up to 60 characters, so
+    // a concatenated or backticked fixture still read as a live citation there (see header).
+    const cites = (s: string) => [...s.matchAll(SECTION_CITATION)].map((m) => `${m[1]}#${m[2]}`);
+    const tick = '`';
+    const sect = '\u00a7';
+    expect(cites(`see ${tick}qa/README.md${tick} ${sect}"Executing a case" first`)).toEqual(['qa/README.md#Executing a case']);
+    expect(cites(`${tick}docs/build.md${tick}${sect} "Native"`)).toEqual(['docs/build.md#Native']);
+    const open = '(';
+    expect(cites(`[spec]${open}qa/README.md) ${sect}"Executing a case"`)).toEqual([]);
+    expect(cites(`${tick}qa/README.md${tick} is the spec`)).toEqual([]);
   });
 });

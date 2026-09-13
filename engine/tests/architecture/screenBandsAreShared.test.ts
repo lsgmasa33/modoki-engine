@@ -119,4 +119,21 @@ describe.skipIf(!hasInternalGames())('the band model is not re-implemented per g
       + 'engine\'s, and a second copy drifts field by field. Re-export the engine\'s instead; '
       + 'registering it per-game with your own Inspector rows is still correct.').toEqual([]);
   });
+
+  it('DECLARES_SOLVE matches a declared solver in either form, and not a call or an import', () => {
+    // Pinned by a self-test, not a yield floor (#1105): ONE game file declares solveBands today, so
+    // a floor would go red on a legitimate rename there and blame the regex for it.
+    expect(DECLARES_SOLVE.test('export function solveBands(bands: Band[]) {')).toBe(true);
+    expect(DECLARES_SOLVE.test('const solveBands = (b) => engineSolve(b);')).toBe(true);
+    expect(DECLARES_SOLVE.test('const layout = solveBands(bands, height);')).toBe(false);
+    expect(DECLARES_SOLVE.test("import { solveBands } from '@modoki/engine/runtime';")).toBe(false);
+  });
+
+  it('DECLARES_TRAIT_SCHEMA flags a re-declared schema, and not a re-export of the engine one', () => {
+    // A clean corpus has no instance, so the scan above cannot tell a working regex from one that
+    // stopped matching (#1105).
+    expect(DECLARES_TRAIT_SCHEMA.test('export const SCREEN_BAND_DEFAULTS = { role: "", weight: 1 };')).toBe(true);
+    expect(DECLARES_TRAIT_SCHEMA.test('const SCREEN_BAND_DEFAULTS={')).toBe(true);
+    expect(DECLARES_TRAIT_SCHEMA.test("export { SCREEN_BAND_DEFAULTS } from '@modoki/engine/runtime';")).toBe(false);
+  });
 });

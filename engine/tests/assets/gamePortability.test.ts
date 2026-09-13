@@ -188,10 +188,12 @@ describe.skipIf(!hasInternalGames())('game project portability (self-contained â
   it('a project using node builtins declares the node types itself (build scopes to ONE project)', () => {
     const nodeImport = /(?:from|import\()\s*['"](?:node:[a-z_/]+|fs|path|os|url|child_process|crypto)['"]/;
     const offenders: string[] = [];
+    let projectsUsingNode = 0;
     for (const proj of projects) {
       const files = walk(proj.dir).filter((f) => !f.includes(`${path.sep}tools${path.sep}`));
       const users = files.filter((f) => nodeImport.test(fs.readFileSync(f, 'utf8')));
       if (users.length === 0) continue;
+      projectsUsingNode++;
       const declares = files.some((f) => /\/\/\/\s*<reference\s+types="node"\s*\/>/.test(fs.readFileSync(f, 'utf8')));
       if (!declares) {
         offenders.push(
@@ -204,6 +206,9 @@ describe.skipIf(!hasInternalGames())('game project portability (self-contained â
       'Add `/// <reference types="node" />` to one of these files (see games/sling/tests/sling-assets.test.ts);\n' +
       `otherwise the per-game build fails on "Cannot find module 'node:fs'":\n${offenders.join('\n')}`,
     ).toEqual([]);
+    // Non-vacuity floor (#1105): a nodeImport that stopped matching `continue`s past every project.
+    expect(projectsUsingNode, 'no project imports a node builtin â€” nodeImport is broken; fix it, do not delete this assertion')
+      .toBeGreaterThan(0);
   });
 
   // Native projects must be self-contained too: the iOS pbxproj once referenced

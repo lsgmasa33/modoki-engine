@@ -9,7 +9,7 @@
  *  Each world has its own entity index (number → Entity) stored in a WeakMap, so
  *  disposing a world automatically disposes its index via GC. */
 
-import { createWorld, type World } from 'koota';
+import { createWorld, type Entity, type World } from 'koota';
 import { notifyListeners } from '../notifyListeners';
 
 let _currentWorld: World | null = null;
@@ -18,11 +18,11 @@ type SwapListener = (newWorld: World, oldWorld: World) => void;
 const listeners = new Set<SwapListener>();
 
 // Per-world entity index. WeakMap so old worlds GC cleanly.
-const entityIndices = new WeakMap<World, Map<number, any>>();
+const entityIndices = new WeakMap<World, Map<number, Entity>>();
 // Per-world guid→entity index, symmetric to the asset manifest's guidToEntry map.
 // Maintained by registerEntity/unregisterEntity/indexEntityGuid in world.ts; this is
 // what makes guid a first-class O(1) entity identity (not an O(n) world scan).
-const guidIndices = new WeakMap<World, Map<string, any>>();
+const guidIndices = new WeakMap<World, Map<string, Entity>>();
 
 /** Get the active main world. Creates one lazily on first call. */
 export function getCurrentWorld(): World {
@@ -69,7 +69,7 @@ export function onWorldSwap(fn: SwapListener): () => void {
 }
 
 /** Get the entity index for a given world (creates if missing). */
-export function getEntityIndex(world: World): Map<number, any> {
+export function getEntityIndex(world: World): Map<number, Entity> {
   let idx = entityIndices.get(world);
   if (!idx) {
     idx = new Map();
@@ -79,7 +79,7 @@ export function getEntityIndex(world: World): Map<number, any> {
 }
 
 /** Get the guid→entity index for a given world (creates if missing). */
-export function getGuidIndex(world: World): Map<string, any> {
+export function getGuidIndex(world: World): Map<string, Entity> {
   let idx = guidIndices.get(world);
   if (!idx) {
     idx = new Map();

@@ -125,9 +125,11 @@ function commandBlocks(md: string): string[] {
 describe('CLI build recipes resolve the toolchain the way the editor does (#159)', () => {
   it('no tracked markdown tells you to hand-roll a toolchain probe in a command block', () => {
     const offences: string[] = [];
+    let blocks = 0;
     for (const file of allMarkdown()) {
       const md = readScannedSource(path.join(REPO, file), DOC_AS_PROSE).raw;
       for (const block of commandBlocks(md)) {
+        blocks++;
         for (const line of block.split('\n')) {
           for (const { re, why } of BANNED) {
             if (re.test(line)) offences.push(`${file}: ${line.trim()}\n    → ${why}`);
@@ -136,6 +138,23 @@ describe('CLI build recipes resolve the toolchain the way the editor does (#159)
       }
     }
     expect(offences, `\n${offences.join('\n')}\n`).toEqual([]);
+    // Non-vacuity floor (#1105): `allMarkdown()`'s floor counts FILES, and the named-file test
+    // below pins which files are enumerated — neither proves `commandBlocks` still yields a block.
+    // Sized under the public snapshot, which carries only engine/build/docs markdown.
+    expect(blocks, 'no shell command blocks found in any tracked markdown — commandBlocks() is broken; fix it, do not delete this assertion')
+      .toBeGreaterThan(50);
+  });
+
+  it('each BANNED pattern flags the instruction it exists for, and not its replacement', () => {
+    // The sweep above greens on zero offences, which is also what a BANNED regex that stopped
+    // matching produces — and a clean corpus has no instance to prove otherwise (#1105).
+    const flagged = (line: string) => BANNED.filter(({ re }) => re.test(line)).length;
+    expect(flagged('export JAVA_HOME=$(/usr/libexec/java_home -v 21)')).toBe(1);
+    expect(flagged('export JAVA_HOME=/opt/homebrew/opt/openjdk@21')).toBe(1);
+    expect(flagged('ANDROID_HOME="/opt/homebrew/share/android-commandlinetools"')).toBe(1);
+    expect(flagged('ANDROID_SDK_ROOT=/opt/homebrew/share/android-sdk')).toBe(1);
+    expect(flagged('eval "$(node engine/scripts/print-toolchain-env.mjs)"')).toBe(0);
+    expect(flagged('export JAVA_HOME="$HOME/.modoki/toolchain/jdk-21"')).toBe(0);
   });
 
   it('the sweep actually reaches the places the two-file version missed', () => {

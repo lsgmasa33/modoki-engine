@@ -1,6 +1,6 @@
 /** Load a scene JSON file into an ECS world. Shared between editor and runtime. */
 
-import { type World } from 'koota';
+import { type Entity, type World } from 'koota';
 import { getCurrentWorld, spawnEntity, indexEntityGuid, findEntityById, findEntityByGuid } from '../core/ecs/world';
 import { getAllTraits, getTraitByName } from '../core/ecs/traitRegistry';
 import { loadModelTemplates, getCachedPrefab } from './meshTemplateCache';
@@ -107,7 +107,7 @@ export interface LoadSceneOptions {
   /** Fetch a prefab JSON file given its path. Returns null if not found. */
   fetchPrefab: (path: string) => Promise<object | null>;
   /** Called after all entities are spawned (runtime: registerEntity, editor: undo tracking) */
-  onEntitySpawned?: (entity: any, oldId: number) => void;
+  onEntitySpawned?: (entity: Entity, oldId: number) => void;
   /** Whether to preload model templates from ModelSource entities */
   loadModels?: boolean;
   /** Called to re-instantiate a prefab instance. The caller handles prefab fetch + entity creation.
@@ -1488,7 +1488,7 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   const world = options.world ?? getCurrentWorld();
   const allTraits = getAllTraits();
   const idMap = new Map<number, number>();
-  const spawnedByEntryId = new Map<number, any>(); // entry.id → spawned handle (for pass 2)
+  const spawnedByEntryId = new Map<number, Entity>(); // entry.id → spawned handle (for pass 2)
 
   // First pass: spawn all entities
   for (const entry of data.entities) {

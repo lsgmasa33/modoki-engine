@@ -332,4 +332,12 @@ describe('live-reload watchers share ONE extension gate, not two (#857)', () => 
     }
     expect(violators, violators.join('\n')).toEqual([]);
   });
+
+  it('EXTENSION_GATE flags both historical spellings of the duplicated gate, and not the shared helper', () => {
+    // Its half of the check above greens on zero matches, and a clean corpus has none (#1105).
+    expect(EXTENSION_GATE.test("if (path.extname(file) === '.json') {")).toBe(true);
+    expect(EXTENSION_GATE.test('if (extname(file).toLowerCase() === ".json") {')).toBe(true);
+    expect(EXTENSION_GATE.test('const target = pathToClassifyForChange(file);')).toBe(false);
+    expect(EXTENSION_GATE.test("if (path.extname(file) === '.glsl') {")).toBe(false);
+  });
 });

@@ -210,8 +210,9 @@ describe('worldRegistry', () => {
       const { getCurrentWorld, getEntityIndex } = await getModule();
       const world = getCurrentWorld();
       const idx = getEntityIndex(world);
-      idx.set(42, { id: 42 });
-      expect(getEntityIndex(world).get(42)).toEqual({ id: 42 });
+      const e = world.spawn();
+      idx.set(e.id(), e);
+      expect(getEntityIndex(world).get(e.id())).toBe(e);
     });
   });
 });

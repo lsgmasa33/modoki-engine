@@ -94,7 +94,7 @@ import {
   nearestEdgeInsertion, minPointsForShape, type Pt,
 } from '../../runtime/core/colliderPoints';
 import { colliderEditInfo, worldPointToLocal, localToWorld, pickVertex, colliderPickHalfExtents } from './colliderEdit2D';
-import { descendantUnionGizmoBox2D } from './gizmoBounds';
+import { descendantUnionGizmoBox2D, type GizmoBoundsEntity } from './gizmoBounds';
 import { gizmoWorldScale, rotateRingAim, scaleCenterAim, axisPickAim, ROTATE_RING_RADIUS, SCALE_XYZ_HALF_EXTENT, AXIS_PICKER_CENTER } from './gizmo3dAim';
 import { drawGizmo2D, hitTestGizmo2D, cursorForHandle, applyGizmoDrag2D, snapDragResult, DEFAULT_GIZMO_SNAP, worldToLocal2D, type GizmoHandle } from './Gizmo2D';
 import { layoutText } from '../../runtime/rendering/text/layoutText';
@@ -107,10 +107,10 @@ import { onMaterial3DDirty } from '../../runtime/rendering/materialDirty';
  *  text's anchor as the pivot. Returns null if the entity isn't a visible Text2D or
  *  its font hasn't loaded yet (gizmo just waits a frame, like the text render does).
  *  Lets the 2D gizmo target text — it has a Transform but no Renderable2D box. */
-function text2DGizmoBox(entity: { has: (t: unknown) => boolean; get: (t: unknown) => Record<string, unknown> } | null, text2dMeta: { trait: unknown } | undefined): { halfW: number; halfH: number; pivotX: number; pivotY: number } | null {
+function text2DGizmoBox(entity: GizmoBoundsEntity | null, text2dMeta: { trait: unknown } | undefined): { halfW: number; halfH: number; pivotX: number; pivotY: number } | null {
   if (!text2dMeta || !entity || !entity.has(text2dMeta.trait)) return null;
-  const t = entity.get(text2dMeta.trait) as Record<string, unknown>;
-  if (t.isVisible === false || !t.text) return null;
+  const t = entity.get(text2dMeta.trait);
+  if (!t || t.isVisible === false || !t.text) return null;
   const provider = getLoadedFont(t.font as string);
   if (!provider) return null;
   const layout = layoutText(provider, t.text as string, {
@@ -313,7 +313,7 @@ function findSkinnedRootId(selectedId: number | null): number | null {
     const ent = findEntity(cur);
     if (!ent) break;
     if (ent.has(ssMeta.trait)) return cur;
-    cur = ent.has(EntityAttributes) ? (ent.get(EntityAttributes).parentId as number) : 0;
+    cur = ent.get(EntityAttributes)?.parentId ?? 0;
   }
   return null;
 }
@@ -669,10 +669,7 @@ export default function SceneView() {
     if (selectedId === null) return false;
     const entity = findEntity(selectedId);
     if (!entity) return false;
-    if (entity.has(EntityAttributes)) {
-      const layer = entity.get(EntityAttributes).layer;
-      if (layer === '2d') return true;
-    }
+    if (entity.get(EntityAttributes)?.layer === '2d') return true;
     // Also check Canvas2D entities (parent containers)
     const c2d = getAllTraits().find(t => t.name === 'Canvas2D');
     return !!(c2d && entity.has(c2d.trait));
@@ -1756,9 +1753,8 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
         const mode = useEditorStore.getState().gizmoMode;
         const recFields = mode === 'translate' ? ['x', 'y'] : mode === 'rotate' ? ['x', 'y', 'rz'] : ['x', 'y', 'sx', 'sy'];
         const actions = g.members.map((m) => {
-          const me = findEntity(m.id);
-          if (!me || !me.has(Transform)) return null;
-          const tf = me.get(Transform);
+          const tf = findEntity(m.id)?.get(Transform);
+          if (!tf) return null;
           const after = { x: tf.x, y: tf.y, rz: tf.rz, sx: tf.sx, sy: tf.sy };
           const ref = entityRef(m.id);
           for (const k of recFields) { notifyFieldEdited(m.id, 'Transform', k, (after as Record<string, number>)[k]); markOverrideIfInstance(m.id, 'Transform', k); }
@@ -1775,9 +1771,8 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
       e.stopPropagation();
       e.preventDefault();
       const { entityId, localStart } = dragRef.current;
-      const entity = findEntity(entityId);
-      if (entity && entity.has(Transform)) {
-        const tf = entity.get(Transform);
+      const tf = findEntity(entityId)?.get(Transform);
+      if (tf) {
         const after = { x: tf.x, y: tf.y, rz: tf.rz, sx: tf.sx, sy: tf.sy };
         // before = the LOCAL transform at drag start (startTransform is world now).
         const before = { ...localStart };
@@ -2066,7 +2061,7 @@ function drawScene2D(ctx: CanvasRenderingContext2D, canvasEntityId: number, o: S
           ctx.setLineDash([]);
           for (const [eid, p] of bonePos) {
             const ent = findEntity(eid);
-            const pid = ent?.has(EntityAttributes) ? (ent.get(EntityAttributes).parentId as number) : 0;
+            const pid = ent?.get(EntityAttributes)?.parentId ?? 0;
             const pp = pid ? bonePos.get(pid) : undefined;
             if (pp) { ctx.beginPath(); ctx.moveTo(pp.x, pp.y); ctx.lineTo(p.x, p.y); ctx.stroke(); }
           }
@@ -3137,7 +3132,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
      *  ancestor are dropped so a parent+child selection moves the child once (Unity). */
     const groupMemberIds = (): number[] => filterOutDescendants(
       useEditorStore.getState().selectedEntityIds,
-      (id) => { const e = findEntity(id); return e?.has(EntityAttributes) ? (e.get(EntityAttributes).parentId as number) : 0; },
+      (id) => findEntity(id)?.get(EntityAttributes)?.parentId ?? 0,
     );
 
     // ── 2.5D billboard bone posing ──
@@ -3162,7 +3157,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         groupProxy.updateMatrixWorld(true);
         const members = groupMemberIds().map((id) => {
           const e = findEntity(id);
-          const parentId = e?.has(EntityAttributes) ? (e.get(EntityAttributes).parentId as number) : 0;
+          const parentId = e?.get(EntityAttributes)?.parentId ?? 0;
           const w = worldTransforms.get(id) ?? { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 };
           const tf = e?.has(Transform) ? e.get(Transform) : null;
           const before: Record<string, number> = tf ? { x: tf.x, y: tf.y, z: tf.z, rx: tf.rx, ry: tf.ry, rz: tf.rz, sx: tf.sx, sy: tf.sy, sz: tf.sz } : {};
@@ -3173,9 +3168,8 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         return;
       }
       if (gizmoEntityId === null) return;
-      const entity = findEntity(gizmoEntityId);
-      if (!entity || !entity.has(Transform)) return;
-      const tf = entity.get(Transform);
+      const tf = findEntity(gizmoEntityId)?.get(Transform);
+      if (!tf) return;
       gizmoDragStart = { x: tf.x, y: tf.y, z: tf.z, rx: tf.rx, ry: tf.ry, rz: tf.rz, sx: tf.sx, sy: tf.sy, sz: tf.sz };
       const o = gizmo.object;
       gizmoScaleStartSign = o ? { x: Math.sign(o.scale.x), y: Math.sign(o.scale.y), z: Math.sign(o.scale.z) } : null;
@@ -3253,7 +3247,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         const entity = findEntity(gizmoEntityId);
         if (!entity || !entity.has(Transform)) return;
         const mode = gizmo.getMode();
-        const pid = entity.has(EntityAttributes) ? (entity.get(EntityAttributes).parentId as number) : 0;
+        const pid = entity.get(EntityAttributes)?.parentId ?? 0;
         let parentRel: { x: number; y: number; rz: number; sx: number; sy: number } | null = null;
         if (pid && pid !== boneGizmo.spriteId) {
           const pEnt = findEntity(pid);
@@ -3278,7 +3272,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
 
       const entity = findEntity(gizmoEntityId);
       if (!entity || !entity.has(Transform)) return;
-      const parentId = entity.has(EntityAttributes) ? entity.get(EntityAttributes).parentId : 0;
+      const parentId = entity.get(EntityAttributes)?.parentId ?? 0;
       const local = worldToLocal(obj, parentId);
       const mode = gizmo.getMode();
       const current = entity.get(Transform);
@@ -3314,9 +3308,8 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         const recFields = mode === 'translate' ? ['x', 'y', 'z']
           : mode === 'rotate' ? ['x', 'y', 'z', 'rx', 'ry', 'rz'] : ['x', 'y', 'z', 'sx', 'sy', 'sz'];
         const actions = groupDrag.members.map((m) => {
-          const e = findEntity(m.id);
-          if (!e || !e.has(Transform)) return null;
-          const tf = e.get(Transform);
+          const tf = findEntity(m.id)?.get(Transform);
+          if (!tf) return null;
           const after = { x: tf.x, y: tf.y, z: tf.z, rx: tf.rx, ry: tf.ry, rz: tf.rz, sx: tf.sx, sy: tf.sy, sz: tf.sz };
           const ref = entityRef(m.id);
           // Record-mode + prefab-override hooks per member (mirrors the single-entity path).
@@ -3337,9 +3330,8 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         return;
       }
       if (gizmoEntityId === null || !gizmoDragStart) return;
-      const entity = findEntity(gizmoEntityId);
-      if (!entity || !entity.has(Transform)) return;
-      const tf = entity.get(Transform);
+      const tf = findEntity(gizmoEntityId)?.get(Transform);
+      if (!tf) return;
       const after = { x: tf.x, y: tf.y, z: tf.z, rx: tf.rx, ry: tf.ry, rz: tf.rz, sx: tf.sx, sy: tf.sy, sz: tf.sz };
       const before = { ...gizmoDragStart };
       const eid = gizmoEntityId;
@@ -4666,7 +4658,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
             if (renderState.billboards.has(anc)) { spriteId = anc; break; }
             seenAnc.add(anc);
             const e = findEntity(anc);
-            anc = e?.has(EntityAttributes) ? (e.get(EntityAttributes).parentId as number) : 0;
+            anc = e?.get(EntityAttributes)?.parentId ?? 0;
           }
           const entry = spriteId ? renderState.billboards.get(spriteId) : undefined;
           const sEnt = spriteId ? findEntity(spriteId) : null;

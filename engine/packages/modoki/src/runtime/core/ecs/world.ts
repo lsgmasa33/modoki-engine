@@ -4,7 +4,7 @@
  *  inside callbacks/functions (never capture at module load) so world swaps take
  *  effect immediately. */
 
-import { type World } from 'koota';
+import { type Entity, type World } from 'koota';
 import { getCurrentWorld, getEntityIndex, getGuidIndex, peekCurrentWorld } from './worldRegistry';
 import { EntityAttributes } from '../traits/EntityAttributes';
 import { emit, entityRef, isJournalEnabled } from '../journal';
@@ -27,7 +27,7 @@ let _onStructure: (() => void) | null = null;
 export function setStructureCallback(fn: (() => void) | null) { _onStructure = fn; }
 
 /** Find an entity by numeric ID in the given world (defaults to current main). */
-export function findEntityById(entityId: number, world: World = getCurrentWorld()) {
+export function findEntityById(entityId: number, world: World = getCurrentWorld()): Entity | undefined {
   return getEntityIndex(world).get(entityId);
 }
 
@@ -35,7 +35,7 @@ export function findEntityById(entityId: number, world: World = getCurrentWorld(
  *  Returns undefined for ''/unknown. Self-healing: on a miss it does ONE full scan,
  *  repopulates the whole guid map, and retries — so correctness holds even if a guid
  *  mint site forgot to call indexEntityGuid (the explicit wiring is just for speed). */
-export function findEntityByGuid(guid: string, world: World = getCurrentWorld()) {
+export function findEntityByGuid(guid: string, world: World = getCurrentWorld()): Entity | undefined {
   if (!guid) return undefined;
   const idx = getGuidIndex(world);
   let entity = idx.get(guid);

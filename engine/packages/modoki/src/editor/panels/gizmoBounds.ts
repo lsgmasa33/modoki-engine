@@ -13,8 +13,10 @@ export type GizmoBox2D = { halfW: number; halfH: number; pivotX: number; pivotY:
 /** The minimum an entity must answer for the union walk — deliberately structural rather than the
  *  koota `Entity` type, so a test can hand in plain objects instead of building a world. */
 export interface GizmoBoundsEntity {
-  has: (trait: unknown) => boolean;
-  get: (trait: unknown) => Record<string, unknown>;
+  has(trait: unknown): boolean;
+  /** `| undefined` because a koota handle's is — the never-undefined form only compiled while
+   *  `findEntity` returned `any` (#1151). */
+  get(trait: unknown): Record<string, unknown> | undefined;
 }
 
 export interface GizmoBoundsDeps {
@@ -74,6 +76,7 @@ export function descendantUnionGizmoBox2D(selectedId: number, deps: GizmoBoundsD
       const child = findEntity(childId);
       if (!child || !child.has(transformTrait)) continue;
       const t = child.get(transformTrait);
+      if (!t) continue;
       const cx = ox + num(t.x) * sx;
       const cy = oy + num(t.y) * sy;
       // A zero or absent scale must not collapse the subtree to a point — treat it as 1, matching
@@ -85,7 +88,7 @@ export function descendantUnionGizmoBox2D(selectedId: number, deps: GizmoBoundsD
       if (r2dTrait && child.has(r2dTrait)) {
         const rend = child.get(r2dTrait);
         // An explicitly hidden child contributes nothing — the box should hug what you can SEE.
-        if (rend.isVisible !== false) { hw = num(rend.width); hh = num(rend.height); }
+        if (rend && rend.isVisible !== false) { hw = num(rend.width); hh = num(rend.height); }
       } else if (measureText) {
         const tbox = measureText(child);
         if (tbox) { hw = tbox.halfW; hh = tbox.halfH; }

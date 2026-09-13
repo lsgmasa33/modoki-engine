@@ -18,7 +18,7 @@
  *  hardware — and that is a Capacitor guarantee, not ours. */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
 import { REPO_ROOT } from '../helpers/repoLayout';
@@ -134,13 +134,24 @@ describe('the hardware probe reads a plugin that is actually present (#146)', ()
     // dev clone stayed green — a red public `ci/main` for a tree-shape difference, not a bug.
     // `discoverProjects` skips absent roots by contract (see `scripts/projectRoots.mjs`).
     const withDevicePlugin: string[] = [];
-    for (const proj of discoverProjects(REPO_ROOT)) {
-      try {
-        const pkg = JSON.parse(readFileSync(path.join(proj.dir, 'package.json'), 'utf8'));
-        const deps = { ...pkg.dependencies, ...pkg.devDependencies };
-        if ('@capacitor/device' in deps) withDevicePlugin.push(`${proj.root}/${proj.name}`);
-      } catch { /* no package.json — not a workspace project */ }
+    const projects = discoverProjects(REPO_ROOT);
+    let read = 0;
+    for (const proj of projects) {
+      const file = path.join(proj.dir, 'package.json');
+      // Only an ABSENT package.json is "not a workspace project". The old bare `catch {}` also
+      // swallowed a malformed one, so a read that failed for every project passed (#1105).
+      if (!existsSync(file)) continue;
+      const pkg = JSON.parse(readFileSync(file, 'utf8'));
+      const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+      if ('@capacitor/device' in deps) withDevicePlugin.push(`${proj.root}/${proj.name}`);
+      read++;
     }
     expect(withDevicePlugin).toEqual([]);
+    // Non-vacuity floor (#1105), conditional and minimal: the public snapshot ships no projects, or
+    // a two-demo `--with-demos` subset on CI, while this clone reads 25.
+    if (projects.length > 0) {
+      expect(read, 'no project package.json was read — discovery or the read is broken; fix it, do not delete this assertion')
+        .toBeGreaterThan(0);
+    }
   });
 });

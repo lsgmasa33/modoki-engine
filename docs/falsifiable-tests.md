@@ -587,8 +587,65 @@ the shared helper (`assertExemptionLedger`) and the four arms it enforces live i
 the FALSIFIABILITY framing and that one owns the guard conventions.
 
 ⚠️ Related but distinct, and bending one fix across both serves neither: a guard with no non-vacuity
-FLOOR (#1105) has a fine population and greens on zero inputs, and a guard whose SCOPE is narrower
-than its claim (#830, #1124) never reaches the population at all.
+FLOOR (Shape G, below) has a fine population and greens on zero inputs, and a guard whose SCOPE is
+narrower than its claim (#830, #1124) never reaches the population at all.
+
+### Shape (G): the scan asserts no offences, and never that its MATCHER found anything (#1105)
+
+A corpus scan collects offences and ends in `expect(offences).toEqual([])`. A regex that stops
+matching produces the same empty list as a clean repo. A `repoFiles({ floor })` or a
+`toContain(file)` check does not close this: those prove the FILES were enumerated, not that the
+matcher yielded anything inside them. The first census found fifteen scans across ten files in this
+shape. Its close-out sweep found eight more inside larger test files that already had a floor
+somewhere, because a floor on one `it` covers nothing in the next. So census per `it`, not per file.
+Which fix applies depends on whether a clean corpus has any positive yield:
+
+- **The matcher has a legitimate yield** (citations, command blocks, `pkill` patterns, temp paths).
+  Count what the matcher returned and floor that count inline:
+  `expect(n, '<what> found — fix the matcher, do not delete this assertion').toBeGreaterThan(N)`.
+  Count AFTER any `continue` that sits between the match and the check, so a skip that eats
+  everything is caught too. Size `N` under the **public snapshot** wherever the scan runs there.
+  The snapshot has no `.claude/skills` or `games/`, and ships no demos or a two-demo subset (see
+  [verify-and-ci.md](verify-and-ci.md) on sizing floors to the snapshot). `cliToolchainRecipes`
+  counts 458 shell blocks on a clone but roughly 120 in the snapshot's markdown, so its floor is 50.
+- **A clean corpus yields ZERO** (a banned pattern: `BANNED`, the basename-reap rule, the
+  Windows `-like` predicate, a chained geometry destroy). A floor here is impossible, because a
+  correct run yields zero too. Put the matcher in ONE constant or function, and pin it with an
+  accept/reject self-test built from the shipped defect string. `uiLengthFallback` already had
+  this shape. `winProcessPredicates` only looked like it: its detection test carried its OWN copy
+  of the regex, so an edit to the sweep's copy left the test pinning a regex nothing ran.
+- **A completeness check skips the real instances before testing them.**
+  `packagedLaunchIsolation` skipped every listed launcher and then asked the detector about the
+  rest, so the detector never ran on a real launch. The positive control is the skipped set
+  itself: every listed launcher must read as a launch.
+- **An unparsed input is skipped instead of counted.** `buildTargetFloor`'s `if (m && …)` and
+  `deviceAppIdentity`'s bare `catch {}` both skipped input they failed to read. Report the
+  failure as an offence, and swallow only the absence the comment actually names. Converting the
+  parse failure is NOT enough on its own. `buildTargetFloor` skipped on `existsSync` BEFORE the
+  parse, so renaming the `CapApp-SPM` path segment still skipped every project and passed. The
+  review caught it by mutation, and the file now floors the count of files it parsed too.
+- **The yield is real but tiny.** Don't floor a population of one. The skills carry exactly ONE
+  `§`-heading citation, so a floor there goes red when a skill is edited, and its message blames
+  the matcher for it. Pin the regex with a self-test instead. Where a small floor is kept
+  deliberately (`reapScoping`'s 2 and 1, all in one script), its message names the other way it
+  can go red.
+- **A `> 0` floor only catches a TOTAL wipe-out.** A second review broke part of each matcher
+  and both floors stayed green. Deleting the array branch of `assetRefIntegrity`'s `stringValues`
+  cut 27,600 strings to about 2,400, blinding the scan to every entity's trait refs, and `> 0` passed.
+  In `sceneGuidUniqueness`, breaking the dominant `EntityAttributes.guid` read left 29 guids from the
+  top-level fallback, enough to hold a combined total above zero. Size the floor to the corpus, gated on
+  the private tree where it lives. When a read has a fallback, floor each path separately.
+
+The mutation bar applies to the floor itself. The #1105 pass broke each of the fifteen matchers
+once, then the eight from the close-out sweep and the three review fixes. Each time, exactly the
+intended test went red. The one exception was the geometry anchor mutation, which also reddened
+the corpus sweep that runs the same matcher.
+
+⚠️ **Check that a real-corpus control finds something before relying on it.** The first idea for
+`geometryRelease` was to count the helper's own sanctioned `destroy(true)` as a real-corpus
+instance. It counted **0**: the helper's parameter is named `g`, which the name-based matcher
+deliberately ignores, so the `inHelper` exemption exempts nothing today. Assuming the control
+matched would have added a floor that could never pass.
 
 ## Gotchas
 

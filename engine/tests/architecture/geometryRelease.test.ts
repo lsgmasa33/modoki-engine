@@ -371,3 +371,22 @@ describe('findScopedGeometryDestroys — parameter shadowing', () => {
     expect(findScopedGeometryDestroys(code)).toEqual([1]);
   });
 });
+
+// `findChainedBuilderDestroys` had no cover of its own, and a clean tree holds no instance of the
+// shape — so a matcher that stopped matching would green the sweep above indistinguishably (#1105).
+// No real-corpus control exists to pair with it: the helper's own `g.destroy(true)` is NOT matched
+// (a `g` parameter is neither geometry-named nor a `.geometry` decl), so nothing is exempted today.
+describe('findChainedBuilderDestroys', () => {
+  it('flags a builder result destroyed inline, including through ?. and nested parens', () => {
+    expect(findChainedBuilderDestroys(stripComments('buildMaterialQuad(1, 1, 0, 0).destroy(true);'))).toEqual([1]);
+    expect(findChainedBuilderDestroys(stripComments('x();\nbuildTextGeometryByPage(page, f(a, b))?.destroy();'))).toEqual([2]);
+  });
+
+  it('does NOT flag a builder result that is kept, or released through the helper', () => {
+    expect(findChainedBuilderDestroys(stripComments('const q = buildMaterialQuad(1, 1, 0, 0); releaseGeometry(q);'))).toEqual([]);
+    // A later `.destroy(` on the same line is NOT chained — only what immediately follows the
+    // builder's `)` is. This is the case that fails if CHAINED_DESTROY loses its `^\s*` anchor.
+    expect(findChainedBuilderDestroys(stripComments('const q = buildMaterialQuad(1, 1, 0, 0); q.destroy();'))).toEqual([]);
+    expect(findChainedBuilderDestroys(stripComments('mesh.geometry = buildMaterialQuad(w, h, 0, 0);'))).toEqual([]);
+  });
+});

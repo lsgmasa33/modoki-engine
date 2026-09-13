@@ -1094,7 +1094,7 @@ export function applyOverridesByRootInstance(
       if (!entity.has(meta.trait)) {
         // Added-trait override (root or child): the instance carries a trait the
         // prefab lacks at this localId. Add it whole so prefab refresh preserves it.
-        entity.add((meta.trait as (d: Record<string, unknown>) => unknown)(known));
+        entity.add(meta.trait(known));
       } else {
         for (const [field, value] of Object.entries(known)) {
           writeTraitField(ecsId, meta, field, value);

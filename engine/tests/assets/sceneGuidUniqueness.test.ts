@@ -32,7 +32,7 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
-import { REPO_ROOT, hasAnyProject } from '../helpers/repoLayout';
+import { REPO_ROOT, hasAnyProject, hasInternalGames } from '../helpers/repoLayout';
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
 
 /** Every committed scene: each project's own scenes plus the scaffolder template's
@@ -54,22 +54,27 @@ function sceneFiles(): string[] {
  *  a top-level `guid` — so a scene on either shape is covered. Top-level `entities[]` only:
  *  a prefab instance's `added[]` subtree carries its own guids under a different ownership
  *  rule and is not what this invariant is about. */
-function duplicatesIn(file: string): string[] {
+function duplicatesIn(file: string): { dups: string[]; guids: number; attrGuids: number } {
   const data = JSON.parse(fs.readFileSync(file, 'utf8'));
   const entities: Array<Record<string, unknown>> = data.entities ?? [];
   const byGuid = new Map<string, string[]>();
+  let guids = 0;
+  let attrGuids = 0;
   for (const e of entities) {
     const ea = (e.traits as Record<string, unknown> | undefined)?.['EntityAttributes'] as
       Record<string, unknown> | undefined;
     const guid = (ea?.guid as string) || (e.guid as string) || '';
     if (!guid) continue;
+    guids++;
+    if (ea?.guid) attrGuids++;
     const name = (ea?.name as string) || (e.name as string) || '(unnamed)';
     const arr = byGuid.get(guid);
     if (arr) arr.push(name); else byGuid.set(guid, [name]);
   }
-  return [...byGuid.entries()]
+  const dups = [...byGuid.entries()]
     .filter(([, names]) => names.length > 1)
     .map(([guid, names]) => `${guid} → ${names.join(' + ')}`);
+  return { dups, guids, attrGuids };
 }
 
 describe.skipIf(!hasAnyProject())('entity guids are unique within a scene file', () => {
@@ -79,10 +84,21 @@ describe.skipIf(!hasAnyProject())('entity guids are unique within a scene file',
 
   it('no scene file spawns two entities with the same guid', () => {
     const rel = (f: string) => path.relative(REPO_ROOT, f).split(path.sep).join('/');
-    const offenders = sceneFiles()
-      .map((f) => ({ file: rel(f), dups: duplicatesIn(f) }))
+    const scanned = sceneFiles().map((f) => ({ file: rel(f), ...duplicatesIn(f) }));
+    const offenders = scanned
       .filter((r) => r.dups.length)
       .map((r) => `${r.file}: ${r.dups.join('; ')}`);
+    // Non-vacuity floor (#1105): a guid read path that drifted skips those entities, which reads as
+    // "no duplicates". The two paths are floored SEPARATELY: the top-level fallback alone carries
+    // enough guids (29 measured) to hold a combined total above zero while the dominant
+    // EntityAttributes.guid path (1,661 measured) reads nothing.
+    const total = (key: 'guids' | 'attrGuids') => scanned.reduce((n, r) => n + r[key], 0);
+    expect(total('guids'), 'no entity guids read from any scene — the guid read path is broken; fix it, do not delete this assertion')
+      .toBeGreaterThan(0);
+    if (hasInternalGames()) {
+      expect(total('attrGuids'), 'far fewer EntityAttributes.guid values read than the scenes hold — that read path is broken; fix it, do not delete this assertion')
+        .toBeGreaterThan(500);
+    }
     expect(
       offenders,
       'Two entities in ONE scene share a guid, so findEntityByGuid picks an arbitrary '

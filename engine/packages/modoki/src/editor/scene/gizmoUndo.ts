@@ -7,10 +7,11 @@
 import type { UndoAction } from '../undo/undoManager';
 import { fireDirtyListeners } from '../../runtime/core/renderDirty';
 
-/** Minimal entity surface the undo closures touch. */
+/** Minimal entity surface the undo closures touch. `get` is `| undefined` because a koota handle's
+ *  is — declaring it never-undefined only compiled while `findEntity` returned `any` (#1151). */
 export interface UndoEntity {
   has(trait: unknown): boolean;
-  get(trait: unknown): Record<string, number>;
+  get(trait: unknown): Record<string, number> | undefined;
   set(trait: unknown, value: Record<string, number>): void;
 }
 
@@ -21,7 +22,7 @@ export interface TransformUndoOptions {
   /** Re-resolve the entity id from a guid-stable ref INSIDE the closures — a captured
    *  koota handle/raw id goes stale on delete/restore or a Play→Stop world rebuild. */
   resolve: () => number | null;
-  findEntity: (id: number) => UndoEntity | undefined;
+  findEntity: (id: number) => UndoEntity | null | undefined;
   /** Only the Transform fields the drag changed, at drag start. */
   before: Record<string, number>;
   /** The same fields at drag end. */

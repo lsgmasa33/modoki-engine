@@ -81,15 +81,26 @@ describe('packaged-app launches isolate their Chromium profile', () => {
     for (const entry of fs.readdirSync(scriptsDir, { withFileTypes: true })) {
       if (!entry.isFile() || !/\.(sh|mjs)$/.test(entry.name)) continue;
       if ((LAUNCHERS as readonly string[]).includes(entry.name)) continue;
-      const live = read(entry.name)
-        .split('\n')
-        .filter((l) => !/^\s*(#|\/\/)/.test(l))
-        .join('\n');
-      // A launch is a spawn/background-exec of the resolved packaged binary. `packagedAppPaths.mjs`
-      // RESOLVES and REAPS one without ever launching it, which is why the match is on the
-      // execution form rather than on the variable name.
-      if (/"\$BIN"\s.*&\s*$/m.test(live) || /\bspawn\(\s*bin\b/.test(live)) missed.push(entry.name);
+      if (launchesPackagedBinary(read(entry.name))) missed.push(entry.name);
     }
     expect(missed, 'new packaged-app launcher(s) must isolate their profile and be listed here').toEqual([]);
   });
+
+  it.each(LAUNCHERS)('the completeness check would catch %s if it were unlisted', (name) => {
+    // Positive control (#1105). The check above greens on zero matches, which is also what a
+    // detector that stopped recognising a launch produces — and every real launcher is skipped
+    // BEFORE it is tested. Each listed launcher is exactly the file it must recognise.
+    expect(launchesPackagedBinary(read(name)), `${name} no longer reads as a launch — fix launchesPackagedBinary(), do not delete this assertion`).toBe(true);
+  });
 });
+
+/** Does this script launch the resolved packaged binary? A launch is a spawn/background-exec of it.
+ *  `packagedAppPaths.mjs` RESOLVES and REAPS one without ever launching it, which is why the match
+ *  is on the execution form rather than on the variable name. Comment lines are dropped first. */
+function launchesPackagedBinary(src: string): boolean {
+  const live = src
+    .split('\n')
+    .filter((l) => !/^\s*(#|\/\/)/.test(l))
+    .join('\n');
+  return /"\$BIN"\s.*&\s*$/m.test(live) || /\bspawn\(\s*bin\b/.test(live);
+}

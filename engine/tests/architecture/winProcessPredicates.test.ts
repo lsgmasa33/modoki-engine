@@ -28,6 +28,13 @@ import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const REPO = path.resolve(__dirname, '../..');
 
+/** `ExecutablePath`/`.Path`/`CommandLine` compared with `-like`, on one line. Deliberately narrow:
+ *  `-like` against a NAME (`$_.Name -like 'node*'`) is a legitimate use of a wildcard and is none
+ *  of this guard's business — the defect is specifically a PATH scoped by wildcard. One constant,
+ *  shared by the sweep and its detection test, so the test pins what the sweep runs. No `g` flag:
+ *  `.test()` on a global regex carries `lastIndex` between lines. */
+const WILDCARD_PATH_PREDICATE = /(ExecutablePath|CommandLine|\$_\.Path)\b[^\n]{0,40}-like/;
+
 /** Every source that could construct a Windows process predicate. Floored well under what is
  *  matched today, so the guard fails loudly if the corpus producer ever silently returns nothing —
  *  a sweep over an empty list passes every assertion. */
@@ -80,11 +87,8 @@ describe('Windows process predicates are prefix tests, not wildcards (#988)', ()
     const offenders: string[] = [];
     for (const { rel, abs } of sources()) {
       const src = strip(fs.readFileSync(abs, 'utf8'), rel);
-      // `ExecutablePath`/`.Path`/`CommandLine` compared with `-like`, on one line. Deliberately
-      // narrow: `-like` against a NAME (`$_.Name -like 'node*'`) is a legitimate use of a wildcard
-      // and is none of this guard's business — the defect is specifically a PATH scoped by wildcard.
       for (const line of src.split('\n')) {
-        if (/(ExecutablePath|CommandLine|\$_\.Path)\b[^\n]{0,40}-like/.test(line)) {
+        if (WILDCARD_PATH_PREDICATE.test(line)) {
           offenders.push(`${rel}: ${line.trim().slice(0, 120)}`);
         }
       }
@@ -95,11 +99,13 @@ describe('Windows process predicates are prefix tests, not wildcards (#988)', ()
   it('the sweep DETECTS the defect it is written for — it is not vacuous', () => {
     // ⚠️ The pattern is checked against the exact string that shipped, because a guard whose regex
     // silently stopped matching would pass forever and look identical to a clean corpus.
+    // ⚠️ Through the SAME constant the sweep uses (#1105) — this test used to hold its own copy of
+    // the regex, so an edit to the sweep's copy left the check it was meant to have vacuous.
     const shipped = "Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like '${esc}\\*' }";
-    expect(/(ExecutablePath|CommandLine|\$_\.Path)\b[^\n]{0,40}-like/.test(shipped)).toBe(true);
+    expect(WILDCARD_PATH_PREDICATE.test(shipped)).toBe(true);
     // …and does not fire on the replacement, nor on a legitimate wildcard over a process NAME.
     const fixed = "$_.ExecutablePath.StartsWith('C:\\tools\\', [System.StringComparison]::OrdinalIgnoreCase)";
-    expect(/(ExecutablePath|CommandLine|\$_\.Path)\b[^\n]{0,40}-like/.test(fixed)).toBe(false);
-    expect(/(ExecutablePath|CommandLine|\$_\.Path)\b[^\n]{0,40}-like/.test("$_.Name -like 'node*'")).toBe(false);
+    expect(WILDCARD_PATH_PREDICATE.test(fixed)).toBe(false);
+    expect(WILDCARD_PATH_PREDICATE.test("$_.Name -like 'node*'")).toBe(false);
   });
 });

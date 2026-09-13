@@ -23,7 +23,7 @@ import { NO_BEHAVIOR_REQUEST } from '../traits/UIScrollView';
 import { findLengthUnitSuspects, formatLengthUnitWarning, lengthUnitWarningKey } from './lengthUnitWarning';
 import { readUILength, readUIAnchorLength } from '../traits/uiLength';
 export { onEditorDirty, setEditorDirtyCallback, markUIDirty } from '../core/uiDirty';
-import type { World } from 'koota';
+import type { Entity, World } from 'koota';
 import type { UIActionBinding } from './bindings';
 import type { AnchorMode } from '../traits/UIAnchor';
 export interface UINodeData {
@@ -606,8 +606,8 @@ function buildTree(world: World): UINodeData[] | null {
   // watched value mutated via a raw entity.set (bypassing markUIDirty) won't re-resolve
   // until the next dirty — see the REPAINT INVARIANT on the UIBinding trait.
   if (highlights.length && _attrMeta) {
-    const byGuid = new Map<string, any>();
-    world.query(_attrMeta.trait).updateEach(([attr]: any[], entity: any) => {
+    const byGuid = new Map<string, Entity>();
+    world.query(_attrMeta.trait).updateEach(([attr]: any[], entity: Entity) => {
       if (attr.guid) byGuid.set(attr.guid, entity);
     });
     for (const h of highlights) {

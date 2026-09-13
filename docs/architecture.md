@@ -63,6 +63,19 @@ Each world carries **two** per-world indexes, both `WeakMap<World, Map<…>>` in
   process, with a stack, so one unregistered entity can't flood a CI log) so the missing
   registration gets fixed.
 
+  ⚠️ **Both indexes are typed koota `Entity`, and so are the lookups that read them**:
+  `findEntityById`/`findEntityByGuid` return `Entity | undefined`, and `findEntity` returns
+  `Entity | null`. The maps used to be `Map<…, any>`, which made all three lookups infer `any`. A
+  read of a field the handle does not have therefore compiled: six undo labels read
+  `findEntity(id)?.name`, which is always `undefined` because the name lives on `EntityAttributes`,
+  and they shipped with typecheck green (#1138). Typing the maps turned up 57 more errors (#1151).
+  Most were unguarded `get` reads; the rest came from two local interfaces (`GizmoBoundsEntity`,
+  `UndoEntity`) that declared `get` could never return `undefined`.
+  `engine/packages/modoki/tests/runtime/entityLookupTypes.test.ts` pins this with
+  `@ts-expect-error`, so a return type that goes back to `any` fails `verify`. A handle's
+  `get(trait)` is `T | undefined`, so read a trait by checking what `get` returns
+  (`const tf = e?.get(Transform); if (!tf) return;`), not with a `!`.
+
   **Always create and remove entities with `spawnEntity(world, ...traits)` and
   `destroyEntity(entity, world)`** — never a bare `world.spawn()` / `entity.destroy()`.
   koota owns `spawn()`, so index maintenance could never be automatic; it was a second call

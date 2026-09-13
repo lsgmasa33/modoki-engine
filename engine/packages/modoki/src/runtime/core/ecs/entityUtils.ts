@@ -1,7 +1,7 @@
 /** Entity utilities — read/write traits, query entities, delete.
  *  Pure runtime functions with no undo or Three.js dependency. */
 
-import type { Trait, TraitRecord, ExtractSchema, TraitValue } from 'koota';
+import type { Entity, Trait, TraitRecord, ExtractSchema, TraitValue } from 'koota';
 import { getCurrentWorld, findEntityById, destroyEntity, setStructureCallback } from './world';
 import { getAllTraits, getTraitByName, transformName, type TraitMeta } from './traitRegistry';
 import { EntityAttributes } from '../traits/EntityAttributes';
@@ -88,7 +88,7 @@ function warnFallbackCapped(entityId: number) {
 
 /** Find an entity by ID. O(1) via entity index, with fallback scan for
  *  entities not registered via registerEntity (e.g. in tests). */
-export function findEntity(entityId: number) {
+export function findEntity(entityId: number): Entity | null {
   const fromIndex = findEntityById(entityId);
   if (fromIndex) return fromIndex;
 
@@ -351,11 +351,11 @@ export function getAllEntities(): EntityInfo[] {
 
   // Primary pass: query EntityAttributes (all visible entities have it).
   // This avoids iterating all 20+ traits just to discover entities.
-  const entitiesToProcess: { id: number; entity: any }[] = [];
+  const entitiesToProcess: { id: number; entity: Entity }[] = [];
   if (attrMeta) {
     const q = safeQuery(attrMeta.trait);
     if (q) {
-      q.updateEach((_: any, entity: any) => {
+      q.updateEach((_: any, entity: Entity) => {
         const id = entity.id();
         seen.add(id);
         entitiesToProcess.push({ id, entity });

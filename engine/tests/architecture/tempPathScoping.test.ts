@@ -69,6 +69,7 @@ function codeLines(code: string): { line: string; n: number }[] {
 describe('temp paths in engine/scripts are clone-scoped', () => {
   it('every literal /tmp path carries a per-clone discriminator', () => {
     const offenders: string[] = [];
+    let tails = 0;
     for (const file of shellScripts()) {
       for (const { line, n } of codeLines(readScannedSource(file).code)) {
         // `mktemp`/`mkdtemp` mint a unique name themselves — the `${TMPDIR:-/tmp}` prefix in
@@ -77,6 +78,7 @@ describe('temp paths in engine/scripts are clone-scoped', () => {
         // The token following `/tmp/` up to the next quote/space/redirect.
         const re = /\/tmp\/([^\s"'`;|)>]*)/g;
         for (let m = re.exec(line); m; m = re.exec(line)) {
+          tails++;
           const tail = m[1];
           // A `$` anywhere in the tail means the name is keyed on something (the backend port,
           // the pid, the clone basename). That is the whole requirement — WHICH discriminator
@@ -92,6 +94,9 @@ describe('temp paths in engine/scripts are clone-scoped', () => {
       'a fixed /tmp name is shared by every clone on this machine — key it on the backend port, '
         + 'the pid, or $(basename "$REPO"), or mint it with mktemp',
     ).toEqual([]);
+    // Non-vacuity floor (#1105): `shellScripts()` floors FILES; this floors the `/tmp/` paths found.
+    expect(tails, 'no literal /tmp paths found in engine/scripts — the matcher is broken; fix it, do not delete this assertion')
+      .toBeGreaterThan(0);
   });
 
   it('every native-temp-dir path carries a per-clone discriminator too', () => {
@@ -100,8 +105,10 @@ describe('temp paths in engine/scripts are clone-scoped', () => {
     // `rm -rf`'d and rebuilt. Both `smoke-packaged.sh` and `repro-cold-boot.sh` shipped a bare
     // shared name here while their PORTS and profiles were already per clone.
     const offenders: string[] = [];
+    let names = 0;
     for (const file of shellScripts()) {
       for (const name of tempDirBasenames(readScannedSource(file).code)) {
+        names++;
         if (!name.includes('$')) offenders.push(`${path.basename(file)}: ${name}`);
       }
     }
@@ -109,6 +116,10 @@ describe('temp paths in engine/scripts are clone-scoped', () => {
       offenders,
       'a fixed name under the machine-wide temp dir is shared by every clone — add $(basename "$REPO")',
     ).toEqual([]);
+    // Non-vacuity floor (#1105): the two scripts named above build under the native temp dir, so a
+    // `tempDirBasenames` that stopped matching must not read as "every name is scoped".
+    expect(names, 'no native-temp-dir paths found in engine/scripts — tempDirBasenames() is broken; fix it, do not delete this assertion')
+      .toBeGreaterThan(0);
   });
 
   it('repro-cold-boot.sh reuses the SMOKE build dir, byte for byte', () => {

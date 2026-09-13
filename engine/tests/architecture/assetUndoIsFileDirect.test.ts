@@ -88,10 +88,12 @@ function code(text: string): string {
   return stripComments(text);
 }
 
-/** Every asset-doc undo entry that does not carry the flag, set to TRUE. */
-function unflagged(): string[] {
+/** Every asset-doc undo entry that does not carry the flag, set to TRUE — plus how many asset-doc
+ *  entries were examined at all, so an empty `hits` can be told apart from a scan that matched none. */
+function unflagged(): { hits: string[]; examined: number } {
   const mutators = assetDocMutators();
   const hits: string[] = [];
+  let examined = 0;
   for (const file of editorSources()) {
     const src = fs.readFileSync(file, 'utf8');
     // A file that imports an asset-doc mutator is in scope even when the literal reaches it
@@ -103,6 +105,7 @@ function unflagged(): string[] {
       const literal = code(actionLiteral(src, open));
       const direct = mutators.some((mut) => literal.includes(mut));
       if (!direct && !(fileTouchesAssets && /\bundo\s*:/.test(literal))) continue;
+      examined++;
       // `: true`, not merely present — `_isFileDirect: false` IS the defect, and undoManager reads
       // the flag truthily. The first version of this guard accepted both that and a comment saying
       // the word, which is the failure its own docstring names.
@@ -111,7 +114,7 @@ function unflagged(): string[] {
       hits.push(`${path.relative(EDITOR, file)}:${line}`);
     }
   }
-  return hits;
+  return { hits, examined };
 }
 
 describe('asset-document undo entries do not dirty the scene', () => {
@@ -134,9 +137,14 @@ describe('asset-document undo entries do not dirty the scene', () => {
   });
 
   it('every asset-doc undo entry in editor/** carries _isFileDirect', () => {
-    expect(unflagged(), `these undo entries mutate an ASSET DOCUMENT but do not set _isFileDirect, so
+    const { hits, examined } = unflagged();
+    expect(hits, `these undo entries mutate an ASSET DOCUMENT but do not set _isFileDirect, so
 each one marks the SCENE dirty — blocking the file-direct agent routes, making modoki_build refuse,
-and making Cmd+S interrupt a preview to rewrite a scene nothing changed:\n\n${unflagged().join('\n')}\n`)
+and making Cmd+S interrupt a preview to rewrite a scene nothing changed:\n\n${hits.join('\n')}\n`)
       .toEqual([]);
+    // Non-vacuity floor (#1105): the mutator list and the file count are pinned above, but neither
+    // proves the `pushAction(` scan reached a single asset-doc undo entry.
+    expect(examined, 'no asset-doc undo entries examined — the pushAction scan or its scope gate is broken; fix it, do not delete this assertion')
+      .toBeGreaterThan(5);
   });
 });

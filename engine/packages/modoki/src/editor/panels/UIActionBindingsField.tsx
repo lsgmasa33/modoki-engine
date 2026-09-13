@@ -8,6 +8,7 @@
  *   - Call: action (registered names), target (→ctx.target), and either typed
  *           param widgets from the action's declared schema or one freeform payload. */
 
+import type { Entity } from 'koota';
 import { useState, useMemo } from 'react';
 import { readTraitData } from '../../runtime/core/ecs/entityUtils';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
@@ -72,10 +73,10 @@ export function UIActionBindingsField({ entityIds, meta, field }: { entityIds: n
   const dirtyTick = useWorldDirtyTick();
   const attrMeta = getTraitByName('EntityAttributes');
   const guidToEntity = useMemo(() => {
-    const map = new Map<string, any>();
+    const map = new Map<string, Entity>();
     if (attrMeta) {
       try {
-        getCurrentWorld().query(attrMeta.trait).updateEach(([a]: any[], ent: any) => {
+        getCurrentWorld().query(attrMeta.trait).updateEach(([a]: any[], ent: Entity) => {
           if (a?.guid) map.set(a.guid, ent);
         });
       } catch { /* no active world */ }

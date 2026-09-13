@@ -21,7 +21,7 @@ import fs from 'fs';
 import { findAssetRoots, readAssetGuid, detectType, type AssetRoot } from '../../plugins/vite-asset-scanner';
 import { deriveGuid, isInternalAssetPath } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { resolveTextureType } from '../../packages/modoki/src/runtime/loaders/textureSettings';
-import { hasAnyProject } from '../helpers/repoLayout';
+import { hasAnyProject, hasInternalGames } from '../helpers/repoLayout';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 // engine/tests/assets/ → repo root (games/ + demos/ + engine/packages/modoki live there).
@@ -138,13 +138,27 @@ describe('asset GUID reference integrity (real assets)', () => {
 
   it('no scene/prefab/mesh/material/particle file references an asset by literal path (all refs are GUIDs)', () => {
     const offenders: string[] = [];
+    let strings = 0;
     for (const a of refBearing) {
       const json = JSON.parse(fs.readFileSync(a.abs, 'utf-8'));
       for (const s of stringValues(json)) {
+        strings++;
         if (looksLikeAssetPath(s)) offenders.push(`${a.url} (${a.type}) → ${s}`);
       }
     }
     expect(offenders).toEqual([]);
+    // Non-vacuity floor (#1105): the predicate is pinned in assetPathPredicate.test.ts, but a
+    // `stringValues` walk that goes PARTLY blind would still pass. Sized to the private tree
+    // (27,600 strings measured) because dropping the walk's array branch — where every entity's
+    // trait refs live — leaves only ~2,400; a `> 0` floor saw only a total wipe-out. The snapshot
+    // keeps a presence check: every ref-bearing file has strings.
+    if (hasInternalGames()) {
+      expect(strings, 'far fewer string values walked than the corpus holds — stringValues() is skipping a node kind; fix it, do not delete this assertion')
+        .toBeGreaterThan(10000);
+    } else if (refBearing.length > 0) {
+      expect(strings, 'no string values walked in any ref-bearing file — stringValues() is broken; fix it, do not delete this assertion')
+        .toBeGreaterThan(0);
+    }
   });
 
   it('every GUID-shaped ref in ref-bearing files resolves to a known asset', () => {
@@ -166,11 +180,13 @@ describe('asset GUID reference integrity (real assets)', () => {
       // .mat.json PBR map refs — every MeshStandardMaterial texture slot.
       'normalTexture', 'roughnessTexture', 'metalnessTexture', 'emissiveTexture', 'aoTexture', 'alphaTexture', 'bumpTexture', 'displacementTexture', 'lightTexture', 'envTexture']);
     const dangling: string[] = [];
+    let resolvedRefs = 0;
 
     const check = (url: string, node: unknown, key?: string): void => {
       if (typeof node === 'string') {
-        if (key && refKeys.has(key) && isGuid(node) && !guids.has(node.toLowerCase())) {
-          dangling.push(`${url} → ${key}: ${node}`);
+        if (key && refKeys.has(key) && isGuid(node)) {
+          if (guids.has(node.toLowerCase())) resolvedRefs++;
+          else dangling.push(`${url} → ${key}: ${node}`);
         }
       } else if (Array.isArray(node)) {
         for (const v of node) check(url, v, key);
@@ -183,6 +199,13 @@ describe('asset GUID reference integrity (real assets)', () => {
       check(a.url, JSON.parse(fs.readFileSync(a.abs, 'utf-8')));
     }
     expect(dangling).toEqual([]);
+    // Non-vacuity floor (#1105): a renamed ref key or a broken isGuid records nothing above. Gated on
+    // the private tree, whose games carry real mesh/material/texture refs; the public snapshot's
+    // demo subset is not guaranteed to hold any key in `refKeys`.
+    if (hasInternalGames()) {
+      expect(resolvedRefs, 'no GUID refs under refKeys resolved — the key set or isGuid is broken; fix it, do not delete this assertion')
+        .toBeGreaterThan(100);
+    }
   });
 
   it('particle resource entries in scenes carry a resolvable GUID path', () => {

@@ -28,6 +28,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readScannedSource } from '@modoki/engine/testing';
+import { hasInternalGames } from '../helpers/repoLayout';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const VITE_CONFIG = readScannedSource(path.join(ROOT, 'vite.config.ts')).code;
@@ -124,6 +125,7 @@ describe('shipped iOS floor', () => {
     // still inherits the default and still fails. What changes is only that a project which states
     // its own floor is checked against the floor it states.
     const stale: string[] = [];
+    let parsed = 0;
     for (const root of ['games', 'demos']) {
       const abs = path.join(ROOT, '..', root);
       if (!fs.existsSync(abs)) continue; // the OSS snapshot ships neither
@@ -132,8 +134,13 @@ describe('shipped iOS floor', () => {
         const pkg = path.join(abs, entry.name, 'ios', 'App', 'CapApp-SPM', 'Package.swift');
         if (!fs.existsSync(pkg)) continue; // no iOS target — nothing to be stale
         const want = Math.trunc(projectIosMinVersion(path.join(abs, entry.name)));
+        parsed++;
         const m = readScannedSource(pkg).code.match(/platforms:\s*\[[^\]]*\.iOS\(\.v(\d+)/);
-        if (m && parseInt(m[1], 10) !== want) {
+        // An unparsed floor is an offence, not a skip (#1105): skipping it made a regex that stopped
+        // matching indistinguishable from every project being current.
+        if (!m) {
+          stale.push(`${root}/${entry.name}: no \`platforms: [.iOS(.vN)]\` found — the matcher or the file changed shape`);
+        } else if (parseInt(m[1], 10) !== want) {
           stale.push(`${root}/${entry.name}: .v${m[1]} (its config asks for .v${want})`);
         }
       }
@@ -144,6 +151,13 @@ describe('shipped iOS floor', () => {
         + `(heal runs on open), or run a native build for it.`
       : '',
     ).toEqual([]);
+    // Non-vacuity floor (#1105): the `existsSync` skip above runs before the parse, so a moved or
+    // renamed `CapApp-SPM` skips every project and reads as "all current". Gated on internal games,
+    // which carry iOS targets; the public snapshot's demos are web-only (native stripped).
+    if (hasInternalGames()) {
+      expect(parsed, 'no Package.swift read in any project — the path or the enumeration is broken; fix it, do not delete this assertion')
+        .toBeGreaterThan(5);
+    }
   });
 
   // The floor was raised from 15.4 to 16.4 on 2026-08-04 by owner decision, deliberately

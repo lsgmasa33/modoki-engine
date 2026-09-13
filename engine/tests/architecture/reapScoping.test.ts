@@ -63,12 +63,14 @@ describe('process reaps in engine/scripts are clone-scoped (#69)', () => {
 
   it('every `pkill -f` pattern is anchored to an absolute path', () => {
     const offenders: string[] = [];
+    let patterns = 0;
     for (const file of scriptFiles()) {
       const isShell = file.endsWith('.sh');
       const src = stripComments(fs.readFileSync(file, 'utf8'), isShell);
       // pkill -f "<pattern>" | '<pattern>' | <bare-word>
       const re = /pkill\s+(?:-\w+\s+)*-f\s+(?:"([^"]*)"|'([^']*)'|(\S+))/g;
       for (let m = re.exec(src); m; m = re.exec(src)) {
+        patterns++;
         const pattern = m[1] ?? m[2] ?? m[3] ?? '';
         if (!/^[/$]/.test(pattern)) {
           offenders.push(`${path.relative(scriptsDir, file)}: pkill -f ${JSON.stringify(pattern)}`);
@@ -80,6 +82,9 @@ describe('process reaps in engine/scripts are clone-scoped (#69)', () => {
       'a reap pattern that does not start with "/" or "$" matches every clone on this machine — '
         + 'scope it to an absolute path ($REPO/..., $APP/...)',
     ).toEqual([]);
+    // Non-vacuity floor (#1105): `scriptFiles()` floors FILES; this floors what the regex found.
+    expect(patterns, 'no `pkill -f` patterns found in engine/scripts — the matcher is broken; fix it, do not delete this assertion')
+      .toBeGreaterThan(0);
   });
 
   it('a `pkill -f` pattern led by a variable uses the fail-if-empty expansion form', () => {
@@ -116,6 +121,7 @@ describe('process reaps in engine/scripts are clone-scoped (#69)', () => {
     // broader. If that file is ever deleted or weakened, this exemption is uncovered — the two
     // are load-bearing together, which is the sort of coupling that goes stale silently.
     const offenders: string[] = [];
+    let namedVarLed = 0;
     for (const file of scriptFiles()) {
       if (!file.endsWith('.sh')) continue; // `${VAR:?}` is bash syntax; JS has no equivalent
       // expansion-time guard — the .mjs side is covered by killPackagedGuard.test.ts instead.
@@ -125,6 +131,7 @@ describe('process reaps in engine/scripts are clone-scoped (#69)', () => {
         const pattern = m[1] ?? m[2] ?? m[3] ?? '';
         if (!/^\$[A-Za-z_{]/.test(pattern)) continue; // not variable-led at all (covered by rule 1)
         if (/^\$\d/.test(pattern) || /^\$\{?[@*#]/.test(pattern)) continue; // positional/special param
+        namedVarLed++;
         if (!/^\$\{[A-Za-z_][A-Za-z0-9_]*:\?/.test(pattern)) {
           offenders.push(`${path.relative(scriptsDir, file)}: pkill -f ${JSON.stringify(pattern)}`);
         }
@@ -135,6 +142,10 @@ describe('process reaps in engine/scripts are clone-scoped (#69)', () => {
       'a `pkill -f` pattern led by a bare $VAR/${VAR} looks scoped in source but is not — use '
         + '${VAR:?message} so an empty variable aborts loudly instead of silently reaping every clone',
     ).toEqual([]);
+    // Non-vacuity floor (#1105): counted after both skips, so a filter that drops every pattern
+    // before the `${VAR:?}` check is caught too.
+    expect(namedVarLed, 'no named-variable-led `pkill -f` patterns reached the check — a skip or the matcher is broken, or the last such reap (today only test-packaged.sh) was moved into the helper; fix the cause, do not delete this assertion')
+      .toBeGreaterThan(0);
   });
 
   it('a `pkill -f` fragment reaped under a clone root is reaped under BOTH spellings (#959)', () => {
@@ -158,6 +169,7 @@ describe('process reaps in engine/scripts are clone-scoped (#69)', () => {
     // ordinary run. The two spellings are spelled out. The cost is a little duplication against
     // `lib/repo-reap.sh`; the alternative is a pattern this guard cannot see.
     const offenders: string[] = [];
+    let fragments = 0;
     for (const file of scriptFiles()) {
       if (!file.endsWith('.sh')) continue;
       const src = stripComments(fs.readFileSync(file, 'utf8'), true);
@@ -169,6 +181,7 @@ describe('process reaps in engine/scripts are clone-scoped (#69)', () => {
         if (!byFragment.has(fragment)) byFragment.set(fragment, new Set());
         byFragment.get(fragment)!.add(varName);
       }
+      fragments += byFragment.size;
       for (const [fragment, vars] of byFragment) {
         if (vars.size < 2) {
           offenders.push(
@@ -184,6 +197,9 @@ describe('process reaps in engine/scripts are clone-scoped (#69)', () => {
         + 'reached through a symlink (#913/#959) — derive the physical root too (`pwd -P`) and '
         + 'reap the same fragment under both, as two separate pkill calls (never "$A|$B", #69)',
     ).toEqual([]);
+    // Non-vacuity floor (#1105): an empty grouping is also a clean pass.
+    expect(fragments, 'no named-variable `pkill -f` fragments were grouped — the matcher is broken, or the last such reap (today only test-packaged.sh) was moved into the helper; fix the cause, do not delete this assertion')
+      .toBeGreaterThan(0);
   });
 
   it('no reap pattern is built from a basename — that discards the clone identity', () => {
@@ -193,11 +209,25 @@ describe('process reaps in engine/scripts are clone-scoped (#69)', () => {
     for (const file of scriptFiles()) {
       const src = stripComments(fs.readFileSync(file, 'utf8'), file.endsWith('.sh'));
       for (const line of src.split('\n')) {
-        if (/basename/.test(line) && /pkill|pattern|taskkill/.test(line)) {
+        if (buildsReapFromBasename(line)) {
           offenders.push(`${path.relative(scriptsDir, file)}: ${line.trim()}`);
         }
       }
     }
     expect(offenders, 'build the reap pattern from the full path, not its basename').toEqual([]);
   });
+
+  it('the basename rule flags the shape it exists for, and not a full-path reap', () => {
+    // A clean corpus has no instance, so the sweep above cannot tell a working predicate from one
+    // that stopped matching (#1105). Pinned here against the shipped shape instead.
+    expect(buildsReapFromBasename('const pattern = `${path.basename(appDir)}/Contents/MacOS`;')).toBe(true);
+    expect(buildsReapFromBasename('pkill -f "$(basename "$APP")/Contents/MacOS"')).toBe(true);
+    expect(buildsReapFromBasename('pkill -f "${APP:?unset}/Contents/MacOS" || true')).toBe(false);
+    expect(buildsReapFromBasename('BUILD="$TMPBASE/$(basename "$REPO")-smoke"')).toBe(false);
+  });
 });
+
+/** A line that builds a reap target (a `pkill`/`taskkill` or a `pattern`) out of a `basename`. */
+function buildsReapFromBasename(line: string): boolean {
+  return /basename/.test(line) && /pkill|pattern|taskkill/.test(line);
+}
