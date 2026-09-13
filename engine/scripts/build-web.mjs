@@ -19,6 +19,7 @@ import { scopedTsconfigContent } from './scopedTsconfig.mjs';
 import { chooseViteConfig } from './viteConfigChoice.mjs';
 import { loadEnginePluginModuleResult } from './loadVendorPlugins.mjs';
 import { acquireBuildClaim } from './buildClaimsStore.mjs';
+import { readGitProvenance, readHeadCommit, settleBuildStamp, writeBuildStamp, BUILD_STAMP_FILENAME } from './ota/buildStamp.mjs';
 
 // --target parsing lives in buildTarget.mjs (pure, unit-tested) — see its header comment for
 // WHY there is no default in either direction (#40).
@@ -283,6 +284,11 @@ async function healNativeProject() {
 
 const tscBin = path.join(repoRoot, 'node_modules', 'typescript', 'bin', 'tsc');
 const viteBin = path.join(repoRoot, 'node_modules', 'vite', 'bin', 'vite.js');
+// #906: a native dist is what an OTA publish uploads, so it records which tree built it. Read NOW,
+// before the heals and icon generation rewrite tracked native files — those are this build's own
+// output, not uncommitted source. Web and playable builds are never OTA-published and get no stamp
+// (it would otherwise put a private-repo commit id into a public web deploy). See buildStamp.mjs.
+const stampStart = target === 'native' && proj ? readGitProvenance(path.resolve(repoRoot, proj)) : null;
 try {
   // FIRST of all — before the heal touches a single native file, let alone the typecheck or the
   // build itself. See validateProjectConfig's own comment for why.
@@ -343,6 +349,12 @@ try {
   // to hand Vite a CJS config, whose loader branch compiles in memory. Which config, and why the
   // choice is by file existence, is `viteConfigChoice.mjs` — not restated here.
   run(`${q(node)} ${q(viteBin)} build --config ${chooseViteConfig(engineDir)}`);
+  if (stampStart) {
+    const projectRoot = path.resolve(repoRoot, proj);
+    const stamp = settleBuildStamp(stampStart, readHeadCommit(projectRoot));
+    writeBuildStamp(path.join(projectRoot, 'dist'), stamp);
+    console.log(`[build-web] ${BUILD_STAMP_FILENAME}: commit ${stamp.commit ?? 'unknown'}, dirty ${stamp.dirty ?? 'unknown'}.`);
+  }
 } catch (e) {
   // A failing CHILD already printed its diagnostics via inherited stdio, so re-printing would
   // duplicate them — that is what the bare `catch` here was for, and it stays right for `run()`.

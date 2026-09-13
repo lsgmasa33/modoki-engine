@@ -333,6 +333,8 @@
           "flexDirection": "row",
           "justifyContent": "center",
           "alignItems": "center",
+          "zIndex": 40,
+          "minTapSize": 48,
           "backgroundOpacity": 0.35,
           "borderRadius": 6,
           "borderWidth": 1,
@@ -341,9 +343,7 @@
           "text": "Credits",
           "fontSize": 12,
           "fontWeight": "bold",
-          "textAlign": "center",
-          "zIndex": 40,
-          "minTapSize": 48
+          "textAlign": "center"
         },
         "UIAction": {
           "bindings": [
@@ -390,13 +390,13 @@
           "paddingRightUnit": "px",
           "paddingBottom": 22,
           "paddingBottomUnit": "px",
+          "zIndex": 50,
           "isVisible": false,
           "backgroundColor": 1317926,
           "backgroundOpacity": 0.98,
           "borderRadius": 12,
           "borderWidth": 1,
-          "borderColor": 3820122,
-          "zIndex": 50
+          "borderColor": 3820122
         },
         "UIAnchor": {
           "anchor": "center",
@@ -487,6 +487,7 @@
           "justifyContent": "center",
           "alignItems": "center",
           "alignSelf": "center",
+          "minTapSize": 48,
           "backgroundColor": 3080102,
           "backgroundOpacity": 1,
           "borderRadius": 7,
@@ -494,8 +495,7 @@
           "fontSize": 14,
           "fontWeight": "bold",
           "textColor": 660754,
-          "textAlign": "center",
-          "minTapSize": 48
+          "textAlign": "center"
         },
         "UIAction": {
           "bindings": [

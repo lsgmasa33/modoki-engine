@@ -33,6 +33,10 @@ export interface OtaManifest {
   engineApi: number;
   files: Record<string, OtaFileEntry>;
   bundleZip?: OtaFileEntry;
+  /** Which source tree built this bundle (#906, additive). Informational on the device — nothing
+   *  here acts on it — but it is inside {@link manifestHashPayload}, so the signed release vouches
+   *  for it. See engine/scripts/ota/buildStamp.mjs. */
+  build?: { commit: string | null; dirty: boolean | null; forced: boolean };
 }
 
 export interface OtaRelease {
@@ -99,6 +103,20 @@ export function validateManifest(manifest: unknown): string[] {
     else {
       if (typeof z.hash !== 'string' || !/^[0-9a-f]{64}$/.test(z.hash)) fail('manifest.bundleZip.hash must be a lowercase hex sha256 (64 chars)');
       if (typeof z.size !== 'number' || !Number.isInteger(z.size) || z.size < 0) fail('manifest.bundleZip.size must be a non-negative integer');
+    }
+  }
+  if (m.build !== undefined) {
+    const b = m.build as Record<string, unknown> | null;
+    if (b == null || typeof b !== 'object' || Array.isArray(b)) fail('manifest.build must be an object when present');
+    else {
+      if (b.commit !== null && (typeof b.commit !== 'string' || !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(b.commit))) {
+        fail('manifest.build.commit must be a full lowercase hex commit id or null');
+      }
+      if (b.dirty !== null && typeof b.dirty !== 'boolean') fail('manifest.build.dirty must be a boolean or null');
+      if (typeof b.forced !== 'boolean') fail('manifest.build.forced must be a boolean');
+      else if (!b.forced && (b.commit === null || b.dirty !== false)) {
+        fail('manifest.build.forced is false, but the build is not a known clean commit');
+      }
     }
   }
   return errors;
@@ -579,6 +597,17 @@ export async function checkForUpdate(opts: CheckForUpdateOptions): Promise<OtaCh
   // and only costs a false alarm plus a lost delta optimization on every sub-game's
   // very first stage (the embedded manifest's `name` is the SHELL's bundle name, never
   // the sub-game's — see ota-embed-manifest.mjs — so this fired on every one of them).
+  // A network base that could not be fetched is REPORTED, like every other delta fallback (#836). The
+  // likeliest cause now is by design: the publish path prunes old versions from the bucket, so a
+  // device that has not updated in a while finds its active version's manifest gone. That costs it a
+  // whole download instead of a delta, and an unexplained bandwidth spike is what nobody can diagnose
+  // later. The EMBEDDED base stays silent: a build that predates it has none, which is not news.
+  if (!baseManifest && currentActive) {
+    opts.onDeltaFallback?.({
+      version: targetVersion,
+      reason: `base manifest ${opts.bundleName}@${currentActive} unavailable (pruned from the bucket, or a fetch failure)`,
+    });
+  }
   if (baseManifest && currentActive) {
     const identityMismatch = baseManifest.name !== opts.bundleName || baseManifest.version !== currentActive;
     if (identityMismatch) {

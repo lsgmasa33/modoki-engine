@@ -29,7 +29,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './otaSafeTokens.mjs';
-import { OTA_DEFAULT_BUNDLE_NAME, otaSigningKeyRefusal } from './publishGuards.mjs';
+import { OTA_DEFAULT_BUNDLE_NAME, otaRetainVersions, otaSigningKeyRefusal } from './publishGuards.mjs';
 
 /** Every refusal {@link otaPublishPreflight} can return, in the order it checks them. */
 export const OTA_PUBLISH_REFUSALS = Object.freeze([
@@ -41,6 +41,7 @@ export const OTA_PUBLISH_REFUSALS = Object.freeze([
   'bad-bucket',
   'bad-project-bundle-name',
   'bad-project-subgames',
+  'bad-project-retain-versions',
   'ambiguous-bundle',
   'unknown-bundle',
   'key-missing',
@@ -115,6 +116,10 @@ export function otaPublishPreflight({ ota, name, version, keyName, bucket, repoR
   if (!Array.isArray(subgames) || subgames.some((s) => typeof s !== 'string')) {
     return { ok: false, refusal: 'bad-project-subgames', bundleName };
   }
+  // Checked before anything is built or uploaded, though only the prune AFTER the upload reads it: a
+  // malformed count discovered then would leave a live release with nothing pruned and no way to say so.
+  const retainVersions = otaRetainVersions(ota);
+  if (retainVersions === null) return { ok: false, refusal: 'bad-project-retain-versions', bundleName, subgames };
 
   const target = otaPublishTarget(name, { bundleName, subgames });
   if (!target) {
@@ -136,5 +141,5 @@ export function otaPublishPreflight({ ota, name, version, keyName, bucket, repoR
   const keyRefusal = otaSigningKeyRefusal(keyPublicKey, ota.publicKey);
   if (keyRefusal) return { ok: false, refusal: keyRefusal, bundleName, subgames, keyPath, keyPublicKey };
 
-  return { ok: true, target, keypair, keyPath, bundleName, subgames, name, version, keyName, bucket };
+  return { ok: true, target, keypair, keyPath, bundleName, subgames, retainVersions, name, version, keyName, bucket };
 }

@@ -76,6 +76,20 @@ export function otaSubgameEngineApi({ stamped, requested, shellEngineApi }) {
  *  {@link OTA_DEFAULT_BUNDLE_NAME} below, for the same reason, pinned by the same test file. */
 export const OTA_DEFAULT_ENGINE_API = 1;
 
+/** How many versions of each bundle an OTA publish keeps when `ota.retainVersions` is ABSENT (#836).
+ *  MUST equal `DEFAULT_PROJECT_CONFIG.ota.retainVersions` — the same deliberate second authored copy
+ *  as {@link OTA_DEFAULT_BUNDLE_NAME}, pinned by the same test file. The owner-facing knob is the
+ *  project field; this only answers for a config that never set it. */
+export const OTA_DEFAULT_RETAIN_VERSIONS = 5;
+
+/** `ota.retainVersions` resolved from a RAW `ota` block: the default when absent, the value when it is
+ *  a positive integer, and `null` for anything else — a malformed retention count must refuse, never
+ *  silently become "keep everything" or "keep one". Pure. */
+export function otaRetainVersions(ota) {
+  const value = ota?.retainVersions === undefined ? OTA_DEFAULT_RETAIN_VERSIONS : ota.retainVersions;
+  return Number.isInteger(value) && value >= 1 ? value : null;
+}
+
 /** The bundle name `project.config.json`'s `ota.bundleName` resolves to when the key is
  *  ABSENT from the raw file. MUST equal `DEFAULT_PROJECT_CONFIG.ota.bundleName` in
  *  `engine/project-config.ts` — a `.mjs` script cannot import that TS module, so this is a

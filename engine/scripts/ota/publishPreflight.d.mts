@@ -9,6 +9,7 @@ export type OtaPublishRefusal =
   | 'bad-bucket'
   | 'bad-project-bundle-name'
   | 'bad-project-subgames'
+  | 'bad-project-retain-versions'
   | 'ambiguous-bundle'
   | 'unknown-bundle'
   | 'key-missing'
@@ -41,6 +42,7 @@ export function otaPublishPreflight(o: {
     keyPath: string;
     bundleName: string;
     subgames: string[];
+    retainVersions: number;
     name: string;
     version: string;
     keyName: string;

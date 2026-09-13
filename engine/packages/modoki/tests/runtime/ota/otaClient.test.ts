@@ -633,6 +633,56 @@ describe('checkForUpdate', () => {
     });
   });
 
+  /** #836: the publish path now prunes old versions from the bucket, so a device whose ACTIVE version
+   *  was pruned finds that version's manifest 404ing. That must be the defined fallback — the whole
+   *  zip of the TARGET version, never a request into the pruned version's folder — and it must say so. */
+  it('a pruned ACTIVE version (its base manifest 404s) stages the TARGET\'s whole zip and reports the fallback (#836)', async () => {
+    const { privateKey, publicKey } = makeKeypair();
+    const release = signRelease({ schema: 1, bundles: { shell: 'v9' }, mandatory: false, minEngineApi: 1 }, privateKey);
+    const targetManifest: OtaManifest = {
+      schema: 1, name: 'shell', version: 'v9', engineApi: 1,
+      files: { 'index.html': { hash: 'a'.repeat(64), size: 1 } },
+      bundleZip: { hash: 'f'.repeat(64), size: 200 },
+    };
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(release))
+      .mockResolvedValueOnce(jsonResponse(targetManifest))
+      .mockResolvedValueOnce(jsonResponse({}, false)); // v2's manifest was pruned
+    const native = mockNative({ getState: vi.fn().mockResolvedValue({ stateJSON: JSON.stringify({ active: { shell: 'v2' } }) }) });
+    const onDeltaFallback = vi.fn();
+
+    const result = await checkForUpdate({
+      baseUrl: 'https://cdn.example.com/game', publicKey, bundleName: 'shell', runningEngineApi: 1, fetchImpl, native, onDeltaFallback,
+    });
+
+    expect(fetchImpl).toHaveBeenNthCalledWith(3, 'https://cdn.example.com/game/bundles/shell/v2/manifest.json');
+    expect(onDeltaFallback).toHaveBeenCalledWith({ version: 'v9', reason: expect.stringContaining('base manifest shell@v2 unavailable') });
+    expect(result).toEqual({ outcome: 'staged', version: 'v9', mandatory: false });
+    expect(native.stageUpdateDelta).not.toHaveBeenCalled();
+    expect(native.stageUpdate).toHaveBeenCalledWith(expect.objectContaining({ zipUrl: 'https://cdn.example.com/game/bundles/shell/v9/bundle.zip' }));
+    // Nothing after the base probe reaches into the pruned version.
+    expect(fetchImpl.mock.calls.slice(3).some(([u]) => String(u).includes('/v2/'))).toBe(false);
+  });
+
+  it('a missing EMBEDDED base (an older build) falls back silently — it is not news', async () => {
+    const { privateKey, publicKey } = makeKeypair();
+    const release = signRelease({ schema: 1, bundles: { shell: 'v1' }, mandatory: false, minEngineApi: 1 }, privateKey);
+    const targetManifest: OtaManifest = {
+      schema: 1, name: 'shell', version: 'v1', engineApi: 1,
+      files: { 'index.html': { hash: 'a'.repeat(64), size: 1 } },
+      bundleZip: { hash: 'f'.repeat(64), size: 200 },
+    };
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(release))
+      .mockResolvedValueOnce(jsonResponse(targetManifest))
+      .mockResolvedValueOnce(jsonResponse({}, false));
+    const onDeltaFallback = vi.fn();
+    await checkForUpdate({
+      baseUrl: 'https://cdn.example.com/game', publicKey, bundleName: 'shell', runningEngineApi: 1, fetchImpl, native: mockNative(), onDeltaFallback,
+    });
+    expect(onDeltaFallback).not.toHaveBeenCalled();
+  });
+
   it('falls back to whole-zip when no base manifest (active OR embedded) is fetchable', async () => {
     const { privateKey, publicKey } = makeKeypair();
     const release = signRelease({ schema: 1, bundles: { shell: 'v1' }, mandatory: false, minEngineApi: 1 }, privateKey);

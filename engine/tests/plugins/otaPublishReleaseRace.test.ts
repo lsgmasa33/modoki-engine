@@ -130,6 +130,74 @@ if (group === 'storage' && cmd === 'cp') {
   fs.mkdirSync(path.dirname(localDst), { recursive: true });
   fs.copyFileSync(src, localDst);
   bumpGeneration(localDst);
+  // FAKE_GCS_WIPE_ON_RELEASE: a concurrent prune deleting a version folder in the moment this publish's
+  // release write lands (#836 close-out) — the gap the publish's own post-release check exists for.
+  if (process.env.FAKE_GCS_WIPE_ON_RELEASE && dstUrl.endsWith('/release.json')) {
+    fs.rmSync(toLocal(process.env.FAKE_GCS_WIPE_ON_RELEASE), { recursive: true, force: true });
+  }
+  process.exit(0);
+}
+
+// #836 retention: ls of a prefix, ls --json of a one-star glob, and rm of an object or a "/**" tree.
+// "matched no objects" is the real gcloud wording for all three (measured against the real bucket).
+const NO_MATCH = 'ERROR: (gcloud.storage.ls) One or more URLs matched no objects.\\n';
+const isMeta = (f) => f.endsWith('.generation');
+// GCS has no folders, only object names: a "folder" with no objects under it does not exist. The local
+// emulation must not list an emptied directory as one, or a delete that removed everything still looks
+// like a version left behind.
+const hasObjects = (dir) => fs.readdirSync(dir).some((f) => {
+  const full = path.join(dir, f);
+  return fs.statSync(full).isDirectory() ? hasObjects(full) : !isMeta(f);
+});
+if (group === 'storage' && cmd === 'ls' && !rest.includes('--json')) {
+  if (process.env.FAKE_GCS_LS_FAIL) { process.stderr.write('ERROR: (gcloud.storage.ls) HTTPError 403: Forbidden.\\n'); process.exit(1); }
+  const url = rest[0].replace(/\\/+$/, '');
+  const dir = toLocal(url);
+  if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) { process.stderr.write(NO_MATCH); process.exit(1); }
+  for (const f of fs.readdirSync(dir).sort()) {
+    if (isMeta(f)) continue;
+    const isDir = fs.statSync(path.join(dir, f)).isDirectory();
+    if (isDir && !hasObjects(path.join(dir, f))) continue;
+    process.stdout.write(url + '/' + f + (isDir ? '/' : '') + '\\n');
+  }
+  process.exit(0);
+}
+if (group === 'storage' && cmd === 'ls' && rest.includes('--json')) {
+  if (process.env.FAKE_GCS_LS_FAIL) { process.stderr.write('ERROR: (gcloud.storage.ls) HTTPError 403: Forbidden.\\n'); process.exit(1); }
+  const pattern = rest.find((a) => a.startsWith('gs://'));
+  const [head, tail] = pattern.split('/*/');
+  const dir = toLocal(head);
+  const out = [];
+  if (fs.existsSync(dir)) {
+    for (const d of fs.readdirSync(dir).sort()) {
+      const file = path.join(dir, d, tail);
+      if (fs.existsSync(file) && fs.statSync(file).isFile()) {
+        out.push({ url: head + '/' + d + '/' + tail + '#1', type: 'cloud_object', metadata: { timeCreated: fs.statSync(file).mtime.toISOString() } });
+      }
+    }
+  }
+  if (!out.length) { process.stderr.write(NO_MATCH); process.exit(1); }
+  process.stdout.write(JSON.stringify(out));
+  process.exit(0);
+}
+if (group === 'storage' && cmd === 'rm') {
+  const url = rest.find((a) => a.startsWith('gs://'));
+  if (process.env.FAKE_GCS_RM_FAIL) { process.stderr.write('ERROR: (gcloud.storage.rm) HTTPError 403: Forbidden.\\n'); process.exit(1); }
+  fs.appendFileSync(path.join(BUCKET_DIR, 'rm.log'), url + '\\n');
+  if (url.endsWith('/**')) {
+    const dir = toLocal(url.slice(0, -3));
+    if (!fs.existsSync(dir) || !hasObjects(dir)) { process.stderr.write(NO_MATCH); process.exit(1); }
+    fs.rmSync(dir, { recursive: true, force: true });
+    process.exit(0);
+  }
+  const file = toLocal(url);
+  if (!fs.existsSync(file)) { process.stderr.write(NO_MATCH); process.exit(1); }
+  fs.rmSync(file, { force: true });
+  fs.rmSync(genPath(file), { force: true });
+  // The last object under a "folder" takes the folder with it, as in GCS.
+  for (let dir = path.dirname(file); dir.startsWith(BUCKET_DIR) && dir !== BUCKET_DIR && !hasObjects(dir); dir = path.dirname(dir)) {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
   process.exit(0);
 }
 
@@ -146,12 +214,21 @@ function readKeyPublicKey(rootDir: string, name = 'default'): string {
  *  guards read. `projectDir` is an ABSOLUTE path (never relative to a `--repo-root` a test
  *  might override), so a test that changes `--repo-root` doesn't accidentally relocate where
  *  the project config is looked for. */
-function writeProjectConfig(projectDir: string, ota: { enabled?: boolean; baseUrl?: string; publicKey?: string; bundleName: string; engineApi?: number; subgames?: string[] }): string {
+function writeProjectConfig(projectDir: string, ota: { enabled?: boolean; baseUrl?: string; publicKey?: string; bundleName: string; engineApi?: number; subgames?: string[]; retainVersions?: unknown }): string {
   fs.mkdirSync(projectDir, { recursive: true });
   fs.writeFileSync(path.join(projectDir, 'project.config.json'), JSON.stringify({
     ota: { enabled: true, baseUrl: '', engineApi: 1, ...ota },
   }));
   return projectDir;
+}
+
+/** A commit id for test stamps — any full hex sha; nothing here resolves it. */
+const TEST_COMMIT = 'a'.repeat(40);
+
+/** Writes the `modoki-build.json` a real build leaves in its dist (#906, ota/buildStamp.mjs). Every
+ *  test dist here needs one: ota-publish.mjs refuses an unstamped dist before any upload. */
+function writeCleanBuildStamp(dir: string, stamp: { commit: string | null; dirty: boolean | null } = { commit: TEST_COMMIT, dirty: false }): void {
+  fs.writeFileSync(path.join(dir, 'modoki-build.json'), JSON.stringify(stamp));
 }
 
 function runNode(cwd: string, env: NodeJS.ProcessEnv, args: string[]): { status: number; stdout: string; stderr: string } {
@@ -208,6 +285,7 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
     bucketDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-bucket-'));
     distDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-race-dist-'));
     fs.writeFileSync(path.join(distDir, 'index.html'), '<html>race-test</html>');
+    writeCleanBuildStamp(distDir);
     raceFlag = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-race-flag-')), 'race');
   });
 
@@ -488,6 +566,7 @@ describe('ota-publish.mjs mandatory stickiness', () => {
     bucketDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-bucket-mandatory-'));
     distDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-mandatory-dist-'));
     fs.writeFileSync(path.join(distDir, 'index.html'), '<html>mandatory-test</html>');
+    writeCleanBuildStamp(distDir);
 
     const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
     execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
@@ -616,6 +695,7 @@ describe('ota-publish.mjs version-collision guard', () => {
     bucketDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-bucket-collision-'));
     distDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-collision-dist-'));
     fs.writeFileSync(path.join(distDir, 'index.html'), '<html>collision-test</html>');
+    writeCleanBuildStamp(distDir);
 
     const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
     execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
@@ -630,7 +710,7 @@ describe('ota-publish.mjs version-collision guard', () => {
 
   // Same name-keyed scratch-project default as the race-condition describe above (this block
   // also publishes both "shell" and "sling" as arbitrary bundle-name test doubles).
-  function publish(name: string, version: string, envOverrides: NodeJS.ProcessEnv = {}) {
+  function publish(name: string, version: string, envOverrides: NodeJS.ProcessEnv = {}, leadingArgs: string[] = []) {
     const projectDir = path.join(repoRoot, 'games', `testproj-${name}`);
     if (!fs.existsSync(path.join(projectDir, 'project.config.json'))) {
       writeProjectConfig(projectDir, { bundleName: name, publicKey: readKeyPublicKey(repoRoot) });
@@ -642,6 +722,8 @@ describe('ota-publish.mjs version-collision guard', () => {
       ...envOverrides,
     }, [
       'engine/scripts/ota-publish.mjs',
+      // BEFORE --dist on purpose: a bare switch parsed as `--key value` would swallow `--dist`.
+      ...leadingArgs,
       '--dist', distDir, '--bucket', 'gs://fakebucket/testprefix',
       '--name', name, '--version', version, '--engine-api', '1', '--key', 'default',
       '--project', projectDir,
@@ -707,6 +789,220 @@ describe('ota-publish.mjs version-collision guard', () => {
     expect(result.status).toBe(0);
     expect(result.stderr).toMatch(/WARNING: manifest verification is NOT enabled for: shell/);
   });
+
+  // ── #906: build provenance ────────────────────────────────────────────────────────────────────
+  const bundleDir = (name: string, version: string) => path.join(bucketDir, 'fakebucket', 'testprefix', 'bundles', name, version);
+  const uploadedManifest = (name: string, version: string) =>
+    JSON.parse(fs.readFileSync(path.join(bundleDir(name, version), 'manifest.json'), 'utf8')) as { build?: unknown };
+
+  it('#906: a clean stamp publishes, and the uploaded manifest carries its commit unforced', () => {
+    const result = publish('shell', 'v1');
+    expect(result.status, result.stderr).toBe(0);
+    expect(uploadedManifest('shell', 'v1').build).toEqual({ commit: TEST_COMMIT, dirty: false, forced: false });
+  });
+
+  it('#906: a dist with NO stamp is refused before anything reaches the bucket', () => {
+    fs.rmSync(path.join(distDir, 'modoki-build.json'));
+    const result = publish('shell', 'v1');
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/has no modoki-build\.json/);
+    expect(fs.existsSync(path.join(bucketDir, 'fakebucket'))).toBe(false);
+  });
+
+  it('#906: a dirty stamp is refused before anything reaches the bucket, and the refusal names the override', () => {
+    writeCleanBuildStamp(distDir, { commit: TEST_COMMIT, dirty: true });
+    const result = publish('shell', 'v1');
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/uncommitted changes/);
+    expect(result.stderr).toMatch(/--allow-unclean-build/);
+    expect(fs.existsSync(path.join(bucketDir, 'fakebucket'))).toBe(false);
+  });
+
+  it('#906: an unknown-tree stamp (git could not answer) is refused like a dirty one', () => {
+    writeCleanBuildStamp(distDir, { commit: null, dirty: null });
+    const result = publish('shell', 'v1');
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/git could not report the tree/);
+  });
+
+  it('#906: --allow-unclean-build publishes a dirty build and the signed manifest records forced: true', () => {
+    writeCleanBuildStamp(distDir, { commit: TEST_COMMIT, dirty: true });
+    const result = publish('shell', 'v1', {}, ['--allow-unclean-build']);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toMatch(/WARNING: publishing an unclean build/);
+    expect(uploadedManifest('shell', 'v1').build).toEqual({ commit: TEST_COMMIT, dirty: true, forced: true });
+  });
+
+  it('#906: --allow-unclean-build on an UNSTAMPED dist records what is unknown as null, still forced', () => {
+    fs.rmSync(path.join(distDir, 'modoki-build.json'));
+    const result = publish('shell', 'v1', {}, ['--allow-unclean-build']);
+    expect(result.status, result.stderr).toBe(0);
+    expect(uploadedManifest('shell', 'v1').build).toEqual({ commit: null, dirty: null, forced: true });
+  });
+
+  it('#906: --allow-unclean-build on a CLEAN build overrides nothing, so a retry without it still resumes', () => {
+    expect(publish('shell', 'v1', {}, ['--allow-unclean-build']).status).toBe(0);
+    expect(uploadedManifest('shell', 'v1').build).toEqual({ commit: TEST_COMMIT, dirty: false, forced: false });
+    const retry = publish('shell', 'v1');
+    expect(retry.status, retry.stderr).toBe(0);
+    expect(retry.stdout).toMatch(/identical contents — resuming/);
+  });
+
+  it('#906: a rebuild from a DIFFERENT commit published under an existing version is a collision, not a resume', () => {
+    expect(publish('shell', 'v1').status).toBe(0);
+    writeCleanBuildStamp(distDir, { commit: 'b'.repeat(40), dirty: false });
+    const second = publish('shell', 'v1');
+    expect(second.status).not.toBe(0);
+    expect(second.stderr).toMatch(/Version collision/);
+  });
+
+  // ── #836: retention ───────────────────────────────────────────────────────────────────────────
+  const bundlesDir = (name: string) => path.join(bucketDir, 'fakebucket', 'testprefix', 'bundles', name);
+  const versionsIn = (name: string) => (fs.existsSync(bundlesDir(name)) ? fs.readdirSync(bundlesDir(name)).sort() : []);
+  let clock = Date.parse('2026-01-01T00:00:00Z');
+  /** Pins a version's manifest creation time, so "newest" does not rest on how fast two spawns ran. */
+  const stampAge = (name: string, version: string) => {
+    clock += 60_000;
+    const file = path.join(bundlesDir(name), version, 'manifest.json');
+    fs.utimesSync(file, new Date(clock), new Date(clock));
+  };
+  const withRetention = (name: string, retainVersions: unknown) =>
+    writeProjectConfig(path.join(repoRoot, 'games', `testproj-${name}`), { bundleName: name, publicKey: readKeyPublicKey(repoRoot), retainVersions });
+  const publishAged = (name: string, version: string) => {
+    const r = publish(name, version);
+    expect(r.status, r.stderr).toBe(0);
+    stampAge(name, version);
+    return r;
+  };
+
+  it('#836: each publish keeps the newest retainVersions and deletes the rest, oldest first', () => {
+    withRetention('shell', 2);
+    publishAged('shell', 'v1');
+    publishAged('shell', 'v2');
+    expect(versionsIn('shell')).toEqual(['v1', 'v2']);
+    const third = publishAged('shell', 'v3');
+    expect(versionsIn('shell')).toEqual(['v2', 'v3']);
+    expect(third.stdout).toMatch(/Retention: kept 2 version\(s\) of shell \(newest 2 \+ live\), deleted 1: v1\./);
+    publishAged('shell', 'v4');
+    expect(versionsIn('shell')).toEqual(['v3', 'v4']);
+  });
+
+  it('#836: an absent retainVersions keeps the default of five', () => {
+    for (const v of ['v1', 'v2', 'v3', 'v4', 'v5', 'v6']) publishAged('shell', v);
+    expect(versionsIn('shell')).toEqual(['v2', 'v3', 'v4', 'v5', 'v6']);
+  });
+
+  it('#836: deleting v1 leaves v10 alone — a delete is a folder glob, never a bare name prefix', () => {
+    withRetention('shell', 2);
+    publishAged('shell', 'v1');
+    publishAged('shell', 'v10');
+    publishAged('shell', 'v2'); // v1 is the oldest of three: it alone goes
+    expect(versionsIn('shell')).toEqual(['v10', 'v2']);
+    const rmLog = fs.readFileSync(path.join(bucketDir, 'rm.log'), 'utf8').split('\n').filter(Boolean).map((u) => u.replace(/^.*\/bundles\//, ''));
+    // manifest.json goes LAST: files, then the zip, then the rest of the folder.
+    expect(rmLog).toEqual(['shell/v1/files/**', 'shell/v1/bundle.zip', 'shell/v1/**']);
+  });
+
+  it('#836: a version folder with no manifest.json is never deleted — it may be a publish still uploading', () => {
+    withRetention('shell', 1);
+    publishAged('shell', 'v1');
+    const inFlight = path.join(bundlesDir('shell'), 'v0-uploading', 'files');
+    fs.mkdirSync(inFlight, { recursive: true });
+    fs.writeFileSync(path.join(inFlight, 'a'.repeat(64)), 'x');
+    const r = publishAged('shell', 'v2');
+    expect(versionsIn('shell')).toEqual(['v0-uploading', 'v2']);
+    expect(r.stdout).toMatch(/left alone, no manifest\.json: v0-uploading/);
+  });
+
+  it('#836: pruning one bundle never touches another bundle in the same bucket', () => {
+    withRetention('shell', 1);
+    withRetention('sling', 1);
+    publishAged('sling', 'v1');
+    publishAged('shell', 'v1');
+    publishAged('shell', 'v2');
+    expect(versionsIn('shell')).toEqual(['v2']);
+    expect(versionsIn('sling')).toEqual(['v1']);
+  });
+
+  it('#836: a listing that fails deletes nothing, and the publish still succeeds with a loud warning', () => {
+    withRetention('shell', 1);
+    publishAged('shell', 'v1');
+    const r = publish('shell', 'v2', { FAKE_GCS_LS_FAIL: '1' });
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stderr).toMatch(/WARNING: the release is live, but pruning old versions failed: could not list/);
+    expect(versionsIn('shell')).toEqual(['v1', 'v2']);
+  });
+
+  it('#836: a publish whose own version was deleted under it (a concurrent prune) FAILS loudly after the release write', () => {
+    const r = publish('shell', 'v1', { FAKE_GCS_WIPE_ON_RELEASE: 'gs://fakebucket/testprefix/bundles/shell/v1' });
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/release\.json now points shell at v1, but .*manifest\.json is GONE/);
+  });
+
+  it('#836: losing ONLY its bundle.zip (the retry race: zip deleted, manifest re-uploaded after) also fails loudly', () => {
+    const r = publish('shell', 'v1', { FAKE_GCS_WIPE_ON_RELEASE: 'gs://fakebucket/testprefix/bundles/shell/v1/bundle.zip' });
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/release\.json now points shell at v1, but .*bundle\.zip is GONE/);
+  });
+
+  it('#836: a malformed retainVersions refuses the publish before anything is uploaded', () => {
+    withRetention('shell', 0);
+    const r = publish('shell', 'v1');
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/ota\.retainVersions is present but not a positive integer/);
+    expect(fs.existsSync(path.join(bucketDir, 'fakebucket'))).toBe(false);
+  });
+
+  describe('ota-prune.mjs (the same prune, by hand)', () => {
+    const prune = (name: string, extra: string[] = [], env: NodeJS.ProcessEnv = {}) => {
+      fs.cpSync(path.join(engineRoot, 'scripts', 'ota-prune.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-prune.mjs'));
+      return runNode(repoRoot, {
+        ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}`, FAKE_GCS_BUCKET_DIR: bucketDir, ...env,
+      }, ['engine/scripts/ota-prune.mjs', '--bucket', 'gs://fakebucket/testprefix', '--name', name,
+        '--project', path.join(repoRoot, 'games', `testproj-${name}`), ...extra]);
+    };
+    const pointReleaseAt = (name: string, version: string) => {
+      const file = path.join(bucketDir, 'fakebucket', 'testprefix', 'release.json');
+      const release = JSON.parse(fs.readFileSync(file, 'utf8'));
+      release.bundles[name] = version;
+      fs.writeFileSync(file, JSON.stringify(release));
+    };
+
+    it('keeps the version release.json points at however old, and --dry-run deletes nothing', () => {
+      withRetention('shell', 5);
+      for (const v of ['v1', 'v2', 'v3']) publishAged('shell', v);
+      withRetention('shell', 1);
+      pointReleaseAt('shell', 'v1'); // e.g. a rollback: the live version is the OLDEST one
+
+      const dry = prune('shell', ['--dry-run']);
+      expect(dry.status, dry.stderr).toBe(0);
+      expect(dry.stdout).toMatch(/keep {3}\(2\): v1, v3/);
+      expect(dry.stdout).toMatch(/delete \(1\): v2/);
+      expect(dry.stdout).toMatch(/Dry run — nothing deleted/);
+      expect(versionsIn('shell')).toEqual(['v1', 'v2', 'v3']);
+
+      const real = prune('shell');
+      expect(real.status, real.stderr).toBe(0);
+      expect(versionsIn('shell')).toEqual(['v1', 'v3']);
+    });
+
+    it('refuses a name the project does not publish, before reading the bucket', () => {
+      withRetention('shell', 1);
+      const r = prune('shell', ['--name', 'not-listed']);
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toMatch(/is neither .* ota\.bundleName/);
+    });
+
+    it('a delete that fails stops and exits non-zero, naming what it had already deleted', () => {
+      withRetention('shell', 5);
+      for (const v of ['v1', 'v2', 'v3']) publishAged('shell', v);
+      withRetention('shell', 1);
+      const r = prune('shell', [], { FAKE_GCS_RM_FAIL: '1' });
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toMatch(/failed deleting shell@v1/);
+      expect(versionsIn('shell')).toEqual(['v1', 'v2', 'v3']);
+    });
+  });
 });
 
 /** #582: ota-publish.mjs's own publish-identity guards — the by-hand path the editor's
@@ -745,6 +1041,7 @@ describe('ota-publish.mjs publish-identity guards (#582)', () => {
     bucketDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-bucket-guards-'));
     distDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-guards-dist-'));
     fs.writeFileSync(path.join(distDir, 'index.html'), '<html>guards-test</html>');
+    writeCleanBuildStamp(distDir);
 
     const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
     execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
@@ -883,6 +1180,7 @@ describe('ota-publish.mjs publish-identity guards (#582)', () => {
     const subgameDistDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-guards-subgame-dist-'));
     try {
       fs.writeFileSync(path.join(subgameDistDir, 'index.html'), '<html>subgame</html>');
+      writeCleanBuildStamp(subgameDistDir);
       fs.writeFileSync(path.join(subgameDistDir, 'subgame.json'), JSON.stringify({ engineApi: 1 }));
       const result = publish('subgame-x', ['--project', projectDir], subgameDistDir);
       expect(result.status).toBe(0);
@@ -897,6 +1195,7 @@ describe('ota-publish.mjs publish-identity guards (#582)', () => {
     const subgameDistDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-guards-subgame-dist-shell-'));
     try {
       fs.writeFileSync(path.join(subgameDistDir, 'index.html'), '<html>subgame</html>');
+      writeCleanBuildStamp(subgameDistDir);
       fs.writeFileSync(path.join(subgameDistDir, 'subgame.json'), JSON.stringify({ engineApi: 1 }));
       const result = publish('shell', ['--project', projectDir], subgameDistDir);
       expect(result.status).not.toBe(0);
@@ -912,6 +1211,7 @@ describe('ota-publish.mjs publish-identity guards (#582)', () => {
     const subgameDistDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-guards-unlisted-'));
     try {
       fs.writeFileSync(path.join(subgameDistDir, 'index.html'), '<html>subgame</html>');
+      writeCleanBuildStamp(subgameDistDir);
       fs.writeFileSync(path.join(subgameDistDir, 'subgame.json'), JSON.stringify({ engineApi: 1 }));
       const result = publish('not-listed', ['--project', projectDir], subgameDistDir);
       expect(result.status).not.toBe(0);
@@ -936,6 +1236,7 @@ describe('ota-publish.mjs publish-identity guards (#582)', () => {
     const dist = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-guards-subgame-api-'));
     try {
       fs.writeFileSync(path.join(dist, 'index.html'), '<html>subgame</html>');
+      writeCleanBuildStamp(dist);
       fs.writeFileSync(path.join(dist, 'subgame.json'), subgameJson);
       fn(dist);
     } finally {
@@ -1005,6 +1306,7 @@ describe('ota-publish.mjs publish-identity guards (#582)', () => {
       const dist = path.join(subProject, 'subgame-dist');
       fs.mkdirSync(dist, { recursive: true });
       fs.writeFileSync(path.join(dist, 'index.html'), '<html>subgame</html>');
+      writeCleanBuildStamp(dist);
       fs.writeFileSync(path.join(dist, 'subgame.json'), JSON.stringify({ engineApi: 1 }));
       const env: NodeJS.ProcessEnv = {
         ...process.env,
@@ -1083,6 +1385,7 @@ describe('ota-publish.mjs input validation (#649)', () => {
     bucketDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-bucket-validation-'));
     distDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-validation-dist-'));
     fs.writeFileSync(path.join(distDir, 'index.html'), '<html>validation-test</html>');
+    writeCleanBuildStamp(distDir);
 
     const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
     execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });

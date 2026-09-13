@@ -14,6 +14,15 @@ export interface OtaManifest {
   /** The whole-bundle zip the native OTA client downloads directly (Phase 1). Optional —
    *  a Phase 0 manifest without it is still valid. */
   bundleZip?: OtaFileEntry;
+  /** Which source tree built this bundle (#906) — see buildStamp.mjs. Optional — a manifest
+   *  published before it is still valid. */
+  build?: OtaManifestBuild;
+}
+
+export interface OtaManifestBuild {
+  commit: string | null;
+  dirty: boolean | null;
+  forced: boolean;
 }
 
 export interface OtaRelease {
@@ -40,6 +49,7 @@ export function createManifest(args: {
   engineApi: number;
   files: Record<string, OtaFileEntry>;
   bundleZip?: OtaFileEntry;
+  build?: OtaManifestBuild;
 }): OtaManifest;
 export function createRelease(args: {
   bundles: Record<string, string>;

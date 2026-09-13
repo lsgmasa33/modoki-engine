@@ -34,6 +34,8 @@ quarantined on that device.
 | `engine/scripts/ota/schema.mjs` | `release.json` / `manifest.json` schemas + `signingPayload` (sorted-key canonical JSON, so a signature is stable regardless of field order) |
 | `engine/scripts/ota/signing.mjs` | Ed25519 via Node's built-in `node:crypto`; keys are raw 32-byte values, base64url via JWK export — so a public key bakes into an app as one string constant |
 | `engine/scripts/ota-publish.mjs` | CLI: hash a `dist/`, upload content-addressed files + `bundle.zip`, merge/re-sign `release.json`. Requires `--project <dir>` (#582) — reads that project's `project.config.json` to enforce the signing-key-identity + dist-kind guards itself |
+| `engine/scripts/ota/buildStamp.mjs` | The build stamp (`modoki-build.json`: which commit built a dist) and the publish decision taken from it — #906 |
+| `engine/scripts/ota/pruneBundle.mjs`, `engine/scripts/ota-prune.mjs` | CDN retention: the prune every publish runs after `release.json`, and the same prune by hand with `--dry-run` — #836 |
 | `engine/scripts/ota-keygen.mjs` | CLI: mint a signing keypair (refuses to overwrite — see Gotchas) |
 | `engine/scripts/ota-embed-manifest.mjs` | CLI: write `ota-embedded-manifest.json` into a built `dist/`, enabling delta on a fresh install. Requires `--project <dir>` (#582) — refuses a `--name` that doesn't match the project's resolved `ota.bundleName`, and a `--dist` outside `--project` |
 | `engine/packages/modoki/src/runtime/ota/otaClient.ts` | `checkForUpdate` — fetch, verify, diff, delegate to native. All the trusted decisions |
@@ -61,7 +63,9 @@ CDN/
 ```
 
 `release.json` — `{schema, bundles: {shell: "v12", …}, mandatory, minEngineApi, manifests?, seq?, sig}`.
-Per-bundle `manifest.json` — `{schema, name, version, engineApi, files: {"<path>": {hash, size}}, bundleZip?}`.
+Per-bundle `manifest.json` — `{schema, name, version, engineApi, files: {"<path>": {hash, size}}, bundleZip?, build?}`.
+`build` = `{commit, dirty, forced}`, which source tree built the bundle — see § Publishing,
+"Build provenance".
 
 Only `release.json` is signed; it is the single trusted root. Everything else is reached by
 content hash **chained back to that root** — see § The trust chain.
@@ -362,8 +366,13 @@ network round-trip. Native resolves `"embedded"` specially — iOS copies from
 since APK assets are not ordinary `File`s the way an OTA snapshot folder is.
 
 If either base manifest can't be fetched (an older build with no embedded manifest, a CDN
-blip), it silently falls back to the whole-`bundle.zip` path. **Delta is an optimization,
-never a requirement for an update to succeed.**
+blip, or — since #836 — an active version the publish path has PRUNED from the bucket), it falls
+back to the whole-`bundle.zip` path of the target. **Delta is an optimization, never a requirement
+for an update to succeed.** A missing ACTIVE base is reported through `onDeltaFallback` (a pruned
+version turns a delta into a full download, and an unexplained bandwidth spike is what nobody can
+diagnose later); a missing EMBEDDED base stays silent, because an older build simply has none.
+That base manifest is the ONLY request a device ever makes into a version other than its target —
+which is what makes pruning safe (see § Publishing, "Retention").
 
 A **failed delta stage falls back the same way** (#556). This matters more than it looks:
 a delta's `copy` entries come off the local disk, so a device-local corruption can fail
@@ -654,6 +663,94 @@ existence-only guard survives anywhere in the pipeline (#577). For the same reas
 `bundle.zip`, so that its presence genuinely means "this version's contents were committed"
 rather than "an upload got partway". `release.json` is still written after everything.
 
+**Build provenance: a manifest names the commit that built it, and a dirty build is refused (#906).**
+The signed manifest proves *this is exactly the bundle we published*; before #906 nothing said
+*which source built it*, so "the player is on shell v13" had no path back to a tree. Now:
+- **The BUILD stamps its own dist.** `build-web.mjs --target native` and `build-subgame.mjs` write
+  `modoki-build.json` = `{commit, dirty}` into the dist (`engine/scripts/ota/buildStamp.mjs`). Git is
+  read when the build **starts** (the native heals and icon generation rewrite tracked files, and
+  those are the build's output, not uncommitted source) and HEAD is re-checked at the end — HEAD
+  moving mid-build counts as dirty. Untracked non-ignored files count as dirty, repo-wide. Web and
+  playable builds get no stamp: they are never OTA-published.
+- ⚠️ **Every `ios/` and `android/` folder is excluded from "dirty"** (`PROVENANCE_PATHSPEC`). Reading
+  at build start was not enough: a native build leaves its OWN rewrites behind for the next one —
+  measured on `games/ota-test`, the first `build-web.mjs --target native` stamped clean and left 3
+  modified and 8 new icon files, so every later publish read dirty, and the editor has no override.
+  Nothing under a native folder reaches the web dist an OTA bundle is (the only tracked non-native
+  file under one is `google-services.json`).
+- ⚠️ **Never stamped from the uploader's checkout.** `ota-publish.mjs` takes a `--dist` someone else
+  built, maybe earlier, maybe elsewhere, so its own cwd would record the wrong tree — confidently.
+  That is why the fix #904 gave `publish-engine-oss.sh` (assert the current checkout) does not
+  transfer here.
+- **The publish refuses anything not provably clean** — a missing or malformed stamp, `dirty: true`,
+  or a tree git could not answer for (`null`: not a repository, git missing). Unknown is never clean.
+  The refusal runs under the build claim and before any upload. `/api/ota/publish` asks the same
+  question (`readGitProvenance`) BEFORE its multi-minute build and CORS rewrite and answers 400, since
+  a late refusal there was a wasted build the dialog could do nothing about.
+- **`--allow-unclean-build` is CLI-only** (owner, 2026-09-13). It publishes anyway and the manifest
+  records `forced: true` plus whatever the stamp did establish. The editor dialog and
+  `modoki_ota_publish` cannot pass it, so from those a dirty tree does not publish — commit first.
+  Consequences worth knowing: **a project outside any git repository cannot OTA-publish from the
+  editor at all**, because its stamp is always unknown — and neither can a PACKAGED-editor user whose
+  machine has no working `git` (a Mac without the Command Line Tools) or no `node` to run the CLI.
+- **`build` is additive and signed for free.** It is an optional field like `bundleZip`; the client
+  validator checks only the fields it knows and never rejects an unknown key, and `manifestHashPayload`
+  covers every field, so `release.manifests[name]` commits to it with no schema or `engineApi`
+  bump (checked before the change: native code never parses `manifest.json`). Both validator ports
+  accept it; `forced: false` is only valid beside a known commit with `dirty: false`, so an unforced
+  manifest is a claim of a clean tree. Nothing on the device acts on it.
+- **It changes what a collision is.** A rebuild from a different commit published under an existing
+  version string hashes differently, so it is refused as a collision — provenance is part of what a
+  version means. A retry of the same stamp still resumes; `forced` stays `false` on a clean build
+  even when the flag was passed, so that holds for a flagged retry too.
+
+**Retention: each publish prunes its bundle to the newest `ota.retainVersions` plus the live one (#836).**
+Before #836 nothing deleted a version, so a bucket grew by a full bundle copy per publish forever
+(`games/ota-test`'s shell had 29). Now `ota-publish.mjs`, after `release.json` points at the new
+version, runs `pruneBundleVersions` (`engine/scripts/ota/pruneBundle.mjs`) for the bundle it just
+published — never another bundle in the bucket:
+- **Kept:** the newest `ota.retainVersions` (Project Settings → OTA → Versions kept, default 5),
+  ordered by when each version's `manifest.json` was CREATED — the manifest is uploaded last, so that
+  is when the version was committed, and version strings have no order; plus the version
+  `release.json` points at, however old (a rollback); plus ⚠️ **every folder with no `manifest.json`**
+  (a publish still uploading, or one that died — indistinguishable, so never deleted, only reported);
+  plus any manifest whose age cannot be read.
+- **Why no device is stranded** (read from `otaClient.ts`): a device runs from its own staged copy,
+  and the bucket is asked only for the TARGET version's files and zip. An older version is reached
+  only as the delta base manifest, whose 404 falls back to the whole zip of the target (§ Delta
+  transfer). So pruning costs a long-idle device one full download, never an update.
+- ⚠️ **A version whose `manifest.json` is younger than an hour is never deleted** (`PRUNE_GRACE_MS`).
+  This, not the generation checks, is what stops a concurrent publish losing its version: a publish
+  uploads its manifest, then spends seconds to minutes in the release write (retrying on a lost
+  generation race), and a prune that planned before that write LANDS would delete what it points at.
+  The close-out review reproduced two shapes against the real function — a second publish of the same
+  bundle, and an identical-content retry of an old version re-pointing the release. Every publish path
+  re-uploads its manifest before its release write, so "young manifest" covers both — once that
+  manifest is up. ⚠️ **Not closed:** a retry of an OLD version still uploading its `files/` and
+  `bundle.zip` (before the manifest refresh) can lose them to a prune that planned in that gap. That is
+  DETECTED, not prevented: after its release write `ota-publish.mjs` confirms its own `manifest.json`
+  and `bundle.zip` still exist, and fails loudly ("publish again now") if not. Prevention would need a
+  lock both the publisher and the prune honour.
+- **Fails closed.** Any listing or `release.json` read that fails deletes nothing more. The generation
+  is re-read before EACH version's deletes and the plan redone if a publish landed; after the deletes
+  the live pointer is read once more, and if it names a deleted version the prune FAILS loudly
+  ("republish now") rather than reporting success.
+- **Delete order:** `files/**`, then `bundle.zip`, then `<version>/**` — the manifest goes last, so a
+  prune that dies partway leaves a version the next prune still recognises and finishes. Explicit
+  `/**` globs, never `rm --recursive <prefix>`: `.../v1` is one character from `.../v10`.
+- **A prune failure after a live release is a warning, not a failed publish** — the next publish
+  prunes again. `ota.retainVersions` itself is checked in the shared preflight
+  (`bad-project-retain-versions`), before anything is built or uploaded.
+- **By hand:** `node engine/scripts/ota-prune.mjs --bucket gs://… --name <bundle> --project <shell>
+  [--dry-run]` runs the same function without publishing — to preview, or to catch up a bucket.
+  First real run, 2026-09-13: `games/ota-test`'s shell went from 29 versions to v25–v29 (live v29
+  still 200, a pruned manifest 404), `ota-subgame-test`'s two untouched.
+- ⚠️ **Never reuse a pruned version string.** Once its manifest is gone the collision guard cannot see
+  it, so the name republishes freely — but a device holding that string in `rejected`, or active on
+  the old bytes, still means the OLD version by it.
+- `modoki-www-site` has a 7-day soft-delete policy, so a mistaken prune there is recoverable for a week.
+  That is the bucket's setting, not something this code relies on.
+
 ## Settled policy decisions
 
 Folded from the retired `docs/plans/mobile-ota-updates-plan.md` (2026-09-07). These are closed
@@ -665,6 +762,8 @@ questions, recorded so they are not re-opened by accident.
 | Apply timing | **Per-release `mandatory` flag.** Routine = background, applies next launch. Mandatory = blocking progress UI, then **"restart to continue"** — NOT a mid-session hot-swap. |
 | Engine-API compatibility | **Exact equality, no range/`>=` policy.** A sub-game built against a different engine version refuses to load, loudly, rather than attempting it. Revisit only if this proves too strict in real use — and note [#837](https://github.com/lsgmasa33/modoki/issues/837) depends on it: any automated publish surface must make the engine-API value it stamps visible rather than defaulted. |
 | `state.json` across a real binary update | **Reset the live bookkeeping** (`active`/`pending`/`bootAttempts`/`confirmedBoots`), **keep the `rejected` quarantine list.** A new binary ships its own latest embedded content, so bookkeeping referencing an abandoned OTA snapshot is meaningless — but a version already proven bad has no reason to become stageable again just because the binary changed. Implemented as `OtaCore.resetForNewBinary` (Swift + Java). |
+| CDN retention (#836) | **The publish path prunes**: newest `ota.retainVersions` (authored, default 5) plus whatever `release.json` points at, under the same generation discipline as the release write. Declined: a bucket age-lifecycle rule (it cannot see which version is live) and deferring until a game ships OTA. |
+| Build provenance (#906) | **Stamped at BUILD time into the signed manifest**; a dirty or unknown build is refused at publish; `--allow-unclean-build` is CLI-only and recorded as `forced: true`. Declined: an unsigned sidecar with dirty-allowed-but-flagged, and a hand-kept version→commit log. |
 | App Store / Play policy | **Permitted.** App Review Guideline 4.7 names first-party HTML5/JS mini-apps/mini-games explicitly; DPLA §3.3.2 allows downloaded interpreted code that does not change the app's advertised primary purpose and is not a storefront for third-party code. Guideline 2.5.2 is the general *compiled*-code ban; 4.7/3.3.2 are the carve-out this feature relies on. Play is more permissive. Practical takeaway: advertise the app as a game collection from v1, and keep every game first-party. |
 
 ## Gotchas
@@ -699,13 +798,15 @@ questions, recorded so they are not re-opened by accident.
 - **Never regenerate the signing key** for a published app. Every installed binary has the
   old public key baked in and will reject everything you publish afterwards. `ota-keygen.mjs`
   refuses to overwrite for this reason.
-- **The deploy step must be additive.** The normal site deploy uses
-  `--delete-unmatched-destination-objects`, which would wipe bundles that already-shipped
-  clients are still fetching. `ota-publish.mjs` deliberately does not.
+- **The deploy step must be additive; the only delete is the bounded prune.** The normal site
+  deploy uses `--delete-unmatched-destination-objects`, which would wipe every version and bundle in
+  the namespace, including the live one. `ota-publish.mjs` uploads additively and removes old
+  versions only through the #836 prune, which never touches the live version (§ Publishing).
 - **Publish only a `dist/` built from the current project config.** `ota-publish.mjs` uploads
-  whatever directory you point it at — it does not build, and does not read
-  `project.config.json`. Publishing a stale `dist/` will silently overwrite a freshly-fixed
-  native install over the air.
+  whatever directory you point it at — it does not build. It reads `project.config.json` only for
+  its publish guards (#582/#827), and the build stamp (#906) says which commit built the dist, not
+  whether that dist is still current. Publishing a stale `dist/` will silently overwrite a
+  freshly-fixed native install over the air; the editor route always builds fresh.
 - **Android: a stale Gradle incremental asset-merge** can produce an APK that contains
   `ota-embedded-manifest.json` per `unzip -l` while the WebView's `fetch` 404s it. A
   `gradlew clean` fixes it. Fails silently — a missing embedded manifest is an expected

@@ -65,6 +65,24 @@ export function validateManifest(manifest) {
       if (typeof z.size !== 'number' || !Number.isInteger(z.size) || z.size < 0) fail('manifest.bundleZip.size must be a non-negative integer');
     }
   }
+  // Optional (#906, additive — same precedent as bundleZip): which source tree built this bundle,
+  // stamped by the BUILD (buildStamp.mjs) and carried here by ota-publish.mjs. It is inside the
+  // canonical manifest hash, so the signed release commits to it. `forced: false` is a claim that
+  // the tree was provably clean, so it is only valid beside a known commit and `dirty: false`.
+  if (manifest.build !== undefined) {
+    const b = manifest.build;
+    if (b == null || typeof b !== 'object' || Array.isArray(b)) fail('manifest.build must be an object when present');
+    else {
+      if (b.commit !== null && (typeof b.commit !== 'string' || !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(b.commit))) {
+        fail('manifest.build.commit must be a full lowercase hex commit id or null');
+      }
+      if (b.dirty !== null && typeof b.dirty !== 'boolean') fail('manifest.build.dirty must be a boolean or null');
+      if (typeof b.forced !== 'boolean') fail('manifest.build.forced must be a boolean');
+      else if (!b.forced && (b.commit === null || b.dirty !== false)) {
+        fail('manifest.build.forced is false, but the build is not a known clean commit');
+      }
+    }
+  }
   return errors;
 }
 
@@ -121,9 +139,10 @@ export function validateRelease(release) {
 /** Builds a manifest object from a name/version/engineApi + a files map
  *  (relative path → {hash, size}), stamping the current schema version. Pure
  *  assembly — callers compute the hashes (see ./buildManifest.mjs). */
-export function createManifest({ name, version, engineApi, files, bundleZip }) {
+export function createManifest({ name, version, engineApi, files, bundleZip, build }) {
   const manifest = { schema: SCHEMA_VERSION, name, version, engineApi, files };
   if (bundleZip) manifest.bundleZip = bundleZip;
+  if (build) manifest.build = build;
   return manifest;
 }
 

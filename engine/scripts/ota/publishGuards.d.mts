@@ -22,4 +22,8 @@ export function otaSubgameEngineApi(o: {
 
 export const OTA_DEFAULT_ENGINE_API: number;
 
+export const OTA_DEFAULT_RETAIN_VERSIONS: number;
+
+export function otaRetainVersions(ota: unknown): number | null;
+
 export const OTA_DEFAULT_BUNDLE_NAME: string;

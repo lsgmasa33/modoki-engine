@@ -700,6 +700,7 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
                 { key: 'ota.baseUrl', label: 'Base URL', type: 'text', placeholder: 'https://storage.googleapis.com/<bucket>/<prefix>', help: 'what the CLIENT fetches from — no trailing slash' },
                 { key: 'ota.bundleName', label: 'Bundle name', type: 'text', placeholder: 'shell', help: "this build's own bundle — 'shell' for the main app" },
                 { key: 'ota.subgames', label: 'Sub-games', type: 'string-list', placeholder: 'one project id per line, e.g. ota-subgame-test', help: 'sub-game project folder names this shell publishes into its bucket — looked up next to this project first, then under games/ and demos/ of the repo; each becomes a Bundle choice in Build → Publish OTA Update… (#837)' },
+                { key: 'ota.retainVersions', label: 'Versions kept', type: 'number', help: 'how many published versions of each bundle stay in the bucket — every publish deletes older ones, never the version release.json points at. A device missing its old version just downloads the whole current bundle (#836)' },
                 { key: 'ota.engineApi', label: 'Engine API version', type: 'number', help: 'stamped from ENGINE_API_VERSION — do not hand-edit to "fix" a rejected update' },
                 { key: 'ota.publicKey', label: 'Public key', type: 'readonly-text', placeholder: 'empty — generate a key via Build → OTA Keys…', help: 'derived from build/ota-keys/<name>.json, never hand-typed (Build → OTA Keys…)' },
               ],

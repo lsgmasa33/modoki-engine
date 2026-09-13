@@ -756,6 +756,7 @@ export function otaPublishSteps(o: {
 // inside `otaPublishPreflight`, which this route and ota-publish.mjs both call. Re-exported for the
 // existing tests that import it from here.
 export { otaSigningKeyRefusal } from '../scripts/ota/publishGuards.mjs';
+import { readGitProvenance } from '../scripts/ota/buildStamp.mjs';
 
 /** The build steps for a `playable` target: the single-file inliner build (VITE_PLAYABLE=1 →
  *  games/<id>/ads/index.html) then reveal the ads/ dir. No favicon/deploy/native — the one HTML IS
@@ -3371,6 +3372,7 @@ export function assetScannerPlugin(): Plugin {
               'bad-bucket': `Could not derive a gs:// bucket from ota.baseUrl ("${cfg.ota.baseUrl}"). Pass ?bucket=gs://... explicitly.`,
               'bad-project-bundle-name': "This project's ota.bundleName is empty — set it in Project Settings → OTA.",
               'bad-project-subgames': "This project's ota.subgames is not a list of project ids — fix it in Project Settings → OTA → Sub-games.",
+              'bad-project-retain-versions': "This project's ota.retainVersions is not a positive whole number — set it in Project Settings → OTA → Versions kept.",
               'ambiguous-bundle': `bundleName ("${bundleName}") is BOTH this project's own ota.bundleName and a sub-game listed in its ota.subgames, so it cannot say which build it means. Rename one.`,
               'unknown-bundle': `bundleName ("${bundleName}") is neither this project's own ota.bundleName ("${r.bundleName}") nor a sub-game listed in its ota.subgames (${JSON.stringify(r.subgames)}). This route publishes the open project as itself, or a listed sub-game built as a sub-game module, never a plain build under another bundle's name. To publish a sub-game from here, add its project id under Project Settings → OTA → Sub-games.`,
               'key-missing': `Signing key "${keyName}" not found. Generate one first: POST /api/ota/keygen?name=${keyName}`,
@@ -3405,6 +3407,21 @@ export function assetScannerPlugin(): Plugin {
               res.end(JSON.stringify({ error: `Sub-game "${target.id}" would be built against engine API ${subgameEngineApi} (its own ota.engineApi), but this shell's ota.engineApi is ${cfg.ota.engineApi}. A device loads a sub-game only when the two are EXACTLY equal, so every device would refuse this bundle. Align the two before publishing.` }));
               return;
             }
+          }
+          // #906: ota-publish.mjs refuses a dist built from an uncommitted or unknown tree — but only once
+          // its stamp exists, i.e. after the multi-minute build and the CORS rewrite below. Ask the SAME
+          // question of the tree now, with the same function the build stamps from, so the editor answers
+          // before spending either. This route cannot pass the CLI's override (owner, 2026-09-13), so a
+          // late refusal here was a wasted build with nothing the dialog could do about it.
+          const tree = readGitProvenance(subgameDir ?? projectRoot);
+          if (tree.commit === null || tree.dirty !== false) {
+            res.statusCode = 400;
+            res.end(JSON.stringify({
+              error: tree.commit === null || tree.dirty === null
+                ? 'git could not report this project\'s tree (not in a git repository, or git is unavailable), so a publish could not record which source it ships. OTA publishing from the editor needs a committed git tree.'
+                : 'The repository has uncommitted changes (outside native ios/ and android/ folders), so no commit would reproduce what this publish ships. Commit them, then publish. (Only the ota-publish.mjs command line can publish an unclean build, with --allow-unclean-build.)',
+            }));
+            return;
           }
           const user = loadProjectUserConfig(projectRoot);
           const gcloudDir = resolveGcloudDir(user.sdk.gcloudPath);

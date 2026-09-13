@@ -81,6 +81,7 @@ describe('otaPublishPreflight — every refusal, each reachable on its own', () 
     ['bad-bucket', { bucket: 'gs://b; rm -rf ~' }],
     ['bad-project-bundle-name', { ota: { ...OTA, bundleName: 42 } }],
     ['bad-project-subgames', { ota: { ...OTA, subgames: 'mini' } }],
+    ['bad-project-retain-versions', { ota: { ...OTA, retainVersions: 0 } }],
     ['ambiguous-bundle', { ota: { ...OTA, subgames: ['shell'] } }],
     ['unknown-bundle', { name: 'not-listed' }],
     ['key-missing', { keyName: 'nope' }],
@@ -139,6 +140,15 @@ describe('both OTA entry points run the ONE preflight (#827)', () => {
     expect(route).toMatch(/otaPublishPreflight\(\{ ota: rawConfig\.ok \? rawConfig\.ota : undefined, name: bundleName,/);
     expect(route).not.toMatch(/otaPublishPreflight\(\{ ota: cfg\.ota/);
     expect(route).not.toMatch(/otaSigningKeyRefusal\(|otaPublishTarget\(/);
+  });
+
+  it('#906: /api/ota/publish refuses an unclean tree BEFORE it takes the build slot, asking the build stamp\'s own question', () => {
+    const check = route.indexOf('const tree = readGitProvenance(subgameDir ?? projectRoot);');
+    const refuse = route.indexOf('if (tree.commit === null || tree.dirty !== false) {');
+    const slot = route.indexOf("acquireBuildSlot('OTA publish', projectRoot)");
+    expect(check, 'the route no longer reads the tree').toBeGreaterThan(-1);
+    expect(refuse).toBeGreaterThan(check);
+    expect(slot, 'the build slot moved').toBeGreaterThan(refuse);
   });
 
   it('each side words EVERY refusal — none answers with undefined', () => {

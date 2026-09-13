@@ -321,3 +321,32 @@ describe('OTA schema-version + validator gate parity (#629)', () => {
     },
   );
 });
+
+describe('OTA validator parity: manifest.build (#906)', () => {
+  const sha = 'c'.repeat(40);
+  // Each row states the EXPECTED verdict, not only that the two ports agree — two ports wrong the same
+  // way would agree too. `forced: false` is a claim of a known clean commit, so it is only valid there.
+  it.each<[string, unknown, boolean]>([
+    ['absent', undefined, true],
+    ['clean, unforced', { commit: sha, dirty: false, forced: false }, true],
+    ['sha-256 commit id', { commit: 'd'.repeat(64), dirty: false, forced: false }, true],
+    ['dirty, forced', { commit: sha, dirty: true, forced: true }, true],
+    ['unknown tree, forced', { commit: null, dirty: null, forced: true }, true],
+    ['dirty but NOT forced', { commit: sha, dirty: true, forced: false }, false],
+    ['unknown commit but NOT forced', { commit: null, dirty: false, forced: false }, false],
+    ['unknown dirtiness but NOT forced', { commit: sha, dirty: null, forced: false }, false],
+    ['forced missing', { commit: sha, dirty: false }, false],
+    ['short commit id', { commit: 'abc1234', dirty: false, forced: false }, false],
+    ['uppercase commit id', { commit: 'C'.repeat(40), dirty: false, forced: false }, false],
+    ['dirty as a string', { commit: sha, dirty: 'false', forced: true }, false],
+    ['null', null, false],
+    ['an array', [], false],
+  ])('%s', (_label, build, accepted) => {
+    const manifest: Record<string, unknown> = {
+      schema: 1, name: 'shell', version: 'v1', engineApi: 1, files: { 'index.html': { hash: 'a'.repeat(64), size: 1 } },
+    };
+    if (build !== undefined) manifest.build = build;
+    expect(validateManifestJs(manifest).length === 0).toBe(accepted);
+    expect(validateManifestTs(manifest).length === 0).toBe(accepted);
+  });
+});

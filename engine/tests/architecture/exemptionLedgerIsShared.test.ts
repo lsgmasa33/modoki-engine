@@ -228,9 +228,6 @@ const RESIDUE: ReadonlyArray<{ item: string; count?: number; reason: string }> =
   { item: 'engine/tests/tools/deviceToolCoverage.test.ts::NOT_DATA_PLANE', count: 3, reason: 'GENERATION SKIP — no scan population; each control-plane exemption is measured by the reverse relay probe' },
   { item: 'engine/tests/tools/deviceToolCoverage.test.ts::NOT_A_JSON_ENVELOPE', reason: 'GENERATION SKIP — ⚠️ no staleness check: a tool that starts answering {ok,…} keeps its row (stated gap)' },
   { item: 'engine/tests/tools/liveCoverage.test.ts::NO_OK_FLAG', reason: 'GENERATION SKIP — load-bearing asserted by its own test (still a POST route tool)' },
-  { item: 'games/wordweave/tests/authoredLabelBudget.test.ts::EXEMPT', reason: 'DEFERRED to the work-ai lane (#1140) — name-keyed, partial staleness; not migrated from work-ai2 to avoid a cross-lane conflict' },
-  { item: 'games/wordweave/tests/capacitorPluginAllowlist.test.ts::PARKED', reason: 'DEFERRED — empty on purpose until #932 parks AppLovin here the way Court does' },
-  { item: 'games/wordweave/tests/shippedFontGlyphs.test.ts::KNOWN_ABSENT', reason: 'DEFERRED to the work-ai lane — empty, compared two-way' },
 ];
 
 /** Files a checkout can legitimately lack: `games/` without the internal games, and the one scanned

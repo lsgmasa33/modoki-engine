@@ -30,3 +30,34 @@
 export function isGcloudObjectNotFoundError(stderr) {
   return /not found: 404|matched no objects or files/i.test(stderr);
 }
+
+/** Classifies a `gcloud storage ls`/`rm` failure's stderr as "that URL or glob matched nothing" (#836).
+ *
+ *  A THIRD predicate, deliberately not either of the two above: `ls` and `rm` of a missing prefix or
+ *  glob say `ERROR: (gcloud.storage.ls) One or more URLs matched no objects.` (measured against the
+ *  real `modoki-www-site` bucket, 2026-09-13) — with no `or files` suffix, so
+ *  {@link isGcloudObjectNotFoundError} reads it as "could not check", and no `release.json`, so
+ *  `isGcsObjectMissing` does too. Anything else stays a failure the caller must not read as "empty". */
+export function isGcloudNoMatchError(stderr) {
+  return /matched no objects/i.test(stderr);
+}
+
+/** Wraps a value for interpolation into a command run through a real shell — `/bin/sh` on POSIX,
+ *  `cmd.exe` on Windows, which is why these calls go through `execSync` at all: Windows resolves
+ *  `gcloud` to `gcloud.cmd`, which a shell-less spawn cannot run.
+ *
+ *  DEFENSE IN DEPTH, not the primary guard: bundle names, versions and buckets are rejected against
+ *  OTA_SAFE_TOKEN/OTA_SAFE_BUCKET before they get here, so none of those can carry a shell
+ *  metacharacter. What this still protects are paths a script derives itself (mkdtemp staging dirs,
+ *  a repo checked out under a path with a space), which must round-trip through the shell intact.
+ *
+ *  POSIX single quotes suppress all expansion; `'\''` is the standard way to put a literal `'` inside
+ *  one. The old `JSON.stringify` form emitted DOUBLE quotes, inside which `$(...)`, backticks and
+ *  `${...}` still expand — it only ever JSON-escaped (#649). win32 keeps the double-quote form: cmd.exe
+ *  does not treat `'` as a quote at all, so single-quoting would paste the quote characters into the
+ *  argument. ⚠️ That win32 branch is UNVALIDATED against a real Windows shell from this machine. */
+export function shellQuote(value) {
+  return process.platform === 'win32'
+    ? JSON.stringify(String(value))
+    : `'${String(value).replace(/'/g, "'\\''")}'`;
+}

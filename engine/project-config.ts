@@ -560,6 +560,12 @@ export interface ProjectConfig {
      *  editor's publish path reads it: a device already treats every non-shell bundle in
      *  `release.json` as a sub-game. Empty = this shell publishes only itself. */
     subgames: string[];
+    /** How many published versions of each bundle stay fetchable in the bucket (#836). Every OTA
+     *  publish then deletes that bundle's older versions — except the one `release.json` points at,
+     *  however old. A device never needs an old version's bundle: it runs from its own staged copy,
+     *  and an old version is only ever fetched as a delta BASE manifest, whose absence falls back to
+     *  downloading the whole current bundle. Positive integer; a malformed value refuses the publish. */
+    retainVersions: number;
   };
   /** Runtime/lifecycle policy. Optional: absent means every knob here is at its off/default. */
   runtime?: {
@@ -773,6 +779,7 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
     bundleName: 'shell',
     engineApi: 1,
     subgames: [],
+    retainVersions: 5,
   },
   // Present (not omitted) despite `runtime` being an optional field on the interface: giving it
   // a default here — rather than leaving DEFAULT_PROJECT_CONFIG.runtime undefined — is what lets

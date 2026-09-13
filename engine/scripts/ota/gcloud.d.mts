@@ -6,3 +6,9 @@
  *  is the ONLY shape that means "safe to proceed"; every other failure (auth expired,
  *  network blip, wrong bucket permissions) must fail CLOSED. */
 export function isGcloudObjectNotFoundError(stderr: string): boolean;
+
+/** "That URL or glob matched nothing" from `gcloud storage ls`/`rm` (#836). */
+export function isGcloudNoMatchError(stderr: string): boolean;
+
+/** Quotes one value for a real shell (`/bin/sh`, or `cmd.exe` on Windows). */
+export function shellQuote(value: unknown): string;
