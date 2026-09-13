@@ -18,12 +18,17 @@ const DEP = '/repo/node_modules/.vite/deps/koota.js';
 
 function host(graph: Record<string, GraphModule[]>, over: Partial<ModuleUrlHost> = {}): ModuleUrlHost {
   const files = new Set([ENGINE_FILE, GAME_FILE, UNLOADED, LINKED, DEP]);
+  // Separator-blind, like the real host: `fs.existsSync` takes either separator and the graph
+  // lookup goes through Vite's `normalizePath`. On win32 `fileForSpec`'s `path.normalize` hands
+  // these POSIX fixtures back as `\repo\…`, so an exact-string fake failed all 12 cases on the
+  // windows-latest leg while the resolver itself was fine.
+  const key = (f: string) => f.replace(/\\/g, '/');
   return {
     viteRoot: ROOT,
     repoRoot: REPO,
-    modulesByFile: (f) => graph[f],
-    exists: (f) => files.has(f),
-    realpath: (f) => (f === LINKED ? ENGINE_FILE : f),
+    modulesByFile: (f) => graph[key(f)],
+    exists: (f) => files.has(key(f)),
+    realpath: (f) => (key(f) === LINKED ? ENGINE_FILE : key(f)),
     ...over,
   };
 }
