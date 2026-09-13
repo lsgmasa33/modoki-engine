@@ -667,10 +667,20 @@ and WASM registry above are the SAME shared code, dimension-parameterized. What 
   load; bodies from prefabs count — it queries the spawned world), **`enterPlay`**, and the editor
   agent **`play`/`resume`/`step`** ops (a body added after load). Owner call (2026-09-13): the
   scene waits during loading rather than running its first frames without physics. What that
-  costs, as the boot-timeline span `scene-physics-init` (`device_profiler {action:'boot'}`):
-  **174 ms of a 270 ms scene load on the Galaxy A23, first launch after install; 134 ms of 198 ms
-  on the next cold start** (`demos/2d-physics-demo` debug APK); 83 ms of 94 ms in the Mac editor.
-  Before the fix that same interval was spent as simulated frames with no physics. The device
+  costs, measured on the Galaxy A23 with `demos/2d-physics-demo` debug APKs built from the pre-fix
+  commit (`665cde13a`) and the fix, each cold-started after a fresh install and again
+  (`device_profiler {action:'boot'}` spans + the first `@collision` tick in the journal):
+
+  | build (A23) | scene load | `scene-physics-init` | first `@collision` |
+  |---|---|---|---|
+  | before, first launch after install | 107 ms | — | tick 6 |
+  | before, next cold start | 52 ms | — | tick 7 |
+  | after, first launch after install | 234 / 270 ms | 142 / 174 ms | tick 1 |
+  | after, next cold start | 214 / 198 ms | 136 / 134 ms | tick 1 |
+
+  (Two "after" runs per row, from two sessions.) So the load grows by roughly 130–175 ms, and in
+  exchange the first ~5–6 simulated ticks — which before the fix ran with bodies frozen and no
+  contacts — now simulate. The Mac editor's span is 83 ms of a 94 ms load. The device
   `sim-step` op waits too, raced against its own `timeoutMs` (the host's transport deadline derives
   from it), refusing with `physicsLoading` only if the budget runs out. **Still lazy:** a body a GAME spawns mid-play
   into a scene that had none — awaiting there would stall the live frame loop. `createTestWorld` is
