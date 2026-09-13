@@ -113,6 +113,7 @@ import { acquireFont } from '../loaders/fontAtlasLoader';
 import { loadFontFamily, loadFontFamilyForRef } from '../loaders/fontLoader';
 import { registerAsset, isGuid, resolveGuidToPath, getAudioLoadType } from '../loaders/assetManifest';
 import { loadTimelineNow } from '../loaders/timelineCache';
+import { loadAnimationClipNow } from '../loaders/animationClipCache';
 import { collectTimelineAudioRefs, collectTimelineControlRefs, collectTimelineVideoRefs } from '../timeline/types';
 import { ASSET_FETCH_INIT, parseAssetJson } from '../loaders/assetFetch';
 import { assetUrl } from '../loaders/assetUrl';
@@ -1959,7 +1960,7 @@ function snapshotPersistentEntities(world: World, keptBaseGuids: Set<string> = n
  *  spanning them would spend the boot timeline's cap on hundreds of zero-length rows and push
  *  the real work off the end of it. */
 const LOADING_RESOURCE_TYPES: ReadonlySet<string> = new Set([
-  'model', 'riggedModel', 'mesh', 'material', 'prefab', 'font', 'environment', 'audio',
+  'model', 'riggedModel', 'mesh', 'material', 'prefab', 'font', 'environment', 'audio', 'animation',
 ]);
 
 /** Per-resource boot spans (#238). The stall being hunted is per-project and bimodal, and the
@@ -1987,7 +1988,7 @@ async function acquireResourceInner(sceneId: SceneId, ref: SceneResourceRef): Pr
       // Never preloaded: a video is STREAMED or downloaded on demand by videoSystem —
       // pulling whole clips into memory at scene load is the opposite of what the
       // delivery policy exists to do. Listed as a resource for the build tree-shaker,
-      // same as texture/particle/animation.
+      // same as texture/particle.
       return;
     case 'prefab':   return acquirePrefab(sceneId, ref.path);
     case 'particle':
@@ -1997,27 +1998,32 @@ async function acquireResourceInner(sceneId: SceneId, ref: SceneResourceRef): Pr
       // tree-shaker keeps the file; the acquire is a no-op (mirrors texture/font).
       return;
     case 'animation':
-      // `.anim.json` clips referenced by Animator entities. The animation system
-      // lazy-loads + caches the clip via getAnimationClip (retrying until ready),
-      // so no preload is needed. Listed as a resource for the build tree-shaker.
+      // `.anim.json` clips referenced by Animator banks. PRELOADED, unlike the other lazily-read
+      // kinds around it (#1097): animationSystem poses nothing until its clip resolves, so a clip
+      // still in flight at the swap leaves every staged entity painting its AUTHORED values — a
+      // fade-in's target at opacity 1 — for as many frames as the fetch takes (measured:
+      // games/court/intro.md § the pre-pose window). Awaiting it here makes the first projected
+      // frame already posed. The lazy getter stays as the fallback for a prefab spawned by code
+      // the manifest never saw. The same gap for spriteanim/rig2d/animset/particle is #1162.
+      await loadAnimationClipNow(ref.path);
       return;
     case 'timeline':
       // `.timeline.json` sequences referenced by Director entities. Fetched above (the
       // transitive-ref walk) to pull out audio cues; the timelineSystem lazy-loads +
       // caches the def via getTimeline (retrying until ready), so no preload is needed
-      // here. Listed as a resource for the build tree-shaker (mirrors animation).
+      // here. Listed as a resource for the build tree-shaker (mirrors particle).
       return;
     case 'animset':
       // `.animset.json` per-clip params referenced by SkeletalAnimator entities.
       // driveAnimator lazy-loads + caches the set via resolveAnimSetParams
       // (retrying until ready), so no preload is needed. Listed as a resource for
-      // the build tree-shaker (mirrors animation/particle).
+      // the build tree-shaker (mirrors particle).
       return;
     case 'spriteanim':
       // `.spriteanim.json` flipbook clip sets referenced by SpriteAnimator.clipSet.
       // spriteAnimationSystem lazy-loads + caches the set via activeSpriteClip
       // (retrying until ready), so no preload is needed. Listed as a resource for
-      // the build tree-shaker (mirrors animset/animation/particle).
+      // the build tree-shaker (mirrors animset/particle).
       return;
     case 'rig2d':
       // `.rig2d.json` 2D skinning rigs referenced by SkinnedSprite2D.rig. skin2DSystem

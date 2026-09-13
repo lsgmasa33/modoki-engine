@@ -303,6 +303,19 @@ fetch is remembered and NOT retried at runtime — only `invalidate`/`clear` res
 plain DATA (nothing to GPU-dispose); `clear*Cache` bumps a generation so an in-flight load from a
 swapped-away scene is dropped.
 
+⚠️ **`.anim.json` clips are ALSO preloaded before a scene goes live** (#1097) —
+`loadAnimationClipNow` awaits the lazy getter's own in-flight promise, and `SceneManager`'s
+`'animation'` acquire awaits it before the swap. The lazy shape alone is not enough for a keyframe
+Animator: `animationSystem` pushes NO pose for a null clip, so a clip still in flight when the world
+went live left every staged entity painting its AUTHORED values — a fade-in's target at opacity 1 —
+for as many frames as the fetch took (measured in Court: 3 sim frames cold, 0 warm;
+`games/court/intro.md` § the pre-pose window). ⚠️ This is NOT a "frame after spawn" lag:
+ANIMATION (150) runs before PROJECTION (300) in the same pass, so a cached clip is posed on the
+spawn frame. Still lazy, and so still exposed: a prefab spawned by code that the scene manifest
+never listed, and a preload refused by a mid-flight invalidation (degrades to the old behaviour,
+never blocks the load). `animSetCache`/`spriteAnimCache` (and `rig2d`/`particle`) are NOT
+preloaded — the same gap, deliberately left open: #1162.
+
 ## Gotchas
 
 - **STEPPED (`+Infinity`) doesn't survive JSON** — `JSON.stringify(Infinity) === "null"`, so a saved

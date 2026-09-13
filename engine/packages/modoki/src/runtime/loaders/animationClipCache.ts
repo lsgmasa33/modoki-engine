@@ -76,6 +76,28 @@ export function getAnimationClip(ref: string, opts?: { load?: boolean }): Animat
   return null;
 }
 
+/** Resolve a clip ref, AWAITING its load — the scene acquire's preload (#1097).
+ *
+ *  The lazy getter above returns null on a miss, and `animationSystem` pushes no pose for a null
+ *  clip, so a clip still in flight when a world goes live leaves every Animator entity painting its
+ *  AUTHORED values (a `UIElement` at opacity 1 behind an authored fade-in) until the fetch lands.
+ *  Awaiting this before the swap is what makes the first projected frame already posed.
+ *
+ *  Rides the getter's own in-flight promise, so there is ONE fetch path and a preload racing a
+ *  per-frame request never fetches twice. Never throws. Resolves null for an unknown/failed ref, and
+ *  also when the load was refused by an invalidation mid-flight — deliberately no retry here (unlike
+ *  `loadTimelineNow`): the lazy getter is still read every frame, so a refused preload degrades to
+ *  exactly the pre-#1097 behaviour instead of blocking the scene. */
+export async function loadAnimationClipNow(ref: string): Promise<AnimationClipDef | null> {
+  const hit = getAnimationClip(ref);
+  if (hit) return hit;
+  const path = clipCacheKey(ref);
+  const inFlight = path ? loading.get(path) : undefined;
+  if (!inFlight) return null;
+  await inFlight;
+  return cache.get(path!) ?? null;
+}
+
 /** Directly seed/override a cached clip by path or GUID (editor live-preview + post-save). */
 export function setAnimationClip(refOrPath: string, def: AnimationClipDef): void {
   const path = clipCacheKey(refOrPath);

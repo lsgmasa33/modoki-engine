@@ -196,6 +196,15 @@ through unchanged. See `runtime/loaders/assetManifest.ts` (`resolveRef`,
 | `.prefab.json` | `acquirePrefab` / `releasePrefab` | parsed prefab JSON |
 | HDR environment | `acquireEnvironment` / `releaseEnvironment` | `THREE.DataTexture` (IBL) |
 
+**Preloaded, not owned:** `.anim.json` clips. The `'animation'` acquire awaits
+`loadAnimationClipNow` before the swap (#1097) so a staged Animator is posed on the spawn frame
+instead of painting authored values until its fetch lands; the clip cache is plain data and is
+not refcounted per scene. (`.timeline.json` defs are ALSO loaded before the swap, but earlier and
+for a different reason: `collectSceneResourceRefs` awaits `loadTimelineNow` to walk their inner refs,
+so their acquire case is a no-op over an already-warm cache.) Every other lazily-read kind
+(`texture`, `particle`, `animset`, `spriteanim`, `rig2d`, `shader`) still returns without loading — see
+`docs/animation.md` § The three asset caches and #1162.
+
 `acquire*` adds the `sceneId` to the resource's owner set (kicking off the load
 on first owner); `release*` removes it and disposes the GPU resource only when
 the set becomes empty. Because ownership is a **set of scene ids**, two scenes
