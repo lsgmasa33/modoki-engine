@@ -299,9 +299,10 @@ describe('the native-folder exclusion premise (#906 close-out)', () => {
   // nothing a Vite build bundles lives there. This holds that premise against the tree, so a web source
   // moved under such a folder fails here instead of silently escaping the dirty check.
   it('no web source sits under an ios/ or android/ folder', () => {
-    // Every file under a native folder (thousands today — the floor proves the enumeration ran), then
-    // the ones a Vite build could import.
-    const native = repoFiles({ match: /(^|\/)(ios|android)\//, exclude: ['node_modules'], floor: 100 });
+    // Every file under a native folder, then the ones a Vite build could import. The floor proves the
+    // enumeration ran, and must hold in the public OSS snapshot too: that carries no games/ and no demo
+    // native folders, leaving only engine/packages/capacitor-*'s ~35 (vs ~700 in the private tree).
+    const native = repoFiles({ match: /(^|\/)(ios|android)\//, exclude: ['node_modules'], floor: 20 });
     const offenders = native.map((f) => f.rel).filter((rel) => /\.(ts|tsx|js|jsx|mjs|cjs|css|html|vue)$/.test(rel));
     expect(offenders).toEqual([]);
   });
