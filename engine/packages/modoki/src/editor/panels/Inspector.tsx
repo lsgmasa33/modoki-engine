@@ -23,6 +23,7 @@ import { isGuid, resolveGuidToPath, getAssetEntry } from '../../runtime/loaders/
 // anchorCss makes, and for the same reason: the Inspector's "this field is inert" gating
 // must not be able to disagree with the layout that makes it inert.
 import { STRETCH_X, STRETCH_Y, isSizeInert } from '../../runtime/ui/anchorLayout';
+import { inertUIAnchorBooleanReason } from '../../runtime/ui/anchorCss';
 import { BufferedTextInput, BufferedNumberInput, inputStyle, readOnlyFieldStyle, MIXED_PLACEHOLDER } from './fields';
 import { type TraitEntry, sameTraitResult, readMergedTraits } from './inspectorMerge';
 import { AssetRefField } from './AssetRefField';
@@ -1195,12 +1196,13 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
       // the runtime really did nothing there. That was the defect, not the explanation
       // for it: a corner-anchored badge could not clear the camera at all, and the greyed
       // box told authors it was working as intended (#272).
-      const safeAreaInert = meta.name === 'UIAnchor' && key === 'safeArea'
-        && (data.anchor as string) === 'center';
+      // The two reserved-edge fields (#1159) are inert on the same predicates the runtime gates on:
+      // `reservedEdgeOf` for the strip, and the stretched padding arm for the container.
+      const safeAreaInert = meta.name === 'UIAnchor' && inertUIAnchorBooleanReason(key, data) !== null;
       // The reason moved off `title=` and onto the label's Tooltip: native tooltips
       // never render in this Electron build, so this explanation was unreadable.
       const safeAreaHint = safeAreaInert
-        ? { ...hint, tooltip: 'Safe Area has no effect on a centered anchor — it reaches no screen edge, so there is no notch or home indicator to clear.' }
+        ? { ...hint, tooltip: inertUIAnchorBooleanReason(key, data)! }
         : hint;
       return (
         <label key={key}

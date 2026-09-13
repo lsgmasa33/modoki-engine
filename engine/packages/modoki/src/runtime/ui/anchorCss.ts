@@ -14,7 +14,7 @@ import type { CSSProperties } from 'react';
 // modes stretch — that membership now decides offset semantics, not just pivot.
 import { STRETCH_X, STRETCH_Y, type AnchorData } from './anchorLayout';
 import { isElementMarginInert } from './uiAuthoring';
-import { isViewportLengthUnit, viewportUnitVar } from '../traits/uiLength';
+import { CONTAINER_HEIGHT_UNIT, isViewportLengthUnit, viewportUnitVar } from '../traits/uiLength';
 
 /** Compose a UIElement's tilt AND scale onto whatever transform the anchor already wrote
  *  (#234 tilt, #340 scale).
@@ -73,6 +73,77 @@ export function applyRotationStyle(
  *  re-resolve on orientation change with no runtime code. */
 function safeAreaInset(edge: 'top' | 'bottom' | 'left' | 'right'): string {
   return `var(--ui-sa-${edge}, env(safe-area-inset-${edge}))`;
+}
+
+/** The edges a reserved band can sit on (#1159). Top and bottom only: a band's size is its
+ *  HEIGHT, and a left/right band would be a width in a different viewport axis. */
+export type ReservedEdge = 'top' | 'bottom';
+
+/** The CSS var a reserved band is published under — the ONE name `UIRenderer` writes and
+ *  `applyAnchorStyle` reads, so the two cannot drift. */
+export function reservedEdgeVar(edge: ReservedEdge): string {
+  return `--ui-reserve-${edge}`;
+}
+
+/** Which edge a `reservesEdge` strip reserves, or null when its anchor pins it to no single
+ *  top/bottom edge — a `stretch` box, a point anchor or a side strip has no band height to give,
+ *  so the field is inert there (the Inspector greys it out on the same predicate). */
+export function reservedEdgeOf(anchor: string): ReservedEdge | null {
+  return anchor === 'top-stretch' ? 'top' : anchor === 'bottom-stretch' ? 'bottom' : null;
+}
+
+/** Why a `UIAnchor` checkbox does nothing for this ANCHOR, or null when it is live — the one
+ *  predicate the Inspector greys a checkbox out on, so the editor and `applyAnchorStyle` /
+ *  `resolveReservedEdges` agree about which anchor modes a field can work on.
+ *
+ *  ⚠️ Anchor-only, deliberately: a `reservesEdge` strip on a valid anchor still publishes `0px` when
+ *  its authored `height` is not positive (a content-sized strip), and the band never reads the
+ *  strip's `minHeight`/`maxHeight`. Both are documented in docs/ui-system.md § "Reserved edge
+ *  bands" rather than greyed out here, because they depend on the UIElement, not the anchor.
+ *
+ *  - `safeArea` is inert only on `center`, which reaches no edge.
+ *  - `reservesEdge` is inert off a `top-stretch`/`bottom-stretch` anchor (`reservedEdgeOf`).
+ *  - `clearsReservedEdges` rides the stretched PADDING arm, so it needs `safeArea` on and an
+ *    anchor that pads its top or bottom: `h-stretch` pads only its sides, and a point anchor
+ *    takes the offset arm, which never reads the band. */
+export function inertUIAnchorBooleanReason(
+  key: string, a: { anchor?: unknown; safeArea?: unknown },
+): string | null {
+  const anchor = typeof a.anchor === 'string' ? a.anchor : 'stretch';
+  if (key === 'safeArea') {
+    return anchor === 'center'
+      ? 'Safe Area has no effect on a centered anchor — it reaches no screen edge, so there is no notch or home indicator to clear.'
+      : null;
+  }
+  if (key === 'reservesEdge') {
+    return reservedEdgeOf(anchor) === null
+      ? 'Reserves Edge only works on a top-stretch or bottom-stretch strip — that is what gives the band a height and an edge.'
+      : null;
+  }
+  if (key === 'clearsReservedEdges') {
+    if (a.safeArea === false) return 'Clears Reserved Edges adds to the safe-area padding, so it needs Safe Area turned on.';
+    const stretchX = STRETCH_X.includes(anchor as AnchorData['anchor']);
+    const stretchY = STRETCH_Y.includes(anchor as AnchorData['anchor']);
+    const padsTopOrBottom = (stretchX || stretchY) && (stretchY || anchor.startsWith('top') || anchor.startsWith('bottom'));
+    return padsTopOrBottom
+      ? null
+      : 'Clears Reserved Edges needs a stretched anchor that reaches the top or bottom edge — it pads that edge.';
+  }
+  return null;
+}
+
+/** A band strip's authored height as a CSS length term, resolved against the UI CONTAINER.
+ *
+ *  ⚠️ `%` becomes `--ui-vh`, which is a percent of the UI container's height — and a CSS `%`
+ *  PADDING would resolve against the WIDTH, which is the first of Court's four wrong units
+ *  (games/court/menu.md § "Every dialog is held between the notch and the banner"). That makes a
+ *  `%` height exact only for a strip whose containing block spans the container's height, which
+ *  a root strip or one inside a full-height stretched root always does. */
+export function reservedBandLength(height: number, unit: string): string {
+  if (!(height > 0)) return '0px';
+  if (unit === '%') return reservedBandLength(height, CONTAINER_HEIGHT_UNIT);
+  if (isViewportLengthUnit(unit)) return `calc(${height} * var(${viewportUnitVar(unit)}, 1${unit}))`;
+  return `${height}px`;
 }
 
 /** Mutate `style` in place with the absolute-positioning CSS for anchor `a`.
@@ -210,8 +281,16 @@ export function applyAnchorStyle(style: CSSProperties, a: AnchorData): void {
   // avoided.
   if (a.safeArea && (stretchX || stretchY)) {
     const fmtPad = (v: string | number | undefined) => typeof v === 'string' ? v : `${v || 0}px`;
+    // A `clearsReservedEdges` container adds the reserved band ON TOP of the inset, because the
+    // band strip sits ON the safe edge (a banner above the home indicator): the space its children
+    // must clear is the inset plus the band, never either one alone (#1159). The var defaults to
+    // 0px, so a scene with no band — or a hidden one — pads exactly what `safeArea` alone does.
+    const reach = (edge: 'top' | 'bottom' | 'left' | 'right') =>
+      a.clearsReservedEdges && (edge === 'top' || edge === 'bottom')
+        ? `calc(${safeAreaInset(edge)} + var(${reservedEdgeVar(edge)}, 0px))`
+        : safeAreaInset(edge);
     const inset = (edge: 'top' | 'bottom' | 'left' | 'right') =>
-      `max(${fmtPad(style[`padding${edge[0].toUpperCase()}${edge.slice(1)}` as 'paddingTop'])}, ${safeAreaInset(edge)})`;
+      `max(${fmtPad(style[`padding${edge[0].toUpperCase()}${edge.slice(1)}` as 'paddingTop'])}, ${reach(edge)})`;
     if (stretchY || a.anchor.startsWith('top')) style.paddingTop = inset('top');
     if (stretchY || a.anchor.startsWith('bottom')) style.paddingBottom = inset('bottom');
     if (stretchX || a.anchor.includes('left')) style.paddingLeft = inset('left');

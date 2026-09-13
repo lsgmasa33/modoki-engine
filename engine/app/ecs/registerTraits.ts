@@ -1464,6 +1464,8 @@ export function registerAllTraits() {
       pivotX: { type: 'number', step: 0.1, tooltip: 'Horizontal pivot (0 = left edge, 0.5 = center, 1 = right edge).\nShifts which point of this element sits at the anchor position.' },
       pivotY: { type: 'number', step: 0.1, tooltip: 'Vertical pivot (0 = top edge, 0.5 = center, 1 = bottom edge).\nShifts which point of this element sits at the anchor position.' },
       safeArea: { type: 'boolean', tooltip: 'Inset this element away from the device notch, Dynamic Island and home indicator.\nOn a POINT anchor this OFFSETS the element (it is not padding).\n\u26a0\ufe0f Set it on the outermost anchored box only \u2014 a nested child takes the FULL device inset relative to its\nparent, not to the screen, so four pads inside one container each get pushed inward.' },
+      reservesEdge: { type: 'boolean', tooltip: 'This strip RESERVES its screen edge — an ad banner, say. Its height is published to every\nelement with Clears Reserved Edges, which then keeps its children clear of it.\nOnly on a top-stretch or bottom-stretch anchor. Reserves nothing while the strip is hidden (isVisible).\nThe strip should sit ON the safe edge: a clearing element adds the safe-area inset under it.' },
+      clearsReservedEdges: { type: 'boolean', tooltip: 'Keep this container\'s children clear of every Reserves Edge strip (top and bottom), on top of the\nsafe-area inset. For a full-screen dialog: its backdrop stays full-bleed while its panel stays above the banner.\nNeeds Safe Area on and a stretched anchor — it adds to the safe-area padding.' },
     },
   });
 }

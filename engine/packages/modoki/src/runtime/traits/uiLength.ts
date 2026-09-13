@@ -58,6 +58,11 @@ export const VIEWPORT_UNIT_AXIS: Readonly<Record<ViewportLengthUnit, (w: number,
   vmax: (w, h) => Math.max(w, h),
 };
 
+/** The viewport unit that is one percent of the container's HEIGHT — what a `%` height means once
+ *  it has to be re-expressed somewhere a CSS `%` would resolve against something else (a padding
+ *  percentage resolves against the WIDTH). Read by `anchorCss.reservedBandLength` (#1159). */
+export const CONTAINER_HEIGHT_UNIT: ViewportLengthUnit = 'vh';
+
 /** The viewport units, in table order — derived from `VIEWPORT_UNIT_AXIS`, not restated. */
 export const VIEWPORT_LENGTH_UNITS = Object.keys(VIEWPORT_UNIT_AXIS) as readonly ViewportLengthUnit[];
 

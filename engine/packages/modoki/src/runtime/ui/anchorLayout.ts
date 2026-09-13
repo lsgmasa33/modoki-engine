@@ -45,6 +45,10 @@ export interface AnchorData {
    *  most callers build this from a trait where it is already resolved; note the TRAIT
    *  defaults to true, so an absent field in a scene JSON means ON. */
   safeArea?: boolean;
+  /** Pad the reserved edge bands (`--ui-reserve-top/bottom`) on top of the safe-area inset
+   *  (#1159). CSS-only: the padding arm insets CHILDREN, which the pixel path never models, so
+   *  `resolveAnchorRect` has nothing to mirror. */
+  clearsReservedEdges?: boolean;
 }
 
 /** Safe-area insets in logical px, for the pixel path. The CSS path gets the same four

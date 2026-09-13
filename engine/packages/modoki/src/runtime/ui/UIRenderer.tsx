@@ -15,6 +15,7 @@ import { registerPointerBlocker } from '../core/pointerBlockers';
 import { installPressOriginTracking } from './pressOrigin';
 import { UI_ROOT_ATTR } from '../traits/TouchControl';
 import { VIEWPORT_LENGTH_UNITS, VIEWPORT_UNIT_AXIS, viewportUnitVar } from '../traits/uiLength';
+import { reservedEdgeVar } from './anchorCss';
 
 interface UIRendererProps {
   /** Store state object for binding resolution (typically from useGameStore) */
@@ -35,6 +36,10 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
   // one container all roots share. '' when unset, so the container carries no fontFamily at
   // all and App.css's body rule (or any ambient default) still wins.
   const rootFontFamily = useUITreeStore(s => s.rootFontFamily);
+  // Reserved edge bands (#1159) — published on the one container every root shares, beside the
+  // viewport vars, so a `clearsReservedEdges` container anywhere below resolves them by cascade.
+  const reserveTop = useUITreeStore(s => s.reserveTop);
+  const reserveBottom = useUITreeStore(s => s.reserveBottom);
   const [vpVars, setVpVars] = useState<Record<string, string>>({});
   const roRef = useRef<ResizeObserver | null>(null);
   /** The queued `update()` frame, so the callback ref's cleanup can CANCEL it rather than let it
@@ -174,6 +179,8 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
         // override an ambient default (e.g. App.css's body rule) with nothing.
         ...(rootFontFamily ? { fontFamily: rootFontFamily } : {}),
         ...vpVars as any,
+        [reservedEdgeVar('top')]: reserveTop,
+        [reservedEdgeVar('bottom')]: reserveBottom,
       }}
     >
       {/* The scene-wide default IS what a root inherits — there is no ancestor above it but this

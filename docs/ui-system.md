@@ -934,6 +934,56 @@ parent (`UIAnchor.ts`):
   see where the element ended up. That is an authoring call, not an engine bug: opt such
   an element out.
 
+#### Reserved edge bands — `reservesEdge` and `clearsReservedEdges` (#1159)
+
+Some chrome has to be kept clear the way the notch is, even though the device knows nothing about
+it. The case that created this is an ad banner under a full-screen dialog. Two opt-in `UIAnchor`
+fields handle it; both default to `false`, so nothing that predates them moves.
+
+- **`reservesEdge`**, on the strip. It is live only on a `top-stretch`/`bottom-stretch` anchor
+  (`reservedEdgeOf`). The projection (`resolveReservedEdges` in `uiTreeStore.ts`) turns the strip's
+  authored HEIGHT into a CSS length. `UIRenderer` publishes it as `--ui-reserve-top`/
+  `--ui-reserve-bottom` on the one container every root shares; with no band the value is `0px`.
+- **`clearsReservedEdges`**, on the container. It rides the stretched padding arm above:
+  `max(<padding>, calc(<inset> + var(--ui-reserve-<edge>, 0px)))` on the top and bottom edges.
+  So it needs `safeArea` on and a stretched anchor that reaches the top or bottom. The Inspector
+  greys it out elsewhere, using `inertUIAnchorBooleanReason` — the same predicate the CSS follows.
+
+The padding shrinks the box the flow children are laid out in, but the container's own background
+still paints the padding. So a dialog's scrim stays full-bleed while its centred panel sits in the
+band between the two.
+
+⚠️ **The band is the strip's HEIGHT, not its distance from the edge.** A clearing container adds
+the safe-area inset UNDER the band, so the strip is assumed to sit directly ON the safe edge. That
+holds for a banner lifted by the inset, like wordweave's `AdBannerSlot` (lifted every frame by
+`patchAnchorPct`). A strip carrying an extra authored offset would under-reserve by that offset.
+
+⚠️ **`%` is converted to `--ui-vh`, never emitted as a CSS `%`.** Padding percentages resolve
+against the containing block's WIDTH, which was the first of Court's four wrong units for the same
+problem (`games/court/menu.md` § "Every dialog is held between the notch and the banner"). `--ui-vh`
+is exact for a strip whose containing block spans the container's height: a root, or a child of a
+full-height stretched root.
+
+⚠️ **Visibility is walked down the tree.** `UINode` draws none of a hidden element's children, so
+a strip inside a hidden container reserves nothing, and neither does a hidden strip (a playable
+build hides the banner). A strip hidden only by a `UIBinding` `visibleBinding` is NOT seen, because
+that resolves at render time. Hide a band with `UIElement.isVisible`.
+
+⚠️ **A fixed-height child cannot shrink into the band without a `minHeight`.** A column flex item
+stays at its content height while `min-height` is `auto`. So a panel authored `height: 80vh` in a
+band shorter than that overflows both ends instead. Author a positive `minHeight` (`1px`; `cssVal`
+drops a `0`). Measured on wordweave's `DictionaryPanel` at the iPhone Air preset: about 1pt past each end of the
+68–793.3pt band without it, and exactly 68.0–793.2pt with it.
+
+⚠️ **The band is the authored `height` field and nothing else.** A content-sized strip (`height: 0`,
+sized by its children) publishes `0px` although the checkbox reads live, and a strip's
+`minHeight`/`maxHeight` are ignored: `height: 9.1%` with `maxHeight: 60px` on a 1024pt-tall screen
+reserves ~93pt for a 60pt strip. Author a reserving strip with an explicit height and no clamp.
+
+Two strips on one edge take the LARGER (`max(...)`), because both are anchored to that edge and so
+overlap rather than stack. Court still hand-rolls the same result per dialog (`syncDialogInsets`),
+pending a migration onto these fields.
+
 An anchored element is rendered with `position: absolute`; pivot is applied as a CSS
 `translate(-pivotX%, -pivotY%)`. Stretched axes ignore pivot (both edges are pinned).
 

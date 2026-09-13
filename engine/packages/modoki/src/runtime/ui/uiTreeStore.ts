@@ -22,6 +22,7 @@ import { scrollSnapChildStyle } from './scrollViewDom';
 import { NO_BEHAVIOR_REQUEST } from '../traits/UIScrollView';
 import { findLengthUnitSuspects, formatLengthUnitWarning, lengthUnitWarningKey } from './lengthUnitWarning';
 import { readUILength, readUIAnchorLength } from '../traits/uiLength';
+import { reservedBandLength, reservedEdgeOf } from './anchorCss';
 export { onEditorDirty, setEditorDirtyCallback, markUIDirty } from '../core/uiDirty';
 import type { Entity, World } from 'koota';
 import type { UIActionBinding } from './bindings';
@@ -93,7 +94,7 @@ export interface UINodeData {
   // already a union) and the layout modules (whose switches have no `default`), so
   // widening here would hand an unrecognised mode straight through to a silently
   // unpositioned element.
-  anchor?: { anchor: AnchorMode; top: number; topUnit: string; right: number; rightUnit: string; bottom: number; bottomUnit: string; left: number; leftUnit: string; pivotX: number; pivotY: number; safeArea: boolean };
+  anchor?: { anchor: AnchorMode; top: number; topUnit: string; right: number; rightUnit: string; bottom: number; bottomUnit: string; left: number; leftUnit: string; pivotX: number; pivotY: number; safeArea: boolean; reservesEdge?: boolean; clearsReservedEdges?: boolean };
   canvas2D?: { referenceWidth: number; referenceHeight: number; scaleMode: string; maxReferenceWidth: number; maxReferenceHeight: number };
   /** UIToggle trait — this entity renders as an on/off switch (a track with a knob)
    *  rather than a plain box. Optional nested block, not scalars: a toggle is rare,
@@ -154,11 +155,18 @@ interface UITreeState {
    *  every root by ordinary CSS inheritance instead of needing to be re-authored on each root's
    *  own `UIElement`. `''` when no `UISettings` entity exists, or both its font fields are empty. */
   rootFontFamily: string;
+  /** The reserved edge bands (#1159) as CSS lengths, published by `UIRenderer` as
+   *  `--ui-reserve-top`/`--ui-reserve-bottom`. `'0px'` when no visible strip reserves that edge.
+   *  Two STRINGS rather than one object so a rebuild that changes nothing re-renders nothing. */
+  reserveTop: string;
+  reserveBottom: string;
 }
 
 export const useUITreeStore = create<UITreeState>(() => ({
   tree: [],
   rootFontFamily: '',
+  reserveTop: '0px',
+  reserveBottom: '0px',
 }));
 
 // ── Dirty flag (core/uiDirty.ts owns the state — see the import above) ──
@@ -191,7 +199,7 @@ function ensureInitialized() {
     resetFontRefWarnings();
     _prevById = new Map(); // drop old-scene refs so they're never reused
     _warnedLengthUnitMismatches.clear();
-    useUITreeStore.setState({ tree: [], rootFontFamily: '' });
+    useUITreeStore.setState({ tree: [], rootFontFamily: '', reserveTop: '0px', reserveBottom: '0px' });
   });
   _initialized = true;
 }
@@ -510,6 +518,8 @@ function buildTree(world: World): UINodeData[] | null {
           left: anc.left || 0, leftUnit: readUIAnchorLength(anc, 'left').unit,
           pivotX: anc.pivotX || 0, pivotY: anc.pivotY || 0,
           safeArea: anc.safeArea,
+          reservesEdge: !!anc.reservesEdge,
+          clearsReservedEdges: !!anc.clearsReservedEdges,
         };
       }
       if (_canvas2dMeta && entity.has(_canvas2dMeta.trait)) {
@@ -686,5 +696,36 @@ export function uiTreeProjection(world: World) {
   // not per frame.
   const settings = world.queryFirst(UISettings)?.get(UISettings);
   const rootFontFamily = resolveUIFontFamily(settings?.fontFamily, settings?.systemFont, 'UISettings');
-  useUITreeStore.setState({ tree, rootFontFamily });
+  const bands = resolveReservedEdges(tree);
+  useUITreeStore.setState({ tree, rootFontFamily, reserveTop: bands.top, reserveBottom: bands.bottom });
+}
+
+/**
+ * The reserved edge bands of a built tree (#1159): every VISIBLE `reservesEdge` strip on a
+ * `top-stretch`/`bottom-stretch` anchor contributes its authored height to its edge.
+ *
+ * ⚠️ **Visibility is walked down the tree, not read per node.** `UINode` returns early on
+ * `!isVisible` and so draws none of that element's children, while the build above still creates
+ * nodes for them. A banner inside a hidden container must therefore reserve nothing, or every
+ * dialog would clear a strip that is not on screen. A strip hidden only by a `UIBinding`
+ * `visibleBinding` is NOT seen here — that resolves at render time against the store — so hide a
+ * band with `UIElement.isVisible`.
+ *
+ * Two strips on one edge take the LARGER, not the sum: both are anchored to the same edge, so they
+ * overlap rather than stack.
+ */
+export function resolveReservedEdges(tree: readonly UINodeData[]): { top: string; bottom: string } {
+  const found = { top: [] as string[], bottom: [] as string[] };
+  const walk = (n: UINodeData): void => {
+    if (!n.isVisible) return;
+    const edge = n.anchor?.reservesEdge ? reservedEdgeOf(n.anchor.anchor) : null;
+    if (edge) {
+      const len = reservedBandLength(n.height, n.heightUnit);
+      if (len !== '0px') found[edge].push(len);
+    }
+    for (const c of n.children) walk(c);
+  };
+  for (const r of tree) walk(r);
+  const join = (l: string[]): string => l.length === 0 ? '0px' : l.length === 1 ? l[0] : `max(${l.join(', ')})`;
+  return { top: join(found.top), bottom: join(found.bottom) };
 }

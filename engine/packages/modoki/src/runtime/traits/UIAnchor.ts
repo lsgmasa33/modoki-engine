@@ -29,4 +29,11 @@ export const UIAnchor = trait({
   pivotX: 0,
   pivotY: 0,
   safeArea: true as boolean,
+  // A reserved edge band (#1159): a `top-stretch`/`bottom-stretch` strip marked `reservesEdge`
+  // publishes its HEIGHT as `--ui-reserve-<edge>` on the UI container (`uiTreeStore` →
+  // `UIRenderer`), and a stretched container marked `clearsReservedEdges` pads that band on top of
+  // the safe-area inset (`anchorCss`). Built for an ad banner under a dialog. See docs/ui-system.md
+  // § "Reserved edge bands".
+  reservesEdge: false as boolean,
+  clearsReservedEdges: false as boolean,
 });
