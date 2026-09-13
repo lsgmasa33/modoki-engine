@@ -653,6 +653,136 @@ describe('/api/scene-mutate (play-mode guard)', () => {
     });
   }
 
+  /** #1122 — the scrub/preview ENVELOPE, which the Play guard above structurally cannot see.
+   *
+   *  `playState` is a 3-value compat shim in which `scrub` and `preview` both read back as
+   *  'stopped', so the loop above passes them straight through. `canEdit()` names *mutate* as
+   *  unsafe there and already gates save + prefab-edit; this route was the agent's authoring entry
+   *  point with no envelope guard at all, so a mutate mid-preview returned `{ok:true, changed:N}`,
+   *  read back correctly, and evaporated when the human left the preview.
+   *
+   *  The accept cases below are load-bearing, not padding: a guard that refuses `runMode` it does
+   *  not recognise would pass every refusal case here and break every ordinary headless edit. */
+  describe('the scrub/preview envelope (#1122)', () => {
+    for (const runMode of ['scrub', 'preview'] as const) {
+      it(`refuses with 409 while in a ${runMode} envelope, leaving the file untouched`, async () => {
+        const scenePath = tempScene();
+        const before = fs.readFileSync(scenePath, 'utf-8');
+        // playState is 'stopped' here BY CONSTRUCTION — that is the whole defect. A fixture that
+        // reported anything else would be testing the Play guard over again.
+        const ctx = makeCtx({ requestBrowser: relay({ editorState: { playState: 'stopped', runMode, modeOwner: 'timeline' } }) });
+
+        const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as
+          { status?: number; body: { ok: boolean; code?: string; runMode?: string; error?: string } };
+
+        expect(r.status).toBe(409);
+        expect(r.body.code).toBe('PREVIEW_ENVELOPE');
+        expect(r.body.runMode).toBe(runMode);
+        expect(r.body.error).toMatch(/reverts on Exit/);
+        expect(fs.readFileSync(scenePath, 'utf-8'), 'nothing was written').toBe(before);
+      });
+    }
+
+    it('names exit_pose_envelope for an ANIMATION-owned envelope — an exit that really works there', async () => {
+      const ctx = makeCtx({ requestBrowser: relay({ editorState: { playState: 'stopped', runMode: 'scrub', modeOwner: 'animation' } }) });
+      const r = (await post('/api/scene-mutate', setX(tempScene()), ctx)) as
+        { body: { modeOwner?: string; options?: string[] } };
+
+      expect(r.body.modeOwner).toBe('animation');
+      expect(r.body.options?.join(' ')).toMatch(/modoki_exit_pose_envelope/);
+    });
+
+    it('does NOT offer exit_pose_envelope for a TIMELINE-owned envelope — there it always refuses', async () => {
+      // §5's bar: a refusal names REAL exits. `exitPoseEnvelope` is ownership-guarded and will not
+      // end the Timeline panel's session (ending it would revert that world mid-run), so listing it
+      // here would spend the agent a turn to be told no. The human's Exit button is the real exit.
+      const ctx = makeCtx({ requestBrowser: relay({ editorState: { playState: 'stopped', runMode: 'preview', modeOwner: 'timeline' } }) });
+      const r = (await post('/api/scene-mutate', setX(tempScene()), ctx)) as
+        { body: { modeOwner?: string; options?: string[]; hint?: string } };
+
+      expect(r.body.modeOwner).toBe('timeline');
+      const options = r.body.options?.join(' ') ?? '';
+      expect(options).not.toMatch(/modoki_exit_pose_envelope/);
+      // ⚠️ The AGENT exit comes first. A draft of this refusal offered only the human's button,
+      // which stalls an unattended agent on a one-call fix: `stopPlay()` ends a timeline preview
+      // SESSION and the `stop` op is unguarded.
+      expect(options).toMatch(/modoki_play_control/);
+      // …and the case Stop deliberately does not cover is still named, so the agent is not left
+      // believing one call always works.
+      expect(options).toMatch(/drag-scrub/);
+      expect(options).toMatch(/Exit Preview/);
+      // …but the agent is still TOLD why, so it does not go looking for the op itself. Warning and
+      // instruction are separate fields precisely so the option list stays purely actionable.
+      expect(r.body.hint).toMatch(/modoki_exit_pose_envelope/);
+    });
+
+    it('refuses on the LIVE path too — the branch every case above silently missed', async () => {
+      // ⚠️ REVIEW FINDING on this very change. The shared `relay()` fixture reports no
+      // `scenePath`, so `canGoLive` is false in every other case here and they ALL exercise the
+      // file-direct branch. Moving the envelope guard down into that branch would have kept the
+      // whole block green while a renderer with this scene loaded routed to `apply-scene-ops`,
+      // joined the snapshotted preview world, answered {ok:true, changed:N} — and lost the edit on
+      // Exit. That is #1122 intact, passing its own tests.
+      const scenePath = tempScene();
+      const before = fs.readFileSync(scenePath, 'utf-8');
+      const applied: string[] = [];
+      const ctx = makeCtx({
+        requestBrowser: vi.fn(async (op: string) => {
+          applied.push(op);
+          if (op === 'editor-state') return { playState: 'stopped', runMode: 'preview', modeOwner: 'timeline', scenePath };
+          if (op === 'resolve-unsaved') return { ok: true, holds: [], discarded: [], covers: ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene'] };
+          return { ok: true, changed: 1, errors: [], warnings: [], unresolved: [] };
+        }),
+      });
+
+      const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as
+        { status?: number; body: { code?: string } };
+
+      expect(r.status).toBe(409);
+      expect(r.body.code).toBe('PREVIEW_ENVELOPE');
+      expect(applied, 'the live applier must never be reached').not.toContain('apply-scene-ops');
+      expect(fs.readFileSync(scenePath, 'utf-8'), 'and nothing was written either').toBe(before);
+    });
+
+    it('ACCEPT — a genuinely stopped editor still writes', async () => {
+      const scenePath = tempScene();
+      const ctx = makeCtx({ requestBrowser: relay({ editorState: { playState: 'stopped', runMode: 'stopped' } }) });
+
+      const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as { body: { ok: boolean; changed: number } };
+
+      expect(r.body.ok).toBe(true);
+      expect(r.body.changed).toBeGreaterThan(0);
+      expect(JSON.parse(fs.readFileSync(scenePath, 'utf-8')).entities[0].traits.Transform.x).toBe(5);
+    });
+
+    it('refuses an UNKNOWN future run mode — the gate is an allowlist, like canEdit()', async () => {
+      // `canEdit()` is `runMode === 'stopped'`. A gate listing the two bad modes would silently
+      // PERMIT a fifth RunMode that save already refuses, and nobody remembers to add it here.
+      const scenePath = tempScene();
+      const before = fs.readFileSync(scenePath, 'utf-8');
+      const ctx = makeCtx({ requestBrowser: relay({ editorState: { playState: 'stopped', runMode: 'some-future-mode' } }) });
+
+      const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as { status?: number; body: { code?: string } };
+
+      expect(r.status).toBe(409);
+      expect(r.body.code).toBe('PREVIEW_ENVELOPE');
+      expect(fs.readFileSync(scenePath, 'utf-8')).toBe(before);
+    });
+
+    it('ACCEPT — a renderer that reports NO runMode at all still writes', async () => {
+      // Deliberately no `?? playState` fallback in the guard: a build old enough to omit `runMode`
+      // predates the preview-mode refactor and cannot BE in scrub/preview. This pins that the
+      // missing field reads as "not in an envelope" rather than refusing every older renderer.
+      const scenePath = tempScene();
+      const ctx = makeCtx({ requestBrowser: relay({ editorState: { playState: 'stopped' } }) });
+
+      const r = (await post('/api/scene-mutate', setX(scenePath), ctx)) as { body: { ok: boolean; changed: number } };
+
+      expect(r.body.ok).toBe(true);
+      expect(JSON.parse(fs.readFileSync(scenePath, 'utf-8')).entities[0].traits.Transform.x).toBe(5);
+    });
+  });
+
   it('refuses with 409 when the editor has UNSAVED live changes, leaving the file untouched (F3)', async () => {
     // The write would hot-reload the scene FILE, rebuilding the live world and destroying live-only
     // entities (create_entity / prefab) not yet saved. Refuse, like load_scene/new_scene guardUnsaved.

@@ -90,3 +90,27 @@ export function startTimeCap(seconds: number, onExpire: () => void): () => void 
   const id = setTimeout(onExpire, Math.max(0, seconds) * 1000);
   return () => clearTimeout(id);
 }
+
+/** The gestures that count as a real user interaction. */
+const GESTURES = ['pointerdown', 'touchstart', 'keydown'] as const;
+
+/**
+ * Fire `cb` ONCE on the first real user gesture; returns a cancel that also unsubscribes.
+ *
+ * ⚠️ **Extracted so there is ONE definition of "first interaction" in a playable** (#1139). There
+ * were about to be two: `bootPlayable` holds the master mute until the player touches the ad
+ * (AppLovin require audio muted until first interaction), and the rewarded time cap now restarts on
+ * the same event. Two copies of `['pointerdown', 'touchstart', 'keydown']` drift the first time
+ * somebody adds `click` to one of them, and then the ad unmutes on an event that does not restart
+ * the timer — a disagreement nothing would report.
+ *
+ * Idempotent: the listeners come off on the first fire, so `cb` cannot run twice however many
+ * gestures arrive in one frame.
+ */
+export function onFirstGesture(cb: () => void): () => void {
+  let fired = false;
+  const off = (): void => { for (const ev of GESTURES) window.removeEventListener(ev, handler); };
+  const handler = (): void => { if (fired) return; fired = true; off(); cb(); };
+  for (const ev of GESTURES) window.addEventListener(ev, handler);
+  return off;
+}

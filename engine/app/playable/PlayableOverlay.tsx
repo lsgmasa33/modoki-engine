@@ -9,7 +9,7 @@
  *  draws a CLOSE button — the ad network overlays its own (an MRAID rule). */
 
 import { useEffect, useState } from 'react';
-import { installClick, startTimeCap } from './mraid';
+import { installClick, startTimeCap, onFirstGesture } from './mraid';
 import { isPlayableEnded, resetPlayableEnd } from './playableEnd';
 
 const Z = 2147483000; // above the game canvas + any DOM UI
@@ -27,17 +27,54 @@ export function PlayableOverlay({ clickUrl, capSeconds = 30, onReplay }: Playabl
   // Seed from the latch so an end fired BEFORE this overlay mounted (during the off-screen hold)
   // still shows the end-card immediately, then keep listening for live ends.
   const [ended, setEnded] = useState(isPlayableEnded);
+  /** Bumped by Replay, to re-arm the cap for the fresh play session — see the effect below. */
+  const [cycle, setCycle] = useState(0);
 
+  /**
+   * The rewarded time cap: armed on VIEWABILITY, and RESTARTED on the first user gesture (owner,
+   * 2026-09-13).
+   *
+   * ⚠️ **Both halves, and each is there for a different viewer.** This effect runs at mount, and
+   * `bootPlayable` holds the mount until ready + viewable — so arming here guarantees a call to
+   * action for someone who scrolls past and never touches the ad, who would otherwise never see
+   * one now that the persistent pill is gone (#1139). Restarting on the first gesture gives anyone
+   * who actually engages a full `capSeconds` of play, instead of whatever remained of a timer that
+   * had been running while they were deciding whether to tap. An engaged player can therefore see
+   * the end card up to ~2x `capSeconds` in, which is the accepted cost of serving both.
+   *
+   * ⚠️ The gesture latch is `onFirstGesture` from `./mraid`, the same one the audio gate uses —
+   * NOT a second private copy of the gesture list. See that function's own note.
+   *
+   * ⚠️ **Keyed on `cycle`, never on `ended`.** Putting `ended` in the deps would tear down and
+   * re-arm the cap at the moment the end card SHOWS, starting a fresh timer underneath it. `cycle`
+   * moves only when Replay does.
+   */
   useEffect(() => {
-    const cancel = startTimeCap(capSeconds, () => setEnded(true));
+    let cancelCap = startTimeCap(capSeconds, () => setEnded(true));
+    const cancelGesture = onFirstGesture(() => {
+      cancelCap();
+      cancelCap = startTimeCap(capSeconds, () => setEnded(true));
+    });
     // The game can end the playable early (win/lose) by dispatching this event.
     const onEnd = () => setEnded(true);
     window.addEventListener('playable:end', onEnd);
-    return () => { cancel(); window.removeEventListener('playable:end', onEnd); };
-  }, [capSeconds]);
+    return () => { cancelCap(); cancelGesture(); window.removeEventListener('playable:end', onEnd); };
+  }, [capSeconds, cycle]);
 
   const install = () => installClick(clickUrl);
-  const replay = () => { resetPlayableEnd(); setEnded(false); (onReplay ?? (() => window.location.reload()))(); };
+  /**
+   * ⚠️ **Replay RE-ARMS the cap, and that is a decision rather than bookkeeping.** Before #1139 the
+   * persistent pill meant a replaying player always had a way to install, so a spent cap cost
+   * nothing. With the pill gone the end card is the only call to action, and a cap that does not
+   * re-arm leaves the rest of the session with none at all — the outcome the owner ruled worst.
+   * Bumping `cycle` restarts the effect above, so the replayed session gets its own full timer.
+   */
+  const replay = () => {
+    resetPlayableEnd();
+    setEnded(false);
+    setCycle((c) => c + 1);
+    (onReplay ?? (() => window.location.reload()))();
+  };
 
   return (
     <>

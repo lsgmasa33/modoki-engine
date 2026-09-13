@@ -3,7 +3,20 @@
  *  Verifies the synthesized sequence lets the app's OWN dragstart handler fill the
  *  DataTransfer and the drop handler read it back — the human-drag contract. */
 import { describe, it, expect, beforeEach } from 'vitest';
-import { performDomDnd } from '../../app/debug/domDnd';
+import { performDomDnd, type EditWitness } from '../../app/debug/domDnd';
+
+/** A witness over three independently-movable counters, so a fixture can model the editor's real
+ *  shape: an undo-stack push, a parked asset write, and a scene-world edit are three DIFFERENT
+ *  things, and #1142 was caused by a probe that could only see the third. `bump` names which
+ *  counters a drop moves — a fixture that moved all three together could not tell the fixed code
+ *  from the broken code. */
+function counters() {
+  const n = { stack: 0, assets: 0, world: 0 };
+  return {
+    witness: ((): EditWitness => ({ ...n })) as () => EditWitness,
+    bump(...which: (keyof typeof n)[]) { for (const k of which) n[k] += 1; },
+  };
+}
 
 // jsdom ships no DataTransfer/DragEvent; the renderer (Chromium) does. Minimal
 // shims so the test exercises the REAL synthesizer logic. DragEvent subclasses
@@ -147,17 +160,18 @@ describe('performDomDnd', () => {
       place(src, 0, 0); place(dst, 100, 0);
       src.addEventListener('dragstart', (e) => (e as DragEvent).dataTransfer!.setData('application/editor-asset', '/x.png'));
       dst.addEventListener('dragover', (e) => e.preventDefault()); // accepts the TYPE...
-      let version = 7;
-      dst.addEventListener('drop', () => { if (commit) version++; }); // ...but may ignore it
-      return { editVersion: () => version };
+      const c = counters();
+      // A SCENE edit: an undo push that also dirties the world against disk — both counters.
+      dst.addEventListener('drop', () => { if (commit) c.bump('stack', 'world'); }); // ...but may ignore it
+      return { witness: c.witness };
     }
 
     it('reports committed:false + a warning when the handler did nothing', async () => {
-      const { editVersion } = scene(false);
-      const res = await performDomDnd({ from: { selector: '#src' }, to: { selector: '#dst' } }, { editVersion });
+      const { witness } = scene(false);
+      const res = await performDomDnd({ from: { selector: '#src' }, to: { selector: '#dst' } }, { witness });
       expect(res.accepted).toBe(true);      // the target WAS willing to take this type
       expect(res.committed).toBe(false);    // ...and then did nothing with it
-      expect(res.warning).toMatch(/no editor edit was recorded/i);
+      expect(res.warning).toMatch(/NEITHER the undo stack NOR the parked-asset registry moved/i);
       expect(res.warning).toMatch(/verify with get_scene_state/i); // tells the caller what to do next
     });
 
@@ -166,15 +180,15 @@ describe('performDomDnd', () => {
       // no undoable edit (a file move writes to disk). Downgrading to ok:false would trade a
       // false success for a false failure across drop targets nobody has enumerated. The
       // warning states exactly what is known instead.
-      const { editVersion } = scene(false);
-      const res = await performDomDnd({ from: { selector: '#src' }, to: { selector: '#dst' } }, { editVersion });
+      const { witness } = scene(false);
+      const res = await performDomDnd({ from: { selector: '#src' }, to: { selector: '#dst' } }, { witness });
       expect(res.ok).toBe(true);
       expect(res.error).toBeUndefined();
     });
 
     it('reports committed:true and no warning when the handler records an edit', async () => {
-      const { editVersion } = scene(true);
-      const res = await performDomDnd({ from: { selector: '#src' }, to: { selector: '#dst' } }, { editVersion });
+      const { witness } = scene(true);
+      const res = await performDomDnd({ from: { selector: '#src' }, to: { selector: '#dst' } }, { witness });
       expect(res.committed).toBe(true);
       expect(res.warning).toBeUndefined();
       expect(res.ok).toBe(true);
@@ -189,10 +203,10 @@ describe('performDomDnd', () => {
       place(src, 0, 0); place(dst, 100, 0);
       src.addEventListener('dragstart', (e) => (e as DragEvent).dataTransfer!.setData('application/editor-asset', '/p.prefab.json'));
       dst.addEventListener('dragover', (e) => e.preventDefault());
-      let version = 1;
-      dst.addEventListener('drop', () => { setTimeout(() => { version++; }, 50); });
+      const c = counters();
+      dst.addEventListener('drop', () => { setTimeout(() => { c.bump('stack', 'world'); }, 50); });
 
-      const res = await performDomDnd({ from: { selector: '#a2' }, to: { selector: '#b2' } }, { editVersion: () => version });
+      const res = await performDomDnd({ from: { selector: '#a2' }, to: { selector: '#b2' } }, { witness: c.witness });
       expect(res.committed).toBe(true);
       expect(res.warning).toBeUndefined();
     });
@@ -214,10 +228,74 @@ describe('performDomDnd', () => {
       const dst = document.createElement('div'); dst.id = 'd3';
       place(src, 0, 0); place(dst, 100, 0);
       let probed = 0;
-      const res = await performDomDnd({ from: { selector: '#s3' }, to: { selector: '#d3' } }, { editVersion: () => { probed++; return 0; } });
+      const res = await performDomDnd({ from: { selector: '#s3' }, to: { selector: '#d3' } }, { witness: () => { probed++; return { stack: 0, assets: 0, world: 0 }; } });
       expect(res.ok).toBe(false);
       expect(res.committed).toBeUndefined();
       expect(probed).toBe(1); // the "before" read only; never re-probed
+    });
+  });
+
+  // ── an ASSET-DOCUMENT drop is a commit too (#1142) ────────────────────────────
+  //
+  // Every case above moves the scene world. The measured defect was the other half: the probe
+  // read `getEditVersion`, which `undoManager.pushAction` bumps only behind
+  // `if (!action._isSelection && !action._isFileDirect)` — so a drop onto a SKIN/atlas/material
+  // editor, all of which are `_isFileDirect`, came back `committed:false` plus "the drop probably
+  // did nothing" on edits that demonstrably landed and were undoable. Both symptoms in #1142 are
+  // below, and each one is a case the old single-counter probe got backwards.
+  describe('asset-document drops', () => {
+    /** `bump` names exactly which counters this drop moves — that is the whole axis under test. */
+    function scene(bump: (keyof EditWitness)[]) {
+      const src = document.createElement('div'); src.id = 'as';
+      const dst = document.createElement('div'); dst.id = 'ad';
+      place(src, 0, 0); place(dst, 100, 0);
+      src.addEventListener('dragstart', (e) => (e as DragEvent).dataTransfer!.setData('application/skin-bone', '3'));
+      dst.addEventListener('dragover', (e) => e.preventDefault());
+      const c = counters();
+      dst.addEventListener('drop', () => c.bump(...bump));
+      return { witness: c.witness };
+    }
+    const drop = (witness: () => EditWitness) =>
+      performDomDnd({ from: { selector: '#as' }, to: { selector: '#ad' } }, { witness });
+
+    it('a SKIN-BONE reparent commits — an undo push that never touches the scene world', async () => {
+      // The rig doc changed and `modoki_history undo` reverted it, so an entry WAS on the stack;
+      // it carried `_isFileDirect`, which is precisely what the old probe filtered out.
+      const { witness } = scene(['stack']);
+      const res = await drop(witness);
+      expect(res.committed).toBe(true);
+      expect(res.committedTo).toBe('asset-document');
+      expect(res.warning).toBeUndefined();
+    });
+
+    it('an ATLAS member drop commits — a park with NO undo entry at all', async () => {
+      // `AtlasAssetView` calls `persistAssetEdit` and pushes nothing, so this one is invisible to
+      // the undo stack as well. Only the dirty-asset registry sees it, which is why the witness
+      // needs a third counter rather than just swapping getEditVersion for getUndoVersion.
+      const { witness } = scene(['assets']);
+      const res = await drop(witness);
+      expect(res.committed).toBe(true);
+      expect(res.committedTo).toBe('asset-document');
+      expect(res.warning).toBeUndefined();
+    });
+
+    it('names the SCENE world when the world counter moves too', async () => {
+      // The discriminator's accept side. Without this, `committedTo` could be hard-wired to
+      // 'asset-document' and every test above would still pass.
+      const { witness } = scene(['stack', 'world']);
+      const res = await drop(witness);
+      expect(res.committed).toBe(true);
+      expect(res.committedTo).toBe('scene');
+    });
+
+    it('still reports the no-op when NOTHING moves — the warning did not become unreachable', async () => {
+      // The half that must survive: a fix that reports every drop as committed would silence the
+      // real false-success this warning exists for (#260's texture-on-a-Hierarchy-row).
+      const { witness } = scene([]);
+      const res = await drop(witness);
+      expect(res.committed).toBe(false);
+      expect(res.committedTo).toBeUndefined();
+      expect(res.warning).toMatch(/NEITHER the undo stack NOR the parked-asset registry moved/);
     });
   });
 
@@ -237,29 +315,29 @@ describe('performDomDnd', () => {
       place(src, 0, 0); place(dst, 100, 0);
       src.addEventListener('dragstart', (e) => (e as DragEvent).dataTransfer!.setData('application/editor-asset', '/p.prefab.json'));
       dst.addEventListener('dragover', (e) => e.preventDefault());
-      let version = 1;
-      dst.addEventListener('drop', () => { version++; });
+      const c = counters();
+      dst.addEventListener('drop', () => { c.bump('stack', 'world'); });
       if (coverRect) {
         const cover = document.createElement('div');
         cover.setAttribute('data-ui-id', 'modal.scrim');
         place(cover, coverRect.x, coverRect.y, coverRect.w, coverRect.h);
       }
-      return { editVersion: () => version };
+      return { witness: c.witness };
     }
 
     it('still delivers the drop when the target is covered — ok:true, and the edit lands', async () => {
       // The load-bearing half of "warn, don't refuse": this call WORKS, so refusing it would be
       // a false failure. Assert the commit, not just the absence of an error.
-      const { editVersion } = scene({ x: 95, y: -5, w: 30, h: 30 });
-      const res = await performDomDnd({ from: { selector: '#cs' }, to: { selector: '#cd' } }, { editVersion });
+      const { witness } = scene({ x: 95, y: -5, w: 30, h: 30 });
+      const res = await performDomDnd({ from: { selector: '#cs' }, to: { selector: '#cd' } }, { witness });
       expect(res.ok).toBe(true);
       expect(res.error).toBeUndefined();
       expect(res.committed).toBe(true);
     });
 
     it('reports occluded + names the cover on the covered endpoint only', async () => {
-      const { editVersion } = scene({ x: 95, y: -5, w: 30, h: 30 });
-      const res = await performDomDnd({ from: { selector: '#cs' }, to: { selector: '#cd' } }, { editVersion });
+      const { witness } = scene({ x: 95, y: -5, w: 30, h: 30 });
+      const res = await performDomDnd({ from: { selector: '#cs' }, to: { selector: '#cd' } }, { witness });
       expect(res.to.occluded).toBe(true);
       expect(res.to.hitTarget).toContain('modal.scrim');
       expect(res.from.occluded).toBe(false);   // the source was clear — don't smear the blame
@@ -269,16 +347,16 @@ describe('performDomDnd', () => {
     });
 
     it('catches a covered SOURCE too — a human could not even grab it', async () => {
-      const { editVersion } = scene({ x: -5, y: -5, w: 30, h: 30 });
-      const res = await performDomDnd({ from: { selector: '#cs' }, to: { selector: '#cd' } }, { editVersion });
+      const { witness } = scene({ x: -5, y: -5, w: 30, h: 30 });
+      const res = await performDomDnd({ from: { selector: '#cs' }, to: { selector: '#cd' } }, { witness });
       expect(res.from.occluded).toBe(true);
       expect(res.to.occluded).toBe(false);
       expect(res.warning).toMatch(/source \(from\)/);
     });
 
     it('names both endpoints when one cover spans them', async () => {
-      const { editVersion } = scene({ x: -5, y: -5, w: 200, h: 30 });
-      const res = await performDomDnd({ from: { selector: '#cs' }, to: { selector: '#cd' } }, { editVersion });
+      const { witness } = scene({ x: -5, y: -5, w: 200, h: 30 });
+      const res = await performDomDnd({ from: { selector: '#cs' }, to: { selector: '#cd' } }, { witness });
       expect(res.warning).toMatch(/source \(from\)/);
       expect(res.warning).toMatch(/target \(to\)/);
     });
@@ -286,8 +364,8 @@ describe('performDomDnd', () => {
     it('says nothing about occlusion on a clean drop', async () => {
       // The regression that would make this whole change worthless: a warning on every drop is
       // the same as no warning at all.
-      const { editVersion } = scene(null);
-      const res = await performDomDnd({ from: { selector: '#cs' }, to: { selector: '#cd' } }, { editVersion });
+      const { witness } = scene(null);
+      const res = await performDomDnd({ from: { selector: '#cs' }, to: { selector: '#cd' } }, { witness });
       expect(res.from.occluded).toBe(false);
       expect(res.to.occluded).toBe(false);
       expect(res.warning).toBeUndefined();
@@ -302,9 +380,9 @@ describe('performDomDnd', () => {
       const cover = document.createElement('div');
       cover.setAttribute('data-ui-id', 'modal.scrim');
       place(cover, 95, -5, 30, 30);
-      const res = await performDomDnd({ from: { selector: '#bs' }, to: { selector: '#bd' } }, { editVersion: () => 7 });
+      const res = await performDomDnd({ from: { selector: '#bs' }, to: { selector: '#bd' } }, { witness: () => ({ stack: 7, assets: 7, world: 7 }) });
       expect(res.warning).toMatch(/NOT ONE A HUMAN COULD PERFORM/);
-      expect(res.warning).toMatch(/no editor edit was recorded/);
+      expect(res.warning).toMatch(/NEITHER the undo stack NOR the parked-asset registry moved/);
     });
 
     /** A COORDINATE aim matched nothing by name, so there is nothing for it to be occluded
@@ -322,7 +400,7 @@ describe('performDomDnd', () => {
       placeInvisible(dst, 400, 0);          // resolves by selector; hit-test sees nothing there
       src.addEventListener('dragstart', (e) => (e as DragEvent).dataTransfer!.setData('application/editor-asset', '/p.prefab.json'));
       dst.addEventListener('dragover', (e) => e.preventDefault());
-      const res = await performDomDnd({ from: { selector: '#is' }, to: { selector: '#id2' } }, { editVersion: () => 1 });
+      const res = await performDomDnd({ from: { selector: '#is' }, to: { selector: '#id2' } }, { witness: () => ({ stack: 1, assets: 1, world: 1 }) });
       expect(res.to.occluded).toBe(true);
       expect(res.warning).toMatch(/off-window or clipped away/);
       expect(res.warning).not.toMatch(/covered by null/);

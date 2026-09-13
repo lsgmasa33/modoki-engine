@@ -2502,7 +2502,12 @@ async function describeUnresolvedAgainstLiveWorld(
       // `unsavedGate`, so these fields are read by nothing, and a type that keeps declaring them
       // would advertise an answer this route no longer consults. What is left is exactly what only
       // `editor-state` can say: the Play state, and WHICH scene is live (for `canGoLive`).
-      type EditorStateProbe = { playState?: string; scenePath?: string };
+      // `runMode`/`modeOwner` are additive alongside `playState` (#1122). `playState` is the
+      // 3-value compat shim and it is still the right field for the Play/paused refusal below;
+      // it is the WRONG field for an authoring decision, because `scrub` and `preview` both
+      // collapse into 'stopped' there. A renderer that omits the two new fields simply skips the
+      // envelope refusal — see the reasoning where it is read.
+      type EditorStateProbe = { playState?: string; runMode?: string; modeOwner?: string; scenePath?: string };
       let st: EditorStateProbe | null = null;
       /** Why the probe did not answer, when it did not.
        *
@@ -2577,6 +2582,70 @@ async function describeUnresolvedAgainstLiveWorld(
         return json({
           error: `game is ${st.playState} — stop the game (press Stop) before editing the scene; edits during Play are discarded on Stop`,
           playState: st.playState,
+        }, 409);
+      }
+      // ── …and the scrub/preview ENVELOPE, which the check above structurally cannot see (#1122). ──
+      //
+      // `canEdit()` is `runMode === 'stopped'` and its docblock names *mutate* by name, yet its
+      // only callers were `saveCommand.ts` and the prefab-edit path — so save was guarded and this
+      // route, the AGENT's authoring entry point, was not. Exactly the asymmetry
+      // `engine/tests/editor/prefabSaveRunModeGuard.test.ts` records one function over.
+      //
+      // Read `runMode`, NOT `playState`, for the same reason `/api/render-sequence` does further
+      // up this file. ⚠️ No `?? st?.playState` fallback here, and that is deliberate rather than an
+      // oversight: a renderer old enough not to report `runMode` predates the preview-mode refactor
+      // and therefore cannot BE in scrub/preview, so a fallback could only ever retranslate
+      // 'stopped' into itself while making this read look like the one above, which DOES need it.
+      //
+      // REFUSE rather than allow-and-disclose (owner's ruling, 2026-09-13). The alternative was a
+      // `{ok:true, revertsOnExit:true}` reply, and it was rejected because neither branch below is
+      // survivable inside the envelope: the live-world path joins a world that is snapshotted and
+      // reverts on Exit, and the file-direct path's write hot-reloads the scene, tearing down the
+      // human's preview session. There is nothing here to disclose an edit INTO.
+      // ⚠️ ALLOWLIST, not a denylist, because `canEdit()` is one (`runMode === 'stopped'`). Listing
+      // the two bad modes would silently PERMIT a fifth `RunMode` that save already refuses, and
+      // the next mode is exactly the thing nobody remembers to add here. `'playing'` is excluded
+      // because the Play/paused 409 above already owns it and says something more specific; a
+      // renderer reporting NO runMode still falls through to the write (see the note above).
+      if (st?.runMode && st.runMode !== 'stopped' && st.runMode !== 'playing') {
+        const owner = st.modeOwner;
+        return json({
+          ok: false,
+          changed: 0,
+          code: 'PREVIEW_ENVELOPE',
+          error: `the editor is inside a ${st.runMode} PREVIEW ENVELOPE`
+            + (owner ? ` owned by the ${owner} panel` : '')
+            + ' — that world is snapshotted and reverts on Exit, so this edit would be applied, read '
+            + 'back successfully, and then silently discarded. Nothing was written.',
+          runMode: st.runMode,
+          ...(owner ? { modeOwner: owner } : {}),
+          // §5: name REAL exits only. `modoki_exit_pose_envelope` is a real exit for an
+          // ANIMATION-owned envelope and a guaranteed refusal for a timeline-owned one (it will
+          // not end another panel's session), so which one is listed depends on the owner.
+          //
+          // ⚠️ `options` holds only things the agent can DO. The reason NOT to reach for the pose
+          // op goes in `hint` instead: an entry that names a tool in order to warn against it is
+          // still an entry with a tool name in it, and an agent scanning the list for something to
+          // call will call it.
+          options: owner === 'animation'
+            ? [
+              'modoki_exit_pose_envelope — closes the ANIMATION preview, restores the authored world and returns the run-mode to stopped; then retry this call',
+            ]
+            : [
+              // ⚠️ A timeline envelope DOES have an agent exit, and an earlier draft of this
+              // refusal denied it — sending the agent to find a human over a one-call fix.
+              // `stopPlay()` ends a scrub/preview that HOLDS a preview session (its own comment:
+              // "Toolbar Stop also EXITS a Timeline ▶ preview"), clears the owner and returns the
+              // mode to stopped; the `stop` agent op is unguarded.
+              "modoki_play_control {action:'stop'} — Stop also ends a Timeline preview SESSION: it reverts the snapshot and returns the run-mode to stopped. Then retry this call",
+              // …but NOT unconditionally, and the gap is deliberate upstream rather than a bug:
+              // a plain drag-scrub holds no session yet, and `stopPlay` leaves it alone on purpose
+              // so a save stays refused rather than exposing an un-reverted pose.
+              'if the run-mode is STILL not stopped afterwards, this is a plain drag-scrub holding no preview session — Stop deliberately leaves that one alone, so ask the human to press ⏹ Exit Preview',
+            ],
+          ...(owner === 'timeline'
+            ? { hint: 'Do not reach for modoki_exit_pose_envelope here — it deliberately refuses a timeline-owned envelope, because ending that session would revert its world mid-run. Use modoki_play_control stop instead.' }
+            : {}),
         }, 409);
       }
       // ── Live-world path (mcp-persistence.md Phase 2) ──

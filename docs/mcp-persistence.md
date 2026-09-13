@@ -54,6 +54,17 @@ three were rare under `auto` and are routine now:
 - **`modoki_build` REFUSES** while unsaved — it reads the FILE, so the artifact would miss the work.
 - **A file-direct `mutate_scene` 409s** while unsaved — its write hot-reloads the scene and would
   destroy live-only work.
+- **`mutate_scene` 409s inside a scrub/preview ENVELOPE** (`code: 'PREVIEW_ENVELOPE'`, #1122) — for
+  the same reason `save_all` refuses the scene half there, and it did not until 2026-09-13. The
+  route gated on the 3-value `playState` compat shim, in which `scrub` and `preview` both collapse
+  to `'stopped'`, so an agent write mid-preview was ALLOWED: it applied, read back correctly, and
+  evaporated when the human left the envelope, with no 409 and nothing in the reply to hint at it.
+  ⚠️ **`playState` is the wrong field for any AUTHORING decision** — read `runMode`, which
+  `editor-state` has reported since the preview-mode refactor. `canEdit()` (`runMode === 'stopped'`)
+  is the predicate, and its docblock names `mutate` by name; it just had no caller on this route.
+  The refusal names the exit that actually works, which depends on `modeOwner`: an ANIMATION-owned
+  envelope is ended by `modoki_exit_pose_envelope`, and a TIMELINE-owned one is not — that op
+  deliberately refuses it, so there the reply asks for the human's ⏹ Exit Preview instead.
 - **A game-code (`.ts`) edit force-reloads the editor and DISCARDS unsaved scene edits** after a 5s
   countdown (CLAUDE.md). This is the sharpest one: accumulated unsaved work is more exposed than it
   was under `auto`.

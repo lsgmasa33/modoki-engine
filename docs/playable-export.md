@@ -43,10 +43,30 @@ and shows the end-card on the cap or a game-dispatched `window 'playable:end'`.
 
 ⚠️ **Since #1139 the end card is the ONLY call to action**, so `capSeconds` is load-bearing rather
 than a backstop: a creative that fires neither `playable:end` nor the cap has no way to click
-through at all. The cap arms when the overlay mounts — i.e. on first VIEWABILITY, not on the
-player's first interaction. AppLovin's audio rule is keyed to first interaction; whether their
-timer rule is too is an open question on #1139, and moving the arming point is a behaviour change
-(a player who never taps would never see Install), not a tidy-up.
+through at all.
+
+**The cap is therefore two-phase (owner, 2026-09-13), and each half serves a different viewer:**
+
+- **Armed on VIEWABILITY** — the overlay's mount effect, and `bootPlayable` holds that mount until
+  ready + viewable. This is what guarantees a call to action for someone who scrolls past and never
+  touches the ad.
+- **RESTARTED on the first user gesture** (`onFirstGesture`, `mraid.ts`) — so a player who taps at
+  4 s of a 5 s cap gets a full 5 s of play, not the 1 s that was left. Engaging with the ad must not
+  cost you the session.
+
+An engaged player can therefore reach the end card at up to ~2x `capSeconds`; that is the accepted
+cost of serving both viewers. **Replay re-arms it** — before #1139 a spent cap cost nothing because
+the persistent pill was always there, and now a replayed session without a timer has no CTA at all.
+
+⚠️ **`onFirstGesture` is shared with the audio gate, deliberately.** AppLovin require audio muted
+until first interaction, and the cap keys off the same event; two private copies of the gesture list
+drift the first time somebody adds `click` to one, and the ad then unmutes on an event that does not
+restart the timer, with nothing reporting the disagreement.
+
+⚠️ **Not verified:** whether AppLovin's own spec *requires* a rewarded timer to start only after
+first interaction. The relayed note on #1139 said so; the requirement list quoted there does not
+include it, and nobody has checked their docs. The two-phase shape satisfies the strict reading
+anyway for anyone who interacts.
 
 ## Per-target assets (`asset-keep.json` → `playable`)
 

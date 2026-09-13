@@ -742,6 +742,62 @@ gives `committed:true` (136 → 141 entities, `undoLabel: 'Instantiate "Cone"'`)
 really was accepted; some legitimate drops make no undoable edit (a file move writes to disk), so
 downgrading them would trade a false success for a false failure across drop targets nobody has
 enumerated. The warning says exactly what is known and no more.
+
+#### ⚠️ `committed` watches the STACK, not the scene-dirty counter (#1142, fixed 2026-09-13)
+
+Read the paragraph above carefully and it states the right criterion — *"not one undo entry pushed,
+which is the decisive part, since every real editor mutation pushes one."* The **wiring measured
+something else**, for over a year: it read `getEditVersion`, and that counter is not "did anything
+happen". It answers *"does the live world now differ from disk"* for the save baseline
+(`editor/scene/serialize.ts`), so `undoManager.pushAction` bumps it behind
+
+```ts
+// in BOTH `pushAction` and `runStep` (undo/redo) — undoManager.ts
+if (!action._isSelection && !action._isFileDirect) notifyEdited();
+```
+
+`_editVersion` therefore counts a **strict subset of the undo stack**, and every asset-panel edit is
+`_isFileDirect: true` — so EVERY drop onto a Skin/material/particle editor came back
+`committed:false` plus "the drop probably did nothing", on edits that had demonstrably landed and
+were undoable. Two QA cases carried a paragraph telling runners to ignore it.
+
+The probe now samples **three** counters (`EditWitness` in `app/debug/domDnd.ts`), because the
+editor genuinely has three answers and no two of them are the same question:
+
+| counter | what it sees | why it is needed |
+|---|---|---|
+| `getUndoVersion()` | every stack push, `_isFileDirect` included | catches a skin-bone reparent |
+| `getDirtyAssetsVersion()` | parked asset-document writes | catches an **atlas** member drop, which calls `persistAssetEdit` and pushes **no undo entry at all** (`AtlasAssetView.tsx`) — invisible to both other counters |
+| `getEditVersion()` | edits that count as unsaved SCENE work (everything not `_isSelection`/`_isFileDirect`) | no longer the verdict; kept as the DISCRIMINATOR behind the new `committedTo: 'scene' \| 'asset-document'` |
+
+`committed` is now "the stack **or** the registry moved". Measured live on `games/skin-test`
+(2026-09-13): a bone reparent gives `committed:true, committedTo:'asset-document'` with no warning,
+and `undoLabel` reads `rig2d reparent bone`; an atlas edit adds the atlas to `dirtyAssetPaths` while
+`undoLabel` does **not** change — which is exactly why the third counter exists.
+
+⚠️ **Do not "simplify" this by widening the `undoManager` guard instead.** That guard is correct:
+`hasUnsavedChanges()`, the title-bar dot and the scene-save baseline all read `_editVersion`, and
+making it count selection or file-direct actions would make a bare click read as unsaved work. The
+defect was the READER, not the guard.
+
+⚠️ **`committedTo:'scene'` means "bumped the save baseline", NOT "touched a scene entity".** An
+Assets **file move**, an OS-file **import** and entity→Assets **prefab-create** all push a plain
+undo action (`panels/assetUndo.ts` sets `_isFileDirect` on none of them), so they count as scene
+work and are labelled `scene` despite touching no entity. That is the counter being reported
+honestly, not a bug in the label — but do not read `scene` as "an entity changed".
+
+⚠️ **What still reaches the no-commit warning**, now that an asset-document drop does not. Both are
+real and neither is a defect in the probe:
+- a handler still running after `COMMIT_SETTLE_MS` (400 ms) — a prefab fetch with nested-prefab
+  preloading, an OS-file import (base64 + convert), a Skin sprite drop's alpha-mask readback;
+- a drop that records in **neither** place — the Project Settings path fields adopt the file
+  server-side and keep the value in dialog-local state, so no counter can see it.
+
+⚠️ Three known imprecisions in the other direction, each needing an unrelated event inside the same
+400 ms window: `getDirtyAssetsVersion()` bumps on park **and** flush/discard (a racing `save_all`);
+`getUndoVersion()` bumps for a `_isSelection` push (latent — no drop target's only effect is a
+selection today); and it bumps from `clearHistory`/`truncateUndoTo`/`swapHistory`, so a scene
+hot-reload mid-window reads as a commit.
 - [x] Apply the same question to the **device twin** (`device_tap`/`device_drag`/`device_pointer`/
       `device_press_key`/`device_hover`/`device_scroll`/`device_type_text`) — it dispatched SYNTHETIC
       DOM events, never OS-level trusted input, a strictly weaker fidelity position than the editor

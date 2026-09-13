@@ -211,7 +211,11 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_history',
     'Undo or redo the last editor action (same stack as Cmd+Z / Cmd+Shift+Z). Your own ' +
-      'create/duplicate/delete/reparent edits are undoable; selection changes are not. ' +
+      'create/duplicate/delete/reparent edits are undoable. \u26a0 SELECTION IS ON THIS STACK TOO: a ' +
+      'selection made by a UI GESTURE (a Hierarchy or Assets click, so modoki_tap too) pushes its own ' +
+      '"Select ..." entry, so ONE undo can pop that instead of your edit. Steer by `undoLabel`, never ' +
+      'by counting calls. (modoki_set_selection is the exception — it writes selection raw and pushes ' +
+      'no entry.) ' +
       'Returns {did, ...editorState}. `did=false` means the stack END was reached — there was ' +
       'nothing to undo. `did=true` means an entry was POPPED and its closure ran; it is NOT a ' +
       'guarantee that the world now looks as it did before, because an entry captured against a ' +

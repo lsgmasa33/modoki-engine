@@ -68,6 +68,20 @@ export interface DomDndResult {
    *  take this payload TYPE; the drop HANDLER can still reject the specific payload and do
    *  nothing. Undefined when no probe was supplied (non-editor host). */
   committed?: boolean;
+  /** WHICH side the commit landed on, present only when `committed` is true. Reported because
+   *  "it worked" and "it worked, and save_all is what persists it" are different follow-ups, and
+   *  the old single-counter signal could not tell them apart (#1142).
+   *
+   *  ⚠️ **Read these as what the counters MEASURE, not as a claim about scene entities.** The
+   *  discriminator is `getEditVersion()` — "does this count as unsaved SCENE work against the
+   *  save baseline" — and a few drops that touch no entity land on the `scene` side because
+   *  their undo action is a plain one:
+   *  - `scene` — the edit bumped the scene-vs-disk baseline. Usually a real scene edit; ALSO an
+   *    Assets **file move**, an OS-file **import** and entity→Assets **prefab-create**, whose
+   *    actions (`panels/assetUndo.ts`) carry no `_isFileDirect` and so count as scene work.
+   *  - `asset-document` — a skin/particle/atlas/material document, parked in the dirty-asset
+   *    registry and flushed by save_all. */
+  committedTo?: 'scene' | 'asset-document';
   /** Present only on a no-op (ok:false): why the drop didn't land. */
   error?: string;
   /** The drop landed, but something about it should stop a verdict resting on it. Two causes,
@@ -77,11 +91,34 @@ export interface DomDndResult {
   warning?: string;
 }
 
+/** Every counter that can witness a drop having done something, sampled together.
+ *
+ *  ⚠️ **THREE counters, because the editor genuinely has three answers** (#1142). The original
+ *  probe read only `getEditVersion`, and that counter is not "did anything happen" — it is
+ *  "does the live world now differ from disk", so `undoManager.pushAction` bumps it behind
+ *  `if (!action._isSelection && !action._isFileDirect)`. Every asset-panel edit sets
+ *  `_isFileDirect: true`, so EVERY skin/particle/material drop was filtered out of it and read
+ *  back as "the drop probably did nothing" — on drops that demonstrably landed and were
+ *  undoable. `docs/enact.md` had the criterion right all along ("not one undo entry pushed…
+ *  every real editor mutation pushes one"); it was the wiring that measured something else. */
+export type EditWitness = {
+  /** Undo-STACK mutations (`getUndoVersion`) — bumps on every push, `_isFileDirect` included.
+   *  This is the one that catches a skin-bone reparent. */
+  stack: number;
+  /** Parked asset-document writes (`getDirtyAssetsVersion`). Needed on top of `stack` because an
+   *  atlas member drop calls `persistAssetEdit` and pushes NO undo action at all, so it is
+   *  invisible to both of the other two. */
+  assets: number;
+  /** Scene-world edits only (`getEditVersion`). No longer the commit signal — kept as the
+   *  DISCRIMINATOR that says which world moved, so the reply can name it. */
+  world: number;
+};
+
 export interface DomDndOptions {
-  /** Monotonic count of non-selection edits (the editor's `getEditVersion`). Injected rather
-   *  than imported so this module keeps no editor dependency. Without it `committed` is
-   *  undefined and the acceptance-only verdict stands. */
-  editVersion?: () => number;
+  /** Samples all three counters at once. Injected rather than imported so this module keeps no
+   *  editor dependency. Without it `committed` is undefined and the acceptance-only verdict
+   *  stands. */
+  witness?: () => EditWitness;
 }
 
 /** Synthesize a full HTML5 drag-and-drop from → to.
@@ -94,8 +131,12 @@ export interface DomDndOptions {
  *  byte-identical, `unsavedChanges:false`, and `canUndo:false`, i.e. not one undo entry was
  *  pushed. The agent was told `ok:true, accepted:true`.
  *
- *  So acceptance is now the FLOOR, not the verdict: when an edit-version probe is supplied we
- *  also check whether the editor recorded an edit, and say so when it did not. */
+ *  So acceptance is now the FLOOR, not the verdict: when a witness probe is supplied we also check
+ *  whether the editor recorded an edit, and say so when it did not.
+ *
+ *  ⚠️ **What counts as "recorded" is the UNDO STACK plus the parked-asset registry, not the
+ *  scene-dirty counter** (#1142) — see `EditWitness`. Reading the scene-dirty counter alone made
+ *  every asset-editor drop, all of which are `_isFileDirect`, report as a no-op. */
 export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions): Promise<DomDndResult> {
   const src = resolveDomPoint(params.from, 'from');
   const dst = resolveDomPoint(params.to, 'to');
@@ -111,7 +152,7 @@ export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions):
   const fromAim = aimProvenance(src.el, src.x, src.y, !!params.from.selector, 'drag');
   const toAim = aimProvenance(dst.el, dst.x, dst.y, !!params.to.selector, 'drag');
   const dt = new DataTransfer();
-  const before = opts?.editVersion?.();
+  const before = opts?.witness?.();
 
   fireDnd(src.el, 'dragstart', src.x, src.y, dt);
   fireDnd(dst.el, 'dragenter', dst.x, dst.y, dt);
@@ -126,9 +167,27 @@ export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions):
   // Let an async drop handler (handlePrefabDrop awaits a fetch) run before asking whether
   // anything changed. Only worth waiting when a commit was actually plausible.
   let committed: boolean | undefined;
+  let committedTo: DomDndResult['committedTo'];
   if (before !== undefined && types.length > 0 && accepted) {
     await sleep(COMMIT_SETTLE_MS);
-    committed = (opts!.editVersion!() ?? before) !== before;
+    const after = opts!.witness!();
+    // EITHER world counts as a commit. The stack catches anything that pushed an undo entry
+    // (scene edits and `_isFileDirect` asset edits alike); the registry catches a park that
+    // pushed nothing.
+    committed = after.stack !== before.stack || after.assets !== before.assets;
+    // ⚠️ Three known imprecisions, stated rather than left to be rediscovered. All are "something
+    // moved that was not this drop", and all need an event inside the 400 ms window:
+    //  1. `getDirtyAssetsVersion` bumps on park AND on flush/discard — a racing `save_all` reads
+    //     as a commit.
+    //  2. `getUndoVersion` bumps for a `_isSelection` push, which #1137 establishes are real undo
+    //     entries. Latent rather than shipped: no drop target's ONLY effect is a selection today
+    //     (the Assets and Hierarchy dragstart handlers do not select).
+    //  3. `getUndoVersion` also bumps from `clearHistory`/`truncateUndoTo`/`swapHistory`, so a
+    //     scene hot-reload or context switch mid-window reads as a commit.
+    // The alternative — diffing the stack's top entry and the registry's contents — buys a
+    // stronger signal than "did this drop do anything" needs. Not the failure this fixes, and the alternative — diffing the registry's
+    // contents — buys a stronger signal than the question deserves.
+    if (committed) committedTo = after.world !== before.world ? 'scene' : 'asset-document';
   }
   // A COVERED endpoint is a warning, never a refusal, and the asymmetry with every other aimed
   // input op is deliberate (#260). `docs/mcp-tool-conventions.md` §3 refuses a covered aim because
@@ -182,7 +241,7 @@ export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions):
   // instead of arriving here. The heuristic stays for the cases nothing has closed.
   if (types.length > 0 && accepted && committed === false) {
     warnings.push(
-      'the target accepted the payload TYPE but no editor edit was recorded, so the drop probably did nothing. Verify with get_scene_state/history before building on this. (A drop that legitimately makes no undoable edit, e.g. a file move, also lands here.)',
+      'the target accepted the payload TYPE but NEITHER the undo stack NOR the parked-asset registry moved, so the drop probably did nothing. Verify with get_scene_state/history before building on this. TWO legitimate drops also land here: one whose handler is still running after 400ms (a prefab fetch, an OS-file import, a sprite alpha readback), and one that records in neither place (a Project Settings path field, which adopts the file server-side and holds the value in dialog state).',
     );
   }
   // `ok` must reflect what ACTUALLY happened, not just "we fired the sequence". An empty
@@ -199,6 +258,7 @@ export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions):
     types,
     accepted,
     ...(committed !== undefined ? { committed } : {}),
+    ...(committedTo ? { committedTo } : {}),
     ...(types.length === 0
       ? { error: 'drag-and-drop no-op: the source element wrote nothing to the DataTransfer — it is likely not a drag source (wrong `from` selector).' }
       : !accepted
@@ -207,7 +267,8 @@ export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions):
     // Everything in `warnings` is a WARNING rather than an error, and `ok` deliberately stays
     // true for all of them. The no-edit case: the DnD sequence really was delivered and really
     // was accepted; what we cannot prove is that the handler acted, and some legitimate drops
-    // are not undoable edits (a file move writes to disk), so downgrading them to ok:false would
+    // are not undoable edits (the warning text names the two that actually reach it — a file
+    // MOVE is not one of them, it records both counters), so downgrading them to ok:false would
     // invent failures across drop targets nobody has enumerated — trading a false success for a
     // false failure. The covered case: the drop genuinely landed, it just landed somewhere a
     // human could not have put it. Say exactly what is known, in both cases.

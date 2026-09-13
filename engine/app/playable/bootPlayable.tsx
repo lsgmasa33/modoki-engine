@@ -9,7 +9,7 @@
 
 import { createRoot } from 'react-dom/client';
 import { setAudioMuted, isAudioMuted } from '@modoki/engine/runtime';
-import { whenReady, whenViewable, onViewableChange } from './mraid';
+import { whenReady, whenViewable, onViewableChange, onFirstGesture } from './mraid';
 import { armPlayableEndLatch } from './playableEnd';
 import { PlayableOverlay } from './PlayableOverlay';
 
@@ -36,13 +36,9 @@ export async function bootPlayable(clickUrl: string): Promise<void> {
   // Ongoing viewability sync (re-mutes if the ad scrolls back off-screen mid-play). No-op standalone.
   onViewableChange((v) => { viewable = v; applyMute(); });
   // First real user gesture → interacted (also what App.tsx uses to resume the AudioContext).
-  const GESTURES = ['pointerdown', 'touchstart', 'keydown'] as const;
-  const onFirstGesture = () => {
-    interacted = true;
-    applyMute();
-    for (const ev of GESTURES) window.removeEventListener(ev, onFirstGesture);
-  };
-  for (const ev of GESTURES) window.addEventListener(ev, onFirstGesture);
+  // ⚠️ Through the SHARED latch (#1139) — the rewarded time cap restarts on the same event, and two
+  // private copies of the gesture list would drift into disagreeing about what an interaction is.
+  onFirstGesture(() => { interacted = true; applyMute(); });
 
   // Hold until the ad container says it's ready + on-screen. Both resolve immediately when
   // standalone (our preview / a plain browser), so the artifact is still runnable. On success mark

@@ -167,6 +167,33 @@ describe('the real registered surface', () => {
   // (`modoki_particle_set`, `modoki_timeline_set`, `modoki_anim_set_clip`) is subject-first by
   // design so siblings sort together, and its names match their ops exactly;
   // `modoki_select_sprite_slice` is a genuine `select-` verb, not a setter.
+  /** #1137 — `modoki_history` told the agent "selection changes are not [undoable]". They are.
+   *
+   *  `pushSelectionChange` puts its own `Select …` entry on the stack for every UI-GESTURE
+   *  selection (a Hierarchy or Assets click, so `modoki_tap` too). Observed live: after undoing a
+   *  create, `undoLabel` read "Select entity". An agent that believed the description, selected,
+   *  edited and then undid ONCE popped the selection and left its edit applied — while `did:true`
+   *  reported success.
+   *
+   *  ⚠️ This guards the RESTATEMENT, not the mechanism. The mechanism is pinned in
+   *  `packages/modoki/tests/editor/undoManager.test.ts` § getEditVersion, which asserts the exact
+   *  divergence: a selection push bumps `getUndoVersion` (the stack moved) and leaves
+   *  `getEditVersion` alone (no world edit). That divergence is also the whole of #1142 — the same
+   *  two counters, read by the dnd commit probe — so if it ever collapses, BOTH those suites go
+   *  red and this one stops being the interesting failure. What this catches is the agent-facing
+   *  COPY of the fact drifting back to the false version, which no behavioural test can see. */
+  it('modoki_history does not tell the agent selection is off the undo stack (#1137)', () => {
+    const desc = s.descriptionOf('modoki_history');
+    expect(desc, 'the false claim is back').not.toMatch(/selection changes are not/i);
+    expect(desc, 'it must still SAY something about selection — silence just moves the trap').toMatch(/selection/i);
+    expect(desc, 'and name the field to steer by, since counting undos is what breaks').toMatch(/undoLabel/);
+    // The sibling that already had it right, and the reason this is one correction rather than
+    // two: `modoki_set_selection` writes selection RAW (`setSelectionRaw`) and genuinely pushes
+    // nothing. The two descriptions must not disagree about the same stack.
+    expect(s.descriptionOf('modoki_set_selection'), 'the accurate sibling drifted instead')
+      .toMatch(/does NOT push an undo entry/i);
+  });
+
   it('a tool whose backend op is `set-*` is NAMED `modoki_set_*`', () => {
     const offenders = Object.entries(CONTRACTS)
       .filter(([name, c]) => typeof c.op === 'string' && c.op.startsWith('set-') && !name.startsWith('modoki_set_'))

@@ -28,7 +28,7 @@ import { makeEvalApi } from './evalApi';
 import {
   useEditorStore, type SelectedAsset,
   enterPlay, stopPlay, pausePlay,
-  undo, redo, canUndo, canRedo, undoLabel, redoLabel, getEditVersion,
+  undo, redo, canUndo, canRedo, undoLabel, redoLabel, getEditVersion, getUndoVersion, getDirtyAssetsVersion,
   loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses,
   getPendingBaseScenePaths, discardPendingBaseScenes,
   getLastSceneLoadFailureMessage,
@@ -57,7 +57,7 @@ import {
   describeDeviceSelection, presetDpr, resolveLogicalSize, resolvePhysicalSize, resolveSafeArea,
   type DevicePreset, type Orientation,
   type PrefabFile,
-  causeSpecs, flushParked,
+  causeSpecs, flushParked, getModeOwner,
 } from '@modoki/engine/editor';
 import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDITOR_JOURNAL_TAIL_DEFAULT } from '../debug/streamSummary';
 import {
@@ -288,6 +288,12 @@ function readEditorState() {
     playState: getPlayState(),
     runMode: getRunMode(),   // 'stopped' | 'scrub' | 'preview' | 'playing' (preview-mode-refactor)
     advancing: isAdvancing(), // false = a frozen frame (Play paused, or a paused preview)
+    // WHICH panel owns a scrub/preview envelope ('timeline' | 'animation'), omitted when none does
+    // — the same pair `saveCommand.ts` already reports as `mode` on a refused save. It is here so a
+    // refusal can name the RIGHT exit: `modoki_exit_pose_envelope` ends an animation-owned envelope
+    // and deliberately refuses a timeline-owned one, so without the owner a refusal can only offer
+    // an exit that may not work. Read by `/api/scene-mutate`'s envelope 409 (#1122).
+    ...(getModeOwner() ? { modeOwner: getModeOwner() } : {}),
     gizmoMode: s.gizmoMode,
     gizmoSpace: s.gizmoSpace,
     sceneViewMode: s.sceneViewMode,
@@ -1066,10 +1072,12 @@ export function registerEditorAgentOps(): void {
     return waitForEditorJournal({ type: p.type, source: p.source ?? 'human', since: p.since }, timeoutMs);
   });
 
-  // `getEditVersion` lets the op distinguish "the target ACCEPTED this payload type" from
+  // The witness lets the op distinguish "the target ACCEPTED this payload type" from
   // "the handler actually did something" — measured: a texture dropped on a Hierarchy entity
   // row reported ok:true/accepted:true and made no edit at all.
-  registerAgentOp('dom-dnd', (params) => performDomDnd((params ?? {}) as DomDndParams, { editVersion: getEditVersion }));
+  registerAgentOp('dom-dnd', (params) => performDomDnd((params ?? {}) as DomDndParams, {
+    witness: () => ({ stack: getUndoVersion(), assets: getDirtyAssetsVersion(), world: getEditVersion() }),
+  }));
 
   // ── Selection ──
   registerAgentOp('set-selection', (params) => {
