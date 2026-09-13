@@ -74,11 +74,13 @@ export interface DomDndResult {
    *
    *  ⚠️ **Read these as what the counters MEASURE, not as a claim about scene entities.** The
    *  discriminator is `getEditVersion()` — "does this count as unsaved SCENE work against the
-   *  save baseline" — and a few drops that touch no entity land on the `scene` side because
-   *  their undo action is a plain one:
-   *  - `scene` — the edit bumped the scene-vs-disk baseline. Usually a real scene edit; ALSO an
-   *    Assets **file move**, an OS-file **import** and entity→Assets **prefab-create**, whose
-   *    actions (`panels/assetUndo.ts`) carry no `_isFileDirect` and so count as scene work.
+   *  save baseline" — and an Assets **file move** lands on the `scene` side while touching no
+   *  entity, because its undo action (`panels/assetUndo.ts` `makeFilesDropUndo`) is a plain one
+   *  and that file sets `_isFileDirect` on nothing:
+   *  - `scene` — the edit bumped the scene-vs-disk baseline. Usually a real scene edit; also a
+   *    file move, which is not one.
+   *    (entity→Assets **prefab-create** is NOT an example: `tagEntityTreeAsInstance` writes a
+   *    `PrefabInstance` trait to every node in the subtree, so `scene` is simply correct there.)
    *  - `asset-document` — a skin/particle/atlas/material document, parked in the dirty-asset
    *    registry and flushed by save_all. */
   committedTo?: 'scene' | 'asset-document';
@@ -175,7 +177,7 @@ export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions):
     // (scene edits and `_isFileDirect` asset edits alike); the registry catches a park that
     // pushed nothing.
     committed = after.stack !== before.stack || after.assets !== before.assets;
-    // ⚠️ Three known imprecisions, stated rather than left to be rediscovered. All are "something
+    // ⚠️ FOUR known imprecisions, stated rather than left to be rediscovered. All are "something
     // moved that was not this drop", and all need an event inside the 400 ms window:
     //  1. `getDirtyAssetsVersion` bumps on park AND on flush/discard — a racing `save_all` reads
     //     as a commit.
@@ -184,9 +186,11 @@ export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions):
     //     (the Assets and Hierarchy dragstart handlers do not select).
     //  3. `getUndoVersion` also bumps from `clearHistory`/`truncateUndoTo`/`swapHistory`, so a
     //     scene hot-reload or context switch mid-window reads as a commit.
+    //  4. …and from `undo()`/`redo()` themselves, which call `notifyUndoChanged()`
+    //     unconditionally — so a HUMAN pressing Cmd+Z mid-window reads as a commit. Likelier in
+    //     practice than (3); the list said "three" and stopped, which invited trusting the set.
     // The alternative — diffing the stack's top entry and the registry's contents — buys a
-    // stronger signal than "did this drop do anything" needs. Not the failure this fixes, and the alternative — diffing the registry's
-    // contents — buys a stronger signal than the question deserves.
+    // stronger signal than "did this drop do anything" needs.
     if (committed) committedTo = after.world !== before.world ? 'scene' : 'asset-document';
   }
   // A COVERED endpoint is a warning, never a refusal, and the asymmetry with every other aimed
@@ -241,7 +245,7 @@ export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions):
   // instead of arriving here. The heuristic stays for the cases nothing has closed.
   if (types.length > 0 && accepted && committed === false) {
     warnings.push(
-      'the target accepted the payload TYPE but NEITHER the undo stack NOR the parked-asset registry moved, so the drop probably did nothing. Verify with get_scene_state/history before building on this. TWO legitimate drops also land here: one whose handler is still running after 400ms (a prefab fetch, an OS-file import, a sprite alpha readback), and one that records in neither place (a Project Settings path field, which adopts the file server-side and holds the value in dialog state).',
+      'the target accepted the payload TYPE but NEITHER the undo stack NOR the parked-asset registry moved, so the drop probably did nothing. Verify with get_scene_state/history before building on this. TWO legitimate drops also land here: one whose handler is still running after 400ms (a prefab fetch with nested-prefab preloading, or a Skin sprite drop reading back an alpha mask), and one that records in neither place (a Project Settings path field, which adopts the file server-side and holds the value in dialog state).',
     );
   }
   // `ok` must reflect what ACTUALLY happened, not just "we fired the sequence". An empty
@@ -268,7 +272,8 @@ export async function performDomDnd(params: DomDndParams, opts?: DomDndOptions):
     // true for all of them. The no-edit case: the DnD sequence really was delivered and really
     // was accepted; what we cannot prove is that the handler acted, and some legitimate drops
     // are not undoable edits (the warning text names the two that actually reach it — a file
-    // MOVE is not one of them, it records both counters), so downgrading them to ok:false would
+    // MOVE is not one of them: it pushes a plain undo action, so the STACK moves and it is
+    // reported committed), so downgrading them to ok:false would
     // invent failures across drop targets nobody has enumerated — trading a false success for a
     // false failure. The covered case: the drop genuinely landed, it just landed somewhere a
     // human could not have put it. Say exactly what is known, in both cases.

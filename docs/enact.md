@@ -781,23 +781,34 @@ making it count selection or file-direct actions would make a bare click read as
 defect was the READER, not the guard.
 
 ⚠️ **`committedTo:'scene'` means "bumped the save baseline", NOT "touched a scene entity".** An
-Assets **file move**, an OS-file **import** and entity→Assets **prefab-create** all push a plain
-undo action (`panels/assetUndo.ts` sets `_isFileDirect` on none of them), so they count as scene
-work and are labelled `scene` despite touching no entity. That is the counter being reported
-honestly, not a bug in the label — but do not read `scene` as "an entity changed".
+Assets **file move** pushes a plain undo action (`panels/assetUndo.ts` sets `_isFileDirect` on
+nothing), so it counts as scene work and is labelled `scene` while touching no entity. That is the
+counter being reported honestly, not a bug in the label — but do not read `scene` as "an entity
+changed".
+
+⚠️ **entity→Assets prefab-create is NOT an example of that**, though an earlier version of this
+paragraph said it was: `createPrefabFromEntity` → `tagEntityTreeAsInstance` writes a
+`PrefabInstance` trait to every node in the subtree, so `scene` is simply the correct label. Stated
+because the wrong version would have told an agent its entities were untouched when a trait had
+just been written to each of them.
 
 ⚠️ **What still reaches the no-commit warning**, now that an asset-document drop does not. Both are
 real and neither is a defect in the probe:
 - a handler still running after `COMMIT_SETTLE_MS` (400 ms) — a prefab fetch with nested-prefab
-  preloading, an OS-file import (base64 + convert), a Skin sprite drop's alpha-mask readback;
+  preloading, or a Skin sprite drop's alpha-mask readback. ⚠️ **Not an OS-file import**: it is
+  gated on `dataTransfer.files.length`, and `performDomDnd` builds a bare `new DataTransfer()` that
+  only the page's own `dragstart` handler ever fills via `setData` — a synthetic drop cannot carry
+  a File, so that branch is unreachable from this tool at all;
 - a drop that records in **neither** place — the Project Settings path fields adopt the file
   server-side and keep the value in dialog-local state, so no counter can see it.
 
-⚠️ Three known imprecisions in the other direction, each needing an unrelated event inside the same
+⚠️ Four known imprecisions in the other direction, each needing an unrelated event inside the same
 400 ms window: `getDirtyAssetsVersion()` bumps on park **and** flush/discard (a racing `save_all`);
 `getUndoVersion()` bumps for a `_isSelection` push (latent — no drop target's only effect is a
-selection today); and it bumps from `clearHistory`/`truncateUndoTo`/`swapHistory`, so a scene
-hot-reload mid-window reads as a commit.
+selection today); it bumps from `clearHistory`/`truncateUndoTo`/`swapHistory`, so a scene
+hot-reload mid-window reads as a commit; and it bumps from `undo()`/`redo()` themselves, so a HUMAN
+pressing Cmd+Z mid-window does too — likelier than the third, and the list said "three" until a
+review counted them.
 - [x] Apply the same question to the **device twin** (`device_tap`/`device_drag`/`device_pointer`/
       `device_press_key`/`device_hover`/`device_scroll`/`device_type_text`) — it dispatched SYNTHETIC
       DOM events, never OS-level trusted input, a strictly weaker fidelity position than the editor

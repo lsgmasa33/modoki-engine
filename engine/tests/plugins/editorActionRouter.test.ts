@@ -707,9 +707,14 @@ describe('/api/scene-mutate (play-mode guard)', () => {
       // which stalls an unattended agent on a one-call fix: `stopPlay()` ends a timeline preview
       // SESSION and the `stop` op is unguarded.
       expect(options).toMatch(/modoki_play_control/);
-      // …and the case Stop deliberately does not cover is still named, so the agent is not left
-      // believing one call always works.
-      expect(options).toMatch(/drag-scrub/);
+      // …and it must WARN, because that exit is destructive: it restores the snapshot taken when
+      // the envelope opened, discarding whatever the human authored inside it. An exit handed to
+      // an unattended agent without that caution is a trap, not a fix.
+      expect(options).toMatch(/DESTRUCTIVE/);
+      // The residual case is a session that has not finished seating (the snapshot is async), so
+      // the advice is RETRY — not the pre-Phase-3 "a plain drag-scrub holds no session".
+      expect(options).toMatch(/retry stop/);
+      expect(options, 'the stale pre-Phase-3 caveat must not come back').not.toMatch(/drag-scrub/);
       expect(options).toMatch(/Exit Preview/);
       // …but the agent is still TOLD why, so it does not go looking for the op itself. Warning and
       // instruction are separate fields precisely so the option list stays purely actionable.
@@ -742,6 +747,25 @@ describe('/api/scene-mutate (play-mode guard)', () => {
       expect(r.body.code).toBe('PREVIEW_ENVELOPE');
       expect(applied, 'the live applier must never be reached').not.toContain('apply-scene-ops');
       expect(fs.readFileSync(scenePath, 'utf-8'), 'and nothing was written either').toBe(before);
+    });
+
+    it('gives GENERIC advice when no modeOwner is reported — not the timeline script', async () => {
+      // ⚠️ Review finding. `modeOwner` is omit-when-null, so a renderer in an envelope with no
+      // owner seated (or a future third panel) hits this branch. A previous draft folded the
+      // generic arm into the timeline one, which then told such a caller "Stop also ends a
+      // TIMELINE preview session" and gave it the timeline-only hint — the same "nobody remembers
+      // the next one" failure the mode allowlist exists to prevent, one expression over.
+      const ctx = makeCtx({ requestBrowser: relay({ editorState: { playState: 'stopped', runMode: 'scrub' } }) });
+
+      const r = (await post('/api/scene-mutate', setX(tempScene()), ctx)) as
+        { status?: number; body: { modeOwner?: string; options?: string[]; hint?: string } };
+
+      expect(r.status).toBe(409);
+      expect('modeOwner' in r.body, 'omitted, not null').toBe(false);
+      const options = r.body.options?.join(' ') ?? '';
+      expect(options).toMatch(/Exit Preview/);
+      expect(options, 'no timeline-specific advice for an unknown owner').not.toMatch(/modoki_play_control/);
+      expect(r.body.hint, 'the timeline hint is timeline-only').toBeUndefined();
     });
 
     it('ACCEPT — a genuinely stopped editor still writes', async () => {

@@ -261,7 +261,7 @@ export { buildRig2D, autoRig2D, type BuildRig2DOptions, type AutoRig2DOptions } 
 export { paintWeights, boneWeightField, dominantBoneField, type PaintWeightsOptions, type PaintWeightsResult } from './skinning/rig2dWeightPaint';
 export {
   findEntity, getEntityTraits, readTraitData, readTraitDataFull, writeTraitField,
-  getAllEntities, buildEntityTree, deleteEntity, deleteEntities, deriveLayer,
+  getAllEntities, entityDisplayName, buildEntityTree, deleteEntity, deleteEntities, deriveLayer,
   onStructureDirty, markStructureDirty, getStructureVersion,
   type EntityInfo,
 } from './core/ecs/entityUtils';

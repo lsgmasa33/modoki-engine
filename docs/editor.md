@@ -1298,6 +1298,11 @@ group math is a single pure module, `editor/scene/multiTransform.ts` (headless-u
   explicitly on any undo (`subscribeUndo` → `mark2DDirty` + `editorMarkScene2DDirty`), which covers
   undo entries that are not transform actions. The live drag follows the same rule: every direct
   write in `installScene2DInteraction` calls both `mark2DDirty()` and `fireDirtyListeners()`.
+- **Undo labels name an entity through `entityDisplayName(id)`** (`entityUtils.ts`), which resolves
+  the name exactly as the Hierarchy row does. An unnamed entity falls back to its GUID rather than a
+  runtime id a hot-reload reassigns — the id only when there is no GUID or no live entity. Never read `.name` off a `findEntity` result: the name lives on the
+  `EntityAttributes` trait, and `findEntity` infers `any`, so the read compiles and is always
+  `undefined`. Every gizmo, 2D-drag and UI move/resize label read `Entity <id>` that way (#1138).
 - **Selection state was already array-based** (`selectedEntityIds` + primary `selectedEntityId`) —
   this feature was purely SceneView-viewport wiring; the store, Inspector, Hierarchy, and selection
   undo already supported multi-select.

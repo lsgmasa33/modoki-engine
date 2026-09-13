@@ -18,7 +18,7 @@ import { clearSkeletalSeeks } from '../../runtime/core/skeletalSeek';
 import { getAllTraits } from '../../runtime/core/ecs/traitRegistry';
 import { worldTransforms, deactivatedEntities } from '../../runtime/core/ecs/transformPropagationSystem';
 import { decomposeTrs } from '../../runtime/core/ecs/decomposeTrs';
-import { findEntity, fireDirtyListeners, addDirtyListener, onStructureDirty, getAllEntities, subtreeIds } from '../../runtime/core/ecs/entityUtils';
+import { findEntity, fireDirtyListeners, addDirtyListener, onStructureDirty, getAllEntities, subtreeIds, entityDisplayName } from '../../runtime/core/ecs/entityUtils';
 import { markOverrideIfInstance } from '../undo/entityActions';
 import { Transform, EntityAttributes, Collider2D, Collider3D, clampAngle, Bone2D, Billboard3D, CameraFrame, Zone3D } from '../../runtime/traits';
 import { colliderWireframeGeometry, colliderOutlineSig3D, colliderWorldScale3D, type ColliderOutline3DParams } from '../../runtime/rendering/colliderOutline3D';
@@ -1763,7 +1763,7 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
           const ref = entityRef(m.id);
           for (const k of recFields) { notifyFieldEdited(m.id, 'Transform', k, (after as Record<string, number>)[k]); markOverrideIfInstance(m.id, 'Transform', k); }
           return buildTransformUndoAction({
-            label: `Transform "${me.name || `Entity ${m.id}`}"`,
+            label: `Transform "${entityDisplayName(m.id)}"`,
             trait: Transform, resolve: () => ref.resolve(), findEntity, before: { ...m.local }, after,
             entityGuid: ref.guid || String(m.id),
           });
@@ -1787,7 +1787,7 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
         // the world is rebuilt (Play→Stop). The ref tolerates all three.
         const ref = entityRef(eid);
         pushAction(buildTransformUndoAction({
-          label: `Transform "${entity.name || `Entity ${eid}`}"`,
+          label: `Transform "${entityDisplayName(eid)}"`,
           trait: Transform, resolve: () => ref.resolve(), findEntity, before, after,
           entityGuid: ref.guid || String(eid),
         }));
@@ -3325,7 +3325,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
             markOverrideIfInstance(m.id, 'Transform', k);
           }
           return buildTransformUndoAction({
-            label: `Transform "${e.name || `Entity ${m.id}`}"`,
+            label: `Transform "${entityDisplayName(m.id)}"`,
             trait: Transform, resolve: () => ref.resolve(), findEntity, before: m.before, after,
             entityGuid: ref.guid || String(m.id),
           });
@@ -3348,7 +3348,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // handle/raw id goes stale on delete/restore or a world rebuild (Play→Stop).
       const ref = entityRef(eid);
       pushAction(buildTransformUndoAction({
-        label: `Transform "${entity.name || `Entity ${eid}`}"`,
+        label: `Transform "${entityDisplayName(eid)}"`,
         trait: Transform, resolve: () => ref.resolve(), findEntity, before, after,
         entityGuid: ref.guid || String(eid),
       }));

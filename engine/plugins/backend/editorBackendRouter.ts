@@ -2604,9 +2604,13 @@ async function describeUnresolvedAgainstLiveWorld(
       // human's preview session. There is nothing here to disclose an edit INTO.
       // ⚠️ ALLOWLIST, not a denylist, because `canEdit()` is one (`runMode === 'stopped'`). Listing
       // the two bad modes would silently PERMIT a fifth `RunMode` that save already refuses, and
-      // the next mode is exactly the thing nobody remembers to add here. `'playing'` is excluded
-      // because the Play/paused 409 above already owns it and says something more specific; a
-      // renderer reporting NO runMode still falls through to the write (see the note above).
+      // the next mode is exactly the thing nobody remembers to add here. A renderer reporting NO
+      // runMode still falls through to the write (see the note above).
+      // ⚠️ The `'playing'` arm is SKEW DEFENCE, not load-bearing, and nothing tests it: with a
+      // real renderer `derivePlayState()` maps `_mode === 'playing'` to `'playing'`/`'paused'`,
+      // both of which the Play 409 above already returned. It only fires for a renderer that
+      // reports `runMode` and `playState` inconsistently. Kept so this gate reads as an
+      // allowlist on its own terms rather than depending on a check twenty lines up.
       if (st?.runMode && st.runMode !== 'stopped' && st.runMode !== 'playing') {
         const owner = st.modeOwner;
         return json({
@@ -2627,24 +2631,38 @@ async function describeUnresolvedAgainstLiveWorld(
           // op goes in `hint` instead: an entry that names a tool in order to warn against it is
           // still an entry with a tool name in it, and an agent scanning the list for something to
           // call will call it.
+          // ⚠️ THREE arms, and the generic one is not padding. A previous draft collapsed it into
+          // the timeline arm, which then answered "Stop also ends a TIMELINE preview" to a
+          // renderer reporting no `modeOwner` at all (the field is omit-when-null) or a future
+          // third panel — the same "nobody remembers the next one" failure the mode allowlist
+          // above exists to prevent, one expression over.
           options: owner === 'animation'
             ? [
               'modoki_exit_pose_envelope — closes the ANIMATION preview, restores the authored world and returns the run-mode to stopped; then retry this call',
             ]
-            : [
-              // ⚠️ A timeline envelope DOES have an agent exit, and an earlier draft of this
-              // refusal denied it — sending the agent to find a human over a one-call fix.
-              // `stopPlay()` ends a scrub/preview that HOLDS a preview session (its own comment:
-              // "Toolbar Stop also EXITS a Timeline ▶ preview"), clears the owner and returns the
-              // mode to stopped; the `stop` agent op is unguarded.
-              "modoki_play_control {action:'stop'} — Stop also ends a Timeline preview SESSION: it reverts the snapshot and returns the run-mode to stopped. Then retry this call",
-              // …but NOT unconditionally, and the gap is deliberate upstream rather than a bug:
-              // a plain drag-scrub holds no session yet, and `stopPlay` leaves it alone on purpose
-              // so a save stays refused rather than exposing an un-reverted pose.
-              'if the run-mode is STILL not stopped afterwards, this is a plain drag-scrub holding no preview session — Stop deliberately leaves that one alone, so ask the human to press ⏹ Exit Preview',
-            ],
+            : owner === 'timeline'
+              ? [
+                // ⚠️ A timeline envelope DOES have an agent exit, and an earlier draft denied it,
+                // sending the agent to find a human over a one-call fix. `stopPlay()` ends a
+                // scrub/preview holding a preview session; the `stop` agent op is unguarded.
+                // ⚠️ …but it is DESTRUCTIVE, and saying so is the difference between an exit and a
+                // trap: it runs `endTimelinePreviewSession({restore:true})`, a full scene reload
+                // from the snapshot taken when the envelope opened, so anything the human did
+                // inside it is discarded. The old text asked the HUMAN to press ⏹; handing an
+                // unattended agent the same button without the caution is not an improvement.
+                "modoki_play_control {action:'stop'} — ends the Timeline preview session and returns the run-mode to stopped, then retry. ⚠️ DESTRUCTIVE: it restores the snapshot taken when the envelope opened, discarding anything the human authored inside it. Prefer asking them if they are at the screen",
+                // ⚠️ NOT "a plain drag-scrub holds no session" — that was true before Phase 3 and
+                // is copied from a `stopPlay` comment that is now stale. Every `enterScrubMode`
+                // call site pairs with `beginTimelinePreviewSession()`, so the only no-session
+                // window left is the async gap before `serializeScene()` resolves — and the right
+                // advice there is to retry, not to go looking for a human.
+                'if the run-mode is STILL not stopped, the session had not finished seating yet (the snapshot is async) — retry stop once before escalating to the human’s ⏹ Exit Preview',
+              ]
+              : [
+                'exit the scrub/preview envelope — ⏹ Exit Preview in whichever panel is driving it — then retry',
+              ],
           ...(owner === 'timeline'
-            ? { hint: 'Do not reach for modoki_exit_pose_envelope here — it deliberately refuses a timeline-owned envelope, because ending that session would revert its world mid-run. Use modoki_play_control stop instead.' }
+            ? { hint: 'Do not reach for modoki_exit_pose_envelope here — it deliberately refuses a timeline-owned envelope, because ending that session would revert its world mid-run. Use modoki_play_control stop instead, minding the caution above.' }
             : {}),
         }, 409);
       }

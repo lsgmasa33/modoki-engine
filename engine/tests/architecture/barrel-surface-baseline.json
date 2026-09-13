@@ -367,6 +367,7 @@
   "ensureManifestLoaded",
   "ensureRiggedModelLoaded",
   "ensureRiggedModelLoadedFor",
+  "entityDisplayName",
   "entityRef",
   "entriesSystem",
   "entryIndexOf",

@@ -2,7 +2,7 @@
  *  Renders as DOM overlay (not Canvas) since UI entities are already DOM elements. */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { findEntity } from '../../runtime/core/ecs/entityUtils';
+import { findEntity, entityDisplayName } from '../../runtime/core/ecs/entityUtils';
 import { getAllTraits } from '../../runtime/core/ecs/traitRegistry';
 import { markUIDirty, onEditorDirty, useUITreeStore } from '../../runtime/ui/uiTreeStore';
 import { pushAction } from '../undo/undoManager';
@@ -522,8 +522,7 @@ export function UIResizeOverlay({ entityId }: { entityId: number }) {
       if (currentAnchor) {
         const before = { top: startAnchor.top, left: startAnchor.left, right: startAnchor.right, bottom: startAnchor.bottom };
         const after = { top: currentAnchor.top, left: currentAnchor.left, right: currentAnchor.right, bottom: currentAnchor.bottom };
-        const entity = findEntity(entityId);
-        const name = entity?.name || `Entity ${entityId}`;
+        const name = entityDisplayName(entityId);
         const ref = entityRef(entityId);
         pushAction({
           label: `Move UI "${name}"`,
@@ -544,8 +543,7 @@ export function UIResizeOverlay({ entityId }: { entityId: number }) {
       if (current) {
         const before = { ...startValues };
         const after = { ...current };
-        const entity = findEntity(entityId);
-        const name = entity?.name || `Entity ${entityId}`;
+        const name = entityDisplayName(entityId);
         const ref = entityRef(entityId);
         pushAction({
           label: `Resize UI "${name}"`,
