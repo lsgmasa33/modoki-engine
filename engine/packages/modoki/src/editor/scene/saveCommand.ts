@@ -22,7 +22,7 @@ import { type MetaFlushResult } from './pendingMeta';
 import { isEditingPrefab, savePrefabEdit } from './prefabEdit';
 import { getRunMode, canEdit, type RunMode } from '../../runtime/core/playState';
 import {
-  hasTimelinePreviewSession, getPreviewSaveHandler, previewHasAuthoredEdits,
+  hasTimelinePreviewSession, getPreviewSaveHandler, previewHasAuthoredEdits, whenPreviewRestoresLanded,
   resumeHandlerFor,
 } from './timelinePreview';
 import { getModeOwner } from './playMode';
@@ -113,6 +113,10 @@ export function runSaveAll(): Promise<SaveOutcome> {
 }
 
 async function runSaveAllOnce(): Promise<SaveOutcome> {
+  // A preview restore still landing: ⏹ Exit has already cleared the session and set 'stopped', so
+  // every check below would pass while the world is still POSED, and the scene write would bake the
+  // pose (#1167 review). Wait for the swap rather than refuse — the save is then of the authored world.
+  await whenPreviewRestoresLanded();
   // ── Inside a preview envelope: put it down, save, pick it back up ──
   // A scene/prefab write must contain AUTHORED data, and the envelope's whole point is that the
   // live world is posed. Refusing was the old answer and it cost two keystrokes every time; simply

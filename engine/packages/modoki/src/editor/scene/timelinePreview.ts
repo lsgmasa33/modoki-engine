@@ -29,6 +29,7 @@ import { serializeScene, getCurrentScenePath, type SceneFile } from './serialize
 import { beginWorldReplacement } from './authoringSettle';
 import { getEditVersion, setPreviewUndoSession, clearPreviewUndoSession, whenUndoIdle, beginPreviewRestore, finishPreviewRestore } from '../undo/undoManager';
 import { createTeardownToken } from '../../runtime/core/liveness';
+import { notifyListeners } from '../../runtime/core/notifyListeners';
 
 /** Authored-world snapshot captured at the first ▶ of a preview session, plus the scene path it
  *  belongs to (so a scene swap mid-preview can't revert the wrong scene). */
@@ -43,6 +44,20 @@ let _snapEditVersion = 0;
 let _undoSessionSeq = 0;
 /** In-flight `begin`, so concurrent openers share ONE snapshot — see beginTimelinePreviewSession. */
 let _pending: Promise<void> | null = null;
+/** Whether `_pending` can still seat its snapshot. An Exit invalidates a begin that is still
+ *  serializing, and that dead begin keeps `_pending` set until its serialize settles — a begin made
+ *  AFTER the Exit must not join it, or it resolves `false` for an envelope nobody closed. */
+let _pendingLive: () => boolean = () => false;
+/** Session restores whose world swap has not finished. A count, not a flag: a second end during the
+ *  first one's restore takes the early return and never restores, but nothing here should rely on
+ *  that to keep the refusal honest. While non-zero, `beginTimelinePreviewSession` refuses (#1167). */
+let _restoresInFlight = 0;
+/** Resolvers for `whenPreviewRestoresLanded`, flushed when `_restoresInFlight` returns to zero. */
+let _restoreWaiters: (() => void)[] = [];
+/** Liveness of preview GESTURES that reopen a session after their own restore — the Timeline's
+ *  grab-while-playing chain (`reopenPreviewAfterRestore`). Module-level rather than panel-owned so
+ *  toolbar Stop (`playMode.stopPlay`), which cannot reach the panel, can cancel one too. */
+const gestureLiveness = createTeardownToken();
 /** Invalidated by every session END, so a `begin` that was already awaiting cannot seat its
  *  snapshot after the envelope it belonged to was exited. */
 const beginLiveness = createTeardownToken();
@@ -201,6 +216,33 @@ export function previewHasAuthoredEdits(): boolean {
   return _snap !== null && getEditVersion() !== _snapEditVersion;
 }
 
+/** Is a session restore still landing? True from the moment an end commits to restoring (before it
+ *  awaits `whenUndoIdle`, so before `sceneManager` shows a pending load) until its swap is done. Any
+ *  other snapshot taker must treat this as a world swap in progress (#1167) — see
+ *  `playMode.aSceneSwapIsHappening`. */
+export function isPreviewRestoreInFlight(): boolean {
+  return _restoresInFlight > 0;
+}
+
+/** Resolves once no session restore is landing (immediately when none is). For an AUTHORED writer
+ *  that must not run in that window: Exit has already cleared the session and set 'stopped', so a
+ *  Cmd+S there passed every envelope check and serialized the still-POSED world (#1167 review). */
+export function whenPreviewRestoresLanded(): Promise<void> {
+  if (_restoresInFlight === 0) return Promise.resolve();
+  return new Promise<void>((resolve) => { _restoreWaiters.push(resolve); });
+}
+
+/** Capture a gesture's liveness; the returned check turns false at the next `cancelPreviewGestures`. */
+export function capturePreviewGesture(): () => boolean {
+  return gestureLiveness.capture();
+}
+
+/** Cancel every in-flight preview gesture — called by ⏹ Exit, an asset switch, the Timeline panel's
+ *  unmount, and toolbar Stop, so a chain still waiting on its restore does not reopen over them. */
+export function cancelPreviewGestures(): void {
+  gestureLiveness.invalidateAll();
+}
+
 /** Is a preview session currently held (snapshot pending restore)? */
 export function hasTimelinePreviewSession(): boolean {
   return _snap !== null;
@@ -213,10 +255,23 @@ export function hasTimelinePreviewSession(): boolean {
  *  once per pointermove, and `serializeScene()` is async — so two moves before the first snapshot
  *  resolves both saw `_snap === null` and the second one serialized an ALREADY-POSED world and
  *  overwrote the authored snapshot with it, silently making Exit revert to the pose. Concurrent
- *  callers now await the same promise, and the resolver only seats a snapshot if none landed. */
-export async function beginTimelinePreviewSession(): Promise<void> {
-  if (_snap) return;
-  if (_pending) return _pending;
+ *  callers now await the same promise, and the resolver only seats a snapshot if none landed.
+ *
+ *  **Resolves `true` only when a session is held**, and every caller must honour `false` by posing
+ *  nothing and handing back the run mode it claimed. `false` means one of:
+ *   - **a restore is in progress** (#1167, owner-settled: refuse, not wait). The ending session has
+ *     already cleared `_snap`, so a begin here would serialize the still-POSED world as the new
+ *     "authored" snapshot, and the next Exit would restore a pose. Waiting instead was declined: the
+ *     pose that follows would aim at entity ids resolved before the swap. The same window already
+ *     refuses every undo/redo (`beginPreviewRestore`, #1148); a drag simply poses again on its next
+ *     move once the restore has landed.
+ *   - **an end intervened** while the snapshot was serializing (see `endTimelinePreviewSession`).
+ *  A pose after `false` is unrevertible and unguarded, since the run mode is (or is about to be)
+ *  back at 'stopped'. A thrown `serializeScene` still rejects. */
+export async function beginTimelinePreviewSession(): Promise<boolean> {
+  if (_snap) return true;
+  if (_pending && _pendingLive()) { await _pending; return _snap !== null; }
+  if (_restoresInFlight > 0) return false;
   const stillLive = beginLiveness.capture();
   // ⚠️ Sample the edit-version BEFORE the await, not after. `serializeScene()` is async, and an
   // authored edit landing during it may or may not be in `snap` — but folding its bump into the
@@ -230,18 +285,22 @@ export async function beginTimelinePreviewSession(): Promise<void> {
   // restore can only cost an undo, where keeping a stale one writes a posed value on undo.
   const session = ++_undoSessionSeq;
   setPreviewUndoSession(session);
-  _pending = (async () => {
+  const mine: Promise<void> = (async () => {
     const snap = await serializeScene();
     const path = getCurrentScenePath();
     // Only seat it if no session end intervened (see endTimelinePreviewSession).
     if (!_snap && stillLive()) { _snap = snap; _snapPath = path; _snapEditVersion = version; }
   })().finally(() => {
-    _pending = null;
+    // Only its OWN slot: a begin made after an Exit cancelled this one may already hold `_pending`.
+    if (_pending === mine) _pending = null;
     // No snapshot seated (serialize threw, or an end intervened): there is no session for the mark to
     // belong to, and nothing will ever restore — so edits from here on are authored.
     if (!_snap) clearPreviewUndoSession(session);
   });
-  return _pending;
+  _pending = mine;
+  _pendingLive = stillLive;
+  await mine;
+  return _snap !== null;
 }
 
 /** End the session. Clears the active flag + any skeletal seeks. When `restore`, revert the world
@@ -290,6 +349,8 @@ async function endSessionHoldingReplacement(opts: { restore: boolean; rebind?: (
   // away, so it must be marked and dropped like the rest, and no undo step may start against a world
   // that is about to be replaced — see `beginPreviewRestore`.
   beginPreviewRestore(session);
+  // Taken in the same synchronous run as `_snap = null` above, so no begin can observe the gap (#1167).
+  _restoresInFlight++;
   let reverted = false;
   try {
     // Let an undo/redo that was ALREADY running finish against the posed world — see `whenUndoIdle`.
@@ -300,6 +361,13 @@ async function endSessionHoldingReplacement(opts: { restore: boolean; rebind?: (
     await sceneManager.loadScene(path ?? '', { preloaded: snap as unknown as SceneData });
     reverted = true;
   } finally {
+    // Released first: a throw from the drop must not leave every later begin refused for good.
+    _restoresInFlight--;
+    if (_restoresInFlight === 0 && _restoreWaiters.length) {
+      const waiters = _restoreWaiters;
+      _restoreWaiters = [];
+      notifyListeners(waiters, 'timelinePreview:restoresLanded', []);
+    }
     // The restore discarded every scene edit made during this session; their undo entries go with
     // them, or an undo after Exit writes a posed value into the authored scene (#1148).
     finishPreviewRestore(session, { drop: reverted });

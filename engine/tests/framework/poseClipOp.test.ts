@@ -154,6 +154,27 @@ describe('the envelope is closable from the agent surface', () => {
     void err;
   });
 
+  it('a session that does NOT open (a restore still landing, #1167) poses nothing, hands the mode back, and says so', async () => {
+    // `beginTimelinePreviewSession` resolves false while an Exit's restore is in flight. Posing after
+    // that is unrevertible, and reporting it as "applied 0 channels" would send the caller to check
+    // their track paths for a problem that is really "try again in a moment".
+    useEditorStore.setState({ editingAnimationClip: CLIP, animatorRootEntityId: 999999 } as never);
+    const spy = vi.spyOn(preview, 'beginTimelinePreviewSession').mockResolvedValue(false);
+    const direct = await poseClipAtTime(CLIP as never, 999999, 0.5);
+    // MUTATION TARGET: pose regardless of `opened` in poseClipAtTime and `refused` is absent.
+    expect(direct.refused).toBe(true);
+    expect(direct.openedSession).toBe(false);
+    // MUTATION TARGET: drop that branch's `exitPreviewMode(owner)` and this stays 'scrub' with no session.
+    expect(getRunMode(), 'the run-mode must be handed back on a refused begin').toBe('stopped');
+
+    const r = await pose({ t: 0.5 });
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('REFUSED_BY_OP');
+    expect(String(r.error)).toMatch(/preview is closing/);
+    expect(getRunMode()).toBe('stopped');
+    spy.mockRestore();
+  });
+
   it('exit with nothing open refuses rather than reporting a cheerful no-op', async () => {
     const r = await exitEnv();
     expect(r.ok).toBe(false);

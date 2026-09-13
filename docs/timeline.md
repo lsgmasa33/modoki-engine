@@ -250,8 +250,8 @@ The details that are load-bearing:
   seek as the scene opens. `started` is false in each of those, so they fire.
 - **The record keeps `started` too, to recognise `restart`.** A `started` that went false behind the
   system's back is a new playthrough, whose end has not fired, even when `restart` is combined with a
-  seek onto the end. `started` alone cannot answer it: `driveSubdirector` writes `started: false` onto a
-  child the frame it ends, so an un-slaved child at its end would read as re-armed and end twice.
+  seek onto the end. The record's `endFired` is still set at that point, so only the TRANSITION from
+  `started` to not-started tells a restart apart from the same playthrough.
 - **`t` defaults to the playhead itself: first sight is not a write**, so a dormant cutscene authored
   paused (in range) is not posed when its scene opens.
 - **The record is created the first frame the query meets a Director, however that frame is skipped**
@@ -263,6 +263,15 @@ The details that are load-bearing:
 - **A slaved child is recorded by `driveSubdirector`, after the parent's read-back**, with `endFired`
   set when the child sits at its own duration. Without that, muting the subdirector track on the frame
   after the child ended fired the child's end a second time.
+- **The read-back writes the `started` an ended STANDALONE Director would hold** (#1158). Nothing reads
+  a slaved child's `started` (its start edge is the parent's crossing into the clip), so the value
+  matters only once the child is un-slaved and runs on its own clock. A child at its own duration after
+  its end is `started`, like any ended Director. It used to be written `started: false` there, a state
+  no standalone Director can be in: a playing child then re-fired its start with no end, a `restart`
+  changed nothing the record could see, and a Stop→Play fired its end again.
+  A clip that **truncates** the child ends it below its duration, which cannot be represented as ended,
+  so that child stays not-started, and un-slaving it plays the remaining tail as one balanced start and
+  end.
 - **A non-finite playhead is wrapped to a finite one** (`+Infinity` → the end when clamping, else 0).
   NaN never equals itself, so it would otherwise read as a fresh write, and re-pose, every frame.
 
@@ -278,10 +287,6 @@ Consequences to know about:
 - **A seek onto the end of a STARTED Director made before the system first met it** (on the very
   frame a scene load carries it in) is taken as an end that already fired, for the same reason a
   carried, ended Director must be. A seek made on any later frame, skipped or not, is seen.
-- **A sub-director un-slaved while sitting at its end** is not fully covered: `driveSubdirector` leaves
-  it at `started: false`, so a `restart` on it does not re-arm the end, a playing one re-fires its
-  start without an end, and losing its record (Stop→Play) fires its end a second time. All three
-  predate #1113; tracked in #1158.
 - **Repointing a playing Director at a shorter timeline it is already past ends that timeline once**:
   the playhead is wrapped onto the new end, whose end has not fired. Before #1113 it sat there with no
   end at all.

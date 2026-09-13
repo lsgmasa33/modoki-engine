@@ -22,7 +22,7 @@ import { serializeScene, getCurrentScenePath, sceneLoadGeneration, isSceneLoadIn
 import { beginWorldReplacement } from './authoringSettle';
 import { undoDepth, truncateUndoTo } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
-import { hasTimelinePreviewSession, endTimelinePreviewSession } from './timelinePreview';
+import { hasTimelinePreviewSession, endTimelinePreviewSession, isPreviewRestoreInFlight, cancelPreviewGestures, whenPreviewRestoresLanded } from './timelinePreview';
 import { setVerboseCapture, isVerboseCaptureActive } from '../../runtime/core/journal';
 import { fetchAiSettings, getCachedAiSettings } from '../panels/aiSettingsModel';
 import { findEntityByGuid } from '../../runtime/core/ecs/world';
@@ -122,9 +122,15 @@ function currentSceneKey(): string | null {
  *  call `sceneManager.loadScene` directly and move neither the epoch nor the in-flight count
  *  (see the SCOPE note on `isSceneLoadInFlight`). Exported for the Hierarchy's collapse restore,
  *  which must not key a restore to the editor's scene path until the winning load's tail has
- *  written it. */
+ *  written it.
+ *
+ *  ⚠️ A THIRD signal, for the same reason: a preview session's restore (`endTimelinePreviewSession`)
+ *  also calls `sceneManager.loadScene` directly, and it first awaits `whenUndoIdle()`, so for that
+ *  wait `getNext()` is still null while the world about to be discarded is still POSED. Play pressed
+ *  then snapshotted the pose and Stop put it back as the authored world (#1167's mechanism, from the
+ *  Play side). */
 export function aSceneSwapIsHappening(): boolean {
-  return isSceneLoadInFlight() || sceneManager.getNext() !== null;
+  return isSceneLoadInFlight() || sceneManager.getNext() !== null || isPreviewRestoreInFlight();
 }
 
 export async function enterPlay(): Promise<void> {
@@ -265,6 +271,22 @@ export async function stopPlay(): Promise<void> {
   // session), so we intentionally DON'T clear it here — leaving it wedged keeps saves refused
   // (leak-proof) rather than exposing the un-reverted pose to a save.
   const rm = getRunMode();
+  if (rm === 'scrub' || rm === 'preview') {
+    // A grab-while-playing chain still waiting on its restore holds the mode with NO session. Cancel
+    // it so it does not reopen over this Stop, let the restore land, and return to stopped (#1167
+    // review) — otherwise this Stop fell through to the no-op below and the chain re-posed anyway.
+    cancelPreviewGestures();
+    // ⚠️ Not while Play is starting up: `enterPlay`'s own preview restore produces this same state
+    // (mode still scrub/preview, session cleared, restore in flight), and that Stop must reach the
+    // #470 queue below, or Play starts anyway.
+    if (!_entering && !hasTimelinePreviewSession() && isPreviewRestoreInFlight()) {
+      await whenPreviewRestoresLanded();
+      _modeOwner = null;
+      setRunMode('stopped');
+      editorEmit('!stop', { fromPreview: rm });
+      return;
+    }
+  }
   if ((rm === 'scrub' || rm === 'preview') && hasTimelinePreviewSession()) {
     await endTimelinePreviewSession({ restore: true });
     _modeOwner = null;

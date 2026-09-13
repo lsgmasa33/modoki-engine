@@ -1560,6 +1560,42 @@ before anyone noticed the session, because every one of them reasoned about the 
 `closeTimelineEditor`/`closeAnimationEditor` are the same shape again: ownership decisions wearing a
 store action's clothes.
 
+**A pose opens a session, or it poses nothing (#1167).** `beginTimelinePreviewSession()` resolves
+`true` only when a session is held, and every caller acts on `false` by posing nothing, starting no
+▶ loop, and handing back the run mode it claimed. It resolves `false` in two cases:
+
+- **A restore is still landing.** The ending session has already cleared its snapshot, so a begin
+  there would serialize the still-posed world as the new "authored" snapshot, and the next Exit
+  would restore a pose. The owner chose **refuse** over **wait** (2026-09-13). Waiting would have
+  kept a drag's last position, but the pose that followed would aim at entity ids resolved before
+  the swap. Refusing matches #1148, which already refuses every undo/redo for the same window. A
+  scrub drag poses again on its next move once the restore has landed. One chain has its own
+  restore: grabbing the playhead while ▶ plays reverts the forward run and then reopens a scrub
+  session. That chain goes through `reopenPreviewAfterRestore`, which re-claims scrub, because a drag
+  move refused during its restore handed the mode back and the reopen then posed under `stopped`. It
+  poses at the latest playhead, and it reopens only while the gesture is live: ⏹ Exit, an asset
+  switch, unmount and toolbar Stop cancel it (`cancelPreviewGestures`). An Exit during that restore
+  used to be silently undone by the reopen.
+- **The restore window reaches the other authored writers too.** Exit clears the session and sets
+  `stopped` before the swap lands, so anything that only checks those would act on the posed world.
+  Cmd+S waits for the restore (`whenPreviewRestoresLanded`) instead of writing the pose, and Play
+  treats a landing restore as a world swap (`aSceneSwapIsHappening`). A Stop pressed during that
+  window waits for the restore and then returns to stopped. The exception is a Stop pressed while
+  Play is starting up: it still goes to #470's queue, because Play's own preview restore produces
+  the same state.
+- **An Exit intervened** while the snapshot was serializing. A begin made after that Exit does not
+  join the cancelled begin still serializing. It opens its own session, and the cancelled caller then
+  also reads `true` ("a session is held"), because `false` would hand back the same owner's mode over
+  the later claim.
+
+Callers used to pose unconditionally after the begin. The one pose that asserts a session
+(`applyPose`/`applyPoseAtTime`) only logged, while `poseAt` and the Timeline ▶ loop posed and fired
+signals with nothing to revert. A thrown snapshot was an unhandled rejection with the mode pinned at
+`scrub`. The Timeline's pose sites now go through `openPreviewSessionThen(owner, pose)`
+(`editor/scene/openPreviewSession.ts`, unit-tested), and `poseClipAtTime` reports `refused`, which
+the `pose-clip` agent op turns into a `REFUSED_BY_OP` "the preview is closing" instead of "applied 0
+channels". Both ▶ loops start only after the session is held.
+
 **Test it by the OWNER, not by the playhead.** With a timeline doc loaded the Timeline's own loop
 advances `playheadTime` too, so "the playhead moved" passes under both the correct and the broken
 behaviour — the vacuum this change's first test fell into. `previewModeOwner()` on the editor test
@@ -3054,9 +3090,9 @@ duplicating its guid. Asset and selection entries stay.
 - The mark stays on **until after the drop**, and a second end during the restore does not clear it.
   An edit pushed while `loadScene` is awaiting lands in the world the swap discards, so it has to be
   dropped too.
-  One exception is still open, #1167. A *pose* during the restore can begin a new session over the
-  still-posed world. That new session's mark then replaces the first one's for the rest of that
-  restore. Overlapping restores each drop their own session, because the restoring set holds both.
+  A *pose* during the restore used to begin a new session over the still-posed world, and its mark
+  then replaced the first one's. That begin is now refused (#1167; see § Play / Stop / Pause, "A pose opens a session, or it poses nothing"), so nothing seats a
+  second session mid-restore. The restoring set still holds more than one session, as a backstop.
 - A coalescing chain never crosses the session boundary.
 
 The marks are keyed to the SESSION, not the run mode, for two reasons. The Timeline ▶ begins its

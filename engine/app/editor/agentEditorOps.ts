@@ -2508,7 +2508,16 @@ export function registerEditorAgentOps(): void {
     // Await it: the session begin serializes the authored world, so a first pose lands a tick
     // later. Replying before that would report a pose the caller's next read cannot see — and the
     // natural next call after posing is exactly such a read.
-    const { applied, openedSession } = await poseClipAtTime(clip, rootId, clamped, 'animation');
+    const { applied, openedSession, refused } = await poseClipAtTime(clip, rootId, clamped, 'animation');
+    if (refused) {
+      return {
+        ok: false, code: 'REFUSED_BY_OP', playhead: clamped, boundClip: clip.name ?? null,
+        ...(clamped !== t ? { clampedFrom: t, duration } : {}),
+        error: 'the preview is closing — the scene was being restored (or the envelope was exited) when '
+          + 'this pose tried to open its session, so nothing was posed.',
+        options: ['pose again once the restore has landed (it takes one scene reload)'],
+      };
+    }
     if (applied === 0) {
       // The pose ran and moved NOTHING. §5: a no-op is a failure when the caller asked for a
       // change. Reporting ok here would be the false success the whole envelope exists to avoid —

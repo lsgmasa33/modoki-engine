@@ -21,14 +21,18 @@ const h = vi.hoisted(() => ({
   failSerialize: false,
   loadGate: null as Promise<void> | null,
   loadGates: [] as Promise<void>[],
+  serializeGate: null as Promise<void> | null,
 }));
 
 vi.mock('../../src/editor/scene/serialize', () => ({
   serializeScene: async () => {
+    if (h.serializeGate) await h.serializeGate;
     if (h.failSerialize) throw new Error('serialize failed');
     const s = { snap: h.snapshots.length }; h.snapshots.push(s); return s;
   },
   getCurrentScenePath: () => h.scenePath,
+  sceneLoadGeneration: () => 0,
+  isSceneLoadInFlight: () => false,
 }));
 vi.mock('../../src/runtime/scene/SceneManager', () => ({
   sceneManager: {
@@ -38,6 +42,9 @@ vi.mock('../../src/runtime/scene/SceneManager', () => ({
       const gate = h.loadGates.shift();
       if (gate) await gate;
     },
+    getNext: () => null,
+    getLoadedScenes: () => new Map(),
+    getCurrent: () => ({ path: h.scenePath }),
   },
 }));
 // NOTE: no openAssetInEditor mock — the controller no longer resolves a root itself; each panel
@@ -55,6 +62,12 @@ import {
 } from '../../src/editor/undo/undoManager';
 import { setRunMode } from '../../src/runtime/core/playState';
 import { onAuthoringSettled } from '../../src/editor/scene/authoringSettle';
+import { openPreviewSessionThen, reopenPreviewAfterRestore } from '../../src/editor/scene/openPreviewSession';
+import { capturePreviewGesture, whenPreviewRestoresLanded } from '../../src/editor/scene/timelinePreview';
+import { createTeardownToken } from '../../src/runtime/core/liveness';
+import { enterScrubMode, exitPreviewMode, aSceneSwapIsHappening, stopPlay, enterPlay } from '../../src/editor/scene/playMode';
+import { getPlayState } from '../../src/runtime/core/playState';
+import { getRunMode } from '../../src/runtime/core/playState';
 
 afterEach(async () => {
   // End any dangling session so the module-level snapshot doesn't leak to the next test.
@@ -63,7 +76,8 @@ afterEach(async () => {
   clearSkeletalSeeks();
   clearControlSpawns();
   h.scenePath = 'A.json'; h.snapshots = []; h.loadCalls = []; h.resolvedRoot = 42;
-  h.failSerialize = false; h.loadGate = null; h.loadGates = [];
+  h.failSerialize = false; h.loadGate = null; h.loadGates = []; h.serializeGate = null;
+  setRunMode('stopped');
 });
 
 describe('timeline preview session controller', () => {
@@ -256,23 +270,21 @@ describe('timeline preview session controller', () => {
       expect(canUndo()).toBe(false);
     });
 
-    it('OVERLAPPING restores each drop their own session — a pose-seated second session does not erase the first\'s', async () => {
-      // #1167's path: Exit 1 is inside loadScene, a pose seats session 2, Exit 2 restores it.
+    it('a begin DURING a restore opens nothing, so the restore drops only its own session\'s edits (#1167)', async () => {
+      // This used to seat a second session over the still-posed world (the overlapping-restores
+      // shape `_restoringSessions` still tolerates). The begin is refused now, so the edit pushed
+      // after it is still marked with the RESTORING session and goes with that restore's drop.
       clearHistory();
       await beginTimelinePreviewSession();
       setRunMode('scrub');
-      let open1!: () => void; let open2!: () => void;
-      h.loadGates = [new Promise<void>((r) => { open1 = r; }), new Promise<void>((r) => { open2 = r; })];
-      const end1 = endTimelinePreviewSession({ restore: true });
-      await flush();                                     // end 1 inside loadScene
-      pushAction(scene('posed in S1'));
-      await beginTimelinePreviewSession();               // a pose seats session 2 over it
-      pushAction(scene('posed in S2'));
-      const end2 = endTimelinePreviewSession({ restore: true });
-      await flush();                                     // end 2 inside loadScene too
-      open1(); await end1;
-      expect(undoLabel()).toBe('posed in S2');           // S1's entry dropped by end 1 — not stranded
-      open2(); await end2;
+      let open!: () => void;
+      h.loadGate = new Promise<void>((r) => { open = r; });
+      const ending = endTimelinePreviewSession({ restore: true });
+      await flush();                                       // inside loadScene
+      pushAction(scene('posed during restore'));
+      expect(await beginTimelinePreviewSession()).toBe(false);
+      pushAction(scene('posed after the refused begin'));
+      open(); await ending;
       setRunMode('stopped');
       expect(canUndo()).toBe(false);
     });
@@ -395,5 +407,236 @@ describe('ending a session holds the world-replacement token until the restore l
     } finally {
       unsubscribe();
     }
+  });
+});
+
+/** #1167 — a begin while a session's restore is landing must not snapshot the still-posed world. */
+describe('a begin during a restore is refused (#1167)', () => {
+  const holdRestore = async () => {
+    await beginTimelinePreviewSession();
+    let open!: () => void;
+    h.loadGate = new Promise<void>((r) => { open = r; });
+    const ending = endTimelinePreviewSession({ restore: true });
+    await new Promise((r) => setTimeout(r, 0));             // inside loadScene: _snap is already null
+    expect(h.loadCalls).toHaveLength(1);
+    return { open, ending };
+  };
+
+  it('resolves false, serializes nothing and seats nothing — the next Exit has no pose to restore', async () => {
+    const { open, ending } = await holdRestore();
+    // MUTATION TARGET: drop the `_restoresInFlight > 0` refusal and this is true, with a SECOND
+    // snapshot taken of the posed world the swap is about to throw away.
+    expect(await beginTimelinePreviewSession()).toBe(false);
+    expect(h.snapshots).toHaveLength(1);
+    expect(hasTimelinePreviewSession()).toBe(false);
+    open(); await ending;
+    expect(hasTimelinePreviewSession()).toBe(false);
+    await endTimelinePreviewSession({ restore: true });
+    expect(h.loadCalls, 'a later Exit restores nothing — no session was seated over the pose').toHaveLength(1);
+  });
+
+  it('ACCEPT SIDE: once the restore lands, a begin opens normally from the restored world', async () => {
+    const { open, ending } = await holdRestore();
+    open(); await ending;
+    // MUTATION TARGET: never release the count and this is false for the rest of the editor's life.
+    expect(await beginTimelinePreviewSession()).toBe(true);
+    expect(h.snapshots).toHaveLength(2);
+  });
+
+  it('ACCEPT SIDE: a restore whose load THROWS still releases the refusal', async () => {
+    await beginTimelinePreviewSession();
+    h.loadGates = [Promise.reject(new Error('load failed'))];
+    await expect(endTimelinePreviewSession({ restore: true })).rejects.toThrow('load failed');
+    expect(await beginTimelinePreviewSession()).toBe(true);
+  });
+
+  it('Play sees a preview restore as a world swap, including the wait BEFORE its load starts', async () => {
+    // `sceneManager.getNext()` is null here (the mock never has a pending load), which is exactly the
+    // `whenUndoIdle` wait in production: only the restore count can say the posed world is going away.
+    expect(aSceneSwapIsHappening()).toBe(false);
+    const { open, ending } = await holdRestore();
+    // MUTATION TARGET: drop `isPreviewRestoreInFlight()` from aSceneSwapIsHappening and Play snapshots
+    // the posed world here, which Stop then restores as the authored one.
+    expect(aSceneSwapIsHappening()).toBe(true);
+    open(); await ending;
+    expect(aSceneSwapIsHappening()).toBe(false);
+  });
+
+  it('a begin made AFTER an Exit cancelled an in-flight begin opens its OWN session (close-out review)', async () => {
+    let release!: () => void;
+    h.serializeGate = new Promise<void>((r) => { release = r; });
+    const cancelled = beginTimelinePreviewSession();
+    await endTimelinePreviewSession({ restore: true });    // Exit mid-snapshot: nothing seated, nothing restored
+    const later = beginTimelinePreviewSession();           // a fresh ruler click, while the dead serialize still runs
+    release();
+    // Pinned on purpose: `true` answers "a session is held" — the later click's. `false` would make the
+    // cancelled click's caller hand back the SAME owner's mode, knocking the later click to 'stopped'
+    // while its pose lands. Its own pose landing first is harmless: the later pose overwrites it and the
+    // session reverts both.
+    expect(await cancelled).toBe(true);
+    // MUTATION TARGET: join `_pending` without checking `_pendingLive()` and this is false — a click refused
+    // for an envelope nobody closed.
+    expect(await later).toBe(true);
+    await endTimelinePreviewSession({ restore: true });
+    expect(h.loadCalls[0].preloaded, 'the session restores ITS snapshot, not the cancelled one').toBe(h.snapshots[1]);
+  });
+
+  it('a begin that JOINED an in-flight begin resolves false when an Exit invalidates it', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    h.serializeGate = gate;
+    const first = beginTimelinePreviewSession();
+    const joined = beginTimelinePreviewSession();
+    await endTimelinePreviewSession({ restore: true });    // no snapshot seated yet → no restore
+    release();
+    expect(await first).toBe(false);
+    expect(await joined).toBe(false);
+    expect(hasTimelinePreviewSession()).toBe(false);
+  });
+});
+
+describe('openPreviewSessionThen — a pose runs only inside a held session (#1167)', () => {
+  it('refused → the pose does not run and the claimed scrub mode is handed back', async () => {
+    await beginTimelinePreviewSession();
+    let open!: () => void;
+    h.loadGate = new Promise<void>((r) => { open = r; });
+    const ending = endTimelinePreviewSession({ restore: true });
+    await new Promise((r) => setTimeout(r, 0));
+    enterScrubMode('timeline');
+    const pose = vi.fn();
+    // MUTATION TARGET: call `pose()` regardless of `opened` and it runs against the world being replaced.
+    expect(await openPreviewSessionThen('timeline', pose)).toBe(false);
+    expect(pose).not.toHaveBeenCalled();
+    // MUTATION TARGET: drop the `exitPreviewMode(owner)` and this stays 'scrub' with no session — Cmd+S blocked.
+    expect(getRunMode()).toBe('stopped');
+    open(); await ending;
+  });
+
+  it('a THROWN snapshot hands the mode back too, instead of an unhandled rejection', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    h.failSerialize = true;
+    enterScrubMode('timeline');
+    const pose = vi.fn();
+    expect(await openPreviewSessionThen('timeline', pose)).toBe(false);
+    expect(pose).not.toHaveBeenCalled();
+    expect(getRunMode()).toBe('stopped');
+    expect(err).toHaveBeenCalled();
+  });
+
+  it('ACCEPT SIDE: opened → the pose runs inside the session and the mode stays claimed', async () => {
+    enterScrubMode('timeline');
+    const pose = vi.fn(() => { expect(hasTimelinePreviewSession()).toBe(true); });
+    expect(await openPreviewSessionThen('timeline', pose)).toBe(true);
+    expect(pose).toHaveBeenCalledTimes(1);
+    expect(getRunMode()).toBe('scrub');
+    exitPreviewMode('timeline');
+  });
+});
+
+/** #1167 close-out review — the Timeline's "grab the playhead while ▶ is playing" chain: restore the
+ *  forward run, then reopen a scrub session. `holdChain` drives it the way `TimelineEditor.scrub` does. */
+describe('reopenPreviewAfterRestore — the grab-while-playing chain (#1167 review)', () => {
+  const holdChain = async () => {
+    await beginTimelinePreviewSession();
+    enterScrubMode('timeline');                               // scrub() claims before starting the restore
+    let open!: () => void;
+    h.loadGate = new Promise<void>((r) => { open = r; });
+    const token = createTeardownToken();
+    const pose = vi.fn(() => { expect(hasTimelinePreviewSession()).toBe(true); });
+    const chain = reopenPreviewAfterRestore('timeline', endTimelinePreviewSession({ restore: true }), token.capture(), pose);
+    await new Promise((r) => setTimeout(r, 0));             // inside loadScene
+    return { open, token, pose, chain };
+  };
+
+  it('a drag move refused DURING the restore does not leave the reopened session posing under stopped', async () => {
+    const { open, pose, chain } = await holdChain();
+    expect(await openPreviewSessionThen('timeline', vi.fn())).toBe(false); // the next pointermove: refused, mode handed back
+    expect(getRunMode()).toBe('stopped');
+    open();
+    expect(await chain).toBe(true);
+    expect(pose).toHaveBeenCalledTimes(1);
+    // MUTATION TARGET: drop the chain's `enterScrubMode(owner)` and this is 'stopped' with a session held and
+    // the world posed — Inspector edits allowed, and the next scene save bakes the pose.
+    expect(getRunMode()).toBe('scrub');
+    exitPreviewMode('timeline');
+  });
+
+  it('an Exit pressed during the restore is NOT undone by the reopen', async () => {
+    const { open, token, pose, chain } = await holdChain();
+    token.invalidateAll();                                    // TimelineEditor.exitPreview
+    await endTimelinePreviewSession({ restore: true });       // finds no snapshot: restores nothing
+    exitPreviewMode('timeline');
+    open();
+    // MUTATION TARGET: drop the `isLive()` check and this is true, with a fresh session posed after the Exit.
+    expect(await chain).toBe(false);
+    expect(pose).not.toHaveBeenCalled();
+    expect(hasTimelinePreviewSession()).toBe(false);
+    expect(getRunMode()).toBe('stopped');
+  });
+
+  it('a restore that THROWS hands the mode back instead of escaping unhandled', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    await beginTimelinePreviewSession();
+    enterScrubMode('timeline');
+    h.loadGates = [Promise.reject(new Error('load failed'))];
+    const pose = vi.fn();
+    // MUTATION TARGET: let the rejection through and this rejects, with the mode pinned at 'scrub'.
+    expect(await reopenPreviewAfterRestore('timeline', endTimelinePreviewSession({ restore: true }), () => true, pose)).toBe(false);
+    expect(pose).not.toHaveBeenCalled();
+    expect(getRunMode()).toBe('stopped');
+    expect(err).toHaveBeenCalled();
+  });
+
+  it('toolbar STOP during the restore cancels the chain and ends stopped, with no session reopened', async () => {
+    await beginTimelinePreviewSession();
+    enterScrubMode('timeline');
+    let open!: () => void;
+    h.loadGate = new Promise<void>((r) => { open = r; });
+    const pose = vi.fn();
+    const chain = reopenPreviewAfterRestore('timeline', endTimelinePreviewSession({ restore: true }), capturePreviewGesture(), pose);
+    await new Promise((r) => setTimeout(r, 0));             // inside loadScene: no session, mode 'scrub'
+    const stopping = stopPlay();
+    open();
+    await stopping;
+    // MUTATION TARGET: drop `cancelPreviewGestures()` from stopPlay and this is true — the chain re-poses
+    // over a Stop the user pressed.
+    expect(await chain).toBe(false);
+    expect(pose).not.toHaveBeenCalled();
+    expect(hasTimelinePreviewSession()).toBe(false);
+    // MUTATION TARGET: drop stopPlay's restore-landing branch and this stays 'scrub' with nothing held.
+    expect(getRunMode()).toBe('stopped');
+  });
+
+  it('a Stop pressed while PLAY starts up over a preview session is still queued, not swallowed (#470)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await beginTimelinePreviewSession();
+    enterScrubMode('timeline');
+    let open!: () => void;
+    h.loadGate = new Promise<void>((r) => { open = r; });
+    const playing = enterPlay();                              // ends the session with a restore first
+    await new Promise((r) => setTimeout(r, 0));              // inside that restore: same state as a grab chain
+    const stopping = stopPlay();
+    open();
+    await stopping; await playing;
+    await new Promise((r) => setTimeout(r, 0));
+    // MUTATION TARGET: drop `!_entering &&` from stopPlay's restore-landing branch and Play starts anyway.
+    expect(getPlayState()).toBe('stopped');
+    void warn;
+  });
+
+  it('whenPreviewRestoresLanded resolves only once the restore has landed', async () => {
+    await expect(whenPreviewRestoresLanded()).resolves.toBeUndefined(); // none in flight: immediate
+    await beginTimelinePreviewSession();
+    let open!: () => void;
+    h.loadGate = new Promise<void>((r) => { open = r; });
+    const ending = endTimelinePreviewSession({ restore: true });
+    await new Promise((r) => setTimeout(r, 0));
+    let landed = false;
+    const waiting = whenPreviewRestoresLanded().then(() => { landed = true; });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(landed).toBe(false);
+    open(); await ending; await waiting;
+    // MUTATION TARGET: never flush `_restoreWaiters` and this never resolves (the test times out).
+    expect(landed).toBe(true);
   });
 });

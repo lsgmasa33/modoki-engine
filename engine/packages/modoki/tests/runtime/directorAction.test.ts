@@ -534,6 +534,98 @@ describe('engine.director — a seek onto the end fires the end once (#1113)', (
   });
 });
 
+/** #1158 — a sub-director un-slaved while it sits at its end must hold the state an ended STANDALONE
+ *  Director holds (started, at the end, end fired). `driveSubdirector` used to write `started: false`
+ *  there, a state no standalone Director can be in, and each probe below read it differently.
+ *
+ *  The parent (6 s) outlives the child's end (global 5 s) by 30 frames, so every count here stays
+ *  clear of the parent's own end; the `start` counts include the parent's start. */
+describe('engine.director — a sub-director un-slaved at its end (#1158)', () => {
+  const startsSoFar = () => tw!.events({ type: '@sequence' }).filter((e) => (e.payload as { phase: string }).phase === 'start').length;
+  /** Mute the parent's subdirector track, so the next frame no longer slaves the child. */
+  const unslave = (clip: { start: number; duration?: number; subdirector: boolean } = { start: 2, subdirector: true }) => setTimeline(PARENT_PATH, normalizeTimeline({
+    id: 'p', name: 'Parent', duration: 6, frameRate: 30,
+    tracks: [{ id: 'ctl', name: 'Sub', target: 'Child', type: 'control', muted: true, clips: [clip] }],
+  }));
+  const stepToChildEnd = () => {
+    let guard = 0;
+    while (endsSoFar() === 0 && guard++ < 400) tw!.step(1);
+    expect(endsSoFar()).toBe(1);
+    expect(startsSoFar()).toBe(2);
+  };
+
+  it('a PLAYING child un-slaved at its end does not start again', () => {
+    const { child } = setupNested();
+    stepToChildEnd();
+    unslave();
+    tw!.step(5);
+    // MUTATION TARGET: write `started: !cp.justEnded` in driveSubdirector's read-back and this is 3 —
+    // an onStart that hides the HUD with no onEnd to restore it.
+    expect(startsSoFar()).toBe(2);
+    expect(endsSoFar()).toBe(1);
+    expect(dir(child).started).toBe(true);
+    expect(timeOf(child)).toBe(3);
+  });
+
+  it('restart on a PAUSED child un-slaved at its end fires both the start and the end', () => {
+    setupNested();
+    stepToChildEnd();
+    unslave();
+    seek({ action: 'pause' }, CHILD_GUID); // accepted: the muted track no longer slaves it
+    tw!.step(3);
+    seek({ action: 'restart', time: 999 }, CHILD_GUID);
+    tw!.step(3);
+    expect(startsSoFar()).toBe(3);
+    // MUTATION TARGET: as above — `started` is already false, restart changes nothing the record can
+    // see, and the new playthrough's end never fires (this stays 1).
+    expect(endsSoFar()).toBe(2);
+  });
+
+  it('Stop → Play on a child un-slaved at its end does not end it again', () => {
+    setupNested();
+    stepToChildEnd();
+    unslave();
+    seek({ action: 'pause' }, CHILD_GUID);
+    tw!.step(3);
+    setRunMode('stopped');
+    setRunMode('playing');
+    seek({ action: 'play' }, CHILD_GUID);
+    tw!.step(5);
+    // MUTATION TARGET: as above — the lost record resolves `endFired` from `started`, reads false, and
+    // this is 2.
+    expect(endsSoFar()).toBe(1);
+    expect(startsSoFar()).toBe(2);
+  });
+
+  it('ACCEPT SIDE: a child TRUNCATED by a shorter clip replays its tail as one balanced start + end', () => {
+    // A decision, pinned: the clip (2 s) ends the 3 s child at local t=2, below its own duration, which
+    // a standalone Director cannot represent as ended. `started: false` stays, so running on its own
+    // clock is a new playthrough of the tail — never an end without a start.
+    registerEngineActions();
+    tw = createTestWorld({ dt: DT, systems: [TIMELINE] });
+    const clip = { start: 2, duration: 2, subdirector: true };
+    setTimeline(PARENT_PATH, normalizeTimeline({
+      id: 'p', name: 'Parent', duration: 6, frameRate: 30,
+      tracks: [{ id: 'ctl', name: 'Sub', target: 'Child', type: 'control', clips: [clip] }],
+    }));
+    setTimeline(CHILD_PATH, normalizeTimeline({ id: 'c', name: 'Child', duration: 3, frameRate: 30, tracks: [] }));
+    const parent = tw.spawn(EntityAttributes({ name: 'Parent', guid: PARENT_GUID }), Director({ timeline: PARENT_PATH }));
+    const child = tw.spawn(
+      EntityAttributes({ name: 'Child', guid: CHILD_GUID, parentId: parent.id() }),
+      Director({ timeline: CHILD_PATH, playing: true }),
+    );
+    stepToChildEnd();
+    expect(timeOf(child)).toBeCloseTo(2, 1); // the crossing frame overshoots by up to one dt — the clip span does not clamp
+    expect(dir(child).started).toBe(false);
+    unslave(clip);
+    tw.step(45); // the 1 s tail, with margin; the parent (at ~5.5 s) is still short of its own end
+    expect(timeOf(child)).toBe(3);
+    // MUTATION TARGET: write `started: true` on a truncated end too and starts stays 2 while ends is 2.
+    expect(startsSoFar()).toBe(3);
+    expect(endsSoFar()).toBe(2);
+  });
+});
+
 /** #1113 close-out review — every seek made BEFORE the system's first record of a Director.
  *
  *  The first version armed the end only on a DETECTED write, and created the record only on a frame

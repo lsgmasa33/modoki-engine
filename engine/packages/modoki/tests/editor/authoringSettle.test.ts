@@ -36,6 +36,9 @@ vi.mock('../../src/editor/scene/serialize', () => ({
 }));
 vi.mock('../../src/editor/scene/timelinePreview', () => ({
   hasTimelinePreviewSession: () => false,
+  isPreviewRestoreInFlight: () => false,
+  cancelPreviewGestures: () => {},
+  whenPreviewRestoresLanded: async () => {},
   endTimelinePreviewSession: async () => null,
 }));
 vi.mock('../../src/editor/panels/aiSettingsModel', () => ({

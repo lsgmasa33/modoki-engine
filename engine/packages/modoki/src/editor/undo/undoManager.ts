@@ -147,9 +147,11 @@ export function clearPreviewUndoSession(session: number): void {
 }
 
 /** The preview sessions whose snapshot restore is in progress. While any is, EVERY undo/redo step is
- *  refused — see `beginPreviewRestore`. A SET, not one slot: a pose during a restore can seat a new
- *  session and a second Exit restore it while the first is still loading (#1167's path), and a
- *  single slot let the second overwrite the first so the first's drop never ran. */
+ *  refused — see `beginPreviewRestore`. A SET, not one slot: a pose during a restore used to seat a
+ *  new session that a second Exit restored while the first was still loading, and a single slot let
+ *  the second overwrite the first so the first's drop never ran. `beginTimelinePreviewSession` now
+ *  refuses during a restore (#1167), so that path is closed; the set stays as the backstop, because
+ *  an overwritten slot would fail silently. */
 const _restoringSessions = new Set<number>();
 
 /** A restore of preview session `session` is starting — refuse every undo/redo until

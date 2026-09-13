@@ -51,7 +51,7 @@ import { applyPoseAtTime, poseClipAtTime, exitPoseEnvelope, onPoseEnvelopeExited
 import { resolveAnimatorRootForClip } from './openAssetInEditor';
 import { frameToTime, snapToFrame, timeToFrame, DEFAULT_VIEWPORT, type Viewport } from './animation/timelineMath';
 import { saveAssetDialog } from '../utils/saveDialog';
-import { enterScrubMode, enterPreviewMode, registerModeOwnerDisplaced } from '../scene/playMode';
+import { enterScrubMode, enterPreviewMode, exitPreviewMode, registerModeOwnerDisplaced } from '../scene/playMode';
 import {
   beginTimelinePreviewSession, hasTimelinePreviewSession,
   setPreviewSaveHandler, clearPreviewSaveHandler, type PreviewSaveHandler,
@@ -310,7 +310,13 @@ export default function AnimationEditor() {
     // where a promise and a setState per frame would both be new work for no gain.
     if (hasTimelinePreviewSession()) { applyPoseAtTime(c, rootId, t); return; }
     setInPreview(true);
-    void poseClipAtTime(c, rootId, t, 'animation');
+    // No session opened (#1167: a restore still landing, or an Exit mid-snapshot), or the snapshot
+    // threw: `poseClipAtTime` posed nothing and handed the mode back, so the ⏹ Exit button must not
+    // stay up for an envelope that does not exist.
+    void poseClipAtTime(c, rootId, t, 'animation').then(
+      (r) => { if (r.refused) setInPreview(false); },
+      (e: unknown) => { setInPreview(false); console.error('[AnimationEditor] could not open the preview session — nothing posed', e); },
+    );
   }, [rootId]);
 
   // ── Load the clip when the open target changes ──
@@ -575,10 +581,9 @@ export default function AnimationEditor() {
     if (!panelDrivesPreview(playing, previewOwner, 'animation')) return; // the Timeline panel's ▶, not ours
     enterPreviewMode(true, 'animation');
     setInPreview(true);
-    void beginTimelinePreviewSession(); // idempotent — a scrub before ▶ already holds the snapshot
     const guard = createPreviewLoopGuard();
     previewLoopGuardRef.current = guard;
-    let last = performance.now();
+    let last = 0;
     const tick = () => {
       if (guard.stopped) return; // displaced — do not reschedule (checked BEFORE scheduling)
       guard.arm(requestAnimationFrame(tick));
@@ -591,7 +596,29 @@ export default function AnimationEditor() {
       useEditorStore.getState().setPlayhead(t);
       pose(cur, t);
     };
-    guard.arm(requestAnimationFrame(tick));
+    // The loop starts only once a session is HELD (#1167). It used to start at once, beside a
+    // fire-and-forget begin: its first frames then posed through `poseClipAtTime`'s opening path, and
+    // a begin that opened nothing (a restore still landing) left every frame posing with no snapshot.
+    const refuse = () => {
+      guard.stop();
+      exitPreviewMode('animation');
+      setInPreview(false);
+      // This panel drives the flag's current run, and that run never began — see TimelineEditor's ▶.
+      useEditorStore.getState().setPreviewPlaying(false);
+    };
+    void beginTimelinePreviewSession().then(
+      (opened) => {
+        if (guard.stopped) return; // torn down or displaced while the snapshot serialized
+        if (!opened) { refuse(); return; }
+        last = performance.now();
+        guard.arm(requestAnimationFrame(tick));
+      },
+      (e: unknown) => {
+        if (guard.stopped) return;
+        console.error('[AnimationEditor] could not open the preview session — ▶ not started', e);
+        refuse();
+      },
+    );
     // Release the ref only if it is still OURS — see the same note in TimelineEditor's cleanup.
     return () => { guard.stop(); if (previewLoopGuardRef.current === guard) previewLoopGuardRef.current = null; };
   }, [playing, previewOwner, pose]);

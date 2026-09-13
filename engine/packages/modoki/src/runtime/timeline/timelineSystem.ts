@@ -118,9 +118,10 @@ export function seekLandsAt(timeline: string, loop: boolean, time: number): numb
  *     Director frozen at speed 0) — the #1113 lock-up in its likeliest shape. `started` is false in
  *     each of those, so the resolved default fires them.
  *  The record also keeps `started`: a `started` that went false behind the system's back is `restart`
- *  (a new playthrough), which re-arms the end even when combined with a seek onto the end. Gating on
- *  `started` alone is wrong — `driveSubdirector` writes `started: false` onto a child the frame it
- *  ends, so an un-slaved child at its end would read as re-armed and end twice.
+ *  (a new playthrough), which re-arms the end even when combined with a seek onto the end — the record's
+ *  `endFired` is still set then, so only the true→false TRANSITION separates a restart from the same
+ *  playthrough. (`driveSubdirector`'s read-back keeps a slaved child's `started` consistent with this
+ *  model, #1158.)
  *
  *  ⚠️ `t` defaults to the playhead itself: FIRST SIGHT IS NOT A WRITE. The record is created the first
  *  frame the query meets a Director, however that frame is skipped, and a paused Director is posed
@@ -883,10 +884,20 @@ function driveSubdirector(
   applyDirectorFrame(world, cp, index, opts, nested, driven);
 
   // Read-back the child's synced playhead so Percept/inspection shows the nested time.
-  child.set(Director, { ...(child.get(Director) as object), time: childCur, lastTime: childPrev, started: !cp.justEnded });
+  //
+  // ⚠️ `started` is written as the state a STANDALONE Director would hold here, because nothing reads it
+  // while the child is slaved (its start edge is the parent's `atStart` crossing) — it matters only once
+  // the child is un-slaved and runs on its own clock (#1158). At its own duration an ended child is
+  // `started` with its end fired, like any ended Director. The old `!cp.justEnded` left it at the end
+  // but NOT started, which no standalone Director can be: a playing one then re-fired its start with no
+  // end, a `restart` changed nothing the record could see, and a lost record (Stop→Play) ended it again.
+  // A clip that TRUNCATES the child ends it below its duration, which cannot be represented as ended, so
+  // that one stays not-started: running the tail on its own clock is then a balanced start + end.
+  const started = !cp.justEnded || childCur >= cDur;
+  child.set(Director, { ...(child.get(Director) as object), time: childCur, lastTime: childPrev, started });
   // The parent's write, not an outside seek — record it, or un-slaving this child would read it as one
   // (and, at the child's end, fire the end the drive above already fired).
-  _playheadSeen.set(`${childId}:${child.generation()}`, { t: childCur, endFired: childCur >= cDur, started: !cp.justEnded });
+  _playheadSeen.set(`${childId}:${child.generation()}`, { t: childCur, endFired: childCur >= cDur, started });
 }
 
 /** Fire the declarative `OnSequence` action for a start/end phase. Pipeline-safe. */

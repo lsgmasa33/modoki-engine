@@ -26,9 +26,11 @@ import { advanceClipTime } from '../../runtime/animation/sampleClip';
 import { previewTimelineAt, previewTimelineStep, previewControlAt, clearPreviewControls } from '../../runtime/timeline/timelineSystem';
 import {
   beginTimelinePreviewSession, endTimelinePreviewSession, hasTimelinePreviewSession, setTimelinePreviewActive,
+  capturePreviewGesture, cancelPreviewGestures,
   setPreviewSaveHandler, clearPreviewSaveHandler, type PreviewSaveHandler,
 } from '../scene/timelinePreview';
 import { enterScrubMode, enterPreviewMode, exitPreviewMode, registerModeOwnerDisplaced } from '../scene/playMode';
+import { openPreviewSessionThen, reopenPreviewAfterRestore } from '../scene/openPreviewSession';
 import { createPreviewLoopGuard, type PreviewLoopGuard } from './previewLoopGuard';
 import { panelDrivesPreview, panelMayStopPreview } from '../scene/previewOwnership';
 import { getRunMode, isAdvancing, onRunModeChange } from '../../runtime/core/playState';
@@ -217,7 +219,7 @@ export default function TimelineEditor() {
     if (!d || rootId == null) return;
     if (hasTimelinePreviewSession()) { applyPose(d, t); return; }
     enterScrubMode('timeline');
-    void beginTimelinePreviewSession().then(() => applyPose(d, t));
+    void openPreviewSessionThen('timeline', () => applyPose(d, t));
   }, [rootId, applyPose]);
   const poseLatest = useCallback((d: TimelineDef) => pose(d, useEditorStore.getState().playheadTime), [pose]);
 
@@ -228,6 +230,7 @@ export default function TimelineEditor() {
     // asset.path/nonce unchanged, so it doesn't re-trigger this effect. On first open no session
     // is held, so this is a no-op.
     clearPreviewControls(); // drop any control-prefab a scrub of the PREVIOUS timeline left spawned
+    cancelPreviewGestures(); // a grab chain of the PREVIOUS target must not reopen on this one
     if (hasTimelinePreviewSession()) void endTimelinePreviewSession({ restore: true });
     exitPreviewMode('timeline'); // opening/switching a timeline returns to stopped (any prior scrub/preview ended above)
     lastAction.current = null;
@@ -463,14 +466,17 @@ export default function TimelineEditor() {
       // Was playing forward, now grabbing the playhead → revert the forward run to authored (you
       // can't un-run a sim), rebind the Director (ids change on reload), REOPEN the envelope's
       // session for the ongoing scrub, then pose at the target time.
+      // Through `reopenPreviewAfterRestore`: it re-claims scrub and reopens only while this gesture is
+      // still live — see there for the two ways the inline chain went wrong.
       const path = store.editingTimelineAsset?.path;
-      void endTimelinePreviewSession({ restore: true, rebind: () => (path ? resolveDirectorRootForTimeline(path) : null) })
-        .then((newRoot) => { if (newRoot != null) useEditorStore.getState().setDirectorRoot(newRoot); return beginTimelinePreviewSession(); })
-        .then(() => poseAt(clamped));
+      const restored = endTimelinePreviewSession({ restore: true, rebind: () => (path ? resolveDirectorRootForTimeline(path) : null) })
+        .then((newRoot) => { if (newRoot != null) useEditorStore.getState().setDirectorRoot(newRoot); });
+      void reopenPreviewAfterRestore('timeline', restored, capturePreviewGesture(),
+        () => poseAt(useEditorStore.getState().playheadTime));
     } else if (!hasTimelinePreviewSession()) {
       // First scrub of the envelope (from stopped): snapshot the AUTHORED world BEFORE posing, so
       // Exit / asset-switch / unmount can revert the pose. (Mandatory scrub session — Phase 3.)
-      void beginTimelinePreviewSession().then(() => poseAt(clamped));
+      void openPreviewSessionThen('timeline', () => poseAt(clamped));
     } else {
       poseAt(clamped); // continuing a scrub within the envelope — just repose
     }
@@ -483,6 +489,7 @@ export default function TimelineEditor() {
    *  serializes immediately after, so a fire-and-forget restore would let the save write the POSED
    *  world. (The ⏹ button ignores the promise; only the save path needs it.) */
   const exitPreview = useCallback((): Promise<void> => {
+    cancelPreviewGestures(); // a grab chain still restoring must not reopen over this Exit
     const store = useEditorStore.getState();
     stopPreviewLoop(); // stop the loop + close gates synchronously (C7)
     store.setPreviewPlaying(false);
@@ -533,7 +540,7 @@ export default function TimelineEditor() {
         const st = useEditorStore.getState();
         enterScrubMode('timeline');
         const pose = previewHooks.current.poseAt;
-        void beginTimelinePreviewSession().then(() => pose(st.playheadTime));
+        void openPreviewSessionThen('timeline', () => pose(st.playheadTime));
       },
     };
   }
@@ -586,8 +593,22 @@ export default function TimelineEditor() {
     let last = performance.now();
     let cancelled = false;
     void (async () => {
-      await beginTimelinePreviewSession(); // snapshot authored world (idempotent across pause/resume)
+      let opened = false;
+      try {
+        opened = await beginTimelinePreviewSession(); // snapshot authored world (idempotent across pause/resume)
+      } catch (e) {
+        console.error('[TimelineEditor] could not open the preview session — ▶ not started', e);
+      }
       if (cancelled || guard.stopped) return; // displaced before we ever took the mode ourselves
+      if (!opened) {
+        // No session (#1167: ▶ pressed while an Exit's restore is still landing, or the snapshot
+        // threw). The loop below poses AND fires signals with nothing to revert them, so it must not
+        // start. Clearing the shared playing flag is right here, unlike on displacement (see
+        // `registerModeOwnerDisplaced` above): this panel drives the flag's current run and that run
+        // never began, so no other panel's preview is keyed on it.
+        useEditorStore.getState().setPreviewPlaying(false);
+        return;
+      }
       setTimelinePreviewActive(true);      // open audio + action-dispatch gates
       enterPreviewMode(true, 'timeline');  // carry the run-mode signal (gates still read the active flag until Phase 4)
       const tick = () => {
@@ -673,6 +694,7 @@ export default function TimelineEditor() {
     // shared flag too. Guarding the flag alone was not enough; the session is the deeper half, and
     // the #810 E2E is what surfaced it. When the Animation panel owns the preview it also owns the
     // session, and its own unmount (`endAnimationPreview`) ends it.
+    cancelPreviewGestures(); // no panel left to drive a session a grab chain would reopen
     const owns = panelMayStopPreview(useEditorStore.getState().previewOwner, 'timeline');
     if (owns && hasTimelinePreviewSession()) {
       const path = useEditorStore.getState().editingTimelineAsset?.path;

@@ -21,6 +21,7 @@ let sessionHeld = false;
 let authoredEdits = false;
 type TestHandler = { owner: 'animation'; suspend: () => Promise<void>; resume: () => void; isLive?: () => boolean };
 let handler: TestHandler | null = null;
+let restoreLanding: Promise<void> | null = null;
 
 // ⚠️ **PARTIAL, via `importOriginal` — and that is not a style choice (#972).** This mock used to
 // be a whole-module replacement listing `unsavedChangeCauses` by hand with FOUR of the five causes
@@ -87,6 +88,7 @@ vi.mock('../../packages/modoki/src/editor/scene/timelinePreview', async (importO
   const actual = await importOriginal<typeof import('../../packages/modoki/src/editor/scene/timelinePreview')>();
   const currentFor = (o: string) => (handler?.owner === o ? handler : null);
   return {
+    whenPreviewRestoresLanded: () => restoreLanding ?? Promise.resolve(),
     hasTimelinePreviewSession: () => sessionHeld,
     getPreviewSaveHandler: () => handler,
     previewHasAuthoredEdits: () => authoredEdits,
@@ -121,7 +123,7 @@ function makeHandler(tag = 'A', live = true) {
 
 beforeEach(() => {
   log.length = 0; sceneDirty = false; sessionHeld = false; authoredEdits = false;
-  handler = null; clearPendingBaseScenes();
+  handler = null; clearPendingBaseScenes(); restoreLanding = null;
 });
 
 describe('runSaveAll inside a preview envelope', () => {
@@ -165,6 +167,21 @@ describe('runSaveAll inside a preview envelope', () => {
     await runSaveAll();
     expect(handler!.suspend, 'the preview must not be cycled for parked work that writes no scene')
       .not.toHaveBeenCalled();
+  });
+
+  it('waits for a preview restore still landing before it writes anything (#1167 review)', async () => {
+    // ⏹ Exit cleared the session and set 'stopped' already, so nothing below this wait can tell the
+    // world is still posed: no session, no handler — the plain save path, which would bake the pose.
+    let land!: () => void;
+    restoreLanding = new Promise<void>((r) => { land = r; });
+    sessionHeld = false; sceneDirty = true;
+    const saving = runSaveAll();
+    await new Promise((r) => setTimeout(r, 0));
+    // MUTATION TARGET: drop `await whenPreviewRestoresLanded()` and the scene is written here, posed.
+    expect(log).toEqual([]);
+    land();
+    await saving;
+    expect(log).toContain('saveScene');
   });
 
   it('suspends BEFORE the scene is written, then resumes', async () => {
