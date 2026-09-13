@@ -90,11 +90,17 @@ describe('#1097 — Animator clips are preloaded at scene load', () => {
       return new Response(JSON.stringify(fadeInClip(clipGuid)), { status: 200, headers: { 'content-type': 'application/json' } });
     });
 
+    const worldBefore = getCurrentWorld();
     let settled = false;
     const load = sceneManager.loadScene('/assets/scenes/preload-test.scene.json', { preloaded: stagedScene(clipGuid) as never })
       .then(() => { settled = true; });
     for (let i = 0; i < 50 && !settled; i++) await new Promise((r) => setTimeout(r, 0));
-    expect(settled).toBe(false); // the swap is parked on the clip
+    expect(settled).toBe(false); // the load is parked on the clip…
+    // …and parked BEFORE the swap. `settled` alone also covers the post-swap tail, so a preload awaited
+    // after `setCurrentWorld` — the new world live and painting unposed frames, i.e. #1097 itself —
+    // passed `settled === false` (review-found). Boolean form on purpose: a failing `toBe(world)`
+    // tries to diff two koota worlds and crashes the vitest worker.
+    expect(getCurrentWorld() === worldBefore).toBe(true);
     expect(fetchMock.mock.calls.some(([u]) => String(u).endsWith(CLIP_PATH))).toBe(true);
 
     releaseClip();
