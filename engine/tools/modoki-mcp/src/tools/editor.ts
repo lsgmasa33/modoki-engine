@@ -250,6 +250,9 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'PRECONDITIONS, refused rather than silently done: `pause` needs PLAYING, `resume` and ' +
       '`step` need PAUSED. In particular `resume` from stopped is NOT a play — it is refused, ' +
       'because running one would discard the state you were inspecting. ' +
+      '`play`, `resume` and `step` WAIT for the physics WASM the world\'s bodies need before any ' +
+      'frame runs, so a stepped frame always simulates. A permanent physics init failure is refused ' +
+      '(ok:false) by `resume`/`step` and by `play` from paused; `play` from stopped still starts and reports it as `physicsError`. ' +
       'This is how you TEST the game like a human pressing Play. After play, exercise it with ' +
       'modoki_tap/drag, read modoki_get_scene_state, then stop to revert. Returns editor state.',
     { action: z.enum(['play', 'stop', 'pause', 'resume', 'step'])

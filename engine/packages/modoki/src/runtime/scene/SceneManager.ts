@@ -95,6 +95,7 @@ import { resolveSceneChain, type SceneRef, type FetchSceneMeta } from './sceneCh
 import { emit } from '../core/journal';
 import { markSceneLoaded, isSceneFilePath } from '../core/ecs/sceneLoaded';
 import { beginBootSpan, endBootSpan, bootSpanAsync } from '../core/bootTimeline';
+import { ensurePhysicsReady } from '../physics/physicsReady';
 import { clearAllOverrideMarks, getOverrideMarkSet, markOverride } from '../loaders/overrideMarks';
 import { clearAuthoredWritesWhileStopped } from '../core/ecs/authoredWrites';
 import { SCENE_FORMAT_VERSION } from '../core/version';
@@ -1032,6 +1033,11 @@ class SceneManagerImpl implements SceneManager {
       // world) — one of the three boot phases #238 names, and the reason this span is separate.
       const swapWorld = nextWorld;
       await bootSpanAsync('scene-before-swap-hooks', () => this.fireBeforeSwapHooks(swapWorld));
+      // Physics WASM: a scene with bodies is never swapped in before Rapier can step it (#1175).
+      // Queried on the SPAWNED world, so bodies that arrived through a prefab count. A permanent
+      // init failure does not abort the load — the loader has already logged it, and refusing the
+      // swap would only trade a scene without physics for no scene at all.
+      await bootSpanAsync('scene-physics-init', () => ensurePhysicsReady(swapWorld));
 
       if (this.isSuperseded(controller, enteredGeneration)) throw new DOMException('Aborted', 'AbortError');
 

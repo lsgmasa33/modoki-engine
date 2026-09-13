@@ -199,6 +199,7 @@ function handRolledPardons(src: string, file: string): Array<{ collection: strin
  *  (skips generating a per-item test, so there is no scan population to spend); DEFERRED (another
  *  lane). A pardon that FILTERS a detector's hits is none of these — migrate it. */
 const RESIDUE: ReadonlyArray<{ item: string; count?: number; reason: string }> = [
+  { item: 'engine/tests/architecture/projectWritersTakeBuildClaim.test.ts::CLAIMS', reason: 'DATA — the claim spellings a project writer may use, each wrapper proven to reach acquireBuildClaim( by the same file (#1160)' },
   { item: 'engine/packages/modoki/tests/editor/devicePresets.test.ts::ANDROID_TABLETS', reason: 'DATA — partitions the Android presets into phones and tablets' },
   { item: 'engine/packages/modoki/tests/editor/uiAuthoring.test.ts::specially_handled', reason: 'DATA — narrows the expected pinned-field list' },
   { item: 'engine/packages/modoki/tests/runtime/uiTreeReuse.test.ts::nested', reason: 'DATA — the non-scalar node keys, so only scalar fields are compared' },

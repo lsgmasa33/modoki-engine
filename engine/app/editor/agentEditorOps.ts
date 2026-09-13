@@ -69,7 +69,7 @@ import {
   getSpriteAnim, getRig2D, getRig2DSource,
   getAnimSet, getSpriteMaterialProgram, isGuid,
   getAllTraits, resolveCreateEntitySpec, type MutateOp, type MutateEntityRef,
-  Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
+  Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, ensurePhysicsReady, pendingPhysics, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
   type AnimationClipDef, type TrackValueType, type TimelineDef, type TrackDef, type TrackKind,
   sceneManager, assetUrl, type AssetSchemaType, collectHandles, rawNow,
 } from '@modoki/engine/runtime';
@@ -1569,7 +1569,46 @@ export function registerEditorAgentOps(): void {
   });
 
   // ── Play control ── matches the GameView transport bar.
-  registerAgentOp('play', async () => { await enterPlay(); return readEditorState(); });
+  // Physics readiness (#1175): `play`, `resume` and `step` never let a tick run before the Rapier
+  // WASM the world's bodies need has instantiated. From STOPPED, `play` gets that from enterPlay
+  // itself, which awaits it INSIDE its `_entering` window — an op-level await in front of enterPlay
+  // would sit OUTSIDE that window, where a Stop hits stopPlay's plain stopped branch and is dropped
+  // instead of queued (#470). So from stopped a PERMANENT init failure cannot be refused up front;
+  // Play starts (as a human's would) and the op REPORTS it as `physicsError`. Everywhere else —
+  // `play` from paused (enterPlay's paused branch awaits nothing), `resume`, `step` — the op awaits
+  // first, refuses on a permanent failure, then re-reads the state, because a Stop landing during the
+  // WASM fetch changed what the op would mean.
+  const physicsFailure = async (): Promise<string | null> => {
+    if (pendingPhysics(getCurrentWorld()).length === 0) return null;
+    const r = await ensurePhysicsReady(getCurrentWorld());
+    return r.ok ? null : r.error;
+  };
+  const physicsRefused = (op: string, error: string) => ({
+    ok: false,
+    error: `${op} refused — physics failed to initialize, so the world would advance with NO physics: ${error}`,
+    playState: getPlayState(),
+  });
+  registerAgentOp('play', async () => {
+    let physicsError: string | null = null;
+    if (getPlayState() === 'paused') {
+      // enterPlay's PAUSED branch just flips to playing — it awaits nothing — so from paused the op
+      // waits here, like `resume`. There is no `_entering` latch on this path to drop a Stop past,
+      // but a Stop landing during the wait still changed what Play would mean: from stopped this op
+      // would run a full snapshot + Play the caller never asked for AFTER stopping, so refuse.
+      const pausedError = await physicsFailure();
+      if (pausedError) return physicsRefused('play', pausedError);
+      if (getPlayState() !== 'paused') return { ok: false, error: 'play from PAUSED — the play state changed while physics was loading', playState: getPlayState() };
+      await enterPlay();
+    } else {
+      await enterPlay();
+      // From stopped, enterPlay awaited readiness inside `_entering`, so anything still pending here
+      // is a permanent failure (the loader memoises the rejection) — this await settles immediately.
+      physicsError = getPlayState() === 'playing' ? await physicsFailure() : null;
+    }
+    return physicsError
+      ? { ...readEditorState(), physicsError: `Play started, but physics failed to initialize — bodies will not simulate: ${physicsError}` }
+      : readEditorState();
+  });
   // `resume` and `pause` are TRANSITIONS, and both used to accept any state and report the editor
   // state back as a success. From STOPPED, `resume` ran a full `enterPlay()` — a snapshot + run,
   // i.e. the thing `play` does — so an agent that meant "carry on from where we paused" silently
@@ -1586,6 +1625,11 @@ export function registerEditorAgentOps(): void {
         hint: st === 'stopped' ? "Use action:'play' to start the game." : "Already running — action:'pause' first if you meant to freeze it.",
       };
     }
+    const resumeError = await physicsFailure();
+    if (resumeError) return physicsRefused('resume', resumeError);
+    // Re-read after the await: from anything but paused, enterPlay would run a full Play — the very
+    // outcome this op exists to refuse.
+    if (getPlayState() !== 'paused') return { ok: false, error: 'resume requires the PAUSED state — the play state changed while physics was loading', playState: getPlayState() };
     await enterPlay();
     return readEditorState();
   });
@@ -1605,8 +1649,13 @@ export function registerEditorAgentOps(): void {
   });
   // Step one frame while Paused: flip to 'playing' around a single synchronous
   // frame, then freeze again (exactly GameView's stepOnce).
-  registerAgentOp('step', () => {
+  registerAgentOp('step', async () => {
     if (getPlayState() !== 'paused') return { ok: false, error: 'step requires paused state', playState: getPlayState() };
+    const stepError = await physicsFailure();
+    if (stepError) return physicsRefused('step', stepError);
+    // Re-read after the await: a Stop (or Resume) landing during the WASM fetch changed what a
+    // step would mean, and flipping to 'playing' below would clobber it.
+    if (getPlayState() !== 'paused') return { ok: false, error: 'step requires paused state — the play state changed while physics was loading', playState: getPlayState() };
     setPlayState('playing');
     stepOneFrame();
     setPlayState('paused');

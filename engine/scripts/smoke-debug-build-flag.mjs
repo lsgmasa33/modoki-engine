@@ -28,6 +28,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import fs from 'node:fs';
+import { claimProjectOrExit } from './cliBuildClaim.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const project = process.argv[2] || 'games/sling';
@@ -74,6 +75,13 @@ const restore = () => {
 };
 process.on('exit', restore);
 for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { restore(); process.exit(130); });
+
+// #1160: this deletes the project's `dist/` before each `build-web` child runs, and that child only
+// claims once it starts, so the delete used to happen unclaimed. Take the claim here instead; each
+// child inherits the token and passes through. Taken AFTER `restore` is registered, deliberately:
+// `exit` listeners run in registration order, so the config is put back before the store's own
+// `exit` hook gives the claim up, never after.
+claimProjectOrExit(projectDir, 'smoke: debugBuild flag (CLI)', 'smoke-debug-flag');
 
 let failures = 0;
 const ok = (name, cond, detail = '') => {

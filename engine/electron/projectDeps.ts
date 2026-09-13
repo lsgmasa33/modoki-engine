@@ -77,6 +77,39 @@ export function hasStaleWorkspaceLink(
 }
 
 /**
+ * Would opening this project have to INSTALL before the editor can start? It has an installable
+ * `package.json` (deps, devDeps or workspaces) and either no `node_modules` or a missing workspace
+ * link. Read-only.
+ *
+ * This is the whole of `ensureProjectDeps`' own pre-vendoring check, not a copy of it: main.ts
+ * calls this for its initial `needsInstall`. The heal-on-open claim (#1160, `openClaim.ts`) asks it
+ * too, with `completedInstall`, to decide between skipping and waiting. Two copies of one rule
+ * would drift. Vendoring can ALSO trigger an install (a changed plugin tarball), but vendoring
+ * writes, so it cannot be asked before the claim is held. A present-but-stale plugin extraction
+ * therefore reads as "not missing" here. An unreadable `package.json` reads as not missing, as
+ * `ensureProjectDeps` returns early on it too.
+ *
+ * `completedInstall: true` also counts a `node_modules` with no `node_modules/.package-lock.json` as
+ * missing. npm writes that hidden lockfile LAST, after every package is extracted, so its absence
+ * means another process's install is still running, or died. Measured timings are in
+ * `openClaim.ts`'s header. It is not the default: `ensureProjectDeps` would then re-install on every
+ * open any tree an npm without the hidden lockfile produced, and its own existence check is what
+ * #215's design chose.
+ */
+export function projectDepsMissing(projectRoot: string, fsOps: WorkspaceLinkFs, opts: { completedInstall?: boolean } = {}): boolean {
+  let pkg: { dependencies?: object; devDependencies?: object; workspaces?: unknown };
+  try {
+    pkg = JSON.parse(fsOps.readFileSync(`${projectRoot}/package.json`, 'utf8'));
+  } catch {
+    return false;
+  }
+  if (!pkg || (!pkg.dependencies && !pkg.devDependencies && !pkg.workspaces)) return false;
+  if (!fsOps.existsSync(`${projectRoot}/node_modules`)) return true;
+  if (opts.completedInstall && !fsOps.existsSync(`${projectRoot}/node_modules/.package-lock.json`)) return true;
+  return hasStaleWorkspaceLink(projectRoot, pkg, fsOps);
+}
+
+/**
  * Compose the error a failed dependency install should surface, folding in an earlier
  * vendoring failure as the CAUSE when there was one.
  *

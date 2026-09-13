@@ -3,30 +3,12 @@
  *  a list of up to 16 named layers + a symmetric NxN collision matrix (checkbox grid,
  *  matrix[i] = bitmask of layers i collides with). Toggling cell (i,j) flips both
  *  (i,j) and (j,i) so the matrix stays symmetric. Resolves to Rapier bits at runtime
- *  via physicsLayers.resolveColliderBits. */
+ *  via physicsLayers.resolveColliderBits. The edit decisions live in physicsLayersMatrix.ts. */
 
-const MAX_LAYERS = 16;
-const ALL = 0xffff;
-
-export interface PhysicsLayersValue {
-  layers: string[];
-  collisionMatrix: number[];
-}
-
-function normalize(value: unknown): PhysicsLayersValue {
-  const v = (value ?? {}) as Partial<PhysicsLayersValue>;
-  const layers = Array.isArray(v.layers) && v.layers.length > 0 ? v.layers.slice(0, MAX_LAYERS) : ['Default'];
-  const src = Array.isArray(v.collisionMatrix) ? v.collisionMatrix : [];
-  const matrix = layers.map((_, i) => (typeof src[i] === 'number' ? (src[i] & ALL) >>> 0 : ALL));
-  return { layers, collisionMatrix: matrix };
-}
-
-/** Drop bit k from a 16-bit mask and shift higher bits down one (layer removal). */
-function removeBit(v: number, k: number): number {
-  const low = v & ((1 << k) - 1);
-  const high = (v >>> (k + 1)) << k;
-  return (low | high) & ALL;
-}
+import {
+  MAX_LAYERS, normalizePhysicsLayers, toggleLayerPair, addPhysicsLayer, removePhysicsLayer,
+  layerPairChecked, type PhysicsLayersValue,
+} from './physicsLayersMatrix';
 
 const cell: React.CSSProperties = { width: 22, height: 22, textAlign: 'center', padding: 0 };
 const hdr: React.CSSProperties = { ...cell, color: '#8a8aa8', fontSize: 10, fontFamily: 'monospace' };
@@ -40,46 +22,19 @@ const smallBtn: React.CSSProperties = {
 };
 
 export default function PhysicsLayersEditor({ value, onChange }: { value: unknown; onChange: (v: PhysicsLayersValue) => void }) {
-  const { layers, collisionMatrix } = normalize(value);
-
-  const emit = (layersNext: string[], matrixNext: number[]) => onChange({ layers: layersNext, collisionMatrix: matrixNext });
+  const current = normalizePhysicsLayers(value);
+  const { layers, collisionMatrix } = current;
 
   const rename = (i: number, name: string) => {
     // Blanks are allowed transiently (runtime keeps entries by index, so an empty name
     // is a harmless unselectable slot — it never shifts other layers' matrix bits).
-    const next = layers.slice(); next[i] = name; emit(next, collisionMatrix);
+    const next = layers.slice(); next[i] = name; onChange({ layers: next, collisionMatrix });
   };
 
-  const uniqueName = () => {
-    let n = layers.length;
-    let name = `Layer ${n}`;
-    while (layers.includes(name)) name = `Layer ${++n}`;
-    return name;
-  };
-
-  const toggle = (i: number, j: number) => {
-    const m = collisionMatrix.slice();
-    if (i === j) { m[i] ^= (1 << i); }
-    else { m[i] ^= (1 << j); m[j] ^= (1 << i); }
-    m[i] &= ALL; m[j] &= ALL;
-    emit(layers, m);
-  };
-
-  const addLayer = () => {
-    if (layers.length >= MAX_LAYERS) return;
-    // New layer collides with everything by default; existing rows already have its
-    // bit set (defaults are all-ones), and the new row is all-ones too → symmetric.
-    emit([...layers, uniqueName()], [...collisionMatrix, ALL]);
-  };
-
-  const removeLayer = (k: number) => {
-    if (layers.length <= 1) return; // keep at least one
-    const layersNext = layers.filter((_, i) => i !== k);
-    const matrixNext = collisionMatrix.filter((_, i) => i !== k).map((row) => removeBit(row, k));
-    emit(layersNext, matrixNext);
-  };
-
-  const checked = (i: number, j: number) => (collisionMatrix[i] & (1 << j)) !== 0;
+  const toggle = (i: number, j: number) => onChange({ layers, collisionMatrix: toggleLayerPair(collisionMatrix, i, j) });
+  const addLayer = () => { if (layers.length < MAX_LAYERS) onChange(addPhysicsLayer(current)); };
+  const removeLayer = (k: number) => { if (layers.length > 1) onChange(removePhysicsLayer(current, k)); };
+  const checked = (i: number, j: number) => layerPairChecked(collisionMatrix, i, j);
 
   return (
     <div style={{ color: '#ddd', fontSize: 12 }}>

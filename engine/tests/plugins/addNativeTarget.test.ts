@@ -9,17 +9,35 @@ import { fileURLToPath } from 'node:url';
 import { ensureCapacitorDeps, ensureCapacitorConfig, detectMissingFirebase, detectMissingFirebaseResult, isPlausibleProjectDir, isNativeTargetScaffolded, scaffoldNativeTarget } from '../../plugins/addNativeTarget';
 import { mergeProjectConfig } from '../../project-config';
 import { makeDirLink } from '../helpers/linkFixture';
+import { acquireBuildClaim, resetBuildClaimsForTests } from '../../scripts/buildClaimsStore.mjs';
 
 let root: string;
 let editorRoot: string;
+let home: string;
+let prevHome: string | undefined;
+let releaseClaim: (() => void) | null;
 
 beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ant-'));
   editorRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ant-ed-'));
   // Mark root as a real Modoki project so the D8 containment guard allows scaffolding.
   fs.writeFileSync(path.join(root, 'project.config.json'), '{}');
+  // scaffoldNativeTarget refuses unless this process holds the project's build claim (#1160), as
+  // both real callers do. Claimed in a private MODOKI_HOME so no test shares a claims file.
+  home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ant-home-'));
+  prevHome = process.env.MODOKI_HOME;
+  process.env.MODOKI_HOME = home;
+  const claim = acquireBuildClaim(root, 'native scaffold (test)');
+  if (!claim.ok) throw new Error(`fixture could not claim: ${claim.message}`);
+  releaseClaim = claim.release;
 });
 afterEach(() => {
+  releaseClaim?.();
+  releaseClaim = null;
+  resetBuildClaimsForTests();
+  if (prevHome === undefined) delete process.env.MODOKI_HOME;
+  else process.env.MODOKI_HOME = prevHome;
+  fs.rmSync(home, { recursive: true, force: true });
   fs.rmSync(root, { recursive: true, force: true });
   fs.rmSync(editorRoot, { recursive: true, force: true });
 });
@@ -268,6 +286,41 @@ describe('isNativeTargetScaffolded markers match the real @capacitor/cli templat
     const entries = templateEntries('android-template.tar.gz');
     expect(entries).toContain('app/build.gradle');
     expect(entries[entries.length - 1]).toBe('variables.gradle');
+  });
+});
+
+describe('scaffoldNativeTarget — the claim gate (#1160)', () => {
+  it('refuses at entry, touching NOTHING, when this process does not hold the project\'s build claim', async () => {
+    releaseClaim?.();
+    releaseClaim = null;
+    writePkg();
+    const cfg = mergeProjectConfig({ app: { appId: 'com.x.y', appName: 'My Game', iconSource: '' } });
+    const before = fs.readFileSync(path.join(root, 'package.json'), 'utf8');
+    const shell: string[] = [];
+    await expect(scaffoldNativeTarget({
+      projectRoot: root, platform: 'android', buildCwd: editorRoot, cfg,
+      send: () => {}, runShell: async (label) => { shell.push(label); return true; },
+    })).rejects.toThrow(/does not hold its build claim/);
+    expect(shell).toEqual([]);
+    expect(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).toBe(before);
+    expect(fs.existsSync(path.join(root, 'capacitor.config.json'))).toBe(false);
+  });
+
+  it('refuses when ANOTHER project is claimed — the claim is per project root', async () => {
+    releaseClaim?.();
+    const other = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ant-other-'));
+    try {
+      const c = acquireBuildClaim(other, 'someone else');
+      if (!c.ok) throw new Error(c.message);
+      releaseClaim = c.release;
+      writePkg();
+      const cfg = mergeProjectConfig({ app: { appId: 'com.x.y', appName: 'My Game', iconSource: '' } });
+      await expect(scaffoldNativeTarget({
+        projectRoot: root, platform: 'android', buildCwd: editorRoot, cfg, send: () => {}, runShell: async () => true,
+      })).rejects.toThrow(/does not hold its build claim/);
+    } finally {
+      fs.rmSync(other, { recursive: true, force: true });
+    }
   });
 });
 

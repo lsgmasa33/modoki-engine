@@ -25,7 +25,8 @@ import { editorEmit } from '../editorJournal';
 import { hasTimelinePreviewSession, endTimelinePreviewSession, isPreviewRestoreInFlight, cancelPreviewGestures, whenPreviewRestoresLanded } from './timelinePreview';
 import { setVerboseCapture, isVerboseCaptureActive } from '../../runtime/core/journal';
 import { fetchAiSettings, getCachedAiSettings } from '../panels/aiSettingsModel';
-import { findEntityByGuid } from '../../runtime/core/ecs/world';
+import { findEntityByGuid, getCurrentWorld } from '../../runtime/core/ecs/world';
+import { ensurePhysicsReady } from '../../runtime/physics/physicsReady';
 import { writeTraitField } from '../../runtime/core/ecs/entityUtils';
 import { getAllTraits } from '../../runtime/core/ecs/traitRegistry';
 
@@ -204,6 +205,11 @@ export async function enterPlay(): Promise<void> {
         console.warn(`[Editor] A5 base snapshot skipped for "${entry.path}": ${(e as Error).message}`);
       }
     }
+    // A body added since the scene loaded (the load itself already awaited Rapier) would otherwise
+    // run Play's first frames with no physics (#1175). Awaited BEFORE the generation re-check below,
+    // so a scene load landing during the WASM fetch is refused exactly like one landing mid-snapshot.
+    // A permanent init failure still enters Play — the loader has logged it loudly.
+    await ensurePhysicsReady(getCurrentWorld());
     // A scene load landed while we were snapshotting: everything captured above describes a world
     // that is gone. Refuse to enter Play rather than arm a Stop that would restore the wrong scene.
     // Bail BEFORE `setPlayState('playing')` — past that point Play is externally visible and the

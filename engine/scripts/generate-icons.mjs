@@ -51,6 +51,7 @@ import { applyAndroidSplashTheme } from './androidSplashTheme.mjs';
 import { isEntryPoint } from './entryPoint.mjs';
 import { loadEnginePluginModuleResult } from './loadVendorPlugins.mjs';
 import { resolveIconInputs, stampExtrasFrom } from './iconInputs.mjs';
+import { claimProjectOrExit } from './cliBuildClaim.mjs';
 
 /** The one directory each platform's run owns. Everything the generator writes here is its
  *  product and is kept; everything it writes elsewhere is collateral and is undone. Measured,
@@ -233,6 +234,12 @@ async function main() {
     process.exit(2);
   }
   const projectRoot = path.resolve(args.project);
+  // #1160: this rewrites `assets/` and, through `@capacitor/assets`, the project's `ios/`/`android/`,
+  // so a hand run takes the build claim first. Spawned by a claimed build (build-web.mjs or the
+  // editor's `/api/build` step), it inherits the parent's token and passes straight through. Held
+  // for the rest of the run: `main` has a dozen return and exit paths, and the store's `exit` hook
+  // releases the claim on every one of them, which a `finally` here could not.
+  claimProjectOrExit(projectRoot, `generate ${platform} icons (CLI)`, 'icon');
   // #1011: every input now comes from the config unless a flag overrides it, so the CLI and the
   // editor's build plan cannot disagree about what the project authored.
   const { cfg, malformed } = await loadIconProjectConfig(projectRoot);

@@ -17,6 +17,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 import fs from 'node:fs';
+import { claimProjectOrExit } from './cliBuildClaim.mjs';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const project = process.argv[2] || 'games/space-invader';
@@ -32,6 +33,9 @@ const ok = (name, cond, detail = '') => { console.log(`${cond ? 'PASS' : 'FAIL'}
 
 // 0. Build the artifact fresh.
 console.log(`[smoke-playable] building ${project} playable…`);
+// #1160: the delete below runs before the `build-web` child claims, so the claim is taken here and
+// the child inherits the token. The store's `exit` hook releases it at the end of the run.
+claimProjectOrExit(path.join(REPO_ROOT, project), 'smoke: playable export (CLI)', 'smoke-playable');
 fs.rmSync(path.join(REPO_ROOT, project, 'ads'), { recursive: true, force: true });
 execFileSync('node', ['engine/scripts/build-web.mjs', '--target', 'playable'], {
   cwd: REPO_ROOT, stdio: ['ignore', 'ignore', 'inherit'],

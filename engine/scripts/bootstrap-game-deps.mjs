@@ -54,6 +54,7 @@ import { fileURLToPath } from 'node:url';
 import { discoverProjects } from './projectRoots.mjs';
 import { projectNeedsInstall } from './projectNeedsInstall.mjs';
 import { loadVendorPlugins } from './loadVendorPlugins.mjs';
+import { acquireBuildClaim } from './buildClaimsStore.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -72,6 +73,9 @@ const npmRun = (args, cwd) =>
 const projects = discoverProjects(repoRoot);
 let installed = 0;
 let built = 0;
+/** Projects left untouched because a build held their claim (#1160) — named again in the summary,
+ *  so a skip is not lost in a long postinstall log. */
+const skipped = [];
 
 // Loaded ONCE, outside the loop — every project vendors the SAME engine plugins, so there is no
 // reason to re-bundle vendorPlugins.ts per project. `null` on a tarball snapshot (no
@@ -104,58 +108,80 @@ for (const proj of projects) {
   // (~0.3s for a no-op), so re-running it is the honest check. `bootstrap-mcp-deps.mjs` carried
   // the same wrong shortcut for engine/tools/* and no longer does.
 
-  // Vendor BEFORE install (#650) — see the file header. `vendorResult` stays `null` when there is
-  // no vendor module to load (a tarball snapshot, or a packaged install with no esbuild) OR when
-  // this project has no engine plugin dependency at all; either way the install below still runs.
-  // Non-fatal like `main.ts`'s own try/catch: a vendoring failure here means the install a few
-  // lines down is now GUARANTEED to fail too (the placeholder `"*"` spec is not on the public
-  // registry), so it is more useful to let that failure surface with its own message than to
-  // abort a step earlier and hide it.
-  let vendorResult = null;
-  if (vendorMod) {
-    try {
-      vendorResult = vendorMod.vendorEnginePlugins(gameDir, repoRoot, { canBuild: true });
-      if (vendorResult.vendored.length) {
-        console.log(`[bootstrap-game-deps] vendored engine plugin(s) for ${label}: ${vendorResult.vendored.join(', ')}`);
-      }
-    } catch (e) {
-      console.warn(`[bootstrap-game-deps] WARNING: plugin vendoring failed for ${label} (continuing): ${e instanceof Error ? e.message : String(e)}`);
-    }
-  }
-
-  console.log(`[bootstrap-game-deps] installing ${label} …`);
+  // #1160: vendoring, the install and `build:plugins` all write this project, so they run under its
+  // build claim. A project a build currently holds is SKIPPED with a warning, never waited on and
+  // never failed: a root `npm install` must not hang or go red because one game is mid-build. The
+  // skipped project is left as it is. A native build holding the claim heals it (`healNativeProject`),
+  // but a web build does not, so the summary below tells the human to run `npm install` again.
+  // `acquireBuildClaim` can also THROW (an uncreatable `~/.modoki`, a wedged lock); that skips the
+  // same way, since writing unclaimed is what this block exists to stop.
+  let claim;
   try {
-    // `--no-audit`: the root .npmrc sets audit=false, but npm reads a project .npmrc only from
-    // the project it operates on — it does NOT walk up to the repo root — and lifecycle scripts do
-    // not export npm_config_audit to children (both verified). So every nested install here would
-    // still hit registry.npmjs.org's audit endpoints, which hang and 503 (npm/cli#7383): 3-5min per
-    // no-op install x26 projects = ~2h. Dependabot on GitHub is what actually reports vulns.
-    npmRun(['install', '--no-audit'], gameDir);
-    installed++;
-    // Records which tarball each plugin was installed from, so the next open/build can detect a
-    // stale extraction (same marker `ensureProjectDeps`/`build-web.mjs` write) — only meaningful
-    // when vendoring actually ran.
-    if (vendorResult) vendorMod.writeVendorMarker(gameDir, vendorResult.expectedVendor);
+    claim = acquireBuildClaim(gameDir, 'bootstrap-game-deps (npm postinstall)', { kind: 'cli' });
   } catch (e) {
-    console.warn(
-      `[bootstrap-game-deps] WARNING: npm install failed in ${label} — ` +
-        `that project won't load in the editor until its deps install. (${e.message})`
-    );
-    continue; // no point building plugins if install failed
+    claim = { ok: false, message: e instanceof Error ? e.message : String(e) };
   }
+  if (!claim.ok) {
+    console.warn(`[bootstrap-game-deps] WARNING: skipped ${label}, its deps were NOT installed: ${claim.message}`);
+    skipped.push(label);
+    continue;
+  }
+  try {
+    // Vendor BEFORE install (#650) — see the file header. `vendorResult` stays `null` when there is
+    // no vendor module to load (a tarball snapshot, or a packaged install with no esbuild) OR when
+    // this project has no engine plugin dependency at all; either way the install below still runs.
+    // Non-fatal like `main.ts`'s own try/catch: a vendoring failure here means the install a few
+    // lines down is now GUARANTEED to fail too (the placeholder `"*"` spec is not on the public
+    // registry), so it is more useful to let that failure surface with its own message than to
+    // abort a step earlier and hide it.
+    let vendorResult = null;
+    if (vendorMod) {
+      try {
+        vendorResult = vendorMod.vendorEnginePlugins(gameDir, repoRoot, { canBuild: true });
+        if (vendorResult.vendored.length) {
+          console.log(`[bootstrap-game-deps] vendored engine plugin(s) for ${label}: ${vendorResult.vendored.join(', ')}`);
+        }
+      } catch (e) {
+        console.warn(`[bootstrap-game-deps] WARNING: plugin vendoring failed for ${label} (continuing): ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
 
-  // Build the game's native-plugin dist/ (gitignored) when it has one.
-  if (pkg.scripts?.['build:plugins']) {
-    console.log(`[bootstrap-game-deps] building plugins for ${label} …`);
+    console.log(`[bootstrap-game-deps] installing ${label} …`);
     try {
-      npmRun(['run', 'build:plugins'], gameDir);
-      built++;
+      // `--no-audit`: the root .npmrc sets audit=false, but npm reads a project .npmrc only from
+      // the project it operates on — it does NOT walk up to the repo root — and lifecycle scripts do
+      // not export npm_config_audit to children (both verified). So every nested install here would
+      // still hit registry.npmjs.org's audit endpoints, which hang and 503 (npm/cli#7383): 3-5min per
+      // no-op install x26 projects = ~2h. Dependabot on GitHub is what actually reports vulns.
+      npmRun(['install', '--no-audit'], gameDir);
+      installed++;
+      // Records which tarball each plugin was installed from, so the next open/build can detect a
+      // stale extraction (same marker `ensureProjectDeps`/`build-web.mjs` write) — only meaningful
+      // when vendoring actually ran.
+      if (vendorResult) vendorMod.writeVendorMarker(gameDir, vendorResult.expectedVendor);
     } catch (e) {
       console.warn(
-        `[bootstrap-game-deps] WARNING: build:plugins failed in ${label} — ` +
-          `that project's native plugins won't resolve until built. (${e.message})`
+        `[bootstrap-game-deps] WARNING: npm install failed in ${label} — ` +
+          `that project won't load in the editor until its deps install. (${e.message})`
       );
+      continue; // no point building plugins if install failed
     }
+
+    // Build the game's native-plugin dist/ (gitignored) when it has one.
+    if (pkg.scripts?.['build:plugins']) {
+      console.log(`[bootstrap-game-deps] building plugins for ${label} …`);
+      try {
+        npmRun(['run', 'build:plugins'], gameDir);
+        built++;
+      } catch (e) {
+        console.warn(
+          `[bootstrap-game-deps] WARNING: build:plugins failed in ${label} — ` +
+            `that project's native plugins won't resolve until built. (${e.message})`
+        );
+      }
+    }
+  } finally {
+    claim.release();
   }
 }
 
@@ -169,3 +195,9 @@ console.log(
   `[bootstrap-game-deps] done (${installed} project(s) installed, ` +
     `${built} built native plugins).`
 );
+if (skipped.length) {
+  console.warn(
+    `[bootstrap-game-deps] WARNING: ${skipped.length} project(s) skipped because their build claim could not be taken: ` +
+      `${skipped.join(', ')}. Run \`npm install\` again once that build finishes.`
+  );
+}

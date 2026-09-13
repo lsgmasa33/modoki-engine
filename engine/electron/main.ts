@@ -259,7 +259,7 @@ import { showMessageBox, resolveDialogParent } from './mainDialog';
 import { serializeMenu, triggerMenuItem, type MenuItemLike } from './menuActions';
 import { getSsrLoadModule, closeSsrLoader } from './ssrLoader';
 import { buildProdCsp, PROD_CSP_ORIGINS } from './csp';
-import { startDevServer, stopDevServer, findFreePort, reclaimLeakedDevServer } from './devServer';
+import { startDevServer, stopDevServer, findFreePort, reclaimLeakedDevServer, devServerRoot } from './devServer';
 import { showSplash, setSplashStatus, closeSplash } from './splash';
 import { pickProjectFolder, pickNewProjectFolder, addRecentProject, getRecentProjects, migrateLegacyRecents, setRecentsScope, chooseInitialProject, projectFolderKind, installAppMenu, isEditorsOwnTree, type RendererMenuSpec } from './projects';
 import { scaffoldProject } from './newProject';
@@ -268,7 +268,9 @@ import { portCandidates, readLastPort, writeLastPort, parseBackendPort } from '.
 import { buildMcpServerEntry, buildChromeDevtoolsEntry, mergeMcpConfig, isMcpStale, mcpChromePort, isMcpTokenForeign, ensureMcpGitignored, detectClaudeCli, atomicWriteFileSync, healMcpPort, resolveMcpTarget, mcpHasModoki, mcpBackendRaw, gitTrackedState, ensureProjectClaudeMd } from './connectClaude';
 import { ensureToken } from './instanceToken';
 import { vendorEnginePlugins, writeVendorMarker, type VendorResult } from '../plugins/vendorPlugins';
-import { composeDepsInstallError, hasStaleWorkspaceLink } from './projectDeps';
+import { composeDepsInstallError, projectDepsMissing } from './projectDeps';
+import { claimProjectForOpen, createOpenSequencer, type OpenTicket } from './openClaim';
+import { acquireBuildClaim } from '../scripts/buildClaimsStore.mjs';
 import { healNativeConfig } from '../plugins/healNativeConfig';
 // The ONE 'same directory?' comparison (#869).
 import { samePath } from '../scripts/pathIdentity.mjs';
@@ -434,7 +436,12 @@ async function installProjectDeps(cwd: string, opts: { preferCi: boolean }): Pro
  *  it runs even for a flat game with native folders but no package.json (which made
  *  ensureProjectDeps early-return before heal); it can't silently stop if the
  *  dep-install logic is refactored; and it ALWAYS logs (a "nothing to do" line
- *  included) so heal-on-open is observable. */
+ *  included) so heal-on-open is observable.
+ *
+ *  Since #1160 "every open" means through `healAndInstallOnOpen`, under the project's build claim.
+ *  The heal can now be skipped: when a build holds the claim and a completed install is present, the
+ *  open leaves the project as it is (only a native build repairs it meanwhile). That skip is logged
+ *  too, so the heal never stops silently. */
 function healProjectOnOpen(projectRoot: string): void {
   if (isEditorsOwnTree(projectRoot, REPO_ROOT)) return; // the editor's own tree, not a game (#869)
   try {
@@ -446,7 +453,7 @@ function healProjectOnOpen(projectRoot: string): void {
   }
 }
 
-async function ensureProjectDeps(projectRoot: string): Promise<void> {
+async function ensureProjectDeps(projectRoot: string, opts: { forceInstall?: boolean } = {}): Promise<void> {
   if (isEditorsOwnTree(projectRoot, REPO_ROOT)) return; // the editor's own tree (#869)
   const pkgPath = path.join(projectRoot, 'package.json');
   if (!fs.existsSync(pkgPath)) return; // not an npm project
@@ -472,8 +479,8 @@ async function ensureProjectDeps(projectRoot: string): Promise<void> {
   // gitignored tarball, in which case node_modules must be (re)built.
   // The plain existence check misses the #215 class: node_modules present overall but one of
   // THIS project's own workspace packages missing from it (see hasStaleWorkspaceLink's comment).
-  let needsInstall = !fs.existsSync(path.join(projectRoot, 'node_modules'))
-    || hasStaleWorkspaceLink(projectRoot, pkg, fs);
+  // `projectDepsMissing` is that check, shared with the heal-on-open claim's skip-or-wait decision.
+  let needsInstall = !!opts.forceInstall || projectDepsMissing(projectRoot, fs);
   let vendorResult: VendorResult | null = null;
   let vendorError: string | null = null;
   try {
@@ -531,6 +538,52 @@ async function ensureProjectDeps(projectRoot: string): Promise<void> {
     }
   }
 }
+
+/** The open-time repair, `healProjectOnOpen` then `ensureProjectDeps`, run under the project's build
+ *  claim (#1160). Both write the files a native build heals, and this runs in Electron main, a
+ *  different pid from the Vite child that holds the editor's own build claims. Without it, opening a
+ *  project while a CLI build healed it raced that build.
+ *
+ *  When something else holds the claim, `claimProjectForOpen` decides: skip if a completed install is
+ *  present, wait for the claim otherwise (the owner's hybrid, #1160). The claim is released before
+ *  the caller spawns Vite, so that child does not inherit a token for a claim that is already gone.
+ *  Every branch logs, which keeps the heal observable the way `healProjectOnOpen`'s doc requires.
+ *
+ *  ⚠️ The wait can outlast a user's patience, so a second Open Project can land mid-wait. Opens run
+ *  one at a time through `opens` (`createOpenSequencer`, whose header has the why), and a newer
+ *  request supersedes this one's `ticket` at once: the wait stops before its next acquire, and this
+ *  returns false so the caller starts no dev server. Returns `ticket.isCurrent()`.
+ *
+ *  Both callers provision Node BEFORE this, outside the claim. Provisioning writes no project file,
+ *  and a first-launch download held under the claim would refuse a CLI build for its whole length.
+ *  (`ensureProjectDeps`' own `ensureNodeProvisioned` call is then a cheap stat.) */
+async function healAndInstallOnOpen(projectRoot: string, ticket: OpenTicket, status: (line: string) => void): Promise<boolean> {
+  if (isEditorsOwnTree(projectRoot, REPO_ROOT)) return ticket.isCurrent(); // the editor's own tree, not a game (#869)
+  const plan = await claimProjectForOpen(path.basename(projectRoot), {
+    acquire: () => acquireBuildClaim(projectRoot, 'editor open: native heal + deps install', { kind: 'editor' }),
+    depsMissing: () => projectDepsMissing(projectRoot, fs, { completedInstall: true }),
+    superseded: () => !ticket.isCurrent(),
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    status,
+    log: (line) => console.log(`[modoki-electron] ${line}`),
+    warn: (line) => console.warn(`[modoki-electron] ${line}`),
+  });
+  if (!plan.heal) return ticket.isCurrent();
+  try {
+    healProjectOnOpen(projectRoot);
+    // A holder that died mid-install leaves `node_modules` without npm's hidden lockfile, which
+    // `ensureProjectDeps`' own bare existence check reads as installed. Only after a wait: an
+    // uncontended open keeps that check's cheaper answer.
+    const forceInstall = plan.waited && projectDepsMissing(projectRoot, fs, { completedInstall: true });
+    await ensureProjectDeps(projectRoot, { forceInstall });
+  } finally {
+    plan.release();
+  }
+  return ticket.isCurrent();
+}
+
+/** Every project open, the launch's included, runs through this one queue (#1160). */
+const opens = createOpenSequencer();
 
 // The Vite dev-server origin the renderer loads from. Resolved at startup:
 // MODOKI_DEV_URL PINS the origin explicitly — findFreePort is skipped entirely, so
@@ -1213,7 +1266,23 @@ async function healConnectedMcp(): Promise<void> {
   }
 }
 
-async function setProject(newRoot: string, opts?: { openSettingsAfter?: boolean }): Promise<void> {
+function setProject(newRoot: string, opts?: { openSettingsAfter?: boolean }): Promise<void> {
+  // Queued synchronously, so the order of opens is the order of requests (#1160).
+  requestedRoot = newRoot;
+  return opens.open((ticket) => openProject(newRoot, ticket, opts));
+}
+
+/** The root of the NEWEST open requested, launch included (#1160). Open Project and Open Recent skip
+ *  a pick equal to it. `state.root` would be wrong for that: with opens queued it holds the last
+ *  root an open STARTED, so re-picking a project while a different one is queued would be dropped. */
+let requestedRoot = '';
+
+async function openProject(newRoot: string, ticket: OpenTicket, opts?: { openSettingsAfter?: boolean }): Promise<void> {
+  // A newer open was requested while this one queued: it owns the editor now, so touch nothing.
+  if (!ticket.isCurrent()) {
+    console.log(`[modoki-electron] open of ${newRoot} superseded before it started`);
+    return;
+  }
   await state.backend.stop().catch(() => {});
   state.root = newRoot;
   refreshInstanceToken(); // the token is per-project — a new root means a new expected token
@@ -1232,12 +1301,21 @@ async function setProject(newRoot: string, opts?: { openSettingsAfter?: boolean 
       // an in-repo game never installed). Show progress in the title — npm install
       // can take several seconds and the window is already visible.
       mainWindow?.setTitle(`Modoki Editor ${APP_VERSION} — installing ${path.basename(newRoot)}…`);
-      healProjectOnOpen(newRoot);
       if (app.isPackaged) await ensureNodeProvisioned(); // Core before Vite spawn (see whenReady)
-      await ensureProjectDeps(newRoot);
+      // False when a later open replaced this one while it waited on a build claim (#1160). That
+      // open owns the dev server and the title now, so this one must not touch either.
+      if (!(await healAndInstallOnOpen(newRoot, ticket, (line) => mainWindow?.setTitle(`Modoki Editor ${APP_VERSION} — ${line}`)))) {
+        console.log(`[modoki-electron] open of ${newRoot} superseded by ${state.root}, not starting its dev server`);
+        return;
+      }
       await startDevServer({ repoRoot: REPO_ROOT, projectRoot: newRoot, url: DEV_URL });
     } catch (e) {
       const detail = e instanceof Error ? e.message : String(e);
+      // A failure of an open the user has already moved on from is not theirs to dismiss (#1160).
+      if (!ticket.isCurrent()) {
+        console.warn(`[modoki-electron] superseded open of ${newRoot} failed (not shown): ${detail}`);
+        return;
+      }
       console.error('[modoki-electron] open project failed:', detail);
       mainWindow?.setTitle(titleFor(state.root));
       const opts = {
@@ -1295,12 +1373,12 @@ function rebuildMenu(): void {
     },
     onOpenProject: async () => {
       const chosen = await pickProjectFolder(mainWindow);
-      if (chosen && !samePath(chosen, state.root)) await setProject(chosen);
+      if (chosen && !samePath(chosen, requestedRoot)) await setProject(chosen);
     },
     // (#869) samePath, not `!==`: a recents entry is one of the two untrusted spelling
     // sources, so a differently-cased entry re-opened the project ALREADY open — a full
     // setProject, discarding whatever unsaved scene state that costs.
-    onOpenRecent: (root) => { if (!samePath(root, state.root)) void setProject(root); },
+    onOpenRecent: (root) => { if (!samePath(root, requestedRoot)) void setProject(root); },
     rendererMenus: rendererMenuSpec,
     // Relay an OS-menu click to the renderer, which dispatches the editor action.
     onMenuAction: (id) => mainWindow?.webContents.send('modoki:bridge-menu-action', id),
@@ -1474,6 +1552,11 @@ app.whenReady().then(async () => {
   const initialRoot = await resolveInitialProject();
   if (!initialRoot) { app.quit(); return; } // packaged first-launch picker cancelled
   state.root = initialRoot;
+  requestedRoot = initialRoot;
+  // The launch takes its place in the open sequence HERE, before `rebuildMenu` makes Open Project
+  // reachable, so an open picked during provisioning queues behind the launch instead of being
+  // superseded by it (#1160). Its body is supplied at the launch heal below, on every path.
+  const launchOpen = opens.reserve<boolean>();
   refreshInstanceToken(); // before the backend binds, so the token gate is never unarmed
   addRecentProject(initialRoot);
 
@@ -2145,19 +2228,46 @@ app.whenReady().then(async () => {
     // and an extra window would just get in the way of the HMR/MCP loop.
     if (app.isPackaged) showSplash();
     try {
-      setSplashStatus('Preparing the editor runtime…');
-      healProjectOnOpen(state.root);
-      // Core toolchain: ALWAYS provision the pinned Node on a packaged launch — even
-      // for a deps-less / no-package.json project (ensureProjectDeps would skip it) —
-      // AND before the Vite child spawns, so it inherits MODOKI_NODE/MODOKI_NPM_CLI
-      // and the Build-Support install SSE (which runs IN that child) can npm-install
-      // the model tools. Also makes "Core (Node / npm)" show present out of the box.
-      // Idempotent (cheap stat when already provisioned).
-      if (app.isPackaged) { setSplashStatus('Preparing Node runtime…'); await ensureNodeProvisioned(); }
-      setSplashStatus('Installing dependencies…');
-      await ensureProjectDeps(state.root);
-      setSplashStatus('Starting editor…');
-      await startDevServer({ repoRoot: REPO_ROOT, projectRoot: state.root, url: DEV_URL });
+      const launched = await launchOpen.run(async (ticket) => {
+        const launchRoot = state.root;
+        try {
+          setSplashStatus('Preparing the editor runtime…');
+          // Core toolchain: ALWAYS provision the pinned Node on a packaged launch — even
+          // for a deps-less / no-package.json project (ensureProjectDeps would skip it) —
+          // AND before the Vite child spawns, so it inherits MODOKI_NODE/MODOKI_NPM_CLI
+          // and the Build-Support install SSE (which runs IN that child) can npm-install
+          // the model tools. Also makes "Core (Node / npm)" show present out of the box.
+          // Idempotent (cheap stat when already provisioned).
+          if (app.isPackaged) { setSplashStatus('Preparing Node runtime…'); await ensureNodeProvisioned(); }
+          setSplashStatus('Installing dependencies…');
+          // Heal + install under the project's build claim; skips or waits if a build holds it (#1160).
+          if (!(await healAndInstallOnOpen(launchRoot, ticket, setSplashStatus))) return false;
+          setSplashStatus('Starting editor…');
+          await startDevServer({ repoRoot: REPO_ROOT, projectRoot: launchRoot, url: DEV_URL });
+          return true;
+        } catch (e) {
+          // Superseded: the open that replaced the launch owns the editor, so its failure is not fatal.
+          if (!ticket.isCurrent()) {
+            console.warn(`[modoki-electron] superseded launch open of ${launchRoot} failed (continuing): ${e instanceof Error ? e.message : e}`);
+            return false;
+          }
+          throw e;
+        }
+      });
+      // An Open Project picked during the launch runs after the launch's turn and restarts the dev
+      // server for ITS root. Creating the window before it settles would load a server that is about
+      // to stop, so wait for every queued open. Superseded covers both "the launch never started
+      // Vite" and "it did, and an open queued behind it".
+      if (!launched || !launchOpen.ticket.isCurrent()) {
+        console.log(`[modoki-electron] launch open superseded by ${requestedRoot}; waiting for the queued open(s)`);
+        await opens.idle();
+        const viteRoot = devServerRoot();
+        // Rooted at state.root, not merely running: a later open that failed before its own
+        // startDevServer leaves the previous project's Vite up under a backend now rooted elsewhere.
+        if (!viteRoot || !samePath(viteRoot, state.root)) {
+          throw new Error(`the project opened during launch (${state.root}) did not open, so there is no editor to show. Its own dialog named the cause.`);
+        }
+      }
     } catch (e) {
       const msg = e instanceof Error ? (e.stack || e.message) : String(e);
       console.error('[modoki-electron] failed to start dev server:', msg);
@@ -2188,6 +2298,10 @@ app.whenReady().then(async () => {
       );
       return;
     }
+  } else {
+    // No dev server to prepare, but the launch's reserved turn must still end, or every later
+    // Open Project would queue behind it forever (#1160).
+    void launchOpen.run(async () => true);
   }
 
   await createWindow(backendBase);

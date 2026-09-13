@@ -66,6 +66,8 @@ import {
   registerFrameCallback,
   unregisterFrameCallback,
   getCurrentWorld,
+  pendingPhysics,
+  ensurePhysicsReady,
   getContactState,
   registerHandleProvider,
   invalidateModel,
@@ -2319,9 +2321,51 @@ registerAgentOp('sim-step', (params) => {
   }
   const frames = Math.max(1, Math.min(600, Math.floor(Number(p.frames ?? 1))));
   const scale = typeof p.scale === 'number' && Number.isFinite(p.scale) && p.scale > 0 ? p.scale : 1;
-  const timeoutMs = Math.max(100, Math.min(SIM_STEP_MAX_TIMEOUT_MS, Number(p.timeoutMs ?? simStepDefaultTimeout(frames))));
+  const budgetMs = Math.max(100, Math.min(SIM_STEP_MAX_TIMEOUT_MS, Number(p.timeoutMs ?? simStepDefaultTimeout(frames))));
 
-  return new Promise((resolve) => {
+  // Physics readiness (#1175): a body whose Rapier WASM has not instantiated is SKIPPED by the
+  // physics system, so these frames would come back physics-free and read as real. Wait for it like
+  // the editor's `step` does — but inside this op's OWN budget, so the host's transport deadline
+  // (derived from the same timeoutMs) still holds: whatever the wait spends, the frames lose.
+  return (async () => {
+    let timeoutMs = budgetMs;
+    const pending = pendingPhysics(world);
+    if (pending.length > 0) {
+      // REAL wall time, not rawNow(): this budget races the host's transport deadline, and a manual
+      // (test/headless) clock would read the wait as 0ms and hand the frames the whole budget again.
+      const started = Date.now();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const outOfTime = new Promise<'loading'>((res) => { timer = setTimeout(() => res('loading'), budgetMs); });
+      const r = await Promise.race([ensurePhysicsReady(world), outOfTime]);
+      clearTimeout(timer);
+      const names = pending.map((m) => m.name);
+      if (r === 'loading') {
+        return {
+          ok: false, physicsLoading: names,
+          error: `sim-step refused — ${names.join(' + ')} was still loading its WASM after ${budgetMs}ms, so a step `
+            + `would run with NO physics. The load continues; retry the step.`,
+        };
+      }
+      if (!r.ok) {
+        // Permanent (the loader gave up and memoised the rejection) — retrying cannot help, so say so.
+        return { ok: false, error: `sim-step refused — physics failed to initialize, so the world would advance with NO physics: ${r.error}` };
+      }
+      timeoutMs = Math.max(100, budgetMs - (Date.now() - started));
+      if (getCurrentWorld() !== world) {
+        // A scene load replaced the world while physics loaded — nothing was unfrozen, so there is nothing to undo.
+        return { ok: false, worldReplaced: true, stepped: 0, requested: frames, error: 'the world was REPLACED while physics was loading — a scene load swapped it out, so no frames were stepped.' };
+      }
+      // Re-read the precondition: a resume (or a concurrent sim-step, whose continuation ran first and
+      // unfroze the world) landed during the wait. Stepping on would re-freeze a world someone else
+      // just set running — the side effect the entry check refuses.
+      if (getTimeScale(world) !== 0) {
+        return { ok: false, timeScale: getTimeScale(world), error: `sim-step requires a PAUSED world — timeScale became ${getTimeScale(world)} while physics was loading.` };
+      }
+    }
+    return stepFrames(timeoutMs);
+  })();
+
+  function stepFrames(timeoutMs: number) { return new Promise((resolve) => {
     const key = `__agent-sim-step-${Date.now()}`;
     let seen = 0;
     let done = false;
@@ -2372,7 +2416,7 @@ registerAgentOp('sim-step', (params) => {
       if (++seen >= frames) finish(false);
     }, 100);
     setTimeScale(world, scale);
-  });
+  }); }
 });
 
 // ── Entity lifecycle (#166 P2) — runtime twins, so the DEVICE can spawn/duplicate/delete. The

@@ -1113,6 +1113,16 @@ same actions + state a person has in the editor. They relay to the renderer over
     § "Second module instance" below (#1155).
 - **Play/test the game:** `modoki_play_control {play|stop|pause|resume|step}` — press Play, exercise
   with `modoki_tap`/`modoki_drag`, read `get_scene_state`, then stop (reverts the authored snapshot).
+  **`play`/`resume`/`step` WAIT for physics** (#1175): the physics systems skip every tick until
+  Rapier's WASM instantiates, so on a cold editor a step used to report success, move nothing and
+  journal no `@collision` — a false "these never collide". The contract chosen is **await, not
+  report**: no tick runs until the Rapier the world's bodies need has instantiated. A PERMANENT init
+  failure is refused (`ok:false`) by `resume`/`step` and by `play` from PAUSED; `play` from STOPPED
+  still enters Play (as a human's would) and returns `physicsError`. From STOPPED, `play` does its waiting INSIDE `enterPlay` — an
+  await in front of it sat outside the Play-startup latch, where a Stop was dropped instead of
+  queued; from PAUSED (where `enterPlay` awaits nothing) the op waits itself, like `resume`.
+  `device_step` waits inside its own `timeoutMs` budget and refuses with `physicsLoading: [...]` only
+  when that runs out (retry), or names a permanent failure.
 - **Edit like a human (undoable):** `modoki_create_entity` (empty/primitive/2d/ui/camera/light/
   particle — identical to the Hierarchy menu), `modoki_duplicate_entity`, `modoki_delete_entities`,
   `modoki_reparent_entity`, `modoki_set_selection`, `modoki_set_gizmo`, `modoki_focus_entity`,

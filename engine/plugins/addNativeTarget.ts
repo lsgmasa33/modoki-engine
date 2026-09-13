@@ -24,6 +24,7 @@ import { findDeleteBoundaries, describeBoundary } from '../scripts/deleteBoundar
 import type { ProjectConfig } from '../project-config';
 import { vendorEnginePlugins, writeVendorMarker } from './vendorPlugins';
 import { healNativeConfig } from './healNativeConfig';
+import { holdsBuildClaim } from '../scripts/buildClaimsStore.mjs';
 
 export type NativePlatform = 'ios' | 'android';
 
@@ -353,6 +354,17 @@ export async function scaffoldNativeTarget(opts: {
   force?: boolean;
 }): Promise<{ warnings: string[] }> {
   const { projectRoot, platform, buildCwd, cfg, send, runShell, force = false } = opts;
+  // #1160: the same gate `healNativeProject` carries, for the same reason. Every step below writes
+  // the project, so the caller must hold its build claim. Both callers (`/api/add-native-target`
+  // through `acquireBuildSlot`, and `add-native-targets.mjs`) already claim first, so this closes no
+  // live race. It makes a third caller that forgets refuse at entry, before it touches anything,
+  // instead of racing a build.
+  if (!holdsBuildClaim(projectRoot)) {
+    throw new Error(
+      `refusing to scaffold ${platform}/ in ${projectRoot}: this process does not hold its build claim. `
+      + 'A scaffold writes the project, so it must run under the claim a build takes first (#1160).',
+    );
+  }
   const platformDir = path.join(projectRoot, platform);
   const alreadyComplete = isNativeTargetScaffolded(projectRoot, platform);
   const willRemove = fs.existsSync(platformDir) && (force || !alreadyComplete);

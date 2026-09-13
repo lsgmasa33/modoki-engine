@@ -696,6 +696,79 @@ pid/TTL staleness, the shape `deviceClaimsStore.mjs` already uses for hardware).
 take the claim and **refuse and exit** rather than waiting: a scripted build must not hang on an
 interactive editor, which is what the routes already do.
 
+**Every other project writer takes the claim too (#1160).** The six above share `dist/`, but the
+claim guards the whole project a build heals: its native folders, `plugins/`, `package.json`,
+lockfile and `node_modules`. #1160's census found nine paths writing those with no claim. Each now
+takes it, in one of three shapes, chosen by what a refusal should do:
+
+| Writer | On a held claim | Why |
+|---|---|---|
+| `vendor-plugins.mjs`, `generate-icons.mjs` and `ota-embed-manifest.mjs` run by hand, and the two smoke scripts (before their `rmSync` of `dist/`/`ads/`) | **refuse, exit 1** (`claimProjectOrExit`, `scripts/cliBuildClaim.mjs`) | a one-shot script has nothing else useful to do. Spawned by a claimed build, each inherits the token and passes through |
+| `bootstrap-game-deps.mjs` (the root `postinstall`) | **skip that project**, warn, name it again in the summary | a root `npm install` must not hang or fail because one game is building. The summary says to re-run it |
+| Electron's heal-on-open (`healAndInstallOnOpen` → `claimProjectForOpen`, `electron/openClaim.ts`) | **skip if a COMPLETED install is present; otherwise wait for the claim**; skip with a warning if the claim is unreadable; stop waiting if another project is opened | the owner's call on #1160. The editor opens instantly when it can, and cannot start Vite without deps when it cannot |
+| `scaffoldNativeTarget` | **throws at entry** (`holdsBuildClaim`) | both callers already claim. The gate catches a future caller that forgets |
+
+⚠️ **A skip leaves the project as it is. It is not a promise that the holder repairs it.** A native
+build does (`healNativeProject`). A web build, `generate-icons` or a smoke script does not, so a
+stale plugin extraction the open would have re-installed stays stale until the next open. The log
+says "left as they are" for that reason.
+
+⚠️ **"Present" means npm FINISHED, and a started wait ends only on the claim.** The #1160 review
+caught the first version ending its wait on a bare `node_modules`. npm creates that directory early:
+measured on a fresh install of three + typescript, it appears at +1.1s, the last package at +4.9s,
+and npm's hidden lockfile `node_modules/.package-lock.json` at +5.0s. So the question uses the hidden
+lockfile (`projectDepsMissing(…, { completedInstall: true })`), and it is asked once, before
+waiting. When an open WAITED and the tree still has no hidden lockfile after it acquires, it forces
+the install `ensureProjectDeps`' bare existence check would skip: the holder died mid-way through a
+fresh install or an `npm ci`. Residues, all accepted:
+- A holder killed while RE-installing over a complete tree leaves the old hidden lockfile behind, and
+  that still reads as present. npm writes it only at the end and does not delete it first.
+- A holder that died BEFORE the open started leaves a stale claim. The first acquire succeeds, so
+  nothing was waited on and nothing is forced.
+- A holder's `build:plugins` running after its install is invisible to the check.
+
+⚠️ **Project opens are SERIALIZED, and a newer request supersedes every older one at once**
+(`createOpenSequencer`, `electron/openClaim.ts`). The editor has one dev server and one
+`state.root`, and each open restarts both. So two concurrent opens corrupt each other: one open's
+`startDevServer` stops the other's child mid-start. On the launch path that quit the app. The wait
+made that window minutes long. The first two fixes guarded one moment inside it: a generation check
+before Vite, then a root comparison, which A → B → A defeated. Review then found the race in every
+await of the open (provisioning, the install, Vite's own start), so the fix became structural:
+- Each open runs only after the previous one has settled.
+- A newer request flips the older open's ticket at once, so its claim wait returns early instead of
+  holding the newer open in the queue.
+- A superseded open that has not started does nothing, and a superseded failure shows no dialog.
+- The launch RESERVES its turn before the menu goes live, so an Open Project picked during a
+  first-launch Node download queues behind the launch instead of being overridden by it.
+- A superseded launch (including one superseded right after its own Vite came up) waits for the
+  queue to go idle. It then requires a dev server rooted at `state.root` before creating the window.
+  If the open that replaced it failed, the launch reports that rather than opening a window onto no
+  server or the wrong one.
+- Open Project and Open Recent skip a pick equal to the newest REQUESTED root (`requestedRoot`), not
+  `state.root`. With opens queued, `state.root` holds the last root an open STARTED, so re-picking
+  a project while another was queued was silently dropped.
+
+Residues, accepted: an Open Project picked after the launch's `idle()` but before its window loads
+still races that load; and a newer open whose Vite timed out with the child still alive passes the
+root check, and the window then waits out its own timeout.
+
+⚠️ **The editor's own build claim does NOT cover its heal-on-open.** The routes run in the Vite child
+(`devServer.ts` spawns it), and the claim is held by that pid. The heal runs in Electron main, a
+different process that held nothing, so opening a project while a CLI build healed it raced
+freely. That is why the open takes its own claim. It releases it before spawning Vite, so the child
+never inherits a token for a claim that is already gone.
+
+**The guard is derived, not listed.** `cliBuildClaims.test.ts` below names its scripts one by one,
+which is exactly how those nine went unseen. `projectWritersTakeBuildClaim.test.ts` walks every
+production file under `engine/scripts`, `engine/electron` and `engine/plugins` that calls a project
+mutator (`vendorEnginePlugins`, `healNativeConfig`, `installProjectDeps`, …) and requires a claim
+spelling in the same file. Its header states what it cannot see: file-level granularity, direct `fs`
+writes to a project path, and a new helper nobody added to its list. The behavioural tests
+(`openClaim`, `bootstrapGameDepsClaim`, `cliScriptsTakeBuildClaim`) cover those specific paths.
+Out of scope on purpose: the config-only writers (`/api/project-settings`, `migrate-*`,
+`seed-quality-tiers`) do not touch what the claim guards, and the two project scaffolders refuse a
+non-empty target, so they cannot race a build.
+
 ⚠️ **The holder SPAWNS a child that wants the same claim, and that nearly shipped as a deadlock.**
 Every route's first pipeline step is `node engine/scripts/build-web.mjs` with
 `MODOKI_PROJECT=<projectRoot>` — the child then asks for a claim on the identical key and, without
@@ -2073,10 +2146,9 @@ the CLI script rather than sitting beside it — is the general shape of the bui
   inherited its token on `MODOKI_BUILD_CLAIM_TOKEN`. An unreadable claims file reads as NOT held —
   it answers a gate. Every build entry point already claimed before it healed (measured at #827),
   so this closed no live race; it makes a build that heals unclaimed refuse instead of racing.
-  ⚠️ It covers `healNativeProject` ONLY. `scaffoldNativeTarget` does not ask, and neither does the
-  Electron heal-on-open (`electron/main.ts`'s `healProjectOnOpen` + `ensureProjectDeps`), which
-  calls `healNativeConfig` and `vendorEnginePlugins` directly with no claim at all — so opening a
-  project in the editor while a CLI native build heals it is an unguarded, pre-existing race.
+  `scaffoldNativeTarget` carries the same gate at its entry since #1160. The Electron heal-on-open
+  calls `healNativeConfig` and `vendorEnginePlugins` directly, so it takes the claim itself instead
+  (§ "One build at a time" → "Every other project writer").
   ⚠️ A claim older than `BUILD_CLAIM_TTL_MS` (60 min) reads as not held, so a route whose steps
   before the heal ran that long would refuse. `/api/build` heals before the go-ios download and the
   release-file writes for that reason; only an auto-scaffold precedes it.
@@ -2358,9 +2430,10 @@ beside the resolver, and the two had already disagreed once (#1027).
 
 **The claim is the one step that stays per side**, because it genuinely differs: a route takes
 `acquireBuildSlot` (the in-process slot plus the cross-process claim, released together), a script
-takes `acquireBuildClaim` alone. What is shared is the rule — claim before any mutation. The native
-heal enforces it inside itself (`holdsBuildClaim`); the scaffold and the Electron heal-on-open do
-not yet, so for them it is still each caller's line order (§ above).
+takes `acquireBuildClaim` alone (a one-shot script, through `claimProjectOrExit`). What is shared is
+the rule: claim before any mutation. The native heal and the native scaffold enforce it inside
+themselves (`holdsBuildClaim`). `projectWritersTakeBuildClaim.test.ts` holds every other caller to it
+(§ "One build at a time" → "Every other project writer", #1160).
 
 **The shape a shared step takes**, and the one it must not: a function with its I/O injected
 (`log`, `install`, `send`, `runShell`), never one with booleans that skip steps. A required step

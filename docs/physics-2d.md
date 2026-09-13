@@ -447,7 +447,12 @@ powerful but painful to author by hand, so there's a Unity-style **named-layer**
   editing the matrix rebuilds every affected collider on the next tick.
 - **Matrix editor**: Project Settings → **Physics Layers** — add/rename/remove layers + a symmetric
   NxN checkbox grid (`PhysicsLayersEditor.tsx`, `'physics-layers'` settings field type). Persisted
-  through the same `/api/project-settings` path; takes effect on reload.
+  through the same `/api/project-settings` path; takes effect on reload. Its edit decisions live in
+  `physicsLayersMatrix.ts`, which reads the stored matrix through the runtime's own
+  `symmetrizeCollisionMatrix` (the OR above) and keeps every edit symmetric — a new layer's bit is
+  set on every existing row, so it collides with all. ⚠️ Before #1174 the grid showed each direction
+  as its own cell: after **+ Add layer** on a customized matrix a pair was asymmetric, the toggle's
+  XOR kept it so, and the runtime OR made it collide whichever cell was checked.
 
 `demos/2d-physics-demo` showcases it: `Ground` (floor/walls), `Default` (boxes/balls), `Ghost`
 (matrix `[3,7,2]`) — the Ghost ball falls **through** the Default box pile but lands **on** the
@@ -649,9 +654,27 @@ and WASM registry above are the SAME shared code, dimension-parameterized. What 
 
 ## Lifecycle (async init + scene + play/stop)
 
-- **Init once at boot:** `await RAPIER.init()` before the pipeline's first run (app boot path; a
-  global `beforeAll` in tests). Physics system no-ops until the module reports ready — same gate
-  pattern as PixiJS `onInit`.
+- **Init lazily, awaited before ticks:** the WASM is imported only for a world that has bodies;
+  the physics system no-ops until the module reports ready, and the tick entry points await it
+  first (next bullet). Tests `await initRapier2D()` in `beforeAll`.
+- **When Rapier is GUARANTEED ready (#1175).** The systems' lazy gate skips the tick until the WASM
+  lands, and on a cold scene that was several frames with bodies frozen at their authored pose, no
+  contacts and an empty `@collision` journal — measured on a cold editor: 2D physics first ran on
+  tick 8, 3D on frame 4. So `ensurePhysicsReady(world)` (`runtime/physics/physicsReady.ts`) awaits
+  the modules the world's bodies need (same `RigidBody2D`/`RigidBody3D` gate as the systems, so a
+  game without physics still never downloads Rapier), at every entry point that can start ticks:
+  **`SceneManager.loadScene`** on the STAGING world before the swap (boot, devices, every editor
+  load; bodies from prefabs count — it queries the spawned world), **`enterPlay`**, and the editor
+  agent **`play`/`resume`/`step`** ops (a body added after load). Owner call (2026-09-13): the
+  scene waits during loading rather than running its first frames without physics. What that
+  costs, as the boot-timeline span `scene-physics-init` (`device_profiler {action:'boot'}`):
+  **174 ms of a 270 ms scene load on the Galaxy A23, first launch after install; 134 ms of 198 ms
+  on the next cold start** (`demos/2d-physics-demo` debug APK); 83 ms of 94 ms in the Mac editor.
+  Before the fix that same interval was spent as simulated frames with no physics. The device
+  `sim-step` op waits too, raced against its own `timeoutMs` (the host's transport deadline derives
+  from it), refusing with `physicsLoading` only if the budget runs out. **Still lazy:** a body a GAME spawns mid-play
+  into a scene that had none — awaiting there would stall the live frame loop. `createTestWorld` is
+  synchronous; physics suites keep awaiting `initRapier*` in `beforeAll`.
 - **`initRapier2D`/`initRapier3D` memoize the WASM init in a single-slot `initPromise`, and the
   slot is CLEARED on failure so a transient import/init error can be retried** — a successful init
   stays memoized forever, because `initPromise` itself is the memoization and there is no separate

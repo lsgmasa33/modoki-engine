@@ -32,9 +32,10 @@ export interface PhysicsLayersConfig {
 /** Symmetrize a matrix: if layer i collides with j, ensure j collides with i. Rapier's
  *  group test is bidirectional (A hits B iff each is in the other's filter), so an
  *  asymmetric row would silently mean "no collision" for that pair. We OR the two
- *  directions so a single authored direction is honored (the editor already keeps it
- *  symmetric; this hardens hand-edited configs). */
-function symmetrize(m: number[]): number[] {
+ *  directions so a single authored direction is honored. Exported because the matrix
+ *  editor reads a config through THIS function (#1174): a grid that showed an asymmetric
+ *  pair cell-by-cell disagreed with the OR here, and its XOR toggle could never close it. */
+export function symmetrizeCollisionMatrix(m: number[]): number[] {
   const out = m.slice();
   for (let i = 0; i < out.length; i++) {
     for (let j = i + 1; j < out.length; j++) {
@@ -57,7 +58,7 @@ export function setPhysicsLayers(config?: PhysicsLayersConfig | null): void {
   if (names.length === 0 || names.every((n) => n.length === 0)) { layers = [DEFAULT_LAYER]; matrix = [ALL]; return; }
   layers = names;
   const m = config?.collisionMatrix ?? [];
-  matrix = symmetrize(names.map((_, i) => (typeof m[i] === 'number' ? (m[i] & ALL) >>> 0 : ALL)));
+  matrix = symmetrizeCollisionMatrix(names.map((_, i) => (typeof m[i] === 'number' ? (m[i] & ALL) >>> 0 : ALL)));
 }
 
 /** Reset to the default single collide-with-all layer (tests + game teardown). */

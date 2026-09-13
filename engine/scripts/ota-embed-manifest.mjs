@@ -51,6 +51,7 @@ import path from 'node:path';
 import { buildManifestFiles } from './ota/buildManifest.mjs';
 import { OTA_DEFAULT_BUNDLE_NAME } from './ota/publishGuards.mjs';
 import { createManifest, validateManifest } from './ota/schema.mjs';
+import { claimProjectOrExit } from './cliBuildClaim.mjs';
 
 const EMBEDDED_BASE_VERSION = 'embedded'; // keep in sync with otaClient.ts's exported constant
 
@@ -128,6 +129,13 @@ async function main() {
   }
 
   const outPath = args.out ? path.resolve(args.out) : path.join(distDir, 'ota-embedded-manifest.json');
+
+  // #1160: hashing `dist/` and writing into it while a build rewrites the same `dist/` embeds a
+  // manifest of a torn tree, so a hand run takes the project's build claim. Taken only after every
+  // argument check, so a bad invocation still fails with its own message. The editor's `/api/build`
+  // step inherits that route's token and passes through. Released by the store's `exit` hook, which
+  // also covers `fail()`'s `process.exit`.
+  claimProjectOrExit(projectDir, 'embed OTA manifest (CLI)', 'ota-embed-manifest');
 
   // Hash the dist tree BEFORE writing the manifest into it — otherwise the manifest would
   // (harmlessly, but confusingly) include a hash for itself from a stale previous run.

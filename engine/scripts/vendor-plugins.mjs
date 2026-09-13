@@ -19,6 +19,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadVendorPlugins } from './loadVendorPlugins.mjs';
+import { claimProjectOrExit } from './cliBuildClaim.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, '..', '..');
@@ -37,6 +38,14 @@ if (!mod) {
   process.exit(1);
 }
 
-const r = mod.vendorEnginePlugins(projectRoot, repoRoot);
+// Vendoring rewrites `plugins/*.tgz` and `package.json`, the same files a build heals, so a hand
+// run takes the project's build claim first and refuses while a build holds it (#1160).
+const claim = claimProjectOrExit(projectRoot, 'vendor engine plugins (CLI)', 'vendor');
+let r;
+try {
+  r = mod.vendorEnginePlugins(projectRoot, repoRoot);
+} finally {
+  claim.release();
+}
 if (r.vendored.length) console.log(`[vendor] ${path.relative(repoRoot, projectRoot)}: ${r.vendored.join(', ')}${r.needsInstall ? ' (run npm install)' : ''}`);
 else console.log(`[vendor] ${path.relative(repoRoot, projectRoot)}: up to date`);

@@ -1782,7 +1782,9 @@ export function registerTools(server: McpServer) {
       'fixed dt — this is a measurement aid, not a deterministic repro (the deterministic route ' +
       'would have to suspend the live render loop). If the frame loop is stopped or the app is ' +
       'backgrounded, that is reported as a failure with the count that did run, and the world is ' +
-      're-frozen either way.',
+      're-frozen either way. Physics WASM a body needs is WAITED for first, inside the same timeoutMs ' +
+      'budget; if it is still loading when the budget runs out the step is refused with ' +
+      '`physicsLoading: [...]` (retry), and a permanent physics init failure is refused naming it.',
     {
       frames: z.number().optional().describe('How many real frames to advance (default 1, max 600).'),
       scale: z.number().optional().describe('timeScale to run at during the step (default 1). Use <1 to advance less sim time per frame.'),
