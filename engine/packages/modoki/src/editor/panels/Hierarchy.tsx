@@ -28,7 +28,7 @@ import { TreeSearchInput, TypeFilterMenu, treeRowPadLeft } from './treeChrome';
 import { useExpandedSet } from './useExpandedSet';
 import { loadCollapsedGuids, saveCollapsedGuids, computeRestoredCollapse, collapsedIdsToGuids, needsCollapseRestore, shouldPersistCollapse, type CollapseOwner } from './hierarchyCollapse';
 import { remapPrefix } from '../utils/assetPaths';
-import { filterEntityTree, collectEntityTypes, normalizeFolderPath, buildHierarchyFolders, countFolderRoots, folderSubtreePaths, folderSubtreeRootIds, revealTargetsFor, groupRootsBySourceScene, resolveDropFolderSync, type HierarchyFolder } from './hierarchyFolders';
+import { filterEntityTree, collectEntityTypes, normalizeFolderPath, buildHierarchyFolders, countFolderRoots, folderSubtreePaths, folderSubtreeRootIds, revealTargetsFor, isRevealRequest, type RevealKey, groupRootsBySourceScene, resolveDropFolderSync, type HierarchyFolder } from './hierarchyFolders';
 import { isSceneDirty } from '../scene/sceneDirty';
 import { startDragGhost, endDragGhost, armGrabCursor, getAssetDragInfo, setDragGhostRefusal } from '../utils/dragGhost';
 import { decideHierarchyAssetDrop } from './assetDropPolicy';
@@ -538,6 +538,7 @@ export default function Hierarchy() {
   const hmrEpoch = useHmrEpoch();
   const selectedId = useEditorStore((s) => s.selectedEntityId);
   const selectedEntityIds = useEditorStore((s) => s.selectedEntityIds);
+  const entityRevealRequest = useEditorStore((s) => s.entityRevealRequest);
   const selectEntity = useEditorStore((s) => s.selectEntity);
   const openFindReferences = useEditorStore((s) => s.openFindReferences);
   const setSelectedEntities = useEditorStore((s) => s.setSelectedEntities);
@@ -875,8 +876,20 @@ export default function Hierarchy() {
   // tucked inside a collapsed folder, or simply scrolled off. Expanding without scrolling
   // leaves the highlight below the fold, which reads exactly like nothing got selected.
   // So: un-collapse whatever hides the row, then scroll it into view.
+  //
+  // A lead change is a reveal request; so is an explicit `requestEntityReveal` (#1156) from a
+  // writer that means "select this" without moving the lead: an agent re-selecting the entity
+  // already selected, or a viewport/UI-preview click on the lead of a multi-selection. Undo/redo,
+  // a Cmd/Ctrl-click trim and a hand collapse never ask, so while the lead stays put they leave the
+  // tree as the user set it. The decision is `isRevealRequest` (hierarchyFolders.ts).
+  const revealKeyRef = useRef<RevealKey | null>(null);
+  /** Bumped only by a reveal request, so the scroll below follows a request, not every write. */
+  const [revealTick, setRevealTick] = useState(0);
   useEffect(() => {
-    if (selectedId === null) return;
+    const key: RevealKey = { lead: selectedId, epoch: collapseEpoch, request: entityRevealRequest };
+    const requested = isRevealRequest(revealKeyRef.current, key);
+    revealKeyRef.current = key;
+    if (selectedId === null || !requested) return;
     const { ancestorIds, folderPaths } = revealTargetsFor(getAllEntities(), selectedId);
     if (ancestorIds.length) {
       setCollapsed(prev => {
@@ -894,7 +907,8 @@ export default function Hierarchy() {
         return next;
       });
     }
-  }, [selectedId, collapseEpoch, setCollapsedFolders]);
+    setRevealTick((t) => t + 1);
+  }, [selectedId, entityRevealRequest, collapseEpoch, setCollapsedFolders]);
 
   // Scroll after the expansion above has committed — on the first pass the row may not be
   // mounted yet. `block: 'nearest'` is a no-op when the row is already visible, so clicking
@@ -903,7 +917,7 @@ export default function Hierarchy() {
     if (selectedId === null) return;
     const row = listRef.current?.querySelector(`[data-entity-row="${selectedId}"]`);
     row?.scrollIntoView({ block: 'nearest' });
-  }, [selectedId, collapsed, collapsedFolders, displayTree]);
+  }, [selectedId, revealTick, collapsed, collapsedFolders, displayTree]);
 
   // Context menu
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; entity: EntityInfo } | null>(null);

@@ -87,6 +87,10 @@ interface EditorState {
   /** Full multi-selection set. [] when nothing selected, [id] for a single
    *  selection. The Inspector renders common traits across all of these. */
   selectedEntityIds: number[];
+  /** Bumped by `requestEntityReveal` — "show the lead entity's row", from a writer whose intent
+   *  a selection DIFF cannot express (#1156). The Hierarchy reveals on a lead change anyway;
+   *  this is for the writes that leave the lead where it was. Not persisted, not undoable. */
+  entityRevealRequest: number;
   /** Primary (lead) selected asset — drives the single-asset Inspector detail. */
   selectedAsset: SelectedAsset | null;
   /** Full multi-selection set of assets. [] when none, [asset] for a single
@@ -369,6 +373,11 @@ interface EditorState {
   previewOwner: 'timeline' | 'animation' | null;
 
   selectEntity: (id: number | null) => void;
+  /** Ask the Hierarchy to reveal the lead entity's row even if the lead did not change (#1156).
+   *  Called by writers that MEAN "select this": an agent's set-selection and a viewport or
+   *  UI-preview pick. Deliberately NOT by undo/redo, a Cmd/Ctrl-click toggle or a delete fold,
+   *  which would re-open a row the user collapsed even when the lead did not move. See docs/editor.md § Revealing the selected row. */
+  requestEntityReveal: () => void;
   /** Replace the whole selection set. `primary` becomes the anchor (defaults to
    *  the last id). Used by Shift-range selection. */
   setSelectedEntities: (ids: number[], primary?: number | null) => void;
@@ -611,6 +620,7 @@ export const useEditorStore = create<EditorState>((set, get) => {
   return {
   selectedEntityId: null,
   selectedEntityIds: [],
+  entityRevealRequest: 0,
   selectedAsset: null,
   selectedAssets: [],
   gizmoMode: lsEnum('editor:gizmoMode', ['translate', 'rotate', 'scale'] as const, 'translate'),
@@ -691,6 +701,8 @@ export const useEditorStore = create<EditorState>((set, get) => {
       selectedAssets: [],
     });
   },
+
+  requestEntityReveal: () => set((s) => ({ entityRevealRequest: s.entityRevealRequest + 1 })),
 
   setSelectedEntities: (ids, primary) => {
     const unique = Array.from(new Set(ids));

@@ -1107,6 +1107,9 @@ export function registerEditorAgentOps(): void {
       throw new OpRefusal('NOT_FOUND', 'set-selection: none of the requested entities resolve to a live entity (ids are reassigned on scene reload — prefer guid). Re-read them with get_scene_state.');
     }
     setSelectionRaw(resolved.length ? resolved[resolved.length - 1] : null, resolved);
+    // An explicit request to select IS a request to see it: re-selecting the entity already
+    // selected changes no value, so without this a row collapsed since stays hidden (#1156).
+    if (resolved.length) useEditorStore.getState().requestEntityReveal();
     const state = readEditorState();
     return missing.length
       ? { ...state, skipped: missing, warning: `${missing.length} requested entity ref(s) matched no live entity and were skipped` }

@@ -29,6 +29,16 @@ export type PickSelectionCommand =
   | { kind: 'set'; ids: number[]; primary: number }
   | { kind: 'select'; id: number };
 
+/** Does applying `cmd` ask the Hierarchy to reveal the lead row? (#1156)
+ *
+ *  A plain or Shift pick means "select this", including a click on the lead of a multi-selection,
+ *  which leaves the lead unchanged and so needs the explicit request. A Ctrl/Cmd toggle trims or
+ *  extends the set and must not re-open a row the user collapsed; keep and clear select nothing.
+ *  Rule: docs/editor.md § Revealing the selected row. */
+export function pickRequestsReveal(cmd: PickSelectionCommand): boolean {
+  return cmd.kind === 'select' || cmd.kind === 'set';
+}
+
 /** Resolve a pick against the current selection.
  *
  *  `entityId` is null when the pick hit nothing. `current` is only consulted for

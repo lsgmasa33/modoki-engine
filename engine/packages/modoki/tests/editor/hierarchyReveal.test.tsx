@@ -129,6 +129,91 @@ describe('Hierarchy reveals the selected entity', () => {
     expect(rowFor(container, 2)).toBeTruthy();
   });
 
+  // #1156 — the agent op writes the store directly (agentEditorOps `setSelectionRaw`), so a
+  // repeat request for the already-selected entity keeps `selectedEntityId` the same number;
+  // it then calls `requestEntityReveal`. `reselectRaw` drives exactly that pair, and
+  // `restoreRaw` the same write WITHOUT the request, which is what undo/redo publishes.
+  const toggleOf = (c: HTMLElement, id: number) =>
+    rowFor(c, id)!.querySelector('span[title^="Click to expand"]') as HTMLElement;
+  const restoreRaw = (lead: number, ids: number[]) =>
+    act(() => { useEditorStore.setState({ selectedEntityId: lead, selectedEntityIds: ids, selectedAsset: null }); });
+  const reselectRaw = (id: number) => {
+    restoreRaw(id, [id]);
+    act(() => { useEditorStore.getState().requestEntityReveal(); });
+  };
+
+  it('#1156: re-selecting the ALREADY-selected entity re-reveals it after its ancestor was collapsed', () => {
+    const { container } = render(<Hierarchy />);
+    selectExternally(3);
+    expect(rowFor(container, 3)).toBeTruthy();
+
+    act(() => { toggleOf(container, 1).click(); });   // a human collapses the root ancestor
+    expect(rowFor(container, 3), 'precondition: the collapse hid the selected row').toBeNull();
+
+    reselectRaw(3);                                     // same id, fresh array
+    expect(rowFor(container, 2), 'intermediate ancestor re-expanded').toBeTruthy();
+    expect(rowFor(container, 3), 'the same-id re-select revealed the row').toBeTruthy();
+  });
+
+  it('#1156: a same-id re-select SCROLLS to a row that is rendered but scrolled away (nothing to un-collapse)', () => {
+    // No collapse state changes here, so only the reveal tick can re-run the scroll.
+    const { container } = render(<Hierarchy />);
+    selectExternally(3);
+    expect(rowFor(container, 3)).toBeTruthy();
+    scrollSpy.mockClear();
+    reselectRaw(3);
+    expect(scrollSpy).toHaveBeenCalledWith({ block: 'nearest' });
+  });
+
+  it('#1156 accept side: a Cmd/Ctrl-click that TRIMS the set and keeps the lead does not re-open a manual collapse or scroll', () => {
+    // Found by the #1156 close-out review: keying on array identity alone re-revealed here,
+    // because toggleEntitySelection publishes a fresh array even when the lead stays put.
+    const { container } = render(<Hierarchy />);
+    act(() => { useEditorStore.getState().setSelectedEntities([4, 3], 3); });
+    expect(rowFor(container, 3)).toBeTruthy();
+    act(() => { toggleOf(container, 1).click(); });   // hand-collapse the lead's ancestor
+    expect(rowFor(container, 3), 'precondition: the collapse hid the lead row').toBeNull();
+    scrollSpy.mockClear();
+
+    act(() => { useEditorStore.getState().toggleEntitySelection(4); });   // trim Cube, lead stays 3
+    expect(useEditorStore.getState().selectedEntityId, 'precondition: the lead did not change').toBe(3);
+    expect(rowFor(container, 3), 'the manual collapse was not undone').toBeNull();
+    expect(scrollSpy, 'the list was not yanked back to the lead').not.toHaveBeenCalled();
+  });
+
+  it('#1156 accept side: UNDOING a trim republishes the superset but does not re-open a manual collapse', () => {
+    // Found by the second close-out review: a rule inferred from the array (a superset is a
+    // request) re-opened the collapse here, because undo restores [4,3] with the lead unchanged.
+    const { container } = render(<Hierarchy />);
+    act(() => { useEditorStore.getState().setSelectedEntities([4, 3], 3); });
+    act(() => { toggleOf(container, 1).click(); });
+    act(() => { useEditorStore.getState().toggleEntitySelection(4); });
+    scrollSpy.mockClear();
+    restoreRaw(3, [4, 3]);                              // what undo's resolveSnap publishes
+    expect(rowFor(container, 3), 'the manual collapse was not undone').toBeNull();
+    expect(scrollSpy).not.toHaveBeenCalled();
+  });
+
+  it('#1156: a plain viewport pick on the LEAD of a multi-selection reveals it (collapse to the lead + request)', () => {
+    // Same state change as a trim ([4,3] -> [3], lead 3), which is why only the writer's request
+    // can tell them apart. applyPickSelection's 'select' path makes exactly these two calls.
+    const { container } = render(<Hierarchy />);
+    act(() => { useEditorStore.getState().setSelectedEntities([4, 3], 3); });
+    act(() => { toggleOf(container, 1).click(); });
+    expect(rowFor(container, 3)).toBeNull();
+    act(() => { useEditorStore.getState().selectEntity(3); useEditorStore.getState().requestEntityReveal(); });
+    expect(rowFor(container, 3), 'the picked lead row was revealed').toBeTruthy();
+  });
+
+  it('#1156 accept side: a trim does not scroll to a lead row that IS rendered (scrolled away, not collapsed)', () => {
+    const { container } = render(<Hierarchy />);
+    act(() => { useEditorStore.getState().setSelectedEntities([4, 3], 3); });
+    expect(rowFor(container, 3), 'precondition: the lead row is mounted, so a scroll could fire').toBeTruthy();
+    scrollSpy.mockClear();
+    act(() => { useEditorStore.getState().toggleEntitySelection(4); });
+    expect(scrollSpy).not.toHaveBeenCalled();
+  });
+
   it('a world swap with NO selection leaves the tree collapsed', () => {
     // Guard the epoch bump against over-expanding: it must only reveal a real selection.
     const { container } = render(<Hierarchy />);

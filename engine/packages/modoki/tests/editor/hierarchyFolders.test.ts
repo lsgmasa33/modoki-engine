@@ -6,7 +6,7 @@ import { describe, it, expect } from 'vitest';
 import type { EntityInfo } from '../../src/runtime/core/ecs/entityUtils';
 import {
   filterEntityTree, collectEntityTypes, normalizeFolderPath,
-  buildHierarchyFolders, countFolderRoots, folderSubtreePaths, folderSubtreeRootIds, revealTargetsFor,
+  buildHierarchyFolders, countFolderRoots, folderSubtreePaths, folderSubtreeRootIds, revealTargetsFor, isRevealRequest,
   groupRootsBySourceScene, resolveDropFolderSync,
 } from '../../src/editor/panels/hierarchyFolders';
 
@@ -299,5 +299,20 @@ describe('resolveDropFolderSync', () => {
 
   it('normalizes both sides before comparing, so equivalent paths are not treated as a change', () => {
     expect(resolveDropFolderSync(0, '/Enemies/', 'Enemies')).toBeNull();
+  });
+});
+
+describe('isRevealRequest (#1156)', () => {
+  const base = { lead: 3, epoch: 0, request: 0 };
+
+  it('the first run, a changed lead, a collapse restore and an explicit request all reveal', () => {
+    expect(isRevealRequest(null, base)).toBe(true);
+    expect(isRevealRequest(base, { ...base, lead: 4 })).toBe(true);
+    expect(isRevealRequest(base, { ...base, epoch: 1 })).toBe(true);
+    expect(isRevealRequest(base, { ...base, request: 1 })).toBe(true);
+  });
+
+  it('nothing else does: the same lead, epoch and request is not a reveal request, whatever the array did', () => {
+    expect(isRevealRequest(base, { ...base })).toBe(false);
   });
 });

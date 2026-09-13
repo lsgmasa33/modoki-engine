@@ -187,4 +187,55 @@ test.describe('2D viewport group gizmo drag', () => {
     await expect.poll(async () => Math.abs(((await traitField(page, centerId, 'Transform', 'x')) as number) - startCenterX) < 1e-5).toBe(true);
     await expect.poll(async () => Math.abs(((await traitField(page, offsetId, 'Transform', 'x')) as number) - startOffsetX) < 1e-5).toBe(true);
   });
+
+  /** #1161 — every 2D drag COMMITS in the pick canvas's pointerup. Without pointer capture a
+   *  release off that canvas never reached it: no undo entry, and the drag stayed live, so a
+   *  buttonless move back over the canvas kept dragging. `scene2DDragCapture.test.ts` can only
+   *  pin the helper (jsdom does not route by capture); this is the spec that fails when the
+   *  SceneView WIRING is wrong: the capture call dropped, or run before the press handler. It
+   *  drags ONE entity, so only `dragRef` is exercised; dropping `groupDragRef`/`vertexDragRef`
+   *  from the predicate is caught by QA-SVIEW-0011, not here. Playwright's mouse is trusted input, so Chromium's
+   *  real capture routing is what runs here. */
+  test('a gizmo drag RELEASED OUTSIDE the 2D canvas still commits one undo step, and a buttonless move after it drags nothing', async ({ page }) => {
+    await gotoEditorWithScene(page, SCENE_2D, 'CenterSprite');
+    await switchToUIMode(page);
+    await page.getByText('CenterSprite', { exact: true }).click();
+    const centerId = (await idByName(page, 'CenterSprite'))!;
+    await expect.poll(() => primarySelectedId(page)).toBe(centerId);
+    await waitForFrames(page);
+
+    const canvas = page.locator('[data-2d-pick]');
+    await canvas.waitFor({ state: 'visible', timeout: 10_000 });
+    const box = await canvas.boundingBox();
+    if (!box) throw new Error('2D overlay canvas has no bounding box');
+    const viewport = page.viewportSize();
+    if (!viewport) throw new Error('no viewport size');
+    // CenterSprite sits at the reference centre, so its free handle is the canvas centre pixel.
+    const gizmoX = box.x + box.width / 2;
+    const gizmoY = box.y + box.height / 2;
+    // Past the canvas's right edge, still inside the window (a release outside the window is a
+    // different gesture). Guard the premise: if the canvas reaches the window edge this spec
+    // would release ON the canvas and pass without testing anything.
+    const releaseX = Math.min(box.x + box.width + 60, viewport.width - 4);
+    expect(releaseX, 'premise: the release point is outside the pick canvas').toBeGreaterThan(box.x + box.width);
+    const startX = (await traitField(page, centerId, 'Transform', 'x')) as number;
+
+    await page.mouse.move(gizmoX, gizmoY);
+    await page.mouse.down();
+    await page.mouse.move(releaseX, gizmoY, { steps: 12 });
+    await page.mouse.up();
+
+    const releasedX = (await traitField(page, centerId, 'Transform', 'x')) as number;
+    expect(releasedX).toBeGreaterThan(startX);
+
+    // No button held: a live (uncaptured, never-finished) drag would follow this move.
+    await page.mouse.move(gizmoX - 40, gizmoY, { steps: 6 });
+    await waitForFrames(page);
+    expect((await traitField(page, centerId, 'Transform', 'x')) as number).toBeCloseTo(releasedX, 5);
+
+    // The release committed a Transform step: undo lands back on the start. Without that entry
+    // the top of the stack is the Hierarchy click's 'Select entity', and x would not move.
+    await page.keyboard.press('ControlOrMeta+z');
+    await expect.poll(async () => Math.abs(((await traitField(page, centerId, 'Transform', 'x')) as number) - startX) < 1e-5).toBe(true);
+  });
 });

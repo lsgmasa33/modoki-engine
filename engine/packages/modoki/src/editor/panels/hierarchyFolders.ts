@@ -197,3 +197,25 @@ export function revealTargetsFor(
   }
   return { ancestorIds, folderPaths };
 }
+
+/** What the Hierarchy reveal compares between runs: the lead, the collapse-restore epoch, and
+ *  the store's explicit reveal-request counter (`entityRevealRequest`). */
+export interface RevealKey {
+  lead: number | null;
+  epoch: number;
+  request: number;
+}
+
+/** Does moving from `prev` to `next` ask the Hierarchy to reveal the lead row? (#1156)
+ *
+ *  Yes on the first run, a changed lead, a collapse restore, or an explicit request. Nothing
+ *  else, and in particular NOT a new selection array on its own. The first #1156 fix tried to
+ *  infer the request from how the array changed, and the close-out reviews showed no diff can:
+ *  undoing a Cmd/Ctrl-click trim republishes a superset (it re-opened the user's collapse), and a
+ *  plain viewport click on the lead of a multi-selection publishes exactly what a trim does (it
+ *  never revealed). Only the writer knows it means "select this", so it says so through
+ *  `requestEntityReveal` (an agent's set-selection, a plain viewport pick). */
+export function isRevealRequest(prev: RevealKey | null, next: RevealKey): boolean {
+  if (!prev) return true;
+  return next.lead !== prev.lead || next.epoch !== prev.epoch || next.request !== prev.request;
+}

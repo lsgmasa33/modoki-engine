@@ -5,7 +5,7 @@
  *  a drift here means clicking in the tree and picking in the viewport disagree. */
 
 import { describe, it, expect } from 'vitest';
-import { resolvePickSelection } from '../../src/editor/scene/pickSelection';
+import { resolvePickSelection, pickRequestsReveal } from '../../src/editor/scene/pickSelection';
 
 const PLAIN = { additive: false, toggle: false };
 const SHIFT = { additive: true, toggle: false };
@@ -77,5 +77,18 @@ describe('entity 0 is a real entity, not a falsy miss', () => {
   it('toggles and adds it like any other id', () => {
     expect(resolvePickSelection(0, CTRL, [1])).toEqual({ kind: 'toggle', id: 0 });
     expect(resolvePickSelection(0, SHIFT, [1])).toEqual({ kind: 'set', ids: [1, 0], primary: 0 });
+  });
+});
+
+describe('pickRequestsReveal (#1156)', () => {
+  const none = { additive: false, toggle: false };
+  it('a plain pick and a Shift pick ask the Hierarchy to reveal the lead, including a pick on the existing lead', () => {
+    expect(pickRequestsReveal(resolvePickSelection(3, none, [4, 3]))).toBe(true);
+    expect(pickRequestsReveal(resolvePickSelection(5, { additive: true, toggle: false }, [4, 3]))).toBe(true);
+  });
+  it('accept side: a Ctrl/Cmd toggle, a keep and a clear do not', () => {
+    expect(pickRequestsReveal(resolvePickSelection(4, { additive: false, toggle: true }, [4, 3]))).toBe(false);
+    expect(pickRequestsReveal(resolvePickSelection(null, { additive: true, toggle: false }, [4, 3]))).toBe(false);
+    expect(pickRequestsReveal(resolvePickSelection(null, none, [4, 3]))).toBe(false);
   });
 });

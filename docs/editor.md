@@ -1303,6 +1303,21 @@ group math is a single pure module, `editor/scene/multiTransform.ts` (headless-u
   runtime id a hot-reload reassigns — the id only when there is no GUID or no live entity. Never read `.name` off a `findEntity` result: the name lives on the
   `EntityAttributes` trait, and `findEntity` infers `any`, so the read compiles and is always
   `undefined`. Every gizmo, 2D-drag and UI move/resize label read `Entity <id>` that way (#1138).
+- **A 2D drag must CAPTURE the pointer, because it commits in its canvas's `pointerup`** (#1161).
+  The single gizmo, group and Collider2D-vertex drags all listen on the Canvas2D's chrome canvas,
+  and all three push their undo entry (with the unsaved flag, and for a gizmo or group drag a
+  `!transform`; a vertex drag's is `Edit Collider2D.points`) only in that canvas's `pointerup`. Without capture, a release past the canvas edge, over the toolbar or over
+  another panel goes to whatever is under the cursor: the entity has moved, nothing can undo it,
+  and the drag ref stays live, so a later hover with NO button held keeps dragging.
+  `bindDragPointerCapture` (`editor/panels/scene2DDragCapture.ts`) captures on a press that claimed
+  a drag, as the 3D gizmo always has. A lost capture for that same pointer while the drag is
+  still live counts as the release. Per the spec that is the touch/pen `pointercancel` path, and it
+  has not been observed live. A second pointer can neither steal the capture nor end the first
+  drag. The UI-mode right-button pan binds it too: it commits nothing, but it stayed live the
+  same way. ⚠️ Any new drag state added to `installScene2DInteraction` must join its `isDragging`
+  predicate, or that drag is uncaptured again. The routing is jsdom-unreachable. The automated check is
+  the e2e `editor-scene-multiselect.spec.ts` (a single gizmo drag released past the canvas edge), and
+  QA-SVIEW-0011 covers all three drag kinds live.
 - **Selection state was already array-based** (`selectedEntityIds` + primary `selectedEntityId`) —
   this feature was purely SceneView-viewport wiring; the store, Inspector, Hierarchy, and selection
   undo already supported multi-select.
@@ -1766,6 +1781,47 @@ so it is hardening, not a replacement for the ownership machinery.
 `hierarchyCollapse.test.ts` pins the decisions; `e2e/editor-hierarchy-collapse.spec.ts` pins the
 wiring, including the Save-As case and the Create Scene case (reverting either turns it red). The
 mechanism class is written up in [async-lifetime.md](./async-lifetime.md).
+
+### Revealing the selected row — a reveal is a REQUEST, not a changed value (#1156, #1143)
+
+Both tree panels un-collapse whatever hides the selected row and scroll it into view when a
+selection asks to be shown: a new lead from any source, or an explicit request. **Neither may
+key that reveal on the selected VALUE alone.** Re-selecting the entity or asset that is already
+selected changes no value, so an agent asking to reveal a row that a human has collapsed since
+would get nothing back. That was measured on both panels: the same select again showed 0 rows;
+clearing the selection first and then selecting showed 1.
+
+- **Hierarchy** reveals on a changed lead, a collapse restore (`collapseEpoch`), or an explicit
+  request: the store's `entityRevealRequest` counter, bumped by `requestEntityReveal()`. Only the
+  writers that MEAN "select this" call it: the agent `set-selection` op (`agentEditorOps.ts`), a
+  plain or Shift viewport pick (`applyPickSelection`, decided by `pickRequestsReveal` in
+  `scene/pickSelection.ts`), a UI-preview pick and a Bone2D handle pick (both in `SceneView.tsx`).
+  Undo/redo, a Cmd/Ctrl-click toggle, the delete folds and a hand collapse do not request, so
+  **while the lead stays the same** they leave the tree as the user set it. Any write that MOVES
+  the lead still reveals, whatever its source: undoing back to an entity under a collapsed parent
+  re-opens it. The decision is `isRevealRequest` (`editor/panels/hierarchyFolders.ts`), and the
+  scroll effect follows a reveal tick rather than every selection write.
+
+  ⚠️ **The request cannot be inferred from the selection diff — two attempts proved it.** Keying on
+  the `selectedEntityIds` array identity revealed on a Cmd-click that trimmed the set. A refinement
+  ("a new array that drops no member is a request") revealed on UNDOING that trim, because undo
+  restores the superset, and it never revealed a plain viewport click on the lead of a
+  multi-selection, because `[4,3] → [3]` with lead 3 is exactly what a trim publishes. Both were
+  found by the close-out reviews. A new selection writer that should reveal must call
+  `requestEntityReveal()`; one that should not must leave it alone.
+- **Assets** keys on the `selectedAsset` OBJECT identity through `createStoreSelectionTracker`
+  (`editor/panels/assetReveal.ts`). The agent op creates a new object per call, so it reads as a
+  request. The panel needs own-marks because its effect also re-syncs a LOCAL multi-select that
+  its own publishes must not collapse. ⚠️ Because any new `selectedAsset` object is a request there,
+  a writer that republished it on a timer or a structure refresh would undo a human's collapse; none
+  does today.
+
+`hierarchyFolders.test.ts` pins the decision. `hierarchyReveal.test.tsx` pins the wiring on both
+sides: a same-id re-select with the request reveals and scrolls, and so does a pick on the lead of a
+multi-selection. A Cmd-click trim, and the undo of one, neither re-open a manual collapse nor
+scroll. The writers' side is pinned by `engine/tests/editor/setSelectionRevealRequest.test.ts` (the
+agent op, through `runAgentOp`) and `pickSelection.test.ts` (`pickRequestsReveal`). The UI-preview
+and bone-pick calls are one-liners in `SceneView.tsx` with no test.
 
 
 ## Asset editors

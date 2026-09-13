@@ -69,7 +69,7 @@ import {
   marqueeExceededThreshold, marqueeOverlayBox, marqueeRect, enclosedByMarquee, mergeMarqueeSelection,
   type MarqueeCandidate,
 } from '../scene/marqueeSelect';
-import { resolvePickSelection, type PickModifiers } from '../scene/pickSelection';
+import { resolvePickSelection, pickRequestsReveal, type PickModifiers } from '../scene/pickSelection';
 import { computePaintOrder } from '../../runtime/rendering/paintOrder';
 import { UIRenderer } from '../../runtime/ui/UIRenderer';
 import { useEditorStore } from '../store/editorStore';
@@ -133,6 +133,7 @@ import { mark2DDirty, get2DDirtyVersion, ensureCanvas2DListeners } from '../stor
 import { Canvas2DMount } from '../../runtime/rendering/Canvas2DMount';
 import { editorCanvas2DPool, editorScene2DRenderer, editorMarkScene2DDirty } from '../rendering/editorScene2D';
 import { loadSceneViewPrefs, saveSceneViewPrefs, type SceneViewLayers } from './sceneViewPrefs';
+import { bindDragPointerCapture } from './scene2DDragCapture';
 
 // Bridge so the 2D Canvas overlay can raycast-pick 2.5D billboards. A billboard renders as a
 // THREE mesh via the game camera in BOTH 3D and 2D mode, so its screen position is a 3D
@@ -205,11 +206,14 @@ function applyPickSelection(entityId: number | null, mods: PickModifiers) {
   const cmd = resolvePickSelection(entityId, mods, st.selectedEntityIds);
   switch (cmd.kind) {
     case 'keep': return;
-    case 'clear': st.selectEntity(null); return;
-    case 'toggle': st.toggleEntitySelection(cmd.id); return;
-    case 'set': st.setSelectedEntities(cmd.ids, cmd.primary); return;
-    case 'select': st.selectEntity(cmd.id); return;
+    case 'clear': st.selectEntity(null); break;
+    case 'toggle': st.toggleEntitySelection(cmd.id); break;
+    case 'set': st.setSelectedEntities(cmd.ids, cmd.primary); break;
+    case 'select': st.selectEntity(cmd.id); break;
   }
+  // #1156: a pick that means "select this" asks the Hierarchy to reveal the lead, which a click on
+  // the lead of a multi-selection needs because it leaves the lead unchanged.
+  if (pickRequestsReveal(cmd)) st.requestEntityReveal();
 }
 
 /** Shared gizmo mode + space toggle buttons used in both 3D and 2D modes. */
@@ -652,15 +656,24 @@ export default function SceneView() {
       e.stopPropagation();
     }
 
+    // #1161's sibling: the pan ends only in this container's pointerup, so without capture a
+    // release outside the viewport left it live — the view kept panning on a buttonless hover.
+    const panCapture = bindDragPointerCapture(container, () => !!panDragRef.current, onPointerUp);
+    function onPointerDownCapturing(e: PointerEvent) {
+      onPointerDown(e);
+      panCapture.afterPress(e);
+    }
+
     container.addEventListener('wheel', onWheel, { passive: false });
-    container.addEventListener('pointerdown', onPointerDown, { capture: true });
+    container.addEventListener('pointerdown', onPointerDownCapturing, { capture: true });
     container.addEventListener('pointermove', onPointerMove, { capture: true });
     container.addEventListener('pointerup', onPointerUp, { capture: true });
     return () => {
       container.removeEventListener('wheel', onWheel);
-      container.removeEventListener('pointerdown', onPointerDown, { capture: true });
+      container.removeEventListener('pointerdown', onPointerDownCapturing, { capture: true });
       container.removeEventListener('pointermove', onPointerMove, { capture: true });
       container.removeEventListener('pointerup', onPointerUp, { capture: true });
+      panCapture.dispose();
     };
   }, [mode, updateViewTransform]);
 
@@ -1578,7 +1591,7 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
             const d = Math.hypot(px - wx, py - wy);
             if (d <= rGame && d < bestBoneD) { bestBoneD = d; bestBone = eid; }
           });
-          if (bestBone !== null) { selectEntity(bestBone); e.stopPropagation(); e.preventDefault(); return; }
+          if (bestBone !== null) { selectEntity(bestBone); useEditorStore.getState().requestEntityReveal(); e.stopPropagation(); e.preventDefault(); return; }
         }
       }
 
@@ -1802,7 +1815,19 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
       dragRef.current = null;
     }
 
-    container.addEventListener('pointerdown', onPointerDown, { capture: true });
+    // #1161: capture the pointer once a press claims a drag, so the release that commits it
+    // reaches this canvas wherever it lands — see scene2DDragCapture.ts.
+    const dragCapture = bindDragPointerCapture(
+      container,
+      () => !!(dragRef.current || groupDragRef.current || vertexDragRef.current),
+      onPointerUp,
+    );
+    function onPointerDownCapturing(e: PointerEvent) {
+      onPointerDown(e);
+      dragCapture.afterPress(e);
+    }
+
+    container.addEventListener('pointerdown', onPointerDownCapturing, { capture: true });
     container.addEventListener('pointermove', onPointerMove, { capture: true });
     container.addEventListener('pointerup', onPointerUp, { capture: true });
     // Pick provider (F15 — docs/enact.md): `pickEntityAtViewportPoint` (defined above,
@@ -1814,9 +1839,10 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
     // must win when both answer for the same point — higher than the 3D provider's default 0.
     const unregPick2D = registerPickProvider(pickEntityAtViewportPoint, 'scene-view', 10);
     return () => {
-      container.removeEventListener('pointerdown', onPointerDown, { capture: true });
+      container.removeEventListener('pointerdown', onPointerDownCapturing, { capture: true });
       container.removeEventListener('pointermove', onPointerMove, { capture: true });
       container.removeEventListener('pointerup', onPointerUp, { capture: true });
+      dragCapture.dispose();
       window.removeEventListener('pointermove', marquee2dMove);
       window.removeEventListener('pointerup', marquee2dUp);
       marqueeEl2d.remove();
@@ -2553,6 +2579,7 @@ function UIEditorOverlay({ viewZoom = 1, showUI = true, show2D = false, selected
       const domId = Number(uiTarget.getAttribute('data-entity-id'));
       if (winner === null || winner === domId) return; // arbiter agrees with default DOM routing
       selectEntity(winner);
+      useEditorStore.getState().requestEntityReveal(); // a UI-preview pick means "select this" (#1156)
       e.stopPropagation();
       e.preventDefault();
       overrodeClickRef.current = true;
@@ -2607,7 +2634,7 @@ function UIEditorOverlay({ viewZoom = 1, showUI = true, show2D = false, selected
       ...safeAreaCssVars(gameViewSafeArea),
     }}>
       <UIRenderer
-        onSelectEntity={(id) => selectEntity(id)}
+        onSelectEntity={(id) => { selectEntity(id); useEditorStore.getState().requestEntityReveal(); }}
         renderCanvas2D={renderCanvas2D}
         uiVisualsHidden={!showUI}
       />
