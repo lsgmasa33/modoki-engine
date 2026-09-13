@@ -17,8 +17,8 @@ import { writeTraitFieldPerEntityWithUndo as writeFieldPerEntity } from '../undo
 import { getUIActionNames, getUIActionParams } from '../../runtime/core/actionRegistry';
 import type { UIActionBinding, UIActionEvent, UIActionKind } from '../../runtime/ui/bindings';
 import { VALUE_TOKEN } from '../../runtime/ui/bindings';
-import { BufferedTextInput, inputStyle, MIXED_PLACEHOLDER } from './fields';
-import { FieldLabel, DropdownField } from './assetViews/widgets';
+import { BufferedTextInput, inputStyle } from './fields';
+import { FieldLabel, DropdownField, MixedSelect } from './assetViews/widgets';
 import { EntityRefField, FieldValueWidget, defaultForHint, useWorldDirtyTick } from './inspectorFields';
 
 const EVENT_OPTS: UIActionEvent[] = ['click', 'change', 'submit'];
@@ -27,17 +27,15 @@ const KIND_OPTS: UIActionKind[] = ['set', 'call'];
 const KIND_LABEL: Record<UIActionKind, string> = { set: 'Set value', call: 'Call method' };
 
 /** Compact labelled <select> for the event/kind pickers (smaller than DropdownField). */
-function MiniSelect({ label, value, options, labels, onChange, mixed = false, uiId }: {
-  label: string; value: string; options: string[]; labels: Record<string, string>; onChange: (v: string) => void; mixed?: boolean; uiId?: string;
+function MiniSelect({ label, value, options, labels, onChange, mixed = false, dataUiId }: {
+  label: string; value: string; options: string[]; labels: Record<string, string>; onChange: (v: string) => void; mixed?: boolean; dataUiId: string;
 }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2 }}>
       <span style={{ flex: 1, color: '#888', fontSize: '11px' }}>{label}</span>
-      <select data-ui-id={uiId} data-ui-kind="field" data-ui-label={label} value={mixed ? '' : value} onChange={(e) => { if (e.target.value !== '') onChange(e.target.value); }}
-        style={{ flex: 1, background: '#111', color: '#ddd', border: '1px solid #444', borderRadius: 3, padding: '2px 4px', fontSize: '12px', cursor: 'pointer' }}>
-        {mixed && <option value="">{MIXED_PLACEHOLDER}</option>}
-        {options.map((o) => <option key={o} value={o}>{labels[o] ?? o}</option>)}
-      </select>
+      <MixedSelect value={value} options={options.map((o) => ({ value: o, label: labels[o] ?? o }))} onChange={onChange} mixed={mixed}
+        dataUiId={dataUiId} dataUiLabel={label}
+        style={{ flex: 1, background: '#111', color: '#ddd', border: '1px solid #444', borderRadius: 3, padding: '2px 4px', fontSize: '12px', cursor: 'pointer' }} />
     </div>
   );
 }
@@ -134,11 +132,11 @@ export function UIActionBindingsField({ entityIds, meta, field }: { entityIds: n
               <span data-ui-id={`uiActions.binding.${i}.remove`} data-ui-kind="button" data-ui-label="Remove" onClick={() => remove(i)} title="Remove" style={{ cursor: 'pointer', color: '#888', padding: '0 2px' }}>×</span>
             </div>
             <MiniSelect label="event" value={event} options={EVENT_OPTS} labels={EVENT_LABEL} mixed={subMixed(i, 'event')}
-              onChange={(v) => update(i, { event: v as UIActionEvent })} uiId={`uiActions.binding.${i}.event`} />
+              onChange={(v) => update(i, { event: v as UIActionEvent })} dataUiId={`uiActions.binding.${i}.event`} />
             <MiniSelect label="kind" value={kind} options={KIND_OPTS} labels={KIND_LABEL} mixed={subMixed(i, 'kind')}
               onChange={(v) => update(i, (row) => v === 'set'
                 ? { kind: 'set', component: row.component || 'UIElement', property: row.property || '', value: row.value ?? '' }
-                : { kind: 'call', action: row.action || '' })} uiId={`uiActions.binding.${i}.kind`} />
+                : { kind: 'call', action: row.action || '' })} dataUiId={`uiActions.binding.${i}.kind`} />
 
             {kind === 'set' ? (() => {
               const ent = b.target ? guidToEntity.get(b.target) : undefined;
@@ -152,10 +150,11 @@ export function UIActionBindingsField({ entityIds, meta, field }: { entityIds: n
               const usingEventValue = b.value === VALUE_TOKEN;
               return (
                 <>
-                  <EntityRefField label="target" value={b.target || ''} onChange={(v) => update(i, { target: v })} mixed={subMixed(i, 'target')} />
-                  <DropdownField label="component" value={b.component || ''} options={compOpts} mixed={subMixed(i, 'component')}
+                  <EntityRefField label="target" value={b.target || ''} onChange={(v) => update(i, { target: v })} mixed={subMixed(i, 'target')}
+                    dataUiId={`uiActions.binding.${i}.target`} />
+                  <DropdownField label="component" dataUiId={`uiActions.binding.${i}.component`} value={b.component || ''} options={compOpts} mixed={subMixed(i, 'component')}
                     onChange={(v) => update(i, { component: v, property: '', value: '' })} />
-                  <DropdownField label="property" value={b.property || ''} options={propOpts} mixed={subMixed(i, 'property')}
+                  <DropdownField label="property" dataUiId={`uiActions.binding.${i}.property`} value={b.property || ''} options={propOpts} mixed={subMixed(i, 'property')}
                     onChange={(v) => update(i, { property: v, value: defaultForHint(fields[v]) })} />
                   {canUseEventValue && (
                     <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: '11px', marginBottom: 2, color: '#bbb' }}>
@@ -183,9 +182,10 @@ export function UIActionBindingsField({ entityIds, meta, field }: { entityIds: n
                 update(i, (row) => ({ params: { ...((row.params as Record<string, unknown>) ?? {}), [k]: v } }));
               return (
                 <>
-                  <DropdownField label="action" value={b.action || ''} options={actOpts} mixed={subMixed(i, 'action')}
+                  <DropdownField label="action" dataUiId={`uiActions.binding.${i}.action`} value={b.action || ''} options={actOpts} mixed={subMixed(i, 'action')}
                     onChange={(v) => update(i, { action: v, params: {} })} />
-                  <EntityRefField label="target" value={b.target || ''} onChange={(v) => update(i, { target: v })} mixed={subMixed(i, 'target')} />
+                  <EntityRefField label="target" value={b.target || ''} onChange={(v) => update(i, { target: v })} mixed={subMixed(i, 'target')}
+                    dataUiId={`uiActions.binding.${i}.target`} />
                   {schema ? Object.entries(schema).map(([k, hint]) => {
                     const usingEventValue = params[k] === VALUE_TOKEN;
                     return (

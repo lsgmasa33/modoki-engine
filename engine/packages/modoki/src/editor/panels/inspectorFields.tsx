@@ -12,7 +12,7 @@ import { onEditorDirty } from '../../runtime/ui/uiTreeStore';
 import { getUIActionNames } from '../../runtime/core/actionRegistry';
 import { getPhysicsLayerNames } from '../../runtime/physics/physicsLayers';
 import { BufferedTextInput, BufferedNumberInput, inputStyle, MIXED_PLACEHOLDER } from './fields';
-import { FieldLabel, DropdownField, ColorField, DEFAULT_COLOR } from './assetViews/widgets';
+import { FieldLabel, DropdownField, ColorField, MixedCheckbox, DEFAULT_COLOR } from './assetViews/widgets';
 import { useEditorStore } from '../store/editorStore';
 
 /** Re-render trigger that bumps on every ECS dirty tick. Lets a widget memoize a
@@ -37,9 +37,13 @@ export function defaultForHint(hint: FieldHint | undefined): unknown {
 /** Entity reference field — a drop target. Drag an entity from the Hierarchy onto
  *  it to store that entity's GUID (resolved from the dragged entity id). Shows the
  *  referenced entity's name with a clear button. Used for UIAction binding
- *  targets. */
-export function EntityRefField({ label, value, onChange, hint, mixed = false }: {
-  label: string; value: string; onChange: (v: string) => void; hint?: FieldHint; mixed?: boolean;
+ *  targets.
+ *
+ *  `dataUiId` is REQUIRED (#1170) and lands on the drop target. That is a `<div>`, not a form
+ *  control, so it cannot show MIXED_PLACEHOLDER in a way `modoki_handles` reads — it says
+ *  `data-ui-mixed` instead, or a mixed selection reads as an empty reference. */
+export function EntityRefField({ label, value, onChange, hint, mixed = false, dataUiId, dataUiLabel }: {
+  label: string; value: string; onChange: (v: string) => void; hint?: FieldHint; mixed?: boolean; dataUiId: string; dataUiLabel?: string;
 }) {
   const [hover, setHover] = useState(false);
   const dirtyTick = useWorldDirtyTick();
@@ -92,6 +96,8 @@ export function EntityRefField({ label, value, onChange, hint, mixed = false }: 
       <FieldLabel label={label} hint={hint} style={{ flex: 1, color: '#888', fontSize: '11px' }} />
       <div
         tabIndex={0}
+        data-ui-id={dataUiId} data-ui-kind="field" data-ui-label={dataUiLabel ?? (label || undefined)}
+        data-ui-mixed={mixed ? 'true' : undefined}
         onKeyDown={(e) => {
           // Backspace/Delete clears the reference when the field is focused.
           if ((e.key === 'Backspace' || e.key === 'Delete') && value && !mixed) {
@@ -144,20 +150,20 @@ export function EntityRefField({ label, value, onChange, hint, mixed = false }: 
 export function FieldValueWidget({ hint, value, onChange, mixed = false, dataUiId, dataUiLabel }: {
   hint: FieldHint | undefined; value: unknown; onChange: (v: unknown) => void; mixed?: boolean; dataUiId: string; dataUiLabel?: string;
 }) {
+  // ⚠️ EVERY branch forwards `dataUiId` (#1170). Only the number and text branches did, so a
+  // boolean, color, entity-ref or enum binding value rendered with no handle at all.
   if (hint?.type === 'boolean') {
-    return <input type="checkbox" checked={mixed ? false : !!value}
-      ref={(el) => { if (el) el.indeterminate = mixed; }}
-      onChange={(e) => onChange(e.target.checked)} />;
+    return <MixedCheckbox checked={!!value} mixed={mixed} onChange={(v) => onChange(v)} dataUiId={dataUiId} dataUiLabel={dataUiLabel} />;
   }
   if (hint?.type === 'number') {
     return <BufferedNumberInput value={typeof value === 'number' ? value : 0} step={hint.step ?? 1} mixed={mixed}
       onChange={(v) => onChange(v)} style={{ ...inputStyle, flex: 1 }} dataUiId={dataUiId} dataUiLabel={dataUiLabel} />;
   }
   if (hint?.type === 'color') {
-    return <ColorField label="" value={typeof value === 'number' ? value : 0} onChange={(v) => onChange(v)} mixed={mixed} />;
+    return <ColorField label="" value={typeof value === 'number' ? value : 0} onChange={(v) => onChange(v)} mixed={mixed} dataUiId={dataUiId} dataUiLabel={dataUiLabel} />;
   }
   if (hint?.type === 'entityRef') {
-    return <EntityRefField label="" value={typeof value === 'string' ? value : ''} onChange={(v) => onChange(v)} mixed={mixed} />;
+    return <EntityRefField label="" value={typeof value === 'string' ? value : ''} onChange={(v) => onChange(v)} mixed={mixed} dataUiId={dataUiId} dataUiLabel={dataUiLabel} />;
   }
   if (hint?.type === 'enum' && (hint.options || hint.optionsSource)) {
     const base = hint.optionsSource === 'uiActions' ? getUIActionNames()
@@ -165,7 +171,7 @@ export function FieldValueWidget({ hint, value, onChange, mixed = false, dataUiI
       : (hint.options ?? []);
     const cur = typeof value === 'string' ? value : '';
     const opts = Array.from(new Set(['', ...base, cur]));
-    return <DropdownField label="" value={cur} options={opts} onChange={(v) => onChange(v)} mixed={mixed} />;
+    return <DropdownField label="" value={cur} options={opts} onChange={(v) => onChange(v)} mixed={mixed} dataUiId={dataUiId} dataUiLabel={dataUiLabel} />;
   }
   // string + unknown-type fallback
   return <BufferedTextInput value={value == null ? '' : String(value)} onChange={(v) => onChange(v)}

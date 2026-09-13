@@ -160,6 +160,8 @@ export function useBufferedValue<T>(externalValue: T, onChange: (v: T) => void, 
 }
 
 export const parseNumber = (s: string) => parseFloat(s) || 0;
+/** True once the text means a number — `-`, `.` and `-.` do not yet. */
+const parsesToNumber = (s: string) => Number.isFinite(parseFloat(s));
 export const parseString = (s: string) => s;
 
 /** Clamp `v` to an optional [min, max] range (either bound may be undefined). */
@@ -237,13 +239,24 @@ export function BufferedNumberInput({ value, onChange, step, style, readOnly, mi
   // Safe against multi-digit entry because every clamped field has min ≤ 0 (you never
   // type up THROUGH the min); a hypothetical large-min field would want a different UI.
   const parse = useCallback((s: string) => clampRange(parseNumber(s), min, max), [min, max]);
-  const { localValue, onFocus, onBlur, handleChange } = useBufferedValue(value, onChange, parse, mixed);
+  // ⚠️ While MIXED, a keystroke that does not parse yet (a lone `-` or `.`) must not commit (#1170
+  // close-out): `parseNumber` turns it into 0, so typing `-` into a mixed WebP Quality clamped every
+  // selected texture to 1. `handleChange` refuses only `''` — enough for a `type="number"` box, which
+  // reports `''` for these, but this one is `type="text"`. Scoped to mixed on purpose: an UNMIXED field
+  // committing `-` → 0 is the one-entity path the echo guard above was built around.
+  const { localValue, onFocus, onBlur, handleChange } = useBufferedValue(value, onChange, parse, mixed, mixed ? parsesToNumber : undefined);
   const ref = useRef<HTMLInputElement>(null);
   // Mouse-wheel adjust (focused only). Replaces the spinner arrows we lost moving off
   // `type="number"`; Shift = ×10. Bases the step on the input's current shown value.
   const onStep = useCallback((dir: 1 | -1, mult: number) => {
-    handleChange(String(applyWheelStep(parseNumber(ref.current?.value ?? '0'), dir, step ?? 1, mult, min, max)));
-  }, [handleChange, step, min, max]);
+    // ⚠️ A MIXED field shows '' and has no value to step FROM (#1170 close-out): `parseNumber('')`
+    // is 0, so one wheel notch on a focused mixed field committed `0 ± step` — clamped — to EVERY
+    // selected entity or texture (WebP Quality 80 and 90 both became 1). Same mass-overwrite
+    // `handleChange` already refuses for a typed '' (F7); the wheel just bypassed it.
+    const shown = ref.current?.value ?? '';
+    if (mixed && shown === '') return;
+    handleChange(String(applyWheelStep(parseNumber(shown || '0'), dir, step ?? 1, mult, min, max)));
+  }, [handleChange, step, min, max, mixed]);
   useWheelStep(ref, onStep, !readOnly);
   // `type="text"` (not `type="number"`): a number input reports `value === ''` for an
   // incomplete entry like a lone `-`, wiping the minus sign before a digit can follow

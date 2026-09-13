@@ -30,7 +30,7 @@ import { AssetRefField } from './AssetRefField';
 import { parseClipBank, stringifyClipBank, type ClipBankEntry } from '../../runtime/audio/clipBank';
 import { SpriteAnimatorSection } from './SpriteAnimatorSection';
 import { AnimatorClipsSection } from './AnimatorClipsSection';
-import { FieldLabel, NumberField, DropdownField, ColorField, Section, SubSection, DEFAULT_COLOR, colorToHex } from './assetViews/widgets';
+import { FieldLabel, NumberField, DropdownField, ColorField, MixedSelect, Section, SubSection, DEFAULT_COLOR, colorToHex } from './assetViews/widgets';
 import { parkMetaEdit, readMetaPreferringPark } from '../scene/pendingMeta';
 import { defaultForHint, FieldValueWidget, EntityRefField, useWorldDirtyTick } from './inspectorFields';
 import { AddComponentPicker } from './AddComponentPicker';
@@ -231,8 +231,12 @@ function AnchorIcon({ preset, active, size }: { preset: string; active: boolean;
   );
 }
 
-/** 4x4 anchor preset grid (Unity-style) */
-function AnchorPickerField({ value, onChange, mixed = false }: { value: string; onChange: (v: string) => void; mixed?: boolean }) {
+/** 4x4 anchor preset grid (Unity-style).
+ *
+ *  Handles (#1170): the grid carries `dataUiId` — with `data-ui-mixed`, since a mixed selection
+ *  shows only as `anchor ----` text and no highlighted cell — and each cell is `<dataUiId>.<preset>`,
+ *  a button whose `data-ui-state` says whether it is the current anchor. */
+export function AnchorPickerField({ value, onChange, mixed = false, dataUiId }: { value: string; onChange: (v: string) => void; mixed?: boolean; dataUiId: string }) {
   // Mixed multi-select: don't highlight any cell; picking one applies to all.
   if (mixed) value = '';
   const grid: string[][] = [
@@ -248,7 +252,7 @@ function AnchorPickerField({ value, onChange, mixed = false }: { value: string; 
   return (
     <div style={{ marginBottom: 4 }}>
       <span style={{ color: '#888', fontSize: '11px' }}>anchor{mixed ? ` ${MIXED_PLACEHOLDER}` : ''}</span>
-      <div style={{
+      <div data-ui-id={dataUiId} data-ui-kind="field" data-ui-label="anchor" data-ui-mixed={mixed ? 'true' : undefined} style={{
         marginTop: 3, padding: 4,
         background: '#1a1a2e', border: '1px solid #444',
         borderRadius: 3, display: 'inline-flex', flexDirection: 'column', gap: 2,
@@ -263,6 +267,8 @@ function AnchorPickerField({ value, onChange, mixed = false }: { value: string; 
             <span style={{ ...labelStyle, width: 38, textAlign: 'right' }}>{rowLabels[ri]}</span>
             {row.map(preset => (
               <div key={preset} onClick={() => onChange(preset)} title={preset}
+                data-ui-id={`${dataUiId}.${preset}`} data-ui-kind="button" data-ui-label={preset}
+                data-ui-state={value === preset ? 'checked' : 'unchecked'}
                 style={{ cursor: 'pointer', lineHeight: 0, borderRadius: 2, background: value === preset ? 'rgba(243,156,18,0.15)' : 'transparent' }}>
                 <AnchorIcon preset={preset} active={value === preset} size={CELL} />
               </div>
@@ -1104,11 +1110,11 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
             onChange={v => write(key, v)} readOnly={stretchDisabled}
             dataUiId={`inspector.field.${meta.name}.${key}`}
             style={{ flex: 1, background: '#111', color: '#ddd', border: '1px solid #444', borderRadius: 3, padding: '2px 4px', fontSize: '12px', fontFamily: 'monospace' }} />
-          <select value={isMixed(unitKey) ? '' : unit} onChange={e => { if (e.target.value !== '') write(unitKey, e.target.value); }} disabled={stretchDisabled}
-            style={{ background: '#111', color: '#ddd', border: '1px solid #444', borderRadius: 3, padding: '2px 2px', fontSize: '11px', fontFamily: 'monospace', cursor: 'pointer' }}>
-            {isMixed(unitKey) && <option value="">--</option>}
-            {UI_LENGTH_UNITS.map((u) => <option key={u} value={u}>{u}</option>)}
-          </select>
+          {/* The unit is its own trait field (`widthUnit`…), so it takes that field's id. Through
+              MixedSelect because this select rendered mixed as `--`, which no reader matched (#1170). */}
+          <MixedSelect value={unit} options={UI_LENGTH_UNITS} mixed={isMixed(unitKey)} onChange={(v) => write(unitKey, v)} disabled={stretchDisabled}
+            dataUiId={`inspector.field.${meta.name}.${unitKey}`} dataUiLabel={unitKey}
+            style={{ background: '#111', color: '#ddd', border: '1px solid #444', borderRadius: 3, padding: '2px 2px', fontSize: '11px', fontFamily: 'monospace', cursor: 'pointer' }} />
         </div>
       );
     }
@@ -1164,10 +1170,12 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
       const af = hint.alphaField;
       const foldAlpha = af && typeof data[af] === 'number';
       return <div key={key} style={ov ? overrideStyle : undefined}><ColorField label={key} value={val as number} onChange={(v) => write(key, v)} mixed={mx}
+        dataUiId={`inspector.field.${meta.name}.${key}`}
         {...(foldAlpha ? { alpha: data[af] as number, onAlphaChange: (a: number) => write(af, a), alphaMixed: isMixed(af) } : {})} /></div>;
     }
     if (hint.type === 'entityRef') {
-      return <div key={key} style={ov ? overrideStyle : undefined}><EntityRefField label={key} value={val as string} onChange={(v) => write(key, v)} hint={hint} mixed={mx} /></div>;
+      return <div key={key} style={ov ? overrideStyle : undefined}><EntityRefField label={key} value={val as string} onChange={(v) => write(key, v)} hint={hint} mixed={mx}
+        dataUiId={`inspector.field.${meta.name}.${key}`} /></div>;
     }
     if (hint.type === 'bindings') {
       return <div key={key} style={ov ? overrideStyle : undefined}><UIActionBindingsField entityIds={entityIds} meta={meta} field={key} /></div>;
@@ -1177,7 +1185,8 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
     }
     if (hint.type === 'enum' && (hint.options || hint.optionsSource)) {
       if (meta.name === 'UIAnchor' && key === 'anchor') {
-        return <div key={key} style={ov ? overrideStyle : undefined}><AnchorPickerField value={val as string} onChange={(v) => write(key, v)} mixed={mx} /></div>;
+        return <div key={key} style={ov ? overrideStyle : undefined}><AnchorPickerField value={val as string} onChange={(v) => write(key, v)} mixed={mx}
+          dataUiId={`inspector.field.${meta.name}.${key}`} /></div>;
       }
       // Resolve dynamic options (UIAction names, this model's clips/bones) at
       // render time; always keep an empty "(none)" option and the current value,
@@ -1185,7 +1194,8 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
       const base = hint.optionsSource ? resolveDynamicOptions(hint.optionsSource, primaryId) : (hint.options ?? []);
       const opts = Array.from(new Set(['', ...base, (val as string) || '']));
       const enumDisabled = selfPlacementDisabled(key); // alignSelf when anchored
-      return <div key={key} style={{ ...(ov ? overrideStyle : {}), ...(enumDisabled ? { opacity: 0.35 } : {}) }}><DropdownField label={key} value={val as string} options={opts} onChange={(v) => write(key, v)} hint={hint} mixed={mx} disabled={enumDisabled} /></div>;
+      return <div key={key} style={{ ...(ov ? overrideStyle : {}), ...(enumDisabled ? { opacity: 0.35 } : {}) }}><DropdownField label={key} value={val as string} options={opts} onChange={(v) => write(key, v)} hint={hint} mixed={mx} disabled={enumDisabled}
+        dataUiId={`inspector.field.${meta.name}.${key}`} /></div>;
     }
     if (hint.type === 'boolean') {
       // UIAnchor.safeArea is inert on exactly ONE anchor: `center`, which reaches no

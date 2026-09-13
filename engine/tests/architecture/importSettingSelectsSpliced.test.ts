@@ -42,7 +42,7 @@ import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 const viewsDir = path.resolve(__dirname, '../../packages/modoki/src/editor/panels/assetViews');
 
 /** Sites that legitimately need no splice, each `<file>::<mapped expression>` with why. All
- *  13 measured 2026-09-12 on work-ai2 via the detector below; every row is one site.
+ *  13 measured 2026-09-12 on work-ai2 (12 since #1170 folded ModelBatchView's select into MixedSelect) via the detector below; every row is one site.
  *
  *  Scope, stated so this is not mistaken for more than it is: every row is a STRING-valued or
  *  dynamically-built list. A string select can technically hit the same behaviour, but a
@@ -65,16 +65,17 @@ const EXEMPT = [
     reason: 'string union' },
   { item: 'VideoAssetView.tsx::(Object.keys(AUDIO_LABELS) as VideoAudioMode[])',
     reason: 'string union' },
-  { item: 'ModelBatchView.tsx::postprocessorIds',
-    reason: 'built at runtime from the registry — not a preset list' },
   // ⚠️ The two halves of what used to be ONE file-less `'options'` row. Same expression, different
   // components, and each now has to argue for itself.
   { item: 'MaterialAssetView.tsx::options',
     reason: 'the shader-property enum dropdown: a {value,label} list the CALLER builds from the '
       + 'shader schema, so the bound value is always one of them by construction' },
-  { item: 'widgets.tsx::options',
-    reason: 'generic DropdownField — a bare string list supplied by the caller. Nothing here knows '
-      + 'the value domain, so splicing would be the wrong layer to do it at' },
+  // ⚠️ #1170 moved the select behind DropdownField into MixedSelect, which now also renders
+  // ModelBatchView's postprocessor list (its own row, "built at runtime from the registry", went
+  // with it) and the Inspector's unit + UIAction mini selects.
+  { item: 'widgets.tsx::normalized',
+    reason: 'generic MixedSelect (behind DropdownField) — a list supplied by the caller. Nothing here '
+      + 'knows the value domain, so splicing would be the wrong layer to do it at' },
 ] as const;
 
 interface Site { file: string; line: number; expr: string; spliced: boolean }

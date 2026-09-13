@@ -265,6 +265,7 @@ export function FontAssetView({ path, name }: { path: string; name: string }) {
       <div style={sectionStyle}>Charset</div>
       <DropdownField
         label="Preset"
+        dataUiId="assetView.font.charset"
         value={settings.charset}
         options={CHARSET_OPTIONS.map((o) => o.value)}
         onChange={(v) => update({ charset: v as FontCharsetPreset })}
@@ -303,6 +304,7 @@ export function FontAssetView({ path, name }: { path: string; name: string }) {
       <div style={sectionStyle}>Mode</div>
       <DropdownField
         label="Glyph source"
+        dataUiId="assetView.font.mode"
         value={settings.mode}
         options={MODE_OPTIONS.map((o) => o.value)}
         onChange={(v) => update({ mode: v as FontMode })}

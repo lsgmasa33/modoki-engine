@@ -108,6 +108,9 @@ function formStateFor(el: Element): { value?: string; checked?: boolean; expande
     else if (type === 'password') out.value = input.value ? MASKED_VALUE : '';
     else {
       out.value = input.value;
+      // A half-typed `-`/`1e` in a mixed `type="number"` box also reads `value === ''` here, and
+      // that is still CORRECT (#1170 close-out, reversing a guard this issue first added): a mixed
+      // field commits nothing until a real value parses, so the selection IS still mixed.
       if (input.value === '' && input.getAttribute('placeholder') === MIXED_PLACEHOLDER) out.mixed = true;
     }
   } else if (tag === 'textarea') {

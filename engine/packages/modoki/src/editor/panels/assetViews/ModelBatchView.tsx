@@ -15,8 +15,8 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useEditorStore } from '../../store/editorStore';
 import { getModelPostprocessorIds } from '../../../runtime/loaders/modelPostprocessorRegistry';
-import { inputStyle, MIXED_PLACEHOLDER } from '../fields';
-import { reimportBtnStyle } from './widgets';
+import { inputStyle } from '../fields';
+import { reimportBtnStyle, MixedSelect } from './widgets';
 import { reimportPaths } from './reimport';
 import { readMetaPreferringPark } from '../../scene/pendingMeta';
 import { loadMetaBatch, planMetaBatchWrite, parkPlannedMetaEdits, type MetaMap, type UnreadableMeta } from './metaBatchLoad';
@@ -161,10 +161,8 @@ export function ModelBatchView({ assets }: { assets: SelectedAsset[] }) {
       {banner}
       <div style={{ marginBottom: 6 }}>
         <div style={{ color: '#888', fontSize: '10px', marginBottom: 2 }}>Postprocessor</div>
-        <select value={common} onChange={(e) => { if (e.target.value) applyPostprocessor(e.target.value); }} style={{ ...inputStyle, width: '100%' }}>
-          {mixed && <option value="">{MIXED_PLACEHOLDER}</option>}
-          {postprocessorIds.map((id) => <option key={id} value={id}>{id}</option>)}
-        </select>
+        <MixedSelect value={common} options={postprocessorIds} mixed={mixed} onChange={applyPostprocessor}
+          dataUiId="assetView.modelBatch.postprocessor" dataUiLabel="Postprocessor" style={{ ...inputStyle, width: '100%' }} />
       </div>
       <button
         disabled={importing}

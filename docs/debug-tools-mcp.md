@@ -2177,6 +2177,18 @@ Canvas2D/SVG editor, exercise a gesture, open a modal). All are Electron-editor 
     ⚠️ A multi-selection whose values DIFFER reports **`mixed:true`**. A mixed checkbox then omits
     `checked`, because its `false` is only how it is drawn. A mixed text field keeps `value:''`,
     and `mixed:true` beside it is what tells that apart from a genuinely empty field.
+    ⚠️ **`mixed` is read from what the control RENDERS, so a producer must render one of exactly four
+    shapes** (`formStateFor` in `engine/app/debug/chromeHandles.ts`): a checkbox with `indeterminate`;
+    an empty input/textarea whose placeholder is `MIXED_PLACEHOLDER`; a select on a
+    `MIXED_PLACEHOLDER` option with `value=''`; or `data-ui-mixed="true"` for anything that can show
+    none of those (a range slider, a color picker, a `<div>` drop target). A control that invents its
+    own mixed look (`--`, or swapping in an untagged `----` box) reads as a definite value — #1170
+    found a dozen. Build a new mixed-capable control from **`MixedSelect` / `MixedCheckbox`**
+    (`editor/panels/assetViews/widgets.tsx`), whose `dataUiId` is required, rather than a raw element.
+    A half-typed `type="number"` box (`-`, `1e`) in a mixed field still reads `mixed:true` — nothing
+    has been committed, so the selection is still mixed.
+    Composite fields: `ColorField` is `<id>` (the hex text) + `<id>.picker` + `<id>.alpha`; the UI
+    anchor grid is `<id>` + one `<id>.<preset>` button per cell, `meta.state:'checked'` on the current one.
   - **Dock tabs are handles.** Each tab is `layout.tab.<component>` (`kind:'tab'`,
     `meta.state:'selected'|'unselected'`), so `modoki_handles {prefix:'layout.tab.'}` answers which
     panels are docked and which one each tabset is showing.

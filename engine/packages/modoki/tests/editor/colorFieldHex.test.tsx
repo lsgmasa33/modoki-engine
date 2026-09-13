@@ -20,7 +20,7 @@ const type = (el: HTMLInputElement, v: string) => fireEvent.change(el, { target:
 describe('ColorField — alpha-bearing field', () => {
   const setup = (alpha = 0.5) => {
     const onChange = vi.fn(), onAlphaChange = vi.fn();
-    render(<ColorField label="bg" value={0x112233} onChange={onChange} alpha={alpha} onAlphaChange={onAlphaChange} />);
+    render(<ColorField dataUiId="test.color" label="bg" value={0x112233} onChange={onChange} alpha={alpha} onAlphaChange={onAlphaChange} />);
     return { onChange, onAlphaChange };
   };
 
@@ -68,7 +68,7 @@ describe('ColorField — alpha-bearing field', () => {
 
 describe('ColorField — mixed multi-select', () => {
   it('blanks the hex to the mixed placeholder rather than showing the primary value', () => {
-    render(<ColorField label="c" value={0x112233} onChange={vi.fn()} mixed />);
+    render(<ColorField dataUiId="test.color" label="c" value={0x112233} onChange={vi.fn()} mixed />);
     expect(hexBox('c').value).toBe('');
   });
 
@@ -77,14 +77,14 @@ describe('ColorField — mixed multi-select', () => {
     // selected entities. Typing #112233 to normalize a mixed selection has to write, or
     // the others silently keep their old colors.
     const onChange = vi.fn();
-    render(<ColorField label="c" value={0x112233} onChange={onChange} mixed />);
+    render(<ColorField dataUiId="test.color" label="c" value={0x112233} onChange={onChange} mixed />);
     type(hexBox('c'), '#112233');
     expect(onChange).toHaveBeenCalledWith(0x112233);
   });
 
   it('commits the primary\'s own alpha byte when only alpha is mixed', () => {
     const onAlphaChange = vi.fn();
-    render(<ColorField label="c" value={0x112233} onChange={vi.fn()} alpha={0.5} onAlphaChange={onAlphaChange} alphaMixed />);
+    render(<ColorField dataUiId="test.color" label="c" value={0x112233} onChange={vi.fn()} alpha={0.5} onAlphaChange={onAlphaChange} alphaMixed />);
     type(hexBox('c'), '#11223380');
     expect(onAlphaChange).toHaveBeenCalledTimes(1);
     expect(onAlphaChange.mock.calls[0][0]).toBeCloseTo(128 / 255, 6);
@@ -92,7 +92,7 @@ describe('ColorField — mixed multi-select', () => {
 
   it('does not broadcast a transient empty buffer to the whole selection', () => {
     const onChange = vi.fn();
-    render(<ColorField label="c" value={0x112233} onChange={onChange} mixed />);
+    render(<ColorField dataUiId="test.color" label="c" value={0x112233} onChange={onChange} mixed />);
     type(hexBox('c'), '');
     expect(onChange).not.toHaveBeenCalled();
   });
@@ -101,7 +101,7 @@ describe('ColorField — mixed multi-select', () => {
 describe('ColorField — no alpha channel', () => {
   const setup = () => {
     const onChange = vi.fn();
-    render(<ColorField label="color" value={0xfff4e0} onChange={onChange} />);
+    render(<ColorField dataUiId="test.color" label="color" value={0xfff4e0} onChange={onChange} />);
     return { onChange };
   };
 

@@ -37,7 +37,8 @@ export function ParamField({ name, param, value, onChange, mixed = false, idPref
       return <AssetRefField label={label} value={(value as string) ?? ''} onChange={onChange} accept={['.png', '.jpg', '.jpeg', '.webp']} mixed={mixed}
         dataUiId={`${idPrefix}.${name}`} dataUiLabel={label} />;
     case 'color':
-      return <ColorField label={label} value={(value as number) ?? (param.default as number) ?? DEFAULT_COLOR} onChange={onChange} mixed={mixed} />;
+      return <ColorField label={label} value={(value as number) ?? (param.default as number) ?? DEFAULT_COLOR} onChange={onChange} mixed={mixed}
+        dataUiId={`${idPrefix}.${name}`} dataUiLabel={label} />;
     case 'bool':
       return (
         <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2 }}>
@@ -213,7 +214,7 @@ export function MaterialAssetView({ path }: { path: string }) {
       {!isCustom && (
         <>
           {sectionHeader('Surface')}
-          <ColorField label="Color" value={(data.color as number) ?? DEFAULT_COLOR} onChange={v => writeField('color', v)} />
+          <ColorField label="Color" dataUiId="assetView.material.color" value={(data.color as number) ?? DEFAULT_COLOR} onChange={v => writeField('color', v)} />
           {!isUnlit && <NumberField label="Roughness" value={(data.roughness as number) ?? 1} step={0.01} onChange={v => writeField('roughness', v)} wide dataUiId="assetView.material.roughness" />}
           {!isUnlit && <NumberField label="Metalness" value={(data.metalness as number) ?? 0} step={0.01} onChange={v => writeField('metalness', v)} wide dataUiId="assetView.material.metalness" />}
           <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2 }}>
@@ -221,7 +222,7 @@ export function MaterialAssetView({ path }: { path: string }) {
             <input data-ui-id="assetView.material.transparent" data-ui-kind="toggle" data-ui-label="Transparent" data-ui-state={data.transparent ? 'checked' : 'unchecked'} type="checkbox" checked={!!data.transparent} onChange={e => writeField('transparent', e.target.checked)} />
           </div>
           <NumberField label="Opacity" value={(data.opacity as number) ?? 1} step={0.01} onChange={v => writeField('opacity', v)} wide dataUiId="assetView.material.opacity" />
-          <DropdownField label="Side" value={(data.side as string) ?? 'front'} options={['front', 'double', 'back']} onChange={v => writeField('side', v)} />
+          <DropdownField label="Side" dataUiId="assetView.material.side" value={(data.side as string) ?? 'front'} options={['front', 'double', 'back']} onChange={v => writeField('side', v)} />
           <NumberField label="Alpha Test" value={(data.alphaTest as number) ?? 0} step={0.01} onChange={v => writeField('alphaTest', v)} wide dataUiId="assetView.material.alphaTest" />
           {!isUnlit && <NumberField label="Env Intensity" value={(data.envMapIntensity as number) ?? 1} step={0.1} onChange={v => writeField('envMapIntensity', v)} wide dataUiId="assetView.material.envMapIntensity" />}
           {boolField('flipY', 'Flip Y')}
@@ -230,7 +231,7 @@ export function MaterialAssetView({ path }: { path: string }) {
           {boolField('vertexColors', 'Vertex Colors')}
 
           {!isUnlit && sectionHeader('Emission')}
-          {!isUnlit && <ColorField label="Emissive" value={(data.emissive as number) ?? 0} onChange={v => writeField('emissive', v)} />}
+          {!isUnlit && <ColorField label="Emissive" dataUiId="assetView.material.emissive" value={(data.emissive as number) ?? 0} onChange={v => writeField('emissive', v)} />}
           {!isUnlit && <NumberField label="Emissive Intensity" value={(data.emissiveIntensity as number) ?? 1} step={0.05} onChange={v => writeField('emissiveIntensity', v)} wide dataUiId="assetView.material.emissiveIntensity" />}
 
           {sectionHeader('Maps')}
@@ -294,14 +295,14 @@ export function MaterialAssetView({ path }: { path: string }) {
               )}
             </>
           )}
-          <DropdownField label="Side" value={(data.side as string) ?? 'front'} options={['front', 'double']} onChange={v => writeField('side', v)} />
+          <DropdownField label="Side" dataUiId="assetView.material.side" value={(data.side as string) ?? 'front'} options={['front', 'double']} onChange={v => writeField('side', v)} />
         </>
       )}
       {/* NPR outline color + color preserve — apply to every material type.
           lineColor defaults to black; colorPreserve 0 = full NPR grayscale,
           1 = keep the material's true color (outline still drawn). A file
           shader with colorPreserve:'alpha' overrides preserve per-pixel. */}
-      <ColorField label="Line Color" value={(data.lineColor as number) ?? 0} onChange={v => writeField('lineColor', v)} />
+      <ColorField label="Line Color" dataUiId="assetView.material.lineColor" value={(data.lineColor as number) ?? 0} onChange={v => writeField('lineColor', v)} />
       <NumberField label="Color Preserve" value={(data.nprColorPreserve as number) ?? 0} step={0.05} wide onChange={v => writeField('nprColorPreserve', clampNum(v, 0, 1))} dataUiId="assetView.material.nprColorPreserve" />
     </>
   );

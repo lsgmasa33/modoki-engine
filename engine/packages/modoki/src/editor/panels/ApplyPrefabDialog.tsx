@@ -6,7 +6,7 @@
  *  base; in `revert` mode they are reset back to the prefab base on this single
  *  instance (the prefab file is untouched). Same diff tree, opposite direction. */
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import {
   getPrefabSource,
@@ -22,6 +22,7 @@ import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import type { AddedEntity } from '../../runtime/loaders/loadSceneFile';
 import { buildOverrideForest, type ForestNode } from './prefabOverrideForest';
+import { MixedCheckbox } from './assetViews/widgets';
 import {
   collectInstanceOverrideFields, addedKey, removedEntityKey, removedTraitKey,
   type EntityOverrideNode,
@@ -86,24 +87,18 @@ function describeAdded(node: AddedEntity): string {
   return parts.join(', ');
 }
 
-function TriCheckbox({ state, onChange, title }: {
+/** A row's tri-state checkbox. Through MixedCheckbox so it carries a handle (#1170): these rows were
+ *  untagged, so an agent could neither read a partly-selected entity nor tick one. */
+export function TriCheckbox({ state, onChange, title, dataUiId, dataUiLabel }: {
   state: 'on' | 'off' | 'mixed';
   onChange: (next: 'on' | 'off') => void;
   title?: string;
+  dataUiId: string;
+  dataUiLabel?: string;
 }) {
-  const ref = useRef<HTMLInputElement>(null);
-  useEffect(() => {
-    if (ref.current) ref.current.indeterminate = state === 'mixed';
-  }, [state]);
   return (
-    <input
-      ref={ref}
-      type="checkbox"
-      checked={state === 'on'}
-      onChange={(e) => onChange(e.target.checked ? 'on' : 'off')}
-      title={title}
-      style={{ marginRight: 6, cursor: 'pointer' }}
-    />
+    <MixedCheckbox checked={state === 'on'} mixed={state === 'mixed'} onChange={(v) => onChange(v ? 'on' : 'off')}
+      title={title} style={{ marginRight: 6, cursor: 'pointer' }} dataUiId={dataUiId} dataUiLabel={dataUiLabel} />
   );
 }
 
@@ -304,7 +299,8 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
             onClick={() => toggleCollapsed(`e:${e.localId}`)}
             style={{ cursor: 'pointer', color: '#888', width: 14, userSelect: 'none' }}
           >{entityCollapsed ? '▸' : '▾'}</span>
-          <TriCheckbox state={entityState} onChange={(next) => toggleMany(entityKeys, next)} />
+          <TriCheckbox state={entityState} onChange={(next) => toggleMany(entityKeys, next)}
+            dataUiId={`prefab.dialog.entity.${e.localId}`} dataUiLabel={e.name} />
           <span style={{ color: '#ddd', fontWeight: 'bold' }}>{e.name}</span>
           <span style={{ color: '#555', marginLeft: 8, fontSize: 10 }}>localId {e.localId}</span>
         </div>
@@ -319,7 +315,8 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
                   onClick={() => toggleCollapsed(`e:${e.localId}:t:${t.trait}`)}
                   style={{ cursor: 'pointer', color: '#888', width: 14, userSelect: 'none' }}
                 >{traitCollapsed ? '▸' : '▾'}</span>
-                <TriCheckbox state={traitState} onChange={(next) => toggleMany(traitKeys, next)} />
+                <TriCheckbox state={traitState} onChange={(next) => toggleMany(traitKeys, next)}
+                  dataUiId={`prefab.dialog.entity.${e.localId}.trait.${t.trait}`} dataUiLabel={t.trait} />
                 <span style={{ color: '#5dade2' }}>{t.trait}</span>
               </div>
               {!traitCollapsed && t.fields.map((f) => (
@@ -327,6 +324,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
                   <TriCheckbox
                     state={checked.has(f.key) ? 'on' : 'off'}
                     onChange={(next) => toggleKey(f.key, next)}
+                    dataUiId={`prefab.dialog.item.${f.key}`} dataUiLabel={f.field}
                   />
                   <span style={{ color: '#bbb', minWidth: 110 }}>{f.field}</span>
                   {isRevert ? (
@@ -392,6 +390,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
                   <TriCheckbox
                     state={checked.has(key) ? 'on' : 'off'}
                     onChange={(next) => toggleKey(key, next)}
+                    dataUiId={`prefab.dialog.item.${key}`} dataUiLabel={node.name || '(unnamed)'}
                     title={isRevert
                       ? 'Remove this added entity (and its subtree) from the instance'
                       : 'Add this entity (and its subtree) to the prefab base'}
@@ -415,6 +414,10 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
               <TriCheckbox
                 state={checked.has(r.key) ? 'on' : 'off'}
                 onChange={(next) => toggleKey(r.key, next)}
+                // A label of its own: without one `labelFor` falls back to `title`, and every row
+                // in this list shares the same title, so a label aim could not tell them apart. (Two
+                // removed children sharing a NAME still collide — aim those by id.)
+                dataUiId={`prefab.dialog.item.${r.key}`} dataUiLabel={r.name}
                 title={isRevert
                   ? 'Restore this prefab entity to the instance'
                   : 'Delete this entity from the prefab base — affects all instances'}
@@ -433,6 +436,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
               <TriCheckbox
                 state={checked.has(r.key) ? 'on' : 'off'}
                 onChange={(next) => toggleKey(r.key, next)}
+                dataUiId={`prefab.dialog.item.${r.key}`} dataUiLabel={`${r.trait} on ${r.entityName}`}
                 title={isRevert
                   ? 'Restore this component to the instance'
                   : 'Delete this component from the prefab base — affects all instances'}

@@ -3,7 +3,7 @@
  *  Settings PARK to the texture's .meta.json on change (#845 — Cmd+S is the write);
  *  Apply runs the conversion + reloads. */
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { backendFetch } from '../../backend/editorBackend';
 import { useEditorStore } from '../../store/editorStore';
 import { DEFAULT_TEXTURE_SETTINGS, TEXTURE_MAX_SIZES, DEFAULT_WEBP_QUALITY, DEFAULT_UASTC_LEVEL, DEFAULT_UASTC_RDO_LAMBDA, UASTC_LEVELS, resolveTextureSettings, resolveTextureType, deriveSettingsForType, variantsToEmit, resolveWebpQuality, resolveUastcRdoLambda, type TextureImportSettings, type TextureFormat, type TextureType, type TextureCacheInfo } from '../../../runtime/loaders/textureSettings';
@@ -12,7 +12,7 @@ import { registerSprite, isGuid, deriveGuid } from '../../../runtime/loaders/ass
 import { markUIDirty } from '../../../runtime/ui/uiTreeStore';
 import { inputStyle, BufferedNumberInput, MIXED_PLACEHOLDER } from '../fields';
 import { withCurrentValue } from './importSettingOptions';
-import { DropdownField, SubSection, formatBytes, reimportBtnStyle } from './widgets';
+import { DropdownField, MixedCheckbox, SubSection, formatBytes, reimportBtnStyle } from './widgets';
 import { SpriteEditor } from '../SpriteEditor';
 import { NineSliceEditor } from '../NineSliceEditor';
 import { useAssetInvalidationEpoch } from '../useAssetInvalidationEpoch';
@@ -48,14 +48,6 @@ const FORMAT_OPTIONS_BY_TYPE: Record<TextureType, { value: TextureFormat; label:
 
 /** Keys of a texture import setting that can be marked "mixed" in a multi-select. */
 export type TextureSettingKey = 'type' | keyof TextureImportSettings;
-
-/** Tri-state checkbox: renders indeterminate when `mixed`, clearing to a definite
- *  value on the user's click. */
-function MixedCheckbox({ checked, mixed, onChange, uiId, uiLabel }: { checked: boolean; mixed?: boolean; onChange: (v: boolean) => void; uiId?: string; uiLabel?: string }) {
-  const ref = useRef<HTMLInputElement>(null);
-  useEffect(() => { if (ref.current) ref.current.indeterminate = !!mixed; }, [mixed]);
-  return <input ref={ref} data-ui-id={uiId} data-ui-kind="toggle" data-ui-label={uiLabel} data-ui-state={mixed ? 'mixed' : checked ? 'checked' : 'unchecked'} type="checkbox" checked={mixed ? false : checked} onChange={(e) => onChange(e.target.checked)} />;
-}
 
 /** Presentational texture Type + Advanced settings block, shared by the single-asset
  *  TextureAssetView and the multi-select TextureBatchView. When `mixed` marks a key,
@@ -111,10 +103,10 @@ export function TextureSettingsControls({ type, settings, mixed, onChangeType, o
         </div>
         <div style={rowStyle}>
           <span style={labelStyle}>Generate Mipmaps</span>
-          <MixedCheckbox checked={settings.mipmaps} mixed={isMixed('mipmaps')} onChange={(v) => onChange({ mipmaps: v })} uiId="assetView.texture.mipmaps" uiLabel="Generate Mipmaps" />
+          <MixedCheckbox checked={settings.mipmaps} mixed={isMixed('mipmaps')} onChange={(v) => onChange({ mipmaps: v })} dataUiId="assetView.texture.mipmaps" dataUiLabel="Generate Mipmaps" />
         </div>
-        <DropdownField label="Wrap S" value={settings.wrapS} mixed={isMixed('wrapS')} options={['repeat', 'clamp', 'mirror']} onChange={(v) => onChange({ wrapS: v as TextureImportSettings['wrapS'] })} />
-        <DropdownField label="Wrap T" value={settings.wrapT} mixed={isMixed('wrapT')} options={['repeat', 'clamp', 'mirror']} onChange={(v) => onChange({ wrapT: v as TextureImportSettings['wrapT'] })} />
+        <DropdownField label="Wrap S" dataUiId="assetView.texture.wrapS" value={settings.wrapS} mixed={isMixed('wrapS')} options={['repeat', 'clamp', 'mirror']} onChange={(v) => onChange({ wrapS: v as TextureImportSettings['wrapS'] })} />
+        <DropdownField label="Wrap T" dataUiId="assetView.texture.wrapT" value={settings.wrapT} mixed={isMixed('wrapT')} options={['repeat', 'clamp', 'mirror']} onChange={(v) => onChange({ wrapT: v as TextureImportSettings['wrapT'] })} />
         <div style={rowStyle}>
           <span style={labelStyle}>Colorspace</span>
           <select data-ui-id="assetView.texture.colorspace" data-ui-kind="field" data-ui-label="Colorspace" value={isMixed('colorspace') ? '' : settings.colorspace} onChange={(e) => { if (e.target.value) onChange({ colorspace: e.target.value as TextureImportSettings['colorspace'] }); }} style={{ ...inputStyle, flex: 1 }}>
@@ -125,26 +117,27 @@ export function TextureSettingsControls({ type, settings, mixed, onChangeType, o
         </div>
         <div style={rowStyle}>
           <span style={labelStyle}>Flip Y</span>
-          <MixedCheckbox checked={settings.flipY ?? false} mixed={isMixed('flipY')} onChange={(v) => onChange({ flipY: v })} uiId="assetView.texture.flipY" uiLabel="Flip Y" />
+          <MixedCheckbox checked={settings.flipY ?? false} mixed={isMixed('flipY')} onChange={(v) => onChange({ flipY: v })} dataUiId="assetView.texture.flipY" dataUiLabel="Flip Y" />
         </div>
         <div style={rowStyle}>
           <span style={labelStyle}>Flip Green (normal)</span>
-          <MixedCheckbox checked={settings.flipGreen ?? false} mixed={isMixed('flipGreen')} onChange={(v) => onChange({ flipGreen: v })} uiId="assetView.texture.flipGreen" uiLabel="Flip Green" />
+          <MixedCheckbox checked={settings.flipGreen ?? false} mixed={isMixed('flipGreen')} onChange={(v) => onChange({ flipGreen: v })} dataUiId="assetView.texture.flipGreen" dataUiLabel="Flip Green" />
         </div>
         {webpEmitted && (
           <div style={rowStyle}>
             <span style={labelStyle}>WebP Quality</span>
-            {isMixed('webpQuality') ? (
-              <input value={MIXED_PLACEHOLDER} readOnly style={{ ...inputStyle, flex: 1 }} />
-            ) : (
-              <BufferedNumberInput
-                value={settings.webpQuality ?? DEFAULT_WEBP_QUALITY}
-                step={1}
-                onChange={(v) => onChange({ webpQuality: resolveWebpQuality(v) })}
-                style={{ ...inputStyle, flex: 1 }}
-                dataUiId="assetView.texture.webpQuality" dataUiLabel="WebP Quality"
-              />
-            )}
+            {/* ⚠️ ONE element, mixed or not (#1170). A mixed value used to SWAP this for an untagged
+                read-only `----` box, so the handle vanished and a batch could not type a shared value;
+                the placeholder shape is what every other mixed field here renders, and typing into it
+                sets every selected texture (owner decision on #1170). */}
+            <BufferedNumberInput
+              value={settings.webpQuality ?? DEFAULT_WEBP_QUALITY}
+              mixed={isMixed('webpQuality')}
+              step={1}
+              onChange={(v) => onChange({ webpQuality: resolveWebpQuality(v) })}
+              style={{ ...inputStyle, flex: 1 }}
+              dataUiId="assetView.texture.webpQuality" dataUiLabel="WebP Quality"
+            />
           </div>
         )}
         {uastcEmitted && (
@@ -164,19 +157,17 @@ export function TextureSettingsControls({ type, settings, mixed, onChangeType, o
             </div>
             <div style={rowStyle}>
               <span style={labelStyle}>UASTC RDO λ</span>
-              {isMixed('uastcRdoLambda') ? (
-                <input value={MIXED_PLACEHOLDER} readOnly style={{ ...inputStyle, flex: 1 }} />
-              ) : (
-                <BufferedNumberInput
-                  value={settings.uastcRdoLambda ?? DEFAULT_UASTC_RDO_LAMBDA}
-                  step={0.1}
-                  min={0}
-                  max={4}
-                  onChange={(v) => onChange({ uastcRdoLambda: resolveUastcRdoLambda(v) })}
-                  style={{ ...inputStyle, flex: 1 }}
-                  dataUiId="assetView.texture.uastcRdoLambda" dataUiLabel="UASTC RDO λ"
-                />
-              )}
+              {/* One element, mixed or not — see WebP Quality above (#1170). */}
+              <BufferedNumberInput
+                value={settings.uastcRdoLambda ?? DEFAULT_UASTC_RDO_LAMBDA}
+                mixed={isMixed('uastcRdoLambda')}
+                step={0.1}
+                min={0}
+                max={4}
+                onChange={(v) => onChange({ uastcRdoLambda: resolveUastcRdoLambda(v) })}
+                style={{ ...inputStyle, flex: 1 }}
+                dataUiId="assetView.texture.uastcRdoLambda" dataUiLabel="UASTC RDO λ"
+              />
             </div>
           </>
         )}

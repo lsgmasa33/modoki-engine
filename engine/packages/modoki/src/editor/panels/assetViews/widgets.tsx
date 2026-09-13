@@ -6,7 +6,7 @@
  *  they're pure presentational widgets with no dependency on the panel shell.
  *  Inspector.tsx re-imports them so behavior is unchanged. */
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import ContextMenu, { type ContextMenuItem } from '../../components/ContextMenu';
 import type { FieldHint } from '../../../runtime/core/ecs/traitRegistry';
 import { backendFetch } from '../../backend/editorBackend';
@@ -171,6 +171,21 @@ export function NumberField({ label, value, onChange, step = 0.1, readOnly = fal
   // BufferedNumberInput). Clamp in `parse` so a typed out-of-range value is capped.
   const parse = useCallback((s: string) => clampRange(parseNumber(s), hint?.min, hint?.max), [hint?.min, hint?.max]);
   const { localValue, onFocus, onBlur, handleChange } = useBufferedValue(value, onChange, parse, mixed);
+  // ⚠️ A `type="number"` input STEPS NATIVELY — mouse wheel while focused, ArrowUp/ArrowDown, and the
+  // spin buttons — and from an empty MIXED box it steps from 0, so `handleChange` receives a real
+  // value and commits it to the whole selection (#1170 close-out). Measured in Electron: one wheel
+  // notch on a mixed `UIElement.zIndex` (10 and 20) set both entities to 1; a review measured ArrowUp
+  // and a spin-button click doing the same in Chromium. ONE guard for all three, at the commit:
+  // Chromium dispatches a native step as a plain `Event`, while typing, pasting and dropping arrive
+  // as an `InputEvent` carrying an `inputType`. So while the box is still empty and mixed, a change
+  // with no `inputType` is a step and is refused — React then restores the controlled `''`. Once the
+  // user has typed a value the box is no longer empty and steps from it normally.
+  // ⚠️ An agent writing this field through a native value setter must dispatch
+  // `new InputEvent('input', {inputType: 'insertText', bubbles: true})`, not a bare `Event`, while mixed.
+  const onNumberChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (mixed && localValue === '' && !(e.nativeEvent as InputEvent).inputType) return;
+    handleChange(e.target.value);
+  };
   // A fully-bounded field (both min AND max declared) gets a drag slider — the
   // range IS the affordance ("how far along the scale"), far more legible than a
   // bare number for effect knobs (glow/weight/opacity). Slider drives the same
@@ -207,7 +222,7 @@ export function NumberField({ label, value, onChange, step = 0.1, readOnly = fal
         onFocus={onFocus}
         onBlur={onBlur}
         onDoubleClick={(e) => (e.target as HTMLInputElement).select()}
-        onChange={(e) => handleChange(e.target.value)}
+        onChange={onNumberChange}
         data-ui-id={dataUiId}
         style={{ ...inputStyle, ...(bounded ? { width: 52, flexShrink: 0 } : { flex: 1 }), color: overrideColor ? '#5dade2' : '#ddd', fontWeight: overrideColor ? 'bold' : 'normal', ...(readOnly ? readOnlyFieldStyle : null) }}
       />
@@ -215,18 +230,55 @@ export function NumberField({ label, value, onChange, step = 0.1, readOnly = fal
   );
 }
 
-export function DropdownField({ label, value, options, onChange, hint, mixed = false, disabled = false }: {
+/** A `<select>` that can show a multi-selection's MIXED state — the ONE shape for it (#1170).
+ *
+ *  When mixed, it shows a non-committal MIXED_PLACEHOLDER row with `value=''`, and picking any real
+ *  option broadcasts it to the whole selection. That exact rendering is what `modoki_handles` reads
+ *  as `meta.mixed` (`formStateFor` in `app/debug/chromeHandles.ts`), so a select that hand-rolls its
+ *  own placeholder text (the Inspector's unit select said `--`) is invisible to an agent.
+ *  `dataUiId` is REQUIRED (#724): an untagged control has no handle at all. */
+export function MixedSelect({ value, options, onChange, mixed = false, disabled = false, style, dataUiId, dataUiLabel }: {
+  value: string; options: ReadonlyArray<string | { value: string; label: string }>; onChange: (v: string) => void;
+  mixed?: boolean; disabled?: boolean; style?: React.CSSProperties; dataUiId: string; dataUiLabel?: string;
+}) {
+  // Normalized first so the option `.map()` stays one `=> <option` line — the shape
+  // importSettingSelectsSpliced.test.ts scans for. Split across a ternary, the scan stopped seeing
+  // this select (and every caller's list behind it) without failing on it.
+  const normalized = options.map((o) => (typeof o === 'string' ? { value: o, label: o } : o));
+  return (
+    <select value={mixed ? '' : value} disabled={disabled} onChange={(e) => { if (e.target.value !== '') onChange(e.target.value); }}
+      data-ui-id={dataUiId} data-ui-kind="field" data-ui-label={dataUiLabel} style={style}>
+      {mixed && <option value="">{MIXED_PLACEHOLDER}</option>}
+      {normalized.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+    </select>
+  );
+}
+
+/** Tri-state checkbox: `indeterminate` when `mixed`, clearing to a definite value on the user's
+ *  click. `indeterminate` is a DOM property with no attribute, so it is set from a ref — and it is
+ *  what `modoki_handles` reads as `meta.mixed`. `dataUiId` is REQUIRED (#724, #1170). */
+export function MixedCheckbox({ checked, mixed = false, onChange, disabled, title, style, dataUiId, dataUiLabel }: {
+  checked: boolean; mixed?: boolean; onChange: (v: boolean) => void; disabled?: boolean; title?: string;
+  style?: React.CSSProperties; dataUiId: string; dataUiLabel?: string;
+}) {
+  const ref = useRef<HTMLInputElement>(null);
+  useEffect(() => { if (ref.current) ref.current.indeterminate = mixed; }, [mixed]);
+  return <input ref={ref} type="checkbox" checked={mixed ? false : checked} disabled={disabled} title={title} style={style}
+    onChange={(e) => onChange(e.target.checked)}
+    data-ui-id={dataUiId} data-ui-kind="toggle" data-ui-label={dataUiLabel} data-ui-state={mixed ? 'mixed' : checked ? 'checked' : 'unchecked'} />;
+}
+
+export function DropdownField({ label, value, options, onChange, hint, mixed = false, disabled = false, dataUiId, dataUiLabel }: {
   label: string; value: string; options: string[]; onChange: (v: string) => void; hint?: FieldHint; mixed?: boolean; disabled?: boolean;
+  /** REQUIRED (#1170) — see MixedSelect. */
+  dataUiId: string; dataUiLabel?: string;
 }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2 }}>
       <FieldLabel label={label} hint={hint} style={{ flex: 1, color: '#888', fontSize: '11px' }} />
-      {/* When mixed, the select shows a non-committal placeholder row; picking any
-          real option broadcasts it to all selected entities. */}
-      <select value={mixed ? '' : value} disabled={disabled} onChange={(e) => { if (e.target.value !== '') onChange(e.target.value); }} style={{ ...inputStyle, flex: 1, cursor: disabled ? 'not-allowed' : undefined }}>
-        {mixed && <option value="">{MIXED_PLACEHOLDER}</option>}
-        {options.map((o) => <option key={o} value={o}>{o}</option>)}
-      </select>
+      <MixedSelect value={value} options={options} onChange={onChange} mixed={mixed} disabled={disabled}
+        dataUiId={dataUiId} dataUiLabel={dataUiLabel ?? (label || undefined)}
+        style={{ ...inputStyle, flex: 1, cursor: disabled ? 'not-allowed' : undefined }} />
     </div>
   );
 }
@@ -299,11 +351,19 @@ const hexInputStyle: React.CSSProperties = {
  *  drops the alpha, since copying a UI color onto a light is a normal thing to do.
  *
  *  With alpha the row is two lines (label+swatch+slider+readout, then the hex): the five
- *  controls don't fit the inspector's column width on one. */
-export function ColorField({ label, value, onChange, mixed = false, alpha, onAlphaChange, alphaMixed = false }: {
+ *  controls don't fit the inspector's column width on one.
+ *
+ *  Handles (#1170): the hex text box carries `dataUiId` itself — it is the one control that shows
+ *  and edits the whole value, the way NumberField's number box does — with `.picker` and `.alpha`
+ *  beside it. The alpha slider cannot show MIXED_PLACEHOLDER, so it says `data-ui-mixed` instead
+ *  (NumberField's slider precedent); the `----` alpha readout is a label, not a control. */
+export function ColorField({ label, value, onChange, mixed = false, alpha, onAlphaChange, alphaMixed = false, dataUiId, dataUiLabel }: {
   label: string; value: number; onChange: (v: number) => void; mixed?: boolean;
   alpha?: number; onAlphaChange?: (a: number) => void; alphaMixed?: boolean;
+  /** REQUIRED (#724, #1170) — an untagged color has no handle for an agent to read or aim at. */
+  dataUiId: string; dataUiLabel?: string;
 }) {
+  const uiLabel = dataUiLabel ?? (label || undefined);
   const hex = colorToHex(value);
   const hasAlpha = typeof alpha === 'number' && !!onAlphaChange;
   const a = hasAlpha ? Math.min(1, Math.max(0, alpha!)) : 1;
@@ -334,6 +394,7 @@ export function ColorField({ label, value, onChange, mixed = false, alpha, onAlp
   const hexField = (
     <input type="text" spellCheck={false} value={localValue} placeholder={hexMixed ? MIXED_PLACEHOLDER : undefined}
       aria-label={`${label} hex`}
+      data-ui-id={dataUiId} data-ui-kind="field" data-ui-label={uiLabel}
       onFocus={(e) => { onFocus(); e.currentTarget.select(); }} onBlur={onBlur}
       onChange={(e) => handleChange(e.target.value)}
       title={valid ? 'Hex color — copy/paste between pickers' : `Not a hex color — expected #rrggbb${hasAlpha ? ' or #rrggbbaa' : ''}`}
@@ -347,6 +408,9 @@ export function ColorField({ label, value, onChange, mixed = false, alpha, onAlp
         <span style={{ ...CHECKER, position: 'relative', width: 28, height: 20, flex: 'none', borderRadius: 2, overflow: 'hidden', opacity: mixed ? 0.4 : 1 }}>
           <span style={{ position: 'absolute', inset: 0, backgroundColor: `rgba(${(rgb >> 16) & 255}, ${(rgb >> 8) & 255}, ${rgb & 255}, ${a})` }} />
           <input type="color" value={hex} aria-label={`${label} color`}
+            data-ui-id={`${dataUiId}.picker`} data-ui-kind="field" data-ui-label={uiLabel}
+            // The swatch dims when mixed, but the picker's own value is the PRIMARY entity's color.
+            data-ui-mixed={mixed ? 'true' : undefined}
             onChange={(e) => onChange(parseInt(e.target.value.slice(1), 16))}
             style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', opacity: 0, border: 'none', padding: 0, cursor: 'pointer' }} />
         </span>
@@ -355,6 +419,8 @@ export function ColorField({ label, value, onChange, mixed = false, alpha, onAlp
             <input type="range" min={0} max={1} step={0.01} value={a}
               onChange={(e) => onAlphaChange!(parseFloat(e.target.value))}
               title="Alpha" aria-label={`${label} alpha`}
+              data-ui-id={`${dataUiId}.alpha`} data-ui-kind="field" data-ui-label={uiLabel}
+              data-ui-mixed={alphaMixed ? 'true' : undefined}
               style={{ width: 56, flex: 'none', cursor: 'pointer', opacity: alphaMixed ? 0.4 : 1 }} />
             <span style={{ color: '#666', fontSize: '10px', width: 26, textAlign: 'right', flex: 'none' }}>{alphaMixed ? MIXED_PLACEHOLDER : a.toFixed(2)}</span>
           </>

@@ -181,7 +181,7 @@ export function MaterialOverridesField({ entityIds, meta, field }: { entityIds: 
 
             {/* Switching TO texture drops the (unused) source + seeds a ref; switching AWAY
                 seeds a default source so the row stays valid. */}
-            <DropdownField label="kind" value={kind} options={kindOptionsForRow(kind, is2D)} onChange={(v) => update(i, (row) => (
+            <DropdownField label="kind" dataUiId={`material.override.${i}.kind`} value={kind} options={kindOptionsForRow(kind, is2D)} onChange={(v) => update(i, (row) => (
               v === 'texture' ? { kind: 'texture', ref: row.ref ?? '', source: undefined }
                 : { kind: v as 'uniform' | 'prop', ref: undefined, source: row.source ?? defaultSource('constant') }
             ))} />
@@ -203,7 +203,7 @@ export function MaterialOverridesField({ entityIds, meta, field }: { entityIds: 
                 onChange={(v) => update(i, () => ({ ref: v }))}
                 dataUiId={`material.override.${i}.ref`} dataUiLabel={o.target || `override ${i + 1}`} />
             ) : (<>
-            <DropdownField label="source" value={srcType} options={SOURCE_OPTS}
+            <DropdownField label="source" dataUiId={`material.override.${i}.source`} value={srcType} options={SOURCE_OPTS}
               onChange={(v) => update(i, () => ({ source: defaultSource(v) }))} />
 
             {srcType === 'constant' && (
@@ -220,7 +220,7 @@ export function MaterialOverridesField({ entityIds, meta, field }: { entityIds: 
             {srcType === 'time' && (<>
               <NumRow label="speed" value={num(src.speed, 1)} step={0.05} onChange={(v) => patchSource(i, { speed: v })} dataUiId={`material.override.${i}.speed`} dataUiLabel={o.target || `override ${i + 1}`} />
               <NumRow label="wrap (s)" value={num(src.wrap, 10000)} step={1} onChange={(v) => patchSource(i, { wrap: v })} dataUiId={`material.override.${i}.wrap`} dataUiLabel={o.target || `override ${i + 1}`} />
-              <DropdownField label="base" value={String(src.base || 'visual')} options={['visual', 'sim']}
+              <DropdownField label="base" dataUiId={`material.override.${i}.base`} value={String(src.base || 'visual')} options={['visual', 'sim']}
                 onChange={(v) => patchSource(i, { base: v })} />
             </>)}
 
