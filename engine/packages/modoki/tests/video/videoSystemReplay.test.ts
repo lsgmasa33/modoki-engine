@@ -305,7 +305,7 @@ describe('videoSystem — video.stop + video.setClip re-arms via the real action
       expect(ends).toBe(1);
 
       // video.stop: seeks to 0 + pauses — exactly what `video.stop`'s handler does in
-      // `videoControls.ts` (`seekEntityVideo(target.id(), 0); patch(target, { playing: false });`).
+      // `videoControls.ts` (`seekEntityVideo(target.id(), 0); patch('video.stop', target, { playing: false });`).
       expect(getUIActionNames()).toContain('video.stop');
       dispatchUIAction('video.stop', { targetGuid: guid });
 

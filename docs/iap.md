@@ -193,9 +193,9 @@ close.
 `stillActive`-style check there.** `resetIap()` clears `cfg` and `entitled` but deliberately does
 NOT clear `settling`, so a settle for the same transaction id restarting in the next session still
 sees it busy via `settle()`'s in-flight check, and the stale `finally` releasing it later is correct,
-not a leak. Court's `storeInFlight` (`games/court/runtime/systems.ts`) is the mirror image and needs
-the OPPOSITE fix — a generation check IS required there — because `resetStoreUi` DOES clear its set
-on teardown, so a next-session entry can be added right after, and only a generation check stops the
+not a leak. `ShelfSession`'s in-flight set (`runtime/iap/shelfSession.ts`, Court's `storeInFlight`
+until #925) is the mirror image and needs the OPPOSITE fix — a generation check IS required there —
+because `reset()` DOES clear its set on teardown, so a next-session entry can be added right after, and only a generation check stops the
 stale `finally` from deleting the NEW entry. Same shape, opposite requirement, because exactly one of
 the two teardown functions clears its set: check which before copying either fix elsewhere.
 
@@ -271,6 +271,26 @@ Prices must come from the store (`productInfo()`), never hardcoded.
 immediately, and reading pre-hydration boots an EMPTY ledger, which makes `isProcessed()` answer
 false for transactions already granted and re-grants every unfinished consumable. A double-credit
 bug caused by wiring, with the state machine behaving exactly as designed on a ledger that lied.
+
+### A store SCREEN is built on the shelf, not from scratch (#925)
+
+A game with a store screen does not re-derive its rules. `runtime/iap/shelf.ts` and
+`shelfSession.ts` carry what Court learned on device, and every game with a shelf reads through them
+(Court and wordweave, both since #925 — wordweave's store screen is the reason they were promoted). The full description and the per-game split
+live in [cross-game-infrastructure.md](./cross-game-infrastructure.md) § "What is shared today";
+the rules a wiring must not break:
+
+- **Describe the shelf as `ShelfOffer[]`** built from authored config. `buildShelfCatalog` is what
+  goes to `configureIap`, so the catalog, the effect and the visibility filter can never read two
+  different product lists.
+- **Words are the game's.** `shelfView` takes `rowWords` and `notice`; `quickBuyView` returns the
+  price for the game to label. Nothing in `runtime/iap/` renders a sentence.
+- **`owned.foreverOwned` is passed in, because who owns the unlock is a PRODUCT decision** (§ 2): a
+  `non-consumable` unlock is `isEntitled(id)` after `refreshEntitlements()`/`reconcile()`, a consumable
+  one is whatever the game recorded. Getting this wrong offers a second sale of something owned.
+- **One `ShelfSession` per screen, reset in the game's teardown.** Its `inFlightCount` is what a
+  reload blocker reads — not `state.kind === 'buying'`, which the watchdog and a grant both release
+  while the payment is still queued.
 
 ---
 
@@ -545,7 +565,9 @@ five-point chain, and nothing stated the invariant, so a fourth point was free t
 deliberately NOT bumping the epoch, and says so in its own comment; the watchdog was the one site not
 following an existing documented rule. ⚠️ **Safe because `storeInFlight`, not `storeAttempt`, is the
 double-charge bar** — it is released in `settleStorePurchase`'s `finally`, BEFORE the attempt guard,
-so the same product is refused either way. The epoch bump only ever silenced the settle.
+so the same product is refused either way. The epoch bump only ever silenced the settle. (Both fields
+are `ShelfSession`'s since #925 — its in-flight set and its supersession token — with the same
+ordering.)
 
 #### Instrument notes — two things that read as "nothing happened" and are not
 

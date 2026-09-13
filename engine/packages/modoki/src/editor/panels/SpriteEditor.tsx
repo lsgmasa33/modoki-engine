@@ -30,13 +30,13 @@ import { markScene2DDirty } from '../../runtime/rendering/Scene2D';
 import { registerHandleProvider, clampHandleToOwner, type InteractionHandle } from '../../runtime/rendering/interactionHandles';
 import { createCoalescedEdit, type CoalescedEdit } from './coalescedEdit';
 import { BufferedNumberInput } from './fields';
-import { resizeSliceRect, type Handle } from './sliceDrag';
+import { resizeSliceRect, moveSliceRect, type Handle } from './sliceDrag';
 import { useDragPointerCapture, pressIsOnScrollbar } from './dragPointerCapture';
 
 type DragMode =
   | { kind: 'none' }
   | { kind: 'create'; startX: number; startY: number }
-  | { kind: 'move'; guid: string; offX: number; offY: number }
+  | { kind: 'move'; guid: string; startRect: SpriteRect; press: { x: number; y: number } }
   | { kind: 'resize'; guid: string; handle: Handle; startRect: SpriteRect; press: { x: number; y: number } };
 
 export type { Handle };
@@ -512,7 +512,7 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
       const s = sprites[i];
       if (ip.x >= s.rect.x && ip.x <= s.rect.x + s.rect.w && ip.y >= s.rect.y && ip.y <= s.rect.y + s.rect.h) {
         setSelected(s.guid);
-        dragRef.current = { kind: 'move', guid: s.guid, offX: ip.x - s.rect.x, offY: ip.y - s.rect.y };
+        dragRef.current = { kind: 'move', guid: s.guid, startRect: { ...s.rect }, press: ip };
         return;
       }
     }
@@ -542,9 +542,7 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     } else if (drag.kind === 'move') {
       setSprites((prev) => prev.map((s) => {
         if (s.guid !== drag.guid) return s;
-        const x = clamp(ix - drag.offX, 0, imgDims.w - s.rect.w);
-        const y = clamp(iy - drag.offY, 0, imgDims.h - s.rect.h);
-        return { ...s, rect: { ...s.rect, x: Math.round(x), y: Math.round(y) } };
+        return { ...s, rect: moveSliceRect(drag.startRect, drag.press, ip, imgDims) };
       }));
     } else if (drag.kind === 'resize') {
       setSprites((prev) => prev.map((s) => {

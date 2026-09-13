@@ -4,7 +4,7 @@
  *  NavigationManager, which owns the history stack. These lifecycle actions have
  *  no state, so they stay as plain built-ins registered once at startup. */
 
-import { registerUIAction } from '../core/actionRegistry';
+import { registerUIAction, refuseAction } from '../core/actionRegistry';
 import { shutdownRealmThenReload } from '../core/realmShutdown';
 import { SkeletalAnimator } from '../traits/SkeletalAnimator';
 import { Animator } from '../traits/Animator';
@@ -16,6 +16,7 @@ import { animatorHasClip } from '../animation/animClipBank';
 import { spriteAnimHasClip } from '../loaders/spriteAnimCache';
 import { scrollToEntry } from '../ui/scrollApi';
 import { EntityAttributes } from '../core/traits/EntityAttributes';
+import { ANIMATOR_CLIP_TRAITS, switchableClipNames, skeletalClipRoster } from '../animation/switchableClips';
 
 /** A UIAction `target` is an entity handle; the scroll API addresses by GUID (the only
  *  hot-reload-stable address). One hop, in one place. */
@@ -37,6 +38,10 @@ function describeEntity(entity: { has(t: unknown): boolean; get(t: unknown): unk
 
 let registered = false;
 
+// ⚠️ Every refusal below is `return refuseAction(...)`, not `console.warn` + `return` (#1129): the
+// dispatch-action agent op reads the returned refusal to answer `ok:false`, and holds NO copy of these
+// preconditions — so a refusal that only warns is reported to an agent as a success.
+
 export function registerEngineActions(): void {
   if (registered) return;
   registered = true;
@@ -57,15 +62,13 @@ export function registerEngineActions(): void {
   //  converts them using the entry size it already resolves. `params.behavior` is
   //  'instant' | 'smooth', the only two values the CSS backend can genuinely honour.
   registerUIAction('ui.scrollTo', ({ target, params }) => {
-    if (!target) {
-      console.warn('[ui.scrollTo] no target entity — point the binding at the scroll view');
-      return;
-    }
+    if (!target) return refuseAction('[ui.scrollTo] no target entity — point the binding at the scroll view');
     const guid = guidOfEntity(target);
-    if (!guid) { console.warn('[ui.scrollTo] target has no guid'); return; }
+    if (!guid) return refuseAction('[ui.scrollTo] target has no guid');
     const p = (params ?? {}) as { x?: number; y?: number; behavior?: 'instant' | 'smooth' };
     const ok = scrollToEntry(guid, { x: p.x, y: p.y }, { behavior: p.behavior });
-    if (!ok) console.warn('[ui.scrollTo] target is not a scroll view (needs UIScrollView + UIEntries)');
+    if (!ok) return refuseAction(`[ui.scrollTo] ${describeEntity(target)} is not a scroll view (needs UIScrollView + UIEntries)`);
+    return undefined;
   });
 
   // engine.quit — native-only. On web there is nothing to quit; the app shell
@@ -82,10 +85,7 @@ export function registerEngineActions(): void {
   //  .anim.json), so toggling is a plain field write the render sync picks up
   //  next frame. Toggles whichever animator trait(s) the target carries.
   registerUIAction('engine.toggleAnimator', ({ target }) => {
-    if (!target) {
-      console.warn('[engine.toggleAnimator] no target entity — set the binding target to an animator entity');
-      return;
-    }
+    if (!target) return refuseAction('[engine.toggleAnimator] no target entity — set the binding target to an animator entity');
     let toggled = false;
     const skel = target.get(SkeletalAnimator);
     if (skel) {
@@ -97,9 +97,8 @@ export function registerEngineActions(): void {
       target.set(Animator, { ...anim, playing: !anim.playing });
       toggled = true;
     }
-    if (!toggled) {
-      console.warn('[engine.toggleAnimator] target has no SkeletalAnimator or Animator trait');
-    }
+    if (!toggled) return refuseAction(`[engine.toggleAnimator] ${describeEntity(target)} has no SkeletalAnimator or Animator trait`);
+    return undefined;
   });
 
   // engine.playClip — switch the target's active animation clip BY NAME, across ALL THREE
@@ -111,22 +110,20 @@ export function registerEngineActions(): void {
   //  `playing`; skeletal lets its mixer crossfade per `fadeDuration`.
   //
   //  Guards differ by where the clip list lives: keyframe (`animatorHasClip`) and sprite
-  //  (`spriteAnimHasClip`) validate synchronously against the bank/clipSet and no-op+warn on
-  //  an unknown name; skeletal clips live in the GLB/animset and are validated at the render
-  //  layer (driveAnimator ignores an unknown name), so no synchronous guard here.
+  //  (`spriteAnimHasClip`) validate synchronously against the bank/clipSet. Skeletal clips live in
+  //  the GLB/animsets, which may not have loaded yet, so a skeletal name is refused only when its
+  //  roster is COMPLETE (every source loaded — `skeletalClipRoster`), non-empty, and lacks the name;
+  //  otherwise the write goes through for the render layer (whose driveAnimator warns and falls back to
+  //  the first clip on a name it has no action for, and merges a still-loading source when it arrives). That rule used
+  //  to live only in the agent bridge's pre-flight, so an agent was refused a typo'd skeletal clip that
+  //  an authored button silently wrote (#1129, owner 2026-09-14).
   registerUIAction('engine.playClip', {
     params: { clip: { type: 'string', tooltip: 'Clip NAME to play — must exist on the target animator (keyframe/sprite bank, or a GLB/animset clip for skeletal)' } },
     handler: ({ target, params, payload }) => {
-      if (!target) {
-        console.warn('[engine.playClip] no target entity — set the binding target to an animator entity');
-        return;
-      }
+      if (!target) return refuseAction('[engine.playClip] no target entity — set the binding target to an animator entity');
       const name = (typeof params?.clip === 'string' && params.clip) ? params.clip
         : (typeof payload === 'string' ? payload : '');
-      if (!name) {
-        console.warn('[engine.playClip] no clip name (set the `clip` param or bind $value)');
-        return;
-      }
+      if (!name) return refuseAction('[engine.playClip] no clip name (set the `clip` param or bind $value)');
       let hasAnimator = false;
       let switched = false;
 
@@ -143,12 +140,24 @@ export function registerEngineActions(): void {
       const skel = target.get(SkeletalAnimator);
       if (skel) {
         hasAnimator = true;
-        target.set(SkeletalAnimator, { ...skel, clip: name, playing: true }); // render layer validates + crossfades
-        switched = true;
+        const roster = skeletalClipRoster(target.id());
+        if (!roster.complete || roster.names.length === 0 || roster.names.includes(name)) {
+          target.set(SkeletalAnimator, { ...skel, clip: name, playing: true }); // render layer validates + crossfades
+          switched = true;
+        }
       }
 
-      if (!hasAnimator) console.warn('[engine.playClip] target has no Animator / SpriteAnimator / SkeletalAnimator trait');
-      else if (!switched) console.warn(`[engine.playClip] no clip named "${name}" on the target's animator(s)`);
+      if (!hasAnimator) {
+        return refuseAction(`[engine.playClip] ${describeEntity(target)} has no Animator / SpriteAnimator / SkeletalAnimator trait — nothing to drive`);
+      }
+      if (!switched) {
+        const known = [...ANIMATOR_CLIP_TRAITS].flatMap((t) => switchableClipNames(target.id(), t));
+        return refuseAction(
+          `[engine.playClip] no clip named "${name}" on ${describeEntity(target)}'s animator(s) (names are case-sensitive)${known.length ? `. Known clips: ${known.join(', ')}` : ''}`,
+          { detail: { known } },
+        );
+      }
+      return undefined;
     },
   });
 
@@ -185,14 +194,10 @@ export function registerEngineActions(): void {
       speed: { type: 'number', tooltip: 'Optional: playback rate multiplier (1 = normal, 0.5 = half speed). Forward only — a negative rate is clamped to 0, because reverse playback is not supported.' },
     },
     handler: ({ target, params, payload, world }) => {
-      if (!target) {
-        console.warn('[engine.director] no target entity — set the binding target to an entity carrying a Director');
-        return;
-      }
+      if (!target) return refuseAction('[engine.director] no target entity — set the binding target to an entity carrying a Director');
       const dir = target.get(Director);
       if (!dir) {
-        console.warn('[engine.director] target has no Director trait');
-        return;
+        return refuseAction(`[engine.director] ${describeEntity(target)} has no Director trait — Directors live on the entity that owns the timeline`);
       }
       // ⚠️ REFUSE on a parent-driven child, before any transport verb is interpreted (#1112).
       //
@@ -210,15 +215,19 @@ export function registerEngineActions(): void {
       //  caller is handed the parent's address and decides for itself.
       //
       //  This is the choke point all three surfaces share (an authored button, the agent bridge's
-      //  dispatch-action op, and its device twin), which is why the refusal lives HERE and not only
-      //  in the bridge — a Pause button wired to a nested cutscene reaches none of the bridge's
-      //  pre-flight checks.
+      //  dispatch-action op, and its device twin), which is why the refusal lives HERE and ONLY here:
+      //  the bridge reads the returned refusal, and `slavedTo` carries the parent's guid so an agent's
+      //  retry is mechanical. ⚠️ Never the runtime id as that address — ids are reassigned on every
+      //  scene hot-reload, so a retry against one drives whatever now holds it.
       const slaving = findSlavingParent(world, target.id());
       if (slaving) {
         const parent = findEntityById(slaving.parentId, world);
         const where = parent ? describeEntity(parent) : `entity ${slaving.parentId}`;
-        console.warn(`[engine.director] ${describeEntity(target)} is DRIVEN by a parent's subdirector clip (parent ${where}, track '${slaving.trackId}') — its playhead is computed from the parent's every frame, so play/pause/toggle/restart/seek/speed on it cannot take effect. Refused, nothing written. Target the parent instead.`);
-        return;
+        const parentGuid = parent ? guidOfEntity(parent) : '';
+        return refuseAction(
+          `[engine.director] ${describeEntity(target)} is a SLAVED sub-director, DRIVEN by a parent's subdirector clip (parent ${where}, track '${slaving.trackId}') — its playhead is computed from the parent's every frame, so play/pause/toggle/restart/seek/speed on it cannot take effect. Refused, nothing written. Target the parent instead${parentGuid ? '' : ' (it carries no guid — re-read the hierarchy to aim at it)'}.`,
+          { detail: parentGuid ? { slavedTo: parentGuid } : {} },
+        );
       }
       const action = (typeof params?.action === 'string' && params.action) ? params.action
         : (typeof payload === 'string' && payload ? payload : 'toggle');
@@ -234,8 +243,7 @@ export function registerEngineActions(): void {
           next.playing = true;
           break;
         default:
-          console.warn(`[engine.director] unknown action "${action}" (expected play|pause|toggle|restart)`);
-          return;
+          return refuseAction(`[engine.director] unknown action "${action}" (expected play|pause|toggle|restart)`);
       }
       // Seeking is orthogonal to the transport action, so it applies AFTER and wins — `{action:
       // 'restart', time: 3}` means "start this playthrough over, from 3s", which is the only
@@ -270,6 +278,7 @@ export function registerEngineActions(): void {
         next.speed = Math.max(0, params.speed);
       }
       target.set(Director, next);
+      return undefined;
     },
   });
 }

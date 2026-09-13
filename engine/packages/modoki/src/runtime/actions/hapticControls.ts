@@ -36,7 +36,7 @@
  * key in here would put engine-chosen storage under a game-chosen setting.
  */
 
-import { registerUIAction } from '../core/actionRegistry';
+import { registerUIAction, refuseAction } from '../core/actionRegistry';
 import { getCurrentWorld } from '../core/ecs/worldRegistry';
 import { HapticSettings } from '../traits/HapticSettings';
 import { playHaptic } from '../haptics/hapticsService';
@@ -49,13 +49,17 @@ function settingsEntity() {
   return getCurrentWorld().queryFirst(HapticSettings);
 }
 
-function setEnabled(next: boolean): void {
+/** False when there is no HapticSettings to write. That is fine for a PLAYER (nothing to toggle), so
+ *  the refusals built from it are unlogged — but it is not a success, and the agent op says so (#1129). */
+function setEnabled(next: boolean): boolean {
   const e = settingsEntity();
-  if (!e) return;               // no HapticSettings authored — nothing to toggle, and that is fine
-  const s = e.get(HapticSettings);
-  if (!s) return;
+  const s = e?.get(HapticSettings);
+  if (!e || !s) return false;
   e.set(HapticSettings, { ...s, enabled: next });
+  return true;
 }
+
+const NO_SETTINGS = 'no HapticSettings entity in the scene — nothing to change (author one to make haptics switchable)';
 
 export function registerHapticControls(): void {
   registerUIAction('haptics.play', {
@@ -77,8 +81,8 @@ export function registerHapticControls(): void {
   registerUIAction('haptics.toggle', () => {
     const e = settingsEntity();
     const s = e?.get(HapticSettings);
-    if (!s) return;
-    setEnabled(!s.enabled);
+    if (!s || !setEnabled(!s.enabled)) return refuseAction(`[haptics.toggle] ${NO_SETTINGS}`, { log: false });
+    return undefined;
   });
 
   // ⚠️ NO `payload` FALLBACK HERE, unlike `play` above, and the asymmetry is deliberate:
@@ -87,7 +91,10 @@ export function registerHapticControls(): void {
   // `params` is `Record<string, unknown>` and carries a real authored boolean.
   registerUIAction('haptics.set', ({ params }) => {
     const enabled = params?.enabled;
-    if (typeof enabled !== 'boolean') return;   // authored scene data — validated, never trusted
-    setEnabled(enabled);
+    if (typeof enabled !== 'boolean') {   // authored scene data — validated, never trusted
+      return refuseAction(`[haptics.set] params.enabled must be a boolean, got ${JSON.stringify(enabled)}`, { log: false });
+    }
+    if (!setEnabled(enabled)) return refuseAction(`[haptics.set] ${NO_SETTINGS}`, { log: false });
+    return undefined;
   });
 }

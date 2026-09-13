@@ -370,9 +370,22 @@ blip, or — since #836 — an active version the publish path has PRUNED from t
 back to the whole-`bundle.zip` path of the target. **Delta is an optimization, never a requirement
 for an update to succeed.** A missing ACTIVE base is reported through `onDeltaFallback` (a pruned
 version turns a delta into a full download, and an unexplained bandwidth spike is what nobody can
-diagnose later); a missing EMBEDDED base stays silent, because an older build simply has none.
+diagnose later). An ABSENT embedded base stays silent, because an older build simply has none — but
+an embedded base that is PRESENT and unusable (malformed JSON, a failed `validateManifest`, a
+non-404 error status) is reported too, since that is a broken build artifact costing every fresh
+install its first delta (#1132). `tryFetchEmbeddedManifest` reads it through `parseAssetJson` to
+tell the two apart; a rejected fetch counts as absent, because that is how iOS's scheme handler
+answers a file missing from the app bundle. (The SPA-fallback `index.html` case `parseAssetJson`
+exists for cannot arise here today: OTA only runs on native, and both Capacitor asset servers
+route to `index.html` only for a path with no extension.)
 That base manifest is the ONLY request a device ever makes into a version other than its target —
 which is what makes pruning safe (see § Publishing, "Retention").
+
+**The shipped app logs every report.** `engine/app/ota.ts` passes `onDeltaFallback` to both its
+`checkForUpdate` calls (shell and sub-games) and writes it with `console.log`, not `console.warn`:
+a warn becomes a Crashlytics issue, and the commonest cause (a pruned active base) is by design.
+Until #1132 the hook was optional and neither call passed it, so every report above reached nobody
+in a real app — only the client's unit tests ever saw one.
 
 A **failed delta stage falls back the same way** (#556). This matters more than it looks:
 a delta's `copy` entries come off the local disk, so a device-local corruption can fail

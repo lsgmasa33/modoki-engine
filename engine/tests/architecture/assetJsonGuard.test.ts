@@ -27,9 +27,9 @@
  *  train people to ignore the guard.
  *
  *  ⚠️ **The allowlist was keyed per FILE while the rule is per CALL, so its one entry pardoned every
- *  `.json()` that file would ever contain (#1123).** `ota/otaClient.ts` holds FIVE, under a reason
- *  written about the OTA server; a sixth — say a fetch of a local manifest added to the same module —
- *  was green, which is the one case this guard exists for. The detector was already per-line, so the
+ *  `.json()` that file would ever contain (#1123).** `ota/otaClient.ts` held FIVE, under a reason
+ *  written about the OTA server, and one of them WAS a fetch of a local manifest (#1132) — it and any
+ *  sixth were green, which is the one case this guard exists for. The detector was already per-line, so the
  *  only thing discarding the granularity was the `continue` that skipped the whole file.
  *
  *  ⚠️ A COUNT rather than `file::token` here, deliberately: every occurrence is the same token
@@ -53,21 +53,11 @@ const EXEMPT = [
     item: 'ota/otaClient.ts',
     count: 4,
     reason: 'FOUR calls fetch a REMOTE OTA release server, not the Vite dev server — `${baseUrl}/…` '
-      + 'at :404, :426, :508 and :684 (the release lookup, its retry, the bundle manifest and '
-      + 'tryFetchManifest). There is no SPA fallback on a CDN to mistake for an asset; a 200-HTML '
-      + 'there would be a proxy or captive portal, a different problem with a different fix.',
-  },
-  {
-    item: 'ota/otaClient.ts::embedded',
-    count: 1,
-    reason: 'The FIFTH call (:700, tryFetchEmbeddedManifest) is NOT against that server — its own '
-      + "docblock says it is a bare relative URL fetched against the app's own served origin, "
-      + 'never baseUrl. So it CAN meet the SPA fallback, and it is exempt for a different reason: '
-      + 'missing-or-invalid is an expected, silent outcome for any build predating the feature, so '
-      + 'the catch IS the classifier and a 200-HTML reaches the same `return null` as a 404. '
-      + '⚠️ The cost is real and stated rather than hidden: a genuinely CORRUPT embedded manifest is '
-      + 'indistinguishable from an absent one. Routing it through parseAssetJson would separate '
-      + 'them — a behaviour change in shipping OTA code, filed as #1132 rather than made in a close-out.',
+      + '— release.json in fetchRelease and again in checkForUpdate, the target bundle manifest in '
+      + 'checkForUpdate, '
+      + 'and tryFetchManifest. There is no SPA fallback on a CDN to mistake for an asset; a 200-HTML '
+      + 'there would be a proxy or captive portal, a different problem with a different fix. The fifth '
+      + 'fetch in the file, tryFetchEmbeddedManifest, is same-origin and parses through parseAssetJson (#1132).',
   },
 ] as const;
 
@@ -91,20 +81,10 @@ describe('asset JSON is parsed through parseAssetJson, not res.json()', () => {
       const raw = fs.readFileSync(abs, 'utf8');
       const code = stripComments(raw);
       assertScanIsSane(raw, code, rel);
-      // ⚠️ The embedded-manifest call is keyed SEPARATELY because it is exempt for a different
-      // reason — a same-origin fetch, not a CDN one. Without this the two reasons would share one
-      // count and the false half would be invisible, which is what review found. Attributed by the
-      // enclosing function name, found by walking back to the nearest `function ` declaration.
       const lines = code.split('\n');
       lines.forEach((line, i) => {
         for (let n = (line.match(/\.json\s*\(\s*\)/g) ?? []).length; n > 0; n -= 1) {
-          const embedded = lines.slice(0, i + 1).reverse()
-            .find((l) => /^\s*(?:async\s+)?function\s/.test(l))
-            ?.includes('tryFetchEmbeddedManifest');
-          out.push({
-            item: embedded ? `${rel}::embedded` : rel,
-            site: `${rel}:${i + 1}  ${line.trim()}`,
-          });
+          out.push({ item: rel, site: `${rel}:${i + 1}  ${line.trim()}` });
         }
       });
     }
@@ -116,8 +96,9 @@ describe('asset JSON is parsed through parseAssetJson, not res.json()', () => {
       label: 'EXEMPT in assetJsonGuard',
       population: jsonCalls(),
       exempt: EXEMPT,
-      // 5 measured 2026-09-12 on work-ai2, all in otaClient.ts — so the population IS the pardons today. Floored
-      // under it so that REMOVING one reaches the over-blessed arm ("blesses 5, found 4"), which is
+      // 4 measured 2026-09-14 on work-ai3 (5 before #1132 moved the embedded read to parseAssetJson), all in
+      // otaClient.ts — so the population IS the pardons today. Floored under it so that REMOVING one
+      // reaches the over-blessed arm ("blesses 4, found 3"), which is
       // the message that tells the author to deduct, rather than reporting a broken detector. The
       // real detector-broke check is `runtimeSources()`'s own floor of 400 files.
       floor: 3,

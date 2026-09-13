@@ -35,7 +35,7 @@ vi.mock('../../src/runtime/loaders/assetManifest', async (importOriginal) => {
 
 import { navigationManager } from '../../src/runtime/managers/NavigationManager';
 import { registerManager, unregisterManager } from '../../src/runtime/managers/managerRegistry';
-import { dispatchUIAction } from '../../src/runtime/core/actionRegistry';
+import { dispatchUIAction, isActionRefusal } from '../../src/runtime/core/actionRegistry';
 import { setPlayState } from '../../src/runtime/core/playState';
 import { getReadValue, __resetReadSourcesForTesting } from '../../src/runtime/core/readSourceRegistry';
 import { setCurrentWorld } from '../../src/runtime/core/ecs/worldRegistry';
@@ -166,17 +166,36 @@ describe('NavigationManager', () => {
     expect(loadScene).not.toHaveBeenCalled();
   });
 
-  it('engine.loadScene / engine.navigateBack return a thenable (#466: applyBindings\' trackLockPromise tracks it)', () => {
+  it('engine.loadScene / engine.navigateBack return a thenable (#466: applyBindings\' trackLockPromise tracks it)', async () => {
     // `applyBindings` holds the global input lock open until a 'call' handler's RETURNED
     // promise settles. These two built-ins used to `void` the promise instead of returning it,
     // so the lock lifted on the 300ms floor alone and a double-tap could fire loadScene twice
     // (#435/#468). Assert the action registry actually gets a thenable back, not just that the
     // underlying navigation happened.
-    const loadResult = dispatchUIAction('engine.loadScene', { payload: '/scenes/Menu.json' });
+    arriveAt('/scenes/A.json');
+    const loadResult = dispatchUIAction('engine.loadScene', { payload: '/scenes/B.json' });
     expect(loadResult).toBeInstanceOf(Promise);
+    await loadResult;
+    expect(navigationManager.canGoBack).toBe(true);
 
     const backResult = dispatchUIAction('engine.navigateBack');
     expect(backResult).toBeInstanceOf(Promise);
+  });
+
+  /** #1129: the dispatch-action op reads the return value WITHOUT awaiting it, so these refusals
+   *  must be returned synchronously — a refusal inside the async load would reach it as a promise. */
+  it('refuses SYNCHRONOUSLY: an unresolvable scene ref (warned) and Back at the root (silent)', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const load = dispatchUIAction('engine.loadScene', { payload: '   ' });
+    expect(isActionRefusal(load) && load.reason).toMatch(/could not resolve scene/);
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    const back = dispatchUIAction('engine.navigateBack');
+    expect(isActionRefusal(back) && back.reason).toMatch(/history is empty/);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(loadScene).not.toHaveBeenCalled();
+    warn.mockRestore();
   });
 
   it('exposes canGoBack as a UI read source', async () => {

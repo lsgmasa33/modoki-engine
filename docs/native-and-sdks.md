@@ -652,9 +652,9 @@ the bridge staying alive through a sheet is the instrument that proved `onStop` 
 Two things follow, and both matter more than the reload:
 - **`court.purchase` is NOT dead code** — do not "fix" or delete it on the strength of never seeing
   it decline. It arms correctly for a genuine HOME press mid-purchase, which does reach `onStop`.
-  Its predicate reads `storeInFlight` (see `beginStorePurchase` in `games/court/runtime/systems.ts`;
-  cleared in that function's `finally` when the generation still matches, and wholesale by
-  `resetStoreUi`).
+  Its predicate reads the shelf session's `inFlightCount` (`ShelfSession` in
+  `engine/packages/modoki/src/runtime/iap/shelfSession.ts`, Court's `storeInFlight` until #925;
+  cleared in `settle()`'s `finally` when the generation still matches, and wholesale by `reset()`).
 - **PlayerPrefs get no background flush while a purchase sheet is open (#619) — and the severity
   was overstated here first.** `App.tsx`'s background flush was `appStateChange` ->
   `if (!isActive) flush()` with `visibilitychange`/`pagehide` as the WEB fallback only, so no edge

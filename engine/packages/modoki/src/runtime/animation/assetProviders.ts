@@ -25,8 +25,9 @@ export interface AnimationAssetProvider {
   resolveSpriteClip(ref: string, clipName: string): SpriteClip | undefined;
   activeSpriteClip(anim: SpriteAnimSource): SpriteClip | undefined;
   spriteAnimHasClip(anim: SpriteAnimSource, name: string): boolean;
-  getAnimSet(ref: string): { clips: { name: string }[] } | null;
+  getAnimSet(ref: string): { source?: string; clips: { name: string }[] } | null;
   getClipNames(modelRef: string): string[];
+  isRiggedModelLoaded(modelRef: string): boolean;
 }
 
 export const animationAssetProvider = createProviderSlot<AnimationAssetProvider>('animationAssetProvider');

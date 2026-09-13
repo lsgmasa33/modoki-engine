@@ -28,7 +28,7 @@ import { animationAssetProvider } from '../animation/assetProviders';
 import { getAnimationClip } from './animationClipCache';
 import { getSpriteAnim, resolveSpriteClip, activeSpriteClip, spriteAnimHasClip } from './spriteAnimCache';
 import { getAnimSet } from './animSetCache';
-import { getClipNames } from './riggedModelCache';
+import { getClipNames, isRiggedModelLoaded } from './riggedModelCache';
 
 import { audioAssetProvider } from '../audio/audioAssetProvider';
 import { getCachedAudioBuffer, resolveAudioUrl, retryFailedAudioDecodes } from './audioBufferCache';
@@ -60,7 +60,7 @@ assetPlumbing.provide({ assetUrl, fetchInit: ASSET_FETCH_INIT, fetchShaderManife
 
 animationAssetProvider.provide({
   getAnimationClip, getSpriteAnim, resolveSpriteClip, activeSpriteClip, spriteAnimHasClip,
-  getAnimSet, getClipNames,
+  getAnimSet, getClipNames, isRiggedModelLoaded,
 });
 
 audioAssetProvider.provide({ getCachedAudioBuffer, resolveAudioUrl, retryFailedAudioDecodes, getAudioLoadType });

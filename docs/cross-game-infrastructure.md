@@ -128,6 +128,7 @@ missing tarball on open.
 | Capability | Where | Note |
 |---|---|---|
 | IAP mechanism | `engine/packages/modoki/src/runtime/iap/**` | Product-agnostic, exposes `configureIap({ onGrant })`. `games/iap-test` proves it with zero game-side state |
+| **Store shelf** (the store SCREEN's decisions and state) | `engine/packages/modoki/src/runtime/iap/shelf.ts` + `shelfSession.ts` | Promoted in #925 (2026-09-13) for wordweave's store screen — the second game with one, and #659's reopen condition. Consumers: Court and wordweave (both landed under #925). `shelf.ts` is pure: a shelf is a list of `ShelfOffer`s (key, product id, kind, coins, `noAds: 'forever' \| 'pass'`, `requires`), and `buildShelfCatalog`/`shelfEffectOf`/`visibleShelfOffers`/`shelfView`/`quickBuyView`/`noAdsRemaining` each return a DECISION. `ShelfSession` holds the stateful guards Court paid for on device: the price-fetch tri-state and idle backstop (#463), the stalled-not-released watchdog (#580), the per-product in-flight set and its reset generation (the double-charge bar), and the refusal latch (#952). ⚠️ **Carries no copy** — rows, notices and the quick-buy label are worded by the game (`rowWords`, `notice`), the #675 line. ⚠️ **Does not own entitlements**: who records a forever unlock is the game's (Court: ours, a consumable carried by cloud save; wordweave: the store's, a non-consumable), so `ShelfInputs.owned` is passed in. Court kept every historical export as a thin adapter (`store.ts`'s `courtShelfOffers`) and its store tests ran unchanged against it |
 | Firebase analytics + crashlytics | official `@capacitor-firebase/*` | Crashlytics needs **no** game-side call sites — the engine reads `appServices().crashlytics` in `globalErrors.ts`, `gameStore.ts` and `ErrorBoundary.tsx` |
 | AppsFlyer attribution | `engine/packages/capacitor-appsflyer` | iOS Swift + Android Java + TS; `devKey`/`appleAppId` are call parameters |
 | AppLovin MAX plugin | `engine/packages/capacitor-applovin-max` | Promoted out of Court in #931 so wordweave can become the second consumer; that wiring is #932 and has NOT landed. **The base plugin only**: `sdkKey`/`adUnitId` are call parameters, and the wrapper (`ads.ts`) and pacing policy (`adPolicy.ts`) stay per game. Court vendors it but keeps it PARKED out of `includePlugins` (#342). `games/3d-test` still carries a pre-promotion fork ([native-and-sdks.md](./native-and-sdks.md) § "Standalone Capacitor Plugin Pattern (iOS SPM)") |
@@ -237,20 +238,17 @@ reopen it.
     scale (`runtime/actions/audioControls.ts`) rather than with either game. That is a far better
     ratio than the module this row was about — file it as its own ticket if a third consumer
     appears, or when someone gets the direction wrong once.
-- **A store SCREEN — deferred on assessment (#659, closed 2026-09-04).** `games/court/runtime/storeUi.ts`
-  is 581 lines / 228 code, and splits ~18% catalog-agnostic / ~42% generic mechanism wearing a
-  Court-shaped type / ~40% copy and catalog. Its two DIRECT imports are siblings — no
-  `@modoki/engine`, no `@court/*`, and it never names an IAP type itself — but the generic ~42%
-  cannot move until `StoreSlot`/`StoreConfig` become a catalog descriptor, and those live in
-  `store.ts`. **The two files are ORDERED, not neighbours.** The genuinely reusable asset is four
-  rules totalling ~40 lines: *no price, no row*; *no verdict while the question is still open*;
-  *a cancel is not an error*; *hidden, not greyed*.
-  **Reopens when a second game acquires a store SCREEN** — verified not met: `storeRows`/
-  `StoreRowView`/`shortfallCard` appear in no game outside `games/court/`.
-  ⚠️ A second game already ships the IAP MECHANISM with no such screen
-  (`games/wordweave/runtime/store.ts`), and the two `store.ts` export surfaces are **disjoint** —
-  Court's is catalog/entitlements/passes, wordweave's is coin-credit/idempotency. They share a
-  posture, not an API, so this is not duplication awaiting extraction.
+- **A store SCREEN — deferred on assessment (#659, closed 2026-09-04), REOPENED and landed by #925
+  (2026-09-13).** The reopen condition ("a second game acquires a store SCREEN") is wordweave's
+  store, built on the shelf under #925, and the move followed the ordering #659 found: the catalog DESCRIPTOR first
+  (`StoreSlot`/`StoreConfig` → `ShelfOffer[]`), then the view-model, then the stateful half — now the
+  table row "Store shelf" above. What stayed per game, and why: the WORDS (every row title, notice
+  and card), the ENTITLEMENT STORE (Court's consumable-forever vs wordweave's store-owned unlock),
+  the grant path (`courtOnGrantImpl`'s durability gate is Court's document shape), and the cards
+  (Court's post-purchase card offers sign-in; wordweave has no account).
+  ⚠️ #659's other finding still holds for the GRANT side: the two games' `store.ts` export surfaces
+  remain disjoint — Court's wallet is a cloud-sync group, wordweave's a coin-credit/idempotency
+  document. The shelf is shared; what a purchase WRITES is not.
 
 ## Blocked: the default-art layer
 
@@ -294,7 +292,8 @@ What *does* work with zero authoring: flat colour boxes with `borderRadius` on `
   `storeUi.ts` that is genuine generic mechanism cannot move until `StoreSlot`/`StoreConfig` are
   parameterised into a catalog descriptor — and those live in `store.ts`, the most coupled file in the
   audit. The two were surveyed as neighbours; they are actually **ordered**. Any attempt that starts
-  with the UI file because it reads cleaner stalls on the config file anyway.
+  with the UI file because it reads cleaner stalls on the config file anyway. (#925 did it in that
+  order and it held: the descriptor landed first, and `storeUi.ts` then shrank to Court's words.)
 - **The reusable asset can be a set of RULES, not code.** The most valuable thing found in
   `storeUi.ts` was four design rules totalling ~40 lines — *no price, no row*; *no verdict while the
   question is still open*; *a cancel is not an error*; *hidden, not greyed*. Worth stating explicitly
@@ -322,7 +321,7 @@ that produced them reversed itself on three of the four rows it originally cover
 actually read the code:
 
 **All four are now settled** (2026-09-04). **#660** (the trusted clock) was PROMOTED — see the table
-in § "What is shared today". **#659** (the store screen) and **#661** (settings + ad policy) were
+in § "What is shared today". **#659** (the store screen — since landed by #925) and **#661** (settings + ad policy) were
 assessed and DEFERRED — see § "What is deliberately NOT shared", which carries each one's reopening
 condition.
 

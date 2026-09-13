@@ -222,3 +222,42 @@ describe('#509 pending-restart must hold a mandatory gate the same as staged', (
   // neither can see a bug that lives in the composition (#509 was exactly one). Add a mapping case
   // here; add a race case there.
 });
+
+describe('#1132 delta-fallback reports reach the log (onDeltaFallback was never wired)', () => {
+  const info = { version: 'v7', reason: 'embedded base manifest is present but unusable: bad' };
+
+  it('the shell check passes onDeltaFallback, and a report is LOGGED, not warned', async () => {
+    const ota = await freshOta();
+    h.addListener.mockResolvedValue({ remove: vi.fn(async () => {}) });
+    h.checkForUpdate.mockImplementationOnce(async (opts: { onDeltaFallback?: (i: typeof info) => void }) => {
+      opts.onDeltaFallback?.(info);
+      return { outcome: 'staged', mandatory: false, version: 'v7' };
+    });
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await expect(ota.checkAppOtaUpdate()).resolves.toBe(true);
+
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/OTA "shell" v7: delta fell back to a whole download — embedded base manifest is present but unusable: bad/));
+    expect(warn).not.toHaveBeenCalled();
+    log.mockRestore(); warn.mockRestore();
+  });
+
+  it('each sub-game check passes onDeltaFallback naming ITS bundle', async () => {
+    const ota = await freshOta();
+    h.fetchRelease.mockResolvedValueOnce({ ok: true, release: { bundles: { shell: 'v1', arcade: 'v3' } } });
+    h.checkForUpdate.mockImplementationOnce(async (opts: { onDeltaFallback?: (i: typeof info) => void }) => {
+      opts.onDeltaFallback?.(info);
+      return { outcome: 'up-to-date' };
+    });
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await ota.checkAppSubgameUpdates();
+
+    expect(h.checkForUpdate).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/OTA "arcade" v7: delta fell back to a whole download/));
+    expect(warn).not.toHaveBeenCalled();
+    log.mockRestore(); warn.mockRestore();
+  });
+});

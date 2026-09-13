@@ -572,6 +572,25 @@ number straight into a field with zero game code.
 `runtime/core/actionRegistry.ts`, where games register handlers via
 `registerUIAction(name, handler)` / `unregisterUIAction(name)`. An unknown action
 **throws in dev** and warns in production, so typo'd action names surface immediately.
+
+**A handler refuses by RETURNING `refuseAction(reason, {detail?, log?})`, never `console.warn` +
+`return`** (#1129). The `dispatch-action` agent op (`modoki_dispatch_action`, `modoki_play_clip`,
+`device_dispatch_action`) reads the handler's return value and answers `ok:false` with the `reason`
+and any `detail` fields (`known` clip names, `slavedTo`); a warn is invisible to it, so a
+warn-and-return refusal was reported to an agent as `dispatched:true`. That gap is how the op came to
+carry hand-written copies of two actions' preconditions, one of which drifted from its handler — it
+refused a typo'd skeletal clip that every authored button wrote anyway. Now the handler is the only
+place a precondition lives, and the op has none. `log` picks the console channel: `'warn'` (default),
+`'error'`, or `false` for a refusal that is routine for a PLAYER — the audio/video/haptics/quality
+built-ins use `false`, because they were silent before and a shipped `console.warn` becomes a
+Crashlytics issue. A refusal is not thenable, so it never holds the input lock below; test for one
+with `isActionRefusal`. ⚠️ **An async handler must refuse BEFORE it creates its promise** — the op reads
+the return value without awaiting it, so a refusal inside the promise reaches it as a pending promise
+and is reported as dispatched (`NavigationManager`'s `engine.loadScene`/`engine.navigateBack` decide
+theirs synchronously for that reason). `engine.playClip` refuses an unknown skeletal clip only against a COMPLETE roster
+(`skeletalClipRoster`: the rig's own GLB clips plus every clip of each animset's `source` GLB, with all of
+them loaded); while any source is still loading the name is written, because the mixer merges it on
+arrival.
 (Bindings are inert unless the game is running — `applyBindings` early-returns when the
 sim is stopped, so editor Stopped/Paused states never mutate the scene.)
 

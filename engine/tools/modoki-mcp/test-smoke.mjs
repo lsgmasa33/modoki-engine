@@ -1317,14 +1317,23 @@ if (canUC3) {
     await withCleanup(async () => {
       await client.callTool({ name: 'modoki_play_control', arguments: { action: 'play' } });
 
-      // `haptics.toggle` returns early (no-op) when the open scene authors no `HapticSettings`
-      // entity, which is the common case — so dispatching it twice usually changes nothing on
-      // disk or in the world. `dispatched:true` here proves the dispatch ROUTE and the Play gate
-      // (a stopped sim refuses identically to a bogus name — see below), not that state changed.
+      // `haptics.toggle` REFUSES when the open scene authors no `HapticSettings` entity, which is the
+      // common case — and since #1129 the op reports a handler's refusal as a failed call naming it,
+      // instead of `dispatched:true`. Either answer proves the dispatch ROUTE and the Play gate, because
+      // both come from the HANDLER: a stopped sim refuses before any handler runs, with 'not playing'
+      // (see above), and could not produce either. So accept `dispatched:true` (a scene that authors
+      // HapticSettings — dispatched twice so it ends where it started) or the handler's own refusal.
       // The bogus-name arm below carries the real weight of this case.
       for (let i = 0; i < 2; i++) {
-        const r = JSON.parse(text(await client.callTool({ name: 'modoki_dispatch_action', arguments: { name: 'haptics.toggle' } })));
-        if (r.dispatched !== true) throw new Error(`dispatch_action did not dispatch a real action while PLAYING: ${JSON.stringify(r)}`);
+        const raw = await client.callTool({ name: 'modoki_dispatch_action', arguments: { name: 'haptics.toggle' } });
+        if (raw.isError) {
+          const why = JSON.parse(text(raw)).error?.why ?? '';
+          if (!/\[haptics\.toggle\] no HapticSettings entity/.test(why)) {
+            throw new Error(`dispatch_action refused a real action while PLAYING for a reason other than the handler's own: ${text(raw)}`);
+          }
+        } else if (JSON.parse(text(raw)).dispatched !== true) {
+          throw new Error(`dispatch_action did not dispatch a real action while PLAYING: ${text(raw)}`);
+        }
       }
 
       // The half that actually catches a dead route: an unknown name must be refused BY NAME, with a

@@ -23,7 +23,7 @@
 import { create } from 'zustand';
 import { useShallow } from 'zustand/react/shallow';
 import type { Entity, ExtractSchema, TraitValue } from 'koota';
-import { registerUIAction } from '../core/actionRegistry';
+import { registerUIAction, refuseAction, type UIActionRefusal } from '../core/actionRegistry';
 import { addStoreHook } from '../ui/storeHooks';
 import { markUIDirty } from '../ui/uiTreeStore';
 import { AudioSource } from '../traits/AudioSource';
@@ -78,17 +78,28 @@ const useAudioMixSelector = () => useAudioMixStore(
  *  full trait object — spread the current data, mirror `engine.toggleAnimator`). */
 type AudioSourceData = TraitValue<ExtractSchema<typeof AudioSource>>;
 
-function patchSource(target: Entity | undefined, patch: Partial<AudioSourceData>): void {
-  const a = target?.get(AudioSource);
-  if (!a || !target) return;
+/** The refusal for an `audio.*` action whose target is missing or carries no AudioSource, else
+ *  undefined. Unlogged (`log: false`): these were silent no-ops for a player before #1129, and stay
+ *  so — the dispatch-action agent op is the caller that reads the reason. */
+function sourceRefusal(action: string, target: Entity | undefined): UIActionRefusal | undefined {
+  if (!target) return refuseAction(`[${action}] no target entity — point the binding at an AudioSource entity`, { log: false });
+  if (!target.has(AudioSource)) return refuseAction(`[${action}] target has no AudioSource trait`, { log: false });
+  return undefined;
+}
+
+function patchSource(action: string, target: Entity | undefined, patch: Partial<AudioSourceData>): UIActionRefusal | undefined {
+  const refused = sourceRefusal(action, target);
+  if (refused) return refused;
+  const a = target!.get(AudioSource)!;
   // Strip undefined-valued keys: koota's setter tests `'key' in value`, not whether it's
   // defined, so an explicit undefined here would overwrite the real value.
   const defined = Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined));
-  target.set(AudioSource, { ...a, ...defined });
+  target!.set(AudioSource, { ...a, ...defined });
   // The write bypasses the trait-mutation dirty path, so nudge the UI projection
   // to re-resolve highlight bindings watching AudioSource (e.g. the crossfade
   // toggle's on/off color) + the Inspector's live `playing` readout this frame.
   markUIDirty();
+  return undefined;
 }
 
 const numArg = (raw: unknown): number | null => {
@@ -120,15 +131,15 @@ export function registerAudioControls(): void {
   // is one queue push per click and no more.
   setUIClickCue(() => cueSound('ui.click'));
 
-  registerUIAction('audio.play', ({ target }) => patchSource(target, { playing: true }));
-  registerUIAction('audio.pause', ({ target }) => patchSource(target, { playing: false }));
+  registerUIAction('audio.play', ({ target }) => patchSource('audio.play', target, { playing: true }));
+  registerUIAction('audio.pause', ({ target }) => patchSource('audio.pause', target, { playing: false }));
   registerUIAction('audio.toggle', ({ target }) => {
     const a = target?.get(AudioSource);
-    if (a) patchSource(target, { playing: !a.playing });
+    return patchSource('audio.toggle', target, { playing: !a?.playing });
   });
   registerUIAction('audio.stop', ({ target, world }) => {
     if (target) stopEntityAudio(world, target);
-    patchSource(target, { playing: false });
+    return patchSource('audio.stop', target, { playing: false });
   });
   registerUIAction('audio.setClip', {
     params: {
@@ -137,16 +148,20 @@ export function registerAudioControls(): void {
     },
     handler: ({ target, params, payload }) => {
       const clip = resolveClip(target, params, payload);
-      if (clip) patchSource(target, { clip, playing: true });
+      if (!clip) {
+        return sourceRefusal('audio.setClip', target)
+          ?? refuseAction('[audio.setClip] no clip — set a `key` that exists in the target AudioSource.clips bank, or a literal `clip` GUID', { log: false });
+      }
+      return patchSource('audio.setClip', target, { clip, playing: true });
     },
   });
   registerUIAction('audio.toggleCrossfade', {
     params: { seconds: { type: 'number', min: 0, step: 0.1, tooltip: 'Crossfade duration when ON (default 1.5s).' } },
     handler: ({ target, params }) => {
       const a = target?.get(AudioSource);
-      if (!a) return;
+      if (!a) return sourceRefusal('audio.toggleCrossfade', target);
       const sec = numArg(params?.seconds) ?? 1.5;
-      patchSource(target, { crossfadeSec: a.crossfadeSec > 0 ? 0 : sec });
+      return patchSource('audio.toggleCrossfade', target, { crossfadeSec: a.crossfadeSec > 0 ? 0 : sec });
     },
   });
   registerUIAction('audio.setBusVolume', {
@@ -159,14 +174,17 @@ export function registerAudioControls(): void {
       // first fixed this read locally, with a helper this file no longer needs).
       const bus = String(params?.bus ?? 'master');
       const v = numArg(params?.value ?? payload);
-      if (v == null) return;
+      if (v == null) return refuseAction('[audio.setBusVolume] no numeric `value` (set it, or bind $value to a slider)', { log: false });
       const clamped = Math.max(0, Math.min(100, v));
       // ⚠️ The SERVICE decides, and the store follows (#1074). This used to write the store first,
       // so a bus `setBusVolume` refused still left fields in the store — and `''` threw inside the
       // store's key builder before the service was ever asked. The cast is safe only because the
       // refusal comes next; `bus` is a document string here, not the enum the picker suggests.
-      if (!setBusVolume(bus as BusName, clamped / 100)) return;
+      if (!setBusVolume(bus as BusName, clamped / 100)) {
+        return refuseAction(`[audio.setBusVolume] unknown bus "${bus}" (expected ${BUS_NAMES.join('|')})`, { log: false });
+      }
       useAudioMixStore.getState().setBusPct(bus as BusName, clamped);
+      return undefined;
     },
   });
   registerUIAction('audio.playOneShot', {
@@ -177,13 +195,16 @@ export function registerAudioControls(): void {
     },
     handler: ({ target, params, payload }) => {
       const clip = resolveClip(target, params, payload);
-      if (!clip) return;
+      if (!clip) {
+        return refuseAction('[audio.playOneShot] no clip — set a `key` that exists in the target AudioSource.clips bank, or a literal `clip` GUID', { log: false });
+      }
       // A bare `??` is correct here because `bus: ''` never arrives — the registry drops a declared
       // param's empty string before dispatch (#1075). Before that, `''` skipped the target's bus and
       // reached `resolveBus('')`, which warned and played it on sfx (#1074). An unknown NON-empty bus
       // still goes to `resolveBus`, which falls back with a warning — deliberately, see its comment.
       const bus = String(params?.bus ?? target?.get(AudioSource)?.bus ?? 'sfx') as BusName;
       cueClip(clip, { bus });
+      return undefined;
     },
   });
 }

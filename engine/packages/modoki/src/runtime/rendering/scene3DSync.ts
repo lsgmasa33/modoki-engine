@@ -2181,6 +2181,8 @@ const DEFAULT_LIBRARY_DEPS: LibraryMergeDeps = { getAnimSet, getRiggedModel, laz
  *  `entry.libraryMerged` so its clips bind exactly once. Records each library
  *  clip's param source in `entry.clipParamSource` so `driveAnimator` plays it
  *  with the LIBRARY animset's per-clip params. Exported for unit tests. */
+// ⚠️ KEEP IN SYNC with `skeletalClipRoster` (animation/switchableClips.ts), which re-derives the clip
+// names this merge makes playable so `engine.playClip` can refuse an unknown one (#1129).
 export function mergeAnimationLibrary(
   entry: SkinnedEntry,
   lib: AnimationLibraryValue | undefined,

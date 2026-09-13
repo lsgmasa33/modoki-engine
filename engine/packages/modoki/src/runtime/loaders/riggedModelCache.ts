@@ -391,6 +391,12 @@ export function getClipNames(modelRef: string): string[] {
   return getRiggedModel(modelRef)?.animations.map((c) => c.name) ?? [];
 }
 
+/** Has this rigged model LOADED? `getClipNames` answers `[]` both before the load and for a GLB with
+ *  no clips; a caller that must tell those apart (a refusal of an unknown clip name, #1129) asks this. */
+export function isRiggedModelLoaded(modelRef: string): boolean {
+  return getRiggedModel(modelRef) !== undefined;
+}
+
 /** One mesh node of a rigged model + the distinct material slots it uses. */
 export interface RigMeshNode {
   /** GLB mesh-node name (the `SkinnedMeshRenderer.node` value). */

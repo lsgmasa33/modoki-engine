@@ -39,7 +39,7 @@
  * the deterministic headless pipeline.
  */
 
-import { registerUIAction } from '../core/actionRegistry';
+import { registerUIAction, refuseAction } from '../core/actionRegistry';
 import { purchase, restorePurchases } from '../iap/purchaseService';
 
 export function registerIapControls(): void {
@@ -59,11 +59,11 @@ export function registerIapControls(): void {
     // Authored scene data — validated, never trusted. Refusing loudly beats charging for whatever
     // `String(undefined)` resolves to.
     if (!product) {
-      console.error('[iap] `iap.buy` needs a product id — either the bare string payload '
-        + '"<store product id>" or { product: "<store product id>" }. Ignoring.');
-      return;
+      return refuseAction('[iap] `iap.buy` needs a product id — either the bare string payload '
+        + '"<store product id>" or { product: "<store product id>" }. Ignoring.', { log: 'error' });
     }
     void purchase(product);
+    return undefined;
   });
 
   registerUIAction('iap.restore', () => {

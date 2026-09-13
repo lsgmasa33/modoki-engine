@@ -15,36 +15,46 @@
  *   - `video.setClip`— swap the clip by GUID. */
 
 import type { Entity } from 'koota';
-import { registerUIAction } from '../core/actionRegistry';
+import { registerUIAction, refuseAction, type UIActionRefusal } from '../core/actionRegistry';
 import { VideoPlayer } from '../traits/VideoPlayer';
 import { EntityAttributes } from '../core/traits/EntityAttributes';
 import { seekEntityVideo, claimVideoEndEmit } from '../video/videoSystem';
 import { emitVideoSkip } from '../video/VideoEvents';
 
-function patch(target: Entity | undefined, fields: Partial<{ playing: boolean; clip: string }>): void {
-  if (!target?.has(VideoPlayer)) return;
+/** The refusal for a `video.*` action whose target is missing or carries no VideoPlayer, else
+ *  undefined. Unlogged, like the audio twin: silent for a player before #1129, read by the agent op. */
+function playerRefusal(action: string, target: Entity | undefined): UIActionRefusal | undefined {
+  if (!target) return refuseAction(`[${action}] no target entity — point the binding at a VideoPlayer entity`, { log: false });
+  if (!target.has(VideoPlayer)) return refuseAction(`[${action}] target has no VideoPlayer trait`, { log: false });
+  return undefined;
+}
+
+function patch(action: string, target: Entity | undefined, fields: Partial<{ playing: boolean; clip: string }>): UIActionRefusal | undefined {
+  const refused = playerRefusal(action, target);
+  if (refused) return refused;
   // Strip undefined-valued keys: koota's setter tests `'key' in value`, not whether it's
   // defined, so an explicit undefined here would overwrite the real value.
   const defined = Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== undefined));
-  target.set(VideoPlayer, defined);
+  target!.set(VideoPlayer, defined);
+  return undefined;
 }
 
 export function registerVideoControls(): void {
-  registerUIAction('video.play', ({ target }) => patch(target, { playing: true }));
-  registerUIAction('video.pause', ({ target }) => patch(target, { playing: false }));
+  registerUIAction('video.play', ({ target }) => patch('video.play', target, { playing: true }));
+  registerUIAction('video.pause', ({ target }) => patch('video.pause', target, { playing: false }));
   registerUIAction('video.toggle', ({ target }) => {
     const v = target?.get(VideoPlayer);
-    if (v) patch(target, { playing: !v.playing });
+    return patch('video.toggle', target, { playing: !v?.playing });
   });
 
   registerUIAction('video.stop', ({ target }) => {
-    if (!target) return;
+    if (!target) return playerRefusal('video.stop', target);
     seekEntityVideo(target.id(), 0);
-    patch(target, { playing: false });
+    return patch('video.stop', target, { playing: false });
   });
 
   registerUIAction('video.skip', ({ target }) => {
-    if (!target) return;
+    if (!target) return playerRefusal('video.skip', target);
     const v = target.get(VideoPlayer);
     // Announce BEFORE stopping. `emitVideoSkip` also emits `@video.end`, so a game
     // that only listens for "the cutscene is over" fires exactly once whether the
@@ -58,7 +68,10 @@ export function registerVideoControls(): void {
     const announceEnd = claimVideoEndEmit(target.id());
     emitVideoSkip({ entity: target.get(EntityAttributes)?.guid, clip: v?.clip ?? '' }, announceEnd);
     seekEntityVideo(target.id(), 0);
-    patch(target, { playing: false });
+    patch('video.skip', target, { playing: false });
+    // NOT the patch's refusal: the skip was already ANNOUNCED above, so a target with no VideoPlayer
+    // has had an effect a listener can observe, and reporting "refused" would be the false answer.
+    return undefined;
   });
 
   registerUIAction('video.seek', {
@@ -66,10 +79,12 @@ export function registerVideoControls(): void {
       seconds: { type: 'number', min: 0, step: 0.1, tooltip: 'Absolute position in seconds.' },
     },
     handler: ({ target, params }) => {
-      if (!target) return;
+      const refused = playerRefusal('video.seek', target);   // no target, or no VideoPlayer: seek would do nothing
+      if (refused) return refused;
       const seconds = Number(params?.seconds ?? 0);
-      if (!Number.isFinite(seconds)) return;
-      seekEntityVideo(target.id(), seconds);
+      if (!Number.isFinite(seconds)) return refuseAction(`[video.seek] seconds must be a finite number, got ${String(params?.seconds)}`, { log: false });
+      seekEntityVideo(target!.id(), seconds);
+      return undefined;
     },
   });
 
@@ -82,8 +97,8 @@ export function registerVideoControls(): void {
     },
     handler: ({ target, params }) => {
       const clip = typeof params?.clip === 'string' ? params.clip : '';
-      if (!clip) return;
-      patch(target, { clip, playing: true });
+      if (!clip) return refuseAction('[video.setClip] no `clip` — set the video asset GUID to switch to', { log: false });
+      return patch('video.setClip', target, { clip, playing: true });
     },
   });
 }

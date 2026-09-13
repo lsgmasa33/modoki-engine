@@ -138,6 +138,12 @@ export {
   type ConfigureIapOptions, type StoreBackend, type StoreCancelled, type IapLedgerStore, type PurchaseVerifier,
   type ProductKind, type IapProduct, type IapProductInfo, type StoreTransaction,
   type PurchaseOutcome, type PurchaseResult, type IapGrant,
+  shelfProductId, sellableShelfOffers, buildShelfCatalog, shelfOfferForProduct, shelfEffectOf,
+  visibleShelfOffers, extendPassExpiry, isPassActive, noAdsActive, noAdsRemaining, shelfView, quickBuyView,
+  type ShelfOffer, type ShelfEffect, type NoAdsState, type NoAdsRemaining, type ShelfState, type ShelfRefusal,
+  type ShelfRowWords, type ShelfRowView, type ShelfNoticeWords, type ShelfInputs, type ShelfView, type QuickBuyView,
+  ShelfSession, SHELF_WATCHDOG_MS,
+  type ShelfSessionOptions, type ShelfTimers, type ShelfBegin, type ShelfSettle,
 } from './iap';
 export { registerIapControls } from './actions/iapControls';
 export { hapticsSystem } from './haptics/hapticsSystem';
@@ -500,7 +506,8 @@ export { getSafeAreaInsets, resetSafeAreaInsets, type SafeAreaInsets } from './u
 export {
   wireDomGestureTracking, unwireDomGestureTracking, isDomGestureActive, resetDomGestureTracking,
 } from './ui/domGestureTracking';
-export { registerUIAction, unregisterUIAction, dispatchUIAction, dispatchGameAction, hasUIAction, getUIActionNames, getUIActionParams } from './core/actionRegistry';
+export { registerUIAction, unregisterUIAction, dispatchUIAction, dispatchGameAction, hasUIAction, getUIActionNames, getUIActionParams, refuseAction, isActionRefusal } from './core/actionRegistry';
+export type { UIActionRefusal } from './core/actionRegistry';
 export type { UIActionContext, UIActionHandler, UIActionDef, UIActionPayload, DispatchOptions } from './core/actionRegistry';
 export { registerEngineActions } from './actions/engineActions';
 export { applyBindings, VALUE_TOKEN } from './ui/bindings';

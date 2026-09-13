@@ -208,7 +208,14 @@ function mockNative(overrides: Partial<OtaNativePlugin> = {}): OtaNativePlugin {
 }
 
 function jsonResponse(body: unknown, ok = true): Response {
-  return { ok, json: async () => body } as unknown as Response;
+  // `status`/`text` too: the embedded-manifest read goes through `parseAssetJson`, which reads the
+  // body as text and tells a 404 (absent) from any other non-ok status (#1132).
+  return rawResponse(JSON.stringify(body), ok ? 200 : 404);
+}
+
+function rawResponse(text: string, status: number): Response {
+  const body = () => { try { return JSON.parse(text) as unknown; } catch { throw new SyntaxError('Unexpected token'); } };
+  return { ok: status >= 200 && status < 300, status, statusText: '', json: async () => body(), text: async () => text } as unknown as Response;
 }
 
 describe('fetchRelease', () => {
@@ -708,6 +715,51 @@ describe('checkForUpdate', () => {
       zipUrl: 'https://cdn.example.com/game/bundles/shell/v1/bundle.zip',
       expectedZipHash: 'f'.repeat(64), expectedZipSize: 200,
       files: [{ path: 'index.html', hash: 'a'.repeat(64) }],
+    });
+  });
+
+  /** #1132 — the embedded base used to collapse every failure into one silent `null`, so a build that
+   *  shipped a BROKEN embedded manifest looked exactly like one that predates the feature. Absent stays
+   *  silent; present-but-unusable is reported. Either way the update still stages as a whole zip. */
+  describe('embedded base manifest: absent is silent, present-but-unusable is reported (#1132)', () => {
+    const cases: Array<{ name: string; embedded: () => Promise<Response>; reported: RegExp | null }> = [
+      { name: '404', embedded: async () => rawResponse('', 404), reported: null },
+      { name: 'the fetch rejects (iOS: file missing from the app bundle)', embedded: async () => { throw new TypeError('Load failed'); }, reported: null },
+      { name: 'a 200 SPA-fallback index.html', embedded: async () => rawResponse('<!doctype html><html></html>', 200), reported: null },
+      { name: 'malformed JSON', embedded: async () => rawResponse('{"schema": 1, "files": ', 200), reported: /embedded base manifest is present but unusable: .*not valid JSON/ },
+      { name: 'valid JSON that fails validateManifest', embedded: async () => rawResponse(JSON.stringify({ schema: 99, name: 'shell', version: 'embedded', engineApi: 1, files: {} }), 200), reported: /present but unusable: manifest\.schema must be 1/ },
+      { name: 'a 500 (served, but not servable)', embedded: async () => rawResponse('', 500), reported: /present but unusable: 500/ },
+    ];
+
+    it.each(cases)('$name', async ({ embedded, reported }) => {
+      const { privateKey, publicKey } = makeKeypair();
+      const release = signRelease({ schema: 1, bundles: { shell: 'v1' }, mandatory: false, minEngineApi: 1 }, privateKey);
+      const targetManifest: OtaManifest = {
+        schema: 1, name: 'shell', version: 'v1', engineApi: 1,
+        files: { 'index.html': { hash: 'a'.repeat(64), size: 1 } },
+        bundleZip: { hash: 'f'.repeat(64), size: 200 },
+      };
+      const fetchImpl = vi.fn()
+        .mockResolvedValueOnce(jsonResponse(release))
+        .mockResolvedValueOnce(jsonResponse(targetManifest))
+        .mockImplementationOnce(embedded);
+      const native = mockNative(); // fresh install: no active version, so the base is the embedded one
+      const onDeltaFallback = vi.fn();
+
+      const result = await checkForUpdate({
+        baseUrl: 'https://cdn.example.com/game', publicKey, bundleName: 'shell', runningEngineApi: 1, fetchImpl, native, onDeltaFallback,
+      });
+
+      expect(fetchImpl).toHaveBeenNthCalledWith(3, 'ota-embedded-manifest.json');
+      expect(result).toEqual({ outcome: 'staged', version: 'v1', mandatory: false });
+      expect(native.stageUpdateDelta).not.toHaveBeenCalled();
+      expect(native.stageUpdate).toHaveBeenCalledTimes(1);
+      if (reported) {
+        expect(onDeltaFallback).toHaveBeenCalledTimes(1);
+        expect(onDeltaFallback).toHaveBeenCalledWith({ version: 'v1', reason: expect.stringMatching(reported) });
+      } else {
+        expect(onDeltaFallback).not.toHaveBeenCalled();
+      }
     });
   });
 

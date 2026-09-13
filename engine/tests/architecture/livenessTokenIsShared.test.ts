@@ -118,7 +118,7 @@ const KNOWN_OUTSIDE_SCAN_DIRS: readonly string[] = [
   // REAL — the textbook #573 shape. `let payoutEpoch = 0` … `const epoch = payoutEpoch` …
   // `if (epoch !== payoutEpoch) return` around an await (`systems.ts:4754-4767`), and the file's
   // own comment already calls it a banner. Three separate counters in one file.
-  'games/court/runtime/systems.ts :: payoutEpoch, bonusSpinEpoch, storeInFlightGen',
+  'games/court/runtime/systems.ts :: payoutEpoch, bonusSpinEpoch',
   // REAL — `private generation = 0` guarding `initLLM()`/`newGame()`; its own docblock (`:15`,
   // `:47`, `:91`) describes the abandoned-generation branch it exists for.
   'games/chess/runtime/ChessManager.ts :: generation',

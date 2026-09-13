@@ -27,21 +27,31 @@ export interface Point { x: number; y: number }
 export interface Sheet { w: number; h: number }
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(v, hi));
+/** `clamp`, widened to include where the value STARTED. Stored data can already sit outside the
+ *  bounds: a slice rect after its texture is re-imported smaller (or a W typed past the sheet,
+ *  since the rect fields do not clamp), or Nine-Slice insets loaded unclamped from a meta that no
+ *  longer fits the image. A plain clamp snapped such a value inside on the first move, so a 0.1 px
+ *  jitter on a handle rewrote `{x:1100, w:8}` on a 1008-wide sheet as `{x:1008, w:100}`. Widened, a
+ *  drag moves it inward by the pointer's travel, and never further out than where it started. */
+const clampFrom = (v: number, start: number, lo: number, hi: number) => clamp(v, Math.min(lo, start), Math.max(hi, start));
 
 /** One axis of a resize, as whole-px `[start, length]`: the dragged edge moves by `delta` and is
- *  clamped to `[0, size]`; the other edge stays put. Dragging past the fixed edge flips the span
+ *  clamped to the sheet (`clampFrom`, so an edge already past it is not pulled in); the other edge
+ *  stays put. Dragging past the fixed edge flips the span
  *  rather than going negative. The two EDGES are rounded, not the start and the length: rounding
  *  those separately sends both up at an exact k+0.5, so a `w` drag to 240.5 on a slice ending at
  *  504 gave `{x:241, w:264}`, moving the fixed edge to 505 (close-out review, #1176). A span that
- *  collapses keeps 1 px on the DRAGGED side of the fixed edge, so the fixed edge only moves when
- *  that 1 px would leave the sheet (a `w` drag onto 504 gives `{x:503, w:1}`, not `{x:504, w:1}`). */
+ *  collapses keeps 1 px on the DRAGGED side of the fixed edge, and the fixed edge never moves
+ *  (a `w` drag onto 504 gives `{x:503, w:1}`, not `{x:504, w:1}`). The 1 px can sit outside the
+ *  sheet only when the fixed edge already does. */
 function resizeSpan(start: number, len: number, movesFar: boolean, delta: number, size: number): [number, number] {
   const fixed = movesFar ? start : start + len;
-  const edge = clamp((movesFar ? start + len : start) + delta, 0, size);
+  const from = movesFar ? start + len : start;
+  const edge = clampFrom(from + delta, from, 0, size);
   let lo = Math.round(Math.min(fixed, edge)), hi = Math.round(Math.max(fixed, edge));
   if (hi - lo < 1) {
-    if (movesFar) { lo = Math.min(fixed, size - 1); hi = lo + 1; }
-    else { hi = Math.max(fixed, 1); lo = hi - 1; }
+    if (movesFar) { lo = fixed; hi = fixed + 1; }
+    else { hi = fixed; lo = fixed - 1; }
   }
   return [lo, hi - lo];
 }
@@ -57,6 +67,19 @@ export function resizeSliceRect(rect: SpriteRect, handle: Handle, press: Point, 
   return { x, y, w, h };
 }
 
+/** The rect a MOVE drag produces (a press inside the slice, not on a handle): the whole rect
+ *  travels with the pointer since the press, kept on the sheet, without being pulled onto it from
+ *  outside (see `clampFrom`). The size is normalised to whole px as `resizeSliceRect` does, so a
+ *  fractional W left by the numeric field comes out whole after a move too. */
+export function moveSliceRect(rect: SpriteRect, press: Point, pointer: Point, sheet: Sheet): SpriteRect {
+  const x = Math.round(rect.x), y = Math.round(rect.y), w = Math.max(1, Math.round(rect.w)), h = Math.max(1, Math.round(rect.h));
+  return {
+    x: Math.round(clampFrom(x + pointer.x - press.x, x, 0, sheet.w - w)),
+    y: Math.round(clampFrom(y + pointer.y - press.y, y, 0, sheet.h - h)),
+    w, h,
+  };
+}
+
 export type GuideEdge = 'l' | 'r' | 't' | 'b';
 export interface NineSliceInsets { l: number; r: number; t: number; b: number }
 
@@ -66,9 +89,9 @@ export interface NineSliceInsets { l: number; r: number; t: number; b: number }
 export function dragNineSliceGuide(start: NineSliceInsets, edge: GuideEdge, press: number, pointer: number, sheet: Sheet): NineSliceInsets {
   const delta = pointer - press;
   switch (edge) {
-    case 'l': return { ...start, l: clamp(Math.round(start.l + delta), 0, sheet.w - start.r - 1) };
-    case 'r': return { ...start, r: clamp(Math.round(start.r - delta), 0, sheet.w - start.l - 1) };
-    case 't': return { ...start, t: clamp(Math.round(start.t + delta), 0, sheet.h - start.b - 1) };
-    case 'b': return { ...start, b: clamp(Math.round(start.b - delta), 0, sheet.h - start.t - 1) };
+    case 'l': return { ...start, l: clampFrom(Math.round(start.l + delta), start.l, 0, sheet.w - start.r - 1) };
+    case 'r': return { ...start, r: clampFrom(Math.round(start.r - delta), start.r, 0, sheet.w - start.l - 1) };
+    case 't': return { ...start, t: clampFrom(Math.round(start.t + delta), start.t, 0, sheet.h - start.b - 1) };
+    case 'b': return { ...start, b: clampFrom(Math.round(start.b - delta), start.b, 0, sheet.h - start.t - 1) };
   }
 }

@@ -269,7 +269,7 @@ synthetic pointer isn't an "active pointer" and a React drag hook's `e.currentTa
 would otherwise throw and abort the drag. `device_press_key` dispatches keydown → brief hold → keyup on
 the focused element (bubbles to `window`, where the F12 debug-menu toggle + input sources listen).
 `device_dispatch_action` triggers a game intent directly and flags a `{dispatched:false}` no-op as an
-error, not a phantom success.
+error, not a phantom success — including a refusal by the action's own handler (#1129, see below).
 
 ⚠️ **A resolved `selector` is dispatched ON the element it resolved to — it did not used to be
 (#299).** `device_tap`/`device_pointer` recognised only `<button>`/`<a>` as DOM targets and sent
@@ -1351,7 +1351,12 @@ so existing callers don't break; don't pass it.
   `ok:true`, and the covered press was filed as "the handle is completely inert" (testboard
   5jE5Tip6Qwp7s7YVAYoH — it was not; the same handle moved the entity on the first try once it was
   out from under the toolbar);
-  `dispatch_action`/`play_clip` fail on an unknown name / stale guid / no-animator target;
+  `dispatch_action`/`play_clip` fail on an unknown name / stale guid, and on ANY refusal by the
+  handler itself — no target, a missing param, the wrong trait, an unknown verb, an unknown clip
+  (with `known`), a slaved sub-director (with `slavedTo`). Since #1129 the `dispatch-action` op
+  holds no copy of any action's preconditions: the handler returns `refuseAction(...)` and the op
+  maps it to `ok:false` + `reason` + the refusal's detail fields
+  (the "A handler refuses by RETURNING" paragraph in [ui-system.md](ui-system.md));
   `reimport`/`import_file` fail on a no-match / unrecognized type; `timeline_set` fails when
   normalization drops a malformed item; `capture_gesture` requires the game Playing; and `diagnose`
   only counts console errors from the last 30s (a stale error no longer pins `ok:false`).

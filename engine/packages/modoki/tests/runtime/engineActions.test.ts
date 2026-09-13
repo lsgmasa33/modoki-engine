@@ -22,6 +22,19 @@ describe('engineActions', () => {
     expect(getUIActionNames()).not.toContain('engine.loadScene');
   });
 
+  /** The one refusal the dispatch-action op cannot reach — it addresses targets by guid — so it is
+   *  pinned here, with a pre-resolved `target` (#1129). */
+  it('ui.scrollTo RETURNS a refusal for a target with no guid', async () => {
+    const { dispatchUIAction, isActionRefusal } = await setup();
+    const { getCurrentWorld } = await import('../../src/runtime/core/ecs/world');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const target = getCurrentWorld().spawn();
+    const result = dispatchUIAction('ui.scrollTo', { target, params: { y: 2 } });
+    expect(isActionRefusal(result) && result.reason).toMatch(/target has no guid/);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('target has no guid'));
+    warn.mockRestore();
+  });
+
   it('registers engine.toggleAnimator', async () => {
     const { getUIActionNames } = await setup();
     expect(getUIActionNames()).toContain('engine.toggleAnimator');

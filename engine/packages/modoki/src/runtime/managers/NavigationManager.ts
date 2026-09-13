@@ -24,7 +24,7 @@ import { isGuid } from '../core/assetRefRules';
 import { registerReadSource, unregisterReadSource } from '../core/readSourceRegistry';
 import { onWorldSwap } from '../core/ecs/worldRegistry';
 import type { ManagerDef } from './managerRegistry';
-import type { UIActionContext } from '../core/actionRegistry';
+import { refuseAction, type UIActionContext } from '../core/actionRegistry';
 
 /** Resolve a scene ref (GUID or path/URL) to a load path, or undefined. */
 function resolvePath(ref: unknown): string | undefined {
@@ -169,8 +169,22 @@ class NavigationManagerImpl implements ManagerDef {
     // AFTER the swap it triggers. So this covers the pre-swap window (chain resolution,
     // resource acquisition), which is where a double-tap actually lands, not the post-swap
     // tail. That's intended, not a shortcut: a new scene should start with fresh input.
-    'engine.loadScene': ({ payload }: UIActionContext) => this.loadScene(payload),
-    'engine.navigateBack': () => this.back(),
+    //
+    // ⚠️ A REFUSAL is decided HERE, synchronously, before the promise exists (#1129). The
+    // dispatch-action agent op reads a handler's return value but does not await it, so a refusal
+    // made inside the async `loadScene`/`back` would reach it as a pending promise and be reported as
+    // `dispatched:true`. A load that is attempted and then FAILS is not a refusal and stays in the
+    // promise — the op does not report that either, deliberately: it would mean awaiting a scene load.
+    'engine.loadScene': ({ payload }: UIActionContext) => {
+      if (!resolvePath(payload)) {
+        return refuseAction(`[engine.loadScene] could not resolve scene "${String(payload)}" — pass a scene GUID or path`);
+      }
+      return this.loadScene(payload);
+    },
+    // Unlogged: Back at the root was always a silent no-op for a player.
+    'engine.navigateBack': () => (this.canGoBack
+      ? this.back()
+      : refuseAction('[engine.navigateBack] no previous scene — the history is empty (at the root)', { log: false })),
   };
 
   init(): void {

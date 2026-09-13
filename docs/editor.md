@@ -2621,6 +2621,12 @@ position against the opposite handle's point, which failed twice on an edge-to-e
   is an integer, and Enact rounded its intermediate moves. So a purely horizontal `se` drag
   shaved a bottom-row slice's height, `392 → 389`.
 Travel makes all of that irrelevant, because a drag that did not move on an axis cannot change it.
+The clamp is widened to include where the value started (`clampFrom`). A slice already partly
+outside the sheet (after a texture is re-imported smaller, or a W typed past it, since the rect
+fields do not clamp) or Nine-Slice insets loaded unclamped from a meta that no longer fits therefore
+move inward by the pointer's travel, and a drag outward leaves them where they started. A plain clamp snapped them inside on the first
+jitter: a nudged `{x:1100, w:8}` became `{x:1008, w:100}`. The body's move drag (`moveSliceRect`)
+follows the same rule.
 The canvases read POINTER events (fractional) and keep the drag alive past the canvas (the capture
 bullet under SceneView above). The `move` drag always carried its grab offset. Live coverage:
 QA-ASSET-0025 steps 5 and 5b.

@@ -20,6 +20,7 @@
 
 import { ed25519 } from '@noble/curves/ed25519.js';
 import { sha256 } from '@noble/hashes/sha2.js';
+import { assetIsAbsent, parseAssetJson } from '../loaders/assetFetch';
 
 export interface OtaFileEntry {
   hash: string;
@@ -579,9 +580,19 @@ export async function checkForUpdate(opts: CheckForUpdateOptions): Promise<OtaCh
   // update outright — delta is an optimization, not a requirement for the update to
   // succeed (an older build with no embedded manifest, or a CDN blip, must still work).
   const baseVersion = currentActive ?? EMBEDDED_BASE_VERSION;
-  let baseManifest = currentActive
-    ? await tryFetchManifest(doFetch, opts.baseUrl, opts.bundleName, currentActive)
-    : await tryFetchEmbeddedManifest(doFetch, opts.embeddedManifestUrl ?? 'ota-embedded-manifest.json');
+  let baseManifest: OtaManifest | null;
+  if (currentActive) {
+    baseManifest = await tryFetchManifest(doFetch, opts.baseUrl, opts.bundleName, currentActive);
+  } else {
+    const embedded = await tryFetchEmbeddedManifest(doFetch, opts.embeddedManifestUrl ?? 'ota-embedded-manifest.json');
+    baseManifest = embedded.kind === 'ok' ? embedded.manifest : null;
+    // An ABSENT embedded manifest stays silent (a build that predates the feature has none). One that
+    // is PRESENT but unusable is a broken build artifact, and it costs every fresh install its first
+    // delta — reported like every other delta fallback, not folded into "absent" (#1132).
+    if (embedded.kind === 'invalid') {
+      opts.onDeltaFallback?.({ version: targetVersion, reason: `embedded base manifest is present but unusable: ${embedded.reason}` });
+    }
+  }
   // The delta BASE fetch is deliberately hash-unverified (see tryFetchManifest's doc) —
   // name/version are the ONLY identity signal here. A mismatched base is not a corrupt
   // base (that's the fetch/validate failure already handled inside tryFetch*), it is
@@ -601,7 +612,7 @@ export async function checkForUpdate(opts: CheckForUpdateOptions): Promise<OtaCh
   // likeliest cause now is by design: the publish path prunes old versions from the bucket, so a
   // device that has not updated in a while finds its active version's manifest gone. That costs it a
   // whole download instead of a delta, and an unexplained bandwidth spike is what nobody can diagnose
-  // later. The EMBEDDED base stays silent: a build that predates it has none, which is not news.
+  // later. An ABSENT embedded base stays silent (reported above only when present-but-unusable).
   if (!baseManifest && currentActive) {
     opts.onDeltaFallback?.({
       version: targetVersion,
@@ -718,20 +729,44 @@ async function tryFetchManifest(
   }
 }
 
-/** Same contract as {@link tryFetchManifest}, but for the EMBEDDED bundle's manifest — a
- *  bare relative URL fetched against the app's own served origin, never `baseUrl` (the
- *  CDN). Missing/invalid is expected and silent for any build that predates this
- *  feature — not an error. */
-async function tryFetchEmbeddedManifest(doFetch: typeof fetch, embeddedManifestUrl: string): Promise<OtaManifest | null> {
+type EmbeddedManifestRead =
+  | { kind: 'ok'; manifest: OtaManifest }
+  | { kind: 'absent' }
+  | { kind: 'invalid'; reason: string };
+
+/** Like {@link tryFetchManifest} (never throws; no usable base means whole-zip), but for the
+ *  EMBEDDED bundle's manifest — a bare relative URL fetched against the app's own served origin,
+ *  never `baseUrl` (the CDN) — and it keeps ABSENT apart from INVALID (#1132).
+ *
+ *  - **absent** — the fetch rejected, or `parseAssetJson` says the file is not there (404/410, or an
+ *    SPA-fallback `index.html`). Expected for any build that predates this feature; the caller stays
+ *    silent. A rejection counts here because it is how iOS answers a file missing from the app
+ *    bundle (the scheme handler fails the task rather than returning a 404).
+ *  - **invalid** — something came back and it is not a usable manifest: malformed JSON, a failed
+ *    `validateManifest`, or a non-ok status that is not "not there". That is a broken build
+ *    artifact, and the caller reports it.
+ *
+ *  ⚠️ The SPA fallback is not reachable where OTA runs today: `engine/app/ota.ts` only checks on a
+ *  native platform, and both Capacitor asset servers route to `index.html` only for a path with NO
+ *  extension (iOS `Router.swift`, Android `WebViewLocalServer.java`). `parseAssetJson` still
+ *  classifies it correctly for any other host. */
+async function tryFetchEmbeddedManifest(doFetch: typeof fetch, embeddedManifestUrl: string): Promise<EmbeddedManifestRead> {
+  let res: Response;
   try {
-    const res = await doFetch(embeddedManifestUrl);
-    if (!res.ok) return null;
-    const manifest = await res.json();
-    if (validateManifest(manifest).length > 0) return null;
-    return manifest as OtaManifest;
+    res = await doFetch(embeddedManifestUrl);
   } catch {
-    return null;
+    return { kind: 'absent' };
   }
+  let manifest: unknown;
+  try {
+    manifest = await parseAssetJson(res, embeddedManifestUrl);
+  } catch (e) {
+    if (assetIsAbsent(e)) return { kind: 'absent' };
+    return { kind: 'invalid', reason: e instanceof Error ? e.message : String(e) };
+  }
+  const errors = validateManifest(manifest);
+  if (errors.length > 0) return { kind: 'invalid', reason: errors.join('; ') };
+  return { kind: 'ok', manifest: manifest as OtaManifest };
 }
 
 interface NativeState {

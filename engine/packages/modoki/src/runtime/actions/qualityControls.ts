@@ -44,7 +44,7 @@
  *  persisting or vice versa, and the two would drift.
  */
 
-import { registerUIAction } from '../core/actionRegistry';
+import { registerUIAction, refuseAction } from '../core/actionRegistry';
 import { choosePlayerQualityTier } from '../rendering/playerQualityTier';
 import { isQualityTier, TIER_ORDER } from '../rendering/qualityTier';
 
@@ -64,14 +64,17 @@ export function registerQualityControls(): void {
       const chosen = params?.tier ?? payload;
       if (chosen === AUTO) {
         choosePlayerQualityTier(null);
-        return;
+        return undefined;
       }
       // Through `isQualityTier`, never a hand-written union — see playerQualityTier.ts's header for
       // why a second copy of the valid set is a real bug shape (a newly added tier persists fine and
       // reads back as "no choice"). Also covers a missing/malformed value: authored scene data —
       // validated, never trusted.
-      if (!isQualityTier(chosen)) return;
+      if (!isQualityTier(chosen)) {
+        return refuseAction(`[quality.set] ${JSON.stringify(chosen)} is not a tier (expected ${[AUTO, ...TIER_ORDER].join('|')})`, { log: false });
+      }
       choosePlayerQualityTier(chosen);
+      return undefined;
     },
   });
 }

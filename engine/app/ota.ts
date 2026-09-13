@@ -98,6 +98,18 @@ export function subscribeOtaGate(listener: GateListener): () => void {
 // loses here. The two read alike and answer different questions; see docs/async-lifetime.md.
 const otaCheckEpoch = createSupersessionToken();
 
+/** `onDeltaFallback` for both `checkForUpdate` calls below. Without it the client's delta-fallback
+ *  reports (#556 a failed delta stage, #836 a pruned active base, #1132 an unusable embedded
+ *  manifest) reached nobody in a shipped app — the hook is optional and nothing passed it.
+ *
+ *  `console.log`, not `console.warn`: a warn becomes a Crashlytics ISSUE (see
+ *  `isPluginUnimplemented` above), and the commonest cause — a device whose active version was
+ *  pruned from the bucket — is by design. The update still succeeds as a whole download; this line
+ *  is what explains the bandwidth afterwards. */
+function logDeltaFallback(bundleName: string, info: { version: string; reason: string }): void {
+  console.log(`[GameShell] OTA "${bundleName}" ${info.version}: delta fell back to a whole download — ${info.reason}`);
+}
+
 export async function checkAppOtaUpdate(): Promise<boolean> {
   // `ready-to-restart` is terminal for this app launch (see setGate's backstop and this
   // function's doc comment): once a mandatory update has staged, NOTHING may boot behind that
@@ -138,6 +150,7 @@ export async function checkAppOtaUpdate(): Promise<boolean> {
       bundleName: ota.bundleName,
       runningEngineApi: ota.engineApi,
       native: m.ModokiOta,
+      onDeltaFallback: (info) => logDeltaFallback(ota.bundleName, info),
       onWillStage: (info) => {
         if (!info.mandatory) return;
         armed = true;
@@ -258,6 +271,7 @@ export async function checkAppSubgameUpdates(): Promise<void> {
           bundleName,
           runningEngineApi: ota.engineApi,
           native: m.ModokiOta,
+          onDeltaFallback: (info) => logDeltaFallback(bundleName, info),
         });
         console.log(`[GameShell] OTA sub-game "${bundleName}" checkForUpdate result:`, result);
       } catch (e) {
