@@ -79,9 +79,14 @@ describe('an overflowing git read is not mistaken for a git verdict (#1120, #112
     //
     // No shell and no POSIX binary, so it runs on every leg of the 3-OS gate. The grandchild is left
     // to die on its own: once the parent closes the pipe its write fails and it exits.
+    //
+    // ⚠️ `detached: true` is load-bearing ON WINDOWS ONLY. libuv puts every non-detached child in a
+    // job object with KILL_ON_JOB_CLOSE, so without it the grandchild dies the instant the child
+    // exits, never writes, and nothing overflows — `thrown()` raised "expected this to throw" on the
+    // windows-latest leg of the public CI, every run, while macOS and ubuntu stayed green.
     const handOff = 'const { spawn } = require("node:child_process");'
       + ' spawn(process.execPath, ["-e", "setTimeout(() => process.stdout.write(\\"x\\".repeat(5000)), 250)"],'
-      + ' { stdio: ["ignore", "inherit", "ignore"] }).unref();'
+      + ' { stdio: ["ignore", "inherit", "ignore"], detached: true }).unref();'
       + ' process.exit(0);';
     const e = thrown(() => execFileSync(process.execPath, ['-e', handOff], { encoding: 'utf8', maxBuffer: 64 }));
     expect(e.code).toBe('ENOBUFS');
