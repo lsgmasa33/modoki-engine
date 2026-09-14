@@ -38,7 +38,6 @@ const root = repoRoot();
  */
 const PENDING_LANES: ReadonlyArray<{ prefix: string; issue: string }> = [
   { prefix: 'games/court/', issue: '#1189' },
-  { prefix: 'games/wordweave/', issue: '#1190' },
 ];
 
 const PENDING: ReadonlyArray<{ file: string; count: number }> = [
@@ -61,15 +60,6 @@ const PENDING: ReadonlyArray<{ file: string; count: number }> = [
   { file: 'games/court/tests/storeChrome.test.ts', count: 1 },
   { file: 'games/court/tests/storeGrant.test.ts', count: 1 },
   { file: 'games/court/tests/uiFontRoots.test.ts', count: 1 },
-  { file: 'games/wordweave/runtime/systems.ts', count: 12 },
-  { file: 'games/wordweave/tests/adBannerLift.test.ts', count: 3 },
-  { file: 'games/wordweave/tests/adBannerReserve.test.ts', count: 1 },
-  { file: 'games/wordweave/tests/levelTransition.test.ts', count: 1 },
-  { file: 'games/wordweave/tests/sceneChrome.test.ts', count: 4 },
-  { file: 'games/wordweave/tests/session.test.ts', count: 1 },
-  { file: 'games/wordweave/tests/systems.test.ts', count: 4 },
-  { file: 'games/wordweave/tools/authorLevel.ts', count: 2 },
-  { file: 'games/wordweave/tools/verifyCorpus.ts', count: 1 },
 ];
 
 /**
