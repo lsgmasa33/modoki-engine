@@ -1333,7 +1333,9 @@ group math is a single pure module, `editor/scene/multiTransform.ts` (headless-u
   release still worked with the Sprite Editor's `captureDrag` deleted (measured 2026-09-14), which made
   outcome-only checks of a panel's capture unfalsifiable. Now only a press inside the Game panel's
   play area reaches the game's sources ([editor-input.md](editor-input.md) § "The pointer ingestion
-  scope"). The QA-ASSET-0025 step 5c stub was added to work around this.
+  scope"). QA-ASSET-0025 step 5c used to stub the canvas's `setPointerCapture` to work around this.
+  The stub is gone (#1192): without it the step goes red when `captureDrag` is deleted (measured
+  2026-09-14).
 - **Selection state was already array-based** (`selectedEntityIds` + primary `selectedEntityId`) —
   this feature was purely SceneView-viewport wiring; the store, Inspector, Hierarchy, and selection
   undo already supported multi-select.
