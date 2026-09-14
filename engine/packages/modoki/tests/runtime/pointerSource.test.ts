@@ -11,10 +11,10 @@
  *  PointerEvents on `window`; the source tracks level state, and we derive the
  *  down-edge exactly as `inputSystem` does (`computePointerEdge`). */
 
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { pointerSource } from '../../src/runtime/input/pointerSource';
 import { createInputFrame, computePointerEdge, type InputFrame } from '../../src/runtime/core/inputActions';
-import { registerPointerBlocker, clearPointerBlockers } from '../../src/runtime/core/pointerBlockers';
+import { registerPointerBlocker, clearPointerBlockers, setPointerIngestScope } from '../../src/runtime/core/pointerBlockers';
 
 /** jsdom lacks a PointerEvent constructor in some versions — synthesize one that
  *  carries pointerId + clientX/clientY, dispatched as the given type. Dispatched on
@@ -78,7 +78,7 @@ function sampleFrame(prev: { down: boolean }): InputFrame {
   return frame;
 }
 
-afterEach(() => { pointerSource.detach(); clearPointerBlockers(); });
+afterEach(() => { pointerSource.detach(); clearPointerBlockers(); setPointerIngestScope(null); });
 
 describe('pointerSource', () => {
   it('reports down + position + drag delta across a press→drag→release', () => {
@@ -433,6 +433,136 @@ describe('pointerSource', () => {
       firePointer('pointerdown', 1, 1, 1, root);
       const f = sampleFrame(prev);
       expect(f.pointer.down).toBe(false);
+    });
+  });
+
+  /** #1182 — the host's ingestion scope. In the editor, a press on a panel or modal is not the game's,
+   *  and before this `pointerSource` latched it and `setPointerCapture`d its target, overriding the
+   *  panel's own capture. jsdom has no `setPointerCapture`, so each target carries a spy. That is
+   *  also why the in-scope case asserts the capture DOES happen: without it, a spy that could never
+   *  be called would make the out-of-scope assertion pass for the wrong reason. */
+  describe('host ingestion scope (#1182)', () => {
+    function surface(): HTMLElement & { setPointerCapture: ReturnType<typeof vi.fn> } {
+      const el = Object.assign(document.createElement('div'), { setPointerCapture: vi.fn() });
+      document.body.appendChild(el);
+      return el as unknown as HTMLElement & { setPointerCapture: ReturnType<typeof vi.fn> };
+    }
+
+    it('a press the scope rejects neither latches nor captures, for its whole gesture', () => {
+      const game = surface();
+      const panel = surface();
+      setPointerIngestScope((t) => t === game);
+      pointerSource.attach();
+      const prev = { down: false };
+
+      firePointer('pointerdown', 10, 10, 1, panel);
+      expect(panel.setPointerCapture).not.toHaveBeenCalled();
+      let f = sampleFrame(prev);
+      expect(f.pointer.down).toBe(false);
+      expect(f.pointer.pressed).toBe(false);
+
+      // The rest of the gesture lands on the game surface: it still belongs to nobody.
+      firePointer('pointermove', 50, 50, 1, game);
+      firePointer('pointerup', 50, 50, 1, game);
+      f = sampleFrame(prev);
+      expect(f.pointer.released).toBe(false);
+      expect(game.setPointerCapture).not.toHaveBeenCalled();
+    });
+
+    it('a press the scope accepts latches AND captures its target', () => {
+      const game = surface();
+      setPointerIngestScope((t) => t === game);
+      pointerSource.attach();
+      const prev = { down: false };
+
+      firePointer('pointerdown', 10, 10, 3, game);
+      expect(game.setPointerCapture).toHaveBeenCalledWith(3);
+      const f = sampleFrame(prev);
+      expect(f.pointer.down).toBe(true);
+      expect(f.pointer.pressed).toBe(true);
+    });
+
+    it('a rejected press leaves the pointer free, so the next press in scope becomes the gesture', () => {
+      // Pins that the scope check sits BEFORE the latch: a check placed after `activeId` was set
+      // would strand the pointer and this second press would hit the early return.
+      const game = surface();
+      const panel = surface();
+      setPointerIngestScope((t) => t === game);
+      pointerSource.attach();
+      const prev = { down: false };
+
+      firePointer('pointerdown', 10, 10, 1, panel);
+      firePointer('pointerdown', 20, 20, 2, game);
+      const f = sampleFrame(prev);
+      expect(f.pointer.pressed).toBe(true);
+      expect(f.pointer.x).toBe(20);
+    });
+
+    it('wheel outside the scope does not accumulate; wheel inside does', () => {
+      const game = surface();
+      const panel = surface();
+      setPointerIngestScope((t) => t === game);
+      pointerSource.attach();
+      const prev = { down: false };
+
+      panel.dispatchEvent(new WheelEvent('wheel', { deltaY: 10, bubbles: true }));
+      expect(sampleFrame(prev).pointer.wheel).toBe(0);
+      game.dispatchEvent(new WheelEvent('wheel', { deltaY: 10, bubbles: true }));
+      expect(sampleFrame(prev).pointer.wheel).toBe(1);
+    });
+
+    it('fails OPEN: a throwing or non-boolean scope keeps the press in scope', () => {
+      const game = surface();
+      pointerSource.attach();
+      const prev = { down: false };
+
+      setPointerIngestScope(() => { throw new Error('boom'); });
+      firePointer('pointerdown', 10, 10, 1, game);
+      expect(sampleFrame(prev).pointer.pressed).toBe(true);
+      firePointer('pointerup', 10, 10, 1, game);
+      sampleFrame(prev);
+
+      setPointerIngestScope(() => undefined as unknown as boolean);
+      firePointer('pointerdown', 10, 10, 2, game);
+      expect(sampleFrame(prev).pointer.pressed).toBe(true);
+    });
+
+    it('a REAL click outside the scope ends a stranded synthetic gesture at ITS last point, and latches nothing', () => {
+      // Same pointerId on both sides, because that is the collision production has: the debug
+      // bridge presses with pointerId 1, and a real mouse is pointerId 1 too. A fixture with
+      // different ids hid that an earlier ordering let the click's UP end the gesture at the
+      // click's coordinates.
+      const game = surface();
+      const panel = surface();
+      setPointerIngestScope((t) => t === game);
+      pointerSource.attach();
+      const prev = { down: false };
+
+      firePointer('pointerdown', 10, 10, 1, game); // synthetic, never released
+      expect(sampleFrame(prev).pointer.pressed).toBe(true);
+
+      fireRealPointer('pointerdown', 300, 400, 1, panel);
+      let f = sampleFrame(prev);
+      expect(f.pointer.released).toBe(true);
+      expect(f.pointer.x).toBe(10); // released where the game's gesture was, not at the click
+      expect(f.pointer.y).toBe(10);
+      expect(panel.setPointerCapture).not.toHaveBeenCalled();
+
+      fireRealPointer('pointermove', 320, 420, 1, panel);
+      fireRealPointer('pointerup', 320, 420, 1, panel);
+      f = sampleFrame(prev);
+      expect(f.pointer.pressed).toBe(false); // the click never became the game's gesture
+      expect(f.pointer.released).toBe(false);
+      expect(f.pointer.down).toBe(false);
+    });
+
+    it('clearing the scope puts every target back in scope', () => {
+      const panel = surface();
+      setPointerIngestScope(() => false);
+      setPointerIngestScope(null);
+      pointerSource.attach();
+      firePointer('pointerdown', 10, 10, 1, panel);
+      expect(sampleFrame({ down: false }).pointer.pressed).toBe(true);
     });
   });
 

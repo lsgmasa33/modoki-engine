@@ -65,7 +65,7 @@ import { noteUserInput } from '../core/userActivity';
 import { rawNow } from '../core/clock';
 import type { InputFrame } from '../core/inputActions';
 import { getPlayState, onPlayStateChange } from '../core/playState';
-import { isPointerBlocked } from '../core/pointerBlockers';
+import { isPointerBlocked, isOutsidePointerScope } from '../core/pointerBlockers';
 import { peekCurrentWorld } from '../core/ecs/worldRegistry';
 import { emit } from '../core/journal';
 import { createOneEuroFilter, POINTER_FILTER_DEFAULTS, type OneEuroParams } from './oneEuroFilter';
@@ -180,6 +180,16 @@ function onPointerDown(e: PointerEvent): void {
     // velocity, and leaving it non-zero would publish a moving pointer that is up.
     endGesture();
   }
+  // Outside the host's scope (the editor: anywhere but the Game panel's play area) the press is not
+  // the game's, so it neither latches nor captures. Capturing it overrode the panel's own
+  // `setPointerCapture` (#1182). Silent, unlike a blocked press: see `setPointerIngestScope`.
+  //
+  // ⚠️ AFTER the takeover above, deliberately. A real press anywhere still ends a stranded
+  // synthetic gesture, at that gesture's own last point. Checking the scope first cannot keep an
+  // editor click out of it: the debug bridge presses with `pointerId: 1`, which is also the real
+  // mouse's id, so the click's `pointerup` passes `onPointerUp`'s id check and ends the gesture
+  // anyway, at the click's coordinates. Measured by review against a same-id fixture.
+  if (isOutsidePointerScope(e.target)) return;
   if (isPointerBlocked(e.target)) {
     // Never latch `activeId` for a blocked press — the whole gesture (its later
     // move/up) already falls through the `pointerId !== activeId` checks below
@@ -273,7 +283,7 @@ function onWheel(e: WheelEvent): void {
   // gesture, so there is no "hold for the whole gesture" argument here — a
   // registered root (e.g. a scrollable DOM list) should block only the notches
   // that land on it, not every notch for the rest of time.
-  if (isPointerBlocked(e.target)) return;
+  if (isOutsidePointerScope(e.target) || isPointerBlocked(e.target)) return;
   wheelAccum += Math.sign(e.deltaY);
   active = true;
 }

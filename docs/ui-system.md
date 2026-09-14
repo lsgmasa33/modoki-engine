@@ -9,7 +9,7 @@ UI scene graph — the ECS world *is* the UI document.
 This page documents the runtime UI traits, the renderer, the projection/dirty-flag
 model that keeps it off the per-frame path, anchor positioning, directional
 controller/keyboard focus, text animation, nine-slice backgrounds, fonts, an image-ref
-gotcha, the per-game custom-React-UI escape hatch, and the cross-game
+gotcha, the game UI layer and its store hooks, and the cross-game
 [dialog-dismissal rule](#dialog-dismissal--the-house-rule-for-every-game).
 
 Related: [Architecture](./architecture.md) · [Scene Loading](./scene-loading.md) ·
@@ -590,7 +590,10 @@ and is reported as dispatched (`NavigationManager`'s `engine.loadScene`/`engine.
 theirs synchronously for that reason). `engine.playClip` refuses an unknown skeletal clip only against a COMPLETE roster
 (`skeletalClipRoster`: the rig's own GLB clips plus every clip of each animset's `source` GLB, with all of
 them loaded); while any source is still loading the name is written, because the mixer merges it on
-arrival.
+arrival. ⚠️ **A handler whose required input only an ENGINE dispatcher can supply must refuse when it
+is absent** (#1185) — the physics demos' zone reactions need `params.self`, an Entity that the collision or zone
+dispatch passes and an agent's JSON params never can, so every agent dispatch of them used to tint
+nothing, journal a crossing that never happened, and answer `dispatched:true`.
 (Bindings are inert unless the game is running — `applyBindings` early-returns when the
 sim is stopped, so editor Stopped/Paused states never mutate the scene.)
 
@@ -3899,31 +3902,12 @@ variant meant for the PixiJS/Scene2D path, which the DOM can't decode. Always go
 
 ---
 
-## Custom React UI per game
+## Game UI layer and store hooks
 
-Sometimes a game's UI is easier to write as a hand-authored React component than as ECS
-entities (a chat transcript, a dense custom widget, etc.). A game's `GameDefinition` (exported as
-`game` from its `game.ts`) may set an optional `UIComponent`:
-
-```ts
-UIComponent?: React.LazyExoticComponent<React.ComponentType> | React.ComponentType;
-```
-
-When set, the app renders this component **instead of** the default ECS `UIRenderer`.
-The component takes **no props** — it reads Zustand stores and ECS queries directly.
-Lazy-load it to keep it out of the main bundle:
-
-```ts
-UIComponent: React.lazy(() =>
-  import('./runtime/ui/MyGameUI').then(m => ({ default: m.MyGameUI })),
-)
-```
-
-`app/App.tsx` wires it up: the custom UI is wrapped in a `GameUIErrorBoundary` whose
-fallback is `DefaultGameUILayer`, inside a `<Suspense>` — so if the custom UI crashes or
-is still loading, the default ECS UI takes over. ⚠️ **No game uses it today** — its only two
-users, `llm-test` (`LLMGameUI`) and `chess` (`ChessGameUI`), were deleted in #1191, so nothing in
-the repo exercises this path end to end.
+Every game's HUD and menus render through `DefaultGameUILayer` (`app/ui/DefaultGameUILayer.tsx`),
+which mounts the ECS-driven `UIRenderer`. There is no per-game React UI override: the
+`GameDefinition.UIComponent` hook that let a game replace the layer was removed in #1194, after
+its only two users (`chess`, `llm-test`) were deleted in #1191.
 
 ### Store-hook injection (`addStoreHook` / `removeStoreHook`)
 
@@ -3932,8 +3916,8 @@ the repo exercises this path end to end.
 dynamic number of `useStore()` calls, games register their stores up-front via
 `addStoreHook(hook)` / `removeStoreHook(hook)`; the layer remounts (via a `version` key)
 when the hook set changes and calls each hook. This lets multiple games contribute store
-fields to the shared UI bindings without prop-drilling. (Source: `games/CUSTOM_UI.md`,
-verified against the game's `game.ts`/`runtime/setup.ts` and `app/App.tsx`.)
+fields to the shared UI bindings without prop-drilling. `games/space-console/runtime/CameraManager.ts`
+is the live example: it adds its selector in `init()` and removes it in `dispose()`.
 
 ---
 
@@ -4018,4 +4002,4 @@ never routes through `applyBindings`. Sliders are unaffected either way — a ra
 | Text animation | `runtime/traits/TextAnimation.ts`, `runtime/ui/uiTextAnimation.ts`, `runtime/rendering/text/textAnimate.ts` |
 | Nine-slice image + editor | `runtime/ui/NineSliceImage.tsx`, `editor/panels/NineSliceEditor.tsx` |
 | Fonts (FontFace loader / MSDF convert / settings) | `runtime/loaders/fontLoader.ts`, `plugins/font-convert.ts`, `runtime/core/fontSettings.ts` |
-| Custom game UI | game's `game.ts` (`UIComponent`), `app/App.tsx`, `app/ui/DefaultGameUILayer.tsx` |
+| Game UI layer + store hooks | `app/ui/DefaultGameUILayer.tsx`, `runtime/ui/storeHooks.ts` |

@@ -69,12 +69,4 @@ export interface GameDefinition {
    *  Called during the game's bootstrap; the engine then drives ads/attribution
    *  init (native only) and crashlytics hooks. No-op for games without services. */
   registerAppServices?: () => Promise<void> | void;
-  /**
-   * Custom React UI layer for this game. When set, rendered instead of the
-   * default ECS UIRenderer. The component receives no props — use Zustand
-   * stores or ECS queries internally.
-   *
-   * Lazy-load with: `UIComponent: () => import('./ui/ChatUI').then(m => m.ChatUI)`
-   */
-  UIComponent?: React.LazyExoticComponent<React.ComponentType> | React.ComponentType;
 }

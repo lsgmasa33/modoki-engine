@@ -163,6 +163,15 @@ UI tree a second time inside SceneView's authoring preview, where a click manipu
 selection, not the running game, and must never claim its pointer. A game's own DOM chrome (like
 `rulesDialog.ts`) registers/unregisters manually around its own mount/unmount.
 
+**A HOST's ingestion scope (an allowlist beside the denylist, #1182).** Block roots suit a game,
+which owns the document. A host that embeds the game in its own UI does not own the document that
+way. Its chrome registers nothing, so every press on it would latch and `setPointerCapture` as the
+game's gesture. `setPointerIngestScope(fn)` (same module) lets the host say which targets are the
+game's. `pointerSource`'s pointerdown and wheel handlers and `gestureSource`'s pointerdown handler
+drop a rejected press before any latch or capture, silently (no `input.pointer.blocked`). It is null
+in a shipped game and fails open. The editor's policy is the Game panel's play area; see
+[editor-input.md](./editor-input.md) § "The pointer ingestion scope".
+
 **A stranded synthetic press, and why a real finger reclaims it (#299).** The primary-touch rule —
 the first pointer down owns the gesture, later pointers are ignored until it lifts — assumes the
 owning press eventually lifts. (This section is about `pointerSource` specifically; `gestureSource`

@@ -29,6 +29,10 @@ source of truth) — `initWorld`/`sceneSetup` are empty and there are no custom 
     next session hands the same ids to the same entities, so an uncleared stash would skip
     re-reading the authored tint and later restore the PREVIOUS session's value. Both are
     pinned by tests in `tests/zone-station.test.ts`.
+  - ⚠️ **These actions cannot be driven by `modoki_dispatch_action`.** Each needs `params.self`
+    (the zone Entity), which only the engine's own collision or zone dispatch passes — so when it is missing or not an entity (a GUID string is not one) the handler
+    RETURNS a refusal (the op answers `ok:false`) and neither tints nor journals (#1185). To fire
+    one, move a body into the zone. Pinned by `tests/zoneActionRefusal.test.ts`.
   Everything else — falling bodies, bouncing, pendulum, spring, trigger detection, player movement
   — is stock engine traits (`RigidBody2D`, `Collider2D`, joints, `CharacterController2D`).
 - **This demo is the engine's ONLY real usage of the 2D declarative zone chain** (#296) —

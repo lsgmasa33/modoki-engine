@@ -115,7 +115,8 @@ export function detachAll(): void {
  *      class as the existing blur / play-start resets in keyboardSource.
  *    - QUEUED discrete events: a source's raw listeners are never detached by the gate —
  *      only `sample()` is skipped — so pointerSource's press/release FIFO keeps filling
- *      with every click made in an editor panel while the game is unfocused. Left alone,
+ *      with every in-scope press made while the game is unfocused (before the editor's
+ *      pointer ingestion scope, #1182, that was every click on an editor panel). Left alone,
  *      reopening replays that whole backlog into the game, one entry per frame.
  *
  *  ⚠️ DRAIN CONTINUOUSLY, NEVER ON THE REOPENING EDGE (#264). This used to reset on both

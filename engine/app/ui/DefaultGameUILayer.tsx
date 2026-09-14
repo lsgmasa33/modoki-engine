@@ -1,5 +1,5 @@
-/** Default UI layer: renders ECS-driven UIRenderer with game store bindings.
- *  Used when a game does not provide a custom UIComponent. */
+/** The game UI layer: renders the ECS-driven UIRenderer with game store bindings. Every game uses
+ *  it — the per-game custom React UI (`GameDefinition.UIComponent`) was removed in #1194. */
 import { useMemo, useSyncExternalStore } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { useGameStore } from '@modoki/engine/runtime';

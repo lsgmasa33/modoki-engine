@@ -1327,15 +1327,13 @@ group math is a single pure module, `editor/scene/multiTransform.ts` (headless-u
   press, are unaffected by their own `onPointerLeave={onPointerUp}`. A press on a scroll viewport's
   own scrollbar still reaches its `pointerdown`, so the slicers skip it with `pressIsOnScrollbar`
   rather than capturing a scrollbar drag as an edit.
-  ⚠️ **In the running editor the GAME's `pointerSource` shadows a panel's capture.** It listens on
-  `window`, so it runs after React's root handler, and on any press that `isPointerBlocked` does not
-  claim it captures the press TARGET (`pointerSource.ts`, "Keep receiving moves…"). For the slicers
-  the target is the canvas, so the canvas ends up holding capture and the release still bubbles to
-  the viewport. Nothing breaks, but **no check that only watches the outcome can tell a panel's
-  capture from none**: measured 2026-09-14, deleting the Sprite Editor's `captureDrag` left an outside
-  release working. With the canvas's own `setPointerCapture` stubbed, the same deletion left the drag
-  live and a buttonless hover resized the slice to 43×43. QA-ASSET-0025 step 5c stubs it for that
-  reason.
+  **The game's `pointerSource` no longer shadows a panel's capture (#1182).** It listens on `window`.
+  Until the editor installed a pointer ingestion scope, it captured the TARGET of any press that no
+  handler had stopped, so the slicer's canvas held capture instead of the viewport. An outside
+  release still worked with the Sprite Editor's `captureDrag` deleted (measured 2026-09-14), which made
+  outcome-only checks of a panel's capture unfalsifiable. Now only a press inside the Game panel's
+  play area reaches the game's sources ([editor-input.md](editor-input.md) § "The pointer ingestion
+  scope"). The QA-ASSET-0025 step 5c stub was added to work around this.
 - **Selection state was already array-based** (`selectedEntityIds` + primary `selectedEntityId`) —
   this feature was purely SceneView-viewport wiring; the store, Inspector, Hierarchy, and selection
   undo already supported multi-select.

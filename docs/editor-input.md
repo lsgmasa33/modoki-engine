@@ -196,7 +196,9 @@ the policy.**
 - **A closed gate DRAINS every frame** (`reset()` on each source), rather than once on an edge.
   Hold `W`, click the Hierarchy, and the character must stop — otherwise `sample()` keeps
   reporting `w` held until physical release. The same drain stops a queued backlog (pointerSource's
-  press FIFO fills from clicks made in editor panels) from replaying into the game on reopen.
+  press FIFO fills with any in-scope press made while the gate is closed) from replaying into the
+  game on reopen. Before #1182, that meant every click on an editor panel; the ingestion scope below
+  now drops those at press time.
   ⚠️ It must NOT reset on the REOPENING edge, which is what it used to do (#264): `PanelFocusHost`
   moves the scope on capture-phase pointerdown, so a click into the Game panel opens the gate and
   lands in the queue in the same tick — and the reopening reset then ate it, along with the rest of
@@ -213,6 +215,43 @@ the policy.**
   and transforms by leaving a non-game panel focused for ~166 ms. The old edge-triggered shape
   could not reach 10 in a row (the next suppressed frame returned early and ran clean, which
   clears the count). `sample()` stays unguarded — it is unchanged, and always ran per frame.
+
+### The pointer ingestion scope — the gate's press-time twin (#1182)
+
+The gate decides what the game **reads** each frame. It cannot stop what the pointer sources do at
+**press** time, before any frame samples: `pointerSource` latches the gesture and
+`setPointerCapture`s the press target, and `gestureSource` adds the pointer to its list. Both listen
+on `window`, and the only press-time filter was the pointer-block registry, which is a denylist that
+editor chrome never joins. So every press on a panel or modal was captured by the game. That
+overrode the panel's own capture: the Sprite Editor canvas ended up holding capture instead of its
+scroll viewport. It also made any outcome-only check of a panel's capture unfalsifiable, because a
+release off the canvas still arrived through the game's capture.
+
+- Mechanism: `setPointerIngestScope(fn)` in `runtime/core/pointerBlockers.ts`. A press, or a wheel
+  notch, whose target the host's predicate rejects never reaches either source. It **fails open**:
+  only an explicit `false` excludes, and a throwing predicate counts as in scope. A shipped game never
+  installs one.
+- Policy: `EditorApp` installs `isGamePointerTarget` (`editor/input/gamePointerScope.ts`) right beside
+  the gate. A press is the game's only if its target is inside `[data-game-view-area]`, the Game
+  panel's play area. That area holds the canvases and the UI layer (plus the Stopped overlay and the
+  debug menu) but not the panel toolbar. This is the same marker `app/debug/uiSurface.ts` uses for
+  the Game panel's surface.
+- **Containment, not focus** (owner, 2026-09-14): `PanelFocusHost` cannot see a modal portalled out
+  of the panel tree. A focus rule would still hand a Sprite Editor press to the game whenever the Game
+  panel was the last one clicked.
+- Not folded into `isPointerBlocked`: a blocked press is the game's own chrome taking it, and it
+  journals `input.pointer.blocked`. An out-of-scope press is not the game's business, and it must not
+  journal a game event for every editor click.
+- The input watch (`pointerRecorder.ts`) marks such a press `outOfScope: true`. It keeps it out of
+  the queue that receives the game's `noteInputResolution()`, and out of `unresolvedOnly`.
+  Otherwise an editor click would take the next real tap's resolution, or be listed as a press the
+  game missed.
+- A real press outside the scope still ends a STRANDED synthetic gesture (#299), at that gesture's
+  own last point, and then latches nothing. Checking the scope before that takeover cannot stop it:
+  the debug bridge presses with `pointerId: 1`, the real mouse's id, so the click's `pointerup`
+  would end the gesture anyway, at the click's coordinates.
+- SceneView's 2D and 3D drags were never affected: their capture-phase canvas listeners call
+  `stopPropagation`, so those presses never reach `window`.
 
 ### The agent-facing half: a suppressed key used to look identical to a delivered one
 

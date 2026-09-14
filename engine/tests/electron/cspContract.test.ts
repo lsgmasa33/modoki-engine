@@ -45,10 +45,13 @@ describe('packaged editor CSP contract', () => {
   // Remote CODE is not granted (#1191): no script or worker from any remote origin. An ALLOWLIST,
   // not a denylist: CSP host-sources need no scheme (`cdn.jsdelivr.net`, `*.jsdelivr.net`), so
   // matching `https:`/`https://` alone would let a scheme-less re-grant through. Anything that is not
-  // a quoted keyword, `blob:`/`data:`, or a loopback origin counts as remote.
+  // a quoted keyword, `blob:`/`data:`, or a loopback origin counts as remote — and `'strict-dynamic'`
+  // is NOT local despite being quoted: it lets an already-trusted script load further scripts from
+  // ANY origin, so it re-opens remote code transitively.
   it('grants no remote origin to the code directives (script-src, worker-src)', () => {
     const isLocal = (s: string) =>
-      /^'[^']+'$/.test(s) || s === 'blob:' || s === 'data:' || /^https?:\/\/(localhost|127\.0\.0\.1):/.test(s);
+      (/^'[^']+'$/.test(s) && s !== "'strict-dynamic'")
+      || s === 'blob:' || s === 'data:' || /^https?:\/\/(localhost|127\.0\.0\.1):/.test(s);
     for (const d of ['script-src', 'worker-src']) {
       const remote = directives[d].filter((s) => !isLocal(s));
       expect(remote, `${d} must not allow a remote origin — self-host the script instead`).toEqual([]);

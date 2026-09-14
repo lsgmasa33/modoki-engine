@@ -869,7 +869,7 @@ export {
 // only through its declared `exports` map — so an agent op cannot register without these.
 export {
   noteInputResolution,
-  startInputWatch, stopInputWatch, clearInputPresses, readInputPresses, isInputWatchOpen,
+  startInputWatch, stopInputWatch, clearInputPresses, readInputPresses, isInputWatchOpen, isUnresolvedPress,
   type InputPressRecord, type InputResolution,
 } from './input/pointerRecorder';
 export {

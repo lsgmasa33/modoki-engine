@@ -12,9 +12,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
   startInputWatch, stopInputWatch, readInputPresses, clearInputPresses,
-  isInputWatchOpen, noteInputResolution, __resetInputRecorder,
+  isInputWatchOpen, noteInputResolution, __resetInputRecorder, isUnresolvedPress,
 } from '../../src/runtime/input/pointerRecorder';
-import { registerPointerBlocker, clearPointerBlockers } from '../../src/runtime/core/pointerBlockers';
+import { registerPointerBlocker, clearPointerBlockers, setPointerIngestScope } from '../../src/runtime/core/pointerBlockers';
 import { registerPickProvider } from '../../src/runtime/core/screenPick';
 import { setManualNow, advanceManual, restoreRealClock } from '../../src/runtime/core/clock';
 
@@ -262,6 +262,49 @@ describe('a press the game never sees must not claim a later resolution', () => 
       expect(swallowed.resolved).not.toMatchObject({ by: 'game' });
       expect(real.resolved).toEqual({ by: 'game', kind: 'cell', id: 'b1' });
     } finally { un(); }
+  });
+
+  it('does not hand a press OUTSIDE the host ingestion scope a later resolution (#1182)', () => {
+    // The editor case: a click on the Game panel's toolbar or a modal never reaches the game's
+    // sources, so the game never hit-tests it. Queued, it took the next real tap's resolution.
+    const toolbar = document.createElement('div');
+    const game = document.createElement('canvas');
+    document.body.append(toolbar, game);
+    setPointerIngestScope((t) => t === game);
+    try {
+      startInputWatch();
+      press(toolbar, [5, 5], [5, 5], { id: 1 });
+      press(game, [60, 60], [60, 60], { id: 2 });
+      noteInputResolution({ kind: 'cell', id: 'c3' });
+
+      const [editorClick, real] = readInputPresses().presses;
+      expect(editorClick.outOfScope).toBe(true);
+      expect(editorClick.blocked).toBeNull();
+      expect(editorClick.resolved).not.toMatchObject({ by: 'game' });
+      expect(real.outOfScope).toBe(false);
+      expect(real.resolved).toEqual({ by: 'game', kind: 'cell', id: 'c3' });
+    } finally { setPointerIngestScope(null); }
+  });
+
+  it('an out-of-scope press says the game never received it, and is not listed as a missed press', () => {
+    // `unresolvedOnly` lists the presses the game FAILED on. An editor click is not one, and the
+    // generic `unknown` reason ("call noteInputResolution() from the game hit-test") is false for it.
+    const toolbar = document.createElement('div');
+    const game = document.createElement('canvas');
+    document.body.append(toolbar, game);
+    setPointerIngestScope((t) => t === game);
+    try {
+      startInputWatch();
+      press(toolbar, [5, 5], [5, 5], { id: 1 });
+      press(game, [60, 60], [60, 60], { id: 2 }); // received, and nothing resolved it
+
+      const [editorClick, missed] = readInputPresses().presses;
+      expect(editorClick.resolved).toMatchObject({ by: 'unknown', reason: expect.stringMatching(/never received/) });
+      expect(isUnresolvedPress(editorClick)).toBe(false);
+      // The accept side: a received press that nothing resolved is still listed.
+      expect(missed.resolved).toMatchObject({ by: 'unknown', reason: expect.stringMatching(/noteInputResolution/) });
+      expect(isUnresolvedPress(missed)).toBe(true);
+    } finally { setPointerIngestScope(null); }
   });
 
   it('does not hand a non-primary press a later resolution either', () => {

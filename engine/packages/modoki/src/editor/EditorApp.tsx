@@ -12,6 +12,8 @@ import { register, registerBindings } from './input/keymap';
 import { useHmrEpoch } from './input/hmrEpoch';
 import { installKeymapDispatcher } from './input/dispatcher';
 import { setInputGate } from '../runtime/input/inputSources';
+import { setPointerIngestScope } from '../runtime/core/pointerBlockers';
+import { isGamePointerTarget } from './input/gamePointerScope';
 import { calibratePresentationScale } from '../runtime/input/presentationScale';
 import { forwardZoomWheel } from './input/zoomWheel';
 import SceneView from './panels/SceneView';
@@ -358,9 +360,14 @@ export default function EditorApp() {
       const p = useEditorStore.getState().focusedPanel;
       return p !== null && p !== 'game';
     });
+    // The gate above decides what the game READS each frame; it cannot stop a press on a panel from
+    // being LATCHED and pointer-captured by the game at press time, before any frame samples. This
+    // scope does that: only a press inside the Game panel's play area starts a game gesture (#1182).
+    setPointerIngestScope(isGamePointerTarget);
 
     return () => {
       setInputGate(null);
+      setPointerIngestScope(null);
       offDispatch();
       offBindings();
     };

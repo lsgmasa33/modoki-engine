@@ -490,14 +490,12 @@ interface GameDefinition {
   registerEditorBindings?: () => void | Promise<void>; // editor-only glue (UI bindings, creatable-asset registrations, …)
   registerAppServices?: () => Promise<void> | void;    // native analytics/ads/etc.
   resetPhase?: (world: World) => void;              // error-recovery reset
-  UIComponent?: React.ComponentType;                // optional custom React UI layer
 }
 ```
 
 `registerSystems()` is where a game adds its own systems (via `registerSystem`) and
 trait editor metadata; `unregisterSystems()` tears them down without touching engine
-systems. When `UIComponent` is set, it replaces the default ECS `UIRenderer` for that
-game (e.g. the chat-driven games).
+systems.
 
 Games are discovered through `virtual:modoki-games` at build time; the **editor** takes
 a runtime path (`app/projectGames.ts` → `loadProjectGames()`) that imports the *open*

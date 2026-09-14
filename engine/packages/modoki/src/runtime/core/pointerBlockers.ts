@@ -168,6 +168,46 @@ export function isInsideGameSurface(target: unknown): boolean {
   return containing(blockers, target).length > 0 || containing(passthrough, target).length > 0;
 }
 
+/** ── INGESTION SCOPE — the host's ALLOWLIST, beside the registries' denylist (#1182) ──
+ *
+ *  The registries above are a denylist of DOM roots, and that is the right shape inside a game: the
+ *  game owns the document, so "everything except the chrome I registered" is the game. It is the
+ *  wrong shape inside a HOST that embeds the game in its own UI. The editor's panels, inspectors and
+ *  modals register nothing, so a press anywhere in them reached `pointerSource`, which latched it as
+ *  the game's gesture and `setPointerCapture`d the press target, overriding the panel's own capture.
+ *  The #264 input gate could not help: it decides what the game READS each frame, and the latch and
+ *  the capture happen at press time, before any frame samples anything.
+ *
+ *  So the host installs a scope predicate: a press whose target it rejects is not the game's at
+ *  all. Mechanism here, policy in the host, the same split as `setInputGate` (the editor installs
+ *  both, side by side, in `EditorApp`). **A shipped game never installs one**, so the scope is null
+ *  and every press is in scope, which is exactly the behaviour before this existed.
+ *
+ *  Why a host allowlist rather than registering editor chrome as blockers: every future panel and
+ *  every portalled modal would need its own registration (a denylist again), and a document-wide
+ *  blocker would make `isInsideGameSurface` above report every editor node as game surface.
+ *
+ *  Deliberately NOT folded into `isPointerBlocked`: a blocked press is a GAME decision (its own
+ *  chrome took it), journals `input.pointer.blocked`, and is named by `nearestPointerBlocker` for the
+ *  input watch. An out-of-scope press is not the game's business at all, so it must not emit a game
+ *  event for every click on the editor. */
+let ingestScope: ((target: unknown) => boolean) | null = null;
+
+/** Install the host's pointer ingestion scope. Return true for a target whose presses belong to the
+ *  game. Pass null to clear, which puts every target back in scope. */
+export function setPointerIngestScope(fn: ((target: unknown) => boolean) | null): void {
+  ingestScope = fn;
+}
+
+/** Is `target` outside the host's scope, so that a press on it must not start a game gesture?
+ *  FAILS OPEN, like `isInputSuppressed`: only an explicit `false` excludes, and a throwing predicate
+ *  counts as in scope. A broken host predicate must never make a game uncontrollable. */
+export function isOutsidePointerScope(target: unknown): boolean {
+  if (!ingestScope) return false;
+  try { return ingestScope(target) === false; }
+  catch { return false; }
+}
+
 /** Test/teardown escape hatch — drop every registration without calling disposers. */
 export function clearPointerBlockers(): void {
   blockers.clear();

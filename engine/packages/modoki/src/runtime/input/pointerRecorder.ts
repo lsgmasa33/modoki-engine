@@ -44,7 +44,7 @@
 
 import { rawNow } from '../core/clock';
 import { journalTick } from '../core/journal';
-import { nearestPointerBlocker } from '../core/pointerBlockers';
+import { nearestPointerBlocker, isOutsidePointerScope } from '../core/pointerBlockers';
 import { pickAt, pickableSurfaces } from '../core/screenPick';
 import type { BoundsSurface } from '../core/screenBounds';
 
@@ -99,6 +99,10 @@ export interface InputPressRecord {
   /** Set when a registered pointer-block root swallowed the press before `pointerSource` could
    *  latch it — with WHICH root, the field `input.pointer.blocked` never carried. */
   blocked: { by: string } | null;
+  /** True when the HOST's ingestion scope rejected the press (`setPointerIngestScope`, #1182). In
+   *  the editor that means it landed outside the Game panel's play area, so the game's input sources
+   *  never saw it. Distinct from `blocked`: that is the game's own chrome taking a press. */
+  outOfScope: boolean;
   /** What the PRESS resolved to. */
   resolved: InputResolution;
   /** What a hit-test reported AFTER the release, when the game runs one there (a drop target).
@@ -235,6 +239,7 @@ function onDown(e: PointerEvent): void {
     ended: 'open',
     target: describeNode(e.target),
     blocked: null,
+    outOfScope: isOutsidePointerScope(e.target),
     resolved: { by: 'none', checked: [] },
     dropResolved: null,
     downMs: now,
@@ -242,6 +247,11 @@ function onDown(e: PointerEvent): void {
   const blocker = nearestPointerBlocker(e.target);
   if (blocker) rec.blocked = { by: describeNode(blocker) };
   rec.resolved = engineResolve(e.target, e.clientX, e.clientY);
+  // engineResolve's `unknown` reason tells the reader to wire the game's hit-test, which is false
+  // for a press the game never received. Say what actually happened instead.
+  if (rec.outOfScope && rec.resolved.by === 'unknown') {
+    rec.resolved = { by: 'unknown', reason: 'outside the host input scope (in the editor: not in the Game panel play area), so the game never received this press' };
+  }
   inFlight.set(e.pointerId, rec);
   // ONLY a press the game can actually receive joins the resolution queue. A blocked press is
   // swallowed by `pointerSource` at ingestion and a non-primary one loses to the primary-touch
@@ -254,7 +264,11 @@ function onDown(e: PointerEvent): void {
   // reported against a press that had been eaten by an overlay. Every unit test had the game
   // claim every press, so none of them could see it — and the wrong record is exactly the one an
   // investigator would have chased.
-  if (!rec.blocked && rec.primary) {
+  //
+  // An out-of-scope press (#1182) is the same case again: the game's sources drop it before any
+  // latch, so it will never be hit-tested. Queuing it handed an editor click (a Pause button, a
+  // modal) the resolution of the next real tap on the game.
+  if (!rec.blocked && !rec.outOfScope && rec.primary) {
     awaitingPressNote.push(rec);
     // Drop the OLDEST unclaimed press, not the newest: a game that never calls the hook at all
     // would otherwise pin the queue at its first-ever press.
@@ -317,9 +331,19 @@ function publish(r: InputPressRecord | InFlight): InputPressRecord {
     ended: r.ended,
     target: r.target,
     blocked: r.blocked,
+    outOfScope: r.outOfScope,
     resolved: r.resolved,
     dropResolved: r.dropResolved,
   };
+}
+
+/** Did a press the game RECEIVED go unresolved? The filter behind `modoki_input_watch
+ *  unresolvedOnly`, which exists to list the presses the game failed on. An out-of-scope press
+ *  (#1182) is excluded: the game never saw it, so listing it there would bury the real misses under
+ *  every editor click. */
+export function isUnresolvedPress(p: InputPressRecord): boolean {
+  if (p.outOfScope) return false;
+  return p.resolved.by === 'none' || p.resolved.by === 'unknown';
 }
 
 /** Open the window. Records nothing that happened before this call — by design, same contract as

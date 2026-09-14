@@ -1,5 +1,4 @@
-import React, { Component, lazy, Suspense, useEffect, useRef, useState } from 'react';
-import type { ErrorInfo, ReactNode } from 'react';
+import React, { lazy, Suspense, useEffect, useRef, useState } from 'react';
 import { Capacitor } from '@capacitor/core';
 import { useWebCanvasSizing } from './useWebCanvasSizing';
 import { useAudioResumeRearm } from './useAudioResumeRearm';
@@ -69,19 +68,6 @@ const Game = __MODOKI_MODULE_RENDER2D__
   ? lazy(() => import('@modoki/engine/runtime/rendering/Game'))
   : null;
 
-/** Lightweight error boundary around custom game UI — falls back to default UIRenderer
- *  instead of resetting the entire game. The game keeps running underneath. */
-class GameUIErrorBoundary extends Component<{ fallback: ReactNode; children: ReactNode }, { hasError: boolean }> {
-  state = { hasError: false };
-  static getDerivedStateFromError() { return { hasError: true }; }
-  componentDidCatch(error: Error, info: ErrorInfo) {
-    console.error('[GameUIErrorBoundary] Custom game UI crashed, falling back to default:', error, info.componentStack);
-  }
-  render() {
-    return this.state.hasError ? this.props.fallback : this.props.children;
-  }
-}
-
 function useHashRoute() {
   const [hash, setHash] = useState(window.location.hash);
   useEffect(() => {
@@ -130,7 +116,6 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
   const [initialized, setInitialized] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [transitioning, setTransitioning] = useState(false);
-  const [GameUI, setGameUI] = useState<React.ComponentType | null>(null);
   const [disable3D, setDisable3D] = useState(false);
   const [otaGate, setOtaGate] = useState<OtaGateState | null>(null);
   /** Copy for the tier-switch overlay, or null when no tier switch is being applied (#227). The
@@ -428,14 +413,6 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         }
         if (cancelled) return;
         if (def.resetPhase) setActiveResetPhase(def.resetPhase);
-
-        // Resolve custom UI component (supports lazy and eager)
-        if (def.UIComponent) {
-          // React.lazy components are functions with $$typeof — just use them directly
-          setGameUI(() => def.UIComponent!);
-        } else {
-          setGameUI(null);
-        }
 
         const config = await def.loadConfig();
         if (cancelled) return;
@@ -737,13 +714,7 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         >
           {Scene3D && !disable3D && <Suspense fallback={null}><Scene3D /></Suspense>}
           {Game && <Suspense fallback={null}><Game /></Suspense>}
-          {GameUI ? (
-            <GameUIErrorBoundary fallback={<DefaultGameUILayer />}>
-              <Suspense fallback={null}><GameUI /></Suspense>
-            </GameUIErrorBoundary>
-          ) : (
-            <DefaultGameUILayer />
-          )}
+          <DefaultGameUILayer />
           {/* Cutscene layer — above the game + UI, below the loading/OTA gates (a
               download prompt must still win over a movie). Renders nothing unless a
               presentation-mode clip is playing. */}

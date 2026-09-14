@@ -38,7 +38,7 @@
  *
  *  Guards `typeof window` so importing it headless is inert; no wall-clock, no RNG. */
 
-import { isPointerBlocked } from '../core/pointerBlockers';
+import { isPointerBlocked, isOutsidePointerScope } from '../core/pointerBlockers';
 import type { GestureFrame, InputFrame } from '../core/inputActions';
 import type { InputSource } from './inputSources';
 
@@ -314,7 +314,9 @@ function handleEmulatedMove(e: PointerEvent): boolean {
 function onPointerDown(e: PointerEvent): void {
   // Filter at INGESTION, the same discipline pointerSource follows: a press that starts on blocked
   // chrome must never enter the list, because filtering later would leave the gesture half-tracked.
-  if (isPointerBlocked(e.target)) return;
+  // The host's ingestion scope applies here for the same reason (#1182): outside it (editor chrome),
+  // the press is not the game's, so it must not enter `live` either.
+  if (isOutsidePointerScope(e.target) || isPointerBlocked(e.target)) return;
   if (isEmulationStart(e)) { startEmulation(e); return; }
   if (find(e.pointerId)) return;
   addPointer(e.pointerId, e.clientX, e.clientY);

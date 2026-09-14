@@ -466,7 +466,7 @@ first version of this paragraph declined it for a reason that turned out to be f
   game decoupling
 - [rendering.md](./rendering.md) — the three render layers, WebGPU, NPR post-process
 - [scene-loading.md](./scene-loading.md) — two-world swap, refcounting, persistence
-- [ui-system.md](./ui-system.md) — ECS UI traits, UIRenderer, custom React UI
+- [ui-system.md](./ui-system.md) — ECS UI traits, UIRenderer, store hooks
 - [prefabs.md](./prefabs.md) · [model-pipeline.md](./model-pipeline.md) ·
   [textures.md](./textures.md) · [editor.md](./editor.md) ·
   [native-and-sdks.md](./native-and-sdks.md)

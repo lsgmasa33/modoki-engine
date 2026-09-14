@@ -112,7 +112,7 @@ import {
   stopInputWatch,
   clearInputPresses,
   readInputPresses,
-  type InputPressRecord,
+  isUnresolvedPress,
 } from '@modoki/engine/runtime';
 import { applyLiveMutate } from './liveMutate';
 import { createEntityLive, duplicateEntityLive, deleteEntitiesLive } from './liveLifecycle';
@@ -1390,9 +1390,6 @@ registerAgentOp('watch-clear', (params) => clearWatch((params as { id?: string }
 registerAgentOp('input-watch-start', (params) => startInputWatch((params ?? {}) as { max?: number }));
 
 const DEFAULT_INPUT_WATCH_LIMIT = 20;
-function isUnresolvedPress(p: InputPressRecord): boolean {
-  return p.resolved.by === 'none' || p.resolved.by === 'unknown';
-}
 /** Shared by `read` and `stop` (stop reports what was captured, same shape as a read). */
 function shapeInputWatchRead(params: unknown): unknown {
   const p = (params ?? {}) as { limit?: number; unresolvedOnly?: boolean; precision?: number };

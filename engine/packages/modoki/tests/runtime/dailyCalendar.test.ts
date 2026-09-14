@@ -26,6 +26,22 @@ import {
 const at = (y: number, m1: number, d: number, h = 12, min = 0): number =>
   new Date(y, m1 - 1, d, h, min).getTime();
 
+/** Run `fn` under an explicit IANA zone, then put the machine zone back. */
+const withTz = (tz: string, fn: () => void) => {
+  const prev = process.env.TZ;
+  const machineZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  try { process.env.TZ = tz; fn(); } finally {
+    // ⚠️ Assigning `undefined` back stores the STRING "undefined", which Node reads as UTC — so a
+    // bare `process.env.TZ = prev` left every later case in this file running in UTC rather than
+    // in the machine zone (#928 close-out review). Delete it instead.
+    // ⚠️ But on WINDOWS a `delete` does not reset Node's zone cache: after the Los Angeles case the
+    // process stayed on PDT, so `at(2026, 8, 28)` built in JST read back as the 27th and three
+    // `daysForMonth — cell states` cases went red there only. Assign the machine zone first (an
+    // assignment resets on every platform), THEN delete, so the env ends unset everywhere.
+    if (prev === undefined) { process.env.TZ = machineZone; delete process.env.TZ; } else process.env.TZ = prev;
+  }
+};
+
 const progress = (over: Partial<DailyProgress> = {}): DailyProgress => ({
   completed: {},
   purchased: {},
@@ -65,14 +81,6 @@ describe('dateKeyOf', () => {
   // evening instant west of it — so a player would be re-handed yesterday's puzzle over breakfast
   // in Tokyo, and handed tomorrow's after dinner in Los Angeles. Each case asserts that the UTC
   // answer really does DIFFER, so the test discriminates instead of merely exercising the code.
-  const withTz = (tz: string, fn: () => void) => {
-    const prev = process.env.TZ;
-    // ⚠️ Assigning `undefined` back stores the STRING "undefined", which Node reads as UTC — so a
-    // bare `process.env.TZ = prev` left every later case in this file running in UTC rather than
-    // in the machine zone (#928 close-out review). Delete it instead.
-    try { process.env.TZ = tz; fn(); } finally { if (prev === undefined) delete process.env.TZ; else process.env.TZ = prev; }
-  };
-
   it('uses the LOCAL date east of Greenwich, where UTC is still yesterday', () => {
     withTz('Asia/Tokyo', () => {
       const morning = new Date(2026, 7, 29, 8, 0).getTime(); // 08:00 JST = 23:00 UTC the 28th
@@ -478,13 +486,6 @@ describe('daysForMonth — DST', () => {
   // assert the PROPERTY, and each one first proves the zone actually moved. Without that guard the
   // whole block is vacuous: a day COUNT is timezone-independent, so it would pass under any zone,
   // including one where `process.env.TZ` never took effect.
-  const withTz = (tz: string, fn: () => void) => {
-    const prev = process.env.TZ;
-    // ⚠️ Assigning `undefined` back stores the STRING "undefined", which Node reads as UTC — so a
-    // bare `process.env.TZ = prev` left every later case in this file running in UTC rather than
-    // in the machine zone (#928 close-out review). Delete it instead.
-    try { process.env.TZ = tz; fn(); } finally { if (prev === undefined) delete process.env.TZ; else process.env.TZ = prev; }
-  };
 
   /** Every day appears once, and lands under the weekday column the platform agrees it falls on.
    *  The alignment is the half that ms-arithmetic would actually break. */

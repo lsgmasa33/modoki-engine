@@ -7,7 +7,7 @@
 
 import type { GameDefinition } from '@modoki/engine/runtime';
 import type { Entity } from 'koota';
-import { registerUIAction, unregisterUIAction, Renderable2D, entityRef, onWorldSwap } from '@modoki/engine/runtime';
+import { registerUIAction, unregisterUIAction, refuseAction, Renderable2D, entityRef, onWorldSwap } from '@modoki/engine/runtime';
 
 // Occupied tints. The IDLE tints are NOT here — they are authored on each station's
 // Renderable2D in the scene, and `tintOnEnter`/`restoreOnExit` below put back exactly what
@@ -43,8 +43,7 @@ const NO_OCCUPANT = -1;   // an enter/exit that arrived without an `other` (neve
 let unsubWorldSwap: (() => void) | null = null;
 function forgetSessionState(): void { authoredTint.clear(); insiders.clear(); }
 
-function tintOnEnter(self: Entity | undefined, other: Entity | undefined, hot: Tint): void {
-  if (!self) return;
+function tintOnEnter(self: Entity, other: Entity | undefined, hot: Tint): void {
   const id = self.id();
   let inside = insiders.get(id);
   if (!inside) { inside = new Set(); insiders.set(id, inside); }
@@ -57,8 +56,7 @@ function tintOnEnter(self: Entity | undefined, other: Entity | undefined, hot: T
   self.set(Renderable2D, hot);
 }
 
-function restoreOnExit(self: Entity | undefined, other: Entity | undefined, fallback: Tint): void {
-  if (!self) return;
+function restoreOnExit(self: Entity, other: Entity | undefined, fallback: Tint): void {
   const id = self.id();
   const inside = insiders.get(id);
   inside?.delete(other ? other.id() : NO_OCCUPANT);
@@ -68,6 +66,15 @@ function restoreOnExit(self: Entity | undefined, other: Entity | undefined, fall
   if (self.isAlive()) self.set(Renderable2D, authoredTint.get(id) ?? fallback);
   authoredTint.delete(id);
 }
+
+// Only the engine's collision/zone dispatch can supply `params.self` (an Entity) — an agent's JSON
+// params never can (a GUID string is not one; koota entities are numbers). Without it nothing is tinted, so a zone event must not be journalled either:
+// RETURN the refusal so dispatch-action reads ok:false instead of dispatched:true (#1185). Silent,
+// because the engine always passes `self` and a shipped warn becomes a crash report.
+const noSelf = (action: string) => refuseAction(
+  `${action}: params.self must be the zone Entity, and it is missing or not an entity — only the zone's own collision dispatch supplies it. Move a body into the zone to fire this.`,
+  { log: false },
+);
 
 const ACTIONS = [
   'sensorZone/enter', 'sensorZone/exit',
@@ -86,6 +93,7 @@ export const game: GameDefinition = {
     // so the reaction is verifiable by data (modoki_journal), not just by eye.
     registerUIAction('sensorZone/enter', (ctx) => {
       const { self, other } = (ctx.params ?? {}) as { self?: Entity; other?: Entity };
+      if (typeof self !== 'number') return noSelf('sensorZone/enter');
       tintOnEnter(self, other, { color: HOT_COLOR, opacity: HOT_OPACITY });
       // ctx.emit binds the world; entityRef() converts the body to its stable GUID
       // (id() would churn across hot-reloads). Verifiable via modoki_journal.
@@ -93,6 +101,7 @@ export const game: GameDefinition = {
     });
     registerUIAction('sensorZone/exit', (ctx) => {
       const { self, other } = (ctx.params ?? {}) as { self?: Entity; other?: Entity };
+      if (typeof self !== 'number') return noSelf('sensorZone/exit');
       restoreOnExit(self, other, BASE_FALLBACK);
       ctx.emit('zone', { phase: 'exit', body: other ? entityRef(other) : undefined });
     });
@@ -107,11 +116,13 @@ export const game: GameDefinition = {
     // game's reaction, not the engine's record.)
     registerUIAction('triggerZone/enter', (ctx) => {
       const { self, other } = (ctx.params ?? {}) as { self?: Entity; other?: Entity };
+      if (typeof self !== 'number') return noSelf('triggerZone/enter');
       tintOnEnter(self, other, { color: ZONE_HOT_COLOR, opacity: ZONE_HOT_OPACITY });
       ctx.emit('zoneTrigger', { phase: 'enter', body: other ? entityRef(other) : undefined });
     });
     registerUIAction('triggerZone/exit', (ctx) => {
       const { self, other } = (ctx.params ?? {}) as { self?: Entity; other?: Entity };
+      if (typeof self !== 'number') return noSelf('triggerZone/exit');
       restoreOnExit(self, other, ZONE_BASE_FALLBACK);
       ctx.emit('zoneTrigger', { phase: 'exit', body: other ? entityRef(other) : undefined });
     });

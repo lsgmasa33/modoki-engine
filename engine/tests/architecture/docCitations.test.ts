@@ -1429,7 +1429,7 @@ const SOURCE_PATH_CORPUS_EXCLUDED: ReadonlyArray<{ path: string; reason: string 
  *  `isNonCitingSource` and `SOURCE_PATH_CORPUS_EXCLUDED`.
  *
  *  It was `docs/**`, `games|demos/<id>/docs/**` and every `CLAUDE.md` — a hand-declared scope,
- *  so a project's top-level doc (`games/court/audio.md`, `games/CUSTOM_UI.md`) was never read, and
+ *  so a project's top-level doc (`games/court/audio.md`) was never read, and
  *  measured on widening it held four paths that had moved or gone (#1124).
  *
  *  `CLAUDE.md` earns the stricter treatment, not the looser one: it is loaded into an agent's
@@ -1777,9 +1777,8 @@ describe('source paths cited in docs and CLAUDE.md resolve (#194, second face; #
       expect(mds.some((f) => ledgerPathCovers(row.path, f)), `${row.path} excludes nothing`).toBe(true);
     }
     const corpus = citingMarkdownFiles().map(rel);
-    // Neither is a `docs/` file nor a `CLAUDE.md` — the two shapes the old hand-declared scope named.
+    // Not a `docs/` file nor a `CLAUDE.md` — the two shapes the old hand-declared scope named.
     expect(corpus).toContain('games/court/audio.md');
-    expect(corpus).toContain('games/CUSTOM_UI.md');
     expect(corpus.some((f) => f.startsWith('qa/cases/'))).toBe(false);
   });
 

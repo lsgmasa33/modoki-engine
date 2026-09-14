@@ -655,6 +655,7 @@
   "isTodayUnplayed",
   "isTouchDevice",
   "isUIOverflowCheckEnabled",
+  "isUnresolvedPress",
   "isVerboseType",
   "journalDecision",
   "journalError",

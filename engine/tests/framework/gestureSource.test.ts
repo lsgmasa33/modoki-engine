@@ -12,7 +12,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { gestureSource, configureGestures, DEFAULT_TAP_MAX_MS, DEFAULT_TAP_SLOP_PX, EMULATED_PINCH_SEED_PX } from '../../packages/modoki/src/runtime/input/gestureSource';
 import { createInputFrame, beginSample, type InputFrame } from '../../packages/modoki/src/runtime/core/inputActions';
-import { registerPointerBlocker, clearPointerBlockers } from '../../packages/modoki/src/runtime/core/pointerBlockers';
+import { registerPointerBlocker, clearPointerBlockers, setPointerIngestScope } from '../../packages/modoki/src/runtime/core/pointerBlockers';
 
 beforeEach(() => {
   configureGestures({ tapMaxMs: DEFAULT_TAP_MAX_MS, tapSlopPx: DEFAULT_TAP_SLOP_PX, mouseEmulation: false });
@@ -323,6 +323,24 @@ describe('blocking and thresholds', () => {
     const f = sample();
     expect(f.gesture.pointerCount).toBe(0);
     expect(f.gesture.tapped).toBe(false);
+  });
+
+  it('a press outside the host ingestion scope is never tracked; one inside it is (#1182)', () => {
+    const game = document.createElement('div');
+    const panel = document.createElement('div');
+    document.body.append(game, panel);
+    setPointerIngestScope((t) => t === game);
+    try {
+      send('pointerdown', 1, 100, 100, T0 + 0, { on: panel });
+      expect(sample().gesture.pointerCount).toBe(0);
+      send('pointerup', 1, 100, 100, T0 + 50, { on: panel });
+
+      // The accept side: without it, a source that tracked nothing at all would pass the line above.
+      send('pointerdown', 2, 100, 100, T0 + 100, { on: game });
+      expect(sample().gesture.pointerCount).toBe(1);
+    } finally {
+      setPointerIngestScope(null);
+    }
   });
 
   it('the thresholds are retunable, and a game is expected to author its own', () => {
