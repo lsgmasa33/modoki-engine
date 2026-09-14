@@ -21,6 +21,8 @@ import { editorScene2DRenderer } from './rendering/editorScene2D';
 import { getInput } from '../runtime/traits/Input';
 import { pickAt } from '../runtime/core/screenPick';
 import { setCoalesceOverrideMs, flushCoalescedEdits } from './panels/coalescedEdit';
+import { getUIOverflowFindings, type UIOverflowFinding } from '../runtime/ui/uiOverflow';
+import { setUIValues } from '../runtime/ui/uiValues';
 
 export interface EditorTestBridge {
   /** The raw Zustand store (read selectedEntityId, gizmoMode, etc.). */
@@ -101,6 +103,12 @@ export interface EditorTestBridge {
    *  overlay (e.g. GameView's UIRenderer root) must never reach here, while a press
    *  elsewhere must. */
   getPointerState(): { down: boolean; pressed: boolean; x: number; y: number } | null;
+  /** The UI text overflow findings store (#1126) — what `diagnose` reads. Lets an E2E assert the
+   *  scan's REAL DOM measurement, which jsdom cannot run. */
+  uiOverflowFindings(): UIOverflowFinding[];
+  /** Merge values into the game UI store (`setUIValues`) — drives a bound text (`{coins}`) the
+   *  way a game does at runtime, so an E2E reaches the text-mutation trigger, not a tree rebuild. */
+  setUIValues(patch: Record<string, string | number | boolean>): void;
   /** What the SceneView's own hit-test says a click at these PAGE coordinates would select —
    *  the prediction `modoki_tap`'s entity aim reports as `occludedByEntity`. `undefined` means no
    *  picker is mounted, `null` means "nothing there". The invariant worth guarding is that this
@@ -189,6 +197,12 @@ export function installEditorTestBridge(): void {
       if (!input) return null;
       const { down, pressed, x, y } = input.pointer;
       return { down, pressed, x, y };
+    },
+    uiOverflowFindings() {
+      return getUIOverflowFindings();
+    },
+    setUIValues(patch) {
+      setUIValues(patch);
     },
   };
   (window as unknown as { __modokiEditorTest?: EditorTestBridge }).__modokiEditorTest = bridge;

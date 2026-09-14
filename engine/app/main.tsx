@@ -33,7 +33,7 @@ import './installConsoleRing'
 import './installDeviceConsoleCapture'
 import App from './App.tsx'
 import { Capacitor } from '@capacitor/core'
-import { setJournalEnabled, setDebugMenuEnabled, setDebugHandlesEnabled, setTierFrameCapEnabled, setTierCalibrationEnabled, setBootProbeAllowed, readPerfProfile, setProfilerEnabled } from '@modoki/engine/runtime'
+import { setJournalEnabled, setDebugMenuEnabled, setDebugHandlesEnabled, setUIOverflowCheckEnabled, setTierFrameCapEnabled, setTierCalibrationEnabled, setBootProbeAllowed, readPerfProfile, setProfilerEnabled } from '@modoki/engine/runtime'
 
 
 // Debug build — event-journal recording gate. ON in the editor (dev + the packaged
@@ -55,6 +55,12 @@ setDebugMenuEnabled(__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)
 // one `device_eval`; a release build with the flag off publishes nothing. Deliberately its own
 // switch rather than riding the journal's, so a game can drop journal cost without going blind.
 setDebugHandlesEnabled(__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)
+
+// UI text overflow warning (#1126) — same gate again. It reports through agent surfaces (journal,
+// `diagnose`, which fails `ok` on a finding), so it belongs wherever those surfaces are live: the
+// editor AND a debug device build, where real fonts and store-localized strings are. Not
+// `import.meta.env.DEV`, which is false in that device build. A release build installs no scan.
+setUIOverflowCheckEnabled(__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)
 
 // The boot ramp probe — refused in a PLAYABLE AD and nowhere else (#221 W2 item 5). It is the
 // only build where a launch-blocking measurement is unaffordable: an ad network measures

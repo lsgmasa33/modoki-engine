@@ -498,6 +498,12 @@ export { UIRenderer } from './ui/UIRenderer';
 // should use `UIAnchor.safeArea` and never touch this — it exists for a game that has to
 // compute WITH the inset (a reserved bottom band, a board fitted into what is left).
 export { getSafeAreaInsets, resetSafeAreaInsets, type SafeAreaInsets } from './ui/safeArea';
+// UI text overflow warning (#1126) — the gate the app shell turns on in editor/debug builds, and the
+// findings store `diagnose` reads. See the module header in `ui/uiOverflow.ts`.
+export {
+  setUIOverflowCheckEnabled, isUIOverflowCheckEnabled, getUIOverflowFindings, recordUIOverflow, refreshUIOverflowCurrent, resetUIOverflowFindings,
+  type UIOverflowFinding, type UIOverflowKind,
+} from './ui/uiOverflow';
 // Whether a native TOUCH gesture is live anywhere in the DOM, independent of the canvas-scoped
 // `Input` resource (which deliberately excludes a press starting on DOM chrome). Touch only —
 // see the module's own header for why mouse/pointer tracking was tried and dropped. For deferring

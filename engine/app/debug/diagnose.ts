@@ -13,7 +13,7 @@ import {
   getDeviceCaps, getDeviceCapsSync, readPerfProfile, getActiveQualityTier, getAutoLightCapStats,
   getShadowCasterCapStats,
   getAssessedQualityTier, getEffectiveTargetFps, getRenderSettings, configCount,
-  getFrameLoopHealth, getCurrentFPS,
+  getFrameLoopHealth, getCurrentFPS, getUIOverflowFindings, isUIOverflowCheckEnabled,
 } from '@modoki/engine/runtime';
 import { getActiveTextureSizeCap } from '@modoki/engine/runtime';
 import { computeLayoutBounds } from './layoutDump';
@@ -139,7 +139,36 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
   // 0 (hidden, or a pop-in animation at t=0), so it does NOT fail `ok`; but it must still be
   // SURFACED so `ok:true` never sits next to a populated `transforms.zeroScale` claiming "No
   // issues detected" (the contradiction the audit flagged). off-screen stays soft + unlisted. (C7 re-audit.)
-  const ok = refIssues.length === 0 && nan.length === 0 && !cameraMissing && consoleErrors.length === 0 && !frameLoopDown;
+  // ── UI text overflow (#1126) ──
+  // Recorded by the runtime UI scan (`runtime/ui/uiOverflowScan.ts`) once per element per world,
+  // and read from its store rather than the journal, which is a ring and evicts. A CURRENT finding
+  // is a HARD problem (owner, 2026-09-14): text visibly painting outside its box must not sit under
+  // `ok: true`; the accepted cost is a not-ok report for a game carrying a known overflow until it
+  // is fixed. One the latest scan did not see overflow (`current: false` — fixed, or no longer rendered)
+  // is SOFT — listed and noted in the summary, not failing `ok`, so a fix made in the running editor
+  // reads as fixed without a reload.
+  // `enabled` is reported beside the count so `count: 0` from a build that never scans (release)
+  // cannot be read as "checked, and clean".
+  const nameById = new Map(entities.map((e) => [e.id, e.name] as const));
+  const overflowFindings = getUIOverflowFindings();
+  const currentOverflows = overflowFindings.filter((f) => f.current).length;
+  const pastOverflowNote = overflowFindings.length > currentOverflows
+    ? `${overflowFindings.length - currentOverflows} earlier UI text overflow(s) not overflowing now — see uiOverflow`
+    : '';
+  const uiOverflow = {
+    enabled: isUIOverflowCheckEnabled(),
+    count: overflowFindings.length,
+    current: currentOverflows,
+    // Current ones first, so the cap never hides the findings that are failing `ok`.
+    findings: [...overflowFindings].sort((x, y) => Number(y.current) - Number(x.current)).slice(0, 20).map((f) => ({
+      ...f,
+      name: nameById.get(f.entityId) ?? '',
+      ...(f.kind === 'spill' ? { boxName: f.boxEntityId === 0 ? '(UI root)' : nameById.get(f.boxEntityId) ?? '' } : {}),
+    })),
+  };
+
+  const ok = refIssues.length === 0 && nan.length === 0 && !cameraMissing && consoleErrors.length === 0 && !frameLoopDown
+    && currentOverflows === 0;
   const zeroScaleNote = zeroScale.length ? `${zeroScale.length} zero-scale (invisible) entit(ies)` : '';
   // Older errors do NOT fail `ok` — that is what pinned the verdict forever and is why the window
   // exists. They do get SAID, in every branch, because a summary reading "No issues detected."
@@ -235,13 +264,14 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
     transforms: { nan, zeroScale },
     camera: { count: cameraCount, ok: !cameraMissing, needed: has3DContent },
     offScreen: { ids: offScreen, count: offScreen.length },
+    uiOverflow,
     consoleErrors,
     // Named so `consoleErrors: []` cannot be read as an absolute — it always means "none in the
     // last errorWindowMs", and now says so. Omitted (with olderErrors) when no window was applied.
     ...(windowing ? { errorWindowMs: opts.errorWindowMs, olderErrors } : {}),
     summary: ok
       ? (() => {
-          const notes = [zeroScaleNote, olderNote].filter(Boolean).join('; ');
+          const notes = [zeroScaleNote, pastOverflowNote, olderNote].filter(Boolean).join('; ');
           return notes ? `No blocking issues. Note: ${notes}.` : 'No issues detected.';
         })()
       : [
@@ -252,6 +282,8 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
           nan.length && `${nan.length} NaN transform field(s)`,
           zeroScaleNote,
           cameraMissing && 'no Camera entity (3D renders black)',
+          currentOverflows && `${currentOverflows} UI text overflow(s) — see uiOverflow`,
+          pastOverflowNote,
           consoleErrors.length && (windowing
             ? `${consoleErrors.length} console error(s) in the last ${Math.round(opts.errorWindowMs! / 1000)}s`
             : `${consoleErrors.length} recent console error(s)`),

@@ -2,10 +2,11 @@
  *  Exercises the real computeDiagnostics path: ref integrity, NaN transforms, and
  *  missing-camera detection over a headless createTestWorld. */
 
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
   createTestWorld, type TestWorld, Transform, EntityAttributes, Renderable3D, Camera,
   setActiveQualityTier, setRenderSettings, resetRenderSettings,
+  recordUIOverflow, refreshUIOverflowCurrent, resetUIOverflowFindings, setUIOverflowCheckEnabled, type UIOverflowFinding,
 } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { computeDiagnostics } from '../../app/debug/diagnose';
@@ -183,5 +184,63 @@ describe('computeDiagnostics: quality tier fields (R6.3)', () => {
     // The EFFECTIVE cap (authored 60, clamped by the authored `low.targetFps: 30`), never the
     // raw authored value — that is the exact distinction R6.2/R6.3 exist to stop hiding.
     expect(d.qualityTier.targetFps).toBe(30);
+  });
+});
+
+// #1126 — the UI text overflow warning's findings store. A finding is a HARD problem (owner,
+// 2026-09-14): it fails `ok`, and the summary says so.
+describe('computeDiagnostics: UI text overflow (#1126)', () => {
+  afterEach(() => { resetUIOverflowFindings(); setUIOverflowCheckEnabled(false); vi.restoreAllMocks(); });
+
+  const finding = (entityId: number, over: Partial<UIOverflowFinding> = {}): Omit<UIOverflowFinding, 'current'> => ({
+    kind: 'spill', boxEntityId: entityId, overflowPx: 6.6, availablePx: 254, textPx: 267.2, clipped: false,
+    entityId, guid: '', text: 'Hard', viewport: { w: 375, h: 667 }, ...over,
+  });
+
+  it('a clean store reports enabled + count 0 and leaves ok alone', () => {
+    game = createTestWorld({});
+    setUIOverflowCheckEnabled(true);
+    const d = computeDiagnostics();
+    expect(d.uiOverflow).toEqual({ enabled: true, count: 0, current: 0, findings: [] });
+    expect(d.ok).toBe(true);
+  });
+
+  it('reports enabled:false from a build that never scans, so count 0 is not read as "checked"', () => {
+    game = createTestWorld({});
+    expect(computeDiagnostics().uiOverflow.enabled).toBe(false);
+  });
+
+  it('a recorded finding fails ok, is named in the summary, and resolves both entity names', () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    game = createTestWorld({});
+    const label = game.spawn(EntityAttributes({ name: 'LevelTab_Hard' }));
+    const row = game.spawn(EntityAttributes({ name: 'LevelTabs' }));
+    recordUIOverflow('k', finding(label.id(), { boxEntityId: row.id() }));
+
+    const d = computeDiagnostics();
+    expect(d.ok).toBe(false);
+    expect(d.summary).toContain('1 UI text overflow(s)');
+    expect(d.uiOverflow.count).toBe(1);
+    expect(d.uiOverflow.findings[0]).toMatchObject({ name: 'LevelTab_Hard', boxName: 'LevelTabs', kind: 'spill', overflowPx: 6.6, current: true });
+  });
+
+  it('a placed element wider than the whole UI names the UI root as its box', () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    game = createTestWorld({});
+    recordUIOverflow('k', finding(1, { boxEntityId: 0 }));
+    expect(computeDiagnostics().uiOverflow.findings[0]).toMatchObject({ boxName: '(UI root)' });
+  });
+
+  it('a finding the latest scan did not see overflow is listed and noted, but no longer fails ok', () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    game = createTestWorld({});
+    recordUIOverflow('k', finding(1));
+    refreshUIOverflowCurrent(new Set());                   // the latest scan did not see it overflow
+
+    const d = computeDiagnostics();
+    expect(d.ok).toBe(true);
+    expect(d.uiOverflow).toMatchObject({ count: 1, current: 0 });
+    expect(d.summary).toMatch(/1 earlier UI text overflow\(s\) not overflowing now/);
+    expect(d.summary).not.toMatch(/No issues detected/);
   });
 });

@@ -914,7 +914,8 @@ export function registerTools(server: McpServer) {
 
   tool('device_diagnose',
     'Structured render/scene health on the connected device — the CAUSES behind a black or wrong ' +
-      'frame, as data (recent console errors, off-screen entities, missing renderers, …). Use this ' +
+      'frame, as data (recent console errors, off-screen entities, missing renderers, UI text that ' +
+      'paints outside its box in `uiOverflow` — debug builds only, and a `current` one fails `ok`, …). Use this ' +
       'instead of a screenshot on Android, where the native screenshot is black on WebGPU. ' +
       '`consoleErrors` covers only the last `errorWindowMs` (the window that gates `ok`); anything ' +
       'older is counted in `olderErrors` — BOOT errors live there, since nobody connects a device ' +

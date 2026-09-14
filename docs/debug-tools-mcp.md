@@ -1738,7 +1738,8 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
 - **Semantic (game logic):** `modoki_journal` reads the tick-stamped event trace — game `emit`s
   (`match`/`score`/`win`) PLUS engine `@`-lifecycle events (`@spawn`/`@despawn`, `@anim-start`/
   `@anim-loop`/`@anim-finish`, `@contact`/`@sensor`, `@scene-loaded`/`@scene-swapped`, `@tier`
-  — a quality-tier change carrying `prev`/`source`/`reason`), GUID-addressed.
+  — a quality-tier change carrying `prev`/`source`/`reason`, and `@ui.overflow` at level `warn` — a
+  UI element's text painting outside its box, [ui-system.md § Text overflow warning](ui-system.md#text-overflow-warning)), GUID-addressed.
   `modoki_dispatch_action` fires a game intent by name (needs Play); `modoki_list_actions` discovers
   dispatchable actions + read-values. Assert on events, not screenshots. Returns the **last 100 events
   + `byType` counts over the whole 10,000-event ring** (a `@contact`-heavy physics session is ~582k
@@ -1849,7 +1850,16 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   (Providers register in `Scene3D`/`Scene2D`; UI via `[data-entity-id]` DOM. New:
   `runtime/core/screenBounds.ts`, `app/debug/layoutDump.ts`.)
 - **Diagnose:** `modoki_diagnose` → structured causes (bad refs, NaN/zero-scale transforms, no camera,
-  off-screen, console errors) — run FIRST when something renders wrong. (`app/debug/diagnose.ts`.)
+  off-screen, console errors, UI text overflow) — run FIRST when something renders wrong. (`app/debug/diagnose.ts`.)
+
+  **`uiOverflow {enabled, count, current, findings}`** lists the UI elements whose text painted outside
+  a box that holds it (#1126). Each finding carries `name`, `kind` (`spill`/`own-box`), `boxName`,
+  `overflowPx`/`availablePx` in CSS px, `clipped`, `text` and `viewport`. `boxName` is `'(UI root)'` for a
+  placed (anchored) element wider than the whole UI. **A `current` finding fails `ok`.** One the latest
+  scan did not see overflow (fixed, or no longer rendered) stays listed, is noted in the summary, and
+  does not fail `ok`. `enabled` is there so `count: 0` from a release build, which never scans, is not read as
+  "checked, and clean". Mechanism, exclusions and limits:
+  [ui-system.md § Text overflow warning](ui-system.md#text-overflow-warning).
   **`consoleErrors` is windowed, and the window is a VERDICT window, not a reporting one (#152).**
   Only errors inside `errorWindowMs` (5 min) gate `ok` — otherwise one benign load-time error sits
   in the shared console ring (1000 entries in the editor, 512 on a debug device build) and pins

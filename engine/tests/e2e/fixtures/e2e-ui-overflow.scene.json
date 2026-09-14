@@ -1,0 +1,744 @@
+{
+  "id": "e2e-ui-overflow-scene-0000-000000000000",
+  "version": 9,
+  "createdAt": "2026-01-01T00:00:00.000Z",
+  "resources": [],
+  "entities": [
+    {
+      "id": 1,
+      "name": "OverflowPanel",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "width": 360,
+          "widthUnit": "px",
+          "gap": 8,
+          "gapUnit": "px",
+          "paddingTop": 8,
+          "paddingTopUnit": "px",
+          "backgroundOpacity": 0.4,
+          "backgroundColor": 2500134
+        },
+        "EntityAttributes": {
+          "name": "OverflowPanel",
+          "guid": "e2e11260-0000-4000-8000-000000000001",
+          "isActive": true,
+          "sortOrder": 0,
+          "parentId": 0,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 2,
+      "name": "SpillRow",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "width": 200,
+          "widthUnit": "px",
+          "height": 36,
+          "heightUnit": "px",
+          "flexDirection": "row",
+          "justifyContent": "center",
+          "alignSelf": "center",
+          "backgroundOpacity": 0.6,
+          "backgroundColor": 3447003
+        },
+        "EntityAttributes": {
+          "name": "SpillRow",
+          "guid": "e2e11260-0000-4000-8000-000000000002",
+          "isActive": true,
+          "sortOrder": 1,
+          "parentId": 1,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "name": "SpillLabel",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "text": "Supercalifragilisticexpialidocious",
+          "fontSize": 20,
+          "fontSizeUnit": "px"
+        },
+        "EntityAttributes": {
+          "name": "SpillLabel",
+          "guid": "e2e11260-0000-4000-8000-000000000003",
+          "isActive": true,
+          "sortOrder": 2,
+          "parentId": 2,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "name": "OwnBoxValue",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "width": 60,
+          "widthUnit": "px",
+          "alignSelf": "center",
+          "text": "Vibration",
+          "fontSize": 18,
+          "fontSizeUnit": "px",
+          "backgroundOpacity": 0.6,
+          "backgroundColor": 3447003
+        },
+        "EntityAttributes": {
+          "name": "OwnBoxValue",
+          "guid": "e2e11260-0000-4000-8000-000000000004",
+          "isActive": true,
+          "sortOrder": 3,
+          "parentId": 1,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "name": "ClipBox",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "width": 80,
+          "widthUnit": "px",
+          "alignSelf": "center",
+          "overflow": "hidden",
+          "text": "Unbreakablelongword",
+          "fontSize": 18,
+          "fontSizeUnit": "px"
+        },
+        "EntityAttributes": {
+          "name": "ClipBox",
+          "guid": "e2e11260-0000-4000-8000-000000000005",
+          "isActive": true,
+          "sortOrder": 4,
+          "parentId": 1,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "name": "CoinRow",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "width": 120,
+          "widthUnit": "px",
+          "height": 32,
+          "heightUnit": "px",
+          "flexDirection": "row",
+          "justifyContent": "center",
+          "alignSelf": "center"
+        },
+        "EntityAttributes": {
+          "name": "CoinRow",
+          "guid": "e2e11260-0000-4000-8000-000000000006",
+          "isActive": true,
+          "sortOrder": 5,
+          "parentId": 1,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "name": "CoinCount",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "text": "{e2eCoins}",
+          "fontSize": 20,
+          "fontSizeUnit": "px"
+        },
+        "EntityAttributes": {
+          "name": "CoinCount",
+          "guid": "e2e11260-0000-4000-8000-000000000007",
+          "isActive": true,
+          "sortOrder": 6,
+          "parentId": 6,
+          "layer": "ui"
+        },
+        "UIBinding": {
+          "textBinding": "e2eCoins"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "name": "FitsRow",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "width": 200,
+          "widthUnit": "px",
+          "flexDirection": "row",
+          "justifyContent": "center",
+          "alignSelf": "center"
+        },
+        "EntityAttributes": {
+          "name": "FitsRow",
+          "guid": "e2e11260-0000-4000-8000-000000000008",
+          "isActive": true,
+          "sortOrder": 7,
+          "parentId": 1,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "name": "FitsLabel",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "text": "OK",
+          "fontSize": 20,
+          "fontSizeUnit": "px"
+        },
+        "EntityAttributes": {
+          "name": "FitsLabel",
+          "guid": "e2e11260-0000-4000-8000-000000000009",
+          "isActive": true,
+          "sortOrder": 8,
+          "parentId": 8,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "name": "ScrollStrip",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "width": 150,
+          "widthUnit": "px",
+          "height": 32,
+          "heightUnit": "px",
+          "flexDirection": "row",
+          "overflow": "scroll",
+          "alignSelf": "center"
+        },
+        "EntityAttributes": {
+          "name": "ScrollStrip",
+          "guid": "e2e11260-0000-4000-8000-000000000010",
+          "isActive": true,
+          "sortOrder": 9,
+          "parentId": 1,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "name": "ScrollLabel",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "text": "AVeryLongUnbreakableWordInsideAScrollView",
+          "fontSize": 20,
+          "fontSizeUnit": "px"
+        },
+        "EntityAttributes": {
+          "name": "ScrollLabel",
+          "guid": "e2e11260-0000-4000-8000-000000000011",
+          "isActive": true,
+          "sortOrder": 10,
+          "parentId": 10,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "name": "EllipsisBox",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "width": 80,
+          "widthUnit": "px",
+          "alignSelf": "center",
+          "textOverflow": "ellipsis",
+          "text": "Ellipsized long label here",
+          "fontSize": 18,
+          "fontSizeUnit": "px"
+        },
+        "EntityAttributes": {
+          "name": "EllipsisBox",
+          "guid": "e2e11260-0000-4000-8000-000000000012",
+          "isActive": true,
+          "sortOrder": 11,
+          "parentId": 1,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "name": "AnchorSlot",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "width": 150,
+          "widthUnit": "px",
+          "height": 36,
+          "heightUnit": "px",
+          "alignSelf": "center",
+          "backgroundOpacity": 0.6,
+          "backgroundColor": 3447003
+        },
+        "EntityAttributes": {
+          "name": "AnchorSlot",
+          "guid": "e2e11260-0000-4000-8000-000000000013",
+          "isActive": true,
+          "sortOrder": 12,
+          "parentId": 1,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 14,
+      "name": "AnchorLabel",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "text": "Anchoredlabelsowidethatitcannotfitanyscreenwidthatallwhatsoever",
+          "fontSize": 64,
+          "fontSizeUnit": "px"
+        },
+        "EntityAttributes": {
+          "name": "AnchorLabel",
+          "guid": "e2e11260-0000-4000-8000-000000000014",
+          "isActive": true,
+          "sortOrder": 13,
+          "parentId": 13,
+          "layer": "ui"
+        },
+        "UIAnchor": {
+          "anchor": "center",
+          "pivotX": 0.5,
+          "pivotY": 0.5,
+          "safeArea": false
+        }
+      }
+    },
+    {
+      "id": 15,
+      "name": "BadgeHost",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "width": 100,
+          "widthUnit": "px",
+          "height": 36,
+          "heightUnit": "px",
+          "alignSelf": "center",
+          "backgroundOpacity": 0.6,
+          "backgroundColor": 3447003
+        },
+        "EntityAttributes": {
+          "name": "BadgeHost",
+          "guid": "e2e11260-0000-4000-8000-000000000015",
+          "isActive": true,
+          "sortOrder": 14,
+          "parentId": 1,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 16,
+      "name": "Badge",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "text": "9",
+          "fontSize": 16,
+          "fontSizeUnit": "px",
+          "backgroundOpacity": 1,
+          "backgroundColor": 13369344
+        },
+        "EntityAttributes": {
+          "name": "Badge",
+          "guid": "e2e11260-0000-4000-8000-000000000016",
+          "isActive": true,
+          "sortOrder": 15,
+          "parentId": 15,
+          "layer": "ui"
+        },
+        "UIAnchor": {
+          "anchor": "top-right",
+          "right": -10,
+          "top": -10,
+          "safeArea": false
+        }
+      }
+    },
+    {
+      "id": 17,
+      "name": "CaptionIcon",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "width": 40,
+          "widthUnit": "px",
+          "height": 40,
+          "heightUnit": "px",
+          "alignSelf": "center",
+          "backgroundOpacity": 1,
+          "backgroundColor": 3447003
+        },
+        "EntityAttributes": {
+          "name": "CaptionIcon",
+          "guid": "e2e11260-0000-4000-8000-000000000017",
+          "isActive": true,
+          "sortOrder": 16,
+          "parentId": 1,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 18,
+      "name": "Caption",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "text": "Settings",
+          "fontSize": 16,
+          "fontSizeUnit": "px"
+        },
+        "EntityAttributes": {
+          "name": "Caption",
+          "guid": "e2e11260-0000-4000-8000-000000000018",
+          "isActive": true,
+          "sortOrder": 17,
+          "parentId": 17,
+          "layer": "ui"
+        },
+        "UIAnchor": {
+          "anchor": "bottom",
+          "pivotX": 0.5,
+          "pivotY": 0,
+          "safeArea": false
+        }
+      }
+    },
+    {
+      "id": 19,
+      "name": "EllipsisRow",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "width": 200,
+          "widthUnit": "px",
+          "height": 32,
+          "heightUnit": "px",
+          "flexDirection": "row",
+          "justifyContent": "center",
+          "alignSelf": "center"
+        },
+        "EntityAttributes": {
+          "name": "EllipsisRow",
+          "guid": "e2e11260-0000-4000-8000-000000000019",
+          "isActive": true,
+          "sortOrder": 18,
+          "parentId": 1,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 20,
+      "name": "EllipsisSpill",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "width": 260,
+          "widthUnit": "px",
+          "flexShrink": 0,
+          "textOverflow": "ellipsis",
+          "text": "An ellipsized label in a box wider than its row",
+          "fontSize": 18,
+          "fontSizeUnit": "px"
+        },
+        "EntityAttributes": {
+          "name": "EllipsisSpill",
+          "guid": "e2e11260-0000-4000-8000-000000000020",
+          "isActive": true,
+          "sortOrder": 19,
+          "parentId": 19,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 21,
+      "name": "JitterBox",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "width": 200,
+          "widthUnit": "px",
+          "alignSelf": "center",
+          "flexDirection": "row",
+          "justifyContent": "center"
+        },
+        "EntityAttributes": {
+          "name": "JitterBox",
+          "guid": "e2e11260-0000-4000-8000-000000000021",
+          "isActive": true,
+          "sortOrder": 20,
+          "parentId": 1,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 22,
+      "name": "JitterLabel",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "text": "Jitter",
+          "fontSize": 54,
+          "fontSizeUnit": "px",
+          "fontWeight": "bold"
+        },
+        "EntityAttributes": {
+          "name": "JitterLabel",
+          "guid": "e2e11260-0000-4000-8000-000000000022",
+          "isActive": true,
+          "sortOrder": 21,
+          "parentId": 21,
+          "layer": "ui"
+        },
+        "TextAnimation": {
+          "effect": "jitter",
+          "speed": 1.4,
+          "amplitude": 0.06,
+          "frequency": 0
+        }
+      }
+    },
+    {
+      "id": 23,
+      "name": "PaddedEllipsisRow",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "width": 200,
+          "widthUnit": "px",
+          "height": 32,
+          "heightUnit": "px",
+          "flexDirection": "row",
+          "justifyContent": "center",
+          "alignSelf": "center"
+        },
+        "EntityAttributes": {
+          "name": "PaddedEllipsisRow",
+          "guid": "e2e11260-0000-4000-8000-000000000023",
+          "isActive": true,
+          "sortOrder": 22,
+          "parentId": 1,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 24,
+      "name": "PaddedEllipsis",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "width": 240,
+          "widthUnit": "px",
+          "flexShrink": 0,
+          "paddingLeft": 20,
+          "paddingLeftUnit": "px",
+          "paddingRight": 20,
+          "paddingRightUnit": "px",
+          "textOverflow": "ellipsis",
+          "text": "A padded ellipsized label whose clip is flush with the row",
+          "fontSize": 18,
+          "fontSizeUnit": "px"
+        },
+        "EntityAttributes": {
+          "name": "PaddedEllipsis",
+          "guid": "e2e11260-0000-4000-8000-000000000024",
+          "isActive": true,
+          "sortOrder": 23,
+          "parentId": 23,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 25,
+      "name": "ScrollAnchorStrip",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "width": 150,
+          "widthUnit": "px",
+          "height": 80,
+          "heightUnit": "px",
+          "overflow": "scroll",
+          "alignSelf": "center"
+        },
+        "EntityAttributes": {
+          "name": "ScrollAnchorStrip",
+          "guid": "e2e11260-0000-4000-8000-000000000025",
+          "isActive": true,
+          "sortOrder": 24,
+          "parentId": 1,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 26,
+      "name": "ScrollAnchorLabel",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "text": "Anchoredcreditsinsideascrollviewwiderthananyscreenwhatsoeverforsure",
+          "fontSize": 64,
+          "fontSizeUnit": "px"
+        },
+        "EntityAttributes": {
+          "name": "ScrollAnchorLabel",
+          "guid": "e2e11260-0000-4000-8000-000000000026",
+          "isActive": true,
+          "sortOrder": 25,
+          "parentId": 25,
+          "layer": "ui"
+        },
+        "UIAnchor": {
+          "anchor": "center",
+          "pivotX": 0.5,
+          "pivotY": 0.5,
+          "safeArea": false
+        }
+      }
+    },
+    {
+      "id": 27,
+      "name": "JitterScaledBox",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "width": 300,
+          "widthUnit": "px",
+          "alignSelf": "center",
+          "flexDirection": "row",
+          "justifyContent": "center",
+          "height": 90,
+          "heightUnit": "px",
+          "alignItems": "center"
+        },
+        "EntityAttributes": {
+          "name": "JitterScaledBox",
+          "guid": "e2e11260-0000-4000-8000-000000000027",
+          "isActive": true,
+          "sortOrder": 26,
+          "parentId": 1,
+          "layer": "ui"
+        }
+      }
+    },
+    {
+      "id": 28,
+      "name": "JitterScaled",
+      "traits": {
+        "RenderableUI": true,
+        "UIElement": {
+          "isVisible": true,
+          "textColor": 16777215,
+          "text": "Jitter",
+          "fontSize": 54,
+          "fontSizeUnit": "px",
+          "fontWeight": "bold",
+          "scale": 1.5
+        },
+        "EntityAttributes": {
+          "name": "JitterScaled",
+          "guid": "e2e11260-0000-4000-8000-000000000028",
+          "isActive": true,
+          "sortOrder": 27,
+          "parentId": 27,
+          "layer": "ui"
+        },
+        "TextAnimation": {
+          "effect": "jitter",
+          "speed": 1.4,
+          "amplitude": 0.06,
+          "frequency": 0
+        }
+      }
+    }
+  ]
+}

@@ -2057,6 +2057,130 @@ longer has a `zIndex` field at all. A migration carries a truthy old `UIAnchor.z
 
 ---
 
+## Text overflow warning
+
+**In the editor and in a debug build, the runtime UI reports any element whose text paints outside
+a box that holds it** (#1126). A finding is recorded once per element per world. It shows up in
+three places:
+- a `[UIOverflow]` `console.warn`;
+- a `@ui.overflow` journal event at level `warn`;
+- `diagnose`'s `uiOverflow` block. A **current** finding fails `ok` there (owner, 2026-09-14).
+
+Decisions: `runtime/ui/uiOverflow.ts`. DOM measurement and scheduling: `runtime/ui/uiOverflowScan.ts`.
+
+**Why the layout lets it happen.** `cssVal` never emits `min-width: 0`, so every flex item keeps
+CSS's automatic minimum width, and shrinking stops at **min-content**. A single long word cannot
+wrap, so it overflows. `flexShrink` does not help. The two shapes the scan reports:
+
+| `kind` | what it looks like | measured against |
+|---|---|---|
+| `spill` | a content-sized child grows to its longest word and runs past its row (centred rows overflow on both sides) | the first enclosing UI element's padding box the text escapes (`boxEntityId`) |
+| `own-box` | a child with a definite `width` keeps it, and its text runs past that box | the element's own padding box |
+
+**Why a runtime check rather than a static budget.** The owner chose this shape on 2026-09-13.
+Where the string comes from does not matter to it:
+- an owner-authored config label;
+- a store-localized price;
+- a runtime number with no maximum.
+
+Only the first can be checked at test time, which is what #1119's
+`games/wordweave/tests/authoredLabelBudget.test.ts` does, and that gate stays. The limit is the
+other side of the same fact: **it fires only when the long string is actually rendered.**
+
+**What it deliberately does not report.** The walk compares the text's horizontal extent against
+each box, inside out, and stops early for these:
+- **Anything inside a horizontal scroll container** (`overflow: 'scroll'`). Its content extends
+  past it by design.
+- **Anything past an enclosing `overflow: 'hidden'` box.** That is also how a pager is built
+  (#743), and its off-page cards sit outside it legitimately.
+- **An authored `textOverflow: 'ellipsis'` running past the element's own box.** The author asked
+  for truncation.
+  - The ellipsis does **not** end the walk: what is still painted is the part inside the element's
+    box, and that part is compared with the boxes further out.
+  - So a 260px ellipsis box in a 200px row is still a `spill`. An ellipsis is the natural fix for an
+    overflow, and the first version let it hide one (close-out review).
+- **Anything past a scaled or rotated box.** It is compared itself, then the walk stops, because
+  its size on screen is not its layout size (a pop tween).
+  - The accepted miss: a row child with an authored `scale` that runs past its row.
+- **Where a PLACED element sits.** A placed element is `position: absolute`, or moved by a pure
+  translation, which covers every `UIAnchor` element.
+  - Past its own box, its painted **width** is compared with the **UI root's** width
+    (`boxEntityId: 0`, `boxName: '(UI root)'`, `overflowPx` = the excess width). Then the walk stops.
+  - Its host's width is not used: a corner badge overhanging its host and a caption under a 40px icon
+    are both authored on purpose, and comparing against the host flagged the caption (close-out review).
+  - A scroll view or `hidden` box further out still exempts it: anchored credits inside a scroll view,
+    a translated ticker inside a mask.
+  - Found by the live check: wordweave's anchored `AdBannerLabel`, given a long string at 360 wide,
+    painted 417px into a 358px-wide UI, and the first walk stopped at the anchor and said nothing.
+  - The accepted miss: a placed label wider than its host but narrower than the screen.
+- **Overshoot of 1px or less.** That is rounding between two laid-out boxes.
+
+**What counts as the text is its GLYPHS, not the boxes around them.** For each text node the scan
+measures every run of non-whitespace characters and takes the union of their line rects. Three
+things are left out, all measured by the close-out reviews in Chromium:
+- **A wrapper's box.** `AutoFitText`/`AnimatedText` spans are `display: block`, stretched to the host.
+- **Hanging whitespace.** In `pre-wrap` (those same spans), a space at the end of the string or at a
+  soft wrap hangs past the box. 9 of 60 wrapped sentences read as false 1.6-4.3px overflows before
+  only the runs were measured.
+- **A text animation's shake.** Pure translations on elements between a text node and its element
+  are subtracted, at that element's OWN scale (a scaled host shakes further on screen). So the glyphs
+  are measured where they are laid out, not where the animation holds them this frame. Before that,
+  `jitter` read as a 1-3px own-box overflow on 13 of 20 samples, and it flickered `current`.
+
+**The element's own clip is where its wrapper cuts.** UINode puts the ellipsis/clamp
+`overflow: hidden` on an inner wrapper, inside the host's padding, so the own box takes the wrapper's
+edges. A padded ellipsis box whose clip is flush with its row is not a spill.
+
+A per-character scale (a typewriter pop) is not subtracted. A glyph caught mid-pop can briefly read
+wider, which is part of what the confirmation pass is for.
+
+**Truncation is reported.** Text cut off by the element's own clip (`overflow: 'hidden'`, a
+`maxLines` clamp, an auto-fit floor) is a finding with `clipped: true`. Per #1125's ruling, a cut-off
+price is worse than a small one.
+
+**`current`** means overflowing in the **latest** scan. A later pass that does not see it overflow
+flips it to `false`: the author widened the box, the count went back down, or the element is no
+longer rendered (a closed screen paints nothing). `diagnose` then lists it without failing `ok`. So
+a fix made in the running editor reads as fixed without a reload, and a toast that overflowed once
+does not pin `ok: false` for the rest of the world.
+
+**When it runs.** It is one pass over the GameView's runtime UI root. It never runs in SceneView's
+preview, which is a second mount of the same tree at a simulated size. A pass is coalesced to one
+per 200ms and is triggered by:
+- a DOM child or text change (a bound `{coins}` changes only a text node);
+- a UI tree rebuild;
+- the root resizing;
+- a web font finishing loading.
+
+A finding needs a **second pass** that still sees it before it is recorded, so a label measured
+before `AutoFitText` converges is not a false alarm.
+
+⚠️ **Style-attribute changes are NOT observed.** A tween writes style every frame, and observing it
+would make the scan continuous on the debug device builds perf is measured on. A binding that moves
+only a style, with no tree rebuild and no text change, is seen on the next pass something else
+triggers. For the same reason, a CSS animation never triggers a pass on its own.
+
+⚠️ **Text that changes every frame costs a pass every 200ms**, for example a timer or an FPS readout.
+Within a pass, computed boxes and translations are cached per element. The cost on a low-end debug
+device (Galaxy A23) has **not been measured**; measure it before trusting a profile taken with the
+check on.
+
+**Coordinates are CSS px of the UI.** Rects are screen px and transform-aware, so every edge is
+divided by the root's own screen/layout ratio. Without that, the editor's scaled preview would
+report an authored 120px row as 60px. The e2e spec measures under a `scale(0.5)` for exactly this.
+
+**Gate.** `setUIOverflowCheckEnabled` is called by `engine/app/main.tsx` with
+`__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__`, the journal's pair. It is not `import.meta.env.DEV`,
+which is false in a debug *device* build, and real fonts and store strings live there. A release
+build installs no scan.
+
+**Tests.**
+- `engine/packages/modoki/tests/runtime/uiOverflow.test.ts`: the decisions, the confirmation pass,
+  the store, and the scan wiring with the DOM measurement stubbed.
+- `uiRenderer.test.tsx`: where the scan is installed.
+- `engine/tests/framework/diagnose.test.ts`: the verdict.
+- `engine/tests/e2e/game-view-ui-overflow.spec.ts`: the real measurement (jsdom has no layout).
+
 ## Projection & the dirty flag (no per-frame work)
 
 The UI tree is **not** rebuilt every frame. `useUIEntities()` is a thin Zustand
