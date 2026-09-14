@@ -689,8 +689,11 @@ public class ModokiIapPlugin extends Plugin {
 
     @PluginMethod
     public void unfinished(PluginCall call) {
-        // queryPurchasesAsync returns only purchases NOT yet consumed/acknowledged — which is
-        // exactly "unfinished", and is answered from Google's record rather than anything local.
+        // queryPurchasesAsync returns every purchase NOT yet CONSUMED, answered from Google's record
+        // rather than anything local. ⚠️ That is wider than "unfinished" (#1183): an ACKNOWLEDGED
+        // non-consumable or active subscription is never consumed, so it comes back on every launch,
+        // where iOS never re-delivers a finished transaction. A game's grant hook for one re-runs
+        // every launch — see docs/iap.md § 2.
         queryAll(call, false);
     }
 

@@ -111,6 +111,15 @@ direction:
   on every launch instead of remembering. Survives reinstall and a new device for free, and no local
   corruption can lose it. **Expiry, refunds and revocation are applied by the platform** — which is
   what makes serverless verification correct rather than merely cheap.
+  ⚠️ **On Android a finished non-consumable or subscription is ALSO re-delivered to the grant hook,
+  every launch** (#1183). `unfinished()` is `queryPurchasesAsync` (INAPP and SUBS), which returns every
+  non-CONSUMED purchase, and neither kind is ever consumed; the engine runs the hook even for an
+  already-granted transaction. iOS never re-delivers a finished transaction. Harmless for a pure
+  unlock. A purchase that also pays game state (wordweave's bundle pays
+  coins) must keep its idempotency marker forever, and a data-losing reinstall pays it again on
+  Android only. Kept as is (owner, 2026-09-14): dropping acknowledged non-consumables from
+  `unfinished()` would lose the grant of one acknowledged before a crash, and the early acknowledge
+  exists for Play's 3-day refund clock.
 - **`consumable` → WE own it.** The store forgets a consumable the moment it is consumed, so the
   grant exists only in our ledger. This is the only kind for which durability is our problem, and
   therefore **the only kind the ledger is load-bearing for**.
