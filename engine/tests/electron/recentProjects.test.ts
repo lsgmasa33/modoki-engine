@@ -6,7 +6,6 @@
  *  the shared file. `electron` is mocked; fs is real, rooted at a temp dir. */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 
 // app.getPath('appData') → <tmp>/appData ; app.getPath('userData') → <tmp>/userData.
@@ -27,6 +26,7 @@ vi.mock('electron', () => ({
 vi.mock('../../electron/splash', () => ({ isSplashWindow: () => false }));
 
 import { getRecentProjects, addRecentProject, migrateLegacyRecents, setRecentsScope, chooseInitialProject, isUnderRepo, projectFolderKind, pickProjectFolder, pickNewProjectFolder } from '../../electron/projects';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const sharedFile = () => path.join(root.dir, 'appData', 'modoki-app', 'recent-projects.json');
 // The legacy DEV recents location is the literal appData/"Electron" dir — dev's userData
@@ -45,7 +45,7 @@ function mkProj(name: string): string {
 }
 
 beforeEach(() => {
-  root.dir = fs.mkdtempSync(path.join(os.tmpdir(), `modoki-recents-${counter++}-`));
+  root.dir = makeScratchDir(`modoki-recents-${counter++}-`);
   setRecentsScope(''); // reset to the unscoped (global) default; scoped tests opt in
 });
 
@@ -273,7 +273,7 @@ describe('chooseInitialProject — two-clone auto-open guard', () => {
 });
 
 describe('projectFolderKind — first-run open-vs-scaffold decision', () => {
-  const mk = () => fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-pfk-'));
+  const mk = () => makeScratchDir('modoki-pfk-');
   const dirs: string[] = [];
   const fresh = () => { const d = mk(); dirs.push(d); return d; };
   afterEach(() => { for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true }); });

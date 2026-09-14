@@ -4,11 +4,11 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 import { computeKeptAssets } from '../../plugins/asset-tree-shaker';
 import type { AssetRoot } from '../../plugins/vite-asset-scanner';
 import { deriveGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const TEX_GUID = '11111111-1111-4111-8111-111111111111';
 const SLICE_GUID = '22222222-2222-4222-8222-222222222222';
@@ -60,7 +60,7 @@ function scene2DSprite(ref: string) {
   }));
 }
 
-beforeEach(() => { projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'atlas-shaker-')); roots = createRoots(projectRoot); });
+beforeEach(() => { projectRoot = makeScratchDir('atlas-shaker-'); roots = createRoots(projectRoot); });
 afterEach(() => { fs.rmSync(projectRoot, { recursive: true, force: true }); });
 
 describe('asset-tree-shaker — atlas', () => {

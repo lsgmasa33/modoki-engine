@@ -22,9 +22,9 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import * as os from 'node:os';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { hasPrivateDocs } from '../helpers/repoLayout';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const repoRoot = path.resolve(__dirname, '../../..');
 const TEMPLATE = 'engine/templates/starter/CLAUDE.md';
@@ -236,7 +236,7 @@ describe('project CLAUDE.md cites asset filenames that exist (#195)', () => {
     // seen by every concurrent corpus scan and by a live editor watching the project roots.
     // Tracked-ness is injected (the real one reads the repo's corpus), so both sides are driven
     // through the same check-ignore call and source filter production uses.
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'projectdocs-ignore-'));
+    const dir = makeScratchDir('projectdocs-ignore-');
     try {
       spawnSync('git', ['init', '-q'], { cwd: dir, encoding: 'utf8' });
       fs.mkdirSync(path.join(dir, 'games', 'p'), { recursive: true });

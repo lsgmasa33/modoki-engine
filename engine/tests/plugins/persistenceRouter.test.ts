@@ -14,6 +14,7 @@ import path from 'path';
 import {
   handleBackendRequest, type BackendContext, type Manifest, getPersistenceMode,
 } from '../../plugins/backend/editorBackendRouter';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /** A PRIVATE temp dir per run, removed afterwards.
  *
@@ -29,7 +30,7 @@ import {
  *  `mkdtempSync` makes the name unique BY CONSTRUCTION rather than by hoping pid+seq is, and the
  *  teardown means a name can never be seen twice. Note the audit's own lesson: a test whose fixture
  *  outlives the run is a test that can be poisoned by its own history. */
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-persistence-'));
+const TMP = makeScratchDir('modoki-persistence-');
 afterAll(() => { fs.rmSync(TMP, { recursive: true, force: true }); });
 
 function makeCtx(over: Partial<BackendContext> = {}): BackendContext {

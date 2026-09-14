@@ -4,7 +4,6 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
@@ -40,11 +39,12 @@ import {
 } from '../../project-config';
 import { ENGINE_API_VERSION } from '../../packages/modoki/src/runtime/core/version';
 import { getRenderSettings, resetRenderSettings } from '../../packages/modoki/src/runtime/rendering/renderSettings';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 let root: string;
 
 beforeEach(() => {
-  root = fs.mkdtempSync(path.join(os.tmpdir(), 'projcfg-'));
+  root = makeScratchDir('projcfg-');
 });
 
 afterEach(() => {

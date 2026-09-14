@@ -20,6 +20,7 @@ import {
 } from '../../scripts/deviceClaimsStore.mjs';
 import type { DeviceClaim } from '../../scripts/deviceClaimsStore.d.mts';
 import { makeDirLink } from '../helpers/linkFixture';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 // (#865) Seeds must be FULLY QUALIFIED **for this platform**, so `path.resolve`, never a POSIX
 // literal. On win32 a bare `/clones/mine` is not qualified — `path.resolve` would re-root it onto
@@ -35,7 +36,7 @@ let home: string;
 let prevHome: string | undefined;
 
 beforeEach(() => {
-  home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-home-'));
+  home = makeScratchDir('modoki-home-');
   prevHome = process.env.MODOKI_HOME;
   process.env.MODOKI_HOME = home;
 });
@@ -278,8 +279,8 @@ describe('#865 ownAdbClaim ambiguity is decided before the clone filter', () => 
  *  link the two spell one directory two ways, and the build refused this clone its OWN phone. */
 describe('#865 a linked checkout does not make this clone a stranger', () => {
   it('matches when the stored side is the real path and the own side is reached through a link', () => {
-    const real = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-real-')));
-    const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-link-'));
+    const real = fs.realpathSync(makeScratchDir('modoki-real-'));
+    const linkDir = makeScratchDir('modoki-link-');
     const link = path.join(linkDir, 'clone');
     let linked = false;
     try {
@@ -346,7 +347,7 @@ describe('#865 isFullyQualified accepts and rejects', () => {
 describe('#865 isSameHolder recognises an owner-claim through a different spelling', () => {
   it('re-claims a CLI owner-claim when the requester spells the same clone differently', () => {
     // A real directory, so `realpathSync.native` has something to canonicalise.
-    const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-clone-')));
+    const dir = fs.realpathSync(makeScratchDir('modoki-clone-'));
     try {
       claimDevice({ deviceId: adbDeviceId('RFTESTSERIAL1'), clone: dir, owner: 'cli:test', label: 'cli' });
       // Premise: a genuinely different STRING for the same directory. Without this the test would
@@ -378,7 +379,7 @@ describe('#865 canonicalClonePath normalisation', () => {
     // `dir` short while the subject returned long, so the assertion failed on short-vs-long — not
     // on the drive-letter case this test exists to pin. (Spelled out rather than quoted: a literal
     // profile path trips `scan-publish-safety`'s home-dir-username rule.)
-    const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-case-')));
+    const dir = fs.realpathSync.native(makeScratchDir('modoki-case-'));
     try {
       const drive = dir.slice(0, 1);
       const flipped = (drive === drive.toLowerCase() ? drive.toUpperCase() : drive.toLowerCase()) + dir.slice(1);

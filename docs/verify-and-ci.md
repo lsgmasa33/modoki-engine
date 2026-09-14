@@ -883,6 +883,88 @@ carries `exclude: ['**/node_modules/**', 'packages/**', '**/release/**']`, so
 under `npm run verify`, so this only bites while iterating on one file — which is exactly when a
 silent empty run is most expensive. Surfaced by the #426 review, which lost a pass to it.
 
+### Scratch dirs — `makeScratchDir`, never a bare `mkdtemp` (#1117)
+
+A test that needs a throwaway directory calls `makeScratchDir(prefix)` from
+`@modoki/engine/testing/scratchDir` (`{ base }` and `{ canonical: true }` cover the other shapes).
+The helper removes every dir it made **after the test file ends, pass or fail**. Removal is the
+helper's job, not the test's. `engine/tests/architecture/scratchDirOwnership.test.ts` refuses the
+names `mkdtemp`/`mkdtempSync` anywhere in the test corpus except the helper.
+
+**Why it exists.** Removal used to be each test's job, and `os.tmpdir()` had no other cleaner. Measured on
+2026-09-14: **131,158 `modoki-*` entries on the `modoki-qa` Mac, 59,249 of them more than 3 days
+old**, and 8,551 on the win clone. The issue as filed said macOS reaps `/var/folders` itself. It does
+not, at least not on anything like this timescale. The leaks came in three shapes:
+- **no teardown at all:** a `beforeEach` that makes a dir per test and has no `afterEach`
+  (`modoki-recents`: 27,100 dirs)
+- **removal on the success path only:** an `rmSync` at the end of the test body, skipped whenever
+  an assertion above it throws
+- **removal of the wrong path:** the test keeps `path.join(mkdtempSync(…), 'race')` and removes that
+  child, orphaning the dir it made
+
+The biggest producer was not a test. It was production code a test drives: `claimsDir()` falls back
+to `os.tmpdir()/modoki-claims-vitest-<pid>` under vitest (42,904 dirs), and the store cannot know
+when a process is done with it. Three kinds of process make one:
+- a vitest worker
+- the vitest **main** process, because vitest builds a Vite server from `engine/vite.config.ts` and
+  the editor backend plugin's `configureServer` sweeps claims
+- every **child** a test spawns (the OTA and build CLIs inherit `VITEST`)
+
+No per-file hook reaches the last two. A private-`TMPDIR` `verify` still left 96 of them after
+the per-file fix, which is how they were found, by tracing every write under that name.
+`engine/tests/globalSetup.ts` calls `reapVitestClaimsDirs` at teardown. It removes the main
+process's own dir, plus every dead-pid dir touched since the run started. A LIVE pid is skipped,
+because another clone's vitest may share `os.tmpdir()`, and older dirs are skipped as historical
+debris.
+
+The shell side had the same defect. `publish-engine-oss.sh` and `publish-demo.sh` now remove their
+minted stage and push clone on `EXIT` (plus the engine script's manifest). `MODOKI_KEEP_STAGE=1` keeps the stage, and
+`--out DIR` is never removed. `assert-app-renders.sh` removes its throwaway Chromium profile on
+every exit. It removes its logs on a PASS, or when they are empty, and a failure prints the path
+of what it keeps. The tests drive each script into a private `TMPDIR`. `publish-demo.sh` runs
+from a throwaway git repo, because the script refuses a dirty demo dir, and a live editor dirties
+one (#18).
+
+How it works, and the traps it closes:
+- **The wiring is asserted, not assumed.** Each vitest config's setup file calls
+  `installScratchDirCleanup(afterAll)`. `makeScratchDir` throws until that has run in its own
+  module instance. A config that forgets it, or a second copy of the module, therefore fails
+  loudly. Otherwise it would silently make dirs nothing removes, which is the exact defect.
+- **File scope, not test scope.** Dirs made at module scope or in `beforeAll` are shared across a
+  file's tests. The setup file's `afterAll` registers first, so under vitest's `stack` hook order it
+  runs after the file's own.
+- ⚠️ **KNOWN GAP: that `afterAll` can be skipped.** Vitest 4 stops a file's `afterAll` chain at the
+  first hook that throws. A file whose OWN `afterAll` throws or times out leaks its dirs, and so
+  does a killed run. A `process.on('exit')` fallback was tried, and it is **unreachable**: the pool
+  ends each worker with SIGTERM, which emits no `exit` unless a SIGTERM handler is installed
+  (measured). `scratchDir.test.ts` pins the gap. What would close it: `globalSetup` mints a run-scoped
+  parent dir, exports it to the workers, and removes it at teardown, with `makeScratchDir` defaulting
+  its `base` to that dir. Not built. It changes every scratch path's parent, and the gap needs a test
+  whose own teardown is already broken.
+- **A dir that cannot be removed is a warning, not a failure.** On Windows a handle a child process
+  has not released yet can outlast the retries. Failing an unrelated suite over temp cleanup would
+  trade a leak for a flaky gate.
+- **Immune to `vi.mock('fs')`.** The helper takes its builtins from `process.getBuiltinModule`,
+  so a suite that mocks `fs` or `os` cannot disarm its own cleanup.
+- **It does not import vitest.** `afterAll` is passed in, because `makeTestGlb` imports the helper
+  and is also loaded by a Playwright spec. A Playwright spec cannot use `makeScratchDir`: nothing
+  installs the cleanup there.
+- **An explicit `rmSync` of a scratch dir is harmless.** The helper's removal is `force`.
+
+**Not covered by the guard:** a computed key (`fs['mkdtemp' + 'Sync']`), a `mktemp -d` in a spawned
+command, a plain write straight into `os.tmpdir()`, and **production code a test drives**, which
+is the class the claims store belonged to. The first two are pinned as the guard's KNOWN GAPS.
+
+**What a private-`TMPDIR` `verify` still leaves (2026-09-14): 23 entries.**
+- 19 `modoki-render-<pid>-N.jpg`. Production owns these: `pruneOldTempFiles` removes them after
+  30 minutes.
+- `device-screenshot-<pid>.png` (or `.jpg`), one per process that captures.
+- `modoki-menu-test` and `modoki-logs`. Both are fixed names, reused rather than accumulated.
+- Node's own `node-compile-cache`.
+
+To check a change, run `TMPDIR=<empty dir>/ npm run verify` and list what is left. A shared
+`os.tmpdir()` cannot answer this, because other clones and live editors write there too.
+
 ### Corpus production: the ONE enumerator these guards share
 
 A guard that scans source first has to decide **which files**. Before #799/#771/#805 every one

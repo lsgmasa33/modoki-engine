@@ -19,11 +19,11 @@
  */
 
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { readScannedSource } from '@modoki/engine/testing';
 import { parseFromStatements, REPO_ROOT } from './moduleGraph';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /** A file whose PROSE shows a relative import — the shape that injects a phantom cross-folder edge. */
 const SRC = [
@@ -47,7 +47,7 @@ describe('the module graph is built from code, not from prose (#812)', () => {
   });
 
   it('the same source read through readScannedSource yields only the REAL import', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modgraph-'));
+    const dir = makeScratchDir('modgraph-');
     try {
       const file = path.join(dir, 'storeHooks.ts');
       fs.writeFileSync(file, SRC, 'utf8');

@@ -12,6 +12,7 @@ import {
   saveLastTarget,
 } from '../../plugins/backend/deviceConnection';
 import { DeviceLeaseAuthority } from '../../plugins/backend/deviceLease';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /**
  * A real TCP "device": a net server speaking the lease protocol
@@ -64,7 +65,7 @@ describe('DeviceConnectionManager (real TCP)', () => {
   // Per-test `.modoki` so the persisted last-target is isolated (never touches the real repo, and
   // one test's saved target can't leak into another's bare-reconnect path).
   let stateDir: string;
-  beforeEach(() => { stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-conn-')); });
+  beforeEach(() => { stateDir = makeScratchDir('modoki-conn-'); });
   afterEach(async () => {
     if (cleanup) { await cleanup(); cleanup = null; }
     fs.rmSync(stateDir, { recursive: true, force: true });
@@ -328,7 +329,7 @@ describe('TcpLeaseTransport timeouts', () => {
 // ── T3: GUID + last-target persistence (the reason Modoki mints the GUID) ──
 describe('device persistence helpers', () => {
   let dir: string;
-  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-dev-')); });
+  beforeEach(() => { dir = makeScratchDir('modoki-dev-'); });
   afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
   it('mints a GUID once and returns the SAME one on reload (survives editor restart)', () => {
@@ -338,7 +339,7 @@ describe('device persistence helpers', () => {
   });
 
   it('a different clone dir mints its own distinct GUID', () => {
-    const other = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-dev2-'));
+    const other = makeScratchDir('modoki-dev2-');
     try { expect(loadOrCreateGuid(dir)).not.toBe(loadOrCreateGuid(other)); }
     finally { fs.rmSync(other, { recursive: true, force: true }); }
   });
@@ -383,7 +384,7 @@ describe('device persistence helpers', () => {
  *  disable trusted iOS input for the rest of a session because of one dropped packet. */
 describe('DeviceConnectionManager.devicePlatform — what latches and what does not (#99)', () => {
   let stateDir: string;
-  beforeEach(() => { stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-plat-')); });
+  beforeEach(() => { stateDir = makeScratchDir('modoki-plat-'); });
   afterEach(() => { fs.rmSync(stateDir, { recursive: true, force: true }); });
 
   it('a FAILED ask is retried — one dropped probe must not disable iOS input for the session', async () => {

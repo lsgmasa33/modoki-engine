@@ -15,11 +15,11 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { relay } from './backendRelay';
-import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 let projectRoot = '';
 
@@ -52,7 +52,7 @@ const sha256 = (text: string) => crypto.createHash('sha256').update(Buffer.from(
 const onDisk = `${JSON.stringify({ id: 'a-guid', version: 1, members: ['s1'], pageSize: 1024, padding: 2, extrude: 1 }, null, 2)}\n`;
 const edited = { id: 'a-guid', version: 1, members: ['s1'], pageSize: 1024, padding: 7, extrude: 1 };
 
-beforeEach(() => { projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-asset-if-match-')); });
+beforeEach(() => { projectRoot = makeScratchDir('modoki-asset-if-match-'); });
 afterEach(() => { fs.rmSync(projectRoot, { recursive: true, force: true }); });
 
 describe('/api/asset-write — ifMatch precondition (#831)', () => {

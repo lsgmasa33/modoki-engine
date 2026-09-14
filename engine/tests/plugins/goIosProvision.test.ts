@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import { ensureGoIos, goIosBinFor, goIosDirFor, PINNED_GO_IOS, type FetchLike } from '../../toolchain'
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /**
  * Guards the on-demand go-ios provisioner — the tool that removes the ⌘R handoff from an iOS ≤16
@@ -14,7 +14,7 @@ import { ensureGoIos, goIosBinFor, goIosDirFor, PINNED_GO_IOS, type FetchLike } 
  */
 describe('goIosProvision — ensureGoIos (mocked fetch)', () => {
   let base: string
-  beforeEach(() => { base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-goios-')) })
+  beforeEach(() => { base = makeScratchDir('modoki-goios-') })
   afterEach(() => { fs.rmSync(base, { recursive: true, force: true }) })
 
   const fakeFetch = (bytes: Buffer, ok = true, status = 200): FetchLike =>

@@ -10,7 +10,6 @@
  */
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
@@ -339,7 +338,7 @@ describe('renderKeystoreProperties — ROUND-TRIP through a real JVM', () => {
   })();
 
   const roundTrip = (ks: Parameters<typeof renderKeystoreProperties>[0]): Record<string, string> => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-props-'));
+    const dir = makeScratchDir('modoki-props-');
     try {
       // UTF-8 + withReader, mirroring ANDROID_SIGNING_BLOCK exactly. Reading it any other way here
       // would test a contract the generated Gradle does not use.
@@ -403,3 +402,5 @@ public class RT { public static void main(String[] a) throws Exception {
     expect(typeof haveJava).toBe('boolean');
   });
 });
+
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';

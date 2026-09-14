@@ -4,10 +4,10 @@
  *  is invoked. */
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { ktxCommandFor, ktxFlags, riggedHash, glbExtensionsUsed, meshoptDroppedBasisu } from '../../plugins/rigged-model-optimize';
 import type { TextureImportSettings } from '../../packages/modoki/src/runtime/loaders/textureSettings';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const baseSettings = (over: Partial<TextureImportSettings> = {}): TextureImportSettings => ({
   format: 'ktx2-uastc', maxSize: 2048, mipmaps: true,
@@ -121,7 +121,7 @@ describe('glbExtensionsUsed (C1 guard)', () => {
     const chunkHeader = Buffer.alloc(8);
     chunkHeader.writeUInt32LE(jsonChunk.length, 0);
     chunkHeader.writeUInt32LE(0x4e4f534a, 4); // 'JSON'
-    const p = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-glb-')), 'm.glb');
+    const p = path.join(makeScratchDir('modoki-glb-'), 'm.glb');
     fs.writeFileSync(p, Buffer.concat([header, chunkHeader, jsonChunk]));
     return p;
   }
@@ -138,7 +138,7 @@ describe('glbExtensionsUsed (C1 guard)', () => {
   });
 
   it('returns [] for a non-GLB file', () => {
-    const p = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-glb-')), 'x.bin');
+    const p = path.join(makeScratchDir('modoki-glb-'), 'x.bin');
     fs.writeFileSync(p, Buffer.from('not a glb at all'));
     expect(glbExtensionsUsed(p)).toEqual([]);
   });

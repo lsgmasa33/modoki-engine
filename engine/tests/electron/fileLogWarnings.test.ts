@@ -39,8 +39,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 let userDataDir = '';
 
@@ -56,7 +55,7 @@ let savedTraceDeprecation: boolean | undefined;
 let savedTraceProcessWarnings: boolean | undefined;
 
 beforeEach(() => {
-  userDataDir = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'filelog-'));
+  userDataDir = makeScratchDir('filelog-', { canonical: true });
   savedConsole = { log: console.log, info: console.info, warn: console.warn, error: console.error };
   savedWarningListeners = process.listeners('warning') as ((warning: Error) => void)[];
   savedNoDeprecation = process.noDeprecation;

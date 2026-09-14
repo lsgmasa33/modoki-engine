@@ -7,12 +7,12 @@
  *  and that a project with no game.ts fails loudly instead of silently. */
 import { describe, it, expect, afterEach } from 'vitest';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 import { subgameBuildPlugin, SUBGAME_ENTRY_VIRTUAL_ID, subgameOutDir } from '../../plugins/subgameBuild';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 function makeProject(withGameTs: boolean): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-subgame-build-test-'));
+  const dir = makeScratchDir('modoki-subgame-build-test-');
   if (withGameTs) fs.writeFileSync(path.join(dir, 'game.ts'), 'export const game = { id: "x" };\n');
   return dir;
 }

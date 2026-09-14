@@ -10,14 +10,15 @@
  * Nothing short of real commits can prove either. Same reasoning as `sweepGate.test.ts`.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, copyFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, rmSync, writeFileSync, existsSync, copyFileSync } from 'node:fs';
+
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, describe, expect, it } from 'vitest';
 import { readScannedSource } from '@modoki/engine/testing';
 import { MACHINERY_PATHS, countProgramFiles, foreignProjects, stripFileList, KNOWN_CROSS_PROJECT }
   from '../../scripts/scopedTypecheckLib.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const SCRIPTS = join(REPO, 'engine', 'scripts');
@@ -44,7 +45,7 @@ function git(cwd: string, ...args: string[]) {
  *  changed" and escalate to a full sweep — every selection assertion below would then pass for
  *  the wrong reason. */
 function makeRepo() {
-  const dir = mkdtempSync(join(tmpdir(), 'tcp-sel-'));
+  const dir = makeScratchDir('tcp-sel-');
   tmpRepos.push(dir);
   git(dir, 'init', '-q', '-b', 'main');
   git(dir, 'config', 'user.email', 't@example.com');
@@ -183,7 +184,7 @@ describe('the scoped-typecheck project selection', () => {
   });
 
   it('FAILS SAFE toward sweeping everything when there is no git repo at all', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'tcp-nogit-'));
+    const dir = makeScratchDir('tcp-nogit-');
     tmpRepos.push(dir);
     const scripts = join(dir, 'engine', 'scripts');
     mkdirSync(scripts, { recursive: true });

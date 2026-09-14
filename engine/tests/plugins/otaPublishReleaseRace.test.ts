@@ -10,12 +10,12 @@
  *  concurrent-write race on the first release.json upload attempt. */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { execFileSync, spawnSync } from 'child_process';
 import { mergeProjectConfig, pruneProjectConfig, DEFAULT_PROJECT_CONFIG, type RawProjectConfig } from '../../project-config';
 import { acquireBuildClaim, resetBuildClaimsForTests } from '../../scripts/buildClaimsStore.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const engineRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -257,7 +257,7 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
   let raceFlag: string;
 
   beforeEach(() => {
-    repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-race-repo-'));
+    repoRoot = makeScratchDir('modoki-ota-race-repo-');
     fs.mkdirSync(path.join(repoRoot, 'engine', 'scripts'), { recursive: true });
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota-publish.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-publish.mjs'));
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota-keygen.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-keygen.mjs'));
@@ -267,7 +267,7 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
     copyClaimStoreScripts(repoRoot);
     fs.mkdirSync(path.join(repoRoot, 'build', 'ota-keys'), { recursive: true });
 
-    binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-gcloud-'));
+    binDir = makeScratchDir('modoki-fake-gcloud-');
     // The fake `gcloud` must be executable by NAME off PATH on both platforms.
     // POSIX: an extensionless shebang script chmod +x. Windows: cmd.exe cannot run a
     // shebang script and ignores the +x bit entirely, and only resolves names carrying
@@ -282,11 +282,11 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
       fs.chmodSync(gcloudPath, 0o755);
     }
 
-    bucketDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-bucket-'));
-    distDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-race-dist-'));
+    bucketDir = makeScratchDir('modoki-fake-bucket-');
+    distDir = makeScratchDir('modoki-ota-race-dist-');
     fs.writeFileSync(path.join(distDir, 'index.html'), '<html>race-test</html>');
     writeCleanBuildStamp(distDir);
-    raceFlag = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-race-flag-')), 'race');
+    raceFlag = path.join(makeScratchDir('modoki-race-flag-'), 'race');
   });
 
   afterEach(() => {
@@ -399,7 +399,7 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
     const keygenEnv = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH}` };
     execFileSync('node', ['engine/scripts/ota-keygen.mjs'], { cwd: repoRoot, env: keygenEnv });
 
-    const otherRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-other-root-'));
+    const otherRoot = makeScratchDir('modoki-ota-other-root-');
     try {
       // If --repo-root were silently ignored, the key generated above (at the script's
       // own default repoRoot) would be found and this would succeed instead.
@@ -519,7 +519,7 @@ describe('ota-publish.mjs release.json optimistic concurrency', () => {
   });
 
   it('--repo-root points key resolution somewhere else, and a key THERE is found and used', () => {
-    const otherRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-other-root-with-key-'));
+    const otherRoot = makeScratchDir('modoki-ota-other-root-with-key-');
     try {
       writeKeyPair(otherRoot);
       const result = publish('shell', 'v1', {}, ['--repo-root', otherRoot]);
@@ -543,7 +543,7 @@ describe('ota-publish.mjs mandatory stickiness', () => {
   let distDir: string;
 
   beforeEach(() => {
-    repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-mandatory-repo-'));
+    repoRoot = makeScratchDir('modoki-ota-mandatory-repo-');
     fs.mkdirSync(path.join(repoRoot, 'engine', 'scripts'), { recursive: true });
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota-publish.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-publish.mjs'));
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota-keygen.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-keygen.mjs'));
@@ -553,7 +553,7 @@ describe('ota-publish.mjs mandatory stickiness', () => {
     copyClaimStoreScripts(repoRoot);
     fs.mkdirSync(path.join(repoRoot, 'build', 'ota-keys'), { recursive: true });
 
-    binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-gcloud-mandatory-'));
+    binDir = makeScratchDir('modoki-fake-gcloud-mandatory-');
     if (process.platform === 'win32') {
       fs.writeFileSync(path.join(binDir, 'gcloud.cjs'), FAKE_GCLOUD_SRC);
       fs.writeFileSync(path.join(binDir, 'gcloud.cmd'), `@node "%~dp0gcloud.cjs" %*\r\n`);
@@ -563,8 +563,8 @@ describe('ota-publish.mjs mandatory stickiness', () => {
       fs.chmodSync(gcloudPath, 0o755);
     }
 
-    bucketDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-bucket-mandatory-'));
-    distDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-mandatory-dist-'));
+    bucketDir = makeScratchDir('modoki-fake-bucket-mandatory-');
+    distDir = makeScratchDir('modoki-ota-mandatory-dist-');
     fs.writeFileSync(path.join(distDir, 'index.html'), '<html>mandatory-test</html>');
     writeCleanBuildStamp(distDir);
 
@@ -672,7 +672,7 @@ describe('ota-publish.mjs version-collision guard', () => {
   let distDir: string;
 
   beforeEach(() => {
-    repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-collision-repo-'));
+    repoRoot = makeScratchDir('modoki-ota-collision-repo-');
     fs.mkdirSync(path.join(repoRoot, 'engine', 'scripts'), { recursive: true });
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota-publish.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-publish.mjs'));
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota-keygen.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-keygen.mjs'));
@@ -682,7 +682,7 @@ describe('ota-publish.mjs version-collision guard', () => {
     copyClaimStoreScripts(repoRoot);
     fs.mkdirSync(path.join(repoRoot, 'build', 'ota-keys'), { recursive: true });
 
-    binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-gcloud-collision-'));
+    binDir = makeScratchDir('modoki-fake-gcloud-collision-');
     if (process.platform === 'win32') {
       fs.writeFileSync(path.join(binDir, 'gcloud.cjs'), FAKE_GCLOUD_SRC);
       fs.writeFileSync(path.join(binDir, 'gcloud.cmd'), `@node "%~dp0gcloud.cjs" %*\r\n`);
@@ -692,8 +692,8 @@ describe('ota-publish.mjs version-collision guard', () => {
       fs.chmodSync(gcloudPath, 0o755);
     }
 
-    bucketDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-bucket-collision-'));
-    distDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-collision-dist-'));
+    bucketDir = makeScratchDir('modoki-fake-bucket-collision-');
+    distDir = makeScratchDir('modoki-ota-collision-dist-');
     fs.writeFileSync(path.join(distDir, 'index.html'), '<html>collision-test</html>');
     writeCleanBuildStamp(distDir);
 
@@ -1018,7 +1018,7 @@ describe('ota-publish.mjs publish-identity guards (#582)', () => {
   let realPublicKey: string;
 
   beforeEach(() => {
-    repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-guards-repo-'));
+    repoRoot = makeScratchDir('modoki-ota-guards-repo-');
     fs.mkdirSync(path.join(repoRoot, 'engine', 'scripts'), { recursive: true });
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota-publish.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-publish.mjs'));
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota-keygen.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-keygen.mjs'));
@@ -1028,7 +1028,7 @@ describe('ota-publish.mjs publish-identity guards (#582)', () => {
     copyClaimStoreScripts(repoRoot);
     fs.mkdirSync(path.join(repoRoot, 'build', 'ota-keys'), { recursive: true });
 
-    binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-gcloud-guards-'));
+    binDir = makeScratchDir('modoki-fake-gcloud-guards-');
     if (process.platform === 'win32') {
       fs.writeFileSync(path.join(binDir, 'gcloud.cjs'), FAKE_GCLOUD_SRC);
       fs.writeFileSync(path.join(binDir, 'gcloud.cmd'), `@node "%~dp0gcloud.cjs" %*\r\n`);
@@ -1038,8 +1038,8 @@ describe('ota-publish.mjs publish-identity guards (#582)', () => {
       fs.chmodSync(gcloudPath, 0o755);
     }
 
-    bucketDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-bucket-guards-'));
-    distDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-guards-dist-'));
+    bucketDir = makeScratchDir('modoki-fake-bucket-guards-');
+    distDir = makeScratchDir('modoki-ota-guards-dist-');
     fs.writeFileSync(path.join(distDir, 'index.html'), '<html>guards-test</html>');
     writeCleanBuildStamp(distDir);
 
@@ -1177,7 +1177,7 @@ describe('ota-publish.mjs publish-identity guards (#582)', () => {
 
   it('f) --name subgame-x (listed) with a real subgame-dist (subgame.json present) publishes successfully — ' +
     'the by-hand sub-game path the docs describe', () => {
-    const subgameDistDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-guards-subgame-dist-'));
+    const subgameDistDir = makeScratchDir('modoki-ota-guards-subgame-dist-');
     try {
       fs.writeFileSync(path.join(subgameDistDir, 'index.html'), '<html>subgame</html>');
       writeCleanBuildStamp(subgameDistDir);
@@ -1192,7 +1192,7 @@ describe('ota-publish.mjs publish-identity guards (#582)', () => {
   });
 
   it('g) --name shell (matching the project\'s own bundleName) with a subgame-dist is refused', () => {
-    const subgameDistDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-guards-subgame-dist-shell-'));
+    const subgameDistDir = makeScratchDir('modoki-ota-guards-subgame-dist-shell-');
     try {
       fs.writeFileSync(path.join(subgameDistDir, 'index.html'), '<html>subgame</html>');
       writeCleanBuildStamp(subgameDistDir);
@@ -1208,7 +1208,7 @@ describe('ota-publish.mjs publish-identity guards (#582)', () => {
 
   it('q) #827: an UNLISTED sub-game name is refused before any upload — the route\'s #837 rule, which this script lacked', () => {
     // Measured before the fix (2026-09-13): this exact shape reached `gcloud storage rsync`.
-    const subgameDistDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-guards-unlisted-'));
+    const subgameDistDir = makeScratchDir('modoki-ota-guards-unlisted-');
     try {
       fs.writeFileSync(path.join(subgameDistDir, 'index.html'), '<html>subgame</html>');
       writeCleanBuildStamp(subgameDistDir);
@@ -1233,7 +1233,7 @@ describe('ota-publish.mjs publish-identity guards (#582)', () => {
   }
 
   function withSubgameDist(subgameJson: string, fn: (dist: string) => void) {
-    const dist = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-guards-subgame-api-'));
+    const dist = makeScratchDir('modoki-ota-guards-subgame-api-');
     try {
       fs.writeFileSync(path.join(dist, 'index.html'), '<html>subgame</html>');
       writeCleanBuildStamp(dist);
@@ -1297,8 +1297,8 @@ describe('ota-publish.mjs publish-identity guards (#582)', () => {
   it('p) #837: a sub-game dist is claimed under its OWN project while it is published — a build holding that project refuses the publish', () => {
     // build-subgame.mjs claims the SUB-GAME project; the publish used to claim only --project (the
     // shell), so a second build of the sub-game could empty the dist mid-upload (close-out review).
-    const subProject = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-subgame-project-'));
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-claims-home-'));
+    const subProject = makeScratchDir('modoki-ota-subgame-project-');
+    const home = makeScratchDir('modoki-ota-claims-home-');
     const prevHome = process.env.MODOKI_HOME;
     const prevToken = process.env.MODOKI_BUILD_CLAIM_TOKEN;
     process.env.MODOKI_HOME = home;
@@ -1362,7 +1362,7 @@ describe('ota-publish.mjs input validation (#649)', () => {
   let realPublicKey: string;
 
   beforeEach(() => {
-    repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-validation-repo-'));
+    repoRoot = makeScratchDir('modoki-ota-validation-repo-');
     fs.mkdirSync(path.join(repoRoot, 'engine', 'scripts'), { recursive: true });
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota-publish.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-publish.mjs'));
     fs.cpSync(path.join(engineRoot, 'scripts', 'ota-keygen.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-keygen.mjs'));
@@ -1372,7 +1372,7 @@ describe('ota-publish.mjs input validation (#649)', () => {
     copyClaimStoreScripts(repoRoot);
     fs.mkdirSync(path.join(repoRoot, 'build', 'ota-keys'), { recursive: true });
 
-    binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-gcloud-validation-'));
+    binDir = makeScratchDir('modoki-fake-gcloud-validation-');
     if (process.platform === 'win32') {
       fs.writeFileSync(path.join(binDir, 'gcloud.cjs'), FAKE_GCLOUD_SRC);
       fs.writeFileSync(path.join(binDir, 'gcloud.cmd'), `@node "%~dp0gcloud.cjs" %*\r\n`);
@@ -1382,8 +1382,8 @@ describe('ota-publish.mjs input validation (#649)', () => {
       fs.chmodSync(gcloudPath, 0o755);
     }
 
-    bucketDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-bucket-validation-'));
-    distDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-validation-dist-'));
+    bucketDir = makeScratchDir('modoki-fake-bucket-validation-');
+    distDir = makeScratchDir('modoki-ota-validation-dist-');
     fs.writeFileSync(path.join(distDir, 'index.html'), '<html>validation-test</html>');
     writeCleanBuildStamp(distDir);
 
@@ -1426,7 +1426,7 @@ describe('ota-publish.mjs input validation (#649)', () => {
     // `marker` genuinely only gets created if ota-publish.mjs itself later hands this string
     // to a shell unguarded — proving the guard fires before any exec, not just that this
     // particular fake-gcloud harness happens not to interpret it.
-    const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-pwn-marker-'));
+    const markerDir = makeScratchDir('modoki-ota-pwn-marker-');
     const marker = path.join(markerDir, 'pwned');
     try {
       const result = publish(`v1$(touch ${marker})`, 'v1');
@@ -1455,7 +1455,7 @@ describe('ota-publish.mjs input validation (#649)', () => {
   });
 
   it('refuses a --bucket carrying a shell metacharacter', () => {
-    const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-pwn-bucket-marker-'));
+    const markerDir = makeScratchDir('modoki-ota-pwn-bucket-marker-');
     const marker = path.join(markerDir, 'pwned');
     try {
       const result = publish('shell', 'v1', `gs://fakebucket$(touch ${marker})/testprefix`);
@@ -1494,7 +1494,7 @@ describe('ota-publish.mjs input validation (#649)', () => {
       // plain fs call (no shell involved), so the marker file can ONLY appear if one of this
       // script's `execSync` calls later shell-expands that path unguarded.
       const markerName = 'q-injection-marker-649';
-      const weirdTmpParent = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-weirdtmp-'));
+      const weirdTmpParent = makeScratchDir('modoki-ota-weirdtmp-');
       const weirdTmpDir = path.join(weirdTmpParent, `evilA$(touch ${markerName})B`);
       fs.mkdirSync(weirdTmpDir);
       const marker = path.join(repoRoot, markerName); // execSync calls inherit this script's cwd (repoRoot)

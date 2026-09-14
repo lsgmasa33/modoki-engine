@@ -1,9 +1,8 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import { acquireBuild, activeBuild, acquireBuildSlot, describeBuildConflict, releasePolicy, resetBuildLockForTests } from '../../plugins/backend/buildLock';
 import { acquireBuildClaim, readBuildClaim, resetBuildClaimsForTests } from '../../scripts/buildClaimsStore.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 afterEach(() => resetBuildLockForTests());
 
@@ -13,7 +12,7 @@ afterEach(() => resetBuildLockForTests());
 let home: string;
 let prevHome: string | undefined;
 beforeEach(() => {
-  home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-home-'));
+  home = makeScratchDir('modoki-home-');
   prevHome = process.env.MODOKI_HOME;
   process.env.MODOKI_HOME = home;
 });

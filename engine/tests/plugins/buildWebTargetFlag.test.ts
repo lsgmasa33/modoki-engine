@@ -5,11 +5,12 @@
  *  posture as otaCliScripts.test.ts) with no MODOKI_PROJECT — the guard must fire before any
  *  project is even needed, so this stays fast. */
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const script = path.join(repoRoot, 'engine', 'scripts', 'build-web.mjs');
@@ -67,7 +68,7 @@ describe('build-web.mjs --target fail-fast', () => {
   // locally, >20s on a CI runner), which timed out the suite on GitHub Actions and burned minutes
   // to re-prove a guard that had already returned.
   it('VITE_PLAYABLE=0 with --target web: does NOT hit the contradiction guard', () => {
-    const scratch = mkdtempSync(path.join(tmpdir(), 'modoki-buildweb-'));
+    const scratch = makeScratchDir('modoki-buildweb-');
     const { status, stderr } = runBuildWeb(['--target', 'web'], { VITE_PLAYABLE: '0' }, scratch);
     expect(stderr).not.toContain('contradict');
     // Sanity: it really did get PAST the guards (failed later, spawning the absent vite.js)
@@ -86,7 +87,7 @@ describe('build-web.mjs --target fail-fast', () => {
 // build (which ships no typescript) never attempts it at all.
 describe('build-web.mjs does not write into engine/ when typescript is absent', () => {
   it('skips tsconfig.app.scoped.json entirely — proves the write is SKIPPED, not just missing a parent dir', () => {
-    const scratch = mkdtempSync(path.join(tmpdir(), 'modoki-buildweb-notsc-'));
+    const scratch = makeScratchDir('modoki-buildweb-notsc-');
     // A real, normally-writable engine/ dir — the OLD code would have written into it
     // successfully here (this fixture does not depend on filesystem permissions), so a
     // present file after the run would mean the write was attempted, not just that it
@@ -120,7 +121,7 @@ describe('build-web.mjs does not write into engine/ when typescript is absent', 
 // stays on the DEFAULT loader, not just that some build eventually succeeds.
 describe('build-web.mjs does NOT pass --configLoader to vite build', () => {
   it('invokes vite build with no --configLoader flag (default bundle loader)', () => {
-    const scratch = mkdtempSync(path.join(tmpdir(), 'modoki-buildweb-configloader-'));
+    const scratch = makeScratchDir('modoki-buildweb-configloader-');
     mkdirSync(path.join(scratch, 'engine'), { recursive: true });
     const viteBinDir = path.join(scratch, 'node_modules', 'vite', 'bin');
     mkdirSync(viteBinDir, { recursive: true });

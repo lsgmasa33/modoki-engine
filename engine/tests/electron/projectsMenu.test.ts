@@ -20,6 +20,7 @@ vi.mock('electron', () => ({
 
 import fs from 'node:fs';
 import { installAppMenu, addRecentProject, setRecentsScope } from '../../electron/projects';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 function buildWithZoom() {
   const onZoom = vi.fn();
@@ -150,7 +151,7 @@ describe('installAppMenu — Open Recent marks the OPEN project (#869)', () => {
   };
 
   it('ticks a recents entry that is the open project spelled differently', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tick-'));
+    const dir = makeScratchDir('modoki-tick-');
     try {
       setRecentsScope('test-scope');
       addRecentProject(dir);
@@ -171,7 +172,7 @@ describe('installAppMenu — Open Recent marks the OPEN project (#869)', () => {
 
   it('does NOT tick a recents entry that is a different project', () => {
     // The inverse, or the fix would be "always tick everything".
-    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tick-'));
+    const base = makeScratchDir('modoki-tick-');
     try {
       const a = path.join(base, 'proj-a');
       const b = path.join(base, 'proj-b');

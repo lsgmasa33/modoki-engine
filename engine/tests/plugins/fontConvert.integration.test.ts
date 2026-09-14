@@ -5,11 +5,11 @@
 
 import { describe, it, expect, beforeAll } from 'vitest';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 import { convertFont, ensureMsdfAtlasGen } from '../../plugins/font-convert';
 import { getFontCacheDir, atlasCachePath, metricsCachePath, instanceCachePath } from '../../plugins/font-cache';
 import { DEFAULT_FONT_SETTINGS } from '../../packages/modoki/src/runtime/core/fontSettings';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const FONT = path.resolve(
   __dirname,
@@ -26,7 +26,7 @@ describe('convertFont (real msdf-atlas-gen)', () => {
     if (!cliAvailable) { console.warn('[fontConvert.integration] msdf-atlas-gen missing — skipping'); return; }
     expect(fs.existsSync(FONT)).toBe(true);
 
-    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-font-it-'));
+    const projectRoot = makeScratchDir('modoki-font-it-');
     try {
       const sourceUrlPath = '/fonts/Geologica-VariableFont.ttf';
       const settings = { ...DEFAULT_FONT_SETTINGS, charset: 'ascii' as const };
@@ -78,7 +78,7 @@ describe('convertFont (real msdf-atlas-gen)', () => {
   // `-varfont` looks correct while doing nothing).
   it('an authored wght axis changes the baked glyph outlines', async () => {
     if (!cliAvailable) { console.warn('[fontConvert.integration] msdf-atlas-gen missing — skipping'); return; }
-    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-font-axis-'));
+    const projectRoot = makeScratchDir('modoki-font-axis-');
     try {
       const def = await bake(projectRoot);              // Geologica's default instance = Thin 100
       const bold = await bake(projectRoot, { wght: 700 });
@@ -104,7 +104,7 @@ describe('convertFont (real msdf-atlas-gen)', () => {
 
   it('re-uses the cache for an unchanged axis, and misses when it changes', async () => {
     if (!cliAvailable) { console.warn('[fontConvert.integration] msdf-atlas-gen missing — skipping'); return; }
-    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-font-axis-cache-'));
+    const projectRoot = makeScratchDir('modoki-font-axis-cache-');
     try {
       expect((await bake(projectRoot, { wght: 700 })).result.cached).toBe(false);
       expect((await bake(projectRoot, { wght: 700 })).result.cached).toBe(true);

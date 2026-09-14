@@ -22,12 +22,12 @@
 import { describe, it, expect, afterAll } from 'vitest';
 import { found } from '@modoki/engine/testing/inOrder';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readScannedSource } from '@modoki/engine/testing';
 import { projectBuildConfigErrors } from '../../plugins/load-project-config';
 import { hasInternalGames } from '../helpers/repoLayout';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const scriptPath = path.join(repoRoot, 'engine', 'scripts', 'add-native-targets.mjs');
@@ -35,7 +35,7 @@ const scriptPath = path.join(repoRoot, 'engine', 'scripts', 'add-native-targets.
 describe('the two-part project-config validation actually rejects bad configs (#589)', () => {
   const tmpDirs: string[] = [];
   const makeProject = (config: unknown): string => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-cli-native-validate-'));
+    const dir = makeScratchDir('modoki-cli-native-validate-');
     tmpDirs.push(dir);
     fs.writeFileSync(path.join(dir, 'project.config.json'), JSON.stringify(config, null, 2));
     return dir;

@@ -28,6 +28,7 @@ import { readScannedSource } from '@modoki/engine/testing';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const REPO = path.resolve(__dirname, '../../..');
 const INSTALLER = path.join(REPO, 'engine/scripts/install-git-hooks.mjs');
@@ -53,7 +54,7 @@ afterEach(() => { for (const d of tmps.splice(0)) fs.rmSync(d, { recursive: true
  *  Returns the repo dir and the hooks dir the installer chose (which it derives from git itself,
  *  so this asserts against git's answer rather than assuming `.git/hooks`). */
 function repoWithHooksInstalled(): { dir: string; hooksDir: string; output: string } {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-hooks-'));
+  const dir = makeScratchDir('modoki-hooks-');
   tmps.push(dir);
   execFileSync('git', ['-C', dir, 'init', '-q'], { stdio: 'pipe' });
   const r = spawnSync(process.execPath, [INSTALLER], { cwd: dir, encoding: 'utf8', env: NEUTRAL_GIT });
@@ -199,7 +200,7 @@ describe('install-git-hooks puts every tracked hook where git runs it (#909)', (
     // `alreadyInstalled` returns false on any content mismatch, so `npm run verify` in this clone
     // replaced the developer's own hook, in every repo, with one line of output and no backup.
     // Reproduced before the revert. The write target is the clone; the lookup dir is only REPORTED.
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-hookspath-'));
+    const dir = makeScratchDir('modoki-hookspath-');
     tmps.push(dir);
     const theirs = path.join(dir, 'their-shared-hooks');
     fs.mkdirSync(theirs);

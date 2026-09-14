@@ -16,16 +16,16 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const CLI_PATH = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../scripts/device.mjs');
 
 let home: string;
 
 beforeEach(() => {
-  home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-device-cli-'));
+  home = makeScratchDir('modoki-device-cli-');
 });
 
 afterEach(() => {

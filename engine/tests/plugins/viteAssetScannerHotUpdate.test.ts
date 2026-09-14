@@ -29,9 +29,9 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { assetScannerPlugin, isGameCodeFile, isShaderGraphFile } from '../../plugins/vite-asset-scanner';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /** Vite hands handleHotUpdate a POSIX-normalized path even on Windows. */
 const posix = (p: string) => p.split(path.sep).join('/');
@@ -67,7 +67,7 @@ function armedPlugin(): Hooked {
 
 beforeEach(() => {
   // realpathSync: macOS /var → /private/var, which would defeat the prefix test.
-  projectRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-hmr-')));
+  projectRoot = fs.realpathSync(makeScratchDir('modoki-hmr-'));
   // A flat one-game project: <root>/game.ts is the entry, <root>/runtime/assets the
   // asset root (findAssetRoots). Note assets live INSIDE runtime/ — that adjacency is
   // the whole trap this rule has to get right.

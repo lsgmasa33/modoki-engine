@@ -5,7 +5,6 @@
  *  fs is real; the BrowserWindow is a stub that records setZoomLevel calls. */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 
 const root = { dir: '' };
@@ -18,6 +17,7 @@ import {
   ZOOM_MIN, ZOOM_MAX, ZOOM_STEP,
 } from '../../electron/zoom';
 import * as atomicWrite from '../../electron/atomicWrite';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 // A minimal BrowserWindow stub — only what zoom.ts touches.
 function makeWin() {
@@ -46,7 +46,7 @@ const readPrefs = () => JSON.parse(fs.readFileSync(prefsFile(), 'utf-8'));
 
 let counter = 0;
 beforeEach(() => {
-  root.dir = fs.mkdtempSync(path.join(os.tmpdir(), `modoki-zoom-${counter++}-`));
+  root.dir = makeScratchDir(`modoki-zoom-${counter++}-`);
   fs.mkdirSync(path.join(root.dir, 'userData'), { recursive: true });
   setUiPrefsDir(null); // default: prefs live in userData
   handleZoom(null, { dir: 'reset' }); // reset module state (level AND wheel accumulator) between tests

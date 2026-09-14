@@ -9,6 +9,7 @@ import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 let projectRoot = '';
 let editorRoot = '';
@@ -40,7 +41,7 @@ const post = (urlPath: string, body: unknown, ctx: BackendContext) =>
 
 beforeEach(() => {
   // A flat project working copy with scripts + dirs the walker must prune.
-  projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-proj-'));
+  projectRoot = makeScratchDir('modoki-proj-');
   fs.writeFileSync(path.join(projectRoot, 'game.ts'), 'export const game = 1;\n');
   fs.mkdirSync(path.join(projectRoot, 'runtime', 'systems'), { recursive: true });
   fs.writeFileSync(path.join(projectRoot, 'runtime', 'setup.ts'), 'export function setup() {}\n');
@@ -53,7 +54,7 @@ beforeEach(() => {
   fs.writeFileSync(path.join(projectRoot, 'dist', 'bundle.js'), '//built\n');
 
   // A separate editor root with the engine source layout (read-only reference).
-  editorRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-editor-'));
+  editorRoot = makeScratchDir('modoki-editor-');
   const engSrc = path.join(editorRoot, 'engine', 'packages', 'modoki', 'src');
   fs.mkdirSync(path.join(engSrc, 'runtime'), { recursive: true });
   fs.writeFileSync(path.join(engSrc, 'runtime', 'core.ts'), 'export const core = true;\n');

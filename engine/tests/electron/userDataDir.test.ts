@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import path from 'node:path';
-import os from 'node:os';
 import realFs from 'node:fs';
 import { readScannedSource } from '@modoki/engine/testing';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
@@ -16,6 +15,7 @@ import {
 } from '../../electron/userDataDir';
 import { makeDirLink } from '../helpers/linkFixture';
 import { readCdpEnabled } from '../../electron/cdp';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /**
  * WHERE the editor keeps its state. Every property here was a real, measured bug:
@@ -231,7 +231,7 @@ describe('#899 — a symlinked spelling is the SAME clone', () => {
   let real = '';
   let link = '';
   beforeEach(() => {
-    base = realFs.mkdtempSync(path.join(realFs.realpathSync.native(os.tmpdir()), 'udd-899-'));
+    base = makeScratchDir('udd-899-', { canonical: true });
     real = path.join(base, 'modoki-qa');
     realFs.mkdirSync(real);
     link = path.join(base, 'link');
@@ -546,7 +546,6 @@ describe('recents must not be keyed on userData — the transitive ordering inva
   });
 });
 
-
 /**
  * ADOPT the pre-existing toolchain instead of re-fetching it.
  *
@@ -559,7 +558,7 @@ describe('recents must not be keyed on userData — the transitive ordering inva
 describe('adoptLegacyToolchain', () => {
   let dir: string;
   const tc = (name: string) => path.join(dir, name, 'toolchain');
-  beforeEach(() => { dir = realFs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tc-')); });
+  beforeEach(() => { dir = makeScratchDir('modoki-tc-'); });
   afterEach(() => { realFs.rmSync(dir, { recursive: true, force: true }); });
   const seed = (p: string, marker: string) => {
     realFs.mkdirSync(path.join(p, marker), { recursive: true });
@@ -656,7 +655,7 @@ describe('adoptLegacyEditorState (#1041)', () => {
   const read = (name: string) => realFs.readFileSync(path.join(target, name), 'utf8');
 
   beforeEach(() => {
-    appData = realFs.mkdtempSync(path.join(os.tmpdir(), 'modoki-1041-'));
+    appData = makeScratchDir('modoki-1041-');
     target = path.join(appData, PACKAGED_DIR, 'deadbeef');
   });
   afterEach(() => { realFs.rmSync(appData, { recursive: true, force: true }); });

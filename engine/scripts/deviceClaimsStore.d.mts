@@ -107,6 +107,10 @@ export declare const MAX_CLAIM_TTL_MS: number;
 export declare function clampTtlMs(ttlMs: number | undefined | null): number | undefined;
 
 export declare function claimsDir(): string;
+/** The fallback claims dir for `pid` under vitest (#1117). */
+export declare function vitestClaimsDir(pid?: number): string;
+/** Remove this process's fallback dir, plus dead-pid ones touched at or after `sinceMs`. Returns the removed paths. */
+export declare function reapVitestClaimsDirs(opts: { sinceMs: number; alive?: (pid: number) => boolean; tmp?: string }): string[];
 
 export declare function adbDeviceId(serial: string): DeviceId;
 export declare function iosDeviceId(udid: string): DeviceId;

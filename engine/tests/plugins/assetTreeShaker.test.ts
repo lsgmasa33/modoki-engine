@@ -4,13 +4,13 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 import { computeKeptAssets, virtualToAbs } from '../../plugins/asset-tree-shaker';
 import { detectType, resolveAssetPath, type AssetRoot } from '../../plugins/vite-asset-scanner';
 import { JSON_ASSET_SUFFIX_TYPE, ID_BEARING_TYPES, classifyJsonAssetSuffix } from '../../plugins/assetTypes';
 import { REF_FIELDS_BY_TRAIT } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
 import { MATERIAL_TEXTURE_SLOTS } from '../../packages/modoki/src/runtime/assets/materialTextureSlots';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 // ── Fixture helpers ──────────────────────────────────
 
@@ -29,7 +29,7 @@ interface Fixture {
 }
 
 function createFixture(): Fixture {
-  const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'shaker-'));
+  const projectRoot = makeScratchDir('shaker-');
   // Single game root: /games/test/assets → <tmp>/games/test/runtime/assets
   const gameAssetsAbs = path.join(projectRoot, 'games/test/runtime/assets');
   fs.mkdirSync(gameAssetsAbs, { recursive: true });
@@ -1915,7 +1915,7 @@ describe('asset-tree-shaker', () => {
     const NFD_NAME = 'cafe\u0301.txt'; // e + combining acute
     const NFC_NAME = 'caf\u00e9.txt';  // precomposed é
     const fsFoldsUnicode = (() => {
-      const probeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'shaker-nfc-'));
+      const probeDir = makeScratchDir('shaker-nfc-');
       try {
         fs.writeFileSync(path.join(probeDir, NFD_NAME), 'x');
         return fs.existsSync(path.join(probeDir, NFC_NAME));

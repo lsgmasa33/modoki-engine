@@ -9,7 +9,6 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import net from 'net';
-import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import { EventEmitter } from 'events';
@@ -23,6 +22,7 @@ import { goIosForwardRunner, reapDeps } from '../../plugins/backend/iosUsbForwar
 import { DeviceLeaseAuthority } from '../../plugins/backend/deviceLease';
 import { listClaims } from '../../plugins/backend/deviceClaims';
 import { WDA_RECORD_FILE, ensureWdaRunning, stopWda, _resetWdaLauncherForTests } from '../../plugins/backend/wdaLauncher';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 let nextPid = 4242;
 
@@ -63,13 +63,13 @@ let prevHome: string | undefined;
 let prevBackendPort: string | undefined;
 
 beforeEach(() => {
-  home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-home-'));
+  home = makeScratchDir('modoki-home-');
   prevHome = process.env.MODOKI_HOME;
   process.env.MODOKI_HOME = home;
   prevBackendPort = process.env.MODOKI_BACKEND_PORT;
   delete process.env.MODOKI_BACKEND_PORT;
   process.env.MODOKI_DEVICE_HOST_PORT = '1';
-  stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-usb-'));
+  stateDir = makeScratchDir('modoki-usb-');
   children = [];
   nextPid = 4242;
   nextChild = () => fakeChild();

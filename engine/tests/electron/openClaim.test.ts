@@ -9,7 +9,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { found } from '@modoki/engine/testing/inOrder';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -19,6 +18,7 @@ import { acquireBuildClaim, resetBuildClaimsForTests, BUILD_CLAIM_ENV_VAR } from
 import { readScannedSource } from '@modoki/engine/testing';
 import ts from 'typescript';
 import { calledNames, callsTo, declarationOf, enclosingFunction, findNodes, namedFunctions, objectLiteralKeys, parseSource } from '@modoki/engine/testing/sourceAst';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const HELD = { ok: false as const, message: 'a command-line build already holds the build claim', held: { label: 'ios build (CLI)', pid: 4242, kind: 'cli' } };
 
@@ -127,8 +127,8 @@ describe('claimProjectForOpen against the real claim store', () => {
   let holder: ChildProcess | null = null;
 
   beforeEach(() => {
-    home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-openclaim-home-'));
-    project = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-openclaim-proj-'));
+    home = makeScratchDir('modoki-openclaim-home-');
+    project = makeScratchDir('modoki-openclaim-proj-');
     prevHome = process.env.MODOKI_HOME;
     process.env.MODOKI_HOME = home;
   });

@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import {
   ensureWda, wdaBuildStatus, wdaSourceDir, wdaDerivedDataDir, wdaVersionDir,
@@ -8,6 +7,7 @@ import {
   PINNED_WDA, WDA_BUNDLE_ID_FROM, WDA_BUNDLE_ID_TO, WDA_EXPIRY_WARN_DAYS,
   type CommandRunner, type NpmInvocation,
 } from '../../toolchain/wdaProvision'
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /**
  * Guards the WebDriverAgent provisioner (#32 Phase 2) WITHOUT an Xcode or a network — both the npm
@@ -99,7 +99,7 @@ describe('parseProvisioningExpiry', () => {
 
 describe('wdaBuildStatus — present is not the same as usable', () => {
   let base: string
-  beforeEach(() => { base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-wda-')) })
+  beforeEach(() => { base = makeScratchDir('modoki-wda-') })
   afterEach(() => { fs.rmSync(base, { recursive: true, force: true }) })
 
   it('reports absent when nothing is built', () => {
@@ -148,7 +148,7 @@ describe('wdaBuildStatus — present is not the same as usable', () => {
 
 describe('ensureWda', () => {
   let base: string
-  beforeEach(() => { base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-wda-')) })
+  beforeEach(() => { base = makeScratchDir('modoki-wda-') })
   afterEach(() => { fs.rmSync(base, { recursive: true, force: true }) })
 
   /** A runner that satisfies the xcodebuild step by laying down build products. */
@@ -234,7 +234,7 @@ describe('registry wiring — the seam production actually takes', () => {
   let prevDir: string | undefined
   let prevTeam: string | undefined
   beforeEach(() => {
-    base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-wda-tc-'))
+    base = makeScratchDir('modoki-wda-tc-')
     prevDir = process.env.MODOKI_TOOLCHAIN_DIR
     prevTeam = process.env.MODOKI_WDA_TEAM_ID
     process.env.MODOKI_TOOLCHAIN_DIR = base

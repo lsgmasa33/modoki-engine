@@ -17,6 +17,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { makeDirLink, canMakeDirLink, cloneRootSpellings, makeFixtureRoot, DIR_LINK_TYPE } from '../helpers/linkFixture';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 describe('linkFixture is not silently disabled (#949)', () => {
   it('can make a directory link on THIS machine — the skip that guards every consumer is not permanent', () => {
@@ -93,7 +94,7 @@ describe('linkFixture is not silently disabled (#949)', () => {
       // (a) the DEFECT: a root taken under the alias, uncanonicalised. `pwd -P` resolves the
       //     ancestor we never created, so the shell's spelling names `realTmp` while anything
       //     built from the native path names `aliasTmp`. This is macOS's /var → /private/var.
-      const viaAlias = fs.mkdtempSync(path.join(aliasTmp, 'r-'));
+      const viaAlias = makeScratchDir('r-', { base: aliasTmp });
       expect(viaAlias).toContain(path.basename(aliasTmp));
       expect(cloneRootSpellings(viaAlias).physical).not.toContain(path.basename(aliasTmp));
 

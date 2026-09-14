@@ -7,13 +7,13 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
 import path from 'path';
-import os from 'os';
 
 const openInOS = vi.hoisted(() => vi.fn(async () => {}));
 const revealInOS = vi.hoisted(() => vi.fn(async () => {}));
 vi.mock('../../plugins/backend/osOpen', () => ({ openInOS, revealInOS }));
 
 import { handleBackendRequest, type BackendContext } from '../../plugins/backend/editorBackendRouter';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 let tmp: string;
 function makeCtx(): BackendContext {
@@ -30,7 +30,7 @@ function makeCtx(): BackendContext {
 const openFile = (p: string) =>
   handleBackendRequest(makeCtx(), { method: 'POST', urlPath: '/api/open-file', query: new URLSearchParams(), body: { path: p } });
 
-beforeEach(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-openfile-')); openInOS.mockClear(); });
+beforeEach(() => { tmp = makeScratchDir('modoki-openfile-'); openInOS.mockClear(); });
 afterEach(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
 
 describe('/api/open-file', () => {

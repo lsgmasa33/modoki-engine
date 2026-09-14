@@ -11,7 +11,6 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 import { atlasReimportHandler } from '../../plugins/reimport-atlas';
 import { getCacheDir, cachePathFor } from '../../plugins/texture-cache';
@@ -19,6 +18,7 @@ import { atlasPageUrlPath } from '../../plugins/atlas-cache';
 import { readMetaSidecar } from '../../plugins/meta-sidecar';
 import type { ReimportAsset, ReimportContext } from '../../plugins/reimport-registry';
 import type { AtlasCacheBlock } from '../../packages/modoki/src/runtime/loaders/spriteAtlas';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const TEX_A = 'aaaaaaaa-1111-4111-8111-111111111111';
 const TEX_B = 'bbbbbbbb-1111-4111-8111-111111111111';
@@ -69,7 +69,7 @@ function ctxFor(assets: ReimportAsset[]): ReimportContext {
 }
 
 beforeAll(async () => {
-  projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-atlasproj-'));
+  projectRoot = makeScratchDir('modoki-atlasproj-');
   assetsDir = path.join(projectRoot, 'assets');
   fs.mkdirSync(path.join(assetsDir, 'tex'), { recursive: true });
   fs.mkdirSync(path.join(assetsDir, 'sprites'), { recursive: true });

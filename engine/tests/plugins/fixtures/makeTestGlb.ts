@@ -24,8 +24,8 @@
 
 import fs from 'fs';
 import path from 'path';
-import os from 'os';
 import sharp from 'sharp';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 interface MeshData {
   // Pinned to the `<ArrayBuffer>` generic (not the newer default `ArrayBufferLike`) because
@@ -148,7 +148,7 @@ export interface TestGlbOptions {
 /** Build + write a test GLB. Returns its path and the structure tests assert on. */
 export async function makeTestGlb(opts: TestGlbOptions = {}): Promise<TestGlbResult> {
   const { gridSegments = 24, withTexture = true } = opts;
-  const dir = opts.dir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-glb-'));
+  const dir = opts.dir ?? makeScratchDir('modoki-glb-');
   const fileName = opts.fileName ?? 'test-model.glb';
   const glbPath = path.join(dir, fileName);
 

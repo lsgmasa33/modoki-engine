@@ -7,10 +7,10 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import sharp from 'sharp';
 import { splashOutputs, composeSplashOverlays } from '../../scripts/splashCompose.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 let root: string;
 let titleSrc: string;
@@ -27,7 +27,7 @@ async function solid(file: string, w: number, h: number, rgb: [number, number, n
 }
 
 beforeEach(async () => {
-  root = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-splash-'));
+  root = makeScratchDir('modoki-splash-');
   titleSrc = path.join(root, 'title.png');
   badgeLight = path.join(root, 'badge-light.png');
   badgeDark = path.join(root, 'badge-dark.png');

@@ -14,9 +14,9 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
 import { makeDirLink } from '../helpers/linkFixture';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const REPO = path.resolve(__dirname, '../../..');
 const SCRIPT = path.join(REPO, 'engine/scripts/stopDevServer.mjs');
@@ -33,7 +33,7 @@ afterEach(() => {
  *  itself a symlink to `/private/var`, so an un-realpath'd base would make the control case below
  *  differ from the real spelling too and stop being a control. */
 function realTmp(): string {
-  const d = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-devstop-')));
+  const d = fs.realpathSync.native(makeScratchDir('modoki-devstop-'));
   tmps.push(d);
   return d;
 }

@@ -7,11 +7,11 @@
  *  the committed files — a value typed by hand into the text box never passes through here. */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { relativiseUnderProject, planDroppedFileDest } from '../../plugins/backend/projectPaths';
 import { canonicalPath } from '../../scripts/pathIdentity.mjs';
 import { makeDirLink, canMakeFileLink } from '../helpers/linkFixture';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 describe('relativiseUnderProject (#394)', () => {
   it('relativises a file inside the project', () => {
@@ -68,7 +68,7 @@ describe('relativiseUnderProject (#394)', () => {
       // form. Seeding with the walk would build every expectation below from the short spelling
       // while the subject returned the long one, reddening `ci/main`'s windows leg and nothing
       // this Mac can run. That is exactly how `deviceClaimBuildGuard.test.ts` died in #878.
-      tmp = canonicalPath(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-pickpath-')));
+      tmp = canonicalPath(makeScratchDir('modoki-pickpath-'));
       projectRoot = path.join(tmp, 'real', 'court');
       fs.mkdirSync(path.join(projectRoot, 'art'), { recursive: true });
       fs.writeFileSync(path.join(projectRoot, 'art', 'icon.png'), 'x');

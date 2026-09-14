@@ -21,24 +21,14 @@
  *  ⚠️ **Every case here has an ACCEPT side**, not just a reject side — proving a floor REJECTS an
  *  empty result never proves it ACCEPTS a populated one, and a floor that rejects everything would
  *  pass a reject-only suite while breaking the gate for real. */
-import { describe, it, expect, afterAll } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const SCRIPTS = path.resolve(__dirname, '..', '..', 'scripts');
-const made: string[] = [];
-
-afterAll(() => {
-  for (const d of made) fs.rmSync(d, { recursive: true, force: true });
-});
-
-function tmp(prefix: string): string {
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-  made.push(d);
-  return d;
-}
+const tmp = (prefix: string): string => makeScratchDir(prefix);
 
 /** A checkout-shaped tree holding the REAL script plus the two modules it imports, and a stand-in
  *  `tsc` that exits 0. The stand-in is safe: every assertion here is about the floor, which runs

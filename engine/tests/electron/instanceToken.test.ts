@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import {
   TOKEN_FILE,
@@ -14,6 +13,7 @@ import {
   legacyRootKey,
 } from '../../electron/instanceToken';
 import { makeDirLink } from '../helpers/linkFixture';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /**
  * C6 unit gate — the instance token (docs/connect-claude-code.md, C6).
@@ -57,7 +57,7 @@ describe('checkToken — validate if present', () => {
 describe('token store', () => {
   let dir: string;
   beforeEach(() => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-token-'));
+    dir = makeScratchDir('modoki-token-');
     _resetTokenCache();
   });
   afterEach(() => {
@@ -86,7 +86,7 @@ describe('token store', () => {
   });
 
   it('different INSTALLS get different tokens for the SAME project (dev vs DMG)', () => {
-    const other = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-token2-'));
+    const other = makeScratchDir('modoki-token2-');
     try {
       const a = ensureToken(dir, '/a/project');
       _resetTokenCache();
@@ -180,7 +180,7 @@ describe('#899 — a symlinked project spelling is the SAME project', () => {
   let ud = '';
   beforeEach(() => {
     _resetTokenCache();
-    base = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'tok-899-'));
+    base = makeScratchDir('tok-899-', { canonical: true });
     real = path.join(base, 'court');
     fs.mkdirSync(real);
     link = path.join(base, 'link');

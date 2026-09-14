@@ -15,7 +15,6 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 import { execFileSync } from 'child_process';
 
@@ -25,6 +24,7 @@ import {
   DEFAULT_TEXTURE_SETTINGS, variantsForFormat, variantExtension,
   type TextureFormat, type TextureImportSettings, type TextureMaxSize, type TextureType, type TextureVariant,
 } from '../../packages/modoki/src/runtime/loaders/textureSettings';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 function toktxPresent(): boolean {
   try { execFileSync('toktx', ['--version'], { stdio: 'ignore' }); return true; } catch { return false; }
@@ -47,8 +47,8 @@ const SRC_W = 130;
 const SRC_H = 70;
 
 beforeAll(async () => {
-  dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-texsrc-'));
-  projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-texproj-'));
+  dir = makeScratchDir('modoki-texsrc-');
+  projectRoot = makeScratchDir('modoki-texproj-');
   srcPath = path.join(dir, 'source.png');
   const sharp = (await import('sharp')).default;
   const channels = 4;

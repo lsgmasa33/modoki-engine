@@ -9,11 +9,11 @@
  *  UX than a base mesh + a console warning). */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { serveProjectAsset } from '../../plugins/backend/staticAssets';
 import { getModelCacheDir, lodCachePath } from '../../plugins/model-cache';
 import { registerReimportHandler, type ReimportHandler } from '../../plugins/reimport-registry';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 let root: string;
 let errSpy: ReturnType<typeof vi.spyOn>;
@@ -26,7 +26,7 @@ const ctx = () => ({
 
 let warnSpy: ReturnType<typeof vi.spyOn>;
 beforeEach(() => {
-  root = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-sa-'));
+  root = makeScratchDir('modoki-sa-');
   errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
   warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 });

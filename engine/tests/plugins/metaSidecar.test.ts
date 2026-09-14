@@ -2,15 +2,15 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 import { readMetaSidecar, writeMetaSidecar } from '../../plugins/meta-sidecar';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 let tmpRoot: string;
 let absPath: string;
 
 beforeEach(() => {
-  tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-meta-'));
+  tmpRoot = makeScratchDir('modoki-meta-');
   absPath = path.join(tmpRoot, 'asset.glb');
 });
 afterEach(() => { fs.rmSync(tmpRoot, { recursive: true, force: true }); });

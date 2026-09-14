@@ -39,8 +39,8 @@
  * mutation is covered elsewhere.
  */
 
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+
 import { basename, dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -57,6 +57,7 @@ import {
   stripSwiftComments,
 } from './sourceScanner';
 import { repoFiles } from '../../../../scripts/repoCorpus.mjs';
+import { makeScratchDir } from './scratchDir';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const RUNTIME = join(HERE, '../../src/runtime');
@@ -403,7 +404,7 @@ describe('readScannedSource is the one read, and REFUSES rather than falling bac
     return p;
   };
 
-  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'scanned-')); });
+  beforeEach(() => { dir = makeScratchDir('scanned-'); });
   afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
   it('strips by extension and hands back a code view aligned with raw', () => {
@@ -479,7 +480,7 @@ describe('readScannedSource is the one read, and REFUSES rather than falling bac
 
 describe('commentText is the comments and nothing else (#1186)', () => {
   let dir: string;
-  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'comments-')); });
+  beforeEach(() => { dir = makeScratchDir('comments-'); });
   afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
   const read = (name: string, body: string) => {
     const p = join(dir, name);

@@ -10,10 +10,10 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import sharp from 'sharp';
 import { withSplashTheme, splashEdgeColour, applyAndroidSplashTheme } from '../../scripts/androidSplashTheme.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const STYLES_REL = path.join('android', 'app', 'src', 'main', 'res', 'values', 'styles.xml');
 
@@ -35,7 +35,7 @@ const STYLES = `<?xml version="1.0" encoding="utf-8"?>
 `;
 
 let root: string;
-beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-splashtheme-')); });
+beforeEach(() => { root = makeScratchDir('modoki-splashtheme-'); });
 afterEach(() => { fs.rmSync(root, { recursive: true, force: true }); });
 
 describe('withSplashTheme', () => {

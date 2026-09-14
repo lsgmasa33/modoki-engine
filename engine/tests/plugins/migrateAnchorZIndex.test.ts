@@ -22,7 +22,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const REAL_SCRIPTS_DIR = path.resolve(__dirname, '../../scripts');
 
@@ -32,7 +32,7 @@ const REAL_SCRIPTS_DIR = path.resolve(__dirname, '../../scripts');
  *  has to pass `existsSync` to be processed at all — see the script's own `filesMatching` note),
  *  so they `skipIf` on a case-sensitive one rather than fail for an unrelated reason. */
 const CASE_INSENSITIVE_FS = (() => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-case-probe-'));
+  const dir = makeScratchDir('modoki-case-probe-');
   try {
     const lower = path.join(dir, 'caseprobe.txt');
     fs.writeFileSync(lower, 'x');
@@ -57,7 +57,7 @@ let tmp: string;
  *  to keep in step. It costs ~80 small files per test, which is not measurable next to the `git
  *  init` this function already does. */
 function makeRepo({ gitInit = true } = {}) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-migrate-anchor-'));
+  const dir = makeScratchDir('modoki-migrate-anchor-');
   fs.mkdirSync(path.join(dir, 'engine'), { recursive: true });
   fs.cpSync(REAL_SCRIPTS_DIR, path.join(dir, 'engine', 'scripts'), { recursive: true });
   if (gitInit) {

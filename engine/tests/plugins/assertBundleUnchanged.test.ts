@@ -8,11 +8,12 @@
  *  `.vite-temp` when the real writers were elsewhere), while a single added FILE is. Run as a
  *  subprocess, the way the smoke script runs it, so the exit code is what is asserted. */
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
+
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const script = path.join(repoRoot, 'engine', 'scripts', 'assertBundleUnchanged.mjs');
@@ -28,7 +29,7 @@ function run(mode: string, appDir: string, listFile: string): { status: number; 
 }
 
 function fixture(): { dir: string; list: string; cleanup: () => void } {
-  const dir = mkdtempSync(path.join(tmpdir(), 'modoki-bundleguard-'));
+  const dir = makeScratchDir('modoki-bundleguard-');
   mkdirSync(path.join(dir, 'Contents', 'Resources'), { recursive: true });
   writeFileSync(path.join(dir, 'Contents', 'Resources', 'app.asar'), 'x');
   writeFileSync(path.join(dir, 'Contents', 'Info.plist'), 'x');

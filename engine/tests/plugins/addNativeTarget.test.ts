@@ -2,7 +2,6 @@
  *  detection, exercised against temp project dirs. */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -10,6 +9,7 @@ import { ensureCapacitorDeps, ensureCapacitorConfig, detectMissingFirebase, dete
 import { mergeProjectConfig } from '../../project-config';
 import { makeDirLink } from '../helpers/linkFixture';
 import { acquireBuildClaim, resetBuildClaimsForTests } from '../../scripts/buildClaimsStore.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 let root: string;
 let editorRoot: string;
@@ -18,13 +18,13 @@ let prevHome: string | undefined;
 let releaseClaim: (() => void) | null;
 
 beforeEach(() => {
-  root = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ant-'));
-  editorRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ant-ed-'));
+  root = makeScratchDir('modoki-ant-');
+  editorRoot = makeScratchDir('modoki-ant-ed-');
   // Mark root as a real Modoki project so the D8 containment guard allows scaffolding.
   fs.writeFileSync(path.join(root, 'project.config.json'), '{}');
   // scaffoldNativeTarget refuses unless this process holds the project's build claim (#1160), as
   // both real callers do. Claimed in a private MODOKI_HOME so no test shares a claims file.
-  home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ant-home-'));
+  home = makeScratchDir('modoki-ant-home-');
   prevHome = process.env.MODOKI_HOME;
   process.env.MODOKI_HOME = home;
   const claim = acquireBuildClaim(root, 'native scaffold (test)');
@@ -57,7 +57,7 @@ describe('isPlausibleProjectDir (D8 containment)', () => {
     expect(isPlausibleProjectDir(path.join(root, 'nope'))).toBe(false);
   });
   it('rejects a dir with no project markers', () => {
-    const bare = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-bare-'));
+    const bare = makeScratchDir('modoki-bare-');
     try {
       expect(isPlausibleProjectDir(bare)).toBe(false);
     } finally {
@@ -65,7 +65,7 @@ describe('isPlausibleProjectDir (D8 containment)', () => {
     }
   });
   it('ensureCapacitorDeps refuses to scaffold a non-project dir', () => {
-    const bare = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-bare-'));
+    const bare = makeScratchDir('modoki-bare-');
     try {
       expect(() => ensureCapacitorDeps(bare, 'ios', editorRoot)).toThrow(/doesn't look like a Modoki project/);
       expect(fs.existsSync(path.join(bare, 'package.json'))).toBe(false); // nothing written
@@ -308,7 +308,7 @@ describe('scaffoldNativeTarget — the claim gate (#1160)', () => {
 
   it('refuses when ANOTHER project is claimed — the claim is per project root', async () => {
     releaseClaim?.();
-    const other = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ant-other-'));
+    const other = makeScratchDir('modoki-ant-other-');
     try {
       const c = acquireBuildClaim(other, 'someone else');
       if (!c.ok) throw new Error(c.message);
@@ -388,7 +388,7 @@ describe('scaffoldNativeTarget repair (#581)', () => {
       const cfg = mergeProjectConfig({ app: { appId: 'com.x.y', appName: 'My Game', iconSource: '' } });
       // The real native project lives elsewhere; `ios/` is only a link to it — the shape a user
       // creates to keep a big native tree off a small volume, or to share one between checkouts.
-      const real = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ant-real-'));
+      const real = makeScratchDir('modoki-ant-real-');
       const keeper = path.join(real, 'App', 'App.xcodeproj', 'project.pbxproj');
       fs.mkdirSync(path.dirname(keeper), { recursive: true });
       fs.writeFileSync(keeper, '// the user\'s customised project — must survive');
@@ -411,7 +411,7 @@ describe('scaffoldNativeTarget repair (#581)', () => {
       const cfg = mergeProjectConfig({ app: { appId: 'com.x.y', appName: 'My Game', iconSource: '' } });
       // A COMPLETE target this time, so only `force` selects it for removal — the case the
       // Firebase guard above already refuses for the same flag, and for the same reason.
-      const real = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ant-real-'));
+      const real = makeScratchDir('modoki-ant-real-');
       const pbx = path.join(real, 'App', 'App.xcodeproj', 'project.pbxproj');
       fs.mkdirSync(path.dirname(pbx), { recursive: true });
       fs.writeFileSync(pbx, '// stub');

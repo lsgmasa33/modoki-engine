@@ -17,6 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { hasAgentSettings } from '../helpers/repoLayout';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..', '..');
 const guard = path.join(repoRoot, 'engine/scripts/context-cost-guard.mjs');
@@ -31,7 +32,7 @@ function freshSid(): string {
 }
 
 beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ctxguard-fixtures-'));
+  tmpDir = makeScratchDir('modoki-ctxguard-fixtures-');
 });
 
 afterEach(() => {
@@ -452,7 +453,6 @@ describe('context-cost-guard — settings registration', () => {
     },
   );
 });
-
 
 describe('context-cost-guard — chain rule (#1107)', () => {
   /** The chain rule is the ONLY rule here whose subject is the TURN rather than the command, so

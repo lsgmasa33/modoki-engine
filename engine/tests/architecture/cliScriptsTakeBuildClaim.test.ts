@@ -17,7 +17,6 @@
  *  top-level execution order. */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -25,6 +24,7 @@ import { acquireBuildClaim, resetBuildClaimsForTests, BUILD_CLAIM_ENV_VAR } from
 import { readScannedSource } from '@modoki/engine/testing';
 import ts from 'typescript';
 import { callsTo, enclosingFunction, parseSource, stringValueOf } from '@modoki/engine/testing/sourceAst';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const scriptsDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../scripts');
 const repoRoot = path.resolve(scriptsDir, '../..');
@@ -36,8 +36,8 @@ let token: string | undefined;
 let release: (() => void) | null = null;
 
 beforeEach(() => {
-  home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-cli-claim-home-'));
-  project = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-cli-claim-proj-'));
+  home = makeScratchDir('modoki-cli-claim-home-');
+  project = makeScratchDir('modoki-cli-claim-proj-');
   prevHome = process.env.MODOKI_HOME;
   process.env.MODOKI_HOME = home;
   const claim = acquireBuildClaim(project, 'native build (test holder)', { kind: 'cli' });

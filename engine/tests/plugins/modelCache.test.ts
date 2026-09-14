@@ -2,12 +2,12 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 import {
   hashKey, cacheDirFor, processedCachePath, lodCachePath, cacheHit, pruneStaleCacheDirs,
 } from '../../plugins/model-cache';
 import { DEFAULT_MODEL_SETTINGS } from '../../packages/modoki/src/runtime/loaders/modelSettings';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 describe('model-cache hashKey', () => {
   it('is deterministic for the same bytes + settings + loader + recipe', () => {
@@ -75,7 +75,7 @@ describe('cacheHit — file integrity validation', () => {
   ]);
 
   beforeEach(() => {
-    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-cache-hit-'));
+    tmpRoot = makeScratchDir('modoki-cache-hit-');
     cacheDir = path.join(tmpRoot, 'cache');
     fs.mkdirSync(cacheDirFor(cacheDir, urlPath, hash), { recursive: true });
   });
@@ -130,7 +130,7 @@ describe('pruneStaleCacheDirs — bounds per-source cache growth', () => {
   };
 
   beforeEach(() => {
-    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-prune-'));
+    tmpRoot = makeScratchDir('modoki-prune-');
     cacheDir = path.join(tmpRoot, 'cache');
   });
   afterEach(() => { fs.rmSync(tmpRoot, { recursive: true, force: true }); });

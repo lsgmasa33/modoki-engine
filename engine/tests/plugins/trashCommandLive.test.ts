@@ -27,12 +27,13 @@ import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { moveToTrash, trashCommand } from '../../plugins/asset-fs-ops';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const onWin = process.platform === 'win32';
 const roots: string[] = [];
 
 function fixture(): { root: string; files: string[]; dir: string } {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-trash-live-'));
+  const root = makeScratchDir('modoki-trash-live-');
   roots.push(root);
   const files = ['a file.json', "it's [weird].json", 'にほんご.json', 'Grüße.json'].map((n) => {
     const p = path.join(root, n);
@@ -106,7 +107,7 @@ describe.skipIf(!onWin)('moveToTrash on real Windows', () => {
     //
     // So we reproduce the legacy condition by forcing 437 ahead of the REAL built script. If
     // the shipped script stops resetting the encoding, 437 stands and this goes red.
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-trash-cp-'));
+    const root = makeScratchDir('modoki-trash-cp-');
     roots.push(root);
     const uni = path.join(root, 'にほんご.json');
     fs.writeFileSync(uni, '{}');

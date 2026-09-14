@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import { captureIosSyslog, parseSyslogLine, DEFAULT_CAPTURE_SECONDS, MAX_CAPTURE_SECONDS } from '../../plugins/backend/deviceSyslog'
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /**
  * Host-side iOS system-log capture. go-ios is stubbed by a script that emits the same JSON-per-line
@@ -20,7 +20,7 @@ import { captureIosSyslog, parseSyslogLine, DEFAULT_CAPTURE_SECONDS, MAX_CAPTURE
  */
 describe.skipIf(process.platform === 'win32')('deviceSyslog — captureIosSyslog (stubbed go-ios)', () => {
   let dir: string
-  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-syslog-')) })
+  beforeEach(() => { dir = makeScratchDir('modoki-syslog-') })
   afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }) })
 
   /** A fake `ios` that prints `body` and then (unless `hang`) sleeps, like a real stream. */

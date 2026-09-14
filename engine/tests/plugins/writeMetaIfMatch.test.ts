@@ -24,11 +24,11 @@
  *  as before. */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 let projectRoot = '';
 
@@ -85,7 +85,7 @@ function seed(meta: Record<string, unknown>): Buffer {
   return fs.readFileSync(metaAbs());
 }
 
-beforeEach(() => { projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-write-meta-if-match-')); });
+beforeEach(() => { projectRoot = makeScratchDir('modoki-write-meta-if-match-'); });
 afterEach(() => { fs.rmSync(projectRoot, { recursive: true, force: true }); });
 
 describe('/api/read-meta — the baseline it hands the client (#845)', () => {

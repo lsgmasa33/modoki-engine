@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import {
   DEFAULT_BACKEND_PORT,
@@ -10,6 +9,7 @@ import {
   readLastPort,
   writeLastPort,
 } from '../../electron/backendPort';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /**
  * C5 unit gate — the STICKY backend-port ladder (docs/connect-claude-code.md, C5).
@@ -105,7 +105,7 @@ describe('parseBackendPort', () => {
 
 describe('last-port persistence', () => {
   let dir: string;
-  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-port-')); });
+  beforeEach(() => { dir = makeScratchDir('modoki-port-'); });
   afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
   it('null when nothing remembered', () => {

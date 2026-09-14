@@ -7,6 +7,7 @@ import { findDeleteBoundaries, describeBoundary } from '../../scripts/deleteBoun
 import { makeDirLink } from '../helpers/linkFixture';
 import { readScannedSource } from '@modoki/engine/testing';
 import { refuseUnsafeReplace } from '../../toolchain/replaceGuard';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /** `deleteBoundary.mjs` — "would a recursive delete of this subtree misreport what it did?"
  *
@@ -21,7 +22,7 @@ import { refuseUnsafeReplace } from '../../toolchain/replaceGuard';
  */
 describe('deleteBoundary — the subtree pre-flight (#990/#989/#1004)', () => {
   let root: string;
-  beforeEach(() => { root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'db-'))); });
+  beforeEach(() => { root = fs.realpathSync.native(makeScratchDir('db-')); });
   afterEach(() => { try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* fixture */ } });
 
   const mk = (...seg: string[]) => { const p = path.join(root, ...seg); fs.mkdirSync(p, { recursive: true }); return p; };
@@ -241,7 +242,7 @@ describe('deleteBoundary — the subtree pre-flight (#990/#989/#1004)', () => {
      *  The mount is of the temp dir's OWN volume, so no other drive is ever involved. */
     const withMount = (name: string, body: (mountPath: string, base: string) => void) => {
       expect(volumeGuidPath, 'could not read the volume GUID — cannot build the fixture').toBeTruthy();
-      const base = fs.mkdtempSync(path.join(os.tmpdir(), 'db-mnt-'));
+      const base = makeScratchDir('db-mnt-');
       const mountPath = path.join(base, name);
       fs.mkdirSync(path.dirname(mountPath), { recursive: true });
       // `mklink` is a cmd builtin, so it needs cmd rather than a direct spawn. A junction whose
@@ -326,7 +327,7 @@ describe('every persistent-destination REPLACE in engine/toolchain consults the 
 
   // Own fixture: the suite's `root`/`mk`/`payload` belong to the describe above.
   let gRoot: string;
-  beforeEach(() => { gRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'rg-'))); });
+  beforeEach(() => { gRoot = fs.realpathSync.native(makeScratchDir('rg-')); });
   afterEach(() => { try { fs.rmSync(gRoot, { recursive: true, force: true }); } catch { /* fixture */ } });
 
   it.each(SITES)('$file guards its rmSync of $dest', ({ file, dest }) => {

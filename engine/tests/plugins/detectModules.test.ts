@@ -1,9 +1,9 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { detectModules, resolveModules, MODULE_KEYS } from '../../plugins/detect-modules';
 import { DEFAULT_PROJECT_CONFIG, mergeProjectConfig, type ProjectConfig } from '../../project-config';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const cleanup: string[] = [];
 afterEach(() => {
@@ -13,7 +13,7 @@ afterEach(() => {
 
 /** Scaffold a throwaway project with the given scene files under runtime/assets/scenes. */
 function makeProject(scenes: Record<string, unknown>): string {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-detect-'));
+  const root = makeScratchDir('modoki-detect-');
   cleanup.push(root);
   const dir = path.join(root, 'runtime', 'assets', 'scenes');
   fs.mkdirSync(dir, { recursive: true });
@@ -101,7 +101,7 @@ describe('detectModules', () => {
   });
 
   it('does not false-match a project cloned under a "scenes" ancestor dir', () => {
-    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-detect-'));
+    const base = makeScratchDir('modoki-detect-');
     cleanup.push(base);
     const projectRoot = path.join(base, 'scenes', 'mygame'); // ancestor segment named "scenes"
     const sceneDir = path.join(projectRoot, 'runtime', 'assets', 'scenes');

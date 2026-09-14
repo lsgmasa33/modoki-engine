@@ -15,13 +15,12 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fs from 'fs';
-import os from 'os';
-import path from 'path';
 import { execFileSync } from 'child_process';
 
 import { convertModel, __resetModelCliChecks } from '../../plugins/model-convert';
 import { DEFAULT_MODEL_SETTINGS, type ModelImportSettings, type ModelEncoder } from '../../packages/modoki/src/runtime/loaders/modelSettings';
 import { makeTestGlb, type TestGlbResult } from './fixtures/makeTestGlb';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 // --- CLI availability gate -------------------------------------------------
 function cliPresent(): { gltfTransform: boolean; gltfpack: boolean } {
@@ -121,7 +120,7 @@ let projectRoot: string; // sandbox so we never touch the real node_modules/.cac
 
 beforeAll(async () => {
   fixture = await makeTestGlb({ gridSegments: 24 }); // 1152 grid + 12 box = 1164 tris
-  projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-proj-'));
+  projectRoot = makeScratchDir('modoki-proj-');
 }, 60_000);
 
 afterAll(() => {

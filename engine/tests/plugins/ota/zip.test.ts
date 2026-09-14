@@ -6,10 +6,11 @@
  *  not something to run per-CI-invocation. */
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { writeFileSync, rmSync } from 'node:fs';
+
 import path from 'node:path';
 import { buildZip } from '../../../scripts/ota/zip.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 describe('buildZip', () => {
   it('produces a zip the system unzip CLI accepts and extracts correctly', () => {
@@ -21,7 +22,7 @@ describe('buildZip', () => {
     ];
     const zip = buildZip(entries);
 
-    const dir = mkdtempSync(path.join(tmpdir(), 'modoki-ota-zip-test-'));
+    const dir = makeScratchDir('modoki-ota-zip-test-');
     const zipPath = path.join(dir, 'test.zip');
     writeFileSync(zipPath, zip);
     try {

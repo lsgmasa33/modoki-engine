@@ -29,10 +29,10 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { relay } from './backendRelay';
-import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 let projectRoot = '';
 
@@ -74,7 +74,7 @@ const write = (body: Record<string, unknown>, ctx: BackendContext) =>
 const onDiskNow = () => JSON.parse(fs.readFileSync(path.join(projectRoot, PATH.replace(/^\//, '')), 'utf-8'));
 
 beforeEach(() => {
-  projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-asset-write-gate-'));
+  projectRoot = makeScratchDir('modoki-asset-write-gate-');
   fs.mkdirSync(path.dirname(path.join(projectRoot, PATH.replace(/^\//, ''))), { recursive: true });
   fs.writeFileSync(path.join(projectRoot, PATH.replace(/^\//, '')), `${JSON.stringify(onDisk, null, 2)}\n`);
 });

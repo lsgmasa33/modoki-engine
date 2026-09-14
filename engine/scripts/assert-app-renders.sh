@@ -39,6 +39,11 @@ APPLOG="$(mktemp "${TMPDIR:-/tmp}/modoki-render-app.XXXXXX")"
 # A throwaway Chromium profile — see the --user-data-dir note at the launch below. Explicit
 # template for the same GNU-mktemp reason as the two lines above.
 USERDATA="$(mktemp -d "${TMPDIR:-/tmp}/modoki-render-ud.XXXXXX")"
+# Temp lifetime (#1117). Nothing removed these before, so every run left a whole Chromium profile
+# behind. The profile is removed on every exit. A log is removed on a PASS, or when it is empty. A failure
+# keeps a non-empty log and prints its path, because the full file is what you read next.
+RENDER_PASSED=0
+trap 'rm -rf "$USERDATA"; for f in "$VITELOG" "$APPLOG"; do { [ "$RENDER_PASSED" = 1 ] || [ ! -s "$f" ]; } && rm -f "$f"; done; true' EXIT
 # Per-clone, and OUTSIDE the human-editor range (#69). This used to be a hardcoded 5179 —
 # the main clone's own editor backend port — so running this harness while your editor was
 # up simply failed: the packaged app PINS MODOKI_BACKEND_PORT and refuses to drift (E6).
@@ -92,7 +97,7 @@ PID=$!
 
 entities=0
 for i in $(seq 1 60); do
-  kill -0 $PID 2>/dev/null || { echo "[render] FAIL: app exited early (${i}s)"; tail -15 "$APPLOG"; exit 1; }
+  kill -0 $PID 2>/dev/null || { echo "[render] FAIL: app exited early (${i}s) — log kept: $APPLOG"; tail -15 "$APPLOG"; exit 1; }
   # `node`, not `python3` — matching smoke-packaged.sh. Python is not a dependency of this repo and
   # is absent on a stock Windows box; worse, Windows ships an App-Execution-Alias STUB at
   # `WindowsApps/python3` that `command -v` FINDS but which only prints "Python was not found" and
@@ -124,4 +129,4 @@ if [ -n "$CONSOLE_ERR" ]; then echo "[render] FAIL: renderer console errors:"; e
 else echo "[render] ok: no renderer console errors"; fi
 
 kill $PID 2>/dev/null || true
-[ "$fail" = 0 ] && { echo "[render] PASS ✅"; exit 0; } || { echo "[render] FAILED ❌"; exit 1; }
+[ "$fail" = 0 ] && { RENDER_PASSED=1; echo "[render] PASS ✅"; exit 0; } || { echo "[render] FAILED ❌ (logs kept: $APPLOG $VITELOG)"; exit 1; }

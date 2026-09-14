@@ -10,15 +10,15 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 import * as THREE from 'three';
 import { rebaseLodGeometry } from '../../plugins/model-convert';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 let tmpRoot: string;
 
 beforeEach(() => {
-  tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-rebase-'));
+  tmpRoot = makeScratchDir('modoki-rebase-');
 });
 afterEach(() => { fs.rmSync(tmpRoot, { recursive: true, force: true }); });
 

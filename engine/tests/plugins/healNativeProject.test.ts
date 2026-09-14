@@ -15,8 +15,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { expectInOrder } from '@modoki/engine/testing/inOrder';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const calls: string[] = [];
 /** Which project/engine root each step was handed — a swapped pair vendors INTO the engine checkout. */
@@ -77,10 +77,10 @@ beforeEach(() => {
   state.problems = [];
   state.reason = null;
   state.fb = { ok: true, notes: [] };
-  home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-home-'));
+  home = makeScratchDir('modoki-home-');
   prevHome = process.env.MODOKI_HOME;
   process.env.MODOKI_HOME = home;
-  project = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-heal-project-'));
+  project = makeScratchDir('modoki-heal-project-');
   const claim = acquireBuildClaim(project, 'ios build');
   if (!claim.ok) throw new Error(`fixture could not claim: ${claim.message}`);
   release = claim.release;

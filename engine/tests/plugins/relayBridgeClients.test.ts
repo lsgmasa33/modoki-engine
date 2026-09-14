@@ -21,9 +21,9 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { assetScannerPlugin } from '../../plugins/vite-asset-scanner';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 type WsMessage = { type: string; event?: string; data?: unknown };
 type WsHandler = (data: unknown, client?: unknown) => void;
@@ -96,7 +96,7 @@ function fakeRes() {
 }
 
 beforeEach(() => {
-  projectRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-relay-')));
+  projectRoot = fs.realpathSync(makeScratchDir('modoki-relay-'));
   fs.mkdirSync(path.join(projectRoot, 'engine'), { recursive: true });
   savedProject = process.env.MODOKI_PROJECT;
   delete process.env.MODOKI_PROJECT;

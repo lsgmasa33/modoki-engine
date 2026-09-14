@@ -36,8 +36,8 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'fs';
 import path from 'path';
-import os from 'os';
 import { hasScratchTooling } from '../helpers/repoLayout';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const ENGINE = path.resolve(__dirname, '../..');
 
@@ -159,7 +159,7 @@ describe('format-version fields are emitted from a named constant, never a numer
   });
 
   it('the ignore-marker mechanism only skips the marked line, not the whole file', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'format-version-guard-'));
+    const dir = makeScratchDir('format-version-guard-');
     const file = path.join(dir, 'synthetic.mjs');
     try {
       // A real violation with NO marker must still be flagged...

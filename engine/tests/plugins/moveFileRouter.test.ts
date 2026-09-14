@@ -7,13 +7,13 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
 import path from 'path';
-import os from 'os';
 import { handleBackendRequest, type BackendContext } from '../../plugins/backend/editorBackendRouter';
 // The REAL resolver and canonicalizer, not hand-rolled stand-ins. A simplified
 // `resolveAssetPath` here silently modelled a route that does NOT tolerate a missing leading
 // slash or a percent-encoded segment — which is precisely the tolerance the canonicalization
 // finding is about, so a fake would have made the guard defend the bug.
 import { resolveAssetPath, absToAssetUrl, createBrowserRequestRegistry, type AssetRoot } from '../../plugins/vite-asset-scanner';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 let tmp: string;
 let tmp2: string;
@@ -70,8 +70,8 @@ const relOf = (abs: string) => abs.slice(tmp.length).replace(/\\/g, '/');
 const markedRel = () => rec.marked.map((m) => relOf(m.abs));
 
 beforeEach(() => {
-  tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-mvrouter-'));
-  tmp2 = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-mvrouter2-'));
+  tmp = makeScratchDir('modoki-mvrouter-');
+  tmp2 = makeScratchDir('modoki-mvrouter2-');
   rec = { marked: [], asked: [] };
   browserFailure = null;
 });

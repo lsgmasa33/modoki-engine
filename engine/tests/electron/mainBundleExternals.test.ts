@@ -4,10 +4,10 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import esbuild from 'esbuild';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
 import { electronOpts, electronMainOutfile, repoRoot } from '../../scripts/electronBuildOpts.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /**
  * PACKAGING GUARD — nothing the Electron MAIN bundle keeps external may resolve to TypeScript.
@@ -98,7 +98,7 @@ let builtMain: string;
 let inputs: string[];
 
 beforeAll(async () => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-main-externals-'));
+  tmpDir = makeScratchDir('modoki-main-externals-');
   // The SHIPPED options with exactly the three overrides isolation requires. They are parameters
   // of `electronOpts` rather than a spread here, so this suite cannot accidentally override the
   // fields that make the defect possible (`packages`, `platform`, `format`, the entry points).

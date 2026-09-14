@@ -649,6 +649,8 @@ export default defineConfig(({ command }) => {
     },
     environment: 'jsdom',
     setupFiles: './tests/setup.ts',
+    // Reaps the claims-store fallback dirs the main process and spawned children leave (#1117).
+    globalSetup: './tests/globalSetup.ts',
     // The default 5s per-test timeout is too tight for the FIRST test in a file that cold-imports a
     // heavy dependency graph (three.js + the engine) — esbuild's first transform of that graph can
     // take several seconds on Windows, so tests intermittently timed out under full-suite load.

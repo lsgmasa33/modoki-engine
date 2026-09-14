@@ -34,7 +34,7 @@ let root: string;
 let savedToolchainDir: string | undefined;
 
 beforeEach(() => {
-  root = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-heal-'));
+  root = makeScratchDir('modoki-heal-');
   // The sdk.dir heal resolves the SDK through the shared toolchain probe, which only honours
   // ANDROID_HOME in DEV-editor mode. A dev box that exports MODOKI_TOOLCHAIN_DIR (some do, so CLI
   // builds find toktx) is bundled-only, so the fixture SDK below would be ignored — unset it.
@@ -145,7 +145,7 @@ function readPbxproj(): string {
 describe('healNativeConfig — android/local.properties', () => {
   it('writes sdk.dir when android/ exists and the file is missing', () => {
     fs.mkdirSync(path.join(root, 'android'));
-    const sdk = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-sdk-'));
+    const sdk = makeScratchDir('fake-sdk-');
     // A usable SDK has platform-tools — the shared toolchain probe now requires it (the
     // consistent marker check that unified this with vite-asset-scanner's build-time probe).
     fs.mkdirSync(path.join(sdk, 'platform-tools'));
@@ -173,7 +173,7 @@ describe('healNativeConfig — android/local.properties', () => {
     fs.mkdirSync(path.join(root, 'android'));
     const lp = path.join(root, 'android', 'local.properties');
     fs.writeFileSync(lp, 'sdk.dir=C:\\Users\\winuser\\AppData\\Roaming\\modoki-app\\toolchain\\android-sdk\n');
-    const sdk = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-sdk-'));
+    const sdk = makeScratchDir('fake-sdk-');
     fs.mkdirSync(path.join(sdk, 'platform-tools')); // the toolchain probe requires this marker to accept an SDK — without it detectAndroidSdk returns null on a host with no other discoverable SDK (e.g. Windows CI), so the repair never runs
     process.env.ANDROID_HOME = sdk;
     healNativeConfig(root);
@@ -2866,3 +2866,5 @@ describe('healNativeConfig — #370 review findings', () => {
     expect(readIgnore(), 'a #196-cited block is left byte-identical').toBe(aged);
   });
 });
+
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';

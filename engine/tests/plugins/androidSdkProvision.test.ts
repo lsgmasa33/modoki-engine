@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import { ensureCmdlineTools, sdkmanagerPath, cmdlineToolsKey, PINNED_CMDLINE_TOOLS, ANDROID_SDK_PACKAGES, type FetchLike } from '../../toolchain'
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /**
  * Guards the Android SDK cmdline-tools bootstrap (Phase E-3) WITHOUT a real ~150MB download — the
@@ -12,7 +12,7 @@ import { ensureCmdlineTools, sdkmanagerPath, cmdlineToolsKey, PINNED_CMDLINE_TOO
  */
 describe('androidSdkProvision — ensureCmdlineTools (mocked fetch)', () => {
   let sdkRoot: string
-  beforeEach(() => { sdkRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-android-')) })
+  beforeEach(() => { sdkRoot = makeScratchDir('modoki-android-') })
   afterEach(() => { fs.rmSync(sdkRoot, { recursive: true, force: true }) })
 
   const fakeFetch = (bytes: Buffer, ok = true, status = 200): FetchLike =>

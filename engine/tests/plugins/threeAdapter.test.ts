@@ -9,7 +9,6 @@
 
 import { describe, it, expect, vi, afterEach, beforeAll, afterAll } from 'vitest';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 import * as THREE from 'three';
 import { Document, NodeIO } from '@gltf-transform/core';
@@ -18,6 +17,7 @@ import {
   applyChangesToDocument, loadGlbToThreeMeshes, writeDocument,
   type LoadedGlb, type AdaptedMesh,
 } from '../../plugins/model-convert/threeAdapter';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -313,7 +313,7 @@ describe('Stage A round-trip — quantized UV source never bakes a FLOAT+normali
   // vertex format and crashed createRenderPipeline every frame. This exercises
   // the real adapter end-to-end (the unit tests above only hit one hop).
   let tmpDir: string;
-  beforeAll(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-adapter-')); });
+  beforeAll(() => { tmpDir = makeScratchDir('modoki-adapter-'); });
   afterAll(() => { if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('denormalizes on load and writes a plain Float32 UV back out', async () => {
@@ -373,7 +373,7 @@ describe('loadGlbToThreeMeshes — a prototype-named attribute SEMANTIC never re
   // be green for the wrong reason. The day this goes RED — gltf-transform stops throwing — is the day
   // the guard becomes live: replace this with a load that asserts only real attributes are mapped.
   let tmpDir: string;
-  beforeAll(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-adapter-proto-')); });
+  beforeAll(() => { tmpDir = makeScratchDir('modoki-adapter-proto-'); });
   afterAll(() => { if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true }); });
 
   /** gltf-transform cannot even BUILD a primitive with a prototype-named semantic (the same throw, on

@@ -11,8 +11,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
-import os from 'os';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const PREFAB_GUID = 'b2c3d4e5-1111-2222-3333-444455556666';
 const SCENE_REL = '/assets/scenes/main.json';
@@ -67,7 +67,7 @@ const scene = (overrides: Record<string, unknown>) => ({
   ],
 });
 
-beforeEach(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-validate-scene-prefab-')); });
+beforeEach(() => { tmp = makeScratchDir('modoki-validate-scene-prefab-'); });
 afterEach(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
 
 describe('GET /api/validate-scene — real prefab resolver (#35)', () => {

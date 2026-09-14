@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import { buildStepEnv, resolveGcloudDir } from '../../plugins/vite-asset-scanner'
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /**
  * Guards the /api/build step-env helper's NO-PROVISION branches (dev / not opted in), which are
@@ -42,7 +42,7 @@ describe('buildStepEnv — no-provision branches', () => {
 
 describe('resolveGcloudDir — gcloud resolution for web deploy', () => {
   let tmp: string
-  beforeEach(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-gcloud-')) })
+  beforeEach(() => { tmp = makeScratchDir('modoki-gcloud-') })
   afterEach(() => { fs.rmSync(tmp, { recursive: true, force: true }) })
 
   it('an override pointing at the gcloud BINARY returns its dir', () => {

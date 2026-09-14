@@ -9,6 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { mcpOutfile, mcpOpts } from '../../scripts/mcpBuildOpts.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /**
  * C1 integration gate — the packaged "Connect Claude Code" MCP bundle.
@@ -40,7 +41,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 
 describe('modoki-mcp packaged bundle', () => {
   it('bundles self-contained and prints the start banner when run standalone', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-mcp-bundle-'));
+    const dir = makeScratchDir('modoki-mcp-bundle-');
     // Output .mjs so the isolated dir needs no package.json `type:module` — this is a
     // STRICTER self-containment check than the shipped index.js (which relies on the
     // MCP package.json shipping alongside it).
@@ -138,7 +139,7 @@ describe('the SHIPPED modoki-mcp bundle (#945 B1)', () => {
     // emits are relative to the cwd. This case is valid only because npm runs BOTH vitest and
     // `build:electron` from the repo root; invoked from elsewhere it would report a false STALE.
     // If this ever needs to survive an arbitrary cwd, pin `absWorkingDir` in `mcpOpts`.
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-mcp-current-'));
+    const dir = makeScratchDir('modoki-mcp-current-');
     try {
       // Same basename, because `sourcemap: true` bakes `//# sourceMappingURL=<basename>.map`
       // into the output — a different name would diff on that line alone.

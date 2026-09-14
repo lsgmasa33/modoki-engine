@@ -3,12 +3,13 @@
  *  real throwaway repository, because what they must get right is git's own answer. */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+
 import path from 'node:path';
 import {
   BUILD_STAMP_FILENAME, otaBuildProvenance, readGitProvenance, readHeadCommit, settleBuildStamp, writeBuildStamp,
 } from '../../../scripts/ota/buildStamp.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const SHA = 'f'.repeat(40);
 
@@ -77,7 +78,7 @@ describe('readGitProvenance against a real repository', () => {
   const git = (...args: string[]) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8' }).trim();
 
   beforeEach(() => {
-    dir = mkdtempSync(path.join(tmpdir(), 'modoki-build-stamp-'));
+    dir = makeScratchDir('modoki-build-stamp-');
     git('init', '-q');
     git('config', 'user.email', 'test@example.invalid');
     git('config', 'user.name', 'test');
@@ -143,7 +144,7 @@ describe('readGitProvenance against a real repository', () => {
   });
 
   it('a directory that is not in a repository is unknown, never clean', () => {
-    const outside = mkdtempSync(path.join(tmpdir(), 'modoki-build-stamp-nogit-'));
+    const outside = makeScratchDir('modoki-build-stamp-nogit-');
     try {
       expect(readGitProvenance(outside)).toEqual({ commit: null, dirty: null });
     } finally {

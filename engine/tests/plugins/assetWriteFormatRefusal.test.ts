@@ -23,11 +23,11 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { relay } from './backendRelay';
-import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
 import { PARTICLE_FORMAT_VERSION, defaultParticleEffect } from '../../packages/modoki/src/runtime/particles/types';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 let projectRoot = '';
 
@@ -55,7 +55,7 @@ const post = (urlPath: string, body: unknown, ctx: BackendContext) =>
 const ASSET_PATH = '/assets/probe.particle.json';
 
 beforeEach(() => {
-  projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-assetwrite-'));
+  projectRoot = makeScratchDir('modoki-assetwrite-');
   fs.mkdirSync(path.join(projectRoot, 'assets'), { recursive: true });
 });
 afterEach(() => { fs.rmSync(projectRoot, { recursive: true, force: true }); });

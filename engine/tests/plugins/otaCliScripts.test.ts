@@ -7,10 +7,10 @@
  *  integration-test posture as modelPipeline.integration.test.ts's CLI shellouts. */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { execFileSync } from 'child_process';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const engineRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -18,7 +18,7 @@ const engineRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '.
  *  engine/scripts/<script>.mjs — build a scratch "repo" with that same shape so we don't
  *  touch the real repo's build/ota-keys/ (which may hold a real, precious private key). */
 function makeScratchRepo(): string {
-  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-cli-test-'));
+  const repoRoot = makeScratchDir('modoki-ota-cli-test-');
   fs.mkdirSync(path.join(repoRoot, 'engine', 'scripts'), { recursive: true });
   // Mirror engine/scripts/ota-*.mjs + ota/ so the scripts' relative imports resolve.
   fs.cpSync(path.join(engineRoot, 'scripts', 'ota-keygen.mjs'), path.join(repoRoot, 'engine', 'scripts', 'ota-keygen.mjs'));
@@ -154,7 +154,7 @@ describe('ota-keygen.mjs', () => {
   // resolution somewhere else" test in otaPublishReleaseRace.test.ts) rather than being
   // silently ignored in favor of import.meta.url's own guess.
   it('--repo-root writes the key under THAT root, not the script\'s own default root', () => {
-    const otherRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-keygen-other-root-'));
+    const otherRoot = makeScratchDir('modoki-ota-keygen-other-root-');
     try {
       const { status } = runNode(repoRoot, 'engine/scripts/ota-keygen.mjs', ['--repo-root', otherRoot]);
       expect(status).toBe(0);
@@ -178,7 +178,7 @@ describe('ota-keygen.mjs', () => {
   });
 
   it('a positional name plus --repo-root still names the file <name>.json (backward-compatible parsing)', () => {
-    const otherRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-keygen-other-root-named-'));
+    const otherRoot = makeScratchDir('modoki-ota-keygen-other-root-named-');
     try {
       const { status } = runNode(repoRoot, 'engine/scripts/ota-keygen.mjs', ['prod', '--repo-root', otherRoot]);
       expect(status).toBe(0);
@@ -259,7 +259,7 @@ describe('ota-embed-manifest.mjs', () => {
   });
 
   it('#582: rejects a --dist outside --project', () => {
-    const outsideDist = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-embed-outside-dist-'));
+    const outsideDist = makeScratchDir('modoki-ota-embed-outside-dist-');
     try {
       fs.writeFileSync(path.join(outsideDist, 'index.html'), '<html></html>');
       const { status, stderr } = runNode(repoRoot, 'engine/scripts/ota-embed-manifest.mjs',

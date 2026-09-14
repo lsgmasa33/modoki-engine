@@ -8,7 +8,6 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import {
@@ -20,6 +19,7 @@ import {
 // Imported from the .mjs directly: these two are the store's own clamp, and the point of the test
 // below is that the STORE applies it — going through the typed shell would test the shell instead.
 import { clampTtlMs, MAX_CLAIM_TTL_MS } from '../../scripts/deviceClaimsStore.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 // (#865) Clone seeds must be FULLY QUALIFIED for the platform, so `path.resolve`, never a POSIX
 // literal. `isSameHolder` now compares through `sameClone`, which refuses a stored path that
@@ -39,12 +39,11 @@ const CLONE_MINE = path.resolve('/clone/mine');
 const CLONE_HUB = path.resolve('/Users/x/Projects/modoki');
 const CLONE_AI = path.resolve('/Users/x/Projects/modoki-ai');
 
-
 let home: string;
 let prevHome: string | undefined;
 
 beforeEach(() => {
-  home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-home-'));
+  home = makeScratchDir('modoki-home-');
   prevHome = process.env.MODOKI_HOME;
   process.env.MODOKI_HOME = home;
 });

@@ -6,9 +6,9 @@
 
 import { describe, it, expect, afterEach } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { handleBackendRequest, type BackendContext } from '../../plugins/backend/editorBackendRouter';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const cleanup: string[] = [];
 afterEach(() => { for (const r of cleanup.splice(0)) fs.rmSync(r, { recursive: true, force: true }); });
@@ -18,7 +18,7 @@ const ent = (traits: Record<string, unknown>) => ({ traits });
 /** Scaffold a throwaway project: an optional project.config.json (build.modules) plus scene
  *  files under runtime/assets/scenes — mirrors detectModules.test.ts's own fixture shape. */
 function makeProject(opts: { buildModules?: Record<string, unknown>; scenes?: Record<string, unknown> }): string {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-buildmod-'));
+  const root = makeScratchDir('modoki-buildmod-');
   cleanup.push(root);
   if (opts.buildModules) {
     fs.writeFileSync(

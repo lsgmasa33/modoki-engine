@@ -18,11 +18,11 @@
  * (see "the GUIDs really were fresh"), because a mask that swallowed everything would make this
  * whole suite unfalsifiable.
  */
-import { describe, it, expect, afterAll } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 import { fileURLToPath } from 'node:url';
 import { scaffoldProject, slugify } from '../../electron/newProject';
 
@@ -32,16 +32,9 @@ const TEMPLATE_DIR = path.resolve(here, '../../templates/starter');
 const NAME = 'My Cool Game';
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 
-const tmpdirs: string[] = [];
-function tmp(prefix: string): string {
-  // `realpathSync.native` because on macOS the temp dir is reached through a symlink, and the
-  // scaffolders `path.resolve` their target — an unresolved base would make the two outputs
-  // differ by spelling alone.
-  const d = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), prefix));
-  tmpdirs.push(d);
-  return d;
-}
-afterAll(() => { for (const d of tmpdirs) fs.rmSync(d, { recursive: true, force: true }); });
+// `canonical` because on macOS the temp dir is reached through a symlink, and the scaffolders
+// `path.resolve` their target — an unresolved base would make the two outputs differ by spelling alone.
+const tmp = (prefix: string): string => makeScratchDir(prefix, { canonical: true });
 
 /** Every file under `root`, as relative POSIX paths → contents (GUIDs masked). */
 function tree(root: string): Map<string, string> {

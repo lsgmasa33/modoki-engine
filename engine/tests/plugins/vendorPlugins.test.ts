@@ -4,10 +4,10 @@
  *  hermetic (no real npm, no network). */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import * as tar from 'tar';
 import semver from 'semver';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 // Mock npm: `npm pack` writes a deterministic tarball into --pack-destination;
 // `npm run build` materializes a dist/ dir. Lets us assert pack invocations.
@@ -23,7 +23,7 @@ const execFileSyncMock = vi.fn((_cmd: string, args: string[], opts: { cwd?: stri
   if (args[0] === 'pack') {
     const destIdx = args.indexOf('--pack-destination');
     const dest = args[destIdx + 1];
-    const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-mock-pack-'));
+    const stage = makeScratchDir('modoki-mock-pack-');
     fs.mkdirSync(path.join(stage, 'package'), { recursive: true });
     fs.copyFileSync(path.join(opts.cwd!, 'package.json'), path.join(stage, 'package', 'package.json'));
     tar.create({ file: path.join(dest, 'pkg-0.0.0.tgz'), sync: true, gzip: true, cwd: stage }, ['package']);
@@ -91,8 +91,8 @@ function installRealCopy(name = PLUGIN) {
 }
 
 beforeEach(() => {
-  projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-vendor-proj-'));
-  engineRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-vendor-eng-'));
+  projectRoot = makeScratchDir('modoki-vendor-proj-');
+  engineRoot = makeScratchDir('modoki-vendor-eng-');
   execFileSyncMock.mockClear();
 });
 afterEach(() => {
@@ -528,8 +528,8 @@ describe('vendorEnginePlugins', () => {
     vendorEnginePlugins(projectRoot, engineRoot);
     const nameA = listTarballs()[0];
 
-    const engineRoot2 = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-vendor-eng2-'));
-    const projectRoot2 = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-vendor-proj2-'));
+    const engineRoot2 = makeScratchDir('modoki-vendor-eng2-');
+    const projectRoot2 = makeScratchDir('modoki-vendor-proj2-');
     try {
       const dir2 = path.join(engineRoot2, 'engine', 'packages', PLUGIN);
       fs.mkdirSync(path.join(dir2, 'dist'), { recursive: true });

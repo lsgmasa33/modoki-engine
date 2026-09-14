@@ -5,13 +5,13 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 
 import { resolvePostprocessorForId, modelReimportHandler, isRiggedMeta } from '../../plugins/reimport-model';
 import * as modelConvert from '../../plugins/model-convert';
 import type { ReimportContext } from '../../plugins/reimport-registry';
 import { readMetaSidecar } from '../../plugins/meta-sidecar';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 // Postprocessors are now declared by the PROJECT in project.config.json (the
 // engine no longer hardcodes per-game paths). Each test gets a temp project
@@ -20,7 +20,7 @@ import { readMetaSidecar } from '../../plugins/meta-sidecar';
 const ISLAND_DECL = { recipeVersion: 2, file: 'runtime/postprocessor.ts', registerFn: 'registerIslandPostprocessor' };
 
 function makeProject(postprocessors: Record<string, unknown> = { island: ISLAND_DECL }): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-proj-'));
+  const dir = makeScratchDir('modoki-proj-');
   fs.writeFileSync(path.join(dir, 'project.config.json'), JSON.stringify({ postprocessors }));
   return dir;
 }
@@ -134,7 +134,7 @@ describe('modelReimportHandler', () => {
   let baseCtx: Omit<ReimportContext, 'ssrLoadModule'>;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-reimport-test-'));
+    tmpDir = makeScratchDir('modoki-reimport-test-');
     glbPath = path.join(tmpDir, 'thing.glb');
     fs.writeFileSync(glbPath, Buffer.from([0x67, 0x6c, 0x54, 0x46])); // bogus GLB header bytes
     projectRoot = makeProject(); // declares island → recipeVersion read from here

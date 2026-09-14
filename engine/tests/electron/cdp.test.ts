@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -23,6 +22,7 @@ import {
   CDP_PORT_PREF_FILE,
   CDP_SCAN_SPAN,
 } from '../../electron/cdp';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /**
  * C1 unit gate — the CDP (renderer remote-debugging) port + switch decision.
@@ -288,7 +288,7 @@ describe('cdpMemoVerdict — a TRANSIENT probe must not advance off a good port'
 
 describe('CDP port memo persistence', () => {
   let dir: string;
-  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-cdpmemo-')); });
+  beforeEach(() => { dir = makeScratchDir('modoki-cdpmemo-'); });
   afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
   it('round-trips {port, ours}', () => {
@@ -466,7 +466,7 @@ describe('CDP nonce helpers (§12.2)', () => {
 describe('CDP pref persistence', () => {
   let dir: string;
   beforeEach(() => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-cdp-'));
+    dir = makeScratchDir('modoki-cdp-');
   });
   afterEach(() => {
     fs.rmSync(dir, { recursive: true, force: true });

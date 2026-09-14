@@ -10,10 +10,10 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { identityMismatch, tokenMismatchWarning, describeIdentity, isWithin, type BackendIdentity } from '../../tools/shared/identity';
 import { makeDirLink } from '../helpers/linkFixture';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const URL_ = 'http://127.0.0.1:5180';
 
@@ -201,7 +201,7 @@ describe('a symlinked clone spells one directory two ways (#913)', () => {
   let tmpRoot: string, real: string, link: string, other: string;
 
   beforeAll(() => {
-    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ident-'));
+    tmpRoot = makeScratchDir('ident-');
     real = path.join(tmpRoot, 'modoki-qa');
     link = path.join(tmpRoot, 'clone-link');
     other = path.join(tmpRoot, 'modoki-ai');

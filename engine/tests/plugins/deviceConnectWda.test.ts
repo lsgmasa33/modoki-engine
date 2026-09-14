@@ -12,13 +12,12 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import net from 'net';
-import os from 'os';
 import fs from 'fs';
-import path from 'path';
 import { DeviceConnectionManager, releaseDeviceResourcesOnExit, wdaHostFor } from '../../plugins/backend/deviceConnection';
 import { DeviceLeaseAuthority } from '../../plugins/backend/deviceLease';
 import { ensureWdaRunning, isWdaProcessRunning, stopWda, _resetWdaLauncherForTests } from '../../plugins/backend/wdaLauncher';
 import { listClaims } from '../../plugins/backend/deviceClaims';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /** A lease-speaking device. `disconnectDelayMs` holds back the reply to a lease `disconnect`, so the
  *  manager's hangup stays suspended on its await. */
@@ -97,13 +96,13 @@ let prevHome: string | undefined;
 let prevPin: string | undefined;
 
 beforeEach(() => {
-  home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-wda-home-'));
+  home = makeScratchDir('modoki-wda-home-');
   prevHome = process.env.MODOKI_HOME;
   process.env.MODOKI_HOME = home;
   // A pinned UDID in the developer's shell would make every listing below "match none".
   prevPin = process.env.MODOKI_IOS_DEVICE_UDID;
   delete process.env.MODOKI_IOS_DEVICE_UDID;
-  stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-wda-conn-'));
+  stateDir = makeScratchDir('modoki-wda-conn-');
   _resetWdaLauncherForTests();
 });
 

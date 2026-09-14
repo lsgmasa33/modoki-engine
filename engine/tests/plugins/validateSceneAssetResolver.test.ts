@@ -14,8 +14,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
-import os from 'os';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const LIVE_GUID = 'a1b2c3d4-1111-2222-3333-444455556666';
 const DEAD_GUID = 'deadbeef-0000-1111-2222-333344445555';
@@ -61,7 +61,7 @@ const dangling = (warnings: string[]) => warnings.filter((w) => /no asset in the
 
 const MESH_ENTRY = { path: MESH_REL, type: 'mesh', guid: LIVE_GUID };
 
-beforeEach(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-validate-scene-asset-')); });
+beforeEach(() => { tmp = makeScratchDir('modoki-validate-scene-asset-'); });
 afterEach(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
 
 describe('GET /api/validate-scene — real asset resolver (#292)', () => {

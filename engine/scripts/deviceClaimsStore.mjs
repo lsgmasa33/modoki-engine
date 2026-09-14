@@ -112,8 +112,48 @@ import { canonicalPath, samePath } from './pathIdentity.mjs';
  *  directory those rules operate on, and only when no explicit one was given. */
 export function claimsDir() {
   if (process.env.MODOKI_HOME) return process.env.MODOKI_HOME;
-  if (process.env.VITEST) return path.join(os.tmpdir(), `modoki-claims-vitest-${process.pid}`);
+  if (process.env.VITEST) return vitestClaimsDir();
   return path.join(os.homedir(), '.modoki');
+}
+
+const VITEST_CLAIMS_PREFIX = 'modoki-claims-vitest-';
+
+/** The claims dir a process falls back to under vitest when `MODOKI_HOME` is unset: one per pid.
+ *  Nothing here removes it when the process is done, because a process cannot tell its last claim
+ *  from any other. Before #1117 this was the largest single leak in `os.tmpdir()`: 42,904 dirs on one
+ *  Mac. Three kinds of process make one, and `engine/tests/globalSetup.ts` reaps all three at
+ *  teardown (`reapVitestClaimsDirs`):
+ *  - a vitest WORKER. The default pool gives each test file a fresh one, so by teardown it is dead.
+ *  - the vitest MAIN process. The editor backend plugin's `configureServer` sweeps stale claims when
+ *    vitest builds its Vite server.
+ *  - a CHILD a test spawns (an OTA or build CLI). It inherits `VITEST` and falls back to its OWN pid.
+ *  A per-file `afterAll` removal existed for workers once, and was dropped as redundant. It was also
+ *  a hazard: a throw there skipped the scratch-dir cleanup queued behind it. */
+export function vitestClaimsDir(pid = process.pid) {
+  return path.join(os.tmpdir(), `${VITEST_CLAIMS_PREFIX}${pid}`);
+}
+
+/** Remove the vitest fallback claims dirs that belong to THIS run and nobody can still be using:
+ *  this process's own, plus any whose pid is dead and that were touched at or after `sinceMs`.
+ *  A LIVE pid is skipped, because another clone's vitest may run concurrently in the same
+ *  `os.tmpdir()`. Dirs from before `sinceMs` are skipped too, because historical debris is not this
+ *  run's to delete. Returns the removed paths. `alive` and `tmp` are injectable for the test. */
+export function reapVitestClaimsDirs({ sinceMs, alive = isPidAlive, tmp = os.tmpdir() }) {
+  const removed = [];
+  for (const name of fs.readdirSync(tmp)) {
+    const pid = name.startsWith(VITEST_CLAIMS_PREFIX) ? Number(name.slice(VITEST_CLAIMS_PREFIX.length)) : NaN;
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    const dir = path.join(tmp, name);
+    const own = pid === process.pid;
+    if (!own && (alive(pid) || mtimeMsOrNaN(dir) < sinceMs)) continue;
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    removed.push(dir);
+  }
+  return removed;
+}
+
+function mtimeMsOrNaN(p) {
+  try { return fs.statSync(p).mtimeMs; } catch { return NaN; }
 }
 
 function claimsFile() {

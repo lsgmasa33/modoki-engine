@@ -12,7 +12,6 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import pathMod from 'node:path';
 import path from 'path';
 import fs from 'fs';
-import os from 'os';
 import {
   findAssetRoots, resolveAssetPath, readAssetGuid, buildManifest, writeAssetGuid, detectType,
   classifySceneChange, isSseRoute, createEditorWriteGuard, normalizeWriteGuardKey, createBrowserRequestRegistry,
@@ -26,6 +25,7 @@ import {
 } from '../../plugins/vite-asset-scanner';
 import { findGamesEntry } from '../../plugins/findGamesEntry';
 import { readScannedSource } from '@modoki/engine/testing';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 // engine/tests/plugins/ → repo root (games/ + engine/packages/modoki live there).
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
@@ -247,7 +247,7 @@ describe('classifySceneChange (hot-reload broadcast classification)', () => {
 describe('pathToClassifyForChange (shader body → descriptor remap, #857)', () => {
   let tmpDir: string;
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-shader-remap-'));
+    tmpDir = makeScratchDir('modoki-shader-remap-');
   });
   afterEach(() => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -771,7 +771,7 @@ describe('findAssetRoots (real project)', () => {
   // The 3d-test-specific versions proved nothing extra: what makes them pass is the SHAPE
   // (`<root>/games/<id>/runtime/assets`), not that particular game's content.
   it('discovers game asset directories under a monorepo-shaped root', () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-mono-'));
+    const tmp = makeScratchDir('modoki-mono-');
     try {
       fs.mkdirSync(path.join(tmp, 'games/probe-game/runtime/assets/scenes'), { recursive: true });
       const roots = findAssetRoots(tmp);
@@ -784,7 +784,7 @@ describe('findAssetRoots (real project)', () => {
   });
 
   it('returns at least 2 roots (modoki + at least one game)', () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-mono2-'));
+    const tmp = makeScratchDir('modoki-mono2-');
     try {
       fs.mkdirSync(path.join(tmp, 'games/probe-game/runtime/assets'), { recursive: true });
       const roots = findAssetRoots(tmp);
@@ -800,7 +800,7 @@ describe('findAssetRoots (real project)', () => {
 
   it('serves a flat one-game project\'s assets at /assets (no /games/<id>/ segment)', () => {
     // C4c flat convention: <projectRoot>/runtime/assets → /assets.
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-flat-'));
+    const tmp = makeScratchDir('modoki-flat-');
     try {
       fs.mkdirSync(path.join(tmp, 'runtime/assets/scenes'), { recursive: true });
       const roots = findAssetRoots(tmp);
@@ -817,7 +817,7 @@ describe('findAssetRoots (real project)', () => {
   it('serves the editor\'s own engine assets for an external project (no engine/ of its own)', () => {
     // C4c: an external project folder has its own games/ but no
     // engine/packages/modoki — the editor's built-in fonts must still be served.
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ext-'));
+    const tmp = makeScratchDir('modoki-ext-');
     try {
       fs.mkdirSync(path.join(tmp, 'games/hello/runtime/assets'), { recursive: true });
       const roots = findAssetRoots(tmp);
@@ -873,7 +873,7 @@ describe('resolveModokiAssetsDir (fallback order)', () => {
 
 describe('findGamesEntry', () => {
   it('finds a flat single-game entry (game.ts)', () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-single-'));
+    const tmp = makeScratchDir('modoki-single-');
     try {
       fs.writeFileSync(path.join(tmp, 'game.ts'), 'export const game = {};');
       const entry = findGamesEntry(tmp);
@@ -885,7 +885,7 @@ describe('findGamesEntry', () => {
   });
 
   it('ignores a legacy games/registry.ts (one project = one game)', () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-reg-'));
+    const tmp = makeScratchDir('modoki-reg-');
     try {
       fs.mkdirSync(path.join(tmp, 'games'), { recursive: true });
       fs.writeFileSync(path.join(tmp, 'games/registry.ts'), 'export const ALL_GAMES = [];');
@@ -897,7 +897,7 @@ describe('findGamesEntry', () => {
   });
 
   it('returns null when no game.ts exists', () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-none-'));
+    const tmp = makeScratchDir('modoki-none-');
     try {
       expect(findGamesEntry(tmp)).toBeNull();
     } finally {
@@ -969,7 +969,7 @@ describe('readAssetGuid', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-scanner-'));
+    tmpDir = makeScratchDir('modoki-scanner-');
   });
   afterEach(() => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -1113,7 +1113,7 @@ describe('buildManifest', () => {
 
 describe('buildManifest auto-heal', () => {
   let tmpDir: string;
-  beforeEach(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-heal-')); });
+  beforeEach(() => { tmpDir = makeScratchDir('modoki-heal-'); });
   afterEach(() => { fs.rmSync(tmpDir, { recursive: true, force: true }); });
 
   it("rewrites the later file's id in place when heal=true", () => {
@@ -1265,7 +1265,7 @@ describe('buildManifest auto-heal', () => {
 
 describe('writeAssetGuid', () => {
   let tmpDir: string;
-  beforeEach(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-wg-')); });
+  beforeEach(() => { tmpDir = makeScratchDir('modoki-wg-'); });
   afterEach(() => { fs.rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('replaces the id of a JSON asset, preserving other fields', () => {
@@ -1350,7 +1350,7 @@ describe('writeAssetGuid', () => {
 // ── Sliced-sprite sub-entries (texture "multiple" mode) ──────────────────────
 describe('scanAllAssets — sprite sub-entries from texture meta', () => {
   let tmpDir: string;
-  beforeEach(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-sprites-')); });
+  beforeEach(() => { tmpDir = makeScratchDir('modoki-sprites-'); });
   afterEach(() => { fs.rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('emits one "sprite" entry per slice, pointing at the parent texture', () => {
@@ -1426,7 +1426,7 @@ describe('scanAllAssets — sprite sub-entries from texture meta', () => {
 // ── Empty-folder visibility ──────────────────────────────────────────────────
 describe('scanAllAssets / buildManifest — empty folders', () => {
   let tmpDir: string;
-  beforeEach(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-emptydir-')); });
+  beforeEach(() => { tmpDir = makeScratchDir('modoki-emptydir-'); });
   afterEach(() => { fs.rmSync(tmpDir, { recursive: true, force: true }); });
 
   it('emits a guid-less "folder" entry for a dir with no file assets, but not for one with files', () => {
@@ -1615,7 +1615,7 @@ describe('otaSubgameProjectDir (#837)', () => {
 
 describe('otaResolveSubgameDir (#837 close-out: where the publish route looks for a listed sub-game)', () => {
   let tmp: string;
-  beforeEach(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-subgame-resolve-')); });
+  beforeEach(() => { tmp = makeScratchDir('modoki-subgame-resolve-'); });
   afterEach(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
   const mk = (...parts: string[]) => { const d = path.join(tmp, ...parts); fs.mkdirSync(d, { recursive: true }); return d; };
   const game = (...parts: string[]) => { const d = mk(...parts); fs.writeFileSync(path.join(d, 'game.ts'), ''); return d; };
@@ -1898,8 +1898,6 @@ describe('/api/ota/publish route has no collision guard of its own (#577)', () =
     ).toBe(false);
   });
 });
-
-
 
 describe('isSiblingRaisedChange — a body write must not discard the descriptor\'s parked edit (#857 close-out)', () => {
   const DESC = '/games/g/assets/shaders/holo.shader.json';

@@ -15,12 +15,13 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync, readdirSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { readFileSync, readdirSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join, relative } from 'node:path';
-import { tmpdir } from 'node:os';
+
 import { fileURLToPath } from 'node:url';
 import { stripComments } from '../helpers/sourceScanner';
 import { assertExemptionLedger } from '../helpers/exemptionLedger';
+import { makeScratchDir } from '../helpers/scratchDir';
 
 const ACCOUNT_DIR = join(fileURLToPath(new URL('.', import.meta.url)), '../../src/runtime/account');
 
@@ -90,7 +91,7 @@ describe('the engine account module carries no player-visible copy (#675)', () =
 
 describe('the sweep does not stop at a subdirectory boundary (regression for the non-recursive hole)', () => {
   it('collects a nested file, and the guard\'s own literal check flags copy inside it', () => {
-    const fixtureDir = mkdtempSync(join(tmpdir(), 'account-nocopy-fixture-'));
+    const fixtureDir = makeScratchDir('account-nocopy-fixture-');
     try {
       mkdirSync(join(fixtureDir, 'copy'));
       const nestedFile = join(fixtureDir, 'copy', 'messages.ts');

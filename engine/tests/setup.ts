@@ -1,4 +1,11 @@
 import '@testing-library/jest-dom/vitest';
+import { afterAll } from 'vitest';
+import { installScratchDirCleanup } from '@modoki/engine/testing/scratchDir';
+
+// Scratch dirs made with makeScratchDir are removed after each test file (#1117). The helper refuses
+// to create any until this has run, so a config that forgets it fails loudly instead of leaking.
+installScratchDirCleanup(afterAll);
+// The claims store's per-pid fallback dirs are reaped once per run by globalSetup.ts, not here.
 
 // jsdom implements no layout, and therefore no `document.elementFromPoint` AT ALL — it is
 // `undefined`, not a stub that returns a miss. bridge.ts hit-tests with it to pick the canvas under

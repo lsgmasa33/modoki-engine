@@ -18,6 +18,7 @@ import { describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 // `projects.ts` imports `electron` at module scope for the picker/menu half. The guard under test
 // touches none of it, so a minimal stub is honest here rather than a fake of the mechanism.
@@ -33,7 +34,7 @@ const onWin = process.platform === 'win32';
 
 describe('isEditorsOwnTree', () => {
   it('recognises the repo root spelled the same way', () => {
-    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-own-'));
+    const repo = makeScratchDir('modoki-own-');
     try {
       expect(isEditorsOwnTree(repo, repo)).toBe(true);
       expect(isEditorsOwnTree(repo + path.sep, repo)).toBe(true);
@@ -45,7 +46,7 @@ describe('isEditorsOwnTree', () => {
   it('does NOT fire for a game inside the repo — that is the normal case', () => {
     // The guard must not swallow the ordinary open. `games/<id>` lives under the repo root and
     // absolutely does want healing and dep installation.
-    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-own-'));
+    const repo = makeScratchDir('modoki-own-');
     try {
       const game = path.join(repo, 'games', 'sling');
       fs.mkdirSync(game, { recursive: true });
@@ -57,7 +58,7 @@ describe('isEditorsOwnTree', () => {
 
   it('does NOT fire for a name-PREFIX sibling clone', () => {
     // `modoki` / `modoki-ai` / `modoki-ai2` are real sibling clones on this machine.
-    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-own-'));
+    const base = makeScratchDir('modoki-own-');
     try {
       const repo = path.join(base, 'modoki');
       const sibling = path.join(base, 'modoki-ai');
@@ -71,7 +72,7 @@ describe('isEditorsOwnTree', () => {
   it.runIf(onWin)('win32: fires for a lower-cased drive letter — the #869 defect', () => {
     // `MODOKI_PROJECT=e:/Projects/modoki` reaches chooseInitialProject, which returns
     // `path.resolve(envProject)`, which reaches these guards as `state.root`.
-    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-own-'));
+    const repo = makeScratchDir('modoki-own-');
     try {
       const flipped = repo[0].toLowerCase() === repo[0]
         ? repo[0].toUpperCase() + repo.slice(1)
@@ -90,7 +91,7 @@ describe('isUnderRepo is NOT the same defect', () => {
     // Pinned because it is the asymmetry that made #869 confusing: the correct comparison was
     // sitting ~130 lines above the two broken ones. If someone "fixes" this to use samePath,
     // this test says what it would be changing and why it was already right.
-    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-under-'));
+    const base = makeScratchDir('modoki-under-');
     try {
       const repo = path.join(base, 'modoki');
       const game = path.join(repo, 'games', 'sling');

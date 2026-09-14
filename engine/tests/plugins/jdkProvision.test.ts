@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import { ensureJdk, discoverJavaHome, jdkVersionDir, PINNED_JDK, jdkDistKey, type FetchLike } from '../../toolchain'
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /**
  * Guards the on-demand JDK provisioner (Phase E-3) WITHOUT a real ~180MB download — the fetch is
@@ -12,7 +12,7 @@ import { ensureJdk, discoverJavaHome, jdkVersionDir, PINNED_JDK, jdkDistKey, typ
  */
 describe('jdkProvision — ensureJdk (mocked fetch)', () => {
   let base: string
-  beforeEach(() => { base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-jdkprov-')) })
+  beforeEach(() => { base = makeScratchDir('modoki-jdkprov-') })
   afterEach(() => { fs.rmSync(base, { recursive: true, force: true }) })
 
   const fakeFetch = (bytes: Buffer, ok = true, status = 200): FetchLike =>

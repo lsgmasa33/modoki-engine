@@ -71,6 +71,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /** The `type` argument for a directory link on this platform.
  *
@@ -168,7 +169,7 @@ export function makeDirLink(target: string, linkPath: string): void {
  * this continent can check.
  */
 export function makeFixtureRoot(prefix: string, base: string = os.tmpdir()): string {
-  return fs.mkdtempSync(path.join(fs.realpathSync.native(base), prefix));
+  return makeScratchDir(prefix, { base, canonical: true });
 }
 
 let probed: boolean | undefined;
@@ -189,7 +190,7 @@ let fileProbed: boolean | undefined;
  */
 export function canMakeDirLink(): boolean {
   if (probed !== undefined) return probed;
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'linkcap-'));
+  const d = makeScratchDir('linkcap-');
   try {
     fs.mkdirSync(path.join(d, 't'));
     makeDirLink(path.join(d, 't'), path.join(d, 'l'));
@@ -217,7 +218,7 @@ export function canMakeDirLink(): boolean {
  */
 export function canMakeFileLink(): boolean {
   if (fileProbed !== undefined) return fileProbed;
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'filelinkcap-'));
+  const d = makeScratchDir('filelinkcap-');
   try {
     fs.writeFileSync(path.join(d, 't'), 'x');
     fs.symlinkSync(path.join(d, 't'), path.join(d, 'l'));

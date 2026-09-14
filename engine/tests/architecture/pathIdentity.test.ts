@@ -20,13 +20,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { canonicalPath, samePath, pathCaseKey, isUnderOrSame } from '../../scripts/pathIdentity.mjs';
 import { makeDirLink } from '../helpers/linkFixture';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const onWin = process.platform === 'win32';
 const CASE_INSENSITIVE = process.platform === 'win32' || process.platform === 'darwin';
 
 describe('samePath', () => {
   it('a path equals itself, however it is spelled', () => {
-    const d = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-pid-'));
+    const d = makeScratchDir('modoki-pid-');
     try {
       expect(samePath(d, d)).toBe(true);
       expect(samePath(d, d + path.sep)).toBe(true);          // trailing separator
@@ -39,7 +40,7 @@ describe('samePath', () => {
   it('distinguishes a CHILD from its parent, and a name-PREFIX sibling', () => {
     // The prefix case is this repo's own hazard: the clones are `modoki`, `modoki-ai`,
     // `modoki-ai2`… so a comparison that reduced to `startsWith` would call them the same.
-    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-pid-'));
+    const parent = makeScratchDir('modoki-pid-');
     try {
       const child = path.join(parent, 'games');
       fs.mkdirSync(child);
@@ -51,7 +52,7 @@ describe('samePath', () => {
   });
 
   it.runIf(onWin)('win32: a lower-cased DRIVE LETTER is the same directory — #869 itself', () => {
-    const d = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-pid-'));
+    const d = makeScratchDir('modoki-pid-');
     try {
       const flipped = d[0].toLowerCase() === d[0] ? d[0].toUpperCase() + d.slice(1) : d[0].toLowerCase() + d.slice(1);
       // Premises — if either of these stops holding, this test is no longer about the defect.
@@ -112,7 +113,7 @@ describe('samePath', () => {
   });
 
   it('follows a SYMLINK to its target — the spelling `path.resolve` cannot reach', () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-pid-'));
+    const root = makeScratchDir('modoki-pid-');
     try {
       const real = path.join(root, 'real');
       const link = path.join(root, 'link');
@@ -138,7 +139,7 @@ describe('samePath', () => {
    *  which is the same trap docs/windows.md § Paths records for the case-fold. */
   describe('#892 a path that does not exist', () => {
     it('matches its own spelling through a symlinked ancestor', (ctx) => {
-      const base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-pid-892-'));
+      const base = makeScratchDir('modoki-pid-892-');
       try {
         const real = path.join(base, 'real');
         fs.mkdirSync(real);
@@ -186,7 +187,7 @@ describe('samePath', () => {
       // The reject side. Proving the predicate now matches more pairs proves nothing on its own —
       // resolving the ancestor and DISCARDING the missing tail would pass every case above and
       // make these two equal, which is the mutation this exists to catch.
-      const base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-pid-892-'));
+      const base = makeScratchDir('modoki-pid-892-');
       try {
         expect(samePath(path.join(base, 'gone-a'), path.join(base, 'gone-b'))).toBe(false);
         expect(samePath(path.join(base, 'gone', 'deep'), path.join(base, 'gone'))).toBe(false);
@@ -222,7 +223,7 @@ describe('samePath', () => {
       // mutation check is the only thing that revealed either.
       const pre892 = (a: string, b: string) =>
         pathCaseKey(canonicalPath(a)) === pathCaseKey(canonicalPath(b));
-      const base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-pid-892-'));
+      const base = makeScratchDir('modoki-pid-892-');
       try {
         const real = path.join(base, 'real');
         fs.mkdirSync(real);
@@ -266,7 +267,7 @@ describe('samePath', () => {
     // Both directions matter. On POSIX `/a/B` and `/a/b` are genuinely different directories, so
     // a fold there would make two distinct paths compare EQUAL — the opposite defect, and worse
     // than the one #869 fixed, because it makes a guard swallow something it should act on.
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-pid-'));
+    const root = makeScratchDir('modoki-pid-');
     try {
       const lower = path.join(root, 'assets');
       const upper = path.join(root, 'ASSETS');
@@ -283,7 +284,7 @@ describe('canonicalPath', () => {
     // Deliberate, and pinned because an earlier draft got it wrong: callers keep this value —
     // `deviceClaimsStore.canonicalClonePath` hands it to a refusal message naming the clone
     // that holds a device, which a human reads. The case-fold belongs to `samePath`.
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-PID-Mixed-'));
+    const root = makeScratchDir('modoki-PID-Mixed-');
     try {
       const out = canonicalPath(root);
       expect(fs.existsSync(out), 'the result still names a real directory').toBe(true);
@@ -304,7 +305,7 @@ describe('canonicalPath', () => {
   });
 
   it('is idempotent', () => {
-    const d = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-pid-'));
+    const d = makeScratchDir('modoki-pid-');
     try {
       expect(canonicalPath(canonicalPath(d))).toBe(canonicalPath(d));
     } finally {
@@ -345,7 +346,7 @@ describe('pathCaseKey (#881)', () => {
 
 describe('isUnderOrSame (#881)', () => {
   it('a root is under ITSELF — the half `isUnderRepo` deliberately answers false', () => {
-    const d = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-uos-'));
+    const d = makeScratchDir('modoki-uos-');
     try {
       expect(isUnderOrSame(d, d)).toBe(true);
       expect(isUnderOrSame(d, d + path.sep)).toBe(true);
@@ -355,7 +356,7 @@ describe('isUnderOrSame (#881)', () => {
   });
 
   it('accepts a real descendant and refuses a real ancestor', () => {
-    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-uos-'));
+    const parent = makeScratchDir('modoki-uos-');
     try {
       const child = path.join(parent, 'assets', 'deep');
       fs.mkdirSync(child, { recursive: true });
@@ -370,7 +371,7 @@ describe('isUnderOrSame (#881)', () => {
     // `…/modoki-ai3-old`.startsWith(`…/modoki-ai3`) is TRUE, which is how the /api/unused-assets
     // filter could offer a neighbouring project's assets for deletion. This is the assertion that
     // fails if anyone reduces this back to a prefix test.
-    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-uos-'));
+    const base = makeScratchDir('modoki-uos-');
     try {
       const root = path.join(base, 'modoki-ai3');
       const sibling = path.join(base, 'modoki-ai3-old');
@@ -409,7 +410,7 @@ describe('isUnderOrSame (#881)', () => {
     // false. Review measured it green under `canonicalPath → path.resolve`. It is kept as an
     // end-to-end acceptance case, not as cover for the realpath — that is the symlink test below,
     // which is the only one on this platform that discriminates the two.
-    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-uos-'));
+    const base = makeScratchDir('modoki-uos-');
     try {
       fs.mkdirSync(path.join(base, 'Project', 'assets'), { recursive: true });
       expect(isUnderOrSame(path.join(base, 'PROJECT'), path.join(base, 'Project', 'assets')))
@@ -425,7 +426,7 @@ describe('isUnderOrSame (#881)', () => {
     // carried the correct spelling with this same comment and its suite has a case named for it;
     // the SSOT was written with the version that test exists to forbid. Only the `..` SEGMENT
     // means escaped.
-    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-uos-'));
+    const base = makeScratchDir('modoki-uos-');
     try {
       fs.mkdirSync(path.join(base, '..bak'), { recursive: true });
       expect(isUnderOrSame(base, path.join(base, '..bak'))).toBe(true);
@@ -449,7 +450,7 @@ describe('isUnderOrSame (#881)', () => {
     // The general form of the trap above, isolated. Both operands must be expressed in the same
     // space or containment is meaningless; a missing child must not fall back to an unresolved
     // spelling while its existing parent gets resolved.
-    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-uos-'));
+    const base = makeScratchDir('modoki-uos-');
     try {
       const real = path.join(base, 'real');
       fs.mkdirSync(real, { recursive: true });
@@ -470,7 +471,7 @@ describe('isUnderOrSame (#881)', () => {
   });
 
   it('follows a symlink, so one directory reached two ways is still inside', (ctx) => {
-    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-uos-'));
+    const base = makeScratchDir('modoki-uos-');
     try {
       const real = path.join(base, 'real');
       fs.mkdirSync(path.join(real, 'assets'), { recursive: true });

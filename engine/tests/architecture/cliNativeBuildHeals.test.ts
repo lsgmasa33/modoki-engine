@@ -24,13 +24,13 @@
 import { describe, it, expect } from 'vitest';
 import { expectInOrder, found } from '@modoki/engine/testing/inOrder';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readScannedSource } from '@modoki/engine/testing';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const buildWeb = path.join(repoRoot, 'engine', 'scripts', 'build-web.mjs');
@@ -311,7 +311,6 @@ const DIRECT_ESBUILD_ALLOWED: ReadonlyArray<{ item: string; count?: number; reas
   },
 ];
 
-
 describe('no engine/scripts/*.mjs rolls its own esbuild module loader (#827)', () => {
   // Enumerated through git, not a filesystem walk — an untracked stray must not silently widen or
   // narrow the corpus. MEASURED at 89 files today (not the "~30" an earlier version of this comment
@@ -480,7 +479,7 @@ describe('loadRequiredEngineModules THROWS instead of degrading (#827)', () => {
     // The array contract is what `add-native-targets.mjs` destructures POSITIONALLY, so an
     // implementation that merged, or reversed the order, would bind the wrong module to the wrong
     // name at that call site while every source-level assertion stayed green.
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-required-modules-'));
+    const dir = makeScratchDir('modoki-required-modules-');
     try {
       const seam = path.join(repoRoot, 'engine', 'scripts', 'loadVendorPlugins.mjs');
       const runner = path.join(dir, 'runner.mjs');
@@ -549,8 +548,8 @@ describe('loadEnginePluginModule degrades instead of throwing', () => {
     // `repoRoot` argument passed in — so the copy, sitting outside this repo's ancestry, hits no
     // node_modules/esbuild at all and the import genuinely throws, with the real function running
     // unmodified.
-    const importerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-no-esbuild-'));
-    const fakeRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fake-repo-'));
+    const importerDir = makeScratchDir('modoki-no-esbuild-');
+    const fakeRepo = makeScratchDir('modoki-fake-repo-');
     try {
       const importerPath = path.join(importerDir, 'loadVendorPlugins.mjs');
       fs.copyFileSync(path.join(repoRoot, 'engine', 'scripts', 'loadVendorPlugins.mjs'), importerPath);

@@ -18,7 +18,8 @@
  *     `smoke-packaged.sh` also `rm -rf`s its build dir, so two clones running
  *     `verify:packaged` at once deleted each other's app mid-build.
  *
- *  NOT covered, deliberately: `mkdtempSync` / `mktemp` callers (unique by construction) and
+ *  NOT covered, deliberately: `mkdtempSync` / `mktemp` callers (unique by construction, so never
+ *  shared; their LIFETIME is a different guard, `scratchDirOwnership.test.ts`, #1117) and
  *  `~/.modoki/**` (machine-wide ON PURPOSE — device claims and the launch log exist to answer
  *  cross-clone questions, and per-cloning them would defeat them).
  */

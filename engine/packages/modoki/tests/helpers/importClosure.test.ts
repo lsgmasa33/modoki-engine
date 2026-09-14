@@ -16,12 +16,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { walkClosure } from './importClosure';
+import { makeScratchDir } from './scratchDir';
 
 /** A three-file chain: entry → mid → leaf, where only `leaf` reaches the forbidden specifier. */
 let srcDir: string;
 
 beforeAll(() => {
-  srcDir = fs.mkdtempSync(path.join(os.tmpdir(), 'import-closure-'));
+  srcDir = makeScratchDir('import-closure-');
   fs.mkdirSync(path.join(srcDir, 'nested'), { recursive: true });
   fs.writeFileSync(path.join(srcDir, 'entry.ts'), "import { m } from './nested/mid';\nexport { m };\n");
   fs.writeFileSync(

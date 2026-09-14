@@ -15,14 +15,15 @@
  *  regression these tests exist for: it is invisible to every other suite, because nothing
  *  else loads this config as CJS. */
 import { describe, it, expect } from 'vitest';
-import { existsSync, mkdtempSync, writeFileSync, rmSync, readdirSync, readFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, writeFileSync, rmSync, readdirSync, readFileSync } from 'node:fs';
+
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 // jsdom's TextEncoder breaks esbuild's startup invariant — hence the node environment above.
 import { build } from 'esbuild';
 import { createRequire } from 'node:module';
 import { chooseViteConfig, isPackagedEngineDir } from '../../scripts/viteConfigChoice.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const engineDir = path.join(repoRoot, 'engine');
@@ -96,7 +97,7 @@ describe('chooseViteConfig', () => {
     // The stale-copy trap: a pack that fails between beforePack and afterPack leaves the staged
     // .cjs behind. Under the first cut (choose by existence) every later dev build in that clone
     // silently used that frozen snapshot. Packaged-ness, not existence, is the discriminator.
-    const dir = mkdtempSync(path.join(tmpdir(), 'modoki-viteconfig-'));
+    const dir = makeScratchDir('modoki-viteconfig-');
     try {
       const env = {} as NodeJS.ProcessEnv;
       expect(chooseViteConfig(dir, undefined, env)).toBe('engine/vite.config.ts');

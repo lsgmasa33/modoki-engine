@@ -3,16 +3,16 @@
  *  Electron), so it runs headless against the REAL engine/templates/starter. */
 import { describe, it, expect, afterEach } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { scaffoldProject, slugify } from '../../electron/newProject';
 import { SCENE_FORMAT_VERSION } from '@modoki/engine/runtime';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const TEMPLATE_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../templates/starter');
 const tmps: string[] = [];
 function freshTmp(): string {
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-newproj-'));
+  const d = makeScratchDir('modoki-newproj-');
   // mkdtemp makes the dir; scaffold wants an empty dir → use a child path.
   const target = path.join(d, 'proj');
   tmps.push(d);

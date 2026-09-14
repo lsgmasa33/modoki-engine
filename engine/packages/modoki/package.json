@@ -30,7 +30,8 @@
     "./testing/prefabInstances": "./tests/helpers/prefabInstances.ts",
     "./testing/exemptionLedger": "./tests/helpers/exemptionLedger.ts",
     "./testing/sourceAst": "./tests/helpers/sourceAst.ts",
-    "./testing/inOrder": "./tests/helpers/inOrder.ts"
+    "./testing/inOrder": "./tests/helpers/inOrder.ts",
+    "./testing/scratchDir": "./tests/helpers/scratchDir.ts"
   },
   "scripts": {
     "test": "vitest run",

@@ -10,11 +10,11 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { expectInOrder } from '@modoki/engine/testing/inOrder';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
 import { otaPublishPreflight, readRawOtaBlock, OTA_PUBLISH_REFUSALS } from '../../../scripts/ota/publishPreflight.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const engineRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 
@@ -22,7 +22,7 @@ let repoRoot: string;
 const KEY = { publicKey: 'pub-A', privateKey: 'priv-A' };
 
 beforeEach(() => {
-  repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ota-preflight-'));
+  repoRoot = makeScratchDir('modoki-ota-preflight-');
   fs.mkdirSync(path.join(repoRoot, 'build', 'ota-keys'), { recursive: true });
   fs.writeFileSync(path.join(repoRoot, 'build', 'ota-keys', 'default.json'), JSON.stringify(KEY));
 });

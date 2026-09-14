@@ -2,10 +2,10 @@
 
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { hashKey, cachePathFor, cacheHit } from '../../plugins/texture-cache';
 import { DEFAULT_TEXTURE_SETTINGS } from '../../packages/modoki/src/runtime/loaders/textureSettings';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 describe('texture-cache hashKey', () => {
   it('is deterministic for the same bytes + settings', () => {
@@ -94,7 +94,7 @@ describe('texture-cache cacheHit', () => {
   };
 
   it('is a hit when the variant exists and is non-empty', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'texcache-'));
+    const dir = makeScratchDir('texcache-');
     try {
       write(dir, 128);
       expect(cacheHit(dir, src, hash, 'ktx2-uastc', '3d')).toBe(true);
@@ -105,7 +105,7 @@ describe('texture-cache cacheHit', () => {
     // Regression guard: an interrupted toktx write leaves a 0-byte file at the final
     // cache path. Counting it as a hit skips re-encoding on reimport forever and ships
     // an empty KTX2 that fails to load at runtime ("Texture load failed: <guid> {}").
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'texcache-'));
+    const dir = makeScratchDir('texcache-');
     try {
       write(dir, 0);
       expect(cacheHit(dir, src, hash, 'ktx2-uastc', '3d')).toBe(false);
@@ -113,7 +113,7 @@ describe('texture-cache cacheHit', () => {
   });
 
   it('is a miss when the variant is absent', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'texcache-'));
+    const dir = makeScratchDir('texcache-');
     try {
       expect(cacheHit(dir, src, hash, 'ktx2-uastc', '3d')).toBe(false);
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }

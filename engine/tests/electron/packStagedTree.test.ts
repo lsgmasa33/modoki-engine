@@ -25,11 +25,11 @@
  */
 import { describe, it, expect, afterAll } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const require_ = createRequire(import.meta.url);
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -38,7 +38,7 @@ const copyThreeAddons = require_(path.join(scriptsDir, 'copy-three-addons.cjs'))
 
 const tmpdirs: string[] = [];
 function tmp(): string {
-  const d = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'modoki-pack-'));
+  const d = makeScratchDir('modoki-pack-', { canonical: true });
   tmpdirs.push(d);
   return d;
 }

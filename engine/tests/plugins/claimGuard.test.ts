@@ -15,9 +15,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..', '..');
 const guard = path.join(repoRoot, 'engine/scripts/claim-guard.mjs');
@@ -28,8 +28,8 @@ let home: string;
 let clone: string;
 
 beforeEach(() => {
-  home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-guard-home-'));
-  clone = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-guard-clone-'));
+  home = makeScratchDir('modoki-guard-home-');
+  clone = makeScratchDir('modoki-guard-clone-');
 });
 
 afterEach(() => {

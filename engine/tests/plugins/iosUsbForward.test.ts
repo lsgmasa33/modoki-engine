@@ -7,13 +7,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import type { ChildProcess } from 'node:child_process';
 import {
   clearIosForwardRecord, goIosForwardRunner, parseGoIosListDetails, pickUsbIosDevice, reapDeps,
   lsofRunner, parseLsofListeners, reapRecordedIosForward, recordIosForward, startIosForward, type UsbmuxEntry,
 } from '../../plugins/backend/iosUsbForward';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const WARN = '{"time":"t","level":"WARN","msg":"go-ios agent is not running. You might need to start it with \'ios tunnel start\' for ios17+."}';
 const dev = (udid: string, connectionType: string, productType = 'iPhone10,1') =>
@@ -298,7 +298,7 @@ describe('the startup reap of a recorded forward', () => {
   const realDeps = { ...reapDeps };
   let dir: string;
   beforeEach(() => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-iosfwd-'));
+    dir = makeScratchDir('modoki-iosfwd-');
     reapDeps.kill = vi.fn();
   });
   afterEach(() => {

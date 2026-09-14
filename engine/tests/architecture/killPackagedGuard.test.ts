@@ -13,11 +13,11 @@
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
 import { killPackaged, altPathSpelling, decodeWinReap, REAP_KILLED, REAP_NONE, REAP_ERROR, productName } from '../../scripts/packagedAppPaths.mjs';
 import { makeDirLink } from '../helpers/linkFixture';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 vi.mock('node:child_process', () => {
   const execFileSyncMock = vi.fn();
@@ -114,7 +114,7 @@ describe.skipIf(process.platform === 'win32')('killPackaged matches BOTH spellin
   beforeEach(() => {
     vi.mocked(execFileSync).mockClear();
     vi.mocked(execFileSync).mockReturnValue(undefined as never);
-    base = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'modoki-killpkg-'));
+    base = makeScratchDir('modoki-killpkg-', { canonical: true });
     dirs.push(base);
   });
 
@@ -256,7 +256,7 @@ describe.skipIf(process.platform === 'win32')('killPackaged reports its outcome 
   });
 
   it('an ERROR on either spelling is never masked by a success on the other', () => {
-    const base = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'modoki-killpkg-o-'));
+    const base = makeScratchDir('modoki-killpkg-o-', { canonical: true });
     try {
       const real = path.join(base, 'real', 'mac-arm64', 'Modoki Editor.app');
       fs.mkdirSync(real, { recursive: true });
@@ -274,7 +274,6 @@ describe.skipIf(process.platform === 'win32')('killPackaged reports its outcome 
     }
   });
 });
-
 
 /** Close-out review findings, pinned. Each of these was CONFIRMED against the running code, and
  *  each is a way the #944 half of the fix reached nobody. */

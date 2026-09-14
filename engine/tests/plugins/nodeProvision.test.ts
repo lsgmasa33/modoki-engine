@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import * as tar from 'tar'
 import { ensureNode, extractArchive, nodeDistFor, PINNED_NODE, nodeDistKey, type FetchLike } from '../../toolchain'
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /**
  * Guards the on-demand Node provisioner (Phase C2) WITHOUT a real download — the fetch is mocked.
@@ -13,7 +13,7 @@ import { ensureNode, extractArchive, nodeDistFor, PINNED_NODE, nodeDistKey, type
 describe('nodeProvision — ensureNode (mocked fetch)', () => {
   let base: string
   beforeEach(() => {
-    base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-nodeprov-'))
+    base = makeScratchDir('modoki-nodeprov-')
   })
   afterEach(() => {
     fs.rmSync(base, { recursive: true, force: true })
@@ -120,7 +120,7 @@ describe('nodeProvision — ensureNode (mocked fetch)', () => {
  *  These assert OUTCOMES on disk — bytes, and the Unix mode — not implementation details. */
 describe('extractArchive — in-process, no subprocess', () => {
   let dir: string
-  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-extract-')) })
+  beforeEach(() => { dir = makeScratchDir('modoki-extract-') })
   afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }) })
 
   it('extracts a .tar.gz from an ABSOLUTE archive path, preserving the exec bit', async () => {

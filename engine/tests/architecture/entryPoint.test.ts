@@ -14,12 +14,11 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { readScannedSource } from '@modoki/engine/testing';
 import { makeDirLink } from '../helpers/linkFixture';
-
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const repoRoot = path.resolve(__dirname, '..', '..', '..');
 
@@ -42,7 +41,7 @@ let realDir = '';
 let linkDir = '';
 
 beforeAll(() => {
-  base = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'entrypoint-'));
+  base = makeScratchDir('entrypoint-', { canonical: true });
   realDir = path.join(base, 'real');
   fs.mkdirSync(realDir);
   fs.writeFileSync(

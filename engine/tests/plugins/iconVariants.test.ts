@@ -8,7 +8,6 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import sharp from 'sharp';
 import {
@@ -19,6 +18,7 @@ import {
   IOS_TINTED_FILE,
   ANDROID_MONOCHROME_FILE,
 } from '../../scripts/iconVariants.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const ADAPTIVE_XML = `<?xml version="1.0" encoding="utf-8"?>
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
@@ -64,7 +64,7 @@ async function makeMaster(file: string, size = 128) {
 }
 
 beforeEach(async () => {
-  root = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-variants-'));
+  root = makeScratchDir('modoki-variants-');
   master = path.join(root, 'master.png');
   await makeMaster(master);
 });
@@ -177,7 +177,7 @@ describe('writeAndroidIconVariants', () => {
   });
 
   it('says so, rather than throwing, when there is no android project', async () => {
-    const bare = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-bare-'));
+    const bare = makeScratchDir('modoki-bare-');
     const { written, notes } = await writeAndroidIconVariants({ projectRoot: bare, iconSrcAbs: master });
     expect(written).toEqual([]);
     expect(notes.join(' ')).toMatch(/no android res/);
@@ -255,7 +255,7 @@ describe('writeIosIconVariants', () => {
   });
 
   it('says so, rather than throwing, when there is no asset catalog', async () => {
-    const bare = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-bare-ios-'));
+    const bare = makeScratchDir('modoki-bare-ios-');
     const { written, notes } = await writeIosIconVariants({ projectRoot: bare, iconSrcAbs: master });
     expect(written).toEqual([]);
     expect(notes.join(' ')).toMatch(/no AppIcon\.appiconset/);

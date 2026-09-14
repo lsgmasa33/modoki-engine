@@ -20,14 +20,13 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import net from 'net';
-import os from 'os';
 import fs from 'fs';
-import path from 'path';
 import { DeviceConnectionManager, adbRunner, DEVICE_PORT } from '../../plugins/backend/deviceConnection';
 import { androidDevicesExec, _clearFriendlyNameCache } from '../../plugins/backend/androidDevices';
 import { DeviceLeaseAuthority, DeviceLeaseClient } from '../../plugins/backend/deviceLease';
 import { listClaims, adbDeviceId } from '../../plugins/backend/deviceClaims';
 import { bridgePortExec } from '../../plugins/backend/androidBridgePort';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const realForward = adbRunner.forward;
 const realRemove = adbRunner.removeForward;
@@ -59,7 +58,7 @@ let prevHome: string | undefined;
 let prevBackendPort: string | undefined;
 
 beforeEach(() => {
-  home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-home-'));
+  home = makeScratchDir('modoki-home-');
   prevHome = process.env.MODOKI_HOME;
   process.env.MODOKI_HOME = home;
   adbRunner.forward = vi.fn();
@@ -73,7 +72,7 @@ beforeEach(() => {
   bridgePortExec.packageUid = () => FAKE_PACKAGE_UID;
   prevBackendPort = process.env.MODOKI_BACKEND_PORT;
   delete process.env.MODOKI_BACKEND_PORT;
-  stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-reentrancy-'));
+  stateDir = makeScratchDir('modoki-reentrancy-');
 });
 
 afterEach(() => {

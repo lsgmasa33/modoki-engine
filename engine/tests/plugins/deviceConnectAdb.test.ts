@@ -11,7 +11,6 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import net from 'net';
-import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import { DeviceConnectionManager, adbRunner, releaseDeviceResourcesOnExit, reclaimStaleDeviceStateAtStartup } from '../../plugins/backend/deviceConnection';
@@ -19,6 +18,7 @@ import { androidDevicesExec, _clearFriendlyNameCache } from '../../plugins/backe
 import { DeviceLeaseAuthority } from '../../plugins/backend/deviceLease';
 import { claimsDir, listClaims } from '../../plugins/backend/deviceClaims';
 import { deviceCdpAdb, discoverDeviceCdpTarget, resetDeviceCdpSession } from '../../plugins/backend/deviceCdp';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const realForward = adbRunner.forward;
 const realRemove = adbRunner.removeForward;
@@ -40,7 +40,7 @@ let home: string;
 let prevHome: string | undefined;
 let prevBackendPort: string | undefined;
 beforeEach(() => {
-  home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-home-'));
+  home = makeScratchDir('modoki-home-');
   prevHome = process.env.MODOKI_HOME;
   process.env.MODOKI_HOME = home;
   adbRunner.forward = vi.fn(); adbRunner.removeForward = vi.fn();
@@ -65,7 +65,7 @@ beforeEach(() => {
   // by the shell it was launched from. Cleared here and restored in afterEach.
   prevBackendPort = process.env.MODOKI_BACKEND_PORT;
   delete process.env.MODOKI_BACKEND_PORT;
-  stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-adb-'));
+  stateDir = makeScratchDir('modoki-adb-');
 });
 afterEach(() => {
   if (prevHome === undefined) delete process.env.MODOKI_HOME;

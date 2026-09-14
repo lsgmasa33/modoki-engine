@@ -5,7 +5,6 @@ import { describe, it, expect, afterEach } from 'vitest';
 import net from 'node:net';
 import http from 'node:http';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import {
   findFreePort, waitForServer, needsWinTreeKill,
@@ -13,6 +12,7 @@ import {
   probeDevServerPort, isProcessAlive, startDevServer, stopChild, type DevServerIdentity,
 } from '../../electron/devServer';
 import { makeDirLink } from '../helpers/linkFixture';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 let occupied: net.Server | null = null;
 
@@ -334,7 +334,7 @@ describe('#190 — proving the server on the port is OURS', () => {
       // realpath the tmpdir itself: on macOS os.tmpdir() is /var/… , itself a symlink to
       // /private/var/… , which would make the CONTROL side of these tests pass for the wrong
       // reason. See pathIdentity.mjs's canonicalWithMissingTail docblock.
-      const base = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'devserver-'));
+      const base = makeScratchDir('devserver-', { canonical: true });
       try { fn(base); } finally { fs.rmSync(base, { recursive: true, force: true }); }
     };
 

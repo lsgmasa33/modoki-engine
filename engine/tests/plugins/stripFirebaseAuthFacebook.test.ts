@@ -8,7 +8,6 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import {
   stripFacebookElements,
@@ -118,7 +117,7 @@ describe('stripFirebaseAuthFacebook — the heal on a project', () => {
     }, null, 2));
   };
 
-  beforeEach(() => { project = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fbstrip-')); });
+  beforeEach(() => { project = makeScratchDir('modoki-fbstrip-'); });
   afterEach(() => { fs.rmSync(project, { recursive: true, force: true }); });
 
   it('is a silent no-op for a project that does not depend on the plugin', () => {
@@ -247,3 +246,5 @@ describe('stripFirebaseAuthFacebook — the heal on a project', () => {
     expect(fs.readFileSync(resolvedPinsPath(project), 'utf8')).toBe(before);
   });
 });
+
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';

@@ -26,7 +26,6 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { readScannedSource } from '@modoki/engine/testing';
-import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import {
@@ -34,6 +33,7 @@ import {
   type BackendContext, type Manifest,
 } from '../../plugins/backend/editorBackendRouter';
 import { registerReimportHandler } from '../../plugins/reimport-registry';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 let projectRoot = '';
 
@@ -112,7 +112,7 @@ function seed(meta: Record<string, unknown> = { id: 'rock-guid', version: 1, tex
   fs.writeFileSync(metaAbs(), `${JSON.stringify(meta, null, 2)}\n`);
 }
 
-beforeEach(() => { asked = []; projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-meta-park-gate-')); });
+beforeEach(() => { asked = []; projectRoot = makeScratchDir('modoki-meta-park-gate-'); });
 afterEach(() => { fs.rmSync(projectRoot, { recursive: true, force: true }); });
 
 describe('/api/write-meta — a park DESTROYED is a refusal (#872)', () => {

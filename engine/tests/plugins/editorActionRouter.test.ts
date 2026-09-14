@@ -12,6 +12,7 @@ import { fileURLToPath } from 'url';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
 import { DEFAULT_PROJECT_CONFIG, PRIVATE_BUILD_FIELDS } from '../../project-config';
 import { readScannedSource } from '@modoki/engine/testing';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 function makeCtx(over: Partial<BackendContext> = {}): BackendContext {
   const base = {
@@ -352,7 +353,7 @@ describe('/api/asset-schema + /api/asset-write (Phase C, host-side)', () => {
     const ctx = () => makeCtx({ resolveAssetPath: (p: string) => path.join(dir, path.basename(p)) });
     const readBack = (name: string) => JSON.parse(fs.readFileSync(path.join(dir, name), 'utf-8'));
 
-    beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-assetwrite-')); });
+    beforeEach(() => { dir = makeScratchDir('modoki-assetwrite-'); });
     afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
     it('ANIMATION: keeps the existing id when data omits it (the empty-string trap)', async () => {
@@ -397,7 +398,7 @@ describe('/api/asset-schema + /api/asset-write (Phase C, host-side)', () => {
     let dir: string;
     const ctx = () => makeCtx({ resolveAssetPath: (p: string) => path.join(dir, p.replace(/^\/games\/x\//, '')) });
 
-    beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-createasset-')); });
+    beforeEach(() => { dir = makeScratchDir('modoki-createasset-'); });
     afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
     it('creates the parent directories rather than throwing ENOENT', async () => {
@@ -447,7 +448,7 @@ describe('/api/read-meta (F10: outside-root & missing-asset are not a silent {})
   });
 
   it('200 raw when the asset EXISTS but has no sidecar — now unambiguously "no sidecar"', async () => {
-    const asset = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-meta-')), 'x.glb');
+    const asset = path.join(makeScratchDir('modoki-meta-'), 'x.glb');
     fs.writeFileSync(asset, 'glb-bytes');
     const ctx = makeCtx({ resolveAssetPath: (p: string) => p });
     const r = (await get('/api/read-meta?path=' + encodeURIComponent(asset), ctx)) as { kind?: string; status?: number; body: string };
@@ -459,9 +460,9 @@ describe('/api/read-meta (F10: outside-root & missing-asset are not a silent {})
 
 describe('/api/import-file (F11: an unrecognized type is not a phantom success)', () => {
   it('copies the file but returns ok:false 422 when nothing registers as an asset', async () => {
-    const src = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-imp-')), 'thing.xyz');
+    const src = path.join(makeScratchDir('modoki-imp-'), 'thing.xyz');
     fs.writeFileSync(src, 'not an asset');
-    const destFolder = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-dest-'));
+    const destFolder = makeScratchDir('modoki-dest-');
     const ctx = makeCtx({
       resolveAssetPath: (p: string) => p,   // destFolder resolves to itself (a real dir)
       absToAssetUrl: (p: string) => p,      // dest abs → a "url"
@@ -511,7 +512,7 @@ describe('/api/validate-scene and /api/validate-prefab — stale-input disclosur
    *
    *  So the fixture now speaks the vocabulary the route actually takes, and `resolveDir` maps it
    *  onto the real temp file — the same shape the `/games/x/…` cases above already use. */
-  const dir = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'modoki-validate-'));
+  const dir = makeScratchDir('modoki-validate-', { canonical: true });
   const resolveDir = (p: string) => path.join(dir, path.basename(p));
   // Created once at collection, so it needs one teardown — otherwise every run leaves a
   // `modoki-validate-*` directory behind. (The old fixture wrote loose files straight into
@@ -682,7 +683,8 @@ describe('/api/scene-mutate (play-mode guard)', () => {
   // temp path passed as `body.path` resolves straight through.
   let seq = 0;
   function tempScene(): string {
-    const p = path.join(os.tmpdir(), `modoki-mutate-guard-${process.pid}-${seq++}.json`);
+    // Inside a scratch dir: a bare `os.tmpdir()` file here was never removed (32 per run, #1117).
+    const p = path.join(makeScratchDir('modoki-mutate-guard-'), `scene-${seq++}.json`);
     fs.writeFileSync(p, JSON.stringify({
       entities: [{ id: 1, name: 'Box', traits: { Transform: { x: 0, y: 0 }, EntityAttributes: { name: 'Box', guid: 'g-box' } } }],
     }));
@@ -1230,7 +1232,7 @@ describe('/api/invalidate-project-config', () => {
     // Its OWN temp root, not makeCtx's default os.tmpdir(): this route now READS the
     // config before writing it, so a stale or hand-broken /tmp/project.config.json
     // left by anything else on the machine would 400 the save and fail this test.
-    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'projset-inval-'));
+    const projectRoot = makeScratchDir('projset-inval-');
     try {
       await post('/api/project-settings', { app: { appName: 'X' } }, makeCtx({ invalidateProjectConfig, projectRoot }));
       expect(invalidateProjectConfig).toHaveBeenCalledTimes(1);
@@ -1248,7 +1250,7 @@ describe('/api/invalidate-project-config', () => {
  *  The body is a PATCH onto what's on disk; absence means "don't touch". */
 describe('/api/project-settings is a non-destructive PATCH', () => {
   let root: string;
-  beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), 'projset-')); });
+  beforeEach(() => { root = makeScratchDir('projset-'); });
   afterEach(() => { fs.rmSync(root, { recursive: true, force: true }); });
 
   const cfgPath = () => path.join(root, 'project.config.json');
@@ -1813,7 +1815,7 @@ describe('/api/asset-def', () => {
  *  It had no route test. Its catch differs from `relayJson`'s (a transport failure falls back to the
  *  disk read), so the envelope check sits in its `try` — which is exactly the shape that can drift. */
 describe('/api/asset-meta', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'asset-meta-1012-'));
+  const dir = makeScratchDir('asset-meta-1012-');
   const asset = path.join(dir, 'tex.png');
   fs.writeFileSync(asset, 'png');
   afterAll(() => fs.rmSync(dir, { recursive: true, force: true }));

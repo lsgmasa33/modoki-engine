@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest'
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import type { UserConfig } from 'vite'
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /**
  * Regression guard for #40: a CLI `MODOKI_PROJECT=games/sling npm run build` used to always
@@ -32,12 +32,12 @@ describe('vite.config base resolution (#40)', () => {
   let rootProjectDir: string
 
   beforeAll(() => {
-    subpathProjectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-basepath-'))
+    subpathProjectDir = makeScratchDir('modoki-basepath-')
     fs.writeFileSync(
       path.join(subpathProjectDir, 'project.config.json'),
       JSON.stringify({ build: { webBasePath: '/subpath-fixture/' } }, null, 2),
     )
-    rootProjectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-basepath-'))
+    rootProjectDir = makeScratchDir('modoki-basepath-')
     fs.writeFileSync(
       path.join(rootProjectDir, 'project.config.json'),
       JSON.stringify({ build: { webBasePath: '/' } }, null, 2),

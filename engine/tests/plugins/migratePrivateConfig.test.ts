@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync, spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
-import os from 'os';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const SCRIPT = path.resolve(__dirname, '../../scripts/migrate-private-config.mjs');
 const REAL_PROJECT_CONFIG_TS = path.resolve(__dirname, '../../project-config.ts');
@@ -20,7 +20,7 @@ const REAL_PROJECT_CONFIG_TS = path.resolve(__dirname, '../../project-config.ts'
 let tmpRepo: string;
 
 beforeEach(() => {
-  tmpRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-migrate-private-'));
+  tmpRepo = makeScratchDir('modoki-migrate-private-');
   fs.mkdirSync(path.join(tmpRepo, 'engine'), { recursive: true });
   fs.copyFileSync(REAL_PROJECT_CONFIG_TS, path.join(tmpRepo, 'engine', 'project-config.ts'));
 });

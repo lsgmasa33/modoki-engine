@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
@@ -24,6 +23,7 @@ import {
   mcpBackendRaw,
   _resetClaudeMemo,
 } from '../../electron/connectClaude';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /**
  * C2 unit gate — the "Connect Claude Code" .mcp.json writer.
@@ -192,7 +192,7 @@ describe('isMcpStale', () => {
 
 describe('atomicWriteFileSync', () => {
   let dir: string;
-  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-aw-')); });
+  beforeEach(() => { dir = makeScratchDir('modoki-aw-'); });
   afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
   it('writes the file and leaves no temp sibling behind', () => {
@@ -243,7 +243,7 @@ describe('detectClaudeCli', () => {
 
 describe('ensureGitignored', () => {
   let dir: string;
-  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-gi-')); });
+  beforeEach(() => { dir = makeScratchDir('modoki-gi-'); });
   afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
   it('no-op when there is no .gitignore (does not create one)', () => {
@@ -352,7 +352,7 @@ describe('isMcpStale — token axis', () => {
 
 describe('healMcpPort', () => {
   let root: string;
-  beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-heal-')); });
+  beforeEach(() => { root = makeScratchDir('modoki-heal-'); });
   afterEach(() => { fs.rmSync(root, { recursive: true, force: true }); });
 
   const writeConnected = (port: number, cdp?: number) =>
@@ -538,7 +538,7 @@ describe('healMcpPort', () => {
  */
 describe('connect write path (handler composition)', () => {
   let root: string;
-  beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-proj-')); });
+  beforeEach(() => { root = makeScratchDir('modoki-proj-'); });
   afterEach(() => { fs.rmSync(root, { recursive: true, force: true }); });
 
   function connect(opts: { isPackaged: boolean; repoRoot: string; port: number; cdpPort?: number }) {
@@ -610,7 +610,7 @@ describe('resolveMcpTarget', () => {
   beforeEach(() => {
     // fs.realpathSync: macOS tmpdir is a /var → /private/var symlink, and resolveMcpTarget
     // path.resolve()s the project root. Without this the `home` guard would never match.
-    home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-home-')));
+    home = fs.realpathSync(makeScratchDir('modoki-home-'));
     repo = path.join(home, 'Projects', 'modoki');
     game = path.join(repo, 'games', '3d-test');
     fs.mkdirSync(game, { recursive: true });
@@ -720,7 +720,7 @@ describe('resolveMcpTarget', () => {
 
 describe('ensureMcpGitignored', () => {
   let dir: string;
-  beforeEach(() => { dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ignore-'))); });
+  beforeEach(() => { dir = fs.realpathSync(makeScratchDir('modoki-ignore-')); });
   afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
   it('project-root config in a plain dir → ignored as before', () => {
@@ -774,7 +774,7 @@ describe('resolveMcpTarget — the write boundary, pinned by mutation', () => {
   };
 
   beforeEach(() => {
-    home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-home-')));
+    home = fs.realpathSync(makeScratchDir('modoki-home-'));
     repo = path.join(home, 'Projects', 'modoki');
     game = path.join(repo, 'games', '3d-test');
     fs.mkdirSync(game, { recursive: true });
@@ -833,7 +833,7 @@ describe('resolveMcpTarget — the write boundary, pinned by mutation', () => {
 
 describe('healMcpPort — never rewrites a version-controlled config (C9b)', () => {
   let root: string;
-  beforeEach(() => { root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-healtrack-'))); });
+  beforeEach(() => { root = fs.realpathSync(makeScratchDir('modoki-healtrack-')); });
   afterEach(() => { fs.rmSync(root, { recursive: true, force: true }); });
 
   const writeConnected = (port: number) =>
@@ -876,7 +876,7 @@ describe('healMcpPort — never rewrites a version-controlled config (C9b)', () 
 
 describe('gitTrackedState', () => {
   let dir: string;
-  beforeEach(() => { dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tracked-'))); });
+  beforeEach(() => { dir = fs.realpathSync(makeScratchDir('modoki-tracked-')); });
   afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 
   it('outside any repo → untracked, WITHOUT shelling out to git', () => {
@@ -928,7 +928,7 @@ describe('mcpHasModoki / mcpBackendRaw — the ${VAR:-default} config (C9b)', ()
   });
 
   it('a deferred config is NOT healed (we must not clobber their expansion)', () => {
-    const d = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-defer-'));
+    const d = makeScratchDir('modoki-defer-');
     try {
       fs.writeFileSync(path.join(d, '.mcp.json'), deferred);
       expect(healMcpPort({ mcpPath: path.join(d, '.mcp.json'), backendPort: 5180, trackedState: 'untracked' }))
@@ -949,7 +949,7 @@ describe('ensureProjectClaudeMd', () => {
   const TEMPLATE_TEXT = '# __GAME_NAME__ — a Modoki game project\n\nUse modoki_get_scene_state.\n';
 
   beforeEach(() => {
-    dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-primer-')));
+    dir = fs.realpathSync(makeScratchDir('modoki-primer-'));
     template = path.join(dir, 'starter-CLAUDE.md');
     fs.writeFileSync(template, TEMPLATE_TEXT);
   });

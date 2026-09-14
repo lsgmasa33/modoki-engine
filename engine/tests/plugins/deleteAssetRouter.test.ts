@@ -36,6 +36,7 @@ vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
 }));
 
 import { handleBackendRequest, type BackendContext } from '../../plugins/backend/editorBackendRouter';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 // Minimal context: /api/delete-asset touches resolveAssetPath and (once anything
 // was actually trashed) rebuildManifest. The rest is cast away — if a future change
@@ -113,7 +114,7 @@ describe('/api/delete-asset rebuilds the asset manifest inline', () => {
   /** A tmpdir with one real file, so `fs.existsSync` puts the path in `resolved`
    *  and the handler reaches the trash+rebuild branch. */
   function withRealFile(): { ctx: (rebuild: () => unknown) => BackendContext; url: string; dir: string } {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-delete-router-'));
+    const dir = makeScratchDir('modoki-delete-router-');
     fs.writeFileSync(path.join(dir, 'probe.particle.json'), '{}');
     return {
       dir,
@@ -201,7 +202,7 @@ describe('/api/delete-asset rebuilds the asset manifest inline', () => {
   });
 
   it('a PARTIAL refusal stays ok:true — the rest of the batch really is in the trash', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-delete-router-partial-'));
+    const dir = makeScratchDir('modoki-delete-router-partial-');
     fs.writeFileSync(path.join(dir, 'went.json'), '{}');
     fs.writeFileSync(path.join(dir, 'locked.json'), '{}');
     refuse = ['locked.json'];

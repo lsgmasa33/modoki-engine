@@ -6,7 +6,6 @@
  *  (buildStepShell.ts), so a regression here is a shell-injection risk, not just a bug. */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 import {
   resolveGcloudDir,
@@ -15,6 +14,7 @@ import {
   OTA_SAFE_BUCKET,
   isGcsObjectMissing,
 } from '../../plugins/backend/gcloud';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 describe('deriveGcsBucketFromBaseUrl', () => {
   it('derives gs:// from a plain storage.googleapis.com URL', () => {
@@ -93,7 +93,7 @@ describe('resolveGcloudDir', () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-gcloud-test-'));
+    tmpDir = makeScratchDir('modoki-gcloud-test-');
   });
 
   afterEach(() => {

@@ -11,11 +11,11 @@
  *  below, not just an implicit assumption. */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 let projectRoot = '';
 
@@ -42,7 +42,7 @@ const post = (urlPath: string, body: unknown, ctx: BackendContext) =>
 
 const sha256 = (text: string) => crypto.createHash('sha256').update(Buffer.from(text, 'utf-8')).digest('hex');
 
-beforeEach(() => { projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-write-if-match-')); });
+beforeEach(() => { projectRoot = makeScratchDir('modoki-write-if-match-'); });
 afterEach(() => { fs.rmSync(projectRoot, { recursive: true, force: true }); });
 
 describe('/api/write-file — no ifMatch (backwards compat)', () => {

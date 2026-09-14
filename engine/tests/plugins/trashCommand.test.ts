@@ -9,10 +9,10 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { trashCommand, moveToTrash } from '../../plugins/asset-fs-ops';
 import { makeDirLink } from '../helpers/linkFixture';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 describe('trashCommand', () => {
   it('macOS: coerces each POSIX path to an alias (the -1728 fix)', () => {
@@ -110,7 +110,7 @@ describe('trashCommand', () => {
 describe('moveToTrash — the Linux rmSync fallback reports what it could not safely delete (#1006)', () => {
   let root: string;
   const noTrashPut = () => { throw new Error('trash-put: command not found'); };
-  beforeEach(() => { root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'mtt-'))); });
+  beforeEach(() => { root = fs.realpathSync.native(makeScratchDir('mtt-')); });
   afterEach(() => { try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* fixture */ } });
 
   it('reports a LINKED folder in `failed` and leaves both the link and its payload alone', () => {

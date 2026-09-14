@@ -16,7 +16,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { expectInOrder, found } from '@modoki/engine/testing/inOrder';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -24,6 +23,7 @@ import ts from 'typescript';
 import { readScannedSource } from '@modoki/engine/testing';
 import { boundIdentifier, callsTo, declarationOf, enclosingFunction, findNodes, parseSource, readsOf } from '@modoki/engine/testing/sourceAst';
 import { acquireBuildClaim, readBuildClaim, resetBuildClaimsForTests } from '../../scripts/buildClaimsStore.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const buildWeb = path.join(repoRoot, 'engine', 'scripts', 'build-web.mjs');
@@ -366,7 +366,7 @@ describe('build-web.mjs inherits an ancestor claim on the SAME project instead o
   let home: string;
   let prevHome: string | undefined;
   beforeEach(() => {
-    home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-home-'));
+    home = makeScratchDir('modoki-home-');
     prevHome = process.env.MODOKI_HOME;
     process.env.MODOKI_HOME = home;
   });
@@ -385,7 +385,7 @@ describe('build-web.mjs inherits an ancestor claim on the SAME project instead o
    *  `node_modules/vite` in scratch either. That failure is this test's "proceeded past the claim
    *  gate" signal; a claim REFUSAL exits well before either check is ever reached. */
   function runBuildWeb(env: NodeJS.ProcessEnv): { status: number; stderr: string } {
-    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-claim-inherit-'));
+    const scratch = makeScratchDir('modoki-claim-inherit-');
     try {
       execFileSync(process.execPath, [buildWeb, '--target', 'web'], { cwd: scratch, env, encoding: 'utf8' });
       return { status: 0, stderr: '' };

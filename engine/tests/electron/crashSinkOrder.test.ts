@@ -6,9 +6,9 @@ import { found } from '@modoki/engine/testing/inOrder';
 import esbuild from 'esbuild';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { electronOpts, electronDir } from '../../scripts/electronBuildOpts.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /**
  * #1043 — a crash during MODULE EVALUATION must still leave a file behind.
@@ -24,7 +24,7 @@ import { electronOpts, electronDir } from '../../scripts/electronBuildOpts.mjs';
  */
 
 let tmp: string;
-beforeAll(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-crashsink-')); });
+beforeAll(() => { tmp = makeScratchDir('modoki-crashsink-'); });
 afterAll(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
 
 describe('the sink is installed before anything else can throw (#1043)', () => {

@@ -3,13 +3,13 @@
  *  guards (an unpinned generator, and unconditional regeneration dirtying the tree). */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { REPO_ROOT } from '../helpers/repoLayout';
 import {
   ICON_TOOL, ICON_COLORS, iconStampValue, iconIsUpToDate,
   iconStampPath, iconSentinelPath, splashPipelineVersion, pipelineVersionFrom,
 } from '../../plugins/iconAssets';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 let root: string;
 let src: string;
@@ -25,7 +25,7 @@ function markGenerated(plat: 'ios' | 'android', stamp = iconStampValue(src, plat
 }
 
 beforeEach(() => {
-  root = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-icon-'));
+  root = makeScratchDir('modoki-icon-');
   src = path.join(root, 'icon.png');
   fs.writeFileSync(src, 'original-icon-bytes');
 });
@@ -196,7 +196,7 @@ describe('splash + icon-variant inputs are all in the stamp', () => {
     // This replaced `typeof === 'string'`, which passed under both hypotheses and duly failed to
     // notice a real missed bump: a fix to `regionLuminanceOf` (the splash badge's colour) shipped
     // with the constant untouched, `iconIsUpToDate` returned true, and the fix reached nothing.
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-pipeline-'));
+    const dir = makeScratchDir('modoki-pipeline-');
     const a = path.join(dir, 'a.mjs'); const b = path.join(dir, 'b.mjs');
     fs.writeFileSync(a, 'export const x = 1;'); fs.writeFileSync(b, 'export const y = 2;');
 

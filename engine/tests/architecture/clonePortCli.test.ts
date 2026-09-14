@@ -9,9 +9,9 @@
 import { describe, it, expect, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { clonePort, canonicalRepoKey } from '../../scripts/clonePort.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const CLI = path.resolve(__dirname, '../../scripts/clonePort.mjs');
 
@@ -77,7 +77,7 @@ describe('clonePort.mjs CLI (#69)', () => {
   // Verified by mutation: the naive template fails this, and so does a pathToFileURL-only
   // guard (which fixes the encoding but not the symlink). Copying the script is safe — it
   // imports nothing but `node:` builtins.
-  const spaceDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clone port ')); // NB: the space
+  const spaceDir = makeScratchDir('clone port '); // NB: the space
   afterAll(() => fs.rmSync(spaceDir, { recursive: true, force: true }));
 
   it('still runs as a CLI from a path that needs URL-encoding (space in the repo path)', () => {

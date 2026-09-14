@@ -14,17 +14,17 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import {
   toolchainRootRefusal,
   describeToolchainRootRefusal,
   TOOLCHAIN_OWNED_ENTRIES,
 } from '../../scripts/toolchainRoot.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 describe('toolchainRootRefusal (#1005)', () => {
   let root: string;
-  beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), 'tcroot-')); });
+  beforeEach(() => { root = makeScratchDir('tcroot-'); });
   afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
 
   const dirWith = (name: string, entries: string[]): string => {

@@ -22,8 +22,8 @@
  *  worker-clone launches landed on 5179, one (modoki-qa, 2026-08-25) with a live hub editor. */
 
 import { describe, it, expect } from 'vitest';
-import { existsSync, mkdtempSync, mkdirSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdirSync, rmSync } from 'node:fs';
+
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { hasPrivateDocs, hasQaSuite } from '../helpers/repoLayout';
@@ -41,6 +41,7 @@ import { pathCaseKey } from '../../scripts/pathIdentity.mjs';
 import { makeDirLink, cloneRootSpellings } from '../helpers/linkFixture';
 import { clonePort, defaultRepoRoot } from '../../scripts/clonePort.mjs';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /** Mirrors `pathIdentity.mjs`'s own platform test. Asked of the module rather than re-derived,
  *  so this file cannot drift from the rule it is pinning. */
@@ -163,7 +164,7 @@ describe('editorPorts.mjs is the one home for the clone → backend port table (
     it('resolves a real directory reached by a case-flipped spelling', () => {
       // On a case-insensitive volume the flipped spelling opens the SAME directory, so `.native`
       // hands back the on-disk name and the exact lookup hits without needing the fold at all.
-      const base = mkdtempSync(path.join(tmpdir(), 'modoki-ports-'));
+      const base = makeScratchDir('modoki-ports-');
       try {
         const real = path.join(base, 'modoki-ai3');
         mkdirSync(real);
@@ -181,7 +182,7 @@ describe('editorPorts.mjs is the one home for the clone → backend port table (
       // reverting the canonicalisation leaves them green. Here the link's own basename is not a
       // clone name in any casing, so only resolving the link finds the port. It is the closest a
       // non-Windows machine can get to the `subst`/junction cases that motivated `.native`.
-      const base = mkdtempSync(path.join(tmpdir(), 'modoki-ports-'));
+      const base = makeScratchDir('modoki-ports-');
       try {
         const real = path.join(base, 'modoki-qa');
         mkdirSync(real);
@@ -255,7 +256,7 @@ describe('launch-editor.sh hands the port derivation the PHYSICAL spelling (#961
     expect(patterns.length, 'no kill_repo_process patterns found — fix the parser, not the test')
       .toBeGreaterThan(0);
 
-    const base = mkdtempSync(path.join(tmpdir(), 'modoki-reap-'));
+    const base = makeScratchDir('modoki-reap-');
     try {
       const real = path.join(base, 'clone');
       mkdirSync(real);
@@ -321,7 +322,7 @@ describe('launch-editor.sh hands the port derivation the PHYSICAL spelling (#961
     let base = '', link = '', logical = '', physical = '';
     let drew = 0;
     for (; drew < 12; drew++) {
-      base = mkdtempSync(path.join(tmpdir(), 'modoki-961-'));
+      base = makeScratchDir('modoki-961-');
       link = path.join(base, 'a-different-name');
       try { makeDirLink(REPO, link); }
       catch { rmSync(base, { recursive: true, force: true }); ctx.skip('cannot create a directory symlink here'); return; }

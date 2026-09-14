@@ -19,6 +19,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
 import { readScannedSource } from '@modoki/engine/testing';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 let projectRoot = '';
 let outsideRoot = '';
@@ -57,8 +58,8 @@ const OTHER_PNG = Buffer.concat([PNG, Buffer.from([0])]);
 const filesIn = (dir: string) => (fs.existsSync(dir) ? fs.readdirSync(dir).sort() : []);
 
 beforeEach(() => {
-  projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-drop-'));
-  outsideRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-elsewhere-'));
+  projectRoot = makeScratchDir('modoki-drop-');
+  outsideRoot = makeScratchDir('modoki-elsewhere-');
   fs.mkdirSync(path.join(projectRoot, 'art'), { recursive: true });
   fs.writeFileSync(path.join(projectRoot, 'art', 'splash-master.png'), PNG);
 });
@@ -171,7 +172,7 @@ describe('/api/adopt-file — a file dropped on a Project Settings path field', 
     // serves back under an extension it trusts — and leaves the contents in the project for a
     // commit to pick up. The asset branch is a different kind of input: the editor's own roots
     // resolved it. This is a REGRESSION TEST for a fix made during close-out, not a hypothetical.
-    const secretDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-secret-'));
+    const secretDir = makeScratchDir('modoki-secret-');
     const secret = path.join(secretDir, 'id_ed25519');
     fs.writeFileSync(secret, 'PRIVATE-KEY-BYTES');
     const ctx = makeCtx();
@@ -190,7 +191,7 @@ describe('/api/adopt-file — a file dropped on a Project Settings path field', 
     // have before the read branch existed, and one nothing pinned. The stub above is deliberately
     // permissive (it is a harness), which is exactly why THIS case uses a production-shaped one:
     // the real guard is `vite-asset-scanner.ts` ~1149, `path.relative` + reject `..`/absolute.
-    const secretDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-secret-'));
+    const secretDir = makeScratchDir('modoki-secret-');
     fs.writeFileSync(path.join(secretDir, 'id_ed25519'), 'PRIVATE-KEY-BYTES');
     const rootDir = path.join(projectRoot, 'runtime', 'assets');
     fs.mkdirSync(rootDir, { recursive: true });
@@ -264,7 +265,7 @@ describe('/api/adopt-file — a file dropped on a Project Settings path field', 
     // An asset drag carries no File, so the renderer has no bytes to upload on the 400 — and an
     // asset root can sit outside the project root. Without this the editor offers a drag that
     // dead-ends in an error the user cannot act on. The server has the file; it just reads it.
-    const shared = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-shared-'));
+    const shared = makeScratchDir('modoki-shared-');
     fs.writeFileSync(path.join(shared, 'shared-icon.png'), OTHER_PNG);
     const ctx = makeCtx({ resolveAssetPath: (p: string) => path.join(shared, p.replace(/^\//, '')) });
     const res = (await post('/api/adopt-file', { assetPath: '/shared-icon.png' }, ctx)) as

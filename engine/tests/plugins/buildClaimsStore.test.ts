@@ -10,7 +10,6 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -30,6 +29,7 @@ import {
   BUILD_CLAIM_ENV_VAR,
 } from '../../scripts/buildClaimsStore.mjs';
 import type { BuildClaim } from '../../scripts/buildClaimsStore.d.mts';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const execFileAsync = promisify(execFile);
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -38,7 +38,7 @@ let home: string;
 let prevHome: string | undefined;
 
 beforeEach(() => {
-  home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-home-'));
+  home = makeScratchDir('modoki-home-');
   prevHome = process.env.MODOKI_HOME;
   process.env.MODOKI_HOME = home;
 });
@@ -749,7 +749,7 @@ describe('round-trip through the real file', () => {
 describe('cross-process: two real node processes racing the same claim (#650)', () => {
   it('exactly one process wins the claim', async () => {
     const storePath = path.join(repoRoot, 'engine', 'scripts', 'buildClaimsStore.mjs');
-    const runnerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-claim-race-'));
+    const runnerDir = makeScratchDir('modoki-claim-race-');
     const runnerPath = path.join(runnerDir, 'claim-race-runner.mjs');
     fs.writeFileSync(
       runnerPath,

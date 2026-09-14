@@ -27,7 +27,6 @@
 import { describe, it, expect } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { hasPublishScripts } from '../helpers/repoLayout';
 import { readScannedSource } from '@modoki/engine/testing';
@@ -38,6 +37,7 @@ import {
   claimLabelFor,
 } from '../../scripts/releaseBranch.mjs';
 import { makeDirLink } from '../helpers/linkFixture';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const REPO = path.resolve(__dirname, '../../..');
 const CLI = path.join(REPO, 'engine/scripts/releaseBranch.mjs');
@@ -332,7 +332,7 @@ describe('releaseBranch.mjs is invoked as a CLI through a non-canonical path', (
    *  invocation ran, symlinked invocation printed nothing and exited 0. So the win32 case has a
    *  local proxy, and a platform we cannot run is not a reason to leave the class unpinned (#910). */
   it('still enters CLI mode when reached through a symlinked repo root', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-symlink-'));
+    const dir = makeScratchDir('modoki-symlink-');
     try {
       const link = path.join(dir, 'repo');
       // 'junction' needs no elevation on win32; a bare 'dir' throws EPERM without
@@ -517,7 +517,7 @@ describe.skipIf(process.platform === 'win32')('prepare-commit-msg exempts releas
   /** A throwaway repo with `branch` checked out, the hook run over `subject`, and the resulting
    *  first line returned. Real git, real hook — no mocking of the thing under test. */
   function firstLineAfterHook(branch: string, subject: string): string {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-hook-'));
+    const dir = makeScratchDir('modoki-hook-');
     try {
       const git = (...args: string[]) =>
         execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', stdio: 'pipe' });

@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import { ensureRuby, rubyDistKey, rubyDirFor, PINNED_RUBY, type FetchLike } from '../../toolchain'
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /**
  * Guards the on-demand portable-Ruby provisioner (the CocoaPods brew-free path) WITHOUT a real
@@ -12,7 +12,7 @@ import { ensureRuby, rubyDistKey, rubyDirFor, PINNED_RUBY, type FetchLike } from
  */
 describe('rubyProvision — ensureRuby (mocked fetch)', () => {
   let base: string
-  beforeEach(() => { base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-ruby-')) })
+  beforeEach(() => { base = makeScratchDir('modoki-ruby-') })
   afterEach(() => { fs.rmSync(base, { recursive: true, force: true }) })
 
   const fakeFetch = (bytes: Buffer, ok = true, status = 200): FetchLike =>

@@ -10,11 +10,11 @@
  *  be a pass-through grant, which would make the "held" case pass for the wrong reason. */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { acquireBuildClaim, resetBuildClaimsForTests, BUILD_CLAIM_ENV_VAR } from '../../scripts/buildClaimsStore.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const scriptsDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../scripts');
 const SCRIPTS = [
@@ -46,9 +46,9 @@ function run() {
 const npmCwds = () => (fs.existsSync(npmLog) ? fs.readFileSync(npmLog, 'utf8').split(/\r?\n/).filter(Boolean) : []);
 
 beforeEach(() => {
-  repo = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-bootstrap-claim-'));
-  home = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-bootstrap-home-'));
-  bin = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-bootstrap-bin-'));
+  repo = makeScratchDir('modoki-bootstrap-claim-');
+  home = makeScratchDir('modoki-bootstrap-home-');
+  bin = makeScratchDir('modoki-bootstrap-bin-');
   npmLog = path.join(bin, 'calls.log');
   fs.mkdirSync(path.join(repo, 'engine', 'scripts'), { recursive: true });
   for (const f of SCRIPTS) fs.copyFileSync(path.join(scriptsDir, f), path.join(repo, 'engine', 'scripts', f));

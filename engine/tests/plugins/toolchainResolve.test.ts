@@ -1,11 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { expectInOrder } from '@modoki/engine/testing/inOrder'
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import { detect, resolve, withToolOnPath, npmSpawnSpec, detectAdb, preflight, guide, install, INSTALLABLE, TOOL_IDS, toolchainStatus, gltfTransformInvocation, gltfpackInvocation, parseJavaMajor, javaMajorFromVersion, resetToolchainCache, systemToolchainAllowed, readToolchainSettings, writeToolchainSettings, isInstallable, cocoapodsEnv, isToolStale, versionMatchesPin, PINNED_TOOL_VERSIONS, PINNED_SHARP_OVERRIDE, planSharpOverride, uninstall, uninstallAll, toolOwnedDirs, shouldSweepProcesses, winSweepCommand, sweepAlt, ffmpegToolBin, ffprobeToolBin, npmToolBin, needsWinShell, spawnable, whichSync, type DetectResult } from '../../toolchain'
 import { makeDirLink } from '../helpers/linkFixture';
 import { TOOLCHAIN_OWNED_ENTRIES } from '../../scripts/toolchainRoot.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /**
  * Guards the shared toolchain resolver (engine/toolchain) — Phase A of the toolchain-layer plan.
@@ -87,7 +87,7 @@ describe('toolchain resolve() — env override + PATH injection', () => {
   })
 
   it('captures a version banner the tool wrote to STDERR (toktx --version does this, exit 0)', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-stderr-ver-'))
+    const dir = makeScratchDir('modoki-stderr-ver-')
     const bin = path.join(dir, process.platform === 'win32' ? 'toktx.cmd' : 'toktx')
     writeStderrExecStub(bin, 'toktx v4.4.2')
     process.env.MODOKI_TOKTX = bin
@@ -142,7 +142,7 @@ describe('toolchain npmSpawnSpec() — the swappable npm seam', () => {
 
 describe('toolchain whichSync() — PATH resolution (the Windows PATHEXT fix)', () => {
   let dir: string
-  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-which-')) })
+  beforeEach(() => { dir = makeScratchDir('modoki-which-') })
   afterEach(() => fs.rmSync(dir, { recursive: true, force: true }))
 
   // The bug this exists for: npm on PATH is `npm.cmd` (+ a `npm` BASH script Windows can't run).
@@ -203,7 +203,7 @@ describe('toolchain detect() — android-sdk (directory tool, the unified probe)
   let savedDir: string | undefined
 
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-sdk-'))
+    tmp = makeScratchDir('modoki-sdk-')
     savedHome = process.env.ANDROID_HOME
     savedRoot = process.env.ANDROID_SDK_ROOT
     // These probes are about the SYSTEM sources, so run as a DEV editor (no toolchain dir). A dev
@@ -399,7 +399,7 @@ describe('toolchain guide() / install() verbs', () => {
 
   it('cocoapodsEnv() is null until CocoaPods is provisioned (no crash when absent)', () => {
     const saved = process.env.MODOKI_TOOLCHAIN_DIR
-    process.env.MODOKI_TOOLCHAIN_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-cp-'))
+    process.env.MODOKI_TOOLCHAIN_DIR = makeScratchDir('modoki-cp-')
     try {
       expect(cocoapodsEnv()).toBeNull() // no ruby/ + cocoapods-gems/ provisioned yet
     } finally {
@@ -423,7 +423,7 @@ describe('toolchain guide() / install() verbs', () => {
 
   it('detect(gltf-transform-cli) finds a userData-installed CLI via MODOKI_TOOLCHAIN_DIR', () => {
     const saved = process.env.MODOKI_TOOLCHAIN_DIR
-    const tc = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tc-'))
+    const tc = makeScratchDir('modoki-tc-')
     // npmToolBin picks the platform-correct shim (.cmd on Windows) — the exact path the code resolves.
     const bin = npmToolBin(tc, 'gltf-transform')
     writeExecStub(bin, '4.0.0') // answers --version so the binary probe passes
@@ -445,7 +445,7 @@ describe('toolchain guide() / install() verbs', () => {
   it('detect(gltfpack) finds a userData-installed CLI via MODOKI_TOOLCHAIN_DIR (probes -v)', () => {
     const saved = process.env.MODOKI_TOOLCHAIN_DIR
     const savedPath = process.env.PATH
-    const tc = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tc-'))
+    const tc = makeScratchDir('modoki-tc-')
     const bin = npmToolBin(tc, 'gltfpack') // platform-correct shim (.cmd on Windows)
     writeExecStub(bin, 'gltfpack 1.2') // gltfpack answers `-v` with its version on stdout, exit 0
     process.env.MODOKI_TOOLCHAIN_DIR = tc
@@ -473,7 +473,7 @@ describe('toolchain guide() / install() verbs', () => {
   it.skipIf(process.platform === 'win32')('detect(ffmpeg) finds the in-package binary (no .bin symlink) via MODOKI_TOOLCHAIN_DIR', () => {
     const saved = process.env.MODOKI_TOOLCHAIN_DIR
     const savedPath = process.env.PATH
-    const tc = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tc-'))
+    const tc = makeScratchDir('modoki-tc-')
     // ffmpeg-static keeps the binary at the package ROOT, not node_modules/.bin.
     const bin = path.join(tc, 'npm-tools', 'node_modules', 'ffmpeg-static', 'ffmpeg')
     fs.mkdirSync(path.dirname(bin), { recursive: true })
@@ -537,7 +537,7 @@ describe('toolchain guide() / install() verbs', () => {
   it.skipIf(process.platform === 'win32')('detect(ffprobe) resolves the per-platform @ffprobe-installer sub-package binary', () => {
     const saved = process.env.MODOKI_TOOLCHAIN_DIR
     const savedPath = process.env.PATH
-    const tc = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tc-'))
+    const tc = makeScratchDir('modoki-tc-')
     const bin = path.join(tc, 'npm-tools', 'node_modules', '@ffprobe-installer', `${process.platform}-${process.arch}`, 'ffprobe')
     fs.mkdirSync(path.dirname(bin), { recursive: true })
     fs.writeFileSync(bin, '#!/bin/sh\necho "ffprobe version n4.4.1"\n')
@@ -567,8 +567,8 @@ describe('toolchain guide() / install() verbs', () => {
     const saved = process.env.MODOKI_TOOLCHAIN_DIR
     const savedPath = process.env.PATH
     const savedAllow = process.env.MODOKI_ALLOW_SYSTEM_TOOLCHAIN
-    const tc = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tc-')) // no settings.json → bundled-only
-    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-sysbin-'))
+    const tc = makeScratchDir('modoki-tc-') // no settings.json → bundled-only
+    const binDir = makeScratchDir('modoki-sysbin-')
     const sys = path.join(binDir, 'gltf-transform')
     fs.writeFileSync(sys, '#!/bin/sh\necho 4.0.0\n') // a system gltf-transform on PATH
     fs.chmodSync(sys, 0o755)
@@ -684,7 +684,7 @@ describe('toolchain model-CLI invocation seam (E-3.5)', () => {
   })
 
   it('gltfTransformInvocation prefers a userData install (packaged editor)', () => {
-    const tc = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-inv-'))
+    const tc = makeScratchDir('modoki-inv-')
     const bin = npmToolBin(tc, 'gltf-transform') // platform-correct shim (.cmd on Windows)
     writeExecStub(bin, '4.4.1')
     process.env.MODOKI_TOOLCHAIN_DIR = tc
@@ -751,7 +751,7 @@ describe('toolchain — bundled-vs-system SDK preference (systemToolchainAllowed
     savedTcDir = process.env.MODOKI_TOOLCHAIN_DIR
     savedAllowEnv = process.env.MODOKI_ALLOW_SYSTEM_TOOLCHAIN
     delete process.env.MODOKI_ALLOW_SYSTEM_TOOLCHAIN
-    tcDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tc-'))
+    tcDir = makeScratchDir('modoki-tc-')
   })
   afterEach(() => {
     if (savedTcDir === undefined) delete process.env.MODOKI_TOOLCHAIN_DIR
@@ -788,8 +788,8 @@ describe('toolchain — bundled-vs-system SDK preference (systemToolchainAllowed
   // with either one silently drove the build off a system SDK despite "bundled-only".
   it('bundled-only IGNORES a system JAVA_HOME / ANDROID_HOME (env is a SYSTEM source)', () => {
     process.env.MODOKI_TOOLCHAIN_DIR = tcDir // no settings.json → bundled-only
-    const sdk = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-sysdk-'))
-    const jdk = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-sysjdk-'))
+    const sdk = makeScratchDir('modoki-sysdk-')
+    const jdk = makeScratchDir('modoki-sysjdk-')
     fs.mkdirSync(path.join(sdk, 'platform-tools'))
     fs.mkdirSync(path.join(jdk, 'bin'), { recursive: true })
     fs.writeFileSync(path.join(jdk, 'bin', process.platform === 'win32' ? 'java.exe' : 'java'), '')
@@ -818,7 +818,7 @@ describe('toolchain — bundled-vs-system SDK preference (systemToolchainAllowed
   it('OUR provisioned SDK outranks a system ANDROID_HOME even with system tools allowed', () => {
     process.env.MODOKI_TOOLCHAIN_DIR = tcDir
     process.env.MODOKI_ALLOW_SYSTEM_TOOLCHAIN = '1'
-    const sys = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-sysdk-'))
+    const sys = makeScratchDir('modoki-sysdk-')
     fs.mkdirSync(path.join(sys, 'platform-tools'))
     fs.mkdirSync(path.join(tcDir, 'android-sdk', 'platform-tools'), { recursive: true })
     const saved = process.env.ANDROID_HOME
@@ -941,7 +941,7 @@ describe('toolchain — pinned CLI/gem tool versions + staleness (bump → reins
     // process. A real machine that installed before this pin existed has a package.json on disk
     // missing `overrides.sharp` — that's the evidence this check looks for, so it self-heals on the
     // next status probe rather than requiring the user to know to click "Reinstall".
-    const tc = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tc-sharp-'))
+    const tc = makeScratchDir('modoki-tc-sharp-')
     process.env.MODOKI_TOOLCHAIN_DIR = tc
     const npmToolsDir = path.join(tc, 'npm-tools')
     fs.mkdirSync(npmToolsDir, { recursive: true })
@@ -958,7 +958,7 @@ describe('toolchain — pinned CLI/gem tool versions + staleness (bump → reins
   })
 
   it('does NOT flag stale for a sharp-override reason when npm-tools/package.json is simply ABSENT (nothing installed here yet)', () => {
-    const tc = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tc-nosharp-'))
+    const tc = makeScratchDir('modoki-tc-nosharp-')
     process.env.MODOKI_TOOLCHAIN_DIR = tc
     const pin = PINNED_TOOL_VERSIONS['gltf-transform-cli']!
     const d: DetectResult = {
@@ -969,7 +969,7 @@ describe('toolchain — pinned CLI/gem tool versions + staleness (bump → reins
   })
 
   it('does NOT flag stale once npm-tools/package.json already carries the pinned sharp override', () => {
-    const tc = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tc-sharp-ok-'))
+    const tc = makeScratchDir('modoki-tc-sharp-ok-')
     process.env.MODOKI_TOOLCHAIN_DIR = tc
     const npmToolsDir = path.join(tc, 'npm-tools')
     fs.mkdirSync(npmToolsDir, { recursive: true })
@@ -995,7 +995,7 @@ describe('toolchain — pinned CLI/gem tool versions + staleness (bump → reins
 describe('toolchain — uninstall / uninstallAll (remove provisioned tools)', () => {
   let root: string
   let tc: string
-  beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-un-')); tc = path.join(root, 'toolchain'); fs.mkdirSync(tc) })
+  beforeEach(() => { root = makeScratchDir('modoki-un-'); tc = path.join(root, 'toolchain'); fs.mkdirSync(tc) })
   afterEach(() => fs.rmSync(root, { recursive: true, force: true }))
 
   it("uninstall('java') removes <toolchain>/jdk", async () => {
@@ -1215,7 +1215,7 @@ describe('toolchain — uninstall / uninstallAll (remove provisioned tools)', ()
       // #1004's link mechanism at all. A flat payload silently converts this into a test of the
       // other guard. (Title updated too: it used to say "the basename guard passes it", naming a
       // guard that no longer exists.)
-      const base = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-un2-'))
+      const base = makeScratchDir('modoki-un2-')
       try {
         const payload = path.join(base, 'PAYLOAD')
         fs.mkdirSync(path.join(payload, 'node'), { recursive: true })
@@ -1331,7 +1331,7 @@ describe('toolchain — uninstall / uninstallAll (remove provisioned tools)', ()
   // the drive. It was an inline pair of lines, which is precisely why nothing could pin it.
   describe('sweepAlt — the second spelling, width-guarded (#958 row 3)', () => {
     it('is null when the path does not resolve to a different spelling', () => {
-      const real = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-alt-'))
+      const real = makeScratchDir('modoki-alt-')
       try { expect(sweepAlt(fs.realpathSync.native(real))).toBeNull() }
       finally { fs.rmSync(real, { recursive: true, force: true }) }
     })
@@ -1366,7 +1366,7 @@ describe('toolchain — detect(npm) resolves a PROVISIONED Node (Core shows pres
   let savedNode: string | undefined, savedCli: string | undefined
   beforeEach(() => {
     savedNode = process.env.MODOKI_NODE; savedCli = process.env.MODOKI_NPM_CLI
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-npm-'))
+    dir = makeScratchDir('modoki-npm-')
     resetToolchainCache()
   })
   afterEach(() => {

@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { reapDeps } from '../../plugins/backend/iosUsbForward';
 import { readScannedSource } from '@modoki/engine/testing';
@@ -12,6 +11,7 @@ import {
   _devicectlOutPath, listIosDevicesForSelection, listIosDevicesForSelectionResult, wdaLauncherExec, _clearIosListCache,
   reapRecordedWdaAgent, killWdaChildOnExit, WDA_RECORD_FILE,
 } from '../../plugins/backend/wdaLauncher';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /**
  * Lazy WebDriverAgent launch (#32 Phase 2b). No Xcode, no phone — `spawn`, the device listing and
@@ -726,7 +726,6 @@ describe('ensureWdaRunning', () => {
   });
 });
 
-
 /** #143 — `devicectl` is CoreDevice (iOS 17+), so an iOS 16-or-older device appears in its JSON as
  *  a stub with no `udid` and is dropped. That made every pre-iPhone-X handset unselectable for
  *  trusted input — and NOT EVEN `MODOKI_IOS_DEVICE_UDID` could reach it, since the pin is matched
@@ -930,7 +929,7 @@ describe('WebDriverAgent left behind by an editor that died (#1077)', () => {
   const recordFile = () => path.join(dir, WDA_RECORD_FILE);
   const writeRecord = (rec: Record<string, unknown>) => fs.writeFileSync(recordFile(), JSON.stringify(rec));
 
-  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-wda-record-')); });
+  beforeEach(() => { dir = makeScratchDir('modoki-wda-record-'); });
   afterEach(() => {
     stopWda();
     Object.assign(reapDeps, realReap);

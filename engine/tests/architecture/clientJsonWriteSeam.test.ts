@@ -38,11 +38,11 @@
 
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles, repoRoot } from '../../scripts/repoCorpus.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /** The one thing every reach of the route has in common, regardless of how the call composed
  *  its body — a template literal, string concat, a helper — none of which the pattern this
@@ -193,7 +193,7 @@ describe('every client-side reach of /api/write-file goes through the one wrappe
  *  not a re-implementation of it. */
 function readScannedSourceFromString(src: string): string {
   const tmp = path.join(
-    fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-write-file-seam-')),
+    makeScratchDir('modoki-write-file-seam-'),
     'probe.ts',
   );
   fs.writeFileSync(tmp, src);

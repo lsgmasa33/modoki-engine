@@ -6,9 +6,9 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 import { createFolderAt, moveAssetFile, duplicateAssetFile, moveToTrash } from '../../plugins/asset-fs-ops';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 let root: string;
 const abs = (p: string) => path.join(root, p);
@@ -16,7 +16,7 @@ const write = (p: string, content: string) => { fs.mkdirSync(path.dirname(abs(p)
 const read = (p: string) => fs.readFileSync(abs(p), 'utf-8');
 const exists = (p: string) => fs.existsSync(abs(p));
 
-beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fsops-')); });
+beforeEach(() => { root = makeScratchDir('modoki-fsops-'); });
 afterEach(() => { fs.rmSync(root, { recursive: true, force: true }); });
 
 describe('createFolderAt', () => {

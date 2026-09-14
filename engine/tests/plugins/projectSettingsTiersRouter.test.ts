@@ -15,7 +15,6 @@
 
 import { describe, it, expect, afterEach } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { handleBackendRequest, type BackendContext } from '../../plugins/backend/editorBackendRouter';
 // Through the same specifier the ROUTE imports it by (a deep source path, not the package
@@ -23,12 +22,13 @@ import { handleBackendRequest, type BackendContext } from '../../plugins/backend
 // import reads back `undefined`, which would make `completeTier()` an empty object and every
 // assertion below vacuous.
 import { UNCLAMPED_OVERRIDES } from '../../packages/modoki/src/runtime/rendering/qualityTier';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const cleanup: string[] = [];
 afterEach(() => { for (const r of cleanup.splice(0)) fs.rmSync(r, { recursive: true, force: true }); });
 
 function makeProject(): string {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-tiers-'));
+  const root = makeScratchDir('modoki-tiers-');
   cleanup.push(root);
   fs.writeFileSync(path.join(root, 'project.config.json'), JSON.stringify({ app: { appId: 'com.x.y' } }));
   return root;

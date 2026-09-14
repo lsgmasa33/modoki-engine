@@ -30,12 +30,12 @@
 
 import { describe, it, expect, afterEach } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { healNativeConfig } from '../../plugins/healNativeConfig';
 import { PROJECT_ROOT_DIRS } from '../../scripts/projectRoots.mjs';
 import { hasNativeProjects } from '../helpers/repoLayout';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 
@@ -155,7 +155,7 @@ describe('build.debugBuild OFF strips every native debug surface (#112)', () => 
 
   /** A minimal but structurally faithful native project the heals can act on. */
   function scaffold(debugBuild: boolean): string {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-debugflag-'));
+    const dir = makeScratchDir('modoki-debugflag-');
     fs.writeFileSync(path.join(dir, 'project.config.json'), JSON.stringify({ build: { debugBuild } }));
     fs.writeFileSync(path.join(dir, 'package.json'),
       JSON.stringify({ dependencies: { 'capacitor-game-debug': 'file:plugins/x.tgz' } }));

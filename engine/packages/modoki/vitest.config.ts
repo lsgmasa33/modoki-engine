@@ -25,6 +25,8 @@ export default defineConfig({
     // pools do not oversubscribe each other.
     ...perfCoreWorkers(),
     include: ['tests/**/*.test.{ts,tsx}'],
+    // Installs makeScratchDir's per-file cleanup (#1117). engine/vite.config.ts's setup does the same.
+    setupFiles: ['./tests/setup.ts'],
     // The first test in a file cold-importing three.js / PixiJS + the engine can exceed the 5s
     // default on Windows under full-suite parallel load, so renderer tests (Scene2D, scene3DSync,
     // syncSceneRenderables3D) timed out intermittently — and a mid-test timeout left the shared

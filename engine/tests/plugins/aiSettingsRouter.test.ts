@@ -6,8 +6,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
-import os from 'os';
 import { handleBackendRequest, type BackendContext } from '../../plugins/backend/editorBackendRouter';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 let tmp: string;
 function makeCtx(): BackendContext {
@@ -24,7 +24,7 @@ const get = () =>
 const post = (patch: unknown) =>
   handleBackendRequest(makeCtx(), { method: 'POST', urlPath: '/api/ai-settings', query: new URLSearchParams(), body: patch });
 
-beforeEach(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-aiset-')); });
+beforeEach(() => { tmp = makeScratchDir('modoki-aiset-'); });
 afterEach(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
 
 describe('/api/ai-settings', () => {

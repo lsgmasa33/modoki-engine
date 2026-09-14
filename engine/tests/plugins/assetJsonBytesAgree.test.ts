@@ -21,12 +21,12 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { relay } from './backendRelay';
-import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { readScannedSource } from '@modoki/engine/testing';
 import { handleBackendRequest, assetJsonBytes, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 let projectRoot = '';
 
@@ -51,7 +51,7 @@ function makeCtx(over: Partial<BackendContext> = {}): BackendContext {
 const post = (urlPath: string, body: unknown, ctx: BackendContext) =>
   handleBackendRequest(ctx, { method: 'POST', urlPath, query: new URLSearchParams(), body });
 
-beforeEach(() => { projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-bytes-')); });
+beforeEach(() => { projectRoot = makeScratchDir('modoki-bytes-'); });
 afterEach(() => { fs.rmSync(projectRoot, { recursive: true, force: true }); });
 
 describe('assetJsonBytes is the one definition of what lands on disk (#831)', () => {

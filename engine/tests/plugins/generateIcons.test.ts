@@ -30,6 +30,7 @@ import { resolveIconInputs as resolveIconInputsAt, stampExtrasFrom, iconInputsTo
 import { ICON_COLORS, iconColorArgs, bundledIconPath, BUNDLED_ICON_REL } from '../../scripts/iconAssets.mjs';
 import { DEFAULT_PROJECT_CONFIG } from '../../project-config';
 import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 /** The engine checkout these tests run in — what `generate-icons.mjs` passes as `engineRoot`. */
 const ENGINE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -49,7 +50,7 @@ const write = (rel: string, body: string) => {
 };
 
 beforeEach(() => {
-  root = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-icons-'));
+  root = makeScratchDir('modoki-icons-');
   write(path.join(PRODUCT, 'mipmap-hdpi', 'ic_launcher.png'), 'product-image');
   write(path.join(PRODUCT, 'mipmap-anydpi-v26', 'ic_launcher.xml'), '<adaptive-icon/>');
   write(path.join('android', 'app', 'src', 'main', 'AndroidManifest.xml'), '<manifest>\n\n</manifest>');
@@ -353,7 +354,7 @@ describe('generate-icons CLI exit codes (#1011 facet C)', () => {
   // The `.cmd` sibling is load-bearing on Windows for the reason the seam block spells out.
   let binDir: string;
   beforeEach(() => {
-    binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fakebin-exit-'));
+    binDir = makeScratchDir('modoki-fakebin-exit-');
     fs.writeFileSync(path.join(binDir, 'npx'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
     fs.writeFileSync(path.join(binDir, 'npx.cmd'), '@echo off\r\nexit /b 1\r\n');
   });
@@ -490,7 +491,7 @@ describe('generate-icons reads project.config.json (#1011, at the seam)', () => 
   let binDir: string;
 
   beforeEach(() => {
-    binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'modoki-fakebin-'));
+    binDir = makeScratchDir('modoki-fakebin-');
     fs.writeFileSync(path.join(binDir, 'npx'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
     // ⚠️ The `.cmd` sibling is not belt-and-braces. `generate-icons.mjs` spawns with
     // `shell: process.platform === 'win32'`, so cmd.exe resolves by PATHEXT and skips an
