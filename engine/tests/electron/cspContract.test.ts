@@ -48,12 +48,16 @@ describe('packaged editor CSP contract', () => {
   // a quoted keyword, `blob:`/`data:`, or a loopback origin counts as remote — and `'strict-dynamic'`
   // is NOT local despite being quoted: it lets an already-trusted script load further scripts from
   // ANY origin, so it re-opens remote code transitively.
-  it('grants no remote origin to the code directives (script-src, worker-src)', () => {
-    const isLocal = (s: string) =>
-      (/^'[^']+'$/.test(s) && s !== "'strict-dynamic'")
-      || s === 'blob:' || s === 'data:' || /^https?:\/\/(localhost|127\.0\.0\.1):/.test(s);
-    for (const d of ['script-src', 'worker-src']) {
-      const remote = directives[d].filter((s) => !isLocal(s));
+  // CSP keywords and schemes are case-insensitive, so compare lower-cased; and the `-elem`/`-attr`
+  // variants OVERRIDE `script-src` for their element kind, so they are code directives too.
+  it('grants no remote origin to the code directives (script-src[-elem|-attr], worker-src)', () => {
+    const isLocal = (raw: string) => {
+      const s = raw.toLowerCase();
+      return (/^'[^']+'$/.test(s) && s !== "'strict-dynamic'")
+        || s === 'blob:' || s === 'data:' || /^https?:\/\/(localhost|127\.0\.0\.1):/.test(s);
+    };
+    for (const d of ['script-src', 'script-src-elem', 'script-src-attr', 'worker-src']) {
+      const remote = (directives[d] ?? []).filter((s) => !isLocal(s));
       expect(remote, `${d} must not allow a remote origin — self-host the script instead`).toEqual([]);
     }
   });
