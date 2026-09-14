@@ -701,6 +701,12 @@ export {
   monthOf, monthsForCalendar, pickDailyLevel, previousMonth, sameMonth,
   type DailyCompletion, type DailyProgress, type DateKey, type DayCell, type DayState, type MonthRef,
 } from './core/dailyCalendar';
+export {
+  drawLoginBonusSegment, loginBonusAvailability, loginBonusClaimRecord, loginBonusSegments,
+  resolveLoginBonusPayout,
+  type LoginBonusClaim, type LoginBonusPayout, type LoginBonusPolicy, type LoginBonusSegment,
+  type LoginBonusSegmentId, type LoginBonusSubstitution, type LoginBonusVerdict,
+} from './core/loginBonus';
 export { stepSimulation, type StepOptions } from './core/stepSimulation';
 export { seedRng, rngNext, rngFloat, rngInt, rngBool, rngPick } from './core/rng';
 export {

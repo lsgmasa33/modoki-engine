@@ -19,6 +19,7 @@
     "./runtime/core/errorText": "./src/runtime/core/errorText.ts",
     "./runtime/core/jsonSafe": "./src/runtime/core/jsonSafe.ts",
     "./runtime/core/dailyCalendar": "./src/runtime/core/dailyCalendar.ts",
+    "./runtime/core/loginBonus": "./src/runtime/core/loginBonus.ts",
     "./editor": "./src/editor/index.ts",
     "./editor/rendering": "./src/editor/rendering/index.ts",
     "./three": "./src/three/index.ts",
