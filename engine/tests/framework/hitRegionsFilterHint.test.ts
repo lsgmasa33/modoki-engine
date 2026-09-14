@@ -62,6 +62,24 @@ describe('hit-regions empty-result hint', () => {
     } finally { offBoard(); }
   });
 
+  it('an EMPTY ids array is a filter miss, not a surface diagnosis (device_hit_regions can send one)', async () => {
+    provideBoard();
+    const r = await runAgentOp('hit-regions', { ids: [] }) as Reply;
+    expect(r.returnedCount).toBe(0);
+    expect(r.hint).not.toMatch(/^Provider\(s\) .* registered but reported no regions/);
+    expect(r.hint).toMatch(/No region matches the filter \(ids=\[\]\), but 2 region\(s\) exist/);
+  });
+
+  it('with no provider filter, a kind miss also names a provider that is registered but EMPTY', async () => {
+    const offBoard = registerHitRegionProvider('board', () => []);
+    provideBoard();
+    try {
+      const r = await runAgentOp('hit-regions', { kind: 'button' }) as Reply;
+      expect(r.hint).toMatch(/Provider\(s\) \[board\] reported NO regions right now/);
+      expect(r.hint).not.toMatch(/\[probe\] reported NO regions/);
+    } finally { offBoard(); }
+  });
+
   it('a schema-less string `ids` (modoki.call / eval) is answered, not thrown', async () => {
     provideBoard();
     const r = await runAgentOp('hit-regions', { ids: 'probe:nope' }) as Reply;

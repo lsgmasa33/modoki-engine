@@ -1518,7 +1518,9 @@ registerAgentOp('hit-regions', (raw: unknown) => {
     const idsText = Array.isArray(p.ids) ? p.ids.join(',') : p.ids != null ? String(p.ids) : '';
     const filterText = [p.provider && `provider=${p.provider}`, p.kind && `kind=${p.kind}`, idsText && `ids=${idsText}`]
       .filter(Boolean).join(' ');
-    const scope = p.provider ? collectHitRegions({ provider: p.provider }) : (p.kind || idsText ? collectHitRegions() : all);
+    // Decide "a filter applied" by PRESENCE, not by the joined text: `ids: []` filters to nothing
+    // in `collectHitRegions` while joining to '' (#1208 close-out review F1).
+    const scope = p.provider ? collectHitRegions({ provider: p.provider }) : (p.kind || p.ids != null ? collectHitRegions() : all);
     if (p.provider && !providers.includes(p.provider)) {
       result.hint = `No hit-region provider is named "${p.provider}". Registered: {${providers.join(', ')}} — `
         + 'check the spelling, or drop provider=.';
@@ -1528,9 +1530,16 @@ registerAgentOp('hit-regions', (raw: unknown) => {
         + 'surface is not hit-testable right now (no level loaded, or a modal is swallowing input).';
     } else {
       const kinds = [...new Set(scope.map((r) => r.kind))].sort();
-      result.hint = `No region matches the filter (${filterText}), but ${scope.length} region(s) exist`
+      // With no provider filter, a correctly spelled kind can belong to a provider that is
+      // registered but EMPTY right now (an unloaded board beside a live HUD). Name those, so
+      // "check the spelling" is not the only reading offered (close-out review F2). `provider`
+      // is stamped from the registry key, so it is safe to compare against `providers`.
+      const reporting = new Set(scope.map((r) => r.provider));
+      const empty = p.provider ? [] : providers.filter((n) => !reporting.has(n));
+      result.hint = `No region matches the filter (${filterText || 'ids=[]'}), but ${scope.length} region(s) exist`
         + `${p.provider ? ` from "${p.provider}"` : ''}. Live kinds there: {${kinds.join(', ')}} — `
-        + 'check the spelling, or drop the filter.';
+        + 'check the spelling, or drop the filter.'
+        + (empty.length ? ` Provider(s) [${empty.join(', ')}] reported NO regions right now (not hit-testable — no level loaded, or a modal is swallowing input), so a kind that only they draw cannot match yet.` : '');
     }
   } else if (regions.length < all.length) {
     result.hint = `${all.length} region(s) matched; showing the first ${regions.length}. Raise limit=, or filter by kind=/provider=.`;

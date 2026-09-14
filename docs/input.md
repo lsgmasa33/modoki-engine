@@ -566,6 +566,20 @@ outright (the `(i)` badge's real hit circle is visibly *smaller* than the ring d
 revealed a 4.8 px dead ring between two controls that reading `hitTest` line by line does not show.
 A game publishes its geometry by calling `registerHitRegionProvider()` from the code that owns it.
 
+**An empty `hit_regions` read explains itself from the population it is actually about** (#1208).
+`kind`/`provider`/`ids` narrow the list before the op explains an empty result, so the explanation
+is decided in the order the filter narrows (the `hit-regions` op in `engine/app/debug/agentBridge.ts`):
+1. A `provider` nobody registered is a spelling question, answered with the registered names.
+2. An empty SCOPE (that provider's regions, or everyone's) is the surface diagnosis: not
+   hit-testable right now. That holds however the rest of the filter is spelled.
+3. Anything else is the filter's miss. It names the kinds that scope has, and any provider that is
+   registered but empty, whose kinds cannot match yet.
+
+"Any regions exist anywhere?" is the tempting shortcut, and it is wrong in both directions. It told
+a correct `provider=board` on an unloaded board, beside a live HUD, to check its spelling. The same
+class, where a filtered read cannot tell "the filter matched nothing" from "nothing exists", is still
+open across 17 other reads (#1214).
+
 Two properties are load-bearing:
 
 - **Gated, and genuinely free when closed.** No listener is even attached until a window opens, and
