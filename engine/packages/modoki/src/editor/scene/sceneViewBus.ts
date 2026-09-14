@@ -9,6 +9,7 @@
  *  hold a dangling reference to a disposed camera or a torn-down viewport's closure. */
 
 import type * as THREE from 'three';
+import { isPackedAlive } from '../../runtime/core/ecs/entityTable';
 
 // ── Editor camera registry (read by the Inspector's "Copy from Editor Camera") ──
 
@@ -123,16 +124,26 @@ export function getEditorProjection(): EditorProjection | null {
 // consumer could read after the object is disposed.
 
 let ecsObjectsRegistry: ReadonlyMap<number, THREE.Object3D> | null = null;
+let ecsOwnersRegistry: ReadonlyMap<number, number> | null = null;
 
-/** SceneView calls this on mount with its live `renderState.ecsObjects`, and `null` on
- *  cleanup. */
-export function setEcsObjectsRegistry(map: ReadonlyMap<number, THREE.Object3D> | null): void {
+/** SceneView calls this on mount with its live `renderState.ecsObjects` and the packed-owner map
+ *  stamped beside it (`renderState.ecsOwners`), and `null` on cleanup. */
+export function setEcsObjectsRegistry(
+  map: ReadonlyMap<number, THREE.Object3D> | null,
+  owners: ReadonlyMap<number, number> | null = null,
+): void {
   ecsObjectsRegistry = map;
+  ecsOwnersRegistry = map ? owners : null;
 }
 
 /** Whether an entity's rendered 3D object is currently visible — `null` when no viewport is
  *  mounted or the entity has no rendered object (no mesh, a resource, UI-layer, etc.). Used
  *  by the E2E devTestBridge to assert collider-only mode actually hides meshes. */
 export function isEcsObjectVisible(entityId: number): boolean | null {
+  // A kept object outlives its entity until the next sync pass reaps or evicts it, so an id that
+  // now names a respawn would otherwise report the dead entity's mesh (#1198 review): the object
+  // counts only while the entity it was built for is still alive.
+  const owner = ecsOwnersRegistry?.get(entityId);
+  if (owner === undefined || !isPackedAlive(owner)) return null;
   return ecsObjectsRegistry?.get(entityId)?.visible ?? null;
 }

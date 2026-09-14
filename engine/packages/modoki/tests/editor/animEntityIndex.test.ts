@@ -13,12 +13,18 @@ vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
   getStructureVersion: () => version,
 }));
 
+let currentWorld: object = {};
+vi.mock('../../src/runtime/core/ecs/worldRegistry', () => ({
+  peekCurrentWorld: () => currentWorld,
+}));
+
 const { getAnimEntityIndex, clearAnimEntityIndex, resolvePathToEntityId } =
   await import('../../src/editor/animation/entityIndex');
 
 beforeEach(() => {
   clearAnimEntityIndex();
   version = 0;
+  currentWorld = {};
   entities = [
     { id: 1, name: 'Root', parentId: 0 },
     { id: 2, name: 'Arm', parentId: 1 },
@@ -39,6 +45,17 @@ describe('getAnimEntityIndex', () => {
     version = 1;
     const b = getAnimEntityIndex();
     expect(b).not.toBe(a);
+  });
+
+  it('rebuilds when the current world changed at the same structure version (#1198 review)', () => {
+    // A scene load bumps the global version while registering into the staging world, then swaps;
+    // a swap back to an existing world bumps nothing. Neither may serve the other world's index.
+    const a = getAnimEntityIndex();
+    currentWorld = {};
+    entities = [{ id: 1, name: 'OtherWorldRoot', parentId: 0 }];
+    const b = getAnimEntityIndex();
+    expect(b).not.toBe(a);
+    expect(b.byId.get(1)?.name).toBe('OtherWorldRoot');
   });
 
   it('clearAnimEntityIndex forces a rebuild even at the same version', () => {

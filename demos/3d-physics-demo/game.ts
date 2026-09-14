@@ -9,7 +9,7 @@
 
 import type { GameDefinition } from '@modoki/engine/runtime';
 import type { Entity } from 'koota';
-import { registerUIAction, unregisterUIAction, refuseAction, Renderable3DPrimitive, entityRef, onWorldSwap } from '@modoki/engine/runtime';
+import { registerUIAction, unregisterUIAction, refuseAction, Renderable3DPrimitive, entityRef, onWorldSwap, packedOf, type PackedEntity } from '@modoki/engine/runtime';
 
 // Occupied tints. The IDLE colours are NOT here — they are authored on each station's
 // Renderable3DPrimitive in the scene, and `tintOnEnter`/`restoreOnExit` below put back
@@ -31,13 +31,18 @@ const ZONE_BASE_COLOR_FALLBACK = 0x9b59b6;   // purple — ditto
 // station occupied at Stop gets a second enter with no matching exit on the next Play. A
 // counter would climb to 2 and never come back down, leaving the station lit forever. A set
 // of occupant ids is idempotent under that duplicate enter, so it self-heals.
-const authoredColor = new Map<number, number>();
-const insiders = new Map<number, Set<number>>();
+// ⚠️ Keyed by the PACKED entity (`packedOf`), zone AND occupant, never `entity.id()` (#1198): koota
+// recycles an index, so a body destroyed inside the zone and a newcomer spawned onto its index are
+// the same `id()`. If the newcomer's enter arrived before the dead body's exit, a bare-id set would
+// add a duplicate and then delete it, restoring the idle tint with the newcomer still inside.
+const authoredColor = new Map<PackedEntity, number>();
+const insiders = new Map<PackedEntity, Set<PackedEntity | typeof NO_OCCUPANT>>();
 const NO_OCCUPANT = -1;   // an enter/exit that arrived without an `other` (never seen; be safe)
 
 // ⚠️ This state belongs to ONE play session and must not outlive its world. Stop reverts by
-// building a brand-new koota World, and `entity.id()` is a per-world SLOT INDEX that restarts
-// at 0 — so the next session hands the same ids to the same entities. Left uncleared, session
+// building a brand-new koota World whose slot indices restart at 0, and koota reuses the destroyed
+// World's id — so the next session hands the same PACKED entity to the same entity, generation and
+// all, and a packed key does not tell the sessions apart. Left uncleared, session
 // 2's first enter would find session 1's entry, skip re-reading the authored colour, and later
 // restore a STALE one: the very shadowing bug this code exists to prevent, laundered through a
 // cache instead of a constant. `onWorldSwap` fires on exactly that swap.
@@ -45,21 +50,25 @@ let unsubWorldSwap: (() => void) | null = null;
 function forgetSessionState(): void { authoredColor.clear(); insiders.clear(); }
 
 function tintOnEnter(self: Entity, other: Entity | undefined, hot: number): void {
-  const id = self.id();
+  const id = packedOf(self);
   let inside = insiders.get(id);
   if (!inside) { inside = new Set(); insiders.set(id, inside); }
   if (inside.size === 0) authoredColor.set(id, (self.get(Renderable3DPrimitive) as { color: number }).color);
-  inside.add(other ? other.id() : NO_OCCUPANT);
+  inside.add(other ? packedOf(other) : NO_OCCUPANT);
   self.set(Renderable3DPrimitive, { color: hot });
 }
 
 function restoreOnExit(self: Entity, other: Entity | undefined, fallback: number): void {
-  const id = self.id();
+  const id = packedOf(self);
   const inside = insiders.get(id);
-  inside?.delete(other ? other.id() : NO_OCCUPANT);
+  inside?.delete(other ? packedOf(other) : NO_OCCUPANT);
   if (inside && inside.size > 0) return;   // someone else is still inside
   insiders.delete(id);
-  // A zone removed while occupied fires an exit for each occupant, so `self` can be dead here.
+  // `self` is normally alive: the engine's zone and contact dispatch drop an event whose self is dead
+  // (runtime/zones/zoneTriggerCore.ts, runtime/physics/physicsContactEvents.ts). So a zone despawned while
+  // occupied never gets these exits and its `insiders` entry is stranded until the world swap. That is
+  // why the zone is keyed by packed entity too: a new zone on the same index must not inherit the
+  // stranded set and skip reading its own authored colour.
   if (self.isAlive()) self.set(Renderable3DPrimitive, { color: authoredColor.get(id) ?? fallback });
   authoredColor.delete(id);
 }

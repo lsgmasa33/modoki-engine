@@ -6,7 +6,10 @@
  *  mirror "because it's a global" must turn THIS red, not slip past unit tests to the e2e. */
 import { describe, it, expect, beforeEach } from 'vitest';
 import * as THREE from 'three';
+import { createWorld } from 'koota';
+import { spawnEntity, destroyEntity } from '../../src/runtime/core/ecs/world';
 import {
+  setEcsObjectsRegistry, isEcsObjectVisible,
   setEditorViewportCamera, getEditorViewportCamera,
   setFocusEntityHandler, focusEntityInSceneView,
   setViewportController, snapEditorViewToAxis, toggleEditorProjection, getEditorProjection,
@@ -103,5 +106,32 @@ describe('sceneViewBus — viewport orientation controller (SceneViewGizmo)', ()
     un();
     expect(getEditorProjection()).toBeNull();
     expect(snapEditorViewToAxis(new THREE.Vector3(1, 0, 0))).toBe(false);
+  });
+});
+
+describe('sceneViewBus — rendered-object probe refuses a dead owner (#1198 review)', () => {
+  it('reports the kept object only while the entity it was built for is alive — not for a respawn on its index', () => {
+    const world = createWorld();
+    try {
+      const dead = spawnEntity(world);
+      const id = dead.id();
+      const objects = new Map<number, THREE.Object3D>([[id, Object.assign(new THREE.Object3D(), { visible: false })]]);
+      const owners = new Map<number, number>([[id, dead.valueOf()]]);
+      setEcsObjectsRegistry(objects, owners);
+      expect(isEcsObjectVisible(id)).toBe(false);
+
+      destroyEntity(dead, world);
+      const newcomer = spawnEntity(world);
+      expect(newcomer.id()).toBe(id); // LIFO free list: the index is reclaimed
+      // The sync pass has not run yet: the map still holds the dead entity's hidden mesh.
+      expect(isEcsObjectVisible(id)).toBeNull();
+
+      owners.set(id, newcomer.valueOf());
+      objects.get(id)!.visible = true;
+      expect(isEcsObjectVisible(id)).toBe(true);
+    } finally {
+      setEcsObjectsRegistry(null);
+      world.destroy();
+    }
   });
 });

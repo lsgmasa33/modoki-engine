@@ -382,6 +382,53 @@ export function outlineSourceGeometry(
   return undefined;
 }
 
+/** The edges overlay for one outlined entity: `existing` when it was traced from `source`, otherwise
+ *  a fresh one (the old one detached and disposed) added to `parent`.
+ *
+ *  ⚠️ **The source geometry is the stamp, not the entity id** (#1198). SceneView keys its outline maps
+ *  by bare id, and an index is recycled: a selected parent's child destroyed and respawned on the same
+ *  index, or a mesh swapped mid-selection, used to keep the edges of the geometry it first saw. Every
+ *  other outline property (colour, TRS) is rewritten each frame by the caller, so the geometry is the
+ *  one thing a stale entry can carry — comparing it re-derives instead of inheriting. Two entities
+ *  sharing one template geometry share a shape, so reusing the edges across them is correct. */
+export function syncEdgeOutline(
+  existing: THREE.LineSegments | undefined,
+  source: THREE.BufferGeometry,
+  makeMaterial: () => THREE.Material,
+  parent: THREE.Object3D,
+): THREE.LineSegments {
+  if (existing && existing.userData.outlineSource === source) return existing;
+  if (existing) disposeEdgeOutline(existing);
+  const outline = new THREE.LineSegments(new THREE.EdgesGeometry(source), makeMaterial());
+  outline.userData.outlineSource = source;
+  parent.add(outline);
+  return outline;
+}
+
+/** `syncEdgeOutline` for the outline `map` holds at `id`, storing a rebuilt outline back into it — the
+ *  get/sync/set step SceneView runs per outlined entity per frame. Kept here so the STORE is tested with
+ *  the rebuild: a rebuild that is not written back builds and adds a fresh outline every frame and
+ *  never disposes it. */
+export function syncOutlineFor(
+  map: Map<number, THREE.LineSegments>,
+  id: number,
+  source: THREE.BufferGeometry,
+  makeMaterial: () => THREE.Material,
+  parent: THREE.Object3D,
+): THREE.LineSegments {
+  const existing = map.get(id);
+  const outline = syncEdgeOutline(existing, source, makeMaterial, parent);
+  if (outline !== existing) map.set(id, outline);
+  return outline;
+}
+
+/** Detach an outline and release its geometry and material. */
+export function disposeEdgeOutline(outline: THREE.LineSegments): void {
+  outline.removeFromParent();
+  outline.geometry.dispose();
+  (outline.material as THREE.Material).dispose();
+}
+
 /** Radius framed when an entity has nothing to measure — no mesh anywhere in its subtree
  *  and no gizmo. Roughly "one unit cube", so F on an empty lands at a workable distance
  *  instead of slamming the near plane into it. */

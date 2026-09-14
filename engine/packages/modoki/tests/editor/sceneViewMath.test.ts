@@ -1,12 +1,12 @@
 /** sceneViewMath — pure viewport helpers extracted from SceneView's render effect
  *  (editor-sceneview F4, Missing Tests 1–4): camera framing, letterbox/NDC remap, and
  *  frustum-wireframe generation. All runnable without a GPU/DOM. */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import * as THREE from 'three';
 import {
   computeLetterbox, computeUIModeNDC, computeFullNDC, computeCamFrustumPositions, frameCameraToBox,
   frameCameraToBoxFixed, computeDeviceLetterbox, resolveDeviceSize, gameAspectFromRect,
-  createSelectGesture, DESELECT_DRAG_PX, outlineSourceGeometry,
+  createSelectGesture, DESELECT_DRAG_PX, outlineSourceGeometry, syncEdgeOutline, syncOutlineFor, disposeEdgeOutline,
   resolveFocusTarget, FOCUS_DEFAULT_RADIUS, shouldHideMeshesForColliderMode, hiddenContentNotice, colliderModeToast } from '../../src/editor/scene/sceneViewMath';
 
 describe('frameCameraToBox (Missing Test #1 — camera framing)', () => {
@@ -270,6 +270,66 @@ describe('createSelectGesture (viewport click vs. camera drag)', () => {
     expect(g.isArmed()).toBe(true);
     g.move(25, 0);          // beyond 20 → drag
     expect(g.isArmed()).toBe(false);
+  });
+});
+
+describe('syncEdgeOutline — the outline is stamped with its source geometry, not its id (#1198)', () => {
+  const material = () => new THREE.LineBasicMaterial();
+
+  it('reuses the outline while the source geometry is the same object', () => {
+    const scene = new THREE.Scene();
+    const geo = new THREE.BoxGeometry(1, 1, 1);
+    const first = syncEdgeOutline(undefined, geo, material, scene);
+    expect(first.parent).toBe(scene);
+    expect(syncEdgeOutline(first, geo, material, scene)).toBe(first);
+    expect(scene.children).toEqual([first]);
+  });
+
+  it('rebuilds for a different source — a newcomer on a recycled index gets ITS edges, and the old ones are released', () => {
+    const scene = new THREE.Scene();
+    const dead = new THREE.BoxGeometry(1, 1, 1);
+    const newcomer = new THREE.SphereGeometry(1);
+    const stale = syncEdgeOutline(undefined, dead, material, scene);
+    const disposedGeo = vi.fn(); const disposedMat = vi.fn();
+    stale.geometry.addEventListener('dispose', disposedGeo);
+    (stale.material as THREE.Material).addEventListener('dispose', disposedMat);
+
+    const fresh = syncEdgeOutline(stale, newcomer, material, scene);
+
+    expect(fresh).not.toBe(stale);
+    // The edges describe the newcomer's shape, not the box the index held before.
+    const expected = new THREE.EdgesGeometry(newcomer).getAttribute('position').count;
+    expect(fresh.geometry.getAttribute('position').count).toBe(expected);
+    expect(expected).not.toBe(new THREE.EdgesGeometry(dead).getAttribute('position').count);
+    expect(scene.children).toEqual([fresh]);
+    expect(disposedGeo).toHaveBeenCalledTimes(1);
+    expect(disposedMat).toHaveBeenCalledTimes(1);
+  });
+
+  it('syncOutlineFor writes a rebuild back into the map, so a steady frame reuses it and the scene holds one outline per id', () => {
+    const scene = new THREE.Scene();
+    const map = new Map<number, THREE.LineSegments>();
+    const box = new THREE.BoxGeometry(1, 1, 1);
+    const first = syncOutlineFor(map, 7, box, material, scene);
+    expect(map.get(7)).toBe(first);
+    expect(syncOutlineFor(map, 7, box, material, scene)).toBe(first);   // steady frame
+    const sphere = new THREE.SphereGeometry(1);
+    const second = syncOutlineFor(map, 7, sphere, material, scene);     // recycled index, new shape
+    expect(second).not.toBe(first);
+    expect(map.get(7)).toBe(second);
+    expect(syncOutlineFor(map, 7, sphere, material, scene)).toBe(second);
+    expect(scene.children).toEqual([second]);
+  });
+
+  it('disposeEdgeOutline detaches and releases both halves', () => {
+    const scene = new THREE.Scene();
+    const o = syncEdgeOutline(undefined, new THREE.BoxGeometry(1, 1, 1), material, scene);
+    const disposed = vi.fn();
+    o.geometry.addEventListener('dispose', disposed);
+    (o.material as THREE.Material).addEventListener('dispose', disposed);
+    disposeEdgeOutline(o);
+    expect(o.parent).toBeNull();
+    expect(disposed).toHaveBeenCalledTimes(2);
   });
 });
 

@@ -10,6 +10,7 @@
  *  so the same index is reused every frame. */
 
 import { getAllEntities, getStructureVersion } from '../../runtime/core/ecs/entityUtils';
+import { peekCurrentWorld } from '../../runtime/core/ecs/worldRegistry';
 import type { AttrNode } from './recording';
 
 export interface AnimEntityIndex {
@@ -20,11 +21,18 @@ export interface AnimEntityIndex {
 
 let cached: AnimEntityIndex | null = null;
 let cachedVersion = -1;
+let cachedWorld: object | null = null;
 
-/** Get the entity index, rebuilding only when the scene structure changed. */
+/** Get the entity index, rebuilding when the scene structure changed OR the current world did.
+ *
+ *  ⚠️ The version alone is not enough (#1198 review): it is ONE global counter. A scene load registers
+ *  its entities into a staging world (bumping it) and awaits before `setCurrentWorld`, so an index
+ *  built in that window is stamped with the new version from the OLD world; and a swap back to an
+ *  existing world registers nothing at all. Either way the ids would name another world's entities. */
 export function getAnimEntityIndex(): AnimEntityIndex {
   const v = getStructureVersion();
-  if (cached && v === cachedVersion) return cached;
+  const world = peekCurrentWorld();
+  if (cached && v === cachedVersion && world === cachedWorld) return cached;
   const byId = new Map<number, AttrNode>();
   const childrenByParent = new Map<number, Map<string, number>>();
   for (const e of getAllEntities()) {
@@ -35,6 +43,7 @@ export function getAnimEntityIndex(): AnimEntityIndex {
   }
   cached = { byId, childrenByParent };
   cachedVersion = v;
+  cachedWorld = world;
   return cached;
 }
 
@@ -44,6 +53,7 @@ export function getAnimEntityIndex(): AnimEntityIndex {
 export function clearAnimEntityIndex(): void {
   cached = null;
   cachedVersion = -1;
+  cachedWorld = null;
 }
 
 // HMR: clear the module-level cache so a hot reload doesn't serve an index built

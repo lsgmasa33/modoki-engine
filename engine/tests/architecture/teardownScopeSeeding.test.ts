@@ -58,7 +58,7 @@ const sites: { label: string; rel: string; seed: string; acquisitions: string[];
       'attachRendererLossHandling(',
       'setEditorViewportCamera(camera)',           // the five module-level slots
       '_pickBillboardInUI = (clientX',
-      'setEcsObjectsRegistry(renderState.ecsObjects)',
+      'setEcsObjectsRegistry(renderState.ecsObjects, renderState.ecsOwners)',
       'setFocusEntityHandler(focusEntityInView)',
       'setViewportController({',
       'const unsubSwap = onWorldSwap(',            // fires on EVERY later scene load if leaked

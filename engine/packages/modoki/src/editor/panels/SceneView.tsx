@@ -82,7 +82,7 @@ import { boneRelToProxyLocal, proxyLocalToBoneLocal } from '../scene/billboardBo
 import { setEditorViewportCamera, setFocusEntityHandler, focusEntityInSceneView, canFrameSelected, setViewportController, setEcsObjectsRegistry } from '../scene/sceneViewBus';
 import { withWarnFilter } from '../scene/warnFilter';
 import { mintEditor3DFrameKey, editor2DChromeFrameKey } from '../scene/frameKeys';
-import { computeUIModeNDC, computeFullNDC, computeCamFrustumPositions, computeLetterbox, frameCameraToBox, gameAspectFromRect, createSelectGesture, outlineSourceGeometry, resolveFocusTarget, axisSnapCameraPosition, slerpCameraOffset, perspHalfHeightAtDistance, perspDistanceForHalfHeight, orthoFrustumForHalfHeight, shouldHideMeshesForColliderMode, hiddenContentNotice, colliderModeToast } from '../scene/sceneViewMath';
+import { computeUIModeNDC, computeFullNDC, computeCamFrustumPositions, computeLetterbox, frameCameraToBox, gameAspectFromRect, createSelectGesture, outlineSourceGeometry, syncOutlineFor, disposeEdgeOutline, resolveFocusTarget, axisSnapCameraPosition, slerpCameraOffset, perspHalfHeightAtDistance, perspDistanceForHalfHeight, orthoFrustumForHalfHeight, shouldHideMeshesForColliderMode, hiddenContentNotice, colliderModeToast } from '../scene/sceneViewMath';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { PREFAB_EDIT_SCENE_PREFIX, PREFAB_EDIT_ROOT_GUID, exitPrefabEditing } from '../scene/prefabEdit';
 import { pushAction, subscribeUndo } from '../undo/undoManager';
@@ -3856,7 +3856,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
 
     // ── ECS Entity Meshes (3D only) ─────────────────────
     const renderState = createRenderState();
-    setEcsObjectsRegistry(renderState.ecsObjects); // E2E observation (collider-only mode etc.)
+    setEcsObjectsRegistry(renderState.ecsObjects, renderState.ecsOwners); // E2E observation (collider-only mode etc.)
     scope.add(() => setEcsObjectsRegistry(null)); // drop the dangling ref to the disposed renderState
     const unsubInvalidation = attachInvalidationListener(renderState, scene);
     scope.add(unsubInvalidation);
@@ -4713,8 +4713,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       const buildOutline = (id: number, obj: THREE.Object3D | null | undefined, color: number) => {
         // A CameraFrame owns its own on-screen representation (teal frameBox / empty marker)
         // and the gizmo attaches to it either way — a yellow EdgesGeometry box on top is
-        // redundant AND buggy (the cached geometry never rebuilds when the slot swaps
-        // marker↔frameBox, so the boxes drift in size). Skip it and drop any stale outline.
+        // redundant. Skip it and drop any stale outline.
         const ent = findEntity(id);
         const isCameraFrame = !!ent && ent.isAlive() && ent.has(CameraFrame);
         const existing = outlineMeshes.get(id);
@@ -4724,19 +4723,15 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         // NodeMaterial spam "AttributeNode: Vertex attribute 'position' not found" every frame.
         const geo = isCameraFrame ? undefined : outlineSourceGeometry(obj);
         if (!obj || !geo) {
-          if (existing) { existing.removeFromParent(); existing.geometry.dispose(); (existing.material as THREE.Material).dispose(); outlineMeshes.delete(id); }
+          if (existing) { disposeEdgeOutline(existing); outlineMeshes.delete(id); }
           return;
         }
         wantOutline.add(id);
-        let outline = existing;
-        if (!outline) {
-          const edges = new THREE.EdgesGeometry(geo);
-          outline = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color }));
-          scene.add(outline);
-          outlineMeshes.set(id, outline);
-        }
+        // Rebuilt when the source geometry differs from the one the edges were traced from — a
+        // recycled index or a mid-selection mesh swap (#1198); otherwise reused.
+        const outline = syncOutlineFor(outlineMeshes, id, geo, () => new THREE.LineBasicMaterial({ color }), scene);
         // Recolour in place so a primary↔member role swap (active-entity change) updates
-        // without a rebuild — the geometry is cached per id, only the tint changes.
+        // without a rebuild — only the tint changes.
         (outline.material as THREE.LineBasicMaterial).color.setHex(color);
         outline.position.copy(obj.position);
         outline.rotation.copy(obj.rotation);
@@ -4753,12 +4748,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       }
       // 2D entity selection outline is drawn by the Scene2DChromeOverlay (drawScene2D).
       for (const [id, outline] of outlineMeshes) {
-        if (!wantOutline.has(id)) {
-          outline.removeFromParent();
-          outline.geometry.dispose();
-          (outline.material as THREE.Material).dispose();
-          outlineMeshes.delete(id);
-        }
+        if (!wantOutline.has(id)) { disposeEdgeOutline(outline); outlineMeshes.delete(id); }
       }
 
       // ── Descendants of the selected entity: dimmer secondary outline ──
@@ -4769,8 +4759,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // its object's children. Same geometry filter as the primary outline: only real-geometry
       // meshes (ecsObjects / baked LODs) produce edges; mesh-less empties, gizmos, billboard
       // and text groups resolve to geometry-less pivots and are skipped. Edges are cached per
-      // id (not rebuilt on a mid-selection mesh swap) — matches the primary outline's behavior;
-      // a re-select refreshes them.
+      // id and rebuilt when the source geometry changes — same rule as the primary outline.
       const descOutlineIds = new Set<number>();
       if (selectedId !== null) {
         const subtree = subtreeIds(getAllEntities(), selectedId);
@@ -4784,25 +4773,14 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
           const geo = obj ? outlineSourceGeometry(obj) : undefined;
           if (!obj || !geo) continue;
           descOutlineIds.add(id);
-          let o = descOutlineMeshes.get(id);
-          if (!o) {
-            const edges = new THREE.EdgesGeometry(geo);
-            o = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0xf1c40f, transparent: true, opacity: 0.35 }));
-            scene.add(o);
-            descOutlineMeshes.set(id, o);
-          }
+          const o = syncOutlineFor(descOutlineMeshes, id, geo, () => new THREE.LineBasicMaterial({ color: 0xf1c40f, transparent: true, opacity: 0.35 }), scene);
           o.position.copy(obj.position);
           o.rotation.copy(obj.rotation);
           o.scale.copy(obj.scale);
         }
       }
       for (const [id, o] of descOutlineMeshes) {
-        if (!descOutlineIds.has(id)) {
-          o.removeFromParent();
-          o.geometry.dispose();
-          (o.material as THREE.Material).dispose();
-          descOutlineMeshes.delete(id);
-        }
+        if (!descOutlineIds.has(id)) { disposeEdgeOutline(o); descOutlineMeshes.delete(id); }
       }
 
       // ── Collider3D wireframe gizmos (3D mode) ──

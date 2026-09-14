@@ -83,9 +83,20 @@ entity's DOM and hook state.
 picker, which run between the pass that fills the cache and the pass that sweeps it — checks a packed owner
 stamped on each entry at every visit, and refuses a dead one: [enact.md](enact.md), the scene-entity row of the aim table (#1197).
 
-**A generation-free `Map<number, …>` / `Set<number>` in `runtime/**` needs a ledger row saying why** —
-`engine/tests/architecture/entityKeyedMaps.test.ts` flags every one at module scope, as a class field
-or as an interface field, with a tagged reason (`not-entity:`, `scratch:`, `revalidated:`, …).
+**A generation-free `Map<number, …>` / `Set<number>` anywhere entity state lives — `runtime/**`, the
+editor, `src/three`, `engine/app`, the starter template, `games/`, `demos/` — needs a ledger row saying why** —
+`engine/tests/architecture/entityKeyedMaps.test.ts` flags every one at module scope, as a class field or
+as an interface field, with a tagged reason (`not-entity:`, `scratch:`, `revalidated:`, …). **A game fixes
+one the engine's way**: `EntityTable`, `packedOf` and `PackedEntity` are exported from
+`@modoki/engine/runtime` (#1198), so the hand-rolled `entity.valueOf()` key is no longer the game-side
+shape. Component state holding an id (`useState<Set<number>>`) is outside the guard by ruling and stays a
+by-hand review.
+
+⚠️ **A GUID is an address, not a lifetime key.** Refer to an entity by guid wherever the reference must
+survive a reload (scene files, cross-entity refs, agent tools). But do not key per-entity STATE by it:
+`spawnPrefabInstance`'s `guidSeed` re-mints the same guid on every respawn by design (Timeline scrub,
+Entries rows), and an entity without `EntityAttributes` has none, so a guid-keyed cache inherits
+exactly as a bare id does. The guard cannot see a string key; that stays by hand too.
 
 Sites that predate the type and carry the second shape by hand, ledgered as `gen-in-value:` and
 deliberately not converted (each is tested, and converting risks iteration order or purge semantics):

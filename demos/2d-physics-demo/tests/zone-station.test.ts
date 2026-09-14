@@ -242,17 +242,17 @@ describe('2d-physics-demo — the authored names resolve to the registered handl
     moveTo(occ1, 0); tw.step(1);
     tw.dispose();
 
-    // SESSION 2: a fresh world. Stop reverts by rebuilding the world, and koota ids are
-    // per-world slot indices that restart at 0 — so the station is handed the SAME id. The
-    // owner has re-coloured it in the Inspector in the meantime.
+    // SESSION 2: a fresh world. Stop reverts by rebuilding the world; its slot indices restart at 0
+    // AND koota reuses the destroyed world's id, so the station gets the SAME packed entity, which is
+    // what the handlers key by (#1198). The owner has re-coloured it in the Inspector in the meantime.
     tw = createTestWorld({ systems: [ZONE] });
     const second = spawnStation(RECOLOURED);
     const occ2 = tw.spawn(Transform({ x: 500, y: 0 }), ZoneOccupant);
 
-    // Guard against this test going vacuous: it only proves anything if the id really is
-    // reused. If a future harness change stops reusing ids, fail here rather than pass for
-    // the wrong reason.
-    expect(second.id()).toBe(first.id());
+    // Guard against this test going vacuous: it only proves anything if the PACKED entity really is
+    // reused (index, generation and world id). If a future harness change stops reusing them, fail
+    // here rather than pass for the wrong reason.
+    expect(second.valueOf()).toBe(first.valueOf());
 
     moveTo(occ2, 0); tw.step(1);
     moveTo(occ2, 500); tw.step(1);

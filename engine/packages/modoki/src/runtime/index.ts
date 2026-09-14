@@ -272,6 +272,9 @@ export {
   type EntityInfo,
 } from './core/ecs/entityUtils';
 export { findEntityById, findEntityByGuid, registerEntity, spawnEntity, unregisterEntity, destroyEntity } from './core/ecs/world';
+// Per-entity state keyed so a recycled index cannot inherit it (#868). Exported for games (#1198, owner
+// ruling): a game fixes an id-keyed map the engine's way, not with a hand-rolled `entity.valueOf()`.
+export { EntityTable, packedOf, type PackedEntity, type EntityTableOptions } from './core/ecs/entityTable';
 export { findUnrenderable2D, type Unrenderable2D } from './rendering/canvas2DRouting';
 export {
   registerModelPostprocessor, getModelPostprocessor, getAllModelPostprocessors, getModelPostprocessorIds,
