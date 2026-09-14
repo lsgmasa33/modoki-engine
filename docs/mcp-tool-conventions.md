@@ -85,7 +85,8 @@ Violations that produced this rule:
 **A tool's name must distinguish it from its neighbours without its description**, because an agent
 often cannot see the description. Claude Code advertises this surface **deferred** — names only,
 schemas fetched on demand ([mcp-response-budget.md](./mcp-response-budget.md) § "Definition surface
-under tool deferral") — so a name is chosen from a list of ~148 strings and nothing else. A pair
+under tool deferral") — so a name is chosen from a list of ~150 strings and nothing else, and each
+string reads `mcp__<server>__<tool>` (`mcp__modoki__modoki_dnd`, `mcp__game-debug__device_list`). A pair
 that reads the same at that width is a coin flip, and §0 ranks a wrong action above an unclear one.
 
 Audit of the whole surface, 2026-08-31 (24 lexically-similar pairs examined; most are fine —
@@ -132,6 +133,15 @@ touching the contracts table, the generated catalog, `liveCoverage`, and every d
 the tool. That is the same cost that made §7 decline splitting `watch` and the journals. They stay
 recorded so a *new* tool does not add a fifth. **When naming a new tool, the test is: could an agent
 seeing only this name and its neighbours pick wrong?**
+
+**The mitigation that costs no rename: a look-alike NAMES its sibling in its description** (#1208,
+2026-09-14). The name alone still cannot choose, but the first schema an agent loads then points at
+the other one. The 2026-09-14 review found four more recoverable pairs the table above does not
+list (`dnd`/`drag`, `journal`/`editor_journal`/`get_console_logs`, `watch`/`input_watch`,
+`wait_for`/`wait_for_edit`) and 24 directed pairs across 16 look-alike groups that did not name each
+other. Guarded: `LOOKALIKE_GROUPS` in `mcpToolContracts.test.ts`. A new look-alike goes into that
+table, and the guard then holds its description to naming the sibling. Findings:
+[the 2026-09-14 ledger](reviews/2026-09-14-mcp-tool-audit.md) § Phase 3.
 - **`position`** — documented as "World position" on `set_transform` while writing `Transform.x/y/z`,
   which is **local**. Every parented entity silently lands somewhere else, reported as success (S1).
 
@@ -219,6 +229,15 @@ legitimate exception: it *measures* a path).
 - **Any id-shaped argument is validated.** `parentGuid` is validated today while `parentId` is
   passed through raw, so a stale numeric id produces an orphan entity — parented to nothing,
   invisible in the Hierarchy — reported as success (S1 `create_entity`/`reparent_entity`/`prefab`).
+- **A ROLE prefix is not a second spelling.** `parentGuid`/`entityGuid` (`modoki_prefab`) and
+  `sampleGuid` (`modoki_capture_gesture`) name WHICH entity, because those tools address two, and a
+  bare `guid` could not say which. A tool that addresses one entity uses bare `id`/`guid`.
+  `set_selection`'s `entityId`/`entityIds` beside `guid`/`guids` is the one mixed spelling left
+  (#1208 P1-5).
+- ⚠️ **A `guid` and an `id` given together are resolved by PRECEDENCE, not refused** — the guid
+  silently wins (`resolveLiveId`, both copies). That contradicts the `AMBIGUOUS` rationale below
+  whenever a stale id names a different entity than the guid. Recorded as open (#1208 P2-2), not as
+  a decision.
 - **Both addressing SHAPES are accepted, so the choice is not a guess.** Aimed-input tools nest
   (`entity:{guid|name|id}`) because they also take a selector or a raw point and the aim modes must
   stay distinguishable; the editor-op tools take a flat `guid`. That rule was written nowhere and
@@ -358,6 +377,10 @@ Rules:
   `bridge.ts`'s `delegateToAgentOps` flattens any throw into the `Error: <msg>` string sentinel the
   game-debug MCP flags, so an `OpRefusal` thrown by a RUNTIME op would lose its code there. None is
   thrown by one today — every recoded site is an editor op, which never runs on a device — and
+  ⚠️ **A RETURNED code is lost on the device too, and that one is not a protocol problem** (#1208
+  C-1): device ops return coded envelopes that cross the wire intact, and the game-debug MCP's
+  `perceptCall`/`writeCall` then stamp `REFUSED_BY_OP` over them. Only the THROW half below needs
+  a protocol change.
   making the device channel carry §5 codes is a protocol change to that MCP, not an extra call to
   `opReplyFor`. Four riders:
   - **The discriminator is a code from the CLOSED set**, not `ok:false`. Dozens of ops report a bad
@@ -570,7 +593,10 @@ choice, not a necessity (F9).
 
 Splitting rule: **if one argument value changes the tool's method, its route, or whether it writes to
 disk, it is more than one tool.** Current offenders (F10): `project_settings` (get/set),
-`watch` (start/read/list/clear, spanning both methods), `journal` (read + capture-window control).
+`watch` (start/read/list/clear, spanning both methods), `journal` (read + capture-window control),
+and, added since that list was written, `profiler` and `input_watch` (read actions GET, capture
+control POST) and `hit_regions` (`action:'show'|'hide'` flips an overlay on a read route). A game
+tool counts too: `wordweave_crossword_view` reads with no params and writes with any (#1208 B-20).
 `play_control`/`history` are acceptable — the op varies but the job does not.
 
 `varies` / `opVaries` in the contract table is a **smell marker**, not a blessing. It exists so the
@@ -636,9 +662,11 @@ variance is machine-readable while it lasts.
 ## 9. Cross-surface parity
 
 **These rules bind all three surfaces.** `device_*` and the `curl` API are not exempt, and the audit
-found the predictable result of treating them as separate: the device server has **no
-`isFailureBody` equivalent**, so a 200-with-`{ok:false}` is reported to the agent as success across
-all six device Percept tools — the exact class fixed on the editor side and silently unfixed here.
+found the predictable result of treating them as separate: the device server had **no
+`isFailureBody` equivalent**, so a 200-with-`{ok:false}` was reported to the agent as success across
+all six device Percept tools — the exact class fixed on the editor side and silently unfixed there.
+(Closed since: `perceptCall` runs the shared `isFailureBody`. Its sibling `writeCall` and two inline
+checks still carry hand-copied predicates, #1208 C-16.)
 
 - **A rule implemented twice diverges.** `result.ts` and `summarize.ts` exist in both MCP servers,
   diverged (136 vs 64 lines). Shared behaviour lives in ONE module both import (F5).
@@ -928,6 +956,13 @@ The description is the tool's contract with the agent — it is read far more of
   inversion to every reader learning the rule from it, and the same sentence is still copied
   verbatim across ~10 `qa/cases/**` (filed as a class, not patched here).
 - **Name the verification.** A mutating tool's description names the read that confirms it.
+  Guarded by a PROXY (`mcpToolContracts.test.ts`): the description must name SOME other tool, or
+  carry a `VERIFICATION_EXEMPT` row saying why the reply is the evidence (it returns the
+  post-state, the read is an action of the same tool, or the effect lies outside the editor). The
+  proxy catches a tool that points nowhere, not one that points at the wrong read.
+- **The first sentence says what the tool DOES** (#1208). It is what a keyword `ToolSearch` and a
+  skim of a loaded schema meet first. A caveat about the reply (`RETURNS {…}`, `NOTE …`), a question
+  (`What references this?`) and an issue number all belong after it. Guarded over both servers.
 
 ## Decisions taken (the surface changes these rules implied)
 
@@ -969,5 +1004,6 @@ These three needed owner sign-off because each changes the advertised surface. A
 
 The remaining known asymmetries are recorded rather than churned: the device↔editor NAMING
 differences (`device_console_logs` vs `modoki_get_console_logs`, …) are tabulated in
-`docs/debug-tools-mcp.md`, and the two genuine device gaps (`device_type_text`, `device_pointer`) are
-features rather than convention violations.
+`docs/debug-tools-mcp.md`. The two device gaps this paragraph once named (`device_type_text`,
+`device_pointer`) have both shipped. The device input tools still have no `entity` aim, although
+`resolve-entity-point` already runs there (#1208 P1-1).

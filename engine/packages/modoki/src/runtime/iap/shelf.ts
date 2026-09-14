@@ -45,8 +45,9 @@ export interface ShelfOffer {
    *
    * Court's bundle needs it: the bundle's permanent-unlock half is recorded under the forever
    * offer's own product id, so selling the bundle while that id is blank would take the money and
-   * drop the unlock with nowhere to write it. A game whose unlock is store-owned has no such
-   * dependency and leaves this unset.
+   * drop the unlock with nowhere to write it. A game that records the unlock by EFFECT rather than
+   * under a product id (wordweave's `StoredPurchases.noAdsForever`), or whose unlock is store-owned,
+   * has no such dependency and leaves this unset.
    */
   readonly requires?: string;
 }

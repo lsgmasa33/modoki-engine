@@ -207,7 +207,7 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
   // ── validate_scene ──
   tool(
     'modoki_validate_scene',
-    'Validate a scene file against the live trait schema (warn-but-load): unknown ' +
+    'Validate a scene file against the live trait schema (warn-but-load; prefabs: modoki_validate_prefab): unknown ' +
       'trait/field, type mismatch, literal-asset-path-instead-of-GUID mistakes, and ' +
       'asset refs whose GUID names nothing in the manifest (a deleted asset — the ref ' +
       'will not resolve at load). schemaAvailable:false means no editor renderer is ' +

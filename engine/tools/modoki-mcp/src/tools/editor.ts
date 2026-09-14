@@ -75,7 +75,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   // ── editor_journal — the human-activity stream (Editor Percept) ──
   tool(
     'modoki_editor_journal',
-    'Read the EDITOR-ACTIVITY stream — what is being done in the editor session (Editor Percept). ' +
+    'Read the EDITOR-ACTIVITY stream — what is being done in the editor session (Editor Percept); game events are modoki_journal, console output modoki_get_console_logs. ' +
       'Event TYPES: !edit, !mutate, !select, !create, !delete, !duplicate, !reparent, !transform, ' +
       '!undo, !redo, !play, !pause, !stop, !scene-load, !save, !gizmo. ' +
       '⚠️ **!mutate is what YOUR OWN modoki_mutate_scene / modoki_set_transform produce** (label ' +
@@ -155,7 +155,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_wait_for',
     'PARK until a condition holds, instead of sleeping a guessed number of ms (an eval setTimeout, ' +
-      'a batch `wait`). Give EXACTLY ONE of: `chrome` (an editor control appears/goes away or reaches ' +
+      'a batch `wait`); to park on a HUMAN edit use modoki_wait_for_edit. Give EXACTLY ONE of: `chrome` (an editor control appears/goes away or reaches ' +
       'a state — the same state modoki_handles reports), `entity` (a get_scene_state guid/name/where ' +
       'matches, or `absent`), `console` (a line containing `match` is logged after the call starts, or ' +
       'within `lookbackMs` before it — for the batch step that logged it), ' +
@@ -192,7 +192,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_wait_for_edit',
     'PARK and be WOKEN the moment the human does something in the editor, instead of polling ' +
-      'modoki_editor_journal in a loop. Returns IMMEDIATELY if a matching event already happened ' +
+      'modoki_editor_journal in a loop (a state condition is modoki_wait_for). Returns IMMEDIATELY if a matching event already happened ' +
       'after `since` (never makes you wait for something that already occurred); otherwise blocks ' +
       'until a matching event arrives or `timeoutMs` elapses. A timeout is a NORMAL result ' +
       '(`{events:[], timedOut:true, nextSeq}`), not an error — just call again with `since:nextSeq` ' +
@@ -495,7 +495,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   // ── gizmo / focus ──
   tool(
     'modoki_set_gizmo',
-    'Set the SceneView transform gizmo mode (translate/rotate/scale) and/or space (world/local).',
+    'Set the SceneView transform gizmo mode (translate/rotate/scale) and/or space (world/local). Returns editor state; gizmoMode/gizmoSpace in modoki_get_editor_state confirm it.',
     {
       mode: z.enum(['translate', 'rotate', 'scale']).optional(),
       space: z.enum(['world', 'local']).optional(),
@@ -667,9 +667,9 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   );
   tool(
     'modoki_focus_entity',
-    'Frame an entity in the SceneView orbit camera (the F-key / "Focus" action). Address it by ' +
+    'Frame an entity in the SceneView orbit camera (the F-key / "Focus" action; keyboard focus is modoki_focus). Address it by ' +
       '`guid` (PREFER — stable) or `id`. Fails if the entity does not resolve, or if no SceneView ' +
-      'is mounted to frame it in (so a "framed it" report always means the camera moved).',
+      'is mounted to frame it in (so a "framed it" report always means the camera moved). Verify the new pose in modoki_get_editor_state.',
     {
       id: z.number().optional().describe('Runtime id. Prefer guid.'),
       guid: z.string().optional().describe('Stable entity guid (preferred). Wins over id.'),

@@ -78,9 +78,11 @@ not, and `games/wordweave` is the second (its coin-pack economy, close-out b51fb
 ⚠️ **Wordweave's hook DIVERGES from Court's shape on point 1 above, deliberately.** Court's grant
 hook has no early "already applied" return — its value writes span three keys (wallet /
 entitlements / passes), so a re-delivery must re-run all of them (see `courtOnGrantImpl`'s own
-banner, `games/court/runtime/systems.ts`). Wordweave has exactly ONE value (`coins`), living in the
-SAME object as the idempotency marker (`StoredPurchases.iapApplied`), under ONE `PlayerPrefs` key —
-so marker-present implies coins-present by construction, and `wordweaveOnGrant` takes an early
+banner, `games/court/runtime/systems.ts`). Every wordweave value (`coins`, `noAdsPassExpiryMs`,
+`noAdsForever`) lives in the SAME object as the idempotency marker (`StoredPurchases.iapApplied`), under
+ONE `PlayerPrefs` key — so marker-present implies every value present by construction (for every
+document written since #1202; a pre-#1202 forever or bundle marker with no `noAdsForever` is the one
+exception, which `applyShelfGrant` repairs on its Android re-delivery), and `wordweaveOnGrant` takes an early
 already-applied return that would be unsafe for Court's multi-key shape. See `creditCoins`'s own
 banner (`games/wordweave/runtime/store.ts`) for exactly when that divergence would have to reverse.
 
@@ -115,9 +117,9 @@ direction:
   every launch** (#1183). `unfinished()` is `queryPurchasesAsync` (INAPP and SUBS), which returns every
   non-CONSUMED purchase, and neither kind is ever consumed; the engine runs the hook even for an
   already-granted transaction. iOS never re-delivers a finished transaction. Harmless for a pure
-  unlock. A purchase that also pays game state (wordweave's bundle pays
-  coins) must keep its idempotency marker forever, and a data-losing reinstall pays it again on
-  Android only. Kept as is (owner, 2026-09-14): dropping acknowledged non-consumables from
+  unlock. A purchase that also pays game state (a bundle paying coins)
+  must keep its idempotency marker forever, and a data-losing reinstall pays it again on Android
+  only. (wordweave's bundle was that case until #1202 declared it the consumable both consoles sell.) Kept as is (owner, 2026-09-14): dropping acknowledged non-consumables from
   `unfinished()` would lose the grant of one acknowledged before a crash, and the early acknowledge
   exists for Play's 3-day refund clock.
 - **`consumable` → WE own it.** The store forgets a consumable the moment it is consumed, so the
@@ -268,12 +270,18 @@ Buttons are declarative `UIAction` bindings, not bespoke TS:
 
 - **`iap.buy`** — payload `{ product }` or the bare product-id string. No default: guessing would
   charge real money for a typo.
-- **`iap.restore`** — **App Store review requires a visible Restore control.** It is deliberately
+- **`iap.restore`** — **App Store review requires a visible Restore control for a non-consumable or a
+  subscription.** A shelf that is ALL consumables has nothing for the STORE to restore, and both
+  shipping games record their permanent unlock themselves and show no Restore row (Court; wordweave
+  since #1202). ⚠️ That is a StoreKit fact, not a review guarantee: a reviewer can still judge a
+  permanent unlock by what it is (Guideline 3.1.1). Court accepts that risk on the strength of a
+  working sign-in restore (`games/court/ads.md`); wordweave has no sign-in yet (#927/#679), so its
+  exposure is larger. It is deliberately
   just the launch path run on demand; restoring is not a different operation from recovering, and
   giving it its own implementation would give it its own bugs.
 
 ⚠️ Two more Apple rules that are cheap now and expensive to retrofit: a visible Restore control (as
-above), and subscription **terms, price and billing period** shown before the purchase is confirmed.
+above, when anything is restorable), and subscription **terms, price and billing period** shown before the purchase is confirmed.
 Prices must come from the store (`productInfo()`), never hardcoded.
 
 `PlayerPrefs.isHydrated()` must be true before `configureIap` — the ledger reads its document

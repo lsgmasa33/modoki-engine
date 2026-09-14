@@ -1619,6 +1619,9 @@ surface and not the other is a *finding*: either closed, or written down here wi
 | `modoki_find_references` | see below |
 | `modoki_delete_asset` | trashes files in the PROJECT CHECKOUT. A device carries a built bundle, not a checkout, and its assets are baked into the app package. |
 | `modoki_create_registered_asset` · `modoki_list_creatable_assets` | the "New X" registry is an EDITOR panel surface writing into the project on disk. Same reason. |
+| `modoki_duplicate_asset` · `modoki_move_asset` · `modoki_create_folder` · `modoki_write_asset_meta` | file operations on the project CHECKOUT, including the import-settings sidecars. A device carries only the imported output. Same reason as `modoki_delete_asset`. |
+| `modoki_unused_assets` · `modoki_validate_prefab` | read the project files on disk: the reference graph and a `.prefab.json` as authored. The device's bundle is already resolved and shaken. Same reason as `modoki_find_references`. |
+| `modoki_discard_asset_edits` | abandons the editor's PARKED asset writes (the dirty-asset registry). A device has no persistence mode and nothing parked. |
 | `modoki_pose_clip` · `modoki_open_animation_editor` · `modoki_exit_pose_envelope` | all three turn on the editor's **preview envelope** — a snapshot of the authored world that ⏹ Exit reverts to, plus a run-mode that blocks a scene save. A device build has no Animation panel, no envelope, and nothing to revert a pose *to*. |
 
 **Closed rather than recorded (#288 Phase 6):** `device_player_prefs`,

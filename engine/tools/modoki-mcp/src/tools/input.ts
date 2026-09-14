@@ -165,7 +165,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_eval',
     'Evaluate JavaScript in the editor RENDERER and return the value — the editor twin of ' +
-      'device_eval. Reads/pokes LIVE renderer state a static file read cannot (a global like ' +
+      'device_eval; list the injected `modoki` ops with modoki_eval_api. Reads/pokes LIVE renderer state a static file read cannot (a global like ' +
       'window.__3d, window.innerWidth/devicePixelRatio, a React fiber value, WGSL validation, or ' +
       'dispatching a bridge event), so you no longer need a raw CDP client for it. Runs as a ' +
       'function body: use `return` to yield a value. The result is safe-stringified in the renderer, ' +
@@ -270,7 +270,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_focus',
     'Move keyboard focus in the editor window: focus the element matching `selector`, or — ' +
       'with NO selector — blur the currently-focused element (focus falls back to <body>). ' +
-      'General-purpose (focus any panel/canvas/input, or defocus a text field). One common ' +
+      'General-purpose (focus any panel/canvas/input, or defocus a text field); to frame an entity in the camera use modoki_focus_entity. One common ' +
       "use is unblocking trusted key input for the GAME: the game's input sampler drops keys " +
       'while a DOM text field (Console filter, inspector) holds focus, and a viewport click ' +
       'does NOT blur it — so call this (no selector) before modoki_press_key. ⚠️ THAT IS ONLY ' +
@@ -324,7 +324,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_dnd',
     'Synthesize an HTML5 drag-and-drop (dragstart→dragover→drop) — the DnD interactions a ' +
       'trusted pointer-drag CANNOT emit: Hierarchy reparent/reorder, Assets file-move & ' +
-      'prefab-instantiate, Skin sprite-onto-part / part-reorder / bone-reparent. Address ' +
+      'prefab-instantiate, Skin sprite-onto-part / part-reorder / bone-reparent (a canvas or gizmo drag is modoki_drag). Address ' +
       'each endpoint by CSS `selector` (targets its center) OR viewport `{x,y}`. Lets the ' +
       "app's own dragstart handler fill the DataTransfer (never fabricated). Returns the " +
       'MIME `types` written (empty ⇒ wrong source element) and `accepted` (target took the ' +

@@ -70,14 +70,14 @@ export function isLiveOwner(owner: number | undefined): boolean {
  *  the two cannot feed different entity kinds, or one of them forget an owner. */
 export function boundsSourcesOf(
   state: Pick<RenderState, 'ecsObjects' | 'ecsOwners' | 'skinned' | 'billboards' | 'textMeshes'>,
-  gizmos?: { objects: ReadonlyMap<number, THREE.Object3D>; owners: ReadonlyMap<number, number> },
+  gizmos?: Iterable<OwnedBoundsEntry>,
 ): EntityBoundsSources {
   return {
     ecsObjects: withOwners(state.ecsObjects, state.ecsOwners),
     skinned: (function* () { for (const [id, entry, owner] of state.skinned.owned()) yield [id, entry.root, owner] as const; })(),
     billboards: groupsOf(state.billboards),
     textMeshes: groupsOf(state.textMeshes),
-    ...(gizmos ? { gizmos: withOwners(gizmos.objects, gizmos.owners) } : {}),
+    ...(gizmos ? { gizmos } : {}),
   };
 }
 

@@ -42,13 +42,18 @@ mesh's rect on BOTH `scene-view` and `game-3d`. The reachable windows are one JS
 `uiFocusSystem`, which reads bounds inside the ECS tick before that frame's render sync) — a
 `modoki_batch` was measured to let a frame run between steps. So every source stamps the packed entity
 (`entity.valueOf()`) on each visit — `RenderState.ecsOwners`, the `skinned` `EntityTable`, an `owner`
-field on billboard/text/flame entries, SceneView's `gizmoOwners`, Scene2D's `activeIds` — and
+field on billboard/text/flame entries, SceneView's gizmo table (`editor/scene/sceneViewGizmoTable.ts`, an
+`EntityTable`), Scene2D's `activeIds` — and
 `isLiveOwner` (`runtime/rendering/entityScreenBounds.ts`) drops a missing or dead stamp. Inside the
 window the newcomer has no rect (the aim refuses) until the next pass measures it. The SceneView 3D
 picker (`pickAt`, the occlusion probe below) gathers from the same maps and applies the same check.
 ⚠️ **A new bounds source must stamp on EVERY visit, not at build**: a same-kind respawn keeps the entry,
 so a build-time stamp names the dead entity forever and the newcomer is never measurable again —
 permanently worse than the one-frame bug. `boundsSourcesOf` is typed so a source cannot omit its owner.
+A cache shared by several KINDS of object on one index needs more than a stamp: SceneView's seven gizmo
+loops each decided "is this row mine?" from the index, so a cross-kind respawn in one frame leaked the
+dead gizmo, and a Camera+Light entity threw in the frame callback every frame (#1206). Its rows carry their kind as well, and one sweep per
+pass releases what no loop kept — the module's docblock has the rules.
 
 **A COVERED aim is refused, whichever resolvable form it took** (2026-08-19). `entity` and
 `selector` are one category — both resolved server-side inside the call — so both now answer

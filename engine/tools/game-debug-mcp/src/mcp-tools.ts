@@ -927,7 +927,7 @@ export function registerTools(server: McpServer) {
 
   tool('device_journal',
     'Read the tick-stamped game-event trace on the device (match/score/win/@contact/…) — the ' +
-      'screenshot-free way to verify game LOGIC. Returns the last 100 events + byType counts over the ' +
+      'screenshot-free way to verify game LOGIC (console output: device_console_logs). Returns the last 100 events + byType counts over the ' +
       'whole ring, plus `captures` (Tier-2 diagnostic state). Narrow with type= and/or level=, raise ' +
       'limit=N; pair with device_dispatch_action to drive the game.\n' +
       'LEVEL: every event carries a triage severity, `info` (default) / `warn` / `error`. ' +
@@ -1098,12 +1098,14 @@ export function registerTools(server: McpServer) {
 
   tool('device_layout_bounds',
     'Numeric screen-space layout on the device (viewport CSS px) — UI DOM rects, 2D, and 3D world ' +
-      'AABBs projected through the game camera. Use instead of eyeballing a screenshot to check ' +
+      'AABBs projected through the game camera (editor-style HANDLES: device_handles). Use instead of eyeballing a screenshot to check ' +
       'alignment/overlap/clipping. Bare = COUNTS + the cheap offScreen/zeroSize id lists; pass ids/layer ' +
       'for per-entity rects, overlaps=true for the O(n²) pair list. Floats rounded — verify by tolerance.',
     {
       layer: z.enum(['ui', '2d', '3d']).optional().describe('Limit to one layer (implies per-entity rects).'),
-      ids: z.array(z.number()).optional().describe('Limit to these entity ids (implies per-entity rects).'),
+      ids: z.array(z.number()).optional().describe('Limit to these entity ids (implies per-entity rects). Volatile across reloads — prefer guids.'),
+      guids: z.array(z.string()).optional().describe('Limit to these entity guids (implies per-entity rects) — the address that survives a reload.'),
+      name: z.string().optional().describe('Limit to entities whose name contains this, case-insensitive (implies per-entity rects).'),
       entities: z.boolean().optional().describe('Force the per-entity rect list on an untargeted call.'),
       overlaps: z.boolean().optional().describe('Materialize the overlapping-pair list (O(n²); default off).'),
       limit: z.number().optional().describe('Cap per-entity rects (sets truncated/totalCount).'),
@@ -1114,7 +1116,7 @@ export function registerTools(server: McpServer) {
 
   tool('device_watch',
     'Percept WATCH on the device — a standing, change-detected numeric time-series over the live ' +
-      'world (jump overshoot, spring settle, velocity decay), the feel questions a screenshot can\'t ' +
+      'world (jump overshoot, spring settle, velocity decay; pointer presses: device_input_watch), the feel questions a screenshot can\'t ' +
       'answer. action:start opens a focused watch (one component, optional guids/names/fields); a value ' +
       'records only when it moves > epsilon. action:read returns per-field STATS (first/last/min/max/' +
       'delta/settled) — pass samples=true for the raw curve. action:list/clear manage them.',
@@ -1187,7 +1189,7 @@ export function registerTools(server: McpServer) {
 
   tool('device_input_watch',
     'Input WATCH on the device — a bounded record of what the POINTER actually did, and what it ' +
-      'resolved to. The one tool that can tell "the press hit nothing" (an authority looked and ' +
+      'resolved to (numeric time-series: device_watch; missed shapes: device_hit_regions). The one tool that can tell "the press hit nothing" (an authority looked and ' +
       'found nothing there) apart from "nothing could answer" (nobody who could look was asked), ' +
       'which is the whole evidence gap a failed gesture otherwise leaves (no journal event, no ' +
       'commit, no coordinates). action:start opens the window and RECORDS NOTHING BEFORE THAT CALL. ' +
@@ -1643,7 +1645,7 @@ export function registerTools(server: McpServer) {
   );
 
   tool('device_mutate_scene',
-    'Set trait fields on live entities ON THE DEVICE (#166) — the write the device surface was ' +
+    'Set trait fields on live entities ON THE DEVICE — the write the device surface was ' +
       'missing, so a "what if X were hidden/smaller/off?" experiment costs one call instead of a ' +
       'rebuild+reinstall cycle. Select with ONE of where (a filter — matching many is the point) / ' +
       'guid (one or an array) / name (exact; ambiguous names are REFUSED) / id. `set` keys are ' +
@@ -1721,7 +1723,7 @@ export function registerTools(server: McpServer) {
   }
 
   tool('device_create_entity',
-    'Spawn an entity in the LIVE world on the device (#166) — no rebuild, no reinstall. Builds the ' +
+    'Spawn an entity in the LIVE world on the device — no rebuild, no reinstall. Builds the ' +
       'SAME entity the editor would (shared spec builders), so a device experiment and an editor ' +
       'one are comparable. An unknown primitive/shape name is refused with the valid list rather ' +
       'than producing an entity whose renderer resolves to nothing. Live only: nothing is written ' +
@@ -1740,7 +1742,7 @@ export function registerTools(server: McpServer) {
   );
 
   tool('device_duplicate_entity',
-    'Copy a live entity ON THE DEVICE, optionally many times (#166) — this is the "spawn N more of ' +
+    'Copy a live entity ON THE DEVICE, optionally many times — this is the "spawn N more of ' +
       'THIS and watch the frame" perf experiment, which previously cost a full rebuild+reinstall ' +
       'per question. DESCENDANTS ARE INCLUDED: a copy of a parent brings its children, each with a ' +
       'FRESH guid (two entities answering to one address would break every read tool). Live only — ' +
@@ -1758,7 +1760,7 @@ export function registerTools(server: McpServer) {
   );
 
   tool('device_delete_entities',
-    'Delete live entities ON THE DEVICE (#166) — the other half of a "does this cost anything?" ' +
+    'Delete live entities ON THE DEVICE — the other half of a "does this cost anything?" ' +
       'experiment. Takes guids (preferred) or ids. If ANY ref does not resolve, NOTHING is deleted ' +
       'and the reply names the misses: a partial delete would leave you unable to tell which ' +
       'entities are now gone. Live only — a relaunch restores the scene.',
@@ -1777,7 +1779,7 @@ export function registerTools(server: McpServer) {
   );
 
   tool('device_step',
-    'Advance a PAUSED device game by N frames, then re-freeze (#166) — what makes a before/after ' +
+    'Advance a PAUSED device game by N frames, then re-freeze — what makes a before/after ' +
       'measurement comparable instead of sampled off a moving world. Pause first with ' +
       'device_set_timescale {scale:0}; stepping a running world is refused rather than silently ' +
       'pausing it. ⚠️ A step here is one REAL frame (however long the phone took, ~16-33ms), NOT a ' +
@@ -1809,7 +1811,7 @@ export function registerTools(server: McpServer) {
   );
 
   tool('device_load_scene',
-    'Swap the scene running ON THE DEVICE (#166) — test another level with no rebuild and no ' +
+    'Swap the scene running ON THE DEVICE — test another level with no rebuild and no ' +
       'reinstall. The reply reads the active scene back after the swap, so a path that does not ' +
       'exist in this build is reported as a failure rather than resolving quietly; the previous ' +
       'scene stays loaded when it fails. Note the device has no unsaved-work guard because it has ' +
@@ -1823,7 +1825,7 @@ export function registerTools(server: McpServer) {
   );
 
   tool('device_read_asset_def',
-    'Read an asset definition AS THE RUNNING BUILD RESOLVED IT (#166 P7) — a particle/animation/' +
+    'Read an asset definition AS THE RUNNING BUILD RESOLVED IT — a particle/animation/' +
       'timeline/spriteanim/rig2d/shader/animset def straight out of the live cache on the phone. ' +
       'NOT .mat.json — a material\'s live cache holds only the compiled THREE.Material, the ' +
       'authored JSON is discarded once built, so read that file directly instead. This is not a ' +
@@ -1850,7 +1852,7 @@ export function registerTools(server: McpServer) {
   // convention layer: no strict schema, no §5 refusal envelope, no coverage tier.
 
   tool('device_profiler',
-    'Where did the frame go, ON THE DEVICE — the profiler surface (#138). Bare = read the live ' +
+    'Read or drive the frame PROFILER on the device — where the frame time went, per marker. Bare = read the live ' +
       'marker aggregate. capture-start/-stop/-read record real frames and rank the WORST ones by ' +
       'cost (not the most recent), so a hitch is findable after the fact. gpu-on/gpu-off enable GPU ' +
       'timestamp queries, which have a real cost and so must be deliberate; on a backend without ' +
@@ -2126,7 +2128,7 @@ async function coordScaleOrRefusal(
   // ── Console Logs ───────────────────────────────────────────
 
   tool('device_console_logs',
-    'Return captured console.log/warn/error/info from the game.',
+    'Return captured console.log/warn/error/info from the game (semantic game events: device_journal).',
     {
       limit: z.number().optional().describe('Max entries (default: 50)'),
       level: z.enum(['log', 'warn', 'error', 'info']).optional(),

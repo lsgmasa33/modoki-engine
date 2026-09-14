@@ -20,6 +20,7 @@ import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { CONTRACTS, contractFor } from '../../tools/modoki-mcp/src/contracts';
 import { getTool } from '../../tools/modoki-mcp/src/registry';
 import { loadSurface, realRequests, type Surface } from './mcpSurface';
+import { loadDeviceSurface } from './deviceSurface';
 
 describe('tool contracts', () => {
   let s: Surface;
@@ -564,5 +565,178 @@ describe('tool contracts', () => {
     const entry = getTool('modoki_set_transform')!;
     const parsed = z.object(entry.shape).strict().safeParse({ entity: { name: 'X' }, nonsense__: 1 });
     expect(parsed.success).toBe(false);
+  });
+});
+
+/** What an agent reads when Claude Code defers the schemas (#1208 phase 3; conventions §2a, §11).
+ *
+ *  Under deferral a tool is chosen from its NAME, and the description is fetched for the few names
+ *  that survive that cut. So two things carry the choice: the first sentence, which is what a
+ *  keyword `ToolSearch` and a skim of a loaded schema meet first, and whether a tool that looks like
+ *  a neighbour says which neighbour to use instead. Both were measured on the 2026-09-14 surface
+ *  (`docs/reviews/2026-09-14-mcp-tool-audit.md` § Phase 3) and neither was held by anything.
+ *
+ *  The first two ledgers were seeded with the 2026-09-14 offenders and emptied in the same review;
+ *  the third keeps only exemptions that carry a reason. */
+describe('descriptions an agent reads under deferral (#1208)', () => {
+  /** Up to the first sentence end (`.`/`!`/`?` before whitespace, and `?` before a dash) or the first
+   *  newline. `e.g.`/`i.e.`/`etc.` do not end a sentence — the review found four first sentences cut
+   *  short there, which would have hidden anything after the abbreviation. */
+  const firstSentence = (d: string): string => {
+    const masked = d.replace(/\b(e\.g|i\.e|etc|vs)\./g, (m) => m.replace(/\./g, '\u0000'));
+    const end = masked.match(/^[\s\S]*?(?:[.!](?=\s|$)|\?(?=\s|$|[—–-])|\n)/)?.[0].length ?? d.length;
+    return d.slice(0, end).trim();
+  };
+
+  /** What is wrong with a first sentence, or null. It must say what the tool DOES:
+   *  - not a caveat about the reply (`RETURNS {…}`, `NOTE …`, `⚠️`), which belongs after it;
+   *  - not a question (`What references this?`), which names the need but not the tool;
+   *  - no issue number, which is history an agent choosing a tool cannot use. */
+  const firstSentenceDefect = (d: string): string | null => {
+    const f = firstSentence(d);
+    // Case-INSENSITIVE for the caveat words, except that a prose "Returns the …" is what a tool does;
+    // only a returned SHAPE (`Returns {…}`/`RETURNS …`) or a `Note:`-style label is a caveat.
+    if (/^(?:NOTE|RETURNS|WARNING|IMPORTANT|CAUTION)\b|^⚠/.test(f) || /^(?:note|warning|important|caution)\s*:|^returns\s*[{[]/i.test(f)) return 'leads with a caveat';
+    if (/\?$/.test(f)) return 'is a question';
+    if (/#\d+/.test(f)) return 'carries an issue number';
+    return null;
+  };
+
+  /** Does `desc` name the tool `full`? The full name always counts. The bare suffix counts only
+   *  when it is compound (`editor_journal`), because a one-word suffix (`drag`, `watch`, `eval`) is
+   *  ordinary prose and would match a description that never meant the tool. */
+  const namesTool = (desc: string, full: string): boolean => {
+    const bare = full.replace(/^(?:modoki|device)_/, '');
+    const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const token = (s: string) => new RegExp(`(?<![a-z0-9_])${esc(s)}(?![a-z0-9_])`);
+    return token(full).test(desc) || (bare.includes('_') && token(bare).test(desc));
+  };
+
+  /** Tools an agent can confuse from the name alone (§2a). Every member names every other. */
+  const LOOKALIKE_GROUPS: ReadonlyArray<readonly string[]> = [
+    ['modoki_dnd', 'modoki_drag'],
+    ['modoki_journal', 'modoki_editor_journal', 'modoki_get_console_logs'],
+    ['modoki_watch', 'modoki_input_watch'],
+    ['modoki_input_watch', 'modoki_hit_regions'],
+    ['modoki_wait_for', 'modoki_wait_for_edit'],
+    ['modoki_capture_viewport', 'modoki_render_scene'],
+    ['modoki_focus', 'modoki_focus_entity'],
+    ['modoki_eval', 'modoki_eval_api'],
+    ['modoki_create_asset', 'modoki_create_registered_asset'],
+    ['modoki_get_layout_bounds', 'modoki_handles'],
+    ['modoki_validate_scene', 'modoki_validate_prefab'],
+    ['device_journal', 'device_console_logs'],
+    ['device_watch', 'device_input_watch'],
+    ['device_input_watch', 'device_hit_regions'],
+    ['device_eval', 'device_eval_api'],
+    ['device_layout_bounds', 'device_handles'],
+  ];
+
+  /** Emptied by #1208 Phase 4 on the day the guard landed. A new row needs a reason an agent
+   *  choosing a tool would accept; "the description was already like that" is not one. */
+  const FIRST_SENTENCE_OFFENDERS: ReadonlyArray<{ item: string; reason: string }> = [];
+
+  const UNNAMED_SIBLINGS: ReadonlyArray<{ item: string; reason: string }> = [];
+
+  /** Mutating tools that need not name a verifying read, with the reason. §11 "name the
+   *  verification". The detector is a PROXY — it asks whether the description names ANY other
+   *  `modoki_*` tool — so it catches a tool that points nowhere, not one that points at the wrong
+   *  read (the ledger's B-12 lists those). */
+  const VERIFICATION_EXEMPT: ReadonlyArray<{ item: string; reason: string }> = [
+    { item: 'modoki_set_selection', reason: 'the reply IS the post-state (returns the new editor state)' },
+    { item: 'modoki_project_settings', reason: 'its own action:get is the read-back' },
+    { item: 'modoki_watch', reason: 'its own action:read/list is the read-back' },
+    { item: 'modoki_input_watch', reason: 'its own action:read is the read-back' },
+    { item: 'modoki_profiler', reason: 'its own read/capture-read actions are the read-back' },
+    { item: 'modoki_build', reason: 'the effect is an artifact outside the editor; the returned log is the evidence' },
+    { item: 'modoki_add_native_target', reason: 'the effect is a native project on disk; the returned stream is the evidence' },
+    { item: 'modoki_eval', reason: 'arbitrary code — the return value is whatever the caller made it' },
+    { item: 'modoki_hover', reason: 'an input; what it changes belongs to the app under the pointer' },
+    { item: 'modoki_drag', reason: 'an input; what it changes belongs to the app under the pointer (its only tool name is its look-alike, modoki_dnd)' },
+  ];
+
+  it('a first sentence says what the tool does', async () => {
+    const s = loadSurface();
+    const d = await loadDeviceSurface();
+    try {
+      const all = [...s.names.map((n) => [n, s.descriptionOf(n)] as const), ...d.names.map((n) => [n, d.descriptionOf(n)] as const)];
+      assertExemptionLedger({
+        label: 'FIRST_SENTENCE_OFFENDERS in mcpToolContracts',
+        population: all.flatMap(([n, desc]) => {
+          const why = firstSentenceDefect(desc);
+          return why ? [{ item: n, site: `${n}: ${why} — "${firstSentence(desc).slice(0, 80)}"` }] : [];
+        }),
+        exempt: FIRST_SENTENCE_OFFENDERS,
+        scanned: all.length,
+        floor: 140,
+        fix: "rewrite the first sentence as what the tool DOES; move the caveat, question or issue number after it.",
+      });
+    } finally { s.restore(); d.restore(); }
+  });
+
+  it('…and THAT detector can fail', () => {
+    expect(firstSentenceDefect('RETURNS {count}: blah. Read the trace.')).toBe('leads with a caveat');
+    expect(firstSentenceDefect('What references this? The inverse walk.')).toBe('is a question');
+    expect(firstSentenceDefect('Spawn an entity on the device (#166) — no rebuild.')).toBe('carries an issue number');
+    expect(firstSentenceDefect('Read the LIVE ECS world. Not the file (#12).')).toBeNull();
+    expect(firstSentenceDefect('Returns the state of the editor.')).toBeNull();
+    // the review's three gaps
+    expect(firstSentenceDefect('Note: count is rects. Numeric layout.')).toBe('leads with a caveat');
+    expect(firstSentenceDefect('Returns {count, total}: blah. Read it.')).toBe('leads with a caveat');
+    expect(firstSentenceDefect('Where did the frame go?— the profiler.')).toBe('is a question');
+    expect(firstSentenceDefect('Find actions (e.g. a level id) for the game (#12). More.')).toBe('carries an issue number');
+  });
+
+  it('a tool that looks like a neighbour names that neighbour', async () => {
+    const s = loadSurface();
+    const d = await loadDeviceSurface();
+    try {
+      const desc = (n: string) => (n.startsWith('device_') ? d.descriptionOf(n) : s.descriptionOf(n));
+      const registered = new Set([...s.names, ...d.names]);
+      const unknown = LOOKALIKE_GROUPS.flat().filter((n) => !registered.has(n));
+      expect(unknown, 'a LOOKALIKE_GROUPS member is not a registered tool — renamed or removed?').toEqual([]);
+      const pairs = LOOKALIKE_GROUPS.flatMap((g) => g.flatMap((a) => g.filter((b) => b !== a).map((b) => [a, b] as const)));
+      assertExemptionLedger({
+        label: 'UNNAMED_SIBLINGS in mcpToolContracts',
+        population: pairs.filter(([a, b]) => !namesTool(desc(a), b)).map(([a, b]) => ({ item: `${a}->${b}`, site: `${a} does not name ${b}` })),
+        exempt: UNNAMED_SIBLINGS,
+        scanned: pairs.length,
+        floor: 30,
+        fix: 'name the look-alike in the description ("for X use modoki_Y instead"), so a deferred-schema agent can tell them apart.',
+      });
+    } finally { s.restore(); d.restore(); }
+  });
+
+  it('…and THAT matcher can fail', () => {
+    expect(namesTool('the stateful twin of modoki_drag', 'modoki_drag')).toBe(true);
+    expect(namesTool('Unlike capture_viewport (a screenshot)', 'modoki_capture_viewport')).toBe(true);
+    // A one-word suffix in prose is not a mention of the tool…
+    expect(namesTool('drag a sprite onto a part', 'modoki_drag')).toBe(false);
+    // …and a longer tool name does not contain a shorter one.
+    expect(namesTool('see modoki_drag_handle', 'modoki_drag')).toBe(false);
+    expect(namesTool('see modoki_wait_for_edit', 'modoki_wait_for')).toBe(false);
+  });
+
+  it('a mutating tool names the read that verifies it, or says why it need not', async () => {
+    const s = loadSurface();
+    try {
+      const mutating = Object.entries(CONTRACTS).filter(([, c]) => c.mutating).map(([n]) => n);
+      // A look-alike pointer ("for X use modoki_Y") is §2a's, not a read-back, so it does not count
+      // here — otherwise the sibling guard's fixes silently satisfy this one (#1208 review, finding 3:
+      // `focus_entity` stayed green with its read-back sentence deleted, because it names `focus`).
+      const siblingsOf = (n: string) => new Set(LOOKALIKE_GROUPS.filter((g) => g.includes(n)).flat());
+      const pointsNowhere = mutating.filter((n) => {
+        const skip = siblingsOf(n);
+        return !s.names.some((other) => other !== n && !skip.has(other) && namesTool(s.descriptionOf(n), other));
+      });
+      assertExemptionLedger({
+        label: 'VERIFICATION_EXEMPT in mcpToolContracts',
+        population: pointsNowhere.map((n) => ({ item: n, site: n })),
+        exempt: VERIFICATION_EXEMPT,
+        scanned: mutating.length,
+        floor: 40,
+        fix: 'name the read that confirms this write (§11), or add a VERIFICATION_EXEMPT row saying why the reply itself is the evidence.',
+      });
+    } finally { s.restore(); }
   });
 });

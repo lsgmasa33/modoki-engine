@@ -82,7 +82,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_create_asset',
     `Scaffold a new asset (${ASSET_TYPES_PROSE}) with sensible defaults + a fresh GUID at ` +
-      'the given path. Then edit it with modoki_write_asset or (for live preview) the particle/anim ops. ' +
+      'the given path. For a GAME-registered kind, or the Assets panel\'s own "New X" document plus the editor it opens, use modoki_create_registered_asset. Then edit it with modoki_write_asset or (for live preview) the particle/anim ops. ' +
       'Always writes the file directly, regardless of persistence mode (modoki_persistence) — this is ' +
       'an explicit "write this file" tool, not a live-state edit.',
     {
@@ -195,7 +195,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'half of that surface: the panel\'s own flow opens the native save dialog FIRST, and on ' +
       'macOS that is a BLOCKING osascript panel, so the whole "New X" surface was unreachable ' +
       'from here. Passing the path routes around it; the human\'s dialog is untouched.\n\n' +
-      'DIFFERENT FROM modoki_create_asset, which takes a fixed enum of six engine asset types. ' +
+      'DIFFERENT FROM modoki_create_asset, which takes a fixed enum of engine asset types. ' +
       'This drives the live, game-extensible registry — read modoki_list_creatable_assets for what ' +
       'is available in the OPEN project.\n\n' +
       'A create-OVERRIDE kind is REFUSED, `scene` above all: its override discards the live world, ' +
@@ -511,7 +511,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
   // ── find_references (#284) ──
   tool(
     'modoki_find_references',
-    'What references this? Walks the reverse asset/entity reference graph from a target — ' +
+    'List what references an asset: walks the reverse asset/entity reference graph from a target — ' +
       'direct AND indirect chains (e.g. texture ← material ← mesh ← entity), including implicit ' +
       'edges no single file records (a UI imageSrc holding the auto-emitted whole-image sprite ' +
       "guid rather than the texture's own). Use before deleting/renaming an asset, or to find " +

@@ -1504,8 +1504,34 @@ registerAgentOp('hit-regions', (raw: unknown) => {
       + 'has no hit regions — nobody was able to answer. A game publishes them by calling '
       + 'registerHitRegionProvider() from the code that owns its hitTest geometry.';
   } else if (all.length === 0) {
-    result.hint = `Provider(s) [${providers.join(', ')}] registered but reported no regions — the `
-      + 'surface is not hit-testable right now (no level loaded, or a modal is swallowing input).';
+    // ⚠️ `all` is the FILTERED list, so an empty one is only evidence about the surface when no
+    // filter applied. A typo'd `kind`/`provider`/`ids` used to earn "not hit-testable right now" —
+    // a confident wrong cause (§0 rank 2, #1208 B-4). So decide in the order the filter narrows:
+    //  1. a `provider` nobody registered is a spelling question, not a surface one;
+    //  2. the SCOPE is that provider's regions (or every provider's) — if the scope itself is empty,
+    //     the surface diagnosis is the true one, however the rest of the filter is spelled
+    //     (#1208 review: checking "any regions anywhere" told a correct `provider=board` on an
+    //     unloaded board to check its spelling, because another provider had a region);
+    //  3. only then is a `kind`/`ids` miss the filter's, with the kinds named FROM THE SCOPE.
+    // `ids` is formatted defensively: the op is reachable schema-less (`modoki.call`, eval), and a
+    // string there used to answer rather than throw.
+    const idsText = Array.isArray(p.ids) ? p.ids.join(',') : p.ids != null ? String(p.ids) : '';
+    const filterText = [p.provider && `provider=${p.provider}`, p.kind && `kind=${p.kind}`, idsText && `ids=${idsText}`]
+      .filter(Boolean).join(' ');
+    const scope = p.provider ? collectHitRegions({ provider: p.provider }) : (p.kind || idsText ? collectHitRegions() : all);
+    if (p.provider && !providers.includes(p.provider)) {
+      result.hint = `No hit-region provider is named "${p.provider}". Registered: {${providers.join(', ')}} — `
+        + 'check the spelling, or drop provider=.';
+    } else if (scope.length === 0) {
+      const who = p.provider ? `Provider "${p.provider}" is` : `Provider(s) [${providers.join(', ')}]`;
+      result.hint = `${who} registered but reported no regions — the `
+        + 'surface is not hit-testable right now (no level loaded, or a modal is swallowing input).';
+    } else {
+      const kinds = [...new Set(scope.map((r) => r.kind))].sort();
+      result.hint = `No region matches the filter (${filterText}), but ${scope.length} region(s) exist`
+        + `${p.provider ? ` from "${p.provider}"` : ''}. Live kinds there: {${kinds.join(', ')}} — `
+        + 'check the spelling, or drop the filter.';
+    }
   } else if (regions.length < all.length) {
     result.hint = `${all.length} region(s) matched; showing the first ${regions.length}. Raise limit=, or filter by kind=/provider=.`;
   }

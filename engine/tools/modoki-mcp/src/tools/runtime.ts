@@ -22,7 +22,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
   // ── Phase A: semantic verification ──
   tool(
     'modoki_journal',
-    'RETURNS {count, total, ringTotal, byType, events}: `count` is what came back, `total` is what MATCHED your filter, and `ringTotal`+`byType` describe the WHOLE ring regardless of the filter — so a filtered read still shows you what else is in there. Read the tick-stamped game-event trace (events a game emits: match/score/win/…). The ' +
+    'Read the tick-stamped GAME-event trace (events a game emits: match/score/win/…) — not the editor-activity stream (modoki_editor_journal) or console output (modoki_get_console_logs). RETURNS {count, total, ringTotal, byType, events}: `count` is what came back, `total` is what MATCHED your filter, and `ringTotal`+`byType` describe the WHOLE ring regardless of the filter — so a filtered read still shows you what else is in there. The ' +
       'screenshot-free way to verify game LOGIC — assert on events, not pixels. Returns the ' +
       'LAST 100 events by default plus `byType` counts over the whole 10,000-event ring and ' +
       '`captures` (Tier-2 diagnostic state). Narrow with type= and/or level=, raise limit=N, pair ' +
@@ -134,9 +134,9 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
   // ── Phase B: numeric layout/bounds ──
   tool(
     'modoki_get_layout_bounds',
-    'NOTE `count` counts RECTS, not entities: every 3D entity is measured once PER MOUNTED VIEWPORT (Scene and Game each have their own camera), so with both open it is roughly doubled. `entityCount` is the distinct-entity number, and `surfaces`/`surfaceNote` appear whenever more than one is mounted. Numeric screen-space layout (viewport CSS px) — UI (true DOM/flexbox rects), 2D, and 3D ' +
-      '(world AABB projected through the game camera). Use this INSTEAD of eyeballing a screenshot ' +
-      'to check alignment, spacing, overlap, or clipping. CALLED BARE it returns COUNTS — count, ' +
+    'Numeric screen-space layout of ENTITIES (viewport CSS px) — UI (true DOM/flexbox rects), 2D, and 3D ' +
+      '(world AABB projected through the game camera); for editor HANDLES use modoki_handles. Use this INSTEAD of eyeballing a screenshot ' +
+      'to check alignment, spacing, overlap, or clipping. NOTE `count` counts RECTS, not entities: every 3D entity is measured once PER MOUNTED VIEWPORT (Scene and Game each have their own camera), so with both open it is roughly doubled. `entityCount` is the distinct-entity number, and `surfaces`/`surfaceNote` appear whenever more than one is mounted. CALLED BARE it returns COUNTS — count, ' +
       'layerCounts, overlapsCount — plus the cheap `offScreen` and `zeroSize` id lists. Those ids ' +
       'are usually the whole answer ("what is invisible / collapsed?"). For per-entity rects pass ' +
       '`ids` or `layer`; for the same-layer overlapping PAIRS (ancestor pairs excluded) pass ' +
@@ -319,8 +319,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
   // ── Profiler (#166 P6) — the editor half of a gap that existed on BOTH surfaces ──
   tool(
     'modoki_profiler',
-    'Where did the frame go? — the Profiler surface (#138), which until now had NO typed tool on ' +
-      'EITHER surface and was reachable only by an agent who knew to eval the op. Called bare it ' +
+    'Read or drive the frame PROFILER — where the frame time went, per marker. Called bare it ' +
       'reads the live marker aggregate (the per-marker self-ms breakdown of a frame). ' +
       'capture-start/-stop/-read record real frames and rank the WORST by cost, not the most recent, ' +
       'so a hitch stays findable after it happened. gpu-on/gpu-off enable GPU timestamp queries — ' +
@@ -382,7 +381,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_watch',
     'Percept WATCH — a standing, change-detected numeric time-series over the live world. The way ' +
       'to see how a NUMBER moved over time (jump overshoot, spring settle, velocity decay, a bone ' +
-      'trajectory) — the animation/physics feel questions you cannot judge from a screenshot. ' +
+      'trajectory) — the animation/physics feel questions you cannot judge from a screenshot (pointer presses: modoki_input_watch). ' +
       'action:start opens a focused watch (one component, optional guid/NAME/field subset); a value ' +
       'is recorded only when it moves > epsilon (settled things record nothing). ' +
       'SCOPE by `names` (case-insensitive substrings) for a runtime-spawned, short-lived entity whose ' +
@@ -487,7 +486,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
   // ── Input WATCH: what the pointer actually did (#134) ──
   tool(
     'modoki_input_watch',
-    'Input WATCH — a bounded record of what the POINTER actually did, and what it resolved to. ' +
+    'Input WATCH — a bounded record of what the POINTER actually did, and what it resolved to (numeric time-series: modoki_watch; the shapes a press missed: modoki_hit_regions). ' +
       'The journal answers "what did the game do"; this answers "what did the finger do" — the ' +
       'question with the LEAST evidence when a gesture fails (a press that resolves to nothing ' +
       'emits no journal event, no commit, no coordinates). action:start opens the window; it ' +

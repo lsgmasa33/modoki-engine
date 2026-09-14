@@ -601,7 +601,15 @@ describe('the real registered surface', () => {
   // readers that chrome is now aimable by label and readable without modoki_eval — the ~1,900 evals
   // #1152/#1153 measured are the spend this buys back. The param wording was trimmed once before
   // pinning (158,364 → 157,776); the close-out then named label/entity in the x/y descriptions (+168).
-  const DEFINITION_BYTES = 157_944;
+  // 2026-09-14 (#1208 phase 4, work-qa): RE-PINNED to 162,505 — measured. The merge base already
+  // priced 161,610 (3,666 over the old pin, inside the headroom, arriving through the 2026-09-14
+  // merges), and this change adds 895: 836 across 17 tools, then +59 on create_asset and
+  // create_registered_asset after review, for a pointer that says how to CHOOSE between them (`gen:ledger`, `ledger/work-qa.csv`): each
+  // look-alike naming its sibling in its first schema read (24 directions, #1208 §2a), first
+  // sentences rewritten to say what the tool does, and set_gizmo/focus_entity naming their
+  // read-back. The first-sentence rewrites REMOVED bytes (two issue numbers, a changelog clause);
+  // the sibling pointers are the spend.
+  const DEFINITION_BYTES = 162_505;
   const DEFINITION_HEADROOM = 4_000;
 
   // `sumSchemaBytes` itself now lives in `mcpSurface.ts` (imported above), not here — this ledger

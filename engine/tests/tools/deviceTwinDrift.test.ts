@@ -161,3 +161,16 @@ describe('coordinate aims all carry the screenshot scale', () => {
     });
   }
 });
+
+describe('device_layout_bounds: guid and name filters reach the device (#1208 P1-4)', () => {
+  it('advertises and forwards `guids` and `name`, which the layout-bounds op already takes', async () => {
+    // The op accepted `guids`/`name` (layoutDump.ts `LayoutBoundsParams`) while the device tool
+    // advertised `ids` only, so a device caller had to map guid → id first — and ids are
+    // reassigned on every scene reload. Strict validation made the missing params a refusal.
+    s = await loadDeviceSurface(() => deviceReply({ count: 1, entities: [] }));
+    expect(s.validate('device_layout_bounds', { guids: ['g-1'], name: 'Puck' }).ok).toBe(true);
+    await s.call('device_layout_bounds', { guids: ['g-1'], name: 'Puck' });
+    expect(relayed(s).method).toBe('layout-bounds');
+    expect(relayed(s).params).toMatchObject({ guids: ['g-1'], name: 'Puck' });
+  });
+});

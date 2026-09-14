@@ -33,7 +33,7 @@ Mixing CocoaPods and SPM produces duplicate-framework conflicts. Any SDK that ha
 
 ### iOS SPM static-linking gotcha
 
-SPM static linking **strips plugin classes that have no external framework dependencies**. The class compiles and links, then is simply absent at runtime, so Capacitor reports `"GameDebug" plugin is not implemented on ios`. `capacitor-game-debug` and `capacitor-modoki-ota` both hit this — each must be registered manually in `MyViewController` (`bridge?.registerPluginInstance(...)`, which keeps the class alive), plus an Xcode file reference from the App target to the plugin source (project-relative path in the pbxproj, no copy). Edit the package source only.
+SPM static linking **stripped `GameDebugPlugin` and `ModokiOtaPlugin`**: the class compiled and linked, then was simply absent at runtime, so Capacitor reported `"GameDebug" plugin is not implemented on ios`. The explanation once given — plugin classes with no external framework dependency get stripped — is contradicted on hardware (below), so treat the cause as unknown. `capacitor-game-debug` and `capacitor-modoki-ota` both hit this — each must be registered manually in `MyViewController` (`bridge?.registerPluginInstance(...)`, which keeps the class alive), plus an Xcode file reference from the App target to the plugin source (project-relative path in the pbxproj, no copy). Edit the package source only.
 
 ⚠️ **Only the game-debug half is generated.** `engine/plugins/healNativeConfig.ts` writes the pbxproj reference and the fenced registration block for `GameDebugPlugin` in every project; it contains **no OTA wiring at all**. `capacitor-modoki-ota`'s pbxproj refs and its `ModokiOtaPlugin` registration are **hand-maintained, in `games/ota-test` only** — the heal is deliberately fenced rather than whole-file precisely because that project hand-extends `MyViewController.swift` with an OTA boot hook (see the comment on `healNativeConfig.ts`'s `healIosGameDebugRegistration`). So regenerating that project's iOS — `cap add ios`, or deleting `ios/` after a native-config problem — restores the GameDebug wiring and **silently drops OTA**. Re-add it by hand and verify the plugin registers.
 
@@ -42,6 +42,15 @@ SPM static linking **strips plugin classes that have no external framework depen
 **The reading that misleads:** `npx cap sync ios` reports one fewer plugin than `cap sync android` (5 vs 6 on a typical project), because the count cannot see the pbxproj road. That gap is expected, not a defect — it was filed as one in #368, where the proposed one-line fix would have broken every iOS build it meant to repair. Guarded by `engine/tests/architecture/capacitorPlatformDeclarations.test.ts`.
 
 `capacitor-modoki-iap` is the contrasting case: it goes through SPM normally and correctly declares both platforms, and it is verified working (real store sandboxes on hardware, 2026-08-12). Note its own `Package.swift` header is deliberately agnostic about *why* — do not read it as a rule that "a system framework import is enough to keep the class"; that causal claim is untested.
+
+⚠️ **`capacitor-modoki-system` is a counter-example to the headline rule, observed on hardware** (#1204,
+iPad mini 5, iOS 26.6.2, 2026-09-14). `ModokiSystemPlugin` imports only Capacitor and UIKit, goes through
+plain SPM with both platforms declared and no manual registration, and `isPluginAvailable('ModokiSystem')`
+answered `true` with its native call working. Capacitor's own SPM plugins (haptics, local-notifications,
+app, preferences…) have the same shape and work too. So "no external framework dependency ⇒ stripped" is
+NOT the discriminator; why `GameDebugPlugin` and `ModokiOtaPlugin` were stripped remains unexplained. Do not
+move a new plugin to manual registration on the strength of that sentence — build it and check
+`isPluginAvailable` on a device first.
 
 A third case, `capacitor-litert-lm` — a podspec whose MediaPipe dependencies `Package.swift` could not
 declare, so it claimed `android` only — was deleted with its two games in #1191. The

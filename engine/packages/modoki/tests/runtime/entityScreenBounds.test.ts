@@ -236,7 +236,7 @@ describe('boundsSourcesOf — the owner each RenderState map carries (#1197)', (
       billboards: new Map([[id, { group: dup(), owner: dead.valueOf() }]]),
       textMeshes: new Map([[id, { group: dup(), owner: dead.valueOf() }]]),
     };
-    const gizmos = { objects: new Map<number, THREE.Object3D>([[id, dup()]]), owners: new Map([[id, dead.valueOf()]]) };
+    const gizmos: [number, THREE.Object3D, number][] = [[id, dup(), dead.valueOf()]];
     dead.destroy();
     const fresh = world.spawn();
     return { state, gizmos, fresh, id };
@@ -264,7 +264,7 @@ describe('boundsSourcesOf — the owner each RenderState map carries (#1197)', (
       if (map === 'skinned') state.skinned.set(fresh, { root: state.skinned.peekId(id)!.root });
       if (map === 'billboards') state.billboards.get(id)!.owner = packed;
       if (map === 'textMeshes') state.textMeshes.get(id)!.owner = packed;
-      if (map === 'gizmos') gizmos.owners.set(id, packed);
+      if (map === 'gizmos') gizmos[0][2] = packed;
       expect(measure(state, gizmos, id).map((b) => b.id)).toEqual([id]);
     });
   }
