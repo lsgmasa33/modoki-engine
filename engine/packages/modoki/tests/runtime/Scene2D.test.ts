@@ -3451,6 +3451,22 @@ describe('Text2D shader reclaim (#690/#696)', () => {
     );
   }
 
+  // #1197 — the text pass's `activeIds` stamp is what `bounds2DProvider` checks between passes.
+  it('stamps the text entity as its slot\'s owner, and the provider drops it once that entity dies (#1197)', async () => {
+    const { traits, world, scene2d, fontLoader, renderer } = await setupText();
+    fontLoader.__setProvider(makeFontProvider());
+    const canvas = spawnCanvas(world, traits);
+    const text = spawnText(world, traits, canvas.id());
+    scene2d.renderFrame();
+    expect(renderer.slots.get(text.id())?.kind).toBe('text'); // premise: the text path built the slot
+    expect(renderer.activeIds.get(text.id())).toBe(text.valueOf());
+    expect(renderer.bounds2DProvider(new Set([text.id()])).map((b: { id: number }) => b.id)).toEqual([text.id()]);
+    const id = text.id();
+    text.destroy();
+    expect(world.spawn().id()).toBe(id); // premise: the index was reclaimed
+    expect(renderer.bounds2DProvider(new Set([id]))).toEqual([]);
+  });
+
   it('reuses the SAME shader across a layout rebuild, on a NEW Mesh', async () => {
     const { traits, world, scene2d, fontLoader, renderer } = await setupText();
     fontLoader.__setProvider(makeFontProvider());
@@ -3640,4 +3656,35 @@ describe('Text2D shader reclaim (#690/#696)', () => {
       expect(geo2).not.toBe(geo1); // full rebuild, NOT the fast path's in-place write
     });
   });
+});
+
+/** #1197 — `bounds2DProvider` refuses a slot whose `activeIds` owner is dead. The unit cases in
+ *  `scene2DBoundsSurface.test.ts` seed `activeIds` by hand; these drive the REAL pass, so a stamp site
+ *  that writes the wrong value (or none) drops every rect of that kind and goes red here. Text is
+ *  covered in the text describe above; the skinned-mesh site has no fixture in this harness. */
+describe('Scene2D.renderFrame — activeIds owner stamps feed the bounds provider (#1197)', () => {
+  const kinds = [
+    { name: 'sprite pass (a primitive)', rend: { sprite: 'square' }, kind: 'graphics', ready: false },
+    { name: 'material pass', rend: { sprite: 'square', material: 'matGuid' }, kind: 'material', ready: true },
+  ];
+  for (const k of kinds) {
+    it(`${k.name}: the slot's owner is the entity, and a dead owner's slot is not reported`, async () => {
+      const { traits, scene2d, world, matReady } = await setup();
+      if (k.ready) matReady.add('matGuid');
+      const renderer = (scene2d as unknown as { defaultRenderer: any }).defaultRenderer;
+      const canvas = spawnCanvas(world, traits);
+      const child = spawnChild(world, traits, canvas.id(), k.rend);
+      scene2d.renderFrame();
+
+      const id = child.id();
+      expect(renderer.slots.get(id)?.kind).toBe(k.kind); // premise: this pass built the slot
+      expect(renderer.activeIds.get(id)).toBe(child.valueOf());
+      expect(renderer.bounds2DProvider(new Set([id])).map((b: { id: number }) => b.id)).toEqual([id]);
+
+      child.destroy();
+      expect(world.spawn().id()).toBe(id); // premise: the index was reclaimed, no pass in between
+      expect(renderer.slots.has(id)).toBe(true); // the dead slot is still there — the window
+      expect(renderer.bounds2DProvider(new Set([id]))).toEqual([]);
+    });
+  }
 });

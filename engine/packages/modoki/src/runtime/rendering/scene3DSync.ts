@@ -1305,6 +1305,10 @@ export interface SkinnedEntry {
  *  reads; this entry just holds the THREE objects that present them in 3D. Lives in
  *  RenderState (not the trait) so the traits stay pure data. */
 export interface BillboardEntry {
+  /** The packed entity (`entity.valueOf()`) that last reconciled this entry — re-stamped on every
+   *  visit, so a same-rig respawn on a dead entity's index hands the entry over. Read by the
+   *  screen-bounds provider to refuse a dead owner's group before the next sweep (#1197). */
+  owner: number;
   /** Rig GUID this entry was built from — a rig swap rebuilds it. */
   rigRef: string;
   /** Topology signature (part count + each part's texture/frame/vertex count). A
@@ -3293,6 +3297,7 @@ async function loadBillboardPage(url: string): Promise<THREE.Texture> {
 
 /** Create the THREE objects for one billboarded rig and kick off texture loads. */
 function buildBillboardEntry(
+  owner: number,
   ss: { rig: string; color: number; opacity: number },
   opt: { mode: 'cylindrical' | 'spherical' | 'flat'; alphaTest: number },
   buf: NonNullable<ReturnType<typeof getSkin2DBuffer>>,
@@ -3302,7 +3307,7 @@ function buildBillboardEntry(
   const flip = new THREE.Group();
   group.add(flip);
   const entry: BillboardEntry = {
-    rigRef: ss.rig, sig: billboardSig(buf.parts), mode: opt.mode, group, flip,
+    owner, rigRef: ss.rig, sig: billboardSig(buf.parts), mode: opt.mode, group, flip,
     meshes: [], orders: [], textures: [], deformVersion: -1, disposed: false,
   };
   // Load each distinct page URL once and share across the parts that use it.
@@ -3354,12 +3359,13 @@ interface SpriteMode3D {
 /** Build/update one SkinnedSprite2D's 3D entry (billboard OR flat) from `skin2DBuffers`.
  *  Camera-INDEPENDENT — `orientBillboards` does the per-frame facing / render-order. */
 function syncSkinnedSprite3D(
-  scene: THREE.Scene, state: RenderState, id: number,
+  scene: THREE.Scene, state: RenderState, entity: Entity,
   tf: { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number },
   ss: { rig: string; color: number; opacity: number; flipX: boolean; flipY: boolean; isVisible: boolean },
   opt: SpriteMode3D, callbacks?: SyncCallbacks,
 ): void {
   const { billboards } = state;
+  const id = entity.id();
   const buf = getSkin2DBuffer(id);
   if (!buf || !buf.parts.length) return; // rig not deformed yet — skin2DSystem retries next frame
   _billboardActive.add(id);
@@ -3369,7 +3375,8 @@ function syncSkinnedSprite3D(
   if (entry && (entry.rigRef !== ss.rig || entry.sig !== sig)) {
     disposeBillboardEntry(entry, scene); billboards.delete(id); entry = undefined;
   }
-  if (!entry) { entry = buildBillboardEntry(ss, opt, buf, scene); billboards.set(id, entry); }
+  if (!entry) { entry = buildBillboardEntry(entity.valueOf(), ss, opt, buf, scene); billboards.set(id, entry); }
+  entry.owner = entity.valueOf();
   entry.mode = opt.mode;
 
   // Cheap per-frame sync of the things that change without a topology rebuild:
@@ -3432,11 +3439,11 @@ export function syncBillboardSprites(world: World, scene: THREE.Scene, state: Re
   const { billboards } = state;
   _billboardActive.clear();
   world.query(Transform, SkinnedSprite2D, Billboard3D).updateEach(([tf, ss, bb], entity) => {
-    syncSkinnedSprite3D(scene, state, entity.id(), tf, ss,
+    syncSkinnedSprite3D(scene, state, entity, tf, ss,
       { mode: bb.mode, alphaTest: bb.alphaTest, pixelsPerUnit: bb.pixelsPerUnit, anchor: bb.anchor }, callbacks);
   });
   world.query(Transform, SkinnedSprite2D, FlatSprite3D).updateEach(([tf, ss, fs], entity) => {
-    syncSkinnedSprite3D(scene, state, entity.id(), tf, ss,
+    syncSkinnedSprite3D(scene, state, entity, tf, ss,
       { mode: 'flat', alphaTest: fs.alphaTest, pixelsPerUnit: fs.pixelsPerUnit, anchor: 'center' }, callbacks);
   });
 
@@ -3521,6 +3528,11 @@ export function orientBillboards(state: RenderState, camera: THREE.Camera) {
  */
 // ── Text3D (SDF text meshes) ──────────────────────────────
 interface TextMeshEntry {
+  /** The packed entity (`entity.valueOf()`) that last reconciled this entry — re-stamped on every
+   *  visit (a same-text respawn on a dead entity's index keeps the entry, so a build-time stamp would
+   *  go stale). Read by the screen-bounds provider (#1197). Not `animOwner`: that one is stamped
+   *  only while a text animation runs. */
+  owner: number;
   /** Container carrying the entity transform + billboard rotation; holds one child
    *  mesh per atlas PAGE the text touches (dynamic CJK spills across pages, each mesh
    *  bound to that page's texture). Baked / single-page text has exactly one child. */
@@ -3667,6 +3679,7 @@ export function syncText3D(world: World, scene: THREE.Scene, state: RenderState,
     if (t.font && sceneId !== undefined) ensureFontLoaded(sceneId, t.font);
     const provider = t.font ? getLoadedFont(t.font) : undefined;
     let entry = textMeshes.get(id);
+    if (entry) entry.owner = entity.valueOf();
 
     if (!provider) { if (entry) entry.group.visible = false; return; }
     // Page 0 texture readiness gates the whole entity (a baked atlas still loading, or
@@ -3687,7 +3700,7 @@ export function syncText3D(world: World, scene: THREE.Scene, state: RenderState,
         lineSpacing: t.lineSpacing, letterSpacing: t.letterSpacing,
       });
       if (!entry) {
-        entry = { group: new THREE.Group(), pages: new Map(), hash, fontId: t.font, billboard: !!t.billboard };
+        entry = { owner: entity.valueOf(), group: new THREE.Group(), pages: new Map(), hash, fontId: t.font, billboard: !!t.billboard };
         scene.add(entry.group);
         textMeshes.set(id, entry);
       }

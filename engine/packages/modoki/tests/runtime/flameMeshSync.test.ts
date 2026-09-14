@@ -209,3 +209,24 @@ describe('the PRODUCTION world-swap wiring (#838) — not the test-only reset ho
     expect(geo2).not.toBe(geo1);
   });
 });
+
+/** #1197 — the SceneView picker refuses a flame rec whose `owner` is dead. A same-index respawn keeps
+ *  the rec (the reap is keyed by id), so a build-time stamp would name the dead entity forever and the
+ *  newcomer's flame would never be pickable. The stamp must follow every visit. */
+describe('syncFlameMeshes — owner stamp (#1197)', () => {
+  it('stamps the building entity, and re-stamps a newcomer that inherits the rec on its index', () => {
+    const first = world.spawn(Transform(), FlameMesh({}));
+    syncFlameMeshes(world, scene, state);
+    const id = first.id();
+    const rec = state.recs.get(id)!;
+    expect(rec.owner).toBe(first.valueOf());
+
+    first.destroy();
+    const second = world.spawn(Transform(), FlameMesh({}));
+    expect(second.id()).toBe(id); // premise: the index was reclaimed
+    syncFlameMeshes(world, scene, state);
+
+    expect(state.recs.get(id)).toBe(rec); // kept — the case the stamp must follow
+    expect(rec.owner).toBe(second.valueOf());
+  });
+});

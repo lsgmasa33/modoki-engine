@@ -79,6 +79,10 @@ value, and drops the pin on a world swap where nothing else re-checks it. A Reac
 entity keys by `uiNodeKey` (`id:generation`, `runtime/ui/uiNodeKey.ts`), or a respawn keeps the dead
 entity's DOM and hook state.
 
+**An out-of-band reader that walks a renderer cache BY ID** — the screen-bounds providers and the SceneView
+picker, which run between the pass that fills the cache and the pass that sweeps it — checks a packed owner
+stamped on each entry at every visit, and refuses a dead one: [enact.md](enact.md), the scene-entity row of the aim table (#1197).
+
 **A generation-free `Map<number, …>` / `Set<number>` in `runtime/**` needs a ledger row saying why** —
 `engine/tests/architecture/entityKeyedMaps.test.ts` flags every one at module scope, as a class field
 or as an interface field, with a tagged reason (`not-entity:`, `scratch:`, `revalidated:`, …).

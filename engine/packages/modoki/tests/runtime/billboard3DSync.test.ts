@@ -265,3 +265,31 @@ describe('syncBillboardSprites — per-part visibility + bind-pose anchor', () =
     expect(state.billboards.get(e.id())!.flip.position.y).toBeCloseTo(anchorY, 9);
   });
 });
+
+/** #1197 — the screen-bounds provider refuses a billboard whose `owner` is dead. The entry SURVIVES
+ *  a same-rig respawn on the dead entity's index (the rebuild gate compares rig + topology only), so a
+ *  stamp written only when the entry is BUILT would name the dead entity forever and the newcomer
+ *  would never be measurable. The stamp must follow every visit. */
+describe('syncBillboardSprites — owner stamp (#1197)', () => {
+  it('stamps the building entity, and re-stamps the newcomer that inherits the entry on its index', async () => {
+    const { world, traits, sync, bufs, T } = await setup();
+    const scene = new T.Scene();
+    const state = sync.createRenderState();
+
+    const first = spawnBillboard(world, traits);
+    bufs.putSkin2DBuffer(first.id(), { parts: [quadPart()] });
+    sync.syncBillboardSprites(world, scene, state);
+    const entry = state.billboards.get(first.id())!;
+    expect(entry.owner).toBe(first.valueOf());
+
+    const id = first.id();
+    first.destroy();
+    const second = spawnBillboard(world, traits);
+    expect(second.id()).toBe(id); // premise: the index was reclaimed
+    expect(second.valueOf()).not.toBe(entry.owner);
+    sync.syncBillboardSprites(world, scene, state);
+
+    expect(state.billboards.get(id)).toBe(entry); // kept, not rebuilt — the case the stamp must follow
+    expect(entry.owner).toBe(second.valueOf());
+  });
+});

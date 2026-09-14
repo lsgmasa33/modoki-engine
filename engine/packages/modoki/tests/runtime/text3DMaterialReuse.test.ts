@@ -358,3 +358,24 @@ describe('syncText3D layout-only fast path wiring (#766) and rebuild ordering (#
     expect(observed!.replacementInstalled).toBe(true); // the NEW mesh was already installed before dispose ran
   });
 });
+
+/** #1197 — the screen-bounds provider refuses a text mesh whose `owner` is dead. A same-text respawn
+ *  on the dead entity's index keeps the entry (the rebuild is gated on the layout hash alone), so the
+ *  stamp must follow every visit — a build-time stamp would leave the newcomer unmeasurable forever. */
+describe('syncText3D owner stamp (#1197)', () => {
+  it('stamps the building entity, and re-stamps a same-text newcomer that inherits the entry', async () => {
+    const ctx = await setup({ pagesPerRebuild: [[0]] });
+    ctx.runFrame();
+    const id = ctx.e.id();
+    const entry = ctx.state.textMeshes.get(id)!;
+    expect(entry.owner).toBe(ctx.e.valueOf());
+
+    ctx.e.destroy();
+    const fresh = ctx.world.spawn(ctx.traits.Transform({}), ctx.traits.Text3D({ font: 'font-guid-1', text: 'A' }));
+    expect(fresh.id()).toBe(id); // premise: the index was reclaimed
+    ctx.runFrame();
+
+    expect(ctx.state.textMeshes.get(id)).toBe(entry); // kept — the case the stamp must follow
+    expect(entry.owner).toBe(fresh.valueOf());
+  });
+});

@@ -17,7 +17,7 @@ import { registerFrameCallback, unregisterFrameCallback, PRIORITY_RENDER_3D } fr
 import { registerSceneRenderer, unregisterSceneRenderer, normalizeJpegQuality, type SceneRenderer } from './offscreenCapture';
 import { registerBoundsProvider } from '../core/screenBounds';
 import { createTeardownScope, type TeardownScope } from '../core/teardownScope';
-import { computeEntityScreenBounds } from './entityScreenBounds';
+import { computeEntityScreenBounds, boundsSourcesOf } from './entityScreenBounds';
 import { readbackToRGBA, type ReadbackBackend } from './readbackToRGBA';
 import { createViewportBringUp, boundedCaptureReadback } from './viewportBringUp';
 import { createRenderer, createRenderState, disposeRenderState, syncCamera, applyOrthoFrustum, computeActiveFrameFit, computeFrameFitById, activeFrameId, type ActiveFrameFit, syncEnvironment, syncFog, syncLights, syncSceneRenderables3D, orientBillboards, reconcileToneExposure, prewarmShadersForWorld, compileLiveScene, clearOwnedMaterials, attachInvalidationListener } from './scene3DSync';
@@ -921,12 +921,7 @@ export default function Scene3D() {
         // actually rendered — an ortho scene through the perspective frustum gives wrong CSS
         // rects and onScreen flags. No gizmos here: icon affordances are editor-only.
         return computeEntityScreenBounds(
-          {
-            ecsObjects: renderState.ecsObjects,
-            skinned: renderState.skinned,
-            billboards: renderState.billboards,
-            textMeshes: renderState.textMeshes,
-          },
+          boundsSourcesOf(renderState),
           activeCamera,
           { left: r.left, top: r.top, width: r.width, height: r.height },
           'game-3d',

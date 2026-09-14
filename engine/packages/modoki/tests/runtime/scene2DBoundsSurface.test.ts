@@ -17,6 +17,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { createWorld } from 'koota';
 import { Scene2DRenderer } from '../../src/runtime/rendering/Scene2D';
 import { Canvas2DPool } from '../../src/runtime/rendering/canvas2DPool';
 
@@ -47,5 +48,52 @@ describe('Scene2DRenderer.boundsSurface (#80)', () => {
     const primary = new Scene2DRenderer({ pool: new Canvas2DPool(), primary: true });
     const editor = new Scene2DRenderer({ pool: new Canvas2DPool(), primary: false });
     expect(surfaceOf(primary)).not.toBe(surfaceOf(editor));
+  });
+});
+
+/** #1197 — `bounds2DProvider` walks `slots` by entity id, and a slot is disposed only by the NEXT
+ *  pass's sweep. koota hands a destroyed entity's index to the next spawn, so between the two an
+ *  id-only provider reported the dead entity's rect under the newcomer's id. `activeIds` records which
+ *  packed entity claimed each id in the last pass; the provider refuses a slot whose claimant is dead.
+ *
+ *  Private state is seeded directly (no PixiJS renderer, no pool canvas), so each live slot reports
+ *  `screen: null` — the assertion is on WHETHER the id is reported at all, which is the whole defect. */
+describe('Scene2DRenderer.bounds2DProvider — refuses a dead owner\'s slot (#1197)', () => {
+  type Internals = { slots: Map<number, unknown>; activeIds: Map<number, number>; bounds2DProvider(ids?: Set<number>): Array<{ id: number }> };
+  const seed = () => {
+    const r = new Scene2DRenderer({ pool: new Canvas2DPool(), primary: true }) as unknown as Internals;
+    const world = createWorld();
+    const dead = world.spawn();
+    const id = dead.id();
+    r.slots.set(id, { kind: 'graphics', obj: {} });
+    r.activeIds.set(id, dead.valueOf());
+    return { r, world, dead, id };
+  };
+
+  it('reports the slot while its owner lives (the accept side)', () => {
+    const { r, id } = seed();
+    expect(r.bounds2DProvider().map((b) => b.id)).toEqual([id]);
+  });
+
+  it('reports NOTHING for the id once the owner is destroyed and a newcomer reclaims the index', () => {
+    const { r, world, dead, id } = seed();
+    dead.destroy();
+    const fresh = world.spawn();
+    expect(fresh.id()).toBe(id); // premise: the index was reclaimed
+    expect(r.bounds2DProvider(new Set([id]))).toEqual([]);
+  });
+
+  it('reports nothing for a slot this pass never claimed (no owner stamp)', () => {
+    const { r, id } = seed();
+    r.activeIds.delete(id);
+    expect(r.bounds2DProvider()).toEqual([]);
+  });
+
+  it('measures the newcomer once the next pass re-claims the id for it', () => {
+    const { r, world, dead, id } = seed();
+    dead.destroy();
+    const fresh = world.spawn();
+    r.activeIds.set(id, fresh.valueOf());
+    expect(r.bounds2DProvider().map((b) => b.id)).toEqual([id]);
   });
 });

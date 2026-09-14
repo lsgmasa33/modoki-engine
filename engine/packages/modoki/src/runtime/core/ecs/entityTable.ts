@@ -248,6 +248,13 @@ export class EntityTable<T> implements Iterable<[number, T]> {
     for (const [id, e] of this.entries) yield [id, e.value];
   }
 
+  /** Every entry with the packed entity it was stored for — dead ones included, like the plain
+   *  iterator. For an id-addressed reader that must refuse a dead owner's entry before the next
+   *  `endPass` sweeps it (`isPackedAlive(packed)`), e.g. a screen-bounds provider (#1197). */
+  *owned(): IterableIterator<[number, T, PackedEntity]> {
+    for (const [id, e] of this.entries) yield [id, e.value, e.packed as PackedEntity];
+  }
+
   /** Stamp `value` for a live `entity`; returns the previous value of THIS entity, or `undefined`.
    *  A dead entity's entry at the index is evicted (disposed). */
   private write(entity: Entity, value: T): T | undefined {

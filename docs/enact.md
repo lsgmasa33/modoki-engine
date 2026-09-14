@@ -31,6 +31,25 @@ data `layout-bounds` reports) rather than a second projection that could drift f
 Implementation: `engine/app/debug/entityResolve.ts` + the `resolve-entity-point` op, wired into the
 one `resolvePoint` seam in `engine/electron/inputRoutes.ts` so all five aimed routes get it at once.
 
+**Every bounds entry carries the entity it was drawn for, and a dead one is not measured** (#1197).
+Each provider walks a renderer cache keyed by entity id (3D `ecsObjects`/`skinned`/`billboards`/
+`textMeshes`/SceneView icon gizmos, 2D `Scene2DRenderer.slots`), and those are swept only on the
+renderer's NEXT pass — while koota hands a destroyed entity's index to the next spawn. Between the two,
+an id-only read returned the DEAD entity's rect under the newcomer's id, so an entity aim tapped where
+the dead entity had been. Measured on `games/3d-test` (2026-09-14): a `modoki_eval` that deleted a mesh,
+created an entity reclaiming its index and read `collectScreenBounds` in one task got the destroyed
+mesh's rect on BOTH `scene-view` and `game-3d`. The reachable windows are one JS task (an eval body;
+`uiFocusSystem`, which reads bounds inside the ECS tick before that frame's render sync) — a
+`modoki_batch` was measured to let a frame run between steps. So every source stamps the packed entity
+(`entity.valueOf()`) on each visit — `RenderState.ecsOwners`, the `skinned` `EntityTable`, an `owner`
+field on billboard/text/flame entries, SceneView's `gizmoOwners`, Scene2D's `activeIds` — and
+`isLiveOwner` (`runtime/rendering/entityScreenBounds.ts`) drops a missing or dead stamp. Inside the
+window the newcomer has no rect (the aim refuses) until the next pass measures it. The SceneView 3D
+picker (`pickAt`, the occlusion probe below) gathers from the same maps and applies the same check.
+⚠️ **A new bounds source must stamp on EVERY visit, not at build**: a same-kind respawn keeps the entry,
+so a build-time stamp names the dead entity forever and the newcomer is never measurable again —
+permanently worse than the one-frame bug. `boundsSourcesOf` is typed so a source cannot omit its owner.
+
 **A COVERED aim is refused, whichever resolvable form it took** (2026-08-19). `entity` and
 `selector` are one category — both resolved server-side inside the call — so both now answer
 `OCCLUDED` (400) naming the cover, with `allowOccluded:true` as the escape hatch. The selector path

@@ -80,6 +80,7 @@ import { addDirtyListener, onStructureDirty, readTraitData } from '../core/ecs/e
 import { getRunMode, isSimRunning, onPlayStateChange } from '../core/playState';
 import { Canvas2DPool, defaultPool, type Canvas2DSlot } from './canvas2DPool';
 import { registerBoundsProvider, type BoundsSurface, type EntityScreenBounds } from '../core/screenBounds';
+import { isPackedAlive } from '../core/ecs/entityTable';
 import { ensurePixiKtxTranscoder } from '../loaders/pixiKtxTranscoder';
 
 // ── Display object tracking ──
@@ -884,7 +885,12 @@ export class Scene2DRenderer {
   // aren't resident yet — dedupes the load so the every-running-frame material pass
   // doesn't re-issue it. Cleared per-url on settle (then markDirty wakes the rebuild).
   private readonly _materialTexLoading = new Set<string>();
-  private readonly activeIds = new Set<number>();
+  // Entity id → the packed entity (`entity.valueOf()`) that claimed it THIS pass. Cleared at the top
+  // of the pass and consumed by the slot-disposal sweep at its end — and, between passes, by
+  // `bounds2DProvider`, which refuses a slot whose owner is no longer alive: koota hands a destroyed
+  // entity's index to the next spawn, so until the next pass sweeps the slot, an id-only read reports
+  // the dead entity's rect for the newcomer's id (#1197).
+  private readonly activeIds = new Map<number, number>();
   private readonly prevCanvasIds = new Set<number>();
   // Pooled per-frame canvas-id set; cleared on entry, mutated through the loop,
   // transferred into prevCanvasIds at the end. Avoids the per-frame `new Set`.
@@ -1726,7 +1732,7 @@ export class Scene2DRenderer {
         const canvasSlot = this.pool.getSlot(canvasId);
         if (!canvasSlot) return;
 
-        this.activeIds.add(id);
+        this.activeIds.set(id, entity.valueOf());
 
         // A video ref is a Sprite on screen but NOT an image asset — it skips the whole
         // still-image path (resolve/load/retain/atlas) and gets its texture from
@@ -1945,7 +1951,7 @@ export class Scene2DRenderer {
         const canvasSlot = this.pool.getSlot(canvasId);
         if (!canvasSlot) return;
 
-        this.activeIds.add(id);
+        this.activeIds.set(id, entity.valueOf());
         materialIds.add(id);
 
         const px = rend.pivotX, py = rend.pivotY;
@@ -2268,7 +2274,7 @@ export class Scene2DRenderer {
         }
         if (!allLoaded) return;
 
-        this.activeIds.add(id);
+        this.activeIds.set(id, entity.valueOf());
 
         // Rebuild signature: part count + each part's url / atlas-frame / topology.
         const sig = buf.parts.map((p) => {
@@ -2392,7 +2398,7 @@ export class Scene2DRenderer {
         const gate = getFontTexturePixi(provider, 0, () => this.markDirty());
         if (!gate || gate.destroyed) return;
 
-        this.activeIds.add(id);
+        this.activeIds.set(id, entity.valueOf());
 
         const layoutHash = [t.font, t.text, t.fontSize, t.align, t.maxWidth, t.lineSpacing,
           t.letterSpacing, provider.atlasVersion, getTextDirtyVersion(t.font)].join('|');
@@ -2816,6 +2822,11 @@ export class Scene2DRenderer {
     const out: EntityScreenBounds[] = [];
     for (const [id, slot] of this.slots) {
       if (ids && !ids.has(id)) continue;
+      // A dead owner's slot awaiting the next sweep is not measured at all — its id may already
+      // name a newcomer, and the rect is where the DEAD entity was drawn (#1197). No stamp means
+      // this pass never claimed the slot, which the sweep is about to dispose.
+      const owner = this.activeIds.get(id);
+      if (owner === undefined || !isPackedAlive(owner)) continue;
       const canvasId = this.canvasOfEntity.get(id);
       const cSlot = canvasId != null ? this.pool.getSlot(canvasId) : null;
       if (!cSlot || !cSlot.canvas.isConnected) { out.push({ id, layer: '2d', surface, screen: null, onScreen: false, canvasId }); continue; }

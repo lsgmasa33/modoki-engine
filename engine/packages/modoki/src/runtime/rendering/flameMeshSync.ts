@@ -40,6 +40,10 @@ interface FlameUniforms {
 }
 
 interface FlameRec {
+  /** The packed entity (`entity.valueOf()`) that last reconciled this rec — re-stamped on every visit,
+   *  since a same-index respawn keeps the rec. The SceneView picker refuses a dead owner's group
+   *  before the next sweep reaches it (#1197). */
+  owner: number;
   /** Carries the entity's world transform (gizmo + pick target). */
   group: THREE.Group;
   outerMesh: THREE.Mesh;
@@ -171,6 +175,7 @@ export function syncFlameMeshes(world: World, scene: THREE.Object3D, state: Flam
     const id = entity.id();
     seen.add(id);
     let rec = state.recs.get(id);
+    if (rec) rec.owner = entity.valueOf();
     if (!rec) {
       const { u, outerMat, innerMat } = buildFlame(fm.additive);
       const geo = flameGeometry(fm.radialSegments);
@@ -186,7 +191,7 @@ export function syncFlameMeshes(world: World, scene: THREE.Object3D, state: Flam
       }
       group.layers.set(PARTICLE_LAYER); // only the after-NPR particle pass renders it
       scene.add(group);
-      rec = { group, outerMesh, innerMesh, outerMat, innerMat, u, additive: fm.additive, segments: fm.radialSegments };
+      rec = { owner: entity.valueOf(), group, outerMesh, innerMesh, outerMat, innerMat, u, additive: fm.additive, segments: fm.radialSegments };
       state.recs.set(id, rec);
     } else {
       if (rec.additive !== fm.additive) {

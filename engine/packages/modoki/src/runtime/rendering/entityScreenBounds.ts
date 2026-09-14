@@ -30,18 +30,63 @@
 
 import * as THREE from 'three';
 import { projectAABBToScreen, type BoundsSurface, type EntityScreenBounds, type ViewportRect } from '../core/screenBounds';
+import { isPackedAlive } from '../core/ecs/entityTable';
+import type { RenderState } from './scene3DSync';
+
+/** One measurable entry: its entity id, the object to measure, and the packed entity
+ *  (`entity.valueOf()`) the renderer last reconciled it for — `undefined` when nothing stamped one. */
+export type OwnedBoundsEntry = readonly [id: number, object: THREE.Object3D, owner: number | undefined];
 
 /** The live object maps a provider measures, in the order it measures them. Iterables rather
- *  than Maps so a test can pass plain arrays of entries. */
+ *  than Maps so a test can pass plain arrays of entries.
+ *
+ *  EVERY entry carries its OWNER (#1197). The maps are keyed by entity id and swept only on the
+ *  renderer's next pass, and koota hands a destroyed entity's index to the next spawn — so between
+ *  a destroy + same-index spawn and that pass, an id-only provider reported the DEAD entity's rect
+ *  for the newcomer's id, and an entity aim tapped where the dead entity had been. Measured live on
+ *  `games/3d-test` (2026-09-14): both `scene-view` and `game-3d` returned the destroyed mesh's rect
+ *  for the respawned id inside one task; `uiFocusSystem` reads bounds inside the ECS tick, before
+ *  that frame's render sync, which is the same window with no agent involved. A source without an
+ *  owner would be silently wrong in exactly that window, so the type does not allow one. */
 export interface EntityBoundsSources {
-  ecsObjects: Iterable<readonly [number, THREE.Object3D]>;
-  /** Skinned meshes (SkinnedMeshRenderer): the cloned hierarchy hangs off `root`. */
-  skinned: Iterable<readonly [number, { root: THREE.Object3D }]>;
-  billboards: Iterable<readonly [number, { group: THREE.Object3D }]>;
-  textMeshes: Iterable<readonly [number, { group: THREE.Object3D }]>;
+  ecsObjects: Iterable<OwnedBoundsEntry>;
+  /** Skinned meshes (SkinnedMeshRenderer): the cloned hierarchy's `root`. */
+  skinned: Iterable<OwnedBoundsEntry>;
+  billboards: Iterable<OwnedBoundsEntry>;
+  textMeshes: Iterable<OwnedBoundsEntry>;
   /** Icon gizmos (Camera / Light / Environment / empty) — measured, but not geometric.
    *  Editor-only; the runtime surface passes none. */
-  gizmos?: Iterable<readonly [number, THREE.Object3D]>;
+  gizmos?: Iterable<OwnedBoundsEntry>;
+}
+
+/** Whether an entry's owner stamp names an entity that is still alive. `undefined` — nothing stamped
+ *  the entry — is not alive: unknown must not read as live. Shared by the bounds provider and the
+ *  SceneView picker, which gather from the same id-keyed maps and have the same window (#1197). */
+export function isLiveOwner(owner: number | undefined): boolean {
+  return owner !== undefined && isPackedAlive(owner);
+}
+
+/** The sources for one 3D surface, read from its `RenderState` — shared by Scene3D and SceneView so
+ *  the two cannot feed different entity kinds, or one of them forget an owner. */
+export function boundsSourcesOf(
+  state: Pick<RenderState, 'ecsObjects' | 'ecsOwners' | 'skinned' | 'billboards' | 'textMeshes'>,
+  gizmos?: { objects: ReadonlyMap<number, THREE.Object3D>; owners: ReadonlyMap<number, number> },
+): EntityBoundsSources {
+  return {
+    ecsObjects: withOwners(state.ecsObjects, state.ecsOwners),
+    skinned: (function* () { for (const [id, entry, owner] of state.skinned.owned()) yield [id, entry.root, owner] as const; })(),
+    billboards: groupsOf(state.billboards),
+    textMeshes: groupsOf(state.textMeshes),
+    ...(gizmos ? { gizmos: withOwners(gizmos.objects, gizmos.owners) } : {}),
+  };
+}
+
+function* withOwners(objects: ReadonlyMap<number, THREE.Object3D>, owners: ReadonlyMap<number, number>): Generator<OwnedBoundsEntry> {
+  for (const [id, obj] of objects) yield [id, obj, owners.get(id)];
+}
+
+function* groupsOf(entries: ReadonlyMap<number, { group: THREE.Object3D; owner: number }>): Generator<OwnedBoundsEntry> {
+  for (const [id, entry] of entries) yield [id, entry.group, entry.owner];
 }
 
 const _box = new THREE.Box3();
@@ -70,7 +115,9 @@ export function expandPickableBounds(box: THREE.Box3, obj: THREE.Object3D, reset
  *  is measured ONCE, by the first map that carries it — the maps are not disjoint in principle
  *  and a duplicate rect for one id on one surface is exactly the ambiguity `surface` exists to
  *  remove. A billboard / text mesh that is not `visible` is not measurable: it cannot be
- *  clicked either, which is the invariant. */
+ *  clicked either, which is the invariant. An entry whose owner is missing or no longer alive is not measured at all: it is a dead
+ *  entity's object awaiting the next sweep, and its id may already name someone else (#1197). It
+ *  does not claim the id either, so a live entry for the same id in a later map still counts. */
 export function computeEntityScreenBounds(
   sources: EntityBoundsSources,
   camera: THREE.Camera,
@@ -81,9 +128,10 @@ export function computeEntityScreenBounds(
   const out: EntityScreenBounds[] = [];
   const seen = new Set<number>();
 
-  const project = (id: number, obj: THREE.Object3D, geometric: boolean): void => {
+  const project = ([id, obj, owner]: OwnedBoundsEntry, geometric: boolean): void => {
     if (ids && !ids.has(id)) return;
     if (seen.has(id)) return;
+    if (!isLiveOwner(owner)) return;
     seen.add(id);
     obj.updateWorldMatrix(true, true);
     if (geometric) _box.setFromObject(obj);
@@ -97,11 +145,12 @@ export function computeEntityScreenBounds(
     out.push({ id, layer: '3d', surface, screen, onScreen, ...(worldAABB ? { worldAABB } : {}) });
   };
 
-  for (const [id, obj] of sources.ecsObjects) project(id, obj, true);
+  for (const e of sources.ecsObjects) project(e, true);
   // Skinned roots carry the cloned hierarchy; `setFromObject` uses the bind-pose bounds.
-  for (const [id, entry] of sources.skinned) project(id, entry.root, true);
-  for (const [id, entry] of sources.billboards) if (entry.group.visible) project(id, entry.group, true);
-  for (const [id, entry] of sources.textMeshes) if (entry.group.visible) project(id, entry.group, true);
-  for (const [id, obj] of sources.gizmos ?? []) project(id, obj, false);
+  for (const e of sources.skinned) project(e, true);
+  // A billboard / text group that is not `visible` cannot be clicked either — the invariant.
+  for (const e of sources.billboards) if (e[1].visible) project(e, true);
+  for (const e of sources.textMeshes) if (e[1].visible) project(e, true);
+  for (const e of sources.gizmos ?? []) project(e, false);
   return out;
 }
