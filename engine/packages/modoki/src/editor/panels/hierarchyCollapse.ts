@@ -11,7 +11,13 @@
 
 /** The subset of `EntityInfo` these decisions read. Declared structurally so the module
  *  stays free of the panel's imports and a test can hand it plain objects. */
+import { durableGuid } from '../../runtime/core/assetRefRules';
+
 export type CollapseNode = { id: number; parentId?: number | null; guid?: string };
+
+/** The guid collapse state may be keyed by: durable only. A runtime guid (#1210) is re-issued to
+ *  a different entity next session, so persisting one would collapse the wrong row. */
+const durableKey = durableGuid;
 
 export const ENTITY_COLLAPSE_LS_KEY = 'editor:hierarchy:entityCollapsed:v1';
 
@@ -56,7 +62,7 @@ export function computeRestoredCollapse(
   // Seen before → restore exactly (map saved guids → current ids). An entity with no guid,
   // or not in the saved set, renders expanded.
   const wanted = new Set(saved);
-  return new Set(parents.filter((e) => e.guid && wanted.has(e.guid)).map((e) => e.id));
+  return new Set(parents.filter((e) => { const g = durableKey(e.guid); return g && wanted.has(g); }).map((e) => e.id));
 }
 
 /** The inverse, for the save side: the guids of the currently-collapsed ids. Ids with no
@@ -65,7 +71,7 @@ export function collapsedIdsToGuids(
   flat: readonly CollapseNode[],
   collapsed: ReadonlySet<number>,
 ): string[] {
-  const idToGuid = new Map(flat.map((e) => [e.id, e.guid || '']));
+  const idToGuid = new Map(flat.map((e) => [e.id, durableKey(e.guid)]));
   const guids: string[] = [];
   for (const id of collapsed) { const g = idToGuid.get(id); if (g) guids.push(g); }
   return guids;

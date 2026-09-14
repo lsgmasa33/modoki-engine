@@ -24,6 +24,7 @@
 
 import { trait, type Entity } from 'koota';
 import { getTraitByName } from '../core/ecs/traitRegistry';
+import { durableGuid } from '../core/assetRefRules';
 
 export const Persistent = trait({});
 
@@ -56,7 +57,9 @@ export function markPersistent(entity: Entity, guid?: string): string {
     );
   }
   // Resolve guid: explicit argument wins, then existing entity guid, then fresh
-  const finalGuid = guid ?? (attr.guid && attr.guid !== '' ? attr.guid : crypto.randomUUID());
+  // A runtime guid (#1210) is not a cross-scene identity — it dies with its world — so it is
+  // replaced like an empty one.
+  const finalGuid = guid ?? (durableGuid(attr.guid) || crypto.randomUUID());
   if (attr.guid !== finalGuid) {
     // Use set() so koota commits the mutation regardless of internal storage layout.
     entity.set(eaMeta.trait, { ...attr, guid: finalGuid });

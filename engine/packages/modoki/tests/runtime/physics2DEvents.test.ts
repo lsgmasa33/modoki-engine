@@ -5,6 +5,7 @@
  *  dispatched with the OTHER entity as target, and that unsubscribe/clear work. */
 
 import { describe, it, expect, beforeAll, afterEach, vi } from 'vitest';
+import { entityRef } from '../../src/runtime/core/journal';
 import { expectInOrder } from '../helpers/inOrder';
 import type { Entity } from 'koota';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
@@ -319,15 +320,16 @@ describe('physics2D — solo (parentless) static colliders', () => {
       tw.spawn(Physics2D({ gravityX: 0, gravityY: 30, pixelsPerMeter: 100 }));
       // Solo floor: Collider2D only — NO RigidBody2D, no parent (EntityAttributes as in a real scene).
       const floorId = tw.spawn(Transform({ x: 0, y: 400 }),
-        Collider2D({ shape: 'box', halfW: 200, halfH: 20, friction: 0.9 }), EntityAttributes({ parentId: 0 })).id();
+        Collider2D({ shape: 'box', halfW: 200, halfH: 20, friction: 0.9 }), EntityAttributes({ parentId: 0 }));
+      const floorRef = entityRef(floorId); // journal refs are guids — a runtime guid here (#1210)
       const body = tw.spawn(Transform({ x: 0, y: 100 }),
         RigidBody2D({ bodyType: 'dynamic', angularDamping: 1 }),
         Collider2D({ shape: 'box', halfW: 20, halfH: 20 }), EntityAttributes({ parentId: 0 }));
       tw.step(240);
       expect(tw.trait<{ y: number }>(Transform, body).y).toBeLessThan(400);   // rested on the solo floor
       const hitFloor = tw.events({ type: '@contact' }).some((e) => {
-        const p = e.payload as { a: number; b: number };
-        return p.a === floorId || p.b === floorId;                            // collision resolves to the solo entity
+        const p = e.payload as { a: string; b: string };
+        return p.a === floorRef || p.b === floorRef;                            // collision resolves to the solo entity
       });
       expect(hitFloor).toBe(true);
       expect(warn.mock.calls.some((c) => String(c[0]).includes('has no RigidBody2D'))).toBe(false);
@@ -360,15 +362,16 @@ describe('physics2D — solo (parentless) static colliders', () => {
     tw.spawn(Physics2D({ gravityX: 0, gravityY: 0, pixelsPerMeter: 100 }));
     // Solo sensor: Collider2D isSensor, NO RigidBody2D, no parent — a body-less trigger volume.
     const sensorId = tw.spawn(Transform({ x: 0, y: 0 }),
-      Collider2D({ shape: 'box', halfW: 40, halfH: 40, isSensor: true }), EntityAttributes({ parentId: 0 })).id();
+      Collider2D({ shape: 'box', halfW: 40, halfH: 40, isSensor: true }), EntityAttributes({ parentId: 0 }));
+    const sensorRef = entityRef(sensorId); // journal refs are guids — a runtime guid here (#1210)
     // A body drifts into it (no gravity, moving -X).
     tw.spawn(Transform({ x: 220, y: 0 }),
       RigidBody2D({ bodyType: 'dynamic', gravityScale: 0, vx: -300 }),
       Collider2D({ shape: 'box', halfW: 10, halfH: 10 }), EntityAttributes({ parentId: 0 }));
     tw.step(120);
     const overlap = tw.events({ type: '@sensor' }).some((e) => {
-      const p = e.payload as { sensor: number; other: number; phase: string };
-      return p.sensor === sensorId && p.phase === 'enter';   // resolves to the solo sensor entity
+      const p = e.payload as { sensor: string; other: string; phase: string };
+      return p.sensor === sensorRef && p.phase === 'enter';   // resolves to the solo sensor entity
     });
     expect(overlap).toBe(true);
   });

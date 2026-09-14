@@ -68,6 +68,7 @@ vi.mock('../../src/editor/animation/recording', () => ({ notifyFieldEdited: vi.f
 
 import { makePrefabInstantiateAction } from '../../src/editor/undo/prefabInstantiateUndo';
 import { readTraitData, getAllEntities } from '../../src/runtime/core/ecs/entityUtils';
+import { formatRuntimeGuid } from '../../src/runtime/core/assetRefRules';
 
 const eaMeta = traitDefs[0];
 
@@ -181,5 +182,26 @@ describe('prefab instantiate undo→redo keeps the entity identity', () => {
     expect(readTraitData(squatter.id(), eaMeta as never)!.guid).toBe(before.Cube);
     // The children are uncontested, so they still come back under their original guids.
     expect(guidsByName(newRoot).Arm).toBe(before.Arm);
+  });
+});
+
+/** #1210: a runtime guid belongs to the world it was minted in. Redo must keep the respawn's own
+ *  address rather than stamp a dead one back — only DURABLE guids are identity worth restoring.
+ *  The runtime guid sits on a CHILD: the action's own `entityRef(initialId)` already mints a durable
+ *  guid over the ROOT's before capture, so a root-only case could not tell the guard from its absence. */
+describe('prefab instantiate redo does not restore runtime guids (#1210)', () => {
+  it('a child\'s runtime guid captured before undo is not stamped onto the respawn', async () => {
+    const rootId = instantiate();
+    const arm = getAllEntities().find((e) => e.name === 'Arm')!;
+    const armEntity = entityIndex.get(arm.id) as { set(t: unknown, v: unknown): void; get(t: unknown): Record<string, unknown> };
+    armEntity.set(EntityAttributes, { ...armEntity.get(EntityAttributes), guid: formatRuntimeGuid(1, 1) });
+    const before = guidsByName(rootId);
+    const action = makeAction(rootId);
+    await action.undo();
+    await action.redo();
+    const after = guidsByName(getAllEntities().find((e) => e.parentId === 0)!.id);
+    expect(after.Arm).not.toBe(formatRuntimeGuid(1, 1)); // the respawn's own address stands
+    expect(after.Cube).toBe(before.Cube);                 // durable identity is still restored
+    expect(after.Leg).toBe(before.Leg);
   });
 });

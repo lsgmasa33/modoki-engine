@@ -48,6 +48,7 @@ vi.mock('../../src/runtime/core/ecs/traitRegistry', () => ({
 
 import { ensureGuid, entityRef, buildGuidIndex, resolveRefs } from '../../src/editor/undo/entityRef';
 import { readTraitData } from '../../src/runtime/core/ecs/entityUtils';
+import { formatRuntimeGuid, isRuntimeGuid, isGuid } from '../../src/runtime/core/assetRefRules';
 
 function spawn(world: ReturnType<typeof createWorld>, guid: string, name = '') {
   const e = world.spawn(Transform({ x: 1 }), EntityAttributes({ name, guid }));
@@ -137,5 +138,35 @@ describe('buildGuidIndex / resolveRefs', () => {
     spawn(testWorld, 'dup');
     const idx = buildGuidIndex();
     expect(idx.get('dup')).toBe(a.id());
+  });
+});
+
+/** #1210: a runtime guid dies with its world. An undo entry holding one would miss after a
+ *  Stop-revert, so `ensureGuid` mints a durable guid over it; a selection ref (mint:false) must not
+ *  hold one either, because the next save re-mints it and the ref would stop resolving mid-world. */
+describe('entityRef over runtime guids (#1210)', () => {
+  beforeEach(() => { testWorld = createWorld(); entityIndex.clear(); });
+
+  function spawnRuntime() {
+    const e = testWorld.spawn(Transform(), EntityAttributes({ name: 'shot', guid: formatRuntimeGuid(1, 5) }));
+    entityIndex.set(e.id(), e);
+    return e;
+  }
+
+  it('ensureGuid replaces a runtime guid with a durable one, written to the live world', () => {
+    const e = spawnRuntime();
+    const g = ensureGuid(e.id());
+    expect(isGuid(g)).toBe(true);
+    expect(isRuntimeGuid(g)).toBe(false);
+    expect((e.get(EntityAttributes) as { guid: string }).guid).toBe(g);
+    expect(ensureGuid(e.id())).toBe(g); // idempotent once durable
+  });
+
+  it('a non-minting ref ignores the runtime guid and falls back to the raw id', () => {
+    const e = spawnRuntime();
+    const ref = entityRef(e.id(), false);
+    expect(ref.guid).toBe('');
+    expect(ref.resolve()).toBe(e.id());
+    expect((e.get(EntityAttributes) as { guid: string }).guid).toBe(formatRuntimeGuid(1, 5)); // not minted
   });
 });

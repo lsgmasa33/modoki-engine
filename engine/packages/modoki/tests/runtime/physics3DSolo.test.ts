@@ -5,6 +5,7 @@
  *  under a non-body GROUP is honored at its composed WORLD pose (the case that a wall-under-an-empty-
  *  group hit). Removing the collider entity drops it so the body falls through. 3D is Y-up. */
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
+import { entityRef } from '../../src/runtime/core/journal';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
 import { SYSTEM_PRIORITY } from '../../src/runtime/core/pipeline';
 import { Transform } from '../../src/runtime/core/traits/Transform';
@@ -41,15 +42,16 @@ describe('physics3D — solo (parentless) static colliders', () => {
     tw = createTestWorld({ systems: [PHYS] });
     tw.spawn(Physics3D({ gravityX: 0, gravityY: -30, gravityZ: 0 }));
     const floorId = tw.spawn(Transform({ x: 0, y: -4, z: 0 }),
-      Collider3D({ shape: 'box', halfW: 5, halfH: 0.5, halfD: 5, friction: 0.9 }), EntityAttributes({})).id();
+      Collider3D({ shape: 'box', halfW: 5, halfH: 0.5, halfD: 5, friction: 0.9 }), EntityAttributes({}));
+    const floorRef = entityRef(floorId); // journal refs are guids — a runtime guid here (#1210)
     tw.spawn(Transform({ x: 0, y: 2, z: 0 }),
       RigidBody3D({ bodyType: 'dynamic', angularDamping: 1 }),
       Collider3D({ shape: 'box', halfW: 0.4, halfH: 0.4, halfD: 0.4 }), EntityAttributes({}));
     tw.step(180);
     const collisions = tw.events({ type: '@collision' });
     const involvesFloor = collisions.some((e) => {
-      const p = e.payload as { a: number; b: number };
-      return p.a === floorId || p.b === floorId;
+      const p = e.payload as { a: string; b: string };
+      return p.a === floorRef || p.b === floorRef;
     });
     expect(involvesFloor).toBe(true);
   });

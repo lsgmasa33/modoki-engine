@@ -22,6 +22,9 @@ const idIndex = new Map<number, any>();
 // registered at module load by anything this file imports lands here — entriesSystem.ts's own
 // viewStates-clearing callback among them.
 const worldSwapListeners: Array<() => void> = [];
+// The real findEntityByGuid keeps a re-minted entity's RUNTIME guid resolving (#1210); a test stands
+// that alias in explicitly here.
+const guidAliases = new Map<string, any>();
 
 vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => testWorld,
@@ -33,6 +36,7 @@ vi.mock('../../src/runtime/core/ecs/world', () => ({
   onWorldSwap: (fn: () => void) => { worldSwapListeners.push(fn); return () => {}; },
   findEntityById: (id: number) => idIndex.get(id),
   findEntityByGuid: (guid: string) => {
+    if (guidAliases.has(guid)) return guidAliases.get(guid);
     let found: any;
     testWorld.query(EntityAttributes).updateEach(([ea]: any[], e: any) => { if (!found && ea.guid === guid) found = e; });
     return found;
@@ -139,7 +143,7 @@ function settleAtEntry(sys: { entriesSystem: (w: typeof testWorld) => void }, vi
   sys.entriesSystem(testWorld);
 }
 
-beforeEach(() => { testWorld = createWorld(); idIndex.clear(); });
+beforeEach(() => { testWorld = createWorld(); idIndex.clear(); guidAliases.clear(); });
 // ⚠️ Koota caps a process at 16 worlds, so a per-test world MUST be released or the 17th test
 // in this file dies with "Too many worlds created" — which reads as a bug in the code under
 // test rather than as test bookkeeping. Hit exactly that when this file crossed 16 cases.
@@ -1743,6 +1747,41 @@ describe('entriesSystem', () => {
  *  It runs inside `entriesSystem` (priority 270) rather than in `uiFocusSystem`, which is
  *  GAME-tier and therefore dead while paused — and a level select is exactly what you scroll
  *  while paused. */
+describe('entriesSystem — a view whose runtime guid is re-minted durable (#1210)', () => {
+  it('keeps driving its existing pool instead of spawning a second one beside it', async () => {
+    const runtime = '00000000-0000-0001-0000-000000000009';
+    const durable = 'd9999999-9999-4999-8999-999999999999';
+    const { sys, src, provider, view } = await setup();
+    src.registerEntrySource('test.rows', () => ({ members: {} }));
+    view.set(EntityAttributes, { ...(view.get(EntityAttributes) as object), guid: runtime });
+    sys.entriesSystem(testWorld);
+    const first = provider.spawned.length;
+    expect(first).toBeGreaterThan(0);
+
+    // A save / ensureGuid / markPersistent replaces the view's guid; the old one still names it.
+    view.set(EntityAttributes, { ...(view.get(EntityAttributes) as object), guid: durable });
+    guidAliases.set(runtime, view);
+    sys.entriesSystem(testWorld);
+
+    expect(provider.spawned.length).toBe(first); // no second pool
+    const owners = new Set<string>();
+    testWorld.query(UIEntry).updateEach(([ue]: any[]) => owners.add(ue.viewGuid));
+    expect([...owners]).toEqual([durable]);
+  });
+
+  it('does not adopt rows belonging to a DIFFERENT view\'s runtime guid', async () => {
+    const other = '00000000-0000-0001-0000-000000000031';
+    const { sys, provider, view } = await setup();
+    view.set(EntityAttributes, { ...(view.get(EntityAttributes) as object), guid: other });
+    sys.entriesSystem(testWorld);
+    const first = provider.spawned.length;
+    view.set(EntityAttributes, { ...(view.get(EntityAttributes) as object), guid: 'e1111111-1111-4111-8111-111111111111' });
+    guidAliases.set(other, { id: () => -12345 }); // the old guid names some OTHER entity now
+    sys.entriesSystem(testWorld);
+    expect(provider.spawned.length).toBe(first * 2); // a fresh pool: nothing was stolen
+  });
+});
+
 describe('entriesSystem — focus on recycle', () => {
   /** The pooled entry root's guid, from the guid of a member inside it (the fake provider names
    *  a Label `${rootGuid}|Label`). */

@@ -24,7 +24,7 @@
  *  a click that lands somewhere plausible and reports success. See
  *  `docs/enact.md` ("Aimed input has THREE target surfaces"). */
 
-import { getAllEntities, collectScreenBounds, pickAt, type BoundsSurface } from '@modoki/engine/runtime';
+import { getAllEntities, collectScreenBounds, pickAt, findEntityByGuid, type BoundsSurface } from '@modoki/engine/runtime';
 import { describeElement, occlusionAt, resolveElementPoint, NOTHING_AT_POINT } from './domResolve';
 import { uiNodesFor, namedUiSurface } from './uiSurface';
 import type { EntityPointSpec, EntityPointResolution, AimedAt } from './entityPointContract';
@@ -41,15 +41,21 @@ export type { EntityPointSpec, EntityPointResolution } from './entityPointContra
 function resolveEntity(spec: EntityPointSpec): { info: ReturnType<typeof getAllEntities>[number] } | { error: string; code?: ErrorCode } {
   const all = getAllEntities();
   if (spec.guid) {
-    const hit = all.find((e) => e.guid === spec.guid);
+    // The live list first; then `findEntityByGuid`, which also resolves a RUNTIME guid (#1210) whose
+    // entity a save has since given a durable one — the address an agent read before the save.
+    const live = all.find((e) => e.guid === spec.guid);
+    const aliased = live ? undefined : findEntityByGuid(spec.guid);
+    const hit = live ?? (aliased ? all.find((e) => e.id === aliased.id()) : undefined);
     return hit ? { info: hit } : { error: `no entity with guid ${JSON.stringify(spec.guid)}`, code: 'NOT_FOUND' };
   }
   if (spec.name) {
     const hits = all.filter((e) => e.name === spec.name);
     if (hits.length === 0) return { error: `no entity named ${JSON.stringify(spec.name)}`, code: 'NOT_FOUND' };
     if (hits.length > 1) {
-      const guids = hits.map((e) => e.guid || `id:${e.id}`).join(', ');
-      return { error: `${hits.length} entities are named ${JSON.stringify(spec.name)} (${guids}) — address by guid`, code: 'AMBIGUOUS' };
+      // Guids only (#1207): the refusal says "address by guid", so it lists nothing else.
+      const guids = hits.map((e) => e.guid).filter(Boolean).join(', ');
+      const way = guids ? `(${guids}) — address by guid` : '— none has a guid, so address one by id';
+      return { error: `${hits.length} entities are named ${JSON.stringify(spec.name)} ${way}`, code: 'AMBIGUOUS' };
     }
     return { info: hits[0] };
   }

@@ -21,6 +21,7 @@ import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { findEntity } from '../../runtime/core/ecs/entityUtils';
 import { getCurrentScenePath } from '../scene/serialize';
 import { getGuidForPath } from '../../runtime/loaders/assetManifest';
+import { durableGuid } from '../../runtime/core/assetRefRules';
 import { clearUnscopedLegacyKey, projectScopedKey } from '../projectScopedKey';
 
 const KEY_BASE = 'editor:lastAnimationClip';
@@ -40,7 +41,7 @@ function guidForEntity(id: number): string | null {
   const ent = findEntity(id);
   if (!meta || !ent) return null;
   const ea = ent.get(meta.trait) as { guid?: string } | undefined;
-  return ea?.guid || null;
+  return durableGuid(ea?.guid) || null; // a runtime guid (#1210) must not outlive the process
 }
 
 /** Resolve a guid → entity id in the current world (null if not present). */

@@ -693,8 +693,10 @@ function resolveLiveEntityRef(ref: MutateEntityRef | undefined): { id: number } 
     const hits = getAllEntities().filter((en) => en.name === ref.name);
     if (hits.length === 0) return { error: `no LIVE entity named ${JSON.stringify(ref.name)}`, code: 'NOT_FOUND' };
     if (hits.length > 1) {
-      const which = hits.map((e) => e.guid || `id:${e.id}`).join(', ');
-      return { error: `${hits.length} LIVE entities are named ${JSON.stringify(ref.name)} (${which}) — address by guid`, code: 'AMBIGUOUS' };
+      // Guids only (#1207): the refusal says "address by guid", so it lists nothing else.
+      const which = hits.map((e) => e.guid).filter(Boolean).join(', ');
+      const way = which ? `(${which}) — address by guid` : '— none has a guid, so address one by id';
+      return { error: `${hits.length} LIVE entities are named ${JSON.stringify(ref.name)} ${way}`, code: 'AMBIGUOUS' };
     }
     return { id: hits[0].id };
   }

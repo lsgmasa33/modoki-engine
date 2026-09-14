@@ -22,6 +22,7 @@ import { getCurrentWorld, getGuidIndex, findEntityByGuid, indexEntityGuid, rebui
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { readTraitData, writeTraitField, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { newGuid } from '../../runtime/loaders/assetManifest';
+import { durableGuid } from '../../runtime/core/assetRefRules';
 
 export interface EntityRef {
   /** Captured stable guid, or '' when the entity is un-guidable. */
@@ -53,7 +54,9 @@ export function ensureGuid(entityId: number): string {
   if (!eaMeta) return '';
   const data = readTraitData(entityId, eaMeta);
   if (!data) return ''; // no EntityAttributes → un-guidable
-  const existing = (data.guid as string) || '';
+  // A runtime guid (#1210) dies with its world, so an undo entry holding one would miss after a
+  // Stop-revert or reload. Mint a durable guid over it, exactly as over an empty one.
+  const existing = durableGuid(data.guid as string);
   if (existing) return existing;
   const g = newGuid();
   writeTraitField(entityId, eaMeta, 'guid', g);
@@ -76,7 +79,9 @@ function readGuid(entityId: number): string {
   const eaMeta = getTraitByName('EntityAttributes');
   if (!eaMeta) return '';
   const data = readTraitData(entityId, eaMeta);
-  return data ? ((data.guid as string) || '') : '';
+  // Durable only (#1210): a runtime guid is re-minted by the next save, so a ref holding one would
+  // stop resolving mid-world. Such an entity takes the raw-id fallback, as a guid-less one did.
+  return data ? durableGuid(data.guid as string) : '';
 }
 
 /** Create an EntityRef for a live entity.

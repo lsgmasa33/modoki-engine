@@ -8,6 +8,7 @@
  *  CHILD entity (event mapping), so per-child OnCollision2D/journal works. */
 
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
+import { entityRef } from '../../src/runtime/core/journal';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
 import { SYSTEM_PRIORITY } from '../../src/runtime/core/pipeline';
 import { Transform } from '../../src/runtime/core/traits/Transform';
@@ -65,13 +66,15 @@ describe('physics2D — compound colliders', () => {
       RigidBody2D({ bodyType: 'dynamic', angularDamping: 1 }), EntityAttributes({}));
     const footIds = [-150, 150].map((fx) =>
       tw!.spawn(Transform({ x: fx, y: 0 }), Collider2D({ shape: 'box', halfW: 40, halfH: 20, friction: 0.9 }),
-        EntityAttributes({ parentId: body.id() })).id());
+        EntityAttributes({ parentId: body.id() })));
+    // Journal refs name an entity by guid — a runtime guid for these unsaved spawns (#1210).
+    const footRefs = footIds.map((e) => entityRef(e));
     tw.step(240);
     const collisions = tw.events({ type: '@collision' });
     // At least one foot landed → a collision naming that foot child entity (not the parent).
     const involvesFoot = collisions.some((e) => {
-      const p = e.payload as { a: number; b: number };
-      return footIds.includes(p.a) || footIds.includes(p.b);
+      const p = e.payload as { a: string; b: string };
+      return footRefs.includes(p.a) || footRefs.includes(p.b);
     });
     expect(involvesFoot).toBe(true);
   });

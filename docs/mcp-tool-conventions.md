@@ -185,18 +185,26 @@ calls. Raw `{x,y}` is refused wherever a resolvable aim exists (`modoki_capture_
 legitimate exception: it *measures* a path).
 
 - `guid` is the only address that always works; `id` is reassigned on every scene reload.
+- **Every entity spawned with EntityAttributes has a guid a tool can hand out** (#1210). A
+  code-spawned one carries a RUNTIME guid (`00000000-GGGG-GGGG-0000-…`, `isRuntimeGuid`). It works
+  in every guid-addressed op now, still resolves after a `save_all` gives the entity a durable guid,
+  and is **valid only until the scene reloads**, after which it misses rather than naming another
+  entity. Replies report it in `guid` like any other; the rules and the mechanism are in
+  [engine-concepts.md](engine-concepts.md) § Entity identity. ⚠️ It is a live-world address: the
+  FILE path (`/api/scene-mutate`) refuses a write carrying one, because a file outlives the world.
 - **A reply reports `guid: null` for an entity that has no guid. It never reports `String(id)`**
-  (#1199). Runtime spawns have no guid, and neither does anything not yet saved or edited. The id
-  in `guid` looked addressable, and every guid-addressed op refused it: a guid-less entity is not in
-  the guid index. The refusal then told the caller to use guids. `liveGuidOf`
-  (`app/debug/liveLifecycle.ts`) is the one helper. Two shapes differ, because a bare element has
-  no `id` beside it: `contacts`/`overlaps` list a guid-less partner as `id:<n>`, and a `watch`
-  series reports `guid: null` plus `id`, with `id:<n>` as its internal key. A `watch read` with
-  `guids` therefore cannot select a guid-less series by its old id string. Select it with `name`.
-  `guids: ["id:<n>"]` also matches, but it is not an advertised form. A producer that hands out a guid should
-  **mint** one (the live `create-entity`, `newScene`'s starter set), not disguise the id. A
-  scene-state warning for null rows was tried and dropped: it fired on every read of a world with
-  runtime spawns.
+  (#1199). Since #1210 that is only an entity with no EntityAttributes, or one whose EntityAttributes
+  was added after spawn. The id in `guid` looked addressable, and every guid-addressed op refused it.
+  `liveGuidOf` (`app/debug/liveLifecycle.ts`) is the one helper. Two shapes differ, because a bare
+  element has no `id` beside it: `contacts`/`overlaps` list such a partner as `id:<n>`, and a `watch`
+  series reports `guid: null` plus `id`, with `id:<n>` as its internal key. A `watch read` with `guids`
+  therefore cannot select that series by its old id string. Select it with `name`. A producer that
+  hands out a guid should **mint** one (the live `create-entity`, `newScene`'s starter set), not
+  disguise the id.
+- **A refusal offers only what the same op accepts** (#1207). An ambiguous-name refusal lists guids,
+  never `id:<n>`: `exclude` takes a name or a guid, and the aimed-input and live-ops refusals say
+  "address by guid". A match with no guid is not listed; when NONE of the matches has one, those two
+  refusals say "address one by id" instead — both accept `{id}` — while `exclude` offers an empty list.
 - A `name` matching several entities is **refused**, everywhere — live path, file path, and input
   aim alike. First-matching is never acceptable (this was measured: one of two `DUP_probe` entities
   moved, `{ok:true, changed:1}`).

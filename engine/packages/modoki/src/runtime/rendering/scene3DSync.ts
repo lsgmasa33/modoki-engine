@@ -444,12 +444,14 @@ export function setActiveCameraFrame(world: World, ref: { name?: string; guid?: 
   // Pass 1: resolve the target entity id. A no-match is a NO-OP — a typo'd ref
   // must NOT deactivate every frame and silently kill framing.
   const target = { id: -1 };
+  // A guid resolves through findEntityByGuid, which also follows a re-minted RUNTIME guid (#1210).
+  const byGuidId = ref.guid != null ? findEntityByGuid(ref.guid, world)?.id() : undefined;
   world.query(CameraFrame, EntityAttributes).updateEach(([, attrs], entity) => {
     if (target.id >= 0) return;
     if (deactivatedEntities.has(entity.id())) return; // can't become the active frame (selectActiveFrame skips it)
     const match =
       (ref.id != null && entity.id() === ref.id) ||
-      (ref.guid != null && attrs.guid === ref.guid) ||
+      (byGuidId != null && entity.id() === byGuidId) ||
       (ref.name != null && attrs.name === ref.name);
     if (match) target.id = entity.id();
   });

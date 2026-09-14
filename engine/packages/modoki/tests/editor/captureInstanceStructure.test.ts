@@ -8,6 +8,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { createWorld, trait } from 'koota';
 import { Transient } from '../../src/runtime/core/traits/Transient';
+import { formatRuntimeGuid } from '../../src/runtime/core/assetRefRules';
 
 const Transform = trait({ x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
 const EntityAttributes = trait({ name: '' as string, isActive: true, sortOrder: 0, parentId: 0, guid: '' as string, layer: '' as '' | '3d' | '2d' | 'ui' });
@@ -326,5 +327,25 @@ describe('captureInstanceStructure', () => {
     expect(s.added).toEqual([]);
     expect(s.removed).toEqual([]);
     expect(s.removedTraits).toEqual({});
+  });
+});
+
+/** #1210: a user-added child that holds only a RUNTIME guid is captured as UNGUIDED, exactly as a
+ *  guid-less one was — never as `added[].guid`, and so never as a `+added.<guid>` override key, both
+ *  of which are persisted and would name another entity next session. */
+describe('captureInstanceStructure over runtime guids (#1210)', () => {
+  beforeEach(() => { testWorld = createWorld(); entityIndex.clear(); entityInfos = []; });
+
+  it('an added child holding a runtime guid is captured with guid ""', async () => {
+    const { captureInstanceStructure } = await getModule();
+    const prefab = makePrefab([{ localId: 1, name: 'Root', traits: { EntityAttributes: { name: 'Root', parentId: 0 } } }]);
+    const rootId = spawnMember(1, 0, 'Root');
+    spawnPlain(rootId, 'Spark', formatRuntimeGuid(1, 9));
+    spawnPlain(rootId, 'Crown', 'guid-crown');
+    const added = captureInstanceStructure(ROOT, prefab as any).added;
+    expect(added.find((n) => n.name === 'Spark')?.guid).toBe('');
+    // …and not in the copied trait either: the loader keeps a non-empty trait guid.
+    expect((added.find((n) => n.name === 'Spark')?.traits.EntityAttributes as { guid?: string }).guid).toBeUndefined();
+    expect(added.find((n) => n.name === 'Crown')?.guid).toBe('guid-crown'); // a durable guid is kept
   });
 });

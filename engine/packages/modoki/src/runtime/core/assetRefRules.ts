@@ -58,6 +58,86 @@ export function isGuid(ref: string | undefined | null): boolean {
   return GUID_RE.test(ref);
 }
 
+/** A RUNTIME guid (#1210): the address `spawnEntity` mints for an entity spawned with an empty
+ *  `EntityAttributes.guid`. Shape `00000000-GGGG-GGGG-0000-NNNNNNNNNNNN` — a 32-bit world
+ *  generation, then a 48-bit per-generation spawn counter. Deterministic (same spawn order →
+ *  same guids) and valid only until its world is swapped out.
+ *
+ *  It is an ADDRESS, never a persistent identity. Everything that treats a non-empty guid as
+ *  "this entity is saved/anchored" must read it through {@link durableGuid}, and nothing may
+ *  write one to a file or to storage that outlives the process — the counter restarts, so a
+ *  persisted runtime guid names a DIFFERENT entity next session.
+ *
+ *  Cannot collide with a v4 (`newGuid`): a v4's fourth group starts with the variant nibble
+ *  8-b, never `0`. The all-zero guid is excluded (generation 0 is never minted) because it is
+ *  already a placeholder elsewhere. */
+const RUNTIME_GUID_RE = /^00000000-([0-9a-f]{4})-([0-9a-f]{4})-0000-[0-9a-f]{12}$/i;
+
+export function isRuntimeGuid(ref: string | undefined | null): boolean {
+  if (!ref) return false;
+  const m = RUNTIME_GUID_RE.exec(ref);
+  return !!m && (m[1] !== '0000' || m[2] !== '0000');
+}
+
+/** Format a runtime guid. `generation` must be ≥ 1; both parts are masked to their widths. */
+export function formatRuntimeGuid(generation: number, ordinal: number): string {
+  // Generation 0 formats as the all-zero placeholder shape, which `isRuntimeGuid` REJECTS — so a
+  // 0 (or a wrapped 2^32) would pass every durableGuid guard and tripwire as if it were durable.
+  if (!Number.isInteger(generation) || generation < 1 || generation > 0xffffffff) {
+    throw new RangeError(`formatRuntimeGuid: generation must be 1..0xffffffff (got ${generation})`);
+  }
+  const g = generation.toString(16).padStart(8, '0');
+  // 48 bits exceed the 32-bit ops, so split into a high 16 and low 32.
+  const hi = Math.floor(ordinal / 0x100000000) & 0xffff;
+  const lo = ordinal >>> 0;
+  const n = hi.toString(16).padStart(4, '0') + lo.toString(16).padStart(8, '0');
+  return `00000000-${g.slice(0, 4)}-${g.slice(4)}-0000-${n}`;
+}
+
+/** Parse a runtime guid back into its parts, or null when `ref` is not one. */
+export function parseRuntimeGuid(ref: string | undefined | null): { generation: number; ordinal: number } | null {
+  if (!isRuntimeGuid(ref)) return null;
+  const s = ref as string;
+  const generation = parseInt(s.slice(9, 13) + s.slice(14, 18), 16);
+  const ordinal = parseInt(s.slice(24), 16);
+  return { generation, ordinal };
+}
+
+/** The entity guid if it is DURABLE — safe to persist, to anchor a derivation on, or to treat as
+ *  "this entity already has an identity" — else `''`. A runtime guid reads as `''` here, so every
+ *  fill-if-empty site that routes through this mints a real guid over it instead of keeping it. */
+export function durableGuid(guid: string | undefined | null): string {
+  return guid && !isRuntimeGuid(guid) ? guid : '';
+}
+
+/** Every runtime guid anywhere inside `value` — strings, array items, object values AND object
+ *  keys (`+added.<guid>`-style keys) — with the path it was found at. The tripwire for files and
+ *  storage: a runtime guid must never be persisted (see {@link isRuntimeGuid}). */
+export function findRuntimeGuids(value: unknown, path = ''): { path: string; guid: string }[] {
+  const out: { path: string; guid: string }[] = [];
+  const walk = (v: unknown, p: string, depth: number) => {
+    if (depth > 64) return;
+    if (typeof v === 'string') {
+      // Cheap prefix test first: a scene file holds thousands of strings.
+      if (v.length >= 36 && v.includes('00000000-')) {
+        for (const m of v.matchAll(/00000000-[0-9a-f]{4}-[0-9a-f]{4}-0000-[0-9a-f]{12}/gi)) {
+          if (isRuntimeGuid(m[0])) out.push({ path: p, guid: m[0] });
+        }
+      }
+      return;
+    }
+    if (!v || typeof v !== 'object') return;
+    if (Array.isArray(v)) { v.forEach((item, i) => walk(item, `${p}[${i}]`, depth + 1)); return; }
+    for (const [k, child] of Object.entries(v as Record<string, unknown>)) {
+      const cp = p ? `${p}.${k}` : k;
+      walk(k, `${cp} (key)`, depth + 1);
+      walk(child, cp, depth + 1);
+    }
+  };
+  walk(value, path, 0);
+  return out;
+}
+
 /** Genuinely external resources that are NOT manifest assets and pass through
  *  reference resolution unchanged (remote CDN files, inline data/blob URIs). */
 export function isExternalUrl(ref: string | undefined | null): boolean {

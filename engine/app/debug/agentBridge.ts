@@ -107,6 +107,7 @@ import {
   getAnimSet,
   getSpriteMaterialProgram,
   isGuid,
+  isRuntimeGuid,
   getGuidForPath,
   startInputWatch,
   stopInputWatch,
@@ -494,8 +495,9 @@ export function dumpSceneState(params: SceneStateParams = {}) {
   };
   // A contact partner with no guid is `id:<n>`, not null (#1199 review). A row's `guid: null` has
   // its `id` beside it; a bare array element has nothing else, so null would lose WHICH body it is
-  // (and two such partners would read `[null, null]`). `id:<n>` is this file's existing
-  // non-address form (see the `exclude` refusal's options) and cannot be mistaken for a guid.
+  // (and two such partners would read `[null, null]`). `id:<n>` cannot be mistaken for a guid.
+  // Since #1210 only an entity with no guid reaches it (no EntityAttributes, or EntityAttributes added
+  // after spawn): a code-spawned one has a runtime guid.
   const contactRefOf = (id: number): string => guidOf(id) ?? `id:${id}`;
   const contactWorld = params.contacts ? getCurrentWorld() : null;
   // An unknown or WRONG-CASE `trait=` was applied silently: every entity came back with
@@ -912,6 +914,15 @@ registerAgentOp('resolve-refs', (params) => {
   for (const e of getAllEntities()) {
     if (wantNum.has(e.id)) liveNum.set(e.id, e.name ?? '');
     if (e.guid && wantGuid.has(e.guid)) liveGuid.set(e.guid, e.name ?? '');
+  }
+  // A runtime guid (#1210) whose entity a save has since re-minted is not in the list under that
+  // string, but findEntityByGuid still names it — the @spawn journal refs carry exactly those.
+  for (const g of wantGuid) {
+    // Runtime guids only: a DURABLE guid the pass above did not match is not live under any string,
+    // and asking findEntityByGuid would rebuild the whole guid index once per despawned ref.
+    if (liveGuid.has(g) || !isRuntimeGuid(g)) continue;
+    const e = findEntityByGuid(g);
+    if (e && e.has(EntityAttributes)) liveGuid.set(g, ((e.get(EntityAttributes) as { name?: string }).name) ?? '');
   }
   const resolved: Record<string, { name: string; alive: boolean }> = {};
   const unresolved: (string | number)[] = [];
@@ -1595,9 +1606,11 @@ function resolveExclude(spec: string): { id: number } | { error: string; options
   const matches = getAllEntities().filter((e) => e.name === spec);
   if (matches.length === 0) return { error: `exclude: no entity named or guid'd '${spec}' in the live world` };
   if (matches.length > 1) {
+    // Guids only (#1207): every option must be something `exclude` itself accepts, and it takes a
+    // name or a guid — never an id. Since #1210 every entity spawned with EntityAttributes has one.
     return {
       error: `exclude: '${spec}' matches ${matches.length} entities — an ambiguous name is refused everywhere, never first-matched`,
-      options: matches.map((m) => m.guid || `id:${m.id}`),
+      options: matches.map((m) => m.guid).filter((g): g is string => !!g),
     };
   }
   return { id: matches[0].id };

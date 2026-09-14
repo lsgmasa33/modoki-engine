@@ -5,6 +5,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
   createTestWorld, type TestWorld, setPlayState, getPlayState, findEntityByGuid, Transform,
+  EntityAttributes, spawnEntity, getCurrentWorld,
   applyOps, parentWorldTrs, worldToLocalTrs, mergeTrs, type MutableScene,
 } from '@modoki/engine/runtime';
 import {
@@ -233,6 +234,29 @@ describe('resolving an entity ref by name', () => {
     expect(r.errors[0]).toMatch(/address by guid/);
     // Reported as unresolved, so a caller scanning that field sees it too.
     expect(r.unresolved).toHaveLength(1);
+    // #1207: the way out it names must WORK — every listed address resolves through the same op.
+    const listed = /named "Twin" \(([^)]*)\)/.exec(r.errors[0])![1].split(', ');
+    expect(listed).toHaveLength(2);
+    for (const guid of listed) {
+      expect(guid).not.toMatch(/^id:/);
+      const again = await runAgentOp('apply-scene-ops', {
+        ops: [{ op: 'setTrait', entity: { guid }, trait: 'Transform', fields: { x: 4 } }],
+      }) as { changed: number; errors: string[] };
+      expect(again.errors).toEqual([]);
+      expect(again.changed).toBe(1);
+    }
+  });
+
+  it('lists no `id:<n>` for an ambiguous match that has no guid — the refusal says "address by guid" (#1207)', async () => {
+    await named('Solo');
+    // EntityAttributes added AFTER spawn, so the mint never saw it: the one way left to have no guid.
+    const late = spawnEntity(getCurrentWorld(), Transform());
+    late.add(EntityAttributes({ name: 'Solo' }));
+    const r = await runAgentOp('apply-scene-ops', {
+      ops: [{ op: 'setTrait', entity: { name: 'Solo' }, trait: 'Transform', fields: { x: 1 } }],
+    }) as { changed: number; errors: string[] };
+    expect(r.errors[0]).toMatch(/2 LIVE entities are named "Solo"/);
+    expect(r.errors[0]).not.toMatch(/id:/);
   });
 
   it('refuses an ambiguous name for removeEntity too — deleting the wrong one is worse', async () => {

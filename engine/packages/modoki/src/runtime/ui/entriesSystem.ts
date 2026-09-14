@@ -29,6 +29,7 @@
  */
 import type { World } from 'koota';
 import { getTraitByName } from '../core/ecs/traitRegistry';
+import { isRuntimeGuid } from '../core/assetRefRules';
 import { spawnEntity, destroyEntity, findEntityById, findEntityByGuid, onWorldSwap, getCurrentWorld } from '../core/ecs/world';
 import { beginSystemTick, endSystemTick } from '../core/systemTick';
 import { parseEntryPrefabs } from '../traits/UIEntries';
@@ -449,6 +450,11 @@ function driveView(
 
   const kinds = parseEntryPrefabs(en.prefabs as string);
   if (kinds.length === 0) return false;
+  // First drive under this guid: it may be a DURABLE guid that replaced the view's runtime guid
+  // (#1210 — a save, an undoable edit, markPersistent). The pool and the window state are keyed by
+  // guid, so without this the view would build a SECOND pool beside rows still showing old content.
+  // After the prefab early-out, so a view with no prefabs does not run the query every frame.
+  if (!viewStates.has(viewGuid)) adoptRuntimeGuidPool(world, view, viewGuid, m);
 
   const countX = Math.max(0, Math.floor((en.countX as number) ?? 0));
   const countY = Math.max(0, Math.floor((en.countY as number) ?? 0));
@@ -931,6 +937,30 @@ function ensureRows(world: World, content: EntityLike, want: number, m: Metas): 
     rows.push(spawned);
   }
   return rows;
+}
+
+/** Re-key everything this view owns under a runtime guid it has since lost to `viewGuid`: the pool
+ *  rows' `UIEntry.viewGuid` and the cached window state. A row qualifies when its recorded guid is a
+ *  runtime guid that `findEntityByGuid` still resolves to THIS view — the address table keeps a
+ *  re-minted entity's runtime guid live for the life of the world, which is what makes the old key
+ *  recognisable. Runs once per guid change (the caller gates on an unseen guid). */
+function adoptRuntimeGuidPool(world: World, view: EntityLike, viewGuid: string, m: Metas): void {
+  let oldGuid = '';
+  const adopt: EntityLike[] = [];
+  // Collect, then write AFTER the query: `updateEach` commits its tuple back when the callback
+  // returns, so a `set` made inside it is overwritten by the value it read.
+  world.query(m.entryMeta.trait).updateEach((_t: unknown[], entity: unknown) => {
+    const e = entity as EntityLike;
+    const recorded = (e.get(m.entryMeta.trait) as { viewGuid?: string }).viewGuid ?? '';
+    if (!recorded || recorded === viewGuid || !isRuntimeGuid(recorded)) return;
+    if (recorded !== oldGuid && (findEntityByGuid(recorded, world) as EntityLike | undefined)?.id() !== view.id()) return;
+    oldGuid = recorded;
+    adopt.push(e);
+  });
+  if (!oldGuid) return;
+  for (const e of adopt) e.set(m.entryMeta.trait, { ...(e.get(m.entryMeta.trait) as object), viewGuid });
+  const st = viewStates.get(oldGuid);
+  if (st) { viewStates.set(viewGuid, st); viewStates.delete(oldGuid); }
 }
 
 /** Every pooled instance currently belonging to this view, by slot. Derived from the WORLD

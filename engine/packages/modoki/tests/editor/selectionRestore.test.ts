@@ -5,6 +5,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createWorld as _createWorld, trait, type World } from 'koota';
+import { formatRuntimeGuid } from '../../src/runtime/core/assetRefRules';
 
 // Wrap createWorld so every test's worlds can be destroyed in afterEach —
 // keeps us under koota's 16-world budget across the whole suite.
@@ -317,5 +318,39 @@ describe('registerSelectionRestore', () => {
 
     expect(useEditorStore.getState().selectedEntityId).toBe(newCamera.id());
     vi.doUnmock('../../src/runtime/core/ecs/world');
+  });
+});
+
+/** #1210: a runtime guid dies with its world, so it can never match in the new one. Before runtime
+ *  guids, such an entity had no guid and was restored by its name path; it must still be. */
+describe('restoreSelectionAcrossSwap over runtime guids (#1210)', () => {
+  it('restores a runtime-guid entity by name path instead of dropping the selection', async () => {
+    const { restoreSelectionAcrossSwap } = await getRestore();
+    const { useEditorStore } = await getStore();
+    const oldWorld = createWorld();
+    const newWorld = createWorld();
+    const oldShot = oldWorld.spawn(Transform(), EntityAttributes({ name: 'Shot', parentId: 0, guid: formatRuntimeGuid(1, 4) }));
+    const newShot = newWorld.spawn(Transform(), EntityAttributes({ name: 'Shot', parentId: 0, guid: formatRuntimeGuid(2, 4) }));
+    useEditorStore.setState({ selectedEntityId: oldShot.id(), selectedEntityIds: [oldShot.id()] });
+    restoreSelectionAcrossSwap(newWorld, oldWorld);
+    expect(useEditorStore.getState().selectedEntityId).toBe(newShot.id());
+  });
+});
+
+/** #1210 close-out, observed live: a Play→Stop with two same-named, never-saved entities restored the
+ *  selection onto the OTHER one — the name-path fallback took the first match. */
+describe('restoreSelectionAcrossSwap — an ambiguous name path', () => {
+  it('clears the selection instead of moving it onto a same-named sibling', async () => {
+    const { restoreSelectionAcrossSwap } = await getRestore();
+    const { useEditorStore } = await getStore();
+    const oldWorld = createWorld();
+    const newWorld = createWorld();
+    oldWorld.spawn(Transform(), EntityAttributes({ name: 'Crate', parentId: 0 }));
+    const oldSecond = oldWorld.spawn(Transform(), EntityAttributes({ name: 'Crate', parentId: 0 }));
+    newWorld.spawn(Transform(), EntityAttributes({ name: 'Crate', parentId: 0 }));
+    newWorld.spawn(Transform(), EntityAttributes({ name: 'Crate', parentId: 0 }));
+    useEditorStore.setState({ selectedEntityId: oldSecond.id(), selectedEntityIds: [oldSecond.id()] });
+    restoreSelectionAcrossSwap(newWorld, oldWorld);
+    expect(useEditorStore.getState().selectedEntityId).toBeNull();
   });
 });

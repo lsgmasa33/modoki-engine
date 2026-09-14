@@ -23,6 +23,7 @@ import {
   deleteEntity,
   getCurrentWorld,
   newGuid,
+  durableGuid,
   buildEntityCreateSpecs,
   resolveCreateEntitySpec,
   type CreateEntitySpec,
@@ -70,7 +71,10 @@ function mintGuid(id: number): string | null {
   const meta = attrMeta();
   const entity = findEntity(id);
   if (!meta || !entity) return null;   // not String(id) — see liveGuidOf (#1199)
-  const existing = (readTraitDataFull(id, meta) as Record<string, unknown> | null)?.guid as string | undefined;
+  // Durable only (#1210): `spawnEntity` already gave the entity a RUNTIME guid, which dies with the
+  // world — a Play→Stop revert rebuilds it and the reply's guid would name nothing. The reply exists
+  // to hand back an address that survives that, so mint over a runtime guid like an empty one.
+  const existing = durableGuid((readTraitDataFull(id, meta) as Record<string, unknown> | null)?.guid as string | undefined);
   if (existing) return existing;
   const guid = newGuid();
   if (!entity.has(meta.trait)) entity.add(meta.trait);

@@ -11,8 +11,7 @@
 
 import { isSimRunning } from './playState';
 import { isTimelinePreviewActive } from './timelinePreview';
-import { getCurrentWorld } from './ecs/world';
-import { EntityAttributes } from './traits/EntityAttributes';
+import { getCurrentWorld, findEntityByGuid } from './ecs/world';
 import { emit as emitJournal } from './journal';
 import type { FieldHint } from './ecs/traitRegistry';
 import type { Entity, World } from 'koota';
@@ -184,11 +183,10 @@ export function dispatchUIAction(name: string, opts?: DispatchOptions): unknown 
   }
   const world = getCurrentWorld();
   let target: Entity | undefined = opts?.target;
-  if (!target && opts?.targetGuid) {
-    world.query(EntityAttributes).updateEach(([attr]: any[], entity: any) => {
-      if (attr.guid === opts.targetGuid) target = entity;
-    });
-  }
+  // Through findEntityByGuid, not a scan of current guid strings: a RUNTIME guid an agent read
+  // before a save re-minted the entity still names it there (#1210), and a scan would hand the
+  // handler `target: undefined` while the caller's own pre-check said the target resolved.
+  if (!target && opts?.targetGuid) target = findEntityByGuid(opts.targetGuid, world);
   // Returned so applyBindings' input lock (#466) can hold open until an async handler
   // settles (duck-typed there, not by static type). Every other caller keeps discarding it,
   // which is exactly what `unknown` allows.
@@ -220,11 +218,10 @@ export function dispatchGameAction(name: string, opts?: DispatchOptions): boolea
   if (!def) { console.warn(`[gameAction] No handler for "${name}"`); return false; }
   const world = getCurrentWorld();
   let target: Entity | undefined = opts?.target;
-  if (!target && opts?.targetGuid) {
-    world.query(EntityAttributes).updateEach(([attr]: any[], entity: any) => {
-      if (attr.guid === opts.targetGuid) target = entity;
-    });
-  }
+  // Through findEntityByGuid, not a scan of current guid strings: a RUNTIME guid an agent read
+  // before a save re-minted the entity still names it there (#1210), and a scan would hand the
+  // handler `target: undefined` while the caller's own pre-check said the target resolved.
+  if (!target && opts?.targetGuid) target = findEntityByGuid(opts.targetGuid, world);
   def.handler({ payload: opts?.payload, params: normaliseParams(def, opts?.params), target, world, emit: (type, payload) => emitJournal(type, payload, world) });
   return true;
 }

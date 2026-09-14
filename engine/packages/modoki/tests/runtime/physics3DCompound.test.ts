@@ -4,6 +4,7 @@
  *  the same body with a single centered collider drops through. A collision on a CHILD collider
  *  resolves to the CHILD entity (event mapping). 3D is Y-up → gravity pulls toward −Y. */
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
+import { entityRef } from '../../src/runtime/core/journal';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
 import { SYSTEM_PRIORITY } from '../../src/runtime/core/pipeline';
 import { Transform } from '../../src/runtime/core/traits/Transform';
@@ -62,12 +63,14 @@ describe('physics3D — compound colliders', () => {
     const footIds = [-1.5, 1.5].map((fx) =>
       tw!.spawn(Transform({ x: fx, y: 0, z: 0 }),
         Collider3D({ shape: 'box', halfW: 0.4, halfH: 0.2, halfD: 0.4, friction: 0.9 }),
-        EntityAttributes({ parentId: body.id() })).id());
+        EntityAttributes({ parentId: body.id() })));
+    // Journal refs name an entity by guid — a runtime guid for these unsaved spawns (#1210).
+    const footRefs = footIds.map((e) => entityRef(e));
     tw.step(180);
     const collisions = tw.events({ type: '@collision' });
     const involvesFoot = collisions.some((e) => {
-      const p = e.payload as { a: number; b: number };
-      return footIds.includes(p.a) || footIds.includes(p.b);
+      const p = e.payload as { a: string; b: string };
+      return footRefs.includes(p.a) || footRefs.includes(p.b);
     });
     expect(involvesFoot).toBe(true);
   });

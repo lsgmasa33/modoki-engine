@@ -10,7 +10,7 @@
  *  or the `EntityAttributes.guid`. New entities get the next free numeric id and
  *  a fresh guid. */
 
-import { newGuid } from '../core/assetRefRules';
+import { newGuid, durableGuid, findRuntimeGuids } from '../core/assetRefRules';
 import { parentWorldTrs, localToWorldTrs, worldToLocalTrs, mergeTrs, persistedTrsKeys, collapsedParentAxes, type TRS } from './transformSpace';
 
 /** Minimal on-disk entity shape (matches editor SerializedEntity / runtime
@@ -187,9 +187,12 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
           : {};
         traits.EntityAttributes = {
           name: op.name ?? existingAttrs.name ?? `Entity ${id}`,
-          guid: existingAttrs.guid ?? mint(),
           parentId: op.parentId ?? existingAttrs.parentId ?? 0,
           ...existingAttrs,
+          // After the spread, so a caller's guid cannot override it: an EMPTY one would leave the
+          // entity unaddressable, and a RUNTIME one (#1210) — copied from a live-world read — is
+          // valid only until reload and must never reach a file.
+          guid: durableGuid(existingAttrs.guid as string) || mint(),
           // re-apply the canonical name/parentId in case existingAttrs lacked them
           ...(op.name ? { name: op.name } : {}),
           ...(op.parentId != null ? { parentId: op.parentId } : {}),
@@ -237,6 +240,23 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
     } catch (e) {
       errors.push(`${where}: ${String(e)}`);
     }
+  }
+
+  // Tripwire (#1210): a runtime guid is a LIVE-world address, valid only until reload, and this
+  // edits the FILE. One arrives when an agent copies a guid from a live read (scene-state, a
+  // journal event) into a ref field, a parentId or an authored string. Refuse the whole write —
+  // `changed = 0` is what the route reads as "leave the file untouched" — rather than persist an
+  // address that names a different entity next session. Checked after every op, so it cannot
+  // matter which op introduced it.
+  const runtimeHits = findRuntimeGuids(scene.entities);
+  if (runtimeHits.length > 0) {
+    for (const h of runtimeHits.slice(0, 5)) {
+      errors.push(`entities.${h.path}: '${h.guid}' is a RUNTIME guid — a live-world address valid only `
+        + `until reload, so it cannot be written to a scene file. Save the live world first (modoki_save_all) `
+        + `so the entity gets a durable guid, then use that.`);
+    }
+    changed = 0;
+    created.length = 0; // nothing is written, so nothing was created
   }
 
   return { scene, changed, errors, warnings, unresolved, ...(created.length ? { created } : {}), ...(codeOut.code ? { code: codeOut.code } : {}) };

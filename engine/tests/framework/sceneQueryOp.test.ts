@@ -150,6 +150,36 @@ describe('scene-query: hits are addressed by GUID, not by runtime id', () => {
     expect(r.options).toEqual(['dup-a', 'dup-b']);
   });
 
+  it('an ambiguous exclude over CODE-SPAWNED bodies offers their runtime guids, and each one works as exclude (#1207)', async () => {
+    tw = createTestWorld({ systems: [PHYS3] });
+    tw.spawn(Physics3D({ gravityX: 0, gravityY: -9.81, gravityZ: 0 }));
+    for (const x of [-5, 5]) {
+      tw.spawn(EntityAttributes({ name: 'Crate' }), Transform({ x, y: 0, z: 0 }),
+        RigidBody3D({ bodyType: 'static' }), Collider3D({ shape: 'box', halfW: 1, halfH: 1, halfD: 1 }));
+    }
+    tw.step(1);
+    const r = await q({ kind: 'raycast', dim: '3d', origin: [0, 10, 0], direction: [0, -1, 0], exclude: 'Crate' });
+    expect(r.code).toBe('AMBIGUOUS');
+    const options = r.options as string[];
+    expect(options).toHaveLength(2);
+    for (const option of options) {
+      expect(option).not.toMatch(/^id:/);
+      const again = await q({ kind: 'raycast', dim: '3d', origin: [0, 10, 0], direction: [0, -1, 0], exclude: option });
+      expect(again.ok, `exclude:${option}`).toBe(true); // the option the refusal offered is accepted
+    }
+  });
+
+  it('an ambiguous exclude never offers an `id:<n>` — exclude cannot take one (#1207)', async () => {
+    floorWorld3D();
+    tw!.spawn(EntityAttributes({ name: 'Floor' }), Transform({ x: 50, y: 0, z: 0 })); // a second, with a runtime guid
+    const late = tw!.spawn(Transform({ x: 60, y: 0, z: 0 }));
+    late.add(EntityAttributes({ name: 'Floor' })); // added after spawn: the mint never saw it, no guid
+    const r = await q({ kind: 'raycast', dim: '3d', origin: [0, 10, 0], direction: [0, -1, 0], exclude: 'Floor' });
+    expect(r.code).toBe('AMBIGUOUS');
+    expect((r.options as string[]).some((o) => o.startsWith('id:'))).toBe(false);
+    expect(r.options).toHaveLength(2); // the two that HAVE an address
+  });
+
   it('an exclude that matches nothing refuses rather than silently casting unfiltered', async () => {
     floorWorld3D();
     const r = await q({ kind: 'raycast', dim: '3d', origin: [0, 10, 0], direction: [0, -1, 0], exclude: 'Nope' });

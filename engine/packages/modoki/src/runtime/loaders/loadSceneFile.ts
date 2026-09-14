@@ -5,6 +5,7 @@ import { getCurrentWorld, spawnEntity, indexEntityGuid, findEntityById, findEnti
 import { getAllTraits, getTraitByName } from '../core/ecs/traitRegistry';
 import { loadModelTemplates, getCachedPrefab } from './meshTemplateCache';
 import { isGuid, isExternalUrl, resolveRef, getAssetType, deriveGuid, newGuid, getAssetEntry, type AssetType } from './assetManifest';
+import { durableGuid } from '../core/assetRefRules';
 import { parseEntryPrefabs } from '../traits/UIEntries';
 import { markUIDirty } from '../ui/uiTreeStore';
 import { markOverride, clearOverrideMarks, clearAllOverrideMarks } from './overrideMarks';
@@ -777,7 +778,8 @@ export function deriveInstanceMemberGuids(world: World): void {
     // instances share inner localIds, so without this their members would collide.
     const pi = hasPI ? (e.get(piMeta.trait) as { localId?: number; parentLocalId?: number }) : null;
     const stepId = pi ? (pi.parentLocalId || pi.localId || 0) : 0;
-    rows.set(e.id(), { handle: e, origGuid: ea.guid || '', parentId: ea.parentId ?? 0, stepId, hasPI });
+    // durableGuid: a runtime guid (#1210) is neither an identity to keep nor an anchor to derive from.
+    rows.set(e.id(), { handle: e, origGuid: durableGuid(ea.guid), parentId: ea.parentId ?? 0, stepId, hasPI });
   }
 
   for (const [id, row] of rows) {
@@ -998,7 +1000,7 @@ export function spawnPrefabInstance(
   for (const e of world.entities) { if ((e as EntityHandle).id() === rootEcsId) { root = e as EntityHandle; break; } }
   if (attrMeta && root?.has(attrMeta.trait)) {
     const ea = root.get(attrMeta.trait) as Record<string, unknown>;
-    if (!ea.guid) {
+    if (!durableGuid(ea.guid as string)) { // a runtime guid (#1210) must not pre-empt guidSeed
       const guid = opts.guidSeed ? deriveGuid(opts.guidSeed) : newGuid();
       root.set(attrMeta.trait, { ...ea, guid }); indexEntityGuid(root, world);
     }

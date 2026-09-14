@@ -199,6 +199,9 @@ with fixed dt, `EMA(constant) = constant`, so `visualDelta == simDelta` and runs
   - register the game's logic systems (via its `GameDefinition.registerSystems()`),
     **render systems excluded** (no Three/Pixi);
   - install `manualClock` + seeded `rng` + fresh `journal`; `setPlayState('playing')`.
+  - save the runtime-guid generation counter and restore it on `dispose()` (#1210), so two
+    identical runs mint identical entity guids. Restored, never zeroed: a world created before the
+    test world may still hold a generation ([engine-concepts.md](engine-concepts.md) § Entity identity).
 - API: `game.step(n, dt?)`, `game.dispatch(intent, payload)`, `game.events(filter?)`,
   `game.trait(Trait, entity)`, `game.query(...)`, `game.setTimeScale(scale)`.
 - **Risk to solve here:** `registerSystem` uses a **module-global** `systems[]` array — two

@@ -1,6 +1,7 @@
 /** Editor state — separate from game state. Tracks selection, mode, etc. */
 
 import type { EntityPin } from '../../runtime/core/ecs/entityPin';
+import { durableGuid } from '../../runtime/core/assetRefRules';
 import { create } from 'zustand';
 import { pushSelectionChange, isExecutingUndoRedo } from '../undo/undoManager';
 import { entityRef, buildGuidIndex, resolveWith, type EntityRef } from '../undo/entityRef';
@@ -914,7 +915,8 @@ export const useEditorStore = create<EditorState>((set, get) => {
   openParticleEditor: (asset) => set((s) => ({ editingParticleAsset: asset, editingParticleDef: null, particleEditNonce: s.particleEditNonce + 1 })),
   openPanel: (id) => set((s) => ({ panelOpenRequest: { id, nonce: (s.panelOpenRequest?.nonce ?? 0) + 1 } })),
   setCameraGizmoShown: (guid, on) => set((s) => {
-    if (!guid) return {};
+    // Durable only: a runtime guid (#1210) is re-issued to another entity next session.
+    if (!durableGuid(guid)) return {};
     const next = new Set(s.cameraGizmoShown);
     if (on) next.add(guid); else next.delete(guid);
     saveCamGizmoShown(next);

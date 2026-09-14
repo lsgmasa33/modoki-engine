@@ -190,6 +190,49 @@ pass that rebuilt it (`entityIndex.ts`). One rebuilt at one priority and read at
 **In serialized data and event payloads, use the GUID, never the id** — runtime ids are reassigned
 on every scene hot-reload.
 
+#### Entity identity: durable guid vs runtime guid (#1210)
+
+`EntityAttributes.guid` is the entity's **address** — what every guid-addressed tool, journal ref
+and entity-ref field takes. It comes in two kinds, and the difference is lifetime:
+
+- **Durable** — a v4 (or `deriveGuid`) guid written to the scene file. Survives reload, scene swaps
+  and saves. Loaded entities have one; the save pre-pass mints one for everything it writes.
+- **Runtime** — `00000000-GGGG-GGGG-0000-NNNNNNNNNNNN` (`isRuntimeGuid`). `spawnEntity` mints one
+  for any entity spawned with EntityAttributes and an empty guid, or with a runtime guid it was
+  COPIED with. So a shot, a board cell or an imported model part is addressable by guid from the
+  frame it spawns. **Valid only until its world is swapped out.**
+  - **N** counts the MINTS in the world (a spawn that already carries a durable guid takes no
+    number), so the same sequence of spawns — the same order AND the same mix of authored and empty
+    guids — yields the same guids, and replays and journals stay comparable. **G** is a generation this engine owns, assigned once
+    per World. ⚠️ It is never koota's world id or entity generation: koota reuses both across a swap,
+    so either would let an old guid name an entity in the new world instead of missing.
+  - `findEntityByGuid` resolves one through a per-world address table
+    (`core/ecs/world.ts`). A stale one misses in O(1). One whose entity a save has since given a
+    durable guid still resolves to that entity, so an agent's handle survives `save_all` — in every
+    lookup that goes THROUGH `findEntityByGuid`. ⚠️ A lookup that scans `EntityAttributes.guid` for
+    an equal string does not follow it, so a live entity lookup by guid uses `findEntityByGuid`.
+  - `createTestWorld` saves the generation on create and restores it on dispose, so identical harness
+    runs mint identical guids.
+
+Three rules follow:
+- **A runtime guid is never persisted.** Anything that treats a non-empty guid as "this entity
+  already has an identity" reads it through `durableGuid(g)` (`''` for empty or runtime), and mints a
+  durable guid over it: the save pre-pass, `ensureGuid`, `markPersistent`, `spawnPrefabInstance`
+  (a `guidSeed` still wins), `deriveInstanceMemberGuids` (never an anchor), and the stores that
+  outlive the process (Hierarchy collapse, camera-gizmo toggle, last animation clip). The save also
+  rewrites a guid-STRING ref pointing at a live entity's runtime guid to that entity's durable guid.
+  The tripwires are `assertNoRuntimeGuids` (console.error in the editor, a throw under vitest),
+  `applyOps` refusing a file write that carries one, and `tests/assets/noRuntimeGuidsOnDisk.test.ts`
+  over the committed corpus.
+- **A guid is an address, not a lifetime key** — the rule is stated once, above (#1198). Runtime guids
+  add a second reason to it: a COPY is re-minted, so a guid-keyed cache loses an entity that was only
+  carried or respawned.
+- **No guid at all** is now reachable only for an entity whose EntityAttributes was added after
+  spawn, or one with no EntityAttributes. Replies report `guid: null` for it
+  ([mcp-tool-conventions.md](mcp-tool-conventions.md) §3).
+
+The Inspector's entity header shows which kind an entity has (`editor/panels/entityGuidLabel.ts`).
+
 ### Component (Trait)
 A **component** is a bag of typed data attached to an entity. In koota's
 vocabulary (and ours) it's called a **trait**. Two kinds:

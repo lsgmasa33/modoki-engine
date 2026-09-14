@@ -14,6 +14,7 @@ import { createTestWorld, type TestWorld, Transform, EntityAttributes,
   getCurrentWorld, setCurrentWorld, setTimeScale, getTimeScale, sceneManager, reparentRefusal,
   stepOneFrame } from '@modoki/engine/runtime';
 import { updateContactIndex } from '../../packages/modoki/src/runtime/physics/physicsContactIndex';
+import { isRuntimeGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { createWorld } from 'koota';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { runAgentOp, hasAgentOp, listAgentOps, relayResponseFor, registerRelayResponder, simStepDefaultTimeout, SIM_STEP_MAX_TIMEOUT_MS, inferAssetDefType } from '../../app/debug/agentBridge';
@@ -46,6 +47,8 @@ describe('create-entity (runtime twin)', () => {
     // An agent told only a numeric id has an address that expires on the next scene reload.
     expect(r.guid).toBeTruthy();
     expect(r.guid).not.toBe(String(r.id));
+    // …and DURABLE (#1210): spawnEntity gave it a runtime guid, which a Play→Stop revert kills.
+    expect(isRuntimeGuid(r.guid)).toBe(false);
     expect(r.saved).toBe(false);
   });
 
@@ -448,59 +451,84 @@ describe('lifecycle: findings from the close-out review', () => {
   });
 });
 
-/** #1199 — an entity with no minted guid used to report `String(id)` as its guid. That value looks
- *  addressable and every guid-addressed op refuses it (a guid-less entity is not in the guid index),
- *  so each producer must say `null` instead. One case per producer: they were four copies once. */
-describe('a guid-less entity reports guid:null, never its id disguised as a guid (#1199)', () => {
+/** #1199, reshaped by #1210. A live id reported as a guid is not addressable: every guid-addressed op
+ *  refuses it. #1199 made each producer say `null` for a guid-less entity instead. #1210 then made a
+ *  guid-less NAMED entity impossible: `spawnEntity` mints a RUNTIME guid for any entity spawned with
+ *  EntityAttributes, so the rows now carry an address that RESOLVES. `null` remains only for an entity
+ *  with no EntityAttributes at all. One case per producer: they were four copies once. */
+describe('reply rows carry an address that resolves, never an id disguised as a guid (#1199, #1210)', () => {
   type Row = { id: number; guid: string | null; name: string };
   type StateReply = { entities: Row[] };
 
-  it('scene-state INDEX and FULL rows carry null, and the id-shaped value resolves nothing', async () => {
+  it('scene-state INDEX and FULL rows carry the runtime guid, it resolves, and the id-shaped value does not', async () => {
     game = createTestWorld({});
     const bare = game.spawn(Transform({ x: 0 }), EntityAttributes({ name: 'Bare' }));
     game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'real', name: 'Real' }));
 
+    let reported = '';
     for (const params of [{}, { full: true }]) {
       const s = await runAgentOp('scene-state', params) as StateReply;
       const row = s.entities.find((e) => e.name === 'Bare')!;
       expect(row.id).toBe(bare.id());
-      expect(row.guid).toBeNull();
+      expect(isRuntimeGuid(row.guid)).toBe(true);
+      reported = row.guid!;
       expect(s.entities.find((e) => e.name === 'Real')!.guid).toBe('real');
     }
-    // The premise of the bug, pinned: the old reported value is not an address.
+    // The address it reports is an address: it finds exactly that entity.
+    const byReported = await runAgentOp('scene-state', { guid: reported }) as StateReply;
+    expect(byReported.entities.map((e) => e.id)).toEqual([bare.id()]);
+    // The premise of #1199, still pinned: the id is not an address.
     const byOldValue = await runAgentOp('scene-state', { guid: String(bare.id()) }) as StateReply;
     expect(byOldValue.entities).toEqual([]);
   });
 
-  it('contacts list a guid-less partner as `id:<n>` — a bare null would lose WHICH body it is', async () => {
+  it('contacts name a code-spawned partner by its runtime guid, and an EntityAttributes-less one as `id:<n>`', async () => {
     game = createTestWorld({});
     const ball = game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'ball', name: 'Ball' }));
     const floor = game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'floor', name: 'Floor' }));
     const debris = game.spawn(Transform({ x: 0 }), EntityAttributes({ name: 'Debris' }));
+    const bare = game.spawn(Transform({ x: 0 })); // no EntityAttributes: un-guidable
     // The index takes PACKED entities (`valueOf()`, #868) and reports partner ids.
     updateContactIndex(getCurrentWorld(), ball.valueOf(), floor.valueOf(), false, 'enter');
     updateContactIndex(getCurrentWorld(), ball.valueOf(), debris.valueOf(), false, 'enter');
+    updateContactIndex(getCurrentWorld(), ball.valueOf(), bare.valueOf(), false, 'enter');
 
     const s = await runAgentOp('scene-state', { guid: 'ball', contacts: true }) as
       { entities: Array<{ contacts?: string[] }> };
-    expect(s.entities[0].contacts?.sort()).toEqual(['floor', `id:${debris.id()}`]);
+    const debrisGuid = (debris.get(EntityAttributes) as { guid: string }).guid;
+    expect(isRuntimeGuid(debrisGuid)).toBe(true);
+    expect(s.entities[0].contacts?.sort()).toEqual(['floor', debrisGuid, `id:${bare.id()}`].sort());
   });
 
-  it('set-traits readback rows carry null for a guid-less target', async () => {
+  it('set-traits readback rows carry the runtime guid of a code-spawned target, and null for an un-guidable one', async () => {
     game = createTestWorld({});
-    const bare = game.spawn(Transform({ x: 0 }), EntityAttributes({ name: 'Bare' }));
-    const r = await runAgentOp('set-traits', { id: bare.id(), set: { 'Transform.x': 3 } }) as
+    const named = game.spawn(Transform({ x: 0 }), EntityAttributes({ name: 'Bare' }));
+    const r = await runAgentOp('set-traits', { id: named.id(), set: { 'Transform.x': 3 } }) as
       { ok?: boolean; entities?: Row[] };
     expect(r.ok).not.toBe(false);
-    expect(r.entities?.[0].guid).toBeNull();
+    expect(r.entities?.[0].guid).toBe((named.get(EntityAttributes) as { guid: string }).guid);
+    expect(isRuntimeGuid(r.entities?.[0].guid)).toBe(true);
+
+    const bare = game.spawn(Transform({ x: 0 }));
+    const r2 = await runAgentOp('set-traits', { id: bare.id(), set: { 'Transform.x': 3 } }) as
+      { ok?: boolean; entities?: Row[] };
+    expect(r2.ok).not.toBe(false);
+    expect(r2.entities?.[0].guid).toBeNull();
   });
 
-  it('delete-entities by id reports null for a guid-less entity', async () => {
+  it('delete-entities by id reports the runtime guid, and null for an un-guidable entity', async () => {
     game = createTestWorld({});
-    const bare = game.spawn(Transform({ x: 0 }), EntityAttributes({ name: 'Bare' }));
-    const r = await runAgentOp('delete-entities', { id: bare.id() }) as { ok?: boolean; guids?: Array<string | null> };
+    const named = game.spawn(Transform({ x: 0 }), EntityAttributes({ name: 'Bare' }));
+    const namedGuid = (named.get(EntityAttributes) as { guid: string }).guid;
+    const r = await runAgentOp('delete-entities', { id: named.id() }) as { ok?: boolean; guids?: Array<string | null> };
     expect(r.ok).not.toBe(false);
-    expect(r.guids).toEqual([null]);
+    expect(isRuntimeGuid(namedGuid)).toBe(true);
+    expect(r.guids).toEqual([namedGuid]);
+
+    const bare = game.spawn(Transform({ x: 0 }));
+    const r2 = await runAgentOp('delete-entities', { id: bare.id() }) as { ok?: boolean; guids?: Array<string | null> };
+    expect(r2.ok).not.toBe(false);
+    expect(r2.guids).toEqual([null]);
   });
 });
 

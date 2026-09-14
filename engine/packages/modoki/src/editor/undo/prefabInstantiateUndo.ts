@@ -21,6 +21,7 @@ import { reportUndoFailure } from './undoFailure';
 import { getAllEntities, readTraitData, writeTraitField, findEntity, type EntityInfo }
   from '../../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
+import { durableGuid } from '../../runtime/core/assetRefRules';
 import { findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
 
 /** Structural address of one entity within an instantiated subtree, e.g.
@@ -73,7 +74,9 @@ function captureSubtreeGuids(rootId: number): Map<SubtreePath, string> {
   const out = new Map<SubtreePath, string>();
   if (!eaMeta) return out;
   for (const { id, path } of subtreePaths(rootId, getAllEntities())) {
-    const guid = (readTraitData(id, eaMeta)?.guid as string) || '';
+    // Durable only (#1210): a runtime guid belongs to the world it was minted in, so stamping it back
+    // onto a respawn would keep a dead address alive instead of the respawn's own.
+    const guid = durableGuid(readTraitData(id, eaMeta)?.guid as string);
     if (guid) out.set(path, guid);
   }
   return out;

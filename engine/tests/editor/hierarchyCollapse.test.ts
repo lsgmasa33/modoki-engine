@@ -16,6 +16,7 @@ import {
   needsCollapseRestore, shouldPersistCollapse, ENTITY_COLLAPSE_LS_KEY, type CollapseOwner,
   type CollapseNode,
 } from '../../packages/modoki/src/editor/panels/hierarchyCollapse';
+import { formatRuntimeGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 
 const A = 'scenes/Alpha.json';
 const B = 'scenes/Beta.json';
@@ -190,5 +191,28 @@ describe('ownership — the #839 mechanism', () => {
     owner = own(W2, A);                                     // the settled refresh finally lands
     expect(shouldPersistCollapse(owner, W2, A)).toBe(true);
     expect(needsCollapseRestore(owner, W2, A)).toBe(false);
+  });
+});
+
+/** #1210: collapse state is saved to localStorage and read back next session, when the spawn
+ *  counter has restarted — so a runtime guid would collapse whichever entity gets that address. */
+describe('collapse persistence ignores runtime guids (#1210)', () => {
+  const rg = formatRuntimeGuid(1, 3);
+  const tree = (): CollapseNode[] => {
+    const out: CollapseNode[] = [];
+    for (let p = 1; p <= 3; p++) {
+      out.push({ id: p, parentId: null, guid: p === 1 ? rg : `g-${p}` });
+      out.push({ id: p * 10, parentId: p, guid: `g-${p * 10}` });
+      out.push({ id: p * 10 + 1, parentId: p, guid: `g-${p * 10 + 1}` });
+    }
+    return out;
+  };
+
+  it('never saves a runtime guid', () => {
+    expect(collapsedIdsToGuids(tree(), new Set([1, 2]))).toEqual(['g-2']);
+  });
+
+  it('never restores a row by a runtime guid, even when the saved list holds one', () => {
+    expect([...computeRestoredCollapse(tree(), [rg, 'g-2'])]).toEqual([2]);
   });
 });

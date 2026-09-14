@@ -6,7 +6,7 @@ import { hasDocKey } from '../../runtime/core/docKeys';
 import { orderEntitiesForSave } from '../../runtime/core/ecs/entityOrder';
 import { getAuthoredWritesWhileStopped, clearAuthoredWritesWhileStopped } from '../../runtime/core/ecs/authoredWrites';
 import { Transient } from '../../runtime/core/traits/Transient';
-import { spawnEntity } from '../../runtime/core/ecs/world';
+import { spawnEntity, findEntityByGuid } from '../../runtime/core/ecs/world';
 import { Camera } from '../../runtime/traits/Camera';
 import { Transform } from '../../runtime/core/traits/Transform';
 import { EntityAttributes } from '../../runtime/core/traits/EntityAttributes';
@@ -26,7 +26,8 @@ import { captureInstanceOverrides, captureInstanceStructure, getPrefabSource, ge
 import type { AddedEntity, NestedOverridePaths } from '../../runtime/loaders/loadSceneFile';
 import { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, collectResourceRefsFromEntities, SceneFormatRefusedError } from '../../runtime/loaders/loadSceneFile';
 import { newGuid, isInternalAssetPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
-import { isGuid } from '../../runtime/core/assetRefRules';
+import { isGuid, durableGuid, isRuntimeGuid } from '../../runtime/core/assetRefRules';
+import { assertNoRuntimeGuids } from './runtimeGuidTripwire';
 import { clearAllSceneDirty, clearSceneDirty, dirtySceneGuidsSnapshot, hasDirtyScenes, isSceneDirty } from './sceneDirty';
 import { WHITE_HDR_GUID } from '../../runtime/assets/builtinAssets';
 import { REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
@@ -188,6 +189,26 @@ function resolveEffectivePrefabOverride(
 import { isTraitDefault } from './traitDefault';
 export { isTraitDefault };
 
+/** Whether a PRIMARY-scene save skips this entity: it or an ancestor is `Transient`, or it or an
+ *  ancestor came from a base scene (`sourceScene` non-empty). The same two exclusions
+ *  `serializeScene` applies below (a Transient root and its subtree; a foreign entity and its
+ *  subtree) — asked of one entity, for a caller that must not promise a save does something to it
+ *  (the Inspector's guid label, #1210). Walks `parentId`; cycle-guarded. */
+export function isSkippedByPrimarySave(entityId: number): boolean {
+  const seen = new Set<number>();
+  let id = entityId;
+  while (id && !seen.has(id)) {
+    seen.add(id);
+    const e = findEntity(id);
+    if (!e) return false;
+    if (e.has(Transient)) return true;
+    const ea = e.has(EntityAttributes) ? (e.get(EntityAttributes) as { parentId?: number; sourceScene?: string }) : undefined;
+    if (ea?.sourceScene) return true;
+    id = ea?.parentId ?? 0;
+  }
+  return false;
+}
+
 export async function serializeScene(opts?: {
   assignGuids?: boolean;
   scene?: { path: string; guid: string };
@@ -262,7 +283,9 @@ export async function serializeScene(opts?: {
       const entity = findEntity(info.id);
       if (!entity || !entity.has(eaMeta.trait)) continue;
       const data = entity.get(eaMeta.trait) as Record<string, unknown>;
-      if (!data.guid || data.guid === '') {
+      // A RUNTIME guid (#1210) is an address valid only until reload, so it counts as no guid:
+      // saving one would hand a later session's spawn counter a collision.
+      if (!durableGuid(data.guid as string)) {
         const guid = newGuid();
         mintedGuids.set(info.id, guid);
         if (opts?.assignGuids) entity.set(eaMeta.trait, { ...data, guid });
@@ -278,7 +301,8 @@ export async function serializeScene(opts?: {
   const guidForId = (id: number): string => {
     if (!id || !eaMeta) return '';
     const live = findEntity(id)?.get(eaMeta.trait) as { guid?: string } | undefined;
-    if (live?.guid) return live.guid;
+    const durable = durableGuid(live?.guid);
+    if (durable) return durable;
     return mintedGuids.get(id) || '';
   };
 
@@ -464,7 +488,7 @@ export async function serializeScene(opts?: {
         // it's live on the entity; on the snapshot path it's in mintedGuids.
         if (eaMeta) {
           const live = findEntity(info.id)?.get(eaMeta.trait) as { guid?: string } | undefined;
-          const rootGuid = (live?.guid && live.guid !== '' ? live.guid : undefined) ?? mintedGuids.get(info.id);
+          const rootGuid = durableGuid(live?.guid) || mintedGuids.get(info.id);
           if (rootGuid) entry.guid = rootGuid;
         }
         // Persist the PLACEMENT parent for a REPARENTED instance (parent isn't the
@@ -546,9 +570,10 @@ export async function serializeScene(opts?: {
         // survive a Stop-revert) without having written to the authored world.
         // (Prefab roots route their guid through overrides, not here, and already
         // carry one minted at instantiation — so they never need this.)
-        if (meta.name === 'EntityAttributes' && !traitData.guid) {
+        if (meta.name === 'EntityAttributes' && !durableGuid(traitData.guid as string)) {
           const minted = mintedGuids.get(info.id);
           if (minted) traitData.guid = minted;
+          else delete traitData.guid; // never write a runtime guid (#1210)
         }
         // Write parentId as the parent's stable GUID ('' for root) rather than the
         // live koota id, so the hierarchy survives a world rebuild without the
@@ -585,6 +610,26 @@ export async function serializeScene(opts?: {
   // internal asset path before it's written to disk, instead of silently
   // healing it (which is how path refs used to slip through unnoticed).
   for (const entry of entities) assertNoPathRefs(entry);
+  // A guid-STRING ref (Joint2D.entityB, BoneAttachment.target, a UIAction target) holding a live
+  // entity's RUNTIME guid (#1210) — an agent read it from scene-state and wrote it through the live
+  // path, where it resolves. Numeric entityId fields already go through `guidForId`; this is the
+  // same "write the target's stable identity" rule for the string form. Resolved through
+  // `findEntityByGuid`, which still finds an entity whose guid was re-minted by the pre-pass above,
+  // so the ref follows its target to the durable guid being written for it. A runtime guid that
+  // names nothing live (a despawned target, another world) is left alone for the tripwire.
+  const durableForRuntime = (g: string): string | undefined => {
+    const target = findEntityByGuid(g);
+    if (!target || !eaMeta) return undefined;
+    // Snapshot path only: a prefab member or captured added child is written WITHOUT its minted guid
+    // (the structure capture reads the live, still-runtime one and records it unguided), so a ref
+    // rewritten to that mint would name nothing after Stop. Leave it for the tripwire instead. The
+    // save path wrote the mint onto the live entity before capture, so there it is the real guid.
+    if (!opts?.assignGuids && prefabChildIds.has(target.id())) return undefined;
+    const live = durableGuid((target.get(eaMeta.trait) as { guid?: string } | undefined)?.guid);
+    return live || mintedGuids.get(target.id()) || undefined;
+  };
+  for (const entry of entities) rewriteRuntimeGuidStrings(entry, durableForRuntime);
+  assertNoRuntimeGuids(entities, 'a serialized scene');
 
   const resources = collectResourceRefs(entities);
 
@@ -638,6 +683,24 @@ export async function serializeScene(opts?: {
     file.baseScene = _currentBaseScene;
   }
   return file;
+}
+
+/** Replace every runtime guid inside string VALUES of `node` (in place) with `resolve(guid)`, when that
+ *  returns one. Keys are left alone — none is built from an entity ref on this path. */
+function rewriteRuntimeGuidStrings(node: unknown, resolve: (g: string) => string | undefined): void {
+  if (!node || typeof node !== 'object') return;
+  const visit = (v: unknown): unknown => {
+    if (typeof v === 'string') {
+      if (!v.includes('00000000-')) return v;
+      return v.replace(/00000000-[0-9a-f]{4}-[0-9a-f]{4}-0000-[0-9a-f]{12}/gi, (m) => (isRuntimeGuid(m) ? resolve(m) ?? m : m));
+    }
+    if (v && typeof v === 'object') rewriteRuntimeGuidStrings(v, resolve);
+    return v;
+  };
+  if (Array.isArray(node)) { for (let i = 0; i < node.length; i++) node[i] = visit(node[i]); return; }
+  for (const k of Object.keys(node as Record<string, unknown>)) {
+    (node as Record<string, unknown>)[k] = visit((node as Record<string, unknown>)[k]);
+  }
 }
 
 /** Dev guard: console.error if any REF field anywhere in a serialized entity holds an

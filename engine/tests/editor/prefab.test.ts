@@ -7,6 +7,7 @@ import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { getEntityTraits, readTraitData, getAllEntities } from '@modoki/engine/runtime';
 import { getTraitByName } from '@modoki/engine/runtime';
 import { registerAsset } from '@modoki/engine/runtime';
+import { formatRuntimeGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { serializePrefab, instantiatePrefab, getPrefabSource, PREFAB_FORMAT_VERSION, type PrefabFile } from '@modoki/engine/editor';
 import {
   buildPrefabEditScene,
@@ -564,5 +565,14 @@ describe('collectPreservedLocalIds — sentinel read-back', () => {
     // A NaN or 0 entry would collide in serializePrefab's allocator and silently renumber.
     expect(map.has(bad.id())).toBe(false);
     expect(map.has(zero.id())).toBe(false);
+  });
+});
+
+/** #1210: prefab files are persisted, so a runtime guid (valid only until reload) in any string
+ *  field must trip the serializer rather than reach the file. */
+describe('serializePrefab runtime-guid tripwire (#1210)', () => {
+  it('trips when an authored string carries a runtime guid', () => {
+    const e = spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: `points at ${formatRuntimeGuid(0xfffffff0, 202)}` }));
+    expect(() => serializePrefab(e.id())).toThrow(/runtime guid/);
   });
 });

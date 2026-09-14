@@ -20,7 +20,7 @@
 
 import { createWorld, type World } from 'koota';
 import { Time } from '../core/traits/Time';
-import { getCurrentWorld, setCurrentWorld, spawnEntity } from '../core/ecs/world';
+import { getCurrentWorld, setCurrentWorld, spawnEntity, _getRuntimeGuidGeneration, _setRuntimeGuidGeneration } from '../core/ecs/world';
 import { registerSystem, unregisterSystem, SYSTEM_PRIORITY } from '../core/pipeline';
 import { timeSystem } from '../core/timeSystem';
 import { setManualNow, restoreRealClock, restoreRealEpoch } from '../core/clock';
@@ -95,6 +95,8 @@ export function createTestWorld(opts: CreateTestWorldOptions = {}): TestWorld {
   let prevWorld: World | undefined;
   try { prevWorld = getCurrentWorld(); } catch { prevWorld = undefined; }
   const prevPlay: PlayState = getPlayState();
+  // Runtime-guid generation (#1210): restored on dispose so two identical runs mint identical guids.
+  const prevRuntimeGuidGeneration = _getRuntimeGuidGeneration();
 
   const world = createWorld();
   if (opts.scenePath !== undefined) markSceneLoaded(world, opts.scenePath);
@@ -183,6 +185,7 @@ export function createTestWorld(opts: CreateTestWorldOptions = {}): TestWorld {
       setPlayState(prevPlay);
       if (prevWorld) setCurrentWorld(prevWorld);
       world.destroy();
+      _setRuntimeGuidGeneration(prevRuntimeGuidGeneration); // restore, never zero — see world.ts
     },
   };
 

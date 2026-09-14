@@ -4,6 +4,7 @@
 import { describe, it, expect } from 'vitest';
 import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type MutableScene, type MutateOp } from '../../src/runtime/scene/sceneMutate';
 import { validateSceneData, type SceneSchema } from '../../src/runtime/loaders/sceneValidation';
+import { formatRuntimeGuid } from '../../src/runtime/core/assetRefRules';
 
 let guidN = 0;
 const mint = () => `guid-${++guidN}`;
@@ -635,5 +636,43 @@ describe("setTrait {space:'world'} — authoring in world coordinates (file path
     const r = applyOps(scene, [{ op: 'setTrait', entity: { id: 2 }, trait: 'EntityAttributes', space: 'world', fields: { name: 'x' } }]);
     expect(r.errors.join(' ')).toMatch(/'space' applies only to trait 'Transform'/);
     expect(r.changed).toBe(0);
+  });
+});
+
+/** #1210: this edits the scene FILE, and a runtime guid is a LIVE-world address valid only until
+ *  reload. An agent copying one from a live read must not get it written to disk. */
+describe('applyOps — runtime guids never reach the file (#1210)', () => {
+  const rg = formatRuntimeGuid(1, 77);
+
+  it('addEntity mints over a caller-supplied runtime guid, and over an empty one', () => {
+    const scene = freshScene();
+    const res = applyOps(scene, [
+      { op: 'addEntity', name: 'FromLive', traits: { EntityAttributes: { guid: rg } } },
+      { op: 'addEntity', name: 'Blank', traits: { EntityAttributes: { guid: '' } } },
+    ], mint);
+    expect(res.errors).toEqual([]);
+    const guidOf = (name: string) => (scene.entities.find((e) => e.name === name)!.traits.EntityAttributes as { guid: string }).guid;
+    expect(guidOf('FromLive')).toBe('guid-1');
+    expect(guidOf('Blank')).toBe('guid-2');
+    expect(res.created?.map((c) => c.guid)).toEqual(['guid-1', 'guid-2']); // the reply names what was written
+  });
+
+  it('refuses the whole write when any field would carry a runtime guid', () => {
+    const scene = freshScene();
+    const res = applyOps(scene, [
+      { op: 'setTrait', entity: { name: 'Child' }, trait: 'Transform', fields: { x: 5 } },
+      { op: 'setTrait', entity: { name: 'Root' }, trait: 'UIAction', fields: { bindings: [{ target: rg }] } },
+    ], mint);
+    expect(res.changed).toBe(0); // the route writes only when changed > 0
+    expect(res.errors.join('\n')).toMatch(/RUNTIME guid/);
+  });
+
+  it('a refused write reports no created entity — none was written', () => {
+    const scene = freshScene();
+    const res = applyOps(scene, [
+      { op: 'addEntity', name: 'Holder', traits: { UIAction: { bindings: [{ target: rg }] } } },
+    ], mint);
+    expect(res.changed).toBe(0);
+    expect(res.created ?? []).toEqual([]);
   });
 });

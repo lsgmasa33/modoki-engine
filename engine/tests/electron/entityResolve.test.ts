@@ -20,6 +20,7 @@ const collectScreenBounds = vi.fn();
 // exercising the old `occlusionScope:'canvas'` fallback unchanged — only the tests that opt in by
 // setting a return value exercise the new `'entity'` scope.
 const pickAt = vi.fn();
+const findEntityByGuid = vi.fn();
 // ⚠️ **The tap-zone veto is imported for REAL, not stubbed** (#1016). `resolveTapZoneVeto` is
 // `pressOrigin.ts`'s own banner-described "part with the decisions in it" — the ancestor rule, the
 // owner rule, the first-non-zone rule — and a fake would make every case below assert this file's
@@ -37,6 +38,7 @@ vi.mock('@modoki/engine/runtime', () => ({
   getAllEntities: (...a: unknown[]) => getAllEntities(...a),
   collectScreenBounds: (...a: unknown[]) => collectScreenBounds(...a),
   pickAt: (...a: unknown[]) => pickAt(...a),
+  findEntityByGuid: (...a: unknown[]) => findEntityByGuid(...a),
   resolveTapZoneVeto: (...a: unknown[]) => (resolveTapZoneVeto as (...x: unknown[]) => unknown)(...a),
   // The REAL constants, not string copies: this file already has them in scope from the
   // `importActual` above, and a hand-synced duplicate of a value you are holding is the
@@ -109,6 +111,35 @@ describe('addressing', () => {
     // QA-TOOL-0003: the machine-readable twin of the same refusal — was REFUSED_BY_OP,
     // indistinguishable from any other refusal without string-matching `error`.
     expect(r.code).toBe('AMBIGUOUS');
+  });
+
+  it('lists only guids when refusing an ambiguous name — never an `id:<n>` it would not accept (#1207)', () => {
+    getAllEntities.mockReturnValue([
+      { id: 1, name: 'Shot', guid: '00000000-0000-0002-0000-000000000001', layer: '3d' },
+      { id: 2, name: 'Shot', guid: '00000000-0000-0002-0000-000000000002', layer: '3d' },
+      { id: 3, name: 'Shot', guid: '', layer: '3d' }, // EntityAttributes added after spawn: no address
+    ]);
+    const r = resolveEntityPointReport({ name: 'Shot', surface: 'game-3d' });
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('(00000000-0000-0002-0000-000000000001, 00000000-0000-0002-0000-000000000002)');
+    expect(r.error).not.toMatch(/id:/);
+  });
+
+  it('when no ambiguous match has a guid, says to address by id rather than listing nothing (#1207)', () => {
+    getAllEntities.mockReturnValue([
+      { id: 1, name: 'Late', guid: '', layer: '3d' },
+      { id: 2, name: 'Late', guid: '', layer: '3d' },
+    ]);
+    const r = resolveEntityPointReport({ name: 'Late', surface: 'game-3d' });
+    expect(r.error).toContain('none has a guid, so address one by id');
+    expect(r.error).not.toContain('()');
+  });
+
+  it('resolves a runtime guid a save has since replaced, through findEntityByGuid (#1210)', () => {
+    stubTopmost(document.createElement('canvas'));
+    findEntityByGuid.mockImplementation((g: string) => (g === '00000000-0000-0002-0000-000000000007' ? { id: () => 7 } : undefined));
+    expect(resolveEntityPointReport({ guid: '00000000-0000-0002-0000-000000000007', surface: 'game-3d' }))
+      .toMatchObject({ ok: true, entity: { id: 7, guid: 'g-puck' } });
   });
 
   it('resolves by id, but guid wins when both are given', () => {

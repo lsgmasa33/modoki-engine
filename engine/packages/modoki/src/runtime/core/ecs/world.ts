@@ -10,6 +10,8 @@ import { EntityAttributes } from '../traits/EntityAttributes';
 import { emit, entityRef, isJournalEnabled } from '../journal';
 import { inSystemTick } from '../systemTick';
 import { Transient } from '../traits/Transient';
+import { formatRuntimeGuid, parseRuntimeGuid, isRuntimeGuid } from '../assetRefRules';
+import { packedOf, type PackedEntity } from './entityTable';
 
 export { getCurrentWorld, setCurrentWorld, onWorldSwap, getGuidIndex, peekCurrentWorld } from './worldRegistry';
 
@@ -37,6 +39,11 @@ export function findEntityById(entityId: number, world: World = getCurrentWorld(
  *  mint site forgot to call indexEntityGuid (the explicit wiring is just for speed). */
 export function findEntityByGuid(guid: string, world: World = getCurrentWorld()): Entity | undefined {
   if (!guid) return undefined;
+  // A runtime guid (#1210) resolves through its world's address table, never the rescan: it names
+  // the entity it was MINTED for, even after a save re-minted that entity a durable guid, and a
+  // stale one (another world's generation, a despawned entity) misses in O(1).
+  const runtime = parseRuntimeGuid(guid);
+  if (runtime) return resolveRuntimeGuid(runtime, world);
   const idx = getGuidIndex(world);
   let entity = idx.get(guid);
   if (entity && guidOf(entity) === guid) return entity;
@@ -46,11 +53,84 @@ export function findEntityByGuid(guid: string, world: World = getCurrentWorld())
   return entity && guidOf(entity) === guid ? entity : undefined;
 }
 
+// ── Runtime guids (#1210) ───────────────────────────────────────────────────────────────────
+// An entity spawned with an empty `EntityAttributes.guid` gets a RUNTIME guid at spawn:
+// `00000000-GGGG-GGGG-0000-NNNNNNNNNNNN` (`isRuntimeGuid`). N counts EntityAttributes spawns in its
+// world, so the same spawn order yields the same guids (replays, journal comparisons). G is the
+// world's GENERATION, and it is what makes a stale guid MISS instead of naming a different entity:
+//
+// ⚠️ G is a counter this module owns, incremented once per world — never koota's world id or entity
+// generation. koota packs 4 bits of world id and 8 of generation and reuses both across a swap
+// (see entityTable.ts), so either would let a guid from the outgoing world match an entity in the
+// incoming one. A per-world counter alone would too: every world would start again at 1.
+//
+// It is an ADDRESS, not a lifetime key, and not a persistent identity: nothing may persist one
+// (`durableGuid`, `assertNoRuntimeGuids`), and per-entity state keys by `packedOf`/EntityTable.
+
+interface RuntimeAddresses {
+  /** This world's generation — assigned on its first mint. */
+  generation: number;
+  /** The ordinal the next mint gets. */
+  next: number;
+  /** ordinal → entity, for lookup. Holds live entities only (`unregisterEntity` removes). */
+  entityOf: Map<number, Entity>;
+  /** packed entity → ordinal, so unregister finds the row even after the guid was re-minted. */
+  ordinalOf: Map<PackedEntity, number>;
+}
+
+const runtimeAddresses = new WeakMap<World, RuntimeAddresses>();
+let nextRuntimeGeneration = 1;
+
+function runtimeAddressesFor(world: World): RuntimeAddresses {
+  let t = runtimeAddresses.get(world);
+  if (!t) {
+    t = { generation: nextRuntimeGeneration++, next: 1, entityOf: new Map(), ordinalOf: new Map() };
+    runtimeAddresses.set(world, t);
+  }
+  return t;
+}
+
+function resolveRuntimeGuid(g: { generation: number; ordinal: number }, world: World): Entity | undefined {
+  const t = runtimeAddresses.get(world);
+  if (!t || t.generation !== g.generation) return undefined;
+  const entity = t.entityOf.get(g.ordinal);
+  if (!entity) return undefined;
+  try { return entity.isAlive() ? entity : undefined; } catch { return undefined; } // destroyed world throws
+}
+
+/** Give `entity` a runtime guid when it carries EntityAttributes with an empty guid — or with a
+ *  runtime guid it was COPIED with (a Persistent/base-scene carry, an undo respawn, a snapshot). A
+ *  fresh spawn never owns an existing address: that row belongs to the entity it was minted for (or
+ *  to a dead world), so keeping it would leave this entity answering to nothing. Must run BEFORE
+ *  `registerEntity`, so the guid index and the `@spawn` journal ref both see the guid. */
+function mintRuntimeGuid(entity: any, world: World): void {
+  let ea: Record<string, unknown> | undefined;
+  try { ea = entity.has(EntityAttributes) ? (entity.get(EntityAttributes) as Record<string, unknown>) : undefined; } catch { ea = undefined; }
+  if (!ea || (ea.guid && !isRuntimeGuid(ea.guid as string))) return;
+  const t = runtimeAddressesFor(world);
+  const ordinal = t.next++;
+  t.entityOf.set(ordinal, entity);
+  t.ordinalOf.set(packedOf(entity), ordinal);
+  entity.set(EntityAttributes, { ...ea, guid: formatRuntimeGuid(t.generation, ordinal) });
+}
+
+/** The runtime-guid generation counter, for `createTestWorld` to save on create and restore on
+ *  dispose — so two identical harness runs mint identical guids. Restored, never zeroed: a world
+ *  created before the test world may still hold a generation, and zeroing would re-issue it.
+ *  @internal */
+export function _getRuntimeGuidGeneration(): number { return nextRuntimeGeneration; }
+/** @internal — see {@link _getRuntimeGuidGeneration}. */
+export function _setRuntimeGuidGeneration(n: number): void { nextRuntimeGeneration = n; }
+/** Live rows in `world`'s runtime-address table. A per-shot spawner must not grow it: the row is
+ *  dropped in `unregisterEntity`, and `isAlive()` on lookup only hides a stale row, it does not free
+ *  it — so this is how a test tells "misses" from "misses AND was released". @internal */
+export function _runtimeAddressRows(world: World): number { return runtimeAddresses.get(world)?.entityOf.size ?? 0; }
+
 /** (Re)index an entity's current guid. Call after a '' → guid mint so the index
  *  reflects the new guid without waiting for the scan fallback. */
 export function indexEntityGuid(entity: any, world: World = getCurrentWorld()) {
   const guid = guidOf(entity);
-  if (guid) getGuidIndex(world).set(guid, entity);
+  if (guid && !isRuntimeGuid(guid)) getGuidIndex(world).set(guid, entity);
 }
 
 /** Percept (J3): journal a spawn/despawn — but ONLY in the currently-active world.
@@ -67,8 +147,10 @@ function emitLifecycle(type: '@spawn' | '@despawn', entity: any, world: World) {
 /** Register an entity in the given world's index. Called after world.spawn(). */
 export function registerEntity(entity: any, world: World = getCurrentWorld()) {
   getEntityIndex(world).set(entity.id(), entity);
-  const guid = guidOf(entity); // present for loaded/serialized entities; '' for fresh ones
-  if (guid) getGuidIndex(world).set(guid, entity);
+  const guid = guidOf(entity); // durable for loaded/serialized entities; a runtime guid for fresh ones
+  // A runtime guid resolves through the address table, never this index — indexing it would only
+  // leave a dead key behind once a save re-mints the entity's guid (#1210).
+  if (guid && !isRuntimeGuid(guid)) getGuidIndex(world).set(guid, entity);
   _onStructure?.();
   emitLifecycle('@spawn', entity, world);
 }
@@ -104,6 +186,7 @@ export function spawnEntity(world: World, ...traits: Parameters<World['spawn']>)
   // eslint-disable-next-line no-restricted-syntax -- the one sanctioned world.spawn in the engine
   const entity = world.spawn(...traits);
   if (inSystemTick()) entity.add(Transient);
+  mintRuntimeGuid(entity, world); // before registerEntity: the index and `@spawn` see the guid (#1210)
   registerEntity(entity, world);
   return entity;
 }
@@ -128,6 +211,12 @@ export function unregisterEntity(entity: any, world: World = getCurrentWorld()) 
   getEntityIndex(world).delete(entity.id());
   const guid = guidOf(entity);
   if (guid) getGuidIndex(world).delete(guid);
+  const t = runtimeAddresses.get(world);
+  if (t) {
+    const packed = packedOf(entity);
+    const ordinal = t.ordinalOf.get(packed);
+    if (ordinal !== undefined) { t.ordinalOf.delete(packed); t.entityOf.delete(ordinal); }
+  }
 }
 
 /** Rebuild the guid→entity index by walking EntityAttributes-tagged entities.
@@ -138,7 +227,8 @@ export function rebuildGuidIndexSync(world: World = getCurrentWorld()) {
   try {
     world.query(EntityAttributes).updateEach(([ea]: any[], entity: any) => {
       const g = (ea?.guid as string) || '';
-      if (g && !idx.has(g)) idx.set(g, entity); // first wins (guids must be unique)
+      // Runtime guids never enter the index: they resolve through the address table (#1210).
+      if (g && !isRuntimeGuid(g) && !idx.has(g)) idx.set(g, entity); // first wins (guids must be unique)
     });
   } catch { /* EntityAttributes not in this world */ }
 }

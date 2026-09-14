@@ -17,6 +17,7 @@
 import { type World } from 'koota';
 import { onWorldSwap } from '../../runtime/core/ecs/world';
 import { getAllTraits, getTraitByName } from '../../runtime/core/ecs/traitRegistry';
+import { durableGuid } from '../../runtime/core/assetRefRules';
 import { useEditorStore } from './editorStore';
 
 let registered = false;
@@ -103,7 +104,9 @@ function collectGuidsById(world: World): Map<number, string> {
   if (!eaMeta) return out;
   try {
     world.query(eaMeta.trait).updateEach(([ea]: Record<string, unknown>[], entity: { id(): number }) => {
-      const g = ea.guid as string;
+      // Durable only (#1210): a runtime guid dies with the old world, so it can never match in the
+      // new one. Such an entity takes the name-path fallback, as a guid-less one always did.
+      const g = durableGuid(ea.guid as string);
       if (g) out.set(entity.id(), g);
     });
   } catch { /* trait not initialized in this world */ }
@@ -133,12 +136,18 @@ function findEntityByPathIn(entries: Map<number, { name: string; parentId: numbe
   const leafName = targetPath[targetPath.length - 1];
   // Iterate candidates with matching leaf name first to keep this cheap on
   // large worlds (avoids walking ancestors for unrelated entities).
+  let found: number | null = null;
   for (const [id, entry] of entries) {
     if (entry.name !== leafName) continue;
     const candidatePath = walkPath(id, entries);
-    if (candidatePath && pathsEqual(candidatePath, targetPath)) return id;
+    if (!candidatePath || !pathsEqual(candidatePath, targetPath)) continue;
+    // AMBIGUOUS → no match. Two same-named siblings (two spawned "Crate"s) share a path, and taking
+    // the first silently moves the selection onto the OTHER one — observed live on a Play→Stop
+    // (#1210 close-out). A cleared selection is honest; a wrong one is not.
+    if (found !== null) return null;
+    found = id;
   }
-  return null;
+  return found;
 }
 
 function walkPath(entityId: number, entries: Map<number, { name: string; parentId: number }>): string[] | null {

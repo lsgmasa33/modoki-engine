@@ -6,6 +6,7 @@ import { EntityAttributes, PrefabInstance } from '../../src/runtime/traits';
 import { registerTrait } from '../../src/runtime/core/ecs/traitRegistry';
 import { deriveInstanceMemberGuids } from '../../src/runtime/loaders/loadSceneFile';
 import { deriveGuid, isGuid } from '../../src/runtime/loaders/assetManifest';
+import { formatRuntimeGuid } from '../../src/runtime/core/assetRefRules';
 
 // deriveInstanceMemberGuids resolves traits via the registry (like loadSceneFile).
 registerTrait({ name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: {} });
@@ -180,5 +181,41 @@ describe('deriveInstanceMemberGuids — nested instances', () => {
     deriveInstanceMemberGuids(world);
     const after = [innerRoot, innerMember].map((e) => (e.get(EntityAttributes) as any).guid);
     expect(after).toEqual(before);
+  });
+});
+
+/** #1210: `spawnEntity` gives a guid-less entity a RUNTIME guid, valid only until reload. A member
+ *  holding one still needs its stable derived guid (persisted references point at it), and a root
+ *  holding one is not a scene anchor — deriving from it would produce a different member guid every
+ *  session. */
+describe('deriveInstanceMemberGuids over runtime guids (#1210)', () => {
+  let world: ReturnType<typeof createWorld>;
+  beforeEach(() => { world = createWorld(); });
+  afterEach(() => { world.destroy(); });
+
+  it('a member holding a runtime guid gets its derived guid', () => {
+    const rootGuid = '11111111-1111-1111-1111-111111111111';
+    const root = world.spawn(EntityAttributes({ guid: rootGuid, parentId: 0, name: 'Root' }), PrefabInstance({ localId: 1, rootInstanceId: 0 }));
+    const a = world.spawn(
+      EntityAttributes({ guid: formatRuntimeGuid(1, 2), parentId: root.id(), name: 'A' }),
+      PrefabInstance({ localId: 2, rootInstanceId: root.id() }),
+    );
+    deriveInstanceMemberGuids(world);
+    expect((a.get(EntityAttributes) as any).guid).toBe(deriveGuid(`${rootGuid}|2`));
+  });
+
+  it('a root holding only a runtime guid is not an anchor', () => {
+    // The member is guid-less so the ANCHOR decision is the only thing under test: a member that
+    // itself held a runtime guid would be skipped for that reason whatever the root carried.
+    const rootRuntime = formatRuntimeGuid(1, 1);
+    const root = world.spawn(EntityAttributes({ guid: rootRuntime, parentId: 0, name: 'Root' }), PrefabInstance({ localId: 1, rootInstanceId: 0 }));
+    const a = world.spawn(
+      EntityAttributes({ guid: '', parentId: root.id(), name: 'A' }),
+      PrefabInstance({ localId: 2, rootInstanceId: root.id() }),
+    );
+    deriveInstanceMemberGuids(world);
+    // No scene anchor above it → left unaddressable, NOT derived from the runtime root.
+    expect((a.get(EntityAttributes) as any).guid).toBe('');
+    expect((root.get(EntityAttributes) as any).guid).toBe(rootRuntime);
   });
 });

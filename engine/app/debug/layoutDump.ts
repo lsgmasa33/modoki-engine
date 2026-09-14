@@ -16,7 +16,7 @@
  *  alone was more than every rect combined. Ask for what you need: `ids`/`layer` for rects,
  *  `overlaps:true` for the pairs. See `docs/mcp-response-budget.md` Phase 4. */
 
-import { getAllEntities, collectScreenBounds, type ScreenRect } from '@modoki/engine/runtime';
+import { getAllEntities, collectScreenBounds, findEntityByGuid, type ScreenRect } from '@modoki/engine/runtime';
 import { uiSurfaceOf } from './uiSurface';
 
 export interface LayoutEntry {
@@ -78,7 +78,9 @@ export function computeLayoutBounds(params: LayoutBoundsParams = {}) {
   const unresolved: Array<string | number> = [];
   const fromGuids: number[] = [];
   for (const g of params.guids ?? []) {
-    const hit = all.find((e) => (e as { guid?: string }).guid === g);
+    // findEntityByGuid, so a runtime guid whose entity a save re-minted still resolves (#1210).
+    const found = findEntityByGuid(g);
+    const hit = found ? byId.get(found.id()) : undefined;
     if (hit) fromGuids.push(hit.id); else unresolved.push(g);
   }
   const fromName = params.name

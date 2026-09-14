@@ -9,6 +9,7 @@ import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { TestPhase, registerTestGameTraits } from './_fixtures/testGame';
 import { serializeScene, isTraitDefault } from '@modoki/engine/editor';
 import { getAllTraits } from '@modoki/engine/runtime';
+import { formatRuntimeGuid, isRuntimeGuid, isGuid, durableGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 
 // Ensure traits are registered (idempotent — registerTrait overwrites)
 registerAllTraits();
@@ -146,9 +147,10 @@ describe('serializeScene', () => {
     // (the prefab-instance pre-pass honours the transient skip, not just the plain-entity branch).
     expect(scene.entities.find((e) => e.name === 'gen-tile')).toBeUndefined();
     expect(scene.entities.find((e) => e.name === 'gen-tile-member')).toBeUndefined();
-    // And the transient root's live guid was never minted/committed (no guid churn into
-    // generated content — the guid pre-pass skips transient ids).
-    expect((genInst.get(EntityAttributes) as { guid: string }).guid).toBe('');
+    // And the transient root never had a DURABLE guid minted/committed (no guid churn into
+    // generated content — the guid pre-pass skips transient ids). It carries only the runtime
+    // address spawnEntity gave it (#1210).
+    expect(durableGuid((genInst.get(EntityAttributes) as { guid: string }).guid)).toBe('');
   });
 
   it('serializes tag traits as boolean true', async () => {
@@ -200,16 +202,19 @@ describe('serializeScene', () => {
       Transform({ x: 1, y: 1, z: 1 }),
       EntityAttributes({ name: 'fresh-unsaved', isActive: true }),
     );
-    // Precondition: a freshly-spawned entity has an empty guid.
-    expect((entity.get(EntityAttributes) as { guid: string }).guid).toBe('');
+    // Precondition: a freshly-spawned entity has no DURABLE guid — only the runtime address
+    // spawnEntity gave it (#1210).
+    const runtimeGuid = (entity.get(EntityAttributes) as { guid: string }).guid;
+    expect(isRuntimeGuid(runtimeGuid)).toBe(true);
 
     const scene = await serializeScene(); // snapshot path — Play uses exactly this
     const out = scene.entities.find((e) => e.name === 'fresh-unsaved');
     const ea = out!.traits.EntityAttributes as { guid?: string };
     // Output carries a stable guid…
     expect(ea.guid).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+    expect(isRuntimeGuid(ea.guid)).toBe(false);
     // …but the live world was NOT mutated (the F3 bug was this writing back).
-    expect((entity.get(EntityAttributes) as { guid: string }).guid).toBe('');
+    expect((entity.get(EntityAttributes) as { guid: string }).guid).toBe(runtimeGuid);
   });
 
   it('save path ({ assignGuids: true }) commits the minted guid to the live world', async () => {
@@ -217,12 +222,13 @@ describe('serializeScene', () => {
       Transform({ x: 2, y: 2, z: 2 }),
       EntityAttributes({ name: 'fresh-tosave', isActive: true }),
     );
-    expect((entity.get(EntityAttributes) as { guid: string }).guid).toBe('');
+    expect(isRuntimeGuid((entity.get(EntityAttributes) as { guid: string }).guid)).toBe(true); // #1210
 
     const scene = await serializeScene({ assignGuids: true });
     const out = scene.entities.find((e) => e.name === 'fresh-tosave');
     const outGuid = (out!.traits.EntityAttributes as { guid?: string }).guid!;
     expect(outGuid).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+    expect(isRuntimeGuid(outGuid)).toBe(false);
     // The live world now carries the SAME guid that was serialized — persisted.
     expect((entity.get(EntityAttributes) as { guid: string }).guid).toBe(outGuid);
   });
@@ -566,5 +572,42 @@ describe('Time.timeScale registration (#410)', () => {
     const meta = getAllTraits().find((t) => t.name === 'Time');
     expect(meta, 'Time is registered').toBeDefined();
     expect(meta!.fields?.timeScale?.runtimeOnly).toBe(true);
+  });
+});
+
+/** #1210: an entity spawned without a guid carries a RUNTIME guid — an address valid only until
+ *  reload, whose counter restarts every session. The serializer must treat it exactly like an empty
+ *  guid (mint a durable one into the output, and into the live world on a real save), resolve
+ *  parent refs through that mint, and refuse to write one anywhere. */
+describe('serializeScene over runtime guids (#1210)', () => {
+  const guidOut = (scene: { entities: { name?: string; traits: Record<string, unknown> }[] }, name: string) =>
+    (scene.entities.find((e) => e.name === name)!.traits.EntityAttributes as { guid?: string; parentId?: string });
+
+  it('save path replaces a runtime guid with a durable one, in the output AND the live world', async () => {
+    const e = spawnEntity(getCurrentWorld(), Transform({ x: 1 }), EntityAttributes({ name: 'rg-save' }));
+    expect(isRuntimeGuid((e.get(EntityAttributes) as { guid: string }).guid)).toBe(true); // minted at spawn
+    const scene = await serializeScene({ assignGuids: true });
+    const out = guidOut(scene, 'rg-save').guid!;
+    expect(isGuid(out)).toBe(true);
+    expect(isRuntimeGuid(out)).toBe(false);
+    expect((e.get(EntityAttributes) as { guid: string }).guid).toBe(out);
+  });
+
+  it('snapshot path writes a durable guid for the entity AND for its child\'s parentId, leaving the world alone', async () => {
+    const parent = spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'rg-parent' }));
+    const rg = (parent.get(EntityAttributes) as { guid: string }).guid;
+    expect(isRuntimeGuid(rg)).toBe(true); // minted at spawn
+    spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'rg-child', guid: 'c1111111-1111-4111-8111-111111111111', parentId: parent.id() }));
+    const scene = await serializeScene();
+    const parentGuid = guidOut(scene, 'rg-parent').guid!;
+    expect(isGuid(parentGuid) && !isRuntimeGuid(parentGuid)).toBe(true);
+    expect(guidOut(scene, 'rg-child').parentId).toBe(parentGuid); // guidForId resolved through the mint
+    expect((parent.get(EntityAttributes) as { guid: string }).guid).toBe(rg); // snapshot does not mutate
+  });
+
+  it('trips when any authored string would carry a runtime guid to disk', async () => {
+    // A generation no world has, so the guid names nothing live and cannot be repaired to a durable one.
+    spawnEntity(getCurrentWorld(), Transform(), EntityAttributes({ name: 'rg-folder', editorFolder: formatRuntimeGuid(0xfffffff0, 103) }));
+    await expect(serializeScene()).rejects.toThrow(/runtime guid/);
   });
 });

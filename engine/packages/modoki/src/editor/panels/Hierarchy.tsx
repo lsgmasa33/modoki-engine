@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { onWorldSwap, getCurrentWorld } from '../../runtime/core/ecs/world';
+import { durableGuid } from '../../runtime/core/assetRefRules';
 import { getAllTraits, getTraitByName, COMPONENT_CATEGORY_ORDER } from '../../runtime/core/ecs/traitRegistry';
 import { getAllEntities, buildEntityTree, deleteEntity, onStructureDirtyCoalesced, getStructureVersion, writeTraitField, readTraitData, subtreeIds, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { pinEntityAt, livePinnedId, type EntityPin } from '../../runtime/core/ecs/entityPin';
@@ -1477,7 +1478,8 @@ export default function Hierarchy() {
     // Find References needs a stable guid to send the backend (runtime ids are
     // reassigned every scene reload) — disable rather than send a target that
     // cannot resolve (a 404 the user can't act on is worse than a greyed-out item).
-    const guid = attr ? (attr.guid as string) || '' : '';
+    // Durable only (#1210): a runtime guid is in no file on disk, so it would search for nothing.
+    const guid = attr ? durableGuid(attr.guid as string) : '';
     return [
       { label: 'Rename', shortcut: 'F2', onClick: () => handleRename(entity), disabled: dis },
       { label: 'Duplicate', shortcut: '⌘D', onClick: () => handleDuplicate(entity), disabled: dis },

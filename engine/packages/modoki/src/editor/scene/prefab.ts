@@ -10,6 +10,8 @@ import { getAllEntities, deleteEntities, markStructureDirty, readTraitData, read
 import { Transient } from '../../runtime/core/traits/Transient';
 import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { newGuid, registerAsset, getGuidForPath, isGuid, resolveRef } from '../../runtime/loaders/assetManifest';
+import { durableGuid } from '../../runtime/core/assetRefRules';
+import { assertNoRuntimeGuids } from './runtimeGuidTripwire';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { invalidatePrefab } from '../../runtime/loaders/meshTemplateCache';
 import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
@@ -337,7 +339,7 @@ export function serializePrefab(
     }
   }
 
-  return {
+  const file: PrefabFile = {
     id: existingId ?? newGuid(),
     // The format version this serializer writes, unconditionally — see PREFAB_FORMAT_VERSION
     // for why this must not be derived from `nestedRefs` (#379).
@@ -349,6 +351,8 @@ export function serializePrefab(
     rootLocalId: ecsToLocal.get(selectedEntityId) ?? 1,
     entities: prefabEntities,
   };
+  assertNoRuntimeGuids(file, 'a serialized prefab');
+  return file;
 }
 
 // ── Rigged re-import merge (P7b-2b) ──────────────────────
@@ -805,7 +809,8 @@ export async function instantiatePrefabAsync(prefab: PrefabFile, parentId: numbe
     const rootEntity = findEntity(rootId);
     if (rootEntity?.has(attrMeta.trait)) {
       const ea = rootEntity.get(attrMeta.trait) as Record<string, unknown>;
-      if (!ea.guid) { rootEntity.set(attrMeta.trait, { ...ea, guid: newGuid() }); indexEntityGuid(rootEntity); }
+      // A runtime guid (#1210) is not an identity: mint over it like an empty one.
+      if (!durableGuid(ea.guid as string)) { rootEntity.set(attrMeta.trait, { ...ea, guid: newGuid() }); indexEntityGuid(rootEntity); }
     }
   }
   // Stamp stable member GUIDs so the new instance's children are referenceable.
@@ -1211,7 +1216,13 @@ function snapshotAddedTraits(ecsId: number): { bag: Record<string, Record<string
       if (soa && !meta.fields[key]?.entityId && isTraitDefault(data[key], schema![key])) continue;
       copy[key] = data[key];
     }
-    if (meta.name === 'EntityAttributes') guid = (data.guid as string) || '';
+    // A runtime guid (#1210) is not a durable address — capture it as unguided, exactly as a
+    // guid-less entity was: never an `added[].guid`, a `+added.<guid>` key, OR the copied trait's
+    // own `guid` (the loop above already copied it, and the loader keeps a non-empty one).
+    if (meta.name === 'EntityAttributes') {
+      guid = durableGuid(data.guid as string);
+      if (!guid) delete copy.guid;
+    }
     bag[meta.name] = copy;
   }
   return { bag, guid };
@@ -1348,7 +1359,7 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
     const ref = captureInstanceReference(ecsId, source, childPrefab);
     for (const m of ref.memberEcsIds) consumedEcsIds.add(m);
     for (const c of ref.consumedEcsIds) consumedEcsIds.add(c);
-    const guid = (eaMeta ? (readTraitData(ecsId, eaMeta)?.guid as string) : '') || '';
+    const guid = eaMeta ? durableGuid(readTraitData(ecsId, eaMeta)?.guid as string) : ''; // #1210
     return {
       parentLocalId, guid, name: byId.get(ecsId)?.name || '', traits: {}, children: [],
       prefab: source,
@@ -2217,7 +2228,9 @@ export function rebuildInstance(
   // into the instance (UI bindings, guid-based undo) survive the rebuild — the
   // re-instantiated root would otherwise mint a fresh guid. Same identity, so
   // carrying the guid is correct (not a duplicate).
-  if (eaMeta && oldRootEa?.guid) writeTraitField(newRootId, eaMeta, 'guid', oldRootEa.guid as string);
+  // Durable only (#1210): a runtime guid belonged to the destroyed root's address row, so copying it
+  // would leave the new root answering to nothing; the respawn's own runtime guid stands instead.
+  if (eaMeta && durableGuid(oldRootEa?.guid as string)) writeTraitField(newRootId, eaMeta, 'guid', oldRootEa!.guid as string);
   setPrefabSource(newRootId, source);
   applyOverridesByRootInstance(newRootId, overrides);
   applyStructureByRootInstance(newRootId, prefab, structure);

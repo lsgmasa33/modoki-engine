@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { readTraitData, readTraitDataFull, findEntity } from '../../runtime/core/ecs/entityUtils';
 import { pinEntityAt } from '../../runtime/core/ecs/entityPin';
 
-import { getCurrentWorld } from '../../runtime/core/ecs/world';
+import { getCurrentWorld, findEntityByGuid } from '../../runtime/core/ecs/world';
 import { writeTraitFieldWithUndo as writeField, writeTraitFieldMultiWithUndo as writeFieldMulti, writeTraitFieldPerEntityWithUndo as writeFieldPerEntity, removeTraitFromEntitiesWithUndo, deleteEntitiesWithUndo, pasteTraitValuesWithUndo } from '../undo/entityActions';
 import { type ContextMenuItem } from '../components/ContextMenu';
 import { useTraitClipboard, setTraitClipboard, isTraitCopyable } from './traitClipboard';
@@ -17,10 +17,13 @@ import { getAnimSet } from '../../runtime/loaders/animSetCache';
 import { useEditorStore } from '../store/editorStore';
 import { getPrefabSource, getCachedPrefabSync, getOverrides } from '../scene/prefab';
 import { getEditorViewportCamera } from '../scene/sceneViewBus';
+import { isSkippedByPrimarySave } from '../scene/serialize';
 import { instantiatePrefabAsync, setPrefabSource, type PrefabFile } from '../scene/prefab';
 import { parseAssetJson, isMissingAsset } from '../../runtime/loaders/assetFetch';
 import { getModelPostprocessorIds } from '../../runtime/loaders/modelPostprocessorRegistry';
 import { isGuid, resolveGuidToPath, getAssetEntry } from '../../runtime/loaders/assetManifest';
+import { durableGuid } from '../../runtime/core/assetRefRules';
+import { describeEntityGuid } from './entityGuidLabel';
 // Which anchors stretch which axis is decided ONCE, in anchorLayout — the same import
 // anchorCss makes, and for the same reason: the Inspector's "this field is inert" gating
 // must not be able to disagree with the layout that makes it inert.
@@ -398,11 +401,8 @@ function DirectorTimelineButton({ timeline, entityId }: { timeline: string; enti
 /** GUID → entity id (mirrors applyBindings' resolution). */
 function guidToEntityId(guid: string): number | undefined {
   if (!guid) return undefined;
-  let found: number | undefined;
-  getCurrentWorld().query(EntityAttributes).updateEach(([ea]: [{ guid: string }], e: { id: () => number }) => {
-    if (ea.guid === guid) found = e.id();
-  });
-  return found;
+  // findEntityByGuid also follows a runtime guid whose entity was since re-minted (#1210).
+  return findEntityByGuid(guid)?.id();
 }
 
 /** Resolve a field's dynamic enum options at Inspector render time. Per-entity
@@ -821,8 +821,10 @@ function CameraFrameGizmoToggle({ entityIds }: { entityIds: number[] }) {
   const shownSet = useEditorStore((s) => s.cameraGizmoShown);
   const setShown = useEditorStore((s) => s.setCameraGizmoShown);
   // Single-select only (a frame's gizmo is per-entity); read the primary's guid.
+  // Durable only (#1210): the toggle is persisted, and a runtime guid would name another entity
+  // next session — so a never-saved runtime spawn shows no toggle, as a guid-less one did.
   const guid = entityIds.length === 1
-    ? (findEntity(entityIds[0])?.get(EntityAttributes)?.guid ?? '')
+    ? durableGuid(findEntity(entityIds[0])?.get(EntityAttributes)?.guid)
     : '';
   if (!guid) return null;
   const on = shownSet.has(guid);
@@ -2040,6 +2042,32 @@ export default function Inspector() {
         )}
         <span style={{ color: '#555', fontSize: '10px', flexShrink: 0 }}>{multi ? `×${selectedIds.length}` : `id:${selectedId}`}</span>
       </div>
+
+      {/* The entity's guid (#1210) — what every guid-addressed tool takes. Read-only; click copies.
+          A runtime guid is badged, because it expires on reload (entityGuidLabel.ts decides). */}
+      {!multi && entityAttr?.data && (() => {
+        const label = describeEntityGuid(entityAttr.data['guid'] as string, isSkippedByPrimarySave(selectedId!));
+        return (
+          <div style={{ padding: '2px 8px 5px', borderBottom: '1px solid #333', display: 'flex', alignItems: 'center', gap: 6, fontSize: '10px' }}
+            title={label.title}>
+            <span style={{ color: '#666', flexShrink: 0 }}>guid</span>
+            <span
+              onClick={() => { if (label.kind !== 'none') void navigator.clipboard?.writeText(label.text).catch(() => {}); }}
+              style={{
+                flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', userSelect: 'all',
+                color: label.kind === 'durable' ? '#aaa' : '#777', cursor: label.kind === 'none' ? 'default' : 'copy',
+              }}
+              data-ui-id="inspector.header.guid" data-ui-kind="text" data-ui-label="entity guid"
+            >{label.text}</span>
+            {label.badge && (
+              <span style={{ flexShrink: 0, color: label.kind === 'runtime' ? '#e0a030' : '#888', border: '1px solid currentColor', borderRadius: 3, padding: '0 4px' }}>
+                {label.badge}
+              </span>
+            )}
+          </div>
+        );
+      })()}
 
       {/* Base-scene ghost banner (Phase 9, unlock added Phase 13) — selectable +
           inspectable always; fields disabled UNLESS unlocked for this exact

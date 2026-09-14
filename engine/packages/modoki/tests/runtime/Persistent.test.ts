@@ -4,6 +4,7 @@
  *  and uses a single koota world to stay well under koota's 16-world cap. */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createWorld, trait } from 'koota';
+import { formatRuntimeGuid, isRuntimeGuid } from '../../src/runtime/core/assetRefRules';
 
 const Transform = trait({ x: 0, y: 0, z: 0 });
 const EntityAttributes = trait({ name: '' as string, parentId: 0, guid: '' as string });
@@ -52,5 +53,17 @@ describe('markPersistent', () => {
     const e = world.spawn(Transform(), EntityAttributes({ name: 'Forced', parentId: 0, guid: 'old' }));
     expect(markPersistent(e, 'explicit-guid')).toBe('explicit-guid');
     expect(e.get(EntityAttributes)!.guid).toBe('explicit-guid');
+  });
+});
+
+describe('markPersistent over a runtime guid (#1210)', () => {
+  it('replaces a runtime guid — it dies with its world, so it cannot be a cross-scene identity', async () => {
+    const { markPersistent } = await getMod();
+    const rg = formatRuntimeGuid(2, 1);
+    const e = world.spawn(Transform(), EntityAttributes({ name: 'Root', parentId: 0, guid: rg }));
+    const guid = markPersistent(e);
+    expect(guid).not.toBe(rg);
+    expect(isRuntimeGuid(guid)).toBe(false);
+    expect(e.get(EntityAttributes)!.guid).toBe(guid);
   });
 });

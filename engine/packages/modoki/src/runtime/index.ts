@@ -489,6 +489,8 @@ export { layoutText, type LayoutFont, type LayoutOptions, type TextLayout, type 
  *  `measureText2D` wraps the `ensureGlyphs` + `layoutText` pair so that trap is not re-exported
  *  with it. */
 export { measureText2D, type MeasureText2DOptions } from './loaders/measureText2D';
+// Runtime guids (#1210): tell an entity's live-only address from its durable identity.
+export { isRuntimeGuid, durableGuid } from './core/assetRefRules';
 export {
   isGuid, isExternalUrl, isInternalAssetPath, newGuid, deriveGuid, registerAsset, unregisterAsset, resolveGuidToPath,
   getGuidForPath, getAssetType, getAssetEntry, getAudioLoadType, resolveRef, loadManifestJson, ensureManifestLoaded, serializeManifest,

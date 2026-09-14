@@ -86,6 +86,7 @@
  */
 
 import { createWorld, type World, type Entity } from 'koota';
+import { durableGuid } from '../core/assetRefRules';
 import { setCurrentWorld, getCurrentWorld, spawnEntity, findEntityById } from '../core/ecs/world';
 import { createTeardownToken, type LivenessCheck } from '../core/liveness';
 import { notifyListeners } from '../core/notifyListeners';
@@ -1699,7 +1700,9 @@ export function filterPersistentDuplicates(
     const ea = snap.traits['EntityAttributes'] as Record<string, unknown> | undefined;
     // Defensive: only roots should be persistent
     if (ea && ((ea.parentId as number) ?? 0) !== 0) continue;
-    let guid = (ea?.guid as string) || '';
+    // Durable only (#1210): a root tagged Persistent without markPersistent now carries a RUNTIME
+    // guid, which is re-minted on every carry and so can match nothing — it must still warn.
+    let guid = durableGuid(ea?.guid as string);
     if (!guid) {
       const p = snap.traits['Persistent'];
       if (p && typeof p === 'object') guid = ((p as Record<string, unknown>).guid as string) || '';

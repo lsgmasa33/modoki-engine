@@ -8,6 +8,7 @@ import { findEntity } from '../../runtime/core/ecs/entityUtils';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { type FieldHint, getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { newGuid } from '../../runtime/loaders/assetManifest';
+import { durableGuid } from '../../runtime/core/assetRefRules';
 import { onEditorDirty } from '../../runtime/ui/uiTreeStore';
 import { getUIActionNames } from '../../runtime/core/actionRegistry';
 import { getPhysicsLayerNames } from '../../runtime/physics/physicsLayers';
@@ -74,7 +75,8 @@ export function EntityRefField({ label, value, onChange, hint, mixed = false, da
     if (!raw) return;
     try {
       const { id } = JSON.parse(raw) as { id: number };
-      let guid = idToGuid.get(id);
+      // A runtime guid (#1210) dies with its world; a ref FIELD is saved, so it needs a durable one.
+      let guid = durableGuid(idToGuid.get(id));
       // The dropped entity may have no guid yet — e.g. a freshly-instantiated
       // prefab instance root, whose identity is otherwise only minted at save
       // time. Mint one on the entity now so the reference resolves immediately
