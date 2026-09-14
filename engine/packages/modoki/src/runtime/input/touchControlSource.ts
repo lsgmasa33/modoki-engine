@@ -1,7 +1,7 @@
 /** Touch-control input source — on-screen d-pads and buttons, as a first-class modality.
  *
  *  The engine had NO touch locomotion of any kind (#297): every game here is either drag/tap
- *  native (sling, space-invader, chess, court) or keyboard-only, and `demos/forest-camp` — the
+ *  native (sling, space-invader, court) or keyboard-only, and `demos/forest-camp` — the
  *  flagship published demo, shipped with real iOS + Android native — told phone players
  *  "WASD to walk". This source is the general fix, not a demo-local one.
  *

@@ -241,7 +241,7 @@ if (courtQuick) {
 // intercepts those bare imports *from external-project files* and re-resolves
 // them against the editor's tree (respecting @modoki/engine's exports map);
 // resolve.dedupe then guarantees one instance. The project's own unique deps
-// (chess.js, …) fall through to normal resolution from its node_modules.
+// (a game's own npm packages) fall through to normal resolution from its node_modules.
 function hostSharedDeps(): Plugin {
   const SHARED = new Set(['@modoki/engine', 'three', 'react', 'react-dom', '@pixi/react', 'koota', 'zustand', 'pixi.js', '@capacitor/core'])
   const anchor = path.join(engineDir, 'app', 'main.tsx') // a real file inside the editor tree

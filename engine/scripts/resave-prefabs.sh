@@ -27,8 +27,9 @@
 #    (1) Entering prefab-edit SAVES THE CURRENT SCENE first — deliberately, so the return
 #        trip's reload-from-disk cannot destroy unsaved work (prefabEdit.ts). That is a real
 #        scene write per prefab, so a project whose game code mutates authored state on load
-#        would bake it. `games/chess` + `games/llm-test` are excluded below for exactly this,
-#        and the script REFUSES them rather than trusting the operator to remember.
+#        would bake it. A project known to do that goes in EXCLUDED below, and the script
+#        REFUSES it rather than trusting the operator to remember. (Empty today: the two it
+#        held, games/chess + games/llm-test, were deleted in #1191.)
 #    (2) The synthetic edit world runs the pipeline like any other scene, so a stopped-mode
 #        system writing to a PREFAB entity would bake too. Nothing tags that as authored-vs-
 #        runtime, but the #124 save-time warning fires on it — read the editor console.
@@ -52,8 +53,8 @@ LAUNCH_LOG="/tmp/resave-prefabs-launch-${PORT}.log"
 cd "$ROOT"
 
 # Projects whose game code mutates authored state on load (#124). Their scenes are still on
-# the legacy format for that reason, and every prefab-edit open would re-save one.
-EXCLUDED="games/chess games/llm-test"
+# the legacy format for that reason, and every prefab-edit open would re-save one. Empty today.
+EXCLUDED=""
 
 [ $# -gt 0 ] || { echo "usage: $0 <project>... (e.g. games/sling)" >&2; exit 2; }
 

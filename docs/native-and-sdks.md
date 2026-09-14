@@ -6,7 +6,7 @@ See also [Architecture](./architecture.md).
 
 ## Standalone Capacitor Plugin Pattern (iOS SPM)
 
-Every native SDK is wrapped in its own Capacitor plugin package. Post-#29 a plugin lives in one of two places. **Shared** plugins live under `engine/packages/` (`capacitor-game-debug`, `capacitor-litert-lm`, `capacitor-modoki-ota`, `capacitor-modoki-iap`, `capacitor-appsflyer`, `capacitor-applovin-max`) and reach each consuming game as a vendored tarball ([cross-game-infrastructure.md](./cross-game-infrastructure.md) § "The vendoring pipeline, and why it is tarballs"). **Per-game** plugins live under `games/<id>/packages/capacitor-*/` (e.g. `games/3d-test/packages/capacitor-adjust`). ⚠️ `games/3d-test/packages/capacitor-applovin-max` is a per-game **fork** of the engine plugin: identical when Court's copy was promoted in #931, and deliberately not switched over, because vendoring it would put MAX into 3d-test's native build, where blank unit ids crash at init (#510). A package contains:
+Every native SDK is wrapped in its own Capacitor plugin package. Post-#29 a plugin lives in one of two places. **Shared** plugins live under `engine/packages/` (`capacitor-game-debug`, `capacitor-modoki-ota`, `capacitor-modoki-iap`, `capacitor-appsflyer`, `capacitor-applovin-max`) and reach each consuming game as a vendored tarball ([cross-game-infrastructure.md](./cross-game-infrastructure.md) § "The vendoring pipeline, and why it is tarballs"). **Per-game** plugins live under `games/<id>/packages/capacitor-*/` (e.g. `games/3d-test/packages/capacitor-adjust`). ⚠️ `games/3d-test/packages/capacitor-applovin-max` is a per-game **fork** of the engine plugin: identical when Court's copy was promoted in #931, and deliberately not switched over, because vendoring it would put MAX into 3d-test's native build, where blank unit ids crash at init (#510). A package contains:
 
 - `Package.swift` — declares the native SDK as a **Swift Package Manager (SPM)** dependency (e.g. `AppLovin-MAX-Swift-Package`, `adjust/ios_sdk`).
 - `*.podspec` — CocoaPods fallback manifest (SPM is the primary path).
@@ -43,19 +43,10 @@ SPM static linking **strips plugin classes that have no external framework depen
 
 `capacitor-modoki-iap` is the contrasting case: it goes through SPM normally and correctly declares both platforms, and it is verified working (real store sandboxes on hardware, 2026-08-12). Note its own `Package.swift` header is deliberately agnostic about *why* — do not read it as a rule that "a system framework import is enough to keep the class"; that causal claim is untested.
 
-`capacitor-litert-lm` is a THIRD case, and the one most easily got wrong. Its
-`ios/Sources/LitertLmPlugin/LitertLmPlugin.swift` is a **complete ~380-line MediaPipe
-implementation** (`import MediaPipeTasksGenAI`, real `LlmInference` model loading and streaming) —
-**not a stub**, despite a stale comment at the top of its `Package.swift` still calling it one. What
-actually blocks iOS is narrower: **`Package.swift` declares only `capacitor-swift-pm`, while
-`CapacitorLitertLm.podspec` declares `MediaPipeTasksGenAI` + `MediaPipeTasksGenAIC`.** So an SPM
-build of that target cannot resolve `import MediaPipeTasksGenAI` and fails to compile, and the
-podspec is not a "fallback" here — it is the only iOS path whose dependencies resolve. Declaring
-`"ios"` on this package without first adding the MediaPipe dependency to `Package.swift` turns a
-green `npm run verify` into a broken `cap sync ios` build on `games/llm-test`.
-⚠️ **Since #981 this is no longer only a comment.** `npm run test:native` compiled the class, and
-`ios/class/capacitor-litert-lm` failed with the exact error above until #991 reframed the row as
-`no-spm`: it now reports **N/A**, and its premise is asserted under `verify` (see `no-spm` below).
+A third case, `capacitor-litert-lm` — a podspec whose MediaPipe dependencies `Package.swift` could not
+declare, so it claimed `android` only — was deleted with its two games in #1191. The
+`capacitorPlatformDeclarations.test.ts` rule it motivated (a package must not declare `ios` while its
+`Package.swift` lacks the podspec's dependencies) still stands, with no package in the repo to reach.
 
 ### Compiling the plugin CLASSES — two integration shapes (#981)
 
@@ -90,8 +81,9 @@ the reference Mac, warm SPM cache: **4–18 s each, ~59 s for all eight, and 56 
 gate.** Cold, each package pays its SPM fetch once (AppsFlyer, AppLovin and Adjust are real network
 artifacts); the numbers above are steady-state.
 
-⚠️ Those figures predate #991, which turned the `litert-lm` leg into an instant `N/A` — so seven
-packages build now, not eight, and the totals are a little lower than stated. Left as measured
+⚠️ Those figures predate #991, which turned the `litert-lm` leg into an instant `N/A`, and #1191,
+which deleted that package — so seven packages build now, not eight, and the totals are a little
+lower than stated. Left as measured
 rather than adjusted by arithmetic: nobody re-timed the gate, and a figure nobody measured is worse
 than a figure with a date on it.
 
@@ -101,9 +93,9 @@ code that ships and works. Two integration shapes exist and **the leg must match
 
 | shape | who | what the leg builds |
 |---|---|---|
-| `spm` | 6 of 8 — applovin-max, appsflyer, game-debug, modoki-iap, and 3d-test's adjust + applovin-max fork | the package's declared product, as `Package.swift` links it |
+| `spm` | 6 of 7 — applovin-max, appsflyer, game-debug, modoki-iap, and 3d-test's adjust + applovin-max fork | the package's declared product, as `Package.swift` links it |
 | `flat` | `capacitor-modoki-ota` | a **synthesised** single-target package holding plugin + core sources together |
-| `no-spm` | `capacitor-litert-lm` | **nothing** — it reports `N/A` with a required `reason` (see below) |
+| `no-spm` | none today | **nothing** — it reports `N/A` with a required `reason` (see below) |
 
 The `flat` shape exists because `OtaPlugin.swift` deliberately carries **no `import
 ModokiOtaCore`**: it ships as loose pbxproj file references compiled directly into the consuming
@@ -126,23 +118,12 @@ somebody decides its shape.
 
 #### `no-spm`, and why `N/A` is not `SKIP` (#991)
 
-`capacitor-litert-lm` was an `spm` row pinned `knownFail: '#991'`, on the theory that
-`Package.swift` was missing a dependency somebody would add. **It cannot be added:** Google
-publishes no SPM distribution of `MediaPipeTasksGenAI` — the pods its podspec names are prebuilt
-binaries built internally, and
-[google-ai-edge/mediapipe#5464](https://github.com/google-ai-edge/mediapipe/issues/5464) is open and
-unanswered.
-
-The reframing that resolved it is that **this is not an SPM package at all**:
-
-- `package.json` declares `capacitor: { android }` and nothing else, so `cap sync ios` never
-  registers the plugin in any consuming app;
-- it is compiled into no App target, which is why `capacitorPlatformDeclarations.test.ts` needed a
-  *second* rule to reach it;
-- that rule exists specifically to **forbid** it declaring `ios` until the manifest is fixed.
-
-So the leg was compiling a configuration the repo deliberately outlaws, for a platform the package
-does not claim, for a consumer (`games/llm-test`) that is iceboxed.
+**No row uses this shape today.** It was introduced for `capacitor-litert-lm`, previously an `spm`
+row pinned `knownFail: '#991'` on the theory that `Package.swift` was missing a dependency somebody
+would add. It could not be added — Google publishes no SPM distribution of `MediaPipeTasksGenAI` — and
+the package declared `capacitor: { android }` only, so it was not an SPM package at all and the leg was
+compiling a configuration the repo outlaws. That package was deleted in #1191; the runner and
+`nativePluginLegCoverage.test.ts` still model the shape for the next package that needs it.
 
 ⚠️ **`N/A` and `SKIP` mean different things and `--require-all` treats them differently.** A SKIP
 says *this runner could not check it* — install Xcode, provision a JDK, and it becomes a real
@@ -154,15 +135,11 @@ gate otherwise all-PASS.
 
 ⚠️ **An N/A row is only honest while its premise holds, so the premise is asserted — and it moved to
 a better gate.** `knownFail` self-expired by flipping to FAIL if the leg ever passed, but only on a
-machine with macOS *and* Xcode running `test:native`. The `no-spm` premise is checked by
-`capacitorPlatformDeclarations.test.ts` under **`npm run verify`** instead: declare `capacitor.ios`,
-or give `Package.swift` the podspec's dependencies, and it goes red naming the row. The stale-row
+machine with macOS *and* Xcode running `test:native`. A `no-spm` premise belongs in
+`capacitorPlatformDeclarations.test.ts` under **`npm run verify`** instead, where declaring
+`capacitor.ios` or giving `Package.swift` the podspec's dependencies goes red naming the row. The stale-row
 check now fires in front of whoever made it stale. The row's `reason` is required, printed in the
 gate summary, and enforced by `nativePluginLegCoverage.test.ts`.
-
-The platform this package actually ships on is covered separately: `android/class/capacitor-litert-lm`
-(#992) compiles its Kotlin class. ⚠️ Its `litertlm-android:+` dependency is a dynamic version, so that
-leg compiles against whatever is newest on the day it runs.
 
 ⚠️ **What a green `*/class/*` leg does NOT prove.** It compiles: the Swift or Java/Kotlin parses,
 resolves its imports and type-checks against the real Capacitor core (and, on Android, AndroidX and
@@ -199,7 +176,7 @@ run and verified them **on Android hardware only** — iOS was generated and nev
 
 ⚠️ **The emission rule is NOT understood, and this doc will not pretend otherwise.** That single run,
 same tool, produced a `SceneDelegate.swift` for eight projects and none for `demos/3d-physics-demo`
-or `games/chess` (which also have no `UIApplicationSceneManifest`). Nor does that run account for
+or `games/chess` (since deleted, #1191; it also had no `UIApplicationSceneManifest`). Nor does that run account for
 every file: there are **ten** tracked `SceneDelegate.swift` today — those eight, plus `games/iap-test`,
 plus `demos/postfx-demo`, which predates the run entirely and is where the trap was first found and
 fixed. Three separate origins, one unexplained split. Capacitor 8.5's templates — both
@@ -322,25 +299,6 @@ await GameDebug.startServer({ port: 9095 });
 const { running, connected } = await GameDebug.getStatus();
 ```
 
-### `capacitor-litert-lm` — on-device LLM
-
-On-device LLM inference (used by the `llm-test` game), with **one TS surface, two engines behind it**: Capacitor's `registerPlugin` routes each call to the native Android implementation (`LitertLmPlugin.kt` — LiteRT-LM Kotlin SDK) or, on web, to `LitertLmWeb` (`src/web.ts` — MediaPipe `@mediapipe/tasks-genai`, Gemma running via WebGPU). The definitions (`src/definitions.ts`) are the contract both sides implement.
-
-```typescript
-import { LitertLm } from 'capacitor-litert-lm';
-
-await LitertLm.downloadModel({ url, filename });        // Android only; progress via 'loadProgress'
-await LitertLm.loadModel({ modelPath, maxTokens: 1024 }); // topK/temperature/randomSeed optional
-const { conversationId } = await LitertLm.createConversation();
-await LitertLm.sendMessage({ conversationId, message }); // tokens stream via 'tokenReceived'
-```
-
-**Status machine:** `getStatus()` returns `idle | loading | ready | generating | error` + `modelName` + `errorMessage`; the JS callers poll it after a `{ ok: false }` result to surface the real error message.
-
-**Streaming.** `sendMessage` resolves only when generation completes; the actual output arrives token-by-token through the `'tokenReceived'` listener (`{ conversationId, token, done }`). `games/llm-test/runtime/services/CapacitorLLMService.ts` is the app-side wrapper — it registers the `tokenReceived` listener (filtered by `conversationId`) **before** calling `sendMessage`, forwards each token to an `onToken(token, done)` callback, and removes the listener in a `finally`. It similarly attaches a `loadProgress` listener around `loadModel` and multicasts to a `Set` of progress callbacks.
-
-**Model download is split by platform** (`games/llm-test/runtime/services/ModelDownloader.ts`): on **Android** `LitertLm.downloadModel` fetches via `HttpURLConnection` into app internal storage and returns the local file path (skipped if `isModelDownloaded` reports it present); on **web** the plugin's `downloadModel`/`isModelDownloaded` are no-ops — the game instead `fetch`es the model with a streaming reader for progress, stores it in the `caches.open('llm-models')` Cache API, and hands MediaPipe a `URL.createObjectURL(blob)`. Web's `loadModel` lazy-imports `@mediapipe/tasks-genai` (and its wasm fileset from jsdelivr) so the bundle isn't paid for off-web.
-
 ## Removing a plugin listener — `remove()` is NOT idempotent
 
 ⚠️ **Calling `.remove()` twice on one `PluginListenerHandle` silently evicts somebody ELSE's
@@ -364,7 +322,7 @@ then settles and its `finally` evicts the NEW listener — and that load's progr
 a multi-GB download with nothing erroring anywhere.
 
 **The shape that is safe** — the Set membership is the arbiter, so the two paths are mutually
-exclusive, and `games/llm-test/runtime/services/CapacitorLLMService.ts` is the worked example:
+exclusive (llm-test's `CapacitorLLMService.ts` was the worked example until #1191 deleted it):
 
 ```ts
 private activeListeners = new Set<PluginListenerHandle>();
@@ -506,7 +464,7 @@ four are fixed on `work-ai2`; check `git log`/the issues for whether that has re
 | #586 | `ModokiIapPlugin`'s parked `purchase()` call is a plugin FIELD that `Bridge.reset()` never clears, so the next realm's purchase was rejected forever; and a `purchasesUpdated` delivery in the reload window was dropped | A `WebViewListener.onPageStarted` releases the stale slot — registered at PARK time, **not** from `load()`; see the ⚠️ below. `purchasesUpdated` is now emitted `retainUntilConsumed: true` on both platforms, so a delivery with no listener is queued and drains into the next realm |
 | #587 | `AdsService.cleanup()` hung off a React unmount that never commits, so banners/MRECs survived every reload still refreshing and monetising with no listener — undercounting `ad_revenue`; and one interstitial was orphaned per `loadInterstitial` | `registerRealmShutdownTask` / `runRealmShutdownTasks` — the app registers, the runtime invokes (the reload sites are in `runtime/**` and cannot reach `appServices()`); plus destroy-before-reassign for the interstitial |
 | #588 | Crashlytics rate-limit budgets are module state, so a cap named "per session" was really per realm while native counted one session | The three session budgets seed from `sessionStorage`; a `[reload]` breadcrumb now explains the discontinuity in a post-reload report |
-| #585 | litert-lm re-loads an already-ready model — Android never closes the old `Engine`, iOS peaks at 2× resident | **Open, iceboxed.** The JS guard that would prevent it is a realm-scoped `let`, which is exactly the class above |
+| #585 | litert-lm re-loads an already-ready model — Android never closes the old `Engine`, iOS peaks at 2× resident | **Closed, not planned** — the plugin was deleted in #1191. The JS guard that would have prevented it was a realm-scoped `let`, exactly the class above |
 
 ⚠️ **#587's Court-side wiring is DORMANT in every build today, and the fix's stated motivation is
 therefore fixed for nobody yet.** `maxEnabled()` requires `APP_CONFIG.applovin.sdkKey !== ''` and the
@@ -727,13 +685,12 @@ re-run. The close-out sweep for #587 enumerated them — `grep -rnE "^let [a-zA-
 `engine/packages/modoki/src/runtime`, `engine/app` and `games/court/**` gives 123 module latches, 14
 of them named like once-per-process guards. Only those guarding NATIVE state are defects; a JS-only
 latch (`engineActions`, `register.ts`, `consoleCapture`, …) is CORRECT to reset, because the new
-realm genuinely must re-register. Where each of the three named ones stands:
+realm genuinely must re-register. Where each of the named ones stands (a third, llm-test's `LLMManager.ts`, was deleted in #1191):
 
 | Latch | Guards | Status |
 |---|---|---|
 | `ads.ts:initialized` | AppLovin (native) | **Covered** — #587's `app.cleanup` task tears the SDK down before the reload |
 | `attribution.ts:initialized`/`starting`/`attPrompted` | AppsFlyer + ATT (native) | **Guarded natively — #607.** The JS latches still die with the realm and `AttributionService` still declares only `init()`, so nothing tears them down; instead the invariant moved to where the state actually lives — a per-process static in the plugin's `start()`, on both ports. ⚠️ `initialize()` is deliberately still unguarded (the SDK declines to re-set its read-only devKey/appId). **RECONCILED on Android, 2026-09-04** — the "two launch events across a reload" reading this row used to carry is REFUTED as an attribution: a re-measurement on an S22 with the guard absent from the binary showed the reload's `start()` posts NO Launch, and that the second Launch came from the RESUME that followed. AppsFlyer's Launch is driven by the foreground transition, not by `start()`. So the guard is inert for Launch counts (it still stops a second `registerSessionReadyListener`). **iOS across a reload is still unmeasured.** Full run + the limits: `games/court/attribution.md` § "#607/#654 — the Android leg measured" (private) |
-| `llm-test/LLMManager.ts` | litert-lm engine (native) | **Open — #585**, iceboxed |
 
 `milestones.ts:started` looks like the same shape and is not: its `fired` ledger lives in
 `PlayerPrefs`, so a re-run is idempotent. That is the distinction to apply — not "is it a module

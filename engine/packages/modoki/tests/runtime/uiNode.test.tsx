@@ -202,9 +202,9 @@ describe('UINode inheritedFontFamily — the inherited font reaches form control
     expect(container.querySelector('input')!.style.fontFamily).toContain('Varela Round');
   });
 
-  /** The chess/llm-test case: neither game authors a scene font, so `inheritedFontFamily` is `''`
+  /** The no-scene-font case (chess and llm-test were it, before #1191): `inheritedFontFamily` is `''`
    *  and this MUST leave `fontFamily` absent, not fall back to `inherit` — an unconditional
-   *  `inherit` was rejected specifically because it would visibly change these two games'
+   *  `inherit` was rejected specifically because it would visibly change such a game's
    *  inputs from the platform's form font to `body`'s `system-ui` for no reason either asked
    *  for. Asserted as ABSENT (empty string on a CSSStyleDeclaration), not merely falsy. */
   it('an empty inheritedFontFamily leaves fontFamily unset on an <input> — no accidental "inherit"', () => {

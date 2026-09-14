@@ -1276,7 +1276,7 @@ of #202 named only `disable3D` and was wrong about the blast radius:
 
 | route | mechanism | projects |
 |---|---|---|
-| `disable3D: true` in the game config | `App.tsx` renders `Scene3D && !disable3D` | `games/chess`, `games/audio-demo` |
+| `disable3D: true` in the game config | `App.tsx` renders `Scene3D && !disable3D` | `games/audio-demo` |
 | `build.modules.render3d: false` | `Scene3D` is `null` at module scope (`__MODOKI_MODULE_RENDER3D__`) | `games/space-invader` |
 
 A 2D project that does neither (`games/court`, `games/text_demo`, `demos/2d-physics-demo`) mounts

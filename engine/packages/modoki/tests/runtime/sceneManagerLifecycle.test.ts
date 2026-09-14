@@ -157,12 +157,12 @@ describe('SceneManager ↔ scene-scoped manager lifecycle', () => {
 
     // Switch to a different game → dispose fires once, against the OLD (space)
     // world it was running on, not the freshly-promoted one.
-    await sceneManager.loadScene('/chess.json', { preloaded: sceneOf('chess') as never, gameId: 'chess' });
-    const worldChess = getCurrentWorld();
+    await sceneManager.loadScene('/puzzle.json', { preloaded: sceneOf('puzzle') as never, gameId: 'puzzle' });
+    const worldPuzzle = getCurrentWorld();
 
     expect(disposeWorlds).toHaveLength(1);
     expect(disposeWorlds[0]).toBe(worldSpace);
-    expect(disposeWorlds[0]).not.toBe(worldChess);
+    expect(disposeWorlds[0]).not.toBe(worldPuzzle);
   });
 
   it('does not activate a game-scoped manager whose games filter fails the active game', async () => {
@@ -170,7 +170,7 @@ describe('SceneManager ↔ scene-scoped manager lifecycle', () => {
     const init = vi.fn();
     managers.registerManager({ name: 'onlySpace', scope: 'game', games: ['space'], init });
 
-    await sceneManager.loadScene('/chess.json', { preloaded: sceneOf('chess') as never, gameId: 'chess' });
+    await sceneManager.loadScene('/puzzle.json', { preloaded: sceneOf('puzzle') as never, gameId: 'puzzle' });
     expect(init).not.toHaveBeenCalled();
   });
 

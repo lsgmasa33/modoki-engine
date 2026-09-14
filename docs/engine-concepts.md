@@ -16,9 +16,9 @@ specifically, see [managers-and-systems.md](./managers-and-systems.md).
 | **Component** (Trait) | pure data on an entity | — | typed fields | `Transform`, `UIElement` |
 | **World** | the container of entities | — | all entities + their traits | the active scene's world |
 | **System** | per-frame `update(world)` | **yes** | nothing (transforms ECS) | `animationSystem`, `shipShakeSystem` |
-| **Projection** | mirrors a store into ECS | on change (or a tick) | nothing | `chessChatProjection` |
-| **Manager** | event-driven logic owner | **no** | long-lived state + methods | `SceneManager`, `ChessManager` |
-| **Store** | reactive state container | — | the data the UI renders | `useChessStore` |
+| **Projection** | mirrors a store into ECS | on change (or a tick) | nothing | `uiTreeProjection` |
+| **Manager** | event-driven logic owner | **no** | long-lived state + methods | `SceneManager`, `CameraManager` |
+| **Store** | reactive state container | — | the data the UI renders | `useGameStore` |
 | **Service** | SDK / platform wrapper | — | a connection/handle | `ads`, `audio` |
 | **Utility** | pure function | — | nothing | `anchorLayout`, `render2DUtils` |
 
@@ -247,13 +247,13 @@ infrastructure that lives the whole session, e.g. Time/Navigation). Registered v
 `registerManager`, symmetric to `registerSystem`.
 
 ```ts
-class ChessManager implements ManagerDef {
-  // Scene-scoped: the LLM download in init() is expensive, so it waits for the
-  // chess scene to load rather than firing the moment the manager is registered
-  // (the editor registers every game's managers up front).
-  name = 'chess.controller'; scope = 'scene' as const; scenes = ['chess'];
-  actions = { 'chess.newGame': () => this.newGame() };
-  init() { /* start a new game + LLM download */ }
+// abridged from games/3d-test/runtime/PlaybackManager.ts
+class PlaybackManager implements ManagerDef {
+  // Scene-scoped: active only while the animation-preview scene is loaded, and
+  // disposed (its action unregistered) on swap away — the editor registers every
+  // game's managers up front, so scope is what keeps it from running elsewhere.
+  name = 'playback'; scope = 'scene' as const; scenes = ['2D Animation'];
+  actions = { 'playback.toggle': ({ world }) => { /* flip every authored rig's `playing` */ } };
 }
 ```
 
@@ -266,13 +266,13 @@ on entities the renderer draws). Two forms:
 
 - **Event-driven** (`registerProjection`) — subscribes to the store and runs at
   `PROJECTION` priority only on the first frame after the store changes or the
-  scene swaps. Use for **pure store→ECS mirrors** (`chessStateProjection`,
-  `llmStateProjection`).
+  scene swaps. Use for **pure store→ECS mirrors**. (No game registers one today —
+  the last ones left with `chess` and `llm-test` in #1191.)
 - **System** (`registerSystem`) — sync that *can't* be a pure mirror because it
   does genuine per-frame work the dirty flag would starve. Such code is a System
   and is **named `*System`, not `*Projection`** — the two reasons it shows up:
-  - it must poll for something no store change signals — `chessBoardSystem`
-    re-attaches a click handler whenever the PixiJS canvas remounts; or
+  - it must poll for something no store change signals — e.g. re-attaching a click
+    handler whenever a PixiJS canvas remounts; or
   - it runs the *reverse* direction (**ECS → store readback**), so there's no
     source store to subscribe to — 3d-test's `gameStatsSystem` reads GamePhase /
     entity count / FPS off ECS and writes the HUD store.
@@ -288,9 +288,10 @@ container** — pure data + setters, no logic, no tick. Its job is to be the
 *writes* the store; React components and Projections *read* it.
 
 The split inside a feature is sharp: **internal plumbing → Manager fields;
-reactive, displayed state → Store.** In `LLMManager` the `llmService` handle is a
-private field (never shown), while `messages`/`status`/`loadProgress` live in
-`useLLMStore` (rendered by the chat UI + projected to ECS).
+reactive, displayed state → Store.** In space-console, `CameraManager` owns the
+`spaceConsole.setCameraDistance` action and the store-hook registration (plumbing,
+never shown), while `cameraDistance`/`cameraDistanceText`/`cameraLodLabel` live in
+`useDebugStore` (rendered by the slider and its label).
 
 ### Service & Utility
 - **Service** — a stateful wrapper around a platform/SDK: `ads` (AppLovin MAX),
@@ -318,7 +319,7 @@ module with `register*`/`unregister*` + a lookup.
 The **write side / read side** pair is the symmetry that lets Managers/Systems
 expose a surface to declarative UI without coupling:
 
-- **Write:** a button's `UIAction` binding `{kind:'call', action:'chess.newGame'}`
+- **Write:** a button's `UIAction` binding `{kind:'call', action:'playback.toggle'}`
   dispatches a named action a Manager/System registered.
 - **Read:** a label's text `Time: {timeSinceGameStart}` resolves through the
   read-source registry to a Manager getter — no per-frame projection needed.
@@ -354,11 +355,12 @@ user clicks a button
   → UINode onClick → applyBindings(bindings,'click')        (gated by isSimRunning)
       ├─ kind:'set'  → write a trait field directly          e.g. UIElement.isVisible
       └─ kind:'call' → dispatchUIAction(name,…)
-           → a Manager/System handler runs                   e.g. ChessManager.newGame()
-               → writes a Store                               useChessStore.newGame()
-                   → Projection re-runs (store changed)       chessStateProjection
-                       → writes ECS entities                  status text, highlights
-                           → render sync paints it            Scene2D
+           → a Manager/System handler runs                   e.g. CameraManager's setCameraDistance (a slider)
+               → writes a Store                               useDebugStore.setCameraDistance()
+                   → EITHER a Projection re-runs              a registerProjection mirror
+                       → writes ECS entities → render sync paints them
+                   → OR the binding resolver reads the store  space-console's distance label
+                       (via its store hook) on the next UI render
 ```
 
 The reverse (a value flowing *to* a label) is the read side: the binding resolver

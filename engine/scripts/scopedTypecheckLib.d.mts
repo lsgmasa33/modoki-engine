@@ -21,7 +21,7 @@ export declare function foreignProjects(
   self: string,
 ): string[];
 
-/** The sanctioned cross-project imports, keyed by consumer label (`'games/chess'`). Mirrors
+/** The sanctioned cross-project imports, keyed by consumer label (e.g. `'games/court'`). Mirrors
  *  `KNOWN_ESCAPES` in `engine/tests/assets/gamePortability.test.ts`, guarded against drift. */
 export declare const KNOWN_CROSS_PROJECT: Readonly<Record<string, readonly string[]>>;
 

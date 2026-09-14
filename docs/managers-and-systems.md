@@ -34,10 +34,10 @@ naming them is what keeps logic from sprawling.
 
 | Role | Ticks? | Driven by | Holds | Examples |
 |------|--------|-----------|-------|----------|
-| **System** | yes | the frame clock | per-frame transform of ECS state | `timeSystem`, `animationSystem`, `shipShakeSystem`, `transformPropagationSystem`, render sync, `chessBoardSystem` (canvas-remount poll), `gameStatsSystem` (ECS→store readback) |
+| **System** | yes | the frame clock | per-frame transform of ECS state | `timeSystem`, `animationSystem`, `shipShakeSystem`, `transformPropagationSystem`, render sync, `gameStatsSystem` (ECS→store readback) |
 | **Manager** | no | events (clicks, scene swaps, SDK callbacks) | long-lived state + a method surface | `SceneManager`, `actionRegistry`, `audio`, (new) `NavigationManager`, `TimeManager` |
-| **Projection** | on change | store subscription (dirty flag) | mirrors state store→ECS, no logic | `uiTreeProjection`, `chessStateProjection` / `chessChatProjection`, `llmStateProjection` / `chatMessageProjection` |
-| **Store** | no | mutations | Zustand state container | `gameStore`, `engineStore`, `debugStore`, `chessStore`, `llmStore` |
+| **Projection** | on change | store subscription (dirty flag) | mirrors state store→ECS, no logic | `uiTreeProjection` |
+| **Store** | no | mutations | Zustand state container | `gameStore`, `engineStore`, `debugStore` |
 | **Trait / Service / Utility** | no | n/a | pure data / SDK wrapper / pure fn | `UIElement`, `ads`, `anchorLayout`, `render2DUtils` |
 
 ### The litmus test
@@ -58,9 +58,10 @@ change* and mirror a store into ECS (or back). They're correctly Systems (they
 tick), but six of them hand-roll per-frame change detection. `uiTreeProjection`
 already solved this with a **dirty flag** (`markUIDirty`). `registerProjection(name, store, syncFn)`
 (`runtime/core/projection.ts`) now generalizes that: it subscribes to the store and runs `syncFn`
-only on change, turning a per-frame poller into an event-driven sync. It **shipped and is in use** —
-`games/chess/runtime/setup.ts` and `games/llm-test/runtime/setup.ts` register four projections
-through it between them. Converting any remaining hand-rolled pollers is mechanical.
+only on change, turning a per-frame poller into an event-driven sync. It **shipped**, but ⚠️ **no
+game registers one today**: its only callers were `chess` and `llm-test` (four projections between
+them), deleted in #1191, so it is exercised by `projection.test.ts` alone. Converting any remaining
+hand-rolled pollers is mechanical.
 
 ## The Manager primitive
 
@@ -104,11 +105,10 @@ game's `setup.ts` and can't ripple an `await` into every game's setup. (Before #
 `deactivate()` synchronously and could tear a manager down mid-init.) That ordering has **no
 producer today**: every engine manager (`TimeManager`, `NavigationManager`,
 `physics2DEventsManager`, `physics3DEventsManager`, `zone2DEventsManager`,
-`zone3DEventsManager`, `timelineEventsManager`, `inputSourcesManager`) is synchronous, and the
-two managers doing real async work — `games/chess/runtime/ChessManager.ts` and
-`games/llm-test/runtime/LLMManager.ts` — declare `init(): void` and fire-and-forget
-(`void this.initLLM()`) *deliberately*: returning that promise would block `loadScene` on an LLM
-model download. So a manager that fires-and-forgets its async work is invisible to the dispose
+`zone3DEventsManager`, `timelineEventsManager`, `inputSourcesManager`) is synchronous. The two game
+managers that did real async work — chess's and llm-test's LLM managers, deleted
+in #1191 — declared `init(): void` and fired-and-forgot (`void this.initLLM()`) *deliberately*:
+returning that promise would have blocked `loadScene` on a model download. So a manager that fires-and-forgets its async work is invisible to the dispose
 ordering above — the registry has no way to know it's still initializing — and if it holds
 world-bound state, its own async continuation must re-check "is my activation still current"
 before touching that state, since a scene swap mid-flight can dispose it without waiting.
@@ -119,16 +119,15 @@ outgoing scene's/game's teardown (#487 item 5).
 
 **The `registerManager`/`unregisterManager` deferral creates a contract worth stating plainly.**
 Manager defs are module-level singletons passed to `registerManager` *by identity*
-(`games/llm-test/runtime/setup.ts`, `games/chess/runtime/setup.ts`,
-`games/space-console/runtime/setup.ts`, `engine/app/ecs/register.ts`), so on a re-register the
+(`games/space-console/runtime/setup.ts`, `engine/app/ecs/register.ts`), so on a re-register the
 old entry and the new entry share ONE def object. Before #518, `dispose(old)` always ran before
 `init(new)`; now, whenever `initPromise` is non-null, `dispose(old)` runs AFTER `init(new)` has
 already completed — on the SAME instance, tearing down what the successor just built.
 `actionOwner` (keyed on `Entry.activationId`) closes this for UIAction *names* only — a deferred
 teardown releases only the names it still owns, not ones a newer activation has since claimed —
 but nothing guards the manager's own fields or any other named global its `dispose()` releases
-(`LLMManager.dispose()`'s `this.generation++; this.llmService = null; clearMessages()` is exactly
-that shape). **A manager whose `init()` returns a promise must tolerate its own `dispose()`
+(the deleted `LLMManager.dispose()`'s `this.generation++; this.llmService = null; clearMessages()`
+was exactly that shape). **A manager whose `init()` returns a promise must tolerate its own `dispose()`
 running after a successor's `init()` on the same def instance.** Like the ordering above, this
 has no live producer either — the sweep of shipped `ManagerDef`s above still holds — so #518 is
 future-proofing this invariant ahead of the first async `init()`, not fixing an observed bug.
@@ -145,7 +144,7 @@ lifetimes, each keyed on a different thing:
 | `init()` fires | when a matching scene loads | when its game becomes active | once, at `registerManager` |
 | `dispose()` fires | on every swap away, **before** the old world dies | when the **active game changes**, not on in-game swaps | only at `unregisterManager` |
 | State | reset per scene — **cannot leak** | persists across a game's scenes | persists the whole session |
-| Use for | per-screen controllers, card spawning, **single-scene controllers with an expensive init** (e.g. the chess / llm-test LLM download) | a controller genuinely spanning a game's scenes (e.g. the space-console camera across Station↔Warp) | engine infrastructure (Time, Navigation) and global cross-game actions (return-to-hub) |
+| Use for | per-screen controllers, card spawning, **single-scene controllers** (e.g. 3d-test's `PlaybackManager`, active only in its animation-preview scene) | a controller genuinely spanning a game's scenes (e.g. the space-console camera across Station↔Warp) | engine infrastructure (Time, Navigation) and global cross-game actions (return-to-hub) |
 
 **`activeGameId` is cleared when a game teardown STARTS, not just set when one succeeds (#539).**
 `initGameManagersFor` writes it on success, and `disposeActiveGameManagers` clears it to `null` at
@@ -250,7 +249,7 @@ If reload is the sanctioned restart, something has to *fire* it. `runtime/core/r
 session is replaced rather than resumed. Off by default: **the threshold is authored data**
 (`runtime.reloadAfterBackgroundMinutes` in `project.config.json`, in the editor's Project Settings),
 because a reload only preserves what the GAME persists. Court and Wordweave each hand-rolled a
-mid-level serializer; `sling`, `chess`, `space-invader` and `alien-animal` persist nothing and would
+mid-level serializer; `sling`, `space-invader` and `alien-animal` persist nothing and would
 lose the session. Capped at 1 minute whenever `build.debugBuild` is on (owner, 2026-09-02) — a ten-minute wait per
 iteration means the trigger is exercised once and assumed correct thereafter.
 
@@ -323,7 +322,7 @@ reason. Do not read this historical entry as license to "fix" a missing device l
 the code did not run on a build made after #591 — go verify instead.
 
 ⚠️ **A realm death is not a process death, and the guards in this repo confuse the two.** Every
-existing double-init latch — `ads.ts`, `attribution.ts`, `LLMManager.ts` — is a module `let`, and
+existing double-init latch — `ads.ts`, `attribution.ts`, and the deleted `LLMManager.ts` — is a module `let`, and
 every comment reasoning about them reasons about StrictMode and game swaps. A reload destroys the
 realm while the native process, and every native SDK in it, lives on. Where a once-per-process
 guard is genuinely needed it must live **natively**; a `let` cannot see this. The defects that
@@ -331,7 +330,7 @@ follow from getting it wrong were filed as #584-#588, and all of them predate th
 shipped paths already reloaded before it (`engine.reload`, `EditorBootBoundary`, Court's post-wipe
 restart).
 
-**#584, #586, #587 and #588 are fixed on `work-ai2` (not yet merged to `main`); #585 (litert-lm) is open and iceboxed.** The native
+**#584, #586, #587 and #588 are fixed on `work-ai2` (not yet merged to `main`); #585 (litert-lm) was closed as not planned when the plugin was deleted (#1191).** The native
 half of this — what `bridge.reset()` does and does not clear, why retained events drain exactly
 once, the per-process init each shipped game does, and a table of all five defects with their fixes
 — lives in [native-and-sdks.md](native-and-sdks.md) § "What a webview reload does and does not
@@ -362,23 +361,20 @@ actions*. Other code calls its methods by importing it directly — no
 `getManager(name)` lookup.
 
 ```ts
-// chess/managers/ChessManager.ts — logic lives HERE
-class ChessManager {
-  name = 'chess';
-  // Scene-scoped (single-scene game): the LLM download in init() is expensive,
-  // so it must wait for the chess scene to actually load — NOT fire just because
-  // the editor registered every game's systems up front.
-  scope = 'scene' as const; scenes = ['chess'];
+// games/space-console/runtime/CameraManager.ts (abridged) — logic lives HERE
+class CameraManager implements ManagerDef {
+  name = 'spaceConsole.camera';
+  // Game scope: persists across the space-console scenes (Station↔Warp). The `games`
+  // filter keeps it off while the editor — which registers every game's managers up
+  // front — has a different game's scene loaded.
+  scope = 'game' as const; games = ['space-console'];
   actions = {
-    'chess.newGame':    () => this.newGame(),
-    'chess.boardClick': ({ payload }) => this.boardClick(payload),
+    'spaceConsole.setCameraDistance': { params: { distance: { type: 'number' } }, handler: /* … */ },
   };
-  init()   { this.startLLMDownload(); }
-  dispose(){ this.cancelLLM(); }
-  handleAITurn() { /* … */ }   // called from the move callback
-  newGame()      { /* … */ }
+  init()    { addStoreHook(useDebugStoreSelector); }
+  dispose() { removeStoreHook(useDebugStoreSelector); }
 }
-export const chessManager = new ChessManager();
+export const cameraManager = new CameraManager();
 ```
 
 ## Write side & read side: the two registries
@@ -606,7 +602,6 @@ registerShaders([stripes, matcap, planet]);
 
 | Today (scattered) | After (owned) |
 |---|---|
-| `chess/init.ts`: `handleAITurn`/`newGame`/`handlePlayerChat` + ad-hoc `registerUIAction` | `ChessManager` (scene scope) — methods + `actions` map |
 | `scene-selector/init.ts`: private `navigateBack`/`selectGame` + `spawnGameCards` | nav → engine `NavigationManager`; cards → `SceneSelectorManager` (scene scope) |
 | `space-console/setup.ts`: inline `setCameraDistance` closure | `CameraManager` owns it |
 

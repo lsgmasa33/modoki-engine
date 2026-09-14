@@ -118,7 +118,7 @@ describe('test files reach the filesystem through os.tmpdir(), not a literal POS
 
   /** Every `.test.ts`/`.test.tsx` under `dir`, via the shared corpus producer
    *  (#799/#771/#805 Phase 4). `floor: 0` deliberately — a per-project `tests/` root can
-   *  legitimately hold as few as 1 matching file today (`games/chess`), so the real
+   *  legitimately hold as few as 1 matching file (`games/chess` did, before #1191), so the real
    *  non-vacuity pin lives in the two `it()`s below instead (`files.length > 100` and a
    *  per-root coverage check), not in this producer's own floor. */
   function testFiles(dir: string): string[] {

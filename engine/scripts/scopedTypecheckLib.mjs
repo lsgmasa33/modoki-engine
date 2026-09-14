@@ -98,15 +98,15 @@ export function foreignProjects(listed, projects, self) {
   return [...found];
 }
 
-/** The ONE sanctioned cross-project import in the repo, so `foreignProjects` does not false-red
- *  on it: `games/chess` reaches into `games/llm-test` (CLAUDE.md § Games must be SELF-CONTAINED,
- *  "one allowlisted exception, pending extraction").
+/** The sanctioned cross-project imports, so `foreignProjects` does not false-red on them — EMPTY
+ *  today (CLAUDE.md § Games must be SELF-CONTAINED). The one entry it held, `games/chess` reaching
+ *  into `games/llm-test`, left with both games (#1191).
  *
  *  ⚠️ A hand-kept copy of `KNOWN_ESCAPES` in engine/tests/assets/gamePortability.test.ts, and it
  *  is guarded rather than trusted: typecheckProjectsSelection.test.ts derives the project pairs
  *  from that Set and asserts they agree with this map, so adding or extracting an escape reddens
  *  instead of silently widening (or falsely narrowing) this gate. */
-export const KNOWN_CROSS_PROJECT = { 'games/chess': ['games/llm-test'] };
+export const KNOWN_CROSS_PROJECT = {};
 
 /** On failure, `err.stdout` carries the whole `--listFiles` dump ahead of the diagnostics —
  *  ~2400 absolute paths per project, which would bury one real type error inside verify's report.

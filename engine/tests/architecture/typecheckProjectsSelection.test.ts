@@ -259,7 +259,7 @@ const POSIX_DUMP = [
   '/repo/games/court/node_modules/@capacitor/core/types.d.ts',
   '/repo/games/court/packages/x/dist/index.d.ts',
   '/repo/games/court-adjacent/other.ts',
-  '/repo/games/llm-test/runtime/services/LLMService.ts',
+  '/repo/games/wordweave/runtime/services/Lexicon.ts',
 ].join('\n');
 
 describe('the coverage predicate', () => {
@@ -286,8 +286,8 @@ describe('the coverage predicate', () => {
 describe('the scoping proof', () => {
   const projects = [
     { root: 'games', name: 'court', dir: '/repo/games/court' },
-    { root: 'games', name: 'llm-test', dir: '/repo/games/llm-test' },
-    { root: 'games', name: 'chess', dir: '/repo/games/chess' },
+    { root: 'games', name: 'wordweave', dir: '/repo/games/wordweave' },
+    { root: 'games', name: 'sling', dir: '/repo/games/sling' },
   ];
 
   it('names the OTHER projects that reached the program', () => {
@@ -295,7 +295,7 @@ describe('the scoping proof', () => {
     // include shape to the wide program leaves every project reporting a healthy count and all
     // 29 green, with this leg reduced to `npm run typecheck` run once per project and #24's mask
     // fully restored. Measured: that mutation passed 29/29 against the inclusion check alone.
-    expect(foreignProjects(POSIX_DUMP, projects, 'games/court')).toEqual(['games/llm-test']);
+    expect(foreignProjects(POSIX_DUMP, projects, 'games/court')).toEqual(['games/wordweave']);
   });
 
   it('reports nothing when the program really is scoped', () => {
@@ -306,14 +306,15 @@ describe('the scoping proof', () => {
 
 describe('KNOWN_CROSS_PROJECT', () => {
   it('agrees with gamePortability.test.ts KNOWN_ESCAPES — a hand-kept copy, guarded', () => {
-    // The allowance exists so chess->llm-test does not false-red the scoping proof. It duplicates
-    // knowledge that already has an owner, so it is DERIVED here and compared: extract the escape
-    // (issue is open) or add another, and this reddens instead of the gate silently widening.
+    // The allowance exists so a sanctioned cross-project import does not false-red the scoping
+    // proof (none today — the chess->llm-test one left with both games in #1191). It duplicates
+    // knowledge that already has an owner, so it is DERIVED here and compared: add or remove an
+    // escape on one side only, and this reddens instead of the gate silently widening.
     // #812: guards read source through the shared reader, which strips comments by extension and
     // runs assertScanIsSane. Correct here rather than merely compliant — KNOWN_ESCAPES is CODE, so
     // a commented-out entry must not be picked up as a live one.
     const { code: src } = readScannedSource(join(REPO, 'engine/tests/assets/gamePortability.test.ts'));
-    const block = src.match(/const KNOWN_ESCAPES = new Set\(\[([\s\S]*?)\]\)/);
+    const block = src.match(/const KNOWN_ESCAPES(?::[^=]*)? = new Set\(\[([\s\S]*?)\]\)/);
     expect(block, 'KNOWN_ESCAPES not found — gamePortability.test.ts changed shape').toBeTruthy();
 
     const derived: Record<string, Set<string>> = {};

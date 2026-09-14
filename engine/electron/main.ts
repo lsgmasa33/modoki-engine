@@ -1021,14 +1021,12 @@ async function createWindow(backendBase: string) {
   // (the developer's own trusted machine). Navigation + window-open hardening
   // above is the primary protection in both.
   //
-  // `script-src`/`worker-src` include `https:` so an on-device-LLM game (chess,
-  // llm-test) can load MediaPipe's GenAI wasm loader `<script>` + inference worker
-  // from its CDN (jsdelivr) — the ONLY external-script need in the tree (the KTX2
-  // transcoder self-hosts libktx to avoid its CDN). This does NOT weaken the posture:
-  // `script-src` already carries `'unsafe-inline' 'unsafe-eval'`, so arbitrary code
-  // is already permitted; the bound that matters is loopback+https, matching the
-  // `https:` already granted to img/media/connect. Without it the CDN `<script>` is
-  // blocked → "Resource load error: genai_wasm_internal.js" and the game never loads.
+  // `script-src`/`worker-src` grant NO remote origin (#1191): code comes only from
+  // loopback or a blob. They used to carry `https:` for exactly one consumer —
+  // MediaPipe's GenAI wasm loader for the on-device-LLM games — and that grant went
+  // with those games. `https:` stays on img/media/connect for remote asset refs and
+  // fetches. A game needing a remote script should self-host it (three's Basis transcoder
+  // and Pixi's KTX transcoder already do) rather than widen this. Contract: csp.ts.
   if (PROD) {
     const csp = buildProdCsp(PROD_CSP_ORIGINS);
     win.webContents.session.webRequest.onHeadersReceived((details, cb) => {

@@ -2,7 +2,7 @@
  *
  *  ⚠️ **THIS LIVED INSIDE `scene3DSync.ts` AND THAT WAS THE BUG.** `resolveActiveTier` ran from
  *  exactly one call site, `makeWebGPURenderer`, so a project that never mounts `Scene3D` —
- *  `disable3D: true` on `games/chess` and `games/audio-demo`, `build.modules.render3d: false` on
+ *  `disable3D: true` on `games/audio-demo`, `build.modules.render3d: false` on
  *  `games/space-invader` — resolved NO tier at all, and every field in the `rendering.three.tiers`
  *  config those projects were seeded with has done nothing since. Extracting the decision is what
  *  lets a 2D boot reach it, and `scene3DSync` now imports the same function it used to own so the

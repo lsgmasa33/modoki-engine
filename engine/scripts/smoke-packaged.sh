@@ -202,8 +202,8 @@ done
 [ "$DEAD" = 1 ] || echo "[smoke] WARNING: first instance (pid $PID) still alive 10s after kill — proceeding anyway, CSP leg may race it"
 
 # ── CSP gate (separate boot, CDP-based — the render checks above can't see it) ──
-# A CSP-blocked CDN script (MediaPipe wasm loader for chess/llm-test) doesn't blank
-# the editor, so the render assertions pass while the on-device-LLM path is broken.
+# A wrong CSP doesn't blank the editor, so the render assertions above pass either way —
+# this leg checks the policy the shipped binary actually enforces.
 echo "[smoke] asserting prod CSP on the built app…"
 if node "$REPO/engine/scripts/assert-app-csp.mjs" "$APP" "$PROJECT"; then
   echo "[smoke] ok: prod CSP correct"

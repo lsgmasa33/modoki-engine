@@ -22,8 +22,7 @@ modoki/                          # Git root (this clone: the integration hub on 
 │   │   │       │                #     (layered L0-L3, see docs/architecture-layers.md; ships in production)
 │   │   │       ├── editor/      #     panels/ scene/ store/ (dev-only, not shipped)
 │   │   │       └── three/       #     Three.js integration (Light, Environment traits)
-│   │   ├── capacitor-game-debug/#   Native debug bridge (TCP server + Modoki lease handshake)
-│   │   └── capacitor-litert-lm/ #   On-device LLM plugin (LiteRT) — used by llm-test
+│   │   └── capacitor-game-debug/#   Native debug bridge (TCP server + Modoki lease handshake)
 │   ├── electron/                # Desktop editor app (electron-builder + autoUpdate self-update)
 │   ├── plugins/                 # Vite/build plugins (asset scanner, texture convert, vendor,
 │   │                            #   heal native config, add native target, reimport registry, …)
@@ -42,8 +41,7 @@ modoki/                          # Git root (this clone: the integration hub on 
 │   ├── alien-animal/            # skeletal-animation showcase (com.modokiengine.alienanimal)
 │   ├── sling/                   # 3D physics gameplay (Rapier3D) — the single-source-of-truth worked example
 │   ├── audio-demo/              # declarative audio · particle/ · text_demo/ · skin-test/
-│   ├── space-console/           # planet scene + camera manager
-│   └── chess/ · llm-test/       # other flat projects
+│   └── space-console/           # planet scene + camera manager
 ├── demos/                       # SAME project format as games/ — the CURATED, PUBLISHABLE set.
 │   │                            # A project lives here iff we intend to publish it: owned/CC0
 │   │                            # assets, web-only SNAPSHOT, public README + ATTRIBUTION.md. IS

@@ -404,7 +404,7 @@ describe('shippable code does not fake spacing with whitespace (#841)', () => {
 
   it.skipIf(!hasInternalGames())('every newline literal in game/demo code is a reviewed exemption', () => {
     // Keyed by FILE and COUNT. Every known site is a file of non-UI text, where a per-literal ledger
-    // would be thirteen rows saying the same thing about ChessAI.ts — but a bare file key would also
+    // would be a dozen rows saying the same thing about one prompt-building file — but a bare file key would also
     // excuse the NEXT newline literal anyone adds to that file, UI-bound or not. The count makes a
     // new literal change the key, so it goes red and gets looked at.
     const perFile = new Map<string, number>();
@@ -418,8 +418,6 @@ describe('shippable code does not fake spacing with whitespace (#841)', () => {
       floor: 1,
       fix: FIX,
       exempt: [
-        { item: 'games/chess/runtime/ai/ChessAI.ts ×13', reason: 'assembles the LLM prompt (system prompt, board, move history) sent to the model — never rendered' },
-        { item: 'games/chess/runtime/ChessManager.ts ×1', reason: 'the chat-reply LLM prompt — sent to the model, never rendered; the REPLY is runtime text this scan cannot see' },
         { item: 'games/wordweave/runtime/dictionary.ts ×1', reason: "'\\n' is the delimiter of the word list it indexes — parsing data, never displayed" },
       ],
     });

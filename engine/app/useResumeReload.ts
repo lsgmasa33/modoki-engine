@@ -10,7 +10,7 @@
  *  the project's `project.config.json`, reachable from the editor's Project Settings dialog. It
  *  defaults to 0 (off) and each project opts in — because the reload only preserves what that
  *  game persists, and most games persist nothing mid-level. `games/court` and `games/wordweave`
- *  each hand-rolled a session serializer; `games/sling`, `chess`, `space-invader` and
+ *  each hand-rolled a session serializer; `games/sling`, `space-invader` and
  *  `alien-animal` would lose the whole session.
  */
 

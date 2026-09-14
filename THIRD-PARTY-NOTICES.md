@@ -34,7 +34,6 @@ dependencies and their licenses.
 | @zappar/msdf-generator | MIT | MSDF text atlas |
 | maxrects-packer | MIT | Atlas packing |
 | chokidar | MIT | File watching (dev) |
-| chess.js | BSD-2-Clause | Chess rules (demo dependency) |
 
 All of the above are permissive (MIT / ISC / BSD / Apache-2.0) and compatible with redistribution
 under Apache-2.0.

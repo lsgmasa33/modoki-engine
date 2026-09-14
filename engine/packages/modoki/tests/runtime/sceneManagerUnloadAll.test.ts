@@ -237,13 +237,13 @@ describe('SceneManager #542 — activeScenePath after unloadAll races a post-swa
 
     // M_game: scope 'game', belongs to the NEW game only. Still inactive right
     // now (activeGameId is 'space') — it activates only once the load below
-    // changes games and calls initGameManagersFor('chess', ...). This is the
+    // changes games and calls initGameManagersFor('puzzle', ...). This is the
     // asymmetric extra hop that keeps the load parked behind the teardown.
     let resolveGame: () => void = () => {};
     let gameInitStarted = false;
     const hangGame = new Promise<void>((resolve) => { resolveGame = resolve; });
     managers.registerManager({
-      name: 'M_game', scope: 'game', games: ['chess'],
+      name: 'M_game', scope: 'game', games: ['puzzle'],
       init: () => { gameInitStarted = true; return hangGame; },
     });
 
@@ -251,7 +251,7 @@ describe('SceneManager #542 — activeScenePath after unloadAll races a post-swa
     // awaited: its swap commits (primaryId -> A, currentWorld -> worldA,
     // clearing `nextLoad`), then its tail parks in `disposeActiveSceneManagers`
     // on M_scene's still-hanging init.
-    const pA = sceneManager.loadScene('/sceneA.json', { preloaded: sceneOf('A') as never, gameId: 'chess' });
+    const pA = sceneManager.loadScene('/sceneA.json', { preloaded: sceneOf('A') as never, gameId: 'puzzle' });
     // Suppress the "unhandled rejection" warning for the window between A
     // rejecting (which can happen as soon as `resolveScene()` below, on the
     // fixed code) and the `await expect(pA).rejects...` further down that

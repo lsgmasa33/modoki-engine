@@ -138,8 +138,8 @@ function deactivate(entry: Entry, ctx?: ManagerContext): void {
  *  ✅ CLOSED (#573). `actionOwner` closed this for UIAction NAMES only, and for a while nothing
  *  guarded the manager's own fields or any other named global its `dispose()` released — so the
  *  rule was that a manager whose `init()` returns a promise had to TOLERATE its own `dispose()`
- *  running after a successor's `init()` (e.g. `LLMManager.dispose()`, which nulls `llmService` and
- *  clears messages). It no longer has to: the continuation below drops a superseded teardown by
+ *  running after a successor's `init()` (e.g. llm-test's `LLMManager.dispose()`, since deleted in
+ *  #1191, which nulled `llmService` and cleared messages). It no longer has to: the continuation below drops a superseded teardown by
  *  checking whether a DIFFERENT, live entry now holds this same def instance. ⚠️ The check is on
  *  the def, NOT on `entry.activationId` — `registerManager` builds a fresh Entry for the
  *  replacement, so the old entry's activationId never moves and comparing it guards nothing.

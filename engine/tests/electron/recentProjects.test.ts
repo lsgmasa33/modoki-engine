@@ -234,10 +234,10 @@ describe('chooseInitialProject — two-clone auto-open guard', () => {
   });
 
   it('MODOKI_PROJECT hard override always wins', () => {
-    const c = chooseInitialProject({ ...base, envProject: `${cloneB}/games/chess`, recents: [`${cloneA}/games/skin-test`] });
+    const c = chooseInitialProject({ ...base, envProject: `${cloneB}/games/puzzle`, recents: [`${cloneA}/games/skin-test`] });
     // The hard override is path.resolve'd by the code (absolutizes MODOKI_PROJECT) — on Windows
     // that stamps a drive + backslashes onto these POSIX fixtures, so resolve the expected too.
-    expect(c).toEqual({ kind: 'path', path: path.resolve(`${cloneB}/games/chess`) });
+    expect(c).toEqual({ kind: 'path', path: path.resolve(`${cloneB}/games/puzzle`) });
   });
 
   it('dev: reopens the most-recent recent UNDER this clone, skipping a sibling clone on top', () => {
@@ -258,8 +258,8 @@ describe('chooseInitialProject — two-clone auto-open guard', () => {
   });
 
   it('single-clone dev: unchanged — reopens the global most-recent (all recents are under repo)', () => {
-    const c = chooseInitialProject({ ...base, recents: [`${cloneB}/games/chess`, `${cloneB}/games/skin-test`] });
-    expect(c).toEqual({ kind: 'path', path: `${cloneB}/games/chess` });
+    const c = chooseInitialProject({ ...base, recents: [`${cloneB}/games/puzzle`, `${cloneB}/games/skin-test`] });
+    expect(c).toEqual({ kind: 'path', path: `${cloneB}/games/puzzle` });
   });
 
   it('packaged: skips the clone guard — reopens the global most-recent wherever it lives', () => {

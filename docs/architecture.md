@@ -507,7 +507,7 @@ project's `game.ts` from the backend, so switching projects needs no editor rebu
 traits; the game's own `runtime/setup.ts` registers its systems, projections, and trait
 metadata. Current projects: `3d-test` (Tropical Island — Three.js/NPR/model import,
 iOS+Android native), `alien-animal` (skeletal-animation showcase), `space-console`,
-`chess`, `llm-test`, and others; the template scaffold lives at `engine/templates/starter`.
+and others; the template scaffold lives at `engine/templates/starter`.
 
 ### The boot effect runs EXACTLY ONCE per `gameId` (#267)
 

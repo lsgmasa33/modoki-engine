@@ -215,7 +215,7 @@ const byName = new Map<string, Entity>();
 // `onWorldSwap(...)` here would fire on IMPORT, and this module is pulled in by every game's chrome
 // (Court's alone has 25 test files importing `resetSceneChromeCache`, several mocking
 // `core/ecs/world` with an explicit export list); a call inside a function does not run until
-// something actually calls it. Same pattern as `chessChatProjection.ts` / `uiTreeStore.ts`.
+// something actually calls it. Same pattern as `uiTreeStore.ts`.
 let _initialized = false;
 function ensureInitialized(): void {
   if (_initialized) return;

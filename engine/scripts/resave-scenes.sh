@@ -22,7 +22,7 @@
 #    (docs/scene-loading.md, the provenance rule) — so games/chess no longer bakes its ~70
 #    runtime entities. The MUTATION half — a stopped-mode system writing to an AUTHORED
 #    entity, which no tag can reach — is fixed too, but only for a projection that opts in
-#    with `pauseWhileStopped` (chess + llm-test do; verified live, their load→save is now
+#    with `pauseWhileStopped` (chess + llm-test did, before #1191 deleted them; verified live, their load→save is now
 #    semantically a no-op). The hazard therefore remains OPEN for any other project: a save
 #    now WARNS, naming each authored field a system rewrote while stopped, so read the
 #    editor console before trusting a sweep. (games/space-invader was also excluded, for #123 — the manifest

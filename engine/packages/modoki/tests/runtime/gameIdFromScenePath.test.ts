@@ -8,7 +8,7 @@ import { gameIdFromScenePath } from '../../src/runtime/scene/SceneManager';
 
 describe('gameIdFromScenePath', () => {
   it('extracts the id from a games/<id>/ path (leading slash or not)', () => {
-    expect(gameIdFromScenePath('/games/chess/runtime/assets/scenes/chess.json')).toBe('chess');
+    expect(gameIdFromScenePath('/games/puzzle/runtime/assets/scenes/puzzle.json')).toBe('puzzle');
     expect(gameIdFromScenePath('games/space-console/runtime/assets/scenes/Station.json')).toBe('space-console');
     expect(gameIdFromScenePath('/games/3d-test/scenes/island.json')).toBe('3d-test');
   });
@@ -21,7 +21,7 @@ describe('gameIdFromScenePath', () => {
   });
 
   it('requires a trailing slash after the id (a bare games/<id> file is not a game scene)', () => {
-    // `games/chess` with no following slash isn't the scene-dir convention.
-    expect(gameIdFromScenePath('/games/chess')).toBeNull();
+    // `games/puzzle` with no following slash isn't the scene-dir convention.
+    expect(gameIdFromScenePath('/games/puzzle')).toBeNull();
   });
 });

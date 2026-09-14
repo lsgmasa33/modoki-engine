@@ -3902,7 +3902,7 @@ variant meant for the PixiJS/Scene2D path, which the DOM can't decode. Always go
 ## Custom React UI per game
 
 Sometimes a game's UI is easier to write as a hand-authored React component than as ECS
-entities (chat transcripts, a chessboard, etc.). A game's `GameDefinition` (exported as
+entities (a chat transcript, a dense custom widget, etc.). A game's `GameDefinition` (exported as
 `game` from its `game.ts`) may set an optional `UIComponent`:
 
 ```ts
@@ -3915,14 +3915,15 @@ Lazy-load it to keep it out of the main bundle:
 
 ```ts
 UIComponent: React.lazy(() =>
-  import('./chess/runtime/ui/ChessGameUI').then(m => ({ default: m.ChessGameUI })),
+  import('./runtime/ui/MyGameUI').then(m => ({ default: m.MyGameUI })),
 )
 ```
 
 `app/App.tsx` wires it up: the custom UI is wrapped in a `GameUIErrorBoundary` whose
 fallback is `DefaultGameUILayer`, inside a `<Suspense>` — so if the custom UI crashes or
-is still loading, the default ECS UI takes over. Games currently using it: **llm-test**
-(`LLMGameUI`) and **chess** (`ChessGameUI`).
+is still loading, the default ECS UI takes over. ⚠️ **No game uses it today** — its only two
+users, `llm-test` (`LLMGameUI`) and `chess` (`ChessGameUI`), were deleted in #1191, so nothing in
+the repo exercises this path end to end.
 
 ### Store-hook injection (`addStoreHook` / `removeStoreHook`)
 

@@ -7,7 +7,7 @@
  *    - **`build.modules.render3d: false` DCEs `three/webgpu`** (~173 KB). `games/space-invader`
  *      drives the playable-ad export and its 5 MB budget; importing the probe would pull the whole
  *      3D renderer back into a bundle that deliberately excluded it.
- *    - **`disable3D: true`** (`games/chess`, `games/audio-demo`) mounts no `Scene3D`, so nothing
+ *    - **`disable3D: true`** (`games/audio-demo`) mounts no `Scene3D`, so nothing
  *      ever called `makeWebGPURenderer` and no tier was ever resolved — every authored tier field
  *      on those projects was inert.
  *
@@ -18,7 +18,7 @@
  *  ⭐ **ONE INSTRUMENT, NOT TWO — this REPLACED the Three path rather than joining it.** The
  *  tempting shape was "keep Three for 3D projects, add this for 2D ones", and it is wrong on this
  *  plan's own stated rule: *a number from a different instrument cannot calibrate this one*. Two
- *  backends would mean a phone could read one band on `sling` and another on `chess`, and the
+ *  backends would mean a phone could read one band on `sling` and another on `audio-demo`, and the
  *  cross-project acceptance gate could never be satisfied by construction.
  *
  *  What deleting the Three path also removed, none of which was the goal but all of which was

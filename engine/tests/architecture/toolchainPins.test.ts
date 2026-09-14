@@ -51,10 +51,6 @@ const EXPECTED: Record<string, { pin: string; why: string }> = {
     pin: '^5.9.3',
     why: 'builds with `tsc && rollup`; its compiler emits plugin JS that ships to devices',
   },
-  'engine/packages/capacitor-litert-lm/package.json': {
-    pin: '^5.9.3',
-    why: 'builds with `tsc && rollup`; its compiler emits plugin JS that ships to devices',
-  },
   'engine/packages/capacitor-modoki-ota/package.json': {
     pin: '^5.9.3',
     why: 'builds with `tsc && rollup`; its compiler emits plugin JS that ships to devices',

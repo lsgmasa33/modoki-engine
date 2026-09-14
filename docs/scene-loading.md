@@ -182,7 +182,6 @@ Two riders learned with it:
   world do not, or every game system would call a blank scene an authoring defect —
   and a headless test opts in with `createTestWorld({ scenePath })`. A game resolving some OTHER
   authored entity should gate on `loadedScenePath` the same way rather than invent a fourth answer.
-  `games/chess` still finds its host by name and waits silently, deliberately not migrated.
 - ⚠️ **Test fixtures reproduce this state by accident, and then pin it.** Fourteen wordweave
   fixtures built the board into a canvas-less test world and passed, because nothing asserted where
   the entities landed — which is exactly why the production defect survived a 7105-test suite. A
@@ -468,12 +467,13 @@ of surfacing as a mystery diff months later. It **skips any file whose prefab ke
 resolve rather than assuming a value** — a guard that guesses an input is a wrong oracle, and a
 wrong oracle fails the file the editor just wrote correctly.
 
-**Three files were deliberately left un-normalized**, because their re-save is not order-only
+**Three files were deliberately left un-normalized**, because their re-save was not order-only
 — `games/3d-test/…/skinned-test.scene.json` (a prefab-instance `added` child gains
 `castShadow`/`receiveShadow`, trait fields the engine grew after the file was written),
-`games/chess/…/chess.scene.json` (format `version` 9 → 12), and
-`games/iap-test/…/main.scene.json` (drops an orphan legacy top-level `id`). A save of one of
-those still produces a diff, and it is a content diff rather than a reorder.
+chess's `chess.scene.json` (format `version` 9 → 12; the project was deleted in #1191), and
+`games/iap-test/…/main.scene.json` (drops an orphan legacy top-level `id`). A save of such a file
+produces a content diff rather than a reorder. `qa/knowledge.md` records which of them have since
+been normalized.
 
 ### Only NON-DEFAULT trait fields are written
 
@@ -712,8 +712,8 @@ manifest's LENGTH, which is silent on a 1-for-1 swap: the space-invader re-save 
 legacy page-texture GUID for the sprite GUID the scene actually references, and the gate reported
 "0 semantic changes". A count is the one property a dropped ref can preserve while still being a drop.
 
-- **`games/chess` — was excluded (#124), now fixed on both halves.** Its game code spawns on
-  load; the save baked ~70 runtime entities (move highlights, rank/file labels, pieces) plus a
+- **`games/chess` — was excluded (#124), then fixed on both halves; deleted in #1191.** Its game
+  code spawned on load; the save baked ~70 runtime entities (move highlights, rank/file labels, pieces) plus a
   live progress-bar value into `chess.scene.json`. The **spawn** half is fixed by the `Transient`
   tag at the spawn site; the **mutation** half by `pauseWhileStopped` on its two store→ECS
   projections (both rules below). Verified live in an editor on `games/chess`: 83 entities in,
@@ -828,9 +828,10 @@ save for that world.
 
 **`engine/scripts/resave-prefabs.sh`** is the prefab sibling of `resave-scenes.sh`. Per project it
 launches this clone's editor, enumerates prefabs from `/api/scan-assets`, then runs
-edit-open → edit-save → edit-exit on each. Like the scene sweep it **refuses `games/chess` and
-`games/llm-test`** (the #124 exclusion) — entering prefab-edit saves the current scene, and those
-two games' code mutates authored state on load. Review with
+edit-open → edit-save → edit-exit on each. It **refuses any project in its `EXCLUDED` list** (the #124
+exclusion) — entering prefab-edit saves the current scene, so a project whose code mutates authored
+state on load would bake it. The list is empty today: its two entries, `games/chess` and
+`games/llm-test`, were deleted in #1191. Review with
 **`node engine/scripts/check-prefab-churn.mjs <same projects>`**, a semantic diff keyed by
 localId (a prefab has no entity GUIDs) reporting entities/traits/values gained or lost and any
 change to a nested-instance row's structure; it exits non-zero on a re-minted prefab `id` or a
@@ -1225,8 +1226,8 @@ is therefore scoped to same-file collisions deliberately, and says so in its own
   the flag, so state accumulated while stopped would never project: if the store went quiet
   before Play (the download finished), the first frame of Play would show authored values rather
   than live ones. Default is `false`, because a projection normally *should* run while stopped —
-  that is what makes an inspector/gizmo edit reflect immediately. Opted in today:
-  `games/chess` (state + chat) and `games/llm-test` (state + chat). Gate:
+  that is what makes an inspector/gizmo edit reflect immediately. ⚠️ **Opted in today: nothing.**
+  Its only users, `games/chess` and `games/llm-test`, were deleted in #1191. Gate:
   `engine/packages/modoki/tests/runtime/projection.test.ts`.
 
   **The class stays open by design, so a save warns instead.** Nothing stops the next game from

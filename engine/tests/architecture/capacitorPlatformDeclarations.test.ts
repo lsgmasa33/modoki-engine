@@ -152,12 +152,12 @@ describe('capacitor plugin platform declarations', () => {
 
   /** #368's third plugin, which the pbxproj rule above cannot reach.
    *
-   *  `capacitor-litert-lm` is compiled into no App target, so `compiledIntoAppTarget` is false
-   *  and the doubling rule has nothing to say about it — yet adding `ios` there is just as
-   *  wrong, for an unrelated reason: its `LitertLmPlugin.swift` really does `import
-   *  MediaPipeTasksGenAI` (it is a full implementation, NOT the stub a stale Package.swift
-   *  comment still calls it), the podspec declares that dependency, and `Package.swift` does
-   *  not. So an SPM build of the target cannot compile, while `npm run verify` stays green.
+   *  `capacitor-litert-lm` (deleted in #1191) was compiled into no App target, so `compiledIntoAppTarget` is false
+   *  and the doubling rule had nothing to say about it — yet adding `ios` there was just as
+   *  wrong, for an unrelated reason: its `LitertLmPlugin.swift` really did `import
+   *  MediaPipeTasksGenAI` (a full implementation, NOT the stub a stale Package.swift comment
+   *  called it), the podspec declared that dependency, and `Package.swift` did not. So an SPM
+   *  build of the target could not compile, while `npm run verify` stayed green.
    *
    *  The rule, stated generally: if the podspec needs a dependency the SPM manifest lacks, the
    *  package must not claim SPM support. */
@@ -390,7 +390,7 @@ function resolveDepPackageJson(projDir: string, depName: string): { capacitor?: 
  *
  *  Deriving scope from `capacitor.ios` (rather than an allowlist naming every real plugin) is
  *  what makes the android-only plugins fall out AUTOMATICALLY instead of needing to be listed
- *  here by hand: `capacitor-game-debug`, `capacitor-modoki-ota` and `capacitor-litert-lm` declare
+ *  here by hand: `capacitor-game-debug` and `capacitor-modoki-ota` declare
  *  android-only ON PURPOSE (see this file's header — SPM's static linker strips a plugin class
  *  with no external framework dependency, so they're compiled into the App target via a pbxproj
  *  reference instead), and a project depending on one of them is correctly never expected to

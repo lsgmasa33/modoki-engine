@@ -72,7 +72,7 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
   }
 
   // ── Camera presence. Only 3D CONTENT renders black without a camera; a pure 2D/UI scene
-  //    (e.g. chess) legitimately has no Camera, so gating `ok` on one there was a false alarm
+  //    legitimately has no Camera, so gating `ok` on one there was a false alarm
   //    ("3D renders black" on a scene with zero 3D). Detect 3D content by the 3D-renderable
   //    traits (a Renderable3DPrimitive can sit at layer:'' so layer alone under-counts) OR
   //    layer==='3d'. (C7 re-audit.) ──

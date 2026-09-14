@@ -93,7 +93,7 @@ describe('managerRegistry', () => {
     registerManager({ name: 'cam', scope: 'game', games: ['space-console'], init: onlySpace });
     registerManager({ name: 'any', scope: 'game', init: anyGame });
 
-    await initGameManagersFor('chess', '/games/chess/scenes/chess.json');
+    await initGameManagersFor('puzzle', '/games/puzzle/scenes/puzzle.json');
     expect(onlySpace).not.toHaveBeenCalled();
     expect(anyGame).toHaveBeenCalledOnce();
 
@@ -359,7 +359,7 @@ describe('managerRegistry', () => {
 
     const disposed = disposeActiveGameManagers();
 
-    await initGameManagersFor('chess', '/games/chess/scenes/chess.json');
+    await initGameManagersFor('puzzle', '/games/puzzle/scenes/puzzle.json');
     registerManager({ name: 'late-g', scope: 'game', dispose: disposeLate });
 
     resolveInit();

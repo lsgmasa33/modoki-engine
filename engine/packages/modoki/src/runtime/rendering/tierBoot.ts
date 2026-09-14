@@ -2,7 +2,7 @@
  *
  *  ── THE DEFECT ────────────────────────────────────────────────────────────────────────────
  *  `resolveActiveTier` ran from exactly ONE place: `makeWebGPURenderer`. So a project with
- *  `disable3D: true` (`games/chess`, `games/audio-demo`) or `build.modules.render3d: false`
+ *  `disable3D: true` (`games/audio-demo`) or `build.modules.render3d: false`
  *  (`games/space-invader`) built no renderer, resolved no tier, and left
  *  `getActiveQualityTier()` null for the whole process — with `getActiveTierOverrides()` returning
  *  `UNCLAMPED_OVERRIDES`. Every one of those projects was seeded with `rendering.three.tiers` by

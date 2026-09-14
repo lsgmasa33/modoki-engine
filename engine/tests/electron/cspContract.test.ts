@@ -10,10 +10,11 @@ import { buildProdCsp, parseCsp, PROD_CSP_ORIGINS } from '../../electron/csp';
  * load-bearing origins directly on the pure `buildProdCsp` contract so a
  * regression fails CI instead of a user's install.
  *
- * Concrete regression this guards: `script-src`/`worker-src` once lacked `https:`,
- * which CSP-blocked MediaPipe's GenAI wasm loader `<script>` + inference worker
- * (chess / llm-test on-device LLM, loaded from jsdelivr) →
- * "Resource load error: genai_wasm_internal.js" and the game never loaded.
+ * It guards BOTH directions: the grants the editor needs (loopback, and `https:`
+ * for remote DATA), and the grant it must not carry — `https:` on the CODE
+ * directives, removed with the on-device-LLM games that were its only consumer
+ * (#1191). The opposite regression shipped once (DMG 0.2.0 lacked a grant it
+ * needed), which is why the needed grants are pinned too.
  */
 describe('packaged editor CSP contract', () => {
   const csp = buildProdCsp(PROD_CSP_ORIGINS);
@@ -34,15 +35,27 @@ describe('packaged editor CSP contract', () => {
     }
   });
 
-  // The core of the guard: external CDN loads (MediaPipe wasm loader + worker,
-  // the model download, remote asset refs) need `https:`. These MUST stay granted.
-  it('grants https: to the directives that load external CDN resources', () => {
-    for (const d of ['script-src', 'worker-src', 'connect-src', 'img-src', 'media-src']) {
-      expect(directives[d], `${d} must allow https: (external CDN / asset refs)`).toContain('https:');
+  // Remote DATA (asset refs, remote video, OTA/CDN fetches) needs `https:`.
+  it('grants https: to the directives that load remote data', () => {
+    for (const d of ['connect-src', 'img-src', 'media-src']) {
+      expect(directives[d], `${d} must allow https: (remote asset refs / fetches)`).toContain('https:');
     }
   });
 
-  it('keeps script-src able to run MediaPipe wasm (unsafe-eval + wasm-unsafe-eval)', () => {
+  // Remote CODE is not granted (#1191): no script or worker from any remote origin. An ALLOWLIST,
+  // not a denylist: CSP host-sources need no scheme (`cdn.jsdelivr.net`, `*.jsdelivr.net`), so
+  // matching `https:`/`https://` alone would let a scheme-less re-grant through. Anything that is not
+  // a quoted keyword, `blob:`/`data:`, or a loopback origin counts as remote.
+  it('grants no remote origin to the code directives (script-src, worker-src)', () => {
+    const isLocal = (s: string) =>
+      /^'[^']+'$/.test(s) || s === 'blob:' || s === 'data:' || /^https?:\/\/(localhost|127\.0\.0\.1):/.test(s);
+    for (const d of ['script-src', 'worker-src']) {
+      const remote = directives[d].filter((s) => !isLocal(s));
+      expect(remote, `${d} must not allow a remote origin — self-host the script instead`).toEqual([]);
+    }
+  });
+
+  it('keeps script-src able to run wasm (unsafe-eval + wasm-unsafe-eval)', () => {
     expect(directives['script-src']).toContain("'unsafe-eval'");
     expect(directives['script-src']).toContain("'wasm-unsafe-eval'");
   });

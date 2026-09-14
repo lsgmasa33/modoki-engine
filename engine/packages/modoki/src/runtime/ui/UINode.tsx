@@ -663,8 +663,8 @@ interface UINodeProps {
    *  ⚠️ It must be the INHERITED value, not the scene default: a modal root authoring its own
    *  `fontFamily` makes those two differ, and handing the input the scene default would render it
    *  in a different typeface from the labels beside it. `''` when nothing up the chain authored a
-   *  font, which is what keeps the repo's two existing `<input>`s (`games/chess`,
-   *  `games/llm-test`, neither authoring one) on the UA font exactly as before. */
+   *  font, which is what kept the repo's only two `<input>`s at the time (chess and llm-test,
+   *  neither authoring one; both deleted in #1191) on the UA font exactly as before. */
   inheritedFontFamily?: string;
 }
 
@@ -854,10 +854,10 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   // `UISettings` default every `div` sibling gets for free through `UIRenderer`'s container
   // (#803, one element type over from the container fix). Gated to input/range ONLY: a `div`
   // already inherits correctly and must be left alone, and using `'inherit'` unconditionally
-  // here was rejected — `games/chess` and `games/llm-test` author the repo's only two
-  // `<input>`s and neither authors a scene font, so an unconditional `inherit` would visibly
-  // change both from the platform's form font to `body`'s `system-ui` for a change neither
-  // game asked for. Gating on `inheritedFontFamily` being non-empty keeps them byte-identical.
+  // here was rejected — the repo's only two `<input>`s at the time (chess and llm-test, since
+  // deleted in #1191) authored no scene font, so an unconditional `inherit` would have visibly
+  // changed both from the platform's form font to `body`'s `system-ui` for a change neither
+  // game asked for. Gating on `inheritedFontFamily` being non-empty keeps such inputs byte-identical.
   else if (inheritedFontFamily && (node.elementType === 'input' || node.elementType === 'range')) {
     style.fontFamily = inheritedFontFamily;
   }

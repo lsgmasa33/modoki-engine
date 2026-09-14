@@ -609,7 +609,7 @@ notice if those three calls were deleted.
 ## On-screen touch controls — the d-pad
 
 Until #297 the engine had **no touch locomotion of any kind**. Every game here was either
-drag/tap native by design (sling, space-invader, chess, court) or keyboard-only — and
+drag/tap native by design (sling, space-invader, court) or keyboard-only — and
 `demos/forest-camp`, the flagship demo published with real iOS + Android native, told players on
 an A23 "WASD to walk" and gave them no way to walk at all (Testboard `xlbhRT4PjuJaK9tLos49`).
 

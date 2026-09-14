@@ -139,8 +139,8 @@ describe('electron-builder packaging manifest', () => {
 
   it('does not broadly exclude capacitor plugins the editor imports at runtime', () => {
     // capacitor-game-debug is the engine debug bridge (engine/app/debug/bridge.ts);
-    // a broad `!node_modules/capacitor-*/**` would drop it → white-screen. Only the
-    // narrow litert-lm exclude (a game plugin pulling ~76MB @mediapipe) is allowed.
+    // a broad `!node_modules/capacitor-*/**` would drop it → white-screen. A NARROW
+    // per-plugin exclude is allowed (litert-lm had one, until #1191 deleted it).
     const files = cfg.files ?? [];
     const capExcludes = files.filter((f) => f.startsWith('!') && /capacitor-\*/.test(f));
     expect(capExcludes, `over-broad capacitor exclude(s): ${capExcludes.join(', ')}`).toHaveLength(0);

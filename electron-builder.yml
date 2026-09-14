@@ -73,10 +73,7 @@ files:
   # node_modules at runtime (the old static-dist build pre-bundled them, so the
   # exclude was safe then; it is NOT now — excluding them = white-screen on launch).
   # Do NOT exclude capacitor-* broadly — capacitor-game-debug is ENGINE debug
-  # tooling the editor imports at runtime (engine/app/debug/bridge.ts). Only exclude
-  # capacitor-litert-lm (a different game's plugin, not needed by this editor, and
-  # it pulls @mediapipe ~76MB). Per-game packaging (#29) will relocate it properly.
-  - "!node_modules/capacitor-litert-lm/**"
+  # tooling the editor imports at runtime (engine/app/debug/bridge.ts).
   - "!node_modules/**/{android,ios}/**"
   - "!node_modules/{playwright-core,@playwright,electron-winstaller}/**"
   # Firebase + its tree are a GAME app-service dep now (moved to the 3d-test

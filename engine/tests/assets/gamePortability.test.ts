@@ -24,14 +24,12 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../
 // self-containment guard matters at least as much there.
 const projects = discoverProjects(repoRoot);
 
-// KNOWN, TRACKED cross-game coupling still to resolve: chess reuses llm-test's
-// on-device-LLM service (LLMService / initLLMSession). Until that's extracted to a
-// shared home, allow EXACTLY these — any NEW escape still fails the guard. Keyed by
+// KNOWN, TRACKED cross-game coupling still to resolve — EMPTY today. The one entry it ever held
+// (chess reusing llm-test's LLM service) left with both games (#1191). Any escape added here must
+// be temporary and allowed EXACTLY — any other escape still fails the guard. Keyed by
 // `<repo-rel file> :: <import specifier>`.
-const KNOWN_ESCAPES = new Set([
-  'games/chess/runtime/ChessManager.ts :: ../../llm-test/runtime/services/initLLMSession',
-  'games/chess/runtime/ChessManager.ts :: ../../llm-test/runtime/services/LLMService',
-  'games/chess/runtime/ai/ChessAI.ts :: ../../../llm-test/runtime/services/LLMService',
+// ⚠️ Keep the `new Set([` … `])` literal: typecheckProjectsSelection.test.ts parses it.
+const KNOWN_ESCAPES: ReadonlySet<string> = new Set([
 ]);
 
 /** Every `.ts`/`.tsx` file under `dir`, git-enumerated (#771/#799) rather than a hand-rolled
@@ -86,26 +84,37 @@ const importScanRoots: string[] = [
   ...(fs.existsSync(TEMPLATE_ROOT) ? [TEMPLATE_ROOT] : []),
 ];
 
-/** Every relative import (static or dynamic) in a game file that resolves OUTSIDE
- *  that game's own folder, as `<repo-rel file> :: <specifier>`. */
-function escapingImports(): string[] {
+/** The relative imports (static or dynamic) in ONE source file that resolve OUTSIDE `gameRoot`,
+ *  as `<repo-rel file> :: <specifier>`. Split out of the walk so the matcher can be exercised on a
+ *  fixture: with `KNOWN_ESCAPES` empty (#1191), no real escape is left in the repo to prove the
+ *  matcher still fires, so a regex that matches nothing would otherwise pass every test here. */
+function escapesInSource(file: string, src: string, gameRoot: string): string[] {
   const out: string[] = [];
   const importRe = /(?:from|import\()\s*['"](\.[^'"]+)['"]/g;
-  for (const gameRoot of importScanRoots) {
-    for (const file of walk(gameRoot)) {
-      const src = fs.readFileSync(file, 'utf8');
-      let m: RegExpExecArray | null;
-      while ((m = importRe.exec(src)) !== null) {
-        const resolved = path.resolve(path.dirname(file), m[1]);
-        if (!resolved.startsWith(gameRoot + path.sep)) {
-          // Forward-slash the repo-relative file so the key matches the canonical
-          // KNOWN_ESCAPES entries on Windows too (path.relative yields backslashes there).
-          out.push(`${path.relative(repoRoot, file).replace(/\\/g, '/')} :: ${m[1]}`);
-        }
-      }
+  let m: RegExpExecArray | null;
+  while ((m = importRe.exec(src)) !== null) {
+    const resolved = path.resolve(path.dirname(file), m[1]);
+    if (!resolved.startsWith(gameRoot + path.sep)) {
+      // Forward-slash the repo-relative file so the key matches the canonical
+      // KNOWN_ESCAPES entries on Windows too (path.relative yields backslashes there).
+      out.push(`${path.relative(repoRoot, file).replace(/\\/g, '/')} :: ${m[1]}`);
     }
   }
   return out;
+}
+
+/** Every escaping import across every scanned project, plus how many files were read — the count
+ *  is the scan's own non-vacuity signal (`walk()` runs with `floor: 0`). */
+function escapingImports(): { escapes: string[]; scanned: number } {
+  const escapes: string[] = [];
+  let scanned = 0;
+  for (const gameRoot of importScanRoots) {
+    for (const file of walk(gameRoot)) {
+      scanned++;
+      escapes.push(...escapesInSource(file, fs.readFileSync(file, 'utf8'), gameRoot));
+    }
+  }
+  return { escapes, scanned };
 }
 
 /** A relative path in a project's committed native config (`Package.swift` SPM deps, Gradle
@@ -158,7 +167,7 @@ function nativeNodeModulesEscapes(): { escapes: string[]; inspected: number } {
 // check portability of). docs/engine-oss-publishing.md.
 describe.skipIf(!hasInternalGames())('game project portability (self-contained — no relative escapes)', () => {
   it('no game imports outside its own folder except the known tracked coupling', () => {
-    const unexpected = escapingImports().filter((e) => !KNOWN_ESCAPES.has(e));
+    const unexpected = escapingImports().escapes.filter((e) => !KNOWN_ESCAPES.has(e));
     expect(
       unexpected,
       `Games must reach the engine via '@modoki/engine', not a relative path that escapes the game folder:\n${unexpected.join('\n')}`,
@@ -166,9 +175,36 @@ describe.skipIf(!hasInternalGames())('game project portability (self-contained �
   });
 
   it('the allowlist has no stale entries (prune when a coupling is fixed)', () => {
-    const escapes = new Set(escapingImports());
+    const escapes = new Set(escapingImports().escapes);
     const stale = [...KNOWN_ESCAPES].filter((e) => !escapes.has(e));
     expect(stale, `KNOWN_ESCAPES lists escapes that no longer exist — remove them:\n${stale.join('\n')}`).toEqual([]);
+  });
+
+  // ⚠️ Non-vacuity (#1191). The two tests above used to be self-proving: the stale-entry check needed
+  // the scan to FIND chess's three escapes. With the allowlist empty, a scan that reads no files or a
+  // matcher that matches nothing would pass both. These two pin each half independently.
+  it('the scan reads the projects\' source (not an empty walk)', () => {
+    expect(escapingImports().scanned, 'the escaping-import scan read almost no files — walk() is broken').toBeGreaterThan(100);
+  });
+
+  it('the matcher reports an escape, and only an escape, on a fixture', () => {
+    const root = path.join(repoRoot, 'games', '__fixture__');
+    const file = path.join(root, 'runtime', 'systems.ts');
+    const src = [
+      "import { a } from '../../../engine/app/store/gameStore';",
+      "import { b } from './local';",
+      "const c = await import('../../sibling/runtime/x');",
+      "import { d } from '@modoki/engine/runtime';",
+      // `..` that stays INSIDE the root is not an escape.
+      "import { e } from '../config';",
+      // A sibling whose name EXTENDS this root's name must still escape (containment needs the separator).
+      "import { f } from '../../__fixture__-kit/y';",
+    ].join('\n');
+    expect(escapesInSource(file, src, root)).toEqual([
+      'games/__fixture__/runtime/systems.ts :: ../../../engine/app/store/gameStore',
+      'games/__fixture__/runtime/systems.ts :: ../../sibling/runtime/x',
+      'games/__fixture__/runtime/systems.ts :: ../../__fixture__-kit/y',
+    ]);
   });
 
   // A game must TYPECHECK standalone too, not just resolve its imports. Game code is typed

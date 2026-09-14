@@ -46,7 +46,8 @@
  *          structural decision, which is exactly what separates N/A from SKIP).
  *          ⚠️ An N/A row is only honest while its premise holds, so the premise is ASSERTED by
  *          `capacitorPlatformDeclarations.test.ts` — under `npm run verify`, not under this gate.
- *          One row today: `capacitor-litert-lm`, whose comment carries the whole argument.
+ *          No row today: the one that had it (`capacitor-litert-lm`, #991) left with its package
+ *          (#1191). The shape stays because the runner and its coverage test still model it.
  *
  * ⚠️ `iap` and `ota` made OPPOSITE choices for the identical problem and nothing records why. The
  * gate models both rather than changing a device-verified shipping path to make a test tidier
@@ -245,39 +246,6 @@ export const PLUGIN_CLASS_LEGS = [
   { dir: 'engine/packages/capacitor-applovin-max', shape: 'spm' },
   { dir: 'engine/packages/capacitor-appsflyer', shape: 'spm' },
   { dir: 'engine/packages/capacitor-game-debug', shape: 'spm' },
-  {
-    dir: 'engine/packages/capacitor-litert-lm',
-    shape: 'no-spm',
-    // ⚠️ #991. This was a 'spm' row carrying `knownFail: '#991'`, and that was the wrong shape for
-    // the wrong reason — it modelled the package as "an SPM leg that is temporarily broken" when it
-    // is not an SPM package at all:
-    //
-    //   · `package.json` declares `capacitor: { android: … }` and nothing else, so `cap sync ios`
-    //     never registers this plugin in ANY consuming app.
-    //   · It is compiled into no App target — `capacitorPlatformDeclarations.test.ts` says so in
-    //     its own docblock, which is why that file needed a SECOND rule to reach this package.
-    //   · That second rule exists specifically to FORBID this package declaring `ios` until
-    //     `Package.swift` gains the podspec's `MediaPipeTasksGenAI` + `MediaPipeTasksGenAIC`.
-    //
-    // So an iOS SPM leg here compiled a configuration the repo deliberately outlaws, for a platform
-    // the package does not claim. Google publishes no SPM distribution of MediaPipeTasksGenAI (the
-    // pods are prebuilt binaries built internally; google-ai-edge/mediapipe#5464 is open and
-    // unanswered), so the one-line fix has nothing to point at and never will on its own.
-    //
-    // ⚠️ THE SELF-EXPIRY IS NOT LOST, it MOVED AND GOT BETTER. `knownFail` expired by flipping to
-    // FAIL if the leg ever passed — but only on a machine with macOS + Xcode running `test:native`,
-    // which is rare. The premise of THIS row is asserted by `capacitorPlatformDeclarations.test.ts`
-    // instead: the moment `Package.swift` declares the podspec's dependencies, or `package.json`
-    // declares `ios`, that guard goes red and names this row. `npm run verify` runs everywhere, on
-    // every push, with no Xcode — so the stale-row check now fires on the machine that made it
-    // stale, in the gate that actually runs.
-    //
-    // ⚠️ `reason` is REQUIRED on this shape and is printed in the gate summary. A silent N/A is the
-    // exemption-nobody-revisits this row exists to avoid.
-    reason: 'declares capacitor.android only and is compiled into no App target; Package.swift '
-      + 'cannot declare the podspec\'s MediaPipe dependencies because Google ships no SPM '
-      + 'distribution of them (#991)',
-  },
   { dir: 'engine/packages/capacitor-modoki-iap', shape: 'spm' },
   {
     dir: 'engine/packages/capacitor-modoki-ota',

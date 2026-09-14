@@ -206,11 +206,10 @@ jobs:
           APP="$(find release -maxdepth 2 -name '*.app' -type d | head -1)"
           bash engine/scripts/assert-app-renders.sh "$APP" "$RUNNER_TEMP/smoke"
 
-      # Gate on the SHIPPED binary actually enforcing its prod CSP — a CSP-blocked
-      # CDN script (MediaPipe wasm loader for the on-device-LLM games) doesn't blank
-      # the editor, so the render gate above can't catch it. This is the layer that
-      # would have caught DMG 0.2.0 (its binary predated the https: script-src fix).
-      - name: Smoke — packaged editor CSP permits on-device-LLM CDN
+      # Gate on the SHIPPED binary actually enforcing its prod CSP — a wrong policy
+      # doesn't blank the editor, so the render gate above can't catch it. This is the
+      # layer that would have caught DMG 0.2.0 (its binary predated a source CSP fix).
+      - name: Smoke — packaged editor enforces its prod CSP
         run: |
           set -euo pipefail
           APP="$(find release -maxdepth 2 -name '*.app' -type d | head -1)"

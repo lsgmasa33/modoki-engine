@@ -959,7 +959,7 @@ are the non-obvious DECISIONS and the roads not taken.
   "unknown". So it fails only when the schema IS present and the field is unknown on a KNOWN trait (a
   certain typo); unknown-TRAIT and no-schema stay warn-but-load.
 
-- **`diagnose` gates the camera check on 3D content.** A pure 2D/UI scene (chess) legitimately has no
+- **`diagnose` gates the camera check on 3D content.** A pure 2D/UI scene legitimately has no
   Camera, so an unconditional "no Camera → 3D renders black" was a false alarm; the check now fires
   only when the scene has a 3D renderable. Zero-scale stays a SOFT signal (an entity can be
   intentionally scaled to 0) — surfaced in the summary, not gated into `ok`.

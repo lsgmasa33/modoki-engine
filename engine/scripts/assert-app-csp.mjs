@@ -9,19 +9,18 @@
  * WHY a dedicated gate: the prod CSP is applied ONLY in the packaged app
  * (app.isPackaged) — dev sets none — so a wrong policy ships silently and only
  * breaks a real install. The render gate can't see it (a CSP-blocked CDN script
- * doesn't blank the editor). Concrete regression this guards: `script-src` once
- * lacked `https:`, CSP-blocking MediaPipe's GenAI wasm loader `<script>` (chess /
- * llm-test on-device LLM, from jsdelivr) → "Resource load error:
- * genai_wasm_internal.js" and the game never loaded. Its static twin is
+ * doesn't blank the editor). Its static twin is
  * engine/tests/electron/cspContract.test.ts (asserts the source policy); THIS
  * asserts the SHIPPED binary actually enforces it — the layer that would have
- * caught DMG 0.2.0, whose binary predated the source fix.
+ * caught DMG 0.2.0, whose binary predated a source fix.
  *
  * Method (needs CDP — a script-injection probe is the faithful check): boot the
  * binary with --remote-debugging-port, wait for the renderer, then FROM the page
- *   B1. inject MediaPipe's real CDN wasm-loader <script> → must LOAD, no CSP violation
- *   B2. inject a bare http: <script> → must be BLOCKED (proves the policy is present
- *       + enforced, not merely absent — a missing CSP would pass B1 but fail B2)
+ *   B1. inject a remote https: <script> → must be BLOCKED by script-src (#1191: the
+ *       code directives grant no remote origin since the on-device-LLM games went)
+ *   B2. inject a bare http: <script> → must be BLOCKED by script-src
+ * Both are violation checks, not load checks, so neither needs network egress: CSP
+ * refuses the element before any request is made. A missing CSP fails both.
  *
  *   node engine/scripts/assert-app-csp.mjs <app-path> [project-dir]
  * Exit 0 = CSP correct; non-zero = a shipped-CSP regression (details printed).
@@ -212,12 +211,11 @@ try {
       await sleep(1000);
     }
 
-    // The probe injects two scripts and awaits their load/error/timeout — a ~20s async op over CDP
-    // plus a live CDN fetch. It occasionally comes back `undefined` (a transient CDP/serialization
+    // The probe injects two scripts and awaits their load/error/timeout — an async op over CDP
+    // of up to ~20s. It occasionally comes back `undefined` (a transient CDP/serialization
     // hiccup on that long await), and JSON.parse(undefined) then throws — a FALSE failure. A real
     // CSP regression reproduces on every attempt; a flake does not. So retry a few times and only
-    // fail on the verdict (or a persistently empty probe). A genuine network-down shows up as a
-    // parseable TIMEOUT/ERRORED result, caught by the B1 check below — not as this retry.
+    // fail on the verdict (or a persistently empty probe).
     const probeExpr = `(async () => {
       const inject = (url) => new Promise((res) => {
         const violations = [];
@@ -231,9 +229,9 @@ try {
         document.head.appendChild(el);
         setTimeout(() => done('TIMEOUT'), 10000);
       });
-      const cdn = await inject('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-genai/wasm/genai_wasm_internal.js');
+      const remote = await inject('https://example.com/blocked.js');
       const bad = await inject('http://example.com/blocked.js');
-      return JSON.stringify({ cdn, bad });
+      return JSON.stringify({ remote, bad });
     })()`;
     let csp = null;
     for (let attempt = 1; attempt <= 3 && !csp; attempt++) {
@@ -242,12 +240,12 @@ try {
       if (!csp && attempt < 3) { log(`CSP probe returned no result (attempt ${attempt}/3) — transient CDP/network hiccup, retrying…`); await sleep(2000); }
     }
     if (!csp) {
-      fail('CSP probe returned no parseable result after 3 attempts — the injection eval kept coming back empty (a CDP/network flake, NOT a CSP verdict). Re-run; if it persists, check network egress to the CDN.');
+      fail('CSP probe returned no parseable result after 3 attempts — the injection eval kept coming back empty (a CDP/network flake, NOT a CSP verdict). Re-run.');
     } else {
-      if (csp.cdn.result === 'LOADED' && csp.cdn.violations.length === 0) {
-        log('PASS B1 — MediaPipe CDN wasm-loader script permitted by CSP');
+      if (csp.remote.violations.some((v) => v.startsWith('script-src'))) {
+        log('PASS B1 — remote https: script blocked (code directives grant no remote origin)');
       } else {
-        fail(`B1 — MediaPipe CDN script was ${csp.cdn.result} (violations: ${csp.cdn.violations.join(',') || 'none'}). The prod CSP likely dropped https: from script-src.`);
+        fail(`B1 — a remote https: script was NOT blocked (result: ${csp.remote.result}, violations: ${csp.remote.violations.join(',') || 'none'}). script-src grants a remote origin again, or the prod CSP is absent.`);
       }
       if (csp.bad.violations.some((v) => v.startsWith('script-src'))) {
         log('PASS B2 — bare http: script blocked (CSP present + enforced)');

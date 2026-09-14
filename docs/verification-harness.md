@@ -67,8 +67,8 @@ not "build a harness from scratch."
 
 What's **missing**: (1) an injectable clock + a **`timeScale`** concept (today
 `performance.now()` is hard-wired in `timeSystem`, and `Time` has no scale field at
-all), (2) a seeded RNG service (today `Math.random` is used directly in `ChessAI`,
-`ChessManager`, `animationCycle`, `DebugMenu`), (3) an **event journal**, (4) a thin
+all), (2) a seeded RNG service (at the time `Math.random` was used directly in `ChessAI`,
+`ChessManager`, `animationCycle`, `DebugMenu` — the first two since deleted with chess, #1191), (3) an **event journal**, (4) a thin
 `createTestWorld` harness + MCP step/events surface.
 
 ### Time-source audit (done) — one real offender + two design gaps
@@ -172,7 +172,7 @@ with fixed dt, `EMA(constant) = constant`, so `visualDelta == simDelta` and runs
 ### Phase 2 — Seeded RNG service
 - Add `rng` service (e.g. mulberry32/xoshiro) with `seed(n)`, `next()`, `int(a,b)`, `pick(arr)`.
 - Replace the ~4 existing `Math.random` sites (`ChessAI`, `ChessManager`, `animationCycle`,
-  `DebugMenu`) with `rng.*`. (Doing it now = 4 edits; later = dozens.)
+  `DebugMenu` — the first two since deleted with chess, #1191) with `rng.*`. (Doing it now = 4 edits; later = dozens.)
 - `createTestWorld({ seed })` seeds it per-run.
 - **Deliverable:** seeded RNG; existing games reproducible; guard from Phase 0 enforced.
 

@@ -1785,7 +1785,7 @@ describe('source paths cited in docs and CLAUDE.md resolve (#194, second face; #
 
   it('every runtime/editor/engine source path cited in any tracked doc exists', (ctx) => {
     // An engine doc legitimately cites a GAME's file by its project-relative path —
-    // `runtime/services/CapacitorLLMService.ts` (llm-test), `runtime/shaders/planet.ts`
+    // `runtime/shaders/planet.ts`
     // (space-console), `tests/haptics.test.ts`. Those resolve on a real clone and CANNOT in the
     // OSS snapshot, which ships no `games/`. Running the rule there asks a question whose answer
     // depends on the checkout rather than on whether the doc is right: measured, the snapshot

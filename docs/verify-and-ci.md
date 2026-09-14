@@ -621,9 +621,7 @@ of these legs matched it: all eight reported SKIP, "offline", while the real cau
 resolve step (an AGP artifact-variant ambiguity). A mistyped coordinate with the network up reads
 `Could not find` and FAILs. With the network down it cannot be told apart, and `--require-all`
 catches the resulting SKIP. The first
-run on a machine downloads the AppLovin, Adjust and LiteRT-LM SDKs and the Kotlin Gradle plugin.
-`capacitor-litert-lm` pins `litertlm-android:+`, a dynamic version, so its leg compiles against
-whatever is newest that day.
+run on a machine downloads the AppLovin, AppsFlyer, Adjust and Play Billing SDKs.
 
 The lease legs were wired in #376 after both sat unrunnable — and therefore permanently
 green-looking — since they were written; the OTA legs existed only as two hand-typed recipes in
@@ -642,9 +640,9 @@ that never runs looking exactly like a test that passes.
 ⚠️ **`N/A` is a third status and is NOT a skip** (#991). A SKIP means *this runner could not check
 it*, which a toolchain install would fix — so `--require-all` is right to fail on it. An N/A means
 *there is nothing here to check on any machine*, a fact about the package rather than the runner, so
-it stays off the exit code even under `--require-all`. One row today (`ios/class/capacitor-litert-lm`,
-whose package is not an SPM package); the reason prints in the summary, and the row's premise is
-asserted under `npm run verify` so it cannot quietly go stale. Detail:
+it stays off the exit code even under `--require-all`. No row uses it today — the one that did
+(`ios/class/capacitor-litert-lm`) left with its package in #1191; a row's reason prints in the
+summary, and its premise belongs under `npm run verify` so it cannot quietly go stale. Detail:
 [native-and-sdks.md](./native-and-sdks.md) § `no-spm`.
 
 ⚠️ **It is not part of `npm run verify` and must not be** — but nor is it optional after touching

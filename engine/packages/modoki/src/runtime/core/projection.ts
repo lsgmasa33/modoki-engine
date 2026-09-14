@@ -11,8 +11,8 @@
  *  soon as the scene is loaded. For sync that needs a genuine per-frame tick —
  *  e.g. detecting an async DOM/canvas (re)mount, or sampling FPS — use
  *  `registerSystem` directly; that work isn't store-driven and the dirty flag
- *  would starve it. (See chessBoardSystem: it stays a System because it must
- *  re-attach a click handler whenever the PixiJS canvas remounts. Likewise a
+ *  would starve it. (A system that re-attaches a click handler whenever a PixiJS
+ *  canvas remounts stays a System for exactly that reason. Likewise a
  *  readback that reads ECS and writes a store — e.g. gameStatsSystem — can't use
  *  this helper: there's no store to subscribe to on the source side.) */
 
