@@ -13,6 +13,7 @@
  *  defect survived a green suite.
  */
 import { describe, it, expect, beforeAll } from 'vitest';
+import { found } from '../helpers/inOrder';
 import * as THREE from 'three';
 import { ensureLineColorOnMaterials } from '../../src/runtime/rendering/npr/NPRPostProcess';
 import { cloneDerived } from '../../src/runtime/rendering/derivedMaterials';
@@ -147,12 +148,9 @@ describe('the accessors must be installed BEFORE anything writes them (#351 revi
     );
     const src = stripComments(rawSrc);
     assertScanIsSane(rawSrc, src, 'runtime/loaders/meshTemplateCache.ts');
-    const install = src.indexOf('ensureLineColorOnMaterials()');
-    const writeLine = src.indexOf('.lineColor = new THREE.Color(');
-    const writePreserve = src.indexOf('.nprColorPreserve = data.nprColorPreserve');
-    expect(install, 'meshTemplateCache must call ensureLineColorOnMaterials()').toBeGreaterThan(-1);
-    expect(writeLine, 'the lineColor write moved — re-check the ordering').toBeGreaterThan(-1);
-    expect(writePreserve, 'the nprColorPreserve write moved — re-check the ordering').toBeGreaterThan(-1);
+    const install = found(src.indexOf('ensureLineColorOnMaterials()'), 'meshTemplateCache\'s ensureLineColorOnMaterials() call');
+    const writeLine = found(src.indexOf('.lineColor = new THREE.Color('), 'the lineColor write (moved? re-check the ordering)');
+    const writePreserve = found(src.indexOf('.nprColorPreserve = data.nprColorPreserve'), 'the nprColorPreserve write (moved? re-check the ordering)');
     expect(install, 'ensureLineColorOnMaterials() must come BEFORE the lineColor write').toBeLessThan(writeLine);
     expect(install, 'ensureLineColorOnMaterials() must come BEFORE the nprColorPreserve write').toBeLessThan(writePreserve);
   });

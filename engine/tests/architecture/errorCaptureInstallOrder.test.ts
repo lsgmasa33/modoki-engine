@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { found } from '@modoki/engine/testing/inOrder';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -53,10 +54,8 @@ describe('global error capture install order (#275)', () => {
   const specs = importSpecifiers(src, 'app/main.tsx');
 
   it('imports ./installErrorCapture before ./App.tsx', () => {
-    const capture = specs.findIndex((s) => s.includes('installErrorCapture'));
-    const app = specs.findIndex((s) => s.includes('App.tsx'));
-    expect(capture, 'main.tsx must import ./installErrorCapture').toBeGreaterThanOrEqual(0);
-    expect(app, 'main.tsx must import ./App.tsx').toBeGreaterThanOrEqual(0);
+    const capture = found(specs.findIndex((s) => s.includes('installErrorCapture')), "main.tsx's import of ./installErrorCapture");
+    const app = found(specs.findIndex((s) => s.includes('App.tsx')), "main.tsx's import of ./App.tsx");
     expect(
       capture,
       `./installErrorCapture must be imported BEFORE ./App.tsx (it is at ${capture}, App.tsx at ${app}). ` +
@@ -92,10 +91,8 @@ describe('global error capture install order (#275)', () => {
   // below it) must wrap OUTSIDE it, not the other way round. #591 briefly had these two the other
   // way round, inverting that nesting, and nothing before this test would have caught a repeat.
   it('imports ./installErrorCapture BEFORE ./installConsoleRing (#591, #633)', () => {
-    const errorCapture = specs.findIndex((s) => s.includes('installErrorCapture'));
-    const consoleRing = specs.findIndex((s) => s.includes('installConsoleRing'));
-    expect(errorCapture, 'main.tsx must import ./installErrorCapture').toBeGreaterThanOrEqual(0);
-    expect(consoleRing, 'main.tsx must import ./installConsoleRing').toBeGreaterThanOrEqual(0);
+    const errorCapture = found(specs.findIndex((s) => s.includes('installErrorCapture')), "main.tsx's import of ./installErrorCapture");
+    const consoleRing = found(specs.findIndex((s) => s.includes('installConsoleRing')), "main.tsx's import of ./installConsoleRing");
     expect(
       errorCapture,
       `./installErrorCapture must be imported BEFORE ./installConsoleRing (it is at ${errorCapture}, ` +

@@ -20,6 +20,7 @@
  *  bails when one already exists. Asserted structurally (order in the file) rather than by running
  *  the script, which would mean assembling a whole snapshot per test. */
 import { describe, it, expect } from 'vitest';
+import { found } from '@modoki/engine/testing/inOrder';
 import fs from 'node:fs';
 import path from 'node:path';
 import { hasPublishScripts } from '../helpers/repoLayout';
@@ -46,8 +47,7 @@ describe.skipIf(!hasPublishScripts())('publish-engine-oss.sh owns the .git it de
   });
 
   it('never removes $STAGE/.git before that refusal', () => {
-    const guardAt = src.search(/elif\s+\[\s+-e\s+"\$\{STAGE\}\/\.git"\s+\]\s*;\s*then/);
-    expect(guardAt, 'refusal branch not found').toBeGreaterThan(-1);
+    const guardAt = found(src.search(/elif\s+\[\s+-e\s+"\$\{STAGE\}\/\.git"\s+\]\s*;\s*then/), 'the pre-existing-.git refusal branch');
 
     // Every `rm -rf …/.git` aimed at the stage must come AFTER the refusal — i.e. inside the
     // else-branch the refusal protects. One appearing earlier would run unconditionally.
@@ -61,10 +61,13 @@ describe.skipIf(!hasPublishScripts())('publish-engine-oss.sh owns the .git it de
   });
 
   it('creates the throwaway repo only inside the guarded branch', () => {
-    const guardAt = src.search(/elif\s+\[\s+-e\s+"\$\{STAGE\}\/\.git"\s+\]\s*;\s*then/);
+    const guardAt = found(src.search(/elif\s+\[\s+-e\s+"\$\{STAGE\}\/\.git"\s+\]\s*;\s*then/), 'the pre-existing-.git refusal branch');
     // Same argument in the other direction: an unguarded `git init` would reinitialise a caller's
     // repo and stage a commit into it even if the deletion were somehow avoided.
-    for (const m of src.matchAll(/git\s+-C\s+"\$STAGE"\s+init/g)) {
+    const inits = [...src.matchAll(/git\s+-C\s+"\$STAGE"\s+init/g)];
+    // A floor, or a renamed `git init` matches nothing and the loop below asserts nothing (#1181 review).
+    expect(inits.length, 'no git init on $STAGE found — did step 4b change shape?').toBeGreaterThan(0);
+    for (const m of inits) {
       expect(m.index ?? -1, 'git init on $STAGE runs before the pre-existing-.git refusal')
         .toBeGreaterThan(guardAt);
     }

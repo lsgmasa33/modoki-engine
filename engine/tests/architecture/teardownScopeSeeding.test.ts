@@ -20,6 +20,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { found } from '@modoki/engine/testing/inOrder';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readScannedSource } from '@modoki/engine/testing';
@@ -176,7 +177,7 @@ describe('the release path is seeded before the first acquisition (#858)', () =>
       // Exactly once, so a rename or a duplicated bring-up fails loudly here rather than letting
       // `indexOf` silently answer about the wrong occurrence.
       expect(code.split(seed).length - 1, `${rel}: expected exactly one \`${seed}\``).toBe(1);
-      const seedAt = code.indexOf(seed);
+      const seedAt = found(code.indexOf(seed), `${rel}: \`${seed}\``);
 
       for (const acq of acquisitions) {
         const at = code.indexOf(acq);

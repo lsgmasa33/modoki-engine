@@ -9,6 +9,7 @@
 import path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
 import { describe, it, expect, afterEach, vi } from 'vitest';
+import { found } from '@modoki/engine/testing/inOrder';
 import { createTestWorld, type TestWorld, Transform, EntityAttributes,
   getCurrentWorld, setCurrentWorld, setTimeScale, getTimeScale, sceneManager, reparentRefusal,
   stepOneFrame } from '@modoki/engine/runtime';
@@ -765,10 +766,8 @@ describe('registerRelayResponder — announce, THEN take the ops (#1030)', () =>
     const f = fakeHot();
     registerRelayResponder(f.hot);
 
-    const announcedAt = f.log.indexOf('send:modoki:bridge-hello');
-    const tookOpsAt = f.log.indexOf('on:modoki:request');
-    expect(announcedAt, 'no modoki:bridge-hello was SENT').toBeGreaterThanOrEqual(0);
-    expect(tookOpsAt, 'no modoki:request handler was registered').toBeGreaterThanOrEqual(0);
+    const announcedAt = found(f.log.indexOf('send:modoki:bridge-hello'), 'a SENT modoki:bridge-hello');
+    const tookOpsAt = found(f.log.indexOf('on:modoki:request'), 'a registered modoki:request handler');
     // ⚠️ THE assertion. "Nothing may answer `modoki:request` before it has announced" — a client
     // that can decline while uncounted completes a denominator that was one short, which is
     // #1030. Both-happened is not enough: with the announce moved to the end of the function the

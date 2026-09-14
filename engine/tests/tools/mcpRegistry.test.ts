@@ -17,6 +17,7 @@
  *  See `docs/debug-tools-mcp.md` (`modoki_batch`), which is why the registry exists. */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { found } from '@modoki/engine/testing/inOrder';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -65,10 +66,9 @@ const allSrcFiles = () =>
  * asserting the offsets catches both directions.
  */
 function between(src: string, startAnchor: string, endAnchor: string, label: string): string {
-  const a = src.indexOf(startAnchor);
+  const a = found(src.indexOf(startAnchor), `${label}: start anchor ${JSON.stringify(startAnchor)} (without it the slice `
+    + 'below measures the wrong region)');
   const b = src.indexOf(endAnchor);
-  expect(a, `${label}: start anchor ${JSON.stringify(startAnchor)} no longer appears — the slice `
-    + 'below is measuring the wrong region').toBeGreaterThanOrEqual(0);
   expect(b, `${label}: end anchor ${JSON.stringify(endAnchor)} no longer appears — slice(a, -1) `
     + 'would silently widen to the rest of the file').toBeGreaterThan(a);
   return src.slice(a, b);

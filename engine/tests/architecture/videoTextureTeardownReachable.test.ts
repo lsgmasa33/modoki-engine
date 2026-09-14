@@ -18,6 +18,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { expectInOrder, found } from '@modoki/engine/testing/inOrder';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readScannedSource } from '@modoki/engine/testing';
@@ -60,17 +61,13 @@ const sites: [label: string, rel: string, regionStart: string, regionEnd: string
 describe('disposeVideoTextures (3D) is reachable from production code', () => {
   it.each(sites)('%s calls disposeVideoTextures before disposeRenderState', (_label, rel, start, end) => {
     const src = read(rel);
-    const from = src.indexOf(start);
-    expect(from, `region start not found in ${rel}`).toBeGreaterThanOrEqual(0);
+    const from = found(src.indexOf(start), `the region start in ${rel}`);
     const to = src.indexOf(end, from);
     expect(to, `region end not found in ${rel}`).toBeGreaterThan(from);
     const region = src.slice(from, to);
 
-    const disposeVideoIdx = region.indexOf('disposeVideoTextures(');
-    const disposeRenderIdx = region.indexOf('disposeRenderState(');
-    expect(disposeVideoIdx, `disposeVideoTextures( not found in region`).toBeGreaterThanOrEqual(0);
-    expect(disposeRenderIdx, `disposeRenderState( not found in region`).toBeGreaterThanOrEqual(0);
-    expect(disposeVideoIdx, 'disposeVideoTextures must run before disposeRenderState — see file header').toBeLessThan(disposeRenderIdx);
+    // disposeVideoTextures must run before disposeRenderState — see file header.
+    expectInOrder(region, ['disposeVideoTextures(', 'disposeRenderState('], `the ${rel} region`);
   });
 
   it('both files import disposeVideoTextures from videoTextureSync', () => {

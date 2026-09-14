@@ -17,6 +17,7 @@
  *  guard for the ordering, on the `bootstrap-game-deps.mjs` side of it. */
 
 import { describe, it, expect } from 'vitest';
+import { expectInOrder, found } from '@modoki/engine/testing/inOrder';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readScannedSource } from '@modoki/engine/testing';
@@ -36,19 +37,11 @@ describe('bootstrap-game-deps.mjs vendors before installing (#650)', () => {
   });
 
   it('runs vendorEnginePlugins BEFORE the install call for each project', () => {
-    const vendorIdx = src.indexOf('vendorEnginePlugins(');
-    const installIdx = src.indexOf("npmRun(['install'");
-    expect(vendorIdx).toBeGreaterThan(-1);
-    expect(installIdx).toBeGreaterThan(-1);
-    expect(vendorIdx).toBeLessThan(installIdx);
+    expectInOrder(src, ['vendorEnginePlugins(', "npmRun(['install'"], 'bootstrap-game-deps');
   });
 
   it('writes the vendor marker AFTER the install call, not before', () => {
-    const installIdx = src.indexOf("npmRun(['install'");
-    const markerIdx = src.indexOf('writeVendorMarker(');
-    expect(installIdx).toBeGreaterThan(-1);
-    expect(markerIdx).toBeGreaterThan(-1);
-    expect(installIdx).toBeLessThan(markerIdx);
+    expectInOrder(src, ["npmRun(['install'", 'writeVendorMarker('], 'bootstrap-game-deps');
   });
 
   it('the marker write sits INSIDE the install\'s own try block (only meaningful once install succeeded)', () => {
@@ -56,11 +49,9 @@ describe('bootstrap-game-deps.mjs vendors before installing (#650)', () => {
     // technique as cliNativeBuildHeals.test.ts's ensureCapacitorDeps-before-vendorEnginePlugins
     // check. A marker written after a FAILED install would record a vendor spec nothing actually
     // installed.
-    const tryIdx = src.indexOf('console.log(`[bootstrap-game-deps] installing');
-    const catchIdx = src.indexOf('} catch (e) {', tryIdx);
-    const markerIdx = src.indexOf('writeVendorMarker(');
-    expect(tryIdx).toBeGreaterThan(-1);
-    expect(catchIdx).toBeGreaterThan(-1);
+    const tryIdx = found(src.indexOf('console.log(`[bootstrap-game-deps] installing'), 'the install log line that opens the try');
+    const catchIdx = found(src.indexOf('} catch (e) {', tryIdx), 'the install try\'s catch');
+    const markerIdx = found(src.indexOf('writeVendorMarker('), 'writeVendorMarker(');
     expect(markerIdx).toBeGreaterThan(tryIdx);
     expect(markerIdx).toBeLessThan(catchIdx);
   });

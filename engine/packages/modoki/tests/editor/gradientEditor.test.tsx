@@ -6,6 +6,7 @@
  *       returns on the first stop with t >= queryT, so an unsorted array samples wrong). */
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeAll } from 'vitest';
+import { expectInOrder } from '../helpers/inOrder';
 import { render } from '@testing-library/react';
 import type { Gradient } from '../../src/runtime/particles/types';
 import GradientEditor from '../../src/editor/panels/particle/GradientEditor';
@@ -79,7 +80,7 @@ describe('GradientEditor — F3 stop-drag identity + sorted persistence', () => 
     expect(red.t).toBeCloseTo(0.9, 2);
     expect(blue.t).toBeCloseTo(0.8, 2);
     // and red now sorts AFTER blue
-    expect(final.colorStops.indexOf(red)).toBeGreaterThan(final.colorStops.indexOf(blue));
+    expectInOrder(final.colorStops, [blue, red], 'colorStops');
   });
 
   it('persists added stops in sorted order', () => {

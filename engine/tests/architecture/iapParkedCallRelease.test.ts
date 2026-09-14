@@ -45,6 +45,7 @@
  *  Capacitor bridge, so it cannot exercise `unpark` at runtime. That verification has to happen on
  *  a device with a real Play purchase in flight. */
 import { describe, expect, it } from 'vitest';
+import { found } from '@modoki/engine/testing/inOrder';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { REPO_ROOT } from '../helpers/repoLayout';
@@ -307,11 +308,9 @@ describe('ModokiIapPlugin: a parked purchase() times out instead of waiting fore
     // not have drifted into purchase(). `statementLines` needs an exact whole-line match, so these
     // anchor on declarations rather than on the two-line log statement in that branch.
     const lineOf = (needle: string): number =>
-      source.split('\n').findIndex((l) => l.includes(needle));
+      found(source.split('\n').findIndex((l) => l.includes(needle)), `the declaration "${needle}"`);
     const listenerAt = lineOf('private final PurchasesUpdatedListener purchasesUpdatedListener');
     const purchaseAt = lineOf('public void purchase(PluginCall call)');
-    expect(listenerAt, 'purchasesUpdatedListener declaration not found').toBeGreaterThan(-1);
-    expect(purchaseAt, 'purchase(PluginCall) declaration not found').toBeGreaterThan(-1);
     expect(
       armSites[0] > listenerAt && armSites[0] < purchaseAt,
       `armStrandTimeout is at line ${armSites[0] + 1}, outside the purchasesUpdated listener `
@@ -358,16 +357,14 @@ describe('ModokiIapPlugin: a parked purchase() times out instead of waiting fore
 
   it('the fire path resolves, unparks FIRST, and never rejects', () => {
     const timeoutBody = extractArmHelper(source);
-    const unparkAt = timeoutBody.indexOf('unpark(call)');
-    const resolveAt = timeoutBody.indexOf('call.resolve(');
-    expect(unparkAt, 'the fire path does not call unpark(call)').toBeGreaterThan(-1);
-    expect(resolveAt, 'the fire path does not call call.resolve(...)').toBeGreaterThan(-1);
+    const unparkAt = found(timeoutBody.indexOf('unpark(call)'), "the fire path's unpark(call)");
+    const resolveAt = found(timeoutBody.indexOf('call.resolve('), "the fire path's call.resolve(...)");
     expect(
-      unparkAt < resolveAt,
+      unparkAt,
       'the fire path resolves BEFORE unparking. unpark()\'s own docblock says the order is '
         + 'load-bearing (the keep-alive flag is read as the response is sent); every other settle '
         + 'site unparks first and this must match.',
-    ).toBe(true);
+    ).toBeLessThan(resolveAt);
     expect(
       timeoutBody.includes('call.reject('),
       'the fire path rejects — that surfaces a spurious error for a purchase that may still be '

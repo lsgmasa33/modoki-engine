@@ -36,6 +36,7 @@
  *  NAMED in prose cannot be mistaken for one that runs. */
 
 import { describe, it, expect } from 'vitest';
+import { found } from '@modoki/engine/testing/inOrder';
 import path from 'node:path';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { readScannedSource } from '@modoki/engine/testing';
@@ -200,11 +201,9 @@ describe('every wholesale .meta.json writer declares how it knows a read landed 
    *  one available to a scan — it goes red for the move that actually happened once. */
   it('the environment guard is decided BEFORE anything expensive is spent', () => {
     const code = read('panels/assetViews/EnvironmentAssetView.tsx');
-    const guard = code.indexOf('metaReadPathOf(');
-    expect(guard, 'the guard must exist at all').toBeGreaterThan(-1);
+    const guard = found(code.indexOf('metaReadPathOf('), 'the provenance guard metaReadPathOf(');
     for (const spend of ['setImporting(true)', 'flushPendingMetaFor(', 'encodeUltraHDR(', 'writeMetaWholesale(']) {
-      const at = code.indexOf(spend);
-      expect(at, `${spend} must be present for this ordering check to mean anything`).toBeGreaterThan(-1);
+      const at = found(code.indexOf(spend), spend);
       expect(guard, `the provenance guard must precede ${spend} — a refusal after it orphans work`).toBeLessThan(at);
     }
   });

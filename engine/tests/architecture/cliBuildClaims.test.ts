@@ -14,6 +14,7 @@
  *  other guard is the WIRING — that each script actually calls it, and calls it early enough. */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { expectInOrder, found } from '@modoki/engine/testing/inOrder';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -215,11 +216,7 @@ describe('build-web.mjs takes the cross-process build claim (#650)', () => {
   });
 
   it('acquires BEFORE validateProjectConfig — the first thing the build pipeline does', () => {
-    const acquireIdx = src.indexOf('acquireBuildClaim(');
-    const validateIdx = src.indexOf('await validateProjectConfig();');
-    expect(acquireIdx).toBeGreaterThan(-1);
-    expect(validateIdx).toBeGreaterThan(-1);
-    expect(acquireIdx).toBeLessThan(validateIdx);
+    expectInOrder(src, ['acquireBuildClaim(', 'await validateProjectConfig();'], 'build pipeline');
   });
 });
 
@@ -251,22 +248,16 @@ describe('add-native-targets.mjs takes the cross-process build claim (#650)', ()
   });
 
   it('acquires BEFORE reading project.config.json (any mutation, including scaffoldNativeTarget\'s own heals, follows)', () => {
-    const acquireIdx = src.indexOf('acquireBuildClaim(');
-    const cfgPathIdx = src.indexOf("const cfgPath = path.join(projectRoot, 'project.config.json');");
-    const scaffoldIdx = src.indexOf('scaffoldNativeTarget(');
-    expect(acquireIdx).toBeGreaterThan(-1);
-    expect(cfgPathIdx).toBeGreaterThan(-1);
-    expect(scaffoldIdx).toBeGreaterThan(-1);
+    const acquireIdx = found(src.indexOf('acquireBuildClaim('), 'acquireBuildClaim(');
+    const cfgPathIdx = found(src.indexOf("const cfgPath = path.join(projectRoot, 'project.config.json');"), 'the cfgPath declaration');
+    const scaffoldIdx = found(src.indexOf('scaffoldNativeTarget('), 'scaffoldNativeTarget(');
     expect(acquireIdx).toBeLessThan(cfgPathIdx);
     expect(acquireIdx).toBeLessThan(scaffoldIdx);
   });
 
   it('claims once PER PROJECT, not once for the whole batch — each spec gets its own dist', () => {
     // The acquire call sits INSIDE the `for (const spec of specs)` loop, not before it.
-    const forIdx = src.indexOf('for (const spec of specs)');
-    const acquireIdx = src.indexOf('acquireBuildClaim(');
-    expect(forIdx).toBeGreaterThan(-1);
-    expect(acquireIdx).toBeGreaterThan(forIdx);
+    expectInOrder(src, ['for (const spec of specs)', 'acquireBuildClaim('], 'add-native-target');
   });
 });
 
@@ -296,12 +287,9 @@ describe('ota-publish.mjs takes the cross-process build claim (#650)', () => {
   });
 
   it('acquires BEFORE hashing/reading distDir (buildManifestFiles) and before any upload', () => {
-    const acquireIdx = src.indexOf('acquireBuildClaim(');
-    const hashIdx = src.indexOf('await buildManifestFiles(distDir)');
-    const uploadIdx = src.indexOf("gcloud storage rsync");
-    expect(acquireIdx).toBeGreaterThan(-1);
-    expect(hashIdx).toBeGreaterThan(-1);
-    expect(uploadIdx).toBeGreaterThan(-1);
+    const acquireIdx = found(src.indexOf('acquireBuildClaim('), 'acquireBuildClaim(');
+    const hashIdx = found(src.indexOf('await buildManifestFiles(distDir)'), 'await buildManifestFiles(distDir)');
+    const uploadIdx = found(src.indexOf("gcloud storage rsync"), 'gcloud storage rsync');
     expect(acquireIdx).toBeLessThan(hashIdx);
     expect(acquireIdx).toBeLessThan(uploadIdx);
   });
@@ -309,10 +297,7 @@ describe('ota-publish.mjs takes the cross-process build claim (#650)', () => {
   it('ALSO claims a sub-game dist\'s own project before hashing it, and releases that claim too (#837)', () => {
     // build-subgame.mjs claims the SUB-GAME project; claiming only --project (the shell) left the
     // dist it uploads unguarded against a second build of that sub-game.
-    const distClaimIdx = src.indexOf('acquireBuildClaim(distProjectDir,');
-    const hashIdx = src.indexOf('await buildManifestFiles(distDir)');
-    expect(distClaimIdx).toBeGreaterThan(-1);
-    expect(distClaimIdx).toBeLessThan(hashIdx);
+    expectInOrder(src, ['acquireBuildClaim(distProjectDir,', 'await buildManifestFiles(distDir)'], 'publish-ota');
     expect(src).toMatch(/\}\s*finally\s*\{\s*buildClaim\.release\(\);\s*distClaim\?\.release\(\);/);
   });
 
@@ -357,11 +342,9 @@ describe('build-subgame.mjs takes the cross-process build claim (#650, #837)', (
   });
 
   it('acquires BEFORE its first write (the scoped tsconfig) and before the vite build', () => {
-    const acquireIdx = src.indexOf('acquireBuildClaim(');
-    const writeIdx = src.indexOf('writeFileSync(scopedPath');
-    const viteIdx = src.indexOf('build --config');
-    expect(writeIdx).toBeGreaterThan(-1);
-    expect(viteIdx).toBeGreaterThan(-1);
+    const acquireIdx = found(src.indexOf('acquireBuildClaim('), 'acquireBuildClaim(');
+    const writeIdx = found(src.indexOf('writeFileSync(scopedPath'), 'writeFileSync(scopedPath');
+    const viteIdx = found(src.indexOf('build --config'), 'build --config');
     expect(acquireIdx).toBeLessThan(writeIdx);
     expect(acquireIdx).toBeLessThan(viteIdx);
   });

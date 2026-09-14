@@ -8,6 +8,7 @@
  *  refused before any upload) is `otaPublishReleaseRace.test.ts` test q. */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { expectInOrder } from '@modoki/engine/testing/inOrder';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -143,12 +144,11 @@ describe('both OTA entry points run the ONE preflight (#827)', () => {
   });
 
   it('#906: /api/ota/publish refuses an unclean tree BEFORE it takes the build slot, asking the build stamp\'s own question', () => {
-    const check = route.indexOf('const tree = readGitProvenance(subgameDir ?? projectRoot);');
-    const refuse = route.indexOf('if (tree.commit === null || tree.dirty !== false) {');
-    const slot = route.indexOf("acquireBuildSlot('OTA publish', projectRoot)");
-    expect(check, 'the route no longer reads the tree').toBeGreaterThan(-1);
-    expect(refuse).toBeGreaterThan(check);
-    expect(slot, 'the build slot moved').toBeGreaterThan(refuse);
+    expectInOrder(route, [
+      'const tree = readGitProvenance(subgameDir ?? projectRoot);',
+      'if (tree.commit === null || tree.dirty !== false) {',
+      "acquireBuildSlot('OTA publish', projectRoot)",
+    ], '/api/ota/publish');
   });
 
   it('each side words EVERY refusal — none answers with undefined', () => {

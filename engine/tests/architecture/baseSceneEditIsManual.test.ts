@@ -8,6 +8,7 @@
  *  The behaviour these protect is covered in `tests/editor/pendingBaseScene.test.ts`. */
 
 import { describe, it, expect } from 'vitest';
+import { found } from '@modoki/engine/testing/inOrder';
 import path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
 import { causeSpecs, flushParked } from '../../packages/modoki/src/editor/scene/serialize';
@@ -88,20 +89,15 @@ describe('the base-scene flush runs LAST, and that rule is DATA (#831, #972)', (
       .toBeGreaterThan(-1);
     const body = code.slice(saveAllAt);
 
-    const before = body.indexOf("await flushParked('before-scene')");
-    const sceneWrite = body.indexOf('await saveScene(opts)');
+    // found(): each is the SUBJECT of the ordering below; an absent one would read -1 and pass it.
+    const before = found(body.indexOf("await flushParked('before-scene')"), "saveAll's await flushParked('before-scene')");
+    const sceneWrite = found(body.indexOf('await saveScene(opts)'), "saveAll's await saveScene(opts)");
     // ⚠️ The CALL, not the declaration. An earlier version of this guard matched the flush name,
     // which first appears inside `withBaseScenes`' body — so moving the AWAIT above `saveScene`,
     // the exact refactor this exists to catch, left it green. The declaration is checked too,
     // because a helper declared before the scene write reads as though it runs there.
-    const afterCall = body.indexOf('await withBaseScenes()');
-    const afterDecl = body.indexOf('const withBaseScenes =');
-    for (const [label, at] of [
-      ["flushParked('before-scene')", before], ['saveScene', sceneWrite],
-      ['await withBaseScenes()', afterCall], ['const withBaseScenes =', afterDecl],
-    ] as const) {
-      expect(at, `saveAll no longer contains \`${label}\` — the ordering this guard asserts has no subject`).toBeGreaterThan(-1);
-    }
+    const afterCall = found(body.indexOf('await withBaseScenes()'), "saveAll's await withBaseScenes()");
+    const afterDecl = found(body.indexOf('const withBaseScenes ='), "saveAll's const withBaseScenes =");
     // …and the helper must actually run the after-scene phase, or the names above vouch for nothing.
     expect(body.slice(afterDecl, afterCall)).toContain("flushParked('after-scene')");
     expect(before).toBeLessThan(sceneWrite);
@@ -118,13 +114,10 @@ describe('the base-scene flush runs LAST, and that rule is DATA (#831, #972)', (
     // the prefab world's unsaved edits are exactly what the route refuses on.
     const code = readScannedSource(path.join(SRC, 'scene/saveCommand.ts')).code;
     const branch = code.slice(code.indexOf('if (isEditingPrefab())'));
-    const before = branch.indexOf("await flushParked('before-scene')");
-    const prefabSave = branch.indexOf('await savePrefabEdit()');
-    const after = branch.indexOf("await flushParked('after-scene')");
-    expect(prefabSave, 'the prefab-edit branch no longer calls savePrefabEdit').toBeGreaterThan(-1);
-    expect(before, 'the prefab-edit branch does not flush before-scene parked work').toBeGreaterThan(-1);
-    expect(after, 'the prefab-edit branch does not flush pending base scenes — Cmd+S there '
-      + 'leaves the edit pending and says nothing').toBeGreaterThan(-1);
+    const before = found(branch.indexOf("await flushParked('before-scene')"), "the prefab-edit branch's before-scene flush");
+    const prefabSave = found(branch.indexOf('await savePrefabEdit()'), "the prefab-edit branch's savePrefabEdit call");
+    const after = found(branch.indexOf("await flushParked('after-scene')"), "the prefab-edit branch's after-scene flush "
+      + '(without it Cmd+S there leaves the edit pending and says nothing)');
     expect(before).toBeLessThan(prefabSave);
     expect(prefabSave).toBeLessThan(after);
   });
@@ -139,11 +132,9 @@ describe('the base-scene flush runs LAST, and that rule is DATA (#831, #972)', (
     const at = code.indexOf('if (preview && !needsAuthoredWorld)');
     expect(at, 'the preview fast path was renamed — this guard has no subject').toBeGreaterThan(-1);
     const branch = code.slice(at, code.indexOf('if (preview && previewHasAuthoredEdits())'));
-    const before = branch.indexOf("flushParked('before-scene')");
-    const after = branch.indexOf("flushParked('after-scene')");
-    expect(before, 'the preview fast path does not flush before-scene parked work').toBeGreaterThan(-1);
-    expect(after, 'the preview fast path does not flush after-scene parked work — a parked '
-      + 'base-scene ref is silently lost on Cmd+S under a preview (#972 P12)').toBeGreaterThan(-1);
+    const before = found(branch.indexOf("flushParked('before-scene')"), "the preview fast path's before-scene flush");
+    const after = found(branch.indexOf("flushParked('after-scene')"), "the preview fast path's after-scene flush "
+      + '(without it a parked base-scene ref is silently lost on Cmd+S under a preview, #972 P12)');
     expect(before).toBeLessThan(after);
     // Non-vacuity: it must not have gone back to naming individual flushes.
     for (const named of ['flushDirtyAssets(', 'flushPendingMeta(', 'flushPendingBaseScenes(']) {

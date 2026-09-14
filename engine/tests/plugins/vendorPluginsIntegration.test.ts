@@ -12,6 +12,7 @@
  * by skipping every check here and reporting green.
  */
 import { describe, it, expect, afterAll } from 'vitest';
+import { expectInOrder } from '@modoki/engine/testing/inOrder';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
@@ -778,7 +779,7 @@ describe('stamp-plugin-builds derives its set from build:plugins, not from disco
     const postinstall: string = pkg.scripts.postinstall;
     expect(postinstall).toContain('stamp-plugin-builds.mjs');
     // Order is the correctness argument: a failed build must never reach the stamper.
-    expect(postinstall.indexOf('build:plugins')).toBeLessThan(postinstall.indexOf('stamp-plugin-builds.mjs'));
+    expectInOrder(postinstall, ['build:plugins', 'stamp-plugin-builds.mjs'], 'postinstall');
     expect(postinstall.slice(postinstall.indexOf('build:plugins'), postinstall.indexOf('stamp-plugin-builds.mjs'))).toContain('&&');
   });
 });

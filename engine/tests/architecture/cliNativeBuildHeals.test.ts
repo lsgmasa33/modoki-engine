@@ -22,6 +22,7 @@
  *  project, which is why the behaviour lives in the unit suite instead. */
 
 import { describe, it, expect } from 'vitest';
+import { expectInOrder, found } from '@modoki/engine/testing/inOrder';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -77,11 +78,7 @@ describe('build-web.mjs heals through the ONE shared sequence (#148, #150, #685,
   });
 
   it('heals BEFORE the typecheck, which resolves plugin types out of the project node_modules', () => {
-    const healCall = src.indexOf('await healNativeProject()');
-    const tscCall = src.indexOf('tsconfig.app.scoped.json`');
-    expect(healCall).toBeGreaterThan(-1);
-    expect(tscCall).toBeGreaterThan(-1);
-    expect(healCall).toBeLessThan(tscCall);
+    expectInOrder(src, ['await healNativeProject()', 'tsconfig.app.scoped.json`'], 'the native build');
   });
 
   it('FAILS the build (throws) on a stale node_modules, a failed install and a Firebase auth manifest refusal (#1062) — never merely logs', () => {
@@ -131,10 +128,9 @@ describe('the editor /api/build heals through the same sequence (#685 parity, #8
     // `healNativeConfig` adds `keystore.properties` to a freshly scaffolded `android/.gitignore`;
     // writing the upload key's passwords first leaves them unignored for as long as the heal takes,
     // or for good if it refuses.
-    const heal = src.indexOf('await healNativeProject(');
+    const heal = found(src.indexOf('await healNativeProject('), 'await healNativeProject(');
     for (const write of ['renderKeystoreProperties(', 'renderExportOptionsPlist(']) {
-      const at = src.indexOf(write);
-      expect(at, `${write} is gone — re-anchor`).toBeGreaterThan(-1);
+      const at = found(src.indexOf(write), `${write} (gone? re-anchor)`);
       expect(heal, `the heal runs after ${write}`).toBeLessThan(at);
     }
   });
@@ -192,11 +188,7 @@ describe('build-web.mjs validates project config before it builds anything (#589
     // Loose about HOW, strict about the ordering fact that matters — validation must land before
     // ANY native file gets healed from a config nothing has checked yet. Compared at the CALL sites
     // in the main flow: the two function DEFINITIONS' order in the file says nothing about which runs.
-    const validateCall = src.indexOf('await validateProjectConfig();');
-    const healCall = src.indexOf('await healNativeProject();');
-    expect(validateCall).toBeGreaterThan(-1);
-    expect(healCall).toBeGreaterThan(-1);
-    expect(validateCall).toBeLessThan(healCall);
+    expectInOrder(src, ['await validateProjectConfig();', 'await healNativeProject();'], 'the native build');
   });
 
   it('exits non-zero on the error path, without a --force-style bypass', () => {
@@ -249,8 +241,7 @@ describe('build-web.mjs warns (never silently) when the project-config gate cann
   });
 
   it('warns with the reason and RETURNS — never process.exit — when the module cannot load', () => {
-    const ifIdx = src.indexOf('if (!cfgMod)', fnStart);
-    expect(ifIdx).toBeGreaterThan(-1);
+    const ifIdx = found(src.indexOf('if (!cfgMod)', fnStart), 'if (!cfgMod) after validateProjectConfig opens');
     expect(ifIdx).toBeLessThan(fnEnd);
     const ifOpenBrace = src.indexOf('{', ifIdx);
     const ifCloseBrace = matchingBraceEnd(src, ifOpenBrace);

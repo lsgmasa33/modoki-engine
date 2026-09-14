@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { expectInOrder } from '@modoki/engine/testing/inOrder'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -1320,7 +1321,7 @@ describe('toolchain — uninstall / uninstallAll (remove provisioned tools)', ()
     // ⚠️ The decode is hoisted OUT of the Where-Object block, which runs once per process.
     it('declares the directories before the pipeline, not inside the filter', () => {
       const cmd = winSweepCommand('C:\\tools\\jdk')
-      expect(cmd.indexOf('$d0 =')).toBeLessThan(cmd.indexOf('Where-Object'))
+      expectInOrder(cmd, ['$d0 =', 'Where-Object'], 'winSweepCommand')
       expect(cmd.slice(cmd.indexOf('Where-Object'))).not.toContain('FromBase64String')
     })
   })

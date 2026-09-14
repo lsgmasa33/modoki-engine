@@ -20,6 +20,7 @@
  */
 
 import { describe, it, expect, afterAll } from 'vitest';
+import { found } from '@modoki/engine/testing/inOrder';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -134,12 +135,9 @@ describe('add-native-targets.mjs wires the validation in before scaffolding (#58
     // Loose about HOW the check is written; strict about the two facts that were broken —
     // reachable at all, and ordered before the scaffold/dry-run report so `--dry-run` cannot
     // claim a project is scaffoldable that the real run would refuse.
-    const checkCall = src.indexOf('projectBuildConfigErrors(projectRoot');
-    const scaffoldCall = src.indexOf('scaffoldNativeTarget(');
-    const dryBranch = src.indexOf('if (DRY) {');
-    expect(checkCall).toBeGreaterThan(-1);
-    expect(scaffoldCall).toBeGreaterThan(-1);
-    expect(dryBranch).toBeGreaterThan(-1);
+    const checkCall = found(src.indexOf('projectBuildConfigErrors(projectRoot'), 'projectBuildConfigErrors(projectRoot');
+    const scaffoldCall = found(src.indexOf('scaffoldNativeTarget('), 'scaffoldNativeTarget(');
+    const dryBranch = found(src.indexOf('if (DRY) {'), 'if (DRY) {');
     expect(checkCall).toBeLessThan(scaffoldCall);
     expect(checkCall).toBeLessThan(dryBranch);
   });

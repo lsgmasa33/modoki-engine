@@ -19,6 +19,7 @@
  *  for when adding a fixture that suddenly has more to do than it used to. */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { expectInOrder } from '@modoki/engine/testing/inOrder';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -434,11 +435,7 @@ describe('the CLI native build runs the generator (#1011 facet A)', () => {
     // Ordering is load-bearing, not tidiness: `ensureCapacitorDeps` can create the very `ios/` or
     // `android/` directory this writes into, and `generateNativeIcons` skips a platform that is not
     // on disk — so running it first would silently generate nothing on a fresh native target.
-    const call = src.indexOf('await generateNativeIcons()');
-    const heal = src.indexOf('await healNativeProject()');
-    expect(call).toBeGreaterThan(-1);
-    expect(heal).toBeGreaterThan(-1);
-    expect(call).toBeGreaterThan(heal);
+    expectInOrder(src, ['await healNativeProject()', 'await generateNativeIcons()'], 'the native build');
   });
 
   it('spawns generate-icons.mjs, passing ONLY the project and the platform', () => {

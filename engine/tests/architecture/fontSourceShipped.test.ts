@@ -24,6 +24,7 @@
  *  FAILURE where the source is the only way the font renders at all), and would not catch a
  *  subtler break in the copy itself. */
 import { describe, it, expect } from 'vitest';
+import { found } from '@modoki/engine/testing/inOrder';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readScannedSource } from '@modoki/engine/testing';
@@ -48,9 +49,8 @@ const SRC_WITH_PROSE = SCANNED.raw;
  *  it were made unconditional again. Verified by mutation: see the mutation-check notes in the
  *  hand-off report for this change. */
 function bakedFontSuccessPath(): string {
-  const start = SRC.indexOf('fontVariantCount++;');
+  const start = found(SRC.indexOf('fontVariantCount++;'), 'fontVariantCount++;');
   const end = SRC.indexOf('convertedFonts.set(');
-  expect(start).toBeGreaterThan(-1);
   expect(end).toBeGreaterThan(start);
   return SRC.slice(start, end);
 }
@@ -59,9 +59,8 @@ function bakedFontSuccessPath(): string {
  *  statement) up to the loop's closing brace, marked by the atlas-count log line that
  *  follows the whole `for` loop. */
 function bakedFontCatchPath(): string {
-  const start = SRC.indexOf('convertedFonts.set(');
+  const start = found(SRC.indexOf('convertedFonts.set('), 'convertedFonts.set(');
   const end = SRC.indexOf('if (fontVariantCount) console.log(');
-  expect(start).toBeGreaterThan(-1);
   expect(end).toBeGreaterThan(start);
   return SRC.slice(start, end);
 }

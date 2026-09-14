@@ -7,6 +7,7 @@
  *  private MODOKI_HOME, because the port contract is only worth anything if `acquireBuildClaim`'s
  *  refusal carries `held` the way the decision reads it. */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { found } from '@modoki/engine/testing/inOrder';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -369,9 +370,9 @@ describe('main.ts wires claimProjectForOpen the way its header requires', () => 
     const launchCatch = findNodes(launchBody!, ts.isCatchClause);
     expect(launchCatch).toHaveLength(1);
     const stmts = launchCatch[0].block.statements;
-    const guardAt = stmts.findIndex((st) => ts.isIfStatement(st) && st.expression.getText(sf) === '!ticket.isCurrent()');
+    const guardAt = found(stmts.findIndex((st) => ts.isIfStatement(st) && st.expression.getText(sf) === '!ticket.isCurrent()'),
+      'the superseded guard in the launch catch');
     const rethrowAt = stmts.findIndex((st) => ts.isThrowStatement(st));
-    expect(guardAt, 'the superseded guard in the launch catch is gone').toBeGreaterThanOrEqual(0);
     expect(findNodes((stmts[guardAt] as ts.IfStatement).thenStatement, ts.isReturnStatement)[0]?.getText(sf)).toBe('return false;');
     // BEFORE the rethrow: a superseded launch whose install failed must not reach the fatal path.
     expect(rethrowAt).toBeGreaterThan(guardAt);

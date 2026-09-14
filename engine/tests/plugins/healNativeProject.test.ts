@@ -13,6 +13,7 @@
  *  prove the one sequence's behaviour. */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { expectInOrder } from '@modoki/engine/testing/inOrder';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -205,7 +206,7 @@ describe('healNativeProject — the sequence', () => {
   it('strips Facebook AFTER an install, never before it — an install re-extracts the original manifest (#1062)', async () => {
     state.needsInstall = true;
     await healNativeProject(project, '/engine', ['ios'], ports().ports);
-    expect(calls.indexOf('stripFacebook')).toBeGreaterThan(calls.indexOf('install:engine plugin changed'));
+    expectInOrder(calls, ['install:engine plugin changed', 'stripFacebook'], 'heal calls');
   });
 
   it('REFUSES the build when the Facebook strip cannot complete, passing its diagnosis through (#1062)', async () => {

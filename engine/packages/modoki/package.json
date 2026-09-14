@@ -29,7 +29,8 @@
     "./testing/fontMetrics": "./tests/helpers/fontMetrics.ts",
     "./testing/prefabInstances": "./tests/helpers/prefabInstances.ts",
     "./testing/exemptionLedger": "./tests/helpers/exemptionLedger.ts",
-    "./testing/sourceAst": "./tests/helpers/sourceAst.ts"
+    "./testing/sourceAst": "./tests/helpers/sourceAst.ts",
+    "./testing/inOrder": "./tests/helpers/inOrder.ts"
   },
   "scripts": {
     "test": "vitest run",

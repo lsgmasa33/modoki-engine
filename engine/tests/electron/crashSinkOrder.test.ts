@@ -2,6 +2,7 @@
 // esbuild needs a native TextEncoder (its startup invariant) and jsdom's polyfill breaks it —
 // same reason mainBundleExternals.test.ts and mcpBundle.test.ts run under node.
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import { found } from '@modoki/engine/testing/inOrder';
 import esbuild from 'esbuild';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -57,10 +58,8 @@ describe('the sink is installed before anything else can throw (#1043)', () => {
     // `fileLog.ts`'s pre-app fallback, and it works today only because fileLog is emitted after
     // electron — if anything ever pulled fileLog into an early module, `indexOf` would find THAT
     // copy and this assertion would pass with the sink at the bottom of the bundle.
-    const sink = code.indexOf('installEarlyCrashSink');
-    const electron = code.indexOf('require("electron")');
-    expect(sink, 'crashSink body not found in the bundle at all').toBeGreaterThan(-1);
-    expect(electron, 'no external electron require in the bundle').toBeGreaterThan(-1);
+    const sink = found(code.indexOf('installEarlyCrashSink'), 'the crashSink body in the bundle');
+    const electron = found(code.indexOf('require("electron")'), 'an external electron require in the bundle');
     expect(
       sink,
       'the crash sink must be emitted BEFORE electron is required, or the window it exists to '

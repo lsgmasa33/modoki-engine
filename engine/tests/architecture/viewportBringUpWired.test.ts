@@ -27,6 +27,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { found } from '@modoki/engine/testing/inOrder';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readScannedSource } from '@modoki/engine/testing';
@@ -124,12 +125,11 @@ describe("the editor's SceneView is wired to viewportBringUp too (#1052)", () =>
 
   it("install's post-await re-check decides SUPERSEDED before UNMOUNTED, and gives the lease back only on unmount", () => {
     const install = code.slice(code.indexOf('const install = async ('), code.indexOf('createViewportBringUp<WebGPURenderer>({'));
-    const wrap = install.indexOf('renderer.dispose = (...args: Parameters<typeof priorDispose>) => { disposeActiveRenderer(); return priorDispose(...args); };');
-    const superseded = install.indexOf('if (!stillCurrent()) {');
-    const unmounted = install.indexOf("if (outerDisposed) { noteRendererProgress('viewport unmounted while the KTX2 loader chunk was in flight');");
-    expect(wrap, 'the dispose wrap is what makes a lease release also drop the active-renderer registration').toBeGreaterThan(-1);
-    expect(superseded, 'install no longer re-checks supersession after setActiveRenderer').toBeGreaterThan(-1);
-    expect(unmounted, 'install no longer re-checks unmount after setActiveRenderer').toBeGreaterThan(-1);
+    const wrap = found(install.indexOf('renderer.dispose = (...args: Parameters<typeof priorDispose>) => { disposeActiveRenderer(); return priorDispose(...args); };'),
+      'the dispose wrap (it is what makes a lease release also drop the active-renderer registration)');
+    const superseded = found(install.indexOf('if (!stillCurrent()) {'), "install's supersession re-check after setActiveRenderer");
+    const unmounted = found(install.indexOf("if (outerDisposed) { noteRendererProgress('viewport unmounted while the KTX2 loader chunk was in flight');"),
+      "install's unmount re-check after setActiveRenderer");
     // The wrap must be in place BEFORE a branch can give the lease back, or that release disposes through
     // the unwrapped `dispose` and the dead renderer stays registered as active.
     expect(wrap, 'the dispose wrap must come before the re-checks').toBeLessThan(superseded);
@@ -158,18 +158,17 @@ describe("the editor's SceneView is wired to viewportBringUp too (#1052)", () =>
   });
 
   it('re-arms the render-on-demand gate INSIDE install, so a renderer adopted late draws too', () => {
-    const start = code.indexOf('const install = async (');
+    const start = found(code.indexOf('const install = async ('), `${SCENEVIEW}'s install definition`);
     const end = code.indexOf('createViewportBringUp<WebGPURenderer>({');
-    expect(start, `${SCENEVIEW} no longer defines install`).toBeGreaterThanOrEqual(0);
     expect(end, 'install must be defined before the bring-up that calls it').toBeGreaterThan(start);
     const installAndAfter = code.slice(start, end);
     expect(installAndAfter.split('gateRef.current.markDirty();').length - 1, 'exactly one markDirty, inside install').toBe(1);
     // At the END — after the frame loop starts. Moved before `setActiveRenderer`'s await or into an
     // early-return branch, a completed install would not re-arm the gate (close-out review).
-    const frameLoop = installAndAfter.indexOf('registerFrameCallback(editorFrameKey');
-    // Anchor first: a renamed frame key makes indexOf -1, and the ordering check below would then pass
-    // however early markDirty moved (close-out §2d review).
-    expect(frameLoop, 'install no longer starts its frame loop with registerFrameCallback(editorFrameKey — update this anchor').toBeGreaterThan(-1);
+    // found(): a renamed frame key makes indexOf -1, and the ordering check below would then pass
+    // however early markDirty moved (close-out §2d review; #1181).
+    const frameLoop = found(installAndAfter.indexOf('registerFrameCallback(editorFrameKey'),
+      "install's registerFrameCallback(editorFrameKey anchor (update it)");
     expect(installAndAfter.indexOf('gateRef.current.markDirty();'), 'markDirty must come after the frame loop is started')
       .toBeGreaterThan(frameLoop);
   });

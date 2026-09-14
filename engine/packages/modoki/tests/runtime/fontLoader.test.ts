@@ -1,6 +1,7 @@
 /** fontLoader unit tests — parseFontFilename (pure), registry lookups on fresh state. */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { expectInOrder } from '../helpers/inOrder';
 
 beforeEach(() => {
   vi.resetModules();
@@ -663,11 +664,8 @@ describe('fontLoader', () => {
       await Promise.resolve();
       await Promise.resolve();
 
-      const addIdx = callOrder.indexOf('add:1');
-      const deleteIdx = callOrder.indexOf('delete:0');
-      expect(addIdx, 'the new face was added').toBeGreaterThanOrEqual(0);
-      expect(deleteIdx, 'the old face was deleted').toBeGreaterThanOrEqual(0);
-      expect(addIdx, 'add happens before delete — no frame with a system fallback').toBeLessThan(deleteIdx);
+      // The new face is added and the old one deleted, add first: no frame with a system fallback.
+      expectInOrder(callOrder, ['add:1', 'delete:0'], 'FontFaceSet calls');
     });
 
     it('registers exactly one variant after a re-import, with no self-collision warning', async () => {

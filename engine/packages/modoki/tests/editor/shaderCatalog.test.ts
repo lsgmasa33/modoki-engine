@@ -1,6 +1,7 @@
 /** shaderCatalog unit tests — option building + schema resolution. */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { expectInOrder } from '../helpers/inOrder';
 import {
   listShaderOptions, optionValueForMaterial, materialFieldsForOption, resolveShaderSchema,
 } from '../../src/editor/shaderCatalog';
@@ -89,7 +90,7 @@ describe('listShaderOptions ordering', () => {
     registerAsset(A, '/assets/shaders/alpha.shader.json', 'shader');
     const files = listShaderOptions().filter((o) => o.kind === 'file').map((o) => o.label);
     expect(files).toEqual([...files].sort((x, y) => x.localeCompare(y)));
-    expect(files.indexOf('alpha')).toBeLessThan(files.indexOf('zebra'));
+    expectInOrder(files, ['alpha', 'zebra'], 'file shader labels');
     const opts = listShaderOptions();
     expect(opts[0].kind).toBe('builtin');
     expect(opts[1].kind).toBe('builtin');

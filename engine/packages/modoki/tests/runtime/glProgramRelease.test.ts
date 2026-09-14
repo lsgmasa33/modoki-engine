@@ -7,6 +7,7 @@
  *  bumps a stats-only `info.destroyProgram`; a pipeline release deletes from `caches`. */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { found } from '../helpers/inOrder';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { installGlProgramReleaseHatch } from '../../src/runtime/rendering/glProgramRelease';
@@ -584,8 +585,7 @@ describe('three internals tripwire — the private surface #715 depends on', () 
     // would not actually detect a Pipelines-only rename, which is the entire point of this test.
     // Slice out just the `Pipelines` class body (from its `class Pipelines extends DataMap {`
     // declaration to the next top-level `class ` declaration) and assert against that instead.
-    const classStart = build.indexOf('class Pipelines extends DataMap {');
-    expect(classStart, '`class Pipelines extends DataMap {` must still open the class in the bundle').toBeGreaterThanOrEqual(0);
+    const classStart = found(build.indexOf('class Pipelines extends DataMap {'), '`class Pipelines extends DataMap {` in the bundle');
     const nextClassStart = build.indexOf('\nclass ', classStart + 1);
     expect(nextClassStart, 'a following top-level class declaration bounds the Pipelines class body').toBeGreaterThan(classStart);
     const pipelinesClass = build.slice(classStart, nextClassStart);

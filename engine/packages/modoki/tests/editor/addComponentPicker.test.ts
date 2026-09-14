@@ -4,6 +4,7 @@
  *  and the by-name sort within each bucket. No React / live world needed. */
 
 import { describe, it, expect } from 'vitest';
+import { expectInOrder } from '../helpers/inOrder';
 import type { TraitMeta } from '../../src/runtime/core/ecs/traitRegistry';
 import { COMPONENT_CATEGORY_ORDER } from '../../src/runtime/core/ecs/traitRegistry';
 import { filterAndGroupAddable } from '../../src/editor/panels/AddComponentPicker';
@@ -55,9 +56,7 @@ describe('filterAndGroupAddable', () => {
     const cats = filterAndGroupAddable(ADDABLE, '').map(([c]) => c);
     // CAT_A before CAT_B (both fixed order). 'Misc' is the LAST fixed-order entry,
     // so it precedes UNKNOWN, which is a true extra appended after all known ones.
-    expect(cats.indexOf(CAT_A)).toBeLessThan(cats.indexOf(CAT_B));
-    expect(cats.indexOf(CAT_B)).toBeLessThan(cats.indexOf('Misc'));
-    expect(cats.indexOf('Misc')).toBeLessThan(cats.indexOf(UNKNOWN));
+    expectInOrder(cats, [CAT_A, CAT_B, 'Misc', UNKNOWN], 'addable categories');
   });
 
   it('missing componentCategory buckets under "Misc"', () => {

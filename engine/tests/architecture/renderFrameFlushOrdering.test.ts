@@ -16,6 +16,7 @@
  *  instead — cheap, and it fails with a message that names the consequence rather than sending a
  *  future reader to git archaeology. */
 import { describe, it, expect } from 'vitest';
+import { found } from '@modoki/engine/testing/inOrder';
 import path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
 
@@ -80,19 +81,20 @@ describe('Scene2D.renderFrame() drains both deferred-destroy queues before the i
   });
 
   it('both flush calls happen BEFORE the idle whole-frame skip (#455, #476)', () => {
+    // found(): each flush is the SUBJECT of its ordering, so its absence must fail here, not read -1.
     expect(
-      maskFlushIdx >= 0 && idleSkipIdx >= 0 && maskFlushIdx < idleSkipIdx,
+      found(maskFlushIdx, 'this.flushPendingMaskDestroy() in renderFrame()'),
       'this.flushPendingMaskDestroy() must run before the idle-skip `return` — moved below it, a '
       + 'mask ramp texture queued for teardown right as the sim goes idle is stranded until the '
       + 'surface tears down instead of being freed on the very next frame (#455).',
-    ).toBe(true);
+    ).toBeLessThan(found(idleSkipIdx, 'the idle-skip condition in renderFrame()'));
     expect(
-      videoFlushIdx >= 0 && idleSkipIdx >= 0 && videoFlushIdx < idleSkipIdx,
+      found(videoFlushIdx, 'flushPendingVideoDestroy2D(this) in renderFrame()'),
       'flushPendingVideoDestroy2D(this) must run before the idle-skip `return` — moved below it, a '
       + 'pinned video decoder / GPU texture queued for teardown right as the sim goes idle is '
       + 'stranded until the surface tears down instead of being freed on the very next frame '
       + '(#476 follow-up to #455).',
-    ).toBe(true);
+    ).toBeLessThan(found(idleSkipIdx, 'the idle-skip condition in renderFrame()'));
   });
 
   it('both flush calls happen before the mid-pass syncVideoTextures2D( call site', () => {
@@ -102,17 +104,17 @@ describe('Scene2D.renderFrame() drains both deferred-destroy queues before the i
       + 'update this guard to match.',
     ).toBeGreaterThanOrEqual(0);
     expect(
-      maskFlushIdx >= 0 && maskFlushIdx < midPassVideoSyncIdx,
+      found(maskFlushIdx, 'this.flushPendingMaskDestroy() in renderFrame()'),
       'this.flushPendingMaskDestroy() must run before the mid-pass syncVideoTextures2D( call — '
       + 'otherwise a future refactor could quietly make the top-of-frame flush redundant, then '
       + 'delete it, re-opening the #455 idle-skip stranding.',
-    ).toBe(true);
+    ).toBeLessThan(midPassVideoSyncIdx);
     expect(
-      videoFlushIdx >= 0 && videoFlushIdx < midPassVideoSyncIdx,
+      found(videoFlushIdx, 'flushPendingVideoDestroy2D(this) in renderFrame()'),
       'flushPendingVideoDestroy2D(this) must run before the mid-pass syncVideoTextures2D( call — '
       + 'otherwise a future refactor could quietly make the top-of-frame flush redundant, then '
       + 'delete it, re-opening the #476 idle-skip stranding.',
-    ).toBe(true);
+    ).toBeLessThan(midPassVideoSyncIdx);
   });
 
   it('no early return sits above either flush call (an ordering check alone can\'t catch this)', () => {

@@ -43,6 +43,7 @@
  *  Do not extend this guard to chase those without a design discussion — they need either real
  *  type information or a bigger rewrite, not another regex. */
 import { describe, it, expect } from 'vitest';
+import { found } from '@modoki/engine/testing/inOrder';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
@@ -327,12 +328,16 @@ describe('a Pixi Geometry is destroyed only through releaseGeometry (unload-befo
     assertScanIsSane(raw, code, path.relative(process.cwd(), HELPER_FILE));
     const [start, end] = helperLineRange(code);
     const body = code.split('\n').slice(start - 1, end).join('\n');
-    expect(/\.unload\s*\(\s*\)/.test(body), `${HELPER_NAME} no longer calls unload()`).toBe(true);
+    // unload()'s position comes from the same whitespace-tolerant pattern that proves it. An earlier
+    // `indexOf('.unload(') < indexOf('.destroy(')` read -1 for `g.unload ()` and passed with the
+    // order reversed (#1181 close-out review, by mutation).
+    const unloadAt = found(body.search(/\.unload\s*\(\s*\)/), `${HELPER_NAME}'s unload() call`);
     expect(/\.destroy\s*\(\s*true\s*\)/.test(body), `${HELPER_NAME} no longer calls destroy(true)`).toBe(true);
-    expect(
-      body.indexOf('.unload(') < body.indexOf('.destroy('),
-      `${HELPER_NAME} must call unload() BEFORE destroy() — Pixi orphans the VAO otherwise`,
-    ).toBe(true);
+    // Ordered against ANY destroy, not only destroy(true): a bare destroy() ahead of unload() orphans
+    // the VAO just the same (#1181 close-out re-review, by mutation).
+    const destroyAt = found(body.search(/\.destroy\s*\(/), `${HELPER_NAME}'s first destroy call`);
+    expect(unloadAt, `${HELPER_NAME} must call unload() BEFORE destroy() — Pixi orphans the VAO otherwise`)
+      .toBeLessThan(destroyAt);
   });
 });
 

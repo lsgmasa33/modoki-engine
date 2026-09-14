@@ -9,6 +9,7 @@
  *      that succeeds and warms nothing, and silence is what makes it expensive.
  */
 import { describe, it, expect } from 'vitest';
+import { expectInOrder } from '../helpers/inOrder';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import {
@@ -281,8 +282,7 @@ describe('three r184 tripwire — the private surface #323 depends on', () => {
     // The names are no longer READ — pairs come from observed draws — but this asymmetry is still
     // load-bearing: it is WHY the walk runs in rounds. A stage's materials do not exist until the
     // graph containing it is built.
-    expect(src.indexOf('this._separableBlurMaterials.push')).toBeGreaterThan(src.indexOf('setup( builder )'));
-    expect(src.indexOf('this._renderTargetsHorizontal = []')).toBeLessThan(src.indexOf('setup( builder )'));
+    expectInOrder(src, ['this._renderTargetsHorizontal = []', 'setup( builder )', 'this._separableBlurMaterials.push'], 'BloomNode.js');
   });
 
   it('BloomNode still draws every stage through _quadMesh.render — how the pairs are observed', () => {

@@ -18,6 +18,7 @@
  *  the type silently defeated it, which is the strongest argument for the promise return. */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { found } from '@modoki/engine/testing/inOrder';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
@@ -109,8 +110,8 @@ describe('the asset-editor modals await the write before closing', () => {
       // Structural, because the ORDER is the behaviour: the bail must sit between the awaited
       // write and onClose(), not after it.
       const src = read(rel);
-      const write = src.indexOf('await writeMetaOrWarn(');
-      const bail = src.indexOf('if (!persisted)', write);
+      const write = found(src.indexOf('await writeMetaOrWarn('), `${rel}: await writeMetaOrWarn(`);
+      const bail = found(src.indexOf('if (!persisted)', write), `${rel}: if (!persisted) after the write`);
       const close = src.indexOf('onClose();', write);
       expect(bail).toBeGreaterThan(write);
       expect(bail).toBeLessThan(close);
@@ -122,9 +123,8 @@ describe('the asset-editor modals await the write before closing', () => {
       // Ordering matters, not just presence: awaiting the write and then closing FIRST in the
       // source would reintroduce the race.
       const src = read(rel);
-      const write = src.indexOf('await writeMetaOrWarn(');
+      const write = found(src.indexOf('await writeMetaOrWarn('), `${rel}: await writeMetaOrWarn(`);
       const close = src.indexOf('onClose();', write);
-      expect(write).toBeGreaterThan(-1);
       expect(close).toBeGreaterThan(write);
     });
   }

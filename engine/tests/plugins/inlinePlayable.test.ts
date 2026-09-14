@@ -4,6 +4,7 @@
  *  self-extract round-trip so a refactor can't silently break the artifact. */
 
 import { describe, it, expect } from 'vitest';
+import { expectInOrder } from '@modoki/engine/testing/inOrder';
 import zlib from 'node:zlib';
 import { buildPlayableHtml, stripExternalRefs, type PlayableInput } from '../../plugins/inlinePlayable';
 
@@ -70,7 +71,7 @@ describe('buildPlayableHtml', () => {
     const out = buildPlayableHtml(input(), fflate);
     expect(out).toContain(fflate); // byte-for-byte, not `$`-mangled
     // fflate defines self.fflate BEFORE the bootstrap's DecompressionStream feature-detect runs.
-    expect(out.indexOf('self.fflate=')).toBeLessThan(out.indexOf('DecompressionStream'));
+    expectInOrder(out, ['self.fflate=', 'DecompressionStream'], 'the playable html');
   });
 
   it('compresses — the gzipped artifact is smaller than the raw payload', () => {

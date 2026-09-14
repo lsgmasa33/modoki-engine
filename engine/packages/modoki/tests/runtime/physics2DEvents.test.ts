@@ -5,6 +5,7 @@
  *  dispatched with the OTHER entity as target, and that unsubscribe/clear work. */
 
 import { describe, it, expect, beforeAll, afterEach, vi } from 'vitest';
+import { expectInOrder } from '../helpers/inOrder';
 import type { Entity } from 'koota';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
 import { SYSTEM_PRIORITY } from '../../src/runtime/core/pipeline';
@@ -255,9 +256,7 @@ describe('OnCollision2D — declarative action dispatch', () => {
 
     tw.step(240);   // falls in then out
 
-    expect(fired).toContain('enter');
-    expect(fired).toContain('exit');
-    expect(fired.indexOf('enter')).toBeLessThan(fired.indexOf('exit'));
+    expectInOrder(fired, ['enter', 'exit'], 'fired');
   });
 });
 

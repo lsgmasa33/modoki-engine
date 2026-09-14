@@ -3,6 +3,7 @@
  *  regardless of whether ffmpeg is installed on the test machine. */
 
 import { describe, it, expect, vi } from 'vitest';
+import { found } from '@modoki/engine/testing/inOrder';
 
 vi.mock('child_process', () => {
   const execFileSync = vi.fn(() => { throw new Error('command not found'); });
@@ -97,7 +98,7 @@ describe('buildFfmpegArgs', () => {
     for (const format of ['mp3', 'aac', 'opus', 'wav', 'flac'] as const) {
       const args = buildFfmpegArgs({ ...S, format }, 'i', 'o');
       // -flags/-fflags +bitexact and -map_metadata -1 must appear AFTER -i (output options).
-      const inputIdx = args.indexOf('-i');
+      const inputIdx = found(args.indexOf('-i'), `-i in the ${format} args`);
       expect(args.indexOf('-flags')).toBeGreaterThan(inputIdx);
       expect(args[args.indexOf('-flags') + 1]).toBe('+bitexact');
       expect(args[args.indexOf('-fflags') + 1]).toBe('+bitexact');

@@ -48,6 +48,8 @@ asking the subject. See **The wrong-subject shape** below.
 | `engine/packages/modoki/tests/runtime/envPmremOwnership.test.ts` | Reference for the two-instance discriminant test |
 | `engine/packages/modoki/tests/video/videoTextureSync2D.test.ts` | The compact model of the same, in `gives each surface its own texture over the SAME element` |
 | `engine/tests/tools/readAssetDefServed.ts` | Reference for the **wrong-subject** shape — probes the op instead of inferring what it serves |
+| `engine/packages/modoki/tests/helpers/inOrder.ts` | `expectInOrder` / `found` — ordering checks that fail on an absent subject, shape **(H)** |
+| `engine/tests/architecture/indexOrderingAssertions.test.ts` | The shape (H) guard: no raw `indexOf`-family position on the vacuous side of an ordering matcher |
 
 ## How it works
 
@@ -646,6 +648,88 @@ the corpus sweep that runs the same matcher.
 instance. It counted **0**: the helper's parameter is named `g`, which the name-based matcher
 deliberately ignores, so the `inHelper` exemption exempts nothing today. Assuming the control
 matched would have added a floor that could never pass.
+
+### Shape (H): an ABSENT subject reads as a position (#1181)
+
+`expect(s.indexOf(a)).toBeLessThan(s.indexOf(b))` looks like it checks that `a` comes before `b`.
+But `indexOf` returns `-1` for a missing needle, and `-1` is less than every real position. So the
+assertion also passes when `a` never appeared. `userDataDir.test.ts` did exactly this: its guard for
+#1036 compared a formatter-wrapped `app.setPath(`, the left side read `-1`, and the check passed with
+its subject gone. The hole sits on whichever side should be SMALLER:
+
+- the actual of `toBeLessThan[OrEqual]`, and the expected of `toBeGreaterThan[OrEqual]`;
+- `.not` swaps the two sides;
+- binding the position first (`const at = src.indexOf(x)`) carries the `-1` into every later
+  comparison;
+- a constant bound is no protection: `expect(banner.indexOf(X)).toBeLessThan(8)` passes on `-1`.
+
+The same holds for `lastIndexOf`, `findIndex`, `findLastIndex` and `search`, and for the boolean
+spelling `expect(a < b).toBe(true)`.
+
+**The census was 114 comparisons in 54 files, not the 21 the issue was filed with** — 102 converted,
+and 12 in the four files `IN_FLIGHT_1179` pardons (below). A regex count
+missed the mirror form, the variable-bound form (the majority), and every `expect(` a formatter had
+wrapped across lines. The guard's first cut missed two more: it read only the ordering matchers, and
+it prefiltered files by those matcher names. So `geometryRelease`'s boolean
+`expect(body.indexOf('.unload(') < body.indexOf('.destroy(')).toBe(true)` was never parsed — and
+that one was live. Its presence checks were whitespace-tolerant regexes, so a
+`g.destroy(true); g.unload ();` order left it green 8/8 (close-out review, by mutation). A re-review
+then found six more: comparisons inside `&&`/`!` (`renderFrameFlushOrdering`'s inline
+`idx >= 0 && idx < other` pins, and `iapParkedCallRelease`'s `lineOf` conjunct), and a same-file
+`const idx = (p) => list.findIndex(p)` helper (`chromeLetterbox`, live: a missing Canvas2D entity
+passed). About half the sites already carried a
+separate presence pin (`toBeGreaterThan(-1)`, `toContain(needle)`), so they were not vacuous today.
+
+⚠️ **The position's pattern must match at least as broadly as the presence check — and as broadly as
+the ORDERING question.** `geometryRelease` proved presence with `/\.unload\s*\(\s*\)/` and ordered
+with `indexOf('.unload(')`, which disagree on a single space. The first repair then ordered against
+`/\.destroy\s*\(\s*true\s*\)/` because that was the presence pattern — and a bare `destroy()` placed
+ahead of `unload()` passed, where the old `indexOf('.destroy(')` had caught it (re-review, by
+mutation). Presence asks "is `destroy(true)` there?"; the order asks "does ANY destroy come first?",
+so the position comes from `/\.destroy\s*\(/`.
+
+**The fix is where the index is PRODUCED, not a pin beside the comparison.** Import from
+`@modoki/engine/testing/inOrder` (package tests: `../helpers/inOrder`):
+
+- `expectInOrder(haystack, [a, b, c], label)`. Every needle must be present, and a missing one is
+  reported by name before any position is compared. Then their first occurrences must strictly
+  increase. Use it for needles searched from the start of a string or list.
+- `found(index, what)`. It throws naming `what` for any negative or non-integer index, and otherwise
+  returns the index. Use it for a position computed any other way: a `from` offset, `lastIndexOf`,
+  a predicate `findIndex`, a regex `search`. For example,
+  `const at = found(src.indexOf('x(', start), 'x( after start')`.
+
+⚠️ **A presence pin does NOT satisfy the guard, on purpose** (owner, 2026-09-14). "Does the
+`toBeGreaterThan(-1)` three lines up pin THIS operand?" is an adjunct question. A pin on a re-bound
+variable, or on the same needle in a different haystack, reads identically, and an adjunct pardon is
+the kind that fails open ([verify-and-ci.md](verify-and-ci.md) § Exemption GRAIN). So every site
+migrated, including the already-pinned half, and the separate pin lines were deleted.
+
+`engine/tests/architecture/indexOrderingAssertions.test.ts` enforces this over every test file,
+on the AST: the four ordering matchers, and a relational comparison under
+`toBe`/`toEqual`/`toStrictEqual(true|false)`, `toBeTruthy` or `toBeFalsy`. It parses every test
+file with no content prefilter, because a prefilter that skips too much is invisible once the tree
+is clean. It does **not** cover:
+
+- ordering outside an `expect` (`if (a < b)`, `assert(a < b)`, a detector's own arithmetic);
+- a position returned by an IMPORTED helper, or by a same-file helper whose body is anything but a
+  concise expression or exactly one `return` statement (`{ const i = s.indexOf(n); return i; }` is
+  not followed) — a same-file `const idx = (p) => list.findIndex(p)` IS followed (`chromeLetterbox`);
+- a position that travels through anything but a plain `const`/`let` initialiser: destructuring
+  (`const [a, b] = [s.indexOf(x), s.indexOf(y)]`), an element of a `.map(n => s.indexOf(n))` array, a
+  later reassignment (`let r = 0; r = s.indexOf(x)`), an object property or method (`o.at`,
+  `h.idx(x)`), a pass-through call (`wrap(s.indexOf(x))`, `Math.min(s.indexOf(x), 9)`). A full
+  tracing probe over the real tree found no live site of any of these (re-review, 2026-09-14);
+- a comparison inside a disjunction asserted true, or a conjunction asserted false — neither asserts
+  any single comparison. A conjunct asserted true (`idx >= 0 && idx < other`), a disjunct asserted
+  false, and `!` are followed, which is what caught `renderFrameFlushOrdering`'s inline pins;
+- arithmetic on a raw index (`src.indexOf(x) + 1` reads `0` when absent).
+
+⚠️ **An ABSENCE check is refused too if it is spelled as an ordering** — `expect(s.indexOf(x)).toBeLessThan(0)`
+reads exactly like the vacuous shape. Spell absence as `expect(s.indexOf(x)).toBe(-1)` or
+`expect(s).not.toContain(x)`; `found()` is for positions that must exist.
+
+Its `IN_FLIGHT_1179` rows pardon four files that #1179 was rewriting on another branch at the time.
 
 ## Gotchas
 

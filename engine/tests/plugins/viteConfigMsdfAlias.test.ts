@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+import { found } from '@modoki/engine/testing/inOrder'
 import fs from 'node:fs'
 import path from 'node:path'
 import type { UserConfig } from 'vite'
@@ -64,11 +65,11 @@ describe('vite.config @zappar/msdf-generator resolve.alias (packaged-editor fix)
 
     const entries = alias as { find: string | RegExp; replacement: string }[]
     const id = '@zappar/msdf-generator/msdfgen_wasm.wasm?url'
-    const firstMatch = entries.findIndex((e) =>
-      typeof e.find === 'string' ? id === e.find || id.startsWith(e.find + '/') : e.find.test(id))
+    const firstMatch = found(entries.findIndex((e) =>
+      typeof e.find === 'string' ? id === e.find || id.startsWith(e.find + '/') : e.find.test(id)),
+    'an alias entry matching the wasm subpath (without one Vite will not emit the wasm)')
     const dirIndex = entries.findIndex((e) => e.find === '@zappar/msdf-generator')
 
-    expect(firstMatch, 'no alias entry matches the wasm subpath — Vite will not emit the wasm').toBeGreaterThanOrEqual(0)
     expect(firstMatch, 'the wasm entry must precede the package-dir alias').toBeLessThan(dirIndex)
     expect(fs.existsSync(entries[firstMatch].replacement),
       `the wasm alias must point at a real file, got ${entries[firstMatch].replacement}`).toBe(true)

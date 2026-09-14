@@ -1,6 +1,7 @@
 /** healNativeConfig — heal-on-open native config (android/local.properties +
  *  iOS DEVELOPMENT_TEAM). Exercised against real temp project dirs. */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { expectInOrder, found } from '@modoki/engine/testing/inOrder';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -558,8 +559,8 @@ describe('healNativeConfig — Android Crashlytics gradle wiring (#282)', () => 
     expect(app, 'the plugin apply landed despite the comment')
       .toContain("apply plugin: 'com.google.firebase.crashlytics'");
     // and INSIDE the guard, not merely somewhere in the file
-    const guardOpen = app.indexOf('if (servicesJSON.text) {');
-    const applyIdx = app.indexOf("apply plugin: 'com.google.firebase.crashlytics'");
+    const guardOpen = found(app.indexOf('if (servicesJSON.text) {'), 'the servicesJSON guard');
+    const applyIdx = found(app.indexOf("apply plugin: 'com.google.firebase.crashlytics'"), 'the crashlytics apply-plugin line');
     expect(applyIdx).toBeGreaterThan(guardOpen);
     expect(applyIdx).toBeLessThan(app.indexOf('} catch(Exception e)'));
     // the commented `dependencies {` anchor survived too
@@ -621,7 +622,7 @@ describe('healNativeConfig — Android Crashlytics gradle wiring (#282)', () => 
     expect(top).toContain('modoki:crashlytics-classpath-begin');
     expect(top).toContain(`classpath 'com.google.firebase:firebase-crashlytics-gradle:3.0.3'`);
     // anchored after the google-services classpath, not the AGP one
-    expect(top.indexOf("google-services:4.4.4'")).toBeLessThan(top.indexOf('firebase-crashlytics-gradle'));
+    expectInOrder(top, ["google-services:4.4.4'", 'firebase-crashlytics-gradle'], 'the top-level build.gradle');
 
     const app = readApp();
     expect(app).toContain('modoki:crashlytics-ndk-begin');
@@ -632,18 +633,13 @@ describe('healNativeConfig — Android Crashlytics gradle wiring (#282)', () => 
     expect(app).toContain("implementation \"com.google.firebase:firebase-crashlytics-ndk:"
       + "${project.hasProperty('firebaseCrashlyticsVersion') ? rootProject.ext.firebaseCrashlyticsVersion : '20.0.3'}\"");
     // right after `dependencies {`
-    const depIdx = app.indexOf('dependencies {');
-    const ndkIdx = app.indexOf('firebase-crashlytics-ndk');
-    const fileTreeIdx = app.indexOf('fileTree');
-    expect(depIdx).toBeGreaterThanOrEqual(0);
-    expect(ndkIdx).toBeGreaterThan(depIdx);
-    expect(ndkIdx).toBeLessThan(fileTreeIdx);
+    expectInOrder(app, ['dependencies {', 'firebase-crashlytics-ndk', 'fileTree'], 'the app build.gradle');
 
     // the apply-plugin line lands INSIDE the servicesJSON guard, not merely somewhere in the file
     expect(app).toContain('modoki:crashlytics-apply-begin');
-    const guardOpen = app.indexOf("if (servicesJSON.text) {");
+    const guardOpen = found(app.indexOf("if (servicesJSON.text) {"), 'the servicesJSON guard');
     const guardClose = app.indexOf('\n    }', guardOpen);
-    const applyIdx = app.indexOf("apply plugin: 'com.google.firebase.crashlytics'");
+    const applyIdx = found(app.indexOf("apply plugin: 'com.google.firebase.crashlytics'"), 'the crashlytics apply-plugin line');
     expect(applyIdx).toBeGreaterThan(guardOpen);
     expect(applyIdx).toBeLessThan(guardClose);
   });
@@ -801,7 +797,7 @@ describe('healNativeConfig — iOS Local Network / Bonjour keys', () => {
     const out = readPlist();
     expect(out).toContain('NSLocalNetworkUsageDescription');
     expect(out).toContain('<string>_game-debug._tcp</string>');
-    expect(out.indexOf('NSBonjourServices')).toBeLessThan(out.lastIndexOf('</dict>')); // before root close
+    expect(found(out.indexOf('NSBonjourServices'), 'NSBonjourServices')).toBeLessThan(out.lastIndexOf('</dict>')); // before root close
   });
 
   it('is idempotent — a second pass adds nothing', () => {
@@ -1378,8 +1374,7 @@ describe('healNativeConfig — Android debugBuild meta-data (#112)', () => {
     healNativeConfig(root);
     const m = readManifest();
     expect(m).toContain(`<meta-data android:name="${NAME}" android:value="true" />`);
-    expect(m.indexOf(NAME)).toBeLessThan(m.indexOf('</application>'));
-    expect(m.indexOf('<application')).toBeLessThan(m.indexOf(NAME));
+    expectInOrder(m, ['<application', NAME, '</application>'], 'AndroidManifest.xml');
     expect(m).toContain('<activity android:name=".MainActivity"'); // existing children intact
   });
 
@@ -1433,7 +1428,7 @@ describe('healNativeConfig — Android game mode (#228)', () => {
     const m = readManifest();
     expect(m).toContain('android:appCategory="game"');
     expect(m).toContain('<meta-data android:name="android.game_mode_config" android:resource="@xml/game_mode_config" />');
-    expect(m.indexOf('android.game_mode_config')).toBeLessThan(m.indexOf('</application>'));
+    expectInOrder(m, ['android.game_mode_config', '</application>'], 'AndroidManifest.xml');
 
     const xml = fs.readFileSync(path.join(root, ...GAME_MODE_XML), 'utf8');
     // Opted OUT: an OS-imposed downscale or fps cap would fight the engine's own quality tiers
@@ -2684,7 +2679,7 @@ describe('healNativeConfig — Android release signing + keystore ignores (#370)
     const block = /modoki:release-signing-begin([\s\S]*?)modoki:release-signing-end/.exec(readGradle())![1];
     expect(block).toContain('if (modokiKeystoreFile.exists()) {');
     // and every signing statement is INSIDE that guard, not before it
-    expect(block.indexOf('if (modokiKeystoreFile.exists())')).toBeLessThan(block.indexOf('signingConfigs'));
+    expectInOrder(block, ['if (modokiKeystoreFile.exists())', 'signingConfigs'], 'the release-signing block');
   });
 
   it('is idempotent — a second pass writes nothing', () => {

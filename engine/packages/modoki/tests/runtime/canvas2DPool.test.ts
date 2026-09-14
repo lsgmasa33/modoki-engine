@@ -2,6 +2,7 @@
 // @vitest-environment jsdom
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { expectInOrder } from '../helpers/inOrder';
 import { DEFAULT_REBUILD_DELAY_MS } from '../../src/runtime/rendering/rendererRecovery';
 import { teardownCanvas2DPools, type TeardownablePool } from './canvas2DPoolTeardown';
 
@@ -222,11 +223,9 @@ describe('canvas2DPool', () => {
 
       expect(warn).toHaveBeenCalledTimes(1);
       const msg = String(warn.mock.calls[0][0]);
-      const verdict = msg.indexOf('No action needed');
-      const alarming = msg.indexOf('destroyPool() ran while');
-      expect(verdict, 'the all-clear must be present').toBeGreaterThanOrEqual(0);
-      expect(alarming, 'the detail must still be present — this reworded, it did not delete').toBeGreaterThan(0);
-      expect(verdict, 'the verdict must come BEFORE the alarming detail').toBeLessThan(alarming);
+      // The all-clear verdict must be present and come BEFORE the alarming detail, which must also
+      // still be present (this reworded the warning, it did not delete it).
+      expectInOrder(msg, ['No action needed', 'destroyPool() ran while'], 'the pool warning');
       // Still says how many, and still says it is once-per-page: no signal was traded away.
       expect(msg).toMatch(/1 slot\(s\)/);
       expect(msg).toMatch(/[Ww]arned once/);

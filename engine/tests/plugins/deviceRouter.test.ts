@@ -4,6 +4,7 @@
  *  error mapping (the whole data plane was previously untested — code-review T1/T2). */
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
+import { expectInOrder } from '@modoki/engine/testing/inOrder';
 import net from 'net';
 import os from 'os';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
@@ -915,7 +916,7 @@ describe('/api/device/request refuses trusted input when the frame loop cannot d
       expect(result).toContain('could not confirm this device can deliver input');
       expect(result).toContain('NOT evidence the game received it');
       // And it fronts the reply, so a reader sees the caveat before the result it qualifies.
-      expect(result.indexOf('could not confirm')).toBeLessThan(result.indexOf('ok (tapped)'));
+      expectInOrder(result, ['could not confirm', 'ok (tapped)'], 'the tap reply');
     } finally {
       await device.close();
     }

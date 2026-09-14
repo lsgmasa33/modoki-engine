@@ -6,6 +6,7 @@
  *  receiving a trusted touch) is out of scope for this file — see the plan doc. */
 
 import { describe, it, expect, vi } from 'vitest';
+import { found } from '@modoki/engine/testing/inOrder';
 import { aimAsResolved } from '../../plugins/backend/deviceAim';
 import {
   NO_SESSION_REASON,
@@ -171,7 +172,7 @@ describe('synthFallbackBanner — a fallback must be impossible to skim past', (
     // Position is the entire point — assert it, or a later refactor can quietly move it to the end
     // and reintroduce exactly the problem this replaced.
     const banner = synthFallbackBanner(NO_SESSION_REASON);
-    expect(banner.indexOf('SYNTHETIC INPUT (NOT TRUSTED)')).toBeLessThan(8);
+    expect(found(banner.indexOf('SYNTHETIC INPUT (NOT TRUSTED)'), 'the SYNTHETIC INPUT warning')).toBeLessThan(8);
   });
 });
 

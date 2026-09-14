@@ -7,6 +7,7 @@
  *     child-arrangement (LayoutGroup) props stay live. */
 
 import { describe, it, expect } from 'vitest';
+import { expectInOrder } from '../helpers/inOrder';
 import {
   buildUiCreateSpecs,
   DEFAULT_UI_ANCHOR,
@@ -74,7 +75,7 @@ describe('buildUiCreateSpecs (anchor-first)', () => {
   it('orders UIAnchor before UIElement in the spec list', () => {
     const { specs } = buildUiCreateSpecs('view', 0);
     const names = specs.map((s) => s.name);
-    expect(names.indexOf('UIAnchor')).toBeLessThan(names.indexOf('UIElement'));
+    expectInOrder(names, ['UIAnchor', 'UIElement'], 'create specs');
   });
 });
 

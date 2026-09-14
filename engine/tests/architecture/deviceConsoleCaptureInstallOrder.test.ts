@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { found } from '@modoki/engine/testing/inOrder';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -70,10 +71,8 @@ describe('device console capture install order (#591)', () => {
   const specs = importSpecifiers(mainSrc, 'app/main.tsx');
 
   it('imports ./installDeviceConsoleCapture BEFORE ./App.tsx', () => {
-    const capture = specs.findIndex((s) => s.includes('installDeviceConsoleCapture'));
-    const app = specs.findIndex((s) => s.includes('App.tsx'));
-    expect(capture, 'main.tsx must import ./installDeviceConsoleCapture').toBeGreaterThanOrEqual(0);
-    expect(app, 'main.tsx must import ./App.tsx').toBeGreaterThanOrEqual(0);
+    const capture = found(specs.findIndex((s) => s.includes('installDeviceConsoleCapture')), "main.tsx's import of ./installDeviceConsoleCapture");
+    const app = found(specs.findIndex((s) => s.includes('App.tsx')), "main.tsx's import of ./App.tsx");
     expect(
       capture,
       `./installDeviceConsoleCapture must be imported BEFORE ./App.tsx (it is at ${capture}, App.tsx at ${app}). ` +
@@ -100,10 +99,9 @@ describe('device console capture install order (#591)', () => {
   // The shared ring (#596/#597 Stage 2) must be imported even EARLIER than the device capture — it
   // is what actually captures boot now, since the device ring no longer patches console.* itself.
   it('imports ./installConsoleRing BEFORE ./App.tsx (and no later than ./installDeviceConsoleCapture)', () => {
-    const ring = specs.findIndex((s) => s.includes('installConsoleRing'));
+    const ring = found(specs.findIndex((s) => s.includes('installConsoleRing')), "main.tsx's import of ./installConsoleRing");
     const capture = specs.findIndex((s) => s.includes('installDeviceConsoleCapture'));
     const app = specs.findIndex((s) => s.includes('App.tsx'));
-    expect(ring, 'main.tsx must import ./installConsoleRing').toBeGreaterThanOrEqual(0);
     expect(
       ring,
       `./installConsoleRing must be imported BEFORE ./App.tsx (it is at ${ring}, App.tsx at ${app}) — ` +

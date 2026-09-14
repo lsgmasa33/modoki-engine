@@ -6,6 +6,7 @@
  */
 
 import { describe, it, expect, afterEach } from 'vitest';
+import { expectInOrder } from '@modoki/engine/testing/inOrder';
 import { join } from 'node:path';
 import { loadDeviceSurface, deviceReply, DEVICE_STUB_BACKEND, type DeviceSurface } from './deviceSurface';
 import { readScannedSource } from '@modoki/engine/testing';
@@ -227,7 +228,7 @@ describe('device_status reports the app identity the SOCKET actually holds (#88)
     // Kept DISTINCT from the app line (conventions §2): a wrong-app session and a wrong-device
     // session are different failures with different fixes.
     expect(text).toMatch(/App: Audio Demo/);
-    expect(text.indexOf('Device:')).toBeGreaterThan(text.indexOf('App:'));
+    expectInOrder(text, ['App:', 'Device:'], 'device_status');
   });
 
   it('omits the hardware line for a bridge older than #146 rather than guessing', async () => {
