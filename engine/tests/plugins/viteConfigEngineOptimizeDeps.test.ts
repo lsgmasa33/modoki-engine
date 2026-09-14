@@ -15,7 +15,7 @@ import { readScannedSource } from '@modoki/engine/testing'
  * which the editor's OWN startup graph does not reach — so opening a project made a packaged
  * editor re-optimize mid-session, rehashing every @modoki_engine_* chunk. The already-loaded
  * `runtime.js?v=<old>` then threw "does not provide an export named …", blanking the renderer
- * (see texture-load-bug.md's follow-up / the "Couldn't open this project" screen). The fix
+ * (the "Couldn't open this project" screen). The fix
  * pre-bundles those subpaths via optimizeDeps.include, gated on MODOKI_VITE_CACHEDIR (set ONLY
  * when packaged — see electron/main.ts) so dev keeps engine HMR.
  */

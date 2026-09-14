@@ -4,7 +4,7 @@ import { createRequire } from 'node:module'
 import { resolveNativeImportTarget } from '../../plugins/native-dynamic-import'
 
 /**
- * Regression guard for the "white models on a cold asset cache" fix (texture-load-bug.md).
+ * Regression guard for the "white models on a cold asset cache" fix (docs/textures.md § "A cold-cache bake that 404s in milliseconds is not a cache miss").
  *
  * `resolveNativeImportTarget` is the resolution logic behind `nativeDynamicImport`'s bypass of
  * Vite's SSR module-runner rewrite. It's tested directly (rather than through

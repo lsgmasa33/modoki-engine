@@ -204,6 +204,39 @@ committed sidecars with a stale `modelCache.hash` are cleaned up by
 `.meta.json` through the real read/write functions; `engine/tests/assets/
 metaSidecarChurn.test.ts` guards against a regression re-introducing one.
 
+### A cold-cache bake that 404s in milliseconds is not a cache miss
+
+**Symptom, from when the Forest Camp demo arrived from the `win` clone:** on a clone with an empty
+`.cache/`, GLB-extracted materials rendered flat white and the HDR sky was flat blue. Every missing
+variant 404'd. "Re-import all" fixed it every time.
+
+**The theory that fit the symptom and was wrong:** a cold cache that auto-heal did not fully cover.
+Three observations killed it. A single isolated `curl` to a missing variant still 404'd in about
+6 ms with no bake attempted. `/api/reimport` sent to the **Vite** origin failed on the first request
+after a clean boot. A process audit found no stale servers. Nothing was racing.
+
+**The mechanism:** the plugin graph loads through Vite's runner-based SSR pipeline. There, `ssrTransform` rewrites
+**every** `import(...)`, including `import('sharp')`, into a call through a module runner that can
+close independently of the server. After that, each rewritten import throws `Vite module runner has
+been closed.`, and `autoBakeThenServe`, which never throws by design, reports it as a plain 404.
+Re-import "fixed" it only because that request goes to the **Electron backend**, whose own SSR
+loader (`engine/electron/ssrLoader.ts`) never shares the dev server's runner. The button routed
+around the bug; it never fixed a cache.
+
+**The fix:** `nativeDynamicImport` (`engine/plugins/native-dynamic-import.ts`) hides the `import()`
+from Vite's parser. Its docblock holds the full reasoning: the two runtime contexts, why
+`/* @vite-ignore */` does not help, and the `VITEST` branch. Every bare `import()` of an npm package
+in the bake plugins goes through it: `texture-convert.ts`, `env-convert.ts`, `reimport-atlas.ts` and
+`model-convert.ts`. **`ctx.ssrLoadModule` was deliberately left alone.** It compiles project
+TS/JSX, which a native import cannot. A postprocessor bake that fails this way falls back to the raw
+source GLB, which is visible, so it is lower severity. Pinned by
+`engine/tests/plugins/nativeDynamicImport.test.ts`.
+
+**Accepted cost:** a cold cache now does the real work on first request: HDR downscale, GLB bakes and
+`toktx` per texture variant. That can outlast an MCP call's timeout, though the bake still
+completes. It happens once per cache wipe, and before the fix a cold cache gave an instant, wrong
+answer instead.
+
 ### Reproducible is not the same as up to date (#161)
 
 `textureCache.hash` being pure buys nothing if the committed value was written under *different*

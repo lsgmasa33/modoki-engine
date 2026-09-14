@@ -29,21 +29,23 @@
  *    This is the rule that carries the CONTEXT test the allowlist never had: a retired doc may
  *    be NAMED in prose (provenance) but never LINKED (a live pointer), decided by form rather
  *    than by guessing at wording.
- *  - Rule 2 (source paths) scans `docs/**` only, and skips `docs/reviews/**`: a review is a
- *    dated point-in-time snapshot, so citing the tree as it stood is correct by construction.
- *    Deleting a file a review discussed must not turn that review red.
+ *  - Rule 2 (source paths) scans every tracked `.md` (#1124) minus `SOURCE_PATH_CORPUS_EXCLUDED`,
+ *    and skips `docs/reviews/**`: a review is a dated point-in-time snapshot, so citing the tree as
+ *    it stood is correct by construction. Deleting a file a review discussed must not turn that
+ *    review red.
  *  - Both exemption lists are checked in BOTH directions (#578): the thing exempted must still
  *    be absent, AND the entry must still be exempting a real citation. An entry that has stopped
  *    covering anything reads as enforcement and enforces nothing, which is how 9 of 22 and 10 of
  *    14 entries came to be pure bookkeeping before anything asked.
- *  - No rule checks LINE numbers, only paths. A `file.ts:123` citation rots silently on
- *    every edit above line 123; the fix for that is to cite the symbol, not to guard the number.
+ *  - No rule checks WHERE a line number points — nothing could. What the "cite by SYMBOL" describe
+ *    below forbids is writing one at all (#686), over every tracked `.md` (#1124).
  */
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { repoFiles as repoCorpusFiles } from '../../scripts/repoCorpus.mjs';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
+import { readScannedSource } from '@modoki/engine/testing';
 import { hasInternalGames, hasPrivateDocs } from '../helpers/repoLayout';
 import { SECTION_CITE, headingIds } from '../helpers/docSections';
 import {
@@ -96,6 +98,24 @@ function repoFiles(): string[] {
 }
 
 const rel = (p: string) => path.relative(repoRoot, p).split(path.sep).join('/');
+
+/** Every `.md` git knows about, for the two corpora #1124 derived. Deliberately NOT `repoFiles()`:
+ *  its `SKIP_DIRS` is a BUILD-OUTPUT list matched per path segment, and applied to Markdown it
+ *  silently dropped 164 tracked docs — all of `.agent-memory/` (agent-loaded context, holding 10
+ *  line citations at the time) plus every `.md` under a directory merely NAMED `build` or `ios`.
+ *  That is the "a named directory excludes the next file" defect this corpus exists to kill, one
+ *  layer down. Git already drops gitignored build output; what is skipped beyond that is a
+ *  reasoned ledger row, never a segment name. */
+function repoMarkdownFiles(): string[] {
+  return repoCorpusFiles({ match: /\.md$/, exclude: new Set(['node_modules']), floor: 50 })
+    .map((f) => rel(f.abs));
+}
+
+/** Markdown read for the line-citation rule: the prose IS the subject, so nothing is stripped. */
+const DOC_AS_PROSE = {
+  comments: 'include',
+  reason: 'Markdown — the doc text is what cites a line, so there is nothing to see past',
+} as const;
 const exists = (p: string) => fs.existsSync(path.join(repoRoot, p));
 
 /* ------------------------------------------------------------------ Rule 1 */
@@ -1332,6 +1352,39 @@ const SOURCE_CITATION_EXEMPT: ReadonlyArray<{ item: string; reason: string }> = 
       + 'the case this list\'s own failure message calls out',
   },
 
+  {
+    item: 'engine/electron/PHASE0_RESULTS.md::electron/main.cjs',
+    reason: 'the Phase 0 spike report (2026-06-11) names its throwaway CommonJS host, and records that it '
+      + 'was superseded in Phase 2 — a dated result describing what it tested',
+  },
+  {
+    item: 'engine/electron/PHASE0_RESULTS.md::electron/preload.cjs',
+    reason: 'the same throwaway spike host\'s preload, named by the same dated report',
+  },
+  {
+    item: 'games/court/audio.md::runtime/music.ts',
+    reason: '"Court had its own runtime/music.ts for half a day; it is gone, and AudioSource.playlist '
+      + 'replaced it" — the doc records the deletion and what replaced it',
+  },
+
+  // --- In ANOTHER repo. The path is right; it just is not this repo's.
+  {
+    item: '.agent-memory/a-readiness-check-must-list-what-is-ready.md::scripts/ensure-firestore-indexes.mjs',
+    reason: 'names `modoki-testboard/scripts/ensure-firestore-indexes.mjs` — a file in the separate '
+      + 'modoki-testboard repo, which rule 2\'s regex keys from its `scripts/` segment',
+  },
+
+  // --- A harness README naming where its file is DROPPED. Re-applied uncommitted while it runs.
+  {
+    item: 'tools-scratch/weave-leak-harness/README.md::runtime/bisect.ts',
+    reason: '"drop into games/wordweave/runtime/bisect.ts" — the harness file is copied in for a run, '
+      + 'never committed',
+  },
+  {
+    item: 'tools-scratch/webkit-gpu-leak/RUN-IN-FLIGHT.md::runtime/bisect.ts',
+    reason: 'the same harness file, named as re-applied and uncommitted while the measurement runs',
+  },
+
   // --- Not built yet. A plan naming its future file is the plan doing its job.
   { item: 'docs/plans/custom-editor-windows-inspectors-plan.md::editor/inspectorRegistry.ts',
     reason: 'custom-editor-windows-inspectors plan: proposed, unbuilt' },
@@ -1343,8 +1396,41 @@ const SOURCE_CITATION_EXEMPT: ReadonlyArray<{ item: string; reason: string }> = 
     reason: 'bundle-new-tools.md: placeholder name in a how-to template' },
 ];
 
-/** Every `.md` whose source-path citations must resolve: the engine docs, plus every `CLAUDE.md`
- *  (#195).
+/** Does an exclusion-ledger `path` cover `relFile`? Three shapes, and nothing else: an exact path; a
+ *  directory prefix ending in `/`; or a glob with `*` (within one segment) and a `**` segment (any depth) — the glob
+ *  exists so a row can say what ANOTHER gate derives (`qa/*.md` is the qa gate's `suiteDocs()`)
+ *  instead of hand-copying today's members, which is the defect #1124 is about. */
+function ledgerPathCovers(rowPath: string, relFile: string): boolean {
+  if (rowPath.includes('*')) {
+    const segment = (part: string) => part.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*');
+    const re = new RegExp(`^${rowPath.split('**/').map(segment).join('(?:[^/]+/)*')}$`);
+    return re.test(relFile);
+  }
+  return rowPath.endsWith('/') ? relFile.startsWith(rowPath) : relFile === rowPath;
+}
+
+/** What rule 2's corpus does NOT read. A trailing `/` makes a row a directory prefix; every row
+ *  must still match a tracked `.md` (`SOURCE_PATH_CORPUS_EXCLUDED is load-bearing`). */
+const SOURCE_PATH_CORPUS_EXCLUDED: ReadonlyArray<{ path: string; reason: string }> = [
+  {
+    path: 'qa/cases/',
+    reason: 'OWNED by `qaCaseReferences.test.ts`, which resolves a case\'s paths itself and knows what a '
+      + 'case `creates:` — a probe file a case writes and deletes is absent from the tree by design',
+  },
+  {
+    path: 'qa/*.md',
+    reason: 'OWNED by `qaCaseReferences.test.ts` — every top-level suite doc, the set its `suiteDocs()` derives '
+      + '(README included: it is that suite\'s spec). The qa gate resolves `qa/tools/…` paths in full; this '
+      + 'rule\'s segment-anchored regex reads only the tail (`tools/cdp-shot.mjs`) and reports it missing',
+  },
+];
+
+/** Every `.md` whose source-path citations must resolve: every tracked `.md` (#1124), minus
+ *  `isNonCitingSource` and `SOURCE_PATH_CORPUS_EXCLUDED`.
+ *
+ *  It was `docs/**`, `games|demos/<id>/docs/**` and every `CLAUDE.md` — a hand-declared scope,
+ *  so a project's top-level doc (`games/court/audio.md`, `games/CUSTOM_UI.md`) was never read, and
+ *  measured on widening it held four paths that had moved or gone (#1124).
  *
  *  `CLAUDE.md` earns the stricter treatment, not the looser one: it is loaded into an agent's
  *  context AUTOMATICALLY at session start, so a wrong path there is believed by default rather
@@ -1352,13 +1438,10 @@ const SOURCE_CITATION_EXEMPT: ReadonlyArray<{ item: string; reason: string }> = 
  *  `runtime/core/traits/Time.ts` by the layering reorg — precisely because the #194 rule stopped
  *  at `docs/**`. */
 function citingMarkdownFiles(): string[] {
-  return repoFiles().filter((f) => {
+  return repoMarkdownFiles().map((r) => path.join(repoRoot, r)).filter((f) => {
     const r = rel(f);
-    if (!r.endsWith('.md')) return false;
     if (isNonCitingSource(r)) return false;
-    if (r.startsWith('docs/')) return true;
-    if (/^(?:games|demos)\/[^/]+\/docs\//.test(r)) return true;
-    return r === 'CLAUDE.md' || r.endsWith('/CLAUDE.md');
+    return !SOURCE_PATH_CORPUS_EXCLUDED.some((row) => ledgerPathCovers(row.path, r));
   });
 }
 
@@ -1421,22 +1504,89 @@ describe('docs cite by SYMBOL, never by line number (#686)', () => {
    * The `qa/` half of this rule lives in `qaCaseReferences.test.ts`; both import the same detectors
    * from `helpers/lineCitations.ts`, because a duplicated detector is one that drifts.
    *
-   * ⚠️ **Scope is top-level `docs/*.md` ONLY, and the two exclusions are deliberate, not laziness:**
+   * ⚠️ **Scope is EVERY tracked `*.md`, minus `LINE_CITATION_CORPUS_EXCLUDED` (#1124, owner
+   * ruling).** It used to be top-level `docs/*.md`, read with a `readdirSync` of that one
+   * directory — so the rule held in `docs/` and refilled everywhere else: ~95 line citations had
+   * accumulated in the projects' own docs, 55 of them in `games/court/daily.md`. A corpus that
+   * names its directories excludes the next one by default; this one is derived from git, so a new
+   * doc directory is covered without anyone remembering to add it, and every exclusion is a
+   * counted, reasoned, load-bearing row instead.
    *
-   * - `docs/reviews/**` is **immutable** by `docs/doc-conventions.md` — "a dated point-in-time
-   *   audit… never updated, only superseded by a newer one". A guard that demands edits to a doc
-   *   the conventions forbid editing is a guard that gets deleted. Those citations stay.
-   * - `docs/plans/**` are in-flight trackers, written and rewritten daily by other clones. Their
-   *   citations rot like any other, but a tracker is folded into its feature doc and DELETED when
-   *   it lands, so the cost of policing them recurs while the benefit does not.
-   *
-   * That leaves the durable feature docs, which is the set this guards. ⚠️ No counts are frozen
-   * into this comment — a measurement of a corpus five clones edit goes stale and then reads as
-   * fact, which is the hazard this file's own finding-10 fix deleted two numbers for. The reasoning
-   * matters because #686 originally claimed the opposite — that half the surface was landed plans
-   * ripe for deletion. Nothing in `plans/` was landed; acting on that would have deleted another
-   * clone's authoritative tracker.
+   * ⚠️ No counts are frozen into this comment beyond that historical one — a measurement of a
+   * corpus five clones edit goes stale and then reads as fact. #686 originally claimed that half
+   * the `docs/` surface was landed plans ripe for deletion; nothing in `plans/` was landed, and
+   * acting on it would have deleted another clone's authoritative tracker.
    */
+  /**
+   * What the line-citation rule does NOT read, and why. A trailing `/` makes a row a directory
+   * prefix. Every row must still earn its place (`every exclusion is load-bearing`), in the sense its
+   * reason names: a `hits` row exists to pardon citations, so it must still cover one; a `files` row
+   * is a standing convention (a tree another gate owns, or one the conventions exempt), so it must
+   * still cover a file.
+   */
+  const LINE_CITATION_CORPUS_EXCLUDED: ReadonlyArray<{ path: string; bearing: 'hits' | 'files'; reason: string }> = [
+    {
+      path: 'docs/doc-conventions.md',
+      bearing: 'hits',
+      reason: 'SPEC — the rule itself, which has to quote every shape it forbids.',
+    },
+    {
+      path: 'qa/README.md',
+      bearing: 'hits',
+      reason: 'SPEC — the QA suite\'s format spec, which quotes the forbidden shapes; the qa gate reads it as '
+        + 'prose for other rules and deliberately not for this one.',
+    },
+    {
+      path: '.claude/skills/summary/SKILL.md',
+      bearing: 'hits',
+      reason: 'SPEC for CHAT output — it prescribes `file.ts:120` as a status-report evidence anchor. '
+        + 'A report is read once, in the turn it is written, so the line cannot drift under it.',
+    },
+    {
+      path: 'qa/cases/',
+      bearing: 'files',
+      reason: 'OWNED by `qaCaseReferences.test.ts`, which runs these same detectors over every case with its '
+        + 'own counted ledger (scanning them here would report every hit twice). NOT `qa/` whole: the qa '
+        + 'gate reads the cases and the top-level suite docs, so `qa/tools/**` stays in this corpus.',
+    },
+    {
+      path: 'qa/*.md',
+      bearing: 'files',
+      reason: 'OWNED by `qaCaseReferences.test.ts` — every top-level suite doc, the set its `suiteDocs()` derives, '
+        + 'read with the same detectors. A glob, not `qa/knowledge.md`: the qa gate itself stopped '
+        + 'hard-coding that one name because a new suite doc was scanned by nothing.',
+    },
+    {
+      path: 'docs/reviews/',
+      bearing: 'files',
+      reason: 'IMMUTABLE by doc-conventions — a dated point-in-time audit is never updated, only '
+        + 'superseded. A guard that demands edits to a doc the conventions forbid editing gets deleted.',
+    },
+    {
+      path: 'docs/plans/',
+      bearing: 'files',
+      reason: 'IN-FLIGHT trackers, rewritten daily by other clones and DELETED when they land (their '
+        + 'rationale folds into a feature doc, which IS guarded). The cost of policing recurs; the '
+        + 'benefit does not.',
+    },
+    {
+      path: 'tools-scratch/**/*-DRAFT.md',
+      bearing: 'hits',
+      reason: 'THIRD-PARTY drafts — upstream issue reports citing three.js/pixi source at a pinned '
+        + 'version, which cannot drift, and which is how an upstream report is conventionally '
+        + 'written (owner ruling on #1124).',
+    },
+  ];
+
+  const isExcludedBy = (row: { path: string }, relFile: string) => ledgerPathCovers(row.path, relFile);
+
+  /** Pure, so the filter is testable on synthetic paths: the rule reads every `.md` it is handed
+   *  except what a ledger row excludes — nothing is included by NAMING a directory. */
+  function lineCitationCorpusFilter(relFiles: readonly string[]): string[] {
+    return relFiles
+      .filter((f) => f.endsWith('.md') && !LINE_CITATION_CORPUS_EXCLUDED.some((row) => isExcludedBy(row, f)))
+      .sort();
+  }
   /**
    * Bare spans that are NOT line numbers, keyed file+token so the exemption cannot widen.
    *
@@ -1467,35 +1617,94 @@ describe('docs cite by SYMBOL, never by line number (#686)', () => {
    * `lineCitationsGuard.test.ts`.
    */
 
-  function featureDocs(): Array<{ rel: string; body: string }> {
-    const dir = path.join(repoRoot, 'docs');
-    if (!fs.existsSync(dir)) return [];
-    return fs
-      .readdirSync(dir)
-      // `doc-conventions.md` is the SPEC for this rule and has to quote every shape it forbids —
-      // the same reason `qa/README.md` sits outside the qa gate, and the same reason the path
-      // check next door skips README (it documents `creates:` by example). A spec that cannot
-      // state its own rule is worse than an unguarded spec.
-      .filter((f) => f.endsWith('.md') && f !== 'doc-conventions.md')
-      .sort()
-      .map((f) => ({ rel: `docs/${f}`, body: fs.readFileSync(path.join(dir, f), 'utf8') }));
+  /** The line-citation corpus: every `.md` git knows about (tracked + untracked-not-ignored, via the
+   *  shared producer — #771), minus the ledger. */
+  function lineCitationCorpus(): Array<{ rel: string; body: string }> {
+    return lineCitationCorpusFilter(repoMarkdownFiles())
+      .map((f) => ({ rel: f, body: readScannedSource(path.join(repoRoot, f), DOC_AS_PROSE).raw }));
   }
 
   it('the enumeration found the docs — a vacuous pass is a failure', () => {
     // Collection, not assertion. A perfect assertion over an empty collection is green and
-    // worthless, and `featureDocs` reads ONE directory by name.
+    // worthless.
     //
     // ⚠️ This used to gate on a private-docs probe (`docs/plans` — a directory the OSS snapshot
     // deliberately EXCLUDES). So on the public runner both of these tests returned early and
     // passed vacuously, over exactly the durable docs that DO ship there. Gate on what the rule
     // actually needs: some docs to read.
-    expect(featureDocs().length).toBeGreaterThan(0);
-    // The full private tree carries far more; only a broken collection trips this.
-    if (hasPrivateDocs()) expect(featureDocs().length).toBeGreaterThan(20);
+    const corpus = lineCitationCorpus().map((d) => d.rel);
+    expect(corpus.length).toBeGreaterThan(0);
+    // Each layout's own anchors, so a collection that silently fell back to one root trips here:
+    // the feature docs ship in both layouts, and the projects' docs (#1124) are the population
+    // the old `docs/`-only walker never reached.
+    expect(corpus.some((f) => f.startsWith('docs/'))).toBe(true);
+    if (hasPrivateDocs()) expect(corpus.length).toBeGreaterThan(20);
+    if (hasInternalGames()) expect(corpus).toContain('games/court/daily.md');
+    // A directory merely NAMED like build output is not build output (close-out finding 1): these two
+    // were silently dropped while the corpus borrowed repoFiles()' segment-matched SKIP_DIRS.
+    if (hasPrivateDocs()) expect(corpus.some((f) => f.startsWith('.agent-memory/')), '.agent-memory/ is read').toBe(true);
+    if (hasInternalGames()) expect(corpus.some((f) => /\/ios\//.test(f)), 'a .md under an ios/ directory is read').toBe(true);
+  });
+
+  it('the corpus is DERIVED — a doc in a directory nobody named is read, an excluded one is not (#1124)', () => {
+    const filtered = lineCitationCorpusFilter([
+      'zz-new-root/notes.md', // no row names this directory — the case a readdirSync of named roots misses
+      'games/court/daily.md',
+      'demos/forest-camp/CLAUDE.md',
+      'README.md',
+      'docs/plans/some-tracker.md',
+      'docs/reviews/2026-01-01-audit.md',
+      'docs/doc-conventions.md',
+      'docs/doc-conventions.md.old.md', // an exact-path row is NOT a prefix — and this still ends in .md
+      'qa/cases/x/case.md',
+      'qa/tools/NOTES.md', // qa/ is NOT excluded whole — the qa gate never reads this
+      'qa/playbook.md', // …but EVERY top-level suite doc is, not just today's knowledge.md
+      'tools-scratch/webkit-gpu-leak/pixijs-upstream-issue-DRAFT.md',
+      'tools-scratch/boot-stall/README.md', // a harness README is not a third-party draft
+      'tools-scratch/a/b/deep-DRAFT.md', // `**` spans more than one directory
+      'engine/app/thing.ts',
+    ]);
+    expect(filtered).toEqual([
+      'README.md',
+      'demos/forest-camp/CLAUDE.md',
+      'docs/doc-conventions.md.old.md',
+      'games/court/daily.md',
+      'qa/tools/NOTES.md',
+      'tools-scratch/boot-stall/README.md',
+      'zz-new-root/notes.md',
+    ]);
+  });
+
+  it('every exclusion is load-bearing — a row that excludes nothing has outlived its reason (#1124)', (ctx) => {
+    // The OSS snapshot ships a curated subset (no plans, no tools-scratch, no .claude), so there a
+    // row's target is legitimately absent; the private tree is where every row must bite.
+    if (!hasPrivateDocs()) { ctx.skip(); return; }
+    const relFiles = repoMarkdownFiles();
+    const dead: string[] = [];
+    const quotesALine = (rel: string): boolean => {
+      const body = readScannedSource(path.join(repoRoot, rel), DOC_AS_PROSE).raw;
+      return codeTokens(body).some(citesALine)
+        || nonCodeText(body).split(/\s+/).some(citesALine)
+        || citesALineInProse(body).length > 0
+        || citesALineByMarker(body).length > 0
+        || codeSpans(body).some(isBareLineSpan);
+    };
+    for (const row of LINE_CITATION_CORPUS_EXCLUDED) {
+      const covered = relFiles.filter((f) => isExcludedBy(row, f));
+      if (covered.length === 0) { dead.push(`${row.path}: matches no tracked .md`); continue; }
+      // A `hits` row's whole reason is the citations it pardons, so it must still pardon one.
+      if (row.bearing === 'hits' && !covered.some(quotesALine)) dead.push(`${row.path}: pardons no line citation any more`);
+    }
+    // The `qa/cases/` row is wider than what the qa gate reads in exactly one way: `loadCases()` skips a
+    // `README.md`. None exists today; if one appears it is read by NEITHER gate, so say so here.
+    // `endsWith('README.md')`, NOT `'/README.md'` — `loadCases()`' own test, so `SETUP-README.md` counts too.
+    const caseReadmes = relFiles.filter((f) => f.startsWith('qa/cases/') && f.endsWith('README.md'));
+    expect(caseReadmes, 'a README under qa/cases/ is read by neither gate — narrow the qa/cases/ row').toEqual([]);
+    expect(dead, 'Delete the LINE_CITATION_CORPUS_EXCLUDED row — its reason no longer holds').toEqual([]);
   });
 
   it('no doc cites a source location by line', () => {
-    const docs = featureDocs();
+    const docs = lineCitationCorpus();
     // Asserted, not returned on (#1071): a bare return here reported PASS over no docs at all.
     expect(docs.length, 'no feature docs found — the enumeration broke').toBeGreaterThan(0);
     const offenders: string[] = [];
@@ -1561,7 +1770,20 @@ describe('docs cite by SYMBOL, never by line number (#686)', () => {
 });
 
 describe('source paths cited in docs and CLAUDE.md resolve (#194, second face; #195)', () => {
-  it('every runtime/editor/engine source path cited in docs/** or a CLAUDE.md exists', (ctx) => {
+  it('SOURCE_PATH_CORPUS_EXCLUDED is load-bearing, and the corpus reaches a project\'s top-level doc (#1124)', (ctx) => {
+    if (!hasInternalGames()) { ctx.skip(); return; }
+    const mds = repoMarkdownFiles();
+    for (const row of SOURCE_PATH_CORPUS_EXCLUDED) {
+      expect(mds.some((f) => ledgerPathCovers(row.path, f)), `${row.path} excludes nothing`).toBe(true);
+    }
+    const corpus = citingMarkdownFiles().map(rel);
+    // Neither is a `docs/` file nor a `CLAUDE.md` — the two shapes the old hand-declared scope named.
+    expect(corpus).toContain('games/court/audio.md');
+    expect(corpus).toContain('games/CUSTOM_UI.md');
+    expect(corpus.some((f) => f.startsWith('qa/cases/'))).toBe(false);
+  });
+
+  it('every runtime/editor/engine source path cited in any tracked doc exists', (ctx) => {
     // An engine doc legitimately cites a GAME's file by its project-relative path —
     // `runtime/services/CapacitorLLMService.ts` (llm-test), `runtime/shaders/planet.ts`
     // (space-console), `tests/haptics.test.ts`. Those resolve on a real clone and CANNOT in the
