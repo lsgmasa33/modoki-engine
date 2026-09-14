@@ -28,7 +28,7 @@
  *  net) therefore runs ONLY on the primary renderer's swap/stop; non-primary renderers only release
  *  their own slots' refcounts. The trait cache + `deactivatedEntities` + skin buffers are global too. */
 
-import type { World } from 'koota';
+import type { Entity, World } from 'koota';
 import { Graphics, Sprite, Mesh, MeshGeometry, Texture, Rectangle, Matrix, Assets, Container, Buffer, BufferUsage, type Shader, type Geometry } from 'pixi.js';
 import { deactivatedEntities } from '../core/ecs/transformPropagationSystem';
 import { getCurrentWorld, onWorldSwap } from '../core/ecs/world';
@@ -36,7 +36,7 @@ import { onAssetInvalidated } from '../core/assetInvalidation';
 import { getAllTraits } from '../core/ecs/traitRegistry';
 import { Transform, Renderable2D, Collider2D, SkinnedSprite2D, Billboard3D, FlatSprite3D, Text2D, TextAnimation, GroupAlpha, Mask2D } from '../traits';
 import { MaterialInstance } from '../traits/MaterialInstance';
-import { applyTextAnimation, isTextAnimating, isColorEffect, type TextAnimParams } from './text/textAnimate';
+import { applyTextAnimation, isTextAnimating, isColorEffect, textAnimElapsed, type TextAnimParams } from './text/textAnimate';
 import { getTime } from '../core/getTime';
 import { ensureFontLoaded, getLoadedFont } from '../loaders/fontAtlasLoader';
 import { getFontTexturePixi } from './text/fontTexturePixi';
@@ -122,6 +122,8 @@ interface Slot { kind: DisplayKind; obj: Graphics | Sprite | Mesh | Container; s
   // on deactivation; `animStart` is the smoothedElapsed captured at (re)activation so
   // each Play restarts the effect from t=0.
   baseQuads?: TextQuad[]; pageNums?: number[]; wasMotion?: boolean; wasColored?: boolean; animStart?: number; animEffect?: string;
+  /** The packed entity the animation clock last ran for — see `textAnimElapsed` (#868). */
+  animOwner?: number;
   // Text slots only: consecutive failed rebuild attempts (see the `meshFrameKey` sentinel
   // comment below) — bounds the retry so a PERMANENT failure degrades to a quiet blank
   // instead of churning every frame forever.
@@ -914,12 +916,12 @@ export class Scene2DRenderer {
   // can't stomp each other's scratch; renderers also run sequentially via frame callbacks).
   private readonly parentOfEntity = new Map<number, number>();   // entityId → parentId
   private readonly sortOrderOfEntity = new Map<number, number>(); // entityId → EntityAttributes.sortOrder
-  // Every entity id alive THIS frame (built from the same EntityAttributes query as
+  // Every entity alive THIS frame, PACKED (#868 — see `Orphan2DTracker`) (built from the same EntityAttributes query as
   // parentOfEntity, so it's effectively "every scene entity"). Feeds `orphan2D.prune` — see
   // there for why `activeIds` (canvas-routed entities only) is the WRONG set: an entity still
   // orphaned this frame is alive but never enters `activeIds`, and pruning against that set
   // would erase its in-progress warn-frame count every single frame.
-  private readonly liveEntityIds = new Set<number>();
+  private readonly liveEntities = new Set<number>();
   private paintOrderOf = new Map<number, number>();              // entityId → global paint index (sortOrder DFS)
   /** entityId → alpha inherited from GroupAlpha ancestors × its own (#211). SPARSE: only
    *  entities actually faded appear, so a scene with no GroupAlpha keeps an empty map and
@@ -1058,8 +1060,9 @@ export class Scene2DRenderer {
 
   /** Count a frame in which `entityId` was visible, active, and drawn by nothing because no
    *  Canvas2D ancestor exists — and say so ONCE, after the grace window, at warn level. */
-  private noteOrphan2D(entityId: number): void {
-    const key = this.orphan2D.note(entityId, () => this.orphan2DKey(entityId), ORPHAN_2D_WARN_FRAMES);
+  private noteOrphan2D(entity: Entity): void {
+    const entityId = entity.id();
+    const key = this.orphan2D.note(entity.valueOf(), () => this.orphan2DKey(entityId), ORPHAN_2D_WARN_FRAMES);
     if (!key) return;
     const attrs = attrMeta ? readTraitData(entityId, attrMeta) : null;
     const name = (attrs?.name as string) || `entity ${entityId}`;
@@ -1567,15 +1570,15 @@ export class Scene2DRenderer {
     this.canvasCompensate.clear();
     this.currentCanvasIds.clear();
     this.dirtyCanvases.clear();
-    this.liveEntityIds.clear();
+    this.liveEntities.clear();
 
     // Step 1: Build parentId + sortOrder maps from all entities with EntityAttributes
     world.query(attrMeta.trait).updateEach(([attr]: any[], entity: any) => {
       this.parentOfEntity.set(entity.id(), attr.parentId || 0);
       this.sortOrderOfEntity.set(entity.id(), attr.sortOrder || 0);
-      this.liveEntityIds.add(entity.id());
+      this.liveEntities.add(entity.valueOf());
     });
-    // ⚠️ `liveEntityIds` must also cover every entity `noteOrphan2D` can reach, not just the ones
+    // ⚠️ `liveEntities` must also cover every entity `noteOrphan2D` can reach, not just the ones
     // with EntityAttributes: `orphan2DKey` already falls back to an `id:`-prefixed key when
     // EntityAttributes is absent or guid-less (see that method), and an entity missing
     // EntityAttributes entirely is exactly the one the query above skips. Without this, a LIVE
@@ -1589,12 +1592,12 @@ export class Scene2DRenderer {
     // `updateEach` deliberately NOT used: it opens the trait stores and runs koota's change
     // detection over every Transform in the scene, and all we want is the id set. A QueryResult IS
     // a readonly Entity[], so plain iteration reads nothing and marks nothing.
-    for (const entity of world.query(Transform)) this.liveEntityIds.add(entity.id());
+    for (const entity of world.query(Transform)) this.liveEntities.add(entity.valueOf());
     // Forget any orphan-warn bookkeeping for an id that no longer names a live entity — koota
     // recycles ids, so an entity that died while still orphaned must not leave a stale count for
     // its id's next occupant to inherit (see `Orphan2DTracker.prune`). Runs right after the live
     // set is fully built and before any pass below calls `note`/`clear` on it.
-    this.orphan2D.prune(this.liveEntityIds);
+    this.orphan2D.prune(this.liveEntities);
     // Explicit Order-in-Layer overrides (Renderable2D) → sprites can stack independent of
     // the entity tree (e.g. a cut-out character's parts parented to scattered bones).
     const orderInLayerOfEntity = new Map<number, number>();
@@ -1717,8 +1720,8 @@ export class Scene2DRenderer {
 
         // Find which Canvas2D this entity belongs to
         const canvasId = this.findCanvasAncestor(id);
-        if (canvasId === null) { this.noteOrphan2D(id); return; } // no Canvas2D ancestor — skip
-        this.orphan2D.clear(id, () => this.orphan2DKey(id));
+        if (canvasId === null) { this.noteOrphan2D(entity); return; } // no Canvas2D ancestor — skip
+        this.orphan2D.clear(entity.valueOf(), () => this.orphan2DKey(id));
 
         const canvasSlot = this.pool.getSlot(canvasId);
         if (!canvasSlot) return;
@@ -2239,8 +2242,8 @@ export class Scene2DRenderer {
         // more fundamental failure of the two, and a rig that never finishes loading would
         // otherwise swallow the report of it entirely (measured — the warning never fired).
         const canvasId = this.findCanvasAncestor(id);
-        if (canvasId === null) { this.noteOrphan2D(id); return; }
-        this.orphan2D.clear(id, () => this.orphan2DKey(id));
+        if (canvasId === null) { this.noteOrphan2D(entity); return; }
+        this.orphan2D.clear(entity.valueOf(), () => this.orphan2DKey(id));
         const buf = getSkin2DBuffer(id);
         if (!buf || !buf.parts.length) return; // rig not ready yet — skin2DSystem retries next frame
 
@@ -2370,8 +2373,8 @@ export class Scene2DRenderer {
         if (!t.isVisible || this._collidersOnly || deactivatedEntities.has(entity.id())) return;
         const id = entity.id();
         const canvasId = this.findCanvasAncestor(id);
-        if (canvasId === null) { this.noteOrphan2D(id); return; }
-        this.orphan2D.clear(id, () => this.orphan2DKey(id));
+        if (canvasId === null) { this.noteOrphan2D(entity); return; }
+        this.orphan2D.clear(entity.valueOf(), () => this.orphan2DKey(id));
         const canvasSlot = this.pool.getSlot(canvasId);
         if (!canvasSlot) return;
 
@@ -2612,11 +2615,8 @@ export class Scene2DRenderer {
         const colored = animActive && isColorEffect(anim!.effect);
         if ((motion || colored || slot.wasMotion || slot.wasColored) && slot.baseQuads && slot.pageMeshes?.length) {
           const now = getTime(world)?.smoothedElapsed ?? 0;
-          // Restart at t=0 on (re)activation OR an effect switch (effect isn't in the
-          // layout hash, so a mid-Play switch keeps the stale start → intros would skip).
-          if (animActive && ((!slot.wasMotion && !slot.wasColored) || slot.animEffect !== anim!.effect)) slot.animStart = now;
-          slot.animEffect = animActive ? anim!.effect : undefined;
-          const tsec = animActive ? now - (slot.animStart ?? now) : 0;
+          // Restarts on (re)activation, an effect switch, or a different entity on this index (#868).
+          const tsec = textAnimElapsed(slot, animActive, anim?.effect, entity.valueOf(), now);
           const quads = animActive ? applyTextAnimation(slot.baseQuads, anim!, tsec, t.fontSize) : slot.baseQuads;
           // pageMeshes can SKIP not-ready pages, so match each page's buffer to its mesh
           // by PAGE NUMBER, not array index.

@@ -437,7 +437,7 @@ export function previewTimelineAt(world: World, rootId: number, def: TimelineDef
       // 3D skeletal — the render layer seeks/blends the mixer to these exact times (Phase 5/B).
       const sa = entity.get(SkeletalAnimator) as { fadeDuration?: number } | undefined;
       const parts = activeClipsAt(track, t, sa?.fadeDuration ?? 0);
-      requestSkeletalSeek(targetId, parts.map((p) => ({ clip: p.clip, time: p.localT, weight: p.weight })));
+      requestSkeletalSeek(entity, parts.map((p) => ({ clip: p.clip, time: p.localT, weight: p.weight })));
     }
   }
 }
@@ -472,7 +472,8 @@ export function previewControlAt(world: World, rootId: number, def: TimelineDef,
         const end = clip.start + (clip.duration ?? PARTICLE_IMPULSE_SCRUB_S);
         if (!track.muted && t >= clip.start && t < end) on = true;
       }
-      if (hasParticleClip) reflectParticleScrub(resolved, on);
+      const target = idx.byId.get(resolved) as unknown as Entity | undefined;
+      if (hasParticleClip && target) reflectParticleScrub(target, on);
     }
     for (let ci = 0; ci < track.clips.length; ci++) {
       const clip = track.clips[ci];
@@ -574,15 +575,15 @@ function controlSpawn(world: World, director: Entity, key: string, prefabRef: st
 /** Journal + request a particle action on a control clip's edge (Phase E). Journals `@control`
  *  regardless (parity with spawn/despawn — a reliable headless trace even with no renderer), then
  *  writes the restart/pause request for `targetId` that `syncParticles` drains in the render layer.
- *  `targetId < 0` means the track target didn't resolve — still journals the edge, no request. */
-function controlParticle(world: World, director: Entity, targetId: number, action: ParticleControlAction): void {
+ *  An undefined `target` means the track target didn't resolve — still journals the edge, no request. */
+function controlParticle(world: World, director: Entity, target: Entity | undefined, action: ParticleControlAction): void {
   emit('@control', { director: entityRef(director), phase: action === 'restart' ? 'particle' : 'particle-pause' }, world);
-  if (targetId >= 0) {
-    requestParticleControl(targetId, action);
+  if (target) {
+    requestParticleControl(target, action);
     // Keep the scrub-reflect memory in sync with what forward preview just did to this emitter, so a
     // scrub taking over after a paused preview sees the true on/off and can pause a still-running emitter
     // (review C8). 'restart' → ON, 'pause' → OFF.
-    noteScrubParticleState(targetId, action === 'restart');
+    noteScrubParticleState(target, action === 'restart');
   }
 }
 
@@ -1022,6 +1023,7 @@ function applyDirectorFrame(world: World, p: Pending, index: EntityIndex, opts: 
         //   particle    → RESTART the track target's ParticleEmitter at start, pause it at end.
         //   subdirector → drive the track target's nested Director synced across the clip span.
         const resolvedTarget = resolveTrackTarget(index, p.rootId, track.target);
+        const particleTarget = resolvedTarget === null ? undefined : index.byId.get(resolvedTarget) as unknown as Entity | undefined;
         const parentId = resolvedTarget ?? p.rootId;
         // Registry key uses the runtime rootId (world-local, cleared on swap); the guid seed uses the
         // Director's STABLE ref (guid) so a control-spawned instance's guid is replay-deterministic.
@@ -1054,15 +1056,15 @@ function applyDirectorFrame(world: World, p: Pending, index: EntityIndex, opts: 
             // fires `atEnd` either, muted or not, so there is nothing for a mute to turn off.
             if (track.muted) {
               if (justMuted && clip.duration !== undefined && insideClipSpan(p.cur, clip)) {
-                controlParticle(world, p.entity, resolvedTarget ?? -1, 'pause');
+                controlParticle(world, p.entity, particleTarget, 'pause');
               }
               continue; // skip this clip's normal edges while muted
             }
             if (justUnmuted && !atStart && clip.duration !== undefined && insideClipSpan(p.cur, clip)) {
-              controlParticle(world, p.entity, resolvedTarget ?? -1, 'restart');
+              controlParticle(world, p.entity, particleTarget, 'restart');
             }
-            if (atStart) controlParticle(world, p.entity, resolvedTarget ?? -1, 'restart');
-            if (atEnd) controlParticle(world, p.entity, resolvedTarget ?? -1, 'pause');
+            if (atStart) controlParticle(world, p.entity, particleTarget, 'restart');
+            if (atEnd) controlParticle(world, p.entity, particleTarget, 'pause');
           } else {
             // Prefab clip — PRESENCE is the truth (controlSpawnRegistry already holds it), so the
             // span test is only needed to keep the JOURNAL balanced: `controlDespawn` emits

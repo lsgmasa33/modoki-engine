@@ -27,7 +27,8 @@ import { identity2D, compose2D, mul2D, removeScale2D, skinVertex2D, type Mat2D }
 import {
   getSkin2DBuffer, putSkin2DBuffer, bumpSkin2DVersion, deleteSkin2DBuffer, type Skin2DBuffer,
 } from './skin2DBuffers';
-import { getDeform2D, getDeform2DVersion } from '../animation/deform2DBuffers';
+import { getDeform2D, getDeform2DVersion, bindDeform2DEviction } from '../animation/deform2DBuffers';
+import { createDespawnEviction } from '../core/ecs/despawnEviction';
 
 interface BoneRec { name: string; local: Mat2D }
 
@@ -59,6 +60,11 @@ function unresolvedSpriteCount(parsed: ParsedRig2D): number {
 }
 const trackedRootIds = new Set<number>();
 
+// #868 — `skin2DBuffers` is read outside this system (Scene2D, the SceneView preview), before the
+// revalidation below can run, so a destroyed root's buffer is deleted at destroy. `needBuild` rebuilds
+// it on the next pass. The `last*ByEntity` caches above are only read here, after revalidation.
+const _bufferEviction = createDespawnEviction(SkinnedSprite2D, deleteSkin2DBuffer);
+
 // Per-frame scratch, reused across frames so an idle rig doesn't re-allocate a Map over
 // EVERY entity in the world (parentOf), a per-Bone2D Map, and a cycle-guard Set per bone
 // each frame just to reach the idle fast-path. Fully cleared + refilled at the top of every
@@ -88,6 +94,8 @@ function nearestSkinnedRoot(id: number, parentOf: Map<number, number>, rootSet: 
 }
 
 export function skin2DSystem(world: World) {
+  _bufferEviction.bind(world);
+  bindDeform2DEviction(world);
   // Collect skinned roots.
   const roots: Array<{ id: number; rig: string }> = [];
   world.query(Transform, SkinnedSprite2D).updateEach(([, ss]: [unknown, { rig: string }], entity: { id(): number }) => {

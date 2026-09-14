@@ -110,3 +110,30 @@ describe('physics3D per-axis locks', () => {
     expect(Math.abs(rb.avy)).toBeGreaterThan(0.1);
   });
 });
+
+describe('physics3D control API — recycled entity index (#868)', () => {
+  it('a newcomer on a dead body\'s index is not handed the dead body before its own is built', () => {
+    tw = createTestWorld({ systems: [PHYS] });
+    world0g(tw);
+    const spawnBox = () => tw!.spawn(
+      Transform({ x: 0, y: 0, z: 0 }),
+      RigidBody3D({ bodyType: 'dynamic' }),
+      Collider3D({ shape: 'box', halfW: 0.5, halfH: 0.5, halfD: 0.5 }),
+    );
+    const a = spawnBox();
+    tw.step(1);
+    expect(applyImpulse3D(tw.world, a, 0, 10, 0)).toBe(true);
+
+    a.destroy();
+    const b = spawnBox();
+    expect(b.id()).toBe(a.id());
+    expect(b.valueOf()).not.toBe(a.valueOf());
+
+    expect(applyImpulse3D(tw.world, b, 0, 10, 0)).toBe(false);
+    expect(setLinvel3D(tw.world, b, 1, 0, 0)).toBe(false);
+    expect(setAngvel3D(tw.world, b, 0, 1, 0)).toBe(false);
+
+    tw.step(1);
+    expect(applyImpulse3D(tw.world, b, 0, 10, 0)).toBe(true);
+  });
+});

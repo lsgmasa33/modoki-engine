@@ -2058,6 +2058,47 @@ describe('Scene2D.renderFrame', () => {
     expect(orphanWarnCount()).toBe(1);
   });
 
+  // #868: the prune above only forgets an id that is absent from the live set. A destroy and a
+  // same-index spawn landing BETWEEN two frames leave the index live the whole time, so the dead
+  // orphan's count and (for a guid-less one) its `id:` warned key were inherited by the newcomer.
+  describe('#868 — an orphan respawned on a dead orphan\'s index between two frames', () => {
+    const run = async (guids: [string, string]) => {
+      const { traits, scene2d, world, registerTrait } = await setup();
+      const { inferFields } = await import('../../src/runtime/core/ecs/traitRegistry');
+      registerTrait({ name: 'EntityAttributes', trait: traits.EntityAttributes, category: 'component', fields: inferFields(traits.EntityAttributes) });
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const orphanWarnCount = () => warnSpy.mock.calls.filter((c) => typeof c[0] === 'string' && c[0].startsWith('[Scene2D]')).length;
+        const spawnOrphan = (guid: string) => world.spawn(
+          traits.Transform({}),
+          traits.Renderable2D({ sprite: 'square', color: 0xffffff, width: 10, height: 10 }),
+          traits.EntityAttributes({ name: 'orphan', parentId: 0, sortOrder: 0, layer: '2d', guid }),
+        );
+        const a = spawnOrphan(guids[0]);
+        scene2d.renderFrame();
+        expect(orphanWarnCount()).toBe(1);
+
+        a.destroy();
+        const b = spawnOrphan(guids[1]); // no frame in between
+        expect(b.id()).toBe(a.id());
+        expect(b.valueOf()).not.toBe(a.valueOf());
+
+        scene2d.renderFrame();
+        return orphanWarnCount();
+      } finally {
+        warnSpy.mockRestore();
+      }
+    };
+
+    it('warns for the newcomer (guid-keyed: the frame count must not be inherited)', async () => {
+      expect(await run(['dead-guid', 'new-guid'])).toBe(2);
+    });
+
+    it('warns for the newcomer (guid-less: the `id:` warned key must not be inherited either)', async () => {
+      expect(await run(['', ''])).toBe(2);
+    });
+  });
+
   // Adversarial review of #590 (docs/ios-gpu-memory.md): `liveEntityIds` was
   // built ONLY from `world.query(attrMeta.trait)` (EntityAttributes), but `noteOrphan2D` is
   // reachable from the Renderable2D/SkinnedSprite2D/Text2D passes for entities that have NO
@@ -2069,7 +2110,7 @@ describe('Scene2D.renderFrame', () => {
   // ORPHAN_2D_WARN_FRAMES===1 that reset is invisible in the warn COUNT (both a reset-to-1 and a
   // real accumulation land on "warn once"), so this asserts the tracker's internal counter
   // directly — the only way to see whether it survives the prune or gets wiped every frame.
-  it("keeps a live no-EntityAttributes orphan's frame count across a prune (liveEntityIds completeness)", async () => {
+  it("keeps a live no-EntityAttributes orphan's frame count across a prune (liveEntities completeness)", async () => {
     const { traits, scene2d, world } = await setup();
     vi.spyOn(console, 'warn').mockImplementation(() => {});
 
@@ -2078,18 +2119,17 @@ describe('Scene2D.renderFrame', () => {
       traits.Renderable2D({ sprite: 'square', color: 0xffffff, width: 10, height: 10 }),
       // Deliberately NO traits.EntityAttributes(...) — this is the gap.
     );
-    const id = orphan.id();
 
     scene2d.renderFrame();
     scene2d.renderFrame();
     scene2d.renderFrame();
 
-    // Without the fix, `prune()` deletes this id's count every frame (it's absent from
-    // `liveEntityIds`), so `note()` restarts at 1 each time and the counter is stuck at 1 after 3
-    // frames. With `liveEntityIds` also covering every `Transform`-bearing entity, the count
-    // accumulates normally.
+    // Without the fix, `prune()` deletes this entity's count every frame (it's absent from
+    // `liveEntities`), so `note()` restarts at 1 each time and the counter is stuck at 1 after 3
+    // frames. With `liveEntities` also covering every `Transform`-bearing entity, the count
+    // accumulates normally. The tracker is keyed by the packed entity (#868).
     const frames = (scene2d.defaultRenderer as any).orphan2D.frames as Map<number, number>;
-    expect(frames.get(id), 'a still-live orphan must not be pruned out from under itself').toBe(3);
+    expect(frames.get(orphan.valueOf()), 'a still-live orphan must not be pruned out from under itself').toBe(3);
   });
 
   it('tears down all slots and releases the pool on world swap', async () => {

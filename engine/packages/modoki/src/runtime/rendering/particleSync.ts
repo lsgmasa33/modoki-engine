@@ -28,6 +28,7 @@ import { particleBackend } from '../particles/particleBackend';
 import type { ParticleHandle, ParticleEffectDef } from '../particles/types';
 import { particleDefProvider } from '../particles/particleDefProvider';
 import { PARTICLE_LAYER } from './layers';
+import { EntityTable } from '../core/ecs/entityTable';
 import { worldTransforms, deactivatedEntities } from '../core/ecs/transformPropagationSystem';
 import { buildCanvas2DRoute, emitterCanvasId, type Canvas2DRoute } from './particle2DRouting';
 
@@ -51,11 +52,28 @@ interface EmitterRec {
 }
 
 export interface ParticleSyncState {
-  recs: Map<number, EmitterRec>;
+  /** Generation-stamped (#868): a same-effect emitter respawned on a dead one's index between two
+   *  frames used to inherit its handle — live particles, elapsed time, a spent one-shot, a paused
+   *  state. `'owner-clears'`: Scene3D and SceneView each create one per mount and dispose it on
+   *  `onWorldSwap` and at teardown (`disposeParticleSyncState`). */
+  recs: EntityTable<EmitterRec>;
+  /** The scene the handles were added to — read by the table's `dispose`. */
+  scene: THREE.Object3D | null;
 }
 
 export function createParticleSyncState(): ParticleSyncState {
-  return { recs: new Map() };
+  const state: ParticleSyncState = {
+    scene: null,
+    recs: new EntityTable<EmitterRec>({
+      label: 'particleSync',
+      worldSwap: 'owner-clears',
+      dispose: (rec) => {
+        state.scene?.remove(particleBackend.getObject3D(rec.handle));
+        particleBackend.dispose(rec.handle);
+      },
+    }),
+  };
+  return state;
 }
 
 const _p = new THREE.Vector3();
@@ -80,9 +98,10 @@ const _route3d: Canvas2DRoute = { parentOf: new Map(), canvasIds: new Set() };
 export function syncParticles(world: World, scene: THREE.Object3D, state: ParticleSyncState, dtOverride?: number, opts?: { forcePlay?: boolean }): void {
   const dt = dtOverride ?? getVisualDelta(world);
   const forcePlay = opts?.forcePlay === true; // editor FX preview: show every emitter PLAYING (ignore playOnStart)
-  const seen = new Set<number>();
+  state.scene = scene;
+  state.recs.beginPass();
   // An emitter under a Canvas2D renders in the 2D (PixiJS) path — particleSync2D owns it. Skipping
-  // it here (so it never enters `seen`) also disposes any stale 3D handle in the cleanup pass below
+  // it here (so it is never touched this pass) also disposes any stale 3D handle in the cleanup pass below
   // if the emitter was reparented under a Canvas2D. Exactly-one-path routing (see particle2DRouting).
   buildCanvas2DRoute(world, _route3d);
 
@@ -94,13 +113,9 @@ export function syncParticles(world: World, scene: THREE.Object3D, state: Partic
     const def = particleDefProvider.get()?.getParticleEffect(pe.effect) ?? null;
     if (!def) return; // asset still loading — retry next frame
 
-    seen.add(id);
-    let rec = state.recs.get(id);
+    let rec = state.recs.get(entity);
     if (!rec || rec.effect !== pe.effect) {
-      if (rec) {
-        scene.remove(particleBackend.getObject3D(rec.handle));
-        particleBackend.dispose(rec.handle);
-      }
+      // `set` below disposes what it replaces: the previous effect's handle, or a dead entity's.
       const handle = particleBackend.create(def);
       const obj = particleBackend.getObject3D(handle);
       scene.add(obj);
@@ -109,7 +124,7 @@ export function syncParticles(world: World, scene: THREE.Object3D, state: Partic
       // preview overrides this (forcePlay) so a control/game-triggered emitter still previews.
       if (pe.playOnStart === false && !forcePlay) particleBackend.pause(handle);
       rec = { handle, effect: pe.effect, def };
-      state.recs.set(id, rec);
+      state.recs.set(entity, rec);
     } else if (rec.def !== def) {
       // Same effect path but the cached def changed → an editor live-edit reseeded
       // it. Push the new definition to the existing backend handle so scene emitters
@@ -118,6 +133,7 @@ export function syncParticles(world: World, scene: THREE.Object3D, state: Partic
       particleBackend.setDef(rec.handle, def);
       rec.def = def;
     }
+    state.recs.touch(entity); // kept this pass; anything not reached here is swept by endPass
     // Re-tag each frame so objects the backend adds later (sub-emitters, a CPU/GPU
     // backend swap under the same wrapper) inherit the layer. Cheap — emitter
     // subtrees are tiny and there are few emitters.
@@ -125,7 +141,7 @@ export function syncParticles(world: World, scene: THREE.Object3D, state: Partic
 
     // Timeline Control track (Phase E): a `particle` clip crossing its start/end queued a restart
     // (re-emit from t=0) / pause here — apply it before this frame's update so it takes effect now.
-    const control = takeParticleControl(id);
+    const control = takeParticleControl(entity);
     if (control === 'restart') particleBackend.restart(rec.handle);
     else if (control === 'pause') particleBackend.pause(rec.handle);
 
@@ -152,19 +168,10 @@ export function syncParticles(world: World, scene: THREE.Object3D, state: Partic
     }
   });
 
-  for (const [id, rec] of state.recs) {
-    if (!seen.has(id)) {
-      scene.remove(particleBackend.getObject3D(rec.handle));
-      particleBackend.dispose(rec.handle);
-      state.recs.delete(id);
-    }
-  }
+  state.recs.endPass();
 }
 
 export function disposeParticleSyncState(state: ParticleSyncState, scene: THREE.Object3D): void {
-  for (const rec of state.recs.values()) {
-    scene.remove(particleBackend.getObject3D(rec.handle));
-    particleBackend.dispose(rec.handle);
-  }
+  state.scene = scene;
   state.recs.clear();
 }

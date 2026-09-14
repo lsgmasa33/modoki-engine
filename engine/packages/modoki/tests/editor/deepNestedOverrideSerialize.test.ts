@@ -130,7 +130,7 @@ describe('serialize an arbitrary-depth scene override (D ⟵ B ⟵ A)', () => {
     const root = instantiatePrefab(dPrefab as any); setPrefabSource(root, D);
     // Scene edit on A (two levels deep): x = 7.
     const a = aRoot();
-    writeTraitFieldImpl(a, TRAITS[0], 'x', 7); markOverride(a, 'Transform', 'x');
+    writeTraitFieldImpl(a, TRAITS[0], 'x', 7); markOverride(index.get(a), 'Transform', 'x');
 
     const scene = await serializeScene();
     const top = scene.entities.find((e) => e.prefab === D)!;
@@ -151,7 +151,7 @@ describe('serialize an arbitrary-depth scene override (D ⟵ B ⟵ A)', () => {
     const root = instantiatePrefab(dPrefab as any); setPrefabSource(root, D);
     const a = aRoot();
     expect((index.get(a)!.get(Transform) as any).y).toBe(5); // B's override is live on A
-    writeTraitFieldImpl(a, TRAITS[0], 'x', 7); markOverride(a, 'Transform', 'x');
+    writeTraitFieldImpl(a, TRAITS[0], 'x', 7); markOverride(index.get(a), 'Transform', 'x');
 
     const scene = await serializeScene();
     const top = scene.entities.find((e) => e.prefab === D)!;
@@ -168,7 +168,7 @@ describe('serialize an arbitrary-depth scene override (D ⟵ B ⟵ A)', () => {
 
     const root = instantiatePrefab(dPrefab as any); setPrefabSource(root, D);
     const a = aRoot();
-    writeTraitFieldImpl(a, TRAITS[0], 'x', 7); markOverride(a, 'Transform', 'x');
+    writeTraitFieldImpl(a, TRAITS[0], 'x', 7); markOverride(index.get(a), 'Transform', 'x');
     const scene = await serializeScene();
     const deep = scene.entities.find((e) => e.prefab === D)!.nestedOverrides;
 

@@ -2,7 +2,7 @@
  *  hand-built world. */
 
 import { describe, it, expect } from 'vitest';
-import { getCurrentWorld, markOverride } from '@modoki/engine/runtime';
+import { getCurrentWorld, markOverride, findEntityById } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { getTraitByName } from '@modoki/engine/runtime';
 import {
@@ -68,8 +68,8 @@ describe('captureInstanceOverrides', () => {
     });
     // Mark them, exactly as the editor's inspector/gizmo edits do — capture is
     // mark-based so a deliberate edit is distinguished from a base divergence.
-    markOverride(childId, 'Transform', 'x');
-    markOverride(childId, 'Renderable3D', 'material');
+    markOverride(findEntityById(childId)!, 'Transform', 'x');
+    markOverride(findEntityById(childId)!, 'Renderable3D', 'material');
 
     const captured = captureInstanceOverrides(rootId, prefab);
     expect(captured[2]).toBeDefined();
@@ -91,7 +91,7 @@ describe('applyOverridesByRootInstance', () => {
     getCurrentWorld().query(tfMeta.trait).updateEach(([tf], entity) => {
       if (entity.id() === childA) (tf as Record<string, unknown>).x = 77;
     });
-    markOverride(childA, 'Transform', 'x');
+    markOverride(findEntityById(childA)!, 'Transform', 'x');
     const captured = captureInstanceOverrides(rootA, prefab);
 
     // Second instance: fresh, no edits

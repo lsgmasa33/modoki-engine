@@ -38,6 +38,7 @@ import { nextClip, type PlaylistState } from './playlist';
 import { getPlayState } from '../core/playState';
 import { isTimelinePreviewActive } from '../core/timelinePreview';
 import { onWorldSwap } from '../core/ecs/world';
+import { EntityTable, packedOf, type PackedEntity } from '../core/ecs/entityTable';
 import {
   play, updateListener, crossfade, resolveBus, type AudioHandle, type AudioPlaySpec, type BusName,
 } from './audioService';
@@ -113,18 +114,30 @@ interface SourceState {
   handle: AudioHandle;
   clip: string;
   paused: boolean;
+  /** Set by every deliberate exit that journals its own terminal event (`end`, or `stop` with its
+   *  reason) before removing the source, so the table's dispose closes the start/terminal pair only
+   *  for the exits nobody journaled: a vanished entity, or a dead entity's entry evicted by a
+   *  newcomer (#868). */
+  journaled?: boolean;
 }
 
+/** ⚠️ Per-entity state here is keyed by the entity's GENERATION, not its bare id (#868). koota
+ *  recycles an index on respawn, and an id-keyed `autoplayed` / `sources` handed the newcomer the
+ *  dead entity's: its live voice (then paused, because the newcomer never declared autoplay) — or,
+ *  with no race at all, a finished one-shot's autoplay guard, which the old `sources`-only sweep
+ *  never cleared. `sources` owns a handle, so it is an `EntityTable` whose dispose stops a still-live
+ *  voice; the flag maps are private, so they key by `PackedEntity` and are pruned each pass to the
+ *  entities that still carry an `AudioSource`. */
 interface AudioState {
-  /** Live entity sources keyed by entity id. */
-  sources: Map<number, SourceState>;
+  /** Live entity sources. Every exit that has not already stopped the voice stops it (dispose). */
+  sources: EntityTable<SourceState>;
   /** Playlist walk state per entity — separate from `sources` because a swap REPLACES the
    *  SourceState, and the walk has to survive exactly that. */
-  playlists: Map<number, PlaylistState>;
+  playlists: Map<PackedEntity, PlaylistState>;
   /** Entities already warned about `playlist` + `loop` together (warn once, not per frame). */
-  warnedLoopingPlaylist: Set<number>;
+  warnedLoopingPlaylist: Set<PackedEntity>;
   /** Entities whose autoplay already fired (so it doesn't restart after a stop). */
-  autoplayed: Set<number>;
+  autoplayed: Set<PackedEntity>;
   /** Handles fading out under a crossfade. Each self-stops on the AUDIO clock via
    *  `handle.stopAfter(...)` (robust to timeScale/frame rate); this list only exists
    *  so a game Stop / scene swap can force-stop a tail mid-fade, and to sweep ended
@@ -144,7 +157,7 @@ interface AudioState {
   /** Entities already warned about an unresolvable clip, keyed by entity id → the clip
    *  warned about. `startOrSwap` retries a missing clip EVERY frame forever, so the warn
    *  has to fire once per (entity, clip) or it would be 60 events/sec. */
-  warnedUnresolved: Map<number, string>;
+  warnedUnresolved: Map<PackedEntity, string>;
   /** One-shot clip cues whose buffer wasn't decoded yet — retried for a bounded number of frames.
    *  On iOS the eager scene-load decode is REJECTED while the AudioContext is suspended and only
    *  completes after the first-gesture resume; the first shot's cue fires on that same gesture,
@@ -163,7 +176,19 @@ function stateFor(world: World): AudioState {
   let s = states.get(world);
   if (!s) {
     s = {
-      sources: new Map(), playlists: new Map(), warnedLoopingPlaylist: new Set(),
+      // `owner-clears`: this state is per world (the `states` WeakMap), and `stopWorldAudio` runs on
+      // the swap. Dispose journals `entity-gone` for any exit that did not journal its own terminal
+      // event first (`SourceState.journaled`), so every `start` keeps exactly one terminal event.
+      sources: new EntityTable<SourceState>({
+        label: 'audioSystem.sources',
+        worldSwap: 'owner-clears',
+        dispose: (src) => {
+          if (src.journaled) return;
+          src.handle.stop(); // a no-op on a voice that already ended
+          journalAudio(world, 'stop', undefined, { clip: src.clip, reason: 'entity-gone' });
+        },
+      }),
+      playlists: new Map(), warnedLoopingPlaylist: new Set(),
       autoplayed: new Set(), fadingOut: [], oneShots: [],
       warnedUnresolved: new Map(), pendingCues: [],
     };
@@ -180,6 +205,7 @@ export function stopWorldAudio(world: World): void {
   if (s) {
     for (const src of s.sources.values()) {
       src.handle.stop();
+      src.journaled = true;
       journalAudio(world, 'stop', undefined, { clip: src.clip, reason: 'world-teardown' });
     }
     s.sources.clear();
@@ -232,11 +258,11 @@ export function rearmAudioAutoplay(world: World): void {
 export function stopEntityAudio(world: World, entity: Entity): void {
   const s = states.get(world);
   if (!s) return;
-  const id = entity.id();
-  const src = s.sources.get(id);
+  const src = s.sources.get(entity);
   if (src) {
     src.handle.stop();
-    s.sources.delete(id);
+    src.journaled = true;
+    s.sources.delete(entity);
     journalAudio(world, 'stop', entity, { clip: src.clip, reason: 'entity-stop' });
   }
 }
@@ -271,6 +297,7 @@ export function audioSystem(world: World): void {
     if (state.sources.size || state.fadingOut.length || state.oneShots.length) {
       for (const src of state.sources.values()) {
         src.handle.stop();
+        src.journaled = true;
         journalAudio(world, 'stop', undefined, { clip: src.clip, reason: 'not-playing' });
       }
       state.sources.clear();
@@ -328,24 +355,28 @@ export function audioSystem(world: World): void {
   });
 
   // 2. Reconcile AudioSource entities from their trait fields.
-  const seen = new Set<number>();
+  const seen = new Set<PackedEntity>();
+  state.sources.beginPass();
   world.query(AudioSource).updateEach(([a], entity) => {
     const id = entity.id();
-    seen.add(id);
+    const key = packedOf(entity);
+    seen.add(key);
+    state.sources.touch(entity);
 
     // autoplay declares intent once (survives a later Stop via the autoplayed guard).
-    if (a.autoplay && !state.autoplayed.has(id)) {
-      state.autoplayed.add(id);
+    if (a.autoplay && !state.autoplayed.has(key)) {
+      state.autoplayed.add(key);
       a.playing = true;
     }
 
-    let src = state.sources.get(id);
+    let src = state.sources.get(entity);
 
     // Drop a finished (non-looping) source.
     let justEnded = false;
     if (src && src.handle.ended) {
       journalAudio(world, 'end', entity, { clip: src.clip });
-      state.sources.delete(id);
+      src.journaled = true;
+      state.sources.delete(entity);
       src = undefined;
       // ⚠️ A PLAYLIST source stays `playing` here. Clearing it was a permanent silence: the
       // playlist block below requires `playing`, and `autoplayed` already holds this id so
@@ -360,14 +391,14 @@ export function audioSystem(world: World): void {
     // missed and it has already ended, immediately. Before the reconcile below, so the swap it
     // requests is applied THIS frame rather than one late.
     if (a.playlist !== 'off' && a.playing) {
-      if (a.loop && !state.warnedLoopingPlaylist.has(id)) {
-        state.warnedLoopingPlaylist.add(id);
+      if (a.loop && !state.warnedLoopingPlaylist.has(key)) {
+        state.warnedLoopingPlaylist.add(key);
         // Not an error — the source still plays. But it plays clip one forever, and the bank looks
         // perfectly valid in the Inspector, so nothing else would ever say why.
         console.warn(`[audio] AudioSource ${id} has playlist='${a.playlist}' AND loop=true — a looping clip never ends, so the playlist will never advance.`);
       }
-      let pl = state.playlists.get(id);
-      if (!pl) { pl = { order: [], idx: 0, pending: '', bank: '', shuffled: false }; state.playlists.set(id, pl); }
+      let pl = state.playlists.get(key);
+      if (!pl) { pl = { order: [], idx: 0, pending: '', bank: '', shuffled: false }; state.playlists.set(key, pl); }
       const next = nextClip(
         pl, a.clips, a.playlist, a.clip,
         src && !src.paused ? src.handle.remainingSec() : null,
@@ -399,17 +430,15 @@ export function audioSystem(world: World): void {
     }
   });
 
-  // Stop handles whose entity (or AudioSource trait) vanished this frame.
-  for (const [id, src] of [...state.sources]) {
-    if (!seen.has(id)) {
-      src.handle.stop();
-      state.sources.delete(id);
-      state.autoplayed.delete(id);
-      state.playlists.delete(id);
-      state.warnedLoopingPlaylist.delete(id);
-      journalAudio(world, 'stop', undefined, { clip: src.clip, reason: 'entity-gone' });
-    }
-  }
+  // Stop handles whose entity (or AudioSource trait) vanished this frame — the table's dispose
+  // stops and journals `entity-gone`. The flag maps are pruned to the entities still carrying an
+  // AudioSource, whether or not they ever had a source: an autoplay one-shot that already finished
+  // has no source left, and its guard used to outlive the entity (#868).
+  state.sources.endPass();
+  for (const k of state.autoplayed) if (!seen.has(k)) state.autoplayed.delete(k);
+  for (const k of state.playlists.keys()) if (!seen.has(k)) state.playlists.delete(k);
+  for (const k of state.warnedLoopingPlaylist) if (!seen.has(k)) state.warnedLoopingPlaylist.delete(k);
+  for (const k of state.warnedUnresolved.keys()) if (!seen.has(k)) state.warnedUnresolved.delete(k);
 
   // 3. Drain the cue bus → fire-and-forget one-shots (NOT tracked per entity). Run whenever there
   //    are fresh cues OR deferred ones still waiting on a buffer decode (the iOS first-shot case).
@@ -438,14 +467,14 @@ function startOrSwap(world: World, state: AudioState, entity: Entity, a: TraitVa
     // trace shows nothing at all for the entity — indistinguishable from one that never
     // tried to play, and exactly the failure a QA case most wants to catch. Warn ONCE
     // per (entity, clip): every frame would be 60 events/sec, which would flush the ring.
-    const id = entity.id();
-    if (state.warnedUnresolved.get(id) !== clip) {
-      state.warnedUnresolved.set(id, clip);
+    const key = packedOf(entity);
+    if (state.warnedUnresolved.get(key) !== clip) {
+      state.warnedUnresolved.set(key, clip);
       emit('@audio', { phase: 'unresolved', entity: entityRef(entity), clip }, world, 'warn');
     }
     return;
   }
-  state.warnedUnresolved.delete(entity.id()); // it resolved — re-arm the warn
+  state.warnedUnresolved.delete(packedOf(entity)); // it resolved — re-arm the warn
   const next = play(spec);
   if (cross && prev) {
     crossfade(prev.handle, next, a.volume, crossfadeSec);
@@ -456,7 +485,8 @@ function startOrSwap(world: World, state: AudioState, entity: Entity, a: TraitVa
   } else {
     prev?.handle.stop();
   }
-  state.sources.set(entity.id(), { handle: next, clip, paused: false });
+  // `replace`, not `set`: the previous voice was already handed to the crossfade (or stopped) above.
+  state.sources.replace(entity, { handle: next, clip, paused: false });
   a.playing = true;
   journalAudio(world, prev ? 'swap' : 'start', entity, {
     // ⚠️ RESOLVED, like the record log — see audioService.play (#993 close-out § 2d).

@@ -146,8 +146,8 @@ describe('revertOverridesSelective', () => {
 
     // Two overrides on the Flame member (localId 2): idleScale and Transform.x.
     const flameId = (() => { let id = 0; testWorld.query(PrefabInstance).updateEach(([pi], e) => { if ((pi as any).localId === 2 && (pi as any).rootInstanceId === root) id = e.id(); }); return id; })();
-    writeTraitFieldImpl(flameId, TRAITS[1], 'idleScale', 0.5); markOverride(flameId, 'EngineFlame', 'idleScale');
-    writeTraitFieldImpl(flameId, TRAITS[0], 'x', 4.1); markOverride(flameId, 'Transform', 'x');
+    writeTraitFieldImpl(flameId, TRAITS[1], 'idleScale', 0.5); markOverride(index.get(flameId), 'EngineFlame', 'idleScale');
+    writeTraitFieldImpl(flameId, TRAITS[0], 'x', 4.1); markOverride(index.get(flameId), 'Transform', 'x');
 
     // Revert ONLY idleScale.
     const result = await m.revertOverridesSelective(root, new Set(['2.EngineFlame.idleScale']));
@@ -165,7 +165,7 @@ describe('revertOverridesSelective', () => {
     // Add a Spin trait the prefab doesn't define at the root (localId 1).
     const rootEntity = index.get(root);
     rootEntity.add(Spin({ speed: 9 }));
-    markOverride(root, 'Spin', 'speed');
+    markOverride(index.get(root), 'Spin', 'speed');
     expect(memberData(root, 1, 'Spin')).toBeDefined();
 
     const result = await m.revertOverridesSelective(root, new Set(['1.Spin.speed']));
@@ -179,7 +179,7 @@ describe('revertOverridesSelective', () => {
     const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
 
     const flameId = (() => { let id = 0; testWorld.query(PrefabInstance).updateEach(([pi], e) => { if ((pi as any).localId === 2 && (pi as any).rootInstanceId === root) id = e.id(); }); return id; })();
-    writeTraitFieldImpl(flameId, TRAITS[1], 'idleScale', 0.5); markOverride(flameId, 'EngineFlame', 'idleScale');
+    writeTraitFieldImpl(flameId, TRAITS[1], 'idleScale', 0.5); markOverride(index.get(flameId), 'EngineFlame', 'idleScale');
 
     const result = await m.revertOverridesSelective(root, new Set(['2.EngineFlame.idleScale']));
     expect(result).not.toBeNull();

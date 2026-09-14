@@ -14,14 +14,14 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createWorld, type World } from 'koota';
 
-const handles: Array<{ url: string; disposed: boolean; playing: boolean }> = [];
+const handles: Array<{ url: string; disposed: boolean; playing: boolean; seeks: number[] }> = [];
 
 vi.mock('../../src/runtime/video/videoService', () => ({
   applyTimeScale: () => {},
   videoFadeGain: () => 1,
   playVideo: (opts: { url: string; timeMode?: 'diegetic' | 'presentation' }) => {
     const rec = {
-      url: opts.url, disposed: false, playing: false,
+      url: opts.url, disposed: false, playing: false, seeks: [] as number[],
       timeMode: opts.timeMode ?? 'diegetic' as 'diegetic' | 'presentation',
     };
     handles.push(rec);
@@ -29,7 +29,7 @@ vi.mock('../../src/runtime/video/videoService', () => ({
       element: { currentTime: 0, duration: 10, style: {} } as unknown as HTMLVideoElement,
       play: () => { rec.playing = true; },
       pause: () => { rec.playing = false; },
-      seek: () => {},
+      seek: (s: number) => { rec.seeks.push(s); },
       setVolume: () => {}, setMuted: () => {}, setRate: () => {},
       setLoop: () => {},
       // Models `setTimeMode` by mutating `rec.timeMode`, not a no-op — this test doesn't
@@ -47,7 +47,7 @@ vi.mock('../../src/runtime/video/videoService', () => ({
 import { VideoPlayer } from '../../src/runtime/traits/VideoPlayer';
 import { setPlayState } from '../../src/runtime/core/playState';
 import {
-  videoSystem, videoElementFor, setVideoUrlResolver, __resetVideoSystem,
+  videoSystem, videoElementFor, seekEntityVideo, claimVideoEndEmit, setVideoUrlResolver, __resetVideoSystem,
 } from '../../src/runtime/video/videoSystem';
 
 let world: World | undefined;
@@ -108,5 +108,42 @@ describe('videoSystem — recycled entity index', () => {
     // A live, playing clip for `b` — the one it created itself.
     expect(handles).toHaveLength(2);
     expect(handles[1].playing).toBe(true);
+  });
+
+  it('the by-id readers refuse a DEAD owner\'s handle before the next pass reconciles the index (#868)', () => {
+    // `videoElementFor`/`seekEntityVideo`/`claimVideoEndEmit` are the addressing contract the texture
+    // surfaces, `UIVideoMount` and the `video.*` actions call with a bare id. The ownership check lives
+    // in the reconcile, so between a despawn+respawn and the next pass they used to reach the dead
+    // entity\'s decoder: a renderer drew its frame, and a seek aimed at the newcomer moved it.
+    const CLIP = 'clip-guid-c';
+    const a = world!.spawn(VideoPlayer({ clip: CLIP, autoplay: true }));
+    videoSystem(world!);
+    expect(handles).toHaveLength(1);
+    expect(videoElementFor(a.id())).toBeDefined();
+
+    a.destroy();
+    const b = world!.spawn(VideoPlayer({ clip: CLIP, autoplay: true }));
+    expect(b.id()).toBe(a.id());
+    expect(b.valueOf()).not.toBe(a.valueOf());
+
+    expect(videoElementFor(b.id())).toBeUndefined();
+    seekEntityVideo(b.id(), 5);
+    expect(handles[0].seeks).toEqual([]);
+    // No live playback for the newcomer yet, so there is nothing to have announced: true, and it must
+    // not latch the DEAD entry either.
+    expect(claimVideoEndEmit(b.id())).toBe(true);
+    expect(claimVideoEndEmit(b.id())).toBe(true);
+
+    videoSystem(world!);
+    expect(handles).toHaveLength(2);
+    expect(videoElementFor(b.id())).toBeDefined();
+  });
+
+  it('a plain despawn stops the by-id readers at once, not at the next pass (#868)', () => {
+    const a = world!.spawn(VideoPlayer({ clip: 'clip-guid-d', autoplay: true }));
+    videoSystem(world!);
+    const id = a.id();
+    a.destroy();
+    expect(videoElementFor(id)).toBeUndefined();
   });
 });

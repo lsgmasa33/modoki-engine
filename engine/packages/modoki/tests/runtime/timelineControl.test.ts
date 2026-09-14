@@ -95,12 +95,12 @@ describe('control track', () => {
     let ev = tw.events({ type: '@control' });
     expect(ev).toHaveLength(1);
     expect((ev[0].payload as { phase: string }).phase).toBe('particle');
-    expect(takeParticleControl(emitter.id())).toBe('restart');
+    expect(takeParticleControl(emitter)).toBe('restart');
 
     tw.step(30); // t ≈ 2.1 — crossed end (start+duration=2) → pause
     ev = tw.events({ type: '@control' });
     expect(ev.map((e) => (e.payload as { phase: string }).phase)).toEqual(['particle', 'particle-pause']);
-    expect(takeParticleControl(emitter.id())).toBe('pause');
+    expect(takeParticleControl(emitter)).toBe('pause');
   });
 
   it('particle control is deterministic — two identical runs journal identically', () => {

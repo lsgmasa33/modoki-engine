@@ -7,6 +7,7 @@ import { measureSafeAreaInsets } from './safeArea';
 import type { ReactNode } from 'react';
 import { useUIEntities } from './useUIEntities';
 import { UINode } from './UINode';
+import { uiNodeKey } from './uiNodeKey';
 import { markUIDirty, useUITreeStore } from './uiTreeStore';
 import { onPlayStateChange } from '../core/playState';
 import { useFocusStore, consumePendingActivation } from './focusManager';
@@ -203,7 +204,7 @@ export function UIRenderer({ storeState = {}, onSelectEntity, renderCanvas2D, ui
           an `else` after `if (node.fontFamily)` — and wrong the moment a second consumer reads it
           above that branch. */}
       {tree.map(node => (
-        <UINode key={node.entityId} node={node} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} inheritedFontFamily={rootFontFamily} />
+        <UINode key={uiNodeKey(node)} node={node} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} inheritedFontFamily={rootFontFamily} />
       ))}
     </div>
   );

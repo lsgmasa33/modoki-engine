@@ -1,5 +1,6 @@
 /** Editor state — separate from game state. Tracks selection, mode, etc. */
 
+import type { EntityPin } from '../../runtime/core/ecs/entityPin';
 import { create } from 'zustand';
 import { pushSelectionChange, isExecutingUndoRedo } from '../undo/undoManager';
 import { entityRef, buildGuidIndex, resolveWith, type EntityRef } from '../undo/entityRef';
@@ -243,10 +244,11 @@ interface EditorState {
   sceneLoadStatus: { active: boolean; loaded: number; total: number };
   /** Transient toast notice (e.g. save succeeded / blocked). Auto-clears. */
   toast: { id: number; message: string; kind: 'info' | 'warn' | 'success' } | null;
-  /** Selective Apply-to-Prefab dialog state */
-  applyPrefabDialog: { active: boolean; rootInstanceId: number | null };
+  /** Selective Apply-to-Prefab dialog state. `subject` pins the instance root it was opened for
+   *  (#868 — see prefabDialogSubject.ts). */
+  applyPrefabDialog: { active: boolean; subject: EntityPin | null };
   /** Selective Revert-to-Prefab dialog state */
-  revertPrefabDialog: { active: boolean; rootInstanceId: number | null };
+  revertPrefabDialog: { active: boolean; subject: EntityPin | null };
   /** Project Settings window open state */
   projectSettingsOpen: boolean;
   /** "Clean Up Unused Assets" dialog open state */
@@ -388,9 +390,9 @@ interface EditorState {
   /** Replace the whole asset selection set (Cmd/Shift multi-select in the Assets
    *  panel). `primary` becomes the lead (defaults to the last). Clears entities. */
   setSelectedAssets: (assets: SelectedAsset[], primary?: SelectedAsset | null) => void;
-  openApplyPrefabDialog: (rootInstanceId: number) => void;
+  openApplyPrefabDialog: (subject: EntityPin) => void;
   closeApplyPrefabDialog: () => void;
-  openRevertPrefabDialog: (rootInstanceId: number) => void;
+  openRevertPrefabDialog: (subject: EntityPin) => void;
   closeRevertPrefabDialog: () => void;
   openProjectSettings: () => void;
   closeProjectSettings: () => void;
@@ -648,8 +650,8 @@ export const useEditorStore = create<EditorState>((set, get) => {
   buildStatus: { active: false, message: '', step: 0, totalSteps: 5, failed: false },
   sceneLoadStatus: { active: false, loaded: 0, total: 0 },
   toast: null,
-  applyPrefabDialog: { active: false, rootInstanceId: null },
-  revertPrefabDialog: { active: false, rootInstanceId: null },
+  applyPrefabDialog: { active: false, subject: null },
+  revertPrefabDialog: { active: false, subject: null },
   projectSettingsOpen: false,
   cleanupAssetsOpen: false,
   findReferencesTarget: null,
@@ -893,10 +895,10 @@ export const useEditorStore = create<EditorState>((set, get) => {
       if (get().toast?.id === id) set({ toast: null });
     }, 3500);
   },
-  openApplyPrefabDialog: (rootInstanceId) => set({ applyPrefabDialog: { active: true, rootInstanceId } }),
-  closeApplyPrefabDialog: () => set({ applyPrefabDialog: { active: false, rootInstanceId: null } }),
-  openRevertPrefabDialog: (rootInstanceId) => set({ revertPrefabDialog: { active: true, rootInstanceId } }),
-  closeRevertPrefabDialog: () => set({ revertPrefabDialog: { active: false, rootInstanceId: null } }),
+  openApplyPrefabDialog: (subject) => set({ applyPrefabDialog: { active: true, subject } }),
+  closeApplyPrefabDialog: () => set({ applyPrefabDialog: { active: false, subject: null } }),
+  openRevertPrefabDialog: (subject) => set({ revertPrefabDialog: { active: true, subject } }),
+  closeRevertPrefabDialog: () => set({ revertPrefabDialog: { active: false, subject: null } }),
   openProjectSettings: () => set({ projectSettingsOpen: true }),
   closeProjectSettings: () => set({ projectSettingsOpen: false }),
   openCleanupAssets: () => set({ cleanupAssetsOpen: true }),

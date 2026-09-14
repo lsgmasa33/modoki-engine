@@ -54,6 +54,7 @@ import {
   beginTimelinePreviewSession, endTimelinePreviewSession, hasTimelinePreviewSession,
 } from '../../src/editor/scene/timelinePreview';
 import { isTimelinePreviewActive, setTimelinePreviewActive } from '../../src/runtime/core/timelinePreview';
+import type { Entity } from 'koota';
 import { requestSkeletalSeek, hasSkeletalSeeks, clearSkeletalSeeks } from '../../src/runtime/core/skeletalSeek';
 import { setControlSpawn, hasControlSpawn, clearControlSpawns } from '../../src/runtime/timeline/controlSpawnRegistry';
 import {
@@ -104,7 +105,7 @@ describe('timeline preview session controller', () => {
 
   it('end ALWAYS clears the preview flag, skeletal seeks, and control spawns', async () => {
     setTimelinePreviewActive(true);
-    requestSkeletalSeek(7, [{ clip: 'x', time: 0, weight: 1 }]);
+    requestSkeletalSeek(7 as unknown as Entity, [{ clip: 'x', time: 0, weight: 1 }]);
     setControlSpawn('dir:trk:0', 9);
     await beginTimelinePreviewSession();
 

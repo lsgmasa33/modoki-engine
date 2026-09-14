@@ -145,11 +145,33 @@ describe('override mark survival across a base edit', () => {
 
     // Simulate a user edit: set the live value AND mark it (what entityActions does).
     writeTraitFieldImpl(root, TRAITS[0], 'x', 7);
-    markOverride(root, 'Transform', 'x');
+    markOverride(index.get(root), 'Transform', 'x');
 
     // Edit the base to 7 (coincides). The marked override must still serialize.
     const newChild = childAtX(7);
     setPrefabCache(CHILD, newChild as any);
     expect(captureInstanceOverrides(root, newChild as any)[1]?.Transform?.x).toBe(7);
+  });
+});
+
+// #868: marks are keyed by the packed entity and never swept before a swap; koota's 8-bit generation
+// repeats a packed value after 256 reuses of an index. instantiatePrefab's per-spawn clear is what
+// keeps a fresh member from reading a dead entity's marks.
+describe('instantiatePrefab — a wrapped packed value (#868)', () => {
+  it('a member landing on a dead marked entity\'s exact packed value starts with no marks', async () => {
+    const { instantiatePrefab, setPrefabCache } = await getModule();
+    const { markOverride, getOverrideMarkSet } = await import('../../src/runtime/loaders/overrideMarks');
+    const dead = testWorld.spawn();
+    const deadPacked = dead.valueOf();
+    markOverride(dead, 'Transform', 'x');
+    dead.destroy();
+    for (let i = 0; i < 255; i++) testWorld.spawn().destroy();
+
+    const child = childAtX(0);
+    setPrefabCache(CHILD, child as any);
+    const root = instantiatePrefab(child as any);
+    expect(index.get(root).valueOf()).toBe(deadPacked); // the wrap this test exists for
+
+    expect(getOverrideMarkSet(index.get(root))).toBeUndefined();
   });
 });

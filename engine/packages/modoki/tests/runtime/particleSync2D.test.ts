@@ -179,7 +179,7 @@ describe('syncParticles2D', () => {
   it('disposes the handle when the emitter entity is destroyed', () => {
     const world = createWorld();
     const { backend, calls } = makeMockBackend();
-    const { ctx, canvasOf } = makeMockCtx();
+    const { ctx, canvasOf, markDirtyCalls } = makeMockCtx();
     const e = world.spawn(Transform(), ParticleEmitter({ effect: EFFECT }));
     canvasOf.set(e.id(), 4);
 
@@ -188,10 +188,14 @@ describe('syncParticles2D', () => {
     const createdId = calls.create[0].id;
 
     e.destroy();
+    markDirtyCalls.length = 0;
     syncParticles2D(world, ctx, state, 1 / 60);
 
     expect(calls.disposed.has(createdId)).toBe(true);
     expect(state.recs.size).toBe(0);
+    // Nothing else draws on canvas 4 now, so only the sweep can ask for the redraw that clears the
+    // emitter's last frame off a render-on-demand canvas.
+    expect(markDirtyCalls).toEqual([4]);
   });
 
   it('skips a deactivated entity (EntityAttributes.isActive → deactivatedEntities) and disposes its handle', async () => {
@@ -258,7 +262,7 @@ describe('syncParticles2D', () => {
     expect(calls.disposed.has(idB)).toBe(false);
     expect(wrapperA.parent).toBeNull();
     expect(state.recs.size).toBe(1);
-    expect(state.recs.has(b.id())).toBe(true);
+    expect(state.recs.hasId(b.id())).toBe(true);
   });
 
   it('disposeParticleSync2DState disposes all handles and clears the map', () => {
@@ -315,3 +319,39 @@ describe('syncParticles2D', () => {
     expect(backend.getContainer({ id: calls.create[0].id }).alpha).toBe(1);
   });
 
+describe('syncParticles2D — recycled entity index (#868)', () => {
+  beforeEach(() => {
+    clearParticleCache();
+    worldTransforms.clear();
+    setParticleEffect(EFFECT, defaultParticleEffect());
+  });
+
+  it('a same-effect emitter respawned on a dead one\'s index between two frames gets its OWN handle', () => {
+    const world = createWorld();
+    try {
+      const { backend, calls } = makeMockBackend();
+      const { ctx, canvasOf, markDirtyCalls } = makeMockCtx();
+      const state = createParticleSync2DState(backend);
+      const a = world.spawn(Transform(), ParticleEmitter({ effect: EFFECT, playOnStart: false }));
+      canvasOf.set(a.id(), 3);
+      syncParticles2D(world, ctx, state, 1 / 60);
+      expect(calls.create).toHaveLength(1);
+      expect(calls.pause).toEqual([1]);
+
+      a.destroy();
+      const b = world.spawn(Transform(), ParticleEmitter({ effect: EFFECT }));
+      expect(b.id()).toBe(a.id());
+      expect(b.valueOf()).not.toBe(a.valueOf());
+      markDirtyCalls.length = 0;
+      syncParticles2D(world, ctx, state, 1 / 60);
+
+      expect(calls.create).toHaveLength(2);         // `b` built its own…
+      expect(calls.dispose).toEqual([1]);           // …the dead one's was released…
+      expect(calls.pause).toEqual([1]);             // …and `b` (playOnStart) is not paused
+      expect(markDirtyCalls).toContain(3);
+      expect(state.recs.size).toBe(1);
+    } finally {
+      world.destroy();
+    }
+  });
+});

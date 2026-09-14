@@ -19,27 +19,31 @@
  *  Why a module-level singleton (mirrors `playState` / `skeletalPreview`): both 3D viewports
  *  (editor SceneView + GameView Scene3D) run on the one frame driver and each owns an
  *  independent mixer clone — reading the same seek request poses each clone to the same time.
- *  It's keyed by runtime entity id, which is stable within a scene load (the scrub session) but is
- *  reassigned on the next load — so the map is force-cleared on any world swap (below), mirroring
- *  `controlSpawnRegistry`, lest a seek target a dead/reused id in the freshly-loaded world. */
+ *  Force-cleared on any world swap (below), mirroring `controlSpawnRegistry`.
+ *
+ *  KEYED BY THE PACKED ENTITY (#868). The set is rebuilt only on the next scrub or Play, so a rig
+ *  deleted after a scrub keeps its seek until then — and an id key posed whatever rig reclaimed the
+ *  destroyed index at the dead rig's scrubbed time. */
 
+import type { Entity } from 'koota';
 import { onWorldSwap } from './ecs/world';
+import { packedOf, type PackedEntity } from './ecs/entityTable';
 
 /** One clip in a seek pose: absolute local `time` at blend `weight` (0..1). A single-element
  *  array is a plain seek (weight 1); two elements are a crossfade (weights sum to ~1). */
 export interface SeekClip { clip: string; time: number; weight: number; }
 
-let _seeks = new Map<number, SeekClip[]>();
+let _seeks = new Map<PackedEntity, SeekClip[]>();
 
 /** Register the desired pose for a skeletal rig (editor scrub-preview): 1 clip = seek, 2 = a
  *  crossfade blend (Phase B — replicates the fadeDuration crossfade Play shows). */
-export function requestSkeletalSeek(entityId: number, clips: SeekClip[]): void {
-  _seeks.set(entityId, clips);
+export function requestSkeletalSeek(rig: Entity, clips: SeekClip[]): void {
+  _seeks.set(packedOf(rig), clips);
 }
 
 /** The pending seek/blend for a rig, or undefined when none (advance normally). */
-export function getSkeletalSeek(entityId: number): SeekClip[] | undefined {
-  return _seeks.get(entityId);
+export function getSkeletalSeek(rig: Entity): SeekClip[] | undefined {
+  return _seeks.get(packedOf(rig));
 }
 
 /** Drop all pending seeks (call when the scrub set is rebuilt, Play resumes, or the editor

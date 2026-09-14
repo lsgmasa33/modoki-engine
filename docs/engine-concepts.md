@@ -47,18 +47,51 @@ rebuilt from a query every call and (b) **trusts an `entity.id()` lookup as "sti
 entity"** will hand a new entity the dead one's state. A `seen`-set sweep at the end of a pass is
 not a defence: a despawn+respawn landing BETWEEN two passes never gets one.
 
-Two sanctioned fixes, and the choice is about who else holds the id:
-- **Key by the packed entity** (`entity.valueOf()` — generation included) when the map is private
-  to the module. Used by `zones/zoneTriggerCore.ts` (QA-ZONE-0003).
-- **Keep the id key and store the generation alongside it**, rebuilding on a mismatch, when the id
-  is also a public *addressing* contract other modules call you with. Used by
-  `physics/physics2DSystem.ts`+`physics3DSystem.ts` (`BodyRec.entityGen`, see
-  [physics-2d.md](physics-2d.md)), by `video/videoSystem.ts` (its `owner` map — #336; its ids reach
-  it from the texture surfaces, `UIVideoMount` and the `video.*` actions), by
-  `rendering/materialInstanceSystem.ts`'s `_defaultBaseCache` (#336 — a cache deliberately held
-  "forever" so re-reading `mesh.material` can't thrash the clone, which is exactly what makes it
-  outlive its entity), and by `rendering/sprite2DMaterialBroker.ts` (#848 — both its registered
-  `entityShaders` maps and its per-frame dirty map).
+**Three sanctioned shapes (#868)**, and the choice is about who else holds the id:
+- **`PackedEntity`** — key a map private to its module by `packedOf(entity)` (`entity.valueOf()`,
+  generation included). The brand makes `map.set(entity.id(), …)` a type error. Used by
+  `zones/zoneTriggerCore.ts` (QA-ZONE-0003).
+- **`EntityTable<T>`** — keeps the id key and stores the generation in the same record as the
+  payload, when the id is also an *addressing* contract other modules call you with, or when entries
+  own something to release. Reads are generation-checked; every write takes an `Entity`, stamps it,
+  and disposes a dead entity's entry at that index first — so the half-shape failure below cannot be
+  written. The 8-bit generation wrap and the world-swap caveat are documented there, once.
+- **Despawn eviction** (`core/ecs/despawnEviction.ts`) — for a **frame-derived cache** filled by one
+  pass and read by id at later priorities or out of band, often by readers that hold only an id (a
+  SceneView gizmo, a parent lookup), so a generation check at the read has nothing to check. The owner
+  binds `world.onRemove(trait)` to the world it is filling from, and the entry is deleted inside
+  `destroy()` before any spawn can reclaim the index. ⚠️ An owner with a change-detection
+  short-circuit must also recompute after an eviction: a respawn with the dead entity's exact values
+  compares unchanged, and its evicted entry would never be rebuilt. Used by
+  `transformPropagationSystem`'s `worldTransforms`/`deactivatedEntities` (which are also cleared on a
+  world swap), `skin2DBuffers` and `deform2DBuffers`.
+
+⚠️ **A packed value is not unique forever, whichever shape holds it** (#868 close-out, measured on
+koota 0.6.6). The generation is 8 bits, so after 256 reuses of one index the next spawn has a dead
+entity's exact `valueOf()` — and koota reuses a destroyed World's id, so two scene swaps later an
+entity in a new world can too. So a packed-keyed map that nothing sweeps before the scene swap still
+clears on spawn (`loaders/overrideMarks.ts`, which a prefab rebuild loop drives past 256), and a
+world-swap reset stays load-bearing under a packed key (`games/space-console/runtime/setup.ts`).
+
+**UI state held across user time** — a dialog's subject, the row being renamed, a debug-tree selection —
+pins its entity with `core/ecs/entityPin.ts`, which records the World object as well as the packed
+value, and drops the pin on a world swap where nothing else re-checks it. A React list keyed by
+entity keys by `uiNodeKey` (`id:generation`, `runtime/ui/uiNodeKey.ts`), or a respawn keeps the dead
+entity's DOM and hook state.
+
+**A generation-free `Map<number, …>` / `Set<number>` in `runtime/**` needs a ledger row saying why** —
+`engine/tests/architecture/entityKeyedMaps.test.ts` flags every one at module scope, as a class field
+or as an interface field, with a tagged reason (`not-entity:`, `scratch:`, `revalidated:`, …).
+
+Sites that predate the type and carry the second shape by hand, ledgered as `gen-in-value:` and
+deliberately not converted (each is tested, and converting risks iteration order or purge semantics):
+`physics/physics2DSystem.ts`+`physics3DSystem.ts` (`BodyRec.entityGen`, see
+[physics-2d.md](physics-2d.md) — iteration order feeds Rapier), `video/videoSystem.ts` (its `owner`
+map — #336; its ids reach it from the texture surfaces, `UIVideoMount` and the `video.*` actions),
+`rendering/materialInstanceSystem.ts`'s `_defaultBaseCache` (#336 — a cache deliberately held
+"forever" so re-reading `mesh.material` can't thrash the clone, which is exactly what makes it outlive
+its entity), and `rendering/sprite2DMaterialBroker.ts` (#848 — both its registered `entityShaders`
+maps and its per-frame dirty map).
 
 ⚠️ **A per-frame rebuild is not automatically the "revalidated" exemption below.** The broker's
 dirty map is cleared and refilled every frame and was still wrong, because the mark and the read sit
@@ -122,11 +155,22 @@ the same space as its `slots`/`activeIds`/`last*Render` maps, which one shared s
 together — re-keying one of them to `entity.valueOf()` would silently desync that sweep. Ask who
 else *keys* the map, not just who calls you.
 
-Neither is needed for a cache whose every entry is **revalidated against a value recomputed this
+**State MIRRORED onto a kept object is not the hazard — state ACCUMULATED in it is (#868).** Most of
+the renderer's id-keyed caches (`scene3DSync`'s `ecsObjects`/`ecsMaterials`/…, `Scene2D`'s
+`last*Render` snapshots, `canvas2DPool`) hold a copy of what was last applied to a Three/Pixi object
+and re-compare every input each frame, so a same-id respawn is indistinguishable from a live edit of
+one entity — an identical respawn skipping its redraw is correct, the pixels already match. What
+leaks is state that is **time-accumulated** (an `AnimationMixer` clock, a particle emitter's elapsed
+time), **build-seeded** (#873's uniforms), **closure-captured** (a mixer listener holding the dead
+entity), or **a once-flag** (`autoplayed`). Ask which of those an entry holds before calling it safe.
+
+None of the three is needed for a cache whose every entry is **revalidated against a value recomputed this
 frame** — that is why `skinning/skin2DSystem.ts` is safe despite looking identical, and
 `tests/runtime/skin2DIdReuse.test.ts` pins it so a future trust-based entry there is caught.
-Likewise a per-frame-rebuilt index (`entityIndex.ts`, `transformPropagationSystem.ts`) never holds
-a value across a despawn and does not share the hazard.
+A per-frame-rebuilt index is exempt only when every read takes its id from a live entity in the SAME
+pass that rebuilt it (`entityIndex.ts`). One rebuilt at one priority and read at a later one is not
+— that is the broker's straddle above — and it takes despawn eviction (`worldTransforms`,
+`deactivatedEntities`, `skin2DBuffers`, `deform2DBuffers`).
 
 **In serialized data and event payloads, use the GUID, never the id** — runtime ids are reassigned
 on every scene hot-reload.

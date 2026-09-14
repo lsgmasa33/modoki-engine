@@ -2,6 +2,7 @@
 
 import React, { lazy, Suspense } from 'react';
 import type { UINodeData } from './useUIEntities';
+import { uiNodeKey } from './uiNodeKey';
 import { applyBindings } from './bindings';
 import { resolveTemplate, evalVisibility } from './bindingResolver';
 
@@ -1843,7 +1844,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
         {videoLayer}
         {canvas2DContent}
         {node.children.map(child => (
-          <UINode key={child.entityId} node={child} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} inheritedFontFamily={node.fontFamily || inheritedFontFamily} />
+          <UINode key={uiNodeKey(child)} node={child} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} inheritedFontFamily={node.fontFamily || inheritedFontFamily} />
         ))}
       </div>
     );
@@ -1905,7 +1906,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
       {videoLayer}
       {textContent}
       {node.children.map(child => (
-        <UINode key={child.entityId} node={child} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} inheritedFontFamily={node.fontFamily || inheritedFontFamily} />
+        <UINode key={uiNodeKey(child)} node={child} storeState={storeState} onSelectEntity={onSelectEntity} renderCanvas2D={renderCanvas2D} uiVisualsHidden={uiVisualsHidden} inheritedFontFamily={node.fontFamily || inheritedFontFamily} />
       ))}
     </div>
   );

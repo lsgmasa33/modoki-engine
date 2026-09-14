@@ -624,7 +624,8 @@ export function instantiatePrefab(
     }
 
     const entity = spawnEntity(getCurrentWorld(), ...traitArgs);
-    clearOverrideMarks(entity.id()); // fresh member — drop stale marks on a reused id
+    // Still needed with the packed key: the 8-bit generation wraps (overrideMarks.ts).
+    clearOverrideMarks(entity);
     localToEcs.set(pe.localId, entity.id());
     ownMemberIds.push(entity.id());
   }
@@ -1030,7 +1031,7 @@ export function captureInstanceOverrides(
     const currentTraits = collectComparableTraits(entity.id(), allTraits);
 
     const diffs = getOverrideValues(localId, currentTraits, prefab);
-    const markSet = getOverrideMarkSet(entity.id());
+    const markSet = getOverrideMarkSet(entity);
 
     // Mark-gate prefab-DEFINED field diffs. getOverrideValues reports every field
     // whose live value differs from the prefab base — but a divergence alone is NOT
@@ -1105,6 +1106,8 @@ export function applyOverridesByRootInstance(
       console.debug(`[Prefab] override skipped: no entity for localId ${localId} in instance ${rootInstanceId}`);
       continue;
     }
+    const member = findEntity(ecsId);
+    if (!member) continue;
     for (const [traitName, fields] of Object.entries(traitMap)) {
       const meta = getTraitByName(traitName);
       if (!meta) {
@@ -1115,7 +1118,7 @@ export function applyOverridesByRootInstance(
         // Added-tag override: ensure the tag is present on the instance. writeTraitField
         // adds the tag for a truthy value (field name is ignored for tags).
         writeTraitField(ecsId, meta, '', true);
-        markOverride(ecsId, traitName, '');
+        markOverride(member, traitName, '');
         continue;
       }
       // Accept any field the trait PERSISTS (its koota schema), so a re-apply keeps
@@ -1131,8 +1134,7 @@ export function applyOverridesByRootInstance(
         }
         known[field] = value;
       }
-      const entity = findEntity(ecsId);
-      if (!entity) continue;
+      const entity = member;
       if (!entity.has(meta.trait)) {
         // Added-trait override (root or child): the instance carries a trait the
         // prefab lacks at this localId. Add it whole so prefab refresh preserves it.
@@ -1144,7 +1146,7 @@ export function applyOverridesByRootInstance(
       }
       // Seed explicit marks from the override map so these fields survive a later
       // serialize even if the prefab base is edited to coincide with them.
-      for (const field of Object.keys(known)) markOverride(ecsId, traitName, field);
+      for (const field of Object.keys(known)) markOverride(member, traitName, field);
     }
   }
 }

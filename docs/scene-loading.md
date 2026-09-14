@@ -1251,7 +1251,11 @@ is therefore scoped to same-file collisions deliberately, and says so in its own
   primary wipe the marks the base just seeded — on *every* chain load, carry or not.
   `loadSceneFile` takes `clearMarks` (default `true`, so every other caller is
   unchanged); `SceneManager` clears once per staging world and passes `false` for its
-  chain and carry calls.
+  chain and carry calls. Marks are keyed by the **packed entity** (#868), so a carried entity's
+  marks are read off its old-world entity and re-seeded onto the new one (`restoreOverrideMarks`),
+  and an editor respawn gets them from its `EntitySnapshot.marks` — never from whatever entity last
+  held the recycled index. Spawns still `clearOverrideMarks` first: nothing sweeps a dead entity's
+  marks before the swap, and koota's 8-bit generation repeats a packed value after 256 reuses.
 - **Editing a base file on disk while a level is open** does not hot-reload by guid
   alone (a base's guid doesn't change when its file does). `agentBridge` matches the
   changed path against every `getLoadedScenes()` entry and reloads via

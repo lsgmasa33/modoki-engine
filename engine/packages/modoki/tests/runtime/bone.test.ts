@@ -50,7 +50,7 @@ function poseBone(): THREE.Bone {
  *  no clip. */
 function spawnRig(bone: THREE.Bone, current: string | undefined = 'clip') {
   const rig = world.spawn(Transform(), EntityAttributes({ guid: 'rig', parentId: 0 }));
-  state.skinned.set(rig.id(), { bones: new Map([[bone.name, bone]]), current } as unknown as SkinnedEntry);
+  state.skinned.set(rig, { bones: new Map([[bone.name, bone]]), current } as unknown as SkinnedEntry);
   return rig;
 }
 
@@ -178,7 +178,7 @@ describe('syncBones (P7b bridge)', () => {
       new THREE.Quaternion().setFromEuler(new THREE.Euler(0.4, 0.2, 0)),
       new THREE.Vector3(2, 5, 9),
     );
-    (state.skinned.get(rig.id()) as unknown as SkinnedEntry).boneWrapperPrefix = new Map([['bone1', { fwd, inv: fwd.clone().invert() }]]);
+    (state.skinned.get(rig) as unknown as SkinnedEntry).boneWrapperPrefix = new Map([['bone1', { fwd, inv: fwd.clone().invert() }]]);
     world.spawn(Transform(), Bone({ name: 'bone1' }), EntityAttributes({ guid: 'b', parentId: rig.id() }));
 
     const p0 = bone.position.clone(), q0 = bone.quaternion.clone(), s0 = bone.scale.clone();
@@ -199,7 +199,7 @@ describe('syncBones (P7b bridge)', () => {
     const boneB = poseBone(); boneB.name = 'boneB';   // clip-driven + an Animator on top
     const rig = world.spawn(Transform(), EntityAttributes({ guid: 'rig', parentId: 0 }));
     const fwd = new THREE.Matrix4().compose(new THREE.Vector3(), new THREE.Quaternion().setFromEuler(new THREE.Euler(0.4, 0.2, 0)), new THREE.Vector3(2, 5, 9));
-    state.skinned.set(rig.id(), {
+    state.skinned.set(rig, {
       bones: new Map([['boneA', boneA], ['boneB', boneB]]),
       current: 'clip',
       boneWrapperPrefix: new Map([['boneA', { fwd, inv: fwd.clone().invert() }]]),
@@ -364,7 +364,7 @@ describe('syncBones — a bone hand-posed to scale ZERO (#258)', () => {
       new THREE.Quaternion().setFromEuler(new THREE.Euler(0.4, 0.2, 0)),
       new THREE.Vector3(2, 5, 9),
     );
-    (state.skinned.get(rig.id()) as unknown as SkinnedEntry).boneWrapperPrefix =
+    (state.skinned.get(rig) as unknown as SkinnedEntry).boneWrapperPrefix =
       new Map([['bone1', { fwd, inv: fwd.clone().invert() }]]);
     const be = world.spawn(Transform(), Bone({ name: 'bone1' }), EntityAttributes({ guid: 'b', parentId: rig.id() }));
 

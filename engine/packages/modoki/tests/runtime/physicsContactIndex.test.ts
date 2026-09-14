@@ -16,7 +16,7 @@ import { physics2DSystem, disposePhysics2D } from '../../src/runtime/physics/phy
 import { physics2DEvents } from '../../src/runtime/physics/Physics2DEvents';
 import { getContactState, updateContactIndex, _resetContactIndex } from '../../src/runtime/physics/physicsContactIndex';
 import { initRapier2D } from '../../src/runtime/physics/rapierLoader';
-import type { World } from 'koota';
+import { createWorld, type World } from 'koota';
 
 beforeAll(async () => { await initRapier2D(); });
 let tw: TestWorld | undefined;
@@ -107,34 +107,39 @@ describe('physicsContactIndex — roll-up to the body', () => {
 });
 
 describe('physicsContactIndex — refcount (many collider pairs per body pair)', () => {
-  // `world` is only ever used as a Map key here, so a bare object stands in.
-  const w = () => ({} as unknown as World);
+  // A real koota world with real entities: the index stamps each entry with the packed entity and
+  // reads back only live ones (#868), so bare made-up ids would read as dead.
+  let kw: World | undefined;
+  afterEach(() => { kw?.destroy(); kw = undefined; });
+  const w = () => { kw = createWorld(); const [e1, e2, e3] = [kw.spawn(), kw.spawn(), kw.spawn()]; return { world: kw, e1, e2, e3 }; };
 
   it('keeps a body pair while ANY collider pair between them is still active', () => {
-    const world = w();
+    const { world, e1, e2 } = w();
+    const [p1, p2, i1, i2] = [e1.valueOf(), e2.valueOf(), e1.id(), e2.id()];
     // Two collider pairs between bodies 1 and 2 both enter (e.g. two legs on one floor).
-    updateContactIndex(world, 1, 2, false, 'enter');
-    updateContactIndex(world, 1, 2, false, 'enter');
-    expect(getContactState(world, 1)!.contacts).toEqual([2]);
+    updateContactIndex(world, p1, p2, false, 'enter');
+    updateContactIndex(world, p1, p2, false, 'enter');
+    expect(getContactState(world, i1)!.contacts).toEqual([i2]);
     // One collider lifts off → the body is STILL touching via the other. A plain Set would
     // wrongly report separation here; the refcount holds it.
-    updateContactIndex(world, 1, 2, false, 'exit');
-    expect(getContactState(world, 1)!.contacts).toEqual([2]);
+    updateContactIndex(world, p1, p2, false, 'exit');
+    expect(getContactState(world, i1)!.contacts).toEqual([i2]);
     // The second lifts → now truly separated; both entries pruned.
-    updateContactIndex(world, 1, 2, false, 'exit');
-    expect(getContactState(world, 1)).toBeUndefined();
-    expect(getContactState(world, 2)).toBeUndefined();
+    updateContactIndex(world, p1, p2, false, 'exit');
+    expect(getContactState(world, i1)).toBeUndefined();
+    expect(getContactState(world, i2)).toBeUndefined();
   });
 
   it('counts solid contacts and sensor overlaps independently', () => {
-    const world = w();
-    updateContactIndex(world, 1, 3, false, 'enter'); // solid
-    updateContactIndex(world, 1, 3, true, 'enter');  // sensor overlap (independent counter)
-    expect(getContactState(world, 1)!.contacts).toEqual([3]);
-    expect(getContactState(world, 1)!.overlaps).toEqual([3]);
-    updateContactIndex(world, 1, 3, false, 'exit');  // drop only the solid
-    expect(getContactState(world, 1)!.contacts).toEqual([]);
-    expect(getContactState(world, 1)!.overlaps).toEqual([3]); // overlap survives
+    const { world, e1, e3 } = w();
+    const [p1, p3, i1, i3] = [e1.valueOf(), e3.valueOf(), e1.id(), e3.id()];
+    updateContactIndex(world, p1, p3, false, 'enter'); // solid
+    updateContactIndex(world, p1, p3, true, 'enter');  // sensor overlap (independent counter)
+    expect(getContactState(world, i1)!.contacts).toEqual([i3]);
+    expect(getContactState(world, i1)!.overlaps).toEqual([i3]);
+    updateContactIndex(world, p1, p3, false, 'exit');  // drop only the solid
+    expect(getContactState(world, i1)!.contacts).toEqual([]);
+    expect(getContactState(world, i1)!.overlaps).toEqual([i3]); // overlap survives
   });
 });
 
@@ -189,5 +194,31 @@ describe('physicsContactIndex — accessor shape', () => {
       Collider2D({ shape: 'circle', radius: 5 }));
     tw.step(3);
     expect(getContactState(tw.world, lonely.id())).toBeUndefined();
+  });
+});
+
+describe('physicsContactIndex — recycled entity index (#868)', () => {
+  it('a despawn+respawn before the next tick does not hand the newcomer the dead body\'s contacts', () => {
+    tw = createTestWorld({ systems: [PHYS] });
+    tw.spawn(Physics2D({ gravityX: 0, gravityY: 20, pixelsPerMeter: 100 }));
+    const floor = tw.spawn(Transform({ x: 0, y: 300 }), RigidBody2D({ bodyType: 'static' }),
+      Collider2D({ shape: 'box', halfW: 200, halfH: 20 }));
+    const a = tw.spawn(Transform({ x: 0, y: 0 }), RigidBody2D({ bodyType: 'dynamic' }),
+      Collider2D({ shape: 'circle', radius: 15 }));
+    tw.step(240);
+    expect(getContactState(tw.world, floor.id())!.contacts).toContain(a.id());
+
+    // No tick between: the reconcile that drops `a` from the index has not run. `b` is far from the
+    // floor, so nothing it touches could legitimately be reported.
+    a.destroy();
+    const b = tw.spawn(Transform({ x: 5000, y: -5000 }), RigidBody2D({ bodyType: 'dynamic' }),
+      Collider2D({ shape: 'circle', radius: 15 }));
+    expect(b.id()).toBe(a.id());
+    expect(b.valueOf()).not.toBe(a.valueOf());
+
+    // Both directions: the newcomer is not "touching the floor", and the floor's partner id — which
+    // the Percept fold resolves to a GUID through the LIVE world, i.e. to `b` — is not listed.
+    expect(getContactState(tw.world, b.id())).toBeUndefined();
+    expect(getContactState(tw.world, floor.id())?.contacts ?? []).not.toContain(b.id());
   });
 });

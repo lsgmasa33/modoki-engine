@@ -2,6 +2,8 @@
 
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { readTraitData, readTraitDataFull, findEntity } from '../../runtime/core/ecs/entityUtils';
+import { pinEntityAt } from '../../runtime/core/ecs/entityPin';
+
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { writeTraitFieldWithUndo as writeField, writeTraitFieldMultiWithUndo as writeFieldMulti, writeTraitFieldPerEntityWithUndo as writeFieldPerEntity, removeTraitFromEntitiesWithUndo, deleteEntitiesWithUndo, pasteTraitValuesWithUndo } from '../undo/entityActions';
 import { type ContextMenuItem } from '../components/ContextMenu';
@@ -1330,7 +1332,8 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
           <button
             onClick={() => {
               const rootInstanceId = (data['rootInstanceId'] as number) || primaryId;
-              useEditorStore.getState().openApplyPrefabDialog(rootInstanceId);
+              const subject = pinEntityAt(rootInstanceId, findEntity, getCurrentWorld());
+              if (subject) useEditorStore.getState().openApplyPrefabDialog(subject);
             }}
             style={{
               marginTop: 6, width: '100%', padding: '4px 8px', background: '#2d3a4a', color: '#bbb',
@@ -1345,7 +1348,8 @@ function TraitSection({ meta, entityIds, data, overrides, mixedFields, onRemove,
           <button
             onClick={() => {
               const rootInstanceId = (data['rootInstanceId'] as number) || primaryId;
-              useEditorStore.getState().openRevertPrefabDialog(rootInstanceId);
+              const subject = pinEntityAt(rootInstanceId, findEntity, getCurrentWorld());
+              if (subject) useEditorStore.getState().openRevertPrefabDialog(subject);
             }}
             style={{
               marginTop: 6, width: '100%', padding: '4px 8px', background: '#3a2d2d', color: '#bbb',

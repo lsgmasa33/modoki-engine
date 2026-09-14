@@ -108,7 +108,7 @@ describe('captureNestedSceneDelta', () => {
     applyOverridesByRootInstance(root, { 1: { Transform: { x: 4.1 } } });
     // User's SCENE edit: idleScale 0.1 -> 0.5 (set live + mark, as entityActions does).
     writeTraitFieldImpl(root, TRAITS[1], 'idleScale', 0.5);
-    markOverride(root, 'EngineFlame', 'idleScale');
+    markOverride(index.get(root), 'EngineFlame', 'idleScale');
 
     const rowOverrides = { 1: { Transform: { x: 4.1 } } }; // the parent prefab's row override
     const delta = captureNestedSceneDelta(root, flamePrefab as any, rowOverrides);
@@ -127,7 +127,7 @@ describe('captureNestedSceneDelta', () => {
     const root = instantiatePrefab(flamePrefab as any);
     setPrefabSource(root, FLAME);
     writeTraitFieldImpl(root, TRAITS[1], 'idleScale', 0.5);
-    markOverride(root, 'EngineFlame', 'idleScale');
+    markOverride(index.get(root), 'EngineFlame', 'idleScale');
 
     // Now the child prefab base idleScale is edited to 0.5 (coincides with override).
     const editedFlame = { ...flamePrefab, entities: [{ ...flamePrefab.entities[0], traits: { ...flamePrefab.entities[0].traits, EngineFlame: { idleScale: 0.5, boostScale: 3, response: 1 } } }] };

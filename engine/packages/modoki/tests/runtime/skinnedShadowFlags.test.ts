@@ -78,9 +78,9 @@ async function setup() {
 }
 
 /** Every mesh in the rig clone, which is what `applyShadowFlags` traverses. */
-function meshesOf(state: { skinned: Map<number, { root: THREE.Object3D }> }, id: number) {
+function meshesOf(state: { skinned: { peekId(id: number): { root: THREE.Object3D } | undefined } }, id: number) {
   const out: THREE.Mesh[] = [];
-  state.skinned.get(id)?.root.traverse((o) => { if ((o as THREE.Mesh).isMesh) out.push(o as THREE.Mesh); });
+  state.skinned.peekId(id)?.root.traverse((o) => { if ((o as THREE.Mesh).isMesh) out.push(o as THREE.Mesh); });
   return out;
 }
 
@@ -156,5 +156,78 @@ describe('syncSkinnedModels — shadow flags (#183)', () => {
       expect(m.castShadow).toBe(false);
       expect(m.receiveShadow).toBe(false);
     }
+  });
+});
+
+describe('syncSkinnedModels — recycled entity index (#868)', () => {
+  it('a same-model rig respawned on a dead one\'s index between two frames gets its OWN clone and mixer', async () => {
+    // The rebuild gate compared only the model ref and library key, so a same-model respawn kept
+    // the dead entity's entry: its running AnimationMixer clock and current clip, a suppressed
+    // @anim-start, and mixer listeners closed over the dead rig entity.
+    const { world, traits, sync, scene, state } = await setup();
+    const { Transform, SkinnedModel } = traits;
+    const a = world.spawn(Transform(), SkinnedModel({ model: 'rig', isVisible: true }));
+    sync.syncSkinnedModels(world, scene, state);
+    const entryA = state.skinned.get(a)!;
+    expect(entryA).toBeDefined();
+
+    a.destroy();
+    const b = world.spawn(Transform(), SkinnedModel({ model: 'rig', isVisible: true }));
+    expect(b.id()).toBe(a.id());
+    expect(b.valueOf()).not.toBe(a.valueOf());
+    sync.syncSkinnedModels(world, scene, state);
+
+    const entryB = state.skinned.get(b)!;
+    expect(entryB).toBeDefined();
+    expect(entryB.mixer).not.toBe(entryA.mixer);
+    expect(entryB.root).not.toBe(entryA.root);
+    expect(entryA.root.parent).toBeNull();               // the dead clone left the scene
+    expect(scene.children.filter((c) => c === entryB.root)).toHaveLength(1);
+  });
+
+  it('a live rig keeps its clone across frames, and a removed rig leaves no shadow-flags row behind', async () => {
+    const { world, traits, sync, scene, state } = await setup();
+    const { Transform, SkinnedModel } = traits;
+    const e = world.spawn(Transform(), SkinnedModel({ model: 'rig', isVisible: true }));
+    sync.syncSkinnedModels(world, scene, state);
+    const first = state.skinned.get(e)!;
+    sync.syncSkinnedModels(world, scene, state);
+    sync.syncSkinnedModels(world, scene, state);
+    expect(state.skinned.get(e)).toBe(first);            // not swept and rebuilt every frame
+    expect(first.root.parent).toBe(scene);
+
+    const id = e.id();
+    expect(state.skinnedShadowFlags.has(id)).toBe(true);
+    e.destroy();
+    sync.syncSkinnedModels(world, scene, state);
+    expect(state.skinned.hasId(id)).toBe(false);
+    expect(state.skinnedShadowFlags.has(id)).toBe(false); // the row goes with its entry
+  });
+});
+
+describe('syncRenderables — recycled entity index (#868)', () => {
+  it('a same-shape primitive respawned on a dead one\'s index between two frames gets its OWN object', async () => {
+    // The rebuild gates compare only mesh kind and size, so the respawn kept the dead entity's
+    // THREE object — and with it whatever was written onto it: MaterialInstance uniform overrides
+    // live in `obj.userData` and are never cleared, and a prop override leaves a bound clone.
+    const { world, traits, sync, scene, state } = await setup();
+    const { Transform, Renderable3DPrimitive } = traits;
+    const a = world.spawn(Transform(), Renderable3DPrimitive({ mesh: 'cube', isVisible: true }));
+    sync.syncRenderables(world, scene, state);
+    const objA = state.ecsObjects.get(a.id())!;
+    expect(objA).toBeDefined();
+    objA.userData.uTint = 0.5;                            // what a MaterialInstance uniform override writes
+
+    a.destroy();
+    const b = world.spawn(Transform(), Renderable3DPrimitive({ mesh: 'cube', isVisible: true }));
+    expect(b.id()).toBe(a.id());
+    expect(b.valueOf()).not.toBe(a.valueOf());
+    sync.syncRenderables(world, scene, state);
+
+    const objB = state.ecsObjects.get(b.id())!;
+    expect(objB).toBeDefined();
+    expect(objB).not.toBe(objA);
+    expect(objB.userData.uTint).toBeUndefined();
+    expect(objA.parent).toBeNull();                       // the dead object left the scene
   });
 });

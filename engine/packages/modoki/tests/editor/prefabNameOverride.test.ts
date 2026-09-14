@@ -99,7 +99,7 @@ describe('EntityAttributes.name override on a prefab instance', () => {
     const child = getAllEntitiesImpl().find((e) => e.name === 'Flame')!;
     const e = index.get(child.id);
     e.set(EntityAttributes, { ...e.get(EntityAttributes), name: 'Flame Left' });
-    markOverride(child.id, 'EntityAttributes', 'name');
+    markOverride(index.get(child.id), 'EntityAttributes', 'name');
 
     const ov = captureInstanceOverrides(root, prefab as any);
     expect(ov[2]?.EntityAttributes?.name).toBe('Flame Left');
@@ -143,7 +143,7 @@ describe('EntityAttributes.name override on a prefab instance', () => {
     const child = getAllEntitiesImpl().find((e) => e.name === 'Flame')!;
     const e = index.get(child.id);
     e.set(Transform, { ...e.get(Transform), x: 7 });
-    markOverride(child.id, 'Transform', 'x');
+    markOverride(index.get(child.id), 'Transform', 'x');
 
     const ov = captureInstanceOverrides(root, prefab as any);
     expect(ov[2]?.Transform?.x).toBe(7);

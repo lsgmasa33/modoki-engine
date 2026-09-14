@@ -131,7 +131,7 @@ describe('collectInstanceOverrideKeys', () => {
     const { collectInstanceOverrideKeys } = await import('../../src/editor/scene/prefabOverrideKeys');
 
     const flameId = (() => { let id = 0; testWorld.query(PrefabInstance).updateEach(([pi], e) => { if ((pi as any).localId === 2 && (pi as any).rootInstanceId === root) id = e.id(); }); return id; })();
-    writeTraitFieldImpl(flameId, TRAITS[1], 'idleScale', 0.5); markOverride(flameId, 'EngineFlame', 'idleScale');
+    writeTraitFieldImpl(flameId, TRAITS[1], 'idleScale', 0.5); markOverride(index.get(flameId), 'EngineFlame', 'idleScale');
 
     const prefab = shipPrefab as any;
     const keys = collectInstanceOverrideKeys(root, prefab);

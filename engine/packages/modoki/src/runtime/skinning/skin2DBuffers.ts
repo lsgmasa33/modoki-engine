@@ -1,5 +1,9 @@
 /** Module-level registry of CPU-skinned 2D vertex buffers, keyed by entity id.
  *
+ *  The id is koota's RECYCLED index, and renderers read this between skin passes, so `skin2DSystem`
+ *  deletes a root's buffer the moment it is destroyed (despawn eviction, #868) — a spawn that
+ *  reclaims the index reads "no buffer" rather than the dead rig's mesh.
+ *
  *  This is the clean seam between the ECS deform system and the renderer:
  *  `skin2DSystem` (an ECS system) writes deformed vertex positions here every
  *  frame, and `Scene2D` (PixiJS) reads them to build/update a `Mesh` — WITHOUT the

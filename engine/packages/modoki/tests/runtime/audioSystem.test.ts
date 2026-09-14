@@ -13,6 +13,7 @@ import { Transform } from '../../src/runtime/core/traits/Transform';
 import { AudioSource } from '../../src/runtime/traits/AudioSource';
 import { AudioListener } from '../../src/runtime/traits/AudioListener';
 import { audioSystem, stopWorldAudio, rearmAudioAutoplay } from '../../src/runtime/audio/audioSystem';
+import { journalEvents } from '../../src/runtime/core/journal';
 import { cueSound, cueClip } from '../../src/runtime/audio/audioCues';
 import {
   getAudioLog, clearAudioLog, setAudioRecordMode, setBusVolume, resume, dispose, endRecordedVoices,
@@ -291,5 +292,92 @@ describe('audio buffer cache — scene-scoped refcount', () => {
     await acquireAudio(1, clip, 'buffer');
     expect(() => retryFailedAudioDecodes()).not.toThrow();
     expect(getAudioCacheStats().buffers).toBe(0);
+  });
+});
+
+describe('audioSystem — recycled entity index (#868)', () => {
+  const plays = () => getAudioLog().filter((l) => l.op === 'play');
+
+  it('a same-clip autoplay source respawned on a dead one\'s index between two frames starts its OWN voice', () => {
+    const clip = mintClip();
+    world = createWorld();
+    const a = world.spawn(AudioSource({ clip, autoplay: true, loop: true }));
+    audioSystem(world);
+    expect(plays()).toHaveLength(1);
+
+    a.destroy();
+    const b = world.spawn(AudioSource({ clip, autoplay: true, loop: true }));
+    expect(b.id()).toBe(a.id());
+    expect(b.valueOf()).not.toBe(a.valueOf());
+    audioSystem(world);
+
+    // Inherited: `autoplayed` already held the index, so `b` never declared intent, and the dead
+    // entity's live voice was treated as `b`'s — then paused because `b.playing` stayed false.
+    expect(plays()).toHaveLength(2);
+    expect(b.get(AudioSource)!.playing).toBe(true);
+    expect(getAudioLog().filter((l) => l.op === 'stop')).toHaveLength(1);   // the dead voice
+  });
+
+  it('an autoplay guard left by a source that already FINISHED does not silence the next entity on its index', () => {
+    // No race needed: a finished one-shot drops its source, and the old sweep only walked `sources`,
+    // so the id stayed in `autoplayed` after the entity was gone.
+    const clip = mintClip();
+    world = createWorld();
+    const a = world.spawn(AudioSource({ clip, autoplay: true }));
+    audioSystem(world);
+    endRecordedVoices();
+    audioSystem(world);          // reaps the finished voice
+    a.destroy();
+    audioSystem(world);          // a frame with the entity gone
+
+    const b = world.spawn(AudioSource({ clip, autoplay: true }));
+    expect(b.id()).toBe(a.id());
+    expect(b.valueOf()).not.toBe(a.valueOf());
+    audioSystem(world);
+    expect(plays()).toHaveLength(2);
+  });
+
+  it('a voice that ends naturally journals exactly ONE terminal event', () => {
+    const clip = mintClip();
+    world = createWorld();
+    world.spawn(AudioSource({ clip, autoplay: true }));
+    audioSystem(world);
+    endRecordedVoices();
+    audioSystem(world);             // the reconcile sees the end and journals it
+    audioSystem(world);
+    const phases = journalEvents({ type: '@audio' }, world).map((e) => (e.payload as { phase: string }).phase);
+    expect(phases.filter((p) => p === 'end' || p === 'stop')).toEqual(['end']);
+  });
+
+  it('a voice that ended on its own still gets a terminal journal event when its entity vanishes', () => {
+    // Every `start` is paired with a terminal event (`end`/`stop`) — docs/audio-plan.md counts them.
+    // A one-shot that finishes and whose entity is despawned before the next reconcile sees the end
+    // must still close its pair.
+    const clip = mintClip();
+    world = createWorld();
+    const a = world.spawn(AudioSource({ clip, autoplay: true }));
+    audioSystem(world);
+    endRecordedVoices();
+    a.destroy();
+    audioSystem(world);
+    const events = journalEvents({ type: '@audio' }, world).map((e) => (e.payload as { phase: string }).phase);
+    expect(events.filter((p) => p === 'start')).toHaveLength(1);
+    expect(events.filter((p) => p === 'end' || p === 'stop')).toHaveLength(1);
+  });
+
+  it('the flag maps are pruned to entities still carrying an AudioSource — re-adding the trait re-arms autoplay', () => {
+    // Pins the per-pass prune: without it every generation that ever autoplayed stays in
+    // `autoplayed` for the life of the world (a bullet-per-frame autoplay sound grows it forever).
+    const clip = mintClip();
+    world = createWorld();
+    const e = world.spawn(AudioSource({ clip, autoplay: true }));
+    audioSystem(world);
+    endRecordedVoices();
+    audioSystem(world);
+    e.remove(AudioSource);
+    audioSystem(world);
+    e.add(AudioSource({ clip, autoplay: true }));
+    audioSystem(world);
+    expect(plays()).toHaveLength(2);
   });
 });

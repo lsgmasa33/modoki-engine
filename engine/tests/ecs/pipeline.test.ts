@@ -29,6 +29,8 @@ describe('pipeline', () => {
       })),
       queryFirst: vi.fn(() => undefined), // singleton lookups (e.g. getTime) use this
       spawn: vi.fn(() => ({ id: vi.fn(() => 1) })),
+      // Despawn-evicting caches (#868, core/ecs/despawnEviction.ts) subscribe per world on each pass.
+      onRemove: vi.fn(() => vi.fn()),
     };
 
     // Should not throw even with a minimal mock world

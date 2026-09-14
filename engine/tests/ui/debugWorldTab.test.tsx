@@ -7,8 +7,9 @@
  *  round-trip, and collapse. */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { render, cleanup, fireEvent } from '@testing-library/react';
-import { getCurrentWorld, Transform, EntityAttributes } from '@modoki/engine/runtime';
+import { render, cleanup, fireEvent, act } from '@testing-library/react';
+import { getCurrentWorld, setCurrentWorld, Transform, EntityAttributes, markStructureDirty } from '@modoki/engine/runtime';
+import { createWorld } from 'koota';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { WorldTab, formatValue, colorToHex, hexToColorNumber } from '../../packages/modoki/src/runtime/debug/tabs/WorldTab';
 
@@ -45,6 +46,68 @@ describe('WorldTab hierarchy', () => {
     const caret = heroRow.querySelector('span') as HTMLElement; // first span = caret
     fireEvent.click(caret);
     expect(queryByText('sword')).toBeNull();
+  });
+});
+
+// #868: the collapse set and the selection were held as bare ids — koota's recycled index — so a
+// node deleted and replaced by a new entity on the same index handed the newcomer its collapsed
+// state and put the newcomer in the inspector, where an edit writes to it.
+describe('WorldTab state across a recycled index (#868)', () => {
+  /** Destroy `hero`+`sword` (child first, so the parent's index is reclaimed first) and spawn a
+   *  different pair onto the same indices. */
+  const replaceWithVillain = () => {
+    const heroId = parent.id();
+    child.destroy();
+    parent.destroy();
+    const villain = getCurrentWorld().spawn(Transform({ x: 7, y: 0, z: 0 }), EntityAttributes({ name: 'villain', layer: '3d' }));
+    const shield = getCurrentWorld().spawn(Transform({ x: 0, y: 0, z: 0 }), EntityAttributes({ name: 'shield', layer: '3d', parentId: villain.id() }));
+    expect(villain.id()).toBe(heroId);
+    act(() => markStructureDirty());
+    return { villain, shield };
+  };
+
+  it('a new entity on a collapsed node\'s index is not collapsed', () => {
+    const { getByText, queryByText } = render(<WorldTab />);
+    fireEvent.click((getByText('hero').parentElement as HTMLElement).querySelector('span') as HTMLElement);
+    expect(queryByText('sword')).toBeNull();
+
+    const { villain, shield } = replaceWithVillain();
+    try {
+      expect(queryByText('villain')).not.toBeNull();
+      expect(queryByText('shield')).not.toBeNull();
+    } finally { shield.destroy(); villain.destroy(); }
+  });
+
+  it('a new entity on the selected node\'s index is not shown in the inspector', () => {
+    const { getByText, queryByText } = render(<WorldTab />);
+    fireEvent.click(getByText('hero'));
+    expect(queryByText('Transform')).not.toBeNull();
+
+    const { villain, shield } = replaceWithVillain();
+    try {
+      expect(queryByText('Transform')).toBeNull();
+    } finally { shield.destroy(); villain.destroy(); }
+  });
+});
+
+describe('WorldTab across a world swap (#868)', () => {
+  it('drops the selection when a new world is promoted, even with an entity on the same index', () => {
+    const original = getCurrentWorld();
+    const { getByText, queryByText } = render(<WorldTab />);
+    fireEvent.click(getByText('hero'));
+    expect(queryByText('Transform')).not.toBeNull();
+
+    const next = createWorld();
+    try {
+      let other;
+      do { other = next.spawn(Transform({ x: 0, y: 0, z: 0 }), EntityAttributes({ name: 'other', layer: '3d' })); } while (other.id() < parent.id());
+      expect(other.id()).toBe(parent.id());
+      act(() => setCurrentWorld(next));
+      expect(queryByText('Transform')).toBeNull();
+    } finally {
+      act(() => setCurrentWorld(original));
+      next.destroy();
+    }
   });
 });
 

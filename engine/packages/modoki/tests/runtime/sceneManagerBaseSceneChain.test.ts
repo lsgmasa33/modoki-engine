@@ -56,15 +56,18 @@ vi.mock('three/examples/jsm/loaders/GLTFLoader.js', () => ({
 // See docs/reviews/a9-carried-instance-overrides-investigation.md.
 const markCounters = vi.hoisted(() => ({ clearAllCalls: 0 }));
 vi.mock('../../src/runtime/loaders/overrideMarks', () => {
+  // Keyed by the packed entity, like the real module (#868).
   const marks = new Map<number, Set<string>>();
+  const setFor = (e: { valueOf(): number }) => {
+    let s = marks.get(e.valueOf());
+    if (!s) { s = new Set(); marks.set(e.valueOf(), s); }
+    return s;
+  };
   return {
-    markOverride: (id: number, t: string, f: string) => {
-      let s = marks.get(id);
-      if (!s) { s = new Set(); marks.set(id, s); }
-      s.add(`${t}.${f}`);
-    },
-    getOverrideMarkSet: (id: number) => marks.get(id),
-    clearOverrideMarks: (id: number) => { marks.delete(id); },
+    markOverride: (e: { valueOf(): number }, t: string, f: string) => { setFor(e).add(`${t}.${f}`); },
+    restoreOverrideMarks: (e: { valueOf(): number }, keys: Iterable<string>) => { const s = setFor(e); for (const k of keys) s.add(k); },
+    getOverrideMarkSet: (e: { valueOf(): number }) => marks.get(e.valueOf()),
+    clearOverrideMarks: (e: { valueOf(): number }) => { marks.delete(e.valueOf()); },
     clearAllOverrideMarks: () => { markCounters.clearAllCalls++; marks.clear(); },
   };
 });
@@ -311,8 +314,8 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
     const { markOverride, getOverrideMarkSet } = await import('../../src/runtime/loaders/overrideMarks');
 
     const idsByName = (world: any) => {
-      const out = new Map<string, number>();
-      world.query(EntityAttributes).updateEach(([attr]: any[], e: any) => out.set((attr as any).name, e.id()));
+      const out = new Map<string, any>(); // name → entity (marks are keyed by the packed entity, #868)
+      world.query(EntityAttributes).updateEach(([attr]: any[], e: any) => out.set((attr as any).name, e));
       return out;
     };
 

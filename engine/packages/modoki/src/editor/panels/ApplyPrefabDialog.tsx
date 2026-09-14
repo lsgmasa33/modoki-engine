@@ -20,6 +20,9 @@ import { entityRef } from '../undo/entityRef';
 import { applyToPrefabWithUndo } from '../undo/applyPrefabUndo';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { getCurrentWorld } from '../../runtime/core/ecs/world';
+import { findEntity } from '../../runtime/core/ecs/entityUtils';
+import { livePinnedId } from '../../runtime/core/ecs/entityPin';
+import { subjectGoneNotice, runOnPinnedSubject } from './prefabDialogSubject';
 import type { AddedEntity } from '../../runtime/loaders/loadSceneFile';
 import { buildOverrideForest, type ForestNode } from './prefabOverrideForest';
 import { MixedCheckbox } from './assetViews/widgets';
@@ -132,9 +135,10 @@ export function RevertPrefabDialog() {
 }
 
 function PrefabOverridesDialog({ mode }: { mode: Mode }) {
-  const { active, rootInstanceId } = useEditorStore((s) =>
+  const { active, subject } = useEditorStore((s) =>
     mode === 'apply' ? s.applyPrefabDialog : s.revertPrefabDialog,
   );
+  const rootInstanceId = subject?.id ?? null;
   const closeDialog = useEditorStore((s) =>
     mode === 'apply' ? s.closeApplyPrefabDialog : s.closeRevertPrefabDialog,
   );
@@ -143,8 +147,16 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [applying, setApplying] = useState(false);
 
+  /** #868: when the instance root the dialog was opened for no longer exists, the dialog closes with a
+   *  notice rather than acting on whatever entity now holds its index (see prefabDialogSubject.ts). */
+  const closeAsGone = (notice: string) => {
+    closeDialog();
+    useEditorStore.getState().showToast(notice, 'warn');
+  };
+
   useEffect(() => {
     if (!active || rootInstanceId === null) return;
+    if (livePinnedId(subject, findEntity, getCurrentWorld()) === null) { closeAsGone(subjectGoneNotice(mode)); return; }
     let cancelled = false;
     setLoadState({ kind: 'loading' });
     (async () => {
@@ -180,7 +192,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
       setLoadState({ kind: 'ready', entities, structural });
     })();
     return () => { cancelled = true; };
-  }, [active, rootInstanceId]);
+  }, [active, subject]);
 
   const totals = useMemo(() => {
     if (loadState.kind !== 'ready') return { total: 0, checked: 0 };
@@ -231,10 +243,15 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
     if (rootInstanceId === null || checked.size === 0 || applying) return;
     setApplying(true);
     try {
-      // Applies the selected overrides to the prefab AND pushes one undo entry.
-      // (Promotion-driven scene re-save now happens inside applyToPrefabWithUndo.)
-      await applyToPrefabWithUndo(rootInstanceId, checked);
-      closeDialog();
+      await runOnPinnedSubject({
+        subject, lookup: findEntity, world: getCurrentWorld(), mode, onGone: closeAsGone,
+        act: async (liveId) => {
+          // Applies the selected overrides to the prefab AND pushes one undo entry.
+          // (Promotion-driven scene re-save now happens inside applyToPrefabWithUndo.)
+          await applyToPrefabWithUndo(liveId, checked);
+          closeDialog();
+        },
+      });
     } finally {
       setApplying(false);
     }
@@ -244,29 +261,34 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
     if (rootInstanceId === null || checked.size === 0 || applying) return;
     setApplying(true);
     try {
-      const result = await revertOverridesSelective(rootInstanceId, checked);
-      if (result) {
-        // The rebuild assigns new ECS ids but preserves the instance root's guid
-        // (rebuildInstance carries it over), so a guid-based ref re-finds the live
-        // root across each rebuild AND across a world rebuild (Play→Stop).
-        const ref = entityRef(result.newRootId);
-        useEditorStore.getState().selectEntity(result.newRootId);
-        const { source, prefab, fullOverrides, fullStructure, reducedOverrides, reducedStructure } = result;
-        pushAction({
-          label: 'Revert prefab overrides',
-          undo: () => {
-            const cur = ref.resolve(); if (cur == null) return;
-            const id = rebuildInstance(cur, source, prefab, fullOverrides, fullStructure);
-            useEditorStore.getState().selectEntity(id);
-          },
-          redo: () => {
-            const cur = ref.resolve(); if (cur == null) return;
-            const id = rebuildInstance(cur, source, prefab, reducedOverrides, reducedStructure);
-            useEditorStore.getState().selectEntity(id);
-          },
-        });
-      }
-      closeDialog();
+      await runOnPinnedSubject({
+        subject, lookup: findEntity, world: getCurrentWorld(), mode, onGone: closeAsGone,
+        act: async (liveId) => {
+          const result = await revertOverridesSelective(liveId, checked);
+          if (result) {
+            // The rebuild assigns new ECS ids but preserves the instance root's guid
+            // (rebuildInstance carries it over), so a guid-based ref re-finds the live
+            // root across each rebuild AND across a world rebuild (Play→Stop).
+            const ref = entityRef(result.newRootId);
+            useEditorStore.getState().selectEntity(result.newRootId);
+            const { source, prefab, fullOverrides, fullStructure, reducedOverrides, reducedStructure } = result;
+            pushAction({
+              label: 'Revert prefab overrides',
+              undo: () => {
+                const cur = ref.resolve(); if (cur == null) return;
+                const id = rebuildInstance(cur, source, prefab, fullOverrides, fullStructure);
+                useEditorStore.getState().selectEntity(id);
+              },
+              redo: () => {
+                const cur = ref.resolve(); if (cur == null) return;
+                const id = rebuildInstance(cur, source, prefab, reducedOverrides, reducedStructure);
+                useEditorStore.getState().selectEntity(id);
+              },
+            });
+          }
+          closeDialog();
+        },
+      });
     } finally {
       setApplying(false);
     }

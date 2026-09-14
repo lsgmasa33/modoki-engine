@@ -9,7 +9,7 @@ import type { World } from 'koota';
 import { resolveTrackTarget, buildEntityIndex, type EntityIndex } from '../core/ecs/entityIndex';
 import { evalDeformTrack } from './deformEval';
 import type { AnimationClipDef } from './types';
-import { setDeform2D } from './deform2DBuffers';
+import { setDeform2D, bindDeform2DEviction } from './deform2DBuffers';
 
 /** Apply `clip`'s deform tracks (if any) at `time` for the animator rooted at
  *  `rootId`. Pass a prebuilt `index` when posing many animators in one frame.
@@ -24,6 +24,7 @@ export function applyClipDeform(
 ): number {
   const tracks = clip.deformTracks;
   if (!tracks || tracks.length === 0) return 0;
+  bindDeform2DEviction(world);
   const idx = index ?? buildEntityIndex(world);
   let applied = 0;
   for (const tr of tracks) {

@@ -80,15 +80,15 @@ describe('previewTimelineAt', () => {
     // Scrub inside the first block → seek Idle at local time (t − start). fadeDuration defaults to
     // 0, so a single full-weight clip (no crossfade).
     previewTimelineAt(world, root.id(), def, 1.0);
-    expect(getSkeletalSeek(alien.id())).toEqual([{ clip: 'Idle', time: 1.0, weight: 1 }]);
+    expect(getSkeletalSeek(alien)).toEqual([{ clip: 'Idle', time: 1.0, weight: 1 }]);
 
     // Scrub well into the second block → seek Attack at its OWN local time.
     previewTimelineAt(world, root.id(), def, 3.5);
-    expect(getSkeletalSeek(alien.id())).toEqual([{ clip: 'Attack', time: 1.0, weight: 1 }]); // 3.5 − 2.5
+    expect(getSkeletalSeek(alien)).toEqual([{ clip: 'Attack', time: 1.0, weight: 1 }]); // 3.5 − 2.5
 
     // Scrub past the last block (no active clip) → the seek set is cleared, rig un-seeked.
     previewTimelineAt(world, root.id(), def, 7.0);
-    expect(getSkeletalSeek(alien.id())).toBeUndefined();
+    expect(getSkeletalSeek(alien)).toBeUndefined();
     expect(hasSkeletalSeeks()).toBe(false);
   });
 
@@ -109,7 +109,7 @@ describe('previewTimelineAt', () => {
 
     // t = 2.6 → 0.1s into the 0.25s fade → incoming Attack weight 0.4, outgoing Idle weight 0.6.
     previewTimelineAt(world, root.id(), def, 2.6);
-    const parts = getSkeletalSeek(alien.id())!;
+    const parts = getSkeletalSeek(alien)!;
     expect(parts).toHaveLength(2);
     expect(parts[0]).toMatchObject({ clip: 'Idle' });   // outgoing, still advancing
     expect(parts[0].weight).toBeCloseTo(0.6, 5);
@@ -118,7 +118,7 @@ describe('previewTimelineAt', () => {
 
     // Past the fade window → single full-weight clip.
     previewTimelineAt(world, root.id(), def, 3.0);
-    expect(getSkeletalSeek(alien.id())).toEqual([{ clip: 'Attack', time: 0.5, weight: 1 }]);
+    expect(getSkeletalSeek(alien)).toEqual([{ clip: 'Attack', time: 0.5, weight: 1 }]);
   });
 
   it('crossfades over the authored OVERLAP region, not fadeDuration, when blocks overlap (Phase D)', () => {
@@ -140,7 +140,7 @@ describe('previewTimelineAt', () => {
     // t = 2.1 → 0.1s into the 0.5s overlap → incoming Attack weight 0.1/0.5 = 0.2.
     // (With the old fadeDuration=0.1 window, 0.1 ≥ 0.1 would collapse to a single full-weight clip.)
     previewTimelineAt(world, root.id(), def, 2.1);
-    const parts = getSkeletalSeek(alien.id())!;
+    const parts = getSkeletalSeek(alien)!;
     expect(parts).toHaveLength(2);
     expect(parts[0]).toMatchObject({ clip: 'Idle' });
     expect(parts[0].weight).toBeCloseTo(0.8, 5);
@@ -151,7 +151,7 @@ describe('previewTimelineAt', () => {
 
     // Past the overlap end (2.5) → single full-weight Attack.
     previewTimelineAt(world, root.id(), def, 2.6);
-    const after = getSkeletalSeek(alien.id())!;
+    const after = getSkeletalSeek(alien)!;
     expect(after).toHaveLength(1);
     expect(after[0]).toMatchObject({ clip: 'Attack', weight: 1 });
     expect(after[0].time).toBeCloseTo(0.6, 5); // 2.6 − 2.0
@@ -201,7 +201,7 @@ describe('previewTimelineAt', () => {
     // t = 1.1 → 0.1s into the fade after the FIRST block's start. The i>0 guard must keep this a
     // single clip (there is no previous block to blend from), not throw on clips[-1].
     previewTimelineAt(world, root.id(), def, 1.1);
-    const parts = getSkeletalSeek(alien.id())!;
+    const parts = getSkeletalSeek(alien)!;
     expect(parts).toHaveLength(1);
     expect(parts[0].clip).toBe('Idle');
     expect(parts[0].time).toBeCloseTo(0.1, 5); // t − start
@@ -248,13 +248,13 @@ describe('previewTimelineAt', () => {
       tracks: [{ id: 'a', name: 'Anim', target: 'Alien', type: 'animation', muted: true, clips: [{ start: 0, clip: 'Idle' }] }],
     });
     previewTimelineAt(world, root.id(), muted, 1.0);
-    expect(getSkeletalSeek(alien.id())).toBeUndefined();
+    expect(getSkeletalSeek(alien)).toBeUndefined();
 
     const noScrub = normalizeTimeline({
       id: 'tl', duration: 4, frameRate: 30,
       tracks: [{ id: 'a', name: 'Anim', target: 'Alien', type: 'animation', clips: [{ start: 0, clip: 'Idle', scrub: false }] }],
     });
     previewTimelineAt(world, root.id(), noScrub, 1.0);
-    expect(getSkeletalSeek(alien.id())).toBeUndefined();
+    expect(getSkeletalSeek(alien)).toBeUndefined();
   });
 });

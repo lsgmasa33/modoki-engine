@@ -837,17 +837,17 @@ describe('loadSceneFile', () => {
     it('clears marks by default — an ordinary single-scene load is unchanged', async () => {
       const { loadSceneFile } = await getLoader();
       const { markOverride, getOverrideMarkSet } = await import('../../src/runtime/loaders/overrideMarks');
-      // A mark left on an id from a PREVIOUS world. 4242 is never spawned by this
-      // load, so only the global clear can remove it (per-entity hygiene can't).
-      markOverride(4242, 'Transform', 'x');
-      expect(getOverrideMarkSet(4242)?.has('Transform.x')).toBe(true);
+      // A mark left on an entity the load never touches, so only the global clear can remove it.
+      const stale = testWorld.spawn();
+      markOverride(stale, 'Transform', 'x');
+      expect(getOverrideMarkSet(stale)?.has('Transform.x')).toBe(true);
 
       await loadSceneFile(
         { version: SCENE_FORMAT_VERSION, entities: [{ id: 1, traits: { Transform: true } }] },
         { fetchPrefab: async () => null, loadModels: false },
       );
 
-      expect(getOverrideMarkSet(4242)).toBeUndefined();
+      expect(getOverrideMarkSet(stale)).toBeUndefined();
     });
 
     it('clearMarks:false preserves marks an EARLIER scene in the same chain seeded', async () => {
@@ -868,9 +868,9 @@ describe('loadSceneFile', () => {
           onEntitySpawned: (entity: any, oldId: number) => { spawned.push({ entity, oldId }); },
         },
       );
-      const fishId = spawned.find((s) => s.oldId === 22)!.entity.id();
-      markOverride(fishId, 'Transform', 'x');
-      expect(getOverrideMarkSet(fishId)?.has('Transform.x')).toBe(true);
+      const fish = spawned.find((s) => s.oldId === 22)!.entity;
+      markOverride(fish, 'Transform', 'x');
+      expect(getOverrideMarkSet(fish)?.has('Transform.x')).toBe(true);
 
       // Scene 2 of the chain (the PRIMARY) — same world, no prefab instances of
       // its own. Before the fix this call wiped the base's marks. It must not.
@@ -879,7 +879,7 @@ describe('loadSceneFile', () => {
         { world: testWorld, clearMarks: false, fetchPrefab: async () => null, loadModels: false },
       );
 
-      expect(getOverrideMarkSet(fishId)?.has('Transform.x')).toBe(true);
+      expect(getOverrideMarkSet(fish)?.has('Transform.x')).toBe(true);
     });
   });
 
@@ -2072,7 +2072,7 @@ describe('overrides over persistent fields absent from meta.fields', () => {
     clearAllOverrideMarks();
     const entity = testWorld.spawn(Animator({ clips: '[]', clip: '', speed: 1 }));
     applyOverridesByLocalToEcs(testWorld, new Map([[1, entity.id()]]), { 1: { Animator: fields } });
-    return { live: entity.get(Animator) as Record<string, unknown>, marks: getOverrideMarkSet(entity.id()) };
+    return { live: entity.get(Animator) as Record<string, unknown>, marks: getOverrideMarkSet(entity) };
   }
 
   it('APPLIES clips/clip rather than skipping them as unknown fields', async () => {

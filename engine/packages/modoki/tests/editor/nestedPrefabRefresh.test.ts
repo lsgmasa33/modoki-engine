@@ -186,7 +186,7 @@ describe('nested override serialization', () => {
     // Override the nested child I2's Transform.x on THIS instance only.
     const innerRoot = innerRootUnder();
     const i2 = memberByLocal(innerRoot, 2);
-    writeTraitFieldImpl(i2, TRAITS[0], 'x', 5); markOverride(i2, 'Transform', 'x');
+    writeTraitFieldImpl(i2, TRAITS[0], 'x', 5); markOverride(index.get(i2), 'Transform', 'x');
 
     const out = serializePrefab(outerRoot, OUTER)!;
     const ref = out.entities.find((e) => e.prefab)!;
@@ -211,12 +211,12 @@ describe('inner-prefab edit refreshes all inner copies, preserving per-copy over
     // Copy A: override the nested child I2.x = 5.
     const innerA = innerRootUnder(m2A);
     const i2A = memberByLocal(innerA, 2);
-    writeTraitFieldImpl(i2A, TRAITS[0], 'x', 5); markOverride(i2A, 'Transform', 'x');
+    writeTraitFieldImpl(i2A, TRAITS[0], 'x', 5); markOverride(index.get(i2A), 'Transform', 'x');
 
     // Edit the INNER prefab base (via copy B's root I1.x = 9) and apply → this
     // rewrites the inner prefab and refreshes BOTH inner copies.
     const innerB = innerRootUnder(memberByLocal(outerB, 2));
-    writeTraitFieldImpl(innerB, TRAITS[0], 'x', 9); markOverride(innerB, 'Transform', 'x');
+    writeTraitFieldImpl(innerB, TRAITS[0], 'x', 9); markOverride(index.get(innerB), 'Transform', 'x');
     await applyToPrefabSelective(innerB, new Set(['1.Transform.x']));
 
     // Still exactly two inner copies (two I1 roots, two I2 children) — no orphan/dup.
@@ -246,9 +246,9 @@ describe('outer-prefab edit rebuilds the instance (risk R3: nested live override
     // Live per-copy override on the nested child, plus an outer-member edit to apply.
     const innerRoot = innerRootUnder(m2);
     const i2 = memberByLocal(innerRoot, 2);
-    writeTraitFieldImpl(i2, TRAITS[0], 'x', 5); markOverride(i2, 'Transform', 'x');
+    writeTraitFieldImpl(i2, TRAITS[0], 'x', 5); markOverride(index.get(i2), 'Transform', 'x');
     const m1 = memberByLocal(outerRoot, 1);
-    writeTraitFieldImpl(m1, TRAITS[0], 'x', 7); markOverride(m1, 'Transform', 'x');
+    writeTraitFieldImpl(m1, TRAITS[0], 'x', 7); markOverride(index.get(m1), 'Transform', 'x');
 
     await applyToPrefabSelective(outerRoot, new Set(['1.Transform.x']));
 

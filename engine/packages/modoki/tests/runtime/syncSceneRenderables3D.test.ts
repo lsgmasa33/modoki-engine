@@ -45,7 +45,7 @@ async function setup() {
     worldTransforms: new Map(), deactivatedEntities: new Set(),
   }));
   vi.doMock('../../src/runtime/loaders/meshTemplateCache', () => ({
-    resolveMeshTemplate: vi.fn(), resolveMaterialForMesh: vi.fn(),
+    resolveMeshTemplate: vi.fn(), resolveMaterialForMesh: vi.fn(), resolveMeshLodInfo: vi.fn(() => null),
     resolveMaterial: vi.fn(() => ({ uuid: 'm', color: { setHex: vi.fn() }, nprColorPreserve: 0, dispose: vi.fn() })),
     getCachedEnvironment: vi.fn(), acquireEnvironment: vi.fn(),
     // syncEnvironment sweeps retired envs (#315) — a mock without these throws on every call.
@@ -93,6 +93,36 @@ describe('syncSceneRenderables3D — functional', () => {
 
     sync.syncSceneRenderables3D(world, scene, state);
     expect(mesh.position.set).toHaveBeenCalledWith(1, 2, 3);
+  });
+
+  it('evicts a GLB object built for a dead entity when a new one reclaims its index (#868)', async () => {
+    const { world, traits, sync } = await setup();
+    const { Transform, Renderable3D } = traits;
+    const spawnShip = () => world.spawn(Transform(), Renderable3D({ mesh: 'ship.glb', material: 'base.mat.json', isVisible: true }));
+    try {
+      const a = spawnShip();
+      const mesh = makeMockMesh();
+      const state = sync.createRenderState();
+      state.ecsObjects.set(a.id(), mesh);
+      state.ecsSprites.set(a.id(), 'ship.glb');
+      const scene: any = { add: vi.fn(), remove: vi.fn() };
+      sync.syncSceneRenderables3D(world, scene, state);          // adopts the seeded object for `a`
+      expect(scene.remove).not.toHaveBeenCalled();
+
+      a.destroy();
+      const b = spawnShip();
+      expect(b.id()).toBe(a.id());
+      expect(b.valueOf()).not.toBe(a.valueOf());
+      sync.syncSceneRenderables3D(world, scene, state);
+      expect(scene.remove).toHaveBeenCalledWith(mesh);             // not handed to `b`
+      expect(state.ecsObjects.get(b.id())).not.toBe(mesh);
+
+      b.destroy();
+      sync.syncSceneRenderables3D(world, scene, state);
+      expect(state.ecsOwners.has(b.id())).toBe(false);             // the owner row goes with the reap
+    } finally {
+      world.destroy(); // release the koota world id — this file is already near the process cap
+    }
   });
 
   it('threads the renderables.shouldUpdateTransform callback through', async () => {
@@ -178,7 +208,7 @@ describe('syncBoneAttachments — transform composition', () => {
     const root = new T.Object3D(); // standalone → updateMatrixWorld(true) won't reset bone
 
     const state = sync.createRenderState();
-    state.skinned.set(rig.id(), { root, bones: new Map([['Bone1', bone]]) } as any);
+    state.skinned.set(rig, { root, bones: new Map([['Bone1', bone]]) } as any);
 
     // Attached prop: local offset (1,0,0), no local rotation, own scale 2.
     const att = world.spawn(
@@ -226,7 +256,7 @@ describe('syncBoneAttachments — transform composition', () => {
     // A skinned entry must exist (else the size===0 guard returns first) — but it's
     // a DIFFERENT rig id than the attachment's target guid resolves to.
     const state = sync.createRenderState();
-    state.skinned.set(999, { root: new T.Object3D(), bones: new Map() } as any);
+    state.skinned.set(world.spawn(), { root: new T.Object3D(), bones: new Map() } as any);
     const att = world.spawn(
       Transform({ x: 5, y: 6, z: 7 }),
       BoneAttachment({ target: 'no-such-rig', bone: 'Bone1' }),
@@ -247,7 +277,7 @@ describe('syncBoneAttachments — transform composition', () => {
     const rig = world.spawn(EntityAttributes({ name: 'Rig', guid: 'rig' }));
     const state = sync.createRenderState();
     // Rig exists but has NO 'Bone1'.
-    state.skinned.set(rig.id(), { root: new T.Object3D(), bones: new Map() } as any);
+    state.skinned.set(rig, { root: new T.Object3D(), bones: new Map() } as any);
     const att = world.spawn(
       Transform({ x: 5, y: 6, z: 7 }),
       BoneAttachment({ target: 'rig', bone: 'Bone1' }),
@@ -271,7 +301,7 @@ describe('syncBoneAttachments — transform composition', () => {
     const root = new T.Object3D();
     const poseSpy = vi.spyOn(root, 'updateMatrixWorld'); // count force-poses
     const state = sync.createRenderState();
-    state.skinned.set(rig.id(), { root, bones: new Map([['Bone1', bone]]) } as any);
+    state.skinned.set(rig, { root, bones: new Map([['Bone1', bone]]) } as any);
 
     for (const name of ['A', 'B']) {
       const att = world.spawn(
@@ -361,7 +391,7 @@ describe('syncSkinnedModels — lifecycle', () => {
 
     sync.syncSkinnedModels(world, scene, state);
 
-    const entry = state.skinned.get(e.id())!;
+    const entry = state.skinned.get(e)!;
     expect(entry).toBeDefined();
     expect(entry.modelRef).toBe('alien.glb');
     expect([...entry.actions.keys()]).toEqual(['Idle']);
@@ -457,12 +487,12 @@ describe('syncSkinnedModels — lifecycle', () => {
     const scene = new T.Scene();
 
     sync.syncSkinnedModels(world, scene, state);
-    const first = state.skinned.get(e.id())!;
+    const first = state.skinned.get(e)!;
     expect(first.modelRef).toBe('a.glb');
 
     e.set(SkinnedModel, { ...e.get(SkinnedModel)!, model: 'b.glb' });
     sync.syncSkinnedModels(world, scene, state);
-    const second = state.skinned.get(e.id())!;
+    const second = state.skinned.get(e)!;
     expect(second).not.toBe(first);          // rebuilt, not mutated in place
     expect(second.modelRef).toBe('b.glb');
     expect(second.bones.has('Spine')).toBe(true);
@@ -478,7 +508,7 @@ describe('syncSkinnedModels — lifecycle', () => {
     const state = sync.createRenderState();
     const scene = new T.Scene();
     sync.syncSkinnedModels(world, scene, state);
-    const root = state.skinned.get(e.id())!.root;
+    const root = state.skinned.get(e)!.root;
     expect(state.skinned.size).toBe(1);
 
     e.set(SkinnedModel, { ...e.get(SkinnedModel)!, isVisible: false });
@@ -559,14 +589,18 @@ describe('attachInvalidationListener — re-import eviction', () => {
     const scene = new T.Scene();
     const root = new T.Group(); scene.add(root);
     const mixer = { stopAllAction: vi.fn(), uncacheRoot: vi.fn() };
-    state.skinned.set(5, { modelRef: '/alien.glb', root, mixer, bones: new Map() } as any);
+    const { createWorld } = await import('koota');
+    const kw = createWorld();
+    const rig = kw.spawn();
+    state.skinned.set(rig, { modelRef: '/alien.glb', root, mixer, bones: new Map() } as any);
 
     sync.attachInvalidationListener(state, scene);
     inval.listener!('/alien.glb', new Set(['/alien.glb']));
 
-    expect(state.skinned.has(5)).toBe(false);     // entry evicted
+    expect(state.skinned.hasId(rig.id())).toBe(false); // entry evicted
     expect(mixer.stopAllAction).toHaveBeenCalled(); // disposeSkinnedEntry ran
     expect(scene.children).not.toContain(root);
+    kw.destroy();
   });
 });
 

@@ -1514,3 +1514,93 @@ describe('filterToTraitSchema', () => {
     expect(filterToTraitSchema(meta, values)).toBe(values);
   });
 });
+
+// #868 — prefab override marks and koota's recycled entity index. A mark says "this field is a
+// deliberate per-instance override" and was keyed by the bare `entity.id()`, cleared only on the
+// instantiate paths. So an editor duplicate/paste/undo that respawned an instance member onto a dead
+// member's index inherited the dead member's marks (a spurious override frozen at save), while a
+// deleted member restored onto a DIFFERENT index lost its own. Marks are keyed by the packed entity
+// and travel in the snapshot.
+describe('override marks across respawn (#868)', () => {
+  afterEach(async () => { (await import('../../src/runtime/loaders/overrideMarks')).clearAllOverrideMarks(); });
+  const spawnMember = (name: string, rootInstanceId = 0) => {
+    const e = testWorld.spawn(
+      Transform({}), EntityAttributes({ name }),
+      PrefabInstance({ source: 'p.prefab.json', localId: 1, rootInstanceId, parentLocalId: 0 }),
+    );
+    entityIndex.set(e.id(), e);
+    return e;
+  };
+
+  it('a respawn onto a dead member\'s index does not inherit that member\'s marks', async () => {
+    const { snapshotEntity, respawnFromSnapshot } = await getModule();
+    const { markOverride, getOverrideMarkSet } = await import('../../src/runtime/loaders/overrideMarks');
+    const source = spawnMember('Unmarked');
+    const dead = spawnMember('Marked');
+    markOverride(dead, 'Transform', 'x');
+    const snapshot = snapshotEntity(source.id())!;
+
+    entityIndex.delete(dead.id());
+    dead.destroy();
+    const newId = respawnFromSnapshot(snapshot);
+    expect(newId).toBe(dead.id());
+
+    expect(getOverrideMarkSet(entityIndex.get(newId))).toBeUndefined();
+  });
+
+  it('a respawn whose packed value wrapped around to a dead member\'s gets no marks (8-bit generation)', async () => {
+    const { snapshotEntity, respawnFromSnapshot } = await getModule();
+    const { markOverride, getOverrideMarkSet } = await import('../../src/runtime/loaders/overrideMarks');
+    const source = spawnMember('Unmarked');
+    const snapshot = snapshotEntity(source.id())!;
+    entityIndex.delete(source.id()); source.destroy();
+    const dead = spawnMember('Marked');
+    const deadPacked = dead.valueOf();
+    markOverride(dead, 'Transform', 'x');
+    entityIndex.delete(dead.id()); dead.destroy();
+
+    // koota's generation is 8 bits: 255 more spawn/destroy cycles on the index bring the next spawn
+    // back to the dead member's exact packed value.
+    for (let i = 0; i < 255; i++) testWorld.spawn().destroy();
+    const newId = respawnFromSnapshot(snapshot);
+    expect(entityIndex.get(newId).valueOf()).toBe(deadPacked);
+
+    expect(getOverrideMarkSet(entityIndex.get(newId))).toBeUndefined();
+  });
+
+  it('duplicating a marked instance root gives the copy the same marks', async () => {
+    const { duplicateEntity } = await getModule();
+    const { markOverride, getOverrideMarkSet } = await import('../../src/runtime/loaders/overrideMarks');
+    const root = testWorld.spawn(
+      Transform({}), EntityAttributes({ name: 'Root' }),
+      PrefabInstance({ source: 'p.prefab.json', localId: 1, rootInstanceId: 0, parentLocalId: 0 }),
+    );
+    entityIndex.set(root.id(), root);
+    root.set(PrefabInstance, { rootInstanceId: root.id() });
+    markOverride(root, 'Transform', 'x');
+
+    const newId = duplicateEntity(root.id(), vi.fn())!;
+    expect(newId).not.toBe(root.id());
+
+    expect([...(getOverrideMarkSet(entityIndex.get(newId)) ?? [])]).toEqual(['Transform.x']);
+  });
+
+  it('delete + undo restores a member\'s marks even when another spawn took its index meanwhile', async () => {
+    const { deleteEntityWithUndo } = await getModule();
+    const { markOverride, getOverrideMarkSet } = await import('../../src/runtime/loaders/overrideMarks');
+    const member = spawnMember('Member');
+    const memberId = member.id();
+    markOverride(member, 'Transform', 'x');
+
+    deleteEntityWithUndo(memberId);
+    const squatter = spawnEntity('Squatter');
+    expect(squatter.id()).toBe(memberId);
+    pushedActions[0].undo();
+
+    let restored: any;
+    testWorld.query(EntityAttributes).updateEach(([ea], e) => { if (ea.name === 'Member') restored = e; });
+    expect(restored).toBeDefined();
+    expect([...(getOverrideMarkSet(restored) ?? [])]).toEqual(['Transform.x']);
+    expect(getOverrideMarkSet(squatter)).toBeUndefined();
+  });
+});

@@ -137,6 +137,9 @@ const BASELINE: Record<string, string> = {
   // file that swallows it imports it directly. Deleting its registration left 71 tests green.
   'engine/packages/modoki/src/editor/store/canvas2DDirty.ts':
     'engine/packages/modoki/tests/editor/canvas2DDirty.test.ts',
+  // #868 Group C: the world-swap clear of worldTransforms / deactivatedEntities.
+  'engine/packages/modoki/src/runtime/core/ecs/transformPropagationSystem.ts':
+    'engine/packages/modoki/tests/runtime/transformPropagationIdReuse.test.ts',
 };
 
 /* ⚠️ **No ALLOWLIST (#1140).** "Producers whose teardown a test swallows and which owe NO wiring test"

@@ -3,7 +3,9 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { onWorldSwap, getCurrentWorld } from '../../runtime/core/ecs/world';
 import { getAllTraits, getTraitByName, COMPONENT_CATEGORY_ORDER } from '../../runtime/core/ecs/traitRegistry';
-import { getAllEntities, buildEntityTree, deleteEntity, onStructureDirtyCoalesced, getStructureVersion, writeTraitField, readTraitData, subtreeIds, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
+import { getAllEntities, buildEntityTree, deleteEntity, onStructureDirtyCoalesced, getStructureVersion, writeTraitField, readTraitData, subtreeIds, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
+import { pinEntityAt, livePinnedId, type EntityPin } from '../../runtime/core/ecs/entityPin';
+import { renameCommitTarget } from './renamePin';
 import { compareSiblings } from '../../runtime/core/ecs/entityOrder';
 import { flattenVisibleIds, rangeBetween } from './hierarchySelection';
 import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, snapshotEntity, respawnFromSnapshot, regenerateSnapshotGuids, classifyPrefabDuplicate, stripPrefabInstanceFromSnapshot, reRootPrefabInstanceSubtree, moveEntityToScene, type EntitySnapshot } from '../undo/entityActions';
@@ -921,8 +923,16 @@ export default function Hierarchy() {
 
   // Context menu
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; entity: EntityInfo } | null>(null);
-  // Inline rename — id of the entity whose name field is currently editable
-  const [renamingId, setRenamingId] = useState<number | null>(null);
+  // Inline rename — the entity whose name field is currently editable. PINNED, not a bare id (#868):
+  // delete that entity and let another spawn take its index, and a bare id would open the newcomer's
+  // row in rename mode and commit the typed name onto it. Resolved every render; a gone pin is null.
+  const [renamingPin, setRenamingPin] = useState<EntityPin | null>(null);
+  const renamingId = livePinnedId(renamingPin, findEntity, getCurrentWorld());
+  const renamingPinRef = useRef(renamingPin);
+  renamingPinRef.current = renamingPin;
+  const setRenamingId = useCallback((id: number | null) => {
+    setRenamingPin(id === null ? null : pinEntityAt(id, findEntity, getCurrentWorld()));
+  }, []);
 
   const handleContextMenu = useCallback((e: React.MouseEvent, entity: EntityInfo) => {
     e.preventDefault();
@@ -966,9 +976,11 @@ export default function Hierarchy() {
   }, []);
 
   const commitRename = useCallback((id: number, name: string) => {
+    const target = renameCommitTarget(renamingPinRef.current, id, findEntity, getCurrentWorld());
     setRenamingId(null);
+    if (target === null) return; // the entity being renamed is gone — never write onto its index's next owner
     const eaMeta = getAllTraits().find((t) => t.name === 'EntityAttributes');
-    if (eaMeta) writeTraitFieldWithUndo(id, eaMeta, 'name', name);
+    if (eaMeta) writeTraitFieldWithUndo(target, eaMeta, 'name', name);
   }, []);
 
   const cancelRename = useCallback(() => setRenamingId(null), []);

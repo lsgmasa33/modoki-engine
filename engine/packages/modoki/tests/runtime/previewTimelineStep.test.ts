@@ -109,11 +109,11 @@ describe('previewTimelineStep', () => {
     // Forward-preview across the particle clip START (1.0) and PAUSE mid-span (t=1.5) — the emitter is
     // left running. Drain the restart the render layer would consume.
     previewTimelineStep(tw.world, root.id(), def, 0, 1.5, { justStarted: true });
-    expect(takeParticleControl(emitter.id())).toBe('restart');
+    expect(takeParticleControl(emitter)).toBe('restart');
 
     // SCRUB out of the span. Before C8, previewTimelineStep wiped the reflect memory every forward step,
     // so the scrub read 'off' and never paused the still-running emitter. Now it pauses it.
     previewControlAt(tw.world, root.id(), def, 3.5);
-    expect(takeParticleControl(emitter.id())).toBe('pause');
+    expect(takeParticleControl(emitter)).toBe('pause');
   });
 });

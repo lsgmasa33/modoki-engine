@@ -103,7 +103,7 @@ interface PhysicsWorldState3D {
   eventQueue: REventQueue;
   bodies: Map<number, BodyRec3D>;   // keyed by ENTITY id
   soloColliders: Map<number, SoloColliderRec>; // keyed by ENTITY id — parentless fixed colliders
-  colliders: Map<number, { entityId: number; entity: Entity; isSensor: boolean; bodyEntityId: number }>; // keyed by collider handle
+  colliders: Map<number, { entityId: number; entity: Entity; isSensor: boolean; bodyPacked: number }>; // keyed by collider handle
   joints: Map<number, JointRec3D>;  // keyed by joint-entity id
   charCtrl?: RCharCtrl;             // shared kinematic character controller, lazily created
   charCfg?: { skin: number; climb: number; slide: number; autoH: number; autoW: number; snap: number };
@@ -456,7 +456,7 @@ function makeColliderDesc(st: PhysicsWorldState3D, c: ColData3, upm: number, ent
  *  the shape was invalid). */
 function attachCollider(
   st: PhysicsWorldState3D,
-  body: RRigidBody, bodyEntityId: number,   // the OWNING body's entity id (for Percept roll-up)
+  body: RRigidBody, bodyPacked: number,   // the OWNING body's PACKED entity (Percept roll-up; generation-carrying, #868)
   colliderEntity: Entity, cfg: PhysicsConfig3D,
   offset: { x: number; y: number; z: number; rx: number; ry: number; rz: number } | null,
   sx = 1, sy = 1, sz = 1,   // collider entity's WORLD scale → collider EXTENTS (P2 scale threading)
@@ -476,7 +476,7 @@ function attachCollider(
       .setActiveEvents(R.ActiveEvents.COLLISION_EVENTS);
     if (offset && offQuat) cd.setTranslation(offset.x, offset.y, offset.z).setRotation(offQuat);
     const col = st.world.createCollider(cd, body);
-    st.colliders.set(col.handle, { entityId: colliderEntity.id(), entity: colliderEntity, isSensor: !!c.isSensor, bodyEntityId });
+    st.colliders.set(col.handle, { entityId: colliderEntity.id(), entity: colliderEntity, isSensor: !!c.isSensor, bodyPacked });
     handles.push(col.handle);
   }
   return handles;
@@ -528,7 +528,7 @@ function createBody(
   const bw = worldScaleOf(entity);
   const bodySx = bw.sx, bodySy = bw.sy, bodySz = bw.sz;   // capture — worldScaleOf returns a shared singleton
   if (entity.has(Collider3D)) {
-    colliderHandles.push(...attachCollider(st, body, entityId, entity, cfg, null, bodySx, bodySy, bodySz));
+    colliderHandles.push(...attachCollider(st, body, entity.valueOf(), entity, cfg, null, bodySx, bodySy, bodySz));
   }
   // Compound: each child collider at its body-LOCAL Transform offset (scaled by the BODY's world
   // scale — the child's local offset lives in the parent's scaled frame); child EXTENTS use the
@@ -537,7 +537,7 @@ function createBody(
     const ctf = child.get(Transform) as TfData3 | undefined;
     const off = ctf ? vecEcsToPhys(ctf.x * bodySx, ctf.y * bodySy, ctf.z * bodySz, cfg.upm) : { x: 0, y: 0, z: 0 };
     const cw = worldScaleOf(child);
-    colliderHandles.push(...attachCollider(st, body, entityId, child, cfg, {
+    colliderHandles.push(...attachCollider(st, body, entity.valueOf(), child, cfg, {
       x: off.x, y: off.y, z: off.z,
       rx: ctf ? ctf.rx : 0, ry: ctf ? ctf.ry : 0, rz: ctf ? ctf.rz : 0,
     }, cw.sx, cw.sy, cw.sz));
@@ -606,7 +606,7 @@ function attachSoloCollider(st: PhysicsWorldState3D, colliderEntity: Entity, cfg
       .setActiveEvents(R.ActiveEvents.COLLISION_EVENTS)
       .setTranslation(pos.x, pos.y, pos.z).setRotation(quat);
     const col = st.world.createCollider(cd);   // no parent body ⇒ Rapier treats it as fixed
-    st.colliders.set(col.handle, { entityId: colliderEntity.id(), entity: colliderEntity, isSensor: !!c.isSensor, bodyEntityId: colliderEntity.id() });
+    st.colliders.set(col.handle, { entityId: colliderEntity.id(), entity: colliderEntity, isSensor: !!c.isSensor, bodyPacked: colliderEntity.valueOf() });
     handles.push(col.handle);
   }
   return handles;
@@ -1245,7 +1245,7 @@ function bodyFor(world: World, entity: Entity): RRigidBody | null {
   const st = worlds.get(world);
   if (!st) return null;
   const rec = st.bodies.get(entity.id());
-  if (!rec) return null;
+  if (!rec || rec.entityGen !== entity.generation()) return null;
   return st.world.getRigidBody(rec.bodyHandle) ?? null;
 }
 
@@ -1255,7 +1255,7 @@ function bodyAndUpm(world: World, entity: Entity): { body: RRigidBody; upm: numb
   const st = worlds.get(world);
   if (!st) return null;
   const rec = st.bodies.get(entity.id());
-  if (!rec) return null;
+  if (!rec || rec.entityGen !== entity.generation()) return null;
   const body = st.world.getRigidBody(rec.bodyHandle);
   return body ? { body, upm: st.upm } : null;
 }

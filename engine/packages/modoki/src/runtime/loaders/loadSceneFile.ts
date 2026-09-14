@@ -150,7 +150,8 @@ export interface LoadSceneOptions {
    *  every chain + carry call. Left `true` by default so every other caller (tests,
    *  and any future single-scene caller) keeps byte-identical behaviour — per-entity
    *  hygiene against id reuse is independent of this flag and always runs
-   *  (`clearOverrideMarks(entity.id())` on each fresh spawn, below). */
+   *  (`clearOverrideMarks(entity)` on each fresh spawn, below — still needed with the packed key,
+   *  because koota's 8-bit generation wraps; see overrideMarks.ts). */
   clearMarks?: boolean;
 }
 
@@ -446,7 +447,7 @@ export function applyOverridesByLocalToEcs(
       if (meta.category === 'tag') {
         // Added-tag override: the instance carries a tag the prefab lacks here.
         if (!entity.has(meta.trait)) entity.add(meta.trait);
-        markOverride(ecsId, traitName, '');
+        markOverride(entity as unknown as Entity, traitName, '');
         continue;
       }
       // Accept any field the trait PERSISTS — its koota schema, not the meta.fields
@@ -473,7 +474,7 @@ export function applyOverridesByLocalToEcs(
       // Seed an explicit mark from the file's override map: each accepted field is a
       // recorded override and must survive serialize even if it later coincides
       // with the prefab base. See overrideMarks.ts.
-      for (const field of accepted) markOverride(ecsId, traitName, field);
+      for (const field of accepted) markOverride(entity as unknown as Entity, traitName, field);
       if (!has) {
         // Added-trait override: the instance carries a trait the prefab lacks at
         // this localId. Add the whole trait rather than dropping it on the floor.
@@ -881,7 +882,7 @@ export function instantiatePrefabIntoWorld(
     }
     if (traitArgs.length > 0) {
       const entity = spawnEntity(world, ...traitArgs as Parameters<typeof world.spawn>);
-      clearOverrideMarks(entity.id()); // fresh member — drop stale marks on a reused id
+      clearOverrideMarks(entity); // the 8-bit generation wraps — see overrideMarks.ts
       const localId = entry.localId ?? 0;
       if (localId) localToEcs.set(localId, entity.id());
       ownMemberIds.push(entity.id());

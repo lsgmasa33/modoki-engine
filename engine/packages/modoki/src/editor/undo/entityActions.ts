@@ -12,7 +12,7 @@ import {
 } from '../../runtime/core/ecs/entityUtils';
 import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { newGuid } from '../../runtime/loaders/assetManifest';
-import { markOverride } from '../../runtime/loaders/overrideMarks';
+import { markOverride, getOverrideMarkSet, restoreOverrideMarks, clearOverrideMarks } from '../../runtime/loaders/overrideMarks';
 import { worldTransforms } from '../../runtime/core/ecs/transformPropagationSystem';
 import { decomposeTrs } from '../../runtime/core/ecs/decomposeTrs';
 import { pushAction, type EditDetail } from './undoManager';
@@ -32,7 +32,7 @@ export function markOverrideIfInstance(entityId: number, traitName: string, fiel
   const piMeta = getTraitByName('PrefabInstance');
   const entity = findEntity(entityId);
   if (!piMeta || !entity || !entity.has(piMeta.trait)) return;
-  markOverride(entityId, traitName, field);
+  markOverride(entity, traitName, field);
 }
 
 function markFieldOverrideIfInstance(entityId: number, meta: TraitMeta, field: string): void {
@@ -366,6 +366,9 @@ export interface EntitySnapshot {
   id: number;
   traits: { meta: TraitMeta; data: Record<string, unknown> | true }[];
   children: EntitySnapshot[];
+  /** The entity's prefab override marks ("Trait.field"), when it has any. Marks are keyed by the
+   *  packed entity (#868), so a respawn gets them only from here — see overrideMarks.ts. */
+  marks?: string[];
 }
 
 export function snapshotEntity(entityId: number): EntitySnapshot | null {
@@ -386,7 +389,8 @@ export function snapshotEntity(entityId: number): EntitySnapshot | null {
   }
   const childEntities = getAllEntities().filter(e => e.parentId === entityId);
   const children = childEntities.map(c => snapshotEntity(c.id)).filter((s): s is EntitySnapshot => s !== null);
-  return { id: entityId, traits, children };
+  const marks = getOverrideMarkSet(entity);
+  return marks && marks.size > 0 ? { id: entityId, traits, children, marks: [...marks] } : { id: entityId, traits, children };
 }
 
 /** Deep-clone a snapshot, assigning a FRESH EntityAttributes.guid to every entity
@@ -400,7 +404,7 @@ export function regenerateSnapshotGuids(snapshot: EntitySnapshot): EntitySnapsho
     if (t.data === true || t.meta.name !== 'EntityAttributes') return t;
     return { meta: t.meta, data: { ...t.data, guid: newGuid() } };
   });
-  return { id: snapshot.id, traits, children: snapshot.children.map(regenerateSnapshotGuids) };
+  return { ...snapshot, traits, children: snapshot.children.map(regenerateSnapshotGuids) };
 }
 
 /** How a duplicate/paste of a prefab-instance entity should be handled (prefab F1):
@@ -428,6 +432,7 @@ export function classifyPrefabDuplicate(snapshot: EntitySnapshot): 'none' | 'roo
  *  becomes a plain ADDED child of the instance (prefab F1, 'member' case). Must
  *  NOT touch the delete-undo restore path, which keeps instance linkage. */
 export function stripPrefabInstanceFromSnapshot(snapshot: EntitySnapshot): EntitySnapshot {
+  // No `marks` either: an override mark means something only on a PrefabInstance member.
   return {
     id: snapshot.id,
     traits: snapshot.traits.filter((t) => t.meta.name !== 'PrefabInstance'),
@@ -467,6 +472,9 @@ export function respawnFromSnapshot(snapshot: EntitySnapshot, newParentId: numbe
     }
   }
   const entity = spawnEntity(getCurrentWorld(), ...traitArgs);
+  // Clear first: the 8-bit generation wraps, so a dead member's marks can match this packed value.
+  clearOverrideMarks(entity);
+  if (snapshot.marks) restoreOverrideMarks(entity, snapshot.marks);
   const newId = entity.id();
   for (const child of snapshot.children) { respawnFromSnapshot(child, newId); }
   return newId;

@@ -11,7 +11,9 @@
 
 import { useEffect, useMemo, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from 'react';
 import { fillRootStyle } from '../tabLayout';
-import { getAllEntities, buildEntityTree, onStructureDirty, getStructureVersion, readTraitData, writeTraitField, type EntityInfo } from '../../core/ecs/entityUtils';
+import { getAllEntities, buildEntityTree, onStructureDirty, getStructureVersion, readTraitData, writeTraitField, findEntity, type EntityInfo } from '../../core/ecs/entityUtils';
+import { pinEntityAt, livePinnedId, type EntityPin } from '../../core/ecs/entityPin';
+import { getCurrentWorld, onWorldSwap } from '../../core/ecs/world';
 import { getTraitByName, type TraitMeta, type FieldHint } from '../../core/ecs/traitRegistry';
 
 const VALUE_REFRESH_MS = 250;
@@ -19,18 +21,31 @@ const layerColor: Record<string, string> = { '3d': '#7dd3fc', '2d': '#fca5a5', u
 
 export function WorldTab() {
   const structureVersion = useSyncExternalStore(onStructureDirty, getStructureVersion, getStructureVersion);
-  const [selectedId, setSelectedId] = useState<number | null>(null);
-  const [collapsed, setCollapsed] = useState<Set<number>>(() => new Set());
+  // Selection and collapse are PINNED to the entity, not held as its id (#868): the id is koota's
+  // recycled index, so a node deleted and replaced on the same index handed the newcomer its
+  // collapsed state and its place in the inspector — where an edit writes to it.
+  const [selectedPin, setSelectedPin] = useState<EntityPin | null>(null);
+  const [collapsedPins, setCollapsedPins] = useState<readonly EntityPin[]>([]);
   const [, setValueTick] = useState(0);
 
   // Rebuild the tree only when the world's structure changes.
   const tree = useMemo(() => buildEntityTree(getAllEntities()), [structureVersion]);
-  // Flat id set to detect a stale selection after a hot-reload / despawn.
-  const liveIds = useMemo(() => new Set(collectIds(tree)), [tree]);
+  const selectedId = selectedPin?.id ?? null;
+  const collapsed = useMemo(() => new Set(collapsedPins.map((pin) => pin.id)), [collapsedPins]);
 
+  // A promoted world marks nothing structure-dirty (SceneManager registers the incoming entities
+  // before the swap), so the prune below never sees it — drop every pin at the swap itself.
+  useEffect(() => onWorldSwap(() => { setSelectedPin(null); setCollapsedPins([]); }), []);
+
+  // The tree rebuilt: drop every pin whose entity is gone (a hot-reload / despawn), including one whose
+  // index a NEW entity now holds — that is the whole fix; the renders read the surviving pins' ids.
   useEffect(() => {
-    if (selectedId != null && !liveIds.has(selectedId)) setSelectedId(null);
-  }, [liveIds, selectedId]);
+    if (selectedPin && livePinnedId(selectedPin, findEntity, getCurrentWorld()) === null) setSelectedPin(null);
+    setCollapsedPins((prev) => {
+      const kept = prev.filter((pin) => livePinnedId(pin, findEntity, getCurrentWorld()) !== null);
+      return kept.length === prev.length ? prev : kept;
+    });
+  }, [tree, selectedPin]);
 
   // Refresh live trait values while a selection is open (cheap, off the frame loop).
   useEffect(() => {
@@ -39,12 +54,12 @@ export function WorldTab() {
     return () => window.clearInterval(id);
   }, [selectedId]);
 
+  const select = (id: number) => setSelectedPin(pinEntityAt(id, findEntity, getCurrentWorld()));
   const toggle = (id: number) =>
-    setCollapsed((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
+    setCollapsedPins((prev) => {
+      if (prev.some((pin) => pin.id === id)) return prev.filter((pin) => pin.id !== id);
+      const pin = pinEntityAt(id, findEntity, getCurrentWorld());
+      return pin ? [...prev, pin] : prev;
     });
 
   return (
@@ -63,7 +78,7 @@ export function WorldTab() {
               depth={0}
               selectedId={selectedId}
               collapsed={collapsed}
-              onSelect={setSelectedId}
+              onSelect={select}
               onToggle={toggle}
             />
           ))
@@ -74,15 +89,6 @@ export function WorldTab() {
   );
 }
 
-function collectIds(nodes: EntityInfo[]): number[] {
-  const out: number[] = [];
-  const walk = (n: EntityInfo) => {
-    out.push(n.id);
-    n.children?.forEach(walk);
-  };
-  nodes.forEach(walk);
-  return out;
-}
 
 function TreeNode({
   node,

@@ -170,11 +170,11 @@ describe('particle 2D/3D partition (exactly-one-path)', () => {
     sync2d.syncParticles2D(world, ctx, state2d, 0.016);
 
     // 2D pass handled ONLY the canvas child.
-    expect(state2d.recs.has(childEnt.id())).toBe(true);
-    expect(state2d.recs.has(bareEnt.id())).toBe(false);
+    expect(state2d.recs.hasId(childEnt.id())).toBe(true);
+    expect(state2d.recs.hasId(bareEnt.id())).toBe(false);
     expect(calls2d.create).toHaveLength(1);
     // Its wrapper was mounted into the canvas slot container.
-    const childRec = state2d.recs.get(childEnt.id())!;
+    const childRec = state2d.recs.peekId(childEnt.id())!;
     const wrapper = wrappers.get(childRec.handle.id)!;
     expect(wrapper.parent).toBe(slots.get(canvasId));
 
@@ -184,14 +184,14 @@ describe('particle 2D/3D partition (exactly-one-path)', () => {
     sync3d.syncParticles(world, scene, state3d, 0.016);
 
     // 3D pass handled ONLY the bare emitter (the canvas child is skipped by its own route build).
-    expect(state3d.recs.has(bareEnt.id())).toBe(true);
-    expect(state3d.recs.has(childEnt.id())).toBe(false);
+    expect(state3d.recs.hasId(bareEnt.id())).toBe(true);
+    expect(state3d.recs.hasId(childEnt.id())).toBe(false);
     expect(calls3d.create).toHaveLength(1);
     expect(calls3d.update).toHaveLength(1);
 
     // ── The partition invariant: disjoint rec maps whose union is every emitter ──
-    const ids2d = new Set(state2d.recs.keys());
-    const ids3d = new Set(state3d.recs.keys());
+    const ids2d = new Set(state2d.recs.ids());
+    const ids3d = new Set(state3d.recs.ids());
     const overlap = [...ids2d].filter((id) => ids3d.has(id));
     expect(overlap).toEqual([]); // no emitter in BOTH passes
 

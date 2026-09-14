@@ -561,6 +561,7 @@ describe('scene3DSync', () => {
       }));
       return {
         isSkinnedMesh: false,
+        removeFromParent: vi.fn(),
         traverse(cb: (o: unknown) => void) { cb(this); children.forEach((c) => c.traverse(cb)); },
       } as unknown as import('three').Object3D;
     }
@@ -575,13 +576,16 @@ describe('scene3DSync', () => {
       const mixer = { stopAllAction: vi.fn(), uncacheRoot: vi.fn() } as any;
       const root = fakeSkinnedRoot([skA, skB]);
       const scene = { remove: vi.fn() } as any;
-      state.skinned.set(7, { modelRef: 'm.glb', root, mixer, actions: new Map(), firstClip: '', bones: new Map(), nodes: new Map() });
+      const { createWorld } = await import('koota');
+      const kw = createWorld();
+      state.skinned.set(kw.spawn(), { modelRef: 'm.glb', root, mixer, actions: new Map(), firstClip: '', bones: new Map(), nodes: new Map() } as SkinnedEntry);
 
       disposeRenderState(state, scene);
+      kw.destroy();
 
       expect(mixer.stopAllAction).toHaveBeenCalled();
       expect(mixer.uncacheRoot).toHaveBeenCalledWith(root);
-      expect(scene.remove).toHaveBeenCalledWith(root);
+      expect(root.removeFromParent).toHaveBeenCalled();
       expect(skA.dispose).toHaveBeenCalledTimes(1); // the leak guard
       expect(skB.dispose).toHaveBeenCalledTimes(1);
       expect(state.skinned.size).toBe(0);

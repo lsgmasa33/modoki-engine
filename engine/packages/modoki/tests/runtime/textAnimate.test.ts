@@ -3,7 +3,7 @@
  *  jitter. No DOM/renderer needed. */
 
 import { describe, it, expect } from 'vitest';
-import { applyTextAnimation, isTextAnimating, isColorEffect, type TextAnimParams } from '../../src/runtime/rendering/text/textAnimate';
+import { applyTextAnimation, isTextAnimating, isColorEffect, textAnimElapsed, type TextAnimParams, type TextAnimClock } from '../../src/runtime/rendering/text/textAnimate';
 import type { TextQuad } from '../../src/runtime/rendering/text/layoutText';
 
 // Four unit-square glyph quads at x = 0,10,20,30 (px), page 0.
@@ -109,5 +109,39 @@ describe('textAnimate', () => {
       expect(Math.abs(q.x0 - i * 10)).toBeLessThanOrEqual(bound + 1e-6);
       expect(Math.abs(q.y0 - 0)).toBeLessThanOrEqual(bound + 1e-6);
     });
+  });
+});
+
+describe('textAnimElapsed — the per-entity animation clock (#868)', () => {
+  it('restarts on activation, on an effect switch, and when a DIFFERENT entity now owns the slot', async () => {
+    const { createWorld } = await import('koota');
+    const world = createWorld();
+    try {
+      const clock: TextAnimClock = {};
+      const a = world.spawn();
+      // Activation at t=10 starts the clock; the renderer then latches wasMotion.
+      expect(textAnimElapsed(clock, true, 'typewriter', a.valueOf(), 10)).toBe(0);
+      clock.wasMotion = true;
+      expect(textAnimElapsed(clock, true, 'typewriter', a.valueOf(), 13)).toBe(3);
+      // Effect switch restarts.
+      expect(textAnimElapsed(clock, true, 'wave', a.valueOf(), 14)).toBe(0);
+      expect(textAnimElapsed(clock, true, 'wave', a.valueOf(), 15)).toBe(1);
+
+      // A respawn on the same index with the same effect: the renderer's slot still has the dead
+      // text's clock and `wasMotion`. It must start from 0, not continue at 3s in.
+      a.destroy();
+      const b = world.spawn();
+      expect(b.id()).toBe(a.id());
+      expect(b.valueOf()).not.toBe(a.valueOf());
+      expect(textAnimElapsed(clock, true, 'wave', b.valueOf(), 18)).toBe(0);
+      expect(textAnimElapsed(clock, true, 'wave', b.valueOf(), 19)).toBe(1);
+
+      // Inactive: 0, and the effect memory clears so re-activation restarts.
+      expect(textAnimElapsed(clock, false, 'wave', b.valueOf(), 20)).toBe(0);
+      clock.wasMotion = false;
+      expect(textAnimElapsed(clock, true, 'wave', b.valueOf(), 25)).toBe(0);
+    } finally {
+      world.destroy();
+    }
   });
 });

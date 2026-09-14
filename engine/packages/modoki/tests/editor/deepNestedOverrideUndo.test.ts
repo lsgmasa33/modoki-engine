@@ -150,12 +150,12 @@ describe('Missing Test 6 — deep-nested override + per-field edit + undo (real 
     // mark the override, with an undo that restores the prior value + clears the mark.
     const prior = 0;
     const next = 7;
-    const doEdit = () => { writeTraitFieldImpl(a, TRAITS[0], 'x', next); markOverride(a, 'Transform', 'x'); };
+    const doEdit = () => { writeTraitFieldImpl(a, TRAITS[0], 'x', next); markOverride(index.get(a), 'Transform', 'x'); };
     doEdit();
     pushAction({
       label: 'Edit A1.Transform.x',
-      redo: () => { writeTraitFieldImpl(a, TRAITS[0], 'x', next); markOverride(a, 'Transform', 'x'); },
-      undo: () => { writeTraitFieldImpl(a, TRAITS[0], 'x', prior); clearOverrideMarks(a); },
+      redo: () => { writeTraitFieldImpl(a, TRAITS[0], 'x', next); markOverride(index.get(a), 'Transform', 'x'); },
+      undo: () => { writeTraitFieldImpl(a, TRAITS[0], 'x', prior); clearOverrideMarks(index.get(a)); },
     });
 
     // After the edit: deep override serializes onto D's path "2.2".

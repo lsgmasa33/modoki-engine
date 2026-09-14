@@ -14,7 +14,11 @@
  *  identity, the part topology, the skin matrices and the deform version — so an inherited entry
  *  is either re-derived or found stale and rebuilt. It is never TRUSTED as "this is still my
  *  entity" the way `videoSystem`'s live decoder handle was. Break that (add a cache entry whose
- *  freshness check is not recomputed per frame) and these tests are what notices. */
+ *  freshness check is not recomputed per frame) and these tests are what notices.
+ *
+ *  The two REGISTRIES this system shares with other modules are the exception (#868): the buffer is
+ *  read by renderers before any revalidation, and the deform epoch does not advance while paused. Both
+ *  are evicted at destroy — the last three tests. */
 
 import { describe, it, expect, afterEach } from 'vitest';
 import '../../src/runtime/loaders/registerProviders';
@@ -23,6 +27,9 @@ import { Transform, SkinnedSprite2D, Bone2D, EntityAttributes } from '../../src/
 import { skin2DSystem } from '../../src/runtime/skinning/skin2DSystem';
 import { getSkin2DBuffer, clearSkin2DBuffers } from '../../src/runtime/skinning/skin2DBuffers';
 import { setRig2D, clearRig2DCache } from '../../src/runtime/loaders/rig2dCache';
+import { beginDeform2DFrame, setDeform2D, clearDeform2DBuffers } from '../../src/runtime/animation/deform2DBuffers';
+import { applyClipDeform } from '../../src/runtime/animation/deform2DSystem';
+import type { AnimationClipDef } from '../../src/runtime/animation/types';
 
 // Two bones, 'root' at the origin and 'arm' at (10,0) under it; the quad's verts run down the arm
 // so a rotation of 'arm' visibly moves v1..v3 and leaves v0 alone.
@@ -43,7 +50,7 @@ const rigDef = {
 };
 
 let world: ReturnType<typeof createWorld> | undefined;
-afterEach(() => { world?.destroy(); world = undefined; clearSkin2DBuffers(); clearRig2DCache(); });
+afterEach(() => { world?.destroy(); world = undefined; clearSkin2DBuffers(); clearRig2DCache(); clearDeform2DBuffers(); });
 
 /** A skinned root plus its two bone entities, with `arm` rotated by `armRot` radians. */
 function spawnRig(armRot: number) {
@@ -121,5 +128,73 @@ describe('skin2DSystem — recycled entity index', () => {
 
     expect(getSkin2DBuffer(b.id())!.parts[0].positions).toHaveLength(6); // 3 verts — rebuilt
     expect(posOf(b.id())).toEqual([0, 0, 5, 0, 5, 5]);
+  });
+
+  // ── #868 Group C: the two id-keyed REGISTRIES are read before any revalidation runs ──
+  // The invariant above covers skin2DSystem's own caches. `skin2DBuffers` is also read OUT of the
+  // system (Scene2D, the SceneView preview) and `deform2DBuffers` is revalidated only by an epoch
+  // that does not advance while animation is paused — so both are evicted the moment the entity
+  // that owns an entry is destroyed.
+
+  const BIND = [0, 0, 10, 0, 20, 0, 20, 10];
+
+  it('#868: a dead root\'s buffer is gone at destroy, before the next skin pass can rebuild it', () => {
+    clearRig2DCache(); clearSkin2DBuffers();
+    setRig2D(RIG, rigDef);
+    world = createWorld();
+
+    const a = world.spawn(Transform(), SkinnedSprite2D({ rig: RIG }));
+    skin2DSystem(world);
+    expect(getSkin2DBuffer(a.id())).toBeDefined();
+
+    a.destroy();
+    const b = world.spawn(Transform(), SkinnedSprite2D({ rig: RIG }));
+    expect(b.id()).toBe(a.id());
+    expect(b.valueOf()).not.toBe(a.valueOf());
+
+    // Scene2D reads this between frames; the dead rig's buffer must not answer for `b`.
+    expect(getSkin2DBuffer(b.id())).toBeUndefined();
+    skin2DSystem(world);
+    expect(posOf(b.id())).toEqual(BIND);
+  });
+
+  it('#868: a same-rig respawn while paused is not baked with the dead root\'s deform offsets', () => {
+    clearRig2DCache(); clearSkin2DBuffers();
+    setRig2D(RIG, rigDef);
+    world = createWorld();
+
+    const a = world.spawn(Transform(), SkinnedSprite2D({ rig: RIG }), EntityAttributes({ guid: 'a' }));
+    skin2DSystem(world);
+    beginDeform2DFrame();
+    setDeform2D(a.id(), 'main', new Float32Array([9, 9, 9, 9, 9, 9, 9, 9]));
+    skin2DSystem(world);
+    expect(posOf(a.id())[0]).toBe(9);
+
+    a.destroy();
+    const b = world.spawn(Transform(), SkinnedSprite2D({ rig: RIG }), EntityAttributes({ guid: 'b' }));
+    expect(b.id()).toBe(a.id());
+
+    // No beginDeform2DFrame(): animation does not run while paused, so `a`'s entry stays current.
+    skin2DSystem(world);
+    expect(posOf(b.id())).toEqual(BIND);
+  });
+
+  it('#868: a deform written before any skin pass in this world is still evicted at destroy', () => {
+    clearRig2DCache(); clearSkin2DBuffers();
+    setRig2D(RIG, rigDef);
+    world = createWorld();
+
+    const a = world.spawn(Transform(), SkinnedSprite2D({ rig: RIG }), EntityAttributes({ guid: 'a' }));
+    const clip = {
+      deformTracks: [{ path: '', part: 'main', keys: [{ t: 0, offsets: [9, 9, 9, 9, 9, 9, 9, 9] }] }],
+    } as unknown as AnimationClipDef;
+    expect(applyClipDeform(world, a.id(), clip, 0)).toBe(1);
+
+    a.destroy();
+    const b = world.spawn(Transform(), SkinnedSprite2D({ rig: RIG }), EntityAttributes({ guid: 'b' }));
+    expect(b.id()).toBe(a.id());
+
+    skin2DSystem(world);
+    expect(posOf(b.id())).toEqual(BIND);
   });
 });

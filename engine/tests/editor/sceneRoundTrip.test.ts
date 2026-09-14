@@ -10,7 +10,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { createWorld } from 'koota';
 import {
   getCurrentWorld, setCurrentWorld, getAllEntities, readTraitData, readTraitDataFull,
-  findEntity, getTraitByName, spawnEntity,
+  findEntity, findEntityById, getTraitByName, spawnEntity,
   writeTraitField, deleteEntity, loadSceneFile, instantiatePrefabIntoWorld, markOverride, type SceneData,
   SCENE_FORMAT_VERSION,
 } from '@modoki/engine/runtime';
@@ -174,7 +174,7 @@ describe('prefab instance round-trip', () => {
     // Override the child's x (prefab base is 5) — mark it as the editor does.
     const childId = childOfRoot(rootId);
     writeTraitField(childId, getTraitByName('Transform')!, 'x', 99);
-    markOverride(childId, 'Transform', 'x');
+    markOverride(findEntityById(childId)!, 'Transform', 'x');
 
     const scene = await serializeScene();
     const rootEntry = scene.entities.find(e => e.name === 'PRoot');
@@ -222,7 +222,7 @@ describe('prefab instance round-trip', () => {
     setPrefabSource(rootId, SOURCE);
     const childId = childOfRoot(rootId);
     writeTraitField(childId, getTraitByName('Transform')!, 'x', 99);
-    markOverride(childId, 'Transform', 'x');
+    markOverride(findEntityById(childId)!, 'Transform', 'x');
 
     const scene = await serializeScene();
     await reloadInFreshWorld(scene, async (s) => (s === SOURCE ? makePrefab() : null));
@@ -327,8 +327,8 @@ describe('prefab override over a schema field with no Inspector row (integration
     const animator = getTraitByName('Animator')!;
     writeTraitField(rootId, animator, 'clips', BANK);
     writeTraitField(rootId, animator, 'clip', 'skin');
-    markOverride(rootId, 'Animator', 'clips');
-    markOverride(rootId, 'Animator', 'clip');
+    markOverride(findEntityById(rootId)!, 'Animator', 'clips');
+    markOverride(findEntityById(rootId)!, 'Animator', 'clip');
 
     const scene = await serializeScene();
     const entry = scene.entities.find((e) => e.prefab === SOURCE);
@@ -342,8 +342,8 @@ describe('prefab override over a schema field with no Inspector row (integration
     const animator = getTraitByName('Animator')!;
     writeTraitField(rootId, animator, 'clips', BANK);
     writeTraitField(rootId, animator, 'clip', 'skin');
-    markOverride(rootId, 'Animator', 'clips');
-    markOverride(rootId, 'Animator', 'clip');
+    markOverride(findEntityById(rootId)!, 'Animator', 'clips');
+    markOverride(findEntityById(rootId)!, 'Animator', 'clip');
 
     const scene = await serializeScene();
     await reloadInFreshWorld(scene, async (s) => (s === SOURCE ? makePrefab() : null));
@@ -361,8 +361,8 @@ describe('prefab override over a schema field with no Inspector row (integration
     const animator = getTraitByName('Animator')!;
     writeTraitField(rootId, animator, 'clips', BANK);
     writeTraitField(rootId, animator, 'clip', 'skin');
-    markOverride(rootId, 'Animator', 'clips');
-    markOverride(rootId, 'Animator', 'clip');
+    markOverride(findEntityById(rootId)!, 'Animator', 'clips');
+    markOverride(findEntityById(rootId)!, 'Animator', 'clip');
 
     const once = await serializeScene();
     await reloadInFreshWorld(once, async (s) => (s === SOURCE ? makePrefab() : null));
@@ -382,8 +382,8 @@ describe('prefab override over a schema field with no Inspector row (integration
     // exclusion is at the READ and no later path can resurrect it.
     writeTraitField(rootId, animator, 'activeClip', 'skin');
     writeTraitField(rootId, animator, 'fadeElapsed', 0.25);
-    markOverride(rootId, 'Animator', 'activeClip');
-    markOverride(rootId, 'Animator', 'fadeElapsed');
+    markOverride(findEntityById(rootId)!, 'Animator', 'activeClip');
+    markOverride(findEntityById(rootId)!, 'Animator', 'fadeElapsed');
 
     const scene = await serializeScene();
     const entry = scene.entities.find((e) => e.prefab === SOURCE);

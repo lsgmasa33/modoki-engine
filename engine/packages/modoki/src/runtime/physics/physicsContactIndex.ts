@@ -40,8 +40,9 @@
  *  stateless @collision/@sensor sinks also don't re-balance across a mid-contact toggle);
  *  a full fix would need per-collider-pair classification, not worth it for this edge. */
 
-import type { World } from 'koota';
+import type { Entity, World } from 'koota';
 import { onWorldSwap } from '../core/ecs/world';
+import { isPackedAlive } from '../core/ecs/entityTable';
 import { getPlayState, onPlayStateChange } from '../core/playState';
 
 // REFCOUNTED (not a plain Set): contacts fire per COLLIDER pair, but we roll up to
@@ -50,27 +51,43 @@ import { getPlayState, onPlayStateChange } from '../core/playState';
 // the ground). A Set would drop the whole body pair the moment the FIRST collider lifts,
 // falsely reporting "no longer touching" while another collider still does. So each
 // other-body maps to a COUNT of active collider pairs; it's present while count > 0.
-interface BodyContacts { contacts: Map<number, number>; overlaps: Map<number, number>; }
+//
+// STAMPED WITH THE PACKED ENTITY (#868). Keys stay the body's `id()` — `dropEntityFromContactIndex`
+// and the Percept read both address by id — but each body entry and each partner count carries the
+// packed (generation-carrying) entity it was recorded for. Removal is exact once the reconcile runs,
+// but a despawn+respawn landing before that tick (unbounded while paused) put the reclaimed index
+// on both sides of a stale pair: the newcomer read as touching the dead body's partners, and a
+// partner's id resolved to the newcomer's GUID. `getContactState` now drops any entry whose
+// recorded entity is no longer alive.
+interface PartnerCount { n: number; packed: number }
+interface BodyContacts { packed: number; contacts: Map<number, PartnerCount>; overlaps: Map<number, PartnerCount>; }
 
 // Per-world: bodyEntityId → its current contact/overlap counters. A regular Map (not Weak):
 // cleared explicitly on the same lifecycle events the physics world itself is (scene swap,
 // Play→Stop) so it can't outlive its world's entity ids.
 const index = new Map<World, Map<number, BodyContacts>>();
 
-function bucketFor(world: World, body: number): BodyContacts {
+const idOf = (packed: number): number => (packed as unknown as Entity).id();
+
+function bucketFor(world: World, bodyPacked: number): BodyContacts {
   let wm = index.get(world);
   if (!wm) { wm = new Map(); index.set(world, wm); }
+  const body = idOf(bodyPacked);
   let b = wm.get(body);
-  if (!b) { b = { contacts: new Map(), overlaps: new Map() }; wm.set(body, b); }
+  if (!b) { b = { packed: bodyPacked, contacts: new Map(), overlaps: new Map() }; wm.set(body, b); }
+  else b.packed = bodyPacked;
   return b;
 }
 
-function bump(counts: Map<number, number>, other: number): void {
-  counts.set(other, (counts.get(other) ?? 0) + 1);
+function bump(counts: Map<number, PartnerCount>, otherPacked: number): void {
+  const other = idOf(otherPacked);
+  const c = counts.get(other);
+  counts.set(other, { n: (c?.n ?? 0) + 1, packed: otherPacked });
 }
-function drop(counts: Map<number, number>, other: number): void {
-  const n = (counts.get(other) ?? 0) - 1;
-  if (n <= 0) counts.delete(other); else counts.set(other, n);
+function drop(counts: Map<number, PartnerCount>, other: number): void {
+  const c = counts.get(other);
+  if (!c) return;
+  if (c.n <= 1) counts.delete(other); else c.n--;
 }
 
 /** Drop a body's entry if it now holds no contacts AND no overlaps (keep the index tight). */
@@ -82,7 +99,8 @@ function pruneIfEmpty(wm: Map<number, BodyContacts>, body: number): void {
 /** Add (enter) or remove (exit) ONE rolled-up body pair. `sensor` picks the `overlaps`
  *  counter (a sensor/trigger overlap) vs `contacts` (a solid, load-bearing contact).
  *  Symmetric — each body counts the other. Callers must have already excluded self-pairs
- *  (a===b). Refcounted so multiple collider pairs between the same two bodies coexist. */
+ *  (a===b). Refcounted so multiple collider pairs between the same two bodies coexist.
+ *  `a`/`b` are the bodies' PACKED entities (`entity.valueOf()`), not their ids. */
 export function updateContactIndex(world: World, a: number, b: number, sensor: boolean, phase: 'enter' | 'exit'): void {
   const key = sensor ? 'overlaps' : 'contacts';
   if (phase === 'enter') {
@@ -91,23 +109,28 @@ export function updateContactIndex(world: World, a: number, b: number, sensor: b
   } else {
     const wm = index.get(world);
     if (!wm) return;
-    const ba = wm.get(a); if (ba) { drop(ba[key], b); }
-    const bb = wm.get(b); if (bb) { drop(bb[key], a); }
-    pruneIfEmpty(wm, a);
-    pruneIfEmpty(wm, b);
+    const ia = idOf(a), ib = idOf(b);
+    const ba = wm.get(ia); if (ba) { drop(ba[key], ib); }
+    const bb = wm.get(ib); if (bb) { drop(bb[key], ia); }
+    pruneIfEmpty(wm, ia);
+    pruneIfEmpty(wm, ib);
   }
 }
 
+const livePartners = (counts: Map<number, PartnerCount>): number[] =>
+  [...counts].filter(([, c]) => isPackedAlive(c.packed)).map(([id]) => id).sort((x, y) => x - y);
+
 /** The body's CURRENT contacts + overlaps as sorted entity-id arrays, or undefined when it
  *  is touching nothing. Sorted so the output is stable across runs (determinism). The
- *  scene-state fold resolves these ids to GUIDs. */
+ *  scene-state fold resolves these ids to GUIDs. An entry recorded for an entity that has since
+ *  died — on either side — is left out, even before the reconcile removes it (#868). */
 export function getContactState(world: World, entityId: number): { contacts: number[]; overlaps: number[] } | undefined {
   const b = index.get(world)?.get(entityId);
-  if (!b || (b.contacts.size === 0 && b.overlaps.size === 0)) return undefined;
-  return {
-    contacts: [...b.contacts.keys()].sort((x, y) => x - y),
-    overlaps: [...b.overlaps.keys()].sort((x, y) => x - y),
-  };
+  if (!b || !isPackedAlive(b.packed)) return undefined;
+  const contacts = livePartners(b.contacts);
+  const overlaps = livePartners(b.overlaps);
+  if (contacts.length === 0 && overlaps.length === 0) return undefined;
+  return { contacts, overlaps };
 }
 
 /** Force-remove an ENTITY from the index: drop its own entry AND every partner's reference

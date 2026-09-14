@@ -110,50 +110,56 @@ export function findUnrenderable2D(
  *     recycles — an entity deleted while still orphaned left its count in `frames` forever, so the
  *     next entity to inherit that id started from a stale count and could never again hit `note()`'s
  *     exact-equality trigger. `prune()` closes this the same way `clear()` closes (1): a caller
- *     that calls it once per frame/sweep with the frame's live ids keeps `frames` bounded by
- *     currently-orphaned entities, not by every entity ever orphaned. */
+ *     that calls it once per frame/sweep with the frame's live entities keeps `frames` bounded by
+ *     currently-orphaned entities, not by every entity ever orphaned.
+ *  4. **It is keyed by the PACKED entity** (`entity.valueOf()`, generation included — #868), and so
+ *     is `prune`'s live set. A prune by id only forgets an index that is ABSENT this frame; a destroy
+ *     and a same-index spawn between two frames keep the index present throughout, so the newcomer
+ *     inherited the dead orphan's count (and its `id:` warned key) and never warned. The numbers this
+ *     class takes are opaque — it never unpacks them. */
 /** The key an entity warns under when it has no guid. koota recycles entity ids, so this form —
  *  and ONLY this form — can outlive its entity and silence an unrelated one that inherits the id
- *  (#700). Exported so `Scene2D.orphan2DKey` mints it and {@link Orphan2DTracker.prune} can
- *  recognise it: one format, one place, so the two cannot drift apart. */
+ *  (#700). Exported so `Scene2D.orphan2DKey` mints it and {@link Orphan2DTracker} can recognise
+ *  it: one format, one place, so the two cannot drift apart. */
 export function orphan2DFallbackKey(entityId: number): string { return `id:${entityId}`; }
 
-/** The entity id inside a fallback key, or null when `key` is a guid — which is unique for the
- *  life of the project and therefore never recycles, so it is not prunable by id. */
-function orphan2DFallbackId(key: string): number | null {
-  if (!key.startsWith('id:')) return null;
-  const n = Number(key.slice(3));
-  return Number.isInteger(n) ? n : null;
-}
+const isFallbackKey = (key: string): boolean => key.startsWith('id:');
 
 export class Orphan2DTracker {
+  /** packed entity → consecutive orphaned frames. */
   private readonly frames = new Map<number, number>();
   private readonly warned = new Set<string>();
+  /** A warned `id:` fallback key → the packed entity that warned under it. The key's text names only
+   *  the recycled index, so this is what lets `prune` tell a dead owner from a live newcomer. */
+  private readonly fallbackOwner = new Map<string, number>();
 
-  /** Count a frame in which `entityId` routed to no canvas. Returns the warn key exactly ONCE
-   *  per orphaning — on the frame the count reaches `afterFrames` and the key is not already
+  /** Count a frame in which `entity` (packed) routed to no canvas. Returns the warn key exactly
+   *  ONCE per orphaning — on the frame the count reaches `afterFrames` and the key is not already
    *  warned — else null. */
-  note(entityId: number, key: () => string, afterFrames: number): string | null {
-    const frames = (this.frames.get(entityId) ?? 0) + 1;
-    this.frames.set(entityId, frames);
+  note(entity: number, key: () => string, afterFrames: number): string | null {
+    const frames = (this.frames.get(entity) ?? 0) + 1;
+    this.frames.set(entity, frames);
     if (frames !== afterFrames) return null;      // exactly once, not every frame after
     const k = key();
     if (this.warned.has(k)) return null;
     this.warned.add(k);
+    if (isFallbackKey(k)) this.fallbackOwner.set(k, entity);
     return k;
   }
 
-  /** `entityId` found a canvas — drop its count and its warned key so a later re-orphaning
+  /** `entity` (packed) found a canvas — drop its count and its warned key so a later re-orphaning
    *  warns again. No-op (and no `key()` call) for an entity that was never counted. */
-  clear(entityId: number, key: () => string): void {
+  clear(entity: number, key: () => string): void {
     if (this.frames.size === 0) return;
-    if (!this.frames.delete(entityId)) return;
+    if (!this.frames.delete(entity)) return;
     if (this.warned.size === 0) return;
-    this.warned.delete(key());
+    const k = key();
+    this.warned.delete(k);
+    this.fallbackOwner.delete(k);
   }
 
   /** Forget everything (teardown / tests). */
-  reset(): void { this.frames.clear(); this.warned.clear(); }
+  reset(): void { this.frames.clear(); this.warned.clear(); this.fallbackOwner.clear(); }
 
   /** Drop `frames` tracking for any id NOT in `aliveIds` — the fix for the id-recycling gap:
    *  `note()`/`clear()` only run on frames Scene2D actually visits an entity, so one that DIES
@@ -162,7 +168,7 @@ export class Orphan2DTracker {
    *  again hit `note()`'s exact-equality trigger — the warn-once-must-forget failure this class
    *  exists to prevent, reintroduced one level down (it forgot on recovery, not on death).
    *
-   *  Call once per frame/sweep with the frame's live entity ids — the same prune-by-active-set
+   *  Call once per frame/sweep with the frame's live PACKED entities — the same prune-by-active-set
    *  shape this codebase already uses for the same recycling hazard (e.g. `videoTextureSync.ts`'s
    *  `seen` set).
    *
@@ -180,14 +186,13 @@ export class Orphan2DTracker {
    *  `prune` is given ids and cannot tell which guids are still live. Not an id COLLISION — it
    *  suppresses only the same entity — so it is the mild end of this shape, but it is the same
    *  forget-on-death failure. Tracked in #738 with the rest of the family. */
-  prune(aliveIds: ReadonlySet<number>): void {
+  prune(alive: ReadonlySet<number>): void {
     if (this.frames.size === 0 && this.warned.size === 0) return;
-    for (const id of this.frames.keys()) if (!aliveIds.has(id)) this.frames.delete(id);
-    // Deleting the current element while iterating a Set is well-defined — visited entries are
+    for (const entity of this.frames.keys()) if (!alive.has(entity)) this.frames.delete(entity);
+    // Deleting the current entry while iterating a Map is well-defined — visited entries are
     // unaffected and the iterator continues from the next one.
-    for (const key of this.warned) {
-      const id = orphan2DFallbackId(key);
-      if (id !== null && !aliveIds.has(id)) this.warned.delete(key);
+    for (const [key, owner] of this.fallbackOwner) {
+      if (!alive.has(owner)) { this.warned.delete(key); this.fallbackOwner.delete(key); }
     }
   }
 }

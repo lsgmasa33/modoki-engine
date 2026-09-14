@@ -2502,3 +2502,44 @@ describe('UINode minTapSize (#948)', () => {
     warn.mockRestore();
   });
 });
+
+// #868: children were keyed by `entityId` alone — koota's recycled index — so a UI entity destroyed
+// and replaced on the same index between two tree rebuilds kept the dead entity's React fiber and
+// DOM: its scroll position, focus, an input's typed value, AutoFitText's measured refs. The key
+// carries the generation now, so the newcomer mounts fresh.
+describe('a child replaced on a recycled index remounts (#868)', () => {
+  const CANVAS2D = { referenceWidth: 1, referenceHeight: 1, scaleMode: 'fitH', maxReferenceWidth: 0, maxReferenceHeight: 0 };
+  // Both parent shapes map children with their own key: a plain element, and a Canvas2D host.
+  it.each([
+    ['a plain parent', {}],
+    ['a Canvas2D parent', { canvas2D: CANVAS2D }],
+  ] as const)('under %s: gives the newcomer a new DOM element, and keeps a live child\'s element', (_label, parentShape) => {
+    const world = createWorld();
+    try {
+      const a = world.spawn();
+      const childFor = (e: { id(): number; generation(): number }, guid: string) =>
+        makeNode({ entityId: e.id(), generation: e.generation(), guid, width: 10, height: 10 });
+      const parentOf = (child: UINodeData) => makeNode({ entityId: 999, guid: 'parent', ...parentShape, children: [child] } as Partial<UINodeData>);
+      const renderCanvas2D = () => null;
+
+      const { container, rerender } = render(<UINode node={parentOf(childFor(a, 'a'))} storeState={{}} renderCanvas2D={renderCanvas2D} />);
+      const before = container.querySelector(`[data-entity-id="${a.id()}"]`);
+      expect(before).not.toBeNull();
+
+      rerender(<UINode node={parentOf(childFor(a, 'a2'))} storeState={{}} renderCanvas2D={renderCanvas2D} />); // same entity, edited
+      expect(container.querySelector(`[data-entity-id="${a.id()}"]`)).toBe(before);
+
+      a.destroy();
+      const b = world.spawn();
+      expect(b.id()).toBe(a.id());
+      expect(b.generation()).not.toBe(a.generation());
+
+      rerender(<UINode node={parentOf(childFor(b, 'b'))} storeState={{}} renderCanvas2D={renderCanvas2D} />);
+      const after = container.querySelector(`[data-entity-id="${b.id()}"]`);
+      expect(after).not.toBeNull();
+      expect(after).not.toBe(before);
+    } finally {
+      world.destroy();
+    }
+  });
+});

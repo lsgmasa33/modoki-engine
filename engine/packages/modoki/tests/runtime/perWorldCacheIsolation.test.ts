@@ -125,22 +125,32 @@ describe('zoneTriggerCore keeps prev-frame occupancy per World (#851)', () => {
 describe('physicsContactIndex keys contacts per World (#851)', () => {
   // ⚠️ Pins a CONTRACT, not an observed bug — see this file's header. Kept because the contract
   // is what a future per-entity/streaming teardown would silently break.
+  // Real entities, not bare numbers: the index stamps each entry with the packed entity and reads
+  // back only live ones (#868), so a made-up id would read as dead. Both worlds spawn their bodies
+  // in the same order, so the IDS collide across worlds exactly as the contract needs.
+  function bodies(w: World, n: number) { return Array.from({ length: n }, () => w.spawn()); }
+
   it('a contact recorded in B is not visible in A', () => {
     const { a, b } = twoWorlds();
-    updateContactIndex(a, 1, 2, false, 'enter');
-    updateContactIndex(b, 1, 3, false, 'enter');
+    const [a1, a2] = bodies(a, 2);
+    const [b1, , b3] = bodies(b, 3);
+    expect(b1.id()).toBe(a1.id());
+    updateContactIndex(a, a1.valueOf(), a2.valueOf(), false, 'enter');
+    updateContactIndex(b, b1.valueOf(), b3.valueOf(), false, 'enter');
     // Read A back AFTER writing B — the ordering that the guidIndex near-miss got wrong.
-    expect(getContactState(a, 1)?.contacts, 'world A’s contacts were clobbered by world B').toEqual([2]);
-    expect(getContactState(b, 1)?.contacts).toEqual([3]);
+    expect(getContactState(a, a1.id())?.contacts, 'world A’s contacts were clobbered by world B').toEqual([a2.id()]);
+    expect(getContactState(b, b1.id())?.contacts).toEqual([b3.id()]);
   });
 
   it('clearing world A’s index leaves world B’s contacts', () => {
     const { a, b } = twoWorlds();
-    updateContactIndex(a, 1, 2, false, 'enter');
-    updateContactIndex(b, 1, 3, false, 'enter');
+    const [a1, a2] = bodies(a, 2);
+    const [b1, , b3] = bodies(b, 3);
+    updateContactIndex(a, a1.valueOf(), a2.valueOf(), false, 'enter');
+    updateContactIndex(b, b1.valueOf(), b3.valueOf(), false, 'enter');
     clearContactIndex(a);
-    expect(getContactState(a, 1)).toBeUndefined();
-    expect(getContactState(b, 1)?.contacts, 'clearing world A also wiped world B').toEqual([3]);
+    expect(getContactState(a, a1.id())).toBeUndefined();
+    expect(getContactState(b, b1.id())?.contacts, 'clearing world A also wiped world B').toEqual([b3.id()]);
   });
 });
 

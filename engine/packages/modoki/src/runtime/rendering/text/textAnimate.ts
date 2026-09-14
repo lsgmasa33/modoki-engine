@@ -50,6 +50,34 @@ export function isTextAnimating(a: TextAnimParams | null | undefined): boolean {
   return !!a && a.effect !== 'none';
 }
 
+/** The animation clock a text renderer keeps per entity across frames (`Scene2D`'s text slot and
+ *  `scene3DSync`'s text mesh entry both carry these fields). */
+export interface TextAnimClock {
+  wasMotion?: boolean;
+  wasColored?: boolean;
+  animStart?: number;
+  animEffect?: string;
+  /** The packed entity (`entity.valueOf()`) the clock last ran for (#868). */
+  animOwner?: number;
+}
+
+/** Seconds into the effect for this frame, restarting the clock at `now` on (re)activation, on an
+ *  effect switch (the effect is not in the mesh hash, so a mid-Play switch would keep the stale
+ *  start and skip a one-shot intro), or when the clock now belongs to a DIFFERENT entity (#868).
+ *  That last case is the recycled index: both renderers key their per-entity slot by `entity.id()`,
+ *  so a same-effect respawn inherited `wasMotion` and carried on the dead text's phase — a
+ *  typewriter that starts half-typed. The one rule both renderers share, so it lives once. */
+export function textAnimElapsed(
+  clock: TextAnimClock, animActive: boolean, effect: string | undefined, owner: number, now: number,
+): number {
+  if (animActive && ((!clock.wasMotion && !clock.wasColored) || clock.animEffect !== effect || clock.animOwner !== owner)) {
+    clock.animStart = now;
+  }
+  clock.animEffect = animActive ? effect : undefined;
+  clock.animOwner = owner;
+  return animActive ? now - (clock.animStart ?? now) : 0;
+}
+
 /** Deterministic [0,1) hash of two small integers (jitter noise — no Math.random). */
 function hash(a: number, b: number): number {
   let h = (Math.imul(a, 374761393) + Math.imul(b, 668265263)) | 0;

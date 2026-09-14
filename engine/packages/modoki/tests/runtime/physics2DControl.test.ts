@@ -127,3 +127,34 @@ describe('physics2D control API — impulses, forces, velocity', () => {
     expect(wakeBody2D(tw.world, box)).toBe(true);
   });
 });
+
+describe('physics2D control API — recycled entity index (#868)', () => {
+  it('a newcomer on a dead body\'s index is not handed the dead body before its own is built', () => {
+    tw = createTestWorld({ systems: [PHYS] });
+    world0g(tw);
+    const spawnBox = () => tw!.spawn(
+      Transform({ x: 0, y: 0 }),
+      RigidBody2D({ bodyType: 'dynamic' }),
+      Collider2D({ shape: 'box', halfW: 20, halfH: 20 }),
+    );
+    const a = spawnBox();
+    tw.step(1);
+    expect(applyImpulse2D(tw.world, a, 30, 0)).toBe(true);
+
+    // Despawn + respawn with no tick between: the reconcile has not run, so the dead body is still
+    // in the Rapier world under the reclaimed index.
+    a.destroy();
+    const b = spawnBox();
+    expect(b.id()).toBe(a.id());
+    expect(b.valueOf()).not.toBe(a.valueOf());
+
+    // Same contract as "before the body exists": a no-op that says so — not a kick delivered to
+    // the dead body and reported as success.
+    expect(applyImpulse2D(tw.world, b, 30, 0)).toBe(false);
+    expect(setLinvel2D(tw.world, b, 5, 0)).toBe(false);
+    expect(wakeBody2D(tw.world, b)).toBe(false);
+
+    tw.step(1);                                    // the reconcile rebuilds for `b`
+    expect(applyImpulse2D(tw.world, b, 30, 0)).toBe(true);
+  });
+});

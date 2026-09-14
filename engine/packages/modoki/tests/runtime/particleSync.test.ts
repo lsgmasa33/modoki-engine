@@ -7,7 +7,7 @@
  *  composition, dt sourcing (Time trait vs override) + playbackSpeed scaling, effect
  *  hot-swap rebuild, isActive/loading gating, and playOnStart=false pausing. */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as THREE from 'three';
 import type { ParticleEffectDef, ParticleHandle } from '../../src/runtime/particles/types';
 import { PARTICLE_LAYER } from '../../src/runtime/rendering/layers';
@@ -15,6 +15,10 @@ import { PARTICLE_LAYER } from '../../src/runtime/rendering/layers';
 beforeEach(() => {
   vi.resetModules();
 });
+// koota caps a process at 16 worlds, and every `setup()` creates one — destroy them, or the file stops
+// being able to add a test.
+const worlds: Array<{ destroy(): void }> = [];
+afterEach(() => { for (const w of worlds.splice(0)) w.destroy(); });
 
 /** A fake backend that records every interaction and hands out stable handles. */
 function makeFakeBackend() {
@@ -67,7 +71,9 @@ async function setup() {
   const particleControl = await import('../../src/runtime/core/particleControlRegistry');
   const { worldTransforms } = await import('../../src/runtime/core/ecs/transformPropagationSystem');
   worldTransforms.clear();
-  return { backend, calls, effects, world: createWorld(), traits, sync, particleControl, worldTransforms };
+  const world = createWorld();
+  worlds.push(world);
+  return { backend, calls, effects, world, traits, sync, particleControl, worldTransforms };
 }
 
 const fakeDef = (over: Partial<ParticleEffectDef> = {}): ParticleEffectDef =>
@@ -365,7 +371,7 @@ describe('syncParticles', () => {
     expect(backend.restart).not.toHaveBeenCalled();
 
     // A control clip crossed its start → restart request drained + applied this frame.
-    particleControl.requestParticleControl(e.id(), 'restart');
+    particleControl.requestParticleControl(e, 'restart');
     sync.syncParticles(world, scene, state, 0.016);
     expect(backend.restart).toHaveBeenCalledWith({ id });
 
@@ -374,7 +380,7 @@ describe('syncParticles', () => {
     expect(backend.restart).toHaveBeenCalledTimes(1);
 
     // Clip end → pause request.
-    particleControl.requestParticleControl(e.id(), 'pause');
+    particleControl.requestParticleControl(e, 'pause');
     sync.syncParticles(world, scene, state, 0.016);
     expect(calls.pause).toContain(id);
   });
@@ -396,5 +402,34 @@ describe('syncParticles', () => {
     expect(calls.dispose).toHaveLength(2);
     expect(scene.remove).toHaveBeenCalledTimes(2);
     expect(state.recs.size).toBe(0);
+  });
+});
+
+describe('syncParticles — recycled entity index (#868)', () => {
+  it('a same-effect emitter respawned on a dead one\'s index between two frames gets its OWN handle', async () => {
+    // The rebuild gate compared only the effect path, so a same-effect respawn reused the dead
+    // emitter's handle: its live particles, elapsed time, a spent one-shot, a paused state.
+    const { calls, effects, world, traits, sync } = await setup();
+    const { Transform, ParticleEmitter } = traits;
+    effects.set('fx/a.particle.json', fakeDef());
+    const scene = makeScene();
+    const state = sync.createParticleSyncState();
+
+    const a = world.spawn(Transform(), ParticleEmitter({ effect: 'fx/a.particle.json', playOnStart: false }));
+    sync.syncParticles(world, scene, state, 0.016);
+    expect(calls.create).toHaveLength(1);
+    expect(calls.pause).toEqual([1]);                       // `a` was created paused
+
+    a.destroy();
+    const b = world.spawn(Transform(), ParticleEmitter({ effect: 'fx/a.particle.json' }));
+    expect(b.id()).toBe(a.id());
+    expect(b.valueOf()).not.toBe(a.valueOf());
+    sync.syncParticles(world, scene, state, 0.016);
+
+    expect(calls.create).toHaveLength(2);                   // `b` built its own…
+    expect(calls.dispose).toEqual([1]);                     // …and the dead one's was released
+    expect(scene.remove).toHaveBeenCalledTimes(1);
+    expect(calls.pause).toEqual([1]);                       // `b` (playOnStart) is NOT paused
+    expect(state.recs.size).toBe(1);
   });
 });

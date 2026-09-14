@@ -74,6 +74,9 @@ export function stepSimulation(world: World, ticks = 1, opts: StepOptions = {}):
   advanceFixedSteps(world, ticks, dt);
 
   if (restore) {
+    // Swapping back to the previous world clears the per-frame transform caches (#868:
+    // `worldTransforms` / `deactivatedEntities`), so read the stepped world's poses through the
+    // on-demand `getWorldTransform3D` (or pass `restore: false`), not the cache, after this returns.
     restoreRealClock();
     resetTimeBaseline();
     setPlayState(prevState);

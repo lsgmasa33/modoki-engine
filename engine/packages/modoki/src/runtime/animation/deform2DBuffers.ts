@@ -11,7 +11,18 @@
  *  stamped with the current epoch; `getDeform2D` returns an entry ONLY if it was
  *  written THIS epoch, so a part that stops being deformed (clip switch, scrub to a
  *  different rig) auto-expires without any explicit removal. Bump the epoch once at
- *  the start of each animation pass with `beginDeform2DFrame()`. */
+ *  the start of each animation pass with `beginDeform2DFrame()`.
+ *
+ *  THE EPOCH IS NOT IDENTITY (#868). It only advances when animation runs, so while paused an entry
+ *  stays "current" indefinitely — and it is keyed by the recycled entity index. An editor delete +
+ *  duplicate of a skinned rig would bake the dead rig's offsets into the new one for the whole pause.
+ *  So an entity's entries are deleted the moment it is destroyed: every writer and the reader call
+ *  `bindDeform2DEviction(world)`. The population trait is `EntityAttributes` because every deform
+ *  target is resolved through the EntityAttributes index (`resolveTrackTarget`). */
+
+import type { World } from 'koota';
+import { EntityAttributes } from '../core/traits/EntityAttributes';
+import { createDespawnEviction } from '../core/ecs/despawnEviction';
 
 interface DeformEntry {
   offsets: Float32Array;
@@ -25,6 +36,13 @@ interface DeformEntry {
 const deforms = new Map<number, Map<string, DeformEntry>>();
 let currentEpoch = 0;
 let versionCounter = 0;
+const eviction = createDespawnEviction(EntityAttributes, (id) => { deforms.delete(id); });
+
+/** Evict an entity's deform entries when it is destroyed in `world` — call before writing or reading
+ *  deforms for `world`. */
+export function bindDeform2DEviction(world: World): void {
+  eviction.bind(world);
+}
 
 /** Begin a new animation pass — entries written before this call become stale (a
  *  part not re-written this pass reads back as "no deform"). */

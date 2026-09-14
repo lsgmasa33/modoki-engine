@@ -92,7 +92,7 @@ interface PhysicsWorldState {
   /** colliderHandle → { entityId, entity, isSensor } for mapping Rapier events back
    *  to entities. `entity` is the full koota handle (the drain runs in the same tick,
    *  so it's live) — needed to notify the Physics2DEvents manager + read OnCollision2D. */
-  colliders: Map<number, { entityId: number; entity: Entity; isSensor: boolean; bodyEntityId: number }>;
+  colliders: Map<number, { entityId: number; entity: Entity; isSensor: boolean; bodyPacked: number }>;
   /** joint-entity id → joint record. Reconciled after bodies each tick. */
   joints: Map<number, JointRec>;
   /** Shared kinematic character controller (lazily created, reconfigured per character). */
@@ -366,7 +366,7 @@ type TfData = { x: number; y: number; rz: number };
  *  the child, and its OnCollision2D runs). Returns all created handles (empty if invalid). */
 function attachCollider(
   st: PhysicsWorldState,
-  body: import('@dimforge/rapier2d-compat').RigidBody, bodyEntityId: number,   // OWNING body's entity id
+  body: import('@dimforge/rapier2d-compat').RigidBody, bodyPacked: number,   // the OWNING body's PACKED entity (Percept roll-up; generation-carrying, #868)
   colliderEntity: Entity, bodyType: BodyType2D, cfg: PhysicsConfig,
   offset: { x: number; y: number; ang: number } | null,
   sx = 1, sy = 1,   // collider entity's WORLD scale → collider EXTENTS (P2 scale threading)
@@ -388,7 +388,7 @@ function attachCollider(
       .setActiveEvents(R.ActiveEvents.COLLISION_EVENTS);
     if (offset) cd.setTranslation(offset.x, offset.y).setRotation(offset.ang);
     const col = st.world.createCollider(cd, body);
-    st.colliders.set(col.handle, { entityId: colliderEntity.id(), entity: colliderEntity, isSensor: !!c.isSensor, bodyEntityId });
+    st.colliders.set(col.handle, { entityId: colliderEntity.id(), entity: colliderEntity, isSensor: !!c.isSensor, bodyPacked });
     handles.push(col.handle);
   }
   return handles;
@@ -436,7 +436,7 @@ function createBody(
 
   // The body's OWN collider(s) (attached at its origin), sized by the body's world scale.
   if (entity.has(Collider2D)) {
-    colliderHandles.push(...attachCollider(st, body, entityId, entity, rb.bodyType, cfg, null, bodySx, bodySy));
+    colliderHandles.push(...attachCollider(st, body, entity.valueOf(), entity, rb.bodyType, cfg, null, bodySx, bodySy));
   }
   // Compound: each child collider, attached at the child's body-LOCAL offset (its Transform,
   // which is already parent-local). The offset is scaled by the BODY's world scale (the child's
@@ -447,7 +447,7 @@ function createBody(
     const off = ctf ? vecEcsToPhys(ctf.x * bodySx, ctf.y * bodySy, cfg.ppm) : { x: 0, y: 0 };
     const ang2 = ctf ? angEcsToPhys(ctf.rz) : 0;
     const cw = worldScaleOf(child);
-    colliderHandles.push(...attachCollider(st, body, entityId, child, rb.bodyType, cfg, { x: off.x, y: off.y, ang: ang2 }, cw.sx, cw.sy));
+    colliderHandles.push(...attachCollider(st, body, entity.valueOf(), child, rb.bodyType, cfg, { x: off.x, y: off.y, ang: ang2 }, cw.sx, cw.sy));
   }
 
   const rec: BodyRec = {
@@ -520,7 +520,7 @@ function attachSoloCollider(st: PhysicsWorldState, colliderEntity: Entity, cfg: 
       .setActiveEvents(R.ActiveEvents.COLLISION_EVENTS)
       .setTranslation(pos.x, pos.y).setRotation(ang);
     const col = st.world.createCollider(cd);   // no parent body ⇒ Rapier treats it as fixed
-    st.colliders.set(col.handle, { entityId: colliderEntity.id(), entity: colliderEntity, isSensor: !!c.isSensor, bodyEntityId: colliderEntity.id() });
+    st.colliders.set(col.handle, { entityId: colliderEntity.id(), entity: colliderEntity, isSensor: !!c.isSensor, bodyPacked: colliderEntity.valueOf() });
     handles.push(col.handle);
   }
   return handles;
@@ -1246,7 +1246,7 @@ function bodyFor2D(world: World, entity: Entity): RRigidBody2D | null {
   const st = worlds.get(world);
   if (!st) return null;
   const rec = st.bodies.get(entity.id());
-  if (!rec) return null;
+  if (!rec || rec.entityGen !== entity.generation()) return null;
   return st.world.getRigidBody(rec.bodyHandle) ?? null;
 }
 
@@ -1255,7 +1255,7 @@ function bodyAndPpm2D(world: World, entity: Entity): { body: RRigidBody2D; ppm: 
   const st = worlds.get(world);
   if (!st) return null;
   const rec = st.bodies.get(entity.id());
-  if (!rec) return null;
+  if (!rec || rec.entityGen !== entity.generation()) return null;
   const body = st.world.getRigidBody(rec.bodyHandle);
   return body ? { body, ppm: st.ppm } : null;
 }

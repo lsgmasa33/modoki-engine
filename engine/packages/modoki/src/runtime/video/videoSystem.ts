@@ -23,6 +23,7 @@ import { VideoPlayer } from '../traits/VideoPlayer';
 import { EntityAttributes } from '../core/traits/EntityAttributes';
 import { getPlayState } from '../core/playState';
 import { onWorldSwap } from '../core/ecs/world';
+import { isPackedAlive } from '../core/ecs/entityTable';
 import { playVideo, applyTimeScale, videoFadeGain, type VideoHandle } from './videoService';
 import { emitVideoStart, emitVideoEnd, emitVideoBlocked, type VideoEventPayload } from './VideoEvents';
 import { getTimeScale } from '../core/getTime';
@@ -150,7 +151,16 @@ export function setVideoDownloader(fn: Downloader | null): void { download = fn;
 /** The `HTMLVideoElement` currently backing an entity, for renderers that upload its
  *  frames. Undefined when the entity has no live clip. */
 export function videoElementFor(entityId: number): HTMLVideoElement | undefined {
-  return live.get(entityId)?.handle.element;
+  return ownedLive(entityId)?.handle.element;
+}
+
+/** `live.get(id)`, but only while the entity that took that slot is still alive (#868). The
+ *  reconcile's ownership check runs once per pass, so between a despawn(+respawn) and that pass the
+ *  by-id readers below — the whole addressing contract — would otherwise reach the dead entity's
+ *  decoder: a renderer uploading its frames, a `video.*` action seeking it. */
+function ownedLive(entityId: number): Live | undefined {
+  const o = owner.get(entityId);
+  return o !== undefined && isPackedAlive(o) ? live.get(entityId) : undefined;
 }
 
 /** Tear down one entity's clip. */
@@ -453,7 +463,7 @@ export function videoSystem(world: World): void {
 /** Seek an entity's live clip, if it has one. Used by the declarative `video.seek` /
  *  `video.stop` / `video.skip` actions, which act on an ENTITY rather than a handle. */
 export function seekEntityVideo(entityId: number, seconds: number): void {
-  const l = live.get(entityId);
+  const l = ownedLive(entityId);
   if (!l) return;
   l.handle.seek(seconds);
   // A rewind to the start begins a NEW playback, so `@video.start` must fire again for it.
@@ -473,7 +483,7 @@ export function seekEntityVideo(entityId: number, seconds: number): void {
  *  An entity with no live handle claims successfully: a skip must always announce (that is the
  *  softlock this action exists to prevent), and there is no guard to double-fire against. */
 export function claimVideoEndEmit(entityId: number): boolean {
-  const l = live.get(entityId);
+  const l = ownedLive(entityId);
   if (!l) return true;
   if (l.endEmitted) return false;
   l.endEmitted = true;

@@ -15,7 +15,7 @@ import type { PhysicsEventBus } from './physicsEventBus';
 import { updateContactIndex } from './physicsContactIndex';
 
 /** The collider→entity reverse-map value both systems keep (keyed by Rapier collider handle). */
-export interface ColliderInfo { entityId: number; entity: Entity; isSensor: boolean; bodyEntityId: number }
+export interface ColliderInfo { entityId: number; entity: Entity; isSensor: boolean; bodyPacked: number }
 export type ColliderMap = Map<number, ColliderInfo>;
 export type FireOnCollision = (self: Entity, other: Entity, phase: 'enter' | 'exit') => void;
 
@@ -40,12 +40,12 @@ export function makeFireOnCollision(OnCollisionTrait: Parameters<Entity['has']>[
   };
 }
 
-/** Resolve a collider to its OWNING body entity id (Percept contact roll-up). This is resolved
+/** Resolve a collider to its OWNING body's PACKED entity (Percept contact roll-up; #868). This is resolved
  *  ONCE at attach time and stored on the ColliderInfo — an own-collider/solo collider owns itself;
  *  a compound child owns its parent BODY. (Resolving it here at drain time can't reliably tell a
  *  compound child from a solo collider whose parent is a non-body group, so we don't guess.) */
 function bodyEntityOf(ci: ColliderInfo): number {
-  return ci.entity.isAlive() ? ci.bodyEntityId : ci.entityId;
+  return ci.entity.isAlive() ? ci.bodyPacked : ci.entity.valueOf();
 }
 
 /** Stable Percept reference for a collider's entity: its GUID when live+guidable

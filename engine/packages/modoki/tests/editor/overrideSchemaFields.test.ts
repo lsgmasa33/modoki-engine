@@ -141,7 +141,7 @@ describe('overrides over SoA fields absent from meta.fields', () => {
   it('MARKS an applied clips/clip override so the mark-gate keeps it', async () => {
     const { root } = await instanceWithOverrides({ 1: { Animator: { clips: BANK, clip: 'skin' } } });
     const { getOverrideMarkSet } = await import('../../src/runtime/loaders/overrideMarks');
-    const marks = getOverrideMarkSet(root);
+    const marks = getOverrideMarkSet(index.get(root));
     expect(marks?.has('Animator.clips')).toBe(true);
     expect(marks?.has('Animator.clip')).toBe(true);
   });
@@ -159,7 +159,7 @@ describe('overrides over SoA fields absent from meta.fields', () => {
     // Runtime read-back advances during play; it must not become an override.
     writeTraitFieldImpl(root, TRAITS[3], 'activeClip', 'skin');
     const { markOverride } = await import('../../src/runtime/loaders/overrideMarks');
-    markOverride(root, 'Animator', 'activeClip'); // even a stray mark must not persist it
+    markOverride(index.get(root), 'Animator', 'activeClip'); // even a stray mark must not persist it
     const { captureInstanceOverrides } = await getModule();
     const captured = captureInstanceOverrides(root, prefab as any);
     expect(captured[1]?.Animator).not.toHaveProperty('activeClip');
@@ -170,7 +170,7 @@ describe('overrides over SoA fields absent from meta.fields', () => {
     const live = index.get(root).get(Animator) as Record<string, unknown>;
     expect(live).not.toHaveProperty('retiredField');
     const { getOverrideMarkSet } = await import('../../src/runtime/loaders/overrideMarks');
-    expect(getOverrideMarkSet(root)?.has('Animator.retiredField')).not.toBe(true);
+    expect(getOverrideMarkSet(index.get(root))?.has('Animator.retiredField')).not.toBe(true);
   });
 
   it('EntityAttributes.editorFolder rides the schema rule, not a special case', async () => {

@@ -19,6 +19,7 @@ import { Transform } from '../core/traits/Transform';
 import { EntityAttributes } from '../core/traits/EntityAttributes';
 import { worldTransforms } from '../core/ecs/transformPropagationSystem';
 import { getWorldTransform3D, type WorldTransform3D } from '../core/ecs/worldTransform';
+import { packedOf, type PackedEntity } from '../core/ecs/entityTable';
 import type { ZoneEventBus, ZonePhase } from './zoneEventBus';
 
 /** Fire the declarative `OnZone` action on the ZONE for one enter/exit. */
@@ -83,7 +84,7 @@ function routeZone(
  *  per CHANNEL ('2d' / '3d') so a scene running both dimensions doesn't have one system's diff
  *  clobber the other's membership (their zone ids share one world but live in separate maps).
  *
- *  KEYED BY THE PACKED ENTITY (`Entity` used directly as a `number`, NOT `entity.id()`) —
+ *  KEYED BY THE PACKED ENTITY (`packedOf(entity)`, NOT `entity.id()`) —
  *  QA-ZONE-0003: this state persists ACROSS frames, and koota's `entity.id()` strips the
  *  generation (`Number.prototype.id` masks to `ENTITY_ID_MASK`), while `has()`/`get()` do the
  *  same — only `isAlive()` checks generation. A despawn immediately followed by a respawn that
@@ -91,10 +92,9 @@ function routeZone(
  *  `.id()`-keyed map: `prev`/`next` share the stripped key, so the diff goes BLIND (no exit for
  *  the dead pair, no enter for the new one) — measured live, reproducibly, with a same-frame
  *  teardown+rebuild. The packed entity number carries the generation, so a reclaimed index is a
- *  genuinely different key and the diff sees a real exit + a real enter. Every other id-keyed
- *  cache in this codebase (`entityIndex.ts`, `transformPropagationSystem.ts`, …) is rebuilt every
- *  frame and never holds a value across a despawn, which is why they don't share this hazard. */
-type ZoneState = Map<number, { member: ZoneMember; occ: Map<number, ZoneMember> }>;
+ *  genuinely different key and the diff sees a real exit + a real enter. The `PackedEntity` brand
+ *  makes an `.id()` key a type error here; the shared rule is in `core/ecs/entityTable.ts` (#868). */
+type ZoneState = Map<PackedEntity, { member: ZoneMember; occ: Map<PackedEntity, ZoneMember> }>;
 const stateByWorld = new WeakMap<World, Map<string, ZoneState>>();
 
 function stateFor(world: World, channel: string): { all: Map<string, ZoneState>; state: ZoneState } {
@@ -126,10 +126,10 @@ export function runZoneTriggers(
 
   const next: ZoneState = new Map();
   for (const z of zones) {
-    const zid = z.entity.valueOf(); // packed (generation-carrying) — see ZoneState's doc comment
-    const occ = new Map<number, ZoneMember>();
+    const zid = packedOf(z.entity); // generation-carrying — see ZoneState's doc comment
+    const occ = new Map<PackedEntity, ZoneMember>();
     for (const o of occupants) {
-      const oid = o.entity.valueOf();
+      const oid = packedOf(o.entity);
       if (oid === zid) continue;
       // `.id()` cached HERE, while `o.entity` is known alive (freshly sampled this tick) — see
       // `refOf`'s comment for why this must never be re-derived from the handle later.

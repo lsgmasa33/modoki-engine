@@ -339,3 +339,26 @@ describe('instantiatePrefabIntoWorld with overrides', () => {
     expect(tf.x).toBe(3);
   });
 });
+
+// #868: override marks are keyed by the packed entity but never swept before a scene swap, and koota's
+// generation is 8 bits — after 256 reuses of an index a fresh member's packed value repeats a dead
+// entity's exactly. The per-spawn `clearOverrideMarks` is what keeps the member clean.
+describe('instantiatePrefabIntoWorld — a wrapped packed value (#868)', () => {
+  it('a member landing on a dead marked entity\'s exact packed value starts with no marks', async () => {
+    const { instantiatePrefabIntoWorld } = await getLoader();
+    const { markOverride, getOverrideMarkSet, clearAllOverrideMarks } = await import('../../src/runtime/loaders/overrideMarks');
+    clearAllOverrideMarks();
+    const dead = testWorld.spawn();
+    const deadPacked = dead.valueOf();
+    markOverride(dead, 'Transform', 'x');
+    dead.destroy();
+    for (let i = 0; i < 255; i++) testWorld.spawn().destroy();
+
+    const prefab = { rootLocalId: 1, entities: [{ localId: 1, traits: { Transform: { x: 0, y: 0, z: 0 }, EntityAttributes: { name: 'Root', parentId: 0 } } }] };
+    instantiatePrefabIntoWorld(testWorld, prefab, 0, undefined, 'pkg/test.prefab.json');
+    const member = findEntityByLocalId(testWorld, 1) as unknown as { valueOf(): number };
+    expect(member.valueOf()).toBe(deadPacked); // the wrap this test exists for
+
+    expect(getOverrideMarkSet(member as never)).toBeUndefined();
+  });
+});

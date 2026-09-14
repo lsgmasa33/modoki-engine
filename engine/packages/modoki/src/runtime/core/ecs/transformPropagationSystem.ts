@@ -32,6 +32,10 @@ import type { World } from 'koota';
 import { Transform } from '../traits/Transform';
 import { EntityAttributes } from '../traits/EntityAttributes';
 import { decomposeTrs } from './decomposeTrs';
+import { createDespawnEviction } from './despawnEviction';
+// worldRegistry, not ./world: dozens of suites mock `core/ecs/world` wholesale, and a re-export
+// missing from their factory would fail this module's import in all of them.
+import { onWorldSwap } from './worldRegistry';
 
 /** World position / Euler rotation / scale. NOT a matrix — already decomposed.
  *  (`getWorldMatrix3D` in `worldTransform.ts` is the matrix API.) */
@@ -57,7 +61,12 @@ export interface WorldTransformRecord {
  *  This map is the per-frame CACHE, filled by `transformPropagationSystem`. It is not
  *  interchangeable with `getWorldTransform3D`, which recomputes ON DEMAND — that one rebuilds two
  *  full-world maps per call, so it is right for a one-off (a bootstrap marker lookup) and wrong for
- *  reading many entities per frame. */
+ *  reading many entities per frame.
+ *
+ *  KEYED BY THE RECYCLED INDEX (#868). An entry is deleted inside `destroy()` (despawn eviction, see
+ *  the bindings below), so a spawn that reclaims the index reads "no world transform" — the reader's
+ *  local fallback — until the next pass, never the dead entity's pose. The whole map is dropped on a
+ *  world swap for the same reason. */
 export const worldTransforms = new Map<number, WorldTransformRecord>();
 
 /** Copy an entity's cached world transform into a caller-owned `out`. Returns `false` (leaving
@@ -77,8 +86,24 @@ export function readWorldTransformInto(entityId: number, out: WorldTransformReco
   return true;
 }
 
-/** Entities deactivated via EntityAttributes.isActive (includes children of inactive parents). */
+/** Entities deactivated via EntityAttributes.isActive (includes children of inactive parents).
+ *  Evicted at despawn and dropped on world swap, like {@link worldTransforms} (#868). */
 export const deactivatedEntities = new Set<number>();
+
+// ── #868 — despawn eviction. Both caches are read by id after the pass that fills them (render
+// callbacks, SceneView, MCP scene-state), so a destroy + same-index spawn in between would hand the
+// newcomer the dead entity's entry. Each eviction also raises `_evictedSinceLastPass`: the pass below
+// skips all work when its snapshot is unchanged, and a respawn with the dead entity's exact values IS
+// unchanged — without the flag its evicted entry would never be rebuilt. ──
+let _evictedSinceLastPass = false;
+const _worldTransformEviction = createDespawnEviction(Transform, (id) => {
+  worldTransforms.delete(id);
+  _evictedSinceLastPass = true;
+});
+const _deactivatedEviction = createDespawnEviction(EntityAttributes, (id) => {
+  deactivatedEntities.delete(id);
+  _evictedSinceLastPass = true;
+});
 
 // Reusable Three.js objects to avoid GC pressure
 const _pos = new THREE.Vector3();
@@ -166,6 +191,8 @@ function trimMatrixPool() {
 export function transformPropagationSystem(world: World) {
   const worldChanged = world !== _prevWorld;
   _prevWorld = world;
+  _worldTransformEviction.bind(world);
+  _deactivatedEviction.bind(world);
 
   // ── 1. Snapshot EntityAttributes (all entities, not just Transform) — feeds the isActive
   //      cascade AND the parentId lookup used below. Pooled + compared in the SAME pass
@@ -250,7 +277,8 @@ export function transformPropagationSystem(world: World) {
   //      from scratch), so skip the cascade walk AND the composition/decompose work below
   //      entirely. Exact `!==` comparison only — an epsilon would silently drop small real
   //      motion, and "provably unchanged" is the whole point of this short-circuit. ──
-  if (!eaChanged && !transformChanged) return;
+  if (!eaChanged && !transformChanged && !_evictedSinceLastPass) return;
+  _evictedSinceLastPass = false;
 
   // ── 4. Compute deactivated entities from the EntityAttributes snapshot above ──
   deactivatedEntities.clear();
@@ -367,3 +395,14 @@ export function transformPropagationSystem(world: World) {
   }
   trimMatrixPool();
 }
+
+// #868 — a promoted world's entities reuse the old world's indices, so the old world's entries would
+// answer for them until the new world's first pass. Drop both caches (readers fall back to local, as
+// in a world that never ran a pass) and forget the previous pass: after A → B → A with no pass on B,
+// A's next pass would otherwise find its snapshot unchanged and leave the caches empty for good. The eviction subscriptions need no change here — the next pass
+// rebinds them, and until then an old-world destroy can only delete from the emptied caches.
+onWorldSwap(() => {
+  worldTransforms.clear();
+  deactivatedEntities.clear();
+  _prevWorld = null;
+});

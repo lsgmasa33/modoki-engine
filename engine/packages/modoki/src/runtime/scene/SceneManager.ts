@@ -86,7 +86,7 @@
  */
 
 import { createWorld, type World, type Entity } from 'koota';
-import { setCurrentWorld, getCurrentWorld, spawnEntity } from '../core/ecs/world';
+import { setCurrentWorld, getCurrentWorld, spawnEntity, findEntityById } from '../core/ecs/world';
 import { createTeardownToken, type LivenessCheck } from '../core/liveness';
 import { notifyListeners } from '../core/notifyListeners';
 import { getAllTraits } from '../core/ecs/traitRegistry';
@@ -96,7 +96,7 @@ import { emit } from '../core/journal';
 import { markSceneLoaded, isSceneFilePath } from '../core/ecs/sceneLoaded';
 import { beginBootSpan, endBootSpan, bootSpanAsync } from '../core/bootTimeline';
 import { ensurePhysicsReady } from '../physics/physicsReady';
-import { clearAllOverrideMarks, getOverrideMarkSet, markOverride } from '../loaders/overrideMarks';
+import { clearAllOverrideMarks, getOverrideMarkSet, restoreOverrideMarks } from '../loaders/overrideMarks';
 import { clearAuthoredWritesWhileStopped } from '../core/ecs/authoredWrites';
 import { SCENE_FORMAT_VERSION } from '../core/version';
 
@@ -731,9 +731,11 @@ class SceneManagerImpl implements SceneManager {
       // instance serializes as "no override" and reverts to the prefab's bare defaults
       // on the next load (A9 defect 2 —
       // docs/reviews/a9-carried-instance-overrides-investigation.md).
+      // Marks are keyed by the packed entity (#868), so resolve each carried id in the old world.
       const carriedMarks = new Map<number, string[]>();
       for (const entry of carriedSnapshots) {
-        const set = getOverrideMarkSet(entry.id);
+        const old = findEntityById(entry.id);
+        const set = old ? getOverrideMarkSet(old) : undefined;
         if (set && set.size > 0) carriedMarks.set(entry.id, [...set]);
       }
       const persistentOnlySnapshots = carriedSnapshots.filter((e) => e.traits['Persistent'] === true);
@@ -943,12 +945,7 @@ class SceneManagerImpl implements SceneManager {
             // the cross-contamination that got an earlier A8 attempt reverted.
             onEntitySpawned: (entity: { id(): number }, oldId: number) => {
               const keys = carriedMarks.get(oldId);
-              if (!keys) return;
-              for (const key of keys) {
-                const dot = key.indexOf('.'); // key is `${trait}.${field}`
-                if (dot <= 0) continue;
-                markOverride(entity.id(), key.slice(0, dot), key.slice(dot + 1));
-              }
+              if (keys) restoreOverrideMarks(entity as unknown as Entity, keys);
             },
           },
         );
