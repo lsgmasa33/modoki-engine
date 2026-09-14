@@ -777,7 +777,7 @@ export default function Hierarchy() {
       // into the STAGING world BEFORE this swap (loadSceneFile's spawnEntity calls, which take the staging world) — SceneManager marks
       // nothing dirty after setCurrentWorld — so for an ordinary scene load no settled
       // refresh ever arrives. One frame from here getCurrentScenePath() is settled
-      // (loadScene writes it in its own tail, scene/serialize.ts:1080) and the restore runs.
+      // (loadScene writes it in its own tail, scene/serialize.ts's setCurrentScenePath call) and the restore runs.
       scheduleSettledRefresh(PATH_SETTLE_FRAMES);
     });
     return () => {

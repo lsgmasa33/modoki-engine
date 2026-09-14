@@ -1817,7 +1817,7 @@ export function registerEditorAgentOps(): void {
       );
     }
     if (outcome === 'superseded') {
-      // A LATER load won the swap while ours was in flight (sceneManager.ts:885-900) — our own
+      // A LATER load won the swap while ours was in flight (SceneManager.loadScene's step-11 tail guard) — our own
       // load did not fail, and this says nothing about whether `path` exists. Mirrors the
       // runtime twin's wording (agentBridge.ts's `load-scene`, #486 finding A).
       return {

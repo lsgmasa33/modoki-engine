@@ -1735,8 +1735,8 @@ export async function acquireModel(sceneId: SceneId, glbRef: string, postprocess
     await loadModelTemplates(glbPath, undefined, postprocessorId);
   }
 
-  // Post-await guard, mirroring acquireMesh's (#485, :1552). releaseAllForScene is
-  // synchronous and can land inside the load above; the owner we added at :1487 is
+  // Post-await guard, mirroring acquireMesh's (#485). releaseAllForScene is
+  // synchronous and can land inside the load above; the owner acquireModel added with addOwner(modelOwners, …) is
   // gone by the time we resume, and nothing will ever release this sceneId again.
   //
   // ⚠️ The OUTER check ("was I released") is currently subsumed by the inner one
@@ -1750,14 +1750,14 @@ export async function acquireModel(sceneId: SceneId, glbRef: string, postprocess
   // green suite; the suite cannot see this one.
   if (!modelOwners.get(glbPath)?.has(sceneId)) {
     if (!modelOwners.get(glbPath)?.size) {
-      // Re-seat the snapshot releaseModelByPath deleted (:1522) so invalidateModel
+      // Re-seat the snapshot releaseModelByPath deleted (its modelLodSnapshots.delete) so invalidateModel
       // finds the LOD siblings without depending on manifest state.
       //
       // ⚠️ This only CHANGES anything when the manifest no longer carries the model's
-      // lodPaths — otherwise invalidateModel's manifest fallback (:432-434) finds the
+      // lodPaths — otherwise invalidateModel's manifest lodPaths fallback finds the
       // siblings on its own and the re-seat is a no-op. Its test has to clear the
       // manifest to reach the branch at all: re-registering the asset does NOT drop a
-      // previously-registered modelCache block (assetManifest.ts:299-311 preserves it
+      // previously-registered modelCache block (assetManifest.ts's registerAsset preserves it
       // when the type is unchanged), so a test that merely re-registers goes green
       // whether or not this line is here. Whether production can reach that state is
       // NOT established — treat the line as defensive, and do not read its test as
@@ -1797,10 +1797,10 @@ export async function acquireMesh(sceneId: SceneId, meshRef: string): Promise<vo
   // Fetch the .mesh.json (cached). After this, meshAssetCache has the entry.
   await fetchMeshAsset(meshPath);
 
-  // Released mid-load → drop the result, mirroring riggedModelCache.ts:177 and
-  // audioBufferCache.ts:206. releaseAllForScene is synchronous and can land
+  // Released mid-load → drop the result, mirroring riggedModelCache.ts's finishLoad and
+  // audioBufferCache.ts's fetchAudioBuffer. releaseAllForScene is synchronous and can land
   // inside this await (SceneManager aborts an in-flight load and releases its
-  // sceneId at sceneManager.ts:279-280; that abort doesn't reach this fetch,
+  // sceneId in SceneManager.loadScene's in-flight nextLoad abort; that abort doesn't reach this fetch,
   // which isn't abortable) — and once it has, nothing will ever call
   // releaseAllForScene for this sceneId again, so any hold re-added below would
   // pin the geometry, material and textures for the process lifetime. Evict the
@@ -1857,8 +1857,8 @@ export async function acquireMesh(sceneId: SceneId, meshRef: string): Promise<vo
         await loadModelTemplates(modelPath, undefined, asset.postprocessor || 'none');
       }
 
-      // Post-await guard, mirroring acquireModel's (#488 site 2, :1512). releaseAllForScene
-      // is synchronous and can land inside the awaits above; the owner added at :1613 is
+      // Post-await guard, mirroring acquireModel's (#488 site 2). releaseAllForScene
+      // is synchronous and can land inside the awaits above; the transitive addOwner(modelOwners, modelPath, …) above is
       // gone by the time we resume, and nothing will ever release this sceneId again. Both
       // conditions are load-bearing — see the note at acquireModel's mirror of this guard.
       if (!modelOwners.get(modelPath)?.has(sceneId)) {
@@ -1917,11 +1917,11 @@ export async function acquireMaterial(sceneId: SceneId, matRef: string): Promise
   // Released mid-load → discard the result, mirroring the post-await guards in
   // `acquireMesh` and `acquireModel`. releaseAllForScene is synchronous and can
   // land inside the await above (SceneManager aborts an in-flight load at
-  // SceneManager.ts:279 and releases its sceneId at :280; that abort doesn't
+  // SceneManager.loadScene's in-flight nextLoad abort and releases its sceneId right after; that abort doesn't
   // reach fetchMaterial, which isn't abortable) — and every LATER
   // releaseAllForScene for this sceneId is a no-op, because those only visit
   // paths whose owner set still contains the id, which is exactly what this one
-  // just drained. (SceneManager.ts:926 really does re-release these ids from the
+  // just drained. (SceneManager.loadScene's catch really does re-release these ids from the
   // aborted load's catch — it simply cannot see the entry fetchMaterial is about
   // to re-seat.) So without this the material, and every texture it holds, is
   // pinned until app teardown. Retire rather than dispose (#317) — a live mesh
@@ -1959,7 +1959,7 @@ export async function acquirePrefab(sceneId: SceneId, prefabRef: string): Promis
   // Released mid-load → discard the result, same shape as acquireMaterial above,
   // and see that comment for why a later releaseAllForScene cannot recover this
   // (#520). fetchPrefab isn't abortable either, so SceneManager's abort at
-  // SceneManager.ts:279 does not reach it. A plain cache delete is the whole
+  // SceneManager.loadScene's in-flight nextLoad abort does not reach it. A plain cache delete is the whole
   // disposal answer here — parsed JSON, no GPU resource — and fetchPrefab's
   // `finally` has already cleared prefabLoadPromises by the time this runs, so
   // there is no resolved promise left to short-circuit the next fetch. Only if
@@ -2026,12 +2026,12 @@ export async function acquireEnvironment(sceneId: SceneId, hdrRef: string): Prom
   // may still bind the just-cached texture for a frame or two after the swap. Only if nobody
   // else owns it, so a second, still-live scene sharing the load keeps its entry.
   //
-  // ⚠️ Currently SUBSUMED by fetchEnvironment's own inner check (`!envOwners.has(hdrPath)`,
-  // ~:1904) for every path this function can actually reach: `releaseAllForScene` itself calls
+  // ⚠️ Currently SUBSUMED by fetchEnvironment's own inner post-load check (`!envOwners.has(hdrPath)`)
+  // for every path this function can actually reach: `releaseAllForScene` itself calls
   // `releaseEnvironmentByPath` (not just a bookkeeping removal), so a mid-load release already
   // retires/evicts the cache entry directly — this guard's `return` is never observably
   // different from falling through. Kept anyway, mirroring `acquireModel`'s own documented
-  // outer/inner redundancy (:1521-1529 above): it states the right invariant, matches the other
+  // outer/inner redundancy (acquireModel's note on its post-await guard): it states the right invariant, matches the other
   // four acquire* functions' shape, and stops being redundant the moment anything is added
   // after it (e.g. a future transitive-dependency acquire on this path). Not provable red/green
   // by a unit test today — see acquireEnvironmentMidLoadGuard.test.ts for why.

@@ -124,7 +124,7 @@ interface StageCtx {
 const _size = new THREE.Vector2();
 
 /** The private surface of three's `RenderPipeline` that `compileStagesAsync` reaches for (r184,
- *  `three/src/renderers/common/RenderPipeline.js` lines 85 / 179). Private on purpose: there is no
+ *  `three/src/renderers/common/RenderPipeline.js`'s constructor `_quadMesh` and `_update`). Private on purpose: there is no
  *  public compile entry point on `RenderPipeline`, and the alternative is reimplementing its
  *  `render()` prologue. Every use is presence-checked, and `postfxStack.test.ts` carries a
  *  TRIPWIRE that fails `npm test` loudly if a three bump moves any of it. */

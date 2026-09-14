@@ -26,15 +26,15 @@
  *  ⚠️ **On Android today the keep-alive is INERT, not a leak — #514 was filed on the opposite
  *  reading.** This was verified by READING the Capacitor sources bundled in
  *  `games/3d-test/node_modules/@capacitor/android`, not by replaying the bridge:
- *  - `Bridge.java:842-845` — `Bridge.callPluginMethod` saves a call into `savedCalls` only if it
+ *  - `Bridge.callPluginMethod` saves a call into `savedCalls` only if it
  *    is kept-alive at the moment the plugin METHOD RETURNS. This plugin parks the call several
  *    async hops later (inside `queryProductDetailsAsync`'s callback), so it never reaches
  *    `savedCalls` regardless of the flag.
- *  - `MessageHandler.java:136-138` — `sendResponseMessage` reads `isKeptAlive()` to decide whether
+ *  - `MessageHandler.sendResponseMessage` reads `isKeptAlive()` to decide whether
  *    to `release()` the call, and copies the same value into the response's `save` field. This is
  *    the reason the flag MUST be cleared before, not after, resolve/reject: by the time
  *    `sendResponseMessage` runs the decision is already made.
- *  - `native-bridge.js:968-978` — a promise-style call's JS callback is deleted on settle
+ *  - `native-bridge.js`'s `cap.fromNative` — a promise-style call's JS callback is deleted on settle
  *    regardless of `save`, so there is no JS-side retention either.
  *
  *  So this guard exists for what happens the day someone parks a call SYNCHRONOUSLY (a cached
@@ -406,9 +406,9 @@ describe('ModokiIapPlugin: a parked purchase() times out instead of waiting fore
 
 describe('ModokiIapPlugin: the reload listener is registered where it actually survives (#586)', () => {
   // ⚠️ The first #586 fix registered this listener from `Plugin.load()` and was completely INERT.
-  // Capacitor's `Bridge` constructor calls `registerAllPlugins()` (`Bridge.java:231`), which is
+  // Capacitor's `Bridge` constructor calls `registerAllPlugins()` (in the `Bridge` constructor), which is
   // what runs `Plugin.load()`; `Bridge.Builder.create()` then calls `setWebViewListeners(...)`
-  // (`:1617`) eighteen lines later, and that setter REPLACES the list (`:1465`) instead of
+  // (in `Bridge.Builder.create`) right after, and that setter REPLACES the list instead of
   // appending — so anything `load()` registered is discarded before the first navigation, and
   // `BridgeWebViewClient.onPageStarted` walks a list that never contained it.
   //

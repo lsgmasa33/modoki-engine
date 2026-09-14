@@ -20,9 +20,9 @@ import { readScannedSource } from '@modoki/engine/testing';
 const REPO = path.resolve(__dirname, '../../..');
 /** ⚠️ **Comments blanked (#812).** Every assertion here is a REQUIRED-pattern match, and this file
  *  scans two heavily-commented sources that explain the very flag it looks for — so raw text lets
- *  PROSE satisfy the assertion. Measured: `stopDevServer.mjs:71`'s comment ("`--configLoader
+ *  PROSE satisfy the assertion. Measured: `stopDevServer.mjs`'s `isEditorOwned` docblock ("`--configLoader
  *  runner` is the discriminator") matches the regex below on its own, so deleting the real
- *  `isEditorOwned` at `:74` left that assertion green. */
+ *  `isEditorOwned` function left that assertion green. */
 const read = (rel: string) => readScannedSource(path.join(REPO, rel)).code;
 
 describe('dev:stop leaves the editor-owned Vite alone (#129)', () => {

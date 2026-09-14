@@ -11,7 +11,7 @@
  *    spawns `cmd.exe` on Windows, which does not strip single quotes — a quoted pathspec like
  *    `'*.scene.json'` reaches git literally and matches nothing. MEASURED on this clone:
  *    `git ls-files '*.scene.json'` via `execSync` → 0 files; the same argv unquoted → 69. This
- *    is a live bug in `engine/scripts/migrate-assets.mjs:80` today (Phase 3 fixes it) — kept
+ *    was a live bug in `engine/scripts/migrate-assets.mjs`'s scene enumeration (Phase 3 fixed it) — kept
  *    here only as the reason every enumerator in this file uses `execFileSync`.
  * 2. **A hand-rolled `readdir` walker drifting from what the repo's own gates consider "the
  *    corpus"** — a blocklist walk misses a directory nobody remembered to list (`show-refs.mjs`
@@ -179,7 +179,7 @@ function rawRepoFiles(includeUntracked) {
  * @param {string | string[]} [options.under] Repo-relative POSIX prefix(es) — a file matches if
  *   `rel === under` or `rel` starts with `under + '/'`. Compared case-insensitively, segment by
  *   segment (a git index holding `Games/` against a worktree holding `games/` must still match —
- *   same reasoning as `engine/tests/assets/anchorZIndexMigrated.test.ts:69-77`'s `sceneFiles`).
+ *   the reason `anchorZIndexMigrated.test.ts`'s `sceneFiles` did this itself before it called here).
  * @param {RegExp | ((rel: string) => boolean)} [options.match] Tested against `rel`.
  * @param {Iterable<string>} [options.exclude] Path SEGMENT names to drop — a file is dropped if
  *   any of its `rel` segments is in this set. No default value: the shared default set (ignoring

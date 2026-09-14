@@ -272,7 +272,7 @@ describe('build-web.mjs warns (never silently) when the project-config gate cann
  *  per-clone temp-file naming) reached one of three implementations.
  *
  *  ⚠️ Wiring, not behaviour. A source census proves a script IMPORTS the seam; it cannot prove the
- *  seam is reached on the path that matters, and `cliBuildClaims.test.ts:165` records the scar
+ *  seam is reached on the path that matters, and `cliBuildClaims.test.ts`'s note above its "build-web.mjs inherits an ancestor claim" block records the scar
  *  where exactly that census stayed green through a deadlock. The behavioural cover is the
  *  no-esbuild subprocess case below, plus running the two scripts by hand.
  *

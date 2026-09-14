@@ -76,7 +76,7 @@ describe('alphaField wiring (color ↔ sibling opacity)', () => {
   it('no alpha sibling can render as an orphan standalone row', () => {
     // Two ways a sibling is kept out of the field list, and every one must take one:
     //  - it declares no FieldHint at all (Text3D.opacity) → never rendered; or
-    //  - it declares one, and Inspector.tsx:763 suppresses it because a color on the
+    //  - it declares one, and Inspector.tsx's TraitSection suppresses it because a color on the
     //    same trait claims it (UIElement.backgroundOpacity).
     // A declared hint that ISN'T claimed would render a duplicate opacity row next to
     // the slider that already edits it.

@@ -14,7 +14,7 @@
  * A block-comment OPENER sitting inside a LINE comment opens a phantom block that runs to the
  * next real terminator, and everything between is DELETED. That is not hypothetical: it was found
  * live in `games/court/runtime/systems.ts` (#411, fixed in `90d1dfc5d`/`2ef648a2d`) and never swept
- * out of the engine, where `runtime/rendering/Scene3D.tsx:28` writes the glob `runtime/**` in a
+ * out of the engine, where `runtime/rendering/Scene3D.tsx`'s comment on its `rawNow` import writes the glob `runtime/**` in a
  * line comment and blinds `determinismGuard.test.ts` to **82 lines including 22 import
  * statements**. Mutation-proved both directions: a `performance.now()` planted inside that window
  * left the guard green; the same line outside it failed. The comment explaining the determinism
@@ -533,7 +533,7 @@ export function stripHashComments(src: string): string {
       // because length and line parity both still hold.
       // What it costs: a `#` INSIDE a genuinely multi-line quoted string is now blanked. Measured
       // across all 35 tracked .sh/.yml files, exactly one such case exists today —
-      // `scripts/publish-engine-oss.sh:351`, inside a multi-line `node -e '…'` — and no guard
+      // `scripts/publish-engine-oss.sh`'s Team-ID check (a), inside its multi-line `node -e '…'` — and no guard
       // scans that file. All 13 `engine/scripts/**.sh` strip byte-identically old vs new.
       // Getting both right needs a real shell/YAML parser, which this is not.
       if (c === '\n') { quote = null; out += c; i += 1; continue; }
@@ -658,4 +658,40 @@ export function readScannedSource(absPath: string, opts: ReadScannedOptions = {}
       : stripComments(raw, { regexLiterals: language === 'js' });
   assertScanIsSane(raw, code, label, opts.sentinels);
   return { raw, code, path: absPath };
+}
+
+/**
+ * Would `readScannedSource` strip this path by its extension, or refuse it? For a guard that builds
+ * its corpus from "every file the scanner can read", so the corpus and the read cannot disagree.
+ */
+export function scanLanguageOf(filePath: string): ScanLanguage | undefined {
+  return LANGUAGE_BY_EXT.get(path.extname(filePath).toLowerCase());
+}
+
+/**
+ * ⚠️ **The COMMENTS of a file and nothing else: the inverse of `.code` (#1186).**
+ *
+ * For a guard whose subject IS comment prose (`sourceCommentCitations`: a comment pointing at a file by LINE
+ * NUMBER rots exactly as a doc citation does). It is derived from the strip rather than from a second scanner,
+ * because every stripper here blanks comment characters and nothing else, length- and
+ * line-preserving. So a character that differs between `raw` and `code` is a comment character.
+ * Everything else (code, and string CONTENT, which the strip keeps) becomes a space, and newlines
+ * stay, so a line count taken over this text is still the real file's line number.
+ *
+ * ⚠️ **Hand it a STRIPPED read.** A `comments: 'include'` read has `code === raw`, and the result is
+ * then all blank, which looks exactly like a file with no comments. A guard using this must assert
+ * its corpus yields comment text at all, or that mistake is a silent pass.
+ */
+export function commentText(scanned: Pick<ScannedSource, 'raw' | 'code' | 'path'>): string {
+  const { raw, code } = scanned;
+  if (raw.length !== code.length) {
+    throw new Error(`${path.basename(scanned.path)}: commentText needs a length-preserving strip `
+      + `(raw ${raw.length} vs code ${code.length}); without it no character can be attributed`);
+  }
+  let out = '';
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    out += c === '\n' ? '\n' : c !== code[i] ? c : ' ';
+  }
+  return out;
 }

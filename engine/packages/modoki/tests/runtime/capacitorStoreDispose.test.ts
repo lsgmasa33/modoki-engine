@@ -14,7 +14,7 @@ vi.mock('@capacitor/core', () => ({
   registerPlugin: vi.fn(() => ({ addListener })),
 }));
 
-// `reconcile` is what the `purchasesUpdated` callback (`capacitorStore.ts:98`) drives when it is
+// `reconcile` is what the `purchasesUpdated` callback (`CapacitorStoreBackend`'s constructor, `capacitorStore.ts`) drives when it is
 // NOT bailing on `disposed` — mocking the module it comes from is the seam that lets a test
 // observe that call without touching the real purchase ledger.
 const reconcile = vi.fn();
@@ -80,7 +80,7 @@ describe('CapacitorStoreBackend — dispose() vs. the in-flight addListener() ro
 });
 
 /** The OTHER half of the guard: the callback registered with `addListener` itself
- *  (`capacitorStore.ts:98`), not just the handle-removal `.then()` above. The native listener is
+ *  (in `CapacitorStoreBackend`'s constructor), not just the handle-removal `.then()` above. The native listener is
  *  live from the moment `addListener` is invoked — so a `purchasesUpdated` event can arrive
  *  BEFORE that promise even settles, let alone after `dispose()` — and this is what proves the
  *  callback bails rather than driving `reconcile()` against a torn-down session. Nothing in the

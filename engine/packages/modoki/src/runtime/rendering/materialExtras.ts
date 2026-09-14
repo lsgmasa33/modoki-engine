@@ -45,14 +45,14 @@
  *
  *  An earlier version of this comment claimed the opposite — that `getMaterialCacheKey()` skips
  *  `/^(is[A-Z]|_)/` and `userData`, so these values were invisible to it before and after. **That
- *  was a category error, measured wrong.** The skip regex (`RenderObject.js:701`) tests the
- *  PROPERTY NAME, and `getKeys` (`RenderObject.js:5-37`) walks the prototype chain pushing every
+ *  was a category error, measured wrong.** The skip regex (in `RenderObject.getMaterialCacheKey`) tests the
+ *  PROPERTY NAME, and `getKeys` (`RenderObject.js`) walks the prototype chain pushing every
  *  key that has a GETTER, enumerable or not. `lineColor` and `nprColorPreserve` are getters named
  *  without a `_`, so they were never skipped — where the BACKING field lives was always irrelevant
  *  to that loop.
  *
  *  The consequence is real, not just a wrong sentence. A number contributes
- *  `value !== 0 ? '1' : '0'` (`RenderObject.js:715`). A light-mask variant of a tint clone used to
+ *  `value !== 0 ? '1' : '0'` (`getMaterialCacheKey` again). A light-mask variant of a tint clone used to
  *  read `nprColorPreserve === 0` and contribute `'0'`; now it reads the carried `0.7` and
  *  contributes `'1'`. So those draws hash to a DIFFERENT pipeline than before — which is the
  *  correct direction (the variant now agrees with the tint clone it was cloned from, and #136 is

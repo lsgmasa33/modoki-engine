@@ -212,7 +212,7 @@ export function resolveAxis(
 
 /**
  * Whether this element can HOST the expander `minTapSize` emits. Mirrors the two structural gates
- * `UINode.tsx` applies inside `if (tapZone && takesClick)` (`:1353`-`:1366`), plus the clip gate.
+ * `UINode.tsx` applies inside `if (tapZone && takesClick)` (its `hosts` check), plus the clip gate.
  *
  * 1. **`elementType` must be `div`** — `input`/`range` render a VOID element and nothing can be
  *    nested inside one.
@@ -234,7 +234,7 @@ export function hostsExpander(ui: Fields, hasToggle: boolean): boolean {
 /**
  * Whether this entity is something the player AIMS AT — the population the 44 pt floor is about.
  *
- * ⚠️ **A binding is not a click binding.** `UINode.tsx:1163` reads
+ * ⚠️ **A binding is not a click binding.** `UINodeInner`'s `isInteractive` reads
  * `bindings.some(b => (b.event || 'click') === 'click')`. A slider binds `event: 'change'`, so it
  * is not a tap target; counting any-binding flags a control for a tap it never receives.
  *
@@ -254,7 +254,7 @@ export function isTapTarget(e: AuthoredEntity): boolean {
 
 /**
  * Whether the renderer would EMIT an expander here at all — `UINode.tsx`'s own
- * `takesClick = isInteractive || swallowsClicks` (`:1182`), the outer gate on the whole tap-zone
+ * `takesClick = isInteractive || swallowsClicks` (in `UINodeInner`), the outer gate on the whole tap-zone
  * branch.
  *
  * ⚠️ **`TouchControl` is an inert case in its own right, and it was in no list because nothing had
@@ -276,7 +276,7 @@ export function isTapTarget(e: AuthoredEntity): boolean {
 export function emitsExpander(e: AuthoredEntity): boolean {
   const ui = e.traits?.UIElement;
   const isInteractive = (e.traits?.UIAction?.bindings ?? []).some((b) => (b.event || 'click') === 'click');
-  // ⚠️ `&& !pointerThrough` is part of `swallowsClicks`, NOT a refinement of it (`UINode.tsx:1181`).
+  // ⚠️ `&& !pointerThrough` is part of `swallowsClicks`, NOT a refinement of it (`UINode.tsx`'s `UINodeInner`).
   // `UIElement`'s own doc states it: "Contradicts `pointerThrough`, which WINS." Omitting it made
   // this predicate report `emits: true` for a shield that the renderer drops entirely — so an
   // authored `minTapSize` there would pass the inert check while doing nothing on screen, which is

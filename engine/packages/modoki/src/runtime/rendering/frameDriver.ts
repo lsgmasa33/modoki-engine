@@ -13,7 +13,7 @@ import { captureFrame } from '../core/profilerCapture';
 import { recordCounterFrame } from '../core/profilerCounters';
 import { pollGpuTimings } from '../core/gpuTimings';
 // Names the CAUSE (a lost GPU device) alongside the SYMPTOM this module reports (frames stopped
-// pumping) — see `activeRenderer.ts:76`, which documents that link and the log-correlation gap
+// pumping) — see `activeRenderer.ts`'s "GPU fault channel" section, which documents that link and the log-correlation gap
 // it used to leave. `activeRenderer` imports only `three` types + `./clock`, so this is L2→L0
 // (rendering → core) and adds no cycle.
 import { getGpuFaultState, onRendererLost, type GpuFaultState } from '../core/activeRenderer';
@@ -356,7 +356,7 @@ export interface FrameLoopUnrecoverableInfo {
   /** ms since the last real frame executed, at the moment of declaration. */
   msSinceLastFrame: number;
   /** The GPU fault channel's state at declaration time, if any — names the cause alongside the
-   *  symptom (`activeRenderer.ts:76`). */
+   *  symptom (`activeRenderer.ts`'s "GPU fault channel" section). */
   gpuFault: GpuFaultState | null;
 }
 const unrecoverableListeners = new Set<(info: FrameLoopUnrecoverableInfo) => void>();
@@ -487,7 +487,7 @@ function checkStall() {
     // Prefer the LATCH — see its declaration for why the live `getGpuFaultState()` read is
     // provably too late in the real sequence (a renderer rebuild wipes it first).
     const gpuFault = latchedGpuFault ?? getGpuFaultState();
-    // ⚠️ CONSTANT text — no `since`/`recoveryAttempts` interpolated. `globalErrors.ts:75` warns
+    // ⚠️ CONSTANT text — no `since`/`recoveryAttempts` interpolated. `globalErrors.ts`'s `MAX_PER_BURST_WINDOW` doc warns
     // about exactly this shape: "the flood that DEFEATS dedupe by varying its text" (there: an
     // entity id; here it was `${Math.round(since)}ms`, distinct on every emission) burns
     // `MAX_ERRORS_PER_SESSION` in minutes and then silently drops every genuine crash for the

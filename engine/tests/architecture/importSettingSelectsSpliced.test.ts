@@ -19,7 +19,7 @@
  *  ⚠️ **Exemptions were keyed by expression text with NO FILE, and this header claimed that meant
  *  "a genuinely new control cannot inherit one by accident". That was false for a GENERIC name
  *  (#1123).** `'options'` is what a caller-supplied list is called in every generic control, so that
- *  one row pardoned `MaterialAssetView.tsx:206` AND `widgets.tsx:223` — two different components —
+ *  one row pardoned `MaterialAssetView`'s shader picker AND `widgets.tsx`'s select — two different components —
  *  and would have pardoned the next `options`-named select anywhere under `assetViews/**`, in any
  *  file, forever. The claim held only for distinctive names like `VIDEO_PRESETS`, which is why it
  *  read as true.

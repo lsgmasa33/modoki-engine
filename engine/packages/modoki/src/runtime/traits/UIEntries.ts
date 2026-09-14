@@ -67,7 +67,7 @@ export const UIEntries = trait({
    *
    *  ⚠️ Without this the resolver is only called when the window moves, and Court has two live
    *  cases that are not window moves: a level gets solved (the tile face changes, the page does
-   *  not), and the async-manifest wedge at `games/court/runtime/systems.ts:9447` where the
+   *  not), and the async-manifest wedge in `games/court/runtime/systems.ts`'s `syncLevelSelect`, where the
    *  ladder length goes 0→N and *"the sig would be IDENTICAL and the gate would skip forever"*.
    *  That bug is already written down as shipped once; a pooled view without an invalidation
    *  surface reproduces it exactly. */
@@ -123,7 +123,7 @@ export const UIEntries = trait({
 /** The bank's type and parser live in `entryPrefabBank.ts` and are re-exported here so every
  *  existing importer (`loaders/loadSceneFile.ts`, `runtime/ui/entriesSystem.ts`) is unchanged.
  *  ⚠️ NOT `plugins/asset-tree-shaker.ts` — that's a build plugin and parses the bank INLINE, on
- *  purpose, rather than importing engine source (see its own comment at `asset-tree-shaker.ts:566`).
+ *  purpose, rather than importing engine source (see its own comment in `asset-tree-shaker.ts`'s `probeTraitRefs`).
  *
  *  ⚠️ **Why they moved out of this file:** `loaders/sceneValidation.ts` needs to read the bank in
  *  order to resolve the view -> entry-prefab edge (#671), and that module is deliberately

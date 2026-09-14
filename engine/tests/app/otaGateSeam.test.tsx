@@ -101,7 +101,7 @@ describe('#509 the mandatory gate, composed through the real checkForUpdate', ()
       getState: async () => ({ stateJSON: JSON.stringify(state) }),
       stageUpdate: async () => { stageEntered.resolve(); await stageGate.promise; },
       stageUpdateDelta: async () => { stageEntered.resolve(); await stageGate.promise; },
-      // Mirrors the real plugin: writes `pending` and CLEARS `bootAttempts` (OtaPlugin.swift:368).
+      // Mirrors the real plugin: writes `pending` and CLEARS `bootAttempts` (ModokiOtaPlugin.activate).
       activate: async ({ name, version }: { name: string; version: string }) => {
         state.pending[name] = version;
         delete state.bootAttempts[name];

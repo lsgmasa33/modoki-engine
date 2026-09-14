@@ -116,7 +116,7 @@ const KNOWN_OUTSIDE_SCAN_DIRS: readonly string[] = [
    * cannot be exercised without playing them. Classified individually rather than as a block: */
 
   // REAL — the textbook #573 shape. `let payoutEpoch = 0` … `const epoch = payoutEpoch` …
-  // `if (epoch !== payoutEpoch) return` around an await (`systems.ts:4754-4767`), and the file's
+  // `if (epoch !== payoutEpoch) return` around an await (Court `systems.ts`'s `settleSolvePayout`), and the file's
   // own comment already calls it a banner. Three separate counters in one file.
   'games/court/runtime/systems.ts :: payoutEpoch, bonusSpinEpoch',
   // REAL — ad-hoc init/fullscreen-ad epochs in the shared app-services package.
@@ -124,8 +124,8 @@ const KNOWN_OUTSIDE_SCAN_DIRS: readonly string[] = [
   'games/3d-test/packages/app-services/src/ads.ts :: initEpoch',
   // REAL — an IAP epoch guarding an awaited purchase flow.
   'games/wordweave/runtime/systems.ts :: iapEpoch',
-  // ⚠️ FALSE POSITIVE, kept so the set is exact rather than silently filtered. `k` is a convex-hull
-  // LOOP INDEX (`let k = hi.length - 1` at :493, `let k = 0` at :505) that happens to be
+  // ⚠️ FALSE POSITIVE, kept so the set is exact rather than silently filtered. `k` is a binary-heap
+  // LOOP INDEX (`let k = hi.length - 1` and `let k = 0` in `nav.ts`'s `buildNavField`) that happens to be
   // zero-initialised and compared, which is all the detector can see. Do NOT "migrate" it. If the
   // detector ever learns to tell a loop counter from a liveness token, this row goes with it.
   'games/sling/runtime/field/nav.ts :: k',

@@ -125,7 +125,7 @@ function formatWarning(w: Error & { code?: string; detail?: unknown }): string {
  * **The defect (#955).** Node's default `'warning'` listener — an internal function literally named
  * `onWarning` — routes through `console.error`. By the time it fires, `console.error` is the tee
  * above, so EVERY process warning lands in `main.log` tagged `[error]`. On packaged Windows that is
- * one guaranteed `[error]` per launch (DEP0190, from the `shell: true` that `toolchain/index.ts:380`
+ * one guaranteed `[error]` per launch (DEP0190, from the `shell: true` that `toolchain/index.ts`'s `needsWinShell` doc
  * documents as load-bearing against `spawn EINVAL`), and `QA-PKG-0001` step 8 tells its runner to
  * read that log for failures. The honest failure mode is a runner filing a bug against a healthy
  * build — or learning to ignore `[error]` there, which is the assertion going quiet.

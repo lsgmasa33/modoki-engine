@@ -23,7 +23,7 @@
  * #633 measured it. Rolldown INLINES this module's body (and the three sibling side-effect
  * modules') into the ENTRY CHUNK's body, and by ES semantics an entry body runs only after every
  * one of its static imports has evaluated. So the bundler converts the side-effect IMPORT — the
- * one construct main.tsx:8-11 says runs early enough — into a body STATEMENT, which those same
+ * one construct main.tsx's `./installErrorCapture` import comment says runs early enough — into a body STATEMENT, which those same
  * comments say is too late. "Above App.tsx in main.tsx" therefore buys ordering against main.tsx's
  * STATEMENTS (React's mount and its effects — the #591 case) and nothing at all against a module
  * App.tsx transitively pulls in. Re-measured on a `--target web` build of games/sling (#633): the

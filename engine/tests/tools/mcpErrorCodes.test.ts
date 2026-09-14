@@ -43,7 +43,7 @@ function docCodes(): string[] {
 /** Where a code can legitimately be EMITTED (as opposed to merely declared in `ERROR_CODES`
  *  itself).
  *
- *  ⚠️ **This was four directories, and the file's own comment below (`:82-89`) recorded the hole:
+ *  ⚠️ **This was four directories, and the file's own comment below (on the `EntityResolveCode` subset test) recorded the hole:
  *  "That guard's SCAN_DIRS never included `packages/modoki/src`, and it passes for an unrelated
  *  reason." The remedy landed then was one hand-written test for the one file somebody had noticed
  *  — the BOUND was left in place, so the next file outside it had the same problem (#830).**

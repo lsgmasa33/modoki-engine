@@ -125,7 +125,7 @@ describe('MaterialBatchView refresher does not clobber not-yet-parked siblings (
 
   // The two tests above both build `next[p]` from `mats[p]` BEFORE calling `persistAssetEdit`, and
   // `next[p]` is the very same object reference the refresher's setter would write back — so
-  // `mats = { ...mats, ...next }` (line 96/74) already puts every path's post-edit doc into the
+  // `mats = { ...mats, ...next }` (in `writeAll` and `writeAllOld` below) already puts every path's post-edit doc into the
   // harness map by itself. Every assertion above reads `peekDirtyAsset`, the dirty REGISTRY, not
   // the harness map, so neither test can tell "the hook registered a setter" from "the hook
   // registered nothing at all" — gutting `useAssetViewRefreshers`' effect body to

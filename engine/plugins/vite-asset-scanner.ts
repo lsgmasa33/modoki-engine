@@ -276,7 +276,7 @@ export function readAssetGuid(absPath: string, type: string): string | undefined
  *  and the file rewritten — so every newly created JSON asset went out through this line.
  *  Measured live, and only live: the router's own route wrote the newline correctly and this
  *  overwrote it milliseconds afterwards, so the request looked right and the file was wrong.
- *  `meta-sidecar.ts:334` already appends its own; this now shares the router's one definition. */
+ *  `meta-sidecar.ts`'s `writeJsonAtomic` already appends its own; this now shares the router's one definition. */
 function writeJsonAtomic(absPath: string, json: unknown): void {
   const tmp = absPath + '.tmp';
   fs.writeFileSync(tmp, assetJsonBytes(json));

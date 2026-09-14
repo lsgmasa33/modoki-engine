@@ -144,7 +144,7 @@ describe('acquireModel — post-await release guard (#488 site 2)', () => {
     // prior modelCache block when one isn't passed and the type is unchanged, so
     // merely re-registering can't clear it — clearManifest() is what actually drops
     // it, matching what a torn-down entry looks like to invalidateModel's fallback
-    // (:432-434). acquireModel already resolved glbPath/lodPaths locally before this
+    // (its no-snapshot lodPaths branch). acquireModel already resolved glbPath/lodPaths locally before this
     // point, so the mutation only affects what invalidateModel's fallback can see.
     manifest.clearManifest();
     manifest.registerAsset(ISLAND_GUID, ISLAND, 'model'); // re-add with no modelCache

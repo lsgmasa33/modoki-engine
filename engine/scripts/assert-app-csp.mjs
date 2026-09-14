@@ -124,7 +124,7 @@ const child = spawn(bin, [`--user-data-dir=${userData}`], {
     MODOKI_BACKEND_PORT: String(BACKEND_PORT),   // per-clone — see the note above
     // Same reasoning, weaker stakes: unpinned, this leg's dev server took 5173 — the main
     // clone's editor PAGE port. MODOKI_VITE_PORT only seeds a PREFERENCE (findFreePort still
-    // runs, main.ts:339), so this cannot fail the leg if the port is busy; it just stops a
+    // runs in main.ts's `app.whenReady`), so this cannot fail the leg if the port is busy; it just stops a
     // throwaway smoke boot from sitting on a port a human's editor announces.
     MODOKI_VITE_PORT: String(BACKEND_PORT + 1),
   },

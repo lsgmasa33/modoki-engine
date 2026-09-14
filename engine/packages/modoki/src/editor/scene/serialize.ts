@@ -1191,7 +1191,7 @@ export function isSceneLoadInFlight(): boolean { return _loadsInFlight > 0; }
 
 /** `loadScene`'s outcome. `'superseded'` covers BOTH ways a load can lose to a newer one:
  *  cancelled early (SceneManager aborts the in-flight load — rejects with AbortError) and
- *  superseded in the winner's TAIL (`sceneManager.ts:885-900` — nothing left to cancel, so the
+ *  superseded in the winner's TAIL (`SceneManager.loadScene`'s step-11 tail guard — nothing left to cancel, so the
  *  loser's own `sceneManager.loadScene` resolves successfully and throws nothing). Neither case
  *  is `'failed'`: this op's own load did not fail, and it says nothing about whether the path
  *  exists. See the doc comment on `loadScene` for why this can't just be a boolean. */
@@ -1268,7 +1268,7 @@ export async function loadScene(
       },
     });
     if (!stillLive()) {
-      // Superseded in the WINNER'S TAIL (sceneManager.ts:885-900): our own `sceneManager.loadScene`
+      // Superseded in the WINNER'S TAIL (SceneManager.loadScene's step-11 tail guard): our own `sceneManager.loadScene`
       // resolved successfully — nothing threw, so the `catch` below never sees this case — but a
       // newer `loadScene` call already won. Running the writes below now would stomp the winner:
       // `setCurrentScenePath` would persist OUR path over the winner's (localStorage too, so the

@@ -318,7 +318,7 @@ export function isUnderOrSame(parent, child) {
   // ⚠️ **`rel.startsWith('..')` is WRONG and this function shipped it once.** It also rejects a
   // child whose NAME begins with two dots — `path.relative('/proj', '/proj/..bak')` is `'..bak'`,
   // which is inside the project and has a perfectly good relative form. Only the `..` SEGMENT
-  // means escaped. `projectPaths.ts:47` already carried this spelling with the same comment, and
+  // means escaped. `projectPaths.ts`'s `relativiseUnderProject` already carried this spelling with the same comment, and
   // `projectPaths.test.ts` has a case named for it; the SSOT was written with the version that
   // test exists to forbid, and review caught it.
   const escapes = rel === '..' || rel.startsWith(`..${path.sep}`);

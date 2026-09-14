@@ -11,7 +11,7 @@
  *  absence means anything.
  *
  *  Why this matters more than it sounds: the JS bridge carries `handleEval` — arbitrary JS
- *  execution on the device. And this exact invariant HAS drifted before; `engine/app/main.tsx:42`
+ *  execution on the device. And this exact invariant HAS drifted before; `engine/app/main.tsx`'s debug-bridge gate comment
  *  records it: "Previously this was ungated on native, so a RELEASE build shipped the eval-capable
  *  server."
  *
@@ -43,7 +43,7 @@ const MARKERS = [
   'app-identity',        // a debug-bridge protocol message type
   // 'GameDebug' USED to be a marker here and was retired — MEASURED (2026-09-03, two real
   // `games/sling` builds) as a FALSE POSITIVE: it reported "1 hits LEAKED" with debugBuild:false,
-  // pointing at `engine/packages/modoki/src/runtime/rendering/deviceCaps.ts:128`, which reads
+  // pointing at `engine/packages/modoki/src/runtime/rendering/deviceCaps.ts`'s `readDeviceModel`, which reads
   // `globalThis.Capacitor?.Plugins?.GameDebug?.getDeviceHardware()` off the GLOBAL for device-model
   // quality tiering — deliberate and shipped in EVERY build, including web-only demos, since
   // `1d9f73c86` (2026-08-07, "the iOS quality-tier allowlist could never fire — same dead-plugin
@@ -53,8 +53,8 @@ const MARKERS = [
   // real leak from its own noise. ⚠️ Do not restore it.
   '[debug-bridge]',      // the bridge's own log prefix (a string literal, so it can't be mangled) —
                          // only bridge.ts emits it
-  'startServer',         // the plugin method only bridge.ts calls (engine/app/debug/bridge.ts:1167,
-                         // 1201) — the only other references are in runtime/debug/**, itself
+  'startServer',         // the plugin method only bridge.ts calls (engine/app/debug/bridge.ts's initNativeBridge
+                         // and port-lifecycle start) — the only other references are in runtime/debug/**, itself
                          // debug-gated
   '[console-capture]',  // #591's eager install — now in main.tsx's STATIC graph, not a lazy chunk,
                          // so this is the one piece of the debug surface whose stripping is not

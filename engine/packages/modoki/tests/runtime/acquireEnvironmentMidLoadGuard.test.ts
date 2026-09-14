@@ -18,7 +18,7 @@
  *  callback, already closes that equivalent window for the environment cache.)
  *
  *  The guard is kept anyway — the brief that added it explicitly calls for symmetry with the
- *  other four, and `acquireModel`'s own doc comment (meshTemplateCache.ts ~:1521) states the
+ *  other four, and the ⚠️ comment on `acquireModel`'s post-await owner guard (meshTemplateCache.ts) states the
  *  identical precedent: an outer check that restates the right invariant, matches the sibling
  *  functions' shape, and stops being redundant the moment anything is added after it (e.g. a
  *  future transitive-dependency acquire on this path). This file exists to prove the guard does

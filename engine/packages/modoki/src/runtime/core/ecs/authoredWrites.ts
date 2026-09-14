@@ -24,7 +24,7 @@
  *  is skipped while stopped". `entriesSystem` runs at `UI_ENTRIES (270)`, which is ABOVE
  *  `TRANSFORM (200)`, so `runPipeline`'s `priority < TRANSFORM` gate does not skip it; it carries
  *  no sim check of its own, and it calls `entity.set` on the AUTHORED scroll-view entity
- *  (`entriesSystem.ts` ~`:741`/`:744`/`:1017`). Three further vectors sit outside the pipeline
+ *  (`entriesSystem.ts`'s `consumeEntryRequest` and `writeWindowState`). Three further vectors sit outside the pipeline
  *  entirely: the DOM scroll handler's `driveEntriesFromScroll`, the Timeline editor's preview, and
  *  action dispatch during preview.
  *
@@ -34,7 +34,7 @@
  *
  *  That is why #1042's proposal to extend the probe to `entity.set` was declined: the writes it
  *  would newly see are ones a save already cannot persist, so it would add noise rather than
- *  coverage. (#1042 cited `timelineSystem.ts:164`/`:264` as the live sites; those two really are
+ *  coverage. (#1042 cited `timelineSystem.ts`'s `scrubAnimator`/`applyTimelineState` as the live sites; those two really are
  *  sim-gated, at `ANIMATION-1 (149)` — but they were never the whole population.)
  *
  *  **What would make this boundary live:** an `entity.set` on a field that is NOT `runtimeOnly`,

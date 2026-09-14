@@ -44,7 +44,7 @@ describe('waitTwoFramesBounded', () => {
   });
 
   it('a LATE rAF after the timeout does not resolve twice or throw', async () => {
-    // `clearTimeout(timer)` lives in the INNER callback (`bootFrameWait.ts:21`), not the outer
+    // `clearTimeout(timer)` lives in the INNER callback (`waitTwoFramesBounded`'s `finish`), not the outer
     // one — a mock that only ever captures and drives the FIRST (outer) rAF never reaches it, so
     // deleting that `clearTimeout` outright left this test green. Capture BOTH chained callbacks
     // and drive them in order, the way a genuinely-late rAF delivery actually would.

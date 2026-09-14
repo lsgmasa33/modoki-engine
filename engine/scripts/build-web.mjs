@@ -168,7 +168,7 @@ async function validateProjectConfig() {
  *  artifacts were built from, and it is a per-MACHINE fact.
  *
  *  ⚠️ Deliberately NOT part of `healNativeProject`: a heal repairs machine/identity config, and burying
- *  a required step inside an optional one is the failure `electron/main.ts:271-274` argues against and
+ *  a required step inside an optional one is the failure `electron/main.ts`'s `healProjectOnOpen` docblock argues against and
  *  #150 actually shipped. It is its own call, in the main flow, where a reader can see it.
  *
  *  Every input comes from `project.config.json` now, so this passes only the project and the platform —

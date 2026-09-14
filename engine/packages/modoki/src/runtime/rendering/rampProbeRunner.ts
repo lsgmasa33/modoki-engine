@@ -350,7 +350,7 @@ function makeCpuNodes(): CpuNodes {
  *
  *  ── WHY THIS ARITHMETIC AND NOT A SYNTHETIC BUSY-LOOP ─────────────────────────────────────
  *  `Matrix4.compose` followed by `multiplyMatrices` is LITERALLY what the engine's transform
- *  propagation runs (`core/ecs/transformPropagationSystem.ts` lines 57 and 284) — same three
+ *  propagation runs (`core/ecs/transformPropagationSystem.ts`'s `makeMatrix` compose and the system's world `multiplyMatrices`) — same three
  *  called methods, same shapes, same allocation-free reuse of preallocated matrices. So the JIT
  *  sees code it has an equivalent of in the real frame, and the number means something about that
  *  frame rather than about a loop nobody runs.

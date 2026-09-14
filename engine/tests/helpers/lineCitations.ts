@@ -161,6 +161,65 @@ export function citesALineInProse(text: string): string[] {
 }
 
 /**
+ * A bare `:NNN` written loose in text rather than as a whole code span: `(:1387, …)`, `see :285`.
+ *
+ * `isBareLineSpan` is asked about a WHOLE span, which is how Markdown writes it. A source comment
+ * has no spans to lean on, so the candidate has to be cut out of running text first. It must not
+ * start inside a larger token: after a word character, `.` or `:` it belongs to a `file.ts:12`
+ * (which `citesALine` owns), a time (`12:30`) or a `host:port`. After `/` it is a URL path. The
+ * second lookbehind names the VALUE shapes measured in comments, each by its two-character context
+ * rather than by the bare punctuation: a JSON key `"value":1` (word + quote), a call `onResume():97`
+ * or `adb (USB):9097` (`()` or word + `)`), an IPv6 host `[::1]:5173` (`:]`), a lone `*:22` listener
+ * (a single `*`), and `[a]:5` / `{b}:6`. Excluding the punctuation outright was tried and dropped
+ * real citations: `**:1745**`, `':1745'` and `` (`saveSync.ts`):1745 `` (#1186 close-out review).
+ *
+ * ⚠️ **No digit floor, unlike `isBareLineSpan` (#1186 close-out).** That floor exists so a QA case can
+ * write a curve-handle id as a whole span (`` `:11` ``); in a comment such ids appear only in the
+ * rule's own specs, which the guard's ledger counts. Borrowing the floor left `(:47)`, `:7` and a stale
+ * `` `:74` `` live in comments under a guard reporting green.
+ */
+export function bareLineRefsInText(text: string): string[] {
+  return [...text.matchAll(/(?<![\w.:/])(?<!\w"|\w\)|\(\)|[^*]\*|^\*|:\]|\w\]|\w\})(:\d+(?:[-,]\d+)*)(?![\w:])/g)]
+    .map((m) => m[1]);
+}
+
+/**
+ * Comment DELIMITERS, blanked so a citation glued to one is still a token (#1186 close-out).
+ * `commentText` keeps `//`, `/*` and `*\/` because they are comment characters, and Markdown never
+ * has them: `//foo.ts:12` read as a URL, and `foo.ts:12*\/` kept a trailing `/` no wrapper class
+ * strips. Only an opener at the start of a comment or after whitespace is blanked, so a URL's `//`
+ * survives for `citesALine`'s URL exemption. A `#` needs nothing: `citesALine`'s suffix test is not
+ * anchored at the start, so `#foo.sh:12` is caught as it stands.
+ */
+function blankCommentDelimiters(line: string): string {
+  return line
+    .replace(/(^|\s)(\/\/+|\/\*+)/g, (_m, lead: string, d: string) => lead + ' '.repeat(d.length))
+    .replace(/\*+\//g, (d) => ' '.repeat(d.length));
+}
+
+/**
+ * Every line citation in the COMMENTS of a source file, by line (#1186).
+ *
+ * `text` is `commentText(readScannedSource(…))`: comment characters kept, everything else blanked,
+ * newlines preserved, so `line` is the real file's line number. The same four detectors the docs
+ * gates run, applied per line. `citesALine` gets whitespace tokens (the `nonCodeText` route, since a
+ * comment has no code spans to split), and bare `:NNN` gets `bareLineRefsInText`.
+ */
+export function lineCitationsInComments(text: string): Array<{ line: number; hit: string }> {
+  const out: Array<{ line: number; hit: string }> = [];
+  text.split('\n').forEach((raw, i) => {
+    if (!/\S/.test(raw)) return;
+    const body = blankCommentDelimiters(raw);
+    const line = i + 1;
+    for (const token of body.split(/\s+/)) if (token && citesALine(token)) out.push({ line, hit: token });
+    for (const hit of bareLineRefsInText(body)) out.push({ line, hit });
+    for (const hit of citesALineInProse(body)) out.push({ line, hit });
+    for (const hit of citesALineByMarker(body)) out.push({ line, hit });
+  });
+  return out;
+}
+
+/**
  * Tokens inside inline code spans and fenced blocks — never bare prose.
  *
  * BOTH are split on whitespace. An inline span used to be kept whole, which quietly defeated

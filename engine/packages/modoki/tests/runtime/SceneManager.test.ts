@@ -1066,8 +1066,8 @@ describe('#888: a throwing onWorldSwap listener must not abort loadScene', () =>
   // Combined into one test to stay within koota's 16-world limit, matching the block below.
   //
   // Pre-fix, `setCurrentWorld` fired its ~50 subscribers in a bare loop, so a throw unwound out of
-  // `SceneManager.ts:1061` BEFORE `nextWorld = null` (:1062) and `swapped = true` (:1065). The
-  // `catch` at :1188 then read both stale flags and did exactly the two things they exist to
+  // `loadScene`'s `setCurrentWorld(promotedWorld)` BEFORE `nextWorld = null` and `swapped = true`. The
+  // outer `catch (err)` then read both stale flags and did exactly the two things they exist to
   // prevent: released every `allocatedSceneId` — the resources of the scene now on screen — and
   // called `destroy()` on the world `_currentWorld` had just been pointed at.
   it('completes the load, keeps its resources, and leaves the promoted world live', async () => {

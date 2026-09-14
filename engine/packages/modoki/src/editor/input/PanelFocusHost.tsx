@@ -16,12 +16,13 @@
  *     would risk a subtle layout regression in ~13 panels for zero benefit; the element
  *     still exists in the DOM tree, so `closest()` and event propagation are unaffected.
  *
- *  2. `data-panel-scope`, NOT `data-editor-panel` — the legacy attribute is READ by
- *     Hierarchy's document-level keydown (`Hierarchy.tsx:860`) to decide whether to yield.
- *     Stamping it on every panel now would silently change that guard's behaviour
- *     (Hierarchy would start bailing where it previously ran) — a real change smuggled
- *     into a phase that is supposed to be revertable on its own. The legacy attribute and
- *     its reader are both deleted in P6; the two mechanisms do not interact until then.
+ *  2. `data-panel-scope`, NOT `data-editor-panel` — the legacy attribute was READ by
+ *     Hierarchy's document-level keydown to decide whether to yield.
+ *     Stamping it on every panel then would silently have changed that guard's behaviour
+ *     (Hierarchy would have started bailing where it previously ran) — a real change smuggled
+ *     into a phase that is supposed to be revertable on its own. P6 replaced that keydown reader
+ *     with scoped bindings; the legacy attribute itself is still stamped (Hierarchy, Assets) and
+ *     still read by `engine/app/debug/domResolve.ts`'s `describeOccluderContext`.
  *
  *  Focus is set on capture-phase mousedown and does NOT consume the event — the click
  *  must still reach the panel. Mouse is never focus-FILTERED (DOM hit-testing already

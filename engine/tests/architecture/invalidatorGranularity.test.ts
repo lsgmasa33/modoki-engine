@@ -216,10 +216,10 @@ function scanTeardownBackedInvalidators(): { name: string; file: string; code: s
  *  Texture'])` plus "still found") is the ledger's over-blessed arm. */
 const EXEMPT_FROM_PER_KEY_CHECK: ReadonlyArray<{ item: string; reason: string }> = [
   // `invalidateTexture` (textureResolver.ts): `loadTexture3D` inserts its cache entry into
-  // `texCache` SYNCHRONOUSLY, before any `await` (textureResolver.ts:510,
+  // `texCache` SYNCHRONOUSLY, before any `await` (`loadTexture3D`,
   // `texCache.set(key, entry)`), and every write that happens AFTER an await identity-checks
   // against the captured entry/texture instead of trusting a re-lookup by key
-  // (textureResolver.ts:507, `if (texCache.get(key) === entry) texCache.delete(key);`; :538,
+  // (`loadTexture3D`'s `.catch`: `if (texCache.get(key) === entry) texCache.delete(key);`; `releaseTexture3D`:
   // `if (entry.texture && entry.texture !== tex) return;`). A load that resolves after
   // `invalidateTexture` has evicted its key therefore has no path back into the map — there is no
   // stale-generation window for a key bump to close, which is exactly what `.invalidateKey(`

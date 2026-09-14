@@ -37,8 +37,8 @@ const REAP = path.resolve(__dirname, '..', '..', 'scripts', 'lib', 'repo-reap.sh
  *    `os.tmpdir()` — native `E:\…` — and `reap_alt_pattern`'s absolute-root precondition is
  *    `case "$PHYS" in /*)`, a POSIX spelling of "is absolute". A native Windows path fails it, so
  *    the whole second-spelling mechanism yielded NOTHING and two cases failed. The harness was
- *    feeding the helper a shape no production caller can produce (`launch-editor.sh:29,34` and
- *    `stop-editor.sh:25,29` both use bash `pwd`/`pwd -P`), so on Windows it went red AND proved
+ *    feeding the helper a shape no production caller can produce (`launch-editor.sh`'s `REPO`/`REPO_LOGICAL` and
+ *    `stop-editor.sh`'s `REPO`/`REPO_PHYS` both use bash `pwd`/`pwd -P`), so on Windows it went red AND proved
  *    nothing. Roots now come from `cloneRootSpellings`, which runs those same two commands.
  *
  *  ⚠️ **Keep the two spellings apart at the boundary.** `marker()` is NATIVE and is what `sleeper`

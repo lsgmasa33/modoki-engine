@@ -133,7 +133,7 @@ describe('dispatcher — text-field tier', () => {
   });
 
   it('does not treat a checkbox as a text field', () => {
-    // editor-multi-select.spec.ts:52 presses Cmd+Z with a checkbox focused and expects
+    // editor-multi-select.spec.ts's "Cmd+Z restores each" test presses Cmd+Z with a checkbox focused and expects
     // the SCENE undo to run.
     const run = vi.fn();
     register({ id: 'app.undo', keys: 'meta+z', scope: 'app-chord', run });

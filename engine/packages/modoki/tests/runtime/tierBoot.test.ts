@@ -120,7 +120,7 @@ describe('⚠️ resolving before the project\'s tiers are loaded — the orderi
 
 describe('live calibration on a project with no Scene3D', () => {
   it('⭐ TICKS the calibration loop — the half of #203 the issue did not record', () => {
-    // `tickTierCalibration` is called from `Scene3D.tsx:358` and nowhere else, so a 2D project had
+    // `tickTierCalibration` is called from `Scene3D.tsx`'s `renderFrame` loop and nowhere else, so a 2D project had
     // no live calibration in EITHER direction: it could not be demoted when it dropped frames and
     // could not be promoted when it had headroom. Resolving a tier at boot without this would buy
     // a first guess with no way to correct it.

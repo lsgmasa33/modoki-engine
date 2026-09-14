@@ -775,7 +775,7 @@ function App() {
         // `pagehide` backstop below over-triggering on iOS, or `shutdownRealmThenReload()`'s
         // throwing route re-arming the latch while leaving ads dead — a pre-existing gap this
         // also closes, since nothing else ever called `ads.init()` a second time). Gated the same
-        // way as the boot-time init above (`Capacitor.isNativePlatform()`, line ~389) — off-device
+        // way as the boot-time init above (its `Capacitor.isNativePlatform()` gate around `ads?.init()`) — off-device
         // `ads.init()` is already a no-op, but mirroring the gate keeps the two call sites reading
         // the same.
         //

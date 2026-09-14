@@ -32,7 +32,7 @@ import { assertDeclaredListIsComplete } from '../helpers/declaredList';
 import { readScannedSource } from '@modoki/engine/testing';
 
 /** ⚠️ **This listed THREE files while a sibling guard over the same subject listed six (#830).**
- *  `routeCoverage.test.ts:31` enumerates "every file that dispatches on an `/api/*` path" as six;
+ *  `routeCoverage.test.ts`'s `ROUTE_FILES` enumerates "every file that dispatches on an `/api/*` path" as six;
  *  this one scanned three, and nothing compared them. `electron/backendServer.ts` and
  *  `plugins/vite-asset-scanner.ts` both dispatch on `/api/` and were never read here — so a bare
  *  `200 {ok:false}` in either was invisible to the guard written to forbid exactly that.

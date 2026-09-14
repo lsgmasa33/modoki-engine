@@ -561,7 +561,7 @@ describe('Application init options (#38)', () => {
 // ── #1000: releasing Pixi's PROCESS-GLOBAL pools is a LAST-ONE-OUT decision ──
 //
 // `app.destroy(true)` clears the module-level `TexturePool` singleton for the whole process
-// (`AbstractRenderer.mjs:250-252` -> `GlobalResourceRegistry.release()`), so one surface's slot
+// (`AbstractRenderer.destroy`'s `releaseGlobalResources` -> `GlobalResourceRegistry.release()`), so one surface's slot
 // teardown destroyed render textures another live surface's BindGroups were bound to. The fix is
 // the options object these tests read: `releaseGlobalResources` must be false while any other
 // Application is live, and true for the last one — skipping it forever would trade a crash for a
@@ -575,7 +575,7 @@ describe('Application init options (#38)', () => {
 //
 // What these DON'T prove: that `{releaseGlobalResources: false}` actually suppresses Pixi's sweep,
 // or that `{removeView: true}` still removes the canvas. Both are claims about pixi 8.20.1's own
-// source, read at `AbstractRenderer.mjs:250-252` and `ViewSystem.mjs:76-82`; no jsdom test can
+// source, read in `AbstractRenderer.destroy` and `ViewSystem.destroy`; no jsdom test can
 // exercise them, and a mock asserting them would be asserting itself.
 describe('Pixi global resource pools (#1000)', () => {
   /** The options object our code handed to `Application.destroy`, for the Nth destroy call. */

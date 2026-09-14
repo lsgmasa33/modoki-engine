@@ -421,7 +421,7 @@ describe('isUnderOrSame (#881)', () => {
 
   it('accepts a child whose NAME begins with two dots', () => {
     // ⚠️ Regression: this function shipped `rel.startsWith('..')`, which reads `..bak` — a
-    // perfectly ordinary directory INSIDE the root — as an escape. `projectPaths.ts:47` already
+    // perfectly ordinary directory INSIDE the root — as an escape. `projectPaths.ts`'s `relativiseUnderProject` already
     // carried the correct spelling with this same comment and its suite has a case named for it;
     // the SSOT was written with the version that test exists to forbid. Only the `..` SEGMENT
     // means escaped.

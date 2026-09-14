@@ -21,7 +21,7 @@
  *  that the helper preserves the value when called. It once kept passing 2/2 after a reviewer
  *  deleted `migrateV12toV13(data);` from `loadSceneFile.ts`. The test that DOES drive the real
  *  loader (and goes red on that mutation) is
- *  `engine/packages/modoki/tests/runtime/loadSceneFile.test.ts:1734-1821`
+ *  `engine/packages/modoki/tests/runtime/loadSceneFile.test.ts`
  *  (`describe('migrateV12toV13 (UIAnchor.zIndex removal)')`) — this test is a corpus/fixture check
  *  alongside it, not a substitute for it. */
 import { describe, it, expect } from 'vitest';

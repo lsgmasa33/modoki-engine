@@ -1,7 +1,7 @@
 /** `bootstrap-game-deps.mjs` must vendor engine plugins BEFORE installing a game's deps, and
  *  record the vendor marker only AFTER the install succeeds (#650, the smaller half of that
  *  issue). `engine/electron/main.ts`'s `ensureProjectDeps` already runs vendor → install →
- *  write-marker in that order, with its own comment (`:322-329`) explaining why: vendoring is
+ *  write-marker in that order, with its own vendoring-failure `catch` comment explaining why: vendoring is
  *  what rewrites an engine plugin's dep from the placeholder `"*"` to a real
  *  `file:plugins/<name>-<hash>.tgz`, and those plugins are not on the public npm registry — so
  *  installing first (or never vendoring at all, which is what this script did before #650) means

@@ -50,7 +50,7 @@ export function parseBuildTarget(argv, env) {
     return { ok: false, message: usage };
   }
 
-  // F1: mirrors vite.config.ts:226's authoritative check (`process.env.VITE_PLAYABLE === '1'`)
+  // F1: mirrors vite.config.ts's authoritative `isPlayable` check (`process.env.VITE_PLAYABLE === '1'`)
   // exactly — a truthy check here (the old bug) treated `VITE_PLAYABLE=0` as "on" and hard-failed
   // a legitimate `--target web` build even though vite itself reads `0` as off.
   if (env.VITE_PLAYABLE === '1' && target !== 'playable') {

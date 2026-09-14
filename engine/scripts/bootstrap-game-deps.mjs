@@ -43,7 +43,7 @@
  * already be committed — stale, on a clone where the plugin's SOURCE has since changed — with no
  * error at all: npm installs a `file:` spec that already resolves just fine, it just isn't the
  * CURRENT one. `engine/electron/main.ts`'s `ensureProjectDeps` runs vendor → install → write-marker
- * in that order for exactly this reason (see its own comment, `:322-329`); this mirrors it. Loaded
+ * in that order for exactly this reason (see its heal-on-open vendoring comment); this mirrors it. Loaded
  * through `loadVendorPlugins.mjs` (not a direct import) because this is a plain `.mjs` script and
  * `vendorPlugins.ts` is TypeScript — same seam `build-web.mjs`/`add-native-targets.mjs` already use.
  */

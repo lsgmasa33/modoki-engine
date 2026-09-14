@@ -11,7 +11,7 @@ afterEach(() => { document.body.innerHTML = ''; });
 /** Dispatch a wheel on `target` through a capture-phase listener that runs the forwarder,
  *  mirroring how EditorApp attaches it. Returns the send spy + whether default was prevented.
  *
- *  `passive: false` is LOAD-BEARING and must match EditorApp.tsx:891. A `wheel` listener on
+ *  `passive: false` is LOAD-BEARING and must match EditorApp's Cmd/Ctrl+wheel zoom effect. A `wheel` listener on
  *  window/document/body is passive BY DEFAULT (per the DOM spec, and in every real browser), and
  *  `preventDefault()` from a passive listener is silently ignored — which would let the browser
  *  page-zoom on Ctrl+wheel instead of the editor's UI zoom. jsdom 26 did not implement the passive

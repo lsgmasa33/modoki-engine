@@ -77,10 +77,10 @@ export const unpatchedLog: (...args: unknown[]) => void = console.log.bind(conso
 // console.error". It was not pristine: `engine/app/main.tsx` imports `./installErrorCapture` (which
 // calls `installGlobalErrorHandlers()`, synchronously, at module eval) ABOVE `./installConsoleRing`
 // (which is what first imports and evaluates THIS module) — so by the time a module-scope
-// `console.error.bind(console)` here would run, `globalErrors.ts:490` has ALREADY replaced
+// `console.error.bind(console)` here would run, `globalErrors.ts`'s `installGlobalErrorHandlers` has ALREADY replaced
 // `console.error` with its Crashlytics-reporting wrapper. Binding "console.error" at that point
 // captures that wrapper, not the real thing — there is no way to reach past it from this module,
-// and reordering the imports is not the fix (`main.tsx:12-15` documents why `installErrorCapture`
+// and reordering the imports is not the fix (`main.tsx`'s comment on `./installErrorCapture` documents why `installErrorCapture`
 // must stay the inner wrap).
 //
 // That would have been SAFE for re-entrancy — globalErrors' wrapper sits INNER to this ring's own
@@ -395,11 +395,11 @@ export function installConsoleRing(opts?: ConsoleRingOptions): void {
  *
  *  ⚠️ DO NOT "SIMPLIFY" THIS INTO A `console[level](...)` CALL. That looks tidier (one recording
  *  path instead of two) and it silently reintroduces a defect this repo already measured and fixed:
- *  `runtime/core/globalErrors.ts:490` wraps `console.error` and reports to Crashlytics, and its
- *  de-duplication (`:385-389`) only recognises a call whose SOLE argument is an `Error` OBJECT,
+ *  `runtime/core/globalErrors.ts`'s `installGlobalErrorHandlers` wraps `console.error` and reports to Crashlytics, and its
+ *  de-duplication (`captureConsoleError`) only recognises a call whose SOLE argument is an `Error` OBJECT,
  *  keyed in a WeakSet. A synthetic STRING cannot match it, so routing an already-reported uncaught
  *  error back through `console.error` files a SECOND Crashlytics issue for the same fault — the
- *  "two issues per fault" symptom documented at `globalErrors.ts:366-377` (measured on a Galaxy
+ *  "two issues per fault" symptom documented in `globalErrors.ts`'s `alreadyReported` doc (measured on a Galaxy
  *  S22, 2026-08-20). Writing straight into the ring keeps the diagnostic line and reports nothing. */
 export function recordConsoleRingEntry(level: ConsoleRingLevel, args: unknown[]): void {
   record(level, args);
@@ -465,7 +465,7 @@ export function getConsoleRingBootPrefixCount(): number {
  *  synchronous notify from a warn/error raised during render would be a setState-during-render
  *  from the caller's perspective (see `runtime/debug/consoleCapture.ts`'s `bump()` doc comment for
  *  the measured incident this mirrors), and is pinned by
- *  `engine/tests/ui/debugErrorToaster.test.tsx:84`'s sibling ring. `version` still bumps
+ *  the sibling ring in `engine/tests/ui/debugErrorToaster.test.tsx`'s "does NOT notify … synchronously" test. `version` still bumps
  *  immediately, so a snapshot taken right after a log call is already correct even before the
  *  microtask runs. */
 export function subscribeConsoleRing(fn: () => void): () => void {

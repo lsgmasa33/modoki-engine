@@ -539,7 +539,7 @@ describe('a failed cube build restores the renderer and source state it dirtied'
 });
 
 describe('per-renderer discriminant (#775 — the cross-renderer bug this cache exists to avoid)', () => {
-  // envPmrem.ts:71-75 is explicit that the per-renderer WeakMap is deliberate, not incidental:
+  // envPmrem.ts's comment on `envDerivedBySource` is explicit that the per-renderer WeakMap is deliberate, not incidental:
   // holding a renderer strongly would pin a DISPOSED renderer alive (#720's shape), so the cache
   // must stay keyed by renderer identity rather than collapsing to a single Map<source, target>.
   // Every OTHER test in this file uses exactly one `const renderer = {}`, so a shared-Map
@@ -620,7 +620,7 @@ describe('per-renderer discriminant (#775 — the cross-renderer bug this cache 
       // A's cached failure" (no second generate call, straight to undefined) apart from "B made
       // its own real attempt and that attempt also failed" (a second generate call). The negative
       // cache is per-renderer (`envDerivedFailureCache` is a `WeakMap<renderer, ...>`,
-      // envPmrem.ts:89), so it must be the latter.
+      // in envPmrem.ts), so it must be the latter.
       cube.failSources.add(source);
 
       expect(getEnvCubeTexture(rendererA, source), 'A fails as instructed').toBeUndefined();

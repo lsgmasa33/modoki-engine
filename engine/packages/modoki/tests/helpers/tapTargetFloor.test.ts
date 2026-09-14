@@ -181,7 +181,7 @@ describe('who is a tap target, and who gets an expander', () => {
   });
 
   it('drops a shield whose swallow is overridden by pointerThrough', () => {
-    // ⚠️ `swallowsClicks` is `swallowClicks === true && !pointerThrough` (`UINode.tsx:1181`) —
+    // ⚠️ `swallowsClicks` is `swallowClicks === true && !pointerThrough` (`UINode.tsx`'s `UINodeInner`) —
     // `UIElement`'s own doc says "Contradicts `pointerThrough`, which WINS". Reading only
     // `swallowClicks` reported `emits: true` for an element the renderer drops entirely, so an
     // authored `minTapSize` there passed the inert check while doing nothing on screen. Nothing in

@@ -115,7 +115,7 @@ describe('`f` frame-selected — Scene view / Hierarchy ONLY, via the real canFr
   });
 
   it('fires from the HIERARCHY — the pinned e2e behaviour', () => {
-    // editor-hierarchy.spec.ts:84 presses `f` after clicking a Hierarchy row and expects
+    // editor-hierarchy.spec.ts's "F key frames the selected entity" test presses `f` after clicking a Hierarchy row and expects
     // SceneView to frame the entity.
     expect(resolve('f', ctx({ focusedPanel: 'hierarchy' }))?.id).toBe('hierarchy.frameSelected');
   });

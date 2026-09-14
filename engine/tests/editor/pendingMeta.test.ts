@@ -977,7 +977,7 @@ describe('the read-failed refusal is keyed on the DOCUMENT (#845/#871/#880)', ()
    *
    *  Under the path-keyed flag A's failure armed the PATH — and `readMetaPreferringPark` returns
    *  early on a park and never reaches the network, so nothing could clear it. B's next
-   *  postprocessor change was then refused with `Inspector.tsx:1487` having already moved the
+   *  postprocessor change was then refused with `Inspector.tsx`'s `handlePostprocessorChange` having already moved the
    *  dropdown and advanced `metaRef.current`: the control moved, no dirty badge appeared, and the
    *  edit was dropped with only a `console.error`. Recovery was Cmd+S, then reselect.
    *

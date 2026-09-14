@@ -94,7 +94,7 @@ public class ModokiIapPlugin extends Plugin {
      *   - The PARK runs on a Play Billing worker: `queryProductDetailsAsync` submits to
      *     `Executors.newFixedThreadPool(availableProcessors())` and invokes the callback directly
      *     with no Handler post, and the park sits inside that callback. NOT main, and NOT
-     *     Capacitor's `HandlerThread("CapacitorPlugins")` (`Bridge.java:138`/`:854`), which only
+     *     Capacitor's `HandlerThread("CapacitorPlugins")` (`Bridge`'s `handlerThread`, posted to by `callPluginMethod`), which only
      *     carries purchase()'s outer body.
      *   - `onPurchasesUpdated` and the WebViewListener run on MAIN.
      *   - `unpark()` is reached from both.
@@ -121,7 +121,7 @@ public class ModokiIapPlugin extends Plugin {
      *
      * ⚠️ On Android today the keep-alive is INERT rather than a leak, and #514 was filed on the
      * opposite reading — do not re-diagnose it. `Bridge.callPluginMethod` saves a call only if it
-     * is kept-alive at the moment the plugin METHOD RETURNS (Bridge.java:842-845), and this call
+     * is kept-alive at the moment the plugin METHOD RETURNS (Bridge.callPluginMethod's isKeptAlive check), and this call
      * is parked several async hops later, so it never reaches `savedCalls`; `native-bridge.js`
      * deletes a promise call's JS callback on settle whatever `save` says. This exists because
      * the lifecycle should be closed where the call is settled — and because the day someone
@@ -181,16 +181,16 @@ public class ModokiIapPlugin extends Plugin {
      * `BridgeWebViewClient.onPageStarted` right before this listener fires — clears
      * `savedCalls` and every plugin's event listeners. It does NOT touch plugin fields, so
      * `awaitingPurchase` keeps pointing at a call whose realm is gone, and every `purchase()`
-     * for that product hits the "already in progress" reject at `:536` forever after.
+     * for that product hits the "already in progress" reject in `purchase` forever after.
      *
      * `Bridge.addWebViewListener` survives every reset — the listener LIST is not cleared by
      * `Bridge.reset()` — so one registration lasts the life of the plugin instance.
      *
      * ⚠️ **Registered here, at park time, and NOT from `load()` — a listener added in `load()` is
-     * silently DISCARDED.** `Bridge`'s constructor calls `registerAllPlugins()` (`Bridge.java:231`),
+     * silently DISCARDED.** `Bridge`'s constructor calls `registerAllPlugins()` (in the `Bridge` constructor),
      * which is what runs `Plugin.load()`; `Bridge.Builder.create()` then calls
-     * `bridge.setWebViewListeners(...)` (`:1617`) eighteen lines later, and that setter REPLACES
-     * the whole list (`:1465`) instead of appending to it. So anything `load()` registered is gone
+     * `bridge.setWebViewListeners(...)` (in `Bridge.Builder.create`) right after, and that setter REPLACES
+     * the whole list (`Bridge.setWebViewListeners`) instead of appending to it. So anything `load()` registered is gone
      * before the first navigation, and `BridgeWebViewClient.onPageStarted` — which iterates
      * `bridge.getWebViewListeners()` — walks a list that never contained it.
      *

@@ -1868,9 +1868,9 @@ export class Scene2DRenderer {
           // an editor trait write on ANY entity). Re-issuing the shape for a pure move is not
           // merely wasted tessellation: `gfx.clear()` emits GraphicsContext 'update' →
           // Graphics.onViewUpdate → RenderGroup.onChildViewUpdate → the VIEW list, where
-          // `validateRenderable` returns true for anything batchable (GraphicsPipe.js:34-42) →
+          // `validateRenderable` returns true for anything batchable (pixi's GraphicsPipe.validateRenderable) →
           // `structureDidChange` → `_buildInstructions` for the WHOLE render group
-          // (RenderGroupSystem.js:104-108). One drifting square re-batches every sibling around it.
+          // (RenderGroupSystem._updateRenderGroups). One drifting square re-batches every sibling around it.
           // PixiJS is right to do that with a view change — we were manufacturing the view change.
           // `geomSig` lives on the SLOT, so a rebuilt slot (undefined) always draws.
           const geomSig = `${colliderMode ? 'c' : rend.sprite}|${rend.width}|${rend.height}|${px}|${py}|${rend.color}|${colliderSig}`;
@@ -2678,7 +2678,7 @@ export class Scene2DRenderer {
         // rebuild key would resurrect #677's per-frame geometry teardown.
         //
         // Derivation of `effScale`: the canvas root container is scaled by (scaleX, scaleY)
-        // (~:1487 above) and this container by (wt.sx * comp.x, wt.sy * comp.y) (below). Since
+        // (renderFrame's canvas-root `slot.container.scale.set`) and this container by (wt.sx * comp.x, wt.sy * comp.y) (below). Since
         // `comp.x = comp.scale / scaleX` (canvas2DScaler.ts's `compensateX`), the per-axis product
         // is `comp.scale * wt.sx` — `comp.x`/`comp.y` and `scaleX`/`scaleY` cancel EXACTLY, so the
         // on-screen factor is the canvas's own uniform scale times the entity's WORLD scale. `comp`
@@ -3021,7 +3021,7 @@ export class Scene2DRenderer {
     // pool has no such caller — `editorCanvas2DPool` is a module singleton whose only teardown is
     // this method. Predicted (NOT observed on a running editor) end state: stuck slots accumulate
     // to `MAX_SLOTS` (6), after which `allocate` refuses and warns and the 2D viewport draws
-    // nothing. That consequence is derived from `canvas2DPool.ts:508`, not measured.
+    // nothing. That consequence is derived from `canvas2DPool.ts`'s `takeFreeSlot` `MAX_SLOTS` refusal, not measured.
     // Idempotent: it acts only on `boundBySim` slots and clears that flag, so the runtime's
     // existing stop-then-destroyPool sequence is unaffected.
     this.pool.releaseAll();

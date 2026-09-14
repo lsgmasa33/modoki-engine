@@ -408,7 +408,7 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
     // not resolve <base-guid> while walking the chain" during a reload right after
     // Save All. Root cause was a torn write dropping the manifest's guid→path entry
     // for a base scene; the fix makes SceneManager itself re-register a resolved
-    // base hop's mapping (fetchSceneMeta, SceneManager.ts ~line 305) instead of
+    // base hop's mapping (loadScene's local fetchSceneMeta, SceneManager.ts) instead of
     // depending SOLELY on the external asset-scanner rescan for that knowledge.
     //
     // To exercise the fix (not just the harness's own upfront registration in

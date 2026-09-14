@@ -19,7 +19,7 @@
  *  ⚠️ NOT gated on `import.meta.hot` — this docblock said so for a long time and it was WRONG in a
  *  way that matters. The registrations below are top-level, and a **device** build is a production
  *  build that runs them. What actually keeps all of this out of a shipped app is
- *  `project.config.json` `build.debugBuild` (`engine/app/main.tsx:14`), which decides whether the
+ *  `project.config.json` `build.debugBuild` (`engine/app/main.tsx`'s `initDebugBridge` gate), which decides whether the
  *  bridge is mounted at all. Do not re-derive the safety answer from this file's scope.
  *
  *  HMR note (load-bearing, and INCIDENTAL — which is why it is written down): this module has no
@@ -743,7 +743,7 @@ export const NO_RENDERER_REFUSAL = Object.freeze({
 // an ordinary editor state — a project built without the 3D renderer module, or a Game tab that has
 // never been opened this session — was reported to the agent as a dead tool, and to
 // `test:mcp:live` as a DEFECT.
-// This generalises the lesson already applied to the game-tool op 200 lines below (`:833`): a
+// This generalises the lesson already applied to the game-tool op below (`game-tool-call`'s throwing-handler catch): a
 // state refusal names its own code, because the op is the only layer that knows it.
 registerAgentOp('render-scene', (params) => {
   if (!hasSceneRenderer()) return NO_RENDERER_REFUSAL;
@@ -2163,7 +2163,7 @@ registerAgentOp('load-scene', async (params) => {
   const before = sceneManager.getCurrent()?.path ?? null;
   const loading = sceneManager.loadScene(p.path);
   // SceneManager allocates THIS attempt's id into `nextLoad` synchronously, before loadScene's
-  // first await (SceneManager.ts:286-288) — so reading it here, between the call and the await,
+  // first await (SceneManager.loadScene's step-2 `nextSceneId`/`nextLoad` allocation) — so reading it here, between the call and the await,
   // names OUR load specifically, not whichever load happens to win a later swap (#486 finding A).
   const myId = sceneManager.getNext()?.id ?? null;
   try {
@@ -2189,16 +2189,16 @@ registerAgentOp('load-scene', async (params) => {
       return { ok: true, current: after, previous: before, entityCount: getAllEntities().length };
     }
     // ⚠️ `> myId`, NOT `!== myId`. Scene ids come from a monotonic `this.nextSceneId++`
-    // (sceneManager.ts:286), so only an id GREATER than ours is evidence that a LATER load won
+    // (loadScene's `nextSceneId` bump), so only an id GREATER than ours is evidence that a LATER load won
     // the swap. A different-but-SMALLER id means nothing newer ever installed and our own load
     // simply never became primary — and reporting THAT as "a later scene load won" would assert
     // from evidence that only says "the current id is not mine", which is the same shape of
     // over-claim this fix exists to remove. That case falls through to the original path check
-    // below and keeps its original message. (A genuinely bad path throws at sceneManager.ts:325
+    // below and keeps its original message. (A genuinely bad path throws at loadScene's `Failed to fetch scene` check
     // and is answered by the catch above; this is belt-and-braces for any resolve-without-
     // installing path, which is what the original `after !== p.path` check was written for.)
     if (cur.id > myId) {
-      // Superseded. `loadScene` still resolved successfully for us (sceneManager.ts:896, "a
+      // Superseded. `loadScene` still resolved successfully for us (loadScene's step-11 `primaryId === id` guard, "a
       // superseded load skips straight to resolving"), so this is not our load failing and it
       // says nothing about whether `p.path` exists.
       if (cur.path === p.path) {

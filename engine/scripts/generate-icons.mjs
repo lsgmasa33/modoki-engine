@@ -248,7 +248,7 @@ async function main() {
 
   // The generator's input convention: <project>/assets/{icon,splash,splash-dark}.png. Staging a
   // splash is the whole of #396's generation half — `@capacitor/assets` has always read these
-  // two filenames (project.js:45-54) and cover-crops them into every bucket; nothing ever put a
+  // two filenames (its Project.loadInputAssets) and cover-crops them into every bucket; nothing ever put a
   // file there, so every project's splash was its icon by default rather than by design.
   // No icon anywhere — the project genuinely authors none. Non-fatal by design: an icon-less build
   // still ships, with the committed icons intact.

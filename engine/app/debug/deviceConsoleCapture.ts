@@ -60,7 +60,7 @@ function toConsoleLine(entry: { level: ConsoleLine['level']; args: string[]; mon
 }
 
 /** Public shape mirrors what `bridgeHelpers.ts`'s `createConsoleRing` used to expose —
- *  `bridge.ts:546-547` calls `.query()` on this. `createConsoleRing` itself is GONE (#596/#597
+ *  `bridge.ts`'s `handleConsoleLogs` calls `.query()` on this. `createConsoleRing` itself is GONE (#596/#597
  *  close-out review): it had no production caller left anywhere, only `bridge.test.ts`'s "console
  *  ring" tests, which pinned a private buffer nothing shipped ever read while THIS one — the one
  *  actually wired to `bridge.ts` — carried no unit contract of its own. Those tests are repointed
@@ -81,7 +81,7 @@ export const consoleRing = {
    *  Routing these synthetic lines back through `console.error` would hand them to
    *  `globalErrors.ts`'s console.error wrapper, whose Error-object WeakSet dedup cannot match a
    *  string, filing a SECOND Crashlytics issue for an uncaught error it has already reported. See
-   *  `recordConsoleRingEntry`'s doc comment and `globalErrors.ts:366-377`. */
+   *  `recordConsoleRingEntry`'s doc comment and `globalErrors.ts`'s `alreadyReported` doc. */
   push(level: ConsoleLine['level'], args: unknown[]): void {
     recordConsoleRingEntry(level, args);
   },

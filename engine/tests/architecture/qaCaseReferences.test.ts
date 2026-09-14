@@ -628,7 +628,7 @@ export function knownUiIds(sources: string[]): {
   // A template-built id (`hierarchy.folder.${name}`) can only be checked to its static prefix.
   // `\s*` BEFORE the `=` as well as after it: a JSX prop is written `uiId={`a.${b}`}` with no
   // space, but the same id is often built in a local first — `const uiId = `projectSettings.${
-  // field.key}`;` (ProjectSettingsDialog.tsx:55) — and without the leading `\s*` that whole
+  // field.key}`;` (`ProjectSettingsDialog.tsx`'s `FieldControl`) — and without the leading `\s*` that whole
   // family of ids is invisible here. The symptom is a case correctly citing a selector that
   // demonstrably resolves in the live DOM being reported as unknown, which is the false alarm
   // qa/README.md warns turns a guard into one people disable. Verified 2026-08-21: every
@@ -1638,7 +1638,7 @@ describe('qa case guard helpers', () => {
     });
 
     it('sees a template id built in a LOCAL first, not only the JSX prop form', () => {
-      // `ProjectSettingsDialog.tsx:55` writes it as a local, with spaces around the `=`:
+      // `ProjectSettingsDialog.tsx`'s `FieldControl` writes it as a local, with spaces around the `=`:
       //   const uiId = `projectSettings.${field.key}`;
       // The prefix regex required no space BEFORE the `=`, so that whole family was invisible
       // and every `projectSettings.<section>.<key>` a case cited came back unknown — a false

@@ -392,7 +392,7 @@ export function clonePortDirsIn(src: string): Set<string> {
   const portish = (line: string) => /(^|[^0-9.])(5\d{3}|9\d{3})\b/.test(line);
 
   // ⚠️ The clone must be the row's KEY CELL, not merely somewhere in the line. `modoki` appears
-  // mid-sentence in plenty of table cells — `docs/reviews/2026-07-30-mcp-tool-audit.md:18` has
+  // mid-sentence in plenty of table cells — `docs/reviews/2026-07-30-mcp-tool-audit.md`'s Gate table has
   // `engine/packages/modoki test | 443 files · 5389 passed`, a clone name and a 5xxx number in one
   // row that is not a port table at all. Keying on the cell excludes it without a ledger entry.
   // Backticks, bold and a trailing `(main)` / `(work-ai)` parenthetical are all stripped, and both
@@ -461,7 +461,7 @@ describe('clonePortDirsIn — the detector, against fixtures (#1102)', () => {
   });
 
   it('does NOT read a clone name that is merely inside a cell', () => {
-    // docs/reviews/2026-07-30-mcp-tool-audit.md:18 — a clone name and a 5xxx number in one table
+    // docs/reviews/2026-07-30-mcp-tool-audit.md's Gate table — a clone name and a 5xxx number in one table
     // row that is not a port table. Excluded by the key-cell rule, with no ledger entry.
     expect([...clonePortDirsIn('| `npm --prefix engine/packages/modoki test` | 443 files · 5389 passed |')])
       .toEqual([]);

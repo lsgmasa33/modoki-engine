@@ -122,7 +122,7 @@ describe('RigidBody3D.bodyType — unrecognised value', () => {
   let tw: TestWorld | undefined;
   afterEach(() => { if (tw) { disposePhysics3D(tw.world); tw.dispose(); tw = undefined; } });
 
-  // Same pre-existing bodyType-cache quirk as the 2D case above (physics3DSystem.ts:881
+  // Same pre-existing bodyType-cache quirk as the 2D case above (physics3DSystem.ts's dynamic-body pull
   // gates the pull-back on `rec.bodyType !== 'dynamic'` against the raw authored string).
   it('warns once; Transform stays frozen (the pre-existing bodyType-cache quirk), unchanged from before #73', () => {
     const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});

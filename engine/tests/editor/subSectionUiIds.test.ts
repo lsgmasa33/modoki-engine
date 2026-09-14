@@ -52,7 +52,7 @@ function declaredSectionTitles(): Map<string, Set<string>> {
       out.set(f, (out.get(f) ?? new Set()).add(title));
     }
     // ⚠️ **The literal form is not the only form, and missing the other one made this whole
-    // widening a no-op (#830 review).** `registerTraits.ts:978` declares
+    // widening a no-op (#830 review).** `registerTraits.ts`'s section helper `S` declares
     // `const S = (section: string, extra?) => ({ section, ...extra })` and UIElement spells its
     // sections as `S('Layout')`, `S('Padding')`, `S('Text Shadow')` … — **11 live titles** that
     // `section: '` cannot see. Mutation-proven before this line existed: adding

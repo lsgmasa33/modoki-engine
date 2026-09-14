@@ -393,7 +393,7 @@ export class DynamicFontProvider implements FontProvider {
       // succeeded stays resolved.
       //
       // ⚠️ BOUNDED, and the bound is the point — same rule as the scratch-overflow path below
-      // (~:424), whose comment already rejects the unbounded shape. `ensureGlyphs` runs per
+      // (generateChunk's scratch-overflow re-queue), whose comment already rejects the unbounded shape. `ensureGlyphs` runs per
       // FRAME for any text whose layout hash changes every frame (a countdown, a score, a
       // typewriter reveal), so an unconditional un-stick turns a PERMANENTLY failing font
       // (a .ttf 404 after an OTA swap) into request → fail → delete → re-request at fetch
@@ -417,14 +417,14 @@ export class DynamicFontProvider implements FontProvider {
         // better here rather than worse: an ungated caller supplies exactly the extra lap this
         // comment says never arrives. The two RENDERER call sites are gated on a layout hash whose
         // only provider-controlled inputs (`atlasVersion`, `markTextDirty()`) move ONLY on the
-        // success path below (~:496-497) — a failed flush never touches either, so a static
+        // success path at generateChunk's tail — a failed flush never touches either, so a static
         // label's hash never changes and `ensureGlyphs` is never called again for it. Text
         // whose hash moves every frame (a countdown, a score) recovers by accident, which is
         // why this survived: the un-stick alone is sufficient there, but not here. Arm a timer
         // to re-queue the batch ourselves instead of waiting on a caller that will never come.
         //
         // Deliberately NOT re-added to `pending` here — this catch runs inside `flush()`,
-        // whose tail (~:394, now further down) is `if (this.pending.size) void this.flush()`;
+        // whose tail is `if (this.pending.size) void this.flush()`;
         // re-queueing into `pending` from here would re-enter `flush()` immediately and turn
         // the bounded retry `MAX_FLUSH_RETRIES` exists for into a per-frame storm. The re-queue
         // happens only inside the TIMER callback, on its own backoff schedule.

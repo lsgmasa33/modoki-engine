@@ -665,7 +665,7 @@ describe('muted ACTIVATION track — hands the entity back to its authored isAct
 describe('self-deactivation warning fires on the WINNING desired, not per-track (#452)', () => {
   /** #452 moved the self-deactivation check from "once per unmuted track" to "once per target,
    *  against the last-unmuted-track's WINNING `desired`" — see the ⚠️ comment above the check in
-   *  timelineSystem.ts (applyTimelineState phase 2, ~:236-246) and docs/timeline.md's #452 section.
+   *  timelineSystem.ts (applyTimelineState's self-deactivation check) and docs/timeline.md's #452 section.
    *  These pin that the real soft-lock still warns, warn-once still holds, a track that LOSES the
    *  decision does not warn, and a muted track (never a driver) cannot trigger it either. */
 

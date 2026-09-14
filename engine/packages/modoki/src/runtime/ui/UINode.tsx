@@ -222,7 +222,7 @@ const AutoFitText = React.memo(function AutoFitText(
     // the fitted font size is written, so it never reaches paint (this whole function runs inside
     // `useLayoutEffect`, before the browser paints).
     // ⚠️ In a `flexDirection: 'row'` parent this width is the item's MAIN size, so the default
-    // `flexShrink: 1` (UIElement.ts:31) is free to shrink it back below `max-content` — which
+    // `flexShrink: 1` (the UIElement default) is free to shrink it back below `max-content` — which
     // would collapse `naturalPx` to `availablePx`, make the fit conclude "it fits", and leave
     // autoFitText SILENTLY INERT. It does not, and the reason is not this line: a flex item's
     // default `min-width: auto` floors shrinking at min-content, and the `white-space: nowrap`

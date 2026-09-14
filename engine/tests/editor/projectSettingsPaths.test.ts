@@ -70,7 +70,7 @@ describe('imagePreviewPath', () => {
   it('previews an image in a per-machine field too — "every path" is not "every committed path"', () => {
     // `someone`, not a real username and not an ad-hoc stand-in either: engine/tests/** ships in
     // the public snapshot, and `verify:publish` hard-fails any `/Users/<name>/` whose name is not
-    // in its PLACEHOLDER_USERS list. It caught "placeholder" here. Same spelling as line 16.
+    // in its PLACEHOLDER_USERS list. It caught "placeholder" here. Same spelling as the absolute-POSIX-path test's `/Users/someone/`.
     expect(imagePreviewPath(javaHome, '/Users/someone/art/icon.png')).toBe('/Users/someone/art/icon.png');
   });
 

@@ -12,7 +12,7 @@
  *     PERSISTENT two-state span reading `Unsaved ● ⌘S` or `Saved ✓`. Not this one: it belongs to a
  *     panel that owns a whole document and has a status line to keep `Saved ✓` in.
  *
- *  ⚠️ #870's body originally named `AtlasAssetView.tsx:121` as the sibling to copy. It is not one —
+ *  ⚠️ #870's body originally named `AtlasAssetView`'s `subscribeDirtyAssets` subscription as the sibling to copy. It is not one —
  *  that subscription drives a flush-ERROR banner (a 409), not an unsaved marker. Corrected there.
  *
  *  A shared component rather than nine copies of the same four lines, so the convention cannot

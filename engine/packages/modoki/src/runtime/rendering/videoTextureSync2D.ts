@@ -153,7 +153,7 @@ function detach(b: Bound): void {
  *  `renderFrame`, ABOVE the idle-frame skip — mirroring `flushPendingMaskDestroy` there for
  *  the same reason. Without the second call site, a clip that ends right before the sim
  *  goes idle queues its texture and then never reaches `syncVideoTextures2D` again (that idle
- *  skip returns before line 2035), stranding a pinned decoder + its GPU texture until the
+ *  skip returns before renderFrame's syncVideoTextures2D call), stranding a pinned decoder + its GPU texture until the
  *  surface is torn down. No-ops cleanly when the surface has no state yet (nothing was ever
  *  bound, so nothing can be pending). */
 export function flushPendingVideoDestroy2D(surface: object): void {

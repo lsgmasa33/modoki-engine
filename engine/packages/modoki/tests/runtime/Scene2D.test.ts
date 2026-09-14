@@ -2841,13 +2841,13 @@ describe('Scene2DRenderer instancing', () => {
    *
    * ⚠️ **What holds the texture here is NOT the retain-before-release bridge, and an earlier
    * version of this comment said it was.** Mutation-checked: disabling the bridge outright
-   * (`if (false && …)` at `Scene2D.tsx:1762`) leaves this test GREEN. The actual protection is
+   * (`if (false && …)` on `renderFrame`'s retain-before-release `bridgeUrl` block) leaves this test GREEN. The actual protection is
    * `deferUnload`'s `setTimeout(0)` — `disposeSlot` schedules the unload, `makeSprite` re-retains
    * the same url later in the SAME frame, and `retainSpriteTexture` clears the pending timer
    * before it can fire. The bridge is a second belt on a path that already holds.
    *
    * So this test is falsifiable on the TRIGGER, not on the bridge: dropping
-   * `displaySlot.builtEpoch !== spriteEpoch` from `needResolve` (`:1724`) reds it, because
+   * `displaySlot.builtEpoch !== spriteEpoch` from `renderFrame`'s `needResolve` reds it, because
    * `resolved` then goes stale and the dispose is no longer balanced by a re-retain.
    */
   it('a re-slice bumps the epoch but keeps the texture, because the url did not move (#1022)', async () => {
@@ -3335,7 +3335,7 @@ describe('Text2D shader reclaim (#690/#696)', () => {
       makeMtsdfPixiShader: (texture: any, atlas: any, style: any, fontSize: any) => ({
         id: ++shaderSeq,
         // `mtsdfUniforms.uniforms.uScreenPxRange` mirrors the real shader's fontSize-derived
-        // uniform (mtsdfPixiShader.ts:502) — a #749 fast-path test asserts THIS gets updated
+        // uniform (`updateMtsdfPixiMetrics` in mtsdfPixiShader.ts) — a #749 fast-path test asserts THIS gets updated
         // on a fontSize-only edit. A mock without it would let that assertion pass vacuously
         // (see #698's scar: `makePixiShaderInstance` mocked with no `resources` once made a
         // uniform-write assertion pass whether or not the write actually happened).

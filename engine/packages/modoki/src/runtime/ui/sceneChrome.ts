@@ -108,13 +108,13 @@ export interface ChromeUIPatch {
    * `UIElement.backgroundOpacity` defaults to **0** (`traits/UIElement.ts`, and see that field's
    * own doc comment — cited without a line number on purpose, the last one went stale the moment
    * this very commit added lines above it), and the renderer
-   * only paints a background when it is nonzero (`ui/UINode.tsx:267`:
+   * only paints a background when it is nonzero (`ui/UINode.tsx`'s `UINodeInner`:
    * `if (node.backgroundOpacity > 0) style.backgroundColor = …`). So `patchUI({ backgroundColor })`
    * against an entity whose scene never authored a nonzero `backgroundOpacity` writes a colour
    * that paints NOTHING — a silent no-op that looks like a success (`patchEntity` returns `true`,
    * the trait holds the value, nothing renders). `UIToggle`'s own `trackOpacity` field
-   * (`traits/UIToggle.ts:50-52`) documents this exact trap as a scar that has already shipped an
-   * invisible panel, and `core/ecs/traitRegistry.ts:54` treats the two fields as a PAIR for the
+   * (`traits/UIToggle.ts`'s `trackOpacity` doc) documents this exact trap as a scar that has already shipped an
+   * invisible panel, and `core/ecs/traitRegistry.ts`'s `FieldHint.alphaField` treats the two fields as a PAIR for the
    * same reason.
    */
   backgroundOpacity?: number;

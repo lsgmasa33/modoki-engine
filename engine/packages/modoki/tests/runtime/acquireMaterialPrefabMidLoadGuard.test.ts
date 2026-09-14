@@ -6,7 +6,7 @@
  * entry in `materialCache` / `prefabCache` that nothing will ever release again
  * (`releaseAllForScene` is never called for that sceneId again).
  *
- * `acquireMesh` (:1570-ish) and `acquireModel`'s post-await guard already handle this
+ * `acquireMesh`'s post-await owner guard and `acquireModel`'s post-await guard already handle this
  * shape — see `acquireModelMidLoadGuard.test.ts`. This file pins the same guard added
  * to `acquireMaterial` and `acquirePrefab`.
  *

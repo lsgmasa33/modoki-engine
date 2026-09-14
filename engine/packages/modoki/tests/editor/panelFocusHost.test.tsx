@@ -46,7 +46,7 @@ describe('PanelFocusHost', () => {
   });
 
   it('does NOT stamp the legacy data-editor-panel attribute', () => {
-    // P2 must stay inert: Hierarchy.tsx:860 READS that attribute to decide whether to
+    // P2 must stay inert: Hierarchy's document-keydown yield (gone since focus-scope P6) READ that attribute to decide whether to
     // yield, so stamping it on every panel would silently change an existing guard.
     const { container } = render(
       <PanelFocusHost id="scene"><div>viewport</div></PanelFocusHost>,

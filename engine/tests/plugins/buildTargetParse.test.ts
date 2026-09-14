@@ -71,7 +71,7 @@ describe('parseBuildTarget', () => {
     expect(result.ok).toBe(false);
   });
 
-  // F1 regression guard: vite.config.ts:226's authoritative check is `VITE_PLAYABLE === '1'`.
+  // F1 regression guard: vite.config.ts's authoritative `isPlayable` check is `VITE_PLAYABLE === '1'`.
   // The old guard here used truthiness, so `VITE_PLAYABLE=0` (which vite reads as OFF) wrongly
   // hard-failed a legitimate `--target web` build.
   it('F1: VITE_PLAYABLE=1 with --target web is a contradiction (not ok)', () => {

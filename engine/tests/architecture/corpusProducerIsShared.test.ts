@@ -30,8 +30,8 @@
  *  spawns the issue had not noticed at all. All are now migrated or on the EXEMPT ledger below.
  *
  *  ⚠️ **`scripts/scan-publish-safety.mjs` is NOT "a second definition of the corpus"** — #814
- *  filed it that way and the claim is disproved. `publish-engine-oss.sh:568` invokes it over
- *  `$STAGE`, which `:167` rsyncs from that script's OWN `git ls-files` manifest, so it is
+ *  filed it that way and the claim is disproved. `publish-engine-oss.sh`'s step-4 blocking safety scan invokes it over
+ *  `$STAGE`, which its step-1 `rsync --files-from` fills from that script's OWN `git ls-files` manifest, so it is
  *  downstream of the enumeration rather than a rival to it. Measured 2026-09-06: tracked=9243,
  *  walked=24099, tracked-but-NOT-walked = **0**.
  *

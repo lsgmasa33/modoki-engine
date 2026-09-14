@@ -6,7 +6,7 @@
  *  synchronously runs game-registered code that does `entity.set(SomeTrait, ...)` on a trait in
  *  the SAME query, the write lands, then koota's own post-callback write-back clobbers it with
  *  the stale pre-callback snapshot — silently. Nothing throws; the handler's write just never
- *  happened. `timelineSystem.ts:752`'s "PASS 1 — collect ... never emit/dispatch/set-on-other-
+ *  happened. `timelineSystem`'s "PASS 1 — collect ... never emit/dispatch/set-on-other-
  *  entities inside the query" comment states the rule; this test enforces it.
  *
  *  The sanctioned fix is collect-during-query, flush-after-close: stage a record inside

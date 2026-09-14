@@ -32,7 +32,7 @@
  *   - bash `pwd -P` through a junction returns the target's spelling (see `cloneRootSpellings`).
  *   - `projectPaths.test.ts` — the suite #949 named as the one that "may care which one it gets",
  *     because it exercises `relativiseUnderProject` through a symlinked ancestor — passes all 17
- *     cases identically with `'junction'` substituted at `:79`.
+ *     cases identically with `'junction'` substituted for the link type it creates.
  *
  * ⚠️ **The narrow exception, and it is real: a test whose SUBJECT is the link type itself must
  * not use this helper.** If the test asserts on the link rather than resolving through it — it is

@@ -960,7 +960,7 @@ await withCleanup(async () => {
   const guids = (JSON.parse(text(b)).steps ?? []).map((st) => st.result?.guid);
   if (guids.length !== 2 || guids.some((g) => !g)) throw new Error(`expected two created guids, got ${JSON.stringify(guids)}`);
   // Assigned as soon as the guids are known to be real, NOT at the end of this function — cleanup
-  // "must undo exactly as many creates as landed, even when the check failed part-way" (see :79-81).
+  // "must undo exactly as many creates as landed, even when the check failed part-way" (see the `smokeGuids` docblock).
   // A late assignment leaves `smokeGuids` at `[]` for every assertion below that throws, and the
   // cleanup loop then runs zero times, leaking these entities into the human's live scene.
   smokeGuids = guids;
@@ -1241,12 +1241,12 @@ if (canGameViewDevice) {
 
 // ── modoki_set_selection (#496) ───────────────────────────────────────────────
 // COVERED_BY_SMOKE claimed this was smoke-covered, but its only occurrence (the batch pre-flight
-// case near :977) is a step inside a batch asserted to be REFUSED before any step runs — that
+// `typo` case in the batch pre-flight block) is a step inside a batch asserted to be REFUSED before any step runs — that
 // step never EXECUTES. This is the first real, executing call.
 //
 // Gated on UC3's `cube` precondition — it already guarantees exactly one entity named 'cube' in
 // the open scene, and CUBE_GUID (captured in the precondition probe above) is a real guid to aim
-// at. There is no `name` param on this tool (that gap is exactly what UC8 found, see :302-303), so
+// at. There is no `name` param on this tool (that gap is exactly what UC8 found, see the UC8 scene-swap-mid-batch comment), so
 // aiming is by guid.
 if (canUC3) {
   const before = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} }))).selection;

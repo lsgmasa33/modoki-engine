@@ -1,4 +1,4 @@
-/** The in-window menu bar. Rendered ONLY by `EditorApp` (`EditorApp.tsx:765`), and only in the
+/** The in-window menu bar. Rendered ONLY by `EditorApp` (its `<MenuBar menus={menus} …/>` render), and only in the
  *  WEB editor — under Electron the OS-level menu replaces it, so nothing here is reachable there. */
 
 import { useState, useEffect } from 'react';

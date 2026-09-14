@@ -18,7 +18,9 @@ import {
   citesALineInProse,
   codeSpans,
   codeTokens,
+  bareLineRefsInText,
   isBareLineSpan,
+  lineCitationsInComments,
   nonCodeText,
   stripLineRef,
 } from '../helpers/lineCitations.js';
@@ -87,6 +89,58 @@ describe('lineCitations helper still detects (positive controls)', () => {
     expect(hits).toHaveLength(3);
     // …and it blanks real spans, so two adjacent ones cannot fuse into a slash-bearing token.
     expect(nonCodeText('a `ok:true`/`changed:1` b')).not.toContain('ok:true');
+  });
+
+  it('comment text: every shape the #1186 census found in source comments is caught, on its line', () => {
+    // Blank lines stand in for the code `commentText` blanks, so the line numbers are real ones.
+    const text = [
+      ' cites (`engine/app/main.tsx:14`),', //                      1 path, wrapped in `( ),`
+      ' the scope set (sceneManager.ts:286), so', //                2 bare filename
+      '',
+      " `puck-blocked` (:1387, …) and :432-434", //                 4 bare, loose in text
+      ' (loadScene lines ~437-459)', //                              5 prose
+      ' the step (release.yml ~L202)', //                            6 marker
+    ].join('\n');
+    expect(lineCitationsInComments(text).map((c) => `${c.line} ${c.hit}`)).toEqual([
+      '1 (`engine/app/main.tsx:14`),',
+      '2 (sceneManager.ts:286),',
+      '4 :1387',
+      '4 :432-434',
+      '5 lines ~437',
+      '6 ~L202',
+    ]);
+  });
+
+  it('comment text: a bare `:NNN` inside a larger token is not a second citation', () => {
+    // `ts:286` is `citesALine`'s, a time and a host:port are not line numbers, a URL path is not either,
+    // and a JSON value, a glued method-call number and a `*` listener port are values.
+    expect(bareLineRefsInText('sceneManager.ts:286 at 12:300 on 127.0.0.1:5196 via http://x/:123')).toEqual([]);
+    expect(bareLineRefsInText('`{"value":1}` and onResume():97 and `*:22` and [a]:5 and {b}:6')).toEqual([]);
+  });
+
+  it('comment text: a SHORT bare ref is a citation too — no Markdown digit floor (#1186 close-out)', () => {
+    // These three were live in comments, one already stale, under a guard that reported green.
+    expect(bareLineRefsInText('the default (:47), its intro prose (`:7`), `isEditorOwned` at `:74`'))
+      .toEqual([':47', ':7', ':74']);
+  });
+
+  it('comment text: the value exclusions do not swallow emphasis, quotes or a wrapped filename (#1186 close-out)', () => {
+    // A first cut excluded the bare punctuation (`*`, `'`, `)` …) and silently dropped all of these.
+    expect(bareLineRefsInText("see **:1745** and ':1745' and \":1746\" and (`saveSync.ts`):1747"))
+      .toEqual([':1745', ':1745', ':1746', ':1747']);
+    expect(bareLineRefsInText('adb (USB):9097 and [::1]:5173')).toEqual([]);
+  });
+
+  it('comment text: a citation glued to a comment delimiter is still caught (#1186 close-out)', () => {
+    const hits = (text: string) => lineCitationsInComments(text).map((c) => c.hit);
+    expect(hits('//foo.ts:12')).toEqual(['foo.ts:12']);
+    expect(hits('             /*see foo.ts:12*/')).toEqual(['foo.ts:12']);
+    expect(hits('   * foo.ts:12*/')).toEqual(['foo.ts:12']);
+    expect(hits('#see foo.sh:12')).toEqual(['foo.sh:12']);
+    expect(hits('# foo.sh:12')).toEqual(['foo.sh:12']);
+    // …and the openers that are NOT delimiters stay: a URL keeps its exemption, a marker keeps its detector.
+    expect(hits(' see https://example.com/a.ts:12')).toEqual([]);
+    expect(hits(' the step #L202')).toEqual(['#L202']);
   });
 
   it('emphasis and possessive wrappers do not hide a citation', () => {

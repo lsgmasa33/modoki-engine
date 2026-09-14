@@ -97,8 +97,8 @@ describe('add-native-targets.mjs wires the validation in before scaffolding (#58
   // ⚠️ `.code`, NOT `fs.readFileSync`. This file's prose names the validators INSIDE the span the
   // binding check below slices, so a raw read lets a COMMENT satisfy an assertion about a binding. That is
   // #812's rule, and its `commentStripperIsShared` detector is blind here because the path arrives
-  // through a variable rather than an inline repo-rooted literal (documented gap, that file's
-  // :235) — the exemption was never signed off in `RAW_READ_ALLOW`, it was just invisible.
+  // through a variable rather than an inline repo-rooted literal (documented gap, that file's `REPO_ROOTED` docblock)
+  // — the exemption was never signed off in `RAW_READ_ALLOW`, it was just invisible.
   const src = readScannedSource(scriptPath).code;
 
   it('binds projectBuildConfigErrors from the shared engine-module loader', () => {

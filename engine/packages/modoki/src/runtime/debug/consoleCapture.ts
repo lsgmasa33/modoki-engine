@@ -48,7 +48,7 @@ const listeners = new Set<() => void>();
  *  shared ring itself.
  *
  *  ⚠️ This is the whole reason for the watermark, not an implementation detail. `ConsoleTab.tsx`'s
- *  Clear button (`tabs/ConsoleTab.tsx:26`) is the only production caller, and if it truncated the
+ *  Clear button (`tabs/ConsoleTab.tsx`'s Clear `onClick`) is the only production caller, and if it truncated the
  *  shared buffer, a human tidying the on-screen tab would silently destroy the buffer behind
  *  `modoki_get_console_logs` / `device_console_logs` / `diagnose` — on device, the one usable log
  *  surface. Clearing must be a view operation, never a mutation of the shared ring. */
@@ -78,7 +78,7 @@ function notifyLocal(): void {
     notifyScheduled = false;
     // Per-listener isolation comes from the shared helper (#888) and is NOT optional.
     // ⚠️ The REPORTER stays local and stays `unpatchedLog`, NOT `console.error`. Same reasoning as
-    // the shared ring's own flush catch: `globalErrors.ts:490` wraps `console.error` and reports to
+    // the shared ring's own flush catch: `globalErrors.ts`'s `installGlobalErrorHandlers` wraps `console.error` and reports to
     // Crashlytics, and its dedup only recognises a call whose sole argument is an `Error` object —
     // so reporting an INTERNAL bookkeeping failure here with two args files a real Crashlytics
     // issue and spends the session's error budget. Reaching this at all means a `subscribeConsole`

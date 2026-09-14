@@ -13,8 +13,8 @@
  * whole job is to be trustworthy. A guard that pushes the fix the wrong way needs the reason
  * recorded next to it.
  *
- * Two runtime files already hold an import inside prose (`ui/storeHooks.ts:11`,
- * `storage/playerPrefs.ts:25`). Both happen to use the bare `@modoki/engine/runtime`, so today's
+ * Two runtime files already hold an import inside prose (the module docblocks of `ui/storeHooks.ts`,
+ * `storage/playerPrefs.ts`). Both happen to use the bare `@modoki/engine/runtime`, so today's
  * graph is correct by luck rather than by construction. This is what replaces the luck.
  */
 

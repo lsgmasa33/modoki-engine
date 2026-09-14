@@ -257,7 +257,7 @@ const repeats = new Map<string, number>();
  * FIRST few repeats after a reload slightly more permissive, which is not worth a persistence path.
  *
  * ⚠️ **This is a strict improvement, not a guarantee — it does NOT make the budget "per session".**
- * `resumeReload.ts:118-123` already notes that iOS can recycle the WKWebView content process while
+ * `resumeReload.ts`'s `markResumeReload` doc already notes that iOS can recycle the WKWebView content process while
  * the app process lives, clearing `sessionStorage` while native state survives. When that happens
  * here, the counters reset to 0 while native Crashlytics still counts one session — i.e. this
  * degrades to exactly today's (unpersisted) behaviour, no worse. What it fixes is the common case:

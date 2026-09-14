@@ -229,7 +229,7 @@ describe('axisPickAim', () => {
   it('the ANSWER depends on the eye it is given — which is why the ortho branch is load-bearing', () => {
     // three derives `eye` differently per projection: `cameraPosition - worldPosition` for a
     // perspective camera, but the negated VIEW DIRECTION for an orthographic one
-    // (TransformControls.js:1113). For an entity off to the side those diverge, and the caller
+    // (TransformControls' gizmo updateMatrixWorld, orthographic branch). For an entity off to the side those diverge, and the caller
     // passing the perspective form to an ortho camera would hide an axis three kept, or publish
     // one three collapsed to 1e-10. Same axis, two eyes, two answers:
     const offCentre = { x: 20, y: 0, z: 0 };

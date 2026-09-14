@@ -2,7 +2,7 @@
  *
  *  Why this guard exists — and why it is not optional. `build.debugBuild` is the single source of
  *  truth for "does this build carry the debug bridge", and **this exact invariant has already
- *  drifted once**: `engine/app/main.tsx:42` records it — *"Previously this was ungated on native,
+ *  drifted once**: `engine/app/main.tsx`'s debug-bridge gate comment records it — *"Previously this was ungated on native,
  *  so a RELEASE build shipped the eval-capable server."* A single source of truth that nothing
  *  verifies will drift again, and the next drift is a store submission carrying a TCP server with
  *  `handleEval` (arbitrary JS) on it.

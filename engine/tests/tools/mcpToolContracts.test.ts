@@ -161,7 +161,7 @@ describe('tool contracts', () => {
      *  mechanism.
      *
      *  This one is trusted by the most consequential mechanism on the surface.
-     *  `test-live-tools.ts:79` picks what to fire at the HUMAN'S OPEN EDITOR with
+     *  `test-live-tools.ts`'s `sweep` filter picks what to fire at the HUMAN'S OPEN EDITOR with
      *  `!(minimalArgsMutates ?? mutating)` — so a tool that under-declares gets its smallest call
      *  run for real against the human's project. The only existing check
      *  (`liveCoverage.test.ts`) asserts the DECLARATION equals false, which is circular: it

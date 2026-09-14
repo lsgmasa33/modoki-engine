@@ -70,9 +70,9 @@ export function shaderManifestPathForBody(bodyPath: string): string | null {
   // change", which an earlier version of this comment said and which is false. At least four other
   // places hard-code the pair independently, and the tree-shaker one is load-bearing (it is what
   // keeps a body file in a production build at all):
-  //   engine/plugins/asset-tree-shaker.ts (:87 kept-extensions, :117 classifier, :886 sibling walk)
-  //   engine/plugins/backend/staticAssets.ts (:44 MIME)
-  //   engine/packages/modoki/src/editor/panels/assetUndo.ts (:31 TEXT_ASSET_EXTS)
+  //   engine/plugins/asset-tree-shaker.ts (`TYPEABLE_EXTS` and the kept extensions, `classify`, `processShader`'s sibling walk)
+  //   engine/plugins/backend/staticAssets.ts (`MIME_TYPES`)
+  //   engine/packages/modoki/src/editor/panels/assetUndo.ts (`TEXT_ASSET_EXTS`)
   // Those cannot import this constant (plugin/runtime split), so a third extension is a sweep.
   const lower = bodyPath.toLowerCase();
   for (const ext of SHADER_BODY_EXTS) {

@@ -100,7 +100,7 @@ describe('screenshotToCSS', () => {
 // directly: same public shape (`push`/`entries`/`query`), but backed by the ONE shared ring
 // (`runtime/core/consoleRing.ts`) rather than a disconnected duplicate. Concretely, that means these
 // tests now run through `recordConsoleRingEntry` → `record` → `stringifyArg` — the actual shared
-// serializer `bridge.ts:546-547` depends on — so a regression there (the Error-stack one this same
+// serializer `bridge.ts`'s `handleConsoleLogs` depends on — so a regression there (the Error-stack one this same
 // review found and fixed) would fail HERE too, which the dead copy structurally could not do.
 describe('console ring (the live shared-ring projection, deviceConsoleCapture.ts)', () => {
   afterEach(() => {

@@ -524,8 +524,8 @@ describe('gitignored paths under engine/ are classified, not defaulted (#1050)',
   // The ONLY rule here that reads the tree, so the only one whose answer depends on which
   // checkout it runs in. Everything else classifies by PATTERN and must run EVERYWHERE —
   // including the public snapshot, which is where the CI that actually runs lives, and which
-  // ships electron-builder.yml and .gitignore verbatim (publish-engine-oss.sh:212 — the old
-  // rewrite is gone, see :285). Skipping the whole block there left the guard firing only on
+  // ships electron-builder.yml and .gitignore verbatim (publish-engine-oss.sh's `MANIFEST` list — the old
+  // rewrite is gone, see its "auto-update feed used to be rewritten here" note). Skipping the whole block there left the guard firing only on
   // a developer's local verify, and a skipped test looks exactly like a passing one.
   it.skipIf(!hasOssOverlay())('every `absent` row really has no producer under engine/', () => {
     // The one rule that reads the tree, and it can only ever RED from what it finds — a clone

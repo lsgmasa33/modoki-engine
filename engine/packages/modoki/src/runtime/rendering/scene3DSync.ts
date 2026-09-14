@@ -3660,7 +3660,7 @@ export function syncText3D(world: World, scene: THREE.Scene, state: RenderState,
         const hasTrueSdf = provider.atlas.type !== 'msdf';
         const pagePositions = buildTextPositionsByPage(layout.quads, { yUp: true });
         // Page-ascending, matching `buildTextPositionsByPage`'s sort — `canWriteTextPositionsInPlace`
-        // compares index-for-index (textMesh.ts:180-189). `entry.pages` is itself built in
+        // compares index-for-index (textMesh.ts's canWriteTextPositionsInPlace). `entry.pages` is itself built in
         // ascending order (the rebuild loop below walks `buildTextGeometryByPage`'s sorted
         // output), so its insertion order already matches; sorted explicitly anyway since that
         // invariant lives in a different code path than this one.
@@ -3694,11 +3694,11 @@ export function syncText3D(world: World, scene: THREE.Scene, state: RenderState,
           // because it mints new geometry AND a new `aTextColor` buffer, both at base state.
           // This fast path writes base POSITIONS only and leaves the colour buffer untouched, so
           // clearing `wasColored` would strand an animated colour with nothing left to restore it
-          // (`Scene2D.tsx:2219-2228` documents the identical reasoning for the 2D twin).
+          // (`Scene2D.tsx`'s renderFrame text fast-path `wasMotion`/`wasColored` note documents the identical reasoning for the 2D twin).
           //
           // #752 landed 2D-ONLY, and rightly so: `makeMtsdfMaterial` takes no `fontSize`
-          // (mtsdfShader.ts:76-84) — 3D derives `screenPxRange` IN-GRAPH from `fwidth`
-          // (mtsdfShader.ts:138-140), the same per-fragment derivative Scene2D's Pixi shader uses
+          // (mtsdfShader.ts's makeMtsdfMaterial signature) — 3D derives `screenPxRange` IN-GRAPH from `fwidth`
+          // (inside makeMtsdfMaterial), the same per-fragment derivative Scene2D's Pixi shader uses
           // whenever it's available (mtsdfPixiShader.ts's `#else` arm is the no-derivatives
           // FALLBACK #752 actually fixed). So 3D is structurally immune to the bug #752 fixed —
           // there is no CPU-computed screenPxRange here to go stale — and `updateMtsdfStyle`
@@ -3901,7 +3901,7 @@ function prepPrewarmMesh(mesh: THREE.Mesh): void {
 /** Whether three will draw this material in TWO side-pinned passes rather than one double-sided
  *  pass. Mirrors the condition in three's `Renderer.renderObject` EXACTLY — the prewarm has to
  *  make the same decision three does, and a paraphrase of it would be the drift this whole
- *  function exists to prevent (r184, Renderer.js:3452):
+ *  function exists to prevent (r184, Renderer.renderObject's transparent DoubleSide split):
  *
  *  ```js
  *  if ( material.transparent === true && material.side === DoubleSide && material.forceSinglePass === false ) {

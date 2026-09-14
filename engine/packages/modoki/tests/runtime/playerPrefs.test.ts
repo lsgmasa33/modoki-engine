@@ -998,7 +998,7 @@ describe('PlayerPrefs — backed-off self-scheduling retry (#619)', () => {
   });
 
   it('scheduleRetry() does not arm a redundant retry timer while an ordinary drain is already pending', async () => {
-    // Kills: deleting the `if (flushTimer != null) return` guard from `scheduleRetry()` (:269).
+    // Kills: deleting the `if (flushTimer != null) return` guard from `scheduleRetry()`.
     // Interleave a SECOND key's write while the first key's rejection is still settling, so its
     // catch branch runs at a moment an ordinary `flushTimer` is already armed to pick the
     // re-queued key up. Without the guard, `scheduleRetry()` arms a SECOND, redundant timer.
@@ -1038,7 +1038,7 @@ describe('PlayerPrefs — backed-off self-scheduling retry (#619)', () => {
   });
 
   it('flush() cancels the pending retry timer instead of leaving a stale one armed', async () => {
-    // Kills: deleting `flush()`'s `retryTimer` cancel (:864-870 area). A stale, uncancelled timer
+    // Kills: deleting `flush()`'s `retryTimer` cancel. A stale, uncancelled timer
     // keeps its ORIGINAL (pre-flush) deadline — this pins that nothing fires at that stale
     // deadline once `flush()` has run its own drains and armed a correctly-backed-off successor.
     vi.useFakeTimers();

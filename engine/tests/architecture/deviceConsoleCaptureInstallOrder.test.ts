@@ -147,7 +147,7 @@ describe('device console capture install order (#591)', () => {
 
   it('installDeviceConsoleCapture.ts pulls in NOTHING beyond the gate and the installer', () => {
     const installSrc = fs.readFileSync(INSTALL_DEVICE_CONSOLE_CAPTURE, 'utf8');
-    // The precedent's most load-bearing assertion (errorCaptureInstallOrder.test.ts:70), and it
+    // The precedent's most load-bearing assertion (errorCaptureInstallOrder.test.ts's "actually calls the installer" test), and it
     // matters MORE here: this module is in main.tsx's STATIC graph, so anything it imports is both
     // evaluated uncovered AND a new candidate to survive DCE into a release bundle. `verify` would
     // stay green either way, and the only gate that could notice (`smoke:debug-flag`) is manual and

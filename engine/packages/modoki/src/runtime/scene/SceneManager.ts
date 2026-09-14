@@ -1561,7 +1561,7 @@ class SceneManagerImpl implements SceneManager {
   /** For tests + shutdown. Releases everything and resets the manager.
    *
    *  Async (F1): a normal scene swap disposes the active scene/game managers and
-   *  re-resolves the active scope (loadScene lines ~437-459); `unloadAll` is the
+   *  re-resolves the active scope (loadScene's gameChanged block); `unloadAll` is the
    *  asymmetric teardown path, so it must do the same or every active manager's
    *  dispose() is skipped — TimeManager/NavigationManager keep their onWorldSwap /
    *  registerReadSource subscriptions live, scene/game managers keep their owned

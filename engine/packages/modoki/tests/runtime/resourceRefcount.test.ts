@@ -880,7 +880,7 @@ describe('re-import-mid-scene transitive snapshot (Missing Test #3)', () => {
     expect(stats.materials['/m1.mat.json']).toBe(1);
 
     // Simulate a mid-scene re-import: invalidateModel evicts the mesh-asset cache
-    // entry that references the model (meshTemplateCache.ts:372-376). The owner
+    // entry that references the model (`invalidateModel`'s meshAssetCache loop). The owner
     // refcounts are untouched — only the cached data is dropped.
     invalidateModel('/island.glb');
 

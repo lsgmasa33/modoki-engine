@@ -89,7 +89,7 @@ describe('device_eval_api guidance (#101)', () => {
     for (const m of notReachable.methods) {
       if (m === 'screenshot') {
         // ⚠️ Asserts the INTERCEPT, not the sentence describing it (#816 review). This read the
-        // rationale comment at bridge.ts:1125 until the code anchor was found: delete the
+        // rationale comment on bridge.ts's `initNativeBridge` screenshot intercept until the code anchor was found: delete the
         // intercept block and leave the comment, and `screenshot` falls through to
         // `delegateToAgentOps` while device_eval_api keeps advertising it as unreachable.
         expect(bridge, 'screenshot is no longer intercepted in initNativeBridge, so it DOES reach '

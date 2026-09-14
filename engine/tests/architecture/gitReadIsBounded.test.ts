@@ -210,7 +210,7 @@ describe('every git read passes an explicit maxBuffer (#1120)', () => {
     // public OSS snapshot ships only `engine build docs` + a few root files, leaving **1,145**.
     // A 1,500 floor is green on every local run and red on the free 3-OS public CI the moment it
     // reaches main — which is how #1014/#1015 reddened that gate, and what
-    // `corpusProducerIsShared.test.ts`'s own note (~line 551) warns is "a fact to MEASURE rather
+    // `corpusProducerIsShared.test.ts`'s own "Public-snapshot note" warns is "a fact to MEASURE rather
     // than to reason to". Found by review; `npm run verify` structurally cannot see that leg.
     expect(files.length).toBeGreaterThanOrEqual(900);
     expect(spawns.length).toBeGreaterThanOrEqual(10);     // 19 measured 2026-09-12

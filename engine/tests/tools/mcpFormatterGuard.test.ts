@@ -28,7 +28,7 @@ import { readScannedSource } from '@modoki/engine/testing';
  *  TWO (#829).** The docblock above says "the MCP server must format every tool result through
  *  `result.ts`" and the note about `sources()` walking "the whole tree" is true only of the tree
  *  it was pointed at. `game-debug-mcp` was never read, and it contained the regression this file
- *  exists to catch, verbatim, at `mcp-tools.ts:2167`:
+ *  exists to catch, verbatim, in `mcp-tools.ts`'s `device_crash_reports` handler (since fixed, 337a861dc):
  *
  *      text: note + JSON.stringify(result, null, 2)
  *

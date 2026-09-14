@@ -86,7 +86,7 @@ describe('global error capture install order (#275)', () => {
     expect(importSpecifiers(capture, 'app/installErrorCapture.ts')).toEqual(['@modoki/engine/runtime']);
   });
 
-  // The MISSING pin (found while implementing #633): main.tsx:12-15 documents `installErrorCapture`
+  // The MISSING pin (found while implementing #633): main.tsx's "Kept ABOVE the device console capture" comment documents `installErrorCapture`
   // as deliberately the INNER wrap — `installGlobalErrorHandlers`' contract is "call it early,
   // BEFORE anything else touches console.warn", so the ring (installConsoleRing, imported right
   // below it) must wrap OUTSIDE it, not the other way round. #591 briefly had these two the other

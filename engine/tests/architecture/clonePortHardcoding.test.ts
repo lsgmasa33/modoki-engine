@@ -111,9 +111,9 @@ describe('every harness that SPAWNS the packaged app pins a per-clone backend po
    *  Kept separate from SPAWNERS so the port assertion still RUNS for them and states its verdict,
    *  rather than the script quietly falling out of the list. */
   const DERIVATION_EXEMPT: ReadonlyArray<{ item: string; reason: string }> = [
-    // `PORT="${PORT:-5188}"` (:47), chosen to sit OUTSIDE every clone lane (5179-5183) rather than
-    // inside one: this harness relaunches the packaged app a dozen times in a row, and the comment
-    // at :45 is explicit that a run must not be able to drive — or be mistaken for — a live editor.
+    // `PORT="${PORT:-5188}"`, chosen to sit OUTSIDE every clone lane (5179-5183) rather than
+    // inside one: this harness relaunches the packaged app a dozen times in a row, and the comment above that default
+    // is explicit that a run must not be able to drive — or be mistaken for — a live editor.
     // Deriving a per-clone port would put it back INSIDE the range it is avoiding. It is also an
     // env-overridable default, the same `${VAR:-…}` shape the MCP half of this file sanctions.
     // ⚠️ Residual, and unfixed on purpose: two clones running repro-cold-boot AT THE SAME TIME
@@ -154,7 +154,7 @@ describe('every harness that SPAWNS the packaged app pins a per-clone backend po
     // ⚠️ **This marker used to be `/clonePort/` alone, and that was too narrow (#830).** There
     // are TWO sanctioned derivations, and root CLAUDE.md names the other one as the primary:
     // "Every launch path derives the backend port from the CLONE DIRECTORY
-    // (engine/scripts/editorPorts.mjs, the one authored table)". `launch-editor.sh:84` and
+    // (engine/scripts/editorPorts.mjs, the one authored table)". `launch-editor.sh`'s `BACKEND_PORT` derivation and
     // `test-packaged.sh` both derive correctly through `editorPorts.mjs` and were invisible to
     // the old guard — it simply never scanned them, so the narrowness never showed. Widening
     // the SPAWNER list is what exposed it: a marker is only tested by the population it meets.

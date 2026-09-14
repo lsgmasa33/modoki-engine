@@ -162,7 +162,7 @@ export function blockingEditors(rows, opts) {
     // BUNDLE location to STATE location, and those are independent: a packaged binary launched
     // with no `--user-data-dir` uses the default wherever its bundle sits. So a staged bundle whose
     // MAIN process is launched flagless would be skipped while genuinely using our state. Every
-    // launcher in this repo passes `--user-data-dir` to a staged bundle (`smoke-packaged.sh:129`),
+    // launcher in this repo passes `--user-data-dir` to a staged bundle (`smoke-packaged.sh`'s `"$BIN" "--user-data-dir=$USERDATA"` launch),
     // so the shape has no producer here — and per CLAUDE.md a Windows path hazard is not
     // diagnosable from a Mac. Recorded rather than guarded, on the same principle as the
     // `--toolchain` gap: a guard against an unobserved failure is a refusal defended by reasoning.

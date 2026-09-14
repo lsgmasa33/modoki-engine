@@ -719,7 +719,7 @@ async function probeInputDeliverability(method: string, deadlineMs?: number): Pr
   if (!isCdpRoutableMethod(method)) return { kind: 'not-applicable' };
   let raw: unknown;
   // `deadlineMs` is the SAME op-sized transport deadline `/api/device/request`'s own `proxy`
-  // helper already computes (#153) from the request's `params.timeoutMs` (line ~1014 above) —
+  // helper already computes (#153) from the request's `params.timeoutMs` (its `opTimeout`/`deadline`, in that route below) —
   // passed through rather than left to the connection's flat 5000ms default. ⚠️ Narrower than it
   // sounds: none of the CDP-routable input tools (tap/drag/press-key/hover/scroll) actually SEND
   // `timeoutMs`, so `deadlineMs` is `undefined` for every real caller today and this probe still
@@ -732,7 +732,7 @@ async function probeInputDeliverability(method: string, deadlineMs?: number): Pr
   // answers exactly that — and absent is not unknown, so it is silent for the same reason the
   // missing `frameLoop` field below is. Without this split the banner rides EVERY tap/drag/
   // press-key/hover/scroll for the life of that build: permanent and unactionable, which is the
-  // failure the `!fl` comment promises not to commit. `deviceAim.ts:72` already draws this exact
+  // failure the `!fl` comment promises not to commit. `deviceAim.ts`'s `decodeAimReply` already draws this exact
   // line (`Unknown method:` → `unsupported`, `Error:` → a real refusal); `isDeviceFailureReply`
   // deliberately matches BOTH prefixes, so testing it alone cannot tell them apart.
   if (typeof raw === 'string' && raw.startsWith('Unknown method:')) return { kind: 'not-applicable' };

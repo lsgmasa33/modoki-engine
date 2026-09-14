@@ -76,7 +76,7 @@ describe('resolveTextureVariantUrl', () => {
   // The HALF THAT MATTERS, and the reason the fix is at the URL rather than an eviction pass in
   // `Scene2D`: the URL must move when the BYTES move and stay put when they do not. A re-slice
   // bumps the sprite epoch without changing the hash, and `Scene2D`'s retain-before-release bridge
-  // (`Scene2D.tsx:1761`) keys on `resolved.url === displaySlot.textureUrl` to keep the shared
+  // (`renderFrame`'s `bridgeUrl` block, `Scene2D.tsx`) keys on `resolved.url === displaySlot.textureUrl` to keep the shared
   // `TextureSource` across that rebuild. An epoch-keyed fix cannot tell the two apart — the epoch
   // bumps for both — and would force a re-download on every re-slice.
   it('moves the URL when the hash moves, and holds it when the hash does not (#1022)', () => {

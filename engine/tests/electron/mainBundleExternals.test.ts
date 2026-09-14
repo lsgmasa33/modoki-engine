@@ -24,7 +24,7 @@ import { electronOpts, electronMainOutfile, repoRoot } from '../../scripts/elect
  * `ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING` — it refuses to strip types under `node_modules` —
  * during `main.cjs` module evaluation. An uncaught main-process exception raises ELECTRON'S OWN
  * error dialog, so the app sat alive with no visible window, no children, no stdout, an empty
- * `--user-data-dir` and `exitCode=null`, before `initFileLog()` at `main.ts:206` could run. Every
+ * `--user-data-dir` and `exitCode=null`, before `main.ts`'s top-level `initFileLog()` could run. Every
  * diagnostic the repo has was empty at once, and `verify` stayed green throughout: it never loads
  * the packaged bundle. `verify:packaged` was unsatisfiable by anyone for a day.
  *

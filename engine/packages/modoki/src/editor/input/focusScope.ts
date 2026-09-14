@@ -17,12 +17,12 @@ if (import.meta.hot) import.meta.hot.accept(() => { window.location.reload(); })
  *  Clicking a Hierarchy row is a click on a plain <div>, so DOM focus stays on <body> —
  *  measured in P0, where every captured keypress reported target=BODY after clicking a
  *  Hierarchy row. Deriving focus from activeElement would report "nothing focused" for
- *  the panel the user is plainly working in, which is the bug Hierarchy.tsx:860 already
- *  works around by hand. */
+ *  the panel the user is plainly working in, which is the bug Hierarchy's old document-level keydown
+ *  worked around by hand (replaced by scoped bindings in P6). */
 
 /** Elements that mean "the user is typing", so bare keys and panel shortcuts must not fire.
  *
- *  Deliberately NARROWER than "any form control": `editor-multi-select.spec.ts:52` presses
+ *  Deliberately NARROWER than "any form control": `editor-multi-select.spec.ts`'s "Cmd+Z restores each" test presses
  *  Cmd+Z while a CHECKBOX has focus and expects the scene undo to run. A blunt
  *  tagName === 'INPUT' test would swallow it. Only text-entry controls count.
  *

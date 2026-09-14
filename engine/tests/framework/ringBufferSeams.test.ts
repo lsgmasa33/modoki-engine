@@ -225,7 +225,7 @@ describe('watch-read: the op strips samples, readWatch keeps them for WatchTab',
     expect(raw.series.length).toBeGreaterThan(0);
     expect(raw.series[0].samples?.map((p) => p.value)).toEqual([0, 5, 2]);
 
-    // THE INVARIANT: the producer always carries samples — WatchTab.tsx:89 renders them into
+    // THE INVARIANT: the producer always carries samples — WatchTab.tsx's `WatchCard` renders them into
     // a Sparkline. Stripping them THERE (rather than at the op) blanks the human's chart.
     const direct = readWatch(started.id!) as { series: Array<{ samples?: unknown[] }> };
     expect(direct.series.length).toBeGreaterThan(0);
@@ -264,7 +264,7 @@ describe('watch-read: the op strips samples, readWatch keeps them for WatchTab',
 /** THE ARCHITECTURAL EXCEPTION, pinned.
  *
  *  Every other stream summarizes in its agent op. `enact-handles` must NOT, because
- *  `engine/electron/inputRoutes.ts:168` calls that op directly —
+ *  `engine/electron/inputRoutes.ts`'s tap/drag-handle `resolve` helper calls that op directly —
  *  `requestRenderer('enact-handles', {ids:[id]})` — to turn a handle id into coordinates for
  *  `tap_handle`/`drag_handle`. Summarize the op and trusted input breaks with a 404 while the
  *  router tests, the inputRoutes tests (which mock the op) and the handlesDump tests (which call
@@ -300,7 +300,7 @@ describe('enact-handles: the OP is a passthrough — the ROUTER summarizes', () 
       { id: 'want', kind: 'button', editor: 'chrome', x: 7, y: 8 },
       { id: 'other', kind: 'button', editor: 'chrome', x: 1, y: 2 },
     ]);
-    // Exactly what engine/electron/inputRoutes.ts:168 issues.
+    // Exactly what engine/electron/inputRoutes.ts's handle `resolve` helper issues.
     const r = await runAgentOp('enact-handles', { ids: ['want'] }) as { handles?: Array<{ id: string; x: number; y: number }> };
     expect(r.handles).toHaveLength(1);
     expect(r.handles![0]).toMatchObject({ id: 'want', x: 7, y: 8 });

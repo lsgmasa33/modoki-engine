@@ -544,7 +544,7 @@ export async function startDevServer(opts: { repoRoot: string; projectRoot: stri
   // launch). os.tmpdir() = /tmp on Unix, %LOCALAPPDATA%\Temp on Windows.
   // …and PER EDITOR, not one shared name. The temp dir is machine-wide, so a bare
   // `modoki-vite.log` is written by every clone's editor at once (opened 'a', so they
-  // interleave rather than truncate) — and line ~595 below hands that path to whoever is
+  // interleave rather than truncate) — and the `proc.on('exit')` handler below hands that path to whoever is
   // diagnosing a dead dev server, which is exactly when reading a sibling clone's output
   // costs the most. Key it on the pinned backend port, the same anchor the launcher's
   // editor log and the derived Vite/CDP ports use; fall back to the pid when the port is

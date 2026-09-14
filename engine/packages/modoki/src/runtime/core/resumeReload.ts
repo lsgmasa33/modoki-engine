@@ -103,9 +103,9 @@ const BREADCRUMB_KEY = 'modoki.resumeReload';
 
 /** Why this exists: **the reload swallows the very resume that triggered it.**
  *
- *  Capacitor emits `appStateChange` with `retainUntilConsumed` false (`AppPlugin.java:40`), and
- *  `bridge.reset()` clears every JS listener at navigation START (`Bridge.java:570-575`,
- *  `CapacitorBridge.swift:295-298`). So the sequence is: OS foregrounds → event fires → our
+ *  Capacitor emits `appStateChange` with `retainUntilConsumed` false (`AppPlugin.load`), and
+ *  `bridge.reset()` clears every JS listener at navigation START (Android `Bridge.reset()`,
+ *  iOS `CapacitorBridge.reset()`). So the sequence is: OS foregrounds → event fires → our
  *  handler reloads → listeners wiped → the new realm registers fresh ones → and the event is
  *  gone, with nothing to re-emit it. Court's cloud-sync `'resume'` request
  *  (`cloudSyncWiring.ts`) is the casualty that matters: without this breadcrumb, sync sits idle

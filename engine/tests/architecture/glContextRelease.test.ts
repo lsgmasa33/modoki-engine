@@ -12,7 +12,7 @@
  *  numbers move on every bump and no guard watches them — docCitations.test.ts covers repo paths,
  *  which these are not — so a symbol is the only citation that survives (#966, cf. #680).
  *
- *  `gpuContextTracking.ts:15-21` already NAMES `previewScene.ts` and `ModelPreview.tsx` as the two
+ *  `gpuContextTracking.ts`'s module docblock already NAMES `previewScene.ts` and `ModelPreview.tsx` as the two
  *  standalone-`WebGLRenderer` sites in the editor — so the seam was documented TWICE and guarded
  *  nowhere, which is how `ModelPreview.tsx` shipped without the call (#776) while `previewScene.ts`
  *  had it. `ModelPreview.tsx`'s teardown has now been patched three times for three different
@@ -20,9 +20,9 @@
  *  — a guard is cheaper than a fourth.
  *
  *  Deliberately NOT covered: `makeWebGPURenderer`'s `WebGPURenderer` has no `forceContextLoss`
- *  API — it wraps `dispose` instead (`scene3DSync.ts:4752-4756`); PixiJS `Application` teardown in
+ *  API — it wraps `dispose` instead (`scene3DSync.ts`'s `makeWebGPURenderer`); PixiJS `Application` teardown in
  *  `ShaderPreview.tsx`; and `@monogrid/gainmap-js` creates its own throwaway renderer internally in
- *  `editor/panels/assetViews/encodeUltraHDR.ts:29`, invisible to our tracking and editor-only,
+ *  `editor/panels/assetViews/encodeUltraHDR.ts`'s `encodeAndCompress` call, invisible to our tracking and editor-only,
  *  short-lived. The `ShaderPreview.tsx` Pixi `Application` gap named above is now covered by the
  *  sibling guard, `rendererLossHandling.test.ts` (#795) — RELEASE-on-teardown (this file) and
  *  DETECT-on-construction (that one) are different properties over the same construction sites.

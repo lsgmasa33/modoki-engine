@@ -46,7 +46,7 @@
  *
  * ⚠️ **`clonePort.canonicalHere` is NOT retired, and two earlier drafts of this paragraph said it
  * was** (close-out review) — once as "a fifth copy", once as "an eleventh", neither counted. It is
- * still live at `clonePort.mjs:79` and is CORRECT there: that file may not import the SSOT (below),
+ * still live in `clonePort.mjs`'s `canonicalHere` and is CORRECT there: that file may not import the SSOT (below),
  * so a local canonicaliser is the one place this recipe is not a duplicate. Recorded because
  * writing a census in the past tense while its rows are still live is exactly what
  * `pathIdentity.mjs`'s header says hid four sites for two fixes.

@@ -79,13 +79,13 @@ describe('patchUI', () => {
 });
 
 describe('patchUI — backgroundColor/backgroundOpacity (defect fix)', () => {
-  // The render-time paint gate lives at `ui/UINode.tsx:267`:
+  // The render-time paint gate lives in `ui/UINode.tsx`'s `UINodeInner`:
   //   if (node.backgroundOpacity > 0) style.backgroundColor = hexToRgba(...);
   // and it sits inside `UINodeInner`, a React component — not reachable from this headless,
   // no-renderer test, and the brief for this test forbids faking one. What IS verifiable here is
   // the TRAIT PAIR `patchUI` writes, which is the gate's actual input: `backgroundColor` with no
   // `backgroundOpacity` leaves the paint gate closed (opacity stays at its silent-no-op default,
-  // 0 — traits/UIElement.ts:164); supplying both opens it.
+  // 0 — the `UIElement` trait's default); supplying both opens it.
   it('backgroundColor alone leaves backgroundOpacity at the silent-no-op default (0)', () => {
     tw!.spawn(UIElement({}), EntityAttributes({ name: 'Panel' }));
     expect(patchUI(tw!.world, 'Panel', { backgroundColor: 0xff0000 })).toBe(true);

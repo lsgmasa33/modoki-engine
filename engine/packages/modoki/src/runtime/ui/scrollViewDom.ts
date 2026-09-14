@@ -210,8 +210,8 @@ export interface ScrollMeasurementSource {
  *  Two facts replace the old "known limitation" paragraph, which was both wrong and incomplete:
  *
  *  - The "both trees visible at different DEVICE sizes" case that paragraph warned about **cannot
- *    occur**: `SceneView.tsx:2323` sizes its preview frame from `gameViewSize`, which only
- *    GameView's effects write (`engine/app/editor/agentEditorOps.ts:142`). Both mounts render the
+ *    occur**: `SceneView.tsx`'s `UIEditorOverlay` sizes its preview frame from `gameViewSize`, which only
+ *    GameView's effects write (`engine/app/editor/agentEditorOps.ts`'s `describeGameView` doc). Both mounts render the
  *    same logical device size by construction — a measured 434 vs 435 is scrollbar/rounding, not a
  *    device gap.
  *  - The residual hazard is a **MIXED** measurement, not two viewports, and it is pre-existing

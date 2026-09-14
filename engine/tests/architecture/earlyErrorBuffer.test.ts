@@ -30,7 +30,7 @@ afterAll(() => { vi.unstubAllGlobals(); });
  * which that shim cannot see AT ALL — a module-eval throw fires an `ErrorEvent`, never a
  * `console.error` call, so only an early `window` listener can catch it.
  *
- * The guard (`engine/index.html:8-90`) is the earliest thing in the page that CAN catch it: it
+ * The guard (`engine/index.html`'s first inline script) is the earliest thing in the page that CAN catch it: it
  * registers both listeners at HTML-parse time, before rolldown's bundled entry chunk has run a
  * single static import (see `errorCaptureInstallOrder.test.ts`'s #636 caveat for the measured byte
  * offsets this covers on a boot that COMPLETES — #825 is the boot that never does).
@@ -81,7 +81,7 @@ const START_MARKER = '<!-- modoki:early-console:start -->';
 //
 // ⚠️ **What this helper does NOT undo, and cannot.** `installGlobalErrorHandlers()` also calls
 // `onAppServicesRegistered(flushQueue)` (`appServices.ts`), and that list has no removal API —
-// `appServices.ts:71`'s own doc comment calls it permanent ("Never removed — the listeners are
+// `appServices.ts`'s `onAppServicesRegistered` doc comment calls it permanent ("Never removed — the listeners are
 // process-level"). Every direct `installGlobalErrorHandlers()` call below therefore leaves one more
 // `flushQueue` registration for the life of this file's test run; that residual is ACCEPTED, not
 // fixed, and is unrelated to the window-listener and console-wrapper leaks this helper DOES close.
@@ -430,7 +430,7 @@ describe('fatal-load guard — #823 (widened screen gate) and #825 (cross-boot s
   });
 
   // The test above dispatches a PLAIN runtime error, which never matches `isReloadRecoverable` —
-  // so it cannot distinguish "the outer mounted-app guard (`index.html:198`) holds" from "only the
+  // so it cannot distinguish "the outer mounted-app guard (`consider()`'s `root.childElementCount > 0` in `index.html`) holds" from "only the
   // INNER duplicate check inside the 1400ms timer holds": mutation-verified, dropping the outer
   // guard's `childElementCount` check still leaves that test green, because `tryAutoReloadOnce`
   // never gets involved for a non-reload-shaped message and the inner duplicate catches it 1400ms

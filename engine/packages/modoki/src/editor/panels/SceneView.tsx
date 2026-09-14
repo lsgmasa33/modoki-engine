@@ -450,7 +450,7 @@ export default function SceneView() {
   // is empty with no explanation, and "empty because the scene has no colliders" is a different
   // message from "empty because sprites are hidden".
   // ⚠️ `peekCurrentWorld`, NOT `getCurrentWorld` — the latter LAZILY CREATES a world
-  // (`worldRegistry.ts:28-35`), and this runs from a 500ms poll that can start before any scene has
+  // (`worldRegistry.ts`'s `getCurrentWorld`), and this runs from a 500ms poll that can start before any scene has
   // loaded, because the flag PERSISTS (#399) and is restored at mount. Allocating a world there and
   // then reporting 0 would put "this scene has NO colliders" on screen about a scene that has not
   // loaded yet — the exact false notice this feature exists to prevent. `undefined` = unmeasured.
@@ -701,7 +701,7 @@ export default function SceneView() {
   // from the Assets panel or a running game, so it only fires when the Scene view itself
   // owns the keyboard. Hierarchy registers the same chord (`hierarchy.frameSelected`,
   // scope 'hierarchy') since users also press it right after clicking an entity there
-  // (editor-hierarchy.spec.ts:84) — the two share `canFrameSelected` (sceneViewBus.ts) so
+  // (editor-hierarchy.spec.ts's "F key frames the selected entity" test) — the two share `canFrameSelected` (sceneViewBus.ts) so
   // they can't drift. Everywhere else — Game view, Inspector, nothing focused — yields,
   // for free, via keymap scope priority; no `focusedPanel` check needed here at all.
   useEffect(() => {
@@ -2858,7 +2858,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     // Released from the scope rather than only from the closure below, so a throw in the ~2,200
     // lines between here and there still detaches them. They now run AFTER that closure's GPU
     // disposal instead of before it, which is safe for a reason worth stating: every event path in
-    // `rendererLossHandling.ts` consults `isStale()` first (`:89`, `:106`, `:136`), and `isStale`
+    // `rendererLossHandling.ts` consults `isStale()` first (in `attachContextLossListeners` and `attachDeviceLostListener`), and `isStale`
     // reads `disposed`, which that closure sets as its FIRST statement.
     scope.add(detachUncapturedError);
     scope.add(detachRendererLoss);
@@ -3022,7 +3022,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
         return !!el && (el === renderer.domElement || renderer.domElement.contains(el));
       };
       // three's OWN `eye`, and the branch matters: for an ORTHOGRAPHIC camera it is the negated
-      // view direction, NOT the direction to the camera's position (TransformControls.js:1113).
+      // view direction, NOT the direction to the camera's position (TransformControls' gizmo updateMatrixWorld, orthographic branch).
       // The editor has an orthographic sibling camera, so getting this wrong there would hide an
       // axis three kept (dropping a usable handle) or publish one three collapsed to 1e-10 —
       // reintroducing the exact miss this module exists to prevent, in ortho only.
@@ -3675,7 +3675,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     let gameActiveCam: THREE.PerspectiveCamera | THREE.OrthographicCamera = gameCam;
 
     // Publish the game-camera billboard raycast for the 2D overlay's pointer handler. Uses the
-    // SAME letterboxed NDC + gameCam as the in-viewport pick3D (line ~2263) so 2D-mode picking
+    // SAME letterboxed NDC + gameCam as the in-viewport pick3D (`pickEntityAtViewportPoint`'s UI-mode path) so 2D-mode picking
     // can't drift from what's drawn. Only billboards — 3D meshes aren't the target in 2D mode.
     scope.add(() => { _pickBillboardInUI = null; }); // drop the 2D-overlay picking bridge
     _pickBillboardInUI = (clientX, clientY) => {

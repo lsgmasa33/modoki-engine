@@ -5,7 +5,7 @@
  *  An untargeted call now reports COUNTS; rects and pairs are opt-in.
  *
  *  The load-bearing constraint is NOT the size — it's that `computeLayoutBounds` is a shared
- *  producer. `diagnose.ts:72` calls it with NO params and reads `.offScreen.length`. Summarize
+ *  producer. `diagnose.ts`'s `computeDiagnostics` calls it with NO params and reads `.offScreen.length`. Summarize
  *  that key away and `modoki_diagnose` breaks in the field, silently, long before a test
  *  notices. So `offScreen` (and `zeroSize`) stay arrays, always. */
 

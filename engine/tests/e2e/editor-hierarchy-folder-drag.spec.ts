@@ -13,7 +13,7 @@ import { gotoEditorWithScene, idByName, stableBoundingBox } from './helpers';
 
 // `EntityAttributes.editorFolder` isn't in the curated Inspector field subset `traitField`
 // reads (entityUtils.ts's readTraitData) — it's surfaced on getAllEntities()'s EntityInfo
-// instead (entityUtils.ts buildEntityTree/getAllEntities, line ~376), same as the Hierarchy
+// instead (entityUtils.ts buildEntityTree/getAllEntities, its editorFolder read), same as the Hierarchy
 // panel itself reads it.
 const editorFolderOf = (page: import('@playwright/test').Page, id: number): Promise<string | undefined> =>
   page.evaluate((i) => (window as any).__modokiEditorTest.getAllEntities().find((e: any) => e.id === i)?.editorFolder, id);

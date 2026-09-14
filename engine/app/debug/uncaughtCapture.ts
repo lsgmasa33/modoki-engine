@@ -46,12 +46,12 @@
  *  exactly this reason; riding it here keeps this module active everywhere the ring itself is.
  *
  *  ⚠️ Records via `recordConsoleRingEntry('error', …)` — NEVER `console.error(...)`. Do not
- *  "simplify" this into a `console.error(...)` call: `runtime/core/globalErrors.ts:490` wraps
- *  `console.error` and reports to Crashlytics, and its de-duplication (`:385-389`) only recognises a
+ *  "simplify" this into a `console.error(...)` call: `runtime/core/globalErrors.ts`'s `installGlobalErrorHandlers` wraps
+ *  `console.error` and reports to Crashlytics, and its de-duplication (`captureConsoleError`) only recognises a
  *  call whose SOLE argument is an `Error` OBJECT, keyed in a WeakSet — a synthetic STRING can't match
  *  it, so routing an already-reported uncaught error back through `console.error` files a SECOND
  *  Crashlytics issue for the same fault (the "two issues per fault" symptom measured and documented
- *  at `globalErrors.ts:366-377`, 2026-08-20). Writing straight into the ring keeps the diagnostic
+ *  in `globalErrors.ts`'s `alreadyReported` doc, 2026-08-20). Writing straight into the ring keeps the diagnostic
  *  line and reports nothing new.
  */
 

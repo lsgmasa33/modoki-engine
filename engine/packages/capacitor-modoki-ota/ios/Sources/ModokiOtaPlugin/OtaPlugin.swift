@@ -14,14 +14,14 @@
 //
 //  - Capacitor persists the served content's location as `KeyValueStore.standard["serverBasePath"]`
 //    (`Plugins/WebView.swift`'s `persistServerBasePath`), but `instanceDescriptor()`
-//    (`CAPBridgeViewController.swift:91-101`) only trusts that string's LAST PATH COMPONENT —
+//    (`CAPBridgeViewController.instanceDescriptor()`) only trusts that string's LAST PATH COMPONENT —
 //    it reconstructs the real directory as
 //    `<Library>/NoCloud/ionic_built_snapshots/<lastPathComponentOfPersistedValue>`.
 //    So OTA bundle folders MUST live there, named by their last component only.
 //  - `instanceDescriptor()` is the documented, sanctioned override point for exactly this
 //    ("This is called early in the View Controller's lifecycle" — precisely where we need
 //    to decide/correct what gets served, BEFORE the WKWebView is created).
-//  - Capacitor's own `isNewBinary` check (`CAPBridgeViewController.swift:18-24`, comparing
+//  - Capacitor's own `isNewBinary` check (`CAPBridgeViewController.isNewBinary`, comparing
 //    `CFBundleVersion`/`CFBundleShortVersionString` against what it last saw) ALREADY
 //    forces a fallback to the embedded bundle after a genuine App Store update, skipping
 //    the persisted path entirely — a real safety net we get for free. Our own state.json

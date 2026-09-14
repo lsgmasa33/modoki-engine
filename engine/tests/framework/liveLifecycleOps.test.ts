@@ -237,7 +237,7 @@ describe('sim-step (runtime twin)', () => {
     const callsAtSwap = queryFirstSpy.mock.calls.length + querySpy.mock.calls.length;
 
     // Simulate a scene load swapping in a NEW world mid-step, destroying the one sim-step
-    // captured — the two-world atomic swap (SceneManager.ts:880-885).
+    // captured — the two-world atomic swap (`SceneManager.loadScene`'s `setCurrentWorld(promotedWorld)` + `destroyWorldWhenSafe`).
     const otherWorld = createWorld();
     setCurrentWorld(otherWorld);
 

@@ -286,7 +286,7 @@ describe('isTextEditable', () => {
   });
 
   it('does NOT treat a checkbox as editable', () => {
-    // editor-multi-select.spec.ts:52 presses Cmd+Z while a checkbox has focus and
+    // editor-multi-select.spec.ts's "Cmd+Z restores each" test presses Cmd+Z while a checkbox has focus and
     // expects the SCENE undo. A blunt tagName==='INPUT' test would swallow it.
     expect(isTextEditable(el({ tagName: 'INPUT', type: 'checkbox' }))).toBe(false);
     expect(isTextEditable(el({ tagName: 'INPUT', type: 'radio' }))).toBe(false);

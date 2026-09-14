@@ -323,7 +323,7 @@ describe('shouldOverrideUserData', () => {
  * REGRESSION GUARD — ordering, not logic.
  *
  * Electron RESOLVES AND CACHES userData on its FIRST read, so whoever reads first wins.
- * This broke for real: `initFileLog()` (added at main.ts:28 by ff364b47, a Windows crash
+ * This broke for real: `initFileLog()` (added to main.ts's top level by ff364b47, a Windows crash
  * fix) reads userData, which silently demoted the `app.setName('Modoki Editor')` 240 lines
  * below it to a no-op — relocating the shipped editor's entire profile (1.2GB toolchain,
  * prefs, caches) from `Modoki Editor` to `modoki-app`. Nothing threw and nothing logged;
@@ -439,7 +439,7 @@ describe('main.ts must fix userData before anything reads it', () => {
    *  `getPath('userData')` is now the PROJECT profile. Every consumer must therefore make a
    *  decision — project-level or editor-level — and the first pass through this file got 2 of 7
    *  right by hand. The one that mattered: `readCdpEnabled`/`writeCdpEnabled` are an EDITOR
-   *  preference, and `readCdpEnabled` defaults to ON when the file is absent (`cdp.ts:76`,
+   *  preference, and `readCdpEnabled` defaults to ON when the file is absent (`cdp.ts`'s `readCdpEnabled`,
    *  opt-out model). Written under project A and read under project B, a user's decision to turn
    *  the remote-debugging port OFF silently reverts to ON, with the checkbox still showing OFF —
    *  deterministic on a fresh packaged install, whose first launch has no recents and so no
@@ -448,8 +448,8 @@ describe('main.ts must fix userData before anything reads it', () => {
    *  So: an allowlist. A new `getPath('userData')` must either go through `editorStateDir()` or
    *  be added here WITH a reason — which is the point at which someone has to think about it.
    *
-   *  ⚠️ **Reach: main.ts ONLY.** This scans one file, so it cannot see `fileLog.ts:244` or
-   *  `zoom.ts:47`, both of which read `getPath('userData')` too. Both were audited by hand and
+   *  ⚠️ **Reach: main.ts ONLY.** This scans one file, so it cannot see `fileLog.ts`'s `initFileLog` or
+   *  `zoom.ts`'s `prefsFile`, both of which read `getPath('userData')` too. Both were audited by hand and
    *  are deliberate (logs follow the project so two editors stop interleaving one `main.log`;
    *  zoom's is the `--user-data-dir` fallback) — but do not read this guard as covering the
    *  whole class, because its docblock used to imply that. (#1036 §2d review F3.) */
@@ -506,7 +506,7 @@ describe('main.ts must fix userData before anything reads it', () => {
   /** ⚠️ Bans the NAME, not one spelling of it (#1036 review F8). The first version was
    *  `not.toMatch(/MODOKI_MULTI\s*\?/)`, which a plain `if (process.env.MODOKI_MULTI) …` — the most
    *  natural way anyone would reintroduce the gate — walks straight past. `src` is comment-stripped
-   *  (`readScannedSource`), so the surviving explanatory mention at main.ts:147 does not count. */
+   *  (`readScannedSource`), so the surviving explanatory mention in main.ts's `shouldOverrideUserData` block does not count. */
   it('MODOKI_MULTI appears nowhere in main.ts CODE — the special case is GONE, not moved', () => {
     // A reintroduced gate means packaged (and a plain dev launch) silently stop being
     // project-keyed, which is invisible in every unit test of the resolvers.

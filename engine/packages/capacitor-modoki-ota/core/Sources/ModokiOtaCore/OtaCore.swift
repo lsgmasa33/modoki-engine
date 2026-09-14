@@ -405,7 +405,7 @@ public enum OtaCore {
     // Keyed on the attempt COUNTER, not a per-process latch in the plugin, because a
     // sub-game's attempt genuinely IS counted on a reload (`beginBundleLoad` runs again
     // against re-executing JS), and on Android `MainActivity.onCreate` — hence the boot
-    // hook — can re-run inside one process (see `OtaPlugin.java:75-82`), so "per process"
+    // hook — can re-run inside one process (see `OtaPlugin.java`'s `IN_FLIGHT_TMP_DIRS` doc), so "per process"
     // is not "per boot" there either. The counter is correct in all three cases.
     if (s.confirmedBoots[name] ?? 0) >= (s.bootAttempts[name] ?? 0) { return s }
     let confirms = (s.confirmedBoots[name] ?? 0) + 1

@@ -40,7 +40,7 @@ import org.json.JSONObject;
  *
  * Integrates with Capacitor's OWN existing live-update mechanism (SharedPreferences file
  * "CapWebViewSettings", key "serverBasePath", read in Bridge.loadWebView() — see
- * Bridge.java:293-304 — gated on `!isDeployDisabled() && !isNewBinary()`, the same
+ * Bridge.loadWebView's serverBasePath block — gated on `!isDeployDisabled() && !isNewBinary()`, the same
  * "skip stale OTA content right after a real Play Store update" safety net iOS has).
  * Unlike iOS, Android's persisted value is a FULL absolute path (verified with
  * `new File(path).exists()`), not a fixed-base-dir + last-path-component convention — so

@@ -83,11 +83,11 @@ describe('installDeviceConsoleCapture — positive case (shared ring installed)'
   // ⚠️ The assertion that matters here is the NEGATIVE one, and it is the whole point of the test:
   // an earlier draft implemented `push` as `console[level](...args)` and pinned it with a test that
   // only checked the entry landed in the ring — which is true under BOTH implementations, so it
-  // proved nothing and would have defended the bug. `globalErrors.ts:490` wraps `console.error` and
-  // reports to Crashlytics; its dedup (`:385-389`) only recognises a call whose sole argument is an
+  // proved nothing and would have defended the bug. `globalErrors.ts`'s `installGlobalErrorHandlers` wraps `console.error` and
+  // reports to Crashlytics; its dedup (`captureConsoleError`) only recognises a call whose sole argument is an
   // `Error` OBJECT, so a synthetic STRING slips past it and files a SECOND issue for an uncaught
   // error already reported — the measured "two issues per fault" regression at
-  // `globalErrors.ts:366-377`. Spying on `console.warn` BEFORE the ring wraps it means the spy sees
+  // `globalErrors.ts`'s `alreadyReported` doc. Spying on `console.warn` BEFORE the ring wraps it means the spy sees
   // any forwarded call, so "spy not called" distinguishes the two implementations.
   it('consoleRing.push() records DIRECTLY, never via console[level] — no second Crashlytics report', async () => {
     vi.resetModules();

@@ -218,7 +218,7 @@ const BANNED_URL_PATHNAME = /new\s+URL\s*\([^;)]*import\.meta\.url\s*\)\s*\.path
  *  ⚠️ **`ARG` allows ONE level of nested parens, and dropping it reintroduces a blind spot this
  *  file already has a scar for.** A first cut used a flat `[^;()]*` to keep the false positives
  *  below out, and went blind to every argument that is not a bare identifier — including the
- *  literal house spelling at `deviceClaimsStore.mjs:626` and `:660`:
+ *  literal house spelling in `deviceClaimsStore.mjs`'s `foreignClaimFor` and `ownAdbClaim`:
  *
  *      canonicalClonePath(opts.clone ?? process.cwd()) === held.clone   // MISSED
  *      canonicalPath(process.cwd()) === own                             // MISSED
@@ -241,7 +241,7 @@ const BANNED_URL_PATHNAME = /new\s+URL\s*\([^;)]*import\.meta\.url\s*\)\s*\.path
  *  matched two shapes that are correct, and one of them is live code (close-out review):
  *
  *      path.relative(canonicalPath(repoRoot), p) !== ''   // projects.ts `isUnderRepo`
- *      path.basename(canonicalPath(p)) === 'games'        // one `===` from editorPorts.mjs:130
+ *      path.basename(canonicalPath(p)) === 'games'        // one `===` from editorPorts.mjs's backendPortForClone
  *
  *  `isUnderRepo` answers STRICT containment and docs/windows.md says explicitly it must NOT
  *  migrate to `isUnderOrSame` — so the guard's own message would have offered no valid fix, and
@@ -497,7 +497,7 @@ describe('same-directory comparisons go through pathIdentity (#869)', () => {
     ['LEFT operand only', 'if (canonicalPath(stored) === own) return null;', true],
     ['space before paren', 'if (canonicalPath (a) === b) return;', true],
     // ⚠️ The three nested-argument rows. A flat `[^;()]*` missed all three, and the second is
-    // live house style at `deviceClaimsStore.mjs:626`. Deleting `ARG` reddens exactly these.
+    // live house style in `deviceClaimsStore.mjs`'s `foreignClaimFor`. Deleting `ARG` reddens exactly these.
     ['a nested call as the argument', 'if (canonicalPath(process.cwd()) === own) return;', true],
     ['the alias, with a ?? default', 'if (canonicalClonePath(opts.clone ?? process.cwd()) === held.clone) return;', true],
     ['nested, and folded', 'if (pathCaseKey(canonicalPath(path.dirname(p))) === key) go();', true],

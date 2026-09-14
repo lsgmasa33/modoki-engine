@@ -4,7 +4,7 @@
  *  `SceneManager` aborts the in-flight load and its own `sceneManager.loadScene` promise
  *  REJECTS with an AbortError — `loadScene`'s `catch` swallows that.
  *
- *  Per `sceneManager.ts:885-900`, a load that starts during the winner's tail finds nothing left
+ *  Per `SceneManager.loadScene`'s step-11 tail guard, a load that starts during the winner's tail finds nothing left
  *  to cancel — `nextLoad` was already cleared at the winner's swap — so it "skips straight to
  *  resolving": its OWN `sceneManager.loadScene` call resolves successfully and throws nothing.
  *  Before the fix, `loadScene`'s success path consulted the epoch guard nowhere, so the loser ran
@@ -96,7 +96,7 @@ describe('loadScene: a load superseded in the WINNER\'S TAIL (#495)', () => {
 
     // The loser's OWN SceneManager.loadScene call now resolves successfully too — the tail
     // supersede: nothing was left to cancel, so it "skips straight to resolving" with no
-    // AbortError (sceneManager.ts:885-900).
+    // AbortError (SceneManager.loadScene's step-11 tail guard).
     call1.resolve();
     const outcome1 = await p1;
 

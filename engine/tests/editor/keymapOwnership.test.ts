@@ -33,8 +33,8 @@ const EDITOR = path.resolve(__dirname, '../../packages/modoki/src/editor');
  *  never produces one, so there is nothing left to undo.
  *
  *  ⚠️ **Keyed `<file>::<event>` and pardoning one listener each (#1123).** This was
- *  `Record<file, reason>`, and `SceneView.tsx` registers TWO listeners — keydown at :3079 and keyup
- *  at :3080 — under one row. Its reason argues for both ("needs keyup as much as keydown"), which is
+ *  `Record<file, reason>`, and `SceneView.tsx` registers TWO listeners — its Shift-snap `onSnapKey` keydown and keyup
+ *  listeners — under one row. Its reason argues for both ("needs keyup as much as keydown"), which is
  *  exactly why the file key read as adequate; what it also pardoned was every FUTURE listener in a
  *  3,000-line panel, including a keypress for something unrelated. The event name is what tells two
  *  listeners apart, so it is in the key rather than hidden behind a count. */

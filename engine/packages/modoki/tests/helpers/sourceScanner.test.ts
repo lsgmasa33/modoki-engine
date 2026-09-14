@@ -47,8 +47,10 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   assertEveryCodeTokenSurvives,
   assertScanIsSane,
+  commentText,
   findDamagedCodeTokens,
   readScannedSource,
+  scanLanguageOf,
   stripComments,
   stripCommentsAndStrings,
   stripHashComments,
@@ -71,7 +73,7 @@ const brokenRegexStrip = (src: string): string =>
 describe('the scanner survives the constructs that broke its predecessors (#411, #418, #419)', () => {
   const cases: ReadonlyArray<{ what: string; src: string; ticket: string }> = [
     // ── #411: a block-comment opener inside a LINE comment ──────────────────────────────────────
-    // The defect this module was extracted for. `Scene3D.tsx:28` writes this exact glob in prose
+    // The defect this module was extracted for. `Scene3D.tsx`'s comment on its `rawNow` import writes this exact glob in prose
     // and it deleted 82 lines — 22 of them imports — from the determinism guard's view.
     { ticket: '#411', what: 'a `/*` glob written inside a line comment',
       src: '// a direct performance.now() in runtime/** fails the guard\nprobe(x);\n/* later */' },
@@ -328,7 +330,7 @@ describe('⚠️ the FORWARD guard: no file the engine guards scan is damaged by
   });
 
   it('the file that proved the old stripper defeats the determinism guard is intact', () => {
-    // ⚠️ The measured #419 case, pinned by name. `Scene3D.tsx:28`'s line comment writes the glob
+    // ⚠️ The measured #419 case, pinned by name. `Scene3D.tsx`'s line comment on its `rawNow` import writes the glob
     // `runtime/**`; under the regex stripper that opened a phantom block running to the next `*/`
     // and deleted 82 lines including 22 `import` statements, so a `performance.now()` planted
     // anywhere in that window left `determinismGuard.test.ts` green.
@@ -465,5 +467,57 @@ describe('readScannedSource is the one read, and REFUSES rather than falling bac
     const { code } = readScannedSource(p, { language: 'shell' });
     expect(code).toContain('run');
     expect(code).not.toContain('note');
+  });
+
+  it('scanLanguageOf answers exactly what readScannedSource would do with the extension', () => {
+    expect(scanLanguageOf('a/b.tsx')).toBe('js');
+    expect(scanLanguageOf('Plugin.JAVA')).toBe('braces');
+    expect(scanLanguageOf('notes.md')).toBeUndefined();
+    expect(() => readScannedSource(write('notes.md', 'x\n'))).toThrow(/no comment stripper/);
+  });
+});
+
+describe('commentText is the comments and nothing else (#1186)', () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'comments-')); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+  const read = (name: string, body: string) => {
+    const p = join(dir, name);
+    writeFileSync(p, body, 'utf8');
+    return commentText(readScannedSource(p));
+  };
+
+  it('JS: keeps line and block comment prose, blanks code and string CONTENT, keeps line numbers', () => {
+    const text = read('a.ts', [
+      'const url = "see a.ts:12"; // cites b.ts:34',
+      '/* block',
+      '   c.ts:56 */ const x = `d.ts:78`;',
+      '',
+    ].join('\n'));
+    expect(text.length, 'length-preserving, so an offset is still a real offset').toBe(
+      'const url = "see a.ts:12"; // cites b.ts:34\n/* block\n   c.ts:56 */ const x = `d.ts:78`;\n'.length,
+    );
+    const lines = text.split('\n');
+    expect(lines[0]).toContain('b.ts:34');
+    expect(lines[0], 'a string is not a comment (owner ruling on #1186: comments only)').not.toContain('a.ts:12');
+    expect(lines[2]).toContain('c.ts:56');
+    expect(lines[2]).not.toContain('d.ts:78');
+    expect(lines[2]).not.toContain('const');
+  });
+
+  it('shell and Swift comments come through too, so the corpus is every language the scanner reads', () => {
+    expect(read('s.sh', 'echo "x.ts:9" # see y.ts:10\n')).toContain('y.ts:10');
+    expect(read('s.sh', 'echo "x.ts:9" # see y.ts:10\n')).not.toContain('x.ts:9');
+    expect(read('P.swift', 'let s = "q.swift:1" /* r.swift:22 */\n')).toContain('r.swift:22');
+  });
+
+  it("a comments:'include' read yields NO comment text, which is why a caller must assert it found some", () => {
+    const p = join(dir, 'b.ts');
+    writeFileSync(p, 'const a = 1; // b.ts:34\n', 'utf8');
+    expect(commentText(readScannedSource(p, { comments: 'include', reason: 'probe' })).trim()).toBe('');
+  });
+
+  it('refuses a view that is not length-aligned', () => {
+    expect(() => commentText({ raw: 'ab', code: 'a', path: 'x.ts' })).toThrow(/length-preserving/);
   });
 });

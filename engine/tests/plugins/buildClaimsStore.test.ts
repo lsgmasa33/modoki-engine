@@ -553,7 +553,7 @@ describe('describeBuildClaimConflict', () => {
   });
 });
 
-// #650 divergence 1 — see buildClaimsStore.mjs's `withLock` comment. deviceClaimsStore.mjs:264
+// #650 divergence 1 — see buildClaimsStore.mjs's `withLock` comment. deviceClaimsStore.mjs's `withLock`
 // gives up and proceeds WITHOUT the lock once its wait window passes ("never block hardware on a
 // lock"), which is correct for a device and WRONG for a build claim: proceeding unlocked risks
 // losing a write in the read-modify-write, which is the exact torn-claim (and so torn-dist) race

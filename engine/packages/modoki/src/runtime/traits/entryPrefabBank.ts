@@ -12,7 +12,7 @@
  *  sceneValidation.ts` imports it directly, for the reason above. The build tree-shaker
  *  (`plugins/asset-tree-shaker.ts`) is NOT one of them — it parses the bank INLINE, on purpose,
  *  because it is a build plugin and must not import engine source (see its own comment at
- *  `asset-tree-shaker.ts:566`).
+ *  `asset-tree-shaker.ts`'s `probeTraitRefs`).
  *  A second hand-rolled parse next to the validator is exactly the drift this repo keeps paying for.
  */
 

@@ -158,7 +158,7 @@ describe('editorPorts.mjs CLI — the bash seam (#349)', () => {
 
   it('the bash idiom the launchers use captures exactly the port, warning excluded', () => {
     // The real thing, not a paraphrase: `${VAR:-$(…)}` under `set -euo pipefail`, which is
-    // what launch-editor.sh line ~80 does. Two properties at once — the substitution yields
+    // what launch-editor.sh's non-MULTI BACKEND_PORT derivation does. Two properties at once — the substitution yields
     // the bare port, and a failing/warning CLI does not abort the shell.
     const script = `set -euo pipefail; PORT="\${MODOKI_BACKEND_PORT:-$(node '${CLI}' backend '${KNOWN}')}"; echo "[$PORT]"`;
     expect(execFileSync('bash', ['-c', script], { encoding: 'utf8', env: NO_PIN }).trim()).toBe('[5182]');

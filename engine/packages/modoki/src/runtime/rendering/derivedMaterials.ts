@@ -148,12 +148,12 @@ export function collectDerivedChain(m: THREE.Material, out: Set<THREE.Material>)
  *  more than the material itself.
  *
  *  ⚠️ Today every caller passes a bare `() => m.dispose()` — all four of them
- *  (`lightMaskVariants.ts:309`, `scene3DSync.ts:167`, `:1692`, `:3024`). The value side is
+ *  (`lightMaskVariants.ts`'s `retireVariantsOf`; `scene3DSync.ts`'s `tintedMaterial`, `syncMaterial`, `syncRenderables`). The value side is
  *  therefore degenerate, and this map behaves identically to a `Set<Material>` plus a
  *  `m.dispose()` at the sweep. Two owners named here previously do NOT in fact use it:
  *  `materialInstanceClones.ts` never calls `retireDerivedMaterial` at all (it routes through
  *  `cloneDerived` + `retireVariantsOf`), and `lightMaskVariants` drops its `owned` entry at
- *  `:307`, BEFORE retiring, deliberately rather than inside the closure. The closure stays
+ *  (`owned.delete` in `retireVariantsOf`), BEFORE retiring, deliberately rather than inside the closure. The closure stays
  *  because the retire contract is the right shape for an owner that needs it — but do not read
  *  this as evidence that one exists. */
 const retiredDerived = new Map<THREE.Material, () => void>();

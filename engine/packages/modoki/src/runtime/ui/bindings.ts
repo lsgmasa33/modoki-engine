@@ -104,7 +104,7 @@ const lockLiveness = createTeardownToken();
 // to infer.
 
 // Reset on world/scene swap — a lock held by the previous world's action must not carry over
-// and brick the next one. Top-level, matching UINode.tsx:109 / uiValues.ts:56 / focusManager
+// and brick the next one. Top-level, matching the top-level onWorldSwap in UINode.tsx / uiValues.ts / focusManager
 // precedent (registered once at module load, not lazily). Routed through releaseLock() (not a
 // duplicate set of field writes) so the swap reset and every other release path bump lockGen
 // identically and can never drift apart.

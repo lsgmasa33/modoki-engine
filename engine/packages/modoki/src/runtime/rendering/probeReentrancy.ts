@@ -109,7 +109,7 @@ export function shareTierResolution(run: () => Promise<void>): Promise<void> {
   // the early return one line up means two production calls can never both reach past it before
   // either has installed its promise, and nothing else in production nulls this slot. Correct as
   // written, and kept for the same reason `acquireModel`'s own outer/inner-redundant guard is kept
-  // (`meshTemplateCache.ts` ~:1521) — it states the right invariant and stops being unreachable the
+  // (`meshTemplateCache.ts`'s `acquireModel` post-await guard note) — it states the right invariant and stops being unreachable the
   // moment a second caller or a mid-flight reset is added — but this is not a proven production
   // race today. See docs/async-lifetime.md.
   //

@@ -181,7 +181,7 @@ describe('computeResize / computeMoveOffsets with an ancestor scale (#651 B2 sec
   it('a px resize under ancestor scale 2 writes HALF what the raw (frame-logical) delta suggests', () => {
     // dx=20 frame-logical px; a further 2x ancestor transform means only 10 authored px of
     // growth actually tracks the cursor on screen. The pre-fix code (no ancestorScaleX) wrote
-    // 100+20=120 here — this is the exact overshoot the brief calls out at uiResizeMath.ts:256.
+    // 100+20=120 here — this is the exact overshoot the brief calls out in uiResizeMath.ts's computeResize px width branch.
     expect(computeResize('resize-r', rv(), computed, PARENT, 20, 0, NO_VP, 2, 1)).toEqual({ width: 110 });
   });
 

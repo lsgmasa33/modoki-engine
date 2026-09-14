@@ -57,7 +57,7 @@ const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : a
 // profile, and clobbering it is the same class of bug in reverse. (The CSP smoke launches
 // the packaged app with one.)
 //
-// ⚠️ #1036 MOVED `REPO_ROOT`, `editorIdentity()` and `setRecentsScope()` up here from ~line 400.
+// ⚠️ #1036 MOVED `REPO_ROOT`, `editorIdentity()` and `setRecentsScope()` up here from further down this file.
 // They used to sit below, and this block inlined a duplicate of REPO_ROOT's expression with a
 // comment apologising for it. The decision now needs the PROJECT, which needs recents, which
 // needs the scope — so the three moved rather than being copied. All are pure path arithmetic
@@ -624,7 +624,7 @@ const CDP = resolveCdpConfig({
   // ⚠️ `editorStateDir()`, NOT `getPath('userData')` (#1036 review F1). This is an EDITOR
   // preference, and userData is now keyed on the PROJECT — so a write under project A and a read
   // under project B are different files. `readCdpEnabled` defaults to ON when the file is absent
-  // (opt-out model, cdp.ts:76), so the miss does not fail safe: a user who switched the
+  // (opt-out model, cdp.ts's readCdpEnabled), so the miss does not fail safe: a user who switched the
   // remote-debugging port OFF gets it back ON at the next launch that keys differently, with the
   // checkbox still showing their choice. Deterministic on a fresh packaged install, whose FIRST
   // launch has no recents and so no sub-key at all.

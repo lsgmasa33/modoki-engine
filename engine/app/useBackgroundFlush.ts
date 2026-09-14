@@ -78,7 +78,7 @@ export function useBackgroundFlush() {
         });
 
       // `appStateChange`'s BACKGROUND edge is fired from one place only —
-      // `BridgeActivity.onStop():118`, itself gated on `activityDepth == 0` — and never from
+      // `BridgeActivity.onStop()`, itself gated on `activityDepth == 0` — and never from
       // `onPause`. (The FOREGROUND edge is a different story; see the unpaired-resume note below.) Play Billing's `ProxyBillingActivity` is TRANSLUCENT, so opening a
       // purchase sheet pauses the host Activity without ever stopping it: no background edge fires
       // while the sheet is up, even though the app is live and killable the whole time.
@@ -93,22 +93,22 @@ export function useBackgroundFlush() {
       // showed all three. Full table in docs/native-and-sdks.md. One asymmetry worth knowing
       // before you touch this: DISMISSING a translucent Activity fires an unpaired
       // `appStateChange(isActive:true)`, a foreground with no preceding background. That is NOT
-      // specific to translucent Activities — `fireStatusChange(true)` at `BridgeActivity.onResume():97`
+      // specific to translucent Activities — `fireStatusChange(true)` at `BridgeActivity.onResume()`
       // is unconditional, so a permission dialog, a system alert, and the app's own cold-launch
       // resume all produce one too (the last is merely dropped, since `notifyListeners(..., false)`
       // does not retain). So an `appStateChange` consumer must never assume a `(true)` is preceded
       // by a `(false)`.
       //
       // iOS asymmetry: there, `pause` maps to `didEnterBackgroundNotification`
-      // (AppPlugin.swift:33-34), which fires LATER than the `willResignActiveNotification` that
-      // already drives `appStateChange(false)` above (AppPlugin.swift:27-28) — so on iOS this
+      // (AppPlugin.load's didEnterBackgroundNotification observer), which fires LATER than the `willResignActiveNotification` that
+      // already drives `appStateChange(false)` above (its willResignActiveNotification observer) — so on iOS this
       // listener is a harmless duplicate flush, not the primary path. Additive only, on both
       // platforms: it never replaces the appStateChange listener above.
       //
       // Flushing on every pause is free WHEN NOTHING IS PENDING, which is the overwhelmingly
       // common case: PlayerPrefs.flush() cancels the debounce and calls drain(), whose callback
       // early-returns when nothing is dirty (`if (dirty.size === 0) return`, pinned by
-      // engine/packages/modoki/tests/runtime/playerPrefs.test.ts:237) before touching the
+      // engine/packages/modoki/tests/runtime/playerPrefs.test.ts's "once per drained batch (#335)" test) before touching the
       // backend. Android fires onPause far more often than onStop, and that costs nothing.
       //
       // It is NOT free while a write is failing: `flush()` also cancels any pending `retryTimer`

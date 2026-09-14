@@ -33,7 +33,7 @@ const outFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'meta-sidecar-')
 // resolution on Windows, so a bare `npx` — whose real file is `npx.cmd` — throws ENOENT and this
 // script is simply unrunnable there (VERIFIED on the `win` clone: `execFileSync('npx',
 // ['--version'])` throws ENOENT in isolation). Same remedy and same spelling as
-// `bootstrap-mcp-deps.mjs:33` and `bootstrap-game-deps.mjs:53`; see docs/windows.md § PATHEXT.
+// the `npmRun` of `bootstrap-mcp-deps.mjs` and `bootstrap-game-deps.mjs`; see docs/windows.md § PATHEXT.
 // Adding a `.cmd` shim is NOT an alternative — Node throws EINVAL on spawning `.cmd` without a
 // shell since the CVE-2024-27980 fix.
 //

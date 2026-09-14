@@ -417,7 +417,7 @@ const toggleBtnStyle: React.CSSProperties = {
 
 // F2: the gap-disclosure row — same shape as ConsoleTab.tsx's `gapStyle`, adapted to this panel's
 // palette. Fixed at ROW_HEIGHT so it lays out like any other virtualized row — same overflow
-// containment as an entry row (`:320`, `whiteSpace`/`overflow`/`textOverflow`), which this row
+// containment as an entry row (`visibleRows.map`'s inline style: `whiteSpace`/`overflow`/`textOverflow`), which this row
 // needs just as much: dock the panel narrow enough and the "— N earlier entries dropped —" text
 // wraps to a second line inside this fixed-height box and overflows into the row below.
 const gapRowStyle: React.CSSProperties = {
