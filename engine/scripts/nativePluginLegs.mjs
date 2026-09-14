@@ -260,6 +260,7 @@ export const PLUGIN_CLASS_LEGS = [
       'core/Sources/ModokiOtaCore/OtaZip.swift',
     ],
   },
+  { dir: 'engine/packages/capacitor-modoki-system', shape: 'spm' },
   // ⚠️ TWO copies of applovin-max still exist: the engine plugin above (promoted out of Court in
   // #931) and 3d-test's game-owned fork, identical at the promotion but maintained by nobody since.
   // The fork keeps its own leg because it is on disk and compiles. It is NOT switched to the engine

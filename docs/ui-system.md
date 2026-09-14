@@ -1825,7 +1825,7 @@ inert under `autoFitText`, so they do not compose.
 
 ⚠️ **The second is easy to talk yourself out of, and that is how it was missed.** "A child with its
 own authored width cannot be squeezed by its text" is true of the row and irrelevant to the child:
-wordweave's `SettingsHapticsValue` gives an owner-editable On/Off word an authored `width: 88` at
+wordweave's `SettingsHapticsValue` (now a `UIToggle` switch; `SettingsNotificationsValue` keeps the same box) gave an owner-editable On/Off word an authored `width: 88` at
 `fontSize: 18`, where `"On"` needs 23.99 px and about ten characters is the ceiling — so
 `settingsOnLabel = "Vibration on"` (~103 px) spills out of its own box with nothing clipping. A
 row-only guard drops it from the population and stays green.

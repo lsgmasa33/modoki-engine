@@ -48,6 +48,21 @@ export const crashlytics = {
 };
 
 /**
+ * Local notifications — a no-op namespace, mirroring `export * as notifications from './notifications'`
+ * in Weaveling's package (#940). A creative has no OS notification centre to reach, so it answers the
+ * real wrapper's off-native values: `unavailable` (the reminder row shows the stored choice) and nothing scheduled.
+ */
+export const notifications = {
+  async permission(): Promise<'unavailable'> { return 'unavailable'; },
+  async requestPermission(): Promise<'unavailable'> { return 'unavailable'; },
+  async replaceDailyReminders(_reminders: unknown, _isOurs: unknown): Promise<{ scheduled: number; permission: 'unavailable' }> {
+    return { scheduled: 0, permission: 'unavailable' };
+  },
+  async openSettings(): Promise<boolean> { return false; },
+  onForeground(_onActive: () => void): () => void { return () => {}; },
+};
+
+/**
  * Ads — a no-op namespace, mirroring `export * as ads from './ads'` in Court's package (#342).
  *
  * ⚠️ The no-op here is not merely a size saving, it is REQUIRED. A playable ad already runs inside

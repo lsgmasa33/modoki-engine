@@ -28,41 +28,6 @@ import { hasInternalGames } from '../helpers/repoLayout';
 const root = repoRoot();
 
 /**
- * Trees whose comment citations are another clone's to rewrite, ledgered per FILE until they are.
- *
- * ⚠️ **Owner ruling on #1186: the guard goes on now, not after these lanes finish.** So a lane's
- * files are counted at FILE grain (`file` with a count) rather than per token, which is coarser than
- * the rest of this ledger on purpose: the tokens are what the other clone is rewriting. The count is
- * exact both ways, so a NEW citation in one of these files fails the gate, and a fix fails it too
- * until the row is lowered in the same commit. Delete a lane's entry here when its last row goes.
- */
-const PENDING_LANES: ReadonlyArray<{ prefix: string; issue: string }> = [
-  { prefix: 'games/court/', issue: '#1189' },
-];
-
-const PENDING: ReadonlyArray<{ file: string; count: number }> = [
-  { file: 'games/court/packages/app-services/src/auth.ts', count: 2 },
-  { file: 'games/court/packages/app-services/src/cloudSave.ts', count: 4 },
-  { file: 'games/court/packages/app-services/src/events.ts', count: 1 },
-  { file: 'games/court/runtime/agentTools.ts', count: 1 },
-  { file: 'games/court/runtime/cloudSyncWiring.ts', count: 1 },
-  { file: 'games/court/runtime/saveSync.ts', count: 2 },
-  { file: 'games/court/runtime/systems.ts', count: 24 },
-  { file: 'games/court/tests/agentToolsPlacement.test.ts', count: 1 },
-  { file: 'games/court/tests/clearDurability.test.ts', count: 1 },
-  { file: 'games/court/tests/coinEconomy.test.ts', count: 1 },
-  { file: 'games/court/tests/dialogAnchorAndReserve.test.ts', count: 4 },
-  { file: 'games/court/tests/hintPanelFitKit.ts', count: 1 },
-  { file: 'games/court/tests/narrationRoom.test.ts', count: 4 },
-  { file: 'games/court/tests/renderSystemWiring.test.ts', count: 4 },
-  { file: 'games/court/tests/sceneChrome.test.ts', count: 1 },
-  { file: 'games/court/tests/sharedPredicates.test.ts', count: 2 },
-  { file: 'games/court/tests/storeChrome.test.ts', count: 1 },
-  { file: 'games/court/tests/storeGrant.test.ts', count: 1 },
-  { file: 'games/court/tests/uiFontRoots.test.ts', count: 1 },
-];
-
-/**
  * Hits that are NOT line citations, keyed file + token and COUNTED (the `BARE_ALLOWED` shape, owner
  * ruling on #1186). One row per file, so its reason has to cover every token it lists. Each token's
  * count is spent, not matched: one more occurrence of it in that file is an offender. Never loosen
@@ -156,9 +121,12 @@ const NOT_A_CITATION: ReadonlyArray<{ file: string; tokens: Readonly<Record<stri
   { file: 'engine/tests/e2e/editor-2d-ui-overlay.spec.ts', tokens: { 'retries:0`/`workers:1': 1 }, reason: 'DATA: Playwright config values.' },
   { file: 'engine/tests/assets/scanPublishSafety.test.ts', tokens: { 'line 10': 1 }, reason: 'DATA: a line of a hypothetical fixture, explaining a sort order.' },
   { file: 'scripts/gen-memory-index.mjs', tokens: { 'line 131': 1 }, reason: 'DATA: a median rendered line length, 131 characters.' },
+  {
+    file: 'games/court/tests/narrationRoom.test.ts',
+    tokens: { '1:1`/`16:9': 1, 'lines 84': 1, 'lines 103': 1, 'lines 122': 1 },
+    reason: 'DATA: two preview aspect ratios, and card heights measured live at 2, 3 and 4 text lines.',
+  },
 ];
-
-const laneOf = (rel: string) => PENDING_LANES.find((l) => rel.startsWith(l.prefix));
 
 /** The wrapper punctuation a comment puts around a citation, so a ledger key is the citation itself. */
 const normalize = (hit: string) => hit.replace(/^[`'"*_([{]+/, '').replace(/[`'"*_.,;:)\]}]+$/, '');
@@ -192,7 +160,7 @@ describe('source comments cite by SYMBOL, never by line number (#1186)', () => {
     for (const { rel, text } of files) {
       for (const { line, hit } of lineCitationsInComments(text)) {
         const token = normalize(hit);
-        population.push({ item: laneOf(rel) ? rel : `${rel}::${token}`, site: `${rel}:${line}  ${token}` });
+        population.push({ item: `${rel}::${token}`, site: `${rel}:${line}  ${token}` });
       }
     }
     // A row for a file this checkout does not carry is dropped ONLY in the public snapshot, which ships
@@ -200,7 +168,7 @@ describe('source comments cite by SYMBOL, never by line number (#1186)', () => {
     // a renamed or deleted file would otherwise leave a dead pardon nothing reports, which re-arms if
     // the path ever comes back (#1186 close-out, proven by adding a row for a missing file).
     const present = new Set(files.map((f) => f.rel));
-    const rowFiles = [...NOT_A_CITATION.map((r) => r.file), ...PENDING.map((r) => r.file)];
+    const rowFiles = NOT_A_CITATION.map((r) => r.file);
     if (hasInternalGames()) {
       expect(rowFiles.filter((f) => !present.has(f)), 'a ledger row names a file that no longer exists: delete '
         + 'or repoint the row').toEqual([]);
@@ -211,8 +179,6 @@ describe('source comments cite by SYMBOL, never by line number (#1186)', () => {
       exempt: [
         ...NOT_A_CITATION.filter((r) => present.has(r.file)).flatMap((r) => Object.entries(r.tokens)
           .map(([token, count]) => ({ item: `${r.file}::${token}`, count, reason: r.reason }))),
-        ...PENDING.filter((r) => present.has(r.file))
-          .map((r) => ({ item: r.file, count: r.count, reason: `pending ${laneOf(r.file)?.issue}` })),
       ],
       floor: 500,
       scanned: files.length,
@@ -221,13 +187,5 @@ describe('source comments cite by SYMBOL, never by line number (#1186)', () => {
         + 'citation at all (a port, a measurement), add a counted NOT_A_CITATION row with a reason. Do '
         + 'NOT loosen helpers/lineCitations.ts, which the docs and QA gates share.',
     });
-  });
-
-  it('a PENDING row belongs to a pending lane, and a lane with no rows is deleted', () => {
-    expect(PENDING.filter((r) => !laneOf(r.file)).map((r) => r.file),
-      'a file-grain row outside a pending lane would pardon every citation in that file').toEqual([]);
-    const lanesInUse = new Set(PENDING.map((r) => laneOf(r.file)?.prefix));
-    expect(PENDING_LANES.filter((l) => !lanesInUse.has(l.prefix)).map((l) => `${l.prefix} (${l.issue})`),
-      'this lane has no pending rows left: delete it, so its files are keyed per token like every other').toEqual([]);
   });
 });
