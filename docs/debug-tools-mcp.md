@@ -2091,7 +2091,7 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   trait dump — AoS/object fields the compact default drops, PLUS runtime read-back fields like
   `SkeletalAnimator.activeClip`/`normalizedTime` and RigidBody `isSleeping`), `world` (resolved world TRS
   + `activeInHierarchy`), `bounds` (per-entity `screen` rect + `onScreen` + 3D `worldAABB {size,center}`),
-  `contacts` (live solid `contacts` + sensor `overlaps`, GUIDs), `resources` (include resource entities,
+  `contacts` (live solid `contacts` + sensor `overlaps`, GUIDs — `id:<n>` for a partner with no guid), `resources` (include resource entities,
   excluded by default), `limit` (+ `truncated`/`totalCount`; an explicit `limit` always wins, and a
   targeted query is never silently capped). **Floats are rounded to 9 significant digits**
   (`247.13061935179246` → `247.130619`; max error 3.5e-7) — ~18–21% of the tokens on a Transform

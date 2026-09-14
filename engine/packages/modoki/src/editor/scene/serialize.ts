@@ -1428,21 +1428,27 @@ export async function newScene(path: string | null = null): Promise<void> {
     // entity without emitting a world swap, so every id-keyed teardown keyed on `onWorldSwap`
     // was skipped — and koota recycles ids LIFO and totally, so the outgoing scene's state
     // aliased exactly onto the incoming scene's entities.
+    // Each starter gets its guid AT SPAWN (#1199). Without one it was unaddressable until the first
+    // save or undoable edit minted it: Assets → Create Scene saves straight away so a human never
+    // saw that, but the agent `new-scene` op does not save, and every guid-addressed op refused
+    // the starters. Minted before `markSceneSaved()` below, so it is part of the clean baseline.
     await sceneManager.replaceWorldContent((world) => {
       spawnEntity(world,
-        Transform({ x: 0, y: 5, z: 10 }), Camera({ fov: 60 }), EntityAttributes({ name: 'Camera', sortOrder: 0 }),
+        Transform({ x: 0, y: 5, z: 10 }), Camera({ fov: 60 }),
+        EntityAttributes({ name: 'Camera', sortOrder: 0, guid: newGuid() }),
       );
       spawnEntity(world,
-        Environment({ hdrPath: WHITE_HDR_GUID }), EntityAttributes({ name: 'HDR Environment', sortOrder: 1 }),
+        Environment({ hdrPath: WHITE_HDR_GUID }),
+        EntityAttributes({ name: 'HDR Environment', sortOrder: 1, guid: newGuid() }),
       );
       spawnEntity(world,
         Transform({ x: 5, y: 10, z: 7 }),
         Light({ lightType: 'directional', color: 0xffffff, intensity: 2 }),
-        EntityAttributes({ name: 'Directional Light', sortOrder: 2 }),
+        EntityAttributes({ name: 'Directional Light', sortOrder: 2, guid: newGuid() }),
       );
       spawnEntity(world,
         Light({ lightType: 'ambient', color: 0xffffff, intensity: 0.6 }),
-        EntityAttributes({ name: 'Ambient Light', sortOrder: 3 }),
+        EntityAttributes({ name: 'Ambient Light', sortOrder: 3, guid: newGuid() }),
       );
     });
     // Keyed by the new scene's own path when it has one, so its undo stack is its own and the

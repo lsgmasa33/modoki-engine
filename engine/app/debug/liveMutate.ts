@@ -70,7 +70,7 @@ export interface LiveMutateSuccess {
   dryRun?: true;
   saved: false;
   savedNote: string;
-  entities: Array<{ id: number; guid: string; name: string; before: Record<string, unknown>; after: Record<string, unknown> }>;
+  entities: Array<{ id: number; guid: string | null; name: string; before: Record<string, unknown>; after: Record<string, unknown> }>;
   detailTruncated?: true;
   hint?: string;
 }
@@ -323,7 +323,7 @@ export function applyLiveMutate(
   params: unknown,
   deps: {
     parseWhere: (expr: string, m: Map<string, TraitMeta>) => { pred: WherePredicate } | { error: string };
-    guidOf: (id: number) => string;
+    guidOf: (id: number) => string | null;
   },
 ): LiveMutateResult {
   const p = (params ?? {}) as LiveMutateParams;

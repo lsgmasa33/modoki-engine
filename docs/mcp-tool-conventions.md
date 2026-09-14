@@ -175,6 +175,16 @@ calls. Raw `{x,y}` is refused wherever a resolvable aim exists (`modoki_capture_
 legitimate exception: it *measures* a path).
 
 - `guid` is the only address that always works; `id` is reassigned on every scene reload.
+- **A reply reports `guid: null` for an entity that has no guid. It never reports `String(id)`**
+  (#1199). Runtime spawns have no guid, and neither does anything not yet saved or edited. The id
+  in `guid` looked addressable, and every guid-addressed op refused it: a guid-less entity is not in
+  the guid index. The refusal then told the caller to use guids. `liveGuidOf`
+  (`app/debug/liveLifecycle.ts`) is the one helper. Two shapes differ, because a bare element has
+  no `id` beside it: `contacts`/`overlaps` list a guid-less partner as `id:<n>`, and a `watch`
+  series reports `guid: null` plus `id`, with `id:<n>` as its internal key. A producer that hands out a guid should
+  **mint** one (the live `create-entity`, `newScene`'s starter set), not disguise the id. A
+  scene-state warning for null rows was tried and dropped: it fired on every read of a world with
+  runtime spawns.
 - A `name` matching several entities is **refused**, everywhere — live path, file path, and input
   aim alike. First-matching is never acceptable (this was measured: one of two `DUP_probe` entities
   moved, `{ok:true, changed:1}`).

@@ -27,7 +27,8 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
       'To get VALUES, target or enrich: trait=<Trait> | id=<n> | name=<substr> | ' +
       'where="Transform.y>3" | full=true (every field, incl. AoS/object fields the compact dump ' +
       'omits) | world/bounds/contacts. Address entities by `guid` — runtime ids are reassigned ' +
-      'on every scene hot-reload. The index applies a default limit (see `hint`/`truncated`); a ' +
+      'on every scene hot-reload. `guid: null` means none has been minted yet (a runtime spawn, or ' +
+      'an entity never saved or edited) — address that one by id. The index applies a default limit (see `hint`/`truncated`); a ' +
       'targeted query is never silently capped. A bad `where` returns a `warnings` array rather ' +
       'than silently ignoring the filter.',
     {
@@ -41,7 +42,7 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
       limit: z.number().int().nonnegative().optional().describe('Cap the number of entities returned; response sets truncated:true + totalCount when hit. The untargeted INDEX applies a default cap; an explicit limit always wins, and a targeted query is never capped unless you pass one.'),
       world: z.boolean().optional().describe('Add each entity\'s RESOLVED world transform (position/rotation/scale after parent-chain propagation) + activeInHierarchy flag. Default false (local Transform only). Saves composing the parent chain by hand.'),
       bounds: z.boolean().optional().describe('Add each entity\'s screen-space rect (screen {x,y,w,h} CSS px) + onScreen flag, plus (3D only) worldAABB {size:[x,y,z], center:[x,y,z]} — the TRUE geometric extent in world units (distinct from the authored scale). Geometry without a separate get_layout_bounds call. Default false. Needs the renderer.'),
-      contacts: z.boolean().optional().describe('Add each body\'s CURRENT physics contacts as GUID arrays (rolled up to bodies): `contacts` (solid, load-bearing — resting on the ground) + `overlaps` (sensor/trigger — inside a zone). The STATE view ("what is it touching NOW"), vs the @contact/@sensor journal EVENTS ("when did they touch"). Present only on bodies currently touching something. Default false.'),
+      contacts: z.boolean().optional().describe('Add each body\'s CURRENT physics contacts as GUID arrays (rolled up to bodies; a partner with no guid appears as `id:<n>`): `contacts` (solid, load-bearing — resting on the ground) + `overlaps` (sensor/trigger — inside a zone). The STATE view ("what is it touching NOW"), vs the @contact/@sensor journal EVENTS ("when did they touch"). Present only on bodies currently touching something. Default false.'),
       precision: precisionParam(),
     },
     async ({ trait, id, guid, name, where, full, resources, limit, world, bounds, contacts, precision }) => {

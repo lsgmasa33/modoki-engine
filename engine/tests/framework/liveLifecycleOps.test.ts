@@ -13,6 +13,7 @@ import { found } from '@modoki/engine/testing/inOrder';
 import { createTestWorld, type TestWorld, Transform, EntityAttributes,
   getCurrentWorld, setCurrentWorld, setTimeScale, getTimeScale, sceneManager, reparentRefusal,
   stepOneFrame } from '@modoki/engine/runtime';
+import { updateContactIndex } from '../../packages/modoki/src/runtime/physics/physicsContactIndex';
 import { createWorld } from 'koota';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { runAgentOp, hasAgentOp, listAgentOps, relayResponseFor, registerRelayResponder, simStepDefaultTimeout, SIM_STEP_MAX_TIMEOUT_MS, inferAssetDefType } from '../../app/debug/agentBridge';
@@ -27,8 +28,8 @@ let game: TestWorld | undefined;
 afterEach(() => { game?.dispose(); game = undefined; });
 
 type CreateReply = { ok?: boolean; error?: string; options?: string[]; id?: number; guid?: string; name?: string; saved?: boolean };
-type DupReply = { ok?: boolean; error?: string; created?: number; entitiesPerCopy?: number; roots?: Array<{ id: number; guid: string }> };
-type DelReply = { ok?: boolean; error?: string; deleted?: number; guids?: string[] };
+type DupReply = { ok?: boolean; error?: string; created?: number; entitiesPerCopy?: number; roots?: Array<{ id: number; guid: string | null }> };
+type DelReply = { ok?: boolean; error?: string; deleted?: number; guids?: Array<string | null> };
 
 async function sceneGuids(): Promise<string[]> {
   const s = await runAgentOp('scene-state', { trait: 'Transform', full: true }) as
@@ -437,13 +438,69 @@ describe('lifecycle: findings from the close-out review', () => {
     const p = game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'p', name: 'P' }));
     game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'c', name: 'C', parentId: p.id() }));
 
-    // Deleting P cascades to C, so reading C's guid AFTERWARDS fell through to String(id) — a live
+    // Deleting P cascades to C, so reading C's guid AFTERWARDS found no entity — once a live
     // entity id disguised as a guid, which a caller would then use for a nonsensical lookup.
     const r = await runAgentOp('delete-entities', { guids: ['p', 'c'] }) as DelReply;
 
     expect(r.ok).not.toBe(false);
     expect(r.guids?.sort()).toEqual(['c', 'p']);
     expect(await sceneGuids()).toEqual([]);
+  });
+});
+
+/** #1199 — an entity with no minted guid used to report `String(id)` as its guid. That value looks
+ *  addressable and every guid-addressed op refuses it (a guid-less entity is not in the guid index),
+ *  so each producer must say `null` instead. One case per producer: they were four copies once. */
+describe('a guid-less entity reports guid:null, never its id disguised as a guid (#1199)', () => {
+  type Row = { id: number; guid: string | null; name: string };
+  type StateReply = { entities: Row[] };
+
+  it('scene-state INDEX and FULL rows carry null, and the id-shaped value resolves nothing', async () => {
+    game = createTestWorld({});
+    const bare = game.spawn(Transform({ x: 0 }), EntityAttributes({ name: 'Bare' }));
+    game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'real', name: 'Real' }));
+
+    for (const params of [{}, { full: true }]) {
+      const s = await runAgentOp('scene-state', params) as StateReply;
+      const row = s.entities.find((e) => e.name === 'Bare')!;
+      expect(row.id).toBe(bare.id());
+      expect(row.guid).toBeNull();
+      expect(s.entities.find((e) => e.name === 'Real')!.guid).toBe('real');
+    }
+    // The premise of the bug, pinned: the old reported value is not an address.
+    const byOldValue = await runAgentOp('scene-state', { guid: String(bare.id()) }) as StateReply;
+    expect(byOldValue.entities).toEqual([]);
+  });
+
+  it('contacts list a guid-less partner as `id:<n>` — a bare null would lose WHICH body it is', async () => {
+    game = createTestWorld({});
+    const ball = game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'ball', name: 'Ball' }));
+    const floor = game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'floor', name: 'Floor' }));
+    const debris = game.spawn(Transform({ x: 0 }), EntityAttributes({ name: 'Debris' }));
+    // The index takes PACKED entities (`valueOf()`, #868) and reports partner ids.
+    updateContactIndex(getCurrentWorld(), ball.valueOf(), floor.valueOf(), false, 'enter');
+    updateContactIndex(getCurrentWorld(), ball.valueOf(), debris.valueOf(), false, 'enter');
+
+    const s = await runAgentOp('scene-state', { guid: 'ball', contacts: true }) as
+      { entities: Array<{ contacts?: string[] }> };
+    expect(s.entities[0].contacts?.sort()).toEqual(['floor', `id:${debris.id()}`]);
+  });
+
+  it('set-traits readback rows carry null for a guid-less target', async () => {
+    game = createTestWorld({});
+    const bare = game.spawn(Transform({ x: 0 }), EntityAttributes({ name: 'Bare' }));
+    const r = await runAgentOp('set-traits', { id: bare.id(), set: { 'Transform.x': 3 } }) as
+      { ok?: boolean; entities?: Row[] };
+    expect(r.ok).not.toBe(false);
+    expect(r.entities?.[0].guid).toBeNull();
+  });
+
+  it('delete-entities by id reports null for a guid-less entity', async () => {
+    game = createTestWorld({});
+    const bare = game.spawn(Transform({ x: 0 }), EntityAttributes({ name: 'Bare' }));
+    const r = await runAgentOp('delete-entities', { id: bare.id() }) as { ok?: boolean; guids?: Array<string | null> };
+    expect(r.ok).not.toBe(false);
+    expect(r.guids).toEqual([null]);
   });
 });
 

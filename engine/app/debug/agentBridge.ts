@@ -115,7 +115,7 @@ import {
   isUnresolvedPress,
 } from '@modoki/engine/runtime';
 import { applyLiveMutate } from './liveMutate';
-import { createEntityLive, duplicateEntityLive, deleteEntitiesLive } from './liveLifecycle';
+import { createEntityLive, duplicateEntityLive, deleteEntitiesLive, liveGuidOf } from './liveLifecycle';
 import { computeLayoutBounds, type LayoutBoundsParams, type LayoutEntry } from './layoutDump';
 import { tailWithCounts, tailHint, CONSOLE_TAIL_DEFAULT, JOURNAL_TAIL_DEFAULT } from './streamSummary';
 import { roundFloats, resolvePrecision } from './roundFloats';
@@ -484,17 +484,19 @@ export function dumpSceneState(params: SceneStateParams = {}) {
 
   // Contact roll-up (Percept): resolve a contacted body's runtime id → its stable GUID
   // (memoized; the index stores ids since it's per-world and read within that world).
-  const eaMeta = metaByName.get('EntityAttributes');
-  const guidCache = new Map<number, string>();
-  const guidOf = (id: number): string => {
+  // `null` for an entity with no guid, NEVER `String(id)` (#1199): the id-as-guid looked addressable
+  // and every guid-addressed op refused it. See `liveGuidOf` in liveLifecycle.ts.
+  const guidCache = new Map<number, string | null>();
+  const guidOf = (id: number): string | null => {
     let g = guidCache.get(id);
-    if (g === undefined) {
-      const d = eaMeta ? readTraitData(id, eaMeta) : null;
-      g = ((d?.guid as string) || '') || String(id);
-      guidCache.set(id, g);
-    }
+    if (g === undefined) { g = liveGuidOf(id); guidCache.set(id, g); }
     return g;
   };
+  // A contact partner with no guid is `id:<n>`, not null (#1199 review). A row's `guid: null` has
+  // its `id` beside it; a bare array element has nothing else, so null would lose WHICH body it is
+  // (and two such partners would read `[null, null]`). `id:<n>` is this file's existing
+  // non-address form (see the `exclude` refusal's options) and cannot be mistaken for a guid.
+  const contactRefOf = (id: number): string => guidOf(id) ?? `id:${id}`;
   const contactWorld = params.contacts ? getCurrentWorld() : null;
   // An unknown or WRONG-CASE `trait=` was applied silently: every entity came back with
   // `traits:{}` and no warning, which reads as "nothing in this scene has that trait" rather than
@@ -564,8 +566,8 @@ export function dumpSceneState(params: SceneStateParams = {}) {
       // Current physics contacts as GUIDs, rolled up to bodies. Present only on a body
       // that's currently touching something (solid `contacts` / sensor `overlaps`).
       const cs = getContactState(contactWorld, info.id);
-      if (cs?.contacts.length) out.contacts = cs.contacts.map(guidOf);
-      if (cs?.overlaps.length) out.overlaps = cs.overlaps.map(guidOf);
+      if (cs?.contacts.length) out.contacts = cs.contacts.map(contactRefOf);
+      if (cs?.overlaps.length) out.overlaps = cs.overlaps.map(contactRefOf);
     }
     return out;
   });
@@ -2366,11 +2368,7 @@ registerAgentOp('delete-entities', deleteEntitiesLive);
 registerAgentOp('set-traits', (params) =>
   applyLiveMutate(params, {
     parseWhere,
-    guidOf: (id) => {
-      const eaMeta = getAllTraits().find((m) => m.name === 'EntityAttributes');
-      const d = eaMeta ? readTraitData(id, eaMeta) : null;
-      return ((d?.guid as string) || '') || String(id);
-    },
+    guidOf: liveGuidOf,
   }));
 
 /** Dispatch a server request op to a result via the registry.

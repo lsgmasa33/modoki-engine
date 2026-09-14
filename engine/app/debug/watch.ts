@@ -17,7 +17,7 @@
  *
  *  Identity: a series is keyed by the entity's stable GUID. A GUID watch is fully stable.
  *  A component watch keys guid-BEARING entities stably; a guid-LESS (fresh, unsaved) entity
- *  falls back to its numeric id, which koota recycles — so for a runtime-spawned, short-lived,
+ *  falls back to `id:<n>` (read back as `guid: null` + `id`, #1199), and koota recycles ids — so for a runtime-spawned, short-lived,
  *  fresh-guid entity (e.g. a prefab re-instantiated every launch) prefer NAME scoping
  *  (`names:[...]`, Batch 3 A): it matches by authored name, auto-joins new spawns, and is stable
  *  across the guid/id churn a guid or numeric-id key can't survive. */
@@ -113,6 +113,17 @@ function entityNameOf(id: number): string | undefined {
   return typeof n === 'string' && n ? n : undefined;
 }
 
+/** The series key for an entity: its guid, or `id:<n>` when it has none (#1199).
+ *
+ *  ⚠️ Never the bare `String(id)` this used to be. The key is echoed to the caller as the series'
+ *  `guid`, and a bare id there looks like a guid that every guid-addressed op then refuses. The
+ *  `id:` prefix keeps the key unique and lets `readWatch` report `guid: null` plus the id instead. */
+function seriesKeyOf(entity: Parameters<typeof entityRef>[0]): string {
+  const ref = entityRef(entity);
+  return typeof ref === 'number' ? `${ID_KEY_PREFIX}${ref}` : ref;
+}
+const ID_KEY_PREFIX = 'id:';
+
 /** Entities a watch currently targets, as {guid,id,name?}. A guid-only watch resolves O(1) via
  *  the guid index; a NAME-scoped watch (Batch 3 A) queries the trait + EntityAttributes so a
  *  runtime-spawned entity whose guid changes every spawn (the sling puck) auto-joins by name; a
@@ -131,7 +142,7 @@ function resolveTargets(w: Watch): { guid: string; id: number; name?: string }[]
     // name matches auto-join — the whole point (a fresh-guid puck has no stable guid to pass).
     try {
       world.query(w.meta.trait, EntityAttributes).updateEach((_: unknown, entity: { id(): number; get(t: unknown): { name?: string } | undefined; has(t: unknown): boolean }) => {
-        const guid = String(entityRef(entity));
+        const guid = seriesKeyOf(entity);
         const name = String(entity.get(EntityAttributes)?.name ?? '');
         const byName = w.names?.some((n) => name.toLowerCase().includes(n));
         const byGuid = w.guids?.has(guid);
@@ -141,7 +152,7 @@ function resolveTargets(w: Watch): { guid: string; id: number; name?: string }[]
   } else {
     try {
       world.query(w.meta.trait).updateEach((_: unknown, entity: { id(): number; get(t: unknown): unknown; has(t: unknown): boolean }) => {
-        out.push({ guid: String(entityRef(entity)), id: entity.id() });
+        out.push({ guid: seriesKeyOf(entity), id: entity.id() });
       });
     } catch { /* trait not present in this world */ }
   }
@@ -385,8 +396,12 @@ export function readWatch(id: string, opts?: { clear?: boolean; name?: string; g
     emitted.push(k);
     const vals = s.samples.map((x) => x.value);
     const lastTick = s.samples.length ? s.samples[s.samples.length - 1].tick : 0;
+    // A guid-less entity's key is `id:<n>` — report that as `guid: null` + the id (#1199).
+    const identity = guid.startsWith(ID_KEY_PREFIX)
+      ? { guid: null, id: Number(guid.slice(ID_KEY_PREFIX.length)) }
+      : { guid };
     series.push({
-      guid, ...(s.name ? { name: s.name } : {}), field, count: s.samples.length,
+      ...identity, ...(s.name ? { name: s.name } : {}), field, count: s.samples.length,
       despawnedAt: s.despawnedAt,
       stats: vals.length ? {
         first: vals[0],

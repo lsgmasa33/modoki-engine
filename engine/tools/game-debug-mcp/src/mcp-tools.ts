@@ -891,7 +891,8 @@ export function registerTools(server: McpServer) {
   tool('device_get_scene_state',
     'Read the live ECS world on the connected device as DATA (no screenshot). Bare call = a compact ' +
       'INDEX (entity id/guid/name/traits, no values); drill down with a filter or enricher. Address ' +
-      'entities by guid (stable across reloads), never by id. Floats are rounded — verify with a ' +
+      'entities by guid (stable across reloads), never by id — except a row with guid:null, which has ' +
+      'no guid yet (a runtime spawn) and can only be addressed by id. Floats are rounded — verify with a ' +
       'tolerance, not ===. RESOURCE entities (mesh/material/prefab/env holders + config singletons ' +
       'Time/Physics/NPRPostFX) are excluded from the untargeted listing — pass resources:true (or any ' +
       'filter) to include them.',
@@ -904,7 +905,7 @@ export function registerTools(server: McpServer) {
       full: z.boolean().optional().describe('Every persistent trait field, not just the curated Inspector subset.'),
       world: z.boolean().optional().describe('Add resolved WORLD transform + activeInHierarchy per entity.'),
       bounds: z.boolean().optional().describe('Add each entity\'s screen-space rect + onScreen flag.'),
-      contacts: z.boolean().optional().describe('Add current physics contacts/overlaps (GUID arrays) per body.'),
+      contacts: z.boolean().optional().describe('Add current physics contacts/overlaps (GUID arrays; a partner with no guid appears as `id:<n>`) per body.'),
       resources: z.boolean().optional().describe('Force-include resource entities (mesh/material/prefab/env holders + config singletons Time/Physics/NPRPostFX). Excluded from the DEFAULT untargeted listing only — any id/guid/trait/name/where filter already includes them.'),
       limit: z.number().optional().describe('Cap entities returned (sets truncated/totalCount).'),
       precision: z.number().optional().describe('Significant digits for floats (default 9; 0 = exact).'),

@@ -50,19 +50,26 @@ function attrMeta() {
   return getAllTraits().find((m) => m.name === 'EntityAttributes');
 }
 
-function guidOf(id: number): string {
+/** An entity's authored guid, or `null` when it has none (#1199).
+ *
+ *  ⚠️ NEVER `String(id)` as the fallback. That is what this used to return, and it is a live id
+ *  disguised as a guid: it looks addressable, and every guid-addressed op then refuses it (a
+ *  guid-less entity is not in the guid index) with a message telling the caller to use guids.
+ *  `null` says "no guid yet" in the reply's own type; the row's `id` is still there beside it.
+ *  Exported so the `set-traits` op reports the same way. */
+export function liveGuidOf(id: number): string | null {
   const meta = attrMeta();
   const d = meta ? (readTraitDataFull(id, meta) as Record<string, unknown> | null) : null;
-  return ((d?.guid as string) || '') || String(id);
+  return (d?.guid as string) || null;
 }
 
 /** Give a freshly-spawned entity a stable guid. The editor mints one via its undo-aware
  *  `ensureGuid`; here we write the field directly, because the reply MUST hand back a guid — an
  *  agent told only a numeric id has been handed an address that expires on the next scene reload. */
-function mintGuid(id: number): string {
+function mintGuid(id: number): string | null {
   const meta = attrMeta();
   const entity = findEntity(id);
-  if (!meta || !entity) return String(id);
+  if (!meta || !entity) return null;   // not String(id) — see liveGuidOf (#1199)
   const existing = (readTraitDataFull(id, meta) as Record<string, unknown> | null)?.guid as string | undefined;
   if (existing) return existing;
   const guid = newGuid();
@@ -170,7 +177,7 @@ export function duplicateEntityLive(params: unknown): unknown {
     return { id, parentId: parent, traits };
   });
 
-  const roots: Array<{ id: number; guid: string }> = [];
+  const roots: Array<{ id: number; guid: string | null }> = [];
   // Everything this call spawns, so a mid-flight failure can be ROLLED BACK. Without it, a spawn
   // that failed on the child of a 2-entity subtree left the parent's copy live in the world while
   // the reply said "nothing was kept" — a half-applied mutation behind a failure verdict, which is
@@ -211,7 +218,7 @@ export function duplicateEntityLive(params: unknown): unknown {
       idMap.set(src.id, newId);
     }
     const newRoot = idMap.get(rootId)!;
-    roots.push({ id: newRoot, guid: guidOf(newRoot) });
+    roots.push({ id: newRoot, guid: liveGuidOf(newRoot) });
   }
 
   return {
@@ -253,9 +260,9 @@ export function deleteEntitiesLive(params: unknown): unknown {
 
   // Read every guid BEFORE deleting anything. deleteEntity CASCADES to the subtree, so deleting a
   // parent destroys a child that is also in `targets` — and reading that child's guid afterwards
-  // falls through to String(id), reporting a live entity id disguised as a guid. Same
+  // finds no entity, reporting `null` for an entity that had a real guid. Same
   // snapshot-before-mutating discipline duplicateEntityLive uses one function up.
-  const deleted = targets.map(guidOf);
+  const deleted = targets.map(liveGuidOf);
   for (const id of targets) deleteEntity(id);   // a second delete of a cascaded child is a safe no-op
   return { ok: true, deleted: deleted.length, guids: deleted, saved: false, savedNote: LIVE_ONLY };
 }
