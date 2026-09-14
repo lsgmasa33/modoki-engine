@@ -8,6 +8,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { stripVTControlCharacters } from 'node:util';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 import { reapVitestClaimsDirs } from '../../scripts/deviceClaimsStore.mjs';
 
@@ -52,7 +53,9 @@ describe('an engine-config vitest run leaves no claims fallback dir behind', () 
       encoding: 'utf8',
       timeout: 180_000,
     });
-    const output = `${run.stdout}\n${run.stderr}`;
+    // Stripped: on GitHub Actions the child's summary is coloured, with escapes between `Tests` and
+    // `2 passed`, so the raw text never matched there. A local terminal-less run prints no colour.
+    const output = stripVTControlCharacters(`${run.stdout}\n${run.stderr}`);
     // Non-vacuity: the child really ran a suite, inside this TMPDIR.
     expect(run.status, output).toBe(0);
     expect(output).toMatch(/Tests\s+\d+ passed/);
