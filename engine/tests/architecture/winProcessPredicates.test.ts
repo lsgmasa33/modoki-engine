@@ -23,8 +23,9 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { stripComments as stripJsComments, assertScanIsSane } from '@modoki/engine/testing';
+import { stripComments as stripJsComments, assertScanIsSane, readScannedSource, shellLogicalLines } from '@modoki/engine/testing';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const REPO = path.resolve(__dirname, '../..');
 
@@ -52,13 +53,24 @@ function sources(): Array<{ rel: string; abs: string }> {
   });
 }
 
-/** `.ps1` uses `#` comments; everything else goes through the shared JS/TS scanner (#419).
+/** The text a predicate is matched in, one unit per line of the returned string:
+ *  - `.sh`: comment-blanked COMMANDS (#1179) — a `-like` predicate wrapped with `\` over two lines was
+ *    two lines, the property on one and `-like` on the next, and matched neither. ⚠️ A predicate
+ *    reflowed as a literal newline INSIDE a quoted string (the natural reflow of `lib/repo-reap.sh`'s
+ *    single-quoted PowerShell) is still two lines — `shellLogicalLines` does not join an open quote;
+ *    and the predicate's 40-character window counts a continuation's indentation;
+ *  - `.ps1`: ⚠️ NO PARSER, by record — PowerShell continues with a trailing backtick and comments with
+ *    `<# … #>` blocks, and this repo has no scanner for either; whole-line `#` comments are dropped and a
+ *    wrapped predicate there is not seen. One file today (`uninstall-editor-windows.ps1`);
+ *  - everything else: the shared JS/TS scanner (#419).
  *
  *  ⚠️ Stripping matters in BOTH directions here. These files explain this very hazard in prose —
  *  `packagedAppPaths.mjs`'s comment contains the words `-like` and `ExecutablePath` — so an
  *  unstripped scan flags the documentation that exists to prevent the bug. */
-function strip(src: string, rel: string): string {
-  if (rel.endsWith('.ps1') || rel.endsWith('.sh')) return src.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n');
+function strip(abs: string, rel: string): string {
+  if (rel.endsWith('.sh')) return shellLogicalLines(readScannedSource(abs).code).map((l) => l.text).join('\n');
+  const src = fs.readFileSync(abs, 'utf8');
+  if (rel.endsWith('.ps1')) return src.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n');
   return stripJsComments(src);
 }
 
@@ -86,7 +98,7 @@ describe('Windows process predicates are prefix tests, not wildcards (#988)', ()
   it('no source pairs a process-path property with -like', () => {
     const offenders: string[] = [];
     for (const { rel, abs } of sources()) {
-      const src = strip(fs.readFileSync(abs, 'utf8'), rel);
+      const src = strip(abs, rel);
       for (const line of src.split('\n')) {
         if (WILDCARD_PATH_PREDICATE.test(line)) {
           offenders.push(`${rel}: ${line.trim().slice(0, 120)}`);
@@ -107,5 +119,13 @@ describe('Windows process predicates are prefix tests, not wildcards (#988)', ()
     const fixed = "$_.ExecutablePath.StartsWith('C:\\tools\\', [System.StringComparison]::OrdinalIgnoreCase)";
     expect(WILDCARD_PATH_PREDICATE.test(fixed)).toBe(false);
     expect(WILDCARD_PATH_PREDICATE.test("$_.Name -like 'node*'")).toBe(false);
+  });
+});
+describe('a shell predicate is read as one COMMAND (#1179)', () => {
+  it('a `-like` path predicate wrapped with a backslash is still found; one in a trailing comment is not', () => {
+    const dir = makeScratchDir('win-pred-');
+    const abs = path.join(dir, 'x.sh');
+    fs.writeFileSync(abs, 'powershell -Command "Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath \\\n  -like \'C:\\x*\' }"\necho ok # $_.ExecutablePath -like x\n');
+    expect(strip(abs, 'x.sh').split('\n').filter((l) => WILDCARD_PATH_PREDICATE.test(l))).toHaveLength(1);
   });
 });

@@ -14,7 +14,7 @@
  *  nothing branches on it — see #365). That is exactly backwards: it would be green on
  *  the case this family cares about. Do not "improve" this file into that version.
  *
- *  **The `;` vs `,`/`}` discriminator, and why it's safe.** A hit like
+ *  **Type position vs value emit, and why the distinction is safe.** A hit like
  *  `interface SubgameManifest { schema: 1 }` or a return-type annotation
  *  `{ version: 2; assets: X[] }` LOOKS like the same defect but isn't: it's a TypeScript
  *  literal TYPE, not a value emit. That asymmetry is deliberate and worth keeping — a
@@ -28,15 +28,16 @@
  *  (the bytes may have been written by a different build) — which is why
  *  `BinaryAssetMeta.version` became `number` in #734, and why `subgameLoader.ts`'s own
  *  `SubgameManifest` declares `schema: number` rather than the producer's `schema: 1`.
- *  TS type members are `;`-terminated; object-literal properties are `,`-terminated or
- *  close the literal — so a numeric hit whose next non-space character is `;` is a type
- *  position and is NOT a violation; anything else (`,`, `}`, end of line) is a real value
- *  emit and IS a violation. */
+ *  How the two are told apart: a type member is a PROPERTY SIGNATURE in the parse and a value
+ *  emit is a PROPERTY ASSIGNMENT (or an `x.version = …` assignment), so only the latter is read.
+ *  (Until #1179 this was a per-line regex keyed on a `;` following the literal — see `versionEmits`.) */
 
 import { describe, it, expect } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import { hasScratchTooling } from '../helpers/repoLayout';
+import { readScannedSource, stripComments } from '@modoki/engine/testing';
+import { findNodes, lineOf, parseSource, ts, unwrapValue } from '@modoki/engine/testing/sourceAst';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const ENGINE = path.resolve(__dirname, '../..');
@@ -80,27 +81,49 @@ const PRIVATE_PRODUCERS = ['../tools-scratch/spine-import.mjs'];
 /** The corpus every test below iterates. */
 const ALL_PRODUCERS = [...PRODUCERS, ...(hasScratchTooling() ? PRIVATE_PRODUCERS : [])];
 
-/** A `version:`/`schema:` property written as a bare numeric literal — a real VALUE
- *  emit, not a type position. See header comment for the `;` discriminator. Also catches
- *  the ASSIGNMENT form (`meta.version = 2;`) — the shape the reimport-handler family and
- *  `writeAssetGuid` actually use. Without this half the original guard could not see a
- *  revert of the very fix it exists to protect (the ten reimport handlers cleaned up in
- *  #734 all wrote `meta.version = 2;`, never `version: 2`). */
-const VIOLATION = /\b(version|schema)\s*:\s*\d+(?!\s*;)|\.(version|schema)\s*=\s*\d/;
-
-/** Same property, but read FROM a named constant (`version: FOO_VERSION` or
- *  `meta.version = FOO_VERSION`). Used only to anchor that the corpus is non-trivial —
- *  see the anti-vacuity check below. The assignment form is what makes `meta-sidecar.ts`
- *  itself (`committed.version = SIDECAR_FORMAT_VERSION`) a real anchor instead of a file
- *  this guard can neither violate nor vouch for. */
-const FROM_CONSTANT = /\b(version|schema)\s*:\s*[A-Z][A-Z0-9_]+|\.(version|schema)\s*=\s*[A-Z][A-Z0-9_]+/;
+/*  A `version:`/`schema:` value written as a bare numeric literal — a real VALUE emit, not a type
+ *  position. The ASSIGNMENT form (`meta.version = 2;`) is read too — the shape the reimport-handler
+ *  family and `writeAssetGuid` actually use. Without that half the original guard could not see a
+ *  revert of the very fix it exists to protect (the ten reimport handlers cleaned up in #734 all
+ *  wrote `meta.version = 2;`, never `version: 2`).
+ *
+ *  ⚠️ **Read from the PARSE since #1179, which retires the `;` discriminator.** The regex form
+ *  (`\b(version|schema)\s*:\s*\d+(?!\s*;)|\.(version|schema)\s*=\s*\d`) told a type position from a
+ *  value by the `;` after it, per LINE, so `meta.version =\n  2` escaped, and a code line starting with
+ *  `*` was dropped as a comment. In the parse a type literal's `version: 2;` is a PROPERTY SIGNATURE and
+ *  a value's is a PROPERTY ASSIGNMENT — the discriminator is the node kind. */
+type Emit = { line: number; text: string; value: 'literal' | 'constant' | 'other' };
+const VERSION_KEYS = new Set(['version', 'schema']);
+/** Every `version`/`schema` VALUE written in one file — `{ version: … }` and `x.version = …` — with
+ *  what it is written from: a numeric literal, a SCREAMING_CASE named constant, or anything else. */
+function versionEmits(code: string, label: string): Emit[] {
+  const sf = parseSource(code, label);
+  const kind = (e: ts.Expression): Emit['value'] => {
+    const u = unwrapValue(e);
+    if (ts.isNumericLiteral(u)) return 'literal';
+    return ts.isIdentifier(u) && /^[A-Z][A-Z0-9_]+$/.test(u.text) ? 'constant' : 'other';
+  };
+  const props = findNodes(sf, (n): n is ts.PropertyAssignment => ts.isPropertyAssignment(n)
+    && (ts.isIdentifier(n.name) || ts.isStringLiteral(n.name)) && VERSION_KEYS.has(n.name.text));
+  const assigns = findNodes(sf, (n): n is ts.BinaryExpression => ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken
+    && ts.isPropertyAccessExpression(n.left) && VERSION_KEYS.has(n.left.name.text));
+  return [
+    ...props.map((p) => ({ line: lineOf(p), text: p.getText(sf).replace(/\s+/g, ' '), value: kind(p.initializer) })),
+    ...assigns.map((b) => ({ line: lineOf(b), text: b.getText(sf).replace(/\s+/g, ' '), value: kind(b.right) })),
+  ];
+}
 
 /** A line carrying this marker is a KNOWN, narrowly-scoped, unrelated numeric version
  *  literal — e.g. `gen-skinned-test-models.mjs`'s `version: 8` is a SCENE format version,
  *  not the sidecar version this guard protects (#781). Use it on exactly the offending
  *  line, with a comment explaining what the literal actually is and why — carving out one
  *  line keeps the REST of the file (its real sidecar-version emit) covered by the guard,
- *  which excluding the whole file from PRODUCERS would not. */
+ *  which excluding the whole file from PRODUCERS would not.
+ *
+ *  ⚠️ **It pardons ONE occurrence (#1179).** It used to skip its whole LINE, so a second literal
+ *  written beside the carved-out one was pardoned too. Now a marker line holding more than one
+ *  NUMERIC-LITERAL version emit pardons none of them — split them, or give each its own line. (Only
+ *  literals are counted: a `schema: SCHEMA_V` beside the marked literal is not a violation to begin with.) */
 const IGNORE_MARKER = 'format-version-guard: ignore-line';
 
 function violationsIn(relPath: string): { line: number; text: string }[] {
@@ -115,15 +138,23 @@ function violationsIn(relPath: string): { line: number; text: string }[] {
   // absolute argument unchanged, and is identical to `join` for the relative producer paths
   // (`..` segments included). Green on every POSIX clone either way — this is only reachable
   // where the tree and the temp dir sit on different volumes.
-  const src = fs.readFileSync(path.resolve(ENGINE, relPath), 'utf-8');
-  const hits: { line: number; text: string }[] = [];
-  src.split('\n').forEach((line, idx) => {
-    const trimmed = line.trim();
-    if (trimmed.startsWith('*') || trimmed.startsWith('//')) return;
-    if (line.includes(IGNORE_MARKER)) return;
-    if (VIOLATION.test(line)) hits.push({ line: idx + 1, text: trimmed });
-  });
-  return hits;
+  const abs = path.resolve(ENGINE, relPath);
+  // Two reads, both declared: the CODE is what is classified; the raw text is read only to find the
+  // ignore marker, which by design lives in a COMMENT on the literal's line.
+  const { raw } = readScannedSource(abs, { comments: 'include', reason: 'the format-version ignore marker is a comment on the pardoned line' });
+  const { code } = readScannedSource(abs);
+  return literalViolations(raw, code, relPath);
+}
+
+/** `violationsIn` over text: the numeric-literal emits, minus the one a marker line pardons. */
+function literalViolations(raw: string, code: string, label: string): { line: number; text: string }[] {
+  const rawLines = raw.split('\n');
+  const literals = versionEmits(code, label).filter((e) => e.value === 'literal');
+  const perLine = new Map<number, number>();
+  for (const e of literals) perLine.set(e.line, (perLine.get(e.line) ?? 0) + 1);
+  return literals
+    .filter((e) => !(rawLines[e.line - 1]?.includes(IGNORE_MARKER) && perLine.get(e.line) === 1))
+    .map(({ line, text }) => ({ line, text }));
 }
 
 describe('format-version fields are emitted from a named constant, never a numeric literal', () => {
@@ -140,9 +171,11 @@ describe('format-version fields are emitted from a named constant, never a numer
     // weak lower bound (e.g. ">= 4" against a 7-entry list) lets N-1 producers be
     // stripped silently — the same defect this file already fixes for the sibling
     // `metaMergeNotClobber`-style liveness check.
+    // From CODE (#1179): the old whole-file regex over raw text was satisfied by a docblock quoting
+    // `version: FOO_VERSION`, which is exactly the file this check exists to name.
     const missing = ALL_PRODUCERS.filter((rel) => {
-      const src = fs.readFileSync(path.join(ENGINE, rel), 'utf-8');
-      return !FROM_CONSTANT.test(src);
+      const abs = path.join(ENGINE, rel);
+      return !versionEmits(readScannedSource(abs).code, rel).some((e) => e.value === 'constant');
     });
     expect(
       missing,
@@ -179,41 +212,44 @@ describe('format-version fields are emitted from a named constant, never a numer
   });
 
   it('the detector detects', () => {
+    const literalsIn = (src: string) => literalViolations(src, stripComments(src), 'row.ts').length;
     // Positives — real value emits.
-    expect(VIOLATION.test('version: 2')).toBe(true);
-    expect(VIOLATION.test('schema: 1')).toBe(true);
-    expect(VIOLATION.test('  version:3')).toBe(true);
-    expect(VIOLATION.test('  schema: 1,')).toBe(true);
-    expect(VIOLATION.test('  version: 2 }')).toBe(true);
+    expect(literalsIn('const a = { version: 2 };')).toBe(1);
+    expect(literalsIn('const a = { schema: 1 };')).toBe(1);
+    expect(literalsIn('const a = { version:3 };')).toBe(1);
+    expect(literalsIn('const a = { "schema": 1, };')).toBe(1);
 
-    // Negatives — referencing a named constant.
-    expect(VIOLATION.test("version: SIDECAR_FORMAT_VERSION")).toBe(false);
-    expect(VIOLATION.test('schema: SUBGAME_MANIFEST_SCHEMA_VERSION')).toBe(false);
-    expect(VIOLATION.test("version: 'v1'")).toBe(false);
+    // Negatives — referencing a named constant, or not a number.
+    expect(literalsIn('const a = { version: SIDECAR_FORMAT_VERSION };')).toBe(0);
+    expect(literalsIn('const a = { schema: SUBGAME_MANIFEST_SCHEMA_VERSION };')).toBe(0);
+    expect(literalsIn("const a = { version: 'v1' };")).toBe(0);
 
     // The ASSIGNMENT form — `meta.version = 2;` — the shape the reimport-handler family
     // and `writeAssetGuid` actually use. This is the case #5 exists to close: without it
     // the guard cannot see a revert of the very literal it was written to protect.
-    expect(VIOLATION.test('  meta.version = 2;')).toBe(true);
-    expect(VIOLATION.test('  committed.version = SIDECAR_FORMAT_VERSION;')).toBe(false);
+    expect(literalsIn('meta.version = 2;')).toBe(1);
+    expect(literalsIn('committed.version = SIDECAR_FORMAT_VERSION;')).toBe(0);
 
-    // Negative — a comment line (filtered upstream by the trim check, not by the regex
-    // itself — verify the regex alone would still match so the trim guard is load-bearing).
-    expect(VIOLATION.test(' * version: 2')).toBe(true);
-    expect(' * version: 2'.trim().startsWith('*')).toBe(true);
+    // A comment is blanked by the scanner, whatever its first character.
+    expect(literalsIn('/**\n * version: 2\n */\nconst x = 1;')).toBe(0);
 
-    // Negatives — TypeScript type positions (`;`-terminated), the discriminator this
-    // guard exists to get right. These are real lines from the corpus.
-    expect(VIOLATION.test('  schema: 1;')).toBe(false);
-    expect(
-      VIOLATION.test(
-        'export function buildManifest(): { version: 2; assets: X[] } {',
-      ),
-    ).toBe(false);
-    expect(
-      VIOLATION.test(
-        'let cachedManifest: { version: 2; assets: X[] } = { version: ASSET_MANIFEST_VERSION, assets: [] };',
-      ),
-    ).toBe(false);
+    // Negatives — TypeScript type positions: a property SIGNATURE, not an assignment. These are real
+    // lines from the corpus (made whole statements to parse).
+    expect(literalsIn('type T = { schema: 1; };')).toBe(0);
+    expect(literalsIn('export function buildManifest(): { version: 2; assets: X[] } { return m; }')).toBe(0);
+    expect(literalsIn('let cachedManifest: { version: 2; assets: X[] } = { version: ASSET_MANIFEST_VERSION, assets: [] };')).toBe(0);
+
+    // #1179: wrapped, a code line that begins with `*`, and two on one line.
+    expect(literalsIn('meta.version =\n  2;')).toBe(1);
+    expect(literalsIn('const a = {\n  version:\n    2,\n};')).toBe(1);
+    expect(literalsIn('const b = 3\n  * 2; meta.schema = 4;')).toBe(1);
+    expect(literalsIn('const c = { version: 1, schema: 2 };')).toBe(2);
+  });
+
+  it('a marker pardons ONE occurrence — a second literal on its line is not carried with it (#1179)', () => {
+    const one = `const scene = { version: 8 }; // ${IGNORE_MARKER} — a scene format version`;
+    const two = `const scene = { version: 8, schema: 3 }; // ${IGNORE_MARKER} — a scene format version`;
+    expect(literalViolations(one, stripComments(one), 'row.ts')).toEqual([]);
+    expect(literalViolations(two, stripComments(two), 'row.ts')).toHaveLength(2);
   });
 });

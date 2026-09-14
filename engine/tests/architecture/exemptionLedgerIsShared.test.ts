@@ -59,6 +59,7 @@ import path from 'node:path';
 import ts from 'typescript';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
+import { readScannedSource, shellLogicalLines } from '@modoki/engine/testing';
 import { REPO_ROOT, hasInternalGames, hasPublishScripts } from '../helpers/repoLayout';
 
 /** Every test root vitest collects — engine, the package, the scaffolder template, each project, and a
@@ -221,6 +222,8 @@ const RESIDUE: ReadonlyArray<{ item: string; count?: number; reason: string }> =
   { item: 'games/court/tests/storeChrome.test.ts::ACCOUNT_ROW_NAMES', reason: 'DATA — partitions the text calls into account rows and the rest' },
   { item: 'games/court/tests/chromeFixture.ts::ANIMATED_CHROME', reason: 'DATA — partitions the spawned chrome into animated and plain; the branch spawns, then continues' },
   { item: 'games/wordweave/tests/authoredLabelBudget.test.ts::TEMPLATE_NAMED', reason: 'DATA — narrows the named-entity list (work-ai lane)' },
+  { item: 'engine/tests/architecture/packagedLaunchIsolation.test.ts::NON_LAUNCH_COMMANDS', reason: 'CLASSIFIER — the shell commands proven NOT to launch what they mention (a test, text); anything else mentioning the binary is a launch' },
+  { item: 'games/wordweave/tests/adBannerReserve.test.ts::NOT_GAME_SOURCE', reason: 'CORPUS — the folders holding no game source (tests, dependencies, build output, native projects); it defines what the playable-gate ledger scans and pardons nothing in it' },
   { item: 'engine/tests/architecture/editorStoreActionsReachable.test.ts::knownOrphans', reason: 'TWO-WAY EXACT (empty) — new orphans and stale rows are both asserted' },
   { item: 'engine/tests/assets/gamePortability.test.ts::KNOWN_ESCAPES', reason: 'TWO-WAY EXACT — new escapes and stale rows both asserted, at the same file::specifier grain' },
   { item: 'engine/tests/tools/routeCoverage.test.ts::NO_TOOL_BY_DESIGN', reason: 'TWO-WAY EXACT — undeclared, stale and newly-covered routes are all asserted' },
@@ -253,11 +256,14 @@ describe('a pardon that filters a detector goes through assertExemptionLedger (#
   it('PUBLISHER_STRIPPED is still stripped by the publisher — the layout exception is real', (ctx) => {
     const publisher = path.join(REPO_ROOT, 'scripts/publish-engine-oss.sh');
     if (!hasPublishScripts()) { ctx.skip(); return; }
-    const text = fs.readFileSync(publisher, 'utf8');
+    // Comment-blanked and read as COMMANDS (#1179): a `#` note naming the strip after code on the same
+    // line was kept by the "line starts with #" filter, and the strip sits inside a `\`-continued
+    // pipeline that a per-line read only happens to see because the `grep` starts its own line.
+    const commands = shellLogicalLines(readScannedSource(publisher).code);
     for (const rel of PUBLISHER_STRIPPED) {
-      // The STRIPPING line, not just the path: a comment or an unrelated mention must not satisfy it.
+      // The STRIPPING command, not just the path: a comment or an unrelated mention must not satisfy it.
       const strip = `grep -vE '^${rel.replace(/\./g, '\\.')}$'`;
-      expect(text.split('\n').some((l) => !l.trim().startsWith('#') && l.includes(strip)),
+      expect(commands.some((c) => c.text.includes(strip)),
         `${rel} is no longer stripped from the snapshot (no \`${strip}\` line) — drop it from PUBLISHER_STRIPPED`).toBe(true);
     }
   });

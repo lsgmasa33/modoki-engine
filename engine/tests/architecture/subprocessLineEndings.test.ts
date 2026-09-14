@@ -22,6 +22,7 @@ import {
   boundIdentifier, callsTo, declarationOf, parseSource, readsOf, unwrapValue, valueCarrier,
 } from '@modoki/engine/testing/sourceAst';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { hasInternalGames, hasPublishScripts } from '../helpers/repoLayout';
 import { outputLines, parsePidRows } from '../../scripts/subprocessText.mjs';
 import { joinPidColumns } from '../../scripts/livePackagedEditor.mjs';
 
@@ -335,13 +336,16 @@ describe('the SHAPE cannot come back — corpus guard (#1118)', () => {
       const { code } = readScannedSource(abs);
       for (const pat of crFragileLineParses(code, rel)) population.push({ item: `${rel}::${pat}`, site: rel });
     }
-    const scanned = new Set(files.map((f) => f.rel));
     assertExemptionLedger({
       label: 'CR_SAFE_UPSTREAM in subprocessLineEndings',
       population,
-      // A row counts only where its file is in the corpus — `scripts/gen-memory-index.mjs` is not in
-      // the OSS snapshot, and a row for an absent file would read as over-blessed there.
-      exempt: CR_SAFE_UPSTREAM.filter((row) => scanned.has(row.item.split('::')[0])),
+      // A row is dropped only where the LAYOUT lacks its file: top-level `scripts/` is not in the OSS
+      // snapshot (`hasPublishScripts()` says which checkout this is), nor internal `games/`. ⚠️ Keyed on
+      // the layout, never on the file (#1179 known gap 1): filtering on "its file was scanned" also
+      // dropped the row of a file somebody DELETED or RENAMED in a full checkout, so a stale pardon
+      // vanished instead of failing — the over-blessed check exists to catch exactly that.
+      exempt: CR_SAFE_UPSTREAM.filter((row) => !((row.item.startsWith('scripts/') && !hasPublishScripts())
+        || (row.item.startsWith('games/') && !hasInternalGames()))),
       scanned: files.length,
       floor: 200,
       fix: 'a line from a bare `\'\\n\'` split must not meet an end-anchored capture: '

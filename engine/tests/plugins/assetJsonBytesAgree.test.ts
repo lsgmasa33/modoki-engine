@@ -25,6 +25,9 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { readScannedSource } from '@modoki/engine/testing';
+import {
+  calleeName, declarationOf, findNodes, flatText, lineOf, parseSource, statementOf, ts, unwrapValue,
+} from '@modoki/engine/testing/sourceAst';
 import { handleBackendRequest, assetJsonBytes, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
@@ -50,6 +53,41 @@ function makeCtx(over: Partial<BackendContext> = {}): BackendContext {
 
 const post = (urlPath: string, body: unknown, ctx: BackendContext) =>
   handleBackendRequest(ctx, { method: 'POST', urlPath, query: new URLSearchParams(), body });
+
+/** Every `writeJsonAtomic` call in a file, and whether each one's OWN bytes argument is an
+ *  `assetJsonBytes(…)` call — inline, or a `const` that the argument RESOLVES to (#1179).
+ *
+ *  This was a line scan: a line holding `writeJsonAtomic(` passed if `assetJsonBytes(` appeared
+ *  anywhere on it, or if its argument's NAME was declared from one anywhere in the file — so a
+ *  producer beside the call on the same line, or a same-named const in another function, vouched for
+ *  a write it has nothing to do with. `producedFrom` lists what each inline/bound producer serialises
+ *  (its first argument's text). A reference to `writeJsonAtomic` that is not a call's callee (passed as
+ *  a value) cannot be classified and is reported. */
+export function jsonWrites(code: string, label: string): { calls: number; untyped: string[]; producedFrom: string[] } {
+  const sf = parseSource(code, label);
+  const producer = (e: ts.Expression | undefined): ts.CallExpression | undefined => {
+    if (!e) return undefined;
+    const u = unwrapValue(e);
+    if (ts.isCallExpression(u)) return calleeName(u) === 'assetJsonBytes' && ts.isIdentifier(u.expression) ? u : undefined;
+    if (!ts.isIdentifier(u)) return undefined;
+    const decl = declarationOf(u);
+    return decl && ts.isVariableDeclaration(decl) && (decl.parent.flags & ts.NodeFlags.Const) !== 0
+      ? producer(decl.initializer) : undefined;
+  };
+  let calls = 0;
+  const untyped: string[] = [];
+  const producedFrom: string[] = [];
+  for (const id of findNodes(sf, (n): n is ts.Identifier => ts.isIdentifier(n) && n.text === 'writeJsonAtomic')) {
+    if (ts.isFunctionDeclaration(id.parent) && id.parent.name === id) continue;
+    const call = ts.isCallExpression(id.parent) && id.parent.expression === id ? id.parent : undefined;
+    if (!call) { untyped.push(`${label}:${lineOf(id)}: <not a call> ${flatText(statementOf(id))}`.replace(/;$/, '')); continue; }
+    calls += 1;
+    const made = call.arguments.length === 2 ? producer(call.arguments[1]) : undefined;
+    if (made) producedFrom.push(made.arguments[0] ? flatText(made.arguments[0]) : '');
+    else untyped.push(`${label}:${lineOf(call)}: ${flatText(call)}`);
+  }
+  return { calls, untyped, producedFrom };
+}
 
 beforeEach(() => { projectRoot = makeScratchDir('modoki-bytes-'); });
 afterEach(() => { fs.rmSync(projectRoot, { recursive: true, force: true }); });
@@ -113,34 +151,41 @@ describe('assetJsonBytes is the one definition of what lands on disk (#831)', ()
     // `writeJsonAtomic` several times, and a comment that happens to contain a call-shaped string
     // would be counted as a call here — a guard satisfied by a comment is the defect that reader
     // exists to stop.
-    const src = readScannedSource(
-      path.resolve(__dirname, '../../plugins/backend/editorBackendRouter.ts')).code;
-    // Line-based, and the DECLARATION is excluded explicitly: a span-matching regex ran from
-    // `function writeJsonAtomic(` into the body and reported the signature as an offending call.
-    const calls = src.split('\n')
-      .filter((l) => l.includes('writeJsonAtomic(') && !l.includes('function writeJsonAtomic('));
-    expect(calls.length, 'the writeJsonAtomic call scan found nothing — it has broken')
-      .toBeGreaterThanOrEqual(5);
-    // A call may name its producer INLINE (`writeJsonAtomic(abs, assetJsonBytes(out))`) or through
-    // a local the same file assigns from one (`const outBytes = assetJsonBytes(out)` — which
-    // /api/asset-write needs, because it also hashes those exact bytes into the reply and must not
-    // serialise them twice). Either DECLARES which serialisation the call owns, which is the
-    // claim; a bare identifier that traces to no producer does not, and still fails.
-    const declaredFrom = (id: string) =>
-      new RegExp(`(?:const|let)\\s+${id}\\s*(?::[^=]+)?=\\s*assetJsonBytes\\(`).test(src);
-    const untyped = calls.filter((c) => {
-      if (/assetJsonBytes\(/.test(c)) return false;
-      const arg = /writeJsonAtomic\([^,]+,\s*([A-Za-z_$][\w$]*)\s*\)/.exec(c);
-      return !(arg && declaredFrom(arg[1]));
-    });
-    expect(untyped, 'a writeJsonAtomic call does not pass assetJsonBytes — not inline, and not '
-      + 'through a local this file assigns from one — so nothing states which serialisation it '
-      + 'owns.\n\n' + untyped.join('\n')).toEqual([]);
+    const w = jsonWrites(readScannedSource(
+      path.resolve(__dirname, '../../plugins/backend/editorBackendRouter.ts')).code, 'editorBackendRouter.ts');
+    expect(w.calls, 'the writeJsonAtomic call scan found nothing — it has broken').toBeGreaterThanOrEqual(5);
+    expect(w.untyped, 'a writeJsonAtomic call does not pass assetJsonBytes — not inline, and not '
+      + 'through a const its own scope binds to one — so nothing states which serialisation it '
+      + 'owns.\n\n' + w.untyped.join('\n')).toEqual([]);
     // And the scene caller specifically must be on the (now single) producer — this is the line
     // that used to read `sceneJsonBytes(scene)`.
-    expect(calls.some((c) => /assetJsonBytes\(scene\)/.test(c)),
-      'the /api/scene-mutate writer no longer serialises `scene` through assetJsonBytes')
-      .toBe(true);
+    expect(w.producedFrom, 'the /api/scene-mutate writer no longer serialises `scene` through assetJsonBytes')
+      .toContain('scene');
+  });
+
+  it('jsonWrites reads each call\'s OWN bytes argument (#1179)', () => {
+    const scan = (body: string) => jsonWrites(`function writeJsonAtomic(absPath: string, bytes: Buffer): void {}\n${body}`, 'fixture.ts');
+    // Inline, wrapped, and through a const of the call's own scope.
+    expect(scan(`function a() { writeJsonAtomic(abs,
+      assetJsonBytes(scene)); }
+    function b() { const outBytes = assetJsonBytes(out); writeJsonAtomic(abs, outBytes); }
+    function c() { const held = (assetJsonBytes(doc) as Buffer); writeJsonAtomic(abs, held!); }`))
+      .toEqual({ calls: 3, untyped: [], producedFrom: ['scene', 'out', 'doc'] });
+    // The line reader passed each of these: a producer elsewhere on the LINE, a same-named const in
+    // ANOTHER function, a `let` reassigned after, the producer's name inside a string.
+    expect(scan(`function c() { writeJsonAtomic(abs, JSON.stringify(x)); const y = assetJsonBytes(x); }
+    function d() { const bytes = assetJsonBytes(out); }
+    function e(bytes: Buffer) { writeJsonAtomic(abs, bytes); }
+    function f() { let raw = assetJsonBytes(out); raw = Buffer.from('x'); writeJsonAtomic(abs, raw); }
+    function g() { writeJsonAtomic(abs, Buffer.from('assetJsonBytes(scene)')); }
+    function i() { writeJsonAtomic(abs, legacy.assetJsonBytes(scene)); }
+    function j() { writeJsonAtomic(abs, sceneJsonBytes(scene)); }`).untyped.map((u) => u.replace(/^fixture\.ts:\d+: /, '')))
+      .toEqual(['writeJsonAtomic(abs, JSON.stringify(x))', 'writeJsonAtomic(abs, bytes)', 'writeJsonAtomic(abs, raw)',
+        "writeJsonAtomic(abs, Buffer.from('assetJsonBytes(scene)'))", 'writeJsonAtomic(abs, legacy.assetJsonBytes(scene))',
+        'writeJsonAtomic(abs, sceneJsonBytes(scene))']);
+    // A reference that is not the callee writes through a path nothing here reads.
+    expect(scan(`function h() { save(writeJsonAtomic); }`).untyped.map((u) => u.replace(/^fixture\.ts:\d+: /, '')))
+      .toEqual(['<not a call> save(writeJsonAtomic)']);
   });
 
   it('the writer and `assetJsonBytes` produce identical bytes for the same document', async () => {

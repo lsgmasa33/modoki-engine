@@ -1350,13 +1350,14 @@ thing it was watching was broken:
    gracefully here is a dead build for them. The assertion compares against `PINNED_NODE.version`
    read from `engine/toolchain/nodeProvision.ts`, so it also catches a **stale packaged build**
    shipping an older Node than the tree pins.
-4. **Nothing leaked in from another clone.** The launch passes `--user-data-dir`, because
-   `resolveUserDataDir` scopes the profile per clone only for **dev** — packaged returns the single
-   `<appData>/Modoki Editor`, correctly assuming a shipped app is installed once. Our harnesses break
-   that assumption: four clones each build and smoke their own packaged app. Since
+4. **Nothing leaked in from another run.** The launch passes `--user-data-dir`. When this was written,
+   `resolveUserDataDir` scoped the profile per clone only for **dev** and packaged returned one
+   `<appData>/Modoki Editor`, so four clones each smoking their own packaged app shared it: since
    `modoki-last-scene:<project name>` is keyed by project NAME with a clone-ABSOLUTE value, a run
    restored another clone's scene, `/@fs` correctly 403'd it, and assertion 2 failed for a reason
-   unrelated to the commit. `shouldOverrideUserData()` stands down for that switch precisely so a
+   unrelated to the commit. Since #1036 the packaged profile is per INSTALL
+   (`<appData>/Modoki Editor/<install-id>`), which ends the cross-clone collision; a gate still passes
+   the flag so each run boots from a fresh profile rather than its own previous run's residue. `shouldOverrideUserData()` stands down for that switch precisely so a
    harness can isolate itself. `assert-app-renders.sh` (the release gate) does the same.
    Guarded by `engine/tests/architecture/packagedLaunchIsolation.test.ts`.
 

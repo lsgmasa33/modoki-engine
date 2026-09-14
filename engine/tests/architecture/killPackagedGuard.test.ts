@@ -14,7 +14,8 @@ import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { readScannedSource } from '@modoki/engine/testing';
+import { insideShellSubstitution, readScannedSource, shellLogicalLines } from '@modoki/engine/testing';
+import { accessPath, findNodes, lineOf, parseSource, ts } from '@modoki/engine/testing/sourceAst';
 import { killPackaged, altPathSpelling, decodeWinReap, REAP_KILLED, REAP_NONE, REAP_ERROR, productName } from '../../scripts/packagedAppPaths.mjs';
 import { makeDirLink } from '../helpers/linkFixture';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
@@ -275,6 +276,47 @@ describe.skipIf(process.platform === 'win32')('killPackaged reports its outcome 
   });
 });
 
+
+/** For every string or template part in `code` holding `needle`, the call it is handed to — the dotted
+ *  callee of the nearest call it is an ARGUMENT of (`console.log`), or `<not an argument>`.
+ *
+ *  ⚠️ **The message's own call, not its line (#1179).** The line test found the first line holding
+ *  `FAILED to reap` and asked whether `console.log` was also on it: a formatter moving the message
+ *  onto its own line under `console.error(` failed it for the wrong reason, a `console.log` elsewhere
+ *  on the line — `ok ? console.log(a) : console.error('FAILED to reap')` — passed it, and a second
+ *  copy of the message further down was never read. */
+function messageSinks(code: string, label: string, needle: string): Array<{ line: number; sink: string }> {
+  const texts = findNodes(parseSource(code, label), (n): n is ts.StringLiteralLike | ts.TemplateLiteralLikeNode =>
+    (ts.isStringLiteralLike(n) || ts.isTemplateHead(n) || ts.isTemplateMiddle(n) || ts.isTemplateTail(n)) && n.text.includes(needle));
+  return texts.map((t) => {
+    let cur: ts.Node = t;
+    for (let p = t.parent; p && !ts.isStatement(p); cur = p, p = p.parent) {
+      if (ts.isCallExpression(p) && p.arguments.some((a) => a === cur)) return { line: lineOf(t), sink: accessPath(p.expression) ?? '<unnamed callee>' };
+    }
+    return { line: lineOf(t), sink: '<not an argument>' };
+  });
+}
+
+describe('the message-sink reader asks each message which call it is handed to (#1179)', () => {
+  const sinks = (src: string) => messageSinks(src, 'fixture.mjs', 'FAILED to reap').map((m) => m.sink);
+
+  it('reads a wrapped call, a template, and every copy', () => {
+    expect(sinks("console.log(\n  '[kill] FAILED to reap',\n  b,\n);\nconsole.error(`${p} FAILED to reap`);")).toEqual(['console.log', 'console.error']);
+  });
+
+  it('a message re-spelt inside the log call is still that call\'s', () => {
+    expect(sinks("console.log('[kill] FAILED to reap'.trim(), b);")).toEqual(['console.log']);
+  });
+
+  it('a console.log elsewhere on the line does not vouch for the message', () => {
+    expect(sinks("ok ? console.log('[kill] killed') : console.error('[kill] FAILED to reap');")).toEqual(['console.error']);
+  });
+
+  it('a message built first and logged by name is not an argument — it fails rather than passing unread', () => {
+    expect(sinks("const m = '[kill] FAILED to reap'; console.log(m);")).toEqual(['<not an argument>']);
+  });
+});
+
 /** Close-out review findings, pinned. Each of these was CONFIRMED against the running code, and
  *  each is a way the #944 half of the fix reached nobody. */
 describe('the reap outcome actually reaches a consumer (#944 close-out)', () => {
@@ -288,15 +330,15 @@ describe('the reap outcome actually reaches a consumer (#944 close-out)', () => 
   it('the ERROR verdict is printed on stdout, not a stream every caller mutes', () => {
     // MEASURED: all five bash callers invoke this as `node "$PATHS" kill … 2>/dev/null || true`,
     // so an alarm on stderr is discarded by every consumer that exists — the two HARMLESS
-    // outcomes printed and the one that matters did not. A text scan, because the alternative is
+    // outcomes printed and the one that matters did not. A source scan, because the alternative is
     // spawning the CLI with pkill removed from PATH, which is not portable in-suite.
-    const line = cliSource.split('\n').find((l) => l.includes('FAILED to reap'));
-    expect(line, 'the ERROR branch disappeared').toBeDefined();
+    const sinks = messageSinks(cliSource, 'packagedAppPaths.mjs', 'FAILED to reap');
+    expect(sinks.length, 'the ERROR branch disappeared').toBeGreaterThan(0);
     expect(
-      line,
+      sinks.filter((m) => m.sink !== 'console.log').map((m) => `packagedAppPaths.mjs:${m.line} → ${m.sink}`),
       'the reap ERROR must go to stdout — every bash caller redirects stderr to /dev/null, so '
         + 'console.error here makes the whole reporting half of #944 a no-op',
-    ).toMatch(/console\.log/);
+    ).toEqual([]);
   });
 
   it('every bash caller still mutes stderr — the premise of the rule above', () => {
@@ -307,15 +349,82 @@ describe('the reap outcome actually reaches a consumer (#944 close-out)', () => 
     // hardcoded list and the rest would keep this green (close-out re-review).
     const scriptsDir = path.resolve(__dirname, '../../scripts');
     const scripts = fs.readdirSync(scriptsDir).filter((f) => f.endsWith('.sh')).map((f) => path.join(scriptsDir, f));
-    const callers = scripts.flatMap((f) => readScannedSource(f, { language: 'shell' }).code
-      .split('\n').filter((l) => /\$PATHS" kill/.test(l)));
+    const kills = scripts.flatMap((f) => pathsKillCommands(readScannedSource(f).code));
+    const callers = kills.map((c) => c.command);
     expect(callers.length, 'no `$PATHS kill` call sites found — this rule lost its subject').toBeGreaterThan(0);
+    expect(kills.filter((k) => k.captured).map((k) => k.command), 'the call is captured by $( … ) — its ERROR line never reaches the terminal').toEqual([]);
+    expect(kills.filter((k) => k.piped).map((k) => k.command), 'the call is piped into another command — its ERROR line never reaches the terminal').toEqual([]);
     for (const c of callers) {
       expect(c).toContain('2>/dev/null');
       // …and stdout must stay OPEN. A future `>/dev/null 2>&1` at a call site would satisfy the
       // line above while re-muting the alarm the fix exists to deliver — the same defect, moved.
-      expect(c, 'stdout is redirected too — the ERROR line is muted again').not.toMatch(/>\s*\/dev\/null\s+2>&1|&>\s*\/dev\/null/);
+      expect(c, 'stdout is redirected too — the ERROR line is muted again').not.toMatch(MUTES_STDOUT);
     }
+  });
+});
+
+/** A redirect that sends STDOUT nowhere: `>`, `>>`, `>|` or `1>` to /dev/null, or `&>`/`&>>` — attached to
+ *  the word before it or not (`"$APP">/dev/null`). `2>/dev/null` is the premise, not a mute. */
+const MUTES_STDOUT = /&>>?\s*\/dev\/null|(?<![0-9&>])1?>>?\|?\s*\/dev\/null/;
+
+/** Each `node "$PATHS" kill …` COMMAND in stripped shell source: its logical line (a backslash-wrapped
+ *  call is one), cut at the first command separator after the call — so the redirect judged is the one
+ *  ON this call. Per physical line (#1179), a call wrapped before its `2>/dev/null` failed for the wrong
+ *  reason, and `node "$PATHS" kill || true; other 2>/dev/null` passed on its neighbour's redirect. */
+function pathsKillCommands(code: string): Array<{ line: number; command: string; captured: boolean; piped: boolean }> {
+  // `||`, `&&`, `;`, a pipe, or a BACKGROUND `&` — never the `&` of a `2>&1` or `&>` redirect.
+  const separator = /\|\||&&|;|\||(?<![<>&])&(?![>&])/;
+  return shellLogicalLines(code).flatMap(({ text, line }) => {
+    const out: Array<{ line: number; command: string; captured: boolean; piped: boolean }> = [];
+    const re = /\$PATHS" kill/g;
+    for (let m = re.exec(text); m; m = re.exec(text)) {
+      // Inside `$( … )` or backticks the ERROR line becomes a value, not output — muted as surely as a
+      // redirect. Counted from the START of the line: cutting at the last separator first threw away
+      // the `$(` of `$(cd "$REPO" && node "$PATHS" kill …)` (#1179 P7 re-review).
+      const command = text.slice(m.index).split(separator)[0]!;
+      // Cut at a PIPE, the call's stdout is the next command's input, not the terminal — `| cat >/dev/null`
+      // or `| grep -q .` swallow the ERROR line as surely as a redirect (#1179 final review). ⚠️ Only the
+      // separator right after THIS command: a `{ …; } | grep` group, or a quoted `;` that cuts the command
+      // early, is not seen — no real caller has either shape.
+      const piped = /^\|(?!\|)/.test(text.slice(m.index + command.length));
+      out.push({ line, command, captured: insideShellSubstitution(text, m.index), piped });
+    }
+    return out;
+  });
+}
+
+describe('the `$PATHS kill` reader judges each call by its own command (#1179)', () => {
+  const commands = (src: string) => pathsKillCommands(src).map((c) => `${c.line}: ${c.command.trim()}`);
+
+  it('reads a call wrapped over backslash-continued lines as one command', () => {
+    expect(commands('node "$PATHS" kill "$APP" \\\n  2>/dev/null \\\n  || true')).toEqual(['1: $PATHS" kill "$APP"   2>/dev/null']);
+  });
+
+  it("a neighbour's redirect on the same line — after ||, && or ; — is not this call's", () => {
+    expect(commands('node "$PATHS" kill || true; other 2>/dev/null\nnode "$PATHS" kill && x 2>/dev/null\nnode "$PATHS" kill 2>&1 | tee log'))
+      .toEqual(['1: $PATHS" kill', '2: $PATHS" kill', '3: $PATHS" kill 2>&1']);
+  });
+
+  it('two calls on one line are two commands, and a background & ends one', () => {
+    expect(commands('node "$PATHS" kill a 2>/dev/null; node "$PATHS" kill b')).toEqual(['1: $PATHS" kill a 2>/dev/null', '1: $PATHS" kill b']);
+    expect(commands('node "$PATHS" kill & sleep 1 2>/dev/null\nnode "$PATHS" kill &>/dev/null')).toEqual(['1: $PATHS" kill', '2: $PATHS" kill &>/dev/null']);
+  });
+
+  it('MUTES_STDOUT is any stdout redirect to /dev/null, and not the stderr one the rule requires', () => {
+    expect(['node x >/dev/null 2>&1', 'node x 2>/dev/null >/dev/null', 'node x 1>/dev/null 2>/dev/null', 'node x &>/dev/null', 'node x > /dev/null',
+      'kill "$APP">/dev/null 2>/dev/null', 'kill 2>/dev/null>/dev/null', 'kill 2>/dev/null >>/dev/null', 'kill >| /dev/null', 'kill &>>/dev/null']
+      .map((c) => MUTES_STDOUT.test(c))).toEqual([true, true, true, true, true, true, true, true, true, true]);
+    expect(['node x 2>/dev/null || true', 'node x 2>>/dev/null', 'node x 2>/dev/null 2>&1'].map((c) => MUTES_STDOUT.test(c))).toEqual([false, false, false]);
+  });
+
+  it('a call piped into another command is marked; a || after it is not a pipe', () => {
+    expect(pathsKillCommands('node "$PATHS" kill 2>/dev/null | cat >/dev/null || true\nnode "$PATHS" kill 2>/dev/null || true\nnode "$PATHS" kill 2>&1 | grep -q .')
+      .map((k) => k.piped)).toEqual([true, false, true]);
+  });
+
+  it('a call captured by $( … ) is marked — its output is a value, not a line on the terminal', () => {
+    expect(pathsKillCommands('x=$(node "$PATHS" kill 2>/dev/null)\ny=1; node "$PATHS" kill\nR="$(cd "$REPO" && node "$PATHS" kill || true)"\nOUT=$(node x) node "$PATHS" kill')
+      .map((k) => k.captured)).toEqual([true, false, true, false]);
   });
 });
 

@@ -21,6 +21,7 @@ import { describe, it, expect } from 'vitest';
 import os from 'os';
 import path from 'path';
 import { readScannedSource } from '@modoki/engine/testing';
+import { calleeName, enclosingNamedFunction, findNodes, flatText, lineOf, parseSource, statementOf, ts, unwrapValue, valueCarrier } from '@modoki/engine/testing/sourceAst';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
 
 const PROJECT = path.join(os.tmpdir(), 'relay-refusal-proj');
@@ -214,28 +215,57 @@ describe('#1013 — a relayed route classifies the op ANSWERING vs the RELAY fai
  *  json({ error }, 504);` would have been INVISIBLE to a guard whose whole job is to find it. The
  *  prose in this file discusses 504 constantly, so the strip is what makes the scan meaningful in
  *  both directions. */
+/** Every numeric literal `504` in one file's comment-stripped code, from the parse (#1179), and
+ *  whether it is THE sanctioned one: the `whenTrue` of `isRelayTransportFailure(msg) ? 504 : 400`
+ *  inside `relayFailureStatus` itself. The per-line form excused any 504 sharing that line of text
+ *  with the classifier, and a wrap of the ternary made the classifier look like an offender. A 504
+ *  inside a string is a message, not a status, and is not reported. */
+function literal504s(code: string, label: string): Array<{ line: number; text: string; sanctioned: boolean }> {
+  const sf = parseSource(code, label);
+  return findNodes(sf, (n): n is ts.NumericLiteral => ts.isNumericLiteral(n) && n.text === '504').map((lit) => {
+    const carrier = valueCarrier(lit);
+    const cond = carrier.parent;
+    const test = cond && ts.isConditionalExpression(cond) ? unwrapValue(cond.condition) : undefined;
+    const sanctioned = !!cond && ts.isConditionalExpression(cond) && cond.whenTrue === carrier
+      && !!test && ts.isCallExpression(test) && calleeName(test) === 'isRelayTransportFailure'
+      && ts.isNumericLiteral(unwrapValue(cond.whenFalse)) && (unwrapValue(cond.whenFalse) as ts.NumericLiteral).text === '400'
+      && enclosingNamedFunction(lit)?.name === 'relayFailureStatus';
+    return { line: lineOf(lit), text: flatText(statementOf(lit)).slice(0, 120), sanctioned };
+  });
+}
+
 describe('#1013 — no route may hard-code its catch status', () => {
+  const routerSrc = readScannedSource(
+    path.join(__dirname, '..', '..', 'plugins', 'backend', 'editorBackendRouter.ts'),
+  ).code;
+
   it('editorBackendRouter names 504 in exactly one place: relayFailureStatus', () => {
-    const src = readScannedSource(
-      path.join(__dirname, '..', '..', 'plugins', 'backend', 'editorBackendRouter.ts'),
-    ).code;
-    const hits = src.split('\n')
-      .map((line, i) => ({ line: line.trim(), n: i + 1 }))
-      .filter((l) => /\b504\b/.test(l.line))
-      // The one site that is allowed to name it — the classifier itself.
-      .filter((l) => !l.line.includes('isRelayTransportFailure(msg) ? 504 : 400'));
+    const all = literal504s(routerSrc, 'editorBackendRouter.ts');
+    const hits = all.filter((h) => !h.sanctioned);
     expect(hits, 'use relayJson (or relayFailureStatus, for a route that post-processes its reply) '
       + 'instead of naming 504 — see #1013. Offending lines: '
-      + hits.map((h) => `${h.n}: ${h.line}`).join(' | ')).toEqual([]);
+      + hits.map((h) => `${h.line}: ${h.text}`).join(' | ')).toEqual([]);
+    // …and the classifier is still there to be the one place — otherwise "no offenders" is vacuous.
+    expect(all.filter((h) => h.sanctioned)).toHaveLength(1);
   });
 
   it('the Electron host carries no literal 504 either — its relay fails through a 500', () => {
     // Pins the scope note above: if `main.ts` ever grows a hard-coded 504 the claim "a different
     // shape" stops being true and this guard needs widening rather than a footnote.
     const src = readScannedSource(path.join(__dirname, '..', '..', 'electron', 'main.ts')).code;
-    const hits = src.split('\n')
-      .map((line, i) => ({ line: line.trim(), n: i + 1 }))
-      .filter((l) => /\b504\b/.test(l.line));
-    expect(hits.map((h) => `${h.n}: ${h.line}`)).toEqual([]);
+    expect(literal504s(src, 'main.ts').map((h) => `${h.line}: ${h.text}`)).toEqual([]);
+  });
+
+  it('the detector sanctions only THE classifier literal — not a 504 beside it, and not a wrapped copy elsewhere (#1179)', () => {
+    const src = [
+      'function relayFailureStatus(msg: string): number {',
+      '  return isRelayTransportFailure(msg)',
+      '    ? 504',
+      '    : 400;',
+      '}',
+      'function relayFailureStatusTwin(msg: string) { return isRelayTransportFailure(msg) ? 504 : 400; }',
+      "function route() { const s = isRelayTransportFailure(m) ? 504 : 400; return json(\n  { error: '504 upstream' },\n  504,\n); }",
+    ].join('\n');
+    expect(literal504s(src, 'r.ts').map((h) => `${h.line}:${h.sanctioned}`)).toEqual(['3:true', '6:false', '7:false', '9:false']);
   });
 });

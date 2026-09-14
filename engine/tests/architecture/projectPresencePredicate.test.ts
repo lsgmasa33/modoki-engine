@@ -25,6 +25,7 @@ import { describe, it, expect } from 'vitest';
 import path from 'node:path';
 import { REPO_ROOT } from '../helpers/repoLayout';
 import { readScannedSource } from '@modoki/engine/testing';
+import { accessPath, calleeName, callsTo, findNodes, lineOf, parseSource, stringValueOf, ts, unwrapValue } from '@modoki/engine/testing/sourceAst';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
@@ -42,24 +43,24 @@ const TEST_DIRS = [
 
 /** ⚠️ **One bare-file `ALLOWED` Set used to serve BOTH rules in this file, and two of its three
  *  entries were never exemptions at all (#1123).** `repoLayout.ts` is the one legitimate
- *  implementation and this guard must SPELL OUT the shapes it forbids — its `what:` labels
- *  literally contain `discoverProjects(...).some(...)`, so it flags itself otherwise (it did, first
- *  run). Neither is a decision anybody should re-review, so neither is a ledger row: they are
- *  `SANCTIONED`, the split `clientJsonWriteSeam.test.ts` makes.
+ *  implementation — not a decision anybody should re-review, so not a ledger row: it is
+ *  `SANCTIONED`, the split `clientJsonWriteSeam.test.ts` makes. (This guard's OWN file was a second
+ *  sanctioned entry while the detectors were text regexes: its `what:` labels spell the forbidden
+ *  shapes, so it flagged itself. Since #1179 the shapes are found in the parse, a string literal is
+ *  not a call, and that entry went stale — removed.)
  *
  *  The third, `e2e/hostProject.ts`, is the real reasoned exemption — and it belonged to rule 2
- *  ONLY. Measured 2026-09-12 on work-ai2: it matches rule 1's `INLINE_PATTERNS` **zero** times, so its rule-1
+ *  ONLY. Measured 2026-09-12 on work-ai2: it matches rule 1's shapes **zero** times, so its rule-1
  *  pardon was inert and covered whatever inline check somebody added there later. One row, one rule.
  *
  *  Repo-relative POSIX literals — matched against `rel` (git's own repo-relative string), never
  *  against an independently `path.join`-built absolute path (#849). */
 const SANCTIONED: readonly string[] = [
   'engine/tests/helpers/repoLayout.ts',
-  'engine/tests/architecture/projectPresencePredicate.test.ts',
 ];
 
 /* ⚠️ **`sanctioned` is file-grained and carries no count, so this RECLASSIFIES rule 1's pardons
- *  rather than closing #1123 for them** — a new inline presence check added to either file is still
+ *  rather than closing #1123 for them** — a new inline presence check added to the sanctioned file is still
  *  green. Deliberate, and defensible only because a second guard covers it:
  *  `architecture/layoutConditionalTestLedger.test.ts` pins this file's conditional-gate list as
  *  empty, so a real `existsSync(path.join(REPO_ROOT, 'games'))` here would redden THERE. Do not copy
@@ -75,12 +76,33 @@ const E2E_EXEMPT = [
   },
 ] as const;
 
-/** Inline computations of project presence — the shapes that have actually appeared. */
-const INLINE_PATTERNS: { re: RegExp; what: string }[] = [
-  { re: /discoverProjects\s*\([^)]*\)\s*\.\s*length\s*[><=]/, what: 'discoverProjects(...).length comparison' },
-  { re: /discoverProjects\s*\([^)]*\)\s*\.\s*some\s*\(/, what: 'discoverProjects(...).some(...)' },
-  { re: /existsSync\s*\(\s*path\.join\s*\([^)]*['"]games['"]\s*\)\s*\)/, what: "existsSync(path.join(..., 'games'))" },
-];
+/**
+ * Inline computations of project presence in one file's comment-stripped code — the shapes that
+ * have actually appeared — found in the PARSE (#1179), so a formatter-wrapped
+ * `discoverProjects(root)\n  .length > 0` or `existsSync(\n  path.join(root, 'games'),\n)` is caught:
+ *  - a comparison with `discoverProjects(…).length` as an operand (`!==` included; the regex's
+ *    `[><=]` let `!== 0` through);
+ *  - `discoverProjects(…).some(…)`;
+ *  - `existsSync(path.join(…, 'games'))` — `'games'` as the LAST join segment.
+ */
+function inlinePresenceChecks(code: string, label: string): Array<{ line: number; what: string }> {
+  const sf = parseSource(code, label);
+  const isDiscover = (e: ts.Expression): boolean => { const u = unwrapValue(e); return ts.isCallExpression(u) && calleeName(u) === 'discoverProjects'; };
+  const COMPARE = new Set([ts.SyntaxKind.GreaterThanToken, ts.SyntaxKind.LessThanToken, ts.SyntaxKind.GreaterThanEqualsToken,
+    ts.SyntaxKind.LessThanEqualsToken, ts.SyntaxKind.EqualsEqualsToken, ts.SyntaxKind.EqualsEqualsEqualsToken,
+    ts.SyntaxKind.ExclamationEqualsToken, ts.SyntaxKind.ExclamationEqualsEqualsToken]);
+  const lengthCompares = findNodes(sf, (n): n is ts.BinaryExpression => ts.isBinaryExpression(n) && COMPARE.has(n.operatorToken.kind))
+    .filter((b) => [b.left, b.right].some((s) => { const u = unwrapValue(s); return ts.isPropertyAccessExpression(u) && u.name.text === 'length' && isDiscover(u.expression); }))
+    .map((n) => ({ line: lineOf(n), what: 'discoverProjects(...).length comparison' }));
+  const somes = callsTo(sf, 'some').filter((c) => ts.isPropertyAccessExpression(c.expression) && isDiscover(c.expression.expression))
+    .map((n) => ({ line: lineOf(n), what: 'discoverProjects(...).some(...)' }));
+  const gamesExists = callsTo(sf, 'existsSync').filter((c) => {
+    const joined = c.arguments[0] && unwrapValue(c.arguments[0]);
+    if (!joined || !ts.isCallExpression(joined) || !['path.join', 'join'].includes(accessPath(joined.expression) ?? '')) return false;
+    return stringValueOf(joined.arguments[joined.arguments.length - 1]) === 'games';
+  }).map((n) => ({ line: lineOf(n), what: "existsSync(path.join(..., 'games'))" }));
+  return [...lengthCompares, ...somes, ...gamesExists];
+}
 
 /** Every `.tsx?` test source file under `under`, via the shared corpus producer
  *  (#799/#771/#805 Phase 4). */
@@ -96,6 +118,22 @@ describe('project-presence is asked in exactly one place (#98)', () => {
   // Floored well under the 1259 measured today.
   const files = walkTests(TEST_DIRS, 900);
 
+  it('the detector sees each shape wrapped, and not in a string or a non-presence use (#1179)', () => {
+    const src = [
+      'if (discoverProjects(root)',
+      '  .length !== 0) run();',
+      'const any = discoverProjects(root).some((p) => p.kind === "game");',
+      'if (existsSync(',
+      "  path.join(REPO_ROOT, 'games'),",
+      ')) run();',
+      "const label = 'discoverProjects(...).some(...)'; const n = discoverProjects(root).map((p) => p.id);",
+      "if (existsSync(path.join(REPO_ROOT, 'games', 'court'))) run();",
+    ].join('\n');
+    expect(inlinePresenceChecks(src, 'x.test.ts').map((h) => `${h.line}:${h.what}`)).toEqual([
+      '1:discoverProjects(...).length comparison', '3:discoverProjects(...).some(...)', "4:existsSync(path.join(..., 'games'))",
+    ]);
+  });
+
   it('found test files to scan (sanity: the guard is not passing vacuously)', () => {
     // Without this, a moved test root turns the whole guard into a silent pass — the failure
     // mode that makes a guard worse than none.
@@ -107,27 +145,18 @@ describe('project-presence is asked in exactly one place (#98)', () => {
     // (`/^\s*(\/\/|\*|\/\*)/`), which is the shape `commentStripperIsShared.test.ts` exists to
     // remove: it misses a trailing `// …` and a block comment opened mid-line. The shared reader
     // matters more now that rows carry counts — a prose mention would inflate the number a row has
-    // to match. Measured both ways 2026-09-12: 5 occurrences either way, so no verdict moves. The
-    // `what:` labels are STRING literals, not comments, so this guard still matches itself and is
-    // still SANCTIONED.
-    const hits: Array<{ item: string; site: string }> = [];
-    for (const { rel, abs } of files) {
-      const code = readScannedSource(abs).code;
-      code.split('\n').forEach((line, i) => {
-        for (const { re, what } of INLINE_PATTERNS) {
-          if (re.test(line)) hits.push({ item: rel, site: `${rel}:${i + 1} — ${what}` });
-        }
-      });
-    }
+    // to match. Measured both ways 2026-09-12: 5 occurrences either way, so no verdict moves (3 since
+    // #1179 parses them — the other 2 were this file's own string labels).
+    const hits = files.flatMap(({ rel, abs }) => inlinePresenceChecks(readScannedSource(abs).code, rel)
+      .map((h) => ({ item: rel, site: `${rel}:${h.line} — ${h.what}` })));
     assertExemptionLedger({
-      label: 'INLINE_PATTERNS in projectPresencePredicate (rule 1)',
+      label: 'inline presence checks in projectPresencePredicate (rule 1)',
       population: hits,
       sanctioned: SANCTIONED,
-      // 5 measured 2026-09-12, ALL of them in the two sanctioned files — so a reasoned pardon here
-      // is zero, which is the point: nothing outside the implementation and this file's own prose
-      // asks the question inline. Floored under 5 so the sanctioned rows' staleness is what reports
-      // a removal, rather than this.
-      floor: 4,
+      // 3 measured 2026-09-14 (#1179), ALL in the sanctioned implementation — the regex's other 2
+      // were this file's own string labels. A reasoned pardon here is zero, which is the point.
+      // Floored under 3 so the sanctioned row's staleness is what reports a removal, rather than this.
+      floor: 2,
       fix: 'inline project-presence checks: use hasInternalGames() / hasAnyProject() from '
         + 'engine/tests/helpers/repoLayout.ts.',
     });
@@ -156,11 +185,10 @@ describe('e2e specs never discover projects themselves (#326 follow-up)', () => 
     let scanned = 0;
     for (const { rel, abs } of walkTests(E2E_DIR, 15)) {
       scanned++;
-      readScannedSource(abs).code.split('\n').forEach((line, i) => {
-        for (let n = (line.match(/\bdiscoverProjects\s*\(/g) ?? []).length; n > 0; n -= 1) {
-          calls.push({ item: rel, site: `${rel}:${i + 1}` });
-        }
-      });
+      // Every CALL, from the parse (#1179) — a wrapped `discoverProjects\n  (root)` is still one.
+      for (const c of callsTo(parseSource(readScannedSource(abs).code, rel), 'discoverProjects')) {
+        calls.push({ item: rel, site: `${rel}:${lineOf(c)}` });
+      }
     }
     // Non-vacuous: if the walk ever stops finding e2e files, the check below passes for free.
     expect(scanned).toBeGreaterThan(5);

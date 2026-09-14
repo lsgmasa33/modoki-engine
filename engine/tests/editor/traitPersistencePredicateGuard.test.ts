@@ -17,6 +17,8 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
+import { accessPath, findNodes, lineOf, parseSource, ts } from '@modoki/engine/testing/sourceAst';
 
 /** Resolved from __dirname, not a file:// URL — the Windows CI leg runs these too. */
 const SRC = join(__dirname, '..', '..', 'packages', 'modoki', 'src');
@@ -30,23 +32,28 @@ const GUARDED = [
   join(SRC, 'runtime', 'scene', 'SceneManager.ts'),
 ];
 
-/** `x in meta.fields` / `!(x in meta.fields)` — the membership test, in any spacing.
- *  Property READS (`meta.fields[x]`) are intentionally not matched. */
-const MEMBERSHIP = /\bin\s+meta\.fields\b/;
+/** Every `x in <…>meta.fields` membership test in one file's comment-stripped code, from the parse —
+ *  `!(x in meta.fields)`, `key in\n  meta.fields`, `k in this.meta.fields` alike. Property READS
+ *  (`meta.fields[x]`) are intentionally not matched: they are not an `in`.
+ *
+ *  ⚠️ **#1179:** the per-line regex missed a wrapped `key in\n  meta.fields`, and its comment filter
+ *  dropped any CODE line that begins with `*` (a continued multiplication, a generator). Comments are
+ *  now blanked by the shared scanner, so these files may still EXPLAIN the trap at length. Measured on
+ *  migrating: 0 in each of the four files, before and after. */
+function membershipTests(code: string, label: string): string[] {
+  const sf = parseSource(code, label);
+  return findNodes(sf, (n): n is ts.BinaryExpression => ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.InKeyword
+    && /(^|\.)meta\.fields$/.test(accessPath(n.right) ?? ''))
+    .map((b) => `${lineOf(b)}: ${b.getText(sf).replace(/\s+/g, ' ')}`);
+}
 
 describe('meta.fields is never used as a persistence predicate', () => {
   for (const file of GUARDED) {
     it(`${file.split('/').slice(-2).join('/')} uses isPersistentTraitField, not \`in meta.fields\``, () => {
-      const lines = readFileSync(file, 'utf8').split('\n');
-      const offenders = lines
-        .map((text, i) => ({ text, line: i + 1 }))
-        // Skip comments — these files EXPLAIN the trap at length, and the
-        // explanation must not trip the guard that enforces it.
-        .filter(({ text }) => !/^\s*(\/\/|\*|\/\*)/.test(text))
-        .filter(({ text }) => MEMBERSHIP.test(text));
+      const offenders = membershipTests(readScannedSource(file).code, file);
 
       expect(
-        offenders.map((o) => `${o.line}: ${o.text.trim()}`),
+        offenders,
         'Use isPersistentTraitField(meta, field) from runtime/core/ecs/traitSchema.ts — '
         + 'meta.fields is the Inspector list and OMITS persistent fields owned by a custom section.',
       ).toEqual([]);
@@ -56,9 +63,15 @@ describe('meta.fields is never used as a persistence predicate', () => {
   it('the guard actually matches the pattern it claims to (self-check)', () => {
     // Without this, a broken regex would make every case above vacuously pass —
     // the "a test can pass on a state the code never produces" failure mode.
-    expect(MEMBERSHIP.test('if (!(fieldName in meta.fields)) continue;')).toBe(true);
-    expect(MEMBERSHIP.test('const allowed = field in meta.fields;')).toBe(true);
-    expect(MEMBERSHIP.test('if (meta.fields[key]?.runtimeOnly) continue;')).toBe(false);
+    const count = (src: string) => membershipTests(src, 'row.ts').length;
+    expect(count('for (;;) { if (!(fieldName in meta.fields)) continue; }')).toBe(1);
+    expect(count('const allowed = field in meta.fields;')).toBe(1);
+    expect(count('for (;;) { if (meta.fields[key]?.runtimeOnly) continue; }')).toBe(0);
+    // #1179: wrapped, on a receiver, two on one line, and a code line that starts with `*`.
+    expect(count('const a = key in\n  meta.fields;')).toBe(1);
+    expect(count('const b = k in this.meta.fields || j in trait.meta.fields;')).toBe(2);
+    expect(count('const c = 2\n  * (k in meta.fields ? 1 : 0);')).toBe(1);
+    expect(count("const d = 'fields' in meta; const e = k in metaFields;")).toBe(0);
   });
 
   it('every guarded file exists (a renamed file must not silently drop its guard)', () => {

@@ -37,9 +37,11 @@
  *  edit above them. Where a detector CAN distinguish occurrences, name them — see
  *  `docs/verify-and-ci.md` § "Exemption GRAIN". */
 import { describe, it, expect } from 'vitest';
-import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { stripComments, readScannedSource } from '@modoki/engine/testing';
+import {
+  calleeName, callsTo, declarationOf, findNodes, flatText, lineOf, parseSource, ts, unwrapValue,
+} from '@modoki/engine/testing/sourceAst';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
@@ -71,24 +73,49 @@ function runtimeSources() {
   return repoFiles({ under: runtimeDir, match: /\.tsx?$/, floor: 400 });
 }
 
+/** Every `.json()` call in one file, one entry per CALL, keyed by the file for the ledger.
+ *
+ *  ⚠️ **A call is a node (#1179)**: a call a formatter wrapped (`res\n  .json()`) and an optional call are
+ *  counted, and a `.json()` spelt inside a string is not — it calls nothing. (The embedded-manifest call
+ *  used to be keyed separately, attributed by the function it ran in; #1132 moved that read to
+ *  `parseAssetJson`, so no second reason is left to keep apart.) */
+function jsonCallsIn(code: string, rel: string): Array<{ item: string; site: string }> {
+  // Parse only a file that can hold one — the population is ~540 files and the gate runs under load.
+  // No stricter than the node below: `res.json?.()` and `res.json<T>()` are calls too.
+  if (!/\.\s*json\b/.test(code)) return [];
+  return findNodes(parseSource(code, rel), (n): n is ts.CallExpression => ts.isCallExpression(n) && n.arguments.length === 0
+    && ts.isPropertyAccessExpression(n.expression) && n.expression.name.text === 'json')
+    .map((c) => ({
+      item: rel,
+      site: `${rel}:${lineOf(c)}  ${flatText(c)}`,
+    }));
+}
+
+describe('the .json() reader attributes each call to the function it is in (#1179)', () => {
+  const items = (src: string) => jsonCallsIn(stripComments(src), 'ota/otaClient.ts').map((c) => c.item);
+
+  it('a .json(x) that takes an argument is not a Response parse', () => {
+    expect(items('reply.json(payload);')).toEqual([]);
+  });
+
+  it('counts a call the formatter wrapped, and an optional call', () => {
+    expect(items('async function f(res) {\n  return res\n    .json();\n}\nconst g = (r) => r?.json();')).toEqual(['ota/otaClient.ts', 'ota/otaClient.ts']);
+    // The prefilter must not skip a file whose only call is an optional CALL.
+    expect(items('export const h = (r) => r.json?.();')).toEqual(['ota/otaClient.ts']);
+  });
+
+  it('a call inside a callback is counted; one spelt in a string calls nothing', () => {
+    expect(items("async function f() {\n  return fetch(u).then((r) => r.json());\n}\nconst doc = 'call res.json() here';"))
+      .toEqual(['ota/otaClient.ts']);
+  });
+});
+
 describe('asset JSON is parsed through parseAssetJson, not res.json()', () => {
   /** Every `.json()` call in runtime/**, one entry per CALL. No file is skipped — that skip was the
    *  defect; the ledger decides what is pardoned. */
   function jsonCalls(): Array<{ item: string; site: string }> {
-    const out: Array<{ item: string; site: string }> = [];
-    for (const { abs } of runtimeSources()) {
-      const rel = path.relative(runtimeDir, abs).replace(/\\/g, '/');
-      const raw = fs.readFileSync(abs, 'utf8');
-      const code = stripComments(raw);
-      assertScanIsSane(raw, code, rel);
-      const lines = code.split('\n');
-      lines.forEach((line, i) => {
-        for (let n = (line.match(/\.json\s*\(\s*\)/g) ?? []).length; n > 0; n -= 1) {
-          out.push({ item: rel, site: `${rel}:${i + 1}  ${line.trim()}` });
-        }
-      });
-    }
-    return out;
+    return runtimeSources().flatMap(({ abs }) =>
+      jsonCallsIn(readScannedSource(abs).code, path.relative(runtimeDir, abs).replace(/\\/g, '/')));
   }
 
   it('has no unguarded .json() call anywhere in runtime/**', () => {
@@ -120,46 +147,82 @@ describe('asset JSON is parsed through parseAssetJson, not res.json()', () => {
   });
 });
 
+/** Every `fetch(…)` in a file whose URL is an `assetUrl(…)` call — inline, `x.assetUrl(…)`, or a `const`
+ *  bound to one — with whether ITS OWN later arguments carry `ASSET_FETCH_INIT` or `….fetchInit`.
+ *
+ *  Read from the call node (#1179). It was a regex for `fetch(assetUrl(` plus a paren-depth scan of the
+ *  argument text, which a `)` inside a string ended early, and whose init check matched the name
+ *  anywhere in that text — inside `assetUrl`'s own arguments included. NOT seen, before or now: a URL in
+ *  a `let` (it may be reassigned), or built by a helper that returns `assetUrl(…)`. */
+export function assetUrlFetchesIn(code: string, rel: string): Array<{ site: string; carriesInit: boolean }> {
+  const sf = parseSource(code, rel);
+  const isAssetUrlCall = (e: ts.Expression): boolean => {
+    const u = unwrapValue(e);
+    if (ts.isCallExpression(u)) return calleeName(u) === 'assetUrl';
+    if (!ts.isIdentifier(u)) return false;
+    const decl = declarationOf(u);
+    return !!decl && ts.isVariableDeclaration(decl) && (decl.parent.flags & ts.NodeFlags.Const) !== 0
+      && !!decl.initializer && ts.isCallExpression(unwrapValue(decl.initializer)) && calleeName(unwrapValue(decl.initializer) as ts.CallExpression) === 'assetUrl';
+  };
+  return callsTo(sf, 'fetch').filter((c) => c.arguments[0] && isAssetUrlCall(c.arguments[0])).map((c) => ({
+    site: `${rel}:${lineOf(c)}`,
+    // `ASSET_FETCH_INIT` bare or through a namespace (`loaders.ASSET_FETCH_INIT`), or a provider's `….fetchInit`.
+    carriesInit: c.arguments.slice(1).some((arg) => findNodes(arg, (n): n is ts.Identifier =>
+      ts.isIdentifier(n) && (n.text === 'ASSET_FETCH_INIT' || (n.text === 'fetchInit' && ts.isPropertyAccessExpression(n.parent) && n.parent.name === n))).length > 0),
+  }));
+}
+
 /** The second half of the same fetch contract: the CACHE POLICY. `ASSET_FETCH_INIT` is `no-store` in
  *  dev (assetFetch.ts says when a stale 304 is possible) and `{}` in a build. Three of the five
  *  sibling def caches — spriteAnim, rig2d, animSet — fetched bare while animationClip and particle
  *  passed it (#1165); nothing but reading them side by side could tell. */
 describe('asset fetches through assetUrl() carry ASSET_FETCH_INIT', () => {
-  /** Every `fetch(assetUrl(…), …)` call in runtime/**, with the text of its argument list. NOT seen:
-   *  a URL built first and fetched by name (`const u = assetUrl(p); fetch(u)`) — none exists today. The
-   *  argument list is found by paren depth, not a line regex, so a call wrapped across lines is
-   *  still read whole. (`stripComments` blanks comments; string contents are irrelevant here — an
-   *  unbalanced paren inside a string literal in a fetch's arguments would mis-scan, and none exists.) */
-  function assetUrlFetches(): Array<{ site: string; args: string }> {
-    const out: Array<{ site: string; args: string }> = [];
-    for (const { abs } of runtimeSources()) {
-      const rel = path.relative(runtimeDir, abs).replace(/\\/g, '/');
-      const raw = fs.readFileSync(abs, 'utf8');
-      const code = stripComments(raw);
-      assertScanIsSane(raw, code, rel);
-      // `plumbing.assetUrl(` too — the provider-injected twin (`pixiShaderBuilder.ts`), whose init
-      // arrives as `plumbing.fetchInit` (registerProviders.ts binds it to ASSET_FETCH_INIT).
-      for (const m of code.matchAll(/\bfetch\s*\(\s*(?:[\w$]+\.)?assetUrl\s*\(/g)) {
-        const open = code.indexOf('(', m.index);
-        let depth = 0;
-        let end = open;
-        for (; end < code.length; end += 1) {
-          if (code[end] === '(') depth += 1;
-          else if (code[end] === ')' && (depth -= 1) === 0) break;
-        }
-        const line = code.slice(0, m.index).split('\n').length;
-        out.push({ site: `${rel}:${line}`, args: code.slice(open + 1, end) });
-      }
-    }
-    return out;
+  function assetUrlFetches(): Array<{ site: string; carriesInit: boolean }> {
+    return runtimeSources().flatMap(({ abs }) => {
+      const { code } = readScannedSource(abs);
+      return code.includes('assetUrl') ? assetUrlFetchesIn(code, path.relative(runtimeDir, abs).replace(/\\/g, '/')) : [];
+    });
   }
+
+  it('assetUrlFetchesIn reads each fetch\'s own URL and init arguments (#1179)', () => {
+    const scan = (code: string) => assetUrlFetchesIn(code, 'fixture.ts').map((f) => `${f.site} ${f.carriesInit}`);
+    expect(scan(`async function load(p: string, signal: AbortSignal) {
+      await fetch(
+        assetUrl(p),
+        { signal, ...ASSET_FETCH_INIT },
+      );
+      await fetch(plumbing.assetUrl(p), plumbing.fetchInit);
+      await fetch(assetUrl(p), { fetchInit, cache: loaders.ASSET_FETCH_INIT.cache });
+      await fetch(assetUrl(p, '(', ASSET_FETCH_INIT));
+      await fetch(assetUrl(\`\${p})\`));
+      const url = assetUrl(p);
+      await fetch(url, ASSET_FETCH_INIT);
+      await window.fetch(url);
+      await fetch(other(p), ASSET_FETCH_INIT);
+      await fetch('assetUrl(x)');
+      let later = assetUrl(p);
+      later = other(p);
+      await fetch(later);
+    }`)).toEqual([
+      'fixture.ts:2 true',
+      'fixture.ts:6 true',
+      'fixture.ts:7 true',
+      // The init INSIDE assetUrl's own arguments is not the fetch's init — the text scan passed it.
+      'fixture.ts:8 false',
+      // A `)` inside a template literal ended the paren count early.
+      'fixture.ts:9 false',
+      // A URL bound first and fetched by name — not seen before.
+      'fixture.ts:11 true',
+      'fixture.ts:12 false',
+    ]);
+  });
 
   it('has no fetch(assetUrl(…)) without the dev no-store init', () => {
     const calls = assetUrlFetches();
     // 16 measured 2026-09-13 on work-ai2. Floored well under it: only a detector that stopped
     // matching can reach this, and that is what would turn the rule below vacuously green.
     expect(calls.length, 'the fetch(assetUrl(…)) detector matched almost nothing — it is broken').toBeGreaterThan(8);
-    const bare = calls.filter((c) => !/\bASSET_FETCH_INIT\b|\.fetchInit\b/.test(c.args)).map((c) => c.site);
+    const bare = calls.filter((c) => !c.carriesInit).map((c) => c.site);
     expect(bare, 'Pass ASSET_FETCH_INIT from runtime/loaders/assetFetch.ts:\n'
       + '  fetch(assetUrl(path), ASSET_FETCH_INIT)  or  { signal, ...ASSET_FETCH_INIT }\n'
       + 'Without it the dev editor can be served a cached copy of the asset (see assetFetch.ts).').toEqual([]);

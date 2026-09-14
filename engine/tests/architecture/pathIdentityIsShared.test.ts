@@ -51,12 +51,22 @@
  *  Per #812, a raw text scan can be satisfied OR hidden by a comment — and this very file's
  *  docblock quotes the banned pattern in order to describe it. `stripComments` is load-bearing,
  *  and `assertScanIsSane` pins that the stripping itself did not go vacuous.
+ *
+ *  ## Why every scan below reads the PARSE, not lines (#1179)
+ *
+ *  All five scans were per-line regexes, so a formatter-wrapped `x ===\n  path.resolve(y)` or
+ *  `new URL(\n  import.meta.url,\n).pathname` escaped, and the entry-point exemption was "`import.meta.url`
+ *  ANYWHERE on the line" — so an unrelated comparison sharing a line with one was waved through. Each
+ *  detector now decides inside the occurrence's own node (the comparison, the `new URL`, the template),
+ *  and the exemptions look inside that node too. Measured on migrating: identical populations (0, 0, 0,
+ *  0, 0 over 246 files) — these scans guard a clean tree, so the fixture tables are what carry them.
  */
 
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { stripComments, assertScanIsSane, readScannedSource } from '@modoki/engine/testing';
+import { accessPath, boundIdentifier, calleeName, findNodes, lineOf, parseSource, readsOf, stringValueOf, ts, unwrapValue, valueCarrier } from '@modoki/engine/testing/sourceAst';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const repoRoot = path.resolve(__dirname, '..', '..', '..');
@@ -102,7 +112,66 @@ function sourceFiles(dir: string): string[] {
   }).map(({ rel }: { rel: string }) => rel);
 }
 
+/** One occurrence a scan reports: its line and its whitespace-collapsed source. */
+type Hit = { line: number; text: string };
+const hitOf = (sf: ts.SourceFile, n: ts.Node): Hit => ({ line: lineOf(n), text: n.getText(sf).replace(/\s+/g, ' ') });
+const isIdentityCompare = (n: ts.Node): n is ts.BinaryExpression => ts.isBinaryExpression(n)
+  && (n.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken || n.operatorToken.kind === ts.SyntaxKind.ExclamationEqualsEqualsToken);
+/** Does `root` READ one of `paths` (`import.meta.url`, `process.argv[1]`) anywhere inside it?
+ *  ⚠️ At any depth inside the comparison — so `path.resolve(a) === (load(import.meta.url), b)` is
+ *  exempt. The per-line form was at least as loose (any mention on the LINE); a tighter rule needs the
+ *  shape of the other operand, which the canonicalPath scan's exemption docblock explains. */
+const mentions = (root: ts.Node, ...paths: string[]): boolean =>
+  findNodes(root, (n): n is ts.Expression => (ts.isPropertyAccessExpression(n) || ts.isElementAccessExpression(n)) && paths.includes(accessPath(n) ?? '')).length > 0;
+
+/** String methods that return the SAME path, re-spelt — `.toLowerCase()` is `pathCaseKey` inline. */
+const RESPELLING_METHODS = new Set(['toLowerCase', 'toUpperCase', 'toLocaleLowerCase', 'toLocaleUpperCase', 'replace', 'replaceAll', 'normalize', 'trim', 'trimEnd', 'trimStart', 'toString']);
+/** One-argument wrappers that return the same path, re-spelt. */
+/** One-argument wrappers that return the same path, re-spelt: `pathCaseKey(x)` on any receiver
+ *  (`pi.pathCaseKey`), and `normalize(x)` on a PATH module however it is named (`path`, `nodePath`,
+ *  `upath`, `path.posix`). A string's own `.normalize('NFC')` is a METHOD, handled below. */
+const isRespellingWrapper = (call: ts.CallExpression): boolean => {
+  if (call.arguments.length !== 1) return false;
+  const name = calleeName(call);
+  if (name === 'pathCaseKey') return true;
+  if (name !== 'normalize') return false;
+  if (ts.isIdentifier(call.expression)) return true; // `import { normalize } from 'node:path'`
+  const receiver = ts.isPropertyAccessExpression(call.expression) ? accessPath(call.expression.expression) : undefined;
+  return receiver !== undefined && /(^|\.)(\w*path|posix|win32)$/i.test(receiver);
+};
+/**
+ * The value a comparison operand really compares, with RE-SPELLINGS peeled off: `path.normalize(
+ * path.resolve(a)).toLowerCase()` compares `path.resolve(a)`. ⚠️ Found by the #1179 P2 review: the
+ * first parse required the operand to BE the call, which quietly dropped every wrapped form the regex
+ * had flagged — `.toLowerCase()`, `.replace(/\\/g, '/')`, `path.normalize(…)` — and `.toLowerCase()`
+ * is the "case-folding hand-roll" family this file's header is about. A DERIVING call
+ * (`path.relative`, `path.dirname`, `path.basename`) is NOT peeled: its result is a different
+ * question. A project-local re-spelling helper (`trimSep(path.resolve(a))`) is not known here — an
+ * accepted gap, pinned by a row. ⚠️ `.replace` is peeled whatever its arguments, so a PREFIX STRIP
+ * (`path.resolve(child).replace(root + path.sep, '') === 'x.ts'`, a containment question) is flagged —
+ * an over-report in the loud direction, 0 such lines in the scanned roots; telling the two apart would
+ * mean reading `.replace`'s arguments.
+ */
+function comparedValue(e: ts.Expression): ts.Expression {
+  let u = unwrapValue(e);
+  for (;;) {
+    // Wrappers first: `path.normalize(x)` is a wrapper, not a `.normalize()` string method on `path`.
+    if (ts.isCallExpression(u) && isRespellingWrapper(u)) {
+      u = unwrapValue(u.arguments[0]!);
+    } else if (ts.isCallExpression(u) && ts.isPropertyAccessExpression(u.expression) && RESPELLING_METHODS.has(u.expression.name.text)) {
+      u = unwrapValue(u.expression.expression);
+    } else {
+      return u;
+    }
+  }
+}
+
 /** `resolve(…)` on either side of a `===`/`!==`.
+ *
+ *  ⚠️ **Now a parse, not a regex (#1179): an operand must BE `path.resolve(…)` or a bare
+ *  `resolve(…)`, once re-spellings are peeled (`comparedValue`)** — wrapped across lines or not — and
+ *  the entry-point exemption applies only when `import.meta.url` / `process.argv[1]` is read INSIDE
+ *  that comparison. The escapes the old regex had, kept below because the table still pins each one:
  *
  *  ⚠️ Three escapes the first version had, all found by the close-out review and all reachable
  *  by ordinary house style — the point of a guard is that it cannot be sidestepped by accident:
@@ -117,7 +186,7 @@ function sourceFiles(dir: string): string[] {
  *    - **`(?:^|[^.\w])`** — so a member call like `foo.resolve(x)` (a Promise helper, a DI
  *      container) is not swept in.
  *  ⚠️ **What it does NOT catch, stated plainly because an earlier docstring overclaimed it as
- *  un-sidesteppable.** The regex needs `resolve(` ADJACENT to the operator, so the commonest
+ *  un-sidesteppable.** The compared value must itself be the `resolve(…)` call, so the commonest
  *  house form — assign first, compare later — escapes it entirely:
  *
  *      const root = path.resolve(x);   // …later…   if (root !== state.root) …
@@ -129,11 +198,21 @@ function sourceFiles(dir: string): string[] {
  *  needs dataflow, not a line regex — so this guard is a **floor**, and #881 carries the question
  *  of whether it should also ban bare `fs.realpathSync` in these roots.
  *
- *  Also per-LINE, so a comparison split across two lines escapes. Same accepted limit. */
-const BANNED = /(?:^|[^.\w])(?:path\.)?resolve\s*\([^;]*\)\s*[!=]==|[!=]==\s*(?:path\.)?resolve\s*\(/;
+ *  It USED to be per-LINE too, so a comparison split across two lines escaped; since #1179 it is not. */
+function resolveCompares(code: string, label: string): Hit[] {
+  const sf = parseSource(code, label);
+  const isResolve = (e: ts.Expression): boolean => {
+    const u = comparedValue(e);
+    return ts.isCallExpression(u) && ['resolve', 'path.resolve'].includes(accessPath(u.expression) ?? '');
+  };
+  return findNodes(sf, isIdentityCompare)
+    .filter((b) => (isResolve(b.left) || isResolve(b.right)) && !mentions(b, ...ENTRYPOINT_IDIOM))
+    .map((b) => hitOf(sf, b));
+}
 
-/** The "was this module run directly?" idiom — a different question, exempt by shape. */
-const ENTRYPOINT_IDIOM = /import\.meta\.url|process\.argv\[1\]/;
+/** The "was this module run directly?" idiom — a different question, exempt by shape: a comparison
+ *  that itself reads one of these. */
+const ENTRYPOINT_IDIOM = ['import.meta.url', 'process.argv[1]'];
 
 /** A bare `fs.realpathSync(...)` — the JS lstat-walk — anywhere in these roots (#881).
  *
@@ -144,27 +223,68 @@ const ENTRYPOINT_IDIOM = /import\.meta\.url|process\.argv\[1\]/;
  *  Windows — measured in docs/windows.md § Paths, where `realpathSync('e:\Projects\modoki')`
  *  comes back unchanged and `.native` returns `E:\Projects\modoki`.
  *
- *  ⚠️ **`.native` is NOT banned, only the bare walk.** `\brealpathSync\s*\(` requires the paren
- *  to follow immediately, so `fs.realpathSync.native(x)` does not match — a `.` sits where the
- *  `(` would have to be. That is deliberate rather than incidental: `.native` throws on a path
- *  that does not exist, which is occasionally exactly what a caller wants, and `canonicalPath`
- *  is built out of it. The regex-table below pins both directions so a later "simplification"
- *  cannot quietly widen this to the shape that would ban the SSOT's own body.
+ *  ⚠️ **`.native` is NOT banned, only the bare walk.** A READ of `realpathSync` whose very next
+ *  link is `.native` is not the walk. That is deliberate rather than incidental: `.native` throws on
+ *  a path that does not exist, which is occasionally exactly what a caller wants, and `canonicalPath`
+ *  is built out of it. The table below pins both directions so a later "simplification" cannot
+ *  quietly widen this to the shape that would ban the SSOT's own body.
  *
- *  The word boundary also lets `import { realpathSync } from 'node:fs'` through at the IMPORT
- *  (no paren follows) while still catching the call — the same destructured-import escape the
- *  `resolve` regex above had to be widened for.
+ *  The IMPORT `import { realpathSync } from 'node:fs'` is a name, not a read, so it passes while the
+ *  call is caught — the same destructured-import escape the `resolve` scan above had to handle. A
+ *  RENAMED import (`import { realpathSync as rp }`) is followed by symbol to `rp`'s reads.
  *
- *  ⚠️ **This is a SOURCE-TEXT guard, so an ALIAS defeats it — measured, not reasoned (#893).**
- *  `const rp = fs.realpathSync; return rp(resolved);` is the banned walk with identical behaviour
- *  and no literal match, and this guard goes green on it. That is the same class as the async twin
- *  conceded in the table below ("an accepted gap, not an endorsement"), reached by a second route.
- *  Deliberately NOT widened: the shapes are unbounded, and a regex chasing them starts failing the
- *  honest spellings. The OUTCOME is covered instead, spelling-independently, by
- *  `pathIdentity.test.ts` → *"win32: an 8.3 SHORT path is the same directory"*, which asserts the
- *  ANSWER and fails on the aliased mutation this one misses. **Two complementary guards: this bans
- *  a spelling, that pins the result — do not delete either as redundant.** */
-const BANNED_REALPATH = /\brealpathSync\s*\(/;
+ *  ⚠️ **Every READ counts, not just a call (#1179), so the ALIAS no longer defeats it.** Until then
+ *  `const rp = fs.realpathSync; return rp(resolved);` — the banned walk with identical behaviour —
+ *  went green, measured (#893). The `const rp = fs.realpathSync` read is now the offender;
+ *  `const f = fs; f.realpathSync(x)` and `const { realpathSync: r } = fs` are caught too. A read in a
+ *  TYPE position (`typeof fs.realpathSync`) is not a walk. None of that is a promise of completeness,
+ *  so the OUTCOME guard stays: `pathIdentity.test.ts` → *"win32: an 8.3 SHORT path is the same
+ *  directory"* asserts the ANSWER.
+ *  **Two complementary guards: this bans a spelling, that pins the result — do not delete either.** */
+function realpathWalks(code: string, label: string): Hit[] {
+  const sf = parseSource(code, label);
+  /** The read takes `.native` next — `x.native`, `x['native']`, `(x).native`, `const { native } = x`. */
+  const takesNative = (read: ts.Expression): boolean => {
+    const carrier = valueCarrier(read);
+    const up = carrier.parent;
+    if (!up) return false;
+    if (ts.isPropertyAccessExpression(up) && up.expression === carrier) return up.name.text === 'native';
+    if (ts.isElementAccessExpression(up) && up.expression === carrier) return stringValueOf(up.argumentExpression) === 'native';
+    return ts.isVariableDeclaration(up) && up.initializer === carrier && ts.isObjectBindingPattern(up.name)
+      && up.name.elements.every((el) => ((el.propertyName ?? el.name) as ts.Identifier).text === 'native');
+  };
+  const inTypePosition = (n: ts.Node): boolean => {
+    for (let cur = n.parent; cur && !ts.isBlock(cur) && !ts.isSourceFile(cur); cur = cur.parent) {
+      // ⚠️ `ExpressionWithTypeArguments` is a TypeNode that RUNS: `fs.realpathSync<string>` and a class's
+      // `extends mixin(fs.realpathSync)` evaluate their operand — only `implements X` and an interface's
+      // `extends X` are pure types (the trap `sourceAst`'s `isNamePosition` documents).
+      if (ts.isExpressionWithTypeArguments(cur)) {
+        const h = cur.parent;
+        if (ts.isHeritageClause(h) && (h.token === ts.SyntaxKind.ImplementsKeyword || ts.isInterfaceDeclaration(h.parent))) return true;
+        continue;
+      }
+      if (ts.isTypeNode(cur)) return true;
+    }
+    return false;
+  };
+  const direct = findNodes(sf, (n): n is ts.Identifier => ts.isIdentifier(n) && n.text === 'realpathSync')
+    .flatMap((id): ts.Expression[] => {
+      const p = id.parent;
+      if (ts.isImportSpecifier(p) || ts.isExportSpecifier(p)) return []; // a name, not a read
+      // A destructure `const { realpathSync } = fs` READS `fs.realpathSync`: count its binding element.
+      if (ts.isBindingElement(p)) return [id];
+      // Any other declaration or object-literal key named `realpathSync` is a name.
+      if (!ts.isPropertyAccessExpression(p) && (p as ts.Node & { name?: ts.Node }).name === id) return [];
+      return [ts.isPropertyAccessExpression(p) && p.name === id ? p : id]; // `fs.realpathSync` is one read
+    });
+  const renamed = findNodes(sf, (n): n is ts.ImportSpecifier => ts.isImportSpecifier(n)
+    && n.propertyName !== undefined && n.propertyName.text === 'realpathSync' && n.name.text !== 'realpathSync')
+    .flatMap((spec) => readsOf(spec.name));
+  return [...direct, ...renamed]
+    .filter((read) => !inTypePosition(read) && (ts.isBindingElement(read.parent) || !takesNative(read)))
+    .sort((a, b) => a.getStart(sf) - b.getStart(sf))
+    .map((read) => hitOf(sf, read));
+}
 
 /** ⚠️ `new URL(import.meta.url).pathname` — a module deriving its OWN directory the one way that
  *  does not survive leaving a Mac. `URL.pathname` is the URL's path COMPONENT: still percent-encoded
@@ -184,19 +304,29 @@ const BANNED_REALPATH = /\brealpathSync\s*\(/;
  *  route is reading an HTTP path, which is exactly what `.pathname` is for. The tie to
  *  `import.meta.url` is what makes it a filesystem-path bug.
  *
- *  ⚠️ `[^;)]*` before `import.meta.url`, NOT an anchored `\(\s*`. This repo's house style for a
+ *  ⚠️ ANY argument may be `import.meta.url`, not only the first. This repo's house style for a
  *  module's own directory is `fileURLToPath(new URL('.', import.meta.url))` — four scripts write it
  *  that way (`typecheck-projects.mjs`, `migrate-legacy-scenes.mjs`, `editorPorts.mjs`,
  *  `install-git-hooks.mjs`). Dropping the `fileURLToPath` wrapper off any of them is a ONE-TOKEN
  *  edit that reproduces #904/#910 exactly, and the anchored form this guard shipped with could not
  *  see it — so the guard missed the spelling it was most likely to be needed for.
  *
- *  ⚠️ **FLOOR, stated plainly** (house standard in this file): per-LINE, so a `new URL(` split
- *  across lines before `.pathname` escapes, as does binding the URL to a variable first
- *  (`const u = new URL(import.meta.url); u.pathname`). Both were measured as escaping. Widening to
- *  catch them means tracking values across lines, which a line regex cannot do; this guard is a
- *  tripwire for the idiom as it is actually written, not a proof. */
-const BANNED_URL_PATHNAME = /new\s+URL\s*\([^;)]*import\.meta\.url\s*\)\s*\.pathname/;
+ *  ⚠️ **The two escapes the regex conceded are closed (#1179):** a `new URL(` wrapped across lines
+ *  before `.pathname`, and the URL bound first (`const u = new URL(import.meta.url); u.pathname`,
+ *  followed by symbol to `u`'s own reads). Still a tripwire, not a proof: a URL passed through a
+ *  function or stored on an object is dataflow this does not follow. */
+function urlPathnames(code: string, label: string): Hit[] {
+  const sf = parseSource(code, label);
+  const isModuleUrl = (e: ts.Expression): boolean => {
+    const u = unwrapValue(e);
+    return ts.isNewExpression(u) && accessPath(u.expression) === 'URL' && (u.arguments ?? []).some((a) => accessPath(a) === 'import.meta.url');
+  };
+  const boundReads = new Set(findNodes(sf, (n): n is ts.NewExpression => ts.isNewExpression(n) && isModuleUrl(n))
+    .flatMap((n) => { const id = boundIdentifier(n); return id ? readsOf(id) : []; }));
+  return findNodes(sf, (n): n is ts.PropertyAccessExpression => ts.isPropertyAccessExpression(n) && n.name.text === 'pathname')
+    .filter((p) => isModuleUrl(p.expression) || boundReads.has(unwrapValue(p.expression) as ts.Identifier))
+    .map((p) => hitOf(sf, p));
+}
 
 /** `canonicalPath(...)` on either side of a `===`/`!==` (#892).
  *
@@ -215,16 +345,17 @@ const BANNED_URL_PATHNAME = /new\s+URL\s*\([^;)]*import\.meta\.url\s*\)\s*\.path
  *  finding nothing is the case where a silently-broken pattern is indistinguishable from a clean
  *  repo. The `it.each` table below and the non-vacuity assertion are what carry it instead.
  *
- *  ⚠️ **`ARG` allows ONE level of nested parens, and dropping it reintroduces a blind spot this
- *  file already has a scar for.** A first cut used a flat `[^;()]*` to keep the false positives
- *  below out, and went blind to every argument that is not a bare identifier — including the
- *  literal house spelling in `deviceClaimsStore.mjs`'s `foreignClaimFor` and `ownAdbClaim`:
+ *  ⚠️ **Any argument, at any nesting depth, since #1179 made this a parse.** The regex it replaced
+ *  needed an `ARG` sub-pattern allowing ONE level of nested parens, and the history of that is worth
+ *  keeping: a first cut used a flat `[^;()]*` to keep the false positives below out, and went blind
+ *  to every argument that is not a bare identifier — including the literal house spelling in
+ *  `deviceClaimsStore.mjs`'s `foreignClaimFor` and `ownAdbClaim`:
  *
  *      canonicalClonePath(opts.clone ?? process.cwd()) === held.clone   // MISSED
  *      canonicalPath(process.cwd()) === own                             // MISSED
  *      pathCaseKey(canonicalPath(path.dirname(p))) === key              // MISSED
  *
- *  That is exactly why `BANNED` above uses `[^;]*` rather than `[^)]*` — its docblock records the
+ *  That is exactly why the old `resolve` regex used `[^;]*` rather than `[^)]*` — its docblock records the
  *  fix, and docs/windows.md § Paths records the census grep that missed #869's eighth site the
  *  same way. Third time; hence `ARG` rather than a flat class. A `(?:^|[^.\w])` prefix would be
  *  pointless here (`canonicalPath` is not a method name on anything) and is omitted rather than
@@ -237,7 +368,7 @@ const BANNED_URL_PATHNAME = /new\s+URL\s*\([^;)]*import\.meta\.url\s*\)\s*\.path
  *  (the "a guard can push the fix the wrong way" hazard the realpath table above pins).
  *
  *  ⚠️ **The compared value must BE the canonicalisation, not merely contain it** — which is why
- *  this is two explicit alternatives rather than `BANNED`'s `[^;]*`. Copying that pattern here
+ *  the old regex was two explicit alternatives rather than the `resolve` regex's `[^;]*`. Copying that pattern here
  *  matched two shapes that are correct, and one of them is live code (close-out review):
  *
  *      path.relative(canonicalPath(repoRoot), p) !== ''   // projects.ts `isUnderRepo`
@@ -247,9 +378,10 @@ const BANNED_URL_PATHNAME = /new\s+URL\s*\([^;)]*import\.meta\.url\s*\)\s*\.path
  *  migrate to `isUnderOrSame` — so the guard's own message would have offered no valid fix, and
  *  the cheapest green would have been deleting the `canonicalPath(...)`. That is precisely the
  *  hazard the paragraph above claims to avoid, committed in the guard that claims it. So the
- *  wrapper whitelist is exactly `pathCaseKey`, the one wrapper that preserves the question.
+ *  wrappers seen through are the RE-SPELLINGS only (`comparedValue`: `pathCaseKey`, a path module's
+ *  `normalize`, case/replace/trim string methods), the ones that preserve the question.
  *
- *  ⚠️ **The entry-point idiom is EXEMPT here too, as it already was for `BANNED`** (#910). The
+ *  ⚠️ **The entry-point idiom is EXEMPT here too, as it already was for the `resolve` scan** (#910). The
  *  shared `entryPoint.mjs` compares `canonicalPath(fileURLToPath(moduleUrl))` against
  *  `canonicalPath(process.argv[1])`, which is this exact banned shape — and is CORRECT, because
  *  the ban's rationale is that `canonicalPath` falls back to `path.resolve` for a path that does
@@ -263,20 +395,32 @@ const BANNED_URL_PATHNAME = /new\s+URL\s*\([^;)]*import\.meta\.url\s*\)\s*\.path
  *  alias for `canonicalPath`, so `canonicalClonePath(a) === canonicalClonePath(b)` is the same
  *  defect under a second name.
  *
- *  ⚠️ **Per-LINE, so the assign-then-compare form escapes — this is a FLOOR, exactly as `BANNED`
- *  is.** The commonest house spelling is not caught:
+ *  ⚠️ **The assign-then-compare form escapes — this is a FLOOR, exactly as the `resolve` scan is.**
+ *  The commonest house spelling is not caught:
  *
  *      const A = pathCaseKey(canonicalPath(a));   // …later…   return A === B;
  *
- *  and `isUnderOrSame` ten lines away in the SSOT is written that way. `BANNED`'s docblock has
- *  said this since #869; this one omitted it, and commit `80c5536f8`'s "a third had no guard in
- *  front of it" overstated what landed. Catching it needs dataflow, not a line regex. */
-const CANONICALISER = String.raw`(?:canonicalPath|canonicalClonePath)`;
-/** An argument list with ONE level of nesting — `process.cwd()`, `path.dirname(p)`,
- *  `opts.clone ?? process.cwd()`. Deeper nesting is an accepted gap; a flat class is not. */
-const ARG = String.raw`(?:[^;()]|\([^;()]*\))*`;
-/** The entry-point exemption for the CANONICALISER shape — deliberately TIGHTER than
- *  `ENTRYPOINT_IDIOM` above, which `BANNED` uses (#910 close-out review).
+ *  and `isUnderOrSame` ten lines away in the SSOT is written that way. The `resolve` scan's
+ *  docblock has said this since #869; this one omitted it, and commit `80c5536f8`'s "a third had no
+ *  guard in front of it" overstated what landed. Catching it needs dataflow along both operands'
+ *  bindings, which this does not do. (A comparison WRAPPED across lines is caught since #1179.) */
+function canonicalCompares(code: string, label: string): Hit[] {
+  const sf = parseSource(code, label);
+  const CANONICALISERS = ['canonicalPath', 'canonicalClonePath'];
+  const isCanonical = (e: ts.Expression): boolean => {
+    const u = unwrapValue(e);
+    return ts.isCallExpression(u) && CANONICALISERS.includes(calleeName(u) ?? '');
+  };
+  // The operand IS the canonicalisation — bare, or re-spelt (`comparedValue`: `pathCaseKey` and the like), which
+  // preserves the question.
+  const isCompared = (e: ts.Expression): boolean => isCanonical(comparedValue(e));
+  return findNodes(sf, isIdentityCompare)
+    .filter((b) => (isCompared(b.left) || isCompared(b.right)) && !mentions(b, ENTRYPOINT_ARGV))
+    .map((b) => hitOf(sf, b));
+}
+/** The entry-point exemption for the canonicaliser shape — deliberately TIGHTER than
+ *  `ENTRYPOINT_IDIOM` above, which the `resolve` scan uses (#910 close-out review). Read inside the
+ *  comparison itself since #1179, not anywhere on its line.
  *
  *  ⚠️ **`ENTRYPOINT_IDIOM` matches `import.meta.url` ALONE, and that is too loose here.**
  *  `path.dirname(fileURLToPath(import.meta.url))` is this repo's dominant idiom for deriving a
@@ -298,15 +442,7 @@ const ARG = String.raw`(?:[^;()]|\([^;()]*\))*`;
  *  is exempt too. That is still the entry-point family — `argv[1]` exists by construction — and
  *  narrowing further would need the shape of the OTHER operand, which is where a regex stops being
  *  honest. Today `entryPoint.mjs` is the only exempt line in the three scanned roots. */
-const ENTRYPOINT_ARGV = /process\.argv\[1\]/;
-
-const BANNED_CANONICAL_COMPARE = new RegExp(
-  // the canonicalisation IS the left operand, bare or folded by `pathCaseKey`
-  `${CANONICALISER}\\s*\\(${ARG}\\)\\s*[!=]==`
-  + `|pathCaseKey\\s*\\(\\s*${CANONICALISER}\\s*\\(${ARG}\\)\\s*\\)\\s*[!=]==`
-  // …or the right operand, same two shapes
-  + `|[!=]==\\s*(?:pathCaseKey\\s*\\(\\s*)?${CANONICALISER}\\s*\\(`,
-);
+const ENTRYPOINT_ARGV = 'process.argv[1]';
 
 /** "Am I the entry point?" decided by CONCATENATING a `file://` prefix onto `process.argv[1]` and
  *  comparing that to `import.meta.url`. The fourth recipe this module exists to end, and the one
@@ -351,11 +487,33 @@ const BANNED_CANONICAL_COMPARE = new RegExp(
  *  `file:///C:/…` on Windows"* as one of the template's three faults, so the cheapest wrong fix a
  *  reader takes from that sentence is to add a slash — which repairs nothing (the percent-encoding
  *  and symlink faults remain) and which the two-slash form of this regex waved through in silence.
- *  Found by close-out review; the samples below pin both spellings. */
-const BANNED_ENTRYPOINT =
-  /file:\/\/\/?(?:\$\{\s*process\.argv\[1\]|["'`]\s*\+\s*process\.argv\[1\])/;
+ *  Found by close-out review; the samples below pin both spellings.
+ *
+ *  Read from the parse since #1179: a template whose text right before `${process.argv[1]}` ends in
+ *  `file://`/`file:///`, or a `'file://' + process.argv[1]` whose `+` operands are exactly those —
+ *  so `'file://' +\n  process.argv[1]`, wrapped, is caught. */
+function entrypointConcats(code: string, label: string): Hit[] {
+  const sf = parseSource(code, label);
+  const FILE_PREFIX = /file:\/\/\/?$/;
+  const isArgv1 = (e: ts.Expression): boolean => accessPath(e) === 'process.argv[1]';
+  const templates = findNodes(sf, ts.isTemplateExpression).filter((t) =>
+    [t.head, ...t.templateSpans.map((s) => s.literal)].some((lit, i) => i < t.templateSpans.length
+      && FILE_PREFIX.test(lit.text) && isArgv1(t.templateSpans[i]!.expression)));
+  const concats = findNodes(sf, (n): n is ts.BinaryExpression => ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.PlusToken)
+    .filter((b) => {
+      // `'x' + 'file://' + process.argv[1]` is `('x' + 'file://') + argv` — the text touching
+      // `argv` is the RIGHTMOST literal of the left side.
+      let l = unwrapValue(b.left);
+      while (ts.isBinaryExpression(l) && l.operatorToken.kind === ts.SyntaxKind.PlusToken) l = unwrapValue(l.right);
+      return ts.isStringLiteralLike(l) && FILE_PREFIX.test(l.text) && isArgv1(b.right);
+    });
+  return [...templates, ...concats].map((n) => hitOf(sf, n));
+}
 
 const files = ROOTS.flatMap(sourceFiles);
+/** Every scanned file's comment-blanked code, read once (#812: a comment can neither satisfy nor
+ *  hide a match). */
+const sources = files.map((rel) => ({ rel, code: readScannedSource(path.join(repoRoot, rel)).code }));
 
 describe('same-directory comparisons go through pathIdentity (#869)', () => {
   it('scans a non-empty set of source files', () => {
@@ -392,18 +550,27 @@ describe('same-directory comparisons go through pathIdentity (#869)', () => {
     ['a member .resolve()', 'if (container.resolve(token) === other) return;', false],
     ['an unrelated await', 'const v = await resolve(x);', false],
     ['samePath, the fix itself', 'if (samePath(projectRoot, repoRoot)) return;', false],
-  ])('regex: %s', (_label, line, shouldMatch) => {
-    expect(BANNED.test(line)).toBe(shouldMatch);
+    // #1179: the wrapped forms the per-line regex let through, and a neighbour's entry-point token.
+    ['wrapped: resolve() on the next line', 'if (x ===\n  path.resolve(y)) return;', true],
+    ['wrapped: operator on the next line', 'if (path.resolve(x)\n  === y) return;', true],
+    ['an import.meta.url ELSEWHERE on the line does not exempt it', 'if (path.resolve(a) === b) load(import.meta.url);', true],
+    ['the entry-point idiom itself is exempt', 'if (path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main();', false],
+    // ⚠️ A deliberate NARROWING (#1179): the old regex's `[^;]*` flagged this, but `path.relative`
+    // DERIVES a different value — a containment question, the one the canonicalPath scan below
+    // already refuses to claim. Measured 0 such lines in the scanned roots when narrowed. Only
+    // RE-SPELLINGS are seen through (`comparedValue`) — the rows below.
+    ['resolve() as an ARGUMENT of a deriving call, result compared', "if (path.relative(path.resolve(a), b) !== '') return;", false],
+    // #1179 P2 review: the first parse dropped these, which the old regex flagged.
+    ['re-spelt: .toLowerCase() on both sides', 'if (path.resolve(a).toLowerCase() === b.toLowerCase()) return;', true],
+    ['re-spelt: path.normalize around it', 'if (path.normalize(path.resolve(a)) === b) return;', true],
+    ['re-spelt: .replace() on it, wrapped', "if (path.resolve(a)\n  .replace(/\\\\/g, '/') === b) return;", true],
+    ['an ACCEPTED GAP, not an endorsement: a project-local re-spelling helper', 'if (trimSep(path.resolve(a)) === trimSep(b)) return;', false],
+  ])('resolve scan: %s', (_label, line, shouldMatch) => {
+    expect(resolveCompares(line, 'row.ts').length > 0).toBe(shouldMatch);
   });
 
   it('no file compares a path.resolve() result with === / !==', () => {
-    const offenders: string[] = [];
-    for (const rel of files) {
-      const src = stripComments(fs.readFileSync(path.join(repoRoot, rel), 'utf8'));
-      src.split('\n').forEach((line, i) => {
-        if (BANNED.test(line) && !ENTRYPOINT_IDIOM.test(line)) offenders.push(`  ${rel}:${i + 1}  ${line.trim()}`);
-      });
-    }
+    const offenders = sources.flatMap(({ rel, code }) => resolveCompares(code, rel).map((h) => `  ${rel}:${h.line}  ${h.text}`));
     expect(
       offenders,
       'A `path.resolve(x) === y` comparison answers "same directory?" WITHOUT normalising\n'
@@ -430,9 +597,18 @@ describe('same-directory comparisons go through pathIdentity (#869)', () => {
     // It is an ACCEPTED GAP: no caller uses it today, and widening the regex to cover a second
     // spelling with zero live instances is how a guard grows false positives it later gets
     // silenced for. If one appears, widen this rather than reading the row as permission.
-    ['the async twin — an accepted gap, not an endorsement', 'await fs.promises.realpath(p);', false],
-  ])('realpath regex: %s', (_label, line, shouldMatch) => {
-    expect(BANNED_REALPATH.test(line)).toBe(shouldMatch);
+    ['the async twin — an accepted gap, not an endorsement', 'async function f() { await fs.promises.realpath(p); }', false],
+    // #1179: an ALIAS used to go green (#893, measured); a read is now the offender.
+    ['an alias of the walk', 'const rp = fs.realpathSync; rp(resolved);', true],
+    ['wrapped member call', 'return fs\n  .realpathSync(p);', true],
+    ['a key or declaration merely NAMED realpathSync', 'const o = { realpathSync: 1 }; function realpathSync() {}', false],
+    // #1179 P2 review: `.native` however it is reached, a type position, and a renamed import.
+    ['.native through brackets or parens', "fs.realpathSync['native'](a); (fs.realpathSync).native(b); const { native } = fs.realpathSync;", false],
+    ['a TYPE position is not a walk', 'type R = typeof fs.realpathSync;', false],
+    ['…but an instantiation expression runs', 'const rp = fs.realpathSync<string>;', true],
+    ['a RENAMED import, then called', "import { realpathSync as rp } from 'node:fs';\nrp(x);", true],
+  ])('realpath scan: %s', (_label, line, shouldMatch) => {
+    expect(realpathWalks(line, 'row.ts').length > 0).toBe(shouldMatch);
   });
 
   it.each([
@@ -449,18 +625,16 @@ describe('same-directory comparisons go through pathIdentity (#869)', () => {
     ['an HTTP request path', "const route = new URL(req.url, base).pathname;", false],
     ['the correct idiom', "const R = path.dirname(fileURLToPath(import.meta.url));", false],
     ['a URL built from something else', "const p = new URL(href).pathname;", false],
-  ])('import.meta.url .pathname regex: %s', (_label, line, shouldMatch) => {
-    expect(BANNED_URL_PATHNAME.test(line)).toBe(shouldMatch);
+    // #1179: the two escapes the regex's docblock conceded, both measured then.
+    ['wrapped across lines', "const R = new URL(\n  import.meta.url,\n).pathname;", true],
+    ['bound first, read later', "const u = new URL(import.meta.url);\nconst R = u.pathname;", true],
+    ['a DIFFERENT binding named alike is not it', "function f() { const u = new URL(import.meta.url); return fileURLToPath(u); }\nfunction g(u: URL) { return u.pathname; }", false],
+  ])('import.meta.url .pathname scan: %s', (_label, line, shouldMatch) => {
+    expect(urlPathnames(line, 'row.ts').length > 0).toBe(shouldMatch);
   });
 
   it('no file derives its own path from new URL(import.meta.url).pathname (#904/#910, #1011)', () => {
-    const offenders: string[] = [];
-    for (const rel of files) {
-      const src = stripComments(fs.readFileSync(path.join(repoRoot, rel), 'utf8'));
-      src.split('\n').forEach((line, i) => {
-        if (BANNED_URL_PATHNAME.test(line)) offenders.push(`  ${rel}:${i + 1}  ${line.trim()}`);
-      });
-    }
+    const offenders = sources.flatMap(({ rel, code }) => urlPathnames(code, rel).map((h) => `  ${rel}:${h.line}  ${h.text}`));
     expect(
       offenders,
       '`new URL(import.meta.url).pathname` keeps the leading slash and percent-encoding, so it\n'
@@ -473,13 +647,7 @@ describe('same-directory comparisons go through pathIdentity (#869)', () => {
   });
 
   it('no file canonicalises with the bare fs.realpathSync walk (#881)', () => {
-    const offenders: string[] = [];
-    for (const rel of files) {
-      const src = stripComments(fs.readFileSync(path.join(repoRoot, rel), 'utf8'));
-      src.split('\n').forEach((line, i) => {
-        if (BANNED_REALPATH.test(line)) offenders.push(`  ${rel}:${i + 1}  ${line.trim()}`);
-      });
-    }
+    const offenders = sources.flatMap(({ rel, code }) => realpathWalks(code, rel).map((h) => `  ${rel}:${h.line}  ${h.text}`));
     expect(
       offenders,
       '`fs.realpathSync` is the JS lstat-walk: it resolves symlinks and junctions but NOT a\n'
@@ -497,13 +665,15 @@ describe('same-directory comparisons go through pathIdentity (#869)', () => {
     ['LEFT operand only', 'if (canonicalPath(stored) === own) return null;', true],
     ['space before paren', 'if (canonicalPath (a) === b) return;', true],
     // ⚠️ The three nested-argument rows. A flat `[^;()]*` missed all three, and the second is
-    // live house style in `deviceClaimsStore.mjs`'s `foreignClaimFor`. Deleting `ARG` reddens exactly these.
+    // live house style in `deviceClaimsStore.mjs`'s `foreignClaimFor`. (The regex needed an `ARG` sub-pattern for
+    // them; the parse needs nothing, and these rows keep that true.)
     ['a nested call as the argument', 'if (canonicalPath(process.cwd()) === own) return;', true],
     ['the alias, with a ?? default', 'if (canonicalClonePath(opts.clone ?? process.cwd()) === held.clone) return;', true],
     ['nested, and folded', 'if (pathCaseKey(canonicalPath(path.dirname(p))) === key) go();', true],
     ['the canonicalClonePath alias', 'return canonicalClonePath(stored) === canonicalClonePath(own);', true],
     ['alias on the right', 'if (own !== canonicalClonePath(c.clone)) continue;', true],
-    // ⚠️ The two rows that made this regex two alternatives instead of `BANNED`'s `[^;]*`. The
+    // ⚠️ The two rows that make "the operand IS the canonicalisation" load-bearing (they made the old
+    // regex two alternatives instead of the resolve scan's `[^;]*`). The
     // first is live code (`projects.ts` `isUnderRepo`), and it must NOT become `isUnderOrSame`.
     ['canonicalPath as an ARGUMENT, result compared', "if (path.relative(canonicalPath(root), p) !== '') return false;", false],
     ['…and the basename form, one edit from editorPorts.mjs:130', "if (path.basename(canonicalPath(p)) === 'games') go();", false],
@@ -519,8 +689,15 @@ describe('same-directory comparisons go through pathIdentity (#869)', () => {
     ['a Map key', 'seen.set(canonicalPath(p), entry);', false],
     ['composed into a join', 'return path.join(canonicalPath(path.dirname(p)), path.basename(p));', false],
     ['samePath, the fix itself', 'if (samePath(projectRoot, repoRoot)) return;', false],
-  ])('canonicalPath-compare regex: %s', (_label, line, shouldMatch) => {
-    expect(BANNED_CANONICAL_COMPARE.test(line)).toBe(shouldMatch);
+    // #1179: wrapped, and nested past the one level the regex's `ARG` allowed.
+    ['wrapped across lines', 'if (\n  canonicalPath(a)\n  === canonicalPath(b)\n) return;', true],
+    ['nested two levels deep', 'if (canonicalPath(path.dirname(path.join(a, b))) === own) return;', true],
+    ['#1179 P2 review: re-spelt with .toLowerCase() on the right', 'if (x === canonicalPath(p).toLowerCase()) return;', true],
+    ['a namespaced fold', 'if (pi.pathCaseKey(canonicalPath(a)) === b) return;', true],
+    ["a string's own .normalize('NFC') on a non-path is not peeled into its argument", "if (label.normalize('NFC') === canonicalName) return;", false],
+    ["…so a canonicalPath re-spelt by the STRING method is still seen", "if (canonicalPath(p).normalize('NFC') === key) return;", true],
+  ])('canonicalPath-compare scan: %s', (_label, line, shouldMatch) => {
+    expect(canonicalCompares(line, 'row.ts').length > 0).toBe(shouldMatch);
   });
 
   /** The EXEMPTION's own falsifiability (#910). The negative row is the load-bearing one: if this
@@ -537,18 +714,14 @@ describe('same-directory comparisons go through pathIdentity (#869)', () => {
       'if (canonicalPath(projectRoot) === canonicalPath(repoRoot)) return;', true],
     ['the accepted looseness: an argv[1] comparison is exempt, and that is stated not hidden',
       'if (canonicalPath(process.argv[1]) === canonicalPath(stored)) return;', false],
-  ])('canonicalPath scan: %s', (_label, line, shouldFlag) => {
-    expect(BANNED_CANONICAL_COMPARE.test(line) && !ENTRYPOINT_ARGV.test(line)).toBe(shouldFlag);
+    ['#1179: an argv[1] in a NEIGHBOURING comparison on the line exempts nothing',
+      'if (canonicalPath(projectRoot) === canonicalPath(repoRoot) || argvOk(process.argv[1])) return;', true],
+  ])('canonicalPath scan with its exemption: %s', (_label, line, shouldFlag) => {
+    expect(canonicalCompares(line, 'row.ts').length > 0).toBe(shouldFlag);
   });
 
   it('no file compares two canonicalPath() results (#892)', () => {
-    const offenders: string[] = [];
-    for (const rel of files) {
-      const src = stripComments(fs.readFileSync(path.join(repoRoot, rel), 'utf8'));
-      src.split('\n').forEach((line, i) => {
-        if (BANNED_CANONICAL_COMPARE.test(line) && !ENTRYPOINT_ARGV.test(line)) offenders.push(`  ${rel}:${i + 1}  ${line.trim()}`);
-      });
-    }
+    const offenders = sources.flatMap(({ rel, code }) => canonicalCompares(code, rel).map((h) => `  ${rel}:${h.line}  ${h.text}`));
     expect(
       offenders,
       '`canonicalPath` is the SPELLING canonicaliser: for a path that does not exist it falls\n'
@@ -561,13 +734,7 @@ describe('same-directory comparisons go through pathIdentity (#869)', () => {
   });
 
   it('no file decides run-as-main by concatenating file:// onto process.argv[1] (#904)', () => {
-    const offenders: string[] = [];
-    for (const rel of files) {
-      const src = stripComments(fs.readFileSync(path.join(repoRoot, rel), 'utf8'));
-      src.split('\n').forEach((line, i) => {
-        if (BANNED_ENTRYPOINT.test(line)) offenders.push(`  ${rel}:${i + 1}  ${line.trim()}`);
-      });
-    }
+    const offenders = sources.flatMap(({ rel, code }) => entrypointConcats(code, rel).map((h) => `  ${rel}:${h.line}  ${h.text}`));
     expect(
       offenders,
       'argv[1] is a raw OS path; import.meta.url is a URL of the REALPATH. Concatenating the two\n'
@@ -597,11 +764,14 @@ describe('same-directory comparisons go through pathIdentity (#869)', () => {
       'if (import.meta.url === `file:///${process.argv[1]}`) await main();',
       'if (import.meta.url === new URL(`file:///${process.argv[1]}`).href) await main();',
       "if (import.meta.url === 'file:///' + process.argv[1]) await main();",
+      // #1179: wrapped, and with a prefix concatenated before the scheme
+      "if (import.meta.url === 'file://' +\n  process.argv[1]) await main();",
+      "if (import.meta.url === '' + 'file://' + process.argv[1]) await main();",
     ];
-    for (const line of banned) expect(BANNED_ENTRYPOINT.test(line), line).toBe(true);
+    for (const line of banned) expect(entrypointConcats(line, 'row.mjs').length, line).toBe(1);
 
     // ⚠️ **Only the LAST of these actually discriminates, and that is stated rather than implied.**
-    // The first three contain no `file://` at all, so this regex could be narrowed to match nothing
+    // The first three contain no `file://` at all, so this scan could be narrowed to match nothing
     // and they would still pass — they are DOCUMENTATION of the house recipe, kept because a reader
     // arriving at a failure needs to see what the right shape looks like. The non-vacuity claim
     // rests on the `banned` list above and on the separate scan-is-not-vacuous case, not on these.
@@ -616,13 +786,13 @@ describe('same-directory comparisons go through pathIdentity (#869)', () => {
       // really uses it, and flagging it would push a game tool onto an import it may not have.
       'if (import.meta.url === pathToFileURL(process.argv[1]).href) await main();',
     ];
-    for (const line of ok) expect(BANNED_ENTRYPOINT.test(line), line).toBe(false);
+    for (const line of ok) expect(entrypointConcats(line, 'row.mjs').length, line).toBe(0);
   });
 
   /** Non-vacuity for ALL THREE scans, and the half that is easy to forget: a guard collecting offenders
    *  and asserting the list is empty goes GREEN when its matching silently breaks (docs/windows.md
    *  § Paths — "the loud failure is the lucky one"). `files.length > 0` above proves we read
-   *  something; this proves the two regexes still FIND the shapes in a real repo file when they
+   *  something; this proves the scans still FIND the shapes in a real repo file when they
    *  are present, rather than having been narrowed into never matching anything. */
   it('both scans still detect their shape in real source (non-vacuity)', () => {
     // ⚠️ Through `readScannedSource`, not `fs.readFileSync` — `commentStripperIsShared` (#812)
@@ -640,14 +810,17 @@ describe('same-directory comparisons go through pathIdentity (#869)', () => {
     // The SSOT's body is the one place `.native` legitimately appears — it must be found by a
     // `realpathSync` search and NOT by the ban.
     expect(ssot).toMatch(/realpathSync\.native\(/);
-    expect(BANNED_REALPATH.test('fs.realpathSync.native(resolved)')).toBe(false);
-    expect(BANNED_REALPATH.test('fs.realpathSync(resolved)')).toBe(true);
-    expect(BANNED.test('if (path.resolve(a) === b) return;')).toBe(true);
+    // …and the real SSOT, which holds the `.native` read, is clean under the walk scan.
+    expect(realpathWalks(ssot, 'pathIdentity.mjs')).toEqual([]);
+    expect(realpathWalks('fs.realpathSync.native(resolved);', 'row.ts')).toEqual([]);
+    expect(realpathWalks('fs.realpathSync(resolved);', 'row.ts')).toHaveLength(1);
+    expect(resolveCompares('if (path.resolve(a) === b) f();', 'row.ts')).toHaveLength(1);
     // (#892) The third scan, held to the same bar: it must find the shape in the SSOT's OWN
     // history — this is `samePath`'s body as it stood before #892 — and must not fire on the body
     // that replaced it, which is what the file really contains now.
-    expect(BANNED_CANONICAL_COMPARE.test('return pathCaseKey(canonicalPath(a)) === pathCaseKey(canonicalPath(b));')).toBe(true);
-    expect(BANNED_CANONICAL_COMPARE.test('return pathCaseKey(canonicalWithMissingTail(a)) === pathCaseKey(canonicalWithMissingTail(b));')).toBe(false);
+    const body = (expr: string) => `function samePath(a, b) { return ${expr}; }`;
+    expect(canonicalCompares(body('pathCaseKey(canonicalPath(a)) === pathCaseKey(canonicalPath(b))'), 'row.mjs')).toHaveLength(1);
+    expect(canonicalCompares(body('pathCaseKey(canonicalWithMissingTail(a)) === pathCaseKey(canonicalWithMissingTail(b))'), 'row.mjs')).toEqual([]);
     expect(ssot).toMatch(/canonicalWithMissingTail\(a\)/);
   });
 });

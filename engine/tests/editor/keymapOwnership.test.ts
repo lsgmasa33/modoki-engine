@@ -19,6 +19,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
+import { callsToPath, findNodes, lineOf, parseSource, stringValueOf, ts } from '@modoki/engine/testing/sourceAst';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
@@ -67,18 +68,41 @@ const ALLOWED = [
 /** The keyboard events a global listener can register for. */
 const EVENTS = ['keydown', 'keyup', 'keypress'] as const;
 
-/** Every keyboard listener registration form we care about, one matcher per event so a match can
- *  SAY which event it is. Global, because the rule counts occurrences rather than answering a
- *  boolean per file. */
-const listenerRe = (ev: string): RegExp => new RegExp(
-  String.raw`\b(?:window|document)\s*\.\s*addEventListener\s*\(\s*['"\`]${ev}['"\`]`, 'g',
-);
+/**
+ * Every `window`/`document` `addEventListener(…)` CALL for a keyboard event in one file, as a ledger
+ * item `<rel>::<event>` — read from the parse (#1179). The per-line regex this replaces missed
+ * `window.addEventListener(\n  'keydown', …)`, the shape a formatter produces for a long handler.
+ *
+ * ⚠️ An event name that is NOT a string literal is reported as `<rel>::<dynamic>`, and no row pardons
+ * one today — writing that row is a reviewed decision like any other. `addEventListener(ev, …)` could
+ * be a keyboard listener, and a regex requiring the quote simply never saw it.
+ */
+function keyboardListeners(code: string, rel: string): Array<{ item: string; site: string }> {
+  const sf = parseSource(code, rel);
+  return callsToPath(sf, 'window.addEventListener', 'document.addEventListener').flatMap((c) => {
+    const ev = stringValueOf(c.arguments[0]);
+    const kind = ev === undefined ? '<dynamic>' : (EVENTS as readonly string[]).includes(ev) ? ev : undefined;
+    return kind ? [{ item: `${rel}::${kind}`, site: `${rel}:${lineOf(c)} (${kind})` }] : [];
+  });
+}
 
 /** Every `.ts`/`.tsx` under `EDITOR`, via the shared corpus producer (#799/#771/#805 Phase 4).
  *  Floored well under the 240 measured today. */
 function walk(dir: string): { abs: string; rel: string }[] {
   return repoFiles({ under: dir, match: /\.tsx?$/, floor: 150 })
     .map(({ abs, rel }) => ({ abs, rel }));
+}
+
+/** Every `scope: '<literal>'` property in one file's comment-stripped code, from the parse (#1179).
+ *  The per-line `exec` this replaces read the RAW file (a comment could red it), took only the first
+ *  match on a line, and missed `scope:\n  'x'`. A non-literal scope is not a typo this can judge. */
+function scopeLiterals(code: string, rel: string): Array<{ line: number; scope: string }> {
+  const sf = parseSource(code, rel);
+  return findNodes(sf, (n): n is ts.PropertyAssignment => ts.isPropertyAssignment(n) && ts.isIdentifier(n.name) && n.name.text === 'scope')
+    .flatMap((p) => {
+      const scope = stringValueOf(p.initializer);
+      return scope === undefined ? [] : [{ line: lineOf(p), scope }];
+    });
 }
 
 describe('keymap ownership — no raw keyboard listeners in editor/', () => {
@@ -95,17 +119,7 @@ describe('keymap ownership — no raw keyboard listeners in editor/', () => {
     // rows carry counts: a docblock quoting `window.addEventListener('keydown'` would have inflated
     // the number a row has to match, and the house rule is the shared reader anyway (#419/#812).
     // Measured both ways on 2026-09-12 on work-ai2: raw and stripped agree at 3, so no verdict moves.
-    const listeners: Array<{ item: string; site: string }> = [];
-    for (const { abs, rel } of files) {
-      const code = readScannedSource(abs).code;
-      code.split('\n').forEach((line, i) => {
-        for (const ev of EVENTS) {
-          for (let n = (line.match(listenerRe(ev)) ?? []).length; n > 0; n -= 1) {
-            listeners.push({ item: `${rel}::${ev}`, site: `${rel}:${i + 1} (${ev})` });
-          }
-        }
-      });
-    }
+    const listeners = files.flatMap(({ abs, rel }) => keyboardListeners(readScannedSource(abs).code, rel));
     assertExemptionLedger({
       label: 'ALLOWED in keymapOwnership',
       population: listeners,
@@ -119,6 +133,25 @@ describe('keymap ownership — no raw keyboard listeners in editor/', () => {
         + 'is introspectable. A raw listener re-creates the class of bug this refactor removed '
         + '(one key firing in three panels at once).',
     });
+  });
+
+  it('the listener detector sees a WRAPPED call, two on one line, and a non-literal event (#1179)', () => {
+    const src = [
+      'window.addEventListener(',
+      "  'keydown',",
+      '  onKey,',
+      ');',
+      "document.addEventListener('keyup', a); window.addEventListener('keypress', b); window.addEventListener('resize', c);",
+      'globalThis.window.addEventListener(ev, d); el.addEventListener("keydown", e);',
+    ].join('\n');
+    expect(keyboardListeners(src, 'p.tsx').map((l) => l.site)).toEqual([
+      'p.tsx:1 (keydown)', 'p.tsx:5 (keyup)', 'p.tsx:5 (keypress)', 'p.tsx:6 (<dynamic>)',
+    ]);
+  });
+
+  it('the scope detector sees a wrapped `scope:` and two on one line, and skips a non-literal (#1179)', () => {
+    const src = "register({ id: 'a',\n  scope:\n    'scenee' });\nconst ok = [{ scope: 'scene' }, { scope: 'hierarchyy' }];\nregister({ scope: dyn });";
+    expect(scopeLiterals(src, 'p.tsx').map((s) => `${s.line}:${s.scope}`)).toEqual(['2:scenee', '4:scene', '4:hierarchyy']);
   });
 
   it('every `scope:` literal names a real panel or tier — typos compile silently', () => {
@@ -135,14 +168,11 @@ describe('keymap ownership — no raw keyboard listeners in editor/', () => {
     ];
     const known = new Set([...TIERS, ...PANELS]);
 
-    const bad: string[] = [];
-    for (const { abs: file, rel } of files) {
-      const src = fs.readFileSync(file, 'utf8');
-      src.split('\n').forEach((line, i) => {
-        const m = /scope: '([a-zA-Z0-9_-]+)'/.exec(line);
-        if (m && !known.has(m[1])) bad.push(`${rel}:${i + 1} → '${m[1]}'`);
-      });
-    }
+    const all = files.flatMap(({ abs, rel }) => scopeLiterals(readScannedSource(abs).code, rel).map((s) => ({ ...s, rel })));
+    // 21 measured 2026-09-14 (the raw per-line scan saw 22 — the extra was a docblock quoting
+    // `scope: 'scene'`). Floored under it: a detector that finds nothing would pass the check below.
+    expect(all.length).toBeGreaterThanOrEqual(15);
+    const bad = all.filter((s) => !known.has(s.scope)).map((s) => `${s.rel}:${s.line} → '${s.scope}'`);
     expect(
       bad,
       `Unknown keymap scope(s):\n  ${bad.join('\n  ')}\n\n`

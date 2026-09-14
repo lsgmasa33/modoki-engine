@@ -4,9 +4,9 @@
 import { describe, it, expect } from 'vitest';
 import ts from 'typescript';
 import {
-  blockInnerText, boundIdentifier, calledNames, callsTo, calleeName, declarationOf, enclosingFunction, findNodes,
-  functionBodyOf, isBlock, lineOf, namedFunctions, objectLiteralKeys, parseSource, readsOf, scriptKindFor,
-  stringValueOf, unwrapValue, valueCarrier,
+  accessPath, blockInnerText, boundIdentifier, calledNames, callOf, callsTo, callsToPath, calleeName, declarationOf,
+  enclosingFunction, enclosingNamedFunction, findNodes, flatText, functionBodyOf, guardProves, guardsOf, importsIn, isBlock, lineOf, namedFunctions, objectLiteralKeys, parseSource,
+  precedingStatements, printedText, readsOf, referencesToPath, scriptKindFor, siteText, statementOf, stringValueOf, ts as reexportedTs, unwrapValue, valueCarrier,
 } from './sourceAst';
 
 const firstCall = (sf: ts.SourceFile, name: string): ts.CallExpression => callsTo(sf, name)[0]!;
@@ -37,6 +37,132 @@ describe('callsTo / calleeName', () => {
     const [outer, inner] = [firstCall(sf, 'outer'), firstCall(sf, 'inner')];
     expect(inner.getText(sf)).toBe('inner(1)');
     expect(outer.getText(sf)).toBe('outer(inner(1), 2)');
+  });
+});
+
+describe('accessPath / referencesToPath / callsToPath — a dotted name however it is formatted (#1179)', () => {
+  const exprAt = (code: string): ts.Expression => {
+    const sf = parseSource(`use(${code});`, 's.ts');
+    return callsTo(sf, 'use')[0]!.arguments[0]!;
+  };
+
+  it('accessPath spells a chain through wrappers, newlines, ?. and literal keys; refuses an unnamed link', () => {
+    expect([
+      'performance\n  .now', '(mesh.material as Material)', 'a?.b!', "o['k']", 'process.argv[1]', 'import.meta.url', 'this.x',
+    ].map((c) => accessPath(exprAt(c)))).toEqual([
+      'performance.now', 'mesh.material', 'a.b', 'o.k', 'process.argv[1]', 'import.meta.url', 'this.x',
+    ]);
+    expect(['f().x', 'o[k].y', '"s".length'].map((c) => accessPath(exprAt(c)))).toEqual([undefined, undefined, undefined]);
+  });
+
+  it('a WRAPPED call is one read — the per-line `\\btok\\s*\\(` form this replaces saw none of these', () => {
+    const sf = parseSource([
+      'const a = performance',
+      '  .now();',
+      'const b = Math.random',
+      '  ();',
+      'const c = (globalThis.Date as DateConstructor)',
+      '  .now();',
+      'const d = (performance.now as () => number)();',
+      'const e = Math.random!();',
+    ].join('\n'), 's.ts');
+    expect(callsToPath(sf, 'performance.now', 'Math.random', 'Date.now').map(lineOf)).toEqual([1, 3, 5, 7, 8]);
+  });
+
+  it('two reads on ONE line are two, and a neighbour on that line does not stand in for either', () => {
+    const sf = parseSource('const t = [Math.random(), Math.random(), Math.floor(1)];', 's.ts');
+    expect(callsToPath(sf, 'Math.random')).toHaveLength(2);
+  });
+
+  it('the suffix rule is a SEGMENT boundary: globalThis.performance.now and f().now are reads, myperformance.now is not', () => {
+    const sf = parseSource('globalThis.performance.now(); myperformance.now(); getApp().getPath("x"); a.getPathname();', 's.ts');
+    expect(callsToPath(sf, 'performance.now').map((c) => c.getText(sf))).toEqual(['globalThis.performance.now()']);
+    expect(callsToPath(sf, 'getPath').map((c) => c.getText(sf))).toEqual(['getApp().getPath("x")']);
+  });
+
+  it('an UNCALLED read counts — handed on as a default, bound, or destructured — and callOf tells them apart', () => {
+    const sf = parseSource([
+      'function applyOps(mint: () => string = newGuid) { return mint(); }',
+      'const now = performance.now.bind(performance);',
+      'const { random } = Math;',
+      'const { now: n2 } = performance;',
+    ].join('\n'), 's.ts');
+    const refs = referencesToPath(sf, 'newGuid', 'performance.now', 'Math.random');
+    expect(refs.map((r) => r.getText(sf))).toEqual(['newGuid', 'performance.now', 'random', 'now: n2']);
+    expect(refs.map((r) => callOf(r))).toEqual([undefined, undefined, undefined, undefined]);
+  });
+
+  it('a name position is not a read: a declaration, an import, a member name, a type', () => {
+    const sf = parseSource([
+      "import { newGuid, newGuid as g2 } from './rules';",
+      'export function newGuid2(): string { return newGuid(); }',
+      'function newGuid3() {}',
+      'const o = { newGuid: 1 }; o.newGuidX; type T = typeof newGuid;',
+      'export { newGuid };',
+      'const { newGuid: g3 } = rules;',
+    ].join('\n'), 's.ts');
+    // Line 6 IS a read — of `rules.newGuid`, returned once as its binding element, never again as
+    // the `newGuid` key inside it.
+    expect(referencesToPath(sf, 'newGuid').map((r) => `${lineOf(r)}:${r.getText(sf)}`)).toEqual(['2:newGuid', '6:newGuid: g3']);
+  });
+
+  it('the positions a generic name rule gets wrong: a shorthand and an instantiation ARE reads; a qualified type, a label, a rest element are not (#1179 review)', () => {
+    const sf = parseSource([
+      'makeOps({ newGuid });',
+      'const m = newGuid<string>;',
+      'type T = typeof rules.newGuid;',
+      'newGuid: for (;;) { break newGuid; }',
+      'const { ...newGuid2 } = rules; const { ...now } = performance;',
+      'class C implements newGuid<string> {}',
+      'const u = import.meta.url;',
+      'class D extends newGuid {} interface I extends newGuid {}',
+    ].join('\n'), 's.ts');
+    expect(referencesToPath(sf, 'newGuid', 'performance.now', 'import.meta.url').map((r) => `${lineOf(r)}:${r.getText(sf)}`))
+      .toEqual(['1:newGuid', '2:newGuid', '7:import.meta.url', '8:newGuid']);
+  });
+
+  it('enclosingNamedFunction names declarations, methods and bound arrows, climbing past anonymous callbacks', () => {
+    const sf = parseSource([
+      'function decl() { on(() => { a(); }); }',
+      'const bound = () => b();',
+      'const o = { key: function () { c(); } };',
+      'class K { constructor() { d(); } method() { e(); } field = () => f(); }',
+      'g();',
+    ].join('\n'), 's.ts');
+    expect(['a', 'b', 'c', 'd', 'e', 'f', 'g'].map((n) => enclosingNamedFunction(firstCall(sf, n))?.name))
+      .toEqual(['decl', 'bound', 'key', 'constructor', 'method', 'field', undefined]);
+  });
+
+  it('only the outermost link of a matching chain counts; a longer NON-matching chain still reads it', () => {
+    const sf = parseSource('a.b.c(); a.b.d();', 's.ts');
+    expect(referencesToPath(sf, 'a.b', 'a.b.c').map((r) => r.getText(sf))).toEqual(['a.b.c', 'a.b']);
+    expect(referencesToPath(sf, 'a.b').map((r) => r.getText(sf))).toEqual(['a.b', 'a.b']);
+  });
+
+  it('statementOf climbs to the statement a node sits in; flatText names it the same however it wraps', () => {
+    const sf = parseSource([
+      'const cacheDir = path.join(',
+      '  app.getPath(',
+      "    'userData',",
+      '  ),',
+      "  'vite-cache',",
+      ');',
+      "function f() { if (x) { return a ?? app.getPath('userData'); } }",
+      "switch (k) { case 1: use(app.getPath('userData')); }",
+      "const g = () => app.getPath('userData');",
+      "class A { dir = app.getPath('userData'); other = 1; }",
+    ].join('\n'), 's.ts');
+    expect(callsToPath(sf, 'getPath').map((c) => flatText(statementOf(c)))).toEqual([
+      "const cacheDir = path.join( app.getPath( 'userData', ), 'vite-cache', );",
+      "return a ?? app.getPath('userData');",
+      "use(app.getPath('userData'));",
+      "const g = () => app.getPath('userData');",
+      "dir = app.getPath('userData');",
+    ]);
+  });
+
+  it('re-exports `ts`, so a project test can walk without its own typescript import', () => {
+    expect(reexportedTs).toBe(ts);
   });
 });
 
@@ -78,6 +204,13 @@ describe('enclosingFunction / declarationOf / readsOf', () => {
     // or the inner const's, however they are spelled.
     expect(readsOf(raw).map((r) => ts.SyntaxKind[r.parent.kind])).toEqual(['CallExpression', 'ShorthandPropertyAssignment']);
     expect(readsOf(raw)[0]!.parent.getText(sf)).toBe('expect(raw)');
+  });
+
+  it('`export { raw }` and `export { raw as alias }` are reads of the local binding (#1179 known gap 2)', () => {
+    const sf = parseSource("const raw = read();\nconst other = 1;\nexport { raw };\nexport { raw as alias, other };\nexport { raw as fromElsewhere } from './x';", 's.ts');
+    const raw = boundIdentifier(firstCall(sf, 'read'))!;
+    // Two local exports read it; the `from './x'` clause names a DIFFERENT module's binding.
+    expect(readsOf(raw).map((r) => r.parent.getText(sf))).toEqual(['raw', 'raw as alias']);
   });
 
   it('THROWS when the checker would not take the file — resolution must not silently find nothing', () => {
@@ -133,5 +266,205 @@ describe('function bodies and literals — the shapes a hand-written brace or qu
     expect(objectLiteralKeys(callsTo(q, 'o')[0]!.arguments[0])).toEqual(['text', 't2', 't3', '[k]', '5']);
     expect(objectLiteralKeys(b!.arguments[2])).toBeUndefined();
     expect(lineOf(c!)).toBe(1);
+  });
+});
+
+describe('guardsOf / precedingStatements / printedText — the condition an occurrence runs under is its OWN (#1179)', () => {
+  const guards = (src: string, name: string) =>
+    guardsOf(firstCall(parseSource(src, 's.ts'), name)).map((g) => `${g.holds ? '' : 'NOT '}${printedText(g.test)}`);
+
+  it('reads the branch the call sits in: then, else, both arms of a ternary, && and ||', () => {
+    expect(guards('if (a) { t(); } else { e(); }', 't')).toEqual(['a']);
+    expect(guards('if (a) { t(); } else { e(); }', 'e')).toEqual(['NOT a']);
+    expect(guards('const v = a ? t() : e();', 'e')).toEqual(['NOT a']);
+    expect(guards('a && t(); b || e();', 't')).toEqual(['a']);
+    expect(guards('a && t(); b || e();', 'e')).toEqual(['NOT b']);
+    expect(guards('if (a) { if (b) { t(); } }', 't')).toEqual(['b', 'a']);
+    // Only the RIGHT operand is guarded: `t()` on the left runs whatever `b` is.
+    expect(guards('t() && b; t2() || b;', 't')).toEqual([]);
+  });
+
+  it('an EARLY EXIT above the call is a guard; an `if` whose block the call merely FOLLOWS is not', () => {
+    expect(guards('function f() { if (!a) return; t(); }', 't')).toEqual(['NOT !a']);
+    expect(guards('function f() { if (!a) { warn(); return x; } t(); }', 't')).toEqual(['NOT !a']);
+    expect(guards('for (;;) { if (a) continue; t(); }', 't')).toEqual(['NOT a']);
+    expect(guards('switch (k) { case 1: if (!a) break; t(); }', 't')).toEqual(['NOT !a']);
+    // A nested `if` exits only when BOTH of its branches do.
+    expect(guards('function f() { if (a) { if (b) return; else throw e; } t(); }', 't')).toEqual(['NOT a']);
+    expect(guards('function f() { if (a) { if (b) return; } t(); }', 't')).toEqual([]);
+    // The "nearest `if (` line above" shape: `t()` is after the block, and runs whatever `a` is.
+    expect(guards('if (a) {\n  x();\n}\nt();', 't')).toEqual([]);
+    expect(guards('function f() { if (a) { warn(); } t(); }', 't')).toEqual([]);
+    expect(guards('function f() { if (a) return; else y(); t(); }', 't')).toEqual([]);
+    expect(guards('function f() { t(); if (!a) return; }', 't')).toEqual([]);
+    // The condition itself is not guarded by itself.
+    expect(guards('if (t()) { x(); }', 't')).toEqual([]);
+  });
+
+  it('guardProves reads !, && and || with the polarity the guard imposes, and nothing it cannot decide', () => {
+    const proves = (src: string) => guardsOf(firstCall(parseSource(src, 's.ts'), 't')).some((g) =>
+      guardProves(g, (e) => ts.isIdentifier(e) && e.text === 'F'));
+    expect(['if (F) t();', 'if (!F) return; t();', 'if ((F as boolean) && x) t();', 'if (!F || x) return; t();', 'if (!(!F)) t();']
+      .map(proves)).toEqual([true, true, true, true, true]);
+    expect(['if (!F) t();', 'if (F) return; t();', 'if (F || x) t();', 'if (!F || x) t();', 'if (!F && x) return; t();', 'if (F && x) return; t();',
+      'if (F === true) t();', 'const g = F; if (g) t();']
+      .map(proves)).toEqual([false, false, false, false, false, false, false, false]);
+  });
+
+  it('guardProves with `value: false` proves the atom FALSE — the mirror, not the negation of the answer', () => {
+    const provesFalse = (src: string) => guardsOf(firstCall(parseSource(src, 's.ts'), 't')).some((g) =>
+      guardProves(g, (e) => ts.isIdentifier(e) && e.text === 'F', false));
+    expect(['if (!F) t();', 'if (F) return; t();', 'if (F || x) return; t();', 'if (!F && x) t();', 'if (!(F)) t();']
+      .map(provesFalse)).toEqual([true, true, true, true, true]);
+    // Unproven either way is not proven false: `x` alone, `F && x` failing, a closure's own exit.
+    expect(['if (x) t();', 'if (F && x) return; t();', 'if (F) t();', 'if (!F) return; t();', 'if (F ? a : b) t();',
+      'function f() { const g = () => { if (F) return; }; t(); }']
+      .map(provesFalse)).toEqual([false, false, false, false, false, false]);
+  });
+
+  it('climbs through a closure to the gate dominating where it is created', () => {
+    expect(guards('async function f() { if (!a) { return; } const g = async () => { await t(); }; }', 't')).toEqual(['NOT !a']);
+    // A hoisted DECLARATION escapes the early exits of its own list — code above them can call it…
+    expect(guards('function f() { queue(load); if (!a) return; function load() { if (b) { t(); } } }', 't')).toEqual(['b']);
+    // …but not the branches enclosing that list.
+    expect(guards('if (other) {\n  function go() {\n    if (gate) {\n      t();\n    }\n  }\n  go();\n}', 't')).toEqual(['gate', 'other']);
+  });
+
+  it('precedingStatements: earlier siblings of each enclosing list, up to the function — not inside earlier branches', () => {
+    const sf = parseSource('before();\nfunction f() { p(); if (c) { q(); } try { r(); d(); } finally {} }\nouter();', 's.ts');
+    const texts = precedingStatements(firstCall(sf, 'd')).map((s) => flatText(s));
+    expect(texts).toEqual(['r();', 'if (c) { q(); }', 'p();']);
+  });
+
+  it('printedText spells equal code equally across a formatter wrap, and keeps parentheses the source wrote', () => {
+    const [a, b] = parseSource('if (!p &&\n  (\n    x ||   y)) {}\nif (!p && (x || y)) {}', 's.ts').statements as unknown as ts.IfStatement[];
+    expect(printedText(a!.expression)).toBe('!p && (x || y)');
+    expect(printedText(a!.expression)).toBe(printedText(b!.expression));
+    expect(flatText(a!.expression)).not.toBe(flatText(b!.expression));
+  });
+});
+
+describe('importsIn — every module edge, read from the declaration (#1179)', () => {
+  const edges = (code: string, label = 'x.ts') => importsIn(parseSource(code, label))
+    .map(({ spec, kind, typeOnly, bindings }) => ({ spec, kind, typeOnly, bindings: bindings.map((b) => (b.imported === b.local ? b.local : `${b.imported} as ${b.local}`)) }));
+
+  it('reads static imports, however wrapped, with every binding by its exported and local name', () => {
+    expect(edges(`import D, {
+      a,
+      b as c,
+    } from './m';
+    import * as ns from "three/webgpu";
+    import 'side-effect';
+    import type { T } from './types';
+    import { type U } from './u';
+    import legacy = require('legacy');
+    import type LegacyT = require('legacy-types');`)).toEqual([
+      { spec: './m', kind: 'import', typeOnly: false, bindings: ['default as D', 'a', 'b as c'] },
+      { spec: 'three/webgpu', kind: 'import', typeOnly: false, bindings: ['* as ns'] },
+      { spec: 'side-effect', kind: 'import', typeOnly: false, bindings: [] },
+      { spec: './types', kind: 'import', typeOnly: true, bindings: ['T'] },
+      // Every specifier type-marked is still NOT erased under verbatimModuleSyntax: `import {} from './u'` runs.
+      { spec: './u', kind: 'import', typeOnly: false, bindings: ['U'] },
+      { spec: 'legacy', kind: 'import', typeOnly: false, bindings: ['* as legacy'] },
+      { spec: 'legacy-types', kind: 'import', typeOnly: true, bindings: ['* as LegacyT'] },
+    ]);
+  });
+
+  it('reads re-exports — the edge a column-0 `import` reader never saw', () => {
+    expect(edges(`export * from './all';
+    export * as grouped from './grouped';
+    export { x, y as z } from './named';
+    export type { T } from './types';
+    export { local };
+    const local = 1;`)).toEqual([
+      { spec: './all', kind: 'reexport', typeOnly: false, bindings: [] },
+      { spec: './grouped', kind: 'reexport', typeOnly: false, bindings: ['* as grouped'] },
+      { spec: './named', kind: 'reexport', typeOnly: false, bindings: ['x', 'y as z'] },
+      { spec: './types', kind: 'reexport', typeOnly: true, bindings: ['T'] },
+    ]);
+  });
+
+  it('reads literal dynamic imports anywhere, and nothing that only looks like one', () => {
+    expect(edges(`async function f(name: string) {
+      const a = await import(
+        './wrapped');
+      const b = await import(\`./template\`);
+      const c = await import(name);
+      const s = "import('./in-a-string')";
+      type T = typeof import('./type-query');
+      return [a, b, c, s];
+    }`)).toEqual([
+      { spec: './wrapped', kind: 'dynamic', typeOnly: false, bindings: [] },
+      { spec: './template', kind: 'dynamic', typeOnly: false, bindings: [] },
+    ]);
+  });
+});
+
+describe('siteText — the unit a ledger key names a site by (#1179 P5)', () => {
+  const sites = (lines: string[]): string[] => {
+    const sf = parseSource(lines.join('\n'), 's.ts');
+    return findNodes(sf, (n): n is ts.Identifier => ts.isIdentifier(n) && n.text === 'T').map(siteText);
+  };
+
+  it('is the statement, flattened, for a site in a simple statement or a block body', () => {
+    expect(sites([
+      'T.clear();',
+      'const x = f(',
+      '  T,',
+      ');',
+      'function g() { if (a) { T.set(1, 2); } }',
+    ])).toEqual(['T.clear();', 'const x = f( T, );', 'T.set(1, 2);']);
+  });
+
+  it('is the innermost OBJECT-LITERAL member, not a whole export', () => {
+    expect(sites([
+      'export const __testing = {',
+      '  a: 1,',
+      '  T,',
+      '  b: () => T.size,',
+      '  c: { d: [T] },',
+      '  e() { return T; },',
+      '  f: 2,',
+      '};',
+    ])).toEqual(['T', 'b: () => T.size', 'd: [T]', 'return T;']);
+  });
+
+  it('is only the HEAD of a compound statement for a site in its head', () => {
+    expect(sites([
+      'for (const [cell, c] of T) {',
+      '  use(cell, c);',
+      '}',
+      'for (const c of T.values()) min = Math.min(min, c.size);',
+      'if (ready(T)) { go(); } else { stop(); }',
+      'while (T.size > 0) drain();',
+      'for (let i = 0; i < T.length; i++) {}',
+      'for (const k in T) {}',
+      'switch (T.kind) { case 1: break; }',
+      'outer: for (const x of T) {}',
+    ])).toEqual([
+      'for (const [cell, c] of T)',
+      'for (const c of T.values())',
+      'if (ready(T))',
+      'while (T.size > 0)',
+      'for (let i = 0; i < T.length; i++)',
+      'for (const k in T)',
+      'switch (T.kind)',
+      'for (const x of T)',
+    ]);
+  });
+
+  it('narrows into a body that is not a block, and down an else-if chain', () => {
+    expect(sites([
+      'for (const c of cells) min = Math.min(min, T.get(c));',
+      'if (a) x = 1; else if (T.has(b)) y = 2; else z = T;',
+      'while (go) if (T) { stop(); }',
+      'do T.pop(); while (more);',
+    ])).toEqual([
+      'min = Math.min(min, T.get(c));',
+      'if (T.has(b))',
+      'z = T;',
+      'if (T)',
+      'do T.pop(); while (more);',
+    ]);
   });
 });

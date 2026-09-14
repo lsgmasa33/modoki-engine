@@ -5,7 +5,8 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { findDeleteBoundaries, describeBoundary } from '../../scripts/deleteBoundary.mjs';
 import { makeDirLink } from '../helpers/linkFixture';
-import { readScannedSource } from '@modoki/engine/testing';
+import { readScannedSource, stripComments } from '@modoki/engine/testing';
+import { callsToPath, calleeName, lineOf, parseSource, precedingStatements, ts, unwrapValue } from '@modoki/engine/testing/sourceAst';
 import { refuseUnsafeReplace } from '../../toolchain/replaceGuard';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
@@ -308,6 +309,59 @@ describe('deleteBoundary — the subtree pre-flight (#990/#989/#1004)', () => {
   });
 });
 
+/** Every recursive `fs.rmSync(<dest>, { recursive: true, … })` in `code`, each with whether a bare
+ *  `refuseUnsafeReplace(<dest>)` statement has already run whenever IT runs — an earlier statement of
+ *  its own block, or of a block enclosing it (`precedingStatements`).
+ *
+ *  ⚠️ **Each delete's own pre-flight (#1179).** This replaced a `findIndex` for the FIRST line holding
+ *  `fs.rmSync(dest, { recursive: true` and a 5-line window above it: a formatter-wrapped call was not
+ *  found at all, a second delete of the same destination was never looked at, and a pre-flight inside
+ *  an earlier `if` — which does not run on every path — sat in the window and counted. Not seen: a
+ *  destination REASSIGNED between the two statements. */
+function replaceSites(code: string, label: string, dest: string): Array<{ line: number; preflighted: boolean }> {
+  const isDest = (e: ts.Expression | undefined) => !!e && ts.isIdentifier(unwrapValue(e)) && (unwrapValue(e) as ts.Identifier).text === dest;
+  return callsToPath(parseSource(code, label), 'fs.rmSync')
+    .filter((c) => isDest(c.arguments[0]))
+    .filter((c) => {
+      const opts = c.arguments[1] && unwrapValue(c.arguments[1]);
+      return !!opts && ts.isObjectLiteralExpression(opts) && opts.properties.some((p) => ts.isPropertyAssignment(p)
+        && ts.isIdentifier(p.name) && p.name.text === 'recursive' && p.initializer.kind === ts.SyntaxKind.TrueKeyword);
+    })
+    .map((c) => ({
+      line: lineOf(c),
+      preflighted: precedingStatements(c).some((st) => {
+        if (!ts.isExpressionStatement(st)) return false;
+        const e = unwrapValue(st.expression);
+        return ts.isCallExpression(e) && calleeName(e) === 'refuseUnsafeReplace' && isDest(e.arguments[0]);
+      }),
+    }));
+}
+
+describe('the replace-site reader asks each delete for ITS OWN pre-flight (#1179)', () => {
+  const read = (src: string) => replaceSites(stripComments(src), 'fixture.ts', 'latest').map((r) => r.preflighted);
+
+  it('accepts a wrapped delete, and a pre-flight further up the same block or an enclosing one', () => {
+    expect(read('refuseUnsafeReplace(latest)\nfs.rmSync(\n  latest,\n  { recursive: true, force: true },\n)')).toEqual([true]);
+    expect(read('refuseUnsafeReplace(latest)\na()\nb()\nc()\nd()\ne()\nf()\ntry {\n  fs.rmSync(latest, { recursive: true })\n} finally {}')).toEqual([true]);
+  });
+
+  it.each([
+    ['a SECOND delete of the same destination — the old findIndex saw only the first',
+      'function a() {\n  refuseUnsafeReplace(latest)\n  fs.rmSync(latest, { recursive: true })\n}\nfunction b() {\n  fs.rmSync(latest, { recursive: true })\n}', [true, false]],
+    ['a pre-flight inside an earlier branch, which does not run on every path',
+      'if (paranoid) {\n  refuseUnsafeReplace(latest)\n}\nfs.rmSync(latest, { recursive: true, force: true })', [false]],
+    ['a pre-flight of a DIFFERENT destination', 'refuseUnsafeReplace(stage)\nfs.rmSync(latest, { recursive: true })', [false]],
+    ['a pre-flight AFTER the delete', 'fs.rmSync(latest, { recursive: true })\nrefuseUnsafeReplace(latest)', [false]],
+    ['a pre-flight only in a COMMENT', '// refuseUnsafeReplace(latest)\nfs.rmSync(latest, { recursive: true })', [false]],
+  ])('reads %s', (_why, src, expected) => {
+    expect(read(src)).toEqual(expected);
+  });
+
+  it('a non-recursive rm of the destination is not a replace site', () => {
+    expect(read('fs.rmSync(latest, { force: true })\nfs.rmSync(latest, { recursive: false })')).toEqual([]);
+  });
+});
+
 /** #1006 close-out — the sweep's OWN residue. #1006 sized the population at two user-owned
  *  delete sites and fixed both; this pass's re-sweep found two more of the same mechanism inside
  *  `engine/toolchain/`, one line away from a staging directory, which is how the original sweep
@@ -332,14 +386,12 @@ describe('every persistent-destination REPLACE in engine/toolchain consults the 
 
   it.each(SITES)('$file guards its rmSync of $dest', ({ file, dest }) => {
     const { code } = readScannedSource(path.resolve(__dirname, '../../toolchain', file));
-    const lines = code.split('\n');
-    const i = lines.findIndex((l) => l.includes(`fs.rmSync(${dest}, { recursive: true`));
-    expect(i, `no recursive rmSync of \`${dest}\` found in ${file} — fix the parser, not the test`)
-      .toBeGreaterThan(-1);
-    // The pre-flight must run BEFORE the delete, not merely exist somewhere in the file.
-    const before = lines.slice(Math.max(0, i - 5), i).join('\n');
-    expect(before, `${file} deletes ${dest} without the #883 pre-flight immediately before it`)
-      .toMatch(/refuseUnsafeReplace\(/);
+    const sites = replaceSites(code, file, dest);
+    expect(sites.length, `no recursive rmSync of \`${dest}\` found in ${file} — fix the parser, not the test`)
+      .toBeGreaterThan(0);
+    // The pre-flight must run BEFORE the delete, on every path to it — not merely exist somewhere in the file.
+    expect(sites.filter((x) => !x.preflighted).map((x) => `${file}:${x.line}`),
+      `${file} deletes ${dest} without the #883 pre-flight having run before it`).toEqual([]);
   });
 
   it('shares ONE policy rather than pasting it — and that policy REFUSES', () => {

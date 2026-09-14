@@ -13,21 +13,22 @@
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { walkClosure } from './importClosure';
 import { makeScratchDir } from './scratchDir';
 
-/** A three-file chain: entry → mid → leaf, where only `leaf` reaches the forbidden specifier. */
+/** A three-file chain: entry → mid → leaf, where only `leaf` reaches the forbidden specifier. `entry`
+ *  re-exports `mid` and `mid` imports `leaf` dynamically — the two edge kinds a line reader missed or
+ *  had to regex separately. */
 let srcDir: string;
 
 beforeAll(() => {
   srcDir = makeScratchDir('import-closure-');
   fs.mkdirSync(path.join(srcDir, 'nested'), { recursive: true });
-  fs.writeFileSync(path.join(srcDir, 'entry.ts'), "import { m } from './nested/mid';\nexport { m };\n");
+  fs.writeFileSync(path.join(srcDir, 'entry.ts'), "export { m } from './nested/mid';\n");
   fs.writeFileSync(
     path.join(srcDir, 'nested', 'mid.ts'),
-    "import { l } from './leaf';\nexport const m = l;\n",
+    "export const m = () => import('./leaf');\n",
   );
   fs.writeFileSync(path.join(srcDir, 'nested', 'leaf.ts'), "import 'three/webgpu';\nexport const l = 1;\n");
 });
@@ -58,6 +59,38 @@ describe('walkClosure', () => {
     // a single-segment address has no separator to get wrong.
     const { offenders } = walk([{ file: 'nested/mid.ts', spec: './leaf' }]);
     expect(offenders).toEqual([]);
+  });
+
+  it('skips only a DYNAMIC import at that address — a static import beside it is still followed (#1179)', () => {
+    // A flag folds away the branch an import() sits in; nothing folds a static import. Keyed on the
+    // address alone, this edge was skipped and its gate check (which reads only the import()) passed.
+    const dir = makeScratchDir('import-closure-static-');
+    fs.writeFileSync(path.join(dir, 'entry.ts'), "import './leaf';\nexport const lazy = () => import('./leaf');\n");
+    fs.writeFileSync(path.join(dir, 'leaf.ts'), "import 'three/webgpu';\n");
+    const { offenders } = walkClosure({ srcDir: dir, entries: ['entry.ts'], forbidden: ['three/webgpu'], skipEdges: [{ file: 'entry.ts', spec: './leaf' }] });
+    expect(offenders).toHaveLength(1);
+  });
+
+  it('treats a non-script import as a leaf, and re-reads a file rewritten between walks (#1179 P4 review)', () => {
+    const dir = makeScratchDir('import-closure-leaf-');
+    fs.writeFileSync(path.join(dir, 'data.json'), '{ "a": 1 }\n');
+    fs.writeFileSync(path.join(dir, 's.css'), 'a { b: c }\n');
+    fs.writeFileSync(path.join(dir, 'i.svg'), '<svg/>\n');
+    fs.writeFileSync(path.join(dir, 'entry.ts'), "import d from './data.json';\nimport './s.css';\nimport u from './i.svg';\nexport { d, u };\n");
+    const walkDir = () => walkClosure({ srcDir: dir, entries: ['entry.ts'], forbidden: ['three/webgpu'] });
+    expect(walkDir()).toEqual({ visited: ['entry.ts', 'data.json', 's.css', 'i.svg'], offenders: [] });
+    // Same path, different content: the second walk must see the new edge — also when the rewrite keeps
+    // the size and lands in the same mtime tick (forced here, since a fast disk does it by itself).
+    const entry = path.join(dir, 'entry.ts');
+    fs.writeFileSync(entry, "import './leaf-a';\n");
+    fs.writeFileSync(path.join(dir, 'leaf-a.ts'), '');
+    fs.writeFileSync(path.join(dir, 'leaf-b.ts'), "import 'three/webgpu';\n");
+    const stamp = new Date(2026, 0, 1);
+    fs.utimesSync(entry, stamp, stamp);
+    expect(walkDir().offenders).toEqual([]);
+    fs.writeFileSync(entry, "import './leaf-b';\n");
+    fs.utimesSync(entry, stamp, stamp);
+    expect(walkDir().offenders).toHaveLength(1);
   });
 
   it('leaves an unrelated skipEdge inert — the allowlist must not silence the whole walk', () => {

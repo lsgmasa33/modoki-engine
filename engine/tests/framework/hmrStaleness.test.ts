@@ -17,6 +17,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { readScannedSource } from '@modoki/engine/testing';
+import { flatText, importsIn, lineOf, parseSource } from '@modoki/engine/testing/sourceAst';
 import type { HotLike } from '../../app/debug/hmrStaleness';
 
 // Type-only reference (not a value import) — keeps this test file, like the module it covers,
@@ -340,24 +341,54 @@ describe('the countdown names the ACTUAL cause, not a fixed one (#850)', () => {
   });
 });
 
+/** The module edges a file writes to `@modoki/engine` or any subpath of it, by kind (#1179).
+ *
+ *  This was a line filter — a line starting `import` and not `import(` must not mention the package —
+ *  which a wrapped `import {\n  x,\n} from '@modoki/engine/editor'` passed (its `from` line does not
+ *  start with `import`), and which never looked at `export … from`. It still counts `import type` as
+ *  static, as the line filter did: the rule is "only the dynamic import", and a type import is how a
+ *  value import starts. */
+export function engineEdges(code: string, label: string): { static: string[]; dynamicEditor: number } {
+  const edges = importsIn(parseSource(code, label)).filter((e) => e.spec === '@modoki/engine' || e.spec.startsWith('@modoki/engine/'));
+  return {
+    static: edges.filter((e) => e.kind !== 'dynamic').map((e) => `${label}:${lineOf(e.node)}: ${flatText(e.node)}`),
+    dynamicEditor: edges.filter((e) => e.kind === 'dynamic' && e.spec === '@modoki/engine/editor').length,
+  };
+}
+
 describe('layering — this module has no direct editor-state import (#850)', () => {
   it('imports @modoki/engine only via the guarded dynamic import, never statically', async () => {
     const path = await import('node:path');
-    const src = readScannedSource(
-      path.join(__dirname, '../../app/debug/hmrStaleness.ts'),
-    ).code;
+    const edges = engineEdges(readScannedSource(path.join(__dirname, '../../app/debug/hmrStaleness.ts')).code, 'hmrStaleness.ts');
 
     // Positive control: the dynamic imports must actually be present in the source — a check
     // that would pass just as well against a file importing nothing proves nothing.
-    const dynamicImports = src.match(/import\(['"]@modoki\/engine\/editor['"]\)/g) ?? [];
-    expect(dynamicImports.length).toBeGreaterThan(0);
+    expect(edges.dynamicEditor).toBeGreaterThan(0);
 
-    // The actual guard: no static `import ... from '@modoki/engine...'` line anywhere.
-    const staticImportLines = src
-      .split('\n')
-      .filter((line) => /^\s*import\b/.test(line) && !/^\s*import\(/.test(line));
-    for (const line of staticImportLines) {
-      expect(line).not.toMatch(/@modoki\/engine/);
-    }
+    // The actual guard: no static import or re-export of the package, however it is formatted.
+    expect(edges.static).toEqual([]);
+  });
+
+  it('engineEdges reads each edge from its declaration, not its first line (#1179)', () => {
+    const edges = (code: string) => engineEdges(code, 'fixture.ts');
+    expect(edges(`import {
+      unsavedChangeCauses,
+    } from '@modoki/engine/editor';
+    import type { X } from '@modoki/engine';
+    export { y } from '@modoki/engine/runtime';
+    import z = require('@modoki/engine/editor');
+    import { other } from '@modoki/engineering';
+    const s = "import { a } from '@modoki/engine'";
+    async function f() { return import(
+      '@modoki/engine/editor'); }
+    const g = () => import('@modoki/engine/runtime');`)).toEqual({
+      static: [
+        "fixture.ts:1: import { unsavedChangeCauses, } from '@modoki/engine/editor';",
+        "fixture.ts:4: import type { X } from '@modoki/engine';",
+        "fixture.ts:5: export { y } from '@modoki/engine/runtime';",
+        "fixture.ts:6: import z = require('@modoki/engine/editor');",
+      ],
+      dynamicEditor: 1,
+    });
   });
 });

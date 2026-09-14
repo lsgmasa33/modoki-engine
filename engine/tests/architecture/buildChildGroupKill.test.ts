@@ -17,28 +17,41 @@
  *
  *  The mechanism itself (does a group kill actually reach the grandchild?) is proven in
  *  `engine/tests/plugins/buildStepShell.test.ts`, which spawns real processes. This guard
- *  only pins the CALL SITES to it. */
+ *  only pins the CALL SITES to it.
+ *
+ *  ⚠️ **Both checks read the parse, not lines or whole-file counts (#1179).** A per-line match missed
+ *  `activeProc\n  ?.kill(…)`; and "as many `killBuildProcess(activeProc)` as `let activeProc`" was a
+ *  FILE-grain count, so a route killing twice paid for a route that never kills. Each binding must
+ *  now reach a kill of its own, resolved by symbol. Comments are blanked by the scanner, so the
+ *  three `(D6)` blocks may still NAME the old `proc.kill()` shape to explain why it was wrong. */
 import { describe, it, expect } from 'vitest';
 import * as path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
+import { callsTo, findNodes, lineOf, parseSource, readsOf, referencesToPath, ts } from '@modoki/engine/testing/sourceAst';
 
 const scannerPath = path.resolve(__dirname, '../../plugins/vite-asset-scanner.ts');
+
+/** Every read of `activeProc.kill` / `proc.kill` — called or handed on — as `line: text`. */
+function directKills(code: string, label: string): string[] {
+  const sf = parseSource(code, label);
+  return referencesToPath(sf, 'activeProc.kill', 'proc.kill').map((r) => `${lineOf(r)}: ${r.getText(sf)}`);
+}
+
+/** Every `let activeProc` binding, with whether one of ITS OWN reads is `killBuildProcess`'s argument. */
+function trackedProcs(code: string, label: string): Array<{ line: number; killed: boolean }> {
+  const sf = parseSource(code, label);
+  const kills = new Set(callsTo(sf, 'killBuildProcess').flatMap((c) => [...c.arguments]));
+  return findNodes(sf, (n): n is ts.VariableDeclaration & { name: ts.Identifier } =>
+    ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.name.text === 'activeProc')
+    .map((d) => ({ line: lineOf(d), killed: readsOf(d.name).some((r) => kills.has(r)) }));
+}
 
 describe('build children are killed as a process group (#176)', () => {
   const src = readScannedSource(scannerPath).code;
 
   it('no abort path signals the spawned pid directly', () => {
-    // Matches `activeProc.kill(`, `activeProc?.kill(`, `proc.kill(` — the pre-#176 form.
-    const offenders = src
-      .split('\n')
-      .map((line, i) => ({ line: line.trim(), n: i + 1 }))
-      // Comments are excluded deliberately: the three `(D6)` blocks NAME the old
-      // `proc.kill()` shape to explain why it was wrong, and a guard that forbids
-      // describing a bug pressures the next author to delete the explanation.
-      .filter(({ line }) => !line.startsWith('//') && !line.startsWith('*'))
-      .filter(({ line }) => /\b(activeProc|proc)\s*\??\.kill\s*\(/.test(line));
     expect(
-      offenders.map(({ n, line }) => `${n}: ${line}`),
+      directKills(src, 'vite-asset-scanner.ts'),
       'use killBuildProcess(proc) — a direct .kill() orphans a compound step\'s grandchildren',
     ).toEqual([]);
   });
@@ -46,9 +59,18 @@ describe('build children are killed as a process group (#176)', () => {
   it('every route that tracks an activeProc aborts it through killBuildProcess', () => {
     // Three routes keep an `activeProc`: /api/add-native-target, /api/build, /api/ota/publish.
     // A fourth added later must not quietly reintroduce the direct-kill shape.
-    const tracked = src.match(/let activeProc\b/g) ?? [];
-    const killed = src.match(/killBuildProcess\(activeProc\)/g) ?? [];
+    const tracked = trackedProcs(src, 'vite-asset-scanner.ts');
     expect(tracked.length).toBeGreaterThanOrEqual(3);
-    expect(killed.length).toBe(tracked.length);
+    expect(tracked.filter((t) => !t.killed).map((t) => `line ${t.line}`)).toEqual([]);
+  });
+
+  it('the detectors see a WRAPPED kill, and a route is not paid for by its neighbour\'s kill (#1179)', () => {
+    expect(directKills('declare const activeProc: any;\nactiveProc\n  ?.kill(\'SIGTERM\');\nconst k = proc.kill.bind(proc);', 'f.ts'))
+      .toEqual(['2: activeProc\n  ?.kill', '4: proc.kill']);
+    const twoRoutes = [
+      'function a() { let activeProc = null; on(() => { killBuildProcess(activeProc); killBuildProcess(activeProc); }); }',
+      'function b() { let activeProc = null; on(() => { activeProc = null; }); }',
+    ].join('\n');
+    expect(trackedProcs(twoRoutes, 'f.ts')).toEqual([{ line: 1, killed: true }, { line: 2, killed: false }]);
   });
 });

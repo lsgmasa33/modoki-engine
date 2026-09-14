@@ -555,6 +555,103 @@ export function stripHashComments(src: string): string {
   return out;
 }
 
+/** One shell COMMAND LINE as the shell reads it: the physical lines a backslash-newline joins. */
+export interface ShellLogicalLine {
+  /** The joined text, each backslash-newline removed as the shell removes it. */
+  text: string;
+  /** 1-based physical line the logical line STARTS on — what a failure message should cite. */
+  line: number;
+}
+
+/**
+ * Shell source split into LOGICAL lines — for a guard that asks a question of one command (#1179).
+ *
+ * A formatter, or a human with a long `node "$PATHS" kill "${APP:?…}" 2>/dev/null || true`, wraps a
+ * command with `\` at the end of a line, and a per-PHYSICAL-line guard then sees half of it: the
+ * redirect that must be on the call is on the next line, and the call fails for the wrong reason or —
+ * the direction that matters — a required token on the continuation line vouches for nothing, while a
+ * forbidden one there is never read.
+ *
+ * Pass it `readScannedSource(abs).code` (comments blanked, line-preserving), so a `\` at the end of a
+ * comment is already gone.
+ *
+ * ⚠️ **Only a backslash-newline joins — deliberately not `&&`, `||`, `|` or a quote left open at the end
+ * of a line**, although the shell continues the command across all of those. Each of them either
+ * separates two COMMANDS (`a &&` ⏎ `b` is two), where joining would let the next command vouch for
+ * this one — the neighbour defect this exists to remove — or, for an open quote, cannot be told from a
+ * heredoc body's apostrophe without a real shell parser, and a wrong join swallows every line up to the
+ * next quote in the file. A `\` inside single quotes is literal and joins nothing; an escaped `\\` at
+ * the end joins nothing either.
+ *
+ * ⚠️ **A CRLF line ending is read as its line.** A checkout with `core.autocrlf=true` (the `win` clone)
+ * ends every line with a backslash and then a CR, which no backslash-at-the-end test sees — so every
+ * join silently fell back to physical lines on Windows only (#1179 P7 review). The CR is dropped from
+ * the returned text.
+ *
+ * ⚠️ **Known limit:** a heredoc body line ending in `\` is joined to the next body line, as in any
+ * `<<EOF` (unquoted) heredoc the shell itself would also join; a `<<'EOF'` body would not be.
+ */
+export function shellLogicalLines(code: string): ShellLogicalLine[] {
+  const out: ShellLogicalLine[] = [];
+  const physical = code.split('\n');
+  let text: string | null = null;
+  let start = 0;
+  let quote: '"' | "'" | null = null;
+  physical.forEach((withCr, i) => {
+    const l = withCr.endsWith('\r') ? withCr.slice(0, -1) : withCr;
+    if (text === null) { text = ''; start = i + 1; quote = null; }
+    let joins = false;
+    for (let j = 0; j < l.length; j += 1) {
+      const c = l[j];
+      if (quote === "'") { if (c === "'") quote = null; continue; }
+      if (c === '\\') {
+        if (j === l.length - 1) joins = true;
+        j += 1;
+        continue;
+      }
+      if (quote === '"') { if (c === '"') quote = null; } else if (c === '"' || c === "'") quote = c;
+    }
+    if (joins) { text += l.slice(0, -1); return; }
+    out.push({ text: text + l, line: start });
+    text = null;
+  });
+  if (text !== null) out.push({ text, line: start });
+  return out;
+}
+
+/**
+ * Whether position `index` of one shell COMMAND LINE (a `shellLogicalLines` entry) sits inside a command
+ * substitution — `$( … )` or backticks — read from the START of the line, so a separator inside the
+ * substitution (`$(cd x && node … )`) does not hide the `$(` that opened it (#1179 P7 review).
+ *
+ * A context stack, because quoting nests the way the shell nests it: inside `"…"` an apostrophe is
+ * literal but `$(` and backticks still open a substitution (`"can't: $("$BIN")"` — a flat single-quote
+ * flag read that apostrophe as opening a string and skipped the `$(`, #1179 final review); inside `'…'`
+ * nothing opens; a plain `(` is its own level, so its `)` does not close a substitution.
+ *
+ * ⚠️ An approximation, stated: a substitution opened on an EARLIER physical line without a backslash is
+ * not seen (`shellLogicalLines` does not join it); arithmetic `$(( … ))` reads as a substitution (the
+ * conservative direction); and ANSI-C `$'…\'…'`, a `case` pattern's `)` and a process substitution
+ * `<( … )` are not modelled.
+ */
+export function insideShellSubstitution(text: string, index: number): boolean {
+  const stack: Array<'sub' | 'tick' | 'dq' | 'sq' | 'paren'> = [];
+  const top = (): string | undefined => stack[stack.length - 1];
+  for (let i = 0; i < index && i < text.length; i += 1) {
+    const c = text[i];
+    if (top() === 'sq') { if (c === "'") stack.pop(); continue; }
+    if (c === '\\') { i += 1; continue; }
+    if (c === '$' && text[i + 1] === '(') { stack.push('sub'); i += 1; continue; }
+    if (c === '`') { if (top() === 'tick') stack.pop(); else stack.push('tick'); continue; }
+    if (top() === 'dq') { if (c === '"') stack.pop(); continue; }
+    if (c === '"') stack.push('dq');
+    else if (c === "'") stack.push('sq');
+    else if (c === '(') stack.push('paren');
+    else if (c === ')' && (top() === 'sub' || top() === 'paren')) stack.pop();
+  }
+  return stack.includes('sub') || stack.includes('tick');
+}
+
 /** The comment syntaxes `readScannedSource` knows how to blank. */
 export type ScanLanguage = 'js' | 'braces' | 'swift' | 'shell' | 'jsonc' | 'yaml';
 

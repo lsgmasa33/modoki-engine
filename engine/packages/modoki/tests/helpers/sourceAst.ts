@@ -35,6 +35,12 @@
 
 import ts from 'typescript';
 
+/** Re-exported so a project's own tests (`games/<id>/tests`) can write a per-guard walk without
+ *  importing `typescript` by name — a game reaches the engine only through `@modoki/engine`. (The
+ *  module itself still has to resolve: it is a devDependency of the package, so a game copied OUT of
+ *  the monorepo needs `typescript` installed to run these tests at all.) */
+export { ts };
+
 /** The parser mode a file's extension asks for. `.mjs`/`.cjs`/`.js` as JS, so a JS-only construct
  *  is not a diagnostic; `.tsx`/`.jsx` with JSX, so a `<Tag>` is not a type assertion. */
 export function scriptKindFor(label: string): ts.ScriptKind {
@@ -89,6 +95,122 @@ export function findNodes<T extends ts.Node>(root: ts.Node, pick: (n: ts.Node) =
 export function callsTo(root: ts.Node, ...names: string[]): ts.CallExpression[] {
   const wanted = new Set(names);
   return findNodes(root, (n): n is ts.CallExpression => ts.isCallExpression(n) && wanted.has(calleeName(n) ?? ''));
+}
+
+/**
+ * The dotted name an expression reads, however it is formatted (#1179): `performance\n  .now` →
+ * `'performance.now'`, `(mesh.material as Material)` → `'mesh.material'`, `a?.b!` → `'a.b'`,
+ * `o['k']` → `'o.k'`, `process.argv[1]` → `'process.argv[1]'`, `import.meta.url` → `'import.meta.url'`,
+ * `this.x` → `'this.x'`. `undefined` when any link is not a name — a call (`f().x`), a computed key
+ * (`o[k]`), a literal — because such a chain has no spelling a guard could have meant.
+ */
+export function accessPath(e: ts.Expression): string | undefined {
+  const p = chainPath(e);
+  return p === undefined || p.includes(UNNAMED) ? undefined : p;
+}
+
+/** Stands in for a link with no name (`f()`, `o[k]`) inside `chainPath`. Not a legal identifier, so
+ *  no wanted path can contain it. */
+const UNNAMED = '<?>';
+
+/** `accessPath`, except an unnamed link survives as `UNNAMED` — so `f().getPath` is `'<?>.getPath'`,
+ *  which a SUFFIX match on `getPath` still finds, and `accessPath` refuses. */
+function chainPath(e: ts.Expression): string | undefined {
+  const u = unwrapValue(e);
+  if (ts.isIdentifier(u)) return u.text;
+  if (u.kind === ts.SyntaxKind.ThisKeyword) return 'this';
+  if (ts.isMetaProperty(u)) return `${ts.tokenToString(u.keywordToken)}.${u.name.text}`;
+  if (ts.isPropertyAccessExpression(u)) {
+    if (!ts.isIdentifier(u.name)) return undefined; // `#private`
+    return `${chainPath(u.expression) ?? UNNAMED}.${u.name.text}`;
+  }
+  if (ts.isElementAccessExpression(u)) {
+    const base = chainPath(u.expression) ?? UNNAMED;
+    const k = unwrapValue(u.argumentExpression);
+    if (ts.isStringLiteralLike(k)) return `${base}.${k.text}`;
+    if (ts.isNumericLiteral(k)) return `${base}[${k.text}]`;
+  }
+  return undefined;
+}
+
+/** `path` names one of `wanted` — equal to it, or ending in it on a segment boundary, the way the
+ *  `\bperformance\.now` regexes these replace matched: `globalThis.performance.now` names
+ *  `performance.now`; `myperformance.now` does not. */
+function pathNames(path: string | undefined, wanted: readonly string[]): string | undefined {
+  if (path === undefined) return undefined;
+  return wanted.find((w) => path === w || path.endsWith(`.${w}`));
+}
+
+/** True when `id` sits in a NAME position rather than reading a value: a declaration's own name, a
+ *  property access's member name, an import/export clause, a type. A `{ x }` shorthand is a read. */
+function isNamePosition(id: ts.Identifier): boolean {
+  const p: ts.Node = id.parent;
+  const named = p as ts.Node & { name?: ts.Node; propertyName?: ts.Node };
+  if (ts.isShorthandPropertyAssignment(p)) return false;
+  // `newGuid<string>` (an instantiation expression) and a CLASS's `extends X` both evaluate their
+  // operand at runtime; only `implements X` and an interface's `extends X` are pure types.
+  if (ts.isExpressionWithTypeArguments(p) && !(ts.isHeritageClause(p.parent)
+    && (p.parent.token === ts.SyntaxKind.ImplementsKeyword || ts.isInterfaceDeclaration(p.parent.parent)))) return false;
+  // `name`/`propertyName` covers every declaration, `import x`/`import * as x`/`import x =`, and a
+  // member name; the rest are positions that are types or jump targets.
+  if (named.name === id || named.propertyName === id) return true;
+  return ts.isQualifiedName(p) || ts.isTypeNode(p) || ts.isLabeledStatement(p) || ts.isBreakOrContinueStatement(p);
+}
+
+/**
+ * Every place in `root` that READS one of `paths` (see `accessPath` for the spelling and the suffix
+ * rule), in source order — called or not. A call is the common case, but `mint = newGuid` and
+ * `const now = performance.now.bind(performance)` hand the same function on to be called later, and
+ * a `\bnewGuid\s*\(` line match never saw either. So does `const { now } = performance`, which is
+ * returned as its binding element.
+ *
+ * Only the outermost node of a chain counts (`a.b.c` is one read of `a.b.c`, not also of `a.b`),
+ * and a declaration's own name is not a read of it (`function newGuid()`).
+ *
+ * ⚠️ **Not reached, and not claimed** (probed in the #1179 P1 review; none occurs in the tree, and the
+ * per-line regexes this replaces missed them too): an ALIAS (`const p = performance; p.now()` — that
+ * is dataflow, see `readsOf`); a destructure from anything but a named chain (`= await import(…)`,
+ * `= a ?? b`), in an assignment (`({ now } = performance)`) or a parameter default; a nested pattern.
+ */
+export function referencesToPath(root: ts.Node, ...paths: string[]): Array<ts.Expression | ts.BindingElement> {
+  const out: Array<ts.Expression | ts.BindingElement> = [];
+  const visit = (n: ts.Node): void => {
+    if (ts.isIdentifier(n) || ts.isPropertyAccessExpression(n) || ts.isElementAccessExpression(n)) {
+      const inner = n.parent && (ts.isPropertyAccessExpression(n.parent) || ts.isElementAccessExpression(n.parent))
+        && n.parent.expression === n;
+      const named = ts.isIdentifier(n) && isNamePosition(n);
+      // A link inside a longer matching chain is not a read of its own; a chain whose longer form
+      // does NOT match (`performance.now.bind`) still reads `performance.now` here.
+      const outerMatches = inner && pathNames(chainPath(n.parent as ts.Expression), paths) !== undefined;
+      if (!named && !outerMatches && pathNames(chainPath(n), paths) !== undefined) {
+        out.push(n);
+      }
+    }
+    if (ts.isBindingElement(n) && ts.isObjectBindingPattern(n.parent) && ts.isVariableDeclaration(n.parent.parent)
+      && n.parent.parent.initializer && !n.dotDotDotToken) {
+      const base = chainPath(n.parent.parent.initializer);
+      const key = n.propertyName ?? n.name;
+      if (base !== undefined && ts.isIdentifier(key) && pathNames(`${base}.${key.text}`, paths) !== undefined) out.push(n);
+    }
+    ts.forEachChild(n, visit);
+  };
+  visit(root);
+  return out;
+}
+
+/** The call `ref` is the callee of — `performance\n  .now()`, `(a as B).f?.()` — or `undefined`
+ *  when the read is not called on the spot. */
+export function callOf(ref: ts.Node): ts.CallExpression | undefined {
+  if (!ts.isExpression(ref)) return undefined;
+  const carrier = valueCarrier(ref);
+  const p = carrier.parent;
+  return p && ts.isCallExpression(p) && p.expression === carrier ? p : undefined;
+}
+
+/** Every CALL in `root` whose callee reads one of `paths` — `referencesToPath` filtered to the
+ *  reads that are called on the spot. */
+export function callsToPath(root: ts.Node, ...paths: string[]): ts.CallExpression[] {
+  return referencesToPath(root, ...paths).map(callOf).filter((c): c is ts.CallExpression => c !== undefined);
 }
 
 /** A node whose VALUE is its operand's value: parentheses, `as`, `satisfies`, `<T>x`, `x!`, `await`. */
@@ -166,11 +288,18 @@ function checkerFor(sf: ts.SourceFile): ts.TypeChecker {
   return checker;
 }
 
-/** The symbol an identifier USES — for a `{ x }` shorthand, the variable `x`, not the property. */
+/** The symbol an identifier USES — for a `{ x }` shorthand, the variable `x`, not the property; for
+ *  `export { x }` / `export { x as y }`, the local `x`, not the export alias (#1179). */
 function valueSymbolAt(checker: ts.TypeChecker, id: ts.Identifier): ts.Symbol | undefined {
-  return ts.isShorthandPropertyAssignment(id.parent) && id.parent.name === id
-    ? checker.getShorthandAssignmentValueSymbol(id.parent)
-    : checker.getSymbolAtLocation(id);
+  const p = id.parent;
+  if (ts.isShorthandPropertyAssignment(p) && p.name === id) return checker.getShorthandAssignmentValueSymbol(p);
+  // Only the un-aliased `export { x }` needs this: in `export { x as y }` the checker already resolves
+  // `x` to the local, and an `export { x } from './m'` target resolves to nothing under `noResolve`,
+  // so it can never equal a binding of this file. Both mutation-checked redundant.
+  if (ts.isExportSpecifier(p) && p.name === id) {
+    return checker.getExportSpecifierLocalTargetSymbol(p);
+  }
+  return checker.getSymbolAtLocation(id);
 }
 
 /** The declaration an identifier resolves to, by the file's own scopes, or `undefined`. */
@@ -270,8 +399,267 @@ export function calledNames(root: ts.Node): string[] {
   return findNodes(root, ts.isCallExpression).map(calleeName).filter((n): n is string => n !== undefined);
 }
 
+/** The statement `n` belongs to: the nearest ancestor-or-self whose parent holds statements (a
+ *  block, a file, a module block, a `case`). For code at the top of a concise arrow body, that is
+ *  whatever statement the arrow itself sits in. */
+export function statementOf(n: ts.Node): ts.Node {
+  let cur = n;
+  while (cur.parent && !(ts.isBlock(cur.parent) || ts.isSourceFile(cur.parent) || ts.isModuleBlock(cur.parent)
+    || ts.isCaseClause(cur.parent) || ts.isDefaultClause(cur.parent) || ts.isClassLike(cur.parent))) cur = cur.parent;
+  return cur; // a class MEMBER is its own unit — never the whole class
+}
+
+/**
+ * The nearest NAMED function `n` runs in, climbing past anonymous callbacks: a function or method
+ * declaration, an accessor, or an arrow/function expression bound by `const x =`, `x: …` in an object
+ * literal, or a class field. `undefined` when NO named function encloses it — module scope, but also
+ * code whose only enclosing functions are unnamed: an IIFE, `export default function () {}`, a
+ * computed method name, an arrow assigned with `x = () => …` or wrapped in a ternary or cast, a class
+ * static block. A key built on it alone lumps all of those together.
+ *
+ * For a ledger KEY, pair it with the statement: a statement's text alone (`return base ??
+ * app.getPath('userData');`) matches that same statement in ANY function, so a pardon written for one
+ * accessor silently moves to a copy of its body elsewhere (#1179 P1 review).
+ */
+export function enclosingNamedFunction(n: ts.Node): { name: string; node: ts.Node } | undefined {
+  for (let cur = n.parent; cur; cur = cur.parent) {
+    if (!ts.isFunctionLike(cur)) continue;
+    if (ts.isConstructorDeclaration(cur)) return { name: 'constructor', node: cur };
+    const own =(cur as ts.Node & { name?: ts.Node }).name;
+    if (own && (ts.isIdentifier(own) || ts.isStringLiteral(own) || ts.isPrivateIdentifier(own))) return { name: own.text, node: cur };
+    const holder = cur.parent;
+    const bound = holder && (ts.isVariableDeclaration(holder) || ts.isPropertyAssignment(holder) || ts.isPropertyDeclaration(holder))
+      && holder.initializer === cur ? holder.name : undefined;
+    if (bound && (ts.isIdentifier(bound) || ts.isStringLiteral(bound) || ts.isPrivateIdentifier(bound))) return { name: bound.text, node: cur };
+  }
+  return undefined;
+}
+
+/** `n`'s source text with every whitespace run collapsed to one space — for a ledger KEY or a
+ *  message, where a formatter's wrap must not change the name. Never for classifying: that is
+ *  what the node is for. Comments inside `n` stay as the source has them (blank them first with
+ *  `readScannedSource`). */
+export function flatText(n: ts.Node): string {
+  return n.getText(n.getSourceFile()).replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * The smallest readable unit naming WHERE `n` sits, as flat text — for a ledger key or a message. Its
+ * statement (`flatText(statementOf(n))`), narrowed in the two places a statement is too big to be a key:
+ *
+ * - inside an OBJECT LITERAL, the innermost member holding `n` — `cellCenters` for the shorthand in a
+ *   700-line `export const __testing = { … }`, not the whole export;
+ * - in the HEAD of a compound statement, the head alone — `for (const c of cellCenters.values())`,
+ *   `if (ready(cellCenters))`, not the loop or branch body. In a body that is not a block
+ *   (`for (…) x = f(n)`), the body statement, narrowed the same way.
+ *
+ * A key is still paired with its function (see `enclosingNamedFunction`): a member or a head alone
+ * matches the same text anywhere else.
+ */
+export function siteText(n: ts.Node): string {
+  const sf = n.getSourceFile();
+  let stmt = statementOf(n);
+  for (;;) {
+    for (let cur: ts.Node = n; cur !== stmt; cur = cur.parent) {
+      if (ts.isObjectLiteralElementLike(cur)) return flatText(cur);
+    }
+    const bodies = compoundBodies(stmt);
+    const body = bodies.find((b) => b.getStart(sf) <= n.getStart(sf) && n.end <= b.end);
+    if (body) { stmt = body; continue; }
+    const head = bodies[0] ?? (ts.isSwitchStatement(stmt) ? stmt.caseBlock : undefined);
+    if (!head) return flatText(stmt);
+    return sf.text.slice(stmt.getStart(sf), head.getStart(sf)).replace(/\s+/g, ' ').trim();
+  }
+}
+
+/** The statements a compound statement runs, in source order — empty for a simple one (and for a
+ *  `switch`, whose clauses `statementOf` already stops at). */
+function compoundBodies(s: ts.Node): ts.Statement[] {
+  if (ts.isIfStatement(s)) return s.elseStatement ? [s.thenStatement, s.elseStatement] : [s.thenStatement];
+  if (ts.isForStatement(s) || ts.isForInStatement(s) || ts.isForOfStatement(s) || ts.isWhileStatement(s)
+    || ts.isLabeledStatement(s)) return [s.statement];
+  return [];
+}
+
 /** 1-based line of `n`'s first non-trivia character. */
 export function lineOf(n: ts.Node): number {
   const sf = n.getSourceFile();
   return sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1;
+}
+
+const printer = ts.createPrinter({ removeComments: true });
+
+/** `n` as the TypeScript printer spells it, whitespace collapsed — for COMPARING code written in two
+ *  places (a gate mirrored across files, a pinned expression), where a formatter's wrap must not make
+ *  equal code differ. `flatText` keeps the source's spacing inside a wrap (`( a || b`); this does
+ *  not. Parentheses the source wrote stay: they are nodes, not formatting. */
+export function printedText(n: ts.Node): string {
+  return printer.printNode(ts.EmitHint.Unspecified, n, n.getSourceFile()).replace(/\s+/g, ' ').trim();
+}
+
+/** The statement list `p` holds, when it holds one. */
+function statementListOf(p: ts.Node): readonly ts.Node[] | undefined {
+  if (ts.isBlock(p) || ts.isSourceFile(p) || ts.isModuleBlock(p) || ts.isCaseClause(p) || ts.isDefaultClause(p)) return p.statements;
+  return undefined;
+}
+
+/** A statement that leaves the enclosing list on EVERY path: `return`, `throw`, `continue`, `break`,
+ *  a block holding one at its top level, or an `if` both of whose branches do. Syntactic only — a
+ *  call that always throws, or `process.exit()`, is not known to exit. */
+function alwaysExits(s: ts.Statement): boolean {
+  if (ts.isReturnStatement(s) || ts.isThrowStatement(s) || ts.isContinueStatement(s) || ts.isBreakStatement(s)) return true;
+  if (ts.isBlock(s)) return s.statements.some(alwaysExits);
+  if (ts.isIfStatement(s)) return !!s.elseStatement && alwaysExits(s.thenStatement) && alwaysExits(s.elseStatement);
+  return false;
+}
+
+/** One condition code runs under: `test` held (`holds: true`) or had failed (`holds: false`) whenever
+ *  it executes. `by` is the node that imposes it — the `if`, the `? :`, the `&&`/`||`, or the
+ *  early-exit `if` above. */
+export interface Guard { test: ts.Expression; holds: boolean; by: ts.Node }
+
+/**
+ * Every condition `n` runs under, innermost first — what a gate check reads instead of "the nearest
+ * `if (` line above", which vouches for an occurrence that sits AFTER that `if`'s block, or inside a
+ * nested one (#1179):
+ * - the THEN (holds) or ELSE (failed) branch of an `if`, and the two arms of a `? :`;
+ * - the right operand of `a && n` (holds) or `a || n` (failed);
+ * - an EARLIER statement of an enclosing list that is `if (T) <always exits>` with no `else` — `T`
+ *   failed, or control would not have reached `n` (an early `return`, `throw`, `continue`, `break`).
+ *
+ * ⚠️ **It climbs THROUGH functions.** A gate dominating where a closure is CREATED dominates what the
+ * closure does, which is the question a build's dead-code elimination asks (`textureResolver`'s probe
+ * factory is an arrow built below its `if (!__MODOKI_MODULE_RENDER3D__) return`). A function
+ * DECLARATION is hoisted to the top of its OWN statement list, so code above an early exit in that list
+ * can call it: the early exits before a declaration are not its guards. The branches ENCLOSING that list
+ * still are — in a module a block-level declaration is scoped to its block (#1179 P3 re-review: stopping
+ * at the declaration instead dropped a real enclosing `if` and let a nested gate pass as the only one).
+ *
+ * Not a guard: a loop condition, a `switch` case, a `try`, `??`, and an exit that is not syntactically
+ * certain (see `alwaysExits`).
+ */
+export function guardsOf(n: ts.Node): Guard[] {
+  const out: Guard[] = [];
+  for (let cur: ts.Node = n, p = n.parent; p; cur = p, p = p.parent) {
+    if (ts.isIfStatement(p)) {
+      if (cur !== p.expression) out.push({ test: p.expression, holds: cur === p.thenStatement, by: p });
+    } else if (ts.isConditionalExpression(p)) {
+      if (cur === p.whenTrue || cur === p.whenFalse) out.push({ test: p.condition, holds: cur === p.whenTrue, by: p });
+    } else if (ts.isBinaryExpression(p)) {
+      const op = p.operatorToken.kind;
+      if (cur === p.right && (op === ts.SyntaxKind.AmpersandAmpersandToken || op === ts.SyntaxKind.BarBarToken)) {
+        out.push({ test: p.left, holds: op === ts.SyntaxKind.AmpersandAmpersandToken, by: p });
+      }
+    } else {
+      const list = statementListOf(p);
+      if (!list || ts.isFunctionDeclaration(cur)) continue;
+      for (let j = list.indexOf(cur) - 1; j >= 0; j -= 1) {
+        const s = list[j];
+        if (ts.isIfStatement(s) && !s.elseStatement && alwaysExits(s.thenStatement)) out.push({ test: s.expression, holds: false, by: s });
+      }
+    }
+  }
+  return out;
+}
+
+/** Whether `guard` proves `isAtom` TRUE where it applies: the atom itself held, `!atom` failed, either
+ *  side of a held `&&`, either side of a failed `||` (parentheses and casts peeled). Anything it cannot
+ *  decide — `a ? b : c`, `a === true`, a variable holding the test — proves nothing.
+ *
+ *  `value: false` asks the mirror question — the atom is proven FALSE: `if (refused()) return;` above,
+ *  or `if (!refused()) { … }` around. Not `!guardProves(…)`: "not proven true" is not "proven false". */
+export function guardProves(guard: Guard, isAtom: (e: ts.Expression) => boolean, value = true): boolean {
+  const proves = (test: ts.Expression, holds: boolean): boolean => {
+    const e = unwrapValue(test);
+    if (isAtom(e)) return holds === value;
+    if (ts.isPrefixUnaryExpression(e) && e.operator === ts.SyntaxKind.ExclamationToken) return proves(e.operand, !holds);
+    if (ts.isBinaryExpression(e)) {
+      const op = e.operatorToken.kind;
+      if (op === ts.SyntaxKind.AmpersandAmpersandToken && holds) return proves(e.left, true) || proves(e.right, true);
+      if (op === ts.SyntaxKind.BarBarToken && !holds) return proves(e.left, false) || proves(e.right, false);
+    }
+    return false;
+  };
+  return proves(guard.test, guard.holds);
+}
+
+/**
+ * The statements that have already run whenever `n`'s own statement runs, nearest first: its earlier
+ * siblings, then the earlier siblings of each statement enclosing it, up to the enclosing FUNCTION's
+ * body (a function's caller decides what ran before it). A statement nested inside an earlier branch,
+ * loop or `try` is not listed — only the enclosing lists' own entries are, which is what makes "the
+ * pre-flight ran before the delete" a claim about THIS delete rather than about a line nearby.
+ *
+ * (An earlier sibling can still have exited, and then `n` never runs — `guardsOf` reads those.)
+ */
+export function precedingStatements(n: ts.Node): ts.Statement[] {
+  const out: ts.Statement[] = [];
+  for (let cur: ts.Node = n, p = n.parent; p && !ts.isFunctionLike(p); cur = p, p = p.parent) {
+    const list = statementListOf(p);
+    if (!list) continue;
+    for (let j = list.indexOf(cur) - 1; j >= 0; j -= 1) out.push(list[j] as ts.Statement);
+  }
+  return out;
+}
+
+/** One module edge a file writes — see `importsIn`. */
+export interface ModuleEdge {
+  /** The specifier as written: `'./a'`, `'three/webgpu'`. */
+  spec: string;
+  /** `import … from` / `import 'x'` / `import x = require('x')` · `export … from` · `import('x')`. */
+  kind: 'import' | 'reexport' | 'dynamic';
+  /** Erased from the emitted JavaScript: `import type`, `export type … from`, `import type x = require()`.
+   *  NOT an import whose every specifier is `type`-marked — under `verbatimModuleSyntax` (this repo) that
+   *  still emits `import {} from 'x'`, which runs the module. */
+  typeOnly: boolean;
+  /** What it binds, by the name the MODULE exports (`imported`) and the name this file uses (`local`):
+   *  `{ a as b }` → `a`/`b`; a default import → `default`; `* as ns` → `*`; `import x = require()` → `*`.
+   *  Empty for a side-effect import, `export * from`, and `import()` (whose result is the whole module). */
+  bindings: Array<{ imported: string; local: string }>;
+  node: ts.Node;
+}
+
+/**
+ * Every module edge in `sf`, in source order — static imports, re-exports and literal `import('…')`
+ * calls — read from the declarations themselves (#1179).
+ *
+ * It replaces a statement joiner that took an `import` at COLUMN 0 and appended lines until one matched
+ * `from '…'`, then regexed that text. It never saw an `export … from '…'` edge (a barrel's whole reason
+ * to exist), an `import` that does not start its line, or `import()` of a template literal; and it read
+ * dynamic imports out of RAW text, comments and strings included. `typeof import('x')` is a type node,
+ * not a call, and is not an edge; an `import()` whose specifier is not a literal names no module and is
+ * skipped.
+ */
+export function importsIn(sf: ts.SourceFile): ModuleEdge[] {
+  const out: ModuleEdge[] = [];
+  const visit = (n: ts.Node): void => {
+    if (ts.isImportDeclaration(n) && ts.isStringLiteralLike(n.moduleSpecifier)) {
+      const clause = n.importClause;
+      const bindings: ModuleEdge['bindings'] = [];
+      if (clause?.name) bindings.push({ imported: 'default', local: clause.name.text });
+      const named = clause?.namedBindings;
+      if (named && ts.isNamespaceImport(named)) bindings.push({ imported: '*', local: named.name.text });
+      if (named && ts.isNamedImports(named)) {
+        for (const e of named.elements) bindings.push({ imported: (e.propertyName ?? e.name).text, local: e.name.text });
+      }
+      out.push({ spec: n.moduleSpecifier.text, kind: 'import', typeOnly: !!clause?.isTypeOnly, bindings, node: n });
+    } else if (ts.isImportEqualsDeclaration(n) && ts.isExternalModuleReference(n.moduleReference)
+      && ts.isStringLiteralLike(n.moduleReference.expression)) {
+      out.push({ spec: n.moduleReference.expression.text, kind: 'import', typeOnly: n.isTypeOnly, bindings: [{ imported: '*', local: n.name.text }], node: n });
+    } else if (ts.isExportDeclaration(n) && n.moduleSpecifier && ts.isStringLiteralLike(n.moduleSpecifier)) {
+      const clause = n.exportClause;
+      const bindings: ModuleEdge['bindings'] = [];
+      if (clause && ts.isNamespaceExport(clause)) bindings.push({ imported: '*', local: clause.name.text });
+      if (clause && ts.isNamedExports(clause)) {
+        for (const e of clause.elements) bindings.push({ imported: (e.propertyName ?? e.name).text, local: e.name.text });
+      }
+      out.push({ spec: n.moduleSpecifier.text, kind: 'reexport', typeOnly: n.isTypeOnly, bindings, node: n });
+    } else if (ts.isCallExpression(n) && n.expression.kind === ts.SyntaxKind.ImportKeyword) {
+      const spec = n.arguments[0] && ts.isStringLiteralLike(n.arguments[0]) ? n.arguments[0].text : undefined;
+      if (spec !== undefined) out.push({ spec, kind: 'dynamic', typeOnly: false, bindings: [], node: n });
+    }
+    ts.forEachChild(n, visit);
+  };
+  visit(sf);
+  return out;
 }

@@ -3,6 +3,7 @@ import path from 'node:path';
 import realFs from 'node:fs';
 import { readScannedSource } from '@modoki/engine/testing';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
+import { calleeName, callsTo, callsToPath, enclosingFunction, enclosingNamedFunction, flatText, lineOf, parseSource, referencesToPath, statementOf, stringValueOf, ts, unwrapValue } from '@modoki/engine/testing/sourceAst';
 import {
   resolveUserDataDir,
   resolveToolchainDir,
@@ -336,26 +337,120 @@ describe('main.ts must fix userData before anything reads it', () => {
   const raw = readScannedSource(path.join(__dirname, '..', '..', 'electron', 'main.ts')).code;
   // Comments here DISCUSS getPath('userData')/setName by name, so match against CODE only —
   // blank the comment lines rather than drop them, to keep every offset comparable.
-  const src = raw
-    .split('\n')
-    .join('\n');
+  const src = raw;
+  // ⚠️ **Positions come from the PARSE, not `src.indexOf("app.setPath('userData'")` (#1179).** A
+  // formatter-wrapped `app.setPath(\n  'userData', …)` made that `-1`, and `expect(-1)
+  // .toBeLessThan(initFileLog)` PASSED — the one ordering this describe exists for went green on a
+  // file where it could no longer find the setPath at all. Every anchor below is a found CALL.
+  const sf = parseSource(src, 'main.ts');
+  const userDataCalls = (method: string): ts.CallExpression[] =>
+    callsToPath(sf, method).filter((c) => stringValueOf(c.arguments[0]) === 'userData');
+  const setPaths = userDataCalls('app.setPath');
+  const at = setPaths[0]?.getStart(sf) ?? Number.NaN;
+  /** Start offset of the first CALL named `name`, or NaN (which no comparison passes). */
+  const firstCallAt = (name: string): number => callsTo(sf, name)[0]?.getStart(sf) ?? Number.NaN;
+  /**
+   * Where a call runs, for a ledger key: the nearest NAMED function (or `<module>`), then — when the
+   * call sits in an anonymous callback below that — the SHORT name of the call the callback is handed
+   * to, with its first string argument when it has one: `<module>>then(…)`,
+   * `<module>>handle('modoki:x')`, `outer>forEach(…)`.
+   *
+   * ⚠️ Short names on purpose, and the named function always kept (#1179 P1 re-review): keyed on the
+   * host call's full text, a `.catch` handler off `app.whenReady().then(async () => { …800 lines… })`
+   * got an 18 KB key that went stale on any edit to startup; and returning the innermost host INSTEAD
+   * of the named function let `memo(() => …)` carry a pardon into any other function using `memo`.
+   */
+  const scopeOf = (c: ts.Node): string => {
+    const named = enclosingNamedFunction(c);
+    let host = '';
+    for (let cur = c.parent; cur && cur !== named?.node; cur = cur.parent) {
+      const p = cur.parent;
+      if (!ts.isFunctionLike(cur) || !p || !(ts.isCallExpression(p) || ts.isNewExpression(p))) continue;
+      const callee = ts.isNewExpression(p) ? `new ${flatText(p.expression)}` : calleeName(p) ?? '<?>';
+      const tag = p.arguments?.[0] && stringValueOf(p.arguments[0]);
+      host = `>${callee}(${tag === undefined ? '…' : `'${tag}'`})`;
+      break; // the innermost host — the named function above it is already in the key
+    }
+    return `${named?.name ?? '<module>'}${host}`;
+  };
+  const VITE_CACHE_FN = '<module>>then(…)';
+  /** True when `c` sits in the THEN branch of an `if` whose condition IS `shouldOverrideUserData(
+   *  process.argv)` — `!shouldOverrideUserData(…)` and `… || true` merely contain the call, and each
+   *  inverts or voids the gate (#1179 P1 re-review). */
+  const gatedByOverride = (c: ts.Node): boolean => {
+    for (let cur: ts.Node = c; cur.parent; cur = cur.parent) {
+      const p = cur.parent;
+      if (!ts.isIfStatement(p) || p.thenStatement !== cur) continue;
+      const cond = unwrapValue(p.expression);
+      if (ts.isCallExpression(cond) && calleeName(cond) === 'shouldOverrideUserData' && cond.arguments.length === 1
+        && flatText(cond.arguments[0]!) === 'process.argv') return true;
+    }
+    return false;
+  };
 
   it('guards the setPath behind shouldOverrideUserData (never clobber --user-data-dir)', () => {
-    expect(src).toMatch(/shouldOverrideUserData\(process\.argv\)/);
+    // ⚠️ THE setPath call itself must sit in the THEN branch of an `if` whose condition calls
+    // `shouldOverrideUserData(process.argv)` (#1179 P1 review). This was a whole-file regex: moving
+    // the setPath below the closing brace made it unconditional, clobbering `--user-data-dir`, with
+    // the regex still satisfied by the `if` left behind.
+    expect(setPaths.map(gatedByOverride)).toEqual([true]);
+  });
+
+  it('the gate detector accepts only THE call as the condition, and only its then-branch (#1179 re-review)', () => {
+    const probe = parseSource([
+      "if (shouldOverrideUserData(process.argv)) { app.setPath('userData', a); }",
+      "if (!shouldOverrideUserData(process.argv)) app.setPath('userData', b);",
+      "if (shouldOverrideUserData(process.argv) || true) app.setPath('userData', c);",
+      "if (shouldOverrideUserData(process.argv)) {} else { app.setPath('userData', d); }",
+      "if (shouldOverrideUserData(process.argv)) {}\napp.setPath('userData', e);",
+    ].join('\n'), 'probe.ts');
+    expect(callsToPath(probe, 'app.setPath').map(gatedByOverride)).toEqual([true, false, false, false, false]);
+  });
+
+  it('scopeOf keys a call by its named function PLUS a short host, never a host that swallows the function (#1179 re-review)', () => {
+    const probe = parseSource([
+      "function outer() { arr.forEach(() => { app.getPath('userData'); }); }",
+      "function editorStateDir() { return memo(() => app.getPath('userData')); }",
+      "function crashDumpDir() { return memo(() => app.getPath('userData')); }",
+      "app.whenReady().then(async () => { longBody(); }).catch((e) => { app.getPath('userData'); });",
+      "ipcMain.handle('modoki:x', async () => { app.getPath('userData'); });",
+      "new Promise((r) => { app.getPath('userData'); });",
+      "app.getPath('userData');",
+    ].join('\n'), 'probe.ts');
+    expect(callsToPath(probe, 'getPath').map(scopeOf)).toEqual([
+      'outer>forEach(…)', 'editorStateDir>memo(…)', 'crashDumpDir>memo(…)', '<module>>catch(…)',
+      "<module>>handle('modoki:x')", '<module>>new Promise(…)', '<module>',
+    ]);
   });
 
   it("calls app.setPath('userData', …) exactly once", () => {
-    expect(src.match(/app\.setPath\(\s*'userData'/g) ?? []).toHaveLength(1);
+    expect(setPaths).toHaveLength(1);
+  });
+
+  it('…and that call, and every initFileLog() call, runs at MODULE LOAD — source order is only run order there', () => {
+    // Every ordering check below compares source POSITIONS. That is run order only for code that
+    // runs as the module loads: a setPath moved into `const later = () => app.setPath(…)` keeps its
+    // position above initFileLog() and runs after it (found by the #1179 mutation check); and an
+    // `initFileLog()` moved into `function bootLog()` that is CALLED above the setPath keeps its
+    // position below it and runs first (#1179 P1 review).
+    //
+    // ⚠️ NOT covered: `chooseInitialProject` runs inside the memo `initialProjectChoice()`, so its
+    // position is not its run time, and the "decides the project ABOVE the setPath" check below reads
+    // the memo body's position. Pre-existing; resolving call order is not a source-position question.
+    expect(setPaths.map((c) => ts.isSourceFile(enclosingFunction(c)))).toEqual([true]);
+    const logInits = callsTo(sf, 'initFileLog');
+    expect(logInits.length).toBeGreaterThanOrEqual(1);
+    expect(logInits.filter((c) => !ts.isSourceFile(enclosingFunction(c))).map((c) => `main.ts:${lineOf(c)}`)).toEqual([]);
   });
 
   it('setPath comes BEFORE initFileLog() — the reader that caused the regression', () => {
-    expect(src.indexOf("app.setPath('userData'")).toBeLessThan(src.indexOf('initFileLog();'));
+    expect(Number.isFinite(at) && Number.isFinite(firstCallAt('initFileLog'))).toBe(true);
+    expect(at).toBeLessThan(firstCallAt('initFileLog'));
   });
 
-  it('NO app.getPath("userData") appears above the setPath', () => {
-    const at = src.indexOf("app.setPath('userData'");
-    expect(at).toBeGreaterThan(-1);
-    expect(src.slice(0, at)).not.toMatch(/app\.getPath\(\s*'userData'\s*\)/);
+  it('NO getPath("userData") appears above the setPath', () => {
+    expect(Number.isFinite(at)).toBe(true);
+    expect(userDataCalls('getPath').filter((c) => c.getStart(sf) < at).map((c) => `main.ts:${lineOf(c)}`)).toEqual([]);
   });
 
   /** ⚠️ **The accessor must not LAUNDER the read past the rule above** (#1036 §2d review F1).
@@ -372,10 +467,10 @@ describe('main.ts must fix userData before anything reads it', () => {
    *  (opt-out model) — re-enabling a remote-debugging port the user turned off, with all 59 tests
    *  in this file green. That is the `app.setName`/ff364b47 shape exactly. */
   it('NO editorStateDir() call appears above the setPath either', () => {
-    const at = src.indexOf("app.setPath('userData'");
-    const above = src.slice(0, at);
-    // the DECLARATION is below the setPath; any *call* above it reads the wrong dir
-    expect(above).not.toMatch(/editorStateDir\(\)/);
+    // the DECLARATION is below the setPath; any READ of it above — a call, or the function handed
+    // on to be called — reads the wrong dir. A declaration's own name is not a read.
+    expect(Number.isFinite(at)).toBe(true);
+    expect(referencesToPath(sf, 'editorStateDir').filter((r) => r.getStart(sf) < at).map((r) => `main.ts:${lineOf(r)}`)).toEqual([]);
   });
 
   /** ⚠️ The same ordering hazard one level up (#1036 §2d review F1, second half). The memoised
@@ -385,10 +480,9 @@ describe('main.ts must fix userData before anything reads it', () => {
    *  `globalRecentsFile()`, the pre-scoping junk drawer that mixes every clone's projects. The
    *  `getRecentProjects()` count-of-one guard below still passes. */
   it('setRecentsScope runs BEFORE the project decision that reads recents', () => {
-    const scope = src.indexOf('setRecentsScope(');
-    const choice = src.indexOf('chooseInitialProject(');
-    expect(scope).toBeGreaterThan(-1);
-    expect(choice).toBeGreaterThan(-1);
+    const scope = firstCallAt('setRecentsScope');
+    const choice = firstCallAt('chooseInitialProject');
+    expect(Number.isFinite(scope) && Number.isFinite(choice)).toBe(true);
     expect(scope).toBeLessThan(choice);
   });
 
@@ -403,9 +497,8 @@ describe('main.ts must fix userData before anything reads it', () => {
   // ── #1036: the profile is keyed on the PROJECT, decided above the setPath ──
 
   it('decides the project ABOVE the setPath — otherwise there is nothing to key on', () => {
-    const at = src.indexOf("app.setPath('userData'");
-    expect(src.indexOf('chooseInitialProject(')).toBeGreaterThan(-1);
-    expect(src.indexOf('chooseInitialProject(')).toBeLessThan(at);
+    expect(Number.isFinite(at) && Number.isFinite(firstCallAt('chooseInitialProject'))).toBe(true);
+    expect(firstCallAt('chooseInitialProject')).toBeLessThan(at);
   });
 
   /** ⚠️ **ONE decision, computed once — not two that are expected to agree** (#1036 review F3/F5).
@@ -428,7 +521,7 @@ describe('main.ts must fix userData before anything reads it', () => {
     // `resolveInitialProject` free to recompute. (#1036 §2d review F4.)
     expect((src.match(/initialProjectChoice\(\)/g) ?? []).length).toBeGreaterThanOrEqual(4);
     // …and the profile block must not hand-roll the env/recents precedence beside it.
-    const at = src.indexOf("app.setPath('userData'");
+    expect(Number.isFinite(at)).toBe(true);
     const above = src.slice(0, at);
     expect(above).not.toMatch(/MODOKI_PROJECT\s*(\|\||\?\?)/);
     expect(above).not.toMatch(/recents\s*\[\s*0\s*\]/);
@@ -454,27 +547,33 @@ describe('main.ts must fix userData before anything reads it', () => {
    *  zoom's is the `--user-data-dir` fallback) — but do not read this guard as covering the
    *  whole class, because its docblock used to imply that. (#1036 §2d review F3.) */
   it('getPath("userData") appears ONLY at sanctioned sites — editor-level files use editorStateDir()', () => {
-    // ⚠️ **SPENT per LINE, keyed by the line's code (#1140).** These were four regexes tested with
-    // `.some()` and no staleness check, so `/'vite-cache'/` pardoned every line in main.ts that
-    // mentions the cache dir AND reads userData — a second consumer spelled near it inherited the
-    // reason — and a site that moved to editorStateDir() left its regex pardoning nothing, silently.
-    // Keyed on the comment-stripped, trimmed line: a reformat reddens and asks for the row to be
-    // re-read, which is the point.
+    // ⚠️ **SPENT per CALL, keyed by the statement it sits in (#1140, #1179).** These were four
+    // regexes tested with `.some()` and no staleness check, so `/'vite-cache'/` pardoned every line
+    // in main.ts that mentions the cache dir AND reads userData — a second consumer spelled near it
+    // inherited the reason — and a site that moved to editorStateDir() left its regex pardoning
+    // nothing, silently. Then they were keyed per LINE, and a wrapped `getPath(\n  'userData',\n)`
+    // never entered the population at all. Now every `getPath('userData')` CALL is one occurrence,
+    // keyed `<enclosing named function>::<statement, whitespace-collapsed>` — so, deliberately, a pure
+    // re-wrap of a pardoned statement no longer reddens; changing what it DOES, or moving it to
+    // another function, still does. ⚠️ The function name is load-bearing: keyed on the statement
+    // alone, `return profileBaseDir ?? app.getPath('userData');` pardoned that body in ANY function, so
+    // a `crashDumpDir()` copying it inherited the accessor's reason (#1179 P1 review).
     const allowed: ReadonlyArray<{ item: string; count?: number; reason: string }> = [
-      { item: "function editorStateDir(): string { return profileBaseDir ?? app.getPath('userData'); }",
+      { item: "editorStateDir::return profileBaseDir ?? app.getPath('userData');",
         reason: 'the accessor itself — its fallback when --user-data-dir was passed' },
-      { item: "const cacheDir = path.join(app.getPath('userData'), 'vite-cache');",
+      { item: `${VITE_CACHE_FN}::const cacheDir = path.join(app.getPath('userData'), 'vite-cache');`,
         reason: 'per-PROJECT dep-optimizer cache — correctly scoped to the project profile' },
-      { item: "const sigFile = path.join(app.getPath('userData'), '.vite-cache-build');",
+      { item: `${VITE_CACHE_FN}::const sigFile = path.join(app.getPath('userData'), '.vite-cache-build');`,
         reason: 'the signature file pairing with vite-cache, same scope' },
-      { item: "fs.mkdirSync(app.getPath('userData'), { recursive: true });",
+      { item: `${VITE_CACHE_FN}::fs.mkdirSync(app.getPath('userData'), { recursive: true });`,
         reason: 'creating that same vite-cache parent' },
     ];
     assertExemptionLedger({
       label: 'allowed userData consumers in main.ts',
-      population: src.split('\n')
-        .map((line, i) => ({ item: line.trim(), site: `main.ts:${i + 1}  ${line.trim()}` }))
-        .filter((x) => /getPath\(\s*'userData'\s*\)/.test(x.item)),
+      population: userDataCalls('getPath').map((c) => {
+        const item = `${scopeOf(c)}::${flatText(statementOf(c))}`;
+        return { item, site: `main.ts:${lineOf(c)}  ${item}` };
+      }),
       exempt: allowed,
       floor: 1,
       fix: 'a new userData consumer: use editorStateDir(), or add its line to `allowed` with a reason',

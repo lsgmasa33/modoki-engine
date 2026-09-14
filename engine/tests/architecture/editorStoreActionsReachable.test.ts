@@ -28,6 +28,8 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { repoFiles, repoRoot } from '../../scripts/repoCorpus.mjs';
+import { readScannedSource } from '@modoki/engine/testing';
+import { parseSource, ts } from '@modoki/engine/testing/sourceAst';
 
 const root = path.resolve(__dirname, '../..');
 const storeFile = path.join(root, 'packages/modoki/src/editor/store/editorStore.ts');
@@ -55,27 +57,32 @@ const consumerRoots = ['packages/modoki/src', 'packages/modoki/tests', 'app', 't
  *  no real consumer, delete it. */
 const knownOrphans = new Set<string>([]);
 
-/** The `interface EditorState { … }` block — the store's declared surface. Reading the
- *  INTERFACE rather than the implementation object keeps the extraction to one shape
- *  (`  name: (args) => ret;`) instead of chasing arrow bodies across 700 lines. */
-function editorStateBlock(src: string): string {
-  const start = src.indexOf('\ninterface EditorState {');
-  expect(start, 'interface EditorState not found — did the store get renamed?').toBeGreaterThan(-1);
-  // First line that closes at column 0 ends the block.
-  const rest = src.slice(start + 1);
-  const end = rest.search(/\n\}/);
-  expect(end).toBeGreaterThan(-1);
-  return rest.slice(0, end);
-}
-
-/** Members whose declared type is a function — the store's actions. */
-function actionNames(block: string): string[] {
-  const out: string[] = [];
-  for (const line of block.split('\n')) {
-    const m = /^ {2}([A-Za-z_][A-Za-z0-9_]*)\??: \(/.exec(line);
-    if (m) out.push(m[1]);
-  }
-  return out;
+/** The function-typed members of an `interface EditorState { … }` in `code` — the store's actions:
+ *  a method signature, or a property whose type is a function type (parenthesised, or one arm of a
+ *  union such as `((id: number) => void) | null`). Reading the INTERFACE rather than the
+ *  implementation object keeps the extraction to one shape instead of chasing arrow bodies across
+ *  700 lines.
+ *
+ *  ⚠️ **The interface's own members (#1179).** This read the block by text — from
+ *  `\ninterface EditorState {` to the first `}` at column 0 — and took one member per LINE matching
+ *  `  name?: (`: a member the formatter wrapped (`name:\n    (id: number) => void;`), a method
+ *  signature (`name(id: number): void;`) and a member indented any other way were not actions, so
+ *  their orphans were never looked for. Measured on migrating: 90 either way. */
+function actionNamesIn(code: string, label: string): string[] {
+  const sf = parseSource(code, label);
+  const decls = sf.statements.filter((st): st is ts.InterfaceDeclaration => ts.isInterfaceDeclaration(st) && st.name.text === 'EditorState');
+  expect(decls.length, 'interface EditorState not found — did the store get renamed?').toBeGreaterThan(0);
+  // ⚠️ Members this reader cannot see must FAIL it, not shrink the population: an `extends Slice`, or a
+  // second merged declaration, moves actions out of the one body read here (#1179 P3 review — the
+  // text reader failed on both by accident, because neither starts `interface EditorState {`).
+  expect(decls.length, 'EditorState is declared more than once — merged declarations are not read').toBe(1);
+  const iface = decls[0];
+  expect(iface.heritageClauses ?? [], 'EditorState extends another interface whose actions this reader does not follow — read them, or inline them').toEqual([]);
+  const isFunctionType = (t: ts.TypeNode | undefined): boolean => !!t && (ts.isFunctionTypeNode(t)
+    || (ts.isParenthesizedTypeNode(t) && isFunctionType(t.type)) || (ts.isUnionTypeNode(t) && t.types.some(isFunctionType)));
+  return iface!.members
+    .filter((m) => ts.isMethodSignature(m) || (ts.isPropertySignature(m) && isFunctionType(m.type)))
+    .map((m) => (m.name && (ts.isIdentifier(m.name) || ts.isStringLiteral(m.name)) ? m.name.text : '<computed>'));
 }
 
 /** Every `.ts`/`.tsx` under the consumer roots, via the shared corpus producer
@@ -90,6 +97,28 @@ function sourceFiles(): Array<{ rel: string; abs: string }> {
   })
     .filter(({ rel }) => rel !== storeRel && rel !== selfRel);
 }
+
+describe('the action reader reads the interface\'s own members (#1179)', () => {
+  it('reads a wrapped member, a method signature and a nullable callback; not state, not another interface', () => {
+    const src = [
+      'interface Other {\n  notMine: () => void;\n}',
+      'interface EditorState {',
+      '  selected: number | null;',
+      '  setSelected: (id: number) => void;',
+      '  revealLeadEntityInHierarchyWithAVeryLongName:\n    (id: number, opts?: { scroll: boolean }) => void;',
+      '    oddlyIndented?: () => void;',
+      '  openPanel(id: string): void;',
+      '  onPick: ((id: number) => void) | null;',
+      '}',
+    ].join('\n');
+    expect(actionNamesIn(src, 's.ts')).toEqual(['setSelected', 'revealLeadEntityInHierarchyWithAVeryLongName', 'oddlyIndented', 'openPanel', 'onPick']);
+  });
+
+  it('refuses a shape whose members it cannot see: an `extends`, and a merged second declaration', () => {
+    expect(() => actionNamesIn('interface Slice { a: () => void; }\ninterface EditorState extends Slice {\n  b: () => void;\n}', 's.ts')).toThrow(/extends another interface/);
+    expect(() => actionNamesIn('interface EditorState {\n  a: () => void;\n}\ninterface EditorState {\n  b: () => void;\n}', 's.ts')).toThrow(/more than once/);
+  });
+});
 
 describe('editor store actions are reachable', () => {
   /** NON-VACUITY (#849). Both exclusions are load-bearing and BOTH fail silently: if `storeRel` or
@@ -115,8 +144,7 @@ describe('editor store actions are reachable', () => {
   });
 
   it('every function-typed EditorState member has a consumer outside editorStore.ts', () => {
-    const src = fs.readFileSync(storeFile, 'utf8');
-    const actions = actionNames(editorStateBlock(src));
+    const actions = actionNamesIn(readScannedSource(storeFile).code, 'editorStore.ts');
     // Sanity: the extraction found a plausible surface. A regex that silently matched
     // nothing would make this test pass vacuously — the failure mode the guard exists to
     // catch, reproduced in the guard itself.

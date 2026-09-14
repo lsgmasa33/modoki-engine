@@ -16,6 +16,9 @@ import { describe, it, expect, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
+import {
+  findNodes, flatText, lineOf, parseSource, printedText, stringValueOf, ts, unwrapValue,
+} from '@modoki/engine/testing/sourceAst';
 import { createTestWorld, emit, JOURNAL_LEVELS, type TestWorld } from '@modoki/engine/runtime';
 import { handleBackendRequest, type BackendContext, type Manifest } from '../../plugins/backend/editorBackendRouter';
 import { runAgentOp } from '../../app/debug/agentBridge';
@@ -134,26 +137,89 @@ describe('hit-regions: the same mechanism at the OP (found by the #1072 close-ou
   });
 });
 
-/** The narrowing shape, as the router spelled it: `if (x === 'a' || x === 'b') params.k = x;`. */
-const NARROWING = /if \((\w+) === '[^']*'(?: \|\| \1 === '[^']*')+\) params\.\w+ = \1;/;
+const EQUALITY = new Set([ts.SyntaxKind.EqualsEqualsEqualsToken, ts.SyntaxKind.EqualsEqualsToken]);
+
+/** The one expression an `a === 'x' || a === 'y' || …` test compares against string literals (two or
+ *  more operands, either spelling order), as the printer spells it — or `undefined` for any other test. */
+function comparedSubject(test: ts.Expression): string | undefined {
+  const operands: ts.Expression[] = [];
+  const split = (e: ts.Expression): void => {
+    const u = unwrapValue(e);
+    if (ts.isBinaryExpression(u) && u.operatorToken.kind === ts.SyntaxKind.BarBarToken) { split(u.left); split(u.right); } else operands.push(u);
+  };
+  split(test);
+  if (operands.length < 2) return undefined;
+  const subjects = operands.map((o) => {
+    if (!ts.isBinaryExpression(o) || !EQUALITY.has(o.operatorToken.kind)) return undefined;
+    const [lit, other] = stringValueOf(o.right) !== undefined ? [o.right, o.left] : [o.left, o.right];
+    return stringValueOf(lit) !== undefined && stringValueOf(other) === undefined ? printedText(unwrapValue(other)) : undefined;
+  });
+  return subjects.every((v) => v !== undefined && v === subjects[0]) ? subjects[0] : undefined;
+}
+
+/** Every VOCABULARY COPY in a file: an `if` whose test compares one value against string literals, and
+ *  whose then-branch assigns THAT value onto a property — `if (x === 'a' || x === 'b') params.k = x`.
+ *
+ *  Node-based (#1179). The line regex this replaced needed the whole shape on one line with a bare
+ *  identifier and `params.` spelled out, so a formatter's wrap, a braced branch, a `query.get('level')`
+ *  subject, double quotes or `'a' === x` each hid a copy. A boolean PARSE of a flag assigns a constant,
+ *  not the compared value, and is not one. Not seen either, before or now: `['a', 'b'].includes(x)`, a
+ *  `switch`, a ternary. */
+export function vocabularyCopies(code: string, label: string): string[] {
+  const sf = parseSource(code, label);
+  return findNodes(sf, ts.isIfStatement).flatMap((s) => {
+    const subject = comparedSubject(s.expression);
+    if (!subject) return [];
+    return findNodes(s.thenStatement, (n): n is ts.BinaryExpression => ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken)
+      .filter((a) => { const t = unwrapValue(a.left); return ts.isPropertyAccessExpression(t) || ts.isElementAccessExpression(t); })
+      .filter((a) => printedText(unwrapValue(a.right)) === subject)
+      .map((a) => `${label}:${lineOf(a)}: ${flatText(a)}`);
+  });
+}
 
 describe('guard: the router copies no vocabulary out of a request value', () => {
   it('editorBackendRouter.ts has no `if (x === \'a\' || x === \'b\') params.k = x` narrowing', () => {
     // Through `readScannedSource`, like every source-scanning guard here (#812).
-    const src = readScannedSource(ROUTER).code;
-    const hits = src.split('\n').map((line, i) => ({ line: i + 1, text: line.trim() })).filter((l) => NARROWING.test(l.text));
-    expect(hits, 'Forward the raw value and let the op that owns the table refuse it, with options '
+    expect(vocabularyCopies(readScannedSource(ROUTER).code, 'editorBackendRouter.ts'),
+      'Forward the raw value and let the op that owns the table refuse it, with options '
       + '(docs/mcp-tool-conventions.md §5). A copy here turns a typo into a wrong answer.').toEqual([]);
   });
 
-  it('the pattern recognises the exact shape #1072 removed (so an empty scan means something)', () => {
-    expect(NARROWING.test("if (level === 'info' || level === 'warn' || level === 'error') params.level = level;")).toBe(true);
-    expect(NARROWING.test("if (source === 'human' || source === 'agent') params.source = source;")).toBe(true);
+  const copies = (body: string) => vocabularyCopies(`function route(query: URLSearchParams, params: Record<string, unknown>) {\n${body}\n}`, 'fixture.ts')
+    .map((h) => h.replace(/^fixture\.ts:\d+: /, ''));
+
+  it('recognises the exact shape #1072 removed (so an empty scan means something)', () => {
+    expect(copies("if (level === 'info' || level === 'warn' || level === 'error') params.level = level;")).toEqual(['params.level = level']);
+    expect(copies("if (source === 'human' || source === 'agent') params.source = source;")).toEqual(['params.source = source']);
     // A boolean PARSE of a flag is not a vocabulary copy, and must not trip the guard.
-    expect(NARROWING.test("if (query.get('clear') === '1' || query.get('clear') === 'true') params.clear = true;")).toBe(false);
+    expect(copies("if (query.get('clear') === '1' || query.get('clear') === 'true') params.clear = true;")).toEqual([]);
+  });
+
+  it('…however it is formatted or spelled (#1179: each of these passed the one-line regex)', () => {
+    expect(copies(`if (level === 'info'
+      || level === 'warn') {
+      params.level = level;
+    }
+    if ("human" == source || 'agent' === source) out['source'] = (source as string);
+    if (query.get('action') === 'start' || query.get('action') === 'stop') params.action = query.get('action');
+    if (level === 'info' || level === 'warn') list.forEach(() => { params.level = level; });
+    if (query.get(
+      'kind') === 'a' || query.get('kind') === 'b') params.kind = query.get('kind');`))
+      .toEqual(['params.level = level', "out['source'] = (source as string)", "params.action = query.get('action')", 'params.level = level',
+        "params.kind = query.get('kind')"]);
+  });
+
+  it('…and only the compared value, assigned in that branch, counts', () => {
+    expect(copies(`if (level === 'info' || level === 'warn') params.level = other;
+    if (level === 'info' || other === 'warn') params.level = level;
+    if (level === 'info') params.level = level;
+    if (level === 'info' || level === 'warn') {} else params.level = level;
+    if (level === 'info' || level.startsWith('w')) params.level = level;
+    if (level !== 'info' || level !== 'warn') params.level = level;
+    if ('info' === 'info' || 'info' === 'warn') params.level = 'info';
+    if (level === 'info' || level === 'warn') local = level;`)).toEqual([]);
   });
 });
-
 describe('/api/device/request refuses an unknown input vocabulary value before any transport (#1076)', () => {
   // The inverse of the relayed routes above, and deliberately so: the device's tables are enforced on
   // the far side of a transport this route CHOOSES — CDP dispatches `press-key` itself and never reaches

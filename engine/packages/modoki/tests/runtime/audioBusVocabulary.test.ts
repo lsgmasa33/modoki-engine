@@ -21,77 +21,129 @@ import { describe, it, expect } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readScannedSource } from '../helpers/sourceScanner';
+import { callsTo, calleeName, declarationOf, enclosingFunction, findNodes, lineOf, parseSource, ts, unwrapValue } from '../helpers/sourceAst';
 
 const SRC = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   '../../src/runtime/audio/audioService.ts',
 );
 
-/** `busNode(` uses that are CALLS, not the declaration.
+/** ⚠️ **Every verdict below is read from the parse, per call (#1179).** The first version judged a
+ *  call by its LINE (`SAFE_ARG` over the trimmed text, so a second `busNode(` on that line was judged
+ *  by the first's argument), let its one bare-`bus` exception be an exact line of text, and proved
+ *  that exception's refusal with a whole-file regex any other function's `hasDocKey` satisfied. The
+ *  `journalAudio` half below used a hand-balanced paren scan — a private tokenizer — and a
+ *  whole-file `const bus = resolveBus(…)` regex to vouch for a shorthand `{ bus }` in a different
+ *  function. Reads go through `readScannedSource` per #812 either way: a guard matching RAW text lets
+ *  a COMMENT hide an offender or satisfy an assertion. */
+
+const isCallTo = (e: ts.Expression | undefined, name: string): boolean => {
+  const u = e && unwrapValue(e);
+  return !!u && ts.isCallExpression(u) && calleeName(u) === name;
+};
+
+/** The literal buses a code path may name directly. */
+const BUS_LITERALS = new Set(['master', 'music', 'sfx', 'ui']);
+
+/**
+ * True when `arg` is a PARAMETER of the function the call runs in, and that function's body refuses
+ * it before the call: a statement earlier in the same body is `if (!hasDocKey(busVolumes, <that
+ * parameter>)) { … return …; }`. Resolved by symbol, so a same-named `bus` refused somewhere else
+ * does not count.
  *
- *  ⚠️ Reads through `readScannedSource`, per #812 — a guard matching RAW text lets a COMMENT
- *  hide an offender or satisfy an assertion, both silently. The first version of this file hand-
- *  rolled a "skip lines starting with //" filter, which is the naive half of what the shared
- *  reader does, and `commentStripperIsShared.test.ts` failed it on exactly that. */
-function busNodeCallSites(code: string): { line: number; text: string }[] {
-  const out: { line: number; text: string }[] = [];
-  code.split('\n').forEach((raw, i) => {
-    const text = raw.trim();
-    if (!text.includes('busNode(')) return;
-    if (/^(export\s+)?function\s+busNode\s*\(/.test(text)) return; // the declaration
-    out.push({ line: i + 1, text });
+ * ⚠️ The first version of the bare-identifier rule allowed ANY bare `bus`, meant as room for
+ * `setBusVolume`. It let EVERY site pass a bare `bus`, so un-normalising the video caller kept this
+ * suite green: the guard permitted exactly the defect it was written for. Hence "refused first", not
+ * "is an identifier".
+ */
+function refusedBeforeCall(call: ts.CallExpression, arg: ts.Expression): boolean {
+  const u = unwrapValue(arg);
+  if (!ts.isIdentifier(u)) return false;
+  const param = declarationOf(u);
+  if (!param || !ts.isParameter(param) || !ts.isFunctionDeclaration(param.parent) || !param.parent.body) return false;
+  const body = param.parent.body;
+  let stmt: ts.Node = call;
+  while (stmt.parent && stmt.parent !== body) stmt = stmt.parent;
+  if (stmt.parent !== body) return false; // the call is not in this function's own body
+  const at = body.statements.indexOf(stmt as ts.Statement);
+  return body.statements.slice(0, at).some((s) => {
+    if (!ts.isIfStatement(s)) return false;
+    const test = unwrapValue(s.expression);
+    if (!ts.isPrefixUnaryExpression(test) || test.operator !== ts.SyntaxKind.ExclamationToken) return false;
+    const check = unwrapValue(test.operand);
+    if (!ts.isCallExpression(check) || calleeName(check) !== 'hasDocKey' || check.arguments.length !== 2) return false;
+    // The TABLE matters as much as the key: `hasDocKey(someOtherTable, bus)` refuses nothing about
+    // buses (#1179 P1 review — the first cut never read this argument).
+    // By SYMBOL: the module-level `busVolumes`, not any local spelled alike.
+    const table = unwrapValue(check.arguments[0]!);
+    const tableDecl = ts.isIdentifier(table) ? declarationOf(table) : undefined;
+    if (!tableDecl || !ts.isVariableDeclaration(tableDecl) || !ts.isIdentifier(tableDecl.name)
+      || tableDecl.name.text !== 'busVolumes' || !ts.isSourceFile(enclosingFunction(tableDecl))) return false;
+    const refused = unwrapValue(check.arguments[1]!);
+    if (!ts.isIdentifier(refused) || declarationOf(refused) !== param) return false;
+    const then = s.thenStatement;
+    return ts.isReturnStatement(then) || (ts.isBlock(then) && then.statements.some(ts.isReturnStatement));
   });
-  return out;
 }
 
-/** A bus argument is SAFE only when it is normalised AT THE CALL, or is a code literal.
- *
- *  ⚠️ The first version of this regex also allowed a bare `bus` identifier — meant as room for
- *  `setBusVolume`, which refuses before it calls. It let EVERY site pass a bare `bus`, so
- *  un-normalising the video caller kept this suite green: the guard permitted exactly the defect it
- *  was written for. The bare-identifier case is now ONE named line, below, not a general shape. */
-const SAFE_ARG = /busNode\(\s*g\s*,\s*(resolveBus\(|'(?:master|music|sfx|ui)')/;
-
-/** The single call site allowed to pass a bare `bus`, because it has already RETURNED on an
- *  unknown one. Matched exactly, so an edit to that line re-opens the question rather than
- *  inheriting the exemption. The refusal it depends on is asserted separately below. */
-const REFUSES_BEFORE_CALLING = 'if (g) busNode(g, bus).gain.value = volume;';
+/** Every `busNode(…)` CALL with how its bus argument is made safe, or `'unsafe'`. The declaration
+ *  is not a call and is not listed. */
+function busNodeCallSites(code: string, label: string): Array<{ line: number; text: string; verdict: 'resolved' | 'literal' | 'refused-first' | 'unsafe' }> {
+  const sf = parseSource(code, label);
+  return callsTo(sf, 'busNode').map((c) => {
+    const bus = c.arguments[1];
+    const lit = bus && unwrapValue(bus);
+    const verdict = isCallTo(bus, 'resolveBus') ? 'resolved'
+      : lit && ts.isStringLiteralLike(lit) && BUS_LITERALS.has(lit.text) ? 'literal'
+        : bus && refusedBeforeCall(c, bus) ? 'refused-first' : 'unsafe';
+    return { line: lineOf(c), text: c.getText(sf).replace(/\s+/g, ' '), verdict };
+  });
+}
 
 describe('busNode callers normalise (#993)', () => {
-  const source = readScannedSource(SRC).code;
-  const sites = busNodeCallSites(source);
+  const sites = busNodeCallSites(readScannedSource(SRC).code, 'audioService.ts');
 
   it('the scan finds call sites at all — a vacuous pass is a failure', () => {
     // Without this, renaming `busNode` makes every rule below pass over an empty list.
     expect(sites.length).toBeGreaterThanOrEqual(3);
   });
 
-  it.each([0, 1, 2])('call site #%i passes a normalised or literal bus', (i) => {
-    const site = sites[i];
-    expect(site, `expected at least ${i + 1} busNode call sites`).toBeDefined();
+  it('every call site passes a normalised or literal bus, or refuses an unknown one first', () => {
     expect(
-      SAFE_ARG.test(site.text) || site.text === REFUSES_BEFORE_CALLING,
-      `audioService.ts:${site.line} passes an unnormalised bus into busNode:\n  ${site.text}\n\n`
-      + 'Wrap it in resolveBus(), or refuse the unknown bus before the call as setBusVolume does. '
-      + '`AudioSource.bus` and `VideoPlayer.bus` are both declared as a union by a CAST on a '
-      + 'default, so the value reaching here is an unchecked string from scene JSON (#993).',
-    ).toBe(true);
+      sites.filter((s) => s.verdict === 'unsafe').map((s) => `audioService.ts:${s.line} ${s.text}`),
+      'busNode is passed an unnormalised bus. Wrap it in resolveBus(), or refuse the unknown bus before '
+      + 'the call as setBusVolume does. `AudioSource.bus` and `VideoPlayer.bus` are both declared as a '
+      + 'union by a CAST on a default, so the value reaching here is an unchecked string from scene JSON (#993).',
+    ).toEqual([]);
   });
 
-  it('every call site is covered by the rules above — a fourth caller is not silently allowed', () => {
-    // The it.each above pins three. If a fourth appears, this is what goes red.
+  it('every call site is accounted for — a fourth caller is not silently allowed', () => {
     expect(
-      sites.length,
-      `busNode gained a caller (${sites.length} now). Add it to the it.each range above after `
-      + 'checking it normalises — do not just widen the number.',
-    ).toBe(3);
+      sites.map((s) => s.verdict),
+      `busNode gained or lost a caller (${sites.length} now). Check it normalises, then update this list `
+      + '— do not just widen it.',
+    ).toEqual(['resolved', 'refused-first', 'resolved']);
   });
 
-  it('the one caller that does NOT wrap is the one that refuses first', () => {
-    // `setBusVolume` passes `bus` bare, which is only safe because it returns early on an unknown
-    // bus. Asserting the refusal is what stops that call site being "the exception" by habit.
-    // `return false` since #1074 — the caller mirroring the volume into the mixer store reads it.
-    expect(source).toMatch(/if \(!hasDocKey\(busVolumes, bus\)\)[\s\S]{0,200}?return false;/);
+  it('the detector judges each call by ITS OWN argument and refusal (#1179)', () => {
+    const src = [
+      "const busVolumes = {}; busNode(g, resolveBus(a)); busNode(g, bus); busNode(g, 'sfx'); busNode(g, 'nope');",
+      'function setBusVolume(bus: string) {',
+      '  if (!hasDocKey(busVolumes, bus)) { return false; }',
+      '  busNode(',
+      '    g,',
+      '    bus,',
+      '  );',
+      '}',
+      'function other(bus: string) { busNode(g, bus); }',
+      'function late(bus: string) { busNode(g, bus); if (!hasDocKey(busVolumes, bus)) return false; }',
+      'function shadow(bus: string) { if (!hasDocKey(busVolumes, bus)) return false; { const bus = raw; busNode(g, bus); } }',
+      'function wrongTable(bus: string) { if (!hasDocKey(otherTable, bus)) return false; busNode(g, bus); }',
+      'function shadowTable(bus: string) { const busVolumes = otherTable; if (!hasDocKey(busVolumes, bus)) return false; busNode(g, bus); }',
+    ].join('\n');
+    expect(busNodeCallSites(src, 'a.ts').map((s) => `${s.line}:${s.verdict}`)).toEqual([
+      '1:resolved', '1:unsafe', '1:literal', '1:unsafe', '4:refused-first', '9:unsafe', '10:unsafe', '11:unsafe', '12:unsafe', '13:unsafe',
+    ]);
   });
 });
 
@@ -102,62 +154,79 @@ const SYSTEM_SRC = path.join(
   '../../src/runtime/audio/audioSystem.ts',
 );
 
-/** The full text of every `journalAudio(` CALL, paren-balanced — `startOrSwap`'s payload spans three
- *  lines with `bus:` on the middle one, so a line-based scan (as `busNodeCallSites` is) would read
- *  that call as carrying no bus at all and wave it through. */
-function journalAudioCalls(code: string): string[] {
-  const out: string[] = [];
-  const re = /\bjournalAudio\(/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(code))) {
-    if (/function\s+$/.test(code.slice(Math.max(0, m.index - 16), m.index))) continue; // the declaration
-    let depth = 1;
-    let i = m.index + m[0].length;
-    for (; i < code.length && depth > 0; i++) {
-      if (code[i] === '(') depth++;
-      else if (code[i] === ')') depth--;
-    }
-    out.push(code.slice(m.index, i).replace(/\s+/g, ' '));
-  }
-  return out;
+/**
+ * Every `bus` field inside a `journalAudio(…)` CALL's arguments — a nested literal or a spread's
+ * literal included — and whether its value is resolved: `bus: resolveBus(…)`, or a `{ bus }`
+ * shorthand whose OWN binding (by symbol) was initialised from `resolveBus(…)`. A function inside the
+ * arguments is not this call's payload and is not walked.
+ */
+function journalAudioBusFields(code: string, label: string): Array<{ line: number; text: string; resolved: boolean }> {
+  const sf = parseSource(code, label);
+  return callsTo(sf, 'journalAudio').flatMap((c) => c.arguments.flatMap((arg) =>
+    findNodes(arg, (n): n is ts.PropertyAssignment | ts.ShorthandPropertyAssignment =>
+      (ts.isPropertyAssignment(n) || ts.isShorthandPropertyAssignment(n)) && ts.isIdentifier(n.name) && n.name.text === 'bus'
+      && !ts.isFunctionLike(findAncestorWithin(n, arg)))
+      .map((p) => {
+        let resolved: boolean;
+        if (ts.isPropertyAssignment(p)) resolved = isCallTo(p.initializer, 'resolveBus');
+        else {
+          // A `const` only: `let bus = resolveBus(x); bus = raw;` keeps the initialiser and loses the
+          // value (#1179 P1 review).
+          const decl = declarationOf(p.name);
+          resolved = !!decl && ts.isVariableDeclaration(decl) && ts.isVariableDeclarationList(decl.parent)
+            && (decl.parent.flags & ts.NodeFlags.Const) !== 0 && isCallTo(decl.initializer, 'resolveBus');
+        }
+        return { line: lineOf(c), text: p.getText(sf), resolved };
+      })));
 }
 
-/** The one emission allowed to report `bus` by SHORTHAND: `playOneShot`'s `stolen`, whose `bus` is the
- *  local declared as `resolveBus(spec.bus)` — asserted below. Matched exactly, like
- *  `REFUSES_BEFORE_CALLING`, so an edit to it re-opens the question instead of inheriting this. */
-const SHORTHAND_OK = "journalAudio(world, 'stolen', undefined, { clip: victim.clip, bus, reason: 'voice-cap' })";
+/** The nearest function-like ancestor of `n` strictly inside `root`, or `root` itself when none. */
+function findAncestorWithin(n: ts.Node, root: ts.Node): ts.Node {
+  for (let cur = n.parent; cur && cur !== root; cur = cur.parent) if (ts.isFunctionLike(cur)) return cur;
+  return root;
+}
 
 describe('audioSystem journals the RESOLVED bus on every emission (#1069)', () => {
   // The behavioural half — one case per path, each proven by reverting its call site — is in
   // vocabWiringReaches.test.ts and audioCueRetry.test.ts. This is the POPULATION half: a fifth
   // emission path written with a raw bus has no behavioural test yet, and this is what reds on it.
-  const source = readScannedSource(SYSTEM_SRC).code;
-  const withBus = journalAudioCalls(source).filter((c) => /[{,]\s*bus\s*[:,}]/.test(c));
+  const fields = journalAudioBusFields(readScannedSource(SYSTEM_SRC).code, 'audioSystem.ts');
 
   it('the scan finds bus-carrying emissions at all — a vacuous pass is a failure', () => {
-    expect(withBus.length).toBeGreaterThanOrEqual(5);
+    expect(fields.length).toBeGreaterThanOrEqual(5);
   });
 
   it('every emission that reports a bus passes it through resolveBus()', () => {
-    const offenders = withBus.filter((c) => c !== SHORTHAND_OK && !/\bbus: resolveBus\(/.test(c));
     expect(
-      offenders,
+      fields.filter((f) => !f.resolved).map((f) => `audioSystem.ts:${f.line} ${f.text}`),
       'An `@audio` journal event reports a bus that did not go through resolveBus(). The graph plays '
       + 'an unrecognised bus on sfx, so a raw field makes the journal disagree with what was heard — '
       + 'and the journal is what QA and agents assert on (#993 § 2d, #1069).',
     ).toEqual([]);
   });
 
-  it("the shorthand exception's `bus` is the resolved local", () => {
-    expect(withBus).toContain(SHORTHAND_OK);
-    expect(source).toMatch(/const bus = resolveBus\(spec\.bus\);/);
-  });
-
   it('every emission is covered — a sixth is not silently allowed', () => {
     expect(
-      withBus.length,
-      `audioSystem.ts gained a bus-carrying journalAudio call (${withBus.length} now). Give it a `
+      fields.length,
+      `audioSystem.ts gained a bus-carrying journalAudio call (${fields.length} now). Give it a `
       + 'behavioural case in vocabWiringReaches.test.ts, then update this number.',
     ).toBe(5);
+  });
+
+  it('the detector reads a wrapped payload, and a shorthand is vouched for only by ITS OWN binding (#1179)', () => {
+    const src = [
+      'function start(spec: S) {',
+      '  journalAudio(world, "start", e, {',
+      '    clip: spec.clip,',
+      '    bus: resolveBus(spec.bus),',
+      '  });',
+      '}',
+      'function steal(spec: S) { const bus = resolveBus(spec.bus); journalAudio(world, "stolen", undefined, { bus }); }',
+      'function raw(spec: S) { const bus = spec.bus; journalAudio(world, "x", undefined, { ...(r ? { bus } : {}) }); }',
+      'function paren(spec: S) { journalAudio(world, ")", undefined, { bus: spec.bus }); }',
+      'function cb(spec: S) { journalAudio(world, "x", undefined, {}, () => ({ bus: spec.bus })); }',
+      'function reassigned(spec: S) { let bus = resolveBus(spec.bus); bus = spec.bus; journalAudio(world, "x", undefined, { bus }); }',
+    ].join('\n');
+    expect(journalAudioBusFields(src, 'a.ts').map((f) => `${f.line}:${f.resolved}`)).toEqual(['2:true', '7:true', '8:false', '9:false', '11:false']);
   });
 });

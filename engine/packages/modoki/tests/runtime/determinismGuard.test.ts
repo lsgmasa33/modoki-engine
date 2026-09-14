@@ -30,16 +30,20 @@
  *  `newGuid()`**, which the ledger below now makes visible as a distinct token. Left alone — routing
  *  it is a behaviour change, not this change.
  *
- *  ⚠️ **The new per-line detector was measured against the old whole-file regexes over all 562
- *  runtime files: identical file sets for all three rules**, at 3 / 1 / 7 occurrences. The one
- *  deliberate narrowing: `\s*\(` used to span a newline on whole-file text and per line it cannot,
- *  so `Date.now\n()` would now be missed. No formatter in this repo emits that. */
+ *  ⚠️ **An occurrence is a READ of the name, found in the parse — not a `\btok\s*\(` match per line
+ *  (#1179).** The per-line form missed a wrapped `performance\n  .now()` and never saw an UNCALLED
+ *  read at all: `applyOps(…, mint = newGuid)` hands the unseeded minter on to be called later, and
+ *  it sat in `scene/sceneMutate.ts` unledgered. It also matched `function newGuid()` — a
+ *  DECLARATION — which is what the old sanctioned `core/assetRefRules.ts::newGuid` row pardoned.
+ *  Measured over all 567 runtime files on migrating: those two rows were the ENTIRE delta, every
+ *  other file::token count identical. */
 
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { stripComments, assertScanIsSane } from '../helpers/sourceScanner';
+import { lineOf, parseSource, referencesToPath } from '../helpers/sourceAst';
 import { assertExemptionLedger } from '../helpers/exemptionLedger';
 import { repoFiles } from '../../../../scripts/repoCorpus.mjs';
 
@@ -108,6 +112,13 @@ const GUID_LEDGER = [
     reason: 'ad-hoc runtime-spawn fallback; deterministic callers pass guidSeed',
   },
   {
+    item: 'scene/sceneMutate.ts::newGuid',
+    reason: 'the DEFAULT `mint` of `applyOps` — an uncalled read, handed on and called per added '
+      + 'entity. Its only production caller is the editor backend\'s scene-file mutate route '
+      + '(authoring: an agent or the editor adding entities to a scene on disk); tests inject a '
+      + 'deterministic mint.',
+  },
+  {
     item: 'traits/Persistent.ts::crypto.randomUUID',
     reason: 'one-time guid when an entity is marked persistent (authoring). ⚠️ Note the token: it '
       + 'bypasses newGuid() rather than calling it.',
@@ -115,9 +126,9 @@ const GUID_LEDGER = [
 ] as const;
 
 /** `core/assetRefRules.ts` DEFINES `newGuid()` and its body is the one `crypto.randomUUID()` call
- *  the repo is supposed to have. Structural, not a reviewed exception — see `sanctioned`. */
+ *  the repo is supposed to have. Structural, not a reviewed exception — see `sanctioned`. (The
+ *  definition's own name is not a read, so it needs no row since #1179.) */
 const GUID_SANCTIONED = [
-  'core/assetRefRules.ts::newGuid',
   'core/assetRefRules.ts::crypto.randomUUID',
 ] as const;
 
@@ -136,41 +147,38 @@ const FILES = tsFiles(RUNTIME).map((f) => {
   return { rel: relative(RUNTIME, f).replace(/\\/g, '/'), raw, code: stripComments(raw) };
 });
 
-/** Every occurrence of each token, one ledger row per occurrence.
+/** Every READ of each token in one file's comment-stripped `code`, one entry per occurrence —
+ *  called or not, however formatted (see `referencesToPath`). Pure, so the fixtures below drive the
+ *  very detector the ledgers run on.
  *
  *  ⚠️ Built from the detector's OWN token list rather than a second copy of the pattern — two
  *  matchers free to disagree is how a load-bearing check ends up checking nothing, which is the
- *  lesson `gitReadIsBounded` and `corpusProducerIsShared` both write down. And it counts per LINE
- *  with a global regex, because the old `\.test()` answered one boolean per FILE and so could not
- *  have carried a count at all. */
-const occurrencesOf = (tokens: readonly string[]): Array<{ item: string; site: string }> => {
-  // Hoisted out of the 562-file x per-line loops; it was rebuilding one RegExp per token per LINE.
-  //
-  // ⚠️ Reusing a `/g/` regex across lines is safe HERE only because `String.prototype.match` resets
-  // `lastIndex` to 0 before it iterates. `.exec()` and `.test()` do NOT, and swapping either in
-  // would make every other line silently unmatched.
-  const matchers = tokens.map((tok) => ({
-    tok,
-    re: new RegExp(String.raw`\b${tok.replace(/\./g, String.raw`\.`)}\s*\(`, 'g'),
-  }));
-  const out: Array<{ item: string; site: string }> = [];
-  for (const f of FILES) {
-    f.code.split('\n').forEach((line, i) => {
-      for (const { tok, re } of matchers) {
-        for (let n = (line.match(re) ?? []).length; n > 0; n -= 1) {
-          out.push({ item: `${f.rel}::${tok}`, site: `${f.rel}:${i + 1}` });
-        }
-      }
-    });
-  }
-  return out;
-};
+ *  lesson `gitReadIsBounded` and `corpusProducerIsShared` both write down. */
+function readsIn(code: string, rel: string, tokens: readonly string[]): Array<{ item: string; site: string }> {
+  const sf = parseSource(code, rel);
+  return tokens.flatMap((tok) => referencesToPath(sf, tok).map((r) => ({ item: `${rel}::${tok}`, site: `${rel}:${lineOf(r)}` })));
+}
+
+const occurrencesOf = (tokens: readonly string[]): Array<{ item: string; site: string }> =>
+  FILES.flatMap((f) => readsIn(f.code, f.rel, tokens));
 
 describe('determinism guard (Phase 0)', () => {
   // Length/line parity is true by construction for the scanner (sourceScanner.ts) — this pins
   // against a regression to a regex stripper. The forward oracle lives in sourceScanner.test.ts.
   it('the comment strip is length- and line-exact (a regex stripper would not be)', () => {
     for (const f of FILES) assertScanIsSane(f.raw, f.code, f.rel);
+  });
+
+  it('the detector sees a WRAPPED read, an UNCALLED one, and two on one line (#1179)', () => {
+    const src = [
+      'const a = performance',
+      '  .now();',
+      'export function applyOps(mint: () => string = newGuid) { return mint(); }',
+      'const pair = [Math.random(), Math.random()];',
+      'export function newGuid(): string { return crypto.randomUUID(); }',
+    ].join('\n');
+    expect(readsIn(src, 'x.ts', ['performance.now', 'newGuid', 'Math.random', 'crypto.randomUUID']).map((o) => `${o.item}@${o.site}`))
+      .toEqual(['x.ts::performance.now@x.ts:1', 'x.ts::newGuid@x.ts:3', 'x.ts::Math.random@x.ts:4', 'x.ts::Math.random@x.ts:4', 'x.ts::crypto.randomUUID@x.ts:5']);
   });
 
   it('no direct wall-clock outside the ledger', () => {

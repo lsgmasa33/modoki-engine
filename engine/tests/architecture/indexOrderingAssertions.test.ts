@@ -180,9 +180,8 @@ const offenderLines = (code: string): number[] => scanOrderings(code, 'fixture.t
  * Counts are exact — the ledger reports a row that over-blesses.
  */
 const IN_FLIGHT_1179 = [
-  { item: 'engine/tests/electron/userDataDir.test.ts', count: 5 },
+  { item: 'engine/tests/electron/userDataDir.test.ts', count: 2 },
   { item: 'engine/tests/architecture/earlyConsoleShim.test.ts', count: 4 },
-  { item: 'engine/tests/plugins/buildLeaseSourceWireShape.test.ts', count: 1 },
   ...(hasInternalGames() ? [{ item: 'games/court/tests/cellMapDiscipline.test.ts', count: 2 }] : []),
 ].map((r) => ({ ...r, reason: '#1179 is rewriting this file on work-ai2; convert with found()/expectInOrder once it lands' }));
 

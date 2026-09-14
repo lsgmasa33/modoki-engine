@@ -36,7 +36,8 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { readScannedSource } from '@modoki/engine/testing';
+import { readScannedSource, stripComments } from '@modoki/engine/testing';
+import { callsTo, enclosingFunction, findNodes, flatText, lineOf, parseSource, ts, unwrapValue, valueCarrier } from '@modoki/engine/testing/sourceAst';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 
 const viewsDir = path.resolve(__dirname, '../../packages/modoki/src/editor/panels/assetViews');
@@ -80,30 +81,91 @@ const EXEMPT = [
 
 interface Site { file: string; line: number; expr: string; spliced: boolean }
 
-function optionSites(): Site[] {
-  const out: Site[] = [];
-  for (const f of fs.readdirSync(viewsDir).filter((n) => n.endsWith('.tsx'))) {
-    const lines = readScannedSource(path.join(viewsDir, f)).code.split('\n');
-    lines.forEach((l, i) => {
-      if (!/=>\s*<option/.test(l)) return;
-      // The list and the .map() are often split across lines by the line length, so read a
-      // small window back. Two lines is enough for every current call site and keeps the
-      // window too small to accidentally borrow a neighbouring control's splice.
-      const window = lines.slice(Math.max(0, i - 2), i + 1).join(' ');
-      // `\(?` at the end: an arrow param may or may not be parenthesised (`o =>` vs `(o) =>`)
-      // and both spellings are in use here. Requiring the paren silently produced an
-      // `<unparsed>` for MaterialAssetView, which the vacuity check below caught.
-      const m = window.match(/([\w$.[\]'"]+|\([^()]*(?:\([^()]*\))?[^()]*\))\s*\.map\(\s*\(?/);
-      out.push({
-        file: f,
-        line: i + 1,
-        expr: (m?.[1] ?? '<unparsed>').trim(),
-        spliced: /withCurrentValue\(/.test(window),
-      });
-    });
-  }
-  return out;
+/** Whether `e` can evaluate to an `<option …>` element: the element itself (parentheses peeled), either
+ *  arm of a `? :`, or the right side of `&&` — `(l) => l === skip ? null : <option …/>` is a producer. */
+function isOptionJsx(e: ts.Expression | undefined): boolean {
+  const u = e && unwrapValue(e);
+  if (!u) return false;
+  if (ts.isConditionalExpression(u)) return isOptionJsx(u.whenTrue) || isOptionJsx(u.whenFalse);
+  if (ts.isBinaryExpression(u) && u.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken) return isOptionJsx(u.right);
+  const tag = ts.isJsxElement(u) ? u.openingElement.tagName : ts.isJsxSelfClosingElement(u) ? u.tagName : undefined;
+  return !!tag && ts.isIdentifier(tag) && tag.text === 'option';
 }
+
+/** Every option-producing `.map(cb)` in one view — `cb` an inline function whose result is an
+ *  `<option>` (a concise body, or a `return` of its own) — with the list it maps and whether that list
+ *  is spliced: `withCurrentValue(…)` called anywhere INSIDE the mapped expression.
+ *
+ *  ⚠️ **The `.map()`'s own receiver, not a text window (#1179).** The line scan this replaces wanted
+ *  `=> <option` on one line, then read the list and `withCurrentValue(` from a two-line window above:
+ *  an arrow whose `<option` a formatter put on the next line was not a site at all, and a spliced
+ *  control directly above an unspliced one lent it its `withCurrentValue(` — the window's own comment
+ *  said it was sized to make that unlikely, not impossible. */
+function optionSitesIn(code: string, file: string): Site[] {
+  const sf = parseSource(code, file);
+  return findNodes(sf, (n): n is ts.ArrowFunction | ts.FunctionExpression => ts.isArrowFunction(n) || ts.isFunctionExpression(n))
+    .filter((cb) => (!ts.isBlock(cb.body) ? isOptionJsx(cb.body)
+      : findNodes(cb.body, ts.isReturnStatement).some((r) => enclosingFunction(r) === cb && isOptionJsx(r.expression))))
+    .map((cb) => {
+      const c = valueCarrier(cb).parent;
+      // ⚠️ An `<option>` producer that is not a `.map()` callback — `list.flatMap(…)`, `Array.from(list,
+      // …)` — is still a site, keyed `<unparsed>`: it matches no exemption, so it fails loudly instead
+      // of silently leaving the population (the text scan reported it that way too).
+      const mapped = c && ts.isCallExpression(c) && c.arguments[0] === valueCarrier(cb) && ts.isPropertyAccessExpression(c.expression)
+        && c.expression.name.text === 'map' ? c.expression.expression : undefined;
+      return mapped
+        ? { file, line: lineOf(c), expr: flatText(mapped), spliced: callsTo(mapped, 'withCurrentValue').length > 0 }
+        : { file, line: lineOf(cb), expr: '<unparsed>', spliced: false };
+    });
+}
+
+function optionSites(): Site[] {
+  return fs.readdirSync(viewsDir).filter((n) => n.endsWith('.tsx'))
+    .flatMap((f) => optionSitesIn(readScannedSource(path.join(viewsDir, f)).code, f));
+}
+
+describe('the option-site reader reads each .map()\'s own list (#1179)', () => {
+  const sites = (src: string) => optionSitesIn(stripComments(src), 'View.tsx').map((x) => `${x.expr}${x.spliced ? ' (spliced)' : ''}`);
+
+  it('finds a site whose <option> the formatter moved to the next line, and a block-bodied one', () => {
+    expect(sites('const a = <select>{SIZES.map((s) =>\n  <option key={s} value={s}>{s}</option>)}</select>;'
+      + '\nconst b = <select>{MODES.map(function (m) { const l = label(m); return (<option value={m}>{l}</option>); })}</select>;'))
+      .toEqual(['SIZES', 'MODES']);
+  });
+
+  it('a spliced control directly above does not lend its splice to the next one', () => {
+    expect(sites('<>\n<select>{withCurrentValue(SIZES, size).map((s) => <option key={s}>{s}</option>)}</select>\n'
+      + '<select>{LEVELS.map((l) => <option key={l}>{l}</option>)}</select>\n</>')).toEqual(['withCurrentValue(SIZES, size) (spliced)', 'LEVELS']);
+  });
+
+  it('keys a cast list the way the ledger spells it, and reads a ternary splice as spliced', () => {
+    expect(sites('<select>{(Object.keys(\n  LABELS,\n) as Mode[]).map((k) => <option key={k}>{k}</option>)}</select>')).toEqual(['(Object.keys( LABELS, ) as Mode[])']);
+    expect(sites('<select>{(isMixed(k) ? LIST : withCurrentValue(LIST, v)).map((o) => <option key={o}>{o}</option>)}</select>')).toHaveLength(1);
+    expect(sites('<select>{(isMixed(k) ? LIST : withCurrentValue(LIST, v)).map((o) => <option key={o}>{o}</option>)}</select>')[0]).toMatch(/\(spliced\)$/);
+  });
+
+  it('a .map() producing something other than an <option> is not a site', () => {
+    expect(sites('const rows = ITEMS.map((i) => <li key={i}>{i}</li>); const n = ITEMS.map((i) => i * 2);')).toEqual([]);
+    // The OUTER callback returns an <li>: not a site. The inner helper is an <option> producer no .map() keys — `<unparsed>`.
+    expect(sites('const rows = ITEMS.map((i) => { const f = () => { return <option>{i}</option>; }; return <li>{f()}</li>; });')).toEqual(['<unparsed>']);
+  });
+
+  it('an <option> producer that is not a .map() callback is a site it cannot key — so it fails, not vanishes', () => {
+    expect(sites('<>\n<select>{LIST.flatMap((o) => <option key={o}>{o}</option>)}</select>\n<select>{Array.from(LIST, (o) => <option key={o}>{o}</option>)}</select>\n</>'))
+      .toEqual(['<unparsed>', '<unparsed>']);
+    // …and so is one handed to .map() as something other than its callback.
+    expect(sites('<select>{LIST.map(render, (o) => <option key={o}>{o}</option>)}</select>')).toEqual(['<unparsed>']);
+  });
+
+  it('a callback that returns an <option> from one arm of a ternary or behind && is still a site', () => {
+    expect(sites('<select>{LEVELS.map((l) => l === skip ? null : <option key={l}>{l}</option>)}</select>')).toEqual(['LEVELS']);
+    expect(sites('<select>{MODES.map((m) => ok && <option key={m}>{m}</option>)}</select>')).toEqual(['MODES']);
+  });
+
+  it('a withCurrentValue inside the callback does not splice the LIST', () => {
+    expect(sites('<select>{LEVELS.map((l) => <option key={l} value={withCurrentValue([l], v)[0]}>{l}</option>)}</select>')).toEqual(['LEVELS']);
+  });
+});
 
 describe('asset-inspector preset selects are honest (#131)', () => {
   it('every option list is either spliced or a declared exemption', () => {
@@ -130,11 +192,10 @@ describe('asset-inspector preset selects are honest (#131)', () => {
     // The count is deliberately a floor, not an equality: a new control must not fail this.
     expect(sites.length).toBeGreaterThanOrEqual(25);
     expect(sites.filter((s) => s.spliced).length).toBeGreaterThanOrEqual(14);
-    // Only an UNSPLICED site has to parse. A spliced one can be shaped however it likes —
-    // `(isMixed(k) ? LIST : withCurrentValue(LIST, v))` defeats the extractor and is exactly
-    // right — and rule 1 already passes it on the splice alone. An unspliced site that fails
-    // to parse gets `<unparsed>`, which matches no exemption, so it fails rule 1 loudly
-    // rather than slipping through as unrecognised.
+    // Only an UNSPLICED site has to be keyable. A spliced one can be shaped however it likes —
+    // `(isMixed(k) ? LIST : withCurrentValue(LIST, v))` — and rule 1 passes it on the splice alone.
+    // An `<option>` producer that is not a `.map()` callback gets `<unparsed>`, which matches no
+    // exemption, so it fails rule 1 loudly rather than slipping through as unrecognised.
     expect(sites.filter((s) => !s.spliced && s.expr === '<unparsed>')).toEqual([]);
   });
 

@@ -28,7 +28,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
-import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { readScannedSource } from '@modoki/engine/testing';
+import { findNodes, flatText, lineOf, parseSource, ts } from '@modoki/engine/testing/sourceAst';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const require_ = createRequire(import.meta.url);
@@ -103,35 +104,60 @@ describe('copy-three-addons afterPack hook (#945 B4)', () => {
   });
 });
 
+/** Every string or template part in `code` saying `failed to run`, each with whether IT is thrown: the
+ *  expression it is part of — up to its own statement — is the operand of a `throw`.
+ *
+ *  ⚠️ **The message's own statement, not its line (#1179).** The line test asked whether `throw new
+ *  Error` sat on the same line as the text: `throw new Error(\n  \`… failed to run: …\`,\n)` — a
+ *  formatter's wrap — read as a warn, and `console.warn('… failed to run'); throw new Error(e)` on one
+ *  line read as a throw. */
+function failedToRunMessages(code: string, label: string): Array<{ site: string; thrown: boolean }> {
+  return findNodes(parseSource(code, label), (n): n is ts.StringLiteralLike | ts.TemplateLiteralLikeNode =>
+    (ts.isStringLiteralLike(n) || ts.isTemplateHead(n) || ts.isTemplateMiddle(n) || ts.isTemplateTail(n)) && n.text.includes('failed to run'))
+    .map((t) => {
+      let cur: ts.Node = t;
+      while (cur.parent && !ts.isStatement(cur.parent) && !ts.isFunctionLike(cur.parent)) cur = cur.parent;
+      return { site: `${label}:${lineOf(t)}: ${flatText(cur)}`, thrown: !!cur.parent && ts.isThrowStatement(cur.parent) };
+    });
+}
+
+describe('the failed-to-run reader asks each message whether IT is thrown (#1179)', () => {
+  const thrown = (src: string) => failedToRunMessages(src, 'fixture.cjs').map((m) => m.thrown);
+
+  it('reads a wrapped throw and every copy', () => {
+    expect(thrown("throw new Error(\n  `[stage] staged x but it failed to run: ${e.message}`,\n  { cause: e },\n);\nconsole.warn('[stage] y failed to run');"))
+      .toEqual([true, false]);
+  });
+
+  it('a throw beside a warned message on the same line does not vouch for it', () => {
+    expect(thrown("console.warn('[stage] x failed to run'); throw new Error(String(e));")).toEqual([false]);
+  });
+
+  it('a message inside a callback that is thrown is not what is thrown', () => {
+    expect(thrown("throw once(() => { console.warn('[stage] x failed to run'); });")).toEqual([false]);
+  });
+
+  it('a message built into an Error that is not thrown is not thrown', () => {
+    expect(thrown("const err = new Error('[stage] x failed to run'); console.warn(err.message);")).toEqual([false]);
+  });
+});
+
 describe('the staging hooks do not discard their own verification (#945 B3)', () => {
   const stagers = ['stage-toktx.cjs', 'stage-msdf.cjs'].map((f) => path.join(scriptsDir, f));
-
-  it('the comment scan is sane over both stagers', () => {
-    for (const f of stagers) {
-      const raw = fs.readFileSync(f, 'utf8');
-      assertScanIsSane(raw, stripComments(raw), path.basename(f));
-    }
-  });
 
   it('a staged binary that fails to run aborts the pack rather than warning', () => {
     // Both stagers verify their staged copy by running it — `toktx --version`, and
     // `msdf-atlas-gen` with no args, which exits non-zero when dyld cannot resolve the sibling
     // dylibs the stager just relocated. That verdict used to be `console.warn`ed and dropped.
     //
-    // ⚠️ This is a TEXT scan and it knows it: it can see that "failed to run" is reported by a
+    // ⚠️ This is a SOURCE scan and it knows it: it can see that "failed to run" is reported by a
     // throw rather than a warn, and it CANNOT see whether the staged binary actually works.
     // Running the staged binary from inside a packed app is verify:packaged's job and is still
     // open. Scoped to "failed to run" deliberately — the OTHER warnings in these files are the
     // legitimate graceful skips for a tool that is absent on this build machine, which
     // before-pack.cjs documents and which must stay warnings.
-    const offenders: string[] = [];
-    for (const f of stagers) {
-      const src = stripComments(fs.readFileSync(f, 'utf8'));
-      for (const line of src.split('\n')) {
-        if (!/failed to run/.test(line)) continue;
-        if (!/throw new Error/.test(line)) offenders.push(`${path.basename(f)}: ${line.trim()}`);
-      }
-    }
+    const offenders = stagers.flatMap((f) => failedToRunMessages(readScannedSource(f).code, path.basename(f)))
+      .filter((m) => !m.thrown).map((m) => m.site);
     expect(
       offenders,
       'a stager that verifies its staged binary and then only warns will sign and ship a binary '
@@ -144,8 +170,8 @@ describe('the staging hooks do not discard their own verification (#945 B3)', ()
     // Without this, deleting the sanity-run entirely would satisfy the rule above by having
     // nothing to match — the guard would go green on the very regression it exists to stop.
     for (const f of stagers) {
-      const src = stripComments(fs.readFileSync(f, 'utf8'));
-      expect(src, `${path.basename(f)} lost its staged-binary sanity check`).toMatch(/failed to run/);
+      expect(failedToRunMessages(readScannedSource(f).code, path.basename(f)).length, `${path.basename(f)} lost its staged-binary sanity check`)
+        .toBeGreaterThan(0);
     }
   });
 });

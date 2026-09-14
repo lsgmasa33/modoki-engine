@@ -13,28 +13,49 @@
  *  The #318 close-out sweep found exactly this: two clone sites (the prewarm side-pinned variants
  *  and the video-texture clone) predating the stamp and missed by the fix that introduced it.
  *
- *  It checks the LINE, so a stamp applied a few lines later (as `lightMaskVariants` does, where
- *  the `userData` assignment must come first) needs an allowlist entry stating why. */
+ *  ⚠️ **Clones are found in the PARSE, and the stamp must wrap THAT clone (#1179).** The per-line
+ *  regex required the receiver's name to sit right before `.clone()`, so `(mesh.material as
+ *  Material).clone()` escaped even on one line, and `material\n  .clone()` did too; the helper's
+ *  "stamps its own clone" check was `markDerived` anywhere on the clone's LINE. */
 
 import { describe, it, expect } from 'vitest';
 import { join } from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
+import { callsTo, calleeName, findNodes, lineOf, parseSource, ts, unwrapValue, valueCarrier } from '@modoki/engine/testing/sourceAst';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const RUNTIME = join(__dirname, '../../packages/modoki/src/runtime');
 
-/** A `.clone()` whose receiver reads as a material. Deliberately loose on the receiver name —
- *  `base`, `material`, `mat`, `target.material`, `m` inside a `.map()` over materials — and
- *  narrowed by the allowlist below rather than by a cleverer regex, because a regex that misses
- *  is the exact failure this guard exists to prevent. */
-const CLONE = /(^|[^A-Za-z0-9_])(\w*[Mm]aterial|base|mat)\s*\.clone\(\)/;
+/** A receiver NAME that reads as a material. Deliberately loose — `base`, `material`, `mat`,
+ *  `target.material` — and narrowed by structure rather than by a cleverer pattern, because a
+ *  matcher that misses is the exact failure this guard exists to prevent. The name is the receiver's
+ *  LAST segment, through parens, casts and `!` — a computed receiver (`mesh[k]`, `mats[i]`) has no name
+ *  and is not matched, as the regex before it did not match it either. */
+const MATERIAL_RECEIVER = /^(\w*[Mm]aterial|base|mat)$/;
 
-/** `cloneDerived(material, base)` — the shared helper that clones, stamps ON its own clone line,
- *  and suppresses the `userData` round-trip (#325). A call to it IS a stamped clone site: the
- *  stamp cannot be forgotten because the caller never writes the `.clone()`. Tracked separately so
- *  the known-sites check below still names every file that mints a mesh-bound material, which is
- *  the signal that would otherwise be lost by routing sites through a helper. */
-const CLONE_HELPER = /(^|[^A-Za-z0-9_])cloneDerived\s*\(/;
+/** Every argument-less `.clone()` CALL on a material-named receiver, with whether that very call is
+ *  the first argument of a `markDerived(…)` call. */
+function materialClones(code: string, rel: string): Array<{ line: number; text: string; stamped: boolean }> {
+  const sf = parseSource(code, rel);
+  return findNodes(sf, (n): n is ts.CallExpression => ts.isCallExpression(n) && n.arguments.length === 0
+    && ts.isPropertyAccessExpression(n.expression) && n.expression.name.text === 'clone')
+    .flatMap((c) => {
+      const recv = unwrapValue((c.expression as ts.PropertyAccessExpression).expression);
+      const name = ts.isIdentifier(recv) ? recv.text : ts.isPropertyAccessExpression(recv) ? recv.name.text : undefined;
+      if (name === undefined || !MATERIAL_RECEIVER.test(name)) return [];
+      const carrier = valueCarrier(c); // `material.clone() as T` is still this clone
+      const outer = carrier.parent;
+      const stamped = ts.isCallExpression(outer) && calleeName(outer) === 'markDerived' && outer.arguments[0] === carrier;
+      return [{ line: lineOf(c), text: c.getText(sf).replace(/\s+/g, ' '), stamped }];
+    });
+}
+
+/** `cloneDerived(material, base)` — the shared helper that clones, stamps its own clone, and
+ *  suppresses the `userData` round-trip (#325). A call to it IS a stamped clone site: the stamp
+ *  cannot be forgotten because the caller never writes the `.clone()`. Tracked separately so the
+ *  known-sites check below still names every file that mints a mesh-bound material, which is the
+ *  signal that would otherwise be lost by routing sites through a helper. */
+const cloneDerivedCalls = (code: string, rel: string): number => callsTo(parseSource(code, rel), 'cloneDerived').length;
 
 /* ⚠️ **No EXEMPT list (#1140).** It was empty since #325 moved `lightMaskVariants`' own
  *  `base.clone()` onto `cloneDerived`, and its match was `file && line.includes(contains)` with no
@@ -72,22 +93,11 @@ function runtimeFiles(): Array<{ abs: string; rel: string }> {
     });
 }
 
-/**
- * Non-blank lines of a file, with 1-based numbers, read through the shared scanner (#812).
- *
- * The private stripper this replaces was line-oriented and tracked no string state, so a `//`
- * inside a URL truncated the rest of the line — lowering what a forbidden-pattern guard could see,
- * which reads as a PASS.
- */
-function codeLines(file: string): Array<{ n: number; text: string }> {
-  return readScannedSource(file).code
-    .split('\n')
-    .map((text, i) => ({ n: i + 1, text }))
-    .filter(({ text }) => text.trim());
-}
-
 /** The one file allowed to contain a raw material `.clone()`: the helper itself. */
 const HELPER_FILE = 'rendering/derivedMaterials.ts';
+
+/** Every runtime file's comment-stripped code, read once through the shared scanner (#812). */
+const SOURCES = runtimeFiles().map(({ abs, rel }) => ({ rel, code: readScannedSource(abs).code }));
 
 describe('material clones carry the derived-base stamp', () => {
   it('every material .clone() in runtime/ goes through cloneDerived or is allowlisted', () => {
@@ -97,14 +107,8 @@ describe('material clones carry the derived-base stamp', () => {
     // material graph — which is exactly what `videoTextureSync`, `lightMaskVariants`,
     // `tintedMaterial` and `applyPropOverride` were all doing while this guard was green. The rule
     // is now "use the helper", and the helper is the only place the raw clone may live.
-    const raw: string[] = [];
-    for (const { abs: file, rel } of runtimeFiles()) {
-      if (rel === HELPER_FILE) continue;
-      for (const { n, text } of codeLines(file)) {
-        if (!CLONE.test(text)) continue;
-        raw.push(`${rel}:${n} — ${text.trim()}`);
-      }
-    }
+    const raw = SOURCES.filter((s) => s.rel !== HELPER_FILE)
+      .flatMap((s) => materialClones(s.code, s.rel).map((c) => `${s.rel}:${c.line} — ${c.text}`));
     expect(raw, 'a material clone bound to a mesh must go through cloneDerived(material, base) — '
       + 'see runtime/rendering/derivedMaterials.ts. A bare .clone() JSON-round-trips userData, '
       + 'which serialises any Material or Texture parked in it and drops the own properties that '
@@ -119,25 +123,27 @@ describe('material clones carry the derived-base stamp', () => {
     // looser form made reverting a migrated site invisible: it kept the set identical, so the two
     // sites this guard's own rule was extended to cover could have gone back to a bare stamped
     // clone with the suite green.
-    const sites: string[] = [];
-    let helperStampsItsOwnClone = false;
-    for (const { abs: file, rel } of runtimeFiles()) {
-      for (const { text } of codeLines(file)) {
-        if (rel === HELPER_FILE) {
-          // The helper is where the ONE raw clone lives, and it must still stamp on that line.
-          if (CLONE.test(text) && text.includes('markDerived')) helperStampsItsOwnClone = true;
-          continue;
-        }
-        if (CLONE_HELPER.test(text) && !text.startsWith('import')) sites.push(rel);
-      }
-    }
+    const sites = SOURCES.filter((s) => s.rel !== HELPER_FILE && cloneDerivedCalls(s.code, s.rel) > 0).map((s) => s.rel);
     expect(new Set(sites)).toEqual(new Set([
       'rendering/lightMaskVariants.ts',      // per-(base, light-selection) variants
       'rendering/scene3DSync.ts',            // tint clones + the prewarm side-pinned variants
       'rendering/materialInstanceClones.ts', // per-entity prop clones (single + array)
       'rendering/videoTextureSync.ts',       // the per-entity video-surface clone
     ]));
-    expect(helperStampsItsOwnClone, 'cloneDerived must still markDerived on its own clone line')
-      .toBe(true);
+    // The helper is where the ONE raw clone lives, and that clone must itself be what it stamps.
+    const helper = SOURCES.find((s) => s.rel === HELPER_FILE)!;
+    expect(materialClones(helper.code, helper.rel).map((c) => c.stamped), 'cloneDerived must markDerived its own clone')
+      .toEqual([true]);
+  });
+
+  it('the detector sees a cast or wrapped receiver, and a stamp must wrap THIS clone (#1179)', () => {
+    const src = [
+      'const a = (mesh.material as Material).clone();',
+      'const b = material',
+      '  .clone();',
+      'const c = markDerived(base.clone() as T, base); const d = mat.clone(); markDerived(d, base);',
+      'const e = geometry.clone(); const f = base.clone(opts);',
+    ].join('\n');
+    expect(materialClones(src, 'r.ts').map((c) => `${c.line}:${c.stamped}`)).toEqual(['1:false', '2:false', '4:true', '4:false']);
   });
 });

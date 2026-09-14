@@ -16,9 +16,37 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { walkClosure, importStatements, type ImportEdge } from '../helpers/importClosure';
+import { walkClosure, runtimeEdgesOf, type ImportEdge } from '../helpers/importClosure';
+import { readScannedSource, stripComments } from '../helpers/sourceScanner';
+import { findNodes, flatText, guardProves, guardsOf, lineOf, parseSource, stringValueOf, ts } from '../helpers/sourceAst';
 
 const srcDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../src');
+
+const FLAG = '__MODOKI_MODULE_RENDER3D__';
+
+/** Every dynamic `import(…)` in `rel` whose specifier `pick` accepts, each with whether IT runs only
+ *  when the flag is on — inside a flag-true branch, or below an early exit on `!flag`, however far up.
+ *
+ *  ⚠️ **The import's OWN gate (#1179).** The two scans this replaces were a file-grained
+ *  `src.includes(FLAG)` — any mention anywhere, a comment included, gated every import in the file —
+ *  and an 8-line window pairing the i-th gate with the i-th import over the RAW text, where a
+ *  commented-out gate counted and a gate for the accessor above could pair with an ungated import. The
+ *  node says whether this import is reachable with the flag off; a type-position
+ *  `typeof import('…')` is an import TYPE, not a call, so it is not in the population at all. */
+function dynamicImports(rel: string, pick: (spec: string) => boolean): Array<{ site: string; spec: string; gated: boolean }> {
+  return dynamicImportsIn(readScannedSource(path.join(srcDir, rel)).code, rel, pick);
+}
+function dynamicImportsIn(code: string, rel: string, pick: (spec: string) => boolean): Array<{ site: string; spec: string; gated: boolean }> {
+  const sf = parseSource(code, rel);
+  return findNodes(sf, (n): n is ts.CallExpression => ts.isCallExpression(n) && n.expression.kind === ts.SyntaxKind.ImportKeyword)
+    .map((c) => ({ c, spec: stringValueOf(c.arguments[0]) ?? '<non-literal>' }))
+    .filter(({ spec }) => pick(spec))
+    .map(({ c, spec }) => ({
+      site: `${rel}:${lineOf(c)} ${flatText(c)}`,
+      spec,
+      gated: guardsOf(c).some((g) => guardProves(g, (e) => ts.isIdentifier(e) && e.text === FLAG)),
+    }));
+}
 
 /** What a render3d-OFF build roots: the runtime barrel every game imports, plus the 2D renderer
  *  entry `App.tsx` lazy-loads when `__MODOKI_MODULE_RENDER2D__` is on. `Scene3D` is deliberately
@@ -42,24 +70,51 @@ const GATED_EDGES: ImportEdge[] = [
   { file: 'runtime/loaders/materialPresets.ts', spec: './fileShaderBuilder' },
 ];
 
+describe('the render3d gate reader asks each import for ITS OWN gate (#1179)', () => {
+  const gated = (src: string) => dynamicImportsIn(stripComments(src), 'fixture.ts', () => true).map((i) => i.gated);
+
+  it.each([
+    ['an early return on !flag', 'export function a() {\n  if (!__MODOKI_MODULE_RENDER3D__) return Promise.reject(e);\n  return import(\'x\');\n}'],
+    ['an early-exit block with a warning in it', 'async function b() {\n  if (!__MODOKI_MODULE_RENDER3D__) {\n    warn();\n    return pbr();\n  }\n  return await import(\'x\');\n}'],
+    ['a closure built below the early return', 'async function c() {\n  if (!__MODOKI_MODULE_RENDER3D__) { ready(); return; }\n  const f = async () => import(\'x\');\n}'],
+    ['a flag-true branch wrapped by the formatter', 'if (\n  __MODOKI_MODULE_RENDER3D__ &&\n  wanted\n) {\n  void import(\'x\');\n}'],
+    ['a failed `!flag || …` early exit', 'function d() {\n  if (!__MODOKI_MODULE_RENDER3D__ || off) return;\n  return import(\'x\');\n}'],
+    ['a ternary arm', 'const p = __MODOKI_MODULE_RENDER3D__ ? import(\'x\') : null;'],
+  ])('accepts %s', (_why, src) => {
+    expect(gated(src)).toEqual([true]);
+  });
+
+  it.each([
+    // The measured regression: an arrow accessor with its gate DELETED, below a gated one.
+    ['an arrow accessor whose gate was deleted, below a gated accessor',
+      'export function a() {\n  if (!__MODOKI_MODULE_RENDER3D__) return null;\n  return import(\'x\');\n}\nexport const b = () => {\n  return import(\'y\');\n};', [true, false]],
+    ['an import AFTER a flag-true block rather than inside it', 'if (__MODOKI_MODULE_RENDER3D__) {\n  warm();\n}\nvoid import(\'x\');', [false]],
+    ['a gate that is only a COMMENT', 'function a() {\n  // if (!__MODOKI_MODULE_RENDER3D__) return;\n  return import(\'x\');\n}', [false]],
+    ['a flag test that does not prove it on', 'function a() {\n  if (__MODOKI_MODULE_RENDER3D__) return;\n  return import(\'x\');\n}', [false]],
+    ['a flag-true branch of an `||`', 'if (__MODOKI_MODULE_RENDER3D__ || other) {\n  void import(\'x\');\n}', [false]],
+  ])('refuses %s', (_why, src, expected) => {
+    expect(gated(src)).toEqual(expected);
+  });
+
+  it('a type-position `typeof import(…)` is not a call, so it is not in the population', () => {
+    expect(gated("type T = typeof import('x').Y;\nexport function a() { if (!__MODOKI_MODULE_RENDER3D__) return; return import('x'); }")).toEqual([true]);
+  });
+});
+
 describe('render3d:false boundary — the 2D boot path never reaches three/webgpu (#214)', () => {
   it.each(GATED_EDGES)(
     'the $file → $spec edge is really gated on __MODOKI_MODULE_RENDER3D__',
     ({ file, spec }) => {
-      const abs = path.join(srcDir, file);
-      expect(fs.existsSync(abs), `${file} no longer exists — stale GATED_EDGES entry`).toBe(true);
-      const src = fs.readFileSync(abs, 'utf8');
+      expect(fs.existsSync(path.join(srcDir, file)), `${file} no longer exists — stale GATED_EDGES entry`).toBe(true);
+      const imports = dynamicImports(file, (s) => s === spec);
+      expect(imports.length, `${file} no longer imports ${spec} — drop the stale GATED_EDGES entry`).toBeGreaterThan(0);
       expect(
-        src.includes(`import('${spec}')`) || src.includes(`import("${spec}")`),
-        `${file} no longer imports ${spec} — drop the stale GATED_EDGES entry`,
-      ).toBe(true);
-      expect(
-        src.includes('__MODOKI_MODULE_RENDER3D__'),
-        `${file} imports ${spec} (which reaches three/webgpu) but no longer mentions ` +
-          `__MODOKI_MODULE_RENDER3D__ — the gate that keeps 546 KB of Three out of a 2D-only ` +
-          `build is gone. Restore it, or remove the entry from GATED_EDGES and let the closure ` +
-          `assertion below report the real cost.`,
-      ).toBe(true);
+        imports.filter((i) => !i.gated).map((i) => i.site),
+        `${file} imports ${spec} (which reaches three/webgpu) where ${FLAG} does not gate it — the gate ` +
+          `that keeps 546 KB of Three out of a 2D-only build is gone. Restore it (the import inside a ` +
+          `flag-true branch, or below an early return on the flag being off), or remove the entry from ` +
+          `GATED_EDGES and let the closure assertion below report the real cost.`,
+      ).toEqual([]);
     },
   );
 
@@ -105,7 +160,7 @@ describe('render3d:false boundary — the 2D boot path never reaches three/webgp
  *  The rule this pins: exactly ONE module may name those specifiers, it must do so with a
  *  gated `import()`, and nothing else on the 2D path may reach them statically. */
 const LOADER_OWNER = 'runtime/loaders/threeLoaderModules.ts';
-const EXAMPLE_LOADER_RE = /three\/examples\/jsm\//;
+const EXAMPLE_LOADER_RE = /^three\/examples\/jsm\//;
 
 describe('render3d:false boundary — three\'s example loaders are imported on demand (#254)', () => {
   /** Files reachable from the 2D entries, following relative imports only (same closure the
@@ -116,15 +171,13 @@ describe('render3d:false boundary — three\'s example loaders are imported on d
     expect(reachable.length).toBeGreaterThan(100); // non-vacuity: an empty closure proves nothing
     const offenders: string[] = [];
     for (const rel of reachable) {
-      for (const { line, text } of importStatements(fs.readFileSync(path.join(srcDir, rel), 'utf8'))) {
-        // The owner module legitimately names every one of these in an `import type` (erased, no
-        // runtime edge) and again in a gated `import()`. Only a value-carrying static import is
-        // the defect. Statement-based rather than line-based: a multi-line `import {\n X,\n}
-        // from '…'` slips straight past a per-line regex, and did — verified by mutation.
-        if (/^import\s+type\b/.test(text)) continue;
-        const m = /from\s*['"](three\/examples\/jsm\/[^'"]+)['"]/.exec(text)
-          ?? /^import\s*['"](three\/examples\/jsm\/[^'"]+)['"]/.exec(text);
-        if (m) offenders.push(`${rel}:${line} → ${m[1]}`);
+      // The owner module legitimately names every one of these in an `import type` (erased, no
+      // runtime edge — `runtimeEdgesOf` drops it) and again in a gated `import()`. Only a static or
+      // re-exported edge is the defect. Read from the declarations (#1179): a multi-line
+      // `import {\n X,\n} from '…'` slipped past a per-line regex once, and an `export … from '…'`
+      // slipped past the statement joiner that replaced it.
+      for (const { spec, kind, node } of runtimeEdgesOf(path.join(srcDir, rel))) {
+        if (kind !== 'dynamic' && EXAMPLE_LOADER_RE.test(spec)) offenders.push(`${rel}:${lineOf(node)} → ${spec}`);
       }
     }
     expect(
@@ -136,42 +189,24 @@ describe('render3d:false boundary — three\'s example loaders are imported on d
   });
 
   it(`every ${LOADER_OWNER} import() sits behind the render3d gate`, () => {
-    const abs = path.join(srcDir, LOADER_OWNER);
-    expect(fs.existsSync(abs), `${LOADER_OWNER} no longer exists — this guard is stale`).toBe(true);
-    const src = fs.readFileSync(abs, 'utf8');
-    const lineOf = (idx: number) => src.slice(0, idx).split('\n').length;
-
+    expect(fs.existsSync(path.join(srcDir, LOADER_OWNER)), `${LOADER_OWNER} no longer exists — this guard is stale`).toBe(true);
     // ⚠️ This used to find each import's enclosing function by scanning BACKWARDS for a line
     // matching /^(export )?(async )?function /, then looking for the flag anywhere in that span.
     // It was defeated by the exact shape it exists to catch: rewriting an accessor as
     // `export const ktx2LoaderCtor = () => {…}` and DELETING its gate still passed 6/6, because
     // the backward scan ran past the arrow function into the PREVIOUS accessor and found *its*
-    // gate. Measured, not theorised. So pair them structurally instead: gates and imports must
-    // ALTERNATE in source order, each gate immediately preceding the import it protects.
-    const GATE = /!__MODOKI_MODULE_RENDER3D__/g;
-    // `(?<!typeof )` excludes the type-position `typeof import('…')` that names MeshoptDecoder's
-    // type — erased, needs no gate, and counting it would inflate the floor below.
-    const DYN = /(?<!typeof )import\(\s*['"]three\/examples\/jsm\/[^'"]+['"]\s*\)/g;
-    const gates = [...src.matchAll(GATE)].map((m) => lineOf(m.index));
-    const imports = [...src.matchAll(DYN)].map((m) => lineOf(m.index));
-
+    // gate. Measured, not theorised. Its replacement paired the i-th gate with the i-th import
+    // within 8 lines — still text, and over the raw file (#1179). Now each import is asked whether
+    // IT runs with the flag off.
+    const imports = dynamicImports(LOADER_OWNER, (s) => EXAMPLE_LOADER_RE.test(s));
     // Non-vacuity: one accessor per loader, plus meshopt. A renamed module or a changed import
     // shape would otherwise pass with zero matches and vouch for nothing.
     expect(imports.length).toBeGreaterThanOrEqual(5);
-    expect(gates.length).toBeGreaterThanOrEqual(imports.length);
-
-    const ungated = imports
-      .map((imp, i) => ({ imp, gate: gates[i] as number | undefined }))
-      // Each import must be preceded by ITS OWN gate — the i-th gate, not any gate — and closely
-      // enough that the two are plainly the same accessor. Deleting one gate shifts every later
-      // pairing and fails here; moving a gate below its import fails here too.
-      .filter(({ imp, gate }) => gate === undefined || gate >= imp || imp - gate > 8)
-      .map(({ imp }) => `${LOADER_OWNER}:${imp}`);
     expect(
-      ungated,
+      imports.filter((i) => !i.gated).map((i) => i.site),
       `an import() of a three example loader is reachable when render3d is off — Rolldown will ` +
-        `emit its chunk into a 2D-only bundle. Put the __MODOKI_MODULE_RENDER3D__ check on the ` +
-        `line immediately before it:\n  ${ungated.join('\n  ')}`,
+        `emit its chunk into a 2D-only bundle. Return early on !${FLAG} before it, as the other ` +
+        `accessors do.`,
     ).toEqual([]);
   });
 });

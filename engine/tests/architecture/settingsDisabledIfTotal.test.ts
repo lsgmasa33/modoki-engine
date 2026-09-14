@@ -28,6 +28,7 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { stripComments, assertScanIsSane, assertEveryCodeTokenSurvives } from '@modoki/engine/testing';
+import { findNodes, flatText, lineOf, namedFunctions, parseSource, ts } from '@modoki/engine/testing/sourceAst';
 
 const dialogPath = path.resolve(
   __dirname,
@@ -37,20 +38,58 @@ const dialogPath = path.resolve(
 // Comment stripping is the shared scanner (@modoki/engine/testing, #419) — this file's own prose
 // explains the very hazard being guarded, so an unstripped scan would match its own documentation.
 
-/** The body of `function FieldControl(...)` — from its declaration to the declaration that
- *  follows it at column 0. Deliberately textual: the point is to catch a `disabled` written
- *  into a `case`, which no type-level check can see. */
-function fieldControlBody(code: string): string {
-  const start = code.indexOf('function FieldControl');
+/** Every mention of `disabled` inside `FieldControl` — its parameters and its body, found as the
+ *  function NODE — except an attribute written bare (`<input disabled>`): that is `readonly-text`
+ *  disabled UNCONDITIONALLY by its own nature, not a `disabledIf` participant, with no value to thread.
+ *
+ *  ⚠️ **The function's own extent and every mention in it (#1179).** The scan this replaces took the
+ *  text from `function FieldControl` to the next line starting `function|const|export|class` — so an
+ *  indented declaration, or a JSX line starting `const`, ended the body early — and matched
+ *  `disabled` followed by `=`, `:` or `{` per line: `function FieldControl({ field, disabled })`, a
+ *  `disabled && …` read and a `disabled={\n  x\n}` split by the formatter all passed. Its bare-attribute
+ *  exemption tested for `disabled style`, which the pattern could never match, so it exempted nothing. */
+function disabledInFieldControl(code: string, label: string): string[] {
+  const sf = parseSource(code, label);
+  const fn = namedFunctions(sf).find((f) => f.name === 'FieldControl');
   expect(
-    start,
+    fn,
     'ProjectSettingsDialog no longer declares `FieldControl` — if the switch was renamed, ' +
       'retarget this guard rather than deleting it; the stale-enumeration hazard is unchanged.',
-  ).toBeGreaterThan(-1);
-  const rest = code.slice(start + 1);
-  const end = rest.search(/^(?:function|const|export|class) /m);
-  return end === -1 ? rest : rest.slice(0, end);
+  ).toBeDefined();
+  const whole = fn!.body.parent;
+  return findNodes(whole, (n): n is ts.Identifier => ts.isIdentifier(n) && n.text === 'disabled')
+    .filter((id) => !(ts.isJsxAttribute(id.parent) && id.parent.name === id && id.parent.initializer === undefined))
+    .map((id) => `line ${lineOf(id)}: ${flatText(ts.isJsxAttribute(id.parent) ? id.parent : id.parent.parent ?? id.parent)}`);
 }
+
+/** Every `<fieldset>` whose `disabled` attribute carries a value. */
+function disablingFieldsets(code: string, label: string): number {
+  return findNodes(parseSource(code, label), (n): n is ts.JsxOpeningElement | ts.JsxSelfClosingElement =>
+    (ts.isJsxOpeningElement(n) || ts.isJsxSelfClosingElement(n)) && ts.isIdentifier(n.tagName) && n.tagName.text === 'fieldset'
+    && n.attributes.properties.some((a) => ts.isJsxAttribute(a) && ts.isIdentifier(a.name) && a.name.text === 'disabled' && !!a.initializer)).length;
+}
+
+describe('the FieldControl reader reads the function node, not a text extent (#1179)', () => {
+  const read = (src: string) => disabledInFieldControl(stripComments(src), 'Dialog.tsx');
+  const TAIL = '\n  const helper = 1;\nfunction After() { return <input disabled={x} />; }';
+
+  it.each([
+    ['a destructured `disabled` parameter', 'function FieldControl({ field, disabled }: P) {\n  return <input />;\n}'],
+    ['a `disabled && …` read', 'function FieldControl(p: P) {\n  const d = p.disabled && p.field;\n  return <input />;\n}'],
+    ['a formatter-split `disabled={…}`', 'function FieldControl(p: P) {\n  return <input\n    disabled={\n      p.off\n    }\n  />;\n}'],
+    ['a `disabled` BELOW an indented declaration that ended the old text extent', 'function FieldControl(p: P) {\nconst inner = 1;\n  return <input disabled={p.off} />;\n}'],
+  ])('flags %s', (_why, src) => {
+    expect(read(src + TAIL)).toHaveLength(1);
+  });
+
+  it('a bare `disabled` attribute is the unconditional readonly field, and a later function is not FieldControl', () => {
+    expect(read('function FieldControl(p: P) {\n  return <input type="text" disabled style={s} />;\n}' + TAIL)).toEqual([]);
+  });
+
+  it('counts a <fieldset> whose disabled attribute carries a value, however it is wrapped', () => {
+    expect(disablingFieldsets('const a = <fieldset\n  data-x={a > b}\n  disabled={off}\n/>;\nconst b = <fieldset disabled>{c}</fieldset>;', 'D.tsx')).toBe(1);
+  });
+});
 
 describe('Project Settings disabledIf is total, not enumerated', () => {
   const raw = fs.readFileSync(dialogPath, 'utf8');
@@ -63,26 +102,18 @@ describe('Project Settings disabledIf is total, not enumerated', () => {
 
   it('disables via a <fieldset>, the one primitive that reaches every field type', () => {
     // Two fieldsets are expected: the per-field wrapper, and the whole-form `inert` one.
-    const fieldsets = code.match(/<fieldset\b[^>]*disabled=/g) ?? [];
     expect(
-      fieldsets.length,
+      disablingFieldsets(code, 'ProjectSettingsDialog.tsx'),
       'expected both the per-field `disabledIf` wrapper and the whole-form `inert` wrapper ' +
         'to disable through <fieldset disabled>',
     ).toBeGreaterThanOrEqual(2);
   });
 
   it('FieldControl never takes or forwards a `disabled` prop', () => {
-    const body = fieldControlBody(code);
-    const offenders = body
-      .split('\n')
-      .map((line, i) => ({ line: line.trim(), n: i + 1 }))
-      .filter(({ line }) => /\bdisabled\s*[=:{]/.test(line))
-      // `readonly-text` is disabled UNCONDITIONALLY by its own nature — it is not a
-      // `disabledIf` participant and has no dynamic value to thread.
-      .filter(({ line }) => !/type="text" disabled style/.test(line));
+    const offenders = disabledInFieldControl(code, 'ProjectSettingsDialog.tsx');
 
     expect(
-      offenders.map((o) => `  line +${o.n}: ${o.line}`).join('\n'),
+      offenders.join('\n'),
       'a `disabled` inside the FieldControl switch re-creates the per-type enumeration that ' +
         'silently covered only 3 of 12 field types. Disabling belongs in the <fieldset> ' +
         'wrapper in `Field`, which reaches every type including ones not written yet.',

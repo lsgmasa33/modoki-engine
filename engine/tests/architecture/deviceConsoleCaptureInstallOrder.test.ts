@@ -3,7 +3,8 @@ import { found } from '@modoki/engine/testing/inOrder';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { stripComments, assertScanIsSane, readScannedSource } from '@modoki/engine/testing';
+import { callsTo, findNodes, flatText, guardsOf, lineOf, parseSource, printedText, stringValueOf, ts } from '@modoki/engine/testing/sourceAst';
 
 /**
  * The device console capture (#591) must be installed by a SIDE-EFFECT IMPORT placed above
@@ -37,38 +38,78 @@ const INSTALL_CONSOLE_RING = path.join(appDir, 'installConsoleRing.ts');
 const INSTALL_DEVICE_CONSOLE_CAPTURE = path.join(appDir, 'installDeviceConsoleCapture.ts');
 const BRIDGE = path.join(appDir, 'debug/bridge.ts');
 
-/** Import specifiers in source order, comments stripped via the shared scanner
- *  (@modoki/engine/testing, #419). Mirrors errorCaptureInstallOrder.test.ts's helper. */
-function importSpecifiers(src: string, label: string): string[] {
-  const code = stripComments(src);
-  assertScanIsSane(src, code, label);
-  return [...code.matchAll(/^\s*import\s+(?:[^'"]*?from\s*)?['"]([^'"]+)['"]/gm)].map((m) => m[1]);
+/** The parse of `abs`, comments blanked through the shared reader (@modoki/engine/testing, #419). */
+function parsed(abs: string): ts.SourceFile {
+  return parseSource(readScannedSource(abs).code, path.relative(appDir, abs));
 }
 
-/** Pull the boolean gate expression out of an `if (<expr>) {` line, comments stripped first, with
- *  whitespace normalized to a single space so formatting differences don't fail a semantically
- *  identical expression. Used both for main.tsx's bridge-import gate and
- *  installDeviceConsoleCapture.ts's own gate — they must fold identically or a release build's DCE
- *  diverges between the two sites. */
-function extractGate(src: string, marker: string | RegExp, label: string): string {
-  const code = stripComments(src);
-  assertScanIsSane(src, code, label);
-  const lines = code.split('\n');
-  const markerIdx = lines.findIndex((l) => (typeof marker === 'string' ? l.includes(marker) : marker.test(l)));
-  expect(markerIdx, `${label}: could not find a line matching ${marker} to locate the guarding "if" from`).toBeGreaterThanOrEqual(0);
-  // The marker (the bridge import call / the installDeviceConsoleCapture() call) sits INSIDE the
-  // `if` block, not necessarily on its own "if (...)" line — walk backward to find it.
-  let ifIdx = markerIdx;
-  while (ifIdx >= 0 && !/if\s*\(/.test(lines[ifIdx])) ifIdx--;
-  expect(ifIdx, `${label}: no preceding "if (" line found above line ${markerIdx} ("${lines[markerIdx]}")`).toBeGreaterThanOrEqual(0);
-  const m = lines[ifIdx].match(/if\s*\((.*)\)\s*\{?\s*$/);
-  expect(m, `${label}: line ${ifIdx} ("${lines[ifIdx]}") does not match the expected "if (<expr>) {" shape`).not.toBeNull();
-  return m![1].replace(/\s+/g, ' ').trim();
+/** Import specifiers in source order — the module's own `import` DECLARATIONS, so a dynamic
+ *  `import('./x')` or a string naming one is not an import. Mirrors errorCaptureInstallOrder.test.ts. */
+function importSpecifiers(abs: string): string[] {
+  return parsed(abs).statements.filter(ts.isImportDeclaration).map((d) => stringValueOf(d.moduleSpecifier) ?? '<non-literal>');
 }
+
+/** The gate every one of `markers` runs under, as `printedText` spells it — so a formatter's wrap
+ *  does not fail a semantically identical expression. Used both for main.tsx's bridge-import gate and
+ *  installDeviceConsoleCapture.ts's own gate: they must fold identically or a release build's DCE
+ *  diverges between the two sites.
+ *
+ *  ⚠️ **The marker's OWN condition, not the nearest `if (` line above it (#1179).** That walk took
+ *  whatever `if` last opened ABOVE the marker — so a marker moved to just after the gate's closing
+ *  brace, or into a nested `if` inside it, was still vouched for by the line above. Here each marker
+ *  must run under exactly ONE condition, in the THEN branch of an `if`; anything else — no gate, an
+ *  `else`, an early return above it, a second nested condition — fails, naming what it found. */
+function gateOf(markers: ts.Node[], what: string, label: string): string {
+  expect(markers.length, `${label}: no ${what} found to read the gate of`).toBeGreaterThan(0);
+  const gates = markers.map((m) => {
+    const guards = guardsOf(m);
+    const seen = guards.map((g) => `${g.holds ? '' : 'NOT '}${printedText(g.test)}`);
+    expect(
+      guards.length === 1 && guards[0].holds && ts.isIfStatement(guards[0].by),
+      `${label}:${lineOf(m)}: \`${flatText(m)}\` must run under exactly one condition — the THEN branch of `
+        + `its gate \`if\`. It runs under: ${JSON.stringify(seen)}`,
+    ).toBe(true);
+    return printedText(guards[0].test);
+  });
+  expect(new Set(gates).size, `${label}: every ${what} must share one gate — found ${JSON.stringify(gates)}`).toBe(1);
+  return gates[0];
+}
+
+/** `import('<spec>')` — a dynamic import of exactly that specifier. */
+const dynamicImports = (sf: ts.SourceFile, spec: string): ts.CallExpression[] =>
+  findNodes(sf, (n): n is ts.CallExpression => ts.isCallExpression(n)
+    && n.expression.kind === ts.SyntaxKind.ImportKeyword && stringValueOf(n.arguments[0]) === spec);
+
+describe('the gate reader reads the marker\'s OWN condition (#1179)', () => {
+  const markersIn = (src: string) => callsTo(parseSource(src, 'fixture.ts'), 'install');
+
+  it('accepts a gate the formatter wrapped, spelt the way the one-line form is', () => {
+    expect(gateOf(markersIn('if (!a &&\n  (\n    b ||\n    c\n  )) {\n  install();\n}'), 'install()', 'fixture')).toBe('!a && (b || c)');
+  });
+
+  it.each([
+    ['after the gate\'s block — the old walk found the `if (` line above it', 'if (!a && b) {\n  x();\n}\ninstall();'],
+    ['inside a nested `if` in the gate', 'if (!a && b) {\n  if (c) {\n    install();\n  }\n}'],
+    ['in the ELSE branch', 'if (!a && b) {\n  x();\n} else {\n  install();\n}'],
+    ['after an early return rather than inside a gate', 'function f() {\n  if (a) return;\n  install();\n}'],
+    ['behind `&&` rather than inside an `if`', '!a && b && install();'],
+    ['inside a function declared in another branch', 'if (other) {\n  function go() {\n    if (!a && b) {\n      install();\n    }\n  }\n  go();\n}'],
+  ])('refuses a marker %s', (_why, src) => {
+    expect(() => gateOf(markersIn(src), 'install()', 'fixture')).toThrow(/must run under exactly one condition/);
+  });
+
+  it('refuses two markers under different gates', () => {
+    expect(() => gateOf(markersIn('if (a) { install(); }\nif (b) { install(); }'), 'install()', 'fixture')).toThrow(/share one gate/);
+  });
+
+  it('a call on a line that starts with `import` is still a call', () => {
+    expect(markersIn("import('./x').then(() => install());")).toHaveLength(1);
+  });
+});
 
 describe('device console capture install order (#591)', () => {
-  const mainSrc = fs.readFileSync(MAIN, 'utf8');
-  const specs = importSpecifiers(mainSrc, 'app/main.tsx');
+  const mainSf = parsed(MAIN);
+  const specs = importSpecifiers(MAIN);
 
   it('imports ./installDeviceConsoleCapture BEFORE ./App.tsx', () => {
     const capture = found(specs.findIndex((s) => s.includes('installDeviceConsoleCapture')), "main.tsx's import of ./installDeviceConsoleCapture");
@@ -82,15 +123,11 @@ describe('device console capture install order (#591)', () => {
     ).toBeLessThan(app);
   });
 
+  // ⚠️ Every CALL, wherever it sits (#1179). The line filter this replaces dropped every line starting
+  // `import`, so `import('./x').then(() => installDeviceConsoleCapture())` was invisible to it.
   it("does NOT install by calling installDeviceConsoleCapture( from main.tsx's body", () => {
-    const stripped = stripComments(mainSrc);
-    assertScanIsSane(mainSrc, stripped, 'app/main.tsx');
-    const body = stripped
-      .split('\n')
-      .filter((l) => !/^\s*import\s/.test(l))
-      .join('\n');
     expect(
-      /\binstallDeviceConsoleCapture\s*\(/.test(body),
+      callsTo(mainSf, 'installDeviceConsoleCapture').length > 0,
       'main.tsx must not CALL installDeviceConsoleCapture() directly — a statement runs after every ' +
         'import, which is too late. The side-effect import ./installDeviceConsoleCapture is the install.',
     ).toBe(false);
@@ -117,23 +154,17 @@ describe('device console capture install order (#591)', () => {
   });
 
   it("does NOT install by calling installConsoleRing( from main.tsx's body", () => {
-    const stripped = stripComments(mainSrc);
-    assertScanIsSane(mainSrc, stripped, 'app/main.tsx');
-    const body = stripped
-      .split('\n')
-      .filter((l) => !/^\s*import\s/.test(l))
-      .join('\n');
     expect(
-      /\binstallConsoleRing\s*\(/.test(body),
+      callsTo(mainSf, 'installConsoleRing').length > 0,
       'main.tsx must not CALL installConsoleRing() directly — a statement runs after every import, ' +
         'which is too late. The side-effect import ./installConsoleRing is the install.',
     ).toBe(false);
   });
 
   it("installDeviceConsoleCapture.ts's gate is byte-identical (modulo whitespace) to main.tsx's bridge-import gate", () => {
-    const installSrc = fs.readFileSync(INSTALL_DEVICE_CONSOLE_CAPTURE, 'utf8');
-    const mainGate = extractGate(mainSrc, "import('./debug/bridge')", 'app/main.tsx (bridge-import gate)');
-    const installGate = extractGate(installSrc, 'installDeviceConsoleCapture()', 'app/installDeviceConsoleCapture.ts');
+    const mainGate = gateOf(dynamicImports(mainSf, './debug/bridge'), "import('./debug/bridge')", 'app/main.tsx (bridge-import gate)');
+    const installGate = gateOf(callsTo(parsed(INSTALL_DEVICE_CONSOLE_CAPTURE), 'installDeviceConsoleCapture'),
+      'installDeviceConsoleCapture() call', 'app/installDeviceConsoleCapture.ts');
     expect(
       installGate,
       'installDeviceConsoleCapture.ts\'s gate must fold IDENTICALLY to the one guarding ' +
@@ -144,13 +175,12 @@ describe('device console capture install order (#591)', () => {
   });
 
   it('installDeviceConsoleCapture.ts pulls in NOTHING beyond the gate and the installer', () => {
-    const installSrc = fs.readFileSync(INSTALL_DEVICE_CONSOLE_CAPTURE, 'utf8');
     // The precedent's most load-bearing assertion (errorCaptureInstallOrder.test.ts's "actually calls the installer" test), and it
     // matters MORE here: this module is in main.tsx's STATIC graph, so anything it imports is both
     // evaluated uncovered AND a new candidate to survive DCE into a release bundle. `verify` would
     // stay green either way, and the only gate that could notice (`smoke:debug-flag`) is manual and
     // greps for `[console-capture]`, not for whatever else came along for the ride.
-    expect(importSpecifiers(installSrc, 'app/installDeviceConsoleCapture.ts'))
+    expect(importSpecifiers(INSTALL_DEVICE_CONSOLE_CAPTURE))
       .toEqual(['@capacitor/core', './debug/deviceConsoleCapture']);
   });
 
@@ -162,9 +192,8 @@ describe('device console capture install order (#591)', () => {
   // the narrower device/bridge gate — a future edit that "simplifies" them back into one expression
   // is exactly the regression this second assertion is meant to catch.
   it("installConsoleRing.ts's gate is the wider union — deliberately NOT equal to the device gate", () => {
-    const ringSrc = fs.readFileSync(INSTALL_CONSOLE_RING, 'utf8');
-    const ringGate = extractGate(ringSrc, 'installConsoleRing(', 'app/installConsoleRing.ts');
-    const deviceGate = extractGate(mainSrc, "import('./debug/bridge')", 'app/main.tsx (bridge-import gate)');
+    const ringGate = gateOf(callsTo(parsed(INSTALL_CONSOLE_RING), 'installConsoleRing'), 'installConsoleRing() call', 'app/installConsoleRing.ts');
+    const deviceGate = gateOf(dynamicImports(mainSf, './debug/bridge'), "import('./debug/bridge')", 'app/main.tsx (bridge-import gate)');
     expect(
       ringGate,
       `app/installConsoleRing.ts's gate must be the documented wider union. Got: "${ringGate}"`,
@@ -180,11 +209,10 @@ describe('device console capture install order (#591)', () => {
   });
 
   it('installConsoleRing.ts pulls in NOTHING beyond the gate and its two installers', () => {
-    const ringSrc = fs.readFileSync(INSTALL_CONSOLE_RING, 'utf8');
     // #596/#597 Stage 3a added the second import: `./debug/uncaughtCapture`'s window-error
     // listeners now register from THIS gate too (not `installDeviceConsoleCapture.ts`'s narrower
     // one — see the module doc comment), so this list legitimately grew by one.
-    expect(importSpecifiers(ringSrc, 'app/installConsoleRing.ts'))
+    expect(importSpecifiers(INSTALL_CONSOLE_RING))
       .toEqual(['@modoki/engine/runtime/core/consoleRing', './debug/uncaughtCapture']);
   });
 
@@ -213,7 +241,7 @@ describe('device console capture install order (#591)', () => {
         'deviceConsoleCapture.ts and bridge.ts should only import { consoleRing, ' +
         'installDeviceConsoleCapture } from it.',
     ).toBe(false);
-    expect(importSpecifiers(bridgeSrc, 'app/debug/bridge.ts').some((s) => s.includes('./deviceConsoleCapture'))).toBe(true);
+    expect(importSpecifiers(BRIDGE).some((s) => s.includes('./deviceConsoleCapture'))).toBe(true);
   });
 
   it('bridge.ts does not bind console.log itself — its chatter must bypass the ring', () => {
@@ -248,6 +276,6 @@ describe('device console capture install order (#591)', () => {
         + '`unpatchedLog` so it cannot evict the boot logs `device_console_logs` exists to show. '
         + '(`console.error` via `_err` IS deliberately in the ring; `console.warn` is unrelated.)',
     ).toBe(false);
-    expect(importSpecifiers(bridgeSrc, 'app/debug/bridge.ts').some((s) => s.includes('./deviceConsoleCapture'))).toBe(true);
+    expect(importSpecifiers(BRIDGE).some((s) => s.includes('./deviceConsoleCapture'))).toBe(true);
   });
 });

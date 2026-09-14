@@ -18,15 +18,15 @@
  *     `smoke-packaged.sh` also `rm -rf`s its build dir, so two clones running
  *     `verify:packaged` at once deleted each other's app mid-build.
  *
- *  NOT covered, deliberately: `mkdtempSync` / `mktemp` callers (unique by construction, so never
- *  shared; their LIFETIME is a different guard, `scratchDirOwnership.test.ts`, #1117) and
+ *  NOT covered, deliberately: `mkdtempSync`, and a `mktemp` TEMPLATE it fills (unique by construction —
+ *  see `literalTmpPaths`; their LIFETIME is a different guard, `scratchDirOwnership.test.ts`, #1117), and
  *  `~/.modoki/**` (machine-wide ON PURPOSE — device claims and the launch log exist to answer
  *  cross-clone questions, and per-cloning them would defeat them).
  */
 import { describe, it, expect } from 'vitest';
-import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { readScannedSource } from '@modoki/engine/testing';
+import { readScannedSource, shellLogicalLines } from '@modoki/engine/testing';
+import { callsToPath, findNodes, lineOf, parseSource, referencesToPath, ts } from '@modoki/engine/testing/sourceAst';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const scriptsDir = path.resolve(__dirname, '../../scripts');
@@ -55,16 +55,35 @@ function tempDirBasenames(src: string): string[] {
 }
 
 /**
- * Numbered lines of ALREADY-STRIPPED shell source. These scripts discuss `/tmp` paths in prose
- * constantly (they document this very hazard), and a doc mention is not a write.
+ * The COMMANDS of ALREADY-STRIPPED shell source, each with the line it starts on. These scripts discuss
+ * `/tmp` paths in prose constantly (they document this very hazard), and a doc mention is not a write.
  *
- * The private version this replaces dropped only WHOLE-LINE `#` comments, so a trailing
- * `cmd  # writes to /tmp/x` was still read as a write. Callers hand in
- * `readScannedSource(file).code`, which blanks both and is line-preserving, so `n` still addresses
- * the real file (#812).
+ * The private version before #812 dropped only WHOLE-LINE `#` comments, so a trailing
+ * `cmd  # writes to /tmp/x` was still read as a write; callers hand in `readScannedSource(file).code`,
+ * which blanks both. Since #1179 a backslash-continued command is ONE entry: per physical line,
+ * `export MODOKI_VITE_LOG=\ ⏎ "/tmp/x.log"` put the variable and the path on different lines and the
+ * native-path rule below read neither.
  */
 function codeLines(code: string): { line: string; n: number }[] {
-  return code.split('\n').map((line, i) => ({ line, n: i + 1 }));
+  return shellLogicalLines(code).map(({ text, line }) => ({ line: text, n: line }));
+}
+
+/**
+ * Every literal `/tmp/<tail>` in stripped shell, and whether it is excused as a `mktemp` TEMPLATE: the
+ * tail ENDS in the `XXX` run `mktemp` replaces with a unique suffix, and the path is `mktemp`'s own
+ * ARGUMENT — directly after `mktemp`/`mkdtemp` and its flags. Before #1179 any line MENTIONING mktemp
+ * skipped every `/tmp` path on it — `X="$(mktemp)"; cp log /tmp/shared.log` passed — and a template with
+ * no `XXX` is not unique at all. (The P7 review: "after a mktemp in the same command" still excused
+ * `cp "$(mktemp)" /tmp/c.XXXXXX` and a redirect target `mktemp /tmp/a.XXXXXX > /tmp/b.XXXXXX`.)
+ */
+function literalTmpPaths(code: string): Array<{ n: number; tail: string; excused: boolean }> {
+  return codeLines(code).flatMap(({ line, n }) => [...line.matchAll(/\/tmp\/([^\s"'`;|)>]*)/g)].map((m) => ({
+    n,
+    tail: m[1]!,
+    // The X run must END the name: BSD mktemp fills only a trailing run, so `x.XXXXXX.log` is a literal,
+    // shared file (measured, #1179 P7 re-review), and `XXXXXX/shared.log` is a fixed name under a dir.
+    excused: /X{3,}$/.test(m[1]!) && /\bmk(d?)temp(?:\s+-[A-Za-z]+)*\s+["']?$/.test(line.slice(0, m.index)),
+  })));
 }
 
 describe('temp paths in engine/scripts are clone-scoped', () => {
@@ -72,22 +91,13 @@ describe('temp paths in engine/scripts are clone-scoped', () => {
     const offenders: string[] = [];
     let tails = 0;
     for (const file of shellScripts()) {
-      for (const { line, n } of codeLines(readScannedSource(file).code)) {
-        // `mktemp`/`mkdtemp` mint a unique name themselves — the `${TMPDIR:-/tmp}` prefix in
-        // those calls is a portability idiom, not a shared name.
-        if (/mk(d?)temp/.test(line)) continue;
-        // The token following `/tmp/` up to the next quote/space/redirect.
-        const re = /\/tmp\/([^\s"'`;|)>]*)/g;
-        for (let m = re.exec(line); m; m = re.exec(line)) {
-          tails++;
-          const tail = m[1];
-          // A `$` anywhere in the tail means the name is keyed on something (the backend port,
-          // the pid, the clone basename). That is the whole requirement — WHICH discriminator
-          // is a judgement call per script, and each one documents its own.
-          if (!tail.includes('$')) {
-            offenders.push(`${path.basename(file)}:${n}: /tmp/${tail}`);
-          }
-        }
+      // `mktemp` mints a unique name itself — a template it fills is not a shared name (see literalTmpPaths).
+      for (const { n, tail, excused } of literalTmpPaths(readScannedSource(file).code)) {
+        tails++;
+        // A `$` anywhere in the tail means the name is keyed on something (the backend port,
+        // the pid, the clone basename). That is the whole requirement — WHICH discriminator
+        // is a judgement call per script, and each one documents its own.
+        if (!excused && !tail.includes('$')) offenders.push(`${path.basename(file)}:${n}: /tmp/${tail}`);
       }
     }
     expect(
@@ -131,7 +141,7 @@ describe('temp paths in engine/scripts are clone-scoped', () => {
     // per-cloning it is precisely how that recurs, so pin them to each other.
     const smoke = readScannedSource(path.join(scriptsDir, 'smoke-packaged.sh')).code;
     const repro = readScannedSource(path.join(scriptsDir, 'repro-cold-boot.sh')).code;
-    const outOf = (src: string) => /^OUT=.*$/m.exec(codeLines(src).map((l) => l.line).join('\n'))?.[0] ?? '';
+    const outOf = (src: string) => codeLines(src).map((l) => l.line.trim()).find((l) => l.startsWith('OUT=')) ?? '';
     // Compare the BASENAME expression, normalised for the two spellings of "this clone"
     // ($CLONE vs an inline $(basename "$REPO")) — the paths must resolve to one directory.
     const norm = (s: string) =>
@@ -166,13 +176,71 @@ describe('temp paths in engine/scripts are clone-scoped', () => {
   });
 
   it('devServer.ts falls back to a per-editor Vite log name', () => {
-    const src = fs.readFileSync(devServerPath, 'utf8');
-    const line = src.split('\n').find((l) => l.includes("MODOKI_VITE_LOG") && l.includes('tmpdir')) ?? '';
-    expect(line, 'devServer.ts should read MODOKI_VITE_LOG with an os.tmpdir() fallback').not.toBe('');
+    const fallbacks = viteLogFallbacks(readScannedSource(devServerPath).code, 'devServer.ts');
+    expect(fallbacks.length, 'devServer.ts should read MODOKI_VITE_LOG with an os.tmpdir() fallback').toBeGreaterThanOrEqual(1);
     expect(
-      line,
-      "the fallback must be tagged (a template literal keyed on the backend port/pid) — a bare "
-        + "'modoki-vite.log' is written by every clone's editor at once",
-    ).not.toMatch(/['"]modoki-vite\.log['"]/);
+      fallbacks.filter((f) => !f.underTmpdir || f.untagged).map((f) => `devServer.ts:${f.line}`),
+      "every fallback must build under os.tmpdir() and be tagged (a template literal keyed on the backend "
+        + "port/pid) — a bare 'modoki-vite.log' is written by every clone's editor at once",
+    ).toEqual([]);
+  });
+
+  it('the fallback detector judges the fallback EXPRESSION, not the line it starts on (#1179)', () => {
+    const src = [
+      'const a = process.env.MODOKI_VITE_LOG || path.join(',
+      '  os.tmpdir(),',
+      "  'modoki-vite.log',",
+      ');',
+      'const b = process.env.MODOKI_VITE_LOG ?? path.join(os.tmpdir(), `modoki-vite-${tag}.log`);',
+      "const c = process.env.MODOKI_VITE_LOG || '/tmp/modoki-vite.log'; const d = os.tmpdir();",
+    ].join('\n');
+    expect(viteLogFallbacks(src, 'd.ts')).toEqual([
+      { line: 1, underTmpdir: true, untagged: true },
+      { line: 5, underTmpdir: true, untagged: false },
+      { line: 6, underTmpdir: false, untagged: true },
+    ]);
   });
 });
+
+/** Every `…MODOKI_VITE_LOG || <fallback>` / `?? <fallback>` in one file, from the parse (#1179): does
+ *  the FALLBACK expression itself call `tmpdir()`, and does it carry the bare shared name anywhere
+ *  inside it. The line-based check it replaces took the first line naming both tokens, so a wrapped
+ *  `path.join(os.tmpdir(),\n 'modoki-vite.log')` put the banned literal on a line nobody read, and a
+ *  `tmpdir()` elsewhere on the line vouched for a fallback that had none. */
+function viteLogFallbacks(code: string, label: string): Array<{ line: number; underTmpdir: boolean; untagged: boolean }> {
+  const sf = parseSource(code, label);
+  return findNodes(sf, (n): n is ts.BinaryExpression => ts.isBinaryExpression(n)
+    && (n.operatorToken.kind === ts.SyntaxKind.BarBarToken || n.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken)
+    && referencesToPath(n.left, 'env.MODOKI_VITE_LOG').length > 0)
+    .map((b) => ({
+      line: lineOf(b),
+      underTmpdir: callsToPath(b.right, 'tmpdir').length > 0,
+      untagged: findNodes(b.right, (n): n is ts.StringLiteralLike => ts.isStringLiteralLike(n)).some((s) => /(^|\/)modoki-vite\.log$/.test(s.text)),
+    }));
+}
+
+describe('the shell temp-path readers take a COMMAND, not a line (#1179)', () => {
+  it('a mktemp template is excused only as the argument of that mktemp — not a neighbour on its line', () => {
+    const code = [
+      'A="$(mktemp /tmp/modoki-a.XXXXXX)"',
+      'B="$(mktemp)"; cp log /tmp/shared.log',
+      'mktemp /tmp/no-template',
+      'C=$(mktemp -d /tmp/x.XXXXXX) && D=/tmp/also-shared',
+      'E="$(mktemp)"; cp log /tmp/cache.XXXXXX',
+      'cp /tmp/before.XXXXXX b; F=$(mktemp)',
+      'cp "$(mktemp)" /tmp/c.XXXXXX',
+      'mktemp "/tmp/q.XXXXXX" > /tmp/redirect.XXXXXX',
+      'LOG="$(mktemp /tmp/modoki-smoke.XXXXXX.log)"',
+    ].join('\n');
+    expect(literalTmpPaths(code).map((p) => `${p.n}:${p.tail}:${p.excused ? 'ok' : 'SHARED'}`))
+      .toEqual(['1:modoki-a.XXXXXX:ok', '2:shared.log:SHARED', '3:no-template:SHARED', '4:x.XXXXXX:ok', '4:also-shared:SHARED',
+        '5:cache.XXXXXX:SHARED', '6:before.XXXXXX:SHARED', '7:c.XXXXXX:SHARED', '8:q.XXXXXX:ok', '8:redirect.XXXXXX:SHARED', '9:modoki-smoke.XXXXXX.log:SHARED']);
+  });
+
+  it('a backslash-wrapped command is one entry, cited at the line it starts on', () => {
+    expect(codeLines('export MODOKI_VITE_LOG=\\\n  "/tmp/x.log"\nnext').map((l) => `${l.n}: ${l.line.trim()}`))
+      .toEqual(['1: export MODOKI_VITE_LOG=  "/tmp/x.log"', '3: next']);
+    expect(tempDirBasenames('BUILD="$TMPBASE/\\\nmodoki-build"')).toEqual(['modoki-build']);
+  });
+});
+

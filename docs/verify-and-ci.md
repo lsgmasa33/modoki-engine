@@ -1346,6 +1346,284 @@ be the occurrence's too**, which is where #1144's own first cut still failed ope
 Comments and Markdown prose have no AST; collapsing whitespace in a matched span stays the right tool
 there.
 
+**#1179 moves the ~40 guards that still judged a code occurrence one LINE at a time onto the same
+helper, in phases.** A line is a window too: too narrow for a wrapped call, too wide for two
+occurrences sharing it. Progress: **P0 + P1 landed (9 guards)** — `determinismGuard`,
+`buildChildGroupKill`, `playableSkipsProbe`, `consoleRingRetainCallSiteGate`, `audioBusVocabulary`,
+`keymapOwnership`, `materialCloneStamp`, `userDataDir` and `tempPathScoping`'s `devServer.ts` check.
+The helper gained `accessPath`/`referencesToPath`/`callsToPath` (a dotted name however it is
+formatted — `performance\n  .now()`, `(mesh.material as Material).clone()`), `statementOf`/`flatText`
+(a ledger KEY that survives a re-wrap) and `enclosingNamedFunction`. What the phase turned up,
+because these recur:
+
+- **Counting READS, not calls, finds what a `tok\s*\(` pattern never could.** `determinismGuard`'s
+  whole delta over 567 runtime files was two rows: `sceneMutate.ts`' `mint = newGuid` default (an
+  unseeded minter handed on uncalled, unledgered until now) and `assetRefRules.ts`' `function
+  newGuid()` — a DECLARATION the regex had been matching, and a sanctioned row had been pardoning.
+- **A migration's text anchors fail open on the absent case.** `userDataDir` asserted
+  `expect(src.indexOf("app.setPath('userData'")).toBeLessThan(src.indexOf('initFileLog();'))`: a
+  wrapped `setPath(` is `-1`, and `-1` is less than everything. Anchor on a found node, and use NaN
+  for "absent" — no comparison passes it. The shape is filed as its own class (#1181).
+- **Source position is run order only at module scope.** Every ordering check compares positions,
+  so the anchor call must be pinned to module scope too; a `setPath` moved into an arrow kept its
+  position and ran later, green, until that was asserted.
+- **A statement's text is not a key without its scope — and the scope must stay SHORT.** Keyed on
+  `flatText(statementOf(call))` alone, `return profileBaseDir ?? app.getPath('userData');` pardoned
+  that body in ANY function — the migration's own regression, caught by review. The first repair keyed
+  on the host call's full text, which gave a `.catch` off the 800-line startup body an 18 KB key and let
+  `memo(() => …)` carry a pardon between functions — caught by the re-review. What holds:
+  `<named function | <module>>` `>` `<host's short callee>(<first string arg | …>)` `::<statement>`.
+- **"Contains the call" is not "is the gate".** `userDataDir`'s `shouldOverrideUserData` check was a
+  whole-file regex the `if` would still satisfy after the `setPath` moved out of it; its first AST
+  replacement asked whether the condition CONTAINED the call, which `if (!shouldOverride…(…))` and
+  `… || true` both do. The unwrapped condition must BE the call, and the occurrence must be in its
+  then-branch.
+- **Moving a guard onto the parse surfaces its OTHER text checks.** `audioBusVocabulary` carried a
+  hand paren-balancing scanner and proved its one exception with a whole-file regex any function's
+  `hasDocKey` satisfied (and never read which TABLE was checked); `buildChildGroupKill` compared
+  FILE-wide counts, so one route killing twice paid for another that never kills. Each is now per node.
+- **`referencesToPath` deliberately does not follow an alias** (`const p = performance; p.now()`), a
+  destructure from anything but a named chain, or a nested pattern — that is dataflow (`readsOf`), and
+  the per-line forms missed them too. Its docblock says so rather than implying coverage.
+
+**P2 landed (8 more guards, 17 in all)** — `pathIdentityIsShared` (five scans), `uiLengthFallback`,
+`traitPersistencePredicateGuard`, `projectPresencePredicate`, `formatVersionFromConstant`,
+`trackedConfigPaths`, `codeAssetRefs` and `relayRefusalStatus`. Most of these guard a clean tree
+(populations 0 before and after), so their fixture tables are what carry them. What recurred:
+
+- **"The operand IS the call" is too strict once a regex's `[^;]*` is gone.** The first parse of
+  `pathIdentityIsShared` asked whether a compared value WAS `path.resolve(…)`, and so dropped every
+  re-spelt form the regex had flagged: `.toLowerCase()` (which is `pathCaseKey` written inline),
+  `.replace(/\\/g, '/')`, `path.normalize(…)`. The rule that holds is to peel RE-SPELLINGS
+  (`comparedValue`) but not DERIVING calls (`path.relative`/`dirname`/`basename`, which ask a
+  different question). Caught by review, not by the author's population measure — which was 0/0 and
+  so could not tell a narrowed detector from a clean tree.
+- **Narrowings hide in "the regex caught it by accident".** A unit fallback quoted inside a string, a
+  GUID quoted inside a JSON string, a renamed import (`DEFAULT_FONT_GUID as F`): each was caught only
+  because the regex read raw text, and each silently dropped out of the first parse. Before landing a
+  migration, list what the OLD text form matched that the new node form cannot see, and either keep
+  it (a text channel over string content, a `readsOf` follow) or pin it as an accepted gap.
+- **An exemption or pardon found by text is a neighbour's.** "`import.meta.url` anywhere on the line"
+  (`pathIdentityIsShared`), "any 504 on the classifier's line" (`relayRefusalStatus`), "every literal
+  on the marker's line" (`formatVersionFromConstant`), "a docblock quoting `version: FOO`" as the
+  from-a-constant anchor — each is now the occurrence's own.
+- **A guard can match its own prose.** `projectPresencePredicate`'s `what:` labels spelt the forbidden
+  shapes, so the file SANCTIONED itself; in the parse a string is not a call, the row went stale, and
+  it is gone.
+- **Two costs the gate surfaced that the suites did not:** a parse over a whole corpus (~3,000 files)
+  must prefilter on a token the occurrence cannot exist without, or it overruns a 20 s budget under
+  `verify`'s load; and reading `readScannedSource(…).raw` must be DECLARED (`comments: 'include'` +
+  reason), which `commentStripperIsShared` enforces.
+
+**P3 landed (11 more guards, 28 in all)** — the ones whose GATE or pre-flight was found beside the
+occurrence rather than from it: `deviceConsoleCaptureInstallOrder` (+ `earlyConsoleShim`'s gate
+pin), `render3dBoundary`, `deleteBoundary`, `projectNeedsInstall`, the JS halves of `reapScoping`
+and `killPackagedGuard`, `packStagedTree`, `assetJsonGuard`, `importSettingSelectsSpliced`,
+`settingsDisabledIfTotal` and `editorStoreActionsReachable`. They share four `sourceAst` walks:
+`guardsOf` (the conditions a node runs under — its `if`/`? :` branch, the right side of `&&`/`||`,
+and an earlier `if (T) <exit>` in an enclosing list), `guardProves` (does a guard prove an atom true,
+through `!`, `&&`, `||`), `precedingStatements` (what has run on every path before it) and
+`printedText` (a formatter-proof spelling for comparing two expressions). What recurred:
+
+- **"The nearest `if (` / `function` line above" is the window again, pointed backwards.** It
+  vouched for a marker that sat AFTER the gate's closing brace, for an import below a PREVIOUS
+  accessor's gate, and — in `assetJsonGuard` — gave an arrow bound after `tryFetchEmbeddedManifest`
+  that function's exemption. Ask the node what encloses it; do not scan for what came before it.
+- **A gate is a claim about control flow, so its polarity is part of it.** The text forms matched the
+  flag's NAME: `if (__MODOKI_MODULE_RENDER3D__) return; import(…)` and `if (!existsSync(nm)) {
+  install(); continue }` both read as the thing they are the opposite of.
+- **What a dominating gate means depends on who can call the code.** A gate dominating where a
+  closure is CREATED dominates the closure (the build DCEs it). A hoisted function DECLARATION can be
+  called from above an early exit in its own statement list, so those exits are not its guards — but
+  the branches enclosing that list still are. Review found the hoisted case after the docblock had
+  waved it away as "no caller asks"; the first fix stopped the climb at the declaration, and re-review
+  found that dropped a real enclosing `if` and let a nested gate pass as the only one.
+- **The accidental catches this time were one hop away from the occurrence.** A presence test moved
+  into a helper (`return existsSync(…node_modules)`) that the line form caught at its caller, a
+  `basename` inside an arrow whose BINDING is named `pattern`, a shell `$(basename …)` inside a JS
+  string, an `<option>` produced by something that is not a `.map()` callback (the text form reported
+  it `<unparsed>` and failed; the first parse made it vanish), `res.json?.()` rejected by a prefilter
+  stricter than the node, and `interface EditorState extends Slice` — which the text reader FAILED on,
+  and the first parse silently read as a smaller population. When a node reader cannot see members,
+  make it refuse the shape rather than shrink.
+
+**P4 landed (7 more guards, 35 in all)** — the router and import guards: `getOkFalseGuard`,
+`routeVocabularyForwarding`, `assetJsonBytesAgree`, `buildLeaseSourceWireShape`, `hmrStaleness`'s
+layering pin, the shared `importClosure` walker (under `mtsdf2DBoundary`, `render3dBoundary` and
+`importClosurePaths`), and the TS half of `buildWebCallSites` — plus the two paren scanners P3 left
+(`earlyConsoleShim`'s plugin-call args, `assetJsonGuard`'s `fetch(assetUrl(…))`). One new `sourceAst`
+walk, `importsIn`: every static import, re-export and literal `import()` with its bindings by exported
+and local name. What recurred:
+
+- **A hand-written paren or brace counter is a line reader with a longer reach.** Four guards had one
+  (`okFalseResponses`, `extractPluginCallArgs`, `assetUrlFetches`, and the statement joiner under the
+  import walker). Each read string contents as syntax — a `(` in a message ended a call early — and
+  each then regexed the text it had cut out, so `error:` inside a nested object counted as the body's
+  cause and `ASSET_FETCH_INIT` inside `assetUrl(…)`'s own arguments counted as the fetch's init. The
+  argument, the key, the element is a node; ask for it.
+- **A block that runs "from this line to the next marker" is a window with a moving edge.** The router
+  guard filed a response under whichever `urlPath === '…'` LINE came before it, and read GET-ness off
+  that one line — so a wrapped `&& method === 'GET'` put a GET route under the POST rule, where its bare
+  200 was never checked. The route and the method are the response's own held guards.
+- **A file-wide name lookup is a neighbour that vouches from further away.** `assetJsonBytesAgree`
+  accepted `writeJsonAtomic(abs, bytes)` because SOME `const bytes = assetJsonBytes(` existed in the
+  2,600-line router; `buildWebCallSites` accepted an args array because a `'--target', 'web'` sat
+  within six lines. Resolve the identifier by scope; read the array the literal is an element of.
+- **The migration found real misses, not just re-spellings.** The import walker had never followed an
+  `export … from` edge, and capped a statement at 12 lines — `DeviceConnectSection.tsx`'s import is 13.
+  The 2D closure it guards went from 202 files to 471 (still clean), and it stopped inventing edges from
+  `import('./x').T` type positions and from `import()` in comments. And its `skipEdges`, meant for
+  flag-gated `import()`s, skipped a STATIC import at the same address too — while the caller's "is it
+  gated?" check read only the `import()` and passed. A skip is now dynamic-only.
+- **When a classification decides whether a rule applies at all, require PROOF to take something out
+  of it — and make the rule you cannot afford to skip unconditional.** `getOkFalseGuard` owes a status
+  from any `ok:false` a GET can reach. Four review rounds on one detector: reading `=== 'GET'` dropped
+  `['GET', 'HEAD'].includes(method)`; "an un-negated `'GET'` literal" moved `(req.method || 'GET') ===
+  'POST'` under the GET rule and off the cause rule; "guards that mention `method`" dropped an aliased
+  `m === 'GET'` and a second `/api/` literal; and the first proof-of-exclusion was itself too generous —
+  any `q.method === 'POST'` nested in a GET route counted, and a one-hop "every caller excludes GET" found
+  callers by NAME in one file, so `hiddenWindowRefusal`, exported and also called from `main.ts`, was
+  excluded by its single in-file caller (the reviewer turned that into a false pass on the real tree).
+  It landed small: the GET rule applies unless the ROUTE'S OWN test (`urlPath === … && method ===
+  'POST'`) proves a GET cannot reach it; a route whose method is checked anywhere else is a ledger row
+  with the reason, not an inference. And every GET response already named its cause (6 of 6), so the
+  cause rule now applies to all of them. Measure what an unconditional rule costs before assuming it is
+  too strict, and prefer a visible ledger row to an inference that has to be right about every caller.
+  Its sibling class — ~20 guards outside #1179's census that read import SYNTAX with a regex — is #1193.
+
+**P5 landed (3 more guards, 38 in all)** — Court's `cellMapDiscipline`, `pieceSprites` (both source
+rules) and `sweepGate`'s describe-scope scan. One new `sourceAst` helper, `siteText`: a site's
+statement, narrowed to the object-literal member or the compound statement's head it sits in, so a
+ledger key names `cellCenters` in a 700-line `__testing` export instead of the whole export. What recurred:
+
+- **A layout convention is a line reader's hidden premise, and the file stops following it before
+  the guard notices.** `sweepGate` took "two spaces of indent" to mean describe-body scope. That holds
+  for a describe at column 0 — and 18 of the 38 gated describes are registered from inside an exported
+  function (`hintNotesSweep.ts` and its siblings), so their bodies sit at four spaces and were never
+  scanned, while the registering function's own statements, which are not describe scope at all, were.
+  `cellMapDiscipline` credited a read to "the last `function` line above it", which had already been
+  wrong once (`export function` was invisible) and still filed the module-scope declaration under
+  `readConfig` and the `__testing` export under `resetCourtIapBoot`. Ask the tree which describe body,
+  which function.
+- **Find a binding by SYMBOL, and count a read that is not a call.** `/PIECE_ICON\(/` per line saw one
+  reader; a `const f = PIECE_ICON` handed on — the way a second reader hides — was none, and neither
+  was `auditLevel` passed to `CORPUS.map`. `readsOf` sees both, skips a shadowing parameter, and does not
+  count the declaration as a read (which is why the cell-map population went 9 → 8).
+- **A NAME-keyed pardon is only as narrow as the name's scope.** `INPUT_PATHS` pardons `hitTest`; by
+  name alone that also reached a `hitTest: () => …` method on the export or a helper called `hitTest`
+  nested inside a draw path. The pardon now applies only to a function declared at module scope.
+- **"When does this run" is a property of the call a function is handed to, not of how its
+  initializer starts.** The old scan read "deferred" off `= () =>`, so a lazy memo it approved was
+  never checked where it was CALLED — and a memo called at describe scope pays for the corpus as early
+  as the `const` it replaced. The walk judges a callback by its call (`it`/hook: later; `describe`:
+  now; an unknown call such as `.map`: not proven to wait, so now) and a named function at every place
+  it is called or handed on.
+- **Some surviving mutants were the better rule.** Widening `cfg.pieceIcon*` to a field of that NAME on
+  any holder, and `=` to every assignment operator, killed nothing on the tree and closed shapes the
+  narrower code let through. So the mutant became the code, rather than a fixture being written to
+  defend the narrower version.
+- **Re-specifying a rule is the moment to re-derive what it covers — not only how it reads.** The review
+  found the texture rule still listed `pieceIcon*`/`civilianIcon` by name, while every piece surface has
+  drawn the COIN since 2026-08-12: `sprite: PIECE_COIN(piece)` in a hint ghost passed, and
+  `PIECE_COIN_SPRITE`'s own comment cited this test as its guard. The set is now DERIVED — every
+  `CourtConfig` field the Inspector offers as an image — and a field leaves it only on proof from the
+  data: the four login-bonus icons are authored as derived sprite guids (no image's texture id), and
+  that exclusion is pinned. The first fix still NAMED the functions that return a texture
+  (`PIECE_ICON`, `PIECE_COIN`, `COIN_SETS`) and the re-review found two it missed, `TRAY_MASTER_TEX` and
+  `tileStarsTexture`; a call now counts as a texture when the local function it reaches can RETURN one.
+  The same mistake at two layers in one fix: a list is a guess about the population. It also found `sweepGate` knew a gate only as `describe.skipIf(c)(…)`; a
+  gate is any `skipIf`/`runIf`/`skip` link of the chain (`describe.skipIf(c).each(rows)(…)`), and a
+  conditional base is judged per arm with the chain's links attached (`(S ? describe : describe.skip).each(…)`).
+  A third round moved the texture rule through destructures, record members and function aliases, and
+  listed what it still does not follow (parameters, pass-through helpers, class methods) on the detector.
+  Its sibling class — test guards outside #1179's census that delimit a code unit by a hand-counted
+  bracket depth, a column-0 line or a fixed indent — is #1195.
+
+**P6 landed (2 census guards, 40 in all, plus one sibling)** — wordweave's `refusalJournal` (#980) and
+`adBannerReserve`'s playable-gate ledger (#1108/#1139), and `levelMoveTransitionGuard` (#1090), which was
+not in the census but read the same handler bodies the same way. One `sourceAst` change: `guardProves`
+takes `value: false`, the atom proven FALSE — "not proven true" is not that. What recurred:
+
+- **A regex over a function body's TEXT is a window, however exactly the body was parsed.** #1144 gave
+  each handler its own body from the parser, and the guards then ran `/const (\w+) = liveBuilt\(/` and
+  `/if \(refusedDuringTransition\(…\)\) return;/` over that text — so the bind-and-check inside a nested
+  `setTimeout` callback vouched for a handler whose own statements ran unguarded, and an honoured
+  refusal in a callback vouched for an `advanceFromResult` the handler ran straight into mid-fade. Both
+  passed on the real file. The parse bounded the span; the classification still has to be a node: the
+  bind is the handler's first statement, and each later statement (each mover CALL, for #1090) runs
+  under a guard imposed inside that handler.
+- **A guard's population is every READ of the thing, not the syntaxes it was seen in.** The playable
+  ledger collected `if (PLAYABLE_ASSETS` and `PLAYABLE_ASSETS ?` per line and stepped over every
+  `const` line to skip the path constants. `if (!PLAYABLE_ASSETS)`, `const reserve = PLAYABLE_ASSETS ?
+  0 : r` inside a function, and `__MODOKI_PLAYABLE__` in `screen.ts` all passed on the real tree — the
+  third time this ledger turned out to be a deny list (#1108 round 2, #1139, now). Every read of the
+  alias by symbol, and the define in any game file, is one entry.
+- **An exclusion owned by ANOTHER guard is sound only while both read the same shape — so share the
+  shape.** The path constants leave the ledger because `playableCorpus.test.ts` checks them against
+  `asset-keep.json`; the exclusion now matches that test's own declaration regex, one copy in
+  `playablePathDeclaration.ts`, against the RAW statement. A copy of it could narrow in one file and
+  leave a `const MODE: string = PLAYABLE_ASSETS ? 'ad' : 'app'` checked by neither.
+- **Replace a one-spelling ban with the property it stood for.** "No verbatim `!built || built.world !==
+  world`" became "no handler reads module `built`" — which is what CLAUDE.md's rule says, catches the
+  copy however it is wrapped or reordered, and also catches a read AFTER the guard. It is narrower in
+  one direction on purpose: the text ban was file-wide, and `syncBuild`'s rebuild test IS that
+  expression, legitimately — it passed only because it is wrapped over five lines.
+- **A ledger KEY that is not unique per occurrence turns a counted pardon back into a name.** Keying by
+  `file::function::site` read better than `function::nth`, and two `if (PLAYABLE_ASSETS)` in one
+  function share it — so a `sanctioned` NAME pardoned the second; the `nth` key it replaced had caught
+  that. Site keys go with counted `exempt` rows. (The same review: an exclusion correct for the file
+  its owning guard reads was applied to every file once the population grew beyond it.)
+- **When the property is "nothing can happen in between", refuse the shapes that can suspend rather
+  than enumerate the suspensions.** A same-function refusal rule was widened to "no `await` between
+  refusal and move", and the next review found five more gaps (an await in the guard's test, in the
+  move's arguments, after the move in a loop, `for await`, `await using`). A move in an `async`
+  function or a generator is now unverifiable, and unverifiable is an offender — no real one exists.
+
+**P7 landed (the shell guards — the census closes)** — `killPackagedGuard`, `packagedLaunchIsolation`,
+`exemptionLedgerIsShared`'s publisher check, `tempPathScoping`, `reapScoping`'s shell half and
+`winProcessPredicates`' `.sh` half. Shell has no parser here, so the unit is the COMMAND:
+`shellLogicalLines` in the scanner — comment-blanked source joined only at a backslash-newline. What
+recurred:
+
+- **The grain for shell is the command, and a command ends at a separator, not at a newline.** A
+  logical line fixes the wrap; it does not fix the neighbour — `node "$PATHS" kill || true; : 2>/dev/null`
+  is one line and two commands, and the old per-line check accepted the second command's redirect for
+  the first. The kill reader cuts at `||`, `&&`, `;`, `|` and a background `&`, and the `mktemp` excuse
+  applies only to a template that is `mktemp`'s own argument (any line MENTIONING `mktemp` used to excuse
+  every `/tmp` path on it). Joining stops at a backslash on purpose: joining across `&&` or an open quote would
+  manufacture exactly the neighbour this removes.
+- **A syntax a detector does not recognise is an exclusion nobody wrote down — including the syntax the
+  NEW detector does not list.** `packagedLaunchIsolation` knew a launch as `"$BIN" … &`, so
+  `test-packaged.sh`'s foreground `exec "$BIN"` was never a launch, and the file-wide `--user-data-dir`
+  contains let one isolated launch vouch for a second. The first rewrite listed launch shapes instead
+  (`exec`, `VAR=` prefixes) and the review found `nohup "$BIN" &`, `env X=1 "$BIN" &` and `then "$BIN"
+  &` had silently stopped being launches — each caught by the regex it replaced. Now every command
+  mentioning the binary is a launch unless PROVEN not to be (a test, `echo`, pure assignments), the
+  unisolated ones go through a counted ledger keyed by command, and the guard's premise was corrected
+  for #1036 (packaged profiles are per install).
+- **Filter a ledger row by LAYOUT, never by "its file is present".** `subprocessLineEndings` dropped a
+  `CR_SAFE_UPSTREAM` row whenever its file was not scanned — right for the OSS snapshot, which ships no
+  top-level `scripts/`, and wrong for a full checkout where the file was deleted: the stale pardon
+  vanished instead of failing. Same shape as `exemptionLedgerIsShared`'s `absentByLayout`.
+- **No parser is a recorded decision, not a silent one.** PowerShell (`winProcessPredicates`' `.ps1`:
+  backtick continuation, `<# #>` blocks) and Java (`iapParkedCallRelease`) stay line-grained, each with
+  the reason on the reader — the Java one fails loud on a reflow because its counts are exact.
+- **The command, on every platform.** The review found the logical-line join silently did nothing on a
+  `core.autocrlf` checkout — each continuation ends backslash-CR — so every P7 guard fell back to
+  physical lines on Windows only. A background `&` ends a command too; and "inside `$( … )`" is found
+  from the start of the line (`insideShellSubstitution`), because cutting at a separator first threw
+  away the `$(` of `$(cd "$REPO" && node … kill)` — a capture opened on an earlier physical line is a
+  stated limit.
+- **Merging two rewrites of one guard is a review of both sides' ASSERTIONS, not of the conflict hunks.**
+  #1187 rewrote the same wordweave guards on `main` while this ran, making every refusal RETURNED. Taking
+  this side's parser detectors and teaching them the new idiom looked complete and kept every test green —
+  and silently dropped `main`'s `GUARD_RETURNS` requirement that a self-guarding mover return its refusal,
+  so a void mover whose guard dropped it passed all 13,693 wordweave tests. The final review found it by
+  running `main`'s version of the guard against the mutated tree. The same merge showed the payoff the
+  other way: the parser ledger immediately found two playable gates (#926, #1184) `main`'s line scan had
+  never counted.
+
+
 Progress: **seventeen guards are on the ledger** — `determinismGuard`, `docCitations` and
 `importSettingSelectsSpliced` (Phase 1); `assetJsonGuard`, `handleProviderOwner`,
 `abandonmentIsShared`, `keymapOwnership` and `projectPresencePredicate` (Phase 2); and the nine whose

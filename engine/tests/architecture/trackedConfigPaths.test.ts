@@ -22,6 +22,7 @@ import { mergeProjectConfig } from '../../project-config';
 import { isNonPortableProjectPath } from '../../packages/modoki/src/editor/panels/projectSettingsPaths';
 import { REPO_ROOT, hasAnyProject, hasInternalGames } from '../helpers/repoLayout';
 import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { findNodes, parseSource, stringValueOf, ts } from '@modoki/engine/testing/sourceAst';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 /** Fields whose value is a path into the PROJECT's own files, so a committed value must be
@@ -43,22 +44,35 @@ const PROJECT_PATH_FIELDS = [
 
 const SETTINGS_SCHEMA_SRC = join(REPO_ROOT, 'engine/app/editor/setup.ts');
 
-/** The `type: 'path'` field keys the Project Settings schema declares. Line-scoped on purpose:
- *  every entry is one line today, and `pathFieldCount` below fails loudly if one ever is not,
- *  rather than this silently returning fewer keys than there are fields. Comments are stripped
- *  first — a schema line quoted inside a doc comment is not a declaration. */
+/** The `type: 'path'` field keys the Project Settings schema declares: every object literal whose OWN
+ *  `type` property is the string `'path'`, with that SAME object's `key` and `committedPath: true`.
+ *  Comments are stripped first — a schema entry quoted inside a doc comment is not a declaration.
+ *
+ *  ⚠️ **From the parse since #1179.** This was line-scoped, and "every entry is one line today" was
+ *  the whole defence: a formatter wrapping one entry put `type: 'path'` on a line without its `key:`,
+ *  so the field dropped out of BOTH sides of the set equality below — and a wrapped `type:\n  'path'`
+ *  was not even counted. `pathFieldCount` now counts the objects, and a `type: 'path'` object whose
+ *  `key` is not a string literal is still counted without a key, so that mismatch stays loud. */
 function schemaPathFields(): { keys: string[]; warned: string[]; pathFieldCount: number } {
   const raw = readFileSync(SETTINGS_SCHEMA_SRC, 'utf8');
   const src = stripComments(raw);
   assertScanIsSane(raw, src, 'engine/app/editor/setup.ts');
-  const lines = src.split('\n').filter((l) => /\btype:\s*'path'/.test(l));
-  const entries = lines
-    .map((l) => ({ key: /\bkey:\s*'([^']+)'/.exec(l)?.[1], warns: /\bcommittedPath:\s*true/.test(l) }))
-    .filter((e): e is { key: string; warns: boolean } => !!e.key);
+  return pathFieldsIn(src, 'setup.ts');
+}
+
+/** `schemaPathFields` over source text, so the fixture below drives the same walk. */
+function pathFieldsIn(src: string, label: string): { keys: string[]; warned: string[]; pathFieldCount: number } {
+  const sf = parseSource(src, label);
+  const ownProp = (o: ts.ObjectLiteralExpression, name: string): ts.Expression | undefined =>
+    o.properties.find((p): p is ts.PropertyAssignment => ts.isPropertyAssignment(p) && ts.isIdentifier(p.name) && p.name.text === name)?.initializer;
+  const fields = findNodes(sf, (n): n is ts.ObjectLiteralExpression => ts.isObjectLiteralExpression(n) && stringValueOf(ownProp(n, 'type')) === 'path');
+  const entries = fields
+    .map((o) => ({ key: stringValueOf(ownProp(o, 'key')), warns: ownProp(o, 'committedPath')?.kind === ts.SyntaxKind.TrueKeyword }))
+    .filter((e): e is { key: string; warns: boolean } => e.key !== undefined);
   return {
     keys: entries.map((e) => e.key),
     warned: entries.filter((e) => e.warns).map((e) => e.key),
-    pathFieldCount: lines.length,
+    pathFieldCount: fields.length,
   };
 }
 
@@ -105,6 +119,23 @@ function strings(node: unknown, path: string, out: [string, string][] = []): [st
 describe('committed project configs hold no machine-local path (#394)', () => {
   it('finds project configs to check — a vacuous pass is a failure', () => {
     expect(tracked.length).toBeGreaterThanOrEqual(CONFIG_FLOOR);
+  });
+
+  it('the schema walk reads a WRAPPED entry, and a neighbour entry\'s key or flag does not stand in (#1179)', () => {
+    const src = [
+      'const fields = [',
+      "  { key: 'app.a', type: 'path', committedPath: true },",
+      '  {',
+      "    key: 'app.b',",
+      '    type:',
+      "      'path',",
+      '    committedPath: true,',
+      '  },',
+      "  { key: 'app.c', type: 'text', committedPath: true }, { key: 'app.d', type: 'path' },",
+      "  { key: someKey, type: 'path' },",
+      '];',
+    ].join('\n');
+    expect(pathFieldsIn(src, 's.ts')).toEqual({ keys: ['app.a', 'app.b', 'app.d'], warned: ['app.a', 'app.b'], pathFieldCount: 4 });
   });
 
   it('PROJECT_PATH_FIELDS is exactly the schema\'s non-user path fields', () => {

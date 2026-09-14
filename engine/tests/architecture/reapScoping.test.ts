@@ -31,8 +31,10 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { stripComments as stripJsComments, assertScanIsSane } from '@modoki/engine/testing';
+import { stripComments as stripJsComments, assertScanIsSane, readScannedSource, shellLogicalLines } from '@modoki/engine/testing';
+import { calleeName, enclosingFunction, findNodes, flatText, lineOf, parseSource, readsOf, ts } from '@modoki/engine/testing/sourceAst';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 const scriptsDir = path.resolve(__dirname, '../../scripts');
 
@@ -42,14 +44,15 @@ function scriptFiles(): string[] {
   return repoFiles({ under: scriptsDir, match: /\.(sh|mjs|js|ts)$/, floor: 60 }).map(({ abs }) => abs);
 }
 
-/** Strip comments so the many prose mentions of `pkill` in these files (they explain this
- *  very hazard) are not mistaken for code. Dual language: `#` comments for shell, the shared
- *  scanner (#419) for JS/TS. */
-function stripComments(src: string, isShell: boolean): string {
-  if (isShell) {
-    return src.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n');
-  }
-  return stripJsComments(src);
+/** The units a reap rule reads, comments blanked so the many prose mentions of `pkill` in these files
+ *  (they explain this very hazard) are not mistaken for code. Dual language:
+ *  - shell: each COMMAND — a logical line, backslash continuations joined (#1179). The whole-line `#`
+ *    filter this replaced kept a trailing `# pkill -f foo` note as code, and a `pkill -f \ ⏎ "$REPO/x"`
+ *    wrapped before its pattern read the `\` as the pattern.
+ *  - JS/TS: the whole file through the shared scanner (#419) — a pattern there is a string, not a line. */
+function scanUnits(file: string): string[] {
+  if (file.endsWith('.sh')) return shellLogicalLines(readScannedSource(file).code).map((l) => l.text);
+  return [stripJsComments(fs.readFileSync(file, 'utf8'))];
 }
 
 describe('process reaps in engine/scripts are clone-scoped (#69)', () => {
@@ -65,11 +68,9 @@ describe('process reaps in engine/scripts are clone-scoped (#69)', () => {
     const offenders: string[] = [];
     let patterns = 0;
     for (const file of scriptFiles()) {
-      const isShell = file.endsWith('.sh');
-      const src = stripComments(fs.readFileSync(file, 'utf8'), isShell);
       // pkill -f "<pattern>" | '<pattern>' | <bare-word>
       const re = /pkill\s+(?:-\w+\s+)*-f\s+(?:"([^"]*)"|'([^']*)'|(\S+))/g;
-      for (let m = re.exec(src); m; m = re.exec(src)) {
+      for (const src of scanUnits(file)) for (let m = re.exec(src); m; m = re.exec(src)) {
         patterns++;
         const pattern = m[1] ?? m[2] ?? m[3] ?? '';
         if (!/^[/$]/.test(pattern)) {
@@ -125,9 +126,8 @@ describe('process reaps in engine/scripts are clone-scoped (#69)', () => {
     for (const file of scriptFiles()) {
       if (!file.endsWith('.sh')) continue; // `${VAR:?}` is bash syntax; JS has no equivalent
       // expansion-time guard — the .mjs side is covered by killPackagedGuard.test.ts instead.
-      const src = stripComments(fs.readFileSync(file, 'utf8'), true);
       const re = /pkill\s+(?:-\w+\s+)*-f\s+(?:"([^"]*)"|'([^']*)'|(\S+))/g;
-      for (let m = re.exec(src); m; m = re.exec(src)) {
+      for (const src of scanUnits(file)) for (let m = re.exec(src); m; m = re.exec(src)) {
         const pattern = m[1] ?? m[2] ?? m[3] ?? '';
         if (!/^\$[A-Za-z_{]/.test(pattern)) continue; // not variable-led at all (covered by rule 1)
         if (/^\$\d/.test(pattern) || /^\$\{?[@*#]/.test(pattern)) continue; // positional/special param
@@ -172,11 +172,10 @@ describe('process reaps in engine/scripts are clone-scoped (#69)', () => {
     let fragments = 0;
     for (const file of scriptFiles()) {
       if (!file.endsWith('.sh')) continue;
-      const src = stripComments(fs.readFileSync(file, 'utf8'), true);
       // <leading named variable> <the rest of the pattern>
       const re = /pkill\s+(?:-\w+\s+)*-f\s+"\$\{?([A-Za-z_][A-Za-z0-9_]*)(?::\?[^}]*)?\}?([^"]*)"/g;
       const byFragment = new Map<string, Set<string>>();
-      for (let m = re.exec(src); m; m = re.exec(src)) {
+      for (const src of scanUnits(file)) for (let m = re.exec(src); m; m = re.exec(src)) {
         const [, varName, fragment] = m;
         if (!byFragment.has(fragment)) byFragment.set(fragment, new Set());
         byFragment.get(fragment)!.add(varName);
@@ -207,10 +206,14 @@ describe('process reaps in engine/scripts are clone-scoped (#69)', () => {
     // app has the same basename. The full appDir was already in hand (#69).
     const offenders: string[] = [];
     for (const file of scriptFiles()) {
-      const src = stripComments(fs.readFileSync(file, 'utf8'), file.endsWith('.sh'));
-      for (const line of src.split('\n')) {
+      const rel = path.relative(scriptsDir, file);
+      if (!file.endsWith('.sh')) {
+        offenders.push(...jsReapsFromBasename(scanUnits(file)[0]!, rel));
+        continue;
+      }
+      for (const line of scanUnits(file)) {
         if (buildsReapFromBasename(line)) {
-          offenders.push(`${path.relative(scriptsDir, file)}: ${line.trim()}`);
+          offenders.push(`${rel}: ${line.trim()}`);
         }
       }
     }
@@ -220,10 +223,21 @@ describe('process reaps in engine/scripts are clone-scoped (#69)', () => {
   it('the basename rule flags the shape it exists for, and not a full-path reap', () => {
     // A clean corpus has no instance, so the sweep above cannot tell a working predicate from one
     // that stopped matching (#1105). Pinned here against the shipped shape instead.
-    expect(buildsReapFromBasename('const pattern = `${path.basename(appDir)}/Contents/MacOS`;')).toBe(true);
+    const js = (src: string) => jsReapsFromBasename(src, 'fixture.mjs').length;
+    expect(js('const pattern = `${path.basename(appDir)}/Contents/MacOS`;')).toBe(1);
     expect(buildsReapFromBasename('pkill -f "$(basename "$APP")/Contents/MacOS"')).toBe(true);
     expect(buildsReapFromBasename('pkill -f "${APP:?unset}/Contents/MacOS" || true')).toBe(false);
     expect(buildsReapFromBasename('BUILD="$TMPBASE/$(basename "$REPO")-smoke"')).toBe(false);
+  });
+});
+
+describe('the shell reap readers take a COMMAND (#1179)', () => {
+  it('a pkill wrapped before its pattern is read with its pattern, and a trailing comment is not code', () => {
+    const dir = makeScratchDir('reap-units-');
+    const f = path.join(dir, 'x.sh');
+    fs.writeFileSync(f, 'pkill -f \\\n  "Modoki Editor"\necho ok # pkill -f "shared name"\n');
+    const re = /pkill\s+(?:-\w+\s+)*-f\s+(?:"([^"]*)"|'([^']*)'|(\S+))/g;
+    expect(scanUnits(f).flatMap((u) => [...u.matchAll(re)].map((m) => m[1] ?? m[2] ?? m[3]))).toEqual(['Modoki Editor']);
   });
 });
 
@@ -231,3 +245,98 @@ describe('process reaps in engine/scripts are clone-scoped (#69)', () => {
 function buildsReapFromBasename(line: string): boolean {
   return /basename/.test(line) && /pkill|pattern|taskkill/.test(line);
 }
+
+/** The JS half of the basename rule: every `basename(…)` call whose OWN expression builds a reap
+ *  target — it flows, within its statement, into a name spelt `pattern`/`pkill`/`taskkill`, or sits in
+ *  an expression naming `pkill`/`taskkill` in a string or a callee. A basename bound to a name first
+ *  (`const base = basename(appDir)`) is followed to each read of that name.
+ *
+ *  ⚠️ **The call's own expression, not its line (#1179).** The line test wanted `basename` and
+ *  `pkill|pattern|taskkill` on one line: `const pattern =\n  \`${path.basename(appDir)}/…\`` — a
+ *  formatter's wrap — passed, a basename bound one statement earlier passed, and an unrelated
+ *  `basename` sharing a line with a correct full-path `pattern` failed. */
+function jsReapsFromBasename(code: string, label: string): string[] {
+  const sf = parseSource(code, label);
+  const REAP_NAME = /pattern|pkill|taskkill/i;
+  const REAP_WORD = /\b(?:pkill|taskkill)\b/;
+  /** The expression `n` is part of, up to (not across) its statement — climbing OUT of a function
+   *  whose result it is (a concise body, or its `return`), since that function's value IS the
+   *  expression: `const pattern = (d) => \`${basename(d)}/…\``, `[dir].map((d) => basename(d))[0]`,
+   *  `{ get pattern() { return basename(d) } }` and `function pattern(d) { return basename(d) }` are
+   *  the basename's own reap target (#1179 P3 review and re-review). */
+  const ownExpression = (n: ts.Node): ts.Node => {
+    let cur = n;
+    for (let p = cur.parent; p; p = cur.parent) {
+      const fn = ts.isReturnStatement(p) ? enclosingFunction(p) : p;
+      if ((ts.isArrowFunction(fn) || ts.isFunctionExpression(fn)) && (fn.body === cur || fn !== p)) { cur = fn; continue; }
+      // …and out of a method, getter or function declaration it is the `return` of: its NAME holds it.
+      if (fn !== p && (ts.isMethodDeclaration(fn) || ts.isGetAccessorDeclaration(fn) || ts.isFunctionDeclaration(fn))) { cur = fn; continue; }
+      if (ts.isStatement(p) || ts.isVariableDeclarationList(p) || ts.isFunctionLike(p) || ts.isSourceFile(p)) break;
+      cur = p;
+    }
+    return cur;
+  };
+  const buildsReap = (n: ts.Node): boolean => {
+    const own = ownExpression(n);
+    const holder = ts.isVariableDeclaration(own) || ts.isParameter(own) || ts.isPropertyDeclaration(own) || ts.isMethodDeclaration(own)
+      || ts.isGetAccessorDeclaration(own) || ts.isFunctionDeclaration(own) ? own.name
+      : ts.isBinaryExpression(own) ? own.left : undefined;
+    if (holder && REAP_NAME.test(flatText(holder))) return true;
+    return findNodes(own, (x): x is ts.Node => (ts.isStringLiteralLike(x) || ts.isTemplateHead(x) || ts.isTemplateMiddle(x)
+      || ts.isTemplateTail(x)) && REAP_WORD.test(x.text)
+      || (ts.isCallExpression(x) && REAP_NAME.test(calleeName(x) ?? ''))
+      || ((ts.isPropertyAssignment(x) || ts.isMethodDeclaration(x) || ts.isGetAccessorDeclaration(x)) && REAP_NAME.test(flatText(x.name)))).length > 0;
+  };
+  const out: string[] = [];
+  // A SHELL `$(basename …)` spelt inside a JS string — `execSync(\`pkill -f "$(basename ${app})/…"\`)` — has
+  // no call node; its own expression is read the same way. (The line test caught it by accident of text.)
+  for (const text of findNodes(sf, (x): x is ts.Node => (ts.isStringLiteralLike(x) || ts.isTemplateHead(x) || ts.isTemplateMiddle(x)
+    || ts.isTemplateTail(x)) && /\bbasename\b/.test(x.text))) {
+    if (buildsReap(text)) out.push(`${label}:${lineOf(text)}: ${flatText(ownExpression(text))}`);
+  }
+  for (const call of findNodes(sf, (x): x is ts.CallExpression => ts.isCallExpression(x) && calleeName(x) === 'basename')) {
+    const own = ownExpression(call);
+    const bound = ts.isVariableDeclaration(own) && ts.isIdentifier(own.name) && own.initializer
+      && !REAP_NAME.test(own.name.text) ? own.name : undefined;
+    const reaps = buildsReap(call) || (!!bound && readsOf(bound).some(buildsReap));
+    if (reaps) out.push(`${label}:${lineOf(call)}: ${flatText(own)}`);
+  }
+  return out;
+}
+
+describe('the JS basename rule reads the call\'s own expression (#1179)', () => {
+  const js = (src: string) => jsReapsFromBasename(stripJsComments(src), 'fixture.mjs').length;
+
+  it.each([
+    ['wrapped by a formatter', 'const pattern =\n  `${path.basename(appDir)}/Contents/MacOS`;'],
+    ['bound to a name one statement earlier', 'const base = path.basename(appDir);\nconst pattern = `${base}/Contents/MacOS`;'],
+    ['handed straight to pkill', "execFileSync('pkill', ['-f', `${basename(appDir)}/Contents/MacOS`]);"],
+    ['assigned to an existing pattern', 'let pattern;\npattern = basename(appDir) + "/Contents/MacOS";'],
+    ['a reap options object', 'reap({ pattern: basename(appDir) });'],
+    ['handed to a reap helper named for the pattern', 'killByPattern(`${basename(appDir)}/Contents/MacOS`);'],
+    ['returned by an arrow bound to a pattern name', 'const pattern = (dir) => `${path.basename(dir)}/Contents/MacOS`;'],
+    ['returned from a block-bodied function held under a pattern key', 'const reap = { pattern: function () { return basename(appDir) + "/Contents/MacOS"; } };'],
+    ['inside a .map() callback whose result is the pattern', 'const pattern = [appDir].map((d) => `${basename(d)}/Contents/MacOS`)[0];'],
+    ['returned by a method shorthand named pattern', 'const reap = { pattern() { return basename(appDir) + "/Contents/MacOS"; } };'],
+    ['returned by a getter named pattern', 'const reap = { get pattern() { return `${basename(appDir)}/Contents/MacOS`; } };'],
+    ['in a class field arrow named pattern', 'class R { pattern = () => `${basename(appDir)}/Contents/MacOS`; }'],
+    ['in a plain class field named pattern', 'class R { pattern = basename(appDir) + "/Contents/MacOS"; }'],
+    ['as the default of a parameter named pattern', 'function kill(pattern = `${basename(appDir)}/Contents/MacOS`) { run(pattern); }'],
+    ['returned by a function declaration named pattern', 'function pattern(dir) { return `${basename(dir)}/Contents/MacOS`; }'],
+    ['spelt as SHELL inside a JS string handed to pkill', 'execSync(`pkill -f "$(basename ${APP})/Contents/MacOS"`);'],
+  ])('flags a basename %s', (_why, src) => {
+    expect(js(src)).toBe(1);
+  });
+
+  it.each([
+    ['a full-path pattern', 'const pattern = `${appDir}/Contents/MacOS`;'],
+    ['a basename SHARING A LINE with a full-path pattern', 'const pattern = `${appDir}/Contents/MacOS`; const label = path.basename(appDir);'],
+    ['a basename for a build dir', 'const BUILD = `${TMPBASE}/${basename(REPO)}-smoke`;'],
+    ['a basename returned by a helper not named for a reap', 'function label(d) { return basename(d); }\nconst pattern = `${appDir}/Contents/MacOS`;'],
+    ['a basename in a class field not named for a reap', 'class R { label = basename(appDir); pattern = `${appDir}/Contents/MacOS`; }'],
+    ['a shell basename in a string that builds no reap', 'execSync(`cp "$(basename ${F})" out/`);'],
+    ['a basename in a comment beside a pkill', "// basename(appDir) was wrong\nexecFileSync('pkill', ['-f', `${appDir}/Contents`]);"],
+  ])('does not flag %s', (_why, src) => {
+    expect(js(src)).toBe(0);
+  });
+});

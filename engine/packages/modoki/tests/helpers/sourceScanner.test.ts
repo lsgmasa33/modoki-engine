@@ -53,6 +53,8 @@ import {
   scanLanguageOf,
   stripComments,
   stripCommentsAndStrings,
+  insideShellSubstitution,
+  shellLogicalLines,
   stripHashComments,
   stripSwiftComments,
 } from './sourceScanner';
@@ -520,5 +522,78 @@ describe('commentText is the comments and nothing else (#1186)', () => {
 
   it('refuses a view that is not length-aligned', () => {
     expect(() => commentText({ raw: 'ab', code: 'a', path: 'x.ts' })).toThrow(/length-preserving/);
+  });
+});
+
+describe('shellLogicalLines — one COMMAND, however it is wrapped (#1179)', () => {
+  const logical = (src: string) => shellLogicalLines(src).map((l) => `${l.line}: ${l.text}`);
+
+  it('joins a backslash-newline, and cites the line the command starts on', () => {
+    expect(logical('echo a\nnode "$PATHS" kill "$APP" \\\n  2>/dev/null \\\n  || true\necho b')).toEqual([
+      '1: echo a',
+      '2: node "$PATHS" kill "$APP"   2>/dev/null   || true',
+      '5: echo b',
+    ]);
+  });
+
+  it('does NOT join across &&, ||, a pipe, or a quote left open — each would let the next command vouch', () => {
+    expect(logical('a &&\nb 2>/dev/null\nc |\nd\necho "open\nx"')).toEqual([
+      '1: a &&', '2: b 2>/dev/null', '3: c |', '4: d', '5: echo "open', '6: x"',
+    ]);
+  });
+
+  it('a backslash inside single quotes, or an escaped backslash, ends nothing', () => {
+    expect(logical("echo 'a\\\\'\nnext\necho x\\\\\\\\\nnext2\necho \"q\\\\\"\nnext3")).toEqual([
+      "1: echo 'a\\\\'", '2: next', '3: echo x\\\\\\\\', '4: next2', '5: echo "q\\\\"', '6: next3',
+    ]);
+  });
+
+  it('a single quote left open at the end of a line does not leak into the next command', () => {
+    // A heredoc body's apostrophe, or a broken line: the quote state resets per command, so the next
+    // command's own continuation still joins.
+    expect(logical("echo 'open\na \\\nb")).toEqual(["1: echo 'open", '2: a b']);
+    // …and a backslash at the end of a line INSIDE single quotes is literal: it joins nothing.
+    expect(logical("echo 'lit \\\nnext'")).toEqual(["1: echo 'lit \\", "2: next'"]);
+  });
+
+  it('a CRLF checkout joins the same commands an LF one does', () => {
+    expect(logical('a \\\r\n  b\r\nc\r\n')).toEqual(['1: a   b', '3: c', '4: ']);
+  });
+
+  it('an escaped quote does not open a string, and a trailing continuation at EOF is kept', () => {
+    expect(logical("echo \\' \\\nstill\nlast \\")).toEqual(["1: echo \\' still", '3: last ']);
+  });
+});
+describe('insideShellSubstitution — whether a position runs as a value, not a command (#1179 P7)', () => {
+  const at = (text: string, needle: string) => insideShellSubstitution(text, text.indexOf(needle));
+  it('counts $( and backticks from the start of the line, past separators inside them', () => {
+    expect([
+      at('R="$(cd "$REPO" && node kill 2>/dev/null || true)"', 'node'),
+      at('x=$(true; node kill)', 'node'),
+      at('x=`echo a | node kill`', 'node'),
+      at('echo "v: $("$BIN" --version)"', '"$BIN"'),
+      at('x=$($(pwd)/bin $BIN)', '$BIN'),
+      // A `)` with no open substitution (a `case` pattern) closes nothing.
+      at('case $k in a) R=$(node kill', 'node'),
+      // An apostrophe inside double quotes is literal; the `$(` after it still opens.
+      at('echo "[smoke] can\'t start: $("$BIN" --version)"', '"$BIN"'),
+      at('echo "it\'s"; X=$("$BIN")', '"$BIN")'),
+      // A plain `(` inside a substitution is its own level: its `)` does not close the substitution.
+      at('X=$(f (a) "$BIN")', '"$BIN"'),
+      // A `)` inside a double-quoted string INSIDE a substitution closes nothing.
+      at('X=$(echo ":)"; node kill 2>/dev/null)', 'node'),
+      // A backtick substitution inside double quotes still opens.
+      at('echo "v: `"$BIN" --version`"', '"$BIN"'),
+    ]).toEqual([true, true, true, true, true, true, true, true, true, true, true]);
+  });
+  it('a closed substitution, a single-quoted $( and an escaped backtick are not', () => {
+    expect([
+      at('OUT=$(node x) node kill', 'node kill'),
+      at("echo '$(' node kill", 'node kill'),
+      // A `$(` inside single quotes INSIDE a substitution opens nothing; the substitution closes.
+      at("X=$(sed 's/$(/x/' f); node kill", 'node kill'),
+      at('echo \\` node kill', 'node kill'),
+      at('node kill', 'node'),
+    ]).toEqual([false, false, false, false, false]);
   });
 });

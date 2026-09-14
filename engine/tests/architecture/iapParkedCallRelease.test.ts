@@ -88,6 +88,13 @@ function countOccurrences(haystack: string, needle: string): number {
   return haystack.split(needle).length - 1;
 }
 
+/* ⚠️ **Line-grained by record, not by oversight (#1179).** The two readers below judge Java one
+ * physical line at a time (a wrapped `unpark(\n call);` is not counted, a statement sharing a line is
+ * judged with it). The #1179 census moved every JS/TS and shell scanner onto a parser or onto logical
+ * commands; this repo's test helpers have no Java parser, and one file does not justify adding one.
+ * A reflow fails LOUD here rather than green: the `unpark` count is pinned at exactly 6, and every
+ * `statementLines` lookup below must find its statement. */
+
 /** Count real `unpark(...)` STATEMENTS — a line whose trimmed form starts with `unpark(` and ends
  *  with `);` — excluding the `private void unpark(...) {` declaration (which starts with
  *  `private`, not `unpark(`) and any line inside a `//` or `/* *\/` comment. A bare substring

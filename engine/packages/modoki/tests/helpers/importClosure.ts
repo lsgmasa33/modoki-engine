@@ -13,6 +13,8 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { importsIn, parseSource, type ModuleEdge } from './sourceAst';
+import { readScannedSource } from './sourceScanner';
 
 /** Repo-relative paths this walker EMITS and MATCHES ON are always POSIX-separated.
  *
@@ -45,77 +47,45 @@ export function resolveRelative(fromFile: string, spec: string): string | null {
   return null;
 }
 
-/** One import STATEMENT, as source text plus its 1-based starting line.
+/** Every RUNTIME module edge of a file, read by `importsIn` from its declarations and memoised per
+ *  file content (a boundary walk parses hundreds of files, several times per suite).
  *
- *  Statement-based rather than line-based, because a line-anchored regex cannot see
+ *  ⚠️ **Read from the parse, not from lines (#1179).** This was a statement joiner: an `import` at
+ *  column 0, extended line by line until `from '…'` matched, capped at 12 lines — plus a regex for
+ *  `import('…')` over the RAW file. Measured against the parse on 2026-09-14 over `src/` (839 files),
+ *  it had missed EVERY `export … from` edge (the 2D closure from `runtime/index.ts` reached 202 files;
+ *  it reaches 471) and a 13-line import in `DeviceConnectSection.tsx`, and had invented edges from
+ *  `import('./x').T` type positions and from `import('…')` inside comments. The wider closure still
+ *  reaches no forbidden specifier.
  *
- *      import {
- *        GLTFLoader,
- *      } from 'three/examples/jsm/loaders/GLTFLoader.js';
- *
- *  and this repo has 103 such imports under `runtime/`+`app/` — five of them BARE, three of
- *  those `three/tsl`. A guard blind to a shape that common is the vacuous-guard failure mode
- *  this file exists to avoid. (Measured 2026-08-20: a sound walk that DOES see them still finds
- *  no forbidden edge, so the blindness was latent, not hiding a live defect — but it defeated a
- *  deliberate mutation, which is the standard that matters.)
- *
- *  ⚠️ The tempting one-character fix — relaxing the old `[^\n;]*?` to `[^;]*?` — is UNSOUND and
- *  was measured producing a false positive: the match is then free to begin at an earlier
- *  newline and run through a doc comment into the next statement's `from '…'`, so a single-line
- *  `import type { WebGPURenderer } from 'three/webgpu'` got reported as a value import of a
- *  forbidden module. Walk statements; do not widen the regex. */
-export interface ImportStatement {
-  /** 1-based line where the statement starts. */
-  line: number;
-  /** The statement's source text, newlines included. */
-  text: string;
+ *  `import type` / `export type … from` are EXCLUDED deliberately: an erased import carries no runtime
+ *  dependency, in either direction (following a type-only relative import would over-report; flagging a
+ *  type-only `three/webgpu` import would too — several modules take only the `WebGPURenderer` type). */
+export function runtimeEdgesOf(file: string): ModuleEdge[] {
+  // A resolved `./data.json`, `./s.css` or `./i.svg` is a LEAF: it imports nothing, and neither the
+  // comment stripper nor the parser reads it (review of #1179 P4 — the first one added would have
+  // thrown out of every boundary walk, blaming a stump parse).
+  if (!SCRIPT.test(file)) return [];
+  // Checked against the file's CONTENT, not its path, size or mtime: a fixture that rewrites a file
+  // between two walks — even to the same size within one mtime tick — must not be answered from the
+  // first read. Compared on the comment-blanked code, which is all the edges depend on; the parse is
+  // what the memo saves.
+  const { code } = readScannedSource(file);
+  const cached = edgeCache.get(file);
+  if (cached?.code === code) return cached.edges;
+  const edges = importsIn(parseSource(code, file)).filter((e) => !e.typeOnly);
+  edgeCache.set(file, { code, edges });
+  return edges;
 }
+const SCRIPT = /\.(?:[cm]?[jt]sx?)$/;
+const edgeCache = new Map<string, { code: string; edges: ModuleEdge[] }>();
 
-/** Every `import …` statement in a file, joined across lines up to its specifier. */
-export function importStatements(src: string): ImportStatement[] {
-  const lines = src.split('\n');
-  const out: ImportStatement[] = [];
-  const DONE = /from\s*['"][^'"]+['"]|^import\s*['"][^'"]+['"]/;
-  for (let i = 0; i < lines.length; i++) {
-    if (!/^import\b/.test(lines[i])) continue; // column 0 only — never a mention inside a comment
-    let text = lines[i];
-    let j = i;
-    // Bounded so an `import` line that never completes (mid-edit, or a stray token) cannot run
-    // the scan to the end of the file and swallow unrelated statements.
-    while (!DONE.test(text) && j + 1 < lines.length && j - i < 12) { j++; text += `\n${lines[j]}`; }
-    out.push({ line: i + 1, text });
-    i = j;
-  }
-  return out;
-}
-
-/** All import specifiers in a file — static `from '…'` / `import '…'` AND dynamic
- *  `import('…')`. `import type` is EXCLUDED deliberately: an erased type import carries no
- *  runtime dependency, in either direction (following a type-only relative import would
- *  over-report; flagging a type-only `three/webgpu` import would too — several modules take
- *  only the `WebGPURenderer` type). */
+/** All runtime import specifiers in a file — static, re-exported and dynamic — split into relative
+ *  and bare. */
 export function importsOf(file: string): { relatives: string[]; bare: string[] } {
-  const src = fs.readFileSync(file, 'utf8');
   const relatives: string[] = [];
   const bare: string[] = [];
-  const add = (spec: string, isTypeOnly: boolean) => {
-    if (isTypeOnly) return;
-    if (spec.startsWith('.')) relatives.push(spec);
-    else bare.push(spec);
-  };
-  for (const { text } of importStatements(src)) {
-    const m = /from\s*['"]([^'"]+)['"]/.exec(text) ?? /^import\s*['"]([^'"]+)['"]/.exec(text);
-    // Side-effect imports (`import 'x'` — no bindings, so no `from`) are covered by the second
-    // alternative. This shape is exactly how a polyfill or a registration module gets pulled in,
-    // and missing it once made the walker answer "nothing reaches three/webgpu" about a file
-    // that imports it outright — silently, which is the failure these guards exist to prevent.
-    if (m) add(m[1], /^import\s+type\b/.test(text));
-  }
-  // Dynamic imports are expression-position, so they are NOT statements and need their own pass.
-  // `typeof import('…')` is a type query — erased, no runtime edge.
-  const dyn = /(?<!typeof\s)import\(\s*['"]([^'"]+)['"]\s*\)/g;
-  let d: RegExpExecArray | null;
-  while ((d = dyn.exec(src)) !== null) add(d[1], false);
+  for (const { spec } of runtimeEdgesOf(file)) (spec.startsWith('.') ? relatives : bare).push(spec);
   return { relatives, bare };
 }
 
@@ -138,7 +108,12 @@ export interface ClosureResult {
 /** Walk the relative-import closure from `entries` and report every FORBIDDEN bare specifier
  *  reached. `skipEdges` are not followed — for edges a build-time flag makes unreachable; the
  *  CALLER owes a separate assertion that each skipped edge really is gated, or the allowlist
- *  becomes a way to silence the guard. */
+ *  becomes a way to silence the guard.
+ *
+ *  ⚠️ **A skip matches a DYNAMIC `import()` only.** A flag can fold away the branch an `import()`
+ *  sits in; nothing folds a static import, which the bundler follows wherever it is written. Keyed on
+ *  `file::spec` alone, a static `import './x'` added beside a gated `import('./x')` was skipped too —
+ *  and the caller's "is the edge gated?" check, which reads only the `import()`, still passed. */
 export function walkClosure(opts: {
   srcDir: string;
   entries: string[];
@@ -168,13 +143,13 @@ export function walkClosure(opts: {
     if (seen.has(file)) continue;
     seen.add(file);
     const rel = toPosix(path.relative(srcDir, file));
-    const { relatives, bare } = importsOf(file);
-    for (const b of bare) {
-      if (forbidden.includes(b)) offenders.push(`${b}\n     via ${chainTo(rel)}`);
-    }
-    for (const r of relatives) {
-      if (skip.has(`${rel}::${r}`)) continue;
-      const resolved = resolveRelative(file, r);
+    for (const { spec, kind } of runtimeEdgesOf(file)) {
+      if (!spec.startsWith('.')) {
+        if (forbidden.includes(spec)) offenders.push(`${spec}\n     via ${chainTo(rel)}`);
+        continue;
+      }
+      if (kind === 'dynamic' && skip.has(`${rel}::${spec}`)) continue;
+      const resolved = resolveRelative(file, spec);
       if (!resolved) continue;
       const resolvedRel = toPosix(path.relative(srcDir, resolved));
       if (!cameFrom.has(resolvedRel)) cameFrom.set(resolvedRel, rel);

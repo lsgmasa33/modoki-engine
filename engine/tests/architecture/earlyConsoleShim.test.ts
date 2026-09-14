@@ -2,7 +2,10 @@ import { describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { readScannedSource } from '@modoki/engine/testing';
+import {
+  callsTo, enclosingFunction, findNodes, flatText, namedFunctions, parseSource, printedText, ts, unwrapValue,
+} from '@modoki/engine/testing/sourceAst';
 import { earlyConsoleShimPlugin, type EarlyConsoleShimPluginOptions } from '../../plugins/earlyConsoleShim';
 
 /**
@@ -127,29 +130,34 @@ describe('early console shim (#633)', () => {
   });
 
   describe("plugin gate mirrors installConsoleRing.ts's runtime gate", () => {
-    const pluginSrc = fs.readFileSync(PLUGIN, 'utf8');
-    const stripped = stripComments(pluginSrc);
-    assertScanIsSane(pluginSrc, stripped, 'plugins/earlyConsoleShim.ts');
+    /** Every `return` of `shouldKeepEarlyConsoleShim` ITSELF — not one of a nested callback — printed.
+     *  ⚠️ Read from the function's own return statements (#1179): the line scan this replaces took the
+     *  first line matching `return !isPlayable` ANYWHERE in the file, so the gate could move out of
+     *  this function (or a second `return` appear in it) with the pin still green, and a formatter
+     *  wrapping the expression across lines failed it for no reason. */
+    function gateReturns(code = readScannedSource(PLUGIN).code): string[] {
+      const sf = parseSource(code, 'plugins/earlyConsoleShim.ts');
+      const fn = namedFunctions(sf).find((f) => f.name === 'shouldKeepEarlyConsoleShim');
+      expect(fn, 'shouldKeepEarlyConsoleShim is gone — did the gate move or get renamed?').toBeDefined();
+      return findNodes(fn!.body, ts.isReturnStatement)
+        .filter((r) => enclosingFunction(r) === fn!.body.parent)
+        .map((r) => (r.expression ? printedText(r.expression) : '<bare return>'));
+    }
+
+    it('reads the function\'s OWN returns — wrapped, every one, and not a nested callback\'s (#1179)', () => {
+      expect(gateReturns('function shouldKeepEarlyConsoleShim(o) {\n  const f = () => { return true; };\n  if (o.x) return false;\n  return !o.a &&\n    (o.b ||\n      o.c);\n}'))
+        .toEqual(['false', '!o.a && (o.b || o.c)']);
+    });
 
     it('pins the exact boolean expression', () => {
-      const lines = stripped.split('\n');
-      const returnIdx = lines.findIndex((l) => /return\s+!isPlayable/.test(l));
       expect(
-        returnIdx,
-        'could not find the `return !isPlayable && (...)` line in shouldKeepEarlyConsoleShim — ' +
-          'did the gate move or get renamed?',
-      ).toBeGreaterThanOrEqual(0);
-      const m = lines[returnIdx].match(/return\s+(.*?);?\s*$/);
-      expect(m, `line ${returnIdx} ("${lines[returnIdx]}") does not match "return <expr>;"`).not.toBeNull();
-      const expr = m![1].replace(/\s+/g, ' ').trim();
-      expect(
-        expr,
+        gateReturns(),
         `plugins/earlyConsoleShim.ts's gate must mirror installConsoleRing.ts's runtime gate ` +
           `(pinned by deviceConsoleCaptureInstallOrder.test.ts as ` +
           `"!__MODOKI_PLAYABLE__ && (import.meta.env.DEV || import.meta.env.VITE_DEBUG_BRIDGE || ` +
           `__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)"), spelled in terms of this file's own ` +
-          `{isPlayable, isDev, hasDebugBridge, isEditor, isDebugBuild} args. Got: "${expr}"`,
-      ).toBe('!isPlayable && (isDev || hasDebugBridge || isEditor || isDebugBuild)');
+          `{isPlayable, isDev, hasDebugBridge, isEditor, isDebugBuild} args, as its ONE return.`,
+      ).toEqual(['!isPlayable && (isDev || hasDebugBridge || isEditor || isDebugBuild)']);
     });
   });
 
@@ -162,40 +170,60 @@ describe('early console shim (#633)', () => {
   // five properties to the exact expression `vite.config.ts` computes it from.
   describe("vite.config.ts wires earlyConsoleShimPlugin's five arguments correctly", () => {
     const VITE_CONFIG = path.join(engineDir, 'vite.config.ts');
-    const viteConfigSrc = fs.readFileSync(VITE_CONFIG, 'utf8');
-    const stripped = stripComments(viteConfigSrc);
-    assertScanIsSane(viteConfigSrc, stripped, 'vite.config.ts');
 
-    /** The `earlyConsoleShimPlugin({ ... })` call's argument object, as `{propName: exprText}` —
-     *  a shorthand property (`isPlayable,`) is recorded as `{isPlayable: 'isPlayable'}`, matching
-     *  what it means. */
-    function extractPluginCallArgs(text: string): Record<string, string> {
-      const callMarker = 'earlyConsoleShimPlugin(';
-      const callIdx = text.indexOf(callMarker);
-      expect(callIdx, 'could not find an earlyConsoleShimPlugin( call in vite.config.ts').toBeGreaterThanOrEqual(0);
-      let i = callIdx + callMarker.length;
-      let depth = 1; // already inside the call's own '('
-      const start = i;
-      while (depth > 0 && i < text.length) {
-        if (text[i] === '(' || text[i] === '{') depth++;
-        else if (text[i] === ')' || text[i] === '}') depth--;
-        i++;
-      }
-      const argsText = text.slice(start, i - 1).trim().replace(/^\{/, '').replace(/\}$/, '');
+    /** The ONE `earlyConsoleShimPlugin({ ... })` call's argument object, as `{propName: exprText}` —
+     *  a shorthand property (`isPlayable,`) is recorded as `{isPlayable: 'isPlayable'}`, matching what
+     *  it means, and anything that has no one expression to pin (a spread, a computed key, an accessor, a
+     *  duplicate) under `'<unreadable>'`.
+     *
+     *  Read from the call node (#1179). It was a paren-depth scan from the first `earlyConsoleShimPlugin(`
+     *  in the text, split on EVERY comma — so a value holding a comma (`f(a, b)`, `[x, y]`) was cut in
+     *  two, a `(` inside a string threw the depth off, and a second call was never looked at. */
+    function pluginCallArgs(code: string, label: string): Record<string, string> {
+      const calls = callsTo(parseSource(code, label), 'earlyConsoleShimPlugin');
+      expect(calls.length, `expected exactly one earlyConsoleShimPlugin( call in ${label}`).toBe(1);
+      const arg = calls[0].arguments[0] ? unwrapValue(calls[0].arguments[0]) : undefined;
+      expect(arg && ts.isObjectLiteralExpression(arg), 'earlyConsoleShimPlugin is not called with an object literal').toBe(true);
       const props: Record<string, string> = {};
-      for (const rawEntry of argsText.split(',')) {
-        const entry = rawEntry.trim();
-        if (!entry) continue;
-        const m = entry.match(/^([A-Za-z0-9_]+)\s*:\s*([\s\S]+)$/);
-        if (m) props[m[1]] = m[2].replace(/\s+/g, ' ').trim();
-        else props[entry] = entry; // shorthand: `isPlayable` means `isPlayable: isPlayable`
+      for (const p of (arg as ts.ObjectLiteralExpression).properties) {
+        const key = ts.isPropertyAssignment(p) && (ts.isIdentifier(p.name) || ts.isStringLiteral(p.name)) ? p.name.text
+          : ts.isShorthandPropertyAssignment(p) ? p.name.text : undefined;
+        const value = ts.isPropertyAssignment(p) ? flatText(p.initializer) : ts.isShorthandPropertyAssignment(p) ? p.name.text : undefined;
+        // A spread, a computed key, a method or accessor, or a key written twice can each change what a
+        // pinned property ends up as, and none has one expression to pin: recorded under '<unreadable>'.
+        if (key === undefined || value === undefined || Object.hasOwn(props, key)) props['<unreadable>'] = [props['<unreadable>'], flatText(p)].filter(Boolean).join(' | ');
+        else props[key] = value;
       }
       return props;
     }
 
+    it('pluginCallArgs reads each property whole, however it wraps (#1179)', () => {
+      expect(pluginCallArgs(`export default () => ({ plugins: [earlyConsoleShimPlugin({
+        isPlayable,
+        isDev: pick(command, 'serve'),
+        hasDebugBridge: ['(', 'x'].includes(
+          mode),
+        ...extra,
+        'isDebugBuild': debugBuildFlag,
+        'isPlayable': true,
+        ['isDev']: false,
+        get isEditor() { return true; },
+      })] });`, 'vite.config.ts')).toEqual({
+        isPlayable: 'isPlayable',
+        isDev: "pick(command, 'serve')",
+        hasDebugBridge: "['(', 'x'].includes( mode)",
+        isDebugBuild: 'debugBuildFlag',
+        '<unreadable>': "...extra | 'isPlayable': true | ['isDev']: false | get isEditor() { return true; }",
+      });
+      // A second call is ambiguous about which one ships: refused, not first-come.
+      expect(() => pluginCallArgs('earlyConsoleShimPlugin({ isPlayable });\nearlyConsoleShimPlugin({ isDev });', 'vite.config.ts')).toThrow(/exactly one/);
+    });
+
     it('wires each argument to the expression the guard expects, by name', () => {
-      const props = extractPluginCallArgs(stripped);
+      const props = pluginCallArgs(readScannedSource(VITE_CONFIG).code, 'vite.config.ts');
       const context = () => `earlyConsoleShimPlugin(...) call in vite.config.ts, parsed as: ${JSON.stringify(props)}`;
+      // A spread, a computed or duplicate key, an accessor could each overwrite a property pinned below.
+      expect(props['<unreadable>'], context()).toBeUndefined();
       expect(props.isPlayable, context()).toBe('isPlayable');
       expect(props.isDev, context()).toBe("command === 'serve'");
       expect(props.hasDebugBridge, context()).toBe('!!process.env.VITE_DEBUG_BRIDGE');
