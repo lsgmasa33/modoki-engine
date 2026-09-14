@@ -5470,8 +5470,9 @@ not re-run either probe unless an Android GL device turns up a wrong frame.
   shape at install time and degrading to a loud no-op if it moves. **UBOs never leaked** (24/24
   `destroyUniformBuffer` calls issue a `gl.deleteBuffer`; a `deleteBindGroupData` override would
   DOUBLE-FREE). **VAOs do leak and cannot be fixed from here** — `three/build/three.webgpu.js`
-  contains `deleteVertexArray` zero times, so three never signals a VAO is dead. #715 is iceboxed;
-  what remains is three upstream changes, not one: wire `_releaseProgram` to
+  contains `deleteVertexArray` zero times, so three never signals a VAO is dead. #715 is closed
+  (owner, 2026-09-14) with nothing left to do in this repo, and the upstream reports are tracked in
+  #694. What remains is three upstream changes, not one: wire `_releaseProgram` to
   `backend.destroyProgram`; make `WebGLBackend.destroyProgram` actually issue the GL deletes rather
   than only dropping its DataMap entry; and invent a backend hook for the pipeline half, which has
   no `backend.*` call on either backend.
