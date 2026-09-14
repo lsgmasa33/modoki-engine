@@ -867,6 +867,7 @@
   "registerSceneRenderer",
   "registerSource",
   "registerSystem",
+  "registerSystemControls",
   "registerTrait",
   "registerUIAction",
   "registerUIBusySource",

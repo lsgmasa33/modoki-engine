@@ -8,7 +8,25 @@ public class ModokiSystemPlugin: CAPPlugin, CAPBridgedPlugin {
     public let jsName = "ModokiSystem"
     public let pluginMethods: [CAPPluginMethod] = [
         CAPPluginMethod(name: "openAppSettings", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "openUrl", returnType: CAPPluginReturnPromise),
     ]
+
+    // A web page in Safari (#1196). https only: `UIApplication.open` would also act on `tel:`,
+    // `sms:` or another app's custom scheme, which an authored link must never reach.
+    @objc func openUrl(_ call: CAPPluginCall) {
+        guard let raw = call.getString("url"),
+              let url = URL(string: raw),
+              url.scheme?.lowercased() == "https",
+              url.host != nil else {
+            call.resolve(["opened": false])
+            return
+        }
+        DispatchQueue.main.async {
+            UIApplication.shared.open(url, options: [:]) { opened in
+                call.resolve(["opened": opened])
+            }
+        }
+    }
 
     @objc func openAppSettings(_ call: CAPPluginCall) {
         let target = call.getString("target") ?? "app"

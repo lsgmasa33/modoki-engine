@@ -1,7 +1,7 @@
 {
   "name": "capacitor-modoki-system",
   "version": "1.0.0",
-  "description": "Capacitor plugin for leaving the app for a system surface (the app's own Settings page)",
+  "description": "Capacitor plugin for leaving the app for a system surface (the app's own Settings page, or a web page in the system browser)",
   "main": "dist/plugin.cjs.js",
   "module": "dist/esm/index.js",
   "types": "dist/esm/index.d.ts",

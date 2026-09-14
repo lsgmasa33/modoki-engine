@@ -641,7 +641,7 @@ empty list space does — a feel call, not a refactor.
 
 #### Engine built-in `UIAction`s
 
-Four stateless lifecycle/animator handlers are registered once at startup by
+Five stateless lifecycle/animator handlers are registered once at startup by
 `registerEngineActions()` (`runtime/actions/engineActions.ts`), callable from any
 `kind:'call'` binding by name:
 
@@ -716,6 +716,38 @@ Four stateless lifecycle/animator handlers are registered once at startup by
 Scene navigation (`engine.loadScene` / `engine.navigateBack`) is **not** here — it lives
 in `NavigationManager`, which owns the history stack (see
 [Managers & Systems](./managers-and-systems.md)).
+
+**`system.openUrl`** (#1196, `runtime/actions/systemControls.ts`, registered app-wide by
+`registerSystemControls()`) opens a web page in the system browser. The page address is the
+binding's typed `url` param, so a Privacy Policy or Terms link is authored data: change where it goes
+in the Inspector, not in code. Both shipping games' settings panels use it for their footer links.
+- **Where it opens.** On iOS and Android it goes through `capacitor-modoki-system`'s `openUrl`
+  (Safari, or the default Android browser). On the web and in the editor it uses `window.open`, and
+  the Electron editor's `setWindowOpenHandler` forwards that to `shell.openExternal`, so the Game
+  panel opens the OS browser and never navigates the editor window. The plugin is reached by name,
+  as `capacitorStore.ts` reaches the IAP plugin, so the engine has no build dependency on it.
+- ⚠️ **It refuses anything that is not a literal `https://`, a host, and nothing outside RFC 3986's
+  ASCII allow-list** (every `%` a two-hex-digit escape, at most one `#`). Refused: `http:`,
+  `javascript:`, a bare `example.com/page`, an unfilled param, and also `https:example.com/…`,
+  `https:///…`, a leading space, `|`, `"`, `{}`, `^`, `<>`, non-ASCII paths and hosts (write IDN hosts in
+  punycode), and bad escapes. The browser's `new URL()` repairs or encodes all of those, but the
+  phone does not. Foundation finds no host in the first group (`https:x`, `https:///x`, a leading space)
+  on every iOS version. iOS 16's `URL(string:)` returns nil for the character group, while iOS 17+
+  encodes those like a browser, so a new phone does not show it. Court's floor is 16.4. Accepting them gave a link that opened in the editor and did nothing
+  on an older iPhone (#1196 close-out, two review rounds). The rule only has to be at least as strict as
+  the strictest native side. The plugin's web copy is replayed against the same vectors
+  (`tests/runtime/openUrlVectors.ts`); Swift and Java keep their own looser checks behind this gate.
+- **It never registers the plugin a second time.** On a device, both native bridges write a plain
+  `Capacitor.Plugins.ModokiSystem` object at document start, and a game that imports the plugin's
+  JavaScript (wordweave) replaces it with a `registerPlugin` proxy at boot. The action calls whichever
+  is there. A second `registerPlugin` would warn "already registered", and a shipped build reports
+  every `console.warn` to Crashlytics. It falls back to `registerPlugin` only when the entry has no
+  `openUrl`, which is an OTA bundle running on an older native binary.
+- **Refusals are synchronous; the outcome is journaled.** Both refusals are decided before the
+  plugin call, so `modoki_dispatch_action` answers `ok:false` for them (#1129). What the OS then
+  did arrives as a `system.openUrl` journal entry, `{ url, opened }`, logged at `warn` when nothing
+  opened. On the web `opened` is always `true`: a popup blocker and the editor's deny-and-forward
+  handler both make `window.open` return `null`, so the web cannot tell them apart.
 
 #### Global input lock (#466)
 

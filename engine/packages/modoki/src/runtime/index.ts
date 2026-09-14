@@ -149,6 +149,7 @@ export { registerIapControls } from './actions/iapControls';
 export { hapticsSystem } from './haptics/hapticsSystem';
 export { registerHapticControls } from './actions/hapticControls';
 export { registerQualityControls } from './actions/qualityControls';
+export { registerSystemControls } from './actions/systemControls';
 export {
   playHaptic, configureHaptics, areHapticsEnabled, canDeviceVibrate,
   hapticLatencyMean, hapticLatencySamples, clearHapticLatency,

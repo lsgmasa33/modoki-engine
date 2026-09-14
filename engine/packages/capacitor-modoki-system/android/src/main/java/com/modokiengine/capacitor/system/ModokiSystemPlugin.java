@@ -37,6 +37,24 @@ public class ModokiSystemPlugin extends Plugin {
         call.resolve(ret);
     }
 
+    // A web page in the default browser (#1196). https only: a VIEW intent would also resolve
+    // `intent:`, `tel:` or another app's custom scheme, which an authored link must never reach.
+    // No <queries> entry is needed — startActivity is called directly and a device with no
+    // browser surfaces as ActivityNotFoundException, which start() turns into false.
+    @PluginMethod
+    public void openUrl(PluginCall call) {
+        String raw = call.getString("url");
+        Uri uri = raw == null ? null : Uri.parse(raw);
+        boolean openable = uri != null
+            && "https".equalsIgnoreCase(uri.getScheme())
+            && uri.getHost() != null
+            && !uri.getHost().isEmpty();
+
+        JSObject ret = new JSObject();
+        ret.put("opened", openable && start(new Intent(Intent.ACTION_VIEW, uri)));
+        call.resolve(ret);
+    }
+
     private boolean start(Intent intent) {
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         try {

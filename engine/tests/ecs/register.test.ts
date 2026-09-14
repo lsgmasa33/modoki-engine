@@ -20,6 +20,7 @@ const mockSetTargetFPS = vi.fn();
  *  test below for why an equal value could not tell the two code paths apart. */
 const mockGetEffectiveTargetFps = vi.fn(() => 30);
 const mockSetRenderSettings = vi.fn();
+const mockRegisterSystemControls = vi.fn();
 
 vi.mock('@modoki/engine/runtime', () => ({
   getGameConfig: () => mockGetGameConfig(),
@@ -30,6 +31,7 @@ vi.mock('@modoki/engine/runtime', () => ({
   registerAudioControls: () => {},
   registerHapticControls: () => {},
   registerQualityControls: () => {},
+  registerSystemControls: () => mockRegisterSystemControls(),
   registerVideoControls: () => {},
   registerManager: (...args: any[]) => mockRegisterManager(...args),
   unregisterManagers: (...args: any[]) => mockUnregisterManagers(...args),
@@ -62,6 +64,15 @@ describe('registerAll', () => {
     const { registerAll } = await import('../../app/ecs/register');
     registerAll();
     expect(mockRegisterAllTraits).toHaveBeenCalledTimes(1);
+  });
+
+  // #1196 close-out: both games' Privacy/Terms footer links bind `system.openUrl` and never register
+  // it themselves — their own tests do, and both sceneChrome guards skip `system.` as engine-owned —
+  // so this is the one test that fails if the app stops registering it, instead of shipping dead links.
+  it('registers the system.openUrl control layer app-wide', async () => {
+    const { registerAll } = await import('../../app/ecs/register');
+    registerAll();
+    expect(mockRegisterSystemControls).toHaveBeenCalledTimes(1);
   });
 
   it('is idempotent — second call does not re-register', async () => {

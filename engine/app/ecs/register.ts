@@ -13,7 +13,7 @@
 import projectConfig from 'virtual:modoki-project-config';
 import { registerAllTraits } from './registerTraits';
 import { setNameTransform } from '@modoki/engine/runtime';
-import { getGameConfig, registerEngineActions, registerAudioControls, registerHapticControls, registerQualityControls, registerVideoControls, registerManager, timeManager, navigationManager, physics2DEventsManager, physics3DEventsManager, zone2DEventsManager, zone3DEventsManager, timelineEventsManager, inputSourcesManager, setPhysicsLayers, setTargetFPS, setRenderSettings, getEffectiveTargetFps } from '@modoki/engine/runtime';
+import { getGameConfig, registerEngineActions, registerAudioControls, registerHapticControls, registerQualityControls, registerSystemControls, registerVideoControls, registerManager, timeManager, navigationManager, physics2DEventsManager, physics3DEventsManager, zone2DEventsManager, zone3DEventsManager, timelineEventsManager, inputSourcesManager, setPhysicsLayers, setTargetFPS, setRenderSettings, getEffectiveTargetFps } from '@modoki/engine/runtime';
 
 /** Once-only latch: the app-scoped registration above happens once per REALM, and nothing clears
  *  this. That is deliberate (#534) — see the header note. */
@@ -34,6 +34,10 @@ export function registerAll() {
   // Built-in quality control layer: quality.set (the player's Auto/Low/Mid/High choice),
   // so a settings screen can drive render tier declaratively too.
   registerQualityControls();
+  // Built-in system control layer: system.openUrl, so a settings screen's Privacy Policy / Terms
+  // link is an authored binding. App-wide because the web and the editor can always open a page;
+  // a native build without capacitor-modoki-system refuses it loudly (see systemControls.ts).
+  registerSystemControls();
   // Skipped entirely when video is excluded — the `video.*` actions would have nothing to
   // drive, and registering them would pull the subsystem back into the bundle.
   if (__MODOKI_MODULE_VIDEO__) registerVideoControls();
