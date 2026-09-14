@@ -181,7 +181,9 @@ legitimate exception: it *measures* a path).
   the guid index. The refusal then told the caller to use guids. `liveGuidOf`
   (`app/debug/liveLifecycle.ts`) is the one helper. Two shapes differ, because a bare element has
   no `id` beside it: `contacts`/`overlaps` list a guid-less partner as `id:<n>`, and a `watch`
-  series reports `guid: null` plus `id`, with `id:<n>` as its internal key. A producer that hands out a guid should
+  series reports `guid: null` plus `id`, with `id:<n>` as its internal key. A `watch read` with
+  `guids` therefore cannot select a guid-less series by its old id string. Select it with `name`.
+  `guids: ["id:<n>"]` also matches, but it is not an advertised form. A producer that hands out a guid should
   **mint** one (the live `create-entity`, `newScene`'s starter set), not disguise the id. A
   scene-state warning for null rows was tried and dropped: it fired on every read of a world with
   runtime spawns.

@@ -67,6 +67,19 @@ describe('Watch — change-detection + stats', () => {
     expect(r.series.find((x) => x.name === 'Real')!.guid).toBe('real');
   });
 
+  it('a NAME-scoped watch reports a guid-less spawn as guid:null + id too (#1199) — it is the path runtime spawns use', () => {
+    setup();
+    const bare = w.spawn(EntityAttributes({ name: 'Puck' }), WPos({ x: 0 }));
+    const started = startWatch({ component: 'WPos', names: ['puck'], fields: ['x'], epsilon: 0.001 });
+    expect(started.ok).toBe(true);
+    tick(1);
+
+    const r = readWatch(started.id!) as { series: { guid: string | null; id?: number; name?: string }[] };
+    expect(r.series).toHaveLength(1);
+    expect(r.series[0].guid).toBeNull();
+    expect(r.series[0].id).toBe(bare.id());
+  });
+
   it('ring-caps the series at maxSamples', () => {
     setup();
     const e = w.spawn(EntityAttributes({ guid: 'r', name: 'R' }), WPos({ x: 0 }));

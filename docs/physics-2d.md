@@ -422,7 +422,8 @@ crates costs nothing).
   body than its enter did (decrementing by that would leak) — force-clearing by body identity is
   exact.
 - **Folded into `get_scene_state`.** `getContactState(world, id)` returns sorted `contacts`/
-  `overlaps` id arrays; `agentBridge.ts` resolves each to a GUID and attaches them under the
+  `overlaps` id arrays; `agentBridge.ts` resolves each to a GUID (`id:<n>` for a partner with no
+  guid, #1199 — see [mcp-tool-conventions.md](./mcp-tool-conventions.md) §3) and attaches them under the
   `contacts` enricher (`?contacts=1`). Cleared on scene swap + Play→Stop (same lifecycle as the
   physics world). See [debug-tools-mcp.md](./debug-tools-mcp.md) "Percept".
 

@@ -18,7 +18,7 @@ const REFRESH_MS = 300;
 
 interface WatchListItem { id: string; component: string; fields: string[]; seriesCount: number }
 interface SeriesStats { first: number; last: number; min: number; max: number; delta: number; settled: boolean }
-interface SeriesItem { guid: string; field: string; count: number; despawnedAt?: number; stats: SeriesStats | null; samples: { tick: number; value: number }[] }
+interface SeriesItem { guid: string | null; id?: number; field: string; count: number; despawnedAt?: number; stats: SeriesStats | null; samples: { tick: number; value: number }[] }
 
 function WatchTab() {
   const [, setTick] = useState(0);
@@ -83,7 +83,9 @@ function WatchCard({ id }: { id: string }) {
         <div style={mutedStyle}>collecting… (values change to record)</div>
       ) : (
         series.map((s) => (
-          <div key={`${s.guid}:${s.field}`} style={{ marginTop: 4 }}>
+          // A guid-less series reads back as guid:null + id (#1199), so key on the id there — two
+          // such series on one field would otherwise share `null:<field>`.
+          <div key={`${s.guid ?? `id:${s.id}`}:${s.field}`} style={{ marginTop: 4 }}>
             <div style={seriesLabelStyle}>
               <span>{s.field}</span>
               <span style={{ color: '#e6e6ff', fontVariantNumeric: 'tabular-nums' }}>{s.stats ? fmt(s.stats.last) : '—'}</span>
