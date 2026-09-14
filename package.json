@@ -131,7 +131,7 @@
     "@types/yauzl": "^3.4.0",
     "@vitest/coverage-v8": "^4.1.10",
     "cross-env": "^10.1.0",
-    "electron": "^43.2.0",
+    "electron": "^44.3.0",
     "electron-builder": "^26.15.7",
     "esbuild": "^0.28.0",
     "eslint": "^10.8.0",
