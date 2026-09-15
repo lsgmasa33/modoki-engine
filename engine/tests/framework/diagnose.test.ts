@@ -192,7 +192,7 @@ describe('computeDiagnostics: quality tier fields (R6.3)', () => {
 describe('computeDiagnostics: UI text overflow (#1126)', () => {
   afterEach(() => { resetUIOverflowFindings(); setUIOverflowCheckEnabled(false); vi.restoreAllMocks(); });
 
-  const finding = (entityId: number, over: Partial<UIOverflowFinding> = {}): Omit<UIOverflowFinding, 'current'> => ({
+  const finding = (entityId: number, over: Partial<UIOverflowFinding> = {}): Omit<UIOverflowFinding, 'current' | 'boxGuid'> => ({
     kind: 'spill', boxEntityId: entityId, overflowPx: 6.6, availablePx: 254, textPx: 267.2, clipped: false,
     entityId, guid: '', text: 'Hard', viewport: { w: 375, h: 667 }, ...over,
   });
@@ -222,13 +222,15 @@ describe('computeDiagnostics: UI text overflow (#1126)', () => {
     expect(d.summary).toContain('1 UI text overflow(s)');
     expect(d.uiOverflow.count).toBe(1);
     expect(d.uiOverflow.findings[0]).toMatchObject({ name: 'LevelTab_Hard', boxName: 'LevelTabs', kind: 'spill', overflowPx: 6.6, current: true });
+    // The box named by guid too (#1223 P2).
+    expect(d.uiOverflow.findings[0]).toMatchObject({ boxGuid: (row.get(EntityAttributes) as { guid: string }).guid });
   });
 
   it('a placed element wider than the whole UI names the UI root as its box', () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     game = createTestWorld({});
     recordUIOverflow('k', finding(1, { boxEntityId: 0 }));
-    expect(computeDiagnostics().uiOverflow.findings[0]).toMatchObject({ boxName: '(UI root)' });
+    expect(computeDiagnostics().uiOverflow.findings[0]).toMatchObject({ boxName: '(UI root)', boxGuid: null });
   });
 
   it('a finding the latest scan did not see overflow is listed and noted, but no longer fails ok', () => {

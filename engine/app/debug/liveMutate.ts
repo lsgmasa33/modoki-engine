@@ -23,9 +23,10 @@ import {
   readTraitDataFull,
   writeTraitField,
   findEntity,
-  findEntityByGuid,
   reparentRefusal,
 } from '@modoki/engine/runtime';
+import { resolveEntityAddress } from './entityRef';
+import type { ErrorCode } from '../../tools/shared/mcpResult';
 
 type TraitMeta = ReturnType<typeof getAllTraits>[number];
 type WherePredicate = (info: { id: number; traits: string[] }) => boolean;
@@ -42,9 +43,10 @@ export interface LiveMutateParams {
   /** Aim: one stable guid, or an array of them (the array form is what makes a
    *  read → filter-in-JS → write loop possible inside a single eval body). */
   guid?: string | string[];
-  /** Aim: exact entity name. AMBIGUOUS NAMES ARE REFUSED (conventions §3) — never first-matched. */
+  /** Aim: exact, case-sensitive entity name. AMBIGUOUS NAMES ARE REFUSED (conventions §3) — never first-matched. */
   name?: string;
-  /** Aim: live entity id. Reassigned on every scene reload; prefer `guid`. */
+  /** Aim: live entity id — only for an entity with NO guid (#1223 D2); one that has a guid is refused
+   *  with the guid as the option, because an id is reassigned on every scene reload. */
   id?: number;
   /** `{"Trait.field": value}` to write a field, or `{"TraitName": true|false}` to add/remove a
    *  tag trait. Keys reuse `where`'s `Trait.field` addressing — one vocabulary for read and write. */
@@ -58,8 +60,12 @@ export interface LiveMutateParams {
 export interface LiveMutateFailure {
   ok: false;
   error: string;
+  /** The §5 code, when the refusal knows it (the shared entity resolver's, #1223). */
+  code?: ErrorCode;
   /** The real choices, when there is a finite set — feeds the tool's §5 `options`. */
   options?: string[];
+  /** Why a runtime guid missed (`'despawned'`/`'world-swapped'`), on a NOT_FOUND (#1223 D4). */
+  stale?: string;
   matched?: number;
 }
 
@@ -72,6 +78,12 @@ export interface LiveMutateSuccess {
   savedNote: string;
   entities: Array<{ id: number; guid: string | null; name: string; before: Record<string, unknown>; after: Record<string, unknown> }>;
   detailTruncated?: true;
+  /** A trait an entity did NOT have, added because a field on it was set (#1216 C-12, #1223 D6) — one row
+   *  per entity and trait, capped at `limit` like `entities`. Absent when nothing was added. A tag write
+   *  (`"Tag": true`) is not listed: adding the trait is what it asked for. */
+  addedTraits?: Array<{ id: number; guid: string | null; trait: string }>;
+  /** Every addition, when more than `addedTraits` lists — the `<list>Total` shape `alsoDeletedTotal` uses. */
+  addedTraitsTotal?: number;
   hint?: string;
 }
 
@@ -184,7 +196,14 @@ function selectTargets(
   metaByName: Map<string, TraitMeta>,
   parseWhere: (expr: string, m: Map<string, TraitMeta>) => { pred: WherePredicate } | { error: string },
 ): { ids: number[] } | LiveMutateFailure {
-  const selectors = [p.where != null, p.guid != null, p.name != null, p.id != null].filter(Boolean).length;
+  // A scalar empty string is ABSENT, as in the shared resolver (#1223): `{guid:'', id:7}` is one selector,
+  // not a refused pair. An element of a guid LIST is not optional, though — `['G1', '']` is two refs, and
+  // the empty one is a miss the caller must hear about, never quietly dropped.
+  const whereGiven = typeof p.where === 'string' && p.where !== '';
+  const guidList = Array.isArray(p.guid) ? p.guid : typeof p.guid === 'string' && p.guid !== '' ? [p.guid] : [];
+  const nameGiven = typeof p.name === 'string' && p.name !== '';
+  const idGiven = typeof p.id === 'number';
+  const selectors = [whereGiven, guidList.length > 0, nameGiven, idGiven].filter(Boolean).length;
   if (selectors === 0) {
     return {
       ok: false,
@@ -195,66 +214,49 @@ function selectTargets(
   if (selectors > 1) {
     // Two selectors could only mean "intersect" or "union" and the caller has not said which.
     // Guessing would silently mutate a different set than they asked for.
-    return { ok: false, error: 'more than one selector given — nothing was applied. Use exactly one of where / guid / name / id.' };
+    return { ok: false, code: 'AMBIGUOUS', error: 'more than one selector given — nothing was applied. Use exactly one of where / guid / name / id.' };
   }
 
-  if (p.guid != null) {
-    const guids = Array.isArray(p.guid) ? p.guid : [p.guid];
+  if (guidList.length) {
     const ids: number[] = [];
     const missing: string[] = [];
-    for (const g of guids) {
-      const ent = findEntityByGuid(g);
-      if (!ent) { missing.push(g); continue; }
+    let stale: string | undefined;
+    for (const g of guidList) {
+      const r = resolveEntityAddress({ guid: g }, { label: 'set-traits guid', accept: ['guid'] });
+      if (!r.ok) { missing.push(r.stale ? `${g} (${r.stale})` : g === '' ? '"" (an empty guid)' : g); stale ??= r.stale; continue; }
       // DEDUPE. `guid: ['G1','G1']` used to report matched:2 for ONE entity — and worse, the second
       // pass re-read `before` AFTER the first write, so `changed` came back 1 against matched 2,
       // which reads as "half my writes were ignored". The counts are documented as exact; that
       // means exact per ENTITY, not per ref. (deleteEntitiesLive already deduped; this did not.)
-      const id = ent.id();
-      if (!ids.includes(id)) ids.push(id);
+      if (!ids.includes(r.id)) ids.push(r.id);
     }
     // A stale guid is routine (ids and entities rebuild on every scene reload), so it must never
     // pass silently — an agent that fed 40 guids and mutated 39 has to know which one vanished.
     if (missing.length) {
       return {
-        ok: false,
-        error: `${missing.length} of ${guids.length} guid(s) matched no entity in the live world — nothing was applied. They may be stale (entities rebuild on scene reload). Missing: ${missing.join(', ')}`,
+        ok: false, code: 'NOT_FOUND',
+        error: `${missing.length} of ${guidList.length} guid(s) matched no entity in the live world — nothing was applied. They may be stale (entities rebuild on scene reload). Missing: ${missing.join(', ')}`,
+        ...(stale ? { stale } : {}),
       };
     }
     return { ids };
   }
 
+  if (idGiven || nameGiven) {
+    const r = resolveEntityAddress({ id: p.id, name: p.name }, { label: idGiven ? 'set-traits id' : 'set-traits name' });
+    if (r.ok) return { ids: [r.id] };
+    const base = { ok: false as const, error: `${r.error} — nothing was applied.`, ...(r.code ? { code: r.code } : {}) };
+    if (nameGiven && r.code === 'NOT_FOUND') {
+      // Near misses, so a typo'd or case-mismatched name has somewhere to go.
+      const q = (p.name as string).toLowerCase();
+      const near = getAllEntities().filter((e) => (e.name ?? '').toLowerCase().includes(q)).slice(0, 10).map((e) => e.name ?? `#${e.id}`);
+      return { ...base, ...(near.length ? { options: near } : {}) };
+    }
+    if (nameGiven && r.code === 'AMBIGUOUS') return { ...base, ...(r.options ? { options: r.options.slice(0, 20) } : {}), matched: r.options?.length };
+    return { ...base, ...(r.options ? { options: r.options } : {}), ...(r.stale ? { stale: r.stale } : {}) };
+  }
+
   const all = getAllEntities();
-
-  if (p.id != null) {
-    const hit = all.find((e) => e.id === p.id);
-    if (!hit) return { ok: false, error: `id ${p.id} matched no entity in the live world — nothing was applied. Ids are reassigned on every scene reload; prefer guid.` };
-    return { ids: [hit.id] };
-  }
-
-  if (p.name != null) {
-    const q = p.name.toLowerCase();
-    const hits = all.filter((e) => (e.name ?? '').toLowerCase() === q);
-    if (hits.length === 0) {
-      const near = all.filter((e) => (e.name ?? '').toLowerCase().includes(q)).slice(0, 10).map((e) => e.name ?? `#${e.id}`);
-      return {
-        ok: false,
-        error: `name "${p.name}" matched no entity exactly — nothing was applied.`,
-        options: near.length ? near : undefined,
-      };
-    }
-    if (hits.length > 1) {
-      // Conventions §3: a name matching several entities is REFUSED everywhere, never
-      // first-matched. `where` is the plural selector; `name` is an aim.
-      return {
-        ok: false,
-        error: `name "${p.name}" matched ${hits.length} entities — nothing was applied. Aim with one guid, or select the set deliberately with where/guid[].`,
-        options: hits.slice(0, 20).map((e) => `${e.name} (guid via scene-state, id ${e.id})`),
-        matched: hits.length,
-      };
-    }
-    return { ids: [hits[0].id] };
-  }
-
   const parsed = parseWhere(p.where as string, metaByName);
   if ('error' in parsed) return { ok: false, error: `${parsed.error} — nothing was applied.` };
   return { ids: all.filter((e) => parsed.pred(e)).map((e) => e.id) };
@@ -362,12 +364,22 @@ export function applyLiveMutate(
 
   const limit = typeof p.limit === 'number' && p.limit >= 0 ? p.limit : DEFAULT_DETAIL_LIMIT;
   const detail: LiveMutateSuccess['entities'] = [];
+  const added: NonNullable<LiveMutateSuccess['addedTraits']> = [];
+  let addedTotal = 0;
   let changed = 0;
 
   for (const id of ids) {
     const entity = findEntity(id);
     if (!entity) continue;
     const before = snapshot(id, writes);
+    // Named BEFORE the writes (a dry run adds nothing, and says what it would add): a field write on a
+    // trait the entity lacks adds that trait — the editor's live path does the same (D6) — and neither
+    // surface said so, so an agent reading `changed:1` could not tell a write from a new component.
+    const lacking = new Set(writes.filter((w) => w.field !== null && !entity.has(w.meta.trait)).map((w) => w.trait));
+    for (const trait of lacking) {
+      addedTotal++;
+      if (added.length < limit) added.push({ id, guid: deps.guidOf(id), trait });
+    }
 
     if (!p.dryRun) {
       for (const w of writes) {
@@ -404,6 +416,8 @@ export function applyLiveMutate(
     entities: detail,
     ...(p.dryRun ? { dryRun: true as const } : {}),
     ...(detail.length < ids.length ? { detailTruncated: true as const } : {}),
+    ...(added.length ? { addedTraits: added } : {}),
+    ...(added.length < addedTotal ? { addedTraitsTotal: addedTotal } : {}),
   };
   if (changed === 0 && !p.dryRun) {
     // Every matched entity already held the requested values. Not a failure (the world IS in the

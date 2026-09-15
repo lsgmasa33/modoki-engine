@@ -346,10 +346,11 @@ describe('float precision: the op rounds, the producer stays exact', () => {
     expect(r.entities[0].traits.Transform.x).toBe(ROUNDED);
   });
 
-  it('integer-valued fields (id, parentId, entityCount) are never touched', async () => {
+  it('integer-valued fields (id, parentId, returnedCount, totalCount) are never touched', async () => {
     game!.spawn(Transform({ x: EXACT }), EntityAttributes({ name: 'Ints', guid: 'i-guid' }));
-    const r = await runAgentOp('scene-state', { name: 'Ints' }) as { entityCount: number; entities: Array<{ id: number }> };
+    const r = await runAgentOp('scene-state', { name: 'Ints' }) as { returnedCount: number; totalCount: number; entities: Array<{ id: number }> };
     expect(Number.isInteger(r.entities[0].id)).toBe(true);
-    expect(Number.isInteger(r.entityCount)).toBe(true);
+    expect(Number.isInteger(r.returnedCount)).toBe(true);
+    expect(Number.isInteger(r.totalCount)).toBe(true);
   });
 });

@@ -156,7 +156,7 @@ describe('uiOverflowKey', () => {
   });
 });
 
-const finding = (over: Partial<UIOverflowFinding> = {}): Omit<UIOverflowFinding, 'current'> => ({
+const finding = (over: Partial<UIOverflowFinding> = {}): Omit<UIOverflowFinding, 'current' | 'boxGuid'> => ({
   kind: 'own-box', boxEntityId: 7, overflowPx: 15.04, availablePx: 88.26, textPx: 103.31, clipped: false,
   entityId: 7, guid: 'g-7', text: 'Vibration on', viewport: { w: 360.4, h: 640 }, ...over,
 });

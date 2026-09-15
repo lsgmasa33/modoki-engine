@@ -19,6 +19,9 @@ import { identityMismatch, tokenMismatchWarning, describeIdentity, type BackendI
 // `timeoutMs` and the device's own internal step budget can never independently drift (#822).
 import { simStepDefaultTimeout } from '../../shared/simStepTiming.js';
 import { DEVICE_KEY_MODIFIERS, KEY_ARG_DESCRIPTION, MOUSE_BUTTONS, POINTER_ACTIONS } from '../../shared/inputVocabulary.js';
+import { CREATE_ENTITY_FIELDS, CREATE_ENTITY_KINDS, vocabularyProse, type CreateEntityKind } from '../../shared/createEntityVocabulary.js';
+import { ignoredHandleFilter, parseHandleIds, shapeHandlesReply, type HandlesResponse } from '../../shared/handlesReply.js';
+import { INVALIDATABLE_ASSET_TYPES } from '../../shared/invalidateAssets.js';
 import { z } from 'zod';
 import { writeFileSync, readFileSync, unlinkSync, statSync } from 'fs';
 import { execFile } from 'child_process';
@@ -29,7 +32,7 @@ import { join } from 'path';
 const pExecFile = promisify(execFile);
 import {
   encodeEvalResult, encodeStructuredResult, extFor, describeScreenshot, isFailureBody,
-  deviceFail, caughtFailure, deviceReplyFailure,
+  deviceFail, caughtFailure, deviceReplyFailure, ERROR_CODES, type ErrorCode, type DeviceResult,
 } from './result.js';
 import { parseReply, isDeviceError, decodeScreenshotReply, describeLease, describeInputFidelity, parseConsoleLogsReply, parseNativeLogsReply, SYNTHETIC_MECHANISM, type LeaseStatus } from './reply.js';
 
@@ -41,6 +44,136 @@ const BACKEND = (process.env.MODOKI_BACKEND ?? 'http://127.0.0.1:5179').replace(
 // file is not. That move is #107's actual fix: the constants were always guarded for parity, but
 // nothing ever asserted what the reporter DOES with a given value, which is the layer the bug
 // was in. See `describeInputFidelity` there.
+
+// ── Entity aim (#1223 P3, #1216 P1-1) ─────────────────────────────────────────
+// The device page resolves `{entity}` through the SAME `resolve-entity-point` op and accept/refuse
+// decision (`entityAimOutcome`) the editor's `modoki_*` input routes use, so these schemas mirror the
+// editor's `makeEntitySpec` (`tools/modoki-mcp/src/shapes.ts`): the same keys, strict, the same
+// refusal text — pinned by `deviceEntityAim.test.ts`, because zod 4 here and zod 3 there means the
+// factory cannot be imported. Two deliberate differences: `surface` has no `'scene-view'` (a shipped
+// game has no editor viewport), and a drag endpoint is strict here too.
+
+/** The surfaces a shipped game can show an entity on. */
+const DEVICE_AIM_SURFACES = ['game-3d', 'game-2d', 'game-ui'] as const;
+
+const DEVICE_ALLOW_OCCLUDED =
+  'Aim there even though something covers the target (default false = REFUSED as OCCLUDED, naming the '
+  + 'cover). A covered press lands on the covering element, so reporting ok would be a false success. '
+  + 'Applies to `entity` and `selector` aims; raw x/y is never refused, because a coordinate is exactly what you asked for.';
+
+/** A FACTORY, as the editor's is: a schema reused by reference is emitted as a `$ref` a client may not resolve. */
+const makeDeviceEntitySpec = () => z.strictObject({
+  guid: z.string().optional(),
+  name: z.string().optional(),
+  id: z.number().int().optional(),
+  surface: z.enum(DEVICE_AIM_SURFACES).optional()
+    .describe('Which on-screen surface to aim in. REQUIRED for a 2D/3D entity, even when only one ' +
+      "surface shows it. For a UI entity it is optional unless the entity is mounted more than once. 'game-3d'/'game-2d' = " +
+      "the game's canvases; 'game-ui' = its DOM UI layer. (No 'scene-view' — that is the editor's viewport.)"),
+  allowOccluded: z.boolean().optional()
+    .describe('Aim at the entity even when something is in front of it, and report what was hit. Default false — a covered aim is REFUSED.'),
+}, { error: 'an entity aim accepts only: guid, name, id, surface, allowOccluded' }).describe(
+  'Aim at a SCENE ENTITY by exactly one of {guid} | {name} | {id}, resolved to its live screen rect ON ' +
+  'THE DEVICE inside this call — no screenshot, no read-then-tap race. Prefer guid; {id} only for an ' +
+  'entity with no guid (runtime ids are reassigned on every reload). A name matching several entities ' +
+  'is REFUSED (AMBIGUOUS, the guids as options), never first-match; a runtime guid from an earlier world ' +
+  'is NOT_FOUND with `stale`. A 2D/3D entity REQUIRES `surface`. Overrides `selector` and x/y. The game ' +
+  'ships no mesh picker unless it registers one, so on a 3D canvas only DOM covering is checked — the ' +
+  'reply\'s occlusionScope says how far the check could see.');
+
+const makeDevicePointSpec = () => z.strictObject({
+  entity: makeDeviceEntitySpec().optional(),
+  selector: z.string().optional(),
+  x: z.number().optional(),
+  y: z.number().optional(),
+  allowOccluded: z.boolean().optional().describe(DEVICE_ALLOW_OCCLUDED),
+}, { error: 'a drag endpoint accepts only: entity, selector, x, y, allowOccluded' });
+
+type DeviceEntityAim = { guid?: string; name?: string; id?: number; surface?: string; allowOccluded?: boolean };
+
+/** The device's next move when nothing exposes handles — not the editor's (a game has no Collider-edit mode). */
+const DEVICE_HANDLES_REMEDIES = {
+  noHandles: 'No handles: this game registers no handle provider and its DOM has no data-ui-id element on screen. device_layout_bounds reads entity rects instead.',
+  nothingLive: 'NOTHING on the device is exposing handles: the game registers no handle provider and its DOM has no data-ui-id element on screen. device_layout_bounds reads entity rects instead.',
+};
+
+// ── create-entity spec (#1216 C-3) ────────────────────────────────────────────
+// `spec` was `z.record(any)`, and the op read only its kind's own field — so `{kind:'primitive',
+// mseh:'cube'}` built the default sphere and answered ok. One strict object per kind, from the
+// vocabulary `modoki_create_entity` derives its flat fields from (`tools/shared/createEntityVocabulary.ts`).
+// mesh/shape stay strings on both surfaces: the op's refusal carries the list AND the sprite-GUID hint.
+
+const specFieldSchema = (kind: CreateEntityKind) => {
+  const f = (CREATE_ENTITY_FIELDS as Partial<Record<CreateEntityKind, { key: string; values: readonly string[]; fallback: string }>>)[kind];
+  if (!f) return {};
+  const described = `One of: ${vocabularyProse(f.values)} (default ${f.fallback}).`;
+  const value = f.key === 'light' || f.key === 'preset'
+    ? z.enum(f.values as unknown as [string, ...string[]])
+    : z.string();
+  return { [f.key]: value.optional().describe(described) };
+};
+
+/** A FACTORY, like the aim spec above: a schema reused by reference is emitted as a `$ref`. */
+const makeDeviceCreateEntitySpec = () => z.discriminatedUnion('kind', CREATE_ENTITY_KINDS.map((kind) => {
+  const field = specFieldSchema(kind);
+  return z.strictObject({ kind: z.literal(kind), ...field },
+    { error: `a "${kind}" spec accepts only: ${['kind', ...Object.keys(field)].join(', ')}` });
+}) as unknown as [z.ZodObject, ...z.ZodObject[]],
+// The union's own miss (an unknown or missing kind) says only "Invalid input" unless told otherwise; the op
+// used to answer this case with the kinds as options, so the schema that now refuses it first names them too.
+{ error: `spec.kind must be one of: ${CREATE_ENTITY_KINDS.join(', ')}` });
+
+/** Sent as the `selector` beside an entity aim that has none. This page resolves the entity first and
+ *  never looks at it; an app built BEFORE entity aim has no entity branch, resolves this selector,
+ *  matches nothing and refuses — naming the cause. Without it that build fell through to its pixel or
+ *  viewport-centre default: `device_scroll {entity}` scrolled the centre and answered ok. */
+export const ENTITY_AIM_SKEW_SELECTOR = '[data-modoki-app-predates-entity-aim]';
+
+/** The aim half of a request: the entity (with the skew selector when no real one rides along) and/or
+ *  the caller's selector. Precedence on the page is entity → selector, so a real selector is kept. */
+function aimWire(entity: DeviceEntityAim | undefined, selector: string | undefined, prefix = ''): Record<string, unknown> {
+  const sel = prefix ? `${prefix}Selector` : 'selector';
+  const ent = prefix ? `${prefix}Entity` : 'entity';
+  if (!hasEntityAim(entity)) return selector ? { [sel]: selector } : {};
+  return { [ent]: entity, [sel]: selector || ENTITY_AIM_SKEW_SELECTOR };
+}
+
+/** An entity aim that names something. `{}` is not one — the page would fall through to selector/x,y. */
+function hasEntityAim(entity: DeviceEntityAim | undefined): entity is DeviceEntityAim {
+  return !!entity && Object.keys(entity).length > 0;
+}
+
+/** How a device aim reads in a reply or an envelope's `what`. */
+function describeDeviceAim(a: { entity?: DeviceEntityAim; selector?: string; x?: number; y?: number }): string {
+  if (hasEntityAim(a.entity)) {
+    const e = a.entity;
+    const addr = e.guid !== undefined ? `guid ${e.guid}` : e.name !== undefined ? `name ${JSON.stringify(e.name)}` : `id ${e.id}`;
+    return `entity ${addr}${e.surface ? ` on ${e.surface}` : ''}`;
+  }
+  return a.selector ? `selector ${JSON.stringify(a.selector)}` : `(${a.x},${a.y})`;
+}
+
+type DragEndpoint = { entity?: DeviceEntityAim; selector?: string; x?: number; y?: number; allowOccluded?: boolean; resolvable: boolean };
+
+/** One drag endpoint from either form — the caller has already refused both at once. */
+function endpointOf(
+  nested: { entity?: DeviceEntityAim; selector?: string; x?: number; y?: number; allowOccluded?: boolean } | undefined,
+  selector: string | undefined, x: number | undefined, y: number | undefined,
+): DragEndpoint {
+  const e = nested ?? { selector, x, y };
+  return { ...e, resolvable: hasEntityAim(e.entity) || !!e.selector };
+}
+
+/** An endpoint on the bridge's wire: `fromEntity`/`fromSelector`/`fromX`/`fromY`/`fromAllowOccluded`
+ *  (`DEVICE_AIM_KEYS`, `app/debug/domPointContract.ts`). The endpoint's own flag beats the top-level one. */
+function endpointWire(end: 'from' | 'to', p: DragEndpoint, allowOccluded: boolean | undefined): Record<string, unknown> {
+  if (!p.resolvable) return { [`${end}X`]: p.x, [`${end}Y`]: p.y };
+  const flag = p.allowOccluded ?? allowOccluded;
+  return {
+    ...aimWire(p.entity, p.selector, end),
+    ...(flag !== undefined ? { [`${end}AllowOccluded`]: flag } : {}),
+  };
+}
 
 // ── The device eval surface's BOUNDARY (#101) ────────────────────────────────
 // Input and screenshot are NOT agent ops: they are bridge-level switch cases
@@ -851,7 +984,12 @@ export function registerTools(server: McpServer) {
    *  one-line addition next to the reasoning instead of a second scattered special case. */
   const OK_IS_A_VERDICT = new Set(['diagnose']);
 
-  async function perceptCall(tool: string, method: string, params: Record<string, unknown> = {}, whatOverride?: string) {
+  async function perceptCall(
+    tool: string, method: string, params: Record<string, unknown> = {}, whatOverride?: string,
+    /** Reshape a SUCCESSFUL answer before it is encoded — never a refusal, which is judged first. It may
+     *  still turn the answer into a failure (`{fail}`) when the answer shows the request was not honoured. */
+    shape?: (parsed: unknown) => Promise<{ value: unknown } | { fail: DeviceResult }>,
+  ) {
     // §5 wants the envelope in the CALLER's terms. The default names the op, which is right for a
     // tool that IS its op — but wrong for a relay, where the op is plumbing and the caller asked
     // about something else entirely. `device_game_tool_call` is the case: every refusal read "read
@@ -882,7 +1020,9 @@ export function registerTools(server: McpServer) {
           got: parsed,
         });
       }
-      return { content: [{ type: 'text' as const, text: encodeStructuredResult(parsed) }] };
+      const shaped = shape ? await shape(parsed) : { value: parsed };
+      if ('fail' in shaped) return shaped.fail;
+      return { content: [{ type: 'text' as const, text: encodeStructuredResult(shaped.value) }] };
     } catch (e) {
       return caughtFailure(tool, what, e);
     }
@@ -907,7 +1047,7 @@ export function registerTools(server: McpServer) {
       bounds: z.boolean().optional().describe('Add each entity\'s screen-space rect + onScreen flag.'),
       contacts: z.boolean().optional().describe('Add current physics contacts/overlaps (GUID arrays; a partner with no guid appears as `id:<n>`) per body.'),
       resources: z.boolean().optional().describe('Force-include resource entities (mesh/material/prefab/env holders + config singletons Time/Physics/NPRPostFX). Excluded from the DEFAULT untargeted listing only — any id/guid/trait/name/where filter already includes them.'),
-      limit: z.number().optional().describe('Cap entities returned (sets truncated/totalCount).'),
+      limit: z.number().optional().describe('Cap entities returned: `returnedCount` came back of `totalCount` matched (both always); truncated:true when it bites.'),
       precision: z.number().optional().describe('Significant digits for floats (default 9; 0 = exact).'),
     },
     async (args) => perceptCall('device_get_scene_state', 'scene-state', Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined))),
@@ -1099,7 +1239,7 @@ export function registerTools(server: McpServer) {
   tool('device_layout_bounds',
     'Numeric screen-space layout on the device (viewport CSS px) — UI DOM rects, 2D, and 3D world ' +
       'AABBs projected through the game camera (editor-style HANDLES: device_handles). Use instead of eyeballing a screenshot to check ' +
-      'alignment/overlap/clipping. Bare = COUNTS + the cheap offScreen/zeroSize id lists; pass ids/layer ' +
+      'alignment/overlap/clipping. Bare = COUNTS + the cheap offScreen/zeroSize guid lists; pass ids/layer ' +
       'for per-entity rects, overlaps=true for the O(n²) pair list. Floats rounded — verify by tolerance.',
     {
       layer: z.enum(['ui', '2d', '3d']).optional().describe('Limit to one layer (implies per-entity rects).'),
@@ -1108,7 +1248,7 @@ export function registerTools(server: McpServer) {
       name: z.string().optional().describe('Limit to entities whose name contains this, case-insensitive (implies per-entity rects).'),
       entities: z.boolean().optional().describe('Force the per-entity rect list on an untargeted call.'),
       overlaps: z.boolean().optional().describe('Materialize the overlapping-pair list (O(n²); default off).'),
-      limit: z.number().optional().describe('Cap per-entity rects (sets truncated/totalCount).'),
+      limit: z.number().optional().describe('Cap per-entity rects (`returnedCount` of `totalCount` rects; `entityTotal` = distinct entities); truncated:true when it bites.'),
       precision: z.number().optional().describe('Significant digits for floats (default 9; 0 = exact).'),
     },
     async (args) => perceptCall('device_layout_bounds', 'layout-bounds', Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined))),
@@ -1307,7 +1447,7 @@ export function registerTools(server: McpServer) {
       'iOS only: `source:"wda"` captures the WHOLE DEVICE SCREEN via WebDriverAgent instead of the ' +
       'app\'s own capture — the only way to see a system permission/ATT dialog, springboard, or ' +
       'anything outside the app. Its pixels are DEVICE-screen coordinates and must NOT be fed to ' +
-      'device_tap/device_drag (aim by `selector` instead — this surface has no `entity` addressing).',
+      'device_tap/device_drag (aim by `entity` or `selector` instead — both resolve on the device).',
     {
       savePath: z.string().optional().describe('Where to save (e.g., /tmp/screenshot.jpg). Defaults to a temp file.'),
       inline: z.boolean().optional().describe('Also embed the image in the response. Large — only when you need to SEE it.'),
@@ -1418,38 +1558,44 @@ export function registerTools(server: McpServer) {
   // ── Tap ────────────────────────────────────────────────────
 
   tool('device_tap',
-    'Tap a target on the connected device. Prefer selector aiming — pass a CSS `selector` (e.g. a ' +
-      'button) and the device resolves it to the element center, occlusion-checked, with NO ' +
-      'screenshot needed (the fix for tapping DOM chrome like a debug-menu close button). Otherwise ' +
-      'pass screenshot pixel `x`/`y` (take a device_screenshot first). Selector wins if both are given. ' +
+    'Tap a target on the connected device. Aim by NAME, not pixels: an `entity` ({guid}|{name}, plus ' +
+      '`surface` for a 2D/3D entity) resolves to the entity\'s live screen rect ON the device inside this ' +
+      'call, and a CSS `selector` (e.g. a button) to the element centre — both occlusion-checked, both ' +
+      'needing no screenshot. Otherwise pass screenshot pixel `x`/`y` (take a device_screenshot first). ' +
+      'Precedence entity → selector → x/y, as in modoki_tap. A covered target is REFUSED (`OCCLUDED`) ' +
+      'unless `allowOccluded:true`; a missed entity is `NOT_FOUND` (with `stale` when a runtime guid ' +
+      'outlived its world), an ambiguous name `AMBIGUOUS` with the guids as options. ' +
       'TRUSTED OS-level input when a route is available — CDP on Android, WebDriverAgent on iOS ' +
       '(#32) — else a synthetic DOM event, which is fronted by a loud banner saying so. Check ' +
       'device_status\'s input-mechanism line to know which you will get.',
     {
+      entity: makeDeviceEntitySpec().optional(),
       selector: z.string().optional().describe('CSS selector to aim at (resolved on-device to the element center; refuses if occluded). Preferred for DOM targets.'),
-      x: z.number().optional().describe('X (screenshot pixels) — used when no selector.'),
-      y: z.number().optional().describe('Y (screenshot pixels) — used when no selector.'),
+      x: z.number().optional().describe('X (screenshot pixels) — used when no entity or selector.'),
+      y: z.number().optional().describe('Y (screenshot pixels) — used when no entity or selector.'),
+      allowOccluded: z.boolean().optional().describe(DEVICE_ALLOW_OCCLUDED),
     },
-    async ({ selector, x, y }) => {
-      if (!selector && (x == null || y == null)) {
+    async ({ entity, selector, x, y, allowOccluded }) => {
+      const resolvable = hasEntityAim(entity) || !!selector;
+      if (!resolvable && (x == null || y == null)) {
         return deviceFail({
           code: 'REFUSED_BY_OP',
           tool: 'device_tap',
           what: 'tap the device screen with no usable aim',
-          why: 'no `selector` was given and the coordinates were incomplete, so there is nowhere to tap. Guessing a point would tap something arbitrary and report success.',
-          got: { selector, x, y },
-          expected: 'either selector:"<css>" (preferred — resolved on-device, refuses when occluded) or BOTH x and y in screenshot pixels',
+          why: 'no `entity` or `selector` was given and the coordinates were incomplete, so there is nowhere to tap. Guessing a point would tap something arbitrary and report success.',
+          got: { entity, selector, x, y },
+          expected: 'entity:{guid|name, surface} or selector:"<css>" (resolved on-device, refused when occluded), or BOTH x and y in screenshot pixels',
         });
       }
-      const aim = `tap ${selector ? `selector ${JSON.stringify(selector)}` : `(${x},${y})`} on the device`;
+      const aim = `tap ${describeDeviceAim({ entity, selector, x, y })} on the device`;
       try {
-        const info = selector ? null : await currentScreenInfo();
+        const info = resolvable ? null : await currentScreenInfo();
         // On the ADB path the device has NO screenInfo of its own (it is only set by the native
         // captureScreen, which Android skips), so sending raw screenshot pixels without ours means
         // the tap is scaled by nothing and lands somewhere else — answered as `Tapped (x,y) — ok`.
         // Dropping stale dims (the S2.i fix) made that reachable whenever the lease changed. If we
         // cannot supply the scale for a COORDINATE aim on an adb lease, refuse and say how to get it.
-        if (!selector && !info && await leaseUsesAdb()) {
+        if (!resolvable && !info && await leaseUsesAdb()) {
           return deviceFail({
             code: 'NOT_AVAILABLE_HERE',
             tool: 'device_tap',
@@ -1457,21 +1603,23 @@ export function registerTools(server: McpServer) {
             why: 'no screenshot scale is available for this lease, and an adb device has none of its own — the coordinates would be sent unscaled and the tap would land somewhere else. Nothing was sent.',
             options: [
               'take a device_screenshot first: it measures the framebuffer and stamps the scale for this lease',
-              'aim by `selector` instead — it resolves on-device and needs no scale at all',
+              'aim by `entity` or `selector` instead — both resolve on-device and need no scale at all',
             ],
           });
         }
-        const params = selector ? { selector } : { x, y, ...(info ? { screenInfo: info } : {}) };
+        const params = resolvable
+          ? { ...aimWire(entity, selector), ...(allowOccluded !== undefined ? { allowOccluded } : {}) }
+          : { x, y, ...(info ? { screenInfo: info } : {}) };
         const reply = await deviceRequest('tap', params);
-        // The device returns an `Error: …` string (no canvas, selector miss/occluded) as a normal
+        // The device returns an `Error: …` string (no canvas, a miss, occluded) as a normal
         // result — don't report a phantom tap as success (F9).
         if (isDeviceError(reply)) {
           return deviceReplyFailure('device_tap', aim, reply, [
-            'a selector miss or an OCCLUDED target is refused here rather than tapping something else — re-read the screen and aim again',
+            'a miss or an OCCLUDED target is refused here rather than tapping something else — re-read the screen and aim again',
             'device_layout_bounds gives the on-screen rects; device_screenshot shows what covers the target',
           ]);
         }
-        return { content: [{ type: 'text' as const, text: `Tapped ${selector ? JSON.stringify(selector) : `(${x},${y})`} — ${String(reply)}` }] };
+        return { content: [{ type: 'text' as const, text: `Tapped ${describeDeviceAim({ entity, selector, x, y })} — ${String(reply)}` }] };
       } catch (e) {
         return caughtFailure('device_tap', aim, e);
       }
@@ -1481,49 +1629,74 @@ export function registerTools(server: McpServer) {
   // ── Drag ───────────────────────────────────────────────────
 
   tool('device_drag',
-    'Drag between two points on the connected device. Aim each end by CSS selector ' +
-      '(`fromSelector`/`toSelector`, resolved + occlusion-checked on-device) or by screenshot pixel ' +
-      'coords (`fromX/fromY`→`toX/toY`; take a device_screenshot first). A selector wins over coords ' +
-      'for that endpoint. TRUSTED OS-level input when a route is available — CDP on Android, ' +
-      'WebDriverAgent on iOS (#32) — else synthetic DOM events, fronted by a loud banner. Check ' +
-      'device_status\'s input-mechanism line to know which you will get.',
+    'Drag between two points on the connected device. Give each end as `from`/`to` — the same nested ' +
+      'shape modoki_drag takes: `{entity}` ({guid}|{name}, plus `surface` for a 2D/3D entity), ' +
+      '`{selector}`, or `{x,y}` in screenshot pixels (take a device_screenshot first) — resolved and ' +
+      'occlusion-checked on-device. The flat `fromSelector`/`fromX`/`fromY`/`toSelector`/`toX`/`toY` ' +
+      'still work; giving one endpoint both ways is refused (`AMBIGUOUS`). A covered endpoint is ' +
+      'REFUSED unless `allowOccluded` (top-level for both ends, or on `from`/`to` for one). TRUSTED ' +
+      'OS-level input when a route is available — CDP on Android, WebDriverAgent on iOS (#32) — else ' +
+      'synthetic DOM events, fronted by a loud banner. Check device_status\'s input-mechanism line to ' +
+      'know which you will get.',
     {
-      fromSelector: z.string().optional().describe('CSS selector for the start point.'),
-      toSelector: z.string().optional().describe('CSS selector for the end point.'),
+      from: makeDevicePointSpec().optional().describe('Start point: {entity} | {selector} | {x,y}, plus an optional allowOccluded for this end.'),
+      to: makeDevicePointSpec().optional().describe('End point: {entity} | {selector} | {x,y}, plus an optional allowOccluded for this end.'),
+      fromSelector: z.string().optional().describe('CSS selector for the start point (flat form of from.selector).'),
+      toSelector: z.string().optional().describe('CSS selector for the end point (flat form of to.selector).'),
       fromX: z.number().optional(), fromY: z.number().optional(),
       toX: z.number().optional(), toY: z.number().optional(),
+      allowOccluded: z.boolean().optional().describe(`${DEVICE_ALLOW_OCCLUDED} Applies to BOTH endpoints; set it on \`from\`/\`to\` to allow just one.`),
       steps: z.number().optional().describe('Intermediate steps (default: 5)'),
       delayMs: z.number().optional().describe('Delay per step ms (default: 20)'),
       dom: z.boolean().optional().describe('Drag DOM chrome (a debug widget, slider) by dispatching the pointer sequence ON the grabbed element instead of the game canvas. Auto-engages when the grab lands on a non-canvas element; pass false to force the canvas/world path.'),
     },
-    async ({ fromSelector, toSelector, fromX, fromY, toX, toY, steps, delayMs, dom }) => {
-      const haveFrom = fromSelector != null || (fromX != null && fromY != null);
-      const haveTo = toSelector != null || (toX != null && toY != null);
+    async ({ from, to, fromSelector, toSelector, fromX, fromY, toX, toY, allowOccluded, steps, delayMs, dom }) => {
+      // One address per endpoint (§3): the nested and flat forms both naming the start is two aims for
+      // one point, and picking one by precedence would silently ignore the other.
+      const doubled = [
+        from && (fromSelector != null || fromX != null || fromY != null) ? 'from' : null,
+        to && (toSelector != null || toX != null || toY != null) ? 'to' : null,
+      ].filter((e): e is string => e !== null);
+      if (doubled.length) {
+        return deviceFail({
+          code: 'AMBIGUOUS',
+          tool: 'device_drag',
+          what: 'drag on the device',
+          why: `the ${doubled.join(' and ')} endpoint was given twice — nested \`${doubled[0]}\` AND the flat ${doubled[0]}Selector/${doubled[0]}X/${doubled[0]}Y — so which one to aim at would be a guess.`,
+          got: { from, to, fromSelector, fromX, fromY, toSelector, toX, toY },
+          options: ['give each endpoint once: from:{entity|selector|x,y} (preferred), or the flat fields'],
+        });
+      }
+      const f = endpointOf(from, fromSelector, fromX, fromY);
+      const t = endpointOf(to, toSelector, toX, toY);
+      const haveFrom = f.resolvable || (f.x != null && f.y != null);
+      const haveTo = t.resolvable || (t.x != null && t.y != null);
       if (!haveFrom || !haveTo) {
         return deviceFail({
           code: 'REFUSED_BY_OP',
           tool: 'device_drag',
           what: 'drag on the device with an incomplete endpoint',
-          why: `${!haveFrom ? 'the START' : 'the END'} endpoint has neither a selector nor both coordinates, so the gesture has no defined path.`,
-          got: { fromSelector, fromX, fromY, toSelector, toX, toY },
-          expected: 'each endpoint as a selector OR both coords: (fromSelector | fromX+fromY) and (toSelector | toX+toY)',
+          why: `${!haveFrom ? 'the START' : 'the END'} endpoint has no entity, no selector and not both coordinates, so the gesture has no defined path.`,
+          got: { from, to, fromSelector, fromX, fromY, toSelector, toX, toY },
+          expected: 'each endpoint as from/to:{entity} | {selector} | {x,y} (or the flat fromSelector | fromX+fromY, toSelector | toX+toY)',
         });
       }
       try {
-        // Only coordinate endpoints need the scale; a selector resolves on-device.
-        const screenInfo = fromSelector && toSelector ? null : await currentScreenInfo();
-        if (!(fromSelector && toSelector) && !screenInfo && await leaseUsesAdb()) {
+        // Only coordinate endpoints need the scale; an entity or selector resolves on-device.
+        const needsScale = !(f.resolvable && t.resolvable);
+        const screenInfo = needsScale ? await currentScreenInfo() : null;
+        if (needsScale && !screenInfo && await leaseUsesAdb()) {
           return deviceFail({
             code: 'NOT_AVAILABLE_HERE',
             tool: 'device_drag',
             what: 'drag by coordinates on the adb-connected device',
             why: 'no screenshot scale is available for this lease, and an adb device has none of its own — the endpoints would be sent unscaled. Nothing was sent.',
-            options: ['take a device_screenshot first to stamp the scale', 'aim BOTH endpoints by selector, which needs no scale'],
+            options: ['take a device_screenshot first to stamp the scale', 'aim BOTH endpoints by entity or selector, which need no scale'],
           });
         }
         const reply = await deviceRequest('drag', {
-          ...(fromSelector ? { fromSelector } : { fromX, fromY }),
-          ...(toSelector ? { toSelector } : { toX, toY }),
+          ...endpointWire('from', f, allowOccluded),
+          ...endpointWire('to', t, allowOccluded),
           steps: steps ?? 5, delayMs: delayMs ?? 20,
           ...(dom !== undefined ? { dom } : {}),
           ...(screenInfo ? { screenInfo } : {}),
@@ -1550,9 +1723,10 @@ export function registerTools(server: McpServer) {
       'Between calls the press PHYSICALLY persists, so you can read state that exists only WHILE the ' +
       'button is held — a slingshot pull preview, a charge-up meter — with device_get_scene_state / ' +
       'device_eval / device_screenshot mid-gesture (the atomic device_drag can\'t expose it). Typical ' +
-      'loop: down → (read) → move → (read) → up. Aim each call by CSS `selector` (resolved on-device) ' +
-      'or screenshot pixel `x`/`y` (take a device_screenshot first) — same aiming as device_tap, no ' +
-      '`entity` addressing on this surface. move/up reuse the button from the down; a move/up with ' +
+      'loop: down → (read) → move → (read) → up. Aim each call by `entity`, CSS `selector` (both resolved ' +
+      'on-device) or screenshot pixel `x`/`y` (take a device_screenshot first) — the same aiming as ' +
+      'device_tap. Only the `down` is refused when its target is covered (`allowOccluded` overrides); a ' +
+      'move/up goes to whatever captured the press. move/up reuse the button from the down; a move/up with ' +
       'nothing held, or a down while already held, is REFUSED rather than silently re-pressing/re-aiming. ' +
       'Always dispatches synthetic DOM events, never OS-level trusted input — this op is not ' +
       'routed through the trusted paths on either platform (#32), and says so on every reply. ' +
@@ -1562,34 +1736,39 @@ export function registerTools(server: McpServer) {
       'landed: `dom:<element>` when it went to DOM UI, `canvas:<how>` when it went to the game surface.',
     {
       action: z.enum(POINTER_ACTIONS).describe("'down' press+hold, 'move' re-aim the held pointer, 'up' release."),
-      selector: z.string().optional().describe('CSS selector to aim at (resolved on-device; refuses if occluded). Preferred.'),
-      x: z.number().optional().describe('X (screenshot pixels) — used when no selector.'),
-      y: z.number().optional().describe('Y (screenshot pixels) — used when no selector.'),
+      entity: makeDeviceEntitySpec().optional(),
+      selector: z.string().optional().describe('CSS selector to aim at (resolved on-device; refuses if occluded). Preferred for DOM targets.'),
+      x: z.number().optional().describe('X (screenshot pixels) — used when no entity or selector.'),
+      y: z.number().optional().describe('Y (screenshot pixels) — used when no entity or selector.'),
       button: z.enum(MOUSE_BUTTONS).optional().describe("Mouse button for 'down' (default 'left'); ignored on move/up (the held button is reused)."),
+      allowOccluded: z.boolean().optional().describe(`${DEVICE_ALLOW_OCCLUDED} Applies to action:'down' only — a move/up is delivered to whatever captured the press.`),
     },
-    async ({ action, selector, x, y, button }) => {
-      if (!selector && (x == null || y == null)) {
+    async ({ action, entity, selector, x, y, button, allowOccluded }) => {
+      const resolvable = hasEntityAim(entity) || !!selector;
+      if (!resolvable && (x == null || y == null)) {
         return deviceFail({
           code: 'REFUSED_BY_OP',
           tool: 'device_pointer',
           what: `pointer ${action} on the device with no usable aim`,
-          why: 'no `selector` was given and the coordinates were incomplete, so there is nowhere to aim. Guessing a point would act on something arbitrary and report success.',
-          got: { action, selector, x, y },
-          expected: 'either selector:"<css>" (preferred) or BOTH x and y in screenshot pixels',
+          why: 'no `entity` or `selector` was given and the coordinates were incomplete, so there is nowhere to aim. Guessing a point would act on something arbitrary and report success.',
+          got: { action, entity, selector, x, y },
+          expected: 'entity:{guid|name, surface} or selector:"<css>" (preferred), or BOTH x and y in screenshot pixels',
         });
       }
-      const aim = `pointer ${action} ${selector ? `selector ${JSON.stringify(selector)}` : `(${x},${y})`} on the device`;
+      const aim = `pointer ${action} ${describeDeviceAim({ entity, selector, x, y })} on the device`;
       try {
-        const scale = await coordScaleOrRefusal('device_pointer', `pointer ${action} at (${x},${y}) on the adb-connected device`, !!selector);
+        const scale = await coordScaleOrRefusal('device_pointer', `pointer ${action} at (${x},${y}) on the adb-connected device`, resolvable);
         if ('content' in scale) return scale;
-        const params = selector ? { action, selector } : { action, x, y, ...(scale.screenInfo ? { screenInfo: scale.screenInfo } : {}) };
+        const params = resolvable
+          ? { action, ...aimWire(entity, selector), ...(allowOccluded !== undefined ? { allowOccluded } : {}) }
+          : { action, x, y, ...(scale.screenInfo ? { screenInfo: scale.screenInfo } : {}) };
         const reply = await deviceRequest('pointer', { ...params, ...(button && action === 'down' ? { button } : {}) });
         // The device signals "nothing held" / "already held" / a selector miss the same way every
         // other Enact op does — an `Error: …` reply, not a thrown error (F9/F15's convention).
         if (isDeviceError(reply)) {
           return deviceReplyFailure('device_pointer', aim, reply, [
             "a 'move'/'up' with nothing held, or a 'down' while already held, is refused rather than acting on a stray/duplicate gesture",
-            'a selector miss or an OCCLUDED target is refused rather than pressing something else — re-read the screen and aim again',
+            'a miss or an OCCLUDED target is refused rather than pressing something else — re-read the screen and aim again',
           ]);
         }
         return { content: [{ type: 'text' as const, text: `Pointer ${action} — ${String(reply)}` }] };
@@ -1614,7 +1793,7 @@ export function registerTools(server: McpServer) {
     async ({ name, payload, targetGuid, params }) => {
       try {
         const sent = { name, ...(payload !== undefined ? { payload } : {}), ...(targetGuid ? { targetGuid } : {}), ...(params ? { params } : {}) };
-        const parsed = parseReply<{ dispatched?: boolean; ok?: boolean; reason?: string }>(await deviceRequest('dispatch-action', sent));
+        const parsed = parseReply<{ dispatched?: boolean; ok?: boolean; reason?: string; code?: string }>(await deviceRequest('dispatch-action', sent));
         const what = `dispatch the action "${name}" on the device`;
         if (isDeviceError(parsed)) {
           return deviceReplyFailure('device_dispatch_action', what, parsed, [
@@ -1626,7 +1805,8 @@ export function registerTools(server: McpServer) {
         const failed = parsed && typeof parsed === 'object' && (parsed.dispatched === false || parsed.ok === false);
         if (failed) {
           return deviceFail({
-            code: 'REFUSED_BY_OP',
+            // The op's own code when it named one (a stale targetGuid is NOT_FOUND, #1223); else the generic refusal.
+            code: typeof parsed.code === 'string' && (ERROR_CODES as readonly string[]).includes(parsed.code) ? parsed.code as ErrorCode : 'REFUSED_BY_OP',
             tool: 'device_dispatch_action',
             what,
             why: `the action was NOT dispatched${parsed.reason ? `: ${parsed.reason}` : ' and the device gave no reason'}. Nothing happened in the game.`,
@@ -1651,7 +1831,8 @@ export function registerTools(server: McpServer) {
       'guid (one or an array) / name (exact; ambiguous names are REFUSED) / id. `set` keys are ' +
       '"Trait.field", the same addressing `where` uses, or a bare "TagTrait": true|false to add/remove ' +
       'a tag. LIVE WORLD ONLY: nothing is written to disk and there is no undo stack — a relaunch is ' +
-      'the undo. An unknown trait/field refuses the WHOLE call with nothing applied; a selector ' +
+      'the undo. A field write on a trait the entity lacks ADDS the trait, as the editor does, and the ' +
+      'reply lists it in `addedTraits:[{id, guid, trait}]`. An unknown trait/field refuses the WHOLE call with nothing applied; a selector ' +
       'matching zero entities is an error, not a silent success. Verify with device_get_scene_state ' +
       '(the reply already includes per-entity before/after). For a selection too complex for one ' +
       'where-clause, device_eval can filter in JS and pass the guid array here.',
@@ -1659,7 +1840,7 @@ export function registerTools(server: McpServer) {
       where: z.string().optional().describe('Filter: "Trait.field <op> value" (ops = != > >= < <= ~), the same grammar device_get_scene_state takes. Matching MANY entities is intended.'),
       guid: z.union([z.string(), z.array(z.string())]).optional().describe('Stable guid, or an array of them. The array form is what lets device_eval read → filter in JS → write in one body.'),
       name: z.string().optional().describe('Exact entity name. A name matching several entities is REFUSED (never first-matched) — use guid or where instead.'),
-      id: z.number().optional().describe('Live entity id. Reassigned on every scene reload — prefer guid.'),
+      id: z.number().optional().describe('Live entity id — only for an entity with no guid; one that has a guid is refused with the guid to use.'),
       set: z.record(z.string(), z.any()).describe('{"Trait.field": value} to write a field, or {"TagTrait": true|false} to add/remove a tag trait. e.g. {"Renderable3D.isVisible": false}'),
       dryRun: z.boolean().optional().describe('Report what WOULD change and change nothing — use it to confirm a broad `where` selects what you meant.'),
       limit: z.number().optional().describe('Cap on per-entity before/after detail rows (default 20). The matched/changed COUNTS are always exact.'),
@@ -1729,9 +1910,9 @@ export function registerTools(server: McpServer) {
       'than producing an entity whose renderer resolves to nothing. Live only: nothing is written ' +
       'to disk and a relaunch is the undo. Verify with device_get_scene_state.',
     {
-      spec: z.record(z.string(), z.any()).describe('What to create, e.g. {kind:"primitive", mesh:"sphere"} or {kind:"2d", shape:"square"} or {kind:"ui", preset:"button"}. kind:"primitive" defaults mesh to "sphere"; kind:"2d" defaults shape to "square".'),
+      spec: makeDeviceCreateEntitySpec().describe(`What to create, e.g. {kind:"primitive", mesh:"sphere"} or {kind:"2d", shape:"square"} or {kind:"ui", preset:"button"}. kind is one of ${vocabularyProse(CREATE_ENTITY_KINDS)}; primitive takes mesh, 2d shape, ui preset, light light, and every other kind nothing. A key its kind does not take is REFUSED, not ignored — a typo would otherwise build the default entity.`),
       parentGuid: z.string().optional().describe('Stable guid of the parent. Preferred over parentId — a stale id would orphan the new entity.'),
-      parentId: z.number().optional().describe('Live parent id (0 = root). Validated; reassigned on scene reload, so prefer parentGuid.'),
+      parentId: z.number().optional().describe('Live parent id (0 = root). Only for a parent with no guid — use parentGuid.'),
     },
     async ({ spec, parentGuid, parentId }) => writeCall('device_create_entity', 'create-entity', {
       spec, ...(parentGuid !== undefined ? { parentGuid } : {}), ...(parentId !== undefined ? { parentId } : {}),
@@ -1749,7 +1930,7 @@ export function registerTools(server: McpServer) {
       'a relaunch is the undo. Measure the effect with device_profiler or device_diagnose.',
     {
       guid: z.string().optional().describe('Stable guid of the entity to copy. Preferred — an id can be recycled by a scene reload and name a different entity.'),
-      id: z.number().optional().describe('Live id of the entity to copy. Prefer guid.'),
+      id: z.number().optional().describe('Live id of the entity to copy — only for an entity with no guid. Use guid.'),
       count: z.number().optional().describe('How many copies to make (default 1, max 1000). This is the knob for a load test.'),
     },
     async ({ guid, id, count }) => writeCall('device_duplicate_entity', 'duplicate-entity', {
@@ -1763,11 +1944,13 @@ export function registerTools(server: McpServer) {
     'Delete live entities ON THE DEVICE — the other half of a "does this cost anything?" ' +
       'experiment. Takes guids (preferred) or ids. If ANY ref does not resolve, NOTHING is deleted ' +
       'and the reply names the misses: a partial delete would leave you unable to tell which ' +
-      'entities are now gone. Live only — a relaunch restores the scene.',
+      'entities are now gone. DESCENDANTS GO TOO: `deleted` lists the guids you named (`deletedNoGuidIds` ' +
+      'for one with no guid) and `alsoDeleted` the descendants taken with them (the first 100, with ' +
+      '`alsoDeletedTotal` when there were more) — the same shape as modoki_delete_entities. Live only — a relaunch restores the scene.',
     {
       guids: z.array(z.string()).optional().describe('Stable guids to delete. Preferred over ids.'),
       guid: z.string().optional().describe('A single stable guid to delete.'),
-      ids: z.array(z.number()).optional().describe('Live ids to delete. Reassigned on scene reload — a recycled id can name a DIFFERENT entity, so prefer guids.'),
+      ids: z.array(z.number()).optional().describe('Live ids to delete — only for entities with no guid; an id for one that has a guid refuses the call. Use guids.'),
       id: z.number().optional().describe('A single live id to delete.'),
     },
     async ({ guids, guid, ids, id }) => writeCall('device_delete_entities', 'delete-entities', {
@@ -1893,22 +2076,44 @@ export function registerTools(server: McpServer) {
       'twin of modoki_handles and the input twin of device_layout_bounds. Called BARE it returns ' +
       'counts (byEditor/byKind); pass a filter to get geometry. A filtered call that matches nothing ' +
       'names what IS live rather than returning a bare empty list, so a typo cannot read as a ' +
-      'correct negative answer.',
+      'correct negative answer. A shipped game has no authoring editors: its handles are the ones the ' +
+      'game registers, plus `chrome` — every `data-ui-id` element in its DOM.',
     {
-      editor: z.string().optional().describe('Filter to one editor/provider, e.g. "collider2d", "skin".'),
-      kind: z.string().optional().describe('Filter to one handle kind, e.g. "collider-vertex", "keyframe".'),
-      ids: z.array(z.string()).optional().describe('Restrict to these handle ids.'),
+      editor: z.string().optional().describe('Filter to one editor/provider, e.g. "chrome", or one the game registers.'),
+      kind: z.string().optional().describe('Filter to one handle kind, e.g. "button".'),
+      ids: z.union([z.string(), z.array(z.string())]).optional().describe('Handle ids to restrict to — a list, or one comma-separated string (the form modoki_handles takes; both surfaces take both).'),
+      prefix: z.string().optional().describe('Restrict to ids starting with this, e.g. "hud." — chrome ids are the elements\' data-ui-id values.'),
+      label: z.string().optional().describe('Restrict to handles whose WHOLE label matches (whitespace-collapsed, case-insensitive; not a substring) — the rule modoki_handles uses.'),
     },
-    async ({ editor, kind, ids }) => perceptCall('device_handles', 'enact-handles', {
-      ...(editor !== undefined ? { editor } : {}),
-      ...(kind !== undefined ? { kind } : {}),
-      ...(ids !== undefined ? { ids } : {}),
-    }),
+    async ({ editor, kind, ids, prefix, label }) => {
+      const filter = {
+        ...(editor !== undefined ? { editor } : {}), ...(kind !== undefined ? { kind } : {}),
+        ...(parseHandleIds(ids) ? { ids: parseHandleIds(ids) } : {}),
+        ...(prefix !== undefined ? { prefix } : {}), ...(label !== undefined ? { label } : {}),
+      };
+      // Shaped exactly as the editor route shapes modoki_handles (#1216 C-14): the op answers every
+      // handle, and this tool used to pass that through — its own description's counts-only bare call
+      // and filter-miss naming existed only on the editor side.
+      return perceptCall('device_handles', 'enact-handles', filter, undefined, async (parsed) => {
+        const ignored = ignoredHandleFilter(parsed as HandlesResponse, filter);
+        if (ignored) {
+          return { fail: deviceFail({
+            code: 'NOT_AVAILABLE_HERE', tool: 'device_handles', what: 'list the handles on the device',
+            why: `the device app ignored \`${ignored}\` — it answered handles that do not match it, so this build predates the op's prefix/label filters. Its list is not a filtered answer.`,
+            options: ['filter by editor/kind/ids, which every build honours', 'rebuild and reinstall the app from this checkout'],
+          }) };
+        }
+        return { value: await shapeHandlesReply(parsed as HandlesResponse, filter,
+          async () => parseReply<HandlesResponse>(await deviceRequest('enact-handles', {})), DEVICE_HANDLES_REMEDIES) };
+      });
+    },
   );
 
   tool('device_invalidate_assets',
-    'Drop cached models/textures on the device so the next frame re-resolves them — the on-device ' +
-      'half of an asset iteration loop. ⚠️ The returned `models`/`textures` counts are the items ' +
+    `Drop cached ${vocabularyProse(INVALIDATABLE_ASSET_TYPES)} assets on the device so the next frame re-resolves them — the on-device ` +
+      'half of an asset iteration loop. (The editor needs no twin: modoki_reimport_asset re-bakes an asset and then ' +
+      'evicts it through this same op, in one call.) ⚠️ The returned ' +
+      '`models`/`textures`/`audio`/`environments` counts are the items ' +
       'ACCEPTED, not the cache entries actually evicted: the underlying invalidate is a void call ' +
       'that no-ops silently on a path nothing has cached, so a typo\'d path still counts. Treat a ' +
       'count as "what I asked for", never as proof something was cached — confirm the effect with ' +
@@ -1916,7 +2121,7 @@ export function registerTools(server: McpServer) {
     {
       items: z.array(z.object({
         path: z.string().describe('Asset path to invalidate.'),
-        type: z.enum(['model', 'texture']).describe('Which cache to drop it from.'),
+        type: z.enum(INVALIDATABLE_ASSET_TYPES).describe('Which cache to drop it from.'),
       })).describe('The assets to invalidate.'),
     },
     async ({ items }) => writeCall('device_invalidate_assets', 'invalidate-assets', { items },
@@ -2025,9 +2230,9 @@ export function registerTools(server: McpServer) {
  *  the action landed at the wrong point and answered ok. Extracted so the four tools cannot drift
  *  again — the divergence existed because each wrote its own version. */
 async function coordScaleOrRefusal(
-  tool: string, what: string, bySelector: boolean,
+  tool: string, what: string, resolvable: boolean,
 ): Promise<{ screenInfo: { imgW: number; imgH: number; nativeW: number; nativeH: number } | null } | DeviceToolResult> {
-  if (bySelector) return { screenInfo: null }; // a selector resolves on-device; no scale needed
+  if (resolvable) return { screenInfo: null }; // an entity or selector resolves on-device; no scale needed
   const info = await currentScreenInfo();
   if (!info && await leaseUsesAdb()) {
     return deviceFail({
@@ -2037,7 +2242,7 @@ async function coordScaleOrRefusal(
       why: 'no screenshot scale is available for this lease, and an adb device has none of its own — the coordinates would be sent unscaled and the action would land somewhere else. Nothing was sent.',
       options: [
         'take a device_screenshot first: it measures the framebuffer and stamps the scale for this lease',
-        'aim by `selector` instead — it resolves on-device and needs no scale at all',
+        'aim by `entity` or `selector` instead — both resolve on-device and need no scale at all',
       ],
     });
   }
@@ -2046,30 +2251,35 @@ async function coordScaleOrRefusal(
 
   tool('device_hover',
     'Hover the pointer over a target on the device (pointerover/enter/move) so :hover styles, ' +
-      'tooltips, and hover-gated UI activate. Aim by CSS `selector` (resolved on-device) or ' +
-      'screenshot pixel `x`/`y`. Trusted-CDP on Android when a session is reachable; on iOS this ' +
+      'tooltips, and hover-gated UI activate. Aim by `entity` ({guid}|{name}, plus `surface` for a ' +
+      '2D/3D entity), CSS `selector` (both resolved on-device, refused when covered unless ' +
+      '`allowOccluded`) or screenshot pixel `x`/`y`. Trusted-CDP on Android when a session is reachable; on iOS this ' +
       'stays SYNTHETIC by design — a touchscreen has no hover state to deliver (#32). Check ' +
       'device_status\'s input-mechanism line to know which.',
     {
-      selector: z.string().optional().describe('CSS selector to hover (preferred).'),
-      x: z.number().optional().describe('X (screenshot pixels) — used when no selector.'),
-      y: z.number().optional().describe('Y (screenshot pixels) — used when no selector.'),
+      entity: makeDeviceEntitySpec().optional(),
+      selector: z.string().optional().describe('CSS selector to hover (preferred for DOM targets).'),
+      x: z.number().optional().describe('X (screenshot pixels) — used when no entity or selector.'),
+      y: z.number().optional().describe('Y (screenshot pixels) — used when no entity or selector.'),
+      allowOccluded: z.boolean().optional().describe(DEVICE_ALLOW_OCCLUDED),
     },
-    async ({ selector, x, y }) => {
-      if (!selector && (x == null || y == null)) {
+    async ({ entity, selector, x, y, allowOccluded }) => {
+      const resolvable = hasEntityAim(entity) || !!selector;
+      if (!resolvable && (x == null || y == null)) {
         return deviceFail({
           code: 'REFUSED_BY_OP',
           tool: 'device_hover',
           what: 'hover on the device with no usable aim',
-          why: 'no `selector` was given and the coordinates were incomplete, so there is nowhere to hover.',
-          got: { selector, x, y },
-          expected: 'either selector:"<css>" (preferred) or BOTH x and y in screenshot pixels',
+          why: 'no `entity` or `selector` was given and the coordinates were incomplete, so there is nowhere to hover.',
+          got: { entity, selector, x, y },
+          expected: 'entity:{guid|name, surface} or selector:"<css>" (preferred), or BOTH x and y in screenshot pixels',
         });
       }
-      const scale = await coordScaleOrRefusal('device_hover', `hover at (${x},${y}) on the adb-connected device`, !!selector);
+      const scale = await coordScaleOrRefusal('device_hover', `hover at (${x},${y}) on the adb-connected device`, resolvable);
       if ('content' in scale) return scale;
-      return enactCall('device_hover', 'hover',
-        selector ? { selector } : { x, y, ...(scale.screenInfo ? { screenInfo: scale.screenInfo } : {}) }, (r) => r);
+      return enactCall('device_hover', 'hover', resolvable
+        ? { ...aimWire(entity, selector), ...(allowOccluded !== undefined ? { allowOccluded } : {}) }
+        : { x, y, ...(scale.screenInfo ? { screenInfo: scale.screenInfo } : {}) }, (r) => r);
     },
   );
 
@@ -2082,10 +2292,10 @@ async function coordScaleOrRefusal(
   // The zero-delta refusal is S3.15's twin: without it, a scroll with no delta dispatched a
   // zero-delta wheel and answered ok — nothing moved, reported as success.
   tool('device_scroll',
-    'Scroll on the device by dispatching a wheel event. Aim by CSS `selector` or screenshot pixel ' +
-      '`x`/`y` (defaults to viewport center). Positive `deltaY` scrolls down, positive `deltaX` ' +
+    'Scroll on the device by dispatching a wheel event. Aim by `entity`, CSS `selector` or screenshot ' +
+      'pixel `x`/`y` (defaults to viewport center). Positive `deltaY` scrolls down, positive `deltaX` ' +
       'scrolls right; ~120 ≈ one wheel tick. `dx`/`dy` are accepted aliases (the editor twin ' +
-      'modoki_scroll uses deltaX/deltaY, so those are canonical here too). A call whose deltas both ' +
+      'modoki_scroll uses deltaX/deltaY, so those are canonical here too); giving both names is refused. A call whose deltas both ' +
       'resolve to 0 is REFUSED rather than dispatched as a silent no-op. Trusted-CDP on Android when ' +
       'a session is reachable; on iOS this stays SYNTHETIC by design — WebDriverAgent has no wheel ' +
       'action at all (#32). Check device_status\'s input-mechanism line to know which.',
@@ -2094,11 +2304,27 @@ async function coordScaleOrRefusal(
       deltaY: z.number().optional().describe('Vertical wheel delta (default 0; positive = down). Canonical name — same as modoki_scroll.'),
       dx: z.number().optional().describe('Alias for deltaX, kept for existing callers.'),
       dy: z.number().optional().describe('Alias for deltaY, kept for existing callers.'),
+      entity: makeDeviceEntitySpec().optional(),
       selector: z.string().optional().describe('CSS selector to scroll over.'),
       x: z.number().optional().describe('X (screenshot pixels) — the point to scroll over.'),
       y: z.number().optional().describe('Y (screenshot pixels).'),
+      allowOccluded: z.boolean().optional().describe(DEVICE_ALLOW_OCCLUDED),
     },
-    async ({ deltaX, deltaY, dx, dy, selector, x, y }) => {
+    async ({ deltaX, deltaY, dx, dy, entity, selector, x, y, allowOccluded }) => {
+      // An alias beside its canonical name is refused, not resolved by precedence (#1217, #1223 D1's
+      // rule for two addresses): `deltaX` silently won, so `{deltaX:0, dx:120}` scrolled nothing.
+      const doubled = [deltaX != null && dx != null ? 'deltaX/dx' : null, deltaY != null && dy != null ? 'deltaY/dy' : null]
+        .filter((e): e is string => e !== null);
+      if (doubled.length) {
+        return deviceFail({
+          code: 'AMBIGUOUS',
+          tool: 'device_scroll',
+          what: 'scroll on the device',
+          why: `${doubled.join(' and ')} given together — they are one parameter under two names, so choosing one would ignore the other.`,
+          got: { deltaX, deltaY, dx, dy },
+          options: ['pass deltaX/deltaY (canonical) only'],
+        });
+      }
       const ex = deltaX ?? dx;
       const ey = deltaY ?? dy;
       if (!ex && !ey) {
@@ -2114,12 +2340,15 @@ async function coordScaleOrRefusal(
       // A coordinate-aimed scroll needs the same screenshot->CSS scale a tap does; without it an
       // adb lease scrolls over the wrong point and reports ok. (A scroll with NEITHER selector nor
       // coords is aimed at the viewport centre on-device, which needs no scale.)
-      const byCoords = !selector && (x != null || y != null);
+      const resolvable = hasEntityAim(entity) || !!selector;
+      const byCoords = !resolvable && (x != null || y != null);
       const scale = await coordScaleOrRefusal('device_scroll', `scroll at (${x},${y}) on the adb-connected device`, !byCoords);
       if ('content' in scale) return scale;
       return enactCall('device_scroll', 'scroll', {
         ...(ex != null ? { dx: ex } : {}), ...(ey != null ? { dy: ey } : {}),
-        ...(selector ? { selector } : {}), ...(x != null ? { x } : {}), ...(y != null ? { y } : {}),
+        ...aimWire(entity, selector),
+        ...(resolvable && allowOccluded !== undefined ? { allowOccluded } : {}),
+        ...(!resolvable && x != null ? { x } : {}), ...(!resolvable && y != null ? { y } : {}),
         ...(scale.screenInfo ? { screenInfo: scale.screenInfo } : {}),
       }, (r) => r);
     },

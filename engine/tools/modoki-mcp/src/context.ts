@@ -174,10 +174,14 @@ export function createToolContext(config: { backend: string; token?: string }): 
     // unit tests all happened to use `{error}` bodies, so none of them could see it.
     const detail = ((): string | undefined => {
       if (!body || typeof body !== 'object') return undefined;
-      const b = body as { error?: unknown; errors?: unknown };
+      const b = body as { error?: unknown; errors?: unknown; reason?: unknown };
       if (typeof b.error === 'string' && b.error) return b.error;
       const list = Array.isArray(b.errors) ? b.errors.filter((e): e is string => typeof e === 'string' && !!e) : [];
-      return list.length ? list.join('; ') : undefined;
+      if (list.length) return list.join('; ');
+      // `reason` too, as `isFailureBody` already reads it: an op that answers `{ok:false, code, reason}`
+      // is relayed on its code's 4xx (#994), and reading only error/errors turned `dispatch-action`'s
+      // stale-targetGuid refusal into "answered HTTP 400 with no explanation" (#1223 close-out review).
+      return typeof b.reason === 'string' && b.reason ? b.reason : undefined;
     })();
     // A 404 is TWO different failures and they must not share a code — this is the "could not look
     // vs nothing is there" distinction §5 is built around, and the first cut of this function got

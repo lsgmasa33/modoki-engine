@@ -2,7 +2,7 @@
  *  Renders as DOM overlay (not Canvas) since UI entities are already DOM elements. */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { findEntity, entityDisplayName } from '../../runtime/core/ecs/entityUtils';
+import { findEntity, entityDisplayName, guidOfEntityId } from '../../runtime/core/ecs/entityUtils';
 import { getAllTraits } from '../../runtime/core/ecs/traitRegistry';
 import { markUIDirty, onEditorDirty, useUITreeStore } from '../../runtime/ui/uiTreeStore';
 import { pushAction } from '../undo/undoManager';
@@ -224,7 +224,7 @@ export function UIResizeOverlay({ entityId }: { entityId: number }) {
           x: er.left + er.width * h.fx,
           y: er.top + er.height * h.fy,
           label: h.id,
-          meta: { entityId, handle: h.id, fx: h.fx, fy: h.fy, disabled },
+          meta: { entityId, guid: guidOfEntityId(entityId), handle: h.id, fx: h.fx, fy: h.fy, disabled },
         };
       });
     });

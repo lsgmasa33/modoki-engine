@@ -7,7 +7,7 @@
 #
 # FAILS on ANY of:
 #   - the ECS world never loaded entities — scene-state relays THROUGH the renderer, so
-#     entityCount>0 already proves the renderer mounted and answered
+#     returnedCount>0 already proves the renderer mounted and answered
 #   - a Vite resolve/transform error in the dev-server log (the deterministic signal of the
 #     packaged-cache import failure — shows as a blocking overlay, renderer never mounts)
 #   - a renderer console error (uncaught/unhandledrejection, captured by agentBridge)
@@ -29,7 +29,7 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 # own PROJECT line: Git Bash rewrites paths in ARGUMENTS but never in ENV VARS, and the project
 # reaches the app as MODOKI_PROJECT. A bare `pwd` hands the Windows app `/e/Projects/…`, which it
 # cannot resolve, so it boots perfectly and loads NO SCENE — and this gate then fails with
-# `entityCount=0`, which reads like a broken renderer rather than a bad path. Measured 2026-08-02.
+# `returnedCount=0`, which reads like a broken renderer rather than a bad path. Measured 2026-08-02.
 PROJECT="$(cd "${2:-$REPO/games/3d-test}" && { pwd -W 2>/dev/null || pwd; })"
 # `mktemp -t <prefix>` (no X's) is BSD/macOS syntax. GNU mktemp — which Git Bash ships — REJECTS
 # it ("too few X's in template"), leaving both vars EMPTY and the script failing three lines later
@@ -102,23 +102,23 @@ for i in $(seq 1 60); do
   # is absent on a stock Windows box; worse, Windows ships an App-Execution-Alias STUB at
   # `WindowsApps/python3` that `command -v` FINDS but which only prints "Python was not found" and
   # exits non-zero. The `|| echo 0` then swallowed it, so every poll returned 0 and this gate failed
-  # with `entityCount=0` — reading as a dead renderer rather than a missing interpreter.
-  entities=$(curl -s -m 2 "http://127.0.0.1:$PORT/api/scene-state" 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).entityCount??0))}catch{process.stdout.write("0")}})' 2>/dev/null || echo 0)
+  # with `returnedCount=0` — reading as a dead renderer rather than a missing interpreter.
+  entities=$(curl -s -m 2 "http://127.0.0.1:$PORT/api/scene-state" 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).returnedCount??0))}catch{process.stdout.write("0")}})' 2>/dev/null || echo 0)
   [ "${entities:-0}" -gt 0 ] 2>/dev/null && break
   sleep 1
 done
 sleep 3   # let any renderer-side import/transform error surface after world load
 
 fail=0
-if [ "${entities:-0}" -le 0 ] 2>/dev/null; then echo "[render] FAIL: renderer never answered (entityCount=$entities)"; tail -20 "$APPLOG"; fail=1
-else echo "[render] ok: renderer mounted, scene loaded (entityCount=$entities)"; fi
+if [ "${entities:-0}" -le 0 ] 2>/dev/null; then echo "[render] FAIL: renderer never answered (returnedCount=$entities)"; tail -20 "$APPLOG"; fail=1
+else echo "[render] ok: renderer mounted, scene loaded (returnedCount=$entities)"; fi
 
 # Exclude Vite's self-healing dep-optimizer reload: when the optimizer re-bundles mid-load
 # (e.g. @modoki/engine's Canvas2DMount chunk re-hashes), an in-flight request for the old
 # chunk logs "Pre-transform error: ... which is in the optimize deps directory" and Vite then
-# forces a full page reload — transient, and the renderer still mounts (entityCount proves it).
+# forces a full page reload — transient, and the renderer still mounts (returnedCount proves it).
 # The genuine packaging bug this gate catches ("Failed to resolve import"/"Cannot find module")
-# is NOT self-healing and additionally leaves entityCount=0, so this exclusion keeps it intact.
+# is NOT self-healing and additionally leaves returnedCount=0, so this exclusion keeps it intact.
 VITE_ERR=$(grep -iE "Failed to resolve import|Internal server error|Pre-transform error|Cannot find module" "$VITELOG" 2>/dev/null \
   | grep -viE "which is in the optimize deps directory" | sort -u)
 if [ -n "$VITE_ERR" ]; then echo "[render] FAIL: Vite resolve/transform errors:"; echo "$VITE_ERR" | sed 's/^/    /' | head -10; fail=1

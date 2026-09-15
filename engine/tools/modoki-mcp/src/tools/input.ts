@@ -10,6 +10,7 @@ import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
 import { ALLOW_OCCLUDED_BASE, MODIFIERS_BASE, TIMEOUT_MS_BASE, allowOccludedParam, makeEntitySpec, makeLabelAimParam, makeWithinParam, modifierEnum, makePointSpec } from '../shapes.js';
 import { KEY_ARG_DESCRIPTION, MOUSE_BUTTONS, POINTER_ACTIONS } from '../../../shared/inputVocabulary.js';
+import { parseHandleIds } from '../../../shared/handlesReply.js';
 
 export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
   const { getJson, postJson, evalRenderer, editorAction } = ctx;
@@ -390,7 +391,7 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
         + 'modoki_get_editor_state `skinMode`.',
       ),
       kind: z.string().optional().describe('Filter to one handle kind, e.g. "collider-vertex", "keyframe", "bone-joint".'),
-      ids: z.string().optional().describe('Comma-separated handle ids to restrict to.'),
+      ids: z.union([z.string(), z.array(z.string())]).optional().describe('Handle ids to restrict to — a list, or one comma-separated string. Both surfaces take both forms (device_handles too).'),
       prefix: z.string().optional().describe('Restrict to ids starting with this, e.g. "inspector." or "layout.tab." — chrome ids are <panel>.<region>.<name>.'),
       label: z.string().optional().describe('Restrict to handles whose WHOLE label matches (whitespace-collapsed, case-insensitive; not a substring) — the same rule the `label` aim on modoki_tap uses.'),
     },
@@ -398,7 +399,8 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       const qs = new URLSearchParams();
       if (editor) qs.set('editor', editor);
       if (kind) qs.set('kind', kind);
-      if (ids) qs.set('ids', ids);
+      const idList = parseHandleIds(ids);
+      if (idList) qs.set('ids', idList.join(','));
       if (prefix) qs.set('prefix', prefix);
       if (label) qs.set('label', label);
       const q = qs.toString();

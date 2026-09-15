@@ -56,14 +56,14 @@ describe('encodeEvalResult', () => {
 
 describe('encodeStructuredResult', () => {
   it('encodes a Percept object COMPACTLY (scene-state / diagnose)', () => {
-    // This test previously asserted PRETTY-printing (`'"entityCount": 2'`, 2-space indent) — it was
+    // This test previously asserted PRETTY-printing (`'"returnedCount": 2'`, 2-space indent) — it was
     // pinning the divergence, not a requirement. MCP ships `content[].text` opaquely and the model
     // reads compact JSON identically, so the indentation was ~40% pure overhead on every device
     // Percept response. The editor server has always been compact; both now share one encoder
     // (`engine/tools/shared/mcpResult.ts`, conventions §9).
-    const out = encodeStructuredResult({ entityCount: 2, entities: [{ id: 1, guid: 'g' }] });
-    expect(out).toBe('{"entityCount":2,"entities":[{"id":1,"guid":"g"}]}');
-    expect(JSON.parse(out)).toEqual({ entityCount: 2, entities: [{ id: 1, guid: 'g' }] });
+    const out = encodeStructuredResult({ returnedCount: 2, entities: [{ id: 1, guid: 'g' }] });
+    expect(out).toBe('{"returnedCount":2,"entities":[{"id":1,"guid":"g"}]}');
+    expect(JSON.parse(out)).toEqual({ returnedCount: 2, entities: [{ id: 1, guid: 'g' }] });
   });
 
   it('passes a bare string reply through unquoted', () => {
@@ -130,7 +130,7 @@ describe('perceptCall shares the editor server\'s C7 failure check (conventions 
     // own verdict and wins over a non-empty errors[] (documented partial success, e.g. reimport).
     expect(isFailureBody({ ok: true, warnings: ['3 entities off-screen'] })).toBeNull();
     expect(isFailureBody({ ok: true, errors: ['one asset failed'] })).toBeNull();
-    expect(isFailureBody({ entityCount: 0, entities: [] })).toBeNull();
+    expect(isFailureBody({ returnedCount: 0, entities: [] })).toBeNull();
   });
 });
 

@@ -170,10 +170,13 @@ describe('dumpSceneState — S1 limit + truncated', () => {
     expect(d.truncated).toBe(true);
     expect(d.totalCount).toBeGreaterThan(1);
   });
-  it('omits the truncated flag when under the limit', () => {
+  // #1223 D3 (§2): `totalCount` is present whether or not the limit bit — a total that exists only
+  // when truncation happened cannot be told from "nothing was left out".
+  it('omits the truncated flag when under the limit, and still reports both counts', () => {
     const d = dumpSceneState({ limit: 100000 });
     expect(d.truncated).toBeUndefined();
-    expect(d.totalCount).toBeUndefined();
+    expect(d.totalCount).toBe(d.entities.length);
+    expect(d.returnedCount).toBe(d.entities.length);
   });
 });
 

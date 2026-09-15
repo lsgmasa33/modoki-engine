@@ -14,7 +14,9 @@ export function parseReply<T>(raw: unknown): T {
  *  transport resolves as a normal `result`. Detect that convention so `device_eval`/`device_tap`/
  *  `device_drag` flag `isError` instead of reporting success (F9/F15). */
 export function isDeviceError(v: unknown): v is string {
-  return typeof v === 'string' && (v.startsWith('Error:') || v.startsWith('Unknown method:'));
+  // Not a bare `startsWith`: the backend fronts a synthetic-fallback reply with a banner line, a
+  // refusal included, and the prefix test read every such refusal as a success (#1223 P3).
+  return isDeviceFailureText(v);
 }
 
 // ── device_console_logs reply shape (#644) ─────────────────────────────────
@@ -80,6 +82,7 @@ export function parseNativeLogsReply(raw: unknown): NativeLogsReply {
 // not cost this file the "no MCP-SDK dependency" property its header promises.
 export { describeShape } from '../../shared/mcpResult.js';
 import { describeShape } from '../../shared/mcpResult.js';
+import { isDeviceFailureText } from '../../shared/deviceRefusal.js';
 
 // ── Input fidelity (#32) ──────────────────────────────────────────────────
 // The literals a device_* reply / device_status line can report. Kept as named constants (rather

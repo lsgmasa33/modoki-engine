@@ -25,7 +25,7 @@ import {
 /** A JSON payload whose compact serialization comfortably exceeds `maxChars`. */
 const bigPayload = (entities = 4000) => ({
   scenePath: '/games/3d-test/runtime/assets/scenes/main.json',
-  entityCount: entities,
+  returnedCount: entities,
   entities: Array.from({ length: entities }, (_, i) => ({
     id: i,
     name: `Entity_${i}`,
@@ -44,7 +44,7 @@ describe('encode — compaction', () => {
   });
 
   it('round-trips an under-cap payload byte-for-byte', () => {
-    const data = { scenePath: '/x/main.json', entityCount: 3 };
+    const data = { scenePath: '/x/main.json', returnedCount: 3 };
     expect(JSON.parse(encode(data))).toEqual(data);
   });
 
@@ -79,7 +79,7 @@ describe('encode — the cap never mid-slices JSON', () => {
 
     // `preview` reports shape, never values, and must stay small.
     expect(parsed.preview.entities).toBe('array(4000)');
-    expect(parsed.preview.entityCount).toBe('4000');
+    expect(parsed.preview.returnedCount).toBe('4000');
     expect(JSON.stringify(parsed.preview).length).toBeLessThan(1000);
   });
 

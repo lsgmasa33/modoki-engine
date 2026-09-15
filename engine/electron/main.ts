@@ -1712,20 +1712,21 @@ app.whenReady().then(async () => {
       if (!from || !to || (typeof sampleEntityId !== 'number' && !sampleGuid)) {
         return { kind: 'json', status: 400, body: { error: 'from, to {x,y} and sampleEntityId OR sampleGuid are required' } };
       }
-      // Prefer the GUID (stable across hot-reloads) — resolve it via a where query each
-      // sample; fall back to the numeric id. (For general non-drag sampling use modoki_watch.)
-      const sampleParams = sampleGuid
-        ? { where: `EntityAttributes.guid=${sampleGuid}`, trait: 'Transform' }
-        : { id: sampleEntityId, trait: 'Transform' };
-      // Prove the sample target RESOLVES before dragging. It used to return {ok:true} with a
-      // trajectory of empty samples for a guid that matched nothing — so a typo, or a guid
-      // from a previous scene / a stale get_scene_state, read as "the drag produced no
-      // motion" (a real gameplay finding) rather than "you sampled a phantom". The whole
-      // point of this tool is tuning feel against a numeric trajectory. (C7)
-      const probe = (await requestRenderer('scene-state', sampleParams)) as { entityCount?: number } | null;
-      if (!probe?.entityCount) {
-        return { kind: 'json', status: 404, body: { error: `sample target ${sampleGuid ? `guid '${sampleGuid}'` : `id ${sampleEntityId}`} matched no entity in the live world — nothing to sample, so the trajectory would be empty. Re-read it with get_scene_state (guids are stable; ids are reassigned on every scene reload).` } };
+      // Name the sample target through the shared resolver BEFORE dragging (#1223): exactly one of
+      // sampleGuid/sampleEntityId, `sampleEntityId` only for an entity with no guid, and a stale runtime
+      // guid named as such. It used to return {ok:true} with a trajectory of empty samples for a guid
+      // that matched nothing — so a typo, or a guid from a previous scene / a stale get_scene_state, read
+      // as "the drag produced no motion" (a real gameplay finding) rather than "you sampled a phantom".
+      // The whole point of this tool is tuning feel against a numeric trajectory. (C7)
+      const target = (await requestRenderer('resolve-entity', { guid: sampleGuid, id: sampleEntityId })) as
+        { ok?: boolean; id?: number; guid?: string | null; code?: string; error?: string; options?: string[]; stale?: string } | null;
+      if (!target?.ok) {
+        const refusal = target ?? { error: 'no editor renderer answered — nothing to sample.' };
+        return { kind: 'json', status: refusal.code === 'NOT_FOUND' || !target ? 404 : 400, body: { ...refusal, ok: false } };
       }
+      // Sample by the RESOLVED guid (the `guid` filter follows a runtime guid a save re-minted); by id
+      // only for the guid-less entity the resolver let through. (For general non-drag sampling use modoki_watch.)
+      const sampleParams = target.guid ? { guid: target.guid, trait: 'Transform' } : { id: target.id, trait: 'Transform' };
       // capture_gesture measures the trajectory the drag PRODUCES — which only happens while the sim
       // runs. A Stopped/Paused game returns ok:true with a flat trajectory that reads exactly like a
       // real "the object didn't track the drag" finding. Guard it symmetrically with the phantom-guid

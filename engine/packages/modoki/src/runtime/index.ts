@@ -267,12 +267,12 @@ export { suggestBones, type SuggestBonesOptions } from './skinning/rig2dAutoBone
 export { buildRig2D, autoRig2D, type BuildRig2DOptions, type AutoRig2DOptions } from './skinning/rig2dBuild';
 export { paintWeights, boneWeightField, dominantBoneField, type PaintWeightsOptions, type PaintWeightsResult } from './skinning/rig2dWeightPaint';
 export {
-  findEntity, getEntityTraits, readTraitData, readTraitDataFull, writeTraitField,
+  findEntity, guidOfEntityId, getEntityTraits, readTraitData, readTraitDataFull, writeTraitField,
   getAllEntities, entityDisplayName, buildEntityTree, deleteEntity, deleteEntities, deriveLayer,
   onStructureDirty, markStructureDirty, getStructureVersion,
   type EntityInfo,
 } from './core/ecs/entityUtils';
-export { findEntityById, findEntityByGuid, registerEntity, spawnEntity, unregisterEntity, destroyEntity } from './core/ecs/world';
+export { findEntityById, findEntityByGuid, registerEntity, spawnEntity, unregisterEntity, destroyEntity, classifyRuntimeGuidMiss, saltRuntimeGuidGeneration, type RuntimeGuidStale } from './core/ecs/world';
 // Per-entity state keyed so a recycled index cannot inherit it (#868). Exported for games (#1198, owner
 // ruling): a game fixes an id-keyed map the engine's way, not with a hand-rolled `entity.valueOf()`.
 export { EntityTable, packedOf, isPackedAlive, type PackedEntity, type EntityTableOptions } from './core/ecs/entityTable';

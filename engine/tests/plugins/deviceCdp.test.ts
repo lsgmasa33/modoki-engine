@@ -5,6 +5,7 @@
  *  `tryDeviceCdpInput` never opens a real socket. Hardware verification (the Samsung actually
  *  receiving a trusted touch) is out of scope for this file — see the plan doc. */
 
+import { decodeDeviceRefusal, isDeviceFailureText } from '../../tools/shared/deviceRefusal';
 import { describe, it, expect, vi } from 'vitest';
 import { found } from '@modoki/engine/testing/inOrder';
 import { aimAsResolved } from '../../plugins/backend/deviceAim';
@@ -142,6 +143,17 @@ function depsWithSession(session: DeviceCdpSession | null, proxy: CdpRouteDeps['
 }
 
 describe('synthFallbackBanner — a fallback must be impossible to skim past', () => {
+  /** #1223 P3 review: the device MCP finds a refusal UNDER this banner by reading the line after it,
+   *  so the banner must be ONE line. A WDA reason can carry a newline (`withLaunchWarning`), and a
+   *  refused synthetic tap under it was reported as a success. Built from the real banner and the
+   *  router's own `${banner}\n${reply}` join, not a hand-written stand-in. */
+  it('stays one line when the reason has a newline, so a refusal under it is still a failure', () => {
+    const banner = synthFallbackBanner('WebDriverAgent has been starting for 12s\n⚠️ could not confirm which phone it launched on');
+    expect(banner).not.toContain('\n');
+    expect(isDeviceFailureText(`${banner}\nError: tap: no LIVE entity`)).toBe(true);
+    expect(isDeviceFailureText(`${banner}\nok (tap) @ css(1,2)`)).toBe(false);
+  });
+
   // The owner's call (2026-08-02): keep the fallback rather than refusing, but make it LOUD. The
   // pre-existing ` [input:synthetic]` marker sits at the END of a long reply, which is exactly how
   // an agent ends up believing a fidelity-sensitive check passed on a weaker mechanism.
@@ -229,6 +241,31 @@ describe('tryDeviceCdpInput — routing choice (#32 Phase 1)', () => {
     const r = await tryDeviceCdpInput('tap', { x: 1, y: 2 }, depsWithSession(sender as unknown as DeviceCdpSession, proxy));
     expect(r).toEqual({ handled: false, reason: STALE_APP_REASON });
     expect(sender.calls).toEqual([]); // nothing dispatched
+  });
+
+  /** #1223 P3: an entity aim's refusal names its code, options and `stale`. The page answers
+   *  `resolve-aim` with an OBJECT, and this decode used to keep only `error` — so the trusted route,
+   *  the one every Android and WDA tap takes, dropped exactly the fields the synthetic path carried. */
+  it('WIRE SHAPE: an object refusal keeps code/options/stale in the reply tail', async () => {
+    const sender = fakeSender();
+    const proxy = async () => JSON.stringify({ error: 'Error: entity: 2 LIVE entities are named "Enemy"', code: 'AMBIGUOUS', options: ['g-a', 'g-b'], stale: 'despawned' });
+    const r = await tryDeviceCdpInput('tap', { entity: { name: 'Enemy' } }, depsWithSession(sender as unknown as DeviceCdpSession, proxy));
+    expect(r.handled).toBe(true);
+    const reply = (r as { reply: string }).reply;
+    expect(reply.startsWith('Error: entity: 2 LIVE')).toBe(true);
+    expect(decodeDeviceRefusal(reply)).toMatchObject({ code: 'AMBIGUOUS', options: ['g-a', 'g-b'], stale: 'despawned' });
+    expect(sender.calls).toEqual([]);
+  });
+
+  it('WIRE SHAPE: an object refusal with a code outside the closed set carries no code', async () => {
+    const sender = fakeSender();
+    const proxy = async () => JSON.stringify({ error: 'Error: tap: nope', code: 'BOGUS', stale: 'despawned' });
+    const r = await tryDeviceCdpInput('tap', { entity: { name: 'X' } }, depsWithSession(sender as unknown as DeviceCdpSession, proxy));
+    const reply = (r as { reply: string }).reply;
+    // On the RAW wire: the MCP's decoder drops an unknown code by itself, so decoding here could not
+    // tell whether THIS hop let it through to an older reader that trusts the tail.
+    expect(reply).not.toContain('BOGUS');
+    expect(decodeDeviceRefusal(reply)).toEqual({ message: 'Error: tap: nope', stale: 'despawned' });
   });
 
   it('WIRE SHAPE: a bare Error string from the page is a refusal, reported verbatim', async () => {

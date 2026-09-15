@@ -452,6 +452,8 @@ const LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
     reason: 'per-world-index: Allocated fresh by each buildEntityIndex call (parentId -> name -> id) and used only within the calling pass; no caller keeps an index across frames; core/ecs/entityIndex.ts:39' },
   { item: 'core/ecs/world.ts::RuntimeAddresses.entityOf',
     reason: 'not-entity: Keyed by a runtime-guid ORDINAL (a per-world spawn counter that is never reused), not an entity id; the value is re-checked with isAlive() on every lookup and the row is deleted by unregisterEntity; the whole table is per-World in a WeakMap; core/ecs/world.ts' },
+  { item: 'core/ecs/world.ts::issuedGenerations',
+    reason: 'not-entity: Holds runtime-guid GENERATIONS (one per World, from a module counter that only increments), never an entity id; read only by classifyRuntimeGuidMiss to call a miss stale (#1223); core/ecs/world.ts' },
   { item: 'core/ecs/transformPropagationSystem.ts::worldTransforms',
     reason: 'despawn-evicted: onRemove(Transform), and the eviction forces the next pass past the unchanged short-circuit; cleared on world swap; pinned by tests/runtime/transformPropagationIdReuse.test.ts; core/ecs/transformPropagationSystem.ts' },
   { item: 'core/ecs/transformPropagationSystem.ts::deactivatedEntities',

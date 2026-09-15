@@ -144,7 +144,8 @@ describe('set-traits: every "did not happen" is a surfaced failure', () => {
 
     expect(r.ok).toBe(false);
     expect(r.matched).toBe(2);
-    expect(r.error).toMatch(/matched 2 entities/i);
+    expect(r.error).toMatch(/2 LIVE entities are named/);
+    expect(r.options).toEqual(['a', 'b']); // the guids, the address this refusal asks for
     expect((await transforms()).every((e) => e.traits.Transform.x === 1)).toBe(true);
   });
 

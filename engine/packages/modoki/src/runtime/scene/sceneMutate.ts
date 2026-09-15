@@ -85,6 +85,13 @@ export interface ApplyResult {
    *  reason; both mutate paths now do too. Omitted (absent, not `[]`) when nothing was created, so
    *  a caller can't mistake "no adds in this batch" for "the add produced nothing". */
   created?: Array<{ op: number; id: number; guid: string; name: string }>;
+  /** A trait an entity did NOT have, added because a `setTrait` set fields on it (#1216 C-12, #1223 D6):
+   *  `{op, id, guid, trait}` in op order — the same row as the live path's. `changed:1` alone could not tell a field write from a new component,
+   *  and a typo'd trait name that happens to be registered lands as a whole new trait. A no-fields
+   *  `setTrait` (a tag) is not listed — adding is what it asked for. Absent when nothing was added.
+   *  ⚠️ Only for an entity whose own `traits` are written: a prefab-instance root writes an override,
+   *  and whether the PREFAB carries the trait is not visible from this file. */
+  addedTraits?: Array<{ op: number; id: number; guid: string | undefined; trait: string }>;
   /** Hard errors (entity not found, malformed op). Non-empty means some ops
    *  were skipped — the caller decides whether to still write. */
   errors: string[];
@@ -105,6 +112,7 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
   const warnings: string[] = [];
   const unresolved: EntityRef[] = [];
   const created: Array<{ op: number; id: number; guid: string; name: string }> = [];
+  const addedTraits: NonNullable<ApplyResult['addedTraits']> = [];
   let changed = 0;
   // FIRST resolveEntity failure's code, if any op hit one — see `ApplyResult.code`.
   const codeOut: { code?: EntityResolveCode } = {};
@@ -150,6 +158,7 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
             if ('error' in converted) { errors.push(`${where}: ${converted.error}`); continue; }
             write = converted.fields;
           }
+          if (existing === undefined && container === entity.traits) addedTraits.push({ op: i, id: entity.id, guid: entityGuid(entity), trait: op.trait });
           container[op.trait] = { ...base, ...write };
           changed++;
         }
@@ -257,9 +266,10 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
     }
     changed = 0;
     created.length = 0; // nothing is written, so nothing was created
+    addedTraits.length = 0; // …and no trait was added to anything
   }
 
-  return { scene, changed, errors, warnings, unresolved, ...(created.length ? { created } : {}), ...(codeOut.code ? { code: codeOut.code } : {}) };
+  return { scene, changed, errors, warnings, unresolved, ...(created.length ? { created } : {}), ...(addedTraits.length ? { addedTraits } : {}), ...(codeOut.code ? { code: codeOut.code } : {}) };
 }
 
 /** Scan surviving entities for entity-ref fields that still point at a removed guid.
@@ -286,8 +296,19 @@ function flagDanglingRefs(scene: MutableScene, removedGuids: Set<string>, warnin
  *  an out-param rather than a return value so every existing `if (!entity) continue;` call site
  *  stays unchanged. */
 function resolveEntity(scene: MutableScene, ref: EntityRef, errors: string[], where: string, unresolved?: EntityRef[], codeOut?: { code?: EntityResolveCode }): MutableEntity | null {
-  if (!ref || (ref.id == null && !ref.name && !ref.guid)) {
+  // The live resolver's rules (`app/debug/entityRef.ts`, #1223), applied to the FILE: an empty string is
+  // absent, and more than one address is refused rather than resolved by precedence. This path used to
+  // let `id` win over a `guid` given beside it, the opposite of the live path, so the same ref named
+  // different entities depending on the persistence mode. (`id` here is the FILE's authored id, not a
+  // runtime one, so the live path's id-only-for-a-guid-less-entity rule does not apply.)
+  const given = ref ? ([ref.id != null ? 'id' : '', ref.guid ? 'guid' : '', ref.name ? 'name' : ''].filter(Boolean)) : [];
+  if (given.length === 0) {
     errors.push(`${where}: entity ref needs an id, name, or guid`);
+    return null;
+  }
+  if (given.length > 1) {
+    errors.push(`${where}: ${given.map((k) => `{${k}}`).join(' | ')} given together — pass exactly one. Two addresses can name two different entities.`);
+    if (codeOut && codeOut.code === undefined) codeOut.code = 'AMBIGUOUS';
     return null;
   }
   let matches: MutableEntity[];

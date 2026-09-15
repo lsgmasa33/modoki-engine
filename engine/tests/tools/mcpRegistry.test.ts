@@ -486,6 +486,34 @@ describe('the real registered surface', () => {
     }
   });
 
+  // #1223: an empty flat `guid` is ABSENT, as in the live resolver, so it does not conflict with a nested
+  // ref. Mutation: in foldEntityRef, filter the flat side on `!== undefined` alone.
+  it('an EMPTY flat guid beside a nested entity is one address, not a conflict', async () => {
+    const s2 = loadSurface();
+    try {
+      const r = await s2.call('modoki_focus_entity', { guid: '', entity: { guid: 'g-1' } });
+      expect(s2.text(r)).not.toMatch(/both `entity` and the flat/);
+      const sent = s2.requests.find((q) => q.path.startsWith('/api/editor-action'));
+      expect(sent?.body).toMatchObject({ guid: 'g-1' });
+    } finally { s2.restore(); }
+  });
+
+  // #1223: the other two nested entity refs were NOT strict, so a typo'd key was stripped and the call
+  // went out with an empty or partial ref. Mutation: drop `.strict(…)` from makeEntitySpec / set_transform's entity.
+  it('the aimed-input `entity` and set_transform `entity` are STRICT too', async () => {
+    const cases: Array<[string, Record<string, unknown>, RegExp]> = [
+      ['modoki_tap', { entity: { guid: 'g-1', surfce: 'game-3d' } }, /accepts only: guid, name, id, surface, allowOccluded/],
+      ['modoki_set_transform', { entity: { gid: 'g-1' }, space: 'local', position: [1, 2, 3] }, /accepts only: guid, name, id/],
+    ];
+    for (const [name, args, why] of cases) {
+      const s2 = loadSurface();
+      try {
+        await expect(s2.call(name, args), name).rejects.toThrow(why);
+        expect(s2.requests.filter((q) => !q.path.startsWith('/api/identity') && !q.path.startsWith('/api/editor-state')), `${name} must refuse BEFORE acting`).toEqual([]);
+      } finally { s2.restore(); }
+    }
+  });
+
   it('the alias folds `id: 0` — the ROOT entity — rather than reading it as "no address"', async () => {
     // `foldEntityRef` filters the flat side on `!== undefined`, not truthiness. Under a truthiness
     // test `{id: 0}` reads as absent, so a caller passing BOTH `id:0` and an `entity` would get the
@@ -594,7 +622,15 @@ describe('the real registered surface', () => {
   // sentences rewritten to say what the tool does, and set_gizmo/focus_entity naming their
   // read-back. The first-sentence rewrites REMOVED bytes (two issue numbers, a changelog clause);
   // the sibling pointers are the spend.
-  const DEFINITION_BYTES = 162_505;
+  // 2026-09-15 (#1223 P1–P5 close-out, work-ai3): RE-PINNED to 166,674 — measured on the merge of
+  // origin/main into work-ai3 (1346cc513). Neither side crossed alone: main arrived at ~165,057
+  // (work-qa #1215, work-ai2 #1254, inside the headroom), and #1223 adds the rest, booked in
+  // `ledger/work-ai3.csv`. P1–P4: +1,370 across the guid-address and addedTraits/alsoDeleted/handles
+  // descriptions. P5: +222 naming the renamed counts (`returnedCount`/`totalCount`,
+  // `worldEntityTotal`, `entityTotal`) in five tools. And +206 on modoki_mutate_scene and
+  // modoki_prefab, where both sides extended one description. The spend is the breaking renames being
+  // stated where an agent reads them.
+  const DEFINITION_BYTES = 166_674;
   const DEFINITION_HEADROOM = 4_000;
 
   // `sumSchemaBytes` itself now lives in `mcpSurface.ts` (imported above), not here — this ledger

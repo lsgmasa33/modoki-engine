@@ -23,6 +23,7 @@
 
 import { emit } from '../core/journal';
 import { getCurrentWorld, onWorldSwap } from '../core/ecs/world';
+import { guidOfEntityId } from '../core/ecs/entityUtils';
 
 /** Overshoot below this is sub-pixel rounding between two independently laid-out boxes, not a
  *  visible overflow. A measurement epsilon — mechanism, not config. */
@@ -159,6 +160,9 @@ export function uiOverflowKey(n: { guid: string; entityId: number; generation: n
 export interface UIOverflowFinding extends UIOverflowVerdict {
   entityId: number;
   guid: string;
+  /** The box named by guid (#1223): `null` for the UI root (`boxEntityId: 0`) or a box with no guid.
+   *  Set by `recordUIOverflow`, so the journal event carries it as well as `diagnose`. */
+  boxGuid: string | null;
   /** The text as rendered, cut to `TEXT_SNIPPET_CHARS`. */
   text: string;
   /** The UI container's size when it was measured, in CSS px — overflow is a function of it. */
@@ -189,12 +193,13 @@ const _findings = new Map<string, UIOverflowFinding>();
 onWorldSwap(() => _findings.clear());
 
 /** Record a confirmed finding. First sighting per key only — returns false for a repeat. */
-export function recordUIOverflow(key: string, f: Omit<UIOverflowFinding, 'current'>): boolean {
+export function recordUIOverflow(key: string, f: Omit<UIOverflowFinding, 'current' | 'boxGuid'>): boolean {
   if (_findings.has(key)) return false;
   // Rounded once, here, so the console line, the journal event and `diagnose` all quote the same
   // numbers (Percept rounds floats; three surfaces rounding separately would disagree).
   const finding: UIOverflowFinding = {
     ...f,
+    boxGuid: f.boxEntityId === 0 ? null : guidOfEntityId(f.boxEntityId),
     current: true,
     overflowPx: round1(f.overflowPx), availablePx: round1(f.availablePx), textPx: round1(f.textPx),
     viewport: { w: Math.round(f.viewport.w), h: Math.round(f.viewport.h) },
@@ -205,7 +210,7 @@ export function recordUIOverflow(key: string, f: Omit<UIOverflowFinding, 'curren
     ? `its own box (${finding.availablePx}px wide${finding.clipped ? ', which clips it' : ''})`
     : finding.boxEntityId === 0
       ? `the UI itself (${finding.availablePx}px wide) — a placed element wider than the screen`
-      : `the box of enclosing UI element ${finding.boxEntityId} (${finding.availablePx}px wide)`;
+      : `the box of enclosing UI element ${finding.boxGuid ?? `id:${finding.boxEntityId}`} (${finding.availablePx}px wide)`;
   console.warn(`[UIOverflow] ${key} text "${finding.text}" is ${finding.textPx}px and paints ${finding.overflowPx}px outside ${where} at a ${finding.viewport.w}x${finding.viewport.h} UI. A string longer than the layout allows overflows instead of shrinking: give the element a width it can wrap in, autoFitText, or a flexible sibling — see docs/ui-system.md § Text overflow warning.`);
   try { emit('@ui.overflow', { key, ...finding }, getCurrentWorld(), 'warn'); } catch { /* no world yet — the store still has it */ }
   return true;

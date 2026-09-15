@@ -125,7 +125,7 @@ describe('the unsaved-work refusal names the ACTUAL cause (S3.11)', () => {
 
   it('a dirty LIVE WORLD is still reported as live-world scene edits', async () => {
     stubFetch();
-    await runAgentOp('create-entity', { spec: { kind: 'empty', name: 'S311Probe' } });
+    await runAgentOp('create-entity', { spec: { kind: 'empty' } });
     await expect(runAgentOp('new-scene', {})).rejects.toThrow(/LIVE-WORLD scene edits/);
     await expect(runAgentOp('new-scene', {})).rejects.not.toThrow(/pending ASSET edit/);
   });

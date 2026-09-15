@@ -84,6 +84,16 @@ function readGuid(entityId: number): string {
   return data ? durableGuid(data.guid as string) : '';
 }
 
+/** How an editor-journal payload names an entity (#1223 P2): its guid, or `id:<n>` when it has none.
+ *
+ *  ⚠️ Never `String(id)`. A bare number in a guid field looks like an address, and every guid-addressed
+ *  op refuses it. `id:<n>` is the form a contact partner with no guid already takes (docs/mcp-tool-conventions.md §3),
+ *  and it cannot be mistaken for a guid. Takes the guid the caller already captured and never reads the
+ *  world: a delete's payload is built after the entity is gone, when its id may name a newcomer. */
+export function journalRefOf(guid: string | null | undefined, id: number): string {
+  return guid || `id:${id}`;
+}
+
 /** Create an EntityRef for a live entity.
  *  `mint` (default true): mint+persist a guid if the entity has none — required
  *  for undo of a *mutation* to survive a world rebuild. Pass `mint:false` for

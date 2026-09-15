@@ -305,13 +305,27 @@ describe('resolving an entity ref by name', () => {
     expect(r.warnings).toEqual([]);
   });
 
-  it('a REAL parent id is honoured (the fix must not reject valid ids)', async () => {
+  it('a REAL parent guid is honoured (the fix must not reject valid parents)', async () => {
     const parent = await createBox();
     const r = await runAgentOp('apply-scene-ops', {
-      ops: [{ op: 'addEntity', name: 'Child', parentId: parent.id, traits: { Transform: {}, EntityAttributes: { name: 'Child' } } }],
+      ops: [{ op: 'addEntity', name: 'Child', parentId: parent.guid, traits: { Transform: {}, EntityAttributes: { name: 'Child' } } }],
     }) as { changed: number; warnings: string[] };
     expect(r.changed).toBe(1);
     expect(r.warnings).toEqual([]);
+  });
+
+  // #1223 D2: a numeric parent naming an entity that HAS a guid used to be honoured. It is refused, and
+  // the entity is NOT created at the root instead: the caller named a real parent by the wrong key.
+  // Mutation: send the non-NOT_FOUND branch in addEntity's numeric-parent resolution to the warning.
+  it('a numeric parent id naming an entity that has a guid is refused with the guid, and nothing is created', async () => {
+    const parent = await createBox();
+    const before = getCurrentWorld().entities.length;
+    const r = await runAgentOp('apply-scene-ops', {
+      ops: [{ op: 'addEntity', name: 'Child', parentId: parent.id, traits: { Transform: {}, EntityAttributes: { name: 'Child' } } }],
+    }) as { ok: boolean; changed: number; errors: string[]; code?: string; options?: string[] };
+    expect(r).toMatchObject({ ok: false, changed: 0, code: 'REFUSED_BY_OP', options: [parent.guid] });
+    expect(r.errors.join('\n')).toMatch(/address it by guid/);
+    expect(getCurrentWorld().entities.length).toBe(before);
   });
 });
 
@@ -328,9 +342,9 @@ describe('create-entity / reparent-entity: a bad parent is REFUSED, never an orp
       .rejects.toMatchObject({ code: 'NOT_FOUND' });
   });
 
-  it('create-entity still accepts a REAL parentId, and 0 (root)', async () => {
+  it('create-entity still accepts a REAL parent by guid, and parentId 0 (root)', async () => {
     const parent = await createBox();
-    const child = await runAgentOp('create-entity', { spec: { kind: 'empty' }, parentId: parent.id }) as { id: number };
+    const child = await runAgentOp('create-entity', { spec: { kind: 'empty' }, parentGuid: parent.guid }) as { id: number };
     expect(child.id).toBeGreaterThan(0);
     const atRoot = await runAgentOp('create-entity', { spec: { kind: 'empty' }, parentId: 0 }) as { id: number };
     expect(atRoot.id).toBeGreaterThan(0);
@@ -351,11 +365,11 @@ describe("setTrait {space:'world'} on the LIVE path — the branch most agent ed
   async function parentAndChild() {
     const parent = await runAgentOp('create-entity', { spec: { kind: 'empty' } }) as { id: number; guid: string };
     await runAgentOp('apply-scene-ops', {
-      ops: [{ op: 'setTrait', entity: { id: parent.id }, trait: 'Transform', fields: { x: 200, y: 247 } }],
+      ops: [{ op: 'setTrait', entity: { guid: parent.guid }, trait: 'Transform', fields: { x: 200, y: 247 } }],
     });
-    const child = await runAgentOp('create-entity', { spec: { kind: 'empty' }, parentId: parent.id }) as { id: number; guid: string };
+    const child = await runAgentOp('create-entity', { spec: { kind: 'empty' }, parentGuid: parent.guid }) as { id: number; guid: string };
     await runAgentOp('apply-scene-ops', {
-      ops: [{ op: 'setTrait', entity: { id: child.id }, trait: 'Transform', fields: { x: 623, y: 679 } }],
+      ops: [{ op: 'setTrait', entity: { guid: child.guid }, trait: 'Transform', fields: { x: 623, y: 679 } }],
     });
     markSceneSaved(); clearHistory();
     return { parent, child };
@@ -407,13 +421,13 @@ describe("setTrait {space:'world'} on the LIVE path — the branch most agent ed
     // G (scale 2,1,1) → P (rotated 45° about Z) → C. Composed, that parent is SHEARED.
     const g = await runAgentOp('create-entity', { spec: { kind: 'empty' } }) as { id: number; guid: string };
     await runAgentOp('apply-scene-ops', {
-      ops: [{ op: 'setTrait', entity: { id: g.id }, trait: 'Transform', fields: { sx: 2, sy: 1, sz: 1 } }],
+      ops: [{ op: 'setTrait', entity: { guid: g.guid }, trait: 'Transform', fields: { sx: 2, sy: 1, sz: 1 } }],
     });
-    const pE = await runAgentOp('create-entity', { spec: { kind: 'empty' }, parentId: g.id }) as { id: number; guid: string };
+    const pE = await runAgentOp('create-entity', { spec: { kind: 'empty' }, parentGuid: g.guid }) as { id: number; guid: string };
     await runAgentOp('apply-scene-ops', {
-      ops: [{ op: 'setTrait', entity: { id: pE.id }, trait: 'Transform', fields: { rz: Math.PI / 4 } }],
+      ops: [{ op: 'setTrait', entity: { guid: pE.guid }, trait: 'Transform', fields: { rz: Math.PI / 4 } }],
     });
-    const c = await runAgentOp('create-entity', { spec: { kind: 'empty' }, parentId: pE.id }) as { id: number; guid: string };
+    const c = await runAgentOp('create-entity', { spec: { kind: 'empty' }, parentGuid: pE.guid }) as { id: number; guid: string };
     markSceneSaved(); clearHistory();
 
     const WANT = { x: 10, y: 0, z: 0 };
@@ -525,6 +539,9 @@ describe('create-entity refusals reach the relay WITH their options (#1070)', ()
     { spec: { kind: 'light', light: 'pont' }, option: 'point' },
     { spec: { kind: 'ui', preset: 'buton' }, option: 'button' },
     { spec: { kind: 'pyramid' }, option: 'camera' },
+    // #1216 C-3: a key the kind does not take built the DEFAULT entity and answered ok.
+    { spec: { kind: 'primitive', mseh: 'cube' }, option: 'mesh' },
+    { spec: { kind: 'primitive', shape: 'circle' }, option: 'mesh' },
   ])('$spec → REFUSED_BY_OP with options, and no edit', async ({ spec, option }) => {
     const version = getEditVersion();
     const reply = await opReplyFor(() => runAgentOp('create-entity', { spec })) as

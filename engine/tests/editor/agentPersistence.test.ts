@@ -71,10 +71,10 @@ describe('Path B — live-world structural ops: mutate live, push undo, dirty th
   });
 
   it('duplicate-entity: live-only, undoable, dirties the flag', async () => {
-    const created = await runAgentOp('create-entity', { spec: { kind: 'empty' } }) as { id: number };
+    const created = await runAgentOp('create-entity', { spec: { kind: 'empty' } }) as { id: number; guid: string };
     markSceneSaved(); // pretend the create was already saved — isolate duplicate's own effect
     const before = getEditVersion();
-    const r = await runAgentOp('duplicate-entity', { id: created.id }) as { id: number };
+    const r = await runAgentOp('duplicate-entity', { guid: created.guid }) as { id: number };
     expect(r.id).not.toBe(created.id);
     expect(getEditVersion()).toBeGreaterThan(before);
     expect(hasUnsavedChanges()).toBe(true);
@@ -82,10 +82,10 @@ describe('Path B — live-world structural ops: mutate live, push undo, dirty th
   });
 
   it('delete-entities: live-only, undoable, dirties the flag', async () => {
-    const created = await runAgentOp('create-entity', { spec: { kind: 'empty' } }) as { id: number };
+    const created = await runAgentOp('create-entity', { spec: { kind: 'empty' } }) as { id: number; guid: string };
     markSceneSaved();
     const before = getEditVersion();
-    const r = await runAgentOp('delete-entities', { ids: [created.id] }) as { ok: boolean };
+    const r = await runAgentOp('delete-entities', { guids: [created.guid] }) as { ok: boolean };
     expect(r.ok).toBe(true);
     expect(getEditVersion()).toBeGreaterThan(before);
     expect(hasUnsavedChanges()).toBe(true);
@@ -93,11 +93,11 @@ describe('Path B — live-world structural ops: mutate live, push undo, dirty th
   });
 
   it('reparent-entity: live-only, undoable, dirties the flag', async () => {
-    const parent = await runAgentOp('create-entity', { spec: { kind: 'empty' } }) as { id: number };
-    const child = await runAgentOp('create-entity', { spec: { kind: 'empty' } }) as { id: number };
+    const parent = await runAgentOp('create-entity', { spec: { kind: 'empty' } }) as { id: number; guid: string };
+    const child = await runAgentOp('create-entity', { spec: { kind: 'empty' } }) as { id: number; guid: string };
     markSceneSaved();
     const before = getEditVersion();
-    const r = await runAgentOp('reparent-entity', { id: child.id, parentId: parent.id }) as { ok: boolean };
+    const r = await runAgentOp('reparent-entity', { guid: child.guid, parentGuid: parent.guid }) as { ok: boolean };
     expect(r.ok).toBe(true);
     expect(getEditVersion()).toBeGreaterThan(before);
     expect(hasUnsavedChanges()).toBe(true);

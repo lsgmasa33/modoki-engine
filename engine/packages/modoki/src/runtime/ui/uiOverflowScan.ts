@@ -192,7 +192,7 @@ export function measureTextOverflow(host: HTMLElement, root: HTMLElement, scale:
 
 export type MeasureFn = (host: HTMLElement, root: HTMLElement, scale: number, cache: ScanCache) => TextOverflowMeasure | null;
 
-export type ScannedFinding = Omit<UIOverflowFinding, 'current'>;
+export type ScannedFinding = Omit<UIOverflowFinding, 'current' | 'boxGuid'>;
 
 /** One pass: every text-bearing node of `tree` rendered under `root`, classified. Returns the
  *  findings keyed by `uiOverflowKey` — recording is the caller's. */

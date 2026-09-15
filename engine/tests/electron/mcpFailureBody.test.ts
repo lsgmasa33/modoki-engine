@@ -59,7 +59,7 @@ describe('isFailureBody', () => {
   });
 
   it('a body with no success flag at all is not a failure (plain data)', () => {
-    expect(isFailureBody({ entities: [], entityCount: 0 })).toBeNull();
+    expect(isFailureBody({ entities: [], returnedCount: 0 })).toBeNull();
   });
 
   it('non-objects and null are not failures', () => {

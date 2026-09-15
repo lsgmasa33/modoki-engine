@@ -39,7 +39,7 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
       where: z.string().optional().describe('Filter by predicate "Trait.field op value", op ∈ = != > >= < <= ~ (~=contains). E.g. "Transform.y>5". Unparseable/unknown-trait/unknown-field → a `warnings` entry, not a silent full dump.'),
       full: z.boolean().optional().describe('Include EVERY persistent trait field (AoS/object fields like animSets/materials/onClickSet), not just the curated Inspector subset. Default false (bare = a names-only index). NOTE: an UNTARGETED full=1 on a real scene exceeds the response cap and comes back as an elision envelope — combine it with trait=/id=/name=/where= or limit=.'),
       resources: z.boolean().optional().describe('Force-include resource entities (mesh/material/prefab/env holders + config singletons Time/Physics/NPRPostFX). Excluded from the DEFAULT untargeted listing only — any id/trait/name/where filter already includes them.'),
-      limit: z.number().int().nonnegative().optional().describe('Cap the number of entities returned; response sets truncated:true + totalCount when hit. The untargeted INDEX applies a default cap; an explicit limit always wins, and a targeted query is never capped unless you pass one.'),
+      limit: z.number().int().nonnegative().optional().describe('Cap the entities returned. `returnedCount` is what came back and `totalCount` every match before the cap (both always); truncated:true when it bites. The untargeted INDEX applies a default cap; an explicit limit always wins, and a targeted query is never capped unless you pass one.'),
       world: z.boolean().optional().describe('Add each entity\'s RESOLVED world transform (position/rotation/scale after parent-chain propagation) + activeInHierarchy flag. Default false (local Transform only). Saves composing the parent chain by hand.'),
       bounds: z.boolean().optional().describe('Add each entity\'s screen-space rect (screen {x,y,w,h} CSS px) + onScreen flag, plus (3D only) worldAABB {size:[x,y,z], center:[x,y,z]} — the TRUE geometric extent in world units (distinct from the authored scale). Geometry without a separate get_layout_bounds call. Default false. Needs the renderer.'),
       contacts: z.boolean().optional().describe('Add each body\'s CURRENT physics contacts as GUID arrays (rolled up to bodies; a partner with no guid appears as `id:<n>`): `contacts` (solid, load-bearing — resting on the ground) + `overlaps` (sensor/trigger — inside a zone). The STATE view ("what is it touching NOW"), vs the @contact/@sensor journal EVENTS ("when did they touch"). Present only on bodies currently touching something. Default false.'),
@@ -112,7 +112,8 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
       '"fields". Returns {ok, changed, errors, warnings, saved, mode} — deliberately NOT the scene ' +
       '(echoing the whole file on every edit cost ~10k tokens for data nobody read). An addEntity op ' +
       'also reports `created:[{op, id, guid, name}]`, so you address what you just made by GUID ' +
-      'instead of re-finding it by name (which is refused when the name is ambiguous). After ' +
+      'instead of re-finding it by name (which is refused when the name is ambiguous). A setTrait with ' +
+      'fields on a trait the entity does not have ADDS the trait, and says so in `addedTraits:[{op, id, guid, trait}]`. After ' +
       'mutating, verify with modoki_get_scene_state, which reads the running engine. ' +
       'PERSISTENCE (mcp-persistence.md): when the editor has this exact scene open, the ' +
       'whole call applies to the LIVE world as ONE undoable step (a human can Cmd-Z it) and stays ' +
@@ -165,11 +166,14 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
       'success. A default would just relocate that mistake into the caller\'s head. For a ROOT ' +
       'entity the two spaces are identical, so either value is correct and cheap to state.',
     {
+      // Strict: a nested z.object is not strict because its parent is, so a typo'd key was STRIPPED and
+      // arrived as an empty ref (§1's silent key strip one level down, #1223).
       entity: z.object({
-        id: z.number().optional(),
+        id: z.number().int().optional(),
         name: z.string().optional(),
         guid: z.string().optional(),
-      }).describe('Entity ref — one of {id} | {name} | {guid}.'),
+      }).strict('an entity ref accepts only: guid, name, id')
+        .describe('Entity ref — exactly one of {guid} | {name} | {id}. Live: {id} only for an entity with no guid; file-direct: {id} is the authored file id.'),
       // It said "World position" and wrote Transform.x/y/z, which is LOCAL. Measured on a parented
       // entity: asking for its OWN current world position moved it by the parent offset
       // (623,679 local / 823,926 world → set to 823,926 → now 1022,1173 world). A parameter whose

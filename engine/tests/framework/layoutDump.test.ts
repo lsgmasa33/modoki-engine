@@ -7,10 +7,11 @@
  *  The load-bearing constraint is NOT the size — it's that `computeLayoutBounds` is a shared
  *  producer. `diagnose.ts`'s `computeDiagnostics` calls it with NO params and reads `.offScreen.length`. Summarize
  *  that key away and `modoki_diagnose` breaks in the field, silently, long before a test
- *  notices. So `offScreen` (and `zeroSize`) stay arrays, always. */
+ *  notices. So `offScreen` (and `zeroSize`) stay arrays, always — of guids since #1223 P2, with
+ *  `<field>NoGuidIds` for an entity that has none. */
 
 import { describe, it, expect, afterEach, beforeEach } from 'vitest';
-import { createTestWorld, type TestWorld, EntityAttributes } from '@modoki/engine/runtime';
+import { createTestWorld, type TestWorld, EntityAttributes, guidOfEntityId } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { computeLayoutBounds } from '../../app/debug/layoutDump';
 
@@ -46,7 +47,7 @@ describe('computeLayoutBounds — untargeted returns counts, not rects', () => {
     spawnUI('B', { x: 50, y: 50, w: 100, h: 100 }); // overlaps A
 
     const d = computeLayoutBounds();
-    expect(d.count).toBe(2);
+    expect(d.totalCount).toBe(2);
     expect(d.entities).toBeUndefined();  // the rects
     expect(d.overlaps).toBeUndefined();  // the O(n²) pair list
     expect(d.overlapsCount).toBe(1);     // ...but the count survives
@@ -54,22 +55,23 @@ describe('computeLayoutBounds — untargeted returns counts, not rects', () => {
     expect(d.hint).toContain('overlaps=true');
   });
 
-  it('ALWAYS returns offScreen as an id array — diagnose.ts reads .offScreen.length', () => {
+  it('ALWAYS returns offScreen as a guid array — diagnose.ts re-reports it', () => {
     spawnUI('Visible', { x: 0, y: 0, w: 10, h: 10 });
     const hidden = spawnUI('Collapsed', { x: 0, y: 0, w: 0, h: 0 });
 
     const d = computeLayoutBounds(); // exactly how diagnose.ts calls it
     expect(Array.isArray(d.offScreen)).toBe(true);
-    expect(d.offScreen).toContain(hidden);
+    expect(d.offScreen).toContain(guidOfEntityId(hidden));
     expect(d.offScreenCount).toBe(1);
     expect(() => d.offScreen.length).not.toThrow();
   });
 
-  it('reports zeroSize ids — the "collapsed to nothing" answer, without the rects', () => {
+  it('reports zeroSize guids — the "collapsed to nothing" answer, without the rects', () => {
     const collapsed = spawnUI('Zero', { x: 5, y: 5, w: 0, h: 20 });
     spawnUI('Fine', { x: 0, y: 0, w: 10, h: 10 });
     const d = computeLayoutBounds();
-    expect(d.zeroSize).toEqual([collapsed]);
+    expect(d.zeroSize).toEqual([guidOfEntityId(collapsed)]);
+    expect(d.zeroSizeNoGuidIds).toBeUndefined();
     expect(d.zeroSizeCount).toBe(1);
   });
 });
@@ -99,7 +101,8 @@ describe('computeLayoutBounds — opting back into the expensive parts', () => {
     spawnUI('Far', { x: 900, y: 900, w: 10, h: 10 }); // disjoint
 
     const d = computeLayoutBounds({ overlaps: true });
-    expect(d.overlaps).toEqual([{ a, b, layer: 'ui' }]);
+    const member = (id: number, name: string) => ({ id, guid: guidOfEntityId(id), name });
+    expect(d.overlaps).toEqual([{ a: member(a, 'A'), b: member(b, 'B'), layer: 'ui' }]);
     expect(d.overlapsCount).toBe(d.overlaps!.length);
   });
 

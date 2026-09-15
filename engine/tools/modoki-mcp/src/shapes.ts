@@ -40,7 +40,7 @@ export const modifierEnum = z.enum(EDITOR_INPUT_MODIFIERS);
 export const makeEntitySpec = () => z.object({
   guid: z.string().optional(),
   name: z.string().optional(),
-  id: z.number().optional(),
+  id: z.number().int().optional(),
   surface: z.enum(['game-3d', 'game-2d', 'scene-view', 'game-ui']).optional()
     .describe('Which on-screen surface to aim in. REQUIRED for a 2D/3D entity, even when only one ' +
       'viewport shows it. For a UI entity it is optional until the entity resolves to more than ' +
@@ -54,10 +54,10 @@ export const makeEntitySpec = () => z.object({
       'on EVERY scope, whether the cover is another entity or a DOM element over the viewport (a ' +
       'modal, a menu, a panel), because the press lands on it either way. `occlusionScope` in the ' +
       'response says how far the check could SEE.'),
-}).describe(
-  'Aim at a SCENE ENTITY by {guid} | {name} | {id}, resolved to its live screen rect INSIDE this ' +
-  'call, so there is no read-then-tap race. Prefer guid: runtime ids are reassigned on every ' +
-  'scene reload. A name matching several entities is REFUSED, never first-match. A 2D/3D entity ' +
+}).strict('an entity aim accepts only: guid, name, id, surface, allowOccluded').describe(
+  'Aim at a SCENE ENTITY by exactly one of {guid} | {name} | {id}, resolved to its live screen rect ' +
+  'INSIDE this call, so there is no read-then-tap race. {id} only for an entity with no guid: ' +
+  'runtime ids are reassigned on every reload. A name matching several entities is REFUSED, never first-match. A 2D/3D entity ' +
   'additionally REQUIRES `surface`, and a UI entity requires it whenever it is mounted in more ' +
   'than one panel. Overrides `selector` and x/y. The response reports `entity`, `surface` (WHICH ' +
   'on-screen copy was aimed at), `aimedAt` ("centre" | "sampled"), `occluded`, ' +
@@ -109,8 +109,8 @@ export const flatEntityAlias = z.object({
 }).strict('an entity ref here accepts only: guid, id')
   .optional().describe(
     'Alternative to this tool\'s flat `guid`/`id`: the same nested ref shape the aimed-input tools '
-    + 'take, accepted here so one addressing form works across the surface. Prefer guid — runtime '
-    + 'ids are reassigned on every scene reload. NO `name` HERE, unlike the aimed-input tools: the '
+    + 'take, accepted here so one addressing form works across the surface. {id} only for an entity '
+    + 'with no guid — runtime ids are reassigned on every scene reload. NO `name` HERE, unlike the aimed-input tools: the '
     + 'ops behind these tools address by guid/id and have no name resolver, so accepting one would '
     + 'advertise a capability that does not exist (it reaches the op as an empty ref and comes back '
     + 'as a misleading "this ref is stale"). Look the guid up with modoki_get_scene_state {name} '
@@ -137,7 +137,8 @@ export function foldEntityRef(
   if (!entity || Object.keys(entity).length === 0) return flat;
   // `!== undefined`, not truthiness: `id: 0` is the ROOT entity, and a truthiness test would read
   // it as "no address given" and silently fall through to the other branch.
-  const flatKeys = Object.entries(flat).filter(([, v]) => v !== undefined).map(([k]) => k);
+  // An empty string is ABSENT, as in the live resolver (`app/debug/entityRef.ts`, #1223).
+  const flatKeys = Object.entries(flat).filter(([, v]) => v !== undefined && v !== '').map(([k]) => k);
   if (flatKeys.length) {
     return { conflict: `both \`entity\` and the flat ${flatKeys.join('/')} were given — they are two ways to say the same thing, and sending both leaves it ambiguous which target you meant. Pass exactly one.` };
   }

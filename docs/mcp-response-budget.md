@@ -164,8 +164,9 @@ with a default `limit` and a `hint`:
 ```jsonc
 {
   "scenePath": "…/tropical-island.scene.json",
-  "entityCount": 135,
-  "truncated": false,
+  "returnedCount": 136,      // counts read live 2026-09-15 (#1223 P5); the token figures below
+  "totalCount": 136,         // are from the original 135-entity measurement
+  "resourcesExcluded": 2,    // + 136 = get_editor_state's worldEntityTotal (138)
   "entities": [
     { "id": 12, "guid": "…", "name": "Island", "parentId": null, "layer": "3d",
       "traits": ["Transform", "Renderable3D", "ModelSource"] }
@@ -194,9 +195,10 @@ than requested:
 
 ```jsonc
 {
-  "count": 241,
+  "totalCount": 241,       // rects; `entityTotal` is the distinct entities behind them
+  "entityTotal": 241,
   "layerCounts": { "ui": 0, "2d": 0, "3d": 241 },
-  "offScreen": [],          // ids — cheap, and diagnose.ts depends on this key
+  "offScreen": [],          // guids (#1223) — cheap, and diagnose.ts depends on this key
   "offScreenCount": 0,
   "overlapsCount": 2625,    // computed cheaply; the PAIRS are what's expensive to serialize
   "hint": "Counts only. Pass ids=… or layer=… for rects; overlaps=1 for the pair list."
@@ -211,8 +213,8 @@ survives, only the serialized pairs are gone. `overlaps=1` costs ~19,350 tok, `l
   `layoutDump.ts`'s `computeLayoutBounds` is **guarded** so the default doesn't pay to compute
   2,625 pairs it then discards. That double-loop otherwise emits more characters than all 241
   rects combined.
-- **The `offScreen` key (array of ids) is preserved.** `diagnose.ts`'s `computeDiagnostics` reads
-  `.offScreen` off a no-arg `computeLayoutBounds()` and takes `.length` — this is the concrete
+- **The `offScreen` key (an array — of guids since #1223) is preserved.** `diagnose.ts`'s `computeDiagnostics` reads
+  `.offScreen` off a no-arg `computeLayoutBounds()` and re-reports it — this is the concrete
   instance of the architectural rule: summarize at the route, and `diagnose.ts`, which calls the
   producer in-process, never notices. `agentBridge.ts`'s `dumpSceneState` (the `scene-state?bounds=1`
   enricher) passes `ids`, so it keeps its rects.

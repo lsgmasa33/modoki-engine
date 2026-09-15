@@ -237,6 +237,20 @@ describe('§5 — classification: the code must match what actually went wrong',
     expect(e.why).not.toContain('no explanation');
   });
 
+  // #1223 close-out review: `dispatch-action` refuses a stale targetGuid as `{ok:false, code:'NOT_FOUND',
+  // reason}`; the code makes the route answer 400, and a reader of only error/errors said "no explanation".
+  // Mutation: drop the `reason` fallback from httpFailure's detail reader.
+  it('reads the cause from `reason` too — a coded op refusal relayed on its 4xx', async () => {
+    const s = (surface = loadSurface((req) =>
+      req.path.startsWith('/api/editor-action')
+        ? { status: 400, body: { ok: false, dispatched: false, code: 'NOT_FOUND', stale: 'world-swapped', reason: "targetGuid 'g' matched no entity in the live world" } }
+        : undefined));
+    const e = envelope(s, await s.call('modoki_dispatch_action', { name: 'my.real', targetGuid: 'g' }));
+    expect(e.code).toBe('NOT_FOUND');
+    expect(e.why).toContain('matched no entity in the live world');
+    expect(e.why).not.toContain('no explanation');
+  });
+
   it('a 403 is the wrong-editor refusal, and says to check identity', async () => {
     const s = (surface = loadSurface(() => ({ status: 403, body: { error: 'token mismatch' } })));
     const e = envelope(s, await s.call('modoki_get_editor_state'));
@@ -628,7 +642,7 @@ describe('review follow-ups — defects the adversarial pass found in this audit
     // every entity — so asking about ONE entity and receiving 200 rects read as "here it is, among
     // others". Same silent-widening class as a dropped filter.
     const s = (surface = loadSurface((req) =>
-      req.path.startsWith('/api/layout-bounds') ? { body: { count: 0, entityCount: 0, entities: [], unresolved: ['stale-guid'] } } : undefined));
+      req.path.startsWith('/api/layout-bounds') ? { body: { totalCount: 0, returnedCount: 0, entityTotal: 0, entities: [], unresolved: ['stale-guid'] } } : undefined));
     await s.call('modoki_get_layout_bounds', { guids: ['stale-guid'] });
     expect(s.last()!.path).toContain('guids=stale-guid');
   });

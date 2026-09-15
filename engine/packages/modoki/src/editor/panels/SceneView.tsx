@@ -18,7 +18,7 @@ import { clearSkeletalSeeks } from '../../runtime/core/skeletalSeek';
 import { getAllTraits } from '../../runtime/core/ecs/traitRegistry';
 import { worldTransforms, deactivatedEntities } from '../../runtime/core/ecs/transformPropagationSystem';
 import { decomposeTrs } from '../../runtime/core/ecs/decomposeTrs';
-import { findEntity, fireDirtyListeners, addDirtyListener, onStructureDirty, getAllEntities, subtreeIds, entityDisplayName } from '../../runtime/core/ecs/entityUtils';
+import { findEntity, fireDirtyListeners, addDirtyListener, onStructureDirty, getAllEntities, subtreeIds, entityDisplayName, guidOfEntityId } from '../../runtime/core/ecs/entityUtils';
 import { markOverrideIfInstance } from '../undo/entityActions';
 import { Transform, EntityAttributes, Collider2D, Collider3D, clampAngle, Bone2D, Billboard3D, CameraFrame, Zone3D } from '../../runtime/traits';
 import { colliderWireframeGeometry, colliderOutlineSig3D, colliderWorldScale3D, type ColliderOutline3DParams } from '../../runtime/rendering/colliderOutline3D';
@@ -88,7 +88,7 @@ import { PREFAB_EDIT_SCENE_PREFIX, PREFAB_EDIT_ROOT_GUID, exitPrefabEditing } fr
 import { pushAction, subscribeUndo } from '../undo/undoManager';
 import { buildTransformUndoAction, buildGroupTransformUndoAction } from '../scene/gizmoUndo';
 import { applyGroupTransform3D, applyGroupTransform2D, filterOutDescendants, resolveGroupPivot2D, virtualDragDelta, groupMemberFields } from '../scene/multiTransform';
-import { entityRef } from '../undo/entityRef';
+import { entityRef, journalRefOf } from '../undo/entityRef';
 import { notifyFieldEdited } from '../animation/recording';
 import {
   parseColliderPoints, serializeColliderPoints, moveVertex, insertVertex, removeVertex,
@@ -1718,7 +1718,7 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
           return buildTransformUndoAction({
             label: `Transform "${entityDisplayName(m.id)}"`,
             trait: Transform, resolve: () => ref.resolve(), findEntity, before: { ...m.local }, after,
-            entityGuid: ref.guid || String(m.id),
+            entityGuid: journalRefOf(ref.guid, m.id),
           });
         }).filter(Boolean) as ReturnType<typeof buildTransformUndoAction>[];
         if (actions.length) pushAction(buildGroupTransformUndoAction(`Transform ${actions.length} entities`, actions));
@@ -1741,7 +1741,7 @@ function installScene2DInteraction(canvasEntityId: number, opts: Scene2DInteract
         pushAction(buildTransformUndoAction({
           label: `Transform "${entityDisplayName(eid)}"`,
           trait: Transform, resolve: () => ref.resolve(), findEntity, before, after,
-          entityGuid: ref.guid || String(eid),
+          entityGuid: journalRefOf(ref.guid, eid),
         }));
         // Record mode: a gizmo drag writes Transform via direct entity.set (above),
         // which bypasses writeTraitField → the animation record hook never sees it.
@@ -2252,7 +2252,7 @@ function registerScene2DColliderHandles(canvasEntityId: number, getCanvas: () =>
         x: rect.left + (backingX / pw) * rect.width,
         y: rect.top + (backingY / ph) * rect.height,
         label: `vertex ${i}`,
-        meta: { entityId: selId, index: i, local: [p.x, p.y] },
+        meta: { entityId: selId, guid: guidOfEntityId(selId), index: i, local: [p.x, p.y] },
         owner: canvas,
       };
     });
@@ -3292,7 +3292,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
           return buildTransformUndoAction({
             label: `Transform "${entityDisplayName(m.id)}"`,
             trait: Transform, resolve: () => ref.resolve(), findEntity, before: m.before, after,
-            entityGuid: ref.guid || String(m.id),
+            entityGuid: journalRefOf(ref.guid, m.id),
           });
         }).filter(Boolean) as ReturnType<typeof buildTransformUndoAction>[];
         if (actions.length) {
@@ -3314,7 +3314,7 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       pushAction(buildTransformUndoAction({
         label: `Transform "${entityDisplayName(eid)}"`,
         trait: Transform, resolve: () => ref.resolve(), findEntity, before, after,
-        entityGuid: ref.guid || String(eid),
+        entityGuid: journalRefOf(ref.guid, eid),
       }));
       // Record mode: the gizmo writes Transform via direct entity.set, bypassing
       // writeTraitField → the animation record hook never sees it. Notify it for

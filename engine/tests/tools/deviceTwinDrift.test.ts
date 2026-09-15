@@ -67,7 +67,7 @@ describe('device_diagnose: ok:false is the ANSWER, not a failed call', () => {
     // whose `ok:false` means "this scene is unhealthy". So the one tool built to report problems
     // became a REFUSED_BY_OP envelope exactly when it had something to report, and the diagnosis
     // the caller asked for was discarded. The editor twin deliberately does not run the check.
-    s = await loadDeviceSurface(() => deviceReply({ ok: false, issues: ['no camera in the scene'], entityCount: 12 }));
+    s = await loadDeviceSurface(() => deviceReply({ ok: false, issues: ['no camera in the scene'], worldEntityTotal: 12 }));
     const r = await s.call('device_diagnose');
     expect(r.isError, `an unhealthy scene is an ANSWER: ${s.text(r)}`).toBeFalsy();
     expect(s.text(r)).toContain('no camera in the scene');
@@ -160,6 +160,29 @@ describe('coordinate aims all carry the screenshot scale', () => {
       expect(r.isError, `${tool} refused a selector aim that needs no scale: ${s.text(r)}`).toBeFalsy();
     });
   }
+});
+
+describe('device_scroll: an alias beside its canonical name is refused (#1217)', () => {
+  // `deltaX ?? dx` let the canonical name win silently, so `{deltaX:0, dx:120}` scrolled nothing and
+  // answered ok. Mutation: drop the doubled-name refusal in device_scroll.
+  it.each([
+    [{ deltaX: 0, dx: 120 }, /deltaX\/dx given together/],
+    [{ deltaY: 120, dy: 120 }, /deltaY\/dy given together/],
+  ])('%j', async (args, why) => {
+    s = await loadDeviceSurface(() => deviceReply('ok'));
+    const r = await s.call('device_scroll', args);
+    expect(r.isError).toBe(true);
+    expect(s.text(r)).toMatch(/AMBIGUOUS/);
+    expect(s.text(r)).toMatch(why);
+    expect(s.real().some((q) => q.path.startsWith('/api/device/request'))).toBe(false);
+  });
+
+  it('the alias alone still scrolls', async () => {
+    s = await loadDeviceSurface(() => deviceReply('ok'));
+    const r = await s.call('device_scroll', { dy: 120 });
+    expect(r.isError, s.text(r)).toBeFalsy();
+    expect(relayed(s)).toMatchObject({ method: 'scroll', params: { dy: 120 } });
+  });
 });
 
 describe('device_layout_bounds: guid and name filters reach the device (#1208 P1-4)', () => {

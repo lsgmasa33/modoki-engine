@@ -33,7 +33,12 @@ import './installConsoleRing'
 import './installDeviceConsoleCapture'
 import App from './App.tsx'
 import { Capacitor } from '@capacitor/core'
-import { setJournalEnabled, setDebugMenuEnabled, setDebugHandlesEnabled, setUIOverflowCheckEnabled, setTierFrameCapEnabled, setTierCalibrationEnabled, setBootProbeAllowed, readPerfProfile, setProfilerEnabled } from '@modoki/engine/runtime'
+import { setJournalEnabled, setDebugMenuEnabled, setDebugHandlesEnabled, setUIOverflowCheckEnabled, setTierFrameCapEnabled, setTierCalibrationEnabled, setBootProbeAllowed, readPerfProfile, setProfilerEnabled, saltRuntimeGuidGeneration } from '@modoki/engine/runtime'
+
+// Runtime guids (#1210) are unique per PAGE LOAD, not just per world: without this the generation
+// counter restarts at 1 on every reload and re-issues the previous page's guids (#1223 D5). Here and
+// not in the engine module, so the headless harness, which never runs this file, stays deterministic.
+saltRuntimeGuidGeneration()
 
 
 // Debug build — event-journal recording gate. ON in the editor (dev + the packaged

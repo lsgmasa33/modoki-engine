@@ -1412,7 +1412,7 @@ It stops the local dev editor and builds a throwaway `.app` on a **per-clone por
 Four things, and the last two exist because this gate has twice reported a cheerful result while the
 thing it was watching was broken:
 
-1. **The renderer mounted** — `entityCount > 0` from `/api/scene-state`, which relays through the
+1. **The renderer mounted** — `returnedCount > 0` from `/api/scene-state`, which relays through the
    renderer, so a non-zero count already proves it answered.
 2. **No Vite resolve/transform error** in the dev-server log, and no renderer console error.
 3. **The app provisioned its own pinned Node.** `ensureNodeProvisioned()` catches its own failure and

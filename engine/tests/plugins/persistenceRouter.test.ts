@@ -399,6 +399,50 @@ describe('Phase 2b: scene-mutate goes LIVE when a renderer is connected on the m
     expect(String(fileBody.created![0].guid).length).toBeGreaterThan(0);
   });
 
+  // #1216 C-12 / D6: `addedTraits` has the same two backends, and the same three literals to be dropped at
+  // (the op wrapper, `decodeSceneOpsReply`, this route's two json() calls). Mutation: drop either
+  // route spread, or the decoder's.
+  it('BOTH branches forward `addedTraits` for a setTrait that added a trait', async () => {
+    const addTrait = (scenePath: string) => ({ path: scenePath, ops: [{ op: 'setTrait', entity: { guid: 'g-box' }, trait: 'Renderable3DPrimitive', fields: { size: 2 } }] });
+    const liveScene = tempScene();
+    const added = [{ op: 0, id: 1, guid: 'g-box', trait: 'Renderable3DPrimitive' }];
+    const liveBrowser = vi.fn(async (op: string) => {
+      if (op === 'editor-state') return { playState: 'stopped', scenePath: liveScene, unsavedChanges: false };
+      if (op === 'apply-scene-ops') return { ok: true, changed: 1, errors: [], warnings: [], unresolved: [], addedTraits: added };
+      throw new Error(`unexpected op ${op}`);
+    });
+    const liveBody = ((await post('/api/scene-mutate', addTrait(liveScene), makeCtx({ requestBrowser: liveBrowser }))) as { body: { addedTraits?: unknown } }).body;
+    expect(liveBody.addedTraits, 'the live branch dropped addedTraits').toEqual(added);
+
+    const fileScene = tempScene();
+    const fileBrowser = vi.fn(async (op: string, params?: unknown) => {
+      if (op === 'editor-state') return { playState: 'stopped', scenePath: '/some/other/scene.json', unsavedChanges: false };
+      if (op === 'resolve-unsaved') return { ok: true, holds: [], discarded: [], covers: (params as { registries?: string[] })?.registries ?? [] };
+      throw new Error(`unexpected op ${op} — should have stayed file-direct`);
+    });
+    const fileBody = ((await post('/api/scene-mutate', addTrait(fileScene), makeCtx({ requestBrowser: fileBrowser }))) as { body: { addedTraits?: unknown } }).body;
+    expect(fileBody.addedTraits, 'the file branch dropped addedTraits').toEqual([{ op: 0, id: 1, guid: 'g-box', trait: 'Renderable3DPrimitive' }]);
+  });
+
+  // #1223 D4, found by the live stale probe: the op answered `stale` and `options` beside its code, and
+  // this route's reply literal (and the decoder before it) dropped both. Mutation: delete the `stale`
+  // spread from the route's live-branch json(), or from decodeSceneOpsReply.
+  it('the LIVE branch carries a refusal\'s `stale` and `options` beside its code', async () => {
+    const liveScene = tempScene();
+    const liveBrowser = vi.fn(async (op: string) => {
+      if (op === 'editor-state') return { playState: 'stopped', scenePath: liveScene, unsavedChanges: false };
+      if (op === 'apply-scene-ops') {
+        return { ok: false, changed: 0, errors: ['op[0] (setTrait): entity: no LIVE entity with guid "g"'], warnings: [], unresolved: [{ guid: 'g' }],
+          code: 'NOT_FOUND', stale: 'world-swapped', options: ['g-other'] };
+      }
+      throw new Error(`unexpected op ${op}`);
+    });
+    const body = ((await post('/api/scene-mutate', addBox(liveScene), makeCtx({ requestBrowser: liveBrowser }))) as {
+      body: { code?: string; stale?: string; options?: string[] };
+    }).body;
+    expect(body).toMatchObject({ code: 'NOT_FOUND', stale: 'world-swapped', options: ['g-other'] });
+  });
+
   it('does NOT go live when the requested scene is not the one currently loaded — stays file-direct', async () => {
     const scenePath = tempScene();
     const before = fs.readFileSync(scenePath, 'utf-8');

@@ -27,10 +27,9 @@ import type { MouseButton, InputModifier } from './rendererOps';
 // of a wire contract silently drifts.
 import type { AimGesture } from '../app/debug/domPointContract';
 import type { DomPointResolution } from '../app/debug/domPointContract';
-// A VALUE, not a type — the refusal messages branch on it. From the DOM-free contract module for
-// the reason its header gives: importing domResolve.ts would pull `document` into this program.
-import { NOTHING_AT_POINT } from '../app/debug/domPointContract';
 import type { EntityPointSpec, EntityPointResolution, OcclusionScope, AimedAt } from '../app/debug/entityPointContract';
+// A VALUE, DOM-free for the same reason: the entity-aim refuse/accept decision the device page shares.
+import { entityAimOutcome, type AimRefusal } from '../app/debug/entityAimRefusal';
 import type { ErrorCode } from '../tools/shared/mcpResult';
 import {
   EDITOR_INPUT_MODIFIERS, MOUSE_BUTTONS, POINTER_ACTIONS, normalizeKeyName, refuseUnknownKey,
@@ -165,6 +164,13 @@ export interface ResolvedPoint {
 const json = (body: unknown, status?: number): BackendResult => ({ kind: 'json', ...(status ? { status } : {}), body });
 const bad = (error: string, code?: ErrorCode, options?: string[]) =>
   json({ error, ...(code ? { code } : {}), ...(options ? { options } : {}) }, 400);
+/** A refused AIM, relayed whole (#1223 P3). `bad(r.error, r.code)` dropped `options` and `stale`, so an
+ *  ambiguous name's guids and a stale runtime guid's `stale` stopped at this host — the resolver named
+ *  them and the agent never saw them. */
+const badAim = (r: AimRefusal) => json({
+  error: r.error, ...(r.code ? { code: r.code } : {}),
+  ...(r.options?.length ? { options: r.options } : {}), ...(r.stale ? { stale: r.stale } : {}),
+}, 400);
 
 /** The first vocabulary refusal among `checks`, as a 400 carrying its options (#1076). These routes
  *  OWN the input tables — nothing sits between them and the trusted dispatch — so an unknown button
@@ -210,7 +216,7 @@ export async function resolvePoint(
   // renderer is read as NOT click-shaped there (`isClickShaped`). A default of `'tap'` here would
   // have re-introduced the permissive path this parameter exists to remove.
   gesture?: AimGesture,
-): Promise<{ point: ResolvedPoint } | { error: string; code?: ErrorCode }> {
+): Promise<{ point: ResolvedPoint } | AimRefusal> {
   const hasEntity = !!spec?.entity && typeof spec.entity === 'object' && Object.keys(spec.entity).length > 0;
   if (spec && spec.label !== undefined && (spec.selector || hasEntity)) {
     return {
@@ -243,63 +249,27 @@ export async function resolvePoint(
     } catch (e) {
       return { error: `${which}: renderer could not resolve entity (${e instanceof Error ? e.message : String(e)})` };
     }
-    if (!res || !res.ok || typeof res.x !== 'number' || typeof res.y !== 'number') {
-      // The hint belongs HERE too — and this is the branch the #261 measurements actually hit.
-      // An unsettled panel reports a ZERO RECT, so the resolver refuses with "zero-size"/"off-screen"
-      // rather than OCCLUDED; instrumenting only the covered case would have left the hint silent on
-      // the one transient that reproduces. Without it the refusal reads as "your entity/selector is
-      // wrong" and the caller goes hunting for a better address instead of re-aiming.
-      return {
-        error: `${which}: ${res?.error ?? 'entity did not resolve'}${await settlingHint(requestRenderer)}`,
-        ...(res?.code ? { code: res.code } : {}),
-      };
+    // The refuse/accept decision is SHARED with the device page (`entityAimRefusal.ts`, #1223 P3), so
+    // a device aim and an editor aim refuse the same resolution the same way. It reads
+    // `entitySpec.allowOccluded`, the value ALREADY sent to the renderer, rather than re-deriving it
+    // from the two fields: `entity:{allowOccluded:false}` beside a top-level `allowOccluded:true`
+    // merges to false, so the resolver refuses a picker-occluded aim, and a re-derived `!false && !true`
+    // here would wave a DOM-occluded one through — one flag, opposite answers (§9).
+    const outcome = entityAimOutcome(which, res, entitySpec.allowOccluded);
+    if ('refusal' in outcome) {
+      // The #261 hint belongs on BOTH refusals — and the unresolved one is the branch the
+      // measurements actually hit: an unsettled panel reports a ZERO RECT, so the resolver refuses with
+      // "zero-size"/"off-screen" rather than OCCLUDED. Without it the refusal reads as "your address is
+      // wrong" and the caller hunts for a better one instead of re-aiming.
+      return { ...outcome.refusal, error: `${outcome.refusal.error}${await settlingHint(requestRenderer)}` };
     }
-    // §3: "a resolvable aim that something COVERS is refused ... this binds `entity` and
-    // `selector` alike". Only the MESH-level half of that was implemented — entityResolve refuses
-    // when the surface's own picker says another entity is in front. DOM-level covering (a modal,
-    // a menu, a panel over the viewport) was reported as `occluded:true` and DISPATCHED ANYWAY on
-    // all three scopes, so a tap meant for a UI button under an open dialog pressed the dialog and
-    // answered ok:true — the §0 rank-1 false success, on the aim category §3 says is one category.
-    // The two documented carve-outs still hold and neither is here: raw {x,y} never reaches this
-    // branch, and a held gesture's move/up is forced through by its caller (see the pointer route).
-    //
-    // Reads `entitySpec.allowOccluded`, the value ALREADY sent to the renderer, rather than
-    // re-deriving it from the two fields. §9: a rule implemented twice diverges — and these two
-    // did, in one reachable combination. `entity:{allowOccluded:false}` with a top-level
-    // `allowOccluded:true` merges to false, so entityResolve refuses a picker-occluded aim while a
-    // re-derived `!false && !true` here would have waved a DOM-occluded one through: one flag,
-    // opposite answers, decided by which kind of cover happened to be in the way.
-    if (res.occluded && !entitySpec.allowOccluded) {
-      const scope = res.occlusionScope === 'canvas'
-        ? ' (this surface has no pick provider, so only DOM-level covering was checked — a mesh in '
-          + 'front of it would not be detected at all)'
-        : '';
-      // "Nothing" is not something you can dismiss. When the hit-test found NO element the point is
-      // clipped away or off-window, and telling the caller to move the thing covering it — which
-      // the message itself calls "nothing" — is self-contradictory advice for a real, if narrow,
-      // case: `centreIsInWindow` admits `x === innerWidth` while `elementFromPoint` is exclusive at
-      // that same edge, so a rect flush against the window's right/bottom lands here.
-      const nothingThere = !res.hitTarget || res.hitTarget === NOTHING_AT_POINT;
-      const settling = await settlingHint(requestRenderer);
-      return {
-        error: (nothingThere
-          ? `${which}: ${res.matched ?? 'the entity'} resolves to a point with NOTHING at it — `
-            + `(${Math.round(res.x)}, ${Math.round(res.y)}) is clipped away or past the window edge, so the `
-            + `input would go nowhere${scope}. Move the camera (or the entity) so it is framed well `
-            + 'inside the viewport, then re-aim.'
-          : `${which}: ${res.matched ?? 'the entity'} resolves to a point covered by `
-            + `${res.hitTarget} — the input would land on THAT, not on your target${scope}. `
-            + 'Dismiss/move what covers it, or pass allowOccluded:true to aim there anyway and see '
-            + 'what happens.') + settling,
-        code: 'OCCLUDED',
-      };
-    }
+    const p = outcome.point;
     return {
       point: {
-        x: res.x, y: res.y,
-        matched: res.matched, hitTarget: res.hitTarget, occluded: res.occluded,
-        occlusionScope: res.occlusionScope, entity: res.entity, surface: res.surface,
-        occludedByEntity: res.occludedByEntity, aimedAt: res.aimedAt, samplesTried: res.samplesTried,
+        x: p.x, y: p.y,
+        matched: p.matched, hitTarget: p.hitTarget, occluded: p.occluded,
+        occlusionScope: p.occlusionScope, entity: p.entity, surface: p.surface,
+        occludedByEntity: p.occludedByEntity, aimedAt: p.aimedAt, samplesTried: p.samplesTried,
       },
     };
   }
@@ -737,7 +707,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
         // `== null`: a JSON `button:null` is "not given" (the vocabulary check passes it), so it clicks
         // LEFT and must be modelled as the tap it is, not the stricter press (#1076 close-out).
         button == null || button === 'left' ? 'tap' : 'press');
-      if ('error' in r) return bad(r.error, r.code);
+      if ('error' in r) return badAim(r);
       await ops.tap(r.point.x, r.point.y, { button, clickCount, modifiers });
       return json({ ok: true, tapped: { x: r.point.x, y: r.point.y, button: button ?? 'left', clickCount: clickCount ?? 1 }, ...provenance(r.point) });
     }
@@ -753,9 +723,9 @@ export function createInputRoutes(deps: InputRouteDeps) {
       // covered destination while keeping the press honest.
       const withFlag = (p?: PointSpec) => (p ? { ...p, allowOccluded: p.allowOccluded ?? allowOccluded } : p);
       const rf = await resolvePoint(withFlag(from), 'from', requestRenderer, 'drag');
-      if ('error' in rf) return bad(rf.error, rf.code);
+      if ('error' in rf) return badAim(rf);
       const rt = await resolvePoint(withFlag(to), 'to', requestRenderer, 'drag');
-      if ('error' in rt) return bad(rt.error, rt.code);
+      if ('error' in rt) return badAim(rt);
       // A zero-length drag is a CLICK, not a drag: mouseDown+mouseUp at one pixel is what Blink
       // synthesizes a `click` from. Measured — `modoki_drag {from:{700,200},to:{700,200}}` over
       // empty SceneView space returned ok:true and CLEARED the human's selection (entity 38 →
@@ -846,7 +816,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
       );
       if ('error' in r) {
         if (heldPointer) armIdleRelease(); // the press survived a refused move — it must not lose its timer
-        return bad(r.error, r.code);
+        return badAim(r);
       }
       // 'down' takes its button from the request (default left); 'move'/'up' REUSE the held one so
       // the whole gesture is one consistent button and a move reads as a drag-move.
@@ -879,7 +849,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
       const unknownVocab = refuseVocabulary(refuseUnknownValues('hover modifiers', modifiers, EDITOR_INPUT_MODIFIERS));
       if (unknownVocab) return unknownVocab;
       const r = await resolvePoint({ x, y, selector, label, within, entity, allowOccluded }, 'hover', requestRenderer, 'hover');
-      if ('error' in r) return bad(r.error, r.code);
+      if ('error' in r) return badAim(r);
       await ops.hover(r.point.x, r.point.y, modifiers);
       return json({ ok: true, hovered: { x: r.point.x, y: r.point.y }, ...provenance(r.point) });
     }
@@ -889,7 +859,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
       const unknownVocab = refuseVocabulary(refuseUnknownValues('scroll modifiers', modifiers, EDITOR_INPUT_MODIFIERS));
       if (unknownVocab) return unknownVocab;
       const r = await resolvePoint({ x, y, selector, label, within, entity, allowOccluded }, 'scroll', requestRenderer, 'scroll');
-      if ('error' in r) return bad(r.error, r.code);
+      if ('error' in r) return badAim(r);
       // A scroll with no delta is a no-op wearing an action's name (S3.15). `deltaY` documents no
       // default and the tool shape is non-strict about intent — a misspelled `dy` reaches here as
       // nothing at all — so the pre-fix behaviour dispatched a zero-delta wheel and answered

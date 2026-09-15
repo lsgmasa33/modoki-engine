@@ -137,6 +137,9 @@ function makeRenderer(overrides?: Record<string, unknown>) {
         };
       }
       if (spec.name === 'Enemy') return { ok: false, error: '3 entities are named "Enemy" (g-a, g-b, g-c) — address by guid' };
+      // #1223 P3: the resolver's §5 fields on a refusal — an ambiguous name's guids, a stale runtime guid.
+      if (spec.name === 'Twin') return { ok: false, code: 'AMBIGUOUS', options: ['g-t1', 'g-t2'], error: '2 LIVE entities are named "Twin"' };
+      if (spec.guid === '00000000-0002-0000-0000-000000000001') return { ok: false, code: 'NOT_FOUND', stale: 'world-swapped', error: 'no live entity has that guid' };
       return { ok: false, error: `no entity with guid ${JSON.stringify(spec.guid ?? spec.name ?? spec.id)}` };
     }
     if (op === 'probe-key-reach') {
@@ -1242,6 +1245,19 @@ describe('entity-aimed input (the third target surface)', () => {
       aimedAt: 'centre',
     });
     expect(calls).toEqual(['renderer:resolve-entity-point', 'tap(500,250)']); // dispatched this time
+  });
+});
+
+describe('an entity aim refusal is relayed whole (#1223 P3)', () => {
+  /** `bad(r.error, r.code)` passed two of the resolver's four fields: the guids an ambiguous name
+   *  offers and the `stale` a runtime guid carries stopped at this host. */
+  it('options and stale reach the 400 body, on tap and on a drag endpoint', async () => {
+    const amb = await post('/api/input/tap', { entity: { name: 'Twin', surface: 'game-3d' } }) as { status: number; body: Record<string, unknown> };
+    expect(amb.status).toBe(400);
+    expect(amb.body).toMatchObject({ code: 'AMBIGUOUS', options: ['g-t1', 'g-t2'] });
+    const stale = await post('/api/input/drag', { from: { entity: { guid: '00000000-0002-0000-0000-000000000001', surface: 'game-3d' } }, to: { x: 1, y: 2 } }) as { body: Record<string, unknown> };
+    expect(stale.body).toMatchObject({ code: 'NOT_FOUND', stale: 'world-swapped' });
+    expect(calls.filter((c) => !c.startsWith('renderer:'))).toEqual([]);
   });
 });
 

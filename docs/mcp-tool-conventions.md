@@ -169,9 +169,27 @@ Two lessons outlast the rename:
   copy — the per-tool part is a SUFFIX, so the shared text stays a verbatim prefix of every variant.
 
 Rules:
-- A count of **returned rows** is `returnedCount`; a count of **everything that exists** is
-  `totalCount`. Never `entityCount` for either. When a filter or limit applied, **both** are present
-  — a total that appears only when truncation happened is not recoverable by the caller.
+- A count of **returned rows** is `returnedCount`; a count of **everything the query matched**,
+  before any limit, is `totalCount` (the meaning `hit_regions` and `find_references` already had).
+  Never `entityCount` for either. When a filter or limit applied, **both** are present — a total that
+  appears only when truncation happened is not recoverable by the caller.
+- **Landed in #1223 P5 (D3, closing #1217):**
+  - `get_scene_state` always carries both, plus `resourcesExcluded` when its default resource filter
+    left entities out. That is F8's constant, now stated.
+  - A count of **every entity in the world**, resources included, is `worldEntityTotal`: editor state,
+    both `load_scene`s and the `!scene-load` journal event.
+  - `get_layout_bounds` counts RECTS in `totalCount`/`returnedCount` (`returnedCount` only when
+    `entities` came back) and the distinct entities behind them in `entityTotal`. Its old `count` is
+    gone.
+  - A capped SECONDARY list in a reply (one that is not the reply's main rows) states its total as
+    `<list>Total`, present only past the cap: `alsoDeleted` + `alsoDeletedTotal`, `addedTraits` +
+    `addedTraitsTotal` (P4 had shipped that one as a bare `addedTraitsTruncated: true`). An absent
+    total then means the list is complete, so the count is always recoverable.
+  - `engine/tests/framework/replyCountVocabulary.test.ts` runs the real ops and fails on any
+    `entityCount` key.
+  - Still spelled otherwise, and not covered by this rename (#1266): `count`/`total`/`ringTotal` on the
+    journals and console logs, `count` on `handles`, and `modoki_list_assets`, which answers `count`
+    and adds `totalCount` only when its limit truncated — the shape this rule forbids.
 - A field whose meaning depends on the entity's layer/kind must either be renamed per meaning or
   carry the qualifier in the payload (e.g. `onScreen` + `onScreenBasis: 'viewport'|'size-only'`).
 - Space matters: any transform-shaped value states `world` or `local` **in its name or its
@@ -185,27 +203,72 @@ calls. Raw `{x,y}` is refused wherever a resolvable aim exists (`modoki_capture_
 legitimate exception: it *measures* a path).
 
 - `guid` is the only address that always works; `id` is reassigned on every scene reload.
+- **ONE live resolver decides what an entity address means: `app/debug/entityRef.ts`
+  (`resolveEntityAddress`, #1223).** Every live op that aims at an entity goes through it: the editor
+  structural ops, `apply-scene-ops`, the device lifecycle ops and `set-traits`, aimed input,
+  `scene-query`'s `exclude`, `dispatch-action`'s `targetGuid`, and `capture_gesture`'s sample (via the
+  `resolve-entity` op). There were
+  eight copies with four precedence orders. Its rules:
+  - **Exactly one of `guid` | `name` | `id`.** An empty string counts as absent, and two addresses are
+    refused (`AMBIGUOUS`). The FILE path (`sceneMutate.ts`) applies the same one-address rule; it used
+    to let `id` win where the live path let `guid` win.
+  - **`{id}` addresses only a REGISTERED entity that has NO guid.** An entity with a guid is refused
+    (`REFUSED_BY_OP`), with the guid as the one `options` entry. Since #1248 that is every entity
+    except one whose EntityAttributes was removed (or removed and re-added). koota's own world entity
+    (id 0) is not registered and is `NOT_FOUND`. `get_editor_state`'s `selection` reports `guid`/`guids`
+    beside the ids, so a read → `set_selection` restore can hand back what the op accepts.
+    A set-shaped op (`delete-entities`, `set-selection`) refuses the whole call for such an id rather
+    than skipping it. A member that matches nothing is handled as before: the EDITOR ops skip it and
+    say so, while the device `delete-entities` refuses the whole call and deletes nothing. The FILE path's `id` is the file's authored id, not a runtime one, and
+    stays accepted. Filters (`get_scene_state`'s `id`, `layout_bounds`, `watch`) are not addresses and
+    are untouched.
+  - **A miss is `NOT_FOUND`, plus `stale` when the guid is a runtime one the page can place.** The
+    values are `'despawned'` and `'world-swapped'` (`classifyRuntimeGuidMiss`, [engine-concepts.md](engine-concepts.md)
+    § Entity identity). The recovery is the same as any miss, re-reading the guid, so it is a field and
+    not a code. It travels in the op's refusal body, which the MCP envelope echoes in `got`.
 - **Every entity has a guid a tool can hand out** (#1210, #1248: `spawnEntity` gives an entity
   spawned without EntityAttributes the trait, Time and Input included). A
   code-spawned one carries a RUNTIME guid (`00000000-GGGG-GGGG-0000-…`, `isRuntimeGuid`). It works
   in every guid-addressed op now, still resolves after a `save_all` gives the entity a durable guid,
   and is **valid only until the scene reloads**, after which it misses rather than naming another
-  entity. Replies report it in `guid` like any other; the rules and the mechanism are in
+  entity. Its generation is salted per page load, so a guid from before an editor reload misses too. Replies report it in `guid` like any other; the rules and the mechanism are in
   [engine-concepts.md](engine-concepts.md) § Entity identity. ⚠️ It is a live-world address: the
   FILE path (`/api/scene-mutate`) refuses a write carrying one, because a file outlives the world.
+- **A reply names every entity by guid, never by a bare id (#1223 P2).** An id is reassigned on every
+  reload, and the mutating tools refuse it for an entity that has a guid, so a reply that hands one out
+  hands out an address the next call refuses. Three shapes, one helper each:
+  - **An object** keeps its id and gains the matching guid key beside it: `id`/`entityId`/`entity` →
+    `guid`, `parentId` → `parentGuid`, `boxEntityId` → `boxGuid`, `canvasId` → `canvasGuid`,
+    `animatorRootEntityId` → `animatorRootGuid`. In-process readers join on the id, so it stays.
+    `guidOfEntityId` (runtime `core/ecs/entityUtils.ts`) is the one reader; `liveGuidOf` names it.
+  - **An id list** becomes a guid list plus `<field>NoGuidIds` for the entities that have none, present
+    only when non-empty (`guidListFields`, `app/debug/entityRef.ts`): `delete_entities`' `deleted` (the
+    editor and device ops now share it; the device one was a count beside `guids: [null]`),
+    `layout_bounds`' `offScreen`/`zeroSize`, `diagnose`'s `transforms.zeroScale` and
+    `offScreen.guids`. `selection.entityIds` keeps its parallel `guids` array instead (P1).
+  - **A string** holds the guid, or `id:<n>` for a guid-less entity: the editor journal
+    (`journalRefOf`, `editor/undo/entityRef.ts`; it wrote `String(id)`), `input_watch`'s blocker
+    label, and `contacts`/`overlaps` partners.
+  - **Not an address:** a trait's own stored fields, echoed as the component holds them in
+    `get_scene_state`'s `full`/`trait=` rows. `traits.EntityAttributes.parentId` stays a number, because
+    set-traits reads that shape back, and the row carries `parentGuid` for it (the guard exempts exactly
+    this path). `traits.PrefabInstance.rootInstanceId` is the same kind of stored id and has NO guid
+    beside it yet; the guard's fixture has no prefab instance, so it does not see it.
+  `tests/framework/replyEntityNaming.test.ts` runs the real ops over a durable/runtime/guid-less
+  fixture and walks each reply for a bare id, so a field added later is held to this. It cannot reach
+  the `handles` meta or the pose ops' root guids, which need the panels. The editor `delete_entities`
+  mints a durable guid on every listed entity BEFORE naming it, so each guid in `deleted` resolves after
+  undo, and the `!delete` journal event names the same guids for the roots (it lists roots only). It
+  mints the descendants it names in `alsoDeleted` the same way (#1216 C-6).
 - **A reply reports `guid: null` for an entity that has no guid. It never reports `String(id)`**
   (#1199). Since #1248 no spawn produces one; only an entity whose EntityAttributes was removed after
-  spawn has no guid. The id in `guid` looked addressable, and every guid-addressed op refused it.
-  `liveGuidOf` (`app/debug/liveLifecycle.ts`) is the one helper. Two shapes differ, because a bare
-  element has no `id` beside it: `contacts`/`overlaps` list such a partner as `id:<n>`, and a `watch`
-  series reports `guid: null` plus `id`, with `id:<n>` as its internal key. A `watch read` with `guids`
+  spawn has no guid. The id in `guid` looked addressable, and every guid-addressed op refused it. A
+  `watch` series reports `guid: null` plus `id`, with `id:<n>` as its internal key. A `watch read` with `guids`
   therefore cannot select that series by its old id string. Select it with `name`. A producer that
   hands out a guid should **mint** one (the live `create-entity`, `newScene`'s starter set), not
   disguise the id.
-- **A refusal offers only what the same op accepts** (#1207). An ambiguous-name refusal lists guids,
-  never `id:<n>`: `exclude` takes a name or a guid, and the aimed-input and live-ops refusals say
-  "address by guid". A match with no guid is not listed; when NONE of the matches has one, those two
-  refusals say "address one by id" instead — both accept `{id}` — while `exclude` offers an empty list.
+- **A refusal offers only what the same op accepts** (#1207). An ambiguous-name refusal lists guids
+  in `options`, never `id:<n>`, and says "address one by guid". A match with no guid is not listed.
 - A `name` matching several entities is **refused**, everywhere — live path, file path, and input
   aim alike. First-matching is never acceptable (this was measured: one of two `DUP_probe` entities
   moved, `{ok:true, changed:1}`).
@@ -243,10 +306,11 @@ legitimate exception: it *measures* a path).
   bare `guid` could not say which. A tool that addresses one entity uses bare `id`/`guid`.
   `set_selection`'s `entityId`/`entityIds` beside `guid`/`guids` is the one mixed spelling left
   (#1208 P1-5).
-- ⚠️ **A `guid` and an `id` given together are resolved by PRECEDENCE, not refused** — the guid
-  silently wins (`resolveLiveId`, both copies). That contradicts the `AMBIGUOUS` rationale below
-  whenever a stale id names a different entity than the guid. Recorded as open (#1208 P2-2), not as
-  a decision.
+- **A `guid` and an `id` given together are REFUSED (`AMBIGUOUS`)**, flat or nested, and so are
+  `parentGuid` beside ANY `parentId` (0 included: "the root" and "under this entity" are two answers)
+  and `entityGuid` beside `entityId` (#1223 D1, which
+  settles #1208 P2-2). They used to be resolved by precedence, with the guid silently winning, which
+  acted on the guid's entity when the caller's stale id named a different one.
 - **Both addressing SHAPES are accepted, so the choice is not a guess.** Aimed-input tools nest
   (`entity:{guid|name|id}`) because they also take a selector or a raw point and the aim modes must
   stay distinguishable; the editor-op tools take a flat `guid`. That rule was written nowhere and
@@ -382,7 +446,10 @@ Rules:
   through `relayResponseFor`; the Electron IPC handler deliberately does not use it — IPC reaches
   exactly one `webContents`, so there is no broadcast and no decline to count (`main.ts`'s
   `requestRenderer` docblock) — so a conversion placed in only one of them is dead in
-  the other — the packaged editor. **The device TCP relay is a third, and it does NOT carry a code:**
+  the other — the packaged editor. **The device TCP relay is a third, and a THROW does not carry a code
+  there** (a RETURNED aim refusal does since #1223 P3: the `Error:` string ends in a
+  `[modoki-refusal]{code,options,stale}` line, `tools/shared/deviceRefusal.ts`, which
+  `deviceReplyFailure` decodes)**:**
   `bridge.ts`'s `delegateToAgentOps` flattens any throw into the `Error: <msg>` string sentinel the
   game-debug MCP flags, so an `OpRefusal` thrown by a RUNTIME op would lose its code there. None is
   thrown by one today — every recoded site is an editor op, which never runs on a device — and
@@ -1027,5 +1094,15 @@ These three needed owner sign-off because each changes the advertised surface. A
 The remaining known asymmetries are recorded rather than churned: the device↔editor NAMING
 differences (`device_console_logs` vs `modoki_get_console_logs`, …) are tabulated in
 `docs/debug-tools-mcp.md`. The two device gaps this paragraph once named (`device_type_text`,
-`device_pointer`) have both shipped. The device input tools still have no `entity` aim, although
-`resolve-entity-point` already runs there (#1208 P1-1).
+`device_pointer`) have both shipped, and the device input tools aim by `entity` too (#1223 P3,
+`docs/enact.md` § "The device surface aims the same way now"). #1223 P4 closed the rest of #1216 and wrote each
+closure into that same doc: a strict `create_entity` spec on both, `alsoDeleted` on both deletes,
+`device_handles` shaped like `modoki_handles`, `addedTraits` on every trait-adding write, and the
+invalidate-assets enum. The one difference left there, no `modoki_invalidate_assets`, is recorded as
+deliberate, with its reason.
+
+**The pattern those closures shared: the reply or schema shaping lived in the one place a surface
+passes through** (an editor route, a tool's switch, an op wrapper), so the other surface skipped it.
+Most of the fixes moved that shaping into `tools/shared/` or into the op itself. `addedTraits` needed
+the field added at each of the four places a reply is rebuilt field by field (the op wrapper, the
+relay decoder, and the route's live and file branches); dropping it at any one loses it.

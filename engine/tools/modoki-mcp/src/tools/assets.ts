@@ -534,7 +534,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'unresolvedRefsFromTarget, warnings} — direct/indirect are hop-1 vs hop>1 referrer chains.',
     {
       target: z.string().describe('What to find references TO: an asset GUID, an entity GUID (EntityAttributes.guid, or a prefab instance\'s own guid), or a virtual asset path starting with "/" (e.g. /assets/textures/wood.png).'),
-      limit: z.number().int().positive().optional().describe('Cap the returned referrer entries (default 50, max 1000). Sets truncated + totalCount.'),
+      limit: z.number().int().positive().optional().describe('Cap the returned referrer entries (default 50, max 1000). `returnedCount`/`totalCount` are always present; truncated when it bites.'),
       maxDepth: z.number().int().positive().optional().describe('How many reference hops back to walk (default 6, max 20). 1 = direct referrers only.'),
       reachableOnly: z.boolean().optional().describe('Count only references that survive a production build (reachable from a scene root) — drops references living in dead/unreferenced files.'),
     },
@@ -567,7 +567,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
         y: z.number().describe('Page CSS y.'),
       }).describe('Gesture END, in page CSS px.'),
       sampleGuid: z.string().optional().describe('Entity GUID whose Transform is sampled each frame (preferred — survives hot-reloads).'),
-      sampleEntityId: z.number().optional().describe('Entity numeric id to sample (fallback; churns across hot-reloads — prefer sampleGuid).'),
+      sampleEntityId: z.number().optional().describe('Entity numeric id to sample. Only for an entity with no guid — use sampleGuid; not together with it.'),
       steps: z.number().optional().describe('Intermediate sample count (default 12).'),
     },
     async ({ from, to, sampleGuid, sampleEntityId, steps }) => postJson('/api/capture-gesture', { from, to, sampleGuid, sampleEntityId, steps }, 60_000),

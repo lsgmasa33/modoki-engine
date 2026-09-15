@@ -93,7 +93,7 @@ describe('S2.39 — the device server knows WHICH editor it is driving', () => {
 describe('device tools reach the lease relay, and shape its replies', () => {
   it('device_get_scene_state proxies through /api/device/request with its filters', async () => {
     const s = (surface = await loadDeviceSurface((req) =>
-      req.path === '/api/device/request' ? deviceReply({ entityCount: 2, entities: [] }) : undefined));
+      req.path === '/api/device/request' ? deviceReply({ returnedCount: 2, totalCount: 2, entities: [] }) : undefined));
     await s.call('device_get_scene_state', { name: 'Player', world: true });
     const sent = s.real().find((r) => r.path === '/api/device/request');
     expect(sent?.method).toBe('POST');

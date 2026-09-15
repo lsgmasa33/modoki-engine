@@ -113,13 +113,18 @@ export interface EntityPointResolution {
   ok: boolean;
   /** Present when `ok` is false — why the entity could not be aimed at. */
   error?: string;
-  /** Machine-readable twin of `error`, for the FOUR refusals this resolver can name precisely
+  /** Machine-readable twin of `error`, for the refusals this resolver can name precisely
    *  (`docs/mcp-tool-conventions.md` §5): `NOT_FOUND` (guid/id/name matched nothing), `AMBIGUOUS`
-   *  (a `name` matched more than one entity), `AMBIGUOUS_SURFACE` (mounted in several on-screen
-   *  surfaces and `surface` was not given), `OCCLUDED` (a default, non-`allowOccluded` aim was
-   *  refused because something else is in front). Every other refusal here stays uncoded — the
+   *  (a `name` matched more than one entity, or more than one address was given), `REFUSED_BY_OP`
+   *  (an `{id}` for an entity that has a guid, #1223 D2), `AMBIGUOUS_SURFACE` (mounted in several
+   *  on-screen surfaces and `surface` was not given), `OCCLUDED` (a default, non-`allowOccluded` aim
+   *  was refused because something else is in front). Every other refusal here stays uncoded — the
    *  caller's generic `REFUSED_BY_OP` fallback is the honest answer for those. */
   code?: ErrorCode;
+  /** The real choices on an address refusal: the guids of an ambiguous name, or the guid to use instead of an id. */
+  options?: string[];
+  /** Why a runtime guid missed (`'despawned'` | `'world-swapped'`), on a `NOT_FOUND` (#1223 D4). */
+  stale?: string;
   x?: number;
   y?: number;
   /** Who resolved. Echoed back so a `{name}` aim can be checked against the entity actually

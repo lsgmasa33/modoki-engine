@@ -117,6 +117,20 @@ export function findEntity(entityId: number): Entity | null {
   return null;
 }
 
+/** An entity's guid, runtime or durable, or `null` when it has none or no live entity has that id.
+ *  The one way a reply names an entity it only holds an id for (#1199, #1223).
+ *
+ *  ⚠️ Never `String(id)` as the fallback: an id disguised as a guid looks addressable, and every
+ *  guid-addressed op refuses it. Looked up through `findEntity`, fallback scan included, because a
+ *  TEST world spawns without registering — the reply rows it builds must still name their entities. */
+export function guidOfEntityId(entityId: number): string | null {
+  const e = findEntity(entityId);
+  if (!e) return null;
+  try {
+    return e.has(EntityAttributes) ? ((e.get(EntityAttributes) as { guid?: string } | undefined)?.guid || null) : null;
+  } catch { return null; }
+}
+
 /** Get all registered traits present on an entity */
 export function getEntityTraits(entityId: number): TraitMeta[] {
   const entity = findEntity(entityId);

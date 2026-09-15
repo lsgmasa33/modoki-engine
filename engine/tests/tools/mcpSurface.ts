@@ -174,7 +174,7 @@ function safeParse(s: string): unknown {
  *  on every call. The stub must model the field the code is required to read. */
 function defaultReply(req: StubRequest): StubReply | undefined {
   if (req.path.split('?')[0] === '/api/editor-state') {
-    return { body: { ok: true, scenePath: '/@fs/tmp/stub/main.json', scenePathRef: '/assets/scenes/main.json', unsavedChanges: false, entityCount: 0 } };
+    return { body: { ok: true, scenePath: '/@fs/tmp/stub/main.json', scenePathRef: '/assets/scenes/main.json', unsavedChanges: false, worldEntityTotal: 0 } };
   }
   return undefined;
 }

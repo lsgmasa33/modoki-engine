@@ -117,6 +117,9 @@ import {
 } from '@modoki/engine/runtime';
 import { applyLiveMutate } from './liveMutate';
 import { createEntityLive, duplicateEntityLive, deleteEntitiesLive, liveGuidOf } from './liveLifecycle';
+import { resolveEntityAddress, type EntityAddress } from './entityRef';
+import type { ErrorCode } from '../../tools/shared/mcpResult';
+import { INVALIDATABLE_ASSET_TYPES, type InvalidatableAssetType } from '../../tools/shared/invalidateAssets';
 import { computeLayoutBounds, type LayoutBoundsParams, type LayoutEntry } from './layoutDump';
 import { tailWithCounts, tailHint, CONSOLE_TAIL_DEFAULT, JOURNAL_TAIL_DEFAULT } from './streamSummary';
 import { roundFloats, resolvePrecision } from './roundFloats';
@@ -185,7 +188,7 @@ interface SceneStateParams {
    *  singletons Time/Physics/NPRPostFX). They're excluded from the DEFAULT untargeted
    *  listing only — any id/trait/name/where filter already includes them. */
   resources?: boolean;
-  /** Cap the number of entities returned; sets `truncated` + `totalCount` when hit.
+  /** Cap the number of entities returned; sets `truncated` when hit (`returnedCount`/`totalCount` are always present).
    *  In INDEX mode (the untargeted default) this defaults to `DEFAULT_INDEX_LIMIT`;
    *  a targeted/enriched query stays uncapped unless you pass one. */
   limit?: number;
@@ -435,6 +438,9 @@ export function dumpSceneState(params: SceneStateParams = {}) {
   const enriched = !!(params.full || params.world || params.bounds || params.contacts);
   const indexMode = !targeted && !enriched;
   let wanted = (params.resources || targeted) ? all : all.filter((e) => !e.isResource);
+  // How many the DEFAULT resource exclusion left out — the constant F8 measured between this read and
+  // the editor state's world count (136 vs 137), which nothing in the reply used to explain.
+  const resourcesExcluded = all.length - wanted.length;
   if (params.id != null) wanted = wanted.filter((e) => e.id === params.id);
   if (params.guid) {
     const ent = findEntityByGuid(params.guid);
@@ -499,6 +505,8 @@ export function dumpSceneState(params: SceneStateParams = {}) {
   // Since #1248 every spawn has a guid (#1210's runtime mint, on EntityAttributes spawnEntity adds), so
   // only an entity whose EntityAttributes was REMOVED after spawn reaches it.
   const contactRefOf = (id: number): string => guidOf(id) ?? `id:${id}`;
+  // The parent named by guid beside `parentId` (#1223 P2); `null` for a root (parentId 0) or a guid-less parent.
+  const parentGuidOf = (parentId: number | undefined): string | null => (parentId ? guidOf(parentId) : null);
   const contactWorld = params.contacts ? getCurrentWorld() : null;
   // An unknown or WRONG-CASE `trait=` was applied silently: every entity came back with
   // `traits:{}` and no warning, which reads as "nothing in this scene has that trait" rather than
@@ -521,7 +529,7 @@ export function dumpSceneState(params: SceneStateParams = {}) {
     // address an entity (runtime ids are reassigned on every reload), and previously buried
     // inside `traits.EntityAttributes` where the untargeted caller could never cheaply see it.
     if (indexMode) {
-      return { id: info.id, guid: guidOf(info.id), name: info.name, parentId: info.parentId, layer: info.layer ?? null, traits: info.traits };
+      return { id: info.id, guid: guidOf(info.id), name: info.name, parentId: info.parentId, parentGuid: parentGuidOf(info.parentId), layer: info.layer ?? null, traits: info.traits };
     }
     const traits: Record<string, unknown> = {};
     for (const name of info.traits) {
@@ -543,7 +551,7 @@ export function dumpSceneState(params: SceneStateParams = {}) {
     // tool that tells agents "address entities by guid, ids are reassigned on every hot-reload"
     // handed back id-only rows in its most common drill-down (the live smoke suite's own shape).
     // One memoized lookup, already implemented.
-    const out: Record<string, unknown> = { id: info.id, guid: guidOf(info.id), name: info.name, parentId: info.parentId, layer: info.layer ?? null, traits };
+    const out: Record<string, unknown> = { id: info.id, guid: guidOf(info.id), name: info.name, parentId: info.parentId, parentGuid: parentGuidOf(info.parentId), layer: info.layer ?? null, traits };
     if (params.world) {
       // Resolved world TRS + effective active state (S3). worldTransforms is empty
       // until transformPropagationSystem has run a frame; omit `world` if so.
@@ -584,9 +592,14 @@ export function dumpSceneState(params: SceneStateParams = {}) {
       : undefined;
   return {
     scenePath: sceneManager.getCurrent()?.path ?? null,
-    entityCount: entities.length,
+    // §2 (#1217, #1223 D3): `returnedCount` is the rows below, `totalCount` every entity the query
+    // matched before the limit — both always, so a total never exists only when truncation happened.
+    // Never `entityCount`: it meant these rows here and the whole world in the editor state.
+    returnedCount: entities.length,
+    totalCount,
+    ...(resourcesExcluded ? { resourcesExcluded } : {}),
     entities,
-    ...(truncated ? { truncated, totalCount } : {}),
+    ...(truncated ? { truncated } : {}),
     ...(warnings.length ? { warnings } : {}),
     ...(hint ? { hint } : {}),
   };
@@ -1022,8 +1035,10 @@ registerAgentOp('dispatch-action', (params) => {
   // read back, saw no change, and had no way to tell "guid didn't resolve" from "the handler
   // ignored me" from "the clip name was wrong". Stale guids are routine (any hot-reload or
   // play→stop rebuilds the world). (C7)
-  if (p.targetGuid && !findEntityByGuid(p.targetGuid)) {
-    return { ok: false, dispatched: false, reason: `targetGuid '${p.targetGuid}' matched no entity in the live world — it may be stale (ids/entities are rebuilt on scene reload and play→stop). Re-read it with get_scene_state.`, simRunning: true };
+  // Through the shared resolver (#1223), so a stale runtime guid says which kind of stale it is.
+  const target = p.targetGuid ? resolveEntityAddress({ guid: p.targetGuid }, { label: 'targetGuid', accept: ['guid'] }) : null;
+  if (target && !target.ok) {
+    return { ok: false, dispatched: false, code: 'NOT_FOUND', ...(target.stale ? { stale: target.stale } : {}), reason: `targetGuid '${p.targetGuid}' matched no entity in the live world — it may be stale (ids/entities are rebuilt on scene reload and play→stop). Re-read it with get_scene_state.`, simRunning: true };
   }
   // The HANDLER decides whether it acted, and says so by returning a refusal (#1129). This op used to
   // re-derive that answer for two actions with hand-written pre-flights (engine.playClip's animator and
@@ -1051,27 +1066,31 @@ registerAgentOp('clear-journal', () => { clearJournal(); return { ok: true }; })
 // Mirrors the Assets-panel button path (assetViews/reimport.ts), so MCP/curl reimports now
 // refresh identically. invalidateModel disposes the model's templates + LOD siblings + mesh
 // entries and notifies onModelInvalidated listeners, which drop the live meshes for re-sync.
+const INVALIDATORS = {
+  model: invalidateModel, texture: invalidateTexture, audio: invalidateAudio, environment: invalidateEnvironment,
+} satisfies Record<InvalidatableAssetType, (path: string) => void>;
+const isInvalidatableAssetType = (t: unknown): t is InvalidatableAssetType =>
+  typeof t === 'string' && (INVALIDATABLE_ASSET_TYPES as readonly string[]).includes(t);
+
 registerAgentOp('invalidate-assets', (params) => {
   const p = (params ?? {}) as { items?: Array<{ path?: string; type?: string }> };
-  let models = 0, textures = 0, audio = 0, environments = 0;
+  // THE list of cache-holding kinds for the server-driven path — the /api/reimport route forwards
+  // every baked type and lets this decide (#304 close-out). A type with no row is ignored on purpose:
+  // `font` refreshes through the manifest-hash channel, and atlas/video hold no engine-side cache. Keep
+  // in step with assetViews/reimport.ts, which is the same decision for the client-side path. Typed
+  // against the shared tuple `device_invalidate_assets` derives its enum from (#1216 C-13).
+  const counts: Record<InvalidatableAssetType, number> = { model: 0, texture: 0, audio: 0, environment: 0 };
   for (const it of p.items ?? []) {
-    if (!it?.path) continue;
-    // THE list of cache-holding kinds for the server-driven path — the /api/reimport
-    // route now forwards every baked type and lets this decide (#304 close-out). A type
-    // with no branch here is ignored on purpose: `font` refreshes through the
-    // manifest-hash channel, and atlas/video hold no engine-side cache. Keep in step
-    // with assetViews/reimport.ts, which is the same decision for the client-side path.
-    if (it.type === 'model') { invalidateModel(it.path); models++; }
-    else if (it.type === 'texture') { invalidateTexture(it.path); textures++; }
-    else if (it.type === 'audio') { invalidateAudio(it.path); audio++; }
-    else if (it.type === 'environment') { invalidateEnvironment(it.path); environments++; }
+    if (!it?.path || !isInvalidatableAssetType(it.type)) continue;
+    INVALIDATORS[it.type](it.path);
+    counts[it.type]++;
   }
-  return { ok: true, models, textures, audio, environments };
+  return { ok: true, models: counts.model, textures: counts.texture, audio: counts.audio, environments: counts.environment };
 });
 
 // ── Phase B: numeric screen-space layout/bounds (turn "is it laid out right?" into data) ──
 registerAgentOp('layout-bounds', (params) => {
-  // Same reasoning as scene-state. `diagnose` reads `computeLayoutBounds().offScreen` (ids, ints)
+  // Same reasoning as scene-state. `diagnose` reads `computeLayoutBounds().offScreen` (guids)
   // from the PRODUCER, so it is unaffected either way — but keep the rounding here regardless.
   const p = (params ?? {}) as LayoutBoundsParams & { precision?: number };
   const result = roundFloats(computeLayoutBounds(p), resolvePrecision(p.precision)) as Record<string, unknown>;
@@ -1125,6 +1144,16 @@ registerAgentOp('layout-settling', () => layoutSettleReport());
 // entity's LIVE screen rect so a viewport tap never has to be aimed from coordinates read in
 // an earlier round-trip. Renderer-side because only the renderer holds the camera, the
 // PixiJS bounds, and the DOM. ──
+/** Resolve ONE entity address — `{guid}` | `{name}` | `{id}` — with the shared resolver and nothing
+ *  else (#1223). For a HOST route that must name its target before it acts and has no world of its
+ *  own to look in: `capture_gesture`'s sample. It replaced a `scene-state` probe filtering
+ *  `EntityAttributes.guid=<g>` by string, which missed a runtime guid a save had since re-minted and
+ *  let a guid beside an id silently win. */
+registerAgentOp('resolve-entity', (params) => {
+  const r = resolveEntityAddress((params ?? {}) as EntityAddress, { label: 'entity' });
+  return r.ok ? { ok: true, id: r.id, guid: r.guid, name: r.name } : r;
+});
+
 registerAgentOp('resolve-entity-point', (params) => {
   const result = resolveEntityPointReport((params ?? {}) as EntityPointSpec) as unknown as Record<string, unknown>;
   // #682 close-out (LOW 6): a 2D/3D entity's rect comes from the same registered bounds
@@ -1599,21 +1628,21 @@ function queryHitRef(entityId: number): { entityId: number; guid: string | null;
 }
 
 /** Resolve the `exclude` argument — a name or guid, never a raw id — to a runtime id.
- *  An ambiguous NAME is REFUSED rather than first-matched (§3, on every path). */
-function resolveExclude(spec: string): { id: number } | { error: string; options?: string[] } {
-  const byGuid = findEntityByGuid(spec);
-  if (byGuid) return { id: byGuid.id() };
-  const matches = getAllEntities().filter((e) => e.name === spec);
-  if (matches.length === 0) return { error: `exclude: no entity named or guid'd '${spec}' in the live world` };
-  if (matches.length > 1) {
-    // Guids only (#1207): every option must be something `exclude` itself accepts, and it takes a
-    // name or a guid — never an id. Since #1210 every entity spawned with EntityAttributes has one.
-    return {
-      error: `exclude: '${spec}' matches ${matches.length} entities — an ambiguous name is refused everywhere, never first-matched`,
-      options: matches.map((m) => m.guid).filter((g): g is string => !!g),
-    };
-  }
-  return { id: matches[0].id };
+ *
+ *  One string that may be either, so it cannot go to the shared resolver (`entityRef.ts`) as one
+ *  address: a guid-shaped string is tried as a guid and falls back to a name only when it misses, as
+ *  before. Both halves use that resolver, so an ambiguous NAME is refused rather than first-matched
+ *  (§3, on every path), and a miss is `NOT_FOUND` — it used to reach the caller coded `AMBIGUOUS`. */
+function resolveExclude(spec: string): { id: number } | { error: string; code: ErrorCode; options?: string[]; stale?: string } {
+  const byGuid = resolveEntityAddress({ guid: spec }, { label: 'exclude', accept: ['guid'] });
+  if (byGuid.ok) return { id: byGuid.id };
+  const byName = resolveEntityAddress({ name: spec }, { label: 'exclude', accept: ['name'] });
+  if (byName.ok) return { id: byName.id };
+  if (byName.code === 'AMBIGUOUS') return { error: byName.error, code: 'AMBIGUOUS', options: byName.options ?? [] };
+  return {
+    error: `exclude: no entity named or guid'd '${spec}' in the live world${byGuid.stale ? ` — a runtime guid that is stale (${byGuid.stale})` : ''}`,
+    code: 'NOT_FOUND', ...(byGuid.stale ? { stale: byGuid.stale } : {}),
+  };
 }
 
 registerAgentOp('scene-query', (params) => {
@@ -1699,7 +1728,7 @@ registerAgentOp('scene-query', (params) => {
       return { ok: false, code: 'REFUSED_BY_OP', error: "exclude is not supported for kind:'shapecast' — the underlying castShape takes no exclusion filter. Use kind:'raycast', or offset the origin past your own collider." };
     }
     const r = resolveExclude(p.exclude);
-    if ('error' in r) return { ok: false, code: 'AMBIGUOUS', error: r.error, options: r.options };
+    if ('error' in r) return { ok: false, code: r.code, error: r.error, ...(r.options ? { options: r.options } : {}), ...(r.stale ? { stale: r.stale } : {}) };
     excludeId = r.id;
   }
 
@@ -2236,7 +2265,7 @@ registerAgentOp('load-scene', async (params) => {
   if (myId !== null && cur !== null) {
     if (cur.id === myId) {
       // Our load won the swap — unchanged success reply.
-      return { ok: true, current: after, previous: before, entityCount: getAllEntities().length };
+      return { ok: true, current: after, previous: before, worldEntityTotal: getAllEntities().length };
     }
     // ⚠️ `> myId`, NOT `!== myId`. Scene ids come from a monotonic `this.nextSceneId++`
     // (loadScene's `nextSceneId` bump), so only an id GREATER than ours is evidence that a LATER load won
@@ -2253,7 +2282,7 @@ registerAgentOp('load-scene', async (params) => {
       // says nothing about whether `p.path` exists.
       if (cur.path === p.path) {
         // The same requested path won, so the caller's requested end state IS true — just not
-        // because of THIS op's load. `entityCount` is deliberately omitted: it would be a live
+        // because of THIS op's load. `worldEntityTotal` is deliberately omitted: it would be a live
         // read of a world this op did not load.
         return {
           ok: true, current: after, previous: before,
@@ -2275,7 +2304,7 @@ registerAgentOp('load-scene', async (params) => {
   if (after !== p.path) {
     return { ok: false, error: `load-scene did not switch to "${p.path}" — the active scene is ${after ?? 'null'}. Check the path exists in this build.`, current: after, previous: before };
   }
-  return { ok: true, current: after, previous: before, entityCount: getAllEntities().length };
+  return { ok: true, current: after, previous: before, worldEntityTotal: getAllEntities().length };
 });
 
 // SIM_STEP_MAX_TIMEOUT_MS / simStepDefaultTimeout are imported at the top of this file (from

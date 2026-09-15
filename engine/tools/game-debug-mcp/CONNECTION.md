@@ -97,7 +97,7 @@ WebGPU screenshot is black:
 | `device_diagnose` | Structured render/scene health — the causes behind a black/wrong frame (console errors, off-screen entities, missing camera, bad transforms) |
 | `device_journal` | Tick-stamped game-event trace (match/score/@contact/…) — verify LOGIC without pixels |
 | `device_introspect` | Dispatchable action names (+ schemas) and live named read-values |
-| `device_layout_bounds` | Numeric screen-space rects (UI DOM / 2D / 3D world-AABB projected); bare = counts + offScreen/zeroSize ids |
+| `device_layout_bounds` | Numeric screen-space rects (UI DOM / 2D / 3D world-AABB projected); bare = counts + offScreen/zeroSize guids |
 | `device_watch` | Standing numeric time-series over the live world (`start`/`read`/`list`/`clear`) — spring settle, velocity decay, overshoot |
 
 **Enact — trusted input:**

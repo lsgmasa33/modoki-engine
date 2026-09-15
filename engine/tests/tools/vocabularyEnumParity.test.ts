@@ -13,6 +13,10 @@ import { loadSurface, type Surface } from './mcpSurface';
 import { loadDeviceSurface, type DeviceSurface } from './deviceSurface';
 import { CREATE_ENTITY_KINDS, LIGHT_KINDS, JOURNAL_LEVELS } from '../../packages/modoki/src/runtime/index';
 import { UI_PRESET_NAMES } from '../../packages/modoki/src/runtime/ui/uiAuthoring';
+import { PRIMITIVE_NAMES } from '../../packages/modoki/src/runtime/loaders/primitives';
+import { PRIMITIVE_SPRITE_NAMES } from '../../packages/modoki/src/runtime/loaders/sceneValidation';
+import { createEntitySpecKeys, resolveCreateEntitySpec } from '../../packages/modoki/src/runtime/scene/createEntitySpec';
+import * as V from '../../tools/shared/createEntityVocabulary';
 import { EDITOR_JOURNAL_SOURCES } from '../../packages/modoki/src/editor/editorJournal';
 import { DEVICE_KEY_MODIFIERS, EDITOR_INPUT_MODIFIERS, KEY_ARG_DESCRIPTION, MOUSE_BUTTONS, POINTER_ACTIONS } from '../../tools/shared/inputVocabulary';
 
@@ -91,14 +95,69 @@ describe('editor MCP tool enums == the runtime tables', () => {
     expect(described).toContain(KEY_ARG_DESCRIPTION);
   });
 
-  it('modoki_create_entity.kind offers every runtime kind except `environment`', () => {
+  // #1216 C-3: it offered every kind but `environment`, which the device tool and the op both built —
+  // an asymmetry nothing recorded a reason for.
+  it('modoki_create_entity.kind offers every runtime kind', () => {
     surface = loadSurface();
-    const offered = enumOf(surface, 'modoki_create_entity', 'kind');
-    // Every kind the tool offers must be one the op builds.
-    expect(offered.filter((k) => !(CREATE_ENTITY_KINDS as readonly string[]).includes(k))).toEqual([]);
-    // And the one the op builds that the tool does not offer is named, so a NEW kind added to the
-    // runtime without the tool fails here instead of being quietly unreachable.
-    expect(CREATE_ENTITY_KINDS.filter((k) => !offered.includes(k))).toEqual(['environment']);
+    expect(sorted(enumOf(surface, 'modoki_create_entity', 'kind'))).toEqual(sorted(CREATE_ENTITY_KINDS));
+  });
+});
+
+/** #1216 C-3 — both create_entity tools derive from `tools/shared/createEntityVocabulary.ts`, a copy
+ *  of the runtime tables (neither MCP package imports the engine). This pins the copy. */
+describe('the shared create-entity vocabulary == the runtime tables', () => {
+  it.each([
+    { list: 'CREATE_ENTITY_KINDS', copy: V.CREATE_ENTITY_KINDS, table: CREATE_ENTITY_KINDS },
+    { list: 'PRIMITIVE_MESHES', copy: V.PRIMITIVE_MESHES, table: PRIMITIVE_NAMES },
+    { list: 'SPRITE_SHAPES', copy: V.SPRITE_SHAPES, table: PRIMITIVE_SPRITE_NAMES },
+    { list: 'LIGHT_KINDS', copy: V.LIGHT_KINDS, table: LIGHT_KINDS },
+    { list: 'UI_PRESETS', copy: V.UI_PRESETS, table: UI_PRESET_NAMES },
+  ])('$list', ({ copy, table }) => {
+    expect(sorted(copy)).toEqual(sorted(table));
+  });
+
+  it.each([...CREATE_ENTITY_KINDS])('kind %s: the same field and default the op applies', (kind) => {
+    const field = (V.CREATE_ENTITY_FIELDS as Record<string, { key: string; fallback: string } | undefined>)[kind];
+    expect(createEntitySpecKeys(kind)).toEqual(field ? ['kind', field.key] : ['kind']);
+    if (!field) return;
+    const r = resolveCreateEntitySpec({ kind });
+    expect(r.ok && (r.spec as unknown as Record<string, unknown>)[field.key]).toBe(field.fallback);
+  });
+});
+
+describe('device_create_entity.spec is one strict object per kind (#1216 C-3)', () => {
+  it('a typo\'d key, another kind\'s field and an unknown kind are refused by the schema', async () => {
+    device = await loadDeviceSurface();
+    const typo = device.validate('device_create_entity', { spec: { kind: 'primitive', mseh: 'cube' } });
+    expect(typo.ok).toBe(false);
+    expect(typo.error).toMatch(/a "primitive" spec accepts only: kind, mesh/);
+    expect(device.validate('device_create_entity', { spec: { kind: 'primitive', shape: 'circle' } }).ok).toBe(false);
+    expect(device.validate('device_create_entity', { spec: { kind: 'empty', name: 'X' } }).ok).toBe(false);
+    // Review: the union's own miss said only "Invalid input"; the op this now pre-empts named the kinds.
+    // Mutation: drop the `error` option from makeDeviceCreateEntitySpec's z.discriminatedUnion.
+    expect(device.validate('device_create_entity', { spec: { kind: 'pyramid' } }).error).toMatch(/spec\.kind must be one of: empty, primitive/);
+  });
+
+  it('every kind, alone and with its own field, is accepted', async () => {
+    device = await loadDeviceSurface();
+    for (const kind of CREATE_ENTITY_KINDS) {
+      expect(device.validate('device_create_entity', { spec: { kind } }).ok, kind).toBe(true);
+      const field = (V.CREATE_ENTITY_FIELDS as Record<string, { key: string; values: readonly string[] } | undefined>)[kind];
+      for (const value of field?.values ?? []) {
+        expect(device.validate('device_create_entity', { spec: { kind, [field!.key]: value } }).ok, `${kind} ${value}`).toBe(true);
+      }
+    }
+  });
+});
+
+describe('modoki_create_entity relays every field it was given, whatever the kind (#1216 C-3)', () => {
+  // The tool copied only the kind's own field into `spec`, so `{kind:'primitive', shape:'circle'}`
+  // dropped `shape` before the op could refuse it and built a sphere.
+  it('a field of another kind reaches the op, which refuses it', async () => {
+    surface = loadSurface();
+    await surface.call('modoki_create_entity', { kind: 'primitive', shape: 'circle' });
+    const body = surface.last()?.body as { spec?: Record<string, unknown>; params?: { spec?: Record<string, unknown> } };
+    expect(body.spec ?? body.params?.spec).toEqual({ kind: 'primitive', shape: 'circle' });
   });
 });
 

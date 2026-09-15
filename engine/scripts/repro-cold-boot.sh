@@ -92,7 +92,7 @@ for i in $(seq 1 "$N"); do
   for _ in $(seq 1 90); do
     kill -0 $PID 2>/dev/null || break          # died — the interesting case; fall through to reporting
     entities=$(curl -s -m 2 "http://127.0.0.1:$PORT/api/scene-state" 2>/dev/null \
-      | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).entityCount??0))}catch{process.stdout.write("0")}})' 2>/dev/null || echo 0)
+      | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const j=JSON.parse(s);process.stdout.write(String(j.returnedCount??j.entityCount??0))}catch{process.stdout.write("0")}})' 2>/dev/null || echo 0)
     [ "${entities:-0}" -gt 0 ] 2>/dev/null && break
     sleep 1
   done
@@ -111,7 +111,7 @@ for i in $(seq 1 "$N"); do
     hits=$((hits+1)); echo "run $i: ★ REPRO — stale-export signature in: $SIG (cacheWipe=$WIPED)"
     [ -n "$BOUNDARY" ] && echo "         $BOUNDARY"
   elif [ "${entities:-0}" -gt 0 ] 2>/dev/null; then
-    clean=$((clean+1)); echo "run $i: ok  entityCount=$entities (cacheWipe=$WIPED)"
+    clean=$((clean+1)); echo "run $i: ok  returnedCount=$entities (cacheWipe=$WIPED)"
   else
     other=$((other+1)); echo "run $i: ??  no scene, no signature (cacheWipe=$WIPED) — see run-$i.app.log"
     tail -5 "$APPLOG" | sed 's/^/         /'

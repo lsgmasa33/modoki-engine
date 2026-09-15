@@ -7,7 +7,7 @@ import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
 import { editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled, withEditorActor } from '@modoki/engine/editor';
-import { setRunMode, setManualNow, restoreRealClock } from '@modoki/engine/runtime';
+import { setRunMode, setManualNow, restoreRealClock, createTestWorld, Transform, EntityAttributes } from '@modoki/engine/runtime';
 import { recordConsoleRingEntry } from '@modoki/engine/runtime/core/consoleRing';
 
 registerAllTraits();
@@ -32,6 +32,20 @@ describe('wait-for op', () => {
 
   it('refuses a where naming an unknown trait — the scene-state parser, not a second copy', async () => {
     expect(await refusalText(runAgentOp('wait-for', { entity: { where: 'NoSuchTrait.x = 1' }, timeoutMs: 5000 }))).toMatch(/unknown trait "NoSuchTrait"/);
+  });
+
+  // #1223 D3: the reader asks scene-state for one example row (`limit:1`) and counts from `totalCount`,
+  // which is every match. It fell back to `entityCount` when nothing was truncated; that field is gone.
+  // Mutation: count from `returnedCount` (the one row) instead of `totalCount`.
+  it('entity: matches counts every entity the query matched, not the one example row', async () => {
+    const game = createTestWorld({});
+    try {
+      for (let i = 0; i < 3; i++) game.spawn(Transform(), EntityAttributes({ name: 'Waitee' }));
+      const r = await runAgentOp('wait-for', { entity: { name: 'Waitee' }, timeoutMs: 50 }) as Result;
+      expect(r).toMatchObject({ satisfied: true, observation: { matches: 3 } });
+      const gone = await runAgentOp('wait-for', { entity: { name: 'Nobody', absent: true }, timeoutMs: 50 }) as Result;
+      expect(gone).toMatchObject({ satisfied: true, observation: { matches: 0 } });
+    } finally { game.dispose(); }
   });
 
   it('editor: reads the live editor state', async () => {

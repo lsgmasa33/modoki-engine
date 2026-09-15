@@ -136,9 +136,9 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_get_layout_bounds',
     'Numeric screen-space layout of ENTITIES (viewport CSS px) — UI (true DOM/flexbox rects), 2D, and 3D ' +
       '(world AABB projected through the game camera); for editor HANDLES use modoki_handles. Use this INSTEAD of eyeballing a screenshot ' +
-      'to check alignment, spacing, overlap, or clipping. NOTE `count` counts RECTS, not entities: every 3D entity is measured once PER MOUNTED VIEWPORT (Scene and Game each have their own camera), so with both open it is roughly doubled. `entityCount` is the distinct-entity number, and `surfaces`/`surfaceNote` appear whenever more than one is mounted. CALLED BARE it returns COUNTS — count, ' +
-      'layerCounts, overlapsCount — plus the cheap `offScreen` and `zeroSize` id lists. Those ids ' +
-      'are usually the whole answer ("what is invisible / collapsed?"). For per-entity rects pass ' +
+      'to check alignment, spacing, overlap, or clipping. NOTE `totalCount` (and `returnedCount`, the rects in `entities`) count RECTS, not entities: every 3D entity is measured once PER MOUNTED VIEWPORT (Scene and Game each have their own camera), so with both open it is roughly doubled. `entityTotal` is the distinct-entity number, and `surfaces`/`surfaceNote` appear whenever more than one is mounted. CALLED BARE it returns COUNTS — totalCount, ' +
+      'layerCounts, overlapsCount — plus the cheap `offScreen` and `zeroSize` GUID lists (an entity with no ' +
+      'guid goes in `offScreenNoGuidIds`/`zeroSizeNoGuidIds`). Those lists are usually the whole answer ("what is invisible / collapsed?"). For per-entity rects pass ' +
       '`ids` or `layer`; for the same-layer overlapping PAIRS (ancestor pairs excluded) pass ' +
       '`overlaps:true` — the pair list is O(n²) and was ~105k chars on a 241-entity scene, so it is ' +
       'opt-in. Cross-check against modoki_capture_viewport when unsure.',
@@ -149,7 +149,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       ids: z.array(z.number()).optional().describe('Limit to these entity ids. Implies per-entity rects.'),
       entities: z.boolean().optional().describe('Force the per-entity rect list on an untargeted call. Large — prefer ids/layer.'),
       overlaps: z.boolean().optional().describe('Materialize the overlapping-pair list. Default false (only overlapsCount is reported) because it is O(n²) and dominated the response.'),
-      limit: z.number().int().positive().optional().describe('Cap the returned per-entity rects; sets truncated + totalCount. Useful with layer= on a big scene.'),
+      limit: z.number().int().positive().optional().describe('Cap the returned per-entity rects (`returnedCount`); sets truncated when it bites. Useful with layer= on a big scene.'),
       precision: precisionParam(),
     },
     async ({ layer, ids, guids, name, entities, overlaps, limit, precision }) => {

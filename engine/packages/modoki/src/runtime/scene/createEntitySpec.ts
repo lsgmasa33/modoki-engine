@@ -54,13 +54,34 @@ const VOCABULARY_FIELDS: Partial<Record<CreateEntitySpec['kind'], VocabularyFiel
 
 const shown = (value: unknown): string => (typeof value === 'string' ? `"${value}"` : String(JSON.stringify(value)));
 
+/** The keys a spec of `kind` may carry: `kind` itself plus its vocabulary field, if it has one. */
+export function createEntitySpecKeys(kind: CreateEntitySpec['kind']): string[] {
+  const field = VOCABULARY_FIELDS[kind];
+  return field ? ['kind', field.key] : ['kind'];
+}
+
 /** Apply the kind's default and check every vocabulary field. The input is not mutated — a caller's
- *  payload object is not the op's to rewrite. */
+ *  payload object is not the op's to rewrite.
+ *
+ *  ⚠️ **A key the kind does not take is REFUSED, not ignored** (#1216 C-3). The builders read only
+ *  their own field, so `{kind:'primitive', mseh:'cube'}` built the DEFAULT sphere and answered ok —
+ *  a typo, or a field meant for another kind (`shape` on a primitive), read as a successful create of
+ *  something else. The MCP schemas are strict too, but this is the check the curl API and a device
+ *  `eval` body reach, so it is the one that holds for every caller. */
 export function resolveCreateEntitySpec(raw: object): CreateEntitySpecResolution {
   const spec = { ...raw } as Record<string, unknown>;
   const kind = spec.kind;
   if (typeof kind !== 'string' || !isCreateEntityKind(kind)) {
     return { ok: false, error: `unknown entity kind ${shown(kind)} — nothing was created.`, options: [...CREATE_ENTITY_KINDS] };
+  }
+  const keys = createEntitySpecKeys(kind);
+  const stray = Object.keys(spec).filter((k) => !keys.includes(k));
+  if (stray.length) {
+    return {
+      ok: false,
+      error: `a "${kind}" spec takes no ${stray.map((k) => `"${k}"`).join(', ')} — nothing was created.`,
+      options: keys,
+    };
   }
   const field = VOCABULARY_FIELDS[kind];
   if (field) {

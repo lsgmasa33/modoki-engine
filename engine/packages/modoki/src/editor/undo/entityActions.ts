@@ -16,7 +16,7 @@ import { markOverride, getOverrideMarkSet, restoreOverrideMarks, clearOverrideMa
 import { worldTransforms } from '../../runtime/core/ecs/transformPropagationSystem';
 import { decomposeTrs } from '../../runtime/core/ecs/decomposeTrs';
 import { pushAction, type EditDetail } from './undoManager';
-import { entityRef, ensureGuid, buildGuidIndex, resolveWith, type EntityRef } from './entityRef';
+import { entityRef, ensureGuid, buildGuidIndex, resolveWith, journalRefOf, type EntityRef } from './entityRef';
 import { notifyFieldEdited } from '../animation/recording';
 import { resolveAffectedScenes, markSceneDirty } from '../scene/sceneDirty';
 
@@ -330,9 +330,9 @@ export function pasteTraitAsNewWithUndo(entityIds: number[], meta: TraitMeta, va
 type ActionCallback = (action: { label: string; undo: () => void; redo: () => void; coalesceKey?: string; detail?: EditDetail; kind?: string; journalPayload?: Record<string, unknown>; affectedScenes?: string[] }) => void;
 
 /** GUID for a parent id in a structural journal payload: 'root' for 0, else the
- *  entity's stable guid (stringified raw id only for an un-guidable entity). */
+ *  entity's stable guid (`id:<n>` only for an un-guidable entity — see `journalRefOf`). */
 function parentGuid(parentId: number): string {
-  return parentId ? (entityRef(parentId).guid || String(parentId)) : 'root';
+  return parentId ? journalRefOf(entityRef(parentId).guid, parentId) : 'root';
 }
 
 /** Build the structured `!edit` diff (Percept V1) from positionally-aligned refs +
@@ -342,7 +342,7 @@ function editDetail(refs: EntityRef[], meta: TraitMeta, field: string, olds: unk
   return {
     trait: meta.name,
     field: field || '',
-    entities: refs.map((r) => r.guid || String(r.rawId)),
+    entities: refs.map((r) => journalRefOf(r.guid, r.rawId)),
     old: olds,
     new: news,
   };
@@ -543,7 +543,7 @@ export function createEntityWithUndo(
     undo: () => { const id = findByRootGuid(guid) ?? (findEntity(currentId) ? currentId : null); if (id != null) deleteEntity(id); selectEntity(null); },
     redo: () => { if (snap) { currentId = respawnFromSnapshot(snap, parentRef?.resolve() ?? 0); selectEntity(currentId); } },
     kind: '!create',
-    journalPayload: { entity: guid || String(currentId), parent: parentGuid(parentId) },
+    journalPayload: { entity: journalRefOf(guid, currentId), parent: parentGuid(parentId) },
     affectedScenes,
   });
   return currentId;
@@ -606,7 +606,7 @@ export function createEntitySubtreeWithUndo(
     undo: () => { const id = findByRootGuid(guid) ?? (findEntity(currentId) ? currentId : null); if (id != null) deleteEntity(id); selectEntity(null); },
     redo: () => { if (snap) { currentId = respawnFromSnapshot(snap, parentRef?.resolve() ?? 0); selectEntity(currentId); } },
     kind: '!create',
-    journalPayload: { entity: guid || String(currentId), parent: parentGuid(parentId) },
+    journalPayload: { entity: journalRefOf(guid, currentId), parent: parentGuid(parentId) },
     affectedScenes,
   });
   return currentId;
@@ -680,7 +680,7 @@ export function duplicateEntity(
     kind: '!duplicate',
     // Source guid from the attrData already read above — do NOT entityRef(entityId) here:
     // that mints+writes a guid to the SOURCE, dirtying authored data purely to log it.
-    journalPayload: { entity: guid || String(currentId), source: ((attrData?.guid as string) || String(entityId)), parent: parentGuid(parentId) },
+    journalPayload: { entity: journalRefOf(guid, currentId), source: journalRefOf(attrData?.guid as string, entityId), parent: parentGuid(parentId) },
     affectedScenes,
   });
   return currentId;
@@ -752,7 +752,7 @@ export function deleteEntitiesWithUndo(
       setSelection?.([]);
     },
     kind: '!delete',
-    journalPayload: { entities: snaps.map(s => s.guid || String(s.snapshot.id)) },
+    journalPayload: { entities: snaps.map(s => journalRefOf(s.guid, s.snapshot.id)) },
     affectedScenes,
   });
 }
@@ -781,7 +781,7 @@ export function deleteEntityWithUndo(entityId: number): void {
     undo: () => { respawnFromSnapshot(snapshot, parentRef?.resolve() ?? 0); },
     redo: () => { const id = findByRootGuid(guid); if (id != null) deleteEntity(id); },
     kind: '!delete',
-    journalPayload: { entities: [guid || String(entityId)] },
+    journalPayload: { entities: [journalRefOf(guid, entityId)] },
     affectedScenes,
   });
 }
@@ -969,7 +969,7 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
     kind: '!reparent',
     // `from`/`to` are parent guids ('root' for scene root); equal when this is a pure
     // reorder (sortOrder change under the same parent).
-    journalPayload: { entity: ref.guid || String(entityId), from: parentGuid(oldParentId), to: parentGuid(savedNewParentId), reorder: !parentChanged },
+    journalPayload: { entity: journalRefOf(ref.guid, entityId), from: parentGuid(oldParentId), to: parentGuid(savedNewParentId), reorder: !parentChanged },
     affectedScenes,
   });
 
@@ -1269,7 +1269,7 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
     },
     kind: '!sceneMove',
     journalPayload: {
-      entity: rootRef.guid || String(entityId),
+      entity: journalRefOf(rootRef.guid, entityId),
       from: fromScene || 'primary', to: targetScene || 'primary',
       count: ids.length, reRooted, rekeyed: rekeyPairs.length,
     },

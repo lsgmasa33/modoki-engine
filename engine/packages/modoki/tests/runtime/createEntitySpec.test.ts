@@ -58,6 +58,22 @@ describe('unknown vocabulary is refused WITH the real options', () => {
   });
 });
 
+/** #1216 C-3: the builders read only their kind's own field, so any other key was silently dropped —
+ *  `{kind:'primitive', mseh:'cube'}` built the default sphere. */
+describe('a key the kind does not take is refused, naming the keys it does', () => {
+  it.each([
+    { raw: { kind: 'primitive', mseh: 'cube' }, stray: 'mseh', keys: ['kind', 'mesh'] },
+    { raw: { kind: 'primitive', shape: 'circle' }, stray: 'shape', keys: ['kind', 'mesh'] },
+    { raw: { kind: 'empty', name: 'Probe' }, stray: 'name', keys: ['kind'] },
+    { raw: { kind: 'light', light: 'spot', intensity: 2 }, stray: 'intensity', keys: ['kind', 'light'] },
+  ])('$raw', ({ raw, stray, keys }) => {
+    const r = refusal(raw);
+    expect(r.error).toContain(`takes no "${stray}"`);
+    expect(r.error).toContain('nothing was created');
+    expect(r.options).toEqual(keys);
+  });
+});
+
 describe('the accept side — every real value passes', () => {
   it.each([
     ...PRIMITIVE_NAMES.map((mesh) => ({ kind: 'primitive', mesh })),

@@ -29,7 +29,10 @@ import {
   type LastScreenInfo,
   type ScreenInfoParam,
 } from './bridgeHelpers';
-import type { AimGesture } from './domPointContract';
+import { deviceAimKeys, type AimGesture } from './domPointContract';
+import type { EntityPointResolution, EntityPointSpec } from './entityPointContract';
+import { entityAimOutcome, type AimRefusal } from './entityAimRefusal';
+import { encodeDeviceRefusal } from '../../tools/shared/deviceRefusal';
 
 interface Request {
   id: string;
@@ -250,13 +253,16 @@ function pickCanvasAt(x: number, y: number): CanvasPick {
 interface DomResolution {
   ok: boolean; x?: number; y?: number;
   matched?: string | null; hitTarget?: string | null; occluded?: boolean; error?: string;
+  code?: 'NOT_FOUND' | 'AMBIGUOUS';
 }
 
 // `hitTarget` is set ONLY by the selector branch of `resolveAim` — a raw x/y aim never claimed
 // anything was under it, so there is nothing for a later re-check to have drifted FROM. `undefined`
 // (not resolved by selector) and `null` (selector resolved, but nothing was there) are both real,
 // distinct answers; see `aimDriftSuffix` below, which is the sole reader of this field.
-type Aim = { x: number; y: number; label: string; hitTarget?: string | null } | { error: string };
+// A refusal is an `AimRefusal` whose `error` carries the `Error:` sentinel; a handler that answers
+// with it renders it through `encodeDeviceRefusal`, so its code/options/stale reach the MCP (#1223 P3).
+type Aim = { x: number; y: number; label: string; hitTarget?: string | null } | AimRefusal;
 
 /** Resolve a CSS selector to a viewport point (+ occlusion) via the shared runtime op — reused so a
  *  device tap/drag can aim by selector, occlusion-checked server-side, with no screenshot round-trip. */
@@ -265,30 +271,82 @@ async function resolveSelectorPoint(selector: string, gesture: AimGesture | unde
   return (await runAgentOp('resolve-dom-point', { selector, gesture })) as DomResolution;
 }
 
-/** Resolve an aim point from EITHER a CSS `selector` (resolved + occlusion-checked on-device) or
- *  screenshot pixel coords (converted via the last capture). `selKey`/`xKey`/`yKey` name the params
- *  (tap uses selector/x/y; drag uses fromSelector/fromX/fromY and toSelector/toX/toY). A selector
- *  that misses or is occluded returns an `Error:` string (surfaced as isError by the MCP client). */
+/** Resolve an aim point from an ENTITY (`{guid|name|id, surface}`, #1223 P3), a CSS `selector`
+ *  (resolved + occlusion-checked on-device), or screenshot pixel coords (converted via the last
+ *  capture) — in that precedence, the editor routes' order (`resolvePoint`). `selKey`/`xKey`/`yKey`
+ *  name the params (tap uses selector/x/y; drag uses fromSelector/fromX/fromY and
+ *  toSelector/toX/toY); the entity and `allowOccluded` keys follow from `selKey` (`deviceAimKeys`).
+ *  A miss or a covered target returns a refusal (surfaced as isError by the MCP client). */
 async function resolveAim(
   // `| undefined` is the honest type: `handleResolveAim` legitimately produces it for an unknown
   // gesture, and the renderer reads absent as the STRICT reading. A cast here claimed otherwise.
   params: Record<string, unknown>, selKey: string, xKey: string, yKey: string,
   gesture: AimGesture | undefined,
 ): Promise<Aim> {
+  const keys = deviceAimKeys(selKey);
+  const allowOccluded = params[keys.allowOccluded] === true;
+  const entity = params[keys.entity];
+  if (entity && typeof entity === 'object' && !Array.isArray(entity) && Object.keys(entity).length > 0) {
+    return resolveEntityAim(entity as EntityPointSpec, keys.which || gesture || 'aim', allowOccluded, gesture);
+  }
   const selector = params[selKey];
   if (typeof selector === 'string' && selector) {
     const r = await resolveSelectorPoint(selector, gesture);
     if (!r.ok || typeof r.x !== 'number' || typeof r.y !== 'number') {
-      return { error: `Error: ${r.error ?? `selector ${JSON.stringify(selector)} did not resolve`}` };
+      return { error: `Error: ${r.error ?? `selector ${JSON.stringify(selector)} did not resolve`}`, ...(r.code ? { code: r.code } : {}) };
     }
-    if (r.occluded) {
-      return { error: `Error: ${JSON.stringify(selector)} (${r.matched}) is occluded by ${r.hitTarget} — not aiming there` };
+    // `allowOccluded` reaches the selector too — the editor twin's rule (§3 binds `entity` and
+    // `selector` alike), and the device had no way at all to press a covered element on purpose.
+    if (r.occluded && !allowOccluded) {
+      return {
+        error: `Error: ${JSON.stringify(selector)} (${r.matched}) is occluded by ${r.hitTarget} — not aiming there. `
+          + 'Dismiss/move what covers it, or pass allowOccluded:true to aim there anyway.',
+        code: 'OCCLUDED',
+      };
     }
     return { x: r.x, y: r.y, label: `${selector}→${r.hitTarget}`, hitTarget: r.hitTarget };
   }
   const screenInfo = params.screenInfo as { imgW: number; imgH: number; nativeW: number; nativeH: number } | undefined;
   const { x, y } = screenshotToCSS(params[xKey] as number, params[yKey] as number, screenInfo);
   return { x, y, label: `css(${Math.round(x)},${Math.round(y)})` };
+}
+
+/** The entity branch of `resolveAim`: the same `resolve-entity-point` op the editor routes call, and
+ *  the same accept/refuse decision (`entityAimOutcome`), so a device aim and an editor aim refuse one
+ *  resolution identically. A top-level `allowOccluded` reaches the entity unless the entity spec
+ *  states its own — the editor's merge. */
+async function resolveEntityAim(
+  entity: EntityPointSpec, which: string, allowOccluded: boolean, gesture: AimGesture | undefined,
+): Promise<Aim> {
+  const runAgentOp = await getRunAgentOp();
+  const sent = { ...entity, gesture, allowOccluded: entity.allowOccluded ?? allowOccluded };
+  let res: EntityPointResolution | null;
+  try {
+    res = (await runAgentOp('resolve-entity-point', sent)) as EntityPointResolution | null;
+  } catch (e) {
+    return { error: `Error: ${which}: could not resolve the entity (${e instanceof Error ? e.message : String(e)})` };
+  }
+  const outcome = entityAimOutcome(which, res, sent.allowOccluded);
+  // No #261 settling hint here, unlike the editor route: `layout-settling` samples `[data-ui-id]`, the
+  // editor's dock chrome, which a shipped game does not have — it would cost a round trip per refusal
+  // to answer "settled" every time.
+  if ('refusal' in outcome) return { ...outcome.refusal, error: `Error: ${outcome.refusal.error}` };
+  const p = outcome.point;
+  const who = p.entity ? `${JSON.stringify(p.entity.name)} guid=${p.entity.guid ?? `id:${p.entity.id}`}` : (p.matched ?? 'entity');
+  const extras = [
+    p.surface ? `surface=${p.surface}` : '',
+    p.occlusionScope ? `occlusionScope=${p.occlusionScope}` : '',
+    p.aimedAt ? `aimedAt=${p.aimedAt}` : '',
+    p.occluded ? `OCCLUDED by ${p.occludedByEntity?.name ?? p.hitTarget} (allowOccluded)` : '',
+  ].filter(Boolean).join(' ');
+  return {
+    x: p.x, y: p.y,
+    label: `entity ${who}${extras ? ` [${extras}]` : ''}→${p.hitTarget}`,
+    // Only a UI entity's `hitTarget` comes from `describeElement` — the one `aimDriftSuffix` compares
+    // against. A 2D/3D aim reports the literal `'canvas'`, which no element description equals, so
+    // passing it would warn of drift on every canvas aim. Absent = "claimed nothing", as for pixels.
+    ...(p.occlusionScope === 'element' ? { hitTarget: p.hitTarget } : {}),
+  };
 }
 
 /** #486 finding C: `resolveAim`'s selector branch crosses a dynamic import PLUS a round trip through
@@ -539,7 +597,7 @@ export async function handleTap(params: Record<string, unknown>): Promise<string
   if (refusal) { _log(`[debug-bridge] TAP → ${refusal}`); return refusal; }
   // #1016: `device_tap` is the click-shaped one. `button` narrows it further — see below.
   const aim = await resolveAim(params, 'selector', 'x', 'y', tapGestureFor(params));
-  if ('error' in aim) { _log(`[debug-bridge] TAP → ${aim.error}`); return aim.error; }
+  if ('error' in aim) { _log(`[debug-bridge] TAP → ${aim.error}`); return encodeDeviceRefusal(aim); }
   _log(`[debug-bridge] TAP @ ${aim.label}`);
   const superseded = supersedeHeldPress('TAP');
   return withMechanismSuffix(`${await dispatchTapAt(aim.x, aim.y)} @ ${aim.label}${superseded}`);
@@ -550,9 +608,9 @@ export async function handleDrag(params: Record<string, unknown>): Promise<strin
   if (refusal) { _log(`[debug-bridge] DRAG → ${refusal}`); return refusal; }
   // Both ends of a drag: the release is never in the from-zone, so no redirect (#1016).
   const fromAim = await resolveAim(params, 'fromSelector', 'fromX', 'fromY', 'drag');
-  if ('error' in fromAim) { _log(`[debug-bridge] DRAG → ${fromAim.error}`); return fromAim.error; }
+  if ('error' in fromAim) { _log(`[debug-bridge] DRAG → ${fromAim.error}`); return encodeDeviceRefusal(fromAim); }
   const toAim = await resolveAim(params, 'toSelector', 'toX', 'toY', 'drag');
-  if ('error' in toAim) { _log(`[debug-bridge] DRAG → ${toAim.error}`); return toAim.error; }
+  if ('error' in toAim) { _log(`[debug-bridge] DRAG → ${toAim.error}`); return encodeDeviceRefusal(toAim); }
   const from = { x: fromAim.x, y: fromAim.y };
   const to = { x: toAim.x, y: toAim.y };
   const steps = (params.steps as number) || 5;
@@ -941,8 +999,15 @@ export async function handlePointer(params: Record<string, unknown>): Promise<st
   if (hasAim || action === 'down') {
     // A lone pointer action — `down` may or may not become a click, and the route cannot know
     // yet, so it takes the strict side (#1016).
-    const resolved = await resolveAim(params, 'selector', 'x', 'y', 'press');
-    if ('error' in resolved) { _log(`[debug-bridge] POINTER ${action} → ${resolved.error}`); return resolved.error; }
+    // Only the PRESS is gated on occlusion — the editor route's rule. A held move/up is delivered to
+    // whatever captured the press, so what sits under the destination cannot stop it; the force has
+    // to reach the entity spec too, or an explicit `entity:{allowOccluded:false}` would win the merge.
+    const held = action !== 'down';
+    const aimParams = held
+      ? { ...params, allowOccluded: true, ...(params.entity && typeof params.entity === 'object' ? { entity: { ...(params.entity as object), allowOccluded: true } } : {}) }
+      : params;
+    const resolved = await resolveAim(aimParams, 'selector', 'x', 'y', 'press');
+    if ('error' in resolved) { _log(`[debug-bridge] POINTER ${action} → ${resolved.error}`); return encodeDeviceRefusal(resolved); }
     aim = resolved;
   } else {
     aim = { x: heldPointer!.x, y: heldPointer!.y, label: `css(${heldPointer!.x},${heldPointer!.y}) [held]` };
@@ -1199,7 +1264,7 @@ export async function handleHover(params: Record<string, unknown>): Promise<stri
   const refusal = frameLoopRefusal('hover');
   if (refusal) return refusal;
   const aim = await resolveAim(params, 'selector', 'x', 'y', 'hover');
-  if ('error' in aim) return aim.error;
+  if ('error' in aim) return encodeDeviceRefusal(aim);
   const el = document.elementFromPoint(aim.x, aim.y);
   if (!el) return `Error: no element at (${Math.round(aim.x)},${Math.round(aim.y)}) to hover`;
   const base = { clientX: aim.x, clientY: aim.y, bubbles: true, cancelable: true, pointerId: 1, pointerType: 'mouse' as const };
@@ -1217,7 +1282,7 @@ export async function handleScroll(params: Record<string, unknown>): Promise<str
   const hasAim = typeof params.selector === 'string' || (typeof params.x === 'number' && typeof params.y === 'number');
   const p = hasAim ? params : { ...params, x: window.innerWidth / 2, y: window.innerHeight / 2 };
   const aim = await resolveAim(p, 'selector', 'x', 'y', 'scroll');
-  if ('error' in aim) return aim.error;
+  if ('error' in aim) return encodeDeviceRefusal(aim);
   const hit = document.elementFromPoint(aim.x, aim.y);
   const el = hit ?? document.scrollingElement ?? document.body;
   const dx = (params.dx as number) ?? 0;

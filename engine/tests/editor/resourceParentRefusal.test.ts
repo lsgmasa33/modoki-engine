@@ -60,7 +60,7 @@ describe('a resource entity holds no children (#1248)', () => {
   it('apply-scene-ops addEntity with the resource parent INSIDE authored EntityAttributes also lands at the root', async () => {
     const input = spawnInput();
     const r = await runAgentOp('apply-scene-ops', {
-      ops: [{ op: 'addEntity', traits: { Transform: {}, EntityAttributes: { name: 'Kid', parentId: input.id() } } }],
+      ops: [{ op: 'addEntity', traits: { Transform: {}, EntityAttributes: { name: 'Kid', parentId: guidOf(input) } } }],
     }) as { created: Array<{ id: number }>; warnings?: string[] };
     expect(parentOf(r.created[0].id)).toBe(0);
     expect(r.warnings?.join('\n')).toMatch(/is a resource/);

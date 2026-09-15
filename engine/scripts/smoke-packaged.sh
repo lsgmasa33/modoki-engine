@@ -134,7 +134,7 @@ for i in $(seq 1 50); do
   kill -0 $PID 2>/dev/null || { echo "[smoke] FAIL: app exited early (${i}s)"; tail -15 "$APPLOG"; exit 1; }
   # node, not python3 — python is not present on a stock Windows dev box (and is not a
   # dependency of this repo anywhere else).
-  entities=$(curl -s -m 2 "http://127.0.0.1:$PORT/api/scene-state" 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).entityCount??0))}catch{process.stdout.write("0")}})' 2>/dev/null || echo 0)
+  entities=$(curl -s -m 2 "http://127.0.0.1:$PORT/api/scene-state" 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).returnedCount??0))}catch{process.stdout.write("0")}})' 2>/dev/null || echo 0)
   [ "${entities:-0}" -gt 0 ] 2>/dev/null && break
   sleep 1
 done
@@ -143,8 +143,8 @@ sleep 3
 
 # ── assertions ──────────────────────────────────────────────
 fail=0
-if [ "${entities:-0}" -le 0 ] 2>/dev/null; then echo "[smoke] FAIL: scene never loaded (entityCount=$entities)"; fail=1
-else echo "[smoke] ok: scene loaded (entityCount=$entities)"; fi
+if [ "${entities:-0}" -le 0 ] 2>/dev/null; then echo "[smoke] FAIL: scene never loaded (returnedCount=$entities)"; fail=1
+else echo "[smoke] ok: scene loaded (returnedCount=$entities)"; fi
 
 VITE_ERR=$(grep -iE "Failed to resolve import|Internal server error|Pre-transform error|Cannot find module" "$VITELOG" 2>/dev/null | sort -u)
 if [ -n "$VITE_ERR" ]; then echo "[smoke] FAIL: Vite errors (renderer-side):"; echo "$VITE_ERR" | sed 's/^/    /' | head -10; fail=1

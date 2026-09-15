@@ -35,6 +35,19 @@ describe('applyOps — setTrait', () => {
     expect(scene.entities[0].traits.Rotate3D).toEqual({ speed: 2 });
   });
 
+  // #1216 C-12 / #1223 D6: the add was silent — `changed:1`, the same answer as a field edit.
+  // Mutation: drop the `addedTraits.push` in applyOps' setTrait branch.
+  it('says which trait it added, and lists neither an edit nor a tag', () => {
+    const scene = freshScene();
+    const res = applyOps(scene, [
+      { op: 'setTrait', entity: { id: 1 }, trait: 'Rotate3D', fields: { speed: 2 } },
+      { op: 'setTrait', entity: { id: 2 }, trait: 'Transform', fields: { x: 1 } },
+      { op: 'setTrait', entity: { id: 2 }, trait: 'Persistent' },
+    ], mint);
+    expect(res.addedTraits).toEqual([{ op: 0, id: 1, guid: 'g-root', trait: 'Rotate3D' }]);
+    expect(applyOps(freshScene(), [{ op: 'setTrait', entity: { id: 2 }, trait: 'Transform', fields: { x: 1 } }], mint).addedTraits).toBeUndefined();
+  });
+
   it('sets a tag when no fields given', () => {
     const scene = freshScene();
     const res = applyOps(scene, [{ op: 'setTrait', entity: { id: 1 }, trait: 'Persistent' }], mint);
@@ -70,6 +83,22 @@ describe('applyOps — setTrait', () => {
     scene.entities.push({ id: 3, name: 'Child', traits: {} });
     const res = applyOps(scene, [{ op: 'setTrait', entity: { name: 'Child' }, trait: 'Transform', fields: { x: 1 } }], mint);
     expect(res.errors.join('\n')).toMatch(/match.*disambiguate/);
+  });
+
+  // #1223 D1: the FILE path let `id` win over a guid given beside it, the opposite of the live path, so
+  // one ref named two different entities depending on the persistence mode. Mutation: delete the
+  // `given.length > 1` refusal in resolveEntity.
+  it('refuses a ref carrying two addresses (AMBIGUOUS), and treats an empty string as absent', () => {
+    const scene = freshScene();
+    const res = applyOps(scene, [{ op: 'setTrait', entity: { id: 1, guid: 'g-child' }, trait: 'Transform', fields: { x: 7 } }], mint);
+    expect(res.changed).toBe(0);
+    expect(res.code).toBe('AMBIGUOUS');
+    expect(res.errors.join('\n')).toMatch(/given together/);
+    expect(scene.entities[0].traits.Transform).toBeUndefined(); // the id's entity was not written either
+    // Accept side: an empty guid beside an id is ONE address.
+    const ok = applyOps(scene, [{ op: 'setTrait', entity: { id: 2, guid: '' }, trait: 'Transform', fields: { x: 7 } }], mint);
+    expect(ok.errors).toEqual([]);
+    expect((scene.entities[1].traits.Transform as { x: number }).x).toBe(7);
   });
 });
 
@@ -665,6 +694,17 @@ describe('applyOps — runtime guids never reach the file (#1210)', () => {
     ], mint);
     expect(res.changed).toBe(0); // the route writes only when changed > 0
     expect(res.errors.join('\n')).toMatch(/RUNTIME guid/);
+  });
+
+  // #1223 P4 review: the tripwire cleared `changed` and `created` but not `addedTraits`, so a refused write
+  // still reported a trait added. Mutation: drop `addedTraits.length = 0` from the tripwire.
+  it('a refused write reports no trait added either', () => {
+    const res = applyOps(freshScene(), [
+      { op: 'setTrait', entity: { id: 1 }, trait: 'Rotate3D', fields: { speed: 2 } },
+      { op: 'setTrait', entity: { name: 'Root' }, trait: 'UIAction', fields: { bindings: [{ target: rg }] } },
+    ], mint);
+    expect(res.changed).toBe(0);
+    expect(res.addedTraits).toBeUndefined();
   });
 
   it('a refused write reports no created entity — none was written', () => {

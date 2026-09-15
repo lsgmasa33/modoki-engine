@@ -1350,14 +1350,15 @@ export async function loadScene(
     // ever applying here. (Play→Stop does NOT come through here — it reloads via
     // sceneManager directly — so its same-scene history is preserved.)
     swapHistory(scenePath);
-    const entityCount = getAllEntities().length;
+    const worldEntityTotal = getAllEntities().length;
     markSceneSaved(); // the freshly loaded world matches disk — a new baseline (C7)
     // A stale dirty guid from the PREVIOUS chain (e.g. a base no longer loaded) must
     // not linger — the freshly loaded chain has no unsaved live-world work yet either.
     clearAllSceneDirty();
     // Editor Percept (V2): the human opened a scene — correlate later game/edit events to it.
-    editorEmit('!scene-load', { path: scenePath, entityCount });
-    console.log(`[Editor] Loaded scene: ${entityCount} entities from ${scenePath}`);
+    // `worldEntityTotal`, the editor state's name for the same count (§2, #1223 D3).
+    editorEmit('!scene-load', { path: scenePath, worldEntityTotal });
+    console.log(`[Editor] Loaded scene: ${worldEntityTotal} entities from ${scenePath}`);
     return 'loaded';
   } catch (e) {
     // An AbortError means a newer load superseded this one — CANCELLED early, by design (see

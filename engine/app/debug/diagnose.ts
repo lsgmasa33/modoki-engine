@@ -17,17 +17,21 @@ import {
 } from '@modoki/engine/runtime';
 import { getActiveTextureSizeCap } from '@modoki/engine/runtime';
 import { computeLayoutBounds } from './layoutDump';
+import { guidListFields } from './entityRef';
 
 export interface DiagnoseConsoleEntry { level: string; ts: number; text: string }
 
-interface RefIssue { entity: number; trait: string; field: string; value: string; kind: 'unresolved-guid' | 'literal-path' }
-interface TransformIssue { entity: number; field: string; value: number }
+// `entity` is the runtime id, with `guid` beside it (`null` when the entity has none, #1223 P2).
+interface RefIssue { entity: number; guid: string | null; trait: string; field: string; value: string; kind: 'unresolved-guid' | 'literal-path' }
+interface TransformIssue { entity: number; guid: string | null; field: string; value: number }
 
 const TRANSFORM_FIELDS = ['x', 'y', 'z', 'rx', 'ry', 'rz', 'sx', 'sy', 'sz'] as const;
 
 export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[]; now?: number; errorWindowMs?: number } = {}) {
   const entities = getAllEntities();
   const metaByName = new Map(getAllTraits().map((m) => [m.name, m] as const));
+  const guidById = new Map(entities.map((e) => [e.id, e.guid || null] as const));
+  const guidOf = (id: number): string | null => guidById.get(id) ?? null;
 
   // ── Asset-ref integrity: ref fields must be a resolvable GUID (or external/primitive). ──
   const refIssues: RefIssue[] = [];
@@ -47,8 +51,8 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
         if (isExternalUrl(v)) continue;                 // http/data/blob — fine
         // A font PATH is a literal-path issue in these fields too — Text2D/Text3D.font and
         // (since #231) UIElement.fontFamily are all manifest GUIDs. QA-INSP-0004.
-        if (isInternalAssetPath(v)) { refIssues.push({ entity: info.id, trait: traitName, field, value: v, kind: 'literal-path' }); continue; }
-        if (isGuid(v) && !resolveGuidToPath(v)) refIssues.push({ entity: info.id, trait: traitName, field, value: v, kind: 'unresolved-guid' });
+        if (isInternalAssetPath(v)) { refIssues.push({ entity: info.id, guid: guidOf(info.id), trait: traitName, field, value: v, kind: 'literal-path' }); continue; }
+        if (isGuid(v) && !resolveGuidToPath(v)) refIssues.push({ entity: info.id, guid: guidOf(info.id), trait: traitName, field, value: v, kind: 'unresolved-guid' });
         // non-guid non-path (e.g. primitive sprite keyword 'circle') passes through.
       }
     }
@@ -65,7 +69,7 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
       if (!t) continue;
       for (const f of TRANSFORM_FIELDS) {
         const val = t[f];
-        if (typeof val === 'number' && !Number.isFinite(val)) nan.push({ entity: info.id, field: f, value: val });
+        if (typeof val === 'number' && !Number.isFinite(val)) nan.push({ entity: info.id, guid: guidOf(info.id), field: f, value: val });
       }
       if ((t.sx ?? 1) * (t.sy ?? 1) * (t.sz ?? 1) === 0) zeroScale.push(info.id);
     }
@@ -82,8 +86,11 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
   const cameraMissing = has3DContent && cameraCount === 0;
 
   // ── Off-screen (from the layout-bounds op). ──
-  let offScreen: number[] = [];
-  try { offScreen = computeLayoutBounds().offScreen; } catch { /* no renderer mounted */ }
+  let offScreen: { guids: string[]; noGuidIds?: number[]; count: number } = { guids: [], count: 0 };
+  try {
+    const lb = computeLayoutBounds();
+    offScreen = { guids: lb.offScreen, ...(lb.offScreenNoGuidIds ? { noGuidIds: lb.offScreenNoGuidIds } : {}), count: lb.offScreenCount };
+  } catch { /* no renderer mounted */ }
 
   // Only errors within the recency window feed the health verdict. Otherwise one benign load-time or
   // fixed-scene-A error sits in the 500-entry ring and forces ok:false FOREVER — and "recent console
@@ -261,9 +268,9 @@ export function computeDiagnostics(opts: { consoleErrors?: DiagnoseConsoleEntry[
     ...frameLoopFields,
     perf,
     refs: { issues: refIssues, count: refIssues.length },
-    transforms: { nan, zeroScale },
+    transforms: { nan, ...guidListFields('zeroScale', zeroScale, guidOf) },
     camera: { count: cameraCount, ok: !cameraMissing, needed: has3DContent },
-    offScreen: { ids: offScreen, count: offScreen.length },
+    offScreen,
     uiOverflow,
     consoleErrors,
     // Named so `consoleErrors: []` cannot be read as an absolute — it always means "none in the

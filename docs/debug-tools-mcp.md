@@ -259,8 +259,13 @@ cannot (it returns the app *underneath* the dialog, looking like a fine screensh
 thing). ⚠️ Its pixels are device-screen coordinates and must **not** be fed to `device_tap`. Detail:
 [docs/trusted-device-input.md](trusted-device-input.md) § "WDA also captures the screen" (#102).
 
-**Enact aiming — prefer a `selector`.** `device_tap`/`device_drag` resolve a CSS `selector` on-device
-(occlusion-checked, no screenshot round-trip — the fix for tapping DOM chrome like a debug-menu ✕), or
+**Enact aiming — by name, as in the editor.** `device_tap`/`drag`/`pointer`/`hover`/`scroll` take an
+`entity` ({guid}|{name}, plus `surface` for a 2D/3D entity) or a CSS `selector`, both resolved on the
+device inside the call and refused when covered unless `allowOccluded` (#1223 P3). A refusal's
+envelope carries its real code (`NOT_FOUND` + `got.stale`, `AMBIGUOUS` + guid options, `OCCLUDED`).
+`device_drag` takes nested `from`/`to` like `modoki_drag`. No `'scene-view'` surface on a device, and
+a 3D aim there checks DOM covering only. Detail and the version-skew caveat: [docs/enact.md](enact.md)
+§ "The device surface aims the same way now". A `selector` is the fix for tapping DOM chrome like a debug-menu ✕. Or
 take screenshot pixel coords (iOS converts off the last capture; Android passes the adb dims as
 `screenInfo`). `device_drag {dom}` drags **DOM chrome** (widgets, sliders) by dispatching the pointer
 sequence ON the grabbed element (auto-engaged on a non-canvas grab) — it neutralizes
@@ -1128,8 +1133,8 @@ same actions + state a person has in the editor. They relay to the renderer over
   queued; from PAUSED (where `enterPlay` awaits nothing) the op waits itself, like `resume`.
   `device_step` waits inside its own `timeoutMs` budget and refuses with `physicsLoading: [...]` only
   when that runs out (retry), or names a permanent failure.
-- **Edit like a human (undoable):** `modoki_create_entity` (empty/primitive/2d/ui/camera/light/
-  particle — identical to the Hierarchy menu), `modoki_duplicate_entity`, `modoki_delete_entities`,
+- **Edit like a human (undoable):** `modoki_create_entity` (empty/primitive/2d/canvas2d/ui/camera/light/
+  environment/particle — identical to the Hierarchy menu), `modoki_duplicate_entity`, `modoki_delete_entities`,
   `modoki_reparent_entity`, `modoki_set_selection`, `modoki_set_gizmo`, `modoki_focus_entity`,
   `modoki_history {undo|redo}`. `modoki_prefab {instantiate|create|detach|overrides|apply|revert}`.
   `modoki_set_transform` sets position/rotation/scale in ONE call (partial merge) and — unlike a
@@ -1636,11 +1641,35 @@ Prefs in particular matter *more* here: on a device the store is a real player's
 namespaced by appId, which is why `action:'clear'` requires `confirm:true` on **both** surfaces —
 one rule, not a device-only precaution.
 
-**Still asymmetric the other way, and it is a real gap rather than a deliberate one:**
-`device_invalidate_assets` exists and there is no `modoki_invalidate_assets`, even though the
-`invalidate-assets` op is registered in `agentBridge.ts` and the editor drives it internally from
-`/api/reimport`. Recorded here so it is not rediscovered as a surprise; it is not part of #288's
-five gaps.
+**`device_invalidate_assets` has no `modoki_invalidate_assets`, and that is deliberate (#1216 C-13).**
+On the editor, eviction is the second half of a re-bake: `modoki_reimport_asset` converts the source
+and then sends the same `invalidate-assets` op for every baked item, in one call. A device has no
+import pipeline to run, so the eviction is the only half it can do. The two surfaces now reach the
+same caches: the tool's `type` enum and the op's dispatch table both come from
+`tools/shared/invalidateAssets.ts` (model, texture, audio, environment). The enum used to stop at
+model and texture, so the audio and HDR eviction the op gained in #304 could not be reached from the
+tool.
+
+**Closed in #1223 P4 (#1216's remainder), rather than recorded:**
+- **`device_create_entity`'s `spec` is strict** (C-3). It was `z.record(any)`, and the op read only
+  its kind's own field, so `{kind:'primitive', mseh:'cube'}` built the default sphere and answered ok.
+  The op (`resolveCreateEntitySpec`) now refuses any key its kind does not take, which covers curl
+  and a device eval too. The device schema is one strict object per kind, and both tools derive
+  their vocabulary from `tools/shared/createEntityVocabulary.ts`. That file is pinned to the runtime
+  tables by `vocabularyEnumParity.test.ts`. `modoki_create_entity` offers `environment` now.
+- **Both `delete_entities` name what the cascade took** (C-6). They answered only the entities they
+  were given, so deleting a parent removed its children without a word. `alsoDeleted` lists those
+  descendants' guids (the first 100, with `alsoDeletedTotal` past that).
+- **`device_handles` matches `modoki_handles`** (C-14). It gained `prefix` and `label`, and `ids`
+  takes a list or a comma-separated string on both. The device tool also returns the counts-only bare
+  call and the filter-miss naming its own description promised. That shaping lived only in the
+  editor's route; it is now `tools/shared/handlesReply.ts`, called from both.
+- **A field write on a trait the entity lacks adds the trait, and every path says so** (C-12, #1223
+  D6). This covers device `set-traits`, the editor's live `apply-scene-ops` and the file-direct
+  `applyOps`; each lists the addition as `addedTraits`. A tag write is not listed, because adding
+  is what it asked for. The file path cannot tell for a prefab-instance root, whose write lands in
+  an override.
+- **`device_mutate_scene`'s `name` is exact** (C-11), which P1's shared resolver made it.
 
 **`modoki_find_references`.** It answers
 "what references this?" by walking the PROJECT ON DISK — the tree-shaker's own forward walk,
@@ -1863,8 +1892,8 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   the game journal by a shared capture counter for the "pressed Play → set timeScale 0.3 → `@match` tick 84"
   correlated story. All three streams return the **last 100 + `byType` counts**; cursor precisely with
   `since`/`sinceCap`, or raise `limit=N`. (`editor/editorJournal.ts`.)
-- **Numeric layout:** `modoki_get_layout_bounds` → **bare it returns COUNTS** (`count`, `layerCounts`,
-  `overlapsCount`) plus the cheap `offScreen`/`zeroSize` **id lists** — usually the whole answer to
+- **Numeric layout:** `modoki_get_layout_bounds` → **bare it returns COUNTS** (`totalCount` rects, `entityTotal` distinct entities, `layerCounts`,
+  `overlapsCount`) plus the cheap `offScreen`/`zeroSize` **guid lists** (`<field>NoGuidIds` for an entity with no guid, #1223) — usually the whole answer to
   "what's invisible or collapsed?". Pass `ids`/`layer` for per-entity screen-space rects (UI DOM rects
   + projected 2D/3D), and `overlaps:true` for the same-layer overlapping PAIRS — that list is O(n²) (2,625
   pairs, 77k chars ≈ 19k tokens on a 241-entity scene), so it's opt-in. Check alignment/overlap/clipping as data.
@@ -2113,7 +2142,7 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   `SkeletalAnimator.activeClip`/`normalizedTime` and RigidBody `isSleeping`), `world` (resolved world TRS
   + `activeInHierarchy`), `bounds` (per-entity `screen` rect + `onScreen` + 3D `worldAABB {size,center}`),
   `contacts` (live solid `contacts` + sensor `overlaps`, GUIDs — a code-spawned partner has a runtime guid (#1210); `id:<n>` only for one with no guid — since #1248 only an entity whose EntityAttributes was removed after spawn), `resources` (include resource entities,
-  excluded by default), `limit` (+ `truncated`/`totalCount`; an explicit `limit` always wins, and a
+  excluded by default), `limit` (`truncated` when it bites; `returnedCount`/`totalCount` are always present; an explicit `limit` always wins, and a
   targeted query is never silently capped). **Floats are rounded to 9 significant digits**
   (`247.13061935179246` → `247.130619`; max error 3.5e-7) — ~18–21% of the tokens on a Transform
   drill-down. **Verify an edit with a TOLERANCE, not `===`.** `precision=0` returns exact float64;
@@ -2556,7 +2585,7 @@ larger, riskier pbxproj edit than #112 needed.
 Dev-only endpoints + scene hot-reload so an AI agent (or any tooling) can edit scenes via plain `curl` and verify the result **without driving a browser/screenshot**. All dev-only (the asset-scanner middleware only runs under `vite` dev). Server: `engine/plugins/vite-asset-scanner.ts`. Browser client: `engine/app/debug/agentBridge.ts` (gated on `import.meta.hot`, stripped from prod). Pure logic (shared Node + browser): `packages/modoki/src/runtime/scene/{sceneValidation,sceneMutate,sceneSchema}.ts`; ref predicates in import-free `runtime/core/assetRefRules.ts`.
 
 - **Scene/prefab hot-reload** — editing a scene file on disk (the `Edit` tool, `git checkout`, `/api/scene-mutate`) auto-reloads the **active** scene in the browser; editor camera + selection are preserved (selection via the existing GUID-keyed `selectionRestore`). A prefab edit reloads the current scene (instances re-expand). The watcher classifies files with the scanner's own `detectType()` — **scene files are positively identified by the `.scene.json` suffix** (or, as a legacy fallback, a plain `.json` under a `scenes/` dir — issue #54). The editor's own Cmd+S saves (`/api/write-file`) are suppressed (1.5s self-write guard) so they don't bounce the live scene; external edits still reload.
-- **`curl localhost:5173/api/scene-state[?trait=Transform][&id=N]`** — returns the **live ECS world** as JSON. **Bare it is an INDEX** (`{scenePath, entityCount, entities:[{id,guid,name,parentId,layer,traits:[names]}], hint}`), capped at a default `limit` of 200 entities — past that it clips and gains `truncated`/`totalCount`. Pass a target (`trait`/`id`/`name`/`where`) or an enricher (`full`/`world`/`bounds`/`contacts`) to get trait **values** (`traits` becomes an object); a targeted query is never capped unless you pass `limit`. Relays to the open tab over the HMR socket (504 if no app is open). Because it reads the live world (not the file), a changed value here proves a hot-reload actually took effect. **Prefer this over screenshots to verify scene edits.**
+- **`curl localhost:5173/api/scene-state[?trait=Transform][&id=N]`** — returns the **live ECS world** as JSON. **Bare it is an INDEX** (`{scenePath, returnedCount, totalCount, resourcesExcluded?, entities:[{id,guid,name,parentId,layer,traits:[names]}], hint}`), capped at a default `limit` of 200 entities — past that it clips and gains `truncated`. `returnedCount` is the rows returned and `totalCount` every entity the query matched before the limit; both are always present. Pass a target (`trait`/`id`/`name`/`where`) or an enricher (`full`/`world`/`bounds`/`contacts`) to get trait **values** (`traits` becomes an object); a targeted query is never capped unless you pass `limit`. Relays to the open tab over the HMR socket (504 if no app is open). Because it reads the live world (not the file), a changed value here proves a hot-reload actually took effect. **Prefer this over screenshots to verify scene edits.**
 - **`curl .../api/validate-scene?path=/games/.../x.json`** — warn-but-load validation: unknown trait/field, type mismatch, and the literal-asset-path-instead-of-GUID mistake (see "Asset References" in `CLAUDE.md`). Needs a tab open to push the trait schema (`schemaAvailable:false` ⇒ ref checks still run, type checks skipped).
 - **`POST .../api/scene-mutate {path, ops}`** — validated `setTrait`/`removeTrait`/`addEntity`/`removeEntity` (entity ref by `id`/`name`/`guid`; mints GUIDs); writes atomically; returns `{ok, changed, errors, warnings}`. Hot-reload then reflects it. It does **NOT** echo the scene back (that fired on every edit and cost ~10k tokens of context for data nobody read — and it was the pre-expansion *file*, not the live world). Pass `returnScene:true` if you actually want the written file; **to verify an edit, read `/api/scene-state`.**
 - **`GET .../api/editor-state`** + **`POST .../api/editor-action {action, …}`** (allowlisted) + **`GET .../api/scenes`** + **`POST .../api/import-file {srcPath, destFolder}`** — the editor-parity surface (live UI state read; selection/play/undo/scene/prefab/entity actions; scene list; Finder-style import). `editor-state`/`editor-action` relay to the renderer, so they need a tab/editor open. See the modoki MCP section above for the tool wrappers.

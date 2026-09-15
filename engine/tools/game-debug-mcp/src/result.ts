@@ -24,6 +24,7 @@ import {
   MAX_PAYLOAD_CHARS, capText as sharedCapText, encode, encodeError,
   type ToolErrorDetail,
 } from '../../shared/mcpResult.js';
+import { decodeDeviceRefusal } from '../../shared/deviceRefusal.js';
 
 // ── Failures: the §5 envelope, device edition ────────────────────────────────
 // `docs/mcp-tool-conventions.md` §5. Before this, every device tool ended in
@@ -86,11 +87,17 @@ export function caughtFailure(tool: string, what: string, e: unknown): DeviceRes
 /** The device answered, but its reply is an `Error: …` STRING rather than a thrown error — a
  *  selector miss, an occluded target, no canvas. A refusal by the op, not a transport failure. */
 export function deviceReplyFailure(tool: string, what: string, reply: unknown, options?: string[]): DeviceResult {
+  // The refusal's own code/options/stale when the device named them (`deviceRefusal.ts`, #1223 P3):
+  // an entity aim knows NOT_FOUND from AMBIGUOUS from OCCLUDED, and its options are the real
+  // choices (the guids), which beat this call site's generic advice. An older app build sends no
+  // tail and lands on the generic refusal, as before.
+  const r = decodeDeviceRefusal(String(reply));
   return deviceFail({
-    code: 'REFUSED_BY_OP',
+    code: r.code ?? 'REFUSED_BY_OP',
     tool, what,
-    why: `the device refused: ${String(reply)}`,
-    ...(options ? { options } : {}),
+    why: `the device refused: ${r.message}`,
+    ...(r.stale ? { got: { stale: r.stale } } : {}),
+    ...(r.options ? { options: r.options } : options ? { options } : {}),
   });
 }
 

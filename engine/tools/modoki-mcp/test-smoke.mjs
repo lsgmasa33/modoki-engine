@@ -81,9 +81,9 @@ if (sj.elided) {
   console.log(`get_scene_state → ELIDED (${sj.bytes} chars, over cap) — envelope still parsed`);
   const narrowed = await client.callTool({ name: 'modoki_get_scene_state', arguments: { limit: 5 } });
   const nj = JSON.parse(text(narrowed));
-  console.log('get_scene_state?limit=5 → scenePath:', nj.scenePath, ' entityCount:', nj.entityCount);
+  console.log('get_scene_state?limit=5 → scenePath:', nj.scenePath, ' returnedCount:', nj.returnedCount);
 } else {
-  console.log('get_scene_state → scenePath:', sj.scenePath, ' entityCount:', sj.entityCount);
+  console.log('get_scene_state → scenePath:', sj.scenePath, ' returnedCount:', sj.returnedCount);
 }
 
 /** Run `check`, then ALWAYS run `cleanup` — and report `check`'s failure in preference to
@@ -1274,6 +1274,12 @@ if (canUC3) {
     let restore;
     if (before?.asset) {
       restore = await client.callTool({ name: 'modoki_set_selection', arguments: { asset: before.asset } });
+    } else if (before?.guids?.length) {
+      // By guid where there is one — set_selection refuses an id for an entity that has a guid (#1223 D2) —
+      // and by id only for a guid-less member; the op takes both in one call.
+      const guids = before.guids.filter(Boolean);
+      const entityIds = before.entityIds.filter((_, i) => !before.guids[i]);
+      restore = await client.callTool({ name: 'modoki_set_selection', arguments: { ...(guids.length ? { guids } : {}), ...(entityIds.length ? { entityIds } : {}) } });
     } else if (before?.entityIds?.length) {
       restore = await client.callTool({ name: 'modoki_set_selection', arguments: { entityIds: before.entityIds } });
     } else {

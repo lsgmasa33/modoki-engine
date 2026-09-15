@@ -8,7 +8,7 @@
  *  tested both ways: nothing written → `REFUSED_BY_OP`, something written → `PARTIAL`. */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { createTestWorld, type TestWorld, setPlayState, registerAsset, findEntity, Transform } from '@modoki/engine/runtime';
+import { createTestWorld, type TestWorld, setPlayState, registerAsset, findEntity, Transform, EntityAttributes } from '@modoki/engine/runtime';
 import { markSceneSaved, clearHistory, clearDirtyAssets, markAssetDirty, setCurrentScenePath, setPrefabCache } from '@modoki/engine/editor';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
@@ -170,7 +170,7 @@ describe('prefab revert — the override keys named', () => {
 
   /** A real instance carrying ONE real override, so `available.all` is non-empty and both refusals
    *  are reached rather than the earlier "has no overrides" exit. */
-  async function instanceWithOverride(): Promise<number> {
+  async function instanceWithOverride(): Promise<string> {
     setPrefabCache(PREFAB, {
       version: 1, name: 'opcodes-1012', rootLocalId: 1,
       entities: [{ localId: 1, name: 'Root', traits: {
@@ -180,19 +180,21 @@ describe('prefab revert — the override keys named', () => {
     } as never);
     const r = await runAgentOp('prefab', { action: 'instantiate', path: PREFAB }) as { rootId: number };
     findEntity(r.rootId)!.set(Transform, { x: 5 });
-    const o = await runAgentOp('prefab', { action: 'overrides', entityId: r.rootId }) as { keys?: { all?: string[] } };
+    // By guid: the instance root has one, so an `entityId` is refused (#1223 D2).
+    const guid = (findEntity(r.rootId)!.get(EntityAttributes) as { guid: string }).guid;
+    const o = await runAgentOp('prefab', { action: 'overrides', entityGuid: guid }) as { keys?: { all?: string[] } };
     expect(o.keys?.all?.length, 'fixture must carry a real override, or the refusals below are never reached').toBeGreaterThan(0);
-    return r.rootId;
+    return guid;
   }
 
   it('an EMPTY keys array → AMBIGUOUS ("nothing" and "everything" are both readings)', async () => {
-    const id = await instanceWithOverride();
-    await expect(runAgentOp('prefab', { action: 'revert', entityId: id, keys: [] })).rejects.toMatchObject({ code: 'AMBIGUOUS' });
+    const guid = await instanceWithOverride();
+    await expect(runAgentOp('prefab', { action: 'revert', entityGuid: guid, keys: [] })).rejects.toMatchObject({ code: 'AMBIGUOUS' });
   });
 
   it('a key matching no override → NOT_FOUND, with the real keys as options', async () => {
-    const id = await instanceWithOverride();
-    const err = await runAgentOp('prefab', { action: 'revert', entityId: id, keys: ['no-such-override-1012'] })
+    const guid = await instanceWithOverride();
+    const err = await runAgentOp('prefab', { action: 'revert', entityGuid: guid, keys: ['no-such-override-1012'] })
       .then(() => null, (e: unknown) => e as { code?: string; options?: string[] });
     expect(err).toMatchObject({ code: 'NOT_FOUND' });
     expect(err?.options?.length).toBeGreaterThan(0);

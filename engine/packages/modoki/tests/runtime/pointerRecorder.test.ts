@@ -17,6 +17,8 @@ import {
 import { registerPointerBlocker, clearPointerBlockers, setPointerIngestScope } from '../../src/runtime/core/pointerBlockers';
 import { registerPickProvider } from '../../src/runtime/core/screenPick';
 import { setManualNow, advanceManual, restoreRealClock } from '../../src/runtime/core/clock';
+import { createTestWorld } from '../../src/runtime/harness/createTestWorld';
+import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
 
 type Pointerish = MouseEvent & { pointerId: number; pointerType: string; isPrimary: boolean };
 
@@ -158,7 +160,7 @@ describe('resolution — "could not look" is not "nothing is there"', () => {
       startInputWatch();
       press(document.body, [50, 50]);
       const r = readInputPresses().presses[0].resolved;
-      expect(r).toEqual({ by: 'pick', entityId: 77, surface: 'game-3d' });
+      expect(r).toEqual({ by: 'pick', entityId: 77, guid: null, surface: 'game-3d' });
     } finally { un(); }
   });
 
@@ -169,7 +171,7 @@ describe('resolution — "could not look" is not "nothing is there"', () => {
 
     startInputWatch();
     press(btn, [10, 10]);
-    expect(readInputPresses().presses[0].resolved).toEqual({ by: 'ui', entityId: 42 });
+    expect(readInputPresses().presses[0].resolved).toEqual({ by: 'ui', entityId: 42, guid: null });
   });
 
   it("lets the game's own hit-test override the engine's fallback", () => {
@@ -375,8 +377,9 @@ describe('blocked presses', () => {
     } finally { a(); b(); }
   });
 
-  it('names an engine UI blocker by its ENTITY id, not just its tag', () => {
-    // "div" is not an answer a reader can act on; `[entity=23]` can be looked up in the scene.
+  it('names an engine UI blocker by its entity, not just its tag — `id:<n>` when no entity has a guid', () => {
+    // "div" is not an answer a reader can act on; `[entity=…]` can be looked up in the scene. No live
+    // entity has id 23 here, so there is no guid to give and the id shows in the `id:<n>` form (#1223 P2).
     const overlay = document.createElement('div');
     overlay.setAttribute('data-entity-id', '23');
     document.body.appendChild(overlay);
@@ -385,8 +388,31 @@ describe('blocked presses', () => {
     try {
       startInputWatch();
       press(overlay, [1, 1]);
-      expect(readInputPresses().presses[0].blocked).toEqual({ by: 'div[entity=23]' });
+      expect(readInputPresses().presses[0].blocked).toEqual({ by: 'div[entity=id:23]' });
     } finally { un(); }
+  });
+
+  // #1223 P2: a runtime id is reassigned on reload, and the mutating tools refuse it for an entity that has
+  // a guid — so a recorded press names its entity by guid, in the resolution and in the blocker label.
+  // Mutation: in pointerRecorder, report `guid: null` in the ui resolution and drop the guid from `describeTarget`.
+  it('names a live UI entity by its guid — in the resolution and in the blocker label', () => {
+    const game = createTestWorld({});
+    try {
+      const e = game.spawn(EntityAttributes({ name: 'Overlay', layer: 'ui' }));
+      const guid = (e.get(EntityAttributes) as { guid: string }).guid;
+      expect(guid).toBeTruthy();
+      const overlay = document.createElement('div');
+      overlay.setAttribute('data-entity-id', String(e.id()));
+      document.body.appendChild(overlay);
+      const un = registerPointerBlocker(overlay);
+      try {
+        startInputWatch();
+        press(overlay, [1, 1]);
+        const rec = readInputPresses().presses[0];
+        expect(rec.blocked).toEqual({ by: `div[entity=${guid}]` });
+        expect(rec.resolved).toEqual({ by: 'ui', entityId: e.id(), guid });
+      } finally { un(); overlay.remove(); }
+    } finally { game.dispose(); }
   });
 
   it('leaves `blocked` null for a press nothing swallowed', () => {

@@ -40,7 +40,13 @@ export type SceneOpsLiveReply = {
   warnings: string[];
   unresolved: EntityRef[];
   created?: Array<{ op: number; id: number; guid: string; name: string }>;
+  /** Traits added because a setTrait set fields on an entity that lacked them (#1216 C-12). */
+  addedTraits?: Array<{ op: number; id: number; guid: string | null; trait: string }>;
   code?: ErrorCode;
+  /** The first failure's real choices (an ambiguous name's guids, the guid to use for an id). */
+  options?: string[];
+  /** Why the first failure's runtime guid missed — `'despawned'` | `'world-swapped'` (#1223 D4). */
+  stale?: string;
 };
 
 export type SceneOpsOutcome =
@@ -82,7 +88,10 @@ export function decodeSceneOpsReply(raw: unknown): SceneOpsOutcome {
       warnings: o.warnings,
       unresolved: o.unresolved as EntityRef[],
       ...(Array.isArray(o.created) ? { created: o.created as SceneOpsLiveReply['created'] } : {}),
+      ...(Array.isArray(o.addedTraits) ? { addedTraits: o.addedTraits as SceneOpsLiveReply['addedTraits'] } : {}),
       ...(typeof o.code === 'string' ? { code: o.code as ErrorCode } : {}),
+      ...(isStringArray(o.options) ? { options: o.options } : {}),
+      ...(typeof o.stale === 'string' ? { stale: o.stale } : {}),
     },
   };
 }

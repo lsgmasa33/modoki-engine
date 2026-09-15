@@ -28,12 +28,15 @@ export class OpRefusal extends Error {
   readonly code: ErrorCode;
   /** The real choices, when there is a finite set — §5's `options`. */
   readonly options?: string[];
+  /** Why a runtime guid missed (#1223 D4) — `classifyRuntimeGuidMiss`'s answer, on a NOT_FOUND only. */
+  readonly stale?: string;
 
-  constructor(code: ErrorCode, message: string, opts: { options?: string[] } = {}) {
+  constructor(code: ErrorCode, message: string, opts: { options?: string[]; stale?: string } = {}) {
     super(message);
     this.name = 'OpRefusal';
     this.code = code;
     if (opts.options) this.options = opts.options;
+    if (opts.stale) this.stale = opts.stale;
   }
 }
 
@@ -54,7 +57,7 @@ export async function opReplyFor(run: () => unknown): Promise<{ result: unknown 
     return { result: toJsonSafe(await run(), 'result') };
   } catch (e) {
     if (e instanceof OpRefusal) {
-      return { result: { ok: false, code: e.code, error: e.message, ...(e.options ? { options: e.options } : {}) } };
+      return { result: { ok: false, code: e.code, error: e.message, ...(e.options ? { options: e.options } : {}), ...(e.stale ? { stale: e.stale } : {}) } };
     }
     return { error: String(e instanceof Error ? e.message : e) };
   }

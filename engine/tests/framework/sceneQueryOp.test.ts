@@ -150,6 +150,15 @@ describe('scene-query: hits are addressed by GUID, not by runtime id', () => {
     expect(r.options).toEqual(['dup-a', 'dup-b']);
   });
 
+  // #1223: the caller coded EVERY exclude failure AMBIGUOUS, a miss included, so "no such entity" read as
+  // "pick one of these" with no options to pick from. Mutation: restore `code: 'AMBIGUOUS'` at the call site.
+  it('an exclude that matches NOTHING is NOT_FOUND, not AMBIGUOUS', async () => {
+    floorWorld3D();
+    const r = await q({ kind: 'raycast', dim: '3d', origin: [0, 10, 0], direction: [0, -1, 0], exclude: 'NoSuchBody' });
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('NOT_FOUND');
+  });
+
   it('an ambiguous exclude over CODE-SPAWNED bodies offers their runtime guids, and each one works as exclude (#1207)', async () => {
     tw = createTestWorld({ systems: [PHYS3] });
     tw.spawn(Physics3D({ gravityX: 0, gravityY: -9.81, gravityZ: 0 }));

@@ -45,6 +45,7 @@
 import { execFileSync } from 'child_process';
 import { adbArgs, adbBinary, forwardOwner } from './androidDevices';
 import { domCodeForKey, normalizeKeyName } from '../../tools/shared/inputVocabulary';
+import { SYNTHETIC_BANNER_OPENING } from '../../tools/shared/deviceRefusal';
 
 import {
   decodeAimReply, resolveAimViaDevice, aimAsResolved, STALE_APP_REASON,
@@ -551,7 +552,10 @@ export const SESSION_LOST_REASON =
  *  aim point and reports how it got there (`canvas:hit` | `only` | `contains` | `ambiguous`), so the
  *  banner points at that marker instead of warning blanket-style. Only `ambiguous` is still a guess. */
 export function synthFallbackBanner(reason: string): string {
-  return `\u26a0\ufe0f SYNTHETIC INPUT (NOT TRUSTED) — ${reason}. This input does NOT set isTrusted, so an `
+  // The opening is SHARED with the device MCP, which finds a refusal under this banner on the line
+  // AFTER it — so the banner is ONE line, whatever the reason says. A WDA reason can carry a newline
+  // (`withLaunchWarning`), and a refused synthetic tap under such a banner read as a success (#1223 P3).
+  return `${SYNTHETIC_BANNER_OPENING} — ${reason.replace(/\s*\n\s*/g, ' — ')}. This input does NOT set isTrusted, so an `
     + 'isTrusted-gated handler will ignore it. Treat a pass here as weaker evidence than a trusted-input '
     + "pass, and check the reply's `canvas:` marker (#93) — `ambiguous` means the target canvas was a guess.";
 }

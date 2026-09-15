@@ -9,6 +9,9 @@ import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
 import { DISCARD_UNSAVED_BASE, TIMEOUT_MS_BASE, discardUnsavedParam, flatEntityAlias, foldEntityRef } from '../shapes.js';
+import {
+  CREATE_ENTITY_FIELDS, CREATE_ENTITY_KINDS, LIGHT_KINDS, PRIMITIVE_MESHES, SPRITE_SHAPES, UI_PRESETS, vocabularyProse,
+} from '../../../shared/createEntityVocabulary.js';
 
 export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   const { getJson, postJson, editorAction, fail } = ctx;
@@ -17,8 +20,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_get_editor_state',
     'Read the WHOLE editor UI state in one call: current scene path, play state ' +
-      '(stopped/playing/paused), gizmo mode/space, FPS, entity count, current selection ' +
-      '(entity ids + selected asset), the editor viewport camera pose, undo/redo ' +
+      '(stopped/playing/paused), gizmo mode/space, FPS, `worldEntityTotal` (every entity, resources too), current selection ' +
+      '(entity ids + guids + selected asset), the editor viewport camera pose, undo/redo ' +
       'availability + labels, `focusedPanel` (which panel owns the KEYBOARD SCOPE) with '
       + '`openPanels` (the ids that currently have a tab — the only values modoki_focus / '
       + 'modoki_press_key accept for `panel`, case-sensitively), '
@@ -90,7 +93,7 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'drag — before/after hold only the TRS fields that moved, e.g. {x,y,z}; a MULTI-SELECT drag is ' +
       'ONE event shaped `{entities:[guid], members:[{entity, before, after}]}` instead, so read ' +
       '`members` — `payload.entity` is undefined there). !scene-load `{path, ' +
-      'entityCount}`, !save `{path, entities}`, !gizmo `{mode|space}`, !sceneviewmode `{mode}`, ' +
+      'worldEntityTotal}`, !save `{path, entities}`, !gizmo `{mode|space}`, !sceneviewmode `{mode}`, ' +
       '!gameviewdevice `{device, orientation}`, !animationviewmode `{mode}`. ' +
       'A trait-field !edit ALSO carries a structured `detail: {trait, field, entities[guid], old[], ' +
       'new[]}` (index-aligned arrays; length-1 for a single edit, N for a multi-select — so "zeroed ' +
@@ -232,8 +235,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       '(reported in `skipped`); if NONE resolve the call fails, so selection is never silently ' +
       'confirmed on a stale id. No refs at all = clear. Does NOT push an undo entry. Returns the new editor state.',
     {
-      entityId: z.number().nullable().optional().describe('Primary entity id to select (null clears). Prefer guid.'),
-      entityIds: z.array(z.number()).optional().describe('Multi-selection set by id. Prefer guids.'),
+      entityId: z.number().nullable().optional().describe('Primary entity id to select (null clears). Only for an entity with no guid — use guid.'),
+      entityIds: z.array(z.number()).optional().describe('Multi-selection set by id. Only for entities with no guid — use guids.'),
       guid: z.string().optional().describe('Entity guid to select (preferred — stable across hot-reloads).'),
       guids: z.array(z.string()).optional().describe('Multi-selection set by guid (preferred).'),
       asset: z.object({ path: z.string(), type: z.string(), name: z.string() }).nullable().optional()
@@ -363,37 +366,35 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   tool(
     'modoki_create_entity',
     'Create an entity exactly like the Hierarchy "Create ▸" menu (undoable). Kinds: empty, ' +
-      'primitive (mesh: sphere/cylinder/cone/plane/…), 2d (shape: square/circle/triangle), ' +
+      `primitive (mesh: ${vocabularyProse(PRIMITIVE_MESHES)}), 2d (shape: ${vocabularyProse(SPRITE_SHAPES)}), ` +
       'canvas2d (full-screen 2D canvas host for Renderable2D children), ui ' +
-      '(preset: view/text/image/button/input/slider), camera, light (light: ambient/directional/' +
-      'point/spot), particle. Returns {id, name, guid} — carry the GUID (runtime ids are ' +
+      `(preset: ${vocabularyProse(UI_PRESETS)}), camera, light (light: ${vocabularyProse(LIGHT_KINDS)}), ` +
+      'environment (an HDR Environment with no .hdr yet), particle. A field that is not its kind\'s ' +
+      '(`shape` on a primitive) is REFUSED rather than ignored. Returns {id, name, guid} — carry the GUID (runtime ids are ' +
       'reassigned on every hot-reload). LIVE-world only: NOT saved to disk — run modoki_save_all ' +
       'to persist (a file tool like set_transform/mutate_scene/build can\'t see it until you do).',
     {
-      kind: z.enum(['empty', 'primitive', '2d', 'canvas2d', 'ui', 'camera', 'light', 'particle'])
-        .describe('What to create — which traits the new entity gets. Drives the default name and, for primitive/2d, the shape/mesh fields.'),
-      parentId: z.number().optional().describe('Parent entity id (default 0 = root).'),
-      parentGuid: z.string().optional().describe('Parent entity guid — PREFER over parentId (stable across hot-reloads). Wins when both are given.'),
-      mesh: z.string().optional().describe('For kind=primitive. One of: cube, box, sphere, cylinder, cone, plane, torus, capsule (default sphere). An unknown name is REFUSED — it would otherwise create an entity whose renderer resolves to nothing.'),
-      shape: z.string().optional().describe('For kind=2d. One of: circle, square, triangle (default square). An unknown name is REFUSED. For an image sprite, create the entity then set Renderable2D.sprite to a texture GUID.'),
-      preset: z.enum(['view', 'text', 'image', 'button', 'input', 'slider']).optional().describe('For kind=ui.'),
-      light: z.enum(['ambient', 'directional', 'point', 'spot']).optional().describe('For kind=light.'),
+      kind: z.enum(CREATE_ENTITY_KINDS)
+        .describe('What to create — which traits the new entity gets. Drives the default name and, for primitive/2d/ui/light, which one field applies.'),
+      parentId: z.number().optional().describe('Parent entity id (default 0 = root). Only for a parent with no guid — use parentGuid.'),
+      parentGuid: z.string().optional().describe('Parent entity guid — PREFER over parentId (stable across hot-reloads). Not together with parentId.'),
+      mesh: z.string().optional().describe(`For kind=primitive only. One of: ${vocabularyProse(PRIMITIVE_MESHES)} (default ${CREATE_ENTITY_FIELDS.primitive.fallback}). An unknown name is REFUSED — it would otherwise create an entity whose renderer resolves to nothing.`),
+      shape: z.string().optional().describe(`For kind=2d only. One of: ${vocabularyProse(SPRITE_SHAPES)} (default ${CREATE_ENTITY_FIELDS['2d'].fallback}). An unknown name is REFUSED. For an image sprite, create the entity then set Renderable2D.sprite to a texture GUID.`),
+      preset: z.enum(UI_PRESETS).optional().describe(`For kind=ui only (default ${CREATE_ENTITY_FIELDS.ui.fallback}).`),
+      light: z.enum(LIGHT_KINDS).optional().describe(`For kind=light only (default ${CREATE_ENTITY_FIELDS.light.fallback}).`),
     },
     async ({ kind, parentId, parentGuid, mesh, shape, preset, light }) => {
-      // Build the discriminated CreateEntitySpec the renderer op expects.
-      let spec: Record<string, unknown>;
-      switch (kind) {
-        // Defaults are applied by the OP (agentEditorOps `create-entity`), so the MCP tool and a
-        // direct curl call behave identically — they used to differ, and the direct path crashed.
-        case 'primitive': spec = { kind, ...(mesh ? { mesh } : {}) }; break;
-        case '2d': spec = { kind, ...(shape ? { shape } : {}) }; break;
-        // ⚠️ No `?? 'view'` / `?? 'point'` here (#1070 close-out review): the op owns those defaults
-        // now (`resolveCreateEntitySpec`), and a copy in the tool would silently keep the OLD one if
-        // the runtime's ever changed — curl and the tool would build different entities again.
-        case 'ui': spec = { kind, ...(preset ? { preset } : {}) }; break;
-        case 'light': spec = { kind, ...(light ? { light } : {}) }; break;
-        default: spec = { kind };
-      }
+      // Build the discriminated CreateEntitySpec the renderer op expects. Every given field rides
+      // along, WHATEVER the kind (#1216 C-3): this switch used to copy only the kind's own field, so
+      // `{kind:'primitive', shape:'circle'}` dropped `shape` here and built a sphere, ok. The op refuses
+      // a field its kind does not take, so sending all of them is what makes that refusal reachable.
+      // ⚠️ No defaults here (#1070 close-out review): the op owns them (`resolveCreateEntitySpec`), and
+      // a copy in the tool would silently keep the OLD one if the runtime's ever changed.
+      const spec: Record<string, unknown> = {
+        kind,
+        ...(mesh !== undefined ? { mesh } : {}), ...(shape !== undefined ? { shape } : {}),
+        ...(preset !== undefined ? { preset } : {}), ...(light !== undefined ? { light } : {}),
+      };
       return editorAction('create-entity', { spec, parentId, parentGuid });
     },
   );
@@ -403,8 +404,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'stable) or `id`. Returns {id, guid} of the new copy — carry the guid. LIVE-world only: NOT ' +
       'saved to disk (run modoki_save_all to persist).',
     {
-      id: z.number().optional().describe('Runtime id — reassigned on hot-reload. Prefer guid.'),
-      guid: z.string().optional().describe('Stable entity guid (preferred). Wins over id.'),
+      id: z.number().optional().describe('Runtime id. Only for an entity with no guid — use guid.'),
+      guid: z.string().optional().describe('Stable entity guid (preferred). Not together with id.'),
       entity: flatEntityAlias,
     },
     async ({ id, guid, entity }) => {
@@ -415,11 +416,12 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
   );
   tool(
     'modoki_delete_entities',
-    'Delete one or more entities and their subtrees (undoable). Address them by `guids` (PREFER — ' +
-      'stable) or `ids`. A recycled id after a hot-reload can hit the WRONG entity, so pass guids ' +
-      'when you have them. LIVE-world only: NOT saved to disk (run modoki_save_all to persist).',
+    'Delete one or more entities and their subtrees (undoable). Address them by `guids`; `ids` only ' +
+      'for an entity with no guid. `deleted` lists the guids you named (`deletedNoGuidIds` for one with ' +
+      'no guid); `alsoDeleted` lists the descendants the delete took with them (the first 100, with ' +
+      '`alsoDeletedTotal` when there were more). LIVE-world only: NOT saved to disk (run modoki_save_all to persist).',
     {
-      ids: z.array(z.number()).optional().describe('Runtime ids — reassigned on hot-reload; a recycled id deletes the wrong entity. Prefer guids.'),
+      ids: z.array(z.number()).optional().describe('Runtime ids. Only for entities with no guid — an id for one that has a guid refuses the call. Use guids.'),
       id: z.number().optional().describe('Singular form of `ids`, for deleting one entity.'),
       guids: z.array(z.string()).optional().describe('Stable entity guids (preferred).'),
       guid: z.string().optional().describe('Singular form of `guids` — the preferred way to delete ONE entity.'),
@@ -432,10 +434,10 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'world transform (undoable). Address the entity AND the parent by `guid`/`parentGuid` ' +
       '(PREFER — stable) or `id`/`parentId`. LIVE-world only: NOT saved to disk (run modoki_save_all).',
     {
-      id: z.number().optional().describe('Runtime id of the entity to move. Prefer guid.'),
-      guid: z.string().optional().describe('Stable guid of the entity to move (preferred). Wins over id.'),
-      parentId: z.number().optional().describe('New parent runtime id (0 or omitted = root). Prefer parentGuid.'),
-      parentGuid: z.string().optional().describe('New parent guid (preferred). Wins over parentId.'),
+      id: z.number().optional().describe('Runtime id of the entity to move. Only for an entity with no guid — use guid.'),
+      guid: z.string().optional().describe('Stable guid of the entity to move (preferred). Not together with id.'),
+      parentId: z.number().optional().describe('New parent runtime id (0 or omitted = root). Only for a parent with no guid — use parentGuid.'),
+      parentGuid: z.string().optional().describe('New parent guid (preferred). Not together with parentId.'),
       sortOrder: z.number().optional().describe(
         'Index among the NEW parent\'s children, 0-based — where the entity lands in Hierarchy '
         + 'order. Omit to append LAST. This is sibling order only; it has no effect on '
@@ -482,10 +484,10 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       // EXTENDS the shared base rather than replacing it (§2 containment): the scope note is real
       // per-tool information, and it sits after the rule instead of forking it.
       discardUnsaved: discardUnsavedParam.describe(`${DISCARD_UNSAVED_BASE}. edit-open ONLY — that action swaps the world like modoki_load_scene; the other prefab actions ignore this.`),
-      parentId: z.number().optional().describe('instantiate: parent entity id (default root). Prefer parentGuid.'),
-      parentGuid: z.string().optional().describe('instantiate: parent entity guid (preferred; wins over parentId).'),
-      entityId: z.number().optional().describe('create/detach/overrides/apply/revert: the entity id. Prefer entityGuid.'),
-      entityGuid: z.string().optional().describe('create/detach/overrides/apply/revert: the entity guid (preferred; wins over entityId).'),
+      parentId: z.number().optional().describe('instantiate: parent entity id (default root). Only for a parent with no guid — use parentGuid.'),
+      parentGuid: z.string().optional().describe('instantiate: parent entity guid (preferred). Not together with parentId.'),
+      entityId: z.number().optional().describe('create/detach/overrides/apply/revert: the entity id. Only for an entity with no guid — use entityGuid.'),
+      entityGuid: z.string().optional().describe('create/detach/overrides/apply/revert: the entity guid (preferred). Not together with entityId.'),
       keys: z.array(z.string()).optional().describe("apply/revert: the override keys to act on — exact strings from a prior `overrides` call's `keys.all`. ALL-or-nothing: one unrecognized key refuses the whole call rather than quietly acting on the rest. OMIT to act on ALL current overrides; an explicit empty array is REFUSED, because a filter that matched nothing means 'act on nothing' and must not fall through to 'act on everything'."),
     },
     // `prefabAction`, NOT `action`: /api/editor-action spends `action` on the op name and strips it
@@ -673,8 +675,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       '`guid` (PREFER — stable) or `id`. Fails if the entity does not resolve, or if no SceneView ' +
       'is mounted to frame it in (so a "framed it" report always means the camera moved). Verify the new pose in modoki_get_editor_state.',
     {
-      id: z.number().optional().describe('Runtime id. Prefer guid.'),
-      guid: z.string().optional().describe('Stable entity guid (preferred). Wins over id.'),
+      id: z.number().optional().describe('Runtime id. Only for an entity with no guid — use guid.'),
+      guid: z.string().optional().describe('Stable entity guid (preferred). Not together with id.'),
       entity: flatEntityAlias,
     },
     async ({ id, guid, entity }) => {

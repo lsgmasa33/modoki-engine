@@ -91,7 +91,7 @@ describe('loadScene: a load superseded in the WINNER\'S TAIL (#495)', () => {
     expect(getCurrentScenePath()).toBe('/sceneB.json');
     expect(h.swapHistoryCalls).toEqual(['/sceneB.json']);
     expect(h.emitCalls).toEqual([
-      { event: '!scene-load', payload: { path: '/sceneB.json', entityCount: expect.any(Number) } },
+      { event: '!scene-load', payload: { path: '/sceneB.json', worldEntityTotal: expect.any(Number) } },
     ]);
 
     // The loser's OWN SceneManager.loadScene call now resolves successfully too — the tail
@@ -107,7 +107,7 @@ describe('loadScene: a load superseded in the WINNER\'S TAIL (#495)', () => {
     expect(h.swapHistoryCalls).toEqual(['/sceneB.json']);
     // Must NOT have journalled the loser's path (against the winner's live entity count).
     expect(h.emitCalls).toEqual([
-      { event: '!scene-load', payload: { path: '/sceneB.json', entityCount: expect.any(Number) } },
+      { event: '!scene-load', payload: { path: '/sceneB.json', worldEntityTotal: expect.any(Number) } },
     ]);
   });
 
@@ -121,7 +121,7 @@ describe('loadScene: a load superseded in the WINNER\'S TAIL (#495)', () => {
     expect(getCurrentScenePath()).toBe('/sceneA.json');
     expect(h.swapHistoryCalls).toEqual(['/sceneA.json']);
     expect(h.emitCalls).toEqual([
-      { event: '!scene-load', payload: { path: '/sceneA.json', entityCount: expect.any(Number) } },
+      { event: '!scene-load', payload: { path: '/sceneA.json', worldEntityTotal: expect.any(Number) } },
     ]);
   });
 });

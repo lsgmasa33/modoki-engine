@@ -92,7 +92,7 @@ describe('roundFloats — deep, and non-mutating', () => {
   });
 
   it('an entity index (no floats) round-trips unchanged', () => {
-    const idx = { entityCount: 2, entities: [{ id: 1, guid: 'g', traits: ['Transform'] }] };
+    const idx = { returnedCount: 2, entities: [{ id: 1, guid: 'g', traits: ['Transform'] }] };
     expect(roundFloats(idx, 9)).toEqual(idx);
   });
 });

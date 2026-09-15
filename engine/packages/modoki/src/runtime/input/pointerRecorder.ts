@@ -46,6 +46,7 @@ import { rawNow } from '../core/clock';
 import { journalTick } from '../core/journal';
 import { nearestPointerBlocker, isOutsidePointerScope } from '../core/pointerBlockers';
 import { pickAt, pickableSurfaces } from '../core/screenPick';
+import { guidOfEntityId } from '../core/ecs/entityUtils';
 import type { BoundsSurface } from '../core/screenBounds';
 
 /** What a press resolved to — a discriminated union, because the three cases are genuinely
@@ -60,8 +61,8 @@ import type { BoundsSurface } from '../core/screenBounds';
  *    says so in words a reader can act on. */
 export type InputResolution =
   | { by: 'game'; kind: string; id?: string | number; label?: string }
-  | { by: 'ui'; entityId: number; label?: string }
-  | { by: 'pick'; entityId: number; surface: BoundsSurface }
+  | { by: 'ui'; entityId: number; guid: string | null; label?: string }
+  | { by: 'pick'; entityId: number; guid: string | null; surface: BoundsSurface }
   | { by: 'none'; checked: Array<'game' | 'ui' | 'pick'> }
   | { by: 'unknown'; reason: string };
 
@@ -168,8 +169,10 @@ function describeNode(n: unknown): string {
   // on the live gate — Court's tutorial catcher reported as a plain "div" and had to be identified
   // by cross-referencing the resolution, which a blocker that is not also the resolved target
   // would not have offered.
+  // Named by guid (#1223 P2): a bare id is reassigned on reload and the mutating tools refuse it for
+  // an entity that has a guid. `id:<n>` only for a guid-less one, the form a contact partner takes.
   const entityId = el.getAttribute?.('data-entity-id');
-  if (entityId) s += `[entity=${entityId}]`;
+  if (entityId) s += `[entity=${guidOfEntityId(Number(entityId)) ?? `id:${entityId}`}]`;
   const testid = el.getAttribute?.('data-testid');
   if (testid) s += `[data-testid="${testid}"]`;
   else if (typeof el.className === 'string' && el.className.trim()) {
@@ -188,7 +191,7 @@ function engineResolve(target: unknown, x: number, y: number): InputResolution {
   if (uiNode) {
     const raw = uiNode.getAttribute('data-entity-id');
     const entityId = raw === null ? NaN : Number(raw);
-    if (Number.isFinite(entityId)) return { by: 'ui', entityId };
+    if (Number.isFinite(entityId)) return { by: 'ui', entityId, guid: guidOfEntityId(entityId) };
   }
   // A UI MISS is deliberately NOT recorded as an authority that looked. "This press was not on a
   // UI node" says nothing whatsoever about whether it hit something in the game — and counting it
@@ -203,7 +206,7 @@ function engineResolve(target: unknown, x: number, y: number): InputResolution {
     const hit = pickAt(surface, x, y);
     if (hit === undefined) continue;
     anyPicker = true;
-    if (hit !== null) return { by: 'pick', entityId: hit, surface };
+    if (hit !== null) return { by: 'pick', entityId: hit, guid: guidOfEntityId(hit), surface };
   }
   if (anyPicker) checked.push('pick');
 

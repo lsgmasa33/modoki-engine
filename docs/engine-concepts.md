@@ -100,7 +100,7 @@ or one frame picks its key from this table:
 | The code holds… | Key | Why |
 |---|---|---|
 | **Per-entity state** — lives and dies with ONE entity: a cache, a GPU object, a timer, a warn-once flag | `packedOf` / `EntityTable` / despawn eviction (above) | `spawnPrefabInstance`'s `guidSeed` re-mints the SAME guid on every respawn by design (Timeline scrub, Entries rows), so a guid-keyed cache hands the dead instance's state to its replacement — #868 spelled as a string. An entity without `EntityAttributes` has no guid at all. |
-| **A reference that should follow "the same thing"** — a selection, a collapsed tree node, a cross-entity field, anything that must survive a reload | the **guid**, resolved through `findEntityByGuid` (inside a structure callback, `peekEntityByGuid`) | A seeded respawn IS the same thing to the person looking at it, and a board rebuild's fresh runtime guids are not. An entity with no guid (a `Time`/`Input` singleton) is dropped when it goes. The editor's worked example is `editor/store/heldEntity.ts` ([editor.md](editor.md) § "Inside one world"). |
+| **A reference that should follow "the same thing"** — a selection, a collapsed tree node, a cross-entity field, anything that must survive a reload | the **guid**, resolved through `findEntityByGuid` (inside a structure callback, `peekEntityByGuid`) | A seeded respawn IS the same thing to the person looking at it, and a board rebuild's fresh runtime guids are not. An entity with no guid (since #1248, only a registered one whose EntityAttributes was removed) is dropped when it goes. The editor's worked example is `editor/store/heldEntity.ts` ([editor.md](editor.md) § "Inside one world"). |
 | **A reference to THIS instance only** — a dialog's subject, the row being renamed; or a game module's handle that never outlives its world | `entityPin` (below) / a live `Entity` checked with `isPackedAlive` before every use | It must never act on a replacement, seeded or not. Court's roots and board handles are the game-side worked example (`games/court/rendering-notes.md` § "The eighth member dies MID-world", #1224). |
 | **Crosses a boundary** — the journal, an agent reply, undo, a game-facing callback | the **guid, taken while the entity was alive** | A dead handle has nothing left to derive it from: `entityRef(deadHandle)` returns `null` (#1227), and an exit callback reads `otherRef`/`refs` instead ([zones.md](zones.md), [physics-2d.md](physics-2d.md)). |
 | Used inside one loop or one frame, never stored | the id | Owner ruling on #1222. |
@@ -229,6 +229,19 @@ and entity-ref field takes. It comes in two kinds, and the difference is lifetim
     an equal string does not follow it, so a live entity lookup by guid uses `findEntityByGuid`.
   - `createTestWorld` saves the generation on create and restores it on dispose, so identical harness
     runs mint identical guids.
+  - **Unique per page load, not just per world (#1223 D5).** The generation counter is module state,
+    so every page load restarted it at 1 and re-issued the previous page's guids. Observed live in the
+    editor on 2026-09-15: before a reload the current world was generation 2, and after it the new page
+    minted generation 1 again, a generation the previous page had already used. A guid an agent held
+    across the reload could then resolve to a different entity instead of missing. The app entry
+    (`app/main.tsx`) calls `saltRuntimeGuidGeneration()` once, which starts the page's generations at
+    a random base. The harness never runs that file, so harness runs stay deterministic.
+  - **A miss says why when it can (#1223 D4).** `classifyRuntimeGuidMiss(guid)` answers `'despawned'`
+    (minted in this world, entity gone) or `'world-swapped'` (minted in an earlier world of this page).
+    It answers `null` for a guid this page never issued, whether from an earlier page load or invented.
+    The agent tools report it as `stale` beside `NOT_FOUND`
+    ([mcp-tool-conventions.md](mcp-tool-conventions.md) §3). A DURABLE miss cannot be classified:
+    nothing records which durable guids once existed.
 - **What a lookup costs** (measured #1222, vitest, n = live entities): a durable hit ~140 ns at 1k and
   ~195 ns at 10k, a runtime hit ~210–270 ns, a runtime stale miss ~160 ns — against 37–190 ns for
   `findEntityById`. A **durable stale miss** rescans the world to self-heal a mint site that forgot

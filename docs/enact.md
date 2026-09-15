@@ -979,13 +979,43 @@ Hierarchy drop indicator, the Assets drop overlay) is invisible from here; gatin
 cannot see those would be a false positive on legitimate flows. The warning composes with the
 `accepted ≠ committed` one above — both can fire on one drop, joined by ` ALSO: `.
 
-**Device-surface asymmetries (§9), both deliberate, neither previously written down:**
-`allowOccluded` exists only on the editor — `resolveAim` (`bridge.ts`) refuses a covered selector
-unconditionally, with no escape hatch — and the device surface has no `entity` addressing at all
-(selector or screenshot pixels only), because it has no editor to resolve a scene entity through.
-Both leave the device STRICTER than the editor, which is the safe direction; the `entity` gap is
-now stated on `device_screenshot`'s description too, which used to send callers to "aim by
-selector/entity" on tools that have no such parameter.
+### The device surface aims the same way now
+
+#1223 P3, #1216 P1-1. Both device-surface asymmetries this section used to record are closed. The premise behind the second was wrong: `resolve-entity-point` is a
+RUNTIME op that has always run on a device, so nothing about a scene entity needs an editor to
+resolve it. `bridge.ts`'s `resolveAim` simply never called it.
+- **`entity`** on `device_tap`/`hover`/`scroll`/`pointer`, and on each end of `device_drag` (nested
+  `from`/`to`, the `modoki_drag` shape; the flat `fromSelector`/`fromX`… still work, and one endpoint
+  given both ways is refused `AMBIGUOUS`). The page resolves it through the same op, and accepts or
+  refuses the answer through the same function the editor's `resolvePoint` uses
+  (`app/debug/entityAimRefusal.ts`), so one resolution is refused identically on both surfaces.
+  The trusted CDP/WDA routes resolve through `handleResolveAim`, which reads the endpoint's keys from
+  `DEVICE_AIM_KEYS` (`domPointContract.ts`).
+- **`allowOccluded`** on those tools, for `entity` and `selector` aims alike. A covered selector used to be
+  refused with no escape hatch. A held `device_pointer` move/up forces it, as the editor route does.
+- **Refusals keep their §5 fields.** The device protocol is an `Error:` string, which an older MCP
+  server must still read as a failure, so a refusal stays that string and carries `code`/`options`/
+  `stale` in ONE trailing `[modoki-refusal]{…}` line (`tools/shared/deviceRefusal.ts`). The MCP decodes
+  it into the envelope: `NOT_FOUND` with `got.stale` for a runtime guid from an earlier world,
+  `AMBIGUOUS` with the guids as `options`, `OCCLUDED`. An older app build sends no tail and still gets
+  the generic `REFUSED_BY_OP`.
+- **Deliberate differences that remain.** `surface` has no `'scene-view'` on the device (a shipped
+  game has no editor viewport). A shipped game registers no mesh picker unless it adds one, so a 3D
+  aim there is `occlusionScope:'canvas'`: DOM covering is checked, a mesh in front is not. `label`/
+  `within` aiming stays editor-only (it names editor chrome). A device refusal gets no #261 settling
+  hint: `layout-settling` samples the editor's `[data-ui-id]` dock chrome, which a game does not have.
+- ⚠️ **Version skew is made loud, not handled.** An app built before this change has no entity branch
+  and fell through to its pixel or viewport-centre default: `device_scroll {entity}` scrolled the
+  centre and answered ok (review finding). So the MCP sends a selector that matches nothing
+  (`ENTITY_AIM_SKEW_SELECTOR`) beside any entity aim without one. The new page resolves the entity
+  first and never reads it; the old one resolves it, misses, and refuses naming
+  `[data-modoki-app-predates-entity-aim]`. Rebuild the app.
+- **Found on the way:** the backend fronts a synthetic-fallback reply with a banner, a refusal
+  included, and the device MCP judged failure by `startsWith('Error:')`. So every refused synthetic tap
+  (the iPhone 8, an Android without adb) came back as `Tapped — ⚠️ SYNTHETIC INPUT … Error: …`, ok.
+  `isDeviceFailureText` now reads the line after the banner, and `synthFallbackBanner` folds newlines
+  in its reason so the banner IS one line — a WDA launch reason carries one (`withLaunchWarning`), and
+  the review reproduced the false success with it.
 ### Agent-input provenance: the actor lease (fixed 2026-07-22)
 
 `withEditorActor` can only attribute code the agent **calls**. Trusted input is the opposite

@@ -15,7 +15,7 @@
 
 import { describe, it, expect, afterEach, beforeAll, vi } from 'vitest';
 import {
-  createTestWorld, type TestWorld, Transform, EntityAttributes, Director, setTimeline, clearTimelineCache, normalizeTimeline,
+  createTestWorld, type TestWorld, Transform, EntityAttributes, destroyEntity, Director, setTimeline, clearTimelineCache, normalizeTimeline,
   Animator, SkeletalAnimator, AudioSource, VideoPlayer, HapticSettings, setAnimSet, clearAnimSetCache,
   registerEngineActions, registerAudioControls, registerVideoControls, registerHapticControls, registerQualityControls, registerIapControls,
 } from '@modoki/engine/runtime';
@@ -44,6 +44,17 @@ describe('dispatch-action: a no-op is a surfaced failure (F8)', () => {
     expect(r.ok).toBe(false);
     expect(r.dispatched).toBe(false);
     expect(r.reason).toMatch(/stale|no entity/i);
+  });
+
+  // #1223 close-out: targetGuid resolves through the shared resolver, so a stale runtime guid says why.
+  // Mutation: drop the `stale` spread from the op's targetGuid refusal.
+  it('a despawned runtime targetGuid → NOT_FOUND with stale:"despawned"', async () => {
+    game = createTestWorld({ actions: { 'my.real': () => {} } });
+    const shot = game.spawn(Transform(), EntityAttributes({ name: 'Shot' }));
+    const guid = (shot.get(EntityAttributes) as { guid: string }).guid;
+    destroyEntity(shot);
+    const r = await runAgentOp('dispatch-action', { name: 'my.real', targetGuid: guid }) as DispatchReply & { code?: string; stale?: string };
+    expect(r).toMatchObject({ ok: false, dispatched: false, code: 'NOT_FOUND', stale: 'despawned' });
   });
 
   it('a valid action DOES dispatch — ok is NOT false, dispatched:true, and the handler ran', async () => {

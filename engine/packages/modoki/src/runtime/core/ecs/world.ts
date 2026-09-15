@@ -175,14 +175,51 @@ interface RuntimeAddresses {
 
 const runtimeAddresses = new WeakMap<World, RuntimeAddresses>();
 let nextRuntimeGeneration = 1;
+/** Every generation this JS realm has handed a world — what lets a miss say "stale" rather than guess. */
+const issuedGenerations = new Set<number>();
+let generationSalted = false;
 
 function runtimeAddressesFor(world: World): RuntimeAddresses {
   let t = runtimeAddresses.get(world);
   if (!t) {
     t = { generation: nextRuntimeGeneration++, next: 1, entityOf: new Map(), ordinalOf: new Map() };
+    issuedGenerations.add(t.generation);
     runtimeAddresses.set(world, t);
   }
   return t;
+}
+
+/** Start this page's runtime-guid generations at a random base (#1223 D5). Called once by the app
+ *  entry (`app/main.tsx`), never by the headless harness, so harness runs keep minting the same guids.
+ *
+ *  ⚠️ Why: the counter is module state, so every page load restarted it at 1 and re-issued the SAME
+ *  guids. Observed live 2026-09-15 in the editor: the page before a reload held Time at
+ *  `00000000-0000-0002-…-000000000001`; after the reload this page minted generation 1 again, the
+ *  generation the previous page's first world had used. A runtime guid an agent held across a reload
+ *  could then resolve to whatever this page spawned at that ordinal, instead of missing.
+ *
+ *  The base leaves 2^20 generations of headroom below the 32-bit ceiling `formatRuntimeGuid` enforces,
+ *  and starts above 2^20 so it cannot meet a generation minted before this call ran. Two page loads
+ *  overlap only when their bases land within one session's world count of each other. Idempotent. */
+export function saltRuntimeGuidGeneration(random32: number = crypto.getRandomValues(new Uint32Array(1))[0]): void {
+  if (generationSalted) return;
+  generationSalted = true;
+  const span = 0xffffffff - 0x200000;
+  nextRuntimeGeneration = Math.max(nextRuntimeGeneration, 0x100000 + ((random32 >>> 0) % span));
+}
+
+/** Why a RUNTIME guid that misses in `world` misses — the `stale` a NOT_FOUND refusal reports (#1223 D4).
+ *  - `'despawned'`: minted in this world, and its entity is gone.
+ *  - `'world-swapped'`: minted in an earlier world of this page — a scene load, Stop, or reload swapped it out.
+ *  - `null`: not a runtime guid, a hit, or one this page never issued (an earlier page load, or invented).
+ *    A DURABLE guid's miss cannot be classified: nothing records which durable guids once existed. */
+export type RuntimeGuidStale = 'despawned' | 'world-swapped';
+export function classifyRuntimeGuidMiss(guid: string, world: World = getCurrentWorld()): RuntimeGuidStale | null {
+  const g = parseRuntimeGuid(guid);
+  if (!g || resolveRuntimeGuid(g, world)) return null;
+  const t = runtimeAddresses.get(world);
+  if (t && t.generation === g.generation) return g.ordinal >= 1 && g.ordinal < t.next ? 'despawned' : null;
+  return issuedGenerations.has(g.generation) ? 'world-swapped' : null;
 }
 
 function resolveRuntimeGuid(g: { generation: number; ordinal: number }, world: World): Entity | undefined {

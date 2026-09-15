@@ -18,6 +18,11 @@
 import * as THREE from 'three';
 import type { ErrorCode } from '../../tools/shared/mcpResult';
 import { OpRefusal } from '../debug/opRefusal';
+import { liveGuidOf } from '../debug/liveLifecycle';
+import {
+  resolveEntityAddress, guidListFields, descendantsOf, alsoDeletedFields, ALSO_DELETED_CAP,
+  type EntityAddress, type EntityAddressKey,
+} from '../debug/entityRef';
 import { describeEditorCamera, type EditorCameraInfo } from './editorCameraInfo';
 import { registerAgentOp as _registerAgentOp, type AgentOpHandler, setSceneReloadSuppressor, replaySuppressedSceneReloads, setPrefabSourceRefresher, inferAssetDefType, dumpSceneState, whereError } from '../debug/agentBridge';
 import { conditionError, waitForCondition, clampWaitTimeout, type WaitCondition, type WaitReaders } from '../debug/waitFor';
@@ -63,7 +68,7 @@ import {
 } from '@modoki/engine/editor';
 import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDITOR_JOURNAL_TAIL_DEFAULT } from '../debug/streamSummary';
 import {
-  getPlayState, setPlayState, getRunMode, canEdit, isAdvancing, getCurrentFPS, getFrameLoopHealth, getRendererGateHealth, getGpuFaultState, stepOneFrame, getAllEntities, findEntity, findEntityByGuid, deleteEntity, findUnrenderable2D,
+  getPlayState, setPlayState, getRunMode, canEdit, isAdvancing, getCurrentFPS, getFrameLoopHealth, getRendererGateHealth, getGpuFaultState, stepOneFrame, getAllEntities, findEntity, deleteEntity, findUnrenderable2D,
   getAnimationClip, normalizeAnimationClip, validateAssetData, journalEvents, getParticleEffect, mountedSurfaces,
   getTimeline, normalizeTimeline, getGuidForPath, getAssetEntry, getPresentationScale,
   getSpriteAnim, getRig2D, getRig2DSource,
@@ -250,6 +255,7 @@ function describeAnimationView() {
 
 function readEditorState() {
   const s = useEditorStore.getState();
+  const all = getAllEntities();
   // ⚠️ ONE reading of the unsaved-work state, projected into every field below (#972 P10). This
   // used to call `hasUnsavedChanges()` twice, `getDirtyAssetPaths()` twice,
   // `getPendingBaseScenePaths()` twice AND `unsavedChangeCauses()` once — four probes of one fact
@@ -373,10 +379,16 @@ function readEditorState() {
     // systems/traits are partly unregistered — so anything measured here may be wrong for
     // reasons that have nothing to do with the scene. Omitted when the project booted clean.
     ...(getGameBootFaults().length ? { gameBootFaults: getGameBootFaults() } : {}),
-    entityCount: getAllEntities().length,
+    // Every entity in the world, resources included (§2, #1223 D3) — not get_scene_state's rows.
+    worldEntityTotal: all.length,
     selection: {
       entityId: s.selectedEntityId,
       entityIds: s.selectedEntityIds,
+      // The guids beside the ids (#1223): `set_selection` refuses an `{id}` for an entity that has a
+      // guid, so a read → restore round trip must be able to hand back what it accepts.
+      // Read per entity, not from `getAllEntities()`, which drops a parked pool row and its subtree.
+      guid: s.selectedEntityId != null ? liveGuidOf(s.selectedEntityId) : null,
+      guids: s.selectedEntityIds.map((id) => liveGuidOf(id)),
       asset: s.selectedAsset,
     },
     camera: readEditorCamera(),
@@ -441,14 +453,14 @@ interface PrefabParams {
   force?: boolean;
   /** instantiate: parent entity id (default root). */
   parentId?: number;
-  /** instantiate: parent entity guid (stable; wins over parentId). */
+  /** instantiate: parent entity guid. Given with ANY `parentId` (0 included), the call is refused (#1223 D1). */
   parentGuid?: string;
   /** create/detach/overrides/apply/revert: the entity to make a prefab from / detach /
    *  inspect-or-mutate overrides on. For overrides/apply/revert this must be a prefab
    *  INSTANCE ROOT (or any member — resolution walks to the instance the entity belongs to
    *  the same way the human dialogs do: via the entity's own PrefabInstance trait). */
   entityId?: number;
-  /** create/detach/overrides/apply/revert: the entity guid (stable; wins over entityId). */
+  /** create/detach/overrides/apply/revert: the entity guid. Given together with `entityId`, the call is refused (#1223 D1). */
   entityGuid?: string;
   /** apply/revert: the override keys to act on (see `overrides`'s `keys.all` for the exact
    *  strings — `"localId.trait.field"` / `"+added.<guid>"` / `"-removed.<localId>"` /
@@ -462,17 +474,23 @@ function setSelectionRaw(entityId: number | null, entityIds: number[]): void {
   useEditorStore.setState({ selectedEntityId: entityId, selectedEntityIds: entityIds, selectedAsset: null });
 }
 
-/** Resolve an entity ref to a LIVE numeric id: `guid` wins (stable across hot-reloads), else
- *  the numeric `id` if it still resolves; null when neither does. CLAUDE.md mandates addressing
- *  by guid because runtime ids are REASSIGNED on every scene reload — a recycled id silently
- *  targets the WRONG entity (data loss on delete/reparent), so guid must be accepted everywhere
- *  an id is. `set_transform`/`mutate_scene` already take {id|name|guid}; this brings the live-world
- *  structural ops to parity. (C7 re-audit.) */
-function resolveLiveId(ref: { id?: number; guid?: string } | undefined): number | null {
-  if (!ref) return null;
-  if (ref.guid) { const e = findEntityByGuid(ref.guid); return e ? e.id() : null; }
-  if (ref.id != null) return findEntity(ref.id) ? ref.id : null;
-  return null;
+/** Throw a shared-resolver refusal as the op's own: a coded one as `OpRefusal`, carrying its `options`
+ *  and `stale`; an uncoded one (no address at all) as a plain `Error`. */
+function throwAddressRefusal(r: { code?: ErrorCode; error: string; options?: string[]; stale?: string }): never {
+  if (r.code) throw new OpRefusal(r.code, r.error, { options: r.options, stale: r.stale });
+  throw new Error(r.error);
+}
+
+/** A SET member (`set-selection`/`delete-entities`): its live id, or null when it matched nothing, so
+ *  the op can skip it and say so. Any OTHER refusal throws, and refuses the whole call: an `{id}` naming
+ *  an entity that has a guid (#1223 D2), or a guid given beside an id (D1), is a wrong address, and
+ *  skipping one quietly would act on the rest of a set the caller did not mean. */
+function resolveLiveIdOrSkip(ref: EntityAddress, op: string, miss: { stale?: string } = {}): number | null {
+  const r = resolveEntityAddress(ref, { label: op, accept: ['guid', 'id'] });
+  if (r.ok) return r.id;
+  // `miss` collects the first skipped ref's `stale`, so an all-miss refusal still says why (#1223 D4).
+  if (r.code === 'NOT_FOUND') { miss.stale ??= r.stale; return null; }
+  return throwAddressRefusal(r);
 }
 
 /** Validate that `path` names a real asset of `expected` type before opening an editor on it.
@@ -493,15 +511,12 @@ function requireAssetPath(path: string | undefined, expected: string, op: string
   if (type && type !== expected) throw new Error(`${op}: "${path}" is a ${type}, not a ${expected} — this editor only opens ${expected} assets.`);
 }
 
-/** Resolve a required entity ref for a structural op, throwing an actionable error when it
- *  doesn't resolve — so a stale guid/id is a visible failure, never a silent wrong-target. */
-function requireLiveId(ref: { id?: number; guid?: string } | undefined, op: string): number {
-  const id = resolveLiveId(ref);
-  if (id == null) {
-    const what = ref?.guid ? `guid "${ref.guid}"` : ref?.id != null ? `id ${ref.id}` : 'entity ref';
-    throw new OpRefusal('NOT_FOUND', `${op}: ${what} matched no live entity — it may be stale (runtime ids are reassigned on every scene reload; prefer addressing by guid). Re-read it with get_scene_state.`);
-  }
-  return id;
+/** Resolve a required entity ref for a structural op through the shared resolver
+ *  (`app/debug/entityRef.ts`, #1223), throwing its refusal — so a stale guid, an ambiguous pair or an
+ *  `{id}` for an entity that has a guid is a visible failure, never a silent wrong target. */
+function requireLiveId(ref: EntityAddress | undefined, op: string, accept: readonly EntityAddressKey[] = ['guid', 'id']): number {
+  const r = resolveEntityAddress(ref, { label: op, accept });
+  return r.ok ? r.id : throwAddressRefusal(r);
 }
 
 /** The parent an entity should be created under / moved to, VALIDATED.
@@ -515,7 +530,10 @@ function requireLiveId(ref: { id?: number; guid?: string } | undefined, op: stri
  *
  *  `0` stays literal: it means ROOT, not "entity 0", and must never be resolved. */
 function resolveParentId(p: { parentId?: number; parentGuid?: string }, op: string, opts: { move?: boolean } = {}): number {
-  const id = p.parentGuid ? requireLiveId({ guid: p.parentGuid }, op) : p.parentId ? requireLiveId({ id: p.parentId }, op) : 0;
+  // Root only when NOTHING else is given: `parentGuid` beside `parentId: 0` is two addresses, and the
+  // shared resolver refuses the pair rather than letting either win (#1223 D1).
+  const rootOnly = !p.parentGuid && (p.parentId == null || p.parentId === 0);
+  const id = rootOnly ? 0 : requireLiveId({ guid: p.parentGuid, id: p.parentId }, op);
   // A MOVE is judged by `reparentRefusal`, which lets a reorder under the current parent through; only a
   // path that CREATES the link refuses a resource parent outright.
   if (!opts.move) refuseResourceParent(id, op);
@@ -685,9 +703,8 @@ function worldFieldsToLocalLive(id: number, fields: Record<string, unknown>): { 
 }
 
 /** Resolve a `mutate_scene`-shaped entity ref ({id}|{name}|{guid}) against the LIVE world —
- *  the live-path twin of sceneMutate.ts's `resolveEntity` (which resolves against the FILE).
- *  `name` is not covered by `resolveLiveId` (structural ops only ever took id/guid), so this
- *  adds it for parity with the file-direct op vocabulary.
+ *  the live-path twin of sceneMutate.ts's `resolveEntity` (which resolves against the FILE). Unlike
+ *  `requireLiveId` it accepts `name`, for parity with the file-direct op vocabulary.
  *
  *  An AMBIGUOUS `name` is an error, not a first-match. It used to be `.find()`, and duplicate
  *  names are ordinary (three entities called "Enemy") — MEASURED on `games/3d-test`: with two
@@ -696,27 +713,11 @@ function worldFieldsToLocalLive(id: number, fields: Record<string, unknown>): { 
  *  Inside a batch there is no intermediate response in which to notice, and the entity-aimed input
  *  path already refuses exactly this (see `entityResolve.ts`) — so the two halves of the agent
  *  surface disagreed about whether an ambiguous name is addressable. It is not. */
-function resolveLiveEntityRef(ref: MutateEntityRef | undefined): { id: number } | { error: string; code?: ErrorCode } {
-  if (!ref) return { error: 'no entity ref given — pass {guid} | {name} | {id}' };
-  if (ref.guid) {
-    const e = findEntityByGuid(ref.guid);
-    return e ? { id: e.id() } : { error: `no LIVE entity with guid ${JSON.stringify(ref.guid)}`, code: 'NOT_FOUND' };
-  }
-  if (ref.id != null) {
-    return findEntity(ref.id) ? { id: ref.id } : { error: `no LIVE entity with id ${ref.id}`, code: 'NOT_FOUND' };
-  }
-  if (ref.name) {
-    const hits = getAllEntities().filter((en) => en.name === ref.name);
-    if (hits.length === 0) return { error: `no LIVE entity named ${JSON.stringify(ref.name)}`, code: 'NOT_FOUND' };
-    if (hits.length > 1) {
-      // Guids only (#1207): the refusal says "address by guid", so it lists nothing else.
-      const which = hits.map((e) => e.guid).filter(Boolean).join(', ');
-      const way = which ? `(${which}) — address by guid` : '— none has a guid, so address one by id';
-      return { error: `${hits.length} LIVE entities are named ${JSON.stringify(ref.name)} ${way}`, code: 'AMBIGUOUS' };
-    }
-    return { id: hits[0].id };
-  }
-  return { error: 'entity ref has none of {guid} | {name} | {id}' };
+function resolveLiveEntityRef(ref: MutateEntityRef | undefined): { id: number } | { error: string; code?: ErrorCode; options?: string[]; stale?: string } {
+  // The shared resolver (#1223): exactly one address, an ambiguous name refused with its guids, `{id}`
+  // only for a guid-less entity, and a stale runtime guid named as such.
+  const r = resolveEntityAddress(ref, { label: 'entity' });
+  return r.ok ? { id: r.id } : r;
 }
 
 /** Core traits every entity needs — mirrors sceneMutate.ts's CORE_TRAITS. removeTrait refuses
@@ -741,7 +742,8 @@ const LIVE_CORE_TRAITS = new Set(['Transform', 'EntityAttributes']);
 async function applySceneOpsLive(ops: MutateOp[]): Promise<{
   changed: number; errors: string[]; warnings: string[]; unresolved: MutateEntityRef[];
   created: Array<{ op: number; id: number; guid: string; name: string }>;
-  code?: ErrorCode;
+  addedTraits?: Array<{ op: number; id: number; guid: string; trait: string }>;
+  code?: ErrorCode; options?: string[]; stale?: string;
 }> {
   const errors: string[] = [];
   const warnings: string[] = [];
@@ -750,12 +752,16 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
   // Without it `changed:N` was the whole answer, so an agent had to re-find its own entity by
   // name, which this surface refuses when the name is ambiguous.
   const created: Array<{ op: number; id: number; guid: string; name: string }> = [];
+  /** #1216 C-12 / D6 — see `ApplyResult.addedTraits` (sceneMutate.ts), the file path's twin. */
+  const addedTraits: Array<{ op: number; id: number; guid: string; trait: string }> = [];
   let changed = 0;
   // FIRST resolveLiveEntityRef failure's machine code, if it had one (NOT_FOUND/AMBIGUOUS) — a
   // single-op call (the common case: modoki_set_transform/tap) needs its refusal's code to
   // survive to the HTTP boundary, and the first one is the one that actually blocked the op the
   // caller most likely cares about.
   let code: ErrorCode | undefined;
+  // …and that failure's `options`/`stale`, which travel with the code (#1223 D4).
+  let first: { options?: string[]; stale?: string } | undefined;
   const allTraitsList = getAllTraits();
 
   await runAsCompositeAction({ label: `Mutate Scene (${ops.length} op${ops.length === 1 ? '' : 's'})`, kind: '!mutate' }, () => {
@@ -765,7 +771,7 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
       try {
         if (op.op === 'setTrait') {
           const resolved = resolveLiveEntityRef(op.entity);
-          if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); if (code === undefined) code = resolved.code; continue; }
+          if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); if (code === undefined) { code = resolved.code; first = resolved; } continue; }
           const id = resolved.id;
           if (!op.trait) { errors.push(`${where}: missing 'trait'`); continue; }
           const meta = allTraitsList.find((t) => t.name === op.trait);
@@ -794,6 +800,9 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
             // undo entry — a live-path-only regression from file-direct parity, found while
             // testing the composite-batch removeTrait+removeEntity case.
             addTraitToEntitiesWithUndo([id], meta, fields);
+            // Already durable here: the undo action's `entityRef` minted it (a test pins that). ensureGuid reads it
+            // back typed non-null; it is not what makes it durable.
+            addedTraits.push({ op: i, id, guid: ensureGuid(id), trait: meta.name });
             changed++;
           } else {
             // writeTraitFieldWithUndo already routes into prefab-INSTANCE overrides
@@ -809,7 +818,7 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
           }
         } else if (op.op === 'removeTrait') {
           const resolved = resolveLiveEntityRef(op.entity);
-          if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); if (code === undefined) code = resolved.code; continue; }
+          if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); if (code === undefined) { code = resolved.code; first = resolved; } continue; }
           const id = resolved.id;
           if (!op.trait) { errors.push(`${where}: missing 'trait'`); continue; }
           if (LIVE_CORE_TRAITS.has(op.trait)) { errors.push(`${where}: cannot remove core trait '${op.trait}'`); continue; }
@@ -835,8 +844,14 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
             // other, and a stale id (they are reassigned on every scene reload) produced an ORPHAN:
             // an entity whose parentId points at nothing, reported as a clean success. Same
             // treatment for both now: resolve, else warn and fall back to the root.
-            if (parentRaw === 0 || resolveLiveId({ id: parentRaw }) != null) parentId = parentRaw;
-            else warnings.push(`${where}: parent id ${parentRaw} matched no live entity (runtime ids are reassigned on every scene reload — prefer a guid) — parented to the scene root instead`);
+            // An id naming an entity that HAS a guid is refused outright (#1223 D2), not re-rooted: the
+            // caller named a real parent by the wrong key, so creating the entity anywhere else is a
+            // wrong-place success.
+            const pr = parentRaw === 0 ? null : resolveEntityAddress({ id: parentRaw }, { label: `${where}: parent` });
+            if (!pr) parentId = 0;
+            else if (pr.ok) parentId = pr.id;
+            else if (pr.code === 'NOT_FOUND') warnings.push(`${where}: parent id ${parentRaw} matched no live entity (runtime ids are reassigned on every scene reload — prefer a guid) — parented to the scene root instead`);
+            else { errors.push(pr.error); if (code === undefined) { code = pr.code; first = pr; } continue; }
           } else if (typeof parentRaw === 'string') {
             const pr = resolveLiveEntityRef({ guid: parentRaw });
             if ('id' in pr) parentId = pr.id;
@@ -864,7 +879,7 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
           created.push({ op: i, id: newId, guid: ensureGuid(newId), name: op.name ?? 'New Entity' });
         } else if (op.op === 'removeEntity') {
           const resolved = resolveLiveEntityRef(op.entity);
-          if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); if (code === undefined) code = resolved.code; continue; }
+          if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); if (code === undefined) { code = resolved.code; first = resolved; } continue; }
           const id = resolved.id;
           deleteEntitiesWithUndo([id]);
           changed++;
@@ -877,7 +892,8 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
     }
   });
 
-  return { changed, errors, warnings, unresolved, created, ...(code ? { code } : {}) };
+  return { changed, errors, warnings, unresolved, created, ...(addedTraits.length ? { addedTraits } : {}), ...(code ? { code } : {}),
+    ...(code && first?.options?.length ? { options: first.options } : {}), ...(code && first?.stale ? { stale: first.stale } : {}) };
 }
 
 // ── Registration ─────────────────────────────────────────────────────────────
@@ -1120,8 +1136,8 @@ export function registerEditorAgentOps(): void {
       // `trait` narrows the one returned row to the trait the predicate reads, keeping the
       // observation small; `limit:1` because the wait needs a count and one example, not a dump.
       const trait = where ? /^\s*(\w+)\./.exec(where)?.[1] : undefined;
-      const r = dumpSceneState({ guid, name, where, ...(trait ? { trait } : {}), limit: 1 }) as { entities: unknown[]; totalCount?: number; entityCount: number };
-      return { count: r.totalCount ?? r.entityCount, first: r.entities[0] };
+      const r = dumpSceneState({ guid, name, where, ...(trait ? { trait } : {}), limit: 1 }) as { entities: unknown[]; totalCount: number };
+      return { count: r.totalCount, first: r.entities[0] };
     },
     consoleSince: (seq) => getConsoleRingEntries(seq),
     consoleWatermark: (lookbackMs) => {
@@ -1180,7 +1196,7 @@ export function registerEditorAgentOps(): void {
       useEditorStore.setState({ selectedAsset: p.asset, selectedEntityId: null, selectedEntityIds: [] });
       return readEditorState();
     }
-    // Resolve every requested ref to a LIVE id (guid wins), keeping only ids that resolve.
+    // Resolve every requested ref to a LIVE id through the shared resolver, keeping only ids that resolve.
     // Selecting a nonexistent/stale id used to "succeed" and echo it back as selected, so a
     // following gizmo / collider-edit / focus silently acted on nothing. Now a fully-unresolved
     // request fails, and a partial one reports what was skipped. No refs at all = clear. (C7 re-audit.)
@@ -1192,13 +1208,14 @@ export function registerEditorAgentOps(): void {
     ];
     const resolved: number[] = [];
     const missing: Array<{ id?: number; guid?: string }> = [];
+    const miss: { stale?: string } = {};
     for (const r of requested) {
-      const id = resolveLiveId(r);
+      const id = resolveLiveIdOrSkip(r, 'set-selection', miss);
       if (id == null) missing.push(r);
       else if (!resolved.includes(id)) resolved.push(id);
     }
     if (requested.length && resolved.length === 0) {
-      throw new OpRefusal('NOT_FOUND', 'set-selection: none of the requested entities resolve to a live entity (ids are reassigned on scene reload — prefer guid). Re-read them with get_scene_state.');
+      throw new OpRefusal('NOT_FOUND', 'set-selection: none of the requested entities resolve to a live entity (ids are reassigned on scene reload — prefer guid). Re-read them with get_scene_state.', { stale: miss.stale });
     }
     setSelectionRaw(resolved.length ? resolved[resolved.length - 1] : null, resolved);
     // An explicit request to select IS a request to see it: re-selecting the entity already
@@ -1585,6 +1602,7 @@ export function registerEditorAgentOps(): void {
       ok: true,
       openedClip: clip.name ?? name,
       animatorRootEntityId: st.animatorRootEntityId,
+      animatorRootGuid: st.animatorRootEntityId != null ? liveGuidOf(st.animatorRootEntityId) : null,
       bound: st.animatorRootEntityId != null,
       ...(st.animatorRootEntityId == null
         ? { hint: 'The clip is open but bound to NO entity, so modoki_pose_clip has nothing to pose. Binding resolves by matching the clip against entities carrying an Animator trait — check one exists in the OPEN scene and lists this clip.' }
@@ -1719,7 +1737,7 @@ export function registerEditorAgentOps(): void {
   // ── Scene management ──
   // load-scene / new-scene SWAP THE WORLD, so anything created live and not saved is gone —
   // from the world, the file, AND the undo stack (swapHistory rebinds). They used to report
-  // {ok:true, entityCount:12}, which looks perfectly healthy while the entity you just made
+  // {ok:true, entityCount:12} (now `worldEntityTotal`), which looks perfectly healthy while the entity you just made
   // no longer exists anywhere. Refuse by default; `discardUnsaved` discards deliberately. (C7)
   //
   // RENAMED from `force` (2026-08-22, owner). §2: one name, one meaning. `force` still means
@@ -2127,7 +2145,7 @@ export function registerEditorAgentOps(): void {
     if (!resolved.ok) {
       throw new OpRefusal('REFUSED_BY_OP', `create-entity: ${resolved.error} Valid: ${resolved.options.join(', ')}.`, { options: resolved.options });
     }
-    // parentGuid (stable) wins over parentId; BOTH are validated; 0 = root stays literal.
+    // parentGuid and parentId are ONE address (both given → refused, #1223); 0 alone = root stays literal.
     const parentId = resolveParentId(p, 'create-entity parent');
     const { name, specs } = buildEntityCreateSpecs(resolved.spec, parentId);
     const id = createEntityWithUndo(`Create ${name}`, parentId, specs as TraitSpec[], (i) => setSelectionRaw(i, i != null ? [i] : []));
@@ -2147,7 +2165,7 @@ export function registerEditorAgentOps(): void {
   });
   registerAgentOp('duplicate-entity', (params) => {
     const p = (params ?? {}) as { id?: number; guid?: string };
-    const id = requireLiveId(p, 'duplicate-entity'); // guid wins; throws on a stale ref (C7 re-audit)
+    const id = requireLiveId(p, 'duplicate-entity'); // throws on a stale, ambiguous or id-for-a-guid ref (#1223)
     if (isResourceEntity(id)) {
       // The Hierarchy disables Duplicate on a resource row; the agent path refuses the same thing (#1248).
       // A copy is a second world singleton: getTime/getInput read one, the systems write both.
@@ -2172,20 +2190,35 @@ export function registerEditorAgentOps(): void {
     if (!refs.length) throw new Error('delete-entities requires { ids } / { id } or { guids } / { guid }');
     const deleted: number[] = [];
     const missing: Array<{ id?: number; guid?: string }> = [];
+    const miss: { stale?: string } = {};
     for (const r of refs) {
-      const id = resolveLiveId(r);
+      const id = resolveLiveIdOrSkip(r, 'delete-entities', miss);
       if (id == null) missing.push(r);
       else if (!deleted.includes(id)) deleted.push(id);
     }
     if (deleted.length === 0) {
-      throw new OpRefusal('NOT_FOUND', 'delete-entities: none of the requested entities exist — nothing was deleted. Runtime ids are reassigned on every scene reload; re-read them with get_scene_state, or address entities by guid.');
+      throw new OpRefusal('NOT_FOUND', 'delete-entities: none of the requested entities exist — nothing was deleted. Runtime ids are reassigned on every scene reload; re-read them with get_scene_state, or address entities by guid.', { stale: miss.stale });
     }
+    // Name them by guid BEFORE deleting (#1223 P2): the delete cascades, so a child also listed reads
+    // no guid afterwards. The ids would be dead addresses the moment this returns.
+    // Mint the durable guids FIRST. `deleteEntitiesWithUndo` writes one over a runtime guid before it
+    // snapshots, and that is the guid its journal event and its undo use — named before the mint, the
+    // reply handed out a runtime guid the journal never mentioned and undo never restored (close-out
+    // review). Every listed id, not only the roots it snapshots: a listed child's guid rides in its
+    // ancestor's snapshot, so a durable one written now is the one an undo brings back.
+    for (const id of deleted) ensureGuid(id);
+    const named = guidListFields('deleted', deleted);
+    // The descendants the cascade takes too, which the reply never mentioned (#1216 C-6) — minted durable
+    // for the same reason as the listed ids: the guid named here must be the one undo brings back.
+    const descendants = descendantsOf(deleted);
+    for (const id of descendants.slice(0, ALSO_DELETED_CAP)) ensureGuid(id);
+    const also = alsoDeletedFields(descendants);
     deleteEntitiesWithUndo(deleted, (sel) => setSelectionRaw(sel[0] ?? null, sel));
-    return { ok: true, deleted, saved: false, ...(missing.length ? { skipped: missing, warning: `${missing.length} ref(s) matched no live entity and were skipped (ids are reassigned on scene reload — prefer guid)` } : {}) };
+    return { ok: true, ...named, ...also, saved: false, ...(missing.length ? { skipped: missing, warning: `${missing.length} ref(s) matched no live entity and were skipped (ids are reassigned on scene reload — prefer guid)` } : {}) };
   });
   registerAgentOp('reparent-entity', (params) => {
-    // guid (stable) wins over id for BOTH the moved entity and the new parent — the reparent is
-    // a structural edit where a recycled id would silently move the wrong node. (C7 re-audit.)
+    // Both the moved entity and the new parent resolve through the shared resolver (#1223): one address
+    // each, `{id}` only for a guid-less entity — a recycled id would silently move the wrong node.
     const p = (params ?? {}) as { id?: number; guid?: string; parentId?: number; parentGuid?: string; sortOrder?: number };
     const id = requireLiveId(p, 'reparent-entity');
     const parentId = resolveParentId(p, 'reparent-entity parent', { move: true });
@@ -2210,9 +2243,10 @@ export function registerEditorAgentOps(): void {
   registerAgentOp('apply-scene-ops', async (params) => {
     const p = (params ?? {}) as { ops?: MutateOp[] };
     if (!Array.isArray(p.ops) || p.ops.length === 0) throw new Error('apply-scene-ops requires a non-empty { ops } array');
-    const { changed, errors, warnings, unresolved, created, code } = await applySceneOpsLive(p.ops);
+    const { changed, errors, warnings, unresolved, created, addedTraits, code, options, stale } = await applySceneOpsLive(p.ops);
     return { ok: errors.length === 0, changed, errors, warnings, unresolved, saved: false,
-      ...(created.length ? { created } : {}), ...(code ? { code } : {}) };
+      ...(created.length ? { created } : {}), ...(addedTraits ? { addedTraits } : {}),
+      ...(code ? { code } : {}), ...(options ? { options } : {}), ...(stale ? { stale } : {}) };
   });
 
   // ── Prefab ops ──
@@ -2234,8 +2268,8 @@ export function registerEditorAgentOps(): void {
       if (!prefab) throw new Error(`prefab not found: ${path}`);
       // Track the parent by guid: `redo` can run after a world rebuild (Play→Stop), where a
       // raw parent id would resolve to a DIFFERENT entity and reparent the instance silently.
-      const parentId = p.parentGuid ? requireLiveId({ guid: p.parentGuid }, 'prefab instantiate parent') : (p.parentId ?? 0);
-      refuseResourceParent(parentId, 'prefab instantiate parent');
+      // Validated like every other parent now (#1223): a stale or invented `parentId` used to pass through raw.
+      const parentId = resolveParentId(p, 'prefab instantiate parent');
       const parentRef = parentId ? entityRef(parentId) : null;
       const rootId = await instantiatePrefabAsync(prefab as PrefabFile, parentId);
       // The human paths all pair instantiate with setPrefabSource — without it the spawned
@@ -2271,7 +2305,7 @@ export function registerEditorAgentOps(): void {
     if (which === 'create') {
       if ((p.entityId == null && !p.entityGuid) || !p.path) throw new Error('prefab create requires { entityId | entityGuid, path }');
       const path = p.path;
-      const entityId = requireLiveId({ id: p.entityId, guid: p.entityGuid }, 'prefab create'); // guid wins (C7 re-audit)
+      const entityId = requireLiveId({ id: p.entityId, guid: p.entityGuid }, 'prefab create'); // both given → refused (#1223 D1)
       const existingId = await resolveExistingPrefabId(path);
       const prefab = serializePrefab(entityId, existingId);
       if (!prefab) throw new Error(`could not serialize prefab from entity ${entityId}`);
@@ -2301,7 +2335,7 @@ export function registerEditorAgentOps(): void {
     }
     if (which === 'detach') {
       if (p.entityId == null && !p.entityGuid) throw new Error('prefab detach requires { entityId | entityGuid }');
-      const entityId = requireLiveId({ id: p.entityId, guid: p.entityGuid }, 'prefab detach'); // guid wins (C7 re-audit)
+      const entityId = requireLiveId({ id: p.entityId, guid: p.entityGuid }, 'prefab detach'); // both given → refused (#1223 D1)
       const snapshot = detachPrefabInstance(entityId);
       // detachPrefabInstance returns [] for a plain (non-instance) entity. Reporting {ok:true,
       // detached:0} let an agent believe it had unpacked a prefab it hadn't — now a hard failure,
@@ -2673,7 +2707,7 @@ export function registerEditorAgentOps(): void {
     }
     return {
       ok: true, exited: true, restored: true,
-      ...(rebound != null ? { reboundRootEntityId: rebound } : {}),
+      ...(rebound != null ? { reboundRootEntityId: rebound, reboundRootGuid: liveGuidOf(rebound) } : {}),
       note: 'Envelope closed and the authored world restored. The run-mode is back to stopped, so a scene save works again.',
     };
   });

@@ -8,9 +8,12 @@
  *  All rects are viewport CSS px (one frame), so layers are directly comparable.
  *
  *  Derived signals: same-layer overlapping pairs (EXCLUDING ancestor/descendant —
- *  a child inside its parent isn't an "overlap") and the off-screen id list.
+ *  a child inside its parent isn't an "overlap") and the off-screen entities.
  *
- *  SIZE: an untargeted call returns COUNTS (+ the cheap offScreen/zeroSize id lists), not the
+ *  Every entity is named by guid (#1223 P2): a row and an overlap member carry `guid` beside `id`, and
+ *  `offScreen`/`zeroSize` are guid lists with `<field>NoGuidIds` for an entity that has none.
+ *
+ *  SIZE: an untargeted call returns COUNTS (+ the cheap offScreen/zeroSize guid lists), not the
  *  per-entity rects and not the overlapping pairs. Returning both made this the largest payload
  *  in the whole agent surface — ~74k tokens on a 241-entity scene, of which the O(n²) pair list
  *  alone was more than every rect combined. Ask for what you need: `ids`/`layer` for rects,
@@ -18,9 +21,12 @@
 
 import { getAllEntities, collectScreenBounds, findEntityByGuid, type ScreenRect } from '@modoki/engine/runtime';
 import { uiSurfaceOf } from './uiSurface';
+import { guidListFields } from './entityRef';
 
 export interface LayoutEntry {
   id: number;
+  /** The entity's guid, `null` when it has none — the address that survives a reload (#1223). */
+  guid: string | null;
   name: string;
   layer: string | null;
   screen: ScreenRect | null;
@@ -38,6 +44,7 @@ export interface LayoutEntry {
   surface?: string;
   /** 2D only: the Canvas2D host entity these bounds were measured against. */
   canvasId?: number;
+  canvasGuid?: string | null;
 }
 
 export interface LayoutBoundsParams {
@@ -57,7 +64,7 @@ export interface LayoutBoundsParams {
   /** Force-include the per-entity rect list. Implied by `ids`/`layer` (asking for a subset is
    *  asking for its rects). Default false on an untargeted call — counts only. */
   entities?: boolean;
-  /** Cap the returned `entities[]`; sets `truncated` + `totalCount`. Without this, `layer=3d` on
+  /** Cap the returned `entities[]` (`returnedCount`); sets `truncated` when it bites. Without this, `layer=3d` on
    *  a real scene returns every rect (230 on the reference project) with no way to narrow — a
    *  drill-down that dead-ends is the same trap as an unbounded default. */
   limit?: number;
@@ -71,6 +78,7 @@ export function computeLayoutBounds(params: LayoutBoundsParams = {}) {
   const { layer, ids } = params;
   const all = getAllEntities();
   const byId = new Map(all.map((e) => [e.id, e] as const));
+  const guidOf = (id: number): string | null => byId.get(id)?.guid || null;
   // Resolve guids/name to ids up front so the rest of the function keeps working in ids. An
   // address that resolves to NOTHING is echoed back as `unresolved` rather than silently
   // narrowing to an empty answer — a stale id used to read exactly like "this entity has no
@@ -114,7 +122,7 @@ export function computeLayoutBounds(params: LayoutBoundsParams = {}) {
       // with no explanation.
       const surface = uiSurfaceOf(el);
       entries.push({
-        id, name: info.name, layer: 'ui',
+        id, guid: info.guid || null, name: info.name, layer: 'ui',
         screen: { x: r.left, y: r.top, w: r.width, h: r.height },
         onScreen: r.width > 0 && r.height > 0,
         zeroSize: r.width === 0 || r.height === 0,
@@ -130,12 +138,12 @@ export function computeLayoutBounds(params: LayoutBoundsParams = {}) {
       if (layer && b.layer !== layer) continue;
       const info = byId.get(b.id);
       entries.push({
-        id: b.id, name: info?.name ?? '', layer: b.layer,
+        id: b.id, guid: guidOf(b.id), name: info?.name ?? '', layer: b.layer,
         screen: b.screen, onScreen: b.onScreen,
         zeroSize: !b.screen || b.screen.w === 0 || b.screen.h === 0,
         ...(b.worldAABB ? { worldAABB: b.worldAABB } : {}),
         ...(b.surface ? { surface: b.surface } : {}),
-        ...(b.canvasId !== undefined ? { canvasId: b.canvasId } : {}),
+        ...(b.canvasId !== undefined ? { canvasId: b.canvasId, canvasGuid: guidOf(b.canvasId) } : {}),
       });
     }
   }
@@ -152,7 +160,8 @@ export function computeLayoutBounds(params: LayoutBoundsParams = {}) {
   };
   // Always COUNT the overlapping pairs (cheap); only materialize the pair objects when asked.
   // Serializing them is what cost ~105k chars, not finding them.
-  const overlaps: { a: number; b: number; layer: string }[] = [];
+  type Member = { id: number; guid: string | null; name: string };
+  const overlaps: { a: Member; b: Member; layer: string }[] = [];
   let overlapsCount = 0;
   for (let i = 0; i < entries.length; i++) {
     for (let j = i + 1; j < entries.length; j++) {
@@ -161,14 +170,17 @@ export function computeLayoutBounds(params: LayoutBoundsParams = {}) {
       if (isAncestor(A.id, B.id) || isAncestor(B.id, A.id)) continue; // nested ≠ overlap
       if (!rectsIntersect(A.screen, B.screen)) continue;
       overlapsCount++;
-      if (params.overlaps) overlaps.push({ a: A.id, b: B.id, layer: A.layer! });
+      if (params.overlaps) overlaps.push({ a: { id: A.id, guid: A.guid, name: A.name }, b: { id: B.id, guid: B.guid, name: B.name }, layer: A.layer! });
     }
   }
-  // `offScreen` (ids) is ALWAYS returned: it is cheap, and `diagnose.ts` calls this with no
-  // params and reads `.offScreen.length`. Dropping it for a count would break modoki_diagnose
-  // in the field long before a test noticed. Same reasoning for `zeroSize`.
-  const offScreen = entries.filter((e) => !e.onScreen).map((e) => e.id);
-  const zeroSize = entries.filter((e) => e.zeroSize).map((e) => e.id);
+  // `offScreen` is ALWAYS returned: it is cheap, and `diagnose.ts` calls this with no params and
+  // re-reports it. Dropping it for a count would break modoki_diagnose in the field long before a
+  // test noticed. Same reasoning for `zeroSize`. One element per RECT, like `totalCount`, so an entity
+  // measured by two surfaces appears twice.
+  const offScreen = guidListFields('offScreen', entries.filter((e) => !e.onScreen).map((e) => e.id), guidOf);
+  const zeroSize = guidListFields('zeroSize', entries.filter((e) => e.zeroSize).map((e) => e.id), guidOf);
+  const offScreenCount = entries.filter((e) => !e.onScreen).length;
+  const zeroSizeCount = entries.filter((e) => e.zeroSize).length;
 
   const layerCounts: Record<string, number> = {};
   for (const e of entries) layerCounts[e.layer ?? 'null'] = (layerCounts[e.layer ?? 'null'] ?? 0) + 1;
@@ -189,38 +201,43 @@ export function computeLayoutBounds(params: LayoutBoundsParams = {}) {
 
   // Every 3D entity is measured once PER MOUNTED SURFACE (the Scene panel and the Game panel each
   // have their own camera), so with both open the counts are inflated — roughly doubled — and
-  // `count`/`offScreenCount`/`zeroSizeCount` read as "the scene has twice as many things". Report
+  // `totalCount`/`offScreenCount`/`zeroSizeCount` read as "the scene has twice as many things". Report
   // the DISTINCT entity count alongside, and name the surfaces, so the number is interpretable
   // instead of merely large. (S2.16)
   const distinctIds = new Set(entries.map((e) => e.id));
   const surfaces = [...new Set(entries.map((e) => (e as { surface?: string }).surface).filter(Boolean))] as string[];
   const perSurface = surfaces.length > 1;
 
+  // §2 (#1217, #1223 D3): `totalCount` and `returnedCount` count RECTS — every rect measured, and the
+  // rects in `entities` — and `entityTotal` the distinct entities behind `totalCount`. This reply
+  // used to say `count` for the rects and `entityCount` for the entities, while `entityCount` meant
+  // returned rows in get_scene_state and the whole world in the editor state.
   return {
-    count: entries.length,
-    /** Distinct ENTITIES behind `count`. Differs whenever more than one viewport is mounted. */
-    entityCount: distinctIds.size,
+    totalCount: entries.length,
+    ...(wantEntities ? { returnedCount: shown.length } : {}),
+    /** Distinct ENTITIES behind `totalCount`. Differs whenever more than one viewport is mounted. */
+    entityTotal: distinctIds.size,
     ...(perSurface ? {
       surfaces,
       surfaceNote:
         `${surfaces.length} viewports are mounted (${surfaces.join(', ')}), and each measures every 3D ` +
-        `entity through its OWN camera — so \`count\` (${entries.length}) counts RECTS, not entities ` +
+        `entity through its OWN camera — so \`totalCount\` (${entries.length}) counts RECTS, not entities ` +
         `(${distinctIds.size}). There is no surface FILTER: layer= cannot separate them (both are ` +
         `layer:'3d') and targeting still returns one rect per viewport. Read \`surface\` on each ` +
-        `entry to tell them apart, and use \`entityCount\` wherever you meant "how many entities".`,
+        `entry to tell them apart, and use \`entityTotal\` wherever you meant "how many entities".`,
     } : {}),
     ...(unresolved.length ? {
       unresolved,
       unresolvedNote: 'These addresses matched no live entity — an empty rect list for them means NOT FOUND, not "off screen". Runtime ids are reassigned on every scene reload; prefer guids.',
     } : {}),
     layerCounts,
-    offScreen,
-    offScreenCount: offScreen.length,
-    zeroSize,
-    zeroSizeCount: zeroSize.length,
+    ...offScreen,
+    offScreenCount,
+    ...zeroSize,
+    zeroSizeCount,
     overlapsCount,
     ...(wantEntities ? { entities: shown } : {}),
-    ...(entitiesTruncated ? { truncated: true, totalCount: entries.length } : {}),
+    ...(entitiesTruncated ? { truncated: true } : {}),
     ...(params.overlaps ? { overlaps } : {}),
     ...(hint ? { hint } : {}),
   };

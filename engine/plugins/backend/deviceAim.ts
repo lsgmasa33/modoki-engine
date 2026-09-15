@@ -1,4 +1,6 @@
 import type { AimGesture } from '../../app/debug/domPointContract';
+import { encodeDeviceRefusal } from '../../tools/shared/deviceRefusal';
+import { ERROR_CODES, type ErrorCode } from '../../tools/shared/mcpResult';
 /**
  * The bits every TRUSTED device-input route shares, regardless of transport (#32).
  *
@@ -58,7 +60,7 @@ export interface AimProxyDeps {
  *  Any test that fakes `proxy` MUST return a string. */
 export type AimOutcome =
   | { kind: 'aim'; aim: { x: number; y: number; label: string } }
-  | { kind: 'refusal'; error: string }   // the page resolved nothing — a real refusal, report it
+  | { kind: 'refusal'; error: string }   // the page resolved nothing — a real refusal, report it (the `Error:` reply, tail included)
   | { kind: 'unsupported' };             // an app build predating `resolve-aim` — fall back quietly
 
 export function decodeAimReply(raw: unknown): AimOutcome {
@@ -74,7 +76,17 @@ export function decodeAimReply(raw: unknown): AimOutcome {
   }
   if (v && typeof v === 'object') {
     const o = v as Record<string, unknown>;
-    if (typeof o.error === 'string') return { kind: 'refusal', error: o.error };
+    // The refusal's §5 fields ride along as the reply's tail line (#1223 P3): the trusted route returns
+    // this string verbatim, so re-encoding here is what lets an entity aim's NOT_FOUND + `stale` or
+    // AMBIGUOUS + guids reach the MCP instead of stopping at this decode.
+    if (typeof o.error === 'string') {
+      return { kind: 'refusal', error: encodeDeviceRefusal({
+        error: o.error,
+        ...(typeof o.code === 'string' && (ERROR_CODES as readonly string[]).includes(o.code) ? { code: o.code as ErrorCode } : {}),
+        ...(Array.isArray(o.options) ? { options: o.options.filter((x): x is string => typeof x === 'string') } : {}),
+        ...(typeof o.stale === 'string' ? { stale: o.stale } : {}),
+      }) };
+    }
     if (typeof o.x === 'number' && typeof o.y === 'number') {
       return { kind: 'aim', aim: { x: o.x, y: o.y, label: String(o.label ?? `css(${Math.round(o.x)},${Math.round(o.y)})`) } };
     }

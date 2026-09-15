@@ -210,6 +210,7 @@ import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type Muta
 import { ERROR_CODES, type ErrorCode } from '../../tools/shared/mcpResult';
 import { refuseDeviceInputVocabulary } from '../../tools/shared/inputVocabulary';
 import { decodeSceneOpsReply } from './sceneOpsReply';
+import { parseHandleIds, shapeHandlesReply, type HandlesResponse } from '../../tools/shared/handlesReply';
 // ASSET_SCHEMA_TYPES is IMPORTED, never restated. This file used to keep its own copy, and it
 // advertised a narrower set in its 400s than `getAssetSchema` actually served — a wrong error
 // message is not cosmetic on a surface whose whole job is telling an agent what it may pass.
@@ -543,7 +544,11 @@ interface ScriptFile { rel: string; path: string; name: string }
 
 /** What the renderer's `enact-handles` op returns. Only the fields the router summarizes
  *  on are named; everything else (viewport, the occlusion counters) rides through. */
-interface HandlesResponse { handles?: Array<{ id?: string; editor?: string; kind?: string }>; [k: string]: unknown }
+/** The editor's next move when nothing exposes handles (the device names its own in `device_handles`). */
+const EDITOR_HANDLES_REMEDIES = {
+  noHandles: 'No handles: open the relevant editor + enter its sub-mode first (e.g. set_scene_view_mode ui + set_collider_edit on).',
+  nothingLive: 'NO editor is currently exposing handles: open the relevant editor + enter its sub-mode first (e.g. set_scene_view_mode ui + set_collider_edit on).',
+};
 
 /** Recursively collect source files under `rootAbs`: `rel` is the root-relative
  *  POSIX path (for folder-tree building + display), `path` is the /@fs/<abs>
@@ -1377,7 +1382,8 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     const label = query.get('label');
     if (editor) params.editor = editor;
     if (kind) params.kind = kind;
-    if (ids) params.ids = ids.split(',').map((s) => s.trim()).filter(Boolean);
+    const idList = parseHandleIds(ids ?? undefined);
+    if (idList) params.ids = idList;
     if (prefix) params.prefix = prefix;
     if (label) params.label = label;
     try {
@@ -1392,73 +1398,11 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       // BEFORE the guard and the real reason justifies one anywhere before the return.
       const refusal = opRefusal(raw);
       if (refusal) return json(raw as Record<string, unknown>, refusalStatus(refusal.code));
-      const res = raw as HandlesResponse;
-      // Summarize HERE, not at the `enact-handles` op: `inputRoutes.ts` calls that op
-      // directly (`requestRenderer('enact-handles', {ids:[id]})`) to resolve tap_handle /
-      // drag_handle coordinates, so an op-level summary would break trusted input. The
-      // router is the agent's boundary; the op is an internal service.
-      //
-      // A bare call with a Dopesheet open enumerates every key of every track (no windowing
-      // in DopesheetView) — ~374 bytes/handle, so 2,000 keys ≈ 187k tokens. Untargeted now
-      // reports per-editor/per-kind counts; the geometry needs an editor/kind/ids filter.
-      const bare = !editor && !kind && !(params.ids?.length) && !prefix && !label;
-      if (bare && res && Array.isArray(res.handles)) {
-        const byEditor: Record<string, number> = {};
-        const byKind: Record<string, number> = {};
-        for (const h of res.handles) {
-          byEditor[h.editor ?? '?'] = (byEditor[h.editor ?? '?'] ?? 0) + 1;
-          byKind[h.kind ?? '?'] = (byKind[h.kind ?? '?'] ?? 0) + 1;
-        }
-        // Keep every diagnostic counter. `occludedCount:0` only means "all clickable" when
-        // `occlusionUnchecked` is 0 too — dropping either would make the pair a lie.
-        const { handles: _handles, ...meta } = res;
-        return json({
-          ...meta,
-          byEditor,
-          byKind,
-          hint: res.handles.length
-            ? 'Counts only. Pass editor=<name>, kind=<name>, or ids=[…] for handle geometry (x/y/rect).'
-            : 'No handles: open the relevant editor + enter its sub-mode first (e.g. set_scene_view_mode ui + set_collider_edit on).',
-        });
-      }
-      // A FILTERED call that matched NOTHING used to return `{count:0, editors:[], handles:[]}`
-      // — byte-indistinguishable from "no editor is open", so a typo'd editor=/kind= read as a
-      // correct negative answer (S3.10). `editors` is derived from the already-filtered list, so
-      // it was empty too. One extra unfiltered probe (only on the zero case, so the hot path is
-      // unchanged) turns it into "your filter matched nothing, and HERE is what is live".
-      if (!bare && res && Array.isArray(res.handles) && res.handles.length === 0) {
-        const asked = [editor ? `editor=${editor}` : null, kind ? `kind=${kind}` : null,
-          params.ids?.length ? `ids=[${params.ids.join(',')}]` : null,
-          prefix ? `prefix=${prefix}` : null, label ? `label=${JSON.stringify(label)}` : null].filter(Boolean).join(', ');
-        let all: HandlesResponse | null = null;
-        try { all = await ctx.requestBrowser('enact-handles', {}) as HandlesResponse; } catch { /* keep the primary answer */ }
-        const byEditor: Record<string, number> = {};
-        const byKind: Record<string, number> = {};
-        // #1152: the id prefixes that ARE live, so an empty `prefix=dialog.saveAs.` answers "that
-        // dialog is not open" — and a typo'd one is visibly a typo — instead of an empty list that
-        // reads the same either way. First segment only: that is the panel/dialog, and a full id
-        // list is the unbounded dump the bare-call summary exists to avoid.
-        const idPrefixes = new Set<string>();
-        for (const h of all?.handles ?? []) {
-          byEditor[h.editor ?? '?'] = (byEditor[h.editor ?? '?'] ?? 0) + 1;
-          byKind[h.kind ?? '?'] = (byKind[h.kind ?? '?'] ?? 0) + 1;
-          if ((prefix || label) && h.editor === 'chrome' && typeof h.id === 'string') idPrefixes.add(`${h.id.split('.')[0]}.`);
-        }
-        const live = Object.keys(byEditor);
-        const prefixNote = idPrefixes.size
-          ? ` Chrome id prefixes live now: {${[...idPrefixes].sort().join(', ')}} — a prefix absent from this set is a panel or dialog that is not open.`
-          : '';
-        const labelNote = label ? ' A label matches the WHOLE label (whitespace-collapsed, case-insensitive), never a substring.' : '';
-        return json({
-          ...res,
-          byEditor,
-          byKind,
-          hint: live.length
-            ? `no handle matches ${asked}. Live now: editor ∈ {${live.join(', ')}}, kind ∈ {${Object.keys(byKind).join(', ')}} — check the spelling, or drop the filter for counts.${prefixNote}${labelNote}`
-            : `no handle matches ${asked}, and NO editor is currently exposing handles: open the relevant editor + enter its sub-mode first (e.g. set_scene_view_mode ui + set_collider_edit on).`,
-        });
-      }
-      return json(res);
+      // The bare-call summary and the filter-miss naming are shared with `device_handles`
+      // (`tools/shared/handlesReply.ts`, #1216 C-14) — here, not at the op, because `inputRoutes.ts`
+      // calls the op directly to aim tap_handle / drag_handle.
+      return json(await shapeHandlesReply(raw as HandlesResponse, params,
+        async () => await ctx.requestBrowser('enact-handles', {}) as HandlesResponse, EDITOR_HANDLES_REMEDIES));
     } catch (e) { return json({ error: String(e instanceof Error ? e.message : e) }, relayFailureStatus(e)); }
   }
 
@@ -2475,13 +2419,15 @@ async function describeUnresolvedAgainstLiveWorld(
 ): Promise<string | null> {
   /** Is THIS ref live? Targeted probe ⇒ uncapped + includes resource entities. */
   const isLive = async (ref: EntityRef): Promise<boolean | null> => {
+    // `guid`, not a `where EntityAttributes.guid=` string compare: the filter resolves through
+    // `findEntityByGuid`, which follows a runtime guid a save re-minted (#1223).
     const params = ref.guid
-      ? { where: `EntityAttributes.guid=${ref.guid}` }
+      ? { guid: ref.guid }
       : ref.id != null
         ? { id: ref.id }
         : { name: ref.name };
     const r = (await ctx.requestBrowser('scene-state', params, 2000)) as
-      | { entities?: Array<{ name?: string }>; entityCount?: number }
+      | { entities?: Array<{ name?: string }> }
       | null;
     if (!r || !Array.isArray(r.entities)) return null; // no editor to ask
     // `name` is a CONTAINS match in dumpSceneState, so re-check it exactly — a partial hit
@@ -2829,6 +2775,8 @@ async function describeUnresolvedAgainstLiveWorld(
             // verified on the cold one. Same shape as the `set_transform {space:'world'}` S1: a
             // capability with two backends chosen by ambient state, checked on one of them.
             ...(live.created?.length ? { created: live.created } : {}),
+            // A trait the write ADDED rather than edited (#1216 C-12, D6) — both branches, for S3.12's reason above.
+            ...(live.addedTraits?.length ? { addedTraits: live.addedTraits } : {}),
             // In the prefab-edit world modoki_save_all REFUSES — edit-save is that world's save.
             ...(live.changed > 0 ? {
               hint: prefabEditTarget
@@ -2837,6 +2785,10 @@ async function describeUnresolvedAgainstLiveWorld(
             } : {}),
             ...(live.unresolved.length ? { unresolved: live.unresolved } : {}),
             ...(live.code ? { code: live.code } : {}),
+            // The refusal's way out and its staleness travel with its code (#1223 D4) — this literal
+            // dropped both, so a stale runtime guid reached the agent as a bare NOT_FOUND.
+            ...(live.options ? { options: live.options } : {}),
+            ...(live.stale ? { stale: live.stale } : {}),
           });
         } catch (e) {
           // The live path itself failed (relay error mid-call, not "no editor") — this is NOT
@@ -2949,7 +2901,7 @@ async function describeUnresolvedAgainstLiveWorld(
       // below) before writing — otherwise every setTrait through this route would
       // reintroduce an `id` field on EVERY entity, the exact diff noise Phase 3 removed.
       const backfilledIds = assignSyntheticEntityIds(scene);
-      const { changed, errors, warnings: opWarnings, unresolved, created, code: applyCode } = applyOps(scene, ops);
+      const { changed, errors, warnings: opWarnings, unresolved, created, addedTraits, code: applyCode } = applyOps(scene, ops);
       // Surface BOTH the op-level warnings (dangling refs / orphaned parents from F5)
       // and the post-apply schema validation warnings.
       const schema = ctx.getSchema();
@@ -3016,6 +2968,7 @@ async function describeUnresolvedAgainstLiveWorld(
         // What each addEntity CREATED — {op, id, guid, name} (S3.12). The agent must not have to
         // re-find its own new entity by name (which this surface refuses when ambiguous).
         ...(created?.length ? { created } : {}),
+        ...(addedTraits?.length ? { addedTraits } : {}),
         ...(liveHint ? { hint: liveHint } : {}),
         ...(returnScene && changed > 0 ? { scene } : {}),
         ...(applyCode ? { code: applyCode } : {}),

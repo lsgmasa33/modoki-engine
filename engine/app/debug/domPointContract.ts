@@ -39,6 +39,27 @@ export const NOTHING_AT_POINT = 'nothing (clipped or off-window)';
  *  tap semantics, and `domDnd` is exactly the call site that must not. */
 export type AimGesture = 'tap' | 'drag' | 'press' | 'hover' | 'scroll';
 
+/** The DEVICE wire keys one aim endpoint reads, keyed by its selector key (#1223 P3). A tap/hover/
+ *  scroll/pointer aims with `selector`/`entity`/`allowOccluded`; a drag's two ends are the `from…`/
+ *  `to…` twins. The page (`bridge.ts`) reads them and the backend's trusted route (`deviceAim.ts`)
+ *  names them, so both take them from this one table — an older app build is told the selector key
+ *  alone and derives the rest here. */
+//  `which` prefixes a refusal the way the editor route's does (`tap: …`, `from: …`) — empty for a
+//  single-point aim, where the caller's gesture names it. Not `'entity'`: the resolver's own message
+//  already opens `entity: …`, and the device read `entity: entity: no LIVE entity` on the A23.
+export const DEVICE_AIM_KEYS: Readonly<Record<string, { entity: string; allowOccluded: string; which: string }>> = {
+  selector: { entity: 'entity', allowOccluded: 'allowOccluded', which: '' },
+  fromSelector: { entity: 'fromEntity', allowOccluded: 'fromAllowOccluded', which: 'from' },
+  toSelector: { entity: 'toEntity', allowOccluded: 'toAllowOccluded', which: 'to' },
+};
+/** An unknown selector key gets keys NO payload carries, so it reads no entity — borrowing the
+ *  single-point `entity` would aim every end of some future gesture at one top-level target. */
+export function deviceAimKeys(selKey: string): { entity: string; allowOccluded: string; which: string } {
+  return Object.prototype.hasOwnProperty.call(DEVICE_AIM_KEYS, selKey)
+    ? DEVICE_AIM_KEYS[selKey]
+    : { entity: `${selKey}:entity`, allowOccluded: `${selKey}:allowOccluded`, which: selKey };
+}
+
 /** Does the runtime's click-time tap-zone redirect apply to this gesture? One predicate, so the
  *  renderer and any future caller cannot disagree about which gestures are click-shaped.
  *
