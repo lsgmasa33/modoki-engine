@@ -254,7 +254,9 @@ export interface GroupTransport {
    *  ⚠️ **It reaches only a phone that syncs WHILE its deleted account's token is still valid.** Once the token
    *  has lapsed, a cold launch refreshes it inside the auth plugin itself (its ID-token listener, registered at
    *  bridge start, before any game code). The SDK signs out, and the game sees an ordinary sign-out with no sync
-   *  to ask from. That reading comes from `@capacitor-firebase/authentication` 8.4.0's source and is unmeasured.
+   *  to ask from. That reading came from `@capacitor-firebase/authentication` 8.4.0's source, and the measurement
+   *  (Court, iPad mini 5 on iOS 26.6.2, 2026-09-16, #1274) shows it WIDER than a lapsed token: a cold launch two
+   *  minutes after the delete was already signed out by the SDK, so a phone not running the game is never asked.
    *  A cheaper ask before every read was tried for this case and removed: the plugin's refresh would beat it,
    *  and it let `'gone'` wipe with the document still present (#679 close-out §2d review).
    *
