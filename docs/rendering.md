@@ -3880,11 +3880,31 @@ Measured on an iPad mini 5 at work-qa `5e2d1c2e1` (`tools-scratch/boot-stall/bui
   continuous hold (20 s, against a 9.3 s worst measured scene-pass compile). Past that it warns once
   and the overlay times out; the 3D view stays held until the compile settles, since drawing then is
   the crash below.
-  ⚠️ **Not covered: a game that pauses itself during boot.** The idle gate (`!isSimRunning()` with
-  no dirty frames left) returns BEFORE the borrow check, and every held frame still spends one of the
-  60 dirty frames. So a game that sets `paused` before its first paint stops reaching `held()` after
-  about 1 s, and the overlay drops ~5 s later over a canvas still held. GameShell boots `playing`, so
-  ordinary games are unaffected. Found by reading, not observed; tracked in #1252.
+- **A held frame does not spend the idle grace window (#1252).** A surface that is not playing draws
+  only for 60 frames after something changes (`idleFrameGrace.ts`). When every frame spent one, a
+  game paused before its first paint stopped running the frame after ~1 s of any hold. It then
+  stopped reaching `held()`, so the overlay dropped ~5 s later over a canvas still held. It also
+  stopped ticking a compile gate, so the gate's ceiling release was never seen and nothing drew
+  until the compile settled. Two changes close it:
+  - **Only a submitted frame spends grace.** It is spent next to `markScenePainted()`, the mark
+    only a drawn frame reaches.
+  - **The borrow check runs before the idle gate**, and before the whole ECS→three sync. Every other
+    hold has a ceiling, so a paused surface ticking through one is bounded. A borrow has none, and
+    up there a compile that never settles costs one check per frame. A borrowed frame also no
+    longer runs `syncEnvironment`, which closes #1239 C for frames. C's prewarm path does not go
+    through the frame loop and stays open.
+  No game pauses during boot (GameShell boots `playing`), so it was observed with injected holds:
+  `demos/postfx-demo`, desktop Chromium on WebGPU, a temporary patch that paused play just before
+  the readiness wait and delayed the swap's live compile by 10 s (2026-09-15).
+  - **Borrow case**, with the delay run inside `borrowRendererTarget`: pre-fix `timeout` at 6.7 s
+    (the 1 s grace plus a 5 s renewal), fixed `painted` at 10.95 s, just after the borrow ended.
+  - **Gate case**, with the delay only: pre-fix, the first submitted frame came at 11.0 s, after the
+    compile settled. Fixed, it came at 5.94 s, at the gate's ceiling release.
+  - The readiness wait still reports `timeout` in the gate case, playing or paused, fixed or not.
+    The promise ends at the ceiling, and the frame the ceiling releases then builds its pipelines
+    synchronously, the iPad finding above.
+
+  Pinned by `idleFrameGrace.test.ts` and `scene3dCompileHoldWired.test.ts`.
 
 ### Precompiling the stack's own stage quads (#323)
 
@@ -4409,8 +4429,10 @@ Serialising compiles protects compiles from each other, but a frame is not a com
   The cost: a capture's turn now counts against the queue budgets of what comes after it, so a scene
   swap landing during a capture that takes over 1 s skips the pre-swap prewarm (a warning, then a
   first-frame stall), and a cold boot can refuse a capture outright.
-- **Not guarded:** PMREM derivation (`syncEnvironment`, which runs before the frame's borrow check)
-  and any compile other than `compileSceneAsync` that binds a target. Both stay open in #1239.
+- **Not guarded:** PMREM derivation from the prewarm, which runs outside the compile lock, and any
+  compile other than `compileSceneAsync` that binds a target. Both stay open in #1239. (A frame's
+  own `syncEnvironment` is guarded since #1252: the borrow check now runs before the idle gate and
+  the whole sync.)
 
 ⚠️ **`Renderer.compileAsync` (three) fixes its render context synchronously, then builds each
 object's node graph after `await`s — `await this._nodes.getForRenderAsync(renderObject)` and an

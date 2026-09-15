@@ -35,12 +35,25 @@ function between(startNeedle: string, endNeedle: string): string {
 
 const BORROW_GUARD = 'if (isRendererTargetBorrowed(renderer)) { heldFrames.held(); return; } heldFrames.released();';
 const STAGE_GUARD = 'if (isPrecompileActive(renderer, rawNow())) return;';
+const IDLE_GATE = 'if (idleGrace.shouldIdle(isSimRunning() || isSkeletalPreviewing())) return;';
 
 describe('Scene3D consults the #1246 compile holds', () => {
   it('holds every frame while a scene-pass compile has the target bound — before EITHER submit', () => {
     expect(occurrences(BORROW_GUARD), 'exactly one borrow guard, renewing the overlay wait as it holds').toBe(1);
-    expectInOrder(code, [STAGE_GUARD, BORROW_GUARD, "gpuPassScope('postfx', () => postfxStack!.render())"]);
+    expectInOrder(code, [BORROW_GUARD, STAGE_GUARD, "gpuPassScope('postfx', () => postfxStack!.render())"]);
     expectInOrder(code, [BORROW_GUARD, "gpuPassScope('scene', () => renderer.render(scene, activeCamera))", 'markScenePainted();']);
+  });
+
+  it('a paused surface keeps asking its holds — the borrow precedes the idle gate, and only a submitted frame spends grace (#1252)', () => {
+    const frame = between('function renderFrame() {', 'idleGrace.submitted(); }');
+    // Past the idle gate a paused surface stopped reaching the borrow guard once grace ran out, so
+    // the overlay's wait stopped renewing. Before the sync too: a borrowed frame costs nothing else.
+    expectInOrder(frame, [BORROW_GUARD, IDLE_GATE, 'syncEnvironment(world, scene, renderer);']);
+    // Spent at the paint mark and nowhere else: a frame a gate or stage session holds drew nothing,
+    // and spending grace on it stopped the loop before the gate's ceiling release was ever seen.
+    expect(frame, 'grace is spent right after the paint mark that only a submitted frame reaches').toContain('markScenePainted(); idleGrace.submitted(); }');
+    expect(occurrences('idleGrace.submitted()')).toBe(1);
+    expect(occurrences(IDLE_GATE)).toBe(1);
   });
 
   it('promises the loading overlay each gate\'s hold as it kicks', () => {

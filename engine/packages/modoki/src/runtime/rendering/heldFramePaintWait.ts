@@ -15,7 +15,8 @@
  *  borrowed target is the GPU-process crash the borrow exists to prevent.
  *
  *  A hold is "continuous" while each held frame comes within `stepMs` of the previous one. A longer
- *  gap means the last renewal has already expired (an idle-gated editor, a long task), so the next
+ *  gap means the last renewal has already expired (a long task, a throttled background tab — not an
+ *  idle-gated surface, since `Scene3D` asks about the borrow before its idle gate, #1252), so the next
  *  held frame starts a new hold rather than inheriting an old one's elapsed time. */
 
 /** How long ONE continuous hold may keep renewing the loading overlay's wait.

@@ -33,6 +33,7 @@ import { gpuPassScope } from '../core/gpuTimings';
 // determinism guard, and the live-compile hold is a real-time deadline, not sim time.
 import { rawNow } from '../core/clock';
 import { createLiveCompileGate } from './liveCompileGate';
+import { createIdleFrameGrace } from './idleFrameGrace';
 import { armScenePaint, markScenePainted, abandonScenePaint, extendScenePaintWait } from './scenePaintSignal';
 import { isPrecompileActive, endAllPrecompiles, isRendererTargetBorrowed, runExclusivePrecompileWithin } from './postfx/precompileSession';
 import { createHeldFramePaintWait, HELD_FRAME_PAINT_WAIT_MAX_MS } from './heldFramePaintWait';
@@ -463,13 +464,11 @@ export default function Scene3D() {
       // raw per-frame transform writes bypass the dirty listeners, so we never
       // gate — every frame may have changed.
       //
-      // Frame COUNTDOWN, not a boolean: scene3DSync's async loaders poll
-      // "not ready — retry next frame" (mesh templates / streamed textures) with
-      // no completion callback, so render a short grace window past each dirty
-      // event to let them converge before settling to 0 submits.
+      // Frame COUNTDOWN, not a boolean, and spent only by frames that SUBMIT (#1252) — see
+      // `idleFrameGrace`.
       const DIRTY_GRACE = 60; // ~1s @60fps
-      let dirtyFrames = DIRTY_GRACE; // draw the first second (initial load + texture settle)
-      const markRenderDirty = () => { dirtyFrames = DIRTY_GRACE; };
+      const idleGrace = createIdleFrameGrace(DIRTY_GRACE);
+      const markRenderDirty = () => idleGrace.markDirty();
 
       // Post-swap live-scene compile (#238). The pre-swap prewarm models a COPY of the incoming
       // scene; this compiles the objects the sync ACTUALLY placed, before the first frame draws
@@ -522,11 +521,24 @@ export default function Scene3D() {
         // deliberately — a paused/stopped surface stops rendering but the profile it already
         // gathered is still the evidence a demotion acts on.
         tickTierCalibration();
+        // Never draw while a scene-pass compile has the render target + MRT bound (#1246, #1239 A).
+        // Unlike the stage session below this has NO ceiling of its own, deliberately: a gate's 5 s
+        // ceiling let a frame through a cold 5+ s scene compile on an iPad mini 5, it drew into the
+        // bound pass target, and the GPU process crashed. See `borrowRendererTarget`. This hold renews
+        // the loading overlay's wait as it holds (`heldFrames`), since nothing promised it. (The stage
+        // session below needs no renewal: its ceiling counts from the gate's kick, which promised it.)
+        //
+        // ⚠️ BEFORE the idle gate, not beside the other holds (#1252). Past the gate, a paused
+        // surface stopped reaching it once the grace window ran out, so `held()` stopped renewing
+        // and the overlay lifted over a canvas still held. Up here a borrowed frame also skips the
+        // whole sync, so a compile that never settles costs this check and nothing else — and
+        // `syncEnvironment` cannot derive a PMREM against the borrowed MRT from a frame (#1239 C).
+        if (isRendererTargetBorrowed(renderer)) { heldFrames.held(); return; }
+        heldFrames.released();
         // Idle gate: while paused/stopped only dirty events + the grace window
         // need a redraw; while playing — or while the Animation editor is previewing
         // skeletal animation (mixer advancing) — render unconditionally.
-        if (!isSimRunning() && !isSkeletalPreviewing() && dirtyFrames <= 0) return;
-        if (dirtyFrames > 0) dirtyFrames--;
+        if (idleGrace.shouldIdle(isSimRunning() || isSkeletalPreviewing())) return;
         const world = getCurrentWorld();
         // Profiler-plan P2, second pass. `render3d-0` used to be ONE opaque span, which is how a
         // 170ms frame on the A23 could report only 37.9ms of engine CPU with no interior to
@@ -657,14 +669,7 @@ export default function Scene3D() {
         // before the branch because a stack disposed mid-compile routes the very next frame down
         // the plain `renderer.render(scene, camera)` path, which is stubbed just the same.
         if (isPrecompileActive(renderer, rawNow())) return;
-        // …and never while a scene-pass compile has the render target + MRT bound (#1246, #1239 A).
-        // Unlike the stage session above this has NO ceiling of its own, deliberately: a gate's 5 s
-        // ceiling let a frame through a cold 5+ s scene compile on an iPad mini 5, it drew into the
-        // bound pass target, and the GPU process crashed. See `borrowRendererTarget`. This hold renews
-        // the loading overlay's wait as it holds (`heldFrames`), since nothing promised it. (The stage
-        // session above needs no renewal: its ceiling counts from the gate's kick, which promised it.)
-        if (isRendererTargetBorrowed(renderer)) { heldFrames.held(); return; }
-        heldFrames.released();
+        // (The scene-pass borrow is checked at the top of the frame, ahead of the idle gate — #1252.)
         const hasStages = planStages(liveReq).length > 0;
         // Tearing down an EXISTING stack matters as much as not building one: a live demotion
         // happens on a device that is already struggling, and a retained stack would keep its
@@ -766,6 +771,8 @@ export default function Scene3D() {
         // rather than another frame count. `GameShell` awaits it before hiding the loading overlay,
         // so the HUD can no longer appear over an unpainted canvas. See `scenePaintSignal.ts`.
         markScenePainted();
+        // …and the same property is what spends the idle grace window: a held frame drew nothing (#1252).
+        idleGrace.submitted();
       }
       // Prewarm the already-current scene before the first render. The runtime
       // game mounts Scene3D BEFORE the scene loads, so the registerBeforeSwap hook

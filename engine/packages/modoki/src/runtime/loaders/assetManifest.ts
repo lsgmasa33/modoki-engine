@@ -511,7 +511,7 @@ export function unregisterAsset(guid: string): void {
   if (pathToGuid.get(entry.path) === guid) pathToGuid.delete(entry.path);
   // Mark the render loop dirty (QA-ASSET-0005, third occurrence). The 3D idle render gate
   // (Scene3D.tsx "Idle render gate (T1)") skips syncSceneRenderables3D entirely once
-  // `dirtyFrames` decays to 0, and a manifest prune is invisible to every source it listens
+  // its grace window (`idleFrameGrace`) runs out, and a manifest prune is invisible to every source it listens
   // to — not an ECS trait write, not a structure change, not a play-state edge. So a bound,
   // UNCHANGED material ref going stale (an asset deleted out from under it) stopped
   // re-running `resolveMaterial` → `resolveRefWarnOnce` at all once the surface went idle: the
