@@ -20,6 +20,7 @@ import { join, relative } from 'node:path';
 
 import { fileURLToPath } from 'node:url';
 import { stripComments } from '../helpers/sourceScanner';
+import { parseSource, ts } from '../helpers/sourceAst';
 import { assertExemptionLedger } from '../helpers/exemptionLedger';
 import { makeScratchDir } from '../helpers/scratchDir';
 
@@ -55,17 +56,31 @@ const ALLOWED_LITERALS: readonly string[] = [
   'network', 'not-configured', 'credential-in-use', 'failed',
 ];
 
-/** Every quoted/templated string literal in `code` (comments already stripped), excluding
- *  `import`/`export … from '<spec>'` module specifiers — a module path is not copy. */
-function stringLiteralsIn(code: string): string[] {
-  const withoutModuleSpecs = code.replace(/(\bfrom\s+)(['"`])(?:\\.|(?!\2).)*\2/g, '$1');
+/** Every quoted/templated string literal in `code` (comments already stripped), excluding module
+ *  specifiers — a module path is not copy. A template with substitutions counts once, as its whole text.
+ *
+ *  Read from the parse (#1193). This was a regex that blanked `from '<spec>'` and then tokenised quotes by
+ *  hand, so a specifier in `import '…'`, `import('…')` or `import x = require('…')` read as copy, and a
+ *  quote inside a template's `${…}` split it. Same 20 literals over the module on 2026-09-15. */
+function stringLiteralsIn(code: string, label = 'account.ts'): string[] {
+  const sf = parseSource(code, label);
   const literals: string[] = [];
-  const re = /'((?:\\.|[^'\\])*)'|"((?:\\.|[^"\\])*)"|`((?:\\.|[^`\\])*)`/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(withoutModuleSpecs)) !== null) {
-    const text = m[1] ?? m[2] ?? m[3] ?? '';
-    if (text.length > 0) literals.push(text);
-  }
+  const isModuleSpecifier = (n: ts.Node): boolean => {
+    const p = n.parent;
+    return ((ts.isImportDeclaration(p) || ts.isExportDeclaration(p)) && p.moduleSpecifier === n)
+      || ts.isExternalModuleReference(p)
+      || (ts.isCallExpression(p) && p.expression.kind === ts.SyntaxKind.ImportKeyword)
+      || (ts.isLiteralTypeNode(p) && ts.isImportTypeNode(p.parent));
+  };
+  const visit = (n: ts.Node): void => {
+    if (ts.isTemplateExpression(n)) { literals.push(n.getText(sf).slice(1, -1)); return; }
+    if ((ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) && !isModuleSpecifier(n)) {
+      const text = n.getText(sf).slice(1, -1);
+      if (text.length > 0) literals.push(text);
+    }
+    ts.forEachChild(n, visit);
+  };
+  visit(sf);
   return literals;
 }
 
@@ -79,7 +94,7 @@ describe('the engine account module carries no player-visible copy (#675)', () =
   it('every string literal in the module is a type-union member, never copy — and every member is still used', () => {
     assertExemptionLedger({
       label: 'ALLOWED_LITERALS in accountNoCopy',
-      population: files.flatMap((file) => stringLiteralsIn(stripComments(readFileSync(join(ACCOUNT_DIR, file), 'utf8')))
+      population: files.flatMap((file) => stringLiteralsIn(stripComments(readFileSync(join(ACCOUNT_DIR, file), 'utf8')), file)
         .map((literal) => ({ item: literal, site: `${file}: ${JSON.stringify(literal)}` }))),
       sanctioned: ALLOWED_LITERALS,
       floor: 1,
@@ -103,7 +118,16 @@ describe('the sweep does not stop at a subdirectory boundary (regression for the
 
       const code = stripComments(readFileSync(nestedFile, 'utf8'));
       // The nested file's only literal is copy — not a union member — so the scan must report it.
-      expect(stringLiteralsIn(code)).toEqual(['Sign in with Apple']);
+      expect(stringLiteralsIn(code, 'messages.ts')).toEqual(['Sign in with Apple']);
+      // …and a module specifier in any spelling is not copy (#1193), while a string beside it still is.
+      expect(stringLiteralsIn([
+        "import './copy/sideEffect';",
+        "import x = require('./copy/required');",
+        "export * from './copy/reexported';",
+        "type T = import('./copy/typed').T;",
+        "const lazy = () => import('./copy/dynamic');",
+        "const label = `Hello ${'there'}`;",
+      ].join('\n'), 'fixture.ts')).toEqual(["Hello ${'there'}"]);
       expect(ALLOWED_LITERALS).not.toContain('Sign in with Apple');
     } finally {
       rmSync(fixtureDir, { recursive: true, force: true });

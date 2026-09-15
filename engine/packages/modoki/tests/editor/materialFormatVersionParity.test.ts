@@ -15,6 +15,7 @@ import * as path from 'node:path';
 import { defaultAssetData } from '../../src/runtime/assets/assetSchemas';
 import { MATERIAL_FORMAT_VERSION } from '../../src/runtime/traits/Renderable3D';
 import { readScannedSource } from '../helpers/sourceScanner';
+import { importBindings, parseSource } from '../helpers/sourceAst';
 
 const src = (rel: string) => readScannedSource(path.join(__dirname, '../../src', rel)).code;
 
@@ -26,13 +27,13 @@ describe('material format-version parity (#784 phase C2b)', () => {
 
   it('defaultMaterial() sources its stamp from MATERIAL_FORMAT_VERSION, not a literal', () => {
     const s = src('runtime/assets/assetSchemas.ts');
-    expect(s).toMatch(/import\s*\{[^}]*MATERIAL_FORMAT_VERSION[^}]*\}\s*from\s*'\.\.\/traits\/Renderable3D'/);
+    expect(importBindings(parseSource(s, 'assetSchemas.ts'), '../traits/Renderable3D').filter((b) => !b.typeOnly).map((b) => b.imported)).toContain('MATERIAL_FORMAT_VERSION');
     expect(s).toMatch(/function defaultMaterial\(\)[\s\S]*?version:\s*MATERIAL_FORMAT_VERSION/);
   });
 
   it('GLB import\'s extractMaterialAsset sources its stamp from MATERIAL_FORMAT_VERSION, not a literal', () => {
     const s = src('editor/scene/modelImport.ts');
-    expect(s).toMatch(/import\s*\{[^}]*MATERIAL_FORMAT_VERSION[^}]*\}\s*from\s*'\.\.\/\.\.\/runtime\/traits'/);
+    expect(importBindings(parseSource(s, 'modelImport.ts'), '../../runtime/traits').filter((b) => !b.typeOnly).map((b) => b.imported)).toContain('MATERIAL_FORMAT_VERSION');
     expect(s).toMatch(/function extractMaterialAsset[\s\S]*?version:\s*MATERIAL_FORMAT_VERSION/);
     // The old unconditional literal must be gone from this writer.
     expect(s).not.toMatch(/version:\s*1,/);

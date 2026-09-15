@@ -6,6 +6,7 @@ import esbuild from 'esbuild';
 import fs from 'node:fs';
 import path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
+import { findNodes, importsIn, lineOf, parseSource, ts } from '@modoki/engine/testing/sourceAst';
 import { electronOpts, electronMainOutfile, repoRoot } from '../../scripts/electronBuildOpts.mjs';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
@@ -52,10 +53,11 @@ import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 const BUNDLE_ROOT_FLOOR = 100;
 
 /**
- * A bare import/require of the engine package (or any `@modoki/*` sibling), in real code.
- *
- * The `import` arm takes an OPTIONAL paren so `await import('@modoki/…')` is caught, and backticks
- * are accepted so `require(\`@modoki/x\`)` with no substitution is too.
+ * Every bare import/require of the engine package (or any `@modoki/*` sibling) in one source file, with
+ * its line — read from the parse (#1193): static, re-exported, dynamic, type-position, and a CommonJS
+ * `require('…')` call. An `import(…)` / `require(…)` whose argument is a TEMPLATE with substitutions
+ * counts by its head (`` import(`@modoki/engine/${n}`) `` reads as `@modoki/engine/…`), as the regex
+ * before it did.
  *
  * ⚠️ **This is why the source case exists alongside the built-artifact case.** Measured: a dynamic
  * `import('@modoki/…')` added to an UNUSED export is tree-shaken out, so the built bundle is clean
@@ -63,11 +65,33 @@ const BUNDLE_ROOT_FLOOR = 100;
  * split, not a redundancy: an unreachable import today is a reachable one after the next edit, and
  * the edit that makes it reachable does not touch the import line.
  *
- * ⚠️ `import type { X } from '@modoki/…'` MATCHES and is banned deliberately, even though esbuild
- * erases it and it could never reach the bundle. A type-only import is one edit away from being a
- * value import, and that edit does not look dangerous. Reach for the relative path from the start.
+ * ⚠️ `import type { X } from '@modoki/…'` is banned deliberately, even though esbuild erases it and it
+ * could never reach the bundle. A type-only import is one edit away from being a value import, and that
+ * edit does not look dangerous. Reach for the relative path from the start. The same holds for
+ * `import('@modoki/…').T`, which the regex this replaced could not tell from a call and now reads on
+ * purpose.
+ *
+ * The regex it replaced took `from` / `require(` / `import` with an optional paren / `export * from`,
+ * each followed by a quote (`\s*` crossed newlines, so a wrap was fine). What it could not see: a comment
+ * between the keyword and the quote — which the stripper happened to blank — and a string that only
+ * LOOKS like an import read as one.
  */
-const BARE_MODOKI = /(?:\bfrom|\brequire\s*\(|\bimport\s*\(?|\bexport\s+\*\s+from)\s*['"`](@modoki\/[^'"`]+)['"`]/g;
+function bareModokiSpecifiers(abs: string, code: string): Array<{ spec: string; line: number }> {
+  const sf = parseSource(code, abs);
+  const edges = importsIn(sf, { typePositions: true }).map((e) => ({ spec: e.spec, line: lineOf(e.node) }));
+  // `require('…')`, and either call with a substituted template — which `importsIn` skips, since it
+  // names no single module.
+  const calls = findNodes(sf, (n): n is ts.CallExpression => ts.isCallExpression(n)
+    && ((ts.isIdentifier(n.expression) && n.expression.text === 'require') || n.expression.kind === ts.SyntaxKind.ImportKeyword));
+  const other = calls.flatMap((c) => {
+    const arg = c.arguments[0];
+    const isRequire = c.expression.kind !== ts.SyntaxKind.ImportKeyword;
+    if (arg && isRequire && ts.isStringLiteralLike(arg)) return [{ spec: arg.text, line: lineOf(c) }];
+    if (arg && ts.isTemplateExpression(arg)) return [{ spec: `${arg.head.text}…`, line: lineOf(c) }];
+    return [];
+  });
+  return [...edges, ...other].filter(({ spec }) => spec.startsWith('@modoki/'));
+}
 
 /**
  * A bare `@modoki` specifier that SURVIVED into a built bundle — the thing that actually breaks.
@@ -159,9 +183,9 @@ describe('electron main bundle — no externalised TypeScript (#1035)', () => {
       // 2026-09-10, scanning raw text yields the same result. Over the BUILT output it is
       // load-bearing (see the shipped case below). Either way it is the mandated entry point.
       const { code } = readScannedSource(abs);
-      for (const m of code.matchAll(BARE_MODOKI)) {
-        const line = code.slice(0, m.index).split('\n').length;
-        offenders.push(`${path.relative(repoRoot, abs)}:${line} — ${m[1]}`);
+      if (path.extname(abs).toLowerCase() === '.json') continue; // data: names no module
+      for (const { spec, line } of bareModokiSpecifiers(abs, code)) {
+        offenders.push(`${path.relative(repoRoot, abs)}:${line} — ${spec}`);
       }
     }
 
@@ -169,6 +193,37 @@ describe('electron main bundle — no externalised TypeScript (#1035)', () => {
 Use a RELATIVE path into engine/packages/modoki/src/… — the local convention across
 engine/plugins/** and engine/electron/** — so esbuild inlines it.
 Offenders:\n  ${offenders.join('\n  ')}`).toEqual([]);
+  });
+
+  it('the source reader finds every spelling of a bare @modoki specifier, and nothing that only looks like one (#1193)', () => {
+    // The real corpus holds NO offender, so without this nothing proves the reader can fire.
+    const code = [
+      "import { a } from '@modoki/engine/a';",
+      "import '@modoki/engine/side-effect';",
+      "import b = require('@modoki/engine/import-equals');",
+      "setup(); export { c } from '@modoki/engine/mid-line';",
+      "import type { D } from '@modoki/engine/type-only';",
+      "type E = import('@modoki/engine/type-position').E;",
+      "const f = await import('@modoki/engine/dynamic');",
+      'const g = require(`@modoki/engine/required`);',
+      "const h = require('./relative');",
+      "const s = \"import { x } from '@modoki/engine/in-a-string'\";",
+      "const t = obj.require('@modoki/engine/not-require');",
+      'const u = await import(`@modoki/engine/${name}`);',
+      'const v = require(`@modoki/${pkg}/x`);',
+    ].join('\n');
+    expect(bareModokiSpecifiers('fixture.ts', code).map(({ spec, line }) => `${line} ${spec}`).sort()).toEqual([
+      '1 @modoki/engine/a',
+      '12 @modoki/engine/…',
+      '13 @modoki/…',
+      '2 @modoki/engine/side-effect',
+      '3 @modoki/engine/import-equals',
+      '4 @modoki/engine/mid-line',
+      '5 @modoki/engine/type-only',
+      '6 @modoki/engine/type-position',
+      '7 @modoki/engine/dynamic',
+      '8 @modoki/engine/required',
+    ]);
   });
 
   it.skipIf(!fs.existsSync(electronMainOutfile))(

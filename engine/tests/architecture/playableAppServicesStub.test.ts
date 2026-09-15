@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
+import { importBindings, importsIn, parseSource, readsOf, ts } from '@modoki/engine/testing/sourceAst';
 import { hasInternalGames } from '../helpers/repoLayout';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
@@ -76,6 +77,43 @@ function scannableFiles(): string[] {
  * because {@link requiredNamespaceMembers} has to know what a namespace is called INSIDE the file
  * it's scanning, not what the stub calls it.
  */
+const APP_SERVICES = /^@[^/]+\/app-services$/;
+
+/** The members a game reads off `import('@x/app-services')`, from the call's own `.then` callback (#1193):
+ *  `.then((m) => m.register())` and `.then(({ analytics }) => …)`. The regex this replaced looked for
+ *  `m.<name>` within 120 characters of the `import(`, so a callback parameter not called `m`, a member
+ *  read past the window and a destructured parameter were each invisible — `games/3d-test`'s
+ *  `({ analytics })` was. Any other shape THROWS — a non-`.then` use, a destructure with a rest or a
+ *  nested pattern, and a callback parameter read as anything but a CALL of its member, `m.<name>(…)`:
+ *  `use(m)`, `const { x } = m`, `const a = m.analytics`, `m.analytics.logEvent()`, `m.analytics!.x()` —
+ *  each hands on a member whose OWN members the namespace scan below could not see. A use this cannot
+ *  read must not pass as no use. Reads are resolved by symbol (`readsOf`), so a same-named property, key
+ *  or shadowing inner binding is not one. NOT read: a static
+ *  `export { x } from '@x/app-services'` in game runtime, which binds nothing here (see `importBindings`). */
+function dynamicMembers(importCall: ts.Node, rel: string): Array<{ imported: string; local?: string }> {
+  const then = importCall.parent;
+  const call = then?.parent;
+  const cb = call && ts.isCallExpression(call) && ts.isPropertyAccessExpression(then) && then.name.text === 'then'
+    ? call.arguments[0] : undefined;
+  const param = cb && (ts.isArrowFunction(cb) || ts.isFunctionExpression(cb)) ? cb.parameters[0]?.name : undefined;
+  if (param && ts.isIdentifier(param)) {
+    const uses = readsOf(param);
+    const calledMember = (u: ts.Identifier): boolean => ts.isPropertyAccessExpression(u.parent) && u.parent.expression === u
+      && ts.isCallExpression(u.parent.parent) && u.parent.parent.expression === u.parent;
+    const unread = uses.filter((u) => !calledMember(u));
+    if (unread.length === 0) return uses.map((u) => ({ imported: (u.parent as ts.PropertyAccessExpression).name.text }));
+  }
+  if (param && ts.isObjectBindingPattern(param)
+    && param.elements.every((el) => !el.dotDotDotToken && ts.isIdentifier(el.name) && (!el.propertyName || ts.isIdentifier(el.propertyName)))) {
+    return param.elements.map((el) => ({
+      imported: ((el.propertyName ?? el.name) as ts.Identifier).text,
+      local: (el.name as ts.Identifier).text,
+    }));
+  }
+  throw new Error(`${rel}: an import() of app-services used in a shape this guard cannot read — teach it `
+    + '(it reads `.then((m) => m.x)` and `.then(({ x }) => …)`) rather than letting the use pass unread');
+}
+
 function requiredNames(files: readonly string[]): { required: Map<string, string[]>; aliases: Map<string, Map<string, string>> } {
   const out = new Map<string, string[]>();
   const aliases = new Map<string, Map<string, string>>(); // file -> localName -> originalName
@@ -86,20 +124,34 @@ function requiredNames(files: readonly string[]): { required: Map<string, string
   };
 
   for (const rel of files) {
-    const src = readScannedSource(path.join(repoRoot, rel)).code;
-    for (const m of src.matchAll(/import\s*\{([^}]*)\}\s*from\s*'@[^/']+\/app-services'/g)) {
-      for (const raw of m[1].split(',')) {
-        const trimmed = raw.trim().replace(/^type\s+/, '');
-        if (!trimmed) continue;
-        const [originalName, localName] = trimmed.split(/\s+as\s+/).map((s) => s.trim());
-        add(originalName, rel);
-        let fileAliases = aliases.get(rel);
-        if (!fileAliases) { fileAliases = new Map(); aliases.set(rel, fileAliases); }
-        fileAliases.set(localName ?? originalName, originalName);
+    const sf = parseSource(readScannedSource(path.join(repoRoot, rel)).code, rel);
+    // Static imports from the parse (#1193). ERASED ones are skipped: `import type { AuthResult }`
+    // names nothing the stub must export at runtime, and the regex this replaced never saw them either
+    // (`import\s*\{` does not match `import type {`) — but it also missed a wrapped or double-quoted
+    // import and a default/namespace one, which would need the whole module.
+    for (const b of importBindings(sf, APP_SERVICES)) {
+      if (b.typeOnly) continue;
+      if (b.imported === '*' || b.imported === 'default') {
+        throw new Error(`${rel}: a namespace/default import of app-services (\`${b.local}\`) — this guard reads named `
+          + 'imports and `import(…).then(…)` only; teach it this shape rather than letting it pass unread');
       }
+      add(b.imported, rel);
+      let fileAliases = aliases.get(rel);
+      if (!fileAliases) { fileAliases = new Map(); aliases.set(rel, fileAliases); }
+      fileAliases.set(b.local, b.imported);
     }
-    for (const m of src.matchAll(/import\(\s*'@[^/']+\/app-services'\s*\)[\s\S]{0,120}?\bm\.([A-Za-z_$][\w$]*)/g)) {
-      add(m[1], rel);
+    for (const e of importsIn(sf)) {
+      if (e.kind !== 'dynamic' || !APP_SERVICES.test(e.spec)) continue;
+      for (const { imported, local } of dynamicMembers(e.node, rel)) {
+        add(imported, rel);
+        // A destructured member is used by its LOCAL name, like a static named import — so the
+        // namespace-member scan below must resolve it (`({ analytics }) => analytics.logEvent(…)`).
+        if (local !== undefined) {
+          let fileAliases = aliases.get(rel);
+          if (!fileAliases) { fileAliases = new Map(); aliases.set(rel, fileAliases); }
+          fileAliases.set(local, imported);
+        }
+      }
     }
   }
   return { required: out, aliases };
@@ -168,6 +220,36 @@ function requiredNamespaceMembers(
   return out;
 }
 
+describe('dynamicMembers — what an import() of app-services is read as (#1193)', () => {
+  const read = (code: string) => {
+    const sf = parseSource(code, 'fixture.ts');
+    return importsIn(sf).filter((e) => e.kind === 'dynamic').flatMap((e) => dynamicMembers(e.node, 'fixture.ts'))
+      .map(({ imported, local }) => (local && local !== imported ? `${imported} as ${local}` : imported));
+  };
+
+  it('reads a member off the callback parameter, whatever it is called, and a destructure with aliases', () => {
+    expect(read("import('@g/app-services').then(async (svc) => { await svc.register(); svc.track('x'); });")).toEqual(['register', 'track']);
+    expect(read("import('@g/app-services').then(({ analytics, auth: a }) => analytics.logEvent(a));")).toEqual(['analytics', 'auth as a']);
+  });
+
+  it('does not mistake a same-named property, key or shadowing binding for a read of the parameter', () => {
+    expect(read("import('@g/app-services').then((m) => { cfg.m = { m: 1 }; [1].forEach((m) => use(m)); m.register(); });"))
+      .toEqual(['register']);
+  });
+
+  it.each([
+    ['the parameter handed on whole', "import('@g/app-services').then((m) => use(m));"],
+    ['the parameter destructured in the body', "import('@g/app-services').then((m) => { const { analytics } = m; analytics.logEvent('x'); });"],
+    ['a rest destructure', "import('@g/app-services').then(({ ...rest }) => rest.x());"],
+    ['no .then at all', "const m = await import('@g/app-services'); m.register();"],
+    ['a chained member, which the namespace scan cannot see', "import('@g/app-services').then((m) => m.analytics.logEvent('x'));"],
+    ['a chained member behind a non-null assertion', "import('@g/app-services').then((m) => m.analytics!.logEvent('x'));"],
+    ['a member held in a variable', "import('@g/app-services').then((m) => { const a = m.analytics; a.logEvent('x'); });"],
+  ])('THROWS on %s — a use it cannot read must not pass as no use', (_label, code) => {
+    expect(() => read(code)).toThrow(/cannot read/);
+  });
+});
+
 /** ⚠️ Gated on `hasInternalGames()`, and the gate is load-bearing rather than defensive.
  *  This guard DERIVES its required set by scanning `games/**` — which is exactly why it is
  *  a good guard here and why it cannot run in the public snapshot, where `games/` is not
@@ -184,6 +266,16 @@ describe.skipIf(!hasInternalGames())('the playable app-services stub keeps up wi
     // `register` is always imported — `game.ts` cannot wire `registerAppServices` without it.
     expect(required.size, 'the import scan matched nothing — the queries have gone stale').toBeGreaterThan(0);
     expect([...required.keys()]).toContain('register');
+    // …and each READER separately (#1193): `register` arrives only through `game.ts`'s dynamic
+    // `import()`, so it proves nothing about the static-import reader — which a mutation emptied with
+    // this test still green. `track` is a static named import in Court's systems.ts.
+    expect(required.get('track'), 'the static-import scan found no `track` — the reader has gone stale, '
+      + 'or Court stopped importing it (then pin another static name)').toContain('games/court/runtime/systems.ts');
+    // …and the DESTRUCTURED `.then(({ analytics }) => …)` branch, the one that found the stub missing
+    // `analytics` (#1193) — a review emptied it with both tests green.
+    expect(required.get('analytics'), 'the destructured-callback scan found no `analytics` in 3d-test — the '
+      + 'reader has gone stale, or 3d-test stopped reading it (then pin another destructured use)')
+      .toContain('games/3d-test/runtime/config.ts');
 
     const exported = stubExports();
     const missing = [...required.entries()].filter(([name]) => !exported.has(name));
@@ -206,6 +298,9 @@ describe.skipIf(!hasInternalGames())('the playable app-services stub keeps up wi
     // `crashlytics.crash`, …) — a scan that found none has gone stale, not a codebase that stopped
     // using them.
     expect(requiredMembers.size, 'the namespace-member scan matched nothing — the queries have gone stale').toBeGreaterThan(0);
+    // A destructured dynamic member is scanned by its LOCAL alias (#1193).
+    expect(requiredMembers.get('analytics')?.get('logEvent'), 'analytics.logEvent in 3d-test was not scanned — the '
+      + 'destructured alias did not reach the member scan').toContain('games/3d-test/runtime/config.ts');
 
     const missing: string[] = [];
     for (const [namespace, byMember] of requiredMembers) {

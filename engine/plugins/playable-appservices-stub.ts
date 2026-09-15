@@ -47,6 +47,18 @@ export const crashlytics = {
   setEnabled(_enabled: boolean): void {},
 };
 
+/** Firebase Analytics — a no-op namespace, mirroring `export * as analytics from './analytics'` in
+ *  3d-test's package, whose `sceneSetup` reads it as `import('@3d-test/app-services').then(({ analytics })
+ *  => analytics.logEvent(…))`. A dynamic import is not checked by Rollup, so without this a playable build
+ *  would reject that promise at runtime rather than fail the build. The guard could not see the use until it
+ *  read the destructured callback from the parse (#1193). Same reason as `track` for doing nothing. */
+export const analytics = {
+  async logEvent(_name: string, _params?: Record<string, string | number>): Promise<void> {},
+  async setUserProperty(_key: string, _value: string): Promise<void> {},
+  async setCurrentScreen(_screenName: string): Promise<void> {},
+  async setEnabled(_enabled: boolean): Promise<void> {},
+};
+
 /**
  * Local notifications — a no-op namespace, mirroring `export * as notifications from './notifications'`
  * in Weaveling's package (#940). A creative has no OS notification centre to reach, so it answers the

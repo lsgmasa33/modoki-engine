@@ -21,6 +21,7 @@ import { expectInOrder, found } from '@modoki/engine/testing/inOrder';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readScannedSource } from '@modoki/engine/testing';
+import { importBindings, parseSource } from '@modoki/engine/testing/sourceAst';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const script = path.join(repoRoot, 'engine', 'scripts', 'bootstrap-game-deps.mjs');
@@ -28,7 +29,7 @@ const src = readScannedSource(script).code;
 
 describe('bootstrap-game-deps.mjs vendors before installing (#650)', () => {
   it('loads vendorPlugins.ts through the shared loadVendorPlugins.mjs seam (plain .mjs cannot import TypeScript)', () => {
-    expect(src).toMatch(/import\s*\{\s*loadVendorPlugins\s*\}\s*from\s*'\.\/loadVendorPlugins\.mjs'/);
+    expect(importBindings(parseSource(src, 'bootstrap-game-deps.mjs'), './loadVendorPlugins.mjs').filter((b) => !b.typeOnly).map((b) => b.imported)).toContain('loadVendorPlugins');
   });
 
   it('calls vendorEnginePlugins and npmRun([\'install\'...) — the two calls this ordering is about', () => {

@@ -50,6 +50,7 @@ import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { importBindings, parseSource } from '@modoki/engine/testing/sourceAst';
 import { hasInternalGames } from '../helpers/repoLayout';
 
 /** Every game/demo module a band solver could plausibly regrow in — `runtime/` plus each game's own
@@ -76,12 +77,14 @@ const DECLARES_SOLVE = /(?:export\s+)?(?:function|const)\s+solveBands\b/;
 /**
  * The engine's solver, imported under any alias — wordweave imports it as `solveVerticalBands`.
  *
- * ⚠️ Matched as an IMPORT STATEMENT, not just "the word near an engine import". The first version
- * was `/\bsolveBands\b[^;]*from\s+'@modoki\/engine/`, and `[^;]*` spans newlines — so a DOC COMMENT
- * mentioning `solveBands` sitting above any unrelated `@modoki/engine` import satisfied it, and a
- * hand-rolled solver in such a file would have passed (found in review).
+ * ⚠️ Read from the IMPORT DECLARATION, not "the word near an engine import". The first version was
+ * `/\bsolveBands\b[^;]*from\s+'@modoki\/engine/`, and `[^;]*` spans newlines — so a DOC COMMENT
+ * mentioning `solveBands` above any unrelated `@modoki/engine` import satisfied it (found in review).
+ * Its successor `import\s*\{[^}]*\bsolveBands\b…` read the RAW file this guard reads, so a
+ * commented-out import still counted; the parse (#1193) sees neither.
  */
-const IMPORTS_ENGINE_SOLVE = /import\s*\{[^}]*\bsolveBands\b[^}]*\}\s*from\s*['"]@modoki\/engine/;
+const importsEngineSolve = (src: string, rel: string): boolean =>
+  importBindings(parseSource(src, rel), /^@modoki\/engine(\/|$)/).filter((b) => !b.typeOnly).map((b) => b.imported).includes('solveBands');
 const DECLARES_TRAIT_SCHEMA = /(?:export\s+)?const\s+SCREEN_BAND_DEFAULTS\s*=\s*\{/;
 
 describe.skipIf(!hasInternalGames())('the band model is not re-implemented per game (#800)', () => {
@@ -103,7 +106,7 @@ describe.skipIf(!hasInternalGames())('the band model is not re-implemented per g
     for (const { abs, rel } of gameRuntimeFiles()) {
       const src = readFileSync(abs, 'utf8');
       if (!DECLARES_SOLVE.test(src)) continue;
-      if (!IMPORTS_ENGINE_SOLVE.test(src)) offenders.push(rel);
+      if (!importsEngineSolve(src, rel)) offenders.push(rel);
     }
     expect(offenders, 'these declare their own solveBands without importing the engine\'s — the '
       + 'band arithmetic has regrown. Import `solveBands` from `@modoki/engine/runtime` and keep '

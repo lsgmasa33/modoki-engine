@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { findDeleteBoundaries, describeBoundary } from '../../scripts/deleteBoundary.mjs';
 import { makeDirLink } from '../helpers/linkFixture';
 import { readScannedSource, stripComments } from '@modoki/engine/testing';
-import { callsToPath, calleeName, lineOf, parseSource, precedingStatements, ts, unwrapValue } from '@modoki/engine/testing/sourceAst';
+import { callsToPath, calleeName, importBindings, lineOf, parseSource, precedingStatements, ts, unwrapValue } from '@modoki/engine/testing/sourceAst';
 import { refuseUnsafeReplace } from '../../toolchain/replaceGuard';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
@@ -401,8 +401,8 @@ describe('every persistent-destination REPLACE in engine/toolchain consults the 
     // warn-and-delete would still sever the link, which is the whole defect.
     for (const { file } of SITES) {
       const { code } = readScannedSource(path.resolve(__dirname, '../../toolchain', file));
-      expect(code, `${file} must import the shared guard, not re-declare it`)
-        .toMatch(/import \{ refuseUnsafeReplace \} from '\.\/replaceGuard'/);
+      expect(importBindings(parseSource(code, file), './replaceGuard').filter((b) => !b.typeOnly).map((b) => b.imported),
+        `${file} must import the shared guard, not re-declare it`).toContain('refuseUnsafeReplace');
       expect(code).not.toMatch(/function refuseUnsafeReplace/);
     }
     const { code: guard } = readScannedSource(path.resolve(__dirname, '../../toolchain/replaceGuard.ts'));

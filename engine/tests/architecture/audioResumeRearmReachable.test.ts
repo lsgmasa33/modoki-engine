@@ -18,6 +18,7 @@ import { describe, it, expect } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { stripComments, readScannedSource } from '@modoki/engine/testing';
+import { importBindings, parseSource } from '@modoki/engine/testing/sourceAst';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 /** Comments blanked at the READ (#812) — the callers used to each remember to strip, which
@@ -33,8 +34,9 @@ describe('useAudioResumeRearm is reached from production code (#489)', () => {
     // Match any path ENDING in the module name, not a pinned './useAudioResumeRearm' — moving the
     // hook into engine/app/hooks/ (which already exists, for useKeyboardShift) changes nothing
     // about reachability and must not turn this guard red.
-    expect(app, 'App.tsx must import useAudioResumeRearm')
-      .toMatch(/import\s*\{[^}]*\buseAudioResumeRearm\b[^}]*\}\s*from\s*'[^']*useAudioResumeRearm'/);
+    // A value import from the parse (#1193) — wrapped, aliased or double-quoted all hold.
+    expect(importBindings(parseSource(app, 'App.tsx'), /(^|\/)useAudioResumeRearm(\.tsx?)?$/).filter((b) => !b.typeOnly).map((b) => b.imported), 'App.tsx must import useAudioResumeRearm')
+      .toContain('useAudioResumeRearm');
   });
 
   it('App.tsx actually CALLS useAudioResumeRearm(), not just imports it', () => {

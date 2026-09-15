@@ -76,6 +76,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
+import { accessPath, callsTo, enclosingFunction, importsIn, parseSource, readsOf, ts } from '@modoki/engine/testing/sourceAst';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const REPO = path.resolve(__dirname, '../../..');
@@ -297,16 +298,49 @@ function capturesHandler(expr: string): boolean | null {
   return null;
 }
 
-/** Module specifiers the file reaches for — STATIC and DYNAMIC, `import type` statements dropped. */
-function importedSpecifiers(code: string): string[] {
-  // A type-only import does not exercise the module, so it must not count as reaching a producer.
-  // ⚠️ LINE-anchored, not `[^;]*;`. The semicolon form ran to the next `;` ANYWHERE in the file, so
-  // a semicolon-less `import type { A } from './types'` (the repo writes those) swallowed the real
-  // value imports on the lines below it — silently un-attributing every producer in the file.
-  const valueCode = code.replace(/^[^\S\n]*import\s+type\b[^\n]*$/gm, ' ');
+/** Module specifiers the file reaches for — static, re-exported and dynamic, plus the ORIGINAL a mock
+ *  loads (`vi.mock('…', (importOriginal) => … importOriginal() …)`, `vi.importActual('…')`); erased
+ *  imports dropped.
+ *
+ *  ⚠️ **Read from the parse (#1193).** This was `from '…'` and `import('…')` regexes over the code with
+ *  every `import type` LINE blanked first. A side-effect `import '../src/…/registerProviders'` has no
+ *  `from`, so a test that loads a producer only for its side effects was never attributed to it (24 such
+ *  edges across the test corpus, measured 2026-09-15); and `importOriginal<typeof import('../x')>()`,
+ *  `Set<import('../x').T>` and fixture strings each read as reaching a producer (145 edges). A type
+ *  position runs nothing. What DOES run a producer without importing it is a partial mock's original —
+ *  the text form credited that by accident, through `importOriginal<typeof import('../producer')>()`'s
+ *  type argument. It is read from what LOADS instead (review of #1193): the `vi.mock`/`vi.doMock` target
+ *  whose factory CALLS its first parameter — resolved by symbol, in the factory's own body (a call inside a
+ *  nested function may never run) — whatever it is called and whatever type argument it is given, and
+ *  `vi.importActual`'s own string argument.
+ *
+ *  Not credited, and stated so: `vi.mock('x')` automocking and `{ spy: true }`, a loader handed on
+ *  (`helper(importOriginal)`) or cast before the call, `vi.importActual(variable)`, and a factory held in a
+ *  variable. None occurs in the repo; each only under-credits, which can fail open for SWALLOWED. A mock
+ *  target written as `vi.mock(import('x'), …)` is credited by `importsIn` as a dynamic edge whatever its
+ *  factory does. */
+function importedSpecifiers(testRel: string, code: string): string[] {
+  const sf = parseSource(code, testRel);
+  return [...importsIn(sf).filter((e) => !e.typeOnly).map((e) => e.spec), ...originalsLoaded(sf)];
+}
+
+function originalsLoaded(sf: ts.SourceFile): string[] {
   const out: string[] = [];
-  for (const m of valueCode.matchAll(/\bfrom\s*['"]([^'"]+)['"]/g)) out.push(m[1]);
-  for (const m of valueCode.matchAll(/\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g)) out.push(m[1]);
+  const onVi = (call: ts.CallExpression): boolean =>
+    ts.isPropertyAccessExpression(call.expression) && accessPath(call.expression.expression) === 'vi';
+  for (const call of callsTo(sf, 'importActual').filter(onVi)) {
+    const arg = call.arguments[0];
+    if (arg && ts.isStringLiteralLike(arg)) out.push(arg.text);
+  }
+  for (const call of callsTo(sf, 'mock', 'doMock').filter(onVi)) {
+    const [target, factory] = call.arguments;
+    if (!target || !ts.isStringLiteralLike(target) || !factory || !(ts.isArrowFunction(factory) || ts.isFunctionExpression(factory))) continue;
+    const loader = factory.parameters[0]?.name;
+    if (!loader || !ts.isIdentifier(loader)) continue;
+    const loads = readsOf(loader).some((r) => ts.isCallExpression(r.parent) && r.parent.expression === r
+      && enclosingFunction(r.parent) === factory);
+    if (loads) out.push(target.text);
+  }
   return out;
 }
 
@@ -314,7 +348,7 @@ function importedSpecifiers(code: string): string[] {
 function importedModules(testRel: string, code: string): Set<string> {
   const dir = path.posix.dirname(testRel);
   const out = new Set<string>();
-  for (const spec of importedSpecifiers(code)) {
+  for (const spec of importedSpecifiers(testRel, code)) {
     if (!spec.startsWith('.')) continue; // package specifiers never address a producer file
     out.add(moduleKey(path.posix.normalize(path.posix.join(dir, spec))));
   }
@@ -375,6 +409,28 @@ for (const t of TESTS) {
     SWALLOWED.get(p)!.push(t.rel);
   }
 }
+
+
+describe('importedSpecifiers — what counts as reaching a producer (#1193)', () => {
+  it('value imports of every spelling, and the original a partial mock loads; not erased imports, type positions or a factory-only mock', () => {
+    expect(importedSpecifiers('t.test.ts', [
+      "import '../side-effect';",
+      "import { a } from '../value';",
+      "import type { T } from '../erased';",
+      "const lazy = () => import('../dynamic');",
+      "let s: Set<import('../type-position').T>;",
+      "vi.mock('../mocked', async (importOriginal) => ({ ...(await importOriginal<typeof import('../mocked')>()) }));",
+      "vi.mock('../renamed', async (orig) => ({ ...(await orig<object>()) }));",
+      "vi.mock('../factoryOnly', () => ({ x: 1 }));",
+      "vi.mock('../loaderUnused', (importOriginal) => ({ x: 1 }));",
+      "vi.mock('../loaderShadowed', (orig) => ({ f: [1].map((orig) => orig()) }));",
+      "vi.mock('../loaderLazy', (orig) => ({ lazy: () => orig() }));",
+      "vi.doMock('../doMocked', async (orig) => ({ ...(await orig()) }));",
+      "server.mock('../notVi', (a) => a());",
+      "const actual = await vi.importActual<typeof import('../typeArgIgnored')>('../actual');",
+    ].join('\n')).sort()).toEqual(['../actual', '../doMocked', '../dynamic', '../mocked', '../renamed', '../side-effect', '../value']);
+  });
+});
 
 /**
  * The parser's own regression cover — the same reason `sourceScanner.test.ts` exists for the

@@ -606,16 +606,19 @@ export function precedingStatements(n: ts.Node): ts.Statement[] {
 export interface ModuleEdge {
   /** The specifier as written: `'./a'`, `'three/webgpu'`. */
   spec: string;
-  /** `import … from` / `import 'x'` / `import x = require('x')` · `export … from` · `import('x')`. */
-  kind: 'import' | 'reexport' | 'dynamic';
-  /** Erased from the emitted JavaScript: `import type`, `export type … from`, `import type x = require()`.
-   *  NOT an import whose every specifier is `type`-marked — under `verbatimModuleSyntax` (this repo) that
-   *  still emits `import {} from 'x'`, which runs the module. */
+  /** `import … from` / `import 'x'` / `import x = require('x')` · `export … from` · `import('x')` ·
+   *  `import('x').T` / `typeof import('x')` (only with `typePositions`, see `importsIn`). */
+  kind: 'import' | 'reexport' | 'dynamic' | 'importType';
+  /** Erased from the emitted JavaScript: `import type`, `export type … from`, `import type x = require()`,
+   *  and every `importType` edge. NOT an import whose every specifier is `type`-marked — under
+   *  `verbatimModuleSyntax` (this repo) that still emits `import {} from 'x'`, which runs the module. */
   typeOnly: boolean;
   /** What it binds, by the name the MODULE exports (`imported`) and the name this file uses (`local`):
    *  `{ a as b }` → `a`/`b`; a default import → `default`; `* as ns` → `*`; `import x = require()` → `*`.
-   *  Empty for a side-effect import, `export * from`, and `import()` (whose result is the whole module). */
-  bindings: Array<{ imported: string; local: string }>;
+   *  Empty for a side-effect import, `export * from`, `import()` (whose result is the whole module) and an
+   *  `importType`. A binding's own `typeOnly` is true when it is erased: the statement's `type`, or its own
+   *  `{ type a }` marker. */
+  bindings: Array<{ imported: string; local: string; typeOnly: boolean }>;
   node: ts.Node;
 }
 
@@ -626,40 +629,79 @@ export interface ModuleEdge {
  * It replaces a statement joiner that took an `import` at COLUMN 0 and appended lines until one matched
  * `from '…'`, then regexed that text. It never saw an `export … from '…'` edge (a barrel's whole reason
  * to exist), an `import` that does not start its line, or `import()` of a template literal; and it read
- * dynamic imports out of RAW text, comments and strings included. `typeof import('x')` is a type node,
- * not a call, and is not an edge; an `import()` whose specifier is not a literal names no module and is
- * skipped.
+ * dynamic imports out of RAW text, comments and strings included. An `import()` whose specifier is not a
+ * literal names no module and is skipped.
+ *
+ * `import('x').T` and `typeof import('x')` are TYPE nodes, not calls: no module runs, so they are not
+ * edges by default. Pass `typePositions: true` when the question is "does this file NAME a module the
+ * compiler must resolve" rather than "what does it run" — a relative type-position import that escapes a
+ * game folder fails a standalone typecheck exactly like a value import does (#1193). They come back as
+ * `kind: 'importType'`, `typeOnly: true`.
  */
-export function importsIn(sf: ts.SourceFile): ModuleEdge[] {
+export function importsIn(sf: ts.SourceFile, opts: { typePositions?: boolean } = {}): ModuleEdge[] {
   const out: ModuleEdge[] = [];
   const visit = (n: ts.Node): void => {
     if (ts.isImportDeclaration(n) && ts.isStringLiteralLike(n.moduleSpecifier)) {
       const clause = n.importClause;
+      const whole = !!clause?.isTypeOnly;
       const bindings: ModuleEdge['bindings'] = [];
-      if (clause?.name) bindings.push({ imported: 'default', local: clause.name.text });
+      if (clause?.name) bindings.push({ imported: 'default', local: clause.name.text, typeOnly: whole });
       const named = clause?.namedBindings;
-      if (named && ts.isNamespaceImport(named)) bindings.push({ imported: '*', local: named.name.text });
+      if (named && ts.isNamespaceImport(named)) bindings.push({ imported: '*', local: named.name.text, typeOnly: whole });
       if (named && ts.isNamedImports(named)) {
-        for (const e of named.elements) bindings.push({ imported: (e.propertyName ?? e.name).text, local: e.name.text });
+        for (const e of named.elements) {
+          bindings.push({ imported: (e.propertyName ?? e.name).text, local: e.name.text, typeOnly: whole || e.isTypeOnly });
+        }
       }
-      out.push({ spec: n.moduleSpecifier.text, kind: 'import', typeOnly: !!clause?.isTypeOnly, bindings, node: n });
+      out.push({ spec: n.moduleSpecifier.text, kind: 'import', typeOnly: whole, bindings, node: n });
     } else if (ts.isImportEqualsDeclaration(n) && ts.isExternalModuleReference(n.moduleReference)
       && ts.isStringLiteralLike(n.moduleReference.expression)) {
-      out.push({ spec: n.moduleReference.expression.text, kind: 'import', typeOnly: n.isTypeOnly, bindings: [{ imported: '*', local: n.name.text }], node: n });
+      out.push({
+        spec: n.moduleReference.expression.text, kind: 'import', typeOnly: n.isTypeOnly,
+        bindings: [{ imported: '*', local: n.name.text, typeOnly: n.isTypeOnly }], node: n,
+      });
     } else if (ts.isExportDeclaration(n) && n.moduleSpecifier && ts.isStringLiteralLike(n.moduleSpecifier)) {
       const clause = n.exportClause;
       const bindings: ModuleEdge['bindings'] = [];
-      if (clause && ts.isNamespaceExport(clause)) bindings.push({ imported: '*', local: clause.name.text });
+      if (clause && ts.isNamespaceExport(clause)) bindings.push({ imported: '*', local: clause.name.text, typeOnly: n.isTypeOnly });
       if (clause && ts.isNamedExports(clause)) {
-        for (const e of clause.elements) bindings.push({ imported: (e.propertyName ?? e.name).text, local: e.name.text });
+        for (const e of clause.elements) {
+          bindings.push({ imported: (e.propertyName ?? e.name).text, local: e.name.text, typeOnly: n.isTypeOnly || e.isTypeOnly });
+        }
       }
       out.push({ spec: n.moduleSpecifier.text, kind: 'reexport', typeOnly: n.isTypeOnly, bindings, node: n });
     } else if (ts.isCallExpression(n) && n.expression.kind === ts.SyntaxKind.ImportKeyword) {
       const spec = n.arguments[0] && ts.isStringLiteralLike(n.arguments[0]) ? n.arguments[0].text : undefined;
       if (spec !== undefined) out.push({ spec, kind: 'dynamic', typeOnly: false, bindings: [], node: n });
+    } else if (opts.typePositions && ts.isImportTypeNode(n) && ts.isLiteralTypeNode(n.argument)
+      && ts.isStringLiteralLike(n.argument.literal)) {
+      out.push({ spec: n.argument.literal.text, kind: 'importType', typeOnly: true, bindings: [], node: n });
     }
     ts.forEachChild(n, visit);
   };
   visit(sf);
   return out;
+}
+
+/**
+ * The names `sf` IMPORTS from every module whose specifier is `spec` (exact) or matches it (a RegExp),
+ * one row per binding, however the declaration is written: wrapped over lines, aliased (`{ a as b }`), a
+ * default or namespace import, `import x = require()`. `imported` is the module's export name, `local`
+ * the name this file uses, `typeOnly` whether the binding is erased.
+ *
+ * The one reader for a guard that pins "F imports N from M", or its negation (#1193). About twenty guards
+ * each wrote `import\s*\{[^}]*N[^}]*\}\s*from\s*'…M'` instead, and each decided for itself which spellings
+ * exist: a multi-line import, `N as M`, a default import and double quotes each broke a different subset.
+ *
+ * A RE-EXPORT is deliberately not an import: `export { N } from 'M'` binds no local name, so a file
+ * holding only that does not use `N`. A guard whose rule also covers re-exports reads `importsIn`.
+ * A side-effect import binds nothing and yields no rows; ask `importsIn` whether the edge exists.
+ */
+export function importBindings(sf: ts.SourceFile, spec: string | RegExp): Array<ModuleEdge['bindings'][number] & { edge: ModuleEdge }> {
+  // `lastIndex` reset: a `/g` or `/y` RegExp's `test` resumes where the previous call stopped, so a
+  // second edge from the same module would read as a miss.
+  const matches = (s: string) => (typeof spec === 'string' ? s === spec : ((spec.lastIndex = 0), spec.test(s)));
+  return importsIn(sf)
+    .filter((e) => e.kind === 'import' && matches(e.spec))
+    .flatMap((edge) => edge.bindings.map((b) => ({ ...b, edge })));
 }

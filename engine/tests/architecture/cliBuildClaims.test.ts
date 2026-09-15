@@ -21,7 +21,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { readScannedSource } from '@modoki/engine/testing';
-import { boundIdentifier, callsTo, declarationOf, enclosingFunction, findNodes, parseSource, readsOf } from '@modoki/engine/testing/sourceAst';
+import { boundIdentifier, callsTo, declarationOf, enclosingFunction, findNodes, importBindings, parseSource, readsOf } from '@modoki/engine/testing/sourceAst';
 import { acquireBuildClaim, readBuildClaim, resetBuildClaimsForTests } from '../../scripts/buildClaimsStore.mjs';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
@@ -193,7 +193,7 @@ describe('build-web.mjs takes the cross-process build claim (#650)', () => {
   const src = readScannedSource(buildWeb).code;
 
   it('imports acquireBuildClaim from buildClaimsStore.mjs', () => {
-    expect(src).toMatch(/import\s*\{[^}]*acquireBuildClaim[^}]*\}\s*from\s*'\.\/buildClaimsStore\.mjs'/);
+    expect(importBindings(parseSource(src, path.basename(buildWeb)), './buildClaimsStore.mjs').filter((b) => !b.typeOnly).map((b) => b.imported)).toContain('acquireBuildClaim');
   });
 
   const calls = claimCalls(src, 'build-web.mjs');
@@ -224,7 +224,7 @@ describe('add-native-targets.mjs takes the cross-process build claim (#650)', ()
   const src = readScannedSource(addNativeTargets).code;
 
   it('imports acquireBuildClaim from buildClaimsStore.mjs', () => {
-    expect(src).toMatch(/import\s*\{[^}]*acquireBuildClaim[^}]*\}\s*from\s*'\.\/buildClaimsStore\.mjs'/);
+    expect(importBindings(parseSource(src, path.basename(addNativeTargets)), './buildClaimsStore.mjs').filter((b) => !b.typeOnly).map((b) => b.imported)).toContain('acquireBuildClaim');
   });
 
   const calls = claimCalls(src, 'add-native-targets.mjs');
@@ -265,7 +265,7 @@ describe('ota-publish.mjs takes the cross-process build claim (#650)', () => {
   const src = readScannedSource(otaPublish).code;
 
   it('imports acquireBuildClaim from buildClaimsStore.mjs', () => {
-    expect(src).toMatch(/import\s*\{[^}]*acquireBuildClaim[^}]*\}\s*from\s*'\.\/buildClaimsStore\.mjs'/);
+    expect(importBindings(parseSource(src, path.basename(otaPublish)), './buildClaimsStore.mjs').filter((b) => !b.typeOnly).map((b) => b.imported)).toContain('acquireBuildClaim');
   });
 
   const calls = claimCalls(src, 'ota-publish.mjs');
@@ -317,7 +317,7 @@ describe('build-subgame.mjs takes the cross-process build claim (#650, #837)', (
   const src = readScannedSource(buildSubgame).code;
 
   it('imports acquireBuildClaim from buildClaimsStore.mjs', () => {
-    expect(src).toMatch(/import\s*\{[^}]*acquireBuildClaim[^}]*\}\s*from\s*'\.\/buildClaimsStore\.mjs'/);
+    expect(importBindings(parseSource(src, path.basename(buildSubgame)), './buildClaimsStore.mjs').filter((b) => !b.typeOnly).map((b) => b.imported)).toContain('acquireBuildClaim');
   });
 
   const calls = claimCalls(src, 'build-subgame.mjs');

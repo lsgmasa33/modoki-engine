@@ -14,6 +14,7 @@ import { registerBuiltinCreatableAssets } from '../../src/editor/panels/builtinC
 import { getCreatableAssets } from '../../src/editor/panels/creatableAssets';
 import { defaultAtlasSource } from '../../src/runtime/loaders/spriteAtlas';
 import { readScannedSource } from '../helpers/sourceScanner';
+import { importBindings, parseSource } from '../helpers/sourceAst';
 
 const src = (rel: string) => readScannedSource(path.join(__dirname, '../../src', rel)).code;
 
@@ -29,13 +30,11 @@ describe('atlas default-document parity (#423)', () => {
 
   it('builtinCreatableAssets.ts sources its atlas body from defaultAtlasSource, not its own literal', () => {
     const s = src('editor/panels/builtinCreatableAssets.ts');
-    // Tolerates OTHER named specifiers in the same import (the `[^}]*` either side of the name),
-    // matching the reimport-atlas assertion below. The strict `\{\s*defaultAtlasSource\s*\}` form
-    // this replaced asserted the import had EXACTLY one specifier, which is not what this guard is
-    // about: co-importing ATLAS_FORMAT_VERSION from the same module (#784) turned it red for a
-    // change that did not touch what it guards. A guard must not make merging an unrelated import
-    // the thing that breaks it — docs/format-versioning.md § 4, the anchor trap.
-    expect(s).toMatch(/import\s*\{[^}]*defaultAtlasSource[^}]*\}\s*from\s*'\.\.\/\.\.\/runtime\/loaders\/spriteAtlas'/);
+    // Read from the parse (#1193), so OTHER specifiers in the same import, a wrap over lines and an
+    // alias all hold — co-importing ATLAS_FORMAT_VERSION from the same module (#784) once turned a
+    // strict `\{\s*defaultAtlasSource\s*\}` regex red for a change that did not touch what it guards
+    // (docs/format-versioning.md § 4, the anchor trap).
+    expect(importBindings(parseSource(s, 'builtinCreatableAssets.ts'), '../../runtime/loaders/spriteAtlas').filter((b) => !b.typeOnly).map((b) => b.imported)).toContain('defaultAtlasSource');
     // The atlas `body:` line must call the factory, not repeat pageSize/padding/extrude literals.
     // Edit `defaultAtlasSource()` in spriteAtlas.ts, not this file, to change the default values.
     expect(s).toMatch(/body:\s*\(guid\)\s*=>\s*\(\{\s*id:\s*guid,\s*\.\.\.defaultAtlasSource\(\)\s*\}\)/);
@@ -53,13 +52,8 @@ describe('atlas default-document parity (#423)', () => {
 
   it('atlasPersist.ts sources DEFAULT_ATLAS_DOC + its coalescing fallbacks from defaultAtlasSource', () => {
     const s = src('editor/panels/assetViews/atlasPersist.ts');
-    // Tolerates OTHER named specifiers in the same import (the `[^}]*` either side of the name),
-    // matching the reimport-atlas assertion below. The strict `\{\s*defaultAtlasSource\s*\}` form
-    // this replaced asserted the import had EXACTLY one specifier, which is not what this guard is
-    // about: co-importing ATLAS_FORMAT_VERSION from the same module (#784) turned it red for a
-    // change that did not touch what it guards. A guard must not make merging an unrelated import
-    // the thing that breaks it — docs/format-versioning.md § 4, the anchor trap.
-    expect(s).toMatch(/import\s*\{[^}]*defaultAtlasSource[^}]*\}\s*from\s*'\.\.\/\.\.\/\.\.\/runtime\/loaders\/spriteAtlas'/);
+    // Read from the parse (#1193) — see the builtinCreatableAssets case above.
+    expect(importBindings(parseSource(s, 'atlasPersist.ts'), '../../../runtime/loaders/spriteAtlas').filter((b) => !b.typeOnly).map((b) => b.imported)).toContain('defaultAtlasSource');
     expect(s).toMatch(/const DEFAULT_ATLAS_DOC: AtlasSourceDoc = defaultAtlasSource\(\)/);
     // Edit `defaultAtlasSource()` in spriteAtlas.ts, not this file, to change the per-field
     // fetch-handler fallbacks (pageSize/padding/extrude) — they must read DEFAULT_ATLAS_DOC, not
@@ -77,7 +71,7 @@ describe('atlas default-document parity (#423)', () => {
 
   it('reimport-atlas.ts\'s readAtlasSource sources its fallback values from defaultAtlasSource', () => {
     const s = readScannedSource(path.join(__dirname, '../../../../plugins/reimport-atlas.ts')).code;
-    expect(s).toMatch(/import\s*\{[^}]*defaultAtlasSource[^}]*\}\s*from\s*'\.\.\/packages\/modoki\/src\/runtime\/loaders\/spriteAtlas'/);
+    expect(importBindings(parseSource(s, 'reimport-atlas.ts'), '../packages/modoki/src/runtime/loaders/spriteAtlas').filter((b) => !b.typeOnly).map((b) => b.imported)).toContain('defaultAtlasSource');
     expect(s).toMatch(/const defaults = defaultAtlasSource\(\)/);
     // The range guards (`> 0`, `>= 0`) and the `raw.texture` preservation are readAtlasSource's
     // own logic and must stay — only the fallback VALUE moves to the factory.

@@ -34,6 +34,7 @@ import { z } from '../../tools/modoki-mcp/node_modules/zod';
 // hoists (or lacks). Used only by the definition-surface ledger (#456) to walk NESTED schemas.
 import { zodToJsonSchema } from '../../tools/modoki-mcp/node_modules/zod-to-json-schema';
 import { readScannedSource } from '@modoki/engine/testing';
+import { importsIn, parseSource } from '@modoki/engine/testing/sourceAst';
 import {
   registerTool,
   getTool,
@@ -931,8 +932,10 @@ describe('zod resolution (issue #23)', () => {
     const src = readScannedSource(
       path.join(path.dirname(fileURLToPath(import.meta.url)), 'mcpRegistry.test.ts'),
     ).code;
-    expect(src, 'import zod from tools/modoki-mcp/node_modules, not a bare specifier')
-      .not.toMatch(/^import\s+\{[^}]*\}\s+from\s+'zod';$/m);
+    // Every edge from the parse (#1193): `^import\s+\{[^}]*\}\s+from\s+'zod';$` missed a wrapped
+    // import, double quotes, no semicolon, a default/namespace import and `export … from 'zod'`.
+    const bare = importsIn(parseSource(src, 'mcpRegistry.test.ts')).filter((e) => e.spec === 'zod' || e.spec.startsWith('zod/'));
+    expect(bare.map((e) => e.spec), 'import zod from tools/modoki-mcp/node_modules, not a bare specifier').toEqual([]);
 
     const mcpZod = JSON.parse(
       fs.readFileSync(path.resolve(SRC, '../node_modules/zod/package.json'), 'utf8'),

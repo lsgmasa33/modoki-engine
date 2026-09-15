@@ -17,6 +17,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { readScannedSource } from '@modoki/engine/testing';
+import { importsIn, parseSource } from '@modoki/engine/testing/sourceAst';
 import { makeDirLink } from '../helpers/linkFixture';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
@@ -109,9 +110,9 @@ describe('isEntryPoint (#910)', () => {
  *  ⚠️ **This adds a clearer MESSAGE, not new reach** (close-out review). `clonePortCli.test.ts`
  *  already copies and RUNS the file, so a real added import was always going to go red — that is
  *  how #881 found it. Do not cite this test as the thing standing between the repo and a broken
- *  CLI; the executable one is. It also only matches a static `import … from`, so an
- *  `export … from` or a dynamic `await import()` slips past it — the running copy would still
- *  catch those. */
+ *  CLI; the executable one is. It reads every module edge from the parse (#1193) — an
+ *  `export … from` or a literal `await import()` included; a `createRequire` call or an `import()`
+ *  of a computed name is not an edge, and the running copy is still what catches those. */
 describe('clonePort.mjs stays import-free (#910)', () => {
   it('imports nothing but node: builtins', () => {
     // Through the SHARED reader, not fs.readFileSync (#812): this file's own docblock quotes an
@@ -119,7 +120,9 @@ describe('clonePort.mjs stays import-free (#910)', () => {
     // would match that comment and redden on prose. `commentStripperIsShared.test.ts` catches
     // exactly this shape — it caught this test.
     const { code } = readScannedSource(path.join(repoRoot, 'engine/scripts/clonePort.mjs'));
-    const specifiers = [...code.matchAll(/^\s*import\s[^'"]*['"]([^'"]+)['"]/gm)].map((m) => m[1]);
+    // Every module edge, from the parse (#1193) — `export … from` and `await import()` too, which the
+    // `^\s*import` regex before it could not see.
+    const specifiers = importsIn(parseSource(code, 'clonePort.mjs')).map((e) => e.spec);
     expect(specifiers.length).toBeGreaterThan(0); // non-vacuous: it does import something
     expect(specifiers.filter((s) => !s.startsWith('node:'))).toEqual([]);
   });

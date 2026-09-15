@@ -3,7 +3,8 @@ import { found } from '@modoki/engine/testing/inOrder';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { readScannedSource } from '@modoki/engine/testing';
+import { callsTo, importsIn, parseSource } from '@modoki/engine/testing/sourceAst';
 
 /**
  * The global error capture (#275) must be installed by a SIDE-EFFECT IMPORT placed above
@@ -41,17 +42,18 @@ import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
 const appDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../app');
 const MAIN = path.join(appDir, 'main.tsx');
 
-/** Import specifiers in source order, comments stripped via the shared scanner
- *  (@modoki/engine/testing, #419). */
-function importSpecifiers(src: string, label: string): string[] {
-  const code = stripComments(src);
-  assertScanIsSane(src, code, label);
-  return [...code.matchAll(/^\s*import\s+(?:[^'"]*?from\s*)?['"]([^'"]+)['"]/gm)].map((m) => m[1]);
+/** The modules a file loads at module init, in source order — imports and re-exports that are not
+ *  erased — read from the parse (#1193). Imports are hoisted and evaluated in exactly this order.
+ *  The regex this replaced took `^\s*import … '…'` only, so an `export … from` ahead of `./App.tsx` (which
+ *  evaluates just as early) was invisible, and an erased `import type` counted as a position. */
+function loadOrder(abs: string, label: string): string[] {
+  return importsIn(parseSource(readScannedSource(abs).code, label))
+    .filter((e) => (e.kind === 'import' || e.kind === 'reexport') && !e.typeOnly)
+    .map((e) => e.spec);
 }
 
 describe('global error capture install order (#275)', () => {
-  const src = fs.readFileSync(MAIN, 'utf8');
-  const specs = importSpecifiers(src, 'app/main.tsx');
+  const specs = loadOrder(MAIN, 'app/main.tsx');
 
   it('imports ./installErrorCapture before ./App.tsx', () => {
     const capture = found(specs.findIndex((s) => s.includes('installErrorCapture')), "main.tsx's import of ./installErrorCapture");
@@ -65,14 +67,11 @@ describe('global error capture install order (#275)', () => {
   });
 
   it('does NOT install by calling the function from main.tsx\'s body', () => {
-    const stripped = stripComments(src);
-    assertScanIsSane(src, stripped, 'app/main.tsx');
-    const body = stripped
-      .split('\n')
-      .filter((l) => !/^\s*import\s/.test(l))
-      .join('\n');
+    // Any CALL, from the parse (#1193) — the text form blanked every line starting `import` and then
+    // regexed the rest, so a call written after an import on one line was blanked with it.
+    const calls = callsTo(parseSource(readScannedSource(MAIN).code, 'app/main.tsx'), 'installGlobalErrorHandlers');
     expect(
-      /installGlobalErrorHandlers\s*\(/.test(body),
+      calls.length > 0,
       'main.tsx must not CALL installGlobalErrorHandlers() — a statement runs after every import, ' +
         'which is too late. The side-effect import ./installErrorCapture is the install.',
     ).toBe(false);
@@ -82,7 +81,9 @@ describe('global error capture install order (#275)', () => {
     const capture = fs.readFileSync(path.join(appDir, 'installErrorCapture.ts'), 'utf8');
     expect(/^\s*installGlobalErrorHandlers\s*\(\s*\)\s*;?\s*$/m.test(capture)).toBe(true);
     // Anything this module imports is itself evaluated uncovered, so the list stays at one.
-    expect(importSpecifiers(capture, 'app/installErrorCapture.ts')).toEqual(['@modoki/engine/runtime']);
+    const edges = importsIn(parseSource(readScannedSource(path.join(appDir, 'installErrorCapture.ts')).code, 'app/installErrorCapture.ts'))
+      .filter((e) => !e.typeOnly).map((e) => e.spec);
+    expect(edges).toEqual(['@modoki/engine/runtime']);
   });
 
   // The MISSING pin (found while implementing #633): main.tsx's "Kept ABOVE the device console capture" comment documents `installErrorCapture`

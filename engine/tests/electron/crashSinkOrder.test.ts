@@ -9,6 +9,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { electronOpts, electronDir } from '../../scripts/electronBuildOpts.mjs';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
+import { readScannedSource } from '@modoki/engine/testing';
+import { importsIn, parseSource } from '@modoki/engine/testing/sourceAst';
 
 /**
  * #1043 — a crash during MODULE EVALUATION must still leave a file behind.
@@ -30,15 +32,18 @@ afterAll(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
 describe('the sink is installed before anything else can throw (#1043)', () => {
   /** SOURCE case. Cheap, and it is the line a human actually edits. */
   it('`./crashSink` is the FIRST import in main.ts', () => {
-    const src = fs.readFileSync(path.join(electronDir, 'main.ts'), 'utf8');
-    const firstImport = /^import\s.*$/m.exec(src);
-    expect(firstImport, 'main.ts has no imports at all — something is very wrong').not.toBeNull();
+    // The first module main.ts LOADS, from the parse (#1193): `/^import\s.*$/m` took the first line
+    // starting `import`, so an `export … from` above it (evaluated just as early) was invisible, and an
+    // erased `import type` line above the sink read as the first import.
+    const first = importsIn(parseSource(readScannedSource(path.join(electronDir, 'main.ts')).code, 'main.ts'))
+      .find((e) => (e.kind === 'import' || e.kind === 'reexport') && !e.typeOnly);
+    expect(first, 'main.ts has no imports at all — something is very wrong').toBeDefined();
     expect(
-      firstImport?.[0],
+      first && `${first.kind} ${first.spec} [${first.bindings.map((b) => b.local).join(',')}]`,
       'main.ts must import ./crashSink FIRST (#1043). Imports are hoisted and evaluated in source '
         + 'order, so any import above it evaluates with no crash handler installed — which is the '
         + 'window where a throw produces no stdout and no main.log at all.',
-    ).toBe("import './crashSink';");
+    ).toBe('import ./crashSink []');
   });
 
   /**

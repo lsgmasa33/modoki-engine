@@ -30,6 +30,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { hasPublishScripts } from '../helpers/repoLayout';
 import { readScannedSource } from '@modoki/engine/testing';
+import { importBindings, parseSource } from '@modoki/engine/testing/sourceAst';
 import {
   releaseBranchFor,
   parseReleaseVersion,
@@ -364,7 +365,8 @@ describe('releaseBranch.mjs is invoked as a CLI through a non-canonical path', (
     // the broken idiom in order to explain it, so a raw read makes this assertion fail on correct
     // source — the guard tripping over its own subject's prose.
     const { code } = readScannedSource(path.join(REPO, 'engine/scripts/releaseBranch.mjs'));
-    expect(code).toContain("import { isEntryPoint } from './entryPoint.mjs'");
+    expect(importBindings(parseSource(code, 'releaseBranch.mjs'), './entryPoint.mjs').filter((b) => !b.typeOnly).map((b) => b.imported))
+      .toContain('isEntryPoint');
     expect(code).toContain('isEntryPoint(import.meta.url)');
     expect(code).not.toContain('`file://${process.argv[1]}`');
   });

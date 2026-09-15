@@ -2,7 +2,10 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { stripComments, assertScanIsSane, readScannedSource } from '@modoki/engine/testing';
+import { importsIn, parseSource, type ModuleEdge } from '@modoki/engine/testing/sourceAst';
+import { resolveRelative, runtimeEdgesOf } from '@modoki/engine/testing/importClosure';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 /**
@@ -73,13 +76,19 @@ function findInstallCalls(text: string): Array<{ hasOptions: boolean }> {
   return calls;
 }
 
-/** Import specifiers in source order, comments stripped. Mirrors
- *  `deviceConsoleCaptureInstallOrder.test.ts`'s identical helper. */
-function importSpecifiers(src: string, label: string): string[] {
-  const code = stripComments(src);
-  assertScanIsSane(src, code, label);
-  return [...code.matchAll(/^\s*import\s+(?:[^'"]*?from\s*)?['"]([^'"]+)['"]/gm)].map((m) => m[1]);
+/** Every module edge `file` writes, read from its declarations (#1193). The regex this replaced took
+ *  `^\s*import … '…'` only, so an `export … from` edge, an import that did not start its line and a
+ *  dynamic `import()` were each invisible — and the dynamic legs below were `includes()` over the text,
+ *  one of them over RAW text a comment could satisfy. */
+function edgesOf(file: string): ModuleEdge[] {
+  const rel = relPosix(file);
+  return importsIn(parseSource(readScannedSource(file).code, rel));
 }
+
+/** Specifiers `file` loads STATICALLY: imports and re-exports, type-only ones included — a guard about
+ *  what must stay behind a dynamic import should not be one `type` keyword from a real edge. */
+const staticSpecifiers = (file: string) => edgesOf(file).filter((e) => e.kind === 'import' || e.kind === 'reexport').map((e) => e.spec);
+const dynamicSpecifiers = (file: string) => edgesOf(file).filter((e) => e.kind === 'dynamic').map((e) => e.spec);
 
 describe('installConsoleRing() options wiring (F8)', () => {
   const allFiles = walk();
@@ -128,16 +137,14 @@ describe('installConsoleRing() options wiring (F8)', () => {
   });
 
   it('main.tsx does not STATICALLY import ./debug/agentBridge — only a dynamic import() reaches its option-less caller', () => {
-    const mainSrc = fs.readFileSync(MAIN, 'utf8');
-    const stripped = stripComments(mainSrc);
-    assertScanIsSane(mainSrc, stripped, 'app/main.tsx');
-    const staticSpecs = importSpecifiers(mainSrc, 'app/main.tsx');
+    const staticSpecs = staticSpecifiers(MAIN);
+    expect(staticSpecs.length, 'main.tsx reads as importing nothing — the reader is broken').toBeGreaterThan(0);
     expect(
       staticSpecs.some((s) => s.includes('debug/agentBridge')),
       `main.tsx's static imports: ${JSON.stringify(staticSpecs)}`,
     ).toBe(false);
     expect(
-      stripped.includes("import('./debug/agentBridge')"),
+      dynamicSpecifiers(MAIN).includes('./debug/agentBridge'),
       'main.tsx must reach ./debug/agentBridge only through a dynamic import() — that is what keeps ' +
         "it (and the option-less installConsoleRing() call inside its installConsoleCapture) behind " +
         "installConsoleRing.ts's static side-effect import in bundling order",
@@ -147,12 +154,12 @@ describe('installConsoleRing() options wiring (F8)', () => {
   it('neither main.tsx nor App.tsx STATICALLY imports @modoki/engine/runtime/debug — only a dynamic import()/lazy() reaches its option-less caller', () => {
     for (const file of [MAIN, APP_TSX]) {
       const rel = relPosix(file);
-      const specs = importSpecifiers(fs.readFileSync(file, 'utf8'), rel);
+      const specs = staticSpecifiers(file);
+      expect(specs.length, `${rel} reads as importing nothing — the reader is broken`).toBeGreaterThan(0);
       expect(specs.some((s) => s.includes('runtime/debug')), `${rel}'s static imports: ${JSON.stringify(specs)}`).toBe(false);
     }
-    const appSrc = fs.readFileSync(APP_TSX, 'utf8');
     expect(
-      appSrc.includes("import('@modoki/engine/runtime/debug')"),
+      dynamicSpecifiers(APP_TSX).includes('@modoki/engine/runtime/debug'),
       'App.tsx must reach @modoki/engine/runtime/debug only through a dynamic import() (lazy())',
     ).toBe(true);
   });
@@ -184,69 +191,76 @@ describe('installConsoleRing() options wiring (F8)', () => {
       RUNTIME_DEBUG_CONSOLE_CAPTURE,
     ];
 
-    /** Both `import ... from '<spec>'` (including a bare `import '<spec>'`) and `export ... from
-     *  '<spec>'` (`export { a } from`, `export * from`, `export type * from`) — a re-export is a
-     *  static edge exactly like an import: the target module is evaluated the moment the barrel
-     *  is. A statement led by `import type`/`export type` is excluded — erased at compile time, it
-     *  never causes the target module to load in a real bundle, and counting it would make this
-     *  guard cry wolf on a type-only edge to a forbidden module that a bundler would never include. */
-    function staticFromSpecifiers(code: string): string[] {
-      const re = /(?:^|\n)[ \t]*(import|export)(\s+type\b)?\s+(?:[^'";]*?\bfrom\s*)?['"]([^'"]+)['"]/g;
-      const specs: string[] = [];
-      for (const m of code.matchAll(re)) {
-        if (m[2]) continue; // `import type` / `export type` — no runtime edge
-        specs.push(m[3]);
-      }
-      return specs;
-    }
+    /** Static edges only — an `import()` is evaluated lazily and cannot flip install order at module
+     *  init. `runtimeEdgesOf` already drops `import type` / `export type` (erased, so a bundler never
+     *  loads the target) and reads every spelling from the parse (#1193): the regex this replaced took a
+     *  statement only at the start of a line, so `setup(); export * from './debug';` — the exact addition
+     *  the docblock above fears — was invisible, and an import in a template string was an edge. */
+    const staticEdgesOf = (file: string) => runtimeEdgesOf(file).filter((e) => e.kind !== 'dynamic');
 
-    /** Resolve a relative specifier to a real `.ts`/`.tsx` file. Returns `null` for a non-relative
-     *  specifier (an npm package, or `@modoki/engine` self-referencing the package's own public
-     *  barrel) — this guard only follows edges INSIDE `packages/modoki/src/runtime`. */
-    function resolveRelative(fromFile: string, spec: string): string | null {
-      if (!spec.startsWith('.')) return null;
-      const base = path.resolve(path.dirname(fromFile), spec);
-      for (const candidate of [base, `${base}.ts`, `${base}.tsx`, path.join(base, 'index.ts'), path.join(base, 'index.tsx')]) {
-        if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
-      }
-      return null;
-    }
-
-    it('never statically reaches ./debug/index or ./debug/consoleCapture, however many hops away', () => {
-      const visited = new Set<string>([RUNTIME_INDEX]);
+    /** Breadth-first over static edges from `entry`; returns every file reached and, for the first
+     *  forbidden one, the chain that reached it. */
+    function staticReach(entry: string, forbidden: readonly string[]): { visited: Set<string>; trail?: string[] } {
+      const visited = new Set<string>([entry]);
       const cameFrom = new Map<string, string>();
-      const queue = [RUNTIME_INDEX];
-
+      const queue = [entry];
       while (queue.length > 0) {
         const file = queue.shift()!;
-        const rel = relPosix(file);
-        const src = fs.readFileSync(file, 'utf8');
-        const stripped = stripComments(src);
-        assertScanIsSane(src, stripped, rel);
-
-        for (const spec of staticFromSpecifiers(stripped)) {
+        for (const { spec } of staticEdgesOf(file)) {
+          if (!spec.startsWith('.')) continue; // an npm package, or `@modoki/engine` naming its own barrel
           const resolved = resolveRelative(file, spec);
           if (!resolved || visited.has(resolved)) continue;
           visited.add(resolved);
           cameFrom.set(resolved, file);
-
-          if (FORBIDDEN.includes(resolved)) {
+          if (forbidden.includes(resolved)) {
             const trail = [resolved];
             let cur = resolved;
             while (cameFrom.has(cur)) { cur = cameFrom.get(cur)!; trail.unshift(cur); }
-            throw new Error(
-              `runtime/index.ts statically reaches ${relPosix(resolved)} via: `
-              + trail.map((f) => relPosix(f)).join(' -> '),
-            );
+            return { visited, trail };
           }
           queue.push(resolved);
         }
       }
+      return { visited };
+    }
+
+    it('never statically reaches ./debug/index or ./debug/consoleCapture, however many hops away', () => {
+      const { visited, trail } = staticReach(RUNTIME_INDEX, FORBIDDEN);
+      expect(trail && `runtime/index.ts statically reaches ${relPosix(trail.at(-1)!)} via: ${trail.map(relPosix).join(' -> ')}`)
+        .toBeUndefined();
 
       // Sanity: the BFS actually walked a real graph, not a no-op over a single file — a barrel
       // this size re-exports hundreds of modules, so a suspiciously small count here would mean
       // the specifier regex or the relative resolver silently stopped following edges.
       expect(visited.size).toBeGreaterThan(50);
+    });
+
+    it('follows the spellings the old line regex missed, and not an import that is only text (#1193)', () => {
+      const dir = makeScratchDir('f11-reach-');
+      try {
+        const write = (rel: string, code: string) => {
+          fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+          fs.writeFileSync(path.join(dir, rel), code, 'utf8');
+        };
+        write('index.ts', [
+          "setup(); export * from './viaMidLine';",
+          "const doc = `\nimport './viaTemplate';`;",
+          "export const lazy = () => import('./viaDynamic');",
+          "import type { T } from './viaType';",
+        ].join('\n'));
+        for (const leaf of ['viaTemplate', 'viaDynamic', 'viaType']) write(`${leaf}.ts`, "import './debug/index';\n");
+        write('viaMidLine.ts', "import {\n  a,\n} from './debug/index';\n");
+        write('debug/index.ts', 'export const a = 1;\n');
+        const forbidden = [path.join(dir, 'debug/index.ts')];
+        const { trail } = staticReach(path.join(dir, 'index.ts'), forbidden);
+        expect(trail?.map((f) => path.relative(dir, f).split(path.sep).join('/')))
+          .toEqual(['index.ts', 'viaMidLine.ts', 'debug/index.ts']);
+        // Without the mid-line re-export, nothing else reaches it: not the template, the import(), nor the type.
+        write('index.ts', fs.readFileSync(path.join(dir, 'index.ts'), 'utf8').replace("setup(); export * from './viaMidLine';", ''));
+        expect(staticReach(path.join(dir, 'index.ts'), forbidden).trail).toBeUndefined();
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
     });
   });
 });

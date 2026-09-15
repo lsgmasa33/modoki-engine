@@ -166,8 +166,31 @@ describe('showMessageBox / showOpenDialog — parent when we can', () => {
  *  matched raw text could be satisfied — or hidden — by a mention in a docblock, and
  *  `fatalDialog.ts` legitimately discusses `dialog.showErrorBox` in prose. */
 import { readScannedSource } from '@modoki/engine/testing';
+import { callsTo, importsIn, importBindings, parseSource, ts } from '@modoki/engine/testing/sourceAst';
 import * as nodePath from 'node:path';
 import { readdirSync } from 'node:fs';
+
+/** `'electron'` and `'electron/main'` — the main-process module under both of its names (#1193 review:
+ *  `import { dialog } from 'electron/main'` passed a ban keyed on the first alone). */
+const ELECTRON_MAIN = /^electron(?:\/main)?$/;
+
+/** Names imported from the main-process electron module, erased ones included — `import { type dialog }`
+ *  is one keyword from real. */
+function electronImportedNames(code: string, file: string): string[] {
+  return importBindings(parseSource(code, file), ELECTRON_MAIN).map((b) => b.imported);
+}
+
+/** Every form that reaches the WHOLE electron module without naming a member: a namespace or default
+ *  import, `import e = require()`, `require()`, `import()` and a re-export. */
+function electronWholeModuleReaches(code: string, file: string): string[] {
+  const sf = parseSource(code, file);
+  return [
+    ...importBindings(sf, ELECTRON_MAIN).filter((b) => b.imported === '*' || b.imported === 'default').map((b) => `import ${b.local}`),
+    ...importsIn(sf).filter((e) => ELECTRON_MAIN.test(e.spec) && (e.kind === 'dynamic' || e.kind === 'reexport')).map((e) => `${e.kind} ${e.spec}`),
+    ...callsTo(sf, 'require').filter((c) => ts.isIdentifier(c.expression) && c.arguments[0] && ts.isStringLiteralLike(c.arguments[0])
+      && ELECTRON_MAIN.test(c.arguments[0].text)).map((c) => `require(${(c.arguments[0] as ts.StringLiteralLike).text})`),
+  ];
+}
 
 describe('every main-process dialog goes through mainDialog (#1044)', () => {
   const dir = nodePath.resolve(__dirname, '../../electron');
@@ -205,8 +228,9 @@ describe('every main-process dialog goes through mainDialog (#1044)', () => {
    *  change than the alias this actually caught. */
   it.each(files)('%s does not import `dialog` from electron', (file) => {
     const { code } = readScannedSource(nodePath.join(dir, file));
-    const specifiers = [...code.matchAll(/import\s*\{([^}]*)\}\s*from\s*['"]electron['"]/g)]
-      .flatMap((m) => m[1].split(',').map((x) => x.trim().split(/\s+as\s+/)[0].trim()));
+    // Every binding from the parse (#1193) — a wrapped or double-quoted import, and `import { type
+    // dialog }` (erased, but one keyword from real) all count.
+    const specifiers = electronImportedNames(code, file);
     expect(
       specifiers.filter((n) => n === 'dialog'),
       `${file}: a parentless native dialog is APP-MODAL on macOS and blocks the whole main ` +
@@ -215,18 +239,40 @@ describe('every main-process dialog goes through mainDialog (#1044)', () => {
     ).toEqual([]);
   });
 
-  /** The specifier ban has exactly one escape: `import * as electron from 'electron'`, which
-   *  never names `dialog` in the import at all. So ban that too, rather than trying to spot
+  /** The specifier ban's escapes are the forms that reach electron WITHOUT naming a member:
+   *  `import * as electron from 'electron'`, a default import, `import e = require('electron')`,
+   *  `require('electron')`, `import('electron')` and a re-export, under `'electron'` or `'electron/main'`
+   *  (#1193 — the regex this replaced saw only the first). `createRequire(…)('electron')` and a computed
+   *  specifier are not read. So ban those too, rather than trying to spot
    *  `something.showMessageBox(` in the body — a member-call regex cannot tell electron's `dialog`
    *  from `fatalDialog.ts`'s INJECTED `deps.showMessageBox`, and an earlier draft of this test duly
    *  failed on the one module that is doing the right thing. Nothing in this tree namespace-imports
    *  electron today; this keeps it that way. */
-  it.each(files)('%s does not namespace-import electron (the specifier ban\'s one escape)', (file) => {
+  it.each(files)('%s does not reach the whole electron module (the specifier ban\'s escapes)', (file) => {
     const { code } = readScannedSource(nodePath.join(dir, file));
     expect(
-      [...code.matchAll(/import\s+\*\s+as\s+(\w+)\s+from\s*['"]electron['"]/g)].map((m) => m[1]),
+      electronWholeModuleReaches(code, file),
       `${file}: a namespace import of electron reaches dialog.* without ever naming it, which is `
         + 'the one thing the specifier ban above cannot see (#1044). Import the members you need.',
     ).toEqual([]);
+  });
+  it('the two readers see every spelling, on a fixture — the real tree holds no offender to prove it (#1193)', () => {
+    expect(electronImportedNames([
+      "import {\n  app,\n  dialog as d,\n} from \"electron\";",
+      "import { type BrowserWindow } from 'electron/main';",
+      "import { dialog as x } from 'electron/renderer';",
+    ].join('\n'), 'fixture.ts')).toEqual(['app', 'dialog', 'BrowserWindow']);
+    expect(electronWholeModuleReaches([
+      "import * as ns from 'electron';",
+      "import def from 'electron/main';",
+      "import eq = require('electron');",
+      "export { app } from 'electron';",
+      "const lazy = () => import('electron/main');",
+      "const req = require('electron');",
+      "const fine = require('./electron');",
+      "const s = \"import * as nope from 'electron'\";",
+    ].join('\n'), 'fixture.ts')).toEqual([
+      'import ns', 'import def', 'import eq', 'reexport electron', 'dynamic electron/main', 'require(electron)',
+    ]);
   });
 });

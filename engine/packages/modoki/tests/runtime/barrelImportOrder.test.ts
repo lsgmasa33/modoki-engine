@@ -47,6 +47,8 @@ import { describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readScannedSource } from '../helpers/sourceScanner';
+import { importsIn, parseSource } from '../helpers/sourceAst';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const RUNTIME_ROOT = path.resolve(HERE, '../../src/runtime');
@@ -72,12 +74,18 @@ function resolveSpecifier(fromFile: string, specifier: string): string | null {
 /** Every relative specifier the barrel statically imports or re-exports, resolved to a file.
  *  `import type` / `export type` statements are INCLUDED on purpose: they are erased at
  *  compile time, but this test is about what happens when the module is loaded FIRST, and a
- *  type-only re-export still names a module a consumer may legitimately enter at. */
+ *  type-only re-export still names a module a consumer may legitimately enter at.
+ *
+ *  ⚠️ **Read from the parse (#1193).** This was `(?:import|export)[\s\S]{0,400}?from '…'` over RAW
+ *  text: a statement whose clause ran past 400 characters reached no `from` inside the window, so its
+ *  module was never an entry. Measured 2026-09-15: the barrel names 250 relative modules and the regex
+ *  found 240 — `./traits`, `./iap`, `./sync`, `./loaders/assetManifest` and six more had never been
+ *  entered first. */
 function barrelEntries(): string[] {
-  const src = fs.readFileSync(BARREL, 'utf8');
   const specs = new Set<string>();
-  for (const m of src.matchAll(/(?:import|export)[\s\S]{0,400}?from\s*['"](\.[^'"]+)['"]/g)) specs.add(m[1]);
-  for (const m of src.matchAll(/^\s*import\s+['"](\.[^'"]+)['"]/gm)) specs.add(m[1]); // side-effect import
+  for (const e of importsIn(parseSource(readScannedSource(BARREL).code, 'runtime/index.ts'))) {
+    if (e.kind !== 'dynamic' && e.spec.startsWith('.')) specs.add(e.spec);
+  }
   const files = new Set<string>();
   for (const s of specs) {
     const r = resolveSpecifier(BARREL, s);

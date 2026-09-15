@@ -5,6 +5,8 @@ import { fileURLToPath } from 'node:url';
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
 import { hasInternalGames } from '../helpers/repoLayout';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { readScannedSource } from '@modoki/engine/testing';
+import { importsIn, parseSource } from '@modoki/engine/testing/sourceAst';
 
 /**
  * PORTABILITY GUARD — a game project must be SELF-CONTAINED (#29): it's opened
@@ -84,20 +86,33 @@ const importScanRoots: string[] = [
   ...(fs.existsSync(TEMPLATE_ROOT) ? [TEMPLATE_ROOT] : []),
 ];
 
-/** The relative imports (static or dynamic) in ONE source file that resolve OUTSIDE `gameRoot`,
+/** Every module specifier ONE source file names — static, re-exported, dynamic and type-position
+ *  (`import('x').T`, `typeof import('x')`), because a game copied out of the repo fails its typecheck
+ *  on an unresolvable TYPE import exactly as it does on a value one.
+ *
+ *  ⚠️ **Read from the parse, not a regex (#1193).** The regex this replaced was
+ *  `(?:from|import\()\s*['"](\.[^'"]+)['"]`, over RAW text: a side-effect `import '../../engine/x'`
+ *  — an escape by any definition — had no `from` and passed; so did `import x = require('…')`. And it
+ *  read comments and strings as imports. Measured over the 654 scanned files on 2026-09-15: the parse
+ *  sees 3 side-effect imports the regex missed (`import './HUD.css'`), and the regex's 36 extra hits
+ *  were comments, fixture strings and type positions — the last of which this now reads on purpose. */
+function specifiersIn(file: string, code: string): string[] {
+  return importsIn(parseSource(code, file), { typePositions: true }).map((e) => e.spec);
+}
+
+/** The relative imports in ONE source file that resolve OUTSIDE `gameRoot`,
  *  as `<repo-rel file> :: <specifier>`. Split out of the walk so the matcher can be exercised on a
  *  fixture: with `KNOWN_ESCAPES` empty (#1191), no real escape is left in the repo to prove the
  *  matcher still fires, so a regex that matches nothing would otherwise pass every test here. */
-function escapesInSource(file: string, src: string, gameRoot: string): string[] {
+function escapesInSource(file: string, code: string, gameRoot: string): string[] {
   const out: string[] = [];
-  const importRe = /(?:from|import\()\s*['"](\.[^'"]+)['"]/g;
-  let m: RegExpExecArray | null;
-  while ((m = importRe.exec(src)) !== null) {
-    const resolved = path.resolve(path.dirname(file), m[1]);
+  for (const spec of specifiersIn(file, code)) {
+    if (!spec.startsWith('.')) continue;
+    const resolved = path.resolve(path.dirname(file), spec);
     if (!resolved.startsWith(gameRoot + path.sep)) {
       // Forward-slash the repo-relative file so the key matches the canonical
       // KNOWN_ESCAPES entries on Windows too (path.relative yields backslashes there).
-      out.push(`${path.relative(repoRoot, file).replace(/\\/g, '/')} :: ${m[1]}`);
+      out.push(`${path.relative(repoRoot, file).replace(/\\/g, '/')} :: ${spec}`);
     }
   }
   return out;
@@ -106,16 +121,19 @@ function escapesInSource(file: string, src: string, gameRoot: string): string[] 
 /** Every escaping import across every scanned project, plus how many files were read — the count
  *  is the scan's own non-vacuity signal (`walk()` runs with `floor: 0`). */
 function escapingImports(): { escapes: string[]; scanned: number } {
+  // Memoised: three cases read it, and each read parses every scanned file (~650).
+  if (escapingImportsMemo) return escapingImportsMemo;
   const escapes: string[] = [];
   let scanned = 0;
   for (const gameRoot of importScanRoots) {
     for (const file of walk(gameRoot)) {
       scanned++;
-      escapes.push(...escapesInSource(file, fs.readFileSync(file, 'utf8'), gameRoot));
+      escapes.push(...escapesInSource(file, readScannedSource(file).code, gameRoot));
     }
   }
-  return { escapes, scanned };
+  return (escapingImportsMemo = { escapes, scanned });
 }
+let escapingImportsMemo: { escapes: string[]; scanned: number } | undefined;
 
 /** A relative path in a project's committed native config (`Package.swift` SPM deps, Gradle
  *  `projectDir` overrides) that resolves OUTSIDE the project's own folder — i.e. it reaches the
@@ -199,11 +217,24 @@ describe.skipIf(!hasInternalGames())('game project portability (self-contained �
       "import { e } from '../config';",
       // A sibling whose name EXTENDS this root's name must still escape (containment needs the separator).
       "import { f } from '../../__fixture__-kit/y';",
+      // The spellings the regex before #1193 could not see: a side-effect import, `import = require`,
+      // a re-export that does not start its line, and a type-position import.
+      "import '../../../engine/app/sideEffect';",
+      "import g = require('../../../engine/app/required');",
+      "setup(); export * from '../../../engine/app/reexported';",
+      "type H = import('../../../engine/app/typed').H;",
+      // …and two it read as imports when they are not: a string and a template.
+      "const s = \"import('../../../engine/app/in-a-string')\";",
+      "const t = `from '../../../engine/app/in-a-template'`;",
     ].join('\n');
     expect(escapesInSource(file, src, root)).toEqual([
       'games/__fixture__/runtime/systems.ts :: ../../../engine/app/store/gameStore',
       'games/__fixture__/runtime/systems.ts :: ../../sibling/runtime/x',
       'games/__fixture__/runtime/systems.ts :: ../../__fixture__-kit/y',
+      'games/__fixture__/runtime/systems.ts :: ../../../engine/app/sideEffect',
+      'games/__fixture__/runtime/systems.ts :: ../../../engine/app/required',
+      'games/__fixture__/runtime/systems.ts :: ../../../engine/app/reexported',
+      'games/__fixture__/runtime/systems.ts :: ../../../engine/app/typed',
     ]);
   });
 
@@ -222,12 +253,14 @@ describe.skipIf(!hasInternalGames())('game project portability (self-contained �
   //
   // `tools/` is skipped: it's build-time Node code, excluded from the app tsconfig on purpose.
   it('a project using node builtins declares the node types itself (build scopes to ONE project)', () => {
-    const nodeImport = /(?:from|import\()\s*['"](?:node:[a-z_/]+|fs|path|os|url|child_process|crypto)['"]/;
+    // Read from the parse (#1193): the regex form missed a side-effect `import 'node:fs'` and
+    // `import fs = require('fs')`, and a comment or string naming `'node:path'` read as a use.
+    const NODE_BUILTIN = /^(?:node:[a-z_/]+|fs|path|os|url|child_process|crypto)$/;
     const offenders: string[] = [];
     let projectsUsingNode = 0;
     for (const proj of projects) {
       const files = walk(proj.dir).filter((f) => !f.includes(`${path.sep}tools${path.sep}`));
-      const users = files.filter((f) => nodeImport.test(fs.readFileSync(f, 'utf8')));
+      const users = files.filter((f) => specifiersIn(f, readScannedSource(f).code).some((spec) => NODE_BUILTIN.test(spec)));
       if (users.length === 0) continue;
       projectsUsingNode++;
       const declares = files.some((f) => /\/\/\/\s*<reference\s+types="node"\s*\/>/.test(fs.readFileSync(f, 'utf8')));
@@ -242,8 +275,8 @@ describe.skipIf(!hasInternalGames())('game project portability (self-contained �
       'Add `/// <reference types="node" />` to one of these files (see games/sling/tests/sling-assets.test.ts);\n' +
       `otherwise the per-game build fails on "Cannot find module 'node:fs'":\n${offenders.join('\n')}`,
     ).toEqual([]);
-    // Non-vacuity floor (#1105): a nodeImport that stopped matching `continue`s past every project.
-    expect(projectsUsingNode, 'no project imports a node builtin — nodeImport is broken; fix it, do not delete this assertion')
+    // Non-vacuity floor (#1105): a NODE_BUILTIN that stopped matching `continue`s past every project.
+    expect(projectsUsingNode, 'no project imports a node builtin — NODE_BUILTIN or the parse is broken; fix it, do not delete this assertion')
       .toBeGreaterThan(0);
   });
 

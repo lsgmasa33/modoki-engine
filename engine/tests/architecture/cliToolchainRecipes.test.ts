@@ -24,6 +24,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { hasPrivateTooling } from '../helpers/repoLayout';
 import { readScannedSource } from '@modoki/engine/testing';
+import { importsIn, parseSource } from '@modoki/engine/testing/sourceAst';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 /** A Markdown doc, read as PROSE — the doc TEXT is the subject of these assertions, and
@@ -204,8 +205,10 @@ describe('CLI build recipes resolve the toolchain the way the editor does (#159)
     // is the #827 half: two scripts each carrying their own bundle-to-temp-and-import is what that
     // issue is about, and a fresh `import { build } from 'esbuild'` here is how it comes back.
     expect(src).toMatch(/loadRequiredEngineModules\(/);
-    expect(src, 'a private esbuild loader is back — use loadVendorPlugins.mjs (#827)')
-      .not.toMatch(/from ['"]esbuild['"]/);
+    // Any edge to esbuild, from the parse (#1193) — `await import('esbuild')` is a private loader too,
+    // and the `from ['"]esbuild['"]` text form could not see it.
+    expect(importsIn(parseSource(src, 'print-toolchain-env.mjs')).map((e) => e.spec).filter((s) => s === 'esbuild'),
+      'a private esbuild loader is back — use loadVendorPlugins.mjs (#827)').toEqual([]);
     expect(src).toMatch(/detect\(['"]java['"]\)/);
     expect(src).toMatch(/detect\(['"]android-sdk['"]\)/);
   });

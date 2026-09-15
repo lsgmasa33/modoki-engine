@@ -22,6 +22,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as THREE from 'three';
 import { join } from 'node:path';
 import { readScannedSource } from '../helpers/sourceScanner';
+import { importBindings, parseSource } from '../helpers/sourceAst';
 
 // Fakes for the two conversions: real generation needs an actual GPU context, which this suite
 // doesn't have. What matters here is OWNERSHIP — one generator/target per call, its scratch state
@@ -145,7 +146,8 @@ afterEach(() => {
 describe('envPmrem.ts imports the WebGPU PMREMGenerator, not the core one', () => {
   it('imports PMREMGenerator from three/webgpu and never references THREE.PMREMGenerator', () => {
     const src = readScannedSource(join(__dirname, '../../src/runtime/rendering/envPmrem.ts')).code;
-    expect(src).toMatch(/import\s*\{[^}]*PMREMGenerator[^}]*\}\s*from\s*'three\/webgpu'/);
+    // A VALUE import, from the parse (#1193): a wrapped or aliased import holds, `import type` does not.
+    expect(importBindings(parseSource(src, 'envPmrem.ts'), 'three/webgpu').filter((b) => !b.typeOnly).map((b) => b.imported)).toContain('PMREMGenerator');
     // Checks actual USE (`new THREE.PMREMGenerator(`), not the file's own warning comment about
     // it — that comment names `THREE.PMREMGenerator` on purpose, to explain why it's wrong.
     expect(src).not.toMatch(/new\s+THREE\.PMREMGenerator\s*\(/);

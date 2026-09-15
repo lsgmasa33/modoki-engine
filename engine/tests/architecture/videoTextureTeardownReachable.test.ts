@@ -22,6 +22,7 @@ import { expectInOrder, found } from '@modoki/engine/testing/inOrder';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readScannedSource } from '@modoki/engine/testing';
+import { importBindings, parseSource } from '@modoki/engine/testing/sourceAst';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 
@@ -72,9 +73,10 @@ describe('disposeVideoTextures (3D) is reachable from production code', () => {
 
   it('both files import disposeVideoTextures from videoTextureSync', () => {
     const scene3D = read('engine/packages/modoki/src/runtime/rendering/Scene3D.tsx');
-    expect(scene3D).toMatch(/import\s*\{\s*disposeVideoTextures\s*\}\s*from\s*'\.\/videoTextureSync'/);
+    // Value imports from the parse (#1193) — another specifier beside it, or a wrap, must not redden this.
+    expect(importBindings(parseSource(scene3D, 'Scene3D.tsx'), './videoTextureSync').filter((b) => !b.typeOnly).map((b) => b.imported)).toContain('disposeVideoTextures');
 
     const sceneView = read('engine/packages/modoki/src/editor/panels/SceneView.tsx');
-    expect(sceneView).toMatch(/import\s*\{\s*disposeVideoTextures\s*\}\s*from\s*'\.\.\/\.\.\/runtime\/rendering\/videoTextureSync'/);
+    expect(importBindings(parseSource(sceneView, 'SceneView.tsx'), '../../runtime/rendering/videoTextureSync').filter((b) => !b.typeOnly).map((b) => b.imported)).toContain('disposeVideoTextures');
   });
 });

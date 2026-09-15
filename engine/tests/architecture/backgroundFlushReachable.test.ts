@@ -29,6 +29,7 @@ import { describe, it, expect } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { stripComments, readScannedSource } from '@modoki/engine/testing';
+import { importBindings, parseSource } from '@modoki/engine/testing/sourceAst';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 /** Comments blanked at the READ (#812): this guard's own sources document the flush rule it
@@ -44,8 +45,9 @@ describe('useBackgroundFlush is reached from production code (#619, #611)', () =
     // Match any path ENDING in the module name, not a pinned './useBackgroundFlush' — moving the
     // hook into engine/app/hooks/ (which already exists, for useKeyboardShift) changes nothing
     // about reachability and must not turn this guard red.
-    expect(app, 'App.tsx must import useBackgroundFlush')
-      .toMatch(/import\s*\{[^}]*\buseBackgroundFlush\b[^}]*\}\s*from\s*'[^']*useBackgroundFlush'/);
+    // A value import from the parse (#1193) — wrapped, aliased or double-quoted all hold.
+    expect(importBindings(parseSource(app, 'App.tsx'), /(^|\/)useBackgroundFlush(\.tsx?)?$/).filter((b) => !b.typeOnly).map((b) => b.imported), 'App.tsx must import useBackgroundFlush')
+      .toContain('useBackgroundFlush');
   });
 
   it('App.tsx actually CALLS useBackgroundFlush(), not just imports it', () => {

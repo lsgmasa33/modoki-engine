@@ -28,6 +28,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readScannedSource } from '@modoki/engine/testing';
+import { importBindings, parseSource } from '@modoki/engine/testing/sourceAst';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
@@ -102,7 +103,7 @@ describe('the editor /api/build heals through the same sequence (#685 parity, #8
   const src = readScannedSource(assetScanner).code;
 
   it('imports healNativeProject from the shared module and calls it for the build platform', () => {
-    expect(src).toMatch(/import\s*\{\s*healNativeProject\s*\}\s*from\s*'\.\/healNativeProject'/);
+    expect(importBindings(parseSource(src, 'vite-asset-scanner.ts'), './healNativeProject').filter((b) => !b.typeOnly).map((b) => b.imported)).toContain('healNativeProject');
     expect(src).toMatch(/await healNativeProject\(projectRoot, buildCwd, \[platform\],/);
   });
 

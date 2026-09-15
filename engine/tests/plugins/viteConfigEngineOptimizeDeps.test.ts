@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { repoFiles } from '../../scripts/repoCorpus.mjs'
 import { hasInternalGames } from '../helpers/repoLayout'
 import { readScannedSource } from '@modoki/engine/testing'
+import { importsIn, parseSource } from '@modoki/engine/testing/sourceAst'
 
 /**
  * Regression guard for the packaged-editor dep-optimize stabilization fix.
@@ -94,16 +95,17 @@ describe('vite.config @modoki/engine optimizeDeps.include (packaged dep-optimize
       floor: 50,
     }).filter(({ rel }: { rel: string }) => !rel.includes('/tests/') && !/\.(test|spec)\.tsx?$/.test(rel))
 
-    // `from '<spec>'`, `import('<spec>')` and a bare side-effect `import '<spec>'`, over
-    // COMMENT-STRIPPED source (`readScannedSource`, as `courtSweepScope.test.ts` does) — a doc
-    // comment reading "imported from '@modoki/engine/x'" matches the `from` arm otherwise, and the
-    // widening to double quotes and bare imports enlarges that surface. Both quote styles; a
-    // template literal cannot be a static specifier worth pre-bundling.
-    const SPEC = /(?:from|import\s*\(?)\s*['"](@modoki\/engine[^'"]*)['"]/g
+    // Every module edge a game file writes — static, re-exported, dynamic, side-effect — read from the
+    // parse (#1193). The regex this replaced (`(?:from|import\s*\(?)\s*['"](@modoki/engine…)['"]`)
+    // needed comments stripped first and could not see `import x = require('…')`; it found the same 9
+    // subpaths on 2026-09-15. `import type` statements stay IN, as they were: listing one costs a
+    // pre-bundle entry, and missing a value import blanks the packaged renderer. A type POSITION
+    // (`typeof import('…')`), which its `import\s*\(?` arm also matched, is not an import and is out.
     const found = new Map<string, string>()
     for (const { abs, rel } of sources as { abs: string; rel: string }[]) {
-      const text = readScannedSource(abs).code
-      for (const m of text.matchAll(SPEC)) if (!found.has(m[1])) found.set(m[1], rel)
+      for (const { spec } of importsIn(parseSource(readScannedSource(abs).code, rel))) {
+        if ((spec === '@modoki/engine' || spec.startsWith('@modoki/engine/')) && !found.has(spec)) found.set(spec, rel)
+      }
     }
 
     expect(found.size).toBeGreaterThan(0)

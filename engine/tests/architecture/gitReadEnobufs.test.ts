@@ -24,6 +24,7 @@
 import { describe, it, expect } from 'vitest';
 import { execFileSync, execSync } from 'node:child_process';
 import { readScannedSource } from '@modoki/engine/testing';
+import { importBindings, parseSource } from '@modoki/engine/testing/sourceAst';
 import { isGitVerdict } from '../../scripts/gitError.mjs';
 import { repoRoot } from '../../scripts/repoCorpus.mjs';
 
@@ -173,7 +174,7 @@ describe('an overflowing git read is not mistaken for a git verdict (#1120, #112
       // ⚠️ STRIPPED source (#812). Reading raw would let a COMMENT mentioning the predicate
       // satisfy this check — a fail-open in the one test that exists to prove it is wired.
       const { code: src } = readScannedSource(`${repoRoot()}/${rel}`);
-      const imports = /import\s*\{[^}]*\bisGitVerdict\b[^}]*\}\s*from\s*['"][^'"]*gitError\.mjs['"]/.test(src);
+      const imports = importBindings(parseSource(src, rel), /(^|\/)gitError\.mjs$/).filter((b) => !b.typeOnly).map((b) => b.imported).includes('isGitVerdict');
       // Called in a REFUSING position: `!isGitVerdict(...)` is what turns a non-verdict into a
       // throw. A bare call that ignored the answer would satisfy a looser check and do nothing.
       const refuses = /!\s*isGitVerdict\s*\(/.test(src);

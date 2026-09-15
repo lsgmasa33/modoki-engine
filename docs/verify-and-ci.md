@@ -1623,6 +1623,57 @@ recurred:
   other way: the parser ledger immediately found two playable gates (#926, #1184) `main`'s line scan had
   never counted.
 
+**#1193 — the import-SYNTAX readers (~40 sites, outside #1179's census).** Each guard had
+its own regex for which spellings of an import exist, and each one missed a different subset: a
+side-effect `import '…'`, `import x = require()`, `export … from`, a statement that does not start its
+line, a clause longer than the regex's window, double quotes, or an import in a string it mistook
+for a real one. They all read `importsIn` now. The helper gained two things. `importBindings(sf, spec)`
+is the one reader for "F imports N from M": one row per binding, however the import is wrapped or aliased.
+`importsIn`'s `typePositions` option returns the import types the compiler resolves (`import('x').T`)
+without counting them as runtime edges. What recurred:
+
+- **Measure the population old against new BEFORE switching, per reader.** Six readers came out
+  identical: the vite config, publish exclusions, Court's sweep scope, account literals, repoLayout
+  importers and the F11 closure (453 files). The runtime graph kept its 2,016 edges. The measurement found
+  every real miss. `barrelImportOrder` entered 240 modules and the barrel names 250. Ten modules, `./traits`
+  and `./iap` among them, had never been imported first, because their export clauses ran past a
+  `[\s\S]{0,400}?` window. `worldSwapTeardownFalsifiable` never saw 24 side-effect imports of a producer.
+  It also counted 145 `typeof import('…')` and fixture-string "imports". Its verdicts were identical
+  anyway, which the probe had to show, since the specifier lists could not. A partial mock does run its
+  producer, though: `vi.mock('../producer', (importOriginal) => … importOriginal() …)`. The text form
+  credited it only by accident, through `importOriginal`'s `typeof import('…')` type argument. Review
+  caught the first parse dropping it. It is now read from what LOADS: the mock target whose factory
+  calls its loader, and `vi.importActual`'s argument. The type argument does not count.
+- **Under `verbatimModuleSyntax`, `import { type A } from './x'` is NOT erased.** It emits
+  `import {} from './x'`, which still runs `./x`. Only `import type` / `export type` statements are
+  erased. `moduleGraph` counted the inline form as type-only. Two runtime edges moved to value, and no
+  cycle changed.
+- **"Which modules does this file run" and "which modules must resolve" are different questions.** A
+  type-position import runs nothing, so walkers and attribution skip it. It still fails a standalone typecheck, so `gamePortability`, `publishExclusions` and
+  `mainBundleExternals` read it on purpose. None of these reads `declare module '…'` or
+  `/// <reference path>`.
+- **A binding pin requires a VALUE binding, and a re-export is not an import.** `export { N } from 'M'`
+  binds no local name. An `import type { N }` does not construct or call anything.
+- **The migration found a latent defect beyond the guard.** `playableAppServicesStub` read dynamic uses as
+  `m.<name>` within 120 characters, so `games/3d-test`'s `.then(({ analytics }) => analytics.logEvent(…))`
+  was invisible. The playable stub had no `analytics`, and a playable build would have rejected that
+  promise at runtime. Rollup does not check dynamic imports. The stub gained the namespace. The guard now
+  THROWS on a use shape it cannot read, where it used to pass it unread: a non-`.then` use, a rest or
+  nested destructure, a callback parameter used other than as a call of its member, `m.<name>(…)`
+  (a chained or held member hides its own members from the namespace scan). A mock's original is credited
+  only for `vi.mock`/`vi.doMock` whose factory calls its loader, by symbol, in its own body. Each reader has its own
+  positive pin (`track` static, `register` dynamic, `analytics` destructured), because the review emptied
+  the destructured branch with the suite still green.
+- **A narrowing hides in "the regex caught it by accident", again.** The review found two more.
+  `mainBundleExternals`' regex took `` import(`@modoki/engine/${n}`) ``, a template the parse names no
+  module for; that arm is read again, by its head. `mainDialog`'s ban keyed on `'electron'` never saw
+  `'electron/main'`, which predates this change. The whole-module arms also had no fixture while the
+  real tree held no offender, so a typo in any arm would have stayed green.
+- **Stays out, and why.** Where a code UNIT ends, measured by bracket counting or the next column-0
+  declaration, is #1195. `findInstallCalls` and `requiredNamespaceMembers` are call scans, not import
+  readers. `crashSinkOrder`'s bundle case reads a built artifact. `sourceScanner.test.ts` counts
+  `/^import /` to measure the stripper itself.
+
 
 Progress: **seventeen guards are on the ledger** — `determinismGuard`, `docCitations` and
 `importSettingSelectsSpliced` (Phase 1); `assetJsonGuard`, `handleProviderOwner`,

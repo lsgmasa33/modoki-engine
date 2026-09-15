@@ -39,6 +39,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { readScannedSource } from '@modoki/engine/testing';
+import { importsIn, parseSource } from '@modoki/engine/testing/sourceAst';
 import { hasInternalGames } from '../helpers/repoLayout';
 
 const REPO = path.resolve(__dirname, '../../..');
@@ -64,13 +65,16 @@ function watchedIn(absPath: string): string[] {
   return [...m![1].matchAll(/'([^']+)'/g)].map((x) => x[1]);
 }
 
-/** Every `@modoki/engine/...` specifier `games/court/tests/**` imports. */
+/** Every `@modoki/engine/...` specifier `games/court/tests/**` imports — static, re-exported or dynamic,
+ *  read from the parse (#1193). The regex this replaced, `from '(@modoki/engine…)'`, took single quotes
+ *  only and never saw a side-effect import or `await import('…')`; same 10 barrels on 2026-09-15. */
 function courtImportedBarrels(): string[] {
   const files = repoFiles({ under: 'games/court/tests', match: /\.tsx?$/, floor: 10 });
   const out = new Set<string>();
-  for (const { abs } of files) {
-    const code = readScannedSource(abs).code;
-    for (const m of code.matchAll(/from '(@modoki\/engine[^']*)'/g)) out.add(m[1]);
+  for (const { abs, rel } of files) {
+    for (const { spec } of importsIn(parseSource(readScannedSource(abs).code, rel))) {
+      if (spec === '@modoki/engine' || spec.startsWith('@modoki/engine/')) out.add(spec);
+    }
   }
   return [...out].sort();
 }

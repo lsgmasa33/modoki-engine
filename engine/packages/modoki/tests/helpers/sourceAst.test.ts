@@ -5,7 +5,7 @@ import { describe, it, expect } from 'vitest';
 import ts from 'typescript';
 import {
   accessPath, blockInnerText, boundIdentifier, calledNames, callOf, callsTo, callsToPath, calleeName, declarationOf,
-  enclosingFunction, enclosingNamedFunction, findNodes, flatText, functionBodyOf, guardProves, guardsOf, importsIn, isBlock, lineOf, namedFunctions, objectLiteralKeys, parseSource,
+  enclosingFunction, enclosingNamedFunction, findNodes, flatText, functionBodyOf, guardProves, guardsOf, importBindings, importsIn, isBlock, lineOf, namedFunctions, objectLiteralKeys, parseSource,
   precedingStatements, printedText, readsOf, referencesToPath, scriptKindFor, siteText, statementOf, stringValueOf, ts as reexportedTs, unwrapValue, valueCarrier,
 } from './sourceAst';
 
@@ -397,6 +397,60 @@ describe('importsIn — every module edge, read from the declaration (#1179)', (
       { spec: './wrapped', kind: 'dynamic', typeOnly: false, bindings: [] },
       { spec: './template', kind: 'dynamic', typeOnly: false, bindings: [] },
     ]);
+  });
+
+  it('marks each binding erased or not — the statement\'s `type`, or the binding\'s own (#1193)', () => {
+    const rows = importsIn(parseSource(`import { a, type b } from './m';
+    import type { c } from './t';
+    export { d, type e } from './r';
+    export type * as f from './s';`, 'x.ts')).flatMap((e) => e.bindings.map((b) => `${b.local}:${b.typeOnly}`));
+    expect(rows).toEqual(['a:false', 'b:true', 'c:true', 'd:false', 'e:true', 'f:true']);
+  });
+
+  it('reads type-position imports only when asked, as erased `importType` edges (#1193)', () => {
+    const code = `type A = import('./a').T;
+    const f = (x: typeof import('../../escape')) => x;
+    const s = "import('./in-a-string').T";
+    const b = await import('./b');`;
+    expect(edges(code).map((e) => e.spec)).toEqual(['./b']);
+    expect(importsIn(parseSource(code, 'x.ts'), { typePositions: true }).map(({ spec, kind, typeOnly }) => ({ spec, kind, typeOnly })))
+      .toEqual([
+        { spec: './a', kind: 'importType', typeOnly: true },
+        { spec: '../../escape', kind: 'importType', typeOnly: true },
+        { spec: './b', kind: 'dynamic', typeOnly: false },
+      ]);
+  });
+});
+
+describe('importBindings — "F imports N from M", however the import is spelt (#1193)', () => {
+  const names = (code: string, spec: string | RegExp) => importBindings(parseSource(code, 'x.ts'), spec)
+    .map((b) => (b.imported === b.local ? b.local : `${b.imported} as ${b.local}`) + (b.typeOnly ? ' (type)' : ''));
+
+  it('reads every spelling a hand-written `import\\s*\\{[^}]*N[^}]*\\}\\s*from` regex split on', () => {
+    expect(names(`import {
+      first,
+      N as renamed,
+    } from "./spriteAtlas";
+    import D, { type T } from './spriteAtlas';
+    import * as ns from './spriteAtlas';
+    import legacy = require('./spriteAtlas');`, './spriteAtlas')).toEqual([
+      'first', 'N as renamed', 'default as D', 'T (type)', '* as ns', '* as legacy',
+    ]);
+  });
+
+  it('matches the specifier exactly, or by RegExp — and a global RegExp is not stateful across edges', () => {
+    const code = "import { a } from '../loaders/spriteAtlas';\nimport { b } from './spriteAtlas';\nimport { c } from './spriteAtlasX';";
+    expect(names(code, './spriteAtlas')).toEqual(['b']);
+    expect(names(code, /(^|\/)spriteAtlas$/g)).toEqual(['a', 'b']);
+  });
+
+  it('is not fooled by a re-export, a side-effect import, a comment or a string', () => {
+    expect(names(`export { N } from './m';
+    import './m';
+    // import { N } from './m';
+    const s = "import { N } from './m'";
+    const t = \`
+    import { N } from './m'\`;`, './m')).toEqual([]);
   });
 });
 

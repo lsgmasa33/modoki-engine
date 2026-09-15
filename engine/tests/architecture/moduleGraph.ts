@@ -1,6 +1,6 @@
 /**
  * Cross-folder import graph over `packages/modoki/src/runtime/**` — the shared measurement
- * used by the architecture guard tests (noNewCycles, barrelSurface). See `docs/architecture-
+ * used by the architecture guard tests (noNewCycles; `barrelSurface` imports the live barrel instead). See `docs/architecture-
  * layers.md` for the layer contract this graph polices. Not a test itself.
  *
  * Node granularity: every TOP-LEVEL subfolder of `runtime/` is one node (`core`, `traits`,
@@ -12,11 +12,13 @@
  * between two real files only if you first smash them into one fake node) — so this is the one
  * invariant callers must not "simplify" away.
  *
- * Edges are tagged `valueOnly: false` when EVERY binding the statement introduces is erased by
- * `import type` / `export type` / an inline `type` specifier — i.e. TypeScript's
- * `verbatimModuleSyntax` (on in tsconfig.app.json) drops the statement entirely, so it can never
- * run the target module for its side effects and can never produce an ESM circular-init
- * `undefined`. A statement with even one non-type binding is `valueOnly: true`. Dynamic
+ * Edges are tagged `valueOnly: false` when the STATEMENT is erased — `import type` / `export type` —
+ * because TypeScript's `verbatimModuleSyntax` (on in tsconfig.app.json) drops it entirely, so it can
+ * never run the target module and can never produce an ESM circular-init `undefined`.
+ * ⚠️ An import whose every specifier is inline-`type` (`import { type A } from './x'`) is NOT erased:
+ * `verbatimModuleSyntax` rewrites it to `import {} from './x'`, which still runs `./x`. This graph used to
+ * count it as type-only (#1193); the two such runtime edges measured on 2026-09-15 moved to value and
+ * changed no cycle. Dynamic
  * `import(...)` is deliberately NOT modeled as a graph edge: it is evaluated lazily, well after
  * module-init, so it cannot participate in the init-order failure mode this graph exists to catch.
  */
@@ -24,6 +26,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readScannedSource } from '@modoki/engine/testing';
+import { importsIn, parseSource } from '@modoki/engine/testing/sourceAst';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -75,78 +78,19 @@ export function nodeIdFor(absFile: string): string {
   return `../${seg}`;
 }
 
-/** True iff every specifier in a `{ ... }` clause is `type`-prefixed (`type X` / `type X as Y`),
- *  meaning the whole clause is erasable. An empty clause (`{}`) is treated as value — it is rare
- *  in this codebase and erring conservative (counting it as a real edge) is the safe direction
- *  for a guard whose job is to not miss things. */
-function braceIsAllType(braceContent: string): boolean {
-  const specs = braceContent
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-  if (specs.length === 0) return false;
-  return specs.every((s) => /^type\b/.test(s));
-}
-
-/** Parse one file's static import/export-from statements into edges (specifier + valueOnly),
- *  without resolving them to files yet. Exported for the barrel-surface test, which also needs
- *  to read `runtime/index.ts`'s export list without duplicating this parsing. */
-export function parseFromStatements(src: string): Array<{ specifier: string; valueOnly: boolean }> {
-  const out: Array<{ specifier: string; valueOnly: boolean }> = [];
-
-  // import type <clause> from '...'  — keyword right after `import` erases the WHOLE statement.
-  // Tracked as ranges (not mutated out of `src`) so the general import regex below can skip
-  // anything already counted here, without a `type { A } from 'x'` line being double-counted.
-  const importTypeRe = /import\s+type\s+(?:\*\s+as\s+\w+|\{[^}]*\}|\w+)\s+from\s+['"]([^'"]+)['"]/g;
-  const typeRanges: Array<[number, number]> = [];
-  for (const m of src.matchAll(importTypeRe)) {
-    out.push({ specifier: m[1], valueOnly: false });
-    typeRanges.push([m.index!, m.index! + m[0].length]);
-  }
-  const inTypeRange = (idx: number) => typeRanges.some(([a, b]) => idx >= a && idx < b);
-
-  // export type { ... } from '...'
-  const exportTypeRe = /export\s+type\s+\{[^}]*\}\s+from\s+['"]([^'"]+)['"]/g;
-  for (const m of src.matchAll(exportTypeRe)) out.push({ specifier: m[1], valueOnly: false });
-  const exportTypeRanges: Array<[number, number]> = [];
-  for (const m of src.matchAll(exportTypeRe)) exportTypeRanges.push([m.index!, m.index! + m[0].length]);
-  const inExportTypeRange = (idx: number) => exportTypeRanges.some(([a, b]) => idx >= a && idx < b);
-
-  // General `import <clause> from '...'` (clause = `* as X` | `X` | `X, { ... }` | `{ ... }`).
-  const importRe = /import\s+((?:\*\s+as\s+\w+)|(?:\w+(?:\s*,\s*\{[^}]*\})?)|(?:\{[^}]*\}))\s+from\s+['"]([^'"]+)['"]/g;
-  for (const m of src.matchAll(importRe)) {
-    if (inTypeRange(m.index!)) continue; // already counted above as type-only
-    const clause = m[1];
-    const specifier = m[2];
-    const braceMatch = clause.match(/\{([^}]*)\}/);
-    const hasBareDefaultOrNamespace = /^(?:\*\s+as\s+\w+|\w+)/.test(clause.trim()) && !clause.trim().startsWith('{');
-    let valueOnly: boolean;
-    if (hasBareDefaultOrNamespace) {
-      valueOnly = true; // a default/namespace binding is never erasable
-    } else if (braceMatch) {
-      valueOnly = !braceIsAllType(braceMatch[1]);
-    } else {
-      valueOnly = true;
-    }
-    out.push({ specifier, valueOnly });
-  }
-
-  // Side-effect-only import: `import '...'` (no clause) — always runs the target module.
-  const sideEffectRe = /import\s+['"]([^'"]+)['"]/g;
-  for (const m of src.matchAll(sideEffectRe)) out.push({ specifier: m[1], valueOnly: true });
-
-  // `export { ... } from '...'` (not `export type { ... }`, handled above) — check inline `type`.
-  const exportRe = /export\s+(\{[^}]*\}|\*(?:\s+as\s+\w+)?)\s+from\s+['"]([^'"]+)['"]/g;
-  for (const m of src.matchAll(exportRe)) {
-    if (inExportTypeRange(m.index!)) continue;
-    const clause = m[1];
-    const specifier = m[2];
-    const braceMatch = clause.match(/\{([^}]*)\}/);
-    const valueOnly = braceMatch ? !braceIsAllType(braceMatch[1]) : true; // `export *` / `export * as X` — value
-    out.push({ specifier, valueOnly });
-  }
-
-  return out;
+/** One file's static import/export-from edges (specifier + valueOnly), without resolving them to files
+ *  yet. Exported for `moduleGraphCommentEdges.test.ts`, which pins what it reads.
+ *
+ *  ⚠️ **Read from the declarations, not from text (#1193).** This was five regexes, one per spelling it
+ *  knew — `import type`, `export type {…}`, `import <clause> from`, `import '…'`, `export {…|*} from` —
+ *  plus a hand-written split of the brace list. `importsIn` reads every spelling the parser does
+ *  (`import x = require()`, a statement the regexes could not see past, an `import` in a template
+ *  string that is not one). Measured over the 540 runtime files on 2026-09-15 it found the same 2,016
+ *  edges; the only change was two `import { type A }` edges moving to value (see the header). */
+export function parseFromStatements(code: string, label: string): Array<{ specifier: string; valueOnly: boolean }> {
+  return importsIn(parseSource(code, label))
+    .filter((e) => e.kind !== 'dynamic')
+    .map((e) => ({ specifier: e.spec, valueOnly: !e.typeOnly }));
 }
 
 /** Resolve a relative specifier from `fromFile` to an actual file on disk (trying `.ts`, `.tsx`,
@@ -167,19 +111,14 @@ function resolveSpecifier(fromFile: string, specifier: string): string | null {
 export function buildRuntimeGraph(): ImportEdge[] {
   const edges: ImportEdge[] = [];
   for (const file of walk(RUNTIME_ROOT)) {
-    // ⚠️ **Comments blanked before the statements are parsed (#812).** `parseFromStatements` is a
-    // regex over text, so a doc comment SHOWING an import example is indistinguishable from a real
-    // one — and a comment holding a RELATIVE specifier injects a phantom cross-folder edge. This
-    // graph feeds `noNewCycles` and `barrelSurface`, both frozen baselines, so that lands not as a
-    // red build you investigate but as a new cycle whose cheapest fix is adding it to
-    // `cycles-baseline.json` — permanently enshrining a cycle that does not exist.
-    // Two runtime files already hold an import in prose (`ui/storeHooks.ts`,
-    // `storage/playerPrefs.ts`); both happen to use the bare `@modoki/engine/runtime`, which the
-    // `.`-prefix filter below drops. The next one to be written relatively is the live bug.
+    // Read through the shared scanner (#812), which `commentStripperIsShared` enforces. Since #1193 the
+    // parse cannot mistake a comment for an import anyway, but a doc comment SHOWING a relative import
+    // was once a phantom cross-folder edge in a graph that feeds frozen baselines (`noNewCycles`), where
+    // the cheapest "fix" is enshrining a cycle that does not exist.
     const src = readScannedSource(file).code;
     const fromNode = nodeIdFor(file);
     const fromFile = path.relative(REPO_ROOT, file).replace(/\\/g, '/');
-    for (const { specifier, valueOnly } of parseFromStatements(src)) {
+    for (const { specifier, valueOnly } of parseFromStatements(src, fromFile)) {
       if (!specifier.startsWith('.')) continue; // external package — not our layering concern
       const resolved = resolveSpecifier(file, specifier);
       const toFile = resolved ? path.relative(REPO_ROOT, resolved).replace(/\\/g, '/') : null;

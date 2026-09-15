@@ -23,6 +23,7 @@ import path from 'node:path';
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
 import { REPO_ROOT } from '../helpers/repoLayout';
 import { readScannedSource } from '@modoki/engine/testing';
+import { importsIn, namedFunctions, parseSource } from '@modoki/engine/testing/sourceAst';
 
 const getInfo = vi.fn();
 vi.mock('@capacitor/app', () => ({ App: { getInfo: () => getInfo() } }));
@@ -121,7 +122,13 @@ describe('the hardware probe reads a plugin that is actually present (#146)', ()
     const src = readScannedSource(path.join(__dirname, '../../app/debug/bridge.ts')).code;
     const fn = src.slice(src.indexOf('async function readDeviceHardware'));
     const body = fn.slice(0, fn.indexOf('\n}'));
-    expect(body).toContain("import('capacitor-game-debug')");
+    // The dynamic import is read from the parse, inside the function's own body (#1193). The text
+    // slice above still bounds the `not.toMatch` below — cutting a body by text shape is #1195.
+    const sf = parseSource(src, 'bridge.ts');
+    const hw = namedFunctions(sf).find((f) => f.name === 'readDeviceHardware');
+    expect(hw, 'readDeviceHardware is gone or renamed').toBeDefined();
+    const dynamic = importsIn(sf).filter((e) => e.kind === 'dynamic' && e.node.pos >= hw!.body.pos && e.node.end <= hw!.body.end);
+    expect(dynamic.map((e) => e.spec)).toContain('capacitor-game-debug');
     // The original bug, pinned by name: `@capacitor/device` is optional and no project installs it.
     expect(body).not.toMatch(/Plugins\?\.Device|@capacitor\/device/);
   });

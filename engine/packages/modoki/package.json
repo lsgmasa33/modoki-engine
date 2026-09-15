@@ -30,6 +30,7 @@
     "./testing/prefabInstances": "./tests/helpers/prefabInstances.ts",
     "./testing/exemptionLedger": "./tests/helpers/exemptionLedger.ts",
     "./testing/sourceAst": "./tests/helpers/sourceAst.ts",
+    "./testing/importClosure": "./tests/helpers/importClosure.ts",
     "./testing/inOrder": "./tests/helpers/inOrder.ts",
     "./testing/scratchDir": "./tests/helpers/scratchDir.ts"
   },
