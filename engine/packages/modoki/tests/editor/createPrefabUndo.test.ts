@@ -66,9 +66,11 @@ const mockFetch = vi.fn(async (url: string, init?: { body?: string }) => {
   const bad = Array.from(failing).some((r) => String(url).includes(r));
   if (!bad && String(url).includes('/api/write-file')) {
     const b = JSON.parse(init?.body ?? '{}') as { path: string; content: string; ifNoneMatch?: string };
-    if (b.ifNoneMatch === '*' && onDisk.has(b.path)) return { ok: false, status: 409, json: async () => ({}) } as any;
+    // Matched case-insensitively and answered with the stored spelling, as APFS and the real route do (#1273).
+    const existing = [...onDisk.keys()].find((k) => k.toLowerCase() === b.path.toLowerCase());
+    if (b.ifNoneMatch === '*' && existing) return { ok: false, status: 409, json: async () => ({ existingPath: existing }) } as any;
     written.push({ path: b.path, content: b.content, createOnly: b.ifNoneMatch === '*' });
-    onDisk.set(b.path, b.content);
+    onDisk.set(existing ?? b.path, b.content);
   }
   const served = !String(url).includes('/api/') && [...onDisk.entries()].find(([p]) => String(url).endsWith(p));
   if (served) return { ok: true, status: 200, text: async () => served[1], json: async () => JSON.parse(served[1]) } as any;
@@ -199,6 +201,20 @@ describe('createPrefabFromEntity over an EXISTING prefab (#1264)', () => {
     expect((JSON.parse(written[0].content) as { id: string }).id).toBe(OLD_ID);
     expect(registerAssetSpy).toHaveBeenCalledWith(OLD_ID, PATH, 'prefab');
     expect(setPrefabCacheSpy).toHaveBeenCalledWith(OLD_ID, expect.objectContaining({ id: OLD_ID }));
+  });
+
+  it('a Replace over a CASE-VARIANT name registers, tags and undoes against the file that is really there (#1273)', async () => {
+    const ON_DISK = '/p/Thing.prefab.json';
+    onDisk.set(ON_DISK, OLD_TEXT);
+    const res = await createPrefabFromEntity(7, PATH, 'Create Prefab "Thing"', async () => true);
+    if (!res || res === 'declined') throw new Error(String(res));
+    expect(res.savePath).toBe(ON_DISK);
+    expect(registerAssetSpy).toHaveBeenCalledWith(OLD_ID, ON_DISK, 'prefab');
+    expect(tagSpy).toHaveBeenCalledWith(7, ON_DISK);
+    written = [];
+    await res.action.undo();
+    expect(written.map((w) => w.path)).toEqual([ON_DISK]);
+    expect(onDisk.get(ON_DISK)).toBe(OLD_TEXT);
   });
 
   it('UNDO of a replace RESTORES the replaced bytes and never trashes the file', async () => {

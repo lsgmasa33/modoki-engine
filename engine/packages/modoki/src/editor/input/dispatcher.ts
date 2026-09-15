@@ -24,7 +24,7 @@ if (import.meta.hot) import.meta.hot.accept(() => { window.location.reload(); })
  *  would break all of them at once, with no error anywhere. */
 
 import { chordFromEvent, resolve } from './keymap';
-import { isTextEditable, topOverlay } from './focusScope';
+import { isModalOpen, isTextEditable, topOverlay } from './focusScope';
 import { useEditorStore } from '../store/editorStore';
 
 let installed = false;
@@ -38,6 +38,7 @@ function onKeyDown(e: KeyboardEvent): void {
   const binding = resolve(chordFromEvent(e), {
     focusedPanel: useEditorStore.getState().focusedPanel,
     overlay: topOverlay(),
+    modal: isModalOpen(),
     textEditable: isTextEditable(typeof document !== 'undefined' ? document.activeElement : null),
   });
   if (!binding) return; // YIELD — see the contract above

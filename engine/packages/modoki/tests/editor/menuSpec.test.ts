@@ -5,8 +5,9 @@
  *  scenario the scheme defends against is spelled out in `menuItemId` — a native menu left open
  *  while the Build menu's device list arrives. */
 
-import { describe, it, expect, vi } from 'vitest';
-import { buildMenuSpec, menuItemId, resolveMenuAction, handleMenuAction } from '../../src/editor/menuSpec';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { buildMenuSpec, menuItemId, resolveMenuAction, handleMenuAction, MENU_REFUSED_UNDER_MODAL } from '../../src/editor/menuSpec';
+import { clearOverlays, pushOverlay } from '../../src/editor/input/focusScope';
 import type { BarMenuItem } from '../../src/editor/components/MenuBar';
 
 describe('menuItemId', () => {
@@ -185,5 +186,48 @@ describe('handleMenuAction', () => {
     const s = sinks();
     handleMenuAction({ [menuItemId('File#0', 0, 'Something Else')]: other }, SAVE, s);
     expect(other).not.toHaveBeenCalled();
+  });
+});
+
+/** A modal dialog is up (#1270): the menu is outside its backdrop, so it must refuse on its own.
+ *  The relay is where both the OS menu click and — under Electron — the ⌘Z accelerator land. */
+describe('the menu under a modal dialog (#1270)', () => {
+  const SAVE = menuItemId('File#0', 0, 'Save All');
+  const sinks = () => ({ showToast: vi.fn(), warn: vi.fn() });
+  beforeEach(() => clearOverlays());
+  afterEach(() => clearOverlays());
+
+  it('a relayed click is REFUSED, runs nothing, and says why', () => {
+    const run = vi.fn();
+    const s = sinks();
+    pushOverlay('replace-prompt', { modal: true });
+    expect(handleMenuAction({ [SAVE]: run }, SAVE, s)).toBe('refused');
+    expect(run).not.toHaveBeenCalled();
+    expect(s.showToast).toHaveBeenCalledWith(MENU_REFUSED_UNDER_MODAL, 'warn');
+  });
+
+  it('a POPOVER does not refuse it — only the modal kind blocks the editor', () => {
+    const run = vi.fn();
+    pushOverlay('context-menu');
+    expect(handleMenuAction({ [SAVE]: run }, SAVE, sinks())).toBe('ran');
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it('the spec greys EVERY item, submenu rows included, and keeps the actions for the race', () => {
+    const menus = {
+      Edit: [{ label: 'Undo', action: vi.fn() }, { label: '', separator: true }, { label: 'Redo', action: vi.fn() }],
+      Window: [{ label: 'Panels', submenu: [{ label: 'Console', action: vi.fn() }] }],
+    };
+    const { menuSpec, menuActionMap } = buildMenuSpec(menus, { modal: true });
+    const rows = menuSpec.menus.flatMap((m) => m.items.flatMap((it) => [it, ...(it.submenu ?? [])])).filter((it) => !it.separator);
+    expect(rows.map((it) => [it.label, it.disabled])).toEqual([['Undo', true], ['Redo', true], ['Panels', true], ['Console', true]]);
+    expect(Object.keys(menuActionMap)).toHaveLength(3);
+    // The spec CARRIES the flag: main reads it to name the modal as the cause when /api/menu refuses
+    // a greyed item, and nothing else tells it (electron/modalRefusal.ts).
+    expect(menuSpec.modal).toBe(true);
+    // Without the flag an item keeps its own state, and the flag is absent rather than false.
+    const plain = buildMenuSpec(menus).menuSpec;
+    expect(plain.menus[0].items[0].disabled).toBeUndefined();
+    expect(plain.modal).toBeUndefined();
   });
 });

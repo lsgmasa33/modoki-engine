@@ -12,11 +12,11 @@ import {
   chordFromEvent, formatChord, KeymapConflictError, type ResolveContext,
 } from '../../src/editor/input/keymap';
 import {
-  isTextEditable, pushOverlay, popOverlay, topOverlay, clearOverlays, overlayDepth,
+  isTextEditable, pushOverlay, popOverlay, topOverlay, clearOverlays, overlayDepth, isModalOpen, subscribeOverlays,
 } from '../../src/editor/input/focusScope';
 
 const ctx = (over: Partial<ResolveContext> = {}): ResolveContext => ({
-  focusedPanel: null, overlay: null, textEditable: false, ...over,
+  focusedPanel: null, overlay: null, modal: false, textEditable: false, ...over,
 });
 
 beforeEach(() => { clearBindings(); clearOverlays(); });
@@ -344,6 +344,52 @@ describe('overlay stack — Escape gets ONE owner', () => {
   });
 });
 
+describe('overlay stack — the modal kind (#1270)', () => {
+  it('a popover is not a modal; a modal anywhere on the stack is', () => {
+    pushOverlay('menu');
+    expect(isModalOpen()).toBe(false);
+    const close = pushOverlay('dialog', { modal: true });
+    pushOverlay('picker');                       // a popover over the modal
+    expect(isModalOpen()).toBe(true);
+    close();
+    expect(isModalOpen()).toBe(false);
+  });
+
+  it('re-pushing an id takes the NEW kind — a stale modal flag cannot outlive its entry', () => {
+    pushOverlay('x', { modal: true });
+    pushOverlay('x');
+    expect(isModalOpen()).toBe(false);
+    expect(overlayDepth()).toBe(1);
+  });
+
+  it('notifies subscribers on push, pop and clear, and stops after unsubscribe', () => {
+    const heard = vi.fn();
+    const off = subscribeOverlays(heard);
+    pushOverlay('a', { modal: true });
+    popOverlay('a');
+    popOverlay('a');                              // already gone — nothing changed, nothing to hear
+    clearOverlays();
+    expect(heard).toHaveBeenCalledTimes(3);
+    off();
+    pushOverlay('b');
+    expect(heard).toHaveBeenCalledTimes(3);
+  });
+
+  it('resolve() makes every non-overlay scope ineligible while `modal` is set', () => {
+    register({ id: 'app.save', keys: 'mod+s', scope: 'app-chord', run: () => {} });
+    register({ id: 'h.del', keys: 'Backspace', scope: 'hierarchy', run: () => {} });
+    register({ id: 'k.f', keys: 'f', scope: 'app-key', run: () => {} });
+    register({ id: 'm.esc', keys: 'Escape', scope: 'overlay', owner: 'dlg', run: () => {} });
+    const under = ctx({ focusedPanel: 'hierarchy', overlay: 'dlg', modal: true });
+    expect(resolve('mod+s', under)).toBeNull();
+    expect(resolve('Backspace', under)).toBeNull();
+    expect(resolve('f', under)).toBeNull();
+    expect(resolve('Escape', under)?.id).toBe('m.esc');
+    // The same context without the modal flag — a popover — resolves the editor's bindings as before.
+    expect(resolve('mod+s', { ...under, modal: false })?.id).toBe('app.save');
+  });
+});
+
 describe('unregister', () => {
   it('removes a binding so the chord yields again', () => {
     register({ id: 'x', keys: 'g', scope: 'scene', run: () => {} });
@@ -378,7 +424,7 @@ describe('modifier variants are distinct chords', () => {
     register({ id: 'a.left10', keys: 'shift+ArrowLeft', scope: 'animation-editor', run: noop });
     register({ id: 'a.upFine', keys: 'alt+ArrowUp', scope: 'animation-editor', run: noop });
 
-    const c = { focusedPanel: 'animation-editor', overlay: null, textEditable: false };
+    const c = { focusedPanel: 'animation-editor', overlay: null, modal: false, textEditable: false };
     expect(resolve(chordFromEvent({ key: 'ArrowLeft' }), c)?.id).toBe('a.left');
     expect(resolve(chordFromEvent({ key: 'ArrowLeft', shiftKey: true }), c)?.id).toBe('a.left10');
     expect(resolve(chordFromEvent({ key: 'ArrowUp', altKey: true }), c)?.id).toBe('a.upFine');
@@ -399,7 +445,7 @@ describe('Cmd+D three-way ownership (was a capture-phase race)', () => {
     register({ id: 'as.dup', keys: 'mod+d', scope: 'assets', run: noop });
     register({ id: 'an.dup', keys: 'mod+d', scope: 'animation-editor', when: () => animHasKeys, run: noop });
 
-    const at = (p: string) => ({ focusedPanel: p, overlay: null, textEditable: false });
+    const at = (p: string) => ({ focusedPanel: p, overlay: null, modal: false, textEditable: false });
     expect(resolve('mod+d', at('hierarchy'))?.id).toBe('h.dup');
     expect(resolve('mod+d', at('assets'))?.id).toBe('as.dup');
     expect(resolve('mod+d', at('animation-editor'))).toBeNull(); // no keys → yields

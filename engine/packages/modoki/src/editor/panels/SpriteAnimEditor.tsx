@@ -252,10 +252,11 @@ export default function SpriteAnimEditor() {
   const newSpriteAnim = useCallback(async () => {
     const pick = await chooseNewAssetPath({ defaultName: 'New Sprite Animation.spriteanim.json', ext: '.spriteanim.json', prompt: 'Create Sprite Animation' });
     if (!pick) return;
-    const { path } = pick;
     // Create-only, asking before a Replace, which keeps the replaced animation's guid (#1264).
-    const r = await writeNewAssetDocument(path, (guid) => jsonFileBody({ id: guid, ...defaultSpriteAnimData() }), { confirmReplace: pick.confirmReplace });
+    const r = await writeNewAssetDocument(pick.path, (guid) => jsonFileBody({ id: guid, ...defaultSpriteAnimData() }), { confirmReplace: pick.confirmReplace });
     if (r.outcome !== 'created' && r.outcome !== 'replaced') return;
+    // `r.path`: a Replace lands on the existing file's on-disk spelling (#1273).
+    const { path } = r;
     registerAsset(r.guid, path, 'spriteanim');
     const name = (path.split('/').pop() || 'SpriteAnim').replace(/\.spriteanim\.json$/i, '');
     useEditorStore.getState().openSpriteAnimEditor({ path, type: 'spriteanim', name });

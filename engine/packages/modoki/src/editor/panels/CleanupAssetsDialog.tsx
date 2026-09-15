@@ -12,6 +12,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import { backendFetch, backendPostJson } from '../backend/editorBackend';
 import { describeRefusedDeletes, readUnusedStaleness } from './assetOps';
+import { ModalShell } from '../components/ModalShell';
 
 interface Orphan { path: string; type: string; bytes: number }
 interface UnusedResponse {
@@ -158,7 +159,7 @@ export default function CleanupAssetsDialog() {
   };
 
   return (
-    <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={close}>
+    <ModalShell kind="cleanup-assets" onDismiss={close}>
       <div onClick={(e) => e.stopPropagation()} style={{
         background: '#1e1e30', border: '1px solid #555', borderRadius: 6, padding: '16px 20px',
         minWidth: 480, maxWidth: 640, maxHeight: '80vh', display: 'flex', flexDirection: 'column', fontFamily: 'monospace',
@@ -284,6 +285,6 @@ export default function CleanupAssetsDialog() {
           )}
         </div>
       </div>
-    </div>
+    </ModalShell>
   );
 }

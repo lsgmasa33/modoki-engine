@@ -34,7 +34,7 @@ describe('mod → Ctrl on Windows/Linux', () => {
     const { register, resolve, chordFromEvent, clearBindings } = await importKeymapAs('Win32');
     clearBindings();
     register({ id: 'app.save', keys: 'mod+s', scope: 'app-chord', run: () => {} });
-    const ctx = { focusedPanel: null, overlay: null, textEditable: false };
+    const ctx = { focusedPanel: null, overlay: null, modal: false, textEditable: false };
 
     expect(resolve(chordFromEvent({ key: 's', ctrlKey: true }), ctx)?.id).toBe('app.save');
     expect(resolve(chordFromEvent({ key: 's', metaKey: true }), ctx)).toBeNull();
@@ -67,7 +67,7 @@ describe('mod → Cmd on Mac (the branch every other test exercises)', () => {
     const { register, resolve, chordFromEvent, clearBindings } = await importKeymapAs('MacIntel');
     clearBindings();
     register({ id: 'app.save', keys: 'mod+s', scope: 'app-chord', run: () => {} });
-    const ctx = { focusedPanel: null, overlay: null, textEditable: false };
+    const ctx = { focusedPanel: null, overlay: null, modal: false, textEditable: false };
 
     expect(resolve(chordFromEvent({ key: 's', metaKey: true }), ctx)?.id).toBe('app.save');
     expect(resolve(chordFromEvent({ key: 's', ctrlKey: true }), ctx)).toBeNull();

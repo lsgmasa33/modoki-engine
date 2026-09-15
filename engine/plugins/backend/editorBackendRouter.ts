@@ -285,8 +285,10 @@ export interface BackendContext {
   /** Resolve an asset-root URL path (e.g. /games/x/assets/y.json) to an absolute
    *  path, or null if it escapes every allowed root. */
   resolveAssetPath(urlPath: string): string | null;
-  /** Reverse of resolveAssetPath: absolute path → asset-root URL, or null. */
-  absToAssetUrl(absPath: string): string | null;
+  /** Reverse of resolveAssetPath: absolute path → asset-root URL, or null. `onDisk` spells an existing
+   *  path the way the disk does rather than as `absPath` is — for a route answering about a request on
+   *  a case-insensitive filesystem (#1261, #1273); see `absToAssetUrl` for why events must not. */
+  absToAssetUrl(absPath: string, opts?: { onDisk?: boolean }): string | null;
   /** Absolute dir of the first asset root (save-dialog default location), or null. */
   firstRootDir(): string | null;
   /** Current cached asset manifest (kept fresh by the host's watcher). */
@@ -1190,6 +1192,22 @@ function describeHolds(holds: readonly UnsavedHold[]): string {
     byKind.set(kind, list);
   }
   return [...byKind].map(([kind, paths]) => `${kind} for ${[...new Set(paths)].join(', ')}`).join('; ');
+}
+
+/** `/api/save-dialog`'s answer for the file the panel returned, or null outside every asset root.
+ *
+ *  Two spellings, two jobs (#1273 close-out review). `path` is what the human TYPED: it names the file to
+ *  create, and `ensureExt` builds a new name from it — the disk's spelling there would christen
+ *  `Walk.anim.json` as `walk.anim.json` because a `walk.json` exists. `existingPath` is what the panel's own
+ *  Replace question was about, spelled the way the create's 409 will spell it, so `chooseNewAssetPath` can
+ *  tell it already asked. Only when something is there. Exported so it is testable without osascript. */
+export function saveDialogReply(
+  ctx: Pick<BackendContext, 'absToAssetUrl'>, chosenAbs: string,
+): { path: string; existingPath?: string } | null {
+  const typed = ctx.absToAssetUrl(chosenAbs);
+  if (!typed) return null;
+  const existingPath = fs.existsSync(chosenAbs) ? ctx.absToAssetUrl(chosenAbs, { onDisk: true }) : null;
+  return { path: typed, ...(existingPath ? { existingPath } : {}) };
 }
 
 export async function handleBackendRequest(ctx: BackendContext, req: BackendRequest): Promise<BackendResult | null> {
@@ -3020,7 +3038,7 @@ async function describeUnresolvedAgainstLiveWorld(
       const candidates = resolved.map(({ abs }) => {
         let isDir = false;
         try { isDir = fs.statSync(abs).isDirectory(); } catch { /* raced away */ }
-        return { abs, move: { from: ctx.absToAssetUrl(abs), to: null, ...(isDir ? { prefix: true } : {}) } };
+        return { abs, move: { from: ctx.absToAssetUrl(abs, { onDisk: true }), to: null, ...(isDir ? { prefix: true } : {}) } };
       }).filter((c): c is { abs: string; move: { from: string; to: null; prefix?: boolean } } => c.move.from !== null);
       // ── The unsaved-work gate, for the AGENT path only (#1215 A-7) ───────────────────────────
       // A delete DESTROYS a human's unsaved work on the path: the repair below drops the parked
@@ -3044,9 +3062,11 @@ async function describeUnresolvedAgainstLiveWorld(
       //
       // ⚠️ Two inputs the exact-url match missed (#1215 close-out review, both reproduced):
       // • CASE. On a case-insensitive filesystem `/assets/FX/spark.particle.json` trashes the file
-      //   the hold calls `/assets/fx/spark.particle.json` — `absToAssetUrl` echoes the REQUEST's
-      //   casing. Compared case-insensitively; the cost on a case-sensitive volume is a refusal
-      //   for a different file of the same name in another case, which is the safe direction.
+      //   the hold calls `/assets/fx/spark.particle.json`. Since #1261 the candidates are spelled
+      //   the way the disk does, but the fold is KEPT: it still spells a path reached
+      //   through a symlinked folder lexically, and a refusal gate that misses is the unsafe
+      //   direction. The cost on a case-sensitive volume is a refusal for a different file of the
+      //   same name in another case.
       // • The asset ROOT. `absToAssetUrl` returns null for it, so it is not in `candidates` and the
       //   probe was skipped outright while `resolved` still went to the trash. A resolved path with
       //   no canonical url is treated as containing everything.
@@ -3341,7 +3361,10 @@ async function describeUnresolvedAgainstLiveWorld(
   if (urlPath === '/api/exists' && method === 'GET') {
     const assetPath = query.get('path') || '';
     const resolved = ctx.resolveAssetPath(assetPath);
-    return json({ exists: !!resolved && fs.existsSync(resolved) });
+    const exists = !!resolved && fs.existsSync(resolved);
+    // `path`: the on-disk spelling of what exists, for the same reason as `/api/write-file`'s
+    // `existingPath` — this probe is case-insensitive where the filesystem is (#1273).
+    return json(exists ? { exists, path: ctx.absToAssetUrl(resolved, { onDisk: true }) } : { exists });
   }
 
   // ── POST /api/save-dialog (M, native) ── macOS "Save As" panel. Returns the
@@ -3366,9 +3389,9 @@ async function describeUnresolvedAgainstLiveWorld(
         // osascript exits non-zero on user cancel (-128).
         return json({ cancelled: true });
       }
-      const urlPathOut = ctx.absToAssetUrl(chosenAbs);
-      if (!urlPathOut) return json({ error: 'outside-asset-roots', abs: chosenAbs });
-      return json({ path: urlPathOut });
+      const reply = saveDialogReply(ctx, chosenAbs);
+      if (!reply) return json({ error: 'outside-asset-roots', abs: chosenAbs });
+      return json(reply);
     } catch (e) {
       return json({ error: String(e) }, 500);
     }
@@ -4306,7 +4329,11 @@ async function describeUnresolvedAgainstLiveWorld(
       // existing asset under a freshly minted guid and dangle every ref to the old one. Checked in
       // the same synchronous window as `ifMatch`, for the same reason.
       if (ifNoneMatch === '*' && fs.existsSync(absPath)) {
-        return json({ ok: false, conflict: true, reason: 'if-none-match' }, 409);
+        // `existingPath` is the url of what is REALLY there, spelled the way the disk spells it
+        // (#1273). `existsSync` is case-insensitive on APFS/NTFS, so `enemy.prefab.json` 409s over
+        // `Enemy.prefab.json` — and a caller that then asked the manifest about its OWN spelling found
+        // no asset, no kind to refuse, and replaced a prefab with a scene. Null for a `/@fs` path.
+        return json({ ok: false, conflict: true, reason: 'if-none-match', existingPath: ctx.absToAssetUrl(absPath, { onDisk: true }) }, 409);
       }
       // Materialize the exact bytes once so the self-write guard can fingerprint
       // them (the F9 late-rename fallback) and we write the identical buffer.
@@ -4330,7 +4357,11 @@ async function describeUnresolvedAgainstLiveWorld(
       const tmpPath = `${absPath}.tmp`;
       fs.writeFileSync(tmpPath, bytes);
       fs.renameSync(tmpPath, absPath);
-      return json({ ok: true });
+      // `path`: the url of the file just written, spelled the way the DISK does (#1273 close-out review).
+      // A create at `/assets/SCENES/new.json` lands in an existing `scenes/` folder on APFS/NTFS, and the
+      // scanner keys it `/assets/scenes/new.json` — a caller registering the spelling it asked for would
+      // give the manifest a key the scan never produces. Null for a `/@fs` path.
+      return json({ ok: true, path: ctx.absToAssetUrl(absPath, { onDisk: true }) });
     } catch (e) {
       return json({ error: String(e) }, 500);
     }
@@ -4467,6 +4498,10 @@ async function describeUnresolvedAgainstLiveWorld(
       // symmetrical.
       ctx.markEditorWrite(absFrom, null);
 
+      // The SOURCE's url is taken HERE, before the move: `onDisk` spells an existing path the way the
+      // disk does (#1261), and after the move `absFrom` exists no longer, so it would echo the
+      // request's casing and the repair below would miss every binding keyed by the real name.
+      const canonFrom = ctx.absToAssetUrl(absFrom, { onDisk: true });
       moveAssetFile(absFrom, absTo);
       // Before the renderer repair, not after: the manifest is what `modoki_list_assets` reads to
       // verify this move, and the watcher would otherwise catch up on its own 150ms debounce.
@@ -4485,9 +4520,9 @@ async function describeUnresolvedAgainstLiveWorld(
       // `{ok:true, repaired:[]}`, indistinguishable from "nothing was bound", arriving from the
       // exact out-of-process caller this repair exists for. `assetEditorBindings.ts`'s header
       // already warned that both sides must originate from the same string "if that ever stops
-      // being true this needs a shared canonicalizer" — `absToAssetUrl` is it.
-      const canonFrom = ctx.absToAssetUrl(absFrom);
-      const canonTo = ctx.absToAssetUrl(absTo);
+      // being true this needs a shared canonicalizer" — `absToAssetUrl` is it. (`canonFrom` is taken
+      // above, before the move; `canonTo` after it, once the destination is on disk to spell it.)
+      const canonTo = ctx.absToAssetUrl(absTo, { onDisk: true });
       // ⚠️ No `?? from` fallback. Falling back to the raw string ships exactly the defect the
       // canonicalization fixes — a path the renderer cannot match — just one size smaller, and
       // reports it as a successful repair. `absToAssetUrl` returns null for a path
@@ -5426,7 +5461,9 @@ async function describeUnresolvedAgainstLiveWorld(
       fs.copyFileSync(srcPath, destAbs);
       // Rescan heals a fresh GUID for the new file (scanner writeAssetGuid path).
       ctx.rebuildManifest();
-      const destUrl = ctx.absToAssetUrl(destAbs);
+      // `onDisk`: the manifest keys the copy by the disk's spelling, and `destFolder` may name its folder
+      // in another case — looked up lexically, a successful import 422'd as an unrecognized type (#1261).
+      const destUrl = ctx.absToAssetUrl(destAbs, { onDisk: true });
       const entry = destUrl ? ctx.getManifest().assets.find((a) => a.path === destUrl) : undefined;
       // The file copied, but the scanner registered NO manifest asset for it — an unrecognized
       // extension (detectType → null) that isn't an importable asset type. Returning ok:true with

@@ -356,7 +356,9 @@ function resolveLabel(label: string, within: string | undefined): CoreResolution
     const sharedId = new Set(many.map((c) => c.id)).size < many.length;
     return {
       error: `${asked} matches ${many.length} on-screen chrome elements: ${named}${more}. Narrow it with `
-        + '`within` (a CSS selector for the panel or dialog, e.g. \'[data-panel-scope="inspector"]\')'
+        + '`within` (a CSS selector for the panel or dialog, e.g. \'[data-panel-scope="inspector"]\', or '
+        + '\'[data-modal-shell="sprite-editor"]\' for a modal — a modal is portalled to <body>, so it is '
+        + 'NOT under its panel\'s data-panel-scope)'
         + (sharedId ? ' — some of these SHARE a data-ui-id, so a selector cannot separate them.' : ', or aim by selector at one of these data-ui-ids.'),
       code: 'AMBIGUOUS',
     };

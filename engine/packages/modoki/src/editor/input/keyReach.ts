@@ -42,7 +42,7 @@
  *  'game'` here) is exactly the shadowing this repo keeps paying for. */
 
 import { normalizeChord, resolve } from './keymap';
-import { isTextEditable, topOverlay } from './focusScope';
+import { isModalOpen, isTextEditable, topOverlay } from './focusScope';
 import { useEditorStore } from '../store/editorStore';
 import { isInputSuppressed } from '../../runtime/input/inputSources';
 import { isSimRunning } from '../../runtime/core/playState';
@@ -73,6 +73,10 @@ export interface KeyReach {
    *  scope warning (only there — it is noise on a press that worked), which is what lets a
    *  reader tell "wrong scope" from "wrong key spelling". */
   chord: string;
+  /** Is a modal dialog open (focusScope.isModalOpen)? Then no editor shortcut and no menu command
+   *  runs, and the game's input is gated too — `/api/input/key` says so, rather than answering a
+   *  press that did nothing with a bare ok (#1270). */
+  modalOpen: boolean;
 }
 
 /** Canonical chord for an `/api/input/key` payload (an Electron keyCode + modifier list),
@@ -93,11 +97,12 @@ export function probeKeyReach(key: string, modifiers?: readonly string[]): KeyRe
   const focusedPanel = useEditorStore.getState().focusedPanel;
   const chord = chordFromElectronKey(key, modifiers);
   if (BARE_MODIFIERS.has(key)) {
-    return { focusedPanel, editorBinding: null, gameInputSuppressed: isInputSuppressed(), simRunning: isSimRunning(), chord };
+    return { focusedPanel, editorBinding: null, gameInputSuppressed: isInputSuppressed(), simRunning: isSimRunning(), chord, modalOpen: isModalOpen() };
   }
   const binding = resolve(chord, {
     focusedPanel,
     overlay: topOverlay(),
+    modal: isModalOpen(),
     textEditable: isTextEditable(typeof document !== 'undefined' ? document.activeElement : null),
   });
   return {
@@ -106,5 +111,6 @@ export function probeKeyReach(key: string, modifiers?: readonly string[]): KeyRe
     gameInputSuppressed: isInputSuppressed(),
     simRunning: isSimRunning(),
     chord,
+    modalOpen: isModalOpen(),
   };
 }

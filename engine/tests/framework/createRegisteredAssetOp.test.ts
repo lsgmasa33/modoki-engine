@@ -50,8 +50,10 @@ beforeEach(() => {
   vi.stubGlobal('fetch', vi.fn(async (url: string, init?: { body?: string }) => {
     if (String(url).endsWith('/api/write-file')) {
       const b = JSON.parse(init?.body ?? '{}') as { path: string; content: string; ifNoneMatch?: string };
-      if (b.ifNoneMatch === '*' && onDisk.has(b.path)) {
-        return { ok: false, status: 409, json: async () => ({ ok: false, conflict: true, reason: 'if-none-match' }) } as unknown as Response;
+      // Matched case-insensitively and answered with the stored spelling, as APFS and the real route do (#1273).
+      const existing = [...onDisk.keys()].find((k) => k.toLowerCase() === b.path.toLowerCase());
+      if (b.ifNoneMatch === '*' && existing) {
+        return { ok: false, status: 409, json: async () => ({ ok: false, conflict: true, reason: 'if-none-match', existingPath: existing }) } as unknown as Response;
       }
       writes.push({ path: b.path, body: b.content, ...(b.ifNoneMatch ? { ifNoneMatch: b.ifNoneMatch } : {}) });
       return { ok: true, status: 200, json: async () => ({ ok: true }) } as unknown as Response;
@@ -234,6 +236,19 @@ describe('a human Replace keeps the replaced asset\'s guid (#1215, owner 2026-09
     expect((JSON.parse(writes[0].body) as { id: string }).id).toBe(OLD_GUID);
     // A replace must not carry the create-only precondition, or the human's confirmed Replace 409s.
     expect(writes[0].ifNoneMatch).toBeUndefined();
+  });
+
+  it('a CASE-VARIANT path replaces, returns and registers the file that is really there (#1273)', async () => {
+    const ON_DISK = '/assets/materials/Rock.mat.json';
+    registerAsset(OLD_GUID, ON_DISK, 'material');
+    onDisk.set(ON_DISK, `{"id":"${OLD_GUID}"}`);
+    const r = await createRegisteredAsset('material', '/assets/materials/rock.mat.json', { replace: true });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.path).toBe(ON_DISK);
+    expect(writes.map((w) => w.path)).toEqual([ON_DISK]);
+    expect(getGuidForPath('/assets/materials/rock.mat.json')).toBeUndefined();
+    expect(getGuidForPath(ON_DISK)).toBe(OLD_GUID);
   });
 
   it('a file the manifest has not indexed yet still gives up its on-disk id', async () => {

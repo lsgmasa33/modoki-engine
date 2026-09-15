@@ -5,6 +5,7 @@
  *  wrong in a way nothing visible reports (see `menuItemId`). */
 
 import type { BarMenuItem } from './components/MenuBar';
+import { isModalOpen } from './input/focusScope';
 
 /** A serializable menu item — no functions cross IPC, so an actionable item carries an `id` that
  *  is dispatched back and looked up in the action map. */
@@ -20,6 +21,9 @@ export interface MenuSpecItem {
 
 export interface MenuSpec {
   menus: { name: string; items: MenuSpecItem[] }[];
+  /** A modal dialog is open (#1270) — every item is greyed, and main names that as the cause when
+   *  `/api/menu` fires one. */
+  modal?: boolean;
 }
 
 const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
@@ -52,8 +56,13 @@ export function menuItemId(path: string, index: number, label: string): string {
  * than rendered, and a submenu PARENT's own action is registered but never dispatched from the OS
  * menu — Electron ignores a click on a parent. Anything that must stay reachable belongs inside
  * the submenu.
+ *
+ * `modal`: a modal dialog is open (#1270), so every item is shown DISABLED. The OS menu is outside
+ * the dialog's backdrop, and a greyed menu is the refusal a human can see before clicking; an agent's
+ * `/api/menu` then reads the same `enabled:false` and is refused by the main process. The action map
+ * is still built — `handleMenuAction` refuses the click that races the rebuild.
  */
-export function buildMenuSpec(menus: Record<string, BarMenuItem[]>): {
+export function buildMenuSpec(menus: Record<string, BarMenuItem[]>, opts?: { modal?: boolean }): {
   menuSpec: MenuSpec;
   menuActionMap: Record<string, () => void>;
 } {
@@ -64,12 +73,15 @@ export function buildMenuSpec(menus: Record<string, BarMenuItem[]>): {
       const id = menuItemId(path, i, it.label);
       if (it.action) menuActionMap[id] = it.action;
       return {
-        id, label: it.label, shortcut: it.shortcut, disabled: it.disabled, checked: it.checked,
+        id, label: it.label, shortcut: it.shortcut, disabled: opts?.modal ? true : it.disabled, checked: it.checked,
         ...(it.submenu && depth === 0 ? { submenu: toSpecItems(it.submenu, id, depth + 1) } : {}),
       };
     });
   return {
-    menuSpec: { menus: Object.entries(menus).map(([name, items]) => ({ name, items: toSpecItems(items, name) })) },
+    menuSpec: {
+      menus: Object.entries(menus).map(([name, items]) => ({ name, items: toSpecItems(items, name) })),
+      ...(opts?.modal ? { modal: true } : {}),
+    },
     menuActionMap,
   };
 }
@@ -112,7 +124,16 @@ export function resolveMenuAction(
     : { miss: 'That menu action was out of date — the menu had just been rebuilt. Try it again.' };
 }
 
-/** The whole outcome of a relayed menu click: run it, or tell the user it went stale.
+/** Shown when a relayed menu click arrives while a modal dialog is open (#1270). */
+export const MENU_REFUSED_UNDER_MODAL = 'Close the open dialog first — menu commands are unavailable while it is up.';
+
+/** The whole outcome of a relayed menu click: run it, refuse it under a modal, or tell the user it
+ *  went stale.
+ *
+ *  ⚠️ The modal refusal is read HERE, from the overlay stack, not from the menu's disabled state.
+ *  Greying the menu takes an IPC round-trip after the dialog opens, and a click inside that window —
+ *  an OS menu left open, or an accelerator, which under Electron IS this relay — would otherwise run
+ *  the command under the dialog: Edit ▸ Undo popping the entity a Replace prompt is about to write.
  *
  *  ⚠️ This exists because extracting only `resolveMenuAction` did not finish the job — the
  *  MESSAGE became testable while the thing that had actually been broken, showing it to the
@@ -123,7 +144,12 @@ export function handleMenuAction(
   actions: Readonly<Record<string, (() => void) | undefined>>,
   id: string,
   sinks: { showToast: (message: string, kind: 'warn') => void; warn: (message: string) => void },
-): 'ran' | 'missed' {
+): 'ran' | 'missed' | 'refused' {
+  if (isModalOpen()) {
+    sinks.warn(`[editor] refusing a menu click for "${id}" — a modal dialog is open`);
+    sinks.showToast(MENU_REFUSED_UNDER_MODAL, 'warn');
+    return 'refused';
+  }
   const outcome = resolveMenuAction(actions, id);
   if ('miss' in outcome) {
     sinks.warn(`[editor] ignoring a menu click for "${id}" — the action map no longer owns that id`);

@@ -22,7 +22,7 @@ import { setInputGate } from '../../src/runtime/input/inputSources';
 import { setPlayState } from '../../src/runtime/core/playState';
 
 const ctx = (over: Partial<ResolveContext> = {}): ResolveContext => ({
-  focusedPanel: null, overlay: null, textEditable: false, ...over,
+  focusedPanel: null, overlay: null, modal: false, textEditable: false, ...over,
 });
 
 beforeEach(() => { clearBindings(); });
@@ -134,6 +134,15 @@ describe('probeKeyReach', () => {
     expect(probeKeyReach('Escape').editorBinding).toBeNull();   // nothing open
     pushOverlay('sprite-editor');
     expect(probeKeyReach('Escape').editorBinding).toBe('modal.escape');
+  });
+
+  it('passes the MODAL into the context and reports it — a press under a dialog reaches nothing (#1270)', () => {
+    register({ id: 'gizmo.translate', keys: 'w', scope: 'scene', run: () => {} });
+    setScope('scene');
+    expect(probeKeyReach('w')).toMatchObject({ editorBinding: 'gizmo.translate', modalOpen: false });
+    pushOverlay('project-settings', { modal: true });
+    expect(probeKeyReach('w')).toMatchObject({ editorBinding: null, modalOpen: true });
+    expect(probeKeyReach('Shift').modalOpen).toBe(true);   // the bare-modifier early return reports it too
   });
 
   it('echoes the canonical chord it resolved against', () => {

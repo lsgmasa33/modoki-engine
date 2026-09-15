@@ -15,6 +15,7 @@
 import { describe, it, expect } from 'vitest';
 import path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
+import { findNodes, parseSource, ts } from '@modoki/engine/testing/sourceAst';
 
 const SRC = path.resolve(__dirname, '../../packages/modoki/src/editor');
 
@@ -34,12 +35,25 @@ const MAY_DISMISS = [
 
 const read = (rel: string) => readScannedSource(path.join(SRC, rel)).code;
 
-/** The backdrop is the JSX element carrying the full-screen overlay style; a dismiss wires its
- *  onClick straight to the close callback. Scans whole opening tags so ATTRIBUTE ORDER does not
- *  matter — `SpritePicker` writes `onClick` before `style`, and an order-sensitive regex read
- *  that as "does not dismiss", i.e. as a pass. Covers both the shared `style={overlay}` form and
- *  the inline `position:'fixed', inset:0` form the layout prompts use. */
+/** Does this source wire a backdrop dismiss? Two shapes:
+ *
+ *  - a `<ModalShell … onDismiss={…}>` — every full-screen modal since #1270 draws its backdrop through
+ *    the shell (`modalShellCoverage.test.ts`), so its dismiss is that one prop. Read from the PARSE,
+ *    not a regex over the tag: an `onDismiss={() => a > b && close()}` puts a `>` inside the tag, which
+ *    is where a `<[^>]*>` scan stops reading.
+ *  - a plain `<div>` click-catcher wired to the close callback — the popover pickers (`SpritePicker`),
+ *    which are not modals and keep their own transparent backdrop. Scans whole opening tags so
+ *    ATTRIBUTE ORDER does not matter: `SpritePicker` writes `onClick` before `style`, and an
+ *    order-sensitive regex read that as "does not dismiss", i.e. as a pass. */
 function backdropDismisses(src: string): boolean {
+  // Parsed only when there is a shell to find: the `<div>` samples below are tag fragments, not a file.
+  const sf = src.includes('ModalShell') ? parseSource(src, 'modal.tsx') : null;
+  const shells = !sf ? [] : findNodes(sf, (n): n is ts.JsxOpeningElement | ts.JsxSelfClosingElement =>
+    (ts.isJsxOpeningElement(n) || ts.isJsxSelfClosingElement(n)) && n.tagName.getText(sf!) === 'ModalShell');
+  for (const shell of shells) {
+    const prop = shell.attributes.properties.find((a) => ts.isJsxAttribute(a) && a.name.getText(sf!) === 'onDismiss');
+    if (prop) return true;
+  }
   for (const tag of src.match(/<div[^>]*>/g) ?? []) {
     const isBackdrop = tag.includes('style={overlay}') || /inset: 0/.test(tag);
     if (isBackdrop && /onClick=\{on(Close|Cancel)\}/.test(tag)) return true;
@@ -73,5 +87,8 @@ describe('editor modal dismiss scope', () => {
     expect(backdropDismisses('<div style={overlay} onClick={onClose}>')).toBe(true);
     expect(backdropDismisses('<div onClick={onClose} style={overlay}>')).toBe(true);  // order-independent
     expect(backdropDismisses('<div style={overlay}>')).toBe(false);
+    expect(backdropDismisses('const a = <ModalShell kind="x" onDismiss={onClose}><b /></ModalShell>;')).toBe(true);
+    expect(backdropDismisses('const a = <ModalShell kind="x" onDismiss={() => n > 0 && close()}><b /></ModalShell>;')).toBe(true);
+    expect(backdropDismisses('const a = <ModalShell kind="x"><b /></ModalShell>;')).toBe(false);
   });
 });

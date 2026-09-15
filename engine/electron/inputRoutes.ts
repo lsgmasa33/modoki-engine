@@ -35,6 +35,7 @@ import {
   EDITOR_INPUT_MODIFIERS, MOUSE_BUTTONS, POINTER_ACTIONS, normalizeKeyName, refuseUnknownKey,
   refuseUnknownValue, refuseUnknownValues, type VocabularyRefusal,
 } from '../tools/shared/inputVocabulary';
+import { modalKeyWarning } from './modalRefusal';
 
 /** The trusted-input primitives, pre-bound to the live window by the caller. */
 export interface InputOps {
@@ -463,7 +464,7 @@ export function createInputRoutes(deps: InputRouteDeps) {
   /** What `probe-key-reach` answers (editor/input/keyReach.ts). Loosely typed on purpose:
    *  it crosses the renderer relay as JSON, and an editor build predating the op replies
    *  with something else entirely — every field is therefore optional and unchecked here. */
-  type KeyReachReply = { focusedPanel?: string | null; editorBinding?: string | null; gameInputSuppressed?: boolean; simRunning?: boolean; chord?: string } | null;
+  type KeyReachReply = { focusedPanel?: string | null; editorBinding?: string | null; gameInputSuppressed?: boolean; simRunning?: boolean; chord?: string; modalOpen?: boolean } | null;
 
   /** Move the editor's KEYBOARD SCOPE to `panel`, or explain why it could not (#301).
    *
@@ -938,7 +939,11 @@ export function createInputRoutes(deps: InputRouteDeps) {
       // element-level onKeyDown (a text input, the Add-Component picker), which fires while
       // that element holds DOM focus. `activeElement` in this same response is that half of
       // the answer. So: "did not reach the running game" yes, "did nothing at all" no.
-      const scopeBlocked = !!(reach?.simRunning && reach.gameInputSuppressed && !reach.editorBinding);
+      // A modal explains a dead press on its own — and outranks the scope warning, whose remedy
+      // (pass panel:"game") would not help while the dialog is up (#1270).
+      const modalWarning = modalKeyWarning(reach);
+      if (modalWarning) warnings.push(modalWarning);
+      const scopeBlocked = !modalWarning && !!(reach?.simRunning && reach.gameInputSuppressed && !reach.editorBinding);
       if (scopeBlocked) {
         warnings.push(`the editor keyboard scope is ${JSON.stringify(reach!.focusedPanel ?? null)}, so the input gate blocked this key from the RUNNING GAME — it moved nothing there. Pass panel:"game" if you meant to drive the game. A bare modoki_focus {} does NOT do this: it clears DOM focus only, and the keyboard scope is separate state. (Editor shortcuts scoped to that panel are unaffected and may still have fired.)`);
       }
@@ -956,7 +961,9 @@ export function createInputRoutes(deps: InputRouteDeps) {
         // warning says a key reached nothing, and `chord` is how you tell "the scope was
         // wrong" from "I spelled the key wrong" (`{key:'UpArro'}` canonicalizes to `uparro`,
         // matches nothing, and dispatches a DOM event no sampler recognizes).
-        ...(scopeBlocked && reach?.chord ? { chord: reach.chord } : {}),
+        // …and with the MODAL warning for the same reason: it too says a key reached nothing, and
+        // "the dialog ate it" must not be the only reading offered for a misspelled key.
+        ...((scopeBlocked || modalWarning) && reach?.chord ? { chord: reach.chord } : {}),
         ...(warnings.length ? { warning: warnings.join(' ') } : {}),
       });
     }

@@ -65,9 +65,11 @@ beforeEach(() => {
     const u = String(url);
     if (u.endsWith('/api/write-file')) {
       const b = JSON.parse(init?.body ?? '{}') as { path: string; content: string; ifNoneMatch?: string };
-      if (b.ifNoneMatch === '*' && onDisk.has(b.path)) return { ok: false, status: 409, json: async () => ({}) } as unknown as Response;
+      // Matched case-insensitively and answered with the stored spelling, as APFS and the real route do (#1273).
+      const existing = [...onDisk.keys()].find((k) => k.toLowerCase() === b.path.toLowerCase());
+      if (b.ifNoneMatch === '*' && existing) return { ok: false, status: 409, json: async () => ({ existingPath: existing }) } as unknown as Response;
       writes.push({ path: b.path, content: b.content, createOnly: b.ifNoneMatch === '*' });
-      onDisk.set(b.path, b.content);
+      onDisk.set(existing ?? b.path, b.content);
       return { ok: true, status: 200, json: async () => ({ ok: true }) } as unknown as Response;
     }
     const served = [...onDisk.entries()].find(([p]) => u.endsWith(p));
@@ -77,7 +79,12 @@ beforeEach(() => {
 });
 // The manifest is a module global: a guid one test registered for TARGET would otherwise be "the replaced
 // scene's id" in the next.
-afterEach(() => { vi.unstubAllGlobals(); for (let g = getGuidForPath(TARGET); g; g = getGuidForPath(TARGET)) unregisterAsset(g); });
+afterEach(() => {
+  vi.unstubAllGlobals();
+  for (const p of [TARGET, ON_DISK]) for (let g = getGuidForPath(p); g; g = getGuidForPath(p)) unregisterAsset(g);
+});
+/** An existing scene whose name differs from TARGET by case alone. */
+const ON_DISK = '/assets/scenes/Level.json';
 
 const idOf = (text: string) => (JSON.parse(text) as { id: string }).id;
 
@@ -109,6 +116,19 @@ describe('Save Scene As', () => {
     expect(asked, 'refused before any question').toEqual([]);
     expect(writes).toEqual([]);
     expect(getGuidForPath(TARGET)).toBe(OLD);
+  });
+
+  it('a Replace over a CASE-VARIANT name saves, registers and remembers the file that is really there (#1273)', async () => {
+    // Registering the typed spelling would give the manifest a second key for one file, and the
+    // remembered scene path is what every later Cmd+S writes to.
+    onDisk.set(ON_DISK, `{"id":"${OLD}","entities":[]}\n`);
+    const r = await saveScene();
+    expect(r).toMatchObject({ saved: true, path: ON_DISK });
+    expect(asked).toEqual([ON_DISK]);
+    expect(writes.map((w) => w.path)).toEqual([ON_DISK]);
+    expect(getGuidForPath(ON_DISK)).toBe(OLD);
+    expect(getGuidForPath(TARGET)).toBeUndefined();
+    expect(getCurrentScenePath()).toBe(ON_DISK);
   });
 
   it('a Replace keeps the replaced scene\'s id — and the NEXT save still writes it', async () => {

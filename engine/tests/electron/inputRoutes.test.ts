@@ -24,7 +24,7 @@ let leaseCalls: { open?: boolean; id?: number }[];
 /** What the fake `probe-key-reach` answers. Default = the open world (no panel owns the
  *  keyboard, so the gate lets input through); a test that needs the QA-PHYS-0003 world
  *  reassigns it before posting. */
-let keyReach: { focusedPanel: string | null; editorBinding: string | null; gameInputSuppressed: boolean; simRunning: boolean };
+let keyReach: { focusedPanel: string | null; editorBinding: string | null; gameInputSuppressed: boolean; simRunning: boolean; modalOpen?: boolean };
 /** Which panels the fake renderer reports as having an open tab. `set-focus-scope` refuses
  *  anything outside this list, exactly as the real op does (#301). Case-sensitive on purpose:
  *  a miscased id is the failure that motivated the guard. */
@@ -1420,6 +1420,25 @@ describe('press_key: warning when the press reached NOTHING', () => {
     keyReach = { focusedPanel: 'game', editorBinding: null, gameInputSuppressed: false, simRunning: true };
     const r = await post('/api/input/key', { key: 'd' }) as { body: Record<string, unknown> };
     expect(r.body).not.toHaveProperty('chord');
+  });
+
+  /** A modal dialog is open (#1270): the keymap yields every editor scope and the input gate is shut,
+   *  so the press reached nothing — and the old answer for that was a bare `ok:true`. */
+  it('names an open MODAL as the cause, and still echoes the chord so a misspelling stays visible', async () => {
+    keyReach = { focusedPanel: 'scene', editorBinding: null, gameInputSuppressed: true, simRunning: true, modalOpen: true };
+    const r = await post('/api/input/key', { key: 'w' }) as { body: { warning?: string; chord?: string } };
+    expect(r.body.warning).toMatch(/modal dialog is open/);
+    // Without the chord, `{key:'UpArro'}` under a dialog reads as "the dialog ate it" and the caller
+    // closes the dialog, presses again, and still has no idea the key name was wrong.
+    expect(r.body.chord).toBe('w');
+    // The scope warning would send them to `panel:"game"`, which fixes nothing while the dialog is up.
+    expect(r.body.warning).not.toMatch(/panel:"game"/);
+  });
+
+  it('says nothing about a modal when none is open', async () => {
+    keyReach = { focusedPanel: 'game', editorBinding: null, gameInputSuppressed: false, simRunning: true };
+    const r = await post('/api/input/key', { key: 'd' }) as { body: { warning?: string } };
+    expect(r.body.warning ?? '').not.toMatch(/modal/);
   });
 
   it('claims only what the GATE proves — never that the press did nothing at all', async () => {

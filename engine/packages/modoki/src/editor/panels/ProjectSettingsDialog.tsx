@@ -24,6 +24,7 @@ import { parseStringList, stringListText } from './stringListText';
 import { Info } from './fields';
 import { fileToBase64 } from './fileBytes';
 import { backendFetch, backendPostJson } from '../backend/editorBackend';
+import { ModalShell } from '../components/ModalShell';
 
 type Values = Record<string, unknown>;
 
@@ -506,11 +507,9 @@ export default function ProjectSettingsDialog() {
   const configWarnings = (draft?.configWarnings ?? []) as { path: string; message: string }[];
 
   return (
-    // Close ONLY when the press STARTS on the scrim itself. Using onMouseDown +
-    // target===currentTarget means a text drag-select that starts inside an input
-    // and releases over the scrim no longer closes the dialog (the old onClick bug).
-    <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-      onMouseDown={(e) => { if (e.target === e.currentTarget) close(); }}>
+    // A drag-select that starts in a field and is released over the scrim does not close it —
+    // the shell's dismiss rule (components/modalBackdrop.ts), which started here.
+    <ModalShell kind="project-settings" onDismiss={close}>
       <div style={{
         background: '#1e1e30', border: '1px solid #555', borderRadius: 6,
         // 940, not the old 540: the Graphics tab's quality-tier MATRIX is four columns wide
@@ -628,6 +627,6 @@ export default function ProjectSettingsDialog() {
           </button>
         </div>
       </div>
-    </div>
+    </ModalShell>
   );
 }

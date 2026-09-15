@@ -257,6 +257,7 @@ import { createInputRoutes, inputDeliverabilityResult, hiddenWindowRefusal } fro
 import { reportFatalStartup } from './fatalDialog';
 import { showMessageBox, resolveDialogParent } from './mainDialog';
 import { serializeMenu, triggerMenuItem, type MenuItemLike } from './menuActions';
+import { explainMenuRefusal, MODAL_CAUSE } from './modalRefusal';
 import { getSsrLoadModule, closeSsrLoader } from './ssrLoader';
 import { buildProdCsp, PROD_CSP_ORIGINS } from './csp';
 import { startDevServer, stopDevServer, findFreePort, reclaimLeakedDevServer, devServerRoot } from './devServer';
@@ -1578,7 +1579,7 @@ app.whenReady().then(async () => {
     get projectRoot() { return state.root; },
     editorRoot: REPO_ROOT, // serve the editor's own Basis transcoder to flat projects
     resolveAssetPath: (p) => state.backend.resolveAssetPath(p),
-    absToAssetUrl: (p) => state.backend.absToAssetUrl(p),
+    absToAssetUrl: (p, opts) => state.backend.absToAssetUrl(p, opts),
     firstRootDir: () => state.backend.firstRootDir(),
     getManifest: () => state.backend.getManifest(),
     rebuildManifest: () => state.backend.rebuildManifest(),
@@ -1772,7 +1773,9 @@ app.whenReady().then(async () => {
       const b = (body ?? {}) as { list?: boolean; path?: string; id?: string };
       const wantList = method === 'GET' || b.list === true || (!b.path && !b.id);
       if (wantList) {
-        return { kind: 'json', body: { menu: items ? serializeMenu(items) : [] } };
+        // Listing is what an agent does BEFORE it clicks, so it says why every item reads
+        // `enabled:false` rather than leaving the reason to the refusal (#1270).
+        return { kind: 'json', body: { menu: items ? serializeMenu(items) : [], ...(rendererMenuSpec?.modal ? { modalOpen: true, modalNote: MODAL_CAUSE } : {}) } };
       }
       // Pass the focused window + the editor's webContents so NATIVE role items (reload/copy/
       // toggleDevTools/…) actually execute rather than no-op while reporting ok:true. Fall back to
@@ -1794,7 +1797,8 @@ app.whenReady().then(async () => {
         leaseId = lease?.id;
       } catch { /* no renderer / older build — fire anyway, unattributed */ }
       try {
-        const res = triggerMenuItem(items, { path: b.path, id: b.id }, { window: ctxWindow, webContents: mainWindow?.webContents });
+        // A greyed item under an open modal says WHY it is greyed (#1270).
+        const res = explainMenuRefusal(triggerMenuItem(items, { path: b.path, id: b.id }, { window: ctxWindow, webContents: mainWindow?.webContents }), rendererMenuSpec?.modal === true);
         return { kind: 'json', status: res.ok ? undefined : (res.available ? 404 : 400), body: res };
       } finally {
         if (leaseId !== undefined) {

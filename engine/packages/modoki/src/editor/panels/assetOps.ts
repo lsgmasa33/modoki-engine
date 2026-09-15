@@ -441,9 +441,11 @@ export interface CreatePrefabResult {
 
 export async function createPrefabFromEntity(
   entityId: number,
-  savePath: string,
+  /** Where to write. Over an existing file of another casing the prefab lands on THAT file's on-disk
+   *  spelling (#1273), which is what the result's `savePath` reports. */
+  requestedPath: string,
   label: string,
-  /** Asked when `savePath` already holds a file (#1264). Both callers DERIVE the path from the
+  /** Asked when `requestedPath` already holds a file (#1264). Both callers DERIVE the path from the
    *  entity's name, so a second entity called "Enemy" used to replace the first Enemy prefab under a
    *  fresh guid — every placed instance of it unlinked — and this function's own undo then TRASHED
    *  the path, taking the original prefab with it. A yes replaces the content and KEEPS the prefab's
@@ -452,8 +454,8 @@ export async function createPrefabFromEntity(
 ): Promise<CreatePrefabResult | 'declined' | null> {
   const draft = serializePrefab(entityId);
   if (!draft) return null;
-  warnInertPrefabSizes(draft, savePath);
-  const written = await writeNewAssetDocument(savePath, (guid, kept) => {
+  warnInertPrefabSizes(draft, requestedPath);
+  const written = await writeNewAssetDocument(requestedPath, (guid, kept) => {
     // ⚠️ A Replace keeps the replaced prefab's id, and `serializePrefab`'s cycle guard only runs
     // for an `existingId` — which the draft had none of. So check it here: an entity holding an
     // instance of the very prefab it is replacing would otherwise write a prefab that contains
@@ -461,7 +463,7 @@ export async function createPrefabFromEntity(
     if (kept) {
       const cyclic = draft.entities.find((e) => e.prefab && wouldCreateCycle(guid, e.prefab));
       if (cyclic) {
-        console.error(`[Prefab] refusing to replace ${savePath} — it would nest "${cyclic.prefab}" inside itself`);
+        console.error(`[Prefab] refusing to replace ${requestedPath} — it would nest "${cyclic.prefab}" inside itself`);
         return null;
       }
     }
@@ -469,6 +471,9 @@ export async function createPrefabFromEntity(
   }, { confirmReplace, keepPrevious: true, guid: draft.id });
   if (written.outcome === 'declined') return 'declined';
   if (written.outcome !== 'created' && written.outcome !== 'replaced') return null;
+  // The path the prefab really landed on — the existing file's on-disk spelling after a Replace
+  // (#1273). Registration, the instance tags and both undo directions all key on it.
+  const savePath = written.path;
   const prefab: PrefabFile = { ...draft, id: written.guid };
   const content = jsonFileBody(prefab);
   const previousContent = written.outcome === 'replaced' ? written.previousContent : null;

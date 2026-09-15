@@ -663,10 +663,11 @@ export default function SkinEditor() {
   const newRig = useCallback(async () => {
     const pick = await chooseNewAssetPath({ defaultName: 'New Rig.rig2d.json', ext: '.rig2d.json', prompt: 'Create Rig2D' });
     if (!pick) return;
-    const { path } = pick;
     // Create-only, asking before a Replace, which keeps the replaced rig's guid (#1264).
-    const r = await writeNewAssetDocument(path, (guid) => jsonFileBody({ id: guid, ...defaultRig2DFile() } satisfies Rig2DFile), { confirmReplace: pick.confirmReplace });
+    const r = await writeNewAssetDocument(pick.path, (guid) => jsonFileBody({ id: guid, ...defaultRig2DFile() } satisfies Rig2DFile), { confirmReplace: pick.confirmReplace });
     if (r.outcome !== 'created' && r.outcome !== 'replaced') return;
+    // `r.path`: a Replace lands on the existing file's on-disk spelling (#1273).
+    const { path } = r;
     registerAsset(r.guid, path, 'rig2d');
     const name = (path.split('/').pop() || 'Rig').replace(/\.rig2d\.json$/i, '');
     useEditorStore.getState().openSkinEditor({ path, type: 'rig2d', name });
@@ -704,9 +705,10 @@ export default function SkinEditor() {
     // would flush the old rig straight back over the regenerated one.
     const r = await writeNewAssetDocument(rigPath, (rigGuid) => jsonFileBody(autoRig2D({ id: rigGuid, sprite: guid, width: dims.width, height: dims.height, isInside })), { confirmReplace: confirmReplaceAsset });
     if (r.outcome !== 'created' && r.outcome !== 'replaced') return;
-    registerAsset(r.guid, rigPath, 'rig2d');
-    const name = (rigPath.split('/').pop() || 'Rig').replace(/\.rig2d\.json$/i, '');
-    useEditorStore.getState().openSkinEditor({ path: rigPath, type: 'rig2d', name });
+    // `r.path`, not `rigPath`: a Replace lands on the existing file's on-disk spelling (#1273).
+    registerAsset(r.guid, r.path, 'rig2d');
+    const name = (r.path.split('/').pop() || 'Rig').replace(/\.rig2d\.json$/i, '');
+    useEditorStore.getState().openSkinEditor({ path: r.path, type: 'rig2d', name });
   }, [trimAlpha, alphaThreshold]);
 
   // Generate a reusable .prefab.json (SkinnedSprite2D + Bone2D chain referencing this

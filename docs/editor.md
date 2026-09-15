@@ -335,20 +335,25 @@ different fixes, and the second sends you to check a cable that was never the pr
 
 - **A second concurrent build is refused — here, in front of the server's own slot.** `/api/build`
   does take a slot (#173's in-process one, plus #650's cross-process claim), but it refuses *after*
-  the request is in flight, as a `FAILED:` build status: `runBuild` fires an SSE request per call,
-  and a native OS menu is not covered by the DOM progress modal — so the modal only *looks* like it
-  is holding the door. This refusal keeps the second build from ever being sent. Before every device row was a build this took a
+  the request is in flight, as a `FAILED:` build status: `runBuild` fires an SSE request per call.
+  This refusal keeps the second build from ever being sent. ⚠️ Since #1270 the progress dialog is a
+  modal that greys the whole menu while it is up, so from the menu this refusal is no longer
+  reachable — the menu refuses first. It stays as the guard for a caller that is not the menu. Before every device row was a build this took a
   deliberate second trip through the menu; now "wrong phone — click the right one" is the natural
   gesture, and it would put two `xcodebuild`/gradle pipelines on one project dir, both reporting
-  into the single shared `buildStatus`. A build that already FAILED does not count as running: its
-  modal is merely still up, and refusing there would make "dismiss a dialog" a prerequisite for
-  retrying.
+  into the single shared `buildStatus`. A build that already FAILED does not count as running here.
+  ⚠️ Its progress dialog is a modal, though, and a modal greys the whole menu until it is closed
+  (#1270, [editor-input.md](./editor-input.md#modals-block-the-editor-underneath-them-1270)), so a
+  retry from the menu takes one click on Close first.
 - **A pick is refused while Project Settings is open.** `user.device.*` has two writers, and they
   write differently: this menu sends a partial patch, while the dialog snapshots the whole config
   when it OPENS and posts that snapshot on Save. So a pick made while it sits open is silently
   written back to the old device — even when the user only meant to edit the app name — and the
   menu then re-reads disk and quietly agrees with the stale value. A lost update nobody is told
-  about is worse than a refusal naming the reason.
+  about is worse than a refusal naming the reason. ⚠️ Since #1270 Project Settings is a modal and
+  the menu is greyed under it, so the menu refuses first, with the generic "close the open dialog"
+  message rather than this one's specific reason; this refusal stays as the guard for a caller that
+  is not the menu.
 
 The pure row-building and both refusals are `engine/app/editor/buildTargetMenu.ts` (unit-tested
 without a phone); the fetching, the patch POST and a generation guard against out-of-order

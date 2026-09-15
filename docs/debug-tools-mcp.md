@@ -2289,7 +2289,11 @@ Canvas2D/SVG editor, exercise a gesture, open a modal). All are Electron-editor 
     `modoki_handles {editor:'chrome'}` lists, counting only ON-WINDOW matches.
   - **Refusals.** No match refuses `NOT_FOUND`, suggesting labels that contain the text. Two or
     more matches refuse `AMBIGUOUS`, naming each id; narrow with `within:'[data-panel-scope="assets"]'`,
-    since every panel's content sits under `data-panel-scope="<component>"`. Label together with
+    since every panel's content sits under `data-panel-scope="<component>"`. ⚠️ **A MODAL dialog does
+    not** — since #1270 every full-screen dialog is portalled to `<body>`, so the Sprite/9-slice
+    editors and the animation pickers are NOT under the panel that opened them. Narrow those with
+    `within:'[data-modal-shell="<kind>"]'` (`sprite-editor`, `nine-slice-editor`, `project-settings`,
+    …), which is the attribute the shell puts on every backdrop. Label together with
     `selector` or `entity` also refuses `AMBIGUOUS`.
   - **Limits.**
     - An untagged element has no label to aim at — tag it.

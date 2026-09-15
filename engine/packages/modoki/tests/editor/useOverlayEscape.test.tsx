@@ -15,7 +15,7 @@ const { useOverlayEscape, useOverlay } = await import('../../src/editor/input/us
 const { topOverlay, overlayDepth, clearOverlays } = await import('../../src/editor/input/focusScope');
 const { resolve, clearBindings, getBindings } = await import('../../src/editor/input/keymap');
 
-const ctxAt = (overlay: string | null) => ({ focusedPanel: null, overlay, textEditable: false });
+const ctxAt = (overlay: string | null) => ({ focusedPanel: null, overlay, modal: false, textEditable: false });
 
 beforeEach(() => { clearOverlays(); clearBindings(); });
 

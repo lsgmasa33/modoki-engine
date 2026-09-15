@@ -69,8 +69,8 @@ async function runGameHook(gameId: string, phase: string, hook?: () => unknown):
 /** Trigger a build + deploy via the dev server's SSE endpoint */
 async function runBuild(platform: 'ios' | 'android' | 'web' | 'playable', variant: 'debug' | 'release' = 'debug') {
   // Refuse a SECOND concurrent build (see `buildRefusal` for what two at once actually do to the
-  // project dir). The DOM progress modal does not gate this: under Electron the build items live
-  // in the native application menu, which a modal cannot cover.
+  // project dir). Since #1270 the progress dialog is a modal and greys the whole menu, so the menu
+  // refuses first; this stays as the guard for any caller that is not the menu.
   const refusal = buildRefusal(useEditorStore.getState().buildStatus);
   if (refusal) { useEditorStore.getState().showToast(refusal, 'warn'); return; }
   // Tool gate: if a native build's required tools aren't installed, OPEN Build Support
@@ -145,7 +145,9 @@ async function refreshDeviceTargets(): Promise<void> {
 async function pickDeviceTarget(patch: DeviceTargetPatch, andBuild?: 'ios' | 'android'): Promise<void> {
   const { showToast } = useEditorStore.getState();
   // Refuse while Project Settings is open — see `pickRefusal`: that dialog would write back the
-  // device it snapshotted when it opened, silently undoing this pick on its next Save.
+  // device it snapshotted when it opened, silently undoing this pick on its next Save. Since #1270
+  // that dialog is a modal and the menu is greyed under it, so the menu refuses first; this stays
+  // as the guard for any caller that is not the menu.
   const refusal = pickRefusal(useEditorStore.getState().projectSettingsOpen);
   if (refusal) { showToast(refusal, 'warn'); return; }
   try {

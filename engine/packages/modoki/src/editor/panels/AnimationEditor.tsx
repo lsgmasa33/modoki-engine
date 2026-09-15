@@ -1098,11 +1098,12 @@ export default function AnimationEditor() {
   const newClip = useCallback(async () => {
     const pick = await chooseNewAssetPath({ defaultName: 'New Animation.anim.json', ext: '.anim.json', prompt: 'Create Animation Clip' });
     if (!pick) return;
-    const { path } = pick;
-    const name = (path.split('/').pop() || 'Clip').replace(/\.anim\.json$/i, '');
+    const name = (pick.path.split('/').pop() || 'Clip').replace(/\.anim\.json$/i, '');
     // Create-only, asking before a Replace, which keeps the replaced clip's guid (#1264).
-    const r = await writeNewAssetDocument(path, (guid) => jsonFileBody(defaultAnimationClip(guid, name)), { confirmReplace: pick.confirmReplace });
+    const r = await writeNewAssetDocument(pick.path, (guid) => jsonFileBody(defaultAnimationClip(guid, name)), { confirmReplace: pick.confirmReplace });
     if (r.outcome !== 'created' && r.outcome !== 'replaced') return;
+    // `r.path`: a Replace lands on the existing file's on-disk spelling (#1273).
+    const { path } = r;
     registerAsset(r.guid, path, 'animation');
     const sel = useEditorStore.getState().selectedEntityId;
     const animMeta = getTraitByName('Animator');

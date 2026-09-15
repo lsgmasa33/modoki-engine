@@ -59,16 +59,30 @@ export function isTextEditable(el: Element | null | undefined): boolean {
 // DevicePicker, SpritePicker) — none stops propagation, so one Escape closes every
 // open overlay at once. A stack gives Escape a single, top-most owner. Nested
 // submenus push their own entry, so closing is innermost-first.
+//
+// An entry is a POPOVER or a MODAL (#1270). A popover owns only the chords it binds and leaves
+// every other chord to the editor underneath. A modal blocks the editor underneath outright: while
+// one is ANYWHERE on the stack, `resolve()` makes every non-overlay scope ineligible and the relayed
+// menu refuses. Anywhere, not only on top, because a picker or context menu can open over a modal
+// and closing that popover must not be what lets ⌘Z reach the scene.
 
-const stack: string[] = [];
+import { notifyListeners } from '../../runtime/core/notifyListeners';
+
+interface OverlayEntry { id: string; modal: boolean }
+
+const stack: OverlayEntry[] = [];
+const listeners = new Set<() => void>();
+// Isolated per listener: a throwing subscriber must not starve the menu's, or abort the push/pop it follows.
+const notify = () => notifyListeners(listeners, 'focusScope:overlays', []);
 
 /** Push an overlay and get its disposer. Call on open; the disposer on close.
  *  Idempotent per id: re-pushing an already-open id moves it to the top rather than
  *  duplicating it, so a re-render can't corrupt the stack. */
-export function pushOverlay(id: string): () => void {
-  const existing = stack.indexOf(id);
+export function pushOverlay(id: string, opts?: { modal?: boolean }): () => void {
+  const existing = stack.findIndex((e) => e.id === id);
   if (existing >= 0) stack.splice(existing, 1);
-  stack.push(id);
+  stack.push({ id, modal: opts?.modal === true });
+  notify();
   return () => popOverlay(id);
 }
 
@@ -76,15 +90,31 @@ export function pushOverlay(id: string): () => void {
  *  picker closing while its parent menu stays open), and blindly popping the top
  *  would evict the wrong one. */
 export function popOverlay(id: string): void {
-  const i = stack.lastIndexOf(id);
-  if (i >= 0) stack.splice(i, 1);
+  for (let i = stack.length - 1; i >= 0; i--) {
+    if (stack[i].id !== id) continue;
+    stack.splice(i, 1);
+    notify();
+    return;
+  }
 }
 
 /** The overlay that currently owns input, or null. */
 export function topOverlay(): string | null {
-  return stack.length ? stack[stack.length - 1] : null;
+  return stack.length ? stack[stack.length - 1].id : null;
+}
+
+/** Is a modal open anywhere on the stack — i.e. is the editor underneath it blocked? */
+export function isModalOpen(): boolean {
+  return stack.some((e) => e.modal);
+}
+
+/** Hear every push and pop. The shape `useSyncExternalStore` takes, which is how the menu learns to
+ *  grey itself out while a modal is up. */
+export function subscribeOverlays(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => { listeners.delete(listener); };
 }
 
 export function overlayDepth(): number { return stack.length; }
 /** Test/teardown hook. */
-export function clearOverlays(): void { stack.length = 0; }
+export function clearOverlays(): void { stack.length = 0; notify(); }

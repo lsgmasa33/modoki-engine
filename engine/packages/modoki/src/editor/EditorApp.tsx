@@ -92,6 +92,9 @@ function resetLayout() {
 
 import MenuBar, { type BarMenuItem } from './components/MenuBar';
 import { buildMenuSpec, handleMenuAction } from './menuSpec';
+import { isModalOpen, subscribeOverlays } from './input/focusScope';
+import { suppressesGameInput } from './input/gameInputGate';
+import { ModalShell } from './components/ModalShell';
 
 // ── Main Editor ─────────────────────────────────────────
 
@@ -350,16 +353,10 @@ export default function EditorApp() {
     // WASD in the Hierarchy latches the character's movement keys, and a gamepad drives
     // the game while you edit the Inspector (gamepadSource polls with no guard at all).
     //
-    // The policy lives HERE, in the editor. The mechanism lives in the runtime's source
-    // registry, because keyboardSource ships inside every game and must never know what
-    // a "panel" is. A shipped game never installs a gate.
-    //
-    // null focus (nothing engaged yet) deliberately does NOT suppress: pressing Play and
-    // immediately using WASD has to work without first clicking the GameView.
-    setInputGate(() => {
-      const p = useEditorStore.getState().focusedPanel;
-      return p !== null && p !== 'game';
-    });
+    // The policy lives HERE, in the editor — in `input/gameInputGate.ts`, where it is tested. The
+    // mechanism lives in the runtime's source registry, because keyboardSource ships inside every
+    // game and must never know what a "panel" is. A shipped game never installs a gate.
+    setInputGate(() => suppressesGameInput(useEditorStore.getState().focusedPanel, isModalOpen()));
     // The gate above decides what the game READS each frame; it cannot stop a press on a panel from
     // being LATCHED and pointer-captured by the game at press time, before any frame samples. This
     // scope does that: only a press inside the Game panel's play area starts a game gesture (#1182).
@@ -643,6 +640,8 @@ export default function EditorApp() {
   // async listing that must not block editor start. Bump → rebuild the tree AND re-push the
   // Electron spec, or the OS menu keeps the boot-time labels forever.
   const extraMenusVersion = useSyncExternalStore(subscribeExtraMenus, getExtraMenusVersion, getExtraMenusVersion);
+  // A modal dialog greys the whole OS menu while it is up (#1270) — see buildMenuSpec's `modal`.
+  const modalOpen = useSyncExternalStore(subscribeOverlays, isModalOpen, isModalOpen);
 
   // Build the menu tree + its serializable Electron spec ONCE per relevant input
   // change (layout name, undo/redo state) instead of on every render. Recomputing
@@ -710,9 +709,9 @@ export default function EditorApp() {
     // Spec + action map are built together by `menuSpec.ts` — they must agree on ids, and the id
     // scheme is load-bearing enough to be unit-tested (see `menuItemId` for why an id carries its
     // label, not just its position).
-    const { menuSpec, menuActionMap } = buildMenuSpec(menus);
+    const { menuSpec, menuActionMap } = buildMenuSpec(menus, { modal: modalOpen });
     return { menus, menuSpecJson: JSON.stringify(menuSpec), menuActionMap };
-  }, [layoutName, undoVersion, extraMenusVersion, runMode, handleSaveLayout, handleSaveLayoutAs, showPanel, isPanelVisible, layoutVersion]);
+  }, [layoutName, undoVersion, extraMenusVersion, runMode, handleSaveLayout, handleSaveLayoutAs, showPanel, isPanelVisible, layoutVersion, modalOpen]);
 
   // Keep the click-relay's action map current with the latest memoized spec.
   menuActionRef.current = menuActionMap;
@@ -840,7 +839,7 @@ function SaveLayoutAsModal({ initial, onSave, onExport, onClose }: { initial: st
   const commit = () => { const n = name.trim(); if (n) onSave(n); };
   const exportToFile = () => { const n = name.trim(); if (n) onExport(n); };
   return (
-    <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={onClose}>
+    <ModalShell kind="save-layout-as" onDismiss={onClose}>
       <div onClick={(e) => e.stopPropagation()} style={{ background: '#1e1e30', border: '1px solid #555', borderRadius: 6, padding: '16px 20px', minWidth: 300, fontFamily: 'monospace' }}>
         <div style={{ color: '#fff', fontSize: 13, marginBottom: 12 }}>Save Layout As</div>
         <input
@@ -864,7 +863,7 @@ function SaveLayoutAsModal({ initial, onSave, onExport, onClose }: { initial: st
           </div>
         </div>
       </div>
-    </div>
+    </ModalShell>
   );
 }
 
@@ -921,7 +920,7 @@ function LoadLayoutModal({ onClose }: { onClose: () => void }) {
   };
 
   return (
-    <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={onClose}>
+    <ModalShell kind="load-layout" onDismiss={onClose}>
       <div onClick={(e) => e.stopPropagation()} style={{ background: '#1e1e30', border: '1px solid #555', borderRadius: 6, padding: '16px 20px', minWidth: 280, maxWidth: 360, fontFamily: 'monospace' }}>
         <div style={{ color: '#fff', fontSize: 13, marginBottom: 12 }}>Load Layout</div>
         {layouts === null ? (
@@ -961,7 +960,7 @@ function LoadLayoutModal({ onClose }: { onClose: () => void }) {
           }}>Cancel</button>
         </div>
       </div>
-    </div>
+    </ModalShell>
   );
 }
 
@@ -974,10 +973,7 @@ function ImportProgressModal() {
   const determinate = totalSteps > 0;
   const pct = determinate ? Math.min(100, Math.round((step / totalSteps) * 100)) : 0;
   return (
-    <div style={{
-      position: 'fixed', inset: 0, zIndex: 9999,
-      background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center',
-    }}>
+    <ModalShell kind="import-progress">
       <div style={{
         background: '#1e1e30', border: '1px solid #555', borderRadius: 6,
         padding: '20px 32px', minWidth: 320, maxWidth: 560, textAlign: 'center', fontFamily: 'monospace',
@@ -1023,7 +1019,7 @@ function ImportProgressModal() {
           </>
         )}
       </div>
-    </div>
+    </ModalShell>
   );
 }
 
@@ -1052,10 +1048,7 @@ function SceneLoadModal() {
   const determinate = total > 0;
   const pct = determinate ? Math.min(100, Math.round((loaded / total) * 100)) : 0;
   return (
-    <div style={{
-      position: 'fixed', inset: 0, zIndex: 9999,
-      background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center',
-    }}>
+    <ModalShell kind="scene-load-progress">
       <div style={{
         background: '#1e1e30', border: '1px solid #555', borderRadius: 6,
         padding: '20px 32px', minWidth: 320, maxWidth: 480, textAlign: 'center', fontFamily: 'monospace',
@@ -1079,7 +1072,7 @@ function SceneLoadModal() {
         </div>
         <div style={{ color: '#666', fontSize: 10 }}>First load bakes textures &amp; models — this can take a moment.</div>
       </div>
-    </div>
+    </ModalShell>
   );
 }
 
@@ -1113,10 +1106,7 @@ function BuildProgressModal() {
   const done = step >= totalSteps && !failed;
 
   return (
-    <div style={{
-      position: 'fixed', inset: 0, zIndex: 9999,
-      background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center',
-    }}>
+    <ModalShell kind="build-progress">
       <div style={{
         background: '#1e1e30', border: '1px solid #555', borderRadius: 6,
         padding: '20px 32px', minWidth: 320, textAlign: 'center', fontFamily: 'monospace',
@@ -1167,6 +1157,6 @@ function BuildProgressModal() {
           </div>
         )}
       </div>
-    </div>
+    </ModalShell>
   );
 }

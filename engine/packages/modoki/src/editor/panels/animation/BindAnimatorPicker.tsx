@@ -13,6 +13,7 @@ import { getAllEntities, findEntity, type EntityInfo } from '../../../runtime/co
 import { getCurrentWorld } from '../../../runtime/core/ecs/world';
 import { pinEntityAt, livePinnedId } from '../../../runtime/core/ecs/entityPin';
 import { useEditorStore } from '../../store/editorStore';
+import { ModalShell } from '../../components/ModalShell';
 
 export interface BindEntityRow {
   id: number;
@@ -112,7 +113,7 @@ export default function BindAnimatorPicker({ clipName, onBind, onClose }: {
   });
 
   return (
-    <div style={overlay} onClick={onClose}>
+    <ModalShell kind="bind-animator-picker" onDismiss={onClose} scrim="rgba(0,0,0,0.4)">
       <div style={popover} onClick={(e) => e.stopPropagation()}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
           <span style={{ color: '#7aa2f7', fontWeight: 'bold', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>Bind “{clipName}”</span>
@@ -166,11 +167,10 @@ export default function BindAnimatorPicker({ clipName, onBind, onClose }: {
           >Bind</button>
         </div>
       </div>
-    </div>
+    </ModalShell>
   );
 }
 
-const overlay: React.CSSProperties = { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center' };
 const popover: React.CSSProperties = { width: 420, height: '60vh', display: 'flex', flexDirection: 'column', background: '#15151f', border: '1px solid #3a3a5a', borderRadius: 5, padding: 10, fontFamily: 'monospace', fontSize: 12, color: '#ccc', boxShadow: '0 6px 24px rgba(0,0,0,0.6)' };
 const input: React.CSSProperties = { background: '#0e0e16', color: '#ddd', border: '1px solid #333', borderRadius: 3, padding: '3px 6px', fontFamily: 'monospace', fontSize: 12 };
 const btn: React.CSSProperties = { background: '#2a2a40', color: '#ccc', border: '1px solid #444', borderRadius: 3, padding: '2px 10px', cursor: 'pointer' };

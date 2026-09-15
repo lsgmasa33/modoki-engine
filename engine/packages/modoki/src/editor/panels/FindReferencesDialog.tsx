@@ -20,6 +20,7 @@ import { selectedAssetTypeFor } from './AssetRefField';
 import { getAllEntities } from '../../runtime/core/ecs/entityUtils';
 import { hasUnsavedChanges } from '../scene/serialize';
 import { formatChainStep, originBadge, type FindReferencesResultLike, type RefHitLike, type RefNodeLike } from './findReferencesFormat';
+import { ModalShell } from '../components/ModalShell';
 
 const btn = (extra?: React.CSSProperties): React.CSSProperties => ({
   padding: '5px 16px', border: '1px solid #555', borderRadius: 3,
@@ -158,7 +159,7 @@ export default function FindReferencesDialog() {
   );
 
   return (
-    <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={close}>
+    <ModalShell kind="find-references" onDismiss={close}>
       <div onClick={(e) => e.stopPropagation()} data-testid="find-references-dialog" style={{
         background: '#1e1e30', border: '1px solid #555', borderRadius: 6, padding: '16px 20px',
         minWidth: 560, maxWidth: 760, maxHeight: '82vh', display: 'flex', flexDirection: 'column', fontFamily: 'monospace',
@@ -273,6 +274,6 @@ export default function FindReferencesDialog() {
             onClick={close} data-testid="find-references-close" style={btn()}>Close</button>
         </div>
       </div>
-    </div>
+    </ModalShell>
   );
 }

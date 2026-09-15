@@ -55,13 +55,18 @@ export function useOverlayEscape(open: boolean, onClose: () => void, kind: strin
  *  For overlays that own other chords (the SpriteEditor modal claims Cmd+Z so the global
  *  undo can't unmount it mid-edit) or that deliberately have no Escape-to-close. Keeping
  *  this separate means adopting the stack never silently ADDS an Escape behaviour a
- *  component didn't already have. */
-export function useOverlay(open: boolean, kind: string): string {
+ *  component didn't already have.
+ *
+ *  `modal` makes it block the editor underneath (focusScope, #1270) — full-screen modals get it
+ *  through `ModalShell`, not by calling this directly. `id` lets a caller that must know the id
+ *  before its child pushes it (SpriteEditor's ⌘Z owner) supply one. */
+export function useOverlay(open: boolean, kind: string, opts?: { modal?: boolean; id?: string }): string {
   const reactId = useId();
-  const id = `${kind}${reactId}`;
+  const id = opts?.id ?? `${kind}${reactId}`;
+  const modal = opts?.modal === true;
   useEffect(() => {
     if (!open) return;
-    return pushOverlay(id);
-  }, [open, id]);
+    return pushOverlay(id, { modal });
+  }, [open, id, modal]);
   return id;
 }

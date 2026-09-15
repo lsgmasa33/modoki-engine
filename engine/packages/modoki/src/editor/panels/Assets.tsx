@@ -69,6 +69,7 @@ import {
   setExpanded, setPendingFolders, setTypeFilter, setViewMode,
   getCurrentFolder, setCurrentFolder,
 } from './assetFolderState';
+import { ModalShell } from '../components/ModalShell';
 
 
 async function instantiatePrefabFromPath(prefabPath: string, _name: string) {
@@ -943,13 +944,14 @@ export default function Assets() {
       // world away first and writes last, so a create-only 409 would arrive after the damage.
       const may = await mayCreateOver(path, pick.confirmReplace, def.assetType);
       if (may === 'declined') return;
-      if (may !== 'create') {
+      if ('existingType' in may) {
         useEditorStore.getState().showToast(`${path} is not a ${def.assetType} (it is typed '${may.existingType}') — choose another name.`, 'warn');
         return;
       }
-      await def.create(path);
+      // `may.create`, not `path`: over an existing file it is that file's on-disk spelling (#1273).
+      await def.create(may.create);
       refresh();
-      def.onCreated?.({ path, name: assetDisplayName(path, def.ext), guid: newGuid() });
+      def.onCreated?.({ path: may.create, name: assetDisplayName(may.create, def.ext), guid: newGuid() });
       return;
     }
     // Everything else shares ONE create path with the agent op (#288 gap 5), so a kind that works
@@ -1962,13 +1964,7 @@ export default function Assets() {
 
       {/* Re-import all confirmation — guards a potentially slow full reconvert. */}
       {confirmReimportAll && (
-        <div
-          style={{
-            position: 'fixed', inset: 0, zIndex: 9999,
-            background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center',
-          }}
-          onClick={() => setConfirmReimportAll(false)}
-        >
+        <ModalShell kind="reimport-all-confirm" onDismiss={() => setConfirmReimportAll(false)}>
           <div
             onClick={(e) => e.stopPropagation()}
             style={{
@@ -2001,7 +1997,7 @@ export default function Assets() {
               >Re-import all</button>
             </div>
           </div>
-        </div>
+        </ModalShell>
       )}
     </div>
   );

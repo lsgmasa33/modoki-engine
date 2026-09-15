@@ -61,40 +61,54 @@ export async function writeNewAssetDocument(
   if (firstBody == null) return { outcome: 'failed', path };
   const first = await post(path, firstBody, true);
   if (first?.ok) {
-    assetWrittenToDisk(path);
-    return { outcome: 'created', path, guid: fresh };
+    // The route's spelling of what it wrote: a create inside a folder typed in another case lands in
+    // the folder that exists, and the caller registers `path` (#1273 close-out review).
+    const written = (await answeredPath(first, 'path')) ?? path;
+    assetWrittenToDisk(written);
+    return { outcome: 'created', path: written, guid: fresh };
   }
   if (first?.status !== 409) return { outcome: 'failed', path, status: first?.status };
-  const existingType = opts.kind ? otherAssetKindAt(path, opts.kind) : undefined;
-  if (existingType) return { outcome: 'wrongKind', path, existingType };
-  if (!opts.confirmReplace) return { outcome: 'exists', path };
-  if (!(await opts.confirmReplace(path))) return { outcome: 'declined', path };
+  // ⚠️ From here on, the path is the one the ROUTE says is there, not the one we asked for (#1273).
+  // The create-only check is case-insensitive wherever the filesystem is, so `enemy.prefab.json`
+  // conflicts with `Enemy.prefab.json` — and every step below keys on an exact path: the kind check
+  // and the kept guid read the manifest, the Replace names the file to the human, and the replacing
+  // write, the parked-edit drop and the caller's registration must all land on the asset that exists
+  // rather than mint a second spelling of it. A route too old to answer keeps the requested spelling.
+  const at = (await answeredPath(first, 'existingPath')) ?? path;
+  const existingType = opts.kind ? otherAssetKindAt(at, opts.kind) : undefined;
+  if (existingType) return { outcome: 'wrongKind', path: at, existingType };
+  if (!opts.confirmReplace) return { outcome: 'exists', path: at };
+  if (!(await opts.confirmReplace(at))) return { outcome: 'declined', path: at };
 
   // Both read BEFORE the replacing write, which is what destroys them.
-  const keptId = await resolveExistingDocumentId(path);
-  const previousContent = opts.keepPrevious ? await readText(path) : null;
+  const keptId = await resolveExistingDocumentId(at);
+  const previousContent = opts.keepPrevious ? await readText(at) : null;
   const guid = keptId ?? fresh;
   const body = build(guid, keptId != null);
-  if (body == null) return { outcome: 'failed', path };
-  const second = await post(path, body, false);
-  if (!second?.ok) return { outcome: 'failed', path, status: second?.status };
-  assetWrittenToDisk(path);
-  return { outcome: 'replaced', path, guid, previousContent };
+  if (body == null) return { outcome: 'failed', path: at };
+  const second = await post(at, body, false);
+  if (!second?.ok) return { outcome: 'failed', path: at, status: second?.status };
+  assetWrittenToDisk(at);
+  return { outcome: 'replaced', path: at, guid, previousContent };
 }
 
 /** For a create that must decide BEFORE it can write — Scene's override discards the live world
- *  first and writes last, so a create-only 409 would arrive after the damage. True when nothing is at
- *  `path`, or the human confirmed replacing it. A check-then-act, unlike `writeNewAssetDocument`:
- *  the price of an override that is arbitrary editor code rather than a document written here. */
+ *  first and writes last, so a create-only 409 would arrive after the damage. `{ create }` when nothing
+ *  is at `path`, or the human confirmed replacing it. A check-then-act, unlike `writeNewAssetDocument`:
+ *  the price of an override that is arbitrary editor code rather than a document written here.
+ *
+ *  `create` is the path to write: `path` itself when nothing is there, else the EXISTING file's
+ *  on-disk spelling — the same reason `writeNewAssetDocument` switches to it (#1273). */
 export async function mayCreateOver(
   path: string,
   confirmReplace: (path: string) => Promise<boolean>,
   kind: string,
-): Promise<'create' | 'declined' | { existingType: string }> {
-  if (!(await assetFileExists(path))) return 'create';
-  const existingType = otherAssetKindAt(path, kind);
+): Promise<{ create: string } | 'declined' | { existingType: string }> {
+  const at = await existingAssetPath(path);
+  if (at == null) return { create: path };
+  const existingType = otherAssetKindAt(at, kind);
   if (existingType) return { existingType };
-  return (await confirmReplace(path)) ? 'create' : 'declined';
+  return (await confirmReplace(at)) ? { create: at } : 'declined';
 }
 
 /** The manifest's type for the asset at `path` when it is not `kind`, else undefined (#1264 close-out).
@@ -109,15 +123,30 @@ export function otherAssetKindAt(path: string, kind: string): string | undefined
   return type && type !== kind ? type : undefined;
 }
 
-/** Whether a file is at `path`, for a create that must ask BEFORE it can write (Scene's override
- *  discards the live world first). `/api/exists`, not `fetch(path).ok` — Vite's SPA fallback answers
- *  200 for a file that is not there. A failed probe reads as absent: the backend is then unreachable
- *  and the write that follows fails on its own. */
-export async function assetFileExists(path: string): Promise<boolean> {
+/** The path of the file at `path`, or null when there is none — for a create that must ask BEFORE it
+ *  can write (Scene's override discards the live world first). `/api/exists`, not `fetch(path).ok` —
+ *  Vite's SPA fallback answers 200 for a file that is not there. A failed probe reads as absent: the
+ *  backend is then unreachable and the write that follows fails on its own.
+ *
+ *  The answer is the route's on-disk spelling, which differs from `path` in case alone when the
+ *  filesystem folded it (#1273); a route too old to answer with one keeps `path`. */
+export async function existingAssetPath(path: string): Promise<string | null> {
   try {
     const res = await backendFetch(`/api/exists?path=${encodeURIComponent(path)}`);
-    return res.ok && ((await res.json()) as { exists?: boolean }).exists === true;
-  } catch { return false; }
+    if (!res.ok) return null;
+    const body = (await res.json()) as { exists?: boolean; path?: unknown };
+    if (body.exists !== true) return null;
+    return typeof body.path === 'string' && body.path ? body.path : path;
+  } catch { return null; }
+}
+
+/** The on-disk path `/api/write-file` names in `field` — `path` on a write, `existingPath` on a
+ *  create-only 409 — if it names one. */
+async function answeredPath(res: Response, field: 'path' | 'existingPath'): Promise<string | undefined> {
+  try {
+    const value = ((await res.json()) as Record<string, unknown>)[field];
+    return typeof value === 'string' && value ? value : undefined;
+  } catch { return undefined; }
 }
 
 async function post(path: string, content: string, createOnly: boolean): Promise<Response | undefined> {

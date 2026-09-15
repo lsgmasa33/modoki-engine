@@ -12,6 +12,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import { backendFetch, backendEventSource } from '../backend/editorBackend';
 import { otaBundleChoices, otaEngineApiNote, type OtaBundleChoice } from './publishOtaTargets';
+import { ModalShell } from '../components/ModalShell';
 
 interface ReleaseInfo { bundles?: Record<string, string>; mandatory?: boolean; minEngineApi?: number }
 interface StatusResponse { ok: boolean; bucket?: string; release?: ReleaseInfo | null; error?: string }
@@ -157,7 +158,7 @@ export default function PublishOtaDialog() {
   };
 
   return (
-    <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={publishing ? undefined : close}>
+    <ModalShell kind="publish-ota" onDismiss={publishing ? undefined : close}>
       <div onClick={(e) => e.stopPropagation()} style={{
         background: '#1e1e30', border: '1px solid #555', borderRadius: 6, padding: '16px 20px',
         minWidth: 520, maxWidth: 640, maxHeight: '82vh', display: 'flex', flexDirection: 'column', fontFamily: 'monospace',
@@ -289,6 +290,6 @@ export default function PublishOtaDialog() {
           )}
         </div>
       </div>
-    </div>
+    </ModalShell>
   );
 }

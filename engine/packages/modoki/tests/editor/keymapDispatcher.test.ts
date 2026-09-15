@@ -220,3 +220,56 @@ describe('claim vs preventDefault are SEPARATE decisions (P8 review D1)', () => 
     expect(appSave).toHaveBeenCalledTimes(1);
   });
 });
+
+/** A MODAL overlay blocks the editor underneath it (#1270). The case above stays true for a
+ *  POPOVER; these pin the other kind, against the real dispatcher. The failure they stand for: a
+ *  Replace prompt is open over Create Prefab, Delete removes the selected entity underneath it, and
+ *  Replace then writes a prefab of an entity that no longer exists. */
+describe('a modal overlay blocks every scope beneath the overlay tier (#1270)', () => {
+  function editorBindings() {
+    const ran = { chord: vi.fn(), panel: vi.fn(), key: vi.fn() };
+    register({ id: 'app.undo', keys: 'meta+z', scope: 'app-chord', run: ran.chord });
+    register({ id: 'h.delete', keys: 'Backspace', scope: 'hierarchy', run: ran.panel });
+    register({ id: 'app.frame', keys: 'f', scope: 'app-key', run: ran.key });
+    useEditorStore.setState({ focusedPanel: 'hierarchy' });
+    return ran;
+  }
+
+  it('app-chord, panel and app-key bindings all yield — nothing runs and nothing is prevented', () => {
+    const ran = editorBindings();
+    pushOverlay('replace-prompt', { modal: true });
+    const presses = [press('z', { metaKey: true }), press('Backspace'), press('f')];
+    expect(ran.chord).not.toHaveBeenCalled();
+    expect(ran.panel).not.toHaveBeenCalled();
+    expect(ran.key).not.toHaveBeenCalled();
+    // Yielded, not swallowed: typing in the modal's own field and native roles still get the key.
+    expect(presses.map((e) => e.defaultPrevented)).toEqual([false, false, false]);
+  });
+
+  it('the same presses reach the editor again once the modal closes', () => {
+    const ran = editorBindings();
+    const close = pushOverlay('replace-prompt', { modal: true });
+    close();
+    press('z', { metaKey: true }); press('Backspace'); press('f');
+    expect([ran.chord, ran.panel, ran.key].map((f) => f.mock.calls.length)).toEqual([1, 1, 1]);
+  });
+
+  it('the modal\'s OWN overlay binding still runs — SpriteEditor\'s slice undo', () => {
+    const appUndo = vi.fn(); const sliceUndo = vi.fn();
+    register({ id: 'app.undo', keys: 'meta+z', scope: 'app-chord', run: appUndo });
+    register({ id: 'sprite.undo', keys: 'meta+z', scope: 'overlay', owner: 'sprite', run: sliceUndo });
+    pushOverlay('sprite', { modal: true });
+    expect(press('z', { metaKey: true }).defaultPrevented).toBe(true);
+    expect(sliceUndo).toHaveBeenCalledTimes(1);
+    expect(appUndo).not.toHaveBeenCalled();
+  });
+
+  it('a popover opened OVER a modal does not unblock the editor — the modal is anywhere on the stack, not on top', () => {
+    const ran = editorBindings();
+    pushOverlay('project-settings', { modal: true });
+    pushOverlay('context-menu');
+    press('z', { metaKey: true }); press('Backspace');
+    expect(ran.chord).not.toHaveBeenCalled();
+    expect(ran.panel).not.toHaveBeenCalled();
+  });
+});

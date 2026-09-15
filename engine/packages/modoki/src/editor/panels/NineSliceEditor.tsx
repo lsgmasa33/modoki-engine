@@ -22,6 +22,7 @@ import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { registerHandleProvider, clampHandleToOwner, type InteractionHandle } from '../../runtime/rendering/interactionHandles';
 import { dragNineSliceGuide } from './sliceDrag';
 import { useDragPointerCapture, pressIsOnScrollbar } from './dragPointerCapture';
+import { ModalShell } from '../components/ModalShell';
 
 export interface NineSliceBorder { l: number; r: number; t: number; b: number; }
 
@@ -437,7 +438,7 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
   // IS the cancel and there is nothing to lose. Guarded by
   // engine/tests/architecture/modalDismissScope.test.ts.
   return (
-    <div style={overlay}>
+    <ModalShell kind="nine-slice-editor" zIndex={10000} scrim="rgba(0,0,0,0.6)">
       <div style={dialog}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
           <div style={{ color: '#fff', fontSize: 13, fontWeight: 'bold' }}>9-slice Border — {name}</div>
@@ -492,11 +493,10 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
           <button data-ui-id="nineSlice.save" style={{ ...btn, background: '#2ecc71', border: '1px solid #27ae60', color: '#fff' }} onClick={save}>Save</button>
         </div>
       </div>
-    </div>
+    </ModalShell>
   );
 }
 
-const overlay: React.CSSProperties = { position: 'fixed', inset: 0, zIndex: 10000, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center' };
 const dialog: React.CSSProperties = {
   background: '#1e1e30', border: '1px solid #555', borderRadius: 6, padding: 14, fontFamily: 'monospace',
   display: 'flex', flexDirection: 'column', width: 860, height: 600, minWidth: 520, minHeight: 400,

@@ -276,6 +276,8 @@ export interface RendererMenuItem {
  *  Electron — see EditorApp). Ordered top-level menus (File, Edit, View, Build…). */
 export interface RendererMenuSpec {
   menus: { name: string; items: RendererMenuItem[] }[];
+  /** The renderer has a modal dialog open (#1270): every item arrives disabled. */
+  modal?: boolean;
 }
 
 /** Map a renderer shortcut ("Cmd+S") to an Electron accelerator ("CmdOrCtrl+S"). */

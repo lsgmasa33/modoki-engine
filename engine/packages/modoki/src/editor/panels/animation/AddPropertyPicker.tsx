@@ -9,6 +9,7 @@ import { relativeEntityPath, trackKey } from '../../animation/recording';
 import { getAnimEntityIndex } from '../../animation/entityIndex';
 import type { TrackValueType } from '../../../runtime/animation/types';
 import type { FieldHint } from '../../../runtime/core/ecs/traitRegistry';
+import { ModalShell } from '../../components/ModalShell';
 
 export interface PropertyCandidate {
   path: string;        // relative to root
@@ -207,7 +208,7 @@ export default function AddPropertyPicker({
   });
 
   return (
-    <div style={overlay} onClick={onClose}>
+    <ModalShell kind="add-property-picker" onDismiss={onClose} scrim="rgba(0,0,0,0.4)">
       <div style={popover} onClick={(e) => e.stopPropagation()}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
           <input data-ui-id="animation.addProperty.filter" data-ui-kind="field" data-ui-label="Filter properties" autoFocus placeholder="Filter properties…" value={filter} onChange={(e) => setFilter(e.target.value)} style={input} />
@@ -284,11 +285,10 @@ export default function AddPropertyPicker({
           </button>
         </div>
       </div>
-    </div>
+    </ModalShell>
   );
 }
 
-const overlay: React.CSSProperties = { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center' };
 const popover: React.CSSProperties = { width: 480, height: '60vh', display: 'flex', flexDirection: 'column', background: '#15151f', border: '1px solid #3a3a5a', borderRadius: 5, padding: 10, fontFamily: 'monospace', fontSize: 12, color: '#ccc', boxShadow: '0 6px 24px rgba(0,0,0,0.6)' };
 const input: React.CSSProperties = { flex: 1, background: '#0e0e16', color: '#ddd', border: '1px solid #333', borderRadius: 3, padding: '3px 6px', fontFamily: 'monospace', fontSize: 12 };
 const btn: React.CSSProperties = { background: '#2a2a40', color: '#ccc', border: '1px solid #444', borderRadius: 3, padding: '2px 8px', cursor: 'pointer' };

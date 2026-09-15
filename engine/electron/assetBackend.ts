@@ -25,7 +25,7 @@ export interface ElectronAssetManifest { version: 2; assets: Array<{ path: strin
 export interface ElectronAssetBackend {
   projectRoot: string;
   resolveAssetPath(urlPath: string): string | null;
-  absToAssetUrl(absPath: string): string | null;
+  absToAssetUrl(absPath: string, opts?: { onDisk?: boolean }): string | null;
   firstRootDir(): string | null;
   getManifest(): ElectronAssetManifest;
   rebuildManifest(): ElectronAssetManifest;
@@ -166,7 +166,7 @@ export function createAssetBackend(opts: {
   return {
     projectRoot,
     resolveAssetPath: (p) => resolveAssetPath(p, assetRoots),
-    absToAssetUrl: (p) => absToAssetUrl(p, assetRoots),
+    absToAssetUrl: (p, opts) => absToAssetUrl(p, assetRoots, opts),
     firstRootDir: () => assetRoots[0]?.absDir ?? null,
     getManifest: () => cachedManifest,
     rebuildManifest,

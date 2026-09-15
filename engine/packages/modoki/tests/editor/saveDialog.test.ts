@@ -14,6 +14,7 @@ vi.mock('../../src/editor/backend/editorBackend', () => ({
 }));
 
 import { chooseNewAssetPath, confirmReplaceAsset } from '../../src/editor/utils/saveDialog';
+import { clearOverlays, isModalOpen } from '../../src/editor/input/focusScope';
 
 /** The chosen path alone — what most branches below pin. */
 const saveAssetDialog = async (o: Parameters<typeof chooseNewAssetPath>[0]) => (await chooseNewAssetPath(o))?.path ?? null;
@@ -176,6 +177,27 @@ describe('modal keyboard behaviour', () => {
     expect(await p).toBe(false);
   });
 
+  it('blocks the editor for exactly as long as it is open — every way out releases it (#1270)', async () => {
+    // Replace, Cancel, Escape and a backdrop press each end the dialog; one that removed the backdrop
+    // without popping its overlay would leave every editor shortcut dead with nothing on screen.
+    clearOverlays();
+    const scrim = () => document.body.lastElementChild as HTMLElement;
+    const exits: Array<[string, () => void]> = [
+      ['Replace', () => button('Replace').click()],
+      ['Cancel', () => button('Cancel').click()],
+      ['Escape', () => { press(document.activeElement ?? document.body, 'Escape'); }],
+      ['backdrop', () => { scrim().dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); scrim().click(); }],
+    ];
+    for (const [how, exit] of exits) {
+      const p = confirmReplaceAsset('/a/rock.mat.json');
+      await tick();
+      expect(isModalOpen(), `open before ${how}`).toBe(true);
+      exit();
+      await p;
+      expect(isModalOpen(), `released by ${how}`).toBe(false);
+    }
+  });
+
   it('registers no GLOBAL key listener — the modal listens on its own overlay', async () => {
     const add = vi.spyOn(document, 'addEventListener');
     const addWin = vi.spyOn(window, 'addEventListener');
@@ -212,6 +234,22 @@ describe('chooseNewAssetPath — which Replace question the create should ask (#
     expect(document.body.textContent).toContain('/games/x/assets/Walk.anim.json already exists');
     clickBtn('Cancel');
     expect(await answer).toBe(false);
+  });
+
+  it('a CASE-VARIANT pick: the create is named as TYPED, and the file the panel asked about is not asked again (#1273)', async () => {
+    // The route answers the typed spelling as `path` and the existing file's on-disk one as `existingPath`;
+    // the create's 409 then hands `confirmReplace` the on-disk one.
+    backendFetch.mockResolvedValue(jsonResponse({ path: '/games/x/assets/scenes/level.json', existingPath: '/games/x/assets/scenes/Level.json' }));
+    const pick = await chooseNewAssetPath({ defaultName: 'scene.json', ext: '.json' });
+    expect(pick?.path).toBe('/games/x/assets/scenes/level.json');
+    const answer = await Promise.race([pick!.confirmReplace('/games/x/assets/scenes/Level.json'), tick().then(() => 'still waiting on a modal')]);
+    expect(answer).toBe(true);
+  });
+
+  it('a new name built by ensureExt keeps the TYPED casing, not an existing sibling\'s', async () => {
+    backendFetch.mockResolvedValue(jsonResponse({ path: '/games/x/assets/Walk.json', existingPath: '/games/x/assets/walk.json' }));
+    const pick = await chooseNewAssetPath(opts);
+    expect(pick?.path).toBe('/games/x/assets/Walk.anim.json');
   });
 
   it('the fallback text box never checks → asks in-app', async () => {

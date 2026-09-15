@@ -14,7 +14,7 @@ import { register, resolve, clearBindings, type ResolveContext } from '../../src
 import { canFrameSelected } from '../../src/editor/scene/sceneViewBus';
 
 const ctx = (over: Partial<ResolveContext> = {}): ResolveContext => ({
-  focusedPanel: null, overlay: null, textEditable: false, ...over,
+  focusedPanel: null, overlay: null, modal: false, textEditable: false, ...over,
 });
 const noop = () => {};
 

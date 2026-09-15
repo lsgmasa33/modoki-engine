@@ -65,7 +65,7 @@ const REQUIRED: Array<{ file: string; ids: string[]; why: string }> = [
     // below exempts them from the namespacing check rather than leaving them unguarded, because
     // this file's own findReferences.footer.close entry argues a modal's EXIT is load-bearing:
     // while the modal is open every other handle reports occluded, so an untagged Close/Cancel
-    // traps an agent inside it. This modal opens via `useOverlay(true, 'sprite-editor')` and is
+    // traps an agent inside it. This modal opens via `<ModalShell kind="sprite-editor">` and is
     // exactly that shape — and three QA cases already address these two ids by selector.
     file: 'panels/SpriteEditor.tsx',
     ids: ['spriteEditor.cancel', 'spriteEditor.save', '`spriteEditor.slice.${s.guid}`'],

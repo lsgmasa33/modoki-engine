@@ -10,7 +10,11 @@
  *  Why `:disabled` and not `.disabled` below: the IDL property reflects only an element's
  *  OWN disabled attribute, so a control disabled by an ancestor <fieldset disabled>
  *  reports `.disabled === false` while being genuinely inert. Asserting on the property
- *  would have passed against a fieldset that did nothing. Only the pseudo-class sees it. */
+ *  would have passed against a fieldset that did nothing. Only the pseudo-class sees it. *
+ *  `baseElement` (document.body), not `container`: the dialog draws its backdrop through `ModalShell`,
+ *  which portals to <body> so a dialog opened inside a hidden panel tab cannot block the editor
+ *  invisibly (#1270). Its DOM is therefore never inside the render container.
+ */
 
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { render, cleanup, waitFor, fireEvent } from '@testing-library/react';
@@ -88,7 +92,7 @@ afterEach(() => { cleanup(); vi.clearAllMocks(); });
 describe('ProjectSettingsDialog — a config file that does not parse (#26)', () => {
   it('shows no banner and leaves everything editable when the config is fine', async () => {
     load = async () => structuredClone(HEALTHY);
-    const { container, findByDisplayValue, queryByText } = render(<ProjectSettingsDialog />);
+    const { baseElement: container, findByDisplayValue, queryByText } = render(<ProjectSettingsDialog />);
     await findByDisplayValue('com.modokiengine.sling');
     expect(queryByText(/could not be read/)).toBeNull();
     expect(container.querySelector('fieldset')?.disabled).toBe(false);
@@ -108,7 +112,7 @@ describe('ProjectSettingsDialog — a config file that does not parse (#26)', ()
 
   it('makes every field inert — including via the fieldset, which owns the sub-editors', async () => {
     load = async () => structuredClone(MALFORMED);
-    const { container, findByDisplayValue } = render(<ProjectSettingsDialog />);
+    const { baseElement: container, findByDisplayValue } = render(<ProjectSettingsDialog />);
     const bundle = await findByDisplayValue('com.modokiengine.prototype');
     expect(container.querySelector('fieldset')?.disabled).toBe(true);
     expect(bundle.matches(':disabled')).toBe(true);
@@ -118,7 +122,7 @@ describe('ProjectSettingsDialog — a config file that does not parse (#26)', ()
 
   it('leaves the TAB buttons and Cancel live — reading around is fine, editing a lie is not', async () => {
     load = async () => structuredClone(MALFORMED);
-    const { container, findByText, getByText } = render(<ProjectSettingsDialog />);
+    const { baseElement: container, findByText, getByText } = render(<ProjectSettingsDialog />);
     await findByText(/could not be read/);
     expect(live(container).map((c) => c.textContent)).toEqual(['General', 'Web', 'Cancel']);
     // And switching tab really works, so the other tabs' values stay readable.
@@ -153,7 +157,7 @@ describe('ProjectSettingsDialog — a config file that does not parse (#26)', ()
   it('still renders normally when load() omits configErrors entirely (the healthy shape)', async () => {
     // GET omits the key rather than sending []; an undefined must not throw on .length.
     load = async () => structuredClone(HEALTHY);
-    const { container, findByDisplayValue } = render(<ProjectSettingsDialog />);
+    const { baseElement: container, findByDisplayValue } = render(<ProjectSettingsDialog />);
     await findByDisplayValue('Sling');
     expect(live(container).length).toBe(controls(container).length);
   });
@@ -199,7 +203,7 @@ describe('ProjectSettingsDialog — an unrecognised config VALUE (#25 follow-up)
     // The fix is usually to pick the right entry in the very dropdown being warned about,
     // so disabling the form would lock the user out of the repair.
     load = async () => structuredClone(WARNED);
-    const { container, findByTestId } = render(<ProjectSettingsDialog />);
+    const { baseElement: container, findByTestId } = render(<ProjectSettingsDialog />);
     await findByTestId('config-warnings');
     expect(container.querySelector('fieldset')?.disabled).toBe(false);
     expect(inert(container)).toHaveLength(0);
@@ -247,7 +251,7 @@ describe('ProjectSettingsDialog — a path field as a drop target', () => {
 
   it('accepts a file drag when the form is healthy, and the drop reaches the backend', async () => {
     load = async () => structuredClone(HEALTHY);
-    const { container, findByDisplayValue } = render(<ProjectSettingsDialog />);
+    const { baseElement: container, findByDisplayValue } = render(<ProjectSettingsDialog />);
     await findByDisplayValue('com.modokiengine.sling');
     const over = new Event('dragover', { bubbles: true, cancelable: true });
     Object.defineProperty(over, 'dataTransfer', { value: fileDrag() });
@@ -268,7 +272,7 @@ describe('ProjectSettingsDialog — a path field as a drop target', () => {
     // A checkbox field renders `Info` INSIDE its <label>, and `cursor:'help'` invites the click.
     // Reaching for an explanation must not change the setting being explained.
     load = async () => structuredClone(HEALTHY);
-    const { container, findByDisplayValue } = render(<ProjectSettingsDialog />);
+    const { baseElement: container, findByDisplayValue } = render(<ProjectSettingsDialog />);
     await findByDisplayValue('com.modokiengine.sling');
     const box = container.querySelector('input[type=checkbox]') as HTMLInputElement;
     const info = container.querySelector('[aria-label="details"]') as HTMLElement;
@@ -280,7 +284,7 @@ describe('ProjectSettingsDialog — a path field as a drop target', () => {
 
   it('REFUSES the same drag while the form is inert, so nothing is copied into the project', async () => {
     load = async () => structuredClone(MALFORMED);
-    const { container, findByDisplayValue } = render(<ProjectSettingsDialog />);
+    const { baseElement: container, findByDisplayValue } = render(<ProjectSettingsDialog />);
     const icon = await findByDisplayValue('art/icon');
     expect(icon.matches(':disabled')).toBe(true);
 

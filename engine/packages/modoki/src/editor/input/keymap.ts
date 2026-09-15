@@ -31,7 +31,8 @@ if (import.meta.hot) import.meta.hot.accept(() => { window.location.reload(); })
 /** Where a binding is eligible to fire.
  *  - 'app-chord'  — everywhere, INCLUDING text fields (Cmd+S, Cmd+Z, Cmd+P)
  *  - 'app-key'    — everywhere EXCEPT text-editable (bare `f` = frame selected)
- *  - 'overlay'    — only while an overlay owns input; may swallow app-chord
+ *  - 'overlay'    — only while an overlay owns input; may swallow app-chord. While a MODAL
+ *                   overlay is open, this is the ONLY scope that resolves (#1270)
  *  - 'text-field' — only while a text-editable element has focus
  *  - <panelId>    — only while that FlexLayout panel is focused ('scene', 'hierarchy', …)
  */
@@ -71,6 +72,10 @@ export interface ResolveContext {
   focusedPanel: string | null;
   /** Top of the overlay stack (a context menu, picker, modal), or null. */
   overlay: string | null;
+  /** Is a MODAL open anywhere on the overlay stack (focusScope.isModalOpen)? Blocks every
+   *  non-overlay scope — the editor under a modal must not act on a key (#1270). Required, not
+   *  optional: a context builder that forgot it would silently read as "no modal". */
+  modal: boolean;
   /** Is focus in an <input type=text>/<textarea>/contenteditable? NOTE: deliberately
    *  NOT "any form control" — an editor e2e test presses Cmd+Z while a CHECKBOX holds
    *  focus and expects the scene undo. See focusScope.isTextEditable. */
@@ -194,9 +199,15 @@ export function clearBindings(): void { bindings.clear(); }
 
 /** Scope priority, highest first. An overlay outranks everything (a modal's Escape/Cmd+Z
  *  must beat the app's), then a focused text field, then the focused panel, then the two
- *  app tiers. */
+ *  app tiers.
+ *
+ *  A modal on the stack makes everything below the overlay tier INELIGIBLE, not merely
+ *  outranked (#1270): a popover only claims what it binds, but a modal's unbound ⌘Z or Delete
+ *  must not reach the scene underneath it. Ineligible means `resolve()` yields, so typing in the
+ *  modal's own fields and native roles (copy, reload) still work. */
 function priority(scope: Scope, ctx: ResolveContext): number {
   if (scope === 'overlay') return ctx.overlay ? 5 : -1;
+  if (ctx.modal) return -1;
   if (scope === 'text-field') return ctx.textEditable ? 4 : -1;
   if (scope === 'app-chord') return 1;                       // always eligible
   if (scope === 'app-key') return ctx.textEditable ? -1 : 2; // blocked while typing

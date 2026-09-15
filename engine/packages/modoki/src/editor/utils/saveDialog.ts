@@ -3,6 +3,7 @@
  *  Falls back to an in-app modal on platforms without a native panel (Windows/Linux). */
 
 import { backendFetch } from '../backend/editorBackend';
+import { openDomModalShell } from '../components/modalBackdrop';
 
 /** In-app path prompt. `window.prompt()` throws "prompt() is not supported" in the Electron
  *  renderer, which broke every "New <asset>" flow on Windows/Linux (no native osascript panel).
@@ -28,12 +29,14 @@ export async function confirmReplaceAsset(path: string): Promise<boolean> {
   return answer !== null;
 }
 
-/** The one modal shell. With `initial` it is a text prompt resolving the trimmed value (null when
- *  empty); without it, a confirmation resolving '' on OK. Null on Cancel, Escape or a backdrop click. */
+/** The prompt and the confirmation, in the plain-DOM form of the editor's modal shell (#1270), so the
+ *  editor underneath takes no key and no menu command while it waits. With `initial` it is a text
+ *  prompt resolving the trimmed value (null when empty); without it, a confirmation resolving '' on
+ *  OK. Null on Cancel, Escape or a backdrop click. */
 function openModal(title: string, message: string, okLabel: string, initial?: string): Promise<string | null> {
   return new Promise((resolve) => {
-    const overlay = document.createElement('div');
-    overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center';
+    // Above every React dialog (99999): Create Prefab and the New buttons can ask from inside one.
+    const { root: overlay, close } = openDomModalShell('save-dialog', { zIndex: 99999, onDismiss: () => done(null) });
     const box = document.createElement('div');
     box.style.cssText = 'background:#1e1e30;border:1px solid #555;border-radius:6px;padding:16px 20px;min-width:380px;font-family:monospace';
     const heading = document.createElement('div');
@@ -58,7 +61,6 @@ function openModal(title: string, message: string, okLabel: string, initial?: st
     row.append(cancel, ok);
     box.append(heading, label, ...(input ? [input] : []), row);
     overlay.append(box);
-    document.body.append(overlay);
 
     const onKey = (e: KeyboardEvent) => {
       // Enter submits only from the prompt's own INPUT. On a focused button it falls through to
@@ -68,11 +70,10 @@ function openModal(title: string, message: string, okLabel: string, initial?: st
       if (e.key === 'Enter' && input && e.target === input) { e.preventDefault(); submit(); }
       else if (e.key === 'Escape') { e.preventDefault(); done(null); }
     };
-    const done = (val: string | null) => { overlay.remove(); resolve(val); };
+    const done = (val: string | null) => { close(); resolve(val); };
     const submit = () => { if (!input) { done(''); return; } const v = input.value.trim(); done(v || null); };
     ok.onclick = submit;
     cancel.onclick = () => done(null);
-    overlay.onclick = (e) => { if (e.target === overlay) done(null); };
     // On the OVERLAY, not the document: every key a modal should hear comes from an element inside
     // it (the input, or the focused button), and a global listener is what keymapOwnership forbids.
     // Removed with the overlay, so nothing outlives a closed modal.
@@ -113,7 +114,7 @@ export async function chooseNewAssetPath(
   opts: SaveAssetDialogOpts,
 ): Promise<{ path: string; confirmReplace: (path: string) => Promise<boolean> } | null> {
   const { defaultName, ext, defaultFolder, prompt } = opts;
-  let res: { path?: string; cancelled?: boolean; unsupported?: boolean; error?: string };
+  let res: { path?: string; existingPath?: string; cancelled?: boolean; unsupported?: boolean; error?: string };
   try {
     res = await backendFetch('/api/save-dialog', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -125,7 +126,11 @@ export async function chooseNewAssetPath(
   if (res.cancelled) return null;
   if (res.path) {
     const path = ensureExt(res.path, ext);
-    const panelChecked = res.path;
+    // The file the panel asked about, spelled as the create's 409 will name it (`existingPath`) — the
+    // typed `level.json` over an existing `Level.json` reaches `confirmReplace` as `Level.json` (#1273).
+    // ⚠️ Unobserved premise, as it was before: that the panel's own "already exists" check folds case
+    // the way APFS does. Wrong, it would be a silent replace of a case variant.
+    const panelChecked = res.existingPath ?? res.path;
     return { path, confirmReplace: (p) => (p === panelChecked ? Promise.resolve(true) : confirmReplaceAsset(p)) };
   }
   if (res.error === 'outside-asset-roots') {

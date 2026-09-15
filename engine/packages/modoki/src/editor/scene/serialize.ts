@@ -1216,17 +1216,19 @@ export async function saveScene(opts: {
   if (written.outcome === 'declined') return { saved: false, path: null, reason: 'cancelled' };
   if (written.outcome === 'wrongKind') {
     // Plain `.json` can name a prefab or material; replacing it would hand its guid to a scene.
-    useEditorStore.getState().showToast(`${target} is not a scene (it is typed '${written.existingType}') — choose another name.`, 'warn');
+    useEditorStore.getState().showToast(`${written.path} is not a scene (it is typed '${written.existingType}') — choose another name.`, 'warn');
     return { saved: false, path: null, reason: 'cancelled' };
   }
-  const ok = written.outcome === 'created' || written.outcome === 'replaced';
-  if (ok) {
-    registerAsset(written.guid, target, 'scene');
-    setCurrentScenePath(target); // persists, so the next Save All goes straight to it
-    editorEmit('!save', { path: target, entities: scene.entities.length }); // Editor Percept (V2)
-    console.log(`[Editor] Saved scene: ${scene.entities.length} entities → ${target}`);
+  if (written.outcome === 'created' || written.outcome === 'replaced') {
+    // `written.path`, not `target`: a Replace lands on the existing file's on-disk spelling (#1273),
+    // and the current scene path persists — a second spelling would be what every later save writes.
+    const saved = written.path;
+    registerAsset(written.guid, saved, 'scene');
+    setCurrentScenePath(saved); // persists, so the next Save All goes straight to it
+    editorEmit('!save', { path: saved, entities: scene.entities.length }); // Editor Percept (V2)
+    console.log(`[Editor] Saved scene: ${scene.entities.length} entities → ${saved}`);
     markSceneSaved(savedAtEditVersion);
-    return { saved: true, path: target, reason: 'ok' };
+    return { saved: true, path: saved, reason: 'ok' };
   }
   console.error(`[Editor] Failed to save scene to ${target}`);
   return { saved: false, path: target, reason: 'write-failed' };

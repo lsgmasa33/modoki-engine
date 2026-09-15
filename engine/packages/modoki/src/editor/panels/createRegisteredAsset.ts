@@ -167,7 +167,9 @@ async function createRegistered(
   }
   // `writeNewAssetDocument` already dropped any parked panel edit for this path (a REPLACE would
   // otherwise have the next Cmd+S flush the old edited doc back over it — #1215 close-out review).
-  registerAsset(registeredGuid, full, def.assetType as AssetType);
+  // `written.path`, not `full`: a Replace lands on the existing file's on-disk spelling (#1273), and
+  // registering the requested one would give the manifest a second key for the same file.
+  registerAsset(registeredGuid, written.path, def.assetType as AssetType);
   const manifestRebuilt = await rebuildBackendManifest();
-  return { ok: true, path: full, name, guid: registeredGuid, def, manifestRebuilt };
+  return { ok: true, path: written.path, name: displayName(written.path, def.ext), guid: registeredGuid, def, manifestRebuilt };
 }

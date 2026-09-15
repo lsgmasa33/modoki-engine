@@ -15,7 +15,9 @@ Mouse is deliberately **not** focus-filtered — DOM hit-testing already routes 
   `KeymapConflictError`.
 - `editor/input/dispatcher.ts` — `installKeymapDispatcher()`, the single `window` keydown listener.
 - `editor/input/focusScope.ts` — `isTextEditable()` + the overlay stack (`pushOverlay`/`popOverlay`/
-  `topOverlay`).
+  `topOverlay`, and `isModalOpen`/`subscribeOverlays` for the modal kind).
+- `editor/components/ModalShell.tsx` + `editor/components/modalBackdrop.ts` — the one full-screen
+  modal shell, React and plain-DOM forms; see [Modals block the editor](#modals-block-the-editor-underneath-them-1270).
 - `editor/input/PanelFocusHost.tsx` — click-to-focus wrapper applied by `EditorApp`'s FlexLayout
   factory, so **every** panel gets focus acquisition at one seam.
 - `editor/input/useOverlayEscape.ts` — `useOverlayEscape()` (push + bind Escape) and `useOverlay()`
@@ -77,7 +79,7 @@ Five, resolved by priority. `resolve()` picks the highest-priority candidate for
 
 | Tier | Fires | Members |
 |---|---|---|
-| `overlay` | only for the top of the overlay **stack**; outranks everything, so it may swallow an app-chord | Escape-to-close, the SpriteEditor modal's ⌘Z |
+| `overlay` | only for the top of the overlay **stack**; outranks everything, so it may swallow an app-chord. While a **modal** is on the stack it is the only tier that resolves | Escape-to-close, the SpriteEditor modal's ⌘Z |
 | `text-field` | when `document.activeElement` is text-editable | Enter/Escape commits, Backspace-clears-ref |
 | `<panelId>` | only when that panel is focused, and never while text-editable | everything panel-specific |
 | `app-key` | everywhere **except** text-editable | *(no registrations today — see note)* |
@@ -96,6 +98,77 @@ game-registered id.
 A command that logically belongs to more than one panel registers **once per scope** (Hierarchy's
 selection commands are registered under both `hierarchy` and `scene`, so copy/paste works with the
 viewport focused). Rename stays Hierarchy-only — the edit box lives on a row.
+
+## Modals block the editor underneath them (#1270)
+
+An overlay is one of two kinds, and the difference is what happens to a chord it did **not** bind:
+
+- **A popover** (ContextMenu, the pickers using `useOverlayEscape`, FontPicker, SpritePicker) claims
+  only what it binds. ⌘S under an open context menu still saves.
+- **A modal** blocks the editor underneath it. While one is **anywhere** on the stack, `resolve()`
+  makes every non-overlay scope ineligible — panel, `app-key`, `app-chord` — so Delete, ⌘Z and ⌘S
+  reach no editor shortcut. Anywhere rather than on top, because a picker or context menu opened
+  over a modal must not be what lets ⌘Z through when it closes. The editor's game-input gate closes
+  too (`EditorApp`'s `setInputGate`), so a running game does not receive keys under a dialog.
+- **A modal takes DOM focus** when it opens (`holdFocus` in `modalBackdrop.ts`) and gives it back on
+  close. The keymap gate alone was not enough: an element-level `onKeyDown` fires for whatever holds
+  DOM focus, and the Assets list keeps focus after a click, handles ⌘⌫/⌘D/Enter itself and stops
+  propagation — so ⌘⌫ under Project Settings trashed the selected asset (found in review, by code
+  trace). Focus is left alone when the dialog already placed it with `autoFocus`.
+- **The React shell portals to `document.body`.** Five dialogs open from inside a panel (the Sprite
+  and 9-slice editors in the Inspector, the two animation pickers, the Re-import-all confirm). A tab
+  FlexLayout hides keeps its content mounted under `display:none`, so an unportalled dialog in a
+  hidden tab would still block every shortcut and grey the menu with nothing on screen to close.
+
+The failure it removes: a Replace prompt open over Create Prefab, Delete pressed with the Hierarchy
+focused, and the entity deleted underneath the prompt — which then wrote a prefab of an entity that no
+longer existed. Every full-screen dialog had its own backdrop and none of them registered.
+
+What still works under a modal, on purpose:
+
+- **The modal's own keys.** Its overlay-scope bindings (SpriteEditor's slice ⌘Z/⌘⇧Z/⌘Y) resolve as
+  before, and element handlers inside it (a prompt's Enter/Escape) fire before the window dispatcher.
+- **Typing and native roles.** Ineligible means `resolve()` returns null, which YIELDS (the
+  `preventDefault` contract above) — ⌘C in the dialog's field, ⌘R, devtools.
+
+**The menu refuses too.** Under Electron the relayed menu is a second way in: an OS-menu click, and
+an accelerator whose chord the dispatcher yielded, both land in `handleMenuAction`. So:
+
+- `buildMenuSpec(menus, { modal })` greys **every** renderer-built item while a modal is open. That
+  is the refusal a human sees before clicking, and `/api/menu` reads the same `enabled:false` and is
+  refused by `triggerMenuItem`, with the open modal named as the cause (`electron/modalRefusal.ts`).
+  Observed live 2026-09-16 with Project Settings open: every renderer item `enabled:false`, the
+  main-owned ones enabled, `Edit/Undo` refused.
+- `handleMenuAction` reads the overlay stack itself and refuses with a toast. Greying takes an IPC
+  round-trip after the dialog opens, and a click or accelerator inside that window would otherwise run
+  the command.
+
+**One shell draws every modal.** `<ModalShell kind=… onDismiss=…>` in React, `openDomModalShell()` in
+`utils/saveDialog.ts` (which has no React by design). Mounting or opening pushes the modal entry, so
+the registration cannot be forgotten by a dialog that draws its own backdrop — the shape all 17 had.
+`onDismiss` is the backdrop dismiss, and it fires only for a press that starts AND ends on the scrim:
+a drag-select that starts in a field and is released outside does not close the dialog.
+
+**Agents are told.** `/api/input/key` warns when a press landed under a modal and no binding of the
+modal's own claimed it, instead of answering `ok:true` alone.
+
+What it does **not** cover:
+
+- **Main-owned menu items** — File ▸ New/Open Project, Open Recent, About, Check for Updates, the
+  View zoom items and every native role. They are built by the main process, not from the renderer's
+  spec, so they are neither greyed nor refused.
+- **Agent HTTP ops.** An MCP mutation or `modoki_history` undo does not go through the keymap or the
+  menu, and is not gated by an open modal.
+- **The IPC window.** Greying the menu is a round-trip after the dialog opens. A `/api/menu` click
+  inside it reaches `handleMenuAction`, which refuses — but main has already answered `ok:true`.
+- **The web (non-Electron) editor's browser defaults.** A blocked ⌘S or ⌘P yields, and with no
+  Electron menu to swallow it Chrome then opens Save Page As or Print. Under Electron nothing happens.
+- **The Scene Load modal's first 400ms.** It renders nothing until the delay elapses (so warm loads
+  never flash it), and it blocks only once it is showing.
+- **A finished build's dialog blocks the Build menu until it is closed.** `docs/editor.md`'s build
+  refusal deliberately does not count a FAILED build as running, so a retry needs no dismissal; the
+  modal kind now requires one click on Close first. Consistent with the rule, and a one-prop change on
+  `BuildProgressModal` if it proves the wrong call.
 
 ## Focus is store-backed, not `document.activeElement`
 
@@ -502,6 +575,11 @@ the wrong panel). Two source-text tripwires stand in for that:
   outside an allowlist that must justify each entry. There are exactly **two** allowed: the
   dispatcher, and SceneView's Shift-snap, which tracks a modifier *level* (it needs keyup as much
   as keydown) rather than dispatching a discrete chord.
+- **`engine/tests/architecture/modalShellCoverage.test.ts`** — no full-screen `position:fixed;
+  inset:0` backdrop in `editor/**` outside the shell, except the two popover click-catchers
+  (FontPicker, SpritePicker). A dialog that hand-rolls its backdrop registers no modal, and nothing
+  else would notice. `modalDismissScope.test.ts` reads the shell's `onDismiss` for which dialogs may
+  close on a backdrop press.
 - The same file guards that every `scope:` literal names a real tier or panel id. `Scope` has an
   open `(string & {})` arm so a game can own chords, which means `scope: 'skin_editor'`
   type-checks, registers, and then never resolves — a silently dead shortcut tsc cannot catch.

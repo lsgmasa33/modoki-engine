@@ -18,7 +18,7 @@ import { resolveModules } from './detect-modules';
 import { findGamesEntry } from './findGamesEntry';
 // The leaf module, not './subgameBuild': that file's shared-key list would reach the Electron main bundle (#1035).
 import { subgameOutDir } from './subgameOutDir';
-import { samePath, canonicalPath } from '../scripts/pathIdentity.mjs';
+import { samePath, canonicalPath, pathCaseKey } from '../scripts/pathIdentity.mjs';
 import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, OTA_SAFE_TOKEN } from './backend/gcloud';
 import { projectAssetRoots, discoverProjects, PROJECT_ROOT_DIRS } from '../scripts/projectRoots.mjs';
 import { listAndroidDevices, resolveBuildAndroidSerial } from './backend/androidDevices';
@@ -1560,18 +1560,51 @@ export function resolveAssetPath(assetPath: string, roots: AssetRoot[]): string 
 }
 
 /** Reverse of resolveAssetPath: map an absolute file path back to its asset-root
- *  URL path, or null if it lives outside every root. */
-export function absToAssetUrl(absPath: string, roots: AssetRoot[]): string | null {
+ *  URL path, or null if it lives outside every root. Spelled as `absPath` is, unless `onDisk`.
+ *
+ *  ⚠️ **`onDisk: true` spells an EXISTING path the way the DISK does, not the way the caller did**
+ *  (#1261, #1273). `resolveAssetPath` is lexical, so on a case-insensitive filesystem (APFS, NTFS)
+ *  `/assets/FX/spark.particle.json` resolves to — and an fs op then acts on — the file the manifest
+ *  and every renderer registry key as `/assets/fx/spark.particle.json` (`scanDir` keys by
+ *  `readdirSync` names). A url echoing the request's casing matched none of them: a delete or move
+ *  repaired nothing, and a create-only 409 could not say which asset was really there. With the
+ *  option the relative part is taken from `canonicalPath` (`realpathSync.native`).
+ *
+ *  ⚠️ **Opt-in, and the WATCHER must never pass it** (#1261 close-out review, observed). A chokidar
+ *  path is already the disk's spelling at the moment of its event, so canonicalising it can only
+ *  change it AFTER a rename — and after `Level.scene.json` → `level.scene.json` it turns the
+ *  `unlink` of the OLD name into the NEW one: the editor's handler, which matches exactly, never
+ *  hears about `Level`, and a world loaded from it stays stale until a save writes it back. "What is
+ *  there now" is right for a route acting on a request; "what changed" is right for an event.
+ *
+ *  Only while it stays under the root: `canonicalPath` resolves symlinks, so a linked subfolder, or a
+ *  root reached through a link (`/var` → `/private/var`), canonicalises OUTSIDE the lexical root —
+ *  compared against the canonical root it stays inside. And the on-disk spelling is taken only when
+ *  it differs from the caller's by CASE alone — a link INSIDE the root (`a` → `b`) canonicalises to
+ *  a different name that `scanDir` never keyed (it lists `a`), so there the lexical spelling is kept,
+ *  never a url derived from a link target. A missing path keeps the caller's spelling: there is no
+ *  on-disk name to prefer. */
+export function absToAssetUrl(absPath: string, roots: AssetRoot[], opts?: { onDisk?: boolean }): string | null {
   for (const root of roots) {
     const rel = path.relative(root.absDir, absPath);
     if (rel === '' || rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) continue;
-    // NFC-normalize, matching scanDir's normalization of the SAME urlPath — on macOS a
-    // filename with non-ASCII characters is stored NFD on disk, and without this the two
-    // disagree: the watcher's urlPath here misses the NFC-keyed pathToGuid lookup, so
-    // invalidateShader falls back to a wholesale cache clear instead of a per-key eviction.
-    return (root.urlPrefix + '/' + rel.split(path.sep).join('/')).replace(/\/+/g, '/').normalize('NFC');
+    if (opts?.onDisk !== true) return toAssetUrl(root.urlPrefix, rel);
+    const onDisk = path.relative(canonicalPath(root.absDir), canonicalPath(absPath));
+    if (onDisk !== '' && onDisk !== '..' && !onDisk.startsWith('..' + path.sep) && !path.isAbsolute(onDisk)
+      && pathCaseKey(onDisk.normalize('NFC')) === pathCaseKey(rel.normalize('NFC'))) {
+      return toAssetUrl(root.urlPrefix, onDisk);
+    }
+    return toAssetUrl(root.urlPrefix, rel);
   }
   return null;
+}
+
+function toAssetUrl(urlPrefix: string, rel: string): string {
+  // NFC-normalize, matching scanDir's normalization of the SAME urlPath — on macOS a
+  // filename with non-ASCII characters is stored NFD on disk, and without this the two
+  // disagree: the watcher's urlPath here misses the NFC-keyed pathToGuid lookup, so
+  // invalidateShader falls back to a wholesale cache clear instead of a per-key eviction.
+  return (urlPrefix + '/' + rel.split(path.sep).join('/')).replace(/\/+/g, '/').normalize('NFC');
 }
 
 /** True when `file` sits inside one of the asset roots. Separators are normalized on
@@ -2081,7 +2114,7 @@ export function assetScannerPlugin(): Plugin {
             projectRoot,
             editorRoot,
             resolveAssetPath: (p) => resolveAssetPath(p, assetRoots),
-            absToAssetUrl: (p) => absToAssetUrl(p, assetRoots),
+            absToAssetUrl: (p, opts) => absToAssetUrl(p, assetRoots, opts),
             firstRootDir: () => assetRoots[0]?.absDir ?? null,
             getManifest: () => cachedManifest,
             rebuildManifest,

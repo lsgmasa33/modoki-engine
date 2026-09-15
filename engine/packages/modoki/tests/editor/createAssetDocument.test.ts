@@ -5,10 +5,12 @@
  *  dialog was never a guard, and three of the paths have no dialog at all.
  *
  *  The route's `ifNoneMatch:'*'` is modelled by the stub below exactly as `/api/write-file` answers
- *  it (409, nothing written) — `tests/plugins/assetWritePreconditions.test.ts` pins the real route. */
+ *  it (409, nothing written, `existingPath` naming what is there) — and, like APFS/NTFS, the stub
+ *  matches a path CASE-INSENSITIVELY and keeps the stored spelling (#1273).
+ *  `tests/plugins/assetWritePreconditions.test.ts` pins the real route. */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { writeNewAssetDocument, assetFileExists, mayCreateOver, otherAssetKindAt } from '../../src/editor/scene/createAssetDocument';
+import { writeNewAssetDocument, existingAssetPath, mayCreateOver, otherAssetKindAt } from '../../src/editor/scene/createAssetDocument';
 import { registerAsset, unregisterAsset } from '../../src/runtime/loaders/assetManifest';
 import { markAssetDirty, getDirtyAssetPaths, clearDirtyAssets } from '../../src/editor/scene/dirtyAssets';
 
@@ -19,24 +21,38 @@ const PATH = '/assets/anims/Walk.anim.json';
 let onDisk = new Map<string, string>();
 let writes: Array<{ path: string; content: string; createOnly: boolean }> = [];
 let failWrites = false;
+/** Off → the route answers as it did before #1273, with no `existingPath` / `path`. */
+let routeNamesExisting = true;
+/** The spelling the route reports for a write it made — a folder the filesystem folded, say. */
+let writtenAs = (p: string) => p;
+/** The stored spelling of `p`, matched case-insensitively — what a case-insensitive filesystem does. */
+const storedAs = (p: string) => [...onDisk.keys()].find((k) => k.toLowerCase() === p.toLowerCase());
 
 beforeEach(() => {
   onDisk = new Map();
   writes = [];
   failWrites = false;
+  routeNamesExisting = true;
+  writtenAs = (p) => p;
   vi.stubGlobal('fetch', vi.fn(async (url: string, init?: { body?: string }) => {
     const u = String(url);
     if (u.endsWith('/api/write-file')) {
       if (failWrites) return { ok: false, status: 403, json: async () => ({}) } as unknown as Response;
       const b = JSON.parse(init?.body ?? '{}') as { path: string; content: string; ifNoneMatch?: string };
-      if (b.ifNoneMatch === '*' && onDisk.has(b.path)) return { ok: false, status: 409, json: async () => ({}) } as unknown as Response;
+      const existing = storedAs(b.path);
+      if (b.ifNoneMatch === '*' && existing) {
+        return { ok: false, status: 409, json: async () => (routeNamesExisting ? { existingPath: existing } : {}) } as unknown as Response;
+      }
       writes.push({ path: b.path, content: b.content, createOnly: b.ifNoneMatch === '*' });
-      onDisk.set(b.path, b.content);
-      return { ok: true, status: 200, json: async () => ({ ok: true }) } as unknown as Response;
+      const stored = existing ?? writtenAs(b.path);
+      onDisk.set(stored, b.content);
+      return { ok: true, status: 200, json: async () => ({ ok: true, ...(routeNamesExisting ? { path: stored } : {}) }) } as unknown as Response;
     }
     if (u.includes('/api/exists')) {
       const p = decodeURIComponent(u.split('path=')[1] ?? '');
-      return { ok: true, status: 200, json: async () => ({ exists: onDisk.has(p) }) } as unknown as Response;
+      const existing = storedAs(p);
+      const body = existing ? { exists: true, ...(routeNamesExisting ? { path: existing } : {}) } : { exists: false };
+      return { ok: true, status: 200, json: async () => body } as unknown as Response;
     }
     const served = [...onDisk.entries()].find(([p]) => u.endsWith(p));
     if (served) return { ok: true, status: 200, text: async () => served[1], json: async () => JSON.parse(served[1]) } as unknown as Response;
@@ -147,11 +163,20 @@ describe('failures', () => {
   });
 });
 
-describe('assetFileExists (the pre-check for a create that discards the world first)', () => {
+describe('existingAssetPath (the pre-check for a create that discards the world first)', () => {
   it('answers from /api/exists, not a raw fetch the SPA fallback would answer 200', async () => {
     onDisk.set('/assets/scenes/level.json', '{}');
-    expect(await assetFileExists('/assets/scenes/level.json')).toBe(true);
-    expect(await assetFileExists('/assets/scenes/none.json')).toBe(false);
+    expect(await existingAssetPath('/assets/scenes/level.json')).toBe('/assets/scenes/level.json');
+    expect(await existingAssetPath('/assets/scenes/none.json')).toBeNull();
+  });
+  it('names the ON-DISK spelling when the filesystem folded the case (#1273)', async () => {
+    onDisk.set('/assets/scenes/Level.json', '{}');
+    expect(await existingAssetPath('/assets/scenes/level.json')).toBe('/assets/scenes/Level.json');
+  });
+  it('a route that names nothing keeps the requested spelling', async () => {
+    routeNamesExisting = false;
+    onDisk.set('/assets/scenes/Level.json', '{}');
+    expect(await existingAssetPath('/assets/scenes/level.json')).toBe('/assets/scenes/level.json');
   });
 });
 
@@ -159,14 +184,14 @@ describe('mayCreateOver (Create Scene asks before its override discards the worl
   const SCENE = '/assets/scenes/level.json';
   it('a free path goes ahead without asking', async () => {
     let asked = false;
-    expect(await mayCreateOver(SCENE, async () => { asked = true; return false; }, 'scene')).toBe('create');
+    expect(await mayCreateOver(SCENE, async () => { asked = true; return false; }, 'scene')).toEqual({ create: SCENE });
     expect(asked).toBe(false);
   });
   it('an existing scene asks, naming it, and the answer decides', async () => {
     onDisk.set(SCENE, '{}');
     const asked: string[] = [];
     expect(await mayCreateOver(SCENE, async (p) => { asked.push(p); return false; }, 'scene')).toBe('declined');
-    expect(await mayCreateOver(SCENE, async () => true, 'scene')).toBe('create');
+    expect(await mayCreateOver(SCENE, async () => true, 'scene')).toEqual({ create: SCENE });
     expect(asked).toEqual([SCENE]);
   });
   it('an existing asset of ANOTHER kind is refused without asking', async () => {
@@ -202,5 +227,70 @@ describe('a Replace across KINDS is refused, never kept (#1264 close-out)', () =
     expect(otherAssetKindAt('/assets/scenes/never-indexed.json', 'scene')).toBeUndefined();
     expect(otherAssetKindAt(PREFAB, 'prefab')).toBeUndefined();
     expect(otherAssetKindAt(PREFAB, 'scene')).toBe('prefab');
+  });
+});
+
+describe('a CASE-VARIANT of an existing asset (#1273) — the filesystem folds it, the manifest does not', () => {
+  // Save Scene As typed `enemy.prefab.json` while `Enemy.prefab.json` exists. The create-only write 409s
+  // (the filesystem matched), but the manifest keys the prefab by its on-disk spelling: asking about the
+  // TYPED one found no asset, no kind to refuse, and replaced a prefab with a scene.
+  const ON_DISK = '/assets/prefabs/Enemy.prefab.json';
+  const TYPED = '/assets/prefabs/enemy.prefab.json';
+  beforeEach(() => { onDisk.set(ON_DISK, `{"id":"${OLD}","entities":[]}\n`); registerAsset(OLD, ON_DISK, 'prefab'); });
+
+  it('a scene over it → wrongKind naming the real file, not asked, nothing written', async () => {
+    let asked = false;
+    const r = await writeNewAssetDocument(TYPED, doc, { guid: FRESH, kind: 'scene', confirmReplace: async () => { asked = true; return true; } });
+    expect(r).toEqual({ outcome: 'wrongKind', path: ON_DISK, existingType: 'prefab' });
+    expect(asked).toBe(false);
+    expect(writes).toEqual([]);
+  });
+
+  it('the same kind asks about the REAL file, keeps its guid, and writes and reports its spelling', async () => {
+    const asked: string[] = [];
+    const r = await writeNewAssetDocument(TYPED, doc, { guid: FRESH, kind: 'prefab', confirmReplace: async (p) => { asked.push(p); return true; } });
+    expect(r).toMatchObject({ outcome: 'replaced', path: ON_DISK, guid: OLD });
+    expect(asked).toEqual([ON_DISK]);
+    expect(writes).toEqual([{ path: ON_DISK, content: doc(OLD), createOnly: false }]);
+  });
+
+  it('the Replace drops a parked edit held under the REAL spelling', async () => {
+    markAssetDirty(ON_DISK, 'animation', { id: OLD, edited: true }, 'panel');
+    await writeNewAssetDocument(TYPED, doc, { confirmReplace: async () => true });
+    expect(getDirtyAssetPaths()).not.toContain(ON_DISK);
+  });
+
+  it('mayCreateOver: another kind is refused, the same kind creates at the REAL file', async () => {
+    expect(await mayCreateOver(TYPED, async () => true, 'scene')).toEqual({ existingType: 'prefab' });
+    const asked: string[] = [];
+    expect(await mayCreateOver(TYPED, async (p) => { asked.push(p); return true; }, 'prefab')).toEqual({ create: ON_DISK });
+    expect(asked).toEqual([ON_DISK]);
+  });
+
+  it('a route that names nothing degrades to the requested spelling rather than failing', async () => {
+    routeNamesExisting = false;
+    const r = await writeNewAssetDocument(TYPED, doc, { guid: FRESH, confirmReplace: async () => false });
+    expect(r).toEqual({ outcome: 'declined', path: TYPED });
+  });
+});
+
+describe('a NEW file inside a folder typed in another case (#1273 close-out review)', () => {
+  // The create succeeds — the filesystem puts it in the folder that exists — and the scanner keys it by
+  // that folder's spelling. Registering the typed one would give the manifest a key no scan produces.
+  const TYPED = '/assets/SCENES/new.json';
+  const ON_DISK = '/assets/scenes/new.json';
+
+  it('reports, and drops parked edits under, the path the route says it wrote', async () => {
+    writtenAs = (p) => (p === TYPED ? ON_DISK : p);
+    markAssetDirty(ON_DISK, 'animation', { stale: true }, 'panel');
+    const r = await writeNewAssetDocument(TYPED, doc, { guid: FRESH });
+    expect(r).toEqual({ outcome: 'created', path: ON_DISK, guid: FRESH });
+    expect(getDirtyAssetPaths()).not.toContain(ON_DISK);
+  });
+
+  it('a route that names nothing keeps the requested spelling', async () => {
+    routeNamesExisting = false;
+    const r = await writeNewAssetDocument(TYPED, doc, { guid: FRESH });
+    expect(r).toEqual({ outcome: 'created', path: TYPED, guid: FRESH });
   });
 });

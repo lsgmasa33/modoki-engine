@@ -30,6 +30,7 @@ import {
   collectInstanceOverrideFields, addedKey, removedEntityKey, removedTraitKey,
   type EntityOverrideNode,
 } from '../scene/prefabOverrideKeys';
+import { ModalShell } from '../components/ModalShell';
 
 // The dialog's tree node is the shared shape exactly — aliased locally so the rest
 // of this file (predating the extraction) doesn't need a wholesale rename.
@@ -373,10 +374,7 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
   };
 
   return (
-    <div style={{
-      position: 'fixed', inset: 0, zIndex: 9999,
-      background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center',
-    }}>
+    <ModalShell kind={`prefab-${mode}`}>
       <div style={{
         background: '#1e1e30', border: '1px solid #555', borderRadius: 6,
         padding: '16px 20px', width: 540, maxHeight: '80vh', display: 'flex', flexDirection: 'column',
@@ -498,6 +496,6 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
           >{confirmLabel}</button>
         </div>
       </div>
-    </div>
+    </ModalShell>
   );
 }

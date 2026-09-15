@@ -9,8 +9,7 @@
  *  islands, or hand-drawn rects (create / move / resize / pivot / rename / delete).
  *  Dev-only (lives under the editor tree, not shipped). */
 
-import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react';
-import { useOverlay } from '../input/useOverlayEscape';
+import { useEffect, useId, useLayoutEffect, useRef, useState, useCallback } from 'react';
 import { isTextEditable } from '../input/focusScope';
 import { register, registerBindings } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
@@ -32,6 +31,7 @@ import { createCoalescedEdit, type CoalescedEdit } from './coalescedEdit';
 import { BufferedNumberInput } from './fields';
 import { resizeSliceRect, moveSliceRect, type Handle } from './sliceDrag';
 import { useDragPointerCapture, pressIsOnScrollbar } from './dragPointerCapture';
+import { ModalShell } from '../components/ModalShell';
 
 type DragMode =
   | { kind: 'none' }
@@ -453,7 +453,10 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
   // YIELDS, so resolution fell through to `app.undo` (app-chord, always eligible) and the
   // scene undo ran underneath the modal — the exact failure the original guarded against.
   // Claiming and preventing are separate decisions, so they are separate fields.
-  const overlayId = useOverlay(true, 'sprite-editor');
+  // The modal's overlay id, pushed by the `ModalShell` below. Known here first because these
+  // bindings name it as their owner. The modal kind already blocks the app's undo underneath
+  // (#1270); these claims are what make ⌘Z run the SLICE undo instead of yielding to nothing.
+  const overlayId = `sprite-editor${useId()}`;
   useEffect(() => {
     const notTyping = () => !isTextEditable(document.activeElement);
     // No `when`: these ALWAYS claim, denying the chord to the app scope. `run` no-ops while
@@ -726,7 +729,7 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
   // IS the cancel and there is nothing to lose. Guarded by
   // engine/tests/architecture/modalDismissScope.test.ts.
   return (
-    <div style={overlay}>
+    <ModalShell kind="sprite-editor" id={overlayId} zIndex={10000} scrim="rgba(0,0,0,0.6)">
       <div style={dialog}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
           <div style={{ color: '#fff', fontSize: 13, fontWeight: 'bold' }}>Sprite Editor — {name}</div>
@@ -821,7 +824,7 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
           <button data-ui-id="spriteEditor.save" style={{ ...btn, background: '#2ecc71', border: '1px solid #27ae60', color: '#fff' }} onClick={save}>Save</button>
         </div>
       </div>
-    </div>
+    </ModalShell>
   );
 }
 
@@ -906,7 +909,6 @@ function detectAlphaIslands(img: HTMLImageElement, w: number, h: number, thresho
 }
 
 // ── small styled bits ──
-const overlay: React.CSSProperties = { position: 'fixed', inset: 0, zIndex: 10000, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center' };
 const dialog: React.CSSProperties = {
   background: '#1e1e30', border: '1px solid #555', borderRadius: 6, padding: 14, fontFamily: 'monospace',
   // Resizable window: drag the bottom-right corner. Flex column so the canvas viewport

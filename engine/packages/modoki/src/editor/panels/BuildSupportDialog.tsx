@@ -12,6 +12,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import { backendFetch, backendEventSource } from '../backend/editorBackend';
+import { ModalShell } from '../components/ModalShell';
 
 interface GuideLink { label: string; url: string }
 interface GuideDoc { id: string; title: string; steps: string[]; links?: GuideLink[]; canAutoInstall: boolean }
@@ -272,7 +273,7 @@ export default function BuildSupportDialog() {
   return (
     // Backdrop does NOT close on click — the dialog is dismissed only via the Close button (and never
     // while an install/remove is in flight). A stray outside click shouldn't lose your place mid-setup.
-    <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+    <ModalShell kind="build-support">
       <div style={{
         position: 'relative',
         background: '#1e1e30', border: '1px solid #555', borderRadius: 6, padding: '16px 20px',
@@ -409,6 +410,6 @@ export default function BuildSupportDialog() {
           <button data-ui-id="buildSupport.footer.close" data-ui-kind="button" data-ui-label="Close" onClick={close} style={btn()}>Close</button>
         </div>
       </div>
-    </div>
+    </ModalShell>
   );
 }

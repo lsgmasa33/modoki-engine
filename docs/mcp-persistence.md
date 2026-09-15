@@ -836,7 +836,17 @@ checked the exact destination (`scene.json`), it does not ask a second time.
 would resolve to a scene document. A destination the manifest types as another kind is refused
 before any question (`otherAssetKindAt`). Only the scene flows pass `kind`: every other create
 enforces a compound extension. A file the manifest has not indexed yet cannot be classified and is
-not refused, and neither is a case-variant name on a case-insensitive filesystem (#1273).
+not refused.
+
+**A case-variant name resolves to the file that is really there** (#1273). On APFS/NTFS the create-only
+check folds case, so `enemy.prefab.json` 409s over `Enemy.prefab.json` — while the manifest keys the
+prefab by its on-disk name, so asking it about the TYPED spelling found no asset and no kind to refuse.
+The 409 (and `/api/exists`) now answer with the existing file's on-disk path (`existingPath` / `path`),
+and `writeNewAssetDocument` / `mayCreateOver` switch to it for every step after the conflict: the kind
+check, the Replace question, the kept guid, the replacing write, the parked-edit drop, and the path the
+caller registers. That last one is why each create caller reads `result.path` rather than the path it
+asked for — registering the typed spelling would give the manifest a second key for one file. The
+spelling comes from `absToAssetUrl`; see "Asset urls take the disk's spelling" below.
 
 **Not verified: stale live display.** A Replace keeps the guid, and `/api/write-file` skips the
 watcher for the editor's own writes. So an entity already showing a replaced particle, clip or rig
@@ -1066,11 +1076,48 @@ which skips the probe and lets the repair drop the work as before). Three detail
   edited" is still the right rule for them. Same flag and meaning as on `/api/write-meta`.
 - **The probe is global and filtered at the route**, exact path or `folder + '/'`, because a folder
   delete takes every hold beneath it and the renderer's per-path matchers answer about one path.
-  The match is **case-insensitive** (on APFS/NTFS `absToAssetUrl` echoes the request's casing, so
-  `/FX/a.json` trashes the file a hold calls `/fx/a.json`), and a path with **no canonical url** —
-  the asset root — counts as containing every hold rather than skipping the probe. Both were found
-  by the close-out review and reproduced. The repair itself still compares exactly, so a
-  case-mismatched `discardUnsaved` delete can strand the park: #1261.
+  The match is **case-insensitive** (on APFS/NTFS `/FX/a.json` trashes the file a hold calls
+  `/fx/a.json`), and a path with **no canonical url** — the asset root — counts as containing every
+  hold rather than skipping the probe. Both were found by the close-out review and reproduced. The
+  fold stays even though the candidates now carry the disk's spelling (#1261, below): a path reached
+  through a symlinked folder is still spelled lexically, and a refusal gate that misses is the unsafe
+  direction.
+
+**Asset urls take the disk's spelling (#1261, #1273).** `resolveAssetPath` is lexical, and an fs op on
+its result acts on whichever file matches in any case, while `scanDir` keys the manifest and every
+renderer registry by the on-disk name. So a route answering about a request asks
+`absToAssetUrl(abs, { onDisk: true })`, which spells an EXISTING path the way the disk does
+(`canonicalPath`, i.e. `realpathSync.native`) — and until it did, a case-mismatched move or delete
+repaired no binding (`applyMove` compares exactly) and the next Cmd+S resurrected the file, reporting
+`ok:true` throughout. The callers are the delete and move repair lists, the create-only 409, a
+successful `/api/write-file`'s `path` (a NEW file created in a folder typed in another case lands in the
+folder that exists, so `writeNewAssetDocument` reports and its caller registers that spelling),
+`/api/exists`, `/api/import-file`'s manifest lookup of its own copy (lexically it 422'd a good import
+into a folder named in another case), and `/api/save-dialog`'s `existingPath`. That last route answers
+TWO spellings on purpose: `path` is what the human typed, which `ensureExt` builds the new file's name
+from, and `existingPath` is the file the panel's own Replace question was about, which
+`chooseNewAssetPath` compares against the create's 409 to skip asking twice (`saveDialogReply`, testable
+without osascript). ⚠️ That skip rests on an
+unobserved premise — that the macOS panel's "already exists" check folds case as APFS does. Four
+limits, each deliberate:
+- **The watcher never passes it** (observed by the close-out review). A chokidar path already IS the
+  disk's spelling at its event, so canonicalising can only change it after a rename — and after an
+  out-of-editor `Level.scene.json` → `level.scene.json` it reported the OLD file's `unlink` under the
+  new name. `handleSceneChanged` matches exactly, so a world loaded from `Level` was never told, and
+  its next save wrote the stale world back. An event names what changed; a route names what is there.
+- **Only a case-only difference is taken.** `canonicalPath` resolves symlinks, so a linked folder
+  INSIDE a root canonicalises to its target's name, which `scanDir` never keyed; there the lexical
+  spelling stays. A root reached through a link (`/var` → `/private/var`) is compared against its own
+  canonical form, so it still gets the disk's spelling under its own `urlPrefix`.
+- **A missing path keeps the caller's spelling** — there is no on-disk name to prefer. That is why
+  `/api/move-file` takes the SOURCE url before `moveAssetFile`: afterwards the source is gone.
+- **Not fixed: the write guard key.** `/api/write-file` still fingerprints the request's spelling
+  (`markEditorWrite`), and so does `/api/move-file` for its source and landings. The create flows now
+  write to the on-disk spelling, so they are unaffected; an agent write, or a move INTO a folder named
+  in another case, may reach the watcher as a foreign change and drop a parked edit — unverified.
+
+Cover: `engine/tests/plugins/assetUrlDiskCasing.test.ts`, against the real resolver on a scratch dir,
+skipped on a case-sensitive filesystem where the defect cannot occur.
 - **`liveScene` is not asked.** Trashing the file a live world was loaded from destroys nothing in
   the world; the next save writes it back. The ledger row narrowed to that registry alone.
 
