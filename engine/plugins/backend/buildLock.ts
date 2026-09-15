@@ -196,8 +196,13 @@ export interface ReleasePolicy {
   /** The HTTP response closed — a normal end, or the client disconnecting. */
   onResponseClose(): void;
   /** The async pipeline is about to spawn its first child. Must be called SYNCHRONOUSLY, before the
-   *  first `await`, or a disconnect in that window sees an un-started pipeline and releases. */
-  onPipelineStart(): void;
+   *  first `await`, or a disconnect in that window sees an un-started pipeline and releases.
+   *
+   *  Returns `false` when the response ALREADY closed and the slot is already released — the caller
+   *  must then start nothing. Each route awaits setup (`buildStepEnv`) between registering the close
+   *  handler and this call, and a client that left during that await freed the slot; starting anyway
+   *  ran the whole publish (build into `dist`, then the upload) holding no slot (#1259 close-out). */
+  onPipelineStart(): boolean;
   /** The pipeline stopped — every step settled, or it returned/threw early. */
   onPipelineEnd(): void;
 }
@@ -208,7 +213,11 @@ export function releasePolicy(release: () => void): ReleasePolicy {
   const fire = () => { if (!done) { done = true; release(); } };
   return {
     onResponseClose: () => { if (!started) fire(); },
-    onPipelineStart: () => { started = true; },
+    onPipelineStart: () => {
+      if (done) return false;
+      started = true;
+      return true;
+    },
     onPipelineEnd: fire,
   };
 }

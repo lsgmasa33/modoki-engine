@@ -84,6 +84,7 @@ import { reclaimStaleDeviceStateAtStartup, shouldReclaimDeviceStateHere } from '
 import { healNativeProject } from './healNativeProject';
 import { injectedBuildNumbers, writeBuildNumberArgFiles } from './healNativeConfig';
 import { spawnBuildCommand, killBuildProcess, resolveBuildStep, type BuildStep } from './buildStepShell';
+import { catchMiddlewareRejection, runSsePipeline } from './ssePipeline';
 import {
   parseBuildVariant, keystoreRefusal, renderKeystoreProperties, renderExportOptionsPlist,
   androidReleaseSteps, iosReleaseSteps, iosDebugBuildStep, androidDebugBuildStep, debugBuildReleaseWarning,
@@ -2009,7 +2010,10 @@ export function assetScannerPlugin(): Plugin {
         listAssets: () => scanAllAssets(assetRoots),
       };
 
-      server.middlewares.use(async (req, res, next) => {
+      // `catchMiddlewareRejection` (#1259): connect catches only a SYNCHRONOUS throw, so without it a
+      // rejection in this async handler — e.g. between an SSE route's headers and its pipeline —
+      // left the request open and the dialog spinning. See ssePipeline.ts.
+      server.middlewares.use(catchMiddlewareRejection(async (req, res, next) => {
         // Serve project asset bytes (files, Basis transcoder, cached LOD GLB /
         // texture variants) via the SAME shared function the Electron backend
         // uses — parity. Returns null ⇒ fall through to Vite module serving.
@@ -2242,38 +2246,36 @@ export function assetScannerPlugin(): Plugin {
             proc.on('error', (e) => { activeProc = null; send(`ERROR: ${e.message}`); resolve(false); });
           });
 
-          scaffoldRelease.onPipelineStart();
-          (async () => {
+          // The client left during setup: the slot is already released, so start nothing (#1259 close-out).
+          if (!scaffoldRelease.onPipelineStart()) return;
+          // `runSsePipeline` (#1259) turns a throw — scaffoldNativeTarget refuses by throwing — into the
+          // final `FAILED:` status and ends the stream.
+          void runSsePipeline(res, `Add ${platform} target`, async () => {
             const TOTAL = 5;
-            try {
-              // #581: existsSync(nativeDir) alone can't tell a genuine target from a folder a
-              // killed `cap add`/`cap sync` left half-written — isNativeTargetScaffolded checks
-              // for the platform's real project file. An incomplete folder falls through into
-              // scaffoldNativeTarget below, which removes it and re-scaffolds cleanly.
-              if (isNativeTargetScaffolded(projectRoot, platform)) {
-                sendStatus(`FAILED:${platform}/ already exists`);
-                send(`This project already has a ${platform}/ folder — nothing to do.`);
-                res.end();
-                return;
-              }
-              if (fs.existsSync(nativeDir)) {
-                send(`Found an incomplete ${platform}/ folder from an earlier interrupted scaffold — repairing it.`);
-              }
-              // Progress is coarse-grained here (the shared helper streams its own
-              // per-step `── label ──` lines); nudge the step bar around the phases.
-              sendStep(1, TOTAL); sendStatus('Scaffolding native target…');
-              const { warnings: fb } = await scaffoldNativeTarget({ projectRoot, platform, buildCwd, cfg, send, runShell });
-              for (const w of fb) send(`⚠️  ${w}`);
-
-              sendStep(TOTAL, TOTAL);
-              sendStatus('DONE');
-              send(`✅ ${platform} target added for "${cfg.app.appName}" (${cfg.app.appId}).${fb.length ? ' See Firebase warning(s) above.' : ''}`);
+            // #581: existsSync(nativeDir) alone can't tell a genuine target from a folder a
+            // killed `cap add`/`cap sync` left half-written — isNativeTargetScaffolded checks
+            // for the platform's real project file. An incomplete folder falls through into
+            // scaffoldNativeTarget below, which removes it and re-scaffolds cleanly.
+            if (isNativeTargetScaffolded(projectRoot, platform)) {
+              sendStatus(`FAILED:${platform}/ already exists`);
+              send(`This project already has a ${platform}/ folder — nothing to do.`);
               res.end();
-            } catch (e) {
-              sendStatus(`FAILED:${e instanceof Error ? e.message : String(e)}`);
-              res.end();
+              return;
             }
-          })().finally(scaffoldRelease.onPipelineEnd);
+            if (fs.existsSync(nativeDir)) {
+              send(`Found an incomplete ${platform}/ folder from an earlier interrupted scaffold — repairing it.`);
+            }
+            // Progress is coarse-grained here (the shared helper streams its own
+            // per-step `── label ──` lines); nudge the step bar around the phases.
+            sendStep(1, TOTAL); sendStatus('Scaffolding native target…');
+            const { warnings: fb } = await scaffoldNativeTarget({ projectRoot, platform, buildCwd, cfg, send, runShell });
+            for (const w of fb) send(`⚠️  ${w}`);
+
+            sendStep(TOTAL, TOTAL);
+            sendStatus('DONE');
+            send(`✅ ${platform} target added for "${cfg.app.appName}" (${cfg.app.appId}).${fb.length ? ' See Firebase warning(s) above.' : ''}`);
+            res.end();
+          }, scaffoldRelease.onPipelineEnd);
           return;
         }
 
@@ -2312,40 +2314,35 @@ export function assetScannerPlugin(): Plugin {
             return;
           }
 
-          (async () => {
-            try {
-              // Ensure a provisioned Node first so install()'s npm runs on it (not system
-              // npm) in the packaged editor — the Vite process can't inherit main's
-              // MODOKI_NODE, so mirror buildStepEnv's ensureNode and publish the result onto
-              // process.env (idempotent; npmSpawnSpec reads it).
-              const stepEnv = await buildStepEnv();
-              if (stepEnv.MODOKI_NODE) process.env.MODOKI_NODE = stepEnv.MODOKI_NODE;
-              if (stepEnv.MODOKI_NPM_CLI) process.env.MODOKI_NPM_CLI = stepEnv.MODOKI_NPM_CLI;
-              // WebDriverAgent is signed per MACHINE, but the Team ID is only ever authored
-              // per PROJECT — so seed the machine setting from the open project the first time,
-              // HERE rather than inside install(). install() deliberately takes no project
-              // context (no other installer does, and threading it through would widen the
-              // toolchain contract for one tool); this route already knows the project.
-              // Only seeds when unset, so a team chosen in Build Support is never overwritten
-              // by whichever project happens to be open.
-              if (id === 'webdriveragent' && !wdaTeamId()) {
-                const team = loadProjectConfig(projectRoot).build.appleTeamId.trim();
-                if (team) {
-                  writeToolchainSettings({ wdaTeamId: team });
-                  send(`Signing WebDriverAgent with Apple Team ${team} (from this project; it is now the machine default).`);
-                }
+          // `runSsePipeline` (#1259): an install failure throws, and becomes the final `FAILED:` status.
+          void runSsePipeline(res, `Install ${id}`, async () => {
+            // Ensure a provisioned Node first so install()'s npm runs on it (not system
+            // npm) in the packaged editor — the Vite process can't inherit main's
+            // MODOKI_NODE, so mirror buildStepEnv's ensureNode and publish the result onto
+            // process.env (idempotent; npmSpawnSpec reads it).
+            const stepEnv = await buildStepEnv();
+            if (stepEnv.MODOKI_NODE) process.env.MODOKI_NODE = stepEnv.MODOKI_NODE;
+            if (stepEnv.MODOKI_NPM_CLI) process.env.MODOKI_NPM_CLI = stepEnv.MODOKI_NPM_CLI;
+            // WebDriverAgent is signed per MACHINE, but the Team ID is only ever authored
+            // per PROJECT — so seed the machine setting from the open project the first time,
+            // HERE rather than inside install(). install() deliberately takes no project
+            // context (no other installer does, and threading it through would widen the
+            // toolchain contract for one tool); this route already knows the project.
+            // Only seeds when unset, so a team chosen in Build Support is never overwritten
+            // by whichever project happens to be open.
+            if (id === 'webdriveragent' && !wdaTeamId()) {
+              const team = loadProjectConfig(projectRoot).build.appleTeamId.trim();
+              if (team) {
+                writeToolchainSettings({ wdaTeamId: team });
+                send(`Signing WebDriverAgent with Apple Team ${team} (from this project; it is now the machine default).`);
               }
-              sendStatus(`Installing ${id}…`);
-              const result = await installTool(id, { toolchainDir, onLog: (line) => send(line) });
-              sendStatus('DONE');
-              send(`✅ Installed ${id} → ${result.path}`);
-            } catch (e) {
-              sendStatus(`FAILED:${e instanceof Error ? e.message : String(e)}`);
-              send(`ERROR: ${e instanceof Error ? e.message : String(e)}`);
-            } finally {
-              res.end();
             }
-          })();
+            sendStatus(`Installing ${id}…`);
+            const result = await installTool(id, { toolchainDir, onLog: (line) => send(line) });
+            sendStatus('DONE');
+            send(`✅ Installed ${id} → ${result.path}`);
+            res.end();
+          });
           return;
         }
 
@@ -3108,8 +3105,12 @@ export function assetScannerPlugin(): Plugin {
           // From here the pipeline owns the build slot (see the two-owners note above) — set
           // SYNCHRONOUSLY, before the first `await`, so a disconnect can never observe a started
           // pipeline as un-started and release the slot out from under it.
-          slotRelease.onPipelineStart();
-          (async () => {
+          // The client left during setup (the `await` above): the slot is already released, so start nothing.
+          if (!slotRelease.onPipelineStart()) return;
+          // `runSsePipeline` (#1259): a rejection anywhere below still ends the stream with a `FAILED:`
+          // status (the observed one: `healNativeProject` on a malformed project package.json), and the
+          // slot goes back exactly once either way.
+          void runSsePipeline(res, `${platform}${isRelease ? ' release' : ''} build`, async () => {
             // First native build with no ios/android folder → scaffold it inline,
             // then PAUSE if it flags something the user must supply (missing
             // Firebase config) so they can act before the build runs against it.
@@ -3193,9 +3194,9 @@ export function assetScannerPlugin(): Plugin {
               for (const n of [...buildNumbers.notes, ...buildNumbers.platformNotes[platform]]) send(`[build] ${n}`);
               send(`[build] build number passed to the ${platform} build: ${buildNumbers[platform] ?? '(none — the committed value is used)'}`);
             }
-            // ⚠️ Every GENERATED input below is written inside ONE try: a throw would otherwise escape into
-            // the build's .finally with no status sent and leave the dialog spinning. Reported as a failed
-            // build instead, like the heal failures above.
+            // Every GENERATED input below is written inside ONE try, so a failed write is reported in the
+            // words below rather than as a bare error. `runSsePipeline` would still end the stream with a
+            // `FAILED:` status without it (#1259); this try is for the message, not the guard.
             try {
               // The gradle steps name the init script (gradleBuildNumberArg), and a hand-run build reads the
               // args files. Written after the heal and the auto-scaffold, like the release inputs below.
@@ -3323,10 +3324,10 @@ export function assetScannerPlugin(): Plugin {
             // "built" for the playable (nothing is deployed — the one HTML file IS the artifact); "deployed" for the rest.
             send(`\n✅ ${label} ${platform === 'playable' ? 'built' : 'build deployed'} successfully!`);
             res.end();
-            // `finally`, not a tail call: the body has ~9 early `return`s (an aborted step, a failed
+            // `onEnd`, not a tail call: the body has ~9 early `return`s (an aborted step, a failed
             // step, a paused scaffold) and can reject, and every one of them must give the slot
             // back — a leaked slot refuses every future build until the editor restarts.
-          })().finally(slotRelease.onPipelineEnd);
+          }, slotRelease.onPipelineEnd);
           return;
         }
 
@@ -3503,8 +3504,10 @@ export function assetScannerPlugin(): Plugin {
 
           // From here the publish pipeline owns the slot, not the socket — see the two-owners note
           // on /api/build's acquire. Set synchronously, before the first `await`.
-          otaRelease.onPipelineStart();
-          (async () => {
+          // The client left during setup: the slot is already released, so start nothing (#1259 close-out).
+          if (!otaRelease.onPipelineStart()) return;
+          // `runSsePipeline` (#1259): e.g. the CORS step's temp-file write throws on an unwritable TMPDIR.
+          void runSsePipeline(res, 'OTA publish', async () => {
             // Step 1: build FRESH from the CURRENTLY OPEN project's project.config.json.
             // Never publish an arbitrary pre-built dist/ — that's how a stale pre-fix
             // build once silently overwrote a freshly-fixed native install over the air.
@@ -3594,12 +3597,12 @@ export function assetScannerPlugin(): Plugin {
               `Verify with modoki_ota_status.`,
             );
             res.end();
-          })().finally(otaRelease.onPipelineEnd);
+          }, otaRelease.onPipelineEnd);
           return;
         }
 
         next();
-      });
+      }));
     },
 
     // On build: tree-shake assets, convert textures, copy only what's referenced

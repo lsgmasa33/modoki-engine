@@ -161,6 +161,24 @@ describe('releasePolicy — which signal gives the slot back', () => {
     expect(calls.n).toBe(1);
   });
 
+  // #1259 close-out: every route awaits setup between registering the close handler and starting its
+  // pipeline. A client that left during that await already freed the slot; starting anyway ran the
+  // whole job holding nothing. `onPipelineStart` now says so, and the route starts nothing.
+  it('refuses to start once a disconnect during setup released the slot', () => {
+    const { calls, release } = spy();
+    const p = releasePolicy(release);
+    p.onResponseClose();
+    expect(calls.n).toBe(1);
+    expect(p.onPipelineStart()).toBe(false);
+    p.onPipelineEnd();
+    expect(calls.n).toBe(1);
+  });
+
+  it('agrees to start when nothing released the slot first', () => {
+    const p = releasePolicy(() => {});
+    expect(p.onPipelineStart()).toBe(true);
+  });
+
   it('releases once when the pipeline throws and close follows', () => {
     const { calls, release } = spy();
     const p = releasePolicy(release);

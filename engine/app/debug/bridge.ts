@@ -1340,9 +1340,11 @@ async function initNativeBridge() {
   GameDebug.addListener('request', async (data) => {
     const id = data.id;
     const method = data.method;
-    const params = typeof data.params === 'string' ? JSON.parse(data.params) : data.params;
 
+    // Everything that can throw sits inside the try — the parse included (#1259's mechanism): a
+    // rejection of this listener sends no response, and the host waits out its deadline instead.
     try {
+      const params = typeof data.params === 'string' ? JSON.parse(data.params) : data.params;
       // iOS screenshot: native capture via drawHierarchy (captures WebGL on iOS)
       // Android screenshots are handled by adb screencap in the MCP server
       if (method === 'screenshot') {
@@ -1417,7 +1419,7 @@ async function initNativeBridge() {
       const result = await handleMessage({ id, method, params });
       await GameDebug.sendResponse({ id, result: safeStringify(result) });
     } catch (e) {
-      await GameDebug.sendResponse({ id, error: (e as Error).message });
+      await GameDebug.sendResponse({ id, error: e instanceof Error ? e.message : String(e) });
     }
   });
 

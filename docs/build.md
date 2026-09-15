@@ -851,6 +851,42 @@ times, and one release rule cannot serve both:
   reloads the page, tearing down the EventSource mid-build, and a retry then writes the same dist
   from two processes. Exactly the bug the lock exists to prevent, re-entered through the back door.
 
+**Every stream ends with a status, even when the handler throws (#1259).** The dialog learns that a
+job is over in one way only: a final `DONE` or `FAILED:…` status followed by the response ending. A
+rejection used to skip both. The build and OTA pipelines ran in a detached `(async () => …)()` with
+only a `.finally`, which freed the slot and left the response open (add-native-target and toolchain
+install each had a hand-written `try`). The middleware is an `async` function,
+and connect catches only a synchronous throw. So the dialog spun until a human closed it. Observed:
+`healNativeProject` rejects on a malformed project `package.json` (a bare `JSON.parse` in
+`ensureCapacitorDeps`). A throw in the preflight half was worse, because that half releases the slot
+on `close`, and `close` never came, so every other build was refused until the dialog was dismissed.
+Both seams now go through `engine/plugins/ssePipeline.ts`:
+
+- `runSsePipeline` wraps all four SSE pipelines (build, OTA publish, add-native-target, toolchain
+  install). A rejection becomes `FAILED:<headline>\n<message>`, and the slot's `onPipelineEnd` still
+  runs exactly once.
+- `catchMiddlewareRejection` wraps the middleware. An open SSE response gets `FAILED:Unexpected
+  error`. Any other response goes to `next(err)`, which is what connect does for a synchronous throw.
+
+Neither writes to a response that is already over. A rejection after the handler's own `res.end()`
+(following `DONE` or a deliberate refusal) must not add a second verdict, and a disconnected client
+has nobody to tell. The message travels in the status only: the Build Support dialog appends every
+log line as well, so an extra `ERROR:` line showed it twice. A per-site `try` is still worth having
+where it words the failure better (the generated-input writes). It is no longer the only guard.
+`ssePipelineWiring.test.ts` refuses the literal detached async IIFE and the literal bare async
+middleware in `vite-asset-scanner.ts`. It does not recognise an equivalent written another way (a
+named async function, `Promise.resolve().then(async …)`), and says so.
+
+**A client that has left by the time setup finishes starts no job (#1259 close-out).** Each route registers the
+slot's `close` handler, then awaits setup (`buildStepEnv`), then starts its pipeline. A disconnect
+inside that await released the slot as "never started", and the pipeline started anyway, holding
+nothing. On `/api/ota/publish` the abort listener is registered after the await, so the whole publish
+ran: the build into `dist` and the upload. `onPipelineStart()` now returns `false` once `close` has
+released the slot, and every route returns without starting. In a dev editor the window is a
+microtask, so in practice no real disconnect lands in it. In a packaged editor that provisions Node,
+it lasts as long as `ensureNode` takes. A disconnect dispatched after the pipeline starts is the
+ordinary mid-pipeline abort: the pipeline keeps the slot, and the step it already spawned is killed.
+
 **Aborting a step kills the process GROUP, not the shell (#176).** For a long time the slot's
 guarantee was bounded by what "the pipeline stopped" could observe — the step's `bash` exiting — and
 that is weaker than it sounds. `bash -c` *exec-replaces* itself for a simple command (so vite,
