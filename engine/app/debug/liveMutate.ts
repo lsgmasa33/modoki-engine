@@ -289,7 +289,9 @@ function guardParentWrite(ids: number[], writes: ParsedWrite[]): LiveMutateFailu
         ok: false,
         error: refusal === 'self-parent'
           ? `setting EntityAttributes.parentId to ${newParent} would make entity ${id} its own parent — nothing was applied.`
-          : `setting EntityAttributes.parentId to ${newParent} would make entity ${id} its own ancestor — nothing was applied. A cycle makes the hierarchy untraversable; re-parent through the editor's reparent op, which validates the move.`,
+          : refusal === 'resource'
+            ? `setting EntityAttributes.parentId to ${newParent} would put a resource entity into the hierarchy (entity ${id} or parent ${newParent} carries a resource trait such as Time or Input) — nothing was applied. Resources are world singletons: they stay at the root and hold no children.`
+            : `setting EntityAttributes.parentId to ${newParent} would make entity ${id} its own ancestor — nothing was applied. A cycle makes the hierarchy untraversable; re-parent through the editor's reparent op, which validates the move.`,
       };
     }
   }

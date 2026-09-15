@@ -496,8 +496,8 @@ export function dumpSceneState(params: SceneStateParams = {}) {
   // A contact partner with no guid is `id:<n>`, not null (#1199 review). A row's `guid: null` has
   // its `id` beside it; a bare array element has nothing else, so null would lose WHICH body it is
   // (and two such partners would read `[null, null]`). `id:<n>` cannot be mistaken for a guid.
-  // Since #1210 only an entity with no guid reaches it (no EntityAttributes, or EntityAttributes added
-  // after spawn): a code-spawned one has a runtime guid.
+  // Since #1248 every spawn has a guid (#1210's runtime mint, on EntityAttributes spawnEntity adds), so
+  // only an entity whose EntityAttributes was REMOVED after spawn reaches it.
   const contactRefOf = (id: number): string => guidOf(id) ?? `id:${id}`;
   const contactWorld = params.contacts ? getCurrentWorld() : null;
   // An unknown or WRONG-CASE `trait=` was applied silently: every entity came back with

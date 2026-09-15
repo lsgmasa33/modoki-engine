@@ -23,8 +23,10 @@ import { rawNow } from '../core/clock';
  *  koota note: AoS (callback) form because the fields are nested objects — the
  *  callback runs per entity so the singleton gets its OWN fresh maps (no shared
  *  default). `inputSystem` mutates these in place each frame. This resource is
- *  runtime-only (spawned like `Time`, never hand-authored into a scene) so it is
- *  intentionally not registered as an editor-inspectable trait. */
+ *  runtime-only (spawned like `Time`, tagged `Transient`, never hand-authored into a scene).
+ *  Since #1248 it IS registered, as a `resource` with no fields: every entity carries
+ *  EntityAttributes now, so Input is a Hierarchy row, and the resource category is what
+ *  keeps that row from being deleted, dragged, duplicated or used as a parent. */
 export const Input = trait(() => ({
   axes: makeAxes(),
   held: makeFlags(),

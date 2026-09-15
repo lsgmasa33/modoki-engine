@@ -39,8 +39,9 @@ const ALLOWLIST: ReadonlyArray<{ item: string; reason: string }> = [
   { item: 'SkinnedMeshRenderer.materials', reason: 'Record<string,string> — per-instance submesh material refs' },
   // Input resource — a transient, runtime-only frame snapshot (axes + per-action
   // held/pressed/released maps). The bug class this guard protects against does NOT
-  // apply: Input is spawned at runtime like Time, never serialized (no EntityAttributes,
-  // unregistered), never prefabbed/undone/duplicated. The nested maps mirror InputFrame
+  // apply: Input is spawned at runtime like Time and tagged Transient, so it is never
+  // serialized; since #1248 it is a registered resource, and every duplicate path (the
+  // Hierarchy, both agent duplicate-entity ops) refuses a resource, and it is never prefabbed. The nested maps mirror InputFrame
   // and are rewritten wholesale by inputSystem each frame. See runtime/traits/Input.ts.
   { item: 'Input.axes', reason: 'Record<Axis,number> — analog axis values this frame' },
   { item: 'Input.held', reason: 'Record<DigitalAction,boolean> — level state' },

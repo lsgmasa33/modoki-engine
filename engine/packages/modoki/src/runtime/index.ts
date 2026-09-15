@@ -472,7 +472,7 @@ export { resolveCreateEntitySpec, type CreateEntitySpecResolution } from './scen
 export { buildUiCreateSpecs, type UiPreset, type UiTraitSpec } from './ui/uiAuthoring';
 // Hierarchy legality (#166 P7) — the ONE self-parent/cycle rule, shared by the editor's undoable
 // reparent and the device's direct parentId write. See runtime/core/ecs/hierarchy.ts.
-export { isAncestorOf, reparentRefusal, type ReparentRefusal } from './core/ecs/hierarchy';
+export { isAncestorOf, isResourceEntity, parentRefusal, parentOrRootFor, reparentRefusal, type ReparentRefusal } from './core/ecs/hierarchy';
 /** LOCAL↔WORLD Transform authoring (`set_transform {space}`) — the FILE-path conversion.
  *  The live path uses `worldToLocal3D`/`getWorldTransform3D` from core/ecs/worldTransform. */
 export { parentWorldTrs, localToWorldTrs, worldToLocalTrs, mergeTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes, type TRS } from './scene/transformSpace';

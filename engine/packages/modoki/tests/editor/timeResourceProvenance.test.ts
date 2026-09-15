@@ -2,9 +2,9 @@
  *  when SceneManager materialized it.
  *
  *  Two facts make provenance the only workable discriminator:
- *   - A file-authored Time entry carries no `EntityAttributes` (it serializes as a bare
- *     `{ name: 'Time (resource)', traits: { Time: {...} } }`), exactly like the
- *     materialized one — so shape cannot tell them apart.
+ *   - A file-authored Time and the materialized one have the same shape — since #1248 both carry
+ *     a default `EntityAttributes` in the world (a committed file may still hold the bare
+ *     `{ name: 'Time (resource)', traits: { Time: {...} } }` entry) — so shape cannot tell them apart.
  *   - Post-#410 an authored Time is byte-identical to the materialized one at EVERY value, not
  *     just the default — every field, `timeScale` included, is `runtimeOnly` now. That only
  *     STRENGTHENS the case for provenance-based tagging: no value-based rule could ever work.
@@ -14,9 +14,9 @@
  *
  *  What this protects: a save used to GROW any scene lacking a Time entity by one
  *  (measured: ui-focus-demo.json, 9 → 10 entities; see docs/scene-loading.md), breaking A10's "a no-op
- *  save is a no-op". And because serialize's foreign-entity filter skips entities without
- *  `EntityAttributes`, the stray singleton was not even confined to the primary — it
- *  landed in whichever file was being saved, a shared BASE scene included. */
+ *  save is a no-op". Before #1248 it was not even confined to the primary: it had no
+ *  `EntityAttributes`, which serialize's foreign-entity filter needs, so it landed in whichever
+ *  file was being saved, a shared BASE scene included. */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { trait } from 'koota';

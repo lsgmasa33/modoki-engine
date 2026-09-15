@@ -26,6 +26,8 @@ import {
   durableGuid,
   buildEntityCreateSpecs,
   resolveCreateEntitySpec,
+  isResourceEntity,
+  parentRefusal,
   type CreateEntitySpec,
 } from '@modoki/engine/runtime';
 
@@ -118,6 +120,9 @@ export function createEntityLive(params: unknown): unknown {
     if (!findEntity(p.parentId)) return { ok: false, error: `parentId ${p.parentId} matched no live entity — nothing was created. Ids are reassigned on scene reload; prefer parentGuid.` };
     parentId = p.parentId;
   }
+  if (parentRefusal(parentId)) {
+    return { ok: false, error: `parent ${parentId} is a resource (Time, Input, a config singleton) and holds no children — a child under the Transient Time/Input singleton is dropped from every save. Nothing was created; parent it elsewhere, or omit the parent for the scene root (#1248).` };
+  }
 
   const { name, specs } = buildEntityCreateSpecs(resolved.spec, parentId);
   const id = spawnFromSpecs(specs);
@@ -160,6 +165,11 @@ export function duplicateEntityLive(params: unknown): unknown {
   // {ok:true, created:1} — the caller asked for five and nothing in the reply said the field was
   // ignored. Every other malformed input in these two files is refused loudly; this was the one
   // place that guessed.
+  if (isResourceEntity(rootId)) {
+    // Same refusal as the editor's duplicate-entity and the Hierarchy's disabled Duplicate (#1248). A copy
+    // is a second world singleton, and for Input its per-frame maps would be SHARED by reference.
+    return { ok: false, error: `duplicate-entity: entity ${rootId} is a resource (Time, Input, a config singleton) — a world holds one, so nothing was duplicated.` };
+  }
   const count = p.count === undefined ? 1 : p.count;
   if (typeof count !== 'number' || !Number.isInteger(count) || count < 1 || count > 1000) {
     return { ok: false, error: `count must be an integer between 1 and 1000 — got ${JSON.stringify(p.count)}. Nothing was duplicated.` };

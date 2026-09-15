@@ -101,8 +101,8 @@ describe('Physics2DEvents — manager subscribers', () => {
     // The journal carries a tick-stamped 'contact' event too.
     const journal = tw.events({ type: '@contact' });
     expect(journal.length).toBeGreaterThanOrEqual(1);
-    const jp = journal[0].payload as { a: number; b: number; point: number[]; normal: number[]; speed: number };
-    expect([jp.a, jp.b]).toContain(body.id());
+    const jp = journal[0].payload as { a: unknown; b: unknown; point: number[]; normal: number[]; speed: number };
+    expect([jp.a, jp.b]).toContain(entityRef(body)); // journal refs are guids — every body has one (#1248)
     expect(jp.point).toHaveLength(2);
   });
 

@@ -5,7 +5,7 @@ import * as THREE from 'three';
 import { emptyDocMap, hasDocKey } from '../../runtime/core/docKeys';
 import { getCurrentWorld, spawnEntity, findEntityByGuid, indexEntityGuid } from '../../runtime/core/ecs/world';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
-import { reparentRefusal } from '../../runtime/core/ecs/hierarchy';
+import { reparentRefusal, parentRefusal } from '../../runtime/core/ecs/hierarchy';
 import {
   findEntity, readTraitData, readTraitDataFull, writeTraitField,
   getAllEntities, deleteEntity, markStructureDirty, cloneTraitValues, subtreeIds,
@@ -1139,7 +1139,9 @@ export function moveEntityToScene(entityId: number, targetScene: string, opts?: 
   let newParentId = 0;
   if (opts?.newParentId) {
     const parentInfo = byId.get(opts.newParentId);
-    if (parentInfo && (parentInfo.sourceScene || '') === targetScene) newParentId = opts.newParentId;
+    // Re-root rather than land under a resource row: a child of the Transient Time/Input singleton is
+    // dropped from every save (#1248 — `parentRefusal`, the rule every parent-creating path shares).
+    if (parentInfo && (parentInfo.sourceScene || '') === targetScene && !parentRefusal(opts.newParentId)) newParentId = opts.newParentId;
   }
   const reRooted = newParentId === 0;
   const parentChanged = oldParentId !== newParentId;

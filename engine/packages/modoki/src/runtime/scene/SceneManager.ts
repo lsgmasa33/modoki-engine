@@ -997,10 +997,11 @@ class SceneManagerImpl implements SceneManager {
         // never be written back to whichever scene happens to be saved next. Without
         // the tag a save silently GREW any scene lacking a Time entity by one
         // (measured on ui-focus-demo.json, 9 → 10 entities; see docs/scene-loading.md), which is a
-        // counter-example to the A10 "a no-op save is a no-op" invariant. Worse for a
-        // BASE scene: the foreign-entity filter in serialize.ts skips any entity
-        // without EntityAttributes, and this one has none, so it lands in EVERY file
-        // saved while it exists rather than being confined to the primary.
+        // counter-example to the A10 "a no-op save is a no-op" invariant. (Before #1248 it
+        // was worse for a BASE scene: it had no EntityAttributes, so the foreign-entity
+        // filter in serialize.ts could not see it and it landed in EVERY file saved. Since
+        // #1248 `spawnEntity` gives every entity EntityAttributes, so the tag is what stops
+        // the primary-save bake.)
         //
         // This does NOT stop a scene from AUTHORING its own Time ENTITY — hosting the
         // resource in a shared BASE scene is a supported setup: a Time that came from a
@@ -1018,11 +1019,13 @@ class SceneManagerImpl implements SceneManager {
       // Input is likewise a global resource — ensure the combined world has the
       // singleton so the app-pipeline inputSystem has a target to write and
       // consumers (character input, UI focus) can read it. Runtime-only; never
-      // authored into a scene file.
+      // authored into a scene file. `Transient` since #1248: every entity now carries
+      // EntityAttributes and Input is a registered resource, so without the tag a save
+      // would write an Input entity (its whole per-frame snapshot) into the scene.
       let hasInput = false;
       stagingWorld.query(Input).updateEach(() => { hasInput = true; });
       if (!hasInput) {
-        spawnEntity(stagingWorld, Input());
+        spawnEntity(stagingWorld, Input(), Transient);
       }
 
       // Prewarm: let renderers compile shaders against the staging world BEFORE
@@ -1408,7 +1411,7 @@ class SceneManagerImpl implements SceneManager {
         // nothing: the new scene reads as frozen and dead to input the moment you press Play.
         //
         // ⚠️ `Input` in particular would be a REGRESSION this method introduces, not a
-        // pre-existing gap: it is absent from the trait registry, so the old in-place
+        // pre-existing gap: it was absent from the trait registry (until #1248), so the old in-place
         // `deleteEntities(getAllEntities()…)` never saw it and it survived by accident. A fresh
         // world has no such accident. (`Time` was already being lost on this path.)
         //
@@ -1421,7 +1424,7 @@ class SceneManagerImpl implements SceneManager {
         if (!hasTime) spawnEntity(staging, Time(), Transient);
         let hasInput = false;
         staging.query(Input).updateEach(() => { hasInput = true; });
-        if (!hasInput) spawnEntity(staging, Input());
+        if (!hasInput) spawnEntity(staging, Input(), Transient);
       } catch (e) {
         // `populate` is caller-supplied and this method is on the public SceneManager
         // interface. A throw here must not strand the staging world: it was never promoted, so

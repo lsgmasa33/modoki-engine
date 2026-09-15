@@ -222,7 +222,7 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
 
     const world = getCurrentWorld();
     const names: string[] = [];
-    world.query(EntityAttributes).updateEach(([attr]: any[]) => names.push((attr as any).name));
+    world.query(EntityAttributes).updateEach(([attr]: any[]) => { const n = (attr as { name: string }).name; if (n) names.push(n); }); // unnamed = a materialized Time/Input (#1248)
     expect(names.sort()).toEqual(['Camera', 'Level1Thing', 'Time']);
 
     // Base-origin entities are stamped with the base's guid; the level's own
@@ -256,7 +256,7 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
     const { getCurrentWorld } = await getWorld();
     await sceneManager.loadScene('/level2.json');
     const names: string[] = [];
-    getCurrentWorld().query(EntityAttributes).updateEach(([attr]: any[]) => names.push((attr as any).name));
+    getCurrentWorld().query(EntityAttributes).updateEach(([attr]: any[]) => { const n = (attr as { name: string }).name; if (n) names.push(n); }); // unnamed = a materialized Time/Input (#1248)
     expect(names.sort()).toEqual(['Camera', 'Level2Thing', 'Time']);
   });
 
@@ -292,7 +292,7 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
 
     // Level1's own entity is gone; level2's is present.
     const names: string[] = [];
-    world2.query(EntityAttributes).updateEach(([attr]: any[]) => names.push((attr as any).name));
+    world2.query(EntityAttributes).updateEach(([attr]: any[]) => { const n = (attr as { name: string }).name; if (n) names.push(n); }); // unnamed = a materialized Time/Input (#1248)
     expect(names).not.toContain('Level1Thing');
     expect(names).toContain('Level2Thing');
   });
@@ -453,7 +453,7 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
     await sceneManager.loadScene('/level-guid-base.json');
 
     const names: string[] = [];
-    getCurrentWorld().query(EntityAttributes).updateEach(([attr]: any[]) => names.push((attr as any).name));
+    getCurrentWorld().query(EntityAttributes).updateEach(([attr]: any[]) => { const n = (attr as { name: string }).name; if (n) names.push(n); }); // unnamed = a materialized Time/Input (#1248)
     // The base's Camera entity must be present — without the fix, chain resolution
     // for '/level-guid-base.json' degrades to primary-only (the guid can't be
     // resolved), silently dropping the base from the world.
@@ -478,7 +478,7 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
     await sceneManager.loadScene('/level3.json');
 
     const names: string[] = [];
-    getCurrentWorld().query(EntityAttributes).updateEach(([attr]: any[]) => names.push((attr as any).name));
+    getCurrentWorld().query(EntityAttributes).updateEach(([attr]: any[]) => { const n = (attr as { name: string }).name; if (n) names.push(n); }); // unnamed = a materialized Time/Input (#1248)
     expect(names).toEqual(['Level3Thing']);
     expect(sceneManager.getLoadedScenes().size).toBe(1);
     expect(getResourceStats().materials['/materials/base.mat.json']).toBeUndefined();
@@ -559,7 +559,7 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
 
     const { getCurrentWorld } = await getWorld();
     const names: string[] = [];
-    getCurrentWorld().query(EntityAttributes).updateEach(([attr]: any[]) => names.push((attr as any).name));
+    getCurrentWorld().query(EntityAttributes).updateEach(([attr]: any[]) => { const n = (attr as { name: string }).name; if (n) names.push(n); }); // unnamed = a materialized Time/Input (#1248)
     expect(names).not.toContain('CameraEdited'); // stale copy still live
     expect(names).toContain('Camera'); // the ORIGINAL base entity, carried unchanged
   });
@@ -581,7 +581,7 @@ describe('SceneManager base-scene chain — additive load + carry-across-swap', 
     expect(fetchCalls['/base.json'] ?? 0).toBeGreaterThan(fetchesAfterFirstLoad); // re-fetched
     const { getCurrentWorld } = await getWorld();
     const names: string[] = [];
-    getCurrentWorld().query(EntityAttributes).updateEach(([attr]: any[]) => names.push((attr as any).name));
+    getCurrentWorld().query(EntityAttributes).updateEach(([attr]: any[]) => { const n = (attr as { name: string }).name; if (n) names.push(n); }); // unnamed = a materialized Time/Input (#1248)
     expect(names).toContain('CameraEdited');
     expect(names).not.toContain('Camera'); // the stale entity is gone, not duplicated
     // Still exactly one base entry in the chain, still correctly ROLE'd — forcing a

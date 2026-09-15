@@ -12,7 +12,8 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { found } from '@modoki/engine/testing/inOrder';
 import { createTestWorld, type TestWorld, Transform, EntityAttributes,
   getCurrentWorld, setCurrentWorld, setTimeScale, getTimeScale, sceneManager, reparentRefusal,
-  stepOneFrame } from '@modoki/engine/runtime';
+  stepOneFrame, Time, Input } from '@modoki/engine/runtime';
+import { Transient } from '../../packages/modoki/src/runtime/core/traits/Transient';
 import { updateContactIndex } from '../../packages/modoki/src/runtime/physics/physicsContactIndex';
 import { isRuntimeGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 import { createWorld } from 'koota';
@@ -487,7 +488,8 @@ describe('reply rows carry an address that resolves, never an id disguised as a 
     const ball = game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'ball', name: 'Ball' }));
     const floor = game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'floor', name: 'Floor' }));
     const debris = game.spawn(Transform({ x: 0 }), EntityAttributes({ name: 'Debris' }));
-    const bare = game.spawn(Transform({ x: 0 })); // no EntityAttributes: un-guidable
+    const bare = game.spawn(Transform({ x: 0 }));
+    bare.remove(EntityAttributes); // un-guidable: since #1248 only a REMOVED EntityAttributes leaves no guid
     // The index takes PACKED entities (`valueOf()`, #868) and reports partner ids.
     updateContactIndex(getCurrentWorld(), ball.valueOf(), floor.valueOf(), false, 'enter');
     updateContactIndex(getCurrentWorld(), ball.valueOf(), debris.valueOf(), false, 'enter');
@@ -510,6 +512,7 @@ describe('reply rows carry an address that resolves, never an id disguised as a 
     expect(isRuntimeGuid(r.entities?.[0].guid)).toBe(true);
 
     const bare = game.spawn(Transform({ x: 0 }));
+    bare.remove(EntityAttributes); // un-guidable (#1248: only a removed EntityAttributes leaves no guid)
     const r2 = await runAgentOp('set-traits', { id: bare.id(), set: { 'Transform.x': 3 } }) as
       { ok?: boolean; entities?: Row[] };
     expect(r2.ok).not.toBe(false);
@@ -526,6 +529,7 @@ describe('reply rows carry an address that resolves, never an id disguised as a 
     expect(r.guids).toEqual([namedGuid]);
 
     const bare = game.spawn(Transform({ x: 0 }));
+    bare.remove(EntityAttributes); // un-guidable (#1248: only a removed EntityAttributes leaves no guid)
     const r2 = await runAgentOp('delete-entities', { id: bare.id() }) as { ok?: boolean; guids?: Array<string | null> };
     expect(r2.ok).not.toBe(false);
     expect(r2.guids).toEqual([null]);
@@ -628,6 +632,51 @@ describe('hierarchy legality is ONE rule (#166 P7)', () => {
     expect(reparentRefusal(a.id(), b.id())).toBe('cycle');   // b is a's child
     expect(reparentRefusal(a.id(), c.id())).toBeNull();      // unrelated: legal
     expect(reparentRefusal(a.id(), 0)).toBeNull();           // scene root: always legal
+  });
+
+  // #1248: every entity carries EntityAttributes, so Time and Input are Hierarchy rows. A child under the
+  // Transient singleton is dropped from every save; a singleton under an entity dies with its subtree.
+  // Mutation: drop the `resource` line in hierarchy.ts's reparentRefusal.
+  it('reparentRefusal refuses a resource as the child AND as the parent, and set-traits says why', async () => {
+    game = createTestWorld({});
+    const a = game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'a', name: 'A' }));
+    const input = game.spawn(Input(), Transient);
+    const time = getCurrentWorld().queryFirst(Time)!;
+
+    expect(reparentRefusal(a.id(), input.id())).toBe('resource');   // under Input
+    expect(reparentRefusal(a.id(), time.id())).toBe('resource');    // under Time
+    expect(reparentRefusal(input.id(), a.id())).toBe('resource');   // Input under an entity
+    expect(reparentRefusal(input.id(), 0)).toBeNull();              // a resource at the root stays legal
+
+    const r = await runAgentOp('set-traits', { id: a.id(), set: { 'EntityAttributes.parentId': input.id() } }) as { ok?: boolean; error?: string };
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/resource entity/);
+  });
+
+  // #1248. Mutation: drop the parentRefusal check in liveLifecycle.ts's createEntityLive.
+  it('device create-entity under a resource parentGuid is refused, and nothing is created', async () => {
+    game = createTestWorld({});
+    const input = game.spawn(Input(), Transient);
+    const guid = (input.get(EntityAttributes) as { guid: string }).guid;
+    const before = getCurrentWorld().entities.length;
+    const r = await runAgentOp('create-entity', { spec: { kind: 'empty' }, parentGuid: guid }) as { ok?: boolean; error?: string };
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/is a resource/);
+    expect(getCurrentWorld().entities.length).toBe(before);
+  });
+
+  // #1248. Mutation: drop the isResourceEntity refusal in liveLifecycle.ts's duplicateEntityLive.
+  it('duplicate-entity refuses a resource — a copy of Input would share its per-frame maps', async () => {
+    game = createTestWorld({});
+    const input = game.spawn(Input(), Transient);
+    const r = await runAgentOp('duplicate-entity', { id: input.id() }) as { ok?: boolean; error?: string };
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/is a resource/);
+    expect(getCurrentWorld().query(Input).length).toBe(1);
+    // Accept side: an ordinary entity still duplicates.
+    const a = game.spawn(Transform({ x: 0 }), EntityAttributes({ guid: 'a', name: 'A' }));
+    const ok = await runAgentOp('duplicate-entity', { id: a.id() }) as { ok?: boolean };
+    expect(ok.ok).not.toBe(false);
   });
 });
 

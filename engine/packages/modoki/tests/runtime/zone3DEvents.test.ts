@@ -1,4 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
+import { entityRef } from '../../src/runtime/core/journal';
 import type { Entity } from 'koota';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
 import { SYSTEM_PRIORITY } from '../../src/runtime/core/pipeline';
@@ -42,11 +43,11 @@ describe('Zone3D triggers — containment & enter/exit', () => {
     expect(hits[0].zone).toBe(zone.id());
     expect(hits[0].other).toBe(occ.id());
 
-    // Journal carries tick-stamped @zone events with raw ids.
+    // Journal carries tick-stamped @zone events naming each entity by its guid (every entity has one, #1248).
     const journal = tw.events({ type: '@zone' });
     expect(journal).toHaveLength(2);
-    expect((journal[0].payload as { zone: number; other: number; phase: string })).toEqual(
-      { zone: zone.id(), other: occ.id(), phase: 'enter' },
+    expect((journal[0].payload as { zone: unknown; other: unknown; phase: string })).toEqual(
+      { zone: entityRef(zone), other: entityRef(occ), phase: 'enter' },
     );
   });
 

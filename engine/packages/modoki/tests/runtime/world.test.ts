@@ -88,7 +88,8 @@ describe('world entity index', () => {
       const world = {
         spawn: (..._traits: unknown[]) => {
           const id = next++;
-          return { id: () => id, destroy: () => { destroyed.push(id); } };
+          // `has`/`add`: spawnEntity gives a spawn without EntityAttributes the trait (#1248).
+          return { id: () => id, destroy: () => { destroyed.push(id); }, has: () => false, add: () => {} };
         },
       };
       return { world: world as never, destroyed };

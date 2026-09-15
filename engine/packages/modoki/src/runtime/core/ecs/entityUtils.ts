@@ -207,7 +207,7 @@ function noteIfAuthoredWriteWhileStopped(
   const attrs = entity.has(EntityAttributes)
     ? (entity.get(EntityAttributes) as { name?: string } | undefined)
     : undefined;
-  noteAuthoredWriteWhileStopped(entityId, attrs?.name ?? `#${entityId}`, traitName, field);
+  noteAuthoredWriteWhileStopped(entityId, attrs?.name || `#${entityId}`, traitName, field);
 }
 
 /** Write a field value to a trait on an entity */

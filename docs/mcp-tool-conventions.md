@@ -185,7 +185,8 @@ calls. Raw `{x,y}` is refused wherever a resolvable aim exists (`modoki_capture_
 legitimate exception: it *measures* a path).
 
 - `guid` is the only address that always works; `id` is reassigned on every scene reload.
-- **Every entity spawned with EntityAttributes has a guid a tool can hand out** (#1210). A
+- **Every entity has a guid a tool can hand out** (#1210, #1248: `spawnEntity` gives an entity
+  spawned without EntityAttributes the trait, Time and Input included). A
   code-spawned one carries a RUNTIME guid (`00000000-GGGG-GGGG-0000-…`, `isRuntimeGuid`). It works
   in every guid-addressed op now, still resolves after a `save_all` gives the entity a durable guid,
   and is **valid only until the scene reloads**, after which it misses rather than naming another
@@ -193,8 +194,8 @@ legitimate exception: it *measures* a path).
   [engine-concepts.md](engine-concepts.md) § Entity identity. ⚠️ It is a live-world address: the
   FILE path (`/api/scene-mutate`) refuses a write carrying one, because a file outlives the world.
 - **A reply reports `guid: null` for an entity that has no guid. It never reports `String(id)`**
-  (#1199). Since #1210 that is only an entity with no EntityAttributes, or one whose EntityAttributes
-  was added after spawn. The id in `guid` looked addressable, and every guid-addressed op refused it.
+  (#1199). Since #1248 no spawn produces one; only an entity whose EntityAttributes was removed after
+  spawn has no guid. The id in `guid` looked addressable, and every guid-addressed op refused it.
   `liveGuidOf` (`app/debug/liveLifecycle.ts`) is the one helper. Two shapes differ, because a bare
   element has no `id` beside it: `contacts`/`overlaps` list such a partner as `id:<n>`, and a `watch`
   series reports `guid: null` plus `id`, with `id:<n>` as its internal key. A `watch read` with `guids`

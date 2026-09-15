@@ -210,9 +210,10 @@ describe('committed scenes are already in canonical entity-write order', () => {
    *  over the INPUT — and the serializer's input is live-ECS order, the very thing
    *  QA-HIER-0002 removes. Such a pair would sail through the guard above and still churn.
    *
-   *  It is reachable: entities with no `EntityAttributes` at all (a `PrefabInstance`- or
-   *  `Time`-only entry) never get a guid minted, so they tie at `('', 0)` and are separated
-   *  only by name. */
+   *  It is reachable: a committed entry with no `EntityAttributes` at all (a `PrefabInstance`- or
+   *  `Time`-only entry) has no guid ON DISK, so it ties at `('', 0)` and is separated only by name.
+   *  (Since #1248 a loaded entity always carries EntityAttributes, so the next save writes one with a
+   *  guid; files not re-saved since still hold the bare entry.) */
   it('no two siblings tie on every sort key (order is DETERMINED, not merely matched)', () => {
     const ties: string[] = [];
     for (const { file, adapted } of readScenes()) {
@@ -228,8 +229,8 @@ describe('committed scenes are already in canonical entity-write order', () => {
       ties,
       'These siblings tie on sortOrder, guid AND name, so nothing decides their relative '
         + 'order — the saved order would depend on live ECS iteration and can churn between '
-        + 'saves. Give one of them a distinct guid (an entity with no EntityAttributes never '
-        + 'gets one minted) or a distinct name.',
+        + 'saves. Give one of them a distinct guid (a committed entry with no EntityAttributes has '
+        + 'none on disk until it is re-saved) or a distinct name.',
     ).toEqual([]);
   });
 });

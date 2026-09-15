@@ -3,6 +3,7 @@
  *  hot edits (restitution / shape swap / collider removal), and sensor no-solver-response.
  *  3D is Y-up → gravity pulls toward −Y, "down" is decreasing y. */
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
+import { entityRef } from '../../src/runtime/core/journal';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
 import { SYSTEM_PRIORITY } from '../../src/runtime/core/pipeline';
 import { Transform } from '../../src/runtime/core/traits/Transform';
@@ -90,9 +91,9 @@ describe('physics3D — reconcile + lifecycle', () => {
     tw.step(120);
     const sensorEvents = tw.events({ type: '@sensor' });
     expect(sensorEvents.length).toBeGreaterThanOrEqual(1);
-    const evt = sensorEvents[0].payload as { sensor: number; other: number };
-    expect(evt.sensor).toBe(zone.id());
-    expect(evt.other).toBe(box.id());
+    const evt = sensorEvents[0].payload as { sensor: unknown; other: unknown };
+    expect(evt.sensor).toBe(entityRef(zone)); // journal refs are guids — every body has one (#1248)
+    expect(evt.other).toBe(entityRef(box));
     expect(tw.trait<{ y: number }>(Transform, box).y).toBeLessThan(0);   // fell straight through
     expect(tw.events({ type: '@collision' })).toHaveLength(0);            // sensors never collide
   });

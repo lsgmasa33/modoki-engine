@@ -6,6 +6,7 @@
  *  world (WASM memory the GC can't reclaim) before the harness tears the world down. */
 
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
+import { entityRef } from '../../src/runtime/core/journal';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
 import { SYSTEM_PRIORITY } from '../../src/runtime/core/pipeline';
 import { Transform } from '../../src/runtime/core/traits/Transform';
@@ -71,8 +72,8 @@ describe('physics2DSystem — falling & resting', () => {
     expect(hits.length).toBeGreaterThanOrEqual(1);
     const enter = hits.find((e) => (e.payload as { phase: string }).phase === 'enter');
     expect(enter).toBeDefined();
-    const p = enter!.payload as { a: number; b: number };
-    expect([p.a, p.b]).toContain(box.id());
+    const p = enter!.payload as { a: unknown; b: unknown };
+    expect([p.a, p.b]).toContain(entityRef(box)); // journal refs are guids — every body has one (#1248)
   });
 
   it('gravity is frozen while timeScale is 0 (pause/time-stop)', () => {
@@ -359,9 +360,9 @@ describe('physics2DSystem — sensors', () => {
     tw.step(120);
     const sensorEvents = tw.events({ type: '@sensor' });
     expect(sensorEvents.length).toBeGreaterThanOrEqual(1);
-    const evt = sensorEvents[0].payload as { sensor: number; other: number };
-    expect(evt.sensor).toBe(zone.id());
-    expect(evt.other).toBe(box.id());
+    const evt = sensorEvents[0].payload as { sensor: unknown; other: unknown };
+    expect(evt.sensor).toBe(entityRef(zone));
+    expect(evt.other).toBe(entityRef(box));
     // No solver response: the box kept falling straight through, well past the sensor.
     const tf = tw.trait<{ y: number }>(Transform, box);
     expect(tf.y).toBeGreaterThan(-100);

@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
+import { entityRef } from '../../src/runtime/core/journal';
 import type { Entity } from 'koota';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
 import { SYSTEM_PRIORITY } from '../../src/runtime/core/pipeline';
@@ -113,8 +114,8 @@ describe('Physics3DEvents — solid contacts', () => {
     expect(hits.length).toBeGreaterThanOrEqual(1);
     const enter = hits.find((e) => (e.payload as { phase: string }).phase === 'enter');
     expect(enter).toBeTruthy();
-    const p = enter!.payload as { a: number; b: number };
-    expect([p.a, p.b]).toContain(box.id());
+    const p = enter!.payload as { a: unknown; b: unknown };
+    expect([p.a, p.b]).toContain(entityRef(box)); // journal refs are guids — every body has one (#1248)
     expect(managerFired).toBe(true);  // the code-subscriber bus fired too
   });
 
@@ -154,8 +155,8 @@ describe('Physics3DEvents — solid contacts', () => {
     // The journal carries a tick-stamped 'contact' event too, with the same shape.
     const journal = tw.events({ type: '@contact' });
     expect(journal.length).toBeGreaterThanOrEqual(1);
-    const jp = journal[0].payload as { a: number; b: number; point: number[]; normal: number[]; speed: number };
-    expect([jp.a, jp.b]).toContain(box.id());
+    const jp = journal[0].payload as { a: unknown; b: unknown; point: number[]; normal: number[]; speed: number };
+    expect([jp.a, jp.b]).toContain(entityRef(box));
     expect(jp.point).toHaveLength(3);
     expect(jp.normal).toHaveLength(3);
   });

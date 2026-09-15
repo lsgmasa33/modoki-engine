@@ -427,7 +427,7 @@ crates costs nothing).
   exact.
 - **Folded into `get_scene_state`.** `getContactState(world, id)` returns sorted `contacts`/
   `overlaps` id arrays; `agentBridge.ts` resolves each to a GUID (a runtime guid for a code-spawned partner, #1210;
-  `id:<n>` only for one with no guid — no EntityAttributes, or EntityAttributes added after spawn — #1199 — see [mcp-tool-conventions.md](./mcp-tool-conventions.md) §3) and attaches them under the
+  `id:<n>` only for one with no guid — since #1248 only an entity whose EntityAttributes was removed after spawn — #1199 — see [mcp-tool-conventions.md](./mcp-tool-conventions.md) §3) and attaches them under the
   `contacts` enricher (`?contacts=1`). Cleared on scene swap + Play→Stop (same lifecycle as the
   physics world). See [debug-tools-mcp.md](./debug-tools-mcp.md) "Percept".
 

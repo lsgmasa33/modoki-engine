@@ -4,6 +4,7 @@ import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { onWorldSwap, getCurrentWorld } from '../../runtime/core/ecs/world';
 import { durableGuid } from '../../runtime/core/assetRefRules';
 import { getAllTraits, getTraitByName, COMPONENT_CATEGORY_ORDER } from '../../runtime/core/ecs/traitRegistry';
+import { parentOrRootFor } from '../../runtime/core/ecs/hierarchy';
 import { getAllEntities, buildEntityTree, deleteEntity, onStructureDirtyCoalesced, getStructureVersion, writeTraitField, readTraitData, subtreeIds, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
 import { pinEntityAt, livePinnedId, type EntityPin } from '../../runtime/core/ecs/entityPin';
 import { renameCommitTarget } from './renamePin';
@@ -299,7 +300,8 @@ const EntityNode = React.memo(function EntityNode({ entity, depth, selectedId, s
         onContextMenu={(e) => onContextMenu(e, entity)}
         onMouseDown={(e) => { if (isSelected) armGrabCursor(e); }}
         onMouseUp={() => document.body.classList.remove('editor-mousedown')}
-        draggable={!isRenaming}
+        // A resource row (Time, Input, a config singleton) is not a tree node: it is never dragged (#1248).
+        draggable={!isRenaming && !entity.isResource}
         onDragStart={(e) => {
           e.dataTransfer.setData('application/editor-entity', JSON.stringify({
             id: entity.id, name: entity.name, parentId: entity.parentId, sortOrder: entity.sortOrder,
@@ -1024,8 +1026,10 @@ export default function Hierarchy() {
     if (snapshot) setEntityClipboard({ snapshot, op: 'cut', sourceId: entity.id });
   }, []);
 
-  const handlePaste = useCallback((parentId: number) => {
+  const handlePaste = useCallback((pasteParentId: number) => {
     if (!entityClipboard) return;
+    // ⌘V with a resource row selected pastes at the root: nothing is parented under a resource (#1248).
+    const parentId = parentOrRootFor(pasteParentId);
     const { snapshot, op, sourceId } = entityClipboard;
     if (op === 'cut') {
       // Move the original under the new parent. reparentEntity carries its own
@@ -1476,7 +1480,7 @@ export default function Hierarchy() {
   const ctxMenuItems = useCallback((entity: EntityInfo): ContextMenuItem[] => {
     const parentId = entity.id;
     const pasteItem: ContextMenuItem = {
-      label: 'Paste', shortcut: '⌘V', disabled: !entityClipboard,
+      label: 'Paste', shortcut: '⌘V', disabled: !entityClipboard || !!entity.isResource,
       onClick: () => handlePaste(parentId),
     };
 
@@ -1518,7 +1522,7 @@ export default function Hierarchy() {
       { label: 'New Folder', onClick: () => createFolder(''), disabled: dis },
       ...(entity.parentId === 0 && entity.editorFolder ? [{ label: 'Remove from Folder', onClick: () => moveEntityToFolder(entity.id, '') }] : []),
       { label: '', separator: true },
-      { label: 'Create', children: createItems(parentId) },
+      { label: 'Create', children: createItems(parentId), disabled: dis },
       { label: '', separator: true },
       { label: 'Delete', shortcut: '⌫', onClick: () => handleDelete(entity), danger: true, disabled: dis },
     ];
@@ -1557,8 +1561,10 @@ export default function Hierarchy() {
   // Drop handler: prefab dragged from Assets → instantiate in scene
   const [dropActive, setDropActive] = useState(false);
 
-  const handlePrefabDrop = useCallback(async (e: React.DragEvent, parentId: number = 0) => {
+  const handlePrefabDrop = useCallback(async (e: React.DragEvent, dropParentId: number = 0) => {
     e.preventDefault();
+    // A prefab dropped on a resource row lands at the root: nothing is parented under a resource (#1248).
+    const parentId = parentOrRootFor(dropParentId);
     setDropActive(false);
     const raw = e.dataTransfer.getData('application/editor-asset');
     if (!raw) return;

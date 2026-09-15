@@ -249,8 +249,10 @@ describe('resolving an entity ref by name', () => {
 
   it('lists no `id:<n>` for an ambiguous match that has no guid — the refusal says "address by guid" (#1207)', async () => {
     await named('Solo');
-    // EntityAttributes added AFTER spawn, so the mint never saw it: the one way left to have no guid.
+    // EntityAttributes REMOVED and re-added after spawn, so no mint saw it: since #1248 (every spawn
+    // gets EntityAttributes) the one way left to have no guid.
     const late = spawnEntity(getCurrentWorld(), Transform());
+    late.remove(EntityAttributes);
     late.add(EntityAttributes({ name: 'Solo' }));
     const r = await runAgentOp('apply-scene-ops', {
       ops: [{ op: 'setTrait', entity: { name: 'Solo' }, trait: 'Transform', fields: { x: 1 } }],

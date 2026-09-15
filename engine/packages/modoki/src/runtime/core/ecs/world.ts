@@ -149,8 +149,9 @@ export function _guidIndexRescans(world: World): number { return guidEpochs.get(
 
 // ── Runtime guids (#1210) ───────────────────────────────────────────────────────────────────
 // An entity spawned with an empty `EntityAttributes.guid` gets a RUNTIME guid at spawn:
-// `00000000-GGGG-GGGG-0000-NNNNNNNNNNNN` (`isRuntimeGuid`). N counts EntityAttributes spawns in its
-// world, so the same spawn order yields the same guids (replays, journal comparisons). G is the
+// `00000000-GGGG-GGGG-0000-NNNNNNNNNNNN` (`isRuntimeGuid`). N counts guid-less spawns in its world
+// (since #1248 `spawnEntity` gives every entity EntityAttributes, so that is every spawn without a
+// durable guid), so the same spawn order yields the same guids (replays, journal comparisons). G is the
 // world's GENERATION, and it is what makes a stale guid MISS instead of naming a different entity:
 //
 // ⚠️ G is a counter this module owns, incremented once per world — never koota's world id or entity
@@ -280,6 +281,11 @@ export function spawnEntity(world: World, ...traits: Parameters<World['spawn']>)
   // eslint-disable-next-line no-restricted-syntax -- the one sanctioned world.spawn in the engine
   const entity = world.spawn(...traits);
   if (inSystemTick()) entity.add(Transient);
+  // EVERY entity carries EntityAttributes, so every entity gets a guid (#1248): an entity without it
+  // (the Time and Input singletons, a bare FX spawn, an authored entry with no EA) had only its
+  // reload-volatile numeric id, so agent tools needed an `{id}` form for it. Added HERE, at the one
+  // spawn seam, rather than by each caller: a caller that forgets is exactly the residue #1210 left.
+  if (!entity.has(EntityAttributes)) entity.add(EntityAttributes);
   mintRuntimeGuid(entity, world); // before registerEntity: the index and `@spawn` see the guid (#1210)
   registerEntity(entity, world);
   return entity;

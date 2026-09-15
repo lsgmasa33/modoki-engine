@@ -1177,9 +1177,10 @@ is therefore scoped to same-file collisions deliberately, and says so in its own
   to exist in the world (systems reading delta are no-ops without it) but it was never
   authored, so writing it back would GROW whatever scene is saved next by one entity —
   measured on `ui-focus-demo.scene.json`, 9 → 10, a direct counter-example to "a no-op save is a
-  no-op". It was not even confined to the primary: serialize's foreign-entity filter skips
-  any entity without `EntityAttributes`, and this one has none, so it landed in a shared
-  **base** just as readily.
+  no-op". Before #1248 it was not even confined to the primary: it had no `EntityAttributes`,
+  which serialize's foreign-entity filter needs, so it landed in a shared **base** just as
+  readily. Since #1248 `spawnEntity` gives every entity `EntityAttributes`, so an authored
+  base-scene Time is stamped with its `sourceScene` like any other base entity.
 
   A scene may still **author** its own Time entity — hosting the resource in a shared base
   scene is a supported setup, and it is why the `Transient` tag is needed at all. A Time
@@ -1188,8 +1189,10 @@ is therefore scoped to same-file collisions deliberately, and says so in its own
   serializes as `"Time": {}`. **Provenance is the only workable discriminator**: an
   authored Time is now byte-identical to the materialized one *at every value*, not just
   the default, so no value-based rule could ever tell them apart without deleting the
-  authored one. (`Input` needs no tag — it is simply not in the trait registry.) Gate:
-  `engine/packages/modoki/tests/editor/timeResourceProvenance.test.ts`.
+  authored one. The materialized `Input` singleton is tagged `Transient` too (#1248): it is a
+  registered resource and carries `EntityAttributes` now, so an untagged one would be saved,
+  per-frame snapshot and all. Gates: `engine/packages/modoki/tests/editor/timeResourceProvenance.test.ts`,
+  `engine/packages/modoki/tests/runtime/sceneManagerSingletonGuids.test.ts`.
 - **An entity SPAWNED BY A SYSTEM is tagged `Transient` at the spawn site, so it is never
   saved** (#124). Same provenance principle as the Time singleton, generalized: `spawnEntity`
   (`runtime/core/ecs/world.ts` — the one sanctioned `world.spawn`, enforced by an ESLint ban

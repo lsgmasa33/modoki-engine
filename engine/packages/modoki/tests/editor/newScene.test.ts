@@ -20,6 +20,7 @@ import { Environment } from '../../src/three/traits/Environment';
 import { Light } from '../../src/three/traits/Light';
 import { Time } from '../../src/runtime/core/traits/Time';
 import { Input } from '../../src/runtime/traits/Input';
+import { Transient } from '../../src/runtime/core/traits/Transient';
 import { newScene, getCurrentScenePath, setCurrentScenePath, NewSceneRefusedError } from '../../src/editor/scene/serialize';
 import { WHITE_HDR_GUID } from '../../src/runtime/assets/builtinAssets';
 import { sceneManager } from '../../src/runtime/scene/SceneManager';
@@ -36,6 +37,9 @@ function registerAll() {
   // every count below would understate what the editor actually shows by one — the Hierarchy
   // renders resource entities, with an `R` badge.
   registerTrait({ name: 'Time', trait: Time, category: 'resource', fields: { timeScale: { type: 'number' } } });
+  // Likewise registered in production since #1248: every entity carries EntityAttributes now, so the
+  // Input singleton is a Hierarchy row too, and the resource category is what keeps it undeletable.
+  registerTrait({ name: 'Input', trait: Input, category: 'resource', fields: {} });
 }
 
 // serialize.ts persists the last-scene path to localStorage; the jsdom env here
@@ -69,19 +73,20 @@ describe('newScene()', () => {
     try { peekCurrentWorld()?.destroy(); } catch { /* already destroyed */ }
   });
 
-  it('spawns four starter entities, plus the Time resource row the editor shows', async () => {
+  it('spawns four starter entities, plus the Time and Input resource rows the editor shows', async () => {
     await newScene();
-    // FIVE, not four: the four authored starters plus the materialized `Time` resource, which
-    // the Hierarchy renders like any other row (with an `R` badge). A loaded scene shows it too,
-    // so this matches what Create Scene now looks like rather than a harness-only count.
-    expect(getAllEntities()).toHaveLength(5);
+    // SIX, not four: the four authored starters plus the materialized `Time` and `Input` resources,
+    // which the Hierarchy renders like any other row (with an `R` badge). A loaded scene shows them
+    // too, so this matches what Create Scene looks like rather than a harness-only count. (`Input`
+    // became a row in #1248, when every entity started carrying EntityAttributes.)
+    expect(getAllEntities()).toHaveLength(6);
     expect(getAllEntities().filter((e) => !e.isResource)).toHaveLength(4);
   });
 
   it('spawns Camera + HDR Environment + Directional + Ambient by name and order', async () => {
     await newScene();
-    // Authored starters only — the materialized `Time` resource has no EntityAttributes, so it
-    // carries no name or sortOrder of its own and is not part of this contract.
+    // Authored starters only — the materialized `Time` and `Input` resources carry only a default
+    // EntityAttributes (no name, sortOrder 0) and are not part of this contract.
     const byOrder = getAllEntities().filter((e) => !e.isResource).sort((a, b) => a.sortOrder - b.sortOrder);
     expect(byOrder.map((e) => e.name)).toEqual(['Camera', 'HDR Environment', 'Directional Light', 'Ambient Light']);
     expect(byOrder.map((e) => e.sortOrder)).toEqual([0, 1, 2, 3]);
@@ -150,7 +155,7 @@ describe('newScene()', () => {
       await newScene();
     } finally { unsub(); }
 
-    expect(countInsideListener).toBe(5);   // four starters + the Time resource
+    expect(countInsideListener).toBe(6);   // four starters + the Time and Input resources
   });
 
   it('has already set the editor scene path by the time swap listeners run', async () => {
@@ -180,7 +185,7 @@ describe('newScene()', () => {
     // `timeSystem` both early-return on the missing resource and write nothing. The new scene
     // then reads as frozen and dead to input the moment you press Play.
     //
-    // ⚠️ `Input` is the one that regressed. It is absent from the trait registry, so the OLD
+    // ⚠️ `Input` is the one that regressed. It was absent from the trait registry (until #1248), so the OLD
     // in-place `deleteEntities(getAllEntities()…)` never saw it and it survived by accident;
     // a freshly-minted world has no such accident. Neither is visible through
     // `getAllEntities()`, so query the world directly — via getAllEntities this would pass
@@ -189,6 +194,10 @@ describe('newScene()', () => {
 
     expect(getCurrentWorld().queryFirst(Time)).toBeDefined();
     expect(getCurrentWorld().queryFirst(Input)).toBeDefined();
+    // …and both are Transient, so the next save writes neither. Input needs it since #1248: it carries
+    // EntityAttributes and is a registered resource now, so an untagged one would be saved.
+    expect(getCurrentWorld().queryFirst(Time)!.has(Transient)).toBe(true);
+    expect(getCurrentWorld().queryFirst(Input)!.has(Transient)).toBe(true);
   });
 
   it('destroys the world it replaced, so koota\'s 16-world pool is not leaked', async () => {
@@ -287,7 +296,7 @@ describe('newScene()', () => {
   it('replaces the previous world (no leftover entities across calls)', async () => {
     await newScene();
     await newScene();
-    expect(getAllEntities()).toHaveLength(5); // not 10 — the prior world is gone, not added to
+    expect(getAllEntities()).toHaveLength(6); // not 12 — the prior world is gone, not added to
   });
 
   // ── #887: two Create Scene gestures must not interleave ─────────────────────────────
@@ -306,9 +315,9 @@ describe('newScene()', () => {
       expect((settled[1] as PromiseRejectedResult).reason)
         .toBeInstanceOf(NewSceneRefusedError);
 
-      // One populated world, not two merged and not the loser's. Five = the four starters plus
-      // the materialized Time resource row, exactly as the sequential tests above assert.
-      expect(getAllEntities()).toHaveLength(5);
+      // One populated world, not two merged and not the loser's. Six = the four starters plus
+      // the materialized Time and Input resource rows, exactly as the sequential tests above assert.
+      expect(getAllEntities()).toHaveLength(6);
       // The path is A's. Pre-fix this was decided by whichever write landed last rather than by
       // which world won, so the editor could display B's world under A's path.
       expect(getCurrentScenePath()).toBe('/assets/scenes/a.json');
@@ -351,7 +360,7 @@ describe('newScene()', () => {
       spy.mockRestore();
 
       await expect(newScene('/assets/scenes/b.json')).resolves.toBeUndefined();
-      expect(getAllEntities()).toHaveLength(5);
+      expect(getAllEntities()).toHaveLength(6);
     });
 
     it('accepts an ordinary sequential call — the guard is not stuck on', async () => {

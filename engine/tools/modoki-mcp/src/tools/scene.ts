@@ -27,8 +27,8 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
       'To get VALUES, target or enrich: trait=<Trait> | id=<n> | name=<substr> | ' +
       'where="Transform.y>3" | full=true (every field, incl. AoS/object fields the compact dump ' +
       'omits) | world/bounds/contacts. Address entities by `guid` — runtime ids are reassigned ' +
-      'on every scene hot-reload. `guid: null` means none has been minted yet (a runtime spawn, or ' +
-      'an entity never saved or edited) — address that one by id. The index applies a default limit (see `hint`/`truncated`); a ' +
+      'on every scene hot-reload. Every entity has a guid: a code-spawned one carries a runtime guid, valid ' +
+      'until the scene reloads. The index applies a default limit (see `hint`/`truncated`); a ' +
       'targeted query is never silently capped. A bad `where` returns a `warnings` array rather ' +
       'than silently ignoring the filter.',
     {

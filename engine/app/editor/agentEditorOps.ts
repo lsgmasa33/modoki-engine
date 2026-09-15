@@ -68,7 +68,7 @@ import {
   getTimeline, normalizeTimeline, getGuidForPath, getAssetEntry, getPresentationScale,
   getSpriteAnim, getRig2D, getRig2DSource,
   getAnimSet, getSpriteMaterialProgram, isGuid,
-  getAllTraits, resolveCreateEntitySpec, type MutateOp, type MutateEntityRef,
+  getAllTraits, resolveCreateEntitySpec, reparentRefusal, parentRefusal, isResourceEntity, type MutateOp, type MutateEntityRef,
   Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, ensurePhysicsReady, pendingPhysics, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
   type AnimationClipDef, type TrackValueType, type TimelineDef, type TrackDef, type TrackKind,
   sceneManager, assetUrl, type AssetSchemaType, collectHandles, rawNow,
@@ -507,10 +507,19 @@ function requireLiveId(ref: { id?: number; guid?: string } | undefined, op: stri
  *  stale `parentId` is not an exotic input — it is what an agent holds after any hot-reload.
  *
  *  `0` stays literal: it means ROOT, not "entity 0", and must never be resolved. */
-function resolveParentId(p: { parentId?: number; parentGuid?: string }, op: string): number {
-  if (p.parentGuid) return requireLiveId({ guid: p.parentGuid }, op);
-  if (p.parentId) return requireLiveId({ id: p.parentId }, op);
-  return 0; // omitted, or an explicit 0 → root
+function resolveParentId(p: { parentId?: number; parentGuid?: string }, op: string, opts: { move?: boolean } = {}): number {
+  const id = p.parentGuid ? requireLiveId({ guid: p.parentGuid }, op) : p.parentId ? requireLiveId({ id: p.parentId }, op) : 0;
+  // A MOVE is judged by `reparentRefusal`, which lets a reorder under the current parent through; only a
+  // path that CREATES the link refuses a resource parent outright.
+  if (!opts.move) refuseResourceParent(id, op);
+  return id; // 0: omitted, or an explicit 0 → root
+}
+
+/** Refuse a resource entity as a parent (#1248 — `parentRefusal`, shared by every parent-creating path). */
+function refuseResourceParent(parentId: number, op: string): void {
+  if (parentRefusal(parentId)) {
+    throw new Error(`${op}: entity ${parentId} is a resource (Time, Input, a config singleton) and holds no children — a child under the Transient Time/Input singleton is dropped from every save. Parent it elsewhere, or omit the parent for the scene root.`);
+  }
 }
 
 /** Make an agent asset-def edit UNDOABLE, the way the equivalent panel edit already is.
@@ -783,6 +792,11 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
             // writeTraitFieldWithUndo already routes into prefab-INSTANCE overrides
             // (markFieldOverrideIfInstance) — the live-world equivalent of sceneMutate.ts's
             // traitWriteContainer comes for free from the existing helper, not reimplemented here.
+            // A parentId write is a reparent in all but name, so it answers to the same rule (#1248). It
+            // used to go straight to the trait, past the resource AND the cycle check.
+            const newParent = meta.name === 'EntityAttributes' ? (fields as Record<string, unknown>).parentId : undefined;
+            const linkRefusal = typeof newParent === 'number' ? reparentRefusal(id, newParent) : null;
+            if (linkRefusal) { errors.push(`${where}: EntityAttributes.parentId ${newParent} refused (${linkRefusal}) for entity ${id} — nothing was applied to it`); continue; }
             for (const [field, value] of Object.entries(fields)) writeTraitFieldWithUndo(id, meta, field, value);
             changed++;
           }
@@ -798,7 +812,12 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
           if (entity?.has(meta.trait)) { removeTraitFromEntitiesWithUndo([id], meta); changed++; }
           // Removing an absent trait is a genuine no-op, not an error (mirrors sceneMutate.ts).
         } else if (op.op === 'addEntity') {
-          const parentRaw = op.parentId;
+          // The parent may arrive as `op.parentId` OR inside the authored EntityAttributes; both are
+          // resolved and judged here, and the result is written back into the trait data below. Taking
+          // only `op.parentId` let an authored `EntityAttributes.parentId` reach the entity unchecked (#1248).
+          const authoredEa = op.traits?.EntityAttributes;
+          const authoredParent = authoredEa && typeof authoredEa === 'object' ? (authoredEa as { parentId?: unknown }).parentId : undefined;
+          const parentRaw = op.parentId ?? (typeof authoredParent === 'number' || typeof authoredParent === 'string' ? authoredParent : undefined);
           // A string parentId is a GUID. An unresolvable one falls back to the root (0) — the
           // pre-existing behaviour, kept deliberately: a missing parent is not worth failing the
           // whole op over, and the entity is still created somewhere visible.
@@ -816,14 +835,21 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
             if ('id' in pr) parentId = pr.id;
             else warnings.push(`${where}: parent guid ${JSON.stringify(parentRaw)} did not resolve (${pr.error}) — parented to the scene root instead`);
           }
+          if (parentRefusal(parentId)) {
+            // Same fallback as an unresolvable parent: the entity is still created, somewhere that is saved (#1248).
+            warnings.push(`${where}: parent ${parentId} is a resource (Time, Input, a config singleton) and holds no children — parented to the scene root instead`);
+            parentId = 0;
+          }
           const specs: TraitSpec[] = Object.entries(op.traits ?? {}).map(([name, data]) => ({
             name, data: data === true ? undefined : data as Record<string, unknown>,
           }));
           if (!specs.some((s) => s.name === 'EntityAttributes')) {
             specs.push({ name: 'EntityAttributes', data: { name: op.name ?? 'New Entity', parentId } });
-          } else if (op.name) {
+          } else {
+            // Always write the RESOLVED parent: the authored data may hold an unresolved guid, a stale id,
+            // or a resource the check above re-rooted — and `op.parentId` must win over it either way.
             const attrs = specs.find((s) => s.name === 'EntityAttributes')!;
-            attrs.data = { ...(attrs.data ?? {}), name: op.name, parentId };
+            attrs.data = { ...(attrs.data ?? {}), ...(op.name ? { name: op.name } : {}), parentId };
           }
           const newId = createEntityWithUndo(op.name ?? 'Add Entity', parentId, specs, () => {});
           if (newId == null) { errors.push(`${where}: nothing was created (an unregistered trait in ${JSON.stringify(Object.keys(op.traits ?? {}))}?)`); continue; }
@@ -2115,6 +2141,11 @@ export function registerEditorAgentOps(): void {
   registerAgentOp('duplicate-entity', (params) => {
     const p = (params ?? {}) as { id?: number; guid?: string };
     const id = requireLiveId(p, 'duplicate-entity'); // guid wins; throws on a stale ref (C7 re-audit)
+    if (isResourceEntity(id)) {
+      // The Hierarchy disables Duplicate on a resource row; the agent path refuses the same thing (#1248).
+      // A copy is a second world singleton: getTime/getInput read one, the systems write both.
+      throw new Error(`duplicate-entity: entity ${id} is a resource (Time, Input, a config singleton) — a world holds one, so it is not duplicated.`);
+    }
     const newId = duplicateEntity(id, (i) => setSelectionRaw(i, i != null ? [i] : []));
     if (newId == null) throw new Error(`duplicate-entity: nothing was duplicated for entity ${id} (does it exist?)`); // C7
     return { id: newId, guid: ensureGuid(newId), saved: false }; // stable handle — see create-entity (C7)
@@ -2150,7 +2181,11 @@ export function registerEditorAgentOps(): void {
     // a structural edit where a recycled id would silently move the wrong node. (C7 re-audit.)
     const p = (params ?? {}) as { id?: number; guid?: string; parentId?: number; parentGuid?: string; sortOrder?: number };
     const id = requireLiveId(p, 'reparent-entity');
-    const parentId = resolveParentId(p, 'reparent-entity parent');
+    const parentId = resolveParentId(p, 'reparent-entity parent', { move: true });
+    // Name the rule that refused, from the one shared check, before reparentEntity folds it into `false`.
+    if (reparentRefusal(id, parentId) === 'resource') {
+      throw new Error(`reparent-entity: refused to move ${id} under ${parentId} — a resource entity (Time, Input, a config singleton) stays at the root and holds no children (#1248).`);
+    }
     const ok = reparentEntity(id, parentId, p.sortOrder);
     // reparentEntity returns false for a no-op OR a rejected move (self-parent, or a cycle) —
     // {ok:false} alone left the agent unable to tell "done nothing" from "refused, and why". (C7)
@@ -2193,6 +2228,7 @@ export function registerEditorAgentOps(): void {
       // Track the parent by guid: `redo` can run after a world rebuild (Play→Stop), where a
       // raw parent id would resolve to a DIFFERENT entity and reparent the instance silently.
       const parentId = p.parentGuid ? requireLiveId({ guid: p.parentGuid }, 'prefab instantiate parent') : (p.parentId ?? 0);
+      refuseResourceParent(parentId, 'prefab instantiate parent');
       const parentRef = parentId ? entityRef(parentId) : null;
       const rootId = await instantiatePrefabAsync(prefab as PrefabFile, parentId);
       // The human paths all pair instantiate with setPrefabSource — without it the spawned

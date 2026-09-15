@@ -17,7 +17,7 @@ import { createWorld } from 'koota';
 import {
   createTestWorld, type TestWorld, Transform, EntityAttributes, PrefabInstance, BoneAttachment, CameraFrame,
   registerUIAction, unregisterUIAction, dispatchUIAction, dispatchGameAction,
-  spawnEntity, destroyEntity, findEntityByGuid, getCurrentWorld, spawnPrefabInstance,
+  spawnEntity, destroyEntity, findEntityByGuid, getCurrentWorld, spawnPrefabInstance, Time, Input, getAllEntities,
 } from '@modoki/engine/runtime';
 import {
   instantiatePrefabAsync, instantiatePrefab, setPrefabSource, serializeScene, captureInstanceStructure, rebuildInstance, type PrefabFile,
@@ -42,14 +42,33 @@ let tw: TestWorld | undefined;
 afterEach(() => { tw?.dispose(); tw = undefined; });
 
 describe('spawnEntity mints a runtime guid (#1210)', () => {
-  it('gives an empty guid a runtime guid, and leaves an authored guid and a non-carrier alone', () => {
+  it('gives an empty guid a runtime guid, and leaves an authored guid alone', () => {
     tw = createTestWorld({});
     const shot = tw.spawn(Transform(), EntityAttributes({ name: 'Shot' }));
     const authored = tw.spawn(Transform(), EntityAttributes({ name: 'Auth', guid: 'a1111111-1111-4111-8111-111111111111' }));
-    const bare = tw.spawn(Transform());
     expect(isRuntimeGuid(guidOf(shot))).toBe(true);
     expect(guidOf(authored)).toBe('a1111111-1111-4111-8111-111111111111');
-    expect(bare.has(EntityAttributes)).toBe(false); // the mint never ADDS the trait
+  });
+
+  // #1248. Mutation: drop the EntityAttributes add in `spawnEntity`.
+  it('gives an entity spawned WITHOUT EntityAttributes the trait and a runtime guid that resolves', () => {
+    tw = createTestWorld({});
+    const bare = tw.spawn(Transform());
+    expect(bare.has(EntityAttributes)).toBe(true);
+    expect(isRuntimeGuid(guidOf(bare))).toBe(true);
+    expect(findEntityByGuid(guidOf(bare))).toBe(bare);
+    // The harness's own Time singleton is spawned bare too.
+    const time = getCurrentWorld().queryFirst(Time)!;
+    expect(isRuntimeGuid(guidOf(time))).toBe(true);
+  });
+
+  // #1248. Mutation: drop the `Input` registration in registerTraits.ts.
+  it('the Input singleton reads as a RESOURCE, so the Hierarchy will not delete it', () => {
+    tw = createTestWorld({});
+    tw.spawn(Input(), Transient);
+    const row = getAllEntities().find((e) => e.traits.includes('Input'));
+    expect(row?.isResource).toBe(true);
+    expect(row?.name).toBe('Input (resource)');
   });
 
   it('mints before registerEntity: @spawn carries the guid, and the index resolves it at once', () => {
@@ -80,8 +99,11 @@ describe('spawnEntity mints a runtime guid (#1210)', () => {
     const inA = tw.spawn(Transform(), EntityAttributes({ name: 'A' }));
     const worldB = createWorld();
     try {
-      const inB = spawnEntity(worldB, Transform(), EntityAttributes({ name: 'B' }));
-      // Same ordinal in both worlds (first carrier spawned in each) — only the generation differs.
+      // Spawn in B until it reaches A's ordinal (the harness's own Time took an earlier one since
+      // #1248), so the two guids differ ONLY in generation.
+      const target = parseRuntimeGuid(guidOf(inA))!.ordinal;
+      let inB = spawnEntity(worldB, Transform(), EntityAttributes({ name: 'B' }));
+      while (parseRuntimeGuid(guidOf(inB))!.ordinal < target) inB = spawnEntity(worldB, Transform(), EntityAttributes({ name: 'B' }));
       expect(parseRuntimeGuid(guidOf(inB))!.ordinal).toBe(parseRuntimeGuid(guidOf(inA))!.ordinal);
       expect(findEntityByGuid(guidOf(inA), worldB)).toBeUndefined();
       expect(findEntityByGuid(guidOf(inB), worldB)).toBe(inB);

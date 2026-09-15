@@ -107,11 +107,13 @@ describe('writeTraitField — authored-write-while-stopped probe', () => {
     expect(records[0].name).toBe('Named Entity');
   });
 
-  it('falls back to "#<id>" when the entity has no EntityAttributes', () => {
+  // Since #1248 every spawn carries EntityAttributes, so "no name" means an EMPTY one. Mutation: `||` → `??`
+  // at entityUtils.ts's noteAuthoredWriteWhileStopped call.
+  it('falls back to "#<id>" when the entity has no name', () => {
     const world = createWorld();
     setCurrentWorld(world);
     setPlayState('stopped');
-    const entity = spawnEntity(world, Health({ hp: 100 })); // no EntityAttributes
+    const entity = spawnEntity(world, Health({ hp: 100 })); // no name: spawnEntity adds a default EntityAttributes
 
     beginSystemTick();
     writeTraitField(entity.id(), healthMeta, 'hp', 1);

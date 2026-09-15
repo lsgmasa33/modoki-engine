@@ -213,8 +213,9 @@ and entity-ref field takes. It comes in two kinds, and the difference is lifetim
 - **Durable** — a v4 (or `deriveGuid`) guid written to the scene file. Survives reload, scene swaps
   and saves. Loaded entities have one; the save pre-pass mints one for everything it writes.
 - **Runtime** — `00000000-GGGG-GGGG-0000-NNNNNNNNNNNN` (`isRuntimeGuid`). `spawnEntity` mints one
-  for any entity spawned with EntityAttributes and an empty guid, or with a runtime guid it was
-  COPIED with. So a shot, a board cell or an imported model part is addressable by guid from the
+  for any entity spawned with an empty guid, or with a runtime guid it was COPIED with. An entity
+  spawned WITHOUT EntityAttributes is given the trait at spawn (#1248), so that includes the Time
+  and Input singletons and a bare FX spawn: **every entity has a guid**. So a shot, a board cell or an imported model part is addressable by guid from the
   frame it spawns. **Valid only until its world is swapped out.**
   - **N** counts the MINTS in the world (a spawn that already carries a durable guid takes no
     number), so the same sequence of spawns — the same order AND the same mix of authored and empty
@@ -252,9 +253,22 @@ Three rules follow:
 - **A guid is an address, not a lifetime key** — the rule is stated once, above (#1198). Runtime guids
   add a second reason to it: a COPY is re-minted, so a guid-keyed cache loses an entity that was only
   carried or respawned.
-- **No guid at all** is now reachable only for an entity whose EntityAttributes was added after
-  spawn, or one with no EntityAttributes. Replies report `guid: null` for it
+- **No guid at all** is no longer reachable through any spawn (#1248). Only an entity whose
+  EntityAttributes was REMOVED after spawn lacks one. Replies still report `guid: null` for it
   ([mcp-tool-conventions.md](mcp-tool-conventions.md) §3).
+- **A resource entity is not a node in the tree** (#1248). A resource is an entity carrying a
+  `resource`-category trait: Time, Input, Physics2D, or a game config. It stays at the root and holds
+  no children. Every entity now has a Hierarchy row, the Transient Time and Input singletons included,
+  and a child under one of those is dropped from every save and Play snapshot with it. A resource moved
+  under an entity is deleted with that entity's subtree.
+  - **The rule lives in `runtime/core/ecs/hierarchy.ts`.** `reparentRefusal` judges moves: the editor
+    reparent, the agent `reparent-entity` op, device `set-traits`, and `apply-scene-ops`' `parentId`
+    write. `parentRefusal` / `parentOrRootFor` judge the paths that CREATE a link.
+  - **Agent create and instantiate are refused:** `create-entity` (editor and device) and prefab
+    instantiate.
+  - **Editor gestures re-root instead:** paste, a prefab dropped on a row, `apply-scene-ops`
+    `addEntity`, and a cross-scene move.
+  - **Only a NEW link is judged.** A reorder under the current parent, or a move to the root, stays legal.
 
 The Inspector's entity header shows which kind an entity has (`editor/panels/entityGuidLabel.ts`).
 

@@ -891,8 +891,8 @@ export function registerTools(server: McpServer) {
   tool('device_get_scene_state',
     'Read the live ECS world on the connected device as DATA (no screenshot). Bare call = a compact ' +
       'INDEX (entity id/guid/name/traits, no values); drill down with a filter or enricher. Address ' +
-      'entities by guid (stable across reloads), never by id — except a row with guid:null, which has ' +
-      'no guid yet (a runtime spawn) and can only be addressed by id. Floats are rounded — verify with a ' +
+      'entities by guid, never by id. Every entity has one; a code-spawned entity\'s runtime guid is ' +
+      'valid only until the scene reloads. Floats are rounded — verify with a ' +
       'tolerance, not ===. RESOURCE entities (mesh/material/prefab/env holders + config singletons ' +
       'Time/Physics/NPRPostFX) are excluded from the untargeted listing — pass resources:true (or any ' +
       'filter) to include them.',

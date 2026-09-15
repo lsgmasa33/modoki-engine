@@ -61,6 +61,7 @@ describe('findEntityByGuid — a stale durable guid (#1222)', () => {
   it('still finds a guid on EntityAttributes ADDED to a live entity after the miss', () => {
     tw = worldWithAStaleGuid();
     const e = tw.spawn(Transform());
+    e.remove(EntityAttributes); // every spawn carries it since #1248; removing it is the way to reach an ADD
     expect(findEntityByGuid(G_LATE, tw.world)).toBeUndefined();
     e.add(EntityAttributes({ name: 'Late', guid: G_LATE }));
     expect(findEntityByGuid(G_LATE, tw.world)).toBe(e);
