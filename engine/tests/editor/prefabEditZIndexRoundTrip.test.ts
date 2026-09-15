@@ -64,8 +64,8 @@ import { getTraitByName } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { setRunMode } from '@modoki/engine/runtime';
 import type { PrefabFile } from '@modoki/engine/editor';
-import { openPrefabForEditing, savePrefabEdit, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
-import { getCachedPrefabSync } from '../../packages/modoki/src/editor/scene/prefab';
+import { openPrefabForEditing, savePrefabEdit, savePrefabEditReport, PREFAB_EDIT_ROOT_GUID } from '../../packages/modoki/src/editor/scene/prefabEdit';
+import { getCachedPrefabSync, warnInertPrefabSizes } from '../../packages/modoki/src/editor/scene/prefab';
 import { setCurrentScenePath } from '../../packages/modoki/src/editor/scene/serialize';
 
 registerAllTraits();
@@ -101,15 +101,19 @@ const RAW_PREFAB: PrefabFile = {
   ],
 };
 
+/** The prefab the stubbed fetch serves — RAW_PREFAB unless a test swaps it. */
+let served: PrefabFile = RAW_PREFAB;
+
 beforeEach(() => {
   written = null;
+  served = RAW_PREFAB;
   setRunMode('stopped');
   setCurrentScenePath(null);
   // @ts-expect-error test stub
   globalThis.fetch = vi.fn(async () => ({
     ok: true,
-    text: async () => JSON.stringify(RAW_PREFAB),
-    json: async () => JSON.parse(JSON.stringify(RAW_PREFAB)),
+    text: async () => JSON.stringify(served),
+    json: async () => JSON.parse(JSON.stringify(served)),
   }));
 });
 
@@ -151,5 +155,69 @@ describe('openPrefabForEditing → savePrefabEdit round trip (#762 follow-up clo
     const savedTraits = savedPrefab.entities[0].traits as unknown as Record<string, Record<string, unknown>>;
     expect(savedTraits.UIElement.zIndex).toBe(20);
     expect(savedTraits.UIAnchor?.zIndex).toBeUndefined();
+  });
+});
+
+// #1258: the agent `edit-save` op answers with the report's warnings — the editor Console is not where an agent
+// looks. Driven through the same real open → spawn → serialize → write round trip as the save above, because the
+// finding is computed from what the edit world SERIALIZES, not from the file that was opened.
+describe('savePrefabEditReport keeps the validation warnings its write reported (#1258)', () => {
+  // A width in % under a top-left anchor: LIVE on disk. The test makes it inert in the edit world instead.
+  const BAND: PrefabFile = {
+    id: 'aaaaaaaa-bbbb-4ccc-8ddd-ffffffffffff',
+    version: 2,
+    name: 'Band',
+    rootLocalId: 1,
+    entities: [{
+      localId: 1, name: 'Band',
+      traits: {
+        EntityAttributes: { name: 'Band', parentId: 0, layer: 'ui', guid: '' },
+        UIAnchor: { anchor: 'top-left' } as unknown as Record<string, unknown>,
+        UIElement: { width: 90, widthUnit: '%' } as unknown as Record<string, unknown>,
+      },
+    }],
+  };
+
+  it('reports the finding for the edited template — made inert in the edit world, not on disk — and still saves', async () => {
+    // The premise, or the test cannot tell "validated what was serialized" from "validated the opened file".
+    expect(warnInertPrefabSizes(BAND, BAND.id!)).toEqual([]);
+    served = BAND;
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await openPrefabForEditing({ path: '/games/x/assets/prefabs/Band.prefab.json', name: 'Band' });
+      // The edit: a stretch anchor now owns the authored width's axis, so the width is stored, shown, never applied.
+      const eaMeta = getTraitByName('EntityAttributes')!;
+      const anchorMeta = getTraitByName('UIAnchor')!;
+      let edited = false;
+      getCurrentWorld().query(eaMeta.trait).updateEach(([ea], entity) => {
+        if ((ea as Record<string, unknown>).guid !== PREFAB_EDIT_ROOT_GUID) return;
+        entity.set(anchorMeta.trait, { anchor: 'stretch' });
+        edited = true;
+      });
+      expect(edited).toBe(true);
+      const report = await savePrefabEditReport();
+      expect(report.saved).toBe(true);
+      expect(written).not.toBeNull();
+      expect(report.warnings.length).toBeGreaterThan(0);
+      expect(report.warnings.join('\n')).toContain('entity[localId=1] "Band".UIElement.width is inert');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('reports no warnings for a clean template', async () => {
+    await openPrefabForEditing({ path: '/games/x/assets/prefabs/Badge.prefab.json', name: 'Badge' });
+    expect(await savePrefabEditReport()).toEqual({ saved: true, warnings: [] });
+  });
+
+  it('savePrefabEdit is the same save, answered as a boolean', async () => {
+    await openPrefabForEditing({ path: '/games/x/assets/prefabs/Badge.prefab.json', name: 'Badge' });
+    await expect(savePrefabEdit()).resolves.toBe(true);
+    setRunMode('playing');
+    try {
+      await expect(savePrefabEdit()).resolves.toBe(false);
+    } finally {
+      setRunMode('stopped');
+    }
   });
 });

@@ -324,12 +324,30 @@ export function collectPreservedLocalIds(rootLocalId: number, rootEcsId: number)
   return map;
 }
 
+/** What a prefab edit-mode save did: whether the file was written, and every prefab validation warning
+ *  `warnInertPrefabSizes` reported for it (empty unless `saved`). */
+export interface PrefabEditSaveReport {
+  saved: boolean;
+  warnings: string[];
+}
+
+/** Save the in-progress prefab edit back to its `.prefab.json`. Returns true on success — the
+ *  human paths (Cmd+S, the toolbar) only need that. `savePrefabEditReport` is the same save with
+ *  the warnings kept, for the agent `edit-save` op (#1258).
+ *
+ *  ⚠️ Deliberately a wrapper and not a signature change to an object: an object is always truthy,
+ *  so a caller still written `if (!(await savePrefabEdit()))` would compile and never see a failure. */
+export async function savePrefabEdit(): Promise<boolean> {
+  return (await savePrefabEditReport()).saved;
+}
+
 /** Save the in-progress prefab edit back to its `.prefab.json`. Serializes the
  *  prefab subtree (scaffold lights/HDR are excluded — they aren't descendants of
- *  the root). Returns true on success. */
-export async function savePrefabEdit(): Promise<boolean> {
+ *  the root). */
+export async function savePrefabEditReport(): Promise<PrefabEditSaveReport> {
+  const NOT_SAVED: PrefabEditSaveReport = { saved: false, warnings: [] };
   const { editingPrefab } = useEditorStore.getState();
-  if (!editingPrefab) return false;
+  if (!editingPrefab) return NOT_SAVED;
   // TRANSIENCE guard, the prefab twin of `saveScene`'s (serialize.ts). Only ever WRITE authored
   // data: while scrub/preview/play is live the world holds preview mutations (a posed skeleton, a
   // control-spawned prefab, physics-settled positions), and this serializes the prefab subtree
@@ -347,10 +365,10 @@ export async function savePrefabEdit(): Promise<boolean> {
       'Saving now would bake preview/play mutations (a posed rig, a spawned prefab) into the prefab ' +
       'file, and every scene that instantiates it would inherit them. Exit preview / stop first.',
     );
-    return false;
+    return NOT_SAVED;
   }
   const rootId = findPrefabEditRoot();
-  if (!rootId) { console.error('[PrefabEdit] cannot save — prefab root not found'); return false; }
+  if (!rootId) { console.error('[PrefabEdit] cannot save — prefab root not found'); return NOT_SAVED; }
 
   // The file as it was when we opened it (openPrefabForEditing seeds this cache). It supplies
   // the two things a re-save must NOT re-derive from the live world: the existing localId
@@ -364,14 +382,14 @@ export async function savePrefabEdit(): Promise<boolean> {
       'editor cache, so its localId numbering cannot be preserved. Saving now would renumber ' +
       "members and break every scene override keyed to them. Re-open the prefab and try again.",
     );
-    return false;
+    return NOT_SAVED;
   }
 
   const prefab = serializePrefab(rootId, editingPrefab.guid, {
     preserveLocalIds: collectPreservedLocalIds(previous.rootLocalId, rootId),
     name: previous.name,
   });
-  if (!prefab) { console.error('[PrefabEdit] serialize produced no prefab'); return false; }
+  if (!prefab) { console.error('[PrefabEdit] serialize produced no prefab'); return NOT_SAVED; }
   // The version `prefab` represents, captured BEFORE the write. `writePrefabFile` is a real fetch
   // to the dev server, and the human keeps working during it — a bone drag or an agent op lands as
   // an ordinary `pushAction`. Re-reading the version after the await would fold that edit into the
@@ -380,9 +398,9 @@ export async function savePrefabEdit(): Promise<boolean> {
   const savedAtEditVersion = getEditVersion();
   // An authoring write, so it reports an inert size (#42, #1251) — warnInertPrefabSizes says why
   // the call sits here and not in writePrefabFile.
-  warnInertPrefabSizes(prefab, editingPrefab.guid);
+  const warnings = warnInertPrefabSizes(prefab, editingPrefab.guid);
   const ok = await writePrefabFile(editingPrefab.guid, prefab);
-  if (!ok) return false;
+  if (!ok) return NOT_SAVED;
   // Refresh the editor's prefab cache to the just-saved version AND invalidate the
   // runtime refcount cache, so reopening the return scene re-expands from the new file.
   setPrefabCache(editingPrefab.guid, prefab);
@@ -399,7 +417,7 @@ export async function savePrefabEdit(): Promise<boolean> {
   // against the world rather than by trusting the flag, which is the only way to see it.
   markSceneSaved(savedAtEditVersion);
   console.log(`[PrefabEdit] saved "${prefab.name}" (${prefab.entities.length} entities)`);
-  return true;
+  return { saved: true, warnings };
 }
 
 /** Leave prefab-edit mode: reload the scene the prefab was opened from — that

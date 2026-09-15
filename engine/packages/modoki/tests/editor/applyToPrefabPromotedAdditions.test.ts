@@ -221,3 +221,51 @@ describe('applyToPrefabSelective — reports promoted additions', () => {
     expect(result.promotedAdditions).toBe(0);
   });
 });
+
+// #1258: the agent `apply` op answers with these, and it has nothing else to read them from — the editor Console
+// is not where an agent looks. The finding is in the TEMPLATE being written, so a value-only apply of an unrelated
+// field still reports a dead size the prefab already carries: that is the file this write just re-authored.
+describe('applyToPrefabSelective — reports the validation warnings it wrote (#1258)', () => {
+  beforeEach(() => {
+    testWorld = createWorld();
+    entityIndex.clear();
+    entityInfos = [];
+    writtenContent = null;
+  });
+
+  async function applyXOnto(prefab: ReturnType<typeof makePrefab>) {
+    const { setPrefabCache, applyToPrefabSelective } = await getModule();
+    setPrefabCache(SRC, prefab as any);
+    const root = testWorld.spawn(
+      Transform({ x: 9, y: 0, z: 0 }),
+      EntityAttributes({ name: 'Ship', parentId: 0, guid: 'g-root' }),
+      PrefabInstance({ source: SRC, localId: 1, rootInstanceId: 0 }),
+    );
+    const rootId = root.id();
+    testWorld.query(PrefabInstance).updateEach(([pi]) => { (pi as any).rootInstanceId = rootId; });
+    entityIndex.set(rootId, root);
+    entityInfos = [{ id: rootId, name: 'Ship', parentId: 0, sortOrder: 0, traits: ['Transform', 'EntityAttributes', 'PrefabInstance'] }];
+    return applyToPrefabSelective(rootId, new Set(['1.Transform.x']));
+  }
+
+  it('carries the finding in the result when the written template holds an inert size', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const prefab = makePrefab();
+      // Width authored on the axis a stretch anchor owns: stored, shown, never applied.
+      Object.assign(prefab.entities[0].traits, { UIAnchor: { anchor: 'stretch' }, UIElement: { width: 90, widthUnit: '%' } });
+      const result = await applyXOnto(prefab);
+      expect(result.applied).toBe(true);
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings![0]).toContain('localId=1');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('carries an empty list for a clean template — the op adds `warnings` only when there is one', async () => {
+    const result = await applyXOnto(makePrefab());
+    expect(result.applied).toBe(true);
+    expect(result.warnings).toEqual([]);
+  });
+});

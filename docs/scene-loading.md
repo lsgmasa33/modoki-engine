@@ -1785,9 +1785,30 @@ Findings come from four passes:
    first or be a named restore, and every function that calls `serializePrefab` — which reaches the
    writers that bypass `writePrefabFile`, like Save-as-Prefab's `writeAssetFile` — must call
    `warnInertPrefabSizes` or be a named GENERATED writer (model import, model re-import, 2D rig
-   prefab). A new writer of either shape fails by file and function instead of being skipped. The
-   agent `create` op also returns the warnings in its response, since the agent never reads the
-   renderer console.
+   prefab). A new writer of either shape fails by file and function instead of being skipped.
+
+   All three agent authoring writes (`modoki_prefab` `create`, `apply` and `edit-save`) also
+   return the warnings in their response as `warnings`, since the agent never reads the renderer
+   console. `create` warns inline. The other two warn one call down, so their helpers hand the
+   findings back: `ApplyResult.warnings`, and `savePrefabEditReport()`'s `{ saved, warnings }`
+   (#1258). `savePrefabEdit()` stays a boolean wrapper over that report, not an object return,
+   because an object is truthy at every existing `if (!ok)` caller and a failed save would read as
+   success. The list is everything `validatePrefabData` warns about for the written template,
+   and an inert size is only one kind.
+
+   **No test drives the op end to end.** The cover is a source guard plus behaviour tests, one
+   layer down:
+   - The source guard is in the same test file. It requires each op's own top-level `return` to
+     answer with the helper's list itself, sent under exactly `<list>.length`. An emptied or
+     sliced copy fails it, and so does an inverted or constant condition, a nested key, or a
+     return inside a callback.
+   - `applyToPrefabUndo.test.ts` pins that the undo wrapper hands `applyToPrefabSelective`'s
+     list through.
+   - `applyToPrefabPromotedAdditions.test.ts` and `prefabEditZIndexRoundTrip.test.ts` pin that
+     each helper fills it.
+
+   What the guard cannot see is a refusal branch that returns the warnings while the success
+   return drops them. The ops throw on refusal, so no such branch exists.
 
    The same check also covers a **prefab instance's overridden fields**, which
    live in the serialized entity's sibling `overrides` object (keyed by prefab

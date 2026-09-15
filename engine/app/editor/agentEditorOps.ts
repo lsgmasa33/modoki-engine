@@ -39,7 +39,7 @@ import {
   loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses,
   getPendingBaseScenePaths, discardPendingBaseScenes,
   getLastSceneLoadFailureMessage,
-  isEditingPrefab, isPrefabEditWorld, prefabSessionWorldPath, openPrefabForEditing, savePrefabEdit, exitPrefabEditing,
+  isEditingPrefab, isPrefabEditWorld, prefabSessionWorldPath, openPrefabForEditing, savePrefabEditReport, exitPrefabEditing,
   createEntityWithUndo, duplicateEntity, deleteEntitiesWithUndo, reparentEntity, ensureGuid, type TraitSpec,
   buildEntityCreateSpecs, type CreateEntitySpec,
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
@@ -2471,12 +2471,14 @@ export function registerEditorAgentOps(): void {
         }
         // apply WRITES the .prefab.json — say so honestly, mirroring how `create` reports `saved`.
         // `appliedKeys` excludes what the template cannot carry; `skippedKeys` names it rather
-        // than leaving the caller to diff a second `overrides` call to notice.
+        // than leaving the caller to diff a second `overrides` call to notice. `warnings` carries the
+        // prefab validation warnings for the written template, as `create` does (#1258).
         const applied = [...keySet].filter((k) => !excluded.includes(k));
         return {
           ok: true, source: result.source, appliedKeys: applied,
           ...(excluded.length > 0 ? { skippedKeys: excluded, skippedReason: 'not representable in a prefab template (scene-only / runtime-only field)' } : {}),
           promotedAdditions: result.promotedAdditions, saved: true,
+          ...(result.warnings?.length ? { warnings: result.warnings } : {}),
         };
       }
 
@@ -2551,15 +2553,16 @@ export function registerEditorAgentOps(): void {
         );
       }
       const editing = useEditorStore.getState().editingPrefab!;
-      const ok = await savePrefabEdit();
-      if (!ok) {
+      const { saved, warnings } = await savePrefabEditReport();
+      if (!saved) {
         throw new Error(
           `prefab edit-save FAILED for ${editing.path} — NOTHING was written. Either the prefab root ` +
           'was not found in the edit world, serialization produced no prefab, or the file write was ' +
           'rejected. See the editor console for the [PrefabEdit] error.',
         );
       }
-      return { ok: true, path: editing.path, guid: editing.guid, saved: true };
+      // `warnings`: the prefab validation warnings for the written template, as `create` answers them (#1258).
+      return { ok: true, path: editing.path, guid: editing.guid, saved: true, ...(warnings.length ? { warnings } : {}) };
     }
     if (which === 'edit-exit') {
       // Report not-editing rather than throwing: leaving a mode you are not in is a legitimate

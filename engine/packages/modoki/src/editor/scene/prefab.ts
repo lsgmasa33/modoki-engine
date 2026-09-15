@@ -1825,6 +1825,11 @@ export interface ApplyResult {
   source?: string;
   prefabBefore?: PrefabFile;
   prefabAfter?: PrefabFile;
+  /** Every `validatePrefabData` warning `warnInertPrefabSizes` reported for the written template (an
+   *  inert size is one kind, not the only one), present only when `applied`. The editor Console
+   *  already shows them; this is for a caller whose reader is not the Console — the agent `apply` op
+   *  answers with them (#1258). */
+  warnings?: string[];
 }
 
 /** Shared no-op result so every early return is consistent. */
@@ -1984,7 +1989,7 @@ export async function applyToPrefabSelective(
     return NOOP_APPLY;
   }
 
-  warnInertPrefabSizes(newPrefab, source);
+  const warnings = warnInertPrefabSizes(newPrefab, source);
   const ok = await writePrefabFile(source, newPrefab);
   if (!ok) return NOOP_APPLY;
 
@@ -2009,6 +2014,7 @@ export async function applyToPrefabSelective(
     source,
     prefabBefore,
     prefabAfter: newPrefab,
+    warnings,
   };
 }
 

@@ -13,7 +13,7 @@ import { describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { readScannedSource } from '../helpers/sourceScanner';
-import { boundIdentifier, calledNames, callsTo, declarationOf, enclosingNamedFunction, findNodes, flatText, functionsNamed, guardProves, parseSource, precedingStatements, printedText, referencesToPath, statementOf, ts, unwrapValue } from '../helpers/sourceAst';
+import { boundIdentifier, calledNames, callsTo, declarationOf, enclosingFunction, enclosingNamedFunction, findNodes, flatText, functionsNamed, guardProves, parseSource, precedingStatements, printedText, referencesToPath, statementOf, ts, unwrapValue, valueCarrier } from '../helpers/sourceAst';
 import { warnInertPrefabSizes } from '../../src/editor/scene/prefab';
 import { assertExemptionLedger } from '../helpers/exemptionLedger';
 import { registerAsset, unregisterAsset } from '../../src/runtime/loaders/assetManifest';
@@ -97,7 +97,7 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
     // The reader must SEE the authoring writes, or an empty census would pass everything below.
     expect(census).toEqual(expect.arrayContaining([
       { file: 'packages/modoki/src/editor/scene/prefab.ts', in: 'applyToPrefabSelective', warned: true },
-      { file: 'packages/modoki/src/editor/scene/prefabEdit.ts', in: 'savePrefabEdit', warned: true },
+      { file: 'packages/modoki/src/editor/scene/prefabEdit.ts', in: 'savePrefabEditReport', warned: true },
       { file: 'app/editor/agentEditorOps.ts', in: 'registerEditorAgentOps', warned: true }, // prefabAction:'create'
     ]));
     // An unwarned write is an offender unless it is a restore. Keyed `file::function` and SPENT per call, so a second
@@ -179,9 +179,58 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
       return isWarnCall(init);
     });
     expect(kept.length, 'one kept warnInertPrefabSizes result in the agent ops').toBe(1);
-    const returned = findNodes(sf, ts.isReturnStatement).filter((r) =>
-      findNodes(r, ts.isIdentifier).some((id) => declarationOf(id) === kept[0]));
-    expect(returned.length, 'the kept warnings reach a return statement').toBe(1);
+    expect(returnsAnswering(kept[0], (v) => isBinding(v, kept[0])), 'the kept warnings ARE the response\'s `warnings`').toBe(1);
+  });
+
+  it('the agent apply and edit-save ops answer with the warnings their save reported (#1258)', () => {
+    // Both warn one call down (applyToPrefabSelective, savePrefabEditReport), so the op holds no warn call of its own —
+    // what has to reach its response is the helper result's `warnings`. Each helper is behaviour-tested for filling it:
+    // applyToPrefabPromotedAdditions.test.ts and prefabEditZIndexRoundTrip.test.ts.
+    const sf = parseSource(readScannedSource(path.join(ENGINE, 'app/editor/agentEditorOps.ts')).code, 'agentEditorOps.ts');
+
+    // apply: `const result = await applyToPrefabWithUndo(…)`, answered as `warnings: result.warnings`.
+    const applyCalls = callsTo(sf, 'applyToPrefabWithUndo');
+    expect(applyCalls.length, 'one applyToPrefabWithUndo call in the agent ops').toBe(1);
+    const applyResult = boundIdentifier(applyCalls[0]);
+    expect(applyResult, 'its result is kept in a variable').toBeDefined();
+    const resultDecl = declarationOf(applyResult!)!;
+    expect(returnsAnswering(applyCalls[0], (v) => ts.isPropertyAccessExpression(v) && v.name.text === 'warnings'
+      && ts.isIdentifier(v.expression) && isBinding(v.expression, resultDecl)), "apply answers with result.warnings itself").toBe(1);
+
+    // edit-save: `const { saved, warnings } = await savePrefabEditReport()`, answered as `{ warnings }`.
+    const saveCalls = callsTo(sf, 'savePrefabEditReport');
+    expect(saveCalls.length, 'one savePrefabEditReport call in the agent ops').toBe(1);
+    expect(callsTo(sf, 'savePrefabEdit').length, 'the boolean savePrefabEdit drops the warnings — the op must not use it').toBe(0);
+    const pattern = valueCarrier(saveCalls[0]).parent;
+    expect(pattern && ts.isVariableDeclaration(pattern) && ts.isObjectBindingPattern(pattern.name), 'the report is destructured').toBe(true);
+    const warningsBinding = (pattern as ts.VariableDeclaration).name as ts.ObjectBindingPattern;
+    const el = warningsBinding.elements.find((e) => ts.isIdentifier(e.name) && e.name.text === 'warnings' && !e.propertyName);
+    expect(el, 'edit-save keeps `warnings` from the report').toBeDefined();
+    expect(returnsAnswering(saveCalls[0], (v) => isBinding(v, el!)), "edit-save answers with the report's warnings itself").toBe(1);
+  });
+
+  it('the response readers accept only the kept value itself, not a derived or replaced list', () => {
+    // Review of #1258: the first version only asked whether the name was MENTIONED in a return, so `warnings: []` and
+    // `warnings: warnings.slice(1)` both passed. The reader now requires the `warnings` property's value to BE the binding.
+    const probe = (ret: string) => {
+      const sf = parseSource(`function op() {\n  const w = compute();\n  const result = other();\n  ${ret}\n}`, 'probe.ts');
+      const w = findNodes(sf, ts.isVariableDeclaration).find((d) => ts.isIdentifier(d.name) && d.name.text === 'w')!;
+      return returnsAnswering(w, (v) => isBinding(v, w));
+    };
+    expect(probe('return { ok: true, ...(w.length ? { warnings: w } : {}) };')).toBe(1);
+    expect(probe('return { ok: true, warnings: w };')).toBe(1);
+    expect(probe('return { ok: true, ...(w.length ? { warnings: [] as string[] } : {}) };')).toBe(0);
+    expect(probe('return { ok: true, ...(w.length ? { warnings: w.slice(1) } : {}) };')).toBe(0);
+    expect(probe('return { ok: true, count: w.length };')).toBe(0);
+    expect(probe('return { ok: true, warnings: result };')).toBe(0);
+    expect(probe('const later = () => ({ warnings: w });\n  return { ok: true };')).toBe(0);
+    // Second review: the condition that SENDS the list, where it sits, and whose return it is.
+    expect(probe('return { ok: true, ...(!w.length ? { warnings: w } : {}) };')).toBe(0);
+    expect(probe('return { ok: true, ...(w.length > 99 ? { warnings: w } : {}) };')).toBe(0);
+    expect(probe('return { ok: true, ...(false ? { warnings: w } : {}) };')).toBe(0);
+    expect(probe('return { ok: true, ...(w.length ? { warnings: w } : { warnings: w }) };')).toBe(0);
+    expect(probe('return { ok: true, debug: { warnings: w } };')).toBe(0);
+    expect(probe('pushAction({ redo: () => { return { warnings: w }; } });\n  return { ok: true };')).toBe(0);
   });
 
   it('writePrefabFile itself does NOT warn, so undo/redo stays quiet', () => {
@@ -403,4 +452,44 @@ function prefabWriteCensus(): Array<{ file: string; in: string | undefined; warn
       warned: warnedFirst(call),
     }));
   });
+}
+
+/** Whether `v` is a read of exactly the binding `decl` declares — by symbol, so a same-named local elsewhere does not count. */
+function isBinding(v: ts.Expression, decl: ts.Declaration): boolean {
+  return ts.isIdentifier(v) && declarationOf(v) === decl;
+}
+
+/** How many `return` statements of the function `host` runs in answer with the kept warnings, in one of the two shapes
+ *  an op uses: a top-level `warnings: <v>` / `{ warnings }` in the returned object literal, or a top-level spread
+ *  `...(<v>.length ? { warnings: <v> } : {})`, where `<v>` satisfies `isValue` in both places.
+ *
+ *  Each restriction closes a false pass a review found (#1258 close-out): the VALUE is judged, so `warnings: []` and
+ *  `warnings: w.slice(1)` fail; the spread's CONDITION must be exactly the list's own `.length`, so `!w.length ?`,
+ *  `w.length > 99 ?` and `false ?` fail; the property must be TOP-LEVEL, so `debug: { warnings: w }` fails; and the
+ *  return must be the host function's own, so a `return { warnings }` inside a callback fails.
+ *
+ *  ⚠️ Not modelled, and it fails CLOSED rather than open: a response built into a variable and returned by name, or a
+ *  value like `w ?? []`, counts 0 and turns the guard red. What it does NOT see is a warnings-carrying return on a
+ *  refusal branch while the success return drops it; the ops throw on refusal, so there is no such branch today. */
+function returnsAnswering(host: ts.Node, isValue: (v: ts.Expression) => boolean): number {
+  const fn = enclosingFunction(host);
+  const isWarningsProp = (p: ts.ObjectLiteralElementLike): boolean =>
+    (ts.isShorthandPropertyAssignment(p) || ts.isPropertyAssignment(p)) && ts.isIdentifier(p.name) && p.name.text === 'warnings'
+    && isValue(ts.isShorthandPropertyAssignment(p) ? p.name : unwrapValue(p.initializer));
+  const isGuardedSpread = (p: ts.ObjectLiteralElementLike): boolean => {
+    if (!ts.isSpreadAssignment(p)) return false;
+    const cond = unwrapValue(p.expression);
+    if (!ts.isConditionalExpression(cond)) return false;
+    const test = unwrapValue(cond.condition);
+    const whenTrue = unwrapValue(cond.whenTrue);
+    const whenFalse = unwrapValue(cond.whenFalse);
+    return ts.isPropertyAccessExpression(test) && test.name.text === 'length' && isValue(unwrapValue(test.expression))
+      && ts.isObjectLiteralExpression(whenTrue) && whenTrue.properties.some(isWarningsProp)
+      && ts.isObjectLiteralExpression(whenFalse) && whenFalse.properties.length === 0;
+  };
+  return findNodes(fn, ts.isReturnStatement).filter((r) => {
+    if (enclosingFunction(r) !== fn || !r.expression) return false;
+    const obj = unwrapValue(r.expression);
+    return ts.isObjectLiteralExpression(obj) && obj.properties.some((p) => isWarningsProp(p) || isGuardedSpread(p));
+  }).length;
 }

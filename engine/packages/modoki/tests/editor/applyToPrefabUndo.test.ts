@@ -120,6 +120,16 @@ describe('applyToPrefabWithUndo — Apply is undoable, restores BOTH prefab + sc
     expect(setCurrentBaseScene).toHaveBeenCalledWith('base-guid-after-undo');
   });
 
+  // #1258: the agent `apply` op answers with `result.warnings`, and this wrapper is the layer between it and
+  // applyToPrefabSelective, which fills them. A wrapper that rebuilt its result would empty the agent's list silently.
+  it('hands back the validation warnings applyToPrefabSelective reported, the same list', async () => {
+    const warnings = ['entity[localId=1] "Ship".UIElement.width is inert'];
+    applyResult = { ...applyResult, warnings };
+    const { applyToPrefabWithUndo } = await getModule();
+    const result = await applyToPrefabWithUndo(1, new Set(['1.Transform.x']));
+    expect(result.warnings).toBe(warnings);
+  });
+
   it('does not push an undo entry for a no-op apply', async () => {
     applyResult = { applied: false };
     const { applyToPrefabWithUndo } = await getModule();
