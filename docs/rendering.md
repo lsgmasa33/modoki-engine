@@ -3854,6 +3854,16 @@ system below TRANSFORM, so animation would never sample its first pose (the #109
 and the idle gate would stop drawing the frames that finish the load. Not frozen: media on its own
 clock and game `setTimeout`s. The editor never mounts `GameShell`, so it never holds.
 
+Measured on an iPad mini 5 at work-qa `5e2d1c2e1` (`tools-scratch/boot-stall/build-ios-1246-final.sh`):
+- **Fresh install:**
+  - The Director read `0.000` as the overlay dropped (13.07 s), and `0.978` a second later. The loading hold released at `elapsed=0.000`.
+  - GameShell's readiness wait resolved `timeout` at 10.4 s, not `painted`. The swap's live compile gate released its frame at its own 5 s ceiling. That frame then built pipelines synchronously, for a 7.7 s stretch with no frame submitted (`FRAME LOOP STALLED`).
+  - The overlay still dropped 33 ms AFTER the first submitted frame, because the two-frame wait behind the readiness wait blocks on that same stalled frame.
+  - No frame was ever held by a scene-pass borrow: at the swap there was no post-FX stack yet.
+  - No crash or throw in 95 s of the tour.
+- **Warm relaunch:**
+  - `painted` at 6.0 s, and the Director read `0.000` at the overlay drop.
+
 **The overlay waits at least as long as a render hold promises (#1246).**
 - The flat 5 s ceiling was measured from when `GameShell` began waiting. That assumed the swap's
   compile was the only hold, but the stage gate kicks later, on a Director's first beat.
@@ -3870,6 +3880,11 @@ clock and game `setTimeout`s. The editor never mounts `GameShell`, so it never h
   continuous hold (20 s, against a 9.3 s worst measured scene-pass compile). Past that it warns once
   and the overlay times out; the 3D view stays held until the compile settles, since drawing then is
   the crash below.
+  ⚠️ **Not covered: a game that pauses itself during boot.** The idle gate (`!isSimRunning()` with
+  no dirty frames left) returns BEFORE the borrow check, and every held frame still spends one of the
+  60 dirty frames. So a game that sets `paused` before its first paint stops reaching `held()` after
+  about 1 s, and the overlay drops ~5 s later over a canvas still held. GameShell boots `playing`, so
+  ordinary games are unaffected. Found by reading, not observed; tracked in #1252.
 
 ### Precompiling the stack's own stage quads (#323)
 
