@@ -244,6 +244,37 @@ export function runExclusivePrecompile<T>(renderer: unknown, fn: () => Promise<T
   return next;
 }
 
+/** Scene-pass compiles currently holding a renderer's render target + MRT bound across `await`s.
+ *  Counted per renderer. See `borrowRendererTarget`. */
+const borrowed = new WeakMap<object, number>();
+
+/** Mark `renderer`'s render target + MRT as BORROWED for as long as `fn` runs (#1246, #1239 A).
+ *
+ *  three's `PassNode.compileAsync` binds the pass target and MRT and keeps them bound across
+ *  `renderer.compileAsync`'s awaits. A frame drawn inside that window renders into the pass's own
+ *  MRT target: invalid pipelines (`writeMask is invalid`, `setPipeline: invalid RenderPipeline`)
+ *  — and on an iPad mini 5 the GPU process CRASHED, leaving every later frame throwing. It is
+ *  reached whenever a frame gate's ceiling (5 s) releases frames while a cold scene-pass compile is
+ *  still running, which a fresh install makes routine (#1239 member A measured ~15 s of black on
+ *  the same iPad). `Scene3D` holds its frame while this is true, ceiling or not: a held frame is a
+ *  pause, a frame drawn now is a dead renderer. */
+export async function borrowRendererTarget<T>(renderer: unknown, fn: () => Promise<T>): Promise<T> {
+  if (!renderer || typeof renderer !== 'object') return fn();
+  const key = renderer as object;
+  borrowed.set(key, (borrowed.get(key) ?? 0) + 1);
+  try {
+    return await fn();
+  } finally {
+    const n = (borrowed.get(key) ?? 1) - 1;
+    if (n <= 0) borrowed.delete(key); else borrowed.set(key, n);
+  }
+}
+
+/** True while a scene-pass compile has `renderer`'s target + MRT bound — never draw then. */
+export function isRendererTargetBorrowed(renderer: unknown): boolean {
+  return !!renderer && typeof renderer === 'object' && (borrowed.get(renderer as object) ?? 0) > 0;
+}
+
 /** What `runExclusivePrecompileWithin` did: ran `fn` (with its value), or gave up waiting. */
 export type QueuedPrecompile<T> = { ran: true; value: T } | { ran: false };
 

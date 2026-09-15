@@ -9,8 +9,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   armScenePaint, markScenePainted, abandonScenePaint, waitForScenePaint,
-  isScenePaintPending, resetScenePaintSignal, SCENE_PAINT_MAX_WAIT_MS,
+  isScenePaintPending, resetScenePaintSignal, SCENE_PAINT_MAX_WAIT_MS, extendScenePaintWait,
 } from '../../src/runtime/rendering/scenePaintSignal';
+import { setManualNow, advanceManual, restoreRealClock } from '../../src/runtime/core/clock';
 
 beforeEach(() => {
   resetScenePaintSignal();
@@ -149,5 +150,48 @@ describe('scenePaintSignal', () => {
     await all;
     expect(outcomes).toHaveLength(3);
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  // #1246: a render-level hold says how long it may keep the first frame as it starts, and the
+  // overlay waits at least that long. A flat 5 s from when GameShell began waiting lifted the overlay
+  // over frames a 6.7 s (iPhone Air) / 9.3 s (iPad mini 5) cold compile was still holding.
+  describe('extendScenePaintWait', () => {
+    beforeEach(() => setManualNow(0));
+    afterEach(() => restoreRealClock());
+    const advance = async (ms: number) => { advanceManual(ms); await vi.advanceTimersByTimeAsync(ms); };
+
+    it('a promise longer than the ceiling keeps the waiter until the promise runs out, then times out', async () => {
+      armScenePaint();
+      let outcome: string | null = null;
+      void waitForScenePaint().then((o) => { outcome = o; });
+      await advance(4_000);
+      extendScenePaintWait(20_000);          // a step that may hold until t = 24 s
+      await advance(SCENE_PAINT_MAX_WAIT_MS); // t = 9 s: the flat ceiling would have fired at 5 s
+      expect(outcome).toBeNull();
+      await advance(15_000);                  // t = 24 s
+      expect(outcome).toBe('timeout');
+    });
+
+    it('only ever extends — a shorter promise does not cut an existing deadline', async () => {
+      armScenePaint();
+      let outcome: string | null = null;
+      void waitForScenePaint().then((o) => { outcome = o; });
+      extendScenePaintWait(10_000);
+      extendScenePaintWait(1_000);
+      await advance(9_000);
+      expect(outcome).toBeNull();
+    });
+
+    it('a promise made BEFORE the wait began still counts (the swap compile kicks first)', async () => {
+      armScenePaint();
+      extendScenePaintWait(12_000);
+      await advance(2_000);
+      let outcome: string | null = null;
+      void waitForScenePaint().then((o) => { outcome = o; });
+      await advance(SCENE_PAINT_MAX_WAIT_MS + 1_000); // t = 8 s, past the waiter's own 5 s
+      expect(outcome).toBeNull();
+      await advance(4_000);                            // t = 12 s
+      expect(outcome).toBe('timeout');
+    });
   });
 });

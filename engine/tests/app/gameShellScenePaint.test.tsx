@@ -21,11 +21,18 @@ const spies = vi.hoisted(() => {
    *  no-3D case. */
   let release: ((outcome: string) => void) | null = null;
   const waitForScenePaint = vi.fn((_opts?: unknown) => new Promise<string>((r) => { release = r; }));
+  const order: string[] = [];
+  const releaseTimeHold = vi.fn(() => { order.push('release'); });
   return {
-    loadScene: vi.fn(async () => {}),
+    loadScene: vi.fn(async () => { order.push('loadScene'); }),
     checkAppOtaUpdate: vi.fn(async () => true),
     waitForScenePaint,
     releaseScenePaint: (outcome = 'painted') => { release?.(outcome); release = null; },
+    /** #1246: the loading time hold. `order` records hold / loadScene / release so a test can pin
+     *  that the world is loaded UNDER the hold and time starts only once the overlay is gone. */
+    order,
+    releaseTimeHold,
+    holdTimeForLoading: vi.fn(() => { order.push('hold'); return releaseTimeHold; }),
     isWaiting: () => release !== null,
   };
 });
@@ -50,6 +57,7 @@ vi.mock('@modoki/engine/runtime', () => ({
   VideoOverlay: () => null,
   onTierSwitchOverlay: vi.fn(() => () => {}),
   waitForScenePaint: spies.waitForScenePaint,
+  holdTimeForLoading: spies.holdTimeForLoading,
   // App.tsx derives its two-frame ceiling from this (#682), so the explicit list must carry it or
   // the module binding fails and this file collects ZERO tests. Value mirrors
   // `runtime/rendering/scenePaintSignal.ts`'s `SCENE_PAINT_MAX_WAIT_MS`; nothing here asserts on
@@ -120,6 +128,7 @@ afterEach(() => {
   config.disable3D = false;
   config.scenePath = '/scene.json';
   spies.releaseScenePaint(); // never leave a deferred parked for the next test
+  spies.order.length = 0;
 });
 
 describe('GameShell first-paint gating (#334)', () => {
@@ -179,5 +188,38 @@ describe('GameShell first-paint gating (#334)', () => {
     await waitFor(() => expect(screen.queryByTestId('loading-overlay')).toBeNull(), { timeout: 5000 });
     expect(spies.loadScene).not.toHaveBeenCalled();
     expect(spies.waitForScenePaint).not.toHaveBeenCalled();
+  });
+
+  // #1246 (owner, 2026-09-15): the whole game waits while the overlay is up — so the world is
+  // loaded UNDER a time hold, and time starts only when the overlay drops. A hold released at
+  // loadScene or at paint would let a Director tour play on under the overlay; one never released
+  // freezes the game forever.
+  it('loads the scene under a loading time hold and releases it only when the overlay drops', async () => {
+    makeGame('hold-game');
+    render(React.createElement(GameShell, { gameId: 'hold-game' }));
+    await waitFor(() => expect(spies.waitForScenePaint).toHaveBeenCalled(), { timeout: 5000 });
+    expect(spies.order).toEqual(['hold', 'loadScene']);
+    expect(screen.queryByTestId('loading-overlay')).not.toBeNull();
+
+    spies.releaseScenePaint('painted');
+    await waitFor(() => expect(screen.queryByTestId('loading-overlay')).toBeNull(), { timeout: 5000 });
+    expect(spies.order).toEqual(['hold', 'loadScene', 'release']);
+  });
+
+  it('releases the hold when GameShell unmounts mid-boot — a game change must not leave time frozen', async () => {
+    makeGame('hold-cancel');
+    const { unmount } = render(React.createElement(GameShell, { gameId: 'hold-cancel' }));
+    await waitFor(() => expect(spies.waitForScenePaint).toHaveBeenCalled(), { timeout: 5000 });
+    expect(spies.releaseTimeHold).not.toHaveBeenCalled();
+    unmount();
+    expect(spies.releaseTimeHold).toHaveBeenCalled();
+  });
+
+  it('releases the hold when a mandatory OTA stops the boot — GameShell stays mounted, nothing else would', async () => {
+    spies.checkAppOtaUpdate.mockResolvedValueOnce(false);
+    makeGame('hold-ota');
+    render(React.createElement(GameShell, { gameId: 'hold-ota' }));
+    await waitFor(() => expect(spies.releaseTimeHold).toHaveBeenCalled(), { timeout: 5000 });
+    expect(spies.order).toEqual(['hold', 'release']);
   });
 });

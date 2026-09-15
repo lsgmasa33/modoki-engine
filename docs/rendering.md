@@ -3843,6 +3843,34 @@ scene, so no HUD entities, so nothing for the window to expose (and the `!config
 replaces paints the same `#0a0a1a`). By the time the paint signal resolves, the overlay is many
 seconds past mounted. Shortening it would trade a real anti-flash benefit for nothing.
 
+**Game time waits while the overlay is up (#1246, owner 2026-09-15: "the whole game waits").**
+The world ticks from the moment it swaps in, and a fresh install's compile keeps the overlay up for
+seconds. On an iPhone Air, `demos/postfx-demo`'s tour had played its whole first look (0–15 s) before
+the overlay lifted, so the first frame anyone saw was the second station. `GameShell` now takes
+`holdTimeForLoading()` before the scene load and releases it when the overlay drops, and also on
+failure, when a mandatory OTA stops the boot, and in the effect cleanup. While any hold is active, `timeSystem` applies a time scale of 0.
+⚠️ **It zeroes TIME; it does not stop the pipeline.** Pausing through `isSimRunning()` would skip every
+system below TRANSFORM, so animation would never sample its first pose (the #1097 pre-pose flash)
+and the idle gate would stop drawing the frames that finish the load. Not frozen: media on its own
+clock and game `setTimeout`s. The editor never mounts `GameShell`, so it never holds.
+
+**The overlay waits at least as long as a render hold promises (#1246).**
+- The flat 5 s ceiling was measured from when `GameShell` began waiting. That assumed the swap's
+  compile was the only hold, but the stage gate kicks later, on a Director's first beat.
+- A cold scene-pass compile ran 6.7 s on an iPhone Air and 9.3 s on an iPad mini 5, so the overlay
+  lifted over frames still held.
+- Each gate now calls `extendScenePaintWait(itsCeiling)` as it kicks (`liveCompileGate`'s
+  `onKick`). A waiter's deadline covers every promise, including one made before it started
+  waiting, and it only ever extends.
+- A scene-pass compile's borrow (no ceiling, below) promises nothing when it starts, and outlasts a
+  gate's 5 s. (A stage precompile session does not: its ceiling counts from the gate's kick, which
+  promised it.) The review of the change caught the gap: on the iPad the overlay would still have
+  timed out 5 s after the kick, releasing game time over an undrawn canvas. So each frame the borrow
+  holds renews the promise (`heldFramePaintWait.ts`), up to `HELD_FRAME_PAINT_WAIT_MAX_MS` per
+  continuous hold (20 s, against a 9.3 s worst measured scene-pass compile). Past that it warns once
+  and the overlay times out; the 3D view stays held until the compile settles, since drawing then is
+  the crash below.
+
 ### Precompiling the stack's own stage quads (#323)
 
 **Partially fixed 2026-08-26.** `compileSceneAsync` covers the scene pass. The stack's INTERNAL
@@ -3981,6 +4009,51 @@ optimisation can become a rendering bug, and none was visible from the node grap
   that recompiles every job after the graph stops changing was tried and did NOT fix it, which also
   eliminates compile-order staleness as the cause. Left open deliberately: three attempts did not
   converge, and it is one cheap pipeline out of ten.
+
+### Precompiling every post-FX look before the first paint was tried and reverted (#1246)
+
+**The ask.** `demos/postfx-demo` freezes at each look switch. A switch rebuilds the `PostFXStack`,
+and the rebuilt stack compiles while holding the frame: 3.5 s cold and 1.3 s warm on an iPad mini 5.
+The owner asked for that compile to happen during loading instead, with about 10 s of loading
+acceptable. It worked on desktop and was reverted on the device. The branch history holds the
+code, from `bab4dec66` to `76dc1f513` on `work-qa`, together with `tools-scratch/boot-stall/switchprobe.mjs`
+and `build-ios-1246.sh`. Do not rebuild it without reading this section.
+
+**What was built.**
+1. An engine action, `engine.postfx`, whose timeline markers named every look.
+2. A cache that kept one built stack per declared look.
+3. A queue that compiled each look's scene pass and stage quads, plus one warm draw, behind the
+   overlay.
+4. Two memory and context fixes on top:
+   - a dormant stack released its render targets;
+   - one MRT node per target layout was shared, and the scene pass was drawn at the top level (call
+     depth 0), so looks shared render contexts. Six looks needed 3 scene contexts instead of 6.
+
+**What killed it on the iPad mini 5 (3 GB, `high` tier), measured in order:**
+- **GPU memory.** Holding every look's targets killed the WebGPU device at
+  `renderer.info.memory.total` = 256 MiB, twice. The NPR look alone added about 166 MiB. Releasing
+  dormant targets fixed this.
+- **Time.** The whole list took 41 s on a fresh install and 24 s on a warm relaunch. The dominant
+  cost is a scene-pass compile per render context (12.4 s for NPR on a fresh install), and context
+  sharing did not bring the total near 10 s.
+- **WebContent memory.** Once all six looks were compiled, iOS killed the web view at the first real
+  frame, and the app reloaded in a loop. This happened with targets released and contexts shared.
+- Desktop Chrome was fine throughout, with every compile in the boot burst. So this failure class
+  is invisible without a device.
+
+**The root cause, for whoever tries next.** three caches every material's shader graph per render
+context, and a context is keyed by attachment state, the MRT node `id` and call depth. Each look is
+a new context, so it rebuilds the whole scene's shaders. Keeping N looks ready means N× the compiled
+state resident. On this device that doesn't fit in memory, and it takes longer than an acceptable
+load. Reopen only if one of these changes: a look can be served without its own scene-pass context,
+three stops keying node state by context, or the target devices have more headroom.
+
+**What stayed** (each fixes a defect that exists without the optimisation):
+- game time waits while the overlay is up;
+- the overlay waits as long as a render hold promises (both in § "The DOM overlay hides on the same
+  signal");
+- no frame draws while a scene-pass compile has the render target bound (§ "Gotcha: every async
+  compile on a renderer is serialised").
 
 ### The checklist: what actually goes into a pipeline key
 
@@ -4300,6 +4373,29 @@ TSL node builders have a racy lazy initialization on the **first** compile a ren
 The reload is now decided **by path on the dev server**: `isShaderGraphFile` (`engine/plugins/vite-asset-scanner.ts`) matches anything under `runtime/rendering/postfx/` or `runtime/rendering/npr/`, and `handleHotUpdate` sends `modoki:shader-code-changed` instead of letting Vite propagate an update. The renderer (`engine/app/debug/hmrStaleness.ts`) then reloads — via the same unsaved-scene countdown banner the game-code reload uses, so a shader edit can never silently discard scene work. ⚠️ **Do NOT re-add `import.meta.hot.invalidate()` to these modules** (they all used to carry it): `invalidate()` does not force a reload, it propagates to importers and stops at the first one that ACCEPTS — and the only importer is `Scene3D.tsx`, a React Fast Refresh boundary that self-accepts, so it was silently swallowed. Fast Refresh then re-ran the component but not its `[]`-deps effect, leaving the already-built `PostFXStack` (and its stale compiled graph) alive. That is exactly how one DOF `viewZ` fix was concluded "didn't work" three separate times. Since `engine/plugins/**` is not hot-reloadable, restart the editor once after changing the rule itself.
 
 ## Gotcha: every async compile on a renderer is serialised — two overlapping compiles build against each other's render target (#956, #957)
+
+⚠️ **No FRAME may draw while a scene-pass compile has the target bound, either (#1246, #1239 A).**
+Serialising compiles protects compiles from each other, but a frame is not a compile.
+- `PassNode.compileAsync` keeps the pass target and MRT bound across its awaits. A frame gate's 5 s
+  ceiling released a frame into that window on an iPad mini 5, during a cold scene-pass compile at a
+  look switch.
+- That frame drew into the bound target: `writeMask is invalid`, then `setPipeline: invalid
+  RenderPipeline`. The GPU process crashed (`gpuProcessExited reason=Crash`), and every later frame
+  threw until the render loop unregistered itself.
+- `PostFXStack.compileSceneAsync` now runs inside `borrowRendererTarget`, and `Scene3D` returns before
+  drawing while `isRendererTargetBorrowed`. That check deliberately has no ceiling: a held frame is a
+  pause, and a frame drawn in that window kills the renderer.
+- The offscreen capture (`modoki_render_scene`, `render_sequence`) draws outside the frame loop, and
+  the overlap runs both ways: a capture drawn under a bound pass target is the crash above, and a
+  compile whose turn starts during the capture's readback saves `captureRT` as its "previous" target
+  and restores it after the capture has, so every later live frame draws into `captureRT`. So the
+  capture takes a turn on `runExclusivePrecompile` like every compile that binds a target (up to
+  10 s, then refuses), and re-checks that its surface was not torn down or rebuilt while it waited.
+  The cost: a capture's turn now counts against the queue budgets of what comes after it, so a scene
+  swap landing during a capture that takes over 1 s skips the pre-swap prewarm (a warning, then a
+  first-frame stall), and a cold boot can refuse a capture outright.
+- **Not guarded:** PMREM derivation (`syncEnvironment`, which runs before the frame's borrow check)
+  and any compile other than `compileSceneAsync` that binds a target. Both stay open in #1239.
 
 ⚠️ **`Renderer.compileAsync` (three) fixes its render context synchronously, then builds each
 object's node graph after `await`s — `await this._nodes.getForRenderAsync(renderObject)` and an

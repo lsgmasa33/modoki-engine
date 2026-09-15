@@ -15,6 +15,7 @@ import type { World } from 'koota';
 import { Time } from './traits/Time';
 import { rawNow } from './clock';
 import { setJournalTick } from './journal';
+import { isTimeHeldForLoading } from './loadingTimeHold';
 
 let lastTime = rawNow();
 let smoothedCadence = 0; // internal EMA of the raw (unscaled) frame cadence
@@ -61,7 +62,9 @@ export function timeSystem(world: World) {
 
     // 3. Apply time control AFTER smoothing. Pause/time-stop = scale 0 → both
     // deltas hit 0 this frame (no EMA coast). Slow-mo/fast-fwd scale linearly.
-    const scale = time.timeScale ?? 1;
+    // A loading hold (`loadingTimeHold.ts`, #1246) stops time the same way, without touching the
+    // authored `timeScale` a game may have set: the scene starts when it is first on screen.
+    const scale = isTimeHeldForLoading() ? 0 : (time.timeScale ?? 1);
     time.delta = delta * scale;                   // gameplay (Unity deltaTime)
     time.smoothedDelta = smoothedCadence * scale; // presentation (Unity smoothDeltaTime)
 

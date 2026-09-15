@@ -32,6 +32,9 @@ export interface LiveCompileGateOpts {
    *  need waking to draw the scene that was just compiled. Not called for a stale generation. */
   onSettled?: () => void;
   onError?: (e: unknown) => void;
+  /** A compile was just kicked and may hold the frame for up to `maxHoldMs` — how `Scene3D` tells
+   *  the loading overlay to wait at least that long (`extendScenePaintWait`, #1246). */
+  onKick?: (maxHoldMs: number) => void;
 }
 
 export interface LiveCompileGate {
@@ -64,6 +67,7 @@ export function createLiveCompileGate(opts: LiveCompileGateOpts): LiveCompileGat
         const stillLive = compileEpoch.begin();
         pending = true;
         deadline = opts.now() + opts.maxHoldMs;
+        opts.onKick?.(opts.maxHoldMs);
         // `.then(…, …)` rather than `.finally`: a rejected compile must release the frame too.
         // The alternative is a viewport that never draws again because a shader failed to build,
         // which is strictly worse than the stall this is here to remove.

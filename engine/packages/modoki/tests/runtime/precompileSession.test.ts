@@ -290,4 +290,35 @@ describe('the stub RECORDS instead of discarding — this is where the job pairs
     expect(session.draws[0].target).toBeNull();
     session.end();
   });
+
+  // #1246 / #1239 A: a frame drawn while a scene-pass compile has the target + MRT bound crashed an
+  // iPad mini 5's GPU process. Scene3D holds its frame while this answers true — so it must be true
+  // for exactly the compile, and never stick after one (a stuck true is a frozen game).
+  describe('borrowRendererTarget', () => {
+    it('is borrowed while fn runs, and released after it resolves or rejects', async () => {
+      const mod = await import('../../src/runtime/rendering/postfx/precompileSession');
+      const renderer = {};
+      let during: boolean | undefined;
+      await mod.borrowRendererTarget(renderer, async () => { during = mod.isRendererTargetBorrowed(renderer); });
+      expect(during).toBe(true);
+      expect(mod.isRendererTargetBorrowed(renderer)).toBe(false);
+
+      await expect(mod.borrowRendererTarget(renderer, async () => { throw new Error('device lost'); })).rejects.toThrow('device lost');
+      expect(mod.isRendererTargetBorrowed(renderer)).toBe(false);
+    });
+
+    it('counts overlapping borrows — the first to finish does not release the second', async () => {
+      const mod = await import('../../src/runtime/rendering/postfx/precompileSession');
+      const renderer = {};
+      let releaseA!: () => void;
+      const a = mod.borrowRendererTarget(renderer, () => new Promise<void>((r) => { releaseA = r; }));
+      let releaseB!: () => void;
+      const b = mod.borrowRendererTarget(renderer, () => new Promise<void>((r) => { releaseB = r; }));
+      releaseA(); await a;
+      expect(mod.isRendererTargetBorrowed(renderer)).toBe(true);
+      releaseB(); await b;
+      expect(mod.isRendererTargetBorrowed(renderer)).toBe(false);
+    });
+  });
+
 });

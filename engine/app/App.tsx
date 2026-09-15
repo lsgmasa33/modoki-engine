@@ -4,7 +4,7 @@ import { useWebCanvasSizing } from './useWebCanvasSizing';
 import { useAudioResumeRearm } from './useAudioResumeRearm';
 import { useBackgroundFlush } from './useBackgroundFlush';
 import { useResumeReload } from './useResumeReload';
-import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, InMemoryBackend, waitForScenePaint, SCENE_PAINT_MAX_WAIT_MS, registerRealmShutdownTask, rearmAudioAutoplay } from '@modoki/engine/runtime';
+import { useGameLoop, setGameConfig, sceneManager, ensureManifestLoaded, resolveSceneByName, assetUrl, appServices, clearAppServices, getCurrentWorld, PlayerPrefs, selectDefaultBackend, InMemoryBackend, waitForScenePaint, SCENE_PAINT_MAX_WAIT_MS, holdTimeForLoading, registerRealmShutdownTask, rearmAudioAutoplay } from '@modoki/engine/runtime';
 import { DefaultGameUILayer } from './ui/DefaultGameUILayer';
 import ErrorBoundary from './ui/components/ErrorBoundary';
 import { EditorBootBoundary } from './ui/components/EditorBootBoundary';
@@ -261,6 +261,14 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
     // after a later game loaded successfully behind it. React bails out of the re-render
     // when the value is already null, so this costs nothing on the ordinary path.
     setError(null);
+
+    // ⭐ GAME TIME WAITS FOR THE OVERLAY (#1246, owner 2026-09-15). Everything below loads a world
+    // that starts ticking the moment it swaps in, while the overlay can stay up for seconds (a fresh
+    // install's shader compile held it ~10 s on an iPhone Air) — so a Director tour had played its
+    // first station invisibly by the time anyone saw the scene. The hold zeroes game time until the
+    // overlay drops, so the first frame seen is t = 0. Released on every exit: success, failure,
+    // a mandatory OTA stopping the boot, and this effect's cleanup (a game change mid-boot). See `core/loadingTimeHold.ts`.
+    const releaseLoadingTimeHold = holdTimeForLoading();
 
     let cancelled = false;
     /** Cancel token for the awaits that park on something OTHER than a promise this body owns —
@@ -548,7 +556,8 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         // mid-session hot-swap — see the plan's Phase 3 decision).
         const otaShouldProceed = await checkAppOtaUpdate();
         if (cancelled) return;
-        if (!otaShouldProceed) return;
+        // This boot ends here for the session, and nothing below will release the hold.
+        if (!otaShouldProceed) { releaseLoadingTimeHold(); return; }
 
         // OTA Phase 4 — a sub-game's config.scenePath is a root-relative build-output
         // literal baked against ITS OWN origin (config.assetBaseUrl, set by
@@ -665,7 +674,9 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
         initializedRef.current = true;
         setInitialized(true);
         setTransitioning(false);
+        releaseLoadingTimeHold();
       } catch (e) {
+        releaseLoadingTimeHold();
         if (!cancelled) {
           console.error('[GameShell] Failed to load game:', e);
           // Take the splash down so the error is SEEN: it outranks every boot surface by z-index,
@@ -677,7 +688,7 @@ export const GameShell = React.memo(function GameShell({ gameId }: { gameId: str
       }
     })();
 
-    return () => { cancelled = true; abortBoot.abort(); };
+    return () => { cancelled = true; abortBoot.abort(); releaseLoadingTimeHold(); };
     // ⚠️ `[gameId]` ONLY — see the `configReadyRef`/`initializedRef` note above (#267). This
     // effect writes `configReady` and `initialized`; listing either here makes it re-run
     // itself and double-drive every registration in the body.

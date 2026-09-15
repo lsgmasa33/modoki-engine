@@ -31,15 +31,20 @@
  *  surface tears down or fails to come up, and the ceiling below bounds every remaining case.
  */
 
+import { rawNow } from '../core/clock';
+
 /** Ceiling on the DOM-level wait, mirroring `liveCompileGate`'s `LIVE_COMPILE_MAX_HOLD_MS`.
  *
- *  The render layer gives up holding the frame 5 s after it kicks the compile — which is one frame
- *  after the swap, i.e. STRICTLY EARLIER than a caller can start waiting here (it has a scene load
- *  and an `onSceneReady` hook to get through first). So on the pathological "compile never settles"
- *  path the render layer releases and paints first, and this resolves on that paint rather than on
- *  its own deadline. The deadline is here for the cases the render layer cannot signal at all: a
- *  render loop that never starts, a surface that never becomes visible, a swap with no 3D content.
- *  It must never be possible for a stuck renderer to leave the loading overlay up forever. */
+ *  The deadline is here for the cases the render layer cannot signal at all: a render loop that never
+ *  starts, a surface that never becomes visible, a swap with no 3D content, a compile that never
+ *  settles. It must never be possible for a stuck renderer to leave the loading overlay up forever.
+ *
+ *  It is a FLOOR per waiter, not the whole story: render-level holds push it out while they keep the
+ *  frame (`extendScenePaintWait`) — a gate by its own 5 s ceiling as it kicks, and a scene-pass
+ *  compile's borrow frame by frame up to `HELD_FRAME_PAINT_WAIT_MAX_MS` (`heldFramePaintWait.ts`).
+ *  ⚠️ So on the "compile never settles" path the render layer does NOT always paint first any more:
+ *  a borrow holds the 3D surface with no ceiling (a frame drawn into its target crashed a GPU
+ *  process, #1246), and this times out over a canvas that stays held until the compile settles. */
 export const SCENE_PAINT_MAX_WAIT_MS = 5000;
 
 export type ScenePaintOutcome =
@@ -58,11 +63,18 @@ interface Waiter {
   resolve: (outcome: ScenePaintOutcome) => void;
   timer: ReturnType<typeof setTimeout>;
   detach: () => void;
+  /** When this waiter times out, on the `rawNow` clock — see `extendScenePaintWait`. */
+  expiresAt: number;
+  /** Re-aim `timer` at `expiresAt`. */
+  rearm: () => void;
 }
 
 /** True while a swapped-in scene is still waiting for its first submitted frame. */
 let armed = false;
 let waiters: Waiter[] = [];
+/** The latest instant a render-level hold has promised to release its frame by (`rawNow` ms), for
+ *  a waiter that starts AFTER the promise was made — see `extendScenePaintWait`. */
+let promisedUntil = 0;
 
 function settle(outcome: ScenePaintOutcome): void {
   if (waiters.length === 0) return;
@@ -91,6 +103,31 @@ export function markScenePainted(): void {
   if (!armed) return;
   armed = false;
   settle('painted');
+}
+
+/** A render-level hold has just promised to hold the first frame for up to `ms` more — make every
+ *  waiter's ceiling cover it (#1246).
+ *
+ *  The overlay's ceiling exists for a renderer that NEVER draws; it was a flat 5 s from when
+ *  `GameShell` started waiting, which assumed the swap's own compile was the only hold. It is not:
+ *  the post-FX stage gate kicks later, on the frame a stack is first built (a Director's first beat
+ *  on `demos/postfx-demo`), and a cold scene-pass compile on a fresh install ran 6.7 s on an iPhone
+ *  Air and 9.3 s on an iPad mini 5 — so the overlay lifted while frames were still held, and the
+ *  player saw a frozen canvas under the HUD.
+ *
+ *  So each hold says how long it may keep the frame (its own ceiling) as it starts, and the overlay
+ *  waits at least that long. It stays bounded — every hold has a ceiling — and a renderer that
+ *  stops drawing still times out once the last promise has run out. Only ever EXTENDS: a shorter
+ *  promise never cuts a waiter's existing deadline. */
+export function extendScenePaintWait(ms: number): void {
+  const until = rawNow() + ms;
+  if (until > promisedUntil) promisedUntil = until;
+  for (const w of waiters) {
+    if (until > w.expiresAt) {
+      w.expiresAt = until;
+      w.rearm();
+    }
+  }
 }
 
 /** The 3D surface can no longer produce that frame — it unmounted, its renderer was torn down, or
@@ -123,15 +160,25 @@ export function waitForScenePaint(opts?: { timeoutMs?: number; signal?: AbortSig
       clearTimeout(waiter.timer);
       resolve('cancelled');
     };
+    const onTimeout = () => {
+      waiters = waiters.filter(w => w !== waiter);
+      waiter.detach();
+      resolve('timeout');
+    };
+    const now = rawNow();
     const waiter: Waiter = {
       resolve,
-      timer: setTimeout(() => {
-        waiters = waiters.filter(w => w !== waiter);
-        waiter.detach();
-        resolve('timeout');
-      }, timeoutMs),
+      // A hold promised before this wait began (the swap's own compile kicks on the first frame
+      // after the swap, before `GameShell` gets here) still counts.
+      expiresAt: Math.max(now + timeoutMs, promisedUntil),
+      timer: undefined as unknown as ReturnType<typeof setTimeout>,
       detach: () => signal?.removeEventListener('abort', onAbort),
+      rearm: () => {
+        clearTimeout(waiter.timer);
+        waiter.timer = setTimeout(onTimeout, Math.max(0, waiter.expiresAt - rawNow()));
+      },
     };
+    waiter.rearm();
     signal?.addEventListener('abort', onAbort, { once: true });
     waiters.push(waiter);
   });
@@ -146,5 +193,6 @@ export function isScenePaintPending(): boolean {
  *  cannot hang the next. */
 export function resetScenePaintSignal(): void {
   armed = false;
+  promisedUntil = 0;
   settle('abandoned');
 }

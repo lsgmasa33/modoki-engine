@@ -669,6 +669,7 @@ export {
 
 // ── Engine Systems ──
 export { timeSystem, resetTimeBaseline } from './core/timeSystem';
+export { holdTimeForLoading, isTimeHeldForLoading } from './core/loadingTimeHold';
 export { getTime, getSimDelta, getVisualDelta, getTimeScale, setTimeScale } from './core/getTime';
 // Input resource accessors — `input`-prefixed on the public surface to avoid
 // colliding with the generic short names (`axis`/`held`/`pressed`/`released`).

@@ -23,6 +23,20 @@ function deferred<T = void>() {
 }
 
 describe('liveCompileGate', () => {
+  it('announces its ceiling once, when it kicks — the overlay waits as long as this hold may (#1246)', () => {
+    const c = clock();
+    const onKick = vi.fn();
+    const gate = createLiveCompileGate({ maxHoldMs: 5000, now: c.now, onKick });
+    const kick = () => new Promise<void>(() => {});
+    gate.tick(kick);
+    expect(onKick).not.toHaveBeenCalled();
+    gate.arm();
+    gate.tick(kick);
+    gate.tick(kick);
+    expect(onKick).toHaveBeenCalledTimes(1);
+    expect(onKick).toHaveBeenCalledWith(5000);
+  });
+
   it('does not hold until a swap arms it', () => {
     const c = clock();
     const gate = createLiveCompileGate({ maxHoldMs: 5000, now: c.now });

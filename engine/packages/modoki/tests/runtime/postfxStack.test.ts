@@ -757,6 +757,19 @@ describe('PostFXStack — stage nodes that own GPU resources are freed (leak reg
       expect(renderer.contextLookups).toEqual([{ rt: scenePasses[0].renderTarget, depth: 2 }]);
     });
 
+    it('the renderer target is BORROWED for the whole pass compile, and only for it (#1246, #1239 A)', async () => {
+      const { PostFXStack } = await import('../../src/runtime/rendering/postfx/PostFXStack');
+      const session = await import('../../src/runtime/rendering/postfx/precompileSession');
+      const renderer = makeRenderer();
+      const stack = new PostFXStack(renderer, new THREE.Scene(), new THREE.PerspectiveCamera(), { bloom: bloomCfg() } as never);
+      let during: boolean | undefined;
+      const inner = scenePasses[0].compileAsync.getMockImplementation()!;
+      scenePasses[0].compileAsync.mockImplementation(async (r) => { during = session.isRendererTargetBorrowed(renderer); return inner(r); });
+      await stack.compileSceneAsync();
+      expect(during).toBe(true);
+      expect(session.isRendererTargetBorrowed(renderer)).toBe(false);
+    });
+
     it('stamps the pass target sample count before compiling', async () => {
       // Not tidiness: `PassNode.setup()` normally stamps this during the first render — the very
       // frame the precompile exists to get ahead of — and a sample-count mismatch is a different

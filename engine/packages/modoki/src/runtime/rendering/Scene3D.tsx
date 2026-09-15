@@ -33,8 +33,9 @@ import { gpuPassScope } from '../core/gpuTimings';
 // determinism guard, and the live-compile hold is a real-time deadline, not sim time.
 import { rawNow } from '../core/clock';
 import { createLiveCompileGate } from './liveCompileGate';
-import { armScenePaint, markScenePainted, abandonScenePaint } from './scenePaintSignal';
-import { isPrecompileActive, endAllPrecompiles } from './postfx/precompileSession';
+import { armScenePaint, markScenePainted, abandonScenePaint, extendScenePaintWait } from './scenePaintSignal';
+import { isPrecompileActive, endAllPrecompiles, isRendererTargetBorrowed, runExclusivePrecompileWithin } from './postfx/precompileSession';
+import { createHeldFramePaintWait, HELD_FRAME_PAINT_WAIT_MAX_MS } from './heldFramePaintWait';
 import { getRenderSettings, getEffectiveThreeSettings, getActiveTierOverrides } from './renderSettings';
 import { maskPostFXRequest } from './qualityTier';
 import { onForceResize } from './resizeBus';
@@ -102,6 +103,11 @@ const BATCH_DRAW_CALLS = false;
  *  never settles (a lost device, a rejected promise we somehow do not see) degrades to the OLD
  *  behaviour — a stalling first frame — instead of a viewport that never draws again. */
 const LIVE_COMPILE_MAX_HOLD_MS = 5000;
+
+/** How long an offscreen capture waits for its turn on the renderer's compile queue before it
+ *  refuses (#1246, #1239). The turn is what keeps a capture and a compile from binding render
+ *  targets over each other; a refusal is an error the agent can retry. */
+const CAPTURE_TURN_WAIT_MS = 10_000;
 
 
 /** Runtime override for the on-device A/B this flag's own comment demands (#212).
@@ -476,6 +482,9 @@ export default function Scene3D() {
         // enough on its own — the scene we just compiled still has to get drawn once.
         onSettled: () => markRenderDirty(),
         onError: (e) => console.warn('[Scene3D] live-scene compile failed:', e),
+        // The loading overlay waits at least as long as this hold may keep the first frame (#1246):
+        // a flat 5 s from when GameShell began waiting lifted it over frames still held.
+        onKick: extendScenePaintWait,
       });
       // The same hold, for the post-FX stack's own stage quads (#323). A separate instance rather
       // than a second job on `liveCompile` because they are armed by different events — see the
@@ -486,6 +495,16 @@ export default function Scene3D() {
         now: rawNow,
         onSettled: () => markRenderDirty(),
         onError: (e) => console.warn('[Scene3D] post-FX stage compile failed:', e),
+        onKick: extendScenePaintWait,
+      });
+      // The scene-pass borrow below makes no promise of its own when it starts, so each frame it holds
+      // renews the overlay's wait instead — bounded, and warned about once it runs out. See the module.
+      const heldFrames = createHeldFramePaintWait({
+        now: rawNow,
+        extend: extendScenePaintWait,
+        stepMs: LIVE_COMPILE_MAX_HOLD_MS,
+        maxMs: HELD_FRAME_PAINT_WAIT_MAX_MS,
+        onBudgetExhausted: (heldMs) => console.warn(`[Scene3D] a shader compile has held frames for ${Math.round(heldMs)} ms — a loading overlay no longer waits for it; the 3D view draws again when the compile settles`),
       });
       const dirtyUnsubs = [
         addDirtyListener(markRenderDirty),  // trait writes through the helper API
@@ -638,6 +657,14 @@ export default function Scene3D() {
         // before the branch because a stack disposed mid-compile routes the very next frame down
         // the plain `renderer.render(scene, camera)` path, which is stubbed just the same.
         if (isPrecompileActive(renderer, rawNow())) return;
+        // …and never while a scene-pass compile has the render target + MRT bound (#1246, #1239 A).
+        // Unlike the stage session above this has NO ceiling of its own, deliberately: a gate's 5 s
+        // ceiling let a frame through a cold 5+ s scene compile on an iPad mini 5, it drew into the
+        // bound pass target, and the GPU process crashed. See `borrowRendererTarget`. This hold renews
+        // the loading overlay's wait as it holds (`heldFrames`), since nothing promised it. (The stage
+        // session above needs no renewal: its ceiling counts from the gate's kick, which promised it.)
+        if (isRendererTargetBorrowed(renderer)) { heldFrames.held(); return; }
+        heldFrames.released();
         const hasStages = planStages(liveReq).length > 0;
         // Tearing down an EXISTING stack matters as much as not building one: a live demotion
         // happens on a device that is already struggling, and a retained stack would keep its
@@ -764,7 +791,7 @@ export default function Scene3D() {
       //    camera (optionally overridden) into an RT, reads it back, and encodes
       //    a JPEG data URL. The `capturing` guard parks the live loop so it can't
       //    render into our target across the async readback. ──
-      const offscreenRender: SceneRenderer = async (opts) => {
+      const captureAtTurn: SceneRenderer = async (opts) => {
         const vw = container.clientWidth || 1280, vh = container.clientHeight || 720;
         const w = Math.max(1, Math.min(Math.round(opts.width ?? vw), 4096));
         const h = Math.max(1, Math.min(Math.round(opts.height ?? vh), 4096));
@@ -907,6 +934,30 @@ export default function Scene3D() {
         } finally {
           capturing = false;
         }
+      };
+      // A capture binds `captureRT` and awaits its readback; a compile binds its pass target and awaits
+      // its builds — and each saves the other's target as "previous" and restores it (#1246 review,
+      // #1239). A scene-pass compile's target under a capture draw is the invalid draw that crashed the
+      // iPad mini 5's GPU process; a capture's target under a compile's restore leaves every later live
+      // frame drawing into `captureRT`. Every compile that binds a target runs as a turn on
+      // `runExclusivePrecompile`, so the capture takes a turn too, and the two cannot overlap in either
+      // direction. The wait can be seconds on a cold compile, so the surface it was asked about may be
+      // gone or rebuilt by the time the turn comes.
+      const offscreenRender: SceneRenderer = async (opts) => {
+        // Checked before queueing too: a capture queued behind an earlier one can start after this
+        // surface was torn down, and would otherwise wait out a rebuild's compiles just to refuse.
+        if (scope.disposed) throw new Error('offscreen render: the 3D surface was torn down before this capture started');
+        const installed = renderer;
+        const turn = await runExclusivePrecompileWithin(installed, CAPTURE_TURN_WAIT_MS, async () => {
+          if (scope.disposed || renderer !== installed) {
+            throw new Error('offscreen render: the 3D surface was torn down or rebuilt while this capture waited for the renderer');
+          }
+          return captureAtTurn(opts);
+        });
+        if (!turn.ran) {
+          throw new Error(`offscreen render: a shader compile held the renderer for over ${CAPTURE_TURN_WAIT_MS} ms — retry once the scene has drawn`);
+        }
+        return turn.value;
       };
       registerSceneRenderer(offscreenRender, 'game-3d');
       scope.add(() => unregisterSceneRenderer(offscreenRender), 'unregisterSceneRenderer');

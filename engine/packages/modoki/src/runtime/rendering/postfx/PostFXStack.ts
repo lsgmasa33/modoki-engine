@@ -58,7 +58,7 @@ import {
   stageCompileJobsFromDraws, driveNodeUpdates, MAX_STAGE_COMPILES, MAX_STAGE_COMPILE_ROUNDS,
 } from './stageCompileJobs';
 import {
-  beginPrecompile, runExclusivePrecompile, PRECOMPILE_MAX_HOLD_MS, type PrecompileSession,
+  beginPrecompile, runExclusivePrecompile, borrowRendererTarget, PRECOMPILE_MAX_HOLD_MS, type PrecompileSession,
 } from './precompileSession';
 import { rawNow } from '../../core/clock';
 
@@ -648,10 +648,12 @@ export class PostFXStack {
     const prevTarget = r.getRenderTarget?.() ?? null;
     const prevMrt = r.getMRT?.() ?? null;
     try {
-      await pinPassCallDepth(
+      // Borrowed for the whole compile: three keeps the pass target + MRT bound across its awaits,
+      // and a frame drawn inside that window crashed an iPad mini 5's GPU process (#1246, #1239 A).
+      await borrowRendererTarget(this.rawRenderer, () => pinPassCallDepth(
         this.rawRenderer, rt, getPassCallDepth(),
         () => this.scenePass.compileAsync(this.rawRenderer),
-      );
+      ));
     } catch (e) {
       // ⚠️ three's `PassNode.compileAsync` binds the pass target + MRT and restores them only on
       // SUCCESS. A rejection (a shader-graph throw, a lost device) left the live renderer drawing
