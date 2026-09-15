@@ -13,7 +13,7 @@
  *  the logic is unit-testable without rendering a React panel. */
 
 import { backendFetch, writeAssetFile, jsonFileBody } from '../backend/editorBackend';
-import { serializePrefab, tagEntityTreeAsInstance, untagEntityTreeAsInstance, setPrefabCache, warnInertPrefabSizes, type PrefabFile } from '../scene/prefab';
+import { serializePrefab, tagEntityTreeAsInstance, untagEntityTreeAsInstance, detachPrefabInstance, reattachPrefabInstance, setPrefabCache, warnInertPrefabSizes, wouldCreateCycle, type PrefabFile } from '../scene/prefab';
 import { entityRef } from '../undo/entityRef';
 import { reportUndoFailure } from '../undo/undoFailure';
 import type { UndoAction } from '../undo/undoManager';
@@ -22,6 +22,8 @@ import { firstAssetRoot } from './assetRoots';
 import { pastePathIn, splitAssetPath, type AssetEntry } from '../utils/assetPaths';
 import { isTextAsset } from './assetUndo';
 import { flushPendingMetaFor } from '../scene/pendingMeta';
+import { writeNewAssetDocument } from '../scene/createAssetDocument';
+import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
 
 // ── Re-import / import planning (pure — unit-testable without IO) ─────
 
@@ -434,25 +436,60 @@ export interface CreatePrefabResult {
  *  so a freshly-created nested prefab flattened on the next save.
  *
  *  Returns null if the entity can't be serialized or the file write fails;
- *  callers log the appropriate panel-specific error. */
+ *  callers log the appropriate panel-specific error. Returns 'declined' when the
+ *  path already held a file and the human chose not to replace it (#1264). */
 
 export async function createPrefabFromEntity(
   entityId: number,
   savePath: string,
   label: string,
-): Promise<CreatePrefabResult | null> {
-  const prefab = serializePrefab(entityId);
-  if (!prefab) return null;
-  warnInertPrefabSizes(prefab, savePath);
+  /** Asked when `savePath` already holds a file (#1264). Both callers DERIVE the path from the
+   *  entity's name, so a second entity called "Enemy" used to replace the first Enemy prefab under a
+   *  fresh guid — every placed instance of it unlinked — and this function's own undo then TRASHED
+   *  the path, taking the original prefab with it. A yes replaces the content and KEEPS the prefab's
+   *  guid (owner 2026-09-15), so placed instances stay linked; undo restores the replaced bytes. */
+  confirmReplace: (path: string) => Promise<boolean>,
+): Promise<CreatePrefabResult | 'declined' | null> {
+  const draft = serializePrefab(entityId);
+  if (!draft) return null;
+  warnInertPrefabSizes(draft, savePath);
+  const written = await writeNewAssetDocument(savePath, (guid, kept) => {
+    // ⚠️ A Replace keeps the replaced prefab's id, and `serializePrefab`'s cycle guard only runs
+    // for an `existingId` — which the draft had none of. So check it here: an entity holding an
+    // instance of the very prefab it is replacing would otherwise write a prefab that contains
+    // itself. Same test the serializer applies, over the same reference rows.
+    if (kept) {
+      const cyclic = draft.entities.find((e) => e.prefab && wouldCreateCycle(guid, e.prefab));
+      if (cyclic) {
+        console.error(`[Prefab] refusing to replace ${savePath} — it would nest "${cyclic.prefab}" inside itself`);
+        return null;
+      }
+    }
+    return jsonFileBody({ ...draft, id: guid });
+  }, { confirmReplace, keepPrevious: true, guid: draft.id });
+  if (written.outcome === 'declined') return 'declined';
+  if (written.outcome !== 'created' && written.outcome !== 'replaced') return null;
+  const prefab: PrefabFile = { ...draft, id: written.guid };
   const content = jsonFileBody(prefab);
-  if (!(await writeAssetFile(savePath, content))) return null;
+  const previousContent = written.outcome === 'replaced' ? written.previousContent : null;
+  const replaced = written.outcome === 'replaced';
 
   // Register the prefab's GUID↔path first so tagEntityTreeAsInstance stores the
   // GUID (PrefabInstance.source is GUID-only).
   if (prefab.id) registerAsset(prefab.id, savePath, 'prefab');
   const cacheKey = prefab.id ?? savePath;
   setPrefabCache(cacheKey, prefab);
+  // ⚠️ Snapshot the links the tree ALREADY has before tagging over them, so undo can put them back
+  // (#1264 close-out). Tagging overwrites every PrefabInstance in the subtree: re-running Create
+  // Prefab on an instance of the very prefab it replaces, or on a tree holding nested instances,
+  // used to come back from undo with those links gone and the next save writing plain entities.
+  let priorLinks = detachPrefabInstance(entityId);
   tagEntityTreeAsInstance(entityId, savePath);
+  // Whether the tree currently carries THIS prefab's tags. A failed undo returns without untagging, and
+  // the undo manager still moves it to the redo stack — so redo must not re-snapshot a tree that is
+  // still tagged, or `priorLinks` becomes this prefab's own links and the next undo re-links the tree
+  // to the file it just trashed (#1264 close-out review).
+  let tagged = true;
 
   // Resolve the tagged subtree root by guid so tag/untag hit the right entity
   // after a world rebuild (Play→Stop).
@@ -470,6 +507,30 @@ export async function createPrefabFromEntity(
     // neither before nor after — entities un-linked from a prefab still on disk, or
     // linked to one that is not. Refusing cleanly and saying so is the honest answer.
     undo: async () => {
+      if (replaced) {
+        // ⚠️ RESTORE, never trash: the path held a prefab before this action, and deleting it is
+        // exactly how the original was lost (#1264). Same shape as skinPrefab.ts's update undo.
+        if (previousContent == null || !(await writeAssetFile(savePath, previousContent))) {
+          reportUndoFailure({
+            direction: 'Undo', label,
+            detail: previousContent == null
+              ? `the prefab this replaced could not be read before the replace, so it cannot be restored: ${savePath}. The file and the entities were left as they are.`
+              : `the replaced prefab was not restored: ${savePath}. The entities were left linked to it rather than half-undone.`,
+          });
+          return;
+        }
+        // Migrate before seeding the cache — getPrefabSource returns early on a cache hit, so an
+        // un-migrated object here poisons override detection (skinPrefab.ts, same reason).
+        try {
+          const restored = JSON.parse(previousContent) as PrefabFile;
+          for (const entry of restored.entities ?? []) migrateUIAnchorZIndexStructured(entry);
+          setPrefabCache(cacheKey, restored);
+        } catch { setPrefabCache(cacheKey, null); }
+        const id = ref.resolve(); if (id != null) untagEntityTreeAsInstance(id);
+        reattachPrefabInstance(priorLinks);
+        tagged = false;
+        return;
+      }
       if (!(await deleteAssetFile(savePath))) {
         reportUndoFailure({
           direction: 'Undo', label,
@@ -479,6 +540,8 @@ export async function createPrefabFromEntity(
       }
       setPrefabCache(cacheKey, null);
       const id = ref.resolve(); if (id != null) untagEntityTreeAsInstance(id);
+      reattachPrefabInstance(priorLinks);
+      tagged = false;
     },
     redo: async () => {
       // Why gating matters MORE than logging on this side: caching the prefab (and
@@ -496,7 +559,12 @@ export async function createPrefabFromEntity(
       }
       if (prefab.id) registerAsset(prefab.id, savePath, 'prefab');
       setPrefabCache(cacheKey, prefab);
-      const id = ref.resolve(); if (id != null) tagEntityTreeAsInstance(id, savePath);
+      const id = ref.resolve();
+      if (id != null) {
+        if (!tagged) priorLinks = detachPrefabInstance(id);
+        tagEntityTreeAsInstance(id, savePath);
+        tagged = true;
+      }
     },
   };
   return { savePath, prefab, action };

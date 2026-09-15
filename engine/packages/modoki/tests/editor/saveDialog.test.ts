@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-/** saveAssetDialog branch coverage (Missing Tests #5).
+/** chooseNewAssetPath (the save dialog) branch coverage (Missing Tests #5).
  *
  *  Native "Save As" via the dev server, with an in-app MODAL fallback (window.prompt() throws in
  *  the Electron renderer). Pins: ensureExt idempotence (via the returned path), the cancelled /
@@ -13,7 +13,10 @@ vi.mock('../../src/editor/backend/editorBackend', () => ({
   backendFetch: (...args: unknown[]) => backendFetch(...args),
 }));
 
-import { saveAssetDialog, confirmReplaceAsset } from '../../src/editor/utils/saveDialog';
+import { chooseNewAssetPath, confirmReplaceAsset } from '../../src/editor/utils/saveDialog';
+
+/** The chosen path alone — what most branches below pin. */
+const saveAssetDialog = async (o: Parameters<typeof chooseNewAssetPath>[0]) => (await chooseNewAssetPath(o))?.path ?? null;
 
 const jsonResponse = (body: unknown) => ({ json: async () => body }) as unknown as Response;
 
@@ -38,7 +41,7 @@ afterEach(() => {
   document.body.innerHTML = ''; // drop any leftover modal between tests
 });
 
-describe('saveAssetDialog', () => {
+describe('chooseNewAssetPath — the chosen path', () => {
   it('returns null when the user cancels the native panel', async () => {
     backendFetch.mockResolvedValue(jsonResponse({ cancelled: true }));
     expect(await saveAssetDialog(opts)).toBeNull();
@@ -185,5 +188,43 @@ describe('modal keyboard behaviour', () => {
       expect(await p).toBe(false);
       expect(document.querySelectorAll('button').length).toBe(0);
     } finally { add.mockRestore(); addWin.mockRestore(); }
+  });
+});
+
+describe('chooseNewAssetPath — which Replace question the create should ask (#1264)', () => {
+  // The macOS panel runs its own "Replace?" — but against the name IT returned, before ensureExt.
+  it('the native panel already checked the EXACT destination → no second, in-app question', async () => {
+    backendFetch.mockResolvedValue(jsonResponse({ path: '/games/x/assets/scenes/level.json' }));
+    const pick = await chooseNewAssetPath({ defaultName: 'scene.json', ext: '.json' });
+    expect(pick?.path).toBe('/games/x/assets/scenes/level.json');
+    // Raced against a tick, so a regression that opens the modal fails HERE rather than as a timeout.
+    const answer = await Promise.race([pick!.confirmReplace(pick!.path), tick().then(() => 'still waiting on a modal')]);
+    expect(answer).toBe(true);
+    expect(document.querySelector('button'), 'no modal was opened').toBeNull();
+  });
+
+  it('the native panel checked the COLLAPSED name (Walk.json ≠ Walk.anim.json) → asks in-app', async () => {
+    backendFetch.mockResolvedValue(jsonResponse({ path: '/games/x/assets/Walk.json' }));
+    const pick = await chooseNewAssetPath(opts);
+    expect(pick?.path).toBe('/games/x/assets/Walk.anim.json');
+    const answer = pick!.confirmReplace(pick!.path);
+    await tick();
+    expect(document.body.textContent).toContain('/games/x/assets/Walk.anim.json already exists');
+    clickBtn('Cancel');
+    expect(await answer).toBe(false);
+  });
+
+  it('the fallback text box never checks → asks in-app', async () => {
+    backendFetch.mockResolvedValue(jsonResponse({ unsupported: true }));
+    const p = chooseNewAssetPath(opts);
+    await tick();
+    modalInput()!.value = '/games/x/assets/Walk.anim.json';
+    clickBtn('Create');
+    const pick = await p;
+    const answer = pick!.confirmReplace(pick!.path);
+    await tick();
+    expect(document.body.textContent).toContain('already exists');
+    clickBtn('Replace');
+    expect(await answer).toBe(true);
   });
 });

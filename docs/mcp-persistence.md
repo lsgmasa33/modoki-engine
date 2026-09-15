@@ -799,6 +799,54 @@ CREATE/REGENERATE writes — a new file has to exist on disk for `registerAsset`
 see it. Of those, `SkinEditor`'s auto-rig is the one that matters: it derives `<sprite>.rig2d.json`,
 so re-rigging the same sprite regenerates over a rig that may already have unsaved edits parked.
 
+### A create asks before it replaces, and a Replace keeps the replaced guid (#1264)
+
+Every human create that writes a file goes through ONE primitive, `writeNewAssetDocument`
+(`editor/scene/createAssetDocument.ts`). It writes create-only (`/api/write-file`'s `ifNoneMatch:'*'`),
+asks `confirmReplace` on a 409, and on a yes writes again **under the replaced document's id**. It
+also calls `assetWrittenToDisk`, so the rule above comes with it. The callers are the four editor
+"New" buttons (Animation, Particle, 2D Rig, Sprite Animation), Auto-rig, Create Prefab (Hierarchy
+menu and Assets entity drop), Save Scene As, and — via `createRegisteredAsset` — the Assets panel's
+New X (#1215).
+
+**Why a Replace keeps the id** (owner, 2026-09-15): "Replace" is about the file's content, not about
+breaking what uses it. Before #1264 each of these minted a fresh guid over the existing file, so
+every scene/prefab ref to the old asset dangled.
+
+**Why the check is at the write, not in the save dialog.** The dialog never was a guard. The
+Windows/Linux fallback is a text box with no existence check. The macOS panel checks the name IT
+returned, before `ensureExt`, so typing `Walk` for a `.anim.json` checks `Walk.json`. Three callers
+also derive their path with no dialog at all. And a dialog-time check can go stale before the write,
+while a 409 cannot. `chooseNewAssetPath` returns the `confirmReplace` to use: when the panel already
+checked the exact destination (`scene.json`), it does not ask a second time.
+
+**Two shapes that differ, on purpose:**
+- **Assets → Create Scene asks BEFORE its override** (`mayCreateOver`), because the override
+  discards the live world first and writes last. A 409 would arrive after the damage. This is the
+  one check-then-act.
+- **Create Prefab's undo after a Replace RESTORES the replaced bytes.** It used to trash the path,
+  which deleted the original prefab too. Its undo also puts back the `PrefabInstance` links the tree
+  had BEFORE tagging (snapshotted with `detachPrefabInstance`, keyed by guid): Create Prefab on an
+  instance of the prefab it replaces used to come back from undo unlinked. ⚠️ Not across Play→Stop for
+  a NESTED instance the tree held: reload re-derives its member guids from the new prefab's root, so
+  those links are skipped (lost, never cross-wired) — #1272. See `detachPrefabInstance`'s docblock.
+
+**A Replace never crosses KINDS.** The scene flows write plain `.json`, so their destination can be
+`Enemy.prefab.json`. Kept, that guid would be re-registered as a scene, and every `PrefabInstance.source`
+would resolve to a scene document. A destination the manifest types as another kind is refused
+before any question (`otherAssetKindAt`). Only the scene flows pass `kind`: every other create
+enforces a compound extension. A file the manifest has not indexed yet cannot be classified and is
+not refused, and neither is a case-variant name on a case-insensitive filesystem (#1273).
+
+**Not verified: stale live display.** A Replace keeps the guid, and `/api/write-file` skips the
+watcher for the editor's own writes. So an entity already showing a replaced particle, clip or rig
+may keep showing the old definition from a guid-keyed runtime cache until the scene reloads. Prefabs
+are not affected: `setPrefabCache` evicts the runtime prefab cache. This came from reading the code
+in the #1264 close-out review, not from an observation.
+
+Guarded by `tests/editor/createWritesAskFirst.test.ts`: no editor function may mint a guid and write
+it with a plain `writeAssetFile`/`postWriteFile`, which is the shape all eight members had.
+
 The collision this rule was written for was measured on the old panel autosave: `particle_set`
 parked v1, a panel-shaped `/api/write-file` put v2 on disk, `dirtyAssetPaths` still listed the path,
 and `save_all` rewrote the file back to **v1** with no warning. That whole class is gone now that

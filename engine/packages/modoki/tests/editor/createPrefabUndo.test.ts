@@ -24,11 +24,22 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 const setPrefabCacheSpy = vi.fn();
 const tagSpy = vi.fn();
 const untagSpy = vi.fn();
+/** The links the tree held BEFORE Create Prefab tagged over them — what undo must put back. */
+const PRIOR_LINKS = [{ id: 7, data: { source: 'g-prior', localId: 1, rootInstanceId: 7, parentLocalId: 0 } }];
+const detachSpy = vi.fn(() => PRIOR_LINKS);
+const reattachSpy = vi.fn();
+const calls: string[] = [];
+const OLD_ID = 'g-old';
 vi.mock('../../src/editor/scene/prefab', () => ({
-  serializePrefab: () => ({ id: 'g-new', root: {} }),
+  serializePrefab: () => ({ id: 'g-new', root: {}, entities: [{ localId: 1, prefab: 'g-child' }] }),
+  // The real guard, reduced to its direct case: the child IS the parent.
+  wouldCreateCycle: (parent: string, child: string) => parent === child,
+  resolveExistingDocumentId: async () => OLD_ID,
   setPrefabCache: (...a: unknown[]) => setPrefabCacheSpy(...a),
-  tagEntityTreeAsInstance: (...a: unknown[]) => tagSpy(...a),
-  untagEntityTreeAsInstance: (...a: unknown[]) => untagSpy(...a),
+  tagEntityTreeAsInstance: (...a: unknown[]) => { calls.push('tag'); return tagSpy(...a); },
+  untagEntityTreeAsInstance: (...a: unknown[]) => { calls.push('untag'); return untagSpy(...a); },
+  detachPrefabInstance: (...a: unknown[]) => { calls.push('detach'); return (detachSpy as (...x: unknown[]) => unknown)(...a); },
+  reattachPrefabInstance: (...a: unknown[]) => { calls.push('reattach'); return reattachSpy(...a); },
   warnInertPrefabSizes: () => undefined,
 }));
 
@@ -36,6 +47,7 @@ const registerAssetSpy = vi.fn();
 vi.mock('../../src/runtime/loaders/assetManifest', () => ({
   registerAsset: (...a: unknown[]) => registerAssetSpy(...a),
   getGuidForPath: () => undefined,
+  newGuid: () => 'g-minted',
 }));
 
 vi.mock('../../src/editor/undo/entityRef', () => ({
@@ -46,8 +58,20 @@ import { createPrefabFromEntity } from '../../src/editor/panels/assetOps';
 
 // Which /api/* routes should fail this test. Everything else answers ok.
 let failing = new Set<string>();
-const mockFetch = vi.fn(async (url: string) => {
+/** Files already on disk, path → text. `/api/write-file` honours `ifNoneMatch:'*'` against it the
+ *  way the real route does (409, nothing written), and a plain GET of the asset serves the text. */
+let onDisk = new Map<string, string>();
+let written: Array<{ path: string; content: string; createOnly: boolean }> = [];
+const mockFetch = vi.fn(async (url: string, init?: { body?: string }) => {
   const bad = Array.from(failing).some((r) => String(url).includes(r));
+  if (!bad && String(url).includes('/api/write-file')) {
+    const b = JSON.parse(init?.body ?? '{}') as { path: string; content: string; ifNoneMatch?: string };
+    if (b.ifNoneMatch === '*' && onDisk.has(b.path)) return { ok: false, status: 409, json: async () => ({}) } as any;
+    written.push({ path: b.path, content: b.content, createOnly: b.ifNoneMatch === '*' });
+    onDisk.set(b.path, b.content);
+  }
+  const served = !String(url).includes('/api/') && [...onDisk.entries()].find(([p]) => String(url).endsWith(p));
+  if (served) return { ok: true, status: 200, text: async () => served[1], json: async () => JSON.parse(served[1]) } as any;
   return { ok: !bad, status: bad ? 500 : 200, json: async () => ({}) } as any;
 });
 
@@ -60,18 +84,21 @@ const spyError = () => {
 
 beforeEach(() => {
   failing = new Set();
+  onDisk = new Map();
+  written = [];
   vi.stubGlobal('fetch', mockFetch);
   mockFetch.mockClear();
   setPrefabCacheSpy.mockClear(); tagSpy.mockClear(); untagSpy.mockClear(); registerAssetSpy.mockClear();
+  detachSpy.mockClear(); reattachSpy.mockClear(); calls.length = 0;
 });
 // Restored in afterEach, NOT inline: a failing assertion skips the rest of the body, so
 // an inline restore never runs and the stub leaks into every later test.
 afterEach(() => { for (const s of spies) s.mockRestore(); spies = []; vi.unstubAllGlobals(); });
 
 async function makeAction() {
-  const res = await createPrefabFromEntity(7, '/p/thing.prefab.json', 'Create Prefab "Thing"');
-  expect(res).not.toBeNull();
-  return res!.action;
+  const res = await createPrefabFromEntity(7, '/p/thing.prefab.json', 'Create Prefab "Thing"', async () => true);
+  if (!res || res === 'declined') throw new Error(`expected a created prefab, got ${res}`);
+  return res.action;
 }
 
 describe('createPrefabFromEntity — undo', () => {
@@ -132,5 +159,143 @@ describe('createPrefabFromEntity — redo', () => {
     expect(setPrefabCacheSpy).toHaveBeenCalledTimes(1);
     expect(registerAssetSpy).toHaveBeenCalledTimes(1);
     expect(tagSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('createPrefabFromEntity over an EXISTING prefab (#1264)', () => {
+  // Both callers derive the path from the entity's NAME, so a second entity called "Thing" lands on
+  // the first Thing prefab. It used to replace it under a fresh guid — every placed instance
+  // unlinked — and this function's undo then TRASHED the path, deleting the original too.
+  const PATH = '/p/thing.prefab.json';
+  const OLD_TEXT = `{"id":"${OLD_ID}","name":"old thing","entities":[]}\n`;
+
+  it('asks, naming the path, and a NO writes nothing', async () => {
+    onDisk.set(PATH, OLD_TEXT);
+    const asked: string[] = [];
+    const res = await createPrefabFromEntity(7, PATH, 'Create Prefab "Thing"', async (p) => { asked.push(p); return false; });
+    expect(res).toBe('declined');
+    expect(asked).toEqual([PATH]);
+    expect(written).toEqual([]);
+    expect(onDisk.get(PATH)).toBe(OLD_TEXT);
+    expect(tagSpy).not.toHaveBeenCalled();
+    expect(registerAssetSpy).not.toHaveBeenCalled();
+  });
+
+  it('a fresh path writes create-only and never asks', async () => {
+    let asked = false;
+    const res = await createPrefabFromEntity(7, PATH, 'Create Prefab "Thing"', async () => { asked = true; return true; });
+    expect(res && res !== 'declined' && res.prefab.id).toBe('g-new');
+    expect(asked).toBe(false);
+    expect(written.map((w) => w.createOnly)).toEqual([true]);
+  });
+
+  it('a YES replaces KEEPING the replaced prefab\'s guid — in the file, the registration and the cache', async () => {
+    onDisk.set(PATH, OLD_TEXT);
+    const res = await createPrefabFromEntity(7, PATH, 'Create Prefab "Thing"', async () => true);
+    if (!res || res === 'declined') throw new Error(String(res));
+    expect(res.prefab.id).toBe(OLD_ID);
+    expect(written).toHaveLength(1);
+    expect(written[0].createOnly).toBe(false);
+    expect((JSON.parse(written[0].content) as { id: string }).id).toBe(OLD_ID);
+    expect(registerAssetSpy).toHaveBeenCalledWith(OLD_ID, PATH, 'prefab');
+    expect(setPrefabCacheSpy).toHaveBeenCalledWith(OLD_ID, expect.objectContaining({ id: OLD_ID }));
+  });
+
+  it('UNDO of a replace RESTORES the replaced bytes and never trashes the file', async () => {
+    onDisk.set(PATH, OLD_TEXT);
+    const res = await createPrefabFromEntity(7, PATH, 'Create Prefab "Thing"', async () => true);
+    if (!res || res === 'declined') throw new Error(String(res));
+    setPrefabCacheSpy.mockClear();
+    await res.action.undo();
+    expect(onDisk.get(PATH)).toBe(OLD_TEXT);
+    expect(mockFetch.mock.calls.some(([u]) => String(u).includes('/api/delete-asset'))).toBe(false);
+    expect(setPrefabCacheSpy).toHaveBeenCalledWith(OLD_ID, expect.objectContaining({ name: 'old thing' }));
+    expect(untagSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('a replace that would nest the prefab inside itself is refused, and the old file survives', async () => {
+    // The draft carries a reference row to 'g-child'. Replacing the prefab whose id IS 'g-child'
+    // with it would make that prefab contain itself.
+    onDisk.set(PATH, OLD_TEXT);
+    const err = spyError();
+    const prefabMod = await import('../../src/editor/scene/prefab');
+    const spy = vi.spyOn(prefabMod, 'resolveExistingDocumentId').mockResolvedValue('g-child');
+    try {
+      const res = await createPrefabFromEntity(7, PATH, 'Create Prefab "Thing"', async () => true);
+      expect(res).toBeNull();
+      expect(written).toEqual([]);
+      expect(onDisk.get(PATH)).toBe(OLD_TEXT);
+      expect(String(err.mock.calls[0]?.[0])).toMatch(/inside itself/);
+    } finally { spy.mockRestore(); }
+  });
+});
+
+describe('createPrefabFromEntity keeps the links the tree ALREADY had (#1264 close-out)', () => {
+  // Tagging overwrites every PrefabInstance in the subtree. Create Prefab on an instance of the prefab
+  // it replaces (same name → same path), or on a tree holding nested instances, used to come back from
+  // undo with NO link at all — and the next save wrote plain entities.
+  it('snapshots the prior links BEFORE tagging', async () => {
+    await makeAction();
+    expect(calls.slice(0, 2)).toEqual(['detach', 'tag']);
+  });
+
+  it('undo of a CREATE untags, then restores the prior links', async () => {
+    const action = await makeAction();
+    calls.length = 0;
+    await action.undo();
+    expect(calls).toEqual(['untag', 'reattach']);
+    expect(reattachSpy).toHaveBeenCalledWith(PRIOR_LINKS);
+  });
+
+  it('undo of a REPLACE untags, then restores the prior links', async () => {
+    onDisk.set('/p/thing.prefab.json', `{"id":"${OLD_ID}","entities":[]}\n`);
+    const res = await createPrefabFromEntity(7, '/p/thing.prefab.json', 'Create Prefab "Thing"', async () => true);
+    if (!res || res === 'declined') throw new Error(String(res));
+    calls.length = 0;
+    await res.action.undo();
+    expect(calls).toEqual(['untag', 'reattach']);
+    expect(reattachSpy).toHaveBeenCalledWith(PRIOR_LINKS);
+  });
+
+  it('redo after a successful undo of a REPLACE re-snapshots too', async () => {
+    onDisk.set('/p/thing.prefab.json', `{"id":"${OLD_ID}","entities":[]}\n`);
+    const res = await createPrefabFromEntity(7, '/p/thing.prefab.json', 'Create Prefab "Thing"', async () => true);
+    if (!res || res === 'declined') throw new Error(String(res));
+    await res.action.undo();
+    calls.length = 0;
+    await res.action.redo();
+    expect(calls).toEqual(['detach', 'tag']);
+  });
+
+  it('redo re-snapshots before tagging again, so a second undo restores what redo overwrote', async () => {
+    const action = await makeAction();
+    await action.undo();
+    calls.length = 0;
+    await action.redo();
+    expect(calls).toEqual(['detach', 'tag']);
+  });
+});
+
+describe('a FAILED undo then redo does not overwrite the prior links with the new prefab\'s own (#1264 close-out)', () => {
+  // reportUndoFailure RETURNS, so the undo manager moves the failed undo to the redo stack while the
+  // tree is still tagged. A redo that re-snapshotted then would store THIS prefab's links as "prior",
+  // and the next successful undo re-linked the tree to the file it had just trashed.
+  it('redo after a failed undo tags without re-snapshotting; the next undo still restores the ORIGINAL links', async () => {
+    const action = await makeAction();   // snapshot #1 → PRIOR_LINKS
+    // Any LATER snapshot is of the tree carrying this prefab's own tags — a distinct value, so the
+    // last assertion can tell which snapshot undo restored.
+    const OWN_LINKS = [{ id: 7, data: { source: 'g-new', localId: 1, rootInstanceId: 7, parentLocalId: 0 } }];
+    detachSpy.mockImplementation(() => OWN_LINKS as never);
+    try {
+      spyError();
+      failing.add('/api/delete-asset');
+      await action.undo();           // fails — tree stays tagged
+      failing.clear();
+      calls.length = 0;
+      await action.redo();
+      expect(calls, 'no snapshot of a tree that is still tagged').toEqual(['tag']);
+      await action.undo();
+      expect(reattachSpy).toHaveBeenLastCalledWith(PRIOR_LINKS);
+    } finally { detachSpy.mockImplementation(() => PRIOR_LINKS); }
   });
 });

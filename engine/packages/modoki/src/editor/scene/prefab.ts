@@ -12,6 +12,7 @@ import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { newGuid, registerAsset, getGuidForPath, isGuid, resolveRef } from '../../runtime/loaders/assetManifest';
 import { durableGuid } from '../../runtime/core/assetRefRules';
 import { assertNoRuntimeGuids } from './runtimeGuidTripwire';
+import { entityRef, type EntityRef } from '../undo/entityRef';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { invalidatePrefab } from '../../runtime/loaders/meshTemplateCache';
 import { migrateUIAnchorZIndexStructured } from '../../runtime/loaders/uiAnchorZIndexMigration';
@@ -1576,8 +1577,9 @@ export function untagEntityTreeAsInstance(rootEcsId: number): void {
   markStructureDirty();
 }
 
-/** A captured PrefabInstance trait, used to undo a detach. */
-export interface DetachedInstanceTrait { id: number; data: Record<string, unknown>; }
+/** A captured PrefabInstance trait, used to undo a detach. `ref`/`rootRef` are what reattach resolves
+ *  through; `id` is the capture-time ECS id, kept for diagnostics only. */
+export interface DetachedInstanceTrait { id: number; ref: EntityRef; rootRef: EntityRef; data: Record<string, unknown>; }
 
 /** Detach a prefab instance — strip the `PrefabInstance` trait off the instance
  *  root and EVERY descendant in its subtree (nested instances included), turning
@@ -1587,15 +1589,18 @@ export interface DetachedInstanceTrait { id: number; data: Record<string, unknow
  *  prefab no longer propagate here and the tree serializes as plain entities.
  *  Returns a snapshot of the removed traits so the action can be undone.
  *
- *  INVARIANT (detach preserves entity ids): this only adds/removes the
- *  `PrefabInstance` trait — it NEVER respawns, reparents, or re-creates entities,
- *  so every snapshot `id` stays valid for `reattachPrefabInstance` (undo) and for
- *  the Hierarchy redo path. The redo there still resolves the root by GUID (so it
- *  survives a Play→Stop world rebuild), but reattach can key the snapshot by raw
- *  numeric id precisely because detach itself is id-stable. If detach is ever made
- *  to re-create entities (e.g. to clear derived per-instance guids), this snapshot
- *  must switch to guid-keyed ids and reattach must resolve through them — see
- *  review F10. */
+ *  ⚠️ The snapshot is keyed by GUID (`entityRef`), NOT by ECS id (#1264 close-out review). Detach itself
+ *  is id-stable, but that was never enough: OTHER undo entries run between a detach and its undo — a
+ *  delete + undo respawns a subtree, and koota recycles ids last-freed-first, so two siblings came back
+ *  with each other's ids and reattach cross-wired their localIds with no error. `rootInstanceId` is an
+ *  ECS id too, so it is re-derived from `rootRef` at reattach. `entityRef` mints a guid for a member that
+ *  has none.
+ *
+ *  ⚠️ LIMIT — a guid only helps while the entity KEEPS it. A detach leaves plain entities whose guids are
+ *  saved, so Hierarchy/agent Detach undo survives Play→Stop. Create Prefab does not: tagging makes a
+ *  held nested instance a row of the NEW prefab, whose member guids are DERIVED from the new root on
+ *  reload, so after Play→Stop those refs miss and reattach skips them (the nested links are lost, never
+ *  cross-wired). Not fixed: #1272. */
 export function detachPrefabInstance(rootEcsId: number): DetachedInstanceTrait[] {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return [];
@@ -1605,7 +1610,12 @@ export function detachPrefabInstance(rootEcsId: number): DetachedInstanceTrait[]
     const entity = findEntity(info.id);
     if (!entity || !entity.has(PrefabInstanceMeta.trait)) continue;
     const pi = entity.get(PrefabInstanceMeta.trait) as Record<string, unknown>;
-    snapshot.push({ id: info.id, data: { source: pi.source, localId: pi.localId, rootInstanceId: pi.rootInstanceId } });
+    // Every field, `parentLocalId` included: it addresses a NESTED instance's per-instance overrides, and a
+    // snapshot that dropped it reattached a nested instance as top-level (0) on undo (#1264 close-out).
+    snapshot.push({
+      id: info.id, ref: entityRef(info.id), rootRef: entityRef(pi.rootInstanceId as number),
+      data: { source: pi.source, localId: pi.localId, rootInstanceId: pi.rootInstanceId, parentLocalId: pi.parentLocalId },
+    });
     entity.remove(PrefabInstanceMeta.trait);
   }
   if (snapshot.length) markStructureDirty();
@@ -1617,11 +1627,14 @@ export function detachPrefabInstance(rootEcsId: number): DetachedInstanceTrait[]
 export function reattachPrefabInstance(snapshot: DetachedInstanceTrait[]): void {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta || !snapshot.length) return;
-  for (const { id, data } of snapshot) {
-    const entity = findEntity(id);
+  for (const { ref, rootRef, data } of snapshot) {
+    const live = ref.resolve();
+    const entity = live == null ? undefined : findEntity(live);
     if (!entity) continue;
-    if (entity.has(PrefabInstanceMeta.trait)) entity.set(PrefabInstanceMeta.trait, data);
-    else entity.add(PrefabInstanceMeta.trait(data));
+    const root = rootRef.resolve();
+    const restored = root == null ? data : { ...data, rootInstanceId: root };
+    if (entity.has(PrefabInstanceMeta.trait)) entity.set(PrefabInstanceMeta.trait, restored);
+    else entity.add(PrefabInstanceMeta.trait(restored));
   }
   markStructureDirty();
 }

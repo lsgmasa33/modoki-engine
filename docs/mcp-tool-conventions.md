@@ -722,8 +722,9 @@ variance is machine-readable while it lasts.
   (`write_asset`) or a sidecar (`write_asset_meta`) for an asset that is not on disk is `NOT_FOUND`;
   an omitted `id` keeps the one on disk. ⚠️ These refusals are for the AGENT path: the editor's own
   flush (`selfWrite`/`rendererWrite`) is exempt, because a flush re-parks on failure, and refusing a
-  park whose file vanished wedges `hasUnsavedChanges()` forever. The human's New-asset Replace is
-  asked in-app, because neither save dialog reliably asks for the real destination. A
+  park whose file vanished wedges `hasUnsavedChanges()` forever. The human's Replace is asked in-app
+  on EVERY create path, and keeps the replaced guid (#1264, one primitive:
+  [mcp-persistence.md](mcp-persistence.md) § "A create asks before it replaces"). A
   write that changes a path↔GUID mapping rebuilds the manifest before replying (`manifestRebuilt`),
   so the read it names as its check is not racing the watcher. Scar: `create_registered_asset`
   replaced an existing material under a fresh guid, answered `ok:true`, and every ref to the old

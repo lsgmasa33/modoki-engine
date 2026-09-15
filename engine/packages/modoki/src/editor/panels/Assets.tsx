@@ -38,7 +38,8 @@ import { newGuid } from '../../runtime/loaders/assetManifest';
 import { getCreatableAssets, type CreatableAssetDef } from './creatableAssets';
 import { reimportPaths } from './assetViews/reimport';
 import { openAssetInEditor } from './openAssetInEditor';
-import { saveAssetDialog, confirmReplaceAsset } from '../utils/saveDialog';
+import { chooseNewAssetPath, confirmReplaceAsset } from '../utils/saveDialog';
+import { mayCreateOver } from '../scene/createAssetDocument';
 import { createRegisteredAssetAskingToReplace } from './createRegisteredAsset';
 
 /** Display name from an asset path: last segment minus a known double/single extension. */
@@ -927,16 +928,25 @@ export default function Assets() {
    *  right editor / selects the new asset. `folder` (a right-clicked folder path) wins
    *  over the def's own `defaultFolder`. */
   const runCreate = useCallback(async (def: CreatableAssetDef, folder?: string) => {
-    const path = await saveAssetDialog({
+    const pick = await chooseNewAssetPath({
       defaultName: def.defaultName + def.ext, ext: def.ext,
       defaultFolder: folder ?? def.defaultFolder, prompt: def.prompt ?? def.label,
     });
-    if (!path) return;
+    if (!pick) return;
+    const { path } = pick;
     // The `create`-OVERRIDE kinds (Scene) stay HERE and are not routed through
     // `createRegisteredAsset`, which refuses them. That is not an inconsistency: the override
     // discards the live world, and the dialog above is what makes a cancel safe — which is exactly
     // the guard an explicit-path call would remove. See createRegisteredAsset.ts's header.
     if (def.create) {
+      // ⚠️ Asked BEFORE the override, not at its write (#1264): Scene's override throws the live
+      // world away first and writes last, so a create-only 409 would arrive after the damage.
+      const may = await mayCreateOver(path, pick.confirmReplace, def.assetType);
+      if (may === 'declined') return;
+      if (may !== 'create') {
+        useEditorStore.getState().showToast(`${path} is not a ${def.assetType} (it is typed '${may.existingType}') — choose another name.`, 'warn');
+        return;
+      }
       await def.create(path);
       refresh();
       def.onCreated?.({ path, name: assetDisplayName(path, def.ext), guid: newGuid() });
@@ -946,7 +956,7 @@ export default function Assets() {
     // for the human cannot silently differ for a tool.
     // Create-only, then an in-app "Replace?" if the file exists — the save dialog above cannot be
     // trusted to have asked for the real destination (#1215). A Replace keeps the replaced guid.
-    const r = await createRegisteredAssetAskingToReplace(def.id, path, confirmReplaceAsset);
+    const r = await createRegisteredAssetAskingToReplace(def.id, path, pick.confirmReplace);
     if (!r) return;
     if (!r.ok) { console.error(`[Assets] ${r.error}`); return; }
     refresh();
@@ -1532,7 +1542,9 @@ export default function Assets() {
       ? `${targetFolder}/${safeName}.prefab.json`
       : `/prefabs/${safeName}.prefab.json`;
 
-    const result = await createPrefabFromEntity(id, savePath, `Save prefab "${name}"`);
+    // Asked when a prefab of that name is already in the folder; a Replace keeps its guid (#1264).
+    const result = await createPrefabFromEntity(id, savePath, `Save prefab "${name}"`, confirmReplaceAsset);
+    if (result === 'declined') return;
     if (!result) { console.error(`[Assets] Failed to create prefab ${savePath}`); return; }
     console.log(`[Assets] Created prefab: ${savePath}`);
     refresh();

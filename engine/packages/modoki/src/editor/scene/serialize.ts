@@ -13,7 +13,8 @@ import { EntityAttributes } from '../../runtime/core/traits/EntityAttributes';
 import { Environment } from '../../three/traits/Environment';
 import { Light } from '../../three/traits/Light';
 import { writeAssetFile, jsonFileBody } from '../backend/editorBackend';
-import { saveAssetDialog } from '../utils/saveDialog';
+import { chooseNewAssetPath } from '../utils/saveDialog';
+import { writeNewAssetDocument } from './createAssetDocument';
 import { getAllTraits, getTraitByName } from '../../runtime/core/ecs/traitRegistry';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { isPrefabEditWorld } from './prefabEditWorld';
@@ -1196,18 +1197,31 @@ export async function saveScene(opts: {
   // the project's scenes folder via the backend, so it persists to the project on
   // disk (dev/Electron). We deliberately do NOT use `showSaveFilePicker`: the File
   // System Access API writes to the user's LOCAL disk, not the project.
-  // `saveAssetDialog` uses the native macOS panel where available and an in-app
+  // `chooseNewAssetPath` uses the native macOS panel where available and an in-app
   // name prompt everywhere else.
-  const target = await saveAssetDialog({
+  const pick = await chooseNewAssetPath({
     defaultName: 'scene.json',
     ext: '.json',
     defaultFolder: '/assets/scenes',
     prompt: 'Save Scene As',
   });
-  if (!target) return { saved: false, path: null, reason: 'cancelled' }; // user cancelled
-  const ok = await writeAssetFile(target, content);
+  if (!pick) return { saved: false, path: null, reason: 'cancelled' }; // user cancelled
+  const target = pick.path;
+  // Create-only, asking before replacing an existing scene (#1264) — the fallback prompt never
+  // checked. A Replace gives THIS scene the replaced one's guid (owner 2026-09-15), so what points
+  // at that scene keeps pointing at it; registering it below is what the next save reads back.
+  const written = await writeNewAssetDocument(target, (guid) => (guid === scene.id ? content : jsonFileBody({ ...scene, id: guid })), {
+    guid: scene.id, confirmReplace: pick.confirmReplace, kind: 'scene',
+  });
+  if (written.outcome === 'declined') return { saved: false, path: null, reason: 'cancelled' };
+  if (written.outcome === 'wrongKind') {
+    // Plain `.json` can name a prefab or material; replacing it would hand its guid to a scene.
+    useEditorStore.getState().showToast(`${target} is not a scene (it is typed '${written.existingType}') — choose another name.`, 'warn');
+    return { saved: false, path: null, reason: 'cancelled' };
+  }
+  const ok = written.outcome === 'created' || written.outcome === 'replaced';
   if (ok) {
-    registerAsset(scene.id, target, 'scene');
+    registerAsset(written.guid, target, 'scene');
     setCurrentScenePath(target); // persists, so the next Save All goes straight to it
     editorEmit('!save', { path: target, entities: scene.entities.length }); // Editor Percept (V2)
     console.log(`[Editor] Saved scene: ${scene.entities.length} entities → ${target}`);

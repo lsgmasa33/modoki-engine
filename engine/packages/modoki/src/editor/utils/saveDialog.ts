@@ -12,15 +12,17 @@ function promptPath(title: string, message: string, initial: string): Promise<st
   return openModal(title, message, 'Create', initial);
 }
 
-/** In-app "Replace?" confirmation for a New-asset create whose destination already exists (#1215).
+/** In-app "Replace?" confirmation for a create whose destination already exists (#1215, #1264).
  *  Needed because neither save path reliably asks: the Windows/Linux fallback above is a text box
  *  with no existence check, and the macOS panel checks the COLLAPSED name (`rock.json`) while the
- *  write goes to `rock.mat.json` (see `ensureExt`). `window.confirm` is not an option for the same
- *  reason `window.prompt` is not. Resolves true only on an explicit Replace. */
+ *  write goes to `rock.mat.json` (see `ensureExt`) — and Create Prefab / Auto-Rig derive their path
+ *  with no dialog at all. `window.confirm` is not an option for the same reason `window.prompt` is
+ *  not. Resolves true only on an explicit Replace. The wording is shared by every create, so it names
+ *  no particular new content: a New X writes a default document, Create Prefab the selected entity. */
 export async function confirmReplaceAsset(path: string): Promise<boolean> {
   const answer = await openModal(
     'Replace existing asset?',
-    `${path} already exists. Replace it with a new default document? It keeps its GUID, so scenes and prefabs that use it keep pointing at it — at the new, default contents.`,
+    `${path} already exists. Replace its contents? It keeps its GUID, so scenes and prefabs that use it keep pointing at it — at the new contents.`,
     'Replace',
   );
   return answer !== null;
@@ -93,12 +95,23 @@ export function ensureExt(p: string, ext: string): string {
   return base + ext;
 }
 
-export async function saveAssetDialog(opts: {
+type SaveAssetDialogOpts = {
   defaultName: string;      // e.g. "New Animation.anim.json"
   ext: string;              // e.g. ".anim.json" — enforced on the result
   defaultFolder?: string;   // asset-root URL to start in (Assets folder context)
   prompt?: string;
-}): Promise<string | null> {
+};
+
+/** The save dialog, plus the `confirmReplace` a create at the chosen path should use (#1264).
+ *
+ *  The macOS panel runs its OWN "Replace?" check — but against the name IT returned, before
+ *  `ensureExt`. When that name already is the real destination (`scene.json`, or a typed
+ *  `Walk.anim.json`) the human has been asked once, and asking again in-app is a double prompt.
+ *  When it is not (`Walk` → `Walk.anim.json`, the compound-extension collapse) the panel checked a
+ *  different file and nobody has asked about this one. The fallback text box never asks. */
+export async function chooseNewAssetPath(
+  opts: SaveAssetDialogOpts,
+): Promise<{ path: string; confirmReplace: (path: string) => Promise<boolean> } | null> {
   const { defaultName, ext, defaultFolder, prompt } = opts;
   let res: { path?: string; cancelled?: boolean; unsupported?: boolean; error?: string };
   try {
@@ -110,7 +123,11 @@ export async function saveAssetDialog(opts: {
     res = { error: 'network' };
   }
   if (res.cancelled) return null;
-  if (res.path) return ensureExt(res.path, ext);
+  if (res.path) {
+    const path = ensureExt(res.path, ext);
+    const panelChecked = res.path;
+    return { path, confirmReplace: (p) => (p === panelChecked ? Promise.resolve(true) : confirmReplaceAsset(p)) };
+  }
   if (res.error === 'outside-asset-roots') {
     alert('Please choose a location inside the project (a game\'s assets/ folder or modoki/assets).');
     return null;
@@ -120,5 +137,5 @@ export async function saveAssetDialog(opts: {
   const seed = `${(defaultFolder ?? '').replace(/\/$/, '')}/${defaultName}`.replace(/^\/+/, '/');
   const typed = await promptPath(prompt ?? 'Save As', 'Save as (project-relative path):', seed);
   if (!typed) return null;
-  return ensureExt(typed.startsWith('/') ? typed : '/' + typed, ext);
+  return { path: ensureExt(typed.startsWith('/') ? typed : '/' + typed, ext), confirmReplace: confirmReplaceAsset };
 }

@@ -14,7 +14,8 @@
  *  are follow-ups; bone POSING already lives in the SceneView. */
 
 import { useEffect, useRef, useState, useCallback, type ReactNode } from 'react';
-import { writeAssetFile, jsonFileBody } from '../backend/editorBackend';
+import { jsonFileBody } from '../backend/editorBackend';
+import { writeNewAssetDocument } from '../scene/createAssetDocument';
 import { newGuid, registerAsset, getAssetEntry, resolveGuidToPath, getGuidForPath } from '../../runtime/loaders/assetManifest';
 import { wholeImageSpriteRef } from './spritePickerGroups';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
@@ -30,10 +31,9 @@ import SkinCanvas from './SkinCanvas';
 import SkinBoneList from './SkinBoneList';
 import { autoRig2D } from '../../runtime/skinning/rig2dBuild';
 import { spriteThumbStyle } from './SpritePicker';
-import { saveAssetDialog } from '../utils/saveDialog';
+import { chooseNewAssetPath, confirmReplaceAsset } from '../utils/saveDialog';
 import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
 import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
-import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { AssetRefField, assetDisplayName } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
 import { makeRigPrefabAsset } from '../scene/skinPrefab';
@@ -661,14 +661,13 @@ export default function SkinEditor() {
 
   // Create a new empty .rig2d.json via the native Save dialog, then open it.
   const newRig = useCallback(async () => {
-    const path = await saveAssetDialog({ defaultName: 'New Rig.rig2d.json', ext: '.rig2d.json', prompt: 'Create Rig2D' });
-    if (!path) return;
-    const guid = newGuid();
-    const doc: Rig2DFile = { id: guid, ...defaultRig2DFile() };
-    const ok = await writeAssetFile(path, jsonFileBody(doc));
-    if (!ok) return;
-    assetWrittenToDisk(path); // CREATE writes the file directly → it is authoritative over any park
-    registerAsset(guid, path, 'rig2d');
+    const pick = await chooseNewAssetPath({ defaultName: 'New Rig.rig2d.json', ext: '.rig2d.json', prompt: 'Create Rig2D' });
+    if (!pick) return;
+    const { path } = pick;
+    // Create-only, asking before a Replace, which keeps the replaced rig's guid (#1264).
+    const r = await writeNewAssetDocument(path, (guid) => jsonFileBody({ id: guid, ...defaultRig2DFile() } satisfies Rig2DFile), { confirmReplace: pick.confirmReplace });
+    if (r.outcome !== 'created' && r.outcome !== 'replaced') return;
+    registerAsset(r.guid, path, 'rig2d');
     const name = (path.split('/').pop() || 'Rig').replace(/\.rig2d\.json$/i, '');
     useEditorStore.getState().openSkinEditor({ path, type: 'rig2d', name });
   }, []);
@@ -697,17 +696,15 @@ export default function SkinEditor() {
       const mask = await loadSpriteAlphaMask(maskUrl, { threshold: alphaThreshold, rect });
       isInside = mask?.isInside;
     }
-    const rigGuid = newGuid();
-    const rig = autoRig2D({ id: rigGuid, sprite: guid, width: dims.width, height: dims.height, isInside });
     const rigPath = sel.path.replace(/\.(png|jpe?g|webp|gif)$/i, '') + '.rig2d.json';
-    const ok = await writeAssetFile(rigPath, jsonFileBody(rig));
-    if (!ok) return;
-    // ⚠️ The one path where this REALLY matters: `rigPath` is DERIVED from the sprite, so
-    // auto-rigging the same sprite twice regenerates over a rig that may already have unsaved
-    // edits parked. The freshly generated file is authoritative — drop the park, loudly, or the
-    // next save flushes the old rig straight back over it.
-    assetWrittenToDisk(rigPath);
-    registerAsset(rigGuid, rigPath, 'rig2d');
+    // `rigPath` is DERIVED from the sprite, so auto-rigging the same sprite twice lands on a rig
+    // that may carry hand-painted weights — and Auto-Rig is not undoable. So it asks, like every
+    // other create, and a Replace keeps the rig's guid so what uses it stays linked (owner
+    // 2026-09-15, #1264). The helper also drops any parked edit for the path, or the next save
+    // would flush the old rig straight back over the regenerated one.
+    const r = await writeNewAssetDocument(rigPath, (rigGuid) => jsonFileBody(autoRig2D({ id: rigGuid, sprite: guid, width: dims.width, height: dims.height, isInside })), { confirmReplace: confirmReplaceAsset });
+    if (r.outcome !== 'created' && r.outcome !== 'replaced') return;
+    registerAsset(r.guid, rigPath, 'rig2d');
     const name = (rigPath.split('/').pop() || 'Rig').replace(/\.rig2d\.json$/i, '');
     useEditorStore.getState().openSkinEditor({ path: rigPath, type: 'rig2d', name });
   }, [trimAlpha, alphaThreshold]);
@@ -824,12 +821,12 @@ export default function SkinEditor() {
   // A refusal leaves `def` null, so without this the panel fell into the `!asset || !def` branch —
   // which (a) made the refusal banner further down unreachable, so the human saw "Double-click a
   // .rig2d.json in Assets to edit" for a rig they had just double-clicked, and (b) OFFERED
-  // `skin.empty.autoRig` when a sprite was selected: one click regenerates `<sprite>.rig2d.json`
-  // under a fresh GUID and writes it straight to disk (`autoRigSelected` → `writeAssetFile` →
-  // `assetWrittenToDisk`), with no dialog. So refusing to load a corrupt rig handed the human a
-  // one-click button to overwrite that exact file — a WORSE outcome than the empty-rig fallback
-  // this replaced, created by the refusal itself. The refused state gets its own view, whose only
-  // actions are Retry and Close.
+  // `skin.empty.autoRig` when a sprite was selected: one click regenerated `<sprite>.rig2d.json`
+  // and wrote it straight to disk, with no dialog. So refusing to load a corrupt rig handed the
+  // human a one-click button to overwrite that exact file — a WORSE outcome than the empty-rig
+  // fallback this replaced, created by the refusal itself. The refused state gets its own view,
+  // whose only actions are Retry and Close. (Auto-Rig now asks before replacing an existing rig,
+  // #1264 — but a Replace prompt over a file the panel just refused is still the wrong offer.)
   if (asset && loadState === 'failed') {
     return (
       <div style={panelStyle}>

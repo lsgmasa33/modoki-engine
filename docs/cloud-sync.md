@@ -466,6 +466,16 @@ does not close Court's case.)
 - **A native Firestore write made offline does not settle until the phone reconnects**, so a sync pass can
   span minutes of play. Anything a pass hands out for display must come from a fresh store read, not the
   pass's start.
+- **A cloud-sync game must turn Android backup OFF** (#1267, #679). Android Auto Backup restores the
+  app's data on a reinstall or a new phone, so the device comes back holding a days-old save with
+  never-synced marks, and the first sync after sign-in raises a fork between that stale copy and
+  the real cloud document — where keeping "this device" replaces the real progress. Measured on a
+  Galaxy A23. The manifest needs `allowBackup="false"`, `fullBackupContent="false"`, a
+  `dataExtractionRules` file excluding every domain from both `<cloud-backup>` and
+  `<device-transfer>` (`allowBackup="false"` alone does not stop device transfer on Android 12+),
+  and `tools:replace` on all three, or the merge fails against libraries that declare their own.
+  `engine/tests/architecture/androidBackupOffForCloudSync.test.ts` enforces it for every project that
+  uses this module; the worked example is [Court's accounts.md](../games/court/accounts.md) § "Android backup is OFF".
 
 ## Related
 

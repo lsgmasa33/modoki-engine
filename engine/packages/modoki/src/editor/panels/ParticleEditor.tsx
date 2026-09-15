@@ -9,7 +9,8 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { AssetLoadRefusedBanner } from './AssetLoadRefusedBanner';
-import { writeAssetFile, jsonFileBody } from '../backend/editorBackend';
+import { jsonFileBody } from '../backend/editorBackend';
+import { writeNewAssetDocument } from '../scene/createAssetDocument';
 import { createPortal } from 'react-dom';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
@@ -25,7 +26,7 @@ import { normalizeParticleDef } from '../../runtime/loaders/particleCache';
 import { newGuid, registerAsset } from '../../runtime/loaders/assetManifest';
 import { parseAssetJson } from '../../runtime/loaders/assetFetch';
 import { classifyParticleFetchSuccess, classifyParticleFetchFailure } from './particleLoadPersist';
-import { saveAssetDialog } from '../utils/saveDialog';
+import { chooseNewAssetPath } from '../utils/saveDialog';
 import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
 import { applyWheelStep, useWheelStep } from './fields';
 import { AssetRefField } from './AssetRefField';
@@ -33,7 +34,6 @@ import { useEditorStore } from '../store/editorStore';
 import { SectionIdContext, particleFieldSlug, useFieldId } from './particle/fieldIds';
 import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
 import { ParkAdoptedBanner } from './AssetLoadRefusedBanner';
-import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { pushAction, peekUndo, isExecutingUndoRedo, type UndoAction } from '../undo/undoManager';
 import { runUndoCommand } from '../undo/undoCommand';
 import CurveEditor from './particle/CurveEditor';
@@ -476,17 +476,13 @@ export default function ParticleEditor() {
 
   // Create a new .particle.json via the native Save dialog, then open it.
   const newParticle = useCallback(async () => {
-    const path = await saveAssetDialog({ defaultName: 'New Particle.particle.json', ext: '.particle.json', prompt: 'Create Particle Effect' });
-    if (!path) return;
-    const guid = newGuid();
-    const def = { ...defaultParticleEffect(), id: guid };
-    const ok = await writeAssetFile(path, jsonFileBody(def));
-    if (!ok) return;
-    // CREATE still writes immediately — the file has to exist for registerAsset + the manifest to
-    // see it — so the file is authoritative: drop any parked write for that path, or the next save
-    // flushes a stale doc over the one just created.
-    assetWrittenToDisk(path);
-    registerAsset(guid, path, 'particle');
+    const pick = await chooseNewAssetPath({ defaultName: 'New Particle.particle.json', ext: '.particle.json', prompt: 'Create Particle Effect' });
+    if (!pick) return;
+    const { path } = pick;
+    // Create-only, asking before a Replace, which keeps the replaced effect's guid (#1264).
+    const r = await writeNewAssetDocument(path, (guid) => jsonFileBody({ ...defaultParticleEffect(), id: guid }), { confirmReplace: pick.confirmReplace });
+    if (r.outcome !== 'created' && r.outcome !== 'replaced') return;
+    registerAsset(r.guid, path, 'particle');
     const name = (path.split('/').pop() || 'Effect').replace(/\.particle\.json$/i, '');
     useEditorStore.getState().openParticleEditor({ path, type: 'particle', name });
   }, []);

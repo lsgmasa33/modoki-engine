@@ -42,8 +42,8 @@ if (typeof globalThis.localStorage === 'undefined') {
   } as Storage;
 }
 
-const saveAssetDialog = vi.fn(async () => null); // null = the human cancelled
-vi.mock('../../src/editor/utils/saveDialog', () => ({ saveAssetDialog }));
+const chooseNewAssetPath = vi.fn(async () => null); // null = the human cancelled
+vi.mock('../../src/editor/utils/saveDialog', () => ({ chooseNewAssetPath }));
 
 const { EntityAttributes } = await import('../../src/runtime/core/traits/EntityAttributes');
 const { Transform } = await import('../../src/runtime/core/traits/Transform');
@@ -65,7 +65,7 @@ function registerAll() {
 }
 
 beforeEach(() => {
-  saveAssetDialog.mockClear();
+  chooseNewAssetPath.mockClear();
   currentPath = null;
   setRunMode('stopped');
   setCurrentScenePath(null); // what prefab-edit does, and the state the dialog branch keys on
@@ -114,7 +114,7 @@ describe('saveScene refuses the prefab-edit world', () => {
     return saveScene().then((r) => {
       expect(r.saved).toBe(false);
       expect(r.reason).toBe('prefab-edit');
-      expect(saveAssetDialog, 'no "Save Scene As" panel — this is the reported bug')
+      expect(chooseNewAssetPath, 'no "Save Scene As" panel — this is the reported bug')
         .not.toHaveBeenCalled();
     });
   });
@@ -139,14 +139,14 @@ describe('saveScene refuses the prefab-edit world', () => {
     setCurrentScenePath('/assets/scenes/brand-new.scene.json');
     const r = await saveScene();
     expect(r.reason, 'not refused — this is a real scene being created').not.toBe('prefab-edit');
-    expect(saveAssetDialog, 'and no dialog: it has a path already').not.toHaveBeenCalled();
+    expect(chooseNewAssetPath, 'and no dialog: it has a path already').not.toHaveBeenCalled();
   });
 
   // ── CONTROL ──────────────────────────────────────────────────────────────────
   it('a REAL scene with no path still reaches the dialog — so the assertions above mean something', async () => {
     currentPath = '/assets/scenes/main.scene.json';
     const r = await saveScene();
-    expect(saveAssetDialog, 'the Save-As branch is genuinely live and reachable').toHaveBeenCalledTimes(1);
+    expect(chooseNewAssetPath, 'the Save-As branch is genuinely live and reachable').toHaveBeenCalledTimes(1);
     expect(r.reason, 'the mock cancels, so nothing is written').toBe('cancelled');
   });
 });

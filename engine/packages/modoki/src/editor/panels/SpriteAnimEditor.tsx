@@ -11,11 +11,11 @@
  *  asset updates next frame. */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { writeAssetFile, jsonFileBody } from '../backend/editorBackend';
+import { jsonFileBody } from '../backend/editorBackend';
+import { writeNewAssetDocument } from '../scene/createAssetDocument';
 import { newGuid, registerAsset, getAssetEntry, resolveGuidToPath } from '../../runtime/loaders/assetManifest';
 import { spriteThumbStyle } from './SpritePicker';
 import { pendingAssetDoc, adoptParkedDoc } from './pendingAssetDoc';
-import { assetWrittenToDisk } from '../scene/dirtyAssets';
 import { normalizeSpriteAnim, type SpriteAnimDef } from '../../runtime/loaders/spriteAnimCache';
 import { parseAssetJson } from '../../runtime/loaders/assetFetch';
 import { classifyAssetDocFetchFailure } from './assetDocLoad';
@@ -23,7 +23,7 @@ import { AssetLoadRefusedBanner, ParkAdoptedBanner } from './AssetLoadRefusedBan
 import { defaultSpriteClip, type SpriteClip } from '../../runtime/traits/SpriteAnimator';
 import { defaultSpriteAnimData } from '../../runtime/assets/assetSchemas';
 import { spriteIndexFromStep } from '../../runtime/particles/types';
-import { saveAssetDialog } from '../utils/saveDialog';
+import { chooseNewAssetPath } from '../utils/saveDialog';
 import { useParkedAssetDoc, saveStatusLabel } from './useParkedAssetDoc';
 import { AssetRefField } from './AssetRefField';
 import { useEditorStore } from '../store/editorStore';
@@ -250,16 +250,13 @@ export default function SpriteAnimEditor() {
 
   // Create a new .spriteanim.json via the native Save dialog, then open it.
   const newSpriteAnim = useCallback(async () => {
-    const path = await saveAssetDialog({ defaultName: 'New Sprite Animation.spriteanim.json', ext: '.spriteanim.json', prompt: 'Create Sprite Animation' });
-    if (!path) return;
-    const guid = newGuid();
-    const doc = { id: guid, ...defaultSpriteAnimData() };
-    const ok = await writeAssetFile(path, jsonFileBody(doc));
-    if (!ok) return;
-    // CREATE writes immediately (the file must exist for registerAsset/the manifest), so the file
-    // is authoritative — drop any parked write for that path.
-    assetWrittenToDisk(path);
-    registerAsset(guid, path, 'spriteanim');
+    const pick = await chooseNewAssetPath({ defaultName: 'New Sprite Animation.spriteanim.json', ext: '.spriteanim.json', prompt: 'Create Sprite Animation' });
+    if (!pick) return;
+    const { path } = pick;
+    // Create-only, asking before a Replace, which keeps the replaced animation's guid (#1264).
+    const r = await writeNewAssetDocument(path, (guid) => jsonFileBody({ id: guid, ...defaultSpriteAnimData() }), { confirmReplace: pick.confirmReplace });
+    if (r.outcome !== 'created' && r.outcome !== 'replaced') return;
+    registerAsset(r.guid, path, 'spriteanim');
     const name = (path.split('/').pop() || 'SpriteAnim').replace(/\.spriteanim\.json$/i, '');
     useEditorStore.getState().openSpriteAnimEditor({ path, type: 'spriteanim', name });
   }, []);

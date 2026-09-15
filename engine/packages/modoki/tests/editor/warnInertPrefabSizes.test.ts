@@ -165,10 +165,16 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
   });
 
   it('createPrefabFromEntity (Save-as-Prefab) warns before writing', () => {
-    expect(writesWarnedFirst(assetOpsSf, 'createPrefabFromEntity', 'writeAssetFile')).toEqual([
-      { in: 'createPrefabFromEntity', write: 'if (!(await writeAssetFile(savePath, content))) return null;', warned: true },
-      // The action's REDO writes the same file again and must stay quiet, for the reason above.
-      { in: 'redo', write: 'if (!(await writeAssetFile(savePath, content))) { reportUndoFailure({ direction: \'Redo\', label, detail: `the prefab file was not written: ${savePath}. The entities were left un-linked rather than pointed at a file that is not there.`, }); return; }', warned: false },
+    // The create goes through writeNewAssetDocument since #1264 (create-only, ask, keep the guid), so the
+    // authoring write is THAT call, and the warned binding feeds its builder.
+    expect(writesWarnedFirst(assetOpsSf, 'createPrefabFromEntity', 'writeNewAssetDocument').map(({ in: fn, warned }) => ({ in: fn, warned }))).toEqual([
+      { in: 'createPrefabFromEntity', warned: true },
+    ]);
+    // The plain writes left are the action's restores, and must stay quiet for the reason above: UNDO of a Replace
+    // writes the REPLACED bytes back, REDO writes the same file again.
+    expect(writesWarnedFirst(assetOpsSf, 'createPrefabFromEntity', 'writeAssetFile').map(({ in: fn, warned }) => ({ in: fn, warned }))).toEqual([
+      { in: 'undo', warned: false },
+      { in: 'redo', warned: false },
     ]);
   });
 

@@ -13,11 +13,10 @@
  *  one create path and not two.
  */
 
-import { newGuid, registerAsset, type AssetType } from '../../runtime/loaders/assetManifest';
+import { registerAsset, type AssetType } from '../../runtime/loaders/assetManifest';
 import { getCreatableAssets, type CreatableAssetDef } from './creatableAssets';
-import { backendFetch, jsonFileBody, postWriteFile } from '../backend/editorBackend';
-import { resolveExistingDocumentId } from '../scene/prefab';
-import { assetWrittenToDisk } from '../scene/dirtyAssets';
+import { backendFetch, jsonFileBody } from '../backend/editorBackend';
+import { writeNewAssetDocument } from '../scene/createAssetDocument';
 
 /** Strip the def's extension off a path to get the display name (mirrors `assetDisplayName`). */
 function displayName(path: string, ext: string): string {
@@ -46,11 +45,8 @@ export async function createRegisteredAssetAskingToReplace(
   path: string,
   confirmReplace: (fullPath: string) => Promise<boolean>,
 ): Promise<CreateRegisteredResult | null> {
-  const first = await createRegisteredAsset(kind, path);
-  if (first.ok || !first.destinationExists) return first;
-  const def = getCreatableAssets().find((d) => d.id === kind);
-  if (!(await confirmReplace(def ? ensureExt(path, def.ext) : path))) return null;
-  return createRegisteredAsset(kind, path, { replace: true });
+  const r = await createRegistered(kind, path, confirmReplace);
+  return r === 'declined' ? null : r;
 }
 
 /** Force the BACKEND to re-scan, and report whether it did.
@@ -94,6 +90,15 @@ export async function createRegisteredAsset(
    *  existing destination instead (#1215 A-1). */
   opts: { replace?: boolean } = {},
 ): Promise<CreateRegisteredResult> {
+  // A replace confirms itself, so it can never come back declined.
+  return createRegistered(kind, path, opts.replace ? async () => true : undefined) as Promise<CreateRegisteredResult>;
+}
+
+async function createRegistered(
+  kind: string,
+  path: string,
+  confirmReplace: ((fullPath: string) => Promise<boolean>) | undefined,
+): Promise<CreateRegisteredResult | 'declined'> {
   const defs = getCreatableAssets();
   const def = defs.find((d) => d.id === kind);
   if (!def) {
@@ -116,42 +121,35 @@ export async function createRegisteredAsset(
   }
 
   const full = ensureExt(path, def.ext);
-  // ⚠️ A REPLACE keeps the replaced asset's identity (owner 2026-09-15, #1215). Minting a fresh
-  // guid over an existing file left every scene/prefab ref to the old one dangling: the human said
-  // "Replace" about the file's CONTENT, not about breaking what used it. Refs now resolve to the
-  // fresh default document. Resolved BEFORE the body, so a def that stamps the guid it is handed
-  // stamps the kept one.
-  const keptId = opts.replace ? await resolveExistingDocumentId(full) : undefined;
-  const guid = keptId ?? newGuid();
   const name = displayName(full, def.ext);
-  const body = def.body ? def.body(guid, name) : { id: guid };
-
-  // ⚠️ REGISTER THE GUID THE DOCUMENT ACTUALLY CARRIES, and stamp one in if it carries none.
-  //
-  // `def.body` is supplied by the def — including a GAME's def, which this registry exists to
-  // support — and nothing forces it to put `guid` in the document. A body with no `id` written to
-  // disk is then healed by the backend's own scan (`buildManifest(..., heal=true)` mints a fresh
-  // random id and writes it into the file), so the guid this function returned to the caller would
-  // name nothing: a ref written with it resolves through the backend manifest to undefined. That
-  // is the "an asset ref the build cannot see" class, arriving through a door the def-author never
-  // looks at. Every built-in def happens to include `id` today — `builtinCreatableAssets.ts` even
-  // comments "`id` first so a fresh guid is stamped" — which is exactly why this must be enforced
-  // here rather than trusted per def.
-  const doc = body as Record<string, unknown>;
-  const docId = typeof doc.id === 'string' && doc.id ? doc.id : undefined;
-  // A def that mints its OWN id wins — the document is the truth, and registering our unused one
-  // against it would recreate the same mismatch from the other side. EXCEPT over a kept id: there
-  // the refs to the replaced asset are the truth, and a def's own id would dangle all of them.
-  if (keptId) doc.id = keptId;
-  else if (!docId) doc.id = guid;
-  const registeredGuid = keptId ?? docId ?? guid;
-
-  // Create-only unless replacing: the route refuses a file that is already there, inside the same
-  // synchronous window as the write, so there is no check-then-write gap for a file to appear in.
-  let res: Response | undefined;
-  try { res = await postWriteFile(full, jsonFileBody(body), undefined, { createOnly: !opts.replace }); }
-  catch { res = undefined; }
-  if (res?.status === 409) {
+  let registeredGuid = '';
+  // Create-only first; a replace happens only behind `confirmReplace`, and it KEEPS the replaced
+  // asset's guid (owner 2026-09-15, #1215) — see `writeNewAssetDocument`, the one implementation
+  // every human create path shares (#1264).
+  const written = await writeNewAssetDocument(full, (guid, kept) => {
+    const body = def.body ? def.body(guid, name) : { id: guid };
+    // ⚠️ REGISTER THE GUID THE DOCUMENT ACTUALLY CARRIES, and stamp one in if it carries none.
+    //
+    // `def.body` is supplied by the def — including a GAME's def, which this registry exists to
+    // support — and nothing forces it to put `guid` in the document. A body with no `id` written to
+    // disk is then healed by the backend's own scan (`buildManifest(..., heal=true)` mints a fresh
+    // random id and writes it into the file), so the guid this function returned to the caller would
+    // name nothing: a ref written with it resolves through the backend manifest to undefined. That
+    // is the "an asset ref the build cannot see" class, arriving through a door the def-author never
+    // looks at. Every built-in def happens to include `id` today — `builtinCreatableAssets.ts` even
+    // comments "`id` first so a fresh guid is stamped" — which is exactly why this must be enforced
+    // here rather than trusted per def.
+    const doc = body as Record<string, unknown>;
+    const docId = typeof doc.id === 'string' && doc.id ? doc.id : undefined;
+    // A def that mints its OWN id wins — the document is the truth, and registering our unused one
+    // against it would recreate the same mismatch from the other side. EXCEPT over a kept id: there
+    // the refs to the replaced asset are the truth, and a def's own id would dangle all of them.
+    if (kept || !docId) doc.id = guid;
+    registeredGuid = doc.id as string;
+    return jsonFileBody(body);
+  }, { confirmReplace });
+  if (written.outcome === 'declined') return 'declined';
+  if (written.outcome === 'exists') {
     return {
       ok: false, code: 'REFUSED_BY_OP', destinationExists: true,
       error: `${full} already exists. Creating a '${kind}' there would REPLACE that asset with a blank default document, so this refuses rather than overwriting it.`,
@@ -162,18 +160,13 @@ export async function createRegisteredAsset(
       ],
     };
   }
-  const ok = res?.ok === true;
-  if (!ok) {
+  if (written.outcome === 'failed') {
     // A failed write that registered the guid anyway would leave the manifest pointing at a file
     // that is not there — resolvable, and dangling.
     return { ok: false, code: 'REFUSED_BY_OP', error: `failed to write ${full} (path outside the asset roots, or the folder does not exist)` };
   }
-  // The file on disk is now authoritative, so any parked panel edit for this path must go — the
-  // same call every other New-X button makes (ParticleEditor, AnimationEditor, …). It matters for
-  // a REPLACE: `/api/write-file` marks the write as the editor's own, so the watcher skips it and
-  // never drops the park, and the next Cmd+S would flush the old edited doc straight back over the
-  // replacement (#1215 close-out review). A no-op for a fresh path.
-  assetWrittenToDisk(full);
+  // `writeNewAssetDocument` already dropped any parked panel edit for this path (a REPLACE would
+  // otherwise have the next Cmd+S flush the old edited doc back over it — #1215 close-out review).
   registerAsset(registeredGuid, full, def.assetType as AssetType);
   const manifestRebuilt = await rebuildBackendManifest();
   return { ok: true, path: full, name, guid: registeredGuid, def, manifestRebuilt };

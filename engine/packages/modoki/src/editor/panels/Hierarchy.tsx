@@ -48,6 +48,7 @@ import {
 // matching live in assetOps/assetRoots so the flat-project "/assets" prefix
 // can't be forgotten in one copy again (#29).
 import { firstWritableAssetRoot, createPrefabFromEntity } from './assetOps';
+import { confirmReplaceAsset } from '../utils/saveDialog';
 
 type DropZone = 'before' | 'child' | 'after' | null;
 
@@ -1097,7 +1098,10 @@ export default function Hierarchy() {
     if (!root) { console.error('[Hierarchy] No writable asset root for prefab'); return; }
     const safeName = (entity.name || 'Entity').replace(/[^a-zA-Z0-9_-]/g, '_');
     const savePath = `${root}/prefabs/${safeName}.prefab.json`;
-    const result = await createPrefabFromEntity(entity.id, savePath, `Save prefab "${entity.name}"`);
+    // The path is derived from the entity's NAME, so it can land on an existing prefab — asked,
+    // and a Replace keeps that prefab's guid (#1264).
+    const result = await createPrefabFromEntity(entity.id, savePath, `Save prefab "${entity.name}"`, confirmReplaceAsset);
+    if (result === 'declined') return;
     if (!result) { console.error(`[Hierarchy] Failed to create prefab ${savePath}`); return; }
     console.log(`[Hierarchy] Created prefab: ${savePath}`);
     pushAction(result.action);
