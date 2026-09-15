@@ -1778,6 +1778,53 @@ for entities lacking a guid, matches by name + ancestor path. Anything unresolve
 cleared. This is the same GUID-keyed mechanism that lets a Stop-revert preserve the user's
 selection.
 
+### Inside one world: selection, collapse and the bound roots follow the ENTITY (#1221)
+
+A swap is not the only thing that breaks an id. Inside a world koota recycles an index LIFO, so a
+selected entity that is destroyed and replaced (a board rebuilt during Play, an agent's
+delete-and-respawn) used to leave the **newcomer** selected — outline, gizmo and Inspector on an
+entity nobody picked — and the same held for a collapsed Hierarchy row and the Animation/Timeline
+panels' bound root. The rule this follows is in [engine-concepts.md](engine-concepts.md) § Entity
+("What to hold").
+
+- **`editor/store/heldEntity.ts`** holds a pointer as `{ id, packed, guid, world }` and resolves it:
+  the same entity → unchanged; gone, and a live entity carries its guid → **follow** it (a Timeline
+  scrub or Entries row respawn, an undo respawn — owner decision 2026-09-15); gone with a guid nothing
+  carries yet → **parked** (hidden, asked again); gone without a guid → dropped.
+- **`editor/store/editorRefLiveness.ts`** does that for `selectedEntityIds`/`selectedEntityId`,
+  `animatorRootEntityId` and `directorRootEntityId`. The readers keep reading plain ids. It runs
+  ⚠️ **synchronously on every structure change** — `unregisterEntity` fires that before `destroy()`,
+  so the pointer is cleared before any spawn can take the index; a once-a-frame check would leave a
+  frame in which a gizmo drag writes to the newcomer — **and again a frame later**, because a seeded
+  prefab respawn writes its guid AFTER its spawn's structure event (that pass may rescan, so a guid
+  written without `indexEntityGuid` is followed too). A store write from anywhere else re-captures and
+  forgets a parked pointer; its own writes push no undo entry.
+  ⚠️ **A world swap re-takes every pointer still held in the old world — one tick later** (a pointer
+  already held or parked in the new world by then is kept). A hold
+  belongs to one World; a root is otherwise re-taken only when its store VALUE changes, and the
+  Timeline panel's re-resolve usually lands on the same number — so without the re-take both roots
+  held the pre-Stop world forever and the newcomer came back after the first Stop. It waits a tick
+  because `stepSimulation` swaps out and back inside one call: re-taking at the swap held the
+  transient world's entities and a destroy there unbound the Animation panel. The price is a one-tick
+  window after a real load in which a bound root's destroy-and-respawn is not caught.
+  ⚠️ **While any durable guid is parked, the frame-later pass can rescan the world** once per frame
+  in which `EntityAttributes` is added or written (`findEntityByGuid`'s gate; ~0.13 ms per 1k
+  entities, [engine-concepts.md](engine-concepts.md) § Entity identity). Accepted: it is what lets a
+  guid written without `indexEntityGuid` be followed.
+- **Selection undo** (`editorStore.ts` `resolveSnap`) resolves a durable guid first, then a HOLD
+  taken at capture when it belongs to the current world (undo history survives a same-scene reload and
+  A→B→A, and another world's number means nothing here) — never the bare raw id, which re-selected whatever took a destroyed entity's index
+  (the capture keeps durable guids only, so that reached every runtime spawn). A primary that is gone
+  falls back to the last remaining member.
+- **Hierarchy collapse** holds each id while it is in the set and re-resolves the holds before every
+  tree rebuild (`holdCollapsed`/`reconcileCollapsed` in `hierarchyCollapse.ts`). A collapsed entity
+  that is gone but has a DURABLE guid is parked, so an undo respawn comes back collapsed, and a parked
+  guid is still persisted — otherwise a game system destroying a collapsed scene entity during Play
+  re-saved the scene's collapse set without it, and Stop restored it expanded. ⚠️ The reconcile runs
+  inside a `setCollapsed` updater and must stay PURE: React runs an updater twice in development and
+  keeps the second result, and the first version wrote the holds from inside it — the newcomer stayed
+  collapsed in the running editor with every unit test green (found by the live check).
+
 ### Hierarchy collapse restore — the swap must SCHEDULE its own restore (#839)
 
 Expand/collapse is per-user view state, so it lives in `localStorage` keyed by scene path and by
@@ -3479,6 +3526,7 @@ until this landed.
 | 3D collider outline | `runtime/rendering/colliderOutline3D.ts` |
 | Play / Stop / Pause | `editor/scene/playMode.ts`, `runtime/core/playState.ts` |
 | Selection restore on world swap | `editor/store/selectionRestore.ts` |
+| Selection / collapse / bound roots follow their entity inside a world | `editor/store/editorRefLiveness.ts`, `editor/store/heldEntity.ts` |
 | Console capture | `editor/consoleCapture.ts`, `editor/panels/Console.tsx` |
 | Asset editors | `editor/panels/{AnimationEditor,ParticleEditor,SpriteEditor,SpriteAnimEditor}.tsx` |
 | Material inspector / preview | `editor/panels/assetViews/MaterialAssetView.tsx`, `editor/panels/MaterialPreview.tsx` |

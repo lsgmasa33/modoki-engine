@@ -1794,8 +1794,9 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   matches enter to exit BY REF. The table's 5,000-name LRU was suspected of dropping names the
   10,000-event ring still holds; measured, it does not (1 miss at 5k/6k/12k spawns): every spawned
   entity costs at least two ring events (`@spawn`/`@despawn`), so the ring never holds more distinct
-  spawn refs than the LRU does. ⚠️ Game code that journals `entityRef(other)` inside an exit callback
-  still re-derives from a dead handle (#1227).
+  spawn refs than the LRU does. Game code gets the same cached ref: an exit callback's
+  `otherRef`/`refs`, while `entityRef(deadHandle)` returns `null` rather than name whatever reclaimed
+  the index (#1227).
 - **Watch (numeric time-series):** `modoki_watch {start|read|list|clear}` — a standing, change-detected
   series for tuning motion feel (jump overshoot, spring settle, bone/velocity decay) that a screenshot
   can't show. Focus by `component` + `guids[]` (resolved at START — a stale guid FAILS, not a silent

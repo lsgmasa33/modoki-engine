@@ -408,7 +408,10 @@ export default tseslint.config(
   // re-lists the fetch/EventSource/spawn selectors too, so games/*/runtime/** keeps every gate the
   // wide zone above set for it.
   {
-    files: ['games/*/runtime/**/*.{ts,tsx}', 'demos/*/runtime/**/*.{ts,tsx}', 'engine/packages/*/src/runtime/core/ecs/**/*.ts'],
+    // `runtime/loaders/**` and `SceneManager.ts` joined after #1222 found a bare destroy() in each (the
+    // loader's structural apply; the placeholder delete). SceneManager's three World.destroy() calls carry
+    // a disable comment rather than keeping the file out.
+    files: ['games/*/runtime/**/*.{ts,tsx}', 'demos/*/runtime/**/*.{ts,tsx}', 'engine/packages/*/src/runtime/core/ecs/**/*.ts', 'engine/packages/*/src/runtime/loaders/**/*.ts', 'engine/packages/*/src/runtime/scene/SceneManager.ts'],
     rules: {
       'no-restricted-syntax': [
         'error',

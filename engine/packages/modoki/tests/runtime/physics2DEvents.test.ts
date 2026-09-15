@@ -355,6 +355,67 @@ describe('Physics2DEvents — H1: exit on despawn + no double-enter on hot edit'
   });
 });
 
+// #1227, the collision half: a synthesized exit for a despawned body hands `OnCollision2D` a dead
+// `other`. Its index is reclaimed before the step, so only the ref cached while alive can name it.
+// Mutations: drop `otherRef` from `makeFireOnCollision`'s params, or the refs from `__emitSensor`.
+describe('OnCollision2D — a despawned body\'s exit names IT, never the index\'s new owner (#1227)', () => {
+  it('the exit action gets otherRef = the dead body, a sensor subscriber gets refs.other, and entityRef(other) is null', () => {
+    const seen: Array<{ phase: string; otherRef: unknown; selfRef: unknown; live: unknown }> = [];
+    tw = createTestWorld({
+      systems: [PHYS],
+      actions: {
+        probe: (ctx) => {
+          const p = ctx.params as { other: Entity; phase: string; otherRef: unknown; selfRef: unknown };
+          seen.push({ phase: p.phase, otherRef: p.otherRef, selfRef: p.selfRef, live: entityRef(p.other) });
+        },
+      },
+    });
+    tw.spawn(Physics2D({ gravityX: 0, gravityY: 0, pixelsPerMeter: 100 }));
+    tw.spawn(Transform({ x: 0, y: 0 }), RigidBody2D({ bodyType: 'static' }),
+      Collider2D({ shape: 'box', halfW: 60, halfH: 60, isSensor: true }), OnCollision2D({ onEnter: 'probe', onExit: 'probe' }),
+      EntityAttributes({ guid: 'guid-sensor', name: 'Trigger' }));
+    const body = tw.spawn(Transform({ x: 0, y: 0 }), RigidBody2D({ bodyType: 'dynamic' }),
+      Collider2D({ shape: 'circle', radius: 12 }), EntityAttributes({ guid: 'guid-g1', name: 'g1' }));
+    const bus: Array<[string, unknown]> = [];
+    physics2DEvents.onSensor((_s, _o, phase, refs) => bus.push([phase, refs.other]), tw.world);
+    const exits: Array<[unknown, unknown]> = [];
+    physics2DEvents.onSensorExit((_s, _o, refs) => exits.push([refs.sensor, refs.other]), tw.world); // through phaseFilter
+    tw.step(5); // enter (pre-overlapping)
+    body.destroy();
+    const g2 = tw.spawn(Transform({ x: 900, y: 900 }), EntityAttributes({ guid: 'guid-g2', name: 'g2' }));
+    expect(g2.id()).toBe(body.id()); // precondition: the index really was reclaimed
+    tw.step(1); // synthesized exit for the dead body
+
+    expect(seen).toEqual([
+      { phase: 'enter', otherRef: 'guid-g1', selfRef: 'guid-sensor', live: 'guid-g1' },
+      { phase: 'exit', otherRef: 'guid-g1', selfRef: 'guid-sensor', live: null },
+    ]);
+    expect(bus).toEqual([['enter', 'guid-g1'], ['exit', 'guid-g1']]);
+    expect(exits).toEqual([['guid-sensor', 'guid-g1']]);
+  });
+
+  // Close-out review: nothing read a SOLID pair's refs, so swapping `{ a, b }` or dropping them in
+  // `phaseFilter` stayed green. Each ref must name the handle beside it, in either argument order.
+  it('a collision subscriber\'s refs name the handles beside them, through onCollision and onCollisionEnter', () => {
+    tw = createTestWorld({ systems: [PHYS] });
+    tw.spawn(Physics2D({ gravityX: 0, gravityY: 20, pixelsPerMeter: 100 }));
+    tw.spawn(Transform({ x: 0, y: 300 }), RigidBody2D({ bodyType: 'static' }),
+      Collider2D({ shape: 'box', halfW: 200, halfH: 20 }), EntityAttributes({ guid: 'guid-floor', name: 'Floor' }));
+    tw.spawn(Transform({ x: 0, y: 0 }), RigidBody2D({ bodyType: 'dynamic' }),
+      Collider2D({ shape: 'circle', radius: 15 }), EntityAttributes({ guid: 'guid-ball', name: 'Ball' }));
+    const pairs: Array<[unknown, unknown]> = [];
+    const guidOfHandle = (e: Entity) => (e.get(EntityAttributes) as { guid: string }).guid;
+    physics2DEvents.onCollision((a, b, _p, refs) => pairs.push([refs.a === guidOfHandle(a), refs.b === guidOfHandle(b)]), tw.world);
+    const enters: Array<[unknown, unknown]> = [];
+    physics2DEvents.onCollisionEnter((a, b, refs) => enters.push([refs.a === guidOfHandle(a), refs.b === guidOfHandle(b)]), tw.world);
+    tw.step(240);
+    expect(pairs.length).toBeGreaterThan(0);
+    expect(enters.length).toBeGreaterThan(0);
+    expect(pairs.every(([x, y]) => x && y)).toBe(true);
+    expect(enters.every(([x, y]) => x && y)).toBe(true);
+  });
+});
+
 describe('physics2D — solo (parentless) static colliders', () => {
   // A Collider2D with no RigidBody2D of its own and no body parent is now created as a PARENTLESS
   // Rapier collider (fixed world geometry) — it collides + fires events without a dummy body,

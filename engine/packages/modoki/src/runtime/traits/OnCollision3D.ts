@@ -4,7 +4,7 @@ import { trait } from 'koota';
  *  `Physics3DEvents` manager (C). Put this on the SAME entity as a `Collider3D`
  *  (e.g. a trigger volume): when that collider begins/ends overlap with another,
  *  the physics system dispatches the named UIAction, passing the OTHER entity as
- *  `ctx.target` and `{ self, other, phase }` in `ctx.params`.
+ *  `ctx.target` and `{ self, other, phase, selfRef, otherRef }` in `ctx.params` — on an exit `other` may be dead, so name it by `otherRef` (#1227).
  *
  *  REQUIRES a `RigidBody3D` on the same entity (or a rigidbody ancestor). A lone
  *  `Collider3D` with no body creates no Rapier collider and fires no events — for a

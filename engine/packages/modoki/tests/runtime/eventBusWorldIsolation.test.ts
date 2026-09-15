@@ -44,7 +44,7 @@ const CASES: BusCase[] = [
       const { events } = createZoneEventBus('ZoneTest', 'zoneTest');
       return {
         subscribe: (cb, world) => events.onZone(cb, world),
-        emit: (world) => events.__emitZone(world, ENT, ENT, 'enter'),
+        emit: (world) => events.__emitZone(world, ENT, ENT, 'enter', { zone: 1, other: 1 }),
         clear: (world) => events.__clear(world),
       };
     },
@@ -55,7 +55,7 @@ const CASES: BusCase[] = [
       const { events } = createPhysicsEventBus('PhysTest', 'physTest');
       return {
         subscribe: (cb, world) => events.onSensor(cb, world),
-        emit: (world) => events.__emitSensor(world, ENT, ENT, 'enter'),
+        emit: (world) => events.__emitSensor(world, ENT, ENT, 'enter', { sensor: 1, other: 1 }),
         clear: (world) => events.__clear(world),
       };
     },

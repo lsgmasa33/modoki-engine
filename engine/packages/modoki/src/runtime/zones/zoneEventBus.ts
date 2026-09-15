@@ -15,8 +15,11 @@
  *  GC on their own. The manager is registered SCENE-SCOPED so its `dispose` also clears the old
  *  world's subscribers deterministically, just before that world dies on a scene swap.
  *
- *  Every callback receives real koota `Entity` handles. Events fire only while the sim is
- *  running (the producer gates its diff on `isSimRunning()`). */
+ *  Every callback receives real koota `Entity` handles, plus `refs`: both entities' journal refs as
+ *  last seen alive. On an exit either handle may be DEAD with its index already reclaimed, so a
+ *  handler names the entity through `refs`, never `entityRef(handle)` (which answers `null` for a
+ *  dead handle — #1227). Events fire only while the sim is running (the producer gates its diff on
+ *  `isSimRunning()`). */
 
 import type { Entity, World } from 'koota';
 import { getCurrentWorld } from '../core/ecs/world';
@@ -24,23 +27,25 @@ import type { ManagerDef } from '../core/managerTypes';
 import { notifyListeners } from '../core/notifyListeners';
 
 export type ZonePhase = 'enter' | 'exit';
-/** `(zone, other, phase)` — `zone` is the `Zone2D`/`Zone3D` entity, `other` the `ZoneOccupant`. */
-export type ZoneHandler = (zone: Entity, other: Entity, phase: ZonePhase) => void;
+/** Both entities' journal refs (`entityRef`), cached by the producer while each was alive. */
+export interface ZoneRefs { readonly zone: string | number; readonly other: string | number }
+/** `(zone, other, phase, refs)` — `zone` is the `Zone2D`/`Zone3D` entity, `other` the `ZoneOccupant`. */
+export type ZoneHandler = (zone: Entity, other: Entity, phase: ZonePhase, refs: ZoneRefs) => void;
 
 /** The consumer + producer surface of a zone event bus. */
 export interface ZoneEventBus {
   onZone(cb: ZoneHandler, world?: World): () => void;
-  onZoneEnter(cb: (zone: Entity, other: Entity) => void, world?: World): () => void;
-  onZoneExit(cb: (zone: Entity, other: Entity) => void, world?: World): () => void;
+  onZoneEnter(cb: (zone: Entity, other: Entity, refs: ZoneRefs) => void, world?: World): () => void;
+  onZoneExit(cb: (zone: Entity, other: Entity, refs: ZoneRefs) => void, world?: World): () => void;
   /** Producer-only: called by the zone-trigger system. Not for game code. */
-  __emitZone(world: World, zone: Entity, other: Entity, phase: ZonePhase): void;
+  __emitZone(world: World, zone: Entity, other: Entity, phase: ZonePhase, refs: ZoneRefs): void;
   /** Drop every subscriber for a world (manager dispose on scene swap; also for tests). */
   __clear(world: World): void;
 }
 
 /** Wrap a phase-agnostic handler so it only fires for one phase (enter/exit). */
-function phaseFilter(want: ZonePhase, cb: (zone: Entity, other: Entity) => void) {
-  return (zone: Entity, other: Entity, phase: ZonePhase) => { if (phase === want) cb(zone, other); };
+function phaseFilter(want: ZonePhase, cb: (zone: Entity, other: Entity, refs: ZoneRefs) => void) {
+  return (zone: Entity, other: Entity, phase: ZonePhase, refs: ZoneRefs) => { if (phase === want) cb(zone, other, refs); };
 }
 
 /** Build a zone event bus + its scene-scoped manager. `managerName` is the ManagerDef name
@@ -64,10 +69,10 @@ export function createZoneEventBus(managerName: string, logTag: string): { event
     onZoneEnter(cb, world = getCurrentWorld()) { return events.onZone(phaseFilter('enter', cb), world); },
     onZoneExit(cb, world = getCurrentWorld()) { return events.onZone(phaseFilter('exit', cb), world); },
 
-    __emitZone(world, zone, other, phase) {
+    __emitZone(world, zone, other, phase, refs) {
       const s = subsByWorld.get(world);
       if (!s || s.size === 0) return;
-      notifyListeners(s, zoneLabel, [zone, other, phase]);
+      notifyListeners(s, zoneLabel, [zone, other, phase, refs]);
     },
     __clear(world) { subsByWorld.delete(world); },
   };

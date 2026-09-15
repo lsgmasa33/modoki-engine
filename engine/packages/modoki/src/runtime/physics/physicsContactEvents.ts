@@ -23,10 +23,12 @@ export interface ColliderInfo { entityId: number; entity: Entity; isSensor: bool
  *  `entity` is known alive (it is being given a collider), so a later exit for a body that has
  *  despawned before any event named it still carries the ref its entity had. */
 export function makeColliderInfo(entity: Entity, isSensor: boolean, bodyPacked: number): ColliderInfo {
-  return { entityId: entity.id(), entity, isSensor, bodyPacked, ref: entityRef(entity) };
+  return { entityId: entity.id(), entity, isSensor, bodyPacked, ref: entityRef(entity) ?? entity.id() }; // alive: being given a collider
 }
 export type ColliderMap = Map<number, ColliderInfo>;
-export type FireOnCollision = (self: Entity, other: Entity, phase: 'enter' | 'exit') => void;
+/** `refs` are both entities' journal refs as last seen ALIVE — the only identity a synthesized exit
+ *  still has for a despawned `other` (#1227). */
+export type FireOnCollision = (self: Entity, other: Entity, phase: 'enter' | 'exit', refs: { self: string | number; other: string | number }) => void;
 
 interface NarrowPhaseLike {
   contactPairsWith(collider: number, f: (other: number) => void): void;
@@ -36,16 +38,19 @@ interface EventQueueLike {
   drainCollisionEvents(f: (h1: number, h2: number, started: boolean) => void): void;
 }
 
-/** Build the declarative `OnCollision` dispatcher for a given trait (`OnCollision2D`/`3D`).
+/** Build the declarative `OnCollision` dispatcher for a given trait (`OnCollision2D`/`3D`): the
+ *  action gets `other` as `ctx.target` and `{ self, other, phase, selfRef, otherRef }` in
+ *  `ctx.params`. On an exit `other` may be DEAD with its index reclaimed — `otherRef` is the ref it
+ *  had while alive, and `entityRef(other)` answers `null` rather than name the newcomer (#1227).
  *  Pipeline-safe: `dispatchGameAction` never throws on an unwired action name; `self` may be
  *  despawned (a synthesized exit), so guard `isAlive()`. */
 export function makeFireOnCollision(OnCollisionTrait: Parameters<Entity['has']>[0]): FireOnCollision {
-  return (self, other, phase) => {
+  return (self, other, phase, refs) => {
     if (!self.isAlive() || !self.has(OnCollisionTrait)) return;
     const r = self.get(OnCollisionTrait) as { onEnter: string; onExit: string };
     const name = phase === 'enter' ? r.onEnter : r.onExit;
     if (!name) return;
-    dispatchGameAction(name, { target: other, params: { self, other, phase } });
+    dispatchGameAction(name, { target: other, params: { self, other, phase, selfRef: refs.self, otherRef: refs.other } });
   };
 }
 
@@ -70,25 +75,29 @@ function bodyEntityOf(ci: ColliderInfo): number {
  *  entity carries a unique runtime guid, so that split reached almost every body (#1225); now an
  *  exit carries the ref its enter did. */
 export function refOf(ci: ColliderInfo): string | number {
-  if (ci.entity.isAlive()) ci.ref = entityRef(ci.entity);
+  if (ci.entity.isAlive()) ci.ref = entityRef(ci.entity) ?? ci.ref;
   return ci.ref;
 }
 
 /** Route ONE collider pair to all three sinks. `a`/`b` order is preserved for the collision
- *  journal payload; the sensor case picks whichever collider `isSensor`. */
+ *  journal payload; the sensor case picks whichever collider `isSensor`. Every sink gets the SAME
+ *  two refs, taken once through `refOf` — the handles beside them may be dead on a synthesized exit,
+ *  the refs never are (#1227). */
 function routePair(world: World, a: ColliderInfo, b: ColliderInfo, phase: 'enter' | 'exit', bus: PhysicsEventBus, fire: FireOnCollision): void {
+  const aRef = refOf(a), bRef = refOf(b);
   if (a.isSensor || b.isSensor) {
     const sensorRec = a.isSensor ? a : b;
     const otherRec = a.isSensor ? b : a;
-    emit('@sensor', { sensor: refOf(sensorRec), other: refOf(otherRec), phase }, world);
-    bus.__emitSensor(world, sensorRec.entity, otherRec.entity, phase);
+    const refs = { sensor: a.isSensor ? aRef : bRef, other: a.isSensor ? bRef : aRef };
+    emit('@sensor', { sensor: refs.sensor, other: refs.other, phase }, world);
+    bus.__emitSensor(world, sensorRec.entity, otherRec.entity, phase, refs);
   } else {
-    emit('@collision', { a: refOf(a), b: refOf(b), phase }, world);
-    bus.__emitCollision(world, a.entity, b.entity, phase);
+    emit('@collision', { a: aRef, b: bRef, phase }, world);
+    bus.__emitCollision(world, a.entity, b.entity, phase, { a: aRef, b: bRef });
   }
   // Either collider may carry the OnCollision trait — fire for each, passing the OTHER as target.
-  fire(a.entity, b.entity, phase);
-  fire(b.entity, a.entity, phase);
+  fire(a.entity, b.entity, phase, { self: aRef, other: bRef });
+  fire(b.entity, a.entity, phase, { self: bRef, other: aRef });
 }
 
 /** Percept: update the queryable current-contact index for ONE live drain-path pair, rolled

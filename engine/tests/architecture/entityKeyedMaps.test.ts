@@ -40,8 +40,13 @@
  *    shape for it. A NAMED props interface at module scope that carries such state is a declaration
  *    and is flagged; an inline props type in the component's parameter list is inside a function and
  *    is not (the `okLiteralParam` fixture pins that).
- *  - Ids held as an ARRAY or a scalar (`editorStore.selectedEntityIds: number[]`, `selectedEntityId`).
- *    Only `Map`/`Set`/`Record` are collections here; #1221 is that shape.
+ *  - Ids held as an ARRAY or a scalar, and a held `Entity` by value: not this detector's job. The second
+ *    one, `heldEntityDeclarations` (#1222, `HELD_LEDGER`), flags a declaration typed with koota's `Entity`,
+ *    a module `…Id(s)` number, and a `…EntityId(s)` field. ITS blind spots: an untyped handle
+ *    (`let puck = null`, inferred from a later assignment) or an untyped id array (`{ movedIds: [] }`); an
+ *    interface/class id field not named `…EntityId` (`parentId`,
+ *    `rootInstanceId`), which would flag every unrelated `…Id` in the corpus; a trait default inside a
+ *    `trait({…})` call (Sling's `Enemy.hpBarId` was one); and, as here, component state and closures.
  *  - A number-keyed map reachable only through an inferred type (`{ routing: ReturnType<typeof f> }`):
  *    no type argument appears at the declaration. SceneView's routing memo was one until #1220 moved it
  *    to `sceneView2DGraph.ts` behind a declared `Canvas2DRoutingMaps`, which the scan now reads.
@@ -88,7 +93,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import ts from 'typescript';
-import { parseSource } from '@modoki/engine/testing/sourceAst';
+import { parseSource, importBindings } from '@modoki/engine/testing/sourceAst';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
@@ -230,6 +235,102 @@ export function numberKeyedDeclarations(code: string, file: string, aliases: Ali
   return { scanned, found };
 }
 
+/** The local names a file imports koota's `Entity` type under — `Entity` from any other module (a scene
+ *  file's JSON entry shape, a test's own interface) is not a handle. */
+function kootaEntityNames(sf: ts.SourceFile): Set<string> {
+  return new Set(importBindings(sf, 'koota').filter((b) => b.imported === 'Entity').map((b) => b.local));
+}
+
+/** Does `node` name koota's `Entity` outside a function signature (whose types die with the call)? */
+function mentionsEntity(node: ts.Node, names: ReadonlySet<string>): boolean {
+  let hit = false;
+  const visit = (n: ts.Node): void => {
+    if (hit || ts.isFunctionLike(n)) return;
+    if (ts.isTypeReferenceNode(n) && !n.typeArguments && names.has(n.typeName.getText())) { hit = true; return; }
+    ts.forEachChild(n, visit);
+  };
+  visit(node);
+  return hit;
+}
+
+/** A number or number array, outside a function signature: `number`, `number | null`, `number[]`,
+ *  `Array<number>`, `readonly number[]`. */
+function isNumberish(t: ts.TypeNode): boolean {
+  if (t.kind === ts.SyntaxKind.NumberKeyword) return true;
+  if (ts.isUnionTypeNode(t)) return t.types.some(isNumberish) && t.types.every((u) => isNumberish(u) || u.kind === ts.SyntaxKind.NullKeyword
+    || u.kind === ts.SyntaxKind.UndefinedKeyword || (ts.isLiteralTypeNode(u) && u.literal.kind === ts.SyntaxKind.NullKeyword));
+  if (ts.isArrayTypeNode(t)) return isNumberish(t.elementType);
+  if (ts.isTypeOperatorNode(t)) return isNumberish(t.type);
+  if (ts.isParenthesizedTypeNode(t)) return isNumberish(t.type);
+  return ts.isTypeReferenceNode(t) && (t.typeName.getText() === 'Array' || t.typeName.getText() === 'ReadonlyArray')
+    && !!t.typeArguments?.[0] && isNumberish(t.typeArguments[0]);
+}
+
+/** A declaration that HOLDS an entity across calls, by value rather than as a map key (#1222): koota's
+ *  `get`/`set` ignore the generation, so a held `Entity` whose entity was destroyed reads and writes whatever
+ *  reclaimed its index, and a held id names it outright. Flags, outside any function:
+ *  - a module variable, class field, interface/type-literal field or module object-literal property whose
+ *    type (or `as` cast) names koota's `Entity` — `Entity | null`, `Entity[]`, `Map<…, Entity>`;
+ *  - a module-scope variable, or a module object-literal property, named `…Id`/`…Ids` holding a number or
+ *    number array (typed, `as number`, or a numeric literal), except a `next…Id` counter, which mints ids
+ *    rather than holding one;
+ *  - a class or interface field named `…EntityId`/`…EntityIds` holding a number or number array.
+ *  A declaration `numberKeyedDeclarations` already flags is left to that ledger. Keys match it. */
+export function heldEntityDeclarations(code: string, file: string): { scanned: number; found: Declaration[] } {
+  const sf = parseSource(code, file);
+  const names = kootaEntityNames(sf);
+  const found: Declaration[] = [];
+  let scanned = 0;
+  const at = (n: ts.Node) => `${file}:${sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1}`;
+  const keyedElsewhere = (n: ts.Node | undefined): boolean => !!n && holdsNumberKeyed(n);
+  const idName = /(?:^|[a-z])Ids?$/;
+  const entityIdName = /EntityIds?$/;
+  const counterName = /^_?next[A-Z]/;   // mints ids rather than holding one
+
+  const objectProps = (obj: ts.ObjectLiteralExpression, prefix: string): void => {
+    for (const p of obj.properties) {
+      if (!ts.isPropertyAssignment(p)) continue;
+      scanned++;
+      const key = `${prefix}.${p.name.getText()}`;
+      const propName = p.name.getText();
+      const init = p.initializer;
+      const idValue = idName.test(propName) && !counterName.test(propName)
+        && (ts.isNumericLiteral(init) || (ts.isAsExpression(init) && isNumberish(init.type)));
+      if (ts.isObjectLiteralExpression(init)) objectProps(init, key);
+      else if ((names.size && mentionsEntity(init, names)) || idValue) found.push({ item: `${file}::${key}`, site: at(p) });
+    }
+  };
+
+  for (const st of sf.statements) {
+    if (!ts.isVariableStatement(st)) continue;
+    const mutable = !(st.declarationList.flags & ts.NodeFlags.Const);
+    for (const d of st.declarationList.declarations) {
+      scanned++;
+      const name = d.name.getText();
+      if (keyedElsewhere(d.type) || keyedElsewhere(d.initializer)) continue;
+      const holdsEntity = names.size > 0 && (!!d.type && mentionsEntity(d.type, names));
+      const holdsId = idName.test(name) && !counterName.test(name) && (d.type ? isNumberish(d.type) && (mutable || ts.isArrayTypeNode(d.type))
+        : mutable && !!d.initializer && ts.isNumericLiteral(d.initializer));
+      if (holdsEntity || holdsId) found.push({ item: `${file}::${name}`, site: at(d) });
+      else if (d.initializer && ts.isObjectLiteralExpression(d.initializer)) objectProps(d.initializer, name);
+    }
+  }
+  const walk = (n: ts.Node): void => {
+    if ((ts.isPropertyDeclaration(n) || ts.isPropertySignature(n)) && !insideFunction(n)) {
+      scanned++;
+      const init = ts.isPropertyDeclaration(n) ? n.initializer : undefined;
+      if (!keyedElsewhere(n.type) && !keyedElsewhere(init)) {
+        const holdsEntity = names.size > 0 && ((!!n.type && mentionsEntity(n.type, names)) || (!!init && mentionsEntity(init, names)));
+        const holdsId = entityIdName.test(n.name.getText()) && !!n.type && isNumberish(n.type);
+        if (holdsEntity || holdsId) found.push({ item: `${file}::${ownerName(n.parent)}.${n.name.getText()}`, site: at(n) });
+      }
+    }
+    ts.forEachChild(n, walk);
+  };
+  walk(sf);
+  return { scanned, found };
+}
+
 const isScannedSource = (rel: string): boolean => /\.tsx?$/.test(rel) && !rel.endsWith('.d.ts') && !rel.includes('.test.');
 
 function readSources(under: string, floor: number, keyRelativeTo: string): Array<{ file: string; code: string }> {
@@ -316,6 +417,22 @@ function scanWidened(): { scanned: number; found: Declaration[] } {
   const found: Declaration[] = [];
   for (const scope of aliasScopes(widened, runtimeAliases)) {
     const r = scan(scope.sources, scope.aliases);
+    scanned += r.scanned;
+    found.push(...r.found);
+  }
+  return { scanned, found };
+}
+
+/** The held-handle scan over the whole corpus — runtime and the widened roots — keyed repo-relative. */
+function scanHeld(): { scanned: number; found: Declaration[] } {
+  const sources = [
+    ...readSources(RUNTIME, 400, ''),
+    ...widenedRoots().flatMap(({ under, floor }) => readSources(under, floor, '')),
+  ];
+  let scanned = 0;
+  const found: Declaration[] = [];
+  for (const { file, code } of sources) {
+    const r = heldEntityDeclarations(code, file);
     scanned += r.scanned;
     found.push(...r.found);
   }
@@ -725,10 +842,12 @@ const WIDENED_LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
     reason: 'per-world-index: the Canvas2D id set, built only by buildCanvas2DRouting from the live world and served only through getCanvas2DRouting, whose stamp includes the structure version every spawn and destroy bumps (#1220); editor/panels/sceneView2DGraph.ts:79' },
   { item: 'engine/packages/modoki/src/editor/panels/gizmoBounds.ts::GizmoBoundsDeps.parentOf',
     reason: 'per-world-index: every caller passes getCanvas2DRouting()\'s map, rebuilt from the live world on each spawn/destroy via the structure version (#1220); editor/panels/sceneView2DGraph.ts:79' },
+  { item: 'engine/packages/modoki/src/editor/panels/hierarchyCollapse.ts::CollapseHolds.held',
+    reason: 'gen-in-value: id -> HeldEntity, and every hold carries the packed entity (generation included) and its World; holdCollapsed keeps a prior hold only while findEntityById(id).valueOf() still equals it, and reconcileCollapsed resolves each through resolveHeld (#1221); editor/panels/hierarchyCollapse.ts:192' },
   { item: 'engine/packages/modoki/src/editor/panels/Hierarchy.tsx::EntityNodeProps.collapsed',
-    reason: 'pending: #1221 — collapse component state held across user time by bare id and never pruned on destroy; a replacement on the index renders collapsed; editor/panels/Hierarchy.tsx:550' },
+    reason: 'revalidated: every collapsed id is held (packed + guid + world) when collapsed and re-resolved before each tree rebuild — a replacement on the index leaves the set, a guid respawn takes its place (#1221); editor/panels/Hierarchy.tsx:726' },
   { item: 'engine/packages/modoki/src/editor/panels/Hierarchy.tsx::EntityNodeProps.selectedIds',
-    reason: 'pending: #1221 — a per-render memo of editorStore.selectedEntityIds, whose bare ids survive a destroy with no prune; editor/panels/Hierarchy.tsx:855' },
+    reason: 'revalidated: a per-render memo of editorStore.selectedEntityIds, which editorRefLiveness re-resolves against the held entity synchronously on every structure change, before a spawn can reclaim the index (#1221); editor/store/editorRefLiveness.ts:125' },
   // ── games/ (owed only where the layout carries the project — see rowIsOwedInLayout) ──
   { item: 'games/court/runtime/knowledge.ts::EMPTY_ASSIGNED',
     reason: 'not-entity: an empty region -> candidate map; its filled twin is keyed by region index (knowledge.ts:184); games/court/runtime/knowledge.ts:178' },
@@ -780,6 +899,133 @@ const WIDENED_LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
     reason: 'not-entity: an empty set of Wordweave board cell indices; games/wordweave/runtime/systems.ts:4797' },
   { item: 'games/wordweave/tools/generate.ts::TierPool.byLength',
     reason: 'not-entity: word length -> words; games/wordweave/tools/generate.ts:159' },
+];
+
+/** Rows for `heldEntityDeclarations` (#1222), keyed repo-relative like WIDENED_LEDGER. Tags as above, plus:
+ *  `alive-checked:` (every use follows an isAlive check or a per-frame prune), `brief:` (instances live
+ *  within one call or frame, the owner's "brief use is fine by id"), `rebuilt:` (reassigned from a live
+ *  query before each use) and `empty:` (a constant that never holds an entity). */
+const HELD_LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
+  { item: 'engine/packages/modoki/src/runtime/core/actionRegistry.ts::UIActionContext.target',
+    reason: 'brief: built per dispatch and handed straight to the handler; runtime/core/actionRegistry.ts:185' },
+  { item: 'engine/packages/modoki/src/runtime/core/actionRegistry.ts::DispatchOptions.target',
+    reason: 'brief: the caller\'s options for one call, read once and never stored; runtime/core/actionRegistry.ts:185' },
+  { item: 'engine/packages/modoki/src/runtime/core/ecs/transformPropagationSystem.ts::_allEntityIds',
+    reason: 'scratch: cleared, then refilled from the live EntityAttributes query in the same pass that reads it; runtime/core/ecs/transformPropagationSystem.ts:204' },
+  { item: 'engine/packages/modoki/src/runtime/input/pointerSource.ts::activeId',
+    reason: 'not-entity: the DOM PointerEvent.pointerId being tracked; runtime/input/pointerSource.ts:204' },
+  { item: 'engine/packages/modoki/src/runtime/physics/physics2DSystem.ts::EMPTY_CHILDREN',
+    reason: 'empty: a frozen empty array, only ever a `??` fallback; runtime/physics/physics2DSystem.ts:728' },
+  { item: 'engine/packages/modoki/src/runtime/physics/physics3DSystem.ts::EMPTY_CHILDREN',
+    reason: 'empty: a frozen empty array, only ever a `??` fallback; runtime/physics/physics3DSystem.ts:147' },
+  { item: 'engine/packages/modoki/src/runtime/physics/physicsContactEvents.ts::ColliderInfo.entity',
+    reason: 'uncertain: held across frames in the per-world collider map; the reconcile before each step evicts unseen and generation-mismatched bodies (runtime/physics/physics2DSystem.ts:945), and a ref crossing to game code goes through refOf\'s isAlive (runtime/physics/physicsContactEvents.ts:78). NOT re-checked for an entity a contact handler destroys mid-routing: the @contact speed reads RigidBody2D off it (physics2DSystem.ts:1336), so a handler that destroys one body and spawns another RigidBody2D entity would report the newcomer\'s velocity. Settled by a test whose onCollisionEnter handler destroys a body and spawns a replacement before the pair\'s contact detail is emitted' },
+  { item: 'engine/packages/modoki/src/runtime/rendering/frameDriver.ts::rafId',
+    reason: 'not-entity: a requestAnimationFrame handle; runtime/rendering/frameDriver.ts:158' },
+  { item: 'engine/packages/modoki/src/runtime/timeline/timelineSystem.ts::Pending.entity',
+    reason: 'brief: pushed into a call-local array from the live Director query and consumed in the same call; runtime/timeline/timelineSystem.ts:1191' },
+  { item: 'engine/packages/modoki/src/runtime/ui/uiOverflow.ts::UIOverflowVerdict.boxEntityId',
+    reason: 'brief: a verdict built and consumed per scan; its id is copied into a finding that is only printed, never used to reach an entity; runtime/ui/uiOverflow.ts:116' },
+  { item: 'engine/packages/modoki/src/runtime/zones/zoneTriggerCore.ts::ZoneCandidate.entity',
+    reason: 'brief: built per frame from the live zone query and consumed by runZoneTriggers in the same call; runtime/zones/zone2DSystem.ts:85' },
+  { item: 'engine/packages/modoki/src/runtime/zones/zoneTriggerCore.ts::OccupantSample.entity',
+    reason: 'brief: built per frame from the live occupant query and consumed in the same call; runtime/zones/zone2DSystem.ts:93' },
+  { item: 'engine/packages/modoki/src/runtime/zones/zoneTriggerCore.ts::ZoneMember.entity',
+    reason: 'revalidated: membership is keyed by the packed entity, so a reclaimed index is a new member (a real exit and enter), and refs cross to game code through refOf\'s isAlive; runtime/zones/zoneTriggerCore.ts:72' },
+  { item: 'engine/packages/modoki/src/editor/panels/uiPreviewPick.ts::PreviewStackEntry{}.canvasEntityId',
+    reason: 'brief: parsed from the DOM for one pick and consumed by that pick; editor/panels/uiPreviewPick.ts:175' },
+  { item: 'engine/packages/modoki/src/editor/store/editorStore.ts::EditorState.selectedEntityId',
+    reason: 'revalidated: held as a HeldEntity (packed value + guid + world) and re-resolved on every structure change, synchronously, before a spawn can reclaim the index (#1221); editor/store/editorRefLiveness.ts:182' },
+  { item: 'engine/packages/modoki/src/editor/store/editorStore.ts::EditorState.selectedEntityIds',
+    reason: 'revalidated: held as a HeldEntity (packed value + guid + world) and re-resolved on every structure change, synchronously, before a spawn can reclaim the index (#1221); editor/store/editorRefLiveness.ts:182' },
+  { item: 'engine/packages/modoki/src/editor/store/editorStore.ts::EditorState.animatorRootEntityId',
+    reason: 'revalidated: held as a HeldEntity (packed value + guid + world) and re-resolved on every structure change, synchronously, before a spawn can reclaim the index (#1221); editor/store/editorRefLiveness.ts:182' },
+  { item: 'engine/packages/modoki/src/editor/store/editorStore.ts::EditorState.directorRootEntityId',
+    reason: 'revalidated: held as a HeldEntity (packed value + guid + world) and re-resolved on every structure change, synchronously, before a spawn can reclaim the index (#1221); editor/store/editorRefLiveness.ts:182' },
+  { item: 'games/court/runtime/systems.ts::trayRoot',
+    reason: 'alive-checked: boardHandlesIntact checks every board handle with isPackedAlive before any per-frame use, and rebuilds the board when one is gone (#1224); games/court/runtime/systems.ts:23748' },
+  { item: 'games/court/runtime/systems.ts::tutorialHand',
+    reason: 'alive-checked: boardHandlesIntact checks every board handle with isPackedAlive before any per-frame use, and rebuilds the board when one is gone (#1224); games/court/runtime/systems.ts:23748' },
+  { item: 'games/court/runtime/systems.ts::dragOutline',
+    reason: 'alive-checked: boardHandlesIntact checks every board handle with isPackedAlive before any per-frame use, and rebuilds the board when one is gone (#1224); games/court/runtime/systems.ts:23748' },
+  { item: 'games/court/runtime/systems.ts::dragBadge',
+    reason: 'alive-checked: boardHandlesIntact checks every board handle with isPackedAlive before any per-frame use, and rebuilds the board when one is gone (#1224); games/court/runtime/systems.ts:23748' },
+  { item: 'games/court/runtime/systems.ts::dragIcon',
+    reason: 'alive-checked: boardHandlesIntact checks every board handle with isPackedAlive before any per-frame use, and rebuilds the board when one is gone (#1224); games/court/runtime/systems.ts:23748' },
+  { item: 'games/court/runtime/systems.ts::dragShadow',
+    reason: 'alive-checked: boardHandlesIntact checks every board handle with isPackedAlive before any per-frame use, and rebuilds the board when one is gone (#1224); games/court/runtime/systems.ts:23748' },
+  { item: 'games/court/runtime/systems.ts::dropRing',
+    reason: 'alive-checked: boardHandlesIntact checks every board handle with isPackedAlive before any per-frame use, and rebuilds the board when one is gone (#1224); games/court/runtime/systems.ts:23748' },
+  { item: 'games/court/runtime/systems.ts::carryRingBars',
+    reason: 'alive-checked: boardHandlesIntact checks every board handle with isPackedAlive before any per-frame use, and rebuilds the board when one is gone (#1224); games/court/runtime/systems.ts:23748' },
+  { item: 'games/court/runtime/systems.ts::trayBanners',
+    reason: 'alive-checked: boardHandlesIntact checks every board handle with isPackedAlive before any per-frame use, and rebuilds the board when one is gone (#1224); games/court/runtime/systems.ts:23748' },
+  { item: 'games/court/runtime/systems.ts::TrayBadgeInstance.root',
+    reason: 'alive-checked: boardHandlesIntact checks every board handle with isPackedAlive before any per-frame use, and rebuilds the board when one is gone (#1224); games/court/runtime/systems.ts:23748' },
+  { item: 'games/court/runtime/systems.ts::TrayBadgeInstance.members',
+    reason: 'alive-checked: boardHandlesIntact checks every board handle with isPackedAlive before any per-frame use, and rebuilds the board when one is gone (#1224); games/court/runtime/systems.ts:23748' },
+  { item: 'games/court/runtime/systems.ts::boardRoot',
+    reason: 'alive-checked: entityAlive(boardRoot) gates the per-frame board branch (#1224); games/court/runtime/systems.ts:24610' },
+  { item: 'games/court/runtime/systems.ts::winFxRoot',
+    reason: 'alive-checked: entityAlive before reuse, and destroySubtrees skips a dead root (#1224); games/court/runtime/systems.ts:18041' },
+  { item: 'games/court/runtime/systems.ts::overlayRoot',
+    reason: 'alive-checked: a dead overlay root marks the board dirty for a rebuild (#1224); games/court/runtime/systems.ts:24703' },
+  { item: 'games/court/runtime/systems.ts::flagRoot',
+    reason: 'alive-checked: respawned when not alive, before its id is read (#1224); games/court/runtime/systems.ts:17823' },
+  { item: 'games/court/runtime/systems.ts::bonusFxRoot',
+    reason: 'alive-checked: entityAlive before reuse, and destroySubtrees skips a dead root (#1224); games/court/runtime/systems.ts:21189' },
+  { item: 'games/court/runtime/systems.ts::flagInstances{}.entity',
+    reason: 'alive-checked: syncFlags drops an instance whose entity is not alive before touching it (#1224); games/court/runtime/systems.ts:17811' },
+  { item: 'games/sling/runtime/fish.ts::zoneIds',
+    reason: 'scratch: cleared and refilled from the live Zone3D query every frame before resolveZones reads it; games/sling/runtime/fish.ts:118' },
+  { item: 'games/sling/runtime/systems.ts::puck',
+    reason: 'alive-checked: pruneDeadHandles nulls a dead handle at the top of the GAME and LATE_UPDATE ticks (#1222); games/sling/runtime/systems.ts:1065' },
+  { item: 'games/sling/runtime/systems.ts::puckVisual',
+    reason: 'alive-checked: pruneDeadHandles nulls a dead handle at the top of the GAME and LATE_UPDATE ticks (#1222); games/sling/runtime/systems.ts:1065' },
+  { item: 'games/sling/runtime/systems.ts::collectSensor',
+    reason: 'alive-checked: pruneDeadHandles nulls a dead handle at the top of the GAME and LATE_UPDATE ticks (#1222); games/sling/runtime/systems.ts:1065' },
+  { item: 'games/sling/runtime/systems.ts::pad',
+    reason: 'alive-checked: pruneDeadHandles nulls a dead handle at the top of the GAME and LATE_UPDATE ticks (#1222); games/sling/runtime/systems.ts:1065' },
+  { item: 'games/sling/runtime/systems.ts::padAnim',
+    reason: 'alive-checked: pruneDeadHandles nulls a dead handle at the top of the GAME and LATE_UPDATE ticks (#1222); games/sling/runtime/systems.ts:1065' },
+  { item: 'games/sling/runtime/systems.ts::aimLine',
+    reason: 'alive-checked: pruneDeadHandles nulls a dead handle at the top of the GAME and LATE_UPDATE ticks (#1222); games/sling/runtime/systems.ts:1065' },
+  { item: 'games/sling/runtime/systems.ts::bandL',
+    reason: 'alive-checked: pruneDeadHandles nulls a dead handle at the top of the GAME and LATE_UPDATE ticks (#1222); games/sling/runtime/systems.ts:1065' },
+  { item: 'games/sling/runtime/systems.ts::bandR',
+    reason: 'alive-checked: pruneDeadHandles nulls a dead handle at the top of the GAME and LATE_UPDATE ticks (#1222); games/sling/runtime/systems.ts:1065' },
+  { item: 'games/sling/runtime/systems.ts::camera',
+    reason: 'alive-checked: pruneDeadHandles nulls a dead handle at the top of the GAME and LATE_UPDATE ticks (#1222); games/sling/runtime/systems.ts:1065' },
+  { item: 'games/sling/runtime/systems.ts::enemies',
+    reason: 'alive-checked: pruneDeadEnemies splices dead enemies and evicts their packed-keyed state at the top of the tick and before planning (#1198); games/sling/runtime/systems.ts:1082' },
+  { item: 'games/space-invader/runtime/systems.ts::pointer.hostId',
+    reason: 'rebuilt: reassigned from resolveCanvas2DHost at the top of every frame, before handlePointer resolves a canvas with it; games/space-invader/runtime/systems.ts:231' },
+  { item: 'games/space-invader/runtime/systems.ts::State{}.player',
+    reason: 'rebuilt: reassigned from world.queryFirst(Player) every frame before any use; games/space-invader/runtime/systems.ts:238' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.crosswordRoot',
+    reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:707' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.crosswordClip',
+    reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:707' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.boardCells',
+    reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:707' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.boardGlyphs',
+    reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:707' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.hitAreas',
+    reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:707' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.bandOutlines',
+    reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:707' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.crosswordCells',
+    reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:707' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.crosswordGlyphs',
+    reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:707' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.trail',
+    reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:707' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.currentWord',
+    reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:707' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.wordFlightGlyphs',
+    reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:707' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.meterCells',
+    reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:707' },
 ];
 
 describe('entity-keyed maps — runtime/** state keyed by a recycled index (#868)', () => {
@@ -905,5 +1151,70 @@ describe('entity-keyed maps — runtime/** state keyed by a recycled index (#868
         + '`EntityTable` or key by `packedOf(entity)` (`core/ecs/entityTable.ts`); otherwise add a row whose '
         + 'reason starts with its tag and cites the line that makes it safe. Keys are repo-relative.',
     });
+  });
+});
+
+
+describe('held entity handles — a declaration holding an Entity or an entity id across calls (#1222)', () => {
+  it('flags module handles, entity-typed fields, module object properties and module id scalars; not locals, counters or other Entity types', () => {
+    const src = [
+      "import type { Entity, World } from 'koota';",
+      'let puck: Entity | null = null;',
+      'const enemies: Entity[] = [];',
+      'let boardRootId = 0;',
+      'let rootIds: number[] = [];',
+      'const pointer = { active: false, hostId: 0, dragId: null as number | null, nextSlotId: 1 };',
+      'const state = { player: null as Entity | null, score: 0, nested: { cam: null as Entity | null } };',
+      'class Owner { held: Entity | undefined; other = 1; }',
+      'interface Store { selectedEntityId: number | null; selectedEntityIds: number[]; target: Entity; }',
+      '',
+      '// Accept side: none of these may be flagged.',
+      'let _nextTraitId = 1;',
+      'const fixedId = 3;',
+      'let parentId = "x";',
+      'interface NotStore { parentId: number; onPick(e: Entity): void; cb: (e: Entity) => void }',
+      'function local() { let held: Entity | null = null; const ids: number[] = []; return [held, ids]; }',
+      'const byId = new Map<number, Entity>();',   // the number-keyed ledger owns this one
+    ].join('\n');
+    const { found, scanned } = heldEntityDeclarations(src, 'fixture.ts');
+    expect(found.map((d) => d.item)).toEqual([
+      'fixture.ts::puck',
+      'fixture.ts::enemies',
+      'fixture.ts::boardRootId',
+      'fixture.ts::rootIds',
+      'fixture.ts::pointer.hostId',
+      'fixture.ts::pointer.dragId',
+      'fixture.ts::state.player',
+      'fixture.ts::state.nested.cam',
+      'fixture.ts::Owner.held',
+      'fixture.ts::Store.selectedEntityId',
+      'fixture.ts::Store.selectedEntityIds',
+      'fixture.ts::Store.target',
+    ]);
+    expect(scanned).toBeGreaterThanOrEqual(found.length + 6);
+  });
+
+  it('every held Entity or entity id in the corpus is liveness-checked, brief, or spends a HELD_LEDGER row', () => {
+    const { scanned, found } = scanHeld();
+    const presentProjects = new Set(discoverProjects(REPO_ROOT).map((pr: { root: string; name: string }) => `${pr.root}/${pr.name}`));
+    assertExemptionLedger({
+      label: 'HELD_LEDGER in entityKeyedMaps',
+      population: found,
+      exempt: HELD_LEDGER.filter(({ item }) => rowIsOwedInLayout(item, presentProjects)),
+      floor: 3000,
+      scanned,
+      fix: 'declaration(s) holding a koota Entity, or an entity id, across calls with no HELD_LEDGER row. koota\'s '
+        + 'get/set ignore the generation, so a held handle reads and writes whatever reclaims a destroyed '
+        + 'entity\'s index. Check it with isAlive()/isPackedAlive before each use (or prune it once per frame), hold '
+        + 'a guid for a reference that should follow "the same thing", or add a row whose reason starts with its '
+        + 'tag and cites the line that makes it safe — rule in docs/engine-concepts.md § Entity.',
+    });
+  });
+
+  it('an Entity that is not koota\'s is not a handle', () => {
+    const src = "interface Entity { name: string }\nlet current: Entity | null = null;";
+    expect(heldEntityDeclarations(src, 'scene.ts').found).toEqual([]);
+    const aliased = "import type { Entity as KEntity } from 'koota';\nlet current: KEntity | null = null;";
+    expect(heldEntityDeclarations(aliased, 'aliased.ts').found.map((d) => d.item)).toEqual(['aliased.ts::current']);
   });
 });

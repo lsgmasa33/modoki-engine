@@ -27,6 +27,7 @@ import { EntityAttributes } from '../runtime/core/traits/EntityAttributes';
 import { loadScene, setCurrentScenePath, setScenePersistenceProject, lastSceneKey, type SceneLoadOutcome } from './scene/serialize';
 import { sceneManager } from '../runtime/scene/SceneManager';
 import { registerSelectionRestore } from './store/selectionRestore';
+import { registerEditorRefLiveness } from './store/editorRefLiveness';
 import { registerLastAnimationClipPersistence, restoreLastAnimationClip } from './animation/lastAnimationClip';
 import { setEditorProjectScope } from './projectScopedKey';
 import { registerLastSkinRigPersistence, restoreLastSkinRig } from './panels/lastSkinRig';
@@ -662,6 +663,8 @@ export function createEditor(options: EditorOptions): React.ComponentType {
   setEditorProjectScope(options.config.name);
   // Subscribe to world swaps to restore the editor's selection across scene loads
   registerSelectionRestore();
+  // …and follow selection + the Animator/Director roots when their entity is destroyed inside a world (#1221)
+  registerEditorRefLiveness();
   // Mirror the open animation clip to localStorage (restored below once the scene loads).
   registerLastAnimationClipPersistence();
   // Mirror the open .rig2d rig to localStorage (restored below once the manifest loads).

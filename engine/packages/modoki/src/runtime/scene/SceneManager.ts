@@ -87,7 +87,7 @@
 
 import { createWorld, type World, type Entity } from 'koota';
 import { durableGuid } from '../core/assetRefRules';
-import { setCurrentWorld, getCurrentWorld, spawnEntity, findEntityById } from '../core/ecs/world';
+import { setCurrentWorld, getCurrentWorld, spawnEntity, destroyEntity, findEntityById } from '../core/ecs/world';
 import { createTeardownToken, type LivenessCheck } from '../core/liveness';
 import { notifyListeners } from '../core/notifyListeners';
 import { getAllTraits } from '../core/ecs/traitRegistry';
@@ -881,9 +881,11 @@ class SceneManagerImpl implements SceneManager {
             // (packed worldId/generation/id) with prototype methods, so we must
             // compare via entity.id() (unpacked local id) — comparing the raw
             // packed value never matches the local id loadSceneFile passes us.
+            // destroyEntity, not a bare destroy(): the placeholder is registered, and a bare destroy
+            // left its corpse in the staging world's entity index (#1222).
             for (const e of stagingWorld.entities) {
               if ((e as unknown as { id(): number }).id() === entityId) {
-                (e as unknown as { destroy(): void }).destroy();
+                destroyEntity(e, stagingWorld);
                 break;
               }
             }
@@ -1227,6 +1229,7 @@ class SceneManagerImpl implements SceneManager {
         for (const sid of allocatedSceneIds) releaseAllForScene(sid);
       }
       if (nextWorld) {
+        // eslint-disable-next-line no-restricted-syntax -- a koota World, not an entity
         try { nextWorld.destroy(); } catch { /* ignore */ }
       }
       if (this.nextLoad?.id === id) this.nextLoad = null;
@@ -1425,6 +1428,7 @@ class SceneManagerImpl implements SceneManager {
         // nothing will ever destroy it, and koota's pool is 16 wide. Mirrors `loadScene`'s own
         // `nextWorld.destroy()` failure path. Nothing above this point has touched the live
         // world or any global, so the editor is left exactly as it was.
+        // eslint-disable-next-line no-restricted-syntax -- a koota World, not an entity
         try { staging.destroy(); } catch { /* nothing else to do */ }
         throw e;
       }
@@ -1513,6 +1517,7 @@ class SceneManagerImpl implements SceneManager {
     // worlds at 16; without this, every scene swap permanently consumes a
     // slot and the engine breaks after ~16 swaps.
     const destroyOldWorld = () => {
+      // eslint-disable-next-line no-restricted-syntax -- a koota World, not an entity
       try { oldWorld.destroy(); } catch (e) { console.warn('[SceneManager] Failed to destroy old world:', e); }
     };
     if (oldWorld !== promotedWorld) {

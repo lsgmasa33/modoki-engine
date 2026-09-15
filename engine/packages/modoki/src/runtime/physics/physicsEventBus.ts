@@ -15,8 +15,11 @@
  *  their own. The manager is registered SCENE-SCOPED so its `dispose` also clears the old
  *  world's subscribers deterministically, just before that world dies on a scene swap.
  *
- *  Every callback receives real koota `Entity` handles. Events fire only while the sim is
- *  running (the producer gates its drain on `dt > 0`). */
+ *  Every callback receives real koota `Entity` handles; sensor and collision callbacks also get
+ *  `refs`, both entities' journal refs as last seen alive. A synthesized exit (a collider removed)
+ *  can hand over a DEAD handle whose index is already reclaimed, so a handler names the entity
+ *  through `refs`, never `entityRef(handle)` (which answers `null` for a dead handle — #1227).
+ *  Events fire only while the sim is running (the producer gates its drain on `dt > 0`). */
 
 import type { Entity, World } from 'koota';
 import { getCurrentWorld } from '../core/ecs/world';
@@ -24,10 +27,14 @@ import type { ManagerDef } from '../core/managerTypes';
 import { notifyListeners } from '../core/notifyListeners';
 
 export type CollisionPhase = 'enter' | 'exit';
-/** `(sensor, other, phase)` — `sensor` is the entity whose collider `isSensor`. */
-export type SensorHandler = (sensor: Entity, other: Entity, phase: CollisionPhase) => void;
-/** `(a, b, phase)` — a solid (non-sensor) contact between two colliders. */
-export type CollisionHandler = (a: Entity, b: Entity, phase: CollisionPhase) => void;
+/** A sensor pair's journal refs (`entityRef`), cached by the producer while each entity was alive. */
+export interface SensorRefs { readonly sensor: string | number; readonly other: string | number }
+/** A solid pair's journal refs, in the handles' `a`/`b` order — see {@link SensorRefs}. */
+export interface CollisionRefs { readonly a: string | number; readonly b: string | number }
+/** `(sensor, other, phase, refs)` — `sensor` is the entity whose collider `isSensor`. */
+export type SensorHandler = (sensor: Entity, other: Entity, phase: CollisionPhase, refs: SensorRefs) => void;
+/** `(a, b, phase, refs)` — a solid (non-sensor) contact between two colliders. */
+export type CollisionHandler = (a: Entity, b: Entity, phase: CollisionPhase, refs: CollisionRefs) => void;
 
 /** Rich contact info fired ONCE when two solid colliders begin touching (the impact moment).
  *  `point`/`normal` are world-space (arrays: [x,y] in 2D, [x,y,z] in 3D); `speed` is the relative
@@ -45,17 +52,17 @@ interface Subs {
 /** The consumer + producer surface of a physics event bus. */
 export interface PhysicsEventBus {
   onSensor(cb: SensorHandler, world?: World): () => void;
-  onSensorEnter(cb: (sensor: Entity, other: Entity) => void, world?: World): () => void;
-  onSensorExit(cb: (sensor: Entity, other: Entity) => void, world?: World): () => void;
+  onSensorEnter(cb: (sensor: Entity, other: Entity, refs: SensorRefs) => void, world?: World): () => void;
+  onSensorExit(cb: (sensor: Entity, other: Entity, refs: SensorRefs) => void, world?: World): () => void;
   onCollision(cb: CollisionHandler, world?: World): () => void;
-  onCollisionEnter(cb: (a: Entity, b: Entity) => void, world?: World): () => void;
-  onCollisionExit(cb: (a: Entity, b: Entity) => void, world?: World): () => void;
+  onCollisionEnter(cb: (a: Entity, b: Entity, refs: CollisionRefs) => void, world?: World): () => void;
+  onCollisionExit(cb: (a: Entity, b: Entity, refs: CollisionRefs) => void, world?: World): () => void;
   /** Fires ONCE when two solid colliders begin touching, with point/normal/impact speed. */
   onContact(cb: ContactHandler, world?: World): () => void;
   /** Producer-only: called by the physics reconciler. Not for game code. */
-  __emitSensor(world: World, sensor: Entity, other: Entity, phase: CollisionPhase): void;
+  __emitSensor(world: World, sensor: Entity, other: Entity, phase: CollisionPhase, refs: SensorRefs): void;
   /** Producer-only: called by the physics reconciler. Not for game code. */
-  __emitCollision(world: World, a: Entity, b: Entity, phase: CollisionPhase): void;
+  __emitCollision(world: World, a: Entity, b: Entity, phase: CollisionPhase, refs: CollisionRefs): void;
   /** Producer-only: called by the physics reconciler on a contact begin. Not for game code. */
   __emitContact(world: World, a: Entity, b: Entity, detail: ContactDetail): void;
   /** Drop every subscriber for a world (manager dispose on scene swap; also for tests). */
@@ -63,8 +70,8 @@ export interface PhysicsEventBus {
 }
 
 /** Wrap a phase-agnostic handler so it only fires for one phase (enter/exit). */
-function phaseFilter<A, B>(want: CollisionPhase, cb: (a: A, b: B) => void) {
-  return (a: A, b: B, phase: CollisionPhase) => { if (phase === want) cb(a, b); };
+function phaseFilter<A, B, R>(want: CollisionPhase, cb: (a: A, b: B, refs: R) => void) {
+  return (a: A, b: B, phase: CollisionPhase, refs: R) => { if (phase === want) cb(a, b, refs); };
 }
 
 /** Build a physics event bus + its scene-scoped manager. `managerName` is the ManagerDef name
@@ -100,15 +107,15 @@ export function createPhysicsEventBus(managerName: string, logTag: string): { ev
       return () => s.delete(cb);
     },
 
-    __emitSensor(world, sensor, other, phase) {
+    __emitSensor(world, sensor, other, phase, refs) {
       const s = subsByWorld.get(world);
       if (!s || s.sensor.size === 0) return;
-      notifyListeners(s.sensor, sensorLabel, [sensor, other, phase]);
+      notifyListeners(s.sensor, sensorLabel, [sensor, other, phase, refs]);
     },
-    __emitCollision(world, a, b, phase) {
+    __emitCollision(world, a, b, phase, refs) {
       const s = subsByWorld.get(world);
       if (!s || s.collision.size === 0) return;
-      notifyListeners(s.collision, collisionLabel, [a, b, phase]);
+      notifyListeners(s.collision, collisionLabel, [a, b, phase, refs]);
     },
     __emitContact(world, a, b, detail) {
       const s = subsByWorld.get(world);

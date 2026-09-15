@@ -4,7 +4,7 @@
  *  inside callbacks/functions (never capture at module load) so world swaps take
  *  effect immediately. */
 
-import { type Entity, type World } from 'koota';
+import { $internal, type Entity, type World } from 'koota';
 import { getCurrentWorld, getEntityIndex, getGuidIndex, peekCurrentWorld } from './worldRegistry';
 import { EntityAttributes } from '../traits/EntityAttributes';
 import { emit, entityRef, isJournalEnabled } from '../journal';
@@ -36,7 +36,12 @@ export function findEntityById(entityId: number, world: World = getCurrentWorld(
 /** Find an entity by its stable guid in the given world (O(1) via the guid index).
  *  Returns undefined for ''/unknown. Self-healing: on a miss it does ONE full scan,
  *  repopulates the whole guid map, and retries — so correctness holds even if a guid
- *  mint site forgot to call indexEntityGuid (the explicit wiring is just for speed). */
+ *  mint site forgot to call indexEntityGuid (the explicit wiring is just for speed).
+ *
+ *  ⚠️ The rescan runs only when a guid could have APPEARED since the last one (see
+ *  {@link GuidEpoch}). It used to run on every miss, so a guid held across frames and polled after
+ *  its entity was gone paid a whole-world scan per call — measured 0.13 ms at 1k entities and
+ *  1.6 ms at 10k, against ~150 ns for a hit (#1222). */
 export function findEntityByGuid(guid: string, world: World = getCurrentWorld()): Entity | undefined {
   if (!guid) return undefined;
   // A runtime guid (#1210) resolves through its world's address table, never the rescan: it names
@@ -47,11 +52,100 @@ export function findEntityByGuid(guid: string, world: World = getCurrentWorld())
   const idx = getGuidIndex(world);
   let entity = idx.get(guid);
   if (entity && guidOf(entity) === guid) return entity;
-  // Miss (or stale) → rescan once and retry.
+  // Miss (or stale) → rescan and retry, unless nothing that can add a guid has happened since the
+  // last rescan — which already put every guid in the world into the index.
+  const epoch = guidEpochFor(world);
+  if (epoch && epoch.scannedAt === epoch.value) return undefined;
   rebuildGuidIndexSync(world);
   entity = idx.get(guid);
   return entity && guidOf(entity) === guid ? entity : undefined;
 }
+
+/** {@link findEntityByGuid} for a caller running INSIDE a structure change — a live, registered
+ *  entity carrying `guid`, or undefined. It never rescans: `unregisterEntity` fires its structure
+ *  callback after the index drops the entity but before `destroy()`, so a rescan there would index
+ *  the dying entity by its guid and a later lookup could hand back the corpse. A guid written onto an
+ *  entity by a site that forgot `indexEntityGuid` is therefore invisible here until a rescan
+ *  (`editor/store/heldEntity.ts` re-asks a frame later through `findEntityByGuid` for that reason). */
+export function peekEntityByGuid(guid: string, world: World = getCurrentWorld()): Entity | undefined {
+  if (!guid) return undefined;
+  const runtime = parseRuntimeGuid(guid);
+  const entity = runtime ? resolveRuntimeGuid(runtime, world) : getGuidIndex(world).get(guid);
+  if (!entity || !isLive(entity) || (!runtime && guidOf(entity) !== guid)) return undefined; // a runtime guid survives a re-mint (#1210)
+  return getEntityIndex(world).get(entity.id()) === entity ? entity : undefined;
+}
+
+/** Per-world counter of everything that can put a guid on a live entity, driven by koota itself:
+ *  `onAdd(EntityAttributes)` (every spawn carrying it, and a later `entity.add`) and
+ *  `onChange(EntityAttributes)` (every `entity.set`, which is the only way to write a SoA trait's
+ *  field — `writeTraitField` and the runtime mint included). `scannedAt` is the value when the index
+ *  was last rebuilt from the world: while the two match, a miss is a real miss and scanning again
+ *  could not find it.
+ *
+ *  Why koota's events and not calls at our own mint sites: the rescan exists precisely for a site
+ *  that forgot `indexEntityGuid`, so the gate must see a write nobody announced. An explicit bump in
+ *  `registerEntity` was tried and removed — `onAdd` already covers every spawn, so no test could
+ *  fail without it. The subscriptions are taken on the world's first miss; before that there is
+ *  nothing to invalidate (`scannedAt` starts at -1).
+ *
+ *  ⚠️ A removal CAN strand a findable guid, when two live entities share one (a hand- or agent-edited
+ *  scene file loads both; only chain scenes filter duplicates). The index holds ONE of them, so
+ *  destroying the indexed one used to leave the other reachable only through the rescan this gate
+ *  now skips. So a guid the RESCAN finds on two entities is recorded (`duplicateGuids`), and
+ *  `unregisterEntity` bumps for exactly those. The rescan is the only place that needs to notice: a
+ *  duplicate that arrives by a spawn or a write bumps the epoch itself, so the next miss rescans and
+ *  records it before the gate can close on it. (Noting collisions in `registerEntity` too was tried
+ *  and removed at the scoped review — no sequence could make it matter.) Bumping on every destroy would reopen the rescan every
+ *  frame in a game that destroys every frame (#1222 close-out review).
+ *
+ *  Not covered, and not reachable today: a world's FIRST miss taken inside an `updateEach` over
+ *  `EntityAttributes` whose callback then writes `ea.guid` back through the state object. koota fixes
+ *  the loop's change tracking when it starts, so that write fires no `onChange`. No engine loop over
+ *  `EntityAttributes` writes a field (26 sites, read at the review). */
+interface GuidEpoch { value: number; scannedAt: number; rescans: number }
+const guidEpochs = new WeakMap<World, GuidEpoch>();
+/** Durable guids the index has seen on more than one live entity in a world — see {@link GuidEpoch}. */
+const duplicateGuids = new WeakMap<World, Set<string>>();
+
+function noteDuplicateGuid(world: World, guid: string): void {
+  let d = duplicateGuids.get(world);
+  if (!d) { d = new Set(); duplicateGuids.set(world, d); }
+  d.add(guid);
+}
+
+function isLive(entity: Entity): boolean {
+  try { return entity.isAlive(); } catch { return false; }
+}
+
+function guidEpochFor(world: World): GuidEpoch | undefined {
+  let e = guidEpochs.get(world);
+  if (!e) {
+    const epoch: GuidEpoch = { value: 0, scannedAt: -1, rescans: 0 };
+    // `world.reset()` drops every koota subscription without a word, and a gate whose bumps have
+    // stopped arriving turns a findable guid into a permanent miss. koota's own React bindings
+    // survive a reset through the reset-subscription set on `$internal` (koota/react `useQuery`),
+    // and so does this: a reset forgets the epoch, so the next miss subscribes and rescans afresh.
+    // Without that hook (a koota that moved it) there is no gate at all — every miss rescans, as
+    // before #1222. Measured on koota 0.6.6; `engine/tests/editor/watch.test.ts` resets one world
+    // per case and is what found this.
+    const resets = (world as unknown as Record<symbol, { resetSubscriptions?: Set<(w: World) => void> }>)[$internal]?.resetSubscriptions;
+    if (!resets) return undefined;
+    e = epoch;
+    guidEpochs.set(world, epoch);
+    const bump = () => { epoch.value++; };
+    try {
+      world.onAdd(EntityAttributes, bump);
+      world.onChange(EntityAttributes, bump);
+      resets.add(function forget() { resets.delete(forget); guidEpochs.delete(world); });
+    } catch { guidEpochs.delete(world); return undefined; } // a destroyed world: no gate
+  }
+  return e;
+}
+
+/** Whole-world guid rescans `world` has run, so a test can tell a gated miss from a rescanned one
+ *  (both return undefined). @internal */
+export function _guidIndexRescans(world: World): number { return guidEpochs.get(world)?.rescans ?? 0; }
+
 
 // ── Runtime guids (#1210) ───────────────────────────────────────────────────────────────────
 // An entity spawned with an empty `EntityAttributes.guid` gets a RUNTIME guid at spawn:
@@ -210,7 +304,13 @@ export function unregisterEntity(entity: any, world: World = getCurrentWorld()) 
   emitLifecycle('@despawn', entity, world); // before index removal — entity still live
   getEntityIndex(world).delete(entity.id());
   const guid = guidOf(entity);
-  if (guid) getGuidIndex(world).delete(guid);
+  if (guid) {
+    const idx = getGuidIndex(world);
+    const held = idx.get(guid);
+    if (held !== undefined && (held === entity || !isLive(held))) idx.delete(guid); // never evict another live holder
+    // Another live entity may still carry this guid, unindexed: let the next miss rescan for it.
+    if (duplicateGuids.get(world)?.has(guid)) { const e = guidEpochs.get(world); if (e) e.value++; }
+  }
   const t = runtimeAddresses.get(world);
   if (t) {
     const packed = packedOf(entity);
@@ -228,12 +328,16 @@ export function unregisterEntity(entity: any, world: World = getCurrentWorld()) 
  *  Sync (the trait is statically imported) so findEntityByGuid can self-heal. */
 export function rebuildGuidIndexSync(world: World = getCurrentWorld()) {
   const idx = getGuidIndex(world);
+  const epoch = guidEpochFor(world);
+  if (epoch) { epoch.scannedAt = epoch.value; epoch.rescans++; } // before the walk: a write DURING it bumps past this
   idx.clear();
   try {
     world.query(EntityAttributes).updateEach(([ea]: any[], entity: any) => {
       const g = (ea?.guid as string) || '';
       // Runtime guids never enter the index: they resolve through the address table (#1210).
-      if (g && !isRuntimeGuid(g) && !idx.has(g)) idx.set(g, entity); // first wins (guids must be unique)
+      if (!g || isRuntimeGuid(g)) return;
+      if (idx.has(g)) noteDuplicateGuid(world, g); // first wins (guids must be unique) — but remember
+      else idx.set(g, entity);
     });
   } catch { /* EntityAttributes not in this world */ }
 }

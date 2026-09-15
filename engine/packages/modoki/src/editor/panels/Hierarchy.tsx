@@ -29,7 +29,7 @@ import ContextMenu, { type ContextMenuItem } from '../components/ContextMenu';
 import RenameInput from '../components/RenameInput';
 import { TreeSearchInput, TypeFilterMenu, treeRowPadLeft } from './treeChrome';
 import { useExpandedSet } from './useExpandedSet';
-import { loadCollapsedGuids, saveCollapsedGuids, computeRestoredCollapse, collapsedIdsToGuids, needsCollapseRestore, shouldPersistCollapse, type CollapseOwner } from './hierarchyCollapse';
+import { loadCollapsedGuids, saveCollapsedGuids, computeRestoredCollapse, needsCollapseRestore, shouldPersistCollapse, holdCollapsed, reconcileCollapsed, persistableCollapsedGuids, NO_COLLAPSE_HOLDS, type CollapseHolds, type CollapseOwner } from './hierarchyCollapse';
 import { remapPrefix } from '../utils/assetPaths';
 import { filterEntityTree, collectEntityTypes, normalizeFolderPath, buildHierarchyFolders, countFolderRoots, folderSubtreePaths, folderSubtreeRootIds, revealTargetsFor, isRevealRequest, type RevealKey, groupRootsBySourceScene, resolveDropFolderSync, type HierarchyFolder } from './hierarchyFolders';
 import { isSceneDirty } from '../scene/sceneDirty';
@@ -693,6 +693,9 @@ export default function Hierarchy() {
   // "restore needed" boolean (which nothing was guaranteed to clear) and not the scene path
   // (which File → Save As changes with no swap). See hierarchyCollapse.ts for both scars.
   const collapseOwnerRef = useRef<CollapseOwner>(null);
+  // #1221: what each collapsed id MEANT when it was collapsed, so a destroy-and-replace on the same
+  // index inside this world does not hand the collapse to the newcomer (hierarchyCollapse.ts).
+  const collapsedHeldRef = useRef<CollapseHolds>(NO_COLLAPSE_HOLDS);
   // Set by the effect below so the persistence effect can ask for a settled refresh too.
   const requestSettledRefreshRef = useRef<() => void>(() => {});
   useEffect(() => {
@@ -714,6 +717,14 @@ export default function Hierarchy() {
       const v = getStructureVersion();
       if (v !== prevVersionRef.current) {
         prevVersionRef.current = v;
+        // Re-resolve the collapsed ids BEFORE the tree rebuild, in the world they were restored for
+        // only — across a swap the restore below owns the set (#1221).
+        const world = getCurrentWorld();
+        if (collapseOwnerRef.current?.world === world) {
+          // A PURE updater: React runs it twice in development. The holds for the new set are re-taken
+          // by the [collapsed] effect below, never written from in here (hierarchyCollapse.ts says why).
+          setCollapsed((prev) => reconcileCollapsed(prev, collapsedHeldRef.current, world) ?? prev);
+        }
         const flat = getAllEntities();
         setEntityCount(flat.length);
         setTree(buildEntityTree(flat));
@@ -798,6 +809,15 @@ export default function Hierarchy() {
     // Same reasoning as the keymap effect below. See input/hmrEpoch.ts.
   }, [hmrEpoch]);
 
+  // Hold each collapsed id while it still names the entity the user collapsed (#1221). Only for a set
+  // restored for the live world — a pre-restore set holds a dead world's ids.
+  useEffect(() => {
+    const world = getCurrentWorld();
+    collapsedHeldRef.current = collapseOwnerRef.current?.world === world
+      ? holdCollapsed(collapsed, collapsedHeldRef.current, world)
+      : NO_COLLAPSE_HOLDS;
+  }, [collapsed]);
+
   // Persist collapse per scene (by guid). Gated on the OWNER so a transient pre-restore set
   // (stale ids from before a swap) can't overwrite the save.
   useEffect(() => {
@@ -810,7 +830,8 @@ export default function Hierarchy() {
       if (path) requestSettledRefreshRef.current();
       return;
     }
-    saveCollapsedGuids(path, collapsedIdsToGuids(getAllEntities(), collapsed));
+    // Parked guids too: a collapsed entity a game system destroyed during Play is still collapsed.
+    saveCollapsedGuids(path, persistableCollapsedGuids(getAllEntities(), collapsed, collapsedHeldRef.current));
   }, [collapsed]);
 
   const handleToggle = useCallback((id: number, recursive = false) => {

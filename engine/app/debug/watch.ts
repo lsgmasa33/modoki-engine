@@ -124,7 +124,7 @@ function entityNameOf(id: number): string | undefined {
  *  `guid`, and a bare id there looks like a guid that every guid-addressed op then refuses. The
  *  `id:` prefix keeps the key unique and lets `readWatch` report `guid: null` plus the id instead. */
 function seriesKeyOf(entity: Parameters<typeof entityRef>[0]): string {
-  const ref = entityRef(entity);
+  const ref = entityRef(entity) ?? entity.id(); // every caller hands a query-live entity, so never null
   return typeof ref === 'number' ? `${ID_KEY_PREFIX}${ref}` : ref;
 }
 const ID_KEY_PREFIX = 'id:';
@@ -146,7 +146,7 @@ function resolveTargets(w: Watch): { guid: string; id: number; name?: string }[]
     // Name-scoped (or guid+name): read EntityAttributes so we can match by name. New spawns whose
     // name matches auto-join — the whole point (a fresh-guid puck has no stable guid to pass).
     try {
-      world.query(w.meta.trait, EntityAttributes).updateEach((_: unknown, entity: { id(): number; get(t: unknown): { name?: string } | undefined; has(t: unknown): boolean }) => {
+      world.query(w.meta.trait, EntityAttributes).updateEach((_: unknown, entity: { id(): number; get(t: unknown): { name?: string } | undefined; has(t: unknown): boolean; isAlive(): boolean }) => {
         const guid = seriesKeyOf(entity);
         const name = String(entity.get(EntityAttributes)?.name ?? '');
         const byName = w.names?.some((n) => name.toLowerCase().includes(n));
@@ -156,7 +156,7 @@ function resolveTargets(w: Watch): { guid: string; id: number; name?: string }[]
     } catch { /* trait not present in this world */ }
   } else {
     try {
-      world.query(w.meta.trait).updateEach((_: unknown, entity: { id(): number; get(t: unknown): unknown; has(t: unknown): boolean }) => {
+      world.query(w.meta.trait).updateEach((_: unknown, entity: { id(): number; get(t: unknown): unknown; has(t: unknown): boolean; isAlive(): boolean }) => {
         out.push({ guid: seriesKeyOf(entity), id: entity.id() });
       });
     } catch { /* trait not present in this world */ }

@@ -13,6 +13,8 @@ import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes
 import { isRuntimeGuid } from '../../src/runtime/core/assetRefRules';
 import { zone2DEvents } from '../../src/runtime/zones/Zone2DEvents';
 import { zone3DEvents } from '../../src/runtime/zones/Zone3DEvents';
+import { entityRef } from '../../src/runtime/core/journal';
+import { destroyEntity } from '../../src/runtime/core/ecs/world';
 
 const ZONE2D = { name: 'zone2D', fn: zone2DSystem, priority: SYSTEM_PRIORITY.TRANSFORM + 2 };
 const ZONE3D = { name: 'zone3D', fn: zone3DSystem, priority: SYSTEM_PRIORITY.TRANSFORM + 2 };
@@ -211,6 +213,55 @@ describe('Zone2D triggers — declarative + despawn', () => {
     expect(isRuntimeGuid(enter?.other as string)).toBe(true);
     expect(exit?.other).toBe(enter?.other);
     expect(exit?.zone).toBe(enter?.zone);
+  });
+});
+
+// #1227: an exit for a DESPAWNED occupant hands game code a dead handle. koota's has()/get() mask
+// the generation, so `entityRef(deadHandle)` used to name whatever reclaimed the index — a live
+// entity that never entered the zone. The engine now hands the ref it cached while the occupant was
+// alive (`otherRef` in the action params, `refs.other` on the bus), and `entityRef` refuses a dead
+// handle with null. Staged exactly as work-qa's repro: destroy g1, spawn g2 on the same index, step.
+// Mutations: drop `otherRef` from `makeFireOnZone`'s params / `refs` from `__emitZone` (the ref
+// assertions go red); drop `entityRef`'s isAlive check (the null assertion reads g2).
+describe('Zone2D triggers — a despawned occupant\'s exit names IT, never the index\'s new owner (#1227)', () => {
+  function stageReclaimedExit(t: TestWorld) {
+    t.spawn(Transform({ x: 0, y: 0, sx: 4, sy: 4 }), Zone2D({ shape: 'box' }), OnZone2D({ onEnter: 'probe', onExit: 'probe' }),
+      EntityAttributes({ guid: 'guid-zone', name: 'Zone' }));
+    const g1 = t.spawn(Transform({ x: 0, y: 0 }), ZoneOccupant, EntityAttributes({ guid: 'guid-g1', name: 'g1' }));
+    t.step(1); // enter
+    destroyEntity(g1);
+    const g2 = t.spawn(Transform({ x: 50, y: 0 }), ZoneOccupant, EntityAttributes({ guid: 'guid-g2', name: 'g2' })); // outside the zone
+    expect(g2.id()).toBe(g1.id()); // precondition: the index really was reclaimed
+    t.step(1); // g1's synthesized exit
+  }
+
+  it('the OnZone2D exit action gets otherRef = the dead occupant, and entityRef(other) is null', () => {
+    const seen: Array<{ phase: string; otherRef: unknown; selfRef: unknown; live: unknown }> = [];
+    tw = createTestWorld({
+      systems: [ZONE2D],
+      actions: {
+        probe: (ctx) => {
+          const p = ctx.params as { other: Entity; phase: string; otherRef: unknown; selfRef: unknown };
+          seen.push({ phase: p.phase, otherRef: p.otherRef, selfRef: p.selfRef, live: entityRef(p.other) });
+        },
+      },
+    });
+    stageReclaimedExit(tw);
+    expect(seen).toEqual([
+      { phase: 'enter', otherRef: 'guid-g1', selfRef: 'guid-zone', live: 'guid-g1' },
+      { phase: 'exit', otherRef: 'guid-g1', selfRef: 'guid-zone', live: null },
+    ]);
+  });
+
+  it('a zone2DEvents subscriber gets refs naming the dead occupant', () => {
+    tw = createTestWorld({ systems: [ZONE2D] });
+    const got: Array<[string, unknown, unknown]> = [];
+    zone2DEvents.onZone((_z, _o, phase, refs) => got.push([phase, refs.zone, refs.other]), tw.world);
+    const exits: unknown[] = [];
+    zone2DEvents.onZoneExit((_z, _o, refs) => exits.push(refs.other), tw.world);
+    stageReclaimedExit(tw);
+    expect(got).toEqual([['enter', 'guid-zone', 'guid-g1'], ['exit', 'guid-zone', 'guid-g1']]);
+    expect(exits).toEqual(['guid-g1']);
   });
 });
 

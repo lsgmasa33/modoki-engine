@@ -3,7 +3,7 @@ import { trait } from 'koota';
 /** Declarative `Zone3D` trigger reaction — the no-code path on top of the `Zone3DEvents`
  *  manager. Put this on the SAME entity as a `Zone3D`: when a `ZoneOccupant` entity enters
  *  or leaves the zone volume, the zone-trigger system dispatches the named UIAction, passing
- *  the OTHER (occupant) entity as `ctx.target` and `{ self, other, phase }` in `ctx.params`.
+ *  the OTHER (occupant) entity as `ctx.target` and `{ self, other, phase, selfRef, otherRef }` in `ctx.params` — on an exit `other` may be dead, so name it by `otherRef` (#1227).
  *
  *  A zone is a PURE geometric containment test — NO physics colliders or `RigidBody3D` needed.
  *  It fires for any entity tagged `ZoneOccupant` whose world position is inside the `Zone3D`

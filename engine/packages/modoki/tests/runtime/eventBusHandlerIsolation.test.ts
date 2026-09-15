@@ -36,17 +36,17 @@ const CASES: Array<[string, EmitterCase]> = [
   ['zone.__emitZone', {
     label: '[zoneIso:zone]',
     subscribe: (cb) => { zone.onZone(cb, W); },
-    emit: () => zone.__emitZone(W, ENT, ENT, 'enter'),
+    emit: () => zone.__emitZone(W, ENT, ENT, 'enter', { zone: 1, other: 1 }),
   }],
   ['physics.__emitSensor', {
     label: '[physicsIso:sensor]',
     subscribe: (cb) => { physics.onSensor(cb, W); },
-    emit: () => physics.__emitSensor(W, ENT, ENT, 'enter'),
+    emit: () => physics.__emitSensor(W, ENT, ENT, 'enter', { sensor: 1, other: 1 }),
   }],
   ['physics.__emitCollision', {
     label: '[physicsIso:collision]',
     subscribe: (cb) => { physics.onCollision(cb, W); },
-    emit: () => physics.__emitCollision(W, ENT, ENT, 'exit'),
+    emit: () => physics.__emitCollision(W, ENT, ENT, 'exit', { a: 1, b: 1 }),
   }],
   ['physics.__emitContact', {
     label: '[physicsIso:contact]',

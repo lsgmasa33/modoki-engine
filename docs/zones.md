@@ -60,13 +60,21 @@ For every enter and exit, `zone2DSystem` / `zone3DSystem` fan out to:
    headlessly with `tw.events({ type: '@zone' })`. This is the Percept-verifiable path — assert on
    events, not pixels.
 2. **Event bus** (`zone2DEvents` / `zone3DEvents`) — subscribe in code:
-   `zone3DEvents.onZoneEnter((zone, other) => …, world)`, plus `onZoneExit` and the phase-agnostic
-   `onZone((zone, other, phase) => …)`. Each returns an unsubscribe fn. World-scoped subscribers
+   `zone3DEvents.onZoneEnter((zone, other, refs) => …, world)`, plus `onZoneExit` and the phase-agnostic
+   `onZone((zone, other, phase, refs) => …)`. `refs` is `{ zone, other }`: both entities' journal refs,
+   cached while each was alive. Each returns an unsubscribe fn. World-scoped subscribers
    (cleared on scene swap via the scene-scoped `Zone2DEvents`/`Zone3DEvents` managers).
 3. **Declarative `OnZone` trait** — put `OnZone3D({ onEnter: 'myAction' })` on the zone; when a
    `ZoneOccupant` enters, the named UIAction is dispatched with the occupant as `ctx.target` and
-   `{ self: zone, other, phase }` in `ctx.params`. The no-code path — an unwired name is a warning,
-   not a crash. Leave a field empty to react to only the other phase.
+   `{ self: zone, other, phase, selfRef, otherRef }` in `ctx.params`. The no-code path — an unwired
+   name is a warning, not a crash. Leave a field empty to react to only the other phase.
+
+⚠️ **On an exit, name the occupant through `otherRef` (or `refs.other`), never `entityRef(other)`**
+(#1227). An occupant that DESPAWNED inside the zone still gets its exit, but `other` is then a dead
+handle, and koota's `has()`/`get()` ignore the generation: once a new spawn reclaims the index (the
+very next spawn, since the free list is LIFO), the handle reads the newcomer. `entityRef` therefore
+returns `null` for a dead handle, and the producer hands over the ref it cached while the occupant
+was alive — the same ref the `@zone` journal event carries.
 
 ## Semantics & lifecycle
 

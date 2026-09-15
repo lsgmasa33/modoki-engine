@@ -355,13 +355,17 @@ physics2DEvents.onSensorExit(...); physics2DEvents.onCollisionEnter(...); physic
 ```
 Subscribers are **world-scoped** (WeakMap<World>, like the journal) so dual editor viewports /
 parallel test worlds stay isolated; the manager's `dispose` clears the old world's subscribers on
-scene swap. Callbacks receive live koota `Entity` handles. Use this when a reaction needs arbitrary
-game state, filtering, or cross-entity logic.
+scene swap. Callbacks receive koota `Entity` handles, and sensor/collision callbacks also get `refs`
+(`{ sensor, other }` / `{ a, b }`), both entities' journal refs cached while alive. Use this when a
+reaction needs arbitrary game state, filtering, or cross-entity logic.
 
 **B — `OnCollision2D` trait (declarative, no-code).** Put it on the same entity as a `Collider2D`
 (e.g. a Sensor Zone). Fields `onEnter`/`onExit` name a UIAction (Inspector dropdown of registered
 actions). On overlap begin/end the physics system dispatches that action, passing the **other**
-entity as `ctx.target` and `{ self, other, phase }` in `ctx.params`. Dispatch goes through the new
+entity as `ctx.target` and `{ self, other, phase, selfRef, otherRef }` in `ctx.params`. ⚠️ A body
+despawned while overlapping gets a synthesized exit whose `other` is a DEAD handle, possibly already
+reclaimed by a new spawn: name it through `otherRef` (or the bus's `refs`), never `entityRef(other)`,
+which returns `null` for a dead handle (#1227; the zone twin is in [zones.md](zones.md)). Dispatch goes through the new
 **pipeline-safe `dispatchGameAction`** (never throws on a missing handler, unlike the
 event-handler-only `dispatchUIAction`, whose dev-throw would abort the frame — F10). This is the
 declarative sugar on top of C. Demonstrated in `demos/2d-physics-demo` (the Sensor Zone tints

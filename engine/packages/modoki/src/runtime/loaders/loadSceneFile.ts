@@ -1,7 +1,7 @@
 /** Load a scene JSON file into an ECS world. Shared between editor and runtime. */
 
 import { type Entity, type World } from 'koota';
-import { getCurrentWorld, spawnEntity, indexEntityGuid, findEntityById, findEntityByGuid } from '../core/ecs/world';
+import { getCurrentWorld, spawnEntity, destroyEntity, indexEntityGuid, findEntityById, findEntityByGuid } from '../core/ecs/world';
 import { getAllTraits, getTraitByName } from '../core/ecs/traitRegistry';
 import { loadModelTemplates, getCachedPrefab } from './meshTemplateCache';
 import { isGuid, isExternalUrl, resolveRef, getAssetType, deriveGuid, newGuid, getAssetEntry, type AssetType } from './assetManifest';
@@ -508,7 +508,6 @@ type EntityHandle = {
   set(t: unknown, d: unknown): void;
   add(i: unknown): void;
   remove(t: unknown): void;
-  destroy(): void;
 };
 
 type PrefabLike = { entities: { localId?: number; traits: Record<string, unknown> }[]; rootLocalId?: number };
@@ -543,10 +542,11 @@ export function prefabSubtreeLocalIds(prefab: PrefabLike, rootLocalId: number): 
  *
  *  The editor passes `getCurrentWorld()`-backed ops (deleteEntities, findEntity,
  *  registerEntity, its 4-call nested-instance expansion, markStructureDirty/UI);
- *  the runtime passes koota-`world`-direct ops (h.destroy, byId map, the single
+ *  the runtime passes koota-`world`-direct ops (destroyEntity on exactly the mapped ids, byId map, the single
  *  instantiatePrefabIntoWorld call). `log` keeps each side's existing warn prefix. */
 export interface StructureApplyOps {
-  /** Delete these ECS ids (cascading to children — both impls cascade). */
+  /** Delete these ECS ids. The editor impl cascades to ECS children; the runtime impl deletes exactly these
+   *  (see its comment) — the ids already include the prefab subtree's mapped members. */
   deleteEntities(ecsIds: number[]): void;
   /** Resolve an ECS id to a handle whose traits can be read/removed, or undefined. */
   findEntity(ecsId: number): { has(t: unknown): boolean; remove(t: unknown): void } | undefined;
@@ -697,12 +697,16 @@ export function applyStructureByLocalToEcs(
   applyStructureCore(
     {
       logPrefix: '[loadSceneFile]',
+      // destroyEntity, never a bare destroy(): that skipped `unregisterEntity`, so the entity index
+      // kept each removed member and `findEntityById` handed back its corpse (#1222).
+      // Exactly the ids handed in, NOT an ECS-parent cascade: during a nested expansion the outer rows'
+      // parentIds are still prefab-file localIds, so a cascade would take unrelated members whose raw parent
+      // number matches a removed member's ECS id (#1222 close-out review). A nested instance's own members
+      // under a removed member are therefore still left behind: #1247.
       deleteEntities: (ecsIds) => {
         const toDelete = new Set(ecsIds);
-        for (const e of world.entities) {
-          const h = e as EntityHandle;
-          if (toDelete.has(h.id())) h.destroy();
-        }
+        const doomed = [...world.entities].filter((e) => toDelete.has((e as EntityHandle).id()));
+        for (const e of doomed) destroyEntity(e, world);
       },
       findEntity: (ecsId) => handleById().get(ecsId),
       spawnAdded: (traitArgs) => {

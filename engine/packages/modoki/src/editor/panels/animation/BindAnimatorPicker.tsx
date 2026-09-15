@@ -9,7 +9,10 @@
  *  just appends to its clip bank) is the obvious choice when it exists. */
 
 import { useMemo, useState } from 'react';
-import { getAllEntities, type EntityInfo } from '../../../runtime/core/ecs/entityUtils';
+import { getAllEntities, findEntity, type EntityInfo } from '../../../runtime/core/ecs/entityUtils';
+import { getCurrentWorld } from '../../../runtime/core/ecs/world';
+import { pinEntityAt, livePinnedId } from '../../../runtime/core/ecs/entityPin';
+import { useEditorStore } from '../../store/editorStore';
 
 export interface BindEntityRow {
   id: number;
@@ -81,6 +84,23 @@ export default function BindAnimatorPicker({ clipName, onBind, onClose }: {
   // Start fully expanded: the entity you want may be nested, and a picker that
   // opens collapsed makes the fix look unavailable.
   const [expanded, setExpanded] = useState<Set<number>>(() => new Set(entities.map((e) => e.id)));
+  // The snapshot's ids are koota's recycled index: an entity destroyed while the picker is open (a
+  // Play rebuild) hands its id to the next spawn, and Bind would bind THAT. So each row is pinned to
+  // the entity it listed, and a pick whose entity is gone is refused (#1221; the ApplyPrefabDialog
+  // shape from #868).
+  const pins = useMemo(() => {
+    const world = getCurrentWorld();
+    return new Map(entities.map((e) => [e.id, pinEntityAt(e.id, findEntity, world)]));
+  }, [entities]);
+  const bind = (id: number) => {
+    const live = livePinnedId(pins.get(id) ?? null, findEntity, getCurrentWorld());
+    if (live === null) {
+      onClose();
+      useEditorStore.getState().showToast('That entity no longer exists — open the picker again to choose from the current scene.', 'warn');
+      return;
+    }
+    onBind(live);
+  };
 
   const rows = useMemo(() => buildEntityRows(entities, filter, expanded), [entities, filter, expanded]);
   const selected = rows.find((r) => r.id === selectedId) ?? null;
@@ -117,7 +137,7 @@ export default function BindAnimatorPicker({ clipName, onBind, onClose }: {
                 key={r.id}
                 data-bind-entity-id={r.id}
                 onClick={() => setSelectedId(r.id)}
-                onDoubleClick={() => onBind(r.id)}
+                onDoubleClick={() => bind(r.id)}
                 title={r.hasAnimator ? 'Has an Animator — the clip is added to its clip list' : 'No Animator — one is added when you bind'}
                 style={{ display: 'flex', alignItems: 'center', gap: 2, padding: '2px 6px', paddingLeft: 6 + r.depth * 12, cursor: 'pointer', background: isSel ? '#2a2a40' : 'transparent', color: isSel ? '#cdd' : '#aab', fontSize: 11, userSelect: 'none', whiteSpace: 'nowrap' }}
                 onMouseEnter={(e) => { if (!isSel) e.currentTarget.style.background = '#1d1d2c'; }}
@@ -142,7 +162,7 @@ export default function BindAnimatorPicker({ clipName, onBind, onClose }: {
             data-ui-id="animation.bindAnimator.confirm" data-ui-kind="button" data-ui-label="bind"
             style={{ ...btn, opacity: selected ? 1 : 0.4, cursor: selected ? 'pointer' : 'default' }}
             disabled={!selected}
-            onClick={() => { if (selected) onBind(selected.id); }}
+            onClick={() => { if (selected) bind(selected.id); }}
           >Bind</button>
         </div>
       </div>

@@ -787,7 +787,7 @@ Two gaps let it through, and both are now closed:
   canonicality check the marker guard says it cannot afford: proving a scene byte-exact needs a
   world, but proving no field on disk is one the serializer would never emit needs only the
   registry. **Its reach is engine traits only** — a game's own `runtimeOnly` field (sling's
-  `Enemy.hpBarId`) is registered by that game's runtime and is invisible to a vitest run.
+  `Enemy.hpBarGuid`) is registered by that game's runtime and is invisible to a vitest run.
 
 The rule for a trait author: `hidden` and `runtimeOnly` answer different questions — *may a human
 edit this?* vs *may this reach disk?* — and an engine-written read-back needs both

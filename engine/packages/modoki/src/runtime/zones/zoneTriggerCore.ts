@@ -20,10 +20,11 @@ import { EntityAttributes } from '../core/traits/EntityAttributes';
 import { worldTransforms } from '../core/ecs/transformPropagationSystem';
 import { getWorldTransform3D, type WorldTransform3D } from '../core/ecs/worldTransform';
 import { packedOf, type PackedEntity } from '../core/ecs/entityTable';
-import type { ZoneEventBus, ZonePhase } from './zoneEventBus';
+import type { ZoneEventBus, ZonePhase, ZoneRefs } from './zoneEventBus';
 
-/** Fire the declarative `OnZone` action on the ZONE for one enter/exit. */
-export type FireOnZone = (zone: Entity, other: Entity, phase: ZonePhase) => void;
+/** Fire the declarative `OnZone` action on the ZONE for one enter/exit. `refs` are both entities'
+ *  journal refs as last seen ALIVE — the only identity a despawn-synthesized exit still has (#1227). */
+export type FireOnZone = (zone: Entity, other: Entity, phase: ZonePhase, refs: ZoneRefs) => void;
 
 /** A zone resolved for this frame: its entity + a containment predicate over an occupant's
  *  WORLD position, with the zone's own world pose (centre/rotation/scale) already baked in. */
@@ -34,16 +35,18 @@ export interface OccupantSample { entity: Entity; x: number; y: number; z: numbe
 
 /** Build the declarative `OnZone` dispatcher for a given trait (`OnZone2D`/`OnZone3D`). The
  *  action lives on the ZONE ("when something enters THIS zone, do X"): dispatched with the
- *  OTHER (occupant) as `ctx.target` and `{ self: zone, other, phase }` in `ctx.params`.
+ *  OTHER (occupant) as `ctx.target` and `{ self: zone, other, phase, selfRef, otherRef }` in
+ *  `ctx.params`. On an exit `other` may be DEAD, and its index already reclaimed: `otherRef` is the
+ *  ref it had while alive, and `entityRef(other)` answers `null` rather than name the newcomer (#1227).
  *  Pipeline-safe: `dispatchGameAction` never throws on an unwired name; a despawned zone (a
  *  synthesized exit) is guarded by `isAlive()`. */
 export function makeFireOnZone(OnZoneTrait: Parameters<Entity['has']>[0]): FireOnZone {
-  return (zone, other, phase) => {
+  return (zone, other, phase, refs) => {
     if (!zone.isAlive() || !zone.has(OnZoneTrait)) return;
     const r = zone.get(OnZoneTrait) as { onEnter: string; onExit: string };
     const name = phase === 'enter' ? r.onEnter : r.onExit;
     if (!name) return;
-    dispatchGameAction(name, { target: other, params: { self: zone, other, phase } });
+    dispatchGameAction(name, { target: other, params: { self: zone, other, phase, selfRef: refs.zone, otherRef: refs.other } });
   };
 }
 
@@ -66,7 +69,7 @@ interface ZoneMember { entity: Entity; ref: string | number }
  *  The cache used to be the numeric id, which split enter (guid) from despawn-exit (number) — for
  *  every code-spawned occupant once #1210 gave each one a runtime guid (#1225). */
 function refOf(m: ZoneMember): string | number {
-  if (m.entity.isAlive()) m.ref = entityRef(m.entity);
+  if (m.entity.isAlive()) m.ref = entityRef(m.entity) ?? m.ref;
   return m.ref;
 }
 
@@ -74,20 +77,21 @@ function refOf(m: ZoneMember): string | number {
  *  was already tracked, so its cached ref carries over; otherwise a new one, its ref taken now
  *  while the entity is known alive. Only a first appearance pays for an `entityRef`. */
 function memberFor(entity: Entity, prior: ZoneMember | undefined): ZoneMember {
-  return prior ?? { entity, ref: entityRef(entity) };
+  return prior ?? { entity, ref: entityRef(entity) ?? entity.id() }; // sampled this tick, so alive
 }
 
-/** Route ONE zone/occupant transition to all three sinks. The journal payload uses `refOf`
- *  (despawn-safe — see its own comment); `bus`/`fire` still receive the raw `Entity` handles,
- *  matching `physicsContactEvents.routePair`'s same accepted trade-off for a synthesized exit
- *  (`makeFireOnZone` already guards `zone.isAlive()` before dispatching). */
+/** Route ONE zone/occupant transition to all three sinks. Every sink gets the SAME refs, taken
+ *  once through `refOf` (despawn-safe — see its own comment): the journal payload, and the `refs`
+ *  handed to `bus`/`fire` beside the raw `Entity` handles. The handles may be dead on a synthesized
+ *  exit (`makeFireOnZone` guards `zone.isAlive()` before dispatching); the refs never are (#1227). */
 function routeZone(
   world: World, zone: ZoneMember, other: ZoneMember,
   phase: ZonePhase, bus: ZoneEventBus, fire: FireOnZone, journalType: string,
 ): void {
-  emit(journalType, { zone: refOf(zone), other: refOf(other), phase }, world);
-  bus.__emitZone(world, zone.entity, other.entity, phase);
-  fire(zone.entity, other.entity, phase);
+  const refs: ZoneRefs = { zone: refOf(zone), other: refOf(other) };
+  emit(journalType, { zone: refs.zone, other: refs.other, phase }, world);
+  bus.__emitZone(world, zone.entity, other.entity, phase, refs);
+  fire(zone.entity, other.entity, phase, refs);
 }
 
 /** Per-world occupancy: which occupants were inside each zone last frame, keeping the zone +

@@ -4,7 +4,7 @@ import { trait } from 'koota';
  *  manager, the 2D twin of `OnZone3D`. Put this on the SAME entity as a `Zone2D`: when a
  *  `ZoneOccupant` entity enters or leaves the zone area, the zone-trigger system dispatches
  *  the named UIAction, passing the OTHER (occupant) entity as `ctx.target` and
- *  `{ self, other, phase }` in `ctx.params`.
+ *  `{ self, other, phase, selfRef, otherRef }` in `ctx.params` — on an exit `other` may be dead, so name it by `otherRef` (#1227).
  *
  *  A zone is a PURE geometric containment test — NO physics colliders or `RigidBody2D` needed.
  *  The dispatch is pipeline-safe (`dispatchGameAction`), so an unwired action name is a warning,

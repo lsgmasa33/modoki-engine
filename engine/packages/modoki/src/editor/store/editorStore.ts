@@ -5,6 +5,8 @@ import { durableGuid } from '../../runtime/core/assetRefRules';
 import { create } from 'zustand';
 import { pushSelectionChange, isExecutingUndoRedo } from '../undo/undoManager';
 import { entityRef, buildGuidIndex, resolveWith, type EntityRef } from '../undo/entityRef';
+import { getCurrentWorld } from '../../runtime/core/ecs/world';
+import { holdEntity, resolveHeld, type HeldEntity } from './heldEntity';
 import { setParticleEffect } from '../../runtime/loaders/particleCache';
 import { setSpriteAnim, type SpriteAnimDef } from '../../runtime/loaders/spriteAnimCache';
 import { setRig2D, type Rig2DFile } from '../../runtime/loaders/rig2dCache';
@@ -586,20 +588,43 @@ export const useEditorStore = create<EditorState>((set, get) => {
   // so selection undo/redo re-resolve to current ids after a world rebuild
   // (Play→Stop) instead of restoring stale numeric ids. Asset selection is
   // path-based and needs no resolution.
-  type SelectionRefs = { primary: EntityRef | null; ids: EntityRef[]; asset: SelectionSnapshot['selectedAsset']; assets: SelectionSnapshot['selectedAssets'] };
+  // Each ref also carries a HOLD of the entity it named (#1221): the guid resolves across a world
+  // rebuild, and the hold is what may stand in for the raw id when it does not.
+  type HeldRef = { ref: EntityRef; held: HeldEntity | null };
+  type SelectionRefs = { primary: HeldRef | null; ids: HeldRef[]; asset: SelectionSnapshot['selectedAsset']; assets: SelectionSnapshot['selectedAssets'] };
+  const capture = (id: number): HeldRef => ({ ref: entityRef(id, false), held: holdEntity(id, getCurrentWorld()) });
   const captureRefs = (snap: SelectionSnapshot): SelectionRefs => ({
-    primary: snap.selectedEntityId != null ? entityRef(snap.selectedEntityId, false) : null,
-    ids: snap.selectedEntityIds.map((id) => entityRef(id, false)),
+    primary: snap.selectedEntityId != null ? capture(snap.selectedEntityId) : null,
+    ids: snap.selectedEntityIds.map(capture),
     asset: snap.selectedAsset,
     assets: snap.selectedAssets,
   });
   const resolveSnap = (r: SelectionRefs): SelectionSnapshot => {
     const idx = buildGuidIndex();
-    // Fall back to the captured raw id when a ref can't be guid-resolved (a
-    // guid-less entity, or no backing world) — preserves the prior raw-id
-    // restore behavior; selectionRestore handles live remap on the next swap.
-    const ids = r.ids.map((ref) => resolveWith(ref, idx) ?? ref.rawId);
-    const primary = r.primary ? (resolveWith(r.primary, idx) ?? r.primary.rawId) : null;
+    // The durable guid first. Failing that, never the bare raw id: it is koota's recycled index, and
+    // falling back to it re-selected whatever took the index of a destroyed selection — the capture
+    // keeps DURABLE guids only, so this reached every runtime spawn (#1221 close-out reviews). The
+    // hold answers instead: the same entity in the same world → its id; gone → nothing.
+    const world = getCurrentWorld();
+    const resolve = (h: HeldRef): number | null => {
+      if (h.ref.guid) {
+        const byGuid = resolveWith(h.ref, idx);
+        if (byGuid !== null) return byGuid;
+      }
+      // ⚠️ Not `resolveWith` for a guid-less ref: it answers the raw id whenever ANY entity lives there.
+      // No hold (it named nothing registered when captured), or a hold from ANOTHER world (undo history
+      // survives a same-scene reload, A→B→A and the prefab-edit round trip): the pre-#1221 rule — a
+      // guid ref that missed is gone, a guid-less ref keeps its raw id. The hold's own number means
+      // nothing in this world, and returning it re-selected a newcomer (final close-out review).
+      if (!h.held || h.held.world !== world) return h.ref.guid ? null : h.ref.rawId;
+      return resolveHeld(h.held, world)?.id ?? null;
+    };
+    const ids = [...new Set(r.ids.map(resolve).filter((id): id is number => id !== null))];
+    const primaryId = r.primary ? resolve(r.primary) : null;
+    // A primary that was captured but is gone falls back to the last remaining member, so it never
+    // points outside the set (selectionRestore's rule). A snapshot captured WITHOUT a primary keeps none.
+    const primary = r.primary === null ? null
+      : primaryId !== null && (ids.includes(primaryId) || ids.length === 0) ? primaryId : (ids[ids.length - 1] ?? null);
     // Asset selection is path-based — no guid resolution needed, just restore verbatim.
     return { selectedEntityId: primary, selectedEntityIds: ids, selectedAsset: r.asset, selectedAssets: r.assets };
   };

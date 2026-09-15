@@ -73,7 +73,7 @@ entity in a new world can too. So a packed-keyed map that nothing sweeps before 
 clears on spawn (`loaders/overrideMarks.ts`, which a prefab rebuild loop drives past 256), and a
 world-swap reset stays load-bearing under a packed key (`games/space-console/runtime/setup.ts`).
 
-**UI state held across user time** — a dialog's subject, the row being renamed, a debug-tree selection —
+**UI state about ONE instance, held across user time** — a dialog's subject, the row being renamed —
 pins its entity with `core/ecs/entityPin.ts`, which records the World object as well as the packed
 value, and drops the pin on a world swap where nothing else re-checks it. A React list keyed by
 entity keys by `uiNodeKey` (`id:generation`, `runtime/ui/uiNodeKey.ts`), or a respawn keeps the dead
@@ -92,11 +92,26 @@ one the engine's way**: `EntityTable`, `packedOf` and `PackedEntity` are exporte
 shape. Component state holding an id (`useState<Set<number>>`) is outside the guard by ruling and stays a
 by-hand review.
 
-⚠️ **A GUID is an address, not a lifetime key.** Refer to an entity by guid wherever the reference must
-survive a reload (scene files, cross-entity refs, agent tools). But do not key per-entity STATE by it:
-`spawnPrefabInstance`'s `guidSeed` re-mints the same guid on every respawn by design (Timeline scrub,
-Entries rows), and an entity without `EntityAttributes` has none, so a guid-keyed cache inherits
-exactly as a bare id does. The guard cannot see a string key; that stays by hand too.
+#### What to hold, decided by what the holder MEANS (#1222, owner decision 2026-09-15)
+
+⚠️ **A GUID is an address, not a lifetime key.** Every place that remembers an entity beyond one loop
+or one frame picks its key from this table:
+
+| The code holds… | Key | Why |
+|---|---|---|
+| **Per-entity state** — lives and dies with ONE entity: a cache, a GPU object, a timer, a warn-once flag | `packedOf` / `EntityTable` / despawn eviction (above) | `spawnPrefabInstance`'s `guidSeed` re-mints the SAME guid on every respawn by design (Timeline scrub, Entries rows), so a guid-keyed cache hands the dead instance's state to its replacement — #868 spelled as a string. An entity without `EntityAttributes` has no guid at all. |
+| **A reference that should follow "the same thing"** — a selection, a collapsed tree node, a cross-entity field, anything that must survive a reload | the **guid**, resolved through `findEntityByGuid` (inside a structure callback, `peekEntityByGuid`) | A seeded respawn IS the same thing to the person looking at it, and a board rebuild's fresh runtime guids are not. An entity with no guid (a `Time`/`Input` singleton) is dropped when it goes. The editor's worked example is `editor/store/heldEntity.ts` ([editor.md](editor.md) § "Inside one world"). |
+| **A reference to THIS instance only** — a dialog's subject, the row being renamed; or a game module's handle that never outlives its world | `entityPin` (below) / a live `Entity` checked with `isPackedAlive` before every use | It must never act on a replacement, seeded or not. Court's roots and board handles are the game-side worked example (`games/court/rendering-notes.md` § "The eighth member dies MID-world", #1224). |
+| **Crosses a boundary** — the journal, an agent reply, undo, a game-facing callback | the **guid, taken while the entity was alive** | A dead handle has nothing left to derive it from: `entityRef(deadHandle)` returns `null` (#1227), and an exit callback reads `otherRef`/`refs` instead ([zones.md](zones.md), [physics-2d.md](physics-2d.md)). |
+| Used inside one loop or one frame, never stored | the id | Owner ruling on #1222. |
+
+The same test flags the held-reference rows too (`HELD_LEDGER`): a declaration typed with koota's `Entity`,
+a module `…Id(s)` number (a variable or an object-literal property) and a `…EntityId(s)` field each need
+`alive-checked:`, `revalidated:`, `brief:` or another tagged reason. Sling's handles are pruned at the top of
+its GAME and LATE_UPDATE ticks (`pruneDeadHandles`, #1222) and Court's
+are checked before use (#1224); Wordweave's `Built` handles are the open `pending: #1243` rows. It cannot see
+a string key, an untyped handle (`let puck = null`) or id array (`movedIds: []`), an id field with another name (`parentId`) or a trait
+default inside `trait({…})`; those stay by hand.
 
 Sites that predate the type and carry the second shape by hand, ledgered as `gen-in-value:` and
 deliberately not converted (each is tested, and converting risks iteration order or purge semantics):
@@ -213,6 +228,16 @@ and entity-ref field takes. It comes in two kinds, and the difference is lifetim
     an equal string does not follow it, so a live entity lookup by guid uses `findEntityByGuid`.
   - `createTestWorld` saves the generation on create and restores it on dispose, so identical harness
     runs mint identical guids.
+- **What a lookup costs** (measured #1222, vitest, n = live entities): a durable hit ~140 ns at 1k and
+  ~195 ns at 10k, a runtime hit ~210–270 ns, a runtime stale miss ~160 ns — against 37–190 ns for
+  `findEntityById`. A **durable stale miss** rescans the world to self-heal a mint site that forgot
+  `indexEntityGuid` (0.13 ms at 1k, 1.6 ms at 10k). ⚠️ It rescans only when koota reported an
+  `EntityAttributes` add or write since the last rescan (or a destroy of one of two live entities
+  sharing a durable guid, or a `world.reset()` — the mechanism is documented at `GuidEpoch` in
+  `core/ecs/world.ts`), so a guid polled every frame after its entity
+  is gone costs one scan, not one per frame — measured: 0 rescans over 20 stepped polls with a system
+  reading `EntityAttributes` each frame, 20 with one that `set`s it each frame. A game that writes
+  `EntityAttributes` every frame therefore reopens the rescan every frame.
 
 Three rules follow:
 - **A runtime guid is never persisted.** Anything that treats a non-empty guid as "this entity

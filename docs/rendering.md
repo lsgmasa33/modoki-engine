@@ -549,7 +549,19 @@ iPad). Raising it means running that case against the new version first.
 
 ⚠️ **Do not quote it as the cost or the benefit of any version on today's code.** The engine now
 generates and disposes the PMREM itself whatever three does, so this table no longer describes a
-three-version difference; today's per-cycle delta has not been re-measured. What r185 did change is
+three-version difference. **Re-measured on today's code, three 0.185.1** (#957, 2026-09-15): the same
+fixture (`games/3d-test`, `tropical-island` ⟷ `empty`) driven in the running editor with
+`modoki.loadScene`, reading `window.__3d.renderer.info.memory` after the counters held still for 2 s.
+
+| after | renderTargets | textures | texturesSize | geometries |
+|---|---|---|---|---|
+| island (priming load) | 2 | 16 | 42.3 MB | 28 |
+| empty, every cycle | 3 | 7 | 2.3 MB | 4 |
+| island, cycles 1–4 | 2 | 16 | 42.3 MB | 29 |
+
+**Zero growth per cycle across four cycles** — the one geometry the first reload adds does not recur.
+(The absolute totals differ from the old table's — the engine and the fixture have both changed since,
+and the cause of the difference was not attributed. Compare per-cycle deltas, not totals.) What r185 did change is
 still true of three itself: `PMREMNode` registers a dispose listener and caches the render TARGET;
 `CubeMapNode` still caches `renderTarget.texture` and disposes the wrong object; and none of it
 touches the WebGL-fallback program leak (#715).

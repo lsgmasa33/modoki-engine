@@ -20,9 +20,9 @@
  *  Inspector metadata — which `registerAllTraits()` gives a plain vitest run.
  *
  *  ⚠️ SCOPE: **engine traits only.** `registerAllTraits()` is all this test can cheaply call, so a
- *  GAME's own trait is invisible here — `games/sling`'s `Enemy.hpBarId` is `runtimeOnly` and is
+ *  GAME's own trait is invisible here — `games/sling`'s `Enemy.hpBarGuid` is `runtimeOnly` and is
  *  registered by `registerSlingSystems()`, which only that game's runtime calls. A save baking
- *  `hpBarId` into one of sling's prefabs passes this guard (checked: it is not on disk today).
+ *  `hpBarGuid` into one of sling's prefabs passes this guard (checked: it is not on disk today).
  *  Registering every game's traits would mean importing game runtimes into an engine test, which
  *  the portability rule is against; the honest fix is knowing the limit, not widening the claim.
  */

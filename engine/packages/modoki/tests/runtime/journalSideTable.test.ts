@@ -17,6 +17,7 @@ afterEach(() => { if (tw) { tw.dispose(); tw = undefined; } });
 function fakeHandle(id: number, opts: { guid?: string; name?: string } = {}) {
   return {
     id: () => id,
+    isAlive: () => true,
     has: (_t: unknown) => true,
     get: (_t: unknown) => ({ guid: opts.guid ?? '', name: opts.name ?? '' }),
   };

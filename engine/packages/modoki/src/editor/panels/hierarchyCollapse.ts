@@ -11,7 +11,10 @@
 
 /** The subset of `EntityInfo` these decisions read. Declared structurally so the module
  *  stays free of the panel's imports and a test can hand it plain objects. */
+import type { World } from 'koota';
 import { durableGuid } from '../../runtime/core/assetRefRules';
+import { holdEntity, resolveHeld, type HeldEntity } from '../store/heldEntity';
+import { findEntityById } from '../../runtime/core/ecs/world';
 
 export type CollapseNode = { id: number; parentId?: number | null; guid?: string };
 
@@ -149,4 +152,103 @@ export function shouldPersistCollapse(
   currentScenePath: string,
 ): boolean {
   return currentScenePath !== '' && owner !== null && owner.world === currentWorld;
+}
+
+// ── Following an entity inside ONE world (#1221) ──────────────────────────────────────────
+// Everything above handles the set across a world swap. Inside a world the ids are koota's recycled
+// index: a collapsed parent that a system destroys and replaces on the same index (a board rebuilt
+// during Play) used to show the NEWCOMER collapsed. So each collapsed id is HELD
+// (`editor/store/heldEntity.ts`) while it is in the set, and the settled refresh re-resolves the
+// holds before it rebuilds the tree: the same entity stays collapsed, a replacement carrying its guid
+// takes its place, and anything else leaves the set.
+//
+// A collapsed entity that is gone but had a guid is PARKED, not forgotten, so a later respawn of that
+// guid comes back collapsed — an undo of a delete, a respawn a frame or more later. Parked guids are
+// also still PERSISTED (`persistableCollapsedGuids`): otherwise a game system destroying a collapsed
+// scene entity during Play would re-save the scene's collapse set without it, and Stop would restore it
+// expanded (#1221 close-out review, both).
+
+export interface CollapseHolds {
+  /** id → hold, for ids in the collapsed set that name a registered entity. */
+  readonly held: ReadonlyMap<number, HeldEntity>;
+  /** Collapsed entities that are gone, waiting for their DURABLE guid to come back. */
+  readonly parked: readonly HeldEntity[];
+}
+
+export const NO_COLLAPSE_HOLDS: CollapseHolds = { held: new Map(), parked: [] };
+
+/** The holds for `collapsed`, recomputed after the set changed (the panel's `[collapsed]` effect).
+ *
+ *  - an id still naming the SAME entity keeps its hold;
+ *  - an id that just entered the set — or whose prior hold names a different entity now (a follow
+ *    landed on an index another collapsed entity used to hold) — is held afresh;
+ *  - a prior hold that LEFT the set because its entity is gone is parked (if it has a guid); one that
+ *    left because the user expanded it is simply forgotten;
+ *  - a parked hold whose entity is back in the set, or from another world, stops being parked. */
+export function holdCollapsed(collapsed: ReadonlySet<number>, prior: CollapseHolds, world: World): CollapseHolds {
+  const held = new Map<number, HeldEntity>();
+  for (const id of collapsed) {
+    const was = prior.held.get(id);
+    const same = was && was.world === world && findEntityById(id, world)?.valueOf() === was.packed;
+    const h = same ? was : holdEntity(id, world);
+    if (h) held.set(id, h);
+  }
+  // Sets, not scans: this runs on every collapse change, and a recursive collapse puts every leaf in
+  // the set — measured at the review, a scan per parked entry cost 384 ms per toggle at 4,000.
+  const heldPacked = new Set<number>();
+  const heldGuids = new Set<string>();
+  for (const h of held.values()) { heldPacked.add(h.packed); if (h.guid) heldGuids.add(h.guid); }
+  const parked: HeldEntity[] = [];
+  const parkedGuids = new Set<string>();
+  const keepParked = (h: HeldEntity) => {
+    // Durable guids only: a runtime guid is never re-issued, so parking one could only ever grow.
+    if (h.world !== world || !durableKey(h.guid) || heldPacked.has(h.packed)) return;
+    if (heldGuids.has(h.guid) || parkedGuids.has(h.guid)) return; // back in the set, or parked already
+    parkedGuids.add(h.guid);
+    parked.push(h.id === null ? h : { ...h, id: null });
+  };
+  for (const [id, was] of prior.held) {
+    if (collapsed.has(id)) continue;
+    const alive = findEntityById(id, world)?.valueOf() === was.packed;
+    if (!alive) keepParked(was); // gone, not expanded
+  }
+  for (const h of prior.parked) keepParked(h);
+  return { held, parked };
+}
+
+/** Re-resolve every held collapsed id, and every parked one, in `world`: the new set, or null when
+ *  nothing moved. An id that was never held passes through untouched. PURE — the panel re-takes the
+ *  holds for the result through {@link holdCollapsed}. ⚠️ It used to hand back the new holds for the
+ *  panel to store from inside a `setCollapsed` updater; React runs an updater twice in development and
+ *  keeps the SECOND result, which then saw the dropped id as never-held and passed it straight back —
+ *  the newcomer stayed collapsed in the running editor with every unit test green (#1221, live check).
+ *
+ *  Runs from the panel's settled refresh, outside any structure change, so it may rescan for a guid
+ *  written without `indexEntityGuid`. */
+export function reconcileCollapsed(collapsed: ReadonlySet<number>, holds: CollapseHolds, world: World): Set<number> | null {
+  let moved = false;
+  const next = new Set<number>();
+  for (const id of collapsed) {
+    const h = holds.held.get(id);
+    if (!h) { next.add(id); continue; }
+    const r = resolveHeld(h, world, { rescan: true });
+    if (r === h) { next.add(id); continue; }
+    moved = true;
+    if (r && r.id !== null) next.add(r.id);
+  }
+  for (const h of holds.parked) {
+    const r = resolveHeld(h, world, { rescan: true });
+    if (r && r.id !== null && !next.has(r.id)) { next.add(r.id); moved = true; }
+  }
+  return moved ? next : null;
+}
+
+/** The guids to persist for this scene: the collapsed ids' durable guids plus every parked one's. */
+export function persistableCollapsedGuids(flat: readonly CollapseNode[], collapsed: ReadonlySet<number>, holds: CollapseHolds): string[] {
+  const out = collapsedIdsToGuids(flat, collapsed);
+  for (const h of holds.parked) {
+    const g = durableKey(h.guid);
+    if (g && !out.includes(g)) out.push(g);
+  }
+  return out;
 }

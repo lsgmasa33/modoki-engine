@@ -9,7 +9,7 @@
 
 import type { GameDefinition } from '@modoki/engine/runtime';
 import type { Entity } from 'koota';
-import { registerUIAction, unregisterUIAction, refuseAction, Renderable3DPrimitive, entityRef, onWorldSwap, packedOf, type PackedEntity } from '@modoki/engine/runtime';
+import { registerUIAction, unregisterUIAction, refuseAction, Renderable3DPrimitive, onWorldSwap, packedOf, type PackedEntity } from '@modoki/engine/runtime';
 
 // Occupied tints. The IDLE colours are NOT here — they are authored on each station's
 // Renderable3DPrimitive in the scene, and `tintOnEnter`/`restoreOnExit` below put back
@@ -98,18 +98,19 @@ export const game: GameDefinition = {
     // ctx.target is the body that entered/left. We tint the zone + log to the journal
     // so the reaction is verifiable by data (modoki_journal), not just by eye.
     registerUIAction('sensorZone3D/enter', (ctx) => {
-      const { self, other } = (ctx.params ?? {}) as { self?: Entity; other?: Entity };
+      const { self, other, otherRef } = (ctx.params ?? {}) as { self?: Entity; other?: Entity; otherRef?: string | number };
       if (typeof self !== 'number') return noSelf('sensorZone3D/enter');
       tintOnEnter(self, other, HOT_COLOR);
-      // ctx.emit binds the world; entityRef() converts the body to its stable GUID
-      // (id() would churn across hot-reloads). Verifiable via modoki_journal.
-      ctx.emit('zone', { phase: 'enter', body: other ? entityRef(other) : undefined });
+      // ctx.emit binds the world; `otherRef` is the body's stable GUID, taken by the engine while
+      // the body was alive. Never `entityRef(other)` here: on an exit the body may be despawned
+      // and its index reused, so its handle can no longer name it (#1227). Verify via modoki_journal.
+      ctx.emit('zone', { phase: 'enter', body: otherRef });
     });
     registerUIAction('sensorZone3D/exit', (ctx) => {
-      const { self, other } = (ctx.params ?? {}) as { self?: Entity; other?: Entity };
+      const { self, other, otherRef } = (ctx.params ?? {}) as { self?: Entity; other?: Entity; otherRef?: string | number };
       if (typeof self !== 'number') return noSelf('sensorZone3D/exit');
       restoreOnExit(self, other, BASE_COLOR_FALLBACK);
-      ctx.emit('zone', { phase: 'exit', body: other ? entityRef(other) : undefined });
+      ctx.emit('zone', { phase: 'exit', body: otherRef });
     });
 
     // The physics-free twin. The Trigger Zone entity carries NO RigidBody3D and NO
@@ -122,16 +123,16 @@ export const game: GameDefinition = {
     // own `@zone` event for every crossing — this one is the game's reaction, not the
     // engine's record.)
     registerUIAction('triggerZone3D/enter', (ctx) => {
-      const { self, other } = (ctx.params ?? {}) as { self?: Entity; other?: Entity };
+      const { self, other, otherRef } = (ctx.params ?? {}) as { self?: Entity; other?: Entity; otherRef?: string | number };
       if (typeof self !== 'number') return noSelf('triggerZone3D/enter');
       tintOnEnter(self, other, ZONE_HOT_COLOR);
-      ctx.emit('zoneTrigger', { phase: 'enter', body: other ? entityRef(other) : undefined });
+      ctx.emit('zoneTrigger', { phase: 'enter', body: otherRef });
     });
     registerUIAction('triggerZone3D/exit', (ctx) => {
-      const { self, other } = (ctx.params ?? {}) as { self?: Entity; other?: Entity };
+      const { self, other, otherRef } = (ctx.params ?? {}) as { self?: Entity; other?: Entity; otherRef?: string | number };
       if (typeof self !== 'number') return noSelf('triggerZone3D/exit');
       restoreOnExit(self, other, ZONE_BASE_COLOR_FALLBACK);
-      ctx.emit('zoneTrigger', { phase: 'exit', body: other ? entityRef(other) : undefined });
+      ctx.emit('zoneTrigger', { phase: 'exit', body: otherRef });
     });
   },
   unregisterSystems: () => {
