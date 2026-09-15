@@ -42,6 +42,10 @@ export type SceneOpsLiveReply = {
   created?: Array<{ op: number; id: number; guid: string; name: string }>;
   /** Traits added because a setTrait set fields on an entity that lacked them (#1216 C-12). */
   addedTraits?: Array<{ op: number; id: number; guid: string | null; trait: string }>;
+  /** The descendants the call's removeEntity ops took with the entities they named (#1262). */
+  alsoDeleted?: string[];
+  alsoDeletedNoGuidIds?: number[];
+  alsoDeletedTotal?: number;
   code?: ErrorCode;
   /** The first failure's real choices (an ambiguous name's guids, the guid to use for an id). */
   options?: string[];
@@ -89,6 +93,9 @@ export function decodeSceneOpsReply(raw: unknown): SceneOpsOutcome {
       unresolved: o.unresolved as EntityRef[],
       ...(Array.isArray(o.created) ? { created: o.created as SceneOpsLiveReply['created'] } : {}),
       ...(Array.isArray(o.addedTraits) ? { addedTraits: o.addedTraits as SceneOpsLiveReply['addedTraits'] } : {}),
+      ...(isStringArray(o.alsoDeleted) ? { alsoDeleted: o.alsoDeleted } : {}),
+      ...(Array.isArray(o.alsoDeletedNoGuidIds) ? { alsoDeletedNoGuidIds: o.alsoDeletedNoGuidIds as number[] } : {}),
+      ...(typeof o.alsoDeletedTotal === 'number' ? { alsoDeletedTotal: o.alsoDeletedTotal } : {}),
       ...(typeof o.code === 'string' ? { code: o.code as ErrorCode } : {}),
       ...(isStringArray(o.options) ? { options: o.options } : {}),
       ...(typeof o.stale === 'string' ? { stale: o.stale } : {}),

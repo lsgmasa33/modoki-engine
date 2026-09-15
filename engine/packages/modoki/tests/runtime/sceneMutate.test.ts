@@ -2,7 +2,7 @@
  *  scene shape. Deterministic GUID minting injected. Pure, no world. */
 
 import { describe, it, expect } from 'vitest';
-import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, type MutableScene, type MutateOp } from '../../src/runtime/scene/sceneMutate';
+import { applyOps, assignSyntheticEntityIds, stripBackfilledEntityIds, ALSO_DELETED_CAP, type MutableScene, type MutateOp } from '../../src/runtime/scene/sceneMutate';
 import { validateSceneData, type SceneSchema } from '../../src/runtime/loaders/sceneValidation';
 import { formatRuntimeGuid } from '../../src/runtime/core/assetRefRules';
 
@@ -295,8 +295,38 @@ describe('applyOps — removeEntity', () => {
 
   it('removes only the leaf when it has no children', () => {
     const scene = freshScene();
-    applyOps(scene, [{ op: 'removeEntity', entity: { name: 'Child' } }], mint);
+    const res = applyOps(scene, [{ op: 'removeEntity', entity: { name: 'Child' } }], mint);
     expect(scene.entities.map((e) => e.id)).toEqual([1]);
+    expect(res).not.toHaveProperty('alsoDeleted'); // nothing cascaded, so no field at all
+  });
+
+  // #1262: `changed:1` was the whole answer, so a parent's remove took its subtree without a word.
+  // Mutation: drop the `alsoDeleted.add(...)` call, or the `...alsoDeleted.fields()` spread.
+  it('names the descendants the remove took, parents first, and not the entity it named', () => {
+    const scene = freshScene();
+    scene.entities.push({ id: 3, name: 'GC', traits: { EntityAttributes: { name: 'GC', guid: 'g-gc', parentId: 2 } } });
+    const res = applyOps(scene, [{ op: 'removeEntity', entity: { name: 'Root' } }], mint);
+    expect(res.alsoDeleted).toEqual(['g-child', 'g-gc']);
+    expect(res).not.toHaveProperty('alsoDeletedTotal');
+    expect(res).not.toHaveProperty('alsoDeletedNoGuidIds');
+  });
+
+  it('lists across every remove in the call, a guid-less descendant by id, and counts past the cap', () => {
+    const scene: MutableScene = { version: 8, entities: [
+      { id: 1, name: 'A', traits: { EntityAttributes: { name: 'A', guid: 'g-a', parentId: 0 } } },
+      { id: 2, name: 'A1', traits: { EntityAttributes: { name: 'A1', parentId: 1 } } },
+      { id: 3, name: 'B', traits: { EntityAttributes: { name: 'B', guid: 'g-b', parentId: 0 } } },
+    ] };
+    const n = ALSO_DELETED_CAP + 2;
+    for (let i = 0; i < n; i++) scene.entities.push({ id: 10 + i, name: `k${i}`, traits: { EntityAttributes: { name: `k${i}`, guid: `g-k${i}`, parentId: 3 } } });
+    const res = applyOps(scene, [
+      { op: 'removeEntity', entity: { name: 'A' } },
+      { op: 'removeEntity', entity: { name: 'B' } },
+    ], mint);
+    expect(res.alsoDeletedNoGuidIds).toEqual([2]);
+    expect(res.alsoDeleted).toHaveLength(ALSO_DELETED_CAP - 1); // the cap counts both lists
+    expect(res.alsoDeleted!.every((g) => g.startsWith('g-k'))).toBe(true);
+    expect(res.alsoDeletedTotal).toBe(n + 1);
   });
 
   // F5 — dangling entity-ref warning.
@@ -705,6 +735,18 @@ describe('applyOps — runtime guids never reach the file (#1210)', () => {
     ], mint);
     expect(res.changed).toBe(0);
     expect(res.addedTraits).toBeUndefined();
+  });
+
+  // #1262: nor a cascade, since nothing left the file. Mutation: drop the tally reset from the tripwire.
+  it('a refused write reports nothing also deleted', () => {
+    const scene = freshScene();
+    scene.entities.push({ id: 3, name: 'Other', traits: { EntityAttributes: { name: 'Other', guid: 'g-other', parentId: 0 } } });
+    const res = applyOps(scene, [
+      { op: 'removeEntity', entity: { name: 'Root' } },
+      { op: 'setTrait', entity: { name: 'Other' }, trait: 'UIAction', fields: { bindings: [{ target: rg }] } },
+    ], mint);
+    expect(res.changed).toBe(0);
+    expect(res).not.toHaveProperty('alsoDeleted');
   });
 
   it('a refused write reports no created entity — none was written', () => {

@@ -1659,7 +1659,15 @@ tool.
   tables by `vocabularyEnumParity.test.ts`. `modoki_create_entity` offers `environment` now.
 - **Both `delete_entities` name what the cascade took** (C-6). They answered only the entities they
   were given, so deleting a parent removed its children without a word. `alsoDeleted` lists those
-  descendants' guids (the first 100, with `alsoDeletedTotal` past that).
+  descendants' guids (the first 100, with `alsoDeletedTotal` past that). **`modoki_mutate_scene`'s
+  `removeEntity` gained the same fields in #1262**, on both its live and file-direct backends: it
+  removed the subtree too and answered `changed:1`. The list is one flat list for the whole call, not
+  one row per op, so it reads exactly like `delete_entities`; the caller already knows which entities it
+  named. One builder (`alsoDeletedTally`, `sceneMutate.ts`) shapes all four replies. ⚠️ The file-direct
+  backend lists only what is authored in the file: a prefab instance there is one row, so removing it
+  lists none of its members, while the live backend lists every expanded member. Its members are gone
+  either way. A partly failed call (`ok:false`) still carries these receipts, and the tool gives that
+  body the full payload budget rather than the envelope's 8k `got`, which elided them.
 - **`device_handles` matches `modoki_handles`** (C-14). It gained `prefix` and `label`, and `ids`
   takes a list or a comma-separated string on both. The device tool also returns the counts-only bare
   call and the filter-miss naming its own description promised. That shaping lived only in the

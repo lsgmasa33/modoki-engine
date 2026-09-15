@@ -92,6 +92,11 @@ export interface ApplyResult {
    *  ⚠️ Only for an entity whose own `traits` are written: a prefab-instance root writes an override,
    *  and whether the PREFAB carries the trait is not visible from this file. */
   addedTraits?: Array<{ op: number; id: number; guid: string | undefined; trait: string }>;
+  /** The descendants every `removeEntity` op took with the entity it named, for the whole call — see
+   *  {@link AlsoDeletedFields}. Absent when no remove cascaded. */
+  alsoDeleted?: string[];
+  alsoDeletedNoGuidIds?: number[];
+  alsoDeletedTotal?: number;
   /** Hard errors (entity not found, malformed op). Non-empty means some ops
    *  were skipped — the caller decides whether to still write. */
   errors: string[];
@@ -105,6 +110,45 @@ export interface ApplyResult {
   code?: EntityResolveCode;
 }
 
+/** How many cascaded descendants a delete reply names before it only counts them. */
+export const ALSO_DELETED_CAP = 100;
+
+/** What a delete took WITH the entities it was asked for (#1216 C-6, #1262), as reply fields: `alsoDeleted`
+ *  (guids) + `alsoDeletedNoGuidIds`, and `alsoDeletedTotal` when more than the cap were taken. All absent
+ *  when nothing cascaded. Every delete surface removes a whole subtree and used to answer only with what
+ *  it was named, so a parent's delete removed its children without a word. Capped because the list is
+ *  unbounded (a scene root's subtree is the scene) and an over-budget reply is elided whole. */
+export interface AlsoDeletedFields { alsoDeleted?: string[]; alsoDeletedNoGuidIds?: number[]; alsoDeletedTotal?: number }
+
+/** Builds {@link AlsoDeletedFields} across one or more deletes — the ONE shape every delete reply uses
+ *  (`delete_entities` on both surfaces, both `removeEntity` backends). `room()` is how many more ids
+ *  would still be listed, so a caller that must mint a guid before naming an entity mints only those. */
+export function alsoDeletedTally() {
+  const guids: string[] = [];
+  const noGuidIds: number[] = [];
+  let total = 0;
+  const room = () => Math.max(0, ALSO_DELETED_CAP - guids.length - noGuidIds.length);
+  return {
+    room,
+    /** Read the guids BEFORE the delete: afterwards a live descendant has none to read. */
+    add(descendants: readonly number[], guidOf: (id: number) => string | null | undefined) {
+      for (const id of descendants.slice(0, room())) {
+        const g = guidOf(id);
+        if (g) guids.push(g); else noGuidIds.push(id);
+      }
+      total += descendants.length;
+    },
+    fields(): AlsoDeletedFields {
+      if (!total) return {};
+      return {
+        alsoDeleted: [...guids],
+        ...(noGuidIds.length ? { alsoDeletedNoGuidIds: [...noGuidIds] } : {}),
+        ...(total > guids.length + noGuidIds.length ? { alsoDeletedTotal: total } : {}),
+      };
+    },
+  };
+}
+
 /** Apply a list of mutation ops to a scene object. Mutates `scene` in place and
  *  also returns it. `mint` is injectable so tests get deterministic ids. */
 export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => string = newGuid): ApplyResult {
@@ -113,6 +157,7 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
   const unresolved: EntityRef[] = [];
   const created: Array<{ op: number; id: number; guid: string; name: string }> = [];
   const addedTraits: NonNullable<ApplyResult['addedTraits']> = [];
+  let alsoDeleted = alsoDeletedTally();
   let changed = 0;
   // FIRST resolveEntity failure's code, if any op hit one — see `ApplyResult.code`.
   const codeOut: { code?: EntityResolveCode } = {};
@@ -225,11 +270,16 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
         // Collect the removed guids BEFORE filtering so we can flag any surviving
         // entity that still references the deleted subtree (a now-dangling ref). (F5)
         const removedGuids = new Set<string>();
+        const byId = new Map<number, MutableEntity>();
         for (const e of scene.entities) {
           if (!toRemove.has(e.id)) continue;
+          byId.set(e.id, e);
           const g = entityGuid(e);
           if (g) removedGuids.add(g);
         }
+        // The subtree, not just the named entity, leaves the file — name the rest (#1262). The Set is in
+        // walk order, root first, so a parent is listed before its children.
+        alsoDeleted.add([...toRemove].filter((id) => id !== entity.id), (id) => entityGuid(byId.get(id)!));
         scene.entities = scene.entities.filter((e) => !toRemove.has(e.id));
         if (removedGuids.size) flagDanglingRefs(scene, removedGuids, warnings, where);
         changed++;
@@ -267,9 +317,10 @@ export function applyOps(scene: MutableScene, ops: MutateOp[], mint: () => strin
     changed = 0;
     created.length = 0; // nothing is written, so nothing was created
     addedTraits.length = 0; // …and no trait was added to anything
+    alsoDeleted = alsoDeletedTally(); // …or removed from the file
   }
 
-  return { scene, changed, errors, warnings, unresolved, ...(created.length ? { created } : {}), ...(addedTraits.length ? { addedTraits } : {}), ...(codeOut.code ? { code: codeOut.code } : {}) };
+  return { scene, changed, errors, warnings, unresolved, ...(created.length ? { created } : {}), ...(addedTraits.length ? { addedTraits } : {}), ...alsoDeleted.fields(), ...(codeOut.code ? { code: codeOut.code } : {}) };
 }
 
 /** Scan surviving entities for entity-ref fields that still point at a removed guid.

@@ -15,6 +15,7 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { createWorld, trait } from 'koota';
+import { collectSubtreeIds } from '../../src/runtime/core/ecs/subtreeCollect';
 
 const Transform = trait({ x: 0, y: 0, z: 0 });
 const EntityAttributes = trait({ name: '' as string, parentId: 0, guid: '' as string, sortOrder: 0 });
@@ -32,13 +33,23 @@ const TRAITS = [
 let editorWorld: ReturnType<typeof createWorld>;
 const index = new Map<number, any>();
 const traitNamesOf = (e: any) => TRAITS.filter((t) => e.has(t.trait)).map((t) => t.name);
+/** name → ECS id at spawn, so a test can state the id collision it depends on. */
+const spawnLog = new Map<string, number>();
 
 vi.mock('../../src/runtime/core/ecs/world', () => ({
   getCurrentWorld: () => editorWorld,
   registerEntity: (e: any) => index.set(e.id(), e),
-  spawnEntity: (world: any, ...traits: any[]) => { const e = world.spawn(...traits); index.set(e.id(), e); return e; },
+  spawnEntity: (world: any, ...traits: any[]) => {
+    const e = world.spawn(...traits);
+    index.set(e.id(), e);
+    if (e.has(EntityAttributes)) spawnLog.set(e.get(EntityAttributes).name, e.id());
+    return e;
+  },
   unregisterEntity: (e: any) => index.delete(e.id()),
   destroyEntity: (e: any) => { ((e: any) => index.delete(e.id()))(e); e.destroy(); },
+  indexEntityGuid: vi.fn(),
+  findEntityById: (id: number) => index.get(id),
+  findEntityByGuid: vi.fn(),
 }));
 vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
   getAllEntities: () => {
@@ -51,18 +62,11 @@ vi.mock('../../src/runtime/core/ecs/entityUtils', () => ({
   },
   findEntity: (id: number) => index.get(id),
   markStructureDirty: vi.fn(),
-  // Cascade like the real deleteEntities (delete the subtree under each id).
+  // The real deleteEntities' walk (collectSubtreeIds) over the editor world, minus the dirty listeners.
   deleteEntities: (ids: number[]) => {
-    const toDelete = new Set<number>();
-    const visit = (id: number) => {
-      if (toDelete.has(id)) return;
-      toDelete.add(id);
-      editorWorld.query(EntityAttributes).updateEach(([ea], e) => {
-        if ((ea as any).parentId === id) visit(e.id());
-      });
-    };
-    for (const id of ids) visit(id);
-    for (const id of toDelete) { const e = index.get(id); if (e) { e.destroy(); index.delete(id); } }
+    const links: [number, number][] = [];
+    editorWorld.query(EntityAttributes).updateEach(([ea], e) => { links.push([e.id(), (ea as any).parentId]); });
+    for (const id of collectSubtreeIds(links, ids)) { const e = index.get(id); if (e) { e.destroy(); index.delete(id); } }
   },
   readTraitData: vi.fn(),
   // Mirrors the real readTraitDataFull: the keys a trait PERSISTS — its koota
@@ -236,4 +240,104 @@ describe('editor↔runtime structural-apply parity (F7 — shared applyStructure
       expect(runtimeShape).toEqual(editorShape);
     });
   }
+});
+
+// ── #1247: a removal that reaches a nested instance, through BOTH real instantiators ──────────────────────
+//
+// The fixtures above hand-build an instance; these run the instantiators themselves, because the defect is
+// in the window between their two passes: a nested row's structure apply runs while the outer rows spawned
+// so far wait for their parent remap. Each case asserts a LITERAL tree on both sides, not only parity — the
+// two sides once agreed on a wrong tree.
+
+const CHILD = 'child-prefab';
+const childPrefab = {
+  id: CHILD, version: 1 as const, name: 'Child', rootLocalId: 1,
+  entities: [
+    { localId: 1, traits: { EntityAttributes: { name: 'CRoot', parentId: 0, guid: '' } } },
+    { localId: 2, traits: { EntityAttributes: { name: 'CMember', parentId: 1, guid: '' } } },
+  ],
+};
+
+type Row = { localId: number; traits: Record<string, unknown>; prefab?: string; removed?: number[] };
+const row = (localId: number, name: string, parentId: number, extra: Partial<Row> = {}): Row =>
+  ({ localId, traits: { EntityAttributes: { name, parentId, guid: '' } }, ...extra });
+const outerOf = (...entities: Row[]) => ({ id: 'outer-prefab', version: 1 as const, name: 'Outer', rootLocalId: 1, entities });
+
+/** name → parent name, over every live entity. A parent id naming no live entity reads `<gone:id>`. */
+function parents(world: ReturnType<typeof createWorld>): Record<string, string> {
+  const byId = new Map<number, any>();
+  for (const e of world.entities as any) if (e.has(EntityAttributes)) byId.set(e.id(), e);
+  const out: Record<string, string> = {};
+  for (const e of byId.values()) {
+    const { name, parentId } = e.get(EntityAttributes);
+    out[name] = parentId === 0 ? '<root>' : byId.has(parentId) ? byId.get(parentId).get(EntityAttributes).name : `<gone:${parentId}>`;
+  }
+  return out;
+}
+
+/** Run one outer prefab (+ an optional instance-level structure) through the editor, then the runtime, each
+ *  in a fresh world prepared by `prepare`. Returns each side's tree and spawn log. */
+async function throughBoth(outer: ReturnType<typeof outerOf>, structure: any, prepare: (w: ReturnType<typeof createWorld>) => void = () => {}) {
+  const editor = await getEditor();
+  const runtime = await getRuntime();
+  const meshCache = await import('../../src/runtime/loaders/meshTemplateCache');
+  vi.mocked(meshCache.getCachedPrefab).mockImplementation(((ref: string) => (ref === CHILD ? childPrefab : null)) as never);
+  editor.setPrefabCache(CHILD, childPrefab as never);
+
+  editorWorld = createWorld(); index.clear(); prepare(editorWorld); spawnLog.clear();
+  const rootId = editor.instantiatePrefab(outer as never, 0);
+  if (structure) editor.applyStructureByRootInstance(rootId, outer as never, structure);
+  const editorSide = { tree: parents(editorWorld), log: new Map(spawnLog) };
+
+  const world = createWorld(); index.clear(); prepare(world); spawnLog.clear();
+  runtime.instantiatePrefabIntoWorld(world, outer as never, 0, undefined, 'outer-prefab', undefined, structure);
+  const runtimeSide = { tree: parents(world), log: new Map(spawnLog) };
+  // koota caps a process at 16 live worlds and this file creates one per F7 case too — free these, or the
+  // next case added here fails at createWorld for a reason unrelated to what it tests.
+  editorWorld.destroy(); world.destroy();
+  return { editorSide, runtimeSide };
+}
+
+describe('#1247 — a removal reaching a nested instance (editor + runtime instantiators)', () => {
+  beforeEach(() => { index.clear(); spawnLog.clear(); });
+
+  // Mutation: restore the runtime's exact-ids delete (no cascade) — the runtime side keeps CMember under
+  // `<gone:…>`. The editor side cascaded before the fix too, so it is the parity guard here.
+  it('removing the outer member above a nested row takes the nested instance\'s members too', async () => {
+    const outer = outerOf(row(1, 'Root', 0), row(2, 'Wing', 1), row(3, 'FlameRow', 2, { prefab: CHILD }));
+    const { editorSide, runtimeSide } = await throughBoth(outer, { removed: [2] });
+    expect(runtimeSide.tree).toEqual({ Root: '<root>' });
+    expect(editorSide.tree).toEqual({ Root: '<root>' });
+  });
+
+  // Probe A from the issue. Mutation: spawn the first pass with the file's raw parentId (either side) — B's
+  // raw parent 5 names CMember while the nested row's removal cascades, so B is destroyed on that side.
+  it('a nested row\'s own removal does not take an outer row whose raw file parent collides with the removed id', async () => {
+    const outer = outerOf(
+      row(1, 'Root', 0), row(5, 'A', 1), row(90, 'B', 5),
+      row(91, 'NestRow', 1, { prefab: CHILD, removed: [2] }),
+    );
+    const { editorSide, runtimeSide } = await throughBoth(outer, undefined);
+    for (const side of [editorSide, runtimeSide]) {
+      expect(side.log.get('CMember'), 'premise: the removed member holds B\'s raw file parent number').toBe(5);
+      expect(side.tree).toEqual({ Root: '<root>', A: 'Root', B: 'A', CRoot: 'Root' });
+    }
+  });
+
+  // Probe B: the same collision on a RECYCLED index, with the most common shape (an outer member whose file
+  // parent is 1). Mutation: as above.
+  it('holds when the removed member reclaims a freed index equal to an outer row\'s raw parent', async () => {
+    const outer = outerOf(row(1, 'Root', 0), row(2, 'A', 1), row(3, 'NestRow', 1, { prefab: CHILD, removed: [2] }));
+    // Free four indices so the instantiation's four spawns reclaim them; destroy order picks which lands on 1.
+    const prepare = (w: ReturnType<typeof createWorld>) => {
+      const fillers = [0, 1, 2, 3].map(() => w.spawn(EntityAttributes({ name: '', parentId: 0 })));
+      const byId = new Map(fillers.map((f) => [f.id(), f]));
+      for (const id of [...byId.keys()].sort((a, b) => a - b)) byId.get(id)!.destroy();
+    };
+    const { editorSide, runtimeSide } = await throughBoth(outer, undefined, prepare);
+    for (const side of [editorSide, runtimeSide]) {
+      expect(side.log.get('CMember'), 'premise: the removed member reclaimed index 1').toBe(1);
+      expect(side.tree).toEqual({ Root: '<root>', A: 'Root', CRoot: 'Root' });
+    }
+  });
 });

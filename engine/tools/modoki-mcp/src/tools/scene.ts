@@ -8,7 +8,7 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
-import { type ToolResult } from '../result.js';
+import { type ToolResult, MAX_PAYLOAD_CHARS } from '../result.js';
 import { summarizeAssets, summarizeTraits, type AssetEntry, type TraitSchema } from '../summarize.js';
 import { mutateOpSchema, precisionParam, unsavedForceParam } from '../shapes.js';
 import { describeShape } from '../../../shared/mcpResult.js';
@@ -113,7 +113,9 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
       '(echoing the whole file on every edit cost ~10k tokens for data nobody read). An addEntity op ' +
       'also reports `created:[{op, id, guid, name}]`, so you address what you just made by GUID ' +
       'instead of re-finding it by name (which is refused when the name is ambiguous). A setTrait with ' +
-      'fields on a trait the entity does not have ADDS the trait, and says so in `addedTraits:[{op, id, guid, trait}]`. After ' +
+      'fields on a trait the entity does not have ADDS the trait, and says so in `addedTraits:[{op, id, guid, trait}]`. A removeEntity removes the whole ' +
+      'subtree, and `alsoDeleted` lists the descendants the call took with the entities it named (as modoki_delete_entities does; ' +
+      'on the file-direct path, only entities authored in the file — never a prefab instance\'s members). After ' +
       'mutating, verify with modoki_get_scene_state, which reads the running engine. ' +
       'PERSISTENCE (mcp-persistence.md): when the editor has this exact scene open, the ' +
       'whole call applies to the LIVE world as ONE undoable step (a human can Cmd-Z it) and stays ' +
@@ -144,8 +146,12 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
       // editor-state probe PLUS a 30s live apply, so an MCP timeout of 30s could fire while the
       // edit was still succeeding — reporting "the backend did not respond in time" for a change
       // that LANDED. A client deadline must exceed the server budget it is waiting on.
+      // A partly failed call answers ok:false AND carries the receipts of the ops that applied (`created`,
+      // `alsoDeleted` — up to ~4k of guids, #1262). The default 8k `got` elided them into a shape preview,
+      // so a mistyped third op cost the agent the guid of the entity its first op made.
       return postJson('/api/scene-mutate', { path: resolved, ops }, 45_000,
-        `apply ${ops.length} scene op(s) (${[...new Set(ops.map((o) => o.op))].join(', ')}) to ${resolved}`);
+        `apply ${ops.length} scene op(s) (${[...new Set(ops.map((o) => o.op))].join(', ')}) to ${resolved}`,
+        { gotBudget: MAX_PAYLOAD_CHARS });
     },
   );
 

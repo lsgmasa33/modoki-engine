@@ -259,7 +259,8 @@ legitimate exception: it *measures* a path).
   the `handles` meta or the pose ops' root guids, which need the panels. The editor `delete_entities`
   mints a durable guid on every listed entity BEFORE naming it, so each guid in `deleted` resolves after
   undo, and the `!delete` journal event names the same guids for the roots (it lists roots only). It
-  mints the descendants it names in `alsoDeleted` the same way (#1216 C-6).
+  mints the descendants it names in `alsoDeleted` the same way (#1216 C-6), and so does the live
+  `mutate_scene` `removeEntity` (#1262).
 - **A reply reports `guid: null` for an entity that has no guid. It never reports `String(id)`**
   (#1199). Since #1248 no spawn produces one; only an entity whose EntityAttributes was removed after
   spawn has no guid. The id in `guid` looked addressable, and every guid-addressed op refused it. A
@@ -1106,4 +1107,6 @@ deliberate, with its reason.
 passes through** (an editor route, a tool's switch, an op wrapper), so the other surface skipped it.
 Most of the fixes moved that shaping into `tools/shared/` or into the op itself. `addedTraits` needed
 the field added at each of the four places a reply is rebuilt field by field (the op wrapper, the
-relay decoder, and the route's live and file branches); dropping it at any one loses it.
+relay decoder, and the route's live and file branches); dropping it at any one loses it. `alsoDeleted`
+on `mutate_scene`'s `removeEntity` (#1262) went through the same four places, and
+`persistenceRouter.test.ts` pins the decoder and both route branches, `deleteCascadeReport.test.ts` the op wrapper.

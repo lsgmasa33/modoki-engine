@@ -25,7 +25,7 @@
  *
  *  Pure over the current world: no DOM, no editor store, so the device bridge imports it as-is. */
 
-import { findEntityById, findEntityByGuid, guidOfEntityId, getAllEntities, getTraitByName, readTraitData, classifyRuntimeGuidMiss, type RuntimeGuidStale } from '@modoki/engine/runtime';
+import { findEntityById, findEntityByGuid, guidOfEntityId, getAllEntities, getTraitByName, readTraitData, classifyRuntimeGuidMiss, type RuntimeGuidStale, ALSO_DELETED_CAP, alsoDeletedTally, type AlsoDeletedFields } from '@modoki/engine/runtime';
 import type { ErrorCode } from '../../tools/shared/mcpResult';
 
 export interface EntityAddress { guid?: string | null; name?: string | null; id?: number | null }
@@ -177,21 +177,15 @@ export function descendantsOf(roots: readonly number[]): number[] {
   return out;
 }
 
-/** How many cascaded descendants a delete reply names before it only counts them. */
-export const ALSO_DELETED_CAP = 100;
+export { ALSO_DELETED_CAP };
 
-/** What a delete took WITH the entities it was asked for (#1216 C-6), as reply fields: `alsoDeleted`
- *  (guids) + `alsoDeletedNoGuidIds`, and `alsoDeletedTotal` when more than the cap were taken. Absent
- *  when the delete cascaded to nothing. Both delete-entities ops answered only the entities they were
- *  named, so a parent's delete removed its whole subtree without a word. Capped because the list is
- *  unbounded (a scene root's subtree is the scene) and an over-budget reply is elided whole — which
- *  would hide `deleted` too. Call it BEFORE deleting: afterwards the descendants have no guid to read. */
-export function alsoDeletedFields(descendants: readonly number[], guidOf?: (id: number) => string | null) {
-  if (!descendants.length) return {};
-  return {
-    ...guidListFields('alsoDeleted', descendants.slice(0, ALSO_DELETED_CAP), guidOf),
-    ...(descendants.length > ALSO_DELETED_CAP ? { alsoDeletedTotal: descendants.length } : {}),
-  };
+/** What a delete took WITH the entities it was asked for (#1216 C-6), in the shape every delete reply
+ *  uses (`alsoDeletedTally`, sceneMutate.ts) — an over-budget reply is elided whole, which would hide
+ *  `deleted` too, hence the cap. Call it BEFORE deleting: afterwards the descendants have no guid to read. */
+export function alsoDeletedFields(descendants: readonly number[], guidOf: (id: number) => string | null = guidOfEntityId): AlsoDeletedFields {
+  const tally = alsoDeletedTally();
+  tally.add(descendants, guidOf);
+  return tally.fields();
 }
 
 /** An id list as reply fields: `{ [key]: guids }`, plus `{ [key + 'NoGuidIds']: ids }` when any entity has no guid. */

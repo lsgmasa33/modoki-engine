@@ -424,6 +424,45 @@ describe('Phase 2b: scene-mutate goes LIVE when a renderer is connected on the m
     expect(fileBody.addedTraits, 'the file branch dropped addedTraits').toEqual([{ op: 0, id: 1, guid: 'g-box', trait: 'Renderable3DPrimitive' }]);
   });
 
+  // #1262: `alsoDeleted` rides the same four places. Mutation: drop any one of the three spreads from
+  // either route json(), or from decodeSceneOpsReply.
+  it('BOTH branches forward `alsoDeleted` for a removeEntity that took descendants', async () => {
+    const withChild = () => {
+      const p = tempScene();
+      fs.writeFileSync(p, JSON.stringify({ entities: [
+        { id: 1, name: 'Box', traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Box', guid: 'g-box' } } },
+        { id: 2, name: 'Kid', traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Kid', guid: 'g-kid', parentId: 'g-box' } } },
+        // Enough grandchildren to pass the cap, so the file branch has an `alsoDeletedTotal` to drop.
+        ...Array.from({ length: 100 }, (_, i) => ({ id: 10 + i, name: `k${i}`, traits: { EntityAttributes: { name: `k${i}`, guid: `g-k${i}`, parentId: 'g-kid' } } })),
+        { id: 3, name: 'Bare', traits: { Transform: { x: 0 }, EntityAttributes: { name: 'Bare', parentId: 'g-kid' } } },
+      ] }));
+      return p;
+    };
+    const removeBox = (scenePath: string) => ({ path: scenePath, ops: [{ op: 'removeEntity', entity: { guid: 'g-box' } }] });
+    const also = { alsoDeleted: ['g-kid'], alsoDeletedNoGuidIds: [3], alsoDeletedTotal: 101 };
+    const liveScene = withChild();
+    const liveBrowser = vi.fn(async (op: string) => {
+      if (op === 'editor-state') return { playState: 'stopped', scenePath: liveScene, unsavedChanges: false };
+      if (op === 'apply-scene-ops') return { ok: true, changed: 1, errors: [], warnings: [], unresolved: [], ...also };
+      throw new Error(`unexpected op ${op}`);
+    });
+    const liveBody = ((await post('/api/scene-mutate', removeBox(liveScene), makeCtx({ requestBrowser: liveBrowser }))) as { body: object }).body;
+    expect(liveBody, 'the live branch dropped a cascade field').toMatchObject(also);
+
+    const fileScene = withChild();
+    const fileBrowser = vi.fn(async (op: string, params?: unknown) => {
+      if (op === 'editor-state') return { playState: 'stopped', scenePath: '/some/other/scene.json', unsavedChanges: false };
+      if (op === 'resolve-unsaved') return { ok: true, holds: [], discarded: [], covers: (params as { registries?: string[] })?.registries ?? [] };
+      throw new Error(`unexpected op ${op} — should have stayed file-direct`);
+    });
+    const fileBody = ((await post('/api/scene-mutate', removeBox(fileScene), makeCtx({ requestBrowser: fileBrowser }))) as {
+      body: { alsoDeleted?: string[]; alsoDeletedNoGuidIds?: number[]; alsoDeletedTotal?: number };
+    }).body;
+    expect(fileBody.alsoDeleted?.[0], 'the file branch dropped alsoDeleted').toBe('g-kid');
+    expect(fileBody.alsoDeletedNoGuidIds, 'the file branch dropped alsoDeletedNoGuidIds').toHaveLength(1);
+    expect(fileBody.alsoDeletedTotal, 'the file branch dropped alsoDeletedTotal').toBe(102);
+  });
+
   // #1223 D4, found by the live stale probe: the op answered `stale` and `options` beside its code, and
   // this route's reply literal (and the decoder before it) dropped both. Mutation: delete the `stale`
   // spread from the route's live-branch json(), or from decodeSceneOpsReply.

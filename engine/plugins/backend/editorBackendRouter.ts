@@ -2777,6 +2777,10 @@ async function describeUnresolvedAgainstLiveWorld(
             ...(live.created?.length ? { created: live.created } : {}),
             // A trait the write ADDED rather than edited (#1216 C-12, D6) — both branches, for S3.12's reason above.
             ...(live.addedTraits?.length ? { addedTraits: live.addedTraits } : {}),
+            // What a removeEntity's cascade took (#1262) — both branches, for S3.12's reason above.
+            ...(live.alsoDeleted ? { alsoDeleted: live.alsoDeleted } : {}),
+            ...(live.alsoDeletedNoGuidIds ? { alsoDeletedNoGuidIds: live.alsoDeletedNoGuidIds } : {}),
+            ...(live.alsoDeletedTotal ? { alsoDeletedTotal: live.alsoDeletedTotal } : {}),
             // In the prefab-edit world modoki_save_all REFUSES — edit-save is that world's save.
             ...(live.changed > 0 ? {
               hint: prefabEditTarget
@@ -2901,7 +2905,7 @@ async function describeUnresolvedAgainstLiveWorld(
       // below) before writing — otherwise every setTrait through this route would
       // reintroduce an `id` field on EVERY entity, the exact diff noise Phase 3 removed.
       const backfilledIds = assignSyntheticEntityIds(scene);
-      const { changed, errors, warnings: opWarnings, unresolved, created, addedTraits, code: applyCode } = applyOps(scene, ops);
+      const { changed, errors, warnings: opWarnings, unresolved, created, addedTraits, alsoDeleted, alsoDeletedNoGuidIds, alsoDeletedTotal, code: applyCode } = applyOps(scene, ops);
       // Surface BOTH the op-level warnings (dangling refs / orphaned parents from F5)
       // and the post-apply schema validation warnings.
       const schema = ctx.getSchema();
@@ -2969,6 +2973,9 @@ async function describeUnresolvedAgainstLiveWorld(
         // re-find its own new entity by name (which this surface refuses when ambiguous).
         ...(created?.length ? { created } : {}),
         ...(addedTraits?.length ? { addedTraits } : {}),
+        ...(alsoDeleted ? { alsoDeleted } : {}),
+        ...(alsoDeletedNoGuidIds ? { alsoDeletedNoGuidIds } : {}),
+        ...(alsoDeletedTotal ? { alsoDeletedTotal } : {}),
         ...(liveHint ? { hint: liveHint } : {}),
         ...(returnScene && changed > 0 ? { scene } : {}),
         ...(applyCode ? { code: applyCode } : {}),

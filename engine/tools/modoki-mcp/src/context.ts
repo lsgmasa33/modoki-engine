@@ -61,8 +61,10 @@ export type ToolContext = {
   /** POST = "do this" → `ok` is a SUCCESS FLAG, so this DOES run `isFailureBody` (C7).
    *  `what` labels the failure envelope in the CALLER's terms (§5): without it a refusal reads
    *  "POST /api/scene-mutate on the editor backend", which describes our plumbing rather than the
-   *  thing the caller asked for. Pass it wherever the intent isn't obvious from the route. */
-  postJson: (path: string, payload: unknown, timeoutMs?: number, what?: string) => Promise<ToolResult>;
+   *  thing the caller asked for. Pass it wherever the intent isn't obvious from the route.
+   *  `gotBudget` widens a 200-but-`ok:false` body's `got` past the 8k default, for a route whose
+   *  failure body is also the receipt of the ops that DID apply (see `encodeError`). */
+  postJson: (path: string, payload: unknown, timeoutMs?: number, what?: string, opts?: { gotBudget?: number }) => Promise<ToolResult>;
   evalRenderer: (code: string, timeoutMs?: number) => Promise<ToolResult>;
   editorAction: (action: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<ToolResult>;
   unsavedChangesWarning: () => Promise<string | null>;
@@ -330,7 +332,7 @@ export function createToolContext(config: { backend: string; token?: string }): 
     }
   }
 
-  async function postJson(path: string, payload: unknown, timeoutMs?: number, what?: string): Promise<ToolResult> {
+  async function postJson(path: string, payload: unknown, timeoutMs?: number, what?: string, opts?: { gotBudget?: number }): Promise<ToolResult> {
     const label = what ?? `POST ${path} on the editor backend`;
     try {
       await ensureIdentity();
@@ -375,6 +377,7 @@ export function createToolContext(config: { backend: string; token?: string }): 
             what: label,
             why: failure.split('\n\nfull response:')[0],
             got: body,
+            ...(opts?.gotBudget ? { gotBudget: opts.gotBudget } : {}),
           })
         : ok(body);
     } catch (e) {

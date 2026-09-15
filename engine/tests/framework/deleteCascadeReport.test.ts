@@ -78,6 +78,62 @@ describe.each([
   });
 });
 
+/** #1262 — `apply-scene-ops`' removeEntity is the same cascade in a third tool, and answered `changed:1`. */
+describe('editor apply-scene-ops removeEntity', () => {
+  type OpsReply = DeleteReply & { changed: number; alsoDeletedNoGuidIds?: number[] };
+  const remove = async (...guids: string[]) =>
+    await runAgentOp('apply-scene-ops', { ops: guids.map((guid) => ({ op: 'removeEntity', entity: { guid } })) }) as OpsReply;
+
+  // Mutation: drop `alsoDeleted.add(...)` in applySceneOpsLive, or the op wrapper's `alsoDeleted` spread.
+  it('names the descendants a parent\'s remove took with it', async () => {
+    const t = tree();
+    const r = await remove(t.guid(t.p));
+    expect(r.changed).toBe(1);
+    expect(new Set(r.alsoDeleted)).toEqual(new Set([t.guid(t.c), t.guid(t.g), t.guid(t.s)]));
+    expect(r).not.toHaveProperty('alsoDeletedTotal');
+  });
+
+  it('a leaf remove carries no `alsoDeleted` at all', async () => {
+    const t = tree();
+    expect(await remove(t.guid(t.g))).not.toHaveProperty('alsoDeleted');
+  });
+
+  // Mutation: build the tally per op instead of once per call (only the last op's cascade survives).
+  it('lists across every remove in the call', async () => {
+    const t = tree();
+    const r = await remove(t.guid(t.c), t.guid(t.s));
+    expect(r.changed).toBe(2);
+    expect(r.alsoDeleted).toEqual([t.guid(t.g)]);
+    const q = game.spawn(Transform(), EntityAttributes({ name: 'Q' })).id();
+    game.spawn(Transform(), EntityAttributes({ name: 'Q1', parentId: q }));
+    const w = game.spawn(Transform(), EntityAttributes({ name: 'W' })).id();
+    game.spawn(Transform(), EntityAttributes({ name: 'W1', parentId: w }));
+    expect((await remove(guidOfEntityId(q)!, guidOfEntityId(w)!)).alsoDeleted).toHaveLength(2);
+  });
+
+  // Mutation: drop the op wrapper's `alsoDeletedTotal` spread.
+  it('past the cap it names the first ones and counts them all', async () => {
+    const p = game.spawn(Transform(), EntityAttributes({ name: 'Big' })).id();
+    const n = ALSO_DELETED_CAP + 5;
+    for (let i = 0; i < n; i++) game.spawn(Transform(), EntityAttributes({ name: `k${i}`, parentId: p }));
+    const r = await remove(guidOfEntityId(p)!);
+    expect(r.alsoDeleted).toHaveLength(ALSO_DELETED_CAP);
+    expect(r.alsoDeletedTotal).toBe(n);
+  });
+
+  // Mutation: drop the `ensureGuid` loop before the remove — the runtime guids named would be re-minted on undo.
+  it('every alsoDeleted guid resolves after undo', async () => {
+    const p = game.spawn(Transform(), EntityAttributes({ name: 'RP' })).id();
+    const c = game.spawn(Transform(), EntityAttributes({ name: 'RC', parentId: p })).id();
+    game.spawn(Transform(), EntityAttributes({ name: 'RG', parentId: c }));
+    expect(guidOfEntityId(c)).toMatch(/^00000000-/);
+    const r = await remove(guidOfEntityId(p)!);
+    expect(r.alsoDeleted).toHaveLength(2);
+    await runAgentOp('undo', {});
+    for (const guid of r.alsoDeleted ?? []) expect(findEntityByGuid(guid), guid).toBeDefined();
+  });
+});
+
 describe('editor: a named descendant\'s guid is the one undo brings back', () => {
   // The editor mints durable guids over runtime ones before its undo snapshot; a descendant it named by
   // its RUNTIME guid would be re-minted on undo, and the reply's guid would name nothing.

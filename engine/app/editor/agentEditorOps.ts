@@ -76,7 +76,7 @@ import {
   getAllTraits, resolveCreateEntitySpec, reparentRefusal, parentRefusal, isResourceEntity, type MutateOp, type MutateEntityRef,
   Transform, getWorldTransform3D, getParentWorldMatrix3D, getCurrentWorld, ensurePhysicsReady, pendingPhysics, mergeTrs, worldToLocalTrs, matrixToTrs, persistedTrsKeys, collapsedParentAxes,
   type AnimationClipDef, type TrackValueType, type TimelineDef, type TrackDef, type TrackKind,
-  sceneManager, assetUrl, type AssetSchemaType, collectHandles, rawNow,
+  sceneManager, assetUrl, type AssetSchemaType, collectHandles, rawNow, alsoDeletedTally, guidOfEntityId, type AlsoDeletedFields,
 } from '@modoki/engine/runtime';
 
 // ── Reads ─────────────────────────────────────────────────────────────────
@@ -744,7 +744,7 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
   created: Array<{ op: number; id: number; guid: string; name: string }>;
   addedTraits?: Array<{ op: number; id: number; guid: string; trait: string }>;
   code?: ErrorCode; options?: string[]; stale?: string;
-}> {
+} & AlsoDeletedFields> {
   const errors: string[] = [];
   const warnings: string[] = [];
   const unresolved: MutateEntityRef[] = [];
@@ -754,6 +754,8 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
   const created: Array<{ op: number; id: number; guid: string; name: string }> = [];
   /** #1216 C-12 / D6 — see `ApplyResult.addedTraits` (sceneMutate.ts), the file path's twin. */
   const addedTraits: Array<{ op: number; id: number; guid: string; trait: string }> = [];
+  /** #1262 — what each removeEntity's cascade took, for the whole call; the file path's twin. */
+  const alsoDeleted = alsoDeletedTally();
   let changed = 0;
   // FIRST resolveLiveEntityRef failure's machine code, if it had one (NOT_FOUND/AMBIGUOUS) — a
   // single-op call (the common case: modoki_set_transform/tap) needs its refusal's code to
@@ -881,6 +883,11 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
           const resolved = resolveLiveEntityRef(op.entity);
           if ('error' in resolved) { errors.push(`${where}: ${resolved.error}`); unresolved.push(op.entity); if (code === undefined) { code = resolved.code; first = resolved; } continue; }
           const id = resolved.id;
+          // The delete takes the subtree; name the rest BEFORE it runs (#1262), minted durable first for
+          // delete-entities' reason: the guid named here must be the one undo brings back.
+          const descendants = descendantsOf([id]);
+          for (const d of descendants.slice(0, alsoDeleted.room())) ensureGuid(d);
+          alsoDeleted.add(descendants, guidOfEntityId);
           deleteEntitiesWithUndo([id]);
           changed++;
         } else {
@@ -892,7 +899,7 @@ async function applySceneOpsLive(ops: MutateOp[]): Promise<{
     }
   });
 
-  return { changed, errors, warnings, unresolved, created, ...(addedTraits.length ? { addedTraits } : {}), ...(code ? { code } : {}),
+  return { changed, errors, warnings, unresolved, created, ...(addedTraits.length ? { addedTraits } : {}), ...alsoDeleted.fields(), ...(code ? { code } : {}),
     ...(code && first?.options?.length ? { options: first.options } : {}), ...(code && first?.stale ? { stale: first.stale } : {}) };
 }
 
@@ -2243,9 +2250,10 @@ export function registerEditorAgentOps(): void {
   registerAgentOp('apply-scene-ops', async (params) => {
     const p = (params ?? {}) as { ops?: MutateOp[] };
     if (!Array.isArray(p.ops) || p.ops.length === 0) throw new Error('apply-scene-ops requires a non-empty { ops } array');
-    const { changed, errors, warnings, unresolved, created, addedTraits, code, options, stale } = await applySceneOpsLive(p.ops);
+    const { changed, errors, warnings, unresolved, created, addedTraits, alsoDeleted, alsoDeletedNoGuidIds, alsoDeletedTotal, code, options, stale } = await applySceneOpsLive(p.ops);
     return { ok: errors.length === 0, changed, errors, warnings, unresolved, saved: false,
       ...(created.length ? { created } : {}), ...(addedTraits ? { addedTraits } : {}),
+      ...(alsoDeleted ? { alsoDeleted } : {}), ...(alsoDeletedNoGuidIds ? { alsoDeletedNoGuidIds } : {}), ...(alsoDeletedTotal ? { alsoDeletedTotal } : {}),
       ...(code ? { code } : {}), ...(options ? { options } : {}), ...(stale ? { stale } : {}) };
   });
 

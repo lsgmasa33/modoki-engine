@@ -566,6 +566,26 @@ describe('S2 batch 5 — filters that were silently accepted or silently dropped
     }
   });
 
+  // #1262 close-out: a partly failed mutate is ok:false AND the receipt of what applied. Past the envelope's
+  // 8k `got` it became a shape preview, and the agent lost the guid its own addEntity minted.
+  // Mutation: drop the `gotBudget` option from modoki_mutate_scene, or its spread in postJson.
+  it('a partly failed mutate_scene keeps its receipts past the default 8k got budget', async () => {
+    const alsoDeleted = Array.from({ length: 100 }, (_, i) => `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`);
+    const s = (surface = loadSurface((req) => req.path === '/api/scene-mutate'
+      ? { status: 200, body: { ok: false, changed: 2, errors: ["op[2] (setTrait): no entity named 'Typo'"],
+        warnings: Array.from({ length: 60 }, (_, i) => `schema warning ${i}: ${'x'.repeat(80)}`),
+        created: [{ op: 0, id: 9, guid: 'g-new-box', name: 'Box' }], alsoDeleted, alsoDeletedTotal: 140 } }
+      : undefined));
+    const e = envelope(s, await s.call('modoki_mutate_scene', { ops: [
+      { op: 'addEntity', name: 'Box' }, { op: 'removeEntity', entity: { name: 'P' } },
+      { op: 'setTrait', entity: { name: 'Typo' }, trait: 'Light', fields: { intensity: 1 } },
+    ] })) as { got?: { created?: Array<{ guid: string }>; alsoDeleted?: string[]; elided?: boolean } };
+    expect(JSON.stringify(e.got).length, 'the fixture must exceed the default budget').toBeGreaterThan(8_000);
+    expect(e.got?.elided).toBeUndefined();
+    expect(e.got?.created?.[0].guid).toBe('g-new-box');
+    expect(e.got?.alsoDeleted).toHaveLength(100);
+  });
+
   it('an unknown OP NAME is refused with the vocabulary, not passed through', async () => {
     const s = (surface = loadSurface());
     await expect(s.call('modoki_mutate_scene', { ops: [{ op: 'setTrai', entity: { name: 'X' }, trait: 'Light' }] }))

@@ -10,6 +10,7 @@ import { isSimRunning } from '../playState';
 import { inSystemTick } from '../systemTick';
 import { noteAuthoredWriteWhileStopped } from './authoredWrites';
 import { compareSiblings } from './entityOrder';
+import { collectSubtreeIds } from './subtreeCollect';
 // Re-exported for backward compatibility — every existing caller imports these from here.
 // The implementation lives in `renderDirty.ts` (a side-effect-free L0 module) so a module
 // that only needs the dirty signal (e.g. `loaders/assetManifest.ts`) doesn't have to import
@@ -584,59 +585,20 @@ export function buildEntityTree(entities: EntityInfo[]): EntityInfo[] {
  *  with no entity has no subtree to speak of. */
 export function subtreeIds(flat: EntityInfo[], rootId: number): number[] {
   if (!flat.some((e) => e.id === rootId)) return [];
-  const childrenByParent = new Map<number, number[]>();
-  for (const e of flat) {
-    if (e.parentId > 0) {
-      let arr = childrenByParent.get(e.parentId);
-      if (!arr) { arr = []; childrenByParent.set(e.parentId, arr); }
-      arr.push(e.id);
-    }
-  }
-  const out: number[] = [];
-  const stack = [rootId];
-  while (stack.length > 0) {
-    const id = stack.pop()!;
-    out.push(id);
-    const children = childrenByParent.get(id);
-    if (children) stack.push(...children);
-  }
-  return out;
+  return collectSubtreeIds(flat.map((e) => [e.id, e.parentId] as const), [rootId]);
 }
 
 /** Delete multiple entities and all their children in one pass.
- *  Builds the child index once (O(n)), then collects subtrees for all IDs. */
+ *  Builds the child index once (O(n)), then collects subtrees for all IDs. The shared walk has a visited
+ *  set, so a parent cycle terminates (it used to loop forever here). */
 export function deleteEntities(entityIds: number[]) {
   if (entityIds.length === 0) return;
 
-  // Build child index from all entities once
-  const allEnts = getAllEntities();
-  const childrenByParent = new Map<number, number[]>();
-  for (const e of allEnts) {
-    if (e.parentId > 0) {
-      let arr = childrenByParent.get(e.parentId);
-      if (!arr) { arr = []; childrenByParent.set(e.parentId, arr); }
-      arr.push(e.id);
-    }
-  }
+  const toDelete = collectSubtreeIds(getAllEntities().map((e) => [e.id, e.parentId] as const), entityIds);
 
-  // Collect entire subtrees depth-first
-  const toDelete: number[] = [];
-  for (const entityId of entityIds) {
-    const stack = [entityId];
-    while (stack.length > 0) {
-      const id = stack.pop()!;
-      toDelete.push(id);
-      const children = childrenByParent.get(id);
-      if (children) stack.push(...children);
-    }
-  }
-
-  // Delete in reverse (children before parents), dedup in case of overlapping subtrees
-  const seen = new Set<number>();
+  // Delete in reverse: within one walk, children before parents
   for (let i = toDelete.length - 1; i >= 0; i--) {
     const id = toDelete[i];
-    if (seen.has(id)) continue;
-    seen.add(id);
     const entity = findEntity(id);
     if (entity) {
       destroyEntity(entity);

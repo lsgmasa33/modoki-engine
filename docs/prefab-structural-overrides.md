@@ -194,7 +194,32 @@ In `loadSceneFile.ts`, after `instantiatePrefabIntoWorld` spawns the prefab and
 
 1. **Entity removals** — for each `removed` localId, delete the corresponding
    spawned entity **and its prefab descendants** (resolve localId → ECS id from
-   the instantiation's `localToEcs`, then cascade by `parentId`).
+   the instantiation's `localToEcs`, then cascade by ECS `parentId` through
+   `collectSubtreeIds`, the walk the editor's `deleteEntities` shares). The map alone
+   is not enough: it reaches a nested row's ROOT but not that nested instance's own
+   members, which used to survive naming a dead parent (#1247).
+
+   ⚠️ **The cascade is sound only because both instantiators spawn their first pass
+   PARENTLESS** (runtime `instantiatePrefabIntoWorld`, editor `instantiatePrefab`).
+   The second pass reads each row's parent from the file entry. A nested row's own
+   `removed` is applied *during* the outer first pass. If the outer rows spawned so
+   far still held the file's parentId (a localId), a cascade would destroy any of them
+   whose raw parent number equals a removed member's ECS id. That was measured with a
+   fresh id (5) and a recycled one (1).
+   #1222 landed that cascade once and reverted it, and the runtime then fell back to
+   deleting exactly the mapped ids. So **a live `parentId` is always an ECS id or 0**,
+   the same rule scene load follows for scene entities. Don't reintroduce a raw
+   localId there. Covered by `structuralApplyParity.test.ts` § #1247.
+
+   The rule covers raw localIds only. A **dangling** `parentId` is not covered.
+   `destroyEntity` does not cascade, so a child whose parent was destroyed on its own
+   keeps the dead id. koota recycles indices last-in-first-out, so a removed member
+   can reclaim that index, and the cascade then destroys the orphan too. The editor's
+   `deleteEntities` has always done this.
+   The orphan was already mis-parented under whichever entity reclaimed the index. The
+   defect is the non-cascading destroy, not the cascade. It matters only at runtime,
+   e.g. a gameplay `spawnPrefabInstance` into a world where something was destroyed
+   without its children.
 2. **Component removals** — for each `removedTraits[localId]`, resolve localId →
    ECS id and remove each named trait from the spawned entity.
 3. **Additions** — for each `AddedEntity`, resolve `parentLocalId → ECS id`, then

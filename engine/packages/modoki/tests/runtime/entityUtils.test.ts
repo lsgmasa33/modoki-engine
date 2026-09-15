@@ -527,6 +527,22 @@ describe('deleteEntities', () => {
     const { deleteEntities } = await getUtils();
     expect(() => deleteEntities([])).not.toThrow();
   });
+
+  // #1247. Mutation: drop the visited set in collectSubtreeIds — the walk never ends (the suite times out).
+  it('terminates on a parent cycle, deleting the cycle and nothing else', async () => {
+    const { deleteEntities } = await getUtils();
+    const a = testWorld.spawn(Transform(), EntityAttributes({ name: 'A', parentId: 0 }));
+    const b = testWorld.spawn(Transform(), EntityAttributes({ name: 'B', parentId: a.id() }));
+    const other = testWorld.spawn(Transform(), EntityAttributes({ name: 'Other', parentId: 0 }));
+    a.set(EntityAttributes, { ...a.get(EntityAttributes), parentId: b.id() });
+    for (const e of [a, b, other]) entityIndex.set(e.id(), e);
+
+    deleteEntities([a.id()]);
+
+    expect(entityIndex.has(a.id())).toBe(false);
+    expect(entityIndex.has(b.id())).toBe(false);
+    expect(entityIndex.has(other.id())).toBe(true);
+  });
 });
 
 describe('deleteEntity', () => {

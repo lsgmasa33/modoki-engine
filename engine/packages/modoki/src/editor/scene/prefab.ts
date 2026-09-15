@@ -624,7 +624,11 @@ export function instantiatePrefab(
         if (meta.name === 'Renderable3D' && data.sprite && !data.mesh) {
           data.mesh = data.sprite; delete data.sprite;
         }
-        traitArgs.push(meta.trait(data)); // parentId remapped in second pass
+        // Spawn PARENTLESS; the second pass reads the parent from the file entry. The file's parentId is
+        // a localId, and left live it would name whichever entity holds that number — so the removal
+        // cascade of a nested row's structure, which runs below mid-pass, would take this row (#1247).
+        if (meta.name === 'EntityAttributes') data.parentId = 0;
+        traitArgs.push(meta.trait(data));
       }
     }
 
@@ -646,8 +650,9 @@ export function instantiatePrefab(
   const rootEcsId = localToEcs.get(prefab.rootLocalId) || 0;
 
   // Second pass: remap EntityAttributes.parentId for every row (including the
-  // nested-instance root, whose parentId is an OUTER-localId value). Direct
-  // findEntity writes — was a full-world query.updateEach per row (O(n²)).
+  // nested-instance root). Every row reads its parent from the FILE entry — the
+  // first pass spawned them all parentless (#1247). Direct findEntity writes — was
+  // a full-world query.updateEach per row (O(n²)).
   const attrMeta = getTraitByName('EntityAttributes');
   if (attrMeta) {
     for (const pe of prefab.entities) {
@@ -656,9 +661,10 @@ export function instantiatePrefab(
       const entity = findEntity(ecsId);
       if (!entity || !entity.has(attrMeta.trait)) continue;
       const ea = entity.get(attrMeta.trait) as Record<string, unknown>;
-      const localParent = pe.prefab
-        ? ((pe.traits['EntityAttributes'] as Record<string, unknown> | undefined)?.parentId as number ?? 0)
-        : (ea.parentId as number);
+      const fileEa = pe.traits['EntityAttributes'];
+      const localParent = fileEa && typeof fileEa === 'object'
+        ? ((fileEa as Record<string, unknown>).parentId as number ?? 0)
+        : 0;
       const newParent = localParent > 0 ? (localToEcs.get(localParent) || parentId) : parentId;
       entity.set(attrMeta.trait, { ...ea, parentId: newParent });
     }

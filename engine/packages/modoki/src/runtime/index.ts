@@ -461,7 +461,7 @@ export { loadedScenePath } from './core/ecs/sceneLoaded';
 export { sceneManager, gameIdFromScenePath, type Scene, type SceneState, type LoadOptions as SceneLoadOptions, type SceneManager, type LoadedSceneEntry } from './scene/SceneManager';
 export { validateSceneData, typeMismatch, REF_FIELDS_BY_TRAIT, type SceneSchema, type ValidationResult, type AssetRefVerdict, type AssetRefResolver, makeAssetRefResolver } from './loaders/sceneValidation';
 export { buildSceneSchema } from './scene/sceneSchema';
-export { applyOps, type MutateOp, type MutableScene, type MutableEntity, type EntityRef as MutateEntityRef, type ApplyResult } from './scene/sceneMutate';
+export { applyOps, alsoDeletedTally, ALSO_DELETED_CAP, type AlsoDeletedFields, type MutateOp, type MutableScene, type MutableEntity, type EntityRef as MutateEntityRef, type ApplyResult } from './scene/sceneMutate';
 // Entity-creation spec builders + the anchor-first UI authoring rules. In runtime (not editor)
 // since #166 so the DEVICE create-entity op can build the SAME entities the editor does — the
 // editor half of the package is stripped from a shipped game build. See

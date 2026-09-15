@@ -1,5 +1,6 @@
 [
   "ALL_PROVIDERS",
+  "ALSO_DELETED_CAP",
   "ANIMATOR_CLIP_TRAITS",
   "ANIMSET_DEFAULTS",
   "ARM_BACKSTOP_MS",
@@ -201,6 +202,7 @@
   "advanceClipTime",
   "advanceManual",
   "agentToolsVersion",
+  "alsoDeletedTally",
   "angEcsToPhys",
   "angPhysToEcs",
   "animationSystem",

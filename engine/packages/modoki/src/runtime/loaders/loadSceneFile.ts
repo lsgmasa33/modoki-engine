@@ -23,6 +23,7 @@ import { parseAnimClipBankResult } from '../animation/animClipBank';
 import { getRunMode } from '../core/playState';
 import { Transient } from '../core/traits/Transient';
 import { migrateUIAnchorZIndexStructured } from './uiAnchorZIndexMigration';
+import { collectSubtreeIds } from '../core/ecs/subtreeCollect';
 
 /** A child subtree an instance adds beyond what its prefab defines. Anchored to
  *  an existing prefab member by `parentLocalId`; nested adds live in `children`
@@ -542,11 +543,12 @@ export function prefabSubtreeLocalIds(prefab: PrefabLike, rootLocalId: number): 
  *
  *  The editor passes `getCurrentWorld()`-backed ops (deleteEntities, findEntity,
  *  registerEntity, its 4-call nested-instance expansion, markStructureDirty/UI);
- *  the runtime passes koota-`world`-direct ops (destroyEntity on exactly the mapped ids, byId map, the single
+ *  the runtime passes koota-`world`-direct ops (destroyEntity over the ECS-parent subtree of the mapped ids, byId map, the single
  *  instantiatePrefabIntoWorld call). `log` keeps each side's existing warn prefix. */
 export interface StructureApplyOps {
-  /** Delete these ECS ids. The editor impl cascades to ECS children; the runtime impl deletes exactly these
-   *  (see its comment) — the ids already include the prefab subtree's mapped members. */
+  /** Delete these ECS ids and their ECS-parent subtrees. The ids already include the prefab subtree's mapped
+   *  members; the cascade adds what the map cannot reach — a nested instance's own members (#1247). Both
+   *  impls rely on every live parentId being an ECS id or 0 (see subtreeCollect.ts). */
   deleteEntities(ecsIds: number[]): void;
   /** Resolve an ECS id to a handle whose traits can be read/removed, or undefined. */
   findEntity(ecsId: number): { has(t: unknown): boolean; remove(t: unknown): void } | undefined;
@@ -699,12 +701,18 @@ export function applyStructureByLocalToEcs(
       logPrefix: '[loadSceneFile]',
       // destroyEntity, never a bare destroy(): that skipped `unregisterEntity`, so the entity index
       // kept each removed member and `findEntityById` handed back its corpse (#1222).
-      // Exactly the ids handed in, NOT an ECS-parent cascade: during a nested expansion the outer rows'
-      // parentIds are still prefab-file localIds, so a cascade would take unrelated members whose raw parent
-      // number matches a removed member's ECS id (#1222 close-out review). A nested instance's own members
-      // under a removed member are therefore still left behind: #1247.
+      // Cascades by ECS parent, like the editor's deleteEntities: the mapped ids reach a nested row's ROOT
+      // but not that nested instance's own members, which would survive naming a dead parent (#1247). The
+      // cascade is sound only because instantiatePrefabIntoWorld spawns its first pass parentless, so an
+      // outer row still awaiting its remap cannot match a removed member's id (see subtreeCollect.ts).
       deleteEntities: (ecsIds) => {
-        const toDelete = new Set(ecsIds);
+        const attrMeta = getTraitByName('EntityAttributes');
+        const links: [number, number][] = [];
+        for (const e of world.entities as Iterable<EntityHandle>) {
+          const ea = attrMeta && e.has(attrMeta.trait) ? (e.get(attrMeta.trait) as { parentId?: number }) : undefined;
+          links.push([e.id(), ea?.parentId ?? 0]);
+        }
+        const toDelete = new Set(collectSubtreeIds(links, ecsIds));
         const doomed = [...world.entities].filter((e) => toDelete.has((e as EntityHandle).id()));
         for (const e of doomed) destroyEntity(e, world);
       },
@@ -875,6 +883,10 @@ export function instantiatePrefabIntoWorld(
       // the correct source + rootInstanceId below
       if (meta.name === 'PrefabInstance') continue;
       if (data === true) traitArgs.push(meta.trait());
+      // Spawn PARENTLESS: the file's parentId is a localId, not an ECS id, and the second pass reads it from
+      // the entry. Left live, it names whichever entity holds that number, and a removal cascade running
+      // during a nested row's expansion below would take this row with it (#1247).
+      else if (meta.name === 'EntityAttributes') traitArgs.push(meta.trait({ ...(data as Record<string, unknown>), parentId: 0 }));
       else traitArgs.push(meta.trait(data as Record<string, unknown>));
     }
     // Attach PrefabInstance trait if the registry knows about it. rootInstanceId
@@ -903,9 +915,9 @@ export function instantiatePrefabIntoWorld(
   const handleById = new Map<number, EntityHandle>();
   for (const e of world.entities) handleById.set((e as EntityHandle).id(), e as EntityHandle);
 
-  // Second pass: remap parentIds in EntityAttributes. A nested-instance root's
-  // parentId is read from the OUTER file's EntityAttributes (its live parentId was
-  // set to 0 by the recursive call); ordinary rows read their live (= file) value.
+  // Second pass: remap parentIds in EntityAttributes. Every row — a nested-instance
+  // root included — reads its parent from the FILE entry: the first pass spawned
+  // rows parentless, and the recursive call spawned the nested root under 0.
   const attrMeta = getTraitByName('EntityAttributes');
   if (attrMeta) {
     for (const entry of prefab.entities) {
