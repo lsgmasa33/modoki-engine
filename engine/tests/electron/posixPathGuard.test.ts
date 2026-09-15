@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { boundIdentifier, calleeName, findNodes, flatText, lineOf, parseSource, readsOf, ts, unwrapValue, valueCarrier } from '@modoki/engine/testing/sourceAst';
 
 /**
  * PACKAGING GUARD — no hardcoded POSIX-only paths in packaged-app code.
@@ -129,14 +130,60 @@ describe('test files reach the filesystem through os.tmpdir(), not a literal POS
 
   // POSIX roots that genuinely do not exist on Windows. `/tmp` and `/var/tmp` are the ones with a
   // trivial correct replacement (`os.tmpdir()`); the others are matched because a test that WRITES
-  // to them is wrong on every platform, Windows or not.
-  const POSIX_ROOT = String.raw`\/(?:tmp|var|usr|home|Users|opt|etc|private)(?:\/|(?=['"\`]))`;
+  // to them is wrong on every platform, Windows or not. POSIX_TEXT and POSIX_START below carry the list.
   // The `fs` surface a test actually touches. Deliberately includes reads: a test that reads a
   // literal `/tmp/...` is just as broken here, it merely fails differently.
   const FS_CALLS =
     'writeFileSync|appendFileSync|mkdirSync|rmSync|rmdirSync|unlinkSync|openSync|createWriteStream'
     + '|createReadStream|readFileSync|readdirSync|existsSync|copyFileSync|cpSync|statSync|renameSync'
     + '|writeFile|readFile|mkdir|appendFile';
+
+  /** A quoted POSIX root anywhere in the text — the cheap pre-filter before a parse. */
+  const POSIX_TEXT = new RegExp(String.raw`['"\`]\/(?:tmp|var|usr|home|Users|opt|etc|private)(?:\/|['"\`]|\$\{)`);
+  const FS_CALL_NAMES = new Set(FS_CALLS.split('|'));
+
+  /** A string or template whose text STARTS with a POSIX root (`/tmp`, `/tmp/…`, a template's head `/private/`). */
+  const POSIX_START = /^\/(?:tmp|var|usr|home|Users|opt|etc|private)(?:\/|$)/;
+  function isPosixLiteral(e: ts.Expression | undefined): boolean {
+    const u = e && unwrapValue(e);
+    if (!u) return false;
+    const text = ts.isStringLiteral(u) || ts.isNoSubstitutionTemplateLiteral(u) ? u.text : ts.isTemplateExpression(u) ? u.head.text : undefined;
+    return text !== undefined && POSIX_START.test(text);
+  }
+
+  /** `e` is the FIRST argument of an fs call, directly or as the first segment of `join(…)`/`resolve(…)` that is. */
+  function fsCallTaking(e: ts.Expression): ts.CallExpression | undefined {
+    let cur = valueCarrier(e);
+    const p = cur.parent;
+    if (p && ts.isCallExpression(p) && p.arguments[0] === cur && ['join', 'resolve'].includes(calleeName(p) ?? '')) cur = valueCarrier(p);
+    const call = cur.parent;
+    return call && ts.isCallExpression(call) && call.arguments[0] === cur && FS_CALL_NAMES.has(calleeName(call) ?? '') ? call : undefined;
+  }
+
+  /** Every POSIX-absolute literal in `sf` that reaches an fs call's path argument — the literal itself as the
+   *  argument (`<line>  <call>`), or a `const`/`let` it initialises whose READS (resolved by scope) reach one
+   *  (`<line>  <name> = <POSIX literal> → fs call`).
+   *
+   *  From the parser (#1195). The bound case used to search a TEXT window: file-wide for a column-0 binding,
+   *  and for an indented one only up to the next sibling `it`/`test`/`describe` at no deeper indent — so a
+   *  name reused in another block was blamed for that block's legitimate call whenever the window guessed
+   *  wrong, and a read after a nested `describe` was missed. The checker resolves which binding a read is. */
+  function posixFsReaches(sf: ts.SourceFile): string[] {
+    const out: string[] = [];
+    const literals = findNodes(sf, (n): n is ts.Expression => ts.isExpression(n) && (ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n) || ts.isTemplateExpression(n)) && isPosixLiteral(n));
+    for (const found of literals) {
+      // The literal may only START the path: `'/tmp/' + name` is the same path, so read the `+` chain it heads
+      // (#1195 close-out review — the text regexes needed only the argument to START with a quoted root).
+      let lit: ts.Expression = valueCarrier(found);
+      while (lit.parent && ts.isBinaryExpression(lit.parent) && lit.parent.operatorToken.kind === ts.SyntaxKind.PlusToken
+        && lit.parent.left === lit) lit = valueCarrier(lit.parent);
+      const direct = fsCallTaking(lit);
+      if (direct) { out.push(`${lineOf(direct)}  ${flatText(direct)}`); continue; }
+      const bound = boundIdentifier(lit);
+      if (bound && readsOf(bound).some((r) => fsCallTaking(r))) out.push(`${lineOf(bound)}  ${bound.text} = <POSIX literal> → fs call`);
+    }
+    return out;
+  }
 
   // Comment stripping is the shared scanner (@modoki/engine/testing, #419) — imported above.
 
@@ -168,46 +215,10 @@ describe('test files reach the filesystem through os.tmpdir(), not a literal POS
     const offenders: string[] = [];
     for (const rel of files) {
       const src = stripComments(fs.readFileSync(path.join(repoRoot, rel), 'utf8'));
-      const lineOf = (idx: number): number => src.slice(0, idx).split('\n').length;
-
-      // (1) The literal sits straight in the call: `writeFileSync('/tmp/x', …)`, and the same
-      //     through `join(...)`/`resolve(...)` as the first segment.
-      const direct = new RegExp(
-        String.raw`(?:${FS_CALLS})\s*\(\s*(?:(?:path\.)?(?:join|resolve)\s*\(\s*)?['"\`]${POSIX_ROOT}`,
-        'g',
-      );
-      for (let m = direct.exec(src); m; m = direct.exec(src)) {
-        offenders.push(`${rel}:${lineOf(m.index)}  ${m[0].trim()}`);
-      }
-
-      // (2) The literal is bound to a const first — the shape that actually shipped — and that
-      //     identifier is then handed to an fs call.
-      //
-      //     SCOPE MATTERS, and getting it wrong makes this guard lie. A file-wide search for the
-      //     identifier produced two false positives on the first run: `toolchainResolve.test.ts`
-      //     reuses the name `tc` in a dozen separate `it` blocks, most of them binding it
-      //     correctly via `mkdtempSync(os.tmpdir())` and calling `fs.rmSync(tc)` — so a fixture
-      //     `const tc = '/tc'` in one block was blamed for a DIFFERENT block's legitimate fs call.
-      //     But narrowing to the enclosing block for everything would miss the real bug, because
-      //     the shape that broke binds at MODULE scope (`const REPORT = …` at the top) and uses it
-      //     inside an `it`. So: a top-level binding is searched file-wide, an indented one only
-      //     until the next sibling `it`/`test`/`describe`.
-      const bind = new RegExp(String.raw`\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*['"\`]${POSIX_ROOT}`, 'g');
-      for (let m = bind.exec(src); m; m = bind.exec(src)) {
-        const name = m[1];
-        const lineStart = src.lastIndexOf('\n', m.index) + 1;
-        const indent = src.slice(lineStart, m.index).length;
-        let window = src;
-        if (indent > 0) {
-          const rest = src.slice(m.index);
-          const next = rest.slice(1).search(new RegExp(String.raw`\n\s{0,${indent}}(?:it|test|describe)\s*[.(]`));
-          window = next === -1 ? rest : rest.slice(0, next + 1);
-        }
-        const used = new RegExp(
-          String.raw`(?:${FS_CALLS})\s*\(\s*(?:(?:path\.)?(?:join|resolve)\s*\(\s*)?${name}\b`,
-        );
-        if (used.test(window)) offenders.push(`${rel}:${lineOf(m.index)}  ${name} = <POSIX literal> → fs call`);
-      }
+      // Parsed only when the text holds a quoted POSIX root at all — every literal the reader below can
+      // find starts with one.
+      if (!POSIX_TEXT.test(src)) continue;
+      offenders.push(...posixFsReaches(parseSource(src, rel)).map((o) => `${rel}:${o}`));
     }
     expect(
       offenders,
@@ -215,5 +226,41 @@ describe('test files reach the filesystem through os.tmpdir(), not a literal POS
         + '(E:\\tmp) and does not exist, so this fails only on the win clone. Use '
         + "path.join(os.tmpdir(), …):\n" + offenders.map((o) => `  ${o}`).join('\n'),
     ).toEqual([]);
+  });
+
+  it('reads a literal into an fs call directly, through join/resolve, or through the binding it is read by (#1195)', () => {
+    const probe = (src: string) => posixFsReaches(parseSource(src, 'probe.test.ts'));
+    expect(probe([
+      "fs.writeFileSync('/tmp/a.txt', 'x');",
+      'readFileSync(path.join(`/private/${x}`, "b"));',
+      "mkdirSync(resolve('/usr'), { recursive: true });",
+      "fs.writeFileSync(path.join(os.tmpdir(), '/tmp'), 'x');",
+    ].join('\n'))).toEqual([
+      "1  fs.writeFileSync('/tmp/a.txt', 'x')",
+      '2  readFileSync(path.join(`/private/${x}`, "b"))',
+      "3  mkdirSync(resolve('/usr'), { recursive: true })",
+    ]);
+    // Bound first — at module scope and used inside an `it`, the shape that shipped.
+    expect(probe("const REPORT = '/tmp/report.txt';\ndescribe('d', () => {\n  it('w', () => {\n    fs.writeFileSync(REPORT, 'x');\n  });\n});"))
+      .toEqual(['1  REPORT = <POSIX literal> → fs call']);
+    // The same NAME rebound in a sibling block is a different binding: the fixture is never written.
+    expect(probe([
+      "it('a', () => { const tc = '/tmp/tc'; expect(norm(tc)).toBe('x'); });",
+      "it('b', () => { const tc = fs.mkdtempSync(path.join(os.tmpdir(), 'tc')); fs.rmSync(tc, { recursive: true }); });",
+    ].join('\n'))).toEqual([]);
+    // A bound literal read through join, and one only compared.
+    expect(probe("function f() {\n    const dir = '/Users/dev';\n    return existsSync(path.join(dir, 'x')) && dir === '/Users/dev';\n}"))
+      .toEqual(['2  dir = <POSIX literal> → fs call']);
+    // A literal that STARTS a concatenation, directly and bound (the #108 report path with a suffix).
+    expect(probe("fs.writeFileSync('/tmp/' + name, 'x');\nconst REPORT = '/tmp/report-' + String(pid) + '.txt';\nfs.writeFileSync(REPORT, 'x');"))
+      .toEqual(["1  fs.writeFileSync('/tmp/' + name, 'x')", '2  REPORT = <POSIX literal> → fs call']);
+    // …but not a literal that merely ends one.
+    expect(probe("fs.writeFileSync(base + '/tmp/x', 'x');")).toEqual([]);
+    // A drive-relative-safe literal, a POSIX literal as a second argument, and a non-fs call.
+    expect(probe("fs.writeFileSync(file, '/tmp/content');\nnormalize('/tmp/x');\nconst p = 'tmp/x'; fs.readFileSync(p);")).toEqual([]);
+    // The pre-filter keeps every root the reader looks for, in every quote.
+    for (const lit of ["'/tmp/a'", '"/var/x"', "`/usr`", "'/home/x'", "'/Users/x'", "'/opt/x'", "'/etc/x'", "'/private/x'", '`/tmp${s}`']) {
+      expect(POSIX_TEXT.test(`readFileSync(${lit})`), lit).toBe(true);
+    }
   });
 });

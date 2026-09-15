@@ -25,7 +25,8 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { stripComments, assertScanIsSane, readScannedSource } from '@modoki/engine/testing';
+import { callsTo, declarationOf, findNodes, lineOf, objectLiteralKeys, parseSource, propertyValue, ts, unwrapValue } from '@modoki/engine/testing/sourceAst';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const EDITOR = path.resolve(__dirname, '../../packages/modoki/src/editor');
@@ -45,47 +46,38 @@ function editorSources(): string[] {
   return repoFiles({ under: EDITOR, match: /\.tsx?$/, floor: 150 }).map(({ abs }) => abs);
 }
 
-/** The text of the balanced `(...)` starting at `open`. */
-function callArgs(src: string, open: number): string {
-  let depth = 0;
-  for (let i = open; i < src.length; i++) {
-    if (src[i] === '(') depth++;
-    else if (src[i] === ')' && --depth === 0) return src.slice(open + 1, i);
-  }
-  return '';
-}
-
-/** The text of the balanced `{...}` starting at `open`. */
-function braceBlock(src: string, open: number): string {
-  let depth = 0;
-  for (let i = open; i < src.length; i++) {
-    if (src[i] === '{') depth++;
-    else if (src[i] === '}' && --depth === 0) return src.slice(open, i + 1);
-  }
-  return '';
-}
-
-/** The ACTION LITERAL a `pushAction(...)` call pushes — inline, or resolved back through the
- *  `const a: ClipAction = { … }; pushAction(a)` form the coalescing panels use.
+/** The ACTION a `pushAction(...)` call pushes — its argument, or, for the `const a: ClipAction = { … };
+ *  pushAction(a)` form the coalescing panels use, the initializer that name RESOLVES to.
  *
- *  Reading the literal, not a window of nearby lines, is load-bearing: the first version of this
+ *  Reading the action, not a window of nearby lines, is load-bearing: the first version of this
  *  guard scanned ±14 lines, and deleting a real flag left it GREEN because a sibling `pushAction`
  *  a few lines up still had one. A guard that cannot fail on the defect it names is worse than no
- *  guard — it certifies. (Caught by mutating it, which is the only thing that ever catches this.) */
-function actionLiteral(src: string, open: number): string {
-  const args = callArgs(src, open);
-  const asVar = /^\s*([A-Za-z_$][\w$]*)\s*$/.exec(args);
-  if (!asVar) return args;                       // inline literal (or a builder call)
-  const decl = src.lastIndexOf(`const ${asVar[1]}`, open);
-  if (decl < 0) return args;                     // built elsewhere — nothing to read
-  const brace = src.indexOf('{', decl);
-  return brace >= 0 && brace < open ? braceBlock(src, brace) : args;
+ *  guard — it certifies. (Caught by mutating it, which is the only thing that ever catches this.)
+ *
+ *  ⚠️ **The action is a NODE (#1195).** The second version counted parentheses and braces over the text
+ *  and resolved a name to the nearest EARLIER `const <name>` spelled alike — so a `(` or `{` inside a
+ *  string moved the literal's edge, and a same-named const in a sibling function stood in for the real
+ *  one. Now `declarationOf` resolves the name by scope. */
+function pushedAction(call: ts.CallExpression): ts.Expression | undefined {
+  const arg = call.arguments[0] && unwrapValue(call.arguments[0]);
+  if (!arg || !ts.isIdentifier(arg)) return arg;
+  const decl = declarationOf(arg);
+  return decl && ts.isVariableDeclaration(decl) && decl.initializer ? unwrapValue(decl.initializer) : arg;
 }
 
-/** Strip comments (shared scanner, @modoki/engine/testing, #419), so a literal cannot be
- *  "flagged" by a line of prose about the flag. */
-function code(text: string): string {
-  return stripComments(text);
+/** Is this action an ASSET-DOC undo entry? A mutator NAMED inside it (called, or handed on), or — in a file
+ *  that touches a mutator at all — an own `undo` member. */
+function isAssetDocEntry(action: ts.Expression, mutators: readonly string[], fileTouchesAssets: boolean): boolean {
+  const direct = findNodes(action, ts.isIdentifier).some((id) => mutators.includes(id.text));
+  return direct || (fileTouchesAssets && (objectLiteralKeys(action) ?? []).includes('undo'));
+}
+
+/** Does the action carry `_isFileDirect: true` as its OWN key? `: true`, not merely present —
+ *  `_isFileDirect: false` IS the defect, and undoManager reads the flag truthily. The first version of this
+ *  guard accepted both that and a comment saying the word, which is the failure its own docstring names;
+ *  a flag inside a nested literal does not flag the action either. */
+function isFlagged(action: ts.Expression): boolean {
+  return propertyValue(action, '_isFileDirect')?.kind === ts.SyntaxKind.TrueKeyword;
 }
 
 /** Every asset-doc undo entry that does not carry the flag, set to TRUE — plus how many asset-doc
@@ -95,23 +87,19 @@ function unflagged(): { hits: string[]; examined: number } {
   const hits: string[] = [];
   let examined = 0;
   for (const file of editorSources()) {
-    const src = fs.readFileSync(file, 'utf8');
+    const code = readScannedSource(file).code;
     // A file that imports an asset-doc mutator is in scope even when the literal reaches it
     // INDIRECTLY: MaterialBatchView's undo closures call a local `apply()` helper, so a
     // mutator-name match alone skipped one of the very sites this guard was written for.
-    const fileTouchesAssets = mutators.some((mut) => new RegExp(`\\b${mut}\\b`).test(src));
-    for (const m of src.matchAll(/\bpushAction\s*\(/g)) {
-      const open = m.index! + m[0].length - 1;
-      const literal = code(actionLiteral(src, open));
-      const direct = mutators.some((mut) => literal.includes(mut));
-      if (!direct && !(fileTouchesAssets && /\bundo\s*:/.test(literal))) continue;
+    const fileTouchesAssets = mutators.some((mut) => new RegExp(`\\b${mut}\\b`).test(code));
+    const sf = parseSource(code, file);
+    for (const call of callsTo(sf, 'pushAction')) {
+      const action = pushedAction(call);
+      if (!action) continue;
+      if (!isAssetDocEntry(action, mutators, fileTouchesAssets)) continue;
       examined++;
-      // `: true`, not merely present — `_isFileDirect: false` IS the defect, and undoManager reads
-      // the flag truthily. The first version of this guard accepted both that and a comment saying
-      // the word, which is the failure its own docstring names.
-      if (/_isFileDirect\s*:\s*true/.test(literal)) continue;
-      const line = src.slice(0, open).split('\n').length;
-      hits.push(`${path.relative(EDITOR, file)}:${line}`);
+      if (isFlagged(action)) continue;
+      hits.push(`${path.relative(EDITOR, file)}:${lineOf(call)}`);
     }
   }
   return { hits, examined };
@@ -134,6 +122,29 @@ describe('asset-document undo entries do not dirty the scene', () => {
       const raw = fs.readFileSync(file, 'utf8');
       assertScanIsSane(raw, stripComments(raw), path.relative(EDITOR, file));
     }
+  });
+
+  it('reads the pushed action as a node — a string\'s bracket, a nested flag and a same-named const elsewhere do not vouch (#1195)', () => {
+    const sf = parseSource([
+      "function other() { const a = { _isFileDirect: true }; }",
+      "function f() {",
+      "  const a = { undo: () => applyAnimationClip(')'), meta: { _isFileDirect: true } };",
+      "  pushAction(a);",
+      "  pushAction({ undo: () => applyAnimationClip('{'), _isFileDirect: true });",
+      "}",
+    ].join('\n'), 'probe.ts');
+    const [byName, inline] = callsTo(sf, 'pushAction').map((c) => pushedAction(c)!);
+    // f's own `a`, resolved by scope — not other()'s flagged one — and its flag is only in `meta`.
+    expect(objectLiteralKeys(byName)).toEqual(['undo', 'meta']);
+    expect([isAssetDocEntry(byName!, ['applyAnimationClip'], false), isFlagged(byName!)]).toEqual([true, false]);
+    expect([isAssetDocEntry(inline!, ['applyAnimationClip'], false), isFlagged(inline!)]).toEqual([true, true]);
+    // The guard's own classifier on the flag's VALUE: false and a truthy non-literal are not `true`.
+    const flagOf = (lit: string) => isFlagged(callsTo(parseSource(`pushAction(${lit});`, 'f.ts'), 'pushAction')[0]!.arguments[0]!);
+    expect(['{ _isFileDirect: false }', '{ _isFileDirect: 1 }', '{ _isFileDirect: yes }', '{ _isFileDirect: true }'].map(flagOf))
+      .toEqual([false, false, false, true]);
+    // An own `undo` member counts only in a file that touches a mutator.
+    const undoOnly = callsTo(parseSource('pushAction({ undo: () => apply() });', 'u.ts'), 'pushAction')[0]!.arguments[0]!;
+    expect([isAssetDocEntry(undoOnly, ['applyAnimationClip'], true), isAssetDocEntry(undoOnly, ['applyAnimationClip'], false)]).toEqual([true, false]);
   });
 
   it('every asset-doc undo entry in editor/** carries _isFileDirect', () => {

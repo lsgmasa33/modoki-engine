@@ -25,6 +25,8 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { readScannedSource } from '@modoki/engine/testing';
+import { declarationOf, findNodes, functionsNamed, parseSource, stringValueOf, ts } from '@modoki/engine/testing/sourceAst';
 import {
   mergeProjectConfig,
   DEFAULT_PROJECT_CONFIG,
@@ -99,18 +101,47 @@ describe('project.config string unions are all validated (#39)', () => {
 });
 
 describe('TONE_MAPPINGS stays in step with resolveToneMapping', () => {
-  it('names exactly the cases the resolver handles', async () => {
+  it('names exactly the cases the resolver handles', () => {
     // project-config.ts is deliberately IMPORT-FREE (browser-safe, no Node deps), so it cannot
     // import the resolver's set — the two lists are a knowing duplication and THIS is the guard
     // that keeps them honest. A name added to the resolver but not here would be rejected as
     // out-of-union despite working; a name here but not in the resolver would silently render as
     // ACESFilmic via the `default` branch.
-    const src = await import('@modoki/engine/testing').then(({ readScannedSource }) =>
-      readScannedSource('engine/packages/modoki/src/runtime/rendering/renderSettings.ts').code);
-    const body = src.slice(src.indexOf('export function resolveToneMapping'));
-    const end = body.indexOf('\n}');
-    const cases = [...body.slice(0, end).matchAll(/case '([^']+)':/g)].map((m) => m[1]);
+    const cases = resolverCases(readScannedSource('engine/packages/modoki/src/runtime/rendering/renderSettings.ts').code, 'renderSettings.ts');
     expect(cases.length).toBeGreaterThan(0);
     expect([...cases].sort()).toEqual([...TONE_MAPPINGS].sort());
   });
+
+  it('reads the switch over the resolver\'s parameter, whatever quotes a label uses (#1195)', () => {
+    // The body used to run to the first '\n}', and a label was /case '([^']+)':/ — so `case "X":` was not one.
+    const probe = (src: string) => resolverCases(src, 'probe.ts');
+    expect(probe('export function resolveToneMapping(name) {\n  const t = `\n}`;\n  switch (name) { case "AgX": case `None`: return 1; case \'Linear\': default: return 0; }\n}'))
+      .toEqual(['AgX', 'None', 'Linear']);
+    // A switch over something else, even inside the resolver, is not its case list.
+    expect(probe("export function resolveToneMapping(name) { switch (mode) { case 'x': break; } switch (name) { case 'AgX': return 1; } }"))
+      .toEqual(['AgX']);
+    expect(() => probe("export function resolveToneMapping(name) { switch (name) { case NAMES.agx: return 1; } }")).toThrow(/not a string literal/);
+    expect(() => probe('export function resolveToneMapping(name) { return name === \'AgX\' ? 1 : 0; }')).toThrow(/one switch over name/);
+  });
 });
+
+/**
+ * The case labels of `resolveToneMapping`'s `switch` over its own parameter, from the parser (#1195). A
+ * label that is not a string literal, or a resolver that is not ONE such switch, fails loudly: the case
+ * list would otherwise read as empty or partial and the comparison above as a real answer.
+ */
+function resolverCases(code: string, label: string): string[] {
+  const fns = functionsNamed(parseSource(code, label), 'resolveToneMapping');
+  expect(fns.length, `expected one resolveToneMapping in ${label}`).toBe(1);
+  const param = fns[0]!.parameters[0]?.name;
+  expect(param && ts.isIdentifier(param), `resolveToneMapping in ${label} has no named parameter`).toBe(true);
+  const paramName = (param as ts.Identifier).text;
+  const switches = findNodes(fns[0]!.body, ts.isSwitchStatement)
+    .filter((sw) => ts.isIdentifier(sw.expression) && declarationOf(sw.expression) === param!.parent);
+  expect(switches.length, `resolveToneMapping in ${label}: expected one switch over ${paramName}`).toBe(1);
+  return switches[0]!.caseBlock.clauses.filter(ts.isCaseClause).map((c) => {
+    const v = stringValueOf(c.expression);
+    expect(v, `resolveToneMapping in ${label}: \`case ${c.expression.getText()}\` is not a string literal`).toBeDefined();
+    return v!;
+  });
+}

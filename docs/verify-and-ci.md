@@ -1674,6 +1674,157 @@ without counting them as runtime edges. What recurred:
   readers. `crashSinkOrder`'s bundle case reads a built artifact. `sourceScanner.test.ts` counts
   `/^import /` to measure the stripper itself.
 
+**#1195 — where a code UNIT ends (~117 sites, in five phases; P3–P5 are #1240–#1242).** These guards
+took the extent of a unit from its text shape: a hand-counted bracket depth, a slice to the next column-0
+`function`, or a fixed-indent closer such as `'\n}'` or `\n {2}\}\);`. A bracket inside a string, a
+neighbour, or one more level of nesting moved that edge. The anchor was observed before the move:
+`keymapHmrEpochGuard`'s paren count ran through `console.log(':-(')`, swallowed the next effect, and read
+its `[hmrEpoch]` as the deps of an effect with `[]`. **P1 landed** the helpers and the 12 guards that read
+a declaration's shape. `sourceAst` gained four helpers. `propertyValue` returns a key's value, and the
+last duplicate wins. `variablesNamed` finds a binding in any scope. `typesNamed`/`typeMembers` return an
+interface or type literal's OWN members, and refuse a union rather than read it as empty. `functionsNamed`
+returns every function known by a name, methods included. What recurred:
+
+- **A text reader fails open by OVER-counting as well as by missing.** `playableAppServicesStub`'s member
+  regex credited the stub with 10 members it does not have. They were parameter names (`_value`, `_doc`),
+  `return`, and the keys of nested return literals (`ok`, `user`, `scheduled`), so a game calling
+  `auth.user(…)` passed. `handleProviderOwner`'s brace walk counted 21 handle literals where there are 16
+  string-kinded ones (17 in all, below).
+  Five were spans anchored on a `kind:` that is not a handle, such as a TYPE `{ kind: 'color' | 'alpha' }`
+  or a `setSel({ kind: 'color' })`. They ran wide enough to match `id:`, `x:` and `owner:` elsewhere in
+  the component. A phantom member vouches for a missing one. Measuring old against new is what separates
+  a real miss from a phantom. A count that DROPS is not a regression until each dropped row has been read.
+- **Every hazard was probed on the real subject, and the old guard passed all six.** They were: a TS
+  method whose name wraps before its `(`; a nested literal closing at the fixed indent, ahead of a
+  `catch`; `markDirty` moved OUT of `install` (the anchor-to-anchor window still held it); an `owner`
+  moved into a nested `meta` literal; `_isFileDirect: true` nested the same way; and the anchor's
+  paren in a string.
+- **"The function named X" has more than one answer.** `install: (r) => install(r)` in a deps literal is a
+  function known by `install`, beside `const install = async …`. `functionsNamed` returns both on purpose,
+  and a caller asking about the declaration filters out a property-assigned one and asserts the count.
+- **Compare a wired value WHOLE.** `viewportBringUpWired` anchored each needle on the delimiter ending it,
+  so that `() => disposed && false` would not pass as `() => disposed`. `printedText(propertyValue(…))`
+  equal to the expected code does the same without a delimiter, and without the brace count that found
+  the call.
+- **The P1 review found the migration opening two holes the text had kept shut, and both have the same
+  shape: one reader widened while the reader it pairs with did not.**
+  - `stubExports` learned the `export { auth }` list form, but `stubNamespaceMembers` still read only
+    `export const auth = {`. A namespace exported through a list counted as exported, and its members were
+    never checked. One export table now feeds both.
+  - `typeMembers` returned an extending interface's own members. The `interface NAME {` text it replaced
+    could not find `interface NAME extends B {` at all, so it failed. The new reader instead read a field
+    moved into the base as missing from the interface, and `manifestBlockPlumbing` passed with `hash`
+    moved and dropped from the writer. `typeMembers` now refuses `extends`.
+
+  So when a migration makes one reader see MORE, ask what pairs with it: the other half of a
+  cross-check, or a failure the old text produced by seeing less.
+- **A population restricted to dodge a false positive is also a hole.** The stub's member scan ran only
+  over namespace OBJECTS, "so an unrelated local called `auth` can't false-positive". So a namespace
+  written as `export class serverTime {}` went unchecked. When the scan was widened to every export, its
+  name regex immediately credited Court's `track: string` parameter's `track.slice(…)` to the imported
+  `track`. The fix is to read by symbol, and that loses a binding HANDED ON: `cloudSyncWiring.ts` calls
+  through `services.auth` and a `cloudSave` parameter, and the symbol scan alone dropped those 4 calls.
+  So a binding whose every read is a member call, a direct call or a `typeof` is read by symbol, and a
+  handed-on binding is followed by name. The third review showed that name-following errs toward
+  requiring a member ONLY when the receiver is spelled like the import. Wordweave calls through
+  `accountAuth()`, which RETURNS `c ? { ...auth, …o } : auth`. Neither form saw those calls, so wordweave
+  required no `auth` member at all, and only Court calling the same four members kept the stub whole.
+  Following the return fixed that, and the fourth review found `const a = accountAuth(); a.signInWithApple()`
+  dropped the same way. **Every round had found one more path the value takes, and each was silent**,
+  because an unmodelled path yielded no members and no report. So there is now one classifier. A value
+  is a member call (required), a direct call or `typeof` (nothing), bound by `const` (follow its reads),
+  or returned from a named function (follow its calls), up to three hops. Anything else is COUNTED on a
+  hand-on ledger. That is `dynamicMembers`' rule: a use the guard cannot read must not pass as no use.
+  **The lesson is the loud default, not the extra hops.** A dataflow follower that returns "nothing" for
+  a shape it does not model has the same defect as the text slice it replaced. A pardoned hand-on is
+  UNCHECKED: the name fallback reads it only while the receiver keeps the import's spelling, and a
+  renamed parameter stayed green in review, so each row's reason has to say so.
+- **A fixture has to call the guard's own classifier.** Three #1195 fixtures re-implemented the check
+  inline (`lits.filter(… 'owner')`, `propertyValue(…)?.kind`, `typeMembers(…)` in place of
+  `versionType`). A mutation back to the text rule left them green. The classifier is now a named
+  function (`isOwned`, `isFlagged`, `versionTypeIn`), and the fixture calls that function.
+- **The docblock's own example was outside the population.** `handleProviderOwner` names `chromeHandles`
+  as the provider it exists to see. That literal's `kind` is computed (`el.getAttribute(…) ?? …`), and
+  both the text reader and the first parse required a string, so deleting its `owner` passed. A computed
+  `kind` now counts, and the ledger key prints it in parentheses.
+- **No parser is still a recorded decision.** `pluginMethodParity`'s Swift `pluginMethods` array keeps
+  its bracket count, and the reason is written on `bracketBody`. A moved edge shows up as a method-set
+  mismatch against the TS and Android sides, so it fails loud.
+
+**P2 landed** the 19 guards that read a function body, a branch, a table or a call by its text extent.
+It added no `sourceAst` helper: each guard's reader is a named function in its own file, over the P1
+helpers plus `precedingStatements`, `readsOf` and `declarationOf`. What recurred:
+
+- **A text reader over a TEST corpus reads the tests' own fixture strings as code.** `liveReloadKinds`
+  enumerated watcher files by comment-blanked text, so the new fixture strings (`server.watcher.on(`,
+  `const onChange = (`) made it list its own test file as a watcher and fail. `posixPathGuard`'s binding
+  regex counted 23 POSIX bindings where there are 14; all 9 extra were `const p = '/Users/…'` inside
+  fixture source strings. `jsonSafeIsShared` counted a `JSON.stringify(...)` written in a message string
+  (the DEV error in `writeMaterialExtra`, `materialExtras.ts`). Comment blanking does not make a text scan safe; strings are the other half.
+- **The extent was not the only window.** "Runs before", "inside the install's try", "the error path"
+  and "the claim is released before this exit" were also offsets: the first `indexOf` of each call, the
+  400 characters after one, the text between a log line and the next `} catch`. The node form is an
+  earlier statement of an enclosing list (`precedingStatements`) in the SAME function. The first draft
+  of that dropped the same-function half and credited a closure merely DEFINED before the install.
+  Offsets on nodes are still offsets: "exits after `buildClaim = …`" by position included the
+  acquisition's own `catch`, which runs while no claim is held. The unit there is the top-level
+  statement.
+- **Where names repeat, resolve by symbol.** SceneView's 2D and 3D pickers are both
+  `pickEntityAtViewportPoint`; only the slice each regex ran over told them apart. A handler that
+  shadows `path` passes `activeScenePath(path` as text. `posixPathGuard`'s indent window was a guess at
+  scope, and missed a module-level binding used two `it`s down.
+- **A reader that sees the whole unit finds what the slice never covered.** `createPrefabFromEntity`
+  writes the prefab twice: the `redo` closure rewrites it and must stay quiet, and that is now pinned.
+  "No tool spreads an `action`-bearing arg object" checked one tool; it now checks the 11 that declare
+  `action`. `classifySceneChange` branches must now RETURN the kind they test, not merely compare it.
+- **A fixture written as a fragment cannot be parsed.** `jsonSafeIsShared`'s detector fixtures were
+  `': JSON.stringify(…) ?? …'` and an unclosed `function isThenable(…) {`. They are statements of the same
+  shapes now, plus the two the paren scan documented as blind spots (a `)` in a regex literal, a
+  backtick nested in `${…}`).
+- **The review confirmed 16 more (plus one plausible and a nit, all fixed), and the largest class was a
+  node reader NARROWER than the text it replaced.** Three reviewers, one per file group, each ran the old
+  guard beside the new one on a perturbed subject. The old window was often wide by ACCIDENT, and that width was load-bearing.
+  - `bootstrapGameDepsVendorOrder`'s `'\n  }'` closer never matched the file's indent, so it scanned
+    from the vendor call to the install. A catch-only reader passed an `if (!vendorResult) continue;`
+    between them.
+  - The icon guard's text ban covered the whole function; `iconSpawns` covered one array literal. A
+    second spawn with `--icon`, or a flag held in a variable, passed.
+  - `objectReads` read array literals and missed `gcloudRun('storage', 'cat', …)`.
+  - The install port only had to CALL `runScaffoldShell`, where the concise-arrow regex had pinned its
+    RETURN. `return true` after it builds on while npm is still running.
+  - `warnInertPrefabSizes` compared the path argument, and the regex had pinned the prefab too.
+  - `posixPathGuard` needed the literal to be the whole argument, and `'/tmp/' + name` is not.
+  - `constructsTeardownToken` took a declaration or `=`, and a `??=` module left the population with
+    both checks on it.
+
+  So "the same population on today's tree" is necessary and not sufficient. Measure the old guard's
+  REACH as well: what else could its window have contained?
+- **A check that lives only in a comment or a failure message is not a check.** `dirtyWake`'s message
+  said the wake ran "before its return", and it compared top-level indices, so a conditional
+  `{ …; return; }` above the wake passed. `viteCacheBust`'s docblock said a clear "on every boot" is not
+  the fix, and nothing read the `if (prev !== buildSig)` gate. The stub scan's commit said nothing
+  unreadable yields "no members" without a row. A returner with no in-file call, or a `return` inside
+  an anonymous callback, did exactly that. A commit message's mutation list is a claim too: "no
+  dedupe: red" was green, because no fixture held a node in both sets.
+- **Each fix to a guard reader gets its own review, and two rounds of it still found defects.** The
+  first re-review of the review fixes found one that stopped counting a `break` the text reader had
+  counted. The second found a release credited because it sat below module scope, though it ran before
+  the build it was meant to cover. It also found a gate reader built from a list of what CAN skip
+  (`guardsOf`: `if`, `? :`, `&&`, `||`), which `??`, `||=` and a `switch` walked past. That reader is now
+  a list of what CANNOT skip. And it found three new rules that no mutation turned red. A list of the
+  ways to escape a check is never complete. Allow the known-safe shapes and flag everything else.
+
+  A third round still found seven, two of them false greens against the real script. Two lessons are new:
+  - **Stop locating the work, and pin a checkable condition instead.** Each claim-release reader tried to
+    say where "the build" was: module scope, then after the `try` block. Each moved the hole
+    (`release(); try { build } catch { failed = true } if (failed) exit` passed). The rule now is that
+    nothing but `console.*` or an exit runs between the release and the exit. It is strict, and red on a
+    nested report, but it cannot be walked around.
+  - **An allowlist needs its own accept cases, or it turns into false reds.** The install allowlist red-flagged
+    `if (npmRun(…).status !== 0)`. The "prior value" check red-flagged `JSON.parse(prev).buildSig !==
+    buildSig`, because a property NAME matched. And a depth budget that returns "clean" when exhausted
+    fails open. Fail loudly instead.
+
 
 Progress: **seventeen guards are on the ledger** — `determinismGuard`, `docCitations` and
 `importSettingSelectsSpliced` (Phase 1); `assetJsonGuard`, `handleProviderOwner`,

@@ -25,6 +25,7 @@ import {
 } from '../../plugins/vite-asset-scanner';
 import { findGamesEntry } from '../../plugins/findGamesEntry';
 import { readScannedSource } from '@modoki/engine/testing';
+import { accessPath, findNodes, functionsNamed, parseSource, referencesToPath, stringValueOf, ts } from '@modoki/engine/testing/sourceAst';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 // engine/tests/plugins/ → repo root (games/ + engine/packages/modoki live there).
@@ -1786,74 +1787,23 @@ describe('otaPublishBuildStepEnv (/api/ota/publish native-build env)', () => {
 // ota-publish.mjs's content-based check — that weaker guard short-circuited the stronger
 // one, permanently burning a version string for a publish that died after upload but
 // produced IDENTICAL bytes on retry. The route is an SSE handler that is not exported, so
-// this asserts against the route's source text directly. Deliberately brittle: it isolates
-// the handler body with stable anchors and fails LOUDLY (not vacuously) if either anchor
-// goes missing, so the test cannot silently stop checking anything.
+// this asserts against the route's source directly — its `if (req.url === '/api/ota/publish' …)`
+// branch and the `otaPublishSteps` helper, as NODES (#1195), failing LOUDLY if either is not
+// found once.
 describe('/api/ota/publish route has no collision guard of its own (#577)', () => {
-  const source = readScannedSource(path.join(PROJECT_ROOT, 'engine/plugins/vite-asset-scanner.ts')).code;
-  const START_ANCHOR = "req.url === '/api/ota/publish'";
-  const END_ANCHOR = '})().finally(otaRelease.onPipelineEnd);';
+  const sf = parseSource(readScannedSource(path.join(PROJECT_ROOT, 'engine/plugins/vite-asset-scanner.ts')).code, 'vite-asset-scanner.ts');
 
-  /** The route is an SSE handler, not an exported function, so the only reachable check is
-   *  on its source text. Throws rather than returning empty when an anchor moves — a
-   *  region this cannot find must fail the suite, never silently shrink to nothing. */
-  const routeBody = (): string => {
-    const startIdx = source.indexOf(START_ANCHOR);
-    const endIdx = source.indexOf(END_ANCHOR);
-    if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) {
-      throw new Error(
-        `#577 regression test: could not isolate the /api/ota/publish handler in ` +
-        `vite-asset-scanner.ts (start anchor ${JSON.stringify(START_ANCHOR)} ` +
-        `${startIdx === -1 ? 'MISSING' : 'ok'}, end anchor ${JSON.stringify(END_ANCHOR)} ` +
-        `${endIdx === -1 ? 'MISSING' : endIdx <= startIdx ? 'BEFORE START' : 'ok'}). The route was ` +
-        `moved or reworded. Re-point the anchors, then confirm the assertions below still cover ` +
-        `the intended region before trusting a green run.`,
-      );
-    }
-    return source.slice(startIdx, endIdx + END_ANCHOR.length);
-  };
+  // ⚠️ These used to be TEXT: the handler from `req.url === '/api/ota/publish'` to the text
+  // `})().finally(otaRelease.onPipelineEnd);`, the helper from `export function otaPublishSteps(` to the
+  // first `'\n}\n'`, and a line filter dropping whatever looked like a comment so a maintainer could
+  // describe the preflight without tripping the guard. A node reader needs none of that: comments are not
+  // nodes, and the strings it reads are exactly the code a preflight would have to write.
 
-  /** Comment lines removed so the assertions below are about CODE only. Without this the
-   *  guard forbids DESCRIBING itself: a maintainer writing "do not re-add the `gcloud
-   *  storage cat .../manifest.json` preflight here" would turn the suite red with a message
-   *  telling them the code does the thing their comment says not to do — in a repo whose
-   *  convention is heavy explanatory comments, that lands fast. Deliberately conservative:
-   *  only lines whose trimmed form OPENS a comment are dropped, never a trailing `//` on a
-   *  line of code, because `'https://…'` inside a real call would take the code with it and
-   *  turn a false positive into a false NEGATIVE — the direction that actually costs.
-   *
-   *  Two known edges, neither worth code today (both checked against this file's real style):
-   *  a block comment whose continuation lines do NOT start with `*` keeps those lines, so
-   *  describing the preflight in that style still turns this red — fails SAFE, just noisy.
-   *  A line that opens `/*` and closes it before real code (`/* c8 ignore next *​/ execFile…`)
-   *  is dropped whole and WOULD evade both assertions — that is the false-negative shape to
-   *  watch; `^\s*\/\*.*\*\/\s*\S` currently matches nowhere in the plugin sources. */
-  /** Since #837 the commands the handler runs live in `otaPublishSteps`, one helper away. So the
-   *  scanned region is the handler PLUS that helper: a preflight re-added in either place is inside
-   *  it. Same throw-rather-than-shrink rule as `routeBody`. */
-  const HELPER_START = 'export function otaPublishSteps(';
-  const helperBody = (): string => {
-    const startIdx = source.indexOf(HELPER_START);
-    const endIdx = startIdx === -1 ? -1 : source.indexOf('\n}\n', startIdx);
-    if (startIdx === -1 || endIdx === -1) {
-      throw new Error(`#577 regression test: could not isolate otaPublishSteps in vite-asset-scanner.ts (anchor ${JSON.stringify(HELPER_START)}). Re-point it.`);
-    }
-    return source.slice(startIdx, endIdx + 2);
-  };
-
-  const routeCode = (): string => `${routeBody()}\n${helperBody()}`
-    .split('\n')
-    .filter((line) => !/^\s*(\/\/|\/\*|\*)/.test(line))
-    .join('\n');
-
-  it('isolates the route handler body between stable start/end anchors', () => {
-    expect(routeBody().length).toBeGreaterThan(0);
+  it('isolates the route handler body and the helper it runs', () => {
+    const { route, helper } = otaPublishUnits(sf);
     // The handler must still run the helper's command, or scanning the helper covers nothing it does.
-    expect(routeBody()).toContain('steps.publishCmd');
-    expect(helperBody()).toContain('ota-publish.mjs');
-    // The strip must not eat the body whole — a `routeCode()` of nothing would pass every
-    // assertion below for the wrong reason.
-    expect(routeCode()).toContain('ota-publish.mjs');
+    expect(referencesToPath(route, 'steps.publishCmd').length).toBeGreaterThan(0);
+    expect(stringPieces(helper).some((p) => p.includes('ota-publish.mjs'))).toBe(true);
   });
 
   // ⚠️ Scope, stated honestly: this catches a re-add written INLINE in this route. It cannot
@@ -1869,15 +1819,16 @@ describe('/api/ota/publish route has no collision guard of its own (#577)', () =
   // guards against (verified by running one over the pre-fix source). A guard that only
   // catches re-adds shaped like its own mutation test is not a guard.
   it('never names a versioned manifest.json — nothing here may reason about one', () => {
+    const { route, helper } = otaPublishUnits(sf);
     expect(
-      routeCode().includes('manifest.json'),
+      [route, helper].flatMap(stringPieces).filter((p) => p.includes('manifest.json')),
       '#577: the /api/ota/publish route must not reference a bundle manifest at all. It used to ' +
       'build `bundles/<name>/<version>/manifest.json` for an EXISTENCE-based collision preflight ' +
       'that ran BEFORE ota-publish.mjs and short-circuited that script\'s CONTENT-based guard, ' +
       'permanently refusing a legitimate identical-bytes retry through the editor dialog and the ' +
       'MCP tool. ota-publish.mjs is the single source of truth — see the Step 3 comment in the ' +
       'route for why a guard here would just re-implement the script.',
-    ).toBe(false);
+    ).toEqual([]);
   });
 
   it('never reads bucket objects — not via `cat`, `ls`, or `objects describe`', () => {
@@ -1886,18 +1837,80 @@ describe('/api/ota/publish route has no collision guard of its own (#577)', () =
     // plausibly reach for either — so all three are refused. Matches the arg-array form
     // (`'storage', 'cat'`) and a bash-string form alike. The CORS step's legitimate
     // `gcloud storage buckets update` must NOT be flagged; the baseline run proves it isn't.
-    const objectRead = /['"`\s]storage['"`,\s]+['"`]?(cat|ls|objects['"`,\s]+['"`]?describe)\b/i;
+    const { route, helper } = otaPublishUnits(sf);
     expect(
-      objectRead.test(routeCode()),
+      [route, helper].flatMap(objectReads),
       '#577: the /api/ota/publish route must not read bucket objects to decide anything. ' +
       'An existence-only collision preflight (`gcloud storage cat`, or an `ls`/`objects ' +
       'describe` standing in for it) ran BEFORE ota-publish.mjs and short-circuited its ' +
       'content-based guard. Reading an object here to gate the publish reintroduces a second ' +
       'guard that races the one in ota-publish.mjs — and the two drifting IS the bug. ' +
       '(Setting CORS via `gcloud storage buckets update` is fine and is not matched.)',
-    ).toBe(false);
+    ).toEqual([]);
+  });
+
+  it('reads the handler, the helper, and every string and argument list in them as nodes (#1195)', () => {
+    const probe = parseSource([
+      'export function otaPublishSteps(o: O) { const t = `\n}\n`; return { publishCmd: `node engine/scripts/ota-publish.mjs ${t}` }; }',
+      'function mw(req, res) {',
+      "  if (req.url === '/api/other') { execFileSync('gcloud', ['storage', 'cat', 'x/manifest.json']); }",
+      "  if ((req.url === '/api/ota/publish' || x) && req.method === 'GET') {",
+      '    /* gcloud storage cat bundles/v/manifest.json */',
+      "    run(steps.publishCmd); execFileSync('gcloud', ['storage', 'buckets', 'update', b]);",
+      "    const m = `${bucket}/manifest.json`; sh(`gcloud storage  ls ${m}`); execFileSync('gcloud', ['storage', 'objects', 'describe', m]);",
+      '  }',
+      '}',
+    ].join('\n'), 'probe.ts');
+    const { route, helper } = otaPublishUnits(probe);
+    expect(referencesToPath(route, 'steps.publishCmd')).toHaveLength(1);
+    expect(stringPieces(helper).filter((p) => p.includes('ota-publish.mjs'))).toHaveLength(1);
+    expect(stringPieces(route).filter((p) => p.includes('manifest.json'))).toEqual(['/manifest.json']);
+    expect(objectReads(route)).toEqual(['storage objects describe', 'gcloud storage  ls ']);
+    // The words spread across a helper call's own arguments, not an array (#1195 close-out review).
+    expect(objectReads(parseSource("gcloudRun('storage', 'cat', `gs://b/x/`);\ngcloudRun('storage', 'buckets', 'update', b);", 'p.ts'))).toEqual(['storage cat']);
+    expect(() => otaPublishUnits(parseSource('function otaPublishSteps() {}', 'x.ts'))).toThrow(/one \/api\/ota\/publish route/);
   });
 });
+
+/** The `/api/ota/publish` handler — the then-branch of the ONE `if` whose test compares `req.url` with that path —
+ *  and the `otaPublishSteps` helper it runs. Either missing, or found twice, throws. */
+function otaPublishUnits(sf: ts.SourceFile): { route: ts.Statement; helper: ts.Node } {
+  const routes = findNodes(sf, ts.isIfStatement).filter((s) => findNodes(s.expression, ts.isBinaryExpression)
+    .some((b) => b.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken && accessPath(b.left) === 'req.url' && stringValueOf(b.right) === '/api/ota/publish'));
+  if (routes.length !== 1) throw new Error(`#577 regression test: expected one /api/ota/publish route in vite-asset-scanner.ts, found ${routes.length}. Re-point it.`);
+  const helpers = functionsNamed(sf, 'otaPublishSteps');
+  if (helpers.length !== 1) throw new Error(`#577 regression test: expected one otaPublishSteps in vite-asset-scanner.ts, found ${helpers.length}. Re-point it.`);
+  return { route: routes[0]!.thenStatement, helper: helpers[0]!.body };
+}
+
+/** The text of every string literal and template piece under `n`. */
+function stringPieces(n: ts.Node): string[] {
+  return findNodes(n, (x): x is ts.StringLiteral | ts.NoSubstitutionTemplateLiteral | ts.TemplateHead | ts.TemplateMiddle | ts.TemplateTail =>
+    ts.isStringLiteral(x) || ts.isNoSubstitutionTemplateLiteral(x) || ts.isTemplateHead(x) || ts.isTemplateMiddle(x) || ts.isTemplateTail(x))
+    .map((x) => x.text);
+}
+
+/** Every bucket-object READ under `n`: a list — an array literal's elements, or a CALL's arguments
+ *  (`gcloudRun('storage', 'cat', uri)`) — whose string items run `storage` then `cat`/`ls` (or `objects` then
+ *  `describe`), as those words; and a single string or template piece holding `storage cat|ls|objects describe`,
+ *  as the piece. `storage buckets update` (the CORS step) is not one. */
+function objectReads(n: ts.Node): string[] {
+  const lists = [
+    ...findNodes(n, ts.isArrayLiteralExpression).map((arr) => arr.elements),
+    ...findNodes(n, ts.isCallExpression).map((call) => call.arguments),
+  ];
+  const fromArrays = lists.flatMap((items) => {
+    const words = items.map((e) => stringValueOf(e));
+    return words.flatMap((w, i) => {
+      if (w !== 'storage') return [];
+      if (words[i + 1] === 'cat' || words[i + 1] === 'ls') return [`storage ${words[i + 1]}`];
+      if (words[i + 1] === 'objects' && words[i + 2] === 'describe') return ['storage objects describe'];
+      return [];
+    });
+  });
+  const fromText = stringPieces(n).filter((p) => /\bstorage\s+(cat|ls|objects\s+describe)\b/i.test(p));
+  return [...fromArrays, ...fromText];
+}
 
 describe('isSiblingRaisedChange — a body write must not discard the descriptor\'s parked edit (#857 close-out)', () => {
   const DESC = '/games/g/assets/shaders/holo.shader.json';

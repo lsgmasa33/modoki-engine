@@ -26,21 +26,27 @@ import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { join } from 'node:path';
 import { DEVICE_STATUS_TARGET_FIELDS } from '../../tools/game-debug-mcp/src/mcp-tools';
 import { readScannedSource } from '@modoki/engine/testing';
+import { parseSource, ts, typeMembers, typesNamed } from '@modoki/engine/testing/sourceAst';
 
 const SRC = join(__dirname, '../../plugins/backend/deviceConnection.ts');
 
-/** The `target: { … } | null` member of `DeviceConnectStatus`, by its field names. */
+/** The `target: { … } | null` member of `DeviceConnectStatus`, by its field names.
+ *
+ *  ⚠️ From the parser (#1195). This used to take the interface up to the first `'\n}'` and the target
+ *  up to its first `}`, then split on `;` and `:` — so a nested literal inside the target ended it
+ *  early, and a field typed `(a: number) => void` would have split into two names. */
 function realTargetFields(): string[] {
-  const src = readScannedSource(SRC).code;
-  const iface = /export interface DeviceConnectStatus \{([\s\S]*?)\n\}/.exec(src);
-  expect(iface, 'DeviceConnectStatus not found — did the interface move or get renamed?').toBeTruthy();
-  const target = /^\s*target:\s*\{([^}]*)\}/m.exec(iface![1]);
-  expect(target, 'DeviceConnectStatus.target is no longer an inline object literal').toBeTruthy();
-  return target![1]
-    .split(';')
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map((s) => s.split(':')[0].trim().replace(/\?$/, ''));
+  const sf = parseSource(readScannedSource(SRC).code, SRC);
+  const decls = typesNamed(sf, 'DeviceConnectStatus');
+  expect(decls.length, 'DeviceConnectStatus not found — did the interface move or get renamed?').toBe(1);
+  const members = typeMembers(decls[0]);
+  expect(members, 'DeviceConnectStatus is no longer a plain interface (it extends another, or became an alias) — read its new shape').toBeDefined();
+  const target = members!.filter((m) => m.name === 'target');
+  expect(target.length, 'DeviceConnectStatus has no `target` member').toBe(1);
+  const t = target[0]!.type;
+  const literal = t && ts.isUnionTypeNode(t) ? t.types.filter(ts.isTypeLiteralNode) : t && ts.isTypeLiteralNode(t) ? [t] : [];
+  expect(literal.length, 'DeviceConnectStatus.target is no longer an inline object literal (or `literal | null`)').toBe(1);
+  return typeMembers(literal[0])!.map((m) => m.name);
 }
 
 describe('device MCP status mirror vs DeviceConnectStatus', () => {

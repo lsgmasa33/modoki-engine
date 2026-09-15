@@ -18,6 +18,7 @@ import path from 'node:path';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { readScannedSource } from '@modoki/engine/testing';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
+import { callsTo, declarationOf, findNodes, functionsNamed, parseSource, ts, variablesNamed } from '@modoki/engine/testing/sourceAst';
 
 const ED = path.resolve(__dirname, '../../packages/modoki/src/editor');
 const read = (rel: string) => readScannedSource(path.join(ED, rel)).code;
@@ -314,19 +315,33 @@ describe('data-ui-id tagging has not rotted', () => {
     // class while every other assertion here stays green (verified by mutation — dropping the
     // attribute from `Check` passed both this suite and particleFieldIds.test.tsx before this
     // check existed). So assert the OUTPUT per widget, not just the wiring once.
-    const panel = read('panels/ParticleEditor.tsx');
+    // ⚠️ From the parser (#1195): each body used to run to the next `'\nfunction '` and pass on the TEXT
+    // `data-ui-id=` or `uiId={uiId` anywhere in it — an attribute fed something else, or one in a string, passed.
+    const sf = parseSource(read('panels/ParticleEditor.tsx'), 'ParticleEditor.tsx');
     for (const widget of ['Num', 'MinMax', 'Vec3Row', 'Check', 'Enum', 'Color']) {
-      const start = panel.indexOf(`function ${widget}({`);
-      expect(start, `widget ${widget} is gone — rename it here too`).toBeGreaterThan(-1);
-      // Body = up to the next top-level `function` declaration.
-      const next = panel.indexOf('\nfunction ', start + 1);
-      const body = panel.slice(start, next === -1 ? undefined : next);
       // Either it emits the attribute itself, or it hands the id to NumInput (which does).
-      expect(body.includes('data-ui-id=') || body.includes('uiId={uiId'), `${widget} computes a ui id but never renders one`).toBe(true);
+      expect(renderedFieldIds(sf, widget), `${widget} computes a ui id but never renders one`).not.toEqual([]);
     }
-    // ...and NumInput, the leaf every numeric field bottoms out in, must emit it.
-    const ni = panel.slice(panel.indexOf('function NumInput({'));
-    expect(ni.slice(0, ni.indexOf('\nfunction ')), 'NumInput no longer renders data-ui-id').toContain('data-ui-id={uiId}');
+    // ...and NumInput, the leaf every numeric field bottoms out in, must emit the id it is handed.
+    expect(renderedFieldIds(sf, 'NumInput'), 'NumInput no longer renders data-ui-id').toEqual(['<input data-ui-id>']);
+  });
+
+  it('reads a widget\'s rendered id attributes, and only ones fed the id it computed (#1195)', () => {
+    const sf = parseSource([
+      'function NumInput({ uiId, other }: P) { return <input data-ui-id={other} title={`\nfunction x`} aria-label={uiId} />; }',
+      'function Check({ label }: P) { const uiId = useFieldId(label); return <div><input data-ui-id={uiId} /></div>; }',
+      'function Vec3Row({ label }: P) { const uiId = useFieldId(label); return <><NumInput uiId={uiId && `${uiId}.x`} /><Other uiId={uiId} /></>; }',
+      'function Enum({ label }: P) { const uiId = useFieldId(label); const note = "data-ui-id="; return <select data-ui-id={note} />; }',
+      'function Color({ label }: P) { const uiId = makeId(label); return <input data-ui-id={uiId} />; }',
+    ].join('\n'), 'probe.tsx');
+    expect(renderedFieldIds(sf, 'NumInput')).toEqual([]);
+    expect(renderedFieldIds(sf, 'Check')).toEqual(['<input data-ui-id>']);
+    expect(renderedFieldIds(sf, 'Vec3Row')).toEqual(['<NumInput uiId>']);
+    expect(renderedFieldIds(sf, 'Enum')).toEqual([]);
+    expect(renderedFieldIds(sf, 'Color')).toEqual([]);
+    // A widget that takes `uiId` as a prop instead of computing it renders an id nobody passes.
+    expect(renderedFieldIds(parseSource('function Check({ label, uiId }: P) { return <input data-ui-id={uiId} />; }', 'p2.tsx'), 'Check')).toEqual([]);
+    expect(() => renderedFieldIds(sf, 'MinMax')).toThrow(/widget MinMax is gone/);
   });
 
   it('the shared tree components still forward a caller-owned uiId', () => {
@@ -630,3 +645,29 @@ describe('data-ui-id tagging has not rotted', () => {
     }
   });
 });
+
+/**
+ * The id attributes a Particle field widget renders FROM the id it computes, as `<tag attr>`: a `data-ui-id`
+ * on any element, or a `uiId` handed to `<NumInput>`, whose value reads the widget's own id — a
+ * `const uiId = useFieldId(…)` in its body, or (for NumInput itself) its `uiId` parameter. Resolved by
+ * symbol, so an attribute fed some other value does not count.
+ */
+function renderedFieldIds(sf: ts.SourceFile, widget: string): string[] {
+  const fns = functionsNamed(sf, widget);
+  expect(fns.length, `widget ${widget} is gone — rename it here too`).toBe(1);
+  const fn = fns[0]!;
+  const ids = new Set<ts.Node>([
+    ...variablesNamed(fn.body, 'uiId').filter((d) => !!d.initializer && callsTo(d.initializer, 'useFieldId').length > 0),
+    // Only NumInput is HANDED its id; every other widget must compute its own (#1195 close-out review).
+    ...(widget !== 'NumInput' ? [] : fn.parameters).flatMap((p) => (ts.isObjectBindingPattern(p.name) ? [...p.name.elements] : [])
+      .filter((e) => ts.isIdentifier(e.name) && e.name.text === 'uiId')),
+  ]);
+  const tagOf = (a: ts.JsxAttribute) => (a.parent.parent as ts.JsxOpeningLikeElement).tagName.getText();
+  return findNodes(fn.body, ts.isJsxAttribute)
+    .filter((a) => a.name.getText() === 'data-ui-id' || (a.name.getText() === 'uiId' && tagOf(a) === 'NumInput'))
+    .filter((a) => {
+      const e = a.initializer && ts.isJsxExpression(a.initializer) ? a.initializer.expression : undefined;
+      return !!e && findNodes(e, ts.isIdentifier).some((id) => { const d = declarationOf(id); return !!d && ids.has(d); });
+    })
+    .map((a) => `<${tagOf(a)} ${a.name.getText()}>`);
+}

@@ -31,6 +31,7 @@
 import { describe, expect, it } from 'vitest';
 import * as path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
+import { callsTo, parseSource, printedText, stringValueOf, ts, typeMembers, typesNamed } from '@modoki/engine/testing/sourceAst';
 import { REPO_ROOT } from '../helpers/repoLayout';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 // @ts-expect-error — .mjs script module, no type declarations by design (it is a build script).
@@ -52,7 +53,13 @@ const filesUnder = (pkgRel: string, sub: string, match: RegExp): string[] =>
   repoFiles({ under: `${pkgRel}/${sub}`, match, floor: 0 }).map((f: { abs: string }) => f.abs);
 
 /** The body between a `signature` ending in an open bracket and its balancing close. Run on
- *  comment-STRIPPED code, so a bracket inside prose cannot unbalance it. */
+ *  comment-STRIPPED code, so a bracket inside prose cannot unbalance it.
+ *
+ *  ⚠️ **SWIFT ONLY, and a recorded decision (#1195).** The TS half reads the parser. Swift has no parser
+ *  in this repo, so the `pluginMethods` array is still cut by counting `[`/`]` — a bracket inside one of
+ *  its string literals would move the edge. Each entry is a fixed `CAPPluginMethod(name: "…")` literal
+ *  with no bracket in it today, and a moved edge shows up as a method-set mismatch against the TS and
+ *  Android sides, which fails. It does not pass. */
 function bracketBody(code: string, signature: string, open: string, close: string, where: string): string {
   const start = code.indexOf(signature);
   if (start === -1) throw new Error(`could not find "${signature}" in ${where}`);
@@ -67,10 +74,25 @@ function bracketBody(code: string, signature: string, open: string, close: strin
   return code.slice(bodyStart, i - 1);
 }
 
-/** Method members of an interface body: an identifier, optional generics, then `(` — `purchase(`,
- *  `listen<T>(`. A field (`productId: string;`) has `:` there, and comment lines are already blank. */
-function tsMethodNames(interfaceBody: string): string[] {
-  return [...interfaceBody.matchAll(/^[ \t]*([a-zA-Z_$][\w$]*)[ \t]*(?:<[^>\n]*>)?[ \t]*\(/gm)].map((m) => m[1]);
+/** The METHOD members the plugin's TS contract declares: `registerPlugin<Iface>('JsName', …)` in
+ *  `src/index.ts` names the interface, and `src/definitions.ts` declares it (#1195). A method signature
+ *  (`purchase(…)`, `listen<T>(…)`) counts; a field (`productId: string`) does not.
+ *
+ *  Both used to be text: a regex for the `registerPlugin<…>('…'` call, and a brace count from
+ *  `export interface <Iface> {` followed by a per-line `ident<…>(` match, which a brace in a string
+ *  type moved and a signature wrapped before its `(` hid. */
+function tsContract(pkgAbs: string, rel: string): { iface: string; jsName: string; methods: string[] } {
+  const indexFile = path.join(pkgAbs, 'src', 'index.ts');
+  const regs = callsTo(parseSource(readScannedSource(indexFile).code, indexFile), 'registerPlugin')
+    .filter((c) => c.typeArguments?.length === 1 && ts.isTypeReferenceNode(c.typeArguments[0]!) && stringValueOf(c.arguments[0]) !== undefined);
+  if (regs.length !== 1) throw new Error(`${rel}/src/index.ts: expected one registerPlugin<Interface>('Name') call, found ${regs.length}`);
+  const iface = printedText((regs[0]!.typeArguments![0] as ts.TypeReferenceNode).typeName);
+  const jsName = stringValueOf(regs[0]!.arguments[0])!;
+  const defsFile = path.join(pkgAbs, 'src', 'definitions.ts');
+  const decls = typesNamed(parseSource(readScannedSource(defsFile).code, defsFile), iface);
+  const members = decls.length === 1 ? typeMembers(decls[0]) : undefined;
+  if (!members) throw new Error(`${rel}/src/definitions.ts: expected one interface ${iface}, found ${decls.length} declaration(s), or one that extends another or is not an interface — read its new shape`);
+  return { iface, jsName, methods: members.filter((m) => m.kind === 'method').map((m) => m.name) };
 }
 
 /** A signature Capacitor can dispatch into: public, void/Unit, exactly one `PluginCall`.
@@ -127,14 +149,8 @@ function readSurface(pkgAbs: string): Surface {
   const rel = relKey(REPO_ROOT, pkgAbs) as string;
 
   // TS: `registerPlugin<Iface>('JsName', …)` names both the interface to read and the plugin name.
-  const indexCode = readScannedSource(path.join(pkgAbs, 'src', 'index.ts')).code;
-  const reg = /registerPlugin<\s*(\w+)\s*>\(\s*['"]([^'"]+)['"]/.exec(indexCode);
-  if (!reg) throw new Error(`${rel}/src/index.ts has no registerPlugin<Interface>('Name') call`);
-  const [, iface, jsName] = reg;
-  const defsCode = readScannedSource(path.join(pkgAbs, 'src', 'definitions.ts')).code;
-  const tsMethods = withoutBuiltins(tsMethodNames(
-    bracketBody(defsCode, `export interface ${iface} {`, '{', '}', `${rel}/src/definitions.ts`),
-  ));
+  const { jsName, methods } = tsContract(pkgAbs, rel);
+  const tsMethods = withoutBuiltins(methods);
 
   // Android: the ONE class carrying @CapacitorPlugin.
   const androidCandidates = filesUnder(rel, 'android/src/main', /\.(?:java|kt)$/)

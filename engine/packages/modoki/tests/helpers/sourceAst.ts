@@ -389,6 +389,138 @@ export function objectLiteralKeys(e: ts.Expression | undefined): string[] | unde
   });
 }
 
+/**
+ * The VALUE an object literal gives `key` (#1195) — the initializer of `key: v`, the name of a `{ key }`
+ * shorthand, or the method itself for `key() {}` / `get key() {}` — or `undefined` when `e` is not an
+ * object literal or declares no such key. Keys are matched by NAME, the way `objectLiteralKeys` spells
+ * them (a quoted or computed-literal key counts).
+ *
+ * It replaces "the text after `key:` up to the next comma or brace", which a nested literal, a string
+ * holding a comma, or a reflow each moved.
+ *
+ * When the literal names `key` twice the LAST one is returned, which is the one the object ends up
+ * holding. A spread AFTER it can still override it at runtime; nothing here can see what the spread holds.
+ */
+export function propertyValue(e: ts.Expression | undefined, key: string): ts.Expression | ts.MethodDeclaration | ts.AccessorDeclaration | undefined {
+  if (!e) return undefined;
+  const u = unwrapValue(e);
+  if (!ts.isObjectLiteralExpression(u)) return undefined;
+  const keys = objectLiteralKeys(u)!;
+  for (let i = u.properties.length - 1; i >= 0; i -= 1) {
+    if (keys[i] !== key) continue;
+    const p = u.properties[i]!;
+    if (ts.isPropertyAssignment(p)) return p.initializer;
+    if (ts.isShorthandPropertyAssignment(p)) return p.name;
+    if (ts.isMethodDeclaration(p) || ts.isGetAccessorDeclaration(p) || ts.isSetAccessorDeclaration(p)) return p;
+  }
+  return undefined;
+}
+
+/**
+ * Every `const`/`let`/`var` declaration in `root` that binds `name` directly (not by destructuring), in
+ * source order — in ANY scope, so a caller that means the module-level one filters by
+ * `enclosingFunction(d) === sf` (#1195). The initializer is `d.initializer`.
+ *
+ * It replaces `src.indexOf('const NAME')` followed by a bracket count or a `'\n];'` closer, which reads
+ * the next declaration whose name merely STARTS with `NAME` (`const MODULES_BY_KEY`) and stops at the
+ * first closer at that indent.
+ */
+export function variablesNamed(root: ts.Node, name: string): ts.VariableDeclaration[] {
+  return findNodes(root, (n): n is ts.VariableDeclaration => ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.name.text === name);
+}
+
+/** Every `interface NAME` and `type NAME =` declaration in `root`, in source order (#1195). An interface
+ *  declared twice MERGES, so a caller reading its fields reads every declaration's `typeMembers`. */
+export function typesNamed(root: ts.Node, name: string): Array<ts.InterfaceDeclaration | ts.TypeAliasDeclaration> {
+  return findNodes(root, (n): n is ts.InterfaceDeclaration | ts.TypeAliasDeclaration =>
+    (ts.isInterfaceDeclaration(n) || ts.isTypeAliasDeclaration(n)) && n.name.text === name);
+}
+
+/** One member of an object TYPE — see `typeMembers`. */
+export interface TypeMember {
+  /** The member's name as a NAME (`'a'` for `a`, `'a-b'` for `'a-b'`); `'[index]'`/`'()'`/`'new()'` for
+   *  an index, call or construct signature. */
+  name: string;
+  kind: 'property' | 'method' | 'index' | 'call' | 'construct';
+  optional: boolean;
+  /** A property's annotation or a method's return type; `undefined` when the source wrote none. */
+  type: ts.TypeNode | undefined;
+  node: ts.TypeElement;
+}
+
+/**
+ * The members of an object type (#1195): an `interface`, a `{ … }` type literal, or a `type X =` alias
+ * whose type is one (parentheses peeled). `undefined` for anything else — a union, a reference, an
+ * intersection, AND an interface that `extends` something — because such a type's members are not all
+ * written in one place, and a guard comparing field lists must not read a partial list off a shape it
+ * cannot see.
+ *
+ * ⚠️ **`extends` is refused, not skipped** (#1195 P1 review). Returning an extending interface's own
+ * members let a field MOVED into its base read as gone: `manifestBlockPlumbing` passed with `hash` moved to
+ * a base and dropped from the writer, where the `interface NAME {` text it replaced failed to find the
+ * interface at all. A caller that genuinely means own members only reads `decl.members` itself.
+ * A nested type literal's members are not its members — `typeMembers(member.type)` reads them.
+ *
+ * It replaces `interface NAME {` sliced to the next `'\n}'` (a nested literal at column 0 ended it) or a
+ * brace count, followed by `/^\s*(\w+)\??:/gm` — which counted every NESTED literal's keys as the
+ * interface's own, and read a method signature as no member at all.
+ */
+export function typeMembers(n: ts.Node | undefined): TypeMember[] | undefined {
+  let t: ts.Node | undefined = n;
+  if (t && ts.isTypeAliasDeclaration(t)) t = t.type;
+  while (t && ts.isParenthesizedTypeNode(t)) t = t.type;
+  if (!t || !(ts.isInterfaceDeclaration(t) || ts.isTypeLiteralNode(t))) return undefined;
+  if (ts.isInterfaceDeclaration(t) && t.heritageClauses?.length) return undefined;
+  const sf = t.getSourceFile();
+  return t.members.map((m): TypeMember => {
+    const optional = !!(m as ts.TypeElement & { questionToken?: ts.QuestionToken }).questionToken;
+    const named = (kind: TypeMember['kind'], type: ts.TypeNode | undefined): TypeMember => {
+      const nm = m.name;
+      const name = !nm ? '?' : ts.isIdentifier(nm) || ts.isStringLiteral(nm) || ts.isNumericLiteral(nm) || ts.isPrivateIdentifier(nm) ? nm.text
+        : ts.isComputedPropertyName(nm) && ts.isStringLiteralLike(nm.expression) ? nm.expression.text : nm.getText(sf);
+      return { name, kind, optional, type, node: m };
+    };
+    if (ts.isPropertySignature(m)) return named('property', m.type);
+    if (ts.isMethodSignature(m)) return named('method', m.type);
+    if (ts.isIndexSignatureDeclaration(m)) return { name: '[index]', kind: 'index', optional, type: m.type, node: m };
+    if (ts.isCallSignatureDeclaration(m)) return { name: '()', kind: 'call', optional, type: m.type, node: m };
+    if (ts.isConstructSignatureDeclaration(m)) return { name: 'new()', kind: 'construct', optional, type: m.type, node: m };
+    return named('property', undefined); // an accessor signature: a property to anything reading field lists
+  });
+}
+
+/** The name a function-like node is known by — its own name, or the `const x =` / `x:` / class field it
+ *  is the value of — and `undefined` when it has none. One rule for `enclosingNamedFunction` and
+ *  `functionsNamed`, so "the function named X" means the same thing to both. */
+function functionName(fn: ts.SignatureDeclaration): string | undefined {
+  if (ts.isConstructorDeclaration(fn)) return 'constructor';
+  const own = (fn as ts.Node & { name?: ts.Node }).name;
+  if (own && (ts.isIdentifier(own) || ts.isStringLiteral(own) || ts.isPrivateIdentifier(own))) return own.text;
+  const holder = fn.parent;
+  const bound = holder && (ts.isVariableDeclaration(holder) || ts.isPropertyAssignment(holder) || ts.isPropertyDeclaration(holder))
+    && holder.initializer === fn ? holder.name : undefined;
+  if (bound && (ts.isIdentifier(bound) || ts.isStringLiteral(bound) || ts.isPrivateIdentifier(bound))) return bound.text;
+  return undefined;
+}
+
+/**
+ * Every function in `root` known by `name` that HAS a body, in source order (#1195): a declaration, an
+ * arrow or function expression bound by `const name =` / `name:` / a class field, an object-literal or
+ * class METHOD, an accessor. The body is `fn.body`, the parameters `fn.parameters`.
+ *
+ * A wider population than `namedFunctions`, deliberately: "the body of `listLegacyDevicesSync`" is a
+ * question about the name, and the object-literal method it is today is exactly the form a
+ * declarations-only reader silently does not see. A guard asking about ONE function asserts the length
+ * it expects — two same-named functions in a file are two answers, not the first one.
+ *
+ * It replaces a slice from `function name(` to the next `'\nfunction '`, which ran on through an
+ * `export function` neighbour, and a slice to a fixed-indent closer (`'\n  },'`).
+ */
+export function functionsNamed(root: ts.Node, name: string): Array<ts.FunctionLikeDeclaration & { body: ts.ConciseBody }> {
+  return findNodes(root, (n): n is ts.FunctionLikeDeclaration & { body: ts.ConciseBody } =>
+    ts.isFunctionLike(n) && !!(n as { body?: ts.Node }).body && functionName(n) === name);
+}
+
 /** True for a `{ … }` block — so a caller holding a `ConciseBody` needs no `typescript` import. */
 export function isBlock(n: ts.Node | undefined): n is ts.Block {
   return !!n && ts.isBlock(n);
@@ -424,13 +556,8 @@ export function statementOf(n: ts.Node): ts.Node {
 export function enclosingNamedFunction(n: ts.Node): { name: string; node: ts.Node } | undefined {
   for (let cur = n.parent; cur; cur = cur.parent) {
     if (!ts.isFunctionLike(cur)) continue;
-    if (ts.isConstructorDeclaration(cur)) return { name: 'constructor', node: cur };
-    const own =(cur as ts.Node & { name?: ts.Node }).name;
-    if (own && (ts.isIdentifier(own) || ts.isStringLiteral(own) || ts.isPrivateIdentifier(own))) return { name: own.text, node: cur };
-    const holder = cur.parent;
-    const bound = holder && (ts.isVariableDeclaration(holder) || ts.isPropertyAssignment(holder) || ts.isPropertyDeclaration(holder))
-      && holder.initializer === cur ? holder.name : undefined;
-    if (bound && (ts.isIdentifier(bound) || ts.isStringLiteral(bound) || ts.isPrivateIdentifier(bound))) return { name: bound.text, node: cur };
+    const name = functionName(cur);
+    if (name !== undefined) return { name, node: cur };
   }
   return undefined;
 }

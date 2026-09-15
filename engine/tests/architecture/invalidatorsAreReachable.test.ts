@@ -20,6 +20,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
+import { parseSource, ts, unwrapValue, variablesNamed } from '@modoki/engine/testing/sourceAst';
 
 const REPO = path.resolve(__dirname, '../../..');
 const RUNTIME_SRC = path.join(REPO, 'engine/packages/modoki/src/runtime');
@@ -27,37 +28,61 @@ const RUNTIME_SRC = path.join(REPO, 'engine/packages/modoki/src/runtime');
 // `invalidatePixiShaderProgram` lives — the shader-cache invalidator `spriteMaterialCache.ts`'s
 // `invalidateShader` calls, so it must be visible to this guard too, not just the loaders.
 const SCAN_DIRS = [path.join(RUNTIME_SRC, 'loaders'), path.join(RUNTIME_SRC, 'rendering')];
-const consumerSrc = readScannedSource(path.join(REPO, 'engine/app/debug/agentBridge.ts')).code;
+const consumerSf = () => parseSource(readScannedSource(path.join(REPO, 'engine/app/debug/agentBridge.ts')).code, 'agentBridge.ts');
 
-/** Every `export function invalidate<Something>(` across the scanned runtime dirs, with the file
- *  that defines it (for a failure message that doesn't force a repo-wide grep). */
+/** `invalidate<Something>` — the names this guard is about. */
+const INVALIDATOR_NAME = /^invalidate[A-Za-z0-9]+$/;
+
+/** Every EXPORTED `invalidate<Something>` function in `sf`: an `export function`, or an `export const` bound to
+ *  an arrow or function expression. From the parser (#1195) — it used to be `/export function (invalidate…)\s*\(/`
+ *  over the text, which never saw the `export const` form. */
+function exportedInvalidators(sf: ts.SourceFile): string[] {
+  const isExported = (n: ts.Node) => ts.canHaveModifiers(n) && !!ts.getModifiers(n)?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
+  return sf.statements.flatMap((st) => {
+    if (ts.isFunctionDeclaration(st) && st.name && st.body && isExported(st)) return [st.name.text];
+    if (ts.isVariableStatement(st) && isExported(st)) {
+      return st.declarationList.declarations.filter((d) => ts.isIdentifier(d.name) && d.initializer
+        && (ts.isArrowFunction(unwrapValue(d.initializer)) || ts.isFunctionExpression(unwrapValue(d.initializer))))
+        .map((d) => (d.name as ts.Identifier).text);
+    }
+    return [];
+  }).filter((name) => INVALIDATOR_NAME.test(name));
+}
+
+/** Every `export`ed invalidator across the scanned runtime dirs, with the file that defines it (for a failure
+ *  message that doesn't force a repo-wide grep). */
 function findInvalidators(): Array<{ name: string; file: string }> {
   const out: Array<{ name: string; file: string }> = [];
   for (const dir of SCAN_DIRS) {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       if (!entry.isFile() || !entry.name.endsWith('.ts')) continue;
-      const src = readScannedSource(path.join(dir, entry.name)).code;
-      for (const m of src.matchAll(/export function (invalidate[A-Za-z0-9]+)\s*\(/g)) {
-        out.push({ name: m[1], file: entry.name });
-      }
+      const sf = parseSource(readScannedSource(path.join(dir, entry.name)).code, entry.name);
+      for (const name of exportedInvalidators(sf)) out.push({ name, file: entry.name });
     }
   }
   return out;
 }
 
-/** Identifiers used as VALUES in the `ASSET_CACHE_INVALIDATORS` object literal, e.g.
- *  `animation: invalidateAnimationClip,` → `invalidateAnimationClip`. Same slicing idiom as
- *  liveReloadKinds.test.ts's `tableBody` extraction. */
-function invalidatorTableValues(src: string): string[] {
-  const start = src.indexOf('const ASSET_CACHE_INVALIDATORS');
-  if (start === -1) throw new Error('could not find "const ASSET_CACHE_INVALIDATORS" — did it move or get renamed?');
-  const table = src.slice(start);
-  const body = table.slice(0, table.indexOf('};'));
-  return [...body.matchAll(/:\s*(invalidate[A-Za-z0-9]+)\s*[,}]/g)].map((m) => m[1]);
+/** The VALUE of each entry in `const ASSET_CACHE_INVALIDATORS = { … }`, e.g. `animation: invalidateAnimationClip`
+ *  → `invalidateAnimationClip`; a shorthand entry → its name. An entry whose value is not a plain name (a
+ *  wrapper arrow, a call) comes back as `<key: text>`, so it can neither pass as wired nor go unseen.
+ *
+ *  From the parser (#1195). It used to be the text from `const ASSET_CACHE_INVALIDATORS` to the first `'};'`,
+ *  matched with `/:\s*(invalidate…)\s*[,}]/` — which silently skipped any entry of another shape. */
+function invalidatorTableValues(sf: ts.SourceFile): string[] {
+  const decls = variablesNamed(sf, 'ASSET_CACHE_INVALIDATORS');
+  if (decls.length !== 1 || !decls[0]!.initializer) throw new Error('could not find one "const ASSET_CACHE_INVALIDATORS = …" — did it move or get renamed?');
+  const table = unwrapValue(decls[0]!.initializer);
+  if (!ts.isObjectLiteralExpression(table)) throw new Error('ASSET_CACHE_INVALIDATORS is no longer an object literal — read its new shape');
+  return table.properties.map((p) => {
+    if (ts.isShorthandPropertyAssignment(p)) return p.name.text;
+    if (ts.isPropertyAssignment(p) && ts.isIdentifier(unwrapValue(p.initializer))) return (unwrapValue(p.initializer) as ts.Identifier).text;
+    return `<${p.getText().replace(/\s+/g, ' ')}>`;
+  });
 }
 
 const INVALIDATORS = findInvalidators();
-const WIRED = new Set(invalidatorTableValues(consumerSrc));
+const WIRED = new Set(invalidatorTableValues(consumerSf()));
 
 /**
  * Invalidators NOT wired into `ASSET_CACHE_INVALIDATORS` (the live-reload watcher path), each with
@@ -123,5 +148,21 @@ describe('every invalidator is reachable from production (#74)', () => {
         + 'one-line reason naming the REAL caller you verified by reading the call site. A row that '
         + 'blesses more than exists means the invalidator got wired or went away: delete the row.',
     });
+  });
+
+  it('reads exported invalidators and the table by node, and never drops an entry it cannot name (#1195)', () => {
+    const sf = parseSource([
+      'export function invalidateA(p: string) { m.delete(p); }',
+      'export const invalidateB = (p: string) => { const t = `};`; m.delete(p); };',
+      'function invalidateC(p: string) {}',
+      'export function invalidator() {}',
+      'export const invalidateD = makeInvalidator();',
+      'const ASSET_CACHE_INVALIDATORS: Partial<Record<K, F>> = {',
+      '  a: invalidateA, invalidateB, c: (p) => invalidateC(p), "d": (invalidateA as F),',
+      '} satisfies object;',
+    ].join('\n'), 'probe.ts');
+    expect(exportedInvalidators(sf)).toEqual(['invalidateA', 'invalidateB']);
+    expect(invalidatorTableValues(sf)).toEqual(['invalidateA', 'invalidateB', '<c: (p) => invalidateC(p)>', 'invalidateA']);
+    expect(() => invalidatorTableValues(parseSource('const ASSET_CACHE_INVALIDATORS = build();', 'x.ts'))).toThrow(/no longer an object literal/);
   });
 });

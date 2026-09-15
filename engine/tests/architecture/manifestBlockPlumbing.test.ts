@@ -19,42 +19,72 @@
 import { describe, it, expect } from 'vitest';
 import path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
+import {
+  accessPath, callsTo, callsToPath, functionsNamed, objectLiteralKeys, parseSource, propertyValue, ts, typeMembers, typesNamed,
+} from '@modoki/engine/testing/sourceAst';
 
 const SRC = path.resolve(__dirname, '../../packages/modoki/src/runtime/loaders/assetManifest.ts');
-// ⚠️ ONE stripped read for every match (#1144 close-out). This file used to strip a copy for
-// `declaredFields` and run `written`/`forwarded`/`emitted` on the RAW text beside it, so a comment
-// inside `guidToEntry.set(guid, {…})` could count as a written field — and the raw-read rule excused
-// it because one use of the read was stripped.
-const { code: src } = readScannedSource(SRC);
+// ⚠️ ONE stripped read for every match (#1144 close-out), and every site below is a NODE of it (#1195).
+// The sites used to be regexes cut at a fixed indent — `\n {2}\}\);` for the set literal, `\n {4}\}\);`
+// for the push — and matched `(\w+):` inside them, so a nested literal's keys counted as fields and one
+// more level of indentation made a site "not found". `guid, path, type` were appended by hand because
+// the per-line regex could not see a shorthand at all.
+const sf = parseSource(readScannedSource(SRC).code, SRC);
 
-/** Optional field names declared on an interface, comments stripped (shared scanner,
- *  @modoki/engine/testing, #419). */
+const oneFunction = (name: string): ts.ConciseBody => {
+  const fns = functionsNamed(sf, name);
+  expect(fns.length, `expected one function ${name} in assetManifest.ts`).toBe(1);
+  return fns[0]!.body;
+};
+
+/** Does `lit`'s own `key` hold exactly `entry.<key>`? A spread, a method or an absent key does not. */
+const holdsEntryField = (lit: ts.Expression, key: string): boolean => {
+  const value = propertyValue(lit, key);
+  return !!value && ts.isExpression(value) && accessPath(value) === `entry.${key}`;
+};
+
+/** Field names declared on an interface — its own members, not a nested block's. */
 function declaredFields(iface: string): string[] {
-  const m = src.match(new RegExp(`export interface ${iface}\\s*\\{([\\s\\S]*?)\\n\\}`));
-  expect(m, `${iface} not found in assetManifest.ts`).toBeTruthy();
-  const body = m![1];
-  return [...new Set([...body.matchAll(/^\s*(\w+)\??:/gm)].map((x) => x[1]))];
+  const decls = typesNamed(sf, iface);
+  expect(decls.length, `${iface} not found in assetManifest.ts`).toBe(1);
+  const members = typeMembers(decls[0]);
+  expect(members, `${iface} is no longer a plain interface (a type alias, or one that extends another — read its new shape)`).toBeDefined();
+  return members!.map((m) => m.name);
 }
 
-/** The body of the single `guidToEntry.set(guid, {…})` literal — what registerAsset writes. */
+/** The keys of the single `guidToEntry.set(guid, {…})` literal inside registerAsset — what it writes. */
 const written = (() => {
-  const m = src.match(/guidToEntry\.set\(guid, \{([\s\S]*?)\n {2}\}\);/);
-  expect(m, 'guidToEntry.set literal not found').toBeTruthy();
-  return new Set([...m![1].matchAll(/^\s*(\w+):/gm)].map((x) => x[1]).concat(['guid', 'path', 'type']));
+  const sets = callsToPath(oneFunction('registerAsset'), 'guidToEntry.set').filter((c) => objectLiteralKeys(c.arguments[1]) !== undefined);
+  expect(sets.length, 'registerAsset: expected one guidToEntry.set(guid, { … })').toBe(1);
+  return new Set(objectLiteralKeys(sets[0]!.arguments[1]));
 })();
 
-/** The `registerAsset(entry.guid, …)` call inside loadManifestJson — what it forwards. */
+/** The `registerAsset(entry.guid, …)` call inside loadManifestJson — the fields it forwards. A POSITIONAL
+ *  argument forwards the `entry.X` it reads; an extras-literal key forwards only when its value IS
+ *  `entry.<that key>`, so `textureType: entry.model` forwards neither. */
 const forwarded = (() => {
-  const m = src.match(/registerAsset\(entry\.guid[\s\S]*?entry\.hash\);/);
-  expect(m, 'loadManifestJson registerAsset call not found').toBeTruthy();
-  return new Set([...m![0].matchAll(/entry\.(\w+)/g)].map((x) => x[1]));
+  const calls = callsTo(oneFunction('loadManifestJson'), 'registerAsset').filter((c) => c.arguments[0] && accessPath(c.arguments[0]) === 'entry.guid');
+  expect(calls.length, 'loadManifestJson: expected one registerAsset(entry.guid, …) call').toBe(1);
+  const out = new Set<string>();
+  for (const arg of calls[0]!.arguments) {
+    const keys = objectLiteralKeys(arg);
+    if (keys) {
+      for (const k of keys) if (holdsEntryField(arg, k)) out.add(k);
+    } else {
+      const p = accessPath(arg);
+      if (p?.startsWith('entry.')) out.add(p.slice('entry.'.length));
+    }
+  }
+  return out;
 })();
 
-/** The `assets.push({…})` literal in serializeManifest — what it emits. */
+/** The `assets.push({…})` literal in serializeManifest — the keys it emits, each counted only when its
+ *  value is `entry.<that key>`. */
 const emitted = (() => {
-  const m = src.match(/assets\.push\(\{([\s\S]*?)\n {4}\}\);/);
-  expect(m, 'serializeManifest assets.push literal not found').toBeTruthy();
-  return new Set([...m![1].matchAll(/(\w+):/g)].map((x) => x[1]));
+  const pushes = callsToPath(oneFunction('serializeManifest'), 'assets.push').filter((c) => objectLiteralKeys(c.arguments[0]) !== undefined);
+  expect(pushes.length, 'serializeManifest: expected one assets.push({ … })').toBe(1);
+  const lit = pushes[0]!.arguments[0]!;
+  return new Set(objectLiteralKeys(lit)!.filter((k) => holdsEntryField(lit, k)));
 })();
 
 describe('asset-manifest block plumbing', () => {

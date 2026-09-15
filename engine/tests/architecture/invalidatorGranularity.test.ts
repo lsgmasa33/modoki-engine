@@ -47,7 +47,7 @@
  *  - An invalidator wired into the table but defined outside `runtime/loaders/*.ts` — reported as a
  *    violation (fail-SAFE direction: it shows up as "not found", not as a silent pass).
  * A behavioural, table-driven check that actually exercises each cache would close these gaps; if
- * a future change to this guard can add that for a given cache, prefer it over extending the regex.
+ * a future change to this guard can add that for a given cache, prefer it over extending the source scan.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -55,74 +55,83 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
+import { calleeName, findNodes, parseSource, ts, unwrapValue, variablesNamed } from '@modoki/engine/testing/sourceAst';
 
 const REPO = path.resolve(__dirname, '../../..');
 const LOADERS_DIR = path.join(REPO, 'engine/packages/modoki/src/runtime/loaders');
 const AGENT_BRIDGE = path.join(REPO, 'engine/app/debug/agentBridge.ts');
 
-/** Identifiers used as VALUES in the `ASSET_CACHE_INVALIDATORS` object literal, e.g.
- *  `shader: invalidateShader,` → `invalidateShader`. Same slicing idiom as
- *  invalidatorsAreReachable.test.ts's `invalidatorTableValues` (duplicated rather than imported —
- *  architecture guards in this directory are each self-contained). */
-function invalidatorTableValues(src: string): string[] {
-  const start = src.indexOf('const ASSET_CACHE_INVALIDATORS');
-  if (start === -1) throw new Error('could not find "const ASSET_CACHE_INVALIDATORS" — did it move or get renamed?');
-  const table = src.slice(start);
-  const body = table.slice(0, table.indexOf('};'));
-  return [...body.matchAll(/:\s*(invalidate[A-Za-z0-9]+)\s*[,}]/g)].map((m) => m[1]);
+// ⚠️ **Read through the parser (#1195).** This file used to cut the table from `const ASSET_CACHE_INVALIDATORS`
+// to the first `'};'`, find functions with `/export function (invalidate…)\s*\((…)\)/`, and slice each body
+// by counting parens and then braces — so a `{` or `)` inside a string or a destructured parameter moved the
+// end, and an `export const invalidateX = (…) =>` was not a function at all.
+
+/** An exported invalidator: its name, and the function node. */
+interface Invalidator { name: string; fn: ts.FunctionLikeDeclaration & { body: ts.ConciseBody } }
+
+/** Every EXPORTED `invalidate<Something>` function in `sf` — an `export function`, or an `export const` bound to
+ *  an arrow or function expression. */
+function exportedInvalidators(sf: ts.SourceFile): Invalidator[] {
+  const isExported = (n: ts.Node) => ts.canHaveModifiers(n) && !!ts.getModifiers(n)?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
+  return sf.statements.flatMap((st): Invalidator[] => {
+    if (ts.isFunctionDeclaration(st) && st.name && st.body && isExported(st)) return [{ name: st.name.text, fn: st as Invalidator['fn'] }];
+    if (ts.isVariableStatement(st) && isExported(st)) {
+      return st.declarationList.declarations.flatMap((d) => {
+        const init = d.initializer && unwrapValue(d.initializer);
+        return ts.isIdentifier(d.name) && init && (ts.isArrowFunction(init) || ts.isFunctionExpression(init))
+          ? [{ name: d.name.text, fn: init as Invalidator['fn'] }] : [];
+      });
+    }
+    return [];
+  }).filter((inv) => /^invalidate[A-Za-z0-9]+$/.test(inv.name));
 }
 
-/** Every `export function invalidate<Something>(` under `runtime/loaders/*.ts`, mapped to the
- *  defining file's comment-blanked `.code` (so a `.delete(`/`invalidateKey(` mentioned only in a
- *  COMMENT can't satisfy the check below) — all 8 wired invalidators live in this one directory
- *  today; a future one defined elsewhere reports as "not found", which is a violation, not a pass. */
-function scanLoaderFunctions(): Map<string, { file: string; code: string }> {
-  const out = new Map<string, { file: string; code: string }>();
+/** The VALUE of each `ASSET_CACHE_INVALIDATORS` entry — a plain name, or `<key: text>` for any other shape, so a
+ *  wrapper arrow can neither pass as a wired name nor be skipped. Same reader as invalidatorsAreReachable.test.ts's
+ *  (duplicated rather than imported — architecture guards in this directory are each self-contained). */
+function invalidatorTableValues(sf: ts.SourceFile): string[] {
+  const decls = variablesNamed(sf, 'ASSET_CACHE_INVALIDATORS');
+  if (decls.length !== 1 || !decls[0]!.initializer) throw new Error('could not find one "const ASSET_CACHE_INVALIDATORS = …" — did it move or get renamed?');
+  const table = unwrapValue(decls[0]!.initializer);
+  if (!ts.isObjectLiteralExpression(table)) throw new Error('ASSET_CACHE_INVALIDATORS is no longer an object literal — read its new shape');
+  return table.properties.map((p) => {
+    if (ts.isShorthandPropertyAssignment(p)) return p.name.text;
+    if (ts.isPropertyAssignment(p) && ts.isIdentifier(unwrapValue(p.initializer))) return (unwrapValue(p.initializer) as ts.Identifier).text;
+    return `<${p.getText().replace(/\s+/g, ' ')}>`;
+  });
+}
+
+/** Every exported invalidator under `runtime/loaders/*.ts`, by name, with its file — all 8 wired invalidators live
+ *  in this one directory today; a future one defined elsewhere reports as "not found", which is a violation, not a
+ *  pass. Parsed from comment-blanked code, so nothing in a comment is a node. */
+function scanLoaderFunctions(): Map<string, { file: string; fn: Invalidator['fn'] }> {
+  const out = new Map<string, { file: string; fn: Invalidator['fn'] }>();
   for (const entry of fs.readdirSync(LOADERS_DIR, { withFileTypes: true })) {
     if (!entry.isFile() || !entry.name.endsWith('.ts')) continue;
-    const { code } = readScannedSource(path.join(LOADERS_DIR, entry.name));
-    for (const m of code.matchAll(/export function (invalidate[A-Za-z0-9]+)\s*\(/g)) {
-      out.set(m[1], { file: entry.name, code });
-    }
+    const sf = parseSource(readScannedSource(path.join(LOADERS_DIR, entry.name)).code, entry.name);
+    for (const { name, fn } of exportedInvalidators(sf)) out.set(name, { file: entry.name, fn });
   }
   return out;
 }
 
-/** Slice one function's body (braces balanced) out of a comment-blanked source string. Naive
- *  brace/paren counting — see this file's docblock for what that can't handle. Safe for the 8
- *  functions this guard actually scans: none of them destructure their parameter or embed an
- *  object/template literal in the body, so a plain depth counter never sees an unbalanced brace. */
-function extractFunctionBody(code: string, name: string): string {
-  const sigIdx = code.indexOf(`export function ${name}(`);
-  if (sigIdx === -1) throw new Error(`extractFunctionBody: "export function ${name}(" not found — did it move?`);
-  const parenStart = code.indexOf('(', sigIdx);
-  let parenDepth = 1;
-  let i = parenStart + 1;
-  while (parenDepth > 0) {
-    if (code[i] === '(') parenDepth++;
-    else if (code[i] === ')') parenDepth--;
-    i++;
-  }
-  const braceStart = code.indexOf('{', i);
-  let braceDepth = 1;
-  let j = braceStart + 1;
-  while (braceDepth > 0 && j < code.length) {
-    if (code[j] === '{') braceDepth++;
-    else if (code[j] === '}') braceDepth--;
-    j++;
-  }
-  return code.slice(braceStart, j);
+/** The member calls `fn`'s own body makes by one of `names` — `programs.delete(guid)`, `liveness.invalidateKey(p)`. */
+function memberCalls(fn: Invalidator['fn'], ...names: string[]): string[] {
+  return findNodes(fn.body, ts.isCallExpression)
+    .filter((c) => ts.isPropertyAccessExpression(c.expression) && names.includes(calleeName(c) ?? ''))
+    .map((c) => calleeName(c)!);
 }
 
-/** Evidence the function's OWN body evicts by key: a `.delete(` (the Map/Set idiom every one of
- *  these caches uses — `programs.delete(guid)`, `materialCache.delete(matPath)`, …) or an
- *  `.invalidateKey(` (the `createTeardownToken<string>()` idiom most of them layer on top). Absence
- *  of BOTH means the body does nothing but delegate elsewhere — in every real case found so far,
- *  a bare wholesale `clear*Cache()` that drops every OTHER entry too. */
-const PER_KEY_EVIDENCE = /\.(?:delete|invalidateKey)\(/;
+/** Evidence the function's OWN body evicts by key: a `.delete(…)` (the Map/Set idiom every one of these caches
+ *  uses — `programs.delete(guid)`, `materialCache.delete(matPath)`, …) or an `.invalidateKey(…)` (the
+ *  `createTeardownToken<string>()` idiom most of them layer on top). Absence of BOTH means the body does nothing
+ *  but delegate elsewhere — in every real case found so far, a bare wholesale `clear*Cache()` that drops every
+ *  OTHER entry too. */
+function evictsPerKey(fn: Invalidator['fn']): boolean {
+  return memberCalls(fn, 'delete', 'invalidateKey').length > 0;
+}
 
 describe('every ASSET_CACHE_INVALIDATORS entry evicts per-key, not wholesale (#852)', () => {
-  const wired = invalidatorTableValues(readScannedSource(AGENT_BRIDGE).code);
+  const wired = invalidatorTableValues(parseSource(readScannedSource(AGENT_BRIDGE).code, 'agentBridge.ts'));
   const loaderFns = scanLoaderFunctions();
 
   it('found a plausible number of wired invalidators (sanity: the parse works, so a pass means something)', () => {
@@ -135,13 +144,12 @@ describe('every ASSET_CACHE_INVALIDATORS entry evicts per-key, not wholesale (#8
       const found = loaderFns.get(name);
       if (!found) {
         violators.push(
-          `${name}: no "export function ${name}(" found under runtime/loaders/ — this guard only ` +
+          `${name}: no exported function ${name} found under runtime/loaders/ — this guard only ` +
           'scans that directory; if it now lives elsewhere, this check needs updating, not silencing.',
         );
         continue;
       }
-      const body = extractFunctionBody(found.code, name);
-      if (!PER_KEY_EVIDENCE.test(body)) {
+      if (!evictsPerKey(found.fn)) {
         violators.push(
           `${name} (${found.file}): body has no ".delete(" or ".invalidateKey(" call of its own — it ` +
           'can only be delegating to a wholesale clear, which drops every unrelated cache entry for ' +
@@ -153,14 +161,19 @@ describe('every ASSET_CACHE_INVALIDATORS entry evicts per-key, not wholesale (#8
   });
 });
 
-/** A module CONSTRUCTS its own `createTeardownToken` — `= createTeardownToken(` — rather than
- *  merely importing the type. That construction is the precondition for either failure direction
- *  existing at all: a module with no token can be neither an overshoot nor an undershoot. Matched
- *  against comment-blanked code so a docblock mentioning the call (several of these modules have
- *  one, explaining the choice) can't satisfy it. */
-const CONSTRUCTS_TEARDOWN_TOKEN = /=\s*createTeardownToken\s*(?:<[^>]*>)?\s*\(/;
+/** A module CONSTRUCTS its own `createTeardownToken` — CALLS it, in any position (a declaration, `=`/`??=`, a
+ *  class field, a parameter default) — rather than merely importing the name or the type. That construction is
+ *  the precondition for either failure direction existing at all: a module with no token can be neither an
+ *  overshoot nor an undershoot. From the parser, so a docblock mentioning the call is not one.
+ *
+ *  ⚠️ Any call, not "a declaration's initializer or a plain `=`" (#1195 close-out review): that first version
+ *  dropped a `liveness ??= createTeardownToken()` module out of the population, and with it both checks below —
+ *  the text regex (`= createTeardownToken(`) had counted it, and class fields already use the form elsewhere. */
+function constructsTeardownToken(sf: ts.SourceFile): boolean {
+  return findNodes(sf, ts.isCallExpression).some((c) => calleeName(c) === 'createTeardownToken');
+}
 
-/** Every `export function invalidate<Something>(<at least one param>)` in a `runtime/loaders/*.ts`
+/** Every exported `invalidate<Something>(<at least one param>)` (a function or a const-bound arrow) in a `runtime/loaders/*.ts`
  *  module that constructs its own `createTeardownToken` — the FULL population, not just the ~8
  *  wired into `ASSET_CACHE_INVALIDATORS` above. A zero-param `invalidateXxx()` is excluded on
  *  purpose: with no key to bump selectively it can only be (or delegate to) a wholesale clear by
@@ -186,17 +199,19 @@ const INVALIDATOR_SCAN_DIRS = [
   path.join(REPO, 'engine/packages/modoki/src/runtime/rendering'),
 ];
 
-function scanTeardownBackedInvalidators(): { name: string; file: string; code: string }[] {
-  const out: { name: string; file: string; code: string }[] = [];
+/** The key-taking exported invalidators of ONE module, when that module constructs its own teardown token. */
+function teardownBackedInvalidators(sf: ts.SourceFile): Invalidator[] {
+  if (!constructsTeardownToken(sf)) return [];
+  return exportedInvalidators(sf).filter(({ fn }) => fn.parameters.length > 0); // zero-param — see docblock above
+}
+
+function scanTeardownBackedInvalidators(): { name: string; file: string; fn: Invalidator['fn'] }[] {
+  const out: { name: string; file: string; fn: Invalidator['fn'] }[] = [];
   for (const dir of INVALIDATOR_SCAN_DIRS) {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       if (!entry.isFile() || !entry.name.endsWith('.ts')) continue;
-      const { code } = readScannedSource(path.join(dir, entry.name));
-      if (!CONSTRUCTS_TEARDOWN_TOKEN.test(code)) continue;
-      for (const m of code.matchAll(/export function (invalidate[A-Za-z0-9]+)\s*\(([^)]*)\)/g)) {
-        if (m[2].trim() === '') continue; // zero-param — see docblock above
-        out.push({ name: m[1], file: entry.name, code });
-      }
+      const sf = parseSource(readScannedSource(path.join(dir, entry.name)).code, entry.name);
+      for (const { name, fn } of teardownBackedInvalidators(sf)) out.push({ name, file: entry.name, fn });
     }
   }
   return out;
@@ -243,7 +258,7 @@ describe('every teardown-backed loader invalidator evicts per-key AND never whol
     assertExemptionLedger({
       label: 'EXEMPT_FROM_PER_KEY_CHECK in invalidatorGranularity',
       population: all
-        .filter(({ name, code }) => !/\.invalidateKey\(/.test(extractFunctionBody(code, name)))
+        .filter(({ fn }) => memberCalls(fn, 'invalidateKey').length === 0)
         .map(({ name, file }) => ({ item: `${file}::${name}`, site: `${name} (${file})` })),
       exempt: EXEMPT_FROM_PER_KEY_CHECK,
       floor: 1,
@@ -255,10 +270,49 @@ describe('every teardown-backed loader invalidator evicts per-key AND never whol
 
   it('no invalidator body calls .invalidateAll( — OVERSHOOT (#852/#856), with no pardons', () => {
     const violators = all
-      .filter(({ name, code }) => /\.invalidateAll\(/.test(extractFunctionBody(code, name)))
+      .filter(({ fn }) => memberCalls(fn, 'invalidateAll').length > 0)
       .map(({ name, file }) => `${name} (${file}): body calls ".invalidateAll(" — OVERSHOOT (#852/#856): this `
         + 'supersedes every OTHER in-flight load in the module, not just the one keyed by this '
         + 'invalidator\'s own argument.');
     expect(violators, violators.join('\n')).toEqual([]);
+  });
+});
+
+describe('the granularity readers see the unit, not a slice of text (#1195)', () => {
+  it('reads each invalidator whole — a destructured parameter, a brace in a string, the const-arrow form', () => {
+    const sf = parseSource([
+      "const liveness = createTeardownToken<string>();",
+      "export function invalidateA({ path }: { path: string }) { const t = '}'; cache.delete(path); liveness.invalidateKey(path); }",
+      'export const invalidateB = (p: string): void => { clearAll(); invalidateKey(p); liveness.invalidateAll(); };',
+      'export function invalidateC() { liveness.invalidateAll(); }',
+      'export function invalidateD(p: string) { const inner = () => cache.delete(p); delete (cache as any)[p]; }',
+      'function invalidateE(p: string) { liveness.invalidateAll(); }',
+    ].join('\n'), 'probe.ts');
+    const byName = new Map(exportedInvalidators(sf).map((i) => [i.name, i.fn]));
+    expect([...byName.keys()]).toEqual(['invalidateA', 'invalidateB', 'invalidateC', 'invalidateD']);
+    expect(evictsPerKey(byName.get('invalidateA')!)).toBe(true);
+    expect(evictsPerKey(byName.get('invalidateB')!)).toBe(false);
+    expect(memberCalls(byName.get('invalidateB')!, 'invalidateAll')).toEqual(['invalidateAll']);
+    expect(memberCalls(byName.get('invalidateA')!, 'invalidateAll')).toEqual([]);
+    // A `delete x[k]` OPERATOR is not a `.delete(` call; one in a nested closure still sits in the body.
+    expect(memberCalls(byName.get('invalidateD')!, 'delete')).toEqual(['delete']);
+    expect(evictsPerKey(byName.get('invalidateD')!)).toBe(true);
+    // The zero-param one is not held to the key rules; the module's token is what makes the rest eligible.
+    expect(teardownBackedInvalidators(sf).map((i) => i.name)).toEqual(['invalidateA', 'invalidateB', 'invalidateD']);
+    expect(teardownBackedInvalidators(parseSource('export function invalidateX(p: string) { m.delete(p); }', 'nt.ts'))).toEqual([]);
+  });
+
+  it('counts a token only when the module CONSTRUCTS one', () => {
+    expect(constructsTeardownToken(parseSource('let t: TeardownToken;\nt = createTeardownToken();', 'a.ts'))).toBe(true);
+    expect(constructsTeardownToken(parseSource("import { createTeardownToken } from './l';\nconst doc = 'createTeardownToken()';", 'b.ts'))).toBe(false);
+    expect(constructsTeardownToken(parseSource('const t = (createTeardownToken<string>() as Token);', 'c.ts'))).toBe(true);
+    expect(constructsTeardownToken(parseSource('let t!: Token;\nt ??= createTeardownToken<string>();', 'd.ts'))).toBe(true);
+    expect(constructsTeardownToken(parseSource('class C { private readonly liveness = createTeardownToken(); }', 'e.ts'))).toBe(true);
+    expect(constructsTeardownToken(parseSource("import type { TeardownToken } from './l';\nlet t: TeardownToken;", 'f.ts'))).toBe(false);
+  });
+
+  it('never drops a table entry it cannot name', () => {
+    expect(invalidatorTableValues(parseSource('const ASSET_CACHE_INVALIDATORS = { a: invalidateA, invalidateB, c: (p) => invalidateC(p) };', 'x.ts')))
+      .toEqual(['invalidateA', 'invalidateB', '<c: (p) => invalidateC(p)>']);
   });
 });

@@ -11,11 +11,26 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { readScannedSource } from '../helpers/sourceScanner';
+import { findNodes, functionsNamed, parseSource, printedText, ts, unwrapValue } from '../helpers/sourceAst';
 import * as path from 'node:path';
 import {
   recordFrame, getFrameProfile, resetFrameProfile, setProfilerFrameCap, getWorstStallWindow,
   BUDGET_30FPS_MS, PROFILE_WINDOW_FRAMES, BUDGET_SLACK,
 } from '../../src/runtime/core/frameProfiler';
+
+/** Every `a * b` inside `isVsyncBound`'s own body, as printed, and the ones with a numeric literal on
+ *  either side (parentheses peeled). From the parser (#1195): a column-0 `}` in a string no longer ends
+ *  the body, and a literal before the operator is a literal too. */
+function vsyncProducts(code: string, label: string): { products: string[]; bareLiterals: string[] } {
+  const fns = functionsNamed(parseSource(code, label), 'isVsyncBound');
+  expect(fns.length, `expected one isVsyncBound in ${label}`).toBe(1);
+  const products = findNodes(fns[0]!.body, (n): n is ts.BinaryExpression =>
+    ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.AsteriskToken);
+  return {
+    products: products.map(printedText),
+    bareLiterals: products.filter((p) => [p.left, p.right].some((o) => ts.isNumericLiteral(unwrapValue(o)))).map(printedText),
+  };
+}
 
 /** Feed frames of exactly `frameMs` apart, each costing `cpuMs` of main-thread work. */
 function feed(frames: Array<{ frameMs: number; cpuMs: number }>, start = 1000) {
@@ -321,17 +336,23 @@ describe('frameProfiler — the two tolerances are separate numbers (#417)', () 
   // Negative-only where a comment could forge a pass: the bare-literal ban is a `not.toMatch`,
   // so a `1.2` reappearing inside a comment fails loudly, which is the safe direction.
   it('each branch of isVsyncBound names its own constant — no bare literal returns', () => {
-    const src = readScannedSource(
-      path.join(__dirname, '../../src/runtime/core/frameProfiler.ts'),
-    ).code;
-    const fn = src.slice(src.indexOf('function isVsyncBound'));
-    const body = fn.slice(0, fn.indexOf('\n}'));
-    expect(body, 'the engine-cap branch must divide at the same constant as budgetMs')
-      .toMatch(/frameCapIntervalMs \* BUDGET_SLACK/);
-    expect(body, 'the display-refresh branch must use its own tolerance, not the budget slack')
-      .toMatch(/iv \* VSYNC_TOLERANCE/);
-    expect(body, 'a bare numeric multiplier is back in isVsyncBound — that is #417 exactly')
-      .not.toMatch(/\*\s*\d+\.\d+/);
+    const { products, bareLiterals } = vsyncProducts(
+      readScannedSource(path.join(__dirname, '../../src/runtime/core/frameProfiler.ts')).code, 'frameProfiler.ts');
+    expect(products, 'the engine-cap branch must divide at the same constant as budgetMs')
+      .toContain('frameCapIntervalMs * BUDGET_SLACK');
+    expect(products, 'the display-refresh branch must use its own tolerance, not the budget slack')
+      .toContain('iv * VSYNC_TOLERANCE');
+    expect(bareLiterals, 'a bare numeric multiplier is back in isVsyncBound — that is #417 exactly').toEqual([]);
+  });
+
+  it('reads isVsyncBound\'s own products, on either side of the `*` (#1195)', () => {
+    // The body used to run to the first '\n}', and the literal ban matched `* 1.2` only after the operator.
+    const probe = (src: string) => vsyncProducts(src, 'probe.ts');
+    expect(probe('function isVsyncBound(m) {\n  const t = `\n}`;\n  return m <= 1.2 * iv;\n}').bareLiterals).toEqual(['1.2 * iv']);
+    expect(probe('function isVsyncBound(m) { return [1].some((iv) => m <= iv * (1.2)); }').bareLiterals).toEqual(['iv * (1.2)']);
+    expect(probe('function isVsyncBound(m) { return m <= iv * VSYNC_TOLERANCE; }\nfunction other(m) { return m * 1.2; }'))
+      .toEqual({ products: ['iv * VSYNC_TOLERANCE'], bareLiterals: [] });
+    expect(() => probe('const isVsyncBound = 1;')).toThrow(/one isVsyncBound/);
   });
 });
 

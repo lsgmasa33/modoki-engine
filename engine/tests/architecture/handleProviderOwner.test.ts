@@ -21,8 +21,9 @@
  *  only way a new provider cannot quietly rejoin the hole is to check the source. */
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
+import { findNodes, objectLiteralKeys, parseSource, printedText, propertyValue, stringValueOf, ts } from '@modoki/engine/testing/sourceAst';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 
@@ -54,14 +55,17 @@ const EXEMPT = [
   },
 ] as const;
 
-/** The `kind:` string a literal declares — what distinguishes two literals in one file. */
-function kindOf(lit: string): string {
-  // ⚠️ `?? [, 'x']` is a SPARSE array and `no-sparse-arrays` is an eslint ERROR here, not a warning —
-  // green under vitest and red only in the lint leg. `<unparsed>` matches no row, so an unreadable
-  // literal fails loudly as unexcused rather than slipping through; `handleLiterals` already requires
-  // a string `kind`, so it should be unreachable.
-  return /\bkind: ('[^']*')/.exec(lit)?.[1] ?? '<unparsed>';
+/** The `kind` a literal declares — what distinguishes two literals in one file: a string quoted
+ *  (`'resize-handle'`), and a computed kind as its printed code in parentheses
+ *  (`(el.getAttribute(UI_KIND_ATTR) ?? el.tagName.toLowerCase())`). */
+function kindOf(lit: ts.ObjectLiteralExpression): string {
+  const value = propertyValue(lit, 'kind');
+  const kind = value && ts.isExpression(value) ? stringValueOf(value) : undefined;
+  return kind !== undefined ? `'${kind}'` : `(${value ? printedText(value) : '?'})`;
 }
+
+/** Does a handle literal name its owning element — its OWN `owner` key, not one in a nested literal? */
+const isOwned = (lit: ts.ObjectLiteralExpression): boolean => objectLiteralKeys(lit)!.includes('owner');
 
 /** Every `.ts`/`.tsx` under `SRC_ROOTS`, via the shared corpus producer (#799/#771/#805 Phase 4).
  *  Floored well under the 855 measured today. */
@@ -82,54 +86,54 @@ function sourceFiles(): Array<{ rel: string; abs: string }> {
   });
 }
 
-/** Every object literal that builds an InteractionHandle, found by anchoring on the `kind:`
- *  field and brace-matching outward. Anchoring on the LITERAL rather than on the
- *  `registerHandleProvider(` call is what lets this see a provider passed by reference
- *  (agentBridge registers `chromeHandles`, whose literals live in another file). */
-function handleLiterals(src: string): string[] {
-  const out: string[] = [];
-  for (let i = src.indexOf('kind:'); i !== -1; i = src.indexOf('kind:', i + 1)) {
-    // Walk back to the opening brace of the enclosing literal.
-    let depth = 0, start = -1;
-    for (let j = i; j >= 0; j--) {
-      const c = src[j];
-      if (c === '}') depth++;
-      else if (c === '{') { if (depth === 0) { start = j; break; } depth--; }
-    }
-    if (start < 0) continue;
-    let d = 0, end = -1;
-    for (let j = start; j < src.length; j++) {
-      const c = src[j];
-      if (c === '{') d++;
-      else if (c === '}') { d--; if (d === 0) { end = j; break; } }
-    }
-    if (end < 0) continue;
-    const lit = src.slice(start, end + 1);
-    // An InteractionHandle always carries kind + editor + x + y. Anything else that happens
-    // to have a `kind:` field (a discriminated union, a draw-state record) is not one.
-    // An InteractionHandle literal always carries id + a string `kind` + a string `editor`
-    // + x + y. Requiring the two STRING fields is what keeps a JSX/style object whose
-    // brace-walk happened to swallow a `kind:` out of the set.
-    if (/\bid:/.test(lit) && /\bkind: '/.test(lit) && /\beditor: '/.test(lit)
-        && /\bx:/.test(lit) && /\by:/.test(lit)) out.push(lit);
-  }
-  return out;
+/** Every object literal that builds an InteractionHandle: its OWN keys include `id`, `kind`, `x`, `y` and a
+ *  string `editor`. Anchoring on the LITERAL rather than on the `registerHandleProvider(` call is what lets
+ *  this see a provider passed by reference (agentBridge registers `chromeHandles`, whose literals live in
+ *  another file). Requiring the STRING `editor` keeps a discriminated union or a draw-state record that
+ *  merely has a `kind` out of the set.
+ *
+ *  ⚠️ **The literal is a NODE (#1195).** It was found by walking back from each `kind:` to an unbalanced
+ *  `{` and brace-matching forward, then testing `\bid:`/`\bx:`/`owner:` anywhere in that TEXT — so a
+ *  NESTED literal's `owner:` (or a string holding a brace) could vouch for the handle around it.
+ *
+ *  ⚠️ **`kind` may be computed.** Both the text form and the parser's first cut required a STRING `kind`,
+ *  which silently excluded the `chromeHandles` literal this docblock names — its `kind` is
+ *  `el.getAttribute(UI_KIND_ATTR) ?? …` — so deleting its `owner` passed (#1195 P1 review). */
+function handleLiterals(sf: ts.SourceFile): ts.ObjectLiteralExpression[] {
+  return findNodes(sf, ts.isObjectLiteralExpression).filter((lit) => {
+    const keys = new Set(objectLiteralKeys(lit));
+    const editor = propertyValue(lit, 'editor');
+    return keys.has('id') && keys.has('kind') && keys.has('x') && keys.has('y')
+      && !!editor && ts.isExpression(editor) && stringValueOf(editor) !== undefined;
+  });
 }
 
 describe('interaction-handle providers name their owning element', () => {
   const files = sourceFiles()
     // The registry declares the field; the dump reads it. Neither builds a handle.
     .filter(({ rel }) => !/interactionHandles\.ts$|handlesDump\.ts$/.test(rel))
-    .map(({ rel, abs }) => ({ rel, src: readFileSync(abs, 'utf8') }))
+    .map(({ rel, abs }) => ({ rel, abs, src: readScannedSource(abs).code }))
     // Only a file that names the type builds one — cheap prefilter, and it keeps the
-    // brace-walk away from unrelated panels entirely.
+    // parse away from unrelated panels entirely.
     .filter(({ src }) => src.includes('InteractionHandle'))
-    .map(({ rel, src }) => ({ rel, literals: handleLiterals(src) }))
+    .map(({ rel, abs, src }) => ({ rel, literals: handleLiterals(parseSource(src, abs)) }))
     .filter(({ literals }) => literals.length > 0);
 
   it('finds the handle literals at all (a refactor must not make this vacuous)', () => {
     expect(files.length).toBeGreaterThanOrEqual(9);
     expect(files.reduce((n, f) => n + f.literals.length, 0)).toBeGreaterThanOrEqual(15);
+  });
+
+  it('reads a handle literal\'s OWN keys — a nested literal\'s `owner` does not vouch for it (#1195)', () => {
+    const sf = parseSource([
+      "const a = { id: 'a', kind: 'k', editor: 'e', x: 1, y: 2, meta: { owner: el, label: '{' } };",
+      "const b = { id: 'b', kind: 'k2', editor: 'e', x: 1, y: 2, owner: el };",
+      "const notAHandle = { kind: 'k3', x: 1, y: 2 };",
+      "const computed = { id, kind: el.getAttribute('k') ?? 'div', editor: 'chrome', x: 1, y: 2 };",
+    ].join('\n'), 'probe.ts');
+    const lits = handleLiterals(sf);
+    expect(lits.map(kindOf)).toEqual(["'k'", "'k2'", "(el.getAttribute('k') ?? 'div')"]);
+    expect(lits.filter((lit) => !isOwned(lit)).map(kindOf)).toEqual(["'k'", "(el.getAttribute('k') ?? 'div')"]);
   });
 
   it('every handle literal names its owning element', () => {
@@ -139,7 +143,7 @@ describe('interaction-handle providers name their owning element', () => {
     assertExemptionLedger({
       label: 'EXEMPT in handleProviderOwner',
       population: files.flatMap(({ rel, literals }) => literals
-        .filter((lit) => !lit.includes('owner:'))
+        .filter((lit) => !isOwned(lit))
         .map((lit) => ({ item: `${rel}::${kindOf(lit)}`, site: `${rel} — kind ${kindOf(lit)}` }))),
       exempt: EXEMPT,
       // 1 measured 2026-09-12, which is also the pardon — so wiring it trips this floor rather than

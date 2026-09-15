@@ -23,7 +23,7 @@ import path from 'node:path';
 import { discoverProjects } from '../../scripts/projectRoots.mjs';
 import { REPO_ROOT } from '../helpers/repoLayout';
 import { readScannedSource } from '@modoki/engine/testing';
-import { importsIn, namedFunctions, parseSource } from '@modoki/engine/testing/sourceAst';
+import { callsTo, findNodes, flatText, functionsNamed, importsIn, parseSource, referencesToPath, stringValueOf, ts } from '@modoki/engine/testing/sourceAst';
 
 const getInfo = vi.fn();
 vi.mock('@capacitor/app', () => ({ App: { getInfo: () => getInfo() } }));
@@ -119,18 +119,22 @@ describe('handleAppIdentity — the leased device\'s hardware', () => {
  *  the only way to assert WHICH plugin is asked, since a mock answers either name happily. */
 describe('the hardware probe reads a plugin that is actually present (#146)', () => {
   it('asks capacitor-game-debug, never @capacitor/device', () => {
-    const src = readScannedSource(path.join(__dirname, '../../app/debug/bridge.ts')).code;
-    const fn = src.slice(src.indexOf('async function readDeviceHardware'));
-    const body = fn.slice(0, fn.indexOf('\n}'));
-    // The dynamic import is read from the parse, inside the function's own body (#1193). The text
-    // slice above still bounds the `not.toMatch` below — cutting a body by text shape is #1195.
-    const sf = parseSource(src, 'bridge.ts');
-    const hw = namedFunctions(sf).find((f) => f.name === 'readDeviceHardware');
-    expect(hw, 'readDeviceHardware is gone or renamed').toBeDefined();
-    const dynamic = importsIn(sf).filter((e) => e.kind === 'dynamic' && e.node.pos >= hw!.body.pos && e.node.end <= hw!.body.end);
-    expect(dynamic.map((e) => e.spec)).toContain('capacitor-game-debug');
+    const probe = hardwareProbe(readScannedSource(path.join(__dirname, '../../app/debug/bridge.ts')).code, 'bridge.ts');
+    expect(probe.imports).toContain('capacitor-game-debug');
     // The original bug, pinned by name: `@capacitor/device` is optional and no project installs it.
-    expect(body).not.toMatch(/Plugins\?\.Device|@capacitor\/device/);
+    expect(probe.deviceReads).toEqual([]);
+  });
+
+  it('reads the probe\'s own body, and every way it could reach the Device plugin (#1195)', () => {
+    // The body used to run to the first '\n}', and the Device check was a regex over that text.
+    const probe = (body: string) => hardwareProbe(`async function readDeviceHardware() {\n  const t = \`\n}\`;\n${body}\n}\nfunction other() { registerPlugin('Device'); return [Plugins.Device, import('@capacitor/device')]; }`, 'probe.ts');
+    expect(probe("const { GameDebug } = await import('capacitor-game-debug');")).toEqual({ imports: ['capacitor-game-debug'], deviceReads: [] });
+    expect(probe("const d = (window as any).Capacitor.Plugins?.Device;\nconst { Device } = await import('@capacitor/device');\nconst r = registerPlugin('Device');").deviceReads)
+      .toEqual(['(window as any).Capacitor.Plugins?.Device', "import('@capacitor/device')", "registerPlugin('Device')"]);
+    expect(probe("log('Plugins.Device is not used'); const x = Plugins.DeviceInfo; registerPlugin('GameDebug');").deviceReads).toEqual([]);
+    expect(probe("const spec = '@capacitor/device';\nawait import(spec);\nloadPlugin(`@capacitor/device`);").deviceReads)
+      .toEqual(["'@capacitor/device'", '`@capacitor/device`']);
+    expect(() => hardwareProbe('function other() {}', 'probe.ts')).toThrow(/readDeviceHardware is gone or renamed/);
   });
 
   it('no Modoki project depends on @capacitor/device — the reason the first version was inert', () => {
@@ -162,3 +166,32 @@ describe('the hardware probe reads a plugin that is actually present (#146)', ()
     }
   });
 });
+
+/**
+ * What `readDeviceHardware` imports dynamically, and every way its body reaches the `@capacitor/device`
+ * plugin — a `Plugins.Device` read (optional chains and a `Capacitor.` prefix included), an import of
+ * `@capacitor/device`, or `registerPlugin('Device')` — as flat source text.
+ *
+ * All of it from the parser, inside the function's own body (#1193, #1195): the body used to be cut to
+ * the first `'\n}'`, and the Device check was `/Plugins\?\.Device|@capacitor\/device/` over that text.
+ */
+function hardwareProbe(code: string, label: string): { imports: string[]; deviceReads: string[] } {
+  const sf = parseSource(code, label);
+  const fns = functionsNamed(sf, 'readDeviceHardware');
+  expect(fns.length, 'readDeviceHardware is gone or renamed').toBe(1);
+  const body = fns[0]!.body;
+  const inBody = importsIn(sf).filter((e) => e.node.pos >= body.pos && e.node.end <= body.end);
+  return {
+    imports: inBody.filter((e) => e.kind === 'dynamic').map((e) => e.spec),
+    deviceReads: [
+      ...referencesToPath(body, 'Plugins.Device').map(flatText),
+      ...inBody.filter((e) => e.spec === '@capacitor/device').map((e) => flatText(e.node)),
+      ...callsTo(body, 'registerPlugin').filter((c) => stringValueOf(c.arguments[0]) === 'Device').map(flatText),
+      // The specifier held in a string anywhere else — `const spec = '@capacitor/device'; await import(spec)` — which
+      // the regex over the body saw and an import-edge reader does not (#1195 close-out review).
+      ...findNodes(body, ts.isStringLiteralLike)
+        .filter((s) => s.text.includes('@capacitor/device') && !inBody.some((e) => e.node.pos <= s.pos && s.end <= e.node.end))
+        .map(flatText),
+    ],
+  };
+}

@@ -10,70 +10,98 @@
  *  presence. Still not a substitute for a live pick-vs-select-outcome check; see the plan's own
  *  test list for what remains a live-editor verification. */
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { readScannedSource } from '../helpers/sourceScanner';
+import { callsTo, declarationOf, enclosingNamedFunction, functionBodyOf, functionsNamed, parseSource, printedText, siteText, stringValueOf, ts } from '../helpers/sourceAst';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const src = readFileSync(join(here, '../../src/editor/panels/SceneView.tsx'), 'utf8');
+const sceneView = parseSource(readScannedSource(join(here, '../../src/editor/panels/SceneView.tsx')).code, 'SceneView.tsx');
 
-/** Every `registerPickProvider(<fn>, 'scene-view'[, priority])` call, with the bare identifier
- *  passed as the provider — NOT an inline arrow (which would defeat this test: it could no longer
- *  prove the registered function IS the one below decorated as `onPointerDown`'s picker). The
- *  optional trailing `, <number>` is the #80 priority argument (the 2D overlay registers at 10,
- *  the 3D viewport at the implicit default). */
-function registeredProviderNames(): string[] {
+/** The named functions `n` sits in, outermost first — `ThreeJSViewport > install` — or `<module>`. */
+function namedPath(n: ts.Node): string {
   const out: string[] = [];
-  const re = /registerPickProvider\(([A-Za-z_$][\w$]*),\s*'scene-view'(?:,\s*\d+)?\)/g;
-  for (const m of src.matchAll(re)) out.push(m[1]);
-  return out;
+  for (let f = enclosingNamedFunction(n); f; f = enclosingNamedFunction(f.node)) out.unshift(f.name);
+  return out.join(' > ') || '<module>';
+}
+
+interface PickWiring {
+  provider: string;
+  /** The #80 priority argument as written, or `undefined` for the implicit default. */
+  priority: string | undefined;
+  registeredIn: string;
+  /** Every call in the file to the SAME function the registration hands over — resolved by the file's
+   *  own scopes, not by name, so the 2D picker's callers are not the 3D picker's — as
+   *  `<where>(<args>)`. */
+  calledFrom: string[];
+}
+
+/**
+ * Every `registerPickProvider(<fn>, 'scene-view'[, priority])` call in `sf`, with where it is registered
+ * and who else calls the very function it registers.
+ *
+ * ⚠️ **The provider must be a BARE name of a function** (`function f`, or `const f = (…) => …`) — NOT an inline arrow (which would
+ * defeat this test: it could no longer prove the registered function IS the one the pointer handler
+ * calls), and not a wrapper. Anything else fails here, by its site.
+ *
+ * From the parser (#1195). The file used to be read raw and cut by text: the 3D handler was the 800
+ * characters after `function onPointerDown(event: PointerEvent)`, and the 2D and UI scopes ran from
+ * `function <name>(` to the next `'\nfunction '`. So a call left behind in a COMMENT passed, a call
+ * past character 800 failed, and both 2D and 3D pickers — which share one name — were told apart only
+ * by which slice a regex happened to run over.
+ */
+function pickWiring(sf: ts.SourceFile): PickWiring[] {
+  return callsTo(sf, 'registerPickProvider').filter((reg) => stringValueOf(reg.arguments[1]) === 'scene-view').map((reg) => {
+    const arg = reg.arguments[0];
+    const id = arg && ts.isIdentifier(arg) ? arg : undefined;
+    const decl = id && declarationOf(id);
+    const fn = decl && (ts.isVariableDeclaration(decl) ? decl.initializer : decl);
+    expect(functionBodyOf(fn), `${siteText(reg)}: the provider is not a bare name of a function`)
+      .toBeDefined();
+    return {
+      provider: id!.text,
+      priority: reg.arguments[2] && printedText(reg.arguments[2]),
+      registeredIn: namedPath(reg),
+      calledFrom: callsTo(sf, id!.text)
+        .filter((c) => ts.isIdentifier(c.expression) && declarationOf(c.expression) === decl)
+        .map((c) => `${namedPath(c)}(${c.arguments.map(printedText).join(', ')})`),
+    };
+  });
 }
 
 describe('SceneView pick providers share the pointer handler\'s own code path', () => {
+  // Read inside each test, so a registration it refuses fails the test that names it, not the file's collection.
+  const wiring = (): PickWiring[] => pickWiring(sceneView);
+
   it('registers a BARE named function as the provider (not a second, inline implementation)', () => {
     // If this fails because a call site switched to an inline `(x, y) => { ... }` arrow, that IS
     // the regression this test exists to catch — a fresh raycast beside the real one, not the SAME
-    // one, is exactly the false-guarantee `screenPick.ts` warns against.
-    const names = registeredProviderNames();
-    expect(names.length).toBeGreaterThanOrEqual(2); // one 3D viewport + one 2D chrome overlay
+    // one, is exactly the false-guarantee `screenPick.ts` warns against. (`pickWiring` refuses it.)
+    expect(wiring().map((w) => w.registeredIn)).toEqual(['installScene2DInteraction', 'UIEditorOverlay', 'ThreeJSViewport > install']);
   });
 
-  it('the 3D-viewport registration and its onPointerDown call the SAME identifier', () => {
-    const names = registeredProviderNames();
-    expect(names).toContain('pickEntityAtViewportPoint');
+  it('the 3D-viewport registration and its onPointerDown call the SAME function', () => {
     // The 3D onPointerDown (selection raycast) must call it — not recompute entries itself.
-    const onPointerDown3D = src.slice(
-      src.indexOf('function onPointerDown(event: PointerEvent)'),
-      src.indexOf('function onPointerDown(event: PointerEvent)') + 800,
-    );
-    expect(onPointerDown3D).toMatch(/pickEntityAtViewportPoint\(event\.clientX, event\.clientY\)/);
+    expect(wiring()).toContainEqual({
+      provider: 'pickEntityAtViewportPoint', priority: undefined, registeredIn: 'ThreeJSViewport > install',
+      calledFrom: ['ThreeJSViewport > install > onPointerDown(event.clientX, event.clientY)'],
+    });
   });
 
-  it('the 2D chrome overlay\'s registration and its onPointerDown call the SAME identifier', () => {
-    // Scope to installScene2DInteraction's own body — there is an UNRELATED
-    // `onPointerDown(e: PointerEvent)` earlier in the file (a panel-pan handler) with no picking
-    // in it at all, so an unscoped search would find the wrong one.
-    const fnStart = src.indexOf('function installScene2DInteraction(');
-    expect(fnStart).toBeGreaterThan(-1);
-    const nextTopLevelFn = src.indexOf('\nfunction ', fnStart + 1);
-    const body = src.slice(fnStart, nextTopLevelFn > -1 ? nextTopLevelFn : src.length);
-    const idx = body.indexOf('function onPointerDown(e: PointerEvent)');
-    expect(idx).toBeGreaterThan(-1);
-    // No fixed window: onPointerDown runs a long gizmo/bone/collider hit-test chain BEFORE the
-    // entity pick, and `body` is already scoped to installScene2DInteraction, so searching the
-    // rest of it cannot cross into an unrelated function.
-    const onPointerDown2D = body.slice(idx);
-    expect(onPointerDown2D).toMatch(/pickEntityAtViewportPoint\(e\.clientX, e\.clientY\)/);
-    // And the registration for THIS canvas is the same-named function, not a copy. Priority 10
-    // (#80) — the 2D overlay must win over the 3D viewport when both answer.
-    expect(body).toMatch(/registerPickProvider\(pickEntityAtViewportPoint, 'scene-view', 10\)/);
+  it('the 2D chrome overlay\'s registration and its onPointerDown call the SAME function', () => {
+    // Resolved by scope: there is an UNRELATED `onPointerDown(e: PointerEvent)` earlier in the file
+    // (a panel-pan handler, in `SceneView`) with no picking in it at all, and the 3D picker shares
+    // this one's name. Priority 10 (#80) — the 2D overlay must win over the 3D viewport when both answer.
+    expect(wiring()).toContainEqual({
+      provider: 'pickEntityAtViewportPoint', priority: '10', registeredIn: 'installScene2DInteraction',
+      calledFrom: ['installScene2DInteraction > onPointerDown(e.clientX, e.clientY)'],
+    });
   });
 
   it('there is exactly ONE definition of `pickEntityAtViewportPoint` per scope (2D and 3D) — no drifted duplicate', () => {
-    // Two definitions total: one inside installScene2DInteraction (2D), one inside the
-    // ThreeJSViewport setup effect (3D). A THIRD would mean somebody pasted a divergent copy.
-    const defs = [...src.matchAll(/function pickEntityAtViewportPoint\(/g)];
-    expect(defs.length).toBe(2);
+    // One inside installScene2DInteraction (2D), one inside the ThreeJSViewport setup (3D). A THIRD —
+    // in any form, a `const` arrow or a method included — would mean somebody pasted a divergent copy.
+    expect(functionsNamed(sceneView, 'pickEntityAtViewportPoint').map(namedPath)).toEqual(['installScene2DInteraction', 'ThreeJSViewport > install']);
   });
 
   // #337 — the "ui" preview mode's paint-order arbiter (`resolvePreviewPickAt`, `uiPreviewPick.ts`)
@@ -82,17 +110,34 @@ describe('SceneView pick providers share the pointer handler\'s own code path', 
   // pointerdown handler that redirects a real click — otherwise the two could disagree and #337
   // would just move from real clicks to synthetic taps instead of being fixed.
   it('the "ui" preview arbiter is registered at a higher priority than the 2D overlay', () => {
-    const names = registeredProviderNames();
-    expect(names).toContain('resolvePreviewPickAt');
-    expect(src).toMatch(/registerPickProvider\(resolvePreviewPickAt, 'scene-view', 20\)/);
+    expect(wiring().filter((w) => w.provider === 'resolvePreviewPickAt').map((w) => w.priority)).toEqual(['20']);
   });
 
-  it('the "ui" preview arbiter\'s pointerdown handler calls the SAME identifier as its registration', () => {
-    const fnStart = src.indexOf('function UIEditorOverlay(');
-    expect(fnStart).toBeGreaterThan(-1);
-    const nextTopLevelFn = src.indexOf('\nfunction ', fnStart + 1);
-    const body = src.slice(fnStart, nextTopLevelFn > -1 ? nextTopLevelFn : src.length);
-    expect(body).toMatch(/registerPickProvider\(resolvePreviewPickAt, 'scene-view', 20\)/);
-    expect(body).toMatch(/resolvePreviewPickAt\(e\.clientX, e\.clientY\)/);
+  it('the "ui" preview arbiter\'s pointerdown handler calls the SAME function as its registration', () => {
+    expect(wiring()).toContainEqual({
+      provider: 'resolvePreviewPickAt', priority: '20', registeredIn: 'UIEditorOverlay',
+      calledFrom: ['UIEditorOverlay > onPointerDownCapture(e.clientX, e.clientY)'],
+    });
+  });
+
+  it('resolves the provider by scope, and refuses one it cannot name (#1195)', () => {
+    const probe = (src: string) => pickWiring(parseSource(src, 'probe.tsx'));
+    // Two same-named pickers: each registration is credited only with ITS function's callers, and a
+    // commented-out call is no call.
+    expect(probe([
+      'function a() { function pick(x, y) {} function onDown(e) { pick(e.x, e.y); } registerPickProvider(pick, \'scene-view\', 10); }',
+      'function b() { function pick(x, y) {} function onDown(e) { /* pick(e.x, e.y); */ } registerPickProvider(pick, \'scene-view\'); }',
+    ].join('\n'))).toEqual([
+      { provider: 'pick', priority: '10', registeredIn: 'a', calledFrom: ['a > onDown(e.x, e.y)'] },
+      { provider: 'pick', priority: undefined, registeredIn: 'b', calledFrom: [] },
+    ]);
+    // Another surface is not this one.
+    expect(probe('function pick() {}\nregisterPickProvider(pick, \'game-view\');')).toEqual([]);
+    // An inline implementation, and a wrapped one — but a name bound to an arrow is a named function.
+    expect(() => probe('registerPickProvider((x, y) => null, \'scene-view\');')).toThrow(/not a bare name/);
+    expect(() => probe('function pick() {}\nregisterPickProvider(withLog(pick), \'scene-view\');')).toThrow(/not a bare name/);
+    expect(() => probe('function pick() {}\nregisterPickProvider(pick.bind(null), \'scene-view\');')).toThrow(/not a bare name/);
+    expect(probe('const pick = (x, y) => null;\nregisterPickProvider(pick, \'scene-view\');').map((w) => w.provider)).toEqual(['pick']);
+    expect(() => probe('const pick = withLog((x, y) => null);\nregisterPickProvider(pick, \'scene-view\');')).toThrow(/not a bare name/);
   });
 });

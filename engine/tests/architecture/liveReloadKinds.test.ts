@@ -66,23 +66,103 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
+import {
+  accessPath, callsTo, callsToPath, calleeName, enclosingFunction, findNodes, flatText, functionsNamed, objectLiteralKeys,
+  parseSource, printedText, readsOf, stringValueOf, ts, typesNamed, unwrapValue, variablesNamed,
+} from '@modoki/engine/testing/sourceAst';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { ASSET_SCHEMA_TYPES } from '../../packages/modoki/src/runtime/assets/assetSchemas';
 
 const REPO = path.resolve(__dirname, '../../..');
-const producerSrc = readScannedSource(path.join(REPO, 'engine/plugins/vite-asset-scanner.ts')).code;
-const consumerSrc = readScannedSource(path.join(REPO, 'engine/app/debug/agentBridge.ts')).code;
+// ⚠️ **Every unit here is read through the parser (#1195).** They used to be text: a union was
+// `type X = ([^;]+);`, `classifySceneChange` and `handleSceneChanged` ran to the first `'\n}'`, the
+// invalidator branch to the first `'\n  }'`, the table to the first `'};'`, and `onChange` was
+// brace-counted from `const onChange = (` — then regexes over each slice.
+const producerSf = parseSource(readScannedSource(path.join(REPO, 'engine/plugins/vite-asset-scanner.ts')).code, 'vite-asset-scanner.ts');
+const consumerSf = parseSource(readScannedSource(path.join(REPO, 'engine/app/debug/agentBridge.ts')).code, 'agentBridge.ts');
 
-/** Members of a `type X = 'a' | 'b'` declaration. */
-function unionMembers(src: string, typeName: string): string[] {
-  const m = new RegExp(`type ${typeName}\\s*=\\s*([^;]+);`).exec(src);
-  if (!m) throw new Error(`could not find "type ${typeName} = …" — did it move or get renamed?`);
-  return [...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1]).sort();
+/** The string members of `type <typeName> = 'a' | 'b'`, sorted. A member that is not a string literal
+ *  comes back as `<its text>`, so it cannot pass as a kind. */
+function unionMembers(sf: ts.SourceFile, typeName: string): string[] {
+  const decls = typesNamed(sf, typeName).filter(ts.isTypeAliasDeclaration);
+  if (decls.length !== 1) throw new Error(`could not find one "type ${typeName} = …" in ${sf.fileName} — did it move or get renamed?`);
+  let t: ts.TypeNode = decls[0]!.type;
+  while (ts.isParenthesizedTypeNode(t)) t = t.type;
+  const members = ts.isUnionTypeNode(t) ? t.types : [t];
+  return members.map((m) => (ts.isLiteralTypeNode(m) && ts.isStringLiteral(m.literal) ? m.literal.text : `<${printedText(m)}>`)).sort();
 }
 
-const PRODUCER = unionMembers(producerSrc, 'LiveReloadKind');
-const CONSUMER = unionMembers(consumerSrc, 'SceneChangedKind');
+/** The one function named `name` in `sf`. */
+function oneFunction(sf: ts.SourceFile, name: string): ts.FunctionLikeDeclaration & { body: ts.ConciseBody } {
+  const fns = functionsNamed(sf, name);
+  if (fns.length !== 1) throw new Error(`expected one function named ${name} in ${sf.fileName}, found ${fns.length}`);
+  return fns[0]!;
+}
+
+/** Every value `classifySceneChange` itself returns (not a nested function's): each arm of a `? :`, a string
+ *  literal as its text, anything else but `null` as `<its text>`. */
+function classifyReturns(sf: ts.SourceFile): string[] {
+  const fn = oneFunction(sf, 'classifySceneChange');
+  const values = (e: ts.Expression): string[] => {
+    const u = unwrapValue(e);
+    if (ts.isConditionalExpression(u)) return [...values(u.whenTrue), ...values(u.whenFalse)];
+    if (u.kind === ts.SyntaxKind.NullKeyword) return [];
+    const v = stringValueOf(u);
+    return [v === undefined ? `<${printedText(u)}>` : v];
+  };
+  return findNodes(fn.body, ts.isReturnStatement)
+    .filter((r) => enclosingFunction(r) === fn && !!r.expression)
+    .flatMap((r) => values(r.expression!));
+}
+
+/** The kinds `classifySceneChange` answers from an explicit `if (type === '<kind>') return '<kind>';` — the
+ *  comparison AND the return naming the same kind. */
+function classifyBranches(sf: ts.SourceFile): string[] {
+  const fn = oneFunction(sf, 'classifySceneChange');
+  return findNodes(fn.body, ts.isIfStatement).filter((s) => enclosingFunction(s) === fn).flatMap((s) => {
+    const t = unwrapValue(s.expression);
+    if (!ts.isBinaryExpression(t) || t.operatorToken.kind !== ts.SyntaxKind.EqualsEqualsEqualsToken || accessPath(t.left) !== 'type') return [];
+    const kind = stringValueOf(t.right);
+    const then = s.thenStatement;
+    const ret = ts.isReturnStatement(then) ? then : ts.isBlock(then) && then.statements.length === 1 && ts.isReturnStatement(then.statements[0]!) ? then.statements[0] as ts.ReturnStatement : undefined;
+    return kind !== undefined && ret?.expression && stringValueOf(ret.expression) === kind ? [kind] : [];
+  });
+}
+
+/** How `handleSceneChanged`'s `if (invalidateCachedAsset)` branch reaches `fireDirtyListeners()`: `top` for a
+ *  statement of the branch itself, `nested` for one inside a further branch, loop or closure — and how many
+ *  `return`/`throw`s (outside nested functions) sit in the branch's statements BEFORE the first top-level wake,
+ *  or in all of them when there is none. A conditional `if (x) { …; return; }` above the wake counts: on that
+ *  path the render is never woken (#1195 close-out review). */
+function dirtyWake(sf: ts.SourceFile): { reached: string[]; exitsBefore: number } {
+  const fn = oneFunction(sf, 'handleSceneChanged');
+  const ifs = findNodes(fn.body, ts.isIfStatement).filter((s) => accessPath(s.expression) === 'invalidateCachedAsset');
+  if (ifs.length !== 1) throw new Error(`expected one "if (invalidateCachedAsset)" in handleSceneChanged, found ${ifs.length}`);
+  const then = ifs[0]!.thenStatement;
+  const top = ts.isBlock(then) ? [...then.statements] : [then];
+  const isWake = (st: ts.Statement) => ts.isExpressionStatement(st) && ts.isCallExpression(unwrapValue(st.expression))
+    && calleeName(unwrapValue(st.expression) as ts.CallExpression) === 'fireDirtyListeners';
+  const wakeAt = top.findIndex(isWake);
+  const exits = (n: ts.Node): number => (ts.isFunctionLike(n) ? 0
+    : (ts.isReturnStatement(n) || ts.isThrowStatement(n) ? 1 : 0) + n.getChildren().reduce((sum, c) => sum + exits(c), 0));
+  return {
+    reached: callsTo(then, 'fireDirtyListeners').map((c) => (top.some((st) => isWake(st) && unwrapValue((st as ts.ExpressionStatement).expression) === c) ? 'top' : 'nested')),
+    exitsBefore: top.slice(0, wakeAt === -1 ? top.length : wakeAt).reduce((sum, st) => sum + exits(st), 0),
+  };
+}
+
+/** The keys of `const ASSET_CACHE_INVALIDATORS = { … }`. */
+function invalidatorTableKeys(sf: ts.SourceFile): string[] {
+  const decls = variablesNamed(sf, 'ASSET_CACHE_INVALIDATORS');
+  if (decls.length !== 1 || !decls[0]!.initializer) throw new Error('could not find one "const ASSET_CACHE_INVALIDATORS = …" — did it move or get renamed?');
+  const keys = objectLiteralKeys(unwrapValue(decls[0]!.initializer));
+  if (!keys) throw new Error('ASSET_CACHE_INVALIDATORS is no longer a plain object literal — read its new shape');
+  return keys;
+}
+
+const PRODUCER = unionMembers(producerSf, 'LiveReloadKind');
+const CONSUMER = unionMembers(consumerSf, 'SceneChangedKind');
 
 describe('live-reload kinds: producer and consumer cannot drift (#74)', () => {
   it('found both unions (sanity: the parse works, so a pass means something)', () => {
@@ -98,12 +178,9 @@ describe('live-reload kinds: producer and consumer cannot drift (#74)', () => {
   });
 
   it('every kind classifySceneChange can RETURN is in the union', () => {
-    const returned = [...producerSrc.matchAll(/return '([a-z0-9]+)';/g)].map((m) => m[1]);
-    const classifyBody = producerSrc.slice(producerSrc.indexOf('export function classifySceneChange'));
-    const inClassify = [...classifyBody.slice(0, classifyBody.indexOf('\n}')).matchAll(/return '([a-z0-9]+)';/g)].map((m) => m[1]);
+    const inClassify = classifyReturns(producerSf);
     expect(inClassify.length, 'classifySceneChange should return several kinds').toBeGreaterThan(2);
-    for (const kind of inClassify) expect(PRODUCER).toContain(kind);
-    expect(returned.length).toBeGreaterThan(0);
+    expect(inClassify.filter((kind) => !PRODUCER.includes(kind))).toEqual([]);
   });
 
   it('every kind in the union has an explicit branch in classifySceneChange', () => {
@@ -112,9 +189,8 @@ describe('live-reload kinds: producer and consumer cannot drift (#74)', () => {
     // by falling through a default/else. ⚠️ The `NO_DIRECT_COMPARISON` exception list that sat here
     // was EMPTY and is deleted (#1140): a kind that genuinely reaches classifySceneChange another way
     // is a counted `assertExemptionLedger` row, not a name list with no staleness check.
-    const classifyBody = producerSrc.slice(producerSrc.indexOf('export function classifySceneChange'));
-    const fnBody = classifyBody.slice(0, classifyBody.indexOf('\n}'));
-    const missing = PRODUCER.filter((k) => !new RegExp(`type === '${k}'`).test(fnBody));
+    const branches = classifyBranches(producerSf);
+    const missing = PRODUCER.filter((k) => !branches.includes(k));
     expect(
       missing,
       'These LiveReloadKind members have no `type === \'<kind>\'` branch in classifySceneChange, so ' +
@@ -129,20 +205,17 @@ describe('live-reload kinds: producer and consumer cannot drift (#74)', () => {
   // below left all 6664 tests in the scoped suites GREEN (measured, close-out of #842). That is
   // exactly the "unreachable mechanism" this file exists for, one level up.
   it('the invalidator branch WAKES a render, not just the cache (#842 close-out)', () => {
-    const fn = consumerSrc.slice(consumerSrc.indexOf('async function handleSceneChanged'));
-    const body = fn.slice(0, fn.indexOf('\n}'));
-    const branch = body.slice(body.indexOf('if (invalidateCachedAsset)'));
-    const branchBody = branch.slice(0, branch.indexOf('\n  }'));
     expect(
-      /fireDirtyListeners\s*\(/.test(branchBody),
+      dirtyWake(consumerSf),
       'The invalidator branch of handleSceneChanged invalidates a cache and returns without waking a '
         + 'render gate. While the sim is STOPPED, Scene2D\'s idle gate (Scene2D.tsx, the '
         + '`!isSimRunning() && !this._externalDirty` early return) skips the entire frame, so the '
         + 'viewport keeps showing PRE-EDIT pixels indefinitely — which is verbatim the symptom the '
         + 'ASSET_CACHE_INVALIDATORS table exists to prevent. Invalidating a cache nothing redraws is '
         + 'not an invalidation. Call fireDirtyListeners() (runtime/core/renderDirty) after the '
-        + 'invalidation; it wakes every subscribed surface, for all kinds in the table.',
-    ).toBe(true);
+        + 'invalidation, as a statement of the branch itself with no return or throw above it; it wakes every '
+        + 'subscribed surface, for all kinds in the table.',
+    ).toEqual({ reached: ['top'], exitsBefore: 0 });
   });
 
   it('every kind is HANDLED — a cache invalidator, or an explicit scene-reload kind', () => {
@@ -152,11 +225,10 @@ describe('live-reload kinds: producer and consumer cannot drift (#74)', () => {
     // On the shared ledger since #1140: the two kinds are `sanctioned` names, so one that GAINS an
     // invalidator entry (or leaves the union) reddens instead of keeping a pardon nobody needs.
     const SCENE_RELOAD_KINDS: readonly string[] = ['scene', 'prefab'];
-    const table = consumerSrc.slice(consumerSrc.indexOf('const ASSET_CACHE_INVALIDATORS'));
-    const tableBody = table.slice(0, table.indexOf('};'));
+    const tableKeys = invalidatorTableKeys(consumerSf);
     assertExemptionLedger({
       label: 'SCENE_RELOAD_KINDS in liveReloadKinds',
-      population: PRODUCER.filter((k) => !new RegExp(`\\b${k}:`).test(tableBody)).map((k) => ({ item: k, site: k })),
+      population: PRODUCER.filter((k) => !tableKeys.includes(k)).map((k) => ({ item: k, site: k })),
       sanctioned: SCENE_RELOAD_KINDS,
       floor: 1,
       fix: 'These kinds are broadcast but have no invalidator entry, so the renderer receives them and '
@@ -242,14 +314,16 @@ describe('live-reload kinds: producer and consumer cannot drift (#74)', () => {
  * hand-typed list the way the THIRD gap's fix once did.
  */
 describe('live-reload watchers share ONE extension gate, not two (#857)', () => {
-  /** A real watcher registration in this codebase — `chokidar`'s own watch call (the Electron
-   *  backend) or the Vite dev server's watcher `.on(` (verified: repo-wide, only two files match
-   *  either shape today). Deliberately checked against COMMENT-BLANKED code below, not raw text:
-   *  this very describe block's own docblock and comments talk ABOUT both shapes in prose, and a
-   *  raw-text match would flag this test file itself as a watcher implementation (measured while
-   *  writing this guard — the fail mode `readScannedSource`'s own module doc warns about, landing
-   *  here on the first attempt). */
-  const WATCHER_REGISTRATION = /chokidar\.watch\(|\.watcher\.on\(/;
+  /** A file that registers a watcher — `chokidar.watch(…)` (the Electron backend) or the Vite dev server's
+   *  `….watcher.on(…)` — AND classifies via `classifySceneChange`: a call to it, or any read of a binding
+   *  imported AS it (an alias, or handed on by reference). From the parser, so a file (like this one) that only
+   *  discusses either in prose or a string cannot satisfy it. */
+  function isWatcherClassifier(sf: ts.SourceFile): boolean {
+    const aliases = findNodes(sf, ts.isImportSpecifier)
+      .filter((sp) => (sp.propertyName ?? sp.name).text === 'classifySceneChange').map((sp) => sp.name);
+    const classifies = callsTo(sf, 'classifySceneChange').length > 0 || aliases.some((id) => readsOf(id).length > 0);
+    return (callsToPath(sf, 'chokidar.watch').length > 0 || callsToPath(sf, 'watcher.on').length > 0) && classifies;
+  }
 
   function findWatcherClassifierFiles(): string[] {
     // `.ts`/`.tsx` repo-wide — floored far under even the smallest real corpus (the public OSS
@@ -257,47 +331,38 @@ describe('live-reload watchers share ONE extension gate, not two (#857)', () => 
     // before it ever reaches the file-content check.
     const candidates = repoFiles({ match: (rel: string) => /\.tsx?$/.test(rel), floor: 500 });
     const out: string[] = [];
-    for (const { abs } of candidates) {
+    for (const { abs, rel } of candidates) {
       let raw: string;
       try { raw = fs.readFileSync(abs, 'utf8'); } catch { continue; } // tracked but absent locally
-      // Cheap RAW pre-filter first — narrows the whole repo down to a handful of candidates
-      // before paying for a comment-blanked parse of each. Widening the candidate set here is
-      // harmless (a raw mention that turns out to be prose is dropped by the blanked check next);
-      // narrowing it here would not be, so this check only ever ADDS candidates relative to the
-      // authoritative one below.
-      if (!WATCHER_REGISTRATION.test(raw) || !raw.includes('classifySceneChange')) continue;
-      // The authoritative check: comment-blanked, so a file that only ever DISCUSSES a watcher
-      // registration or `classifySceneChange` — like this describe block's own docblock — cannot
-      // satisfy it.
-      const { code } = readScannedSource(abs);
-      if (WATCHER_REGISTRATION.test(code) && code.includes('classifySceneChange')) out.push(abs);
+      // Cheap RAW pre-filter first — narrows the whole repo down to a handful of candidates before
+      // paying for a parse of each. It only ever ADDS candidates relative to the authoritative check
+      // next: every call the parser can find spells both names somewhere in the raw text.
+      if (!raw.includes('classifySceneChange') || !/\bwatch\b|\bwatcher\b/.test(raw)) continue;
+      if (isWatcherClassifier(parseSource(readScannedSource(abs).code, rel))) out.push(abs);
     }
     return out;
   }
 
-  /** No whitespace/quote-variant escape: `extname` call, optional `.toLowerCase()`, `===`, a
-   *  quoted `.json` — the exact shape of the duplicated line in both its historical spellings. */
-  const EXTENSION_GATE = /extname\s*\([^)]*\)\s*(?:\.\s*toLowerCase\s*\(\s*\)\s*)?===\s*(['"])\.json\1/;
+  /** The extension gate #857 found duplicated, as a node: `extname(…)` — optionally `.toLowerCase()`d —
+   *  compared (`===`, `!==`, `==`, `!=`, either way round) with the string `.json`. */
+  function isExtensionGate(n: ts.Node): n is ts.BinaryExpression {
+    if (!ts.isBinaryExpression(n)) return false;
+    const op = n.operatorToken.kind;
+    if (![ts.SyntaxKind.EqualsEqualsEqualsToken, ts.SyntaxKind.ExclamationEqualsEqualsToken, ts.SyntaxKind.EqualsEqualsToken,
+      ts.SyntaxKind.ExclamationEqualsToken].includes(op)) return false;
+    const isExtname = (e: ts.Expression): boolean => {
+      let u = unwrapValue(e);
+      if (ts.isCallExpression(u) && calleeName(u) === 'toLowerCase' && ts.isPropertyAccessExpression(u.expression)) u = unwrapValue(u.expression.expression);
+      return ts.isCallExpression(u) && calleeName(u) === 'extname';
+    };
+    return (stringValueOf(n.right) === '.json' && isExtname(n.left)) || (stringValueOf(n.left) === '.json' && isExtname(n.right));
+  }
 
-  /** Slice the `onChange` handler's body out of comment-blanked source (balanced braces — same
-   *  idiom as invalidatorGranularity.test.ts's extractFunctionBody), so a mention of the extension
-   *  gate in a COMMENT can neither satisfy nor defeat this check. Both watcher files declare the
-   *  handler the same way: `const onChange = (file: string) => { ... };`. */
-  function extractOnChangeBody(code: string, label: string): string {
-    const sigIdx = code.indexOf('const onChange = (');
-    if (sigIdx === -1) {
-      throw new Error(`${label}: "const onChange = (" not found — did the watcher handler move or get renamed?`);
-    }
-    const braceStart = code.indexOf('{', sigIdx);
-    if (braceStart === -1) throw new Error(`${label}: no "{" found after "const onChange = ("`);
-    let depth = 1;
-    let j = braceStart + 1;
-    while (depth > 0 && j < code.length) {
-      if (code[j] === '{') depth++;
-      else if (code[j] === '}') depth--;
-      j++;
-    }
-    return code.slice(braceStart, j);
+  /** The one `onChange` handler in `sf`: its extension gates (as flat text), and how many times it calls the
+   *  shared `pathToClassifyForChange`. */
+  function onChangeGate(sf: ts.SourceFile): { gates: string[]; callsShared: number } {
+    const fn = oneFunction(sf, 'onChange');
+    return { gates: findNodes(fn.body, isExtensionGate).map(flatText), callsShared: callsTo(fn.body, 'pathToClassifyForChange').length };
   }
 
   const watcherFiles = findWatcherClassifierFiles();
@@ -312,9 +377,8 @@ describe('live-reload watchers share ONE extension gate, not two (#857)', () => 
     const violators: string[] = [];
     for (const abs of watcherFiles) {
       const rel = path.relative(REPO, abs).split(path.sep).join('/');
-      const { code } = readScannedSource(abs);
-      const body = extractOnChangeBody(code, rel);
-      if (EXTENSION_GATE.test(body)) {
+      const { gates, callsShared } = onChangeGate(parseSource(readScannedSource(abs).code, rel));
+      if (gates.length > 0) {
         violators.push(
           `${rel}: onChange still tests extname(...) === '.json' directly instead of going through ` +
           'pathToClassifyForChange — this is the exact duplicated line #857 exposed: a shader BODY ' +
@@ -322,7 +386,7 @@ describe('live-reload watchers share ONE extension gate, not two (#857)', () => 
           'shader-body edit no matter what pathToClassifyForChange itself does.',
         );
       }
-      if (!/pathToClassifyForChange\s*\(/.test(body)) {
+      if (callsShared === 0) {
         violators.push(
           `${rel}: onChange does not call pathToClassifyForChange — every watcher must resolve the ` +
           'path to classify through the one shared helper, not its own logic, so the two watchers ' +
@@ -333,11 +397,49 @@ describe('live-reload watchers share ONE extension gate, not two (#857)', () => 
     expect(violators, violators.join('\n')).toEqual([]);
   });
 
-  it('EXTENSION_GATE flags both historical spellings of the duplicated gate, and not the shared helper', () => {
+  it('isExtensionGate flags both historical spellings of the duplicated gate, and not the shared helper', () => {
     // Its half of the check above greens on zero matches, and a clean corpus has none (#1105).
-    expect(EXTENSION_GATE.test("if (path.extname(file) === '.json') {")).toBe(true);
-    expect(EXTENSION_GATE.test('if (extname(file).toLowerCase() === ".json") {')).toBe(true);
-    expect(EXTENSION_GATE.test('const target = pathToClassifyForChange(file);')).toBe(false);
-    expect(EXTENSION_GATE.test("if (path.extname(file) === '.glsl') {")).toBe(false);
+    const gates = (src: string) => onChangeGate(parseSource(`const onChange = (file: string) => {\n${src}\n};`, 'probe.ts')).gates;
+    expect(gates("if (path.extname(file) === '.json') {}")).toEqual(["path.extname(file) === '.json'"]);
+    expect(gates('if (extname(file).toLowerCase() === ".json") {}')).toEqual(['extname(file).toLowerCase() === ".json"']);
+    expect(gates("if ('.json' !== extname(\n  file,\n)) return;")).toEqual(["'.json' !== extname( file, )"]);
+    expect(gates('const target = pathToClassifyForChange(file);')).toEqual([]);
+    expect(gates("if (path.extname(file) === '.glsl') {}")).toEqual([]);
+    expect(gates("log(\"extname(file) === '.json'\");")).toEqual([]);
+  });
+
+  it('reads the unions, classifySceneChange, the wake branch and the table as units (#1195)', () => {
+    const sf = parseSource([
+      "export type K = ('scene' | 'prefab' | Other);",
+      'export function classifySceneChange(rel: string): K | null {',
+      "  const type = detectType(rel, '.json'); const t = `\n}`;",
+      "  if (type === 'prefab') return 'prefab';",
+      "  if (type === 'material') return 'shader';",
+      "  if (type === 'timeline') { return 'timeline'; }",
+      "  const nested = () => { if (type === 'rig2d') return 'rig2d'; };",
+      "  return rel.endsWith('x') ? 'scene' : kindOf(rel);",
+      '}',
+      'async function handleSceneChanged(msg) {',
+      '  const invalidateCachedAsset = pick(msg);',
+      '  if (invalidateCachedAsset) {\n  invalidateCachedAsset(msg.urlPath);\n  if (msg.x) { fireDirtyListeners(); }\n  return;\n  fireDirtyListeners();\n  }',
+      '}',
+      'const ASSET_CACHE_INVALIDATORS: Record<string, Fn> = { animation: invalidateAnimationClip, "timeline": invalidateTimeline };',
+    ].join('\n'), 'probe.ts');
+    expect(unionMembers(sf, 'K')).toEqual(['<Other>', 'prefab', 'scene']);
+    expect(classifyReturns(sf)).toEqual(['prefab', 'shader', 'timeline', 'scene', '<kindOf(rel)>']);
+    expect(classifyBranches(sf)).toEqual(['prefab', 'timeline']);
+    expect(dirtyWake(sf)).toEqual({ reached: ['nested', 'top'], exitsBefore: 1 });
+    const early = parseSource("async function handleSceneChanged(msg) { const invalidateCachedAsset = f;\n  if (invalidateCachedAsset) {\n    if (!msg.viaSibling) { await drop(msg); return; }\n    const g = () => { return 1; };\n    fireDirtyListeners();\n    return;\n  }\n}", 'early.ts');
+    expect(dirtyWake(early)).toEqual({ reached: ['top'], exitsBefore: 1 });
+    expect(invalidatorTableKeys(sf)).toEqual(['animation', 'timeline']);
+    // A watcher file is one that CALLS both — not one that names them.
+    expect(isWatcherClassifier(parseSource("server.watcher.on('change', (f) => classifySceneChange(f));", 'a.ts'))).toBe(true);
+    expect(isWatcherClassifier(parseSource("const w = chokidar.watch(dir); w.on('all', onChange);\nclassifySceneChange(x);", 'b.ts'))).toBe(true);
+    expect(isWatcherClassifier(parseSource("const doc = 'chokidar.watch( and classifySceneChange('; watcher.off(x);", 'c.ts'))).toBe(false);
+    expect(isWatcherClassifier(parseSource("server.watcher.on('change', reload); // classifySceneChange", 'd.ts'))).toBe(false);
+    // Imported under another name, called or handed on — still a classifying watcher; imported and unused is not.
+    expect(isWatcherClassifier(parseSource("import { classifySceneChange as classify } from './s';\nchokidar.watch(d).on('all', (f) => classify(f));", 'e.ts'))).toBe(true);
+    expect(isWatcherClassifier(parseSource("import { classifySceneChange as classify } from './s';\nchokidar.watch(d).on('all', (f) => route(f, classify));", 'f.ts'))).toBe(true);
+    expect(isWatcherClassifier(parseSource("import { classifySceneChange as classify } from './s';\nchokidar.watch(d);", 'g.ts'))).toBe(false);
   });
 });

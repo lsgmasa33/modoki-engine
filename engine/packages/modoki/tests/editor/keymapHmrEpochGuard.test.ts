@@ -15,10 +15,11 @@
  *  See docs/editor-hmr.md. */
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { repoFiles } from '../../../../scripts/repoCorpus.mjs';
+import { readScannedSource } from '../helpers/sourceScanner';
+import { accessPath, callsTo, functionBodyOf, importsIn, objectLiteralKeys, parseSource, ts, unwrapValue } from '../helpers/sourceAst';
 
 const EDITOR = join(fileURLToPath(new URL('.', import.meta.url)), '../../src/editor');
 
@@ -39,45 +40,39 @@ function walk(dir: string, out: string[] = []): string[] {
   return out;
 }
 
-/** Slice out each `useEffect(` body, brace-balanced, together with its dep array — good
- *  enough for a lint-style guard and far cheaper than a real parser. */
-function effectBlocks(src: string): string[] {
-  const blocks: string[] = [];
-  const re = /useEffect\(/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(src))) {
-    let depth = 0;
-    let i = m.index + m[0].length - 1;
-    for (; i < src.length; i++) {
-      if (src[i] === '(') depth++;
-      else if (src[i] === ')') {
-        depth--;
-        if (depth === 0) break;
-      }
-    }
-    blocks.push(src.slice(m.index, i + 1));
-  }
-  return blocks;
+/** Every `useEffect(…)` whose callback registers keymap bindings — a `register({ … })` call inside it.
+ *
+ *  ⚠️ **The effect and its dep array are NODES (#1195).** This used to slice each `useEffect(` out by
+ *  counting parentheses from the call and take "the last `[…]` before the last `)`" as its deps. A
+ *  `(` inside a string kept the count above zero, so that effect's slice swallowed the NEXT effect and
+ *  read the neighbour's `[hmrEpoch]` as its own: `console.log(':-(')` in an effect with `[]` deps
+ *  passed. Measured as a false pass before the move; it is the fixture below. */
+function registrarEffects(sf: ts.SourceFile): ts.CallExpression[] {
+  return callsTo(sf, 'useEffect').filter((effect) => {
+    const body = functionBodyOf(effect.arguments[0]);
+    return !!body && callsTo(body, 'register').some((r) => objectLiteralKeys(r.arguments[0]) !== undefined);
+  });
 }
 
-/** The dependency array of a `useEffect(...)` block — the text of the final `[...]`
- *  argument — or null if the effect has none (which is itself an offence here). */
-function depsOf(block: string): string | null {
-  const close = block.lastIndexOf(')');
-  const open = block.lastIndexOf('[', close);
-  if (open < 0) return null;
-  const end = block.indexOf(']', open);
-  return end < 0 ? null : block.slice(open, end + 1);
+/** Does the effect's DEP ARRAY name `hmrEpoch`? No dep array at all is an offence too. */
+function depsHaveEpoch(effect: ts.CallExpression): boolean {
+  const deps = effect.arguments[1] && unwrapValue(effect.arguments[1]);
+  if (!deps || !ts.isArrayLiteralExpression(deps)) return false;
+  return deps.elements.some((el) => accessPath(el)?.split('.').pop() === 'hmrEpoch');
 }
+
+/** Only files that import the keymap registry can register bindings. */
+const importsKeymap = (sf: ts.SourceFile): boolean =>
+  importsIn(sf).some((e) => e.kind === 'import' && /(^|\/)input\/keymap$/.test(e.spec));
 
 /** Does this source register keymap bindings from an effect whose DEP ARRAY lacks `hmrEpoch`? */
-function hasEpochlessRegistrar(src: string): boolean {
-  // Only files that actually pull in the keymap registry can register bindings.
-  if (!/from ['"][^'"]*input\/keymap['"]/.test(src)) return false;
-  // Test the DEP ARRAY, not the whole block — the effects carry an explanatory comment mentioning
-  // `hmrEpoch`, so a substring search over the body silently passes even after the dep is
-  // removed. (Caught by mutating a real registrar.)
-  return effectBlocks(src).some((block) => /\bregister\(\s*\{/.test(block) && !/hmrEpoch/.test(depsOf(block) ?? ''));
+function hasEpochlessRegistrar(src: string, label = 'probe.tsx'): boolean {
+  const sf = parseSource(src, label);
+  if (!importsKeymap(sf)) return false;
+  // The DEP ARRAY, not the whole effect — the effects carry an explanatory comment mentioning
+  // `hmrEpoch`, so a substring search over the body silently passes even after the dep is removed.
+  // (Caught by mutating a real registrar.)
+  return registrarEffects(sf).some((effect) => !depsHaveEpoch(effect));
 }
 
 describe('keymap registrars are HMR-epoch keyed', () => {
@@ -90,11 +85,24 @@ describe('keymap registrars are HMR-epoch keyed', () => {
     expect(hasEpochlessRegistrar(unkeyed.replace(head, ''))).toBe(false); // no keymap import
   });
 
+  it('a bracket inside a string does not hand an effect its NEIGHBOUR\'s deps (#1195)', () => {
+    // The issue's probe, verbatim: the first effect's deps are `[]`, the offence, and the `(` in its
+    // string made the old paren count swallow the second effect and read `[hmrEpoch]` as its own.
+    const head = "import { register } from '../input/keymap';\n";
+    const probe = `${head}useEffect(() => { console.log(':-('); register({ key: 'a' }); }, []);\n`
+      + "useEffect(() => { register({ key: 'b' }); }, [hmrEpoch]);\n";
+    expect(hasEpochlessRegistrar(probe)).toBe(true);
+    // And the accept side: both keyed, with the same string.
+    expect(hasEpochlessRegistrar(probe.replace(', []);', ', [hmrEpoch]);'))).toBe(false);
+    // No dep array at all runs every render and still counts as unkeyed.
+    expect(hasEpochlessRegistrar(`${head}useEffect(() => { register({ key: 'c' }); });`)).toBe(true);
+  });
+
   it('every useEffect that calls register() depends on the HMR epoch', () => {
     const offenders: string[] = [];
     for (const file of walk(EDITOR)) {
       const rel = relative(EDITOR, file).split('\\').join('/');
-      if (hasEpochlessRegistrar(readFileSync(file, 'utf8'))) offenders.push(rel);
+      if (hasEpochlessRegistrar(readScannedSource(file).code, file)) offenders.push(rel);
     }
     expect(
       offenders,
@@ -108,9 +116,8 @@ describe('keymap registrars are HMR-epoch keyed', () => {
     // Without this, a broken walk/regex would make the assertion above pass by finding
     // nothing at all — the same vacuity trap the HMR plugin test hit.
     const found = walk(EDITOR).filter((f) => {
-      const src = readFileSync(f, 'utf8');
-      return /from ['"][^'"]*input\/keymap['"]/.test(src)
-        && effectBlocks(src).some((b) => /\bregister\(\s*\{/.test(b));
+      const sf = parseSource(readScannedSource(f).code, f);
+      return importsKeymap(sf) && registrarEffects(sf).length > 0;
     });
     expect(found.length).toBeGreaterThanOrEqual(6);
   });

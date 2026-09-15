@@ -31,6 +31,7 @@ import { MODULE_KEYS } from '../../plugins/detect-modules';
 import { REPO_ROOT } from '../helpers/repoLayout';
 import { stripComments, stripCommentsAndStrings, assertScanIsSane, readScannedSource } from '@modoki/engine/testing';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { parseSource, propertyValue, stringValueOf, ts, unwrapValue, variablesNamed } from '@modoki/engine/testing/sourceAst';
 
 /** `gpuParticles` → `__MODOKI_MODULE_GPU_PARTICLES__`; `render3d` → `__MODOKI_MODULE_RENDER3D__`
  *  (no camel boundary before a digit, so it does NOT become `RENDER_3D`). */
@@ -160,11 +161,16 @@ describe('build.modules toggles are wired in both directions', () => {
 
   it('the Engine Modules panel offers exactly the keys MODULE_KEYS resolves', () => {
     const panelPath = 'engine/packages/modoki/src/editor/panels/ModuleTogglesEditor.tsx';
-    const src = readScannedSource(path.join(REPO_ROOT, panelPath)).code;
-    const start = src.indexOf('const MODULES');
-    expect(start, `${panelPath} no longer declares a MODULES array — this guard needs updating`).toBeGreaterThan(-1);
-    const block = src.slice(start, src.indexOf('\n];', start));
-    const rows = [...block.matchAll(/key:\s*'([^']+)'/g)].map((m) => m[1]);
+    // The array and each row's `key` are NODES (#1195). This was `indexOf('const MODULES')` up to the
+    // first `'\n];'` with `key:\s*'…'` matched inside — a longer `const MODULES_…` name, a closer at that
+    // indent inside a row, or a double-quoted key each changed the rows it read.
+    const abs = path.join(REPO_ROOT, panelPath);
+    const decls = variablesNamed(parseSource(readScannedSource(abs).code, abs), 'MODULES');
+    expect(decls.length, `${panelPath} no longer declares one MODULES array — this guard needs updating`).toBe(1);
+    const init = decls[0]!.initializer && unwrapValue(decls[0]!.initializer);
+    expect(init && ts.isArrayLiteralExpression(init), `${panelPath}'s MODULES is no longer an array literal`).toBe(true);
+    const rows = (init as ts.ArrayLiteralExpression).elements.map((el) => stringValueOf(propertyValue(el, 'key') as ts.Expression));
+    expect(rows.filter((k) => k === undefined).length, `a ${panelPath} row has no string \`key\` — it can resolve to no module`).toBe(0);
 
     expect(
       [...rows].sort(),

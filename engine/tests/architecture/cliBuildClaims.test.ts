@@ -21,7 +21,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { readScannedSource } from '@modoki/engine/testing';
-import { boundIdentifier, callsTo, declarationOf, enclosingFunction, findNodes, importBindings, parseSource, readsOf } from '@modoki/engine/testing/sourceAst';
+import { accessPath, boundIdentifier, callsTo, callsToPath, declarationOf, enclosingFunction, findNodes, importBindings, parseSource, precedingStatements, readsOf, unwrapValue } from '@modoki/engine/testing/sourceAst';
 import { acquireBuildClaim, readBuildClaim, resetBuildClaimsForTests } from '../../scripts/buildClaimsStore.mjs';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
@@ -311,6 +311,37 @@ describe('ota-publish.mjs takes the cross-process build claim (#650)', () => {
   });
 });
 
+/** How build-subgame.mjs gives its claim back: for each `process.exit(…)` in a module statement AFTER the one
+ *  that takes the claim (`buildClaim = …` — so not the acquisition's own refusal and catch, which run while no
+ *  claim is held), whether a `buildClaim?.release();` statement has already run on its way there — an earlier
+ *  statement of a list enclosing the exit — with nothing but `console.*` or an exit called between that release and it;
+ *  whether the module's LAST statement is that release; and how many release calls there are in all.
+ *
+ *  ⚠️ "Nothing runs between", not "after the work" (#1195 close-out review, then two §2d rounds). Every reader
+ *  that tried to locate the WORK moved the hole: module scope missed a release hoisted into a wrapper above the
+ *  build's `try`; "after the try block, or else after the claim" missed `release(); try { build } catch
+ *  { failed = true } if (failed) process.exit(1)`. Any call between release and exit is treated as work, so
+ *  `release(); try { report(e) } catch { process.exit(2) }` is red too: strict, and loud rather than silent. */
+function claimReleases(sf: ts.SourceFile): { exitsAfterClaim: boolean[]; atModuleEnd: boolean; releases: number } {
+  const isRelease = (st: ts.Node) => ts.isExpressionStatement(st) && callsToPath(st.expression, 'buildClaim.release')
+    .some((c) => unwrapValue(st.expression) === c);
+  const assigns = findNodes(sf, (n): n is ts.BinaryExpression => ts.isBinaryExpression(n)
+    && n.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isIdentifier(n.left) && n.left.text === 'buildClaim');
+  expect(assigns.length, 'expected one `buildClaim = …` assignment').toBe(1);
+  const last = sf.statements[sf.statements.length - 1];
+  const topIndex = (n: ts.Node) => sf.statements.findIndex((st) => st.pos <= n.pos && n.end <= st.end);
+  const calls = findNodes(sf, ts.isCallExpression);
+  /** Work between two offsets: any call but `console.*` or another `process.exit` (an exit ends the run, it does no work). */
+  const runsBetween = (from: number, to: number) => calls.some((c) => c.pos >= from && c.end <= to
+    && !(accessPath(c.expression) ?? '').startsWith('console.') && accessPath(c.expression) !== 'process.exit');
+  return {
+    exitsAfterClaim: callsToPath(sf, 'process.exit').filter((c) => topIndex(c) > topIndex(assigns[0]!))
+      .map((c) => precedingStatements(c).some((s) => isRelease(s) && !runsBetween(s.end, c.getStart()))),
+    atModuleEnd: !!last && isRelease(last),
+    releases: callsToPath(sf, 'buildClaim.release').length,
+  };
+}
+
 describe('build-subgame.mjs takes the cross-process build claim (#650, #837)', () => {
   // It had none: nothing ran it but a human until #837 wired it into the editor's OTA publish, which
   // uploads the `subgame-dist` it writes. A hand-run copy racing that publish would ship a torn module.
@@ -336,9 +367,42 @@ describe('build-subgame.mjs takes the cross-process build claim (#650, #837)', (
 
   it('releases the claim on the failure exit AND after a successful build', () => {
     // `process.exit()` skips `finally`, so both paths release explicitly.
-    expect(src.match(/buildClaim\?\.\s*release\(\)/g) ?? []).toHaveLength(2);
-    const failIdx = src.indexOf('buildClaim?.release();\n  process.exit(1);');
-    expect(failIdx).toBeGreaterThan(-1);
+    expect(claimReleases(parseSource(src, 'build-subgame.mjs'))).toEqual({ exitsAfterClaim: [true], atModuleEnd: true, releases: 2 });
+  });
+
+  it('reads each exit and the module\'s last statement by node (#1195)', () => {
+    // It used to count /buildClaim\?\.\s*release\(\)/ and find `'buildClaim?.release();\n  process.exit(1);'` — a
+    // fixed two-space adjacency, so a blank line or a log between the two failed it, and a release ANYWHERE
+    // before some exit passed it.
+    const probe = (tail: string) => claimReleases(parseSource(`if (!ok) process.exit(1);\nlet buildClaim = null;\ntry { buildClaim = acquire(); } catch { process.exit(1); }\n${tail}`, 'probe.mjs'));
+    expect(probe('try { run(); } catch (e) {\n  buildClaim?.release();\n\n  console.error(e);\n  process.exit(1);\n}\nbuildClaim?.release();'))
+      .toEqual({ exitsAfterClaim: [true], atModuleEnd: true, releases: 2 });
+    expect(probe('if (x) { buildClaim?.release(); }\ntry { run(); } catch (e) { process.exit(1); }\nbuildClaim?.release();'))
+      .toEqual({ exitsAfterClaim: [false], atModuleEnd: true, releases: 2 });
+    expect(probe('try { run(); } catch (e) { const r = () => buildClaim?.release(); process.exit(2); }\nfinish();'))
+      .toEqual({ exitsAfterClaim: [false], atModuleEnd: false, releases: 1 });
+    // A release that ran earlier in the same handler covers an exit nested in a branch after it.
+    expect(probe('try { run(); } catch (e) {\n  buildClaim?.release();\n  if (fromChild) { process.exit(e.status ?? 1); }\n  process.exit(1);\n}\nbuildClaim?.release();'))
+      .toEqual({ exitsAfterClaim: [true, true], atModuleEnd: true, releases: 2 });
+    // A release BEFORE the build's try does not vouch for the catch's exit: the build ran with no claim.
+    expect(probe('buildClaim?.release();\ntry { run(); } catch (e) {\n  process.exit(1);\n}\nbuildClaim?.release();'))
+      .toEqual({ exitsAfterClaim: [false], atModuleEnd: true, releases: 2 });
+    // …nor one hoisted above it inside a wrapper: a list below module scope is still before the work.
+    for (const [open, close] of [['if (go) {', '}'], ['{', '}'], ['try {', '} finally {}']]) {
+      expect(probe(`${open}\n  buildClaim?.release();\n  try { run(); } catch (e) { process.exit(1); }\n${close}\nbuildClaim?.release();`), open)
+        .toEqual({ exitsAfterClaim: [false], atModuleEnd: true, releases: 2 });
+    }
+    // …nor one before the work when the exit is outside any catch (a flag set in the catch, the exit after it).
+    expect(probe('let failed = false;\nbuildClaim?.release();\ntry { run(); } catch (e) { failed = true; }\nif (failed) process.exit(1);\nbuildClaim?.release();'))
+      .toEqual({ exitsAfterClaim: [false], atModuleEnd: true, releases: 2 });
+    expect(probe('buildClaim?.release();\nconst r = run();\nif (r.status) process.exit(1);\nbuildClaim?.release();'))
+      .toEqual({ exitsAfterClaim: [false], atModuleEnd: true, releases: 2 });
+    // Work done, then released, then a conditional exit: released.
+    expect(probe('const r = run();\nbuildClaim?.release();\nif (r.status) process.exit(1);'))
+      .toEqual({ exitsAfterClaim: [true], atModuleEnd: false, releases: 1 });
+    // Strict: any non-console call after the release counts as work, so a report in a nested try is red.
+    expect(probe('try { run(); } catch (e) {\n  buildClaim?.release();\n  try { report(e); } catch { process.exit(2); }\n  process.exit(1);\n}\nbuildClaim?.release();'))
+      .toEqual({ exitsAfterClaim: [false, false], atModuleEnd: true, releases: 2 });
   });
 
   it('acquires BEFORE its first write (the scoped tsconfig) and before the vite build', () => {

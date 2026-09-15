@@ -18,31 +18,22 @@
  *  seed guard (`qualityTierSeed.test.ts`) is what pins values. */
 
 import { describe, it, expect } from 'vitest';
-import fs from 'node:fs';
 import path from 'node:path';
 import { REPO_ROOT } from '../helpers/repoLayout';
-import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { readScannedSource } from '@modoki/engine/testing';
+import { parseSource, typeMembers, typesNamed } from '@modoki/engine/testing/sourceAst';
 
-/** Field names declared directly in `interface <name> { … }`, ignoring nested object literals
- *  (the `postFX` block declares its own inner keys, which are not tier fields). */
+/** Field names declared directly on `interface <name>` — its OWN members, from the parser (#1195), so a
+ *  nested literal's keys (the `postFX` block declares its own inner keys, which are not tier fields) are
+ *  not counted, and a brace or a `key:` inside a string cannot move the edge. It used to brace-count the
+ *  body, flatten `{…}` one level deep with a regex and match `^\s*(\w+)\s*[?:]` per line. */
 function interfaceFields(file: string, name: string): string[] {
-  const raw = fs.readFileSync(file, 'utf8');
-  // Comments stripped first (shared scanner, @modoki/engine/testing, #419) — only then is it
-  // safe to flatten nested `{...}` blocks down to top-level members.
-  const src = stripComments(raw);
-  assertScanIsSane(raw, src, file);
-  const start = src.indexOf(`interface ${name} {`);
-  expect(start, `${name} not found in ${file} — did it get renamed?`).toBeGreaterThan(-1);
-  let depth = 0, i = src.indexOf('{', start), end = -1;
-  for (; i < src.length; i++) {
-    if (src[i] === '{') depth++;
-    else if (src[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
-  }
-  expect(end, `unbalanced braces reading ${name}`).toBeGreaterThan(-1);
-  const body = src.slice(src.indexOf('{', start) + 1, end);
-  // Strip nested blocks so only top-level members remain.
-  const flat = body.replace(/\{[^{}]*\}/g, '{}');
-  return [...flat.matchAll(/^\s*(\w+)\s*[?:]/gm)].map((m) => m[1]).sort();
+  const sf = parseSource(readScannedSource(file).code, file);
+  const decls = typesNamed(sf, name);
+  expect(decls.length, `${name} in ${file}: expected one declaration — did it get renamed, or split in two?`).toBe(1);
+  const members = typeMembers(decls[0]);
+  expect(members, `${name} in ${file} is no longer a plain interface or type literal (an alias, or one that extends another) — read its new shape`).toBeDefined();
+  return members!.map((m) => m.name).sort();
 }
 
 describe('the engine tier type and its project-config twin describe the same fields', () => {

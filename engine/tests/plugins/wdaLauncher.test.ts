@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { reapDeps } from '../../plugins/backend/iosUsbForward';
 import { readScannedSource } from '@modoki/engine/testing';
+import { callsTo, findNodes, functionsNamed, parseSource, ts } from '@modoki/engine/testing/sourceAst';
 import {
   parseIosDevices, parseIosDevicesResult, resolveIosDevice, ensureWdaRunning, stopWda,
   isWdaProcessRunning, _resetWdaLauncherForTests, WDA_PROBE_TIMEOUT_MS,
@@ -140,10 +141,14 @@ describe('a broken iOS listing does not read as "no phone is paired" (#1096)', (
     // suite green — measured. The helper has no other caller and cannot be stubbed (it is called
     // through `legacyDefault`, not through `opts`), so the guard is on the SOURCE, the same shape
     // this file already uses for DEVICECTL_ARGV.
-    const src = readScannedSource(path.join(__dirname, '../../plugins/backend/wdaLauncher.ts')).code;
-    const body = /listLegacyDevicesSync\(\): string \{([\s\S]*?)\n {2}\},/.exec(src)?.[1];
-    expect(body, 'listLegacyDevicesSync is gone — this guard no longer guards anything').toBeDefined();
-    expect(body!, 'a swallowed xctrace failure reads as "no legacy devices", which is #1096').not.toMatch(/catch/);
+    // The method's body is its NODE (#1195), not the text up to the next two-space `},` — which a
+    // nested object literal ended early, and one more level of indentation moved past the method.
+    const file = path.join(__dirname, '../../plugins/backend/wdaLauncher.ts');
+    const fns = functionsNamed(parseSource(readScannedSource(file).code, file), 'listLegacyDevicesSync');
+    expect(fns.length, 'listLegacyDevicesSync is gone (or doubled) — this guard no longer guards one thing').toBe(1);
+    // A `catch` CLAUSE, or a `.catch(` handler: either one turns an xctrace failure into a listing.
+    const swallows = findNodes(fns[0]!.body, ts.isCatchClause).length + callsTo(fns[0]!.body, 'catch').length;
+    expect(swallows, 'a swallowed xctrace failure reads as "no legacy devices", which is #1096').toBe(0);
   });
 
   it('ACCEPT: with both sync sources answering, an empty listing still says "no iOS device is paired"', async () => {

@@ -15,9 +15,10 @@
  *  Modelled on `prefabFormatVersionLiteral.test.ts`, the local precedent for this exact
  *  read-source-as-text style. */
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { readScannedSource } from '@modoki/engine/testing';
+import { parseSource, printedText, typeMembers, typesNamed } from '@modoki/engine/testing/sourceAst';
 
 const ENGINE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -34,34 +35,43 @@ const TARGETS: Target[] = [
   { interfaceName: 'PrefabFile', file: 'packages/modoki/src/editor/scene/prefab.ts' },
 ];
 
-/** Extract `interface <name> { ... }`'s body — up to the next top-level `}` at the start of a
- *  line, which is how every one of these interfaces is formatted in this repo. */
-function interfaceBody(src: string, name: string): string | null {
-  const start = src.indexOf(`interface ${name} {`);
-  if (start === -1) return null;
-  const bodyStart = src.indexOf('{', start) + 1;
-  const end = src.indexOf('\n}', bodyStart);
-  if (end === -1) return null;
-  return src.slice(bodyStart, end);
+/** The type annotation of `<name>.version`, as the printer spells it — or why it cannot be read.
+ *
+ *  ⚠️ **The interface and its member come from the parser (#1195).** This used to cut the body at the
+ *  first `'\n}'` after `interface <name> {` and match `/version\s*:\s*([^;]+);/` in it: a nested type
+ *  literal closing at column 0 ended the body early, and a NESTED `version:` (a member of some inner
+ *  literal) answered for the interface's own. */
+function versionType(file: string, name: string): string {
+  return versionTypeIn(readScannedSource(file).code, file, name);
+}
+
+/** `versionType` over source handed in directly — the one reader both the real files and the fixture use. */
+function versionTypeIn(code: string, file: string, name: string): string {
+  const sf = parseSource(code, file);
+  const decls = typesNamed(sf, name);
+  expect(decls.length, `expected one "interface ${name}" in ${file}`).toBe(1);
+  const members = typeMembers(decls[0]);
+  expect(members, `${name} in ${file} is no longer a plain interface or a type literal (an alias, or one that extends another)`).toBeDefined();
+  // Found by NAME before asserting on its type — a rename/removal of the field must go red by name,
+  // not pass vacuously because there is nothing to fail.
+  const version = members!.filter((m) => m.name === 'version' && m.kind === 'property');
+  expect(version.length, `no own "version" field on ${name}`).toBe(1);
+  expect(version[0]!.type, `${name}.version has no type annotation`).toBeDefined();
+  return printedText(version[0]!.type!);
 }
 
 describe('read-back document types declare version: number, never a pinned literal (#734, #784)', () => {
   for (const t of TARGETS) {
     it(`${t.interfaceName}.version in ${t.file} is "number"`, () => {
-      const abs = path.resolve(ENGINE, t.file);
-      const src = readFileSync(abs, 'utf8');
-      const body = interfaceBody(src, t.interfaceName);
-      expect(body, `could not find "interface ${t.interfaceName} { ... }" in ${t.file}`).toBeTruthy();
-
-      const fieldMatch = body!.match(/version\s*:\s*([^;]+);/);
-      // Assert the field is found by name before asserting on its type — a rename/removal of
-      // the field must go red by NAME, not pass vacuously because there is nothing to fail.
-      expect(fieldMatch, `no "version: <type>;" field found in interface ${t.interfaceName}`).toBeTruthy();
-
-      expect(
-        fieldMatch![1].trim(),
-        `${t.interfaceName}.version must be "number", found "${fieldMatch![1].trim()}"`,
-      ).toBe('number');
+      const found = versionType(path.resolve(ENGINE, t.file), t.interfaceName);
+      expect(found, `${t.interfaceName}.version must be "number", found "${found}"`).toBe('number');
     });
   }
+
+  it('reads the interface\'s OWN version: not a nested literal\'s, and not moved by a column-0 closer (#1195)', () => {
+    // The two shapes the text slice got wrong, on synthetic source through the guard's own reader.
+    const probe = (src: string) => versionTypeIn(src, 'probe.ts', 'Doc');
+    expect(probe('interface Doc {\n  meta: { version: number;\n};\n  version: 1;\n}')).toBe('1');
+    expect(probe('interface Doc {\n  version: number;\n  inner: { version: 2 };\n}')).toBe('number');
+  });
 });

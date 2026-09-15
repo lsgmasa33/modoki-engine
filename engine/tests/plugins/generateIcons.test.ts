@@ -31,6 +31,7 @@ import { ICON_COLORS, iconColorArgs, bundledIconPath, BUNDLED_ICON_REL } from '.
 import { DEFAULT_PROJECT_CONFIG } from '../../project-config';
 import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
+import { accessPath, callsTo, callsToPath, declarationOf, findNodes, functionsNamed, parseSource, printedText, stringValueOf, ts, unwrapValue } from '@modoki/engine/testing/sourceAst';
 
 /** The engine checkout these tests run in — what `generate-icons.mjs` passes as `engineRoot`. */
 const ENGINE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -446,22 +447,19 @@ describe('the CLI native build runs the generator (#1011 facet A)', () => {
   // ⚠️ COMMENTS STRIPPED, and this is the whole difference between a guard and a decoration. The
   // first version of this block read the raw text — so `// await generateNativeIcons();` left all
   // four assertions green, and commenting a line out is how anyone actually disables it. Worse, the
-  // `body` slice below opens with a 12-line docblock that NAMES `res.status !== 0`, so half these
-  // regexes were satisfiable by prose alone. `stripComments` is length- and line-preserving, which
+  // function opens with a 12-line docblock that NAMES `res.status !== 0`, so half the regexes were
+  // satisfiable by prose alone. `stripComments` is length- and line-preserving, which
   // `assertScanIsSane` then proves — a regex stripper silently eats source and every count taken
   // from it is meaningless.
   const raw = fs.readFileSync(BUILD_WEB, 'utf8');
   const src = stripComments(raw);
   assertScanIsSane(raw, src, 'build-web.mjs', ['generateNativeIcons', 'healNativeProject']);
 
-  /** The function body alone — so an assertion about what it passes cannot be satisfied by a
-   *  comment, or by some unrelated spawn elsewhere in a 600-line script. */
-  const body = (() => {
-    const start = src.indexOf('async function generateNativeIcons()');
-    expect(start).toBeGreaterThan(-1);
-    const end = src.indexOf('\nasync function ', start + 1);
-    return src.slice(start, end === -1 ? undefined : end);
-  })();
+  // ⚠️ The function comes from the PARSER (#1195), and so does every assertion about it. It used to be
+  // the text from `async function generateNativeIcons()` to the next `'\nasync function '` — a later
+  // plain `function` rode along — with regexes over that text: a flag in a log string counted as one
+  // passed, and `res.status !== 0` anywhere in it counted as the check that fails the build.
+  const fn = generateIconsFunction(src, 'build-web.mjs');
 
   it('calls it in the main flow, AFTER the heal that may create the platform directory', () => {
     // Ordering is load-bearing, not tidiness: `ensureCapacitorDeps` can create the very `ios/` or
@@ -473,33 +471,132 @@ describe('the CLI native build runs the generator (#1011 facet A)', () => {
   it('spawns generate-icons.mjs, passing ONLY the project and the platform', () => {
     // The point of the fix: the script resolves its own inputs from project.config.json now. If a
     // future author re-derives the editor's fourteen-flag command line here, that is a second copy
-    // of `iconStep` and the two will drift — which is the whole of #1011. So pin the absence.
-    expect(body).toMatch(/generate-icons\.mjs/);
-    expect(body).toMatch(/'--project'/);
-    expect(body).toMatch(/'--platform'/);
-    for (const flag of ['--icon', '--splash', '--title', '--badge', '--orientation', '--stamp']) {
-      expect(body).not.toContain(`'${flag}'`);
-    }
+    // of `iconStep` and the two will drift — which is the whole of #1011. So pin the flags exactly
+    // (`--strict` is #1028's, see the function).
+    expect(iconSpawns(fn)).toEqual([{ script: 'engine/scripts/generate-icons.mjs', flags: ['--project', '--platform', '--strict'] }]);
+    // …and no input flag appears ANYWHERE in the function: a second spawn, or a flag held in a variable and
+    // passed by name, re-derives the command line just as surely (#1195 close-out review).
+    expect(inputFlagsIn(fn)).toEqual([]);
   });
 
   it('FAILS the build on a non-zero exit rather than building on over stale art', () => {
-    expect(body).toMatch(/res\.status !== 0/);
-    expect(body).toMatch(/process\.exit\(1\)/);
+    expect(exitBranches(fn)).toContainEqual(expect.objectContaining({ test: 'res.status !== 0', exits: ['1'] }));
   });
 
   it('tells "the generator would not start" apart from "your icon source is bad"', () => {
     // `status` is null when the child never ran or died on a signal — no node on PATH, OOM, an
     // abort. Folding that into the non-zero branch sends the operator to inspect an icon file that
     // is perfectly fine, which is the most expensive kind of wrong error message.
-    expect(body).toMatch(/res\.error \|\| res\.status === null/);
-    expect(body).toMatch(/not a problem with the icon source/);
+    const branches = exitBranches(fn);
+    expect(branches.map((b) => b.test)).toEqual(['res.error || res.status === null', 'res.status !== 0']);
+    expect(branches[0]!.says).toMatch(/not a problem with the icon source/);
+    expect(branches[1]!.says).not.toMatch(/not a problem with the icon source/);
   });
 
   it('is skipped entirely for a non-native target, and for a project with no platform dir', () => {
-    expect(body).toMatch(/target !== 'native'/);
-    expect(body).toMatch(/if \(!platforms\.length\) return;/);
+    const exits = earlyReturns(fn);
+    expect(exits).toContainEqual(expect.arrayContaining(["target !== 'native'"]));
+    expect(exits).toContainEqual(['!platforms.length']);
+  });
+
+  it('reads the spawn, the exit branches and the early returns as units (#1195)', () => {
+    const probe = (body: string) => generateIconsFunction(`async function generateNativeIcons() {\n${body}\n}\nfunction later() { spawnSync(n, ['--icon']); if (res.status !== 0) process.exit(1); }`, 'probe.mjs');
+    const f = probe([
+      "if (target !== 'native' || !proj) return;",
+      "if (x) { console.log('skip'); return; }",
+      'if (!platforms.length) return;',
+      "if (z) return; else console.log('an if with an else is not an early exit');",
+      "const script = path.join(repoRoot, 'engine', 'scripts', 'generate-icons.mjs');",
+      "for (const p of platforms) { if (skip(p)) return; const res = spawnSync(process.execPath, [script, '--project', root, '--platform', p], {});",
+      "  console.log('never pass --icon here');",
+      "  if (res.error || res.status === null) { console.error(`could not RUN: ${res.error}. not a problem with the icon source`); process.exit(1); }",
+      '  if (res.status !== 0) {\n\n    process.exit(2);\n  }',
+      "  if (res.status === 3) console.log('only logs');",
+      '}',
+    ].join('\n'));
+    expect(iconSpawns(f)).toEqual([{ script: 'engine/scripts/generate-icons.mjs', flags: ['--project', '--platform'] }]);
+    expect(exitBranches(f)).toEqual([
+      { test: 'res.error || res.status === null', exits: ['1'], says: 'could not RUN: . not a problem with the icon source' },
+      { test: 'res.status !== 0', exits: ['2'], says: '' },
+    ]);
+    expect(earlyReturns(f)).toEqual([["target !== 'native'", '!proj'], ['x'], ['!platforms.length']]);
+    // A script named through a variable the reader cannot follow is not a pass. (The early exits above are the
+    // function's own top-level ones: not `if (z) … else`, and not `if (skip(p)) return;` inside the loop.)
+    expect(iconSpawns(probe("spawnSync(process.execPath, [pick(), '--project']);"))).toEqual([{ script: '<pick()>', flags: ['--project'] }]);
+    // A flag spread in, or written as a template, is still a flag.
+    expect(iconSpawns(probe("spawnSync(process.execPath, [s, `--title`, t, ...extra, p.q]);"))).toEqual([{ script: '<s>', flags: ['--title', '<...extra>', '<p.q>'] }]);
+    // A flag in a second call, held in a variable, or inside a command string is still in the function.
+    expect(inputFlagsIn(probe("const iconFlag = '--icon';\nexecFileSync(n, [s, '--splash', 'a.png', `--title=${t}`]);\nspawnSync(n, [s, iconFlag]);"))).toEqual(['--icon', '--splash', '--title']);
+    expect(inputFlagsIn(probe("log('regenerate icons with --strict');"))).toEqual([]);
+    expect(() => generateIconsFunction('function other() {}', 'probe.mjs')).toThrow(/one generateNativeIcons/);
   });
 });
+
+/** The one `generateNativeIcons` in `code`. */
+function generateIconsFunction(code: string, label: string): ts.FunctionLikeDeclaration & { body: ts.ConciseBody } {
+  const fns = functionsNamed(parseSource(code, label), 'generateNativeIcons');
+  expect(fns.length, `expected one generateNativeIcons in ${label}`).toBe(1);
+  return fns[0]!;
+}
+
+/** Each `spawnSync(…, [<script>, …args])` in `fn`: the script as the `path.join` string parts its variable is
+ *  declared with (`<…>` when it is anything else), and every `--flag` string in the argument array — plus, as
+ *  `<…>`, any element that is neither a plain name nor a string (a spread, a call), since a flag could hide there. */
+function iconSpawns(fn: ts.FunctionLikeDeclaration & { body: ts.ConciseBody }): Array<{ script: string; flags: string[] }> {
+  return callsTo(fn.body, 'spawnSync').map((call) => {
+    const list = call.arguments[1];
+    const elements = list && ts.isArrayLiteralExpression(list) ? [...list.elements] : [];
+    const first = elements[0];
+    const decl = first && ts.isIdentifier(first) ? declarationOf(first) : undefined;
+    const init = decl && ts.isVariableDeclaration(decl) && decl.initializer ? unwrapValue(decl.initializer) : undefined;
+    const script = init && ts.isCallExpression(init) && accessPath(init.expression) === 'path.join'
+      ? init.arguments.map(stringValueOf).filter((p): p is string => p !== undefined).join('/')
+      : `<${first ? printedText(first) : ''}>`;
+    const flags = elements.slice(1).flatMap((e) => {
+      const v = stringValueOf(e);
+      if (v !== undefined) return v.startsWith('--') ? [v] : [];
+      return ts.isIdentifier(e) ? [] : [`<${printedText(e)}>`];
+    });
+    return { script, flags };
+  });
+}
+
+/** The editor's per-input flags — the fourteen-flag command line #1011 retired — each time one appears as a
+ *  word of any string or template piece in `fn`'s body. */
+const INPUT_FLAGS = ['--icon', '--splash', '--title', '--badge', '--orientation', '--stamp'];
+function inputFlagsIn(fn: ts.FunctionLikeDeclaration & { body: ts.ConciseBody }): string[] {
+  return findNodes(fn.body, (x): x is ts.StringLiteral | ts.NoSubstitutionTemplateLiteral | ts.TemplateHead | ts.TemplateMiddle | ts.TemplateTail =>
+    ts.isStringLiteral(x) || ts.isNoSubstitutionTemplateLiteral(x) || ts.isTemplateHead(x) || ts.isTemplateMiddle(x) || ts.isTemplateTail(x))
+    .flatMap((p) => p.text.split(/[\s=]+/).filter((w) => INPUT_FLAGS.includes(w)));
+}
+
+/** Every `if` in `fn` whose branch calls `process.exit`: its test as printed, the exit codes, and the text
+ *  of the strings and template pieces the branch says. */
+function exitBranches(fn: ts.FunctionLikeDeclaration & { body: ts.ConciseBody }): Array<{ test: string; exits: string[]; says: string }> {
+  return findNodes(fn.body, ts.isIfStatement).flatMap((s) => {
+    const exits = callsToPath(s.thenStatement, 'process.exit');
+    if (exits.length === 0) return [];
+    const pieces = findNodes(s.thenStatement, (n): n is ts.StringLiteral | ts.NoSubstitutionTemplateLiteral | ts.TemplateHead | ts.TemplateMiddle | ts.TemplateTail =>
+      ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n) || ts.isTemplateHead(n) || ts.isTemplateMiddle(n) || ts.isTemplateTail(n));
+    return [{ test: printedText(s.expression), exits: exits.map((c) => (c.arguments[0] ? printedText(c.arguments[0]) : '')), says: pieces.map((p) => p.text).join('') }];
+  });
+}
+
+/** The early exits at the top of `fn`'s body — `if (…) return;`, or a block ending in `return` — each as the
+ *  disjuncts of its test, printed. */
+function earlyReturns(fn: ts.FunctionLikeDeclaration & { body: ts.ConciseBody }): string[][] {
+  if (!ts.isBlock(fn.body)) return [];
+  const disjuncts = (e: ts.Expression): ts.Expression[] => {
+    const u = unwrapValue(e);
+    return ts.isBinaryExpression(u) && u.operatorToken.kind === ts.SyntaxKind.BarBarToken ? [...disjuncts(u.left), ...disjuncts(u.right)] : [u];
+  };
+  return fn.body.statements.filter((s): s is ts.IfStatement => {
+    if (!ts.isIfStatement(s) || s.elseStatement) return false;
+    const t = s.thenStatement;
+    const last = ts.isBlock(t) ? t.statements[t.statements.length - 1] : t;
+    return !!last && ts.isReturnStatement(last);
+  }).map((s) => disjuncts(s.expression).map(printedText));
+}
 
 /** #1011 at the SEAM — the script really reading `project.config.json`, driven end to end.
  *

@@ -22,13 +22,16 @@
  *  project, which is why the behaviour lives in the unit suite instead. */
 
 import { describe, it, expect } from 'vitest';
-import { expectInOrder, found } from '@modoki/engine/testing/inOrder';
+import { expectInOrder } from '@modoki/engine/testing/inOrder';
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readScannedSource } from '@modoki/engine/testing';
-import { importBindings, parseSource } from '@modoki/engine/testing/sourceAst';
+import {
+  accessPath, boundIdentifier, calledNames, calleeName, callsTo, callsToPath, findNodes, functionBodyOf, functionsNamed, importBindings,
+  parseSource, printedText, propertyValue, readsOf, stringValueOf, ts, unwrapValue, variablesNamed,
+} from '@modoki/engine/testing/sourceAst';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
@@ -39,89 +42,171 @@ const assetScanner = path.join(repoRoot, 'engine', 'plugins', 'vite-asset-scanne
 
 /** The steps of the sequence. An entry point calling any of these itself is composing the sequence
  *  by hand again. */
-const HEAL_STEPS = /\b(healNativeConfig|ensureCapacitorDeps|vendorEnginePlugins|writeVendorMarker|verifyInstalledMatchesTarball(?:Result)?)\(/;
+const HEAL_STEPS = ['healNativeConfig', 'ensureCapacitorDeps', 'vendorEnginePlugins', 'writeVendorMarker',
+  'verifyInstalledMatchesTarball', 'verifyInstalledMatchesTarballResult'];
 
-/** Index of the `}` that closes the brace opened at `openBraceIdx` (which must itself be `{`). */
-function matchingBraceEnd(text: string, openBraceIdx: number): number {
-  let depth = 0;
-  for (let i = openBraceIdx; i < text.length; i++) {
-    if (text[i] === '{') depth++;
-    else if (text[i] === '}') { depth--; if (depth === 0) return i; }
-  }
-  throw new Error('no matching close brace found');
+// ⚠️ **Every unit below is read through the parser (#1195).** These checks used to cut their subjects
+// as text — a function body to its matching `}` by counting braces (so a `{` in a string moved the end),
+// an `if (…)` branch the same way, "the error path" as the 400 characters after a call, the install
+// port as the text up to the next `'});'`, and a plan's step as the text up to the next `'},'` — then ran
+// regexes over the slice, which a reformatted line or a blank line in between also broke.
+
+const buildWebSf = () => parseSource(readScannedSource(buildWeb).code, 'build-web.mjs');
+const scannerSf = () => parseSource(readScannedSource(assetScanner).code, 'vite-asset-scanner.ts');
+
+/** The one function named `name` in `sf` — a rename or a second copy fails by name. */
+function oneFunction(sf: ts.SourceFile, name: string): ts.FunctionLikeDeclaration & { body: ts.ConciseBody } {
+  const fns = functionsNamed(sf, name);
+  expect(fns.length, `expected one function named ${name} in ${sf.fileName} — re-anchor, do not delete`).toBe(1);
+  return fns[0]!;
+}
+
+/** `e` is `<path> === '<value>'` / `!==`, either way round. */
+function isComparison(e: ts.Expression, op: ts.SyntaxKind, path: string, value: string): boolean {
+  const u = unwrapValue(e);
+  if (!ts.isBinaryExpression(u) || u.operatorToken.kind !== op) return false;
+  return (accessPath(u.left) === path && stringValueOf(u.right) === value)
+    || (accessPath(u.right) === path && stringValueOf(u.left) === value);
+}
+
+/** Each `loadEnginePluginModuleResult(<root>, path.join(…))` in `root`, as `<root>::<joined parts>`. */
+function loaderEntries(root: ts.Node): string[] {
+  return callsTo(root, 'loadEnginePluginModuleResult').map((c) => {
+    const [base, entry] = c.arguments;
+    const parts = entry && ts.isCallExpression(entry) && accessPath(entry.expression) === 'path.join'
+      ? entry.arguments.map((a) => stringValueOf(a) ?? `<${printedText(a)}>`) : [`<${entry ? printedText(entry) : ''}>`];
+    return `${base ? printedText(base) : ''}::${parts.join('/')}`;
+  });
+}
+
+/** What the `if (!<binding>)` branch of `fn` — the degrade path when a module did not load — does. */
+function degradeBranch(fn: ts.FunctionLikeDeclaration & { body: ts.ConciseBody }, binding: string): {
+  namesNoEsbuild: boolean; warns: number; endsInReturn: boolean; exits: number;
+} {
+  const ifs = findNodes(fn.body, ts.isIfStatement).filter((s) => {
+    const t = unwrapValue(s.expression);
+    return ts.isPrefixUnaryExpression(t) && t.operator === ts.SyntaxKind.ExclamationToken && accessPath(t.operand) === binding;
+  });
+  expect(ifs.length, `expected one \`if (!${binding})\` in ${fn.name?.getText() ?? 'the function'}`).toBe(1);
+  const then = ifs[0]!.thenStatement;
+  const last = ts.isBlock(then) ? then.statements[then.statements.length - 1] : then;
+  return {
+    namesNoEsbuild: findNodes(then, (n): n is ts.Expression => ts.isExpression(n)
+      && isComparison(n, ts.SyntaxKind.EqualsEqualsEqualsToken, 'reason', 'no-esbuild')).length > 0,
+    warns: callsToPath(then, 'console.warn').length,
+    endsInReturn: !!last && ts.isReturnStatement(last),
+    exits: callsToPath(then, 'process.exit').length,
+  };
+}
+
+/** The `<subject>.reason` values `root` THROWS on — `if (result.reason === 'k') throw …`, the throw as the
+ *  whole branch or the last statement of its block. */
+function throwingReasons(root: ts.Node, subject: string): string[] {
+  return findNodes(root, ts.isIfStatement).flatMap((s) => {
+    const t = unwrapValue(s.expression);
+    if (!ts.isBinaryExpression(t) || t.operatorToken.kind !== ts.SyntaxKind.EqualsEqualsEqualsToken
+      || accessPath(t.left) !== `${subject}.reason`) return [];
+    const then = s.thenStatement;
+    const last = ts.isBlock(then) ? then.statements[then.statements.length - 1] : then;
+    const reason = stringValueOf(t.right);
+    return last && ts.isThrowStatement(last) && reason !== undefined ? [reason] : [];
+  });
+}
+
+/** Whether every call to `callee` in `fn` runs only after an early `return` has ruled out `target !== 'native'`. */
+function gatedOnNative(fn: ts.FunctionLikeDeclaration & { body: ts.ConciseBody }, callee: ts.CallExpression): boolean {
+  const body = fn.body;
+  if (!ts.isBlock(body)) return false;
+  // An early exit at the top of the function body, BEFORE the statement holding the call.
+  const stmt = body.statements.find((s) => s.pos <= callee.pos && callee.end <= s.end);
+  const earlier = stmt ? body.statements.slice(0, body.statements.indexOf(stmt)) : [];
+  return earlier.some((s) => ts.isIfStatement(s) && !s.elseStatement && ts.isReturnStatement(s.thenStatement)
+    && disjuncts(s.expression).some((d) => isComparison(d, ts.SyntaxKind.ExclamationEqualsEqualsToken, 'target', 'native')));
+}
+
+/** `a || b || c` → `[a, b, c]` (parentheses peeled); anything else → `[e]`. */
+function disjuncts(e: ts.Expression): ts.Expression[] {
+  const u = unwrapValue(e);
+  return ts.isBinaryExpression(u) && u.operatorToken.kind === ts.SyntaxKind.BarBarToken ? [...disjuncts(u.left), ...disjuncts(u.right)] : [u];
+}
+
+/** The calls to a heal step anywhere in `sf`, by name — called directly or as a member. */
+function healStepCalls(sf: ts.SourceFile): string[] {
+  return calledNames(sf).filter((n) => HEAL_STEPS.includes(n));
 }
 
 describe('build-web.mjs heals through the ONE shared sequence (#148, #150, #685, #827)', () => {
-  const src = readScannedSource(buildWeb).code;
-  const fnStart = src.indexOf('async function healNativeProject()');
-  const fnEnd = fnStart === -1 ? -1 : matchingBraceEnd(src, src.indexOf('{', fnStart));
-  const fnBody = src.slice(fnStart, fnEnd);
+  const heal = () => oneFunction(buildWebSf(), 'healNativeProject');
 
-  it('has its heal function (the anchor every assertion below slices from)', () => {
-    expect(fnStart, 'build-web.mjs no longer has `async function healNativeProject()` — re-anchor, do not delete').toBeGreaterThan(-1);
+  it('has its heal function (the anchor every assertion below reads)', () => {
+    expect(heal().parameters.length).toBe(0);
   });
 
   it('loads healNativeProject.ts through the reason-reporting loader, and calls it', () => {
-    expect(fnBody).toMatch(/loadEnginePluginModuleResult\(repoRoot, path\.join\('plugins', 'healNativeProject\.ts'\)\)/);
-    expect(fnBody).toMatch(/\.healNativeProject\(projectRoot, repoRoot, platforms,/);
+    expect(loaderEntries(heal().body)).toEqual(['repoRoot::plugins/healNativeProject.ts']);
+    const calls = callsToPath(heal().body, 'healMod.healNativeProject');
+    expect(calls.map((c) => c.arguments.slice(0, 3).map(printedText))).toEqual([['projectRoot', 'repoRoot', 'platforms']]);
   });
 
   it('derives platforms through nativeHealPlatforms, so the editor\'s per-platform step is honoured (#1062)', () => {
-    expect(fnBody).toMatch(/const platforms = nativeHealPlatforms\(process\.env,/);
+    const decls = variablesNamed(heal().body, 'platforms');
+    expect(decls.length).toBe(1);
+    const init = decls[0]!.initializer && unwrapValue(decls[0]!.initializer);
+    expect(init && ts.isCallExpression(init) && accessPath(init.expression) === 'nativeHealPlatforms'
+      && accessPath(init.arguments[0]!) === 'process.env').toBe(true);
   });
 
   it('calls no step of the sequence directly — anywhere in the script', () => {
-    expect(src).not.toMatch(HEAL_STEPS);
+    expect(healStepCalls(buildWebSf())).toEqual([]);
   });
 
   it('gates the heal on the NATIVE target', () => {
-    expect(fnBody).toMatch(/target\s*!==\s*'native'/);
+    const [call] = callsToPath(heal().body, 'healMod.healNativeProject');
+    expect(call && gatedOnNative(heal(), call)).toBe(true);
   });
 
   it('heals BEFORE the typecheck, which resolves plugin types out of the project node_modules', () => {
-    expectInOrder(src, ['await healNativeProject()', 'tsconfig.app.scoped.json`'], 'the native build');
+    expectInOrder(readScannedSource(buildWeb).code, ['await healNativeProject()', 'tsconfig.app.scoped.json`'], 'the native build');
   });
 
   it('FAILS the build (throws) on a stale node_modules, a failed install and a Firebase auth manifest refusal (#1062) — never merely logs', () => {
-    expect(fnBody).toMatch(/'stale-node-modules'\)\s*throw new Error/);
-    expect(fnBody).toMatch(/'install-failed'\)\s*throw new Error/);
-    expect(fnBody).toMatch(/'facebook-sdk-manifest'\)\s*throw new Error/);
+    expect(throwingReasons(heal().body, 'result')).toEqual(['stale-node-modules', 'facebook-sdk-manifest', 'install-failed']);
   });
 
   it('warns with the reason and RETURNS — never process.exit — when the module cannot load (#714, #731)', () => {
-    const ifIdx = fnBody.indexOf('if (!healMod)');
-    expect(ifIdx).toBeGreaterThan(-1);
-    const branch = fnBody.slice(ifIdx, matchingBraceEnd(fnBody, fnBody.indexOf('{', ifIdx)));
-    expect(branch).toMatch(/reason === 'no-esbuild'/);
-    expect(branch).toMatch(/console\.warn/);
-    expect(branch).toMatch(/return;/);
-    expect(branch).not.toMatch(/process\.exit/);
+    expect(degradeBranch(heal(), 'healMod')).toEqual({ namesNoEsbuild: true, warns: 1, endsInReturn: true, exits: 0 });
   });
 });
 
 describe('the editor /api/build heals through the same sequence (#685 parity, #827)', () => {
-  const src = readScannedSource(assetScanner).code;
+  /** The ONE call to the imported `healNativeProject`. */
+  const healCall = (sf = scannerSf()) => {
+    const calls = callsTo(sf, 'healNativeProject').filter((c) => ts.isIdentifier(c.expression));
+    expect(calls.length, 'expected one healNativeProject(…) call in vite-asset-scanner.ts').toBe(1);
+    return calls[0]!;
+  };
 
   it('imports healNativeProject from the shared module and calls it for the build platform', () => {
-    expect(importBindings(parseSource(src, 'vite-asset-scanner.ts'), './healNativeProject').filter((b) => !b.typeOnly).map((b) => b.imported)).toContain('healNativeProject');
-    expect(src).toMatch(/await healNativeProject\(projectRoot, buildCwd, \[platform\],/);
+    const sf = scannerSf();
+    expect(importBindings(sf, './healNativeProject').filter((b) => !b.typeOnly).map((b) => b.imported)).toContain('healNativeProject');
+    const call = healCall(sf);
+    expect(call.arguments.slice(0, 3).map(printedText)).toEqual(['projectRoot', 'buildCwd', '[platform]']);
+    expect(ts.isAwaitExpression(call.parent)).toBe(true);
   });
 
   it('calls no step of the sequence directly', () => {
-    expect(src).not.toMatch(HEAL_STEPS);
+    expect(healStepCalls(scannerSf())).toEqual([]);
   });
 
   it('names the platform on BOTH scaffold runners too — the auto-scaffold shift()s the plan\'s own step away (#1062)', () => {
-    const runners = src.match(/env: \{ \.\.\.buildEnv, MODOKI_ICONS_HANDLED: '1', MODOKI_NATIVE_PLATFORM: platform \?\? '' \}/g) ?? [];
-    expect(runners.length, '/api/add-native-target runShell and the /api/build runScaffoldShell').toBe(2);
+    expect(scaffoldRunnerEnvs(scannerSf()), '/api/add-native-target runShell and the /api/build runScaffoldShell')
+      .toEqual([{ namesPlatform: true }, { namesPlatform: true }]);
   });
 
   it('names the platform on each per-platform build-web step — or an Android build heals iOS too (#1062)', () => {
+    const sf = scannerSf();
     for (const [plan, platform] of [['iosPrefixSteps', 'ios'], ['androidPrefixSteps', 'android']] as const) {
-      const at = src.indexOf(`const ${plan}: BuildStep[] = [`);
-      expect(at, `${plan} is gone — re-anchor`).toBeGreaterThan(-1);
-      const step = src.slice(at, src.indexOf('},', src.indexOf("build-web.mjs --target native'", at)));
-      expect(step).toContain(`MODOKI_NATIVE_PLATFORM: '${platform}'`);
+      expect(planBuildWebPlatforms(sf, plan), `${plan}'s build-web step`).toEqual([platform]);
     }
   });
 
@@ -129,28 +214,97 @@ describe('the editor /api/build heals through the same sequence (#685 parity, #8
     // `healNativeConfig` adds `keystore.properties` to a freshly scaffolded `android/.gitignore`;
     // writing the upload key's passwords first leaves them unignored for as long as the heal takes,
     // or for good if it refuses.
-    const heal = found(src.indexOf('await healNativeProject('), 'await healNativeProject(');
-    for (const write of ['renderKeystoreProperties(', 'renderExportOptionsPlist(']) {
-      const at = found(src.indexOf(write), `${write} (gone? re-anchor)`);
-      expect(heal, `the heal runs after ${write}`).toBeLessThan(at);
-    }
+    expect(releaseWritesAroundHeal(scannerSf(), healCall())).toEqual({
+      renderKeystoreProperties: { before: 0, after: 1 },
+      renderExportOptionsPlist: { before: 0, after: 1 },
+    });
   });
 
   it('installs through the abort-aware scaffold shell, not a blocking exec', () => {
-    const call = src.indexOf('await healNativeProject(');
-    const portsEnd = src.indexOf('});', call);
-    expect(src.slice(call, portsEnd)).toMatch(/install:\s*\(why\)\s*=>\s*runScaffoldShell\(/);
+    // The port RETURNS the shell's own promise: the heal awaits it for `install-failed`, so a port that starts
+    // the install and returns `true` builds on while npm is still running (#1195 close-out review).
+    expect(portReturns(healCall().arguments[3], 'install')).toEqual(['runScaffoldShell']);
+    const install = functionBodyOf(propertyValue(healCall().arguments[3], 'install'));
+    expect(calledNames(install!).filter((n) => ['execSync', 'execFileSync', 'spawnSync'].includes(n))).toEqual([]);
   });
 
   it('ENDS the build on every refusal — the block cannot fall through to the build steps', () => {
-    const ifIdx = src.indexOf('if (!heal.ok)');
-    expect(ifIdx).toBeGreaterThan(-1);
-    const block = src.slice(ifIdx, matchingBraceEnd(src, src.indexOf('{', ifIdx)));
-    expect(block).toMatch(/sendStatus\(`FAILED:stale node_modules`|sendStatus\('FAILED:stale node_modules'\)/);
-    expect(block).toMatch(/res\.end\(\);\s*return;\s*$/);
-    expect(block).not.toMatch(/runScaffoldShell\(|spawnBuildCommand\(|execSync\(/);
+    expect(refusalBlock(scannerSf())).toEqual({
+      // Every refusal reports; a template status is named by its fixed head.
+      statuses: ['FAILED:npm install (', 'FAILED:stale node_modules', 'FAILED:Firebase auth plugin manifest (Facebook SDK)', 'FAILED:Build claim not held\n'],
+      endsWith: ['res.end()', 'return'],
+      buildCalls: [],
+    });
   });
 });
+
+/** For each #370 release-file writer, how many of its calls in `sf` sit before and after `heal`. */
+function releaseWritesAroundHeal(sf: ts.SourceFile, heal: ts.CallExpression): Record<string, { before: number; after: number }> {
+  return Object.fromEntries(['renderKeystoreProperties', 'renderExportOptionsPlist'].map((w) => {
+    const calls = callsTo(sf, w);
+    return [w, { before: calls.filter((c) => c.pos < heal.pos).length, after: calls.filter((c) => c.pos > heal.pos).length }];
+  }));
+}
+
+/** What the inline function at `key` of object literal `obj` hands back: the callee of a concise arrow's call, or
+ *  of each `return <call>` of its own (not a nested function's), awaited or not — `<text>` for anything else. */
+function portReturns(obj: ts.Expression | undefined, key: string): string[] {
+  const fn = propertyValue(obj, key);
+  const f = fn && ts.isExpression(fn) ? unwrapValue(fn) : fn;
+  expect(f && (ts.isArrowFunction(f) || ts.isFunctionExpression(f) || ts.isMethodDeclaration(f)), `no inline \`${key}\` port`).toBe(true);
+  const port = f as ts.ArrowFunction | ts.FunctionExpression | ts.MethodDeclaration;
+  const named = (e: ts.Expression) => { const u = unwrapValue(e); return ts.isCallExpression(u) ? calleeName(u) ?? `<${printedText(u)}>` : `<${printedText(u)}>`; };
+  if (port.body && !ts.isBlock(port.body)) return [named(port.body)];
+  return findNodes(port.body!, ts.isReturnStatement)
+    .filter((r) => { let cur: ts.Node = r.parent; while (!ts.isFunctionLike(cur)) cur = cur.parent; return cur === port; })
+    .map((r) => (r.expression ? named(r.expression) : '<undefined>'));
+}
+
+/** Every object literal in `sf` that spreads `buildEnv` and sets `MODOKI_ICONS_HANDLED: '1'` — a scaffold
+ *  runner's env — and whether it also passes `MODOKI_NATIVE_PLATFORM: platform ?? …`. */
+function scaffoldRunnerEnvs(sf: ts.SourceFile): Array<{ namesPlatform: boolean }> {
+  return findNodes(sf, ts.isObjectLiteralExpression)
+    .filter((o) => o.properties.some((p) => ts.isSpreadAssignment(p) && accessPath(p.expression) === 'buildEnv')
+      && stringValueOf(propertyValue(o, 'MODOKI_ICONS_HANDLED') as ts.Expression | undefined) === '1')
+    .map((o) => {
+      const v = propertyValue(o, 'MODOKI_NATIVE_PLATFORM');
+      const u = v && ts.isExpression(v) ? unwrapValue(v) : undefined;
+      return { namesPlatform: !!u && ts.isBinaryExpression(u) && u.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken && accessPath(u.left) === 'platform' };
+    });
+}
+
+/** The `MODOKI_NATIVE_PLATFORM` each `node engine/scripts/build-web.mjs --target native` step of `const <plan>` sets. */
+function planBuildWebPlatforms(sf: ts.SourceFile, plan: string): Array<string | undefined> {
+  const decls = variablesNamed(sf, plan);
+  expect(decls.length, `${plan} is gone — re-anchor`).toBe(1);
+  const list = decls[0]!.initializer && unwrapValue(decls[0]!.initializer);
+  expect(list && ts.isArrayLiteralExpression(list), `${plan} is no longer an array literal`).toBe(true);
+  return (list as ts.ArrayLiteralExpression).elements.filter(ts.isObjectLiteralExpression)
+    .filter((step) => stringValueOf(propertyValue(step, 'cmd') as ts.Expression | undefined) === 'node engine/scripts/build-web.mjs --target native')
+    .map((step) => {
+      const env = propertyValue(step, 'env');
+      return stringValueOf(propertyValue(env && ts.isExpression(env) ? env : undefined, 'MODOKI_NATIVE_PLATFORM') as ts.Expression | undefined);
+    });
+}
+
+/** The `if (!heal.ok)` block of the editor build: the statuses it reports, how it ends, and any build step it calls. */
+function refusalBlock(sf: ts.SourceFile): { statuses: string[]; endsWith: string[]; buildCalls: string[] } {
+  const ifs = findNodes(sf, ts.isIfStatement).filter((s) => {
+    const t = unwrapValue(s.expression);
+    return ts.isPrefixUnaryExpression(t) && t.operator === ts.SyntaxKind.ExclamationToken && accessPath(t.operand) === 'heal.ok';
+  });
+  expect(ifs.length, 'expected one `if (!heal.ok)` in vite-asset-scanner.ts').toBe(1);
+  const then = ifs[0]!.thenStatement;
+  const stmts = ts.isBlock(then) ? then.statements : [then];
+  return {
+    statuses: callsTo(then, 'sendStatus').map((c) => {
+      const a = c.arguments[0];
+      return a && ts.isTemplateExpression(a) ? a.head.text : stringValueOf(a) ?? '';
+    }),
+    endsWith: stmts.slice(-2).map((s) => ts.isExpressionStatement(s) ? printedText(s.expression) : ts.isReturnStatement(s) && !s.expression ? 'return' : printedText(s)),
+    buildCalls: calledNames(then).filter((n) => ['runScaffoldShell', 'spawnBuildCommand', 'execSync'].includes(n)),
+  };
+}
 
 describe('describeUnreadablePackageJsonWarning (the shared #685/#731 producer)', () => {
   it('names the project root, the #685 check, and why it matters — asserted DIRECTLY, not via a caller', async () => {
@@ -167,8 +321,6 @@ describe('describeUnreadablePackageJsonWarning (the shared #685/#731 producer)',
 });
 
 describe('build-web.mjs validates project config before it builds anything (#589 sibling)', () => {
-  const src = readScannedSource(buildWeb).code;
-
   // `/api/build` runs projectBuildConfigErrors (#827) for EVERY target
   // (web/playable/ios/android alike) before its platform branch — vite-asset-scanner.ts's
   // `/api/build` handler. add-native-targets.mjs (#589) added the identical pair before its
@@ -181,35 +333,49 @@ describe('build-web.mjs validates project config before it builds anything (#589
   // `cliNativeTargetValidates.test.ts`'s first describe block (#589); not duplicated here.
 
   it('reaches the shared projectBuildConfigErrors, and neither half of it directly (#827)', () => {
-    expect(src).toMatch(/projectBuildConfigErrors\(/);
-    expect(src).not.toMatch(/projectConfigUnionErrors\(|validateBuildConfig\(/);
+    const called = calledNames(buildWebSf());
+    expect(called).toContain('projectBuildConfigErrors');
+    expect(called.filter((n) => n === 'projectConfigUnionErrors' || n === 'validateBuildConfig')).toEqual([]);
   });
 
   it('runs the check BEFORE the heal', () => {
     // Loose about HOW, strict about the ordering fact that matters — validation must land before
     // ANY native file gets healed from a config nothing has checked yet. Compared at the CALL sites
     // in the main flow: the two function DEFINITIONS' order in the file says nothing about which runs.
-    expectInOrder(src, ['await validateProjectConfig();', 'await healNativeProject();'], 'the native build');
+    expectInOrder(readScannedSource(buildWeb).code, ['await validateProjectConfig();', 'await healNativeProject();'], 'the native build');
   });
 
   it('exits non-zero on the error path, without a --force-style bypass', () => {
-    const validateCall = src.indexOf('projectBuildConfigErrors(');
-    const nextChunk = src.slice(validateCall, validateCall + 400);
-    expect(nextChunk).toMatch(/cfgErrors\.length/);
-    expect(nextChunk).toMatch(/process\.exit\(1\)/);
     // The issue explicitly leaves a bypass as an owner call — this check must not grow one.
-    expect(nextChunk).not.toMatch(/--force/);
+    expect(configErrorPath(oneFunction(buildWebSf(), 'validateProjectConfig'))).toEqual({ exitsWith: ['1'], forceFlags: [] });
   });
 });
 
-describe('both editor routes validate through the shared projectBuildConfigErrors (#589, #827)', () => {
-  const src = readScannedSource(assetScanner).code;
+/** What `fn` does with `projectBuildConfigErrors(…)`'s result: the exit codes of each `if` that tests the
+ *  bound errors' `.length`, and any string in `fn` naming a `--force` flag. */
+function configErrorPath(fn: ts.FunctionLikeDeclaration & { body: ts.ConciseBody }): { exitsWith: string[]; forceFlags: string[] } {
+  const calls = callsTo(fn.body, 'projectBuildConfigErrors');
+  expect(calls.length, 'expected one projectBuildConfigErrors(…) call').toBe(1);
+  const bound = boundIdentifier(calls[0]!);
+  expect(bound, 'the projectBuildConfigErrors(…) result is not bound to a name').toBeDefined();
+  const lengthTests = readsOf(bound!).filter((r) => {
+    const p = r.parent;
+    const test = ts.isPropertyAccessExpression(p) && p.name.text === 'length' ? ts.findAncestor(p, ts.isIfStatement) : undefined;
+    return !!test && test.expression.pos <= r.pos && r.end <= test.expression.end;
+  }).map((r) => ts.findAncestor(r, ts.isIfStatement)!);
+  return {
+    exitsWith: lengthTests.flatMap((s) => callsToPath(s.thenStatement, 'process.exit').map((c) => (c.arguments[0] ? printedText(c.arguments[0]) : ''))),
+    forceFlags: findNodes(fn.body, ts.isStringLiteralLike).map((s) => s.text).filter((t) => t.includes('--force')),
+  };
+}
 
+describe('both editor routes validate through the shared projectBuildConfigErrors (#589, #827)', () => {
   it('/api/build and /api/add-native-target each call it, and neither calls a half of it', () => {
     // Two calls: one per route. Fewer means a route stopped validating; a half called directly is
     // the hand-assembled expression #827 removed, which the next check added to the function misses.
-    expect(src.match(/projectBuildConfigErrors\(projectRoot\)/g) ?? []).toHaveLength(2);
-    expect(src).not.toMatch(/projectConfigUnionErrors\(|validateBuildConfig\(/);
+    const sf = scannerSf();
+    expect(callsTo(sf, 'projectBuildConfigErrors').map((c) => c.arguments.map(printedText))).toEqual([['projectRoot'], ['projectRoot']]);
+    expect(calledNames(sf).filter((n) => n === 'projectConfigUnionErrors' || n === 'validateBuildConfig')).toEqual([]);
   });
 });
 
@@ -221,35 +387,108 @@ describe('both editor routes validate through the shared projectBuildConfigError
 // here is that build-web.mjs's OWN degrade branch now consumes that reason instead of discarding
 // it silently.
 describe('build-web.mjs warns (never silently) when the project-config gate cannot load (#731)', () => {
-  const src = readScannedSource(buildWeb).code;
-
-  function matchingBraceEnd(text: string, openBraceIdx: number): number {
-    let depth = 0;
-    for (let i = openBraceIdx; i < text.length; i++) {
-      if (text[i] === '{') depth++;
-      else if (text[i] === '}') { depth--; if (depth === 0) return i; }
-    }
-    throw new Error('no matching close brace found');
-  }
-
-  const fnStart = src.indexOf('async function validateProjectConfig()');
-  const fnEnd = matchingBraceEnd(src, src.indexOf('{', fnStart));
+  const validate = () => oneFunction(buildWebSf(), 'validateProjectConfig');
 
   it('uses loadEnginePluginModuleResult for the load, not the plain null-returning wrapper', () => {
-    expect(fnStart).toBeGreaterThan(-1);
-    const fnBody = src.slice(fnStart, fnEnd);
-    expect(fnBody).toMatch(/loadEnginePluginModuleResult\(repoRoot, path\.join\('plugins', 'load-project-config\.ts'\)\)/);
+    expect(loaderEntries(validate().body)).toEqual(['repoRoot::plugins/load-project-config.ts']);
+    expect(calledNames(validate().body)).not.toContain('loadEnginePluginModule');
   });
 
   it('warns with the reason and RETURNS — never process.exit — when the module cannot load', () => {
-    const ifIdx = found(src.indexOf('if (!cfgMod)', fnStart), 'if (!cfgMod) after validateProjectConfig opens');
-    expect(ifIdx).toBeLessThan(fnEnd);
-    const ifOpenBrace = src.indexOf('{', ifIdx);
-    const ifCloseBrace = matchingBraceEnd(src, ifOpenBrace);
-    const branch = src.slice(ifIdx, ifCloseBrace);
-    expect(branch).toMatch(/reason === 'no-esbuild'/);
-    expect(branch).toMatch(/console\.warn/);
-    expect(branch).not.toMatch(/process\.exit/);
+    expect(degradeBranch(validate(), 'cfgMod')).toEqual({ namesNoEsbuild: true, warns: 1, endsInReturn: true, exits: 0 });
+  });
+});
+
+describe('the build-web.mjs / /api/build readers see the unit, not a slice of text (#1195)', () => {
+  const probe = (src: string, label = 'probe.mjs') => parseSource(src, label);
+
+  it('reads a function and its degrade branch whole, however its braces and blank lines fall', () => {
+    // A `{` inside a string used to move the brace-counted end; a blank line broke `\)\s*throw`.
+    const sf = probe([
+      'async function healNativeProject() {',
+      "  if (target !== 'native' || !proj) return;",
+      "  const { module: healMod, reason } = await loadEnginePluginModuleResult(repoRoot, path.join('plugins', 'healNativeProject.ts'));",
+      "  if (!healMod) { const why = reason === 'no-esbuild' ? '{' : 'x'; console.warn(why); return; }",
+      '  const platforms = nativeHealPlatforms(process.env, has);',
+      '  const result = await healMod.healNativeProject(projectRoot, repoRoot, platforms, {});',
+      "  if (result.reason === 'stale-node-modules')\n\n    throw new Error('x');",
+      "  if (result.reason === 'install-failed') { log(); throw new Error('y'); }",
+      "  if (result.reason === 'facebook-sdk-manifest') console.error('only logs');",
+      '}',
+    ].join('\n'));
+    const fn = oneFunction(sf, 'healNativeProject');
+    expect(loaderEntries(fn.body)).toEqual(['repoRoot::plugins/healNativeProject.ts']);
+    expect(degradeBranch(fn, 'healMod')).toEqual({ namesNoEsbuild: true, warns: 1, endsInReturn: true, exits: 0 });
+    expect(throwingReasons(fn.body, 'result')).toEqual(['stale-node-modules', 'install-failed']);
+    expect(gatedOnNative(fn, callsToPath(fn.body, 'healMod.healNativeProject')[0]!)).toBe(true);
+  });
+
+  it('refuses a degrade branch that exits, logs nothing, or does not end the function', () => {
+    const branch = (then: string) => degradeBranch(oneFunction(probe(`async function f() { const { module: m } = load(); if (!m) ${then} go(); }`), 'f'), 'm');
+    expect(branch("{ console.warn('x'); process.exit(1); }")).toEqual({ namesNoEsbuild: false, warns: 1, endsInReturn: false, exits: 1 });
+    expect(branch('{ return; console.warn(1); }')).toEqual({ namesNoEsbuild: false, warns: 1, endsInReturn: false, exits: 0 });
+    expect(branch('return;')).toEqual({ namesNoEsbuild: false, warns: 0, endsInReturn: true, exits: 0 });
+    expect(() => degradeBranch(oneFunction(probe('function f() { if (!other) return; }'), 'f'), 'm')).toThrow(/one `if \(!m\)`/);
+  });
+
+  it('gates only on an EARLY exit that rules out a non-native target', () => {
+    const gated = (body: string) => {
+      const fn = oneFunction(probe(`function f() {\n${body}\n}`), 'f');
+      return gatedOnNative(fn, callsTo(fn.body, 'heal')[0]!);
+    };
+    expect(gated("if (!proj || target !== 'native') return;\nheal();")).toBe(true);
+    expect(gated("heal();\nif (target !== 'native') return;")).toBe(false);
+    expect(gated("if (target === 'native') log();\nheal();")).toBe(false);
+    expect(gated("if (target !== 'web') return;\nheal();")).toBe(false);
+    expect(gated("if (target !== 'native') log();\nheal();")).toBe(false);
+    expect(gated("if ('native' !== target) return;\nheal();")).toBe(true);
+  });
+
+  it('reads the error path by what the bound result reaches, and a --force anywhere in the function', () => {
+    const path_ = (body: string) => configErrorPath(oneFunction(probe(`async function v() {\n${body}\n}`), 'v'));
+    expect(path_("const errs = cfg.projectBuildConfigErrors(root);\nconsole.log('a long line'.repeat(40));\n\nif (errs.length) {\n  console.error(errs);\n  process.exit(1);\n}"))
+      .toEqual({ exitsWith: ['1'], forceFlags: [] });
+    expect(path_("const errs = cfg.projectBuildConfigErrors(root);\nif (errs.length && !process.argv.includes('--force')) process.exit(2);"))
+      .toEqual({ exitsWith: ['2'], forceFlags: ['--force'] });
+    expect(path_('const errs = cfg.projectBuildConfigErrors(root);\nif (other.length) process.exit(1);')).toEqual({ exitsWith: [], forceFlags: [] });
+    expect(path_('const errs = cfg.projectBuildConfigErrors(root);\nif (errs) process.exit(3);')).toEqual({ exitsWith: [], forceFlags: [] });
+    expect(() => path_('cfg.projectBuildConfigErrors(root);')).toThrow(/not bound/);
+  });
+
+  it('reads the editor build\'s refusal block, plan steps and runner envs as units', () => {
+    const sf = probe([
+      "const iosPrefixSteps = [{ label: '}', cmd: 'node engine/scripts/build-web.mjs --target native',",
+      "  env: { MODOKI_NATIVE_PLATFORM: 'ios' }, cwd }, { cmd: 'other', env: { MODOKI_NATIVE_PLATFORM: 'android' } }] as const;",
+      "run({ env: { ...buildEnv, MODOKI_ICONS_HANDLED: '1', MODOKI_NATIVE_PLATFORM: platform ?? '' } });",
+      "run({ env: {\n  ...buildEnv,\n  MODOKI_ICONS_HANDLED: '1',\n} });",
+      "run({ env: { MODOKI_ICONS_HANDLED: '1', MODOKI_NATIVE_PLATFORM: 'ios' } });",
+      "run({ env: { ...buildEnv, MODOKI_ICONS_HANDLED: '1', MODOKI_NATIVE_PLATFORM: 'ios' } });",
+      "renderKeystoreProperties(k); x.healNativeConfig(); const heal2 = await healNativeProject(r); renderExportOptionsPlist(o); renderKeystoreProperties(k);",
+      'async function build() { if (!heal.ok) {',
+      "  if (heal.reason === 'x') { sendStatus(`FAILED:npm install (${heal.why})`); } else { sendStatus('FAILED:stale node_modules'); }",
+      '  res.end();',
+      '',
+      '  return;',
+      '} }',
+    ].join('\n'), 'probe.ts');
+    expect(planBuildWebPlatforms(sf, 'iosPrefixSteps')).toEqual(['ios']);
+    expect(scaffoldRunnerEnvs(sf)).toEqual([{ namesPlatform: true }, { namesPlatform: false }, { namesPlatform: false }]);
+    expect(healStepCalls(sf)).toEqual(['healNativeConfig']);
+    expect(releaseWritesAroundHeal(sf, callsTo(sf, 'healNativeProject')[0]!)).toEqual({
+      renderKeystoreProperties: { before: 1, after: 1 }, renderExportOptionsPlist: { before: 0, after: 1 },
+    });
+    expect(refusalBlock(sf)).toEqual({ statuses: ['FAILED:npm install (', 'FAILED:stale node_modules'], endsWith: ['res.end()', 'return'], buildCalls: [] });
+    const fallsThrough = probe("if (!heal.ok) { sendStatus('FAILED:x'); res.end(); }\nif (!heal.ok) {}", 'probe.ts');
+    expect(() => refusalBlock(fallsThrough)).toThrow(/one `if \(!heal.ok\)`/);
+    // An install port must return the shell's result — not call it and return something else.
+    const ports = probe([
+      "heal(r, { install: (why) => runScaffoldShell(`npm install (${why})`, 'npm install', r) });",
+      "heal(r, { install: async (why) => { runScaffoldShell('x'); return true; } });",
+      "heal(r, { install: async (why) => { const ok = await runScaffoldShell('x'); log(() => { return f(); }); return await runScaffoldShell('y'); } });",
+    ].join('\n'), 'probe.ts');
+    expect(callsTo(ports, 'heal').map((c) => portReturns(c.arguments[1], 'install'))).toEqual([['runScaffoldShell'], ['<true>'], ['runScaffoldShell']]);
+    expect(refusalBlock(probe("if (!heal.ok) { res.end(); runScaffoldShell('x'); }", 'probe.ts')))
+      .toEqual({ statuses: [], endsWith: ['res.end()', "runScaffoldShell('x')"], buildCalls: ['runScaffoldShell'] });
   });
 });
 
