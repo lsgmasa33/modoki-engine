@@ -13,7 +13,7 @@ import { describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { readScannedSource } from '../helpers/sourceScanner';
-import { calledNames, calleeName, callsTo, declarationOf, enclosingNamedFunction, findNodes, flatText, functionsNamed, parseSource, precedingStatements, printedText, referencesToPath, statementOf, ts, unwrapValue } from '../helpers/sourceAst';
+import { boundIdentifier, calledNames, calleeName, callsTo, declarationOf, enclosingNamedFunction, findNodes, flatText, functionsNamed, parseSource, precedingStatements, printedText, referencesToPath, statementOf, ts, unwrapValue } from '../helpers/sourceAst';
 import { warnInertPrefabSizes } from '../../src/editor/scene/prefab';
 import { assertExemptionLedger } from '../helpers/exemptionLedger';
 import { registerAsset, unregisterAsset } from '../../src/runtime/loaders/assetManifest';
@@ -122,11 +122,16 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
     // The reader decides per CALL: a second serializer in a function that already warns for another prefab is unwarned.
     const probe = (body: string) => {
       const sf = parseSource(`async function ops(which) {\n${body}\n}`, 'probe.ts');
-      return callsTo(sf, 'serializePrefab').map((c) => serializedPrefabIsWarned(c, sf));
+      return callsTo(sf, 'serializePrefab').map((c) => serializedPrefabIsWarned(c));
     };
     expect(probe("if (which === 'a') { const p = serializePrefab(1); warnInertPrefabSizes(p, 'x'); }\n  if (which === 'b') { const q = serializePrefab(2); }")).toEqual([true, false]);
     expect(probe("const p = serializePrefab(1);\n  warnInertPrefabSizes(other, 'x');")).toEqual([false]);
     expect(probe("serializePrefab(1);")).toEqual([false]);
+    // Unconditional, and reached through the shared wrapper climb.
+    expect(probe("const p = serializePrefab(1);\n  if (never) warnInertPrefabSizes(p, 'x');")).toEqual([false]);
+    expect(probe("const p = serializePrefab(1);\n  const later = () => warnInertPrefabSizes(p, 'x');")).toEqual([false]);
+    expect(probe("warnInertPrefabSizes(p, 'x');\n  const p = serializePrefab(1);")).toEqual([false]);
+    expect(probe("const p = serializePrefab(1)!;\n  const w = warnInertPrefabSizes(p, 'x');")).toEqual([true]);
 
     const producers = serializeCensus();
     expect(producers.length, 'the reader must see the serializers, or the ledger below is vacuous').toBeGreaterThanOrEqual(6);
@@ -277,13 +282,24 @@ const GENERATED_PREFAB_WRITERS = [
   { item: 'packages/modoki/src/editor/scene/skinPrefab.ts::makeRigPrefabAsset', reason: 'a 2D skin rig prefab built from bone definitions — Bone/skin entities, no UIElement' },
 ];
 
-function serializedPrefabIsWarned(call: ts.CallExpression, fn: ts.Node): boolean {
-  let bound: ts.Node = call;
-  while (bound.parent && (ts.isParenthesizedExpression(bound.parent) || ts.isAwaitExpression(bound.parent) || ts.isAsExpression(bound.parent))) bound = bound.parent;
-  const decl = bound.parent;
-  if (!decl || !ts.isVariableDeclaration(decl) || !ts.isIdentifier(decl.name)) return false;
-  return callsTo(fn, 'warnInertPrefabSizes').some((w) => {
-    const arg = w.arguments[0] && unwrapValue(w.arguments[0]);
+function serializedPrefabIsWarned(call: ts.CallExpression): boolean {
+  // Bound through the shared wrapper climb (`!`, `as`, `satisfies`, parens, await), so `serializePrefab(id)!` is read.
+  const name = boundIdentifier(call);
+  const decl = name?.parent;
+  if (!decl) return false;
+  // The warning must be an UNCONDITIONAL later statement of the same list — the bar `warnedFirst` holds the
+  // writePrefabFile census to. A warning inside a branch, a closure or a callback may never run (#1251 close-out
+  // re-review: `if (never) warnInertPrefabSizes(copy, …)` passed). It does not also pin "before the write", because
+  // this census exists for writers it cannot name.
+  const stmt = statementOf(call);
+  const list = stmt.parent && (stmt.parent as { statements?: readonly ts.Node[] }).statements;
+  if (!list) return false;
+  return list.slice(list.indexOf(stmt) + 1).some((s) => {
+    const kept = ts.isVariableStatement(s) && s.declarationList.declarations.length === 1
+      ? s.declarationList.declarations[0]!.initializer : undefined;
+    const e = ts.isExpressionStatement(s) ? unwrapValue(s.expression) : kept && unwrapValue(kept);
+    if (!e || !ts.isCallExpression(e) || calleeName(e) !== 'warnInertPrefabSizes') return false;
+    const arg = e.arguments[0] && unwrapValue(e.arguments[0]);
     return !!arg && ts.isIdentifier(arg) && declarationOf(arg) === decl;
   });
 }
@@ -305,7 +321,7 @@ function serializeCensus(): Array<{ file: string; in: string | undefined; warns:
       return {
         file: path.relative(ENGINE, abs).split(path.sep).join('/'),
         in: fn?.name,
-        warns: !!fn && serializedPrefabIsWarned(call, fn.node),
+        warns: serializedPrefabIsWarned(call),
       };
     });
   });

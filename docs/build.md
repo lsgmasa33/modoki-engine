@@ -2921,7 +2921,7 @@ on every build AND every project open (a plain `launch-editor.sh games/court` re
   `$(cat games/<id>/android/.gradle/modoki-build-number.args)` to gradle and the iOS twin to
   xcodebuild. ⚠️ **Not optional on Android:** without it a hand-run APK carries the frozen committed
   versionCode, and installing it over an editor build fails with `INSTALL_FAILED_VERSION_DOWNGRADE`.
-  Recover with `adb install -r -d` (a debug APK may downgrade) — never an uninstall, which destroys
+  Recover with `adb -s <serial> install -r -d` (a debug APK may downgrade) — never an uninstall, which destroys
   the app's data.
 - **The accepted cost:** an archive made directly in Xcode or Android Studio ships the stale committed
   number. Store builds go through **Build → iOS/Android Release**.

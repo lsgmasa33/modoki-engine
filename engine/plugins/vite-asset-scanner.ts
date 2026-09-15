@@ -3192,49 +3192,50 @@ export function assetScannerPlugin(): Plugin {
             if (platform === 'ios' || platform === 'android') {
               for (const n of [...buildNumbers.notes, ...buildNumbers.platformNotes[platform]]) send(`[build] ${n}`);
               send(`[build] build number passed to the ${platform} build: ${buildNumbers[platform] ?? '(none — the committed value is used)'}`);
-              // The gradle steps name the init script (gradleBuildNumberArg). Written here, after the heal and
-              // the auto-scaffold, because `android/` may not have existed when the request arrived.
-              // A throw here would escape into the build's .finally with no status sent and leave the dialog
-              // spinning — report it as a failed build instead, like the heal failures above.
-              try {
-                writeBuildNumberArgFiles(projectRoot, buildNumbers);
-              } catch (e) {
-                sendStatus('FAILED:build number files');
-                send(`Build failed — could not write the build-number files: ${(e as Error).message}`);
-                res.end();
-                return;
+            }
+            // ⚠️ Every GENERATED input below is written inside ONE try: a throw would otherwise escape into
+            // the build's .finally with no status sent and leave the dialog spinning. Reported as a failed
+            // build instead, like the heal failures above.
+            try {
+              // The gradle steps name the init script (gradleBuildNumberArg), and a hand-run build reads the
+              // args files. Written after the heal and the auto-scaffold, like the release inputs below.
+              if (platform === 'ios' || platform === 'android') writeBuildNumberArgFiles(projectRoot, buildNumbers);
+              // #370: write the two GENERATED, GITIGNORED inputs a release build needs. Both are
+              // re-derived every run rather than hand-maintained, so the upload key and the Team ID
+              // each have exactly one home (`project.user.json`) and the native files that consume
+              // them cannot go stale. Placed HERE — after the auto-scaffold and the heal — because
+              // `android/` or `ios/` may not have existed when the request arrived.
+              //
+              // ⚠️ Both files hold private values (the key passwords; the Apple Team ID, which is a
+              // PRIVATE_BUILD_FIELDS value). They are written to paths the project's own `.gitignore`
+              // covers — `android/keystore.properties` and `ios/App/build/` — and `verify:publish` is
+              // the backstop for that, not the defence. Do not relocate either without checking the
+              // ignore rules first.
+              if (isRelease && platform === 'android') {
+                const propsPath = path.join(projectRoot, 'android', 'keystore.properties');
+                // `mode` applies only when writeFileSync CREATES the file, so a keystore.properties
+                // that already exists keeps whatever mode it had (0644 from an earlier engine, or
+                // from a hand-written one). chmod unconditionally afterwards — this file holds the
+                // upload key's passwords, and "it was already there" is not a reason to leave it
+                // world-readable. Best-effort: a filesystem without POSIX modes must not fail a build.
+                fs.writeFileSync(propsPath, renderKeystoreProperties(user.keystore), { mode: 0o600 });
+                try { fs.chmodSync(propsPath, 0o600); } catch { /* non-POSIX fs — the write still landed */ }
+                send(`[build] wrote ${path.relative(buildCwd, propsPath)} from project.user.json (user.keystore)`);
               }
-            }
-            // #370: write the two GENERATED, GITIGNORED inputs a release build needs. Both are
-            // re-derived every run rather than hand-maintained, so the upload key and the Team ID
-            // each have exactly one home (`project.user.json`) and the native files that consume
-            // them cannot go stale. Placed HERE — after the auto-scaffold and the heal — because
-            // `android/` or `ios/` may not have existed when the request arrived.
-            //
-            // ⚠️ Both files hold private values (the key passwords; the Apple Team ID, which is a
-            // PRIVATE_BUILD_FIELDS value). They are written to paths the project's own `.gitignore`
-            // covers — `android/keystore.properties` and `ios/App/build/` — and `verify:publish` is
-            // the backstop for that, not the defence. Do not relocate either without checking the
-            // ignore rules first.
-            if (isRelease && platform === 'android') {
-              const propsPath = path.join(projectRoot, 'android', 'keystore.properties');
-              // `mode` applies only when writeFileSync CREATES the file, so a keystore.properties
-              // that already exists keeps whatever mode it had (0644 from an earlier engine, or
-              // from a hand-written one). chmod unconditionally afterwards — this file holds the
-              // upload key's passwords, and "it was already there" is not a reason to leave it
-              // world-readable. Best-effort: a filesystem without POSIX modes must not fail a build.
-              fs.writeFileSync(propsPath, renderKeystoreProperties(user.keystore), { mode: 0o600 });
-              try { fs.chmodSync(propsPath, 0o600); } catch { /* non-POSIX fs — the write still landed */ }
-              send(`[build] wrote ${path.relative(buildCwd, propsPath)} from project.user.json (user.keystore)`);
-            }
-            if (isRelease && platform === 'ios') {
-              const optsPath = path.join(projectRoot, IOS_EXPORT_OPTIONS_PATH);
-              fs.mkdirSync(path.dirname(optsPath), { recursive: true });
-              fs.writeFileSync(optsPath, renderExportOptionsPlist({
-                teamId: cfg.build.appleTeamId.trim(),
-                method: cfg.build.iosExportMethod,
-              }));
-              send(`[build] wrote ${path.relative(buildCwd, optsPath)} (method: ${cfg.build.iosExportMethod})`);
+              if (isRelease && platform === 'ios') {
+                const optsPath = path.join(projectRoot, IOS_EXPORT_OPTIONS_PATH);
+                fs.mkdirSync(path.dirname(optsPath), { recursive: true });
+                fs.writeFileSync(optsPath, renderExportOptionsPlist({
+                  teamId: cfg.build.appleTeamId.trim(),
+                  method: cfg.build.iosExportMethod,
+                }));
+                send(`[build] wrote ${path.relative(buildCwd, optsPath)} (method: ${cfg.build.iosExportMethod})`);
+              }
+            } catch (e) {
+              sendStatus('FAILED:could not write a generated build input');
+              send(`Build failed — could not write a generated build input: ${(e as Error).message}`);
+              res.end();
+              return;
             }
             // Provision go-ios the moment a build actually needs it — this build targets an iOS
             // device `devicectl` cannot reach, and without go-ios the deploy ends in a manual ⌘R.
