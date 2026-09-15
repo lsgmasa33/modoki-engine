@@ -22,10 +22,29 @@ export type ViewMode = 'category' | 'folder';
  *  path-space (which the real folders use) so it never collides with one. */
 export const ASSETS_SECTION = '@@assets-section';
 
-/** Sliced sprites grouped under the texture GUID they were cut from. They render
- *  as children of that texture row, never as standalone entries. */
-export function spritesByTexture(assets: ReadonlyArray<AssetEntry>): Map<string, AssetEntry[]> {
+/** Where a sprite shows, decided once for the list, the footer and the nesting (#1249).
+ *
+ *  By default a sprite is a sub-asset: it renders as a child of its texture row and is never a row
+ *  of its own. That rule cannot also answer a narrowing that asks FOR sprites — deciding it on the
+ *  sprite's own row, which never renders, made the `sprite` type chip list 0 rows while its menu
+ *  entry counted every sprite, and made a search for a slice's name find nothing. So:
+ *  - the `sprite` chip is on → every sprite is a flat row, and nothing nests (a texture that is
+ *    listed too would otherwise show the same sprites twice);
+ *  - search text with no type chip → a matching sprite is a flat row only when its texture row is
+ *    not listed, because a listed texture already shows it as a child;
+ *  - otherwise → sprites nest and are not rows. */
+export function spriteRowsEnabled(typeFilter: ReadonlySet<string>): boolean {
+  return typeFilter.has('sprite');
+}
+
+/** Sliced sprites grouped under the texture GUID they were cut from, for the texture row to render
+ *  as children. Empty while sprites are flat rows (`spriteRowsEnabled`) — see there. */
+export function spritesByTexture(
+  assets: ReadonlyArray<AssetEntry>,
+  typeFilter: ReadonlySet<string>,
+): Map<string, AssetEntry[]> {
   const m = new Map<string, AssetEntry[]>();
+  if (spriteRowsEnabled(typeFilter)) return m;
   for (const a of assets) {
     if (a.type !== 'sprite' || !a.sprite?.texture) continue;
     const arr = m.get(a.sprite.texture);
@@ -34,8 +53,8 @@ export function spritesByTexture(assets: ReadonlyArray<AssetEntry>): Map<string,
   return m;
 }
 
-/** Search text AND (when any chip is active) the type filter. Sprites are always
- *  excluded from the flat lists — they render as texture children. */
+/** Search text AND (when any chip is active) the type filter. Sprites follow the rule in
+ *  `spriteRowsEnabled`'s doc: nested by default, flat rows when the narrowing asks for them. */
 export function filterAssets(
   assets: ReadonlyArray<AssetEntry>,
   filter: string,
@@ -43,21 +62,42 @@ export function filterAssets(
 ): AssetEntry[] {
   const q = filter.toLowerCase();
   const hasType = typeFilter.size > 0;
+  const spriteChip = spriteRowsEnabled(typeFilter);
+  const matches = (a: AssetEntry) => !q || a.name.toLowerCase().includes(q) || a.path.toLowerCase().includes(q);
+  const listed = (a: AssetEntry) => a.type !== 'sprite' && (!hasType || typeFilter.has(a.type)) && matches(a);
+  // Only a search with no chip needs to know which textures are listed; build the set only then.
+  const searchSprites = !hasType && q !== '';
+  const listedTextures = new Set<string>();
+  if (searchSprites) for (const a of assets) if (a.guid && listed(a)) listedTextures.add(a.guid);
   return assets.filter((a) => {
-    if (a.type === 'sprite') return false;
-    if (hasType && !typeFilter.has(a.type)) return false;
-    if (q && !a.name.toLowerCase().includes(q) && !a.path.toLowerCase().includes(q)) return false;
-    return true;
+    if (a.type !== 'sprite') return listed(a);
+    if (spriteChip) return matches(a);
+    return searchSprites && matches(a) && !(a.sprite?.texture && listedTextures.has(a.sprite.texture));
   });
 }
 
-/** Total assets that CAN appear in the flat list — the denominator of the footer's
- *  "N of M assets". Sliced sprites are excluded for the same reason as in
- *  `filterAssets`: counting them compares a sprite-free numerator against a
- *  sprite-inflated denominator, so the footer sticks on "N of M" forever once any
- *  texture is sliced. */
-export function flatAssetTotal(assets: ReadonlyArray<AssetEntry>): number {
+/** Total assets that CAN appear in the list — the denominator of the footer's "N of M assets".
+ *  Sprites count only while the current narrowing can make them rows (the `sprite` chip, or search
+ *  text with no chip — `filterAssets`): counting them otherwise compares a sprite-free numerator
+ *  against a sprite-inflated denominator, so the footer sticks on "N of M" forever once any texture
+ *  is sliced; NOT counting them while a search lists them let N exceed M ("600 of 250 assets" for a
+ *  600-slice sheet whose slices match and whose name does not). */
+export function flatAssetTotal(
+  assets: ReadonlyArray<AssetEntry>,
+  filter: string,
+  typeFilter: ReadonlySet<string>,
+): number {
+  if (spriteRowsEnabled(typeFilter) || (typeFilter.size === 0 && filter !== '')) return assets.length;
   return assets.reduce((n, a) => n + (a.type === 'sprite' ? 0 : 1), 0);
+}
+
+/** The assets a file action (delete, duplicate, cut/copy) applies to: the selection, minus sprites. A sprite
+ *  has no file of its own — it is a slice record inside its texture's sidecar — which is why its context menu
+ *  already offers none of these. Keyboard Select All now reaches sprite ROWS (#1249), so without this a
+ *  Cmd+A → Delete under the sprite chip queued every sprite for a delete that removes nothing on disk and
+ *  pushes an undo that restores nothing. */
+export function fileActionTargets(selected: ReadonlyArray<AssetEntry>): AssetEntry[] {
+  return selected.filter((a) => a.type !== 'sprite');
 }
 
 /** Category view: group by type, ordered by the shared canonical type order (so

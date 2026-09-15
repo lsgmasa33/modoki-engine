@@ -79,14 +79,17 @@ export function createStoreSelectionTracker(): StoreSelectionTracker {
  *  the section renders while `ASSETS_SECTION` is collapsed, see `visibleOrder` in `assetListing.ts`);
  *  and, for a sliced sprite (`<texture>#<sliceGuid>`, `assetManifest.ts` — the LAST `#`, as
  *  `SpriteAssetView.tsx` splits it), the parent texture row its child rows render under, in the
- *  `texture` group. An ENGINE asset (`/modoki/…`) gets none: those rows live in the Engine section,
+ *  `texture` group — unless the list shows that sprite as a ROW of its own (`spriteRow`: the `sprite`
+ *  chip, or a search that surfaced it — `filterAssets`, #1249), where it renders in the `sprite` group
+ *  and no texture row holds it. An ENGINE asset (`/modoki/…`) gets none: those rows live in the Engine section,
  *  which `EngineRevealWatcher` reveals through its own keys, and adding project keys for them would
  *  only re-open the project's collapsed groups. */
-export function revealKeysFor(asset: Pick<SelectedAsset, 'path' | 'type'>): string[] {
+export function revealKeysFor(asset: Pick<SelectedAsset, 'path' | 'type'>, opts: { spriteRow?: boolean } = {}): string[] {
   if (asset.path.startsWith('/modoki/')) return [];
   const hash = asset.type === 'sprite' ? asset.path.lastIndexOf('#') : -1;
   const rowPath = hash >= 0 ? asset.path.slice(0, hash) : asset.path;
-  const keys = hash >= 0 ? ['texture', rowPath] : [asset.type];
+  // A flat sprite row sits in the texture's FOLDER (its path is `<texture>#<slice>`) but in the `sprite` group.
+  const keys = hash >= 0 ? (opts.spriteRow ? ['sprite'] : ['texture', rowPath]) : [asset.type];
   keys.push(ASSETS_SECTION);
   const lastSlash = rowPath.lastIndexOf('/');
   if (lastSlash > 0) {

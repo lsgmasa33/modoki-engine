@@ -1768,8 +1768,9 @@ Findings come from four passes:
    every instance inherits it, so reporting it from the scene side would name the wrong file
    (`main.json` for a value in `thing.prefab.json`) and then repeat it per instance — one bad
    prefab in 6 scenes at 4 instances each is 24 warnings for a single mistake. It is reported
-   instead at prefab **write** time (Apply-to-Prefab / Save-as-Prefab, via
-   `warnInertPrefabSizes`), which reaches the person who just authored it, and by a repo-wide
+   instead at prefab **write** time — every AUTHORING write: Apply-to-Prefab, Save-as-Prefab,
+   prefab edit mode's save, and the agent `modoki_prefab create` op, via `warnInertPrefabSizes`
+   — which reaches the person who just authored it, and by a repo-wide
    guard (`engine/tests/assets/prefabInertSize.test.ts`) that also covers prefabs written by hand
    or by an agent — which no editor hook can see. `GET /api/validate-prefab?path=…` exposes the
    same check so an agent editing prefab JSON can verify its own edit. All four share the one
@@ -1777,7 +1778,16 @@ Findings come from four passes:
 
    The write-time hook deliberately does NOT live in `writePrefabFile`: that is also the undo/redo
    restore path (`installPrefabSnapshot`), and warning there would fire while someone *reverts*
-   the value.
+   the value. The price is that each authoring write has to remember the call — and two did not:
+   edit mode's save predated #42 and the agent `create` op was never listed (#1251). So the guard
+   (`warnInertPrefabSizes.test.ts`) takes **two censuses** over the package's `src/editor` and the
+   app's `app/editor`, each through `assertExemptionLedger`: every `writePrefabFile` call must warn
+   first or be a named restore, and every function that calls `serializePrefab` — which reaches the
+   writers that bypass `writePrefabFile`, like Save-as-Prefab's `writeAssetFile` — must call
+   `warnInertPrefabSizes` or be a named GENERATED writer (model import, model re-import, 2D rig
+   prefab). A new writer of either shape fails by file and function instead of being skipped. The
+   agent `create` op also returns the warnings in its response, since the agent never reads the
+   renderer console.
 
    The same check also covers a **prefab instance's overridden fields**, which
    live in the serialized entity's sibling `overrides` object (keyed by prefab

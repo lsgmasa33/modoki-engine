@@ -1663,14 +1663,20 @@ export function resolveInstanceContext(entityId: number): { source: string; root
  *  (pass 4). Warns, never blocks — a dead size is inert, not corrupt.
  *
  *  The one thing that must stay HERE, because it is invisible in the code and looks like an
- *  obvious cleanup: call this from the AUTHORING writes only (Apply-to-Prefab, Save-as-Prefab),
- *  never from `writePrefabFile`. That is the single choke point for prefab writes AND the
+ *  obvious cleanup: call this from EVERY AUTHORING write (Apply-to-Prefab, Save-as-Prefab, prefab edit
+ *  mode save, the agent `create` op — #1251), never from `writePrefabFile`. That is the single choke point for prefab writes AND the
  *  undo/redo restore path (`installPrefabSnapshot`), so hooking it warns while someone REVERTS the
  *  value. Guarded by tests/editor/warnInertPrefabSizes.test.ts. */
-export function warnInertPrefabSizes(prefab: unknown, source: string): void {
-  for (const w of validatePrefabData(prefab).warnings) {
-    console.warn(`[Editor] ${source}: ${w}`);
+export function warnInertPrefabSizes(prefab: unknown, source: string): string[] {
+  // Name the FILE even when the caller holds the GUID (PrefabInstance.source and prefab edit mode both
+  // do) — the same resolution writePrefabFile applies before it writes.
+  const where = isGuid(source) ? (resolveRef(source) || source) : source;
+  const { warnings } = validatePrefabData(prefab);
+  for (const w of warnings) {
+    console.warn(`[Editor] ${where}: ${w}`);
   }
+  // Returned for a caller whose reader is not the editor Console — the agent op answers in its response.
+  return warnings;
 }
 
 export async function writePrefabFile(source: string, prefab: PrefabFile): Promise<boolean> {

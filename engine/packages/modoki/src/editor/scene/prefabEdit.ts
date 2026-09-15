@@ -8,7 +8,7 @@
  *  serialize the prefab subtree back out, excluding the scaffold entities. */
 
 import type { PrefabFile } from './prefab';
-import { serializePrefab, writePrefabFile, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs } from './prefab';
+import { serializePrefab, warnInertPrefabSizes, writePrefabFile, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs } from './prefab';
 import { collectResourceRefs, setCurrentScenePath, setCurrentBaseScene, getCurrentScenePath, saveScene, loadScene, markSceneSaved, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
 import { swapHistory, getEditVersion } from '../undo/undoManager';
 import { sceneManager } from '../../runtime/scene/SceneManager';
@@ -378,6 +378,9 @@ export async function savePrefabEdit(): Promise<boolean> {
   // saved baseline without it ever being written; see markSceneSaved's doc comment for why that is
   // data loss and not a cosmetic flag (#573).
   const savedAtEditVersion = getEditVersion();
+  // An authoring write, so it reports an inert size (#42, #1251) — warnInertPrefabSizes says why
+  // the call sits here and not in writePrefabFile.
+  warnInertPrefabSizes(prefab, editingPrefab.guid);
   const ok = await writePrefabFile(editingPrefab.guid, prefab);
   if (!ok) return false;
   // Refresh the editor's prefab cache to the just-saved version AND invalidate the

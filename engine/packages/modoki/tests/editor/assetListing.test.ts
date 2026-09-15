@@ -9,7 +9,7 @@
 
 import { describe, it, expect } from 'vitest';
 import {
-  spritesByTexture, filterAssets, flatAssetTotal, groupByType, visibleOrder, ASSETS_SECTION,
+  spritesByTexture, filterAssets, flatAssetTotal, fileActionTargets, groupByType, visibleOrder, ASSETS_SECTION,
 } from '../../src/editor/panels/assetListing';
 import { buildFolderTree, type AssetEntry, type FolderNode } from '../../src/editor/utils/assetPaths';
 
@@ -19,24 +19,67 @@ const a = (path: string, type = 'texture', name?: string): AssetEntry =>
 const sprite = (path: string, texture: string): AssetEntry =>
   ({ path, name: path.split('/').pop()!, type: 'sprite', sprite: { texture } }) as AssetEntry;
 
+const NONE: ReadonlySet<string> = new Set();
+
 describe('spritesByTexture', () => {
   it('groups sliced sprites under the texture GUID they came from', () => {
-    const m = spritesByTexture([a('/t/sheet.png'), sprite('/t/s0', 'guid-1'), sprite('/t/s1', 'guid-1'), sprite('/t/s2', 'guid-2')]);
+    const m = spritesByTexture([a('/t/sheet.png'), sprite('/t/s0', 'guid-1'), sprite('/t/s1', 'guid-1'), sprite('/t/s2', 'guid-2')], NONE);
     expect([...m.keys()]).toEqual(['guid-1', 'guid-2']);
     expect(m.get('guid-1')!.map((s) => s.path)).toEqual(['/t/s0', '/t/s1']);
   });
 
   it('ignores sprites with no source texture, and non-sprites', () => {
-    const m = spritesByTexture([a('/t/sheet.png'), { path: '/t/orphan', name: 'orphan', type: 'sprite' } as AssetEntry]);
+    const m = spritesByTexture([a('/t/sheet.png'), { path: '/t/orphan', name: 'orphan', type: 'sprite' } as AssetEntry], NONE);
     expect(m.size).toBe(0);
+  });
+
+  it('nests nothing while the sprite chip makes sprites rows — a listed texture would show them twice (#1249)', () => {
+    const assets = [tex('/t/sheet.png', 'g'), sprite('/t/sheet.png#s0', 'g')];
+    expect(spritesByTexture(assets, new Set(['sprite', 'texture'])).size).toBe(0);
+    expect(spritesByTexture(assets, new Set(['texture'])).get('g')).toHaveLength(1);
+  });
+});
+
+/** A texture with a GUID, which is what its sprites point at. */
+const tex = (path: string, guid: string): AssetEntry => ({ ...a(path), guid }) as AssetEntry;
+
+describe('filterAssets — sprites (#1249)', () => {
+  // Court's shape: every texture carries one auto whole-image sprite; plus a sliced sheet.
+  const ASSETS = [
+    tex('/t/hero.png', 'g-hero'), sprite('/t/hero.png#default', 'g-hero'),
+    tex('/t/sheet.png', 'g-sheet'), { ...sprite('/t/sheet.png#s0', 'g-sheet'), name: 'fish_03' } as AssetEntry,
+    a('/m/villain.glb', 'model'),
+  ];
+  const paths = (xs: AssetEntry[]) => xs.map((x) => x.path);
+
+  it('the sprite chip lists every sprite as a row — it listed 0 while the menu counted them', () => {
+    expect(paths(filterAssets(ASSETS, '', new Set(['sprite'])))).toEqual(['/t/hero.png#default', '/t/sheet.png#s0']);
+  });
+
+  it('the sprite chip still ANDs with the search and with the other chips', () => {
+    expect(paths(filterAssets(ASSETS, 'fish', new Set(['sprite'])))).toEqual(['/t/sheet.png#s0']);
+    expect(paths(filterAssets(ASSETS, '', new Set(['sprite', 'model'])))).toEqual(['/t/hero.png#default', '/t/sheet.png#s0', '/m/villain.glb']);
+  });
+
+  it("a search for a slice's name lists that slice when its texture does not match", () => {
+    expect(paths(filterAssets(ASSETS, 'fish_03', NONE))).toEqual(['/t/sheet.png#s0']);
+  });
+
+  it('a search that also matches the texture lists only the texture — its row already holds the sprite', () => {
+    expect(paths(filterAssets(ASSETS, 'hero', NONE))).toEqual(['/t/hero.png']);
+  });
+
+  it('a chip that is not sprite keeps sprites out, search or not', () => {
+    expect(paths(filterAssets(ASSETS, 'fish_03', new Set(['texture'])))).toEqual([]);
   });
 });
 
 describe('filterAssets', () => {
-  const ASSETS = [a('/x/hero.png'), a('/x/villain.glb', 'model'), a('/x/theme.mp3', 'audio'), sprite('/x/s0', 'g')];
+  // hero.png owns the sprite, so a search that lists hero.png leaves the sprite nested under it.
+  const ASSETS = [tex('/x/hero.png', 'g'), a('/x/villain.glb', 'model'), a('/x/theme.mp3', 'audio'), sprite('/x/s0', 'g')];
 
-  it('always drops sprites — they render as texture children, never standalone', () => {
-    expect(filterAssets(ASSETS, '', new Set()).some((x) => x.type === 'sprite')).toBe(false);
+  it('drops sprites while nothing narrows to them — they render as texture children', () => {
+    expect(filterAssets(ASSETS, '', NONE).some((x) => x.type === 'sprite')).toBe(false);
   });
 
   it('matches the query against name OR path, case-insensitively', () => {
@@ -61,8 +104,33 @@ describe('flatAssetTotal', () => {
     // `filtered` against a sprite-inflated total, so "N of M" never reaches M once
     // any texture is sliced.
     const assets = [a('/t/sheet.png'), sprite('/t/s0', 'g'), sprite('/t/s1', 'g')];
-    expect(flatAssetTotal(assets)).toBe(1);
-    expect(filterAssets(assets, '', new Set())).toHaveLength(flatAssetTotal(assets));
+    expect(flatAssetTotal(assets, '', NONE)).toBe(1);
+    expect(filterAssets(assets, '', NONE)).toHaveLength(flatAssetTotal(assets, '', NONE));
+  });
+
+  it('counts sprites while the sprite chip makes them rows, so the footer can still reach M (#1249)', () => {
+    const assets = [tex('/t/sheet.png', 'g'), sprite('/t/sheet.png#s0', 'g'), sprite('/t/sheet.png#s1', 'g')];
+    const chips = new Set(['sprite', 'texture']);
+    expect(flatAssetTotal(assets, '', chips)).toBe(3);
+    expect(filterAssets(assets, '', chips)).toHaveLength(flatAssetTotal(assets, '', chips));
+    expect(filterAssets(assets, '', new Set(['sprite']))).toHaveLength(2); // "2 of 3"
+  });
+
+  it('counts sprites while a search can list them, so N never exceeds M (#1249 close-out)', () => {
+    // 3 slices matching "slice", on a sheet whose own name does not match, in a 1-texture project.
+    const assets = [tex('/t/sheet.png', 'g'), ...[0, 1, 2].map((i) => ({ ...sprite(`/t/sheet.png#${i}`, 'g'), name: `slice_${i}` }) as AssetEntry)];
+    const n = filterAssets(assets, 'slice', NONE).length;
+    expect(n).toBe(3);
+    expect(n).toBeLessThanOrEqual(flatAssetTotal(assets, 'slice', NONE));
+    expect(flatAssetTotal(assets, '', NONE)).toBe(1); // cleared search: sprites nest again and leave the count
+  });
+});
+
+describe('fileActionTargets', () => {
+  it('drops sprites — no file of their own — and keeps everything else in order (#1249 close-out)', () => {
+    const picked = [a('/t/a.png'), sprite('/t/a.png#0', 'g'), a('/m/b.glb', 'model')];
+    expect(fileActionTargets(picked).map((x) => x.path)).toEqual(['/t/a.png', '/m/b.glb']);
+    expect(fileActionTargets([sprite('/t/a.png#0', 'g')])).toEqual([]);
   });
 });
 

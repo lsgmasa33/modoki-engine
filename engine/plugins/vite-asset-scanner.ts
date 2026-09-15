@@ -82,10 +82,11 @@ import { type SceneSchema } from '../packages/modoki/src/runtime/loaders/sceneVa
 import { handleBackendRequest, assetJsonBytes, type BackendContext, type BackendResult } from './backend/editorBackendRouter';
 import { reclaimStaleDeviceStateAtStartup, shouldReclaimDeviceStateHere } from './backend/deviceConnection';
 import { healNativeProject } from './healNativeProject';
+import { injectedBuildNumbers, writeBuildNumberArgFiles } from './healNativeConfig';
 import { spawnBuildCommand, killBuildProcess, resolveBuildStep, type BuildStep } from './buildStepShell';
 import {
   parseBuildVariant, keystoreRefusal, renderKeystoreProperties, renderExportOptionsPlist,
-  androidReleaseSteps, iosReleaseSteps, debugBuildReleaseWarning,
+  androidReleaseSteps, iosReleaseSteps, iosDebugBuildStep, androidDebugBuildStep, debugBuildReleaseWarning,
   IOS_EXPORT_OPTIONS_PATH, IOS_EXPORT_DIR, ANDROID_AAB_PATH, ANDROID_RELEASE_APK_PATH,
 } from './releaseBuild';
 import { PROJECT_USER_CONFIG_FILENAME } from '../project-config';
@@ -2737,33 +2738,30 @@ export function assetScannerPlugin(): Plugin {
             ...(androidIconStep ? [androidIconStep] : []),
             { label: 'Syncing Capacitor Android...', cmd: 'npx cap sync android', cwd: androidCwd },
           ];
+          // The build number goes to xcodebuild/gradle on the command line, never into a committed
+          // file (#1226) — see injectedBuildNumbers. Resolved per platform because each store's
+          // never-lower floor is the platform's own committed value.
+          const buildNumbers: ReturnType<typeof injectedBuildNumbers> = (platform === 'ios' || platform === 'android')
+            ? injectedBuildNumbers(projectRoot, cfg)
+            : { notes: [], platformNotes: { android: [], ios: [] } };
           const stepsByPlatform: Record<string, BuildStep[]> = {
             // iOS is macOS-only (preflight blocks it off-darwin), so its bash-only steps
             // (`$(…)`, `~`, xcodebuild/xcrun) never run on Windows — no winCmd needed.
             ios: isRelease ? [
               ...iosPrefixSteps,
-              ...iosReleaseSteps({ iosCwd, iosXcodeTarget }),
+              ...iosReleaseSteps({ iosCwd, iosXcodeTarget, buildNumber: buildNumbers.ios }),
             ] : [
               ...iosPrefixSteps,
-              { label: 'Building Xcode project...', cmd: `xcodebuild ${iosXcodeTarget} -scheme App -configuration Debug -destination 'id=${IOS_DEST}' -allowProvisioningUpdates build`, cwd: iosCwd },
+              iosDebugBuildStep({ iosCwd, iosXcodeTarget, deviceId: IOS_DEST, buildNumber: buildNumbers.ios }),
               ...iosDeploySteps,
             ],
             android: isRelease ? [
               ...androidPrefixSteps,
-              ...androidReleaseSteps({ androidCwd, buildCwd, env: androidBuildEnv, ota: cfg.ota.enabled }),
+              ...androidReleaseSteps({ androidCwd, buildCwd, env: androidBuildEnv, ota: cfg.ota.enabled, buildNumber: buildNumbers.android }),
             ] : [
               ...androidPrefixSteps,
-              // gradlew wrapper: posix `android/gradlew` vs Windows `android\gradlew.bat`.
-              // JAVA_HOME/ANDROID_HOME are injected via env (not a bash export prefix).
-              // --no-daemon: don't leave a persistent Gradle daemon (a java.exe running from the
-              // provisioned JDK) after the build. On Windows that daemon keeps the JDK's files LOCKED,
-              // so "Remove Java SDK" (and any manual delete) fails half-way. The build JVM exits when
-              // the build finishes, releasing the lock. Small perf cost on repeat builds; worth it.
-              // `clean` when ota.enabled: Gradle's incremental asset-merge task has been observed to
-              // miss a NEW file (ota-embedded-manifest.json) added to dist/ between builds, serving a
-              // stale merged-assets APK with no error (plan doc's "Gradle asset-merge staleness"
-              // gotcha) — costs a slower build only for OTA-enabled projects.
-              { label: 'Building Android APK...', cmd: `android/gradlew -p android ${cfg.ota.enabled ? 'clean ' : ''}assembleDebug --no-daemon`, winCmd: `android\\gradlew.bat -p android ${cfg.ota.enabled ? 'clean ' : ''}assembleDebug --no-daemon`, env: androidBuildEnv, cwd: androidCwd },
+              // The flags and why each is there: androidDebugBuildStep (releaseBuild.ts).
+              androidDebugBuildStep({ androidCwd, env: androidBuildEnv, ota: cfg.ota.enabled, buildNumber: buildNumbers.android }),
               // adb path + apk-relative path use forward slashes, which adb accepts on
               // Windows too; adb is an absolute exe path, so these run on both shells.
               { label: 'Installing on device...', cmd: `${adb} install -r android/app/build/outputs/apk/debug/app-debug.apk`, cwd: androidCwd },
@@ -3185,6 +3183,24 @@ export function assetScannerPlugin(): Plugin {
                   sendStatus(`FAILED:Build claim not held\n${heal.message}`);
                   send(heal.message);
                 }
+                res.end();
+                return;
+              }
+            }
+            // What the build number resolved to, and why when a committed value outranked it (#1226) —
+            // the heal no longer prints it, because it no longer writes it.
+            if (platform === 'ios' || platform === 'android') {
+              for (const n of [...buildNumbers.notes, ...buildNumbers.platformNotes[platform]]) send(`[build] ${n}`);
+              send(`[build] build number passed to the ${platform} build: ${buildNumbers[platform] ?? '(none — the committed value is used)'}`);
+              // The gradle steps name the init script (gradleBuildNumberArg). Written here, after the heal and
+              // the auto-scaffold, because `android/` may not have existed when the request arrived.
+              // A throw here would escape into the build's .finally with no status sent and leave the dialog
+              // spinning — report it as a failed build instead, like the heal failures above.
+              try {
+                writeBuildNumberArgFiles(projectRoot, buildNumbers);
+              } catch (e) {
+                sendStatus('FAILED:build number files');
+                send(`Build failed — could not write the build-number files: ${(e as Error).message}`);
                 res.end();
                 return;
               }

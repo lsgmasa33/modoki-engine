@@ -40,7 +40,7 @@ import {
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
   runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, discardDirtyAssets,
   applyAssetPathMoves, type PathMove,
-  getPrefabSource, instantiatePrefabAsync, setPrefabSource, serializePrefab, writePrefabFile,
+  getPrefabSource, instantiatePrefabAsync, setPrefabSource, serializePrefab, writePrefabFile, warnInertPrefabSizes,
   resolveExistingPrefabId, tagEntityTreeAsInstance, untagEntityTreeAsInstance,
   detachPrefabInstance, reattachPrefabInstance,
   applyToPrefabWithUndo, revertOverridesSelective, rebuildInstance, resolveInstanceContext,
@@ -2268,6 +2268,10 @@ export function registerEditorAgentOps(): void {
       const existingId = await resolveExistingPrefabId(path);
       const prefab = serializePrefab(entityId, existingId);
       if (!prefab) throw new Error(`could not serialize prefab from entity ${entityId}`);
+      // An authoring write (it can overwrite an existing template), so it reports an inert size like
+      // the human Save-as-Prefab does (#42, #1251) — in THIS response too, because the agent that
+      // authored it does not read the renderer console (the instantiate op's QA-ASSET-0014 rule above).
+      const warnings = warnInertPrefabSizes(prefab, path);
       const ok = await writePrefabFile(path, prefab);
       if (ok) {
         tagEntityTreeAsInstance(entityId, path);
@@ -2286,7 +2290,7 @@ export function registerEditorAgentOps(): void {
       // `saved` describes the .prefab.json FILE write (ok). The live-world PrefabInstance
       // TAG on the source entity is separate and unsaved until modoki_save_all — reported so
       // an agent doesn't conflate "the asset file landed" with "the scene linkage did too".
-      return { ok, source: path, saved: ok, sceneLinkageSaved: false };
+      return { ok, source: path, saved: ok, sceneLinkageSaved: false, ...(warnings.length ? { warnings } : {}) };
     }
     if (which === 'detach') {
       if (p.entityId == null && !p.entityGuid) throw new Error('prefab detach requires { entityId | entityGuid }');

@@ -132,4 +132,11 @@ describe('revealKeysFor', () => {
     const keys = revealKeysFor({ path: '/assets/textures/zombie/head.png#1234-guid', type: 'sprite' });
     expect(keys).toEqual(['texture', '/assets/textures/zombie/head.png', ASSETS_SECTION, '/assets', '/assets/textures', '/assets/textures/zombie', '/']);
   });
+
+  it('a sprite the list shows as its OWN row opens the sprite group instead — no texture row holds it (#1249)', () => {
+    // The sprite chip (or a search) lists sprites flat; expanding the `texture` group, which the chip hides,
+    // left the row unrendered and scrollIntoView found nothing.
+    const keys = revealKeysFor({ path: '/assets/textures/zombie/head.png#1234-guid', type: 'sprite' }, { spriteRow: true });
+    expect(keys).toEqual(['sprite', ASSETS_SECTION, '/assets', '/assets/textures', '/assets/textures/zombie', '/']);
+  });
 });

@@ -6,7 +6,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { healNativeConfig, androidSdkDirValue } from '../../plugins/healNativeConfig';
+import { healNativeConfig, androidSdkDirValue, injectedBuildNumbers, writeBuildNumberArgFiles } from '../../plugins/healNativeConfig';
+import {
+  ANDROID_BUILD_NUMBER_ARGS_PATH, IOS_BUILD_NUMBER_ARGS_PATH, ANDROID_VERSION_CODE_INIT_SCRIPT_PATH,
+  renderAndroidVersionCodeInitScript, gradleBuildNumberArg,
+} from '../../plugins/releaseBuild';
+import { loadProjectConfig } from '../../plugins/load-project-config';
 // Read the floors from the schema rather than hardcoding them: this file asserts the WIRING
 // (the default reaches the heal at all). The floor VALUES are pinned, deliberately and with
 // their rationale, in tests/architecture/buildTargetFloor.test.ts — duplicating them here
@@ -2229,13 +2234,31 @@ describe('healNativeConfig — orientation + status bar', () => {
       }
     }
 
-    it('derives the build number from the commit count', () => {
+    /** The whole of #1226. An auto number is the commit count, so writing it rewrote two committed
+     *  files on every build AND every project open. The heal leaves it alone; the marketing version,
+     *  which moves only with the config, is still synced. */
+    it('AUTO: the heal writes no build number, and still syncs the marketing version', () => {
+      writeNative();
+      gitRepoWithCommits(7);
+      writeCfg({ version: '2.4', buildNumber: 1, buildNumberAuto: true });
+      const r = healNativeConfig(root);
+      const g = fs.readFileSync(gradlePath(), 'utf8');
+      const x = fs.readFileSync(pbxPath(), 'utf8');
+      expect(g).toContain('versionCode 1\n');
+      expect(x).toContain('CURRENT_PROJECT_VERSION = 1;');
+      expect(g).toContain('versionName "2.4"');
+      expect(x).toContain('MARKETING_VERSION = 2.4;');
+      expect(r.notes.join(' ')).not.toContain('commit');
+    });
+
+    const inject = () => injectedBuildNumbers(root, loadProjectConfig(root));
+
+    it('derives the injected build number from the commit count, for both platforms', () => {
       writeNative();
       gitRepoWithCommits(7);
       writeCfg({ version: '1.0', buildNumber: 1, buildNumberAuto: true });
-      const r = healNativeConfig(root);
-      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 7');
-      expect(fs.readFileSync(pbxPath(), 'utf8')).toContain('CURRENT_PROJECT_VERSION = 7;');
+      const r = inject();
+      expect([r.android, r.ios]).toEqual([7, 7]);
       expect(r.notes.join(' ')).toContain('derived from git commit count');
     });
 
@@ -2243,27 +2266,68 @@ describe('healNativeConfig — orientation + status bar', () => {
       writeNative();
       gitRepoWithCommits(3);
       writeCfg({ version: '1.0', buildNumber: 10, buildNumberAuto: true });
-      const r = healNativeConfig(root);
-      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 10');
+      const r = inject();
+      expect(r.android).toBe(10);
       expect(r.notes.join(' ')).toContain('floor');
     });
 
-    it('the never-lower guard still wins over a derived number', () => {
-      // The native project already uploaded at 50; the repo only has 3 commits. Writing 3
-      // would be exactly the silent Play rejection this whole heal exists to prevent.
-      writeNative(GRADLE.replace('versionCode 1', 'versionCode 50'), PBX.replace('CURRENT_PROJECT_VERSION = 1;', 'CURRENT_PROJECT_VERSION = 50;'));
+    it('never injects below the committed value, per platform', () => {
+      // The native project was last built at 50 (Android) / 20 (iOS); the repo only has 30 commits.
+      // Handing gradle 30 would be exactly the silent Play rejection the never-lower guard exists for.
+      writeNative(GRADLE.replace('versionCode 1', 'versionCode 50'), PBX.replace('CURRENT_PROJECT_VERSION = 1;', 'CURRENT_PROJECT_VERSION = 20;'));
+      gitRepoWithCommits(30);
+      writeCfg({ version: '1.0', buildNumber: 1, buildNumberAuto: true });
+      const r = inject();
+      expect([r.android, r.ios]).toEqual([50, 30]);
+      // Advice about a platform's file goes to THAT platform's build only.
+      expect(r.platformNotes.android.join(' ')).toContain('building with Android versionCode 50, not 30');
+      expect(r.platformNotes.ios).toEqual([]);
+      expect(r.notes.join(' ')).not.toContain('versionCode');
+    });
+
+    it('passes no number for a platform whose value cannot be ordered', () => {
+      writeNative(GRADLE, PBX.replace('CURRENT_PROJECT_VERSION = 1;', 'CURRENT_PROJECT_VERSION = 1.2;'));
       gitRepoWithCommits(3);
       writeCfg({ version: '1.0', buildNumber: 1, buildNumberAuto: true });
-      const r = healNativeConfig(root);
-      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 50');
-      expect(r.notes.join(' ')).toContain('REFUSED to lower Android versionCode 50');
+      const r = inject();
+      expect(r.android).toBe(3);
+      expect(r.ios).toBeUndefined();
+      expect(r.platformNotes.ios.join(' ')).toContain('building with the committed iOS CURRENT_PROJECT_VERSION');
+    });
+
+    /** #1226 close-out. The route resolves the numbers BEFORE it auto-scaffolds a missing platform folder, so
+     *  a platform with no file yet must still get the number — or a fresh / re-scaffolded folder builds with
+     *  the template's `versionCode 1` while the log reports the derived count. */
+    it('passes the number for a platform whose native folder does not exist yet', () => {
+      gitRepoWithCommits(9);
+      writeCfg({ version: '1.0', buildNumber: 1, buildNumberAuto: true });
+      const r = inject(); // no android/ or ios/ at all
+      expect([r.android, r.ios]).toEqual([9, 9]);
+    });
+
+    it('writes the init script and one arguments file per platform folder present — empty when there is no number', () => {
+      writeNative(GRADLE, PBX.replace('CURRENT_PROJECT_VERSION = 1;', 'CURRENT_PROJECT_VERSION = 1.2;'));
+      gitRepoWithCommits(4);
+      writeCfg({ version: '1.0', buildNumber: 1, buildNumberAuto: true });
+      writeBuildNumberArgFiles(root, inject());
+      const read = (rel: string) => fs.readFileSync(path.join(root, rel), 'utf8');
+      expect(read(ANDROID_BUILD_NUMBER_ARGS_PATH)).toBe(`${gradleBuildNumberArg(4).trim()}\n`);
+      expect(read(ANDROID_VERSION_CODE_INIT_SCRIPT_PATH)).toBe(renderAndroidVersionCodeInitScript());
+      expect(read(IOS_BUILD_NUMBER_ARGS_PATH)).toBe('\n'); // the dotted 1.2 cannot be ordered → build uses the file's own
+    });
+
+    it('writes nothing for a platform folder that is absent', () => {
+      writeCfg({ version: '1.0', buildNumber: 5 });
+      writeBuildNumberArgFiles(root, { android: 5, ios: 5 });
+      expect(fs.existsSync(path.join(root, 'android'))).toBe(false);
+      expect(fs.existsSync(path.join(root, 'ios'))).toBe(false);
     });
 
     it('falls back to app.buildNumber (with a note) outside a git repo', () => {
       writeNative();
       writeCfg({ version: '1.0', buildNumber: 4, buildNumberAuto: true });
-      const r = healNativeConfig(root); // root is a bare tmpdir — no .git anywhere
-      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 4');
+      const r = inject(); // root is a bare tmpdir — no .git anywhere
+      expect(r.android).toBe(4);
       expect(r.notes.join(' ')).toContain('no commit count could be read');
     });
 
@@ -2274,19 +2338,20 @@ describe('healNativeConfig — orientation + status bar', () => {
       writeNative();
       gitRepoWithCommits(7);
       writeCfg({ version: '1.0', buildNumber: 7, buildNumberAuto: true });
-      const r = healNativeConfig(root);
-      expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 7');
+      const r = inject();
+      expect(r.android).toBe(7);
       expect(r.notes.join(' ')).toContain('floor');
       expect(r.notes.join(' ')).not.toContain('derived from git commit count');
     });
 
-    it('auto OFF (the default) passes the typed value straight through', () => {
+    it('auto OFF (the default): the heal writes the typed value, and the build is handed the same one', () => {
       writeNative();
       gitRepoWithCommits(30);
       writeCfg({ version: '1.0', buildNumber: 2 }); // no buildNumberAuto field at all
       const r = healNativeConfig(root);
       expect(fs.readFileSync(gradlePath(), 'utf8')).toContain('versionCode 2');
       expect(r.notes.join(' ')).not.toContain('commit');
+      expect([inject().android, inject().ios]).toEqual([2, 2]);
     });
   });
 

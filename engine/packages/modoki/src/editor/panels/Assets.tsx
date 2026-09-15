@@ -56,7 +56,7 @@ import {
 } from '../utils/assetPaths';
 import { ASSET_TYPE_COLORS, AssetTypeGlyph, compareAssetTypes } from './assetTypeIcons';
 import {
-  spritesByTexture as spritesByTextureOf, filterAssets, flatAssetTotal, groupByType, visibleOrder,
+  spritesByTexture as spritesByTextureOf, filterAssets, flatAssetTotal, fileActionTargets, groupByType, visibleOrder,
   ASSETS_SECTION, type ViewMode,
 } from './assetListing';
 import { resolveAssetKey } from './assetKeyCommands';
@@ -754,7 +754,7 @@ export default function Assets() {
     }
     if (plan.expand) {
       setExpanded((prev) => {
-        const keys = revealKeysFor(selectedAsset);
+        const keys = revealKeysFor(selectedAsset, { spriteRow: filtered.some((a) => a.path === selectedAsset.path) });
         if (keys.every((k) => prev.has(k))) return prev;
         const next = new Set(prev);
         for (const k of keys) next.add(k);
@@ -1234,11 +1234,12 @@ export default function Assets() {
   }, [assets, collectDeletion, pushDeleteUndo, clearSelection, refresh]);
 
   // The AssetEntry objects currently selected (falls back to the active item).
+  // Sprites are dropped — they have no file to act on (fileActionTargets, assetListing.ts).
   const selectedAssets = useCallback((): AssetEntry[] => {
     const inSel = assets.filter((a) => selection.has(a.path));
-    if (inSel.length) return inSel;
+    if (inSel.length) return fileActionTargets(inSel);
     const a = assets.find((x) => x.path === selected);
-    return a ? [a] : [];
+    return a ? fileActionTargets([a]) : [];
   }, [assets, selection, selected]);
 
   const deleteSelection = useCallback(async () => {
@@ -1615,13 +1616,13 @@ export default function Assets() {
     });
   }, []);
 
-  // Sliced sprites are nested UNDER their source texture (Unity-style sub-assets),
-  // not shown as standalone rows — index them by parent texture GUID.
+  // Sliced sprites are nested UNDER their source texture (Unity-style sub-assets) —
+  // index them by parent texture GUID — unless the `sprite` chip makes them rows (#1249).
   // The list-shaping decisions live in assetListing.ts (#105 Phase 3) — pure, and
   // unit-tested there rather than only through e2e.
-  const spritesByTexture = useMemo(() => spritesByTextureOf(assets), [assets]);
+  const spritesByTexture = useMemo(() => spritesByTextureOf(assets, typeFilter), [assets, typeFilter]);
   const filtered = useMemo(() => filterAssets(assets, filter, typeFilter), [assets, filter, typeFilter]);
-  const flatTotal = useMemo(() => flatAssetTotal(assets), [assets]);
+  const flatTotal = useMemo(() => flatAssetTotal(assets, filter, typeFilter), [assets, filter, typeFilter]);
   const grouped = useMemo(() => groupByType(filtered), [filtered]);
 
   // Folder view: build tree (seeded with empty pending folders)

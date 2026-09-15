@@ -63,7 +63,7 @@ export {
   captureInstanceOverrides, applyOverridesByRootInstance,
   applyToPrefab, applyToPrefabSelective,
   revertOverridesSelective, rebuildInstance,
-  writePrefabFile, resolveExistingPrefabId,
+  writePrefabFile, warnInertPrefabSizes, resolveExistingPrefabId,
   tagEntityTreeAsInstance, untagEntityTreeAsInstance,
   detachPrefabInstance, reattachPrefabInstance,
   captureInstanceStructure, resolveInstanceContext,

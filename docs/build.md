@@ -2551,7 +2551,7 @@ well-known dirs and completes ("✅ deployed successfully").
 MODOKI_PROJECT=games/<id> npm run build -- --target native
 (cd games/<id> && npx cap sync ios)
 xcodebuild -project games/<id>/ios/App/App.xcodeproj -scheme App -configuration Debug \
-  -sdk iphonesimulator -destination 'id=<SIM_UDID>' build
+  -sdk iphonesimulator -destination 'id=<SIM_UDID>' build $(cat games/<id>/ios/App/build/modoki-build-number.args)
 xcrun simctl boot <SIM_UDID>
 xcrun simctl install booted <path-to-App.app>
 xcrun simctl launch booted <appId>
@@ -2562,7 +2562,7 @@ xcrun simctl launch booted <appId>
 MODOKI_PROJECT=games/<id> npm run build -- --target native
 (cd games/<id> && npx cap sync ios)
 xcodebuild -project games/<id>/ios/App/App.xcodeproj -scheme App -configuration Debug \
-  -destination 'id=<DEVICE_UDID>' -allowProvisioningUpdates build
+  -destination 'id=<DEVICE_UDID>' -allowProvisioningUpdates build $(cat games/<id>/ios/App/build/modoki-build-number.args)
 xcrun devicectl device install app --device <DEVICE_ID> \
   ~/Library/Developer/Xcode/DerivedData/App-*/Build/Products/Debug-iphoneos/App.app
 xcrun devicectl device process launch --device <DEVICE_ID> <appId>
@@ -2583,7 +2583,7 @@ see "Hands-free install (go-ios)" below. The manual equivalent is shorter than l
 
 ```bash
 xcodebuild -project games/<id>/ios/App/App.xcodeproj -scheme App -configuration Debug \
-  -destination 'id=<UDID>' -allowProvisioningUpdates -derivedDataPath /tmp/<id>-dd build
+  -destination 'id=<UDID>' -allowProvisioningUpdates -derivedDataPath /tmp/<id>-dd build $(cat games/<id>/ios/App/build/modoki-build-number.args)
 ios install --path=/tmp/<id>-dd/Build/Products/Debug-iphoneos/App.app --udid=<UDID>
 ios launch <appId> --udid=<UDID>
 ```
@@ -2677,7 +2677,7 @@ class (an iPhone 7) that took a development-signed build with **no Xcode run at 
 ```bash
 idevice_id -l                                   # the UDID; xcrun xctrace also lists 16.x devices
 xcodebuild -project games/<id>/ios/App/App.xcodeproj -scheme App -configuration Debug \
-  -destination 'id=<UDID>' -allowProvisioningUpdates -derivedDataPath /tmp/court-dd build
+  -destination 'id=<UDID>' -allowProvisioningUpdates -derivedDataPath /tmp/court-dd build $(cat games/<id>/ios/App/build/modoki-build-number.args)
 mkdir -p /tmp/ipa/Payload && cp -R /tmp/court-dd/Build/Products/Debug-iphoneos/App.app /tmp/ipa/Payload/
 (cd /tmp/ipa && zip -qry app.ipa Payload)
 ideviceinstaller -u <UDID> install /tmp/ipa/app.ipa
@@ -2771,7 +2771,7 @@ when you want the loop hands-free on such a device.
 MODOKI_PROJECT=games/<id> npm run build -- --target native
 (cd games/<id> && npx cap sync android)
 eval "$(node engine/scripts/print-toolchain-env.mjs)"   # JAVA_HOME + ANDROID_HOME, resolved as the editor does
-games/<id>/android/gradlew -p games/<id>/android assembleDebug
+games/<id>/android/gradlew -p games/<id>/android assembleDebug $(cat games/<id>/android/.gradle/modoki-build-number.args)   # build number, #1226
 adb install games/<id>/android/app/build/outputs/apk/debug/app-debug.apk
 adb shell am start -n <appId>/.MainActivity
 ```
@@ -2866,19 +2866,17 @@ once, and why it reads the **highest** of a file's occurrences: a pbxproj carrie
 configuration, and a Debug left at 1 must not authorise lowering a Release at 11.
 
 **Auto-increment is deliberately not offered.** A build number that changes itself makes builds
-non-reproducible and churns a committed file on every build (the write-behind-your-back hazard in
-CLAUDE.md). The owner bumps it, in the same change as the native edit it ships — a native change
-that is not bumped never reaches the device.
+non-reproducible. The owner bumps it, in the same change as the native edit it ships — a native
+change that is not bumped never reaches the device.
 
 ### `app.buildNumberAuto` — derive it from the commit count (2026-08-25)
 
 Hand-bumping per upload is exactly the chore this checkbox removes. With **Auto build number**
 checked in Project Settings (General → App Identity), the typed `app.buildNumber` is IGNORED and
 the effective number is derived from `git rev-list --count HEAD` of the project's repo at every
-open/build, with the typed value kept as a **FLOOR** (`max` of the two) — so a store-forced jump
+native build, with the typed value kept as a **FLOOR** (`max` of the two) — so a store-forced jump
 typed by hand still wins, and the never-lower guard keeps its role as the last line of defence
-either way. The native files always see ONE resolved number; how it was derived never leaks into
-them.
+either way.
 
 ⚠️ **Typing that floor means unchecking Auto first.** `app.buildNumber`'s input carries
 `disabledIf: { key: 'app.buildNumberAuto', is: 'true' }`, which is a real native `disabled` — not
@@ -2889,22 +2887,44 @@ it never could, and the help text added in the same commit contradicted it.) The
 round-trip because `buildNumber` is stored independently of `buildNumberAuto` — that is precisely
 why the field is greyed out rather than hidden.
 
-Two known wrinkles, both absorbed by the floor + never-lower pair rather than by cleverness:
-commit counts differ between clones (`main` vs a worker branch), and the count is shared by every
-game in the repo. Only store uploads care about the absolute value, and only monotonicity matters
-there. A project copied OUT of its repo (no git) falls back to `app.buildNumber` with a note.
+Two known wrinkles: commit counts differ between clones (`main` vs a worker branch), and the count
+is shared by every game in the repo. Only store uploads care about the absolute value, and only
+monotonicity matters there. ⚠️ **Since #1226 nothing catches the first one** — see the floor below:
+a `release_*` hotfix or a worker clone at count 10302, after `main` uploaded 10500, is handed 10302
+and refused silently by the store. Upload from one line of history. A project copied OUT of its repo (no git) falls back to `app.buildNumber` with a note.
 
-⚠️ **Auto mode re-introduces committed-file churn on purpose.** The rationale above rejects a
-self-incrementing build number because it churns committed native files on every build — auto does
-exactly that (the count moves with every merged commit, so whichever clone builds first rewrites
-`versionCode`/`CURRENT_PROJECT_VERSION`). That is accepted noise here, not an accident: the churn
-is the number staying TRUE instead of drifting stale, and merge conflicts from two concurrent
-builds resolve to the higher value either way. The #18 rule still applies — don't sweep these into
-unrelated commits.
-⚠️ **"On every build" undersells when it fires: a plain `launch-editor.sh games/<id>` is enough.**
-Observed 2026-09-07 on `games/court` — launching the editor with no game build requested rewrote
-`versionCode` 6106 → 7173 and both `CURRENT_PROJECT_VERSION`s with it. Nothing is wrong when you
-see that diff after a read-only editor session; revert it rather than hunting it.
+⚠️ **An auto number is handed to the build, never written into a committed file (#1226,
+2026-09-15).** It used to be: the heal wrote it into `versionCode` / both `CURRENT_PROJECT_VERSION`s
+on every build AND every project open (a plain `launch-editor.sh games/court` rewrote 6106 → 7173,
+2026-09-07), because the count moves with nearly every commit. Measured before the change, one
+`build --target native` of `games/court` modified exactly those two files and nothing else. Now:
+- **The heal writes the number only in MANUAL mode**, where it changes only when the owner types a
+  new one (owner, 2026-09-15). The marketing version is synced in both modes.
+- **`/api/build` resolves the number once** (`injectedBuildNumbers`: the commit count, the floor, and
+  never below the value the committed file already carries). ⚠️ That last floor is much WEAKER than
+  the never-lower guard it replaces: nothing raises the committed value in auto mode any more, so it
+  is frozen at the last committed number and only catches a count below THAT. No high-water mark of
+  uploaded numbers exists anywhere. The route passes the number to all four compiles:
+  `CURRENT_PROJECT_VERSION=N` to the xcodebuild debug `build` and the release `archive`, and
+  `-PmodokiVersionCode=N --init-script .gradle/modoki-version-code.init.gradle` to gradle debug and
+  release. The export takes none — it does not compile, and `manageAppVersionAndBuildNumber` stays
+  pinned off, so it ships the archive's value.
+- ⚠️ **Not `-Pandroid.injected.version.code`.** AGP's own property looks like exactly this and is
+  ignored on a command-line build: with it set to 424242, AGP 8.13 produced an APK and a bundle
+  manifest still at the committed 10125. The init script (written per build into the gitignored
+  `android/.gradle/` by `renderAndroidVersionCodeInitScript`) sets each application variant's output
+  `versionCode` through `androidComponents.onVariants`, and produced 424242 in both. The xcodebuild
+  override gave `CFBundleVersion` 424242 in a simulator build. Both runs left `git status` clean.
+- **Hand-run builds read it from a file.** `build --target native` writes
+  `android/.gradle/modoki-build-number.args` and `ios/App/build/modoki-build-number.args` (both
+  gitignored; `writeBuildNumberArgFiles`), and the CLI recipes above append
+  `$(cat games/<id>/android/.gradle/modoki-build-number.args)` to gradle and the iOS twin to
+  xcodebuild. ⚠️ **Not optional on Android:** without it a hand-run APK carries the frozen committed
+  versionCode, and installing it over an editor build fails with `INSTALL_FAILED_VERSION_DOWNGRADE`.
+  Recover with `adb install -r -d` (a debug APK may downgrade) — never an uninstall, which destroys
+  the app's data.
+- **The accepted cost:** an archive made directly in Xcode or Android Studio ships the stale committed
+  number. Store builds go through **Build → iOS/Android Release**.
 
 The defaults (`"1.0"` / `1`) are exactly what `cap add` scaffolds, so adopting these fields rewrote
 nothing: running the heal across all 20 projects touched **one file**, `games/iap-test`'s pbxproj,
@@ -3024,8 +3044,6 @@ git checkout -- games/<id>/project.config.json games/<id>/android/variables.grad
 
 ⚠️ **Revert before committing anything.** Verified working 2026-08-12: `games/sling` installed and
 ran on the Y6 at API 28, and produced a probe-vs-identity A/B that nothing else could.
-⚠️ `npx cap sync android` also rewrites the **#206** escaping `@capacitor/haptics` gradle path on
-every run — revert that too (`git status` after every build).
 
 ### iOS (iPhone 7 — iOS 15.x max)
 

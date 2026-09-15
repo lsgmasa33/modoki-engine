@@ -274,12 +274,31 @@ async function healNativeProject() {
       }
     },
   });
-  if (result.ok) return;
+  if (result.ok) {
+    await writeBuildNumberArgs(projectRoot);
+    return;
+  }
   // No `[build-web]` prefix on these: the top-level `catch` adds it to every in-process throw.
   if (result.reason === 'stale-node-modules') throw new Error(result.lines.join('\n'));
   if (result.reason === 'facebook-sdk-manifest') throw new Error(result.lines.join('\n'));
   if (result.reason === 'install-failed') throw new Error(`npm install (${result.why}) failed in ${projectRoot} — not building.`);
   throw new Error(result.message);
+}
+
+/** #1226: an AUTO build number is no longer written into build.gradle / project.pbxproj, so a hand-run
+ *  gradle or xcodebuild after this script must be handed it — the recipes in docs/build.md append
+ *  `$(cat <project>/android/.gradle/modoki-build-number.args)` (or the iOS twin). This writes those files
+ *  with the number the editor's own build would pass; without it a hand-run debug APK carries the frozen
+ *  committed versionCode and fails to install over an editor build (INSTALL_FAILED_VERSION_DOWNGRADE).
+ *  Same esbuild-less degradation as the heal above: in a packaged editor the route wrote them already. */
+async function writeBuildNumberArgs(projectRoot) {
+  const { module: mod } = await loadEnginePluginModuleResult(repoRoot, path.join('plugins', 'healNativeConfig.ts'));
+  const { module: cfgMod } = await loadEnginePluginModuleResult(repoRoot, path.join('plugins', 'load-project-config.ts'));
+  if (!mod || !cfgMod) return;
+  const numbers = mod.injectedBuildNumbers(projectRoot, cfgMod.loadProjectConfig(projectRoot));
+  mod.writeBuildNumberArgFiles(projectRoot, numbers);
+  for (const n of [...numbers.notes, ...numbers.platformNotes.android, ...numbers.platformNotes.ios]) console.log(`[build-web] ${n}`);
+  console.log(`[build-web] build number for a hand-run native build: android=${numbers.android ?? '(committed)'} ios=${numbers.ios ?? '(committed)'} — append $(cat android/.gradle/modoki-build-number.args) to gradlew, $(cat ios/App/build/modoki-build-number.args) to xcodebuild`);
 }
 
 const tscBin = path.join(repoRoot, 'node_modules', 'typescript', 'bin', 'tsc');

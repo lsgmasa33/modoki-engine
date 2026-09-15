@@ -21,6 +21,10 @@ import { spawnSync } from 'node:child_process';
 import { loadProjectConfig } from './load-project-config';
 import { detect as detectTool } from '../toolchain';
 import type { ProjectConfig } from '../project-config';
+import {
+  ANDROID_VERSION_CODE_INIT_SCRIPT_PATH, ANDROID_BUILD_NUMBER_ARGS_PATH, IOS_BUILD_NUMBER_ARGS_PATH,
+  renderAndroidVersionCodeInitScript, gradleBuildNumberArg, xcodeBuildNumberArg,
+} from './releaseBuild';
 
 export interface HealResult {
   /** Human-readable notes on what was healed (for the console / status). */
@@ -1892,7 +1896,8 @@ function decideBuildWrite(
   return { write: true };
 }
 
-/** Resolve the effective build number this heal pass writes to the native files.
+/** Resolve the effective build number — written to the native files by the heal in manual mode, and
+ *  handed to every native build on the command line in both modes ({@link injectedBuildNumbers}).
  *
  *  With `app.buildNumberAuto` FALSE, `app.buildNumber` passes straight through. TRUE — the
  *  "Auto" checkbox — the typed value is IGNORED and the number is derived from
@@ -1928,6 +1933,83 @@ export function resolveBuildNumber(projectRoot: string, cfg: ProjectConfig): { v
     return { value: floor, note: `build number ${floor} = app.buildNumber floor (git reports ${count} commits)` };
   }
   return { value: count, note: `build number ${count} derived from git commit count` };
+}
+
+/** The build number each platform's native build is handed on the command line (#1226) —
+ *  `CURRENT_PROJECT_VERSION=N` to xcodebuild, `-PmodokiVersionCode=N` + an init script to gradle
+ *  (`xcodeBuildNumberArg` / `gradleBuildNumberArg` in releaseBuild.ts, which say why not AGP's own
+ *  `android.injected.version.code`) — so a build never has to write it into a committed file.
+ *
+ *  The number is {@link resolveBuildNumber}'s, raised to the value the committed file already carries
+ *  when that is higher. ⚠️ That floor is WEAKER than the never-lower guard the heal applied when it
+ *  still wrote the number: in auto mode nothing raises the committed value any more, so it is frozen
+ *  at whatever was last committed, and it catches only a count below THAT — not a build from a
+ *  branch or clone whose count is below a number already uploaded from another. A platform whose
+ *  file is absent still gets the number: the build scaffolds the folder before it compiles, and a
+ *  template's `1` is nothing to protect. A value that cannot be ordered gets none (with a note), so
+ *  the build falls back to the file's own value rather than overriding it blindly.
+ *
+ *  `notes` are shared; `platformNotes` belong to one platform's build, so an Android build does not
+ *  print advice about the iOS file. */
+export function injectedBuildNumbers(
+  projectRoot: string,
+  cfg: ProjectConfig,
+): { android?: number; ios?: number; notes: string[]; platformNotes: { android: string[]; ios: string[] } } {
+  const bn = resolveBuildNumber(projectRoot, cfg);
+  const out: ReturnType<typeof injectedBuildNumbers> = {
+    notes: bn.note ? [bn.note] : [],
+    platformNotes: { android: [], ios: [] },
+  };
+  if (!isBuildNumber(bn.value)) return out;
+  const platforms = [
+    { key: 'android', file: path.join(projectRoot, 'android', 'app', 'build.gradle'), re: /versionCode(?:\s*=\s*|\s+)([0-9.]+)/g, name: 'versionCode', label: 'Android versionCode', store: 'Play' },
+    { key: 'ios', file: path.join(projectRoot, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj'), re: /CURRENT_PROJECT_VERSION = ([0-9.]+);/g, name: 'CURRENT_PROJECT_VERSION', label: 'iOS CURRENT_PROJECT_VERSION', store: 'App Store Connect' },
+  ] as const;
+  for (const p of platforms) {
+    const notes = out.platformNotes[p.key];
+    const existing = fs.existsSync(p.file)
+      ? readExistingBuild(fs.readFileSync(p.file, 'utf8'), p.re, p.name)
+      : { kind: 'none' as const };
+    if (existing.kind === 'unreadable') {
+      notes.push(`building with the committed ${p.label}: ${existing.why}, so no build number is passed to override it`);
+      continue;
+    }
+    if (existing.kind === 'ok' && existing.max > bn.value) {
+      notes.push(
+        `building with ${p.label} ${existing.max}, not ${bn.value}: the committed value is higher and ${p.store} ` +
+        `rejects a build number it has already seen. Raise app.buildNumber to at least ${existing.max + 1} before the next upload.`,
+      );
+      out[p.key] = existing.max;
+      continue;
+    }
+    out[p.key] = bn.value;
+  }
+  return out;
+}
+
+/** Write what a native build needs to carry {@link injectedBuildNumbers} into its compile, for every
+ *  platform folder present: the gradle init script, plus one arguments file per platform that a
+ *  hand-run build reads — `gradlew … assembleDebug $(cat android/.gradle/modoki-build-number.args)`.
+ *  Both locations are gitignored, so the build still leaves `git status` clean.
+ *
+ *  ⚠️ **The arguments files are not optional for the terminal recipes (#1226 close-out).** Before
+ *  #1226 `build --target native` wrote the commit count into build.gradle, so a hand-run gradle and
+ *  the editor's build agreed. Without it a hand-run build uses the frozen committed number, and
+ *  installing it over an editor build fails with INSTALL_FAILED_VERSION_DOWNGRADE (`adb install -r -d`
+ *  recovers a debug APK without the uninstall that would destroy the app's data). An empty file (no number) means "use the committed
+ *  value". Called by the `/api/build` route and by `build-web.mjs --target native`. */
+export function writeBuildNumberArgFiles(projectRoot: string, numbers: { android?: number; ios?: number }): void {
+  if (fs.existsSync(path.join(projectRoot, 'android'))) {
+    const init = path.join(projectRoot, ANDROID_VERSION_CODE_INIT_SCRIPT_PATH);
+    fs.mkdirSync(path.dirname(init), { recursive: true });
+    fs.writeFileSync(init, renderAndroidVersionCodeInitScript());
+    fs.writeFileSync(path.join(projectRoot, ANDROID_BUILD_NUMBER_ARGS_PATH), gradleBuildNumberArg(numbers.android).trim() + '\n');
+  }
+  if (fs.existsSync(path.join(projectRoot, 'ios'))) {
+    const args = path.join(projectRoot, IOS_BUILD_NUMBER_ARGS_PATH);
+    fs.mkdirSync(path.dirname(args), { recursive: true });
+    fs.writeFileSync(args, xcodeBuildNumberArg(numbers.ios).trim() + '\n');
+  }
 }
 
 /** The bundle id a config may legally contribute to native files — same shape rule as
@@ -2433,13 +2515,18 @@ export function healNativeConfig(projectRoot: string): HealResult {
     if (ams) notes.push(ams);
     // App version + build number → both platforms' native version fields (#199). Nothing
     // managed these before, so every project shipped the scaffolder's hardcoded 1 — and a
-    // duplicate build number is refused SILENTLY by both stores. `buildNumberAuto` decides
-    // whether the number comes from the typed field or the repo's commit count.
-    const bn = resolveBuildNumber(projectRoot, cfg);
-    if (bn.note) notes.push(bn.note);
-    const av = healAndroidVersion(projectRoot, cfg.app.version, bn.value);
+    // duplicate build number is refused SILENTLY by both stores.
+    //
+    // ⚠️ The build number is written ONLY in manual mode (#1226). An AUTO number is the commit
+    // count, which moves with nearly every commit, so writing it here rewrote two committed files
+    // on every build AND every project open. The build hands it to xcodebuild/gradle on the command
+    // line instead (`injectedBuildNumbers`); the committed value stays whatever it last was, and only
+    // a direct Xcode / Android Studio archive reads it. The marketing version is still synced in both
+    // modes — it changes only when `app.version` does.
+    const managedBuild = cfg.app.buildNumberAuto ? undefined : cfg.app.buildNumber;
+    const av = healAndroidVersion(projectRoot, cfg.app.version, managedBuild);
     if (av) notes.push(av);
-    const iv = healIosVersion(projectRoot, cfg.app.version, bn.value);
+    const iv = healIosVersion(projectRoot, cfg.app.version, managedBuild);
     if (iv) notes.push(iv);
     // App identity → EVERY native file that carries it. Write-once at `cap add` before this:
     // changing Project Settings afterwards silently changed nothing anywhere.

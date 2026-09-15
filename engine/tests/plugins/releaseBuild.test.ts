@@ -15,6 +15,8 @@ import { spawnSync } from 'node:child_process';
 import {
   parseBuildVariant, keystoreRefusal, renderKeystoreProperties, renderExportOptionsPlist,
   androidReleaseSteps, iosReleaseSteps, debugBuildReleaseWarning,
+  iosDebugBuildStep, androidDebugBuildStep, xcodeBuildNumberArg, gradleBuildNumberArg,
+  renderAndroidVersionCodeInitScript, ANDROID_VERSION_CODE_INIT_SCRIPT_PATH, ANDROID_BUILD_NUMBER_ARGS_PATH, IOS_BUILD_NUMBER_ARGS_PATH,
   BUILD_VARIANTS, IOS_EXPORT_METHODS,
   ANDROID_AAB_PATH, ANDROID_RELEASE_APK_PATH, IOS_ARCHIVE_PATH, IOS_EXPORT_DIR, IOS_EXPORT_OPTIONS_PATH,
 } from '../../plugins/releaseBuild';
@@ -203,7 +205,7 @@ describe('renderExportOptionsPlist', () => {
 });
 
 describe('androidReleaseSteps', () => {
-  const steps = androidReleaseSteps({ androidCwd: '/p', buildCwd: '/r', env: { JAVA_HOME: '/jdk' }, ota: false });
+  const steps = androidReleaseSteps({ androidCwd: '/p', buildCwd: '/r', env: { JAVA_HOME: '/jdk' }, ota: false, buildNumber: undefined });
 
   it('builds the AAB *and* a release-signed APK in one gradle run', () => {
     // The APK is not redundant: it is the only way to `adb install` and actually TEST the release
@@ -237,13 +239,13 @@ describe('androidReleaseSteps', () => {
 
   it('cleans first only for an OTA project (the asset-merge staleness gotcha)', () => {
     expect(steps[0].cmd).not.toContain('clean');
-    const ota = androidReleaseSteps({ androidCwd: '/p', buildCwd: '/r', env: {}, ota: true });
+    const ota = androidReleaseSteps({ androidCwd: '/p', buildCwd: '/r', env: {}, ota: true, buildNumber: undefined });
     expect(ota[0].cmd).toContain('clean');
   });
 });
 
 describe('iosReleaseSteps', () => {
-  const steps = iosReleaseSteps({ iosCwd: '/p', iosXcodeTarget: '-project ios/App/App.xcodeproj' });
+  const steps = iosReleaseSteps({ iosCwd: '/p', iosXcodeTarget: '-project ios/App/App.xcodeproj', buildNumber: undefined });
 
   it('CLEARS the previous archive + export before archiving', () => {
     // Nothing else does. `-exportArchive` refuses a non-empty exportPath, and a failed export after
@@ -288,8 +290,62 @@ describe('iosReleaseSteps', () => {
   });
 
   it('honours an xcworkspace target (a CocoaPods project) unchanged', () => {
-    const ws = iosReleaseSteps({ iosCwd: '/p', iosXcodeTarget: '-workspace ios/App/App.xcworkspace' });
+    const ws = iosReleaseSteps({ iosCwd: '/p', iosXcodeTarget: '-workspace ios/App/App.xcworkspace', buildNumber: undefined });
     expect(ws[1].cmd).toContain('-workspace ios/App/App.xcworkspace');
+  });
+});
+
+/** #1226: the build number reaches every native compile on the command line, so no build writes it
+ *  into a committed file. Four compiles — debug and release on each platform — and a gradle `winCmd`
+ *  beside each POSIX one; the variant nobody checks is the one that would ship the committed number. */
+describe('build number injection (#1226)', () => {
+  const GRADLE_ARG = ' -PmodokiVersionCode=42 --init-script .gradle/modoki-version-code.init.gradle';
+
+  it('an injectable number becomes the argument; anything else passes none, so the committed value is used', () => {
+    expect(xcodeBuildNumberArg(42)).toBe(' CURRENT_PROJECT_VERSION=42');
+    expect(gradleBuildNumberArg(42)).toBe(GRADLE_ARG);
+    for (const n of [undefined, 0, -3, 1.5, Number.NaN, 2_100_000_000]) {
+      expect(xcodeBuildNumberArg(n), String(n)).toBe('');
+      expect(gradleBuildNumberArg(n), String(n)).toBe('');
+    }
+  });
+
+  it('every compile carries it: both platforms, debug and release, POSIX and Windows', () => {
+    const iosDebug = iosDebugBuildStep({ iosCwd: '/p', iosXcodeTarget: '-project ios/App/App.xcodeproj', deviceId: 'D', buildNumber: 42 });
+    const iosRelease = iosReleaseSteps({ iosCwd: '/p', iosXcodeTarget: '-project ios/App/App.xcodeproj', buildNumber: 42 });
+    const androidDebug = androidDebugBuildStep({ androidCwd: '/p', env: {}, ota: true, buildNumber: 42 });
+    const androidRelease = androidReleaseSteps({ androidCwd: '/p', buildCwd: '/r', env: {}, ota: false, buildNumber: 42 });
+    expect(iosDebug.cmd).toMatch(/ build CURRENT_PROJECT_VERSION=42$/);
+    expect(iosRelease[1].cmd).toMatch(/ archive CURRENT_PROJECT_VERSION=42$/);
+    for (const s of [androidDebug, androidRelease[0]]) {
+      expect(s.cmd?.endsWith(GRADLE_ARG), s.label).toBe(true);
+      expect(s.winCmd?.endsWith(GRADLE_ARG), s.label).toBe(true);
+    }
+    expect(androidDebug.cmd).toContain('clean assembleDebug');
+  });
+
+  it('the export takes no number — it does not compile, and ships the archive\'s own value', () => {
+    const steps = iosReleaseSteps({ iosCwd: '/p', iosXcodeTarget: '-project ios/App/App.xcodeproj', buildNumber: 42 });
+    expect(steps[2].cmd).toContain('-exportArchive');
+    expect(steps[2].cmd).not.toContain('CURRENT_PROJECT_VERSION');
+    // Which is only true while Xcode is told not to manage the number at export.
+    expect(renderExportOptionsPlist({ teamId: 'X', method: 'app-store-connect' })).toContain('<key>manageAppVersionAndBuildNumber</key>\n\t<false/>');
+  });
+
+  it('the init script gradle is pointed at is the one the build writes, and reads the property the argument sets', () => {
+    // gradle resolves --init-script against `-p android`, so the argument is the path relative to android/.
+    const named = gradleBuildNumberArg(42).match(/--init-script (\S+)/)![1];
+    expect(path.posix.join('android', named)).toBe(ANDROID_VERSION_CODE_INIT_SCRIPT_PATH);
+    const property = gradleBuildNumberArg(42).match(/-P(\w+)=42/)![1];
+    expect(renderAndroidVersionCodeInitScript()).toContain(`projectProperties['${property}']`);
+  });
+
+  it('keeps the generated files under folders the Capacitor templates gitignore (the ignore rules themselves are not read here)', () => {
+    // `android/.gradle/` and `ios/App/build/` are ignored by every games/*/android|ios .gitignore today (checked by hand,
+    // 2026-09-15); games/ is absent from the public snapshot, so this suite cannot read them.
+    expect(ANDROID_VERSION_CODE_INIT_SCRIPT_PATH.startsWith('android/.gradle/')).toBe(true);
+    expect(ANDROID_BUILD_NUMBER_ARGS_PATH.startsWith('android/.gradle/')).toBe(true);
+    expect(IOS_BUILD_NUMBER_ARGS_PATH.startsWith('ios/App/build/')).toBe(true);
   });
 });
 
