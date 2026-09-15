@@ -87,7 +87,7 @@ export const ads = {
 
 /**
  * Auth — a no-op namespace, mirroring `export * as auth from './auth'` in Court's package
- * (#359/#360).
+ * (#359/#360) and Wordweave's port of it (#927).
  *
  * ⚠️ Like `ads` above, the no-op is REQUIRED rather than merely a size saving, and for a sharper
  * reason. A playable ad is a few seconds inside somebody else's ad slot: it has no Firebase app, no
