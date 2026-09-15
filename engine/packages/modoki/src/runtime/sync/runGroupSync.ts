@@ -21,10 +21,15 @@ export type GroupOutcome =
    *  caller must know this write also changed the device's content, not just its marks. */
   | { kind: 'uploaded'; version: number; replacedLocal?: true }
   | { kind: 'adopted'; version: number }
-  /** The saves have forked and `onFork` is `'ask'`. Nothing is written — the caller resolves via
-   *  `resolveGroupFork` once the player answers. */
+  /** The saves have forked, their contents DIFFER, and `onFork` is `'ask'`. Nothing is written — the
+   *  caller resolves via `resolveGroupFork` once the player answers. (An equal-content fork never asks —
+   *  #1253, see the fork branch in `runGroupSync`.) */
   | { kind: 'fork'; local: LocalGroup<never>; server: CloudGroup<never> }
   | { kind: 'failed'; reason: string }
+  /** This device had synced the group, its document is gone, and `GroupTransport.confirmAccount` says the
+   *  account itself was deleted — on another device. Nothing is written; what happens to the local save is
+   *  the game's call. `runCloudSync` stops at the first one. */
+  | { kind: 'account-gone' }
   /** `resolveGroupFork`'s push lost a race — the server moved again while the player was deciding.
    *  The caller must re-run a full `runGroupSync`/`runCloudSync` pass for this group rather than treat it
    *  as a plain failure; see `resolveFork.ts`'s docblock for why a bare `'conflict'` is not enough. */
@@ -146,6 +151,16 @@ function localMovedUnderUs(group: AnySyncGroup, established: boolean, seen: stri
   return group.fingerprint(group.store.read().content) !== seen;
 }
 
+/** `transport.confirmAccount`, with a throw read as `'unknown'` — never `'gone'`, which wipes a save. An answer
+ *  outside the contract needs no mapping: the caller acts only on exactly `'gone'` or `'exists'`. */
+async function askAccount(transport: GroupTransport, uid: string): Promise<'exists' | 'gone' | 'unknown'> {
+  try {
+    return await transport.confirmAccount!(uid);
+  } catch {
+    return 'unknown';
+  }
+}
+
 /** Re-read the store and re-scope its marks — the state a pass restarts from. */
 function readScoped(group: AnySyncGroup, uid: string): { local: LocalGroup<never>; seen: string } {
   const fresh = group.store.read();
@@ -195,6 +210,14 @@ export async function runGroupSync(
 
     if (decision.action === 'none') return { kind: 'idle' };
 
+    // ⚠️ A MISSING document on a lineage this device has exchanged is not a new account — something deleted
+    // it. Ask before recreating: see `GroupTransport.confirmAccount` for the two-device deletion this stops.
+    if (decision.action === 'create' && local.marks.lastSyncedVersion > 0 && transport.confirmAccount) {
+      const status = await askAccount(transport, opts.uid);
+      if (status === 'gone') return { kind: 'account-gone' };
+      if (status !== 'exists') return { kind: 'failed', reason: 'document missing and the account could not be confirmed' };
+    }
+
     if (decision.action === 'take-server') {
       // ⚠️ A content-REPLACING outcome, so re-check the store before acting on a decision made
       // against a read that is now two network round trips old — see `localMovedUnderUs`.
@@ -213,10 +236,33 @@ export async function runGroupSync(
     }
 
     if (decision.action === 'fork') {
-      if (group.onFork === 'ask') {
-        return { kind: 'fork', local, server: server as CloudGroup<never> };
-      }
       const s = server as CloudGroup<never>;
+      // ⚠️ **A fork whose two sides hold the SAME content is not a question (#1253).** `decideGroup`
+      // calls it a fork on versions and marks alone — this device wrote, the server moved — and never
+      // compares what the two sides hold. Two phones opened on the same day both raise a date floor to
+      // the same date, which is exactly that: a "choose which save to keep" dialog with two identical
+      // rows. Nothing is lost whichever side wins, so it resolves as the policy path below does with
+      // the SERVER chosen: through `merge` (a fork, so unioned fields are kept — see the ⚠️ there) and,
+      // since the merge then teaches the server nothing, an adopt at its version with no upload.
+      // Deliberately NOT fixed by dropping such fields from a game's fingerprint: a field that only
+      // rises must still sync.
+      //
+      // ⚠️ **Compared against what the STORE holds, never against `local`.** `local` goes synthetic
+      // after an adopt that owed an upload (its content is the adopt's result), so a push that lost a
+      // race re-enters here holding content equal to the server's while the device holds a game write
+      // that landed during the round trip — the fork the player must be asked about. The re-check on
+      // the adopt below does not rescue that: it re-reads and re-decides, and the attempt bound turns
+      // the real question into a silent `failed`.
+      //
+      // ⚠️ **And the fork CARRIES that fresh read, never `local`** (#679, measured on a device). A dialog renders
+      // its "this device" rows from it, and `local` is the pass's START: a push that waits on the network (a
+      // native Firestore write made offline does not settle until reconnect) spans whatever the player did
+      // meanwhile, so the rows showed a save one level short and hid exactly what "use the cloud" would drop.
+      // The answer was never at risk — `resolveGroupFork` re-reads — only what the player was shown.
+      const current = readScoped(group, opts.uid);
+      if (group.onFork === 'ask' && current.seen !== group.fingerprint(s.content)) {
+        return { kind: 'fork', local: current.local, server: s };
+      }
       // ⚠️ **A policy-resolved fork goes through `merge`, NEVER through `adopt` — and the two are
       // not interchangeable.** `adopt` is the SILENT path, and its whole contract rests on there
       // being nothing local to preserve (see `SyncGroupSpec.adopt`): that premise is what makes it
@@ -225,7 +271,7 @@ export async function runGroupSync(
       // day whose date has passed, a spend record that must follow the receipt it paid for — would
       // be silently discarded. `merge` is the hook that owns that, on both arms.
       const choice: ConflictChoice =
-        group.onFork === 'take-server' || s.updatedAt > local.updatedAt ? 'server' : 'local';
+        group.onFork === 'ask' || group.onFork === 'take-server' || s.updatedAt > local.updatedAt ? 'server' : 'local';
       const merged = group.merge(local, s, choice);
       // The merge taught the server nothing it does not already hold, so there is nothing to
       // upload — adopt at its version rather than spending a round trip re-pushing its own content.
@@ -436,6 +482,8 @@ export async function runCloudSync(
     const outcome = await runGroupSync(group, transport, opts);
     outcomes[group.id] = outcome;
     if (outcome.kind === 'fork') asking.push(group.id);
+    // The account is gone for every group, and the next group's own create would ask the same question.
+    if (outcome.kind === 'account-gone') break;
   }
   return { outcomes, asking };
 }

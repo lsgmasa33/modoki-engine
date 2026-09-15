@@ -4677,6 +4677,29 @@ to its 60 fps cap. The same perturbation in the desktop editor (1600×909) moved
 3.9 ms, and `samples` 16 → 4 at full resolution moved it 8.2 → ~4.0 ms — so both knobs reach
 GTAONode live. Not measured: the look at 0.5 on a phone, which is the owner's call.
 
+**Over time the S22 slows down from heat, not from the engine (#1209).** Measured 2026-09-15:
+- **Setup:** `demos/postfx-demo` at `resolutionScale: 0.5`, full tour, 11 minutes (7 loops) in one
+  run, with a synthetic tap every 2 s. Without the taps, Samsung's own governor throttles an
+  untouched phone.
+- **The heavy stations fall loop after loop.** All Composed went 42 → 25 → 23 → 21 → 21 → 19 fps,
+  GTAO 60 → 40 → 32 → 29, DOF 60 → 49 → 34 → 31.
+- **The light stations stay at 60 the whole run**, at the same point in every loop (Bloom on the
+  HorseHead, Vignette).
+- **The GPU ceiling falls in step.** The phone's GPU frequency ceiling (`max_gpuclk`) went
+  818 → 599 → 350 → 285 → 220 MHz, thermal status reached 3 (severe) inside loop 3, and the GPU
+  sat at 99% busy on the heavy stations.
+- **Not the CPU:** CPU time per frame is 5–10 ms, and the big cores' frequency limit went back to
+  full after loop 2.
+- **Not the tier:** it stayed `high` with no tier events. Calibration demotes on CPU cost only, so
+  it cannot see this.
+
+**The decisive control:** a fresh launch on the still-hot phone reproduced loop-7 fps from its
+first loop (All Composed 19.8, GTAO 25.9, DOF 31.9). So the drop is GPU thermal throttling and
+nothing that accumulates in the app.
+
+That run also exposed a separate problem: **look switches leak ~50 MB of GPU textures per loop**
+(#1269). It does not cost fps: the light stations hold 60 while it climbs.
+
 ⚠️ **Always passes a REAL normal buffer — the "nullable normalNode" cheap path is broken here.**
 `ao()`'s `normalNode` argument is documented as nullable (GTAO reconstructs normals from depth
 when it's `null`), and that was the original plan. It doesn't work under this renderer:

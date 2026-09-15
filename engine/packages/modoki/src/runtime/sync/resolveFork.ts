@@ -1,7 +1,7 @@
 /** Resolving a genuine fork once the player has answered (#532). */
 
 import { scopeMarksToAccount } from './decide';
-import { persist, type GroupOutcome } from './runGroupSync';
+import { persist, persistMarks, type GroupOutcome } from './runGroupSync';
 import type {
   AnySyncGroup, CloudGroup, ConflictChoice, GroupTransport, LocalGroup,
 } from './types';
@@ -87,18 +87,18 @@ export async function resolveGroupFork(
   }
 
   if (result === 'ok') {
-    const acknowledged: LocalGroup<never> = {
-      content,
-      version,
-      updatedAt: local.updatedAt,
-      marks: {
-        lastSyncedVersion: version,
-        lastSyncedFingerprint: group.fingerprint(content),
-        uid: opts.uid,
-        lastSyncedAt: opts.now,
-      },
-    };
-    const ok = await persist(group, acknowledged);
+    // ⚠️ **MARKS ONLY — the content is already on the device (`preUpload` above), and writing it again
+    // would destroy a game write that landed during the push.** The push is the await a real write races:
+    // a level finished in that round trip is on disk by now, and persisting the decision-time `content`
+    // over it — with marks stamping that same content's fingerprint — leaves the device reading CLEAN with
+    // the finish gone for good. Marks describing what was UPLOADED instead leave the raced write reading
+    // dirty, so the next sync uploads it: `runGroupSync`'s plain-upload self-heal (`persistMarks`).
+    const ok = await persistMarks(group, version, {
+      lastSyncedVersion: version,
+      lastSyncedFingerprint: group.fingerprint(content),
+      uid: opts.uid,
+      lastSyncedAt: opts.now,
+    });
     if (!ok) return { kind: 'failed', reason: 'content write was not durable' };
     return { kind: 'uploaded', version };
   }

@@ -34,6 +34,7 @@ merge table.
 | `engine/packages/modoki/src/runtime/sync/coordinator.ts` | `CloudSyncCoordinator` — *when* a sync runs. Debounce, the pending-conflict suppression, trigger coalescing, and the #506 teardown guard. Generic over the FORK (`SyncFork`), never the save. Promoted out of Court in #658. |
 | `games/court/runtime/saveSync.ts` | The first consumer's group declarations (`courtProgressSaveGroup`/`courtPurchasesSaveGroup`/`courtSettingsSaveGroup`) and its own field-by-field merge rules. Worked example. |
 | `games/court/accounts.md` | Court's account system end to end — auth, the conflict dialog UI, the account-deletion flow. Read it for how a game WIRES this contract, not for the contract itself. |
+| `games/wordweave/runtime/saveSync.ts` · `runtime/cloudSyncWiring.ts` | The second consumer, Weaveling (#679): three groups, the wiring ported from Court's. What it does differently is § "Weaveling, the second consumer" below; its own docs are [save.md](../games/wordweave/docs/save.md) § Cloud save and [accounts.md](../games/wordweave/docs/accounts.md). |
 
 L2 folder (`'sync'` is in `L2_FOLDERS`, `engine/eslint.config.js`), importing no other L2 folder —
 in particular not `storage/`. The one edge out of the folder is `coordinator.ts` → L0
@@ -253,6 +254,15 @@ for that group, not treat it as a plain failure.
   UI-layer decision the engine doesn't make; see `runCloudSync`'s `asking: string[]` for the set a
   single dialog should resolve together, `sync/coordinator.ts` for the driver that aggregates them,
   and Court's `saveSync.ts` for a worked example of the game-side half.
+
+  ⚠️ **A fork whose two sides hold the same content never asks (#1253).** `decideGroup` calls a fork
+  on versions and marks alone, so two phones that each raised a date floor to the same day fork with
+  identical content. Nothing is lost whichever side wins, so `runGroupSync` resolves it the way a
+  policy fork resolves with the SERVER chosen: through `merge` (so fork-only unions still happen),
+  then, since the merge teaches the server nothing, an adopt at the server's version with no upload.
+  "Same" means the fingerprint of what the STORE holds, never the runner's `local`, which goes
+  synthetic after an adopt that owed an upload. Do not "fix" such a fork by dropping a field from a
+  game's fingerprint instead: a field that only rises must still sync.
 - **`'take-server'`** — silently take the server's side. For a group whose local side is never worth
   defending.
 - **`'take-newer'`** — silently take whichever side has the later `updatedAt`.
@@ -380,14 +390,49 @@ against a torn write, look for an ordering fix before reaching for a second atom
 "guard + marker in one write, confirmed durable, then the dependent side-effect" recovers the same
 guarantee without needing the two values to share a key.
 
-### Still open: the narrowed dialog has never been seen on a device
+### Weaveling, the second consumer (#679)
+
+Weaveling adopted this contract unchanged, with the same three groups as Court: progress and purchases ask,
+settings take the newer side. Four things are worth knowing because they differ from Court, or because they
+changed the engine:
+
+- **The document nests its content.** Weaveling's is `{ content, version, updatedAt }`; Court flattens content
+  beside `version`. Flattened, a content field that happened to be called `version` would become the
+  compare-and-swap the rules read. The rules are Court's, and were re-measured against Weaveling's project on
+  2026-09-15 with 14 probes ([Weaveling's save.md](../games/wordweave/docs/save.md) § "Verified on devices").
+- **Account deletion holds sync before deleting the documents.** Court has no such hold. Between
+  `deleteAllSaves` and the auth-user delete, a sync that starts — or a push still on the network — creates a
+  document back, since the rules allow any create at version 1. Weaveling raises a hold and waits (bounded) for
+  running syncs first.
+- **A missing document on a synced lineage is checked, not recreated** — `GroupTransport.confirmAccount`,
+  optional, added for Weaveling. Measured on two devices: a second phone still signed in to an account deleted on
+  the first recreated all its documents, because an ID token outlives its user by up to an hour.
+  - When a group this device has exchanged under the sync's uid (`lastSyncedVersion > 0`) reads no document,
+    `runGroupSync` asks before creating.
+  - `'gone'` yields an `account-gone` outcome, and `runCloudSync` stops at it. What the local save does is the
+    game's call; Weaveling wipes.
+  - `'unknown'`, a throw, or an answer outside the contract never counts as gone, and creates nothing.
+    `'exists'` recreates as before.
+  - The answer is about the uid passed in, never whoever is signed in by then.
+  - A transport without the method keeps the old behaviour; Court wires it in #1263.
+  - **Not reached:** a phone that syncs only after its deleted account's token has lapsed — the next-day case. On
+    a cold launch, the auth plugin's own token listener makes the failing refresh first, and the SDK signs out, so
+    the game sees an ordinary sign-out and keeps the save (reasoned from the plugin's source). See [Weaveling's accounts.md](../games/wordweave/docs/accounts.md) § "An account deleted on another device".
+- **A fork carries the store as it is when the question is asked**, never the pass's start. Found on a device:
+  an upload parked offline spanned a level the player finished, so the dialog's "this device" rows were one
+  level short. `resolveGroupFork` always re-read the save, so no answer was ever wrong — only what the player was
+  shown. Court's rows get the fix too.
+
+### Still open: Court's narrowed dialog has never been seen on a device
 
 When only some of a game's asking groups fork, the dialog narrows to the fields the forking groups
 own (Fork policies above). Court's version of this — hiding all five `court.progress` rows on a
 purchases-only fork, leaving only `Coins`/`NoAds` — is unit-tested with distinguishing assertions,
 but data-correct is not pixels-correct, and nobody has looked at the resulting layout on a device.
 `qa/cases/persistence/cloud-sync-purchases-only-fork-narrowed-dialog.md` (QA-PREFS-0007) is the case
-that exists to close this gap; it stays open until an owner has watched it happen.
+that exists to close this gap; it stays open until an owner has watched it happen. (Weaveling's own narrowed
+dialog, Coins and Ads rows only, WAS seen on the iPad mini 5 on 2026-09-15, but that is a different scene and
+does not close Court's case.)
 
 ## Gotchas
 
@@ -416,6 +461,11 @@ that exists to close this gap; it stays open until an owner has watched it happe
 - **The transport's `load()` must throw on a read failure, never return `null`.** `null` means "no
   document for this group" and licenses a fresh-install `create`; conflating a read failure with
   "no document" lets an offline device conclude it's brand new and overwrite a real account.
+- **`null` from a device that has synced that group is not a new account either — it is a deletion.**
+  Without `confirmAccount`, a second signed-in phone recreates a deleted account's save (Weaveling section above).
+- **A native Firestore write made offline does not settle until the phone reconnects**, so a sync pass can
+  span minutes of play. Anything a pass hands out for display must come from a fresh store read, not the
+  pass's start.
 
 ## Related
 

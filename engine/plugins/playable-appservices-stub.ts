@@ -135,6 +135,10 @@ export const auth = {
   async currentUserResult() { return { ok: true as const, user: null }; },
   async signOut(): Promise<void> {},
   async onAuthChanged(_cb: unknown): Promise<() => void> { return () => {}; },
+  // Weaveling's cloud-sync deletion check (#679). A playable has no account to ask about; `'unknown'` is the
+  // real function's own off-device answer, and it creates and wipes nothing.
+  async accountStatus(_uid: string) { return 'unknown' as const; },
+  isUserNotFound(_e: unknown) { return false; },
   classifyAuthError(_e: unknown) { return 'not-configured' as const; },
   toCourtUser(_raw: unknown) { return null; },
   __resetAuthForTest(): void {},

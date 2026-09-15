@@ -237,4 +237,32 @@ export interface GroupTransport {
   /** Attempt a write. `'conflict'` means the server's compare-and-swap REJECTED it — another device
    *  wrote first — which is a normal race outcome, not an error: re-read and decide again. */
   push(groupId: string, doc: CloudGroup<unknown>): Promise<'ok' | 'conflict' | 'failed'>;
+  /** Does account `uid` still exist on the server? (#679.) Asked only when a group this device has synced under
+   *  that uid (`lastSyncedVersion > 0`) finds its document MISSING, before anything is created. The answer must
+   *  come from the server, not a cached credential: a deleted user's ID token stays valid for up to an hour.
+   *  - `'gone'`: the group reports `account-gone` and writes nothing. What happens to the local save is the game's
+   *    call.
+   *  - `'unknown'` (offline, a plugin failure, a signed-in account that is not `uid`): creates nothing and retries
+   *    on the next sync.
+   *  - `'exists'`: recreates as before. A document cleared by hand, or an auth-user delete that failed after its
+   *    documents went.
+   *
+   *  ⚠️ **Without it, account deletion protects only the device that ran it.** Measured on two devices: a second
+   *  phone still signed in to a deleted account read "no document", and the create put the deleted user's save
+   *  back, where no client can reach it once the token lapses.
+   *
+   *  ⚠️ **It reaches only a phone that syncs WHILE its deleted account's token is still valid.** Once the token
+   *  has lapsed, a cold launch refreshes it inside the auth plugin itself (its ID-token listener, registered at
+   *  bridge start, before any game code). The SDK signs out, and the game sees an ordinary sign-out with no sync
+   *  to ask from. That reading comes from `@capacitor-firebase/authentication` 8.4.0's source and is unmeasured.
+   *  A cheaper ask before every read was tried for this case and removed: the plugin's refresh would beat it,
+   *  and it let `'gone'` wipe with the document still present (#679 close-out §2d review).
+   *
+   *  ⚠️ **Answer for `uid`, never for whoever happens to be signed in** — an account switch mid-sync would
+   *  otherwise answer about the new account. A throw reads as `'unknown'`, never `'gone'`.
+   *
+   *  Optional, so a game that has not wired it keeps the old behaviour. Firebase answers with a forced
+   *  `getIdToken`: for a user deleted server-side it rejects with `auth/user-not-found`, on Android and iOS
+   *  alike. */
+  confirmAccount?(uid: string): Promise<'exists' | 'gone' | 'unknown'>;
 }
