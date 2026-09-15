@@ -496,10 +496,18 @@ export function mergeRiggedPrefab(fresh: PrefabFile, existing: PrefabFile): Pref
  *  Returns undefined only when neither knows it (a genuinely new prefab); the
  *  caller then mints a fresh guid via serializePrefab's `existingId ?? newGuid()`. */
 export async function resolveExistingPrefabId(prefabPath: string): Promise<string | undefined> {
-  const known = getGuidForPath(prefabPath);
+  return resolveExistingDocumentId(prefabPath);
+}
+
+/** The id an existing JSON asset document at `docPath` already carries, by the same two-step
+ *  lookup as {@link resolveExistingPrefabId} — which is this, for a prefab. Nothing about the
+ *  lookup is prefab-specific; the New-asset "Replace" path uses it too, so replacing a material
+ *  keeps the refs that point at it (#1215). */
+export async function resolveExistingDocumentId(docPath: string): Promise<string | undefined> {
+  const known = getGuidForPath(docPath);
   if (known) return known;
   try {
-    const res = await fetch(assetUrl(prefabPath));
+    const res = await fetch(assetUrl(docPath));
     if (!res.ok) return undefined;
     const data = await res.json() as { id?: unknown };
     return typeof data.id === 'string' ? data.id : undefined;

@@ -57,7 +57,11 @@ function makeCtx(
     resolveAssetPath: resolve,
     rebuildManifest: rebuild,
     absToAssetUrl: () => null,   // → the route falls back to the absolute path; not asserted here
-    requestBrowser: async () => ({ ok: true, notes: [] }),
+    // The agent delete's unsaved-work probe (#1215) answers "nothing held"; `covers` is required or
+    // the gate reads a skewed renderer. Every other op is the repair, answered as before.
+    requestBrowser: async (op: string, params: unknown) => (op === 'resolve-unsaved'
+      ? { ok: true, holds: [], discarded: [], covers: (params as { registries?: string[] }).registries ?? [] }
+      : { ok: true, notes: [] }),
     getSchema: () => undefined,
     firstRootDir: () => null,
     invalidateProjectConfig: () => {},

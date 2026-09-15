@@ -148,12 +148,14 @@ const EXEMPT: Record<string, { reason: string; registries?: readonly string[] }>
     + 'slice of `CAUSE_SPECS` — so a fourth path-keyed registry cannot compile without a repair. '
     + '⚠️ VOID if that repair stops being derived: "it repairs them" was true of the hand-written '
     + 'version too, right up until it was two of three (#972) and nothing said so.', },
-  '/api/delete-asset': { reason:
-    'the same seam as /api/move-file with `to: null` (unbindDeletedAssetEditors), exempt on the '
-    + 'same three grounds: a file must be deletable while it is being edited, the repair covers '
-    + 'every path-keyed registry by derivation, and the exemption is void if that stops being '
-    + 'true. Its drops are REPORTED, never silent (#898) — destroying pending work is exactly the '
-    + 'thing that must reach the human.', },
+  // ⚠️ NOT the move-file exemption any more (#1215 A-7, owner 2026-09-15). A move CARRIES the work
+  // across; a delete DESTROYS it, and the "drops are reported" note reached only the agent that
+  // caused them. The AGENT path now gates the three path-keyed registries the repair drops; the
+  // renderer's own deletes (`rendererWrite`) do not. What is left exempt is `liveScene` alone.
+  '/api/delete-asset': { registries: ['liveScene'], reason:
+    'trashing the file the live world was loaded from destroys nothing in the live world — the '
+    + 'human\'s next save writes it back — so refusing on it would be a false alarm. The three '
+    + 'path-keyed registries the delete repair actually DROPS are gated.', },
   '/api/read-meta': { registries: ['pendingMeta'], reason:
     "the EDITOR'S OWN disk read — `readMetaPreferringPark` calls it FROM the renderer, so probing "
     + 'the renderer back would be circular for every real caller it has. It is also the read whose '
@@ -176,8 +178,10 @@ const EXEMPT: Record<string, { reason: string; registries?: readonly string[] }>
   //    touch, and "most" is a gap, not an exemption. ──
   '/api/write-file': { reason:
     'renderer-only. It has NO entry in engine/tools/modoki-mcp/src/contracts.ts, so no agent tool '
-    + 'reaches it; its callers are the editor OWN saves (postWriteFile — saveScene, '
-    + 'writePrefabFile), and it fingerprints EVERY write through markEditorWrite, which is the '
+    + 'calls it DIRECTLY. Three reach it THROUGH the renderer — create_registered_asset, prefab '
+    + 'create and save_all (an earlier version of this reason said "no agent tool reaches it", '
+    + 'which was false; #1215) — but every one of those writes is issued BY the renderer, which '
+    + 'holds the registries, and the route fingerprints EVERY write through markEditorWrite, the '
     + 'same assertion selfWrite makes on /api/asset-write: a write issued from the renderer is '
     + 'never blind to the registry. VOID the day it gains an MCP contract — it would then need '
     + 'asset-write selfWrite split, because the renderer half must not be gated.', },
@@ -519,6 +523,26 @@ describe('the sidecar park gate covers every Node route that could clobber a par
       "the renderer's own /api/write-meta POST must declare `rendererWrite: true`, or the park gate "
       + "refuses the editor's own saves — the Sprite Editor and 9-slice editor cannot save while an "
       + 'Inspector import-settings edit is parked').toBe(true);
+
+    // The renderer's own DELETES must say so too (#1215). The route gates the agent path on unsaved
+    // work; without `rendererWrite` the human deleting a file they have a parked edit on gets a 409,
+    // and `deleteAssetFile` reports it only as `false`. Checked per CALL, not per file: each POST
+    // to the route must carry the flag within its own request body, so a second call added without
+    // it cannot hide behind the first.
+    for (const file of [
+      'engine/packages/modoki/src/editor/panels/assetOps.ts',
+      'engine/packages/modoki/src/editor/panels/CleanupAssetsDialog.tsx',
+    ]) {
+      const src = source(file);
+      const calls = [...src.matchAll(/['"]\/api\/delete-asset['"]/g)];
+      expect(calls.length, `${file} no longer POSTs /api/delete-asset — re-point this guard`).toBeGreaterThan(0);
+      for (const m of calls) {
+        const body = src.slice(m.index, m.index + 200);
+        expect(/rendererWrite:\s*true/.test(body),
+          `${file}: a /api/delete-asset call without \`rendererWrite: true\` — the agent-path unsaved gate `
+          + 'would refuse the human\'s own delete of a file they have unsaved edits on').toBe(true);
+      }
+    }
 
     const assetOps = source('engine/packages/modoki/src/editor/panels/assetOps.ts');
     expect(/flushPendingMetaFor\s*\(/.test(assetOps),

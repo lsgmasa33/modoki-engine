@@ -85,7 +85,10 @@ function makeCtx(renderer: RendererStub, manifest: Manifest = { version: 2, asse
   return {
     projectRoot,
     editorRoot: projectRoot,
-    resolveAssetPath: (p: string) => path.join(projectRoot, p.replace(/^\//, '')),
+    // Percent-decodes, like the real `resolveAssetPath`. It did not, and nothing noticed until
+    // `/api/write-meta` started checking the asset EXISTS (#1215 A-2): F7's `/rock%2Epng` resolved
+    // to a file literally named `rock%2Epng`, a resolver no route is ever given.
+    resolveAssetPath: (p: string) => path.join(projectRoot, decodeURIComponent(p).replace(/^\//, '')),
     absToAssetUrl: (p: string) => p,
     firstRootDir: () => null,
     getManifest: () => manifest,

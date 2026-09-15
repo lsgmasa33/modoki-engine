@@ -87,6 +87,8 @@ describe('/api/reimport → invalidate-assets notification', () => {
     const res = await handleBackendRequest(ctx, reimportReq({ path: '/assets/models/thing.glb' }));
 
     expect((res as { body: { converted: number } }).body.converted).toBe(1);
+    // §8: a bake writes files, so the reply says it is on disk (#1215 A-21).
+    expect((res as { body: { saved?: boolean } }).body.saved).toBe(true);
     expect(invalidateCalls(requestBrowser)).toHaveLength(1);
     expect(requestBrowser).toHaveBeenCalledWith('invalidate-assets', {
       items: [{ path: '/assets/models/thing.glb', type: 'model' }],

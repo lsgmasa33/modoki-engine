@@ -20,6 +20,11 @@ import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { registerCreatableAsset, unregisterCreatableAsset } from '../../packages/modoki/src/editor/panels/creatableAssets';
 import { registerBuiltinCreatableAssets } from '../../packages/modoki/src/editor/panels/builtinCreatableAssets';
+import { createRegisteredAsset, createRegisteredAssetAskingToReplace } from '../../packages/modoki/src/editor/panels/createRegisteredAsset';
+import { registerAsset, unregisterAsset, getGuidForPath } from '../../packages/modoki/src/runtime/loaders/assetManifest';
+import { markAssetDirty, getDirtyAssetPaths, clearDirtyAssets } from '../../packages/modoki/src/editor/scene/dirtyAssets';
+
+const OLD_GUID = '33333333-3333-4333-8333-333333333333';
 
 registerAllTraits();
 registerEditorAgentOps();
@@ -32,16 +37,28 @@ const list = () => runAgentOp('list-creatable-assets', {}) as Promise<ListReply>
 const create = (params: unknown) => runAgentOp('create-registered-asset', params) as Promise<CreateReply>;
 
 /** Captures what the create path tried to WRITE, without touching a real backend. */
-let writes: Array<{ path: string; body: string }> = [];
+let writes: Array<{ path: string; body: string; ifNoneMatch?: string }> = [];
 let rescans = 0;
+/** Files the stub backend treats as already on disk, keyed by path → the document's text. The
+ *  stub honours `ifNoneMatch:'*'` against it the way `/api/write-file` does (409, nothing written),
+ *  and serves it to a plain GET, which is how `resolveExistingDocumentId` reads an on-disk id. */
+let onDisk = new Map<string, string>();
 beforeEach(() => {
   writes = [];
   rescans = 0;
+  onDisk = new Map();
   vi.stubGlobal('fetch', vi.fn(async (url: string, init?: { body?: string }) => {
     if (String(url).endsWith('/api/write-file')) {
-      const b = JSON.parse(init?.body ?? '{}') as { path: string; content: string };
-      writes.push({ path: b.path, body: b.content });
-      return { ok: true, json: async () => ({ ok: true }) } as unknown as Response;
+      const b = JSON.parse(init?.body ?? '{}') as { path: string; content: string; ifNoneMatch?: string };
+      if (b.ifNoneMatch === '*' && onDisk.has(b.path)) {
+        return { ok: false, status: 409, json: async () => ({ ok: false, conflict: true, reason: 'if-none-match' }) } as unknown as Response;
+      }
+      writes.push({ path: b.path, body: b.content, ...(b.ifNoneMatch ? { ifNoneMatch: b.ifNoneMatch } : {}) });
+      return { ok: true, status: 200, json: async () => ({ ok: true }) } as unknown as Response;
+    }
+    const served = [...onDisk.entries()].find(([p]) => String(url).endsWith(p));
+    if (served && !init?.body) {
+      return { ok: true, status: 200, json: async () => JSON.parse(served[1]) } as unknown as Response;
     }
     if (String(url).endsWith('/api/rescan-assets')) {
       rescans++;
@@ -180,6 +197,114 @@ describe('creating an ordinary document kind', () => {
     expect(r.code).toBe('REFUSED_BY_OP');
     expect(String(r.error)).toMatch(/failed to write/);
     expect(r.guid).toBeUndefined();
+  });
+});
+
+describe('an existing destination (#1215 A-1)', () => {
+  it('the agent op REFUSES rather than replacing the asset under a new guid', async () => {
+    onDisk.set('/assets/materials/rock.mat.json', `{"id":"${OLD_GUID}"}`);
+    const r = await create({ kind: 'material', path: '/assets/materials/rock.mat.json' });
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('REFUSED_BY_OP');
+    expect(String(r.error)).toMatch(/already exists/);
+    // The refusal is only useful if it names the tool that does what the agent most likely meant.
+    expect(r.options?.join(' ')).toMatch(/modoki_write_asset/);
+    expect(r.guid).toBeUndefined();
+    expect(writes).toEqual([]);
+    expect(getGuidForPath('/assets/materials/rock.mat.json')).toBeUndefined();
+  });
+
+  it('the agent op sends the create-only precondition on a fresh path, and writes', async () => {
+    const r = await create({ kind: 'material', path: '/assets/materials/fresh.mat.json' });
+    expect(r.ok).toBe(true);
+    expect(writes[0].ifNoneMatch).toBe('*');
+  });
+});
+
+describe('a human Replace keeps the replaced asset\'s guid (#1215, owner 2026-09-15)', () => {
+  afterEach(() => { unregisterAsset(OLD_GUID); });
+
+  it('the manifest\'s guid for the path is kept, in the document AND the registration', async () => {
+    registerAsset(OLD_GUID, '/assets/materials/rock.mat.json', 'material');
+    onDisk.set('/assets/materials/rock.mat.json', `{"id":"${OLD_GUID}"}`);
+    const r = await createRegisteredAsset('material', '/assets/materials/rock.mat.json', { replace: true });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.guid).toBe(OLD_GUID);
+    expect((JSON.parse(writes[0].body) as { id: string }).id).toBe(OLD_GUID);
+    // A replace must not carry the create-only precondition, or the human's confirmed Replace 409s.
+    expect(writes[0].ifNoneMatch).toBeUndefined();
+  });
+
+  it('a file the manifest has not indexed yet still gives up its on-disk id', async () => {
+    onDisk.set('/assets/materials/unindexed.mat.json', `{"id":"${OLD_GUID}"}`);
+    const r = await createRegisteredAsset('material', '/assets/materials/unindexed.mat.json', { replace: true });
+    expect(r.ok && r.guid).toBe(OLD_GUID);
+  });
+
+  it('the kept id beats a def that mints its own — the refs point at the OLD id', async () => {
+    registerCreatableAsset({
+      id: 'test.ownid2', label: 'X', ext: '.z.json', defaultName: 'X', assetType: 'material',
+      body: () => ({ id: 'def-chosen-id' }) as never,
+    });
+    try {
+      onDisk.set('/assets/z/own.z.json', `{"id":"${OLD_GUID}"}`);
+      const r = await createRegisteredAsset('test.ownid2', '/assets/z/own.z.json', { replace: true });
+      expect(r.ok && r.guid).toBe(OLD_GUID);
+      expect((JSON.parse(writes[0].body) as { id: string }).id).toBe(OLD_GUID);
+    } finally { unregisterCreatableAsset('test.ownid2'); }
+  });
+
+  it('replace over NOTHING mints a fresh guid, as a create does', async () => {
+    const r = await createRegisteredAsset('material', '/assets/materials/new.mat.json', { replace: true });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.guid).not.toBe(OLD_GUID);
+    expect(r.guid).toMatch(/^[0-9a-f-]{36}$/);
+  });
+});
+
+describe('the HUMAN create asks before replacing (#1215 close-out review)', () => {
+  // The save dialog cannot be trusted to have asked: the Windows/Linux fallback never checks, and
+  // the macOS panel checks the collapsed `.json` name. So the panel creates create-only and asks.
+  it('a fresh path writes with no question', async () => {
+    const asked: string[] = [];
+    const r = await createRegisteredAssetAskingToReplace('material', '/assets/materials/fresh2', async (p) => { asked.push(p); return true; });
+    expect(r?.ok).toBe(true);
+    expect(asked).toEqual([]);
+  });
+
+  it('an existing path ASKS, naming the real destination, and a yes replaces keeping the guid', async () => {
+    onDisk.set('/assets/materials/rock2.mat.json', `{"id":"${OLD_GUID}"}`);
+    const asked: string[] = [];
+    const r = await createRegisteredAssetAskingToReplace('material', '/assets/materials/rock2', async (p) => { asked.push(p); return true; });
+    expect(asked).toEqual(['/assets/materials/rock2.mat.json']);
+    expect(r?.ok && r.guid).toBe(OLD_GUID);
+    expect(writes).toHaveLength(1);
+  });
+
+  it('a Replace DROPS a parked panel edit for that path — or the next Cmd+S writes the old doc back', async () => {
+    onDisk.set('/assets/materials/parked.mat.json', `{"id":"${OLD_GUID}"}`);
+    markAssetDirty('/assets/materials/parked.mat.json', 'material', { id: OLD_GUID, shader: 'edited' }, 'panel');
+    try {
+      const r = await createRegisteredAssetAskingToReplace('material', '/assets/materials/parked.mat.json', async () => true);
+      expect(r?.ok).toBe(true);
+      expect(getDirtyAssetPaths()).not.toContain('/assets/materials/parked.mat.json');
+    } finally { clearDirtyAssets(); }
+  });
+
+  it('a NO writes nothing and resolves null', async () => {
+    onDisk.set('/assets/materials/rock3.mat.json', `{"id":"${OLD_GUID}"}`);
+    const r = await createRegisteredAssetAskingToReplace('material', '/assets/materials/rock3.mat.json', async () => false);
+    expect(r).toBeNull();
+    expect(writes).toEqual([]);
+  });
+
+  it('a refusal that is NOT "exists" is returned as-is, with no question', async () => {
+    let askedAtAll = false;
+    const r = await createRegisteredAssetAskingToReplace('materal', '/assets/materials/x', async () => { askedAtAll = true; return true; });
+    expect(r?.ok).toBe(false);
+    expect(askedAtAll).toBe(false);
   });
 });
 

@@ -147,3 +147,9 @@ date,clone,tool,delta_bytes,tool_bytes_after,surface_bytes_after,sha
 2026-09-14,work-qa,modoki_create_asset,63,713,162505,30ecbd22a
 2026-09-14,work-qa,modoki_create_registered_asset,-4,1509,162505,30ecbd22a
 2026-09-15,work-qa,modoki_watch,211,4328,162716,2f7af3729
+2026-09-15,work-qa,modoki_create_registered_asset,206,1715,165057,cccdd9f24
+2026-09-15,work-qa,modoki_delete_asset,1167,3616,165057,cccdd9f24
+2026-09-15,work-qa,modoki_duplicate_asset,63,1368,165057,cccdd9f24
+2026-09-15,work-qa,modoki_move_asset,63,998,165057,cccdd9f24
+2026-09-15,work-qa,modoki_write_asset,49,2243,165057,cccdd9f24
+2026-09-15,work-qa,modoki_write_asset_meta,167,3027,165057,cccdd9f24

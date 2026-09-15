@@ -998,13 +998,33 @@ they carry deliberately different shapes and collapsing them is a wire change. S
 cause can no longer be **forgotten** — it reaches disk — but it can be left **unnamed in the report**,
 i.e. the work is saved and the toast does not mention it. Stated rather than pretended away.
 
-#### Why `/api/move-file` and `/api/delete-asset` are EXEMPT rather than gated
+#### Why `/api/move-file` is EXEMPT, and `/api/delete-asset` gates only the AGENT
 
-Gating them would refuse a rename *because* the file being renamed has unsaved edits — precisely the
-case the repair exists to carry across. A file must stay renameable while it is being edited. They
-instead repair every path-keyed registry, **by derivation**, and the exemption in
+Gating a move would refuse a rename *because* the file being renamed has unsaved edits — precisely
+the case the repair exists to carry across. A file must stay renameable while it is being edited.
+The route instead repairs every path-keyed registry, **by derivation**, and the exemption in
 `tests/architecture/unsavedGateCoverage.test.ts` is void if that stops being true. "It repairs them"
 was true of the hand-written version too, right up until it was two of three and nothing said so.
+
+`/api/delete-asset` used to share that exemption, and the reasoning did not transfer (#1215 A-7,
+owner 2026-09-15). **A move carries the work across; a delete destroys it.** The repair drops the
+parked writes for the dead path and reports the drop in `repaired` — but that reply goes to whoever
+called, and when the caller is an agent the human whose edit it was is told nothing. That is §8's
+`destroys` consequence, so the agent path now refuses with `REQUIRES_SAVE` (hatch `discardUnsaved`,
+which skips the probe and lets the repair drop the work as before). Three details carry the weight:
+
+- **`rendererWrite:true` exempts the editor's own deletes** — the Assets panel, undo/redo, the Cleanup
+  dialog, the model-import prune. That is the human deleting on purpose, and "deletable while being
+  edited" is still the right rule for them. Same flag and meaning as on `/api/write-meta`.
+- **The probe is global and filtered at the route**, exact path or `folder + '/'`, because a folder
+  delete takes every hold beneath it and the renderer's per-path matchers answer about one path.
+  The match is **case-insensitive** (on APFS/NTFS `absToAssetUrl` echoes the request's casing, so
+  `/FX/a.json` trashes the file a hold calls `/fx/a.json`), and a path with **no canonical url** —
+  the asset root — counts as containing every hold rather than skipping the probe. Both were found
+  by the close-out review and reproduced. The repair itself still compares exactly, so a
+  case-mismatched `discardUnsaved` delete can strand the park: #1261.
+- **`liveScene` is not asked.** Trashing the file a live world was loaded from destroys nothing in
+  the world; the next save writes it back. The ledger row narrowed to that registry alone.
 
 #### Incident: Cmd+S under a timeline preview flushed 2 of 3 (#972 P12)
 
@@ -1147,21 +1167,21 @@ path-scoped ask from `/api/validate-prefab` match) and a marker for a genuinely 
 
 ### What is still NOT fixed
 
-- ⚠️ **`/api/move-file` and `/api/delete-asset` repair the park for `dirtyAsset` and `pendingMeta`
-  and NOT `pendingBaseScene`** — `assetEditorBindings.ts` does not reference that registry at all.
-  A moved or deleted `.scene.json` strands its parked baseScene edit on a dead path and it never
-  flushes: edit a baseScene ref, rename the scene, and the edit is silently gone at the next
-  `save_all`. Tracked as **#972**, not #889, because the mechanism is #972's — a consumer
-  hand-enumerating the registries instead of deriving them. ⚠️ **Gating these routes would be the
-  WRONG fix**: it would refuse a rename *because* the file being renamed has unsaved edits, which
-  is the case the repair exists to carry across. The fix is to finish the repair.
+- ~~`/api/move-file` and `/api/delete-asset` repair the park for `dirtyAsset` and `pendingMeta`
+  and NOT `pendingBaseScene`~~ — **fixed by #972**: `PARKED_MOVE_REPAIRS` (`assetEditorBindings.ts`)
+  now covers every path-keyed cause by derivation, `pendingBaseScenes` included. Gating was the
+  wrong fix for a MOVE, which the repair carries across; a DELETE destroys the work instead, and
+  since #1215 its agent path is gated (see "Why `/api/move-file` is EXEMPT" above).
 - These three used to be **prose here and invisible to the guard** — they matched none of
   `CONTENT_CALLS`' trigger symbols, so `unsavedGateCoverage` classified them as nothing and this
   list read as a ledger the guard keeps when for them it was not. Closed in phase 3 by adding
   `moveToTrash`, `moveAssetFile` and `writeFileSync` as triggers. `/api/write-file` came out
-  **exempt**: it has no `contracts.ts` entry, so no agent tool reaches it, and it fingerprints every
-  write through `markEditorWrite` — the same assertion `selfWrite` makes. ⚠️ Void the day it gains
-  an MCP contract.
+  **exempt**: it has no `contracts.ts` entry, so no agent tool calls it directly, and it
+  fingerprints every write through `markEditorWrite` — the same assertion `selfWrite` makes.
+  ⚠️ This said "no agent tool reaches it", which was false: `create_registered_asset`, `prefab
+  create` and `save_all` all reach it THROUGH the renderer (#1215). The exemption survives because
+  each of those writes is issued by the renderer, which holds the registries. ⚠️ Void the day it
+  gains an MCP contract.
 
 ## 6. Prior fix this generalizes
 

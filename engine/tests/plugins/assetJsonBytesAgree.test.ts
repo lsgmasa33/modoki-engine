@@ -193,6 +193,9 @@ describe('assetJsonBytes is the one definition of what lands on disk (#831)', ()
     // than a silent divergence between "what we hash" and "what we write".
     const doc = { version: 1, type: 'pbr', color: 255, nested: { a: [1, 2] } };
     const ctx = makeCtx();
+    // An agent write edits an EXISTING asset; a missing path is NOT_FOUND since #1215.
+    fs.mkdirSync(path.join(projectRoot, 'assets'), { recursive: true });
+    fs.writeFileSync(path.join(projectRoot, 'assets/x.mat.json'), '{}');
     await post('/api/asset-write', { path: '/assets/x.mat.json', type: 'material', data: doc }, ctx);
     const onDisk = fs.readFileSync(path.join(projectRoot, 'assets/x.mat.json'));
     expect(onDisk.equals(assetJsonBytes(doc))).toBe(true);

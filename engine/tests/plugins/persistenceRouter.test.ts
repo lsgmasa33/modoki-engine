@@ -195,6 +195,8 @@ describe('Phase 1: file-direct routes report `saved` (additive, no behaviour cha
 
   it('asset-write: saved:true on a successful write', async () => {
     const assetPath = path.join(TMP, `asset-${seq++}.particle.json`);
+    // An agent write edits an EXISTING asset; a missing path is NOT_FOUND since #1215.
+    fs.writeFileSync(assetPath, '{}');
     const r = (await post('/api/asset-write', {
       path: assetPath, type: 'particle', data: { emitter: { shape: 'point' }, particle: { lifetime: 1 } },
     }, makeCtx())) as { body: { ok: boolean; saved?: boolean } };

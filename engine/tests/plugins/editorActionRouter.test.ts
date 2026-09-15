@@ -382,8 +382,10 @@ describe('/api/asset-schema + /api/asset-write (Phase C, host-side)', () => {
     });
 
     it('a NEW file with no prior id is written without inventing one', async () => {
+      // `selfWrite`: since #1215 only the editor's own flush may write a path that is not on disk —
+      // an agent write there is NOT_FOUND. What this pins is unchanged: the route mints no id.
       const r = (await post('/api/asset-write', {
-        path: '/games/x/new.anim.json', type: 'animation', data: { name: 'New', duration: 1, tracks: [] },
+        path: '/games/x/new.anim.json', type: 'animation', data: { name: 'New', duration: 1, tracks: [] }, selfWrite: true,
       }, ctx())) as { body?: { ok?: boolean } };
       expect(r.body?.ok).toBe(true);
       expect(readBack('new.anim.json').id).toBeFalsy(); // create-asset owns minting, not this route

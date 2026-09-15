@@ -248,7 +248,7 @@ export async function deleteAssetFile(assetPath: string): Promise<boolean> {
   try {
     const res = await backendFetch('/api/delete-asset', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: assetPath }),
+      body: JSON.stringify({ path: assetPath, rendererWrite: true }),
     });
     if (!res.ok) return false;
     // An unparseable body is not a failed delete — the trash already happened, and the old
@@ -298,9 +298,12 @@ export type DeleteFilesResult = {
 export async function deleteAssetFiles(paths: string[]): Promise<DeleteFilesResult> {
   if (paths.length === 0) return { ok: true, trashed: 0, missing: [], failed: [] };
   try {
+    // `rendererWrite` (here and in `deleteAssetFile`): every caller is the editor's own flow — the
+    // Assets panel, undo/redo, the model-import prune — i.e. the human deleting on purpose. The
+    // route's unsaved-work gate is for the AGENT path, which cannot see the human's edit (#1215).
     const res = await backendFetch('/api/delete-asset', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ paths }),
+      body: JSON.stringify({ paths, rendererWrite: true }),
     });
     if (!res.ok) return { ok: false, trashed: 0, missing: [], failed: [] };
     // A body we cannot parse is not a failed delete — the trash already happened.

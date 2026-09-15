@@ -622,7 +622,7 @@ variance is machine-readable while it lasts.
 - **An operation that swaps the world, or READS OR WRITES a file the editor holds unsaved work
   for, refuses when that work would be lost or omitted**, with `REQUIRES_SAVE` and an escape hatch
   — `discardUnsaved` where the work is DESTROYED (`load_scene`/`new_scene`/`prefab edit-open`/
-  `write_asset_meta`), `force` where it merely goes un-included (`build`/`add_native_target`/
+  `write_asset_meta`/`delete_asset`), `force` where it merely goes un-included (`build`/`add_native_target`/
   `ota_publish`/`reimport_asset`/`duplicate_asset`). Two consequences, two names: one word for both
   is how an agent carries a harmless habit into an irreversible one. `load_scene`/`new_scene`/
   `build` do this; **`ota_publish` does not** — it builds from the scene file and ships over the
@@ -648,6 +648,19 @@ variance is machine-readable while it lasts.
   `ok:false`: a caller who reads `ok:false` reasonably assumes nothing happened, so a partial apply
   behind a failure verdict is worse than either honest outcome. An entity-not-found, by contrast,
   can only be learned while applying, so it stays a per-op error alongside whatever succeeded.
+- **A write refuses what it would silently replace or orphan, and never changes an identity the
+  caller did not name** (#1215). A create over an existing file is refused rather than replaced
+  (`create_registered_asset` via `/api/write-file`'s `ifNoneMatch:'*'`, beside the 409s
+  `create_asset`/`duplicate_asset`/`move_asset`/`create_folder`/`import_file` already had); an edit
+  (`write_asset`) or a sidecar (`write_asset_meta`) for an asset that is not on disk is `NOT_FOUND`;
+  an omitted `id` keeps the one on disk. ⚠️ These refusals are for the AGENT path: the editor's own
+  flush (`selfWrite`/`rendererWrite`) is exempt, because a flush re-parks on failure, and refusing a
+  park whose file vanished wedges `hasUnsavedChanges()` forever. The human's New-asset Replace is
+  asked in-app, because neither save dialog reliably asks for the real destination. A
+  write that changes a path↔GUID mapping rebuilds the manifest before replying (`manifestRebuilt`),
+  so the read it names as its check is not racing the watcher. Scar: `create_registered_asset`
+  replaced an existing material under a fresh guid, answered `ok:true`, and every ref to the old
+  guid dangled.
 - **A write is verifiable.** For every authoring tool there is a read that returns what was written,
   from the same place the write landed (`read_asset_def` reads the LIVE cache, because an unsaved
   edit exists only there). A write whose effect cannot be read back cannot be verified without

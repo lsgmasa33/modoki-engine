@@ -53,6 +53,13 @@ function makeCtx(): BackendContext {
     // `resolveAssetPath` is tolerant and the renderer compares exactly.
     absToAssetUrl: (abs: string) => absToAssetUrl(abs, roots()),
     requestBrowser: async (op: string, params: unknown) => {
+      // The agent delete's unsaved-work probe (#1215 A-7) answers "nothing held" and is not
+      // recorded: `asked` is the REPAIR this file asserts on, and the gate has its own tests in
+      // assetWritePreconditions.test.ts. `covers` is required, or the gate reads a skewed renderer.
+      if (op === 'resolve-unsaved' && !browserFailure) {
+        const registries = (params as { registries?: string[] }).registries ?? [];
+        return { ok: true, holds: [], discarded: [], covers: registries };
+      }
       rec.asked.push({ op, params });
       if (browserFailure) throw browserFailure;
       return { ok: true, notes: ['repointed the Inspector selection'] };

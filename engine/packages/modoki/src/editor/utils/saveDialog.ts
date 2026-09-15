@@ -9,6 +9,26 @@ import { backendFetch } from '../backend/editorBackend';
  *  This renders a minimal modal with plain DOM — no React dependency in this util — and resolves
  *  with the typed value (trimmed) or null on cancel/Escape. */
 function promptPath(title: string, message: string, initial: string): Promise<string | null> {
+  return openModal(title, message, 'Create', initial);
+}
+
+/** In-app "Replace?" confirmation for a New-asset create whose destination already exists (#1215).
+ *  Needed because neither save path reliably asks: the Windows/Linux fallback above is a text box
+ *  with no existence check, and the macOS panel checks the COLLAPSED name (`rock.json`) while the
+ *  write goes to `rock.mat.json` (see `ensureExt`). `window.confirm` is not an option for the same
+ *  reason `window.prompt` is not. Resolves true only on an explicit Replace. */
+export async function confirmReplaceAsset(path: string): Promise<boolean> {
+  const answer = await openModal(
+    'Replace existing asset?',
+    `${path} already exists. Replace it with a new default document? It keeps its GUID, so scenes and prefabs that use it keep pointing at it — at the new, default contents.`,
+    'Replace',
+  );
+  return answer !== null;
+}
+
+/** The one modal shell. With `initial` it is a text prompt resolving the trimmed value (null when
+ *  empty); without it, a confirmation resolving '' on OK. Null on Cancel, Escape or a backdrop click. */
+function openModal(title: string, message: string, okLabel: string, initial?: string): Promise<string | null> {
   return new Promise((resolve) => {
     const overlay = document.createElement('div');
     overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center';
@@ -20,32 +40,42 @@ function promptPath(title: string, message: string, initial: string): Promise<st
     const label = document.createElement('div');
     label.textContent = message;
     label.style.cssText = 'color:#9a9aa8;font-size:11px;margin-bottom:8px';
-    const input = document.createElement('input');
-    input.value = initial;
-    input.style.cssText = 'width:100%;box-sizing:border-box;padding:6px 8px;border-radius:3px;border:1px solid #444;background:#11111c;color:#eee;font-family:monospace;font-size:12px';
+    const input = initial === undefined ? null : document.createElement('input');
+    if (input) {
+      input.value = initial ?? '';
+      input.style.cssText = 'width:100%;box-sizing:border-box;padding:6px 8px;border-radius:3px;border:1px solid #444;background:#11111c;color:#eee;font-family:monospace;font-size:12px';
+    }
     const row = document.createElement('div');
     row.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;margin-top:12px';
     const cancel = document.createElement('button');
     cancel.textContent = 'Cancel';
     cancel.style.cssText = 'padding:4px 16px;border:1px solid #555;border-radius:3px;background:#2a2a40;color:#ccc;cursor:pointer;font-family:monospace;font-size:11px';
     const ok = document.createElement('button');
-    ok.textContent = 'Create';
+    ok.textContent = okLabel;
     ok.style.cssText = 'padding:4px 16px;border:1px solid #3a6;border-radius:3px;background:#244;color:#cfc;cursor:pointer;font-family:monospace;font-size:11px';
     row.append(cancel, ok);
-    box.append(heading, label, input, row);
+    box.append(heading, label, ...(input ? [input] : []), row);
     overlay.append(box);
     document.body.append(overlay);
 
+    const onKey = (e: KeyboardEvent) => {
+      // Enter submits only from the prompt's own INPUT. On a focused button it falls through to
+      // that button: Tab-to-Cancel then Enter must cancel (it submitted, briefly — #1215 close-out
+      // review), and in a confirmation the focused button is Cancel, so a destructive Replace takes
+      // a deliberate click rather than a reflexive Enter.
+      if (e.key === 'Enter' && input && e.target === input) { e.preventDefault(); submit(); }
+      else if (e.key === 'Escape') { e.preventDefault(); done(null); }
+    };
     const done = (val: string | null) => { overlay.remove(); resolve(val); };
-    const submit = () => { const v = input.value.trim(); done(v || null); };
+    const submit = () => { if (!input) { done(''); return; } const v = input.value.trim(); done(v || null); };
     ok.onclick = submit;
     cancel.onclick = () => done(null);
     overlay.onclick = (e) => { if (e.target === overlay) done(null); };
-    input.onkeydown = (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); submit(); }
-      else if (e.key === 'Escape') { e.preventDefault(); done(null); }
-    };
-    setTimeout(() => { input.focus(); input.select(); }, 0);
+    // On the OVERLAY, not the document: every key a modal should hear comes from an element inside
+    // it (the input, or the focused button), and a global listener is what keymapOwnership forbids.
+    // Removed with the overlay, so nothing outlives a closed modal.
+    overlay.onkeydown = onKey;
+    setTimeout(() => { if (input) { input.focus(); input.select(); } else { cancel.focus(); } }, 0);
   });
 }
 

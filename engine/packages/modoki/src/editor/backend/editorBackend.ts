@@ -93,10 +93,15 @@ export function jsonFileBody(data: unknown): string {
  *  which reports `write GLB failed (${res.status})`). `content` is passed through completely
  *  unchanged — compose a JSON document's bytes with `jsonFileBody` FIRST; this function does not
  *  know or care whether it is writing JSON or binary. */
-export function postWriteFile(filePath: string, content: string, encoding?: string): Promise<Response> {
+export function postWriteFile(
+  filePath: string, content: string, encoding?: string,
+  /** `createOnly` sends `ifNoneMatch:'*'`: the route answers 409 instead of overwriting a file that
+   *  is already there (#1215). Absent, the write replaces — which every save depends on. */
+  opts?: { createOnly?: boolean },
+): Promise<Response> {
   return backendFetch('/api/write-file', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path: filePath, content, encoding }),
+    body: JSON.stringify({ path: filePath, content, encoding, ...(opts?.createOnly ? { ifNoneMatch: '*' } : {}) }),
   });
 }
 

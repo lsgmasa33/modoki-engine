@@ -1787,6 +1787,60 @@ if (!uc14Path) {
   }
 }
 
+// UC15 — an agent's asset write refuses what it would destroy or orphan (#1215), against the real
+// renderer. The router tests fake the unsaved-work probe; only a live editor proves that a parked
+// particle edit actually reaches the delete gate, and that the create refusal crosses the
+// renderer op → /api/write-file → 409 → REFUSED_BY_OP chain intact.
+const UC15_PART = '/assets/particles/mcp-smoke-1215.particle.json';
+const UC15_MAT = '/assets/materials/mcp-smoke-1215.mat.json';
+const errCode = (r) => { try { return JSON.parse(text(r)).error?.code ?? ''; } catch { return ''; } };
+{
+  const pre = JSON.parse(text(await client.callTool({ name: 'modoki_list_assets', arguments: { name: 'mcp-smoke-1215' } })));
+  if (!Array.isArray(pre.assets)) throw new Error(`UC15 precheck: list_assets returned no \`assets\` array: ${JSON.stringify(pre).slice(0, 200)}`);
+  if (pre.assets.length) throw new Error(`UC15 cannot run: ${pre.assets.map((a) => a.path).join(', ')} already exists — a previous run left it behind. Trash it and re-run.`);
+}
+await withCleanup(async () => {
+  // A-1: the second create at the same path is refused, and the first asset keeps its guid.
+  const first = JSON.parse(text(await client.callTool({ name: 'modoki_create_registered_asset', arguments: { kind: 'material', path: UC15_MAT } })));
+  if (!first.ok || !first.guid) throw new Error(`UC15 first create failed: ${JSON.stringify(first).slice(0, 300)}`);
+  const again = await client.callTool({ name: 'modoki_create_registered_asset', arguments: { kind: 'material', path: UC15_MAT } });
+  if (!again.isError || errCode(again) !== 'REFUSED_BY_OP' || !/already exists/.test(text(again))) {
+    throw new Error(`UC15 a create over an existing asset must be refused, got: ${text(again).slice(0, 300)}`);
+  }
+  const listed = JSON.parse(text(await client.callTool({ name: 'modoki_list_assets', arguments: { type: 'material', name: 'mcp-smoke-1215' } })));
+  const row = (listed.assets ?? []).find((a) => a.path === UC15_MAT);
+  if (row?.guid !== first.guid) throw new Error(`UC15 the refused create changed the asset's guid (${first.guid} -> ${row?.guid})`);
+
+  // A-2: a sidecar for an asset that is not there is NOT_FOUND, not an orphan written and "ok".
+  const orphan = await client.callTool({ name: 'modoki_write_asset_meta', arguments: { path: '/assets/textures/mcp-smoke-1215-NEVER.png', meta: {} } });
+  if (!orphan.isError || errCode(orphan) !== 'NOT_FOUND') {
+    throw new Error(`UC15 write_asset_meta on a missing asset must be NOT_FOUND, got: ${text(orphan).slice(0, 300)}`);
+  }
+
+  // A-7: park a real edit, then delete. Refused; then discardUnsaved goes through and the park is gone.
+  const made = JSON.parse(text(await client.callTool({ name: 'modoki_create_asset', arguments: { type: 'particle', path: UC15_PART } })));
+  if (!made.ok) throw new Error(`UC15 could not scaffold its probe particle: ${JSON.stringify(made).slice(0, 300)}`);
+  const schema = JSON.parse(text(await client.callTool({ name: 'modoki_asset_schema', arguments: { type: 'particle' } })));
+  const parked = JSON.parse(text(await client.callTool({ name: 'modoki_particle_set', arguments: { path: UC15_PART, def: { ...schema.example, id: made.id, maxParticles: 321 } } })));
+  if (parked.saved !== false) throw new Error(`UC15 particle_set reported saved=${parked.saved} — the edit must be PARKED for the gate to have anything to see`);
+  const refusedDel = await client.callTool({ name: 'modoki_delete_asset', arguments: { paths: [UC15_PART] } });
+  if (!refusedDel.isError || errCode(refusedDel) !== 'REQUIRES_SAVE') {
+    throw new Error(`UC15 deleting a path with a parked edit must be REQUIRES_SAVE, got: ${text(refusedDel).slice(0, 300)}`);
+  }
+  const forced = JSON.parse(text(await client.callTool({ name: 'modoki_delete_asset', arguments: { paths: [UC15_PART], discardUnsaved: true } })));
+  if (forced.trashed !== 1 || forced.saved !== true) throw new Error(`UC15 discardUnsaved:true must trash the probe: ${JSON.stringify(forced).slice(0, 300)}`);
+  const state = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+  if ((state.dirtyAssetPaths ?? []).includes(UC15_PART)) throw new Error('UC15 the forced delete left the parked edit behind — the next save_all would recreate the file');
+  console.log('UC15 create over existing → refused, guid kept · orphan sidecar → NOT_FOUND · delete over a parked edit → REQUIRES_SAVE, then discardUnsaved trashes it and drops the park ✓');
+}, async () => {
+  const now = JSON.parse(text(await client.callTool({ name: 'modoki_get_editor_state', arguments: {} })));
+  if ((now.dirtyAssetPaths ?? []).includes(UC15_PART)) {
+    await client.callTool({ name: 'modoki_discard_asset_edits', arguments: { paths: [UC15_PART] } });
+  }
+  const swept = await client.callTool({ name: 'modoki_delete_asset', arguments: { paths: [UC15_PART, UC15_MAT], discardUnsaved: true } });
+  if (swept.isError) throw new Error(`UC15 could not trash its probes — they are STILL in the project (${UC15_PART}, ${UC15_MAT}): ${text(swept).slice(0, 300)}`);
+});
+
 await client.close();
 
 // F12 — a SKIPPED case used to leave the verdict at a cheerful `SMOKE OK`, so the run reported

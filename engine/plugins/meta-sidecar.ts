@@ -289,6 +289,20 @@ export function salvageIdIfCorrupt(absPath: string): string | undefined {
   }
 }
 
+/** The GUID the sidecar on disk already carries — read from a sidecar that parses, or salvaged
+ *  textually from one that does not ({@link salvageIdIfCorrupt}). `undefined` when there is no
+ *  sidecar or it carries no guid. Must be called BEFORE `quarantineCorruptSidecar` moves the file. */
+export function existingSidecarId(absPath: string): string | undefined {
+  const salvaged = salvageIdIfCorrupt(absPath);
+  if (salvaged) return salvaged;
+  try {
+    const id = (JSON.parse(fs.readFileSync(sidecarPath(absPath), 'utf-8')) as { id?: unknown }).id;
+    return typeof id === 'string' && isGuid(id) ? id : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function quarantineCorruptSidecar(absPath: string): string | undefined {
   if (classifySidecarOnDisk(absPath).kind !== 'unreadable') return undefined;
   const sidecar = sidecarPath(absPath);
@@ -320,12 +334,19 @@ export function quarantineCorruptSidecar(absPath: string): string | undefined {
  *  supply `version`. */
 export function writeMetaSidecar(absPath: string, meta: Record<string, unknown>): void {
   assertSidecarWritable(absPath);
-  // ⚠️ Capture the salvageable `id` BEFORE the quarantine moves the file away. The editor panels
+  // ⚠️ Capture the existing `id` BEFORE the quarantine moves the file away. The editor panels
   // reach here via `/api/read-meta`, which returns `{}` for an unparsable sidecar exactly as it
   // does for a missing one — so the payload they POST carries no `id`, and without this the write
   // below would produce an id-less sidecar and the next scan would mint a fresh GUID, dangling
   // every scene/prefab reference. Preserving the bytes does not preserve the ASSET; this does.
-  const salvagedId = salvageIdIfCorrupt(absPath);
+  //
+  // ⚠️ And from a sidecar that PARSES, not only a corrupt one (#1215 A-10). This used to salvage
+  // only on the corrupt branch, so `modoki_write_asset_meta` posting a complete-looking sidecar
+  // that simply omitted `id` — a valid call, the schema does not require it — wrote the file
+  // id-less, and the next scan re-minted the texture's GUID out from under every ref to it.
+  // Nothing a caller omits should be able to change an asset's identity; a caller that wants a
+  // different id has to say so, and still can.
+  const salvagedId = existingSidecarId(absPath);
   // An unparsable sidecar is moved aside, not overwritten (#778). This sits at the choke point
   // deliberately: every reimport handler reaches disk through here, and each one has already
   // lost the authored fields by this line — `readMetaSidecar` returns `{}` for a corrupt file

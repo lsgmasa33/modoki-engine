@@ -15,8 +15,9 @@
 
 import { newGuid, registerAsset, type AssetType } from '../../runtime/loaders/assetManifest';
 import { getCreatableAssets, type CreatableAssetDef } from './creatableAssets';
-import { writeAssetFile } from './assetOps';
-import { backendFetch, jsonFileBody } from '../backend/editorBackend';
+import { backendFetch, jsonFileBody, postWriteFile } from '../backend/editorBackend';
+import { resolveExistingDocumentId } from '../scene/prefab';
+import { assetWrittenToDisk } from '../scene/dirtyAssets';
 
 /** Strip the def's extension off a path to get the display name (mirrors `assetDisplayName`). */
 function displayName(path: string, ext: string): string {
@@ -33,7 +34,24 @@ export function ensureExt(path: string, ext: string): string {
 
 export type CreateRegisteredResult =
   | { ok: true; path: string; name: string; guid: string; def: CreatableAssetDef; manifestRebuilt: boolean }
-  | { ok: false; code: 'NOT_FOUND' | 'REFUSED_BY_OP'; error: string; options?: string[] };
+  | { ok: false; code: 'NOT_FOUND' | 'REFUSED_BY_OP'; error: string; options?: string[]; destinationExists?: true };
+
+/** The HUMAN "New X" create: create-only first, and replace only after `confirmReplace` says yes
+ *  (#1215 close-out review). The save dialog cannot be trusted to have asked — the Windows/Linux
+ *  fallback never checks, and the macOS panel checks the collapsed `.json` name — so a Replace that
+ *  keeps the old guid, and so silently re-points every scene and prefab using it, has to be asked
+ *  for HERE, where the real destination is known. Resolves `null` when the human declines. */
+export async function createRegisteredAssetAskingToReplace(
+  kind: string,
+  path: string,
+  confirmReplace: (fullPath: string) => Promise<boolean>,
+): Promise<CreateRegisteredResult | null> {
+  const first = await createRegisteredAsset(kind, path);
+  if (first.ok || !first.destinationExists) return first;
+  const def = getCreatableAssets().find((d) => d.id === kind);
+  if (!(await confirmReplace(def ? ensureExt(path, def.ext) : path))) return null;
+  return createRegisteredAsset(kind, path, { replace: true });
+}
 
 /** Force the BACKEND to re-scan, and report whether it did.
  *
@@ -67,7 +85,15 @@ async function rebuildBackendManifest(): Promise<boolean> {
  * structural — keyed off `def.create` existing, not off the id `'scene'` — because the registry is
  * game-extensible and the next override will not be called "scene".
  */
-export async function createRegisteredAsset(kind: string, path: string): Promise<CreateRegisteredResult> {
+export async function createRegisteredAsset(
+  kind: string,
+  path: string,
+  /** `replace:true` overwrites a file already at `path`, KEEPING that asset's GUID. Only
+   *  `createRegisteredAssetAskingToReplace` passes it, after the human confirmed in-app. The agent
+   *  op never does (§8: no option a human path does not use), so an agent create refuses an
+   *  existing destination instead (#1215 A-1). */
+  opts: { replace?: boolean } = {},
+): Promise<CreateRegisteredResult> {
   const defs = getCreatableAssets();
   const def = defs.find((d) => d.id === kind);
   if (!def) {
@@ -90,7 +116,13 @@ export async function createRegisteredAsset(kind: string, path: string): Promise
   }
 
   const full = ensureExt(path, def.ext);
-  const guid = newGuid();
+  // ⚠️ A REPLACE keeps the replaced asset's identity (owner 2026-09-15, #1215). Minting a fresh
+  // guid over an existing file left every scene/prefab ref to the old one dangling: the human said
+  // "Replace" about the file's CONTENT, not about breaking what used it. Refs now resolve to the
+  // fresh default document. Resolved BEFORE the body, so a def that stamps the guid it is handed
+  // stamps the kept one.
+  const keptId = opts.replace ? await resolveExistingDocumentId(full) : undefined;
+  const guid = keptId ?? newGuid();
   const name = displayName(full, def.ext);
   const body = def.body ? def.body(guid, name) : { id: guid };
 
@@ -107,17 +139,41 @@ export async function createRegisteredAsset(kind: string, path: string): Promise
   // here rather than trusted per def.
   const doc = body as Record<string, unknown>;
   const docId = typeof doc.id === 'string' && doc.id ? doc.id : undefined;
-  if (!docId) doc.id = guid;
   // A def that mints its OWN id wins — the document is the truth, and registering our unused one
-  // against it would recreate the same mismatch from the other side.
-  const registeredGuid = docId ?? guid;
+  // against it would recreate the same mismatch from the other side. EXCEPT over a kept id: there
+  // the refs to the replaced asset are the truth, and a def's own id would dangle all of them.
+  if (keptId) doc.id = keptId;
+  else if (!docId) doc.id = guid;
+  const registeredGuid = keptId ?? docId ?? guid;
 
-  const ok = await writeAssetFile(full, jsonFileBody(body));
+  // Create-only unless replacing: the route refuses a file that is already there, inside the same
+  // synchronous window as the write, so there is no check-then-write gap for a file to appear in.
+  let res: Response | undefined;
+  try { res = await postWriteFile(full, jsonFileBody(body), undefined, { createOnly: !opts.replace }); }
+  catch { res = undefined; }
+  if (res?.status === 409) {
+    return {
+      ok: false, code: 'REFUSED_BY_OP', destinationExists: true,
+      error: `${full} already exists. Creating a '${kind}' there would REPLACE that asset with a blank default document, so this refuses rather than overwriting it.`,
+      options: [
+        'modoki_write_asset — edit the existing asset in place instead',
+        `a different path — e.g. ${full.slice(0, -def.ext.length)}-2${def.ext}`,
+        'modoki_delete_asset first, if replacing it with a fresh default is really what you want (its refs will then dangle)',
+      ],
+    };
+  }
+  const ok = res?.ok === true;
   if (!ok) {
     // A failed write that registered the guid anyway would leave the manifest pointing at a file
     // that is not there — resolvable, and dangling.
     return { ok: false, code: 'REFUSED_BY_OP', error: `failed to write ${full} (path outside the asset roots, or the folder does not exist)` };
   }
+  // The file on disk is now authoritative, so any parked panel edit for this path must go — the
+  // same call every other New-X button makes (ParticleEditor, AnimationEditor, …). It matters for
+  // a REPLACE: `/api/write-file` marks the write as the editor's own, so the watcher skips it and
+  // never drops the park, and the next Cmd+S would flush the old edited doc straight back over the
+  // replacement (#1215 close-out review). A no-op for a fresh path.
+  assetWrittenToDisk(full);
   registerAsset(registeredGuid, full, def.assetType as AssetType);
   const manifestRebuilt = await rebuildBackendManifest();
   return { ok: true, path: full, name, guid: registeredGuid, def, manifestRebuilt };

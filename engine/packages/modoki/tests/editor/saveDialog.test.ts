@@ -13,7 +13,7 @@ vi.mock('../../src/editor/backend/editorBackend', () => ({
   backendFetch: (...args: unknown[]) => backendFetch(...args),
 }));
 
-import { saveAssetDialog } from '../../src/editor/utils/saveDialog';
+import { saveAssetDialog, confirmReplaceAsset } from '../../src/editor/utils/saveDialog';
 
 const jsonResponse = (body: unknown) => ({ json: async () => body }) as unknown as Response;
 
@@ -108,5 +108,82 @@ describe('saveAssetDialog', () => {
     modalInput()!.value = '/games/x/assets/Offline';
     clickBtn('Create');
     expect(await p).toBe('/games/x/assets/Offline.anim.json');
+  });
+});
+
+/** The in-app modal's KEYBOARD contract (#1215). The fallback prompt and the Replace confirmation
+ *  share one shell, and the close-out review found the shared keydown listener submitting a prompt
+ *  when Enter was pressed on a focused Cancel. */
+describe('modal keyboard behaviour', () => {
+  const press = (target: EventTarget, key: string) =>
+    target.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+  const settled = async <T>(p: Promise<T>) => {
+    let done = false; let value: T | undefined;
+    p.then((v) => { done = true; value = v; });
+    await tick();
+    return { done, value };
+  };
+  const button = (label: string) =>
+    [...document.querySelectorAll('button')].find((b) => b.textContent === label) as HTMLButtonElement;
+
+  it('prompt: Enter in the INPUT submits the typed path', async () => {
+    backendFetch.mockResolvedValue(jsonResponse({ unsupported: true }));
+    const p = saveAssetDialog(opts);
+    await tick();
+    modalInput()!.value = '/games/x/assets/Typed';
+    press(modalInput()!, 'Enter');
+    expect(await p).toBe('/games/x/assets/Typed.anim.json');
+  });
+
+  it('prompt: Enter on a focused CANCEL does not submit', async () => {
+    backendFetch.mockResolvedValue(jsonResponse({ unsupported: true }));
+    const p = saveAssetDialog(opts);
+    await tick();
+    press(button('Cancel'), 'Enter');
+    expect((await settled(p)).done, 'Enter on Cancel must not resolve the prompt with the path').toBe(false);
+    button('Cancel').click();
+    expect(await p).toBeNull();
+  });
+
+  it('confirm: Replace resolves true; Cancel and Escape resolve false', async () => {
+    const yes = confirmReplaceAsset('/a/rock.mat.json');
+    await tick();
+    expect(document.body.textContent).toContain('/a/rock.mat.json');
+    button('Replace').click();
+    expect(await yes).toBe(true);
+
+    const no = confirmReplaceAsset('/a/rock.mat.json');
+    await tick();
+    button('Cancel').click();
+    expect(await no).toBe(false);
+
+    const esc = confirmReplaceAsset('/a/rock.mat.json');
+    await tick();
+    press(document.activeElement ?? document.body, 'Escape');
+    expect(await esc).toBe(false);
+  });
+
+  it('confirm: Enter does NOT replace — a destructive Replace takes a click', async () => {
+    const p = confirmReplaceAsset('/a/rock.mat.json');
+    await tick();
+    expect(document.activeElement?.textContent).toBe('Cancel');
+    press(document.activeElement ?? document, 'Enter');
+    expect((await settled(p)).done).toBe(false);
+    button('Cancel').click();
+    expect(await p).toBe(false);
+  });
+
+  it('registers no GLOBAL key listener — the modal listens on its own overlay', async () => {
+    const add = vi.spyOn(document, 'addEventListener');
+    const addWin = vi.spyOn(window, 'addEventListener');
+    try {
+      const p = confirmReplaceAsset('/a/one.mat.json');
+      await tick();
+      expect(add.mock.calls.filter((c) => c[0] === 'keydown')).toEqual([]);
+      expect(addWin.mock.calls.filter((c) => c[0] === 'keydown')).toEqual([]);
+      button('Cancel').click();
+      expect(await p).toBe(false);
+      expect(document.querySelectorAll('button').length).toBe(0);
+    } finally { add.mockRestore(); addWin.mockRestore(); }
   });
 });

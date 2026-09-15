@@ -139,8 +139,8 @@ const ENV_CODES = new Set(['NOT_FOUND', 'NO_RENDERER', 'REQUIRES_SAVE', 'AMBIGUO
 /** ⚠️ `REQUIRES_SAVE` cannot fire in THIS sweep, and is kept anyway (#994 widen, 2026-09-09).
  *
  *  Its only producers are `modoki_build`, `modoki_add_native_target`, `modoki_ota_publish`
- *  (`src/tools/project.ts`) and the four `unsavedRefusal()` callers in `editorBackendRouter.ts`
- *  (`/api/write-meta`, `/api/reimport`, `/api/asset-write`, `/api/duplicate-asset`). All seven
+ *  (`src/tools/project.ts`) and the five `unsavedRefusal()` callers in `editorBackendRouter.ts`
+ *  (`/api/write-meta`, `/api/reimport`, `/api/asset-write`, `/api/duplicate-asset`, `/api/delete-asset`). All eight
  *  MUTATE, so none is among the non-mutating tools swept below. Same "declared ≠ reachable" shape
  *  as the defect #994 fixed — but this one produces no wrong verdict, and deleting it would be a
  *  claim that no future read-only tool can refuse that way, which is not ours to make.

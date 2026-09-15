@@ -105,7 +105,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'an explicit "write this file" tool, not a live-state edit. For a LIVE particle/animation preview ' +
       'while tuning, prefer modoki_particle_set / modoki_anim_set_clip.',
     {
-      path: z.string().describe('Asset-root URL of the file to WRITE, e.g. /assets/particles/spark.particle.json. Must already exist — use modoki_create_asset for a new one.'),
+      path: z.string().describe('Asset-root URL of the file to WRITE, e.g. /assets/particles/spark.particle.json. Must already exist — a path that is not on disk is refused NOT_FOUND; use modoki_create_asset for a new one.'),
       type: z.enum(ASSET_TYPES)
         .describe('The asset type `data` conforms to; picks the validator applied before the write.'),
       data: z.record(z.any()).describe('The asset document IN FULL (see modoki_asset_schema for the shape). Fields you omit are DELETED — this is a replace, not a merge.'),
@@ -137,6 +137,10 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'an asset already loaded into the open scene stays live until the next scene swap, even ' +
       'though its file is gone. The panel\'s delete has the same limit — this is not a difference ' +
       'between them.\n\n' +
+      'REFUSES (REQUIRES_SAVE) while the editor holds a human\'s UNSAVED edit for a path you are ' +
+      'deleting, or for anything inside a folder you are deleting: the delete would destroy it. ' +
+      'modoki_save_all first, or discardUnsaved:true. An unsaved live-world scene edit does not ' +
+      'refuse — trashing the file destroys nothing in the world.\n\n' +
       'A path that is not on disk is REPORTED in `missing`, not an error — so a list carrying ' +
       'maybe-absent sidecars is safe, and `trashed` counts only files that really existed. ' +
       'A path the OS REFUSES to trash (locked, denied ACL, >260 chars) is named in `failed` and ' +
@@ -154,8 +158,12 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     {
       paths: z.array(z.string()).min(1)
         .describe('Asset-root URLs to trash, e.g. ["/games/x/assets/fx/probe.particle.json"]. Trashed in ONE OS call (one trash sound). Include the .meta.json sidecars yourself — nothing expands the list for you.'),
+      discardUnsaved: z.boolean().optional().describe(
+        `${DISCARD_UNSAVED_BASE}. Here that work is an unsaved asset document, import-settings or `
+        + 'base-scene edit for a path being deleted: the editor drops it along with the file.',
+      ),
     },
-    async ({ paths }) => postJson('/api/delete-asset', { paths },
+    async ({ paths, discardUnsaved }) => postJson('/api/delete-asset', { paths, ...(discardUnsaved ? { discardUnsaved: true } : {}) },
       undefined, `move ${paths.length} asset file(s) to the OS trash`),
   );
 
@@ -202,6 +210,9 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'and the save dialog is what made cancelling safe — supplying a path is exactly what removes ' +
       'that guard. Use modoki_new_scene, which refuses with REQUIRES_SAVE when there is unsaved ' +
       'work.\n\n' +
+      'REFUSES a path that already exists rather than replacing it — a replacement would be a ' +
+      'blank default under a NEW guid, dangling every ref to the old asset. Edit that asset with ' +
+      'modoki_write_asset instead.\n\n' +
       'Writes the file directly and registers its GUID. Verify with modoki_list_assets (a `name` ' +
       'filter finds it in one call); edit the new document with modoki_write_asset; remove it with ' +
       'modoki_delete_asset. NOT modoki_resolve_refs — that resolves ENTITY refs from journal ' +
@@ -424,7 +435,8 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     + 'opposed to what references it.\n\n'
     + 'REPLACES the sidecar — it does not merge — so modoki_get_asset_meta FIRST, change the fields '
     + 'you mean, and post the whole object back. A partial post silently drops every setting you '
-    + 'omitted.\n\n'
+    + 'omitted, except the asset\'s `id`, which is kept. A path with no asset on disk, a folder, or the .meta.json itself is refused '
+    + '(NOT_FOUND) rather than writing an orphan sidecar.\n\n'
     + 'Writing settings does NOT re-convert the asset: run modoki_reimport_asset afterwards, or the '
     + 'files on disk still reflect the OLD settings while the sidecar claims the new ones. '
     + '⚠️ Texture settings are load-bearing on real hardware — block-compressed KTX2 needs '
@@ -463,7 +475,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     + 'is why this is not a file copy: a byte-for-byte duplicate would carry the original\'s guid '
     + 'and two assets claiming one guid breaks every ref that resolves through the manifest. Use it '
     + 'to fork a material/prefab/particle as a starting point. REFUSES rather than clobbering: a '
-    + 'destination that already exists is a 409. Verify with modoki_list_assets.\n\n'
+    + 'destination that already exists is a 409. Verify with modoki_list_assets — the manifest is rebuilt before the reply (`manifestRebuilt`).\n\n'
     + '⚠️ The copy\'s .meta.json import settings are seeded from the SOURCE\'S FILE, so this refuses '
     + '(REQUIRES_SAVE) while the source has a parked Inspector import-settings edit — the copy '
     + 'would otherwise be born with the pre-edit settings. modoki_save_all first, or force:true.',
@@ -487,7 +499,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     + '`mv` is not, because the manifest is rebuilt from the new location. REFUSES rather than '
     + 'clobbering: a destination that already exists is a 409, and a missing source is a 404. A '
     + 'case-only rename (Sprites -> sprites) IS allowed, since on macOS/Windows the two paths are '
-    + 'the same entry rather than a collision. Verify with modoki_list_assets.\n\n'
+    + 'the same entry rather than a collision. Verify with modoki_list_assets — the manifest is rebuilt before the reply (`manifestRebuilt`).\n\n'
     + '⚠️ `repairFailed` = the file moved but an attached editor was NOT repaired, so its bindings '
     + 'and parked writes still point at the old path and the next human Cmd+S can undo the move. '
     + 'The panel repairs itself; you, from another process, have no backstop. Say so.',

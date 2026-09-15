@@ -131,7 +131,7 @@ export default function CleanupAssetsDialog() {
       // Asking for a path that is not there is free: the backend skips it and reports it in
       // `missing` rather than failing.
       const withSidecars = paths.flatMap((p) => [p, `${p}.meta.json`, `${p}.meta.local.json`]);
-      const res = await backendPostJson('/api/delete-asset', { paths: withSidecars });
+      const res = await backendPostJson('/api/delete-asset', { paths: withSidecars, rendererWrite: true });
       const j = (await res.json()) as { ok?: boolean; error?: string; trashed?: number; failed?: string[] };
       if (!res.ok || !j.ok) throw new Error(j.error || `delete failed (${res.status})`);
       // ⚠️ A PARTIAL refusal is `ok:true`, so the throw above cannot see it — this dialog was the

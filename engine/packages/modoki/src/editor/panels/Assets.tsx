@@ -38,8 +38,8 @@ import { newGuid } from '../../runtime/loaders/assetManifest';
 import { getCreatableAssets, type CreatableAssetDef } from './creatableAssets';
 import { reimportPaths } from './assetViews/reimport';
 import { openAssetInEditor } from './openAssetInEditor';
-import { saveAssetDialog } from '../utils/saveDialog';
-import { createRegisteredAsset } from './createRegisteredAsset';
+import { saveAssetDialog, confirmReplaceAsset } from '../utils/saveDialog';
+import { createRegisteredAssetAskingToReplace } from './createRegisteredAsset';
 
 /** Display name from an asset path: last segment minus a known double/single extension. */
 function assetDisplayName(p: string, ext: string): string {
@@ -944,7 +944,10 @@ export default function Assets() {
     }
     // Everything else shares ONE create path with the agent op (#288 gap 5), so a kind that works
     // for the human cannot silently differ for a tool.
-    const r = await createRegisteredAsset(def.id, path);
+    // Create-only, then an in-app "Replace?" if the file exists — the save dialog above cannot be
+    // trusted to have asked for the real destination (#1215). A Replace keeps the replaced guid.
+    const r = await createRegisteredAssetAskingToReplace(def.id, path, confirmReplaceAsset);
+    if (!r) return;
     if (!r.ok) { console.error(`[Assets] ${r.error}`); return; }
     refresh();
     def.onCreated?.({ path: r.path, name: r.name, guid: r.guid });
