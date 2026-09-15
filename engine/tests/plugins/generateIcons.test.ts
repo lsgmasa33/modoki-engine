@@ -175,7 +175,9 @@ describe('resolveIconInputs (#1011)', () => {
       splashDarkSource: 'art/splash-dark.png',
       splashTitleSource: 'art/title.png',
       iconMonochromeSource: 'art/mono.png',
+      notificationIconSource: 'art/glyph.png',
     }));
+    expect(r.notificationIcon).toBe(path.join(ROOT, 'art/glyph.png'));
     expect(r.icon).toBe(path.join(ROOT, 'art/icon.png'));
     expect(r.splash).toBe(path.join(ROOT, 'art/splash.png'));
     expect(r.splashDark).toBe(path.join(ROOT, 'art/splash-dark.png'));
@@ -250,6 +252,26 @@ describe('resolveIconInputs (#1011)', () => {
     });
   });
 
+  // #1203 close-out review: the notification icon's removal is the same rule, and it was first written
+  // as "no source ⇒ remove", which deletes a game's committed drawables on a hand run over a config the
+  // script could not read. One case per branch.
+  describe('notificationIconCleared — facet B again', () => {
+    it('clears only when the config was READ and names no source', () => {
+      expect(resolveIconInputs({}, ROOT, cfgWith({})).notificationIconCleared).toBe(true);
+      expect(resolveIconInputs({}, ROOT, cfgWith({ notificationIconSource: 'art/n.png' })).notificationIconCleared).toBe(false);
+    });
+    it('does NOT clear when the config could not be read', () => {
+      expect(resolveIconInputs({}, ROOT, null).notificationIconCleared).toBe(false);
+    });
+    it('obeys the caller\'s flag when it cannot read the config itself (the packaged editor)', () => {
+      expect(resolveIconInputs({ 'notification-icon-cleared': 'true' }, ROOT, null).notificationIconCleared).toBe(true);
+    });
+    it('lets an explicit FALSE flag win over a readable, empty config', () => {
+      // `flag === 'true' || inference` would pass every case above; this is the one it fails.
+      expect(resolveIconInputs({ 'notification-icon-cleared': 'false' }, ROOT, cfgWith({})).notificationIconCleared).toBe(false);
+    });
+  });
+
   it('its no-config fallbacks are the REAL config defaults, not a second copy of them', () => {
     // `resolveIconInputs` hard-codes 55 / -8 for the case where there is no config to read at all
     // (a hand run on a non-source checkout). That is a genuine fallback — a .mjs script cannot
@@ -287,6 +309,7 @@ describe('iconInputsToArgs — the editor hands the script EVERYTHING it resolve
         iconSource: 'art/icon.png', splashSource: 'art/splash.png', splashDarkSource: 'art/splash-dark.png',
         splashTitleSource: 'art/title.png', splashTitleWidthPct: 40, splashTitleOffsetPct: 12, splashBadge: true,
         iconDarkSource: 'art/d.png', iconTintedSource: 'art/t.png', iconMonochromeSource: 'art/m.png',
+        notificationIconSource: 'art/n.png',
       },
       capacitor: { orientation: 'landscape' },
     }],
@@ -327,6 +350,14 @@ describe('stampExtrasFrom (#1011)', () => {
     expect(extras.titleWidthPct).toBe(33);
     expect(extras.badgeArtAbs).toBe(inputs.badgeLight);
     expect(extras.engineRootAbs).toBe(path.join(path.sep, 'engine-root'));
+  });
+
+  it('carries the notification icon source, so re-cutting that art regenerates (#1203)', () => {
+    // Mutation-found: with this field dropped, every other test stayed green, while an edited
+    // notification glyph read as "already current" and shipped the old icon.
+    const inputs = resolveIconInputs({}, path.join(path.sep, 'proj'), { app: { notificationIconSource: 'art/n.png' }, capacitor: {} });
+    expect(stampExtrasFrom(inputs, path.join(path.sep, 'engine-root')).notificationIconSrcAbs)
+      .toBe(path.join(path.sep, 'proj', 'art/n.png'));
   });
 
   it('drops the badge art from the stamp when the badge is off, so it cannot change the hash', () => {
@@ -767,6 +798,53 @@ describe('generate-icons reads project.config.json (#1011, at the seam)', () => 
     const strict = runIn(['--project', root, '--platform', 'android', '--strict', 'true']);
     expect(strict.status).not.toBe(0);
     expect(`${strict.stdout}${strict.stderr}`).toMatch(/not building on derived stand-ins/);
+  });
+
+  it('a broken notificationIconSource withholds the stamp too (#1203) — the sixth requested input', () => {
+    // No derivation stands behind this one, so the degrade is "leave the committed icon" rather than
+    // "derive" — but stamping it would still make a repaired path regenerate nothing.
+    writeConfig({ iconSource: 'art/icon.png', notificationIconSource: 'art/no-such-glyph.png' });
+    realPng('art/icon.png');
+    fs.mkdirSync(path.join(root, 'android', 'app', 'src', 'main', 'res'), { recursive: true });
+    npxSucceeds();
+    const res = runIn(['--project', root, '--platform', 'android']);
+    expect(res.status).toBe(0);
+    expect(`${res.stdout}${res.stderr}`).toMatch(/notificationIconSource/);
+    expect(fs.existsSync(path.join(root, '.cache', 'icon-stamp-android'))).toBe(false);
+  });
+
+  it('a hand run over a MALFORMED config keeps the committed notification icons (#1203 review)', () => {
+    // The script's own banner says it is using flags only and "clearing nothing". Before the fix, an
+    // absent `--notification-icon` still read as a cleared setting, and all five drawables were deleted.
+    fs.writeFileSync(path.join(root, 'project.config.json'), '{ "app": { "notificationIconSource": "art/n.png", } }');
+    realPng('art/icon.png');
+    const icon = write(path.join('android', 'app', 'src', 'main', 'res', 'drawable-mdpi', 'ic_stat_notification.png'), 'committed');
+    npxSucceeds();
+    const res = runIn(['--project', root, '--platform', 'android', '--icon', path.join(root, 'art/icon.png')]);
+    expect(res.status).toBe(0);
+    expect(fs.existsSync(icon), `${res.stdout}${res.stderr}`).toBe(true);
+  });
+
+  // The removal is wired end to end, driven the two ways production clears it. Found by mutation: with
+  // `cleared:` dropped from the generator's call, every other test stayed green (#1203 review).
+  it('a readable config with NO notificationIconSource removes the committed icons', () => {
+    writeConfig({ iconSource: 'art/icon.png' });
+    realPng('art/icon.png');
+    const icon = write(path.join('android', 'app', 'src', 'main', 'res', 'drawable-mdpi', 'ic_stat_notification.png'), 'stale');
+    npxSucceeds();
+    const res = runIn(['--project', root, '--platform', 'android']);
+    expect(res.status).toBe(0);
+    expect(fs.existsSync(icon), `${res.stdout}${res.stderr}`).toBe(false);
+  });
+
+  it('--notification-icon-cleared true removes them when the script cannot read the config (the packaged editor)', () => {
+    fs.writeFileSync(path.join(root, 'project.config.json'), '{ "app": { "iconSource": "art/icon.png", } }');
+    realPng('art/icon.png');
+    const icon = write(path.join('android', 'app', 'src', 'main', 'res', 'drawable-mdpi', 'ic_stat_notification.png'), 'stale');
+    npxSucceeds();
+    const res = runIn(['--project', root, '--platform', 'android', '--icon', path.join(root, 'art/icon.png'), '--notification-icon-cleared', 'true']);
+    expect(res.status).toBe(0);
+    expect(fs.existsSync(icon), `${res.stdout}${res.stderr}`).toBe(false);
   });
 
   it('a malformed config is FATAL under --strict instead of exiting 0 on stale art', () => {

@@ -66,7 +66,7 @@ export function resolveIconInputs(args, projectRoot, cfg, engineRoot) {
   // exists precisely so a caller can state something the script cannot infer, so it must not
   // quietly stop stating it. `parseArgs` is a naive pairwise loop, so a flag passed LAST with no
   // value lands here as `undefined` too.
-  for (const [flag, raw] of [['badge', args.badge], ['splash-cleared', args['splash-cleared']], ['strict', args.strict]]) {
+  for (const [flag, raw] of [['badge', args.badge], ['splash-cleared', args['splash-cleared']], ['notification-icon-cleared', args['notification-icon-cleared']], ['strict', args.strict]]) {
     if (raw !== undefined && raw !== 'true' && raw !== 'false') {
       console.warn(`[icon] ⚠️ --${flag} expects true|false, got ${JSON.stringify(raw)} — reading it as false. `
         + 'A boolean flag with no value (or a trailing flag) parses this way.');
@@ -104,6 +104,15 @@ export function resolveIconInputs(args, projectRoot, cfg, engineRoot) {
     iconDark: pick('icon-dark', app?.iconDarkSource),
     iconTinted: pick('icon-tinted', app?.iconTintedSource),
     iconMonochrome: pick('icon-monochrome', app?.iconMonochromeSource),
+    // Android's notification small icon (#1203). No derivation and no default: unset means the
+    // project emits none. Whether an earlier build's output is REMOVED is the next field's call.
+    notificationIcon: pick('notification-icon', app?.notificationIconSource),
+    // The same two ways to know as `splashCleared` below, for the same reason (#1203 review): an
+    // unreadable config names no source because it cannot see one, and removing the committed
+    // drawables there destroys art. The packaged editor states it with the flag.
+    notificationIconCleared: args['notification-icon-cleared'] !== undefined
+      ? args['notification-icon-cleared'] === 'true'
+      : args['notification-icon'] === undefined && cfg !== null && !cfgSet(app?.notificationIconSource),
     // ⚠️ FACET B. Deleting the staged splash is only correct when the CONFIG says there is no custom
     // splash — "the author cleared `splashSource`". It is wrong when the operator merely did not type
     // the flag, and it was wrong for every hand run because the two were indistinguishable here.
@@ -161,6 +170,11 @@ export function stampExtrasFrom(inputs, engineRootAbs) {
     // that flips `--splash-cleared` while changing nothing else — where the clear is skipped as
     // "already current". Deleting `.cache/icon-stamp-<platform>` is the recovery, and the cost of
     // the alternative is paid by every project on every machine.
+    // `notificationIconCleared` is left out for the same reason, since its source hash separates set
+    // from unset. One difference: these drawables are COMMITTED, while the staged splash is local
+    // scratch. So git can bring in the icons while this machine's stamp stays at an older "unset"
+    // (build at C0 with it unset, then pull C1 which opts in and C2 which clears it without committing
+    // the deletions). That build is skipped and the icons stay. Same recovery: delete the stamp.
     // ⚠️ NOT re-gated on `inputs.badge` here. `resolveIconInputs` already returns these as undefined
     // when the badge is off, and a second copy of that rule is a redundant property: a test written
     // against it passes whether or not the gate exists, because the other mechanism already produced
@@ -170,6 +184,7 @@ export function stampExtrasFrom(inputs, engineRootAbs) {
     iconDarkSrcAbs: inputs.iconDark,
     iconTintedSrcAbs: inputs.iconTinted,
     iconMonochromeSrcAbs: inputs.iconMonochrome,
+    notificationIconSrcAbs: inputs.notificationIcon,
     titleWidthPct: inputs.titleWidthPct,
     titleOffsetPct: inputs.titleOffsetPct,
     badge: inputs.badge,
@@ -182,7 +197,7 @@ export function stampExtrasFrom(inputs, engineRootAbs) {
  *  that could not read the config (`cfg === null`, the packaged editor) resolves the same inputs from
  *  these alone. Returns `[flag, value]` pairs WITHOUT the leading `--`; the caller quotes them for its
  *  shell. An undefined input emits no flag (absent means unset on the way back in); a boolean always
- *  emits, because for `badge`, `splash-cleared` and `strict` an absent flag does NOT mean false once
+ *  emits, because for `badge`, `splash-cleared`, `notification-icon-cleared` and `strict` an absent flag does NOT mean false once
  *  the config is unreadable.
  *
  *  @param {ReturnType<typeof resolveIconInputs>} inputs
@@ -206,5 +221,7 @@ export function iconInputsToArgs(inputs) {
   str('icon-dark', inputs.iconDark);
   str('icon-tinted', inputs.iconTinted);
   str('icon-monochrome', inputs.iconMonochrome);
+  str('notification-icon', inputs.notificationIcon);
+  out.push(['notification-icon-cleared', inputs.notificationIconCleared ? 'true' : 'false']);
   return out;
 }

@@ -17,6 +17,11 @@ export interface IconInputs {
   iconDark: string | undefined;
   iconTinted: string | undefined;
   iconMonochrome: string | undefined;
+  /** Android's notification small icon source (#1203). Undefined = emit none. */
+  notificationIcon: string | undefined;
+  /** True ONLY when the config positively has no `notificationIconSource`, or the caller says so with
+   *  `--notification-icon-cleared`. Gates removing a previously emitted icon (#1203). */
+  notificationIconCleared: boolean;
   /** True ONLY when the config positively has no `splashSource`, i.e. the setting was cleared —
    *  never merely because the `--splash` flag was not typed, and never when `cfg` is null. */
   splashCleared: boolean;
@@ -50,6 +55,7 @@ export declare function stampExtrasFrom(
   iconDarkSrcAbs?: string;
   iconTintedSrcAbs?: string;
   iconMonochromeSrcAbs?: string;
+  notificationIconSrcAbs?: string;
   titleWidthPct?: number;
   titleOffsetPct?: number;
   badge?: boolean;

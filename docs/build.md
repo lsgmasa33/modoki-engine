@@ -583,6 +583,44 @@ the obvious "the knight is the bright bit" key does not work.
 ground, simulates the Android adaptive mask at the real inset, shows the tinted variant under a
 tint, and shows each splash as a device crops it.
 
+### Notification small icon — Android (#1203)
+
+`@capacitor/local-notifications` finds its small icon **by drawable name**: `capacitor.config.json`
+`plugins.LocalNotifications.smallIcon`, else `android.R.drawable.ic_dialog_info`. That fallback is the
+generic white "i", and `dumpsys notification` shows it as `id=0x0108009b` (a framework `0x01` id).
+`@capacitor/assets` emits nothing for that slot, so a game that posts notifications needs one emitted.
+
+- **Opt in with `app.notificationIconSource`** (Project Settings → "Notification icon (Android)").
+  `engine/scripts/notificationIcon.mjs` then writes
+  `res/drawable-{mdpi,hdpi,xhdpi,xxhdpi,xxxhdpi}/ic_stat_notification.png` at 24dp. Unset emits
+  nothing, and clearing it removes what an earlier build wrote. Then name it in
+  `capacitor.config.json`: `"LocalNotifications": { "smallIcon": "ic_stat_notification" }`.
+  ⚠️ **Nothing at build time can see that join fail**: a wrong name just posts the framework "i". A
+  game that opts in pins it in a test (`games/wordweave/tests/config.test.ts`).
+- **Android draws the alpha only.** The source must be a silhouette, and the emitter forces the RGB to
+  white. The themed-launcher `iconMonochromeSource` is usually the right file.
+  - There is deliberately **no derivation**. A silhouette recovered from a painting is the #397
+    fallback, and at 24dp it is a smudge.
+  - A fully opaque source (including an RGB or JPEG file) is not emitted, because it would render
+    as a solid square. The previous icon stays, and the run is not stamped.
+- **The crop keys on alpha ≥ 64, not ≥ 1.** Brush art carries a faint wash to the canvas edge.
+  Cropping to that kept 19..1011 of Weaveling's 1024 px master, where the grid itself is 81..943, so
+  the mark lost a fifth of its size. The mark is then fitted to Material's 22dp live area and centred.
+- **Stamp.** The source's content is hashed into the Android stamp only, so opting in does not
+  regenerate a game's iOS set. ⚠️ **`notificationIcon.mjs` is a `PIPELINE_SOURCES` entry, and that
+  hash is shared by both platforms.** Any edit to the file, a comment included, regenerates every
+  project's icons on both platforms once, as an edit to `iconVariants.mjs` always has. Three degrades
+  join the #1028 no-stamp list:
+  - an unreadable source;
+  - a source with no pixel at alpha ≥ 64;
+  - a fully opaque source.
+- **Clearing is POSITIVE, like the splash's facet B.** A previously emitted icon is removed only when
+  the config was read and names no source, or when the caller passes `--notification-icon-cleared
+  true` (the packaged editor). A hand run over an unreadable config removes nothing.
+- **Tint:** `plugins.LocalNotifications.iconColor`. ⚠️ The plugin passes it to `Color.parseColor`
+  and, on a parse failure, rejects and returns BEFORE building the notification. So a malformed colour
+  means no notification at all, not an untinted one.
+
 **The generator does not stay inside the platform it is given** (#236). Measured on
 `forest-camp`: `generate --android` also rewrites `ios/App/App.xcodeproj/project.pbxproj`,
 stripping the leading zero off `LastUpgradeCheck = 0920` → `920` — an **iOS** file mangled by an

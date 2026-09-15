@@ -48,6 +48,7 @@ import { ICON_TOOL, iconColorArgs, bundledIconPath } from './iconAssets.mjs';
 import { composeSplashOverlays } from './splashCompose.mjs';
 import { writeIosIconVariants, writeAndroidIconVariants } from './iconVariants.mjs';
 import { applyAndroidSplashTheme } from './androidSplashTheme.mjs';
+import { writeAndroidNotificationIcon } from './notificationIcon.mjs';
 import { isEntryPoint } from './entryPoint.mjs';
 import { loadEnginePluginModuleResult } from './loadVendorPlugins.mjs';
 import { resolveIconInputs, stampExtrasFrom } from './iconInputs.mjs';
@@ -229,6 +230,7 @@ async function main() {
       + '                        [--title-width <pct>] [--title-offset <pct>] [--badge true|false]\n'
       + '                        [--badge-light <file>] [--badge-dark <file>] [--orientation portrait|landscape|any]\n'
       + '                        [--icon-dark <file>] [--icon-tinted <file>] [--icon-monochrome <file>]\n'
+      + '                        [--notification-icon <file>] [--notification-icon-cleared true|false]\n'
       + '                        [--strict true|false]  every degraded outcome exits non-zero instead of 0.\n'
       + '                                               Set by the two BUILD callers; a hand run stays forgiving.');
     process.exit(2);
@@ -491,6 +493,24 @@ async function main() {
   // (`splashEdgeColour` throws `extract_area: bad extract area` on a master 1 px in either
   // dimension) and an operator told the wrong subsystem failed looks in the wrong place.
   if (platform === 'android') {
+    // Its own try for the same reason as the splash colour below: a failure has to name its own
+    // subsystem. Opt-in, so for a project without `app.notificationIconSource` this only removes a
+    // previously emitted icon, and there usually is none.
+    try {
+      const notif = await writeAndroidNotificationIcon({
+        projectRoot, srcAbs: inputs.notificationIcon, cleared: inputs.notificationIconCleared,
+      });
+      if (notif.written.length) console.log(`[icon] notification small icon: ${notif.written.length} file(s)`);
+      if (notif.removed.length) console.log(`[icon] notification small icon cleared: removed ${notif.removed.length} file(s)`);
+      for (const n of notif.notes) console.log(`[icon] ${n}`);
+      requestedButMissing.push(...notif.missing);
+    } catch (e) {
+      console.error(`[icon] notification small icon failed (${e.message}) — will retry next build`);
+      postFailed = true;
+    }
+  }
+
+  if (platform === 'android') {
     try {
       // The Android 12+ system splash is the only launch surface the platform actually draws —
       // the generated drawable buckets are never shown at minSdk 31+. See androidSplashTheme.mjs.
@@ -535,12 +555,15 @@ async function main() {
   // can discover an entry. Five sites feed this list; one branch acts on it. Patching each site
   // instead is how the first cut of #1028 fixed the light splash and left four siblings behind.
   if (requestedButMissing.length) {
-    console.error(`[icon] ⚠️  ${requestedButMissing.length} authored input(s) were REQUESTED and could not be read, `
-      + 'so a derived stand-in was used instead:');
+    // Each entry names its own reason: most are an unreadable path, but the notification icon also
+    // reports art that was READ and is unusable (nothing above the alpha floor, or fully opaque),
+    // where the path is fine and the art is what needs fixing.
+    console.error(`[icon] ⚠️  ${requestedButMissing.length} authored input(s) were REQUESTED and could not be used, `
+      + 'so a derived stand-in or the previously committed art ships instead:');
     for (const m of requestedButMissing) console.error(`[icon]   ${m}`);
     if (inputs.strict) {
-      console.error('[icon] --strict: not building on derived stand-ins for art somebody authored. '
-        + 'Fix the path(s) above, or clear the field(s) in Project Settings if the art is genuinely gone.');
+      console.error('[icon] --strict: not building on derived stand-ins or stale art for inputs somebody authored. '
+        + 'Fix each input above as its line says, or clear the field(s) in Project Settings if the art is genuinely gone.');
       process.exit(1);
     }
     postFailed = true;   // no stamp: the next run re-attempts, so a repaired path self-heals

@@ -58,6 +58,7 @@ const PIPELINE_SOURCES = [
   'splashLayout.mjs',
   'iconVariants.mjs',
   'androidSplashTheme.mjs',
+  'notificationIcon.mjs',
 ] as const;
 
 /** Hash of the given files' contents — the identity of our own post-processing code.
@@ -112,6 +113,9 @@ export interface IconStampExtras {
   iconDarkSrcAbs?: string;
   iconTintedSrcAbs?: string;
   iconMonochromeSrcAbs?: string;
+  /** Android's notification small icon (#1203). Hashed on Android only, so opting in does not
+   *  regenerate a game's iOS icons. */
+  notificationIconSrcAbs?: string;
   titleWidthPct?: number;
   titleOffsetPct?: number;
   badge?: boolean;
@@ -169,6 +173,8 @@ export function iconStampValue(
       String(extras.titleOffsetPct ?? ''),
       String(extras.badge ?? false),
       extras.orientation ?? '',
+      // Android-only: iOS has no such artifact, so opting a game in must not regenerate its iOS set.
+      plat === 'android' ? fileHash(extras.notificationIconSrcAbs) : '',
     ].join('\0'))
     .digest('hex');
 }

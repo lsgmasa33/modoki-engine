@@ -142,9 +142,17 @@ describe('splash + icon-variant inputs are all in the stamp', () => {
     ['iconDarkSrcAbs'],
     ['iconTintedSrcAbs'],
     ['iconMonochromeSrcAbs'],
+    ['notificationIconSrcAbs'],
   ])('configuring %s changes the stamp', (field) => {
     expect(iconStampValue(src, 'android', { [field]: other })).not.toBe(base());
   });
+
+  it('the notification icon moves only the ANDROID stamp — iOS has no such artifact (#1203)', () => {
+    // Without the platform gate, opting a game in would regenerate its whole iOS icon set for an
+    // output iOS never receives.
+    expect(iconStampValue(src, 'ios', { notificationIconSrcAbs: other })).toBe(iconStampValue(src, 'ios'));
+  });
+
 
   it('hashes each source file\'s CONTENT, so editing one in place regenerates', () => {
     const before = iconStampValue(src, 'android', { splashSrcAbs: other });
@@ -216,7 +224,7 @@ describe('splash + icon-variant inputs are all in the stamp', () => {
   it('tracks the REAL pipeline sources when anchored — not a placeholder', () => {
     // Guards the wiring, not just the helper: pinned back to a literal, this stops matching.
     const expected = pipelineVersionFrom(
-      ['splashCompose.mjs', 'splashLayout.mjs', 'iconVariants.mjs', 'androidSplashTheme.mjs']
+      ['splashCompose.mjs', 'splashLayout.mjs', 'iconVariants.mjs', 'androidSplashTheme.mjs', 'notificationIcon.mjs']
         .map((f) => path.join(REPO_ROOT, 'engine', 'scripts', f)),
     );
     expect(splashPipelineVersion(REPO_ROOT)).toBe(expected);

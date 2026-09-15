@@ -35,6 +35,7 @@ import { repoFiles } from '../../scripts/repoCorpus.mjs';
 const PROJECT_PATH_FIELDS = [
   'app.iconSource',
   'app.iconMonochromeSource',
+  'app.notificationIconSource',
   'app.iconDarkSource',
   'app.iconTintedSource',
   'app.splashSource',

@@ -216,6 +216,13 @@ export interface ProjectConfig {
      *  own fallback treatment does the same thing. Any project whose icon is a painting rather
      *  than a flat mark should author this one. */
     iconMonochromeSource: string;
+    /** PROJECT-RELATIVE path to the **Android notification small icon** silhouette (#1203): white
+     *  on transparency, emitted as `res/drawable-<density>/ic_stat_notification.png`. Empty = none,
+     *  and a previously emitted one is removed. There is no derivation, because Android draws only
+     *  the alpha, so a painting would become a solid square. The project's `capacitor.config.json`
+     *  must also name `ic_stat_notification` as `plugins.LocalNotifications.smallIcon`. Otherwise
+     *  the plugin never looks the icon up and the framework "i" still shows. */
+    notificationIconSource: string;
     /** Marketing version — what a player sees in the store listing ("1.0", "2.3.1").
      *  Synced by `healAndroidVersion` into `versionName` and by `healIosVersion` into
      *  `MARKETING_VERSION` (which `Info.plist` reads as `CFBundleShortVersionString`
@@ -696,6 +703,7 @@ export const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
     iconDarkSource: '',
     iconTintedSource: '',
     iconMonochromeSource: '',
+    notificationIconSource: '',
     // '1.0' / 1 are exactly what `cap add` scaffolds into versionName/versionCode and
     // MARKETING_VERSION/CURRENT_PROJECT_VERSION, so adopting these fields rewrites NOTHING
     // in any existing project (measured across all 20: every one is 1.0/1 bar iap-test,
