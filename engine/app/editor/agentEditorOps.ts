@@ -34,7 +34,7 @@ import {
   loadScene, saveAll, newScene, getCurrentScenePath, hasUnsavedChanges, unsavedChangeCauses,
   getPendingBaseScenePaths, discardPendingBaseScenes,
   getLastSceneLoadFailureMessage,
-  isEditingPrefab, isPrefabEditWorld, openPrefabForEditing, savePrefabEdit, exitPrefabEditing,
+  isEditingPrefab, isPrefabEditWorld, prefabSessionWorldPath, openPrefabForEditing, savePrefabEdit, exitPrefabEditing,
   createEntityWithUndo, duplicateEntity, deleteEntitiesWithUndo, reparentEntity, ensureGuid, type TraitSpec,
   buildEntityCreateSpecs, type CreateEntitySpec,
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
@@ -263,8 +263,15 @@ function readEditorState() {
   // them. `unsavedChanges` is derived from the same table, so it cannot disagree with `unsavedCauses`.
   const _causes = unsavedChangeCauses();
   const _unsavedAny = hasUnsavedChanges();
+  const _prefabEditWorld = prefabSessionWorldPath(s.editingPrefab);
   return {
     scenePath: getCurrentScenePath(),
+    // The synthetic `/__prefab-edit__/<guid>` world while one is loaded, omitted otherwise (#1254). `scenePath` is
+    // null there on purpose (a normal scene save must not target a real file), which left the scene-edit tools with
+    // no way to address the world `modoki_prefab edit-open` tells an agent to edit: `/api/scene-mutate` goes live
+    // for exactly this handle, and `activeScenePath` falls back to it. The WORLD and the SESSION must agree: a world with no
+    // edit session (an exit whose reload failed) cannot be persisted by any route, so it is not offered as editable.
+    ...(_prefabEditWorld ? { prefabEditWorld: _prefabEditWorld } : {}),
     // Live-world work not on disk. Anything reading the scene FILE (set_transform,
     // mutate_scene, build) is looking at a DIFFERENT world while this is true. (C7)
     // Also true while a dirty asset (below) is pending — see hasUnsavedChanges()'s own comment.

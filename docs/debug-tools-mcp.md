@@ -1220,6 +1220,11 @@ single most confusing failure on this surface: an entity that is *right there on
 | **Reads the LIVE world** | `get_scene_state`, `get_layout_bounds`, `watch`, `journal`, `diagnose`, `capture_viewport`, `capture_gesture`, `get_editor_state` | — |
 | **Reads the FILE** | `build`, `list_scenes`, `list_assets` | — |
 
+**In prefab-edit mode** (`prefab edit-open`) there is no scene file at all, so `mutate_scene` and
+`set_transform` with `path` omitted target the prefab-edit world by its handle (`prefabEditWorld` in
+`get_editor_state`, reported only while that world's edit session is open). They apply live only, never to a file, and `prefab edit-save`, not `save_all`,
+is what persists the edit. See [prefabs.md](./prefabs.md) § "Prefab edit mode".
+
 **The rule: a file tool cannot see live work until you `save_all`.**
 
 ```

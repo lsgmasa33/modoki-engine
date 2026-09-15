@@ -13,12 +13,14 @@ import { describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { readScannedSource } from '../helpers/sourceScanner';
-import { boundIdentifier, calledNames, calleeName, callsTo, declarationOf, enclosingNamedFunction, findNodes, flatText, functionsNamed, parseSource, precedingStatements, printedText, referencesToPath, statementOf, ts, unwrapValue } from '../helpers/sourceAst';
+import { boundIdentifier, calledNames, callsTo, declarationOf, enclosingNamedFunction, findNodes, flatText, functionsNamed, guardProves, parseSource, precedingStatements, printedText, referencesToPath, statementOf, ts, unwrapValue } from '../helpers/sourceAst';
 import { warnInertPrefabSizes } from '../../src/editor/scene/prefab';
 import { assertExemptionLedger } from '../helpers/exemptionLedger';
 import { registerAsset, unregisterAsset } from '../../src/runtime/loaders/assetManifest';
 
 const SRC = path.resolve(__dirname, '../../src');
+/** A probe source's import of the warning — the readers only accept the engine function, never a same-named stranger. */
+const WARN_IMPORT = "import { warnInertPrefabSizes } from './prefab';\n";
 const read = (rel: string) => readScannedSource(path.join(SRC, rel)).code;
 
 const trap = (localId = 3) => ({
@@ -121,7 +123,7 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
     // stays covered by the census above.)
     // The reader decides per CALL: a second serializer in a function that already warns for another prefab is unwarned.
     const probe = (body: string) => {
-      const sf = parseSource(`async function ops(which) {\n${body}\n}`, 'probe.ts');
+      const sf = parseSource(`${WARN_IMPORT}async function ops(which) {\n${body}\n}`, 'probe.ts');
       return callsTo(sf, 'serializePrefab').map((c) => serializedPrefabIsWarned(c));
     };
     expect(probe("if (which === 'a') { const p = serializePrefab(1); warnInertPrefabSizes(p, 'x'); }\n  if (which === 'b') { const q = serializePrefab(2); }")).toEqual([true, false]);
@@ -132,6 +134,23 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
     expect(probe("const p = serializePrefab(1);\n  const later = () => warnInertPrefabSizes(p, 'x');")).toEqual([false]);
     expect(probe("warnInertPrefabSizes(p, 'x');\n  const p = serializePrefab(1);")).toEqual([false]);
     expect(probe("const p = serializePrefab(1)!;\n  const w = warnInertPrefabSizes(p, 'x');")).toEqual([true]);
+    // Nothing between the two may leave first (review of d6c713d53) — but the null bail may, since it has no prefab.
+    expect(probe("const p = serializePrefab(1);\n  if (fast) { await writeAssetFile(path, jsonFileBody(p)); return; }\n  warnInertPrefabSizes(p, 'x');")).toEqual([false]);
+    expect(probe("const p = serializePrefab(1);\n  await write(p);\n  throw new Error('x');\n  warnInertPrefabSizes(p, 'x');")).toEqual([false]);
+    expect(probe("const p = serializePrefab(1);\n  for (const k of ks) { if (k) break; }\n  warnInertPrefabSizes(p, 'x');")).toEqual([true]);
+    expect(probe("const p = serializePrefab(1);\n  if (!p) return null;\n  warnInertPrefabSizes(p, 'x');")).toEqual([true]);
+    expect(probe("const p = serializePrefab(1);\n  if (!p) { console.error('none'); return false; }\n  warnInertPrefabSizes(p, 'x');")).toEqual([true]);
+    expect(probe("const p = serializePrefab(1);\n  if (!p || fast) return null;\n  warnInertPrefabSizes(p, 'x');")).toEqual([false]);
+    expect(probe("const p = serializePrefab(1);\n  if (!q) return null;\n  warnInertPrefabSizes(p, 'x');")).toEqual([false]);
+    // The engine function only: a method sharing its name, or a local shadowing it, is not the warning.
+    expect(probe("const p = serializePrefab(1);\n  logger.warnInertPrefabSizes(p, 'x');")).toEqual([false]);
+    expect(probe("function warnInertPrefabSizes() {}\n  const p = serializePrefab(1);\n  warnInertPrefabSizes(p, 'x');")).toEqual([false]);
+    // …and an import only when it is that export of that module.
+    const probeFrom = (imp: string) => callsTo(parseSource(`${imp}\nasync function ops() {\n  const p = serializePrefab(1);\n  warnInertPrefabSizes(p, 'x');\n}`, 'probe.ts'), 'serializePrefab').map((c) => serializedPrefabIsWarned(c));
+    expect(probeFrom("import { warnInertPrefabSizes } from './someLogger';")).toEqual([false]);
+    expect(probeFrom("import { noop as warnInertPrefabSizes } from './prefab';")).toEqual([false]);
+    expect(probeFrom("import { warnInertPrefabSizes } from '@modoki/engine/editor';")).toEqual([true]);
+    expect(probeFrom("import { warnInertPrefabSizes } from '../scene/prefab';")).toEqual([true]);
 
     const producers = serializeCensus();
     expect(producers.length, 'the reader must see the serializers, or the ledger below is vacuous').toBeGreaterThanOrEqual(6);
@@ -157,7 +176,7 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
     const sf = parseSource(readScannedSource(path.join(ENGINE, 'app/editor/agentEditorOps.ts')).code, 'agentEditorOps.ts');
     const kept = findNodes(sf, ts.isVariableDeclaration).filter((d) => {
       const init = d.initializer && unwrapValue(d.initializer);
-      return !!init && ts.isCallExpression(init) && calleeName(init) === 'warnInertPrefabSizes';
+      return isWarnCall(init);
     });
     expect(kept.length, 'one kept warnInertPrefabSizes result in the agent ops').toBe(1);
     const returned = findNodes(sf, ts.isReturnStatement).filter((r) =>
@@ -191,7 +210,7 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
     // The function must exist, once.
     expect(() => chain('function other() {}')).toThrow(/one function named writePrefabFile/);
 
-    const first = (body: string) => writesWarnedFirst(parseSource(`async function save(prefab, path) {\n${body}\n}`, 'probe.ts'), 'save', 'write')
+    const first = (body: string) => writesWarnedFirst(parseSource(`${WARN_IMPORT}async function save(prefab, path) {\n${body}\n}`, 'probe.ts'), 'save', 'write')
       .map((w) => w.warned);
     expect(first('warnInertPrefabSizes(prefab, path);\n\n  await write(path, prefab);')).toEqual([true]);
     expect(first('const warnings = warnInertPrefabSizes(prefab, path);\n  await write(path, prefab);')).toEqual([true]);
@@ -199,6 +218,7 @@ describe('the hook is on EVERY AUTHORING write, not on writePrefabFile (#42, #12
     expect(first('await write(path, prefab);\n  warnInertPrefabSizes(prefab, path);')).toEqual([false]);
     expect(first('if (dirty) warnInertPrefabSizes(prefab, path);\n  await write(path, prefab);')).toEqual([false]);
     expect(first('warnInertPrefabSizes(prefab, other);\n  await write(path, prefab);')).toEqual([false]);
+    expect(first('this.warnInertPrefabSizes(prefab, path);\n  await write(path, prefab);')).toEqual([false]);
     // The warning must inspect the prefab being written — directly, or the value its body is built from.
     expect(first('warnInertPrefabSizes({}, path);\n  await write(path, prefab);')).toEqual([false]);
     expect(first('warnInertPrefabSizes(undefined, path);\n  await write(path, prefab);')).toEqual([false]);
@@ -267,7 +287,7 @@ function warnedFirst(call: ts.CallExpression): boolean {
     const kept = ts.isVariableStatement(s) && s.declarationList.declarations.length === 1
       ? s.declarationList.declarations[0]!.initializer : undefined;
     const e = ts.isExpressionStatement(s) ? unwrapValue(s.expression) : kept && unwrapValue(kept);
-    return !!e && ts.isCallExpression(e) && calleeName(e) === 'warnInertPrefabSizes'
+    return isWarnCall(e)
       && !!e.arguments[1] && printedText(e.arguments[1]) === path && warnsTheWrittenPrefab(e, call);
   });
 }
@@ -282,6 +302,42 @@ const GENERATED_PREFAB_WRITERS = [
   { item: 'packages/modoki/src/editor/scene/skinPrefab.ts::makeRigPrefabAsset', reason: 'a 2D skin rig prefab built from bone definitions — Bone/skin entities, no UIElement' },
 ];
 
+/** Whether `e` calls THE engine `warnInertPrefabSizes` — by its bare name, resolving to an import or to its own
+ *  top-level declaration in `prefab.ts`. A method that shares the name (`logger.warnInertPrefabSizes(…)`) or a local
+ *  function shadowing it is not the warning (#1251 review of d6c713d53). */
+function isWarnCall(e: ts.Expression | undefined): e is ts.CallExpression {
+  if (!e || !ts.isCallExpression(e) || !ts.isIdentifier(e.expression) || e.expression.text !== 'warnInertPrefabSizes') return false;
+  const d = declarationOf(e.expression);
+  if (!d) return false;
+  // An import of THAT export from THAT module: not a same-named export of another module, nor another export aliased
+  // to the name (review of the census fix: `from './someLogger'` and `{ noop as warnInertPrefabSizes }` both passed).
+  if (ts.isImportSpecifier(d)) {
+    const decl = d.parent.parent.parent;
+    const from = ts.isStringLiteral(decl.moduleSpecifier) ? decl.moduleSpecifier.text : '';
+    return (d.propertyName ?? d.name).text === 'warnInertPrefabSizes' && (/(^|\/)prefab$/.test(from) || from === '@modoki/engine/editor');
+  }
+  return ts.isFunctionDeclaration(d) && ts.isSourceFile(d.parent) && path.basename(d.getSourceFile().fileName) === 'prefab.ts';
+}
+
+/** Whether statement `s` can leave its list without running the statements after it: a `return` or `throw` anywhere
+ *  in it, or a `break`/`continue` aimed outside it — nested functions and classes excluded, since their exits are
+ *  their own. Syntactic only: a call that throws is not known to. The ONE exit allowed is the null bail
+ *  `if (!prefab) <exit>` — on that path there is no prefab to warn about. */
+function mayLeaveBefore(s: ts.Node, isPrefab: (e: ts.Expression) => boolean): boolean {
+  if (ts.isIfStatement(s) && !s.elseStatement && guardProves({ test: s.expression, holds: true, by: s }, isPrefab, false)) return false;
+  const isLoop = (n: ts.Node) => ts.isForStatement(n) || ts.isForInStatement(n) || ts.isForOfStatement(n) || ts.isWhileStatement(n) || ts.isDoStatement(n);
+  const leaves = (n: ts.Node, loop: boolean, sw: boolean): boolean => {
+    if (ts.isFunctionLike(n) || ts.isClassLike(n)) return false;
+    if (ts.isReturnStatement(n) || ts.isThrowStatement(n)) return true;
+    if (ts.isBreakStatement(n)) return !!n.label || !(loop || sw);
+    if (ts.isContinueStatement(n)) return !!n.label || !loop;
+    const inLoop = loop || isLoop(n);
+    const inSwitch = sw || ts.isSwitchStatement(n);
+    return !!ts.forEachChild(n, (c) => leaves(c, inLoop, inSwitch) || undefined);
+  };
+  return leaves(s, false, false);
+}
+
 function serializedPrefabIsWarned(call: ts.CallExpression): boolean {
   // Bound through the shared wrapper climb (`!`, `as`, `satisfies`, parens, await), so `serializePrefab(id)!` is read.
   const name = boundIdentifier(call);
@@ -289,19 +345,24 @@ function serializedPrefabIsWarned(call: ts.CallExpression): boolean {
   if (!decl) return false;
   // The warning must be an UNCONDITIONAL later statement of the same list — the bar `warnedFirst` holds the
   // writePrefabFile census to. A warning inside a branch, a closure or a callback may never run (#1251 close-out
-  // re-review: `if (never) warnInertPrefabSizes(copy, …)` passed). It does not also pin "before the write", because
-  // this census exists for writers it cannot name.
+  // re-review: `if (never) warnInertPrefabSizes(copy, …)` passed). Nor may anything between the two leave the list
+  // (review of d6c713d53: `if (fast) { await write(p); return; }` above the warning passed) — except the null bail.
+  // It does not also pin "before the write", because this census exists for writers it cannot name.
   const stmt = statementOf(call);
   const list = stmt.parent && (stmt.parent as { statements?: readonly ts.Node[] }).statements;
   if (!list) return false;
-  return list.slice(list.indexOf(stmt) + 1).some((s) => {
+  const isPrefab = (e: ts.Expression) => ts.isIdentifier(e) && declarationOf(e) === decl;
+  for (const s of list.slice(list.indexOf(stmt) + 1)) {
     const kept = ts.isVariableStatement(s) && s.declarationList.declarations.length === 1
       ? s.declarationList.declarations[0]!.initializer : undefined;
     const e = ts.isExpressionStatement(s) ? unwrapValue(s.expression) : kept && unwrapValue(kept);
-    if (!e || !ts.isCallExpression(e) || calleeName(e) !== 'warnInertPrefabSizes') return false;
-    const arg = e.arguments[0] && unwrapValue(e.arguments[0]);
-    return !!arg && ts.isIdentifier(arg) && declarationOf(arg) === decl;
-  });
+    if (isWarnCall(e)) {
+      const arg = e.arguments[0] && unwrapValue(e.arguments[0]);
+      if (arg && isPrefab(arg)) return true;
+    }
+    if (mayLeaveBefore(s, isPrefab)) return false;
+  }
+  return false;
 }
 
 /** Every `serializePrefab(` call in the editor, with the function it sits in and whether THAT CALL's prefab is warned:

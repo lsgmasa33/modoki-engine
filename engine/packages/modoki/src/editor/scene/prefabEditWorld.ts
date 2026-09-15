@@ -28,5 +28,28 @@ export { PREFAB_EDIT_SCENE_PREFIX };
  * to call from a probe or a guard that must not mutate editor state.
  */
 export function isPrefabEditWorld(): boolean {
-  return (sceneManager.getCurrent()?.path ?? '').startsWith(PREFAB_EDIT_SCENE_PREFIX);
+  return prefabEditWorldPath() !== null;
+}
+
+/** The loaded prefab-edit world's synthetic path (`/__prefab-edit__/<guid>`), or `null` when a real scene is loaded.
+ *  Same ground truth as `isPrefabEditWorld` — the handle the agent edit routes address that world by (#1254),
+ *  because it has no asset path to be addressed by. */
+export function prefabEditWorldPath(): string | null {
+  const p = sceneManager.getCurrent()?.path ?? '';
+  return p.startsWith(PREFAB_EDIT_SCENE_PREFIX) ? p : null;
+}
+
+/**
+ * The prefab-edit world's handle ONLY while the edit SESSION for that same prefab is open — what an agent may edit
+ * and then persist with `edit-save`. `session` is the store's `editingPrefab`, passed in so this stays a pure read.
+ *
+ * ⚠️ **Not `prefabEditWorldPath()`, which is the right question for "may this world be SAVED as a scene" and the
+ * wrong one here** (#1254 close-out review). An exit whose return-scene reload fails, or that has no scene to return
+ * to, still clears the session while the world stays synthetic. Reporting the world then let a mutate go live and
+ * answer "run edit-save" — which refuses without a session, as does `save_all` in that world, so the edit could not
+ * reach disk by any route.
+ */
+export function prefabSessionWorldPath(session: { guid: string } | null | undefined): string | null {
+  const world = prefabEditWorldPath();
+  return world && session && world === `${PREFAB_EDIT_SCENE_PREFIX}${session.guid}` ? world : null;
 }

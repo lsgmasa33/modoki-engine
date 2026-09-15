@@ -72,20 +72,27 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
    *  documented `path` default was broken on every call for exactly that reason, so this lives in
    *  ONE place now rather than being re-derived per tool.
    *
+   *  While `modoki_prefab edit-open` has the prefab-edit world loaded there IS no scene file, so the
+   *  editor reports `prefabEditWorld` (`/__prefab-edit__/<guid>`) instead, and that handle is what
+   *  `/api/scene-mutate` applies live (#1254).
+   *
    *  Returns the path, or an already-formed error ToolResult to return as-is. */
   async function activeScenePath(path: string | undefined, toolName: string): Promise<string | ToolResult> {
     if (path) return path;
     let ref: string | undefined;
     try {
       const { status, body } = await call('/api/editor-state');
-      if (status < 400 && body && typeof body === 'object') ref = (body as { scenePathRef?: string }).scenePathRef;
+      if (status < 400 && body && typeof body === 'object') {
+        const st = body as { scenePathRef?: string; prefabEditWorld?: string };
+        ref = st.scenePathRef ?? st.prefabEditWorld;
+      }
     } catch (e) { return unreachable(e); }
     if (!ref) {
       return fail({
         code: 'NOT_FOUND',
         tool: toolName,
         what: 'resolve the ACTIVE scene as an editable path, because `path` was omitted',
-        why: "the editor reported no editable scene path. Either no scene is open, or the open scene lives outside the project's asset roots and so has no asset-root URL.",
+        why: "the editor reported no editable scene path. Either no scene is open, the open scene lives outside the project's asset roots and so has no asset-root URL, or a prefab-edit world is loaded with no edit session (an edit-exit whose scene reload failed), which nothing can save.",
         expected: 'an asset-root URL like /assets/scenes/main.scene.json',
         options: [
           'pass `path` explicitly — get the valid values from modoki_list_scenes',
@@ -112,7 +119,9 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
       'live-only until modoki_save_all — persistence is MANUAL-only, so `saved:false` is the normal ' +
       'answer, not a failure. `setBaseScene` has no live equivalent and always goes straight to the ' +
       'FILE. With no editor connected, or targeting a scene that ISN\'T the one open ' +
-      'live, this falls back to writing the scene FILE directly (the browser-free curl-editing path).',
+      'live, this falls back to writing the scene FILE directly (the browser-free curl-editing path). ' +
+      'Exception — the prefab-edit world (`path` omitted during modoki_prefab edit-open): LIVE-only, never a file; ' +
+      'setBaseScene is refused there, and a call when that world is not loaded is refused rather than written.',
     {
       path: z.string().optional().describe(
         'Asset-root URL of the scene, e.g. /games/x/assets/scenes/main.scene.json. Defaults to the ' +

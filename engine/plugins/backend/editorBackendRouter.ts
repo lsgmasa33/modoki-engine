@@ -35,6 +35,7 @@ import fs from 'fs';
 //      inlines it. The rule covers every tree the main bundle inlines, not just these two
 //      — see docs/build.md, guarded by tests/electron/mainBundleExternals.test.ts.
 import { hasDocKey } from '../../packages/modoki/src/runtime/core/docKeys';
+import { PREFAB_EDIT_SCENE_PREFIX } from '../../packages/modoki/src/runtime/core/ecs/sceneLoaded';
 import crypto from 'crypto';
 import os from 'os';
 import path from 'path';
@@ -57,6 +58,24 @@ import { findGamesEntry } from '../findGamesEntry';
 export function toFsUrl(abs: string): string {
   return path.posix.join('/@fs/', abs.replace(/\\/g, '/'));
 }
+/** The 403 for a path that resolves outside the project's asset roots — carrying its OWN options (#1254).
+ *
+ *  Without them the MCP's `httpFailure` fell back to its bare-403 option, "the backend belongs to a DIFFERENT
+ *  editor/project (C6)". That is the Electron token gate's meaning and never this one, so a rejected path sent the
+ *  agent to `modoki_identity` — which then matched, leaving it with a refusal whose only explanation was false.
+ *  Route-authored options win over that fallback, so every ASSET-ROOT path refusal in this file goes through here. The
+ *  project-root and /@fs-accepting routes (`/api/write-file`, `/api/read-file`, `/api/adopt-file`, `/api/open-file`…) do
+ *  not: they accept a different set of paths, so this advice would be wrong there, and no MCP tool reaches them. */
+function outsideAssetRoots(error: string): BackendResult {
+  return json({
+    error,
+    options: [
+      "pass an asset-root URL of THIS project (e.g. /assets/scenes/main.scene.json) — modoki_list_assets and modoki_list_scenes list valid values",
+      'a Vite /@fs/<abs> URL or an absolute filesystem path is not accepted — use the asset-root form of the same file',
+    ],
+  }, 403);
+}
+
 /** An asset-root URL for a scene path in whatever form the renderer reported it, or null.
  *
  *  Accepts Vite's `/@fs/<abs>` form (what `editor-state` actually returns) and an
@@ -2494,9 +2513,18 @@ async function describeUnresolvedAgainstLiveWorld(
       if (typeof scenePath !== 'string' || !scenePath) {
         return json({ error: "path is required (the scene FILE to edit, e.g. '/assets/scenes/main.scene.json'). Use /api/editor-state to find the active scene." }, 400);
       }
-      const absPath = ctx.resolveAssetPath(scenePath);
-      if (!absPath) return json({ error: 'path outside allowed directories' }, 403);
-      if (!fs.existsSync(absPath)) return json({ error: `scene not found: ${scenePath}` }, 404);
+      // ── The prefab-edit world (#1254) is addressed by its synthetic `/__prefab-edit__/<guid>` handle, not a file. ──
+      // It is LIVE-ONLY: there is no file to check, and none to fall back to — the template reaches disk through
+      // `modoki_prefab edit-save`, never through this route's file write. So the file gates are skipped here, and a
+      // call that cannot go live is refused below rather than falling through to file-direct.
+      const prefabEditTarget = scenePath.startsWith(PREFAB_EDIT_SCENE_PREFIX);
+      let absPath = '';
+      if (!prefabEditTarget) {
+        const resolved = ctx.resolveAssetPath(scenePath);
+        if (!resolved) return outsideAssetRoots('path outside allowed directories');
+        if (!fs.existsSync(resolved)) return json({ error: `scene not found: ${scenePath}` }, 404);
+        absPath = resolved;
+      }
       if (!Array.isArray(ops)) return json({ error: 'ops must be an array' }, 400);
       // ── A setTrait naming an UNKNOWN FIELD on a KNOWN trait is refused BEFORE either path. ──
       // This check used to live ~55 lines below, INSIDE the file-direct branch — i.e. after the
@@ -2545,7 +2573,7 @@ async function describeUnresolvedAgainstLiveWorld(
       // it is the WRONG field for an authoring decision, because `scrub` and `preview` both
       // collapse into 'stopped' there. A renderer that omits the two new fields simply skips the
       // envelope refusal — see the reasoning where it is read.
-      type EditorStateProbe = { playState?: string; runMode?: string; modeOwner?: string; scenePath?: string };
+      type EditorStateProbe = { playState?: string; runMode?: string; modeOwner?: string; scenePath?: string; prefabEditWorld?: string };
       let st: EditorStateProbe | null = null;
       /** Why the probe did not answer, when it did not.
        *
@@ -2601,18 +2629,24 @@ async function describeUnresolvedAgainstLiveWorld(
           ok: false,
           changed: 0,
           code: 'NO_RENDERER',
-          error: 'scene-mutate refused: an editor renderer may be attached and it did not answer '
-            + `the state probe within 8s (${probeReason}), so this could NOT rule out unsaved `
-            + 'live-world work or a running game. This route writes the scene FILE and the write '
-            + 'hot-reloads the scene, which would DISCARD any unsaved work — and "could not look" '
-            + 'is not "nothing is there".',
+          // The prefab-edit handle has no file to write and cannot save through save_all, so neither the file-write
+          // rationale nor that option applies to it (#1254 close-out review) — only "it did not answer, retry" does.
+          error: prefabEditTarget
+            ? 'scene-mutate refused: an editor renderer may be attached and it did not answer '
+              + `the state probe within 8s (${probeReason}), so this could NOT confirm the prefab-edit world `
+              + `${scenePath} is the one loaded. Nothing was applied.`
+            : 'scene-mutate refused: an editor renderer may be attached and it did not answer '
+              + `the state probe within 8s (${probeReason}), so this could NOT rule out unsaved `
+              + 'live-world work or a running game. This route writes the scene FILE and the write '
+              + 'hot-reloads the scene, which would DISCARD any unsaved work — and "could not look" '
+              + 'is not "nothing is there".',
           options: [
             'retry — the renderer is usually mid-scene-load, a GLB parse or a shader compile, and answers a moment later',
             'modoki_get_editor_state — if it answers, the renderer is alive and you can see what is pending',
             // ⚠️ #1030 removed that race — see the sibling option above for why the replacement
             // must not claim "nothing is attached" either.
             'the attached page may be a game/runtime page rather than #/editor — open the editor route and retry',
-            'modoki_save_all — flush any unsaved work first, so a later retry has nothing to lose',
+            ...(prefabEditTarget ? [] : ['modoki_save_all — flush any unsaved work first, so a later retry has nothing to lose']),
           ],
         }, 503);
       }
@@ -2730,7 +2764,11 @@ async function describeUnresolvedAgainstLiveWorld(
       // which raced any read that followed and reported freshly-edited entities as ABSENT.
       const liveRef = toAssetRef(ctx, st?.scenePath);
       const wantRef = toAssetRef(ctx, scenePath);
-      const canGoLive = !!st && !!liveRef && liveRef === wantRef && !hasSetBaseScene;
+      // The prefab-edit world has no asset path to normalize, so it is matched by its handle: the renderer must report
+      // THAT world loaded right now (#1254). A stale handle — edit-exit ran, or another prefab is open — must not apply
+      // the ops to whatever world is live instead.
+      const canGoLive = !!st && !hasSetBaseScene
+        && (prefabEditTarget ? st.prefabEditWorld === scenePath : !!liveRef && liveRef === wantRef);
       if (canGoLive) {
         try {
           // #647: DECODE the reply, never cast it. The renderer that produces this versions
@@ -2781,7 +2819,12 @@ async function describeUnresolvedAgainstLiveWorld(
             // verified on the cold one. Same shape as the `set_transform {space:'world'}` S1: a
             // capability with two backends chosen by ambient state, checked on one of them.
             ...(live.created?.length ? { created: live.created } : {}),
-            ...(live.changed > 0 ? { hint: 'applied to the LIVE world only — run modoki_save_all to write it to disk.' } : {}),
+            // In the prefab-edit world modoki_save_all REFUSES — edit-save is that world's save.
+            ...(live.changed > 0 ? {
+              hint: prefabEditTarget
+                ? "applied to the LIVE prefab-edit world only — run modoki_prefab {action:'edit-save'} to write the .prefab.json."
+                : 'applied to the LIVE world only — run modoki_save_all to write it to disk.',
+            } : {}),
             ...(live.unresolved.length ? { unresolved: live.unresolved } : {}),
             ...(live.code ? { code: live.code } : {}),
           });
@@ -2797,6 +2840,28 @@ async function describeUnresolvedAgainstLiveWorld(
           // retry at all.
           return json({ error: `apply-scene-ops failed: ${e instanceof Error ? e.message : String(e)}` }, 500);
         }
+      }
+      // A prefab-edit handle that could not go live has NO file-direct fallback (#1254): nothing on disk is that world.
+      if (prefabEditTarget) {
+        const why = hasSetBaseScene
+          ? 'setBaseScene changes what a SCENE file loads, and the prefab-edit world is not a scene file'
+          : !st
+            ? 'no editor renderer is attached, so there is no prefab-edit world to apply the ops to'
+            : st.prefabEditWorld
+              ? `the editor has a DIFFERENT prefab open for editing (${st.prefabEditWorld})`
+              : 'the editor has no prefab-edit session for that world — edit-exit ran (an exit whose return-scene reload failed leaves the world loaded with no session, and nothing can save it), or edit-open never did';
+        return json({
+          ok: false,
+          changed: 0,
+          code: (hasSetBaseScene ? 'REFUSED_BY_OP' : 'NOT_FOUND') satisfies ErrorCode,
+          error: `scene-mutate refused ${scenePath}: ${why}. Nothing was applied and nothing was written.`,
+          options: hasSetBaseScene
+            ? ['drop the setBaseScene op — it has no meaning inside a prefab template']
+            : [
+              "modoki_prefab {action:'edit-open', path:'<the .prefab.json>'} — then retry with `path` omitted, which targets the world it opened",
+              'modoki_get_editor_state — `prefabEditWorld` is the handle of the prefab-edit world whose edit SESSION is open, when one is',
+            ],
+        }, hasSetBaseScene ? 400 : 409);
       }
       // ── File-direct fallback (headless curl, no renderer, wrong scene loaded, or setBaseScene) ──
       // Refuse when the editor has UNSAVED work of ANY kind — since #831 a Material slider drag
@@ -2968,7 +3033,7 @@ async function describeUnresolvedAgainstLiveWorld(
       const missing: string[] = [];
       for (const p of inputs) {
         const absPath = ctx.resolveAssetPath(p);
-        if (!absPath) return json({ error: 'Path outside allowed directories' }, 403);
+        if (!absPath) return outsideAssetRoots('Path outside allowed directories');
         if (!fs.existsSync(absPath)) { missing.push(p); continue; }
         resolved.push({ input: p, abs: absPath });
       }
@@ -3306,7 +3371,7 @@ async function describeUnresolvedAgainstLiveWorld(
     // Fail those explicitly so a typo'd/escaped path isn't read as an empty-but-valid meta. (F10)
     if (!assetPath) return json({ error: 'path is required (an asset-root path, e.g. /assets/models/x.glb)' }, 400);
     const resolved = ctx.resolveAssetPath(assetPath);
-    if (!resolved) return json({ error: `path outside allowed directories: ${assetPath}` }, 403);
+    if (!resolved) return outsideAssetRoots(`path outside allowed directories: ${assetPath}`);
     if (!fs.existsSync(resolved)) return json({ error: `asset not found: ${assetPath}` }, 404);
     // The asset exists, so `{}` is no longer "bad path". ⚠️ It is still NOT unambiguous: this
     // returns `readMetaSidecar`, which yields `{}` for a sidecar that exists and does not PARSE
@@ -3338,7 +3403,7 @@ async function describeUnresolvedAgainstLiveWorld(
     const assetPath = query.get('path') || '';
     if (!assetPath) return json({ error: 'path is required (an asset-root path to a .ttf/.otf)' }, 400);
     const resolved = ctx.resolveAssetPath(assetPath);
-    if (!resolved) return json({ error: `path outside allowed directories: ${assetPath}` }, 403);
+    if (!resolved) return outsideAssetRoots(`path outside allowed directories: ${assetPath}`);
     if (!fs.existsSync(resolved)) return json({ error: `asset not found: ${assetPath}` }, 404);
     try {
       return json({ axes: readFontAxes(fs.readFileSync(resolved)) });
@@ -3524,7 +3589,8 @@ async function describeUnresolvedAgainstLiveWorld(
         path: string; meta: unknown; ifMatch?: string; discardUnsaved?: boolean; rendererWrite?: boolean;
       };
       const resolved = ctx.resolveAssetPath(assetPath);
-      if (!resolved) return { kind: 'raw', status: 403, contentType: 'application/json', body: '{}' };
+      // Was an EMPTY-bodied 403, which the MCP read as the wrong-editor refusal (#1212 A-5).
+      if (!resolved) return outsideAssetRoots(`path outside allowed directories: ${assetPath}`);
       // ── The park gate (#872) ──────────────────────────────────────────────────────────────
       // This route REPLACES the sidecar wholesale, and since #845 a human's Inspector
       // import-settings change is PARKED in the renderer rather than written. Both directions used
@@ -3875,7 +3941,7 @@ async function describeUnresolvedAgainstLiveWorld(
       if (!assetPath || !type) return json({ error: 'asset-write requires { path, type, data }' }, 400);
       if (!getAssetSchema(type)) return json({ error: `unknown asset type '${type}' — valid: ${ASSET_SCHEMA_TYPES.join(', ')}`, types: ASSET_SCHEMA_TYPES }, 400);
       const abs = ctx.resolveAssetPath(assetPath);
-      if (!abs) return json({ error: 'path outside allowed directories' }, 403);
+      if (!abs) return outsideAssetRoots('path outside allowed directories');
       // ── #889 phase 3: the dirty-asset gate. ──
       //
       // ⚠️ **`selfWrite` is the whole reason this route could not simply be gated**, and it is why
@@ -4111,7 +4177,7 @@ async function describeUnresolvedAgainstLiveWorld(
       if (!assetPath || !type) return json({ error: 'create-asset requires { type, path }' }, 400);
       if (!getAssetSchema(type)) return json({ error: `unknown asset type '${type}' — valid: ${ASSET_SCHEMA_TYPES.join(', ')}`, types: ASSET_SCHEMA_TYPES }, 400);
       const abs = ctx.resolveAssetPath(assetPath);
-      if (!abs) return json({ error: 'path outside allowed directories' }, 403);
+      if (!abs) return outsideAssetRoots('path outside allowed directories');
       if (fs.existsSync(abs)) return json({ error: `destination exists: ${assetPath}` }, 409);
       const id = crypto.randomUUID();
       const data = defaultAssetData(type) as Record<string, unknown>;
@@ -4200,7 +4266,7 @@ async function describeUnresolvedAgainstLiveWorld(
       const { from, to, force } = (body ?? {}) as { from: string; to: string; force?: boolean };
       const absFrom = ctx.resolveAssetPath(from);
       const absTo = ctx.resolveAssetPath(to);
-      if (!absFrom || !absTo) return json({ error: 'Path outside allowed directories' }, 403);
+      if (!absFrom || !absTo) return outsideAssetRoots('Path outside allowed directories');
       if (!fs.existsSync(absFrom)) return json({ error: 'Source not found' }, 404);
       if (fs.existsSync(absTo)) return json({ error: 'Destination exists' }, 409);
       // ── The unsaved-work gate (#882 for the sidecar, #889 for the DOCUMENT) ──────────────
@@ -4262,7 +4328,7 @@ async function describeUnresolvedAgainstLiveWorld(
       const { from, to } = (body ?? {}) as { from: string; to: string };
       const absFrom = ctx.resolveAssetPath(from);
       const absTo = ctx.resolveAssetPath(to);
-      if (!absFrom || !absTo) return json({ error: 'Path outside allowed directories' }, 403);
+      if (!absFrom || !absTo) return outsideAssetRoots('Path outside allowed directories');
       if (!fs.existsSync(absFrom)) return json({ error: 'Source not found' }, 404);
       // Never clobber an existing asset on move/rename (renameSync would silently
       // destroy it). EXCEPT a case-only rename (e.g. Sprites→sprites): on a
@@ -4364,7 +4430,7 @@ async function describeUnresolvedAgainstLiveWorld(
     try {
       const { path: folderPath } = (body ?? {}) as { path: string };
       const absPath = ctx.resolveAssetPath(folderPath);
-      if (!absPath) return json({ error: 'Path outside allowed directories' }, 403);
+      if (!absPath) return outsideAssetRoots('Path outside allowed directories');
       if (fs.existsSync(absPath)) return json({ error: 'Folder exists' }, 409);
       createFolderAt(absPath);
       return json({ ok: true });
@@ -4936,7 +5002,7 @@ async function describeUnresolvedAgainstLiveWorld(
     // would therefore turn "that asset does not exist" into a 200 carrying an empty document, which
     // is exactly the ambiguity F10 removed. Node can answer it, so Node answers it.
     const preResolved = ctx.resolveAssetPath(assetPath);
-    if (!preResolved) return json({ error: `path outside allowed directories: ${assetPath}` }, 403);
+    if (!preResolved) return outsideAssetRoots(`path outside allowed directories: ${assetPath}`);
     if (!fs.existsSync(preResolved)) return json({ error: `asset not found: ${assetPath}` }, 404);
     try {
       const raw = await ctx.requestBrowser('read-asset-meta', { path: assetPath });
@@ -5268,7 +5334,7 @@ async function describeUnresolvedAgainstLiveWorld(
       if (!srcPath || !destFolder) return json({ error: 'import-file requires { srcPath, destFolder }' }, 400);
       if (!fs.existsSync(srcPath) || !fs.statSync(srcPath).isFile()) return json({ error: `source not found or not a file: ${srcPath}` }, 404);
       const destDirAbs = ctx.resolveAssetPath(destFolder);
-      if (!destDirAbs) return json({ error: 'destFolder outside allowed directories' }, 403);
+      if (!destDirAbs) return outsideAssetRoots('destFolder outside allowed directories');
       if (!fs.existsSync(destDirAbs)) fs.mkdirSync(destDirAbs, { recursive: true });
       const base = path.basename(srcPath);
       const destAbs = path.join(destDirAbs, base);

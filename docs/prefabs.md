@@ -411,7 +411,34 @@ exposed as the `prefab` agent op / `modoki_prefab` MCP tool's `prefabAction: 'ed
 [debug-tools-mcp.md](./debug-tools-mcp.md)'s generated tool catalog. `edit-open` swaps the world
 exactly as `load-scene` does (refuses on unsaved work, takes `discardUnsaved`) and additionally saves the
 current scene on the way in, deliberately, so the return trip's reload-from-disk is
-non-destructive; `modoki_save_all` refuses outright while in prefab-edit mode. This is what
+non-destructive; `modoki_save_all` refuses outright while in prefab-edit mode.
+
+**Editing the template from an agent (#1254).** The prefab-edit world has no scene file. Prefab-edit
+sets the editor's scene path to `null`, so a normal save cannot target a real file. That world is
+therefore addressed by its synthetic handle, `/__prefab-edit__/<prefab guid>`, which
+`modoki_get_editor_state` reports as `prefabEditWorld` only while that world is loaded AND its edit
+session is open (`prefabSessionWorldPath(editingPrefab)`: the world and the session must name the same
+prefab). An exit whose return-scene reload fails, or that has no scene to return to, clears the session
+but leaves the world loaded. Nothing can persist an edit there (`edit-save` needs the session, and
+`save_all` refuses the prefab world), so that world is deliberately not reported as editable.
+- `modoki_mutate_scene` and `modoki_set_transform` with `path` **omitted** target it.
+- `/api/scene-mutate` treats that handle as **LIVE-ONLY**. It applies through `apply-scene-ops` only
+  when the renderer reports that exact world, and otherwise refuses: 409, or 400 for `setBaseScene`.
+  It never falls back to a file write, because the template reaches disk only through `edit-save`.
+- A stale handle therefore cannot edit whatever world happens to be live. That covers a handle left
+  over after `edit-exit` (including the failed-reload exit above) and a handle for a different prefab.
+- **Parent new entities UNDER the prefab root.** `edit-save` serializes only the root's subtree
+  (`serializePrefab` → `collectTree(rootId)`), so an `addEntity` with `parentId: 0` succeeds live and
+  is silently absent from the saved file.
+- **Prefer `space: 'local'`.** A 2D template's root is re-parented under the editor-only
+  `__PrefabEditStage` scaffold, so a `'world'` transform converts against the stage offset and
+  `edit-save` bakes that offset into the template.
+- The live entity tools (`create_entity`, `duplicate_entity`, `delete_entities`, `reparent_entity`)
+  never needed a path, and work unchanged.
+- `modoki_validate_scene` does not apply here: it validates files, so use `modoki_validate_prefab`
+  on the `.prefab.json`.
+
+This is what
 `engine/scripts/resave-prefabs.sh` drives to bulk-migrate prefabs to the current serializer
 format — see [scene-loading.md](./scene-loading.md) § "Re-saving legacy prefabs".
 
