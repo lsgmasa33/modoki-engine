@@ -122,9 +122,17 @@ writes:
   with the UI-flag setter of the same name in `uiTreeStore`.)
 - **Structure-dirty** — `markStructureDirty()` bumps a monotonic `getStructureVersion()`
   and notifies `onStructureDirty(fn)` subscribers (Hierarchy, Console) on
-  create/delete/reparent. It's wired to `registerEntity` via `setStructureCallback`, and
-  `writeTraitField`/`setTrait` also fire it for the `EntityAttributes` fields that reshape
-  the tree (`name`, `layer`, `parentId`, `sortOrder`, `editorFolder`).
+  create/delete/reparent. It's wired to BOTH `registerEntity` and `unregisterEntity` via
+  `setStructureCallback`, and `writeTraitField`/`setTrait` also fire it for the `EntityAttributes`
+  fields that reshape the tree (`name`, `layer`, `parentId`, `sortOrder`, `editorFolder`).
+  **An id-keyed memo must key on a version that BOTH lifecycle events move**, because koota recycles
+  indices. The spawn half is what stops a newcomer on a dead entity's index being served that entity's
+  row; the destroy half is what drops a dead row when nothing respawns. #1220 found both missing at
+  once. SceneView's 2D graph memos were keyed on the 2D dirty version (`canvas2DDirty.ts`), which
+  neither event bumps, so a respawn inherited the dead entity's parent and paint rank. And
+  `unregisterEntity` bumped nothing, so the Animation Editor's entity index kept a destroyed entity's
+  name-path until the next spawn. A world swap drops the old world wholesale without unregistering, so
+  it bumps nothing here; `onWorldSwap` is the signal for that.
   **`onStructureDirtyCoalesced(fn)`** collapses a burst to at most once per animation
   frame — essential for React subscribers, since firing per-entity during a synchronous
   scene load (one `markStructureDirty` per instantiated entity) blows React's

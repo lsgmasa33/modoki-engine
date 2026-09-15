@@ -217,6 +217,11 @@ export function unregisterEntity(entity: any, world: World = getCurrentWorld()) 
     const ordinal = t.ordinalOf.get(packed);
     if (ordinal !== undefined) { t.ordinalOf.delete(packed); t.entityOf.delete(ordinal); }
   }
+  // The mirror of registerEntity's bump (#1220). Without it a destroy moved no version at all, so a
+  // memo keyed on the structure version kept a destroyed entity's row until the next spawn anywhere
+  // bumped it. Structure listeners only set dirty flags (notifyListeners isolates a throwing one), so
+  // firing before `entity.destroy()` lets nothing rebuild from the corpse.
+  _onStructure?.();
 }
 
 /** Rebuild the guid→entity index by walking EntityAttributes-tagged entities.

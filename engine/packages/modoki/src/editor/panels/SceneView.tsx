@@ -71,7 +71,7 @@ import {
   type MarqueeCandidate,
 } from '../scene/marqueeSelect';
 import { resolvePickSelection, pickRequestsReveal, type PickModifiers } from '../scene/pickSelection';
-import { computePaintOrder } from '../../runtime/rendering/paintOrder';
+import { getCanvas2DRouting, getPaintOrder } from './sceneView2DGraph';
 import { UIRenderer } from '../../runtime/ui/UIRenderer';
 import { useEditorStore } from '../store/editorStore';
 import { register, registerBindings } from '../input/keymap';
@@ -890,63 +890,6 @@ function useLetterboxBounds() {
   return bounds;
 }
 
-
-/** Build a entityId→parentId map and the set of Canvas2D entity IDs for the
- *  current world. Used to route each Renderable2D to its owning Canvas2D. */
-function buildCanvas2DRouting(): { parentOf: Map<number, number>; sortOrderOf: Map<number, number>; orderInLayerOf: Map<number, number>; canvasIds: Set<number> } {
-  const allTraits = getAllTraits();
-  const eaMeta = allTraits.find(t => t.name === 'EntityAttributes');
-  const c2dMeta = allTraits.find(t => t.name === 'Canvas2D');
-  const r2dMeta = allTraits.find(t => t.name === 'Renderable2D');
-  const parentOf = new Map<number, number>();
-  const sortOrderOf = new Map<number, number>();
-  const orderInLayerOf = new Map<number, number>();
-  const canvasIds = new Set<number>();
-  if (eaMeta) {
-    getCurrentWorld().query(eaMeta.trait).updateEach(([ea]: any[], entity: any) => {
-      parentOf.set(entity.id(), ea.parentId || 0);
-      sortOrderOf.set(entity.id(), ea.sortOrder || 0);
-    });
-  }
-  if (r2dMeta) {
-    getCurrentWorld().query(r2dMeta.trait).updateEach(([r]: any[], entity: any) => {
-      if (r.orderInLayer) orderInLayerOf.set(entity.id(), r.orderInLayer);
-    });
-  }
-  if (c2dMeta) {
-    getCurrentWorld().query(c2dMeta.trait).updateEach((_: any, entity: any) => {
-      canvasIds.add(entity.id());
-    });
-  }
-  return { parentOf, sortOrderOf, orderInLayerOf, canvasIds };
-}
-
-// The routing only depends on the scene graph (parentId/sortOrder/Canvas2D set),
-// which always bumps the 2D dirty version (any ECS write fires addDirtyListener →
-// mark2DDirty; world swap does too). So memoize it by that version: the per-frame
-// draw and — crucially — the per-`pointermove` HOVER hit-test reuse one build
-// instead of allocating fresh maps every event over a static scene. (gizmos F3)
-let _routingCache: { version: number; routing: ReturnType<typeof buildCanvas2DRouting> } | null = null;
-function getCanvas2DRouting(): ReturnType<typeof buildCanvas2DRouting> {
-  const version = get2DDirtyVersion();
-  if (_routingCache && _routingCache.version === version) return _routingCache.routing;
-  const routing = buildCanvas2DRouting();
-  _routingCache = { version, routing };
-  return routing;
-}
-
-// Paint order is a pure function of the routing (sortOrder DFS over the hierarchy), so it's
-// invariant across sim-running redraws of a static scene — cache it by the same 2D dirty
-// version instead of re-running the O(n) DFS every frame per Canvas2D layer (P4).
-let _paintOrderCache: { version: number; order: Map<number, number> } | null = null;
-function getPaintOrder(): Map<number, number> {
-  const version = get2DDirtyVersion();
-  if (_paintOrderCache && _paintOrderCache.version === version) return _paintOrderCache.order;
-  const { sortOrderOf, parentOf, orderInLayerOf } = getCanvas2DRouting();
-  const order = computePaintOrder(sortOrderOf, parentOf, orderInLayerOf.size ? orderInLayerOf : undefined);
-  _paintOrderCache = { version, order };
-  return order;
-}
 
 /** With every 2D pointer surface temporarily click-through, find the UI entity
  *  (if any) directly beneath a screen point. The 2D surfaces have

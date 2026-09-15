@@ -43,8 +43,8 @@
  *  - Ids held as an ARRAY or a scalar (`editorStore.selectedEntityIds: number[]`, `selectedEntityId`).
  *    Only `Map`/`Set`/`Record` are collections here; #1221 is that shape.
  *  - A number-keyed map reachable only through an inferred type (`{ routing: ReturnType<typeof f> }`):
- *    no type argument appears at the declaration. #1220's `_routingCache` is one; its ledger stands in
- *    through `GizmoBoundsDeps.parentOf`, which declares the same map.
+ *    no type argument appears at the declaration. SceneView's routing memo was one until #1220 moved it
+ *    to `sceneView2DGraph.ts` behind a declared `Canvas2DRoutingMaps`, which the scan now reads.
  *  - State kept alive by a CLOSURE or a component scope rather than a declaration: a function-local
  *    `new Map<number, …>()` captured by the callback it returns (`Scene3D.tsx`'s per-mount `ecsLights`
  *    is one — read by hand 2026-09-14: lights rebuild on a type change and every field is re-applied
@@ -711,12 +711,20 @@ const WIDENED_LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
     reason: 'gen-in-value: SceneView\'s RenderState.ecsOwners, the packed entity each ecsObjects entry was built for (runtime LEDGER row); read only by isEcsObjectVisible, which checks it alive; editor/scene/sceneViewBus.ts:127' },
   { item: 'engine/packages/modoki/src/editor/panels/Hierarchy.tsx::NO_COLLAPSE',
     reason: 'not-entity: an empty sentinel substituted for the collapsed set while filtering; never written, so it holds no id; editor/panels/Hierarchy.tsx:81' },
-  { item: 'engine/packages/modoki/src/editor/panels/SceneView.tsx::_paintOrderCache',
-    reason: 'pending: #1220 — memoized by the 2D dirty version, which a runtime spawn/destroy does not bump, so a recycled index is served the dead entity\'s paint rank; editor/panels/SceneView.tsx:941' },
-  { item: 'engine/packages/modoki/src/editor/panels/SceneView.tsx::_paintOrderCache{}.order',
-    reason: 'pending: #1220 — the id -> rank map inside _paintOrderCache\'s declared type, same gap; editor/panels/SceneView.tsx:941' },
+  { item: 'engine/packages/modoki/src/editor/panels/sceneView2DGraph.ts::_paintOrderCache',
+    reason: 'per-world-index: rebuilt from the live world whenever the structure version moves, which every registerEntity AND unregisterEntity bumps (#1220), so a recycled index is never served the dead entity\'s rank; editor/panels/sceneView2DGraph.ts:92, runtime/core/ecs/world.ts:224' },
+  { item: 'engine/packages/modoki/src/editor/panels/sceneView2DGraph.ts::_paintOrderCache{}.order',
+    reason: 'per-world-index: the id -> rank map inside _paintOrderCache, rebuilt on the same structure-version stamp (#1220); editor/panels/sceneView2DGraph.ts:92' },
+  { item: 'engine/packages/modoki/src/editor/panels/sceneView2DGraph.ts::Canvas2DRoutingMaps.parentOf',
+    reason: 'per-world-index: id -> parentId, built only by buildCanvas2DRouting from the live world and served only through getCanvas2DRouting, whose stamp includes the structure version every spawn and destroy bumps (#1220); editor/panels/sceneView2DGraph.ts:79' },
+  { item: 'engine/packages/modoki/src/editor/panels/sceneView2DGraph.ts::Canvas2DRoutingMaps.sortOrderOf',
+    reason: 'per-world-index: id -> sortOrder, built only by buildCanvas2DRouting from the live world and served only through getCanvas2DRouting, whose stamp includes the structure version every spawn and destroy bumps (#1220); editor/panels/sceneView2DGraph.ts:79' },
+  { item: 'engine/packages/modoki/src/editor/panels/sceneView2DGraph.ts::Canvas2DRoutingMaps.orderInLayerOf',
+    reason: 'per-world-index: id -> Renderable2D.orderInLayer, built only by buildCanvas2DRouting from the live world and served only through getCanvas2DRouting, whose stamp includes the structure version every spawn and destroy bumps (#1220); editor/panels/sceneView2DGraph.ts:79' },
+  { item: 'engine/packages/modoki/src/editor/panels/sceneView2DGraph.ts::Canvas2DRoutingMaps.canvasIds',
+    reason: 'per-world-index: the Canvas2D id set, built only by buildCanvas2DRouting from the live world and served only through getCanvas2DRouting, whose stamp includes the structure version every spawn and destroy bumps (#1220); editor/panels/sceneView2DGraph.ts:79' },
   { item: 'engine/packages/modoki/src/editor/panels/gizmoBounds.ts::GizmoBoundsDeps.parentOf',
-    reason: 'pending: #1220 — every caller passes the 2D-dirty-version memoized routing map, same gap as _paintOrderCache; editor/panels/SceneView.tsx:930' },
+    reason: 'per-world-index: every caller passes getCanvas2DRouting()\'s map, rebuilt from the live world on each spawn/destroy via the structure version (#1220); editor/panels/sceneView2DGraph.ts:79' },
   { item: 'engine/packages/modoki/src/editor/panels/Hierarchy.tsx::EntityNodeProps.collapsed',
     reason: 'pending: #1221 — collapse component state held across user time by bare id and never pruned on destroy; a replacement on the index renders collapsed; editor/panels/Hierarchy.tsx:550' },
   { item: 'engine/packages/modoki/src/editor/panels/Hierarchy.tsx::EntityNodeProps.selectedIds',
