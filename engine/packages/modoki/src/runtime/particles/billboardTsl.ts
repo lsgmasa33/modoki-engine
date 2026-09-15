@@ -9,12 +9,15 @@
  */
 
 import { abs, float, floor, linearDepth, oneMinus, smoothstep, uv, vec2, viewportLinearDepth } from 'three/tsl';
+import type { Node } from 'three/webgpu';
 import type { SpriteMode } from './types';
 
 // Explicit node types so a consumer's `opacityExpr.mul(radialAlpha())` resolves the
 // scalar `.mul` overload (a bare `any` return makes overload resolution pick vec3).
-type FloatNode = ReturnType<typeof float>;
-type Vec2Node = ReturnType<typeof vec2>;
+// ⚠️ `Node<'float'>`, not `ReturnType<typeof float>`: since @types/three 0.184 that return type is
+// the narrow `VarNode<'float', ConvertNode>`, which no other float expression is assignable to.
+type FloatNode = Node<'float'>;
+type Vec2Node = Node<'vec2'>;
 /* eslint-disable-next-line @typescript-eslint/no-explicit-any */
 type TslNode = any;
 

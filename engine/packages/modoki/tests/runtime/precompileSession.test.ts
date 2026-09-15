@@ -7,7 +7,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   beginPrecompile, isPrecompileActive, endAllPrecompiles, runExclusivePrecompile,
-  resetPrecompileSession, PRECOMPILE_MAX_HOLD_MS,
+  runExclusivePrecompileWithin, resetPrecompileSession, PRECOMPILE_MAX_HOLD_MS,
 } from '../../src/runtime/rendering/postfx/precompileSession';
 
 /** As much of three's `Renderer` as the session touches. */
@@ -147,6 +147,48 @@ describe('overlapping sessions cannot corrupt the renderer', () => {
     expect(otherRan).toBe(true);
     released();
     await blocked;
+  });
+});
+
+/** #957 — the queue's wait can be long (a cold previous-scene compile), and one caller — the
+ *  pre-swap prewarm, which a scene load awaits — must not inherit that without bound. */
+describe('runExclusivePrecompileWithin — a queue wait with a ceiling', () => {
+  let r: ReturnType<typeof fakeRenderer>;
+  beforeEach(() => { r = fakeRenderer(); resetPrecompileSession(r); });
+
+  it('runs fn and hands back its value when the queue reaches it in time', async () => {
+    await expect(runExclusivePrecompileWithin(r, 50, async () => 7)).resolves.toEqual({ ran: true, value: 7 });
+  });
+
+  it('runs fn when the compile ahead of it finishes INSIDE the ceiling — the accept side', async () => {
+    const ahead = runExclusivePrecompile(r, () => new Promise<void>((res) => setTimeout(res, 10)));
+    let ran = false;
+    const result = await runExclusivePrecompileWithin(r, 200, async () => { ran = true; });
+    await ahead;
+    expect(result.ran).toBe(true);
+    expect(ran).toBe(true);
+  });
+
+  it('gives up at the ceiling, and fn NEVER runs — not even once the queue finally reaches it', async () => {
+    let release!: () => void;
+    const ahead = runExclusivePrecompile(r, () => new Promise<void>((res) => { release = res; }));
+    let ran = false;
+    const result = await runExclusivePrecompileWithin(r, 20, async () => { ran = true; });
+    expect(result).toEqual({ ran: false });
+
+    release();
+    await ahead;
+    // One more turn of the queue, so a late run would have happened by now.
+    await runExclusivePrecompile(r, async () => {});
+    expect(ran).toBe(false);
+  });
+
+  it('delivers a rejection from fn to the caller, and does not wedge the queue', async () => {
+    await expect(runExclusivePrecompileWithin(r, 50, () => Promise.reject(new Error('bad shader'))))
+      .rejects.toThrow('bad shader');
+    let ran = false;
+    await runExclusivePrecompile(r, async () => { ran = true; });
+    expect(ran).toBe(true);
   });
 });
 

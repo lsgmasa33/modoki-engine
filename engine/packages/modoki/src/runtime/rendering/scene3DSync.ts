@@ -79,6 +79,14 @@ import { cloneDerived, collectDerivedChain, retireDerivedMaterial, retiredDerive
 import { getActiveRenderer } from '../core/activeRenderer';
 import { setActiveRenderer } from '../loaders/textureResolver';
 import { PARTICLE_LAYER } from './layers';
+import { runExclusivePrecompile, runExclusivePrecompileWithin } from './postfx/precompileSession';
+
+/** How long the pre-swap prewarm waits for its turn on the renderer's compile queue before
+ *  skipping (#957). A mechanism ceiling, not a feel knob: it bounds how much a scene load can be
+ *  delayed by the PREVIOUS scene's compile still running (a cold pipeline cache), and the skip is
+ *  safe because the post-swap live compile warms the placed scene anyway. Roughly three times the
+ *  prewarm's own main-thread cost on an A23 (~300-360 ms, #324). */
+const PREWARM_MAX_QUEUE_MS = 1_000;
 
 // Reused across frames to avoid per-frame allocations
 const _activeLightIds = new Set<number>();
@@ -4552,7 +4560,21 @@ async function prewarmShadersForWorldInner(
   const compileSpan = beginBootSpan('shader-compile', `${count} placeholders${rigCount ? ` + ${rigCount} rigs` : ''}${unresolvedDetail}`);
   try {
     if (typeof compile === 'function') {
-      await (renderer as THREE.WebGLRenderer).compileAsync(prewarmScene, camera);
+      // Queued with every other compile on this renderer — the canvas context this compiles for is
+      // "whatever is bound", and a stage compile running alongside would bind a bloom target under
+      // it (#957, see `runExclusivePrecompile`). Queued with a CEILING, because a scene load awaits
+      // this hook and has none of its own: behind a cold previous-scene compile it would otherwise
+      // wait for all of it. Skipping costs only the warm — `compileLiveScene` compiles what the
+      // swap actually placed.
+      const queued = await runExclusivePrecompileWithin(
+        renderer, PREWARM_MAX_QUEUE_MS, () => (renderer as THREE.WebGLRenderer).compileAsync(prewarmScene, camera),
+      );
+      if (!queued.ran) {
+        console.warn(
+          `[prewarm] skipped: another compile held this renderer for over ${PREWARM_MAX_QUEUE_MS} ms — `
+          + 'the post-swap live compile covers the scene instead (#957).',
+        );
+      }
     } else {
       // Fallback: synchronous compile (still better than first-frame-stutter)
       (renderer as THREE.WebGLRenderer).compile?.(prewarmScene, camera);
@@ -4632,15 +4654,41 @@ function clearPreviousLiveStandIns(): void {
   _liveRetained.length = 0;
 }
 
+/** The `compile` a surface hands `compileLiveScene` when it may draw through a post-FX stack.
+ *
+ *  ⚠️ Everything it needs is read when the compile's TURN on the renderer's queue comes, not at
+ *  the kick (#957) — the queue can hold it for seconds, and in between a frame may:
+ *   - REBUILD the stack (a Director beat, an SS settle): the new stack's scene pass is what the
+ *     next frame draws, so it is the one to warm. Capturing at the kick warmed a disposed one.
+ *   - drop the stack (tier demotion): the scene now draws into the canvas context — compile that.
+ *   - tear the surface down: its renderer is disposed, so compile nothing. */
+export function liveSceneCompileAtTurn(
+  renderer: { compileAsync?(scene: THREE.Scene, camera: THREE.Camera): Promise<unknown> },
+  scene: THREE.Scene,
+  atTurn: () => { stack: { compileSceneAsync(): Promise<void> } | null; camera: THREE.Camera; tornDown: boolean },
+): () => Promise<void> {
+  return async () => {
+    const { stack, camera, tornDown } = atTurn();
+    if (tornDown) return;
+    if (stack) await stack.compileSceneAsync();
+    else await renderer.compileAsync?.(scene, camera);
+  };
+}
+
 export async function compileLiveScene(
   renderer: WebGPURenderer | THREE.WebGLRenderer,
   scene: THREE.Scene,
   camera: THREE.Camera,
   compile?: () => Promise<void>,
 ): Promise<void> {
-  return bootSpanAsync('live-scene-compile', async () => {
-    // Whatever the previous compile left behind, before adding more.
-    clearPreviousLiveStandIns();
+  // Whatever the previous compile left behind, before adding more — and BEFORE queueing, so a
+  // compile abandoned by a swap has its stand-ins out of the new scene now, not once it settles.
+  clearPreviousLiveStandIns();
+  // ⚠️ Queued behind every other compile on this renderer (#957). `compile` binds the post-FX
+  // scene pass's target + MRT across its `await`, and three reads that bound state lazily between
+  // yields — so a stage compile allowed to run alongside built this scene's materials against
+  // bloom's targets: invalid pipelines, a black first launch. See `runExclusivePrecompile`.
+  return runExclusivePrecompile(renderer, () => bootSpanAsync('live-scene-compile', async () => {
     // three reads `matrixWorld` for the pipeline key (the mirrored-entity variant) and for
     // culling, and `compileAsync` updates neither.
     scene.updateMatrixWorld(true);
@@ -4716,7 +4764,7 @@ export async function compileLiveScene(
       // `_prewarmRetained`). They are held until the next prewarm frees them.
       for (const stand of standIns) scene.remove(stand);
     }
-  });
+  }));
 }
 
 // ── Renderer creation ───────────────────────────────────

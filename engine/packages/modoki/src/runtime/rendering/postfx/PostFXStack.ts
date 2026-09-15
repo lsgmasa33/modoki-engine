@@ -37,7 +37,7 @@
 // which is exactly how a correct shader fix ended up looking broken.
 
 import * as THREE from 'three';
-import { RenderPipeline, QuadMesh } from 'three/webgpu';
+import { RenderPipeline, QuadMesh, type Node, type NodeMaterial } from 'three/webgpu';
 import { pass, mrt, output, normalView, add, mul, mix, float, vec3, uniform, rtt, materialReference, vec4 } from 'three/tsl';
 import { bloom } from 'three/examples/jsm/tsl/display/BloomNode.js';
 import { dof } from 'three/examples/jsm/tsl/display/DepthOfFieldNode.js';
@@ -58,7 +58,7 @@ import {
   stageCompileJobsFromDraws, driveNodeUpdates, MAX_STAGE_COMPILES, MAX_STAGE_COMPILE_ROUNDS,
 } from './stageCompileJobs';
 import {
-  beginPrecompile, runExclusivePrecompile, type PrecompileSession,
+  beginPrecompile, runExclusivePrecompile, PRECOMPILE_MAX_HOLD_MS, type PrecompileSession,
 } from './precompileSession';
 import { rawNow } from '../../core/clock';
 
@@ -220,9 +220,11 @@ export class PostFXStack {
         // to both (defaults black / 0). Custom fragmentNode shaders write this
         // target themselves via `nprFragmentOutput`, which packs the same fields.
         ensureLineColorOnMaterials();
+        // The casts are types only: @types/three 0.185+ types `materialReference` as an untyped
+        // `MaterialReferenceNode`, which `vec4`'s overloads no longer accept.
         mrtDict.lineColor = vec4(
-          materialReference('lineColor', 'color'),
-          materialReference('nprColorPreserve', 'float'),
+          materialReference('lineColor', 'color') as unknown as Node<'vec3'>,
+          materialReference('nprColorPreserve', 'float') as unknown as Node<'float'>,
         );
       }
       (scenePass as unknown as { setMRT(m: unknown): void }).setMRT(mrt(mrtDict as never));
@@ -420,7 +422,8 @@ export class PostFXStack {
         // #962 — the two cost knobs, clamped by `aoPassSettings` because a scene file can hold what
         // the Inspector would refuse. Both are LIVE: `samples` is a uniform, and `resolutionScale`
         // is a plain field GTAONode reads in `setSize`, which its own `updateBefore` calls every
-        // frame — so a change lands on the next frame with no rebuild. Left at three's defaults
+        // frame — so a change lands on the next frame with no rebuild. ⚠️ r186 bakes `samples` into
+        // the shader and rebuilds GTAO's material on a change — re-read this when three moves past r185. Left at three's defaults
         // (1 / 16) this pass renders at full resolution, which is what made an Adreno 730 slow.
         const applyAoKnobs = (c: AoStageConfig) => {
           const s = aoPassSettings(c);
@@ -622,8 +625,15 @@ export class PostFXStack {
    *  the node graph is first BUILT — i.e. during the first `render()`, which is precisely the
    *  frame this call exists to get ahead of. Compiling before that leaves `samples` at the
    *  RenderTarget default, and a sample-count mismatch is a different pipeline key: the compile
-   *  would succeed, warm the wrong set, and look exactly like a fix that did not work. */
+   *  would succeed, warm the wrong set, and look exactly like a fix that did not work.
+   *
+   *  ⚠️ **Must run inside `runExclusivePrecompile`, and does NOT take it itself** (#957). The
+   *  target/MRT swap above stays bound across three's `await`s, so running beside
+   *  `compileStagesAsync` builds scene materials against a bloom target — #956's black screen.
+   *  Its caller `compileLiveScene` holds the lock; locking here too would deadlock on that. */
   async compileSceneAsync(): Promise<void> {
+    // Queued behind other compiles, so a rebuild can dispose this stack before its turn (#957).
+    if (this.disposed) return;
     const rt = this.scenePass.renderTarget;
     rt.samples = this.renderer.samples;
     if (this.renderer.getOutputBufferType) rt.texture.type = this.renderer.getOutputBufferType();
@@ -632,10 +642,28 @@ export class PostFXStack {
     // draws at depth 1, and `context.id` is part of every material's node-builder cache key — so
     // without it the first frame rebuilds every shader graph synchronously (513 ms of an 807 ms
     // block on the A23). Full mechanism + measurement: `passCompileContext.ts`.
-    await pinPassCallDepth(
-      this.rawRenderer, rt, getPassCallDepth(),
-      () => this.scenePass.compileAsync(this.rawRenderer),
-    );
+    const r = this.rawRenderer as {
+      getRenderTarget?(): unknown; setRenderTarget?(t: unknown): void; getMRT?(): unknown; setMRT?(m: unknown): void;
+    };
+    const prevTarget = r.getRenderTarget?.() ?? null;
+    const prevMrt = r.getMRT?.() ?? null;
+    try {
+      await pinPassCallDepth(
+        this.rawRenderer, rt, getPassCallDepth(),
+        () => this.scenePass.compileAsync(this.rawRenderer),
+      );
+    } catch (e) {
+      // ⚠️ three's `PassNode.compileAsync` binds the pass target + MRT and restores them only on
+      // SUCCESS. A rejection (a shader-graph throw, a lost device) left the live renderer drawing
+      // every later frame into this pass's own target — a black canvas for the rest of the session.
+      // Undone only while the pass target is STILL what is bound: anything else was bound by
+      // someone else (an offscreen capture's `captureRT`) and is theirs to restore (#957).
+      if (r.getRenderTarget?.() === rt) {
+        r.setRenderTarget?.(prevTarget);
+        r.setMRT?.(prevMrt);
+      }
+      throw e;
+    }
   }
 
   /** Compile the pipelines the stack's OWN STAGE QUADS will need, without drawing a frame (#323).
@@ -701,10 +729,24 @@ export class PostFXStack {
     // renderer-global state permanently (a `render` stub restored over the real one) and would
     // also interleave their `setRenderTarget` calls, compiling each other's jobs against the wrong
     // attachment state. See `precompileSession.ts`.
-    return runExclusivePrecompile(this.rawRenderer, () => this.compileStagesInner());
+    //
+    // ⚠️ The kick time travels with the call, because the queue can hold it for seconds (#957: the
+    // scene compile queues here too). `PRECOMPILE_MAX_HOLD_MS` is a promise about when the stub is
+    // gone RELATIVE TO THE GATE'S KICK — a session begun late would hold frames past the gate's
+    // release, after the scene was already revealed. So a wait that used the budget skips.
+    const kickedAt = rawNow();
+    return runExclusivePrecompile(this.rawRenderer, () => {
+      if (rawNow() - kickedAt >= PRECOMPILE_MAX_HOLD_MS) {
+        if (import.meta.env?.DEV) {
+          console.debug('[PostFXStack] stage precompile skipped: queued past its hold budget (#957)');
+        }
+        return Promise.resolve();
+      }
+      return this.compileStagesInner(kickedAt);
+    });
   }
 
-  private async compileStagesInner(): Promise<void> {
+  private async compileStagesInner(kickedAt: number): Promise<void> {
     if (this.disposed) return;
     const pipeline = this.pipeline as unknown as RenderPipelineInternals;
     const r = this.rawRenderer as RendererInternals;
@@ -721,7 +763,7 @@ export class PostFXStack {
     // RECORDER. Refcounted per renderer and deadline-bounded — the deadline is what stops a slow
     // compile from letting `liveCompileGate`'s own ceiling release a frame through a stubbed
     // `render` (a blank submit, then `markScenePainted`: #334's bug). Restores everything itself.
-    const session: PrecompileSession | null = beginPrecompile(this.rawRenderer, rawNow());
+    const session: PrecompileSession | null = beginPrecompile(this.rawRenderer, kickedAt);
     if (!session) { warnStageCompileUnavailable(); return; }
 
     const prevRT = this.renderer.getRenderTarget();
@@ -809,7 +851,7 @@ export class PostFXStack {
           // instanced/batched/morph meshes, and `QuadMesh` shares one module-level geometry, so
           // `getGeometryCacheKey()` matches too. Verified by the 0-pipelines-created measurement
           // in this method's header.
-          const quad = new QuadMesh(job.material as unknown as THREE.Material);
+          const quad = new QuadMesh(job.material as unknown as NodeMaterial);
           quad.frustumCulled = false; // sharp edge 2, as above
           quad.updateMatrixWorld(true);
           // ⚠️ RETAINED, never disposed here. three refcounts a pipeline by the render objects

@@ -22,7 +22,7 @@
  */
 
 import * as THREE from 'three';
-import { SpriteNodeMaterial, MeshBasicNodeMaterial, MeshStandardNodeMaterial } from 'three/webgpu';
+import { SpriteNodeMaterial, MeshBasicNodeMaterial, MeshStandardNodeMaterial, type Node } from 'three/webgpu';
 import {
   Fn, If, instanceIndex, instancedArray, uniform, hash, float, int, vec2, vec3, vec4,
   texture, uv, mix, sin, cos, max, floor, abs, sign, select,
@@ -170,7 +170,7 @@ type LooseBuf = any;
 // to the properly-typed node intersected with `{ value }` (for the JS-side updates).
 type FNode = ReturnType<typeof float>;
 type INode = ReturnType<typeof int>;
-type VNode = ReturnType<typeof vec3>;
+type VNode = Node<'vec3'>;
 type V4Node = ReturnType<typeof vec4>;
 /* eslint-disable-next-line @typescript-eslint/no-explicit-any */
 type Uni<N> = N & { value: any };
@@ -188,7 +188,7 @@ type ComputeNodeT = unknown; // result of Fn(...)().compute(count); dispatched v
  * `THREE.Matrix4.makeRotationFromEuler` (so the GPU mesh tumble matches the CPU path in
  * meshMatrices.ts exactly). Used for both vertex positions and (for lit meshes) normals.
  */
-function eulerRotateXYZ(v: LooseBuf, rx: LooseBuf, ry: LooseBuf, rz: LooseBuf): VNode {
+function eulerRotateXYZ(v: LooseBuf, rx: Node<'float'>, ry: Node<'float'>, rz: Node<'float'>): VNode {
   const a = cos(rx), b = sin(rx);
   const c = cos(ry), d = sin(ry);
   const e = cos(rz), f = sin(rz);
@@ -196,10 +196,12 @@ function eulerRotateXYZ(v: LooseBuf, rx: LooseBuf, ry: LooseBuf, rz: LooseBuf): 
   const m00 = c.mul(e),          m01 = c.mul(f).negate(),   m02 = d;
   const m10 = af.add(be.mul(d)), m11 = ae.sub(bf.mul(d)),   m12 = b.negate().mul(c);
   const m20 = bf.sub(ae.mul(d)), m21 = be.add(af.mul(d)),   m22 = a.mul(c);
+  // Typed as scalars: an untyped `v.x` makes `.mul` resolve its vec3 overload (@types/three 0.185+).
+  const vx: Node<'float'> = v.x, vy: Node<'float'> = v.y, vz: Node<'float'> = v.z;
   return vec3(
-    m00.mul(v.x).add(m01.mul(v.y)).add(m02.mul(v.z)),
-    m10.mul(v.x).add(m11.mul(v.y)).add(m12.mul(v.z)),
-    m20.mul(v.x).add(m21.mul(v.y)).add(m22.mul(v.z)),
+    m00.mul(vx).add(m01.mul(vy)).add(m02.mul(vz)),
+    m10.mul(vx).add(m11.mul(vy)).add(m12.mul(vz)),
+    m20.mul(vx).add(m21.mul(vy)).add(m22.mul(vz)),
   );
 }
 
@@ -815,7 +817,7 @@ export class GpuComputeBackend implements IParticleBackend {
     if (tex) {
       const tx = resolveTiles(def.render.tilesX);
       const ty = resolveTiles(def.render.tilesY);
-      let sampleUv: ReturnType<typeof vec2> = uv();
+      let sampleUv: Node<'vec2'> = uv();
       if (tx > 1 || ty > 1) {
         const tileCount = tx * ty;
         // Stable per-particle [0,1) phase for random-start: depends only on instanceIndex, so

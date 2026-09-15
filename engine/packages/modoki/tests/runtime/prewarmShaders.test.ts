@@ -7,7 +7,7 @@
  *  Heavy GPU siblings scene3DSync imports at module load are mocked; the renderer is
  *  a stub whose `compileAsync` captures the scene it was handed. */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as THREE from 'three';
 
 const deactivatedEntities = new Set<number>();
@@ -1080,8 +1080,9 @@ describe('compileLiveScene — prepares the live scene and restores every mutati
     let releaseA!: () => void;
     const hangingRenderer = { compileAsync: vi.fn(() => new Promise<void>((res) => { releaseA = res; })) };
     const pending = sync.compileLiveScene(hangingRenderer as never, scene, camera);
-    // A's stand-ins are live children of the shared scene right now.
-    expect(scene.children.length).toBe(3);
+    // A's stand-ins are live children of the shared scene once its turn on the renderer's compile
+    // queue starts — a microtask later, not synchronously (#957).
+    await vi.waitFor(() => expect(scene.children.length).toBe(3));
 
     // Call B — the next scene's compile. It must clear A's leftovers, or a transparent object from
     // the OLD scene stands inside the NEW one until A finally settles.
@@ -1138,5 +1139,222 @@ describe('compileLiveScene — prepares the live scene and restores every mutati
     // count — so compiling against the canvas context would warm pipelines nothing draws.
     expect(viaPass).toHaveBeenCalledTimes(1);
     expect(stub.renderer.compileAsync).not.toHaveBeenCalled();
+  });
+
+  it('a compile queued behind an abandoned one on the SAME renderer still clears its stand-ins at once', async () => {
+    const { sync } = await setup();
+    const scene = new THREE.Scene();
+    const mesh = new THREE.Mesh(
+      new THREE.BufferGeometry(),
+      new THREE.MeshStandardMaterial({ transparent: true, side: THREE.DoubleSide }),
+    );
+    scene.add(mesh);
+    let releaseA!: () => void;
+    const renderer = {
+      compileAsync: vi.fn()
+        .mockImplementationOnce(() => new Promise<void>((res) => { releaseA = res; }))
+        .mockImplementation(async () => {}),
+    };
+    const pendingA = sync.compileLiveScene(renderer as never, scene, camera);
+    await vi.waitFor(() => expect(scene.children.length).toBe(3));
+    expect(renderer.compileAsync).toHaveBeenCalledTimes(1); // A is in flight and hanging
+
+    // B waits for A (#957) — but a transparent object from the OLD scene must not stand inside the
+    // new one for as long as A takes, so the clear happens before B joins the queue.
+    const pendingB = sync.compileLiveScene(renderer as never, scene, camera);
+    expect(scene.children).toEqual([mesh]);
+
+    releaseA();
+    await Promise.all([pendingA, pendingB]);
+    expect(renderer.compileAsync).toHaveBeenCalledTimes(2);
+    expect(scene.children).toEqual([mesh]);
+  });
+});
+
+/** #957 — the black first launch on iOS (#956). three's `compileAsync` fixes its render context
+ *  synchronously, then builds each object's node graph after `await`s, reading the renderer's
+ *  bound target AT THAT MOMENT. So two compiles that each bind their own target across an `await`
+ *  build against each other's. This stub reproduces exactly that read: it records the target bound
+ *  when the compile starts, yields twice, and flags a build that sees a different one. */
+describe('every async compile on a renderer is serialised (#957)', () => {
+  // A failing fake-timer test must not leave setTimeout faked (or console.warn muted) for the rest.
+  afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+
+  function bindingRenderer(onFirstCompile?: () => void) {
+    const crossed: string[] = [];
+    const renderer = {
+      target: 'canvas',
+      compileAsync: vi.fn(async (_scene: unknown) => {
+        const context = renderer.target;
+        if (renderer.compileAsync.mock.calls.length === 1) onFirstCompile?.();
+        await new Promise((r) => setTimeout(r, 0));
+        await new Promise((r) => setTimeout(r, 0));
+        if (renderer.target !== context) crossed.push(`${context} context built against ${renderer.target}`);
+      }),
+    };
+    return { renderer, crossed };
+  }
+
+  /** What `PostFXStack.compileStagesAsync` does to the renderer: bind a stage target (bloom's
+   *  blur mip), compile its quad, restore — all inside the shared lock. */
+  function stageCompile(lock: (r: unknown, fn: () => Promise<void>) => Promise<void>, renderer: ReturnType<typeof bindingRenderer>['renderer']) {
+    return lock(renderer, async () => {
+      renderer.target = 'bloom.h0';
+      await renderer.compileAsync({});
+      renderer.target = 'canvas';
+    });
+  }
+
+  it('a live scene compile through the post-FX scene pass never interleaves with a stage compile', async () => {
+    const { sync } = await setup();
+    const { runExclusivePrecompile } = await import('../../src/runtime/rendering/postfx/precompileSession');
+    const { renderer, crossed } = bindingRenderer();
+    const scene = new THREE.Scene();
+    scene.add(new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial()));
+    // `PassNode.compileAsync`: bind the pass target, compile, restore.
+    const viaPass = async () => {
+      renderer.target = 'scenePass';
+      await renderer.compileAsync(scene);
+      renderer.target = 'canvas';
+    };
+
+    // Production order: the scene compile is kicked first, and `Scene3D` reaches the stage gate
+    // once the scene gate's ceiling releases the frame — while the scene compile is still running.
+    const live = sync.compileLiveScene(renderer as never, scene, camera, viaPass);
+    const stage = stageCompile(runExclusivePrecompile, renderer);
+    await Promise.all([live, stage]);
+
+    expect(renderer.compileAsync).toHaveBeenCalledTimes(2);
+    expect(crossed).toEqual([]);
+  });
+
+  it('a stage compile already running holds off a live scene compile kicked after it', async () => {
+    const { sync } = await setup();
+    const { runExclusivePrecompile } = await import('../../src/runtime/rendering/postfx/precompileSession');
+    const { renderer, crossed } = bindingRenderer();
+    const scene = new THREE.Scene();
+    scene.add(new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial()));
+
+    const stage = stageCompile(runExclusivePrecompile, renderer);
+    const live = sync.compileLiveScene(renderer as never, scene, camera);
+    await Promise.all([stage, live]);
+
+    expect(renderer.compileAsync).toHaveBeenCalledTimes(2);
+    expect(crossed).toEqual([]);
+  });
+
+  it('the pre-swap prewarm never interleaves with a stage compile', async () => {
+    const { world, sync } = await setup();
+    const { runExclusivePrecompile } = await import('../../src/runtime/rendering/postfx/precompileSession');
+    // The prewarm awaits its own preparation before it compiles, so kicking the stage compile at a
+    // fixed point could let it finish first and pass vacuously. Kick it at the moment the prewarm's
+    // compile STARTS instead — the one moment an overlap is possible.
+    let stage: Promise<void> | undefined;
+    const { renderer, crossed } = bindingRenderer(() => { stage = stageCompile(runExclusivePrecompile, renderer); });
+
+    await sync.prewarmShadersForWorld(world, renderer as never, camera);
+    await stage;
+
+    // The prewarm compiled its F4 placeholder scene — the empty world still compiles once.
+    expect(renderer.compileAsync).toHaveBeenCalledTimes(2);
+    expect(crossed).toEqual([]);
+  });
+
+  it('the prewarm gives up waiting and SKIPS, rather than stall a scene load behind a slow compile', async () => {
+    // A scene load awaits the prewarm (a before-swap hook, no timeout of its own). Behind the
+    // previous scene's cold compile, an unbounded wait would hold the load for all of it.
+    const { world, sync } = await setup();
+    const { runExclusivePrecompile } = await import('../../src/runtime/rendering/postfx/precompileSession');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { renderer } = bindingRenderer();
+    let release!: () => void;
+    const ahead = runExclusivePrecompile(renderer, () => new Promise<void>((res) => { release = res; }));
+
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const prewarm = sync.prewarmShadersForWorld(world, renderer as never, camera);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await prewarm; // resolved with the queue still held — the load goes ahead
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(renderer.compileAsync).not.toHaveBeenCalled();
+    expect(warn.mock.calls.some((c) => String(c[0]).includes('[prewarm] skipped'))).toBe(true);
+
+    release();
+    await ahead;
+    await runExclusivePrecompile(renderer, async () => {});
+    expect(renderer.compileAsync).not.toHaveBeenCalled(); // and it never runs late, for a scene already gone
+  });
+
+  it('a live compile leaves a render-target binding it did not make ALONE — an offscreen capture owns its own', async () => {
+    // A capture (`modoki_render_scene`) binds `captureRT`, awaits its readback and restores the
+    // previous target itself. A live compile whose span straddles that must not write back what it
+    // saw at its start: that re-bound `captureRT` after the capture had restored, and every later
+    // frame drew into it (review of #957's first close-out fix).
+    const { sync } = await setup();
+    const renderer = {
+      // The capture is already mid-readback when the compile's turn comes, so `captureRT` is bound…
+      target: 'captureRT' as unknown,
+      getRenderTarget() { return renderer.target; },
+      setRenderTarget(t: unknown) { renderer.target = t; },
+      getMRT() { return null; },
+      setMRT() {},
+      compileAsync: vi.fn(async () => {
+        await new Promise((r) => setTimeout(r, 0));
+        // …and the capture finishes, restoring its previous target, while the compile still runs.
+        renderer.setRenderTarget(null);
+        await new Promise((r) => setTimeout(r, 0));
+      }),
+    };
+    const scene = new THREE.Scene();
+    scene.add(new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial()));
+
+    await sync.compileLiveScene(renderer as never, scene, camera);
+    expect(renderer.target).toBe(null);
+  });
+
+  describe("liveSceneCompileAtTurn — everything is read at the compile's TURN, not its kick", () => {
+    function surface() {
+      const renderer = { compileAsync: vi.fn(async () => {}) };
+      const s1 = { compileSceneAsync: vi.fn(async () => {}) };
+      const s2 = { compileSceneAsync: vi.fn(async () => {}) };
+      const state = { stack: s1 as typeof s1 | null, camera: camera as THREE.Camera, tornDown: false };
+      return { renderer, s1, s2, state };
+    }
+
+    it("a stack REBUILT while the compile was queued: warms the new stack's scene pass, not the disposed one", async () => {
+      const { sync } = await setup();
+      const { renderer, s1, s2, state } = surface();
+      const scene = new THREE.Scene();
+      const compile = sync.liveSceneCompileAtTurn(renderer, scene, () => state); // kicked with s1
+      state.stack = s2; // a Director beat rebuilt the stack before the queue reached it
+      await compile();
+      expect(s2.compileSceneAsync).toHaveBeenCalledTimes(1);
+      expect(s1.compileSceneAsync).not.toHaveBeenCalled();
+    });
+
+    it('the stack DROPPED while queued: compiles the scene against the canvas context, with the camera of the turn', async () => {
+      const { sync } = await setup();
+      const { renderer, state } = surface();
+      const scene = new THREE.Scene();
+      const compile = sync.liveSceneCompileAtTurn(renderer, scene, () => state);
+      const later = new THREE.OrthographicCamera();
+      state.stack = null;
+      state.camera = later;
+      await compile();
+      expect(renderer.compileAsync).toHaveBeenCalledWith(scene, later);
+    });
+
+    it('the surface TORN DOWN while queued: compiles nothing on its disposed renderer', async () => {
+      const { sync } = await setup();
+      const { renderer, s1, state } = surface();
+      const compile = sync.liveSceneCompileAtTurn(renderer, new THREE.Scene(), () => state);
+      state.tornDown = true;
+      state.stack = null;
+      await compile();
+      expect(renderer.compileAsync).not.toHaveBeenCalled();
+      expect(s1.compileSceneAsync).not.toHaveBeenCalled();
+    });
   });
 });

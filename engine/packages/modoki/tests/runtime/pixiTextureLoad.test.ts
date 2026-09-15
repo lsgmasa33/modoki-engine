@@ -108,7 +108,7 @@ describe('loadPixiTexture', () => {
  *  that option is what these assert.
  *
  *  ⚠️ It is invisible to every other gate: iOS 26, Android and desktop do not premultiply by
- *  default, so the repro needs a real iOS 16 device — the same blind spot as the r185 ceiling. */
+ *  default, so the repro needs a real iOS 16 device — the same blind spot as #956's clean-install black screen. */
 describe('loadMtsdfAtlasTexture — the atlas must decode UNPREMULTIPLIED (#1045)', () => {
   const url = '/assets/fonts/KleeOne-Regular.ttf~atlas.png?v=abc';
   let bitmapOpts: ImageBitmapOptions | undefined;

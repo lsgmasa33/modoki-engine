@@ -147,7 +147,7 @@ export function createBillboard(maxParticles: number, render: RenderConfig, opts
     // for bottom-origin (KTX2, flipY=false) textures so the sprite reads right-side up.
     const sampleUv = orientSampleUv(
       (tx > 1 || ty > 1)
-        ? spriteSheetUv(float(attribute('aFrame', 'float')), tx, ty)
+        ? spriteSheetUv(float(attribute<'float'>('aFrame', 'float')), tx, ty)
         : uv(),
       tex.flipY === false,
     );

@@ -2830,7 +2830,8 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
     let projection: 'perspective' | 'orthographic' = 'perspective';
 
     // ── OrbitControls ───────────────────────────────────
-    const controls = new OrbitControls(camera, renderer.domElement);
+    // Typed for BOTH projections: the view toggle re-points `controls.object` at the ortho camera.
+    const controls = new OrbitControls<THREE.PerspectiveCamera | THREE.OrthographicCamera>(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.1;
     controls.target.set(0, 0, 0);

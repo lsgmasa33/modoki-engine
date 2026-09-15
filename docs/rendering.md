@@ -510,54 +510,64 @@ would ship the whole Three node pipeline into a `render3d:false` build (#214). I
 still dies with its source; a 2D-only build never imports the module and the registry stays empty.
 It is reclassified L3 in place for that edge — see [architecture-layers.md](./architecture-layers.md) D4.
 
-### The r185 bump — measured, REVERTED, and now capped
+### three r185 → r186 — what the bump changed, and why it stopped at r185 (#956, #957)
 
-⚠️ **WE ARE NOT ON r185 AND MUST NOT GO THERE. `three` is pinned to `0.184.0`** (#956): r185
-**black-screens EVERY iOS device on first launch after a clean install**. Everything below is a
-record of what the bump *would* buy, kept because the measurement is real and #957 will want it —
-**it is not a recommendation, and it was read as one.** This section previously ended on "a 67% cut
-in texture-memory growth for a dependency bump" with no mention of the regression, which made the
-doc a developer reads before touching three's version argue for crossing the ceiling (#966).
+`three` is pinned to **0.185.1** (exact) and `@types/three` to `^0.185.4` (#957, 2026-09-15). It sat
+at 0.184.0 for a while because r185 black-screened every iOS device on a clean-install first launch
+(#956) — that turned out to be the engine's own compile overlap, not three (§ "Gotcha: every async
+compile on a renderer is serialised"), and the bump landed once the fix did.
 
-⚠️ **No gate can catch the regression.** The repro is first-launch-on-a-cold-install only; a warm
-pipeline cache hides it, and `npm run verify`, `verify:all`, both CI legs and both signed release
-builds were all green on the affected tree. The ceiling is therefore asserted as a DECLARATION:
-`engine/tests/architecture/threeVersionCeiling.test.ts` (the installed version, plus both manifests
-that declare `three`) and a `three` ignore entry in `.github/dependabot.yml`. Raising it needs an
-on-device clean-install check — that is #957, and it is the only thing that can observe the defect.
+⚠️ **r186 is measured BAD for this engine — do not bump to it.** Its `GTAONode` reads the depth with
+`this.depthNode.gather()` (`sampleCenterDepth`, behind a `_resolutionScale.lessThan(1).select(…)`,
+so the `textureGather` is in the shader whatever the scale). WGSL has **no `textureGather` overload
+for `texture_depth_multisampled_2d`**, and our scene pass is multisampled whenever `antialias` is on
+— the high tier. So every AO pass under MSAA fails: *"no matching call to textureGather(texture_depth_multisampled_2d, sampler, vec2<f32>)"*,
+`renderPipeline_GTAO_*` invalid. Measured on `demos/postfx-demo`'s AO station, desktop Chromium, 85 s
+runs that all reached it: **0.184.0 → 0 errors, 0.185.1 → 0, 0.186.0 → 128**; and on the iPad the same
+error at the AO station on a warm relaunch, after 0.186.0 had PASSED the clean-install launch — which is
+why QA-RENDER-0008 now runs long enough to reach AO on a COLD launch (~75–80 s: the station is at
+timeline t=60 and sim time is capped per frame, so cold stalls push it later in wall time). It is a three defect (r184/r185 have no `gather()` there); the same
+multisampled-depth wall already blocks GTAO's depth-only normal reconstruction (`PostFXStack.ts`'s AO
+stage comment). Revisit at r187.
 
-three `0.184.0 → 0.185.1` closed the expensive half of the env leak with **no engine code**. Same
-fixture, same probe, same island↔empty cycle:
+⚠️ **The ceiling is "verified on a device", not "known bad".** No automated gate can see the #956
+defect class — it needs a cold pipeline cache — so `engine/tests/architecture/threeVersionCeiling.test.ts`
+(the installed version plus both manifests that declare `three`) and a `three` ignore entry in
+`.github/dependabot.yml` bound `three` below the first release that has NOT passed QA-RENDER-0008
+(`qa/cases/rendering/ios-clean-install-postfx-first-launch.md`, a clean-install first launch on the
+iPad). Raising it means running that case against the new version first.
+
+**The env-leak record is historical.** Measured before the engine took ownership of the PMREM
+(`envPmrem.ts`, #739/#775/#779), on the same island ⟷ empty cycle:
 
 | per cycle | 0.184.0 | 0.185.1 |
 |---|---|---|
-| renderTargets | +5 | **+3** |
-| textures | +9 | **+3** |
-| geometries | +17 | **+17 (unchanged — ours, not three's)** |
-| **texturesSize** | **+72.1 MB** | **+24.1 MB** |
+| renderTargets | +5 | +3 |
+| textures | +9 | +3 |
+| geometries | +17 | +17 (ours, not three's) |
+| texturesSize | +72.1 MB | +24.1 MB |
 
-A **67% cut in texture-memory growth for a dependency bump.** The geometry half is untouched exactly
-as predicted — it was the `modelOwners` ownership gap, not a three defect.
+⚠️ **Do not quote it as the cost or the benefit of any version on today's code.** The engine now
+generates and disposes the PMREM itself whatever three does, so this table no longer describes a
+three-version difference; today's per-cycle delta has not been re-measured. What r185 did change is
+still true of three itself: `PMREMNode` registers a dispose listener and caches the render TARGET;
+`CubeMapNode` still caches `renderTarget.texture` and disposes the wrong object; and none of it
+touches the WebGL-fallback program leak (#715).
 
-⚠️ `"three"` is now an **exact pin** (`0.184.0`, no caret) and the engine package's peer range carries
-the matching ceiling (`>=0.183.0 <0.185.0`), so neither a plain `npm install` nor a lockfile
-regeneration can pick 0.185.x up. **0.185.0 and 0.185.1 are the only releases after 0.184.0** — so
-the cap costs nothing today beyond the env-leak win recorded above.
-
-**What r185 fixed:** `PMREMNode` now registers a dispose listener and caches the RENDER TARGET, so
-`pmrem.dispose()` disposes the target. **What it did NOT fix:** `CubeMapNode` is byte-identical to
-r184 (still caches `renderTarget.texture` and disposes the wrong object), and the `PMREMGenerator`
-ping-pong target is freed only by `PMREMNode.dispose()`, which nothing calls when the env changes —
-together the residual 24.1 MB/cycle above. It also does not touch the WebGL-fallback program leak
-(#715), which is a different layer entirely.
-
-⚠️ **`@types/three` is deliberately HELD at `^0.183.1`** — owner decision, 2026-09-05, asked directly.
-Bumping it to 0.185.4 fails `verify` with ~20 errors as the TSL node generics became far more
-specific, hitting `particles/billboardTsl.ts`, `gpuComputeBackend.ts`, `spriteBillboard.ts`,
-`postfx/PostFXStack.ts`, `SceneView.tsx` and the `water.ts` shader in both `games/sling` and
-`demos/forest-camp`. Types lagging the runtime is the pre-existing arrangement, **not an open task to
-pick up.** Known cost: a REMOVED symbol still fails loudly at typecheck (the safe direction), but a
-CHANGED SIGNATURE could silently typecheck against the older types.
+**What r185 changed that no type check sees** (measured by diffing the release builds and the
+migration guide against the repo's own call sites, #957 — none observed live yet):
+- **GTAO look** — darker and wider (owner-accepted, below). `AmbientOcclusionPostFX` is off by
+  default and no committed game scene enables it; `demos/postfx-demo` shows it as a station.
+- **WebGPURenderer premultiplied alpha** was reimplemented — the NPR particle pass renders into a
+  target with a null background, the one place a blend difference could show.
+- **TransformControls world-space translation snap** now snaps the full world position under a rotated
+  or scaled parent (the SceneView gizmo).
+- **GLTFExporter** bakes a negative `normalScale` sign into the normal texture (the OBJ/FBX → GLB import
+  converter).
+- Type-only: the errors `@types/three` 0.185/0.186 raised were all stricter TSL generics
+  (`ReturnType<typeof float>` became a narrow `VarNode`), fixed with `Node<'float'>`-style aliases —
+  no three API the repo uses was removed or renamed between 0.184 and 0.186. r186 would also bake GTAO's
+  `samples` into the shader (a rebuild per change) and change its distance model.
 
 ⚠️ **GTAO is genuinely darker under r185 and the owner ACCEPTED it** (shown the side-by-side,
 2026-09-05: *"diff is fine"*). Mean luminance 42.32 → 39.86 on `demos/postfx-demo` with GTAO forced
@@ -4277,24 +4287,107 @@ TSL node builders have a racy lazy initialization on the **first** compile a ren
 
 The reload is now decided **by path on the dev server**: `isShaderGraphFile` (`engine/plugins/vite-asset-scanner.ts`) matches anything under `runtime/rendering/postfx/` or `runtime/rendering/npr/`, and `handleHotUpdate` sends `modoki:shader-code-changed` instead of letting Vite propagate an update. The renderer (`engine/app/debug/hmrStaleness.ts`) then reloads — via the same unsaved-scene countdown banner the game-code reload uses, so a shader edit can never silently discard scene work. ⚠️ **Do NOT re-add `import.meta.hot.invalidate()` to these modules** (they all used to carry it): `invalidate()` does not force a reload, it propagates to importers and stops at the first one that ACCEPTS — and the only importer is `Scene3D.tsx`, a React Fast Refresh boundary that self-accepts, so it was silently swallowed. Fast Refresh then re-ran the component but not its `[]`-deps effect, leaving the already-built `PostFXStack` (and its stale compiled graph) alive. That is exactly how one DOF `viewZ` fix was concluded "didn't work" three separate times. Since `engine/plugins/**` is not hot-reloadable, restart the editor once after changing the rule itself.
 
-## Gotcha: on three r185 an MRT pass is set up against the BLOOM pass's render target (why three is pinned)
+## Gotcha: every async compile on a renderer is serialised — two overlapping compiles build against each other's render target (#956, #957)
 
-⚠️ **`MRTNode.setup()` (three) resolves its declared output names against
-`builder.renderer.getRenderTarget()` — whatever target is bound at BUILD time.** A name that does not
-match a texture on that target resolves to index `-1`.
+⚠️ **`Renderer.compileAsync` (three) fixes its render context synchronously, then builds each
+object's node graph after `await`s — `await this._nodes.getForRenderAsync(renderObject)` and an
+`await yieldToMain()` per object — reading `renderer.getRenderTarget()` / `getMRT()` AT THAT
+MOMENT.** `MRTNode.setup()` resolves its outputs against the bound target, and the pipeline
+descriptor's colour targets come from the context fixed at the start. So a compile that binds a
+target and awaits is borrowing renderer-GLOBAL state for its whole duration, and any other compile
+that runs in that window builds against the wrong one.
 
-**On r185 that setup also runs while `UnrealBloomPass`'s internal blur targets are bound** — observed
-four times in one run, against `h0`, `h1`, `h3`, `h4` (⚠️ **`h2` did not appear**, and that is
-unexplained: either a build did not happen for that mip or the log was short). Each carries one
-texture named `UnrealBloomPass.hN`, so **every** declared output misses, `members` is empty, and
-`OutputStructNode` emits `struct OutputType {}` — *"structures must have at least one member"* →
-`Fragment module is invalid` → pipeline creation fails → **black screen**, plus `writeMask is invalid`.
+**The rule: every async compile on a renderer goes through `runExclusivePrecompile`
+(`postfx/precompileSession.ts`)** — the pre-swap prewarm, `compileLiveScene` (which carries
+`PostFXStack.compileSceneAsync`) and `PostFXStack.compileStagesAsync`. A new compile path takes the
+same lock. ⚠️ It must not be taken twice on one path — the inner call waits for the outer one, which
+waits for the inner one — so `compileSceneAsync` deliberately does not lock itself.
 
-**r184 never runs the setup against those targets**, and that is the whole behavioural difference —
-the new `-1` guard alone does not explain it, because r184's `members[-1] = …` also leaves `length` at
-0 and would fail identically *if it ever ran there*. Tracked as #956; three is pinned at 0.184.0.
+Three consequences of queueing, each found by review and each pinned by a test:
+- **A caller whose wait has no ceiling of its own must not queue without one.** The pre-swap prewarm
+  is awaited by the scene swap, which has no timeout, so it queues through
+  `runExclusivePrecompileWithin` (`PREWARM_MAX_QUEUE_MS`, 1 s) and SKIPS its compile past that —
+  never unlocked, never late. Otherwise a cold compile of the previous scene stalls the next load.
+- **The stage compile's hold ceiling counts from its gate's KICK.** `PRECOMPILE_MAX_HOLD_MS` (4 s)
+  promises the stubbed `render` is gone before the 5 s gate releases a frame (#334); a session begun
+  after a long queue wait would break that, so `compileStagesAsync` carries its kick time into
+  `beginPrecompile` and skips when the wait alone used the budget.
+- **A compile's closure resolves when its turn comes, not when it was kicked** — and that is what
+  `Scene3D` wants (`liveSceneCompileAtTurn`): it reads the stack, camera and liveness at the turn,
+  because a rebuild while queued means the NEW stack's scene pass is what the next frame draws
+  (capturing at the kick lost that warm). A null stack falls back to a canvas compile, a torn-down
+  surface compiles nothing, and a stale disposed stack's `compileSceneAsync` returns.
 
-⚠️ **The r185 hunk changes THREE things, not one** — quoting only the guard misleads:
+Also on this path: three's `PassNode.compileAsync` restores the target + MRT only on SUCCESS, so a
+rejected compile left every later frame drawing into the scene pass's own target.
+`compileSceneAsync` undoes it on rejection — and ⚠️ only while the pass target is STILL bound. An
+unconditional write-back of "what was bound when the compile started" was tried first and is wrong:
+an offscreen capture binds `captureRT` across its own readback `await` and restores it itself, so a
+compile straddling it re-bound `captureRT` after the capture finished.
+
+⚠️ **What the lock does NOT cover:** it serialises compiles against each other only. Frames released
+at a gate's ceiling, offscreen captures (`modoki_render_scene`) and PMREM derivation still use the
+renderer while a compile holds its target — #1239, one class, to be designed across rather than
+patched per site.
+
+### How this became #956's black first launch
+
+Until #957 only the stage compile held the lock. The live-scene compile ran outside it, and
+`liveCompileGate` releases the FRAME at its 5 s ceiling **without cancelling the compile**; `Scene3D`
+then reaches `stackCompile.tick()` and kicks the stage compile while the scene compile is still
+building. The stage compile binds bloom's blur targets (`UnrealBloomPass.h0..h4`); the scene
+compile's remaining materials build against them; pipeline creation fails validation — *"Color
+target has no corresponding fragment stage output but writeMask … is not zero"* and
+*"`GPUColorTargetState.format`: Required member is undefined"*, on plain `MeshStandardMaterial`
+pipelines — and the scene never paints. In every broken run below, the failed pipelines were still failing 9 s later.
+
+**Why only a clean install:** the overlap needs the scene compile to outlive a 5 s ceiling, which only
+a COLD pipeline cache does. A relaunch, a redeploy over an install and an editor preview all hit a
+warm cache and finish well inside it — which is why `verify`, both CI legs and both signed release
+builds were green on the broken tree.
+
+### Measured — the overlap is the trigger, on BOTH versions
+
+`demos/postfx-demo`, `--target web`, desktop Chromium (Playwright, WebGPU), 2026-09-15. The overlap is
+forced by shortening the scene gate's ceiling to 100 ms (`?liveHold=100`, from the probe patch):
+
+| three | overlap | serialised | runs with pipeline errors |
+|---|---|---|---|
+| 0.185.1 | forced | no | **5/5** (~30 errors, lantern-only frame) |
+| 0.184.0 | forced | no | **5/5** (10 errors, empty frame) |
+| 0.185.1 | forced | yes | 0/5 |
+| 0.184.0 | forced | yes | 0/5 |
+| either | not forced | no | 0/4 each |
+
+The "yes" rows were re-run against the committed fix, not only the experiment. So **the pin to
+0.184 was never the protection it looked like** — r184 breaks identically once the compiles overlap;
+it simply did not overlap on the devices tried.
+
+**Why r184 did not black-screen on an iOS clean install — timing, measured on the device.** The
+unfixed code overlaps on BOTH versions; what differs is how long the overlap lasts. iPad mini 5,
+`demos/postfx-demo`, clean install, unfixed build, 2026-09-15 (`[PROBE-957]` timings, ms):
+
+| three | scene compile | stage compile kicked | overlap | result |
+|---|---|---|---|---|
+| 0.184.0 | 5310 → 11805 | 10322 | ~1.5 s | no pipeline error, renders |
+| 0.185.1 | 5599 → 16438 | 10618 | ~5.8 s | #956's errors, black for good |
+
+Both cross the 5 s readiness ceiling, so both kick the stage compile on top of the scene compile.
+r184's cold scene compile simply finished ~4.6 s sooner, and in that shorter window no scene material
+happened to build while a bloom target was bound. ⚠️ **That is luck, not a property** — one run, and a
+slower device or a heavier scene widens the window on r184 too. The pin was never the protection.
+
+### What the earlier diagnosis saw, re-read
+
+The `[MRT-ANOMALY]` lines from the iPad (`rtTextures=[UnrealBloomPass.hN] outputs=[output|normal|lineColor]`,
+empty `members`, `struct OutputType {}`) are one way this overlap shows up — a scene MRT built while a
+bloom target was bound — not a change in how r185 schedules `MRTNode.setup()`. The desktop forced
+overlap produced the `writeMask`/`format` pair without any `MRTNode` miss, so which symptom appears
+depends on where the two compiles interleave. The unexplained `rtTextures=[output]` row fits the same
+reading (a foreign single-`output` target bound mid-build) but was not re-measured.
+
+⚠️ **The r185 hunk in `MRTNode.setup()` changes THREE things, not one** — still worth knowing when
+reading r185's MRT code, and quoting only the guard misleads:
 
 ```diff
 -			members[ index ] = vec4( outputNodes[ name ] );
@@ -4304,46 +4397,15 @@ the new `-1` guard alone does not explain it, because r184's `members[-1] = …`
 +			members[ index ] = outputNodes[ name ].convert( type );
 ```
 
-The guard is **not gratuitous** — `getOutputType( index )` does `renderTarget.textures[ index ].type`
-and would throw on `-1`, so the guard is required by the line under it. And the member **type**
-changed from always-`vec4` to one derived from the target's format. Do not read "the guard is the
-difference" as "the guard is the bug".
-
-### ⚠️ When this can fire at all — NOT unconditionally
-
-`requiredMrtTargets` (`postfx/stackPlan.ts`) adds `normal` only for `npr || ao`, and `lineColor` only
-for `npr`; `PostFXStack.ts` calls `setMRT` **only when `targets.length > 1`**. So a project with
-neither NPR nor AO has a single `output` target, **no `MRTNode` is ever built, and this bug cannot
-fire**. AO-only gives two outputs and the same shape with two misses. A future session asking "can we
-lift the r185 ceiling for this project?" must check that gate first — the pin is not unconditional.
-
-### ⚠️ An unresolved question — do not treat the `[output]` row as settled
-
-The device log also carries one `rtTextures=[output] outputs=[output|normal|lineColor] membersLen=1`
-row, on **both** versions, which was written up as the benign "declared but unread" case (below).
-**That explanation may not hold.** `PostFXStack.ts` consumes `normal`/`lineColor` **eagerly in the
-constructor**, gated on the same condition that declares them — so for any pass whose MRT declares
-three, its own target should already hold three textures by build time and `membersLen` should be 3.
-A row showing one texture named `output` may therefore be a **fifth foreign-target build**, i.e. part
-of the bug rather than benign.
-
-**This is unresolved.** The log prints texture *names*, and two different targets whose single texture
-is named `output` are indistinguishable in it. **Next measurement: add `renderTarget.uuid` to the log
-line** (`tools-scratch/three-r185-mrt/instrumentation/`) — one field, one run, and it separates the
-two hypotheses. #1007 was closed as not-a-defect on the benign reading; if this resolves the other
-way, that closure needs revisiting.
-
-⚠️ **Also undisclosed so far, and material:** this engine runs its own precompile session that
-**stubs `renderer.render` and saves/restores `setMRT`/`setRenderTarget`**
-(`postfx/precompileSession.ts`). Any claim that the foreign-target binding is purely three's must
-account for that first — it is also a cheaper repro axis than the ones tried below.
+The guard is **required** — `getOutputType( index )` reads `renderTarget.textures[ index ].type` and
+would throw on `-1` — and the member **type** changed from always-`vec4` to one derived from the
+target's format.
 
 ### The benign case — a `-1` on its own is NOT a bug
 
 The pass allocates exactly the outputs the graph **consumes**, so an unread `normal`/`lineColor`
-legitimately has no texture and skipping it is the documented intent. Measured on both versions,
-one variable at a time (`tools-scratch/three-r185-mrt/minimal-repro.html`, which prints
-`renderTarget.textures` directly):
+legitimately has no texture and skipping it is the documented intent (#1007, retracted on this).
+Measured on both versions, one variable at a time (`tools-scratch/three-r185-mrt/minimal-repro.html`):
 
 | consumed | `renderTarget.textures` |
 |---|---|
@@ -4351,31 +4413,34 @@ one variable at a time (`tools-scratch/three-r185-mrt/minimal-repro.html`, which
 | `output` + `normal` | `[output\|normal]` |
 | `output` + `normal` + `lineColor` | `[output\|normal\|lineColor]` |
 
-What makes a `-1` real is a miss for a name a LIVE stage is reading — the bloom-target case above,
-and possibly the `[output]` row per the open question.
+`requiredMrtTargets` (`postfx/stackPlan.ts`) adds `normal` only for `npr || ao` and `lineColor` only
+for `npr`, and `PostFXStack.ts` calls `setMRT` only when `targets.length > 1` — so a project with
+neither has no `MRTNode` at all. ⚠️ That does NOT exempt it from this gotcha: the overlap corrupts the
+colour-target state of any compile, MRT or not.
 
-**Two things a future session should not re-derive** (both tested and disproved during #956):
-- It is **not** r185's reuse of a module-level `_renderPipelineDescriptor` with a `reset()` after
+**Two theories tested and disproved during #956 — do not re-derive them:**
+- **Not** r185's reuse of a module-level `_renderPipelineDescriptor` with a `reset()` after
   `createRenderPipelineAsync()`. WebKit snapshots the descriptor synchronously; verified with a
   standalone WebGPU page, no three.js involved.
-- It is **not** the F4 prewarm ordering. Building r185 with the F4 placeholder disabled changes
-  nothing.
+- **Not** the F4 prewarm ordering. Building r185 with the F4 placeholder disabled changes nothing.
 
-**Measuring it is cheap — do not reach for a device build.** It reproduces from a plain
-`--target web` build served over LAN and opened in **iPad Safari**, and intermittently (~1 in 20
-loads) in **macOS Safari**. ⚠️ Three traps: Safari caches `index.html` across builds, so serve with
-`Cache-Control: no-store` or you will silently compare the wrong bundle; the failure is
-**self-healing** in Safari — `frameDriver`'s watchdog re-arms the rAF chain and the app paints a few
-seconds later, so a screenshot taken late reads as a pass (the packaged app does not recover, because
-the readiness ceiling reveals the game first); and a `fetch`-based console collector **drops lines**
-under rapid logging, so read the page's own log for anything high-volume.
+### Reproducing it
 
-⚠️ **Reproducing the bloom-target case MINIMALLY is unsolved.** A standalone page with the same MRT
-shape plus `bloom()` does not produce it, with or without effect-graph churn, mid-sequence material
-creation, `BloomNode.setResolutionScale(2)` (note: that is bloom's own internal scale, **new in
-r185** — not the engine's NPR `superSampleScale`, which scales the scene pass), a `setLayers` split,
-or a GTAO stage. So far it needs the full app. That gap, and the un-identified r185 change behind it,
-are what stand between us and an upstream report — `tools-scratch/three-r185-mrt/`.
+**Desktop, deterministic — use this first.** `tools-scratch/three-r185-mrt/overlap/`: apply
+`scene3d-probe.patch` (compile START/END timings + the `?liveHold=` override), run `build-both.sh`
+(builds the installed three and 0.185.1, each with the `[MRT-SETUP]` probe, and restores
+`node_modules`), serve each with `serve.mjs` (`Cache-Control: no-store`), and `repeat.sh <port>
+"?liveHold=100" 5`. To see the unfixed behaviour, build from a tree before the #957 fix. Revert the
+patch before committing anything.
+
+**iOS.** iPad Safari over LAN reproduced #956 reliably from a plain web build, and macOS Safari about
+1 load in 20. Three traps: Safari caches `index.html` across builds, so serve with `no-store` or you
+compare the wrong bundle; the failure can look **self-healing** — `frameDriver`'s watchdog re-arms the
+rAF chain, so a late screenshot reads as a pass; and a `fetch`-based console collector **drops lines**
+under rapid logging. The gate for a three upgrade is a clean-install first launch on the **iPad** (WebGPU —
+the iPhone 8's WebGL2 path does not reproduce it): QA-RENDER-0008,
+`qa/cases/rendering/ios-clean-install-postfx-first-launch.md`, measured red on 0.185.1 without the
+fix and rendering (after ~15 s of black, #1239) with it.
 
 ## Bloom Post-Process
 
@@ -5038,7 +5103,7 @@ consequences the pool now handles explicitly, each with a mutation-verified test
 - **The default font is ENGINE-provided** — `DEFAULT_FONT_GUID` (`runtime/assets/builtinAssets.ts`, exported from `@modoki/engine/runtime`) is the engine's Arimo, baked mtsdf/ascii. A game does NOT need a font in its own assets to render `Text2D`; point `Text2D.font` at that GUID. It exists because fonts are otherwise referenced by CSS **family name** and stay guid-less — the asset scanner deliberately skips GUID healing for them — while a `Text2D` ref must be a GUID, so before it, getting MSDF text meant copying a font into the project (Court shipped a byte-identical 500 KB duplicate for exactly this reason, #52). It is the one engine font with a committed `.meta.json`; the other bundled families stay family-name-only, and the tree-shaker keeps a font only if something names it (measured: Court's build keeps **1 of 9** engine font files). A code-only reference still needs an `asset-keep.json` entry — the path is under `/modoki/assets/`, which is keep-listable like any project path.
 - **⚠️ The GLSL program declares `OES_standard_derivatives`, and WHERE it declares it is load-bearing.** Pixi's high-shader assembly emits **version-less (GLSL ES 1.00)** source — it only takes the ES 3.00 path when the source literally contains `#version 300 es` (`GlProgram`: `indexOf('#version 300 es')`). In ES 1.00 the `screenPxRange` line's `fwidth` is illegal without the extension declared, so every MTSDF program failed to compile on iOS 15 (`ERROR: 'GL_OES_standard_derivatives' : extension is disabled`) and **every glyph silently vanished**. Not a capability gap — WebGL2 and the extension are both present; desktop and Android drivers simply accept `fwidth` in ES 1.00 source anyway, so only Apple's stricter compiler rejects it, which is why it hid on every machine we test on. The directive **must precede `precision`**: measured on-device, a pragma placed in this file's `fragment.header` bit (where Pixi injects it, i.e. *after* the precision line) fails just as loudly with `extension directive must occur before any non-preprocessor tokens`. Hence `withDerivativesExtension` rewrites the ASSEMBLED source instead. `enable`, not `require`, so a device lacking it degrades to a warning; not switched to `#version 300 es`, which would hard-fail a genuinely WebGL1-only device.
 - **⚠️ The atlas must be decoded UNPREMULTIPLIED, and `alphaMode` CANNOT enforce that (#1045).** An MTSDF atlas carries the 3-channel distance field in **RGB** and the true SDF in **alpha**, so premultiplying scales the field by alpha and drags `median(rgb)` below the shader's 0.5 edge threshold — `fill = clamp((sd - 0.5) * spr + 0.5, 0, 1)` is then 0 for every pixel and **every 2D glyph in the game renders fully transparent**. `fontTexturePixi` sets `source.alphaMode = 'no-premultiply-alpha'` and that is not enough: per the WebGL spec `UNPACK_PREMULTIPLY_ALPHA_WEBGL` is **ignored for `ImageBitmap` uploads**, so the only lever is the `createImageBitmap` option — and `Assets.load` does not expose it (`loadTextures.mjs` passes `{premultiplyAlpha:'none'}` ONLY when `data.alphaMode === 'premultiplied-alpha'`, and otherwise calls `createImageBitmap(blob)` bare, leaving it to the UA). Hence `loadMtsdfAtlasTexture` (`pixiTextureLoad.ts`) fetches and decodes the atlas itself. ⚠️ **Do not "simplify" it back to `Assets.load({data:{alphaMode:'premultiplied-alpha'}})`** — that yields the right bitmap only by exploiting an inverted condition inside Pixi's loader while mislabelling the source, and would break silently on a Pixi bump. Since Pixi's `Assets` no longer owns the texture, its disposer **destroys** it; `Assets.unload` there would be a silent no-op leaking the whole 8 MB page.
-  - **Why it hid:** the UA default differs by WebKit version. Measured on an iPhone 8 / iOS 16.7.16, `createImageBitmap(blob)` is byte-identical to `{premultiplyAlpha:'premultiply'}`; iOS 26, Android and desktop do not premultiply, so the identical bundle is correct there. Like the `OES_standard_derivatives` trap above, this is **not a capability gap** — and the repro needs a real iOS 16 device, so `verify` and both CI legs are green on the affected tree (the same blind-spot class as the r185 ceiling, § "The r185 bump").
+  - **Why it hid:** the UA default differs by WebKit version. Measured on an iPhone 8 / iOS 16.7.16, `createImageBitmap(blob)` is byte-identical to `{premultiplyAlpha:'premultiply'}`; iOS 26, Android and desktop do not premultiply, so the identical bundle is correct there. Like the `OES_standard_derivatives` trap above, this is **not a capability gap** — and the repro needs a real iOS 16 device, so `verify` and both CI legs are green on the affected tree (the same blind-spot class as the three ceiling, § "three r185 → r186").
   - **The measurement that identified it, and the one worth repeating.** Data-correct is not pixels-correct: the glyph entities, geometry, UVs, uniforms, VAO bindings, texture binding, texture completeness, scissor/stencil/blend and viewport ALL checked out on the device. What isolated it was reading the same texel two ways — `ctx.drawImage(bitmap)` on a 2D canvas (the file: `125,194,125 a=126`) versus `gl.readPixels` through an FBO attached to the live GL texture (as uploaded: `62,96,62 a=126`, i.e. `125 x 126/255`). Over one glyph cell, texels with `median(rgb) > 0.5` were **1775 in the file and 0 on the GPU**. ⚠️ **A shader-level bisect nearly sent this the wrong way:** patching the fragment shader to a solid opaque red and relinking showed *nothing*, which reads as "the draw never lands" — but `gl.linkProgram` **resets every uniform to zero**, so the vertex stage was writing a degenerate `gl_Position` and no variant could have drawn. Patch Pixi's shader SOURCE and drop its cached program instead, so Pixi recompiles and re-syncs uniforms.
 - **A baked font's SOURCE file is not always shipped.** `Text2D` needs only `~atlas.png` + `~metrics.json`; the `.ttf` ships only when a DOM consumer names the family. See [build.md](./build.md) § "Converted assets" — including the blind spot where a CSS-named family needs `shipSource: 'always'`.
 - **Per-page meshes + dynamic packing** — one Pixi `Mesh` per atlas PAGE the text touches (a dynamic CJK provider spills glyphs across pages; a baked / single-page font is one mesh), all children of the slot `Container` so the anchor pivot + transform apply to the whole block. Geometry rebuilds only when the layout hash changes (text/font/size/wrap/spacing/`atlasVersion`); the shader updates only on a style-hash change; placement writes only when the transform moves. Atlas textures are FONT-owned (freed on scene teardown), never disposed by the slot. Per-glyph animation recomputes page positions from the base quads each frame while the sim runs (frozen when stopped, like skeletal animation).

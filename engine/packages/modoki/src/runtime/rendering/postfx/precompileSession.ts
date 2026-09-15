@@ -82,7 +82,13 @@ interface RendererLike {
  *  `markScenePainted()` firing anyway over a blank canvas. That is #334's bug exactly, and it is
  *  reachable — the compile cap times ~130 ms per pipeline on an A23 is seconds, not milliseconds.
  *  Kept BELOW `LIVE_COMPILE_MAX_HOLD_MS` (5 s) so the stub is always gone before the gate lets a
- *  frame past. */
+ *  frame past.
+ *
+ *  ⚠️ **Measured from the gate's KICK, not from when the session begins** (#957). Since every
+ *  compile on a renderer queues on one chain, a stage compile can start seconds after its gate
+ *  armed; a deadline counted from `beginPrecompile` would then outlive the gate's release and hold
+ *  frames AFTER the scene was revealed. So `compileStagesAsync` passes its kick time as `now`, and
+ *  skips outright when its queue wait alone used the budget. */
 export const PRECOMPILE_MAX_HOLD_MS = 4_000;
 
 const sessions = new WeakMap<object, Entry>();
@@ -202,6 +208,30 @@ export function endAllPrecompiles(renderer: unknown): void {
 
 /** Run `fn` with no other exclusive precompile in flight on this renderer.
  *
+ *  ⚠️ **EVERY async compile on a renderer goes through here, not only the stage compile** (#957):
+ *  the pre-swap prewarm (`prewarmShadersForWorld`), the live-scene compile (`compileLiveScene`,
+ *  which carries `PostFXStack.compileSceneAsync`) and `PostFXStack.compileStagesAsync`. The
+ *  reason is a fact about three, measured: `Renderer.compileAsync` fixes its render context
+ *  synchronously and then builds each object's node graph after `await`s, reading
+ *  `renderer.getRenderTarget()`/`getMRT()` AT THAT MOMENT. Two compiles that each bind their own
+ *  target across an `await` therefore build against each other's. The scene compile used to run
+ *  outside this chain, and `liveCompileGate` releases the frame at its ceiling without cancelling
+ *  the compile — so a cold pipeline cache (a clean-install first launch) let the stage compile
+ *  start on top of it, bind bloom's targets, and leave the scene's materials with pipelines that
+ *  fail validation (`writeMask`, `GPUColorTargetState.format`): #956's black screen. Forcing that
+ *  overlap on desktop Chromium broke 5/5 loads on BOTH three 0.184 and 0.185.1; serialising it
+ *  here took both to 0/5. `docs/rendering.md` § "Every async compile on a renderer is serialised".
+ *
+ *  ⚠️ **Never call this from inside `fn`** on the same renderer — the inner call waits for the
+ *  outer one to finish, which waits for the inner one. There is no way to detect that from here.
+ *  So `compileSceneAsync` does NOT lock itself; its one caller, `compileLiveScene`, holds the lock.
+ *
+ *  ⚠️ **A long or never-settling compile holds everything queued behind it**, and a caller whose
+ *  WAIT has no ceiling of its own inherits that. The two gated compiles are fine — their gates
+ *  release frames at 5 s whatever the queue does. The pre-swap prewarm is NOT gated: the scene swap
+ *  awaits it, so it queues through `runExclusivePrecompileWithin` and skips its compile rather than
+ *  stall a scene load behind the previous scene's compile. A new ungated caller needs the same.
+ *
  *  Rejections are absorbed into the CHAIN (so one failure cannot wedge every later compile) but
  *  are still delivered to this caller.
  */
@@ -212,6 +242,32 @@ export function runExclusivePrecompile<T>(renderer: unknown, fn: () => Promise<T
   const next = prev.then(fn, fn);
   chains.set(key, next.then(() => undefined, () => undefined));
   return next;
+}
+
+/** What `runExclusivePrecompileWithin` did: ran `fn` (with its value), or gave up waiting. */
+export type QueuedPrecompile<T> = { ran: true; value: T } | { ran: false };
+
+/** `runExclusivePrecompile` for a caller that must not wait without bound — the pre-swap prewarm,
+ *  which a scene load awaits. If the queue has not reached this call within `maxWaitMs`, it resolves
+ *  `{ ran: false }` and `fn` NEVER runs, not even later: running it unlocked would reintroduce the
+ *  overlap the queue exists to prevent (#957), and running it once its turn finally comes would
+ *  compile for a scene the caller has already moved past.
+ *
+ *  A rejection from `fn` is delivered to this caller, as with `runExclusivePrecompile`. */
+export function runExclusivePrecompileWithin<T>(
+  renderer: unknown, maxWaitMs: number, fn: () => Promise<T>,
+): Promise<QueuedPrecompile<T>> {
+  let expired = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const gaveUp = new Promise<QueuedPrecompile<T>>((resolve) => {
+    timer = setTimeout(() => { expired = true; resolve({ ran: false }); }, maxWaitMs);
+  });
+  const turn = runExclusivePrecompile(renderer, async (): Promise<QueuedPrecompile<T>> => {
+    if (expired) return { ran: false };
+    clearTimeout(timer);
+    return { ran: true, value: await fn() };
+  });
+  return Promise.race([turn, gaveUp]);
 }
 
 /** Test seam: forget everything for one renderer. */

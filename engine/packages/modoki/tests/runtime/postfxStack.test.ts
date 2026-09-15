@@ -768,6 +768,150 @@ describe('PostFXStack — stage nodes that own GPU resources are freed (leak reg
       expect(scenePasses[0].renderTarget.samples).toBe(4);
       expect(scenePasses[0].renderTarget.texture.type).toBe(1016);
     });
+
+    it('a stack disposed while its compile was queued compiles nothing (#957)', async () => {
+      // The compile runs when the renderer's compile queue reaches it, which can be after a rebuild
+      // disposed this stack — compiling its pass then would warm pipelines for a dead graph.
+      const stack = await makeStack({ bloom: bloomCfg() });
+      stack.dispose();
+      await stack.compileSceneAsync();
+      expect(scenePasses[0].compileAsync).not.toHaveBeenCalled();
+    });
+
+    /** three's `PassNode.compileAsync` binds the pass target + MRT and restores them only on success. */
+    function bindingRenderer() {
+      const r = {
+        ...makeRenderer(),
+        target: 'canvas' as unknown,
+        mrt: null as unknown,
+        getRenderTarget: () => r.target,
+        setRenderTarget: (t: unknown) => { r.target = t; },
+        getMRT: () => r.mrt,
+        setMRT: (m: unknown) => { r.mrt = m; },
+      };
+      return r;
+    }
+
+    it('a scene-pass compile that REJECTS unbinds the pass target + MRT three left behind (#957)', async () => {
+      const { PostFXStack } = await import('../../src/runtime/rendering/postfx/PostFXStack');
+      const renderer = bindingRenderer();
+      const stack = new PostFXStack(renderer, new THREE.Scene(), new THREE.PerspectiveCamera(), { bloom: bloomCfg() } as never);
+      const pass = scenePasses[0];
+      pass.compileAsync.mockImplementationOnce(async () => {
+        renderer.setRenderTarget(pass.renderTarget);
+        renderer.setMRT('sceneMRT');
+        throw new Error('shader graph exploded');
+      });
+
+      await expect(stack.compileSceneAsync()).rejects.toThrow('shader graph exploded');
+      // Left bound, every later frame draws into the pass's own target: a black canvas for good.
+      expect(renderer.target).toBe('canvas');
+      expect(renderer.mrt).toBe(null);
+    });
+
+    it('…but leaves a binding it did not make alone — an offscreen capture restores its own', async () => {
+      const { PostFXStack } = await import('../../src/runtime/rendering/postfx/PostFXStack');
+      const renderer = bindingRenderer();
+      const stack = new PostFXStack(renderer, new THREE.Scene(), new THREE.PerspectiveCamera(), { bloom: bloomCfg() } as never);
+      const pass = scenePasses[0];
+      pass.compileAsync.mockImplementationOnce(async () => {
+        renderer.setRenderTarget(pass.renderTarget);
+        renderer.setRenderTarget('captureRT'); // a capture bound its target mid-compile
+        throw new Error('device lost');
+      });
+
+      await expect(stack.compileSceneAsync()).rejects.toThrow('device lost');
+      expect(renderer.target).toBe('captureRT');
+    });
+  });
+
+  /** #957. Every compile on a renderer queues on ONE chain, and the stage compile is the half that
+   *  held the lock first — so nothing else in the suite notices if it stops taking it. */
+  describe('stage precompile takes its turn on the renderer compile queue (#957)', () => {
+    afterEach(async () => {
+      const clock = await import('../../src/runtime/core/clock');
+      clock.restoreRealClock();
+    });
+
+    async function queued() {
+      const { PostFXStack } = await import('../../src/runtime/rendering/postfx/PostFXStack');
+      const session = await import('../../src/runtime/rendering/postfx/precompileSession');
+      const clock = await import('../../src/runtime/core/clock');
+      const renderer = makeRenderer();
+      const stack = new PostFXStack(renderer, new THREE.Scene(), new THREE.PerspectiveCamera(), { bloom: bloomCfg() } as never);
+      const inner = vi.spyOn(stack as unknown as { compileStagesInner(k: number): Promise<void> }, 'compileStagesInner')
+        .mockResolvedValue(undefined);
+      let release!: () => void;
+      const ahead = session.runExclusivePrecompile(renderer, () => new Promise<void>((res) => { release = res; }));
+      return { stack, inner, ahead, release: () => release(), clock };
+    }
+
+    it('does not start while another compile holds the renderer', async () => {
+      const { stack, inner, ahead, release } = await queued();
+      const kicked = stack.compileStagesAsync();
+      await new Promise((r) => setTimeout(r, 10));
+      expect(inner).not.toHaveBeenCalled();
+      release();
+      await Promise.all([ahead, kicked]);
+      expect(inner).toHaveBeenCalledTimes(1);
+    });
+
+    it('carries its KICK time into the session, so the hold ceiling still counts from the gate', async () => {
+      const { stack, inner, ahead, release, clock } = await queued();
+      clock.setManualNow(1_000);
+      const kicked = stack.compileStagesAsync();
+      const { PRECOMPILE_MAX_HOLD_MS } = await import('../../src/runtime/rendering/postfx/precompileSession');
+      clock.setManualNow(1_000 + PRECOMPILE_MAX_HOLD_MS - 1); // waited just under the budget
+      release();
+      await Promise.all([ahead, kicked]);
+      expect(inner).toHaveBeenCalledWith(1_000);
+    });
+
+    it('the session it opens ENDS at kick + PRECOMPILE_MAX_HOLD_MS, not at turn + that — #334 composes with the gate', async () => {
+      // The load-bearing half: a session deadline counted from its late start would still hold the
+      // stubbed renderer after the gate released a frame at kick + 5 s.
+      const { PostFXStack } = await import('../../src/runtime/rendering/postfx/PostFXStack');
+      const session = await import('../../src/runtime/rendering/postfx/precompileSession');
+      const clock = await import('../../src/runtime/core/clock');
+      let activeAtKickDeadline: boolean | undefined;
+      const renderer = {
+        ...makeRenderer(),
+        render: vi.fn(),
+        toneMapping: 0, outputColorSpace: 'srgb', depth: true, stencil: false,
+        compileAsync: vi.fn(async () => {
+          // Asked while the session is open, at the instant the KICK-based ceiling expires.
+          activeAtKickDeadline = session.isPrecompileActive(renderer, 1_000 + session.PRECOMPILE_MAX_HOLD_MS);
+        }),
+      };
+      const stack = new PostFXStack(renderer, new THREE.Scene(), new THREE.PerspectiveCamera(), { bloom: bloomCfg() } as never);
+      // The terminal-quad prologue `compileStagesInner` needs; the stage walk then finds nothing.
+      Object.assign((stack as unknown as { pipeline: object }).pipeline, {
+        _update: vi.fn(), _quadMesh: { camera: new THREE.OrthographicCamera(), frustumCulled: true },
+      });
+      let release!: () => void;
+      const ahead = session.runExclusivePrecompile(renderer, () => new Promise<void>((res) => { release = res; }));
+
+      clock.setManualNow(1_000);
+      const kicked = stack.compileStagesAsync();
+      clock.setManualNow(1_000 + session.PRECOMPILE_MAX_HOLD_MS - 1); // queued almost the whole budget
+      await new Promise((r) => setTimeout(r, 0)); // the holder's body starts a microtask after the call
+      release();
+      await Promise.all([ahead, kicked]);
+
+      expect(renderer.compileAsync).toHaveBeenCalled();
+      expect(activeAtKickDeadline).toBe(false);
+    });
+
+    it('skips when the queue wait alone used the hold budget — it would hold frames past the gate', async () => {
+      const { stack, inner, ahead, release, clock } = await queued();
+      const { PRECOMPILE_MAX_HOLD_MS } = await import('../../src/runtime/rendering/postfx/precompileSession');
+      clock.setManualNow(1_000);
+      const kicked = stack.compileStagesAsync();
+      clock.setManualNow(1_000 + PRECOMPILE_MAX_HOLD_MS);
+      release();
+      await Promise.all([ahead, kicked]);
+      expect(inner).not.toHaveBeenCalled();
+    });
   });
 
 });

@@ -20,7 +20,7 @@ import { createTeardownScope, type TeardownScope } from '../core/teardownScope';
 import { computeEntityScreenBounds, boundsSourcesOf } from './entityScreenBounds';
 import { readbackToRGBA, type ReadbackBackend } from './readbackToRGBA';
 import { createViewportBringUp, boundedCaptureReadback } from './viewportBringUp';
-import { createRenderer, createRenderState, disposeRenderState, syncCamera, applyOrthoFrustum, computeActiveFrameFit, computeFrameFitById, activeFrameId, type ActiveFrameFit, syncEnvironment, syncFog, syncLights, syncSceneRenderables3D, orientBillboards, reconcileToneExposure, prewarmShadersForWorld, compileLiveScene, clearOwnedMaterials, attachInvalidationListener } from './scene3DSync';
+import { createRenderer, createRenderState, disposeRenderState, syncCamera, applyOrthoFrustum, computeActiveFrameFit, computeFrameFitById, activeFrameId, type ActiveFrameFit, syncEnvironment, syncFog, syncLights, syncSceneRenderables3D, orientBillboards, reconcileToneExposure, prewarmShadersForWorld, compileLiveScene, liveSceneCompileAtTurn, clearOwnedMaterials, attachInvalidationListener } from './scene3DSync';
 import { disposeVideoTextures } from './videoTextureSync';
 import { registerRenderSurface } from './materialBroker';
 import { onRendererLost, makeViewportLossPolicy, attachUncapturedErrorListener } from '../core/activeRenderer';
@@ -697,7 +697,11 @@ export default function Scene3D() {
           // frame settled on — both of which exist only now. Holding the submit until it resolves
           // is the point: the pipelines it builds are exactly the ones the first draw would
           // otherwise build SYNCHRONOUSLY, and that is the stall.
-          if (liveCompile.tick(() => compileLiveScene(renderer, scene, activeCamera, () => postfxStack!.compileSceneAsync()))) return;
+          // The stack, camera and liveness are read when the compile's TURN comes, not at the kick
+          // (#957) — see `liveSceneCompileAtTurn`.
+          if (liveCompile.tick(() => compileLiveScene(renderer, scene, activeCamera, liveSceneCompileAtTurn(
+            renderer, scene, () => ({ stack: postfxStack, camera: activeCamera, tornDown: disposed }),
+          )))) return;
           // …and the stack's OWN stage quads (#323), on its OWN gate.
           //
           // ⚠️ This deliberately does NOT ride `liveCompile`, and the reason is measured, not
