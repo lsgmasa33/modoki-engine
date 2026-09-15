@@ -10,6 +10,7 @@ import { OnZone2D } from '../../src/runtime/traits/OnZone2D';
 import { zone2DSystem } from '../../src/runtime/zones/zone2DSystem';
 import { zone3DSystem } from '../../src/runtime/zones/zone3DSystem';
 import { EntityAttributes } from '../../src/runtime/core/traits/EntityAttributes';
+import { isRuntimeGuid } from '../../src/runtime/core/assetRefRules';
 import { zone2DEvents } from '../../src/runtime/zones/Zone2DEvents';
 import { zone3DEvents } from '../../src/runtime/zones/Zone3DEvents';
 
@@ -172,10 +173,44 @@ describe('Zone2D triggers — declarative + despawn', () => {
     // occ1's exit must NOT claim to be occ2 (the misattribution this test guards): koota's
     // has()/get() don't check generation, so entityRef(deadHandle) would otherwise silently
     // resolve occ2's guid for occ1's own exit — reading as "occ2 entered and exited the same
-    // tick", which is false. `refOf` falls back to the CACHED numeric id instead: honestly
-    // anonymous rather than confidently wrong.
+    // tick", which is false. `refOf` returns the ref CACHED while occ1 was alive instead — occ1's
+    // own guid, the same ref its enter carried (#1225; it used to be the bare numeric id).
     expect(exit?.other).not.toBe('guid-occ2');
-    expect(typeof exit?.other).toBe('number');
+    expect(exit?.other).toBe('guid-occ1');
+  });
+
+  // #1225: a despawn-exit carries the ref its ENTER carried. The cache used to be the numeric id,
+  // so every runtime-guid occupant (#1210 — every code spawn) journaled enter as a guid and exit
+  // as a number, and the pair could no longer be matched by ref.
+  // Review follow-up: a ZONE member is seeded the frame the zone first appears; a guid changed later
+  // reaches the despawn-exit only through the live refresh.
+  it('a zone guid changed after the zone was first tracked is the ref its despawn-exit carries', () => {
+    tw = createTestWorld({ systems: [ZONE2D] });
+    const zone = tw.spawn(Transform({ x: 0, y: 0, sx: 4, sy: 4 }), Zone2D({ shape: 'box' }), EntityAttributes({ name: 'zone' }));
+    const occ = tw.spawn(Transform({ x: 50, y: 50 }), ZoneOccupant, EntityAttributes({ name: 'shot' }));
+    tw.step(1);                                    // zone tracked (member seeded), occupant outside
+    zone.set(EntityAttributes, { ...zone.get(EntityAttributes)!, guid: 'd1225bbb-0000-4000-8000-000000000002' });
+    moveTo(occ, 0, 0); tw.step(1);                 // enter — refOf(zone) is live here
+    zone.destroy(); tw.step(1);                    // zone gone → synthesized exit
+
+    const ev = tw.events({ type: '@zone' }).map((e) => e.payload as { zone: unknown; phase: string });
+    expect(ev.find((e) => e.phase === 'exit')?.zone).toBe('d1225bbb-0000-4000-8000-000000000002');
+  });
+
+  it('a despawned runtime-guid occupant journals its exit under the same ref as its enter', () => {
+    tw = createTestWorld({ systems: [ZONE2D] });
+    tw.spawn(Transform({ x: 0, y: 0, sx: 4, sy: 4 }), Zone2D({ shape: 'box' }), EntityAttributes({ name: 'zone' }));
+    const occ = tw.spawn(Transform({ x: 0, y: 0 }), ZoneOccupant, EntityAttributes({ name: 'shot' }));
+    tw.step(1);
+    tw.step(1); // a second diff while inside — the member (and its cached ref) carries across frames
+    occ.destroy(); tw.step(1);
+
+    const ev = tw.events({ type: '@zone' }).map((e) => e.payload as { zone: unknown; other: unknown; phase: string });
+    const enter = ev.find((e) => e.phase === 'enter');
+    const exit = ev.find((e) => e.phase === 'exit');
+    expect(isRuntimeGuid(enter?.other as string)).toBe(true);
+    expect(exit?.other).toBe(enter?.other);
+    expect(exit?.zone).toBe(enter?.zone);
   });
 });
 

@@ -334,7 +334,7 @@ export function applyTimelineState(world: World, rootId: number, def: TimelineDe
           `timeline will STOP HERE permanently and cannot re-activate itself. Point the track at the ` +
           `object you want to show/hide instead.`,
         );
-        emit('@timeline-selfdeact', { director: rootId, track: track.name, t });
+        emit('@timeline-selfdeact', { director: rootEntity ? entityRef(rootEntity) : rootId, track: track.name, t });
       }
       if (cur.isActive !== desired) entity.set(EntityAttributes, { ...cur, isActive: desired });
     } else if (decision.hasMuted) {

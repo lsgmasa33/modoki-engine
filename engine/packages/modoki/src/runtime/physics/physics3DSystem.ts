@@ -37,7 +37,7 @@ import { createPhysicsWorldRegistry } from './physicsWorldRegistry';
 import { meshColliderProvider } from './meshColliderProvider';
 import { buildMeshColliderDescs } from './meshColliderGeometry';
 import { physics3DEvents } from './Physics3DEvents';
-import { makeFireOnCollision, collectContactEvents, routeContactEvents, collectContactExits, routeContactExits, refOf, type ColliderInfo, type DrainedPair, type ContactExitPair } from './physicsContactEvents';
+import { makeFireOnCollision, collectContactEvents, routeContactEvents, collectContactExits, routeContactExits, refOf, makeColliderInfo, type ColliderInfo, type ColliderMap, type DrainedPair, type ContactExitPair } from './physicsContactEvents';
 import { physicsSubsteps, substepFraction, substepLerp } from './physicsSubstep';
 import { dropEntityFromContactIndex } from './physicsContactIndex';
 import { emit, isVerboseCaptureActive } from '../core/journal';
@@ -103,7 +103,7 @@ interface PhysicsWorldState3D {
   eventQueue: REventQueue;
   bodies: Map<number, BodyRec3D>;   // keyed by ENTITY id
   soloColliders: Map<number, SoloColliderRec>; // keyed by ENTITY id — parentless fixed colliders
-  colliders: Map<number, { entityId: number; entity: Entity; isSensor: boolean; bodyPacked: number }>; // keyed by collider handle
+  colliders: ColliderMap; // keyed by collider handle
   joints: Map<number, JointRec3D>;  // keyed by joint-entity id
   charCtrl?: RCharCtrl;             // shared kinematic character controller, lazily created
   charCfg?: { skin: number; climb: number; slide: number; autoH: number; autoW: number; snap: number };
@@ -476,7 +476,7 @@ function attachCollider(
       .setActiveEvents(R.ActiveEvents.COLLISION_EVENTS);
     if (offset && offQuat) cd.setTranslation(offset.x, offset.y, offset.z).setRotation(offQuat);
     const col = st.world.createCollider(cd, body);
-    st.colliders.set(col.handle, { entityId: colliderEntity.id(), entity: colliderEntity, isSensor: !!c.isSensor, bodyPacked });
+    st.colliders.set(col.handle, makeColliderInfo(colliderEntity, !!c.isSensor, bodyPacked));
     handles.push(col.handle);
   }
   return handles;
@@ -606,7 +606,7 @@ function attachSoloCollider(st: PhysicsWorldState3D, colliderEntity: Entity, cfg
       .setActiveEvents(R.ActiveEvents.COLLISION_EVENTS)
       .setTranslation(pos.x, pos.y, pos.z).setRotation(quat);
     const col = st.world.createCollider(cd);   // no parent body ⇒ Rapier treats it as fixed
-    st.colliders.set(col.handle, { entityId: colliderEntity.id(), entity: colliderEntity, isSensor: !!c.isSensor, bodyPacked: colliderEntity.valueOf() });
+    st.colliders.set(col.handle, makeColliderInfo(colliderEntity, !!c.isSensor, colliderEntity.valueOf()));
     handles.push(col.handle);
   }
   return handles;

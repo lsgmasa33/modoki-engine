@@ -240,14 +240,11 @@ export function entityRef(entity: EntityLike): string | number {
   if (name && _enabled) {
     try {
       const w = getCurrentWorld();
+      // ONE key: the ref this call returns. There used to be a second, numeric-id alias, because
+      // the synthesized despawn-exit (physicsContactEvents/zoneTriggerCore `refOf`) emitted the
+      // cached numeric id; it now emits the ref cached from a live call, so every journaled ref
+      // was recorded here under exactly that string (#1225).
       recordRefName(w, ref, name);
-      // Dual-key: also alias under the NUMERIC id. A guidable entity emits its GUID here (while
-      // alive), but the synthesized-exit path (physicsContactEvents `refOf`) emits the cached
-      // numeric `entityId` once the entity is DEAD — so a reader resolving that numeric ref would
-      // miss the name recorded only under the GUID. Aliasing both key forms keeps a despawned
-      // guidable entity nameable (the feature's headline case) and lets enter (guid) correlate
-      // with exit (numeric id). No-op when ref already IS the numeric id.
-      if (ref !== nid) recordRefName(w, nid, name);
     } catch { /* no current world */ }
   }
   return ref;

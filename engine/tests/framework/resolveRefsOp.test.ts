@@ -1,7 +1,7 @@
 /** resolve-refs op — the batched "ref → entity name" second hop that keeps names OUT of the
  *  journal stream. Covers the dense branching that had zero coverage: numeric-string coercion,
  *  live-world-wins-over-side-table precedence + the `alive` flag, side-table resolution AFTER
- *  despawn (incl. the numeric-id key the synthesized-exit path emits), the `unresolved` list,
+ *  despawn (by the guid the synthesized exit carries, #1225), the `unresolved` list,
  *  the empty-name-is-unresolved guard, and the empty-refs early return. */
 
 import { describe, it, expect, afterEach } from 'vitest';
@@ -42,19 +42,17 @@ describe('resolve-refs: live-world resolution', () => {
 });
 
 describe('resolve-refs: side-table resolution after despawn (the headline case)', () => {
-  it('names a despawned GUID entity by BOTH its guid and its numeric id, alive:false', async () => {
+  it('names a despawned GUID entity by its guid, alive:false', async () => {
     game = createTestWorld();
     const e = game.spawn(EntityAttributes({ guid: 'g-bolt', name: 'Bolt' }));
-    const id = e.id();
-    entityRef(e); // a contact emit would do this while alive → seeds the side-table (dual-keyed)
+    entityRef(e); // a contact emit would do this while alive → seeds the side-table
     e.destroy();
     game.step(1);
 
-    const r = await resolve(['g-bolt', id]);
-    // Live lookup misses (dead), so both fall through to the side-table — the numeric id resolves
-    // because entityRef dual-keys it (the synthesized-exit path emits that numeric id).
+    const r = await resolve(['g-bolt']);
+    // Live lookup misses (dead), so it falls through to the side-table. A despawn-exit carries this
+    // same guid (the ref cached while alive, #1225), so the guid is the only key it needs.
     expect(r.resolved['g-bolt']).toEqual({ name: 'Bolt', alive: false });
-    expect(r.resolved[String(id)]).toEqual({ name: 'Bolt', alive: false });
     expect(r.unresolved).toBeUndefined();
   });
 

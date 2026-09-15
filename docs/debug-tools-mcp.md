@@ -1784,19 +1784,31 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   of the (high-frequency) journal stream. Batch every ref you care about into one call after you've
   narrowed down. Names resolve **even for DESPAWNED entities** (captured at emit time in a per-world
   LRU side-table), which a live `get_scene_state` lookup cannot. Returns `{resolved:{ref:{name,alive}},
-  unresolved:[…]}`. Invariant: the side-table **dual-keys** a guidable entity — it records the name
-  under BOTH the GUID and the numeric id — because a live event carries the GUID while the synthesized
-  despawn-EXIT carries the cached numeric id; keying only the GUID would leave the exit ref unresolvable
-  (the case the feature exists for). Don't "simplify" that to a single key.
+  unresolved:[…]}`. Invariant: **a despawn-EXIT carries the ref its entity was last journaled
+  under while ALIVE** — the same ref its enter carried, unless the guid changed during the overlap (a
+  save re-minting a runtime guid). `physicsContactEvents`/`zoneTriggerCore` `refOf` caches that ref and
+  refreshes it on every live call, never re-deriving it from the dead handle, so the side-table keys
+  each name under exactly that one ref. It used to dual-key (GUID + numeric id) because the exit
+  carried the numeric id; once #1210 gave every code spawn a runtime guid, that split enter from exit
+  for almost every body (#1225). Don't reintroduce a numeric fallback for a guid entity — an agent
+  matches enter to exit BY REF. The table's 5,000-name LRU was suspected of dropping names the
+  10,000-event ring still holds; measured, it does not (1 miss at 5k/6k/12k spawns): every spawned
+  entity costs at least two ring events (`@spawn`/`@despawn`), so the ring never holds more distinct
+  spawn refs than the LRU does. ⚠️ Game code that journals `entityRef(other)` inside an exit callback
+  still re-derives from a dead handle (#1227).
 - **Watch (numeric time-series):** `modoki_watch {start|read|list|clear}` — a standing, change-detected
   series for tuning motion feel (jump overshoot, spring settle, bone/velocity decay) that a screenshot
   can't show. Focus by `component` + `guids[]` (resolved at START — a stale guid FAILS, not a silent
   empty) or `names[]` (case-insensitive substrings — NEW spawns matching a name AUTO-JOIN, the handle
   for a runtime-spawned entity whose guid changes every launch, e.g. the sling puck); optional
   `fields[]`. Anti-flood knobs `epsilon` (record only on change), `everyNFrames` (decimate),
-  `maxSamples` (ring cap), `maxSeries` (cap on MOVING series — a static/never-moved entity doesn't
-  consume it, so a screen of static tiles can't crowd out a late-joining mover), `expireFrames`
-  (auto-expire). `read` returns per-series stats `first/last/min/max/delta/settled` + each series'
+  `maxSamples` (ring cap), `maxSeries` (cap on LIVE MOVING series — a static/never-moved entity doesn't
+  consume it, so a screen of static tiles can't crowd out a late-joining mover, and a despawned one
+  gives its slot back), `expireFrames` (auto-expire). Series count has a hard 4096 memory ceiling; at
+  it the series of the longest-DESPAWNED entities are evicted first (`evictedDespawned` on `read`), and
+  only when none is left does a new series get refused (`truncated`). That matters because every code
+  spawn carries a unique runtime guid (#1210), so a per-shot spawner opens one series per shot and never
+  reuses one (#1225). `read` returns per-series stats `first/last/min/max/delta/settled` + each series'
   entity `name`; narrow a broad watch with `name=`/`guids=`/`limit=` (`seriesTotal`/`seriesTruncated`
   report the full match count). Editor-side observer — zero shipped-game cost. (`app/debug/watch.ts`.)
 - **Input watch (what the finger did):** `modoki_input_watch`/`device_input_watch {start|read|stop|clear}`

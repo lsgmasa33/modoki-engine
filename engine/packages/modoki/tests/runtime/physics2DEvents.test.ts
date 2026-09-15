@@ -5,7 +5,8 @@
  *  dispatched with the OTHER entity as target, and that unsubscribe/clear work. */
 
 import { describe, it, expect, beforeAll, afterEach, vi } from 'vitest';
-import { entityRef } from '../../src/runtime/core/journal';
+import { entityRef, resolveRefName } from '../../src/runtime/core/journal';
+import { isRuntimeGuid } from '../../src/runtime/core/assetRefRules';
 import { expectInOrder } from '../helpers/inOrder';
 import type { Entity } from 'koota';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
@@ -262,6 +263,52 @@ describe('OnCollision2D — declarative action dispatch', () => {
 });
 
 describe('Physics2DEvents — H1: exit on despawn + no double-enter on hot edit', () => {
+  // #1225: the synthesized despawn-exit carries the ref the ENTER carried. `refOf` used to fall back
+  // to the numeric id for a dead body, so once #1210 gave every code spawn a runtime guid the
+  // journal read enter=guid, exit=number for almost every body, and the pair no longer matched.
+  // Review follow-up: the cache is REFRESHED by every live refOf, not only seeded at attach — a guid
+  // that changes after the collider exists (a save re-minting a runtime guid) is what the enter and
+  // the exit must both carry.
+  it('a guid changed after the collider attached is the ref both the enter and the despawn-exit carry', () => {
+    tw = createTestWorld({ systems: [PHYS] });
+    tw.spawn(Physics2D({ gravityX: 0, gravityY: 20, pixelsPerMeter: 100 }));
+    // A tall sensor below the body: it falls in and is still inside when destroyed.
+    tw.spawn(Transform({ x: 0, y: 400 }), RigidBody2D({ bodyType: 'static' }),
+      Collider2D({ shape: 'box', halfW: 60, halfH: 200, isSensor: true }), EntityAttributes({ name: 'Trigger' }));
+    const body = tw.spawn(Transform({ x: 0, y: 0 }), RigidBody2D({ bodyType: 'dynamic' }),
+      Collider2D({ shape: 'circle', radius: 12 }), EntityAttributes({ name: 'Shot' }));
+    tw.step(1);                                    // colliders attached (ref seeded), body above the sensor
+    expect(tw.events({ type: '@sensor' })).toHaveLength(0);
+    body.set(EntityAttributes, { ...body.get(EntityAttributes)!, guid: 'd1225aaa-0000-4000-8000-000000000001' });
+    for (let i = 0; i < 240 && tw.events({ type: '@sensor' }).length === 0; i++) tw.step(1); // fall in → enter
+    body.destroy();
+    tw.step(1);                                    // synthesized exit
+
+    const ev = tw.events({ type: '@sensor' }).map((e) => e.payload as { other: unknown; phase: string });
+    expect(ev.find((e) => e.phase === 'enter')?.other).toBe('d1225aaa-0000-4000-8000-000000000001');
+    expect(ev.find((e) => e.phase === 'exit')?.other).toBe('d1225aaa-0000-4000-8000-000000000001');
+  });
+
+  it('journals a despawned runtime-guid body\'s @sensor exit under the same ref as its enter', () => {
+    tw = createTestWorld({ systems: [PHYS] });
+    tw.spawn(Physics2D({ gravityX: 0, gravityY: 0, pixelsPerMeter: 100 }));
+    tw.spawn(Transform({ x: 0, y: 0 }), RigidBody2D({ bodyType: 'static' }),
+      Collider2D({ shape: 'box', halfW: 60, halfH: 60, isSensor: true }), EntityAttributes({ name: 'Trigger' }));
+    const body = tw.spawn(Transform({ x: 0, y: 0 }), RigidBody2D({ bodyType: 'dynamic' }),
+      Collider2D({ shape: 'circle', radius: 12 }), EntityAttributes({ name: 'Shot' }));
+    tw.step(5);                                    // enter (pre-overlapping)
+    body.destroy();
+    tw.step(1);                                    // synthesized exit for the dead body
+
+    const ev = tw.events({ type: '@sensor' }).map((e) => e.payload as { sensor: unknown; other: unknown; phase: string });
+    const enter = ev.find((e) => e.phase === 'enter');
+    const exit = ev.find((e) => e.phase === 'exit');
+    expect(isRuntimeGuid(enter?.other as string)).toBe(true);
+    expect(exit?.other).toBe(enter?.other);
+    expect(exit?.sensor).toBe(enter?.sensor);
+    expect(resolveRefName(exit?.other as string, tw.world)).toBe('Shot');
+  });
+
   it('synthesizes a sensor exit when a body inside a trigger is despawned', () => {
     tw = createTestWorld({ systems: [PHYS] });
     tw.spawn(Physics2D({ gravityX: 0, gravityY: 0, pixelsPerMeter: 100 })); // no gravity: body rests inside

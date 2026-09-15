@@ -32,7 +32,7 @@ import { worldTransforms } from '../core/ecs/transformPropagationSystem';
 import { getWorldTransform3D } from '../core/ecs/worldTransform';
 import { createPhysicsWorldRegistry } from './physicsWorldRegistry';
 import { physics2DEvents } from './Physics2DEvents';
-import { makeFireOnCollision, collectContactEvents, routeContactEvents, collectContactExits, routeContactExits, refOf, type ColliderInfo, type DrainedPair, type ContactExitPair } from './physicsContactEvents';
+import { makeFireOnCollision, collectContactEvents, routeContactEvents, collectContactExits, routeContactExits, refOf, makeColliderInfo, type ColliderInfo, type ColliderMap, type DrainedPair, type ContactExitPair } from './physicsContactEvents';
 import { physicsSubsteps, substepFraction, substepLerp } from './physicsSubstep';
 import { dropEntityFromContactIndex } from './physicsContactIndex';
 import { emit, isVerboseCaptureActive } from '../core/journal';
@@ -92,7 +92,7 @@ interface PhysicsWorldState {
   /** colliderHandle → { entityId, entity, isSensor } for mapping Rapier events back
    *  to entities. `entity` is the full koota handle (the drain runs in the same tick,
    *  so it's live) — needed to notify the Physics2DEvents manager + read OnCollision2D. */
-  colliders: Map<number, { entityId: number; entity: Entity; isSensor: boolean; bodyPacked: number }>;
+  colliders: ColliderMap;
   /** joint-entity id → joint record. Reconciled after bodies each tick. */
   joints: Map<number, JointRec>;
   /** Shared kinematic character controller (lazily created, reconfigured per character). */
@@ -388,7 +388,7 @@ function attachCollider(
       .setActiveEvents(R.ActiveEvents.COLLISION_EVENTS);
     if (offset) cd.setTranslation(offset.x, offset.y).setRotation(offset.ang);
     const col = st.world.createCollider(cd, body);
-    st.colliders.set(col.handle, { entityId: colliderEntity.id(), entity: colliderEntity, isSensor: !!c.isSensor, bodyPacked });
+    st.colliders.set(col.handle, makeColliderInfo(colliderEntity, !!c.isSensor, bodyPacked));
     handles.push(col.handle);
   }
   return handles;
@@ -520,7 +520,7 @@ function attachSoloCollider(st: PhysicsWorldState, colliderEntity: Entity, cfg: 
       .setActiveEvents(R.ActiveEvents.COLLISION_EVENTS)
       .setTranslation(pos.x, pos.y).setRotation(ang);
     const col = st.world.createCollider(cd);   // no parent body ⇒ Rapier treats it as fixed
-    st.colliders.set(col.handle, { entityId: colliderEntity.id(), entity: colliderEntity, isSensor: !!c.isSensor, bodyPacked: colliderEntity.valueOf() });
+    st.colliders.set(col.handle, makeColliderInfo(colliderEntity, !!c.isSensor, colliderEntity.valueOf()));
     handles.push(col.handle);
   }
   return handles;

@@ -972,7 +972,8 @@ are the non-obvious DECISIONS and the roads not taken.
   fresh-guid spawns) is the headline fix for a runtime-spawned entity like the sling puck. For the
   un-scoped "watch all" case, `maxSeries` caps MOVING series only (a static baseline is cheap and
   doesn't consume it) — an eviction scheme was rejected because at a small cap it thrashes and can drop
-  a just-baselined mover before it records its first movement.
+  a just-baselined mover before it records its first movement. The one eviction that DID land (#1225)
+  cannot do that: at the 4096 memory ceiling it drops only DESPAWNED entities' frozen series.
 
 - **The DMG config-refresh trap (a road not taken).** `project_settings` writes reach the Electron
   backend, but the child Vite serves the renderer and caches the config module. The naive fix — watch

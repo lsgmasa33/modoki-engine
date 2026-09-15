@@ -12,6 +12,7 @@ import { physics3DSystem, disposePhysics3D } from '../../src/runtime/physics/phy
 import { physics3DEvents } from '../../src/runtime/physics/Physics3DEvents';
 import { initRapier3D } from '../../src/runtime/physics/rapier3DLoader';
 import { resolveRefName, setVerboseCapture } from '../../src/runtime/core/journal';
+import { isRuntimeGuid } from '../../src/runtime/core/assetRefRules';
 
 beforeAll(async () => { await initRapier3D(); });
 
@@ -218,7 +219,7 @@ describe('Physics3DEvents — Percept tiers & resolvability (3D parity)', () => 
     setVerboseCapture('@contact', false);
   });
 
-  it('resolveRefName names a guid entity by both keys, surviving despawn', () => {
+  it('resolveRefName names a guid entity by its guid, surviving despawn', () => {
     tw = createTestWorld({ systems: [PHYS] });
     tw.spawn(Physics3D({ gravityX: 0, gravityY: -20, gravityZ: 0 }));
     tw.spawn(Transform({ x: 0, y: 0, z: 0 }), RigidBody3D({ bodyType: 'static' }),
@@ -226,7 +227,7 @@ describe('Physics3DEvents — Percept tiers & resolvability (3D parity)', () => 
     const box = tw.spawn(Transform({ x: 0, y: 6, z: 0 }), RigidBody3D({ bodyType: 'dynamic' }),
       Collider3D({ shape: 'box', halfW: 0.5, halfH: 0.5, halfD: 0.5 }), EntityAttributes({ guid: 'g-box', name: 'Box' }));
 
-    tw.step(180); // a contact fires → entityRef caches the name under both the guid and numeric id
+    tw.step(180); // a contact fires → entityRef caches the name under the guid
     expect(resolveRefName('g-box', tw.world)).toBe('Box');
 
     box.destroy();
@@ -237,6 +238,29 @@ describe('Physics3DEvents — Percept tiers & resolvability (3D parity)', () => 
 });
 
 describe('Physics3DEvents — despawn exit, hot edit, unsubscribe', () => {
+  // #1225: the synthesized despawn-exit carries the ref the ENTER carried. `refOf` used to fall back
+  // to the numeric id for a dead body, so once #1210 gave every code spawn a runtime guid the
+  // journal read enter=guid, exit=number for almost every body, and the pair no longer matched.
+  it('journals a despawned runtime-guid body\'s @sensor exit under the same ref as its enter', () => {
+    tw = createTestWorld({ systems: [PHYS] });
+    tw.spawn(Physics3D({ gravityX: 0, gravityY: 0, gravityZ: 0 }));
+    tw.spawn(Transform({ x: 0, y: 0, z: 0 }), RigidBody3D({ bodyType: 'static' }),
+      Collider3D({ shape: 'box', halfW: 1, halfH: 1, halfD: 1, isSensor: true }), EntityAttributes({ name: 'Trigger' }));
+    const body = tw.spawn(Transform({ x: 0, y: 0, z: 0 }), RigidBody3D({ bodyType: 'dynamic' }),
+      Collider3D({ shape: 'sphere', radius: 0.2 }), EntityAttributes({ name: 'Shot' }));
+    tw.step(5);                                    // enter (pre-overlapping)
+    body.destroy();
+    tw.step(1);                                    // synthesized exit for the dead body
+
+    const ev = tw.events({ type: '@sensor' }).map((e) => e.payload as { sensor: unknown; other: unknown; phase: string });
+    const enter = ev.find((e) => e.phase === 'enter');
+    const exit = ev.find((e) => e.phase === 'exit');
+    expect(isRuntimeGuid(enter?.other as string)).toBe(true);
+    expect(exit?.other).toBe(enter?.other);
+    expect(exit?.sensor).toBe(enter?.sensor);
+    expect(resolveRefName(exit?.other as string, tw.world)).toBe('Shot');
+  });
+
   it('synthesizes a sensor exit when a body inside a trigger is despawned', () => {
     tw = createTestWorld({ systems: [PHYS] });
     tw.spawn(Physics3D({ gravityX: 0, gravityY: 0, gravityZ: 0 }));   // no gravity: body rests inside

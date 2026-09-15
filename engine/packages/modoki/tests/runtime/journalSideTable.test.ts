@@ -1,8 +1,8 @@
 /** journal.ts ref→name side-table — the mechanism that lets Percept name an entity AFTER it
  *  despawns (recordRefName, driven by entityRef; read by resolveRefName). Covers the pieces the
- *  physics event tests can't isolate: the dual-key (guid entity resolvable by BOTH its GUID and its
- *  numeric id — the fix for the synthesized-exit path emitting a numeric id), the numeric-id
- *  despawn path, and the LRU cap + recency refresh that bound the table across a long session. */
+ *  physics event tests can't isolate: the single key (a guid entity is recorded under its GUID only —
+ *  the numeric-id alias went when the synthesized exit stopped emitting a numeric id, #1225), the
+ *  numeric-id despawn path, and the LRU cap + recency refresh that bound the table across a long session. */
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { createTestWorld, type TestWorld } from '../../src/runtime/harness/createTestWorld';
@@ -22,25 +22,24 @@ function fakeHandle(id: number, opts: { guid?: string; name?: string } = {}) {
   };
 }
 
-describe('side-table: dual-key + despawn resolution', () => {
-  it('a guidable entity is resolvable by BOTH its GUID and its numeric id (dual-key)', () => {
+describe('side-table: single key + despawn resolution', () => {
+  it('a guidable entity is recorded under its GUID only — no numeric-id alias (#1225)', () => {
     tw = createTestWorld();
     const e = tw.spawn(EntityAttributes({ guid: 'g-bolt', name: 'Bolt' }));
     entityRef(e); // seeds the side-table as a contact emit would, while alive
     expect(resolveRefName('g-bolt', tw.world)).toBe('Bolt');
-    expect(resolveRefName(e.id(), tw.world)).toBe('Bolt'); // the numeric alias — the P0 fix
+    // The alias existed only for a despawn-exit that emitted the numeric id. Keyed per entity it
+    // cost a second LRU slot for every guid entity ever journaled, and the id is recycled, so it
+    // named whichever entity last held the index.
+    expect(resolveRefName(e.id(), tw.world)).toBeUndefined();
   });
 
-  it('resolves a NAMED guid-LESS entity by its numeric id after it despawns', () => {
+  it('records a NAMED guid-LESS handle under its numeric id', () => {
+    // Since #1210 `spawnEntity` mints a runtime guid for every EntityAttributes carrier, so a real
+    // guid-less named entity only arises outside it; a fake handle stands in for one.
     tw = createTestWorld();
-    const e = tw.spawn(EntityAttributes({ name: 'Spark' })); // no guid → recorded under numeric id only
-    const id = e.id();
-    entityRef(e);
-    expect(resolveRefName(id, tw.world)).toBe('Spark');
-    e.destroy();
-    tw.step(1);
-    expect(e.isAlive()).toBe(false);
-    expect(resolveRefName(id, tw.world)).toBe('Spark'); // still nameable post-despawn (side-table)
+    expect(entityRef(fakeHandle(4242, { name: 'Spark' }))).toBe(4242); // no guid → the ref IS the id
+    expect(resolveRefName(4242, tw.world)).toBe('Spark');
   });
 
   it('does not record a nameless entity', () => {

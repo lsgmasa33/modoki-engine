@@ -687,7 +687,8 @@ describe('self-deactivation warning fires on the WINNING desired, not per-track 
     expect(msgs[0]).toContain('"SelfOff"');
     const events = tw.events({ type: '@timeline-selfdeact' });
     expect(events).toHaveLength(1);
-    expect(events[0].payload).toMatchObject({ director: root.id(), track: 'SelfOff' });
+    // The Director's journal ref, like every other emit — not its recycled numeric id (#1225).
+    expect(events[0].payload).toMatchObject({ director: root.get(EntityAttributes)!.guid, track: 'SelfOff' });
     warn.mockRestore();
   });
 

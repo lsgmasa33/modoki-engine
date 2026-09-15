@@ -289,6 +289,187 @@ describe('watch-start refuses a missing component with the options, not "unknown
   });
 });
 
+// #1225 — every code spawn carries a unique runtime guid since #1210, so a per-shot spawner opens a
+// NEW series per shot and never reuses one. A despawned series used to keep its mover slot and stay
+// in the watch forever, so a long watch filled with dead shots and went blind to live ones.
+describe('a per-shot spawner does not exhaust the watch (#1225)', () => {
+  type Read = { truncated?: boolean; evictedDespawned?: number; seriesTotal: number; series: { guid: string; count: number; despawnedAt?: number }[] };
+  const destroy = (e: unknown) => (e as { destroy(): void }).destroy();
+  const move = (e: ReturnType<typeof w.spawn>, x: number) => e.set(WPos, { ...e.get(WPos)!, x });
+
+  it('a despawned series gives its mover slot back — more shots than maxSeries all record', () => {
+    setup();
+    const started = startWatch({ component: 'WPos', names: ['shot'], fields: ['x'], epsilon: 0.001, maxSeries: 2 });
+    let t = 0;
+    for (let i = 0; i < 10; i++) {
+      const e = w.spawn(EntityAttributes({ guid: `shot-${i}`, name: 'Shot' }), WPos({ x: 0 }));
+      tick(++t);                           // baseline
+      tick(++t, () => move(e, 5));          // first movement → takes a slot
+      tick(++t, () => destroy(e));          // despawn → gives it back
+    }
+    const r = readWatch(started.id!) as Read;
+    expect(r.truncated).toBeFalsy();
+    expect(r.series.filter((x) => x.count === 2)).toHaveLength(10); // every shot recorded its movement
+  });
+
+  it('a rejoining entity takes a slot again when it moves', () => {
+    setup();
+    const a = w.spawn(EntityAttributes({ guid: 'a', name: 'A' }), WPos({ x: 0 }));
+    const started = startWatch({ component: 'WPos', fields: ['x'], epsilon: 0.001, maxSeries: 1 });
+    tick(1);
+    tick(2, () => move(a, 5));             // a holds the only slot
+    tick(3, () => destroy(a));             // released
+    const a2 = w.spawn(EntityAttributes({ guid: 'a', name: 'A' }), WPos({ x: 5 }));
+    tick(4);                               // rejoins, same value — no movement yet
+    tick(5, () => move(a2, 8));            // moves again → must re-take the slot
+    const b = w.spawn(EntityAttributes({ guid: 'b', name: 'B' }), WPos({ x: 0 }));
+    tick(6);
+    tick(7, () => move(b, 3));             // no slot left for b
+    const r = readWatch(started.id!) as Read;
+    expect(r.series.find((x) => x.guid === 'a')!.count).toBe(3);
+    expect(r.series.find((x) => x.guid === 'b')!.count).toBe(1);
+    expect(r.truncated).toBe(true);
+  });
+
+  it('clearing a despawned series does not release a slot a LIVE series holds', () => {
+    setup();
+    const a = w.spawn(EntityAttributes({ guid: 'a', name: 'A' }), WPos({ x: 0 }));
+    const started = startWatch({ component: 'WPos', fields: ['x'], epsilon: 0.001, maxSeries: 1 });
+    tick(1);
+    tick(2, () => move(a, 5));
+    tick(3, () => destroy(a));             // a's slot released at despawn
+    const b = w.spawn(EntityAttributes({ guid: 'b', name: 'B' }), WPos({ x: 0 }));
+    tick(4);
+    tick(5, () => move(b, 3));             // b takes the one slot
+    readWatch(started.id!, { guids: ['a'], clear: true }); // a still has 2 samples, but no slot to give
+    const c = w.spawn(EntityAttributes({ guid: 'c', name: 'C' }), WPos({ x: 0 }));
+    tick(6);
+    tick(7, () => move(c, 1));             // must be refused: b still holds the slot
+    const r = readWatch(started.id!) as Read;
+    expect(r.series.find((x) => x.guid === 'c')!.count).toBe(1);
+    expect(r.truncated).toBe(true);
+  });
+
+  it('at the series ceiling evicts the oldest DESPAWNED series, never a live one', () => {
+    setup();
+    const CEIL = 4096; // MAX_SERIES_CEIL in watch.ts
+    const started = startWatch({ component: 'WPos', names: ['e'], fields: ['x'], epsilon: 0.001 });
+    const dead = [0, 1].map((i) => w.spawn(EntityAttributes({ guid: `dead-${i}`, name: 'e' }), WPos({ x: 0 })));
+    for (let i = 0; i < CEIL - 2; i++) w.spawn(EntityAttributes({ guid: `live-${i}`, name: 'e' }), WPos({ x: 0 }));
+    tick(1);                               // CEIL baselines — the watch is full
+    tick(2, () => destroy(dead[0]));
+    tick(3, () => destroy(dead[1]));       // dead-0 despawned first, so it is evicted first
+    w.spawn(EntityAttributes({ guid: 'new-0', name: 'e' }), WPos({ x: 0 }));
+    tick(4);                               // room made by evicting dead-0
+    let r = readWatch(started.id!, { limit: 0 }) as Read;
+    expect(r.truncated).toBeFalsy();
+    expect(r.evictedDespawned).toBe(1);
+    expect((readWatch(started.id!, { guids: ['dead-0'] }) as Read).seriesTotal).toBe(0);
+    expect((readWatch(started.id!, { guids: ['dead-1', 'new-0'] }) as Read).seriesTotal).toBe(2);
+
+    w.spawn(EntityAttributes({ guid: 'new-1', name: 'e' }), WPos({ x: 0 }));
+    tick(5);                               // evicts dead-1
+    w.spawn(EntityAttributes({ guid: 'new-2', name: 'e' }), WPos({ x: 0 }));
+    tick(6);                               // nothing despawned left → refused, every live series kept
+    r = readWatch(started.id!, { limit: 0 }) as Read;
+    expect(r.evictedDespawned).toBe(2);
+    expect(r.truncated).toBe(true);
+    expect(r.seriesTotal).toBe(CEIL);
+    expect((readWatch(started.id!, { guids: ['new-2'] }) as Read).seriesTotal).toBe(0);
+  });
+});
+
+// #1225 close-out review: three accounting holes in the eviction above, each reproduced first.
+describe('despawn eviction keeps its books straight (#1225 review)', () => {
+  type Read = { truncated?: boolean; evictedDespawned?: number; seriesTotal: number; series: { guid: string; field: string; count: number; despawnedAt?: number }[] };
+  type List = { watches: { id: string; seriesCount: number }[] };
+  const destroy = (e: unknown) => (e as { destroy(): void }).destroy();
+  const setX = (e: ReturnType<typeof w.spawn>, x: number) => e.set(WPos, { ...e.get(WPos)!, x });
+  const CEIL = 4096; // MAX_SERIES_CEIL in watch.ts
+  const seriesCount = (id: string) => (listWatches() as List).watches.find((x) => x.id === id)!.seriesCount;
+
+  it('an entity refused every series and then despawned does not buy a series past the ceiling', () => {
+    setup();
+    const started = startWatch({ component: 'WPos', names: ['e'], fields: ['x'], epsilon: 0.001 });
+    for (let i = 0; i < CEIL; i++) w.spawn(EntityAttributes({ guid: `live-${i}`, name: 'e' }), WPos({ x: 0 }));
+    tick(1);                               // full
+    const refused = Array.from({ length: 5 }, (_, i) => w.spawn(EntityAttributes({ guid: `ref-${i}`, name: 'e' }), WPos({ x: 0 })));
+    tick(2);                               // all five refused — no series
+    tick(3, () => refused.forEach(destroy));
+    for (let i = 0; i < 5; i++) w.spawn(EntityAttributes({ guid: `late-${i}`, name: 'e' }), WPos({ x: 0 }));
+    tick(4);
+    expect(seriesCount(started.id!)).toBe(CEIL);
+    expect((readWatch(started.id!, { limit: 0 }) as Read).truncated).toBe(true);
+  });
+
+  it('a rejoining entity never evicts its own series, so its mover slot is not leaked', () => {
+    setup();
+    const started = startWatch({ component: 'WPos', names: ['e'], fields: ['x', 'y'], epsilon: 0.001, maxSeries: 1 });
+    // CEIL-1 filler series (one filler's y is NaN, so it has x only), then `self` gets x and is refused y.
+    for (let i = 0; i < (CEIL - 2) / 2; i++) w.spawn(EntityAttributes({ guid: `f-${i}`, name: 'e' }), WPos({ x: 0, y: 0 }));
+    w.spawn(EntityAttributes({ guid: 'f-odd', name: 'e' }), WPos({ x: 0, y: NaN }));
+    const self = w.spawn(EntityAttributes({ guid: 'self', name: 'e' }), WPos({ x: 0, y: 0 }));
+    tick(1);
+    tick(2, () => setX(self, 1));          // self.x takes the only slot
+    tick(3, () => destroy(self));          // released; self queued for eviction
+    const self2 = w.spawn(EntityAttributes({ guid: 'self', name: 'e' }), WPos({ x: 2, y: 0 }));
+    tick(4);                               // rejoins and moves: x retakes the slot; y has no room
+    // The rejoin kept its own history: y's refusal did not evict self's x to make room.
+    const mid = readWatch(started.id!, { guids: ['self'] }) as Read;
+    expect(mid.series.map((s) => [s.field, s.count])).toEqual([['x', 3]]);
+    expect(mid.evictedDespawned).toBeUndefined();
+    tick(5, () => destroy(self2));         // released again
+    const mover = w.spawn(EntityAttributes({ guid: 'mover', name: 'e' }), WPos({ x: 0, y: 0 }));
+    tick(6);                               // evicts self for room
+    tick(7, () => setX(mover, 3));         // must get the slot back
+    const r = readWatch(started.id!, { guids: ['mover'] }) as Read;
+    expect(r.series.find((s) => s.field === 'x')!.count).toBe(2);
+  });
+
+  it('a rejoining entity keeps its series when an entity reached EARLIER in the same pass needs room', () => {
+    setup();
+    const started = startWatch({ component: 'WPos', names: ['e'], fields: ['x'], epsilon: 0.001 });
+    for (let i = 0; i < CEIL - 1; i++) w.spawn(EntityAttributes({ guid: `f-${i}`, name: 'e' }), WPos({ x: 0 }));
+    const b = w.spawn(EntityAttributes({ guid: 'b', name: 'e' }), WPos({ x: 0 }));
+    tick(1);                               // full
+    tick(2, () => destroy(b));             // b queued for eviction
+    w.spawn(EntityAttributes({ guid: 'c', name: 'e' }), WPos({ x: 0 }));  // queried before b's rejoin
+    w.spawn(EntityAttributes({ guid: 'b', name: 'e' }), WPos({ x: 7 }));  // b back, same guid
+    tick(3);
+    const r = readWatch(started.id!, { guids: ['b'] }) as Read;
+    expect(r.series.map((s) => [s.count, s.despawnedAt])).toEqual([[2, undefined]]); // history kept, live
+    expect((readWatch(started.id!, { guids: ['c'] }) as Read).seriesTotal).toBe(0);     // c refused instead
+  });
+
+  it('a rejoin whose sample is not a number is not reported as despawned either', () => {
+    setup();
+    const a = w.spawn(EntityAttributes({ guid: 'a', name: 'A' }), WPos({ x: 0 }));
+    const started = startWatch({ component: 'WPos', fields: ['x'], epsilon: 0.001 });
+    tick(1);
+    tick(2, () => setX(a, 5));
+    tick(3, () => destroy(a));
+    w.spawn(EntityAttributes({ guid: 'a', name: 'A' }), WPos({ x: NaN }));
+    tick(4);
+    expect((readWatch(started.id!, { guids: ['a'] }) as Read).series[0].despawnedAt).toBeUndefined();
+  });
+
+  it('a rejoin refused at the mover cap is not reported as despawned', () => {
+    setup();
+    const a = w.spawn(EntityAttributes({ guid: 'a', name: 'A' }), WPos({ x: 0 }));
+    const started = startWatch({ component: 'WPos', fields: ['x'], epsilon: 0.001, maxSeries: 1 });
+    tick(1);
+    tick(2, () => setX(a, 5));
+    tick(3, () => destroy(a));             // frozen, slot released
+    const b = w.spawn(EntityAttributes({ guid: 'b', name: 'B' }), WPos({ x: 0 }));
+    tick(4);
+    tick(5, () => setX(b, 1));             // b holds the slot
+    w.spawn(EntityAttributes({ guid: 'a', name: 'A' }), WPos({ x: 9 })); // a back, at a moved value
+    tick(6);                               // its movement is refused — but it is present
+    const r = readWatch(started.id!, { guids: ['a'] }) as Read;
+    expect(r.series[0].despawnedAt).toBeUndefined();
+  });
+});
+
 describe('read+clear does not leak the mover budget (review follow-up)', () => {
   it('polling with clear:true keeps moverCount bounded — a moving entity must not read as settled', () => {
     // moverCount is incremented once per series at its FIRST movement, detected by

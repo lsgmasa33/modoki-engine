@@ -14,8 +14,17 @@ import { dispatchGameAction } from '../core/actionRegistry';
 import type { PhysicsEventBus } from './physicsEventBus';
 import { updateContactIndex } from './physicsContactIndex';
 
-/** The collider→entity reverse-map value both systems keep (keyed by Rapier collider handle). */
-export interface ColliderInfo { entityId: number; entity: Entity; isSensor: boolean; bodyPacked: number }
+/** The collider→entity reverse-map value both systems keep (keyed by Rapier collider handle).
+ *  `ref` is the entity's journal ref as last seen ALIVE — see {@link refOf}. Build one with
+ *  {@link makeColliderInfo}, which seeds it. */
+export interface ColliderInfo { entityId: number; entity: Entity; isSensor: boolean; bodyPacked: number; ref: string | number }
+
+/** The one constructor for a {@link ColliderInfo}: caches the numeric id AND the journal ref while
+ *  `entity` is known alive (it is being given a collider), so a later exit for a body that has
+ *  despawned before any event named it still carries the ref its entity had. */
+export function makeColliderInfo(entity: Entity, isSensor: boolean, bodyPacked: number): ColliderInfo {
+  return { entityId: entity.id(), entity, isSensor, bodyPacked, ref: entityRef(entity) };
+}
 export type ColliderMap = Map<number, ColliderInfo>;
 export type FireOnCollision = (self: Entity, other: Entity, phase: 'enter' | 'exit') => void;
 
@@ -49,15 +58,20 @@ function bodyEntityOf(ci: ColliderInfo): number {
 }
 
 /** Stable Percept reference for a collider's entity: its GUID when live+guidable
- *  (survives scene reloads), else the cached numeric id. THE single seam every contact
- *  emit site uses — `@collision`/`@sensor` here AND `@contact` in physics2D/3DSystem —
- *  so "collider entity → stable ref" is defined once and can't drift. Falls back to the
- *  cached `entityId` for a despawned entity (the synthesized-exit path routes pairs whose
- *  entity may already be dead, where `entityRef`'s live-handle probing is unsafe). The
- *  numeric-id fallback still resolves to a name because `entityRef` dual-keys the side-table
- *  (records the name under both the GUID and the numeric id while the entity is alive). */
+ *  (survives scene reloads). THE single seam every contact emit site uses —
+ *  `@collision`/`@sensor` here AND `@contact` in physics2D/3DSystem — so "collider entity →
+ *  stable ref" is defined once and can't drift.
+ *
+ *  A despawned entity gets the ref CACHED on `ci` — the one the last live call returned (or
+ *  {@link makeColliderInfo} seeded), never anything re-derived from the dead handle: koota's
+ *  `has()`/`get()` do not check generation, so `entityRef(deadHandle)` on a reclaimed index names
+ *  the NEW entity. It used to fall back to the cached numeric id, which split every pair: the
+ *  enter carried the guid, the synthesized despawn-exit a number. Since #1210 every code-spawned
+ *  entity carries a unique runtime guid, so that split reached almost every body (#1225); now an
+ *  exit carries the ref its enter did. */
 export function refOf(ci: ColliderInfo): string | number {
-  return ci.entity.isAlive() ? entityRef(ci.entity) : ci.entityId;
+  if (ci.entity.isAlive()) ci.ref = entityRef(ci.entity);
+  return ci.ref;
 }
 
 /** Route ONE collider pair to all three sinks. `a`/`b` order is preserved for the collision

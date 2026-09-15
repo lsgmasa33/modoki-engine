@@ -225,17 +225,17 @@ describe('Zone3D triggers — despawn, GUID, sim-gating', () => {
     expect(exits).toBe(1);
   });
 
-  it('a synthesized exit is despawn-safe: still-alive zone keeps its GUID, dead occupant falls back to its id', () => {
+  it('a synthesized exit is despawn-safe: still-alive zone keeps its GUID, dead occupant carries the guid cached while alive', () => {
     tw = createTestWorld({ systems: [ZONE] });
     tw.spawn(Transform({ x: 0, y: 0, z: 0, sx: 4, sy: 4, sz: 4 }), Zone3D({ shape: 'box' }), EntityAttributes({ guid: 'g-zone' }));
     const occ = tw.spawn(Transform({ x: 0, y: 0, z: 0 }), ZoneOccupant, EntityAttributes({ guid: 'g-occ' }));
     tw.step(1);
-    const occId = occ.id();
-    occ.destroy(); tw.step(1);   // gone while inside → synthesized exit; its GUID is no longer resolvable
+    occ.destroy(); tw.step(1);   // gone while inside → synthesized exit; the dead handle is never re-probed
     const exit = tw.events({ type: '@zone' }).find((e) => (e.payload as { phase: string }).phase === 'exit');
     expect(exit).toBeTruthy();
-    // The zone survives (GUID kept); a destroyed entity can't resolve a GUID, so `other` is its id.
-    expect(exit!.payload as { zone: string; other: number }).toMatchObject({ zone: 'g-zone', other: occId });
+    // The zone survives (GUID kept); the destroyed occupant carries the ref cached while it was alive —
+    // the same durable guid its enter carried, not its recycled numeric id (#1225).
+    expect(exit!.payload as { zone: string; other: string }).toMatchObject({ zone: 'g-zone', other: 'g-occ' });
   });
 });
 

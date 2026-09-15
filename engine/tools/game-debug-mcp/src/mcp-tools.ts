@@ -1129,7 +1129,7 @@ export function registerTools(server: McpServer) {
       epsilon: z.number().optional().describe('(start) Change threshold (default 1e-4).'),
       everyNFrames: z.number().optional().describe('(start) Sample every Nth frame (default 1).'),
       maxSamples: z.number().optional().describe('(start) Ring cap per series (default 600).'),
-      maxSeries: z.number().optional().describe('(start) Cap on moving series (default 512).'),
+      maxSeries: z.number().optional().describe('(start) Cap on LIVE moving series (default 512) — a despawned entity gives its slot back.'),
       expireFrames: z.number().optional().describe('(start) Auto-remove after N frames (0 = never).'),
       id: z.string().optional().describe('(read/clear) Watch id from start/list. Omit on clear to clear ALL.'),
       name: z.string().optional().describe('(read) Filter returned series to entities whose name contains this.'),

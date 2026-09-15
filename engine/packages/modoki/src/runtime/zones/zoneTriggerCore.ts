@@ -47,23 +47,34 @@ export function makeFireOnZone(OnZoneTrait: Parameters<Entity['has']>[0]): FireO
   };
 }
 
-/** One member of `ZoneState` — the live handle PLUS its numeric id, cached at the moment this
- *  entry was recorded (when the entity was known alive, sampled fresh from this frame's query).
- *  The cache is what `refOf` falls back to once the handle may have gone dead AND had its index
- *  reclaimed by an unrelated entity — see `refOf`'s own comment. */
-interface ZoneMember { entity: Entity; id: number }
+/** One member of `ZoneState` — the live handle PLUS its journal ref, cached at the moment this
+ *  entry was first recorded (when the entity was known alive, sampled fresh from this frame's
+ *  query) and refreshed by every live `refOf`. The cache is what `refOf` returns once the handle
+ *  may have gone dead AND had its index reclaimed by an unrelated entity — see `refOf`. */
+interface ZoneMember { entity: Entity; ref: string | number }
 
 /** Stable Percept/journal reference for a zone-state member: its GUID when the handle is STILL
- *  alive (`entityRef` does its own live-handle probe — `has()`/`get()`), else the id CACHED when
- *  this entry was recorded. Mirrors `physicsContactEvents.refOf` exactly, and for the same reason
+ *  alive (`entityRef` does its own live-handle probe — `has()`/`get()`), else the ref CACHED on
+ *  the member. Mirrors `physicsContactEvents.refOf` exactly, and for the same reason
  *  (QA-ZONE-0003, review follow-up): koota's `has()`/`get()` do not check generation, only
  *  `isAlive()` does — so calling `entityRef(deadHandle)` on a handle whose index has been
  *  RECLAIMED by a new entity silently resolves to the NEW entity's guid/name, misattributing the
  *  exit. Reproduced live: a same-tick despawn+respawn produced a `@zone` journal entry with the
  *  zone/other roles inverted, both naming entities that were still alive — the exit belonged to
- *  the DEAD pair, not to them. The cached `id` avoids re-deriving anything from the handle. */
+ *  the DEAD pair, not to them. The cached ref avoids re-deriving anything from the handle.
+ *
+ *  The cache used to be the numeric id, which split enter (guid) from despawn-exit (number) — for
+ *  every code-spawned occupant once #1210 gave each one a runtime guid (#1225). */
 function refOf(m: ZoneMember): string | number {
-  return m.entity.isAlive() ? entityRef(m.entity) : m.id;
+  if (m.entity.isAlive()) m.ref = entityRef(m.entity);
+  return m.ref;
+}
+
+/** The member for `entity` in the next diff: last frame's member when the same (packed) entity
+ *  was already tracked, so its cached ref carries over; otherwise a new one, its ref taken now
+ *  while the entity is known alive. Only a first appearance pays for an `entityRef`. */
+function memberFor(entity: Entity, prior: ZoneMember | undefined): ZoneMember {
+  return prior ?? { entity, ref: entityRef(entity) };
 }
 
 /** Route ONE zone/occupant transition to all three sinks. The journal payload uses `refOf`
@@ -127,15 +138,16 @@ export function runZoneTriggers(
   const next: ZoneState = new Map();
   for (const z of zones) {
     const zid = packedOf(z.entity); // generation-carrying — see ZoneState's doc comment
+    const before = prev.get(zid);
     const occ = new Map<PackedEntity, ZoneMember>();
     for (const o of occupants) {
       const oid = packedOf(o.entity);
       if (oid === zid) continue;
-      // `.id()` cached HERE, while `o.entity` is known alive (freshly sampled this tick) — see
-      // `refOf`'s comment for why this must never be re-derived from the handle later.
-      if (z.contains(o.x, o.y, o.z)) occ.set(oid, { entity: o.entity, id: o.entity.id() });
+      // The ref is cached HERE, while `o.entity` is known alive (freshly sampled this tick) — see
+      // `refOf`'s comment for why it must never be re-derived from the handle later.
+      if (z.contains(o.x, o.y, o.z)) occ.set(oid, memberFor(o.entity, before?.occ.get(oid)));
     }
-    next.set(zid, { member: { entity: z.entity, id: z.entity.id() }, occ });
+    next.set(zid, { member: memberFor(z.entity, before?.member), occ });
   }
 
   // Enters — in `next` but not `prev`.
