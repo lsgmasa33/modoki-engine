@@ -14,12 +14,6 @@
   ],
   "entities": [
     {
-      "name": "Time (resource)",
-      "traits": {
-        "Time": {}
-      }
-    },
-    {
       "name": "Camera",
       "traits": {
         "Transform": {},
@@ -34,6 +28,16 @@
           "parentId": "",
           "layer": "3d",
           "guid": "15aca27d-1db5-4402-82d7-c57273fb86f4"
+        }
+      }
+    },
+    {
+      "name": "Time (resource)",
+      "traits": {
+        "Time": {},
+        "EntityAttributes": {
+          "parentId": "",
+          "guid": "283df7e8-5b1e-89d1-27cd-2e06b902fa67"
         }
       }
     },

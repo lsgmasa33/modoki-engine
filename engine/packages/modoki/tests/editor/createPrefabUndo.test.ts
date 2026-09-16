@@ -32,6 +32,11 @@ const calls: string[] = [];
 const OLD_ID = 'g-old';
 vi.mock('../../src/editor/scene/prefab', () => ({
   serializePrefab: () => ({ id: 'g-new', root: {}, entities: [{ localId: 1, prefab: 'g-child' }] }),
+  // createPrefabFromEntity awaits this before serializing (#1284). A no-op here is safe
+  // precisely because this file asserts the undo/redo closures and mocks serializePrefab
+  // anyway — that the warm HAPPENS, unconditionally and before the serialize, is what
+  // coldCacheWarmCensus.test.ts reads out of the source.
+  preloadNestedPrefabsForSubtree: async () => {},
   // The real guard, reduced to its direct case: the child IS the parent.
   wouldCreateCycle: (parent: string, child: string) => parent === child,
   resolveExistingDocumentId: async () => OLD_ID,

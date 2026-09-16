@@ -1,15 +1,9 @@
 {
   "id": "16cdd656-25ba-4b84-9ecc-b11e65da5846",
-  "version": 12,
+  "version": 13,
   "createdAt": "2026-07-02T07:27:42.290Z",
   "resources": [],
   "entities": [
-    {
-      "name": "Time (resource)",
-      "traits": {
-        "Time": {}
-      }
-    },
     {
       "name": "Playground",
       "traits": {
@@ -167,6 +161,16 @@
           "parentId": "28c54561-bbea-48ce-80df-def65377a09e",
           "layer": "2d",
           "guid": "fbe0e9e0-4f6b-4a3a-9237-51ca58105d74"
+        }
+      }
+    },
+    {
+      "name": "Time (resource)",
+      "traits": {
+        "Time": {},
+        "EntityAttributes": {
+          "parentId": "",
+          "guid": "7ba63bbe-705a-a541-7e20-b5e835fd7843"
         }
       }
     },

@@ -1,15 +1,9 @@
 {
   "id": "f060328d-a0b1-4015-80d7-4f997b8fb858",
-  "version": 12,
+  "version": 13,
   "createdAt": "2026-07-04T08:29:29.144Z",
   "resources": [],
   "entities": [
-    {
-      "name": "Time (resource)",
-      "traits": {
-        "Time": {}
-      }
-    },
     {
       "name": "Pendulum Joint",
       "traits": {
@@ -535,6 +529,16 @@
           "parentId": "72c0ee4a-1aff-45fe-82fb-759fddd48dd9",
           "layer": "2d",
           "guid": "f50503f2-6fef-4cc1-b1e7-63b9d8fb4f09"
+        }
+      }
+    },
+    {
+      "name": "Time (resource)",
+      "traits": {
+        "Time": {},
+        "EntityAttributes": {
+          "parentId": "",
+          "guid": "8ec98813-b32b-ea0a-b270-ce55da5ca12c"
         }
       }
     },

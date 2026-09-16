@@ -682,6 +682,15 @@ re-saving an already-migrated scene is byte-identical, verified across *fresh ed
 (not merely within one session, which would not have proven the `rootInstanceId` GUID is
 persisted rather than re-minted per launch).
 
+Run again on **2026-09-16** for #1268, across 16 projects: **45 files, 34 of them gaining an
+`EntityAttributes` with a derived guid**, and the other 11 changing *only* by format convergence.
+(36 files bumped v12→v13 in total — the two counts measure different things: 36 is how many bumped,
+11 is how many had nothing else to show for the re-save.) That pass is the reason the
+convergence claim above needs one caveat — it holds for the *serializer*, but a guid that the
+serializer MINTS rather than derives never converges, because each run mints a different one. See
+"An entry with NO guid gets a DERIVED one at load" below for the mechanism, and why the reviewing
+script cannot be `check-scene-churn.mjs` for this particular class.
+
 Tooling, for the next time a serializer change makes the committed files stale:
 
 ```bash
@@ -1154,6 +1163,69 @@ So a repo-wide uniqueness check would fail on the architecture rather than find 
 cross-file signal is "same guid, *different* entity name", which is too weak to gate a build on: an
 entity legitimately renamed in one scene is indistinguishable from a copy-paste collision. The guard
 is therefore scoped to same-file collisions deliberately, and says so in its own header.
+
+### An entry with NO guid gets a DERIVED one at load (#1268)
+
+The per-file rule above has a sibling the same guard now carries: **every committed entry must have
+a guid at all.** That was not true until 2026-09-16 — 34 entries across 34 files had none, every one
+of them the authored `Time (resource)` root.
+
+**Why a missing guid is not inert.** Since #1248 `spawnEntity` gives every entity
+`EntityAttributes`, and mints a **runtime** guid for it (#1210). `durableGuid()` reads a runtime
+guid as absent *on purpose*, so the serializer's guid pre-pass (`serialize.ts`) minted a random
+`crypto.randomUUID()` over it on the first save. Two consequences, and the second is the one people
+miss:
+
+- Each clone minted a **different** guid, so two clones saving the same untouched scene produced
+  conflicting diffs for a file neither had edited.
+- The entity also **moved**, because `compareSiblings` (`entityOrder.ts`) tiebreaks siblings on
+  `guid.localeCompare` — see "The `entities` ARRAY ORDER" above. A random guid is a random sort key.
+
+**The fix is a derivation at load**, in `deriveAuthoredEntityGuids`
+(`runtime/loaders/authoredEntityGuids.ts`), called from `loadSceneFile`'s first pass. The seed is
+`scene:<project-relative path>|path:<parent path>/<name>`, hashed through the frozen `deriveGuid()`,
+with an ordinal appended when two entries in one file would otherwise seed identically (the per-file
+uniqueness rule is exactly what that ordinal protects). It runs ahead of `deriveInstanceMemberGuids`
+so a newly-identified entry can anchor the prefab members beneath it.
+
+Three things about it that are easy to get wrong:
+
+- ⚠️ **It is derived ONCE and then STORED, not re-derived every load.** Every input to the seed is
+  authored data a human edits, so a re-derived identity would move under a rename or a reparent. The
+  engine already ships one derive-and-don't-store address space — prefab instance members — and
+  #1272/#1278/#1284 are the bugs that came out of it: a reload re-derived them and everything holding
+  a reference missed. The corpus guard in `sceneGuidUniqueness.test.ts` is what keeps the stored half
+  true; deriving alone would leave an old file arriving from a branch to reintroduce the trap.
+- ⚠️ **No `scenePath` means no derivation**, and that exemption is load-bearing. `SceneManager`'s
+  carried-snapshot respawn synthesises its `SceneData` from live entities drawn from several scenes,
+  so it has no single scene identity — and those entities already hold durable guids from their own
+  files, which is exactly what `filterPersistentDuplicates` matches them on. A base-scene chain is
+  the opposite case: one `loadSceneFile` call per file, each with its own path, so a base entity
+  derives the same guid whichever level extends it.
+- ⚠️ **The path is PROJECT-RELATIVE, so the same derived guid appears in several projects.** After
+  the migration, 11 files share `019e4c7f-…` — all of them `/assets/scenes/main.scene.json` with a
+  `Time (resource)` root. That is the section above working as designed, not a collision: uniqueness
+  is per file, the 11 are separate apps that are never loaded together, and a project-relative path
+  is the identity that survives a game being **copied out of the repo** (#29), which a repo path
+  would not. ⚠️ But "project-relative" is what callers happen to pass, **not** something the
+  derivation enforces — `App.tsx`'s OTA sub-game boot prefixes `assetBaseUrl` onto the path, so the
+  same scene seeds differently there. Latent (the runtime never saves) and tracked in #1293, which
+  also carries the alternative: seeding on the file's own `id`, which `SceneManager` already computes.
+- ⚠️ **A derived guid is checked against the guids already IN the file, not just against other
+  derived ones.** A file can legitimately hold both halves of this migration at once — a merge that
+  kept both sides, a partial revert, the pre-#1248 shape pasted into a migrated file — and the
+  guid-less copy otherwise derives *exactly* the stored guid of its migrated twin. Nothing downstream
+  catches that: `filterDuplicateChainGuids` compares on-disk guids before any derivation runs, and the
+  corpus guard only sees it after a save.
+
+The migration itself is recorded under "Re-saving legacy scenes" above: 45 files in one commit, 34
+gaining a guid and 11 converging v12→v13. Note that `check-scene-churn.mjs` cannot review this class
+on its own — it keys entities on `EntityAttributes.guid ?? 'name:'+name`, so an entity that *gains* a
+guid changes key and reports as LOST + NEW, which would bury a real defect in 34 files of noise.
+That review was done by comparing each file against `HEAD` field by field instead.
+
+**Still open:** duplicating or renaming a scene FILE (#1293) — a duplicate copies the entity guids
+verbatim, and a rename changes the seed for any entry not yet migrated.
 
 ### Gotchas
 

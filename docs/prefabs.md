@@ -582,9 +582,65 @@ the file.**
   its members from the flat output. The selection root itself is never collapsed.
 - **Resource acquisition** is transitive: `SceneManager` walks each fetched
   prefab for nested `prefab` refs and acquires them under the scene id.
-- **Caching:** the editor's sync instantiate reads nested children from the
-  editor `prefabCache`; async entry points call `preloadNestedPrefabs()` first so
-  they're present (also why edit-mode save references rather than flattens).
+- **Caching — and it cuts BOTH ways, which is the part that bit (#1284).** The editor's
+  `prefabCache` is read *synchronously* by code on both sides of the nesting, and every
+  one of those readers treats "not in the cache" as "not a prefab":
+  - **instantiate** — `instantiatePrefab` skips a nested row whose child is not cached
+    (it warns). `instantiatePrefabAsync` exists so UI entry points cannot get this wrong.
+  - **serialize + capture** — `planPrefabRows` **flattens** a held nested instance into
+    copies, `captureNestedRef` drops a user-added nested subtree from `added[]`, and
+    `captureNestedInstanceOverrides` / `reapplyNestedInstanceOverrides` lose a nested
+    instance's per-copy overrides across a rebuild *with no warning at all*.
+
+  ⚠️ **There are two warmers, and they answer different questions.**
+  `preloadNestedPrefabs(prefabFile)` walks a prefab FILE's reference rows;
+  `preloadNestedPrefabsForSubtree(entityId)` walks the LIVE tree. **The sync readers above
+  all walk the live tree**, so the file walk alone leaves anything live-but-not-in-the-file
+  cold — and an ordinary scene load leaves the *whole* cache cold, because the loader fills
+  the RUNTIME cache (`meshTemplateCache`), not this one.
+
+  That gap is what #1284 was: Create Prefab warmed nothing, so on a freshly-loaded scene it
+  silently wrote copies instead of a reference, and the author found out weeks later when
+  editing the child prefab moved nothing. The rebuild paths warmed from the file, so they
+  lost only *user-added* nested instances — the same defect at a smaller amplitude.
+
+  **Serializing a live tree therefore means `await preloadNestedPrefabsForSubtree(id)`
+  first**, and `serializePrefab` stays synchronous so the obligation sits with the caller
+  who can actually await. The scene save does the same thing its own way — `serialize.ts`
+  collects every live instance source and awaits `getPrefabSource` over the set before its
+  capture loop — which is why a scene save has never lost nesting to a cold cache.
+
+  The live walk does **not** recurse into each fetched file's rows, deliberately:
+  `collectTree` is a full descendant walk and every nested root is its own
+  `PrefabInstance`, so depth is already covered. A recursion was written and removed —
+  with both present, neither could be shown to fail, which is the shape of a line that is
+  load-bearing only in appearance.
+
+  Guarded two ways: `coldPrefabCacheWarming.test.ts` (behaviour, starting from a cold
+  cache — note every OTHER nested test calls `setPrefabCache` by hand and so only ever
+  exercised the warm path) and `coldCacheWarmCensus.test.ts` (a source census of every
+  `serializePrefab(` call, with an exemption ledger for the four that cannot hold a nested
+  instance or are warmed at open time, plus a by-name check that the two rebuild entry
+  points still warm at all).
+
+  ⚠️ **The class is NOT closed, and this paragraph is the place that says so.** Four async
+  entry points warm; roughly a dozen other reachers of the same sync readers do not — the
+  **Apply to Prefab dialog** (it warms only the outer prefab, so a user-added nested row is
+  missing from the dialog and can never be promoted), the `modoki_prefab
+  overrides`/`apply`/`revert` ops, and `applyToPrefabSelective`'s own earlier
+  `captureInstanceStructure`. Four more are **synchronous undo closures that can never await
+  a warm**, which is what makes a caller-side fix structurally incapable of finishing this:
+  the remaining work is a world-level warming seam (warm every live `PrefabInstance.source`
+  once after a scene load), tracked as **#1295**. Until it lands, treat "warmed" as a
+  property of the four named paths, not of the editor.
+
+  ⚠️ **One behaviour change worth knowing, because warming changes what a GUARD can see.**
+  `planPrefabRows` runs `wouldCreateCycle` BEFORE the cache lookup, and that guard returns
+  `false` on a miss — so a cold cache made it blind. With the tree warmed it now has the data
+  to refuse: `modoki_prefab create` over an EXISTING path, on an entity holding an instance of
+  a prefab that nests the target guid, used to flatten-and-succeed and now fails the op with
+  `could not serialize prefab from entity N`. That is the guard working, but it is a new
+  refusal rather than a silent mis-save.
 - **A prefab's effective ROOT, without spawning** (#1031): `effectivePrefabRootTraits`
   in `runtime/loaders/prefabOverrides.ts` answers "what traits would a spawned
   instance's root carry?" — for code that must not spawn: the `UIEntries` pool

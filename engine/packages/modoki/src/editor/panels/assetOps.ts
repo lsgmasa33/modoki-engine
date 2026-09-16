@@ -13,7 +13,7 @@
  *  the logic is unit-testable without rendering a React panel. */
 
 import { backendFetch, writeAssetFile, jsonFileBody } from '../backend/editorBackend';
-import { serializePrefab, tagEntityTreeAsInstance, untagEntityTreeAsInstance, detachPrefabInstance, reattachPrefabInstance, setPrefabCache, warnInertPrefabSizes, wouldCreateCycle, type PrefabFile } from '../scene/prefab';
+import { serializePrefab, preloadNestedPrefabsForSubtree, tagEntityTreeAsInstance, untagEntityTreeAsInstance, detachPrefabInstance, reattachPrefabInstance, setPrefabCache, warnInertPrefabSizes, wouldCreateCycle, type PrefabFile } from '../scene/prefab';
 import { entityRef } from '../undo/entityRef';
 import { reportUndoFailure } from '../undo/undoFailure';
 import type { UndoAction } from '../undo/undoManager';
@@ -467,6 +467,10 @@ export async function createPrefabFromEntity(
    *  guid (owner 2026-09-15), so placed instances stay linked; undo restores the replaced bytes. */
   confirmReplace: (path: string) => Promise<boolean>,
 ): Promise<CreatePrefabResult | 'declined' | null> {
+  // serializePrefab reads nested children from the editor prefab cache SYNCHRONOUSLY, and
+  // nothing else on this path warms it — after an ordinary scene load it is empty, so a held
+  // nested instance was flattened into copies with only a console.warn (#1284).
+  await preloadNestedPrefabsForSubtree(entityId);
   const draft = serializePrefab(entityId);
   if (!draft) return null;
   warnInertPrefabSizes(draft, requestedPath);

@@ -54,17 +54,18 @@ function sceneFiles(): string[] {
  *  a top-level `guid` — so a scene on either shape is covered. Top-level `entities[]` only:
  *  a prefab instance's `added[]` subtree carries its own guids under a different ownership
  *  rule and is not what this invariant is about. */
-function duplicatesIn(file: string): { dups: string[]; guids: number; attrGuids: number } {
+function duplicatesIn(file: string): { dups: string[]; guids: number; attrGuids: number; missing: string[] } {
   const data = JSON.parse(fs.readFileSync(file, 'utf8'));
   const entities: Array<Record<string, unknown>> = data.entities ?? [];
   const byGuid = new Map<string, string[]>();
+  const missing: string[] = [];
   let guids = 0;
   let attrGuids = 0;
   for (const e of entities) {
     const ea = (e.traits as Record<string, unknown> | undefined)?.['EntityAttributes'] as
       Record<string, unknown> | undefined;
     const guid = (ea?.guid as string) || (e.guid as string) || '';
-    if (!guid) continue;
+    if (!guid) { missing.push((ea?.name as string) || (e.name as string) || '(unnamed)'); continue; }
     guids++;
     if (ea?.guid) attrGuids++;
     const name = (ea?.name as string) || (e.name as string) || '(unnamed)';
@@ -74,7 +75,7 @@ function duplicatesIn(file: string): { dups: string[]; guids: number; attrGuids:
   const dups = [...byGuid.entries()]
     .filter(([, names]) => names.length > 1)
     .map(([guid, names]) => `${guid} → ${names.join(' + ')}`);
-  return { dups, guids, attrGuids };
+  return { dups, guids, attrGuids, missing };
 }
 
 describe.skipIf(!hasAnyProject())('entity guids are unique within a scene file', () => {
@@ -106,6 +107,44 @@ describe.skipIf(!hasAnyProject())('entity guids are unique within a scene file',
         + 'always a copy-pasted entity that kept the original\'s guid — mint a fresh v4 '
         + 'guid for the COPY (the later/renamed one), and check nothing else in the '
         + 'project referenced it first.',
+    ).toEqual([]);
+  });
+
+  /** #1268. The sibling invariant, and the reason it lives here: the duplicate check above
+   *  `continue`s past an entry with no guid, so the population this asserts on was the one
+   *  thing this file deliberately could not see.
+   *
+   *  A committed entry with no guid is not inert. Since #1248 every spawned entity gets
+   *  `EntityAttributes`, and an entry with none takes a RUNTIME guid at spawn — which
+   *  `durableGuid()` reads as absent, so the first save mints a random v4 over it. A different
+   *  one in every clone, so two clones saving the same untouched scene conflict; and because
+   *  `compareSiblings` tiebreaks on `guid.localeCompare`, the entity moves in the file too.
+   *  34 entries across 34 files were in exactly that state until the re-save in #1268.
+   *
+   *  The loader now DERIVES a guid for such an entry (`deriveAuthoredEntityGuids`) so every
+   *  clone at least agrees on the value — but a derived guid is meant to be stored on the next
+   *  save, not re-derived forever (the prefab-member address space that is re-derived every
+   *  load is what #1272/#1278/#1284 are about). This guard is what keeps the stored half true:
+   *  without it, a scene arriving from an old branch reintroduces the trap silently. */
+  it('every committed scene entity carries a guid', () => {
+    const rel = (f: string) => path.relative(REPO_ROOT, f).split(path.sep).join('/');
+    const scanned = sceneFiles().map((f) => ({ file: rel(f), ...duplicatesIn(f) }));
+    const offenders = scanned
+      .filter((r) => r.missing.length)
+      .map((r) => `${r.file}: ${r.missing.join(', ')}`);
+    // Non-vacuity floor: if the read path breaks, every entry looks guid-LESS rather than
+    // guid-ful, so this assertion fails loudly instead of passing — but floor the entity count
+    // anyway, so a glob that stops matching cannot read as "no offenders".
+    const entities = scanned.reduce((n, r) => n + r.guids + r.missing.length, 0);
+    expect(entities, 'no scene entities scanned at all — the file glob is broken; fix it, do not delete this assertion')
+      .toBeGreaterThan(0);
+    expect(
+      offenders,
+      'A committed scene entry has no guid. The first save in ANY clone will mint a random one '
+        + 'for it and move it in the file, so two clones saving the same untouched scene produce '
+        + 'conflicting diffs (#1268). Fix by opening the scene in the editor and saving it once — '
+        + 'the loader derives a stable guid, and the save stores it. Do not hand-write a v4 guid: '
+        + 'another clone would derive a different value for the same entry.',
     ).toEqual([]);
   });
 });

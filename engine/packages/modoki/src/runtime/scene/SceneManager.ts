@@ -796,6 +796,10 @@ class SceneManagerImpl implements SceneManager {
         await loadSceneFile(sceneData, {
           world: stagingWorld,
           clearMarks: false, // once-per-world clear above owns this (A9 defect 1)
+          // Scene identity for #1268's derived guids. Per REF, not per chain: each scene in
+          // the chain is loaded by its own call with its own path, so a base scene's entity
+          // derives the same guid no matter which level extends it.
+          scenePath: ref.path,
           fetchPrefab: async (prefabPath: string) => {
             // Use the refcounted prefab cache (already acquired in step 6)
             const cached = getCachedPrefab(prefabPath);
@@ -940,6 +944,11 @@ class SceneManagerImpl implements SceneManager {
           {
             world: nextWorld,
             clearMarks: false, // once-per-world clear above owns this (A9 defect 1)
+            // ⚠️ NO `scenePath` here, deliberately (#1268). These snapshots come from the
+            // live world and may originate in SEVERAL different scenes, so there is no one
+            // scene identity to seed a derived guid on — and they already carry durable
+            // guids from their own files, which is exactly what filterPersistentDuplicates
+            // matches a carried entity on. Passing a path here would re-key them mid-swap.
             fetchPrefab: async () => null, // flattened snapshots never carry a `prefab` ref
             loadModels: false,
             // Re-seed the marks captured off the dying world, per entity, against

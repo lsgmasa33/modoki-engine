@@ -863,6 +863,59 @@ export async function preloadNestedPrefabs(prefab: PrefabFile, seen = new Set<st
   }
 }
 
+/** Warm every prefab referenced by the LIVE entity subtree under `selectedEntityId`,
+ *  so the sync cache readers that run over that subtree can see them (#1284).
+ *
+ *  ⚠️ This is the counterpart to `preloadNestedPrefabs`, and the difference between the
+ *  two IS the defect it fixes. `preloadNestedPrefabs` walks a prefab FILE's reference
+ *  rows; the sync readers walk the LIVE TREE. Anything live-but-not-in-the-file is
+ *  therefore never warmed by it, and every such reader treats "not in the cache" as
+ *  "not a prefab" and silently takes its degraded branch:
+ *    - `planPrefabRows` flattens a held nested instance into copies (Create Prefab had
+ *      no warm at all, so after an ordinary scene load EVERY live instance was cold —
+ *      the scene loader fills the RUNTIME cache, not this one);
+ *    - `captureNestedRef` drops a user-added nested subtree from `added[]` entirely;
+ *    - `captureNestedInstanceOverrides` / `reapplyNestedInstanceOverrides` lose a
+ *      nested instance's per-copy overrides across a rebuild, with no warning at all.
+ *
+ *  ⚠️ **Calling this does not make those readers safe everywhere — only on the paths that
+ *  call it.** Four entry points do (both Create Prefab paths, `applyToPrefabSelective`,
+ *  `revertOverridesSelective`); roughly a dozen other reachers do NOT, including the Apply
+ *  to Prefab dialog and the `modoki_prefab overrides`/`apply`/`revert` ops, and four of them
+ *  are SYNCHRONOUS undo closures that can never await one of these at all. That is #1295,
+ *  and it is why the remaining fix is a world-level warming seam rather than more call-site
+ *  warms. Do not read this docstring as saying the class is closed.
+ *
+ *  Call this from the async entry point BEFORE any of them, exactly as the scene save
+ *  already does for its own capture loop (`serialize.ts`, "Preload every referenced
+ *  prefab so captureInstanceOverrides can read from the cache without async I/O").
+ *
+ *  The warmed set is deliberately a SUPERSET of the set `planPrefabRows` turns into
+ *  reference rows: it includes the selection root, which that function never collapses.
+ *  Over-warming costs one cached fetch; under-warming is the bug — so the asymmetry is
+ *  the point, and a later change to the membership rule cannot silently re-open this.
+ *
+ *  ⚠️ No recursion into each fetched FILE's own rows, deliberately. `collectTree` is a
+ *  full descendant walk and `instantiatePrefab` gives every nested root its own
+ *  `PrefabInstance`, so an instance nested N levels deep is its OWN entry in this loop —
+ *  and every sync reader this feeds walks the live tree too, so a file row with no live
+ *  instance is never read. A `preloadNestedPrefabs(child, seen)` call here was written
+ *  first and removed: it made the depth case pass for the WRONG reason, and the pair was
+ *  mutually redundant, so neither line could be shown to fail on its own. The depth-2
+ *  case is covered in coldPrefabCacheWarming.test.ts and dies if this walk is truncated. */
+export async function preloadNestedPrefabsForSubtree(selectedEntityId: number): Promise<void> {
+  const piMeta = getTraitByName('PrefabInstance');
+  if (!piMeta) return;
+  const seen = new Set<string>();
+  for (const e of collectTree(selectedEntityId, getAllEntities())) {
+    if (!e.traits.includes('PrefabInstance')) continue;
+    const source = readTraitData(e.id, piMeta)?.source as string | undefined;
+    if (!source || seen.has(source)) continue;
+    seen.add(source);
+    await getPrefabSource(source);
+  }
+}
+
 /** Async-safe instantiate: preload every nested child into the editor cache, THEN
  *  run the synchronous `instantiatePrefab`. Use this from UI entry points (drag-drop,
  *  Instantiate buttons) — `instantiatePrefab` alone silently skips nested rows whose
@@ -2221,10 +2274,18 @@ export async function applyToPrefabSelective(
   if (liveAddedRootsToDelete.length) deleteEntities(liveAddedRootsToDelete);
 
   prefabCache.set(source, newPrefab);
-  // refreshAllInstances re-instantiates synchronously — make sure any nested
-  // children are cached first.
+  // Every instance of this source, with NO exclusion — the clicked one goes through
+  // capture/restore too, so fields the user just applied drop out of its override set
+  // on the next render because they now match the prefab base.
+  const rootsToRefresh = collectInstanceRoots(source);
+  // refreshInstances re-instantiates synchronously, so warm both halves first: the new
+  // file's own reference rows...
   await preloadNestedPrefabs(newPrefab);
-  refreshAllInstances(source, oldPrefab, newPrefab);
+  // ...and the LIVE tree of each instance. A user-added nested instance is not a row of
+  // newPrefab, so the file walk above never reaches it, and captureNestedInstanceOverrides
+  // would then drop its per-copy overrides with no warning at all (#1284).
+  for (const rootId of rootsToRefresh) await preloadNestedPrefabsForSubtree(rootId);
+  refreshInstances(source, rootsToRefresh, oldPrefab, newPrefab);
 
   // Those promoted additions are now prefab members in the live world, but the
   // scene file on disk still lists them as `added` structural overrides. The
@@ -2520,18 +2581,6 @@ function collectInstanceRoots(source: string, excludeRootId?: number): number[] 
   return rootIds;
 }
 
-/** Refresh every prefab instance of a given source (no exclusion). Used by the
- *  selective-apply path so the clicked instance also goes through capture/restore —
- *  fields the user just applied naturally drop out of the override set on next
- *  render because they now match the prefab base. */
-function refreshAllInstances(
-  source: string,
-  oldPrefab: PrefabFile,
-  newPrefab: PrefabFile,
-): void {
-  refreshInstances(source, collectInstanceRoots(source), oldPrefab, newPrefab);
-}
-
 // ── Revert overrides (per-instance reset toward the prefab base) ─────────
 
 /** Deep-clone a per-field override map (values are JSON-safe trait data). */
@@ -2642,6 +2691,9 @@ export async function revertOverridesSelective(
   }
   // Nested children must be cached for the synchronous re-instantiation.
   await preloadNestedPrefabs(prefab);
+  // The file walk above misses a USER-ADDED nested instance (not a row of `prefab`),
+  // whose per-copy overrides rebuildInstance captures from the cache (#1284).
+  await preloadNestedPrefabsForSubtree(rootInstanceId);
 
   // Capture the instance's current state against the prefab, then subtract the
   // reverted keys to get the state to re-apply after the rebuild.

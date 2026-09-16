@@ -60,6 +60,7 @@ export {
   PREFAB_FORMAT_VERSION,
   serializePrefab, instantiatePrefab, instantiatePrefabAsync, setPrefabSource,
   getPrefabSource, setPrefabCache, refreshPrefabSourceForPath, getOverrides, getOverrideValues,
+  preloadNestedPrefabs, preloadNestedPrefabsForSubtree,
   captureInstanceOverrides, applyOverridesByRootInstance,
   applyToPrefab, applyToPrefabSelective,
   revertOverridesSelective, rebuildInstance,

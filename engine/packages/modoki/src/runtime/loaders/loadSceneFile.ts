@@ -6,6 +6,7 @@ import { getAllTraits, getTraitByName } from '../core/ecs/traitRegistry';
 import { loadModelTemplates, getCachedPrefab } from './meshTemplateCache';
 import { isGuid, isExternalUrl, resolveRef, getAssetType, deriveGuid, newGuid, getAssetEntry, type AssetType } from './assetManifest';
 import { durableGuid } from '../core/assetRefRules';
+import { deriveAuthoredEntityGuids } from './authoredEntityGuids';
 import { parseEntryPrefabs } from '../traits/UIEntries';
 import { markUIDirty } from '../ui/uiTreeStore';
 import { markOverride, clearOverrideMarks, clearAllOverrideMarks } from './overrideMarks';
@@ -155,6 +156,19 @@ export interface LoadSceneOptions {
    *  (`clearOverrideMarks(entity)` on each fresh spawn, below — still needed with the packed key,
    *  because koota's 8-bit generation wraps; see overrideMarks.ts). */
   clearMarks?: boolean;
+  /** Project-relative path of the scene file being loaded (e.g. `/assets/scenes/Lvl-0002.scene.json`).
+   *
+   *  Used as the scene half of the seed when an entry with no durable guid needs one derived
+   *  (#1268 — see `deriveAuthoredEntityGuids`). `SceneData` carries no `id` and this loader never
+   *  reads the file's top-level one, so the caller's path is the only scene identity available here.
+   *
+   *  ⚠️ OPTIONAL on purpose, and absent means "derive nothing". `SceneManager`'s carried-snapshot
+   *  respawn synthesises its `SceneData` from live entities drawn from SEVERAL scenes, so it has no
+   *  single scene identity — and those entities already hold durable guids from their originating
+   *  files, which `filterPersistentDuplicates` matches on. A base-scene chain is the opposite case:
+   *  it runs one call PER FILE, each with its own path, so a base entity derives the same guid no
+   *  matter which level pulls it in. */
+  scenePath?: string;
 }
 
 /** Thrown by `loadSceneFile` when a scene's format version is `too-new` or `unreadable`
@@ -1510,8 +1524,36 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   const idMap = new Map<number, number>();
   const spawnedByEntryId = new Map<number, Entity>(); // entry.id → spawned handle (for pass 2)
 
+  // A guid for every entry written before #1248, derived so that each clone loading these
+  // same bytes writes the same guid back (#1268). Computed over the WHOLE entity list up
+  // front, because the seed needs a parent path and parents are addressed by guid — which
+  // means it cannot be done entry-by-entry inside the spawn loop below. Runs ahead of
+  // `deriveInstanceMemberGuids` (end of this function) so an entry this gives an identity
+  // to can anchor the prefab members underneath it.
+  // ⚠️ The live world's guids are passed as RESERVED, not just the file's own. `SceneManager`
+  // filters `data.entities` before this point — a row shadowed by a carried `Persistent` entity, or
+  // by an earlier scene in a base chain, is REMOVED — so the file alone does not know every guid
+  // that is spoken for, and a guid-less twin would otherwise derive a live entity's address.
+  const liveGuids: string[] = [];
+  {
+    const attrMeta = allTraits.find((m) => m.name === 'EntityAttributes');
+    if (attrMeta) {
+      for (const e of world.entities as Iterable<{ has(t: unknown): boolean; get(t: unknown): { guid?: string } }>) {
+        if (!e.has(attrMeta.trait)) continue;
+        const g = durableGuid(e.get(attrMeta.trait).guid);
+        if (g) liveGuids.push(g);
+      }
+    }
+  }
+  const authoredGuids = deriveAuthoredEntityGuids(data.entities, options.scenePath, liveGuids);
+
   // First pass: spawn all entities
   for (const entry of data.entities) {
+    // `durableGuid`, not raw truthiness, and for the same reason as the gate below: a RUNTIME guid
+    // at `entry.guid` is not an identity. Taking it here would discard the derived guid AND stamp
+    // the runtime one into EntityAttributes, which the first save then persists — a value that
+    // names a different entity next session, and one `noRuntimeGuidsOnDisk.test.ts` forbids.
+    const authoredGuid = durableGuid(entry.guid) || authoredGuids.get(entry.id);
     const traitArgs: any[] = [];
     let sawEntityAttributes = false;
     for (const [traitName, traitData] of Object.entries(entry.traits)) {
@@ -1539,8 +1581,19 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
         // sitting right here. Only applies to EntityAttributes on an entry that
         // carries a top-level guid; plain entities keep serializing their guid
         // directly inside EntityAttributes and are unaffected.
-        if (traitName === 'EntityAttributes' && entry.guid && !fieldData.guid) {
-          fieldData = { ...fieldData, guid: entry.guid };
+        //
+        // `authoredGuid` also covers the #1268 case: an entry that DOES carry
+        // EntityAttributes but with no guid in it (and no top-level guid either) takes the
+        // derived one here, rather than falling through to a runtime guid at spawn.
+        // ⚠️ `durableGuid`, not `!fieldData.guid`. `deriveAuthoredEntityGuids` classifies an entry
+        // through `durableGuid` too, so a persisted RUNTIME guid counts as no identity there and
+        // gets one derived — and a raw truthiness check here would then throw that derivation away,
+        // let `mintRuntimeGuid` overwrite the field, and leave the first save minting a random v4:
+        // #1268 intact, in the one shape this module's docblock claims to cover. The corpus cannot
+        // hold that input (`noRuntimeGuidsOnDisk.test.ts`), but a user project or a hand-edited
+        // file can.
+        if (traitName === 'EntityAttributes' && authoredGuid && !durableGuid(fieldData.guid as string)) {
+          fieldData = { ...fieldData, guid: authoredGuid };
         }
         if (entityIdFieldNames.length === 0) traitArgs.push(meta.trait(fieldData));
         else {
@@ -1562,9 +1615,25 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
     // entry.guid so it's discoverable in the meantime — onInstantiatePrefab (below)
     // replaces this placeholder with the real, fully-populated instance moments
     // later, so a bare guid-only stand-in here is enough for pass 2 to resolve.
-    if (!sawEntityAttributes && entry.guid) {
-      const eaMeta = allTraits.find((m) => m.name === 'EntityAttributes');
-      if (eaMeta) traitArgs.push(eaMeta.trait({ guid: entry.guid }));
+    //
+    // The same stand-in carries #1268's case, which reaches here by a different route: an
+    // entry written before #1248 has NO EntityAttributes and no top-level guid, so without
+    // this it spawns bare, `spawnEntity` adds the trait with a RUNTIME guid, and the first
+    // save mints a random durable one — a different one in every clone. `authoredGuid` is
+    // derived from the scene path and the entry's place in it, so every clone agrees.
+    //
+    // ⚠️ `entry.guid` and the derived guid are NOT interchangeable in the gate below. A
+    // prefab root must get its placeholder even when it has no other traits (that is the
+    // whole point above), but an entry with no traits AND no guid is a stray that the
+    // `traitArgs.length > 0` check has always dropped — pushing an EntityAttributes onto it
+    // would make it spawn as a phantom entity that no previous build had. Court carried
+    // exactly such a stray until #1248 deleted it.
+    if (!sawEntityAttributes) {
+      const standInGuid = durableGuid(entry.guid) || (traitArgs.length > 0 ? authoredGuids.get(entry.id) : undefined);
+      if (standInGuid) {
+        const eaMeta = allTraits.find((m) => m.name === 'EntityAttributes');
+        if (eaMeta) traitArgs.push(eaMeta.trait({ guid: standInGuid }));
+      }
     }
     if (traitArgs.length > 0) {
       const entity = spawnEntity(world, ...traitArgs);

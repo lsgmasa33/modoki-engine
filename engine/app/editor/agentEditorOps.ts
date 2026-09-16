@@ -46,6 +46,7 @@ import {
   runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, discardDirtyAssets,
   applyAssetPathMoves, type PathMove,
   getPrefabSource, instantiatePrefabAsync, setPrefabSource, serializePrefab, writePrefabFile, warnInertPrefabSizes,
+  preloadNestedPrefabsForSubtree,
   resolveExistingPrefabId, tagEntityTreeAsInstance, untagEntityTreeAsInstance,
   detachPrefabInstance, reattachPrefabInstance,
   applyToPrefabWithUndo, revertOverridesSelective, rebuildInstance, resolveInstanceContext,
@@ -2319,6 +2320,9 @@ export function registerEditorAgentOps(): void {
       const path = p.path;
       const entityId = requireLiveId({ id: p.entityId, guid: p.entityGuid }, 'prefab create'); // both given → refused (#1223 D1)
       const existingId = await resolveExistingPrefabId(path);
+      // Same cold-cache flatten as the human path (#1284) — resolveExistingPrefabId fetches
+      // raw and never touches the editor prefab cache, so nothing here warms it.
+      await preloadNestedPrefabsForSubtree(entityId);
       const prefab = serializePrefab(entityId, existingId);
       if (!prefab) throw new Error(`could not serialize prefab from entity ${entityId}`);
       // An authoring write (it can overwrite an existing template), so it reports an inert size like
