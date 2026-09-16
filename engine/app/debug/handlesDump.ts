@@ -39,7 +39,12 @@ export type AnnotatedHandle = Omit<InteractionHandle, 'owner'> & {
 };
 
 export interface HandlesDumpResult {
-  count: number;
+  /** §2 (#1217, #1223 D3, #1266): the handles below. This op applies a FILTER but no limit, so
+   *  `totalCount` always equals it — emitted anyway, because an absent total cannot be told apart
+   *  from "this tool does not report one", which is the ambiguity the rule exists to kill. */
+  returnedCount: number;
+  /** Everything the filter matched. Equal to `returnedCount` here, by the note above. */
+  totalCount: number;
   /** Distinct editors currently offering handles — a quick "what can I aim at now?". */
   editors: string[];
   /** How many handles are OFF-screen (need scrolling into view before they're aimable). */
@@ -116,7 +121,8 @@ export function computeHandles(params: HandlesDumpParams = {}): HandlesDumpResul
   const editors = Array.from(new Set(handles.map((h) => h.editor))).sort();
   const count = (pred: (h: AnnotatedHandle) => boolean) => handles.reduce((n, h) => n + (pred(h) ? 1 : 0), 0);
   return {
-    count: handles.length,
+    returnedCount: handles.length,
+    totalCount: handles.length,
     editors,
     offScreenCount: count((h) => !h.onScreen),
     occludedCount: count((h) => !!h.occludedBy),

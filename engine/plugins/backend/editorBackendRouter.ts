@@ -5279,7 +5279,14 @@ async function describeUnresolvedAgainstLiveWorld(
     const scenes = ctx.getManifest().assets
       .filter((a) => a.type === 'scene')
       .map((a) => ({ path: a.path, ...((a as { guid?: string }).guid ? { guid: (a as { guid?: string }).guid } : {}) }));
-    return json({ count: scenes.length, scenes });
+    // §2 (#1266): `returnedCount`/`totalCount`, matching modoki_list_assets. This route answers the
+    // whole manifest slice — no filter, no limit — so the two always agree; both are emitted anyway,
+    // because an absent total reads as "this tool does not report one". ⚠️ This body is assembled in
+    // the Node router, NOT in an agent op, so `replyCountVocabulary.test.ts` (which walks op replies)
+    // structurally cannot see it — it was still answering a bare `count` after every op had been
+    // renamed, i.e. modoki_list_assets and modoki_list_scenes disagreeing about how to name the same
+    // thing. Pinned below by `editorBackendRouter`'s own scenes test instead.
+    return json({ returnedCount: scenes.length, totalCount: scenes.length, scenes });
   }
 
   // ── GET /api/build-modules (M) ── resolve `build.modules` (the Project Settings →

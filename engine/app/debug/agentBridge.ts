@@ -786,8 +786,11 @@ registerAgentOp('console-logs', (params) => {
   for (const e of ring) byLevel[e.level] = (byLevel[e.level] ?? 0) + 1;
   return {
     logs: r.items,
-    count: r.items.length,
-    total: r.total,
+    // §2 (#1217, #1223 D3, #1266): `returnedCount` is the rows here, `totalCount` everything the
+    // filter matched before the tail. `ringTotal` is a THIRD population — the whole ring, filter
+    // ignored — so it keeps its own name rather than being folded into either.
+    returnedCount: r.items.length,
+    totalCount: r.total,
     ringTotal: ring.length,
     byLevel,
     // The ring is `[pinned boot prefix] ++ [rolling tail]` — once it wraps, that is DISCONTIGUOUS,
@@ -887,9 +890,11 @@ registerAgentOp('journal-events', (params) => {
   const captures = verboseCaptureState();
   const idle = captures.types.filter((t) => !captures.active.includes(t));
   return {
-    count: r.items.length,
+    // §2 (#1217, #1223 D3, #1266): `returnedCount`/`totalCount` everywhere; `ringTotal` below is a
+    // THIRD population (the whole ring, filter ignored) and keeps its own name.
+    returnedCount: r.items.length,
     /** Events MATCHING the filter (the whole ring when unfiltered). */
-    total: r.total,
+    totalCount: r.total,
     /** Every event in the ring, and the histogram over ALL of them — unchanged by a filter, so
      *  a filtered read still shows what else is in there. */
     ringTotal: ring.total,
@@ -1244,7 +1249,10 @@ registerAgentOp('diagnose', (params) => {
       available: true,
       usedBytes: cache.usedBytes(),
       budgetBytes: cache.budgetBytes(),
-      count: entries.length,
+      // §2 (#1266): the cache is listed whole — no filter, no limit — so the two agree, and both
+      // are emitted rather than leaving an absent total that reads as "not reported".
+      returnedCount: entries.length,
+      totalCount: entries.length,
       entries,
     },
   };
@@ -1429,7 +1437,7 @@ registerAgentOp('watch-clear', (params) => clearWatch((params as { id?: string }
 // coordinates). Response shaping (limit/unresolvedOnly/precision) lives HERE, in the op, same
 // split as watch-read: `readInputPresses()` (the producer, `runtime/input/pointerRecorder.ts`)
 // stays a pure ring-buffer read with no agent-surface concerns. ──
-registerAgentOp('input-watch-start', (params) => startInputWatch((params ?? {}) as { max?: number }));
+registerAgentOp('input-watch-start', (params) => startInputWatch((params ?? {}) as { maxPresses?: number }));
 
 const DEFAULT_INPUT_WATCH_LIMIT = 20;
 /** Shared by `read` and `stop` (stop reports what was captured, same shape as a read). */
@@ -1444,7 +1452,7 @@ function shapeInputWatchRead(params: unknown): unknown {
   const presses = matched.slice(Math.max(0, matched.length - limit));
   const result: Record<string, unknown> = {
     open: out.open,
-    max: out.max,
+    maxPresses: out.maxPresses,
     // Recomputed against what THIS call actually returns (post-filter, post-limit) — `totalCount`
     // stays the producer's true all-time count, per §2 ("both present whenever a filter applied").
     returnedCount: presses.length,

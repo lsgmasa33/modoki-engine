@@ -69,8 +69,9 @@ export const AudioSource = trait({
   //
   // ⚠️ It picks once per autoplay ARMING — not on every advance, which is what `playlist: 'shuffle'`
   // already does for the rest of the walk. "Arming" is wider than "app start": a Stop→Play in the
-  // editor re-rolls it, and so does `rearmAudioAutoplay` (the #611 pagehide backstop). ⚠️ That re-roll
-  // does NOT rebuild the walk order, so the advance after it follows the OLD order — #1281.
+  // editor re-rolls it, and so does `rearmAudioAutoplay` (the #611 pagehide backstop). The walk
+  // follows the re-roll: `nextClip` re-derives its position when `clip` is written from outside it
+  // (#1281), so the advance after a re-arm is the new opener's successor, not the old order's.
   shuffleStart: false as boolean,
   // Runtime playback state (not serialized) — reflects whether the source is
   // currently sounding, for the Inspector + debug tooling.

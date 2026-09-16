@@ -139,10 +139,10 @@ describe('journal-events: byType describes the RING, not the filtered slice', ()
     emit('score', { n: 2 });
     emit('match', { n: 3 });
     const r = await journal({ type: 'match' }) as unknown as {
-      count: number; total: number; ringTotal: number; byType: Record<string, number>; filter?: Record<string, string>;
+      returnedCount: number; totalCount: number; ringTotal: number; byType: Record<string, number>; filter?: Record<string, string>;
     };
-    expect(r.count).toBe(2);       // returned
-    expect(r.total).toBe(2);       // matching the filter
+    expect(r.returnedCount).toBe(2);       // returned
+    expect(r.totalCount).toBe(2);       // matching the filter
     expect(r.ringTotal).toBe(3);   // in the ring
     // The histogram is the whole point: `{match:2}` alone reads as "this ring holds only matches".
     expect(r.byType).toEqual({ match: 2, score: 1 });
@@ -152,8 +152,8 @@ describe('journal-events: byType describes the RING, not the filtered slice', ()
   it('an unfiltered read reports the same numbers on both keys, with no `filter` echo', async () => {
     game = createTestWorld();
     emit('match', { n: 1 });
-    const r = await journal({}) as unknown as { total: number; ringTotal: number; filter?: unknown };
-    expect(r.total).toBe(r.ringTotal);
+    const r = await journal({}) as unknown as { totalCount: number; ringTotal: number; filter?: unknown };
+    expect(r.totalCount).toBe(r.ringTotal);
     expect(r.filter).toBeUndefined();
   });
 });

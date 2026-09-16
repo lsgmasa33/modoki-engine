@@ -20,6 +20,9 @@ import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { CONTRACTS, contractFor } from '../../tools/modoki-mcp/src/contracts';
 import { getTool } from '../../tools/modoki-mcp/src/registry';
 import { loadSurface, realRequests, type Surface } from './mcpSurface';
+// The §11 first-sentence rule lives beside this file so the GAME-tool guard applies the same one
+// (#1218) — two copies of a rule diverge invisibly.
+import { firstSentence, firstSentenceDefect } from './firstSentence';
 import { loadDeviceSurface } from './deviceSurface';
 
 describe('tool contracts', () => {
@@ -579,29 +582,6 @@ describe('tool contracts', () => {
  *  The first two ledgers were seeded with the 2026-09-14 offenders and emptied in the same review;
  *  the third keeps only exemptions that carry a reason. */
 describe('descriptions an agent reads under deferral (#1208)', () => {
-  /** Up to the first sentence end (`.`/`!`/`?` before whitespace, and `?` before a dash) or the first
-   *  newline. `e.g.`/`i.e.`/`etc.` do not end a sentence — the review found four first sentences cut
-   *  short there, which would have hidden anything after the abbreviation. */
-  const firstSentence = (d: string): string => {
-    const masked = d.replace(/\b(e\.g|i\.e|etc|vs)\./g, (m) => m.replace(/\./g, '\u0000'));
-    const end = masked.match(/^[\s\S]*?(?:[.!](?=\s|$)|\?(?=\s|$|[—–-])|\n)/)?.[0].length ?? d.length;
-    return d.slice(0, end).trim();
-  };
-
-  /** What is wrong with a first sentence, or null. It must say what the tool DOES:
-   *  - not a caveat about the reply (`RETURNS {…}`, `NOTE …`, `⚠️`), which belongs after it;
-   *  - not a question (`What references this?`), which names the need but not the tool;
-   *  - no issue number, which is history an agent choosing a tool cannot use. */
-  const firstSentenceDefect = (d: string): string | null => {
-    const f = firstSentence(d);
-    // Case-INSENSITIVE for the caveat words, except that a prose "Returns the …" is what a tool does;
-    // only a returned SHAPE (`Returns {…}`/`RETURNS …`) or a `Note:`-style label is a caveat.
-    if (/^(?:NOTE|RETURNS|WARNING|IMPORTANT|CAUTION)\b|^⚠/.test(f) || /^(?:note|warning|important|caution)\s*:|^returns\s*[{[]/i.test(f)) return 'leads with a caveat';
-    if (/\?$/.test(f)) return 'is a question';
-    if (/#\d+/.test(f)) return 'carries an issue number';
-    return null;
-  };
-
   /** Does `desc` name the tool `full`? The full name always counts. The bare suffix counts only
    *  when it is compound (`editor_journal`), because a one-word suffix (`drag`, `watch`, `eval`) is
    *  ordinary prose and would match a description that never meant the tool. */

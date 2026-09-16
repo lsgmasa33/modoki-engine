@@ -50,7 +50,8 @@ PlayerPrefs.get<T>(key): T | undefined           // sync, returns a fresh copy
 PlayerPrefs.set<T>(key, value): void             // sync into cache; atomic durable write is debounced
 PlayerPrefs.has(key): boolean
 PlayerPrefs.delete(key): void                    // also: set(key, undefined)
-PlayerPrefs.keys(): string[]
+PlayerPrefs.keys(): string[]                      // readable keys — omits a protected one (see Gotchas)
+PlayerPrefs.keysIncludingProtected(): string[]    // for a sweep that DELETES, not a reader (see Gotchas)
 PlayerPrefs.clear(): void                         // empties THIS game's namespace
 PlayerPrefs.isHydrated(): boolean                 // true once init() has hydrated the cache
 PlayerPrefs.isSwapInFlight(): boolean             // true while an init() swap is mid-flight (see Gotchas)
@@ -145,6 +146,15 @@ if (score > best) PlayerPrefs.set('bestScore', score);
   clobbering*, not the player's intent — `delete()` and `clear()` still remove such a key, and
   `delete()` frees it for a subsequent `set()`. `get()`/`has()`/`keys()` all report it as absent,
   deliberately: `has(k) === true` implies `get(k) !== undefined`, and game code relies on that.
+  ⚠️ **A sweep that DELETES by prefix must use `keysIncludingProtected()`, not `keys()`** (#1276).
+  The omission above is right for every reader and wrong for a wipe: the key is still on disk, still
+  occupies its logical name, and `delete()` removes it perfectly well. Court wiped `court.session.*`
+  on account deletion by enumerating a prefix through `keys()`, so a board written by a NEWER build
+  and read back after a downgrade survived the delete loop, survived the re-sweep, AND was invisible
+  to the read-back that reports the wipe **confirmed** — a wipe returning success over a save that
+  was still there. `clear()` had always compensated for this in its own loop (it must mean *every*
+  key); a targeted sweep has to ask. Deliberately kept as a separate function rather than folded into
+  `keys()`, because every other caller is a reader.
   ⚠️ **That same asymmetry means the durability accessors can disagree with each other** (#630
   review) — `PlayerPrefs.isProtected(key)` is the way to ask "absent, or present-but-unreadable?"
   where `has()` cannot answer. A refused `set()` never touches `cache`/`dirty`/the in-flight

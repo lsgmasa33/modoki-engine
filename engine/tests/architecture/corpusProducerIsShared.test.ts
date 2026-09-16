@@ -347,6 +347,18 @@ const EXEMPT: ReadonlyArray<ExemptRow> = [
     reason: 'Walks Court\'s asset tree to resolve font GUIDs. Same #29 bar as courtCache.ts.',
   },
   {
+    file: 'games/wordweave/tests/sceneChrome.test.ts', rule: 'walker', walker: 'collectFontGuids',
+    reason: 'Walks Weaveling\'s (and the engine\'s) font sidecars to prove UISettings.fontFamily '
+      + 'names a font something ships — the twin of Court\'s uiFontRoots walker, added by #1280 '
+      + 'when Weaveling adopted the same scene-wide UI font default. Same #29 bar: a game test '
+      + 'cannot import engine/scripts/repoCorpus.mjs, which is why this is a second walker rather '
+      + 'than a second caller. It exists because the check it performs is NOT inherited from '
+      + 'anywhere: assetRefIntegrity\'s dangling-GUID scan runs off a key allowlist carrying '
+      + 'neither UIElement.fontFamily nor UISettings.fontFamily (disproved by experiment in '
+      + '#1280\'s review — repointing the font sidecar\'s id left that guard green), and a '
+      + 'dangling default renders every UI root in the system font.',
+  },
+  {
     file: 'games/court/tests/sceneChrome.test.ts', rule: 'walker', walker: 'walk',
     reason: 'Walks Court\'s runtime/ to parse every patchUI call site against the scene (#804). '
       + 'The walk REPLACED a hand-listed pair of files, which was the narrowing surface a close-out '

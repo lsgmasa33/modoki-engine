@@ -56,10 +56,10 @@ describe('console-logs: the op tails, the producer does not', () => {
     console.error('boom'); // an error at the very end
 
     const r = await runAgentOp('console-logs', {}) as {
-      logs: Array<{ text: string }>; total: number; byLevel: Record<string, number>; truncated?: boolean; hint?: string;
+      logs: Array<{ text: string }>; totalCount: number; byLevel: Record<string, number>; truncated?: boolean; hint?: string;
     };
     expect(r.logs.length).toBe(50);
-    expect(r.total).toBe(121);
+    expect(r.totalCount).toBe(121);
     // The histogram covers everything, not just the 50 shown — the error is at index 120,
     // so it IS in the tail here; the "counted but not shown" case is covered in
     // streamSummary.test.ts.
@@ -91,12 +91,12 @@ describe('console-logs: the op tails, the producer does not', () => {
     for (let i = 0; i < 5; i++) console.log(`m${i}`);
 
     const r = await runAgentOp('console-logs', { level: 'warn' }) as {
-      logs: Array<{ level: string }>; count: number; total: number; ringTotal: number; byLevel: Record<string, number>;
+      logs: Array<{ level: string }>; returnedCount: number; totalCount: number; ringTotal: number; byLevel: Record<string, number>;
     };
     // What came back is filtered…
     expect(r.logs.every((l) => l.level === 'warn')).toBe(true);
-    expect(r.count).toBe(1);
-    expect(r.total).toBe(1);
+    expect(r.returnedCount).toBe(1);
+    expect(r.totalCount).toBe(1);
     // …but the ring-wide numbers are not.
     expect(r.ringTotal).toBe(7);
     expect(r.byLevel.error).toBe(1);
@@ -107,16 +107,16 @@ describe('console-logs: the op tails, the producer does not', () => {
   it('an unfiltered read reports ringTotal === total (the two agree when nothing is excluded)', async () => {
     const { runAgentOp } = await freshBridge();
     for (let i = 0; i < 4; i++) console.log(`m${i}`);
-    const r = await runAgentOp('console-logs', {}) as { total: number; ringTotal: number };
-    expect(r.ringTotal).toBe(r.total);
+    const r = await runAgentOp('console-logs', {}) as { totalCount: number; ringTotal: number };
+    expect(r.ringTotal).toBe(r.totalCount);
   });
 
   it('an explicit limit overrides the default', async () => {
     const { runAgentOp } = await freshBridge();
     for (let i = 0; i < 30; i++) console.log(`m${i}`);
-    const r = await runAgentOp('console-logs', { limit: 3 }) as { logs: unknown[]; total: number };
+    const r = await runAgentOp('console-logs', { limit: 3 }) as { logs: unknown[]; totalCount: number };
     expect(r.logs).toHaveLength(3);
-    expect(r.total).toBe(30);
+    expect(r.totalCount).toBe(30);
   });
 
   // Finding A (#596/#597 close-out review): the ring is `[pinned boot prefix] ++ [rolling tail]` —
@@ -156,11 +156,11 @@ describe('journal-events: the op tails, journalEvents() stays whole', () => {
     for (let i = 0; i < 150; i++) emit(i % 5 === 0 ? 'score' : 'match', { i });
 
     const r = await runAgentOp('journal-events', {}) as {
-      count: number; total: number; byType: Record<string, number>; events: unknown[]; truncated?: boolean;
+      returnedCount: number; totalCount: number; byType: Record<string, number>; events: unknown[]; truncated?: boolean;
     };
     expect(r.events).toHaveLength(100);
-    expect(r.count).toBe(100);
-    expect(r.total).toBe(150);
+    expect(r.returnedCount).toBe(100);
+    expect(r.totalCount).toBe(150);
     expect(r.byType).toEqual({ score: 30, match: 120 });
     expect(r.truncated).toBe(true);
 
@@ -173,8 +173,8 @@ describe('journal-events: the op tails, journalEvents() stays whole', () => {
     for (let i = 0; i < 20; i++) emit('match', { i });
     for (let i = 0; i < 5; i++) emit('win', { i });
 
-    const only = await runAgentOp('journal-events', { type: 'win' }) as { total: number };
-    expect(only.total).toBe(5);
+    const only = await runAgentOp('journal-events', { type: 'win' }) as { totalCount: number };
+    expect(only.totalCount).toBe(5);
     const few = await runAgentOp('journal-events', { limit: 2 }) as { events: unknown[] };
     expect(few.events).toHaveLength(2);
   });

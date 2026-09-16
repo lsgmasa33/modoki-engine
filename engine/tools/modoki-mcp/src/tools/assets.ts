@@ -8,7 +8,7 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
-import { DISCARD_UNSAVED_BASE, unsavedForceParam } from '../shapes.js';
+import { DISCARD_UNSAVED_BASE, displayNameParam, unsavedForceParam } from '../shapes.js';
 
 /** Every type the backend's `getAssetSchema` actually serves. ONE list, because three tools take
  *  it and they had drifted NARROWER than the backend: the enum was material|particle|animation
@@ -112,8 +112,11 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       replace: z.boolean().optional().describe('Acknowledge that this write DELETES top-level fields the existing file has. Without it, such a write is refused (409) and lists them.'),
       discardUnsaved: z.boolean().optional().describe(
         `${DISCARD_UNSAVED_BASE}. Here that work is a PARKED edit to this same asset document — a `
-        + 'panel edit the human has not saved. It is dropped before the write, so their older copy '
-        + 'cannot flush back over you at the next save_all.',
+        + 'panel edit the human has not saved. It is dropped AFTER the write succeeds, deliberately: '
+        + 'riding along with the probe meant a write that then threw destroyed their park with '
+        + 'nothing written in its place. So a FAILED write costs them nothing — and a succeeded one '
+        + 'can still report `discardWarning`, meaning the park was NOT dropped and their older copy '
+        + 'may yet flush over you at the next save_all. Read it; do not assume the drop happened.',
       ),
     },
     async ({ path, type, data, replace, discardUnsaved }) => postJson(
@@ -216,7 +219,13 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'Writes the file directly and registers its GUID. Verify with modoki_list_assets (a `name` ' +
       'filter finds it in one call); edit the new document with modoki_write_asset; remove it with ' +
       'modoki_delete_asset. NOT modoki_resolve_refs — that resolves ENTITY refs from journal ' +
-      'payloads and never answers about an asset GUID.',
+      'payloads and never answers about an asset GUID.\n\n' +
+      '⚠️ SIDE EFFECT: the kind\'s own post-create hook runs, exactly as the panel runs it, and for ' +
+      'SEVERAL kinds (spriteanim, rig2d, particle) that OPENS the matching editor panel — so `openPanels` (and for a rig, ' +
+      '`editingSkinAsset`) change in modoki_get_editor_state without this tool saying so. A hook ' +
+      'that THROWS is swallowed to a console.debug and this still answers ok:true, so a missing ' +
+      'panel is not an error you can see here: check modoki_get_editor_state, or ' +
+      'modoki_get_console_logs for the hook failure.',
     {
       kind: z.string().describe('A `kind` id from modoki_list_creatable_assets (e.g. "material", "animation", "sling.level"). An unknown kind is refused with the live list.'),
       path: z.string().describe("Asset-root URL for the new file, e.g. /assets/materials/rock.mat.json. The kind's extension is appended if you leave it off, so the manifest cannot classify the file as something other than the kind you asked for."),
@@ -239,9 +248,9 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'modoki_get_editor_state.openPanels if it refuses.',
     {
       path: z.string().describe('Asset-root URL of the clip, e.g. /assets/animations/walk.anim.json. Must be an animation asset — another type is refused.'),
-      name: z.string().optional().describe('Display name for the editor tab. Defaults to the filename without its .anim.json suffix.'),
+      displayName: displayNameParam('Here the stem drops .anim.json. \u26a0\ufe0f This is DATA, not a label: the editor uses it as the CLIP NAME when it scaffolds a clip for an empty file, and as the clip-name fallback the panel displays.'),
     },
-    async ({ path, name }) => editorAction('open-animation-editor', { path, ...(name !== undefined ? { name } : {}) }),
+    async ({ path, displayName }) => editorAction('open-animation-editor', { path, ...(displayName !== undefined ? { displayName } : {}) }),
   );
   tool(
     'modoki_pose_clip',
@@ -404,7 +413,11 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     + '`ok:false` is an ANSWER (this prefab has problems), not a failed call. Unlike it, this pass '
     + 'consults no trait schema, so it reports no schemaAvailable — the checks it runs are '
     + 'structural and need no renderer. Also covers a prefab INSTANCE\'s overridden fields, which '
-    + 'live in the entity\'s sibling `overrides` object rather than in `traits`.',
+    + 'live in the entity\'s sibling `overrides` object rather than in `traits`.\n\n'
+    + '⚠️ Reads the FILE on disk, so an unsaved edit parked in the editor is not validated here — '
+    + 'modoki_save_all first. `staleInputs` / `staleInputsUnknown` / `staleInputsNote` name what the '
+    + 'pass could not see, and are ABSENT when the editor is clean, so their absence is the '
+    + 'all-clear rather than a silence.',
     { path: z.string().describe('Asset-root URL of the .prefab.json, e.g. /assets/prefabs/crate.prefab.json.') },
     async ({ path }) => getJson(`/api/validate-prefab?path=${encodeURIComponent(path)}`),
   );
@@ -421,7 +434,14 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     + 'constant). Returns `orphans` (largest first, each with `bytes`), `totalBytes`, `sceneCount` '
     + 'and `warnings`. Scoped to the PROJECT\'s own assets — the engine\'s shared /modoki/assets '
     + 'root is excluded, because those are engine-owned and shared with every other project. '
-    + 'The INVERSE question ("what points AT this?") is modoki_find_references.',
+    + 'The INVERSE question ("what points AT this?") is modoki_find_references.\n\n'
+    + '⚠️ Reads FILES ON DISK, not the live editor — a ref you just added in an UNSAVED scene is '
+    + 'invisible here, so its target lists as an orphan. That matters more than on the other reads '
+    + 'because this answer feeds a DELETE. modoki_save_all first. When the editor held something '
+    + 'this pass could not see, it says so rather than guessing: `staleInputs` names what was '
+    + 'unread, `staleInputsUnknown` says the renderer could not be asked at all, and '
+    + '`staleInputsNote` carries both in prose. All three are ABSENT when the editor is clean — '
+    + 'never an empty array — so their absence IS the all-clear.',
     {},
     async () => getJson('/api/unused-assets'),
   );
@@ -457,7 +477,9 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       meta: z.record(z.any()).describe('The COMPLETE sidecar object to write — read it back with modoki_get_asset_meta first and edit that, since this replaces rather than merges.'),
       discardUnsaved: z.boolean().optional().describe(
         `${DISCARD_UNSAVED_BASE}. Here that work is a parked Inspector import-settings edit for this `
-        + 'asset: it is dropped before the write, so nothing stale survives to flush back over you.',
+        + 'asset. It is dropped AFTER the write succeeds (#872), so a failed write costs the human '
+        + 'nothing — and `discardUnconfirmed` in the reply says the drop could not be confirmed, '
+        + 'which is the case where something stale CAN still flush back over you.',
       ),
     },
     async ({ path, meta, discardUnsaved }) => postJson(
@@ -515,7 +537,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     'Create a folder under the project\'s asset roots — the prerequisite for the tools that take a '
     + 'destination inside one (modoki_import_file `destFolder`, modoki_create_asset `path`), which '
     + 'do not create it for you. Refuses a path outside the asset roots (403) and an existing '
-    + 'folder (409). Not recursive: create parents first.',
+    + 'folder (409). RECURSIVE: missing parents are created too, so a nested path needs one call.',
     { path: z.string().describe('Asset-root URL of the folder to create, e.g. /assets/textures/ui.') },
     async ({ path }) => postJson('/api/create-folder', { path }, undefined, `create the folder ${path}`),
   );
@@ -531,7 +553,14 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'Reads FILES ON DISK, not the live world — an unsaved edit in the running scene is not ' +
       'reflected here; modoki_save_all first if you just changed something. ' +
       'Returns {target, direct, indirect, returnedCount, totalCount, truncated, ' +
-      'unresolvedRefsFromTarget, warnings} — direct/indirect are hop-1 vs hop>1 referrer chains.',
+      'unresolvedRefsFromTarget, warnings} — direct/indirect are hop-1 vs hop>1 referrer chains — ' +
+      'plus the two fields that ANSWER the usual question outright: `unreferenced` (nothing points ' +
+      'at it, which is NOT the same as `direct.length === 0`, since that can still have indirect ' +
+      'hits) and `reachable` (whether the target survives a production build). ' +
+      'And `staleInputs` / `staleInputsUnknown` / `staleInputsNote`, which name what this pass could ' +
+      'NOT see because the editor held it unsaved — ABSENT when the editor is clean, never an empty ' +
+      'array, so their absence is what makes the disk-vs-live caveat above verifiable instead of a ' +
+      'standing worry.',
     {
       target: z.string().describe('What to find references TO: an asset GUID, an entity GUID (EntityAttributes.guid, or a prefab instance\'s own guid), or a virtual asset path starting with "/" (e.g. /assets/textures/wood.png).'),
       limit: z.number().int().positive().optional().describe('Cap the returned referrer entries (default 50, max 1000). `returnedCount`/`totalCount` are always present; truncated when it bites.'),

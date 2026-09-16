@@ -182,8 +182,8 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       timeoutMs: z.number().int().positive().optional().describe(
         `${TIMEOUT_MS_BASE} — the body is abandoned then. Default 5000, max 25000 (clamped, not ` +
         'refused). Raise it when the code awaits something slow — e.g. modoki.waitForEdit(), which ' +
-        'parks by design and could never outlive the old fixed budget. The device twin caps LOWER ' +
-        '(4500): its TCP transport has a fixed 5s per-request deadline it cannot exceed.',
+        'parks by design and could never outlive the old fixed budget. The device twin has its own ' +
+        'budget — default 4000, ceiling 20000 — so a slow device eval is raised the same way.',
       ),
     },
     async ({ code, timeoutMs }) => evalRenderer(code, timeoutMs),
@@ -196,8 +196,10 @@ export function registerInputTools(tool: ToolDef, ctx: ToolContext): void {
       'generated camelCase method modoki_eval\'s injected `modoki` object exposes for it ' +
       '(`layout-bounds` -> `modoki.layoutBounds(params)`), plus the fixed helpers `modoki.call(op, params)`, ' +
       '`modoki.ops()`, `modoki.api(path, init)` (a host route with no matching op, via backendFetch), and ' +
-      '`modoki.composite(label, fn)` (collapse a script\'s edits into ONE undo entry). Call this before ' +
-      'writing a modoki_eval script instead of reading source to find the surface. Requires the Electron editor.',
+      '`modoki.composite(label, fn)` (collapse a script\'s edits into ONE undo entry), and ' +
+      '`modoki.import(path)` (import a module AS THE APP HOLDS IT — a hand-written import of an ' +
+      'engine file yields a SECOND instance whose module-level state the app never sees). ' +
+      'Call this before writing a modoki_eval script instead of reading source to find the surface.',
     {},
     async () => getJson('/api/eval-api'),
   );

@@ -953,6 +953,25 @@ function keys(): string[] {
   return [...cache.keys()];
 }
 
+/** Every logical key present in this namespace, INCLUDING one protected by an unreadable save
+ *  (#1276). The counterpart to `keys()`, for the one thing `keys()` cannot serve: a caller
+ *  DELETING a set of keys rather than reading them.
+ *
+ *  ⚠️ **A prefix sweep must use this, not `keys()`.** `keys()` answers "what can I read", which is
+ *  the right answer for every reader and the wrong one for a wipe: a key this build cannot decode
+ *  is still on disk, still occupies its logical name, and `del()` removes it perfectly well. Court
+ *  wipes `court.session.*` on account deletion by enumerating a prefix, and with `keys()` a session
+ *  written by a NEWER build (then read back after a downgrade) was invisible both to the delete
+ *  loop and to the read-back that CONFIRMS the wipe — so the wipe reported success over a save that
+ *  was still there. `clear()` already compensates for exactly this in its own loop; a targeted
+ *  sweep had no way to.
+ *
+ *  Deliberately NOT folded into `keys()`: every other caller is a reader, and a reader handed a key
+ *  whose `get()` returns `undefined` is the asymmetry `has()`'s comment exists to prevent. */
+function keysIncludingProtected(): string[] {
+  return [...new Set([...cache.keys(), ...unreadable.keys()])];
+}
+
 /** Remove every key in this namespace. */
 function clear(): void {
   for (const k of cache.keys()) dirty.add(k);
@@ -1104,6 +1123,7 @@ export const PlayerPrefs = {
   has,
   delete: del,
   keys,
+  keysIncludingProtected,
   clear,
   flush,
   isHydrated,

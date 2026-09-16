@@ -195,6 +195,33 @@ else). The other cache blocks' hashes (`textureCache.hash`, `fontCache.hash`,
 ...) stay committed — they mix only source bytes + settings + an in-repo
 encoder version, so they ARE reproducible across machines.
 
+**The local file fills a cache block in; it never CREATES one (#1279).** For
+**audio and environments**, a block's mere existence is what the build reads as
+"this asset has been converted": `vite-asset-scanner.ts` ships the converted
+variant when it is there and the source verbatim when it is not
+(`if (!hasCache) { shipSource(); continue; }`). The same truthiness test bakes
+the manifest's texture and environment blocks. (Textures and models convert
+unconditionally at build time and have their manifest hash overwritten from
+that conversion; fonts gate on the `font` SETTINGS block, and audio/font emit a
+manifest block from their settings too — the cache block controls only the
+converted-variant fields. So the shipped-bytes blast radius is audio and
+environments.) So until #1279 the merge let a
+GITIGNORED file decide what a build SHIPS: a `{"audioCache":{"bytes":1236743}}`
+left behind by an earlier import made that machine convert, while a fresh clone
+or CI — which cannot have the file — shipped the source. Same commit, different
+shipped bytes, nothing reporting it. Observed on `games/wordweave` while closing
+out #921: with `audioCache` stripped from all 26 committed sidecars and both
+caches deleted, the native build still logged `converted 26 audio clip(s)`. The
+committed sidecar now decides WHICH blocks exist and the local file only
+supplies this host's values inside them; a local block with no committed
+counterpart is inert, and the next `writeMetaSidecar` clears it.
+
+⚠️ **`videoCache` is deliberately outside this split**, though it carries `bytes`
+in the same shape. A video's size is not Inspector-only: the manifest bakes it
+so `policy: 'auto'` can choose stream-vs-download without a network round-trip.
+Peeling it would blank that everywhere but the importing machine — the very
+machine-dependence the split exists to remove. Asked and answered in #1279.
+
 A fresh checkout has no `.meta.local.json` (gitignored), so it self-heals for
 free: the serving path already treats a missing/stale model hash as a cache
 miss and re-bakes (`autoBakeThenServe`, `plugins/backend/staticAssets.ts`,

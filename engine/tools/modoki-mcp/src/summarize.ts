@@ -27,7 +27,7 @@ export function summarizeAssets(assets: AssetEntry[], q: AssetQuery = {}) {
     const byType: Record<string, number> = {};
     for (const a of assets) byType[a.type] = (byType[a.type] ?? 0) + 1;
     return {
-      total: assets.length,
+      totalCount: assets.length,
       byType,
       hint: 'Counts only. Narrow with type=<type>, folder=<path prefix>, or name=<substring>; or all=true for every entry.',
     };
@@ -41,10 +41,15 @@ export function summarizeAssets(assets: AssetEntry[], q: AssetQuery = {}) {
   const totalCount = filtered.length;
   let truncated = false;
   if (q.limit != null && filtered.length > q.limit) { filtered = filtered.slice(0, q.limit); truncated = true; }
+  // §2 (#1217, #1223 D3, #1266): `returnedCount` is the rows below, `totalCount` every asset the
+  // filter matched before the limit — BOTH always, so a total never exists only when truncation
+  // happened. A total that appears only on truncation is not recoverable by the caller: its
+  // absence conflates "nothing was cut" with "this tool does not report it".
   return {
-    count: filtered.length,
+    returnedCount: filtered.length,
+    totalCount,
     assets: filtered,
-    ...(truncated ? { truncated, totalCount } : {}),
+    ...(truncated ? { truncated } : {}),
     // A zero-result filter is the silent-empty trap: say so, and say how to recover.
     ...(filtered.length === 0 ? { hint: 'No match. Call bare for per-type counts, or widen the filter.' } : {}),
   };

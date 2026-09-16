@@ -462,8 +462,8 @@ describe('capture phase and multi-touch — seeing what the engine refuses', () 
 });
 
 describe('the ring is bounded', () => {
-  it('drops the oldest past `max`, and says how many', () => {
-    startInputWatch({ max: 3 });
+  it('drops the oldest past `maxPresses`, and says how many', () => {
+    startInputWatch({ maxPresses: 3 });
     for (let i = 0; i < 5; i++) press(document.body, [i, i]);
 
     const r = readInputPresses();

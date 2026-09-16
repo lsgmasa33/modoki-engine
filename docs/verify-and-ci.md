@@ -610,6 +610,47 @@ a number per test with no rationale between them. **#1046 is the closed preceden
 scan at 17s against a 20s budget, handed 60s on Windows. The unit-test default is the wrong
 *instrument* for a corpus walk, not merely a too-small number — which is what decides the fix shape.
 
+### ⚠️ Your own mutation check racing your own backgrounded gate — a failure naming data no commit contains
+
+The same "the symptom points somewhere the bug is not" shape, from the other direction, and it is
+self-inflicted. Observed on `work-ai` on 2026-09-16 while closing out #1280.
+
+A `verify` was running in the background. In the same working tree, a mutation check was doing what
+CLAUDE.md requires of every new test — break the mechanism, confirm the test reds, restore. One of
+those mutations wrote a deliberately-dangling GUID into a scene file for a few seconds. The gate
+read the tree mid-mutation and reported:
+
+```
+/games/wordweave/assets/scenes/main.scene.json: MISSING font-family:deadbeef-0000-4000-8000-000000000000
+/games/wordweave/assets/scenes/main.scene.json: STALE font-family:651fcb15-…
+```
+
+Two findings in a guard that has nothing to do with fonts-as-such, in a commit that did not contain
+either state. It reads exactly like a real defect in the change under test.
+
+- **The shape:** any tree-mutating check — a mutation test, a `git checkout` A/B, a temporary
+  fixture edit — overlapping a backgrounded `verify`/`vitest` **in the same clone**.
+- **The tell, and it is a sharp one:** *the failure names data no committed file contains.* Grep the
+  reported value against `HEAD`; if it is not there, the gate read a transient tree, and the run is
+  not evidence about anything. Re-run it before believing a word.
+- ⚠️ **`/close-out` § 2b covers the neighbouring case and not this one.** That rule isolates an
+  `opus-reviewer` in a worktree because a REVIEWER mutates your tree. The gate reading a tree *you*
+  are mutating is the mirror image, and isolating the reviewer does nothing for it — the session
+  that hit this had correctly worktree-isolated its reviewer minutes earlier.
+- **The rule:** mutation-check or run the gate, never both at once in one clone. A backgrounded gate
+  makes the tree read-only until it returns.
+
+⚠️ It also generates load that `verifyLoad.mjs` cannot see: registration happens in `verify.mjs`
+alone, so mutation checks, scoped `npx vitest run`s, `npm test`, `typecheck` and `lint` are all
+invisible to the peer count. Four clones mid-close-out can saturate the box while every one of them
+reads `peers == 1` and claims the full worker pool — measured on the hub at load **154.86** with
+**106** node processes across four clones and zero registered runs (#1285). ⚠️ **`work-qa`
+independently confirmed the same gap from the other side**: ~8 mutation checks in one session, each
+a scoped vitest run, none of them visible to the peer count. Mutation checks are the worst case
+structurally — by design they run the same suite repeatedly, back to back. The fix shape is to move
+registration into `engine/testWorkers.ts`, the chokepoint both vitest configs already call;
+unimplemented, because it changes worker budgeting for six clones and needs a measurement.
+
 ### What the environment flip does NOT risk, and how that was checked
 
 The obvious worry is a test that still passes under node because its subject silently no-ops without

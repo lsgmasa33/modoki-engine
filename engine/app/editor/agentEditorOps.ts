@@ -1479,30 +1479,34 @@ export function registerEditorAgentOps(): void {
   // Open the Particle Editor dock panel on a .particle.json (normally a double-click in
   // Assets). Mounts CurveEditor/GradientEditor, whose interaction-handle providers then
   // register — so the agent can reach the size/opacity curve points + gradient stops.
+  // No `displayName` here, unlike its four siblings (#1266): `editingParticleAsset.name` is read
+  // only as the unreachable `|| asset.name` arm of two `fileName=` fallbacks in ParticleEditor, so
+  // a caller-supplied one had no observable effect. The stem is still computed, because
+  // `SelectedAsset` requires a name.
   registerAgentOp('open-particle-editor', (params) => {
-    const p = (params ?? {}) as { path?: string; name?: string };
+    const p = (params ?? {}) as { path?: string };
     requireAssetPath(p.path, 'particle', 'open-particle-editor');
-    const name = p.name ?? p.path!.split('/').pop()?.replace(/\.particle\.json$/, '') ?? p.path!;
+    const name = p.path!.split('/').pop()?.replace(/\.particle\.json$/, '') ?? p.path!;
     useEditorStore.getState().openParticleEditor({ path: p.path!, type: 'particle', name });
     return readEditorState();
   });
   // Open the Sprite slicer / 9-slice modal on a texture (normally the Texture-Inspector
   // buttons). Selects the texture + requests the modal → its handle providers mount.
   registerAgentOp('open-sprite-editor', (params) => {
-    const p = (params ?? {}) as { path?: string; name?: string };
+    const p = (params ?? {}) as { path?: string; displayName?: string };
     requireAssetPath(p.path, 'texture', 'open-sprite-editor');
     // The modal's own mount effect resets `spriteEditorSelection` to null, but a call on a path
     // that is ALREADY open re-triggers no mount (TextureAssetView's `setSpriteEditorOpen(true)`
     // is a no-op on an already-true boolean) — so without this, joining a session the human
     // already had open would report whatever THEY had selected as if this call selected it.
     useEditorStore.getState().setSpriteEditorSelection(null);
-    useEditorStore.getState().requestTextureEditor(p.path!, 'sprite', p.name);
+    useEditorStore.getState().requestTextureEditor(p.path!, 'sprite', p.displayName);
     return readEditorState();
   });
   registerAgentOp('open-nine-slice-editor', (params) => {
-    const p = (params ?? {}) as { path?: string; name?: string };
+    const p = (params ?? {}) as { path?: string; displayName?: string };
     requireAssetPath(p.path, 'texture', 'open-nine-slice-editor');
-    useEditorStore.getState().requestTextureEditor(p.path!, 'nineslice', p.name);
+    useEditorStore.getState().requestTextureEditor(p.path!, 'nineslice', p.displayName);
     return readEditorState();
   });
   // Select a slice in the currently-open Sprite Editor, so its 8 resize handles + pivot
@@ -1519,9 +1523,9 @@ export function registerEditorAgentOps(): void {
   // 'parts') had an agent route at all (#373); this is the missing "open the panel" half —
   // once open, the mode buttons carry `data-ui-id="skin.mode.*"` and are chrome-tappable.
   registerAgentOp('open-skin-editor', (params) => {
-    const p = (params ?? {}) as { path?: string; name?: string };
+    const p = (params ?? {}) as { path?: string; displayName?: string };
     requireAssetPath(p.path, 'rig2d', 'open-skin-editor');
-    const name = p.name ?? p.path!.split('/').pop()?.replace(/\.rig2d\.json$/i, '') ?? p.path!;
+    const name = p.displayName ?? p.path!.split('/').pop()?.replace(/\.rig2d\.json$/i, '') ?? p.path!;
     useEditorStore.getState().openSkinEditor({ path: p.path!, type: 'rig2d', name });
     return readEditorState();
   });
@@ -1553,9 +1557,9 @@ export function registerEditorAgentOps(): void {
   // happened to have opened the clip by hand. This is the one call the panel path already uses,
   // including its bind-root resolution, rather than a second way of opening a clip.
   registerAgentOp('open-animation-editor', async (params) => {
-    const p = (params ?? {}) as { path?: string; name?: string };
+    const p = (params ?? {}) as { path?: string; displayName?: string };
     requireAssetPath(p.path, 'animation', 'open-animation-editor');
-    const name = p.name ?? p.path!.split('/').pop()?.replace(/\.anim\.json$/, '') ?? p.path!;
+    const name = p.displayName ?? p.path!.split('/').pop()?.replace(/\.anim\.json$/, '') ?? p.path!;
     useEditorStore.getState().openAnimationEditor({ path: p.path!, type: 'animation', name }, resolveAnimatorRootForClip(p.path!));
 
     // ⚠️ `openAnimationEditor` sets the open ASSET; it does not load the clip DOCUMENT. That is

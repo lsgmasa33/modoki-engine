@@ -25,12 +25,14 @@ beforeEach(() => { st = { order: [], idx: 0, pending: '', bank: '', shuffled: fa
 const tick = (current: string, remaining: number | null, mode: 'off' | 'sequential' | 'shuffle' = 'shuffle') =>
   nextClip(st, BANK, mode, current, remaining, FADE);
 /** A clip runs down into its cross-fade, then the new one gets going. */
-function runOut(current: string): string {
-  const next = tick(current, 0.4);
+function runOut(current: string, mode: 'sequential' | 'shuffle' = 'shuffle'): string {
+  const next = tick(current, 0.4, mode);
   expect(next).toBeTruthy();
-  tick(next!, 999);         // the new voice is up — clears the in-flight latch
+  tick(next!, 999, mode);   // the new voice is up — clears the in-flight latch
   return next!;
 }
+/** The same, on the authored order — so a test can name the exact clip it expects next. */
+const runOutSeq = (current: string) => runOut(current, 'sequential');
 
 describe('the swap threshold', () => {
   it('does nothing while the clip has time left', () => {
@@ -129,6 +131,100 @@ describe('the order is keyed on the bank CONTENT, not its length', () => {
     const order = [...st.order];
     for (let i = 0; i < 10; i++) tick(REFS[0], 999);
     expect(st.order).toEqual(order);
+  });
+});
+
+/**
+ * #1281 — the clip is written from OUTSIDE the walk, and the walk has to notice.
+ *
+ * `order`/`idx` is a cache of where we are, and it used to be re-derived only when the BANK
+ * changed. Every other writer of `clip` — the `audio.setClip` action, a debug bed picker,
+ * `rearmAudioAutoplay` re-arming a `shuffleStart` source after the phone comes back — left it
+ * pointing at the old position, so the next advance followed the stale order.
+ */
+describe('a clip set from outside the walk (#1281)', () => {
+  it('plays the successor of the clip that is ACTUALLY playing', () => {
+    // Sequential [t0…t11] playing t0; jump to t2. The stale order answered t1 — the old
+    // position's successor — which is a track the listener already passed.
+    tick(REFS[0], 999, 'sequential');
+    tick(REFS[2], 999, 'sequential');          // an outside write lands
+    expect(runOutSeq(REFS[2])).toBe(REFS[3]);
+  });
+
+  it('does not play the same clip twice in a row when the write picks the NEXT clip', () => {
+    // The nastiest case, because it is the one a listener notices: set the very clip the walk was
+    // about to play and the stale order served it again immediately.
+    tick(REFS[0], 999, 'sequential');
+    tick(REFS[1], 999, 'sequential');
+    expect(runOutSeq(REFS[1])).toBe(REFS[2]);
+  });
+
+  it('KEEPS a clip written inside the cross-fade window instead of stepping past it', () => {
+    // The adopted clip has not played yet, so it takes the same in-flight latch one of our own
+    // swaps would. Without that, the re-derive rotates to the written clip and the threshold in
+    // this very same call advances straight past it — `debugPlayBed(t2)` would play t3 and never
+    // t2 at all. Same mechanism made the shuffleStart re-arm skip its freshly-rolled opener.
+    tick(REFS[0], 999, 'sequential');
+    expect(nextClip(st, BANK, 'sequential', REFS[2], 0.4, FADE)).toBeNull();
+    expect(st.order[st.idx], 'the walk adopted the written clip rather than its successor').toBe(REFS[2]);
+  });
+
+  it('adopts a write that arrives with the old clip already ENDED, mid-swap', () => {
+    // The production shape of the re-arm, and the one an in-flight latch would hide: the app is
+    // backgrounded during a cross-fade (so `pending` is set), `audioDispose()` ends the handle, and
+    // the re-arm writes a fresh `shuffleStart` opener on the same frame the walk sees `ended`.
+    // Unless `ended` clears the latch BEFORE the divergence check, that write is invisible and the
+    // source advances from the stale position instead.
+    tick(REFS[0], 999, 'sequential');
+    tick(REFS[0], 0.4, 'sequential');          // the cross-fade fires — a swap is now in flight
+    expect(st.pending, 'a swap really is in flight').toBe(REFS[1]);
+
+    expect(nextClip(st, BANK, 'sequential', REFS[7], null, FADE, true)).toBeNull();
+    expect(st.order[st.idx], 'the walk adopted the written opener, not the stale successor').toBe(REFS[7]);
+  });
+
+  it('still covers every clip once per lap after the jump', () => {
+    // Rotating rather than rebuilding is what buys this: a reshuffle at the jump would discard the
+    // rest of the lap, and clips would start repeating before the bank was exhausted.
+    tick(REFS[0], 999, 'sequential');
+    tick(REFS[5], 999, 'sequential');
+    const played = [REFS[5]];
+    let cur = REFS[5];
+    for (let i = 0; i < 11; i++) { cur = runOutSeq(cur); played.push(cur); }
+    expect(new Set(played).size).toBe(12);
+  });
+
+  it('leaves the walk POSITION alone for a clip that is not in the bank', () => {
+    // A source may play something outside its own bank (an intro sting). The walk must sit still
+    // through it and carry on where it was — so when the sting ends, the next clip is the one that
+    // was coming, not the top of the list.
+    //
+    // ⚠️ The walk has to be MID-lap for this to be falsifiable: at idx 0 the guard is a no-op,
+    // because rotating to a clip the order does not contain returns the order unchanged and resets
+    // an index that was already 0. The first version of this test did exactly that and stayed green
+    // when the guard was deleted.
+    tick(REFS[0], 999, 'sequential');
+    let cur = REFS[0];
+    for (let i = 0; i < 3; i++) cur = runOutSeq(cur);
+    expect(st.idx, 'three clips in').toBe(3);
+
+    tick('not-in-bank', 999, 'sequential');
+    expect(st.idx, 'a clip the order does not contain must not move the walk').toBe(3);
+
+    // And the consequence, stated as behaviour: the sting ends and the walk resumes at REFS[4],
+    // not at REFS[1] (which is what a reset index would serve).
+    expect(nextClip(st, BANK, 'sequential', 'not-in-bank', null, FADE, true)).toBe(REFS[4]);
+  });
+
+  it('does NOT re-derive while the walk is running normally', () => {
+    // The accept side, and the one that makes the guard falsifiable in the other direction: an
+    // unconditional rotate would reset `idx` every frame and the playlist would never advance.
+    tick(REFS[0], 999, 'sequential');
+    const order = [...st.order];
+    let cur = REFS[0];
+    for (let i = 0; i < 4; i++) cur = runOutSeq(cur);
+    expect(st.order).toEqual(order);   // same lap, never rebuilt
+    expect(st.idx).toBe(4);            // and it really did walk
   });
 });
 

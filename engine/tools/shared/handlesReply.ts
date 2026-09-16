@@ -67,7 +67,15 @@ export async function shapeHandlesReply(
   if (isBareHandlesFilter(filter)) {
     // Keep every diagnostic counter. `occludedCount:0` only means "all clickable" when
     // `occlusionUnchecked` is 0 too — dropping either would make the pair a lie.
-    const { handles, ...meta } = res;
+    //
+    // ⚠️ `returnedCount` is DROPPED here, and that is the whole point of naming it (#1266). This
+    // branch returns NO rows — it strips `handles` and answers counts — so a field defined as "the
+    // rows in this reply" would state a falsehood: a bare call with a Dopesheet open would say
+    // `returnedCount: 2000` beside no `handles` key at all, and a caller that believed it would
+    // conclude its own parse had failed. Under the old vague name `count` this was merely
+    // ambiguous; the precise name makes it wrong, so the summary must not carry it. `totalCount`
+    // stays: how many handles exist IS the answer a bare call is giving.
+    const { handles, returnedCount: _returnedCount, ...meta } = res;
     return {
       ...meta,
       ...countsOf(handles),

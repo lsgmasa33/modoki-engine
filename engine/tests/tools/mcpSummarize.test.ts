@@ -28,8 +28,8 @@ const TRAITS: Record<string, TraitSchema> = {
 
 describe('summarizeAssets — bare returns counts', () => {
   it('per-type counts, no entries', () => {
-    const d = summarizeAssets(ASSETS) as { total: number; byType: Record<string, number>; assets?: unknown; hint: string };
-    expect(d.total).toBe(4);
+    const d = summarizeAssets(ASSETS) as { totalCount: number; byType: Record<string, number>; assets?: unknown; hint: string };
+    expect(d.totalCount).toBe(4);
     expect(d.byType).toEqual({ scene: 2, mesh: 1, texture: 1 });
     expect(d.assets).toBeUndefined();
     expect(d.hint).toContain('folder=');
@@ -44,9 +44,9 @@ describe('summarizeAssets — bare returns counts', () => {
     // Regression: `limit` alone used to fall through to the counts branch, so asking for
     // "the first 2 assets" returned a histogram. A parameter that does not change the answer
     // is worse than a missing one — the caller believes it narrowed.
-    const d = summarizeAssets(ASSETS, { limit: 2 }) as { count: number; assets: AssetEntry[]; truncated: boolean; totalCount: number };
+    const d = summarizeAssets(ASSETS, { limit: 2 }) as { returnedCount: number; assets: AssetEntry[]; truncated: boolean; totalCount: number };
     expect(d.assets).toHaveLength(2);
-    expect(d.count).toBe(2);
+    expect(d.returnedCount).toBe(2);
     expect(d.truncated).toBe(true);
     expect(d.totalCount).toBe(4);
   });
@@ -71,8 +71,8 @@ describe('summarizeAssets — filters buy entries', () => {
   });
 
   it('limit caps and flags truncated + totalCount', () => {
-    const d = summarizeAssets(ASSETS, { type: 'scene', limit: 1 }) as { count: number; truncated: boolean; totalCount: number };
-    expect(d.count).toBe(1);
+    const d = summarizeAssets(ASSETS, { type: 'scene', limit: 1 }) as { returnedCount: number; truncated: boolean; totalCount: number };
+    expect(d.returnedCount).toBe(1);
     expect(d.truncated).toBe(true);
     expect(d.totalCount).toBe(2);
   });
@@ -82,9 +82,26 @@ describe('summarizeAssets — filters buy entries', () => {
     expect(d.truncated).toBeUndefined();
   });
 
+  // §2 (#1266): `totalCount` used to be emitted ONLY alongside `truncated`, so its absence
+  // conflated "nothing was cut" with "this tool does not report a total" — and the caller could
+  // not tell which without a second, unfiltered call. Mutation: put `totalCount` back inside the
+  // `truncated ?` spread in summarizeAssets and this goes red while the two above stay green.
+  it('carries totalCount even when NOTHING truncated — an absent total is unrecoverable', () => {
+    const d = summarizeAssets(ASSETS, { type: 'scene' }) as { returnedCount: number; totalCount: number; truncated?: boolean };
+    expect(d.truncated).toBeUndefined();
+    expect(d.returnedCount).toBe(2);
+    expect(d.totalCount).toBe(2);
+  });
+
+  it('a zero-match filter still carries both counts, so 0 of 0 is legible', () => {
+    const d = summarizeAssets(ASSETS, { type: 'nope' }) as { returnedCount: number; totalCount: number };
+    expect(d.returnedCount).toBe(0);
+    expect(d.totalCount).toBe(0);
+  });
+
   it('a zero-match filter is never silent — it hints', () => {
-    const d = summarizeAssets(ASSETS, { type: 'nope' }) as { count: number; hint: string };
-    expect(d.count).toBe(0);
+    const d = summarizeAssets(ASSETS, { type: 'nope' }) as { returnedCount: number; hint: string };
+    expect(d.returnedCount).toBe(0);
     expect(d.hint).toContain('No match');
   });
 });

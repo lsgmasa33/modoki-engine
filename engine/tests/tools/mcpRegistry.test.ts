@@ -260,6 +260,13 @@ describe('the real registered surface', () => {
   // convention that had already converged, i.e. a blind spot waiting for its next drift. (`action`
   // and `type` were first counted among them too, but only because an undescribed param's `''` was
   // taken as the shared base — see the comparison below. Both are per-tool enums, 10 and 8 wordings.)
+  // ⚠️ #1266 took ONE meaning off `name` and it still belongs here — the entry is narrower, not gone.
+  // The five `open_*_editor` tools spelled an asset DISPLAY LABEL `name`, which was never the
+  // category this entry pardons: every other `name` is *the name of the thing the tool addresses*
+  // (an entity to filter, a trait to describe, an action to dispatch, an asset to match), with the
+  // type stated each time — `path`'s pattern exactly. A label you ASSIGN is a different job, so it
+  // became `displayName` rather than being excused here. Four addressing meanings remain, so the
+  // containment check still cannot police this word; do not read the rename as clearing it.
   const PER_TOOL_MEANING: readonly string[] = [
     'path', 'name', 'kind', 'id', 'ids', 'key', 'limit', 'all', 'from', 'to', 'clear', 'since',
     'guid', 'guids', 'quality', 'selector', 'button', 'steps', 'entity', 'parentId',
@@ -630,7 +637,24 @@ describe('the real registered surface', () => {
   // `worldEntityTotal`, `entityTotal`) in five tools. And +206 on modoki_mutate_scene and
   // modoki_prefab, where both sides extended one description. The spend is the breaking renames being
   // stated where an agent reads them.
-  const DEFINITION_BYTES = 166_674;
+  // 2026-09-16 (#1266 + #1218, work-ai3): RE-PINNED to 171,084 — measured on `b272dba16`, booked in
+  // `ledger/work-ai3.csv`. +4,156 across 18 tools, and this one is worth reading as a WARNING about
+  // where a surface budget actually goes, because almost none of it is the renames.
+  //   The §2 renames (#1266) are ~net zero: `displayName` is longer than `name` on four tools and
+  //   `maxPresses` than `max` on two, but open_particle_editor REFUNDED 65 B by losing a param
+  //   nothing read. The count vocabulary is reply-side and costs the schema nothing.
+  //   The spend is #1218 — 13 descriptions that pointed nowhere, pointed at history, or stated what
+  //   the code does not do. Four tools are 2/3 of it: unused_assets (+585, a disk-vs-live warning it
+  //   had NONE of, on the answer that feeds a delete), find_references (+550, `unreferenced`/
+  //   `reachable` and the staleInputs trio its enumerated shape omitted), open_skin_editor (+505)
+  //   and create_registered_asset (+474, an undocumented panel-opening side effect and a swallowed
+  //   hook error).
+  //   ⚠️ Much of that is a MOVE, not new prose: `contracts.ts` notes already described the
+  //   staleInputs fields in detail, and `notes` is not part of the surface an agent reads. Moving a
+  //   fact from a place nobody reads to the place everybody does SPENDS this budget by definition —
+  //   so a "no new information" change can still cost 4 KB, and that is the spend being approved
+  //   here, not an oversight.
+  const DEFINITION_BYTES = 171_084;
   const DEFINITION_HEADROOM = 4_000;
 
   // `sumSchemaBytes` itself now lives in `mcpSurface.ts` (imported above), not here — this ledger

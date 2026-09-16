@@ -498,22 +498,22 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       'could look was asked); everything else either infers from absence or conflates the two. ' +
       'action:stop closes the window but KEEPS what was recorded, so you can stop then read without ' +
       'racing your own probe. action:clear drops recorded presses without closing the window. ' +
-      'Params are per-ACTION: a read-time filter on a START call (or `max` on anything but start) is ' +
+      'Params are per-ACTION: a read-time filter on a START call (or `maxPresses` on anything but start) is ' +
       'REFUSED naming the right action rather than silently dropped.',
     {
       action: z.enum(['start', 'read', 'stop', 'clear']).describe('open the window | read presses | close (keeps presses) | drop recorded presses (window stays open if it was)'),
-      max: z.number().int().positive().optional().describe('(start) Ring capacity — most recent N presses kept (default 40, ceiling 500).'),
+      maxPresses: z.number().int().positive().optional().describe('(start) Ring capacity — most recent N presses kept, ONE ring for the whole watch (default 40, ceiling 500). Not modoki_watch\'s `maxSamples`, which caps each series separately.'),
       limit: z.number().int().positive().optional().describe('(read) Most-recent N presses to return (default 20).'),
       unresolvedOnly: z.boolean().optional().describe("(read) Keep only presses whose resolved.by is 'none' or 'unknown' — presses NOTHING could explain. THE diagnostic filter: this is the one question this tool exists to answer, so start here when a reported gesture apparently did nothing."),
       precision: precisionParam('x/y/upX/upY/maxD/heldMs'),
     },
     async (args) => {
-      const { action, max, limit, unresolvedOnly, precision } = args;
+      const { action, maxPresses, limit, unresolvedOnly, precision } = args;
       // Per-action allowlist (mirrors modoki_watch's S3.19 fix) — a key belonging to a DIFFERENT
       // action is refused BY NAME, never silently dropped (which would either widen a start to the
       // default ring size unexpectedly or ignore a read-time narrow).
       const ACCEPTS: Record<string, readonly string[]> = {
-        start: ['max'],
+        start: ['maxPresses'],
         read: ['limit', 'unresolvedOnly', 'precision'],
         stop: [],
         clear: [],
@@ -533,7 +533,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
           }),
         });
       }
-      if (action === 'start') return postJson('/api/input-watch/start', { max });
+      if (action === 'start') return postJson('/api/input-watch/start', { maxPresses });
       if (action === 'stop') return postJson('/api/input-watch/stop', {});
       if (action === 'clear') return postJson('/api/input-watch/clear', {});
       const q = new URLSearchParams();
@@ -553,7 +553,9 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
       'them. The companion to modoki_input_watch: that one says a press hit nothing, this one says ' +
       'WHAT it missed and BY HOW MUCH. action:read returns the regions as data (viewport CSS px — ' +
       'the same space the input watch records presses in, so they compare with no transform). ' +
-      'action:show/hide toggles an on-screen overlay that draws the shapes AND plots the last few ' +
+      'action:show/hide toggles the OVERLAY, and action:read is its own read-back — the reply\'s ' +
+      '`visible` says whether the overlay is up, so a show/hide is confirmed without a second tool. ' +
+      'The overlay draws the shapes AND plots the last few ' +
       'recorded presses, green inside a region and red outside — the two failure classes made ' +
       'visually distinct (a press outside every shape = targeting; a press inside the right shape ' +
       'that still did nothing = latching/frame-rate). Pass at:{x,y} to ask the question directly: ' +

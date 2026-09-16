@@ -27,7 +27,7 @@ describe('computeHandles', () => {
   it('summarises an all-clear set (owner-less handles are unchecked, not clean)', () => {
     provide(h({ id: 'a' }), h({ id: 'b', x: 20 }));
     expect(computeHandles()).toMatchObject({
-      count: 2, editors: ['chrome'], offScreenCount: 0, occludedCount: 0,
+      returnedCount: 2, totalCount: 2, editors: ['chrome'], offScreenCount: 0, occludedCount: 0,
       occlusionUnchecked: 2, disabledCount: 0,
       viewport: { w: 1600, h: 968 },
     });
@@ -152,7 +152,7 @@ describe('computeHandles', () => {
       // `a` is covered by the modal; `b` hit-tests to itself but is inert.
       document.elementFromPoint = (x: number) => (x === 10 ? modal : b) as Element;
       provide(h({ id: 'covered', x: 10, owner: a }), h({ id: 'greyed', x: 99, owner: b, meta: { disabled: true } }));
-      expect(computeHandles()).toMatchObject({ count: 2, occludedCount: 1, disabledCount: 1 });
+      expect(computeHandles()).toMatchObject({ returnedCount: 2, occludedCount: 1, disabledCount: 1 });
     });
   });
 
@@ -233,7 +233,7 @@ describe('computeHandles', () => {
 
   it('filters by editor, and reports only the surviving editors', () => {
     provide(h({ id: 'c1', editor: 'chrome' }), h({ id: 's1', editor: 'skin' }));
-    expect(computeHandles({ editor: 'chrome' })).toMatchObject({ count: 1, editors: ['chrome'] });
+    expect(computeHandles({ editor: 'chrome' })).toMatchObject({ returnedCount: 1, totalCount: 1, editors: ['chrome'] });
     expect(computeHandles().editors).toEqual(['chrome', 'skin']);
   });
 

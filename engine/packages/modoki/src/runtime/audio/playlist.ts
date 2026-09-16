@@ -75,9 +75,15 @@ export function randomStartClip(clips: unknown): string | null {
  *  rotation makes a full lap cover every clip before any repeat — seeking from a mid-list position
  *  wraps early, so a handful of clips get played twice as often as the rest. */
 export function buildOrder(refs: readonly string[], mode: PlaylistMode, current: string): string[] {
-  const base = mode === 'shuffle' ? shuffleRefs(refs) : refs.slice();
-  const at = base.indexOf(current);
-  return at > 0 ? base.slice(at).concat(base.slice(0, at)) : base;
+  return rotateTo(mode === 'shuffle' ? shuffleRefs(refs) : refs.slice(), current);
+}
+
+/** Put `current` at the front, keeping the rest in their existing cycle. Returns `order` unchanged
+ *  when `current` is already first or is not in it at all. Shared with the re-derive in `nextClip`
+ *  so "rotate to" has ONE definition — the two callers must agree about what a lap is. */
+function rotateTo(order: string[], current: string): string[] {
+  const at = order.indexOf(current);
+  return at > 0 ? order.slice(at).concat(order.slice(0, at)) : order;
 }
 
 /**
@@ -113,8 +119,63 @@ export function nextClip(
     state.pending = '';
   }
 
-  // The recovery path, before the latch: whatever we were waiting for, the clip is over.
-  if (ended) { state.pending = ''; return advance(state); }
+  // The clip moved out from under the walk (#1281). `order`/`idx` is a CACHE of where we are, and
+  // until now it was re-derived only when the BANK changed — so every other writer of `clip` left
+  // it pointing at the old position and the next advance followed the stale order. Two reachable
+  // ways in, one divergence: the `audio.setClip` action and any debug bed picker, and
+  // `rearmAudioAutoplay`'s re-armed `shuffleStart`, which rolls a fresh opener while this state
+  // survives untouched. Symptom either way is the wrong successor — and when the outside write
+  // happens to pick the clip the walk was ABOUT to play, the same track twice in a row, the one
+  // repeat `shuffleRefs`'s `avoid` exists to prevent.
+  //
+  // Detected rather than announced: the walk already knows what it believes is playing, so it can
+  // notice the disagreement itself. That covers every writer, including ones not written yet — a
+  // `rotatePlaylistTo` seam every caller had to remember would be one `a.clip = …` away from
+  // reopening this. The existing order is ROTATED, never rebuilt: a reshuffle here would discard
+  // the rest of the lap, and a lap is what guarantees every clip plays once before any repeats.
+  //
+  // ⚠️ A clip that is NOT in the bank leaves the walk alone. A source may author a `clip` outside
+  // its own bank (an intro sting, say), and rotating to something the order does not contain would
+  // mean re-deriving on every single frame forever.
+  //
+  // ⚠️ And NOT while a swap is in flight (`pending`), which is the one window where `clip` lagging
+  // behind the walk is normal rather than an outside write: we have just asked for the next clip
+  // and the caller may not have applied it yet. Re-deriving there rotates back to the clip still
+  // playing, clears the latch, and swaps again on the very next frame — the bank-tearing the latch
+  // exists to prevent. The latch clears itself on the remainder climbing back, so a write that
+  // lands during the window is picked up one frame later instead. (Caught by
+  // `does not swap again while the previous swap is still in flight`, which this broke.)
+  //
+  // ⚠️ The one shape that costs: a clip whose WHOLE duration is under `crossfadeSec` is never above
+  // the threshold, so its latch only ever clears on `ended` — a write mid-clip is then adopted at
+  // the next clip boundary rather than at once. Nothing authored hits it (a bed is minutes against
+  // a 4 s fade, and a sub-fade clip cannot cross-fade in the first place), so it is a stated limit
+  // rather than a case to complicate this for.
+  // ⚠️ `ended` clears the latch FIRST. The clip is over, so there is nothing in flight left to
+  // protect — and leaving it set would suppress the check on the one frame that needs it most: the
+  // `rearmAudioAutoplay` path arrives with the handle already ended (`audioDispose()` ends every
+  // live handle before `onRealmSurvived` re-arms), so if the app was backgrounded mid-crossfade the
+  // stale `pending` would send it straight to `advance` and the old order.
+  if (ended) state.pending = '';
+  const adopted = !state.pending
+    && state.order[state.idx] !== current
+    && state.order.includes(current);
+  if (adopted) {
+    state.order = rotateTo(state.order, current);
+    state.idx = 0;
+    // ⚠️ The adopted clip has NOT played yet, so it takes the same in-flight latch one of our own
+    // swaps would: its voice is still winding up. Without this the very next decision in this same
+    // call steps straight past it — `ended` advances, or the threshold fires because the handle
+    // still reports the OLD clip's remainder — and the clip somebody just asked for is never heard.
+    // That is the whole `shuffleStart` re-arm path: `randomStartClip` rolls an opener, the walk
+    // adopts it, and the source would start on its SUCCESSOR instead.
+    state.pending = current;
+  }
+
+  // The recovery path, before the latch: whatever we were waiting for, the clip is over. Unless we
+  // just adopted a clip — then the thing that ended is the clip we were adopted AWAY from, and the
+  // new one is owed its turn.
+  if (ended) return adopted ? null : advance(state);
 
   const fade = Math.max(0, crossfadeSec);
   // ⚠️ The in-flight latch clears on the REMAINING TIME climbing back, never on `current` matching

@@ -301,7 +301,7 @@ never in the producer. The ceilings below are **measured** (bytes/entry × ring 
 
 | Tool | Producer (untouched) | Seam | Boundary default | Measured ceiling |
 |---|---|---|---|---|
-| `get_console_logs` | `dumpConsoleLogs` projecting the shared `runtime/core/consoleRing.ts` (1000 entries in the editor, 512 on a debug device build) — `diagnose` reads it directly | `console-logs` op | last 50 + `count`/`total`/`ringTotal`/`byLevel`, where `byLevel`+`ringTotal` cover the WHOLE ring even under a filter (S3.8) | ~162 B/entry *(stale — see caveat below)* → **40–54k tok** (editor) |
+| `get_console_logs` | `dumpConsoleLogs` projecting the shared `runtime/core/consoleRing.ts` (1000 entries in the editor, 512 on a debug device build) — `diagnose` reads it directly | `console-logs` op | last 50 + `returnedCount`/`totalCount`/`ringTotal`/`byLevel`, where `byLevel`+`ringTotal` cover the WHOLE ring even under a filter (S3.8) | ~162 B/entry *(stale — see caveat below)* → **40–54k tok** (editor) |
 | `watch` (`read`) | `readWatch()` — `WatchTab.tsx`'s `WatchCard` renders `samples` | `watch-read` op | stats-only; `samples:true` opts in | 39.8 B/sample × 512 series × 600–5000 → **3.1M–25.8M tok** |
 | `journal` | `journalEvents()` — cap `journal.ts`'s `MAX_EVENTS` — `JournalTab` reads it | `journal-events` op | last 100 + `byType` | 102–226 B/ev → **257k–582k tok** |
 | `editor_journal` | `readEditorJournal()` — cap `editorJournal.ts`'s `MAX_EVENTS` | `editor-journal` op | last 100 + `byType`; `merged` tails `game` + `timeline` too | 130–253 B/ev → **54k–126k tok** |

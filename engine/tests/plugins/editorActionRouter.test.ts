@@ -319,9 +319,36 @@ describe('/api/scenes', () => {
         { path: '/games/x/assets/foo.mesh.json', type: 'mesh' },
       ] }) as unknown as Manifest,
     });
-    const r = (await get('/api/scenes', ctx)) as { body: { count: number; scenes: Array<{ path: string; guid?: string }> } };
-    expect(r.body.count).toBe(1);
+    const r = (await get('/api/scenes', ctx)) as { body: { returnedCount: number; scenes: Array<{ path: string; guid?: string }> } };
+    expect(r.body.returnedCount).toBe(1);
     expect(r.body.scenes[0]).toMatchObject({ path: '/games/x/assets/scenes/a.json', guid: 'g-a' });
+  });
+
+  /** §2 count vocabulary (#1266), pinned HERE because nothing else can see it.
+   *
+   *  `replyCountVocabulary.test.ts` walks agent-op replies and is what proved the rename landed on
+   *  the journals, the console ring, handles and list_assets. This body is assembled in the Node
+   *  router instead, so that walker never reaches it — and it was still answering a bare `count`
+   *  after every op had been renamed, leaving `modoki_list_assets` and `modoki_list_scenes` naming
+   *  the same thing two different ways. A review of #1266 found it; this is the guard that would
+   *  have.
+   *
+   *  Mutation: put `count:` back in editorBackendRouter's /api/scenes body and this goes red. */
+  it('names its counts returnedCount + totalCount, never a bare `count`', async () => {
+    const ctx = makeCtx({
+      getManifest: () => ({ version: 2, assets: [
+        { path: '/games/x/assets/scenes/a.json', type: 'scene', guid: 'g-a' },
+        { path: '/games/x/assets/scenes/b.json', type: 'scene', guid: 'g-b' },
+        { path: '/games/x/assets/foo.mesh.json', type: 'mesh' },
+      ] }) as unknown as Manifest,
+    });
+    const r = (await get('/api/scenes', ctx)) as { body: Record<string, unknown> };
+    expect(r.body.returnedCount).toBe(2);
+    // Both always — an absent total cannot be told from "this route does not report one", and this
+    // route applies no limit, so the pair agreeing IS the answer.
+    expect(r.body.totalCount).toBe(2);
+    expect(r.body).not.toHaveProperty('count');
+    expect(r.body).not.toHaveProperty('total');
   });
 });
 

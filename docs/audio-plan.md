@@ -253,6 +253,32 @@ trait fields controlled by built-in actions** — and every game gets it for fre
     deliberate); ignored with `playlist: 'off'` or a bank under two entries.
     `randomStartClip` + the `audioSystem` seam: `engine/tests/framework/audioPlaylist.test.ts` and
     `engine/packages/modoki/tests/runtime/audioPlaylistSystem.test.ts`.
+  - ⚠️ **The walk RE-DERIVES when `clip` is written from outside it** (#1281). `order`/`idx` is a
+    cache of where we are, and it used to be rebuilt only when the BANK changed — so every other
+    writer left it pointing at the old position and the next advance followed a stale order. Two
+    ways in, one divergence: the `audio.setClip` action or a debug bed picker writing the trait, and
+    `rearmAudioAutoplay` (the #611 pagehide backstop) re-arming a `shuffleStart` source while its
+    playlist state survives untouched. The symptom is the wrong successor — and when the write picks
+    the clip the walk was ABOUT to play, the same track twice in a row, the one repeat
+    `shuffleRefs`'s `avoid` argument exists to prevent. `nextClip` now compares what it believes is
+    playing against what IS, and rotates. Detected rather than announced, deliberately: a
+    `rotatePlaylistTo` seam every caller had to remember would be one `a.clip = …` away from
+    reopening it, and this covers writers that do not exist yet. Two riders, both load-bearing and
+    both guarded: it ROTATES rather than rebuilds (a reshuffle would discard the rest of the lap,
+    and a lap is what makes every clip play once before any repeats), and it is **inert while a swap
+    is in flight** — that window is the one where `clip` lagging the walk is normal, and re-deriving
+    there clears the latch and tears through the bank a clip per frame.
+    ⚠️ **The adopted clip then takes that same latch, and `ended` clears the latch BEFORE the check** —
+    both learned from review, and between them they are the difference between the re-arm working and
+    only appearing to. `audioDispose()` ends every live handle before `onRealmSurvived` re-arms, so
+    the re-arm frame ALWAYS arrives with the clip ended: without the early clear a backgrounding
+    mid-cross-fade leaves `pending` set and the write is invisible, and without the latch on the
+    adopted clip the same call advances straight past it — so `randomStartClip`'s freshly-rolled
+    opener is never heard and the source starts on its successor. The first version of the re-arm
+    test re-armed over a LIVE voice, which production cannot produce, and passed while that path was
+    broken. Residual, stated: a clip shorter than `crossfadeSec` is never above the threshold, so its
+    latch clears only on `ended` and a mid-clip write is adopted at the next boundary instead of at
+    once. Nothing authored is that short.
   - ⚠️ **TWO triggers, and the second is not optional.** The cross-fade trigger fires BEFORE the
     clip ends — `remainingSec <= crossfadeSec` — because waiting for the end is too late: by then
     there is no live voice left to fade OUT, so there is nothing to cross-fade and the next clip

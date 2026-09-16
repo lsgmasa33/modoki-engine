@@ -271,6 +271,35 @@ describe('PlayerPrefs — schema version protection (#630)', () => {
     expect(PlayerPrefs.get('badJson')).toBe('replaced');
   });
 
+  it('keysIncludingProtected() sees a protected key that keys() hides, and neither invents one (#1276)', async () => {
+    const backend = new InMemoryBackend();
+    await backend.set('mk:g1:fromTheFuture', JSON.stringify({ v: 2, d: 'written by a newer build' }));
+    await PlayerPrefs.init({ namespace: 'g1', backend });
+    PlayerPrefs.set('ordinary', 1);
+
+    // The split this pair exists for: `keys()` answers "what can I read" and is right to omit the
+    // protected key — every caller of it is a READER. A caller that DELETES needs the other answer,
+    // because the key is still on disk and `delete()` removes it perfectly well. Court wiped
+    // `court.session.*` by prefix through `keys()`, so a session written by a newer build survived
+    // an account delete that reported success (#1276).
+    expect(PlayerPrefs.keys()).toEqual(['ordinary']);
+    expect(PlayerPrefs.keysIncludingProtected().sort()).toEqual(['fromTheFuture', 'ordinary']);
+  });
+
+  it('keysIncludingProtected() reports a key ONCE, and drops it when it is deleted (#1276)', async () => {
+    // Two failure modes of a union, both of which would make a prefix sweep misreport: a key in
+    // both maps listed twice (Court counts DISTINCT swept sessions into `court.progress.cleared`),
+    // and a deleted protected key still listed, which would leave the wipe's own confirming
+    // read-back claiming a survivor forever and never able to report success.
+    const backend = new InMemoryBackend();
+    await backend.set('mk:g1:fromTheFuture', JSON.stringify({ v: 2, d: 'x' }));
+    await PlayerPrefs.init({ namespace: 'g1', backend });
+
+    expect(PlayerPrefs.keysIncludingProtected()).toEqual(['fromTheFuture']);
+    PlayerPrefs.delete('fromTheFuture');
+    expect(PlayerPrefs.keysIncludingProtected()).toEqual([]);
+  });
+
   it('isProtected() tells "absent" apart from "present but unreadable" — false, true, false (review finding 2)', async () => {
     const backend = new InMemoryBackend();
     await backend.set('mk:g1:protected', JSON.stringify({ v: 2, d: 'from the future' }));

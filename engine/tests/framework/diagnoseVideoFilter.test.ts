@@ -20,7 +20,7 @@ import { runAgentOp } from '../../app/debug/agentBridge';
 import { setActiveVideoCache, type ActiveVideoCache } from '@modoki/engine/runtime';
 
 type Reply = {
-  video?: { available: boolean; reason?: string; usedBytes?: number; budgetBytes?: number; count?: number; entries?: unknown[] };
+  video?: { available: boolean; reason?: string; usedBytes?: number; budgetBytes?: number; returnedCount?: number; totalCount?: number; entries?: unknown[] };
 };
 const diagnose = (params?: unknown) => runAgentOp('diagnose', params ?? {}) as Promise<Reply>;
 
@@ -49,7 +49,7 @@ describe('no cache wired reports WHY, not an empty index', () => {
     expect(String(r.video?.reason)).toMatch(/NOT "the cache is empty"/);
     // No index fields to mistake for a real (empty) answer.
     expect(r.video?.entries).toBeUndefined();
-    expect(r.video?.count).toBeUndefined();
+    expect(r.video?.returnedCount).toBeUndefined();
   });
 });
 
@@ -65,14 +65,15 @@ describe('a wired cache reports its index', () => {
     expect(r.video?.available).toBe(true);
     expect(r.video?.usedBytes).toBe(3072);
     expect(r.video?.budgetBytes).toBe(8192);
-    expect(r.video?.count).toBe(2);
+    expect(r.video?.returnedCount).toBe(2);
+    expect(r.video?.totalCount).toBe(2);
     expect(r.video?.entries).toHaveLength(2);
   });
 
-  it('an EMPTY wired cache is available:true with count 0 — the case null must not impersonate', async () => {
+  it('an EMPTY wired cache is available:true with returnedCount 0 — the case null must not impersonate', async () => {
     setActiveVideoCache({ entries: () => [], usedBytes: () => 0, budgetBytes: () => 8192 });
     const r = await diagnose({ video: true });
     expect(r.video?.available).toBe(true);
-    expect(r.video?.count).toBe(0);
+    expect(r.video?.returnedCount).toBe(0);
   });
 });

@@ -341,7 +341,7 @@ const DECLS: Record<string, Decl> = {
   },
   modoki_eval_api: {
     kind: 'read', method: 'GET', route: '/api/eval-api', requires: ['editor', 'renderer'],
-    notes: 'Discovery for modoki_eval — lists every op as its generated modoki.<camelCase>(params) method, plus call/ops/api/composite.',
+    notes: 'Discovery for modoki_eval — lists every op as its generated modoki.<camelCase>(params) method, plus call/ops/api/composite/import. NOT Electron-only: the description said "Requires the Electron editor" until #1218, while `requires` here has always been [editor, renderer] and the route is a bare relay.',
   },
 
   // ── editor session + scene/entity ops ──
@@ -827,7 +827,7 @@ const DECLS: Record<string, Decl> = {
     kind: 'asset', method: 'POST', route: '/api/create-folder',
     mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
     minimalArgs: { path: '/assets/probe-folder' },
-    notes: 'The prerequisite for modoki_import_file `destFolder` and modoki_create_asset `path`, neither of which creates its destination. Not recursive; refuses an existing folder (409).',
+    notes: 'The prerequisite for modoki_import_file `destFolder` and modoki_create_asset `path`, neither of which creates its destination. RECURSIVE (mkdir -p): missing parents are created. Refuses an existing folder (409) — the existence check is on the TARGET only, never its parents. It said "not recursive" until #1218; the code never was.',
   },
 
   modoki_capture_gesture: {

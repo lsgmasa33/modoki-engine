@@ -1337,7 +1337,7 @@ export function registerTools(server: McpServer) {
       'recorded; action:clear drops recorded presses without closing the window.',
     {
       action: z.enum(['start', 'read', 'stop', 'clear']).describe('open the window | read presses | close (keeps presses) | drop recorded presses'),
-      max: z.number().optional().describe('(start) Ring capacity — most recent N presses kept (default 40, ceiling 500).'),
+      maxPresses: z.number().optional().describe('(start) Ring capacity — most recent N presses kept, ONE ring for the whole watch (default 40, ceiling 500). Not device_watch\'s `maxSamples`, which caps each series separately.'),
       limit: z.number().optional().describe('(read) Most-recent N presses to return (default 20).'),
       unresolvedOnly: z.boolean().optional().describe("(read) Keep only presses whose resolved.by is 'none' or 'unknown' — presses NOTHING could explain. THE diagnostic filter."),
       precision: z.number().optional().describe('(read) Significant digits for float fields (default 9; 0 = exact).'),
@@ -1347,7 +1347,7 @@ export function registerTools(server: McpServer) {
       // PER-ACTION ALLOWLIST, mirroring the editor twin and device_watch above — a key belonging
       // to a different action is refused by name, never silently dropped.
       const ACCEPTS: Record<string, readonly string[]> = {
-        start: ['max'],
+        start: ['maxPresses'],
         read: ['limit', 'unresolvedOnly', 'precision'],
         stop: [],
         clear: [],
@@ -1927,7 +1927,8 @@ export function registerTools(server: McpServer) {
       'THIS and watch the frame" perf experiment, which previously cost a full rebuild+reinstall ' +
       'per question. DESCENDANTS ARE INCLUDED: a copy of a parent brings its children, each with a ' +
       'FRESH guid (two entities answering to one address would break every read tool). Live only — ' +
-      'a relaunch is the undo. Measure the effect with device_profiler or device_diagnose.',
+      'a relaunch is the undo. CONFIRM the copies with device_get_scene_state, which is where the '
+      + 'new guids come from; device_profiler / device_diagnose measure the EFFECT, not the edit.',
     {
       guid: z.string().optional().describe('Stable guid of the entity to copy. Preferred — an id can be recycled by a scene reload and name a different entity.'),
       id: z.number().optional().describe('Live id of the entity to copy — only for an entity with no guid. Use guid.'),
@@ -1946,7 +1947,9 @@ export function registerTools(server: McpServer) {
       'and the reply names the misses: a partial delete would leave you unable to tell which ' +
       'entities are now gone. DESCENDANTS GO TOO: `deleted` lists the guids you named (`deletedNoGuidIds` ' +
       'for one with no guid) and `alsoDeleted` the descendants taken with them (the first 100, with ' +
-      '`alsoDeletedTotal` when there were more) — the same shape as modoki_delete_entities. Live only — a relaunch restores the scene.',
+      '`alsoDeletedTotal` when there were more) — the same shape as modoki_delete_entities. CONFIRM '
+      + 'with device_get_scene_state, which is also where current guids come from. Live only — a '
+      + 'relaunch restores the scene.',
     {
       guids: z.array(z.string()).optional().describe('Stable guids to delete. Preferred over ids.'),
       guid: z.string().optional().describe('A single stable guid to delete.'),

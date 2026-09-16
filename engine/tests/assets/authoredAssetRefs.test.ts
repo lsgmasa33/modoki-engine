@@ -243,16 +243,21 @@ const provenPairs = new Set(
  *  only when the blank has a defined behaviour the engine implements — not merely "it seems to
  *  work". Keep it short: a wrongly-listed pair silences the guard for that field repo-wide.
  *
- *  `UIElement.fontFamily` (#231): CSS `font-family` INHERITS, so a UI tree gets its typeface
- *  from one authored ancestor and every descendant is legitimately blank — of the 16 committed
- *  instances, 12 are blank and the 4 that are not are `games/wordweave`'s UI roots (`HUD Root`,
- *  `HelpModal`, `DictionaryModal`, `ResultModal`), all pointing at the same font guid. (Court used
- *  to be the one non-blank instance, on its `Intro` root; #803 moved Court's font onto
- *  `UISettings.fontFamily` instead — a different trait — so Court now contributes zero instances
- *  of this field, all blank.) Blank also has a documented fallback chain of its own (`systemFont`,
- *  then the browser default — `runtime/ui/fontFamilyRef.ts`). It became a "proven" pair the
- *  moment a root was first migrated from a family NAME to a GUID; nothing about the blanks
- *  changed. */
+ *  ⚠️ **`UIElement.fontFamily` (#231) was listed here and is now EMPTY — removed by #1280, and the
+ *  removal is the mechanism working, not a regression.** The pair was PROVEN only because
+ *  `games/wordweave` authored a resolvable font GUID on its UI roots; every other instance was
+ *  blank, which is legitimate (CSS `font-family` INHERITS, and blank has its own documented
+ *  fallback chain — `systemFont`, then the browser default, in `runtime/ui/fontFamilyRef.ts`).
+ *  #1280 moved Weaveling's roots onto the scene-wide `UISettings.fontFamily` default, exactly as
+ *  #803 had already moved Court's — so NO scene authors a resolvable value on this field any more,
+ *  the pair stops being proven, the guard stops looking at it, and a pardon for it has no subject.
+ *  That is the `imageSrc` story below, arriving on schedule and caught by the ledger this time
+ *  instead of by hand.
+ *
+ *  ⚠️ **It can come back, and then it must be re-added.** `UIElement.fontFamily` is still the
+ *  engine's per-element OVERRIDE (#803 kept it deliberately), so the first scene to author one
+ *  re-proves the pair — and every legitimately blank instance in the repo reds at once. That red
+ *  is this entry asking to exist again, not a defect in the scene that authored the override. */
 /*  ⚠️ `UIElement.imageSrc` was listed here on 2026-09-09 and REMOVED the same day — do not re-add
  *  it without reading this. It was added to green a real red, but the red had a different cause and
  *  the entry was dead within the hour:
@@ -273,7 +278,7 @@ const provenPairs = new Set(
  *  field-level pardon is the right GRAIN for a field whose blank is its meaning, but the Set had no
  *  staleness check, so `imageSrc` went inert and was found only by hand. As `sanctioned`, a pair
  *  that stops being proven, or stops holding any blank, reddens on its own. */
-const OPTIONAL_BLANK_PAIRS: readonly string[] = ['UIElement.fontFamily'];
+const OPTIONAL_BLANK_PAIRS: readonly string[] = [];
 
 /** Every instance of a proven asset-ref pair whose value is a blank string. */
 const blanks = allInstances.filter(

@@ -131,7 +131,7 @@ const MAX_AWAITING = 16;
 const STALE_NOTE_MS = 1000;
 
 let open = false;
-let max = DEFAULT_MAX;
+let maxPresses = DEFAULT_MAX;
 let seqCounter = 0;
 let dropped = 0;
 const ring: InputPressRecord[] = [];
@@ -310,7 +310,7 @@ function onCancel(e: PointerEvent): void { finish(e, 'cancel'); }
 
 function push(rec: InFlight): void {
   ring.push(rec);
-  while (ring.length > max) { ring.shift(); dropped++; }
+  while (ring.length > maxPresses) { ring.shift(); dropped++; }
 }
 
 /** The wire shape, copied field by field rather than spread-minus-deletes. Explicit is the point:
@@ -353,17 +353,17 @@ export function isUnresolvedPress(p: InputPressRecord): boolean {
  *  the journal's `@contact` gating: no history, only what follows. Re-opening an already-open
  *  window is reported rather than silently treated as a fresh start, because a caller who thinks
  *  it just cleared the ring would misread every older press as belonging to its own probe. */
-export function startInputWatch(opts?: { max?: number }): {
-  ok: true; max: number; alreadyOpen: boolean; recorded: number;
+export function startInputWatch(opts?: { maxPresses?: number }): {
+  ok: true; maxPresses: number; alreadyOpen: boolean; recorded: number;
 } {
   const wasOpen = open;
-  const requested = opts?.max;
+  const requested = opts?.maxPresses;
   if (typeof requested === 'number' && Number.isFinite(requested) && requested > 0) {
-    max = Math.min(Math.floor(requested), MAX_CEIL);
+    maxPresses = Math.min(Math.floor(requested), MAX_CEIL);
   } else if (!wasOpen) {
-    max = DEFAULT_MAX;
+    maxPresses = DEFAULT_MAX;
   }
-  while (ring.length > max) { ring.shift(); dropped++; }
+  while (ring.length > maxPresses) { ring.shift(); dropped++; }
   if (!wasOpen) {
     open = true;
     if (typeof window !== 'undefined') {
@@ -373,7 +373,7 @@ export function startInputWatch(opts?: { max?: number }): {
       window.addEventListener('pointercancel', onCancel, true);
     }
   }
-  return { ok: true, max, alreadyOpen: wasOpen, recorded: ring.length };
+  return { ok: true, maxPresses, alreadyOpen: wasOpen, recorded: ring.length };
 }
 
 /** Close the window and detach every listener — closed is free, not cheap. Recorded presses are
@@ -416,7 +416,7 @@ export function clearInputPresses(): number {
  *  evidence, and omitting it would make a stuck gesture look like no gesture at all. */
 export function readInputPresses(): {
   open: boolean;
-  max: number;
+  maxPresses: number;
   returnedCount: number;
   totalCount: number;
   dropped: number;
@@ -426,7 +426,7 @@ export function readInputPresses(): {
   const presses = [...ring.map(publish), ...held].sort((a, b) => a.seq - b.seq);
   return {
     open,
-    max,
+    maxPresses,
     returnedCount: presses.length,
     totalCount: seqCounter,
     dropped,
@@ -489,5 +489,5 @@ export function __resetInputRecorder(): void {
   ring.length = 0;
   seqCounter = 0;
   dropped = 0;
-  max = DEFAULT_MAX;
+  maxPresses = DEFAULT_MAX;
 }

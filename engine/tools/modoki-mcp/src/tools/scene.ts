@@ -295,7 +295,7 @@ export function registerSceneTools(tool: ToolDef, ctx: ToolContext): void {
       folder: z.string().optional().describe('Filter to assets whose path starts with this prefix, e.g. "/assets/scenes".'),
       name: z.string().optional().describe('Filter to assets whose name or path contains this substring (case-insensitive).'),
       all: z.boolean().optional().describe('Return every asset entry. Large — prefer a filter.'),
-      limit: z.number().int().positive().optional().describe('Cap the returned entries; sets truncated + totalCount. Passing limit alone also switches the response from per-type counts to entries.'),
+      limit: z.number().int().positive().optional().describe('Cap the returned entries; sets `truncated` when it bit (`returnedCount`/`totalCount` are always present). Passing limit alone also switches the response from per-type counts to entries.'),
     },
     async ({ type, folder, name, all, limit }) => {
       try {

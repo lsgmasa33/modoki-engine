@@ -2124,7 +2124,7 @@ entity refs are **GUIDs** (hot-reload-stable). Prefer these over screenshots.
   boot lines are wanted, so size alone cannot deliver the guarantee. 1000 entries in the editor, 512
   on a debug device build (matching the 200+300 it replaced).
 - **Console:** `modoki_get_console_logs` returns the **last 50** plus three numbers that do NOT mean the
-  same thing: `count` (what came back), `total` (what matched `level=`/`since=`), and
+  same thing: `returnedCount` (what came back), `totalCount` (what matched `level=`/`since=`), and
   `ringTotal`+`byLevel` (the WHOLE ring — 1000 entries in the editor, 512 on a debug device build
   since #596/#597 — regardless of the filter). That last part is the
   point — a `level:'warn'` read still tells you whether any errors exist. It used to build the

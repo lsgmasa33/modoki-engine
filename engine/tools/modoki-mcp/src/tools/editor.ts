@@ -8,7 +8,7 @@
 import { z } from 'zod';
 import type { ToolDef } from '../toolDef.js';
 import type { ToolContext } from '../context.js';
-import { DISCARD_UNSAVED_BASE, TIMEOUT_MS_BASE, discardUnsavedParam, flatEntityAlias, foldEntityRef } from '../shapes.js';
+import { DISCARD_UNSAVED_BASE, TIMEOUT_MS_BASE, discardUnsavedParam, displayNameParam, flatEntityAlias, foldEntityRef } from '../shapes.js';
 import {
   CREATE_ENTITY_FIELDS, CREATE_ENTITY_KINDS, LIGHT_KINDS, PRIMITIVE_MESHES, SPRITE_SHAPES, UI_PRESETS, vocabularyProse,
 } from '../../../shared/createEntityVocabulary.js';
@@ -511,7 +511,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     "Set the SceneView viewport mode: '3d' (Three.js) or 'ui' (the 2D/UI overlay). The " +
       "toolbar selector is a native <select> that trusted input can't drive, so use this. " +
       "'ui' mode is REQUIRED to edit Collider2D vertices (with set-collider-edit) and to see " +
-      'their interaction handles (modoki_handles editor=collider2d). Returns editor state.',
+      'their interaction handles (modoki_handles editor=collider2d). Returns editor state; '
+      + 'sceneViewMode in modoki_get_editor_state confirms it.',
     { mode: z.enum(['3d', 'ui']) },
     async ({ mode }) => editorAction('set-scene-view-mode', { mode }),
   );
@@ -602,7 +603,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     'Toggle Collider2D vertex-edit mode (the toolbar "Points" button) for the selected ' +
       "entity. Pair with modoki_set_scene_view_mode 'ui' + a selected entity that has an editable " +
       'collider (polygon/polyline/concave); then modoki_handles editor=collider2d lists its ' +
-      'draggable vertices. Returns editor state.',
+      'draggable vertices. Returns editor state; colliderEditMode in modoki_get_editor_state '
+      + 'confirms it — modoki_handles is the NEXT step, not the read-back.',
     { on: z.boolean().describe('true enters collider vertex-edit mode on the selected entity, false leaves it.') },
     async ({ on }) => editorAction('set-collider-edit', { on }),
   );
@@ -613,9 +615,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'so their interaction handles then appear (modoki_handles editor=particle — kinds ' +
       "'curve-point' / 'gradient-stop'). Pass the asset's served path (e.g. " +
       "'/assets/particles/fire.particle.json'). Returns editor state.",
-    { path: z.string().describe("The asset's served path, e.g. '/assets/particles/fire.particle.json'."),
-      name: z.string().optional().describe('Display label for the panel tab (default: the filename stem).') },
-    async ({ path, name }) => editorAction('open-particle-editor', { path, name }),
+    { path: z.string().describe("The asset's served path, e.g. '/assets/particles/fire.particle.json'.") },
+    async ({ path }) => editorAction('open-particle-editor', { path }),
   );
   tool(
     'modoki_open_sprite_editor',
@@ -626,8 +627,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'a bug (#373). Call modoki_select_sprite_slice next. ' +
       "Pass the texture's served path (e.g. '/assets/textures/sheet.png'). Returns editor state.",
     { path: z.string().describe("The texture's served path, e.g. '/assets/textures/ui.png'."),
-      name: z.string().optional().describe('Display label for the editor (default: the filename stem).') },
-    async ({ path, name }) => editorAction('open-sprite-editor', { path, name }),
+      displayName: displayNameParam() },
+    async ({ path, displayName }) => editorAction('open-sprite-editor', { path, displayName }),
   );
   tool(
     'modoki_select_sprite_slice',
@@ -645,8 +646,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'visually…" button — only for type=ui textures). Its 4 guide knobs then appear ' +
       '(modoki_handles editor=nineslice). Pass the texture\'s served path. Returns editor state.',
     { path: z.string().describe("The texture's served path, e.g. '/assets/textures/ui.png'."),
-      name: z.string().optional().describe('Display label for the editor (default: the filename stem).') },
-    async ({ path, name }) => editorAction('open-nine-slice-editor', { path, name }),
+      displayName: displayNameParam() },
+    async ({ path, displayName }) => editorAction('open-nine-slice-editor', { path, displayName }),
   );
   tool(
     'modoki_open_skin_editor',
@@ -654,10 +655,10 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'double-click or the Texture Inspector "Auto Rig" button. There was previously NO agent ' +
       "route to open this panel at all (#373). Once open, modoki_handles editor=skin lists its " +
       "bone-joint handles in skinMode 'rig' or 'weights' — NOT 'parts' (modoki_set_skin_mode). " +
-      "Pass the rig's served path (e.g. '/assets/characters/hero.rig2d.json'). Returns editor state.",
+      "Pass the rig's served path (e.g. '/assets/characters/hero.rig2d.json'). Returns editor state; editingSkinAsset + openPanels in modoki_get_editor_state confirm it opened.",
     { path: z.string().describe("The rig's served path, e.g. '/assets/characters/hero.rig2d.json'."),
-      name: z.string().optional().describe('Display label for the panel tab (default: the filename stem).') },
-    async ({ path, name }) => editorAction('open-skin-editor', { path, name }),
+      displayName: displayNameParam('Here: the Skin panel header. ⚠️ ALSO used as DATA: "Make Prefab" writes it as the root entity name into the generated .prefab.json, so a throwaway label here persists to disk.') },
+    async ({ path, displayName }) => editorAction('open-skin-editor', { path, displayName }),
   );
   tool(
     'modoki_set_skin_mode',
@@ -665,7 +666,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       "(reposition each part's source mesh — NO bone-joint handles), or 'weights' (paint the " +
       "selected bone's per-vertex influence). modoki_handles editor=skin reports bone-joint " +
       "handles in 'rig' AND 'weights' — only 'parts' hides them. The toolbar buttons carry " +
-      '`data-ui-id="skin.mode.*"` and are chrome-tappable too; this is the direct route. Returns editor state.',
+      '`data-ui-id="skin.mode.*"` and are chrome-tappable too; this is the direct route. Returns '
+      + 'editor state; skinMode in modoki_get_editor_state confirms it.',
     { mode: z.enum(['parts', 'rig', 'weights']) },
     async ({ mode }) => editorAction('set-skin-mode', { mode }),
   );
@@ -673,7 +675,10 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_focus_entity',
     'Frame an entity in the SceneView orbit camera (the F-key / "Focus" action; keyboard focus is modoki_focus). Address it by ' +
       '`guid` (PREFER — stable) or `id`. Fails if the entity does not resolve, or if no SceneView ' +
-      'is mounted to frame it in (so a "framed it" report always means the camera moved). Verify the new pose in modoki_get_editor_state.',
+      'is mounted to frame it in. ⚠️ `framed:true` means the focus request was DELIVERED, not that the '
+      + 'camera moved: an entity with no mesh, no gizmo and no world transform resolves to no focus '
+      + 'target and the viewport returns early, reporting framed anyway. Verify the new pose in '
+      + 'modoki_get_editor_state.',
     {
       id: z.number().optional().describe('Runtime id. Only for an entity with no guid — use guid.'),
       guid: z.string().optional().describe('Stable entity guid (preferred). Not together with id.'),

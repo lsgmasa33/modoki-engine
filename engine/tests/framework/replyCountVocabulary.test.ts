@@ -29,6 +29,32 @@ registerEditorAgentOps();
 
 const RETIRED = new Set(['entityCount']);
 
+/** #1266 retires `count` and `total` as well — but only at the TOP LEVEL of a reply, which is the
+ *  distinction the first pass of this change got wrong and the guard itself caught.
+ *
+ *  A bare top-level `count` is the ambiguity §2 is about: `modoki_journal`, `get_console_logs`,
+ *  `modoki_handles` and `modoki_list_assets` each answered `count` and/or `total`, meaning "rows
+ *  here" on some and "everything that matched" on others — `entityCount`'s collision in a shorter
+ *  word. Those are now `returnedCount`/`totalCount`.
+ *
+ *  A NESTED `count` is qualified by the key above it and carries no such ambiguity: `diagnose`
+ *  answers `refs.count`, `camera.count`, `offScreen.count` and `uiOverflow.count`, and none of them
+ *  can be misread — the parent states the subject, and none is a returned-rows-vs-matched pair, so
+ *  renaming them to `returnedCount` would imply a truncation that cannot happen. `ringTotal` stays
+ *  for the same reason it always did: a third population (the whole ring, filter ignored) that
+ *  neither name covers.
+ *
+ *  ⚠️ Two limits of that reasoning, both known and neither currently live:
+ *  - "qualified by its parent" is WEAKER than it sounds for `watch`'s `series[].count`
+ *    (`app/debug/watch.ts`), which counts samples beside a `samples` array that IS capped by
+ *    `maxSamples`, inside a series list that IS capped by a read-side limit. That one is a genuine
+ *    returned-vs-matched pair wearing a nested name; it is left alone here only because renaming a
+ *    per-series field is a different change from this one, not because the parent excuses it.
+ *  - the top-level check keys on `path === '$'`, so a reply whose ROOT is an array would put its
+ *    elements at `$[0]` and slip past. No agent op returns an array root today, and this line is
+ *    only defensible while that holds. */
+const RETIRED_TOP_LEVEL = new Set(['count', 'total']);
+
 /** Every path in `reply` whose key is a retired count name. */
 function retiredKeys(reply: unknown): string[] {
   const out: string[] = [];
@@ -36,7 +62,7 @@ function retiredKeys(reply: unknown): string[] {
     if (Array.isArray(v)) { v.forEach((el, i) => visit(el, `${path}[${i}]`)); return; }
     if (v && typeof v === 'object') {
       for (const [k, el] of Object.entries(v)) {
-        if (RETIRED.has(k)) out.push(`${path}.${k}`);
+        if (RETIRED.has(k) || (path === '$' && RETIRED_TOP_LEVEL.has(k))) out.push(`${path}.${k}`);
         visit(el, `${path}.${k}`);
       }
     }
@@ -76,6 +102,17 @@ describe('the walker', () => {
     expect(retiredKeys({ a: [{ b: { entityCount: 0 } }] })).toEqual(['$.a[0].b.entityCount']);
     expect(retiredKeys({ returnedCount: 1, totalCount: 2, worldEntityTotal: 3, entityTotal: 1 })).toEqual([]);
   });
+
+  // #1266: the top-level/nested split. Mutation: drop the `path === '$'` clause and the nested
+  // case below is flagged too, which is what took `diagnose`'s four qualified counts red.
+  it('flags a bare top-level count/total, and leaves a nested one alone', () => {
+    expect(retiredKeys({ count: 1 })).toEqual(['$.count']);
+    expect(retiredKeys({ total: 1 })).toEqual(['$.total']);
+    expect(retiredKeys({ refs: { issues: [], count: 0 } })).toEqual([]);
+    expect(retiredKeys({ ringTotal: 9 })).toEqual([]);
+    // …but a retired name is still caught at ANY depth.
+    expect(retiredKeys({ refs: { entityCount: 0 } })).toEqual(['$.refs.entityCount']);
+  });
 });
 
 describe('no reply emits entityCount (#1223 D3)', () => {
@@ -91,10 +128,30 @@ describe('no reply emits entityCount (#1223 D3)', () => {
     ['diagnose', {}],
     ['journal-events', {}],
     ['editor-journal', {}],
+    // #1266 widened the walk to the three ops that spelled `count`/`total`: the journals and the
+    // console ring answer both, `enact-handles` answered a bare `count`, and `diagnose`'s video
+    // cache carried a third.
+    ['console-logs', {}],
+    ['console-logs', { level: 'warn' }],
+    ['enact-handles', {}],
   ] as const)('%s %j', async (op, params) => {
     expect(retiredKeys(await runAgentOp(op, params))).toEqual([]);
   });
 });
+
+// The journals' and the console ring's THREE-number contract (returnedCount / totalCount /
+// ringTotal) is not re-asserted here. `ringBufferSeams.test.ts` and `journalControlOp.test.ts`
+// already pin it on a SEEDED ring, where the three genuinely differ — a check here would read
+// `typeof x === 'number'` on an empty ring, which passes whatever the numbers mean. This file's
+// job for those ops is the walk above: the retired names are gone from their replies.
+
+// `enact-handles`' own counts are NOT asserted here either, for the reason above plus a sharper
+// one: this file registers no handle provider and jsdom exposes no `[data-ui-id]` chrome, so the
+// op answers ZERO handles — a check here would be `0 === 0` against two fields that
+// `handlesDump.ts` sets from the SAME expression, which no mutation can tell apart. The real cover
+// is `tests/electron/handlesDump.test.ts` (seeded providers, 2/2 and 1/1) for the producer, and
+// `tests/tools/handlesReplyShape.test.ts` for the summary that must DROP `returnedCount`. The walk
+// above is this file's job for it: the retired names are gone from the reply.
 
 describe('get_scene_state: returnedCount + totalCount, both always (§2)', () => {
   // The rule's own words: a total that appears only when truncation happened is not recoverable.

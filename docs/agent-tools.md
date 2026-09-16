@@ -123,6 +123,26 @@ tool is still a defect, and so is this one while the editor **is** playing.
   mean a mis-named tool registers fine and then silently fails to appear — the invisible failure
   this seam exists to remove.
 
+### The first sentence says what the tool DOES (#1218)
+
+`docs/mcp-tool-conventions.md` §11 applies here in full: no leading caveat, no question, **no issue
+number**. ⚠️ It binds a game tool *harder* than an engine one, and the reason is the line above about
+`contracts.ts` — an engine tool has a fallback, the generated catalog in `docs/debug-tools-mcp.md`,
+and **a game tool has none**. Its description is the whole of its documentation, and under schema
+deferral the first sentence is often the only part read before the tool is chosen. `(#339)` is the
+least useful thing that sentence can carry.
+
+The rule was unguarded here until #1218 and all five game tools had drifted to an issue-number
+opening, because the #1208 guards take their population from the engine's surface loaders while
+these register at runtime. Keep the provenance — just put it in the second sentence:
+
+```ts
+// NO  — the one sentence an agent reads is spent on history
+description: 'Place a piece from the tray onto a cell — the ONE thing an agent could not do before #339: …'
+// YES — same facts, the first sentence earns its place
+description: 'Place a piece from the tray onto a cell. The ONE thing an agent could not otherwise do: … (#339).'
+```
+
 ### Handler conventions
 
 Return a JSON-serializable answer; it is passed through to the caller **untouched**, so your tool
@@ -195,6 +215,7 @@ What covers it instead:
 | `engine/tests/tools/mcpGameTools.test.ts` (conformance) | The zod rebuild and the op-side validator agree on 12 accept/reject cases — one declaration, two implementations, no shared code |
 | `engine/tests/framework/agentToolRegistry.test.ts` | Name validation, the reserved prefix, the debug gate on **both** list and lookup, change notification |
 | `engine/tests/architecture/gameAgentToolNames.test.ts` | `<gameId>_` namespacing across `games/` + `demos/`, no cross-project collisions |
+| `engine/tests/tools/gameToolFirstSentence.test.ts` | §11's first sentence, over the `registerAgentTool` call sites in `games/` + `demos/`. Shares ONE detector with the engine guard (`tests/tools/firstSentence.ts`) rather than restating the rule. It reads SOURCE, not the registry — so it also pins that the extractor can still parse what the corpus writes, and refuses to guess at a shape it cannot read |
 | `games/court/tests/agentTools.test.ts` | The worked example's behaviour |
 
 ## Writing a handler that runs on a phone

@@ -187,9 +187,28 @@ Rules:
     total then means the list is complete, so the count is always recoverable.
   - `engine/tests/framework/replyCountVocabulary.test.ts` runs the real ops and fails on any
     `entityCount` key.
-  - Still spelled otherwise, and not covered by this rename (#1266): `count`/`total`/`ringTotal` on the
-    journals and console logs, `count` on `handles`, and `modoki_list_assets`, which answers `count`
-    and adds `totalCount` only when its limit truncated — the shape this rule forbids.
+- **Landed in #1266 — the remainder, so the rule now holds everywhere:** the journals and console
+  logs, `handles`, `list_assets` and `list_scenes` all answer `returnedCount`/`totalCount`, and
+  `list_assets` no longer gates its total on truncation. Four things that change are worth knowing
+  before writing the next reply:
+  - **`ringTotal` is a THIRD population and keeps its own name** — the whole ring, filter ignored.
+    The journals and the console ring need all three numbers; neither `returnedCount` nor
+    `totalCount` covers it.
+  - **Both are emitted even where nothing can truncate** (`handles`, `list_scenes`, `diagnose`'s
+    video cache). An absent total cannot be told apart from "this tool does not report one", which
+    is the ambiguity the rule exists to remove.
+  - **`count` and `total` are retired at the TOP LEVEL only.** A bare top-level `count` is the
+    ambiguity; a NESTED one is qualified by the key above it, so `diagnose`'s `refs.count`,
+    `camera.count`, `offScreen.count` and `uiOverflow.count` stay. None is a returned-vs-matched
+    pair, and renaming them would imply a truncation that cannot happen. (`watch`'s `series[].count`
+    is the weak case — genuinely a capped pair wearing a nested name — recorded in the guard.)
+  - ⚠️ **A summary that returns NO rows must DROP `returnedCount`, not rename into it.** `handles`'
+    bare call strips its rows and answers counts; carrying a field defined as "the rows in this
+    reply" made it state a falsehood (`returnedCount: 2000` beside no `handles` key). Precision cuts
+    both ways — the vague old name was merely unhelpful there, the precise one was wrong.
+  - Guarded by `replyCountVocabulary.test.ts` (walks real op replies) plus, for the bodies that
+    walker structurally cannot reach, `editorActionRouter.test.ts` for the Node-router `/api/scenes`
+    and `handlesReplyShape.test.ts` for the shared summary.
 - A field whose meaning depends on the entity's layer/kind must either be renamed per meaning or
   carry the qualifier in the payload (e.g. `onScreen` + `onScreenBasis: 'viewport'|'size-only'`).
 - Space matters: any transform-shaped value states `world` or `local` **in its name or its
@@ -597,7 +616,7 @@ Rules:
     They look like the last unrefused vocabulary on this surface — free-form strings that FILTER a
     read, where an unknown value would yield an empty list and the tool's own description says an
     empty result should "read as a correct negative answer". **Driven live (2026-09-12), and it does
-    not conflate:** `GET /api/enact-handles?editor=zzzzz` answers `count:0` with
+    not conflate:** `GET /api/enact-handles?editor=zzzzz` answers `returnedCount:0` with
     `hint: "no handle matches editor=zzzzz. Live now: editor ∈ {chrome}, kind ∈ {button, span} —
     check the spelling, or drop the filter for counts."` It names the live vocabulary and says to
     check the spelling, which is the recovery information a refusal would have carried. A closed
@@ -1053,11 +1072,23 @@ The description is the tool's contract with the agent — it is read far more of
   proxy catches a tool that points nowhere, not one that points at the wrong read.
 - **The first sentence says what the tool DOES** (#1208). It is what a keyword `ToolSearch` and a
   skim of a loaded schema meet first. A caveat about the reply (`RETURNS {…}`, `NOTE …`), a question
-  (`What references this?`) and an issue number all belong after it. Guarded over both servers.
+  (`What references this?`) and an issue number all belong after it. Guarded over both servers —
+  **and, since #1218, over a GAME's own tools too.** That gap was structural rather than an
+  oversight: the #1208 guards take their population from `loadSurface()`/`loadDeviceSurface()`,
+  while `registerAgentTool` runs at runtime from whichever project is open, so the rule held on the
+  engine surface and nowhere else, and all five game tools had drifted to an issue-number opening.
+  ⚠️ **It matters MORE for a game tool.** An engine tool has a fallback — the generated catalog in
+  `docs/debug-tools-mcp.md` — and a game tool has none, so its description is its entire
+  documentation. `gameToolFirstSentence.test.ts` reads the `registerAgentTool` call sites out of the
+  corpus (booting a project is not available to a unit test), which makes the EXTRACTOR the thing
+  that can lie — so it is tested against its own fixtures, and it fails LOUDLY in both directions a
+  scanner can go quiet: a description shape it cannot parse is recorded as unreadable rather than
+  excused, and an independent count of `registerAgentTool` call sites catches a registration it
+  never saw at all (a call made through a variable yields no row, so nothing else could).
 
 ## Decisions taken (the surface changes these rules implied)
 
-These three needed owner sign-off because each changes the advertised surface. All three are DONE.
+These needed owner sign-off because each changes the advertised surface. All are DONE.
 
 1. **§1 strict everywhere — LANDED.** An unknown key is now an error naming the real params, at the
    single registration point (`registerAll.ts`), so it covers direct calls and every `modoki_batch`
@@ -1092,6 +1123,33 @@ These three needed owner sign-off because each changes the advertised surface. A
    not document the refusal their `device_tap`/`device_drag`/`device_pointer` siblings do. Closing
    it belongs in the shared `resolve-dom-point` op (§9's registration rule), not in a second
    per-route check.
+
+5. **§2 param + count renames — LANDED (#1266, 2026-09-16).** Three breaking changes, all hard: no
+   alias, no deprecation window. §1 strict validation is what makes that safe rather than silent —
+   the old spelling now refuses by name, on direct calls and `modoki_batch` steps alike, so a caller
+   self-corrects in one round trip instead of having its parameter dropped. (#1223's `device_scroll`
+   alias precedent exists to protect names that were already CANONICAL; these were not.)
+   - `name` → **`displayName`** on four `open_*_editor` tools. `name` addresses an ENTITY everywhere
+     else on this surface, so the one place it meant "what to call this asset" was the one a caller
+     gets wrong silently: a string is a string, the call succeeds, and it labels something with an
+     entity name — §1's measured `set_selection {name:'Capsule'}` bug wearing a different hat.
+   - `max` → **`maxPresses`** on `input_watch`, both surfaces. ⚠️ The audit filed this as "one
+     meaning under two names" with `maxSamples`, and **that was wrong**: `maxSamples` caps each
+     (entity,field) series, `max` capped ONE global press ring. Sharing a name would have made it
+     lie. The real defect was the opposite — `watch` names its two axes (`maxSamples` + `maxSeries`)
+     while `input_watch` spelled its one as a bare `max`.
+   - The count vocabulary remainder, above.
+6. **A parameter nothing reads is DROPPED, not renamed (#1266).** `modoki_open_particle_editor` lost
+   its `name` rather than gaining a `displayName`: `editingParticleAsset.name` is read only as the
+   `|| asset.name` arm of two `fileName=` fallbacks, and `requireAssetPath` guarantees a non-empty
+   path, so that arm is unreachable and the value had no observable effect. Renaming it would have
+   advertised a knob that does nothing — CLAUDE.md's "an unwired field is a lie with a tooltip",
+   reached from the schema side. ⚠️ The general lesson for a SHARED wording: `displayName`'s one
+   sentence was false on one of its five tools and incomplete on two more, because the value is
+   consumed as DATA rather than shown on two of them (the Animation editor uses it as a CLIP NAME;
+   the Skin editor's "Make Prefab" writes it as a root entity name into a `.prefab.json`). A
+   constant that satisfies the containment check states its claim N times — check it on every
+   member, not on the one you wrote it for.
 
 The remaining known asymmetries are recorded rather than churned: the device↔editor NAMING
 differences (`device_console_logs` vs `modoki_get_console_logs`, …) are tabulated in

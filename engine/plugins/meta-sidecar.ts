@@ -109,7 +109,14 @@ function localSidecarPath(absPath: string): string {
   return absPath + '.meta.local.json';
 }
 
-/** Content-cache blocks that carry byte-size stats. */
+/** Content-cache blocks that carry byte-size stats.
+ *
+ *  ⚠️ `videoCache` is deliberately NOT one of them, though it carries `bytes` in the same shape.
+ *  A video's byte size is not inspector-only: the manifest bakes it (`vite-asset-scanner.ts` →
+ *  `video.bytes`) because `policy: 'auto'` decides stream-vs-download from it without a network
+ *  round-trip. Peeling it would blank that on every machine but the one that imported the clip,
+ *  silently flipping the runtime's choice on a fresh clone — the exact machine-dependence this
+ *  split exists to remove. Asked and answered in #1279; do not "complete the list". */
 const CACHE_BLOCKS = ['textureCache', 'modelCache', 'fontCache', 'audioCache', 'environmentCache', 'atlasCache'] as const;
 type CacheBlock = (typeof CACHE_BLOCKS)[number];
 /** Machine-local, inspector-only size fields peeled out of EVERY cache block. */
@@ -135,7 +142,22 @@ function localKeysFor(block: CacheBlock): readonly string[] {
  *  the authored fields. The DATA-LOSS half is now closed at the write path — `writeMetaSidecar`
  *  quarantines an unreadable sidecar before overwriting it — so this merge-read stays simple
  *  and total on purpose. A caller that needs the distinction itself calls
- *  {@link classifySidecarOnDisk}, which is exported for exactly that. */
+ *  {@link classifySidecarOnDisk}, which is exported for exactly that.
+ *
+ *  ⚠️ **The local file fills blocks in; it never CREATES one** (#1279). For audio and environments,
+ *  a cache block's mere existence is what the build reads as "this asset has been converted" — it
+ *  ships the converted variant when the block is there and the source verbatim when it is not
+ *  (`vite-asset-scanner.ts`: `if (!hasCache) { shipSource(); continue; }`), and the same test bakes
+ *  the manifest's texture and environment blocks. (Textures and models convert unconditionally and
+ *  are then overwritten from the build-time conversion; fonts gate on the `font` settings block.)
+ *  Merging stats into a block the committed
+ *  sidecar does not have therefore made a GITIGNORED file decide what a build SHIPS: a
+ *  `{"audioCache":{"bytes":1236743}}` left behind on the machine that once imported the clip
+ *  converted, while a fresh clone or CI shipped the source — same commit, different bytes, nothing
+ *  reporting it. So the committed sidecar alone decides WHICH blocks exist, and the local file only
+ *  supplies this host's values inside them. A local block with no committed counterpart is inert
+ *  (a stale leftover from a sidecar that was since rewritten without it); the next write through
+ *  `writeMetaSidecar` clears it. */
 export function readMetaSidecar(absPath: string): Record<string, unknown> {
   const sidecar = sidecarPath(absPath);
   if (!fs.existsSync(sidecar)) return {};
@@ -148,8 +170,9 @@ export function readMetaSidecar(absPath: string): Record<string, unknown> {
       for (const block of CACHE_BLOCKS) {
         const localBlock = local[block];
         if (!localBlock || typeof localBlock !== 'object') continue;
-        const target = (meta[block] ??= {}) as Record<string, unknown>;
-        for (const k of localKeysFor(block)) if (k in localBlock) target[k] = localBlock[k];
+        const target = meta[block];
+        if (!target || typeof target !== 'object') continue; // no committed block → nothing to fill in (#1279)
+        for (const k of localKeysFor(block)) if (k in localBlock) (target as Record<string, unknown>)[k] = localBlock[k];
       }
     } catch { /* unreadable local stats → whatever the committed sidecar has stands */ }
   }
@@ -369,6 +392,14 @@ export function writeMetaSidecar(absPath: string, meta: Record<string, unknown>)
         delete b[k];
       }
     }
+    // A block left holding NOTHING once its stats are peeled is not a conversion record — and
+    // committing `"audioCache": {}` would tell every machine and CI "already converted" exactly
+    // as a real block does (#1279's truthiness test, now in the committed half rather than the
+    // gitignored one). No reimport handler can produce this — each writes a `hash`, or
+    // `processedPath`/`lodPaths` for models — so it only arises from a wholesale external write
+    // (`/api/write-meta`, `modoki_write_asset_meta`) that carried stats and nothing else. Drop
+    // the local half with it: with no committed block to merge into, those bytes are unreadable.
+    if (Object.keys(b).length === 0) { delete committed[block]; delete local[block]; }
   }
   writeJsonAtomic(sidecarPath(absPath), committed);
   const localPath = localSidecarPath(absPath);
