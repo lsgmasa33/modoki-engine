@@ -542,8 +542,25 @@ wrong twice over.** Re-run at the stated scope, `work-qa`'s tree gives 125 consu
 a tree difference either: both files that state one (`vendorPluginsIntegration`,
 `cliNativeBuildHeals`) carry it at *both* shas and neither was touched between them.
 
+⚠️ **Re-run it with BOTH the root and the pattern below, or you will read drift that is not there.**
+Every timeout in this set is written with a numeric separator — `130_000`, `30_000` ×3, `60_000` —
+so the obvious `\}, *[0-9]{4,}\)` matches **none of them**: it consumes `60`, hits the `_`, and dies
+two digits short. `work-qa` reported 1 with that pattern where the honest answer for it is 0, and a
+reader re-deriving the figure that way sees more corpus walks riding the default than there are.
+
+```
+grep -rl --include='*.ts' -E 'repoCorpus|repoFiles\(' engine/tests games demos   # 125
+  | xargs grep -lE '\}, *[0-9_]{4,}\)'                                          # 2
+```
+
+⚠️ **Note which way that error points.** A blinded timeout-counter inflates *"how many corpus walks
+ride the unit-test default"* — the very claim the count is offered as evidence for. **A counting
+instrument that errs toward your thesis produces no friction at any step**, which is why two clones
+each explained the gap twice without either one re-running the other's command.
+
 The trap generalises, and it is the reason this paragraph exists: **two counts taken at different
-scopes on the same tree diverge exactly like two counts taken on different trees** — so labelling
+scopes — or with different patterns — on the same tree diverge exactly like two counts taken on
+different trees** — so labelling
 the figure with a sha would have made the wrong explanation look confirmed. *"It's a tree
 difference"* is the plausible reading that stops you looking for the real one. The ratio does drift
 upward as corpus tests are added, which is the argument #1290 makes; it just did not drift here. Repo size and machine contention move
