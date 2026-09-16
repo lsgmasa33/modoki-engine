@@ -61,6 +61,17 @@ export const AudioSource = trait({
   // ⚠️ A playlist source must NOT `loop`: a looping clip never runs out, so nothing ever triggers
   // the advance and the bank's first entry plays forever. `audioSystem` warns once if both are set.
   playlist: 'off' as 'off' | 'sequential' | 'shuffle',
+  // Start on a RANDOM bank entry instead of `clip`. Without it a shuffled playlist still opens on
+  // the authored clip every launch, so the first thing a player hears is the same every session
+  // while everything after it varies — which reads as "the music always starts with that one".
+  // Off by default: `clip` is also what a non-playlist source plays, and a game may well want a
+  // specific opener. Ignored unless `playlist` is on and the bank holds at least two entries.
+  //
+  // ⚠️ It picks once per autoplay ARMING — not on every advance, which is what `playlist: 'shuffle'`
+  // already does for the rest of the walk. "Arming" is wider than "app start": a Stop→Play in the
+  // editor re-rolls it, and so does `rearmAudioAutoplay` (the #611 pagehide backstop). ⚠️ That re-roll
+  // does NOT rebuild the walk order, so the advance after it follows the OLD order — #1281.
+  shuffleStart: false as boolean,
   // Runtime playback state (not serialized) — reflects whether the source is
   // currently sounding, for the Inspector + debug tooling.
   playing: false as boolean,

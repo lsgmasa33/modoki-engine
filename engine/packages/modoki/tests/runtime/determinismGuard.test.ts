@@ -82,10 +82,14 @@ const WALLCLOCK_LEDGER = [
 const RANDOM_LEDGER = [
   {
     item: 'audio/playlist.ts::Math.random',
-    reason: 'The music-playlist shuffle. Cosmetic by construction: a playlist order reaches no '
-      + 'game state, no journal event and no replay. Routing it through the seeded RNG would be '
-      + 'actively WRONG — it would consume the stream gameplay draws from, so which track plays '
-      + 'would change which level is generated.',
+    count: 2,
+    reason: 'The music-playlist shuffle, and (#921) `randomStartClip`, which picks the bed a '
+      + '`shuffleStart` source OPENS on. Both are cosmetic by construction: a playlist order and '
+      + 'its opening entry reach no game state, no journal event and no replay. The SECOND '
+      + 'occurrence is safe for the same reason as the first and needs the same exemption — '
+      + 'routing either through the seeded RNG would be actively WRONG, because it would consume '
+      + 'the stream gameplay draws from, so which track plays would change which level is '
+      + 'generated.',
   },
 ] as const;
 

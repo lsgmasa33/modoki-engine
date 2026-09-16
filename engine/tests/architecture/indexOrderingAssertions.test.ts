@@ -39,7 +39,6 @@ import { declarationOf, findNodes, lineOf, parseSource, unwrapValue } from '@mod
 import { readScannedSource } from '@modoki/engine/testing';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
-import { hasInternalGames } from '../helpers/repoLayout';
 
 const INDEX_CALLS = new Set(['indexOf', 'lastIndexOf', 'findIndex', 'findLastIndex', 'search']);
 const LESS = new Set(['toBeLessThan', 'toBeLessThanOrEqual']);
@@ -178,11 +177,15 @@ const offenderLines = (code: string): number[] => scanOrderings(code, 'fixture.t
  * Files #1179 (work-ai2) is rewriting on an unpushed branch. #1181 does not edit them, so the two
  * branches do not conflict; whichever lands second converts what is left and deletes its row.
  * Counts are exact — the ledger reports a row that over-blesses.
+ *
+ * ⚠️ `games/court/tests/cellMapDiscipline.test.ts` was the third row here. #1240 P3 replaced that
+ * file's `indexOf` ordering with node positions inside `layoutBoard`'s body, so the two occurrences
+ * this blessed are gone and the row went with them — which is the rule above working, not a
+ * relaxation.
  */
 const IN_FLIGHT_1179 = [
   { item: 'engine/tests/electron/userDataDir.test.ts', count: 2 },
   { item: 'engine/tests/architecture/earlyConsoleShim.test.ts', count: 4 },
-  ...(hasInternalGames() ? [{ item: 'games/court/tests/cellMapDiscipline.test.ts', count: 2 }] : []),
 ].map((r) => ({ ...r, reason: '#1179 is rewriting this file on work-ai2; convert with found()/expectInOrder once it lands' }));
 
 describe('indexOrderingAssertions detector', () => {

@@ -53,6 +53,22 @@ export function shuffleRefs(refs: readonly string[], avoid?: string): string[] {
   return out;
 }
 
+/** The bank entry a `shuffleStart` source opens on, or `null` when the bank cannot offer a choice
+ *  (fewer than two entries — the same floor `nextClip` uses, since one clip is not a playlist).
+ *
+ *  Separate from `buildOrder` because it answers a different question at a different time: this one
+ *  fires ONCE, when autoplay starts the source, and the walk order is then rotated to whatever it
+ *  returned — so the first lap still covers every clip exactly once.
+ *
+ *  ⚠️ `Math.random` for the reason `shuffleRefs` documents: which track opens reaches no game state,
+ *  and drawing from the seeded RNG would consume the stream gameplay draws from, so the bed that
+ *  played would change which level is generated. */
+export function randomStartClip(clips: unknown): string | null {
+  const refs = parseClipBank(clips).map((c) => c.ref);
+  if (refs.length < 2) return null;
+  return refs[Math.floor(Math.random() * refs.length)] ?? null;
+}
+
 /** Build the walk order for a bank, rotated so `current` is at the front.
  *
  *  ROTATED rather than sought-to: both keep a hot reload from restarting the music, but only

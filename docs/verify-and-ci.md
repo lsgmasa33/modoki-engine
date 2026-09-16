@@ -1825,6 +1825,78 @@ helpers plus `precedingStatements`, `readsOf` and `declarationOf`. What recurred
     buildSig`, because a property NAME matched. And a depth budget that returns "clean" when exhausted
     fails open. Fail loudly instead.
 
+**P3 landed** the ~43 sites in 14 GAME test files — Court (11), sling, forest-camp and wordweave (3) —
+that took a code unit out of a game's `runtime/systems.ts` by text shape. It added no `sourceAst`
+helper: each file's reader is a named function over P1's. Populations were measured old against new
+for every member, and **most were identical, which is the point** — these guards were correct on
+today's tree and blind to the next edit. Three were not identical, and the deltas say what the text
+could not see:
+
+- **A scan can enumerate NOTHING and still look busy.** `worldSwap`'s `__testing` partition has three
+  member scans, all keyed on a two-space indent. The INLINE-ARROW arm — the one its own comment calls
+  "the one shape this partition could not see" — matched 0 members where there are 85; every one of
+  them was in no population at all, under a rule whose claim is that it is TOTAL. The verdict does not
+  move (none takes a world first), so nothing but the count could have reported this.
+- **A body-by-name slice over-reads, and how far is not visible at the call site.** `winSequence` cut
+  to the next `'\nfunction '`: `lockedRefusal`'s body is 316 characters and it read 1,235;
+  `commitUndo`'s is 1,873 and it read 4,848. wordweave's 14 `update*Visuals` passes are 61,015
+  characters together and the slices returned 151,714. Every one of those checks asks whether a body
+  MENTIONS something, so the answer was partly a neighbour's.
+- **A `[^}]*` body is a fail-OPEN miss.** wordweave's backgroundColor guard read a `patchUI` body with
+  `\{([^}]*)\}`, which ends at the first `}` — so a call nesting an object before its
+  `backgroundColor` read as not pushing one. 36 sites found against 37 (`CoinShortfallBuy`).
+
+What else recurred:
+
+- **`function name(` cannot see a GENERIC signature, and a parameter's TEXT cannot see an optional
+  one.** Court's `systems.ts` has three generic declarations (`nestEntryMap`, `withDeadline`,
+  `trackedCloudSync`) that were in no population, and `saveSession(world?: World)` read as world-free
+  because `world?: World` fails `startsWith('world: World')`.
+- **A slice to EOF is a window over the whole rest of the file, and two of these were.**
+  `cellMapDiscipline` anchored at `layoutBoard` and ran to the end; `sweepGate` sliced its skip banner
+  the same way, and the file declares a THIRD banner below it that also writes to stderr and calls no
+  `console.*`. Narrowing the second to its `if` statement was NOT enough on its own: mutation-checked,
+  aiming the selector at the other banner left both assertions green, because the two blocks are
+  indistinguishable by what they assert. It now pins which banner it read.
+- **Fixture-testing a reader usually means SPLITTING it from the file it reads.** Half of these readers
+  took a path, so their hazards could not be staged: `palette`'s mirror reader, `layoutInputSignature`'s
+  runtime-write reader and the three `configFields` span readers all became `(source, label)` functions
+  with a thin file wrapper, and the fixture calls the reader rather than a copy of it.
+- **A fixture expectation is a claim too.** Three of these were wrong on the first run — a nested
+  literal's HOLDER is a field of the interface (its inner key is not), a top-level `nested: {…}` key IS
+  a written field, and `objectLiteralKeys` spells a spread `'...'`, which the hand-rolled reader had
+  skipped silently. Each was a case the new reader answered correctly and the fixture had guessed at.
+- **The migration's OWN review found the one regression, and it was a node reader that asked for MORE
+  than the text did.** The bare-entity-id BAN in `worldSwap` went from `/^let (\w*RootId) = /gm` — a
+  name — to a name PLUS a `number` annotation or a numeric-literal initializer. Three of its four
+  spellings went silent: `= -1` (a `PrefixUnaryExpression`, not a numeric literal), `= NONE`, and
+  `= boardRoot.id()`, which is the shape the ban exists to forbid. Proven both ways: with that
+  declaration inserted into `systems.ts`, the migrated file was 22/22 green while the pre-migration
+  guard was RED. **A node predicate is not automatically wider than the text it replaces — every
+  conjunct you add to "what the node must look like" is reach you are giving up**, and the fixture
+  will not tell you, because a fixture written alongside the new reader exercises the spellings that
+  still work. The same shape, smaller: `p0.type?.getText() === 'World'` refuses `World | null`, which
+  `startsWith('world: World')` accepted.
+- **A partition that enumerates by SHAPE has to enumerate every shape.** The `__testing` seam rule
+  calls itself total; 27 of that literal's 321 properties are METHOD syntax (`name(world, dt) { … }`),
+  which neither the three `^ {2}` regexes nor the first node cut put in any population. Asking "is
+  this a `PropertyAssignment` whose initializer is an arrow" is a question about spelling, and a
+  partition's members do not owe you one spelling. Related, and empty today: a reader enumerating
+  only `function` declarations cannot see a member naming a `const f = (world: World) => …`.
+- **A migration can strand an exemption row in ANOTHER file.** `cellMapDiscipline`'s two `indexOf`
+  ordering comparisons were on `indexOrderingAssertions`' in-flight ledger (#1181). Converting them to
+  node positions left that row blessing occurrences that no longer exist, and the ledger's
+  over-blessing check caught it in `verify` — which is that rule working, and worth knowing before the
+  next phase moves a file another guard counts.
+- **Three smaller ones, all fail-closed, all from the same cause — a node reader answers a slightly
+  different question than the text did, and the difference is invisible until the input changes.**
+  Excising a literal by its own span left `cfg`/`fields`/the trait `name` in the identifier corpus (a
+  config field spelled `name` would have counted as read by its own declaration); `objectLiteralKeys`
+  spells a spread `'...'`, which a guard checking keys against scene entities would have reported as
+  "no entity named '...' is authored"; and `findNodes(…, isStringLiteralLike)` descends INTO a
+  template's `${…}`, so `` `${n === 1 ? 'minute' : 'minutes'}` `` contributes two arms the function
+  cannot return alone. Read what the helper returns for the shapes your subject does NOT have yet.
+
 
 Progress: **seventeen guards are on the ledger** — `determinismGuard`, `docCitations` and
 `importSettingSelectsSpliced` (Phase 1); `assetJsonGuard`, `handleProviderOwner`,

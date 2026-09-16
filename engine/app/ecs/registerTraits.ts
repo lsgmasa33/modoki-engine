@@ -748,6 +748,7 @@ export function registerAllTraits() {
       autoplay: { type: 'boolean', tooltip: 'Play automatically when the game starts.' },
       crossfadeSec: { type: 'number', min: 0, step: 0.1, tooltip: 'Crossfade duration (s) when the clip changes while playing. 0 = hard cut. With a playlist this ALSO sets how early the next clip starts, so 0 means the swap only happens once the current clip has ended.' },
       playlist: { type: 'enum', options: ['off', 'sequential', 'shuffle'], tooltip: 'Walk the clip bank instead of playing only Clip. The next clip starts crossfadeSec before this one ends (or right after it ends, if that window was missed). ⚠️ Leave Loop OFF — a looping clip never ends, so a playlist can never advance.' },
+      shuffleStart: { type: 'boolean', tooltip: 'Open on a random bank entry instead of Clip, once, when autoplay starts the source. Without it a shuffled playlist still begins with the same track every session. Needs a playlist and at least two banked clips.' },
       playOnCue: { type: 'string', tooltip: 'Named cue that fires this as a one-shot (raised via cueSound). Empty = none.' },
       spatial: { type: 'boolean', tooltip: '3D positional audio — attenuates by distance from the AudioListener.' },
       refDistance: { type: 'number', min: 0, step: 0.5, section: 'Spatial', showWhen: { spatial: ['true'] }, tooltip: 'Distance at which volume is full.' },

@@ -146,3 +146,51 @@ describe('a clip that ENDS advances the playlist — the recovery path', () => {
     expect(e.get(AudioSource)!.playing).toBe(false);
   });
 });
+
+describe('shuffleStart — the opening clip (#921)', () => {
+  /** The seam, not the picker: `engine/tests/framework/audioPlaylist.test.ts` owns whether
+   *  `randomStartClip` varies. What this covers is whether `audioSystem` CALLS it, on the right
+   *  frame, and writes the answer onto the trait — the wiring that would otherwise be the one line
+   *  nothing fails for (the #1069 class). */
+  it('opens on a bank entry other than the authored clip when it rolls one', () => {
+    // Forced rather than sampled: Math.random is the only non-determinism, so pinning it makes the
+    // assertion exact instead of "probably different". 0.99 * 4 = index 3.
+    vi.spyOn(Math, 'random').mockReturnValue(0.99);
+    const e = world!.spawn(AudioSource({
+      clip: refs[0], bus: 'music', clips: bank, playlist: 'shuffle', shuffleStart: true, autoplay: true,
+    }));
+    audioSystem(world!);
+    expect(e.get(AudioSource)!.clip).toBe(refs[3]);
+  });
+
+  it('leaves the authored clip alone without the flag — the control', () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.99);
+    const e = world!.spawn(AudioSource({
+      clip: refs[0], bus: 'music', clips: bank, playlist: 'shuffle', autoplay: true,
+    }));
+    audioSystem(world!);
+    expect(e.get(AudioSource)!.clip).toBe(refs[0]);
+  });
+
+  it('needs a playlist: a bank used as a lookup table still opens on its authored clip', () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.99);
+    const e = world!.spawn(AudioSource({
+      clip: refs[0], bus: 'music', clips: bank, playlist: 'off', shuffleStart: true, autoplay: true,
+    }));
+    audioSystem(world!);
+    expect(e.get(AudioSource)!.clip).toBe(refs[0]);
+  });
+
+  it('picks ONCE, not on every frame', () => {
+    // The failure this guards against is a re-roll each frame, which would restart the music
+    // constantly. The mock moves after the first frame; the clip must not follow it.
+    const rolls = [0.99, 0.01, 0.01, 0.01, 0.01];
+    let i = 0;
+    vi.spyOn(Math, 'random').mockImplementation(() => rolls[Math.min(i++, rolls.length - 1)]);
+    const e = world!.spawn(AudioSource({
+      clip: refs[0], bus: 'music', clips: bank, playlist: 'shuffle', shuffleStart: true, autoplay: true,
+    }));
+    for (let f = 0; f < 5; f++) audioSystem(world!);
+    expect(e.get(AudioSource)!.clip).toBe(refs[3]);
+  });
+});

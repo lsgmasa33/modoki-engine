@@ -11,7 +11,7 @@
  */
 
 import { describe, expect, it, beforeEach } from 'vitest';
-import { nextClip, buildOrder, shuffleRefs, type PlaylistState } from '../../packages/modoki/src/runtime/audio/playlist';
+import { nextClip, buildOrder, shuffleRefs, randomStartClip, type PlaylistState } from '../../packages/modoki/src/runtime/audio/playlist';
 import { stringifyClipBank } from '../../packages/modoki/src/runtime/audio/clipBank';
 
 const REFS = Array.from({ length: 12 }, (_, i) => `guid-${i}`);
@@ -154,5 +154,35 @@ describe('shuffleRefs', () => {
 
   it('keeps `avoid` off the front', () => {
     for (let i = 0; i < 200; i++) expect(shuffleRefs(REFS, REFS[3])[0]).not.toBe(REFS[3]);
+  });
+});
+
+describe('randomStartClip — which clip a shuffleStart source OPENS on', () => {
+  it('answers with a bank member, every time', () => {
+    const inBank = new Set(REFS);
+    for (let i = 0; i < 200; i++) expect(inBank.has(randomStartClip(BANK)!)).toBe(true);
+  });
+
+  it('actually varies — the whole point, and the assertion a constant would pass without', () => {
+    // A `return refs[0]` would satisfy "is a bank member" forever. 200 draws over 12 refs miss a
+    // given ref with probability (11/12)^200 ≈ 3e-8, so "more than one distinct answer" is not flaky.
+    const seen = new Set(Array.from({ length: 200 }, () => randomStartClip(BANK)));
+    expect(seen.size).toBeGreaterThan(1);
+  });
+
+  it('declines a bank that cannot offer a choice — the same floor nextClip uses', () => {
+    // One clip is not a playlist, so there is nothing to pick between and the authored clip stands.
+    // ⚠️ This arm is the one that pins the FLOOR: delete `refs.length < 2` and it goes red.
+    expect(randomStartClip(stringifyClipBank([{ key: 't', ref: REFS[0] }]))).toBeNull();
+  });
+
+  it('declines an empty or malformed bank without throwing', () => {
+    // ⚠️ NOT a second test of the floor — close-out review caught that: with the floor deleted these
+    // still answer `null` (`refs[NaN] ?? null`), so they can never fail for that reason. What they do
+    // pin is that a bank the parser cannot read is a quiet `null` rather than a throw out of the
+    // autoplay branch, which would take the whole frame's audio reconcile with it.
+    expect(randomStartClip('')).toBeNull();
+    expect(randomStartClip('{not json')).toBeNull();
+    expect(randomStartClip(undefined)).toBeNull();
   });
 });

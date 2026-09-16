@@ -244,6 +244,15 @@ trait fields controlled by built-in actions** — and every game gets it for fre
   source plays the ONE guid in `clip`, so a twelve-track bank shipped twelve tracks and played
   the first, and every game wanting background music wrote the same loop (games/court did,
   for half a day, before this replaced it).
+  - **`AudioSource.shuffleStart` picks the OPENING clip** (#921, owner 2026-09-16: *"start music
+    should be randomized"*). ⚠️ **`'shuffle'` alone only decides what comes NEXT** — autoplay starts
+    the source on the authored `clip`, so every launch opened with the same track and only the order
+    after it varied, which reads as "the music always starts with that one". With the flag, autoplay
+    picks a random bank entry ONCE and the walk order rotates to it, so the first lap still covers
+    every clip. Off by default (`clip` is also what a non-playlist source plays, and an opener can be
+    deliberate); ignored with `playlist: 'off'` or a bank under two entries.
+    `randomStartClip` + the `audioSystem` seam: `engine/tests/framework/audioPlaylist.test.ts` and
+    `engine/packages/modoki/tests/runtime/audioPlaylistSystem.test.ts`.
   - ⚠️ **TWO triggers, and the second is not optional.** The cross-fade trigger fires BEFORE the
     clip ends — `remainingSec <= crossfadeSec` — because waiting for the end is too late: by then
     there is no live voice left to fade OUT, so there is nothing to cross-fade and the next clip

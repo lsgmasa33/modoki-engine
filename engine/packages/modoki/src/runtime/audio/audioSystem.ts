@@ -34,7 +34,7 @@ import {
   AudioSettings, AUDIO_SETTINGS_DEFAULT_LIMIT, AUDIO_SETTINGS_DEFAULT_STEAL_FADE,
 } from '../traits/AudioSettings';
 import { AudioListener } from '../traits/AudioListener';
-import { nextClip, type PlaylistState } from './playlist';
+import { nextClip, randomStartClip, type PlaylistState } from './playlist';
 import { getPlayState } from '../core/playState';
 import { isTimelinePreviewActive } from '../core/timelinePreview';
 import { onWorldSwap } from '../core/ecs/world';
@@ -367,6 +367,14 @@ export function audioSystem(world: World): void {
     if (a.autoplay && !state.autoplayed.has(key)) {
       state.autoplayed.add(key);
       a.playing = true;
+      // `shuffleStart`: open on a random bank entry rather than the authored `clip`. Here rather
+      // than in the playlist block below because that one only ever answers "what comes NEXT" —
+      // the opening clip is the one the source starts with, and by the time the playlist has a
+      // state the first track is already sounding.
+      if (a.shuffleStart && a.playlist !== 'off') {
+        const start = randomStartClip(a.clips);
+        if (start) a.clip = start;
+      }
     }
 
     let src = state.sources.get(entity);

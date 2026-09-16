@@ -263,3 +263,7 @@ engine/vite.config*.cjs
 
 # per-clone opencode config (pins THIS clone's backend port)
 opencode.json
+
+# #921 Phase 1: CC0 audio candidates staged for the owner to listen to. Not committed, because
+# rejected clips must not land in history. Approved clips move to runtime/assets/audio/ in Phase 2.
+games/wordweave/audio-candidates/
