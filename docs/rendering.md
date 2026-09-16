@@ -3564,6 +3564,73 @@ a filter — see the NPR section below.
 - **FXAA runs pre-tonemap**, matching what NPR did historically. FXAA's luma heuristics assume
   gamma space, so this is a known, pre-existing compromise.
 
+### Disposal: a rebuild must free what three's OWN node `dispose()` misses (#1269)
+
+Every structural change (stage set, MRT layout, SS scale, camera object) disposes the whole
+`PostFXStack` and builds a new one, so anything a stage leaves allocated leaks **once per switch**.
+`RenderPipeline.dispose()` does not recurse into the node graph, which is why each stage handle has
+its own `dispose` (bloom's pyramid, DOF's targets, GTAO's target, the `rtt()` wrappers). That was
+not enough, because several three nodes' own `dispose()` miss things they allocate.
+
+**Every stage frees its node through `disposeNodeOwned` (`postfx/nodeOwnedResources.ts`) — one
+place, not a per-stage copy.** It calls the node's own `dispose()`, then walks the node's own
+properties for render targets (arrays too, for bloom's two mip pyramids) by three's `isRenderTarget`
+flag rather than by private field names, freeing each target's textures and depth texture, and
+finally the `_quadMesh` material an `RTTNode` never frees. The three gaps it closes:
+
+| Gap | Why three leaves it | Where it bites |
+|---|---|---|
+| A target's **textures** | freed from the target's `dispose` event only if it was ever rendered INTO — `Textures.updateRenderTarget` is what registers that listener. A target only ever **bound** as a sampled texture (which allocates the GPU texture) keeps it | every node built by a compile whose stack then never drew — reachable: `Scene3D` returns before `render()` on the precompile and live-compile paths, and disposes on tier demotion, camera swap, unmount and GPU-loss recovery |
+| `RTTNode`'s **quad material** | `RTTNode` declares no `dispose()` at all, so the inherited one only fires an event. (`RenderPipeline` frees its own quad material; `RTTNode` does not) | one compiled pipeline per `rtt()` wrapper per rebuild — DOF's input and the SS>1 NPR composite |
+| Resources made in a **constructor or `setup()`** | `GTAONode`'s 5×5 noise `DataTexture`; `DepthOfFieldNode`'s `GaussianBlurNode`, minted fresh on **every** build (once per render context — the precompile and the draw each make one) and orphaned by the next | `disposeGtaoNode`; `trackDofNode`, which wraps `setup()` to record every blur node and is called right after `dof()` |
+
+Three related rules the same file and class own:
+
+- **`ownedTextureInput`** resolves a stage input that is not already a texture node through an
+  `rtt()` the STACK owns — `dof()`'s own `convertToTexture` mints the identical RTT and keeps no
+  handle on it, and AO sits straight before DOF ending in a `mul`. ⚠️ It is deliberately **narrower
+  than three's rule**, which also passes a `SampleNode` through: this helper feeds the FXAA stage
+  too, whose `wgslFn` binds a real `texture_2d<f32>` + sampler, and a SampleNode is a vec4-valued
+  expression, not a texture binding. No stage outputs one today.
+- **The constructor frees what it already allocated if anything throws** — the scene pass included,
+  since `pass()` runs first and `ensureLineColorOnMaterials()` is a known TSL-build throw site. A
+  constructor that never returns leaves the caller no instance to dispose, and `Scene3D` builds
+  inside the frame callback, which `frameDriver` retries next frame — so it repeats per episode.
+- **`dispose()` frees every stage even if one disposer throws**, rethrowing the first error
+  afterwards; a skipped tail is a leaked mip pyramid, and the error still surfaces.
+
+⚠️ **A DOF node built AFTER its disposer ran is not covered**, and freeing it there was tried and
+removed: at that instant its targets have never been rendered into, so three's `Textures` holds no
+entry and every dispose is a guarded no-op — it would leak again the moment the node drew. No path
+reaches it today (`compileStagesInner` re-checks `disposed` before every job). The fix, if one is
+ever needed, is not building after dispose.
+
+**Measured** on `demos/postfx-demo`'s 90 s tour (every loop enters "All Composed" =
+`ao,dof,bloom,vignette`). On a Galaxy S22, before: +12 textures and ~50 MB per loop, 110 → 413 MB
+over seven loops. The editor GameView reproduces it exactly (57 → 69 → 82 textures at the same
+tour point), and a ledger on `renderer.backend.createTexture`/`destroyTexture` attributed all 12:
+8 blur-node textures, 2 for DOF's input RTT (colour + depth), 2 noise textures. After the fix three
+loops read identical texture counts and bytes at every matching point, with the gallery still
+rendering and no GPU errors.
+
+⚠️ **The helpers reach into three's PRIVATE fields** (`_CoCBlurredMaterial`, `_noiseNode`,
+`_quadMesh`), so a three bump can quietly make them free nothing. `postfxNodeOwnedResources.test.ts`
+is the tripwire: it builds the **real** three nodes, first proving each premise (the node's own
+`dispose()` leaves the resource alive), then that the helper frees it — a mocked node's `dispose()`
+frees everything by construction, which is how every one of these passed `postfxStack.test.ts`. Two
+things about that file are easy to get wrong, both measured: three's example nodes (`dof`, `ao`,
+`bloom`) live in `node_modules`, so vitest externalises them and they are real **whatever** the
+package's stub aliases say — what the `vi.mock`s actually rescue is `pass`/`rtt`, in the test and in
+the helper (delete them and 6 of the 14 cases go red). And the mocks resolve three's build directory
+with `fileURLToPath`, never `new URL(...).pathname`, which yields `/D:/…` on Windows and fails to
+import — red on the public CI matrix, invisible to the Mac gate.
+
+**To re-measure** a suspected post-FX leak: play the scene, wrap `window.__3d.renderer.backend`'s
+`createTexture`/`destroyTexture` to keep a `Map` of live textures (name, size, `new Error().stack`),
+and compare `renderer.info.memory.textures` at the SAME timeline point across loops. Grouping the
+survivors by name and stack names the owner directly; a count at different stations cannot tell a
+leak from a larger look.
+
 ## NPR Outline Post-Process
 
 The engine ships a stylized cel/outline post-process that runs **only on WebGPU**. It is off by default and toggled by the `NPRPostFX` ECS trait. It is **two stages of the post-FX stack** above, not a standalone pipeline — so it composes with bloom/vignette/DOF.
@@ -3688,7 +3755,8 @@ There is **one** post-FX code path; NPR has no branch of its own.
 - The stack is built **lazily** on the first frame `planStages(req)` is non-empty *and* the
   renderer is WebGPU (`renderer.isWebGPURenderer === true`); otherwise
   `renderer.render(scene, activeCamera)`.
-- Turning every trait off keeps the stack alive but routes around it, so toggling stays cheap.
+- When the (tier-masked) request plans no stages, the stack is disposed rather than kept, so a
+  live tier demotion frees its render targets.
 - `setConfig()` applies cheap uniform updates; a `true` return disposes and rebuilds. A
   camera-object swap (perspective ↔ ortho) also forces a rebuild.
 - The request is edge-triggered on `stackSignature`, so a static scene does no per-frame config work.

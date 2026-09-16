@@ -404,8 +404,8 @@ export default function Scene3D() {
       // Post-FX stack — the ONE composable post-process path (NPR stylize,
       // NPR particles, DOF, bloom, vignette, FXAA). Built lazily on the first
       // frame any *PostFX trait is enabled. Requires WebGPURenderer (gated
-      // below). When every trait turns off we keep the stack alive but route
-      // through plain renderer.render so toggling stays cheap.
+      // below). When the tier-masked request plans NO stages the stack is
+      // disposed, not kept — see the `!hasStages` branch in the frame callback.
       const isWebGPU = (renderer as { isWebGPURenderer?: boolean }).isWebGPURenderer === true;
       // The WebGPURenderer can run ON TOP of WebGL2 when WebGPU is unavailable
       // (GameConfig.preferWebGPU) — `isWebGPU` above is true either way. FXAA is

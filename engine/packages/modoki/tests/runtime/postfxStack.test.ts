@@ -14,6 +14,19 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as THREE from 'three';
 
+/** A render target shaped like three's: `isRenderTarget` is what the disposal walk keys off, and
+ *  `textures`/`depthTexture` are the GPU textures a bare `renderTarget.dispose()` can miss (#1269).
+ *  `depthTexture` defaults to NULL because that is what the post nodes' own targets have — bloom's
+ *  pyramid and the RTT wrappers are all built `{depthBuffer: false}`; only the scene pass has one. */
+function makeFakeTarget(depthTexture: { dispose: () => void } | null = null) {
+  return {
+    isRenderTarget: true,
+    dispose: vi.fn(),
+    textures: [{ dispose: vi.fn() }],
+    depthTexture,
+  };
+}
+
 // Chainable no-op TSL node with an observable `.value` where relevant
 // (bloom()'s returned node exposes strength/radius/threshold as {value}).
 function makeBloomNode() {
@@ -23,8 +36,11 @@ function makeBloomNode() {
     threshold: { value: 0 },
     // Real BloomNode owns a MIP PYRAMID of render targets + materials and has a
     // dispose(). Modelling it here is what lets us catch the stage forgetting to
-    // call it — the leak class no other assertion can see.
+    // call it — the leak class no other assertion can see. The targets live in two
+    // ARRAYS, which is what `disposeNodeOwned` has to walk to free their textures (#1269).
     dispose: vi.fn(),
+    _renderTargetsHorizontal: [makeFakeTarget(), makeFakeTarget()],
+    _renderTargetsVertical: [makeFakeTarget(), makeFakeTarget()],
   };
 }
 
@@ -43,7 +59,14 @@ function makeScenePass() {
     // and texture type onto, and `compileAsync` stands in for three's `PassNode.compileAsync` —
     // whose only observable act here is asking the renderer for a render context the way
     // `Renderer.compile()` does: two arguments, so no call depth.
-    renderTarget: { samples: 0, texture: { type: null as unknown } },
+    renderTarget: {
+      isRenderTarget: true,
+      samples: 0,
+      texture: { type: null as unknown },
+      dispose: vi.fn(),
+      textures: [{ dispose: vi.fn() }, { dispose: vi.fn() }],
+      depthTexture: { dispose: vi.fn() },  // the scene pass DOES own one
+    },
     compileAsync: vi.fn(async (r: { _renderContexts: { get(rt: unknown, mrt: unknown, d?: number): unknown } }) => {
       r._renderContexts.get(p.renderTarget, null);
     }),
@@ -51,6 +74,10 @@ function makeScenePass() {
   };
   return p;
 }
+/** Every ParticlePassNode the NPR stage built this test, so a case can assert what its disposal
+ *  freed — the real one extends PassNode and owns a render target. */
+const particlePasses: Array<{ renderTarget: ReturnType<typeof makeFakeTarget>; dispose: ReturnType<typeof vi.fn> }> = [];
+
 /** Every pass the mocked `pass()` handed out this test, so a case can reach the one its stack
  *  holds. Declared after the factory: referencing it from inside would make its element type
  *  circular. */
@@ -63,12 +90,21 @@ function makeUniform(initial: unknown) {
   return u;
 }
 
+// Shaped like a real RTTNode: a `renderTarget` flagged `isRenderTarget` with its own textures, and
+// the `_quadMesh` whose material three's inherited dispose() never frees (#1269). The walker in
+// `disposeNodeOwned` keys off `isRenderTarget`, so a flag-less fake would silently assert nothing.
 const rttSpy = vi.fn((node: unknown) => ({
   __rtt: node,
   isTextureNode: true,
   setPixelRatio: vi.fn(),
   dispose: vi.fn(),
-  renderTarget: { dispose: vi.fn() },
+  renderTarget: {
+    isRenderTarget: true,
+    dispose: vi.fn(),
+    textures: [{ dispose: vi.fn() }],
+    depthTexture: { dispose: vi.fn() },
+  },
+  _quadMesh: { material: { dispose: vi.fn() } },
 }));
 const buildCompositeNodeSpy = vi.fn((args: Record<string, unknown>) => ({ __composite: args }));
 const buildFXAANodeSpy = vi.fn((opts: Record<string, unknown>) => ({ __fxaa: opts }));
@@ -91,10 +127,24 @@ const bloomSpy = vi.fn((_color: unknown, strength: number, radius: number, thres
 // assertions below can read `.value` without a cast.
 type UniformNode = { value: number };
 const vignetteSpy = vi.fn((_color: unknown, intensity: UniformNode, smoothness: UniformNode) => ({ __vignette: [intensity, smoothness] }));
-const dofSpy = vi.fn((_color: unknown, viewZ: unknown, focusDistance: UniformNode, focalLength: UniformNode, bokehScale: UniformNode) => (
-  // Real DepthOfFieldNode owns 6 render targets + 5 materials and has a dispose().
-  { __dof: [viewZ, focusDistance, focalLength, bokehScale], dispose: vi.fn() }
-));
+const dofSpy = vi.fn((_color: unknown, viewZ: unknown, focusDistance: UniformNode, focalLength: UniformNode, bokehScale: UniformNode) => {
+  // Real DepthOfFieldNode owns 6 render targets + 5 materials and has a dispose() — and its
+  // setup() assigns a NEW GaussianBlurNode to `_CoCBlurredMaterial.colorNode` on every build, which
+  // that dispose() misses (#1269). `blurNodes` records each one this fake's setup() made.
+  const node = {
+    __dof: [viewZ, focusDistance, focalLength, bokehScale],
+    dispose: vi.fn(),
+    _CoCBlurredMaterial: { colorNode: null as { dispose: ReturnType<typeof vi.fn> } | null },
+    blurNodes: [] as Array<{ dispose: ReturnType<typeof vi.fn> }>,
+    setup(_builder: unknown) {
+      const blur = { dispose: vi.fn() };
+      node.blurNodes.push(blur);
+      node._CoCBlurredMaterial.colorNode = blur;
+      return {};
+    },
+  };
+  return node;
+});
 const buildViewZNodeSpy = vi.fn((depthTextureNode: unknown, isOrthographic: boolean, _near?: unknown, _far?: unknown) => ({ __viewZ: [depthTextureNode, isOrthographic] }));
 
 // Real GTAONode owns an RT + material and has a dispose(); `radius` is a live
@@ -109,6 +159,8 @@ function makeAoNode(depthNode: unknown, normalNode: unknown) {
     resolutionScale: 1,
     getTextureNode: vi.fn(() => ({ __aoTexture: true, r: { __aoTextureR: true } })),
     dispose: vi.fn(),
+    // The noise DataTexture GTAONode's constructor makes and its dispose() misses (#1269).
+    _noiseNode: { value: { dispose: vi.fn() } },
   };
 }
 const aoSpy = vi.fn((depthNode: unknown, normalNode: unknown, _camera: unknown) => makeAoNode(depthNode, normalNode));
@@ -118,6 +170,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   renderPipelines.length = 0;
   scenePasses.length = 0;
+  particlePasses.length = 0;
 
   vi.doMock('three/tsl', () => ({
     pass: vi.fn(() => { const p = makeScenePass(); scenePasses.push(p); return p; }),
@@ -154,10 +207,13 @@ beforeEach(() => {
     buildFXAANode: buildFXAANodeSpy,
   }));
   vi.doMock('../../src/runtime/rendering/npr/ParticlePassNode', () => ({
+    // Real ParticlePassNode extends PassNode, so it owns a render target whose textures its own
+    // dispose() does not free (#1269) — modelled here or the stage's routing asserts nothing.
     ParticlePassNode: class {
       getTextureNode = vi.fn(() => ({ __particleTexture: true, isTextureNode: true }));
       dispose = vi.fn();
-      constructor(..._a: unknown[]) {}
+      renderTarget = makeFakeTarget({ dispose: vi.fn() });
+      constructor(..._a: unknown[]) { particlePasses.push(this); }
     },
   }));
 
@@ -341,15 +397,19 @@ describe('PostFXStack — AO (GTAO) stage', () => {
 
   it('is ordered before dof/bloom/vignette (AO -> DOF -> bloom -> vignette)', async () => {
     await makeStack({ ao: aoCfg(), dof: dofCfg(), bloom: bloomCfg(), vignette: vignetteCfg() });
-    // dof's color input is AO's mul() output, not the raw scene color.
-    expect(dofSpy.mock.calls[0][0]).toEqual(expect.objectContaining({ __mul: expect.anything() }));
+    // dof's color input is AO's mul() output, not the raw scene color — resolved through an RTT
+    // the stack owns, since AO's output is not a texture node (#1269).
+    expect(dofSpy.mock.calls[0][0]).toEqual(expect.objectContaining({
+      __rtt: expect.objectContaining({ __mul: expect.anything() }),
+    }));
   });
 
-  it('dispose() frees the GTAO node (owns a render target + material)', async () => {
+  it('dispose() frees the GTAO node (owns a render target + material) AND its noise texture', async () => {
     const stack = await makeStack({ ao: aoCfg() });
     const aoNode = aoSpy.mock.results[0].value;
     stack.dispose();
     expect(aoNode.dispose).toHaveBeenCalledTimes(1);
+    expect(aoNode._noiseNode.value.dispose).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -410,6 +470,34 @@ describe('PostFXStack — DOF stage', () => {
     expect(focusArg.value).toBe(20);
     expect(focalArg.value).toBe(3);
     expect(bokehArg.value).toBe(0.5);
+  });
+
+  it('hands dof() the scene colour texture directly — no RTT when the input already is one', async () => {
+    await makeStack({ dof: dofCfg() });
+    expect(dofSpy.mock.calls[0][0]).toEqual(SCENE_COLOR);
+    expect(rttSpy).not.toHaveBeenCalled();
+  });
+
+  it('dispose() frees the RTT it put in front of dof() when AO precedes it (#1269)', async () => {
+    const stack = await makeStack({ ao: aoCfg(), dof: dofCfg() });
+    const inputRtt = rttSpy.mock.results[0].value;
+    expect(dofSpy.mock.calls[0][0]).toBe(inputRtt);
+    stack.dispose();
+    expect(inputRtt.renderTarget.dispose).toHaveBeenCalledTimes(1);
+    expect(inputRtt.renderTarget.textures[0].dispose).toHaveBeenCalledTimes(1);
+    expect(inputRtt._quadMesh.material.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it('dispose() frees the DOF node and the blur node of EVERY build of it (#1269)', async () => {
+    const stack = await makeStack({ dof: dofCfg() });
+    const dofNode = dofSpy.mock.results[0].value;
+    // Two builds, as the stage precompile and the draw each build it in their own render context.
+    dofNode.setup({});
+    dofNode.setup({});
+    expect(dofNode.blurNodes).toHaveLength(2);
+    stack.dispose();
+    expect(dofNode.dispose).toHaveBeenCalledTimes(1);
+    for (const blur of dofNode.blurNodes) expect(blur.dispose).toHaveBeenCalledTimes(1);
   });
 
   it('does not force setMRT — depth is already free from pass()', async () => {
@@ -695,6 +783,8 @@ describe('PostFXStack — dispose frees every stage-owned render target (T3)', (
     const compositeRTT = rttSpy.mock.results[0].value;
     stack.dispose();
     expect(compositeRTT.renderTarget.dispose).toHaveBeenCalledTimes(1);
+    expect(compositeRTT.renderTarget.textures[0].dispose).toHaveBeenCalledTimes(1);
+    expect(compositeRTT._quadMesh.material.dispose).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -702,11 +792,65 @@ describe('PostFXStack — stage nodes that own GPU resources are freed (leak reg
   // These nodes own render targets that `RenderPipeline.dispose()` cannot reach.
   // The stack rebuilds on ANY stage-set change, so a missing dispose leaks the
   // whole pyramid every time a sibling effect is toggled in the Inspector.
-  it('dispose() frees the bloom node (11 render targets + 8 materials upstream)', async () => {
+  it('dispose() frees the bloom node (11 render targets + 8 materials upstream) and its mip textures', async () => {
     const stack = await makeStack({ bloom: bloomCfg() });
     const bloomNode = bloomSpy.mock.results[0].value;
     stack.dispose();
     expect(bloomNode.dispose).toHaveBeenCalledTimes(1);
+    // #1269: the pyramid's targets are held in arrays, and a target rendered into by nothing keeps
+    // its texture unless the texture is disposed directly.
+    for (const rt of [...bloomNode._renderTargetsHorizontal, ...bloomNode._renderTargetsVertical]) {
+      expect(rt.textures[0].dispose).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('a stage that THROWS mid-build frees the stages already built, and the scene pass', async () => {
+    const { PostFXStack } = await import('../../src/runtime/rendering/postfx/PostFXStack');
+    // bloom is planned AFTER ao, so ao is already built and holding its GPU resources.
+    bloomSpy.mockImplementationOnce(() => { throw new Error('boom'); });
+    expect(() => new PostFXStack(
+      makeRenderer(), new THREE.Scene(), new THREE.PerspectiveCamera(),
+      { ao: aoCfg(), bloom: bloomCfg() } as never,
+    )).toThrow('boom');
+    const aoNode = aoSpy.mock.results[0].value;
+    expect(aoNode.dispose, 'the built AO stage is unreachable once the constructor throws').toHaveBeenCalledTimes(1);
+    expect(aoNode._noiseNode.value.dispose).toHaveBeenCalledTimes(1);
+    expect(scenePasses[0].dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it('dispose() frees the PARTICLE pass target\'s textures and the stylized RT\'s texture (#1269)', async () => {
+    // The stylized RT is a REAL THREE.RenderTarget the stage builds, and it names its texture, so a
+    // prototype spy can tell exactly which textures the stack freed.
+    const texSpy = vi.spyOn(THREE.Texture.prototype, 'dispose');
+    const stack = await makeStack({ npr: nprCfg() });
+    const particlePass = particlePasses[0];
+    stack.dispose();
+    const freedNames = texSpy.mock.instances.map((t) => (t as THREE.Texture).name);
+    expect(freedNames, 'the stylized RT\'s texture, which a bare renderTarget.dispose() misses').toContain('nprStylized');
+    expect(particlePass.renderTarget.textures[0].dispose).toHaveBeenCalledTimes(1);
+    texSpy.mockRestore();
+  });
+
+  it('dispose() frees every OTHER stage when one disposer throws, and rethrows after (#1269)', async () => {
+    const stack = await makeStack({ ao: aoCfg(), bloom: bloomCfg() });
+    const bloomNode = bloomSpy.mock.results[0].value;
+    const aoNode = aoSpy.mock.results[0].value;
+    bloomNode.dispose.mockImplementation(() => { throw new Error('disposer blew up'); });
+    expect(() => stack.dispose()).toThrow('disposer blew up');
+    // AO is planned BEFORE bloom, so a skipped tail would be the scene pass — the full-resolution
+    // MRT target, the most expensive thing in the stack.
+    expect(aoNode.dispose).toHaveBeenCalledTimes(1);
+    expect(scenePasses[0].dispose).toHaveBeenCalledTimes(1);
+    for (const tex of scenePasses[0].renderTarget.textures) expect(tex.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it('dispose() frees the SCENE PASS target\'s textures, not just the target (#1269)', async () => {
+    const stack = await makeStack({ bloom: bloomCfg() });
+    const scenePass = scenePasses[0];
+    stack.dispose();
+    expect(scenePass.dispose).toHaveBeenCalledTimes(1);
+    for (const tex of scenePass.renderTarget.textures) expect(tex.dispose).toHaveBeenCalledTimes(1);
+    expect(scenePass.renderTarget.depthTexture.dispose).toHaveBeenCalledTimes(1);
   });
 
   it('dispose() frees the DOF node (6 render targets + 5 materials upstream)', async () => {

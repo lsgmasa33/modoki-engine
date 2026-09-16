@@ -44,6 +44,9 @@ import { dof } from 'three/examples/jsm/tsl/display/DepthOfFieldNode.js';
 import { vignette } from 'three/examples/jsm/tsl/display/CRT.js';
 import { ao } from 'three/examples/jsm/tsl/display/GTAONode.js';
 import { buildViewZNode } from './dofViewZ';
+import {
+  ownedTextureInput, disposeGtaoNode, trackDofNode, disposeNodeOwned, disposeRenderTarget,
+} from './nodeOwnedResources';
 import { buildCompositeNode, type NPRCompositeUniforms } from '../npr/compositeNodes';
 import { buildFXAANode } from '../npr/fxaaNode';
 import { ParticlePassNode } from '../npr/ParticlePassNode';
@@ -203,7 +206,13 @@ export class PostFXStack {
     this.rawRenderer = renderer;
     this.renderer = renderer as RendererLike;
     const scenePass = pass(scene, camera);
-
+    // Everything from here on can throw (three's own TSL build bugs reach `ensureLineColorOnMaterials`
+    // and every stage builder), and a constructor that throws hands the caller NO instance to
+    // dispose — so the scene pass allocated on the line above, and every stage built below, would be
+    // unreachable. `Scene3D` builds inside the frame callback and `frameDriver` retries the next
+    // frame, so that leak repeats per episode rather than once.
+    const stages: StageHandle[] = [];
+    try {
     const targets = requiredMrtTargets(req);
     // 'output' is always present and needs no MRT call — a bare pass() already
     // exposes it. Only build an MRT dict when a stage needs a second target.
@@ -259,7 +268,6 @@ export class PostFXStack {
     };
 
     let color = scenePass.getTextureNode('output') as ColorNode;
-    const stages: StageHandle[] = [];
     for (const kind of planStages(req)) {
       const built = this.buildStage(kind, color, req, ctx);
       color = built.color;
@@ -275,6 +283,11 @@ export class PostFXStack {
     // Read the pass's real call depth off the first frame it draws — what `compileSceneAsync`
     // pins depends on it. See `passCompileContext`.
     observePassCallDepth(this.scenePass, renderer);
+    } catch (err) {
+      for (const stage of stages) stage.dispose?.();
+      disposeNodeOwned(scenePass);
+      throw err;
+    }
   }
 
   private buildStage(
@@ -353,12 +366,9 @@ export class PostFXStack {
               uniforms.grayscaleLift.value = c.grayscaleLift;
               (uniforms.clearColor.value as THREE.Color).setHex(c.clearColor);
             },
-            // RTTNode's inherited dispose() only fires an event — it does NOT
-            // free `renderTarget` — so dispose the target directly too. (T3)
-            dispose: () => {
-              ownedRtt?.renderTarget?.dispose();
-              ownedRtt?.dispose?.();
-            },
+            // RTTNode's inherited dispose() only fires an event — it frees neither
+            // `renderTarget` nor its own quad material. (T3, #1269)
+            dispose: () => { if (ownedRtt) disposeNodeOwned(ownedRtt); },
           },
         };
       }
@@ -399,8 +409,8 @@ export class PostFXStack {
             },
             dispose: () => {
               inner.dispose();
-              (particlePass as unknown as { dispose?(): void }).dispose?.();
-              stylizedRT.dispose();
+              disposeNodeOwned(particlePass);
+              disposeRenderTarget(stylizedRT);
             },
           },
         };
@@ -452,7 +462,8 @@ export class PostFXStack {
             // GTAONode owns its own render target + material (GTAONode.js's
             // dispose() frees `_aoRenderTarget` + `_material`) — not reachable
             // from RenderPipeline.dispose(). Same leak class as bloom/dof above.
-            dispose: () => (aoPass as unknown as { dispose?(): void }).dispose?.(),
+            // Plus the noise texture its own dispose() misses (#1269).
+            dispose: () => disposeGtaoNode(aoPass),
           },
         };
       }
@@ -476,7 +487,7 @@ export class PostFXStack {
             // reachable from RenderPipeline.dispose(). Because this stack rebuilds
             // on ANY stage-set change (toggling vignette/DOF/NPR/FXAA in the
             // Inspector), skipping this leaks the entire pyramid per checkbox click.
-            dispose: () => (bloomPass as unknown as { dispose?(): void }).dispose?.(),
+            dispose: () => disposeNodeOwned(bloomPass),
           },
         };
       }
@@ -516,14 +527,13 @@ export class PostFXStack {
         const focusDistanceU = uniform(cfg.focusDistance);
         const focalLengthU = uniform(cfg.focalLength);
         const bokehScaleU = uniform(cfg.bokehScale);
-        // ⚠️ dof() runs its input through `convertToTexture`, which mints an RTTNode
-        // when the input is not ALREADY a texture node — and DepthOfFieldNode.dispose()
-        // does not free that RTT. Today it always is one (planStages puts 'dof'
-        // straight after the scene color / the NPR particle texture, with nothing
-        // between), so nothing leaks. If a stage is ever inserted directly BEFORE dof
-        // (e.g. Phase 4's 'ao'), wrap the input explicitly the way 'fxaa' does and
-        // dispose that RTT here, or this starts leaking a full-screen target per rebuild.
-        const dofNode = dof(color, viewZ, focusDistanceU, focalLengthU, bokehScaleU);
+        // dof() runs its input through `convertToTexture`, which mints an RTTNode that
+        // DepthOfFieldNode.dispose() never frees. AO is ordered straight before DOF and
+        // ends in a `mul`, not a texture, so resolve the input HERE and own the RTT (#1269).
+        const input = ownedTextureInput(color);
+        const dofNode = dof(input.tex, viewZ, focusDistanceU, focalLengthU, bokehScaleU);
+        // Before the node is first built: setup() is where it makes the blur nodes it leaks.
+        const disposeDof = trackDofNode(dofNode);
         return {
           color: dofNode as ColorNode,
           handle: {
@@ -544,8 +554,11 @@ export class PostFXStack {
             },
             // DepthOfFieldNode owns 6 render targets + 5 materials (CoC, blurred CoC,
             // blur64, blur16 near/far, composite) — same non-recursing-dispose hazard
-            // as bloom above.
-            dispose: () => (dofNode as unknown as { dispose?(): void }).dispose?.(),
+            // as bloom above — plus a GaussianBlurNode per build that its dispose() misses.
+            dispose: () => {
+              disposeDof();
+              input.dispose();
+            },
           },
         };
       }
@@ -557,11 +570,7 @@ export class PostFXStack {
         // particle pass's texture node, or an SS composite RTT) use it directly;
         // otherwise resolve the chain into an RTT first. Skipping the redundant
         // wrap saves a full-screen blit on the common NPR path.
-        const alreadyTexture = (color as { isTextureNode?: boolean } | null)?.isTextureNode === true;
-        const inputTex = alreadyTexture ? color : rtt(color);
-        const ownedRtt = alreadyTexture
-          ? null
-          : inputTex as unknown as { dispose?(): void; renderTarget?: THREE.RenderTarget };
+        const { tex: inputTex, dispose: disposeInput } = ownedTextureInput(color);
 
         // Display-resolution texel size (superSampleScale 1): `planFxaaEnabled`
         // only admits this stage at SS=1, and it runs at the tail — after the SS
@@ -589,10 +598,7 @@ export class PostFXStack {
               edgeThresholdMin.value = c.edgeThresholdMin;
               blendStrength.value = c.blendStrength;
             },
-            dispose: () => {
-              ownedRtt?.renderTarget?.dispose();
-              ownedRtt?.dispose?.();
-            },
+            dispose: disposeInput,
           },
         };
       }
@@ -906,10 +912,18 @@ export class PostFXStack {
     // Hand-free every node-owned render target: RenderPipeline.dispose() does
     // NOT recurse into the node graph, so without this an SS-scale rebuild
     // (dispose + reconstruct) leaks a target per rebuild.
-    for (const stage of this.stages) stage.dispose?.();
-    this.scenePass.dispose?.();
+    // Every stage is freed even if one throws — a skipped tail is a leaked pyramid, and each
+    // disposer now does more work than a single call. The first error is rethrown afterwards, so a
+    // broken disposer still surfaces instead of being swallowed.
+    let failure: unknown;
+    const free = (fn: () => void) => {
+      try { fn(); } catch (err) { failure ??= err; }
+    };
+    for (const stage of this.stages) free(() => stage.dispose?.());
+    free(() => disposeNodeOwned(this.scenePass));
     // Drop the precompile quads' references only — see the field's own note on why nothing here
     // is disposed.
     this.compiledQuads.length = 0;
+    if (failure !== undefined) throw failure;
   }
 }
