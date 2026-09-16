@@ -129,8 +129,8 @@ function localSidecarPath(absPath: string): string {
 /** Content-cache blocks whose contents are split between the COMMITTED sidecar and this machine's
  *  gitignored one. Being listed here does NOT mean "peel everything" — what gets peeled is decided
  *  per block by {@link LOCAL_KEYS}. */
-const CACHE_BLOCKS = ['textureCache', 'modelCache', 'fontCache', 'audioCache', 'environmentCache', 'atlasCache', 'videoCache'] as const;
-type CacheBlock = (typeof CACHE_BLOCKS)[number];
+export const CACHE_BLOCKS = ['textureCache', 'modelCache', 'fontCache', 'audioCache', 'environmentCache', 'atlasCache', 'videoCache'] as const;
+export type CacheBlock = (typeof CACHE_BLOCKS)[number];
 
 /** Machine-local, inspector-only size fields. Spread into most blocks below — but NOT all of them,
  *  which is why this is a named list rather than an unconditional prefix (#1300). */
@@ -175,6 +175,105 @@ const LOCAL_KEYS: Record<CacheBlock, readonly string[]> = {
 /** Every key peeled out of `block` into the gitignored local sidecar. */
 function localKeysFor(block: CacheBlock): readonly string[] {
   return LOCAL_KEYS[block];
+}
+
+/** The key under which a local sidecar records WHICH peel table wrote it. */
+const PEEL_STAMP = '__peel';
+
+/** A short fingerprint of {@link LOCAL_KEYS}, stamped into every local sidecar this build writes.
+ *
+ *  ⚠️ **Derived from the table, never bumped by hand.** The thing a local half can be stale
+ *  against is precisely the set of keys that were being peeled when it was written, so hashing that
+ *  set makes every future peel migration self-invalidating with no constant for anyone to forget.
+ *  A hand-maintained `PEEL_VERSION` would be the second list this file already warns about twice.
+ *
+ *  ## The defect this exists to close (#1305 close-out)
+ *
+ *  Without it, "does this machine hold the peeled values" was answered by "does the local block
+ *  hold ANY peeled key" — and a local half written BEFORE a later peel holds exactly the keys that
+ *  earlier peel produced, which is a non-empty subset. Measured on `~/Projects/modoki` (the hub)
+ *  2026-09-17: **19 audio local halves, every one `{bytes}` only, none carrying `durationSec`** —
+ *  `bytes` was peeled by #1279 and `durationSec` only by #1289. The predicate read all 19 as
+ *  healed, so the Duration row would have stayed blank on the owner's own clone while the fix
+ *  reported success. A stamp mismatch is the honest signal: this file was written under a peel
+ *  table that no longer exists, so nothing in it can be trusted to be complete. */
+export function peelSchemaId(): string {
+  return crypto.createHash('sha256').update(JSON.stringify(LOCAL_KEYS)).digest('hex').slice(0, 8);
+}
+
+/** Cache blocks this asset has COMMITTED but whose peeled values this machine does not hold —
+ *  i.e. the merge in {@link readMetaSidecar} had nothing to merge, so every Inspector row fed by
+ *  {@link LOCAL_KEYS} for that block is blank (or, worse, renders a defaulted `0`).
+ *
+ *  ## Why this exists: a peel migration deletes, and nothing treated the absence as a miss (#1305)
+ *
+ *  #127, #1289 and #1300 each stripped a field out of the committed sidecars. None of them could
+ *  seed the local half — `.meta.local.json` is gitignored, so no commit can carry one — and nothing
+ *  re-derived it, because a peeled value is only ever written as a side-effect of a reimport
+ *  handler and the handler runs only on a CONVERTED-ARTIFACT cache miss. With a warm `.cache/`
+ *  there is no miss, so the value never came back: measured 2026-09-17, `durationSec` appeared zero
+ *  times on disk repo-wide across 29 committed audio and 7 video blocks.
+ *
+ *  ⚠️ **`modelCache` looked like a counter-example and is the reason this went unnoticed twice.**
+ *  It self-heals, but only because the field it peels is `hash` — the cache KEY — so `staticAssets`
+ *  cannot locate the artifact without it and the miss is structural. `lodBytes`/`triCounts` ride
+ *  back on that same handler write. Every other block keeps its `hash` committed, so the warm-cache
+ *  early return fires and nothing heals. The analogy does not generalise, and both prior changes
+ *  cited it as though it did.
+ *
+ *  ⚠️ **"Incomplete" is NOT "some peeled key is absent."** `LOCAL_KEYS` is a superset per block:
+ *  `textureCache` lists all four {@link VOLATILE_STAT_KEYS} but a healthy texture local half holds
+ *  only `variantBytes` (66 of them do, in this repo). Requiring every listed key would report every
+ *  texture on the machine as broken forever. The signal is that NONE of the peeled keys arrived —
+ *  which is what a never-seeded block actually looks like, and what an absent local file gives.
+ *
+ *  Takes the two halves rather than a merged doc on purpose: after {@link readMetaSidecar} has
+ *  merged, a value that came from the local file is indistinguishable from one that was committed,
+ *  so the question cannot be asked of the result. */
+export function blocksMissingLocalHalf(absPath: string): CacheBlock[] {
+  const sidecar = sidecarPath(absPath);
+  if (!fs.existsSync(sidecar)) return [];
+  let committed: Record<string, unknown>;
+  try { committed = JSON.parse(fs.readFileSync(sidecar, 'utf-8')); } catch { return []; }
+
+  let local: Record<string, Record<string, unknown> | undefined> = {};
+  const localPath = localSidecarPath(absPath);
+  if (fs.existsSync(localPath)) {
+    // An unreadable local half is treated as an ABSENT one — the peeled values are equally
+    // unavailable either way, and re-deriving them is also how a corrupt one gets rewritten.
+    try { local = JSON.parse(fs.readFileSync(localPath, 'utf-8')); } catch { local = {}; }
+  }
+
+  // A local half written under a DIFFERENT peel table cannot be judged key-by-key: it holds
+  // exactly what that table peeled, which is a non-empty subset of what this one does. Treat the
+  // whole file as stale — see peelSchemaId's note and the 19 `{bytes}`-only audio halves on the hub.
+  const stampMatches = (local as Record<string, unknown>)[PEEL_STAMP] === peelSchemaId();
+
+  const missing: CacheBlock[] = [];
+  for (const block of CACHE_BLOCKS) {
+    const peeled = localKeysFor(block);
+    if (peeled.length === 0) continue; // nothing is peeled out of it, so nothing can be missing
+    const target = committed[block];
+    if (!target || typeof target !== 'object') continue; // not converted on this asset at all
+    const localBlock = local[block];
+    const held = stampMatches && localBlock && typeof localBlock === 'object'
+      ? peeled.some((k) => k in localBlock)
+      : false;
+    if (!held) missing.push(block);
+  }
+  return missing;
+}
+
+/** The reimport handler type that regenerates `block`'s peeled values.
+ *
+ *  Derived by dropping the `Cache` suffix rather than looked up in a table, because a table would
+ *  be a second list to keep in step with {@link CACHE_BLOCKS} — the failure this whole area already
+ *  has one instance of (`metaSidecarChurn.test.ts` carried a hand-copied peel list and drifted to
+ *  calling it `HOST_LOCAL_KEYS`, a name that does not exist). The correspondence is total and is
+ *  asserted in `metaSidecarLocalHalf.test.ts`, which fails if any block stops naming a real
+ *  handler. */
+export function reimportTypeForBlock(block: CacheBlock): string {
+  return block.replace(/Cache$/, '');
 }
 
 /** Read the sidecar JSON — the committed `.meta.json` with this machine's local
@@ -464,7 +563,10 @@ export function writeMetaSidecar(absPath: string, meta: Record<string, unknown>)
   }
   writeJsonAtomic(sidecarPath(absPath), committed);
   const localPath = localSidecarPath(absPath);
-  if (Object.keys(local).length > 0) writeJsonAtomic(localPath, local);
+  // Stamped with the peel table that produced it, so a LATER peel migration can tell this file is
+  // incomplete rather than reading its subset of keys as "healed" (#1305 close-out). Written only
+  // alongside real blocks — a bare stamp would be a local half with no values in it.
+  if (Object.keys(local).length > 0) writeJsonAtomic(localPath, { ...local, [PEEL_STAMP]: peelSchemaId() });
   else if (fs.existsSync(localPath)) fs.rmSync(localPath, { force: true }); // no stats now → drop a stale local file
 }
 

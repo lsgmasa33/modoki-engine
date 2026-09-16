@@ -31,6 +31,7 @@ import {
 } from '../../scene/pendingMeta';
 import { useMetaDirty } from '../useMetaDirty';
 import { UnsavedMetaBadge } from './UnsavedMetaBadge';
+import { sumMeasured } from './measuredStats';
 
 /** Cheap rigged-detection: does this GLB declare a skin? Fetches the file and reads
  *  only its glTF JSON chunk (glbDeclaresSkin), so the Model inspector shows
@@ -641,7 +642,12 @@ function ModelImportedStats({ cache }: { cache: ModelCacheInfo | undefined }) {
 
   if (!cache) return null;
   const lodPaths = cache.lodPaths ?? [];
-  const total = (cache.lodBytes ?? []).reduce((a, b) => a + (b ?? 0), 0);
+  // ⚠️ `undefined` is NOT zero — see the same note in `TextureAssetView` (#1305). `lodBytes` and
+  // `triCounts` are peeled into the gitignored local sidecar, so before this machine has re-derived
+  // them these rows read "0 tri · 0 B" per LOD and a 0 B total: a measurement the Inspector does
+  // not have, stated as fact. Models are the block that usually self-heals (their peeled `hash` is
+  // the cache key), so this is rarely SEEN — which is exactly why it would have stayed.
+  const total = sumMeasured(cache.lodBytes);
   return (
     <>
       <div style={sectionStyle}>Imported</div>
@@ -649,13 +655,15 @@ function ModelImportedStats({ cache }: { cache: ModelCacheInfo | undefined }) {
         <div key={i} style={rowStyle}>
           <span style={labelStyle}>LOD{i}</span>
           <span style={valStyle}>
-            {(cache.triCounts?.[i] ?? 0).toLocaleString()} tri · {formatBytes(cache.lodBytes?.[i] ?? 0)}
+            {cache.triCounts?.[i] !== undefined ? `${cache.triCounts[i]!.toLocaleString()} tri` : '— tri'}
+            {' · '}
+            {cache.lodBytes?.[i] !== undefined ? formatBytes(cache.lodBytes[i]!) : '—'}
           </span>
         </div>
       ))}
       <div style={{ ...rowStyle, borderTop: '1px solid #333', marginTop: 2, paddingTop: 3 }}>
         <span style={{ ...labelStyle, color: '#aaa' }}>Total</span>
-        <span style={{ ...valStyle, color: '#fff' }}>{formatBytes(total)}</span>
+        <span style={{ ...valStyle, color: '#fff' }}>{total !== undefined ? formatBytes(total) : '—'}</span>
       </div>
     </>
   );

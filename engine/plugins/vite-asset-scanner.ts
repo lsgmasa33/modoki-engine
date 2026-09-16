@@ -1243,8 +1243,16 @@ function scanDir(dir: string, base: string, urlPrefix: string): AssetEntry[] {
           };
           if (cache) {
             video.ext = cache.ext ?? VIDEO_EXTENSION;
-            // Size/duration are what let `policy: 'auto'` decide without a network
-            // round-trip, so carry them even though they read as "stats".
+            // `bytes` is what lets `policy: 'auto'` decide without a network round-trip, so carry
+            // it even though it reads as a "stat" — and it is why `videoCache.bytes` is the one
+            // volatile-looking field NOT peeled into the gitignored local sidecar
+            // (`meta-sidecar.ts` § LOCAL_KEYS). ⚠️ This used to say "Size/duration", which is
+            // wrong and cost a re-investigation under #1305: `resolveDeliveryPolicy`
+            // (`runtime/loaders/videoSettings.ts`) resolves auto against encoded SIZE alone, and
+            // `durationSec` is Inspector-only. Naming a peeled field as load-bearing is exactly
+            // what stops the next reader touching it — or, here, made a correct peel look like a
+            // shipped regression. `durationSec` is carried below for the editor's benefit; when
+            // conversion runs this whole entry is rebuilt from a fresh probe anyway.
             if (cache.bytes != null) video.bytes = cache.bytes;
             if (cache.durationSec != null) video.durationSec = cache.durationSec;
             if (cache.width != null) video.width = cache.width;

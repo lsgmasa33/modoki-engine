@@ -206,24 +206,120 @@ different BYTES under the provisioned `ffmpeg-static` 6.0 vs Homebrew `ffmpeg`
 crosses an MP3 granule — and this Mac's two ffprobe builds disagree about
 duration on all 26. Nothing consumes the value (`AudioManifestBlock` bakes
 `loadType`/`format`/`ext` and no duration); its one reader is `AudioAssetView`'s
-Inspector row, which gets it back from the merged local half — *on a machine that
-has one*.
+Inspector row, which gets it back from the merged local half — which, until #1305,
+no machine had (below).
 
-⚠️ **And in practice NO machine has one, so the Duration row is blank — for audio
-since #1289 and for video since #1300.** Measured 2026-09-16 on this clone: 107
-`.meta.local.json` files exist (63 png, 37 glb, 3 jpg, 2 ttf, 1 hdr, 1 gltf) and
-**zero** for any audio or video clip. Both peels stripped the committed value
-without seeding the local half, and nothing seeds it later.
+### A peel migration cannot seed, so absence has to be the trigger (#1305)
 
-⚠️ **This is NOT the self-heal `modelCache.hash` relies on, and that analogy is
-what hid it.** A stale model hash IS a cache miss — the serving path cannot find
-the processed file, so it re-bakes. A missing `durationSec` is not: the audio and
-video routes in `plugins/backend/staticAssets.ts` auto-bake only when
-`fs.existsSync(cached)` is false, i.e. when the converted BYTES are absent. With a
-warm variant cache no reimport ever fires, so the row stays blank indefinitely on
-every machine, not just a fresh clone. It comes back only on an explicit reimport
-(Inspector → Apply). Tracked as a class — the peel migrations that need a seeding
-step — rather than fixed per-format.
+⚠️ **For a year the peel worked in one direction only: every migration DELETED the
+committed value, and nothing ever put a local one back.** Measured 2026-09-17 by
+walking every committed sidecar in `games/`, `demos/` and `engine/packages/`:
+
+| block | peeled keys | committed | has local half | missing |
+|---|---|---|---|---|
+| `textureCache` | `variantBytes` | 282 | 66 | **216** |
+| `audioCache` | `bytes`, `durationSec` | 29 | **0** | **29** |
+| `fontCache` | `bytes` | 10 | 3 | 7 |
+| `videoCache` | `durationSec` | 7 | **0** | **7** |
+| `environmentCache` | `bytes` | 3 | 1 | 2 |
+| `atlasCache` | `bytes` | 1 | **0** | 1 |
+| `modelCache` | `hash`, `lodBytes`, `triCounts` | 46 | 38 | 8 |
+
+`durationSec` appeared **zero times on disk repo-wide**. This is a property of the
+mechanism, not an oversight in any one migration: **`.meta.local.json` is
+gitignored, so no commit can carry one.** "Seed at migration time" was never a
+shippable option — only a script every clone would have to run by hand, and none
+was written.
+
+⚠️ **`modelCache` heals, but only by accident of WHICH field was peeled — and
+citing it as a general self-heal is what hid this twice.** `hash` is the cache
+*key*: `staticAssets.ts` cannot locate the artifact without it, so the miss is
+structural and the reimport handler runs; `lodBytes`/`triCounts` ride back on that
+same write. Every other block keeps its `hash` committed, so the warm-cache early
+return fires and nothing re-derives. A stale model hash IS a cache miss; a missing
+`durationSec` is not, and the routes auto-bake only when `fs.existsSync(cached)` is
+false — i.e. when the converted BYTES are gone. With a warm `.cache/`, never.
+
+**The fix makes absence itself the trigger, at `/api/read-meta`** — see
+`plugins/backend/healLocalHalf.ts`. `blocksMissingLocalHalf` (in `meta-sidecar.ts`,
+derived from `LOCAL_KEYS`) reports a committed block whose peeled values this
+machine does not hold, and the route schedules one reimport for it.
+
+⚠️ **A heal is NOT reliably cheap, and the first version of this section said it
+was.** The claim was *"every converter re-stats/re-probes even on a warm cache hit,
+so it costs an `ffprobe`/`statSync`, not a re-encode"*. That is true only while the
+ARTIFACT cache is warm: measured 2026-09-17, **106 of this clone's 215 healable
+textures have no `.cache/modoki-textures` entry for their hash**, so each is a full
+`toktx` encode, and `games/video-test` has no `.cache` at all. The `modelCache`
+paragraph above explains why it cannot be warm for a model missing its local half —
+`hash` *is* the cache key, so a missing one is a cache miss by construction. Hence
+the cap of two concurrent heals in `healLocalHalf.ts`: `metaBatchLoad` fetches this
+route once per path in a multi-selection through `Promise.all`, so uncapped,
+selecting a folder would start a hundred encoders from a GET.
+
+⚠️ **A heal must leave the COMMITTED sidecar byte-identical, and this is enforced,
+not assumed.** The reimport handlers rebuild their whole block in canonical key
+order and stamp `meta.type`, so on a sidecar predating that shape the rewrite is
+byte-different — **43 of 282 committed texture sidecars**. Behind a GET that would
+make merely clicking an asset dirty a tracked `games/**` file (`CLAUDE.md`'s
+"never `git add -A`" rule, #18) and invalidate the `X-Meta-Sha256` baseline the
+same response just handed the panel. `healLocalHalf` snapshots the committed half
+and restores it afterwards, including after a throw. It restores rather than
+prevents because those handlers are shared with `/api/reimport`, where rewriting the
+committed half is correct — the difference is that a user asked for that one.
+
+Two more constraints the heal inherits rather than invents: it is refused while a
+`pendingMeta` park exists (#882 — the handlers read settings from DISK, so baking
+under a park converts with pre-edit values), and a `passive` reader opts out with
+`heal=0`, because `modoki_get_asset_meta` is an observer and an observer must not
+re-encode what it observes.
+
+⚠️ **The trigger is the READ route, not the serve path, and the obvious choice was
+wrong.** Teaching `staticAssets.ts`'s warm-cache guards that an absent local half
+is a miss would have healed **video only**: the Inspector's previews point at the
+SOURCE file — `AudioAssetView`'s `<audio controls src={path}>` and
+`TextureAssetView`'s `<img src={path}>`, deliberate and commented as such — so
+opening an audio or texture asset never requests the converted URL. Only
+`VideoAssetView` asks for one (`videoPreviewUrl`).
+
+Two properties the implementation must keep, both pinned by tests in
+`engine/tests/plugins/metaSidecarLocalHalf.test.ts`:
+
+- **It never blocks the response.** `assetViews/metaBatchLoad.ts` fetches this route
+  once per path in a multi-selection, so an inline probe would stall
+  `TextureBatchView` by the size of the selection. The Inspector picks the result up
+  through the invalidation epoch that already cache-busts this URL.
+- **One attempt per (asset, sidecar sha).** A machine with no `ffprobe` can never
+  satisfy the check, so without the memo every Inspector open would re-attempt a
+  probe that cannot succeed. The consequence is accepted deliberately: installing
+  `ffprobe` later does **not** backfill until something rewrites the sidecar, and
+  the Inspector's own Re-import button is that something.
+
+⚠️ **"Incomplete" is a two-part question, and getting the second part wrong made the
+first version of this fix do nothing on the hub.** Within one peel generation the
+test is *none of the block's peeled keys arrived* — not *some are missing*, because
+`LOCAL_KEYS` is a superset per block: `textureCache` lists all four
+`VOLATILE_STAT_KEYS` but a healthy texture local half holds only `variantBytes` (66
+do; none has the other three), so requiring the full list would mark every texture on
+every machine permanently broken.
+
+But that test alone reads a local half written by an EARLIER peel as healthy, since
+it holds exactly the keys that peel produced — a non-empty subset. Measured on
+`~/Projects/modoki` (the hub) 2026-09-17: **19 audio local halves, every one
+`{bytes}` only, none carrying `durationSec`** — `bytes` was peeled by #1279 and
+`durationSec` only by #1289. All 19 read as healed. So each local sidecar now carries
+`__peel`, a fingerprint **derived from `LOCAL_KEYS`** (`peelSchemaId()`), and a
+mismatch invalidates the whole file: it was written under a table that no longer
+exists, so nothing in it can be trusted to be complete. Derived rather than a
+hand-bumped version constant, so the next peel migration self-invalidates with
+nothing for anyone to remember.
+
+⚠️ **An absent stat is not zero, and rendering it as zero was the worse half.**
+Audio and video gate their rows on `!== undefined` and vanish; texture and model
+defaulted to `0` and *rendered* it — `Total 0 B` across 216 texture blocks, and
+`0 tri · 0 B` per LOD. A blank row is honest about not knowing. Both now go through
+`assetViews/measuredStats.ts`, whose one job is keeping a measured zero and an
+absent value distinguishable.
 
 Its siblings `channels`/`sampleRate` stay committed, but ⚠️ **not because the
 settings force them.** That reason holds for wordweave's 26 clips and is false for

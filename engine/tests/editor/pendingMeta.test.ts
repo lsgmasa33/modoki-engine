@@ -878,6 +878,23 @@ describe('only a read that feeds a panel may move the baseline', () => {
     await readMetaPreferringPark(TEX);
     expect(peekMetaBaseline(TEX)).toBe('V1');
   });
+
+  /** ⚠️ #1305: `passive` now carries one MORE consequence, and it is a server-side one — the read
+   *  route re-derives a missing `.meta.local.json` by running the asset's reimport handler. An
+   *  agent sweeping sidecars with `modoki_get_asset_meta` would therefore start a conversion per
+   *  asset, which is the same "an observer must not disarm/alter the thing it observes" rule as
+   *  above, one layer down. The flag above governs only what THIS module records, so the server has
+   *  to be told separately — and nothing else in the suite can see that it was. */
+  it('a PASSIVE read tells the SERVER not to heal; a panel read leaves it enabled', async () => {
+    stubDisk();
+    await readMetaPreferringPark(TEX, { passive: true });
+    await readMetaPreferringPark(TEX);
+    const calls = (globalThis.fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+    const reads = calls.map((c) => String(c[0])).filter((u) => u.includes('/api/read-meta'));
+    expect(reads).toHaveLength(2);
+    expect(reads[0], 'an agent read must opt out of the heal').toContain('heal=0');
+    expect(reads[1], 'a panel read is exactly who the heal exists for').not.toContain('heal=0');
+  });
 });
 
 /** The guard against an id-less wholesale write, keyed on the DOCUMENT (#845, #871, #880).

@@ -15,6 +15,18 @@ beforeEach(() => {
 });
 afterEach(() => { fs.rmSync(tmpRoot, { recursive: true, force: true }); });
 
+/** The local sidecar's cache blocks, with the peel-schema stamp dropped.
+ *
+ *  The stamp (#1305 close-out) is asserted on its own below. It is excluded here because these
+ *  assertions are about WHICH KEYS peel, and folding an opaque content hash into each of them would
+ *  make all three churn on any future change to `LOCAL_KEYS` — noise in exactly the tests whose job
+ *  is to state the peel boundary precisely. */
+function localBlocks(): Record<string, unknown> {
+  const raw = JSON.parse(fs.readFileSync(absPath + '.meta.local.json', 'utf-8')) as Record<string, unknown>;
+  delete raw.__peel;
+  return raw;
+}
+
 describe('readMetaSidecar', () => {
   it('returns {} when the sidecar does not exist', () => {
     expect(readMetaSidecar(absPath)).toEqual({});
@@ -118,8 +130,7 @@ describe('writeMetaSidecar — committed / machine-local byte-stat split', () =>
     // …and modelCache.hash does NOT (#127 — machine-dependent by construction).
     expect(committed.modelCache).not.toHaveProperty('hash');
     // The stats (and the model hash) live in the gitignored local sidecar.
-    const local = JSON.parse(fs.readFileSync(absPath + '.meta.local.json', 'utf-8'));
-    expect(local).toEqual({
+    expect(localBlocks()).toEqual({
       modelCache: { hash: 'h1', triCounts: [150775], lodBytes: [3628528] },
       textureCache: { variantBytes: { uastc: 223651 } },
       fontCache: { bytes: 627701 },
@@ -145,7 +156,7 @@ describe('writeMetaSidecar — committed / machine-local byte-stat split', () =>
     // the source). They stay committed because their value follows the source deterministically and
     // no divergence has ever been observed in them — not because they cannot be measurements.
     expect(committed.audioCache).toEqual({ hash: 'h4', ext: 'mp3', channels: 1, sampleRate: 22050 });
-    expect(JSON.parse(fs.readFileSync(absPath + '.meta.local.json', 'utf-8'))).toEqual({
+    expect(localBlocks()).toEqual({
       audioCache: { durationSec: 0.182857, bytes: 2527 },
     });
   });
@@ -166,7 +177,7 @@ describe('writeMetaSidecar — committed / machine-local byte-stat split', () =>
     expect(committed.videoCache).toEqual({
       hash: 'v1', ext: 'mp4', bytes: 1745855, width: 640, height: 360, fps: 24, hasAudio: true,
     });
-    expect(JSON.parse(fs.readFileSync(absPath + '.meta.local.json', 'utf-8'))).toEqual({
+    expect(localBlocks()).toEqual({
       videoCache: { durationSec: 24.009002 },
     });
   });

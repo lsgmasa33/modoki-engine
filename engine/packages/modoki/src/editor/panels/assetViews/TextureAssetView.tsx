@@ -19,6 +19,7 @@ import { useAssetInvalidationEpoch } from '../useAssetInvalidationEpoch';
 import { parkMetaEdit, readMetaPreferringPark, flushPendingMetaFor } from '../../scene/pendingMeta';
 import { useMetaDirty } from '../useMetaDirty';
 import { UnsavedMetaBadge } from './UnsavedMetaBadge';
+import { sumMeasured } from './measuredStats';
 
 const TEXTURE_TYPE_OPTIONS: { value: TextureType; label: string }[] = [
   { value: '3d', label: '3D — model / material (mipmapped, KTX2)' },
@@ -394,7 +395,13 @@ function TextureImportedStats({ cache }: { cache: TextureCacheInfo | undefined }
     return <div style={{ color: '#666', fontSize: '10px', marginTop: 4 }}>Converted ✓ — re-import to compute stats</div>;
   }
   const bytes = cache.variantBytes ?? {};
-  const total = Object.values(bytes).reduce((a, b) => a + (b ?? 0), 0);
+  // ⚠️ `undefined` is NOT zero here, and defaulting it was the worse half of #1305. `variantBytes`
+  // is peeled into the gitignored local sidecar, so on a machine that has never re-derived it this
+  // reduce ran over `{}` and the Total row asserted a confident **0 B** — across 216 of 282
+  // committed texture blocks in this repo. A row that renders '—' is honest about not knowing; a
+  // row that renders 0 B is the Inspector reporting a measurement it does not have. The per-variant
+  // rows below already rendered '—' for an absent entry; only the Total did not.
+  const total = sumMeasured(Object.values(bytes));
   return (
     <>
       <div style={sectionStyle}>Imported</div>
@@ -405,7 +412,7 @@ function TextureImportedStats({ cache }: { cache: TextureCacheInfo | undefined }
         <div key={v} style={rowStyle}><span style={labelStyle}>{v}</span><span style={valStyle}>{bytes[v] !== undefined ? formatBytes(bytes[v]!) : '—'}</span></div>
       ))}
       <div style={{ ...rowStyle, borderTop: '1px solid #333', marginTop: 2, paddingTop: 3 }}>
-        <span style={{ ...labelStyle, color: '#aaa' }}>Total</span><span style={{ ...valStyle, color: '#fff' }}>{formatBytes(total)}</span>
+        <span style={{ ...labelStyle, color: '#aaa' }}>Total</span><span style={{ ...valStyle, color: '#fff' }}>{total !== undefined ? formatBytes(total) : '—'}</span>
       </div>
     </>
   );

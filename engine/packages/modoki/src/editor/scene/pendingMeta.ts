@@ -492,7 +492,13 @@ export async function readMetaPreferringPark(
 ): Promise<PreferredMetaRead> {
   const parked = peekPendingMeta(path);
   if (parked !== undefined) return { meta: parked as Record<string, unknown>, pendingRef: parked, ok: true };
-  const url = cacheBustReimport(`/api/read-meta?path=${encodeURIComponent(path)}`, opts?.reimportEpoch ?? 0);
+  // ⚠️ A `passive` read also opts out of the SERVER's local-half heal (#1305). `passive` already
+  // means "this read feeds no panel", and the same reasoning applies one layer down: the heal runs
+  // a reimport handler, so without `heal=0` an agent sweeping sidecars with
+  // `modoki_get_asset_meta` would start a conversion per asset. The server needs to be told
+  // because the flag below only governs what THIS module records.
+  const base = `/api/read-meta?path=${encodeURIComponent(path)}${opts?.passive ? '&heal=0' : ''}`;
+  const url = cacheBustReimport(base, opts?.reimportEpoch ?? 0);
   const r = await backendFetch(url, opts?.signal ? { signal: opts.signal } : undefined);
   // ⚠️ `passive` reads record NOTHING (#872 review). A baseline is a claim about the bytes a
   // PANEL's displayed document came from, and the flush conditions the human's next save on it —

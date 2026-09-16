@@ -57,14 +57,14 @@ function trackedMetaSidecars(): string[] {
 /** Cache-block values a COMMITTED sidecar must never carry, because the machine that wrote them
  *  is what decides them. `writeMetaSidecar` peels each into the gitignored `.meta.local.json`.
  *
- *  ⚠️ Spelled out here rather than imported from meta-sidecar.ts's `HOST_LOCAL_KEYS` ON PURPOSE.
+ *  ⚠️ Spelled out here rather than imported from meta-sidecar.ts's `LOCAL_KEYS` ON PURPOSE.
  *  A guard derived from the very constant it guards moves WITH it: delete the `audioCache` entry
  *  there and an imported list would simply stop checking audio and stay green, which is the
  *  constant-vs-constant shape that folds away to nothing. This table is the independent claim;
- *  `HOST_LOCAL_KEYS` is the implementation of it, and the two are meant to be able to disagree.
+ *  `LOCAL_KEYS` is the implementation of it, and the two are meant to be able to disagree.
  *
  *  ⚠️ What it CANNOT catch, so nobody reads it as more than it is: this is a guard on the STATE of
- *  the corpus, not on the mechanism. Delete the `audioCache` entry from `HOST_LOCAL_KEYS` and this
+ *  the corpus, not on the mechanism. Delete the `audioCache` entry from `LOCAL_KEYS` and this
  *  file stays green — the committed sidecars are already clean, and nothing re-dirties them until
  *  somebody reimports AND commits. The mechanism is pinned by the unit tests in
  *  `engine/tests/plugins/metaSidecar.test.ts`; this table is what stops a sidecar arriving from an
