@@ -532,8 +532,12 @@ plus `spawnSync`. What the three actually share is being **long-running**, which
 instrument the other two looking for a corpus.
 
 The corpus-walk budget gap is real on its own evidence and is **#1290**: `grep -rl` over
-`repoCorpus|repoFiles(` finds **125 test files**, of which **2** state a timeout — so 123 corpus
-walks are charged against a ceiling sized for a unit test. Repo size and machine contention move
+`repoCorpus|repoFiles(` across `engine/tests games demos` finds **125 test files**, of which **2**
+state a timeout — so 123 corpus walks are charged against a ceiling sized for a unit test.
+⚠️ **That ratio is a property of a TREE, not of the repo** — counted on `b85b1ddbf`; `work-qa`
+counted 122/1 on `55203d6f2` an hour earlier, and the difference is the #1285 commits in between.
+It drifts upward every time somebody adds a corpus test, which is the argument rather than a
+footnote to it, so quote the sha with the figure the way a timing is quoted with its `context:` line. Repo size and machine contention move
 independently, so a ceiling tuned against one gets re-crossed by the other, and the repo accumulates
 a number per test with no rationale between them. **#1046 is the closed precedent**: docCitations'
 scan at 17s against a 20s budget, handed 60s on Windows. The unit-test default is the wrong
