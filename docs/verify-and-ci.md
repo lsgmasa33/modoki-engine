@@ -468,6 +468,27 @@ was never read. **A passing test count is not a passing suite**: read the exit c
 `Errors` line. This is the same class as the timeout above — a real failure wearing the costume of
 something else.
 
+### ⚠️ `void <async>` at a test seam: a failure that blames an unrelated file
+
+The general form of the trap above, and worth knowing on its own because the symptom points
+somewhere the bug is not. Found by `work-ai2` on 2026-09-16, diagnosed to a fix:
+
+A test called `void shutdownRealmThenReload(...)`. The `void` let the whole registered-task chain run
+asynchronously and **outlive the test file**. Vitest attributes late async work to *whatever file is
+running when it settles* — so the failure surfaced in **a different game's suite entirely**, and was
+unreproducible in isolation. Capturing and awaiting the promise fixed it.
+
+- **The shape:** `void <async call>` (or any un-awaited promise) at a test seam.
+- **The tell:** *fails only in the full run, passes alone, and blames an unrelated file.*
+- ⚠️ **Per-file isolation does NOT contain it.** A fresh module registry per file still shares the
+  process, so an escaped promise crosses files regardless. Do not reason "each file is isolated,
+  therefore this cannot be cross-file".
+
+Three clones hit `games/wordweave/tests/backgroundRotation.test.ts` three different ways on three
+different trees the same afternoon — a timeout, a non-reproducing assertion, and this escaped
+promise. When one test keeps absorbing unrelated failures, suspect the victim's own isolation, not
+three coincidences. Context on #1285.
+
 ### What the environment flip does NOT risk, and how that was checked
 
 The obvious worry is a test that still passes under node because its subject silently no-ops without
