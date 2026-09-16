@@ -126,30 +126,55 @@ function localSidecarPath(absPath: string): string {
   return absPath + '.meta.local.json';
 }
 
-/** Content-cache blocks that carry byte-size stats.
- *
- *  ⚠️ `videoCache` is deliberately NOT one of them, though it carries `bytes` in the same shape.
- *  A video's byte size is not inspector-only: the manifest bakes it (`vite-asset-scanner.ts` →
- *  `video.bytes`) because `policy: 'auto'` decides stream-vs-download from it without a network
- *  round-trip. Peeling it would blank that on every machine but the one that imported the clip,
- *  silently flipping the runtime's choice on a fresh clone — the exact machine-dependence this
- *  split exists to remove. Asked and answered in #1279; do not "complete the list". */
-const CACHE_BLOCKS = ['textureCache', 'modelCache', 'fontCache', 'audioCache', 'environmentCache', 'atlasCache'] as const;
+/** Content-cache blocks whose contents are split between the COMMITTED sidecar and this machine's
+ *  gitignored one. Being listed here does NOT mean "peel everything" — what gets peeled is decided
+ *  per block by {@link LOCAL_KEYS}. */
+const CACHE_BLOCKS = ['textureCache', 'modelCache', 'fontCache', 'audioCache', 'environmentCache', 'atlasCache', 'videoCache'] as const;
 type CacheBlock = (typeof CACHE_BLOCKS)[number];
-/** Machine-local, inspector-only size fields peeled out of EVERY cache block. */
+
+/** Machine-local, inspector-only size fields. Spread into most blocks below — but NOT all of them,
+ *  which is why this is a named list rather than an unconditional prefix (#1300). */
 const VOLATILE_STAT_KEYS = ['variantBytes', 'lodBytes', 'triCounts', 'bytes'] as const;
-/** Extra per-block keys that are host-dependent rather than merely volatile, so
- *  committing them churns the tree between clones. See the module note for why
- *  these two, and why no third one belongs here by analogy. */
-const HOST_LOCAL_KEYS: Partial<Record<CacheBlock, readonly string[]>> = {
-  modelCache: ['hash'],
-  audioCache: ['durationSec'],
+
+/** Every key peeled out of each block into the gitignored local sidecar.
+ *
+ *  ⚠️ **This table is authoritative and EXHAUSTIVE** — `Record<CacheBlock, …>` means adding a block
+ *  to `CACHE_BLOCKS` fails to compile until someone decides what it peels. That is deliberate: the
+ *  previous shape applied `VOLATILE_STAT_KEYS` to every block unconditionally and kept a small
+ *  per-block table of *extras*, which made "peel `bytes`" and "be split at all" the same decision.
+ *  `videoCache` needs those separated, so the composition moved here where each block states its
+ *  own whole answer.
+ *
+ *  ⚠️ **`videoCache` peels `durationSec` but KEEPS `bytes` committed, and the asymmetry is the
+ *  point.** A video's byte size is not Inspector-only: the manifest bakes it
+ *  (`vite-asset-scanner.ts` → `video.bytes`) because `resolveDeliveryPolicy`'s `policy: 'auto'`
+ *  decides stream-vs-download from it with no network round-trip (`videoUrl.ts` passes `v?.bytes`
+ *  and nothing else). Peeling it would blank that on every machine but the importing one, silently
+ *  flipping the runtime's choice on a fresh clone — the exact machine-dependence this split exists
+ *  to remove (#1279; do not "complete the list"). Its `durationSec` has no such consumer: the only
+ *  reader anywhere is the Inspector's duration row (`VideoAssetView.tsx`), and
+ *  `VideoManifestBlock.durationSec` is declared but consumed by nothing. It is measured by ffprobe
+ *  on the file ffmpeg produced, so it tracks the MACHINE — and already had: two byte-identical
+ *  `cutscene.mp4` copies (`games/video-test`, `demos/video-demo`) were committed with the same
+ *  hash and bytes but `24.009002` against `24.01` (#1300). */
+const LOCAL_KEYS: Record<CacheBlock, readonly string[]> = {
+  textureCache: VOLATILE_STAT_KEYS,
+  fontCache: VOLATILE_STAT_KEYS,
+  environmentCache: VOLATILE_STAT_KEYS,
+  atlasCache: VOLATILE_STAT_KEYS,
+  // `hash` mixes local CLI versions (hashKey/riggedHash, the latter encoding whether toktx exists
+  // at all), so committing it churns between clones — #127.
+  modelCache: [...VOLATILE_STAT_KEYS, 'hash'],
+  // ffprobe MEASURES durationSec on the file ffmpeg produced, and resolveTool picks both binaries
+  // per machine — #1289.
+  audioCache: [...VOLATILE_STAT_KEYS, 'durationSec'],
+  // See the ⚠️ above: duration is host-measured, `bytes` is load-bearing and stays committed.
+  videoCache: ['durationSec'],
 };
 
 /** Every key peeled out of `block` into the gitignored local sidecar. */
 function localKeysFor(block: CacheBlock): readonly string[] {
-  const extra = HOST_LOCAL_KEYS[block];
-  return extra ? [...VOLATILE_STAT_KEYS, ...extra] : VOLATILE_STAT_KEYS;
+  return LOCAL_KEYS[block];
 }
 
 /** Read the sidecar JSON — the committed `.meta.json` with this machine's local
@@ -427,6 +452,14 @@ export function writeMetaSidecar(absPath: string, meta: Record<string, unknown>)
     // Left as-is deliberately: a block with a duration and no `hash`/`ext` is not a conversion
     // record either way, and dropping it is the honest reading. Noted because the failure is
     // silent, and because it is the one behaviour the peel changed outside the sidecar itself.
+    //
+    // ⚠️ #1300 brought `videoCache` under the same branch, and video HAS the same convert-or-ship
+    // truthiness (`plugins/backend/staticAssets.ts` auto-bakes on a variant cache miss). The reach
+    // is narrower than audio's on purpose: `videoCache` keeps `bytes` committed, so a block written
+    // by the reimport handler can never peel to empty — only a wholesale external write carrying
+    // `videoCache: { durationSec }` ALONE can land here. Same reading as audio's, and pinned by a
+    // test rather than left as an assumption, because this is the seam where the previous peel
+    // changed behaviour outside the sidecar.
     if (Object.keys(b).length === 0) { delete committed[block]; delete local[block]; }
   }
   writeJsonAtomic(sidecarPath(absPath), committed);

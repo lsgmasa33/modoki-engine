@@ -41,7 +41,21 @@ vi.mock('three/webgpu', () => ({
     constructor(public renderer: unknown) {}
     fromEquirectangular(source: unknown) {
       pmrem.generateCalls++;
-      if (pmrem.failSources.has(source)) throw new Error('mock pmrem generation failure');
+      if (pmrem.failSources.has(source)) {
+        // ⚠️ Mirror three's REAL `fromEquirectangular` → `_fromTexture`, which binds the
+        // generator's internal cubeUV target and clears `xr.enabled` on its way to a render and
+        // restores them ONLY from `_cleanup()` — the last statement of the normal-return path.
+        // `dispose()` does not call `_cleanup()`, which is the whole of #1298.
+        //
+        // A mock that merely THREW would pass whether or not our restore existed and prove
+        // nothing — the same trap the cube mock below already documents. Guarded so the plain `{}`
+        // renderers the other failure tests in this file use stay no-ops.
+        const r = this.renderer as { setRenderTarget?: (t: unknown) => void; setMRT?: (m: unknown) => void; xr?: { enabled: boolean } };
+        if (typeof r?.setRenderTarget === 'function') r.setRenderTarget(this);
+        if (typeof r?.setMRT === 'function') r.setMRT(null);
+        if (r?.xr) r.xr.enabled = false;
+        throw new Error('mock pmrem generation failure');
+      }
       const rt = {
         texture: { isTexture: true, isPMREMTexture: true, mapping: 'CubeUVReflectionMapping', uuid: `pmrem-${pmrem.generateCalls}`, dispose: vi.fn() },
         dispose: vi.fn(),
@@ -652,5 +666,80 @@ describe('syncEnvironment falls back to the raw equirect when there is no render
     } finally {
       releaseEnvironment(1, GUID);
     }
+  });
+});
+
+/** #1298 — both derivations borrow the renderer's global bindings, and three restores them only on
+ *  its own normal-return path. `PMREMGenerator.dispose()` calls `_dispose()` and never `_cleanup()`
+ *  (the method that runs `setRenderTarget(_oldTarget, …)`), and `CubeRenderTarget`'s equirect
+ *  conversion restores only after a successful render. So a throw used to leave the renderer bound
+ *  to an internal offscreen target, and the next frame drew into it instead of the canvas.
+ *
+ *  These drive a REAL failure through `buildEnvDerivedTarget` via `failSources` — the same hook the
+ *  ownership cases above use — rather than calling the helper directly, so they pin that each
+ *  branch actually ADOPTED it. `withRendererState`'s own semantics are covered in
+ *  tests/runtime/rendererState.test.ts. */
+describe('envPmrem restores the renderer\'s bindings when generation throws (#1298)', () => {
+  /** Models the binding rather than spying on it, so the assertion is about the END STATE the next
+   *  frame would render into. Note the suite's other cases pass a bare `{}` — that path is covered
+   *  by rendererState.test.ts's "no getRenderTarget" case. */
+  function makeTrackingRenderer() {
+    const r = {
+      _target: null as unknown,
+      _mrt: 'PREV_MRT' as unknown,
+      xr: { enabled: true },
+      getRenderTarget: vi.fn(() => r._target),
+      setRenderTarget: vi.fn((t: unknown) => { r._target = t; }),
+      getMRT: vi.fn(() => r._mrt),
+      setMRT: vi.fn((m: unknown) => { r._mrt = m; }),
+    };
+    return r;
+  }
+
+  it('pmrem: a generation throw leaves the renderer on its previous target, not the PMREM\'s', () => {
+    const renderer = makeTrackingRenderer();
+    const source = new THREE.DataTexture();
+    source.image = { width: 4, height: 2 } as never;
+    // Stand in for what three does inside fromEquirectangular before it fails.
+    pmrem.failSources.add(source);
+    renderer.setRenderTarget('CANVAS');
+
+    // getEnvPMREMTexture catches internally and degrades to undefined — it never throws into the
+    // render loop. The binding is the observable half.
+    expect(getEnvPMREMTexture(renderer, source)).toBeUndefined();
+
+    expect(renderer._target, 'the renderer must still point at what it did before the failed derivation').toBe('CANVAS');
+    expect(renderer._mrt).toBe('PREV_MRT');
+    expect(renderer.xr.enabled).toBe(true);
+  });
+
+  it('cube: a generation throw likewise leaves the previous target bound', () => {
+    const renderer = makeTrackingRenderer();
+    const source = new THREE.DataTexture();
+    source.image = { width: 4, height: 2 } as never;
+    cube.failSources.add(source);
+    renderer.setRenderTarget('CANVAS');
+
+    expect(getEnvCubeTexture(renderer, source)).toBeUndefined();
+
+    expect(renderer._target).toBe('CANVAS');
+    expect(renderer._mrt).toBe('PREV_MRT');
+  });
+
+  it('the ACCEPT side: a SUCCESSFUL derivation also leaves the previous target bound', () => {
+    // ⚠️ Scoped claim: the success mock binds nothing (three restores its own state from
+    // `_cleanup()` on this path), so this pins NON-INTERFERENCE — the helper must not clobber a
+    // working derivation — not the restore itself. The restore is pinned by the two throw cases
+    // above, whose mocks dirty the renderer first precisely so they can fail.
+    const renderer = makeTrackingRenderer();
+    const source = new THREE.DataTexture();
+    source.image = { width: 4, height: 2 } as never;
+    renderer.setRenderTarget('CANVAS');
+
+    expect(getEnvPMREMTexture(renderer, source)).toBeTruthy();
+
+    expect(renderer._target).toBe('CANVAS');
+    expect(renderer._mrt).toBe('PREV_MRT');
+    expect(renderer.xr.enabled).toBe(true);
   });
 });

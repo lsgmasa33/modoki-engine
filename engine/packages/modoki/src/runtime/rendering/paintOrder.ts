@@ -16,7 +16,10 @@
 export function computePaintOrder(
   sortOrderOf: Map<number, number>,
   parentOf: Map<number, number>,
-  /** Optional per-entity "Order in Layer" (Renderable2D.orderInLayer). When given, the
+  /** Optional per-entity "Order in Layer", collected by `orderInLayer.ts`'s
+   *  `collectOrderInLayer` from every 2D trait that carries the field (`Renderable2D`,
+   *  `Text2D`) — both the runtime and the editor SceneView pass the map from there, which is
+   *  what keeps the two surfaces agreeing (#1228). When given, the
    *  final order is re-ranked PRIMARILY by orderInLayer (higher = on top), with the
    *  hierarchy DFS index as the tiebreak — so an explicit layer order overrides tree
    *  position while entities sharing a layer keep their hierarchy stacking. */

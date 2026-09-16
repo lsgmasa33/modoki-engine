@@ -150,6 +150,56 @@ describe('writeMetaSidecar — committed / machine-local byte-stat split', () =>
     });
   });
 
+  it('peels videoCache.durationSec but KEEPS bytes committed — the asymmetry is the whole fix (#1300)', () => {
+    // The obstruction #1300 had to clear: `VOLATILE_STAT_KEYS` (which contains `bytes`) used to
+    // apply to every split block unconditionally, so `videoCache` could not join the split without
+    // peeling `bytes` too. `bytes` must stay committed — `resolveDeliveryPolicy`'s `policy: 'auto'`
+    // reads it (and ONLY it — `videoUrl.ts` passes `v?.bytes`) to choose stream-vs-download with no
+    // network round-trip, so peeling it would blank that on every machine but the importing one.
+    writeMetaSidecar(absPath, {
+      id: 'g',
+      videoCache: { hash: 'v1', ext: 'mp4', bytes: 1745855, durationSec: 24.009002, width: 640, height: 360, fps: 24, hasAudio: true },
+    });
+    const committed = JSON.parse(fs.readFileSync(absPath + '.meta.json', 'utf-8'));
+    // `bytes` present is the ASSERTION, not an oversight: a future "complete the list" that moved
+    // videoCache onto VOLATILE_STAT_KEYS would regress #1279 and must fail here.
+    expect(committed.videoCache).toEqual({
+      hash: 'v1', ext: 'mp4', bytes: 1745855, width: 640, height: 360, fps: 24, hasAudio: true,
+    });
+    expect(JSON.parse(fs.readFileSync(absPath + '.meta.local.json', 'utf-8'))).toEqual({
+      videoCache: { durationSec: 24.009002 },
+    });
+  });
+
+  it('merges videoCache.durationSec back on read, so the Video inspector still shows a duration', () => {
+    // Same reason as audio's: the only reader anywhere is VideoAssetView's duration row
+    // (VideoManifestBlock.durationSec is declared and consumed by nothing), so "peeled" has to
+    // differ from "dropped" here or the fix quietly removes a field the editor displays.
+    fs.writeFileSync(absPath + '.meta.json', JSON.stringify({
+      id: 'g', version: 2, videoCache: { hash: 'v1', ext: 'mp4', bytes: 1745855 },
+    }));
+    fs.writeFileSync(absPath + '.meta.local.json', JSON.stringify({
+      videoCache: { durationSec: 24.009002 },
+    }));
+    expect(readMetaSidecar(absPath).videoCache).toEqual({
+      hash: 'v1', ext: 'mp4', bytes: 1745855, durationSec: 24.009002,
+    });
+  });
+
+  it('a videoCache carrying ONLY durationSec peels to empty and commits no block (the truthiness seam)', () => {
+    // videoCache joining CACHE_BLOCKS brought it under the empty-block branch, and video has the
+    // same convert-or-ship truthiness audio does (staticAssets auto-bakes on a variant cache miss).
+    // Unreachable from the reimport handler — it always writes hash/ext/bytes, and `bytes` is not
+    // peeled for video — so only a wholesale external write (/api/write-meta,
+    // modoki_write_asset_meta) can land here. Pinned rather than assumed, because this is the seam
+    // where #1289's peel changed behaviour OUTSIDE the sidecar.
+    writeMetaSidecar(absPath, { id: 'g', videoCache: { durationSec: 24.01 } });
+    const committed = JSON.parse(fs.readFileSync(absPath + '.meta.json', 'utf-8'));
+    expect(committed).not.toHaveProperty('videoCache');
+    // The local half goes with it: with no committed block to merge into, those bytes are unreadable.
+    expect(fs.existsSync(absPath + '.meta.local.json')).toBe(false);
+  });
+
   it('merges durationSec back on read, so the Audio inspector still shows a duration', () => {
     // Its one consumer is AudioAssetView's inspector row — `AudioManifestBlock` bakes
     // loadType/format/ext and no duration — so "peeled" has to differ from "dropped" HERE or the

@@ -207,25 +207,68 @@ crosses an MP3 granule — and this Mac's two ffprobe builds disagree about
 duration on all 26. Nothing consumes the value (`AudioManifestBlock` bakes
 `loadType`/`format`/`ext` and no duration); its one reader is `AudioAssetView`'s
 Inspector row, which gets it back from the merged local half — *on a machine that
-has one*. A fresh clone shows no Duration row at all until the clip is first served
-and re-baked, the same self-heal `modelCache.hash` already relies on.
+has one*.
+
+⚠️ **And in practice NO machine has one, so the Duration row is blank — for audio
+since #1289 and for video since #1300.** Measured 2026-09-16 on this clone: 107
+`.meta.local.json` files exist (63 png, 37 glb, 3 jpg, 2 ttf, 1 hdr, 1 gltf) and
+**zero** for any audio or video clip. Both peels stripped the committed value
+without seeding the local half, and nothing seeds it later.
+
+⚠️ **This is NOT the self-heal `modelCache.hash` relies on, and that analogy is
+what hid it.** A stale model hash IS a cache miss — the serving path cannot find
+the processed file, so it re-bakes. A missing `durationSec` is not: the audio and
+video routes in `plugins/backend/staticAssets.ts` auto-bake only when
+`fs.existsSync(cached)` is false, i.e. when the converted BYTES are absent. With a
+warm variant cache no reimport ever fires, so the row stays blank indefinitely on
+every machine, not just a fresh clone. It comes back only on an explicit reimport
+(Inspector → Apply). Tracked as a class — the peel migrations that need a seeding
+step — rather than fixed per-format.
 
 Its siblings `channels`/`sampleRate` stay committed, but ⚠️ **not because the
 settings force them.** That reason holds for wordweave's 26 clips and is false for
 `demos/forest-camp`'s 3, which set `forceMono: false` and no `sampleRate`, so
 `buildFfmpegArgs` passes neither `-ac` nor `-ar` and both values are ffprobe
 readings of the source. They stay committed because their value follows the source
-deterministically and no divergence has been observed in them — and a machine with
-NO ffprobe deletes them outright, which #1300 tracks.
+deterministically and no divergence has been observed in them.
+
+⚠️ **A machine with no ffprobe used to DELETE them, and the fix was to stop the
+deletion rather than to peel more** (#1300). `probeStats` swallows every ffprobe
+failure and returns `{}`, and nothing gates ffprobe the way `ensureFfmpeg()` gates
+ffmpeg — `ffprobeBinary()` simply returns a name. The reimport handlers then wrote
+their cache block WHOLESALE, so a reimport on such a machine dropped
+`channels`/`sampleRate` from all 29 audio sidecars (and `width`/`height`/`fps`/
+`hasAudio` from video's, which carries more probe-only fields), and the machine that
+does have ffprobe put them back on its next bake — the non-converging ping-pong this
+whole split exists to stop.
+
+**Both handlers now MERGE**: the previous block is spread first, so a probe reading
+that is absent leaves the committed value alone, while the conversion's own
+`hash`/`ext`/`bytes` still win unconditionally and a stale hash can never survive a
+reimport. Peeling `channels`/`sampleRate` was rejected — it would remove reviewable
+values to fix a churn nobody has observed. Failing loudly on a missing ffprobe was
+considered and rejected too (owner, 2026-09-16): merging also covers ffprobe present
+but erroring on ONE file, which a startup gate would not, and it breaks no machine
+that imports successfully today. **Accepted cost:** a clip re-encoded to different
+channels on a run where the probe fails keeps the old reading until a run that can
+measure it — a stale number instead of a deleted one.
+
+⚠️ ffmpeg-present/ffprobe-absent is **constructible but never observed** on a real
+machine (the two are separate auto-installs, `engine/toolchain/index.ts`). What was
+driven is the consequence: the real writer, fed the block a no-ffprobe reimport
+produces.
 
 ⚠️ **"The hash is reproducible" is not "the artifact is."** The in-repo
 `*_ENCODER_VERSION` literal each key mixes stands in for an external CLI whose
 real version is hashed nowhere, so one committed hash can name different
 converted bytes on two machines — audio and video via `ffmpeg`, textures and
 environments via `toktx` (a manual install, so nothing pins it). The peel above
-removes the sidecar churn that exposed this for audio; **#1297 tracks the
-divergence itself, and after #1289 a clean `git status` is no longer evidence
-about it.**
+removes the sidecar churn that exposed this for audio and video; **#1297 tracks the
+divergence itself, and after #1289 and #1300 a clean `git status` is no longer
+evidence about it.** ⚠️ #1300 widened exactly that blind spot — the divergent
+`videoCache.durationSec` is gone from the tree, which removes the last committed
+signal that two machines' ffprobe builds disagree. Do not read the quiet as
+agreement.
 
 **The local file fills a cache block in; it never CREATES one (#1279).** For
 **audio and environments**, a block's mere existence is what the build reads as
@@ -248,18 +291,32 @@ committed sidecar now decides WHICH blocks exist and the local file only
 supplies this host's values inside them; a local block with no committed
 counterpart is inert, and the next `writeMetaSidecar` clears it.
 
-⚠️ **`videoCache` is deliberately outside this split**, though it carries `bytes`
-in the same shape. A video's size is not Inspector-only: the manifest bakes it
-so `policy: 'auto'` can choose stream-vs-download without a network round-trip.
-Peeling it would blank that everywhere but the importing machine — the very
-machine-dependence the split exists to remove. Asked and answered in #1279.
+⚠️ **`videoCache` is SPLIT DOWN THE MIDDLE, and the asymmetry is deliberate: `durationSec` is
+peeled, `bytes` stays committed** (#1300, resolving what #1279 left open).
 
-⚠️ **That argument is about `bytes`, and it does NOT settle `durationSec`.** The two
-committed sidecars for the same byte-identical `cutscene.mp4` (`games/video-test`
-and `demos/video-demo`) carry the same `videoCache.hash` and the same `bytes`, and
-record `24.009002` against `24.01` — #1289's mechanism, already in the tree rather
-than waiting to happen. Peeling it is not a list entry: joining `CACHE_BLOCKS` would
-peel `bytes` with it, so it needs a per-key split. #1300 tracks that.
+`bytes` is not Inspector-only. The manifest bakes it so `resolveDeliveryPolicy`'s
+`policy: 'auto'` can choose stream-vs-download without a network round-trip —
+`videoUrl.ts` passes `v?.bytes` and nothing else. Peeling it would blank that
+everywhere but the importing machine: the very machine-dependence the split
+exists to remove. Asked and answered in #1279, and still the answer.
+
+`durationSec` has no such consumer. Its only reader anywhere is `VideoAssetView`'s
+Inspector duration row — `VideoManifestBlock.durationSec` is declared and consumed
+by nothing — and ffprobe MEASURES it on the file ffmpeg produced, so it tracks the
+machine exactly as audio's does. It had already diverged in the committed tree: the
+byte-identical `cutscene.mp4` under `games/video-test` and `demos/video-demo`
+carried the same `videoCache.hash` and the same `bytes` against `24.009002` and
+`24.01`. ⚠️ Five other video sidecars agreed across both local ffprobe builds and
+were peeled anyway — "this clip happens to be stable" is the reasoning #1300 exists
+to correct, and reading `loop-screen.mp4`'s agreement as "video is fine" is the
+mistake that was made once already.
+
+**What made this a mechanism change rather than a list entry:** per-key peeling
+already existed (`HOST_LOCAL_KEYS`), but `VOLATILE_STAT_KEYS` — which contains
+`bytes` — was applied to every split block unconditionally, so "peel `bytes`" and
+"be split at all" were one decision. `LOCAL_KEYS` is now authoritative per block and
+`Record<CacheBlock, …>`, so adding a cache block does not compile until someone
+states what it peels.
 
 A fresh checkout has no `.meta.local.json` (gitignored), so it self-heals for
 free: the serving path already treats a missing/stale model hash as a cache

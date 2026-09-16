@@ -78,6 +78,10 @@ const HOST_LOCAL_PAIRS: ReadonlyArray<{ block: string; key: string; issue: strin
     block: 'audioCache', key: 'durationSec', issue: '#1289',
     why: 'ffprobe MEASURES it on the file ffmpeg produced, and resolveTool picks both binaries per machine — 4 of wordweave\'s 26 clips encode to different bytes under ffmpeg 6.0 vs 8.1.1',
   },
+  {
+    block: 'videoCache', key: 'durationSec', issue: '#1300',
+    why: 'same mechanism as audio\'s, and it had ALREADY diverged in the committed tree: the byte-identical cutscene.mp4 under games/video-test and demos/video-demo carried the same videoCache.hash and the same bytes but 24.009002 against 24.01. Only videoCache.durationSec is host-local — `bytes` stays COMMITTED on purpose, because resolveDeliveryPolicy\'s policy:"auto" reads it to choose stream-vs-download without a network round-trip (#1279)',
+  },
 ];
 
 describe('committed .meta.json sidecars never carry a host-local cache value (#127, #1289)', () => {

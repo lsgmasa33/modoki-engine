@@ -27,6 +27,7 @@ import { getCurrentWorld } from '../../runtime/core/ecs/world';
 import { getAllTraits } from '../../runtime/core/ecs/traitRegistry';
 import { getStructureVersion } from '../../runtime/core/ecs/entityUtils';
 import { computePaintOrder } from '../../runtime/rendering/paintOrder';
+import { collectOrderInLayer } from '../../runtime/rendering/orderInLayer';
 import { get2DDirtyVersion } from '../store/canvas2DDirty';
 
 export interface Canvas2DRoutingMaps {
@@ -42,10 +43,8 @@ function buildCanvas2DRouting(): Canvas2DRoutingMaps {
   const allTraits = getAllTraits();
   const eaMeta = allTraits.find(t => t.name === 'EntityAttributes');
   const c2dMeta = allTraits.find(t => t.name === 'Canvas2D');
-  const r2dMeta = allTraits.find(t => t.name === 'Renderable2D');
   const parentOf = new Map<number, number>();
   const sortOrderOf = new Map<number, number>();
-  const orderInLayerOf = new Map<number, number>();
   const canvasIds = new Set<number>();
   if (eaMeta) {
     getCurrentWorld().query(eaMeta.trait).updateEach(([ea]: any[], entity: any) => {
@@ -53,11 +52,18 @@ function buildCanvas2DRouting(): Canvas2DRoutingMaps {
       sortOrderOf.set(entity.id(), ea.sortOrder || 0);
     });
   }
-  if (r2dMeta) {
-    getCurrentWorld().query(r2dMeta.trait).updateEach(([r]: any[], entity: any) => {
-      if (r.orderInLayer) orderInLayerOf.set(entity.id(), r.orderInLayer);
-    });
-  }
+  // ⚠️ The order-in-layer map comes from the SHARED runtime helper, not from a local
+  // `Renderable2D`-only pass (#1228). The local pass was the defect: the runtime collected it from
+  // `Renderable2D` AND `Text2D` while this one read `Renderable2D` alone, so a `Text2D.orderInLayer`
+  // — which this very editor's Inspector exposes — moved the label in the game and not in SceneView,
+  // and the pick below then handed the click to the sprite underneath.
+  //
+  // This resolves the traits by direct import rather than through `getAllTraits()` like the two
+  // metadata lookups above. That is safe because it is the SAME trait object either way:
+  // `engine/app/ecs/traits/index.ts` re-exports from `@modoki/engine/runtime`, which is what the
+  // helper imports, and `registerTraits.ts` registers those very objects. It is also what makes the
+  // helper the single source — a name-keyed lookup here would be a second list to keep in step.
+  const orderInLayerOf = collectOrderInLayer(getCurrentWorld());
   if (c2dMeta) {
     getCurrentWorld().query(c2dMeta.trait).updateEach((_: any, entity: any) => {
       canvasIds.add(entity.id());

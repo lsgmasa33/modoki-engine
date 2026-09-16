@@ -20,7 +20,14 @@ export const videoReimportHandler: ReimportHandler = async (sourceUrlPath, absPa
   });
   if (typeof meta.id !== 'string') meta.id = randomUUID();
   meta.video = settings;
+  // ⚠️ MERGE, never replace — the same mechanism as reimport-audio.ts, see the long note there
+  // (#1300). Video's `probeStats` swallows ffprobe failures identically, and this block carries
+  // MORE probe-only fields than audio's (`width`/`height`/`fps`/`hasAudio`), so a wholesale
+  // replacement on a machine without ffprobe erased four values rather than two. `bytes` comes from
+  // `statSync`, not the probe, so it survives either way — but it is the only one that did.
+  const prevVideoCache = (meta.videoCache ?? {}) as Record<string, unknown>;
   meta.videoCache = {
+    ...prevVideoCache,
     hash: result.hash,
     ext: result.ext,
     bytes: result.bytes,

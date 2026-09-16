@@ -19,14 +19,20 @@
  *  cannot key, i.e. a raw internal asset path on an instance whose scene has never been saved.
  *  Measured over the repo's 56 scenes: at most 4 distinct prefabs per scene, median 0.
  *
- *  ⚠️ Registered as a **beforeSwap** hook, not a post-load one, and the distinction matters:
- *  the loader AWAITS these, so the swap cannot complete while the cache is half warm. A
- *  post-swap hook would leave a window in which a gesture reads cold. */
+ *  ⚠️ Registered as a **beforeSwap** hook, not a post-load one, and the distinction matters: the
+ *  loader AWAITS these, so no gesture can land in a window where the cache is still cold. A
+ *  post-swap hook would leave exactly that window.
+ *
+ *  ⚠️ It is NOT a barrier, though — `fireBeforeSwapHooks` wraps each hook in try/catch and only
+ *  `console.warn`s, so a throw mid-loop leaves a PARTIALLY warmed cache and the swap proceeds
+ *  anyway. Nothing here realistically throws (the fetch swallows its own errors), but do not
+ *  read the await as a guarantee that the cache is complete. */
 
 import type { World } from 'koota';
 import { sceneManager } from '../../runtime/scene/SceneManager';
 import { getCachedPrefab } from '../../runtime/loaders/meshTemplateCache';
 import { getTraitByName } from '../../runtime/core/ecs/traitRegistry';
+import { isGuid } from '../../runtime/loaders/assetManifest';
 import { getPrefabSource, isEditorPrefabCached, primeEditorPrefabCache, type PrefabFile } from './prefab';
 
 /** Every distinct `PrefabInstance.source` in `world`. Read off the STAGING world the hook is
@@ -45,10 +51,18 @@ function liveSources(world: World): string[] {
 export async function warmEditorPrefabCacheFor(world: World): Promise<void> {
   for (const source of liveSources(world)) {
     if (isEditorPrefabCached(source)) continue;
-    // The loader already fetched, parsed and migrated this — take it rather than re-reading.
-    const shared = getCachedPrefab(source) as PrefabFile | undefined;
-    if (shared) { primeEditorPrefabCache(source, shared); continue; }
-    // Not keyable by the runtime cache (a raw asset path on an unsaved instance) — fetch it.
+    // ⚠️ GUID only. `getCachedPrefab` resolves the ref internally via `resolveRef`, which
+    // REJECTS an internal asset path with a loud console.error — and a raw path is precisely
+    // the case the fetch below exists for, so asking anyway would print an integrity error on
+    // the one input this branch is designed to handle. `fetchPrefabSource` dodges the same
+    // edge deliberately (it uses `assetUrl` for a non-guid); this matches it.
+    if (isGuid(source)) {
+      // The loader already fetched, parsed and migrated this — take it rather than re-reading.
+      const shared = getCachedPrefab(source) as PrefabFile | undefined;
+      if (shared) { primeEditorPrefabCache(source, shared); continue; }
+    }
+    // Not in the runtime cache, or not keyable by it (a raw asset path on an instance whose
+    // scene has never been saved) — fetch it.
     await getPrefabSource(source);
   }
 }

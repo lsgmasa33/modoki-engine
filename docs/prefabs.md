@@ -644,10 +644,19 @@ the file.**
     cannot complete half-warm) that takes each prefab from the RUNTIME cache the loader has already
     filled. A `Map.get` plus a `Map.set`; it only fetches for a source the runtime cache cannot key.
 
-  The ~15 `await preloadNestedPrefabsForSubtree(...)` calls are deliberately KEPT even though both
-  of the above should make them redundant: each is a `Map.has` once warm, and the failure they
-  guard against is SILENT. They are the cheap half of the defence; the census that policed them was
-  the expensive half, and only that was removed.
+  ⚠️ **"By construction" is NOT universal, and the exceptions are why the per-call-site warms stay.**
+  Three spawners put a live instance into the CURRENT world *after* the swap, so the beforeSwap hook
+  structurally cannot reach them: the timeline scrub preview and its control-track edge
+  (`runtime/timeline/timelineSystem.ts`), and the UIEntries scroll pool
+  (`runtime/loaders/entryPrefabProvider.ts` → `runtime/ui/entriesSystem.ts`). All three go through
+  `spawnPrefabInstance`, which writes a non-empty `source`, and none goes through
+  `instantiatePrefabInstance`. A game spawning a prefab from `onSceneReady` is the same shape.
+
+  The ~15 `await preloadNestedPrefabsForSubtree(...)` calls are therefore deliberately KEPT: each
+  is a `Map.has` once warm, the failure they guard against is SILENT, and the paragraph above does
+  not cover everything. They are the cheap half of the defence; the census that policed them was
+  the expensive half, and only that was removed. ⚠️ Nothing now detects their removal — that was
+  the census's one uncovered job, recorded here rather than left implicit.
 
   ⚠️ **Do not trust a census that anchors on ONE reader — this paragraph shipped a wrong count
   three times doing exactly that.** The sync reads are not three; in `prefab.ts` alone there are

@@ -10,6 +10,9 @@
  *     mid-session instance invisible. */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import { readScannedSource } from '../helpers/sourceScanner';
 import { createWorld, trait } from 'koota';
 
 const Transform = trait({ x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
@@ -77,8 +80,13 @@ vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({
   getCachedPrefab: (ref: string) => runtimeCache.get(ref),
 }));
 
+const registerSpy = vi.fn();
+const unregisterSpy = vi.fn();
 vi.mock('../../src/runtime/scene/SceneManager', () => ({
-  sceneManager: { registerBeforeSwap: vi.fn(), unregisterBeforeSwap: vi.fn() },
+  sceneManager: {
+    registerBeforeSwap: (...a: unknown[]) => registerSpy(...a),
+    unregisterBeforeSwap: (...a: unknown[]) => unregisterSpy(...a),
+  },
 }));
 
 const PATH = '/assets/prefabs/fish.prefab.json';
@@ -109,6 +117,7 @@ const mockFetch = vi.fn(async (url: string) => {
 beforeEach(() => {
   testWorld = createWorld(); index.clear(); runtimeCache.clear(); fetches = [];
   invalidateSpy.mockClear(); mockFetch.mockClear();
+  registerSpy.mockClear(); unregisterSpy.mockClear();
   vi.stubGlobal('fetch', mockFetch);
 });
 afterEach(() => { vi.unstubAllGlobals(); });
@@ -189,5 +198,72 @@ describe('instantiatePrefabInstance — cache keyed by what the INSTANCE carries
       'setPrefabSource resolves the path to the guid — that is the key readers will use').toBe(GUID);
     expect(m.getCachedPrefabSync(GUID),
       'caching under the PATH alone is what left every mid-session instance invisible').not.toBeNull();
+  });
+});
+
+/** ⚠️ ONE assertion, and deliberately not a census.
+ *
+ *  The source census this replaced enumerated every READER and demanded a warm before each, so it
+ *  needed a new anchor per reader — and every sweep that anchored on one of them missed a path,
+ *  including its own, twice. It was deleted for that (owner, 2026-09-16).
+ *
+ *  This is the opposite shape: a single invariant that does not grow. `setPrefabSource` resolves a
+ *  path to the GUID the instance will carry, so pairing it with an instantiate is exactly the step
+ *  that must also seed the cache — which is `instantiatePrefabInstance`'s whole job. Any OTHER
+ *  production caller is a path that links an instance without caching it, i.e. the #1295 defect.
+ *
+ *  It is here because the close-out sweep found precisely that: `modoki_prefab instantiate` and its
+ *  undo respawn, which the deleted census could never have caught either (it anchored on
+ *  serializePrefab / captureInstanceStructure / tagEntityTreeAsInstance, and that path calls none). */
+describe('#1295 — setPrefabSource is prefab.ts\'s to pair with an instantiate', () => {
+  it('has no production caller outside prefab.ts', () => {
+    const roots = [path.resolve(__dirname, '../../src/editor'), path.resolve(__dirname, '../../../../app')];
+    const offenders: string[] = [];
+    for (const root of roots) {
+      for (const rel of fs.readdirSync(root, { recursive: true }) as string[]) {
+        if (!/\.tsx?$/.test(rel)) continue;
+        const abs = path.join(root, rel);
+        if (abs.endsWith(`editor${path.sep}scene${path.sep}prefab.ts`)) continue;
+        // ⚠️ Through the stripping reader, never raw text (#812): a COMMENT naming
+        // `setPrefabSource(` would otherwise be reported as an offender, and this file's own
+        // fix commentary does exactly that. `setPrefabSourceRefresher` is a different symbol,
+        // so the pattern requires the call paren.
+        const code = readScannedSource(abs).code;
+        if (/\bsetPrefabSource\s*\(/.test(code)) offenders.push(rel);
+      }
+    }
+    expect(offenders,
+      'pair instantiate + setPrefabSource + cache-seed via instantiatePrefabInstance instead — a bare setPrefabSource links the instance but leaves the cache keyed by the path, which every sync reader then misses')
+      .toEqual([]);
+  });
+});
+
+/** ⚠️ The WIRING, not the helper — and it is here because close-out review proved nothing
+ *  covered it: deleting `installEditorPrefabCacheWarm()` from `createGameEditor` left every
+ *  suite green, the hook never registered, no scene load was ever warmed, and the only symptom
+ *  was silent data loss. A producer whose consumer nobody wired is a documented class in this
+ *  repo, and #1277 hit the same shape in the same range ("cover the PRODUCTION wiring, not just
+ *  the helper"). */
+describe('#1295 — the swap warm is actually installed', () => {
+  it('registers a beforeSwap hook, and the disposer unregisters that same hook', async () => {
+    const { installEditorPrefabCacheWarm } = await warm();
+
+    const dispose = installEditorPrefabCacheWarm();
+
+    expect(registerSpy).toHaveBeenCalledTimes(1);
+    const hook = registerSpy.mock.calls[0]![0];
+    expect(typeof hook).toBe('function');
+    dispose();
+    expect(unregisterSpy).toHaveBeenCalledWith(hook);
+  });
+
+  it('is called by the editor entry point — a hook nobody installs warms nothing', () => {
+    // ⚠️ Stripped, not raw (#812): read as raw text, a comment merely MENTIONING the call
+    // would satisfy this assertion on its own — the guard passing while the wiring is gone.
+    const setup = readScannedSource(
+      path.resolve(__dirname, '../../../../app/editor/setup.ts')).code;
+    expect(/\binstallEditorPrefabCacheWarm\s*\(\s*\)/.test(setup),
+      'createGameEditor must install the warm; it is the editor-only entry point, so a game build never loads it')
+      .toBe(true);
   });
 });

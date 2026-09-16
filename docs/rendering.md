@@ -465,7 +465,8 @@ That is safe because `dispose()` frees the scratch state but **not** the output 
 the one thing we keep. The cube half (#775) has no generator to dispose — `CubeRenderTarget`
 disposes its own scratch geometry/material internally inside `fromEquirectangularTexture` — but it
 temporarily swaps the source texture's filtering flags and the renderer's MRT state, restoring both
-before returning, so it must only ever run from this sync, same as the PMREM build.
+before returning **on the normal path only** (see the throw-safety bullet below), so it must only
+ever run from this sync, same as the PMREM build.
 
 Consequences worth knowing before touching this:
 
@@ -475,6 +476,23 @@ Consequences worth knowing before touching this:
   so it is always the `three/webgpu` one. Using the wrong one **does not throw**: three logs
   `NodeBuilder: Material "ShaderMaterial" is not compatible` and returns a target that rendered
   nothing, so a silently BLACK environment gets bound and every unit test still passes.
+- ⚠️ **THE INVARIANT: any renderer-global binding this subtree touches is restored in a `finally`,
+  because three restores only on the NORMAL-RETURN path** (#1298). `setRenderTarget`/`setMRT`/
+  `xr.enabled` are renderer-global — whatever was bound last is what the next
+  `renderer.render(scene, camera)` draws into — and three gives no unconditional restore:
+  `PMREMGenerator.dispose()` calls `_dispose()` and **never** `_cleanup()`, the method that actually
+  runs `setRenderTarget(_oldTarget, …)`, whose only call sites are the last statement of
+  `fromScene()`/`_fromTexture()`; `CubeRenderTarget.fromEquirectangularTexture` and the
+  `CubeCamera.update` it calls behave the same. So a throw on a degraded or lost context used to
+  strand the renderer on an internal offscreen target and every later frame drew into it — a black
+  screen with nothing in the log. **Borrow the renderer through `withRendererState`
+  (`runtime/rendering/rendererState.ts`) rather than hand-rolling the pair**; the repo had three
+  correct hand-rolled copies and two that restored only on the normal path before this was
+  centralised. State belonging to the SOURCE or the SCENE (`minFilter`/`generateMipmaps`,
+  `scene.background`, `camera.layers.mask`, `autoClear`) stays at the call site — only the caller
+  knows what it perturbed. ⚠️ It does **not** address state borrowed across an `await`, where
+  another consumer legitimately runs inside the window: that is a different mechanism (#1239) that
+  a `finally` cannot close and would mask.
 - ⚠️ **The "0 / 0" row is a per-surface DELTA, not a claim that ownership is free.** Engine
   ownership keys on `(renderer, source, kind)` where three's own `CubeMapNode._cache` keys on the
   source alone — that is the point (three would hand one surface a target another renderer built),

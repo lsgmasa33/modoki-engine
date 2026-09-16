@@ -134,7 +134,21 @@ describe('repoCorpus', () => {
       //
       // The probe CREATES that state rather than asserting over whatever happens to be on disk —
       // with no worktree active the check would pass vacuously and prove nothing.
-      const probe = path.join(repoRoot(), '.claude', 'repoCorpus-probe-wt');
+      //
+      // ⚠️ PER-PROCESS NAME (#1291). This used to be the constant `repoCorpus-probe-wt`, which is
+      // defenceless against a SECOND vitest process in the same clone: both the opening `rmSync`
+      // and the `finally` one below delete by name, so whichever run is mid-assertion has its live
+      // probe deleted under it. Measured at 4 reds in 7 paired runs. The symptom is especially
+      // misleading here — the delete trips this test's own POSITIVE CONTROL, so it reports "git
+      // did not report the nested checkout at all" and sends the reader after `git ls-files`
+      // behaviour rather than after a concurrent delete.
+      //
+      // ⚠️ And the MATCHING below must use `probeName`, not the shared `repoCorpus-probe-wt`
+      // prefix: a substring match would be satisfied by the OTHER process's probe directory, so
+      // the positive control could pass on evidence this test did not create — re-introducing the
+      // vacuity the control exists to rule out, in a form that only appears under concurrency.
+      const probeName = `repoCorpus-probe-wt-${process.pid}`;
+      const probe = path.join(repoRoot(), '.claude', probeName);
       fs.rmSync(probe, { recursive: true, force: true });
       fs.mkdirSync(probe, { recursive: true });
       try {
@@ -148,9 +162,9 @@ describe('repoCorpus', () => {
           { cwd: repoRoot(), encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 },
         ).split('\0').filter(Boolean);
         expect(
-          raw.some((r) => r.includes('repoCorpus-probe-wt')),
-          'positive control failed: git did not report the nested checkout at all, so the '
-          + 'assertion below cannot distinguish "filtered correctly" from "never present"',
+          raw.some((r) => r.includes(probeName)),
+          'positive control failed: git did not report THIS process\'s nested checkout at all, so '
+          + 'the assertion below cannot distinguish "filtered correctly" from "never present"',
         ).toBe(true);
 
         // ⚠️ `repoFiles` memoises its raw enumeration per module instance, and earlier tests in
@@ -162,13 +176,36 @@ describe('repoCorpus', () => {
         const fresh = await import('../../scripts/repoCorpus.mjs');
         const files = fresh.repoFiles({ floor: 1 });
         expect(
-          files.some((f) => f.rel.includes('repoCorpus-probe-wt')),
-          'the fresh enumeration did not include the probe path in any form — the filter cannot '
-          + 'be credited for dropping something that was never enumerated',
+          files.some((f) => f.rel.includes(probeName)),
+          // ⚠️ This message used to read "the fresh enumeration did not include the probe path in '
+          // any form", which is the condition under which this assertion PASSES — it was worded
+          // for a vacuity check (the job of the positive control above, on `raw`) and never
+          // re-worded for the filter check it actually guards. A failure here means the opposite.
+          'repoFiles() returned the nested checkout\'s DIRECTORY entry — the directory filter did '
+          + 'not drop it, which is the EISDIR-on-readFileSync bug this test exists to prevent',
         ).toBe(false);
         for (const { rel, abs } of files) {
           expect(rel.endsWith('/'), `rel "${rel}" is a directory entry`).toBe(false);
-          expect(fs.statSync(abs).isFile(), `abs for "${rel}" is not a regular file`).toBe(true);
+          // ⚠️ `statSync` guarded, because the enumeration includes UNTRACKED files and this test
+          // is not the only writer of them (#1291 review). `repoFiles({floor:1})` defaults to
+          // `includeUntracked: true`, so a CONCURRENT vitest process's own probe file appears in
+          // this list — and its `finally` can delete it between our enumeration and this stat,
+          // giving an ENOENT that names the other process's file and points nowhere near the
+          // cause. Per-pid naming fixed the mutual DELETE; it cannot stop the two runs from
+          // enumerating each other. `rawRepoFiles` wraps its own stat for exactly this reason
+          // (`repoCorpus.mjs`); this loop did not.
+          //
+          // A file that vanished mid-test is not evidence about the DIRECTORY filter under test,
+          // so skipping it is the honest reading — the `rel.endsWith('/')` assertion above still
+          // runs on every entry, and that is the one this test exists for.
+          let stat: fs.Stats;
+          try {
+            stat = fs.statSync(abs);
+          } catch (e) {
+            if ((e as NodeJS.ErrnoException).code === 'ENOENT') continue; // vanished under us
+            throw e;
+          }
+          expect(stat.isFile(), `abs for "${rel}" is not a regular file`).toBe(true);
         }
       } finally {
         fs.rmSync(probe, { recursive: true, force: true });
@@ -192,7 +229,15 @@ describe('repoCorpus', () => {
       // a flake seam this test creates for its neighbours. `.tmp` is matched by no guard's
       // extension filter (docCitations' TEXT_EXT is md|ts|tsx|mjs|cjs|js|sh|yml|yaml), and the
       // root is outside every `under` root in the repo.
-      const probeRel = 'repoCorpus-untracked-probe.tmp';
+      //
+      // ⚠️ PER-PROCESS NAME (#1291). The reasoning above is about intra-process parallelism
+      // (`fileParallelism`, other files in THIS run) and it handled that correctly — but a fixed
+      // name is defenceless against a second vitest PROCESS in the same clone, which is an
+      // ordinary workflow (a scoped run beside a backgrounded gate, a mutation check overlapping
+      // one). Both runs delete this exact path, so whichever is mid-assertion sees its own probe
+      // vanish: either an ENOENT stat or a `some(...)` that is false where it must be true.
+      // Every property argued for above is preserved — repo root, `.tmp`, no scanner's filter.
+      const probeRel = `repoCorpus-untracked-probe.${process.pid}.tmp`;
       const probeAbs = path.join(root, probeRel);
       fs.rmSync(probeAbs, { force: true });
       try {

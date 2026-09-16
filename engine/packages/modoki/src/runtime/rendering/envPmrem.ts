@@ -22,6 +22,7 @@ import * as THREE from 'three';
 // — by the two console errors, not by any test.
 import { PMREMGenerator as WebGPUPMREMGenerator, CubeRenderTarget } from 'three/webgpu';
 import { registerEnvDisposeHook } from '../loaders/meshTemplateCache';
+import { withRendererState } from './rendererState';
 
 // ── Environment PMREM/cube derivation (#739, #779, #775) ─────────────────────────────
 //
@@ -97,29 +98,31 @@ function emptyPerKind<T>(make: () => T): Record<EnvDerivedKind, T> {
  *  else (caching, failure handling, disposal) is shared. Throws on failure; the caller catches. */
 function buildEnvDerivedTarget(renderer: object, source: THREE.DataTexture, kind: EnvDerivedKind): THREE.RenderTarget {
   if (kind === 'pmrem') {
-    // Constructed OUTSIDE the try, so `finally` can always reach it: if
-    // `fromEquirectangular` throws, three has already allocated the ~6 MB ping-pong render
-    // target, 11 LOD meshes and their materials, and `generator.dispose()` freeing them must
-    // still run.
-    // ⚠️ **This comment used to claim `dispose()` also brings three's `_cleanup()` with it,
-    // restoring the renderer's previous render target. That is FALSE** (read from three 0.185.1,
-    // both generators): `dispose()` calls `_dispose()` — materials, ping-pong target, LOD
-    // geometries — and never `_cleanup()`. `_cleanup()` is what runs `setRenderTarget(_oldTarget,
-    // …)` and restores `xr.enabled`, and it is called only as the last statement of `fromScene()`
-    // / `_fromTexture()`, i.e. on the NORMAL path. So on a throw this branch leaves the renderer
-    // bound to the PMREM's internal cube target and the NEXT frame renders into it instead of the
-    // canvas — the very failure the 'cube' branch below hand-rolls its own restore to prevent.
-    // Fixing that is #1298; the false premise is corrected here now because it is what stopped
-    // anyone writing the restore. PMREMGenerator accepts WebGLRenderer or
-    // WebGPURenderer; `renderer` here is typed loosely to avoid pulling the WebGPU renderer type
-    // into this file's public signature.
+    // TWO separate guarantees, and they are not interchangeable:
+    //
+    // ① `withRendererState` restores the renderer's render target / MRT / `xr.enabled`. three does
+    //    NOT do this for us: `PMREMGenerator.dispose()` calls `_dispose()` (materials, ping-pong
+    //    target, LOD geometries) and never `_cleanup()`, which is the method that runs
+    //    `setRenderTarget(_oldTarget, …)` — and `_cleanup()`'s only call sites are the last
+    //    statement of `fromScene()` / `_fromTexture()`, i.e. the NORMAL path. Without this, a
+    //    throw here left the renderer bound to the PMREM's internal cube target and every later
+    //    frame drew into it instead of the canvas (#1298). Read from three 0.185.1, both
+    //    generators.
+    // ② `generator.dispose()` frees the ~6 MB ping-pong target, 11 LOD meshes and their materials.
+    //    The generator is constructed OUTSIDE the try so the `finally` can always reach it, and it
+    //    frees scratch ONLY — never the returned render target, by design.
+    //
+    // PMREMGenerator accepts WebGLRenderer or WebGPURenderer; `renderer` is typed loosely here to
+    // avoid pulling the WebGPU renderer type into this file's public signature.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const generator = new WebGPUPMREMGenerator(renderer as any);
-    try {
-      return generator.fromEquirectangular(source);
-    } finally {
-      generator.dispose(); // frees the generator's scratch target + LOD meshes; NOT the rt (by design)
-    }
+    return withRendererState(renderer, () => {
+      try {
+        return generator.fromEquirectangular(source);
+      } finally {
+        generator.dispose();
+      }
+    });
   }
   // 'cube': no generator to dispose — `fromEquirectangularTexture` disposes its own scratch
   // geometry/material internally (`CubeRenderTarget.js`). It DOES temporarily mutate
@@ -132,22 +135,22 @@ function buildEnvDerivedTarget(renderer: object, source: THREE.DataTexture, kind
   // guarantee around it here.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const r = renderer as any;
-  const prevTarget = typeof r.getRenderTarget === 'function' ? r.getRenderTarget() : undefined;
-  const prevMRT = typeof r.getMRT === 'function' ? r.getMRT() : undefined;
-  const prevXrEnabled = r.xr ? r.xr.enabled : undefined;
+  // The renderer-global half goes through the shared helper — same guarantee the 'pmrem' branch
+  // above now gets, from one implementation. The SOURCE-TEXTURE half stays here: only this branch
+  // perturbs `minFilter`/`generateMipmaps`, so it is not renderer state and does not belong in a
+  // helper every borrower shares.
   const prevMinFilter = source.minFilter;
   const prevGenerateMipmaps = source.generateMipmaps;
-  try {
-    const rt = new CubeRenderTarget(source.image.height);
-    rt.fromEquirectangularTexture(r, source);
-    return rt;
-  } finally {
-    if (typeof r.setRenderTarget === 'function') r.setRenderTarget(prevTarget);
-    if (typeof r.setMRT === 'function') r.setMRT(prevMRT);
-    if (r.xr && prevXrEnabled !== undefined) r.xr.enabled = prevXrEnabled;
-    source.minFilter = prevMinFilter;
-    source.generateMipmaps = prevGenerateMipmaps;
-  }
+  return withRendererState(renderer, () => {
+    try {
+      const rt = new CubeRenderTarget(source.image.height);
+      rt.fromEquirectangularTexture(r, source);
+      return rt;
+    } finally {
+      source.minFilter = prevMinFilter;
+      source.generateMipmaps = prevGenerateMipmaps;
+    }
+  });
 }
 
 /** Get (or lazily build) the derived texture of `kind` for `source`, rendered with `renderer`.

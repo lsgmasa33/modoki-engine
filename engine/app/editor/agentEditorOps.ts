@@ -45,7 +45,7 @@ import {
   writeTraitFieldWithUndo, removeTraitFromEntitiesWithUndo, addTraitToEntitiesWithUndo,
   runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, discardDirtyAssets,
   applyAssetPathMoves, type PathMove,
-  getPrefabSource, instantiatePrefabAsync, setPrefabSource, serializePrefab, writePrefabFile, warnInertPrefabSizes,
+  getPrefabSource, instantiatePrefabInstance, serializePrefab, writePrefabFile, warnInertPrefabSizes,
   preloadNestedPrefabsForSubtree,
   resolveExistingPrefabId, tagEntityTreeAsInstance, untagEntityTreeAsInstance,
   detachPrefabInstance, reattachPrefabInstance,
@@ -2284,10 +2284,11 @@ export function registerEditorAgentOps(): void {
       // Validated like every other parent now (#1223): a stale or invented `parentId` used to pass through raw.
       const parentId = resolveParentId(p, 'prefab instantiate parent');
       const parentRef = parentId ? entityRef(parentId) : null;
-      const rootId = await instantiatePrefabAsync(prefab as PrefabFile, parentId);
-      // The human paths all pair instantiate with setPrefabSource — without it the spawned
-      // tree carries no link back to the prefab, so overrides/revert/apply have no source.
-      setPrefabSource(rootId, path);
+      // Shares the human paths' helper (#1295): instantiate + setPrefabSource + leave the
+      // editor cache keyed by what the instance CARRIES. Without the last part the tree is
+      // linked but the cache is keyed by `path` while the instance carries the resolved GUID,
+      // so every sync reader treats this instance as "not a prefab" and drops it silently.
+      const rootId = await instantiatePrefabInstance(prefab as PrefabFile, path, parentId);
       setSelectionRaw(rootId, [rootId]);
       pushAction(makePrefabInstantiateAction({
         label: `Instantiate "${(prefab as PrefabFile).name ?? path}"`,
@@ -2295,8 +2296,7 @@ export function registerEditorAgentOps(): void {
         respawn: async () => {
           const again = await getPrefabSource(path);
           if (!again) return null;
-          const id = await instantiatePrefabAsync(again as PrefabFile, parentRef ? (parentRef.resolve() ?? 0) : 0);
-          setPrefabSource(id, path);
+          const id = await instantiatePrefabInstance(again as PrefabFile, path, parentRef ? (parentRef.resolve() ?? 0) : 0);
           return id;
         },
         remove: (id) => { deleteEntity(id); },

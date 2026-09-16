@@ -64,6 +64,7 @@ import {
   beginPrecompile, runExclusivePrecompile, borrowRendererTarget, PRECOMPILE_MAX_HOLD_MS, type PrecompileSession,
 } from './precompileSession';
 import { rawNow } from '../../core/clock';
+import { withRendererState } from '../rendererState';
 
 /** One assembled stage.
  *  - `applyConfig` pushes this stage's own config into live uniforms (a no-op
@@ -402,10 +403,16 @@ export class PostFXStack {
               const w = Math.max(1, Math.floor(_size.x * pr));
               const h = Math.max(1, Math.floor(_size.y * pr));
               if (stylizedRT.width !== w || stylizedRT.height !== h) stylizedRT.setSize(w, h);
-              const prevRT = this.renderer.getRenderTarget();
-              this.renderer.setRenderTarget(stylizedRT);
-              inner.render(); // everything upstream → stylizedRT (working space)
-              this.renderer.setRenderTarget(prevRT);
+              // ⚠️ The restore must survive a THROW (#1298). `inner.render()` is the entire
+              // upstream post-FX chain, so a shader-compile failure or a lost device inside it
+              // used to leave the renderer bound to `stylizedRT` — and every later frame then drew
+              // into that offscreen target instead of the canvas, with nothing in the log. The
+              // save/restore pair was here already; what it lacked was a `finally`.
+              // `ParticlePassNode`, the consumer of this very target, has always done it this way.
+              withRendererState(this.renderer, () => {
+                this.renderer.setRenderTarget(stylizedRT);
+                inner.render(); // everything upstream → stylizedRT (working space)
+              });
             },
             dispose: () => {
               inner.dispose();

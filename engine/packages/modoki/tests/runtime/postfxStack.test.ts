@@ -675,6 +675,29 @@ describe('PostFXStack — NPR particle stage (scene-injecting, not a filter)', (
     expect(renderer.setRenderTarget).toHaveBeenCalledTimes(2);
     expect(renderer.setRenderTarget.mock.calls[1][0]).toBeNull();
   });
+
+  it('render() restores the previous render target even when the internal pass THROWS (#1298)', async () => {
+    // The throw twin of the test above, and the defect #1298 fixed here. The save/restore pair
+    // existed but was a pair of BARE STATEMENTS: `inner.render()` is the entire upstream post-FX
+    // chain, so a shader-compile failure or a lost device inside it skipped the restore and left
+    // the renderer bound to the stylized RT — every later frame then drew into that offscreen
+    // target instead of the canvas, with nothing in the log.
+    const renderer = makeRenderer();
+    const { PostFXStack } = await import('../../src/runtime/rendering/postfx/PostFXStack');
+    const stack = new PostFXStack(renderer, new THREE.Scene(), new THREE.PerspectiveCamera(), { npr: nprCfg() } as never);
+    const [internal, terminal] = renderPipelines;
+    internal.render = vi.fn(() => { throw new Error('mock compile failure in the upstream chain'); });
+
+    expect(() => stack.render()).toThrow(/mock compile failure/);
+
+    // Restored despite the throw: bound to the stylized RT, then back to null.
+    expect(renderer.setRenderTarget).toHaveBeenCalledTimes(2);
+    expect(renderer.setRenderTarget.mock.calls[0][0]).not.toBeNull();
+    expect(renderer.setRenderTarget.mock.calls[1][0]).toBeNull();
+    // And the error is not swallowed on the way out — the terminal pipeline never ran. A restore
+    // that also ate the exception would hide the lost device instead of surfacing it.
+    expect(terminal.render).not.toHaveBeenCalled();
+  });
 });
 
 describe('PostFXStack — NPR composes with the rest of the stack (the Phase 3 point)', () => {

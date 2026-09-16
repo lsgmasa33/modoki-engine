@@ -67,6 +67,7 @@ import { coerceParamValue } from '../loaders/shaderSchema';
 import { register2DMaterialShaderMap, isEntity2DMaterialDirty, hasAny2DMaterialDirty } from './sprite2DMaterialBroker';
 import type { Entity2DShaderEntry } from './sprite2DMaterialBroker';
 import { computePaintOrder } from './paintOrder';
+import { collectOrderInLayer } from './orderInLayer';
 import { computeGroupAlpha } from './groupAlpha';
 import { computeMaskGroups } from './maskGroups';
 import { buildMaskRamp } from './maskRamp';
@@ -1604,17 +1605,15 @@ export class Scene2DRenderer {
     // its id's next occupant to inherit (see `Orphan2DTracker.prune`). Runs right after the live
     // set is fully built and before any pass below calls `note`/`clear` on it.
     this.orphan2D.prune(this.liveEntities);
-    // Explicit Order-in-Layer overrides (Renderable2D) → sprites can stack independent of
+    // Explicit Order-in-Layer overrides (Renderable2D + Text2D) → sprites can stack independent of
     // the entity tree (e.g. a cut-out character's parts parented to scattered bones).
-    const orderInLayerOfEntity = new Map<number, number>();
-    world.query(Renderable2D).updateEach(([r]: any[], entity: any) => {
-      if (r.orderInLayer) orderInLayerOfEntity.set(entity.id(), r.orderInLayer);
-    });
-    world.query(Text2D).updateEach(([t]: any[], entity: any) => {
-      if (t.orderInLayer) orderInLayerOfEntity.set(entity.id(), t.orderInLayer);
-    });
+    // ⚠️ Collected by the SHARED helper, not inline (#1228): the editor SceneView derives the same
+    // map, and when each side collected its own the two drifted — the editor never read Text2D.
+    const orderInLayerOfEntity = collectOrderInLayer(world);
     // Global paint order (hierarchy DFS by sortOrder, re-ranked by orderInLayer) — drives
-    // Pixi child z so 2D siblings stack by hierarchy, matching the editor SceneView.
+    // Pixi child z so 2D siblings stack by hierarchy. The editor SceneView feeds the same two
+    // inputs to the same function, so the two surfaces agree by construction rather than by
+    // a comment asserting it.
     this.paintOrderOf = computePaintOrder(this.sortOrderOfEntity, this.parentOfEntity, orderInLayerOfEntity.size ? orderInLayerOfEntity : undefined);
     // Group alpha (#211): the ancestor product that the flat PixiJS tree cannot give us for
     // free. Same parent map as the paint order, one pass, and skipped entirely when nothing

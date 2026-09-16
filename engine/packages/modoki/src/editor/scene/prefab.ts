@@ -2617,6 +2617,14 @@ function refreshInstances(
 ): void {
   if (rootIds.length === 0) return;
 
+  // Pinned BEFORE the loop, because the loop is what invalidates ids: each rebuild deletes a
+  // subtree and spawns a replacement, and a freed id can come straight back.
+  const eaMetaForGuid = getTraitByName('EntityAttributes');
+  const guidOf = new Map<number, string>();
+  for (const id of rootIds) {
+    guidOf.set(id, eaMetaForGuid ? ((readTraitData(id, eaMetaForGuid)?.guid as string) || '') : '');
+  }
+
   let refreshed = 0;
   for (const oldRootId of rootIds) {
     // ⚠️ A root can be DEAD by the time the loop reaches it, and `rebuildInstance` does not
@@ -2630,7 +2638,10 @@ function refreshInstances(
     // loop reached both while still alive ("Refreshed 2 instance(s)"), so the ordering the
     // hazard needs did not occur. Kept because it costs one map lookup and the failure it
     // prevents is a silently duplicated subtree; do NOT read it as a covered case.
-    if (!isLiveInstanceRoot(oldRootId)) continue;
+    //
+    // ⚠️ Checked by GUID, not id — an id-only check is worse than none here. See
+    // `isLiveInstanceRoot`.
+    if (!isLiveInstanceRoot(oldRootId, guidOf.get(oldRootId) ?? '')) continue;
     refreshed++;
     // Capture this instance's per-field overrides AND structural diffs against
     // the OLD prefab, then tear down + re-instantiate from the NEW prefab and
@@ -2646,13 +2657,28 @@ function refreshInstances(
   console.log(`[Prefab] Refreshed ${refreshed} instance(s) of "${source}"`);
 }
 
-/** Is `rootId` still a live, self-rooted prefab-instance root? False once it has been
- *  destroyed — `readTraitData` goes through `findEntity`, which drops a dead id. */
-function isLiveInstanceRoot(rootId: number): boolean {
+/** Is `rootId` still the SAME live, self-rooted prefab-instance root it was when the caller
+ *  collected it — identified by `expectedGuid`, not by the id?
+ *
+ *  ⚠️ The guid is what makes this safe, and an id-only version is actively worse than no check
+ *  at all (close-out review). koota recycles entity ids LIFO, and the caller's loop deletes a
+ *  subtree and then spawns a replacement — so the freed id can be handed straight back to the
+ *  NEW root. An id-only check would then report a destroyed instance as live, and the loop
+ *  would rebuild the first instance a second time using the overrides and structure captured
+ *  for a DIFFERENT one. Comparing the stable guid cannot confuse the two.
+ *
+ *  An empty expected guid means the caller had nothing stable to pin, so this degrades to the
+ *  id check rather than refusing outright — every entity carries a guid since #1210, so that
+ *  path is not expected to be reached. */
+function isLiveInstanceRoot(rootId: number, expectedGuid: string): boolean {
   const meta = getTraitByName('PrefabInstance');
   if (!meta) return false;
   const pi = readTraitData(rootId, meta);
-  return !!pi && pi.rootInstanceId === rootId;
+  if (!pi || pi.rootInstanceId !== rootId) return false;
+  if (!expectedGuid) return true;
+  const eaMeta = getTraitByName('EntityAttributes');
+  const guid = eaMeta ? (readTraitData(rootId, eaMeta)?.guid as string | undefined) : undefined;
+  return guid === expectedGuid;
 }
 
 /** Collect root entity ids for every instance of a given source. Optionally
