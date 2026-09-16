@@ -459,7 +459,19 @@ variables move between these columns, not one** — the worker split changed wit
 would need `MODOKI_VERIFY_NO_BUDGET=1` on the busy run, and has not been taken.
 
 `engine/scripts/verifyLoad.mjs` registers each run in `~/.modoki/verify-runs.json` and divides the
-performance-core pool by the number of live runs. It intervenes **only when `peers > 1`**, so a solo
+performance-core pool by the number of live runs. **Since #1285's second phase EVERY vitest pool
+registers**, not just `verify.mjs`: `perfCoreWorkers()` in `engine/testWorkers.ts` is the chokepoint
+both vitest configs call, so a scoped `npx vitest run`, a bare `npm test` and a mutation check are
+all counted. `peers` counts DISTINCT GROUPS, not processes — `verify.mjs` stamps a group id into
+both lanes' env, so one gate with two vitest lanes still counts once.
+
+⚠️ **The registry deliberately does NOT use `claimsDir()`, and the first version of this did.**
+`claimsDir()` redirects to `modoki-claims-vitest-<pid>/` whenever `VITEST` is set, so every pool
+registered into a temp dir named after its own pid — visible to nobody, and it re-created the
+per-pid dir *after* `globalSetup` reaped it, re-opening the #1117 tmpdir leak at one dir per vitest
+process. The whole mechanism was **inert while looking healthy**: a plausible budget returned, a
+green gate, a correct-looking `context:` line, and 34 passing tests that all injected `dir` and so
+never touched the real resolution. `verifyRegistryDir()` honours `MODOKI_HOME` and nothing else. It intervenes **only when `peers > 1`**, so a solo
 gate is byte-identical to before — `testWorkers.ts` keeps deciding, which matters because it returns
 `{}` on a homogeneous CPU and halves on Windows. `MODOKI_VERIFY_NO_BUDGET=1` opts out;
 `MODOKI_TEST_MAX_WORKERS` still beats everything. It is advisory, not a mutex: serializing would make
@@ -742,8 +754,25 @@ reads `peers == 1` and claims the full worker pool — measured on the hub at lo
 independently confirmed the same gap from the other side**: ~8 mutation checks in one session, each
 a scoped vitest run, none of them visible to the peer count. Mutation checks are the worst case
 structurally — by design they run the same suite repeatedly, back to back. The fix shape is to move
-registration into `engine/testWorkers.ts`, the chokepoint both vitest configs already call;
-unimplemented, because it changes worker budgeting for six clones and needs a measurement.
+registration into `engine/testWorkers.ts`, the chokepoint both vitest configs already call.
+**Implemented 2026-09-16** — see the registry note above, including the two ways it can be built so
+that it silently does nothing.
+
+⚠️ **It leaves an ASYMMETRY that is now live, and it was not designed on purpose.** A registering
+pool COUNTS as a peer but does not YIELD: `perfCoreWorkers()` discards the budget it gets back, by
+design, because sizing pools from the peer count was a separate deferred decision. So a two-minute
+mutation check registers, keeps all 12 workers, and the concurrent `verify` that now sees it halves
+itself to `app=6 engine=3`. Total oversubscription does fall (18 rather than 24 on 12 cores, and the
+four-way measurement says total is what drives casualties), but **the run that yields is the GATE —
+the one whose redness is expensive — and the run that keeps its cores is the throwaway.**
+
+✅ **LEAVE IT AS IS (owner, 2026-09-16).** Put to the owner as three readings — leave it, make
+everything shrink, or give the gate priority and let ad-hoc runs shrink around it — and the ruling
+was the first. **So this asymmetry is a DECISION, not an oversight**, and a later session must not
+"complete" it by making scoped runs yield: that is the option that was declined. What justifies it
+is that the measured win is in TOTAL oversubscription (24 → 18 workers on 12 cores) and the four-way
+A/B says total is what produces the casualties; the gate paying wall clock for that is the accepted
+cost. Reopen only with a measurement showing the gate's slowdown costs more than the reds it avoids.
 
 ### What the environment flip does NOT risk, and how that was checked
 

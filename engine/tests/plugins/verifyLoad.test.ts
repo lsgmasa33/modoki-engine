@@ -17,6 +17,8 @@ import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 import {
   perfCores, budgetFor, isLiveRun, readRuns, registerVerifyRun, unregisterVerifyRun, benchLine,
   parseVitestAggregates, registryPath, MIN_WORKERS, VERIFY_TTL_MS,
+  groupOf, countGroups, isTestRun, registerTestRun, VERIFY_GROUP_ENV, VERIFY_REGISTERED_ENV,
+  verifyRegistryDir,
 } from '../../scripts/verifyLoad.mjs';
 
 let dir: string;
@@ -159,9 +161,13 @@ describe('registerVerifyRun / unregisterVerifyRun', () => {
   });
 
   it('shrinks each run\'s share as clones join', () => {
-    registerVerifyRun({ pid: 111, clone: '/a', dir, alive, total: 12 });
-    const second = registerVerifyRun({ pid: 222, clone: '/b', dir, alive, total: 12 });
-    const third = registerVerifyRun({ pid: 333, clone: '/c', dir, alive, total: 12 });
+    // ⚠️ `env: {}` per call, because three CLONES are three PROCESSES with three environments.
+    // Sharing this process's env would hand all three the same `MODOKI_VERIFY_GROUP` — which the
+    // vitest run executing this test has itself set — and they would collapse into one peer. That
+    // is correct production behaviour (a lane of a gate JOINS that gate) and wrong for this case.
+    registerVerifyRun({ pid: 111, clone: '/a', dir, alive, total: 12, env: {} });
+    const second = registerVerifyRun({ pid: 222, clone: '/b', dir, alive, total: 12, env: {} });
+    const third = registerVerifyRun({ pid: 333, clone: '/c', dir, alive, total: 12, env: {} });
     expect([second.peers, third.peers]).toEqual([2, 3]);
     expect([second.appWorkers, third.appWorkers]).toEqual([6, 4]);
     // The engine lane has always taken about half the app lane's pool and runs inside it.
@@ -231,5 +237,120 @@ describe('parseVitestAggregates — the figures that survive a contended box', (
     expect(parseVitestAggregates('Test Files  865 passed')).toBeNull();
     expect(parseVitestAggregates('')).toBeNull();
     expect(parseVitestAggregates(undefined as never)).toBeNull();
+  });
+});
+
+describe('group identity — N processes of ONE gate must count ONCE', () => {
+  it('falls back to the pid when an entry carries no group (a pre-#1285 clone)', () => {
+    // A mixed fleet mid-upgrade writes entries with no `group`. Those must stay DISTINCT from each
+    // other rather than collapsing into one shared "undefined" group, which would under-count the
+    // box and hand every clone a pool it does not have.
+    expect(groupOf({ pid: 42, clone: '/a', startedAt: 0 })).toBe('42');
+    expect(groupOf({ pid: 7, clone: '/a', startedAt: 0, group: 'g1' })).toBe('g1');
+    expect(countGroups([
+      { pid: 1, clone: '/a', startedAt: 0 },
+      { pid: 2, clone: '/b', startedAt: 0 },
+    ])).toBe(2);
+  });
+
+  it('counts a gate and BOTH its lanes as one peer, not three', () => {
+    // The regression this whole mechanism can cause: `verify.mjs` spawns two vitest lanes, both now
+    // register themselves, and a SOLO gate would read peers=3 and budget itself to a third of a box
+    // it owns entirely. That is worse than the blindness being fixed.
+    registerVerifyRun({ pid: 100, clone: '/hub', dir, alive, total: 12, env: {}, group: 'gate-100' });
+    registerVerifyRun({ pid: 101, clone: '/hub', dir, alive, total: 12, env: {}, group: 'gate-100' });
+    const engineLane = registerVerifyRun({
+      pid: 102, clone: '/hub', dir, alive, total: 12, env: {}, group: 'gate-100',
+    });
+    expect(engineLane.peers).toBe(1);
+    expect(engineLane.appWorkers).toBe(12);
+    expect(readRuns({ dir, alive })).toHaveLength(3); // three entries, one group
+  });
+
+  it('still counts a SEPARATE run as its own peer while a gate is registered', () => {
+    // The point of the change: a scoped run or a mutation check on another clone is a real consumer
+    // and must show up. If this passes only because everything is one group, the fix does nothing.
+    registerVerifyRun({ pid: 100, clone: '/hub', dir, alive, total: 12, env: {}, group: 'gate-100' });
+    registerVerifyRun({ pid: 101, clone: '/hub', dir, alive, total: 12, env: {}, group: 'gate-100' });
+    const mutationCheck = registerVerifyRun({ pid: 200, clone: '/qa', dir, alive, total: 12, env: {} });
+    expect(mutationCheck.peers).toBe(2);
+    expect(mutationCheck.appWorkers).toBe(6);
+  });
+
+  it('inherits the group from the environment, which is how a lane joins its gate', () => {
+    const laneEnv = { [VERIFY_GROUP_ENV]: 'gate-999' };
+    const lane = registerVerifyRun({ pid: 300, clone: '/hub', dir, alive, total: 12, env: laneEnv });
+    expect(lane.group).toBe('gate-999');
+  });
+
+  it('does NOT write the group back into the env it was given', () => {
+    // An earlier draft published here, and the second logically-distinct run in one process then
+    // picked up the first one's group and the two collapsed into one peer. Publication belongs to
+    // the caller that spawns children.
+    const env: NodeJS.ProcessEnv = {};
+    registerVerifyRun({ pid: 400, clone: '/a', dir, alive, total: 12, env });
+    expect(env[VERIFY_GROUP_ENV]).toBeUndefined();
+    expect(env[VERIFY_REGISTERED_ENV]).toBeUndefined();
+  });
+});
+
+describe('registerTestRun — the vitest-pool entry point', () => {
+  it('refuses to register when vitest is not running — the DEV SERVER case', () => {
+    // ⚠️ `engine/vite.config.ts` is the dev server's config too, and its `test:` block is evaluated
+    // on every `npm run dev`. Registering there would hold a slot for the whole 45-minute TTL and
+    // shrink every clone's gate because somebody opened the editor. A wrong count is worse than a
+    // low one, so this fails CLOSED.
+    expect(registerTestRun({ dir, alive, total: 12, env: {} })).toBeNull();
+    expect(readRuns({ dir, alive })).toHaveLength(0);
+  });
+
+  it('registers when vitest IS running, and publishes the group to its own env', () => {
+    const env: NodeJS.ProcessEnv = { VITEST: 'true' };
+    const budget = registerTestRun({ pid: 500, clone: '/qa', dir, alive, total: 12, env });
+    expect(budget?.peers).toBe(1);
+    expect(env[VERIFY_GROUP_ENV]).toBe('500');
+    expect(env[VERIFY_REGISTERED_ENV]).toBe('1');
+    expect(readRuns({ dir, alive }).map((r) => r.pid)).toEqual([500]);
+  });
+
+  it('returns null — and registers nothing — when an ancestor already registered', () => {
+    // `verify.mjs` marks the env for both lanes. Returning null is how the caller knows it owns no
+    // registration and must not unregister one on exit; a lane tearing down the GATE's slot would
+    // leave every other clone over-budgeting for the rest of the run.
+    const env: NodeJS.ProcessEnv = { VITEST: 'true', [VERIFY_REGISTERED_ENV]: '1' };
+    expect(registerTestRun({ pid: 600, clone: '/hub', dir, alive, total: 12, env })).toBeNull();
+    expect(readRuns({ dir, alive })).toHaveLength(0);
+  });
+
+  it('isTestRun keys off VITEST only', () => {
+    expect(isTestRun({ VITEST: 'true' })).toBe(true);
+    expect(isTestRun({})).toBe(false);
+    // NODE_ENV=test alone is not enough — plenty of tooling sets it outside vitest.
+    expect(isTestRun({ NODE_ENV: 'test' })).toBe(false);
+  });
+});
+
+describe('verifyRegistryDir — the registry must be visible to OTHER processes', () => {
+  it('resolves OUTSIDE the vitest sandbox, with nothing injected', () => {
+    // ⚠️ THE REGRESSION TEST FOR AN INERT SHIP. Every other test in this file injects `dir`, so not
+    // one of them exercised the real resolution — and the real resolution went through
+    // `claimsDir()`, which redirects to `modoki-claims-vitest-<pid>/` whenever VITEST is set. Each
+    // pool therefore registered into a private temp dir nothing else reads: the budget returned a
+    // plausible number, the gate stayed green, 34 tests passed, and a live run polled every 0.5s
+    // never appeared in the shared registry.
+    //
+    // This test takes the DEFAULT path deliberately. It runs under vitest, so if the claims
+    // redirection ever comes back this goes red here rather than being discovered by polling.
+    expect(process.env.VITEST).toBeTruthy(); // the condition that used to trigger the redirect
+    expect(registryPath()).not.toContain('modoki-claims-vitest-');
+    expect(registryPath()).not.toContain(os.tmpdir());
+    expect(registryPath()).toBe(path.join(os.homedir(), '.modoki', 'verify-runs.json'));
+  });
+
+  it('still honours MODOKI_HOME, so a deliberate sandbox can redirect', () => {
+    // Refusing the automatic redirect must not refuse the explicit one — MODOKI_HOME is how a
+    // sandbox, and any test that wants isolation without injecting `dir`, opts out.
+    expect(verifyRegistryDir({ env: { MODOKI_HOME: '/tmp/sandbox' } })).toBe('/tmp/sandbox');
+    expect(verifyRegistryDir({ env: {}, home: '/home/x' })).toBe(path.join('/home/x', '.modoki'));
   });
 });

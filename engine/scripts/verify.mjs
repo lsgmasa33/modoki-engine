@@ -79,6 +79,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import {
   registerVerifyRun, unregisterVerifyRun, benchLine, parseVitestAggregates,
+  VERIFY_GROUP_ENV, VERIFY_REGISTERED_ENV,
 } from './verifyLoad.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -116,6 +117,19 @@ let budget = null;
  *  ⚠️ `MODOKI_TEST_MAX_WORKERS` still beats everything, as `testWorkers.ts` documents: it is the
  *  lever for an unusual box and for bisecting a contention problem, so a deliberate human setting is
  *  never silently outvoted by this. */
+/** Env that makes a spawned lane JOIN this gate rather than count as another one.
+ *
+ *  ⚠️ **Load-bearing since registration moved into `testWorkers.ts` (#1285).** Both lanes are vitest
+ *  processes, so both now register themselves. Without this they would register as two more runs and
+ *  a SOLO gate would read `peers = 3` — budgeting itself down to a third of a box it has entirely to
+ *  itself, which is the precise inversion of what the budget is for. `VERIFY_REGISTERED_ENV` makes
+ *  the lanes skip registering at all; `VERIFY_GROUP_ENV` is belt-and-braces, so that a lane which
+ *  registers anyway lands in THIS gate's group and still counts once. */
+function laneGroupEnv() {
+  if (!budget) return {};
+  return { [VERIFY_GROUP_ENV]: budget.group, [VERIFY_REGISTERED_ENV]: '1' };
+}
+
 function laneWorkerEnv(share, { respect } = {}) {
   if (process.env.MODOKI_TEST_MAX_WORKERS) return {};
   if (process.env.MODOKI_VERIFY_NO_BUDGET) return {};
@@ -240,6 +254,7 @@ async function checksAndEngineLane() {
   const engine = await runCommand('npm --prefix engine/packages/modoki test',
     {
       MODOKI_TEST_MAX_WORKERS: ENGINE_LANE_WORKERS,
+      ...laneGroupEnv(),
       ...laneWorkerEnv(budget?.engineWorkers, { respect: 'MODOKI_VERIFY_ENGINE_WORKERS' }),
     });
   parts.push(`--- engine tests ---\n${engine.output}`);
@@ -250,7 +265,7 @@ async function checksAndEngineLane() {
 const lanes = [
   // The app suite keeps the machine's full performance-core pool (`engine/testWorkers.ts` sizes it)
   // — it is the critical path, and starving it just moves the wall-clock onto this lane.
-  { name: 'app tests', run: () => runCommand('npm test', laneWorkerEnv(budget?.appWorkers)) },
+  { name: 'app tests', run: () => runCommand('npm test', { ...laneGroupEnv(), ...laneWorkerEnv(budget?.appWorkers) }) },
   { name: 'checks + engine tests', run: checksAndEngineLane },
 ];
 

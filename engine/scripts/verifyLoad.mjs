@@ -55,11 +55,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { claimsDir, isPidAlive } from './deviceClaimsStore.mjs';
+import { isPidAlive } from './deviceClaimsStore.mjs';
 
-/** Registry of in-flight `verify` runs, machine-wide. Sits beside the device claims (~/.modoki) and
- *  is picked up by the same `MODOKI_HOME` / vitest redirection, so a test never touches the real
- *  one. */
+/** Registry of in-flight test runs, machine-wide. Sits beside the device claims in `~/.modoki`.
+ *
+ *  ⚠️ It does NOT follow the device claims' vitest redirection — see `verifyRegistryDir()`. It
+ *  honours `MODOKI_HOME` and nothing else, because a registry only other processes can read is the
+ *  whole point, and the claims' per-pid sandbox makes that impossible. */
 export const VERIFY_REGISTRY_FILE = 'verify-runs.json';
 
 /** Wall-clock backstop for an entry whose pid check cannot help — a recycled pid, or a run killed
@@ -75,8 +77,89 @@ export const VERIFY_TTL_MS = 45 * 60 * 1000;
  *  contended gate is still better than one that cannot finish. */
 export const MIN_WORKERS = 2;
 
-export function registryPath(dir = claimsDir()) {
+/**
+ * Where the SHARED registry lives — deliberately NOT `claimsDir()`.
+ *
+ * ⚠️ **`claimsDir()` redirects to a per-pid temp dir whenever `VITEST` is set** (`deviceClaimsStore`
+ * — `modoki-claims-vitest-<pid>/`), so that a test can never corrupt the real device claims. That is
+ * right for claims and FATAL here: this registry's entire purpose is to be visible to OTHER
+ * processes, and a vitest pool writing into a directory named after its own pid is visible to
+ * nobody.
+ *
+ * ⚠️ **This was shipped and measured inert.** Registration from `testWorkers.ts` returned a
+ * plausible budget, the gate stayed green, and 34 tests passed — every one of them injecting `dir`,
+ * so not one exercised the real resolution. A live run polled every 0.5s never appeared in
+ * `~/.modoki/verify-runs.json`. The test that now prevents it is `resolves outside the vitest
+ * sandbox`: it asserts the DEFAULT path, with nothing injected.
+ *
+ * `MODOKI_HOME` is still honoured, so a deliberate sandbox (and any test that wants one) can still
+ * redirect; only the automatic VITEST redirection is refused.
+ */
+export function verifyRegistryDir({ env = process.env, home = os.homedir() } = {}) {
+  if (env.MODOKI_HOME) return env.MODOKI_HOME;
+  return path.join(home, '.modoki');
+}
+
+export function registryPath(dir = verifyRegistryDir()) {
   return path.join(dir, VERIFY_REGISTRY_FILE);
+}
+
+/** Env var carrying the GROUP id every process of one gate shares. See `groupOf()`. */
+export const VERIFY_GROUP_ENV = 'MODOKI_VERIFY_GROUP';
+
+/** Env var marking "this process tree already registered", so workers do not re-register. */
+export const VERIFY_REGISTERED_ENV = 'MODOKI_VERIFY_REGISTERED';
+
+/**
+ * The id that makes N processes count as ONE run.
+ *
+ * ⚠️ **Without this, moving registration into `testWorkers.ts` COUNTS ONE GATE AS SEVERAL AND
+ * BUDGETS IT AGAINST ITSELF** — the exact inversion of what #1285 is for. Two ways it happens:
+ *
+ *   1. `verify.mjs` spawns TWO vitest processes (app lane ‖ engine lane). Registering per process
+ *      makes a solo gate read `peers = 3` (both lanes plus `verify.mjs`) and take a third of the
+ *      box it has entirely to itself.
+ *   2. Vitest's pool workers may evaluate the config too, depending on pool and version. Per-pid
+ *      registration would then scale `peers` with the WORKER COUNT — the quantity being budgeted.
+ *
+ * So `verify.mjs` stamps its own pid into the env, every process it spawns inherits it, and
+ * `peers` counts DISTINCT GROUPS rather than entries. A standalone `npx vitest run` inherits
+ * nothing and is its own group, which is the whole point: it is a real, separate consumer of the
+ * box and used to be invisible.
+ *
+ * Entries written by an older clone carry no `group`; they fall back to their own pid, so a mixed
+ * fleet mid-upgrade degrades to the previous behaviour rather than mis-grouping.
+ */
+export function groupOf(run) {
+  if (run?.group) return String(run.group);
+  return String(run?.pid ?? '');
+}
+
+/** Distinct live groups — this is `peers`. */
+export function countGroups(runs) {
+  return new Set(runs.map(groupOf)).size;
+}
+
+/**
+ * Is this process actually running TESTS?
+ *
+ * ⚠️ **`engine/vite.config.ts` is the DEV SERVER's config as well as the test suite's**, and its
+ * `test:` block — including the `perfCoreWorkers()` call registration hangs off — is evaluated
+ * whenever Vite loads the config. Without this gate, `npm run dev` would register the editor as a
+ * live test run and hold the slot for the full 45-minute TTL, so every clone's gate would budget
+ * itself down because somebody opened the editor. That is worse than the blindness being fixed: it
+ * is a WRONG count rather than a low one.
+ *
+ * VERIFIED by probe rather than assumed, 2026-09-16: at config-evaluation time vitest has already
+ * set `VITEST="true"` and `NODE_ENV="test"`, with `VITEST_WORKER_ID` still undefined — the config
+ * is evaluated once, in the MAIN process, and pool workers do not re-evaluate it.
+ *
+ * Fails CLOSED: an environment that does not set `VITEST` simply does not register, which is the
+ * behaviour that existed before this module. A missed registration costs one slot of accuracy; a
+ * phantom one costs every clone on the box.
+ */
+export function isTestRun(env = process.env) {
+  return Boolean(env.VITEST);
 }
 
 /** Performance cores, or logical cores where that is unknowable.
@@ -125,7 +208,7 @@ export function isLiveRun(run, { now = Date.now(), alive = isPidAlive } = {}) {
   return alive(run.pid);
 }
 
-export function readRuns({ dir = claimsDir(), now = Date.now(), alive = isPidAlive } = {}) {
+export function readRuns({ dir = verifyRegistryDir(), now = Date.now(), alive = isPidAlive } = {}) {
   let raw;
   try {
     raw = fs.readFileSync(registryPath(dir), 'utf8');
@@ -144,7 +227,7 @@ export function readRuns({ dir = claimsDir(), now = Date.now(), alive = isPidAli
   return parsed.runs.filter((r) => isLiveRun(r, { now, alive }));
 }
 
-function writeRuns(runs, dir = claimsDir()) {
+function writeRuns(runs, dir = verifyRegistryDir()) {
   fs.mkdirSync(dir, { recursive: true });
   const file = registryPath(dir);
   // Write-then-rename so a concurrent reader never sees a half-written file. Two runs registering
@@ -170,24 +253,34 @@ export function budgetFor(total, runners) {
 export function registerVerifyRun({
   pid = process.pid,
   clone = process.cwd(),
-  dir = claimsDir(),
+  dir = verifyRegistryDir(),
   now = Date.now(),
   alive = isPidAlive,
   total = perfCores(),
+  env = process.env,
+  group = env[VERIFY_GROUP_ENV] || String(pid),
 } = {}) {
+  // ⚠️ **Deliberately does NOT write the group back into `process.env`.** An earlier draft did, so
+  // that children would inherit it — and that made the function silently non-idempotent: the SECOND
+  // logically-distinct run registering in the same process picked up the FIRST one's group from the
+  // ambient env and the two collapsed into one peer. Caught by `verifyLoad.test.ts`'s three-clone
+  // case reporting `peers` of 1. Publication is now explicit and belongs to the caller that spawns
+  // children (`verify.mjs` via `laneGroupEnv()`, `registerTestRun` for its own process).
   const others = readRuns({ dir, now, alive }).filter((r) => r.pid !== pid);
-  const runs = [...others, { pid, clone, startedAt: now }];
+  const runs = [...others, { pid, clone, startedAt: now, group: String(group) }];
   try {
     writeRuns(runs, dir);
   } catch {
     // An unwritable ~/.modoki must not fail the gate — budgeting is an optimisation, and a run that
     // cannot register simply behaves as it did before this module existed.
   }
-  const peers = runs.length;
+  const peers = countGroups(runs);
   const appWorkers = budgetFor(total, peers);
   return {
     peers,
     total,
+    /** This run's group id — the caller publishes it to children it spawns. */
+    group: String(group),
     appWorkers,
     // The engine lane has always taken about half the app lane's pool (12 vs a pinned 6) and runs
     // entirely INSIDE it, so it keeps that ratio rather than getting an equal share.
@@ -195,7 +288,40 @@ export function registerVerifyRun({
   };
 }
 
-export function unregisterVerifyRun({ pid = process.pid, dir = claimsDir(), now = Date.now(), alive = isPidAlive } = {}) {
+/**
+ * Register ANY vitest pool — the half of #1285 that `verify.mjs` alone could never see.
+ *
+ * ⚠️ **The peer count used to describe a different population from the load it sat beside.** Only
+ * `verify.mjs` registered, so a scoped `npx vitest run`, a `npm test`, a typecheck and — worst of
+ * all — a MUTATION CHECK were invisible. Mutation checks are structurally the bad case: CLAUDE.md
+ * requires one per new test and they re-run the same suite back to back by design. MEASURED on the
+ * hub: **load 154.86 with 106 node processes across four clones, and every clone reading
+ * `peers == 1`** and claiming the whole pool.
+ *
+ * Returns `null` when this process tree has already registered, so the caller knows not to unwind
+ * a registration it does not own. Never throws: a pool that cannot register must still run.
+ */
+export function registerTestRun(opts = {}) {
+  const env = opts.env ?? process.env;
+  if (!isTestRun(env)) return null;
+  if (env[VERIFY_REGISTERED_ENV]) return null;
+  try {
+    const budget = registerVerifyRun({ ...opts, env });
+    // Publish to OUR OWN env only, so anything this pool spawns joins this group instead of
+    // counting against it. Cheap insurance: probed 2026-09-16, vitest evaluates the config once in
+    // the main process and pool workers do not re-evaluate it — but a future pool that did would
+    // otherwise scale `peers` with the worker count, which is the quantity being budgeted.
+    env[VERIFY_GROUP_ENV] = budget.group;
+    env[VERIFY_REGISTERED_ENV] = '1';
+    return budget;
+  } catch {
+    // Budgeting is advisory. A registry that cannot be read or written leaves the pool sized
+    // exactly as it was before this existed, which is the correct failure direction.
+    return null;
+  }
+}
+
+export function unregisterVerifyRun({ pid = process.pid, dir = verifyRegistryDir(), now = Date.now(), alive = isPidAlive } = {}) {
   try {
     writeRuns(readRuns({ dir, now, alive }).filter((r) => r.pid !== pid), dir);
   } catch {

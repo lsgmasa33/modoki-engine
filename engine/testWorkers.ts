@@ -1,6 +1,31 @@
 import os from 'node:os'
 import { execFileSync } from 'node:child_process'
 
+import { registerTestRun, unregisterVerifyRun } from './scripts/verifyLoad.mjs'
+
+/**
+ * Put THIS vitest pool in the machine-wide registry (#1285).
+ *
+ * ⚠️ **This function is the chokepoint, which is exactly why registration belongs here.** Before
+ * this, only `engine/scripts/verify.mjs` registered — so a scoped `npx vitest run`, a bare
+ * `npm test`, and above all a MUTATION CHECK consumed the box while every clone read `peers == 1`.
+ * Measured on the hub: load **154.86**, 106 node processes across four clones, zero registered
+ * runs. Both vitest configs call `perfCoreWorkers()`, so registering here catches every pool
+ * without either config having to remember to.
+ *
+ * ⚠️ It does NOT change this function's answer. Sizing the pool from the peer count is a separate,
+ * deliberately deferred decision (the division is currently blind to actual load, which measured a
+ * 2.5x cost on a box at load 39.5). This only makes the count TRUE; `verify.mjs` remains the only
+ * thing that acts on it.
+ */
+function registerThisPool(): void {
+  const budget = registerTestRun()
+  if (!budget) return // already registered by an ancestor — not ours to release.
+  // `exit` only: a pool killed by an uncaught signal is reaped by the registry's pid + TTL checks
+  // anyway, and adding signal handlers here would change how a vitest run responds to Ctrl-C.
+  process.on('exit', () => unregisterVerifyRun())
+}
+
 /**
  * `{ maxWorkers }` capped to the machine's PERFORMANCE cores, or `{}` where that is unknowable.
  * Spread into a vitest `test` block. Shared by `engine/vite.config.ts` (the app suite) and
@@ -54,6 +79,7 @@ import { execFileSync } from 'node:child_process'
  * so two vitest pools do not oversubscribe each other.
  */
 export function perfCoreWorkers(): { maxWorkers?: number } {
+  registerThisPool()
   const override = process.env.MODOKI_TEST_MAX_WORKERS
   if (override) {
     const n = Number(override)
