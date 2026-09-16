@@ -623,16 +623,31 @@ the file.**
   instance or are warmed at open time, plus a by-name check that the two rebuild entry
   points still warm at all).
 
-  ⚠️ **The class is NOT closed, and this paragraph is the place that says so.** Four async
-  entry points warm; roughly a dozen other reachers of the same sync readers do not — the
-  **Apply to Prefab dialog** (it warms only the outer prefab, so a user-added nested row is
-  missing from the dialog and can never be promoted), the `modoki_prefab
-  overrides`/`apply`/`revert` ops, and `applyToPrefabSelective`'s own earlier
-  `captureInstanceStructure`. Four more are **synchronous undo closures that can never await
-  a warm**, which is what makes a caller-side fix structurally incapable of finishing this:
-  the remaining work is a world-level warming seam (warm every live `PrefabInstance.source`
-  once after a scene load), tracked as **#1295**. Until it lands, treat "warmed" as a
-  property of the four named paths, not of the editor.
+  ⚠️ **Every ASYNC entry point now warms; the five that do not are synchronous.** The warmed
+  ones: both Create Prefab paths, `assetOps`' async Create-Prefab **redo**, `applyToPrefab`,
+  `applyToPrefabSelective` (twice — its own capture and its per-root loop),
+  `revertOverridesSelective`, the Apply to Prefab dialog, and the `modoki_prefab
+  overrides`/`apply`/`revert` ops. What remains are **five synchronous undo/redo closures**
+  (two in `ApplyPrefabDialog`, three in `agentEditorOps`) that can never await a warm — which
+  is what makes a caller-side fix structurally incapable of finishing this. The rest is a
+  world-level warming seam (warm every live `PrefabInstance.source` once after a scene load),
+  tracked as **#1295**.
+
+  ⚠️ **Do not trust a census that anchors on one reader.** This paragraph shipped a wrong count
+  twice, and both times for the same reason: every sweep anchored on `captureInstanceStructure`,
+  so the path that reaches `planPrefabRows` through `tagEntityTreeAsInstance` — `assetOps`'
+  async redo — was invisible to a manual sweep AND to an adversarial review. There are **three**
+  sync readers over the live tree (`planPrefabRows`, `captureInstanceStructure`,
+  `captureNestedInstanceOverrides`), reached by different call chains, and
+  `coldCacheWarmCensus.test.ts` now pins the call sites of two of them separately for exactly
+  that reason.
+
+  ⚠️ **`applyToPrefab` is the one worth remembering**, because it shows what the cold read
+  actually costs. It captures the structure and uses the result to BUILD the key set it hands
+  to `applyToPrefabSelective`, so a cold miss did not merely hide a row — it silently dropped
+  a hand-added nested subtree from an action whose entire promise is "apply all of it". It was
+  found by the population guard in `coldCacheWarmCensus.test.ts` on the guard's first run,
+  having been missed by both a manual sweep and an adversarial review.
 
   ⚠️ **One behaviour change worth knowing, because warming changes what a GUARD can see.**
   `planPrefabRows` runs `wouldCreateCycle` BEFORE the cache lookup, and that guard returns

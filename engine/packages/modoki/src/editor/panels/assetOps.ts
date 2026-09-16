@@ -590,6 +590,11 @@ export async function createPrefabFromEntity(
       const id = ref.resolve();
       if (id != null) {
         if (!tagged) priorLinks = detachPrefabInstance(id, { strip: false });
+        // tagEntityTreeAsInstance re-runs planPrefabRows, whose nested-instance lookup is the
+        // same sync cache read as the original create (#1284). Cold, the plan drops the nested
+        // row, planMatchesFile then disagrees with the file that was written WARM, and the redo
+        // tags nothing at all — leaving the subtree unlinked from the prefab it just restored.
+        await preloadNestedPrefabsForSubtree(id);
         tagEntityTreeAsInstance(id, savePath, prefab);
         tagged = true;
       }

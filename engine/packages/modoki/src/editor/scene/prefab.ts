@@ -2146,6 +2146,12 @@ export async function applyToPrefabSelective(
     return NOOP_APPLY;
   }
 
+  // Warm THIS instance's live subtree before the structural capture below (#1284). The
+  // per-root loop further down is a different set and comes far too late: `captureNestedRef`
+  // runs inside the capture at `const structure = ...`, and on a cold cache it returns null
+  // and the user-added nested subtree is dropped from `added[]` entirely.
+  await preloadNestedPrefabsForSubtree(rootInstanceId);
+
   // Deep-clone the old prefab and overlay selected live values onto it. A second
   // pristine clone is the `before` snapshot for undo (oldPrefab itself isn't mutated,
   // but cloning guards against any aliasing into the cache).
@@ -2337,6 +2343,11 @@ export async function applyToPrefab(selectedEntityId: number): Promise<void> {
     console.warn(`[Prefab] Cannot apply: source prefab not in cache: ${source}`);
     return;
   }
+  // `captureInstanceStructure` below reads nested children from the cache SYNCHRONOUSLY
+  // (`captureInstanceOverrides` does not — it only diffs trait bags against the world), and this
+  // path builds the key set that applyToPrefabSelective then acts on. So a cold miss here does
+  // not just hide a row, it silently drops the subtree from an "apply EVERYTHING" action (#1284).
+  await preloadNestedPrefabsForSubtree(rootInstanceId);
   const all = captureInstanceOverrides(rootInstanceId, prefab);
   const keys = new Set<string>();
   for (const [localId, traits] of Object.entries(all)) {

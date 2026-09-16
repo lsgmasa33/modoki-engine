@@ -10,6 +10,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import {
   getPrefabSource,
+  preloadNestedPrefabsForSubtree,
   captureInstanceStructure,
   revertOverridesSelective,
   rebuildInstance,
@@ -180,6 +181,13 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
         if (!cancelled) setLoadState({ kind: 'error', message: `Could not load prefab ${source}` });
         return;
       }
+      // `buildStructural` -> `captureInstanceStructure` -> `captureNestedRef` reads nested
+      // children from the editor cache SYNCHRONOUSLY. The fetch above warms only the OUTER
+      // prefab, so on a cold cache a nested instance the author dragged in by hand is dropped
+      // from `added[]` and is simply MISSING from this dialog — unpromotable, with only a
+      // console.warn (#1284).
+      await preloadNestedPrefabsForSubtree(rootInstanceId);
+      if (cancelled) return;
       const entities = collectInstanceOverrideFields(rootInstanceId, prefab);
       const structural = buildStructural(rootInstanceId, prefab);
       if (cancelled) return;

@@ -14,7 +14,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { readScannedSource } from '../helpers/sourceScanner';
-import { calledNames, callsTo, enclosingNamedFunction, functionBodyOf, functionsNamed, parseSource, precedingStatements, printedText, ts, unwrapValue } from '../helpers/sourceAst';
+import { calledNames, callsTo, enclosingFunction, enclosingNamedFunction, functionBodyOf, functionsNamed, parseSource, precedingStatements, printedText, ts, unwrapValue } from '../helpers/sourceAst';
 import { assertExemptionLedger } from '../helpers/exemptionLedger';
 
 const SRC = path.resolve(__dirname, '../../src');
@@ -144,5 +144,108 @@ describe('#1284 — the two rebuild entry points warm the live tree (#1295 carri
     const body = functionBodyOf(fns[0]);
     expect(body, `${fnName} has no body`).toBeTruthy();
     expect(calledNames(body!), `${fnName} feeds rebuildInstance -> captureNestedInstanceOverrides, a SILENT sync cache read`).toContain(WARM);
+  });
+});
+
+/** The rest of the family. The AST reader at the top of this file matches a warm in the SAME
+ *  function immediately before the call; these sites do not have that shape (the dialog warms in
+ *  a `useEffect` closure while the read happens inside the pure helper `buildStructural`, and the
+ *  agent ops warm inside anonymous `if (which === ...)` branches).
+ *
+ *  ⚠️ **This was a COUNT guard and that was not good enough.** Counting warms per file is blind to
+ *  ORDER, which is the entire bug class — close-out review moved a warm to AFTER the reads it was
+ *  meant to cover and the suite stayed green, which is precisely the defect ("the warm existed 111
+ *  lines later, too late") that motivated writing the guard. So it now checks POSITION: a warm must
+ *  appear before the read, inside the same enclosing function. */
+const ORDERED_WARMS: Array<{ file: string; reader: string; why: string }> = [
+  {
+    file: 'packages/modoki/src/editor/panels/ApplyPrefabDialog.tsx', reader: 'buildStructural',
+    why: 'without it a hand-added nested instance is missing from the dialog and unpromotable',
+  },
+  {
+    file: 'app/editor/agentEditorOps.ts', reader: 'collectInstanceOverrideKeys',
+    why: 'on apply/revert this capture is what an explicit `keys` list is validated against, so a cold miss turns a legitimate key into a refusal',
+  },
+  {
+    file: 'packages/modoki/src/editor/panels/assetOps.ts', reader: 'tagEntityTreeAsInstance',
+    why: 'the async redo re-runs planPrefabRows; cold, planMatchesFile disagrees with the file written warm and the redo tags NOTHING',
+  },
+  {
+    file: 'packages/modoki/src/editor/scene/prefab.ts', reader: 'captureInstanceStructure',
+    why: 'applyToPrefab and applyToPrefabSelective both build key sets from it; cold, a hand-added subtree is dropped from an apply-EVERYTHING action',
+  },
+];
+
+/** Enclosing functions where the reader runs WITHOUT a warm of its own, each with why that is
+ *  correct. Not a place to park an unwarmed site — every row says what warms it instead. */
+const READS_WARMED_ELSEWHERE = [
+  { item: 'packages/modoki/src/editor/scene/prefab.ts::refreshInstances', reason: 'called only from applyToPrefabSelective, which warms every root in rootsToRefresh before calling it' },
+  { item: 'packages/modoki/src/editor/scene/prefab.ts::captureNestedInstanceOverrides', reason: 'runs inside the sync rebuildInstance; its two async callers warm first. The four SYNC undo closures that also reach rebuildInstance are #1295 — they can never await one' },
+  { item: 'packages/modoki/src/editor/scene/prefab.ts::captureInstanceReference', reason: 'internal recursion, reached only from planPrefabRows/captureNestedRef, both behind a warmed caller' },
+  { item: 'packages/modoki/src/editor/scene/prefab.ts::revertOverridesSelective', reason: 'warms itself, but after `const prefab = await getPrefabSource(...)`, so the position check below sees the warm and the read in the right order anyway' },
+  { item: 'packages/modoki/src/editor/scene/prefabOverrideKeys.ts::collectInstanceOverrideKeys', reason: 'a pure helper; every caller (the dialog, both agent ops) warms before calling it' },
+  { item: 'packages/modoki/src/editor/scene/serialize.ts::serializeScene', reason: 'the scene save warms by its own mechanism — await Promise.all over every live instance source before the capture loop' },
+];
+
+describe('#1284 — warms outside the serialize census (#1295 carries the sync undo closures)', () => {
+  it.each(ORDERED_WARMS)('$file warms BEFORE $reader, not merely somewhere in the file', ({ file, reader }) => {
+    const abs = path.join(ENGINE, file);
+    const sf = parseSource(readScannedSource(abs).code, path.basename(abs));
+    const reads = callsTo(sf, reader);
+    expect(reads.length, `${reader} not found in ${file} — did it move or get renamed?`).toBeGreaterThan(0);
+    const warms = callsTo(sf, WARM);
+    // A read inside a function on the ledger is warmed by its CALLER, so it has no warm of its
+    // own by design; the ledger row is what vouches for it. Everything else must be ordered.
+    const ledgered = (r: ts.CallExpression) =>
+      READS_WARMED_ELSEWHERE.some((k) => k.item === `${file}::${enclosingNamedFunction(r)?.name}`);
+    const unordered = reads.filter((r) => !ledgered(r) && !warms.some(
+      (w) => enclosingFunction(w) === enclosingFunction(r) && w.getStart() < r.getStart()));
+    expect(unordered.map((r) => `${reader} at line ${sf.getLineAndCharacterOfPosition(r.getStart()).line + 1}`),
+      `every ${reader} call must be preceded by ${WARM} in its own function`).toEqual([]);
+  });
+
+  /** `planPrefabRows` — the reader whose cold miss FLATTENS — is reached through
+   *  `tagEntityTreeAsInstance`, and nothing enumerated those call sites. That is exactly how the
+   *  async redo in `assetOps.ts` survived a manual sweep AND an adversarial review: every census
+   *  anchored on `captureInstanceStructure`, which that path never calls. Pinned here by warmed /
+   *  unwarmed split rather than by name, so both a lost warm and a new cold site are red. */
+  it('every tagEntityTreeAsInstance call is warmed, except the one sync closure #1295 owns', () => {
+    const sites = ['packages/modoki/src/editor/panels/assetOps.ts', 'app/editor/agentEditorOps.ts']
+      .flatMap((rel) => {
+        const abs = path.join(ENGINE, rel);
+        const sf = parseSource(readScannedSource(abs).code, path.basename(abs));
+        const warms = callsTo(sf, WARM);
+        return callsTo(sf, 'tagEntityTreeAsInstance').map((c) => ({
+          at: `${rel}:${sf.getLineAndCharacterOfPosition(c.getStart()).line + 1}`,
+          warmed: warms.some((w) => enclosingFunction(w) === enclosingFunction(c) && w.getStart() < c.getStart()),
+        }));
+      });
+    expect(sites.length, 'a new tagEntityTreeAsInstance call site must be classified').toBe(4);
+    expect(sites.filter((x) => x.warmed).length, 'three async paths must warm before re-planning the rows').toBe(3);
+    expect(sites.filter((x) => !x.warmed).map((x) => x.at),
+      'the only unwarmed one is the SYNC redo closure in the agent create op — it cannot await, and is #1295')
+      .toEqual(['app/editor/agentEditorOps.ts:2356']);
+  });
+
+  /** ⚠️ Counted PER OCCURRENCE, not deduped. A `new Set` here hid a second unwarmed call added
+   *  inside an already-listed function — proven by mutation during close-out review. */
+  it('no NEW sync structure reader has landed unclassified', () => {
+    const roots = [path.join(SRC, 'editor'), path.join(ENGINE, 'app/editor')];
+    const files = roots.flatMap((root) => (fs.readdirSync(root, { recursive: true }) as string[])
+      .filter((f) => /\.tsx?$/.test(f)).map((f) => path.join(root, f)));
+    const found = files.sort().flatMap((abs) => {
+      const code = readScannedSource(abs).code;
+      if (!code.includes('captureInstanceStructure(')) return [];
+      const rel = path.relative(ENGINE, abs).split(path.sep).join('/');
+      return callsTo(parseSource(code, path.basename(abs)), 'captureInstanceStructure')
+        .map((c) => `${rel}::${enclosingNamedFunction(c)?.name}`);
+    });
+    const warmedHere = ORDERED_WARMS.map((w) => w.file);
+    const classified = found.filter((f) => READS_WARMED_ELSEWHERE.some((k) => k.item === f)
+      || warmedHere.some((wf) => f.startsWith(`${wf}::`)));
+    expect(found.filter((f) => !classified.includes(f)),
+      'a new captureInstanceStructure call site must be classified: warmed in its own function, or a row in READS_WARMED_ELSEWHERE')
+      .toEqual([]);
+    expect(found.length, 'occurrence count is pinned so a SECOND call inside a known function cannot hide behind dedupe').toBe(9);
   });
 });

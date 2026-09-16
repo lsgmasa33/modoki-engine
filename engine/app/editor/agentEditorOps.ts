@@ -2404,6 +2404,10 @@ export function registerEditorAgentOps(): void {
       }
       const prefab = await getPrefabSource(ctx.source);
       if (!prefab) throw new Error(`prefab overrides: could not load prefab source "${ctx.source}" for entity ${entityId}.`);
+      // collectInstanceOverrideKeys -> captureInstanceStructure reads nested children from the
+      // editor cache SYNCHRONOUSLY; cold, a user-added nested instance is missing from `keys`
+      // and the caller cannot address what it cannot see (#1284).
+      await preloadNestedPrefabsForSubtree(ctx.rootInstanceId);
       const entities = collectInstanceOverrideFields(ctx.rootInstanceId, prefab);
       const keys = collectInstanceOverrideKeys(ctx.rootInstanceId, prefab);
       // Flatten the per-entity/trait tree into one list an agent can scan for a key without
@@ -2434,6 +2438,9 @@ export function registerEditorAgentOps(): void {
       }
       const prefab = await getPrefabSource(ctx.source);
       if (!prefab) throw new Error(`prefab ${verb}: could not load prefab source "${ctx.source}" for entity ${entityId}.`);
+      // Same cold read as `overrides` above (#1284) — and here it decides what an explicit
+      // `keys` list is validated against, so a cold miss turns a legitimate key into a refusal.
+      await preloadNestedPrefabsForSubtree(ctx.rootInstanceId);
       const available = collectInstanceOverrideKeys(ctx.rootInstanceId, prefab);
       if (available.all.length === 0) {
         throw new Error(`prefab ${verb}: instance rooted at entity ${ctx.rootInstanceId} has no overrides — nothing to ${verb}.`);
