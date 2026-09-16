@@ -487,7 +487,8 @@ unreproducible in isolation. Capturing and awaiting the promise fixed it.
 Three clones hit `games/wordweave/tests/backgroundRotation.test.ts` three different ways on three
 different trees the same afternoon — a timeout, a non-reproducing assertion, and this escaped
 promise. When one test keeps absorbing unrelated failures, suspect the victim's own isolation, not
-three coincidences. Context on #1285.
+three coincidences. The wordweave case is #1288: that test is correct only if its stub wins a
+module-hydration race, and per-file isolation is its only defence.
 
 ### What the environment flip does NOT risk, and how that was checked
 
