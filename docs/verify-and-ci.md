@@ -465,6 +465,24 @@ gate is byte-identical to before — `testWorkers.ts` keeps deciding, which matt
 `MODOKI_TEST_MAX_WORKERS` still beats everything. It is advisory, not a mutex: serializing would make
 one clone wait on another's gate, and the goal is to stop the thrash, not the work.
 
+⚠️ **It divides by the PEER COUNT and never looks at the load — so it charges you for a peer that
+is not costing you anything.** Three runs of the hub gate on 2026-09-16, same tree modulo doc
+commits, show the peer count setting the wall clock more than the load does:
+
+| `context:` | wall clock |
+|---|---|
+| `load 109.5 · 2 run(s) · app=6` | 291.2s |
+| `load 74.6 · 1 run · app=12` | **88.7s** |
+| `load 39.5 · 2 run(s) · app=6` | 217.8s |
+
+The third row is the one to read: the **lowest** load of the three, and 2.5x slower than the second,
+because a registered peer halved the pool on a box that was not saturated. A peer whose run is
+nearly finished, or which is in its single-threaded typecheck leg, costs you half your workers
+exactly as a peer hammering twelve cores does. That is the mechanism doing what it says — 2 runs ×
+6 workers = the 12 performance cores — and it is still the wrong trade at load 39.5. **Load-aware
+budgeting is the obvious next move and is not implemented**; it is the second known gap in this
+fix, alongside the peer count seeing only `verify.mjs` runs (#1285).
+
 ### The app suite paid for jsdom on every file and needed it on about an eighth of them
 
 `engine/vite.config.ts` set `environment: 'jsdom'` for the whole app suite. The engine package suite
