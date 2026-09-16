@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Unit (jsdom + @testing-library/react) — the shared ContextMenu component's
  *  separator + shortcut-hint additions, used by the reorganized Hierarchy menu.
  *  Asserts: shortcut hints render, separators render as inert dividers, normal

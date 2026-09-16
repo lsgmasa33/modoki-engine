@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** N12 — journaling must turn ON when a debug client attaches, not on the first
  *  `journal-events` read. A shipped game boots with `setJournalEnabled(false)`
  *  (main.tsx), so events before that first read were silently lost — and a full page

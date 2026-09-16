@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Preview3DShell graceful WebGL-unavailable path (Phase 2). Isolated in its own
  *  file: a createPreviewScene mock that THROWS, shared with other tests in one file,
  *  trips a vitest cross-test async-error-attribution quirk (the throw surfaces as an

@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** #1068 — an `Error` anywhere in an op result reaches the agent as TEXT on BOTH editor transports.
  *
  *  Both transports end in a bare `JSON.stringify` the renderer does not own (Vite's `hot.send`; the

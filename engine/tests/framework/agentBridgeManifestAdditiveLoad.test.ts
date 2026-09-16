@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Guards the ADDITIVE-load invariant for the `manifest-updated` handler `initAgentBridge`
  *  registers off the Electron bridge (see the `bridge.on('manifest-updated', ...)` block in
  *  `app/debug/agentBridge.ts`, added for #503): it must call `loadManifestJson` WITHOUT

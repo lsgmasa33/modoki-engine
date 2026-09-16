@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Mouse-wheel value adjustment for editor number inputs (jsdom):
  *  - applyWheelStep: pure step math (precision rounding + min/max clamp)
  *  - useWheelStep: non-passive wheel listener that only fires while focused, reports

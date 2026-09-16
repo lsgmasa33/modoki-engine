@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** #1016 — the DEVICE aim surface must send the gesture, and the right one.
  *
  *  ⚠️ **This file exists because the fix shipped without it and a mutation proved the gap.** The

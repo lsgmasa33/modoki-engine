@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** World tab (runtime ECS inspector) — DOM integration + unit tests (Phase 2).
  *
  *  Proves the debug menu's world inspector reads the live ECS tree and writes trait

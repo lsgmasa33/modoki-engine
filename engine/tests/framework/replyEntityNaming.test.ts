@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Every agent reply names an entity by guid — never by a bare runtime id (#1223 P2).
  *
  *  A runtime id is reassigned on every scene reload, and since #1223 D2 the mutating tools refuse it

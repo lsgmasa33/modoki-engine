@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Device-side handlers added for #31 (`device_pointer`/`device_type_text`) — `handlePointer`
  *  and `handleType` in `app/debug/bridge.ts`. These are the ONLY place the held-pointer refusal
  *  logic and the synthetic-typing fallback live, so a test against the MCP tool's stub backend

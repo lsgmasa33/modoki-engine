@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Pins #489: the AudioContext gesture unlock must stay ARMED, and the app must re-arm audio
  *  on foreground, or an iOS Music.app interruption silences the game until a relaunch.
  *

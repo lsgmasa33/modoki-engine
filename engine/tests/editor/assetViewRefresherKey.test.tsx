@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** `useAssetViewRefreshers` re-registers when the SELECTION changes, and the key it uses to decide
  *  that must be injective over path lists (#891 close-out review).
  *

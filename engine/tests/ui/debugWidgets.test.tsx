@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Floating stat widgets — store unit + launcher/layer integration (Phase 4.5).
  *
  *  Guards the spawn-a-floating-widget flow: the Stats tab is a launcher whose buttons

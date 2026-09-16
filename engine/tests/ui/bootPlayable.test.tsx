@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** bootPlayable — the playable audio-mute gate (Phase 5). Locks the contract that a playable
  *  build holds ALL audio muted until the ad is VIEWABLE, then releases it. A regression here
  *  = a playable that blares audio off-screen (a network rejection reason). */

@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Regression for docs/async-lifetime.md: the native `request` listener's `screenshot` branch
  *  writes the module-level `lastScreenInfo` after `await GameDebug.captureScreen()` with no
  *  liveness check.

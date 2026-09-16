@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Phase 0 of #32 (docs/trusted-device-input.md): every device input handler in
  *  `app/debug/bridge.ts` must report the mechanism it actually used, so an agent is never misled
  *  about input fidelity. Today that mechanism is `INPUT_MECHANISM` ('synthetic') for all seven

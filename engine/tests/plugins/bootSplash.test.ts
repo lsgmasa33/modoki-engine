@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** The WEB boot splash (#396 follow-on).
  *
  *  The plugin's image work is covered by `splashCompose.test.ts` (it shares `overlayLayersFor`

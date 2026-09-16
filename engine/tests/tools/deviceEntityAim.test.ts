@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** #1223 P3 / #1216 P1-1 — the device input tools aim at an ENTITY, and their refusals keep their code.
  *
  *  Drives the REAL `device_*` handlers against a stubbed backend (`deviceSurface.ts`), so what is

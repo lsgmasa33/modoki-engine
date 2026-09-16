@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Pins #619: pending PlayerPrefs writes must flush while a Google Play billing sheet is open.
  *
  *  Play Billing's `ProxyBillingActivity` is TRANSLUCENT, so opening a purchase sheet pauses the

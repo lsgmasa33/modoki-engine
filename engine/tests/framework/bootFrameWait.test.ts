@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** #682 — `waitTwoFramesBounded` (extracted from `App.tsx`'s boot sequence) races two chained
  *  `requestAnimationFrame`s against a timeout, so a dead rAF chain cannot hang boot forever.
  *  Resolves `'frames' | 'timeout'` (close-out LOW 6) so a caller can tell the two apart — `App.tsx`

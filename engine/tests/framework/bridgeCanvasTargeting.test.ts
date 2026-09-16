@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Which canvas synthetic device input is dispatched ON (#93).
  *
  *  The defect: `dispatchTapAt`/`handleDrag`/`handlePointer` all did `document.querySelector('canvas')`

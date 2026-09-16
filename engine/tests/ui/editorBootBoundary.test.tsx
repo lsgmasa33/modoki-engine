@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** EditorBootBoundary — last-resort boundary around the editor route.
  *
  *  Regression guard for the packaged editor serving a dep chunk that is missing an export the

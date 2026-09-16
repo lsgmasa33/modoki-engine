@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Pins #516: `GameShell`'s per-game boot effect (`engine/app/App.tsx`) used to guard
  *  re-entrancy with `activeGameIdRef`, a ref written ONLY on the boot's success path. Swapping
  *  game A→B unregisters A's systems, then boots B; if the user swaps back to A while B is still

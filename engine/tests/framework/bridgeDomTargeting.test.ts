@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Synthetic device input must land on the DOM UI element under the aim, not the canvas (#299).
  *
  *  THE DEFECT: `dispatchTapAt`/`handlePointer` recognised only `<button>`/`<a>` as DOM targets and

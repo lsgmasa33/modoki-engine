@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** DebugMenu overlay — DOM integration tests (Phase 1).
  *
  *  Exercises the real component end-to-end in jsdom: hidden until toggled, F12 +

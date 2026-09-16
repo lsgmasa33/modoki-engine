@@ -387,6 +387,104 @@ It closes the silence, not the coverage.
   reproduces (re-measured 2026-08-18 — the pinned worker cap is why), so chaining is now kept
   because splitting is wall-clock-NEUTRAL and therefore pointless, not because it is harmful.
 
+## What made it faster (2026-09-16, #1283) — and why the 2026-08 numbers above are unquotable
+
+The section above is still correct about **mechanism** and wrong about **magnitude**, because it was
+measured on a box that no longer exists in practice.
+
+### ⚠️ Wall clock stopped being a measurement on this machine
+
+Six clones run concurrent sessions (CLAUDE.md § Clones), and a session runs the gate whenever it is
+finishing work — so the gate is routinely measured against other clones' gates. Measured on the hub
+while `modoki-qa` ran its own:
+
+```
+load average: 149.47 / 177.23 / 147.48     on a 12P+4E box
+38 live node processes under ~/Projects/modoki-qa · 3 under ~/Projects/modoki
+```
+
+That is ~9x oversubscription of the twelve performance cores. **Two runs of the same tree measured
+118.4s and 191.7s on the same afternoon**, differing only in what else was on the box.
+
+**The damage is not only slowness — it turns the gate RED.** `engine/testWorkers.ts` already records
+the shape: oversubscription's first casualties are the tests nearest `testTimeout`, and they fail as
+*timeouts*, which reads exactly like a regression in the diff under test. It cost a session on
+2026-09-16 (wordweave `backgroundRotation` overshooting a 20s ceiling by 302ms while `npm test`
+alone stayed green), and the response was to double every ceiling — a fix aimed at the symptom.
+
+So: **`npm run verify` now prints a `context:` line on every run** — load average, how many verify
+runs share the box, and the worker split — plus each lane's vitest aggregates. Those aggregates are
+summed across workers and so do NOT inflate under contention the way wall clock does; they are the
+only figures two runs on a busy machine can be compared by. **A timing quoted without its context
+line is not a measurement.**
+
+`engine/scripts/verifyLoad.mjs` registers each run in `~/.modoki/verify-runs.json` and divides the
+performance-core pool by the number of live runs. It intervenes **only when `peers > 1`**, so a solo
+gate is byte-identical to before — `testWorkers.ts` keeps deciding, which matters because it returns
+`{}` on a homogeneous CPU and halves on Windows. `MODOKI_VERIFY_NO_BUDGET=1` opts out;
+`MODOKI_TEST_MAX_WORKERS` still beats everything. It is advisory, not a mutex: serializing would make
+one clone wait on another's gate, and the goal is to stop the thrash, not the work.
+
+### The app suite paid for jsdom on 866 files and needed it on 110
+
+`engine/vite.config.ts` set `environment: 'jsdom'` for the whole app suite. The engine package suite
+sets no `environment` at all and so defaulted to `node` — which is the entire reason its per-file
+environment cost was ~8x cheaper. Measured across all 866 files:
+
+| | jsdom everywhere | node by default |
+|---|---|---|
+| aggregate `environment` | 957.87s | **8.59s** |
+| CPU time (user+sys) | 1168s | **791s (−32%)** |
+| tests passing | 26,964 | 26,964 (identical) |
+
+`tests/architecture` alone is **178 of 180 files DOM-free** — source-scanning guards that read files
+off disk and never render. A file that needs a DOM now says so with `// @vitest-environment jsdom`.
+
+⚠️ **`environmentMatchGlobs` is not the mechanism** — it was removed in vitest 4 (4.1.11 here). The
+per-file docblock is what this version supports.
+
+⚠️ **The list was derived by RUNNING the suite under node and taking the failures, not by grepping
+for `document`.** A grep over these files is dominated by source-scanning guards that match the word
+"document" inside a string they are searching for.
+
+### ⚠️ Two files failed as UNHANDLED REJECTIONS, and a passing test count hid them
+
+`@capacitor/app` touches `document` at import time, so under node
+`tests/framework/bridgeJournalGate.test.ts` and `bridgeRequestRejection.test.ts` threw
+`ReferenceError` *asynchronously*. Vitest printed `865 passed`, then `Errors 6 errors`, and **exited
+non-zero** — the suite was red while every test line read green.
+
+This was missed on the first pass because the check was `grep 'Test Files'` on a run whose exit code
+was never read. **A passing test count is not a passing suite**: read the exit code, and read the
+`Errors` line. This is the same class as the timeout above — a real failure wearing the costume of
+something else.
+
+### What the environment flip does NOT risk, and how that was checked
+
+The obvious worry is a test that still passes under node because its subject silently no-ops without
+a DOM. Checked rather than assumed: 46 engine modules carry a `typeof window === 'undefined'`
+fallback, and 43 node-environment test files import one. Of those, the guards actually reached are
+DEV debug-console hooks (`window.__ecsWorld`, `__editorStore`, `__prefabEdit`) that no test asserts
+on. The one genuinely behavioural guard — `readViewport()` in `engine/app/editor/agentEditorOps.ts`,
+which returns `null` with no `window` — is asserted by no node-environment test.
+
+**To regenerate the classification** after adding tests: run `npm test -- --environment node`, take
+the `FAIL` files *and* any file named by an `Errors` block, and add the docblock to each.
+
+⚠️ **A classification derived from "run it and take the failures" is only as complete as what that
+run DISCOVERED — and this suite's file set is conditional.** `engine/vite.config.ts` excludes
+`games/court/tests/**` unless `courtTouched()` says the branch touched Court, so the original sweep
+never saw Court's 220 files and silently did not cover them. It surfaced two commits later, when
+editing comments in `games/court/tests/*.ts` flipped that gate and pulled in 6 failures plus 2
+unhandled-rejection files, every one DOM-dependent. **Before trusting a regenerated list, check that
+the run actually discovered the files you think it did** — compare the `Test Files` count against
+`1086` (866 without Court).
+
+Still unclassified, and recorded rather than papered over: Court's **51 sweep-tier files**
+(`MODOKI_COURT_SWEEPS=1`) are skipped in a normal run. They are corpus-walking generator/strategy/
+rating tests, very unlikely to need a DOM — and if one does it fails loudly, as these did. The
+nightly sweep on `main` is where that would surface.
+
 ## Typecheck traps that have bitten CI
 
 - **Always run root `npm run typecheck`, not just the package one.** The package's

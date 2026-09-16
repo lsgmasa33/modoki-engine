@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** #1223 P3 / #1216 P1-1 — the DEVICE page aims at an entity.
  *
  *  `bridge.ts`'s `resolveAim` handled only a selector and screenshot pixels, so `device_tap` and its

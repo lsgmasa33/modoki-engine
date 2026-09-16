@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** `useParkedAssetDoc` — the panel half of manual asset saves (#259), in jsdom.
  *
  *  Replaces the `useDebouncedSave` suite this file grew out of. The contract it locks down is

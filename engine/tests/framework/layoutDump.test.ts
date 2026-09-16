@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** layout-bounds — the response-shape contract (docs/mcp-response-budget.md Phase 4).
  *
  *  This was the largest payload in the entire agent surface: ~74k tokens on a 241-entity

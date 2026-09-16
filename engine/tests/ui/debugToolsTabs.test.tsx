@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Cheats / Console / Device debug tabs + console capture — tests (Phase 4). */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';

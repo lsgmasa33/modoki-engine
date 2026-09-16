@@ -217,7 +217,7 @@ describe('vendorEnginePlugins', () => {
       spy.mockRestore();
       // ⚠️ NO WALL-CLOCK BOUND HERE, deliberately (#751). An `expect(Date.now() - started)
       // .toBeLessThan(5_000)` used to sit here. It could not catch anything the harness does not
-      // already catch — `testTimeout` is 20 s (60 s on Windows), so a genuine hang fails as a
+      // already catch — `testTimeout` is finite (engine/vite.config.ts), so a genuine hang fails as a
       // timeout — while firing spuriously anywhere in the 5-20 s band on a loaded runner. That is
       // a pure flake generator, and it fails the ONLY gate: `verify` aborts the lane, so the run
       // yields no verdict at all about whatever change was actually under test.
@@ -264,7 +264,7 @@ describe('vendorEnginePlugins', () => {
 
       // ⚠️ NO WALL-CLOCK BOUND HERE, deliberately (#751). An `expect(Date.now() - started)
       // .toBeLessThan(5_000)` used to sit here. It could not catch anything the harness does not
-      // already catch — `testTimeout` is 20 s (60 s on Windows), so a genuine hang fails as a
+      // already catch — `testTimeout` is finite (engine/vite.config.ts), so a genuine hang fails as a
       // timeout — while firing spuriously anywhere in the 5-20 s band on a loaded runner. That is
       // a pure flake generator, and it fails the ONLY gate: `verify` aborts the lane, so the run
       // yields no verdict at all about whatever change was actually under test.
@@ -362,7 +362,7 @@ describe('vendorEnginePlugins', () => {
       spy.mockRestore();
       // ⚠️ NO WALL-CLOCK BOUND HERE, deliberately (#751). An `expect(Date.now() - started)
       // .toBeLessThan(5_000)` used to sit here. It could not catch anything the harness does not
-      // already catch — `testTimeout` is 20 s (60 s on Windows), so a genuine hang fails as a
+      // already catch — `testTimeout` is finite (engine/vite.config.ts), so a genuine hang fails as a
       // timeout — while firing spuriously anywhere in the 5-20 s band on a loaded runner. That is
       // a pure flake generator, and it fails the ONLY gate: `verify` aborts the lane, so the run
       // yields no verdict at all about whatever change was actually under test.

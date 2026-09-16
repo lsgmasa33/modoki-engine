@@ -36,9 +36,15 @@ export default defineConfig({
     // Kept in step with engine/vite.config.ts DELIBERATELY, not incidentally: verify.mjs runs this
     // package as the engine lane CONCURRENTLY with the app lane,
     // so both pools meet the same contention and a ceiling raised in only one of them just moves
-    // which lane goes red. See docs/windows.md for the measurement behind 60s.
-    testTimeout: process.platform === 'win32' ? 60000 : 20000,
-    hookTimeout: 30000,
+    // which lane goes red. See docs/windows.md for the measurement behind the Windows ceiling.
+    //
+    // 2026-09-16 (owner): "we should increase the timeout in general" — every ceiling doubled, here
+    // and in engine/vite.config.ts together, for the reason this comment already gives. The trigger
+    // was the APP lane (wordweave backgroundRotation overshooting 20s by 302ms under the two
+    // concurrent lanes), so nothing in THIS suite was measured red; it moves anyway, because the
+    // two being equal is the invariant.
+    testTimeout: process.platform === 'win32' ? 120000 : 40000,
+    hookTimeout: 60000,
     // Coverage is OFF unless --coverage is passed. This suite is the FIRST leg of a
     // two-leg measurement: the root suite (engine/vite.config.ts) and this one both
     // exercise packages/modoki/src, so either leg alone understates it — this package holds the

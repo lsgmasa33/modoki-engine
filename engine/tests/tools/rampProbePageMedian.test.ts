@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** `engine/tools/ramp-probe-page/main.ts` — the standalone measurement page's headline (#205
  *  R5.4). Covers only `medianMeasurement`, the one piece of logic in that file; everything else
  *  is DOM wiring for a human tapping a phone screen.

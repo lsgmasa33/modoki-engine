@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** #682 — every device input handler in `app/debug/bridge.ts` must REFUSE, rather than dispatch,
  *  when the frame loop cannot actually deliver the input: a dead rAF chain means `inputSystem`
  *  never samples the down/up edge no matter how long the wall-clock `setTimeout` hold waits, so

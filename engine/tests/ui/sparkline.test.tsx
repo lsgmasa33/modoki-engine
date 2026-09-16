@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Sparkline redraw regression tests (Phase 1).
  *
  *  jsdom returns a null 2D context, so the DebugMenu integration test can't see

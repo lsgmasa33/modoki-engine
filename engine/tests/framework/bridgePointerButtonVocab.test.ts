@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** `device_pointer`'s `button` is an AGENT-SUPPLIED key into a code-declared table (#993).
  *
  *  `POINTER_BUTTON_CODE` in `app/debug/bridge.ts` is a literal `{ left: 0, middle: 1, right: 2 }`

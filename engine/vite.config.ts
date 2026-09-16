@@ -647,7 +647,27 @@ export default defineConfig(({ command }) => {
         '**/index.ts',
       ],
     },
-    environment: 'jsdom',
+    // NODE by default; a file that needs a DOM says so with `// @vitest-environment jsdom` (#1283).
+    //
+    // This was `'jsdom'` for the whole suite, and the whole suite paid for it. MEASURED 2026-09-16
+    // over all 866 app-suite files, comparing vitest's own cross-worker aggregates (which, unlike
+    // wall clock, do not inflate when the box is busy — see engine/scripts/verifyLoad.mjs):
+    //
+    //     aggregate `environment`   957.87s  ->  8.59s
+    //     CPU time (user+sys)         1168s  ->   795s   (-32%)
+    //
+    // Only 108 files actually need a DOM. `tests/architecture` alone is 178 of 180 DOM-free — those
+    // are source-scanning guards that read files off disk and never render anything. The engine
+    // package suite already defaulted to node (it sets no `environment` at all), which is exactly
+    // why its per-file environment cost was ~8x cheaper than this one's.
+    //
+    // ⚠️ The 108 were derived by RUNNING the suite under node and taking the failures, not by
+    // grepping for `document` — a grep over these files is dominated by source-scanning guards that
+    // match the WORD "document" inside a string they are searching for.
+    //
+    // ⚠️ `environmentMatchGlobs` is NOT the mechanism: it was removed in vitest 4 (4.1.11 here).
+    // The per-file docblock is what this version supports, and 21 files already used it.
+    environment: 'node',
     setupFiles: './tests/setup.ts',
     // Reaps the claims-store fallback dirs the main process and spawned children leave (#1117).
     globalSetup: './tests/globalSetup.ts',
@@ -660,10 +680,22 @@ export default defineConfig(({ command }) => {
     // 20s was still not enough on the `win` clone: qaCaseReferences.test.ts walks the whole QA
     // corpus off disk, runs 8s unloaded, and blew past 35s under the app lane — failing 2 of 3
     // verify runs. That is a budget set on faster hardware, not a misbehaving test, so Windows
-    // gets its own ceiling and every other platform keeps the tighter one (a global raise would
-    // hide a real hang on the machines fast enough to notice it).
-    testTimeout: process.platform === 'win32' ? 60000 : 20000,
-    hookTimeout: 30000,
+    // got its own ceiling while every other platform kept the tighter one.
+    //
+    // 2026-09-16 (owner): "we should increase the timeout in general" — every ceiling here doubles,
+    // rather than one platform being patched each time the same shape reaches it. macOS was the
+    // second: wordweave's backgroundRotation.test.ts ("exactly ONE background is visible at every
+    // level of the corpus") runs ~15.7s of test time UNLOADED and hit 20302ms — a 302ms overshoot —
+    // under `verify`'s two concurrent lanes, failing the gate reproducibly while `npm test` alone
+    // stayed green. Both incidents are a budget set against lighter load than the gate really runs,
+    // so the fix is the budget, not the test.
+    //
+    // ⚠️ The cost is real, and the earlier version of this block argued the other way: a looser
+    // ceiling hides a genuine hang, and these are PER-TEST bounds, so a deadlocked test now burns
+    // twice as long before it reports. Accepted deliberately — a gate that fails on load is worse
+    // than one that reports a hang slowly, because the first teaches people to re-run it.
+    testTimeout: process.platform === 'win32' ? 120000 : 40000,
+    hookTimeout: 60000,
     include: [
       // ENGINE tests only — tests/** is the engine test surface, and it ships to the
       // public OSS repo (docs/engine-oss-publishing.md). DEMO-GAME tests live with

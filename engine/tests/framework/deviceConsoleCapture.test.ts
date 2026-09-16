@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Unit tests for the device console-capture SEAM (#591; rebuilt on the shared ring in #596/#597
  *  Stage 2) — split out of `bridge.ts` so it can be installed before `App.tsx`'s module graph. See
  *  `engine/app/debug/deviceConsoleCapture.ts` and `deviceConsoleCaptureInstallOrder.test.ts` (the

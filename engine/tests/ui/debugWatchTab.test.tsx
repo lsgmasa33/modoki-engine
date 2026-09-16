@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Watch tab (editor-only) — DOM integration tests (Phase 3).
  *
  *  The Watch observer lives in app/debug/watch.ts (editor-side, stripped from game

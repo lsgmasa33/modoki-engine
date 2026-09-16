@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /**
  * The unified cross-boot stash (#861), and one test per member of the family it closes.
  *

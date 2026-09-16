@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 import { describe, it, expect, afterEach, afterAll, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';

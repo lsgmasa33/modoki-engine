@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /**
  * #1162 — the four remaining lazily-cached asset defs are preloaded at scene load, like #1097's
  * Animator clips.

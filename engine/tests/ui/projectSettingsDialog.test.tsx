@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** ProjectSettingsDialog — the malformed-config banner (#26), as INTEGRATION over the
  *  real component: the router half is covered in tests/plugins/editorActionRouter.test.ts,
  *  but the whole point of #26 is what the HUMAN sees, and that only exists here.

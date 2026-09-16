@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /**
  * hmrStaleness — the RENDERER half of the game-code HMR fix.
  *

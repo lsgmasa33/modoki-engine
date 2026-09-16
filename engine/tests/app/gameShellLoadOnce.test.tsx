@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Pins #267: `GameShell`'s per-game boot effect (`engine/app/App.tsx`) used to list
  *  `[gameId, initialized, configReady]` as its dependency array while its own body calls
  *  `setConfigReady(true)`/`setInitialized(true)` mid-effect — an effect that writes state it

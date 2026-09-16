@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Asset Inspector — Phase 3 converter-param exposure (integration).
  *  Covers the UASTC-knob visibility + commit in the pure TextureSettingsControls.
  *  The audio sample-rate/bit-depth controls + both converters' arg/cache behavior

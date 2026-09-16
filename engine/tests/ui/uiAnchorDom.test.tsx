@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** UIAnchor end-to-end: the UIAnchor TRAIT → uiTreeProjection → UINode → real DOM.
  *
  *  Scope is deliberately narrow — this covers only the SEAM, which nothing else did.

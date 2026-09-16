@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Time / Journal / Store debug tabs — DOM integration tests (Phase 3).
  *
  *  Each reads a runtime-safe source (getTimeScale/setTimeScale, journalEvents,

@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Phase 2 — component/wiring tests (jsdom + @testing-library/react).
  *
  *  Phase 1 proved the action layer is correct by calling it directly. These render

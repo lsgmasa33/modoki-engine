@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Asset Inspector — Phase 2 Mesh + Material previews.
  *  - Unit: buildPreviewMaterial produces a faithful THREE material from .mat.json data.
  *  - Integration: Preview3DShell drives populate/frame/wireframe/rebuild/dispose and

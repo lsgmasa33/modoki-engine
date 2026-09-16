@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Unit tests for the ONE uncaught-error/unhandledrejection capture (#596/#597 Stage 3a) — split
  *  out of `deviceConsoleCapture.ts` (which had its own copy) and `agentBridge.ts` (which had a
  *  SECOND, near-identical copy) so there is exactly one registration, riding

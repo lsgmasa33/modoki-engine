@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** A scene/prefab hot reload held back by the suppressor is DEFERRED, not dropped (#1164), and a
  *  prefab change evicts the cached prefab before the reload it triggers (#1169).
  *

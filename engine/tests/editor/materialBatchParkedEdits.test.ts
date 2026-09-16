@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** #843 — `MaterialBatchView`'s live refresher used to re-load ALL selected materials from
  *  `pendingAssetDoc`/disk on every edit (`useAssetViewRefresher(paths[0] ?? '', () => loadAll())`,
  *  which REPLACES the whole `mats` map). `persistAssetEdit` calls the registered setter

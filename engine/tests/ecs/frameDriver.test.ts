@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** FrameDriver unit tests — priority ordering, FPS capping, ref-counted start/stop, stepOneFrame. */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';

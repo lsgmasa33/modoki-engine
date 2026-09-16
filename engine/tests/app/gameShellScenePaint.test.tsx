@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Pins #334: `GameShell` must not hide the `LoadingOverlay` — and so reveal the game's permanent
  *  HUD — until the renderer has actually PAINTED a frame of the scene that just swapped in.
  *

@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** #1012 — a refusal thrown as `OpRefusal` reaches the backend as a CODED envelope, on BOTH relay
  *  transports.
  *

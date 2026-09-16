@@ -237,7 +237,7 @@ describe('/api/device/request screenshot with NO lease (#102)', () => {
  *  back a value the caller will misread.
  *
  *  The budget is Windows-shaped: socket-close propagation there is slower than on ubuntu/macOS,
- *  and 10s sits well inside the suite's 20s `testTimeout` (engine/vite.config.ts). */
+ *  and 10s sits well inside the suite's `testTimeout` (engine/vite.config.ts). */
 async function waitForLeaseState(pred: (s: string) => boolean, timeoutMs = 10_000): Promise<unknown> {
   const deadline = Date.now() + timeoutMs;
   let last: string;

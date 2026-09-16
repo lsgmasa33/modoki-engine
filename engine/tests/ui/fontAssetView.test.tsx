@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** FontAssetView — Phase 1 UI logic (integration).
  *  - `fieldType` is now an editable msdf/mtsdf select (was static "MTSDF" text).
  *  - `atlasMax` (runtime dynamic-page size) is hidden for a baked font (it has no

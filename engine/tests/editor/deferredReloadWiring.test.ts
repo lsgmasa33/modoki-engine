@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** The editor's wiring of the deferred hot reload (#1164/#1169), through the REAL
  *  `registerEditorAgentOps` — the unit suites call `replaySuppressedSceneReloads` and subscribe spy
  *  listeners directly, so deleting any of the three lines below failed nothing (close-out review):

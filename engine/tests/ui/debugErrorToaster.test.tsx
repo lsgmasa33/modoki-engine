@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** ErrorToaster — shows a sliding toast on console.error, auto-dismisses after 3s
  *  (Phase 4.6). Fed by the debug console-capture.
  *

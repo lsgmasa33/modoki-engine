@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** hostCanvasUnder — resolves the host <canvas> under a pointer, disambiguating the editor's
  *  dual rendering (GameView + SceneView UI-preview both tag the same data-entity-id). Locks the
  *  behavior a game relies on to map window pointer events to the RIGHT canvas. */

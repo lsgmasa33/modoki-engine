@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** `useMetaDirty` — the panel-visible half of parked `.meta.json` import-settings edits (#870).
  *
  *  Since #845 an Inspector import-settings change PARKS instead of writing, so there is unsaved

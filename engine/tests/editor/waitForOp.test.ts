@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** The `wait-for` op (#1154) through the real registry and the real readers — the seam the pure
  *  suite (waitFor.test.ts) cannot see: that each condition kind is bound to the resolver its
  *  matching read tool uses, and that an unevaluable condition is refused before parking. */

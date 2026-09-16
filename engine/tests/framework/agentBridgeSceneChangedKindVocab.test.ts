@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** `scene-changed`'s `kind` is a PROTOCOL-supplied key into a code-declared table (#993).
  *
  *  `ASSET_CACHE_INVALIDATORS` in `app/debug/agentBridge.ts` is a code-declared literal, and

@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /**
  * A click on an interactive control must not ALSO read as a click on whatever is behind it.
  *

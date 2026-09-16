@@ -76,7 +76,7 @@ describe.skipIf(process.platform === 'win32')('deviceSyslog — captureIosSyslog
     // ⚠️ NO WALL-CLOCK BOUND HERE, deliberately (#751). This ran a REAL 1 s timer plus a process
     // spawn against a 5 s assertion — 5x headroom on an I/O-shaped wait, the thinnest margin of the
     // four sites #751's sweep found. It could not catch anything the harness does not already catch
-    // (`testTimeout` is 20 s, 60 s on Windows, so a stream that never ends fails as a timeout), and
+    // (`testTimeout` is finite — engine/vite.config.ts — so a stream that never ends fails as a timeout), and
     // the two assertions below are what actually prove the capture was BOUNDED: it came back, with
     // the window it used and the lines it read.
     expect(cap.capturedFor).toBe(CAPTURE_WINDOW)

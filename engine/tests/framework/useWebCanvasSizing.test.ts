@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** useWebCanvasSizing — pins the BOOT ORDERING the shipped web build depends on.
  *
  *  The pure geometry (computeContainerBox) is covered by webCanvasSizing.test.ts;

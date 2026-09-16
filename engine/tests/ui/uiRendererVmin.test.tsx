@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** UIRenderer viewport-var publishing — the vmin/vmax bug behind editor previews.
  *
  *  UIRenderer sets CSS custom props (--ui-vw/vh/vmin/vmax) on its container so

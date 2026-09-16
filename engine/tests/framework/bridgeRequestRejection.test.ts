@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** #1259's mechanism on the device bridge: the native `request` listener is async, and a throw that
  *  escapes it sends NO response, so the host (game-debug MCP) waits out its whole deadline. The
  *  `params` parse used to sit above the listener's try. Native always re-serialises params today

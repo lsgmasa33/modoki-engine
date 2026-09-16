@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** TouchControl end-to-end: the TRAIT → uiTreeProjection → UINode → real DOM (#297).
  *
  *  This covers the seam the input source depends on and nothing else tests. The source's own

@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** PlayableOverlay — the playable CTA/install overlay. Locks: there is NO persistent Install
  *  affordance (#1139), the end-card appears on the time-cap AND on a `playable:end` event, its
  *  Install routes the tap through installClick, and Replay clears it. */

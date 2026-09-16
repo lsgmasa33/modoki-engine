@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** healNativeConfig — heal-on-open native config (android/local.properties +
  *  iOS DEVELOPMENT_TEAM). Exercised against real temp project dirs. */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';

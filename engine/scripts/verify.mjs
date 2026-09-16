@@ -7,8 +7,28 @@
 // cheap and only interesting when the types are sane — so lint runs after typecheck,
 // sequentially, inside that one lane.
 //
-// MEASURED 2026-08-18 on this Mac, quiet box, warm caches (4 runs). ⚠️ Quote the RANGE — the
-// spread between rounds is larger than most changes you would make here:
+// ⚠️⚠️ **THE TABLE BELOW IS HISTORY, NOT THE CURRENT GATE (superseded 2026-09-16, #1283).** Two of
+// its load-bearing claims are now false, and both were quoted as current long after they stopped
+// being true — which is exactly why this script now prints a `context:` line on every run:
+//
+//   1. **"quiet box" no longer describes this machine.** Six clones run concurrent sessions and a
+//      session runs the gate when it finishes work. Measured on the hub while `modoki-qa` ran its
+//      own: load average 149.47 on a 12P+4E box, 38 live node processes in the other clone. Every
+//      wall-clock figure below was taken under conditions that no longer occur, so a run today is
+//      NOT comparable to them. `engine/scripts/verifyLoad.mjs` now budgets pools across clones.
+//   2. **"lane 2 never binds" is false.** Lane 2 was the pole in 3 of 5 runs on 2026-09-16
+//      (191.6s vs 134.9s in one). It gained the scoped per-project typecheck (#967) after this
+//      table was written, and the app lane has since got much cheaper (P2 below), so the ~30s of
+//      slack the table claims is gone. Do not plan a change on the assumption that lane 2 is free.
+//
+// What IS current, and measured by CPU time + vitest's cross-worker aggregates rather than wall
+// clock (the only figures that survive a contended box):
+//
+//   app suite, jsdom-for-everything -> node-by-default (#1283 P2)
+//     aggregate `environment`   957.87s -> 8.59s      CPU (user+sys)  1168s -> 791s  (-32%)
+//
+// MEASURED 2026-08-18 on this Mac, quiet box, warm caches (4 runs) — HISTORICAL, see above.
+// ⚠️ Quote the RANGE — the spread between rounds is larger than most changes you would make here:
 //
 //                              standalone      inside the lane
 //   typecheck                       12.4s          15.9-17.3s
@@ -19,6 +39,10 @@
 //   (+ scoped per-project typecheck, #967 — not in the above; its cost is at the leg below)
 //   app tests (lane 1)                             82.1-86.0s
 //   verify wall-clock                              82.1-86.0s
+//
+// ⚠️ SUPERSEDED — see point 2 at the top of this header. Lane 2 DOES bind now. Kept because the
+// reasoning below is still the right way to think about the two lanes, not because the conclusion
+// still holds.
 //
 // ⚠️ **The app lane IS the wall clock — LANE 2 NEVER BINDS.** Wall exceeded appLane by 7-8ms in
 // every run (82.077/82.070, 79.564/79.556, 86.019/86.012, 86.100/86.093), which is this script's
@@ -53,6 +77,9 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import {
+  registerVerifyRun, unregisterVerifyRun, benchLine, parseVitestAggregates,
+} from './verifyLoad.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -69,6 +96,32 @@ const repoRoot = path.resolve(__dirname, '..', '..');
  * Deliberately not tiny: at 3 workers this suite went from ~25s to 64-80s and became the pole.
  */
 const ENGINE_LANE_WORKERS = process.env.MODOKI_VERIFY_ENGINE_WORKERS ?? '6';
+
+/** This run's share of the box, filled in by `main()` before any lane starts (#1283).
+ *
+ *  ⚠️ Both lanes read it, so it must be registered BEFORE the first `spawn` — a lane launched
+ *  against the default would size itself from the whole machine and the budget would describe a
+ *  pool nobody used. */
+let budget = null;
+
+/** Extra env for a lane's worker cap — `{}` when this run should behave exactly as it did before
+ *  the budget existed.
+ *
+ *  ⚠️ **It intervenes ONLY when the box is genuinely shared (`peers > 1`).** A solo run must fall
+ *  through to `testWorkers.ts` untouched, because that module knows things this one deliberately
+ *  does not: it returns `{}` on a homogeneous CPU so vitest keeps its own default, and it HALVES on
+ *  Windows because SMT siblings are not cores. Setting a number here unconditionally would overwrite
+ *  both — and the Windows case is measured to go RED, not merely slow, when over-subscribed.
+ *
+ *  ⚠️ `MODOKI_TEST_MAX_WORKERS` still beats everything, as `testWorkers.ts` documents: it is the
+ *  lever for an unusual box and for bisecting a contention problem, so a deliberate human setting is
+ *  never silently outvoted by this. */
+function laneWorkerEnv(share) {
+  if (process.env.MODOKI_TEST_MAX_WORKERS) return {};
+  if (process.env.MODOKI_VERIFY_NO_BUDGET) return {};
+  if (!budget || budget.peers <= 1) return {};
+  return { MODOKI_TEST_MAX_WORKERS: String(share) };
+}
 
 function runCommand(cmd, extraEnv = {}) {
   return new Promise((resolve) => {
@@ -180,7 +233,7 @@ async function checksAndEngineLane() {
   // Runs even if lint failed — a lint error says nothing about whether the tests pass, and finding
   // out both in one go beats a second full run.
   const engine = await runCommand('npm --prefix engine/packages/modoki test',
-    { MODOKI_TEST_MAX_WORKERS: ENGINE_LANE_WORKERS });
+    { MODOKI_TEST_MAX_WORKERS: ENGINE_LANE_WORKERS, ...laneWorkerEnv(budget?.engineWorkers) });
   parts.push(`--- engine tests ---\n${engine.output}`);
 
   return finish(scoped.ok && lint.ok && engine.ok);
@@ -189,7 +242,7 @@ async function checksAndEngineLane() {
 const lanes = [
   // The app suite keeps the machine's full performance-core pool (`engine/testWorkers.ts` sizes it)
   // — it is the critical path, and starving it just moves the wall-clock onto this lane.
-  { name: 'app tests', run: () => runCommand('npm test') },
+  { name: 'app tests', run: () => runCommand('npm test', laneWorkerEnv(budget?.appWorkers)) },
   { name: 'checks + engine tests', run: checksAndEngineLane },
 ];
 
@@ -200,10 +253,18 @@ process.on('SIGINT', () => {
   for (const child of runCommand._active || []) {
     child.kill('SIGTERM');
   }
+  // Drop this run's slot on the way out, so a Ctrl-C does not leave every other clone budgeting
+  // around a gate that is gone. The pid check and the TTL both expire it anyway — this just makes
+  // the common case immediate rather than waiting for one of them.
+  unregisterVerifyRun();
   process.exitCode = 1;
   // Give children a moment to die, then force exit.
   setTimeout(() => process.exit(1), 500).unref();
 });
+
+// Covers the paths SIGINT and the normal return do not: a throw, and `process.exit()` from
+// anywhere. Safe to run twice — removing an absent pid is a no-op.
+process.on('exit', () => unregisterVerifyRun());
 
 /** Re-copy `engine/scripts/git-hooks/*` into the hooks dir git actually reads (#909).
  *
@@ -252,9 +313,16 @@ async function main() {
 
   installGitHooks();
 
+  // Registered BEFORE any lane spawns, so both lanes see the same share (#1283).
+  budget = registerVerifyRun();
+
   // Announce the lanes up front. Output is buffered per lane, so without this the terminal shows
   // NOTHING until the first lane finishes — on a gate people sit and watch, silence reads as a hang.
   console.log(`[verify] running ${lanes.length} lanes concurrently: ${lanes.map((l) => l.name).join(' · ')}`);
+  if (budget.peers > 1) {
+    console.log(`[verify] ${budget.peers} verify runs share this box — sizing pools to `
+      + `app=${budget.appWorkers} engine=${budget.engineWorkers} (MODOKI_VERIFY_NO_BUDGET=1 opts out)`);
+  }
 
   const results = await Promise.all(
     lanes.map(async (lane) => {
@@ -263,7 +331,7 @@ async function main() {
       const header = `\n===== [${status}] ${lane.name} (${result.seconds.toFixed(1)}s) =====\n`;
       process.stdout.write(header);
       process.stdout.write(result.output);
-      return { name: lane.name, ok: result.ok, seconds: result.seconds };
+      return { name: lane.name, ok: result.ok, seconds: result.seconds, output: result.output };
     })
   );
 
@@ -276,6 +344,22 @@ async function main() {
     console.log(`  [${r.ok ? 'PASS' : 'FAIL'}] ${r.name} (${r.seconds.toFixed(1)}s)`);
   }
   console.log(`  total wall-clock: ${wallSeconds.toFixed(1)}s`);
+
+  // ⚠️ Printed on EVERY run, not behind a flag. A timing with no record of the contention it ran
+  // under is not comparable to another one, and that is exactly how this script's header table came
+  // to be quoted as current long after the box stopped being quiet (#1283).
+  console.log(benchLine(budget));
+  for (const r of results) {
+    const agg = parseVitestAggregates(r.output);
+    if (!agg) continue;
+    // Summed across workers, so these do NOT inflate with contention the way wall clock does —
+    // they are the number to compare between two runs on a busy machine.
+    const p = agg.parts;
+    console.log(`  ${r.name}: vitest ${agg.duration.toFixed(1)}s`
+      + ` (transform ${(p.transform ?? 0).toFixed(1)} · setup ${(p.setup ?? 0).toFixed(1)}`
+      + ` · import ${(p.import ?? 0).toFixed(1)} · tests ${(p.tests ?? 0).toFixed(1)}`
+      + ` · environment ${(p.environment ?? 0).toFixed(1)})`);
+  }
 
   const failed = results.filter((r) => !r.ok);
   if (failed.length > 0) {

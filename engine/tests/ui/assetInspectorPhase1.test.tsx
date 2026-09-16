@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** Asset Inspector — Phase 1 quick wins (integration).
  *  Covers the WebP-quality control's visibility logic in the pure, prop-driven
  *  TextureSettingsControls. The font fieldType/atlasMax + spriteanim-button changes
