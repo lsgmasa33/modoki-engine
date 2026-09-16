@@ -464,6 +464,13 @@ but describes a different population than a reader will see.
 | CPU time (user+sys) | 1168s | **791s (−32%)** |
 | tests passing | 26,964 | 26,964 (identical) |
 
+⚠️ **Those are QUIET-BOX figures, and the aggregates inflate under load like everything else.** A
+green run on the merged tree on 2026-09-16 at `load 109.5/81.6 · 2 verify run(s)` reported aggregate
+`environment` **116.77s** over 868 files — 13x the 8.59s above, and still an eighth of the 957.87s
+the flip removed. So the table measures the FLIP, not a budget: a loaded run showing three figures
+of environment time is not a regression against it. Compare a loaded run only against another loaded
+run, and read the `context:` line of both.
+
 ⚠️ **No file count is quoted anywhere in this section on purpose.** The first draft said "108", and
 three commits in the same change added ten more without updating it. The live answer is
 `grep -rl '@vitest-environment jsdom'` over the include roots — a number that cannot go stale.
@@ -514,11 +521,23 @@ module-hydration race, and per-file isolation is its only defence.
 
 ⚠️ **The canary set is THREE tests, not one.** `work-qa`'s reds were `backgroundRotation` (20846ms),
 `releaseBuild` (34491ms) and `projectPresencePredicate` (22601ms) — in the same run — and `ai3`'s
-non-timeout casualties were two of those three. What they share is that **each walks the repo corpus
-off disk**, so each scales with repo SIZE and with CONTENTION, which move independently: a ceiling
-tuned against one gets re-crossed by the other, which is how three tests end up individually
-re-widened. Riding the unit-test default timeout is the wrong shape for a corpus walk; a stated
-corpus-walk budget is the right one. Not designed or filed yet (#1285 carries the note).
+non-timeout casualties were two of those three.
+
+⚠️ **What they share is NOT a mechanism, and the first version of this paragraph said it was.** It
+claimed all three "walk the repo corpus off disk". Checked against the files, that is one of three:
+`projectPresencePredicate` calls `repoFiles()`; `backgroundRotation` steps **7,200 frames** over an
+in-memory stubbed level corpus and reads nothing off disk; `releaseBuild` is pure decision functions
+plus `spawnSync`. What the three actually share is being **long-running**, which
+`engine/testWorkers.ts` already gives as the reason a test goes first under oversubscription. Do not
+instrument the other two looking for a corpus.
+
+The corpus-walk budget gap is real on its own evidence and is **#1290**: `grep -rl` over
+`repoCorpus|repoFiles(` finds **125 test files**, of which **2** state a timeout — so 123 corpus
+walks are charged against a ceiling sized for a unit test. Repo size and machine contention move
+independently, so a ceiling tuned against one gets re-crossed by the other, and the repo accumulates
+a number per test with no rationale between them. **#1046 is the closed precedent**: docCitations'
+scan at 17s against a 20s budget, handed 60s on Windows. The unit-test default is the wrong
+*instrument* for a corpus walk, not merely a too-small number — which is what decides the fix shape.
 
 ### What the environment flip does NOT risk, and how that was checked
 
