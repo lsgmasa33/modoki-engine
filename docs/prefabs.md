@@ -618,10 +618,8 @@ the file.**
 
   Guarded two ways: `coldPrefabCacheWarming.test.ts` (behaviour, starting from a cold
   cache — note every OTHER nested test calls `setPrefabCache` by hand and so only ever
-  exercised the warm path) and `coldCacheWarmCensus.test.ts` (a source census of every
-  `serializePrefab(` call, with an exemption ledger for the four that cannot hold a nested
-  instance or are warmed at open time, plus a by-name check that the two rebuild entry
-  points still warm at all).
+  exercised the warm path) and `prefabCacheWarm.test.ts` (the swap warm and the instantiate
+  helper — the two mechanisms that make the cache populated by construction).
 
   ⚠️ **Every entry point that reaches one of these readers now warms — including the undo/redo
   closures.** Those were deferred three times as "synchronous closures that can never await",
@@ -634,6 +632,23 @@ the file.**
   real I/O, and `entityRef` exists in those files precisely because a raw ecs id goes stale
   across a world rebuild (Play→Stop, a watcher reload).
 
+
+  ⚠️ **The cache is now populated BY CONSTRUCTION, and the per-call-site warms are belt-and-braces
+  rather than the mechanism** (#1295). Two things make it so, and they are what to keep working if
+  this ever regresses:
+  - **`instantiatePrefabInstance`** — every path that spawns a prefab from an asset path caches it
+    under the ref the new instance actually CARRIES. `setPrefabSource` resolves a path to a GUID
+    whenever the manifest can, and nothing used to cache under that guid, so a prefab dropped in
+    mid-session was unreachable however warm the scene load had been.
+  - **`installEditorPrefabCacheWarm`** — a `beforeSwap` hook (the loader awaits it, so the swap
+    cannot complete half-warm) that takes each prefab from the RUNTIME cache the loader has already
+    filled. A `Map.get` plus a `Map.set`; it only fetches for a source the runtime cache cannot key.
+
+  The ~15 `await preloadNestedPrefabsForSubtree(...)` calls are deliberately KEPT even though both
+  of the above should make them redundant: each is a `Map.has` once warm, and the failure they
+  guard against is SILENT. They are the cheap half of the defence; the census that policed them was
+  the expensive half, and only that was removed.
+
   ⚠️ **Do not trust a census that anchors on ONE reader — this paragraph shipped a wrong count
   three times doing exactly that.** The sync reads are not three; in `prefab.ts` alone there are
   **seven** (`planPrefabRows`, `instantiatePrefab`, `wouldCreateCycle`, `captureNestedRef`,
@@ -641,15 +656,17 @@ the file.**
   `Inspector.tsx` and the prefab-edit save. They are reached by different call chains, so a sweep
   anchored on `captureInstanceStructure` cannot see the one that reaches `planPrefabRows` through
   `tagEntityTreeAsInstance` — which is how `assetOps`' async redo survived a manual sweep AND an
-  adversarial review. `coldCacheWarmCensus.test.ts` pins three anchors separately for that reason,
-  and **#1295** tracks replacing the whole approach with a world-level warm.
+  adversarial review. A source census used to pin three anchors separately for that reason; it was
+  **deleted** once the cache became populated by construction (see below), because it needed a new
+  anchor per reader and that treadmill was its own maintenance defect.
 
   ⚠️ **`applyToPrefab` is the one worth remembering**, because it shows what the cold read
   actually costs. It captures the structure and uses the result to BUILD the key set it hands
   to `applyToPrefabSelective`, so a cold miss did not merely hide a row — it silently dropped
   a hand-added nested subtree from an action whose entire promise is "apply all of it". It was
-  found by the population guard in `coldCacheWarmCensus.test.ts` on the guard's first run,
-  having been missed by both a manual sweep and an adversarial review.
+  found by a source census on its first run, having been missed by both a manual sweep and an
+  adversarial review — which is the argument for the construction-level fix below rather than for
+  keeping the census.
 
   ⚠️ **One behaviour change worth knowing, because warming changes what a GUARD can see.**
   `planPrefabRows` runs `wouldCreateCycle` BEFORE the cache lookup, and that guard returns

@@ -10,6 +10,7 @@ import { createElement } from 'react';
 import type React from 'react';
 import {
   createEditor, setExtraMenus, useEditorStore, backendFetch, backendEventSource, fetchDeviceList,
+  installEditorPrefabCacheWarm,
   type ExtraMenuItem, type DeviceListReply,
 } from '@modoki/engine/editor';
 import { GameView } from '@modoki/engine/editor/rendering';
@@ -247,6 +248,12 @@ export async function createGameEditor(): Promise<{ default: React.ComponentType
   // 0. Load the open project's games at runtime (C4c) — dev editor pulls them
   //    from the project registry over the backend; packaged/web use the baked
   //    virtual module. Replaces the static `virtual:modoki-games` import.
+  // Warm the EDITOR prefab cache on every scene swap, before the swap completes (#1295).
+  // Installed here because this module is the editor-only entry point — App.tsx lazy-imports
+  // it and never loads it in a game build, so the hook cannot reach a shipped runtime.
+  // Not torn down: `createGameEditor` runs once per editor boot, and the hook is idempotent.
+  installEditorPrefabCacheWarm();
+
   const { ALL_GAMES } = await loadProjectGames();
 
   // 1. Load the game's config — running the config module registers its scene

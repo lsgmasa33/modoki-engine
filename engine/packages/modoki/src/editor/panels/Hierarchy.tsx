@@ -13,7 +13,7 @@ import { flattenVisibleIds, rangeBetween } from './hierarchySelection';
 import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, snapshotEntity, respawnFromSnapshot, regenerateSnapshotGuids, classifyPrefabDuplicate, stripPrefabInstanceFromSnapshot, reRootPrefabInstanceSubtree, moveEntityToScene, type EntitySnapshot } from '../undo/entityActions';
 import { preflightSceneMove, formatSceneMoveConfirm } from '../scene/sceneMoveScan';
 import { entityRef } from '../undo/entityRef';
-import { instantiatePrefabAsync, setPrefabSource, detachPrefabInstance, reattachPrefabInstance, type PrefabFile } from '../scene/prefab';
+import { instantiatePrefabInstance, detachPrefabInstance, reattachPrefabInstance, type PrefabFile } from '../scene/prefab';
 import { parseAssetJson, isMissingAsset } from '../../runtime/loaders/assetFetch';
 import { focusEntityInSceneView, canFrameSelected } from '../scene/sceneViewBus';
 import { getCurrentScenePath } from '../scene/serialize';
@@ -1597,8 +1597,7 @@ export default function Hierarchy() {
       }
       // Preload nested children before the sync expand — otherwise a nested (v2)
       // prefab's children are silently dropped.
-      const currentId = await instantiatePrefabAsync(prefab, parentId);
-      setPrefabSource(currentId, path);
+      const currentId = await instantiatePrefabInstance(prefab, path, parentId);
       selectEntity(currentId);
       console.log(`[Hierarchy] Instantiated prefab "${prefab.name}" under parent ${parentId}`);
 
@@ -1614,8 +1613,7 @@ export default function Hierarchy() {
             if (isMissingAsset(e)) return null;
             throw e;
           }
-          const id = await instantiatePrefabAsync(p, parentId);
-          setPrefabSource(id, path);
+          const id = await instantiatePrefabInstance(p, path, parentId);
           selectEntity(id);
           return id;
         },

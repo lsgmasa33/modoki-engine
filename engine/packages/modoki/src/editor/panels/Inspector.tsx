@@ -18,7 +18,7 @@ import { useEditorStore } from '../store/editorStore';
 import { getPrefabSource, getCachedPrefabSync, getOverrides } from '../scene/prefab';
 import { getEditorViewportCamera } from '../scene/sceneViewBus';
 import { isSkippedByPrimarySave } from '../scene/serialize';
-import { instantiatePrefabAsync, setPrefabSource, type PrefabFile } from '../scene/prefab';
+import { instantiatePrefabInstance, type PrefabFile } from '../scene/prefab';
 import { parseAssetJson, isMissingAsset } from '../../runtime/loaders/assetFetch';
 import { getModelPostprocessorIds } from '../../runtime/loaders/modelPostprocessorRegistry';
 import { isGuid, resolveGuidToPath, getAssetEntry } from '../../runtime/loaders/assetManifest';
@@ -1546,8 +1546,7 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
                   const res = await fetch(asset.path);
                   const prefab = await parseAssetJson(res, asset.path) as PrefabFile;
                   // Preload nested children before the sync expand (nested prefabs).
-                  const rootId = await instantiatePrefabAsync(prefab);
-                  setPrefabSource(rootId, asset.path);
+                  const rootId = await instantiatePrefabInstance(prefab, asset.path);
                   // Make it undoable via the shared helper (prefab F4) — same
                   // reassign-on-redo semantics as Hierarchy/Assets so Cmd+Z removes
                   // the instance and redo respawns + retracks the new id.
@@ -1564,8 +1563,7 @@ function AssetInspector({ asset }: { asset: SelectedAsset }) {
                         if (isMissingAsset(e)) return null;
                         throw e;
                       }
-                      const id = await instantiatePrefabAsync(p);
-                      setPrefabSource(id, asset.path);
+                      const id = await instantiatePrefabInstance(p, asset.path);
                       return id;
                     },
                     remove: (id) => { deleteEntity(id); },

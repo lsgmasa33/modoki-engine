@@ -56,9 +56,12 @@ export {
   fetchDeviceList, androidRowLabel, androidRowNote,
   type DeviceListReply, type AndroidDeviceRow, type IosDeviceRow, type DeviceClaim,
 } from './panels/deviceConnectModel';
+export { installEditorPrefabCacheWarm, warmEditorPrefabCacheFor } from './scene/prefabCacheWarm';
 export {
   PREFAB_FORMAT_VERSION,
   serializePrefab, instantiatePrefab, instantiatePrefabAsync, setPrefabSource,
+  instantiatePrefabInstance,
+  primeEditorPrefabCache, isEditorPrefabCached,
   getPrefabSource, setPrefabCache, refreshPrefabSourceForPath, getOverrides, getOverrideValues,
   preloadNestedPrefabs, preloadNestedPrefabsForSubtree,
   captureInstanceOverrides, applyOverridesByRootInstance,

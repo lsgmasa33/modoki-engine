@@ -6,7 +6,7 @@ import { fileToBase64 } from './fileBytes';
 import { getGameConfig } from '../../runtime/core/config';
 import { loadAllFonts } from '../../runtime/loaders/fontLoader';
 import {
-  instantiatePrefabAsync, setPrefabSource, type PrefabFile, serializePrefab,
+  instantiatePrefabInstance, type PrefabFile, serializePrefab,
 } from '../scene/prefab';
 import { importModel } from '../scene/modelImport';
 import { needsGLBConversion, convertSourceToGLB } from '../scene/convertToGLB';
@@ -77,8 +77,7 @@ async function instantiatePrefabFromPath(prefabPath: string, _name: string) {
     const res = await fetch(prefabPath);
     if (!res.ok) { console.error(`[Assets] Failed to fetch ${prefabPath}`); return; }
     const prefab: PrefabFile = await res.json();
-    const rootId = await instantiatePrefabAsync(prefab);
-    setPrefabSource(rootId, prefabPath);
+    const rootId = await instantiatePrefabInstance(prefab, prefabPath);
     console.log(`[Assets] Instantiated prefab "${prefab.name}"`);
 
     const { deleteEntity } = await import('../../runtime/core/ecs/entityUtils');
@@ -89,8 +88,7 @@ async function instantiatePrefabFromPath(prefabPath: string, _name: string) {
         const r = await fetch(prefabPath);
         if (!r.ok) return null;
         const p: PrefabFile = await r.json();
-        const id = await instantiatePrefabAsync(p);
-        setPrefabSource(id, prefabPath);
+        const id = await instantiatePrefabInstance(p, prefabPath);
         return id;
       },
       remove: (id) => { deleteEntity(id); },

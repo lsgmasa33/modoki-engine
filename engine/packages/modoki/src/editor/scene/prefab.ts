@@ -885,10 +885,12 @@ export async function preloadNestedPrefabs(prefab: PrefabFile, seen = new Set<st
  *  version of this comment called those closures "synchronous … can never await", which was
  *  false and was the stated reason for deferring them.
  *
- *  What is NOT covered is a reader reached from somewhere nobody has enumerated — the census in
- *  `coldCacheWarmCensus.test.ts` anchors on `serializePrefab`, `captureInstanceStructure` and
- *  `tagEntityTreeAsInstance`, and every time a sweep here anchored on ONE of those it missed a
- *  path. #1295 tracks replacing all of it with a world-level warm.
+ *  ⚠️ **These calls are now belt-and-braces, not the mechanism.** Since #1295 the cache is
+ *  populated by construction — `instantiatePrefabInstance` caches under the ref the instance
+ *  carries, and `installEditorPrefabCacheWarm` fills it on every scene swap from what the loader
+ *  already parsed. These are kept because each costs a `Map.has` once warm and the failure they
+ *  guard against is silent; the source census that used to police them was deleted, because it
+ *  needed a new anchor per reader and every sweep that anchored on ONE of them missed a path.
  *
  *  Call this from the async entry point BEFORE any of them, exactly as the scene save
  *  already does for its own capture loop (`serialize.ts`, "Preload every referenced
@@ -910,14 +912,62 @@ export async function preloadNestedPrefabs(prefab: PrefabFile, seen = new Set<st
 export async function preloadNestedPrefabsForSubtree(selectedEntityId: number): Promise<void> {
   const piMeta = getTraitByName('PrefabInstance');
   if (!piMeta) return;
+  // Collect first, then fetch in parallel — the scene save's equivalent preload does the same
+  // (`serialize.ts`). The Set is what dedupes; it is NOT a side effect of fetching serially,
+  // so parallelising cannot reintroduce a double fetch for two instances of one source.
   const seen = new Set<string>();
   for (const e of collectTree(selectedEntityId, getAllEntities())) {
     if (!e.traits.includes('PrefabInstance')) continue;
     const source = readTraitData(e.id, piMeta)?.source as string | undefined;
-    if (!source || seen.has(source)) continue;
-    seen.add(source);
-    await getPrefabSource(source);
+    if (source) seen.add(source);
   }
+  await Promise.all([...seen].map((source) => getPrefabSource(source)));
+}
+
+/** Spawn an instance of a prefab that was loaded from an asset PATH, and leave the editor
+ *  prefab cache answering to the key the instance actually CARRIES (#1295).
+ *
+ *  ⚠️ This closes the gap that made every per-call-site warm necessary, and it is the reason
+ *  a world-level warm alone could not replace them. The three raw-fetch instantiate entry
+ *  points (Assets, Hierarchy, Inspector — and their undo respawns) fetched the file, spawned
+ *  it, then called `setPrefabSource`, which stores the **GUID** when the manifest resolves one.
+ *  Nothing ever cached the prefab under that guid, so a prefab dropped in mid-session was
+ *  invisible to every sync reader — `planPrefabRows` flattened it, `captureNestedRef` dropped
+ *  it — no matter what happened at scene load.
+ *
+ *  ⚠️ Sets the map DIRECTLY rather than calling `setPrefabCache`, deliberately: that helper also
+ *  calls `invalidatePrefab`, because every one of its callers follows a prefab FILE WRITE. This
+ *  one follows a READ, and invalidating the runtime cache on every drag-drop would throw away
+ *  exactly the entries the loader just acquired. */
+export async function instantiatePrefabInstance(
+  prefab: PrefabFile, sourcePath: string, parentId: number = 0,
+): Promise<number> {
+  const rootId = await instantiatePrefabAsync(prefab, parentId);
+  if (!rootId) return rootId;
+  setPrefabSource(rootId, sourcePath);
+  // Whatever ref setPrefabSource settled on — the guid when the manifest resolves it, the raw
+  // path when it cannot (a freshly-instantiated instance before its scene is saved).
+  const piMeta = getTraitByName('PrefabInstance');
+  const live = piMeta ? (readTraitData(rootId, piMeta)?.source as string | undefined) : undefined;
+  if (live) primeEditorPrefabCache(live, prefab);
+  return rootId;
+}
+
+/** Seed the editor prefab cache from a READ — the scene-load warm and the instantiate helper.
+ *
+ *  ⚠️ Deliberately NOT `setPrefabCache`, and the difference is the whole reason this exists:
+ *  that one also calls `invalidatePrefab`, because all of ITS callers follow a prefab FILE
+ *  WRITE and a later scene load must re-read from disk. A read-side seed that invalidated the
+ *  runtime cache would throw away the very entries the scene loader just acquired — on every
+ *  drag-drop, and once per prefab on every scene swap. */
+export function primeEditorPrefabCache(source: string, prefab: PrefabFile): void {
+  prefabCache.set(source, prefab);
+}
+
+/** Is this source already in the editor cache? (`getCachedPrefabSync` answers the same
+ *  question, but returning the file invites a caller to use a copy it should not hold.) */
+export function isEditorPrefabCached(source: string): boolean {
+  return prefabCache.has(source);
 }
 
 /** Async-safe instantiate: preload every nested child into the editor cache, THEN
@@ -2567,7 +2617,21 @@ function refreshInstances(
 ): void {
   if (rootIds.length === 0) return;
 
+  let refreshed = 0;
   for (const oldRootId of rootIds) {
+    // ⚠️ A root can be DEAD by the time the loop reaches it, and `rebuildInstance` does not
+    // no-op on one: it reads `parentId` as 0, finds no members, deletes nothing, and then
+    // `instantiatePrefab(prefab, 0)` spawns a DUPLICATE instance at the scene root. The shape
+    // is `collectInstanceRoots(S)` returning both an instance of S and a second instance of S
+    // the author dropped INSIDE it, where the outer teardown destroys the inner root first.
+    //
+    // ⚠️ TRACED, NOT DRIVEN. Found by reading, in the #1295 review. I could not build a
+    // fixture that fires it — with an inner instance nested under an outer one, the refresh
+    // loop reached both while still alive ("Refreshed 2 instance(s)"), so the ordering the
+    // hazard needs did not occur. Kept because it costs one map lookup and the failure it
+    // prevents is a silently duplicated subtree; do NOT read it as a covered case.
+    if (!isLiveInstanceRoot(oldRootId)) continue;
+    refreshed++;
     // Capture this instance's per-field overrides AND structural diffs against
     // the OLD prefab, then tear down + re-instantiate from the NEW prefab and
     // re-apply them. Structure must be captured before the teardown inside
@@ -2577,7 +2641,18 @@ function refreshInstances(
     rebuildInstance(oldRootId, source, newPrefab, captured, capturedStructure);
   }
 
-  console.log(`[Prefab] Refreshed ${rootIds.length} instance(s) of "${source}"`);
+  // Reports what was REBUILT, not what was listed. The two differ exactly when a root died
+  // under another root's teardown, so this line is the only place that case becomes visible.
+  console.log(`[Prefab] Refreshed ${refreshed} instance(s) of "${source}"`);
+}
+
+/** Is `rootId` still a live, self-rooted prefab-instance root? False once it has been
+ *  destroyed — `readTraitData` goes through `findEntity`, which drops a dead id. */
+function isLiveInstanceRoot(rootId: number): boolean {
+  const meta = getTraitByName('PrefabInstance');
+  if (!meta) return false;
+  const pi = readTraitData(rootId, meta);
+  return !!pi && pi.rootInstanceId === rootId;
 }
 
 /** Collect root entity ids for every instance of a given source. Optionally
