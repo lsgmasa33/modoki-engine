@@ -1,4 +1,4 @@
-// Cross-clone worker budgeting and load context for `npm run verify` (#1283).
+// Cross-clone worker budgeting and load context for `npm run verify` (#1285).
 //
 // ── WHY THIS EXISTS ──
 //
@@ -34,6 +34,22 @@
 //
 // Deliberately NOT a mutex. Serializing would make a clone wait minutes on another clone's gate,
 // and the point is to stop the thrash, not to stop the work.
+//
+// ⚠️ **THE BUDGET NEVER RENEGOTIATES, so this HALVES the problem rather than solving it.** A run
+// sizes its pools once, at registration, and keeps them for its whole gate. The FIRST clone to
+// start therefore always sees `peers = 1` and takes the entire pool; only later arrivals divide. Two
+// clones land at 12+6 and 6+3 = 27 workers on 12 perf cores, not the 2x6 that "divides the pool by
+// the number of live runs" reads like. Still well short of the 36 they took before, and renegotiating
+// mid-run would mean restarting a live vitest pool — but do not quote the mechanism as if the
+// division were even.
+//
+// ⚠️ **The read-modify-write can drop a LIVE peer, and that is worse than the register-side race.**
+// If A's exit handler reads the registry, B then renames its own registration in, and A writes its
+// filtered set, B's entry is gone for the rest of B's run: B's own release no-ops, and every run
+// starting afterwards sees `peers` one lower and over-budgets. The window is a few milliseconds and
+// the consequence lasts a whole gate. Not observed, not defended against — an advisory budget that
+// is occasionally one slot generous is still the point, and a lock here would cost more than it
+// saves.
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -82,13 +98,21 @@ export function perfCores({ platform = process.platform } = {}) {
   // cap would describe a pool that never existed.
   if (platform === 'win32') return Math.ceil(logical / 2);
 
+  // ⚠️ **EVERY platform is decided BEFORE the probe, not just win32.** The first fix moved `win32`
+  // up and left this gate out, so on a Mac the sysctl still answered first for `linux`, `freebsd`
+  // and everything else — `perfCores({platform:'linux'})` returned 12 (this box's PERFORMANCE
+  // cores) where the homogeneous-CPU answer is 16. The injectable seam was still unreachable for
+  // every branch but the one that had been fixed, which is the same defect one branch short of
+  // swept. `testWorkers.ts` has the correct shape and gates on `!== 'darwin'` before probing.
+  if (platform !== 'darwin') return logical;
+
   try {
     const n = Number(execFileSync('sysctl', ['-n', 'hw.perflevel0.logicalcpu'], {
       encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
     }).trim());
     if (Number.isFinite(n) && n > 0) return n;
   } catch {
-    // Not Apple Silicon (or no sysctl) — fall through to the homogeneous-CPU answer.
+    // An Intel Mac (no `hw.perflevel0`) or no sysctl — the homogeneous-CPU answer is correct there.
   }
   return logical;
 }
@@ -181,12 +205,19 @@ export function unregisterVerifyRun({ pid = process.pid, dir = claimsDir(), now 
 
 /** One line of context for any number this gate prints.
  *
- *  ⚠️ This is Phase 0 of the #1283 work and it is load-bearing, not decoration: a `verify` timing
+ *  ⚠️ This is Phase 0 of the #1285 work and it is load-bearing, not decoration: a `verify` timing
  *  with no record of the contention it ran under cannot be compared against another one, and four
  *  months of the header's table were quoted as current long after the box stopped being quiet. */
-export function benchLine({ peers, total, appWorkers, engineWorkers, load = os.loadavg() }) {
-  const [l1, l5] = load;
-  return `  context: load ${l1.toFixed(1)}/${l5.toFixed(1)} · ${peers} verify run(s) on ${total} perf core(s)`
+export function benchLine({
+  peers, total, appWorkers, engineWorkers, load = os.loadavg(), platform = process.platform,
+}) {
+  // ⚠️ **`os.loadavg()` returns `[0,0,0]` on Windows — always, by Node's contract.** Printed raw
+  // that reads as a perfectly idle box, which is strictly worse than printing nothing: the line
+  // LOOKS like a measurement was taken. And it lands on the one platform that `testWorkers.ts`
+  // measures going RED rather than merely slow under oversubscription — the platform this line
+  // exists to explain. `peers` and the worker split are still real there, so the line stays.
+  const l = platform === 'win32' ? 'n/a (os.loadavg is 0 on Windows)' : `${load[0].toFixed(1)}/${load[1].toFixed(1)}`;
+  return `  context: load ${l} · ${peers} verify run(s) on ${total} perf core(s)`
     + ` · workers app=${appWorkers} engine=${engineWorkers}`;
 }
 
@@ -197,7 +228,17 @@ export function benchLine({ peers, total, appWorkers, engineWorkers, load = os.l
  *  the comparable number between two runs on a contended machine. `environment` in particular is
  *  what exposed the app suite paying jsdom for files that never touch a DOM. */
 export function parseVitestAggregates(output) {
-  const m = /Duration\s+([\d.]+)s\s+\(([^)]+)\)/.exec(output ?? '');
+  // Strip ANSI first. Vitest dims the `(…)` group, so with colour enabled the line reads
+  // `Duration  12.3s \x1b[2m (transform …)\x1b[22m` and `\s+\(` cannot cross the escape — the match
+  // fails and the caller's `if (!agg) continue` drops the line in silence. Under `verify`'s pipe
+  // picocolors disables colour, which is the only reason this worked; anyone setting `FORCE_COLOR`
+  // to read the gate more easily would lose exactly the figures a contended box is compared by.
+  // Matching an ANSI SGR escape REQUIRES the ESC control character — that is what the strip is for,
+  // not an accident of the pattern. (The disable must sit on the line immediately above the regex:
+  // put a continuation comment between them and it lands on the comment instead, silently.)
+  // eslint-disable-next-line no-control-regex
+  const ansi = /\x1b\[[0-9;]*m/g;
+  const m = /Duration\s+([\d.]+)s\s+\(([^)]+)\)/.exec((output ?? '').replace(ansi, ''));
   if (!m) return null;
   const parts = {};
   for (const seg of m[2].split(',')) {

@@ -647,7 +647,7 @@ export default defineConfig(({ command }) => {
         '**/index.ts',
       ],
     },
-    // NODE by default; a file that needs a DOM says so with `// @vitest-environment jsdom` (#1283).
+    // NODE by default; a file that needs a DOM says so with `// @vitest-environment jsdom` (#1285).
     //
     // This was `'jsdom'` for the whole suite, and the whole suite paid for it. MEASURED 2026-09-16
     // over all 866 app-suite files, comparing vitest's own cross-worker aggregates (which, unlike
@@ -656,14 +656,19 @@ export default defineConfig(({ command }) => {
     //     aggregate `environment`   957.87s  ->  8.59s
     //     CPU time (user+sys)         1168s  ->   795s   (-32%)
     //
-    // Only 108 files actually need a DOM. `tests/architecture` alone is 178 of 180 DOM-free — those
-    // are source-scanning guards that read files off disk and never render anything. The engine
-    // package suite already defaulted to node (it sets no `environment` at all), which is exactly
-    // why its per-file environment cost was ~8x cheaper than this one's.
+    // `tests/architecture` alone is 178 of 180 DOM-free — source-scanning guards that read files off
+    // disk and never render. The engine package suite already defaulted to node (it sets no
+    // `environment` at all), which is exactly why its per-file environment cost was ~8x cheaper.
     //
-    // ⚠️ The 108 were derived by RUNNING the suite under node and taking the failures, not by
+    // ⚠️ The set was derived by RUNNING the suite under node and taking the failures, not by
     // grepping for `document` — a grep over these files is dominated by source-scanning guards that
-    // match the WORD "document" inside a string they are searching for.
+    // match the WORD "document" inside a string they are searching for. **That method missed twice**
+    // (an async unhandled rejection with every test line green; Court's 220 files, which
+    // `courtTouched()` hides from discovery), so treat it as a starting point, not an oracle.
+    //
+    // ⚠️ **No count is quoted here on purpose.** The first version said "108", which three later
+    // commits in the same change invalidated without touching this comment. `grep -rl
+    // '@vitest-environment jsdom'` over the include roots is the answer, and it cannot go stale.
     //
     // ⚠️ `environmentMatchGlobs` is NOT the mechanism: it was removed in vitest 4 (4.1.11 here).
     // The per-file docblock is what this version supports, and 21 files already used it.

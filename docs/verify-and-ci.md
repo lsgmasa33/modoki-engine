@@ -387,7 +387,7 @@ It closes the silence, not the coverage.
   reproduces (re-measured 2026-08-18 — the pinned worker cap is why), so chaining is now kept
   because splitting is wall-clock-NEUTRAL and therefore pointless, not because it is harmful.
 
-## What made it faster (2026-09-16, #1283) — and why the 2026-08 numbers above are unquotable
+## What made it faster (2026-09-16, #1285) — and why the 2026-08 numbers above are unquotable
 
 The section above is still correct about **mechanism** and wrong about **magnitude**, because it was
 measured on a box that no longer exists in practice.
@@ -425,17 +425,26 @@ gate is byte-identical to before — `testWorkers.ts` keeps deciding, which matt
 `MODOKI_TEST_MAX_WORKERS` still beats everything. It is advisory, not a mutex: serializing would make
 one clone wait on another's gate, and the goal is to stop the thrash, not the work.
 
-### The app suite paid for jsdom on 866 files and needed it on 110
+### The app suite paid for jsdom on every file and needed it on about an eighth of them
 
 `engine/vite.config.ts` set `environment: 'jsdom'` for the whole app suite. The engine package suite
 sets no `environment` at all and so defaulted to `node` — which is the entire reason its per-file
-environment cost was ~8x cheaper. Measured across all 866 files:
+environment cost was ~8x cheaper.
 
-| | jsdom everywhere | node by default |
+⚠️ **The table below was measured over the 866-file, Court-EXCLUDED population** (`courtTouched()`
+was false on that branch). The gate runs **1086** files when Court is in. The ratio holds; the
+absolute figures are for the smaller set, and quoting them as "the current gate" overstates nothing
+but describes a different population than a reader will see.
+
+| (866 files, Court excluded) | jsdom everywhere | node by default |
 |---|---|---|
 | aggregate `environment` | 957.87s | **8.59s** |
 | CPU time (user+sys) | 1168s | **791s (−32%)** |
 | tests passing | 26,964 | 26,964 (identical) |
+
+⚠️ **No file count is quoted anywhere in this section on purpose.** The first draft said "108", and
+three commits in the same change added ten more without updating it. The live answer is
+`grep -rl '@vitest-environment jsdom'` over the include roots — a number that cannot go stale.
 
 `tests/architecture` alone is **178 of 180 files DOM-free** — source-scanning guards that read files
 off disk and never render. A file that needs a DOM now says so with `// @vitest-environment jsdom`.
@@ -480,10 +489,12 @@ unhandled-rejection files, every one DOM-dependent. **Before trusting a regenera
 the run actually discovered the files you think it did** — compare the `Test Files` count against
 `1086` (866 without Court).
 
-Still unclassified, and recorded rather than papered over: Court's **51 sweep-tier files**
-(`MODOKI_COURT_SWEEPS=1`) are skipped in a normal run. They are corpus-walking generator/strategy/
-rating tests, very unlikely to need a DOM — and if one does it fails loudly, as these did. The
-nightly sweep on `main` is where that would surface.
+The residual gap is **narrower than "51 unclassified files"**, which an earlier draft of this
+section claimed. Court's sweep-tier files are ordinary `*.test.ts` and ARE discovered in a normal
+run — `MODOKI_COURT_SWEEPS` gates the `describe` BODIES, and vitest runs a describe callback to
+collect its tasks (`engine/vite.config.ts` records this), so their imports and collection already
+ran under node and would have thrown. What is genuinely unexercised is a DOM need inside a skipped
+`it` body. The nightly sweep on `main` is where that would surface.
 
 ## Typecheck traps that have bitten CI
 

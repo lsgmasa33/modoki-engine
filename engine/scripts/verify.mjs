@@ -7,7 +7,7 @@
 // cheap and only interesting when the types are sane — so lint runs after typecheck,
 // sequentially, inside that one lane.
 //
-// ⚠️⚠️ **THE TABLE BELOW IS HISTORY, NOT THE CURRENT GATE (superseded 2026-09-16, #1283).** Two of
+// ⚠️⚠️ **THE TABLE BELOW IS HISTORY, NOT THE CURRENT GATE (superseded 2026-09-16, #1285).** Two of
 // its load-bearing claims are now false, and both were quoted as current long after they stopped
 // being true — which is exactly why this script now prints a `context:` line on every run:
 //
@@ -24,7 +24,7 @@
 // What IS current, and measured by CPU time + vitest's cross-worker aggregates rather than wall
 // clock (the only figures that survive a contended box):
 //
-//   app suite, jsdom-for-everything -> node-by-default (#1283 P2)
+//   app suite, jsdom-for-everything -> node-by-default (#1285 P2)
 //     aggregate `environment`   957.87s -> 8.59s      CPU (user+sys)  1168s -> 791s  (-32%)
 //
 // MEASURED 2026-08-18 on this Mac, quiet box, warm caches (4 runs) — HISTORICAL, see above.
@@ -97,7 +97,7 @@ const repoRoot = path.resolve(__dirname, '..', '..');
  */
 const ENGINE_LANE_WORKERS = process.env.MODOKI_VERIFY_ENGINE_WORKERS ?? '6';
 
-/** This run's share of the box, filled in by `main()` before any lane starts (#1283).
+/** This run's share of the box, filled in by `main()` before any lane starts (#1285).
  *
  *  ⚠️ Both lanes read it, so it must be registered BEFORE the first `spawn` — a lane launched
  *  against the default would size itself from the whole machine and the budget would describe a
@@ -116,9 +116,14 @@ let budget = null;
  *  ⚠️ `MODOKI_TEST_MAX_WORKERS` still beats everything, as `testWorkers.ts` documents: it is the
  *  lever for an unusual box and for bisecting a contention problem, so a deliberate human setting is
  *  never silently outvoted by this. */
-function laneWorkerEnv(share) {
+function laneWorkerEnv(share, { respect } = {}) {
   if (process.env.MODOKI_TEST_MAX_WORKERS) return {};
   if (process.env.MODOKI_VERIFY_NO_BUDGET) return {};
+  // A lane-specific knob the caller names wins too. `MODOKI_VERIFY_ENGINE_WORKERS=10` used to be
+  // overwritten by the budget's spread, so the engine lane ran at 3 while the banner said 10 — the
+  // docblock above promised a deliberate human setting is never outvoted, and covered only one of
+  // the two knobs that sentence reads as covering.
+  if (respect && process.env[respect]) return {};
   if (!budget || budget.peers <= 1) return {};
   return { MODOKI_TEST_MAX_WORKERS: String(share) };
 }
@@ -233,7 +238,10 @@ async function checksAndEngineLane() {
   // Runs even if lint failed — a lint error says nothing about whether the tests pass, and finding
   // out both in one go beats a second full run.
   const engine = await runCommand('npm --prefix engine/packages/modoki test',
-    { MODOKI_TEST_MAX_WORKERS: ENGINE_LANE_WORKERS, ...laneWorkerEnv(budget?.engineWorkers) });
+    {
+      MODOKI_TEST_MAX_WORKERS: ENGINE_LANE_WORKERS,
+      ...laneWorkerEnv(budget?.engineWorkers, { respect: 'MODOKI_VERIFY_ENGINE_WORKERS' }),
+    });
   parts.push(`--- engine tests ---\n${engine.output}`);
 
   return finish(scoped.ok && lint.ok && engine.ok);
@@ -313,7 +321,7 @@ async function main() {
 
   installGitHooks();
 
-  // Registered BEFORE any lane spawns, so both lanes see the same share (#1283).
+  // Registered BEFORE any lane spawns, so both lanes see the same share (#1285).
   budget = registerVerifyRun();
 
   // Announce the lanes up front. Output is buffered per lane, so without this the terminal shows
@@ -347,7 +355,7 @@ async function main() {
 
   // ⚠️ Printed on EVERY run, not behind a flag. A timing with no record of the contention it ran
   // under is not comparable to another one, and that is exactly how this script's header table came
-  // to be quoted as current long after the box stopped being quiet (#1283).
+  // to be quoted as current long after the box stopped being quiet (#1285).
   console.log(benchLine(budget));
   for (const r of results) {
     const agg = parseVitestAggregates(r.output);

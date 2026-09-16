@@ -1344,7 +1344,9 @@ the old `engine/packages/` path is a relocation, not a dropped SDK; only the loc
     is empirically nil. `os.cpus().length` cannot answer (it reports LOGICAL cores), and the
     PowerShell `Get-CimInstance Win32_Processor` query that can costs ~1.9s per vitest launch —
     noise inside `verify`, but it would double a single-file run.
-- **`testTimeout` is 60s on Windows, 20s everywhere else — in BOTH vitest configs**
+- **`testTimeout` is 120s on Windows, 40s everywhere else — in BOTH vitest configs** (doubled
+  2026-09-16 by `080b82a67`; it was 60s/20s, and this bullet asserted the old pair for long enough
+  that a `win` session reading it would have ruled out a ceiling it was actually hitting)
   ([engine/vite.config.ts](../engine/vite.config.ts) for the app lane,
   [engine/packages/modoki/vitest.config.ts](../engine/packages/modoki/vitest.config.ts) for the
   engine lane). There are exactly two, they run CONCURRENTLY as verify.mjs's two lanes, and a
@@ -1359,9 +1361,18 @@ the old `engine/packages/` path is a relocation, not a dropped SDK; only the loc
   table above — and still exceeded **35s** inside the app lane, failing 2 of 3 `npm run verify`
   runs. It walks the whole QA corpus off disk, so it grows with the suite it checks; a budget set
   on faster hardware was always going to be the binding constraint here first.
-  - Deliberately **not** a global raise. On a machine where 20s is generous, a 60s ceiling turns a
-    real hang into a long wait instead of a failure — and the cost of that is paid on the boxes
-    most likely to notice a hang at all.
+  - ⚠️ **OVERRULED 2026-09-16 (owner: *"we should increase the timeout in general"*) — it IS a
+    global raise now.** This bullet used to argue the opposite: *"deliberately not a global raise;
+    on a machine where 20s is generous, a 60s ceiling turns a real hang into a long wait instead of
+    a failure."* That cost stands and was accepted knowingly — a per-test hang now burns twice as
+    long before reporting. What changed the call is that macOS reached the same wall (wordweave
+    `backgroundRotation` overshot 20s by **302ms** under `verify`'s two concurrent lanes while
+    `npm test` alone stayed green), so the ceiling was not a Windows accommodation after all.
+  - ⚠️ **And the ceiling was probably never the real problem.** #1285 found six such budgets widened
+    one at a time (#751, #1046, #505, #1059, #1099, plus the 2026-09-16 one) because *another
+    clone's* `verify` was saturating the box — measured load average 149 on 12 perf cores. The
+    systemic fix is the cross-clone worker budget in `engine/scripts/verifyLoad.mjs`; whether these
+    ceilings can now come back DOWN is an open question on #1285, not a settled one.
   - This is the contention bullet above *acted on* rather than restated: tests nearest the ceiling
     fail as timeouts, which is indistinguishable from a regression until somebody re-runs idle.
     Raising the Windows ceiling is what stops that re-run being the routine cost of the gate.
