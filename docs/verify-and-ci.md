@@ -483,6 +483,35 @@ exactly as a peer hammering twelve cores does. That is the mechanism doing what 
 budgeting is the obvious next move and is not implemented**; it is the second known gap in this
 fix, alongside the peer count seeing only `verify.mjs` runs (#1285).
 
+#### Does the budgeting actually earn its keep? Measured — and the answer depends on what you measure
+
+Controlled A/B on a box the owner cleared of all clone activity, 2026-09-16, `7f288dd5d`. Full app
+suite per run, concurrency GENERATED rather than waited for, so the conditions are comparable.
+(`repoCorpus.test.ts` excluded from the four-way, per #1291.)
+
+| | workers each | total on 12 perf cores | wall | extra contention reds |
+|---|---|---|---|---|
+| solo baseline | 12 | 12 | 113s | — |
+| **two** concurrent, budgeted | 6 | 12 | 210s | none |
+| **two** concurrent, unbudgeted | 12 | 24 | **202s** | none |
+| **four** concurrent, budgeted | 3 | 12 | 425s | **0 in 4/4 runs** |
+| **four** concurrent, unbudgeted | 12 | 48 | **401s** | **1–2 in 4/4 runs** |
+
+**Unbudgeted is ~5% FASTER in both pairs, and at four concurrent it is reliably REDDER** — every
+unbudgeted run also failed `accountScreen`, half of them `deviceSyslog` (#1099's load-sensitive
+capture window) as well, at a load that reached **94.66**. Budgeted runs lost nothing beyond the
+shared-tree artifact both conditions carry.
+
+⚠️ **So the mechanism costs ~5–6% wall clock and buys the casualties, not the speed** — which is the
+whole point: this repo's complaint was never that the gate is slow, it is that contention turns it
+RED and the red reads like your diff. **An early version of this section recommended deleting the
+budgeting** on the two-way throughput result alone. That was benchmarking the quantity a benchmark
+happens to produce rather than the one the problem is about, and the four-way case reversed it.
+
+⚠️ **Two concurrent runs produce no casualties in either condition.** The effect appears at FOUR —
+which is the configuration this repo actually runs. A concurrency experiment stopped at two would
+have concluded, twice over, that none of this matters.
+
 ### The app suite paid for jsdom on every file and needed it on about an eighth of them
 
 `engine/vite.config.ts` set `environment: 'jsdom'` for the whole app suite. The engine package suite
@@ -559,6 +588,20 @@ module-hydration race, and per-file isolation is its only defence.
 `releaseBuild` (34491ms) and `projectPresencePredicate` (22601ms) — in the same run — and `ai3`'s
 non-timeout casualties were two of those three.
 
+⚠️ **All three are SECONDS-long tests on a quiet box.** Measured 2026-09-16 at `loadavg` 5.2 with
+every clone idle: `backgroundRotation` **6.4s** (ten consecutive isolated runs — 6.39, 6.54, 6.45,
+6.54, 6.52, 6.57, 6.86, 6.49, 6.44, 6.84; 10/10 green, 7% spread) and `projectPresencePredicate`
+**3.34s**. So the reds above are a **~3-7x contention multiplier**, not tests that grew into their
+ceiling. ⚠️ `ai3`'s runs of `backgroundRotation` "in isolation" measured 20.7s and 32.2s — isolated
+from other test FILES but not from the BOX, which is the distinction that made a load artifact look
+like an intrinsic flake. **"In isolation" must mean a quiet machine, or it means nothing.**
+
+⚠️ **A quiet 10/10 does NOT clear #1288's hydration race.** A race needs a perturbation to lose, and
+a quiet box supplies none — ten green runs are exactly what a real-but-unperturbed race looks like.
+What the repeat establishes is that contention is the TRIGGER, so the failure rate is a property of
+the box rather than of the test. Any fix for that test must therefore be validated **under load**;
+a quiet pass cannot distinguish "fixed" from "unperturbed".
+
 ⚠️ **What they share is NOT a mechanism, and the first version of this paragraph said it was.** It
 claimed all three "walk the repo corpus off disk". Checked against the files, that is one of three:
 `projectPresencePredicate` calls `repoFiles()`; `backgroundRotation` steps **7,200 frames** over an
@@ -567,9 +610,12 @@ plus `spawnSync`. What the three actually share is being **long-running**, which
 `engine/testWorkers.ts` already gives as the reason a test goes first under oversubscription. Do not
 instrument the other two looking for a corpus.
 
-The corpus-walk budget gap is real on its own evidence and is **#1290**: `grep -rl` over
-`repoCorpus|repoFiles(` across `engine/tests games demos` finds **125 test files**, of which **2**
-state a timeout — so 123 corpus walks are charged against a ceiling sized for a unit test.
+The population is real and countable: `grep -rl` over `repoCorpus|repoFiles(` across
+`engine/tests games demos` finds **125 test files**, of which **2** state a timeout. ⚠️ **That was
+filed as #1290 and #1290 is now CLOSED** — the count describes exposure correctly and the *cost*
+model behind it did not survive measurement (see the measured table below). Kept here because the
+counting method, and the three separate ways two clones got it wrong, are worth more than the
+conclusion was.
 ⚠️ **A count carries its SCOPE before it carries its sha.** Counted on `b85b1ddbf` over
 `engine/tests games demos`. `work-qa` first reported 122/1 on `55203d6f2`, and both of us explained
 the gap as a tree difference — main's #1285 commits landing in between. **That explanation was
@@ -612,21 +658,51 @@ the figure with a sha would have made the wrong explanation look confirmed. *"It
 difference"* is the plausible reading that stops you looking for the real one. The ratio does drift
 upward as corpus tests are added, which is the argument #1290 makes; it just did not drift here.
 
-⚠️ **125 counts tests EXPOSED to the default, not walks PERFORMED — and the cost model behind it is
-OPEN.** `repoFiles()` does not walk the disk per call: `engine/scripts/repoCorpus.mjs` shells out
-once to `git ls-files -z`, `statSync`s every listed path (9,991 on this tree), memoises the result
-in `cachedRawFilesByMode`, and applies each caller's `under`/`match`/`exclude` as an in-memory
-filter. So the expensive part is the cold enumeration, and **how often it actually runs is not
-established**. Neither vitest config sets `isolate`, so the default per-FILE module registry would
-give each of the 125 files a cold enumeration; if registries are reused more than that implies, the
-real number is nearer workers × modes. Three candidate models, no measurement — **so do not quote
-125 as a count of enumerations.** The discriminating measurement is a count of `git ls-files` spawns
-across one app-suite run, and it comes before any size sweep: it decides whether #1290 is about 125
-enumerations or about 12. Repo size and machine contention move
-independently, so a ceiling tuned against one gets re-crossed by the other, and the repo accumulates
-a number per test with no rationale between them. **#1046 is the closed precedent**: docCitations'
-scan at 17s against a 20s budget, handed 60s on Windows. The unit-test default is the wrong
-*instrument* for a corpus walk, not merely a too-small number — which is what decides the fix shape.
+⚠️ **125 counts tests EXPOSED to the default, not walks PERFORMED.** `repoFiles()` does not walk the
+disk per call: `engine/scripts/repoCorpus.mjs` shells out once to `git ls-files -z`, `statSync`s
+every listed path, memoises by mode in `cachedRawFilesByMode`, and applies each caller's
+`under`/`match`/`exclude` as an in-memory filter.
+
+### The corpus cost model — MEASURED, and it closed #1290
+
+Taken 2026-09-16 on `7f288dd5d` with every clone idle (`loadavg` 3.4–5.3), because a loaded box
+cannot answer any of this. Method for the spawn count: a transparent `git` shim first on `PATH`
+logging every `ls-files` argv, then one full app-suite run.
+
+| what | measured |
+|---|---|
+| cold `repoFiles()` | **99.1ms** (one git spawn + a `statSync` per path, 9,994 files) |
+| warm, same options | 4.4ms |
+| warm, different filter | 2.5ms (710 files) |
+| cold enumerations per app-suite run | **138** (118 `--cached --others --exclude-standard -z` + 20 `--cached -z`) |
+| `projectPresencePredicate` alone | **3.34s** test time, of which ~0.1s is enumeration |
+| app suite solo, 12 workers | 113s (1091 files, 30765 passed) |
+
+Three things follow, and the third is why #1290 closed:
+
+1. **The memo does not amortise across test files.** 138 cold enumerations against 125
+   corpus-consuming files — several call both `includeUntracked` modes. So the module-level cache is
+   reset roughly per test FILE, which is direct positive evidence that **vitest's per-file module
+   registry really is fresh** (neither config sets `isolate`). Useful well beyond this section: any
+   design leaning on module state surviving between test files is leaning on nothing.
+2. **The enumeration is nonetheless cheap.** 138 × ~99ms ≈ 13.7s across the whole suite, spread over
+   12 workers — about **0.25%** of a single 40s ceiling.
+3. **So a corpus test is not slow because it enumerates.** It is ~3% enumeration and ~97% reading and
+   parsing the matched files' CONTENTS. A budget attached to `repoCorpus.mjs` — the obvious fix,
+   since it is the one chokepoint all 125 go through — **would bound the wrong 3%.**
+
+⚠️ **Which is why the "corpus-walk budget" idea was retired rather than built.** #1290 argued these
+tests need their own stated budget because they scale with repo size. Measured, the canary is a
+**3.34s** test that a loaded box stretched to the **22601ms** red that prompted the issue — a ~6.7x
+contention multiplier, which is #1285's subject, not a second budget concept. Adding one would have
+put two overlapping mechanisms in the repo where one does. **#1046 remains the precedent worth
+knowing** (docCitations' scan at 17s against a 20s budget, handed 60s on Windows) — but as an
+instance of the contention class, not of a corpus-cost class.
+
+⚠️ **The general lesson is the one to carry off**: *a test that got slow under load is not evidence
+about what the test spends its time on.* Every quantity in the table above was guessed at least once
+during the investigation, by two clones, and the guesses were wrong in both directions — "order
+tens, amortised" and "123 expensive walks" were both stated confidently before anyone counted.
 
 ### ⚠️ Your own mutation check racing your own backgrounded gate — a failure naming data no commit contains
 
