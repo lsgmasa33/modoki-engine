@@ -558,12 +558,35 @@ ride the unit-test default"* — the very claim the count is offered as evidence
 instrument that errs toward your thesis produces no friction at any step**, which is why two clones
 each explained the gap twice without either one re-running the other's command.
 
+⚠️ **And the reported command was not the command run.** `work-qa`'s figure came from an
+alternation — `timeout: *[0-9]+|\}, *[0-9_]{4,}\)` — reported as the second branch alone. Split over
+the identical file list: the budget branch matches 0, and the `timeout:` branch matches exactly one
+line — the `timeout: 120_000` option on `vendorPluginsIntegration.test.ts`'s `spawnSync` of the
+vendor script, **a child-process kill option, not a vitest budget.** The same `_` broke both branches in opposite
+directions, a false negative plus a false positive summing to a plausible 1. **The regex was an
+honest bug that one re-run would have caught; the paraphrase is what cost three rounds**, because it
+moved the disagreement from *"what does this command return"*, answerable in seconds, to *"why do
+our trees differ"*, which neither side can falsify. Quote the command you ran, not the command you
+meant.
+
 The trap generalises, and it is the reason this paragraph exists: **two counts taken at different
 scopes — or with different patterns — on the same tree diverge exactly like two counts taken on
 different trees** — so labelling
 the figure with a sha would have made the wrong explanation look confirmed. *"It's a tree
 difference"* is the plausible reading that stops you looking for the real one. The ratio does drift
-upward as corpus tests are added, which is the argument #1290 makes; it just did not drift here. Repo size and machine contention move
+upward as corpus tests are added, which is the argument #1290 makes; it just did not drift here.
+
+⚠️ **125 counts tests EXPOSED to the default, not walks PERFORMED — and the cost model behind it is
+OPEN.** `repoFiles()` does not walk the disk per call: `engine/scripts/repoCorpus.mjs` shells out
+once to `git ls-files -z`, `statSync`s every listed path (9,991 on this tree), memoises the result
+in `cachedRawFilesByMode`, and applies each caller's `under`/`match`/`exclude` as an in-memory
+filter. So the expensive part is the cold enumeration, and **how often it actually runs is not
+established**. Neither vitest config sets `isolate`, so the default per-FILE module registry would
+give each of the 125 files a cold enumeration; if registries are reused more than that implies, the
+real number is nearer workers × modes. Three candidate models, no measurement — **so do not quote
+125 as a count of enumerations.** The discriminating measurement is a count of `git ls-files` spawns
+across one app-suite run, and it comes before any size sweep: it decides whether #1290 is about 125
+enumerations or about 12. Repo size and machine contention move
 independently, so a ceiling tuned against one gets re-crossed by the other, and the repo accumulates
 a number per test with no rationale between them. **#1046 is the closed precedent**: docCitations'
 scan at 17s against a 20s budget, handed 60s on Windows. The unit-test default is the wrong
