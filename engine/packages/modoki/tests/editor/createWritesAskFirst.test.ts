@@ -13,17 +13,24 @@
  *  and a create that mints no longer writes plainly. */
 
 import { describe, it, expect } from 'vitest';
-import path from 'node:path';
 import { repoFiles } from '../../../../scripts/repoCorpus.mjs';
 import { readScannedSource } from '../helpers/sourceScanner';
 import { callsTo, enclosingFunction, enclosingNamedFunction, parseSource, ts } from '../helpers/sourceAst';
 import { assertExemptionLedger } from '../helpers/exemptionLedger';
 
-const EDITOR = path.resolve(__dirname, '../../src/editor');
+/** Repo-relative and POSIX, because every `item` below is sliced out of `repoFiles()`'s `rel` —
+ *  which is git's own output and must never be re-derived through `node:path`. This was
+ *  `path.resolve(__dirname, …)` + `path.relative(EDITOR, abs)`, and that round-trip keyed the
+ *  population `scene\prefab.ts::writePrefabFile` on Windows while the exempt row below says
+ *  `scene/prefab.ts` — so the row pardoned an occurrence it could no longer match, and the guard
+ *  reddened on Windows ONLY while fail-OPEN there (it could not see the offender it polices).
+ *  Instance 9 of docs/windows.md § Paths; see repoCorpus.mjs's doc-block on the same hazard. */
+const EDITOR_REL = 'engine/packages/modoki/src/editor';
 const PLAIN_WRITES = ['writeAssetFile', 'postWriteFile'];
 
-function editorSources(dir: string): string[] {
-  return repoFiles({ under: dir, match: (rel: string) => /\.tsx?$/.test(rel), floor: 20 }).map(({ abs }: { abs: string }) => abs);
+/** `{ rel, abs }` straight from the corpus — `rel` stays POSIX on every platform. */
+function editorSources(): Array<{ rel: string; abs: string }> {
+  return repoFiles({ under: EDITOR_REL, match: (rel: string) => /\.tsx?$/.test(rel), floor: 20 });
 }
 
 /** Every plain write in `sf`, with whether its own function also mints a guid. */
@@ -53,10 +60,11 @@ describe('an editor create writes through writeNewAssetDocument, never mint-then
   });
 
   it('no editor function mints a guid and writes it with a plain write', () => {
-    const files = editorSources(EDITOR);
-    const writes = files.flatMap((abs) => {
-      const rel = path.relative(EDITOR, abs);
-      return mintedPlainWrites(parseSource(readScannedSource(abs).code, rel), rel);
+    const files = editorSources();
+    const writes = files.flatMap(({ rel, abs }) => {
+      // A slice off a POSIX string, not a `path.relative` round-trip — see EDITOR_REL above.
+      const key = rel.slice(EDITOR_REL.length + 1);
+      return mintedPlainWrites(parseSource(readScannedSource(abs).code, key), key);
     });
     expect(writes.length, 'the reader must see the editor\'s plain writes, or the ledger below is vacuous').toBeGreaterThanOrEqual(10);
     assertExemptionLedger({
