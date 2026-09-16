@@ -827,9 +827,36 @@ checked the exact destination (`scene.json`), it does not ask a second time.
 - **Create Prefab's undo after a Replace RESTORES the replaced bytes.** It used to trash the path,
   which deleted the original prefab too. Its undo also puts back the `PrefabInstance` links the tree
   had BEFORE tagging (snapshotted with `detachPrefabInstance`, keyed by guid): Create Prefab on an
-  instance of the prefab it replaces used to come back from undo unlinked. ⚠️ Not across Play→Stop for
-  a NESTED instance the tree held: reload re-derives its member guids from the new prefab's root, so
-  those links are skipped (lost, never cross-wired) — #1272. See `detachPrefabInstance`'s docblock.
+  instance of the prefab it replaces used to come back from undo unlinked.
+
+  ⚠️ **That snapshot cannot be relied on across a Play→Stop, and the fix was to stop relying on it**
+  (#1272). Once the tree is a prefab, a held nested instance is *owned*-nested, so `serialize.ts`
+  writes no scene entry for it (`parentIsMember && parentLocalId`), its guid never reaches disk, and
+  `deriveInstanceMemberGuids` mints a fresh one from the new root on load. The snapshot's ref then
+  misses and reattach skipped it **silently** — the instance was left plain and the next save dropped
+  its link for good. Chasing the guid was the obvious fix and the wrong one: after a reload the
+  prefab's own rows carry `source === this prefab` while the held instance carries its child
+  prefab's guid, so **`untagEntityTreeAsInstance` takes the source and removes only its own rows**.
+  Undo never destroys the nested link, so nothing needs resolving across the reload. A nested root
+  this prefab owned also loses its `parentLocalId`, since the row that owned it is going away.
+  `reattachPrefabInstance` **returns** how many links it could not put back, and the human path
+  reports them — undo no longer depends on it, but "restored nothing" and "restored everything" must
+  not look alike, which is precisely what kept this invisible. ⚠️ It counts by **outcome, not by
+  ref**: the snapshot is taken with `strip: false`, so it also holds the entities the scoped untag
+  KEEPS, whose guids the reload re-mints. Counting unresolved refs announced a failure over a
+  completely correct undo — the first version of this shipped that way.
+
+  ⚠️ **Two shapes where undo does NOT restore the pre-create world**, both residues rather than
+  regressions (before the scoping they were left fully unlinked, which is worse), both from a nested
+  root whose `parentLocalId` this tagging overwrote and whose re-derived guid then defeats reattach:
+  a nested instance held *inside another held instance* keeps the stamp this Create Prefab wrote, so
+  `serializeScene`'s owned-nested branch (`parentIsMember && parentLocalId`) files its edits as a
+  `nestedOverrides` delta keyed to a row that is not it; and one owned by an OUTER prefab is zeroed
+  rather than returned to the outer row's id, so the user-added branch beside it captures it as an
+  `added` reference node while the outer prefab still expands its own — a duplicated subtree on the
+  next load. The correct rule is "did THIS tagging write my
+  `parentLocalId`?", which is `plan.nestedRefs`; the untag asks "was my nearest linked ancestor
+  stripped?" instead. Not fixed — tracked on #1272.
 
 **A Replace never crosses KINDS.** The scene flows write plain `.json`, so their destination can be
 `Enemy.prefab.json`. Kept, that guid would be re-registered as a scene, and every `PrefabInstance.source`

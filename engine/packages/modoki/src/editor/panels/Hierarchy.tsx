@@ -1125,7 +1125,13 @@ export default function Hierarchy() {
     const ref = entityRef(rootId);
     pushAction({
       label: `Detach prefab "${name}"`,
-      undo: () => reattachPrefabInstance(snapshot),
+      // Detach leaves PLAIN entities, whose guids ARE serialized, so these refs survive a
+      // Play→Stop where Create Prefab's do not (#1272). Report a miss anyway rather than
+      // discard the count — that silence is what hid #1272 for as long as it did.
+      undo: () => {
+        const unresolved = reattachPrefabInstance(snapshot);
+        if (unresolved > 0) console.warn(`[Hierarchy] Detach undo: ${unresolved} prefab link(s) could not be put back — no longer addressable.`);
+      },
       redo: () => { const id = ref.resolve(); if (id != null) detachPrefabInstance(id); },
     });
   }, []);

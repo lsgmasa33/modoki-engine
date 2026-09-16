@@ -439,6 +439,21 @@ export interface CreatePrefabResult {
  *  callers log the appropriate panel-specific error. Returns 'declined' when the
  *  path already held a file and the human chose not to replace it (#1264). */
 
+/** Say so when undo could not put a prior prefab link back (#1272).
+ *
+ *  Scoping the untag by source means undo no longer DEPENDS on the GUID-keyed snapshot resolving
+ *  — a held nested instance keeps its own link rather than being stripped and restored. But a ref
+ *  can still miss (an entity deleted since the create, a guid re-minted across a reload), and a
+ *  silent skip is indistinguishable from a working undo. The entities are left as they are; this
+ *  only reports, because there is nothing left to roll back by the time it is known. */
+function reportUnrestoredLinks(unresolved: number, label: string): void {
+  if (unresolved <= 0) return;
+  reportUndoFailure({
+    direction: 'Undo', label,
+    detail: `${unresolved} prefab link${unresolved === 1 ? '' : 's'} the tree had before could not be put back — ${unresolved === 1 ? 'that entity is' : 'those entities are'} no longer addressable (deleted, or its guid was re-derived by a scene reload). Everything else was undone.`,
+  });
+}
+
 export async function createPrefabFromEntity(
   entityId: number,
   /** Where to write. Over an existing file of another casing the prefab lands on THAT file's on-disk
@@ -488,8 +503,12 @@ export async function createPrefabFromEntity(
   // (#1264 close-out). Tagging overwrites every PrefabInstance in the subtree: re-running Create
   // Prefab on an instance of the very prefab it replaces, or on a tree holding nested instances,
   // used to come back from undo with those links gone and the next save writing plain entities.
-  let priorLinks = detachPrefabInstance(entityId);
-  tagEntityTreeAsInstance(entityId, savePath);
+  // ⚠️ Snapshot WITHOUT stripping (#1278). Tagging below overwrites every row it owns, so the
+  // strip was never needed here — and it was actively wrong: a held nested instance's members
+  // are deliberately NOT retagged (a reload leaves them linked to their own prefab), so
+  // stripping first left them plain until the next scene load.
+  let priorLinks = detachPrefabInstance(entityId, { strip: false });
+  tagEntityTreeAsInstance(entityId, savePath, prefab);
   // Whether the tree currently carries THIS prefab's tags. A failed undo returns without untagging, and
   // the undo manager still moves it to the redo stack — so redo must not re-snapshot a tree that is
   // still tagged, or `priorLinks` becomes this prefab's own links and the next undo re-links the tree
@@ -531,8 +550,8 @@ export async function createPrefabFromEntity(
           for (const entry of restored.entities ?? []) migrateUIAnchorZIndexStructured(entry);
           setPrefabCache(cacheKey, restored);
         } catch { setPrefabCache(cacheKey, null); }
-        const id = ref.resolve(); if (id != null) untagEntityTreeAsInstance(id);
-        reattachPrefabInstance(priorLinks);
+        const id = ref.resolve(); if (id != null) untagEntityTreeAsInstance(id, savePath);
+        reportUnrestoredLinks(reattachPrefabInstance(priorLinks, { rootEcsId: id ?? undefined }), label);
         tagged = false;
         return;
       }
@@ -544,8 +563,8 @@ export async function createPrefabFromEntity(
         return;
       }
       setPrefabCache(cacheKey, null);
-      const id = ref.resolve(); if (id != null) untagEntityTreeAsInstance(id);
-      reattachPrefabInstance(priorLinks);
+      const id = ref.resolve(); if (id != null) untagEntityTreeAsInstance(id, savePath);
+      reportUnrestoredLinks(reattachPrefabInstance(priorLinks, { rootEcsId: id ?? undefined }), label);
       tagged = false;
     },
     redo: async () => {
@@ -566,8 +585,8 @@ export async function createPrefabFromEntity(
       setPrefabCache(cacheKey, prefab);
       const id = ref.resolve();
       if (id != null) {
-        if (!tagged) priorLinks = detachPrefabInstance(id);
-        tagEntityTreeAsInstance(id, savePath);
+        if (!tagged) priorLinks = detachPrefabInstance(id, { strip: false });
+        tagEntityTreeAsInstance(id, savePath, prefab);
         tagged = true;
       }
     },

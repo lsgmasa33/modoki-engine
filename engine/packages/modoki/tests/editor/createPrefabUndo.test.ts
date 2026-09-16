@@ -92,6 +92,7 @@ beforeEach(() => {
   mockFetch.mockClear();
   setPrefabCacheSpy.mockClear(); tagSpy.mockClear(); untagSpy.mockClear(); registerAssetSpy.mockClear();
   detachSpy.mockClear(); reattachSpy.mockClear(); calls.length = 0;
+  reattachSpy.mockReturnValue(0); // links restored cleanly unless a test says otherwise
 });
 // Restored in afterEach, NOT inline: a failing assertion skips the rest of the body, so
 // an inline restore never runs and the stub leaks into every later test.
@@ -130,6 +131,34 @@ describe('createPrefabFromEntity — undo', () => {
 
     expect(untagSpy).toHaveBeenCalledTimes(1);
     expect(setPrefabCacheSpy).toHaveBeenCalledWith('g-new', null);
+  });
+
+  // #1272: the untag is scoped to the prefab being undone, so a held nested instance keeps its
+  // link to its OWN child prefab instead of being stripped and restored from a guid that a
+  // Play->Stop may have re-derived.
+  it('untags only the prefab it is undoing, naming it', async () => {
+    const action = await makeAction();
+    await action.undo();
+    expect(untagSpy).toHaveBeenCalledWith(7, '/p/thing.prefab.json');
+  });
+
+  // #1272: undo no longer DEPENDS on the guid-keyed reattach resolving, but a miss must not be
+  // silent -- "restored nothing" and "restored everything" looking alike is what hid the bug.
+  it('reports the links it could not put back, and says nothing when it restored them all', async () => {
+    const quiet = await makeAction();
+    const noErr = spyError();
+    await quiet.undo();
+    expect(noErr, 'a clean undo must not report').not.toHaveBeenCalled();
+
+    const action = await makeAction();
+    const err = spyError();
+    reattachSpy.mockReturnValue(2);
+    await action.undo();
+
+    expect(err).toHaveBeenCalledTimes(1);
+    const msg = String(err.mock.calls[0][0]);
+    expect(msg).toContain('Undo');
+    expect(msg).toContain('2 prefab links');
   });
 });
 
@@ -210,7 +239,14 @@ describe('createPrefabFromEntity over an EXISTING prefab (#1264)', () => {
     if (!res || res === 'declined') throw new Error(String(res));
     expect(res.savePath).toBe(ON_DISK);
     expect(registerAssetSpy).toHaveBeenCalledWith(OLD_ID, ON_DISK, 'prefab');
-    expect(tagSpy).toHaveBeenCalledWith(7, ON_DISK);
+    // The written prefab is handed to tagging so it can check its freshly-computed plan against
+    // the file that actually landed (#1278 close-out §2d) — the two are computed either side of
+    // the write's await, which on a Replace includes the confirmReplace dialog.
+    expect(tagSpy).toHaveBeenCalledWith(7, ON_DISK, expect.objectContaining({ id: OLD_ID }));
+    // The snapshot is taken WITHOUT stripping (#1278): tagging overwrites the rows it owns, and
+    // must leave a held nested instance's members carrying their own link rather than relying on
+    // a strip-then-retag that no longer retags them.
+    expect(detachSpy).toHaveBeenCalledWith(7, { strip: false });
     written = [];
     await res.action.undo();
     expect(written.map((w) => w.path)).toEqual([ON_DISK]);
@@ -260,7 +296,7 @@ describe('createPrefabFromEntity keeps the links the tree ALREADY had (#1264 clo
     calls.length = 0;
     await action.undo();
     expect(calls).toEqual(['untag', 'reattach']);
-    expect(reattachSpy).toHaveBeenCalledWith(PRIOR_LINKS);
+    expect(reattachSpy).toHaveBeenCalledWith(PRIOR_LINKS, { rootEcsId: 7 });
   });
 
   it('undo of a REPLACE untags, then restores the prior links', async () => {
@@ -270,7 +306,7 @@ describe('createPrefabFromEntity keeps the links the tree ALREADY had (#1264 clo
     calls.length = 0;
     await res.action.undo();
     expect(calls).toEqual(['untag', 'reattach']);
-    expect(reattachSpy).toHaveBeenCalledWith(PRIOR_LINKS);
+    expect(reattachSpy).toHaveBeenCalledWith(PRIOR_LINKS, { rootEcsId: 7 });
   });
 
   it('redo after a successful undo of a REPLACE re-snapshots too', async () => {
@@ -311,7 +347,7 @@ describe('a FAILED undo then redo does not overwrite the prior links with the ne
       await action.redo();
       expect(calls, 'no snapshot of a tree that is still tagged').toEqual(['tag']);
       await action.undo();
-      expect(reattachSpy).toHaveBeenLastCalledWith(PRIOR_LINKS);
+      expect(reattachSpy).toHaveBeenLastCalledWith(PRIOR_LINKS, { rootEcsId: 7 });
     } finally { detachSpy.mockImplementation(() => PRIOR_LINKS); }
   });
 });

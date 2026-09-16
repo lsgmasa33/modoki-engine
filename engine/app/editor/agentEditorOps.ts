@@ -2323,7 +2323,12 @@ export function registerEditorAgentOps(): void {
       const warnings = warnInertPrefabSizes(prefab, path);
       const ok = await writePrefabFile(path, prefab);
       if (ok) {
-        tagEntityTreeAsInstance(entityId, path);
+        // Snapshot the links the tree already had, so undo can put them back (#1278). Tagging
+        // deliberately leaves a held nested instance linked to its OWN prefab, but the untag
+        // below strips the WHOLE tree — without this the agent path's undo left that instance
+        // permanently unlinked, with nothing recorded to restore it. Mirrors the human flow.
+        const priorLinks = detachPrefabInstance(entityId, { strip: false });
+        tagEntityTreeAsInstance(entityId, path, prefab);
         // Undo reverts the LIVE tagging only — deliberately NOT the file write. Deleting the
         // .prefab.json on undo (as the human path does for a brand-new prefab) is wrong here:
         // this op also OVERWRITES an existing prefab (`existingId` preserves its GUID), and
@@ -2332,8 +2337,15 @@ export function registerEditorAgentOps(): void {
         const ref = entityRef(entityId);
         pushAction({
           label: `Create prefab "${prefab.name ?? path}" (link only)`,
-          undo: () => { const id = ref.resolve(); if (id != null) untagEntityTreeAsInstance(id); },
-          redo: () => { const id = ref.resolve(); if (id != null) tagEntityTreeAsInstance(id, path); },
+          undo: () => {
+            const id = ref.resolve(); if (id == null) return;
+            // Scoped to THIS prefab (#1272): a held nested instance keeps its own link rather
+            // than being stripped and restored from a guid that a Play→Stop may have re-minted.
+            untagEntityTreeAsInstance(id, path);
+            const unresolved = reattachPrefabInstance(priorLinks, { rootEcsId: id });
+            if (unresolved > 0) console.warn(`[prefab create] undo: ${unresolved} prior prefab link(s) could not be put back — no longer addressable.`);
+          },
+          redo: () => { const id = ref.resolve(); if (id != null) tagEntityTreeAsInstance(id, path, prefab); },
         });
       }
       // `saved` describes the .prefab.json FILE write (ok). The live-world PrefabInstance
@@ -2357,7 +2369,12 @@ export function registerEditorAgentOps(): void {
       const ref = entityRef(entityId);
       pushAction({
         label: `Detach prefab "${name}"`,
-        undo: () => { reattachPrefabInstance(snapshot); },
+        undo: () => {
+          // Detach leaves plain entities, whose guids ARE serialized, so these survive a
+          // Play→Stop where Create Prefab's do not (#1272). Reported, never discarded.
+          const unresolved = reattachPrefabInstance(snapshot);
+          if (unresolved > 0) console.warn(`[prefab detach] undo: ${unresolved} prefab link(s) could not be put back — no longer addressable.`);
+        },
         redo: () => { const id = ref.resolve(); if (id != null) detachPrefabInstance(id); },
       });
       return { ok: true, detached: snapshot.length, saved: false };

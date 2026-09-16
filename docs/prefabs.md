@@ -75,6 +75,66 @@ consumer below resolves a member BY localId, and each is a place a renumber goes
   `overrides[localId]` rather than its `traits`.
 - **`editor/panels/ApplyPrefabDialog.tsx`** — pairs a live instance entity to its template row.
 - The live **`PrefabInstance.localId`** trait, which carries the id on every spawned entity.
+- **`editor/scene/prefab.ts`'s `tagEntityTreeAsInstance`** — stamps that trait after a Create
+  Prefab, so it must assign the SAME ids the file just got.
+
+⚠️ **That last one had its own numbering and they disagreed (#1278).** `serializePrefab` collapses
+a nested instance below the root to one reference row and drops its members from the numbering;
+`tagEntityTreeAsInstance` numbered the full `collectTree`. So after Create Prefab on a tree holding
+a nested instance, every member ordered after it was live-tagged one higher than its row — and
+because BFS visits a nested instance's members *last*, the divergence only appears when a surviving
+entity sits deeper than the dropped ones (`R → A, Hull(instance), B → C`: `C` is row 5 and was
+tagged 6). `captureInstanceOverrides` on the next save then paired each live entity with the wrong
+row and wrote overrides under an id denoting a different member, silently.
+
+The first fix had tagging mirror the written file row-by-row, and **close-out review found that
+still wrong** — it inferred membership from the hierarchy, and "every descendant of a nested root"
+is wrong in both directions:
+
+- An **owned** grand-nested instance (`parentLocalId > 0`) is *not* dropped by the serializer.
+  `captureInstanceStructure`'s `captureChild` returns `null` for those, so they never enter
+  `consumedEcsIds`, and being self-rooted they are not members either — they get a reference row
+  of their own. Skipping it shifted every later row by one, and the entity whose row went missing
+  was left with **no `PrefabInstance` at all**.
+- `memberEcsIds` is a **world-wide query on `rootInstanceId`**, not a subtree walk, so a member
+  reparented out of its instance is dropped while sitting outside the subtree.
+
+So the inference is gone. **`planPrefabRows` owns the decision and both `serializePrefab` and
+`tagEntityTreeAsInstance` call it.** **Anything that needs a member's localId calls the planner;
+nothing re-derives it.**
+
+⚠️ **One decision procedure is NOT one answer, and this is the part that is easy to get wrong
+twice.** The callers must also feed it the same inputs, at the same time, and they do neither for
+free:
+
+- **Different arguments.** The planner takes `preserveLocalIds` and `existingId`; tagging passes
+  neither. Safe today only because the paths that preserve (prefab-edit re-save) never tag and the
+  paths that tag never preserve — pinned by
+  `engine/tests/architecture/prefabTagNeverPreservesLocalIds.test.ts`, because a prefab-edit "save
+  and relink" would reintroduce #1278 silently.
+- **Different times.** `serializePrefab` plans, then the caller **`await`s the file write** — on a
+  Replace that await contains the `confirmReplace` **dialog**, an unbounded wait during which MCP
+  ops and the file-watcher's scene reload keep running. Tagging then plans again over world and
+  prefab-cache state that may have moved. So tagging takes the written `PrefabFile` and checks its
+  plan against it (`planMatchesFile`), and **refuses to tag on a mismatch**. That degradation is
+  chosen deliberately: an *untagged* entity round-trips as an `added` node and loses nothing,
+  whereas an entity tagged with a localId the file has no row for is written to **neither** the
+  scene entry (serialize drops it as a prefab child) **nor** the overrides — it is simply gone on
+  the next load.
+
+A nested row is not retagged onto the new prefab: it keeps its link to its own child prefab and
+receives only `parentLocalId`, exactly as `instantiatePrefabIntoWorld` does on reload, and its
+members are left alone. **The invariant to hold on to is that the live world after Create Prefab
+equals the world after a save + reload** — that is the only bar that catches this class. Holding it
+meant splitting capture from strip: `detachPrefabInstance(root, { strip: false })` snapshots for
+undo without severing links the tagging deliberately will not restore.
+
+⚠️ **Dropping the strip means the tag write must name every field.** koota's generated setter is a
+**partial merge** (`if ('k' in value) store.k[i] = value.k`), so an omitted field silently keeps its
+previous value — which the old strip-then-add had reset. A surviving `parentLocalId` makes
+`serialize.ts` classify the row as an *owned* nested instance (`parentIsMember && parentLocalId`),
+which writes **no scene entry for it at all**, and the freshly created prefab link is gone on the
+next reload.
 
 `serializePrefab`'s default numbering (no `opts`) is **positional** (`i + 1` over the BFS-ordered
 tree) — correct for "create a prefab from an entity", where there is no prior numbering to

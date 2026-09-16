@@ -8,12 +8,12 @@ import { createWorld, trait } from 'koota';
 
 const Transform = trait({ x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 });
 const EntityAttributes = trait({ name: '' as string, parentId: 0, guid: '' as string, sortOrder: 0 });
-const PrefabInstance = trait({ source: '' as string, localId: 0, rootInstanceId: 0 });
+const PrefabInstance = trait({ source: '' as string, localId: 0, rootInstanceId: 0, parentLocalId: 0 });
 
 const TRAITS = [
   { name: 'Transform', trait: Transform, category: 'component', fields: { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 0, sy: 0, sz: 0 } },
   { name: 'EntityAttributes', trait: EntityAttributes, category: 'component', fields: { name: 0, parentId: 0, guid: 0, sortOrder: 0 } },
-  { name: 'PrefabInstance', trait: PrefabInstance, category: 'component', fields: { source: 0, localId: 0, rootInstanceId: 0 } },
+  { name: 'PrefabInstance', trait: PrefabInstance, category: 'component', fields: { source: 0, localId: 0, rootInstanceId: 0, parentLocalId: 0 } },
 ] as const;
 
 let testWorld: ReturnType<typeof createWorld>;
@@ -190,6 +190,188 @@ describe('Create-Prefab-on-a-child then save outer → nested reference (regress
     // Flattening would have written the Flame's Transform inline on a second row.
     expect(out.entities.filter((e) => e.name === 'Flame')).toHaveLength(1);
     expect(ref!.traits.Transform).toBeUndefined(); // ref row carries only EntityAttributes
+  });
+});
+
+describe('tagEntityTreeAsInstance mirrors the rows serializePrefab wrote (#1278)', () => {
+  const TAG_PATH = 'aaaaaaaa-0000-4000-8000-0000000000fa';
+
+  /** R ─┬─ A
+   *     ├─ Hull   ← a self-rooted instance of INNER, with its own member Bolt
+   *     └─ B ── C
+   *
+   *  BFS is R, A, Hull, B, Bolt, C — so the dropped member (Bolt) is visited BEFORE a
+   *  surviving one (C). That ordering is what makes the two numberings diverge: C is row 5
+   *  in the file and used to be tagged 6. A shallower tree hides the bug, because BFS puts a
+   *  nested instance's members last. */
+  const buildTree = () => {
+    const mk = (name: string, parentId: number, guid: string, x = 0) => {
+      const e = testWorld.spawn(Transform({ x }), EntityAttributes({ name, parentId, guid }));
+      index.set(e.id(), e);
+      return e;
+    };
+    const r = mk('R', 0, 'g-r');
+    const a = mk('A', r.id(), 'g-a');
+    const hull = mk('Hull', r.id(), 'g-hull');
+    const b = mk('B', r.id(), 'g-b');
+    const bolt = mk('Bolt', hull.id(), 'g-bolt', 1);
+    const c = mk('C', b.id(), 'g-c');
+    // Make Hull a live instance of INNER: the root is self-rooted, the member points at it.
+    hull.add(PrefabInstance({ source: INNER, localId: 1, rootInstanceId: hull.id() }));
+    bolt.add(PrefabInstance({ source: INNER, localId: 2, rootInstanceId: hull.id() }));
+    return { r, a, hull, b, bolt, c };
+  };
+
+  const piOf = (e: { get(t: unknown): unknown }) => e.get(PrefabInstance) as Record<string, unknown>;
+
+  it('gives every member the localId its OWN row carries, across a dropped nested member', async () => {
+    const { serializePrefab, setPrefabCache, tagEntityTreeAsInstance } = await getModule();
+    setPrefabCache(INNER, innerPrefab as any);
+    const { r, hull, bolt, c } = buildTree();
+
+    const p = serializePrefab(r.id())!;
+    // Hull is one reference row; Bolt is gone. R, A, Hull(ref), B, C.
+    expect(p.entities.map((e) => e.name)).toEqual(['R', 'A', 'Hull', 'B', 'C']);
+    expect(p.entities.some((e) => e.name === 'Bolt')).toBe(false);
+
+    tagEntityTreeAsInstance(r.id(), TAG_PATH);
+
+    // THE defect: every tagged entity must carry the localId of the row that describes IT.
+    for (const row of p.entities) {
+      if (row.prefab) continue; // nested ref row — checked separately below
+      const live = [...index.values()].find((e: any) => (e.get(EntityAttributes) as any).name === row.name);
+      expect(piOf(live).localId, `${row.name} must be tagged with its own row's localId`).toBe(row.localId);
+    }
+    // Stated concretely, because the loop above would also pass on an empty file:
+    const cRow = p.entities.find((e) => e.name === 'C')!;
+    expect(cRow.localId).toBe(5);
+    expect(piOf(c).localId).toBe(5); // was 6 — Bolt consumed a number the file never assigned
+
+    // The nested instance keeps its OWN prefab and only learns which row produced it,
+    // exactly as instantiatePrefabIntoWorld does on reload.
+    const hullRow = p.entities.find((e) => e.prefab)!;
+    expect(piOf(hull).source).toBe(INNER);
+    expect(piOf(hull).parentLocalId).toBe(hullRow.localId);
+
+    // Its member is left alone entirely — not retagged onto the new prefab.
+    expect(piOf(bolt).source).toBe(INNER);
+    expect(piOf(bolt).rootInstanceId).toBe(hull.id());
+  });
+
+  /** An OWNED grand-nested instance — one that the nested prefab's OWN file produced, marked by
+   *  `parentLocalId > 0`. `captureInstanceStructure`'s `captureChild` returns null for these, so
+   *  they never enter `consumedEcsIds` and, being self-rooted, they are not members either: the
+   *  serializer gives them a reference row of their OWN. Any rule of the form "skip every
+   *  descendant of a nested root" therefore drops a row that exists, and everything after it is
+   *  numbered one short — the entity whose row went missing ends up with NO PrefabInstance at
+   *  all. Found by close-out review of the first #1278 fix, which had exactly that rule. */
+  it('an OWNED grand-nested instance still gets its own row, and nothing after it is skipped', async () => {
+    const { serializePrefab, setPrefabCache, tagEntityTreeAsInstance } = await getModule();
+    setPrefabCache(INNER, innerPrefab as any);
+    setPrefabCache(OUTER, outerPrefab as any);
+    const mk = (name: string, parentId: number, guid: string, x = 0) => {
+      const e = testWorld.spawn(Transform({ x }), EntityAttributes({ name, parentId, guid }));
+      index.set(e.id(), e); return e;
+    };
+    // R -> O1(instance of OUTER) -> O2(member) -> Hull(OWNED instance of INNER) -> Bolt
+    // R -> B -> C -> D            (plain, ordered after the nested subtree in BFS)
+    const r = mk('R', 0, 'g-r4');
+    const o1 = mk('O1', r.id(), 'g-o1');
+    const b = mk('B', r.id(), 'g-b4');
+    const o2 = mk('O2', o1.id(), 'g-o2');
+    const c = mk('C', b.id(), 'g-c4');
+    const hull = mk('Hull', o2.id(), 'g-hull4');
+    const d = mk('D', c.id(), 'g-d4');
+    const bolt = mk('Bolt', hull.id(), 'g-bolt4', 1);
+    o1.add(PrefabInstance({ source: OUTER, localId: 1, rootInstanceId: o1.id() }));
+    o2.add(PrefabInstance({ source: OUTER, localId: 2, rootInstanceId: o1.id() }));
+    // parentLocalId 3 = OUTER's own nested row, i.e. this instance is OWNED by OUTER.
+    hull.add(PrefabInstance({ source: INNER, localId: 1, rootInstanceId: hull.id(), parentLocalId: 3 }));
+    bolt.add(PrefabInstance({ source: INNER, localId: 2, rootInstanceId: hull.id() }));
+
+    const p = serializePrefab(r.id())!;
+    // Two reference rows: O1 (the outer instance) and Hull (owned, but still its own row).
+    expect(p.entities.filter((e) => e.prefab).map((e) => e.name)).toEqual(['O1', 'Hull']);
+
+    tagEntityTreeAsInstance(r.id(), TAG_PATH);
+
+    // Every non-nested row is tagged with its own localId — none silently skipped.
+    for (const row of p.entities) {
+      if (row.prefab) continue;
+      const live = [...index.values()].find((e: any) => (e.get(EntityAttributes) as any).name === row.name);
+      expect(live.has(PrefabInstance), `${row.name} must be tagged at all`).toBe(true);
+      expect(piOf(live).localId, `${row.name} must carry its own row's localId`).toBe(row.localId);
+    }
+    // D is the entity the old "skip every descendant" rule lost entirely.
+    expect(d.has(PrefabInstance)).toBe(true);
+    expect(piOf(d).localId).toBe(p.entities.find((e) => e.name === 'D')!.localId);
+    // Hull is re-stamped against ITS row in the new prefab, not left on OUTER's row 3.
+    expect(piOf(hull).parentLocalId).toBe(p.entities.find((e) => e.name === 'Hull')!.localId);
+    expect(piOf(hull).source).toBe(INNER);
+  });
+
+  /** The plan tagging computes is a SECOND read of the world — `serializePrefab` runs, then the
+   *  caller awaits a file write (on a Replace, the confirmReplace DIALOG). If the tree or the
+   *  prefab cache moved in that window, tagging would stamp localIds addressing rows the file
+   *  does not have, and such an entity is written to neither the scene entry nor the overrides —
+   *  it vanishes on the next load. Untagged is the degradation that loses nothing. */
+  it('refuses to tag, loudly, when the tree no longer matches the prefab that was written', async () => {
+    const { serializePrefab, tagEntityTreeAsInstance } = await getModule();
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const mk = (name: string, parentId: number, guid: string) => {
+      const e = testWorld.spawn(Transform({ x: 0 }), EntityAttributes({ name, parentId, guid }));
+      index.set(e.id(), e); return e;
+    };
+    const r = mk('R', 0, 'g-r6');
+    const a = mk('A', r.id(), 'g-a6');
+    const written = serializePrefab(r.id())!;   // two rows: R, A
+    const late = mk('Late', a.id(), 'g-late6'); // a member appears during the await
+
+    tagEntityTreeAsInstance(r.id(), TAG_PATH, written);
+
+    expect(err).toHaveBeenCalledWith(expect.stringContaining('no longer matches the prefab just written'));
+    // Nothing tagged at all — a partial tag is what writes an id addressing a row that is not there.
+    expect(r.has(PrefabInstance)).toBe(false);
+    expect(a.has(PrefabInstance)).toBe(false);
+    expect(late.has(PrefabInstance)).toBe(false);
+    err.mockRestore();
+  });
+
+  it('tags normally when the tree still matches — the guard is not always-on', async () => {
+    const { serializePrefab, tagEntityTreeAsInstance } = await getModule();
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const mk = (name: string, parentId: number, guid: string) => {
+      const e = testWorld.spawn(Transform({ x: 0 }), EntityAttributes({ name, parentId, guid }));
+      index.set(e.id(), e); return e;
+    };
+    const r = mk('R', 0, 'g-r7'); const a = mk('A', r.id(), 'g-a7');
+    const written = serializePrefab(r.id())!;
+
+    tagEntityTreeAsInstance(r.id(), TAG_PATH, written);
+
+    expect(err).not.toHaveBeenCalled();
+    expect(piOf(r).localId).toBe(1);
+    expect(piOf(a).localId).toBe(2);
+    err.mockRestore();
+  });
+
+  it('clears a stale parentLocalId on a row this prefab owns (koota set is a partial merge)', async () => {
+    const { serializePrefab, setPrefabCache, tagEntityTreeAsInstance } = await getModule();
+    setPrefabCache(INNER, innerPrefab as any);
+    const mk = (name: string, parentId: number, guid: string) => {
+      const e = testWorld.spawn(Transform({ x: 0 }), EntityAttributes({ name, parentId, guid }));
+      index.set(e.id(), e); return e;
+    };
+    const r = mk('R', 0, 'g-r5');
+    // Create Prefab directly ON an owned nested instance: it becomes row 1 of the NEW prefab,
+    // so its parentLocalId must be cleared. Left at 3, serialize.ts's `parentIsMember &&
+    // parentLocalId` writes no scene entry for it and the new link vanishes on reload.
+    r.add(PrefabInstance({ source: INNER, localId: 1, rootInstanceId: r.id(), parentLocalId: 3 }));
+
+    serializePrefab(r.id());
+    tagEntityTreeAsInstance(r.id(), TAG_PATH);
+    expect(piOf(r).source).toBe(TAG_PATH);
+    expect(piOf(r).parentLocalId).toBe(0);
   });
 });
 

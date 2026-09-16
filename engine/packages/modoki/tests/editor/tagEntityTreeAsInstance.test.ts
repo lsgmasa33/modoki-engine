@@ -21,7 +21,15 @@ const PrefabInstance = trait({ source: '' as string, localId: 0, rootInstanceId:
 let testWorld: ReturnType<typeof createWorld>;
 const entityIndex = new Map<number, any>();
 // Minimal EntityInfo list (collectTree only reads id + parentId).
-let entityInfos: { id: number; parentId: number }[] = [];
+// Mirrors the real EntityInfo: `traits` is required, and tagEntityTreeAsInstance reads it (via
+// the shared planPrefabRows) to find nested-instance roots.
+// ⚠️ This suite never sets it non-empty, so NO entity here is ever a nested-instance root and the
+// planner's nested branch is unreached — these tests cover the GUID-only invariant, not the
+// numbering. The numbering's coverage lives in packages/.../nestedPrefabSerialize.test.ts. Note
+// also that `entityInfos` is captured at spawn and never reflects traits added later, whereas
+// production's getAllEntities() is live: a second tag on the same tree would see [] here and
+// ['PrefabInstance'] in production. No test does that today — it is a trap, not a defect.
+let entityInfos: { id: number; parentId: number; name: string; sortOrder: number; traits: string[] }[] = [];
 
 vi.mock('../../src/runtime/core/ecs/world', () => ({
   onWorldSwap: () => () => {},
@@ -74,7 +82,7 @@ async function getManifest() {
 function spawnNode(parentId: number): number {
   const e = testWorld.spawn(Transform, EntityAttributes({ parentId }));
   entityIndex.set(e.id(), e);
-  entityInfos.push({ id: e.id(), parentId });
+  entityInfos.push({ id: e.id(), parentId, name: '', sortOrder: 0, traits: [] });
   return e.id();
 }
 

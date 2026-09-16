@@ -138,41 +138,32 @@ function collectTree(entityId: number, allEntities: EntityInfo[]): EntityInfo[] 
   return result;
 }
 
-/** Serialize selected entity + descendants as a prefab.
- *  Pass `existingId` when re-saving an existing prefab to preserve its UUID.
+/** Which entities of `tree` become ROWS of the prefab, and what localId each one gets.
  *
- *  Nested prefab instances inside the subtree (a self-rooted PrefabInstance below
- *  the selection root) are written as *reference rows* — one row carrying the
- *  child `prefab` GUID + captured overrides/structure — and their members are
- *  excluded from the flat output. The selection root itself is never collapsed
- *  this way (so "save instance as prefab" still flattens the instance). */
-export function serializePrefab(
+ *  ⚠️ This is THE numbering for a prefab's localId address space, and it exists as one function
+ *  because it used to exist as two (#1278). `serializePrefab` decides the rows; Create Prefab
+ *  then stamps `PrefabInstance.localId` onto the live tree, and that stamp MUST agree — it is
+ *  the same address space a scene's `overrides`/`removed` are keyed in (docs/prefabs.md
+ *  § "localId stability"). Tagging used to re-derive it by counting the live tree, which
+ *  disagreed for every member ordered after a nested instance, and the next save then wrote
+ *  overrides under an id denoting a different member. **Anything that needs to know a member's
+ *  localId calls this; nothing re-derives it.**
+ *
+ *  Membership is genuinely not inferable from the hierarchy, which is why re-deriving it kept
+ *  going wrong: a nested instance's own members and the added subtrees it folded in are dropped,
+ *  but an OWNED nested instance deeper inside it is NOT (`captureInstanceStructure`'s
+ *  `captureChild` returns null for those, so they never enter `consumedEcsIds`) and gets a
+ *  reference row of its own. "Every descendant of a nested root" is the wrong rule in both
+ *  directions — `memberEcsIds` is a world-wide query on `rootInstanceId`, so a member reparented
+ *  out of the subtree is dropped too.
+ *
+ *  Returns null when a nested ref would make the prefab transitively contain itself. */
+function planPrefabRows(
+  tree: EntityInfo[],
   selectedEntityId: number,
   existingId?: string,
-  opts?: {
-    /** ecsId → the localId that entity ALREADY had in the prefab being re-saved.
-     *
-     *  Only prefab-edit can supply this, and only prefab-edit needs it: localIds are the
-     *  address space a SCENE's `overrides` / `removed` / `removedTraits` are keyed in, so
-     *  renumbering them on a re-save silently repoints or drops every override on every
-     *  instance. Positional numbering does renumber — a prefab whose members were authored
-     *  with a gap (a deleted sibling) compacts on the next save (measured on sling's
-     *  FieldCorner: `drip` 4 → 2). Members with no entry here (the user added them during
-     *  the edit) are allocated ABOVE every preserved id, never into a freed gap. */
-    preserveLocalIds?: Map<number, number>;
-    /** Keep this as the prefab's `name` instead of taking the ROOT ENTITY's name.
-     *
-     *  The two are independent: the asset is named by its file, the root entity by the
-     *  author. Defaulting to the root's name silently renames the asset on any re-save —
-     *  measured on sling, where "Cover Enemy" and "Green Enemy" both became "Enemy"
-     *  because that is what their root entity is called. */
-    name?: string;
-  },
-): PrefabFile | null {
-  const allEntities = getAllEntities();
-  const tree = collectTree(selectedEntityId, allEntities);
-  if (tree.length === 0) return null;
-
+  preserveLocalIds?: Map<number, number>,
+): { nestedRefs: Map<number, { ref: InstanceReference; childPrefab: PrefabFile }>; flatTree: EntityInfo[]; ecsToLocal: Map<number, number> } | null {
   const piMeta = getTraitByName('PrefabInstance');
 
   // ── Find nested-instance roots and the members they consume ──
@@ -216,17 +207,84 @@ export function serializePrefab(
   // member; only genuinely new members are allocated, above the highest preserved id.
   const flatTree = tree.filter((e) => !skip.has(e.id));
   const ecsToLocal = new Map<number, number>();
-  const preserve = opts?.preserveLocalIds;
-  if (preserve) {
+  if (preserveLocalIds) {
     let next = 0;
-    for (const e of flatTree) next = Math.max(next, preserve.get(e.id) ?? 0);
+    for (const e of flatTree) next = Math.max(next, preserveLocalIds.get(e.id) ?? 0);
     for (const e of flatTree) {
-      const kept = preserve.get(e.id);
+      const kept = preserveLocalIds.get(e.id);
       ecsToLocal.set(e.id, kept ?? ++next);
     }
   } else {
     flatTree.forEach((e, i) => ecsToLocal.set(e.id, i + 1));
   }
+  return { nestedRefs, flatTree, ecsToLocal };
+}
+
+/** Does a freshly-computed plan still describe the prefab that was WRITTEN? The two are computed
+ *  either side of an `await` (see `tagEntityTreeAsInstance`), so this is the tripwire for the
+ *  world or the prefab cache having moved underneath. Compares row count and, positionally,
+ *  which rows are nested references — enough to catch a member appearing or vanishing and a
+ *  nested child becoming cacheable mid-flight (which flips it from flattened to a reference row
+ *  and shifts every localId after it). */
+function planMatchesFile(
+  plan: { flatTree: EntityInfo[]; nestedRefs: Map<number, unknown> },
+  written: PrefabFile,
+  source: string,
+): boolean {
+  const mismatch = (why: string) => {
+    console.error(`[Prefab] not tagging "${source}" — the live tree no longer matches the prefab just written (${why}). The entities were left untagged rather than pointed at rows that may not exist.`);
+    return false;
+  };
+  if (plan.flatTree.length !== written.entities.length) {
+    return mismatch(`${plan.flatTree.length} rows now vs ${written.entities.length} written`);
+  }
+  for (let i = 0; i < plan.flatTree.length; i++) {
+    if (plan.nestedRefs.has(plan.flatTree[i].id) !== !!written.entities[i].prefab) {
+      return mismatch(`row ${i + 1} changed between a nested reference and a plain member`);
+    }
+  }
+  return true;
+}
+
+/** Serialize selected entity + descendants as a prefab.
+ *  Pass `existingId` when re-saving an existing prefab to preserve its UUID.
+ *
+ *  Nested prefab instances inside the subtree (a self-rooted PrefabInstance below
+ *  the selection root) are written as *reference rows* — one row carrying the
+ *  child `prefab` GUID + captured overrides/structure — and their members are
+ *  excluded from the flat output. The selection root itself is never collapsed
+ *  this way (so "save instance as prefab" still flattens the instance). */
+export function serializePrefab(
+  selectedEntityId: number,
+  existingId?: string,
+  opts?: {
+    /** ecsId → the localId that entity ALREADY had in the prefab being re-saved.
+     *
+     *  Only prefab-edit can supply this, and only prefab-edit needs it: localIds are the
+     *  address space a SCENE's `overrides` / `removed` / `removedTraits` are keyed in, so
+     *  renumbering them on a re-save silently repoints or drops every override on every
+     *  instance. Positional numbering does renumber — a prefab whose members were authored
+     *  with a gap (a deleted sibling) compacts on the next save (measured on sling's
+     *  FieldCorner: `drip` 4 → 2). Members with no entry here (the user added them during
+     *  the edit) are allocated ABOVE every preserved id, never into a freed gap. */
+    preserveLocalIds?: Map<number, number>;
+    /** Keep this as the prefab's `name` instead of taking the ROOT ENTITY's name.
+     *
+     *  The two are independent: the asset is named by its file, the root entity by the
+     *  author. Defaulting to the root's name silently renames the asset on any re-save —
+     *  measured on sling, where "Cover Enemy" and "Green Enemy" both became "Enemy"
+     *  because that is what their root entity is called. */
+    name?: string;
+  },
+): PrefabFile | null {
+  const allEntities = getAllEntities();
+  const tree = collectTree(selectedEntityId, allEntities);
+  if (tree.length === 0) return null;
+
+  const piMeta = getTraitByName('PrefabInstance');
+  const plan = planPrefabRows(tree, selectedEntityId, existingId, opts?.preserveLocalIds);
+  if (!plan) return null; // cycle — planPrefabRows already reported it
+  const { nestedRefs, flatTree, ecsToLocal } = plan;
 
   const allTraits = getAllTraits();
   const prefabEntities: PrefabEntity[] = [];
@@ -1534,8 +1592,29 @@ export function applyStructureByRootInstance(
 
 /** Tag every entity in the tree rooted at `rootEcsId` with a PrefabInstance
  *  trait pointing to `source`. localIds match the prefab's localId scheme
- *  (BFS order, root = 1) so per-localId overrides round-trip correctly. */
-export function tagEntityTreeAsInstance(rootEcsId: number, source: string): void {
+ *  (BFS order, root = 1) so per-localId overrides round-trip correctly.
+ *
+ *  ⚠️ The numbering comes from `planPrefabRows` — the SAME function `serializePrefab` uses to
+ *  decide rows (#1278). It used to be re-derived here by counting the live tree, which the
+ *  serializer does not do: a nested instance collapses to one reference row and its members are
+ *  dropped, so the two disagreed for every member ordered after it and the next save paired each
+ *  live entity with the wrong row. **Do not re-derive this — call the planner.**
+ *
+ *  A nested row is NOT retagged onto `source`: a reload leaves it linked to its own child
+ *  prefab and stamps only `parentLocalId` (the outer row that produced it — see
+ *  `instantiatePrefabIntoWorld`). This mirrors that, so the live world after Create Prefab
+ *  equals the world after a save + reload, and its members are left alone entirely.
+ *
+ *  ⚠️ PASS `writtenPrefab` whenever you have it. One planner does NOT mean one answer: the
+ *  caller serializes, then `await`s a file write — on a Replace that await includes the
+ *  `confirmReplace` DIALOG, an unbounded wait during which MCP ops and the file-watcher's scene
+ *  reload keep running. The plan computed here is therefore a SECOND read of mutable world +
+ *  prefab-cache state. If it disagrees with the file, tagging writes localIds addressing rows
+ *  that do not exist, and such an entity is then written to neither the scene entry nor the
+ *  overrides — it is simply gone on the next load. So the plan is checked against the file and a
+ *  mismatch REFUSES to tag: an untagged entity round-trips as an `added` node, which is the
+ *  degradation that loses nothing. */
+export function tagEntityTreeAsInstance(rootEcsId: number, source: string, writtenPrefab?: PrefabFile): void {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return;
 
@@ -1549,36 +1628,117 @@ export function tagEntityTreeAsInstance(rootEcsId: number, source: string): void
   // Mirror serializePrefab's localId assignment (BFS, root = 1)
   const allEntities = getAllEntities();
   const tree = collectTree(rootEcsId, allEntities);
-  const ecsToLocal = new Map<number, number>();
-  tree.forEach((e, i) => ecsToLocal.set(e.id, i + 1));
 
-  for (const info of tree) {
-    const localId = ecsToLocal.get(info.id)!;
-    const entity = findEntity(info.id);
-    if (!entity) continue;
-    const piData = { source: ref, localId, rootInstanceId: rootEcsId };
-    if (entity.has(PrefabInstanceMeta.trait)) {
-      entity.set(PrefabInstanceMeta.trait, piData);
-    } else {
-      entity.add(PrefabInstanceMeta.trait(piData));
+  /** ⚠️ `piData` must name EVERY field of PrefabInstance. koota's generated setter is a partial
+   *  merge (`if ('k' in value) store.k[i] = value.k`), so an omitted field keeps its old value —
+   *  and this used to be masked by Create Prefab stripping the trait first. A surviving
+   *  `parentLocalId` makes serialize classify the row as an OWNED nested instance of the prefab
+   *  it used to belong to (`serialize.ts` `parentIsMember && parentLocalId`), which writes no
+   *  scene entry for it at all and loses the new link on the next reload. */
+  const applyTag = (ecsId: number, localId: number) => {
+    const entity = findEntity(ecsId);
+    if (!entity) return;
+    const piData = { source: ref, localId, rootInstanceId: rootEcsId, parentLocalId: 0 };
+    if (entity.has(PrefabInstanceMeta.trait)) entity.set(PrefabInstanceMeta.trait, piData);
+    else entity.add(PrefabInstanceMeta.trait(piData));
+  };
+
+  // The same decision procedure the serializer used — but a SECOND read of the world, so it is
+  // checked against the file before anything is written. (`planPrefabRows` only returns null for
+  // a cycle, which needs `existingId`; this call passes none, so that cannot fire here.)
+  const plan = planPrefabRows(tree, rootEcsId)!;
+  if (writtenPrefab && !planMatchesFile(plan, writtenPrefab, source)) return;
+  for (const info of plan.flatTree) {
+    const localId = plan.ecsToLocal.get(info.id)!;
+    const nested = plan.nestedRefs.get(info.id);
+    if (nested) {
+      // Nested reference row — keep its link to its OWN prefab and stamp only which outer row
+      // produced it, exactly as instantiatePrefabIntoWorld does on reload. Its members are not
+      // rows of this prefab and are left untouched.
+      const entity = findEntity(info.id);
+      if (entity?.has(PrefabInstanceMeta.trait)) {
+        entity.set(PrefabInstanceMeta.trait, {
+          ...(entity.get(PrefabInstanceMeta.trait) as Record<string, unknown>), parentLocalId: localId,
+        });
+      }
+      continue;
     }
+    applyTag(info.id, localId);
   }
   markStructureDirty();
 }
 
-/** Inverse of tagEntityTreeAsInstance — strip the PrefabInstance trait off
- *  every entity in the tree rooted at `rootEcsId`. Used for undo when a
- *  newly-created prefab is reverted. */
-export function untagEntityTreeAsInstance(rootEcsId: number): void {
+/** Inverse of tagEntityTreeAsInstance — strip the PrefabInstance trait off the entities that
+ *  belong to `source` in the tree rooted at `rootEcsId`. Used for undo when a newly-created
+ *  prefab is reverted.
+ *
+ *  ⚠️ `source` is REQUIRED (#1272). It used to be optional, and the optional path stripped EVERY
+ *  link in the subtree — including a held nested instance's link to its OWN child prefab, which
+ *  tagging deliberately never touched. An optional parameter whose default is the old broken
+ *  behaviour is the scar #1278 left; it does not get made twice. Undo then depends on `reattachPrefabInstance` putting that link
+ *  back from the GUID-keyed snapshot — and after a Play→Stop the nested instance's guid has been
+ *  re-minted (it is owned-nested now, so `serialize.ts` writes no scene entry for it and
+ *  `deriveInstanceMemberGuids` derives a fresh guid from the new root on load). The ref misses,
+ *  reattach skips it silently, and the instance is left plain with its link to Q gone for good.
+ *
+ *  Scoping by source removes the need to resolve anything across the reload: after a reload this
+ *  prefab's own rows carry `source === this prefab` and a held nested instance carries its own
+ *  child prefab's guid, so "what this Create Prefab added" is answerable from the live data
+ *  rather than from an identity that did not survive.
+ *
+ *  A nested root that this prefab OWNED also loses its `parentLocalId` — the row that owned it is
+ *  being removed, so it goes back to being a free-standing instance. One nested deeper (owned by
+ *  the child prefab, not by this one) keeps its stamp, because its owner is untouched.
+ *
+ *  ⚠️ That test — "was my nearest linked ancestor stripped?" — is a PROXY for the real question,
+ *  "did this tagging write my `parentLocalId`?", whose answer is `plan.nestedRefs`. It is wrong in
+ *  two shapes, both left standing on #1272: a nested instance held inside ANOTHER held instance
+ *  keeps the stamp this Create Prefab wrote (its ancestor was not stripped), and one owned by an
+ *  OUTER prefab is zeroed rather than returned to that prefab's row id. Both need the pre-create
+ *  value, which only the snapshot has — and reattach cannot reach it once the guid re-derives. */
+export function untagEntityTreeAsInstance(rootEcsId: number, source: string): void {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return;
 
+  // Callers pass the asset PATH; PrefabInstance.source is GUID-only. Mirrors tagEntityTreeAsInstance.
+  const ref = isGuid(source) ? source : (getGuidForPath(source) ?? source);
+
   const allEntities = getAllEntities();
   const tree = collectTree(rootEcsId, allEntities);
+  const sourceOf = new Map<number, string | undefined>();
+  const removed = new Set<number>();
+
   for (const info of tree) {
     const entity = findEntity(info.id);
-    if (!entity) continue;
-    if (entity.has(PrefabInstanceMeta.trait)) entity.remove(PrefabInstanceMeta.trait);
+    if (!entity?.has(PrefabInstanceMeta.trait)) continue;
+    const pi = entity.get(PrefabInstanceMeta.trait) as Record<string, unknown>;
+    sourceOf.set(info.id, pi.source as string | undefined);
+    if (pi.source !== ref) continue; // a nested instance's OWN link — not ours
+    entity.remove(PrefabInstanceMeta.trait);
+    removed.add(info.id);
+  }
+
+  // A kept nested root whose owning row we just removed is no longer owned by anything.
+  {
+    const parentOf = new Map(tree.map((i) => [i.id, i.parentId]));
+    for (const info of tree) {
+      if (removed.has(info.id) || !sourceOf.has(info.id)) continue;
+      // The nearest ancestor that carries a link decides who owned this one.
+      let cur = parentOf.get(info.id) ?? 0;
+      while (cur && !sourceOf.has(cur)) cur = parentOf.get(cur) ?? 0;
+      if (!cur || !removed.has(cur)) continue; // owned by a child prefab, or by nothing — leave it
+      const entity = findEntity(info.id);
+      if (!entity?.has(PrefabInstanceMeta.trait)) continue;
+      entity.set(PrefabInstanceMeta.trait, {
+        ...(entity.get(PrefabInstanceMeta.trait) as Record<string, unknown>), parentLocalId: 0,
+      });
+    }
+  }
+  // ⚠️ A scoped strip that matched NOTHING, on a tree that does carry links, means undo left the
+  // whole subtree tagged as an instance of a prefab it has just deleted. Silent is exactly what
+  // this function was changed to stop being (#1272 review F5).
+  if (!removed.size && sourceOf.size) {
+    console.error(`[Prefab] untagEntityTreeAsInstance: nothing in this subtree is tagged as "${source}", though ${sourceOf.size} entit${sourceOf.size === 1 ? 'y carries' : 'ies carry'} some other prefab link — the tree was left tagged.`);
   }
   markStructureDirty();
 }
@@ -1602,14 +1762,28 @@ export interface DetachedInstanceTrait { id: number; ref: EntityRef; rootRef: En
  *  ECS id too, so it is re-derived from `rootRef` at reattach. `entityRef` mints a guid for a member that
  *  has none.
  *
- *  ⚠️ LIMIT — a guid only helps while the entity KEEPS it. A detach leaves plain entities whose guids are
- *  saved, so Hierarchy/agent Detach undo survives Play→Stop. Create Prefab does not: tagging makes a
- *  held nested instance a row of the NEW prefab, whose member guids are DERIVED from the new root on
- *  reload, so after Play→Stop those refs miss and reattach skips them (the nested links are lost, never
- *  cross-wired). Not fixed: #1272. */
-export function detachPrefabInstance(rootEcsId: number): DetachedInstanceTrait[] {
+ *  ⚠️ LIMIT — a guid only helps while the entity KEEPS it. A detach leaves plain entities whose guids
+ *  are saved, so Hierarchy/agent Detach undo survives Play→Stop. **Create Prefab's snapshot does
+ *  not**: a held nested instance ends up INSIDE the new prefab, and `serialize.ts` writes no scene
+ *  entry for an owned nested instance (`parentIsMember && parentLocalId`) — only a `nestedOverrides`
+ *  delta against the outer row. Its guid never reaches disk, so `deriveInstanceMemberGuids` re-mints
+ *  it from the new root on reload and these refs miss.
+ *
+ *  That is still true, and #1272 fixed the CONSEQUENCE rather than the identity:
+ *  `untagEntityTreeAsInstance` takes the prefab's source and strips only its own rows, so undo never
+ *  destroys the nested link and never needs the snapshot to resolve it. `reattachPrefabInstance`
+ *  returns the count it could not resolve instead of swallowing it. Do NOT re-key this snapshot on
+ *  a localId path to "fix" the miss — the address it would need is the one #1278 had to make a
+ *  single source of truth, and undo no longer depends on it.
+ *
+ *  `opts.strip: false` snapshots WITHOUT removing the traits — for a caller that is about to
+ *  overwrite the links itself and only wants the undo record (#1278). Create Prefab is one:
+ *  stripping first used to leave a held nested instance's members plain, because the tagging
+ *  that followed deliberately does not retag them. Detach proper keeps the default. */
+export function detachPrefabInstance(rootEcsId: number, opts?: { strip?: boolean }): DetachedInstanceTrait[] {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return [];
+  const strip = opts?.strip !== false;
   const tree = collectTree(rootEcsId, getAllEntities());
   const snapshot: DetachedInstanceTrait[] = [];
   for (const info of tree) {
@@ -1622,7 +1796,7 @@ export function detachPrefabInstance(rootEcsId: number): DetachedInstanceTrait[]
       id: info.id, ref: entityRef(info.id), rootRef: entityRef(pi.rootInstanceId as number),
       data: { source: pi.source, localId: pi.localId, rootInstanceId: pi.rootInstanceId, parentLocalId: pi.parentLocalId },
     });
-    entity.remove(PrefabInstanceMeta.trait);
+    if (strip) entity.remove(PrefabInstanceMeta.trait);
   }
   if (snapshot.length) markStructureDirty();
   return snapshot;
@@ -1630,19 +1804,48 @@ export function detachPrefabInstance(rootEcsId: number): DetachedInstanceTrait[]
 
 /** Inverse of detachPrefabInstance — re-add the captured PrefabInstance traits
  *  (undo of a detach). */
-export function reattachPrefabInstance(snapshot: DetachedInstanceTrait[]): void {
+export function reattachPrefabInstance(
+  snapshot: DetachedInstanceTrait[],
+  /** The subtree undo is restoring. Given, an unresolved ref is only counted as LOST once the link
+   *  is confirmed absent from the world. Omit it and every unresolved ref counts, which is right
+   *  for a caller that stripped the whole tree (Detach). */
+  opts?: { rootEcsId?: number },
+): number {
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
-  if (!PrefabInstanceMeta || !snapshot.length) return;
-  for (const { ref, rootRef, data } of snapshot) {
-    const live = ref.resolve();
+  if (!PrefabInstanceMeta || !snapshot.length) return 0;
+  const unresolvedEntries: DetachedInstanceTrait[] = [];
+  for (const entry of snapshot) {
+    const live = entry.ref.resolve();
     const entity = live == null ? undefined : findEntity(live);
-    if (!entity) continue;
-    const root = rootRef.resolve();
-    const restored = root == null ? data : { ...data, rootInstanceId: root };
+    if (!entity) { unresolvedEntries.push(entry); continue; }
+    const root = entry.rootRef.resolve();
+    const restored = root == null ? entry.data : { ...entry.data, rootInstanceId: root };
     if (entity.has(PrefabInstanceMeta.trait)) entity.set(PrefabInstanceMeta.trait, restored);
     else entity.add(PrefabInstanceMeta.trait(restored));
   }
   markStructureDirty();
+  if (!unresolvedEntries.length) return 0;
+
+  // ⚠️ AN UNRESOLVED REF IS NOT A LOST LINK, and counting it as one made this report fire on
+  // the very flow the #1272 fix makes work. The snapshot is taken with `strip: false`, so it also
+  // holds the entities the scoped untag deliberately KEEPS — a held nested instance, whose guid the
+  // reload re-mints. Its ref misses every time, and nothing needed doing to it. Counting refs
+  // announced "2 links could not be put back" over a completely correct undo, which is worse than
+  // the silence it replaced: it sends the next reader hunting a phantom.
+  //
+  // So the question is asked of the WORLD, not of the snapshot: is this link actually absent now?
+  // (Limit: two sibling instances of the same prefab at the same localId are indistinguishable
+  // here, so a genuine loss can be masked by a surviving twin. That under-reports rather than
+  // crying wolf, which is the side to err on for something a human reads.)
+  if (opts?.rootEcsId == null) return unresolvedEntries.length;
+  const present = new Set<string>();
+  for (const info of collectTree(opts.rootEcsId, getAllEntities())) {
+    const e = findEntity(info.id);
+    if (!e?.has(PrefabInstanceMeta.trait)) continue;
+    const pi = e.get(PrefabInstanceMeta.trait) as Record<string, unknown>;
+    present.add(`${pi.source}|${pi.localId}|${pi.parentLocalId ?? 0}`);
+  }
+  return unresolvedEntries.filter(({ data: d }) => !present.has(`${d.source}|${d.localId}|${d.parentLocalId ?? 0}`)).length;
 }
 
 /** Seed (or evict) the in-memory prefab cache. Used by save/import flows so

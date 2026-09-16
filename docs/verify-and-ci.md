@@ -410,7 +410,29 @@ That is ~9x oversubscription of the twelve performance cores. **Two runs of the 
 the shape: oversubscription's first casualties are the tests nearest `testTimeout`, and they fail as
 *timeouts*, which reads exactly like a regression in the diff under test. It cost a session on
 2026-09-16 (wordweave `backgroundRotation` overshooting a 20s ceiling by 302ms while `npm test`
-alone stayed green), and the response was to double every ceiling — a fix aimed at the symptom.
+alone stayed green).
+
+⚠️ **A casualty does not have to wear a timeout's shape — under load it also fails as an ASSERTION**
+(`modoki-ai3`, 2026-09-16, load 123.41/132.11/129.54 with another clone's gate running, on a tree
+*without* any of this section's changes). Two files failed that run, neither a timeout, neither in
+the diff: `tests/architecture/projectPresencePredicate.test.ts` (*"no test computes project presence
+inline"*) and `games/wordweave/tests/backgroundRotation.test.ts`. **So "it failed as an assertion,
+not a timeout" is not evidence that the load hypothesis is out** — an earlier version of this
+paragraph implied it was, and reasoning from it would start a regression hunt on a saturation
+artifact. Both of those files enumerate a corpus off disk, which is the suspected reason they are
+load-sensitive; that has not been diagnosed.
+
+⚠️ **The discriminator is re-running the SAME file alone, REPEATEDLY — one isolated pass is not an
+answer.** Same afternoon, same sha, no edit between runs, `backgroundRotation` in isolation:
+pass, pass, **fail** (1 failed / 5 passed, 20.7s), pass (6 passed, 32.2s). A single clean isolated
+run is what got this written off as an unreproducible flake earlier in the day; it took three to see
+it alternate.
+
+**The ceilings were then doubled (40s, 120s on Windows), and that was the RIGHT call, not a
+symptomatic patch** — this paragraph said the opposite twice. `work-qa`'s three reds the same day
+measured 20846ms, 34491ms and 22601ms; all three pass at 40s and none of them is a regression. Do
+not lower them. The contention work below is what addresses the cause; the ceilings are what stops
+the cause from being mistaken for a diff.
 
 So: **`npm run verify` now prints a `context:` line on every run** — load average, how many verify
 runs share the box, and the worker split — plus each lane's vitest aggregates. Those aggregates are
@@ -489,6 +511,14 @@ different trees the same afternoon — a timeout, a non-reproducing assertion, a
 promise. When one test keeps absorbing unrelated failures, suspect the victim's own isolation, not
 three coincidences. The wordweave case is #1288: that test is correct only if its stub wins a
 module-hydration race, and per-file isolation is its only defence.
+
+⚠️ **The canary set is THREE tests, not one.** `work-qa`'s reds were `backgroundRotation` (20846ms),
+`releaseBuild` (34491ms) and `projectPresencePredicate` (22601ms) — in the same run — and `ai3`'s
+non-timeout casualties were two of those three. What they share is that **each walks the repo corpus
+off disk**, so each scales with repo SIZE and with CONTENTION, which move independently: a ceiling
+tuned against one gets re-crossed by the other, which is how three tests end up individually
+re-widened. Riding the unit-test default timeout is the wrong shape for a corpus walk; a stated
+corpus-walk budget is the right one. Not designed or filed yet (#1285 carries the note).
 
 ### What the environment flip does NOT risk, and how that was checked
 

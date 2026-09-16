@@ -189,6 +189,57 @@ describe('detachPrefabInstance', () => {
     expect((b2.get(PrefabInstance) as Record<string, unknown>).localId, 'B keeps B\'s row').toBe(3);
   });
 
+  /** The untag clears `parentLocalId` on a nested root THIS prefab owned, and must LEAVE the stamp
+   *  on one owned by a child prefab further in — its owner is untouched. Close-out review found the
+   *  second half asserted by nothing: deleting the `!removed.has(cur)` condition (so every kept
+   *  linked descendant is zeroed) left the whole editor suite green. */
+  it('untag clears parentLocalId only for a nested root IT owned, not one owned deeper (#1272)', async () => {
+    const { untagEntityTreeAsInstance } = await getModule();
+    const OUTER = 'ffffffff-0000-4000-8000-0000000000aa';
+    const CHILD = 'ffffffff-0000-4000-8000-0000000000bb';
+    const mk = (name: string, parentId: number, guid: string) => {
+      const e = testWorld.spawn(Transform(), EntityAttributes({ name, parentId, guid }));
+      index.set(e.id(), e); return e;
+    };
+    // R(tagged SRC) -> A(nested, owned by SRC) -> N(nested, owned by A's prefab)
+    const r = mk('R', 0, 'ffffffff-0000-4000-8000-000000000001');
+    const a = mk('A', r.id(), 'ffffffff-0000-4000-8000-000000000002');
+    const n = mk('N', a.id(), 'ffffffff-0000-4000-8000-000000000003');
+    r.add(PrefabInstance({ source: SRC, localId: 1, rootInstanceId: r.id() }));
+    a.add(PrefabInstance({ source: OUTER, localId: 1, rootInstanceId: a.id(), parentLocalId: 2 }));
+    n.add(PrefabInstance({ source: CHILD, localId: 1, rootInstanceId: n.id(), parentLocalId: 4 }));
+
+    untagEntityTreeAsInstance(r.id(), SRC);
+
+    expect(r.has(PrefabInstance), 'the tagged root is stripped').toBe(false);
+    // A was owned by the prefab being undone -> its owner is going away.
+    expect((a.get(PrefabInstance) as Record<string, unknown>).parentLocalId, 'A was owned by SRC').toBe(0);
+    // N was owned by A's prefab, which is untouched -> its stamp still addresses a live row.
+    expect((n.get(PrefabInstance) as Record<string, unknown>).parentLocalId, 'N is owned deeper').toBe(4);
+  });
+
+  it('reattach COUNTS the refs it could not resolve, and returns 0 when it restored everything (#1272)', async () => {
+    const { detachPrefabInstance, reattachPrefabInstance } = await getModule();
+    const R_GUID = 'eeeeeeee-0000-4000-8000-000000000001';
+    const M_GUID = 'eeeeeeee-0000-4000-8000-000000000002';
+    const root = testWorld.spawn(Transform(), EntityAttributes({ name: 'R', parentId: 0, guid: R_GUID }), PrefabInstance({ source: SRC, localId: 1 }));
+    index.set(root.id(), root);
+    root.set(PrefabInstance, { source: SRC, localId: 1, rootInstanceId: root.id() });
+    const member = testWorld.spawn(Transform(), EntityAttributes({ name: 'M', parentId: root.id(), guid: M_GUID }), PrefabInstance({ source: SRC, localId: 2, rootInstanceId: root.id() }));
+    index.set(member.id(), member);
+
+    // Accept side first: everything still addressable restores, and reports nothing. A guard that
+    // always fires is indistinguishable from one that works.
+    const clean = detachPrefabInstance(root.id());
+    expect(reattachPrefabInstance(clean)).toBe(0);
+
+    // Now the #1272 shape: a snapshot member is no longer addressable by the guid it was captured
+    // under. Silence here is what made the bug invisible — the count is the whole point.
+    const snapshot = detachPrefabInstance(root.id());
+    index.delete(member.id()); member.destroy();
+    expect(reattachPrefabInstance(snapshot)).toBe(1);
+  });
+
   it('reattach re-derives rootInstanceId from the ROOT\'s guid when the root came back on a new id (#1264 close-out)', async () => {
     const { detachPrefabInstance, reattachPrefabInstance } = await getModule();
     const R_GUID = 'cccccccc-0000-4000-8000-000000000001';

@@ -1,0 +1,157 @@
+/** The AGENT `prefab create` op must put back the links the tree already had, on undo (#1278).
+ *
+ *  Its undo calls `untagEntityTreeAsInstance`, which strips `PrefabInstance` off the WHOLE
+ *  subtree. That was survivable while tagging retagged the whole subtree too — undo simply
+ *  returned it to "no links". It stopped being survivable when #1278 made tagging deliberately
+ *  LEAVE a held nested instance linked to its own child prefab: undo then destroyed a link the
+ *  create had never touched, and the op recorded nothing to restore it.
+ *
+ *  The human path (`assetOps.createPrefabFromEntity`) has carried a snapshot since #1264 and its
+ *  wiring is pinned in `packages/modoki/tests/editor/createPrefabUndo.test.ts`. The agent path —
+ *  which is where close-out review FOUND this — had no equivalent, and the fix could be deleted
+ *  with the whole gate staying green. This is that equivalent.
+ *
+ *  Driven the way production drives it: `runAgentOp` on the registered editor ops, with the real
+ *  undo stack. Only the backend write is stubbed. */
+
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import {
+  createTestWorld, type TestWorld, setPlayState, Transform, EntityAttributes, PrefabInstance,
+  deriveInstanceMemberGuids, getCurrentWorld,
+} from '@modoki/engine/runtime';
+import { clearHistory, markSceneSaved, undo } from '@modoki/engine/editor';
+import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefab';
+import { registerAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
+import { registerAllTraits } from '../../app/ecs/registerTraits';
+import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
+import { runAgentOp } from '../../app/debug/agentBridge';
+
+registerAllTraits();
+registerEditorAgentOps();
+
+const CHILD_GUID = 'dddddddd-0000-4000-8000-00000000c001';
+const CHILD_PATH = '/assets/prefabs/Child.prefab.json';
+const NEW_PATH = '/assets/prefabs/Made.prefab.json';
+
+/** A two-entity child prefab: root 'Hull' with a member 'Bolt'. */
+const childPrefab = {
+  id: CHILD_GUID, version: 3 as const, name: 'Child', rootLocalId: 1,
+  entities: [
+    { localId: 1, name: 'Hull', traits: { Transform: {}, EntityAttributes: { name: 'Hull', parentId: 0, guid: '' } } },
+    { localId: 2, name: 'Bolt', traits: { Transform: {}, EntityAttributes: { name: 'Bolt', parentId: 1, guid: '' } } },
+  ],
+};
+
+let game: TestWorld | undefined;
+let origFetch: typeof globalThis.fetch;
+
+beforeEach(() => {
+  game = createTestWorld({});
+  setPlayState('stopped');
+  clearHistory();
+  markSceneSaved();
+  registerAsset(CHILD_GUID, CHILD_PATH, 'prefab');
+  setPrefabCache(CHILD_GUID, childPrefab as never);
+  origFetch = globalThis.fetch;
+  // Test stub — every backend call succeeds; the op's IO is not what is under test here.
+  globalThis.fetch = (async () => ({ ok: true, json: async () => ({ ok: true, files: [] }), text: async () => '' } as Response)) as typeof globalThis.fetch;
+});
+afterEach(() => {
+  globalThis.fetch = origFetch;
+  game?.dispose(); game = undefined;
+});
+
+describe('agent prefab create — undo restores the links the tree already had (#1278)', () => {
+  it('a held nested instance is still linked to its own prefab after undo', async () => {
+    // R ── Hull (a live instance of Child) ── Bolt
+    const r = game!.spawn(Transform(), EntityAttributes({ name: 'R', guid: 'g-agent-r' }));
+    const hull = game!.spawn(Transform(), EntityAttributes({ name: 'Hull', parentId: r.id(), guid: 'g-agent-hull' }));
+    const bolt = game!.spawn(Transform(), EntityAttributes({ name: 'Bolt', parentId: hull.id(), guid: 'g-agent-bolt' }));
+    hull.add(PrefabInstance({ source: CHILD_GUID, localId: 1, rootInstanceId: hull.id() }));
+    bolt.add(PrefabInstance({ source: CHILD_GUID, localId: 2, rootInstanceId: hull.id() }));
+
+    const res = await runAgentOp('prefab', { action: 'create', entityGuid: 'g-agent-r', path: NEW_PATH }) as { ok: boolean };
+    expect(res.ok).toBe(true);
+
+    // Tagging leaves the held instance on its OWN prefab (that is the #1278 behaviour).
+    expect((hull.get(PrefabInstance) as { source: string }).source).toBe(CHILD_GUID);
+
+    await undo();
+
+    // THE defect: undo strips the whole subtree, so without a snapshot+reattach the nested
+    // instance comes back plain and the next save writes it as unlinked entities.
+    expect(hull.has(PrefabInstance), 'Hull lost its prefab link on undo').toBe(true);
+    expect((hull.get(PrefabInstance) as { source: string }).source).toBe(CHILD_GUID);
+    expect(bolt.has(PrefabInstance), 'Bolt lost its prefab link on undo').toBe(true);
+    expect((bolt.get(PrefabInstance) as { rootInstanceId: number }).rootInstanceId).toBe(hull.id());
+
+    // The root was plain before the create, and must be plain again after undo — otherwise the
+    // assertions above would also pass with "undo restored nothing and tagging never ran".
+    expect(r.has(PrefabInstance), 'R was plain before the create').toBe(false);
+  });
+
+  /** #1272 as reported. Once the tree is a prefab, the held instance is OWNED-nested, so
+   *  `serialize.ts` writes no scene entry for it — its guid never reaches disk and a reload
+   *  re-mints it from the new root. The undo snapshot is GUID-keyed, so its ref misses.
+   *
+   *  The reload is driven, not mimicked: blanking the members' guids and running the REAL
+   *  `deriveInstanceMemberGuids` is exactly what `loadSceneFile` does at the end of a load. A test
+   *  that hand-wrote a different guid would prove only that a different string fails to resolve. */
+  it('survives a Play→Stop reload re-deriving the nested instance guids (#1272)', async () => {
+    const r = game!.spawn(Transform(), EntityAttributes({ name: 'R', guid: 'g-reload-r' }));
+    const hull = game!.spawn(Transform(), EntityAttributes({ name: 'Hull', parentId: r.id(), guid: 'g-reload-hull' }));
+    const bolt = game!.spawn(Transform(), EntityAttributes({ name: 'Bolt', parentId: hull.id(), guid: 'g-reload-bolt' }));
+    hull.add(PrefabInstance({ source: CHILD_GUID, localId: 1, rootInstanceId: hull.id() }));
+    bolt.add(PrefabInstance({ source: CHILD_GUID, localId: 2, rootInstanceId: hull.id() }));
+
+    await runAgentOp('prefab', { action: 'create', entityGuid: 'g-reload-r', path: NEW_PATH });
+
+    // ── Play → Stop: the world is rebuilt from the snapshot, and the nested instance comes back
+    // with no serialized guid, so the loader derives one off the new root.
+    const before = (hull.get(EntityAttributes) as { guid: string }).guid;
+    for (const e of [hull, bolt]) {
+      e.set(EntityAttributes, { ...(e.get(EntityAttributes) as object), guid: '' });
+    }
+    deriveInstanceMemberGuids(getCurrentWorld());
+    const after = (hull.get(EntityAttributes) as { guid: string }).guid;
+    // The premise of the whole issue: the guid the snapshot captured is NOT the guid now live.
+    expect(after, 'the reload must actually re-mint the guid, or this test proves nothing').not.toBe(before);
+    expect(after).toBeTruthy();
+
+    await undo();
+
+    // Before the fix the untag stripped this link and the guid-keyed reattach could not find it.
+    expect(hull.has(PrefabInstance), 'Hull lost its link to its own prefab across the reload').toBe(true);
+    expect((hull.get(PrefabInstance) as { source: string }).source).toBe(CHILD_GUID);
+    // A row this prefab owned is no longer owned by anything once the owner is removed.
+    expect((hull.get(PrefabInstance) as { parentLocalId: number }).parentLocalId).toBe(0);
+    expect(r.has(PrefabInstance), 'the created prefab tag must still be gone').toBe(false);
+  });
+
+  /** The report must not fire on the flow the fix makes WORK (close-out review F1).
+   *
+   *  `priorLinks` is a `strip: false` snapshot, so it also holds the entities the scoped untag
+   *  deliberately KEEPS — whose guids the reload re-mints. Counting unresolved REFS therefore
+   *  announced "2 prefab links could not be put back" over a completely correct undo, which is
+   *  worse than the silence it replaced: it sends the next reader hunting a phantom. */
+  it('says nothing when the undo actually restored everything, across a reload', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const r = game!.spawn(Transform(), EntityAttributes({ name: 'R', guid: 'g-quiet-r' }));
+      const hull = game!.spawn(Transform(), EntityAttributes({ name: 'Hull', parentId: r.id(), guid: 'g-quiet-hull' }));
+      const bolt = game!.spawn(Transform(), EntityAttributes({ name: 'Bolt', parentId: hull.id(), guid: 'g-quiet-bolt' }));
+      hull.add(PrefabInstance({ source: CHILD_GUID, localId: 1, rootInstanceId: hull.id() }));
+      bolt.add(PrefabInstance({ source: CHILD_GUID, localId: 2, rootInstanceId: hull.id() }));
+
+      await runAgentOp('prefab', { action: 'create', entityGuid: 'g-quiet-r', path: NEW_PATH });
+      for (const e of [hull, bolt]) e.set(EntityAttributes, { ...(e.get(EntityAttributes) as object), guid: '' });
+      deriveInstanceMemberGuids(getCurrentWorld());
+      await undo();
+
+      // Precondition: the undo really did restore them — otherwise silence proves nothing.
+      expect((hull.get(PrefabInstance) as { source: string }).source).toBe(CHILD_GUID);
+      const unresolved = warn.mock.calls.map(String).filter((m) => m.includes('could not be put back'));
+      expect(unresolved, `a correct undo must not report a failure: ${unresolved.join(' | ')}`).toEqual([]);
+    } finally { warn.mockRestore(); }
+  });
+});
