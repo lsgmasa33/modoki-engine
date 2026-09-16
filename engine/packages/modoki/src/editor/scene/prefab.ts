@@ -879,12 +879,16 @@ export async function preloadNestedPrefabs(prefab: PrefabFile, seen = new Set<st
  *      nested instance's per-copy overrides across a rebuild, with no warning at all.
  *
  *  ⚠️ **Calling this does not make those readers safe everywhere — only on the paths that
- *  call it.** Four entry points do (both Create Prefab paths, `applyToPrefabSelective`,
- *  `revertOverridesSelective`); roughly a dozen other reachers do NOT, including the Apply
- *  to Prefab dialog and the `modoki_prefab overrides`/`apply`/`revert` ops, and four of them
- *  are SYNCHRONOUS undo closures that can never await one of these at all. That is #1295,
- *  and it is why the remaining fix is a world-level warming seam rather than more call-site
- *  warms. Do not read this docstring as saying the class is closed.
+ *  call it.** Every async entry point that reaches one of them now does, INCLUDING the undo and
+ *  redo closures: `UndoAction.undo/redo` are typed `(): void | Promise<void>` and `undoManager`
+ *  awaits them under its own in-flight mutex, so a closure that needs to warm can. An earlier
+ *  version of this comment called those closures "synchronous … can never await", which was
+ *  false and was the stated reason for deferring them.
+ *
+ *  What is NOT covered is a reader reached from somewhere nobody has enumerated — the census in
+ *  `coldCacheWarmCensus.test.ts` anchors on `serializePrefab`, `captureInstanceStructure` and
+ *  `tagEntityTreeAsInstance`, and every time a sweep here anchored on ONE of those it missed a
+ *  path. #1295 tracks replacing all of it with a world-level warm.
  *
  *  Call this from the async entry point BEFORE any of them, exactly as the scene save
  *  already does for its own capture loop (`serialize.ts`, "Preload every referenced

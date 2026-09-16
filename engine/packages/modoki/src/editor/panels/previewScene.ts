@@ -11,13 +11,13 @@
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { applyRendererColorConfig } from '../../runtime/rendering/scene3DSync';
 import { frameCameraToBoxFixed } from '../scene/sceneViewMath';
 import { noteGpuContextCreated } from '../../runtime/core/gpuContextTracking';
 import { type TeardownScope } from '../../runtime/core/teardownScope';
 import { attachRendererLossHandling } from '../../runtime/rendering/rendererLossHandling';
 import { makePreviewLossPolicy, REOPEN_INSPECTOR_HINT } from './previewLossPolicy';
+import { createPreviewEnvironment } from './previewEnvironment';
 
 export interface PreviewSceneHandle {
   scene: THREE.Scene;
@@ -75,8 +75,9 @@ export function createPreviewScene(
   // #858. `dispose` is only handed to the caller by the `return` at the very END of this
   // function, and `Preview3DShell`'s `catch` around the call has nothing to dispose because
   // `handle` was never assigned — so everything taken between here and that return used to leak
-  // outright. `pmrem.fromScene` below is a real GPU op and a realistic throw point on a degraded
-  // context. The scope makes the release reachable from the first acquisition onward.
+  // outright. The PMREM derivation inside `createPreviewEnvironment` below is a real GPU op and a
+  // realistic throw point on a degraded context. The scope makes the release reachable from the
+  // first acquisition onward.
   // Pushed FIRST so LIFO drains it LAST — after which the handle honestly reports itself dead.
   // The scope is the CALLER's now, so a caller can drain it WITHOUT going through `dispose()`
   // (`Preview3DShell` legitimately does exactly that on the constructor-throw path). Without this,
@@ -122,11 +123,10 @@ export function createPreviewScene(
   scope.add(() => detachLoss());
 
   const scene = new THREE.Scene();
-  const pmrem = new THREE.PMREMGenerator(renderer);
-  const roomEnv = new RoomEnvironment();
-  const envTexture = pmrem.fromScene(roomEnv, 0.04).texture;
-  roomEnv.dispose(); // free the RoomEnvironment's geometries/materials (only envTexture is kept)
-  pmrem.dispose();
+  // Registers the PMREM output target's release onto `scope` as it is taken (#1277) — this used
+  // to be five lines here that kept only the texture and disposed THAT on teardown, which frees
+  // nothing. See `previewEnvironment.ts`.
+  const envTexture = createPreviewEnvironment(renderer, scope);
   scene.environment = envTexture;
   scene.add(new THREE.AmbientLight(0xffffff, 0.25));
   const key = new THREE.DirectionalLight(0xffffff, 1.0);
@@ -205,8 +205,10 @@ export function createPreviewScene(
     if (raf !== null) cancelAnimationFrame(raf);
     controls.removeEventListener('change', onControlsChange);
     controls.dispose();
+    // Unbind only. The environment's own release is already on `scope` from
+    // `createPreviewEnvironment` and drains right after this closure — it frees the PMREM output
+    // TARGET, which is the handle `envTexture.dispose()` (what used to sit here) could not reach.
     scene.environment = null;
-    envTexture.dispose();
   });
 
   const dispose = () => {

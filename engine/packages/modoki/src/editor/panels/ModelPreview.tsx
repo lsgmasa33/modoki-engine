@@ -13,7 +13,7 @@ import * as THREE from 'three';
 import type { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { makeGltfLoader } from '../../runtime/loaders/threeLoaderModules';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
+import { createPreviewEnvironment } from './previewEnvironment';
 import { assetUrl } from '../../runtime/loaders/assetUrl';
 import { lodUrlSuffix } from '../../runtime/loaders/modelSettings';
 import { getKTX2Loader } from '../../runtime/loaders/textureResolver';
@@ -76,7 +76,6 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
      *  alongside the geometry/material/texture dispose loops below is redundant, not
      *  wrong: both target the same objects and dispose() is idempotent. */
     sourceRoot: THREE.Object3D | null;
-    envTexture: THREE.Texture | null;
     ownedMaterials: Set<THREE.Material>;
     ownedGeometries: Set<THREE.BufferGeometry>;
     /** THREE.Material.dispose() does not free the textures hanging off it (map,
@@ -183,12 +182,10 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
       // light it needs so metallic/rough surfaces show form instead of flat white.
       // The main scene uses HDR envs via a shared cache; for this standalone
       // preview a procedural RoomEnvironment is the standard drop-in equivalent.
-      const pmrem = new THREE.PMREMGenerator(renderer);
-      const roomEnv = new RoomEnvironment();
-      const envTexture = pmrem.fromScene(roomEnv, 0.04).texture;
-      roomEnv.dispose(); // free the RoomEnvironment's geometries/materials (only envTexture is kept)
-      pmrem.dispose();
-      scene.environment = envTexture;
+      // Registers the PMREM output target's release onto `scope` as it is taken (#1277) — this
+      // used to be five lines here that kept only the texture and disposed THAT in `teardown`,
+      // which frees nothing. See `previewEnvironment.ts`.
+      scene.environment = createPreviewEnvironment(renderer, scope);
       // Ambient lowered (0.6 -> 0.25) now that IBL provides ambient fill, so
       // highlights aren't blown out. Key/fill directionals keep directional form.
       scene.add(new THREE.AmbientLight(0xffffff, 0.25));
@@ -217,7 +214,7 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
       scene.add(modelRoot);
 
       stateRef.current = {
-        renderer, scene, camera, controls, modelRoot, sourceRoot: null, envTexture,
+        renderer, scene, camera, controls, modelRoot, sourceRoot: null,
         ownedMaterials: new Set(), ownedGeometries: new Set(), ownedTextures: new Set(),
         raf: null, activeLevel: hasLods ? 'auto' : 0, aborted: false,
         needsRender: true, // draw the first frame
@@ -258,8 +255,11 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
         // comment) — kept because disposeSourceModel is the one place that also walks a
         // freshly-parsed source model's own hierarchy, not just the sets collected from it.
         if (s.sourceRoot) { disposeSourceModel(s.sourceRoot); s.sourceRoot = null; }
+        // Unbind only. The environment's own release is on `scope` from
+        // `createPreviewEnvironment` and drains after this closure — it frees the PMREM output
+        // TARGET, which is the handle `s.envTexture?.dispose()` (what used to sit here) could not
+        // reach (#1277).
         s.scene.environment = null;
-        s.envTexture?.dispose();
         // The renderer's own `forceContextLoss()`/`dispose()`/`removeChild` used to close this
         // body; they moved onto the scope above so they are reachable from a partial bring-up.
         // They still run immediately after this closure — see the LIFO note there.

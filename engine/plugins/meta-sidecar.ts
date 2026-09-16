@@ -37,8 +37,25 @@
  *  Nothing breaks without it — the serving path already treats a missing/stale
  *  hash as a cache miss and re-bakes (see `autoBakeThenServe` in
  *  backend/staticAssets.ts, written for the sibling "fresh checkout" case).
+ *  `audioCache.durationSec` is peeled for the same reason by a different route
+ *  (#1289). It is not derived from source + settings at all: it is ffprobe's
+ *  MEASUREMENT of the file ffmpeg just produced, so it moves when either binary
+ *  does, and `resolveTool` (ffmpeg-tool.ts) resolves both per machine (env
+ *  override -> provisioned toolchain -> PATH). Measured on `games/wordweave`
+ *  2026-09-16: 4 of 26 clips encode to DIFFERENT BYTES under ffmpeg-static 6.0 vs
+ *  Homebrew 8.1.1 (`silenceremove` trims a different sample count), and the two
+ *  ffprobe builds on that Mac disagree about duration on all 26. Nothing consumes
+ *  it — `AudioManifestBlock` bakes loadType/format/ext and no duration — so its
+ *  one reader is AudioAssetView's inspector row, which gets it back from the
+ *  merged local half.
+ *
  *  The OTHER blocks' hashes stay committed: they mix only source bytes, settings
  *  and an in-repo encoder version, so they ARE reproducible across machines.
+ *  ⚠️ That is a claim about the HASH, not about the artifact it names. The in-repo
+ *  literal stands in for an external CLI whose real version is hashed nowhere, so
+ *  one committed hash can cover different converted bytes on two machines (#1297,
+ *  measured on the audio clips above). Reproducible key, machine-dependent
+ *  artifact — do not read this paragraph as promising the second.
  */
 
 import fs from 'fs';
@@ -123,8 +140,11 @@ type CacheBlock = (typeof CACHE_BLOCKS)[number];
 const VOLATILE_STAT_KEYS = ['variantBytes', 'lodBytes', 'triCounts', 'bytes'] as const;
 /** Extra per-block keys that are host-dependent rather than merely volatile, so
  *  committing them churns the tree between clones. See the module note for why
- *  `modelCache.hash` is the only one. */
-const HOST_LOCAL_KEYS: Partial<Record<CacheBlock, readonly string[]>> = { modelCache: ['hash'] };
+ *  these two, and why no third one belongs here by analogy. */
+const HOST_LOCAL_KEYS: Partial<Record<CacheBlock, readonly string[]>> = {
+  modelCache: ['hash'],
+  audioCache: ['durationSec'],
+};
 
 /** Every key peeled out of `block` into the gitignored local sidecar. */
 function localKeysFor(block: CacheBlock): readonly string[] {
@@ -399,6 +419,14 @@ export function writeMetaSidecar(absPath: string, meta: Record<string, unknown>)
     // `processedPath`/`lodPaths` for models — so it only arises from a wholesale external write
     // (`/api/write-meta`, `modoki_write_asset_meta`) that carried stats and nothing else. Drop
     // the local half with it: with no committed block to merge into, those bytes are unreadable.
+    //
+    // ⚠️ #1289 widened what reaches this branch: `durationSec` is now a peeled key, so a wholesale
+    // external write carrying `audioCache: { durationSec }` and nothing else lands here and commits
+    // NO audio block — where before it committed a truthy one. The scanner keys convert-or-ship on
+    // that truthiness, so the same agent call now makes the build ship the source clip verbatim.
+    // Left as-is deliberately: a block with a duration and no `hash`/`ext` is not a conversion
+    // record either way, and dropping it is the honest reading. Noted because the failure is
+    // silent, and because it is the one behaviour the peel changed outside the sidecar itself.
     if (Object.keys(b).length === 0) { delete committed[block]; delete local[block]; }
   }
   writeJsonAtomic(sidecarPath(absPath), committed);

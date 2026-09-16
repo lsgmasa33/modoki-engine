@@ -99,10 +99,18 @@ function buildEnvDerivedTarget(renderer: object, source: THREE.DataTexture, kind
   if (kind === 'pmrem') {
     // Constructed OUTSIDE the try, so `finally` can always reach it: if
     // `fromEquirectangular` throws, three has already allocated the ~6 MB ping-pong render
-    // target, 11 LOD meshes and their materials, and `generator.dispose()` freeing them (plus
-    // three's own `_cleanup()` restoring the renderer's previous render target) must still run,
-    // or the renderer is left pointing at the PMREM's internal cube target and the NEXT frame
-    // renders into it instead of the canvas. PMREMGenerator accepts WebGLRenderer or
+    // target, 11 LOD meshes and their materials, and `generator.dispose()` freeing them must
+    // still run.
+    // ⚠️ **This comment used to claim `dispose()` also brings three's `_cleanup()` with it,
+    // restoring the renderer's previous render target. That is FALSE** (read from three 0.185.1,
+    // both generators): `dispose()` calls `_dispose()` — materials, ping-pong target, LOD
+    // geometries — and never `_cleanup()`. `_cleanup()` is what runs `setRenderTarget(_oldTarget,
+    // …)` and restores `xr.enabled`, and it is called only as the last statement of `fromScene()`
+    // / `_fromTexture()`, i.e. on the NORMAL path. So on a throw this branch leaves the renderer
+    // bound to the PMREM's internal cube target and the NEXT frame renders into it instead of the
+    // canvas — the very failure the 'cube' branch below hand-rolls its own restore to prevent.
+    // Fixing that is #1298; the false premise is corrected here now because it is what stopped
+    // anyone writing the restore. PMREMGenerator accepts WebGLRenderer or
     // WebGPURenderer; `renderer` here is typed loosely to avoid pulling the WebGPU renderer type
     // into this file's public signature.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

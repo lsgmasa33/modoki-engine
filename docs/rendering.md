@@ -3625,6 +3625,54 @@ the helper (delete them and 6 of the 14 cases go red). And the mocks resolve thr
 with `fileURLToPath`, never `new URL(...).pathname`, which yields `/D:/…` on Windows and fails to
 import — red on the public CI matrix, invisible to the Mac gate.
 
+### The same asymmetry outside post-FX: a PMREM's output target (#1277)
+
+The rule that generalises out of the table above — **a render target and its texture are different
+owners, and freeing the texture is not freeing the target** — has a second home in the editor's two
+3D previews (`panels/previewScene.ts`, `panels/ModelPreview.tsx`).
+
+`PMREMGenerator.fromScene()` returns a **`WebGLRenderTarget`**. Both previews kept only its
+`.texture`, assigned that to `scene.environment`, and disposed the TEXTURE on teardown. Neither
+disposal reaches the target:
+
+- `generator.dispose()` frees the generator's own scratch (`_pingPongRenderTarget`, the LOD meshes,
+  the blur/GGX/cubemap materials) and **deliberately not its output** — `runtime/rendering/envPmrem.ts`
+  says the same in situ, and the runtime env path has owned its targets since #779/#775.
+- `target.texture.dispose()` is a **no-op on a render-target texture**, and this is the half that
+  reads as covered when it is not. three registers `onTextureDispose` inside `initTexture` — the
+  normal upload path — while a render target's texture is set up by `setupRenderTarget`, which
+  registers `onRenderTargetDispose` on the **target**. So the RT texture never gets `__webglInit`,
+  and `deallocateTexture` opens with `if ( textureProperties.__webglInit === undefined ) return;`.
+  (three 0.185.1, `WebGLTextures.js` — `deallocateTexture`, `initTexture`, `setupRenderTarget`.)
+
+Both previews now derive through **`panels/previewEnvironment.ts`**, which holds the target and
+registers its release onto the caller's `TeardownScope` as it is taken (#858). One helper rather
+than two patches, because the five-line block was copy-pasted — which is why one defect lived in two
+files. `previewEnvOwnership.test.ts` census-guards against a third copy by matching the bare
+`PMREMGenerator` identifier; it started as `new\s+(THREE\.)?PMREMGenerator\s*\(` and a mutation check
+walked an aliased namespace import straight past it.
+
+⚠️ **LATENT today — do not go looking for it with a memory counter.** Both previews build their own
+`WebGLRenderer` and `forceContextLoss()` it on teardown, which drops the whole context and takes the
+orphaned target with it, so `renderer.info.memory.renderTargets` shows nothing on today's path. It
+becomes a per-open leak the moment either preview re-IBLs without a teardown, or runs on a renderer
+handed back by `panels/rendererLease.ts` across remounts. The defect is established by reading
+three's source, not by a measurement.
+
+⚠️ The helper's `roomEnv`/`generator` disposals sit in a **`finally`** so a throw mid-derivation
+still frees the scratch three has already allocated by then (the ping-pong render target, the LOD
+meshes, their materials). Both panels disposed on the normal path only.
+
+⚠️ **What that `finally` does NOT buy — the obvious reading is wrong, and this doc asserted the
+wrong version first.** It does **not** restore the renderer's previous render target. That restore
+lives in `_cleanup()`, which three calls as the last statement of `fromScene()`/`_fromTexture()`,
+on the **normal path only**; `dispose()` calls `_dispose()` — materials, ping-pong target, LOD
+geometries — and never `_cleanup()`. True of **both** generators (`three/src/extras` and
+`three/src/renderers/common/extras`). So a throw mid-derivation strands the renderer on the PMREM's
+internal cube target whatever the caller does in a `finally`; only an explicit
+`setRenderTarget`/`xr.enabled` restore fixes that, which is what `envPmrem.ts`'s `'cube'` branch
+already hand-rolls and its `'pmrem'` branch does not (#1298).
+
 **To re-measure** a suspected post-FX leak: play the scene, wrap `window.__3d.renderer.backend`'s
 `createTexture`/`destroyTexture` to keep a `Map` of live textures (name, size, `new Error().stack`),
 and compare `renderer.info.memory.textures` at the SAME timeline point across loops. Grouping the

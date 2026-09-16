@@ -595,7 +595,11 @@ export async function createPrefabFromEntity(
         // row, planMatchesFile then disagrees with the file that was written WARM, and the redo
         // tags nothing at all — leaving the subtree unlinked from the prefab it just restored.
         await preloadNestedPrefabsForSubtree(id);
-        tagEntityTreeAsInstance(id, savePath, prefab);
+        // Re-resolve: a cold source makes that warm do real I/O, and entityRef exists in this
+        // file precisely because a raw id goes stale across a world rebuild (Play->Stop, a
+        // watcher reload). Tagging the pre-await id could hit a different entity, or none.
+        const tagId = ref.resolve(); if (tagId == null) return;
+        tagEntityTreeAsInstance(tagId, savePath, prefab);
         tagged = true;
       }
     },

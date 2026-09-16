@@ -14,7 +14,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { readScannedSource } from '../helpers/sourceScanner';
-import { calledNames, callsTo, enclosingFunction, enclosingNamedFunction, functionBodyOf, functionsNamed, parseSource, precedingStatements, printedText, ts, unwrapValue } from '../helpers/sourceAst';
+import { calledNames, callsTo, enclosingNamedFunction, functionBodyOf, functionsNamed, parseSource, precedingStatements, printedText, ts, unwrapValue } from '../helpers/sourceAst';
 import { assertExemptionLedger } from '../helpers/exemptionLedger';
 
 const SRC = path.resolve(__dirname, '../../src');
@@ -147,16 +147,43 @@ describe('#1284 — the two rebuild entry points warm the live tree (#1295 carri
   });
 });
 
+/** Is `node` preceded, on its own path and UNCONDITIONALLY, by `await preloadNestedPrefabsForSubtree(...)`?
+ *
+ *  ⚠️ The statement must BE the warm, not merely contain one. `precedingStatements` yields the
+ *  enclosing blocks' earlier statements, and a preceding `if (which === 'overrides') { … }` is one
+ *  of those — so a subtree search (`callsTo(st, WARM).length > 0`) lets a sibling branch's warm
+ *  vouch for this read, which is the regression this guard has now been through twice. A warm
+ *  nested inside a preceding conditional may never have run. */
+function warmedByPrecedingStatement(node: ts.Node): boolean {
+  return precedingStatements(node).some((st) => {
+    if (!ts.isExpressionStatement(st)) return false;
+    const e = unwrapValue(st.expression);
+    return ts.isCallExpression(e) && ts.isIdentifier(e.expression) && e.expression.text === WARM;
+  });
+}
+
 /** The rest of the family. The AST reader at the top of this file matches a warm in the SAME
  *  function immediately before the call; these sites do not have that shape (the dialog warms in
  *  a `useEffect` closure while the read happens inside the pure helper `buildStructural`, and the
  *  agent ops warm inside anonymous `if (which === ...)` branches).
  *
- *  ⚠️ **This was a COUNT guard and that was not good enough.** Counting warms per file is blind to
- *  ORDER, which is the entire bug class — close-out review moved a warm to AFTER the reads it was
- *  meant to cover and the suite stayed green, which is precisely the defect ("the warm existed 111
- *  lines later, too late") that motivated writing the guard. So it now checks POSITION: a warm must
- *  appear before the read, inside the same enclosing function. */
+ *  ⚠️ **Two earlier shapes of this guard were both too weak, and the second was a REGRESSION.**
+ *  A per-file COUNT is blind to ORDER, so moving a warm after the reads it covers stayed green —
+ *  the exact defect ("the warm existed 111 lines later, too late") it was written for. Replacing it
+ *  with `enclosingFunction(w) === enclosingFunction(r) && w.getStart() < r.getStart()` was WORSE in
+ *  one place: every prefab sub-action lives inside ONE `registerAgentOp('prefab', async (params) =>
+ *  …)` arrow, so the `which === 'overrides'` branch's warm compared equal to the
+ *  `which === 'apply'` branch's read and vouched for it — deleting the apply warm stayed green,
+ *  while the count guard it replaced had caught exactly that.
+ *
+ *  So it checks DOMINANCE, not position: the warm must be in a statement that PRECEDES the read on
+ *  the read's own path (`precedingStatements` walks the enclosing blocks), which a sibling `if`
+ *  branch never is.
+ *
+ *  ⚠️ Argument identity is deliberately NOT checked here, unlike `serializedTreeIsWarmed` above.
+ *  `assetOps`' redo warms `id` and then re-resolves into `tagId` before tagging — correct, because
+ *  the await is a window in which a world rebuild can stale the id — and a naive arg match would
+ *  call that correction a defect. */
 const ORDERED_WARMS: Array<{ file: string; reader: string; why: string }> = [
   {
     file: 'packages/modoki/src/editor/panels/ApplyPrefabDialog.tsx', reader: 'buildStructural',
@@ -182,8 +209,7 @@ const READS_WARMED_ELSEWHERE = [
   { item: 'packages/modoki/src/editor/scene/prefab.ts::refreshInstances', reason: 'called only from applyToPrefabSelective, which warms every root in rootsToRefresh before calling it' },
   { item: 'packages/modoki/src/editor/scene/prefab.ts::captureNestedInstanceOverrides', reason: 'runs inside the sync rebuildInstance; its two async callers warm first. The four SYNC undo closures that also reach rebuildInstance are #1295 — they can never await one' },
   { item: 'packages/modoki/src/editor/scene/prefab.ts::captureInstanceReference', reason: 'internal recursion, reached only from planPrefabRows/captureNestedRef, both behind a warmed caller' },
-  { item: 'packages/modoki/src/editor/scene/prefab.ts::revertOverridesSelective', reason: 'warms itself, but after `const prefab = await getPrefabSource(...)`, so the position check below sees the warm and the read in the right order anyway' },
-  { item: 'packages/modoki/src/editor/scene/prefabOverrideKeys.ts::collectInstanceOverrideKeys', reason: 'a pure helper; every caller (the dialog, both agent ops) warms before calling it' },
+  { item: 'packages/modoki/src/editor/scene/prefabOverrideKeys.ts::collectInstanceOverrideKeys', reason: 'a pure helper; both in-repo callers (the two agent ops) warm before calling it. It IS re-exported from editor/index.ts, so an out-of-repo caller is not checkable here' },
   { item: 'packages/modoki/src/editor/scene/serialize.ts::serializeScene', reason: 'the scene save warms by its own mechanism — await Promise.all over every live instance source before the capture loop' },
 ];
 
@@ -193,13 +219,11 @@ describe('#1284 — warms outside the serialize census (#1295 carries the sync u
     const sf = parseSource(readScannedSource(abs).code, path.basename(abs));
     const reads = callsTo(sf, reader);
     expect(reads.length, `${reader} not found in ${file} — did it move or get renamed?`).toBeGreaterThan(0);
-    const warms = callsTo(sf, WARM);
     // A read inside a function on the ledger is warmed by its CALLER, so it has no warm of its
-    // own by design; the ledger row is what vouches for it. Everything else must be ordered.
+    // own by design; the ledger row is what vouches for it. Everything else must be DOMINATED.
     const ledgered = (r: ts.CallExpression) =>
       READS_WARMED_ELSEWHERE.some((k) => k.item === `${file}::${enclosingNamedFunction(r)?.name}`);
-    const unordered = reads.filter((r) => !ledgered(r) && !warms.some(
-      (w) => enclosingFunction(w) === enclosingFunction(r) && w.getStart() < r.getStart()));
+    const unordered = reads.filter((r) => !ledgered(r) && !warmedByPrecedingStatement(r));
     expect(unordered.map((r) => `${reader} at line ${sf.getLineAndCharacterOfPosition(r.getStart()).line + 1}`),
       `every ${reader} call must be preceded by ${WARM} in its own function`).toEqual([]);
   });
@@ -208,23 +232,31 @@ describe('#1284 — warms outside the serialize census (#1295 carries the sync u
    *  `tagEntityTreeAsInstance`, and nothing enumerated those call sites. That is exactly how the
    *  async redo in `assetOps.ts` survived a manual sweep AND an adversarial review: every census
    *  anchored on `captureInstanceStructure`, which that path never calls. Pinned here by warmed /
-   *  unwarmed split rather than by name, so both a lost warm and a new cold site are red. */
+   *  unwarmed split rather than by name, so both a lost warm and a new cold site are red.
+   *
+   *  ⚠️ Enumerated from the FILES. It hardcoded two paths at first, which repeated at the file level
+   *  the mistake it exists to fix — a probe file carrying a bare unwarmed call sat green, because
+   *  the guard never looked at it. `tagEntityTreeAsInstance` is re-exported from editor/index.ts,
+   *  so a new panel reaches it. */
   it('every tagEntityTreeAsInstance call is warmed, except the one sync closure #1295 owns', () => {
-    const sites = ['packages/modoki/src/editor/panels/assetOps.ts', 'app/editor/agentEditorOps.ts']
+    const roots = [path.join(SRC, 'editor'), path.join(ENGINE, 'app/editor')];
+    const sites = roots
+      .flatMap((root) => (fs.readdirSync(root, { recursive: true }) as string[])
+        .filter((f) => /\.tsx?$/.test(f)).map((f) => path.relative(ENGINE, path.join(root, f)).split(path.sep).join('/')))
+      .sort()
       .flatMap((rel) => {
         const abs = path.join(ENGINE, rel);
+        if (!readScannedSource(abs).code.includes('tagEntityTreeAsInstance(')) return [];
         const sf = parseSource(readScannedSource(abs).code, path.basename(abs));
-        const warms = callsTo(sf, WARM);
         return callsTo(sf, 'tagEntityTreeAsInstance').map((c) => ({
           at: `${rel}:${sf.getLineAndCharacterOfPosition(c.getStart()).line + 1}`,
-          warmed: warms.some((w) => enclosingFunction(w) === enclosingFunction(c) && w.getStart() < c.getStart()),
+          warmed: warmedByPrecedingStatement(c),
         }));
       });
     expect(sites.length, 'a new tagEntityTreeAsInstance call site must be classified').toBe(4);
-    expect(sites.filter((x) => x.warmed).length, 'three async paths must warm before re-planning the rows').toBe(3);
     expect(sites.filter((x) => !x.warmed).map((x) => x.at),
-      'the only unwarmed one is the SYNC redo closure in the agent create op — it cannot await, and is #1295')
-      .toEqual(['app/editor/agentEditorOps.ts:2356']);
+      'EVERY site warms now — the last holdout was the agent create redo, which turned out to be able to await after all')
+      .toEqual([]);
   });
 
   /** ⚠️ Counted PER OCCURRENCE, not deduped. A `new Set` here hid a second unwarmed call added

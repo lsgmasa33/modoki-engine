@@ -148,10 +148,22 @@ const sites: { label: string; rel: string; seed: string; acquisitions: string[];
       'new THREE.WebGLRenderer(',
       'noteGpuContextCreated()',
       'new OrbitControls(',
+      // The PMREM output target (#1277). It is a GPU allocation like the three above, and it is
+      // the helper — not this panel — that registers the release, so what must be pinned here is
+      // that THIS panel's scope is the one handed over.
+      'createPreviewEnvironment(renderer, scope)',
     ],
     releases: [
       'scope.add(noteGpuContextCreated())',
       'scope.add(teardown)',
+      // ⚠️ This is the ONLY falsifiable cover #1277's fix has on this panel, and that asymmetry is
+      // deliberate rather than an oversight. `previewScene` is a plain factory, so its twin is a
+      // real behavioural test (`previewSceneLoss.test.ts`) that builds the thing and asserts the
+      // target is freed; `ModelPreview` is a `.tsx` panel this repo will not mount in jsdom, so
+      // there is nothing to drive. Swap this argument for a fresh `createTeardownScope(...)` and
+      // the target is owned by a scope nobody drains — #1277 reproduced exactly, with every other
+      // gate still green. An adversarial review of #1277 found that hole; this line is the patch.
+      'createPreviewEnvironment(renderer, scope)',
       // The two lines the close-out review's finding 1 was about. This panel has TWO entry points
       // into teardown, and the renderer's disposal lives on the scope — so the loss path MUST
       // drain the scope, not call `teardown()`. Reverting that one identifier is a silent

@@ -623,24 +623,26 @@ the file.**
   instance or are warmed at open time, plus a by-name check that the two rebuild entry
   points still warm at all).
 
-  ⚠️ **Every ASYNC entry point now warms; the five that do not are synchronous.** The warmed
-  ones: both Create Prefab paths, `assetOps`' async Create-Prefab **redo**, `applyToPrefab`,
-  `applyToPrefabSelective` (twice — its own capture and its per-root loop),
-  `revertOverridesSelective`, the Apply to Prefab dialog, and the `modoki_prefab
-  overrides`/`apply`/`revert` ops. What remains are **five synchronous undo/redo closures**
-  (two in `ApplyPrefabDialog`, three in `agentEditorOps`) that can never await a warm — which
-  is what makes a caller-side fix structurally incapable of finishing this. The rest is a
-  world-level warming seam (warm every live `PrefabInstance.source` once after a scene load),
-  tracked as **#1295**.
+  ⚠️ **Every entry point that reaches one of these readers now warms — including the undo/redo
+  closures.** Those were deferred three times as "synchronous closures that can never await",
+  and that was simply false: `UndoAction.undo/redo` are typed `(): void | Promise<void>`,
+  `undoManager`'s `runStep` does `await run()`, and the comment beside its in-flight mutex says
+  an action's undo/redo may await, *"e.g. prefab instantiate redo"*. A wrong premise survived
+  three passes because each one restated it instead of checking the type.
 
-  ⚠️ **Do not trust a census that anchors on one reader.** This paragraph shipped a wrong count
-  twice, and both times for the same reason: every sweep anchored on `captureInstanceStructure`,
-  so the path that reaches `planPrefabRows` through `tagEntityTreeAsInstance` — `assetOps`'
-  async redo — was invisible to a manual sweep AND to an adversarial review. There are **three**
-  sync readers over the live tree (`planPrefabRows`, `captureInstanceStructure`,
-  `captureNestedInstanceOverrides`), reached by different call chains, and
-  `coldCacheWarmCensus.test.ts` now pins the call sites of two of them separately for exactly
-  that reason.
+  Each closure that warms then **re-resolves its `entityRef`**: a cold source makes the warm do
+  real I/O, and `entityRef` exists in those files precisely because a raw ecs id goes stale
+  across a world rebuild (Play→Stop, a watcher reload).
+
+  ⚠️ **Do not trust a census that anchors on ONE reader — this paragraph shipped a wrong count
+  three times doing exactly that.** The sync reads are not three; in `prefab.ts` alone there are
+  **seven** (`planPrefabRows`, `instantiatePrefab`, `wouldCreateCycle`, `captureNestedRef`,
+  `applyStructureByRootInstance`, and two inside the nested-override capture/replay pair), plus
+  `Inspector.tsx` and the prefab-edit save. They are reached by different call chains, so a sweep
+  anchored on `captureInstanceStructure` cannot see the one that reaches `planPrefabRows` through
+  `tagEntityTreeAsInstance` — which is how `assetOps`' async redo survived a manual sweep AND an
+  adversarial review. `coldCacheWarmCensus.test.ts` pins three anchors separately for that reason,
+  and **#1295** tracks replacing the whole approach with a world-level warm.
 
   ⚠️ **`applyToPrefab` is the one worth remembering**, because it shows what the cold read
   actually costs. It captures the structure and uses the result to BUILD the key set it hands

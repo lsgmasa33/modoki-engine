@@ -2353,7 +2353,15 @@ export function registerEditorAgentOps(): void {
             const unresolved = reattachPrefabInstance(priorLinks, { rootEcsId: id });
             if (unresolved > 0) console.warn(`[prefab create] undo: ${unresolved} prior prefab link(s) could not be put back — no longer addressable.`);
           },
-          redo: () => { const id = ref.resolve(); if (id != null) tagEntityTreeAsInstance(id, path, prefab); },
+          redo: async () => {
+            const id = ref.resolve(); if (id == null) return;
+            // tagEntityTreeAsInstance re-runs planPrefabRows, the FLATTEN reader (#1284): cold,
+            // the re-planned rows drop the nested instance, planMatchesFile then disagrees with
+            // the file written warm, and the redo tags nothing at all.
+            await preloadNestedPrefabsForSubtree(id);
+            const after = ref.resolve(); if (after == null) return;
+            tagEntityTreeAsInstance(after, path, prefab);
+          },
         });
       }
       // `saved` describes the .prefab.json FILE write (ok). The live-world PrefabInstance
@@ -2534,14 +2542,20 @@ export function registerEditorAgentOps(): void {
       const { source, prefab: revertedPrefab, fullOverrides, fullStructure, reducedOverrides, reducedStructure } = result;
       pushAction({
         label: 'Revert prefab overrides',
-        undo: () => {
+        undo: async () => {
           const cur = ref.resolve(); if (cur == null) return;
-          const id = rebuildInstance(cur, source, revertedPrefab, fullOverrides, fullStructure);
+          // Same cold read as the dialog's closures (#1284); undoManager awaits undo/redo.
+          await preloadNestedPrefabsForSubtree(cur);
+          const after = ref.resolve(); if (after == null) return;
+          const id = rebuildInstance(after, source, revertedPrefab, fullOverrides, fullStructure);
           useEditorStore.getState().selectEntity(id);
         },
-        redo: () => {
+        redo: async () => {
           const cur = ref.resolve(); if (cur == null) return;
-          const id = rebuildInstance(cur, source, revertedPrefab, reducedOverrides, reducedStructure);
+          // Same cold read as the dialog's closures (#1284); undoManager awaits undo/redo.
+          await preloadNestedPrefabsForSubtree(cur);
+          const after = ref.resolve(); if (after == null) return;
+          const id = rebuildInstance(after, source, revertedPrefab, reducedOverrides, reducedStructure);
           useEditorStore.getState().selectEntity(id);
         },
       });

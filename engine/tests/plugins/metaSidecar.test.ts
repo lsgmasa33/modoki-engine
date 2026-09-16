@@ -126,6 +126,45 @@ describe('writeMetaSidecar — committed / machine-local byte-stat split', () =>
     });
   });
 
+  it('peels audioCache.durationSec, and ONLY it, out of the audio block (#1289)', () => {
+    // durationSec is not derived from (source bytes + settings) like the rest of the block — it is
+    // ffprobe's MEASUREMENT of the file ffmpeg just produced, so it moves when either binary does.
+    // Measured 2026-09-16: 4 of games/wordweave's 26 clips encode to different bytes under
+    // ffmpeg-static 6.0 vs Homebrew ffmpeg 8.1.1, and the two ffprobe builds on that Mac disagree
+    // about duration on ALL 26.
+    writeMetaSidecar(absPath, {
+      id: 'g',
+      audioCache: { hash: 'h4', ext: 'mp3', durationSec: 0.182857, channels: 1, sampleRate: 22050, bytes: 2527 },
+    });
+    const committed = JSON.parse(fs.readFileSync(absPath + '.meta.json', 'utf-8'));
+    // The accept side, and it is the half that matters: channels/sampleRate stay reviewable in git,
+    // so a peel that took the whole block would satisfy a bare not.toHaveProperty and be wrong.
+    // ⚠️ Not because the settings always force them — that reason is false for 3 of the 29 migrated
+    // sidecars (`demos/forest-camp`'s clips set `forceMono: false` and no `sampleRate`, so
+    // buildFfmpegArgs passes neither `-ac` nor `-ar` and both values are pure ffprobe readings of
+    // the source). They stay committed because their value follows the source deterministically and
+    // no divergence has ever been observed in them — not because they cannot be measurements.
+    expect(committed.audioCache).toEqual({ hash: 'h4', ext: 'mp3', channels: 1, sampleRate: 22050 });
+    expect(JSON.parse(fs.readFileSync(absPath + '.meta.local.json', 'utf-8'))).toEqual({
+      audioCache: { durationSec: 0.182857, bytes: 2527 },
+    });
+  });
+
+  it('merges durationSec back on read, so the Audio inspector still shows a duration', () => {
+    // Its one consumer is AudioAssetView's inspector row — `AudioManifestBlock` bakes
+    // loadType/format/ext and no duration — so "peeled" has to differ from "dropped" HERE or the
+    // fix silently removes a field the editor displays.
+    fs.writeFileSync(absPath + '.meta.json', JSON.stringify({
+      id: 'g', version: 2, audioCache: { hash: 'h4', ext: 'mp3', channels: 1, sampleRate: 22050 },
+    }));
+    fs.writeFileSync(absPath + '.meta.local.json', JSON.stringify({
+      audioCache: { durationSec: 0.182857, bytes: 2527 },
+    }));
+    expect(readMetaSidecar(absPath).audioCache).toEqual({
+      hash: 'h4', ext: 'mp3', channels: 1, sampleRate: 22050, durationSec: 0.182857, bytes: 2527,
+    });
+  });
+
   it('readMetaSidecar merges the local byte-stats back (inspector sees live sizes)', () => {
     const meta = metaWithStats();
     writeMetaSidecar(absPath, meta);

@@ -71,12 +71,31 @@ class FakeWebGLRenderer {
   forceContextLoss() { this.contextLost = true; this.domElement.dispatchEvent(new Event('webglcontextlost', { cancelable: true })); }
   dispose() { this.disposeCalls++; this.disposed = true; }
 }
+/** Every PMREM output target `createPreviewScene` derives, so teardown can be asserted against it.
+ *  ⚠️ `fromScene()` hands back a RENDER TARGET, not a texture, and the target is what owns the
+ *  framebuffer (#1277). This fake used to be `{ texture: { dispose(){} } }` — no target-level
+ *  `dispose` at all — which could not model the defect: it made `envTexture.dispose()` look like a
+ *  real free, AND, because `teardownScope`'s drain catches and logs a throwing release by design,
+ *  a teardown calling the missing `target.dispose()` was swallowed rather than reddening anything.
+ *  Mutation-checked: restoring that shape leaves this whole file green. */
+const pmremTargets: { disposed: boolean; texture: { disposed: boolean } }[] = [];
 vi.mock('three', async (importOriginal) => {
   const actual = await importOriginal<typeof import('three')>();
   return {
     ...actual,
     WebGLRenderer: FakeWebGLRenderer,
-    PMREMGenerator: class { fromScene() { return { texture: { dispose() {} } }; } dispose() {} },
+    PMREMGenerator: class {
+      fromScene() {
+        const target = {
+          disposed: false,
+          texture: { disposed: false, dispose(this: { disposed: boolean }) { this.disposed = true; } },
+          dispose(this: { disposed: boolean }) { this.disposed = true; },
+        };
+        pmremTargets.push(target);
+        return target;
+      }
+      dispose() {}
+    },
   };
 });
 
@@ -152,5 +171,36 @@ describe('previewScene.ts — a lost context tears the scene down via its OWN di
     expect(handle.contentRoot.children.length).toBe(1);
     handle.dispose(); // e.g. the panel's own unmount, running after the loss
     expect(handle.contentRoot.children.length).toBe(0);
+  });
+});
+
+/** #1277's PRODUCTION WIRING. `previewEnvOwnership.test.ts` proves `createPreviewEnvironment`
+ *  itself frees the target; only this file can prove the panel actually routes through it and
+ *  drains it, because `previewScene` is the one preview that is a plain factory and can be built
+ *  for real. Without this, the helper could be correct and unreachable — the shape that made
+ *  #1268's derived-guid fix pass while production was still broken. */
+describe('previewScene.ts — the PMREM output target is freed by teardown (#1277)', () => {
+  it('disposes the TARGET, not merely its texture, when the scope drains', async () => {
+    // ⚠️ `mockClear()` is load-bearing, not hygiene: `vi.spyOn` on an ALREADY-spied method hands
+    // back the existing mock WITH its call history, and the loss tests above legitimately log. So
+    // without this, the `not.toHaveBeenCalled()` below reads THEIR console.error and fails for a
+    // reason that has nothing to do with this teardown — which is exactly what it did first run.
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    err.mockClear();
+    pmremTargets.length = 0;
+    const { createPreviewScene } = await import('../../src/editor/panels/previewScene');
+    const container = document.createElement('div');
+    const scope = createTeardownScope('test');
+    createPreviewScene(container, {}, scope);
+
+    expect(pmremTargets, 'the panel derives exactly one environment').toHaveLength(1);
+    expect(pmremTargets[0].disposed, 'not freed before teardown').toBe(false);
+
+    scope.dispose();
+
+    expect(pmremTargets[0].disposed, 'the target owns the framebuffer — it is what must be freed').toBe(true);
+    // The drain reports a throwing step and carries on (teardownScope `run()`), so a teardown
+    // calling something the fake does not have would otherwise pass silently. Nothing threw here.
+    expect(err, 'no teardown step may throw — a swallowed throw is how this defect hid').not.toHaveBeenCalled();
   });
 });

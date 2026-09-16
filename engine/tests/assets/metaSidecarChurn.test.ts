@@ -54,30 +54,72 @@ function trackedMetaSidecars(): string[] {
   return repoFiles({ match: /\.meta\.json$/, floor: 0, includeUntracked: false }).map((f) => f.rel);
 }
 
-describe('committed .meta.json sidecars never carry modelCache.hash (#127)', () => {
-  it('has no tracked sidecar with modelCache.hash', () => {
-    const offenders: string[] = [];
-    for (const rel of trackedMetaSidecars()) {
-      const abs = path.join(PROJECT_ROOT, rel);
-      let json: unknown;
-      try {
-        json = JSON.parse(fs.readFileSync(abs, 'utf-8'));
-      } catch {
-        continue; // unparsable — not this guard's concern
+/** Cache-block values a COMMITTED sidecar must never carry, because the machine that wrote them
+ *  is what decides them. `writeMetaSidecar` peels each into the gitignored `.meta.local.json`.
+ *
+ *  ⚠️ Spelled out here rather than imported from meta-sidecar.ts's `HOST_LOCAL_KEYS` ON PURPOSE.
+ *  A guard derived from the very constant it guards moves WITH it: delete the `audioCache` entry
+ *  there and an imported list would simply stop checking audio and stay green, which is the
+ *  constant-vs-constant shape that folds away to nothing. This table is the independent claim;
+ *  `HOST_LOCAL_KEYS` is the implementation of it, and the two are meant to be able to disagree.
+ *
+ *  ⚠️ What it CANNOT catch, so nobody reads it as more than it is: this is a guard on the STATE of
+ *  the corpus, not on the mechanism. Delete the `audioCache` entry from `HOST_LOCAL_KEYS` and this
+ *  file stays green — the committed sidecars are already clean, and nothing re-dirties them until
+ *  somebody reimports AND commits. The mechanism is pinned by the unit tests in
+ *  `engine/tests/plugins/metaSidecar.test.ts`; this table is what stops a sidecar arriving from an
+ *  old branch, or a hand-edit, from putting the value back. */
+const HOST_LOCAL_PAIRS: ReadonlyArray<{ block: string; key: string; issue: string; why: string }> = [
+  {
+    block: 'modelCache', key: 'hash', issue: '#127',
+    why: 'machine-dependent by construction — hashKey/riggedHash mix local CLI versions, and riggedHash encodes whether toktx exists at all',
+  },
+  {
+    block: 'audioCache', key: 'durationSec', issue: '#1289',
+    why: 'ffprobe MEASURES it on the file ffmpeg produced, and resolveTool picks both binaries per machine — 4 of wordweave\'s 26 clips encode to different bytes under ffmpeg 6.0 vs 8.1.1',
+  },
+];
+
+describe('committed .meta.json sidecars never carry a host-local cache value (#127, #1289)', () => {
+  for (const { block, key, issue, why } of HOST_LOCAL_PAIRS) {
+    it(`has no tracked sidecar with ${block}.${key}`, () => {
+      const offenders: string[] = [];
+      for (const rel of trackedMetaSidecars()) {
+        const abs = path.join(PROJECT_ROOT, rel);
+        let json: unknown;
+        try {
+          json = JSON.parse(fs.readFileSync(abs, 'utf-8'));
+        } catch {
+          continue; // unparsable — not this guard's concern
+        }
+        if (!json || typeof json !== 'object') continue;
+        const cacheBlock = (json as Record<string, unknown>)[block];
+        if (cacheBlock && typeof cacheBlock === 'object' && key in cacheBlock) {
+          offenders.push(rel);
+        }
       }
-      if (!json || typeof json !== 'object') continue;
-      const modelCache = (json as Record<string, unknown>).modelCache;
-      if (modelCache && typeof modelCache === 'object' && 'hash' in modelCache) {
-        offenders.push(rel);
-      }
-    }
-    expect(
-      offenders,
-      offenders.length > 0
-        ? `${offenders.length} committed sidecar(s) carry modelCache.hash (#127 — machine-dependent, ` +
-          `churns between clones): ${offenders.join(', ')}\nRun: node engine/scripts/migrate-meta-sidecars.mjs`
-        : undefined,
-    ).toEqual([]);
+      expect(
+        offenders,
+        offenders.length > 0
+          ? `${offenders.length} committed sidecar(s) carry ${block}.${key} (${issue} — ${why}), so they `
+            + `churn between clones: ${offenders.join(', ')}\nRun: node engine/scripts/migrate-meta-sidecars.mjs`
+          : undefined,
+      ).toEqual([]);
+    });
+  }
+
+  /** Non-vacuity: the loop above is only a guard if it READ something. A sidecar corpus that fails
+   *  to enumerate (a broken `repoFiles` match, a moved root) reports zero offenders for every pair
+   *  and looks identical to a clean tree.
+   *
+   *  ⚠️ The floor is conditioned on `INTERNAL_GAMES` for the reason this file's header already
+   *  documents, and which an unconditional `> 100` reproduces exactly: `verify:publish` runs this
+   *  directory INSIDE the assembled OSS snapshot, which ships no `games/` and two demos — 15
+   *  sidecars, measured, against 455 here. A worker's `npm run verify` cannot see that leg, so an
+   *  unconditional floor is green on every clone and red on the hub's push. The snapshot keeps a
+   *  floor rather than skipping, or the guard goes vacuous exactly where the public repo needs it. */
+  it('actually scanned a corpus of sidecars', () => {
+    expect(trackedMetaSidecars().length).toBeGreaterThan(INTERNAL_GAMES ? 100 : 10);
   });
 });
 

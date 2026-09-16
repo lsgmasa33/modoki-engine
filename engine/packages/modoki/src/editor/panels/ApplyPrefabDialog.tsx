@@ -283,14 +283,28 @@ function PrefabOverridesDialog({ mode }: { mode: Mode }) {
             const { source, prefab, fullOverrides, fullStructure, reducedOverrides, reducedStructure } = result;
             pushAction({
               label: 'Revert prefab overrides',
-              undo: () => {
+              undo: async () => {
                 const cur = ref.resolve(); if (cur == null) return;
-                const id = rebuildInstance(cur, source, prefab, fullOverrides, fullStructure);
+                // rebuildInstance -> captureNestedInstanceOverrides is a sync cache read with NO
+                // warning on a miss, so a cold cache silently resets a nested instance's per-copy
+                // overrides to the child prefab base (#1284). UndoAction.undo/redo are typed
+                // `(): void | Promise<void>` and undoManager awaits them under its own mutex, so
+                // awaiting here is supported rather than merely tolerated.
+                await preloadNestedPrefabsForSubtree(cur);
+                const after = ref.resolve(); if (after == null) return;
+                const id = rebuildInstance(after, source, prefab, fullOverrides, fullStructure);
                 useEditorStore.getState().selectEntity(id);
               },
-              redo: () => {
+              redo: async () => {
                 const cur = ref.resolve(); if (cur == null) return;
-                const id = rebuildInstance(cur, source, prefab, reducedOverrides, reducedStructure);
+                // rebuildInstance -> captureNestedInstanceOverrides is a sync cache read with NO
+                // warning on a miss, so a cold cache silently resets a nested instance's per-copy
+                // overrides to the child prefab base (#1284). UndoAction.undo/redo are typed
+                // `(): void | Promise<void>` and undoManager awaits them under its own mutex, so
+                // awaiting here is supported rather than merely tolerated.
+                await preloadNestedPrefabsForSubtree(cur);
+                const after = ref.resolve(); if (after == null) return;
+                const id = rebuildInstance(after, source, prefab, reducedOverrides, reducedStructure);
                 useEditorStore.getState().selectEntity(id);
               },
             });

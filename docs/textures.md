@@ -195,6 +195,38 @@ else). The other cache blocks' hashes (`textureCache.hash`, `fontCache.hash`,
 ...) stay committed — they mix only source bytes + settings + an in-repo
 encoder version, so they ARE reproducible across machines.
 
+**`audioCache.durationSec` joined the peel in #1289** — the same "machine-dependent
+by construction" test, reached from the other side. It is not derived from
+(source + settings) at all: ffprobe MEASURES it on the MP3 `ffmpeg` has just
+written, and `resolveTool` (`plugins/ffmpeg-tool.ts`) resolves BOTH binaries per
+machine (env override → the editor's provisioned toolchain copy → bare name on
+PATH). Measured on `games/wordweave`, 2026-09-16: 4 of 26 clips encode to
+different BYTES under the provisioned `ffmpeg-static` 6.0 vs Homebrew `ffmpeg`
+8.1.1 — `silenceremove` trims a different sample count, which on those four
+crosses an MP3 granule — and this Mac's two ffprobe builds disagree about
+duration on all 26. Nothing consumes the value (`AudioManifestBlock` bakes
+`loadType`/`format`/`ext` and no duration); its one reader is `AudioAssetView`'s
+Inspector row, which gets it back from the merged local half — *on a machine that
+has one*. A fresh clone shows no Duration row at all until the clip is first served
+and re-baked, the same self-heal `modelCache.hash` already relies on.
+
+Its siblings `channels`/`sampleRate` stay committed, but ⚠️ **not because the
+settings force them.** That reason holds for wordweave's 26 clips and is false for
+`demos/forest-camp`'s 3, which set `forceMono: false` and no `sampleRate`, so
+`buildFfmpegArgs` passes neither `-ac` nor `-ar` and both values are ffprobe
+readings of the source. They stay committed because their value follows the source
+deterministically and no divergence has been observed in them — and a machine with
+NO ffprobe deletes them outright, which #1300 tracks.
+
+⚠️ **"The hash is reproducible" is not "the artifact is."** The in-repo
+`*_ENCODER_VERSION` literal each key mixes stands in for an external CLI whose
+real version is hashed nowhere, so one committed hash can name different
+converted bytes on two machines — audio and video via `ffmpeg`, textures and
+environments via `toktx` (a manual install, so nothing pins it). The peel above
+removes the sidecar churn that exposed this for audio; **#1297 tracks the
+divergence itself, and after #1289 a clean `git status` is no longer evidence
+about it.**
+
 **The local file fills a cache block in; it never CREATES one (#1279).** For
 **audio and environments**, a block's mere existence is what the build reads as
 "this asset has been converted": `vite-asset-scanner.ts` ships the converted
@@ -221,6 +253,13 @@ in the same shape. A video's size is not Inspector-only: the manifest bakes it
 so `policy: 'auto'` can choose stream-vs-download without a network round-trip.
 Peeling it would blank that everywhere but the importing machine — the very
 machine-dependence the split exists to remove. Asked and answered in #1279.
+
+⚠️ **That argument is about `bytes`, and it does NOT settle `durationSec`.** The two
+committed sidecars for the same byte-identical `cutscene.mp4` (`games/video-test`
+and `demos/video-demo`) carry the same `videoCache.hash` and the same `bytes`, and
+record `24.009002` against `24.01` — #1289's mechanism, already in the tree rather
+than waiting to happen. Peeling it is not a list entry: joining `CACHE_BLOCKS` would
+peel `bytes` with it, so it needs a per-key split. #1300 tracks that.
 
 A fresh checkout has no `.meta.local.json` (gitignored), so it self-heals for
 free: the serving path already treats a missing/stale model hash as a cache
