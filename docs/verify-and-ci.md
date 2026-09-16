@@ -436,9 +436,27 @@ the cause from being mistaken for a diff.
 
 So: **`npm run verify` now prints a `context:` line on every run** — load average, how many verify
 runs share the box, and the worker split — plus each lane's vitest aggregates. Those aggregates are
-summed across workers and so do NOT inflate under contention the way wall clock does; they are the
-only figures two runs on a busy machine can be compared by. **A timing quoted without its context
+summed across workers and so inflate **less** than wall clock. **A timing quoted without its context
 line is not a measurement.**
+
+⚠️ **They inflate too — this section first claimed they were "the only figures two runs on a busy
+machine can be compared by", and that overstates it.** Measured 2026-09-16, the same tree (identical
+`868` files / `26996` passed, differing only in doc and memory commits) run twice:
+
+| app lane | busy | quiet | inflation |
+|---|---|---|---|
+| `context:` | `load 109.5 · 2 run(s) · app=6` | `load 74.6 · 1 run · app=12` | |
+| wall clock | 291.2s | **88.7s** | **3.28x** |
+| aggregate `tests` | 742.60s | 481.71s | 1.54x |
+| aggregate `import` | 621.61s | 365.07s | 1.70x |
+| aggregate `environment` | 116.77s | 60.11s | 1.94x |
+| aggregate `setup` | 87.67s | 39.61s | 2.21x |
+
+So the aggregates are roughly **twice as stable** as wall clock, which is the real claim, and a 54%
+swing on the steadiest of them is still far too large to read a code change through. ⚠️ **Two
+variables move between these columns, not one** — the worker split changed with them (`app=6` against
+`app=12`), because `verifyLoad.mjs` budgets down when it sees a peer. A clean single-variable A/B
+would need `MODOKI_VERIFY_NO_BUDGET=1` on the busy run, and has not been taken.
 
 `engine/scripts/verifyLoad.mjs` registers each run in `~/.modoki/verify-runs.json` and divides the
 performance-core pool by the number of live runs. It intervenes **only when `peers > 1`**, so a solo
