@@ -162,9 +162,10 @@ export function ModelPreview({ sourceUrl, hasLods, lodCount }: Props) {
         { canvas: renderer.domElement },
         {
           label: 'ModelPreview', isStale: () => stateRef.current === null,
-          // This panel is embedded in the Model Inspector (`ModelAssetView`, mounted with no `key`)
-          // — selecting a different model re-populates THIS SAME instance rather than unmounting it,
-          // so the default "reopen the panel" hint is wrong (finding 6, third adversarial review of
+          // This panel is embedded in the Model Inspector (`ModelAssetView`), which has no panel of
+          // its own to reopen, so the default "reopen the panel" hint is wrong. (Selecting another
+          // model DOES remount it — `Inspector.tsx` keys `AssetInspector` by path — which is why
+          // reopening the Inspector, or reselecting, rebuilds it.) (finding 6, third adversarial review of
           // #795; same shape as `previewScene.ts`'s Mesh/Material Preview3DShell, finding 2).
           // ⚠️ `scope.dispose()`, NOT `teardown()`. This panel has TWO entry points into teardown
           // — this one and the effect's own cleanup — and the renderer's `forceContextLoss`/

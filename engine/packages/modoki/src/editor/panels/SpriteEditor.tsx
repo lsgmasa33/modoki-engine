@@ -69,12 +69,11 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
   // #901: the reason the last Save did not write, shown IN the dialog. Cleared on every
   // Save attempt so a stale reason can never sit under a later, different outcome.
   const [saveRefusal, setSaveRefusal] = useState<SaveRefusal | null>(null);
-  // ⚠️ Clear it when the PATH changes, not only on the next Save. `Inspector.tsx` renders the
-  // asset views with no `key`, and an agent can re-open this modal on another texture
-  // (`TextureAssetView` does exactly that) — so the component survives the swap while
-  // `metaLoadedRef` resets and re-reads. Without this the dialog shows asset B under asset A's
-  // refusal, which is a notice describing work the human is no longer looking at.
-  useEffect(() => { setSaveRefusal(null); }, [path]);
+  // ⚠️ `path` never changes for a mounted instance. `Inspector.tsx` renders the asset view as
+  // `<AssetInspector key={selectedAsset.path}>`, so selecting another texture — including the
+  // `open-sprite-editor` / `open-nine-slice-editor` ops — REMOUNTS this modal with fresh state. Per-path
+  // resets and "did the path change under me" checks guard nothing here (#1328 was filed on the
+  // opposite belief and closed); `editor-texture-modal-swap.spec.ts` pins the remount.
   const [sprites, setSprites] = useState<SpriteSlice[]>([]);
   // Store-backed, not local `useState`: an agent needs a route to change which slice is
   // selected (`select-sprite-slice`), and `modoki_get_editor_state` needs to be able to report
@@ -91,9 +90,10 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
   // lived only in TextureAssetView's `useState`, so `select-sprite-slice` stored any string with no
   // modal on screen and `open-sprite-editor` could not tell whether the modal ever opened. Published
   // only once THIS path's slices have loaded — before that the slice list is the previous texture's
-  // (or empty), and a caller told "open" would be refused a slice that is about to appear. While a
-  // new path loads, the previous path's entry is WITHDRAWN: the component survives a texture swap
-  // (no `key`), and leaving A published would let `select-sprite-slice` accept A's slices over B.
+  // (or empty), and a caller told "open" would be refused a slice that is about to appear. A texture
+  // swap remounts this modal (see the note above): the old instance's unmount withdraws A's entry and
+  // this one publishes nothing until B's slices load, so `select-sprite-slice` never accepts A's
+  // slices over B.
   const [loadedPath, setLoadedPath] = useState<string | null>(null);
   const setEditorMount = useEditorStore((s) => s.setEditorMount);
   const sliceKey = sprites.filter((s) => s.guid !== '__preview__').map((s) => s.guid).join('\n');
@@ -184,8 +184,7 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
       })
       .catch(() => {
         /* no meta yet — fresh sheet */
-        // A fresh sheet, literally: the slices on screen were the PREVIOUS texture's (the component
-        // survives a swap), so they are cleared rather than shown — and published — under this one.
+        // A fresh sheet, literally: nothing is shown — or published — under this path.
         // A save stays refused by `metaLoadedRef` (false here), so this cannot write an empty list
         // over the real sidecar. Then the modal counts as open on this path for the agent ops (#1213).
         if (ac.signal.aborted) return;
@@ -669,12 +668,6 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
 
   // ── Persist ──
   const save = async () => {
-    // ⚠️ Capture the path this attempt is FOR. `writeMetaOrWarn`'s POST now carries a renderer
-    // probe (up to 1500ms, two with discardUnsaved), and the Inspector renders these views with no
-    // `key` — so an agent re-opening this modal on another asset mid-flight would land THIS
-    // asset's refusal on THAT asset's dialog. The `[path]` effect above only clears a refusal left
-    // over from before the swap; this closes the other direction (close-out review 2).
-    const attemptPath = path;
     // ⚠️ Clear FIRST, on every attempt — see NineSliceEditor.save for why a stale refusal standing
     // under a later successful write is the same lie in the opposite direction.
     setSaveRefusal(null);
@@ -703,23 +696,19 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
       // BOTH channels (#901) — the console keeps path + mechanism for a debugger, the notice
       // carries consequence + remedy to the person looking at the dialog.
       const refusal: SaveRefusal = { kind: 'meta-never-read' };
-      console.error(saveRefusalConsoleMessage(refusal, 'SpriteEditor', attemptPath));
-      // The console line is unconditional — it is the record, and it names its own path. Only the
-      // ON-SCREEN notice is dropped when the dialog has moved on, because that one would be read
-      // as describing whatever is showing now.
-      if (attemptPath === path) setSaveRefusal(refusal);
+      console.error(saveRefusalConsoleMessage(refusal, 'SpriteEditor', path));
+      setSaveRefusal(refusal);
       return;
     }
+    // A swap while this POST is in flight unmounts this modal AND its parent view (see the note at the
+    // top), so what follows still acts on THIS texture, and `onClose` lands on an unmounted parent.
     const persisted = await writeMetaOrWarn(path, nextMeta);
     if (!persisted) {
       // Keep the dialog open on a failed write — see the note in NineSliceEditor.save. A slice set
       // is far more work to re-author than a border, so losing it to a dev-server blip is worse.
       const refusal: SaveRefusal = { kind: 'write-failed' };
-      console.error(saveRefusalConsoleMessage(refusal, 'SpriteEditor', attemptPath));
-      // The console line is unconditional — it is the record, and it names its own path. Only the
-      // ON-SCREEN notice is dropped when the dialog has moved on, because that one would be read
-      // as describing whatever is showing now.
-      if (attemptPath === path) setSaveRefusal(refusal);
+      console.error(saveRefusalConsoleMessage(refusal, 'SpriteEditor', path));
+      setSaveRefusal(refusal);
       return;
     }
     // #845 close-out: this write just committed whatever `readMetaPreferringPark` read at load

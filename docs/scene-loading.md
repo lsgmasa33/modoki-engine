@@ -974,6 +974,26 @@ allowlisted case).
 > rather than just lookups. This is a **disk-form change only**; translation stays at
 > the load seam.
 
+**Gotcha — a reference to a prefab-instance entry resolves to its PLACEHOLDER (#1353).** Pass 2
+resolves every `entityId` field while prefab entries are still placeholders, and a guid resolves
+there exactly as a number does. The prefab loop then destroys each placeholder, and koota hands
+the freed id to the first row the instantiation spawns. That row is the root only when the prefab
+lists its root row first. So pass 2 records every reference it resolves, `onInstantiatePrefab`
+returns the spawned root, and the placeholder's references (and `idMap`, for a later entry's lazily
+resolved numeric parent) are re-pointed at it. They are DETACHED — zeroed — before the placeholder is
+destroyed (`detachEntityIdRefs`) and attached after (`attachEntityIdRefs`): in between, the member that
+reclaims the id may be structurally `removed`, and that removal cascades by `parentId` across the
+world, which used to delete every scene row still holding the id. A prefab that fails to instantiate
+applies each field's `onMissing` policy to them instead (a `parentId` stays 0, the scene root; a
+`PrefabInstance` whose `rootInstanceId` was detached is stripped, since at 0 it would save as an
+instance root) and drops its `idMap` entry. When an instance's parent is
+itself a placeholder a LATER entry replaces, every row the instantiation handed that parent is
+recorded the same way: the root, and each orphan or extra top-level row (#1339's shape). The
+retarget walks the record, never the world: after the destroy, a new member that reclaimed the id
+has children that legitimately hold it. Pinned by
+`packages/modoki/tests/runtime/sceneLoadInstanceParentRefs.test.ts`, whose prefab lists its root
+LAST so recycling cannot mask the bug.
+
 ### Why it mattered, and the regression gate
 
 A scene saved after a base-scene **carry** (a level swap that keeps a shared base
@@ -1185,9 +1205,10 @@ it has already sent one sweep in the wrong direction (2026-08-18):
   `sceneAnchorOf` resolves the scene-side `parentId` (a guid or an entry id) to that parent. Only a
   parent with a durable guid is followed, and refs below any other parent are left as they were. A
   guid-less PLAIN parent's guid is seeded from the scene PATH (`deriveAuthoredEntityGuids`), which a
-  copy at another path does not share. A guid-less INSTANCE parent can only be named by number, which
-  the loader resolves to the destroyed placeholder, so the child lands wherever koota recycles that
-  id (#1353). **Change the loader's walk and this one together.**
+  copy at another path does not share. A guid-less INSTANCE parent can only be named by number. Since
+  #1353 the loader parents the child to that instance's root, whose guid derives from its own scene
+  parent, so the walk COULD follow it; it conservatively does not, which only affects legacy files
+  that were never re-saved. **Change the loader's walk and this one together.**
   `engine/tests/plugins/remintPrefabMemberRefs.test.ts` pins the pair by loading the original and
   the copy through the real loader, never by hand-computing a guid. A prefab the reader cannot
   resolve maps nothing, so a ref into it still dangles.

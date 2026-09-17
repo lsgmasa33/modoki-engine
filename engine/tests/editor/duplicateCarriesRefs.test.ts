@@ -64,7 +64,7 @@ async function load(scene: SceneData): Promise<void> {
     onInstantiatePrefab: async (source, parentId, rootTf, _old, extra, overrides, structure, nested, rootGuid) => {
       const world = getCurrentWorld();
       const rootId = instantiatePrefabIntoWorld(world, prefabs.get(source) as never, parentId, rootTf, source, overrides, structure, undefined, nested);
-      if (!rootId) return;
+      if (!rootId) return undefined;
       for (const e of world.entities) {
         if (e.id() !== rootId) continue;
         for (const [name, data] of Object.entries(extra ?? {})) {
@@ -73,6 +73,7 @@ async function load(scene: SceneData): Promise<void> {
         }
         if (rootGuid) e.set(eaMeta.trait, { ...(e.get(eaMeta.trait) as object), guid: rootGuid });
       }
+      return rootId; // as SceneManager does, so the loader retargets placeholder refs (#1353)
     },
   });
 }

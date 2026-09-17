@@ -116,7 +116,10 @@ export interface LoadSceneOptions {
   /** Called to re-instantiate a prefab instance. The caller handles prefab fetch + entity creation.
    *  `rootExtraTraits` are traits the scene file added on the prefab-instance root beyond what the
    *  prefab itself defines (e.g. user-added Rotate3D, AnimatePosition). `overrides` carries
-   *  per-localId field-level edits captured at save time so children's local edits survive reload. */
+   *  per-localId field-level edits captured at save time so children's local edits survive reload.
+   *  Returns the spawned instance root's koota id (`undefined` = nothing spawned). The loader re-points
+   *  every reference it resolved to the destroyed placeholder onto that root (#1353); a caller that
+   *  returns nothing leaves those references naming a dead id. */
   onInstantiatePrefab?: (
     source: string,
     parentId: number,
@@ -133,7 +136,7 @@ export interface LoadSceneOptions {
      *  the instance root, re-applied so a foldered prefab instance stays in its
      *  folder across reload. Empty/undefined = ungrouped. */
     rootEditorFolder?: string,
-  ) => void;
+  ) => Promise<number | undefined> | number | undefined | void;
   /** Called before deleting a placeholder entity during prefab re-instantiation */
   onDeletePlaceholder?: (entityId: number) => void;
   /** Target world for entity spawning. Defaults to getCurrentWorld(). SceneManager
@@ -1447,6 +1450,59 @@ export function collectResourceRefsFromEntities(
   return refs;
 }
 
+/** One stored entity reference: `field` of `trait` on `entity`. */
+interface EntityIdRef {
+  entity: Entity; trait: unknown; field: string;
+  /** The field's `onMissing` is `'stripTrait'`: with nothing to point at, the trait goes, not the value. */
+  strip?: boolean;
+}
+
+function noteEntityIdRef(refsTo: Map<number, EntityIdRef[]>, target: number, ref: EntityIdRef): void {
+  if (target <= 0) return;
+  const list = refsTo.get(target);
+  if (list) list.push(ref);
+  else refsTo.set(target, [ref]);
+}
+
+function writeEntityIdRef({ entity, trait, field }: EntityIdRef, expect: number, value: number): boolean {
+  if (!entity.isAlive()) return false; // the placeholder's own self-reference
+  const t = trait as Parameters<Entity['get']>[0];
+  if (!entity.has(t)) return false;
+  const data = entity.get(t) as Record<string, unknown>;
+  if (data[field] !== expect) return false; // rewritten since it was recorded
+  entity.set(t, { ...data, [field]: value } as never);
+  return true;
+}
+
+/** Zero every recorded reference to `placeholder` BEFORE it is destroyed, and return them (#1353).
+ *  Between the destroy and the retarget, koota hands the placeholder's id to a freshly spawned member,
+ *  and a structural `removed` on that member cascades by `parentId` across the world — so a reference
+ *  still holding the id would be deleted with it. If nothing replaces the placeholder,
+ *  {@link dropDetachedEntityIdRefs} applies each field's `onMissing` policy to what is left.
+ *  Driven by the record, never by scanning for `field === id` afterwards: once destroyed, the id's new
+ *  owner has children that legitimately hold it. */
+function detachEntityIdRefs(refsTo: Map<number, EntityIdRef[]>, placeholder: number): EntityIdRef[] {
+  const refs = refsTo.get(placeholder);
+  if (!refs) return [];
+  refsTo.delete(placeholder);
+  return refs.filter((ref) => writeEntityIdRef(ref, placeholder, 0));
+}
+
+/** Nothing replaced the placeholder: apply each detached field's `onMissing` policy, as pass 2 does for a
+ *  reference that never resolved. `'root'` keeps the 0 `detachEntityIdRefs` wrote; `'stripTrait'` removes
+ *  the trait, because a `PrefabInstance` with `rootInstanceId: 0` reads as an instance ROOT on save. */
+function dropDetachedEntityIdRefs(refs: EntityIdRef[]): void {
+  for (const { entity, trait, strip } of refs) {
+    const t = trait as Parameters<Entity['get']>[0];
+    if (strip && entity.isAlive() && entity.has(t)) entity.remove(t);
+  }
+}
+
+/** Point the references `detachEntityIdRefs` zeroed at the instance root that replaced the placeholder. */
+function attachEntityIdRefs(refsTo: Map<number, EntityIdRef[]>, refs: EntityIdRef[], root: number): void {
+  for (const ref of refs) if (writeEntityIdRef(ref, 0, root)) noteEntityIdRef(refsTo, root, ref);
+}
+
 /** Resolve a serialized parentId to a live koota id in `world`.
  *  - GUID string (current files) → the entity carrying that guid, via the guid index.
  *  - number > 0 (legacy files) → remapped through `idMap` (file id → fresh koota id).
@@ -1547,6 +1603,10 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   const world = options.world ?? getCurrentWorld();
   const allTraits = getAllTraits();
   const idMap = new Map<number, number>();
+  // Every `entityId` field this load resolved, keyed by the koota id it now holds. A reference to a
+  // prefab-instance entry resolves to that instance's PLACEHOLDER, which the prefab loop below destroys
+  // and replaces; this is what lets it re-point those references at the real root (#1353).
+  const refsTo = new Map<number, EntityIdRef[]>();
   const spawnedByEntryId = new Map<number, Entity>(); // entry.id → spawned handle (for pass 2)
 
   // A guid for every entry written before #1248, derived so that each clone loading these
@@ -1699,7 +1759,13 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
       for (const [fieldName, hint] of entityIdFields) {
         const resolved = resolveEntityIdField(traitData[fieldName], idMap, world);
         if (resolved === 'empty') continue; // no value / already 0 — nothing to remap
-        if (resolved !== 'miss') { (patch ??= {})[fieldName] = resolved; continue; }
+        if (resolved !== 'miss') {
+          (patch ??= {})[fieldName] = resolved;
+          noteEntityIdRef(refsTo, resolved, {
+            entity, trait: meta.trait, field: fieldName, strip: hint.entityId!.onMissing === 'stripTrait',
+          });
+          continue;
+        }
         if (hint.entityId!.onMissing === 'stripTrait') {
           // Say which id space `label` is in — `entry.id` is a per-LOAD synthetic
           // index (Phase 3, scene-loading.md), not a file id or a live koota id, and
@@ -1761,6 +1827,14 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
 
   // Re-instantiate prefab instances — delegated to caller (editor vs runtime specific)
   if (options.onInstantiatePrefab) {
+    // Every placeholder a prefab entry below may still replace (#1353). Over-inclusive on purpose —
+    // a trait-form member or a prefab that fails to load stays in it — which only costs a scan.
+    const placeholderIds = new Set<number>();
+    for (const entry of data.entities) {
+      if (!entry.prefab && !entry.traits['PrefabInstance']) continue;
+      const id = idMap.get(entry.id);
+      if (id) placeholderIds.add(id);
+    }
     for (const entry of data.entities) {
       const pi = entry.traits['PrefabInstance'] as Record<string, unknown> | undefined;
       // A prefab instance is expressed by a top-level `prefab` ref (scene serialize
@@ -1817,9 +1891,10 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
         rootExtraTraits[name] = data;
       }
 
+      const detached = detachEntityIdRefs(refsTo, newEntityId);
       options.onDeletePlaceholder?.(newEntityId);
 
-      await options.onInstantiatePrefab(
+      const rootEcsId = await options.onInstantiatePrefab(
         source,
         ecsParent,
         rootTf,
@@ -1831,6 +1906,34 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
         entry.guid,
         typeof rootEa?.editorFolder === 'string' ? (rootEa.editorFolder as string) : undefined,
       );
+      if (typeof rootEcsId === 'number' && rootEcsId > 0) {
+        // Everything that was resolved to the placeholder now names the root. Without this the stored
+        // id stayed the placeholder's, and a child landed on whichever entity koota recycled that id
+        // for — the root only when the prefab lists its root row first (#1353).
+        idMap.set(entry.id, rootEcsId);
+        attachEntityIdRefs(refsTo, detached, rootEcsId);
+      } else {
+        // Nothing replaced the placeholder: the detached references get their `onMissing` value, and a
+        // later entry's numeric parent must resolve to 0 too, not to the freed id.
+        dropDetachedEntityIdRefs(detached);
+        idMap.delete(entry.id);
+      }
+      placeholderIds.delete(newEntityId);
+      // This instance's parent may be a placeholder that a LATER entry replaces (a guid resolves to the
+      // still-live placeholder), and the instantiation hands that parent to every row it cannot parent
+      // inside the prefab — the root, an orphan row, an extra top-level row — so each such row is
+      // recorded like a pass-2 reference. Anything else holding a live placeholder's id is a reference
+      // to it, so matching on the value is exact while the placeholder is alive.
+      if (placeholderIds.has(ecsParent)) {
+        const eaTrait = getTraitByName('EntityAttributes')?.trait;
+        if (eaTrait) {
+          for (const e of world.entities as Iterable<Entity>) {
+            if (!e.has(eaTrait)) continue;
+            if ((e.get(eaTrait) as { parentId?: unknown }).parentId !== ecsParent) continue;
+            noteEntityIdRef(refsTo, ecsParent, { entity: e, trait: eaTrait, field: 'parentId' });
+          }
+        }
+      }
 
       // Demoted to debug: this fires per instance on every (hot-)reload — at log
       // level it spams the console + isn't free under heavy reload churn (F9).

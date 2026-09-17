@@ -534,9 +534,10 @@ type SceneEntry = AddedNode & { id?: unknown; traits?: { EntityAttributes?: { gu
  *  that anchor down to the parent — `null` when no reload can be relied on to address it. Mirrors
  *  `resolveParentRef` (a guid names an entry, a positive number an entry id, anything else the
  *  root). Only a parent with a durable guid is followed:
- *  - a guid-less INSTANCE parent can only be named by its numeric entry id, which the loader
- *    resolves to the instance's PLACEHOLDER — destroyed right after — so where the child lands
- *    depends on which entity koota recycles that id for (#1338 review, filed as #1353);
+ *  - a guid-less INSTANCE parent can only be named by its numeric entry id. Since #1353 the loader
+ *    parents the child to the re-instantiated root, and that root derives a guid from ITS scene
+ *    parent (`deriveInstanceMemberGuids`), so a chain below a durable parent could be followed.
+ *    Not following it is a conservative choice for legacy, never-re-saved files, not a necessity;
  *  - a guid-less PLAIN parent gets a guid seeded from the scene PATH (`deriveAuthoredEntityGuids`),
  *    which a copy at another path does not share.
  *  Either way nothing below it can be predicted, so its refs are left as they were. */

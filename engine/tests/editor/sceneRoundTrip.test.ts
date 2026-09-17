@@ -38,8 +38,9 @@ async function reloadInFreshWorld(
     onDeletePlaceholder: (id) => deleteEntity(id),
     onInstantiatePrefab: async (source, parentId, rootTf, _placeholderId, _rootExtra, overrides) => {
       const prefab = await fetchPrefab(source);
-      if (!prefab) return;
-      instantiatePrefabIntoWorld(getCurrentWorld(), prefab, parentId, rootTf, source, overrides);
+      if (!prefab) return undefined;
+      // Returned as SceneManager does, so the loader retargets placeholder refs (#1353).
+      return instantiatePrefabIntoWorld(getCurrentWorld(), prefab, parentId, rootTf, source, overrides) || undefined;
     },
   });
 }

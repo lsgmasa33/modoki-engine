@@ -427,7 +427,13 @@ unsaved-work refusal, unlike `/api/scene-mutate` above). Two things worth knowin
   edit there refused with only a console line. Together: the key stops the display, the stamp stops
   anything reaching disk. The key is also what reaches the `.mat.json`-registry views (#897), whose
   `if (!data) return <Loading…/>` gate is honest again once `data` resets — the stamp cannot see
-  that registry at all.
+  that registry at all. It also remounts the modals an asset view owns: the Sprite Editor and the
+  9-slice editor never outlive a texture swap, even when `open-sprite-editor` /
+  `open-nine-slice-editor` re-point an open one. #1328 assumed they did and was closed after a
+  live run. `engine/tests/e2e/editor-texture-modal-swap.spec.ts` goes red without the key, so a
+  modal needs no per-path reset of its own. The flip side, read from source and not driven: moving
+  or renaming the open texture changes `selectedAsset.path` too, which closes an open modal
+  without a prompt and drops its unsaved edits (#1362).
 
   ⚠️ **Two producers outside the read helper re-stamp explicitly rather than being holes in the
   guard.** `VideoAssetView` (the declared raw-read exemption — an exemption from the READ HELPER is

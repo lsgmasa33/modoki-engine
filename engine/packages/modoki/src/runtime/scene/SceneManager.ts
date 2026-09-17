@@ -815,7 +815,7 @@ class SceneManagerImpl implements SceneManager {
             // `overrides` carries per-localId field-level edits captured at save time;
             // `nestedOverrides` carries scene-level edits on the prefab's own nested instances.
             const cached = getCachedPrefab(source);
-            if (!cached) { console.warn(`[SceneManager] Prefab not in cache: ${source}`); return; }
+            if (!cached) { console.warn(`[SceneManager] Prefab not in cache: ${source}`); return undefined; }
             const rootEcsId = instantiatePrefabIntoWorld(
               stagingWorld,
               cached as { entities: { localId?: number; traits: Record<string, unknown> }[]; rootLocalId?: number },
@@ -878,6 +878,8 @@ class SceneManagerImpl implements SceneManager {
                 break;
               }
             }
+            // The loader re-points every reference it resolved to the placeholder onto this root (#1353).
+            return rootEcsId || undefined;
           },
           onDeletePlaceholder: (entityId) => {
             // The placeholder lives in stagingWorld; destroy it so the prefab

@@ -86,11 +86,12 @@ async function load(scene: SceneData): Promise<void> {
     onInstantiatePrefab: async (source, parentId, rootTf, _old, _extra, overrides, structure, nested, rootGuid) => {
       const world = getCurrentWorld();
       const rootId = instantiatePrefabIntoWorld(world, prefabs.get(source) as never, parentId, rootTf, source, overrides, structure, undefined, nested);
-      if (!rootId || !rootGuid) return;
+      if (!rootId || !rootGuid) return rootId || undefined;
       for (const e of world.entities) {
         if (e.id() !== rootId) continue;
         e.set(eaMeta.trait, { ...(e.get(eaMeta.trait) as object), guid: rootGuid });
       }
+      return rootId; // as SceneManager does, so the loader retargets placeholder refs (#1353)
     },
   });
 }
@@ -411,9 +412,9 @@ describe('members the loader anchors above the instance root follow too (#1339)'
     expect(byAnchor.parent).toEqual([]);
   });
 
-  // #1338 review: a guid-less INSTANCE parent can only be named by number, which the loader resolves to
-  // the destroyed placeholder (#1353) — the child lands wherever koota recycles the id. Nothing
-  // follows through it. Mutation: let `sceneAnchorOf` step through a guid-less instance parent.
+  // #1338 review: a guid-less INSTANCE parent can only be named by number. Since #1353 the child lands
+  // under the re-instantiated root (whose guid derives from its own scene parent), but the walk
+  // conservatively does not follow through it (see `sceneAnchorOf`). Mutation: let `sceneAnchorOf` step through a guid-less instance parent.
   it('an instance whose scene parent is a guid-less instance maps nothing for its orphan rows', () => {
     const ORPH2 = 'aaaaaaaa-0000-4000-8000-0000000000a3';
     prefabs.set(ORPH2, { id: ORPH2, rootLocalId: 1, entities: [row(1, 'Orph2Root', 0), row(7, 'Stray2', 0)] });

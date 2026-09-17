@@ -914,6 +914,8 @@ const HELD_LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
     reason: 'brief: the caller\'s options for one call, read once and never stored; runtime/core/actionRegistry.ts:185' },
   { item: 'engine/packages/modoki/src/runtime/core/ecs/transformPropagationSystem.ts::_allEntityIds',
     reason: 'scratch: cleared, then refilled from the live EntityAttributes query in the same pass that reads it; runtime/core/ecs/transformPropagationSystem.ts:204' },
+  { item: 'engine/packages/modoki/src/runtime/loaders/loadSceneFile.ts::EntityIdRef.entity',
+    reason: 'alive-checked: a record local to one loadSceneFile call (#1353), dropped when it returns; writeEntityIdRef skips a dead entity and a field that no longer holds the expected id before every write; runtime/loaders/loadSceneFile.ts:1464' },
   { item: 'engine/packages/modoki/src/runtime/input/pointerSource.ts::activeId',
     reason: 'not-entity: the DOM PointerEvent.pointerId being tracked; runtime/input/pointerSource.ts:204' },
   { item: 'engine/packages/modoki/src/runtime/physics/physics2DSystem.ts::EMPTY_CHILDREN',

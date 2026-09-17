@@ -1902,6 +1902,9 @@ export default function Inspector() {
     // Keyed here rather than on each child so it also covers this component's OWN per-asset state
     // (the postprocessor row's `metaRef`/`metaLoaded`, which is member 1) and the `.mat.json`-side
     // views, whose `if (!data) return <Loading…/>` gate is honest again once `data` resets.
+    // It also remounts any MODAL a view owns (the Sprite Editor, the 9-slice editor) when an agent
+    // op re-points it at another texture, so none of them carries one asset's undo history or save
+    // into the next (#1328; `editor-texture-modal-swap.spec.ts` goes red without this key).
     return <AssetInspector key={selectedAsset.path} asset={selectedAsset} />;
   }
 

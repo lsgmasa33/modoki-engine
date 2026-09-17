@@ -16,9 +16,9 @@ import type { RendererLossEvent, RendererLossHandlers } from '../../runtime/rend
 
 /** Shared by every caller whose actual recovery path is "close and reopen the Inspector", not the
  *  DEFAULT hint's "reopen the panel" — `previewScene.ts` (its own `PreviewSceneHandle` finding 2)
- *  and `ModelPreview.tsx` (finding 6, third adversarial review of #795) both live inside
- *  `Inspector.tsx` mounted with no `key`, so reselecting a different Mesh/Material/model asset
- *  re-populates the SAME instance in place rather than unmounting it. Exported so
+ *  and `ModelPreview.tsx` (finding 6, third adversarial review of #795) both live inside the
+ *  Inspector's asset view, which has no panel of its own to reopen. (That view IS remounted per
+ *  asset — `Inspector.tsx` keys `AssetInspector` by path — so reselecting rebuilds it too.) Exported so
  *  `modelPreviewLoss.ts`'s own user-facing message can single-source this exact phrase instead of
  *  carrying a second, driftable copy. */
 export const REOPEN_INSPECTOR_HINT = 'close and reopen the Inspector to rebuild it';

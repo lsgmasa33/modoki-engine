@@ -44,12 +44,11 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
   // #901: the reason the last Save did not write, shown IN the dialog. Cleared on every
   // Save attempt so a stale reason can never sit under a later, different outcome.
   const [saveRefusal, setSaveRefusal] = useState<SaveRefusal | null>(null);
-  // ⚠️ Clear it when the PATH changes, not only on the next Save. `Inspector.tsx` renders the
-  // asset views with no `key`, and an agent can re-open this modal on another texture
-  // (`TextureAssetView` does exactly that) — so the component survives the swap while
-  // `metaLoadedRef` resets and re-reads. Without this the dialog shows asset B under asset A's
-  // refusal, which is a notice describing work the human is no longer looking at.
-  useEffect(() => { setSaveRefusal(null); }, [path]);
+  // ⚠️ `path` never changes for a mounted instance. `Inspector.tsx` renders the asset view as
+  // `<AssetInspector key={selectedAsset.path}>`, so selecting another texture — including the
+  // `open-sprite-editor` / `open-nine-slice-editor` ops — REMOUNTS this modal with fresh state. Per-path
+  // resets and "did the path change under me" checks guard nothing here (#1328 was filed on the
+  // opposite belief and closed); `editor-texture-modal-swap.spec.ts` pins the remount.
   // Publish "open, on this texture" for the agent ops (#1213) — the modal's open state is
   // TextureAssetView-local, so `open-nine-slice-editor` could not otherwise confirm it opened.
   const setEditorMount = useEditorStore((s) => s.setEditorMount);
@@ -359,12 +358,6 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
 
   // ── Persist ──
   const save = async () => {
-    // ⚠️ Capture the path this attempt is FOR. `writeMetaOrWarn`'s POST now carries a renderer
-    // probe (up to 1500ms, two with discardUnsaved), and the Inspector renders these views with no
-    // `key` — so an agent re-opening this modal on another asset mid-flight would land THIS
-    // asset's refusal on THAT asset's dialog. The `[path]` effect above only clears a refusal left
-    // over from before the swap; this closes the other direction (close-out review 2).
-    const attemptPath = path;
     // ⚠️ Clear FIRST, on every attempt. A refusal left standing under a later outcome is worse than
     // no refusal: press Save again after the dev server recovers and a stale "not saved" would sit
     // there while the write actually landed, which is the same lie in the opposite direction.
@@ -390,13 +383,12 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
       // the notice carries the consequence + remedy to whoever is editing, in the dialog they are
       // looking at. Reporting to one of them is what made this refusal read as a dead button.
       const refusal: SaveRefusal = { kind: 'meta-never-read' };
-      console.error(saveRefusalConsoleMessage(refusal, 'NineSliceEditor', attemptPath));
-      // The console line is unconditional — it is the record, and it names its own path. Only the
-      // ON-SCREEN notice is dropped when the dialog has moved on, because that one would be read
-      // as describing whatever is showing now.
-      if (attemptPath === path) setSaveRefusal(refusal);
+      console.error(saveRefusalConsoleMessage(refusal, 'NineSliceEditor', path));
+      setSaveRefusal(refusal);
       return;
     }
+    // A swap while this POST is in flight unmounts this modal AND its parent view (see the note at the
+    // top), so what follows still acts on THIS texture, and `onClose` lands on an unmounted parent.
     const persisted = await writeMetaOrWarn(path, nextMeta);
     if (!persisted) {
       // KEEP THE DIALOG OPEN (owner, 2026-08-18). Closing on a failed write throws the edit away
@@ -406,11 +398,8 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
       // logged the status + body; this line names the dialog, since that one is tagged
       // `[Inspector]` for every caller.
       const refusal: SaveRefusal = { kind: 'write-failed' };
-      console.error(saveRefusalConsoleMessage(refusal, 'NineSliceEditor', attemptPath));
-      // The console line is unconditional — it is the record, and it names its own path. Only the
-      // ON-SCREEN notice is dropped when the dialog has moved on, because that one would be read
-      // as describing whatever is showing now.
-      if (attemptPath === path) setSaveRefusal(refusal);
+      console.error(saveRefusalConsoleMessage(refusal, 'NineSliceEditor', path));
+      setSaveRefusal(refusal);
       return;
     }
     savedRef.current = persisted;

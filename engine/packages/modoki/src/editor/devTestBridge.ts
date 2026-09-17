@@ -5,6 +5,8 @@
 
 import * as THREE from 'three';
 import { useEditorStore } from './store/editorStore';
+import { getAssetEntry, type SpriteAssetRef } from '../runtime/loaders/assetManifest';
+import { wholeImageSpriteGuid } from './panels/nineSliceRevert';
 import { getAllEntities, readTraitData, deleteEntity } from '../runtime/core/ecs/entityUtils';
 import { getTraitByName } from '../runtime/core/ecs/traitRegistry';
 import { importModel } from './scene/modelImport';
@@ -106,6 +108,11 @@ export interface EditorTestBridge {
   /** The UI text overflow findings store (#1126) — what `diagnose` reads. Lets an E2E assert the
    *  scan's REAL DOM measurement, which jsdom cannot run. */
   uiOverflowFindings(): UIOverflowFinding[];
+  /** The running manifest's sprite record for `guid` (null = not registered). Lets an E2E assert what
+   *  an editor modal left REGISTERED, which is not visible on screen until something renders it (#1328). */
+  spriteRef(guid: string): SpriteAssetRef | null;
+  /** `spriteRef` for a texture's auto whole-image sprite — the one the 9-slice editor previews into. */
+  wholeImageSpriteRef(textureGuid: string): SpriteAssetRef | null;
   /** Merge values into the game UI store (`setUIValues`) — drives a bound text (`{coins}`) the
    *  way a game does at runtime, so an E2E reaches the text-mutation trigger, not a tree rebuild. */
   setUIValues(patch: Record<string, string | number | boolean>): void;
@@ -197,6 +204,12 @@ export function installEditorTestBridge(): void {
       if (!input) return null;
       const { down, pressed, x, y } = input.pointer;
       return { down, pressed, x, y };
+    },
+    spriteRef(guid) {
+      return getAssetEntry(guid)?.sprite ?? null;
+    },
+    wholeImageSpriteRef(textureGuid) {
+      return getAssetEntry(wholeImageSpriteGuid(textureGuid))?.sprite ?? null;
     },
     uiOverflowFindings() {
       return getUIOverflowFindings();
