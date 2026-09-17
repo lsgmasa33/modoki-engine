@@ -32,10 +32,13 @@ import { join, relative } from 'node:path';
 import { describe, expect, it } from 'vitest';
 // The repo's ONE vetted comment scanner (#419) — never write a private stripper here. See its
 // own docblock for why a naive `//`/`/* */` regex has twice deleted real code from a guard's view.
-// `stripCommentsAndStrings` additionally blanks string/template CONTENT (parser-driven) — used
-// below to compute brace/bracket DEPTH safely, so a stray `(`/`{`/`[` inside a tooltip string
-// cannot desync a balanced-span scan (#723 review finding H).
-import { stripComments, stripCommentsAndStrings, findDamagedCodeTokens, readScannedSource } from '@modoki/engine/testing';
+// The #723 derivers read the PARSE instead of a string-blanked companion (#1241) — see the note
+// above `parsedSource`.
+import { stripComments, findDamagedCodeTokens, readScannedSource } from '@modoki/engine/testing';
+import {
+  callsTo, declarationOf, enclosingFunction, findNodes, objectLiteralKeys, parseSource, propertyValue, stringValueOf,
+  unwrapValue, variablesNamed, ts,
+} from '@modoki/engine/testing/sourceAst';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 
 /** `qa/README.md` is read as PROSE — the format spec's own tables and sentences are what these
@@ -716,13 +719,22 @@ export function particleFieldIds(source: string): string[] {
   if (!source.includes('SectionIdContext.Provider')) return [];
   const out: string[] = [];
   let section = '';
-  const re = /<Section\s+title="([^"]+)"|<(?:Num|Check|Enum|Color|MinMax|Vec3Row)\s[^>]*?\blabel="([^"]+)"/g;
-  for (const m of source.matchAll(re)) {
-    if (m[1] !== undefined) section = particleFieldSlug(m[1]);
-    else if (section) out.push(`particle.${section}.${particleFieldSlug(m[2])}`);
+  // In SOURCE order, which `findNodes` keeps. The text version's `[^>]*?` before `label=` stopped at
+  // the first `>` — an arrow's `=>` in an earlier prop — and dropped the field (#1241).
+  for (const el of jsxElements(parsedSource(source))) {
+    const tag = el.tagName.getText();
+    if (tag === 'Section') {
+      const title = jsxStringAttr(el, 'title');
+      if (title !== undefined) section = particleFieldSlug(title);
+    } else if (PARTICLE_FIELD_WIDGETS.has(tag) && section) {
+      const label = jsxStringAttr(el, 'label');
+      if (label !== undefined) out.push(`particle.${section}.${particleFieldSlug(label)}`);
+    }
   }
   return out;
 }
+
+const PARTICLE_FIELD_WIDGETS = new Set(['Num', 'Check', 'Enum', 'Color', 'MinMax', 'Vec3Row']);
 
 // ── #723: derivers for the templated families that used to be verified by SHAPE alone ─────────
 //
@@ -743,151 +755,106 @@ export function particleFieldIds(source: string): string[] {
 // answer there; it would be the dishonest one everywhere else in this list.
 
 /**
- * `balancedBraceSpan`/`topLevelObjectKeys`/`splitTopLevelItems` below all need to know real
- * `{}[]()` DEPTH, but counting those characters wherever they appear TEXTUALLY breaks the moment
- * one appears inside a string — `tooltip: 'playing (or not'` has an unmatched `(` that is not a
- * bracket at all. Measured (#723 review, item H): injecting that exact string into
- * `registerTraits.ts` silently dropped 8 ids (every field of `SkeletalAnimator`, the trait whose
- * span the desynced counter then ran past).
+ * ⚠️ **Every deriver below reads the parsed SOURCE, never its text extent (#1241).**
  *
- * The fix is NOT to blank the source and scan the blanked text — `stripCommentsAndStrings` blanks
- * a string literal's content (the very field names and key names these functions extract) to
- * spaces. Instead: build a DEPTH-SAFE companion string of identical length via the shared,
- * parser-driven stripper, use IT to decide where a `{`/`[`/`(`/`,` is real, but slice/accumulate
- * the actual TEXT from the original — positions line up 1:1 because both stripping passes are
- * length-preserving.
+ * They used to find a literal by a regex (`registerTrait\(\{`, `const MODULES:[^=]*=\s*\[`), take its
+ * extent by counting brackets, split it at depth-0 commas, and read `key:`/`type:` out of each entry
+ * with another regex. Counting brackets wherever they appear textually broke the moment one sat in a
+ * string — `tooltip: 'playing (or not'` silently dropped 8 ids (#723 review, item H) — so a DEPTH-SAFE
+ * companion string (`stripCommentsAndStrings`, same length) decided where a bracket was real. That
+ * repaired the brackets and left the rest: a `'\n];'` closer, an entry regex that read a NESTED
+ * literal's `type:` as the field's own, a `[\s\S]*?` window pairing one row's `field` with the next
+ * row's `defaultPath`. A node has none of those edges.
+ *
+ * One parse per source text, TSX first then TS (a `<T>x` cast does not parse as TSX, a `<Tag>` does
+ * not parse as TS) — the fallback the depth-safe pass already needed. Each deriver keeps its cheap
+ * TEXT GATE first, so the hand-typed fixtures below, most of which are not whole programs, are only
+ * parsed when they are the deriver's subject.
  */
+const parsedSourceCache = new Map<string, ts.SourceFile>();
 
-/** A generic helper the trait-registry derivers below share: given the index of an object
- *  literal's opening `{` (in `text`, whose depth-safe companion is `depthSafe` — same length, same
- *  offsets), return the text strictly between it and its MATCHING `}` (brace-depth aware, so a
- *  nested `{ }` inside a field's own config — `castShadow: { type: 'enum', ... }` — does not end
- *  the scan early, AND a `{`/`}` inside a STRING cannot desync it either — see the note above). */
-function balancedBraceSpan(text: string, depthSafe: string, openBraceIndex: number): string {
-  let depth = 0;
-  for (let i = openBraceIndex; i < depthSafe.length; i++) {
-    if (depthSafe[i] === '{') depth++;
-    else if (depthSafe[i] === '}') {
-      depth--;
-      if (depth === 0) return text.slice(openBraceIndex + 1, i);
-    }
+function parsedSource(source: string): ts.SourceFile {
+  const cached = parsedSourceCache.get(source);
+  if (cached) return cached;
+  let sf: ts.SourceFile;
+  try {
+    sf = parseSource(source, 'deriver-source.tsx');
+  } catch {
+    sf = parseSource(source, 'deriver-source.ts');
   }
-  return '';
+  parsedSourceCache.set(source, sf);
+  return sf;
 }
 
-/** The bracket-matching twin of `balancedBraceSpan`, for a `[ ... ]` array literal (used by
- *  `projectSettingsFieldIds` below to find a `fields: [ ... ]` array's body). */
-function balancedBracketSpan(text: string, depthSafe: string, openBracketIndex: number): string {
-  let depth = 0;
-  for (let i = openBracketIndex; i < depthSafe.length; i++) {
-    if (depthSafe[i] === '[') depth++;
-    else if (depthSafe[i] === ']') {
-      depth--;
-      if (depth === 0) return text.slice(openBracketIndex + 1, i);
-    }
-  }
-  return '';
+/** Every JSX opening or self-closing element in `root`, in source order. */
+function jsxElements(root: ts.Node): Array<ts.JsxOpeningElement | ts.JsxSelfClosingElement> {
+  return findNodes(root, (n): n is ts.JsxOpeningElement | ts.JsxSelfClosingElement =>
+    ts.isJsxOpeningElement(n) || ts.isJsxSelfClosingElement(n));
 }
 
-/** Split an array/object literal's BODY into its top-level entries at DEPTH-0 commas — decided
- *  from `depthSafeBody` (same length as `body`), so a comma or bracket inside a string cannot
- *  fracture an entry or hide a real separator. Shared by `topLevelObjectKeys` (below) and
- *  `projectSettingsFieldIds`'s array-of-field-objects scan. */
-function splitTopLevelItems(body: string, depthSafeBody: string): string[] {
-  const items: string[] = [];
-  let depth = 0;
-  let start = 0;
-  for (let i = 0; i < depthSafeBody.length; i++) {
-    const d = depthSafeBody[i];
-    if (d === '{' || d === '[' || d === '(') depth++;
-    else if (d === '}' || d === ']' || d === ')') depth--;
-    else if (d === ',' && depth === 0) {
-      items.push(body.slice(start, i));
-      start = i + 1;
-    }
-  }
-  if (start < body.length) items.push(body.slice(start));
-  return items;
+/** A JSX attribute's value when it is a plain string (`title="Advanced"`), else `undefined` —
+ *  `title={sectionName}` has no static value to derive. */
+function jsxStringAttr(el: ts.JsxOpeningElement | ts.JsxSelfClosingElement, name: string): string | undefined {
+  const attr = el.attributes.properties.find((p): p is ts.JsxAttribute => ts.isJsxAttribute(p) && p.name.getText() === name);
+  return attr?.initializer && ts.isStringLiteral(attr.initializer) ? attr.initializer.text : undefined;
 }
 
-/** The key of one top-level object-literal entry (`key: { ... }` or `key: value`), as split out by
- *  `splitTopLevelItems` — `undefined` when the entry does not start with a plain or quoted key. */
-function entryKey(entry: string): string | undefined {
-  const m = /^\s*(?:'([^']+)'|([A-Za-z_$][\w$]*))\s*:/.exec(entry);
-  return m?.[1] ?? m?.[2];
+/** The array literal a MODULE-level `const NAME = [...]` is initialised to (`as const` peeled), or
+ *  `undefined`. A same-named local inside a function is not the catalog. */
+function moduleArray(sf: ts.SourceFile, name: string): ts.ArrayLiteralExpression | undefined {
+  const decls = variablesNamed(sf, name).filter((d) => enclosingFunction(d) === sf);
+  const init = decls.length === 1 && decls[0]!.initializer ? unwrapValue(decls[0]!.initializer) : undefined;
+  return init && ts.isArrayLiteralExpression(init) ? init : undefined;
+}
+
+/** The object literals an array literal holds directly, each resolved through a `const` it names
+ *  (`FREE_PRESET`) — a spread or any other element holds no literal this can read. */
+function arrayObjects(arr: ts.ArrayLiteralExpression): ts.ObjectLiteralExpression[] {
+  return arr.elements.flatMap((e) => {
+    let u = unwrapValue(e);
+    if (ts.isIdentifier(u)) {
+      const d = declarationOf(u);
+      u = d && ts.isVariableDeclaration(d) && d.initializer ? unwrapValue(d.initializer) : u;
+    }
+    return ts.isObjectLiteralExpression(u) ? [u] : [];
+  });
+}
+
+/** A literal's OWN string member `key`, or `undefined`. */
+function ownString(o: ts.ObjectLiteralExpression, key: string): string | undefined {
+  const v = propertyValue(o, key);
+  return v && ts.isExpression(v) ? stringValueOf(v) : undefined;
 }
 
 interface TraitDecl {
   name: string;
   category: string;
-  /** The text inside `fields: { ... }`, or '' when the trait has none (a tag). */
-  fieldsBody: string;
-  /** The depth-safe (string-blanked) companion of `fieldsBody`, same length/offsets — see the
-   *  note above `balancedBraceSpan` for why `topLevelObjectKeys` needs this rather than
-   *  `fieldsBody` itself to split fields safely. */
-  depthSafeFieldsBody: string;
+  /** The `fields: { … }` literal, or `undefined` when the trait has none (a tag). */
+  fields: ts.ObjectLiteralExpression | undefined;
 }
 
-/** Every `registerTrait({ name: '…', category: '…', fields: {…} })` call in a source file,
- *  parsed with brace-depth tracking rather than a single regex — the fields object routinely
- *  contains its own nested `{ }` (an `options: [...]`, a per-field config object), which a
- *  non-greedy `[^}]*?` would stop at prematurely. Shared by `traitFieldIds`, `traitSectionIds` and
+/** Every `registerTrait({ name: '…', category: '…', fields: {…} })` call in a source file, each read
+ *  off the call's OWN object literal — the text version took the first `name: '…'` anywhere in the
+ *  braces, a nested literal's included. Shared by `traitFieldIds`, `traitSectionIds` and
  *  `addComponentItemIds` below so the three cannot read the registry three different ways.
  *
- *  Gated on the literal substring `registerTrait(` before doing any work: `stripCommentsAndStrings`
- *  is a real TypeScript parse, and every other (non-registry) source in the corpus — plus dozens of
- *  hand-typed fixtures in the tests below — would otherwise pay that cost for nothing. */
-// `traitFieldIds`/`traitSectionIds`/`addComponentItemIds` each call `traitDecls` independently on
-// the SAME source, and it now does a real TS parse (not just a regex scan) — keyed on the exact
-// source TEXT (immutable within one test run, and the `registerTrait(` gate already keeps this
-// tiny: only a handful of files in the whole corpus ever populate it).
-const traitDeclsCache = new Map<string, TraitDecl[]>();
-
+ *  Gated on the literal substring `registerTrait(` before doing any work: the parse is real, and
+ *  every other (non-registry) source in the corpus — plus dozens of hand-typed fixtures in the tests
+ *  below — would otherwise pay it for nothing. The literal substring is not unique to
+ *  `registerTraits.ts` — its own DEFINITION (`traitRegistry.ts`) and a call site inside a `.tsx` panel
+ *  (`createEditor.tsx`) contain it too, which is what `parsedSource`'s TSX-then-TS fallback is for. */
 function traitDecls(source: string): TraitDecl[] {
   if (!source.includes('registerTrait(')) return [];
-  const cached = traitDeclsCache.get(source);
-  if (cached) return cached;
-  // Depth-safe companion, SOLELY to decide where a `{`/`}` is real (see the note above
-  // `balancedBraceSpan`) — the actual name/category/field text is always sliced from `source`.
-  //
-  // The literal substring `registerTrait(` is not unique to `registerTraits.ts` — its own
-  // DEFINITION (`traitRegistry.ts`) and one call site inside a `.tsx` panel (`createEditor.tsx`)
-  // both contain it too, and `stripCommentsAndStrings` THROWS on whichever extension fails to
-  // parse. Same two-attempt strategy as `assertKnownUiIdsSourceSurvived` above: try TSX (JSX is
-  // the common case), fall back to plain TS.
-  let depthSafe: string;
-  try {
-    depthSafe = stripCommentsAndStrings(source, 'traitDecls-source.tsx');
-  } catch {
-    depthSafe = stripCommentsAndStrings(source, 'traitDecls-source.ts');
-  }
-  const out: TraitDecl[] = [];
-  const callRe = /registerTrait\(\{/g;
-  let m: RegExpExecArray | null;
-  while ((m = callRe.exec(source))) {
-    const openIdx = m.index + m[0].length - 1;
-    const body = balancedBraceSpan(source, depthSafe, openIdx);
-    if (!body) continue;
-    const bodyStart = openIdx + 1;
-    const depthSafeBody = depthSafe.slice(bodyStart, bodyStart + body.length);
-    const name = /name:\s*'([^']+)'/.exec(body)?.[1];
-    const category = /category:\s*'([^']+)'/.exec(body)?.[1];
-    if (!name || !category) continue;
-    let fieldsBody = '';
-    let depthSafeFieldsBody = '';
-    const fieldsIdx = body.indexOf('fields:');
-    if (fieldsIdx !== -1) {
-      const braceIdx = body.indexOf('{', fieldsIdx);
-      if (braceIdx !== -1) {
-        fieldsBody = balancedBraceSpan(body, depthSafeBody, braceIdx);
-        const fieldsBodyStart = braceIdx + 1;
-        depthSafeFieldsBody = depthSafeBody.slice(fieldsBodyStart, fieldsBodyStart + fieldsBody.length);
-      }
-    }
-    out.push({ name, category, fieldsBody, depthSafeFieldsBody });
-  }
-  traitDeclsCache.set(source, out);
-  return out;
+  return callsTo(parsedSource(source), 'registerTrait').flatMap((call) => {
+    const arg = call.arguments[0] && unwrapValue(call.arguments[0]);
+    if (!arg || !ts.isObjectLiteralExpression(arg)) return [];
+    const name = ownString(arg, 'name');
+    const category = ownString(arg, 'category');
+    if (!name || !category) return [];
+    const fields = propertyValue(arg, 'fields');
+    const lit = fields && ts.isExpression(fields) ? unwrapValue(fields) : undefined;
+    return [{ name, category, fields: lit && ts.isObjectLiteralExpression(lit) ? lit : undefined }];
+  });
 }
 
 /** Field `type`s `Inspector.tsx`'s `renderField`/`VecField` actually tag with a `data-ui-id` —
@@ -934,19 +901,21 @@ const INSPECTOR_TAGGED_FIELD_TYPES = new Set(['number', 'string', 'boolean']);
 export function traitFieldIds(source: string): string[] {
   const out: string[] = [];
   for (const d of traitDecls(source)) {
-    const entries = splitTopLevelItems(d.fieldsBody, d.depthSafeFieldsBody);
+    if (!d.fields) continue;
+    // Each field's OWN config literal, by key — its `showIf`/`options` nest their own `type:`/`key:`,
+    // which the entry regexes this replaced could read as the field's (#1241).
+    const configs = d.fields.properties.flatMap((p) => {
+      const key = p.name && (ts.isIdentifier(p.name) || ts.isStringLiteral(p.name)) ? p.name.text : undefined;
+      const value = ts.isPropertyAssignment(p) ? unwrapValue(p.initializer) : undefined;
+      return key && value && ts.isObjectLiteralExpression(value) ? [{ key, config: value }] : [];
+    });
     // A field claimed as ANOTHER field's alpha slider is never a standalone row, whatever ITS own
     // type is — collected first so the second pass can simply skip a claimed key.
-    const alphaTargets = new Set<string>();
-    for (const entry of entries) {
-      const af = /\balphaField:\s*'([\w$]+)'/.exec(entry)?.[1];
-      if (af) alphaTargets.add(af);
-    }
-    for (const entry of entries) {
-      const key = entryKey(entry);
-      if (!key || alphaTargets.has(key)) continue;
-      if (/\bhidden:\s*true\b/.test(entry)) continue;
-      const type = /\btype:\s*'([\w-]+)'/.exec(entry)?.[1];
+    const alphaTargets = new Set(configs.map((c) => ownString(c.config, 'alphaField')).filter(Boolean));
+    for (const { key, config } of configs) {
+      if (alphaTargets.has(key)) continue;
+      if (propertyValue(config, 'hidden')?.kind === ts.SyntaxKind.TrueKeyword) continue;
+      const type = ownString(config, 'type');
       if (!type || !INSPECTOR_TAGGED_FIELD_TYPES.has(type)) continue;
       out.push(`inspector.field.${d.name}.${key}`);
     }
@@ -1012,9 +981,14 @@ export function addComponentItemIds(source: string): string[] {
  * "fixing" this by switching to an import.
  */
 export function traitSubSectionIds(source: string): string[] {
+  if (!source.includes('<SubSection')) return [];
   const slug = (title: string) => title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
   const out = new Set<string>();
-  for (const m of source.matchAll(/<SubSection\s+title="([^"]+)"/g)) out.add(slug(m[1]));
+  // Any attribute position — the text regex required `title` to be the FIRST prop (#1241).
+  for (const el of jsxElements(parsedSource(source))) {
+    const title = el.tagName.getText() === 'SubSection' ? jsxStringAttr(el, 'title') : undefined;
+    if (title !== undefined) out.add(slug(title));
+  }
   return [...out].map((s) => `inspector.subsection.${s}`);
 }
 
@@ -1032,9 +1006,18 @@ export function traitSubSectionIds(source: string): string[] {
  */
 export function animationViewModeIds(source: string): string[] {
   if (!source.includes('animation.viewMode.')) return [];
-  const m = /\(\[([^\]]*)\]\s*as const\)\.map/.exec(source);
-  if (!m) return [];
-  return [...m[1].matchAll(/'([^']+)'/g)].map((mm) => `animation.viewMode.${mm[1]}`);
+  // The tuple whose OWN `.map` callback builds the id — not the first `(… as const).map` in the file
+  // (#1241). The gate above keeps other files out; inside this one, the callback decides.
+  return callsTo(parsedSource(source), 'map').flatMap((call) => {
+    const receiver = ts.isPropertyAccessExpression(call.expression) ? unwrapValue(call.expression.expression) : undefined;
+    const cb = call.arguments[0];
+    const builds = !!cb && findNodes(cb, ts.isTemplateExpression).some((t) => t.head.text === 'animation.viewMode.');
+    if (!builds || !receiver || !ts.isArrayLiteralExpression(receiver)) return [];
+    return receiver.elements.flatMap((e) => {
+      const v = stringValueOf(e);
+      return v === undefined ? [] : [`animation.viewMode.${v}`];
+    });
+  });
 }
 
 /**
@@ -1042,9 +1025,12 @@ export function animationViewModeIds(source: string): string[] {
  * `gizmoModes` array's `value` field, the same array the toolbar itself maps over.
  */
 export function sceneViewGizmoIds(source: string): string[] {
-  const m = /gizmoModes:\s*Array<[^>]*>\s*=\s*\[([\s\S]*?)\];/.exec(source);
-  if (!m) return [];
-  return [...m[1].matchAll(/value:\s*'([^']+)'/g)].map((mm) => `sceneView.toolbar.gizmo.${mm[1]}`);
+  if (!source.includes('gizmoModes')) return [];
+  const arr = moduleArray(parsedSource(source), 'gizmoModes');
+  return (arr ? arrayObjects(arr) : []).flatMap((o) => {
+    const v = ownString(o, 'value');
+    return v === undefined ? [] : [`sceneView.toolbar.gizmo.${v}`];
+  });
 }
 
 /**
@@ -1054,12 +1040,11 @@ export function sceneViewGizmoIds(source: string): string[] {
  * own read).
  */
 export function devicePickerDeviceIds(source: string): string[] {
-  const m = /DEVICE_PRESETS:\s*DevicePreset\[\]\s*=\s*\[([\s\S]*?)\n\];/.exec(source);
-  if (!m) return [];
-  const names = new Set<string>();
-  for (const mm of m[1].matchAll(/name:\s*'([^']+)'/g)) names.add(mm[1]);
-  const free = /FREE_PRESET[^=]*=\s*\{[^}]*name:\s*'([^']+)'/.exec(source)?.[1];
-  if (free) names.add(free);
+  if (!source.includes('DEVICE_PRESETS')) return [];
+  const arr = moduleArray(parsedSource(source), 'DEVICE_PRESETS');
+  // `FREE_PRESET` is an element by reference; `arrayObjects` resolves it to its own literal, where
+  // the text version needed a second regex for it (#1241).
+  const names = new Set((arr ? arrayObjects(arr) : []).map((o) => ownString(o, 'name')).filter((n): n is string => !!n));
   return [...names].map((n) => `gameView.devicePicker.device.${n}`);
 }
 
@@ -1068,11 +1053,13 @@ export function devicePickerDeviceIds(source: string): string[] {
  * `MODULES`' `key` and `OPTIONS`' `slug`, both module-level arrays in the same file.
  */
 export function moduleToggleIds(source: string): string[] {
-  const modules = /const MODULES:[^=]*=\s*\[([\s\S]*?)\n\];/.exec(source);
-  const options = /const OPTIONS:[^=]*=\s*\[([\s\S]*?)\n\];/.exec(source);
+  if (!source.includes('MODULES') || !source.includes('OPTIONS')) return [];
+  const sf = parsedSource(source);
+  const modules = moduleArray(sf, 'MODULES');
+  const options = moduleArray(sf, 'OPTIONS');
   if (!modules || !options) return [];
-  const keys = [...modules[1].matchAll(/key:\s*'([^']+)'/g)].map((mm) => mm[1]);
-  const slugs = [...options[1].matchAll(/slug:\s*'([^']+)'/g)].map((mm) => mm[1]);
+  const keys = arrayObjects(modules).map((o) => ownString(o, 'key')).filter((k): k is string => !!k);
+  const slugs = arrayObjects(options).map((o) => ownString(o, 'slug')).filter((k): k is string => !!k);
   const out: string[] = [];
   for (const key of keys) for (const slug of slugs) out.push(`module-toggles.${key}.${slug}`);
   return out;
@@ -1100,17 +1087,26 @@ export function qualityTierIds(sources: string[]): string[] {
   const modelSrc = sources.find((s) => s.includes('export const MATRIX_GROUPS'));
   if (!editorSrc || !modelSrc) return [];
 
-  const tierMatch = /const TIER_COLUMNS:[^=]*=\s*\[([^\]]*)\]/.exec(editorSrc);
-  const tiers = tierMatch ? [...tierMatch[1].matchAll(/'([^']+)'/g)].map((mm) => mm[1]) : [];
+  const editorSf = parsedSource(editorSrc);
+  const modelSf = parsedSource(modelSrc);
+  const tierArr = moduleArray(editorSf, 'TIER_COLUMNS');
+  const tiers = (tierArr?.elements ?? []).map((e) => stringValueOf(e)).filter((t): t is string => !!t);
 
-  const postfxMatch = /export const POSTFX_LABELS[^=]*=\s*\{([^}]*)\}/.exec(modelSrc);
-  const postfxFields = postfxMatch ? [...postfxMatch[1].matchAll(/(\w+):/g)].map((mm) => mm[1]) : [];
+  const postfxDecl = variablesNamed(modelSf, 'POSTFX_LABELS').filter((d) => enclosingFunction(d) === modelSf);
+  const postfxFields = postfxDecl.length === 1 ? objectLiteralKeys(postfxDecl[0]!.initializer) ?? [] : [];
 
+  // Each ROW's own `field` and `defaultPath` — a literal inside `MATRIX_GROUPS` holding both. The text
+  // version paired each `field:` with the NEXT `defaultPath:` anywhere after it, so a row missing its
+  // own took the following row's (#1241).
+  const groups = variablesNamed(modelSf, 'MATRIX_GROUPS').filter((d) => enclosingFunction(d) === modelSf);
   const rowFields: string[] = [];
   const defaultableFields: string[] = [];
-  for (const m of modelSrc.matchAll(/field:\s*'([\w-]+)'[\s\S]*?defaultPath:\s*(null|'[^']*')/g)) {
-    rowFields.push(m[1]);
-    if (m[2] !== 'null') defaultableFields.push(m[1]);
+  for (const row of groups.length === 1 ? findNodes(groups[0]!, ts.isObjectLiteralExpression) : []) {
+    const field = ownString(row, 'field');
+    const defaultPath = propertyValue(row, 'defaultPath');
+    if (field === undefined || !defaultPath) continue;
+    rowFields.push(field);
+    if (defaultPath.kind !== ts.SyntaxKind.NullKeyword) defaultableFields.push(field);
   }
   const allFields = [...new Set([...rowFields, ...postfxFields])];
 
@@ -1133,7 +1129,7 @@ const PROJECT_SETTINGS_UNTAGGED_CONTROL_KINDS = new Set([
 /**
  * `projectSettings.${field.key}` (`ProjectSettingsDialog.tsx`'s `FieldControl`) — derived from
  * every field object's OWN top-level `key`/`type` in `engine/app/editor/setup.ts`'s `fields: [...]`
- * arrays (brace/bracket-depth aware — see the note above `balancedBraceSpan`: a `showIf`/
+ * arrays (read as nodes — see the note above `parsedSource`: a `showIf`/
  * `disabledIf` guard nests its OWN `{ key: '…' }` pointing at ANOTHER field, and reading only each
  * array item's TOP-LEVEL key/type is what keeps that nested key from borrowing the outer field's
  * type, or vice versa).
@@ -1165,20 +1161,16 @@ const PROJECT_SETTINGS_UNTAGGED_CONTROL_KINDS = new Set([
  */
 export function projectSettingsFieldIds(source: string): string[] {
   if (!source.includes("key: 'app.appName'")) return [];
-  const depthSafe = stripCommentsAndStrings(source, 'setup.ts');
   const out = new Set<string>();
-  const fieldsRe = /fields:\s*\[/g;
-  let m: RegExpExecArray | null;
-  while ((m = fieldsRe.exec(source))) {
-    const openIdx = m.index + m[0].length - 1;
-    const arrayBody = balancedBracketSpan(source, depthSafe, openIdx);
-    if (!arrayBody) continue;
-    const bodyStart = openIdx + 1;
-    const depthSafeArrayBody = depthSafe.slice(bodyStart, bodyStart + arrayBody.length);
-    for (const entry of splitTopLevelItems(arrayBody, depthSafeArrayBody)) {
-      const key = /\bkey:\s*'([\w.]+)'/.exec(entry)?.[1];
+  const arrays = findNodes(parsedSource(source), (n): n is ts.PropertyAssignment => ts.isPropertyAssignment(n)
+    && n.name.getText() === 'fields' && ts.isArrayLiteralExpression(unwrapValue(n.initializer)));
+  for (const prop of arrays) {
+    for (const entry of arrayObjects(unwrapValue(prop.initializer) as ts.ArrayLiteralExpression)) {
+      // The entry's OWN key and type — a `showIf`/`disabledIf` guard nests its own `{ key: '…' }`
+      // pointing at ANOTHER field.
+      const key = ownString(entry, 'key');
       if (!key) continue;
-      const type = /\btype:\s*'([\w-]+)'/.exec(entry)?.[1];
+      const type = ownString(entry, 'type');
       if (type && PROJECT_SETTINGS_UNTAGGED_CONTROL_KINDS.has(type)) continue;
       const uiId = `projectSettings.${key}`;
       out.add(uiId);
@@ -1227,8 +1219,12 @@ export function projectSettingsFieldIds(source: string): string[] {
 export function contextMenuItemIds(source: string): string[] {
   if (!source.includes('ContextMenuItem')) return [];
   const out = new Set<string>();
-  for (const m of source.matchAll(/\{\s*label:\s*'([^']+)'[^}]*?(?:onClick|children)\s*:/g)) {
-    out.add(m[1]);
+  // An object whose OWN members are a static `label` and an `onClick` or `children` — in any order;
+  // the text needed `label` first and the other key before the object's first `}` (#1241).
+  for (const o of findNodes(parsedSource(source), ts.isObjectLiteralExpression)) {
+    const keys = objectLiteralKeys(o) ?? [];
+    const label = ownString(o, 'label');
+    if (label !== undefined && (keys.includes('onClick') || keys.includes('children'))) out.add(label);
   }
   return [...out].map((label) => `contextmenu.item.${label}`);
 }
@@ -1780,12 +1776,12 @@ describe('qa case guard helpers', () => {
     });
 
     it('inspector.subsection — from a literal <SubSection title> call site', () => {
-      expect(traitSubSectionIds('<SubSection title="Advanced" defaultOpen={x}>')).toEqual([
+      expect(traitSubSectionIds('const a = <SubSection title="Advanced" defaultOpen={x}>{c}</SubSection>;')).toEqual([
         'inspector.subsection.advanced',
       ]);
       // A dynamic call (`<SubSection title={sectionName}>`, Inspector.tsx's own) has no static
       // value — correctly derives nothing rather than guessing.
-      expect(traitSubSectionIds('<SubSection title={sectionName} defaultOpen={x}>')).toEqual([]);
+      expect(traitSubSectionIds('const a = <SubSection title={sectionName} defaultOpen={x}>{c}</SubSection>;')).toEqual([]);
     });
 
     /**
@@ -1967,6 +1963,77 @@ describe('qa case guard helpers', () => {
       // The citation-side regex must extract the id WHOLE (trailing `"` included), not truncated.
       const cited = [...`data-ui-id='gameView.devicePicker.device.iPad Pro 11"'`.matchAll(CITED_UI_ID_RE)];
       expect(cited[0]?.[1] ?? cited[0]?.[3]).toBe('gameView.devicePicker.device.iPad Pro 11"');
+    });
+
+    /**
+     * #1241: each deriver reads nodes, and each row below is a shape its TEXT version misread —
+     * observed on the replaced readers before the switch. A nested literal answering for its parent,
+     * a closer or a `>` inside a string, a declaration spelled without the annotation the regex
+     * required, a member in an order the regex did not expect.
+     */
+    it('reads each literal by its own members, whatever it nests or holds in a string (#1241)', () => {
+      const traits = [
+        "registerTrait({ meta: { name: 'Other' }, name: 'T', category: 'component', fields: {",
+        "  mode: { showIf: { key: 'x', type: 'number' }, type: 'enum' },",
+        "  size: { type: 'number', tooltip: 'a (b', ui: { hidden: true } },",
+        "  'quoted-key': { type: 'boolean' },",
+        '} });',
+      ].join('\n');
+      expect(traitFieldIds(traits)).toEqual(['inspector.field.T.size', 'inspector.field.T.quoted-key']);
+      expect(addComponentItemIds(traits)).toEqual(['inspector.addComponent.item.T']);
+      // A registry that only parses as TS (a `<T>x` cast reads as JSX to the TSX parser).
+      expect(addComponentItemIds("const t = <Trait>x;\nregisterTrait({ name: 'Cast', category: 'component' });"))
+        .toEqual(['inspector.addComponent.item.Cast']);
+
+      expect(projectSettingsFieldIds([
+        "const s = { fields: [{ showIf: { key: 'other.key', type: 'path' }, key: 'app.appName', type: 'text' }] };",
+      ].join('\n'))).toEqual(['projectSettings.app.appName']);
+
+      expect(devicePickerDeviceIds([
+        "const FREE_PRESET = { id: 'x', meta: { name: 'Inner' }, name: 'Free' };",
+        "export const DEVICE_PRESETS = [FREE_PRESET, { name: 'Pixel', note: '];' }, { name: 'iPad' }];",
+      ].join('\n')).sort()).toEqual(['Free', 'Pixel', 'iPad'].map((n) => `gameView.devicePicker.device.${n}`));
+
+      expect(moduleToggleIds([
+        "const MODULES = [{ key: 'audio', note: { key: 'nested' } }] as const;",
+        "const OPTIONS = [{ slug: 'on' }];",
+      ].join('\n'))).toEqual(['module-toggles.audio.on']);
+
+      expect(sceneViewGizmoIds([
+        "const gizmoModes: Array<{ value: string; tip: string }> = [{ value: 'a', tip: 'x];' }, { value: 'b', tip: '' }];",
+        "function preview() { const gizmoModes = [{ value: 'local' }]; return gizmoModes; }",
+      ].join('\n'))).toEqual(['sceneView.toolbar.gizmo.a', 'sceneView.toolbar.gizmo.b']);
+
+      expect(animationViewModeIds([
+        "const other = (['show3D'] as const).map((k) => k);",
+        'const tabs = ([\'dopesheet\', \'curves\'] as const).map((m) => <b data-ui-id={`animation.viewMode.${m}`} />);',
+      ].join('\n'))).toEqual(['animation.viewMode.dopesheet', 'animation.viewMode.curves']);
+
+      expect(contextMenuItemIds("const items: ContextMenuItem[] = [{ onClick: f, label: 'Paste' }, { label: 'Undo', undo: g }];"))
+        .toEqual(['contextmenu.item.Paste']);
+
+      expect(particleFieldIds([
+        'const p = <SectionIdContext.Provider value={x}><Section title="Emission">',
+        '  <Num on={(v) => set(v)} label="Rate / sec" />',
+        '  <Tooltip label="Not a field" />',
+        '</Section></SectionIdContext.Provider>;',
+      ].join('\n'))).toEqual(['particle.emission.rate-sec']);
+
+      expect(traitSubSectionIds('const a = <SubSection defaultOpen title="Advanced">{c}</SubSection>;'))
+        .toEqual(['inspector.subsection.advanced']);
+
+      const quality = qualityTierIds([
+        "const TIER_COLUMNS: string[] = ['low', 'mid'];",
+        [
+          "export const MATRIX_GROUPS = [{ rows: [{ field: 'noDefault' }, { field: 'cap', defaultPath: 'a.b' }] }];",
+          "export const POSTFX_LABELS = { bloom: 'Bloom', nested: { inner: 1 } };",
+        ].join('\n'),
+      ]);
+      // A row without its own `defaultPath` is not a row; the text paired it with the next row's.
+      expect(quality).not.toContain('quality-tiers.field.low.noDefault');
+      expect(quality).toContain('quality-tiers.field.default.cap');
+      expect(quality).toContain('quality-tiers.field.mid.nested');
+      expect(quality).not.toContain('quality-tiers.field.mid.inner');
     });
 
     it('an under-deriving family goes RED rather than silently passing (rule 1)', () => {

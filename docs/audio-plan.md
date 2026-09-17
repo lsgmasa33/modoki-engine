@@ -172,12 +172,32 @@ Commits `25f3b2f` + `633abcf` (review fixes).
   kept playing the pre-conversion buffer until an editor restart. The batch/agent re-import
   paths did not call it at all. Both fixed in #304's close-out; the chain and the shared
   event behind it are in [editor.md](editor.md) § "The asset Inspector" (rule 3, the preview keyed on the PATH).
+- **…and the eviction refills an OWNED buffer clip itself (#1361).** `getCachedAudioBuffer` is
+  read-only — the audio system treats a miss as "not decoded yet" and waits — and the only other
+  refill, `retryFailedAudioDecodes`, runs from `audioService.resume()` on the next pointer, key or
+  visibility event. So after any re-import, new plays of that clip were silent until a click, or
+  until a scene reload when an agent drove the re-import with no input at all (reproduced live on
+  `games/audio-demo`: owned, uncached 3 s later). `invalidateAudio` now re-fetches when a scene owns
+  the clip and the manifest says `buffer`; an unowned clip stays evicted, since no
+  `releaseAudioForScene` would ever drop a refilled row. Same shape as the prefab refill in
+  [prefabs.md](prefabs.md) (#1308). **The refetch is only right because the manifest update
+  arrives FIRST**: `servedAudioUrl` builds the `?v=<hash>` from it and the load type is read from
+  it. `/api/reimport` broadcasts its rebuilt manifest before sending `invalidate-assets` on the
+  same channel, and the Inspector and Assets-panel callers run only after that route has replied.
+  Observed live: the invalidation saw the new hash, which the entry lacked before the re-import.
+  A caller that invalidates BEFORE the manifest moves would re-cache the old variant — which is
+  what `device_invalidate_assets` does, since a device gets no manifest push; it refetches the
+  old `?v=`, the same URL the input-driven retry used before. The editor paths invalidate TWICE
+  per re-import (the route's op, then the panel's own call), so the clip decodes twice and is
+  briefly uncached in between — `audioSystem` retries a play on the next frame, so nothing is
+  dropped. A settling load removes only its OWN in-flight entry, or the superseded load would
+  delete the refill's entry and let the next acquire start a third fetch.
 
 - **Pipeline parity with textures** — the scanner bakes the `audio` block (loadType
   always; format+ext once converted) into the manifest, serves the `~audio.<ext>`
   variant (dev on-demand self-heal in `staticAssets.ts` + build drop-source), and
-  the runtime resolver (`servedAudioUrl`) targets it with a **prod-only** `?v=<hash>`
-  cache-bust (`withCacheBust`). Buffer decode AND streaming both resolve through it,
+  the runtime resolver (`servedAudioUrl`) targets it with a `?v=<hash>` cache-bust
+  (`withCacheBust`; prod-only until #1022, now in dev too). Buffer decode AND streaming both resolve through it,
   so a dropped-source prod build still loads. The strict conversion-fallback gate +
   dist-file verifier cover audio (an ffmpeg failure fails the build unless
   `MODOKI_ALLOW_ASSET_FALLBACK=1`, which then correctly ships + advertises source).

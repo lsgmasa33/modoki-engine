@@ -76,7 +76,10 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
-import { accessPath, callsTo, enclosingFunction, importsIn, parseSource, readsOf, ts } from '@modoki/engine/testing/sourceAst';
+import {
+  accessPath, calleeName, callsTo, declarationOf, enclosingFunction, findNodes, importsIn, parseSource,
+  propertyValue, readsOf, stringValueOf, unwrapValue, variablesNamed, ts,
+} from '@modoki/engine/testing/sourceAst';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const REPO = path.resolve(__dirname, '../../..');
@@ -173,27 +176,21 @@ function moduleKey(rel: string): string {
   return rel.replace(/\.tsx?$/, '');
 }
 
-/**
- * The text between the parenthesis at `open` and its match. Strings are NOT blanked by the scanner
- * (only comments are), so an unmatched paren inside a string literal can truncate the slice —
- * measured as needing TWO or more before it bites, and no world-mock factory in the repo has that.
- * Capped so a pathological file cannot hang the run; the largest real factory is ~1.1 KB.
- */
-function balanced(src: string, open: number): string {
-  let depth = 0;
-  const limit = Math.min(src.length, open + 8000);
-  for (let i = open; i < limit; i++) {
-    if (src[i] === '(') depth++;
-    else if (src[i] === ')') {
-      depth--;
-      if (depth === 0) return src.slice(open + 1, i);
-    }
-  }
-  return src.slice(open + 1, limit);
+/** A `vi.<name>(…)` call — not `server.mock(…)`, not a bare `mock(…)`. */
+const onVi = (call: ts.CallExpression): boolean =>
+  ts.isPropertyAccessExpression(call.expression) && accessPath(call.expression.expression) === 'vi';
+
+/** A function-like node a mock can hand over as a value: an arrow, a function expression, or an
+ *  object-literal method (`onWorldSwap(fn) { … }`). */
+type HandlerFn = ts.ArrowFunction | ts.FunctionExpression | ts.MethodDeclaration;
+
+function asHandlerFn(n: ts.Node | undefined): HandlerFn | undefined {
+  const u = n && ts.isExpression(n) ? unwrapValue(n) : n;
+  return u && (ts.isArrowFunction(u) || ts.isFunctionExpression(u) || ts.isMethodDeclaration(u)) ? u : undefined;
 }
 
 /**
- * Does this `onWorldSwap:` value CAPTURE the handler it is given, so a test can invoke it?
+ * Does this `onWorldSwap` value CAPTURE the handler it is given, so a test can invoke it?
  *
  * ⚠️ **A parameter is not a capture — it must be USED.** `(_fn) => () => {}` declares a parameter
  * and drops it on the floor, which is a no-op wearing a capture's signature. An earlier version
@@ -202,100 +199,65 @@ function balanced(src: string, open: number): string {
  * `(...args) => () => {}` as capturing — and the guard's own failure message hands the reader that
  * exact signature, so writing it and forgetting the body was the cheapest way to silence it.
  *
+ * ⚠️ **Used means a READ OF THAT BINDING inside the function's own body (#1241).** The text version
+ * had to bound the body by hand — a brace count, or "to the first top-level comma" for a concise
+ * arrow — because the body used to run on to the end of the mock factory, and a SIBLING key
+ * mentioning the name (`getCurrentWorld: vi.fn()` beside an ignored `fn`) satisfied the check. The
+ * node's body is the body, and `readsOf` resolves by symbol, so neither a sibling's `vi.fn` nor a
+ * sibling's own `fn` parameter can vouch.
+ *
  * `null` is an unrecognised shape (commonly a shorthand referencing a variable declared above).
  * Read as NOT capturing: a guard that cannot parse its subject must fail loud, not assume the safe
- * answer.
+ * answer. A destructured parameter names nothing this can check, so it is not credited either.
  */
-/** Content between the brace at `open` and its match. */
-function balancedBraces(src: string, open: number): string {
-  let depth = 0;
-  const limit = Math.min(src.length, open + 8000);
-  for (let i = open; i < limit; i++) {
-    if (src[i] === '{') depth++;
-    else if (src[i] === '}') { depth--; if (depth === 0) return src.slice(open + 1, i); }
+function capturesHandler(value: ts.Node): boolean | null {
+  let fnNode = asHandlerFn(value);
+  const u = ts.isExpression(value) ? unwrapValue(value) : value;
+  if (!fnNode && ts.isCallExpression(u) && onVi(u) && calleeName(u) === 'fn') {
+    if (u.arguments.length === 0) return false; // `vi.fn()` — no handler at all
+    fnNode = asHandlerFn(u.arguments[0]);
   }
-  return src.slice(open + 1, limit);
+  if (!fnNode || !fnNode.body) return null;
+  const body = fnNode.body;
+  return fnNode.parameters.some((p) => ts.isIdentifier(p.name)
+    && readsOf(p.name).some((r) => ts.findAncestor(r, (n) => n === body) !== undefined));
 }
 
-/** Split a parameter list on TOP-LEVEL commas, so `(a: Map<X, Y>, b)` is two params, not three. */
-function splitTopLevel(params: string): string[] {
-  const out: string[] = [];
-  let depth = 0, last = 0;
-  for (let i = 0; i < params.length; i++) {
-    const c = params[i];
-    if (c === '(' || c === '[' || c === '{' || c === '<') depth++;
-    else if (c === ')' || c === ']' || c === '}' || c === '>') depth--;
-    else if (c === ',' && depth === 0) { out.push(params.slice(last, i)); last = i + 1; }
-  }
-  out.push(params.slice(last));
-  return out;
+/** `capturesHandler` over an `onWorldSwap:` value written as source — the fixtures' way in, through
+ *  the real reader. `rest` is the value plus whatever follows it in the factory literal. */
+function capturesHandlerText(rest: string): boolean | null {
+  const sf = parseSource(`const factoryResult = { onWorldSwap: ${rest} };`, 'fixture.ts');
+  const lit = variablesNamed(sf, 'factoryResult')[0]!.initializer;
+  const value = propertyValue(lit, 'onWorldSwap');
+  if (!value) throw new Error(`capturesHandlerText: no onWorldSwap in the fixture '${rest}'`);
+  return capturesHandler(value);
 }
 
-/**
- * A function's OWN body — never the rest of the object literal it sits in.
- *
- * ⚠️ This bound is the whole point. The body used to be `factory.slice(afterTheKey)`, i.e.
- * everything to the end of the mock factory, so a SIBLING key mentioning the parameter's name
- * satisfied the "is the parameter used?" check. Combined with `\b`, the `fn` inside the repo's
- * commonest sibling — `getCurrentWorld: vi.fn()` — made `onWorldSwap: (fn) => () => {}` read as a
- * capture. That is the same trap the parameter check was written to close, one layer down.
- */
-function ownBody(rest: string): string {
-  const lead = rest.length - rest.replace(/^\s*/, '').length;
-  if (rest[lead] === '{') return balancedBraces(rest, lead);
-  // Concise body: to the first TOP-LEVEL comma — the next property of the mock factory.
-  const s = rest.slice(lead);
-  let depth = 0;
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i];
-    if (c === '(' || c === '[' || c === '{') depth++;
-    else if (c === ')' || c === ']' || c === '}') { if (depth === 0) return s.slice(0, i); depth--; }
-    else if (c === ',' && depth === 0) return s.slice(0, i);
-  }
-  return s;
+/** The object literal(s) a mock factory RETURNS — a concise `() => ({ … })`, or every `return` of a
+ *  block body that belongs to the factory itself. A return that is not a literal comes back as
+ *  `undefined`, which the caller reads as unreadable. */
+function factoryResults(factory: HandlerFn): Array<ts.ObjectLiteralExpression | undefined> {
+  const body = factory.body;
+  if (!body) return [undefined];
+  const returned = ts.isBlock(body)
+    ? findNodes(body, ts.isReturnStatement).filter((r) => enclosingFunction(r) === factory).map((r) => r.expression)
+    : [body];
+  if (returned.length === 0) return [undefined];
+  return returned.map((r) => {
+    const lit = r && unwrapValue(r);
+    return lit && ts.isObjectLiteralExpression(lit) ? lit : undefined;
+  });
 }
 
-function capturesHandler(expr: string): boolean | null {
-  let e = expr.trim().replace(/^async\s+/, '');
-
-  const viFn = /^vi\.fn\s*\(/.exec(e);
-  if (viFn) {
-    const inner = balanced(e, viFn[0].length - 1).trim();
-    if (inner === '') return false; // `vi.fn()` — no handler at all
-    e = inner.replace(/^async\s+/, '');
-  }
-
-  const usesParam = (params: string, body: string): boolean => {
-    // `(?:\.\.\.)?` — an OPTIONAL rest prefix. Written `\.{3}?` once, which is exactly-three-dots
-    // (lazily), so every plain `(fn)` failed to match, names came back empty, and every capturing
-    // mock in the repo was read as a no-op. The guard flagged selectionRestore.test.ts, which is
-    // the file it points people at as the reference for capturing correctly.
-    const names = splitTopLevel(params)
-      .map((p) => /^\s*(?:\.\.\.)?\s*([A-Za-z_$][\w$]*)/.exec(p)?.[1])
-      .filter((n): n is string => Boolean(n));
-    if (names.length === 0) return false; // destructured or empty — nothing nameable to credit
-    // ⚠️ `(?<![.\w$])` excludes a PROPERTY ACCESS, so `vi.fn(` no longer satisfies a parameter
-    // named `fn`. See ownBody above for the other half of that same defect.
-    return names.some((n) => new RegExp(`(?<![.\\w$])${n}(?![\\w$])`).test(body));
-  };
-
-  // Arrow with a parenthesised parameter list. `balanced` rather than `[^)]*`, so a parameter
-  // carrying its own parens — `(fn: (a: A, b: B) => void)` — is read instead of falling through.
-  if (e.startsWith('(')) {
-    const params = balanced(e, 0);
-    const after = e.slice(params.length + 2);
-    const arrow = /^\s*(?::[^=]*?)?=>/.exec(after);
-    if (arrow) return usesParam(params, ownBody(after.slice(arrow[0].length)));
-  }
-  let m = /^([A-Za-z_$][\w$]*)\s*=>/.exec(e);
-  if (m) return usesParam(m[1], ownBody(e.slice(m[0].length)));
-  m = /^function\b[^(]*\(/.exec(e);
-  if (m) {
-    const params = balanced(e, m[0].length - 1);
-    return usesParam(params, ownBody(e.slice(m[0].length + params.length + 1)));
-  }
-
-  return null;
+/** Whether a mock factory loads the ORIGINAL module — calls its own first parameter
+ *  (`importOriginal`, whatever it is named) or `vi.importActual` in its own body. The same reading
+ *  `originalsLoaded` uses to credit a partial mock with reaching the producer. */
+function loadsOriginal(factory: HandlerFn): boolean {
+  const loader = factory.parameters[0]?.name;
+  const own = (n: ts.Node) => enclosingFunction(n) === factory;
+  if (loader && ts.isIdentifier(loader) && readsOf(loader).some((r) => ts.isCallExpression(r.parent)
+    && r.parent.expression === r && own(r.parent))) return true;
+  return !!factory.body && callsTo(factory.body, 'importActual').some((c) => onVi(c) && own(c));
 }
 
 /** Module specifiers the file reaches for — static, re-exported and dynamic, plus the ORIGINAL a mock
@@ -326,8 +288,6 @@ function importedSpecifiers(testRel: string, code: string): string[] {
 
 function originalsLoaded(sf: ts.SourceFile): string[] {
   const out: string[] = [];
-  const onVi = (call: ts.CallExpression): boolean =>
-    ts.isPropertyAccessExpression(call.expression) && accessPath(call.expression.expression) === 'vi';
   for (const call of callsTo(sf, 'importActual').filter(onVi)) {
     const arg = call.arguments[0];
     if (arg && ts.isStringLiteralLike(arg)) out.push(arg.text);
@@ -367,32 +327,91 @@ function importedModules(testRel: string, code: string): Set<string> {
  *      registration throws or no-ops depending on the call site.
  *
  * A factory spreading `importOriginal()` is a PARTIAL mock — the real `onWorldSwap` and the real
- * listener Set survive — so it is never a swallow.
+ * listener Set survive — so it is not a swallow UNLESS a key written after the spread replaces
+ * `onWorldSwap` with something that does not capture. This used to say "never", and a fixture below
+ * pinned `{ ...(await importOriginal()), onWorldSwap: vi.fn() }` as clean: that override drops the
+ * registration exactly like a wholesale no-op (#1241 close-out review).
  */
-function swallowsWorldSwap(code: string): boolean {
-  const calls = [...code.matchAll(/\bvi\.(?:do)?[Mm]ock\s*\(\s*['"]([^'"]+)['"]\s*,/g)];
-  for (const call of calls) {
-    if (!WORLD_MODULE.test(call[1].replace(/\.tsx?$/, ''))) continue;
+/** Whether the member holding `value` comes after the literal's last spread — so it, not the spread
+ *  original, is what the module exports. */
+function overridesSpread(lit: ts.ObjectLiteralExpression, value: ts.Node): boolean {
+  const at = lit.properties.findIndex((p) => p === value || p === value.parent);
+  const lastSpread = lit.properties.map((p) => ts.isSpreadAssignment(p)).lastIndexOf(true);
+  return at > lastSpread;
+}
 
-    const openParen = code.indexOf('(', call.index!);
-    const factory = balanced(code, openParen);
-    if (/importOriginal/.test(factory)) continue;
+/**
+ * Whether `e` IS the module the factory loaded: `await <loader>()` / `await vi.importActual(…)`, or a
+ * `const` bound to one, resolved by symbol. An allowlist of the known-safe shapes (#1241 close-out,
+ * third review): trusting any spread, or any `x.onWorldSwap`, credited a hoisted spy object
+ * (`mocks.onWorldSwap`) and a spread of stubs as "the original survives".
+ */
+function isLoadedOriginal(e: ts.Expression, factory: HandlerFn): boolean {
+  const u = unwrapValue(e);
+  if (ts.isCallExpression(u)) {
+    if (onVi(u) && calleeName(u) === 'importActual') return true;
+    const loader = factory.parameters[0]?.name;
+    const callee = unwrapValue(u.expression);
+    return !!loader && ts.isIdentifier(loader) && ts.isIdentifier(callee) && declarationOf(callee) === loader.parent;
+  }
+  if (!ts.isIdentifier(u)) return false;
+  const d = declarationOf(u);
+  return !!d && ts.isVariableDeclaration(d) && ts.isIdentifier(d.name) && !!d.initializer
+    && enclosingFunction(d) === factory && isLoadedOriginal(d.initializer, factory);
+}
 
-    const withValue = /\bonWorldSwap\s*:/.exec(factory);
-    if (withValue) {
-      if (capturesHandler(factory.slice(withValue.index + withValue[0].length)) !== true) return true;
-      continue;
+/** A value that hands the ORIGINAL `onWorldSwap` on: `<original>.onWorldSwap`, or
+ *  `vi.fn(<original>.onWorldSwap)` — a spy over the real function still registers. */
+function passesOriginal(value: ts.Node, factory: HandlerFn): boolean {
+  if (!ts.isExpression(value)) return false;
+  const u = unwrapValue(value);
+  const inner = ts.isCallExpression(u) && onVi(u) && calleeName(u) === 'fn' && u.arguments[0] ? unwrapValue(u.arguments[0]) : u;
+  if (ts.isPropertyAccessExpression(inner) && inner.name.text === 'onWorldSwap') return isLoadedOriginal(inner.expression, factory);
+  return ts.isElementAccessExpression(inner) && stringValueOf(inner.argumentExpression) === 'onWorldSwap'
+    && isLoadedOriginal(inner.expression, factory);
+}
+
+function swallowsWorldSwap(code: string, label = 'fixture.test.ts'): boolean {
+  const sf = parseSource(code, label);
+  for (const call of callsTo(sf, 'mock', 'doMock').filter(onVi)) {
+    const [target, factoryArg] = call.arguments;
+    if (!target || !ts.isStringLiteralLike(target) || !WORLD_MODULE.test(target.text.replace(/\.tsx?$/, ''))) continue;
+    // `vi.mock(world)` with no factory AUTOMOCKS: every export, `onWorldSwap` included, becomes a
+    // bare `vi.fn()`. The text version required a `,` after the target and skipped it (#1241).
+    if (!factoryArg) return true;
+    const factory = asHandlerFn(factoryArg);
+    if (!factory) return true; // a factory held in a variable — unreadable, so not credited
+    const partial = loadsOriginal(factory);
+    for (const result of factoryResults(factory)) {
+      const value = result && propertyValue(result, 'onWorldSwap');
+      if (partial) {
+        // A PARTIAL mock keeps the real `onWorldSwap` only through what it returns (#1241 close-out
+        // reviews): a return this cannot read is not credited; every spread must BE the loaded
+        // original (a spread of anything else is unreadable); a literal with no such spread drops the
+        // key; and a key written AFTER the last spread replaces the original — so that value must
+        // capture, or hand the original on (`vi.fn(actual.onWorldSwap)`, `actual.onWorldSwap`).
+        if (!result) return true;
+        const spreads = result.properties.filter(ts.isSpreadAssignment);
+        if (spreads.length === 0 || spreads.some((sp) => !isLoadedOriginal(sp.expression, factory))) return true;
+        if (!value) continue;
+        if (overridesSpread(result, value) && capturesHandler(value) !== true && !passesOriginal(value, factory)) return true;
+        continue;
+      }
+      // Absent, a shorthand, or a value this cannot read — none of them is a capture.
+      if (!value || capturesHandler(value) !== true) return true;
     }
-    return true; // shorthand, or the key is absent entirely
   }
   return false;
 }
 
 const PRODUCERS = new Map<string, string>(); // moduleKey -> rel
 for (const f of scannedFiles(PRODUCER_ROOTS, (rel) => !IS_TEST.test(rel), 400)) {
-  // `worldRegistry.ts` DEFINES `onWorldSwap`; it does not register a teardown with it.
-  if (!/\bonWorldSwap\s*\(/.test(f.code)) continue;
-  if (/\bexport function onWorldSwap\s*\(/.test(f.code)) continue;
+  if (!f.code.includes('onWorldSwap')) continue; // a cheap pre-filter; the parse decides
+  const sf = parseSource(f.code, f.rel);
+  // A CALL, so `worldRegistry.ts`, which DEFINES `onWorldSwap` and never calls it, is not a producer.
+  // (The text version needed a second `export function onWorldSwap(` test for that; a declaration
+  // is not a call. Mutation-checked: re-adding a definer exclusion changes nothing.)
+  if (callsTo(sf, 'onWorldSwap').length === 0) continue;
   PRODUCERS.set(moduleKey(f.rel), f.rel);
 }
 
@@ -401,7 +420,7 @@ const TEST_BY_REL = new Map(TESTS.map((t) => [t.rel, t]));
 
 const SWALLOWED = new Map<string, string[]>(); // producer rel -> test files that swallow it
 for (const t of TESTS) {
-  if (!swallowsWorldSwap(t.code)) continue;
+  if (!swallowsWorldSwap(t.code, t.rel)) continue;
   for (const k of importedModules(t.rel, t.code)) {
     const p = PRODUCERS.get(k);
     if (!p) continue;
@@ -442,11 +461,12 @@ describe('importedSpecifiers — what counts as reaching a producer (#1193)', ()
  * capturing signature, so declaring the parameter and forgetting the body is the cheapest way to
  * silence it.
  *
- * ⚠️ **Each string carries a trailing sibling key, because that is what the parser is really fed.**
- * Production passes `factory.slice(afterTheKey)`, which runs to the end of the mock factory, not to
- * the end of the arrow. A table of bare expressions is green over exactly the bug that shipped:
+ * ⚠️ **Each string carries a trailing sibling key**, because that is the bug that shipped: the text
+ * reader was fed `factory.slice(afterTheKey)`, which ran to the end of the mock factory, and
  * `getCurrentWorld: vi.fn()` sitting after an ignored `fn` parameter satisfied the reference check
- * via the `fn` inside `vi.fn(`.
+ * via the `fn` inside `vi.fn(`. The reader takes the value's NODE since #1241
+ * (`capturesHandlerText` parses each row inside a factory literal), and the siblings stay so a
+ * regression to a text extent is caught by the rows that caught it the first time.
  */
 describe('capturesHandler — the shapes a review caught it misreading', () => {
   const SIB = ' getCurrentWorld: vi.fn(), findEntityById: vi.fn(),';
@@ -462,6 +482,10 @@ describe('capturesHandler — the shapes a review caught it misreading', () => {
     ['ignored parameter, block body, sibling mentions the name', `(fn) => { return () => {}; }, wake: (fn: X) => fn(),`],
     ['function keyword, parameter ignored', `function (fn) { return () => {}; },${SIB}`],
     ['ignored parameter with a parenthesised type', `(fn: (a: A, b: B) => void) => () => {},${SIB}`],
+    // #1241: a string holding a paren or a brace moved every text edge; a shadowing inner `fn` is
+    // not the handler.
+    ['ignored parameter, string paren in the body', `(fn) => { log(')'); return () => {}; },${SIB}`],
+    ['inner function shadows the parameter', `(fn) => { const off = (fn) => fn; return off; },${SIB}`],
   ];
 
   const CAPTURES: Array<[string, string]> = [
@@ -473,24 +497,27 @@ describe('capturesHandler — the shapes a review caught it misreading', () => {
     ['function keyword that captures', `function (fn) { listener = fn; return () => {}; },${SIB}`],
     ['parenthesised type, parameter used', `(fn: (a: A, b: B) => void) => { listener = fn; },${SIB}`],
     ['default parameter, used', `(fn = noop) => { listener = fn; },${SIB}`],
+    // #1241: the text body ended at the `}` inside the string, before the capture.
+    ['captures after a string brace', `(fn) => { log('}'); listener = fn; },${SIB}`],
+    ['concise body that stores it', `(fn) => void registered.push(fn),${SIB}`],
   ];
 
   it.each(NO_OP)('reads %s as NOT capturing — the handler is dropped', (_label, expr) => {
-    expect(capturesHandler(expr)).not.toBe(true);
+    expect(capturesHandlerText(expr)).not.toBe(true);
   });
 
   it.each(CAPTURES)('reads %s as capturing — a test can invoke the real handler', (_label, expr) => {
-    expect(capturesHandler(expr)).toBe(true);
+    expect(capturesHandlerText(expr)).toBe(true);
   });
 
   it('an unrecognised shape is NOT read as capturing (fail loud, never assume the safe answer)', () => {
     // A property shorthand referencing a variable declared above the mock — focusManager.test.ts's
     // shape. The value cannot be read from the factory, so it must not be credited.
-    expect(capturesHandler('someHandlerDeclaredAbove,')).not.toBe(true);
+    expect(capturesHandlerText('someHandlerDeclaredAbove,')).not.toBe(true);
   });
 
   it('a destructured parameter is not credited (it names nothing this can check)', () => {
-    expect(capturesHandler(`({ fn }) => () => {},${SIB}`)).not.toBe(true);
+    expect(capturesHandlerText(`({ fn }) => () => {},${SIB}`)).not.toBe(true);
   });
 });
 
@@ -530,10 +557,61 @@ describe('swallowsWorldSwap — the instrument still detects a swallow', () => {
     expect(swallowsWorldSwap(mock(' onWorldSwap: (fn) => { listener = fn; return () => {}; },'))).toBe(false);
   });
 
-  it('does NOT fire on an importOriginal partial mock', () => {
+  it('does NOT fire on an importOriginal partial mock — but does on one that overrides onWorldSwap with a no-op', () => {
+    expect(swallowsWorldSwap(
+      "vi.mock('../../src/runtime/core/ecs/world', async (importOriginal) => ({ ...(await importOriginal()), getCurrentWorld: vi.fn() }));",
+    )).toBe(false);
+    // This expectation was `false` until #1241's close-out review: the key after the spread IS the export.
     expect(swallowsWorldSwap(
       "vi.mock('../../src/runtime/core/ecs/world', async (importOriginal) => ({ ...(await importOriginal()), onWorldSwap: vi.fn() }));",
-    )).toBe(false);
+    )).toBe(true);
+  });
+
+  it('reads the factory as a node, not as text (#1241)', () => {
+    const W = "'../../src/runtime/core/ecs/world'";
+    // Swallows the text reader passed: the loader NAMED in a string, a loader declared and never
+    // called, a loader called only inside a lazy member, and an automock with no factory at all.
+    expect(swallowsWorldSwap(`vi.mock(${W}, () => ({ hint: 'importOriginal', onWorldSwap: vi.fn() }));`)).toBe(true);
+    expect(swallowsWorldSwap(`vi.mock(${W}, (importOriginal) => ({ onWorldSwap: vi.fn() }));`)).toBe(true);
+    expect(swallowsWorldSwap(`vi.mock(${W}, (orig) => ({ lazy: () => orig(), onWorldSwap: vi.fn() }));`)).toBe(true);
+    expect(swallowsWorldSwap(`vi.mock(${W});`)).toBe(true);
+    // A block-bodied factory: every return is the module, and one that drops the key swallows.
+    expect(swallowsWorldSwap(`vi.mock(${W}, () => { if (x) return { onWorldSwap: (fn) => { l = fn; } }; return { getCurrentWorld: vi.fn() }; });`)).toBe(true);
+    expect(swallowsWorldSwap(`vi.doMock(${W}, () => { const cap = 1; return { onWorldSwap: (fn) => { l = fn; } }; });`)).toBe(false);
+    // Not swallows the text reader flagged: a partial mock through `vi.importActual`, and a capturing
+    // METHOD (`onWorldSwap(fn) {…}` has no `onWorldSwap:` to find).
+    expect(swallowsWorldSwap(`vi.mock(${W}, async () => ({ ...(await vi.importActual(${W})), getCurrentWorld: vi.fn() }));`)).toBe(false);
+    // …unless a key AFTER the spread overrides `onWorldSwap` with a no-op — every loader spelling.
+    expect(swallowsWorldSwap(`vi.mock(${W}, async () => ({ ...(await vi.importActual(${W})), onWorldSwap: vi.fn() }));`)).toBe(true);
+    expect(swallowsWorldSwap(`vi.mock(${W}, async () => { const a = await vi.importActual(${W}); return { ...a, onWorldSwap: vi.fn() }; });`)).toBe(true);
+    expect(swallowsWorldSwap(`vi.mock(${W}, async (orig) => ({ ...(await orig()), onWorldSwap: vi.fn() }));`)).toBe(true);
+    expect(swallowsWorldSwap(`vi.mock(${W}, async (importOriginal) => ({ ...(await importOriginal()), onWorldSwap: () => {} }));`)).toBe(true);
+    // An override that captures (hierarchyReveal's shape) is fine, and a key BEFORE the spread is overwritten by it.
+    expect(swallowsWorldSwap(`vi.mock(${W}, async (orig) => ({ ...(await orig()), onWorldSwap: (fn) => { hooks.push(fn); } }));`)).toBe(false);
+    expect(swallowsWorldSwap(`vi.mock(${W}, async (orig) => ({ onWorldSwap: vi.fn(), ...(await orig()) }));`)).toBe(false);
+    // A method override is an override too.
+    expect(swallowsWorldSwap(`vi.mock(${W}, async (orig) => ({ ...(await orig()), onWorldSwap() {} }));`)).toBe(true);
+    // Handing the original on is not a swallow — the repo's `{ ...actual, X: vi.fn(actual.X) }` spy idiom.
+    expect(swallowsWorldSwap(`vi.mock(${W}, async (orig) => { const a = await orig(); return { ...a, onWorldSwap: vi.fn(a.onWorldSwap) }; });`)).toBe(false);
+    expect(swallowsWorldSwap(`vi.mock(${W}, async (orig) => { const a = await orig(); return { ...a, onWorldSwap: a.onWorldSwap }; });`)).toBe(false);
+    // …but only when the receiver IS the loaded original: a hoisted spy object or a fake is not.
+    expect(swallowsWorldSwap(`const mocks = vi.hoisted(() => ({ onWorldSwap: vi.fn() }));\nvi.mock(${W}, async (orig) => ({ ...(await orig()), onWorldSwap: mocks.onWorldSwap }));`)).toBe(true);
+    expect(swallowsWorldSwap(`vi.mock(${W}, async (orig) => ({ ...(await orig()), onWorldSwap: vi.fn(mocks.onWorldSwap) }));`)).toBe(true);
+    expect(swallowsWorldSwap(`vi.mock(${W}, async () => { const a = await vi.importActual(${W}); return { ...a, onWorldSwap: vi.fn(a['onWorldSwap']) }; });`)).toBe(false);
+    // A spread of anything but the original is not "the original survives".
+    expect(swallowsWorldSwap(`vi.mock(${W}, async (orig) => { const a = await orig(); return { ...stubs, findEntityById: a.findEntityById }; });`)).toBe(true);
+    expect(swallowsWorldSwap(`vi.mock(${W}, async (orig) => { const a = await orig(); return { ...a, ...stubs }; });`)).toBe(true);
+    // A partial factory whose module this cannot read, or that spreads nothing, is not credited.
+    expect(swallowsWorldSwap(`vi.mock(${W}, async (orig) => { const mod = { ...(await orig()), onWorldSwap: vi.fn() }; return mod; });`)).toBe(true);
+    expect(swallowsWorldSwap(`vi.mock(${W}, async (orig) => Object.assign({}, await orig(), { onWorldSwap: vi.fn() }));`)).toBe(true);
+    expect(swallowsWorldSwap(`vi.mock(${W}, async (orig) => { const a = await orig(); return { getCurrentWorld: a.getCurrentWorld }; });`)).toBe(true);
+    expect(swallowsWorldSwap(`vi.mock(${W}, () => ({ onWorldSwap(fn) { listener = fn; } }));`)).toBe(false);
+    expect(swallowsWorldSwap(`vi.mock(${W}, () => ({ onWorldSwap(fn) { return () => {}; } }));`)).toBe(true);
+    // A factory it cannot read is not credited.
+    expect(swallowsWorldSwap(`vi.mock(${W}, factory);`)).toBe(true);
+    expect(swallowsWorldSwap(`vi.mock(${W}, () => makeWorldMock());`)).toBe(true);
+    // A mock written in a STRING is not a mock — this very file's fixtures read as swallows to the text.
+    expect(swallowsWorldSwap(`const s = "vi.mock(${W}, () => ({}))";`)).toBe(false);
   });
 
   it('pins WORLD_MODULE itself — an unrelated module mocked the same way is not a swallow', () => {

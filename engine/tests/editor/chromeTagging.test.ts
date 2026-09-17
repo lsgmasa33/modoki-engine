@@ -18,7 +18,10 @@ import path from 'node:path';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { readScannedSource } from '@modoki/engine/testing';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
-import { callsTo, declarationOf, findNodes, functionsNamed, parseSource, ts, variablesNamed } from '@modoki/engine/testing/sourceAst';
+import {
+  callsTo, declarationOf, enclosingNamedFunction, findNodes, flatText, functionsNamed, lineOf, parseSource, ts,
+  variablesNamed,
+} from '@modoki/engine/testing/sourceAst';
 
 const ED = path.resolve(__dirname, '../../packages/modoki/src/editor');
 const read = (rel: string) => readScannedSource(path.join(ED, rel)).code;
@@ -407,7 +410,7 @@ describe('data-ui-id tagging has not rotted', () => {
   // green. Passing the PROP is what's checked (a static, syntactic fact about the JSX), not that
   // the id is a non-empty literal at runtime — that mirrors `BufferedNumberInput` itself.
   //
-  // ⚠️ HONEST SCOPE (found by mutation, close-out 2026-09-05): this regex scan below sees ONLY a
+  // ⚠️ HONEST SCOPE (found by mutation, close-out 2026-09-05): the element scan below sees ONLY a
   // literal `<BufferedNumberInput`/`<BufferedTextInput` JSX tag. It is BLIND to any helper that
   // wraps one and re-exposes its own prop — a mutation adding an untagged `<Num label="Zzz" v={1}
   // on={() => {}} />` to `SpriteEditor.tsx` (`Num` wraps `BufferedNumberInput`) passed this suite
@@ -462,39 +465,36 @@ describe('data-ui-id tagging has not rotted', () => {
       .map(({ abs, rel }) => ({ abs, rel }));
   }
 
-  /** Find every `<BufferedNumberInput …>`/`<BufferedTextInput …>` JSX element in `src` and
-   *  report whether it carries a `dataUiId=` prop. Scans char-by-char from the opening tag to
-   *  its closing `>`, tracking `{}` depth so a `>` inside a JS expression (a generic, a
-   *  comparison, a nested arrow function) doesn't end the element early. */
-  function findBufferedInputs(src: string): Array<{ line: number; hasId: boolean; snippet: string }> {
-    const results: Array<{ line: number; hasId: boolean; snippet: string }> = [];
-    const re = new RegExp(`<(${SCANNED_PRIMITIVES.join('|')})\\b`, 'g');
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(src))) {
-      const start = m.index;
-      let depth = 0, end = -1;
-      for (let i = start; i < src.length; i++) {
-        const c = src[i];
-        if (c === '{') depth++;
-        else if (c === '}') depth--;
-        else if (c === '>' && depth === 0) { end = i; break; }
-      }
-      if (end === -1) continue; // malformed — the other assertions in this file will catch it
-      const chunk = src.slice(start, end + 1);
-      results.push({
-        line: src.slice(0, start).split('\n').length,
-        hasId: /\bdataUiId=/.test(chunk),
-        snippet: chunk.replace(/\s+/g, ' ').slice(0, 100),
+  /** Every `<BufferedNumberInput …>`/`<BufferedTextInput …>` JSX element in `code`, with whether it
+   *  passes a `dataUiId` prop, and its KEY: the tag and its first prop, flattened.
+   *
+   *  ⚠️ **The element is the parser's (#1241).** The text version scanned from `<Tag` to the first
+   *  `>` at brace depth 0 — so a `>` inside a STRING prop (`placeholder="a > b"`) ended the element
+   *  early and a `dataUiId` after it went unseen — and keyed an exemption on the first two
+   *  SPACE-separated tokens, so a first prop containing a space was cut mid-expression. A `dataUiId`
+   *  handed in through a spread (`{...props}`) is not a passed prop here, as before: the scan cannot
+   *  see what the spread holds. */
+  function findBufferedInputs(code: string, label: string): Array<{ line: number; hasId: boolean; key: string; snippet: string }> {
+    const tags = new Set<string>(SCANNED_PRIMITIVES);
+    return findNodes(parseSource(code, label), (n): n is ts.JsxOpeningElement | ts.JsxSelfClosingElement =>
+      (ts.isJsxOpeningElement(n) || ts.isJsxSelfClosingElement(n)) && tags.has(n.tagName.getText()))
+      .map((el) => {
+        const props = el.attributes.properties;
+        const first = props[0];
+        return {
+          line: lineOf(el),
+          hasId: props.some((p) => ts.isJsxAttribute(p) && p.name.getText() === 'dataUiId'),
+          key: `<${el.tagName.getText()}${first ? ` ${flatText(first)}` : ''}`,
+          snippet: flatText(el).slice(0, 100),
+        };
       });
-    }
-    return results;
   }
 
   /** ⚠️ **SPENT per ELEMENT, keyed `file::<tag> <first prop>` (#1140).** This was a
    *  `Record<file, prefix[]>` matched with `.some(startsWith)` and no staleness check, so a second
    *  untagged `<BufferedTextInput value={editableEntityName(…)}` in the same file was excused by a
    *  reason argued about the header field, and a row whose element was since tagged pardoned nothing
-   *  without anyone being told. The key is the element's tag plus its first prop as the scan sees it
+   *  without anyone being told. The key is the element's tag plus its first prop NODE, flattened
    *  (comment-stripped, whitespace-collapsed) — code, never prose, per the #816 note below. */
   const DATA_UI_ID_EXEMPT: ReadonlyArray<{ item: string; count?: number; reason: string }> = [
     // The entity-name header field: BufferedTextInput now forwards data-ui-id (#724), but this
@@ -516,19 +516,15 @@ describe('data-ui-id tagging has not rotted', () => {
       reason: 'the entity-name header field — its <span> wrapper already carries data-ui-id="inspector.header.name"; a second id on the input would double-tag one logical field' },
   ];
 
-  /** The occurrence key for an element: its tag and first prop, from the normalized snippet. */
-  const elementKey = (snippet: string) => snippet.split(' ').slice(0, 2).join(' ');
-
   it('every BufferedNumberInput/BufferedTextInput passes a dataUiId prop (#724)', () => {
     const untagged: Array<{ item: string; site: string }> = [];
     let scanned = 0;
     for (const root of SCAN_ROOTS) {
       for (const { abs: file, rel } of listTsxFiles(root)) {
-        const src = readScannedSource(file).code;
-        for (const hit of findBufferedInputs(src)) {
+        for (const hit of findBufferedInputs(readScannedSource(file).code, rel)) {
           scanned++;
           if (hit.hasId) continue;
-          untagged.push({ item: `${rel}::${elementKey(hit.snippet)}`, site: `${rel}:${hit.line}  ${hit.snippet}` });
+          untagged.push({ item: `${rel}::${hit.key}`, site: `${rel}:${hit.line}  ${hit.snippet}` });
         }
       }
     }
@@ -567,46 +563,82 @@ describe('data-ui-id tagging has not rotted', () => {
     const unattributed: string[] = [];
     for (const root of SCAN_ROOTS) {
       for (const { abs, rel } of repoFiles({ under: root, match: /\.tsx?$/, floor: 5 })) {
-        const src = readScannedSource(abs).code;
-        for (const m of src.matchAll(/\bdataUiId\s*(\??)\s*:\s*string/g)) {
-          const line = src.slice(0, m.index).split('\n').length;
-          // Attribute to the nearest PRECEDING function declaration. An arrow-function component
-          // has no such marker, so it lands in `unattributed` and FAILS the test loudly rather
-          // than being silently dropped — a scan that quietly skips what it cannot parse is the
-          // fail-open shape this whole file exists to close.
-          // ⚠️ **Both declaration forms, and the reason is that one form alone is WORSE than
-          // none (found by the #830 review, mutation-proven).** This matched only
-          // `function <Name>(`, and took the LAST one preceding the prop — so an ARROW component
-          // declared after a function declaration silently inherited that function's name. In
-          // `fields.tsx`, which declares `BufferedTextInput` and `BufferedNumberInput` as
-          // functions, a new `const SneakyField = ({ dataUiId }: { dataUiId?: string }) => …`
-          // was attributed to `BufferedNumberInput`, matched SCANNED_PRIMITIVES, and was
-          // EXEMPTED — 39/39 green over exactly the defect this check exists to catch, in the
-          // file most likely to grow the next field widget. The docblock's claim that an arrow
-          // component "lands in `unattributed` and FAILS loudly" was true only when no function
-          // declaration preceded it.
-          // ⚠️ The arrow form must NOT require its `=>`. This scan runs over the text BEFORE the
-          // prop declaration, and an arrow component's `=>` sits AFTER its parameter list — so a
-          // pattern anchored on `=>` never matches in the slice, and the attribution silently
-          // falls back to the previous `function` declaration. (Caught by mutation while fixing
-          // exactly that: the first attempt at this line still let `SneakyField` inherit
-          // `BufferedNumberInput`.) `[A-Z][a-zA-Z0-9]*` is PascalCase on purpose — it admits a
-          // component and rejects a SCREAMING_CASE const like SCANNED_PRIMITIVES.
-          const DECL = /\bfunction\s+([A-Z][a-zA-Z0-9]*)\s*\(|\bconst\s+([A-Z][a-zA-Z0-9]*)\s*(?::[^=\n]*)?=/g;
-          let component = '';
-          for (const f of src.slice(0, m.index).matchAll(DECL)) component = f[1] ?? f[2];
-          if (!component) { unattributed.push(`${rel}:${line}`); continue; }
-          out.push({ rel, line, component, optional: m[1] === '?' });
-        }
+        const { decls, unattributed: lost } = dataUiIdDeclarationsIn(readScannedSource(abs).code, rel);
+        out.push(...decls);
+        unattributed.push(...lost);
       }
     }
     expect(unattributed, [
-      'A `dataUiId` prop declaration could not be attributed to a `function <Name>(` component.',
-      'It is probably an arrow-function component. Extend the attributor above — do NOT drop it,',
-      'or this guard silently stops covering it, which is exactly the defect it exists to catch.',
+      'A `dataUiId` prop declaration could not be attributed to a component — it is declared outside',
+      'any named function (a standalone `type`/`interface`, an anonymous component). Attribute it here',
+      '— do NOT drop it, or this guard silently stops covering it, which is exactly the defect it',
+      'exists to catch.',
     ].join('\n')).toEqual([]);
     return out;
   }
+
+  /**
+   * The `dataUiId: string` prop DECLARATIONS in one file, each attributed to the named function whose
+   * signature holds it — a `function` declaration or an arrow bound by `const` (`enclosingNamedFunction`).
+   *
+   * ⚠️ **Attributed by ANCESTRY, not by "the nearest declaration above" (#1241).** The text version took
+   * the LAST `function <Name>(` / `const <Name> =` before the prop, and was wrong twice (the #830 review):
+   * an arrow component after a function declaration inherited that function's name — in `fields.tsx` a
+   * `SneakyField` was attributed to `BufferedNumberInput`, matched SCANNED_PRIMITIVES, and was exempted —
+   * and the first fix still missed an arrow because its `=>` sits after the prop. The prop's own
+   * ancestors cannot be out of order. A declaration with no named function around it is `unattributed`,
+   * and fails loudly.
+   */
+  function dataUiIdDeclarationsIn(code: string, rel: string): {
+    decls: { rel: string; line: number; component: string; optional: boolean }[];
+    unattributed: string[];
+  } {
+    const decls: { rel: string; line: number; component: string; optional: boolean }[] = [];
+    const unattributed: string[] = [];
+    const isString = (t: ts.TypeNode | undefined): boolean => !!t && (t.kind === ts.SyntaxKind.StringKeyword
+      || (ts.isUnionTypeNode(t) && t.types.some((u) => u.kind === ts.SyntaxKind.StringKeyword)));
+    const props = findNodes(parseSource(code, rel), (n): n is ts.PropertySignature =>
+      ts.isPropertySignature(n) && n.name.getText() === 'dataUiId' && isString(n.type));
+    for (const prop of props) {
+      const owner = enclosingNamedFunction(prop);
+      if (!owner) { unattributed.push(`${rel}:${lineOf(prop)}`); continue; }
+      decls.push({ rel, line: lineOf(prop), component: owner.name, optional: !!prop.questionToken });
+    }
+    return { decls, unattributed };
+  }
+
+  it('findBufferedInputs reads the element node — a `>` in a string does not end it (#1241)', () => {
+    const hits = (code: string) => findBufferedInputs(code, 'fixture.tsx').map((h) => `${h.hasId}:${h.key}`);
+    // The text scan stopped at the string's `>`, and the `dataUiId=` inside that string vouched for an
+    // element that passes no id at all.
+    expect(hits('const a = <BufferedTextInput placeholder="dataUiId= >" value={v} />;')).toEqual(['false:<BufferedTextInput placeholder="dataUiId= >"']);
+    expect(hits('const a = <BufferedTextInput placeholder="a > b" value={v} dataUiId="x" />;')).toEqual(['true:<BufferedTextInput placeholder="a > b"']);
+    // The key is the whole first prop, not its first space-separated token.
+    expect(hits('const a = <BufferedNumberInput value={x ?? 1} onChange={f} />;')).toEqual(['false:<BufferedNumberInput value={x ?? 1}']);
+    // An opening tag with children, a spread, and a tag this scan does not cover.
+    expect(hits('const a = <BufferedTextInput dataUiId={id}>{c}</BufferedTextInput>;\nconst b = <BufferedTextInput {...p} />;\nconst c = <Other value={v} />;'))
+      .toEqual(['true:<BufferedTextInput dataUiId={id}', 'false:<BufferedTextInput {...p}']);
+  });
+
+  it('dataUiIdDeclarationsIn attributes a prop by its enclosing component (#1241, the #830 case)', () => {
+    const read = (code: string) => {
+      const { decls, unattributed } = dataUiIdDeclarationsIn(code, 'fixture.tsx');
+      return { decls: decls.map((d) => `${d.component}:${d.optional}`), unattributed };
+    };
+    // An arrow component declared AFTER a primitive's function declaration is its own component.
+    expect(read([
+      'export function BufferedNumberInput({ dataUiId }: { dataUiId?: string }) { return null; }',
+      'const SneakyField = ({ dataUiId }: { dataUiId?: string }) => <input data-ui-id={dataUiId} />;',
+      'function Wide({ dataUiId }: { dataUiId?: string | undefined }) { return null; }',
+    ].join('\n'))).toEqual({ decls: ['BufferedNumberInput:true', 'SneakyField:true', 'Wide:true'], unattributed: [] });
+    // `Typed`'s props sit in a type ARGUMENT, not its signature — declared outside any function body,
+    // so it is unattributed rather than guessed.
+    expect(read('const Typed: FC<{ dataUiId: string | undefined }> = ({ dataUiId }) => null;').unattributed).toEqual(['fixture.tsx:1']);
+    expect(read('interface Props { dataUiId?: string }\nexport function W(p: Props) { return null; }'))
+      .toEqual({ decls: [], unattributed: ['fixture.tsx:1'] });
+    // A value named dataUiId, or a non-string prop, is not a declaration.
+    expect(read('function X() { const o = { dataUiId: string }; }\nfunction Y(p: { dataUiId: number }) {}')).toEqual({ decls: [], unattributed: [] });
+  });
 
   it('every dataUiId-accepting component REQUIRES the prop, unless the call-site scan covers it', () => {
     const decls = dataUiIdDeclarations();

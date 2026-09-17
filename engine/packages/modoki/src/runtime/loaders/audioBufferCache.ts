@@ -104,10 +104,10 @@ export function releaseAudioForScene(sceneId: SceneId): void {
   }
 }
 
-/** Drop the decoded buffer for one clip (guid or path) so the next acquire
- *  re-fetches + re-decodes. Owners are kept — this is a content invalidation
- *  (e.g. the editor re-converted the clip via the Audio Inspector), not a
- *  release. Mirrors `invalidateTexture`.
+/** Drop the decoded buffer for one clip (guid or path) and, when a scene still
+ *  owns it as a buffer clip, re-fetch + re-decode it at once (#1361). Owners are
+ *  kept — this is a content invalidation (e.g. the editor re-converted the clip
+ *  via the Audio Inspector), not a release. Mirrors `invalidateTexture`.
  *
  *  ⚠️ **Accepts a PATH as well as a guid, and that is not cosmetic (#304 close-out).**
  *  It used to resolve through `refToPath` unconditionally, and `resolveRef` rejects an
@@ -132,6 +132,19 @@ export function invalidateAudio(ref: string): void {
   audioLiveness.invalidateKey(path);
   audioBufferCache.delete(path);
   audioLoadPromises.delete(path);
+  // Refill an OWNED buffer clip here (#1361) — a scene still plays it, and nothing else would:
+  // `getCachedAudioBuffer` is read-only, so a miss just reads as "not decoded yet" to the audio
+  // system, and the only other refill (`retryFailedAudioDecodes`) runs on the next user input.
+  // Without this, an agent-driven reimport left the clip silent until a scene reload. Same shape
+  // as #1308's owned-prefab refill. The refetch must see the NEW manifest hash (`servedAudioUrl`'s
+  // `?v=`), and every EDITOR caller guarantees that: `/api/reimport` broadcasts the rebuilt
+  // manifest before its `invalidate-assets` op on the same channel, and the Inspector/Assets-panel
+  // callers run only after that route has replied. On a DEVICE (`device_invalidate_assets`) no
+  // manifest update arrives, so the refill fetches the old `?v=` — the same URL the input-driven
+  // retry used before. The load type is read AFTER that update too, so a
+  // stream→buffer reimport decodes here and a buffer→stream one does not. Unowned clips stay
+  // evicted: a refilled entry nothing owns is one no `releaseAudioForScene` would ever drop.
+  if (audioOwners.has(path) && getAudioLoadType(path) === 'buffer') void fetchAudioBuffer(path);
 }
 
 /** Debug/test snapshot: per-path owner counts + decoded-buffer count. */
@@ -218,7 +231,9 @@ function fetchAudioBuffer(path: string): Promise<void> {
       console.warn(`[AudioCache] load failed for ${path}: ${e?.name ?? 'Error'}: ${e?.message ?? String(err)}`);
     }
   })().finally(() => {
-    audioLoadPromises.delete(path);
+    // Only drop OUR entry: an invalidation mid-load (#1361) seats a newer refill under the same
+    // path, and deleting that one let the next acquire/resume start a third, duplicate fetch.
+    if (audioLoadPromises.get(path) === promise) audioLoadPromises.delete(path);
   });
 
   audioLoadPromises.set(path, promise);

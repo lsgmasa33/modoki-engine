@@ -2318,6 +2318,76 @@ What else recurred:
   partition's members do not owe you one spelling. Related, and empty today: a reader enumerating
   only `function` declarations cannot see a member naming a `const f = (world: World) => …`.
 
+**P4 landed** (#1241) the seven engine guards that kept a private scope or dataflow simulator:
+`geometryRelease`, `notifyIsShared`, `metaMergeNotClobber`, `worldSwapTeardownFalsifiable`,
+`appManagerDisposeReachable`, `chromeTagging` and the eleven #723 derivers in `qaCaseReferences`. The
+close-out sweep (`depth(\+\+|--)` over every test root) found two more that no census had listed,
+`gameToolFirstSentence` and `modalShellCoverage`, and moved them too. It added no `sourceAst` helper.
+`qaCaseReferences` keeps one parse per source text, TSX first and then TS, because a `<T>x` cast does
+not parse as TSX. Populations were measured old against new. Seven were identical, among them 1352 ids
+and 116 patterns over the editor corpus, per deriver and per file. (`chromeTagging`'s exemption keys now
+hold the whole first prop, but no element changed.) One was not, and one differed only in the guard's own
+file:
+
+- **`notifyIsShared` found four fan-outs the regex never matched.** Two call the element inside a spread
+  (`...p(set)`), which the regex refused because it rejects a call preceded by `.`. Both are COLLECT
+  queries, so they are exempt as `query`. Court's and Wordweave's cloud-sync teardowns start their
+  callback body with `try`, and the regex needed the call first. Both are now `notifyListeners(…, () =>
+  {})`.
+- **`worldSwapTeardownFalsifiable`'s text reader counted its own fixture STRINGS as mocks.** That is P2's
+  lesson again, from inside the guard.
+
+What recurred:
+
+- **"The nearest declaration above" is a scope guess, and three guards made it.** They were
+  `metaMergeNotClobber`'s nearest `const`, `chromeTagging`'s last `function`/`const` before the prop,
+  and `geometryRelease`'s 200-line brace-frame stack, which a `'}'` in a string closed early. They are
+  now `declarationOf` and `enclosingNamedFunction`. **Removing the guess removes the checks that
+  existed to catch it:** "two calls resolved to the same declaration" was only there to catch the
+  scope-blind binding, so it went too.
+- **A nested literal answering for its parent was the commonest miss.** A first-match regex read an
+  inner `name`, `type`, `hidden`, `key` or `id` as the outer literal's own: a trait's `showIf`, a
+  settings field's guard, `generated: { id }` and `FREE_PRESET`'s `meta`. `ownString`/`propertyValue`
+  read own members only.
+- **A text window pairs neighbours, and each one here paired silently.** `MATRIX_GROUPS` gave a row
+  without a `defaultPath` the next row's. The write-meta reader took the next `JSON.stringify(`
+  anywhere in the file. `unregisterManagers`' 500-character window stood in for "an element of this
+  array". The view-mode reader took the file's FIRST `(… as const).map`, where it should take the
+  one whose callback builds the id.
+- **A guard can ship with no cover for its own reader.** `appManagerDisposeReachable` had none, so six
+  wrong readings passed unnoticed until someone ran the old regexes on hazards. Among them:
+  `implements Disposable, ManagerDef` was not a manager, a `nickname = '…'` field read as the name, and
+  `Array<ManagerDef>` was not in the census.
+- **A mutation has to break the thing you think it breaks.** Three first attempts stayed green for a
+  reason unrelated to the guard. `findNodes` is root-inclusive and in source order, so an "any depth"
+  mutation still found the literal's own member first. The old semantic is "first in TEXT order". A
+  probe named `geo2` never matched `/geo$/`, so "exemption removed: green" proved nothing. And one
+  fixture line held two ways to satisfy the rule (`fn?.()` beside `(fn as F)()`), so removing either
+  one stayed green. Give each expectation one path to satisfy it.
+- **A redundant conjunct is a finding, not a harmless extra.** The producer scan's "does not
+  DEFINE `onWorldSwap`" test was unreachable once producers were read as CALLS. A definer that never
+  calls the function is already out. Mutation found it, and it was deleted rather than kept "just in
+  case".
+
+- **The review still found three node readers NARROWER than their text — P1–P3's lesson, a fourth
+  time.** Each one passed a spelling the old guard had failed, and each fixture had been written
+  beside the new reader:
+  - `worldSwapTeardownFalsifiable` widened "loads the original" to `vi.importActual` and any
+    loader name, and then skipped the whole literal. So `{ ...(await vi.importActual(world)),
+    onWorldSwap: vi.fn() }` passed as a partial mock, though the key after the spread IS the
+    export. The pre-migration fixture already pinned the `importOriginal` spelling of that swallow as
+    clean. A partial mock now answers for an override written after its last spread. Two more
+    re-review rounds tightened that the P2 way, with an allowlist and not a list of escapes: a spread
+    or an `x.onWorldSwap` hand-on counts only when `x` resolves to `await <loader>()` or
+    `vi.importActual(…)`. Otherwise a hoisted `mocks.onWorldSwap` spy and a `...stubs` spread each
+    passed as "the original survives". The repo's `vi.fn(actual.onWorldSwap)` spy idiom stays clean.
+  - `geometryRelease`'s `.geometry` test needed the whole initializer to BE the read. The regex had
+    matched a prefix, so `mesh.geometry ?? fallback` and `mesh.geometry.clone()` had counted.
+  - `modalShellCoverage` did not unwrap `inset: 0 as const`.
+
+  The fix is the one P3 named: before you trust an equal population, list what the old REACH
+  admitted and probe each spelling against both readers.
+
 **P5 landed** `layoutConditionalScan.ts` on the parse and recorded the three readers that stay text or
 move. The scanner's population was **identical** old against new (86 rows, every predicate sign and
 gate string), so the change is the REACH, and five fixtures pin it: four the text scanner got wrong

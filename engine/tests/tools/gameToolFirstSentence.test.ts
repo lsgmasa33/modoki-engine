@@ -24,6 +24,7 @@
 import { describe, it, expect } from 'vitest';
 import { readScannedSource } from '../../packages/modoki/tests/helpers/sourceScanner';
 import { firstSentenceDefect } from './firstSentence';
+import { callsTo, parseSource, propertyValue, unwrapValue, ts } from '../../packages/modoki/tests/helpers/sourceAst';
 import { assertExemptionLedger } from '../../packages/modoki/tests/helpers/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { hasInternalGames } from '../helpers/repoLayout';
@@ -52,81 +53,36 @@ export function countRegisterCalls(src: string): number {
  *  wrong answer. */
 export function extractGameTools(src: string, file: string): GameTool[] {
   const out: GameTool[] = [];
-  const CALL = /(?<![A-Za-z0-9_$])registerAgentTool\s*\(\s*\{/g;
-  for (let m = CALL.exec(src); m; m = CALL.exec(src)) {
-    const fields = readTopLevelFields(src, m.index + m[0].length);
-    if (fields.name === undefined) continue;
-    out.push({ name: fields.name, description: fields.description ?? '', file });
+  for (const call of callsTo(parseSource(src, file), 'registerAgentTool')) {
+    const arg = call.arguments[0] && unwrapValue(call.arguments[0]);
+    if (!arg || !ts.isObjectLiteralExpression(arg)) continue;
+    const name = propertyValue(arg, 'name');
+    if (name === undefined) continue;
+    const description = propertyValue(arg, 'description');
+    out.push({ name: concatenatedString(name) ?? '', description: (description && concatenatedString(description)) ?? '', file });
   }
   return out;
 }
 
-/** Scan one object literal from just after its `{`, returning the `name` and `description` written
- *  at ITS top level — depth 1 only.
+/**
+ * A value that is one plain string literal or several joined by `+`, as its text; '' for anything
+ * else (a template literal with a substitution, an identifier, a call).
  *
- *  ⚠️ Depth-tracking is not tidiness here, it is the whole correctness of the guard. A regex that
- *  takes the first `description:` in the block takes a PARAM's, because every game tool's `params`
- *  carry their own `description` fields; the corpus only escapes that by happening to write
- *  `description` before `params`. Anchoring to "the value opens a quote" does not help either — a
- *  param's description opens with a quote too. So the reader walks the literal, counting braces and
- *  skipping over string bodies, and considers a key only while depth === 1.
- *
- *  Skipping string BODIES also fixes the other half: a `{` or `}` inside a description (or a
- *  regex-looking literal) no longer desynchronises the brace count and truncate the block early. */
-function readTopLevelFields(src: string, from: number): { name?: string; description?: string } {
-  const out: { name?: string; description?: string } = {};
-  let depth = 1;
-  let i = from;
-  while (i < src.length && depth > 0) {
-    const ch = src[i];
-    if (ch === '{' || ch === '[') { depth++; i++; continue; }
-    if (ch === '}' || ch === ']') { depth--; i++; continue; }
-    if (ch === "'" || ch === '"' || ch === '`') { i = skipString(src, i); continue; }
-    if (depth === 1) {
-      const key = /^\b(name|description)\s*:\s*/.exec(src.slice(i));
-      if (key && out[key[1] as 'name' | 'description'] === undefined) {
-        const read = readConcatenatedString(src, i + key[0].length);
-        // A non-literal value (a template literal, a helper call, an identifier) reads as '' and is
-        // RECORDED as '', not skipped — the live check treats '' as unreadable and fails, which is
-        // the honest outcome for a description this cannot police.
-        out[key[1] as 'name' | 'description'] = read.value;
-        i = read.next;
-        continue;
-      }
-    }
-    i++;
+ * ⚠️ **The call's OWN object literal, read by member (#1241).** This was a hand-written walk that
+ * counted braces, skipped string bodies and considered a key only at depth 1 — correct only because
+ * it was a tokenizer, and a `${…}` holding a brace or a regex literal still moved its edge. The depth
+ * rule it enforced is `propertyValue`'s: a param's own `description` is a member of the PARAM, never
+ * of the call's literal, whatever order the two are written in.
+ */
+function concatenatedString(v: ts.Node): string | undefined {
+  const u = ts.isExpression(v) ? unwrapValue(v) : v;
+  if (ts.isBinaryExpression(u) && u.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    const left = concatenatedString(u.left);
+    const right = concatenatedString(u.right);
+    return left === undefined || right === undefined ? undefined : left + right;
   }
-  return out;
+  return ts.isStringLiteral(u) || ts.isNoSubstitutionTemplateLiteral(u) ? u.text : undefined;
 }
-
-/** Index just past the string literal starting at `i` (handles escapes). */
-function skipString(src: string, i: number): number {
-  const quote = src[i];
-  for (let j = i + 1; j < src.length; j++) {
-    if (src[j] === '\\') { j++; continue; }
-    if (src[j] === quote) return j + 1;
-  }
-  return src.length;
-}
-
-/** A chain of plain string literals joined by `+`, from `at`. `value` is '' when the value is not
- *  one (a template literal, an identifier, a call). */
-function readConcatenatedString(src: string, at: number): { value: string; next: number } {
-  const parts: string[] = [];
-  let i = at;
-  for (;;) {
-    const lit = /^\s*(?:'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)")/.exec(src.slice(i));
-    if (!lit) return { value: parts.join(''), next: i };
-    parts.push(unescape(lit[1] ?? lit[2] ?? ''));
-    i += lit[0].length;
-    const plus = /^\s*\+/.exec(src.slice(i));
-    if (!plus) return { value: parts.join(''), next: i };
-    i += plus[0].length;
-  }
-}
-
-const unescape = (s: string): string =>
-  s.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\'/g, "'").replace(/\\"/g, '"').replace(/\\\\/g, '\\');
 
 /** ⚠️ **`floor: 0`, and `describe.skipIf` is NOT what protects this.** A `skipIf` skips the `it`s;
  *  Vitest still RUNS the describe body to collect, so `liveGameTools()` executes on every checkout
@@ -229,10 +185,25 @@ describe('extractGameTools reads what the corpus actually writes', () => {
     expect(countRegisterCalls('unregisterAgentTool({ name: 1 });')).toBe(0);
   });
 
+  // #1241: the hand-written walk's edges — a brace inside a `${…}` and inside a regex literal.
+  it('is not moved by a brace inside a template substitution or a regex literal', () => {
+    const t = extractGameTools(`registerAgentTool({
+      name: 'g_tpl',
+      run: () => \`\${ { a: 1 }.a }\`,
+      match: /[}]/,
+      description: 'Reads past both.',
+    });`, 'f.ts');
+    expect(t).toEqual([{ name: 'g_tpl', description: 'Reads past both.', file: 'f.ts' }]);
+  });
+
   // It must NOT invent a description it cannot read — '' is how the live test learns to fail.
   it('returns an empty description for a form it cannot read, rather than guessing', () => {
     const t = extractGameTools('registerAgentTool({ name: \'g_f\', description: buildDesc() });', 'f.ts');
     expect(t[0].description).toBe('');
+    // …including a chain with ONE unreadable link: half a description is not the description.
+    expect(extractGameTools("registerAgentTool({ name: 'g_g', description: 'Starts. ' + suffix });", 'f.ts')[0].description).toBe('');
+    // An EMPTY literal link is readable — it is not the unreadable marker.
+    expect(extractGameTools("registerAgentTool({ name: 'g_h', description: 'Does X.' + '' });", 'f.ts')[0].description).toBe('Does X.');
   });
 });
 

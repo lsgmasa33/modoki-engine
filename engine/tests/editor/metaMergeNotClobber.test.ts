@@ -42,6 +42,10 @@ import { describe, it, expect } from 'vitest';
 import path from 'node:path';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { readScannedSource } from '@modoki/engine/testing';
+import {
+  accessPath, callsTo, declarationOf, enclosingFunction, findNodes, flatText, isBlock, lineOf,
+  objectLiteralKeys, parseSource, propertyValue, unwrapValue, ts,
+} from '@modoki/engine/testing/sourceAst';
 
 const SRC = path.resolve(__dirname, '../../packages/modoki/src/editor');
 const read = (rel: string) => readScannedSource(path.join(SRC, rel)).code;
@@ -123,126 +127,68 @@ function hasMetaWriteCall(src: string): boolean {
 // shorthand property that was assigned a few lines earlier (`const updatedMeta = { ... };
 // writeMetaOrWarn(path, updatedMeta)`) — both shapes occur in the real corpus, so both are
 // resolved here.
+//
+// ⚠️ Every extent below is the parser's (#1241). The version before it balanced brackets by hand,
+// split arguments on a depth-counted comma, and bound an identifier to the NEAREST `const` of that
+// name earlier in the file — scope-blind, so a same-named `const` in another function answered for
+// this call's payload, and a bracket inside a string moved every edge. It carried a second check
+// ("two calls resolved to the same declaration") only to catch that mis-binding; resolving by scope
+// removes the cause, so the check went with it.
 
-function extractBalanced(src: string, openIdx: number, openCh: string, closeCh: string): string {
-  if (src[openIdx] !== openCh) {
-    throw new Error(`extractBalanced: expected '${openCh}' at index ${openIdx}, found '${src[openIdx]}'`);
+/** The object literal a payload expression IS: the literal itself, or the `const` it names —
+ *  resolved by the file's own scopes. Anything else THROWS: a payload this detector cannot
+ *  resolve must never be treated as clean (`const meta = computeMeta(x)` included). */
+function payloadLiteral(e: ts.Expression, where: string): ts.ObjectLiteralExpression {
+  const u = unwrapValue(e);
+  if (ts.isObjectLiteralExpression(u)) return u;
+  if (ts.isIdentifier(u)) {
+    const decl = declarationOf(u);
+    const init = decl && ts.isVariableDeclaration(decl) && ts.isVariableDeclarationList(decl.parent)
+      && (decl.parent.flags & ts.NodeFlags.Const) && decl.initializer ? unwrapValue(decl.initializer) : undefined;
+    if (init && ts.isObjectLiteralExpression(init)) return init;
+    throw new Error(`metaPayloadLiterals: '${u.text}' (${where}) does not resolve to a \`const\` object literal — `
+      + 'this write call\'s payload cannot be verified and must not be treated as clean');
   }
-  let depth = 0;
-  for (let i = openIdx; i < src.length; i++) {
-    if (src[i] === openCh) depth++;
-    else if (src[i] === closeCh) {
-      depth--;
-      if (depth === 0) return src.slice(openIdx, i + 1);
+  throw new Error(`metaPayloadLiterals: unrecognized meta payload '${flatText(u)}' (${where})`);
+}
+
+/** The object literals a `planMetaBatchWrite` mutate callback RETURNS: a concise `(m) => ({ … })`,
+ *  or every `return` of a block body that belongs to the callback itself (not a nested function).
+ *  Both forms are in use; a return that is not a literal throws. */
+function mutateReturnLiterals(e: ts.Expression | undefined, where: string): ts.ObjectLiteralExpression[] {
+  const fn = e && unwrapValue(e);
+  if (!fn || !(ts.isArrowFunction(fn) || ts.isFunctionExpression(fn))) {
+    throw new Error(`metaPayloadLiterals: planMetaBatchWrite's mutate is not an inline function (${where})`);
+  }
+  const returned = isBlock(fn.body)
+    ? findNodes(fn.body, ts.isReturnStatement).filter((r) => enclosingFunction(r) === fn).map((r) => r.expression)
+    : [fn.body];
+  if (returned.length === 0) throw new Error(`metaPayloadLiterals: planMetaBatchWrite mutate returns nothing (${where})`);
+  return returned.map((r) => {
+    const lit = r && unwrapValue(r);
+    if (!lit || !ts.isObjectLiteralExpression(lit)) {
+      throw new Error(`metaPayloadLiterals: planMetaBatchWrite mutate returns no object literal (${where})`);
     }
-  }
-  throw new Error(`extractBalanced: unbalanced '${openCh}${closeCh}' starting at ${openIdx}`);
+    return lit;
+  });
 }
 
-/** Splits `text` on TOP-LEVEL commas only (depth-tracking `(){}[]`), returning each part's
- *  absolute offset into the ORIGINAL source (`text` starts at `baseOffset` in it) so callers can
- *  re-locate a part's exact position for a further `extractBalanced` call. */
-function splitTopLevelWithOffsets(text: string, baseOffset: number): { text: string; start: number }[] {
-  const parts: { text: string; start: number }[] = [];
-  let depth = 0;
-  let curStart = 0;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (ch === '(' || ch === '{' || ch === '[') depth++;
-    else if (ch === ')' || ch === '}' || ch === ']') depth--;
-    if (ch === ',' && depth === 0) {
-      parts.push({ text: text.slice(curStart, i), start: baseOffset + curStart });
-      curStart = i + 1;
-    }
-  }
-  if (curStart < text.length) parts.push({ text: text.slice(curStart), start: baseOffset + curStart });
-  return parts;
-}
-
-function firstNonWs(text: string, from: number): number {
-  let i = from;
-  while (i < text.length && /\s/.test(text[i])) i++;
-  return i;
-}
-
-/** Finds the nearest `const <ident> = ...` (optionally typed: `const x: T = ...`) BEFORE
- *  `beforeIdx` and returns its full literal text plus the declaration's own offset. This is how
- *  a write call that passes a variable ("`writeMetaOrWarn(path, updatedMeta)`") reaches the
- *  literal that was actually built for the payload.
- *
- *  The nearest declaration is found REGARDLESS of shape — not just brace literals — and then
- *  checked: if it isn't `{ ... }` (e.g. `const meta = computeMeta(x);`), this THROWS rather than
- *  silently falling through to some earlier, unrelated `const <ident> = {` (which is how the
- *  detector used to bind an unrelated function's literal to this call when two same-named
- *  `const`s live in different scopes — a payload this detector cannot resolve must never be
- *  treated as clean). The returned `offset` lets callers detect the OTHER shape of that same
- *  bug: two different write calls both resolving to the identical declaration. */
-function resolveIdentifierLiteral(
-  codeSrc: string,
-  beforeIdx: number,
-  ident: string,
-): { literal: string; offset: number } {
-  const declRe = new RegExp(`const\\s+${ident}\\b[^=]*=\\s*`, 'g');
-  let bestDeclIdx = -1;
-  let bestValueIdx = -1;
-  let dm: RegExpExecArray | null;
-  while ((dm = declRe.exec(codeSrc))) {
-    if (dm.index < beforeIdx && dm.index > bestDeclIdx) {
-      bestDeclIdx = dm.index;
-      bestValueIdx = dm.index + dm[0].length;
-    }
-  }
-  if (bestDeclIdx < 0) {
-    throw new Error(`resolveIdentifierLiteral: could not find 'const ${ident} = ...' before index ${beforeIdx}`);
-  }
-  if (codeSrc[bestValueIdx] !== '{') {
-    throw new Error(
-      `resolveIdentifierLiteral: 'const ${ident} = ...' at index ${bestDeclIdx} (nearest before ${beforeIdx}) ` +
-        `is not an object literal — this write call's payload cannot be verified and must not be treated as clean`,
-    );
-  }
-  return { literal: extractBalanced(codeSrc, bestValueIdx, '{', '}'), offset: bestDeclIdx };
-}
-
-/** For every meta-sidecar write call in `src`, returns the full text of the object literal it
- *  writes — resolving through a variable/shorthand property where the call doesn't carry the
- *  literal inline. Throws (loudly, in a test) on a call shape this doesn't recognize, rather
- *  than silently skipping it — a skipped call is a write this guard is no longer checking. */
-function metaPayloadLiterals(src: string): string[] {
-  const codeSrc = codeLines(src).join('\n');
-  const literals: string[] = [];
-  // Declaration offsets bound by an identifier-resolved payload (Fix 1's other tell): if two
-  // DIFFERENT write calls resolve to the exact same `const` declaration, one of them is binding
-  // to a literal that was never built for it — the scope-blind lookup finding someone else's
-  // same-named `const` because its own local declaration wasn't a brace literal.
-  const declOffsets: number[] = [];
-  const pushResolved = (resolved: { literal: string; offset: number }) => {
-    literals.push(resolved.literal);
-    declOffsets.push(resolved.offset);
-  };
+/** For every meta-sidecar write call in `code`, the object literal it writes — resolving through a
+ *  variable/shorthand property where the call doesn't carry the literal inline. Throws (loudly, in a
+ *  test) on a call shape this doesn't recognize, rather than silently skipping it — a skipped call
+ *  is a write this guard is no longer checking. */
+function metaPayloadLiterals(code: string, label: string): ts.ObjectLiteralExpression[] {
+  const sf = parseSource(code, label);
+  const where = (n: ts.Node) => `${label}:${lineOf(n)}`;
+  const literals: ts.ObjectLiteralExpression[] = [];
 
   // Shape 1: writeMetaOrWarn(<pathExpr>, <payloadExpr>) or parkMetaEdit(<pathExpr>, <payloadExpr>)
   // — #845 gave every field handler a SECOND way to reach the sidecar (park now, write later),
   // and it carries the exact same (pathExpr, payloadExpr) shape, so one pass handles both.
-  const callRe = /(?:writeMetaOrWarn|writeMetaWholesale|parkMetaEdit)\(/g;
-  let m: RegExpExecArray | null;
-  while ((m = callRe.exec(codeSrc))) {
-    const parenOpen = m.index + m[0].length - 1;
-    const parens = extractBalanced(codeSrc, parenOpen, '(', ')');
-    const args = splitTopLevelWithOffsets(parens.slice(1, -1), parenOpen + 1);
-    if (args.length < 2) {
-      throw new Error(`metaPayloadLiterals: meta write/park call with <2 args near index ${m.index}`);
-    }
-    const payload = args[1];
-    const payloadTrimStart = firstNonWs(payload.text, 0);
-    const payloadStart = payload.start + payloadTrimStart;
-    if (codeSrc[payloadStart] === '{') {
-      literals.push(extractBalanced(codeSrc, payloadStart, '{', '}'));
-    } else {
-      const identMatch = payload.text.slice(payloadTrimStart).match(/^[A-Za-z_$][\w$]*/);
-      if (!identMatch) throw new Error(`metaPayloadLiterals: unrecognized meta write/park payload '${payload.text}'`);
-      pushResolved(resolveIdentifierLiteral(codeSrc, m.index, identMatch[0]));
-    }
+  for (const call of callsTo(sf, 'writeMetaOrWarn', 'writeMetaWholesale', 'parkMetaEdit')) {
+    const payload = call.arguments[1];
+    if (!payload) throw new Error(`metaPayloadLiterals: meta write/park call with <2 args (${where(call)})`);
+    literals.push(payloadLiteral(payload, where(call)));
   }
 
   // Shape 3: `planMetaBatchWrite(<paths>, <metas>, (m) => <payload>)` — #903 moved the two batch
@@ -256,75 +202,44 @@ function metaPayloadLiterals(src: string): string[] {
   // turned a red gate green by making this guard BLIND to the exact destruction it exists for — the
   // "a fix scoped to the instances someone listed reads afterwards as a fix to the class" trap this
   // file's own header is about.
-  const planRe = /planMetaBatchWrite\(/g;
-  while ((m = planRe.exec(codeSrc))) {
-    const parenOpen = m.index + m[0].length - 1;
-    const parens = extractBalanced(codeSrc, parenOpen, '(', ')');
-    const args = splitTopLevelWithOffsets(parens.slice(1, -1), parenOpen + 1);
-    if (args.length < 3) {
-      throw new Error(`metaPayloadLiterals: planMetaBatchWrite with <3 args near index ${m.index}`);
-    }
-    const mutate = args[2];
-    // Both arrow forms are in use and both must be found: a concise body `(m) => ({ … })` and a
-    // block body `(m) => { …; return { … }; }`. Matching only one would let the other's payload
-    // ship unexamined, which is this file's #784 lesson (an anchor that stops matching is silent).
-    const body = mutate.text.match(/=>\s*\(\s*\{/) ?? mutate.text.match(/\breturn\s*\{/);
-    if (!body || body.index === undefined) {
-      throw new Error(`metaPayloadLiterals: planMetaBatchWrite mutate returns no object literal — '${mutate.text.slice(0, 80)}'`);
-    }
-    const braceRel = mutate.text.indexOf('{', body.index + body[0].length - 1);
-    literals.push(extractBalanced(codeSrc, mutate.start + braceRel, '{', '}'));
+  for (const call of callsTo(sf, 'planMetaBatchWrite')) {
+    if (call.arguments.length < 3) throw new Error(`metaPayloadLiterals: planMetaBatchWrite with <3 args (${where(call)})`);
+    literals.push(...mutateReturnLiterals(call.arguments[2], where(call)));
   }
 
   // Shape 2: a raw `backendFetch('/api/write-meta', { ..., body: JSON.stringify({ path, meta: <X> }) })`
   // — quoted OR template-literal endpoint. The corpus test (`hasMetaWriteCall`) anchors on the
   // bare substring `/api/write-meta` regardless of quote style, so this extractor must recognize
   // every style that anchor does — otherwise a template-literal endpoint passes the corpus check
-  // while contributing zero payload literals here, and its clobber ships unexamined.
-  const fetchRe = /(['"`])\/api\/write-meta\1/g;
-  while ((m = fetchRe.exec(codeSrc))) {
-    const stringifyIdx = codeSrc.indexOf('JSON.stringify(', m.index);
-    if (stringifyIdx < 0) {
-      throw new Error(`metaPayloadLiterals: '/api/write-meta' with no JSON.stringify body near index ${m.index}`);
+  // while contributing zero payload literals here, and its clobber ships unexamined. The body is
+  // read off THIS call's options object: the text version searched forward for the next
+  // `JSON.stringify(` in the file, whoever's it was.
+  for (const lit of findNodes(sf, ts.isStringLiteralLike).filter((l) => l.text === '/api/write-meta')) {
+    const call = lit.parent;
+    if (!ts.isCallExpression(call) || call.arguments[0] !== lit) {
+      throw new Error(`metaPayloadLiterals: '/api/write-meta' is not a fetch call's first argument (${where(lit)})`);
     }
-    const parenOpen = stringifyIdx + 'JSON.stringify'.length;
-    const braceIdx = codeSrc.indexOf('{', parenOpen);
-    if (braceIdx < 0) throw new Error(`metaPayloadLiterals: JSON.stringify with no object body near index ${stringifyIdx}`);
-    const bodyObj = extractBalanced(codeSrc, braceIdx, '{', '}');
-    const props = splitTopLevelWithOffsets(bodyObj.slice(1, -1), braceIdx + 1);
-    const metaProp = props.find((p) => /^\s*meta\b/.test(p.text));
-    if (!metaProp) throw new Error(`metaPayloadLiterals: write-meta body missing a 'meta' property near index ${m.index}`);
-    const colonIdx = metaProp.text.indexOf(':');
-    if (colonIdx < 0) {
-      // Shorthand `meta` — the property IS the variable, resolve it like any other identifier.
-      pushResolved(resolveIdentifierLiteral(codeSrc, m.index, 'meta'));
-    } else {
-      const localValueStart = firstNonWs(metaProp.text, colonIdx + 1);
-      const absValueStart = metaProp.start + localValueStart;
-      if (codeSrc[absValueStart] === '{') {
-        literals.push(extractBalanced(codeSrc, absValueStart, '{', '}'));
-      } else {
-        const rest = metaProp.text.slice(localValueStart);
-        const identMatch = rest.match(/^[A-Za-z_$][\w$]*/);
-        if (!identMatch) throw new Error(`metaPayloadLiterals: unrecognized meta value '${rest}'`);
-        pushResolved(resolveIdentifierLiteral(codeSrc, m.index, identMatch[0]));
-      }
+    const body = propertyValue(call.arguments[1], 'body');
+    const stringify = body && unwrapValue(body as ts.Expression);
+    if (!stringify || !ts.isCallExpression(stringify) || accessPath(stringify.expression) !== 'JSON.stringify') {
+      throw new Error(`metaPayloadLiterals: '/api/write-meta' with no JSON.stringify body (${where(lit)})`);
     }
-  }
-
-  const seenOffsets = new Set<number>();
-  for (const offset of declOffsets) {
-    if (seenOffsets.has(offset)) {
-      throw new Error(
-        `metaPayloadLiterals: two different write calls resolved to the SAME 'const' declaration ` +
-          `(offset ${offset}) — one of them is binding a same-named const from a different scope, ` +
-          `not the literal actually built for its own payload`,
-      );
+    const meta = propertyValue(stringify.arguments[0], 'meta');
+    if (!meta || !ts.isExpression(meta)) {
+      throw new Error(`metaPayloadLiterals: write-meta body missing a 'meta' property (${where(lit)})`);
     }
-    seenOffsets.add(offset);
+    // A `{ meta }` shorthand comes back as its name, which resolves like any other identifier.
+    literals.push(payloadLiteral(meta, where(lit)));
   }
 
   return literals;
+}
+
+/** A payload literal that MERGES an existing sidecar or CREATES a complete one — read off the
+ *  literal's OWN members (a spread, or an `id` key), not anywhere in its text: `generated: { id }`
+ *  nested inside is not the sidecar's id. */
+function mergesOrCreates(literal: ts.ObjectLiteralExpression): boolean {
+  return (objectLiteralKeys(literal) ?? []).some((k) => k === '...' || k === 'id');
 }
 
 /** A meta payload literal that neither MERGES an existing sidecar nor CREATES a complete one.
@@ -335,14 +250,14 @@ function metaPayloadLiterals(src: string): string[] {
  *     which legitimately authors a fresh sidecar from scratch.
  *
  *  Anything else replaces the file with a fragment. */
-function clobberingMetaPayloads(src: string): string[] {
-  return metaPayloadLiterals(src).filter((literal) => !literal.includes('...') && !/\bid\s*:/.test(literal));
+function clobberingMetaPayloads(code: string, label = 'fixture.ts'): string[] {
+  return metaPayloadLiterals(code, label).filter((l) => !mergesOrCreates(l)).map(flatText);
 }
 
 describe('meta sidecar writers merge instead of replacing', () => {
   for (const rel of WRITERS) {
     it(`${rel} never posts a meta literal that drops the existing keys`, () => {
-      expect(clobberingMetaPayloads(read(rel))).toEqual([]);
+      expect(clobberingMetaPayloads(read(rel), rel)).toEqual([]);
     });
   }
 
@@ -377,7 +292,7 @@ describe('meta sidecar writers merge instead of replacing', () => {
     for (const rel of WRITERS) {
       const src = read(rel);
       if (!hasMetaWriteCall(src)) continue;
-      const literals = metaPayloadLiterals(src);
+      const literals = metaPayloadLiterals(src, rel);
       if (literals.length === 0) {
         throw new Error(`${rel}: has a meta-write call but resolved zero payload literals — vacuous pass`);
       }
@@ -396,7 +311,7 @@ describe('meta sidecar writers merge instead of replacing', () => {
     // `version` (a different document, a different owner, out of scope per
     // docs/format-versioning.md § 3) and a whole-file scan would wrongly flag those too.
     const offenders = WRITERS.filter((rel) =>
-      metaPayloadLiterals(read(rel)).some((literal) => /version\s*:\s*\d/.test(literal)),
+      metaPayloadLiterals(read(rel), rel).some((literal) => objectLiteralKeys(literal)?.includes('version')),
     );
     expect(offenders).toEqual([]);
   });
@@ -430,8 +345,49 @@ describe('meta sidecar writers merge instead of replacing', () => {
     expect(discovered.sort()).toEqual([...WRITERS, ...EXCLUDED].sort());
   });
 
+  it('the detector reads the payload by scope and by member, not by nearby text (#1241)', () => {
+    const clobbers = (src: string) => clobberingMetaPayloads(src, 'fixture.ts');
+    // H1 — a same-named `const` in ANOTHER function sits nearer the call than the one it names. The
+    // nearest-`const` lookup bound the call to that merge and passed the clobber.
+    expect(clobbers([
+      'const updated = { postprocessor: x };',
+      'function other() { const updated = { ...meta, a }; use(updated); }',
+      'void writeMetaOrWarn(p, updated);',
+    ].join('\n'))).toEqual(['{ postprocessor: x }']);
+    // H2 — `...` inside a string, and an `id` inside a NESTED literal, are not a spread or the
+    // sidecar's id. The text test (`includes('...')`, `/\bid\s*:/`) passed both.
+    expect(clobbers("void writeMetaOrWarn(p, { label: 'more...', postprocessor: x });")).toHaveLength(1);
+    expect(clobbers('void writeMetaOrWarn(p, { generated: { id: g }, postprocessor: x });')).toHaveLength(1);
+    // H3 — a bracket inside a string does not move an argument's edge.
+    expect(clobbers("void writeMetaOrWarn(p, { note: ')}', ...meta });")).toEqual([]);
+    // A block-bodied mutate: EVERY return of the callback is a payload, and a nested function's
+    // return is not.
+    expect(clobbers([
+      'planMetaBatchWrite(paths, metas, (m) => {',
+      '  if (!m) return { early: 1 };',
+      '  const f = () => { return { unrelated: 1 }; };',
+      '  if (m.done) return { ...m };',
+      '  return { postprocessor: f() };',
+      '});',
+    ].join('\n'))).toEqual(['{ early: 1 }', '{ postprocessor: f() }']);
+  });
+
+  it('a payload the detector cannot resolve THROWS — never reads as clean', () => {
+    const extract = (src: string) => () => metaPayloadLiterals(src, 'fixture.ts');
+    expect(extract('const meta = computeMeta(x); writeMetaOrWarn(p, meta);')).toThrow(/const` object literal/);
+    expect(extract('let meta = { ...m }; writeMetaOrWarn(p, meta);')).toThrow(/const` object literal/);
+    expect(extract('function f(meta) { writeMetaOrWarn(p, meta); }')).toThrow(/const` object literal/);
+    expect(extract('writeMetaOrWarn(p);')).toThrow(/<2 args/);
+    expect(extract('writeMetaOrWarn(p, build());')).toThrow(/unrecognized meta payload/);
+    expect(extract('planMetaBatchWrite(paths, metas, mutate);')).toThrow(/not an inline function/);
+    expect(extract('planMetaBatchWrite(paths, metas, (m) => { return build(m); });')).toThrow(/no object literal/);
+    expect(extract("backendFetch('/api/write-meta', { method: 'POST', body: payload });")).toThrow(/no JSON.stringify body/);
+    expect(extract("backendFetch('/api/write-meta', { body: JSON.stringify({ path }) });")).toThrow(/missing a 'meta'/);
+    expect(extract("const url = '/api/write-meta';")).toThrow(/first argument/);
+  });
+
   it('the detector detects — merge/create/clobber, both inline and via a variable', () => {
-    const bad = (src: string) => clobberingMetaPayloads(src).length === 1;
+    const bad = (src: string) => clobberingMetaPayloads(src, 'fixture.tsx').length === 1;
 
     // Clobber: the two real shapes the historical bug took.
     expect(bad(`

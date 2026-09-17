@@ -16,6 +16,7 @@ import { describe, it, expect } from 'vitest';
 import { readScannedSource } from '@modoki/engine/testing';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
+import { findNodes, parseSource, propertyValue, stringValueOf, unwrapValue, ts } from '@modoki/engine/testing/sourceAst';
 
 const EDITOR = 'engine/packages/modoki/src/editor';
 
@@ -25,29 +26,26 @@ const CSS_TEXT = [
   /\binset:\s*0\s*;[^'"`]*?position:\s*fixed\b/,
 ];
 
-/** `position: 'fixed'` and `inset: 0` in the SAME object literal, in either order and whatever sits
- *  between them. Brace-MATCHED rather than `[^{}]*`: a style object can hold a nested value or a
- *  `${…}` template, and a character class that stops at the first brace would read past the object
- *  it is in — or miss the pair entirely — while the guard reports a clean scan. */
-function sameObjectBackdrop(code: string): boolean {
-  for (const m of code.matchAll(/position:\s*['"]fixed['"]/g)) {
-    let depth = 0, start = m.index;
-    // Walk back to the `{` that opens the object this property sits in.
-    while (start > 0) {
-      const ch = code[--start];
-      if (ch === '}') depth++;
-      else if (ch === '{') { if (depth === 0) break; depth--; }
-    }
-    let end = m.index + m[0].length;
-    depth = 0;
-    while (end < code.length) {
-      const ch = code[end++];
-      if (ch === '{') depth++;
-      else if (ch === '}') { if (depth === 0) break; depth--; }
-    }
-    if (/\binset:\s*0\b/.test(code.slice(start, end))) return true;
-  }
-  return false;
+/** `position: 'fixed'` as an OWN member of an object literal, with `inset: 0` in that same literal —
+ *  its own member or a nested one ("still one object tree", pinned below) — in either order and
+ *  whatever sits between them.
+ *
+ *  ⚠️ **The literal is the parser's (#1241).** This walked backwards and forwards from the match by
+ *  counting braces, with no idea of strings — a `'{'` or `'}'` in a sibling value moved the object's
+ *  edge, so the pair could be read across two objects or missed inside one. `label` names the file
+ *  for the parse's extension (a `.tsx` panel holds JSX). */
+function sameObjectBackdrop(code: string, label: string): boolean {
+  if (!/position['"]?\s*:\s*['"]fixed['"]/.test(code)) return false; // a cheap gate (a quoted key too); the parse decides
+  const isZero = (e: ts.Expression): boolean => {
+    const v = unwrapValue(e);
+    return (ts.isNumericLiteral(v) && Number(v.text) === 0) || (ts.isStringLiteral(v) && /^0(px)?$/.test(v.text));
+  };
+  return findNodes(parseSource(code, label), ts.isObjectLiteralExpression).some((o) => {
+    const pos = propertyValue(o, 'position');
+    if (!pos || !ts.isExpression(pos) || stringValueOf(pos) !== 'fixed') return false;
+    return findNodes(o, ts.isPropertyAssignment).some((p) => (ts.isIdentifier(p.name) || ts.isStringLiteral(p.name))
+      && p.name.text === 'inset' && isZero(p.initializer));
+  });
 }
 
 /** The shell itself — the one place a modal backdrop is defined. */
@@ -69,14 +67,14 @@ const ON_THE_SHELL: Record<string, number> = {
   'panels/SpriteEditor.tsx': 1, 'panels/animation/AddPropertyPicker.tsx': 1, 'panels/animation/BindAnimatorPicker.tsx': 1,
 };
 
-const drawsBackdrop = (code: string) => sameObjectBackdrop(code) || CSS_TEXT.some((re) => re.test(code));
+const drawsBackdrop = (code: string, label = 'fixture.tsx') => sameObjectBackdrop(code, label) || CSS_TEXT.some((re) => re.test(code));
 
 describe('editor modals use the one modal shell (#1270)', () => {
   const files = repoFiles({ under: EDITOR, match: /\.tsx?$/, floor: 150 });
 
   it('no file draws its own full-screen backdrop beyond the shell and the exempt popovers — and every row still earns itself', () => {
     const population = files
-      .filter(({ abs }) => drawsBackdrop(readScannedSource(abs).code))
+      .filter(({ abs, rel }) => drawsBackdrop(readScannedSource(abs).code, rel))
       .map(({ rel }) => ({ item: rel, site: rel }));
     assertExemptionLedger({
       label: 'EXEMPT in modalShellCoverage',
@@ -99,16 +97,25 @@ describe('editor modals use the one modal shell (#1270)', () => {
   });
 
   it('the detector detects both spellings the old dialogs used', () => {
-    expect(drawsBackdrop(`<div style={{ position: 'fixed', inset: 0, zIndex: 9999 }}>`)).toBe(true);
+    expect(drawsBackdrop(`const a = <div style={{ position: 'fixed', inset: 0, zIndex: 9999 }} />;`)).toBe(true);
     expect(drawsBackdrop(`el.style.cssText = 'position:fixed;inset:0;z-index:99999'`)).toBe(true);
-    expect(drawsBackdrop(`<div style={{ position: 'fixed', zIndex: 9999, inset: 0 }}>`)).toBe(true);
-    expect(drawsBackdrop(`<div style={{ inset: 0, position: 'fixed' }}>`)).toBe(true);
-    expect(drawsBackdrop(`<div style={{ position: 'fixed', left: 4, top: 8 }}>`)).toBe(false);
+    expect(drawsBackdrop(`const a = <div style={{ position: 'fixed', zIndex: 9999, inset: 0 }} />;`)).toBe(true);
+    expect(drawsBackdrop(`const a = <div style={{ inset: 0, position: 'fixed' }} />;`)).toBe(true);
+    expect(drawsBackdrop(`const a = <div style={{ position: 'fixed', left: 4, top: 8 }} />;`)).toBe(false);
     // Two different objects on one line are not one backdrop.
-    expect(drawsBackdrop(`<a style={{ position: 'fixed', left: 4 }} /><b style={{ inset: 0 }} />`)).toBe(false);
+    expect(drawsBackdrop(`const a = <><a style={{ position: 'fixed', left: 4 }} /><b style={{ inset: 0 }} /></>;`)).toBe(false);
     // …and a brace between the two properties does not hide them from each other.
-    expect(drawsBackdrop("<div style={{ position: 'fixed', top: `${y}px`, inset: 0 }}>")).toBe(true);
-    expect(drawsBackdrop("<div style={{ position: 'fixed', transform: t({ x }), inset: 0 }}>")).toBe(true);
-    expect(drawsBackdrop("<div style={{ position: 'fixed', pad: { inset: 0 } }}>")).toBe(true); // nested counts: still one object tree
+    expect(drawsBackdrop("const a = <div style={{ position: 'fixed', top: `${y}px`, inset: 0 }} />;")).toBe(true);
+    expect(drawsBackdrop("const a = <div style={{ position: 'fixed', transform: t({ x }), inset: 0 }} />;")).toBe(true);
+    expect(drawsBackdrop("const a = <div style={{ position: 'fixed', pad: { inset: 0 } }} />;")).toBe(true); // nested counts: still one object tree
+    // #1241: a brace inside a string no longer moves the object's edge — either way.
+    expect(drawsBackdrop("const a = <div style={{ position: 'fixed', content: '}', inset: 0 }} />;")).toBe(true);
+    expect(drawsBackdrop("const a = <><i style={{ position: 'fixed', tag: '{' }} /><b style={{ inset: 0 }} /></>;")).toBe(false);
+    // A fixed position that is not a backdrop, and a value that is not the literal zero.
+    expect(drawsBackdrop("const a = <div style={{ position: 'fixed', inset: 0.5 }} />;")).toBe(false);
+    expect(drawsBackdrop("const a = <div style={{ position: 'fixed', inset: 0 as const }} />;")).toBe(true);
+    expect(drawsBackdrop("const a = <div style={{ 'position': 'fixed', 'inset': 0 }} />;")).toBe(true);
+    // The literal that is FIXED must hold the inset — a parent holding a fixed child does not.
+    expect(drawsBackdrop("const a = <div style={{ pad: { position: 'fixed' }, inset: 0 }} />;")).toBe(false);
   });
 });

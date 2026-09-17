@@ -18,35 +18,37 @@
  *
  *  THE RULE. No `.destroy(` call on a Pixi Geometry anywhere in `engine/packages/modoki/src/**`
  *  or `engine/app/**`, except inside `releaseGeometry`'s own body in Scene2D.tsx. Route the
- *  teardown through `releaseGeometry(geo)` instead. A Geometry is recognised three ways:
- *  (1) the callee identifier LOOKS like one (matches `/geometry|geo$/i`); (2) it was declared
- *  as `const/let/var X = <expr>.geometry` in the SAME lexical block as the `.destroy(` call, or
- *  an ancestor block of it — a declaration and its later `.destroy(` can be statements apart
- *  (e.g. captured then released after other cleanup runs), so this is NOT limited to one line,
- *  but it IS scoped per block, not per file: two unrelated locals named `g` in two different
- *  methods (one a Geometry, one a `Graphics`) must not cross-contaminate each other — including a
- *  function/arrow PARAMETER of the same name, which shadows an outer geometry local exactly like
- *  real JS scoping (registered on the frame its own body opens, braced or not); (3) it's the
- *  direct, un-assigned result of a geometry-returning builder (`buildMaterialQuad`,
- *  `buildTextGeometryByPage`) chained straight into `.destroy(`.
+ *  teardown through `releaseGeometry(geo)` instead. A `.destroy(` call's receiver is a Geometry
+ *  when (see `geometryDestroys`):
+ *  (1) its NAME looks like one (matches `/geometry|geo$/i`) — the identifier, or the last member
+ *      of a chain (`mesh.geometry.destroy()`);
+ *  (2) it is an identifier that RESOLVES to a `const/let/var X = <chain>.geometry` declaration —
+ *      however many statements apart, and by the language's own scoping, so a same-named
+ *      parameter or a local in another function is a different binding (#1241: this used to be a
+ *      brace-counting scope simulator, which a `}` inside a string closed early);
+ *  (3) it is the direct, un-assigned result of a geometry-returning builder (`buildMaterialQuad`,
+ *      `buildTextGeometryByPage`).
  *
  *  ⚠️ WHAT THIS DOES NOT CATCH — stated plainly because a guard whose comment overclaims is worse
- *  than one that states its edge; the next reader trusts the comment. It is a per-identifier,
- *  per-block heuristic, not a type checker, so it MISSES:
+ *  than one that states its edge; the next reader trusts the comment. It resolves one binding by
+ *  name, with no type information, so it MISSES:
  *   - a geometry reached through an array/collection element (`meshes.map(m => m.geometry)` then
  *     `.forEach(g => g.destroy())` — the destroyed value was never bound by a `const/let/var …
- *     = X.geometry` declaration this scanner recognises);
- *   - a geometry stored on `this` (`this.quad = buildMaterialQuad(...); this.quad.destroy(true)` —
- *     no local identifier to track at all);
+ *     = X.geometry` declaration);
+ *   - a geometry stored on `this` under a name that does not look like one (`this.quad =
+ *     buildMaterialQuad(...); this.quad.destroy(true)` — rule (2) follows local bindings only);
+ *   - a geometry bound by assignment rather than declaration (`let g; g = m.geometry`);
  *   - a destroy reached through a wrapper helper (`function freeGeo(g2) { g2.destroy(true) }` —
  *     the call site that matters is the CALLER of `freeGeo`, invisible from here).
- *  Do not extend this guard to chase those without a design discussion — they need either real
- *  type information or a bigger rewrite, not another regex. */
+ *  Do not extend this guard to chase those without a design discussion — they need real type
+ *  information, not another rule. */
 import { describe, it, expect } from 'vitest';
-import { found } from '@modoki/engine/testing/inOrder';
-import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { stripComments, assertScanIsSane } from '@modoki/engine/testing';
+import { readScannedSource } from '@modoki/engine/testing';
+import {
+  accessPath, calleeName, callsTo, declarationOf, findNodes, functionsNamed, lineOf, parseSource,
+  unwrapValue, ts,
+} from '@modoki/engine/testing/sourceAst';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 
 const roots = [
@@ -57,109 +59,13 @@ const roots = [
 const HELPER_FILE = path.resolve(__dirname, '../../packages/modoki/src/runtime/rendering/Scene2D.tsx');
 const HELPER_NAME = 'releaseGeometry';
 // Name-based: catches `geo.destroy()`, `myGeometry.destroy()`, `mesh.geometry.destroy()` (the
-// captured identifier is the property name, "geometry"). Deliberately NOT a bare `^g$` — this
-// codebase names plenty of unrelated `Graphics` locals `g` (e.g. `colliderOverlays`), and a
-// Graphics.destroy() is a legitimate bare call (ViewContainer orders unload-before-destroy
-// correctly; it's Geometry alone that inverts it). A short-named local actually holding a
-// Geometry (the original bug used `const g = m.geometry`) is caught below by scoped data flow.
+// receiver's last name is "geometry"). Deliberately NOT a bare `^g$` — this codebase names plenty
+// of unrelated `Graphics` locals `g` (e.g. `colliderOverlays`), and a Graphics.destroy() is a
+// legitimate bare call (ViewContainer orders unload-before-destroy correctly; it's Geometry alone
+// that inverts it). A short-named local actually holding a Geometry (the original bug used
+// `const g = m.geometry`) is caught by rule (2) instead.
 const GEOMETRY_NAME = /geometry|geo$/i;
-// Data-flow: any identifier declared as `const/let/var X = <expr>.geometry` is a Geometry
-// regardless of what it's named — this is what catches a reintroduced
-// `const quad = mesh.geometry; … mesh.destroy(); … quad.destroy();` split across statements,
-// not just the single-line `const g = m.geometry; … g.destroy()` shape the original bug in
-// Scene2D's `layoutHash` rebuild had. Applied with BLOCK scope (see findScopedGeometryDestroys below), not a
-// single line or the whole file — a file-wide identifier set conflates an unrelated `g` (e.g. a
-// `Graphics` local in `destroyColliderOverlay`) with a geometry declared under the same short
-// name in a different method of the same file.
-const GEOMETRY_DECL = /\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*[A-Za-z_$][\w.]*?\.geometry\b/g;
-// `?.` is optional between the identifier and `.destroy(` — `geo?.destroy()` is the exact shape
-// this guard exists to catch (it was the bug before this fix).
-const DESTROY_CALL = /\b([A-Za-z_$][A-Za-z0-9_$]*)\??\.destroy\s*\(/g;
-// Builder-chain case: a geometry-returning builder's result destroyed inline, with no
-// identifier for the two checks above to see at all — e.g.
-// `buildMaterialQuad(1,1,0,0).destroy(true)`. Matched by bracket-depth walking from the
-// builder's own `(` to its matching `)`, below, then checking what immediately follows.
-const GEOMETRY_BUILDERS = ['buildMaterialQuad', 'buildTextGeometryByPage'];
-const BUILDER_CALL = new RegExp(`\\b(?:${GEOMETRY_BUILDERS.join('|')})\\s*\\(`, 'g');
-const CHAINED_DESTROY = /^\s*\??\.destroy\s*\(/;
-
-// Function/arrow PARAMETERS are not `const/let/var` declarations, so `GEOMETRY_DECL` never saw
-// them — an inner parameter of the SAME NAME as an outer geometry local used to resolve straight
-// up to that outer decl instead of shadowing it: `const g = m.geometry; releaseGeometry(g);
-// overlays.forEach((g) => g.destroy())` flagged the arrow's own, unrelated `g` (a false positive —
-// the arrow's `g` is never a Geometry). Matched for BOTH a braced body (`(g) => { … }`,
-// `function(g) { … }`, whose real `{` already opens a Frame below — the parameter is registered on
-// that SAME frame) and a concise arrow body with no braces (`(g) => g.destroy()`, which has no `{`
-// to hang a Frame off at all — a SYNTHETIC frame is opened right after `=>` and closed at the first
-// depth-0 statement/argument boundary that follows, i.e. the natural end of a single expression).
-const ARROW_PARAMS = /\(([^()]*)\)\s*=>\s*(\{)?/g;
-const FUNCTION_PARAMS = /\bfunction\b(?:\s+[A-Za-z_$][\w$]*)?\s*\(([^()]*)\)\s*(\{)?/g;
-
-/** Split a parameter list on TOP-LEVEL commas only — a destructured param (`{a, b}`) must not be
- *  split into two. */
-function splitTopLevelParams(paramStr: string): string[] {
-  const parts: string[] = [];
-  let depth = 0;
-  let cur = '';
-  for (const c of paramStr) {
-    if (c === '{' || c === '[') depth++;
-    else if (c === '}' || c === ']') depth--;
-    if (c === ',' && depth === 0) { parts.push(cur); cur = ''; } else cur += c;
-  }
-  if (cur.trim()) parts.push(cur);
-  return parts;
-}
-
-/** Plain identifier parameter names from a parameter-list string — skips destructuring patterns
- *  (the name-based `GEOMETRY_NAME` check still catches a plain `geo`/`geometry` param on its own)
- *  and strips a leading `...` (rest) or a trailing `= default`. */
-function paramIdentifiers(paramStr: string): string[] {
-  return splitTopLevelParams(paramStr)
-    .map((p) => p.trim())
-    .filter((p) => p && p[0] !== '{' && p[0] !== '[')
-    .map((p) => p.replace(/^\.\.\./, '').split('=')[0].trim())
-    .filter((p) => /^[A-Za-z_$][\w$]*$/.test(p));
-}
-
-/** Where a concise (brace-less) arrow body ends: the first depth-0 `,`/`;`, or the first closing
- *  bracket hit AT depth 0 — which belongs to whatever CONTAINS the arrow (e.g. the `)` that closes
- *  `.forEach(...)`), not to the body itself. Balanced brackets/parens/braces nested inside the body
- *  (a call, an object literal) are walked over, not stopped on. */
-function conciseArrowBodyEnd(code: string, start: number): number {
-  let depth = 0;
-  for (let i = start; i < code.length; i++) {
-    const c = code[i];
-    if (c === '(' || c === '[' || c === '{') depth++;
-    else if (c === ')' || c === ']' || c === '}') {
-      if (depth === 0) return i;
-      depth--;
-    } else if (depth === 0 && (c === ',' || c === ';')) return i;
-  }
-  return code.length;
-}
-
-interface ParamScope { frameIndex: number; synthetic: boolean; closeIndex: number; params: string[] }
-
-/** Every function/arrow parameter list in `code`, with where its body's scope frame starts (and,
- *  for a brace-less arrow body, where the synthetic frame ends). Skips a param list with no plain
- *  identifiers to register (nothing to shadow). */
-function findParamScopes(code: string): ParamScope[] {
-  const scopes: ParamScope[] = [];
-  for (const re of [ARROW_PARAMS, FUNCTION_PARAMS]) {
-    re.lastIndex = 0;
-    for (let m = re.exec(code); m; m = re.exec(code)) {
-      const params = paramIdentifiers(m[1]);
-      if (params.length === 0) continue;
-      const bodyStart = m.index + m[0].length;
-      if (m[2] === '{') {
-        scopes.push({ frameIndex: bodyStart - 1, synthetic: false, closeIndex: -1, params }); // the `{` itself — a real open/close event already brackets it
-      } else {
-        scopes.push({ frameIndex: bodyStart, synthetic: true, closeIndex: conciseArrowBodyEnd(code, bodyStart), params });
-      }
-    }
-  }
-  return scopes;
-}
+const GEOMETRY_BUILDERS = new Set(['buildMaterialQuad', 'buildTextGeometryByPage']);
 
 /** Every `.ts`/`.tsx` under `roots`, via the shared corpus producer (#799/#771/#805 Phase 4).
  *  Floored well under the 855 measured today. */
@@ -167,148 +73,94 @@ function sourceFiles() {
   return repoFiles({ under: roots, match: /\.tsx?$/, floor: 600 });
 }
 
-/** The line range of `releaseGeometry`'s own body — the one place allowed to call `.destroy(`
- *  on a Geometry directly. Found by brace-counting on the STRIPPED source from the `function`
- *  keyword to the matching close. */
-function helperLineRange(strippedSrc: string): [number, number] {
-  const startIdx = strippedSrc.indexOf(`function ${HELPER_NAME}(`);
-  if (startIdx < 0) {
-    throw new Error(`${HELPER_NAME} not found in ${path.relative(process.cwd(), HELPER_FILE)} — `
+/** Every `x.destroy(…)` / `x?.destroy(…)` call in `root`, with its receiver's value (wrappers peeled). */
+function destroyCalls(root: ts.Node): Array<{ call: ts.CallExpression; receiver: ts.Expression }> {
+  return callsTo(root, 'destroy').flatMap((call) => {
+    const callee = unwrapValue(call.expression);
+    return ts.isPropertyAccessExpression(callee) ? [{ call, receiver: unwrapValue(callee.expression) }] : [];
+  });
+}
+
+/** The name `receiver` is known by for rule (1): an identifier, or a chain's last member. */
+function receiverName(receiver: ts.Expression): string | undefined {
+  if (ts.isIdentifier(receiver)) return receiver.text;
+  if (ts.isPropertyAccessExpression(receiver) && ts.isIdentifier(receiver.name)) return receiver.name.text;
+  return undefined;
+}
+
+/** A `const/let/var X = <chain>.geometry` declaration — rule (2)'s binding. */
+function isGeometryBinding(d: ts.Node | undefined): d is ts.VariableDeclaration {
+  return !!d && ts.isVariableDeclaration(d) && !!d.initializer && readsGeometry(d.initializer);
+}
+
+/** An expression whose value is a `.geometry` read: the read itself, either side of `??`/`||`/`&&`,
+ *  a `? :` arm, or its `.clone()` (still a Geometry). The regex this replaced matched any initializer
+ *  that STARTED with `<chain>.geometry`, so these all counted (#1241 close-out review). */
+function readsGeometry(e: ts.Expression): boolean {
+  const u = unwrapValue(e);
+  if (/(^|\.)geometry$/.test(accessPath(u) ?? '')) return true;
+  if (ts.isBinaryExpression(u)) {
+    const op = u.operatorToken.kind;
+    if (op === ts.SyntaxKind.QuestionQuestionToken || op === ts.SyntaxKind.BarBarToken) return readsGeometry(u.left) || readsGeometry(u.right);
+    // `a && b` is `a` only when `a` is falsy, and a geometry never is — so only the right side is the value.
+    if (op === ts.SyntaxKind.AmpersandAmpersandToken) return readsGeometry(u.right);
+  }
+  if (ts.isConditionalExpression(u)) return readsGeometry(u.whenTrue) || readsGeometry(u.whenFalse);
+  return ts.isCallExpression(u) && calleeName(u) === 'clone' && ts.isPropertyAccessExpression(u.expression)
+    && readsGeometry(u.expression.expression);
+}
+
+/**
+ * Every `.destroy(` call in `sf` whose receiver is a Pixi Geometry by one of the three rules in the
+ * file docblock, in source order.
+ *
+ * Rule (2) resolves the receiver through the file's own scopes (`declarationOf`), which is what keeps
+ * two same-named locals in two scopes — one a Geometry, one a `Graphics`, or a parameter shadowing a
+ * geometry local — from vouching for each other. The checker is built only for a file that declares a
+ * geometry binding under the receiver's name at all, which is a handful of the ~850.
+ */
+function geometryDestroys(sf: ts.SourceFile): ts.CallExpression[] {
+  const calls = destroyCalls(sf);
+  if (calls.length === 0) return [];
+  const boundNames = new Set(findNodes(sf, isGeometryBinding)
+    .flatMap((d) => (ts.isIdentifier(d.name) ? [d.name.text] : [])));
+  return calls.filter(({ receiver }) => {
+    const name = receiverName(receiver);
+    if (name !== undefined && GEOMETRY_NAME.test(name)) return true;
+    if (ts.isIdentifier(receiver) && boundNames.has(receiver.text) && isGeometryBinding(declarationOf(receiver))) return true;
+    return ts.isCallExpression(receiver) && GEOMETRY_BUILDERS.has(calleeName(receiver) ?? '');
+  }).map(({ call }) => call);
+}
+
+/** `geometryDestroys` over a snippet, as 1-based lines — the fixtures' view of the real classifier. */
+function geometryDestroyLines(code: string): number[] {
+  return geometryDestroys(parseSource(code, 'fixture.ts')).map(lineOf);
+}
+
+/** `releaseGeometry`'s one declaration in `sf` — the one place allowed to call `.destroy(` on a
+ *  Geometry directly. */
+function releaseGeometryIn(sf: ts.SourceFile): ts.FunctionLikeDeclaration & { body: ts.ConciseBody } {
+  const decls = functionsNamed(sf, HELPER_NAME);
+  if (decls.length !== 1) {
+    throw new Error(`${HELPER_NAME} is declared ${decls.length} times in ${path.relative(process.cwd(), HELPER_FILE)} — `
       + 'did it move or get renamed? Update this guard alongside it.');
   }
-  const bodyStart = strippedSrc.indexOf('{', startIdx);
-  let depth = 0;
-  let i = bodyStart;
-  for (; i < strippedSrc.length; i++) {
-    if (strippedSrc[i] === '{') depth++;
-    else if (strippedSrc[i] === '}') { depth--; if (depth === 0) break; }
-  }
-  const startLine = strippedSrc.slice(0, bodyStart).split('\n').length;
-  const endLine = strippedSrc.slice(0, i).split('\n').length;
-  return [startLine, endLine];
+  return decls[0]!;
 }
 
-function findAllMatches(re: RegExp, code: string): RegExpExecArray[] {
-  const out: RegExpExecArray[] = [];
-  re.lastIndex = 0;
-  for (let m = re.exec(code); m; m = re.exec(code)) out.push(m);
-  return out;
-}
-
-// `idents` maps a name to WHETHER its nearest binding is a geometry — `true` for a
-// `const/let/var X = <expr>.geometry` decl, `false` for a function/arrow PARAMETER of the same
-// name, which is a real binding (so it stops the search) but never a geometry.
-type Frame = { parent: Frame | null; idents: Map<string, boolean> };
-
-/** Every `.destroy(` call in `code` that targets a Pixi Geometry, as 1-based line numbers —
- *  either its callee name LOOKS like one, or it's an identifier declared
- *  `const/let/var X = <expr>.geometry` in the SAME lexical block as the call, or an ANCESTOR
- *  block of it (a real caller may capture-then-release several statements apart). Scope is
- *  walked with a brace-depth stack over the whole file: each `{`/`}` (real, or a SYNTHETIC pair
- *  for a brace-less arrow body — see `findParamScopes`) opens/closes a Frame, each declaration
- *  registers its identifier on the CURRENT (innermost) frame, and each `.destroy(` call looks the
- *  identifier up through its own frame and every ancestor, stopping at the NEAREST binding —
- *  exactly JS lexical scoping, which is what keeps two same-named locals in two different scopes
- *  (one a Geometry, one not — including a parameter shadowing an outer geometry local) from
- *  cross-contaminating. Braces are counted on the STRIPPED source (comments already removed)
- *  without string-literal awareness, matching `helperLineRange`'s existing approximation above —
- *  a `{`/`}` inside a string could misattribute scope, an accepted trade-off for a static guard
- *  over real source. */
-function findScopedGeometryDestroys(code: string): number[] {
-  const declMatches = findAllMatches(GEOMETRY_DECL, code);
-  const destroyMatches = findAllMatches(DESTROY_CALL, code);
-  const paramScopes = findParamScopes(code);
-
-  type Event =
-    | { index: number; kind: 'open' }
-    | { index: number; kind: 'close' }
-    | { index: number; kind: 'decl'; ident: string; geometry: boolean }
-    | { index: number; kind: 'destroy'; ident: string; looksGeometry: boolean };
-
-  const events: Event[] = [];
-  for (let i = 0; i < code.length; i++) {
-    if (code[i] === '{') events.push({ index: i, kind: 'open' });
-    else if (code[i] === '}') events.push({ index: i, kind: 'close' });
-  }
-  for (const d of declMatches) events.push({ index: d.index, kind: 'decl', ident: d[1], geometry: true });
-  for (const scope of paramScopes) {
-    // A braced body's `{`/`}` were already pushed by the char scan above — only a brace-less
-    // (synthetic) scope needs its OWN open/close pair. Either way the param decls land at
-    // `frameIndex`, pushed AFTER the matching open so the stable sort keeps them inside the frame
-    // the open just created, not the enclosing one.
-    if (scope.synthetic) {
-      events.push({ index: scope.frameIndex, kind: 'open' });
-      events.push({ index: scope.closeIndex, kind: 'close' });
-    }
-    for (const p of scope.params) events.push({ index: scope.frameIndex, kind: 'decl', ident: p, geometry: false });
-  }
-  for (const m of destroyMatches) {
-    events.push({ index: m.index, kind: 'destroy', ident: m[1], looksGeometry: GEOMETRY_NAME.test(m[1]) });
-  }
-  events.sort((a, b) => a.index - b.index);
-
-  const root: Frame = { parent: null, idents: new Map() };
-  let top = root;
-  const offenderLines: number[] = [];
-
-  for (const ev of events) {
-    if (ev.kind === 'open') {
-      top = { parent: top, idents: new Map() };
-    } else if (ev.kind === 'close') {
-      if (top.parent) top = top.parent;
-    } else if (ev.kind === 'decl') {
-      top.idents.set(ev.ident, ev.geometry);
-    } else {
-      let declaredAsGeometry = false;
-      for (let f: Frame | null = top; f; f = f.parent) {
-        if (f.idents.has(ev.ident)) { declaredAsGeometry = f.idents.get(ev.ident) === true; break; }
-      }
-      if (ev.looksGeometry || declaredAsGeometry) {
-        offenderLines.push(code.slice(0, ev.index).split('\n').length);
-      }
-    }
-  }
-  return offenderLines;
-}
-
-/** 1-based line numbers where a geometry-returning builder's result is destroyed inline —
- *  `buildMaterialQuad(...).destroy(` / `buildTextGeometryByPage(...)?.destroy(` — with no
- *  intervening identifier assignment for `findScopedGeometryDestroys` to see. */
-function findChainedBuilderDestroys(code: string): number[] {
-  const lines: number[] = [];
-  for (let m = BUILDER_CALL.exec(code); m; m = BUILDER_CALL.exec(code)) {
-    const openParen = m.index + m[0].length - 1;
-    let depth = 0;
-    let i = openParen;
-    for (; i < code.length; i++) {
-      if (code[i] === '(') depth++;
-      else if (code[i] === ')') { depth--; if (depth === 0) break; }
-    }
-    if (depth !== 0) continue; // unbalanced parens — malformed/unparseable, skip rather than false-positive
-    if (CHAINED_DESTROY.test(code.slice(i + 1))) lines.push(code.slice(0, i + 1).split('\n').length);
-  }
-  return lines;
+function parsed(abs: string, rel: string): ts.SourceFile {
+  return parseSource(readScannedSource(abs).code, rel);
 }
 
 describe('a Pixi Geometry is destroyed only through releaseGeometry (unload-before-destroy)', () => {
   it('no other .destroy( call touches a geometry-shaped identifier', () => {
     const offenders: string[] = [];
     for (const { abs, rel } of sourceFiles()) {
-      const raw = fs.readFileSync(abs, 'utf8');
-      const code = stripComments(raw);
-      assertScanIsSane(raw, code, rel);
-      const isHelperFile = abs === HELPER_FILE;
-      const [helperStart, helperEnd] = isHelperFile ? helperLineRange(code) : [-1, -1];
-      const inHelper = (lineNo: number) => isHelperFile && lineNo >= helperStart && lineNo <= helperEnd;
-      const codeLines = code.split('\n');
-
-      const offenderLines = [
-        ...findScopedGeometryDestroys(code),
-        ...findChainedBuilderDestroys(code),
-      ];
-      for (const lineNo of offenderLines) {
-        if (inHelper(lineNo)) continue;
-        offenders.push(`${rel}:${lineNo}  ${codeLines[lineNo - 1].trim()}`);
+      const sf = parsed(abs, rel);
+      const helper = abs === HELPER_FILE ? releaseGeometryIn(sf) : undefined;
+      for (const call of geometryDestroys(sf)) {
+        if (helper && ts.findAncestor(call, (n) => n === helper)) continue;
+        offenders.push(`${rel}:${lineOf(call)}  ${call.getText(sf).replace(/\s+/g, ' ')}`);
       }
     }
     expect(
@@ -323,75 +175,96 @@ describe('a Pixi Geometry is destroyed only through releaseGeometry (unload-befo
   });
 
   it(`${HELPER_NAME} itself still calls unload() before destroy(true)`, () => {
-    const raw = fs.readFileSync(HELPER_FILE, 'utf8');
-    const code = stripComments(raw);
-    assertScanIsSane(raw, code, path.relative(process.cwd(), HELPER_FILE));
-    const [start, end] = helperLineRange(code);
-    const body = code.split('\n').slice(start - 1, end).join('\n');
-    // unload()'s position comes from the same whitespace-tolerant pattern that proves it. An earlier
-    // `indexOf('.unload(') < indexOf('.destroy(')` read -1 for `g.unload ()` and passed with the
-    // order reversed (#1181 close-out review, by mutation).
-    const unloadAt = found(body.search(/\.unload\s*\(\s*\)/), `${HELPER_NAME}'s unload() call`);
-    expect(/\.destroy\s*\(\s*true\s*\)/.test(body), `${HELPER_NAME} no longer calls destroy(true)`).toBe(true);
+    const helper = releaseGeometryIn(parsed(HELPER_FILE, path.relative(process.cwd(), HELPER_FILE)));
+    const unloads = callsTo(helper.body, 'unload').filter((c) => c.arguments.length === 0);
+    const destroys = destroyCalls(helper.body).map(({ call }) => call);
+    expect(unloads.length, `${HELPER_NAME} no longer calls unload()`).toBeGreaterThan(0);
+    expect(destroys.some((c) => c.arguments.length === 1 && c.arguments[0]!.kind === ts.SyntaxKind.TrueKeyword),
+      `${HELPER_NAME} no longer calls destroy(true)`).toBe(true);
     // Ordered against ANY destroy, not only destroy(true): a bare destroy() ahead of unload() orphans
     // the VAO just the same (#1181 close-out re-review, by mutation).
-    const destroyAt = found(body.search(/\.destroy\s*\(/), `${HELPER_NAME}'s first destroy call`);
-    expect(unloadAt, `${HELPER_NAME} must call unload() BEFORE destroy() — Pixi orphans the VAO otherwise`)
-      .toBeLessThan(destroyAt);
+    expect(unloads[0]!.getStart(), `${HELPER_NAME} must call unload() BEFORE destroy() — Pixi orphans the VAO otherwise`)
+      .toBeLessThan(destroys[0]!.getStart());
   });
 });
 
-// Unit cover for `findScopedGeometryDestroys` itself, against synthetic snippets rather than the
-// real tree — a positive control (still catches the split-declaration shape the guard exists for)
-// paired with the false positive a parameter/outer-local name collision used to produce.
-describe('findScopedGeometryDestroys — parameter shadowing', () => {
+// Unit cover for the classifier itself, against synthetic snippets rather than the real tree — a
+// positive control (still catches the split-declaration shape the guard exists for) paired with the
+// false positive a parameter/outer-local name collision used to produce.
+describe('geometryDestroys — a receiver named like a geometry', () => {
+  it('flags an identifier or a chain whose last member looks like a geometry', () => {
+    expect(geometryDestroyLines('geo.destroy();\nmesh.geometry?.destroy(true);\nthis.quadGeometry.destroy();')).toEqual([1, 2, 3]);
+  });
+
+  it('does NOT flag a short or unrelated name with no geometry binding', () => {
+    expect(geometryDestroyLines('g.destroy();\nmesh.geometry.buffer.destroy();\ngeoms[0].destroy();')).toEqual([]);
+  });
+});
+
+describe('geometryDestroys — binding resolution', () => {
   it('still flags a captured-then-destroyed geometry split across statements (regression control)', () => {
-    const code = stripComments('const g = m.geometry; doOtherCleanup(); g.destroy();');
-    expect(findScopedGeometryDestroys(code)).toEqual([1]);
+    expect(geometryDestroyLines('const g = m.geometry; doOtherCleanup(); g.destroy();')).toEqual([1]);
   });
 
   it('does NOT flag an arrow parameter that merely shares a name with an outer geometry local', () => {
     // The exact false-positive shape found in review: `g` here is the OUTER geometry local, but
     // `overlays.forEach`'s own `g` is a Graphics-per-overlay parameter — an unrelated binding that
     // shadows the outer one for the whole span of its (brace-less) arrow body.
-    const code = stripComments(
-      'const g = m.geometry; releaseGeometry(g); overlays.forEach((g) => g.destroy());',
-    );
-    expect(findScopedGeometryDestroys(code)).toEqual([]);
+    expect(geometryDestroyLines('const g = m.geometry; releaseGeometry(g); overlays.forEach((g) => g.destroy());')).toEqual([]);
   });
 
   it('does NOT flag a same-named parameter shadowing a braced arrow body either', () => {
-    const code = stripComments(
-      'const g = m.geometry; releaseGeometry(g); overlays.forEach((g) => { g.destroy(); });',
-    );
-    expect(findScopedGeometryDestroys(code)).toEqual([]);
+    expect(geometryDestroyLines('const g = m.geometry; releaseGeometry(g); overlays.forEach((g) => { g.destroy(); });')).toEqual([]);
   });
 
   it('still flags the outer geometry AFTER a shadowing arrow closes', () => {
-    const code = stripComments(
-      'const g = m.geometry; overlays.forEach((g) => { g.destroy(); }); g.destroy();',
-    );
-    // Line 1: the shadowed call inside the arrow must NOT be flagged; the outer `g.destroy()`
+    // Line 2: the shadowed call inside the arrow must NOT be flagged; the outer `g.destroy()`
     // after the arrow closes still refers to the geometry and MUST be.
-    expect(findScopedGeometryDestroys(code)).toEqual([1]);
+    expect(geometryDestroyLines('const g = m.geometry; overlays.forEach((g) => { g.destroy(); });\ng.destroy();')).toEqual([2]);
+  });
+
+  it('does NOT flag a same-named local in ANOTHER function', () => {
+    expect(geometryDestroyLines('function a() { const g = m.geometry; releaseGeometry(g); }\nfunction b() { const g = makeGraphics(); g.destroy(); }')).toEqual([]);
+  });
+
+  it('flags through a `?.`, a cast and a chain that ends in `.geometry`', () => {
+    expect(geometryDestroyLines('const q = (mesh?.geometry as Geometry);\nq?.destroy();')).toEqual([2]);
+    // A fallback, a guard and a clone of a geometry are still a geometry.
+    expect(geometryDestroyLines('const a = mesh.geometry ?? fallback; a.destroy();\nconst b = m.geometry || null; b?.destroy();\nconst c = m.geometry.clone(); c.destroy();')).toEqual([1, 2, 3]);
+    expect(geometryDestroyLines('const d = ready && m.geometry; d.destroy();\nconst e = flag ? m.geometry : other; e.destroy();')).toEqual([1, 2]);
+    // The LEFT side of `&&` is never the value.
+    expect(geometryDestroyLines('const idx = m.geometry && m.geometry.indexBuffer; idx.destroy();')).toEqual([]);
+    // A binding of something READ off a geometry is not a geometry.
+    expect(geometryDestroyLines('const a = mesh.geometry.attributes; a.destroy();')).toEqual([]);
+  });
+
+  it('keeps a scope when a string holds a closing brace (#1241 — the brace-counting simulator closed it early)', () => {
+    // The old frame stack popped at the `'}'`, looked `g` up in the file scope, found nothing and
+    // passed this. Observed red against the old reader before the migration.
+    expect(geometryDestroyLines("function a() {\n  const g = m.geometry;\n  log('}');\n  g.destroy();\n}")).toEqual([4]);
   });
 });
 
-// `findChainedBuilderDestroys` had no cover of its own, and a clean tree holds no instance of the
-// shape — so a matcher that stopped matching would green the sweep above indistinguishably (#1105).
-// No real-corpus control exists to pair with it: the helper's own `g.destroy(true)` is NOT matched
-// (a `g` parameter is neither geometry-named nor a `.geometry` decl), so nothing is exempted today.
-describe('findChainedBuilderDestroys', () => {
+// The builder rule had no cover of its own, and a clean tree holds no instance of the shape — so a
+// matcher that stopped matching would green the sweep above indistinguishably (#1105). No real-corpus
+// control exists to pair with it: the helper's own `g.destroy(true)` is NOT matched (a `g` parameter
+// is neither geometry-named nor a `.geometry` binding), so nothing is exempted today.
+describe('geometryDestroys — a builder result destroyed inline', () => {
   it('flags a builder result destroyed inline, including through ?. and nested parens', () => {
-    expect(findChainedBuilderDestroys(stripComments('buildMaterialQuad(1, 1, 0, 0).destroy(true);'))).toEqual([1]);
-    expect(findChainedBuilderDestroys(stripComments('x();\nbuildTextGeometryByPage(page, f(a, b))?.destroy();'))).toEqual([2]);
+    expect(geometryDestroyLines('buildMaterialQuad(1, 1, 0, 0).destroy(true);')).toEqual([1]);
+    expect(geometryDestroyLines('x();\nbuildTextGeometryByPage(page, f(a, b))?.destroy();')).toEqual([2]);
+  });
+
+  it('flags one whose arguments hold a paren inside a string (#1241 — the paren count ended there)', () => {
+    expect(geometryDestroyLines("buildMaterialQuad(1, ')').destroy(true);")).toEqual([1]);
   });
 
   it('does NOT flag a builder result that is kept, or released through the helper', () => {
-    expect(findChainedBuilderDestroys(stripComments('const q = buildMaterialQuad(1, 1, 0, 0); releaseGeometry(q);'))).toEqual([]);
-    // A later `.destroy(` on the same line is NOT chained — only what immediately follows the
-    // builder's `)` is. This is the case that fails if CHAINED_DESTROY loses its `^\s*` anchor.
-    expect(findChainedBuilderDestroys(stripComments('const q = buildMaterialQuad(1, 1, 0, 0); q.destroy();'))).toEqual([]);
-    expect(findChainedBuilderDestroys(stripComments('mesh.geometry = buildMaterialQuad(w, h, 0, 0);'))).toEqual([]);
+    expect(geometryDestroyLines('const q = buildMaterialQuad(1, 1, 0, 0); releaseGeometry(q);')).toEqual([]);
+    // A later `.destroy(` on a DIFFERENT receiver is not chained — only a call on the builder's
+    // own result is.
+    expect(geometryDestroyLines('const q = buildMaterialQuad(1, 1, 0, 0); q.destroy();')).toEqual([]);
+    expect(geometryDestroyLines('mesh.geometry = buildMaterialQuad(w, h, 0, 0);')).toEqual([]);
+    expect(geometryDestroyLines('buildMaterialQuad(1, 1, 0, 0).other().destroy();')).toEqual([]);
   });
 });

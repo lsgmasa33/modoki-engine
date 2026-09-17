@@ -363,6 +363,17 @@ an optional alpha coverage predicate; these return a ready `.rig2d.json` payload
 
 ## Gotchas
 
+- **An async Skin panel op commits only onto the document it was computed from.** Re-tessellate,
+  auto-rig and assigning a sprite to a meshless part read the rig, await the sprite's dims or alpha
+  mask, then commit a WHOLE copy of the document they read. `commit` used to write that copy to
+  whatever rig was open when the await returned, so opening another rig meanwhile replaced its
+  document, bones and all (observed: the second rig came back with `bar`'s bones), and an edit made
+  meanwhile to the same rig was silently overwritten. Each op now captures its basis (path +
+  document identity, `editor/panels/skinOpBasis.ts`) and `commit` refuses with an on-screen
+  "the rig changed while it was computing — nothing applied" notice (naming the rig, and cleared by the next applied edit or a rig switch) when the editor no longer holds exactly
+  that document. Pinned by `tests/editor/skinOpBasis.test.ts` and
+  `engine/tests/e2e/editor-skin-op-retarget.spec.ts`, which holds the mask request to open the
+  window deterministically. A new async op must capture a basis the same way.
 - **Trait fields must stay scalar** — the `traitScalarFields` guard fails the build on
   any new array/object trait field. All rig structure lives in the `.rig2d.json` asset
   and the bone hierarchy is child entities, never an array on a trait.

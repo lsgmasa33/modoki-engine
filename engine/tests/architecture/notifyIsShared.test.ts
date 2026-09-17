@@ -49,9 +49,9 @@
  *   - **A `.map`/`for` over an ARRAY of callbacks built inline**, never stored in a named binding.
  *     Not seen in SCAN_DIRS, and matching it would need to distinguish a callback array from any
  *     other array of functions.
- *   - **`.forEach((cb, i) => cb())`** — a multi-parameter callback. `FOREACH_NOTIFY` requires a
- *     single parameter. No instance in SCAN_DIRS (scanned); stated because the single-parameter
- *     assumption is exactly the kind this guard has now been wrong about twice.
+ *   - **A `.forEach` whose callback is not written inline** — `subs.forEach(dispatch)`, or a
+ *     callback bound first and passed by name. Only an arrow or function expression is read; the
+ *     multi-parameter and non-first-statement spellings are read since #1241.
  *   - **Rows are `path :: identifier`, not line numbers.** While the `KNOWN_UNMIGRATED` ledger
  *     existed this was a real hole: one file could hold several identical rows (each event bus did,
  *     one per emitter), so migrating one of a same-named pair while adding a NEW loop with the same
@@ -89,9 +89,9 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import fs from 'node:fs';
 import path from 'node:path';
-import { stripCommentsAndStrings } from '@modoki/engine/testing';
+import { readScannedSource } from '@modoki/engine/testing';
+import { callsTo, declarationOf, findNodes, parseSource, unwrapValue, ts } from '@modoki/engine/testing/sourceAst';
 import { assertExemptionLedger } from '@modoki/engine/testing/exemptionLedger';
 import { repoFiles } from '../../scripts/repoCorpus.mjs';
 import { deriveUnscannedRoots } from '../helpers/unscannedRoots';
@@ -176,6 +176,14 @@ const insideScanDirs = (rel: string): boolean =>
  *    reports a throwing provider once per provider (`warnedThrowers`) so a per-frame
  *    `modoki_handles` poll cannot flood the console; the helper would report on every call.
  *
+ *  - `runtime/core/screenBounds.ts` `collectScreenBounds` — a COLLECT query, `interactionHandles`'
+ *    shape: each provider RETURNS bounds, spread into the result, inside its own skip-on-throw `try`.
+ *  - `editor/panels/assetEditorBindings.ts` — `PARKED_MOVE_REPAIRS`, a fixed table of repairers
+ *    each RETURNING the notes it produced. Not a subscriber set at all.
+ *
+ *  Both were invisible to the text detector until #1241: the element is called inside a spread
+ *  (`...p(set)`), and the regex refused a call preceded by `.` so as not to read `entity.id()`.
+ *
  *  - `engine/plugins/load-project-config.ts` — `for (const [filename, read] of [[…, readRawProjectConfig],
  *    […, readRawProjectUserConfig]] as const)`. An inline two-element array of READERS whose return
  *    value is used; the header lists this shape as one the guard does not mean to match, and it is
@@ -224,6 +232,8 @@ const EXEMPT: Readonly<Record<string, ExemptKind>> = {
   'engine/packages/modoki/src/runtime/core/screenPick.ts :: fn': 'query',
   'engine/packages/modoki/src/runtime/rendering/hitRegions.ts :: fn': 'query',
   'engine/packages/modoki/src/runtime/rendering/interactionHandles.ts :: p': 'query',
+  'engine/packages/modoki/src/runtime/core/screenBounds.ts :: p': 'query',
+  'engine/packages/modoki/src/editor/panels/assetEditorBindings.ts :: repair': 'query',
   'engine/plugins/load-project-config.ts :: read': 'query',
   'games/wordweave/runtime/stem.ts :: coValidate': 'query',
   'engine/packages/modoki/src/runtime/scene/SceneManager.ts :: hook': 'async-sequential',
@@ -245,104 +255,37 @@ function scannedFiles(roots: readonly string[] = SCAN_DIRS): Array<{ rel: string
   });
 }
 
-const esc = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-/** Half 1: a `for…of` over ANY iterable, binding one or more element names.
+/** Every identifier a binding brings into scope, read off the binding NODE (#1241).
  *
- *  ⚠️ Deliberately NOT restricted to sets named `listeners`/`subs`/`cbs` — see the header. The
- *  discrimination is entirely Half 2's job: `for (const id of pending) clearTimeout(id)` and
- *  `for (const k of kids) visit(k)` bind an element and do not CALL it, so they do not match.
- *
- *  ⚠️ **And not restricted to a bare identifier either, which is the trap version 2 fell into.**
- *  Having just replaced a NAME-scoped claim, it replaced it with a BINDING-FORM-scoped one:
+ *  ⚠️ **Not restricted to a bare identifier, which is the trap version 2 fell into.** Having just
+ *  replaced a NAME-scoped claim, it replaced it with a BINDING-FORM-scoped one:
  *  `for (const [key, fn] of registry) fn(...)` — the standard spelling for a keyed subscriber
  *  registry — matched nothing. That hid `runtime/core/lateUpdate.ts` and `SceneManager`'s
  *  `fireSceneCallbacks`, both of which carry their own hand-rolled isolation, i.e. copies nine and
  *  ten of the convention the helper exists to absorb. Found by review, not by this guard.
- *  A destructured binding contributes EVERY name it binds; Half 2 asks whether any of them is
- *  called. */
-const SUBSCRIBER_LOOPS = /for\s*\(\s*const\s+([\w$]+|[[{][^;]*?)\s+of\s+/g;
-
-/** Every identifier a binding brings into scope.
  *
- *  ⚠️ **Deliberately OVER-collects rather than risking a miss.** The two failure directions are not
- *  symmetric here: an extra name can only produce a hit that a human then reads and dismisses,
- *  while a missing name is a fan-out nobody ever sees — which is the failure this guard has now
- *  shipped twice (once scoped by variable NAME, once by BINDING FORM).
- *
- *  Handles, all measured: a plain identifier; array patterns including holes (`[, e]`), defaults
- *  (`[a = noop]` binds `a`, not `noop`) and rest (`[a, ...rest]`); object patterns (`{ fn }`, and
- *  `{ a: b }` binds `b`, not `a`); and nesting in either direction (`[a, { fn }]`,
- *  `[a, [b, fn]]`) — the last of which the previous `\[([^\]]*)\]` could not even match, because
- *  it stopped at the first `]`. `for (const { fn } of …)` is idiomatic in this repo (this very file
- *  uses `for (const { rel, abs } of …)`), so that gap was the one most likely to bite. */
-function boundNames(binding: string): string[] {
-  const noDefaults = binding.replace(/=\s*[^,\]}]+/g, '');   // `[a = noop]` binds a
-  const noKeys = noDefaults.replace(/([\w$]+)\s*:/g, '');     // `{ a: b }` binds b
-  return [...noKeys.matchAll(/[\w$]+/g)].map((mm) => mm[0]!);
+ *  Every shape is the parser's: a plain identifier; array patterns with holes (`[, e]`), defaults
+ *  (`[a = noop]` binds `a`, not `noop`) and rest; object patterns (`{ a: b }` binds `b`); nesting
+ *  either way. The text version before #1241 was a regex over the binding's text that had to
+ *  over-collect to be safe; a name that is not bound is now simply not returned. */
+function boundIdentifiers(name: ts.BindingName): ts.Identifier[] {
+  if (ts.isIdentifier(name)) return [name];
+  return name.elements.flatMap((e) => (ts.isOmittedExpression(e) ? [] : boundIdentifiers(e.name)));
 }
 
-/** The offset just past the `)` that closes this loop's header.
+/** Half 2: `body` CALLS the binding `id` declares — `fn(…)`, `fn?.(…)`, `(fn as F)(…)`.
  *
- *  Needed because Half 1 now ends at ` of `, not at `)` — the iterable expression can itself
- *  contain parentheses (`for (const [k, v] of Object.entries(x))`), so the close has to be found by
- *  counting rather than by matching `[^)]+\)`, which is what the old form did and what stopped it
- *  from ever seeing a nested pattern. */
-function headerEnd(src: string, from: number): number {
-  let depth = 0;
-  for (let i = from; i < src.length; i++) {
-    if (src[i] === '(') depth++;
-    else if (src[i] === ')') { depth--; if (depth === 0) return i + 1; }
-  }
-  return from;
-}
-
-/** The `.forEach` spelling of the same thing: `set.forEach((cb) => cb())`. The callback's own
- *  parameter must be the thing invoked, which is what separates it from any other forEach. */
-const FOREACH_NOTIFY =
-  /\.forEach\s*\(\s*(?:async\s*)?\(?\s*([\w$]+)\s*\)?\s*=>\s*(?:\{\s*)?([\w$]+)\s*\(/g;
-
-/** Half 2: the loop's element is CALLED **inside the loop's own body**.
- *
- *  ⚠️ The body is delimited properly — braces matched, or up to the `;` of a single-statement
- *  loop — NOT a fixed character window. A window was the first version and it was unusable once
- *  Half 1 stopped filtering by name: `for (const id of ids)` paired with an unrelated `entity.id()`
- *  600 characters later, and the guard reported a dozen files that contain no fan-out at all.
- *  The stripper blanks in place rather than deleting, so offsets are the source's own and this
- *  scan is safe to run on them.
- *
- *  The leading `(^|[^\w$.])` is what rejects a METHOD call: `entity.id()` must not count as the
- *  loop variable `id` being invoked. */
-/** String and template literals must be blanked before `bodyCallsElement` counts braces, or a `}`
- *  that is DATA closes the loop body early and the fan-out inside it goes unseen. Measured:
- *  `for (const fn of listeners) { log('}'); fn(); }` reported FALSE without this.
- *
- *  ⚠️ **This is `stripCommentsAndStrings`, the repo's shared parser-driven stripper, and reaching
- *  for a private regex here would be a real defect rather than a shortcut.** An earlier version of
- *  this file hand-rolled one — the thirteenth, which `sourceScanner.ts`'s own header rule 1
- *  forbids by name — and it reproduced the exact bug that header records: a lone backtick in JSX
- *  text pairs with the next template's backtick and blanks every line between, `fn();` included.
- *  Measured on the shipped version before the swap: 353 of 880 scanned files had real code blanked
- *  (mostly `${…}` interpolation contents), and `' '.repeat()` over a multi-line template destroyed
- *  the line count that `assertScanIsSane` exists to check. The parser build yields the identical
- *  ledger rows and additionally closes the regex-literal hole the hand-rolled one had to
- *  declare as a blind spot. */
-function bodyCallsElement(src: string, from: number, element: string): boolean {
-  let i = from;
-  while (i < src.length && /\s/.test(src[i]!)) i++;
-  let body: string;
-  if (src[i] === '{') {
-    let depth = 0; let j = i;
-    for (; j < src.length; j++) {
-      if (src[j] === '{') depth++;
-      else if (src[j] === '}') { depth--; if (depth === 0) { j++; break; } }
-    }
-    body = src.slice(i, j);
-  } else {
-    const end = src.indexOf(';', i);
-    body = src.slice(i, end < 0 ? i + 200 : end + 1);
-  }
-  return new RegExp(`(^|[^\\w$.])${esc(element)}\\s*\\(`).test(body);
+ *  ⚠️ **By symbol, not by name (#1241).** The body is the loop's or callback's own NODE, so a `}`
+ *  inside a string cannot end it early (measured before the literal blanking existed:
+ *  `for (const fn of listeners) { log('}'); fn(); }` read FALSE) and a single-statement body cannot
+ *  run on to the next `;`. And the callee has to RESOLVE to this binding: a nested function's own
+ *  `fn` parameter called inside the loop is not the loop's element. A method call (`entity.id()`)
+ *  is not a call of `id` at all — its callee is a property access, not the identifier. */
+function callsBinding(body: ts.Node, id: ts.Identifier): boolean {
+  return findNodes(body, ts.isCallExpression).some((c) => {
+    const callee = unwrapValue(c.expression);
+    return ts.isIdentifier(callee) && callee.text === id.text && declarationOf(callee) === id.parent;
+  });
 }
 
 interface Scanned { file: string; offenders: string[] }
@@ -353,34 +296,42 @@ function rowsFrom(scanned: Scanned[]): string[] {
   return scanned.flatMap((r) => r.offenders.map((o) => `${r.file} :: ${o}`)).sort();
 }
 
-/** The offenders in ONE comment-and-string-stripped source: both halves of the detector, exactly as
- *  `scan` runs them. A function of its own so the positive control below exercises the SAME code
- *  `scan` does. A control that re-implements the match is not a control, and the #953 phase-3/4
- *  review measured that: disabling the forEach branch in here left the string-regex check green. */
-function offendersIn(src: string): string[] {
-  const offenders: string[] = [];
-  for (const m of src.matchAll(SUBSCRIBER_LOOPS)) {
-    const body = headerEnd(src, m.index!);
-    for (const name of boundNames(m[1]!)) {
-      if (bodyCallsElement(src, body, name)) offenders.push(name);
-    }
-  }
-  for (const m of src.matchAll(FOREACH_NOTIFY)) {
-    if (m[1] === m[2]) offenders.push(`${m[1]!} (forEach)`);
-  }
-  return offenders;
+/** The offenders in ONE parsed source: both halves of the detector, exactly as `scan` runs them. A
+ *  function of its own so the positive controls below exercise the SAME code `scan` does. A control
+ *  that re-implements the match is not a control, and the #953 phase-3/4 review measured that:
+ *  disabling the forEach branch in here left the string-regex check green.
+ *
+ *  Half 1 is a `for…of` over ANY iterable, binding one or more element names — deliberately NOT
+ *  restricted to sets named `listeners`/`subs`/`cbs` (see the header). The discrimination is Half 2's
+ *  job: `for (const id of pending) clearTimeout(id)` binds an element and does not CALL it.
+ *
+ *  The `.forEach` spelling is the same pair: a callback PARAMETER that the callback calls —
+ *  `set.forEach((cb) => cb())`, a `function (cb) {…}`, a `(fn, key) => fn()` over a Map, or a call
+ *  that is not the body's first statement. The regex before #1241 saw only the first of those. */
+function offendersIn(code: string, label: string): string[] {
+  const sf = parseSource(code, label);
+  const loops = findNodes(sf, ts.isForOfStatement).flatMap((loop) => {
+    const init = loop.initializer;
+    if (!ts.isVariableDeclarationList(init)) return [];
+    return init.declarations.flatMap((d) => boundIdentifiers(d.name))
+      .filter((id) => callsBinding(loop.statement, id)).map((id) => id.text);
+  });
+  const forEachs = callsTo(sf, 'forEach').flatMap((call) => {
+    const cb = call.arguments[0] && unwrapValue(call.arguments[0]);
+    if (!ts.isPropertyAccessExpression(call.expression) || !cb || !(ts.isArrowFunction(cb) || ts.isFunctionExpression(cb))) return [];
+    return cb.parameters.flatMap((p) => boundIdentifiers(p.name))
+      .filter((id) => callsBinding(cb.body, id)).map((id) => `${id.text} (forEach)`);
+  });
+  return [...loops, ...forEachs];
 }
 
 function scan(roots: readonly string[] = SCAN_DIRS, dropOverlap = false): Scanned[] {
   const results: Scanned[] = [];
   for (const { rel, abs } of scannedFiles(roots)) {
     if (dropOverlap && insideScanDirs(rel)) continue;   // see `insideScanDirs`
-    // ONE parse per file. `stripCommentsAndStrings` blanks comments AND string/template literals
-    // in a single pass (it calls `stripComments` itself), so this replaces the `readScannedSource`
-    // call that used to sit here — and doing it per LOOP-MATCH instead of per file timed the suite
-    // out at 20s, which is how this ended up hoisted rather than tucked inside the predicate.
-    const src = stripCommentsAndStrings(fs.readFileSync(abs, 'utf8'), rel);
-    results.push({ file: rel, offenders: abs === HELPER ? [] : offendersIn(src) });
+    // ONE parse per file, of the comment-blanked text: a string is a node, so literals no longer need
+    // blanking — `stripCommentsAndStrings` did that only so a brace count could not read them (#1241).
+    results.push({ file: rel, offenders: abs === HELPER ? [] : offendersIn(readScannedSource(abs).code, rel) });
   }
   return results;
 }
@@ -400,19 +351,15 @@ describe('every fan-out-shaped loop is migrated or exempt (#888, #953)', () => {
     // Without this, a regex that silently stopped matching would make the whole file green while
     // testing nothing. The helper carries the ONE legitimate hand-rolled loop, so it is the
     // natural positive control: exempt in `scan`, but the detector must still fire on it.
-    const src = stripCommentsAndStrings(fs.readFileSync(HELPER, 'utf8'), 'notifyListeners.ts');
-    const hits = [...src.matchAll(SUBSCRIBER_LOOPS)]
-      .filter((m) => boundNames(m[1]!).some((n) => bodyCallsElement(src, headerEnd(src, m.index!), n)));
+    const hits = offendersIn(readScannedSource(HELPER).code, 'notifyListeners.ts');
     expect(hits.length, 'the detector no longer fires on the helper\'s own loop — it has stopped '
       + 'detecting anything, and every other assertion in this file is now vacuous').toBe(1);
 
     // The forEach half needs its own control: it shares no code with the loop half, so a green
     // file proves nothing about it. This fixture is the exact spelling found in `traitClipboard`,
     // `gameRegistry` and `spriteMaterialCache` — all three invisible to the first version.
-    const positive = 'listeners.forEach((l) => l());';
-    const negative = 'rows.forEach((r) => render(r));';
-    expect([...positive.matchAll(FOREACH_NOTIFY)].filter((m) => m[1] === m[2]).length).toBe(1);
-    expect([...negative.matchAll(FOREACH_NOTIFY)].filter((m) => m[1] === m[2]).length).toBe(0);
+    expect(offendersIn('listeners.forEach((l) => l());', 'fixture.ts')).toEqual(['l (forEach)']);
+    expect(offendersIn('rows.forEach((r) => render(r));', 'fixture.ts')).toEqual([]);
   });
 
   it('the detector `scan` runs fires on BOTH spellings — a positive control through the real path', () => {
@@ -420,22 +367,22 @@ describe('every fan-out-shaped loop is migrated or exempt (#888, #953)', () => {
     // control above stayed green, and only ledger rows that happened to use `.forEach` went red.
     // #953 migrated the last of those, so without this control the forEach half could stop firing
     // and the whole guard would still pass.
-    const fixture = stripCommentsAndStrings([
+    const fixture = [
       'for (const fn of listeners) { fn(); }',
       'subs.forEach((cb) => cb(1));',
       'rows.forEach((r) => render(r));',
       'for (const id of ids) { clearTimeout(id); }',
-    ].join('\n'), 'fixture.ts');
-    expect(offendersIn(fixture)).toEqual(['fn', 'cb (forEach)']);
+    ].join('\n');
+    expect(offendersIn(fixture, 'fixture.ts')).toEqual(['fn', 'cb (forEach)']);
 
     // And through the TSX parse, with JSX around the loop: the panels' effect-cleanup shape.
-    const tsx = stripCommentsAndStrings([
+    const tsx = [
       'export function Panel() {',
       '  useEffect(() => { return () => { for (const off of offs) off(); }; }, []);',
       '  return <div className="row">{items.map((i) => <span key={i}>{i}</span>)}</div>;',
       '}',
-    ].join('\n'), 'fixture.tsx');
-    expect(offendersIn(tsx)).toEqual(['off']);
+    ].join('\n');
+    expect(offendersIn(tsx, 'fixture.tsx')).toEqual(['off']);
   });
 
   it('no hand-rolled fan-out inside SCAN_DIRS or the unscanned roots beyond EXEMPT — and every row still earns itself', () => {
@@ -480,62 +427,67 @@ describe('every fan-out-shaped loop is migrated or exempt (#888, #953)', () => {
 
   it('a `}` inside a string literal does not truncate the loop body', () => {
     // Measured before `blankLiterals` existed: this exact body reported FALSE, so a hand-rolled
-    // fan-out whose body happened to contain a brace in a string was invisible.
-    const withBrace = 'for (const fn of listeners) { log(\'}\'); fn(); }';
-    const plain = 'for (const fn of listeners) { fn(); }';
-    const negative = 'for (const fn of listeners) { other(); }';
-    for (const [src, expected] of [[withBrace, true], [plain, true], [negative, false]] as const) {
-      const stripped = stripCommentsAndStrings(src, 'fixture.ts');
-      const m = [...src.matchAll(SUBSCRIBER_LOOPS)][0]!;
-      expect(bodyCallsElement(stripped, headerEnd(src, m.index!), 'fn'), src).toBe(expected);
-    }
+    // fan-out whose body happened to contain a brace in a string was invisible. The body is a node
+    // now; the case stays because it is the hazard a text reader of this shape fails.
+    expect(offendersIn('for (const fn of listeners) { log(\'}\'); fn(); }', 'fixture.ts')).toEqual(['fn']);
+    expect(offendersIn('for (const fn of listeners) { fn(); }', 'fixture.ts')).toEqual(['fn']);
+    expect(offendersIn('for (const fn of listeners) { other(); }', 'fixture.ts')).toEqual([]);
   });
 
   it('reads every destructuring shape — object, nested, holes, defaults, rest', () => {
-    // The three rows marked MISS here were measured on the previous version and are what the
-    // object-pattern widening bought: `{ fn }` matched nothing at all (and it is idiomatic — this
-    // very file uses `for (const { rel, abs } of …)`), and `[a, [b, fn]]` could not match because
-    // the old `\[([^\]]*)\]` stopped at the first `]`. Both would have hidden a fan-out silently,
-    // which is the failure this guard has now shipped twice.
-    const cases: Array<[string, string[]]> = [
-      ['for (const { fn } of listeners) { fn(); }', ['fn']],                      // was: no match
-      ['for (const [key, { fn }] of x) { fn(); }', ['key', 'fn']],                // was: MISS
-      ['for (const [a, [b, fn]] of x) { fn(); }', ['a', 'b', 'fn']],              // was: no match
-      ['for (const { a: fn } of x) { fn(); }', ['fn']],
-      ['for (const [a = noop] of x) { a(); }', ['a']],
-      ['for (const [, e] of x) { e(); }', ['e']],
-      ['for (const [a, ...rest] of x) { a(); }', ['a', 'rest']],
+    // The rows marked "was" were measured on earlier versions: `{ fn }` matched nothing at all (and it
+    // is idiomatic — this very file uses `for (const { rel, abs } of …)`), and `[a, [b, fn]]` could not
+    // match because an old `\[([^\]]*)\]` stopped at the first `]`. Both hid a fan-out silently.
+    const cases: Array<[string, string[], string[]]> = [
+      ['for (const { fn } of listeners) { fn(); }', ['fn'], ['fn']],               // was: no match
+      ['for (const [key, { fn }] of x) { fn(); }', ['key', 'fn'], ['fn']],         // was: MISS
+      ['for (const [a, [b, fn]] of x) { fn(); }', ['a', 'b', 'fn'], ['fn']],       // was: no match
+      ['for (const { a: fn } of x) { fn(); }', ['fn'], ['fn']],
+      ['for (const [a = noop] of x) { a(); }', ['a'], ['a']],
+      ['for (const [a = noop] of x) { noop(); }', ['a'], []],                       // a default is not bound
+      ['for (const [, e] of x) { e(); }', ['e'], ['e']],
+      ['for (const [a, ...rest] of x) { a(); }', ['a', 'rest'], ['a']],
     ];
-    for (const [src, expected] of cases) {
-      const m = [...src.matchAll(SUBSCRIBER_LOOPS)][0];
-      expect(m, `Half 1 does not match: ${src}`).toBeDefined();
-      expect(boundNames(m![1]!), src).toEqual(expected);
-      expect(boundNames(m![1]!).some((n) => bodyCallsElement(src, headerEnd(src, m!.index!), n)), src)
-        .toBe(true);
+    for (const [src, bound, called] of cases) {
+      const loop = findNodes(parseSource(src, 'fixture.ts'), ts.isForOfStatement)[0]!;
+      const decl = (loop.initializer as ts.VariableDeclarationList).declarations[0]!;
+      expect(boundIdentifiers(decl.name).map((id) => id.text), src).toEqual(bound);
+      expect(offendersIn(src, 'fixture.ts'), src).toEqual(called);
     }
   });
 
   it('an iterable containing parentheses does not truncate the header', () => {
-    // Half 1 now ends at ` of `, so the loop body starts after a COUNTED `)` rather than the first
-    // one. `Object.entries(x)` is the shape that breaks the naive version.
-    const src = 'for (const [k, fn] of Object.entries(reg)) { fn(); }';
-    const m = [...src.matchAll(SUBSCRIBER_LOOPS)][0]!;
-    expect(bodyCallsElement(src, headerEnd(src, m.index!), 'fn')).toBe(true);
+    // `Object.entries(x)` is the shape that broke the naive header match.
+    expect(offendersIn('for (const [k, fn] of Object.entries(reg)) { fn(); }', 'fixture.ts')).toEqual(['fn']);
   });
 
   it('reads a DESTRUCTURED binding — the keyed-registry spelling', () => {
     // The blind spot that hid `lateUpdate` and `fireSceneCallbacks` from version 2 of this guard.
-    const keyed = 'for (const [key, fn] of registry) { fn(world); }';
-    const m = [...keyed.matchAll(SUBSCRIBER_LOOPS)][0];
-    expect(m, 'Half 1 no longer matches a destructured binding').toBeDefined();
-    expect(boundNames(m![1]!)).toEqual(['key', 'fn']);
-    expect(boundNames(m![1]!).some((n) => bodyCallsElement(keyed, headerEnd(keyed, m!.index!), n)))
-      .toBe(true);
+    expect(offendersIn('for (const [key, fn] of registry) { fn(world); }', 'fixture.ts')).toEqual(['fn']);
     // …and the key being unused must not by itself make it a hit.
-    const notAFanout = 'for (const [key, row] of registry) { render(row, key); }';
-    const m2 = [...notAFanout.matchAll(SUBSCRIBER_LOOPS)][0]!;
-    expect(boundNames(m2[1]!).some((n) => bodyCallsElement(notAFanout, headerEnd(notAFanout, m2.index!), n)))
-      .toBe(false);
+    expect(offendersIn('for (const [key, row] of registry) { render(row, key); }', 'fixture.ts')).toEqual([]);
+  });
+
+  it('asks whether the LOOP\'S binding is called, not a same-named one (#1241)', () => {
+    // A nested function's own `fn` parameter shadows the loop element; calling it is not a fan-out.
+    expect(offendersIn('for (const fn of listeners) { wrap((fn) => fn()); }', 'fixture.ts')).toEqual([]);
+    // A method named like the element is not a call of it.
+    expect(offendersIn('for (const id of ids) { entity.id(); }', 'fixture.ts')).toEqual([]);
+    // A single-statement body ends where the statement does, not at the next `;` in the file.
+    expect(offendersIn('for (const fn of listeners) other(fn)\nfn();', 'fixture.ts')).toEqual([]);
+    // Optional call and a cast still call it.
+    expect(offendersIn('for (const fn of listeners) { fn?.(); }', 'fixture.ts')).toEqual(['fn']);
+    expect(offendersIn('for (const fn of listeners) { (fn as F)(); }', 'fixture.ts')).toEqual(['fn']);
+  });
+
+  it('reads the forEach spellings the single-parameter regex could not (#1241)', () => {
+    expect(offendersIn('subs.forEach(function (cb) { cb(); });', 'fixture.ts')).toEqual(['cb (forEach)']);
+    // A parameter other than the first — the element `(cb, i)` spelling's mirror.
+    expect(offendersIn('pairs.forEach((key, fn) => fn(key));', 'fixture.ts')).toEqual(['fn (forEach)']);
+    expect(offendersIn('subs.forEach((cb) => { log(); cb(); });', 'fixture.ts')).toEqual(['cb (forEach)']);
+    expect(offendersIn('subs.forEach(({ fn }) => fn());', 'fixture.ts')).toEqual(['fn (forEach)']);
+    // A forEach that is not a method call, and a callback that only passes its element on.
+    expect(offendersIn('forEach((cb) => cb());\nrows.forEach((r) => use(r));', 'fixture.ts')).toEqual([]);
   });
 
   it('the roots this guard does NOT scan are really scanned — the ledger above is not vacuous there', () => {

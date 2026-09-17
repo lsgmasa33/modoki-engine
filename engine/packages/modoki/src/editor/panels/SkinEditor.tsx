@@ -44,6 +44,10 @@ import { runUndoCommand } from '../undo/undoCommand';
 import { BufferedNumberInput, inputStyle } from './fields';
 import { getAssetDragInfo, setDragGhostRefusal } from '../utils/dragGhost';
 import { decideSkinPartAssetDrop, skinPartAcceptsAsset } from './assetDropPolicy';
+import { captureSkinOpBasis, isSkinOpBasisCurrent, type SkinOpBasis } from './skinOpBasis';
+
+/** The on-screen words of a refused async op (see `commit`). */
+const SKIN_OP_STALE_NOTICE = 'the rig changed while it was computing — nothing applied';
 
 
 /** Derive width/height/pivot in texture space from the current mesh's vertex bounds,
@@ -294,6 +298,7 @@ export default function SkinEditor() {
   useEffect(() => {
     setLoadState('ok'); // a fresh open/retry starts clean; the fetch below flips this on refusal
     setParkAdopted(false); // …and so does the park notice — the branch below re-raises it if taken
+    setSaveMsg(''); // …and the status line: a message about the previous rig does not describe this one
     if (!asset) return;
     let cancelled = false;
     const existing = useEditorStore.getState().editingSkinDef;
@@ -381,8 +386,20 @@ export default function SkinEditor() {
   }, [asset?.path, nonce]);
 
   // ── Edit → global-undo commit (one step per discrete op) ──
-  const commit = useCallback((next: Rig2DFile, label: string) => {
+  // `basis`: what an ASYNC op computed `next` from. Refused when the editor has moved on since —
+  // another rig opened, or this one edited — because `next` is a whole document (skinOpBasis.ts).
+  const commit = useCallback((next: Rig2DFile, label: string, basis?: SkinOpBasis) => {
     const store = useEditorStore.getState();
+    if (basis && !isSkinOpBasisCurrent(basis, store)) {
+      // Name the rig: after a retarget this notice sits on the OTHER rig, which the op never touched.
+      const rig = assetDisplayName(basis.path) || basis.path;
+      const remedy = label === 'sprite + mesh' ? 'drop the sprite on the part again' : 'run it again';
+      console.warn(`[SkinEditor] ${label} on ${basis.path}: the rig changed while it was computing — nothing applied.`);
+      setSaveMsg(`${label} on ${rig}: ${SKIN_OP_STALE_NOTICE}; ${remedy}`);
+      return;
+    }
+    // A later commit that DID apply supersedes a stale-op notice; any other message is left alone.
+    setSaveMsg((m) => (m.includes(SKIN_OP_STALE_NOTICE) ? '' : m));
     const before = store.editingSkinDef;
     const path = store.editingSkinAsset?.path;
     if (!before || !path) return;
@@ -405,7 +422,8 @@ export default function SkinEditor() {
   // ── Rig operations (pure generation core) ──
   const reTessellate = useCallback(async () => {
     const s = useEditorStore.getState(); const d = s.editingSkinDef;
-    if (!d) return;
+    const basis = captureSkinOpBasis(s);
+    if (!d || !basis) return;
     const ap = activePartOf(d, s.activeSkinPart);
     const dom = await resolveSpriteDomain(ap.sprite, ap.mesh?.verts ?? []);
     let isInside: ((u: number, v: number) => boolean) | undefined;
@@ -426,7 +444,7 @@ export default function SkinEditor() {
     }
     const radius = awRadius > 0 ? awRadius : Math.max(dom.width, dom.height) * 0.6;
     const { skinIndices, skinWeights } = computeAutoWeights(mesh.verts, coerceRigBones(d.bones), { radius, falloff: awFalloff });
-    commit(withActivePart(d, s.activeSkinPart, { mesh, skinIndices, skinWeights }), `tessellate ${cols}×${rows}`);
+    commit(withActivePart(d, s.activeSkinPart, { mesh, skinIndices, skinWeights }), `tessellate ${cols}×${rows}`, basis);
   }, [cols, rows, awRadius, awFalloff, trimAlpha, alphaThreshold, commit]);
 
   const reWeight = useCallback(() => {
@@ -448,12 +466,14 @@ export default function SkinEditor() {
     const ap = activePartOf(d, s.activeSkinPart);
     if (!ap.sprite) { setSaveMsg('Active part has no sprite'); return; }
     if (d.bones?.length && !window.confirm('Auto-rig regenerates the whole skeleton + this part’s mesh + weights. Continue?')) return;
+    const basis = captureSkinOpBasis(s);
+    if (!basis) return;
     const dom = await resolveSpriteDomain(ap.sprite, ap.mesh?.verts ?? []);
     let isInside: ((u: number, v: number) => boolean) | undefined;
     if (trimAlpha && dom.url) { const mask = await loadSpriteAlphaMask(dom.url, { threshold: alphaThreshold, rect: dom.rect }); isInside = mask?.isInside; }
     const rig = autoRig2D({ sprite: ap.sprite, width: dom.width, height: dom.height, isInside });
     const next = withActivePart({ ...d, bones: rig.bones }, s.activeSkinPart, { mesh: rig.mesh, skinIndices: rig.skinIndices, skinWeights: rig.skinWeights });
-    commit(next, 'auto-rig');
+    commit(next, 'auto-rig', basis);
   }, [trimAlpha, alphaThreshold, commit]);
 
   // Assign a sprite to a specific part (defaults to the active one). A part with no
@@ -466,14 +486,16 @@ export default function SkinEditor() {
     const ap = activePartOf(d, partIndex);
     const hasMesh = (ap.mesh?.verts?.length ?? 0) > 0;
     if (!sprite || hasMesh) { commit(withActivePart(d, partIndex, { sprite }), 'sprite'); return; }
+    const basis = captureSkinOpBasis(s);
+    if (!basis) return;
     const dom = await resolveSpriteDomain(sprite, []);
     let isInside: ((u: number, v: number) => boolean) | undefined;
     if (trimAlpha && dom.url) { const mask = await loadSpriteAlphaMask(dom.url, { threshold: alphaThreshold, rect: dom.rect }); isInside = mask?.isInside; }
     const mesh = generateGridMesh({ width: dom.width, height: dom.height, cols, rows, pivotX: dom.pivotX, pivotY: dom.pivotY, isInside });
-    if (!mesh.verts.length) { commit(withActivePart(d, partIndex, { sprite }), 'sprite'); return; } // trim killed every cell → just set the ref
+    if (!mesh.verts.length) { commit(withActivePart(d, partIndex, { sprite }), 'sprite', basis); return; } // trim killed every cell → just set the ref
     const radius = awRadius > 0 ? awRadius : Math.max(dom.width, dom.height) * 0.6;
     const { skinIndices, skinWeights } = computeAutoWeights(mesh.verts, coerceRigBones(d.bones), { radius, falloff: awFalloff });
-    commit(withActivePart(d, partIndex, { sprite, mesh, skinIndices, skinWeights }), 'sprite + mesh');
+    commit(withActivePart(d, partIndex, { sprite, mesh, skinIndices, skinWeights }), 'sprite + mesh', basis);
   }, [commit, cols, rows, awRadius, awFalloff, trimAlpha, alphaThreshold]);
 
   // The active-part variant used by the inspector's sprite ref field.
@@ -524,9 +546,11 @@ export default function SkinEditor() {
   // Append a new part per sprite (each named after its asset, auto-tessellated). Sequential so
   // each addPart reads the freshly-committed def and lands at a correct index.
   const addPartsForSprites = useCallback(async (guids: string[]) => {
+    // Each part awaits its sprite; a rig opened meanwhile must not receive the remaining parts.
+    const path = useEditorStore.getState().editingSkinAsset?.path;
     for (const guid of guids) {
       const cur = useEditorStore.getState().editingSkinDef;
-      if (!cur) break;
+      if (!cur || useEditorStore.getState().editingSkinAsset?.path !== path) break;
       const { def: next, index } = addPart(cur);
       const nice = assetDisplayName(resolveGuidToPath(guid) ?? '');
       commit(nice ? renamePart(next, index, nice) : next, 'add part');
@@ -899,7 +923,7 @@ export default function SkinEditor() {
             immediately — see the retarget effect's comment. */}
         <button data-ui-id="skin.header.close" data-ui-kind="button" data-ui-label="close rig" onClick={() => { dismissedPath.current = selectedAsset?.path ?? asset.path; useEditorStore.getState().closeSkinEditor(); }} title="Close rig (back to the picker)" style={{ ...btn, padding: '1px 7px' }}>✕</button>
         <span style={{ fontWeight: 'bold', color: '#ddd', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{asset.name}</span>
-        {saveMsg && <span style={{ fontSize: 10, color: saveMsg.includes('fail') ? '#e74c3c' : '#8a8a96' }}>{saveMsg}</span>}
+        {saveMsg && <span style={{ fontSize: 10, color: saveMsg.includes('fail') || saveMsg.includes(SKIN_OP_STALE_NOTICE) ? '#e74c3c' : '#8a8a96' }}>{saveMsg}</span>}
         <span style={{ fontSize: 10, color: dirty ? '#f1c40f' : '#2ecc71' }}>{saveStatusLabel(dirty)}</span>
       </div>
 
