@@ -81,18 +81,23 @@ describe('which asset editors are holding unsaved edits (#1362)', () => {
     expect(assetEditorHoldMessage(['/assets/sprites'])).toBeNull();
   });
 
-  // #1362 close-out review: the panel's matcher and the ROUTER's are two implementations of one
-  // predicate, and only the router folded case. On a case-insensitive filesystem both spellings
-  // name one file, so the unfolded version gave NO panel message while the backend refused anyway —
-  // the silent no-op the message exists to prevent.
-  // Mutation: drop the `toLowerCase()` pair from assetEditorHoldMessage.
-  it('matches case-insensitively, as the backend matcher does', () => {
+  // ⚠️ Pins the panel matcher as EXACT, which is the opposite of what a review round asked for and
+  // is the point. A review flagged that this matcher and the ROUTER's disagree — the router folds
+  // case — and I "fixed" it by folding case here too (7294b1921, reverted). That is the looser
+  // match `assetEditorBindings.ts`'s header forbids, and it broke the very case it was meant to
+  // protect: on a case-SENSITIVE volume it makes the panel block a move the backend would allow.
+  //
+  // The two matchers compare different things, so they SHOULD differ: the panel compares two values
+  // from one source (a `from` cased differently from the mount path is unreachable), the router
+  // compares a filesystem-derived path against a store path. This test exists so the next round
+  // does not re-raise it and the next author does not re-loosen it.
+  it('compares paths EXACTLY — a differently-cased path is a different asset here', () => {
     useEditorStore.getState().setEditorMount('sprite', { path: '/assets/Sprites/Catvader.png', slices: [], dirty: true });
-    expect(assetEditorHoldMessage(['/assets/sprites/catvader.png'])).toContain('sprite editor');
-    // …and the folder form, which is where the two matchers had to agree.
-    expect(assetEditorHoldMessage(['/assets/sprites'])).toContain('sprite editor');
-    // …without swallowing a sibling whose name merely starts the same way.
-    expect(assetEditorHoldMessage(['/assets/sprite'])).toBeNull();
+    expect(assetEditorHoldMessage(['/assets/sprites/catvader.png'])).toBeNull();
+    expect(assetEditorHoldMessage(['/assets/sprites'])).toBeNull();
+    // …and the real spelling, from the same source the mount got its path from, still matches.
+    expect(assetEditorHoldMessage(['/assets/Sprites/Catvader.png'])).toContain('sprite editor');
+    expect(assetEditorHoldMessage(['/assets/Sprites'])).toContain('sprite editor');
   });
 
   it('both editors dirty at once are both named', () => {

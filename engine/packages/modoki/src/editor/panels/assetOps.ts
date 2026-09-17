@@ -400,17 +400,28 @@ export async function moveFileTo(from: string, to: string): Promise<boolean> {
  *  `{ok, status}` and throws the reason away, so a refused human rename would look like a move that
  *  simply did not happen. Same fact, one source — `dirtyAssetEditorHolds()`. */
 export function assetEditorHoldMessage(froms: readonly string[]): string | null {
-  // ⚠️ Case-folded, because the BACKEND's matcher is (`heldAssetEditorRefusal`, via
-  // `absToAssetUrl` + `toLowerCase`). This is a second implementation of one predicate — the
-  // docblock above says "same fact, one source", and that was only true of the FACT, not of the
-  // matching. Left unfolded, a `from` spelled in a different case than the mount path produced NO
-  // panel message and a backend refusal anyway: the silent no-op this message exists to prevent,
-  // on a case-insensitive filesystem where both spellings name one file (#1261/#1273's class).
-  const lower = froms.map((f) => f.toLowerCase());
-  const holds = dirtyAssetEditorHolds().filter(({ path }) => {
-    const p = path.toLowerCase();
-    return lower.some((from) => p === from || p.startsWith(`${from}/`));
-  });
+  // ⚠️ EXACT comparison, deliberately — do NOT fold case here, and do not "align" it with the
+  // backend's matcher, which does.
+  //
+  // The two differ because they compare different things. This one compares two values from ONE
+  // source: every `from` the panel passes comes from `asset.path` / `node.path` /
+  // `clipboard.paths`, the same manifest values the mount's `path` is set from, so they cannot
+  // differ in spelling. `assetEditorBindings.ts`'s header states that premise for this whole
+  // subsystem and its consequence in as many words: "there is no normalization to get wrong; if
+  // that ever stops being true this needs a shared canonicalizer, NOT a looser match here."
+  // `heldAssetEditorRefusal` folds case because it compares a FILESYSTEM-derived path
+  // (`absToAssetUrl` of the real `from`) against a store path, where two spellings of one file are
+  // both legitimate on a case-insensitive volume.
+  //
+  // ⚠️ Scar: a review flagged the divergence as "the two matchers can disagree" and I closed it by
+  // adding `toLowerCase()` here (7294b1921, reverted). That was the looser match the header
+  // forbids, and it BROKE the case it was meant to protect: on a case-SENSITIVE volume,
+  // `/assets/A.png` held while `/assets/a.png` moves made this panel block a move the backend would
+  // have allowed. The disagreement the review described needs a `from` cased differently from the
+  // mount path, which the shared source makes unreachable. If that premise ever breaks, reach for
+  // `samePath` (`engine/scripts/pathIdentity.mjs`), not for `toLowerCase`.
+  const holds = dirtyAssetEditorHolds().filter(({ path }) =>
+    froms.some((from) => path === from || path.startsWith(`${from}/`)));
   if (!holds.length) return null;
   const which = holds.map((h) => `the ${h.kind} editor (${h.path})`).join(' and ');
   return `Unsaved edits in ${which} — Save or Cancel it first, then move the asset.`;
