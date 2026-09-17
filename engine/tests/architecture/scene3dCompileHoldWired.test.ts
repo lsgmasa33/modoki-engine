@@ -49,6 +49,10 @@ describe('Scene3D consults the #1246 compile holds', () => {
     // Past the idle gate a paused surface stopped reaching the borrow guard once grace ran out, so
     // the overlay's wait stopped renewing. Before the sync too: a borrowed frame costs nothing else.
     expectInOrder(frame, [BORROW_GUARD, IDLE_GATE, 'syncEnvironment(world, scene, renderer);']);
+    // The stage session too (#1239 C): under its stubbed `render`, the sync's PMREM derivation
+    // draws nothing and caches an empty IBL; and a paused surface must still see its ceiling.
+    expect(occurrences(STAGE_GUARD), 'exactly one stage-session guard').toBe(1);
+    expectInOrder(frame, [BORROW_GUARD, STAGE_GUARD, IDLE_GATE, 'syncEnvironment(world, scene, renderer);']);
     // Spent at the paint mark and nowhere else: a frame a gate or stage session holds drew nothing,
     // and spending grace on it stopped the loop before the gate's ceiling release was ever seen.
     expect(frame, 'grace is spent right after the paint mark that only a submitted frame reaches').toContain('markScenePainted(); idleGrace.submitted(); }');

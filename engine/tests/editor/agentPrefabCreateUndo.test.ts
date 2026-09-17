@@ -17,7 +17,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   createTestWorld, type TestWorld, setPlayState, Transform, EntityAttributes, PrefabInstance,
-  deriveInstanceMemberGuids, getCurrentWorld,
+  deriveInstanceMemberGuids, getCurrentWorld, Transient,
 } from '@modoki/engine/runtime';
 import { clearHistory, markSceneSaved, undo } from '@modoki/engine/editor';
 import { setPrefabCache } from '../../packages/modoki/src/editor/scene/prefab';
@@ -153,5 +153,34 @@ describe('agent prefab create — undo restores the links the tree already had (
       const unresolved = warn.mock.calls.map(String).filter((m) => m.includes('could not be put back'));
       expect(unresolved, `a correct undo must not report a failure: ${unresolved.join(' | ')}`).toEqual([]);
     } finally { warn.mockRestore(); }
+  });
+});
+
+/** The agent op is the one consumer that CANNOT fall back to the renderer console — it reads the
+ *  response and nothing else — and it was the one call site of the runtime-exclusion report with no
+ *  test at all (close-out re-review finding 5): deleting the `warnings.push` left every suite green.
+ *  Same lesson as #1258, which is why the inert-size warnings ride in this response too. */
+describe('agent prefab create — runtime entities left out are REPORTED in the response (#1306)', () => {
+  it('names them in warnings when the selection contained a generated subtree', async () => {
+    const r = game!.spawn(Transform(), EntityAttributes({ name: 'R', guid: 'g-warn-r' }));
+    const kept = game!.spawn(Transform(), EntityAttributes({ name: 'Kept', parentId: r.id(), guid: 'g-warn-kept' }));
+    // A pooled row's shape: the region root plus a member, both tagged, as a system tick spawns them.
+    const pooled = game!.spawn(Transform(), EntityAttributes({ name: 'PooledRow', parentId: r.id(), guid: 'g-warn-pooled' }));
+    const pooledChild = game!.spawn(Transform(), EntityAttributes({ name: 'RowLabel', parentId: pooled.id(), guid: 'g-warn-pooled-child' }));
+    pooled.add(Transient); pooledChild.add(Transient);
+
+    const res = await runAgentOp('prefab', { action: 'create', entityGuid: 'g-warn-r', path: NEW_PATH }) as { ok: boolean; warnings?: string[] };
+    expect(res.ok).toBe(true);
+    expect(res.warnings?.join(' ') ?? '').toContain('2 runtime entities were left out of the prefab');
+    // The object of the sentence matters here more than anywhere: this reader has no other context.
+    expect(res.warnings?.join(' ') ?? '').toContain('of the prefab');
+    expect(kept.has(EntityAttributes)).toBe(true); // fixture sanity: the authored sibling is still there
+  });
+
+  it('says nothing when the selection lost nothing', async () => {
+    game!.spawn(Transform(), EntityAttributes({ name: 'R', guid: 'g-quiet-r' }));
+    const res = await runAgentOp('prefab', { action: 'create', entityGuid: 'g-quiet-r', path: NEW_PATH }) as { ok: boolean; warnings?: string[] };
+    expect(res.ok).toBe(true);
+    expect((res.warnings ?? []).join(' ')).not.toContain('runtime entit');
   });
 });

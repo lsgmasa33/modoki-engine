@@ -106,6 +106,8 @@ interface ScenePassLike {
   dispose?(): void;
   renderTarget: THREE.RenderTarget;
   compileAsync(renderer: unknown): Promise<void>;
+  /** The MRT `compileAsync` binds (three's `PassNode.getMRT`) — what a rejected compile leaves bound. */
+  getMRT?(): unknown;
   /** three calls this from inside the terminal pipeline's quad draw, and it is where the pass
    *  renders the scene. Wrapped once per app to read the renderer's call depth AT that moment —
    *  see `observePassCallDepth` in `passCompileContext`. */
@@ -658,8 +660,14 @@ export class PostFXStack {
     const r = this.rawRenderer as {
       getRenderTarget?(): unknown; setRenderTarget?(t: unknown): void; getMRT?(): unknown; setMRT?(m: unknown): void;
     };
-    const prevTarget = r.getRenderTarget?.() ?? null;
-    const prevMrt = r.getMRT?.() ?? null;
+    // `has*` distinguishes "no accessor" from "nothing bound": a renderer without the getter is
+    // left alone on the restore rather than bound to null (#1302 ②, same as `withRendererState`).
+    const hasTarget = typeof r.getRenderTarget === 'function';
+    const hasMrt = typeof r.getMRT === 'function';
+    const prevTarget = hasTarget ? r.getRenderTarget!() : null;
+    const prevMrt = hasMrt ? r.getMRT!() : null;
+    const passMrt = typeof this.scenePass.getMRT === 'function' ? this.scenePass.getMRT() : null;
+    const knowsPassMrt = typeof this.scenePass.getMRT === 'function';
     try {
       // Borrowed for the whole compile: three keeps the pass target + MRT bound across its awaits,
       // and a frame drawn inside that window crashed an iPad mini 5's GPU process (#1246, #1239 A).
@@ -671,12 +679,22 @@ export class PostFXStack {
       // ⚠️ three's `PassNode.compileAsync` binds the pass target + MRT and restores them only on
       // SUCCESS. A rejection (a shader-graph throw, a lost device) left the live renderer drawing
       // every later frame into this pass's own target — a black canvas for the rest of the session.
-      // Undone only while the pass target is STILL what is bound: anything else was bound by
-      // someone else (an offscreen capture's `captureRT`) and is theirs to restore (#957).
-      if (r.getRenderTarget?.() === rt) {
-        r.setRenderTarget?.(prevTarget);
-        r.setMRT?.(prevMrt);
+      //
+      // ⚠️ Each binding is guarded by its OWN identity (#1302): the target is undone while the pass
+      // target is still bound, the MRT while the pass's MRT is still bound. They are independent
+      // state — a foreign binder such as `PMREMGenerator` saves and restores the target only, so it
+      // never owns the MRT, and nesting the MRT restore inside the target check left the scene MRT
+      // bound under it. A foreign target here should not happen at all: every other binder either
+      // holds its frame or takes a queue turn (#1239), so say so when it does.
+      const ownsTarget = hasTarget && r.getRenderTarget!() === rt;
+      if (ownsTarget) r.setRenderTarget?.(prevTarget);
+      else if (hasTarget && import.meta.env?.DEV) {
+        console.warn('[PostFXStack] a scene-pass compile rejected with a foreign render target bound — '
+          + 'something wrote the renderer binding during a compile (#1239)');
       }
+      // A pass that cannot say which MRT it binds falls back to the target's verdict.
+      const ownsMrt = hasMrt && (knowsPassMrt ? r.getMRT!() === passMrt : ownsTarget);
+      if (ownsMrt) r.setMRT?.(prevMrt);
       throw e;
     }
   }

@@ -379,6 +379,27 @@ describe('applyActiveTierToRuntime — pushing the active tier into the live run
     frameDriver.setTargetFPS(60);
   });
 
+  /** #1239 D. Every compile re-reads `shadowMap.enabled` after each await, so a flip mid-compile
+   *  warms a mix of both shadow variants. The write waits for the compile to finish. */
+  it('defers the shadow-map flip while a compile holds the renderer, and applies it after', async () => {
+    const { runExclusivePrecompile, resetPrecompileSession } = await import('../../src/runtime/rendering/postfx/precompileSession');
+    resetPrecompileSession(mockRenderer);
+    let release!: () => void;
+    let duringCompile: boolean | undefined;
+    const compile = runExclusivePrecompile(mockRenderer, () => new Promise<void>((res) => {
+      release = () => { duringCompile = mockRenderer.shadowMap.enabled; res(); };
+    }));
+    setActiveQualityTier({ tier: 'low', source: 'measured', reason: 'x' });
+    applyActiveTierToRuntime();
+    expect(mockRenderer.shadowMap.enabled).toBe(true);
+    await Promise.resolve(); // the compile starts on a microtask
+    release();
+    await compile;
+    await new Promise((res) => setTimeout(res, 0));
+    expect(duringCompile).toBe(true);
+    expect(mockRenderer.shadowMap.enabled).toBe(false);
+  });
+
   it('caps the frame driver when the active tier authors one', () => {
     setActiveQualityTier({ tier: 'low', source: 'measured', reason: 'x' });
     applyActiveTierToRuntime();

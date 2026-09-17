@@ -9,6 +9,7 @@
 
 import type { PrefabFile } from './prefab';
 import { serializePrefab, warnInertPrefabSizes, writePrefabFile, setPrefabCache, getCachedPrefabSync, preloadNestedPrefabs } from './prefab';
+import { runtimeExcludedMessage } from './authoringScope';
 import { collectResourceRefs, setCurrentScenePath, setCurrentBaseScene, getCurrentScenePath, saveScene, loadScene, markSceneSaved, lastSceneKey, getScenePersistenceProject, type SerializedEntity } from './serialize';
 import { swapHistory, getEditVersion } from '../undo/undoManager';
 import { sceneManager } from '../../runtime/scene/SceneManager';
@@ -385,9 +386,14 @@ export async function savePrefabEditReport(): Promise<PrefabEditSaveReport> {
     return NOT_SAVED;
   }
 
+  // A prefab containing a UIScrollView spawns pooled rows INSIDE the prefab-edit world (the pool
+  // runs while stopped), so this save legitimately drops them — and says so, because this path
+  // already has a `warnings` array the agent op surfaces and a console nobody reads (review F4).
+  let runtimeExcluded = 0;
   const prefab = serializePrefab(rootId, editingPrefab.guid, {
     preserveLocalIds: collectPreservedLocalIds(previous.rootLocalId, rootId),
     name: previous.name,
+    onRuntimeExcluded: (n) => { runtimeExcluded = n; },
   });
   if (!prefab) { console.error('[PrefabEdit] serialize produced no prefab'); return NOT_SAVED; }
   // The version `prefab` represents, captured BEFORE the write. `writePrefabFile` is a real fetch
@@ -399,6 +405,7 @@ export async function savePrefabEditReport(): Promise<PrefabEditSaveReport> {
   // An authoring write, so it reports an inert size (#42, #1251) — warnInertPrefabSizes says why
   // the call sits here and not in writePrefabFile.
   const warnings = warnInertPrefabSizes(prefab, editingPrefab.guid);
+  if (runtimeExcluded > 0) warnings.push(runtimeExcludedMessage(runtimeExcluded));
   const ok = await writePrefabFile(editingPrefab.guid, prefab);
   if (!ok) return NOT_SAVED;
   // Refresh the editor's prefab cache to the just-saved version AND invalidate the

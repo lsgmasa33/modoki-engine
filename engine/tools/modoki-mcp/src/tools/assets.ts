@@ -148,8 +148,8 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'maybe-absent sidecars is safe, and `trashed` counts only files that really existed. ' +
       'A path the OS REFUSES to trash (locked, denied ACL, >260 chars) is named in `failed` and ' +
       'is STILL ON DISK: `ok:true` + `failed` means the REST went, `ok:false` means none did. ' +
-      '⚠️ `failed` is populated on Windows only — elsewhere a refusal arrives as ok:false with ' +
-      '`failed` empty, so an empty `failed` is not evidence every path went. `ok` is.\n\n' +
+      'On macOS the paths still on disk after Finder refuses are what `failed` names, and ' +
+      '`failedReason` carries what Finder said. `ok` is still the verdict to read first.\n\n' +
       '⚠️ `repairFailed` is NOT `failed`: the files are trashed, but an attached editor still ' +
       'holds bindings and parked writes for the dead path, so the next human Cmd+S can recreate ' +
       'what you deleted. The panel repairs itself; you, from another process, have no backstop. ' +
@@ -285,9 +285,10 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'CALL IT WHEN YOU ARE DONE POSING. While the envelope is open the run-mode is `scrub`, and ' +
       'that is precisely what BLOCKS a scene save — so a posed editor left behind is one the human ' +
       'cannot Cmd+S until they press ⏹ themselves.\n\n' +
-      'It refuses when the TIMELINE panel owns the envelope rather than the Animation side. That is ' +
-      'deliberate: ending the Timeline\'s session would revert its world mid-run, which is worse ' +
-      'than refusing.\n\n' +
+      'It REFUSES (REFUSED_BY_OP, `modeOwner` names the holder) when another panel — the ' +
+      'Timeline — owns the envelope. That is deliberate: ending the Timeline\'s session would ' +
+      'revert its world mid-run, which is worse than refusing. With NO envelope open it answers ' +
+      'NOT_FOUND: there was nothing to exit, and the authored world is already showing.\n\n' +
       'IT ALWAYS RESTORES — there is no way to keep the posed values. Every path in the editor\'s ' +
       'own UI restores too, and the only thing a keep-the-pose option would do is bake a preview ' +
       'frame into the authored world, which is exactly what the envelope exists to prevent. If you ' +

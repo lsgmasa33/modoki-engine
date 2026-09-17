@@ -46,6 +46,7 @@ import {
   runAsCompositeAction, markAssetDirty, getDirtyAssetPaths, discardDirtyAssets,
   applyAssetPathMoves, type PathMove,
   getPrefabSource, instantiatePrefabInstance, serializePrefab, writePrefabFile, warnInertPrefabSizes,
+  runtimeExcludedMessage,
   preloadNestedPrefabsForSubtree,
   resolveExistingPrefabId, tagEntityTreeAsInstance, untagEntityTreeAsInstance,
   detachPrefabInstance, reattachPrefabInstance,
@@ -1561,6 +1562,24 @@ export function registerEditorAgentOps(): void {
     const p = (params ?? {}) as { path?: string; displayName?: string };
     requireAssetPath(p.path, 'animation', 'open-animation-editor');
     const name = p.displayName ?? p.path!.split('/').pop()?.replace(/\.anim\.json$/, '') ?? p.path!;
+    // Captured BEFORE the switch (#1212 A-13): the store is re-pointed immediately, so a refusal
+    // below reports an editor that has ALREADY left whatever clip was open, and must say so.
+    const previousPath = useEditorStore.getState().editingAnimationAsset?.path ?? null;
+    const prevField = previousPath && previousPath !== p.path ? { previousPath } : {};
+    // Described from what is open AT REPLY TIME, never from what this call did: a human or a
+    // concurrent call can re-point the single-slot editor during the wait, and a note written
+    // before it ("switched to X, Y is gone") is then false in both halves. And a re-open of the
+    // SAME clip is not "nothing happened" — the store reset the playhead, any pose and the preview.
+    const describeNow = (openNow: string | null | undefined): string =>
+      openNow === p.path
+        ? (previousPath == null
+          ? `the Animation editor is now on ${p.path} (nothing was open before)`
+          : previousPath !== p.path
+            ? `the switch is NOT undone: the Animation editor is on ${p.path}, and ${previousPath} is no longer open`
+            : `${p.path} was re-opened, which reset the playhead, any pose and the preview`)
+        : `the Animation editor is now on ${openNow ?? 'no clip'}${openNow && openNow === previousPath
+          ? ' (the clip that was open before this call)'
+          : ' (something else re-pointed it during the wait)'}`;
     useEditorStore.getState().openAnimationEditor({ path: p.path!, type: 'animation', name }, resolveAnimatorRootForClip(p.path!));
 
     // ⚠️ `openAnimationEditor` sets the open ASSET; it does not load the clip DOCUMENT. That is
@@ -1587,9 +1606,12 @@ export function registerEditorAgentOps(): void {
     const openPath = st.editingAnimationAsset?.path;
     if (clip && openPath !== p.path) {
       return {
-        ok: false, code: 'REFUSED_BY_OP', path: p.path, openPath,
+        ok: false, code: 'REFUSED_BY_OP', path: p.path, openPath, ...prevField, editorNow: describeNow(openPath),
         error: `another clip (${openPath}) was opened while this call was waiting for ${p.path}, so the editor is not showing what was asked for.`,
-        hint: 'Something else re-pointed the Animation editor mid-call — the human double-clicking an asset, or a concurrent agent call. Retry; the editor holds ONE open clip, so two openers cannot both win.',
+        options: [
+          `retry modoki_open_animation_editor {path:"${p.path}"} — the editor holds ONE open clip, and something else (the human, or a concurrent call) re-pointed it mid-call`,
+          'modoki_get_editor_state shows which clip is open now',
+        ],
       };
     }
     if (!clip) {
@@ -1598,12 +1620,14 @@ export function registerEditorAgentOps(): void {
       // opened earlier and since switched away from IS still mounted — see
       // docs/editor.md § Tab mounting latches.
       return {
-        ok: false, code: 'NOT_AVAILABLE_HERE', path: p.path,
-        error: `the Animation editor was pointed at ${p.path} but no clip document loaded within 3s.`,
-        hint: 'The clip DOCUMENT is fetched by the Animation panel, so that panel has to be mounted '
-          + '— and a tab that has never been OPENED this session is not mounted. Open AND select the '
-          + 'Animation tab (or check modoki_get_editor_state.openPanels) and retry. The pose itself '
-          + 'needs no panel; only this load step does.',
+        ok: false, code: 'NOT_AVAILABLE_HERE', path: p.path, ...prevField,
+        error: `the Animation editor was pointed at ${p.path} but no clip document loaded within 3s — `
+          + `${describeNow(st.editingAnimationAsset?.path)}. `
+          + 'The clip DOCUMENT is fetched by the Animation panel, and a tab never OPENED this session is not mounted.',
+        options: [
+          'modoki_get_editor_state.openPanels — if the Animation tab is absent, it has never been opened; a human opens AND selects it once, then retry',
+          `retry modoki_open_animation_editor {path:"${p.path}"} once the panel is mounted — the pose itself needs no panel, only this load step does`,
+        ],
       };
     }
     // Report the BIND separately from the open. They fail independently — a clip can load
@@ -2074,15 +2098,30 @@ export function registerEditorAgentOps(): void {
   registerAgentOp('discard-asset-edits', (params) => {
     const p = (params ?? {}) as { paths?: string[]; all?: boolean };
     const pending = getDirtyAssetPaths();
-    if (p.paths !== undefined && !Array.isArray(p.paths)) throw new Error('discard-asset-edits: `paths` must be an array of asset paths.');
+    // Coded refusals with the choices in `options` (#1212 A-20): these were plain throws — the relay
+    // calls those REFUSED_BY_OP with NO options — and the pending list sat in the prose.
+    // Capped like liveMutate's AMBIGUOUS list: options are not size-bounded by the formatter, and
+    // the error prose already names every pending path. JSON-quoted so a path is pasteable as is.
+    const choices = pending.length
+      ? [...pending.slice(0, 20).map((x) => `paths:${JSON.stringify([x])}`), 'all:true — drops every pending asset write, unrecoverably']
+      : [];
+    if (p.paths !== undefined && !Array.isArray(p.paths)) {
+      throw new OpRefusal('REFUSED_BY_OP', 'discard-asset-edits: `paths` must be an array of asset paths.', { options: choices.length ? choices : ['paths:["/assets/…"]'] });
+    }
     if (!p.paths?.length && !p.all) {
-      throw new Error(
+      throw new OpRefusal('REFUSED_BY_OP',
         'discard-asset-edits: say WHAT to discard — pass `paths:[…]`, or `all:true` to drop every '
         + `pending asset write. A bare call is refused because dropping them all is unrecoverable. ${
           pending.length ? `Pending now (${pending.length}): ${pending.join(', ')}` : 'Nothing is pending right now.'}`,
+        // Nothing pending → no options: there is nothing to choose, and the prose says so.
+        choices.length ? { options: choices } : {},
       );
     }
-    if (p.paths?.length && p.all) throw new OpRefusal('AMBIGUOUS', 'discard-asset-edits: pass `paths` OR `all:true`, not both — they disagree about the scope.');
+    if (p.paths?.length && p.all) {
+      throw new OpRefusal('AMBIGUOUS', 'discard-asset-edits: pass `paths` OR `all:true`, not both — they disagree about the scope.', {
+        options: ['keep `paths` and drop `all` — discards only those', 'keep `all:true` and drop `paths` — discards everything pending'],
+      });
+    }
     const r = discardDirtyAssets(p.all ? undefined : p.paths);
     // ⚠️ This op owns the DIRTY-ASSET registry and not the sidecar one, and `all:true` reads as if
     // it owned both. A parked `.meta.json` import-settings edit survives it untouched, so an agent
@@ -2323,12 +2362,17 @@ export function registerEditorAgentOps(): void {
       // Same cold-cache flatten as the human path (#1284) — resolveExistingPrefabId fetches
       // raw and never touches the editor prefab cache, so nothing here warms it.
       await preloadNestedPrefabsForSubtree(entityId);
-      const prefab = serializePrefab(entityId, existingId);
+      let runtimeExcluded = 0;
+      const prefab = serializePrefab(entityId, existingId, { onRuntimeExcluded: (n) => { runtimeExcluded = n; } });
       if (!prefab) throw new Error(`could not serialize prefab from entity ${entityId}`);
       // An authoring write (it can overwrite an existing template), so it reports an inert size like
       // the human Save-as-Prefab does (#42, #1251) — in THIS response too, because the agent that
       // authored it does not read the renderer console (the instantiate op's QA-ASSET-0014 rule above).
       const warnings = warnInertPrefabSizes(prefab, path);
+      // Runtime entities under the selection (pooled UIEntries rows, timeline scrub/control spawns)
+      // are excluded from the file (#1306) — and the agent does not read the renderer console, so it
+      // is told here or not at all. Same reasoning as the inert-size warnings above (#1258).
+      if (runtimeExcluded > 0) warnings.push(runtimeExcludedMessage(runtimeExcluded));
       const ok = await writePrefabFile(path, prefab);
       if (ok) {
         // Snapshot the links the tree already had, so undo can put them back (#1278). Tagging
@@ -2670,7 +2714,10 @@ export function registerEditorAgentOps(): void {
   registerAgentOp('pose-clip', async (params) => {
     const { t } = (params ?? {}) as { t?: number };
     if (typeof t !== 'number' || !Number.isFinite(t)) {
-      return { ok: false, code: 'REFUSED_BY_OP', error: `pose-clip requires a finite t (seconds); got ${JSON.stringify(t)}` };
+      return {
+        ok: false, code: 'REFUSED_BY_OP', error: `pose-clip requires a finite t (seconds); got ${JSON.stringify(t)}`,
+        options: ['pass t as a number of seconds, e.g. {t: 0.5}'],
+      };
     }
     const st = useEditorStore.getState();
     const clip = st.editingAnimationClip as (AnimationClipDef & { name?: string }) | null | undefined;
@@ -2681,14 +2728,19 @@ export function registerEditorAgentOps(): void {
       return {
         ok: false, code: 'NOT_FOUND',
         error: 'no animation clip is open in the editor, so there is nothing to sample a pose from.',
-        options: ['open a .anim.json (the Animation panel, or the Assets panel) and retry'],
+        options: ['modoki_open_animation_editor {path:"/assets/…/x.anim.json"} opens a clip — then retry'],
       };
     }
     if (rootId == null) {
       return {
         ok: false, code: 'NOT_FOUND', boundClip: clip.name ?? null,
         error: `the clip "${clip.name ?? '(unnamed)'}" is open but is not BOUND to an entity, so there is nothing to pose.`,
-        options: ['bind it to an entity with an Animator trait (the Animation panel\'s bind picker)'],
+        // Named in AGENT tools (#1212 A-14): the bind resolves at OPEN time, from an Animator whose
+        // `clips` bank lists this clip, else from a selected entity carrying an Animator.
+        options: [
+          'modoki_set_selection an entity that carries an Animator, then modoki_open_animation_editor again — the bind resolves when the clip is opened (re-opening resets the playhead and any pose)',
+          'or add this clip to an Animator\'s `clips` bank with modoki_mutate_scene, then reopen it',
+        ],
       };
     }
     const duration = clip.duration;
@@ -2752,14 +2804,47 @@ export function registerEditorAgentOps(): void {
     const { exited, rebound } = await exitPoseEnvelope(true);
     if (!exited) {
       // Ownership-guarded: the session and the run-mode are globals shared with the Timeline
-      // panel, and ending ITS session here would revert its world mid-run. Say which it is rather
-      // than reporting a cheerful no-op.
+      // panel, and ending ITS session here would revert its world mid-run. Say WHICH it is (#1212
+      // A-11): the two causes used to share one NOT_AVAILABLE_HERE — "could not look, relaunch" —
+      // with the discriminator in prose, and they have different next steps. `exitPoseEnvelope`
+      // changes nothing when it does not exit, so the owner read here is the one it refused on.
+      const owner = getModeOwner();
+      if (owner && owner !== 'animation') {
+        return {
+          ok: false, code: 'REFUSED_BY_OP', modeOwner: owner,
+          error: `the ${owner} panel owns the preview envelope, not the Animation side — this op `
+            + 'deliberately will not end it, because reverting its world mid-run is worse than refusing.',
+          // ⚠️ A timeline envelope DOES have an agent exit. The same text as `/api/scene-mutate`'s
+          // timeline arm (editorBackendRouter.ts) — keep the two in step; that arm's comments carry
+          // the history of denying this exit once already.
+          options: owner === 'timeline'
+            ? [
+              "modoki_play_control {action:'stop'} — ends the Timeline preview session and returns the run-mode to stopped. ⚠️ DESTRUCTIVE: it restores the snapshot taken when the envelope opened, discarding anything the human authored inside it. Prefer asking them if they are at the screen",
+              'modoki_get_editor_state.modeOwner says who holds the envelope now',
+            ]
+            : [`⏹ Exit Preview in the ${owner} panel (a human action) — then retry`],
+        };
+      }
+      // No owner is not "stopped": Play holds no owner (enterScrub/PreviewMode are no-ops while
+      // playing), and a restore in flight briefly leaves the run-mode set with the owner cleared.
+      // "The authored world is already showing" is false in both.
+      const runMode = getRunMode();
+      if (runMode !== 'stopped') {
+        return {
+          ok: false, code: 'REFUSED_BY_OP', runMode,
+          error: `no preview envelope is open, but the editor is ${runMode === 'playing' ? 'PLAYING' : `in ${runMode} with no owner (an envelope is closing or seating)`} — so the authored world is not what is showing, and a scene save is still refused.`,
+          options: runMode === 'playing'
+            ? ["modoki_play_control {action:'stop'} — ends Play and restores the authored world"]
+            : ['retry in a moment — the run-mode settles once the restore lands', 'modoki_get_editor_state.runMode shows when it has'],
+        };
+      }
       return {
-        ok: false, code: 'NOT_AVAILABLE_HERE',
-        error: 'no ANIMATION preview envelope is open, so there was nothing to exit.',
-        hint: 'Either nothing is posed, or the Timeline panel owns the preview envelope — this op '
-          + 'deliberately will not end that one, because reverting its world mid-run is worse than '
-          + 'refusing.',
+        ok: false, code: 'NOT_FOUND',
+        error: 'no preview envelope is open, so there was nothing to exit — the authored world is already showing.',
+        options: [
+          'nothing to do: a scene save works as it is',
+          'modoki_pose_clip opens an Animation envelope, if a pose was what you expected to find',
+        ],
       };
     }
     return {

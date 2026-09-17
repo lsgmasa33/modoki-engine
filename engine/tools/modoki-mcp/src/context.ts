@@ -12,7 +12,7 @@
  *
  *  Keep this module free of side effects. */
 
-import { createFormatter, isFailureBody, ERROR_CODES, type ToolResult, type ToolErrorDetail, type ErrorCode } from './result.js';
+import { createFormatter, isFailureBody, codeFromBody, codeFromStatus, optionsFromBody, type ToolResult, type ToolErrorDetail } from './result.js';
 import { identityMismatch, tokenMismatchWarning, describeIdentity, type BackendIdentity } from '../../shared/identity.js';
 import { literalImportSpecs, secondInstanceWarning, type ModuleUrlAnswer } from './evalImports.js';
 
@@ -150,21 +150,7 @@ export function createToolContext(config: { backend: string; token?: string }): 
         });
   }
 
-  /** A specific code the BACKEND supplied beats one derived from the HTTP status. Three of the
-   *  closed set (`AMBIGUOUS`/`AMBIGUOUS_SURFACE`/`OCCLUDED`) are refusals a route can name
-   *  precisely — measured live: `modoki_set_transform {entity:{name:'DUP_probe'}}` against two
-   *  same-named entities came back as the generic `REFUSED_BY_OP`, indistinguishable from any
-   *  other refusal without string-matching prose. `fallback` is whatever this call site would
-   *  have used anyway, so an ordinary body with no `code` (or a junk value that isn't in the
-   *  closed set) is unaffected. */
-  function codeFromBody(body: unknown, fallback: ErrorCode): ErrorCode {
-    if (body && typeof body === 'object') {
-      const c = (body as { code?: unknown }).code;
-      if (typeof c === 'string' && (ERROR_CODES as readonly string[]).includes(c)) return c as ErrorCode;
-    }
-    return fallback;
-  }
-
+  
   /** A backend HTTP failure, as a §5 envelope. One builder so every route reports a 4xx/5xx the
    *  same way — the audit found `backend ${status}: ${JSON.stringify(body)}` repeated at six sites
    *  and nowhere did it say what the caller should do next. */
@@ -205,29 +191,27 @@ export function createToolContext(config: { backend: string; token?: string }): 
     // Match the two route-miss messages explicitly instead. A message-shape check is a weaker
     // discriminator than a structured flag would be, so both hosts should grow one — but this is
     // the seam that must not be WRONG in the meantime, and both strings are ours.
-    const routeMissing = status === 404 && (!detail || /no backend route for|no such API route/i.test(detail));
-    const statusCode: ErrorCode = status === 404
-      ? (routeMissing ? 'NOT_AVAILABLE_HERE' : 'NOT_FOUND')
-      : status >= 500 ? 'NOT_AVAILABLE_HERE' : 'REFUSED_BY_OP';
-    const code = codeFromBody(body, statusCode);
+    const code = codeFromBody(body, codeFromStatus(status, detail));
+    // The route-miss case still steers the OPTIONS below (a missing route and a missing target
+    // need different next steps), so it keeps its own name even though `codeFromStatus` now owns
+    // the code. Same predicate, asked once: the shared helper answers NOT_AVAILABLE_HERE on a 404
+    // exactly when the route is the thing that is missing.
+    const routeMissing = status === 404 && codeFromStatus(status, detail) === 'NOT_AVAILABLE_HERE';
     // Options the ROUTE named beat anything derived here, for the same reason `code` does: the
     // route knows what its own refusal costs and what the caller's real exits are, and this
     // function can only guess from a status. Without this a §5 refusal authored server-side —
     // the park gate's "save first / discardUnsaved:true / read the parked value" (#872) — arrived
     // with its `why` intact and its options silently dropped, which is the half that converts a
     // dead end into the agent's next move.
-    const routeOptions = ((): string[] | undefined => {
-      if (!body || typeof body !== 'object') return undefined;
-      const o = (body as { options?: unknown }).options;
-      if (!Array.isArray(o)) return undefined;
-      const list = o.filter((x): x is string => typeof x === 'string' && !!x);
-      return list.length ? list : undefined;
-    })();
+    const routeOptions = optionsFromBody(body);
     return fail({
       code,
       what,
+      // PARTIAL is not a refusal — part of the work LANDED — so do not call it one (#1212).
       why: detail
-        ? `the backend refused with HTTP ${status}: ${detail}`
+        ? (code === 'PARTIAL'
+          ? `the backend reported a PARTIAL result (HTTP ${status}) — not a clean refusal; read got for what did and did not land: ${detail}`
+          : `the backend refused with HTTP ${status}: ${detail}`)
         : `the backend answered HTTP ${status} with no explanation.`,
       got: body,
       ...(routeOptions
@@ -320,6 +304,11 @@ export function createToolContext(config: { backend: string; token?: string }): 
         if (failure) {
           return fail({
             code: codeFromBody(body, 'REFUSED_BY_OP'),
+            // The op's own next steps (#1212). The ≥400 path always relayed them; this 200 path
+            // kept the code and dropped the options. Most coded refusals are re-statused by their
+            // route now, but not all (apply-scene-ops answers a coded PARTIAL at 200), and an
+            // uncoded `{ok:false, …}` may carry options too — so both paths relay them.
+            ...(optionsFromBody(body) ? { options: optionsFromBody(body)! } : {}),
             what: `GET ${path} on the editor backend`,
             why: failure.split('\n\nfull response:')[0],
             got: body,
@@ -374,6 +363,11 @@ export function createToolContext(config: { backend: string; token?: string }): 
       return failure
         ? fail({
             code: codeFromBody(body, 'REFUSED_BY_OP'),
+            // The op's own next steps (#1212). The ≥400 path always relayed them; this 200 path
+            // kept the code and dropped the options. Most coded refusals are re-statused by their
+            // route now, but not all (apply-scene-ops answers a coded PARTIAL at 200), and an
+            // uncoded `{ok:false, …}` may carry options too — so both paths relay them.
+            ...(optionsFromBody(body) ? { options: optionsFromBody(body)! } : {}),
             what: label,
             why: failure.split('\n\nfull response:')[0],
             got: body,

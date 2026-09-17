@@ -12,6 +12,18 @@
  *     a Timeline control track instantiating a prefab), so a preview/scrub mutation can't leak
  *     into a saved scene — the guarantee is structural, not vigilance (preview-mode refactor).
  *
+ *  ⚠️ **Honoured through ONE predicate, not by each reader's own walk** — `collectTransientSubtreeIds`
+ *  / `filterAuthoringVisible` (`editor/scene/authoringScope.ts`). Every editor reader that treats the
+ *  live tree as AUTHORING input asks it: `serializeScene`, `captureInstanceStructure`,
+ *  `collectInstanceRoots` (Apply-to-Prefab's fan-out) and `serializePrefab` (Create Prefab). The
+ *  last two had no check at all until #1301/#1306, and the two that did carried near-identical
+ *  copies of the walk — which is how the misses went unnoticed. A new reader asks the predicate;
+ *  it does not write a third copy. See docs/prefabs.md § Authoring scope.
+ *
+ *  ⚠️ This tag is NOT only a Play-mode thing. A UIEntries pool runs above `TRANSFORM`, so it
+ *  spawns, recycles and destroys tagged rows while the sim is STOPPED. The measurement behind that
+ *  claim lives in docs/prefabs.md § Authoring scope — one copy, so re-measuring updates one place.
+ *
  *  Carries no data; purely a "do not serialize" flag. Deliberately UNREGISTERED (not in
  *  `registerTraits`) — a pure runtime marker checked by trait identity (`entity.has(Transient)`),
  *  never via the name-based trait registry. (Distinct from Persistent, which does the opposite —

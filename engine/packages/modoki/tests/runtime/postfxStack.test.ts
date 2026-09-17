@@ -989,19 +989,74 @@ describe('PostFXStack — stage nodes that own GPU resources are freed (leak reg
       expect(renderer.mrt).toBe(null);
     });
 
-    it('…but leaves a binding it did not make alone — an offscreen capture restores its own', async () => {
+    /** #1302. The target and the MRT are independent bindings. A foreign binder such as
+     *  `PMREMGenerator` saves and restores the TARGET only, so the MRT still bound is the pass's —
+     *  nesting its restore under the target check left the scene MRT bound for good. */
+    it('…leaves a FOREIGN target alone, but still gives back the pass MRT it left bound (#1302)', async () => {
+      const { PostFXStack } = await import('../../src/runtime/rendering/postfx/PostFXStack');
+      const renderer = bindingRenderer();
+      renderer.mrt = 'prevMRT';
+      const stack = new PostFXStack(renderer, new THREE.Scene(), new THREE.PerspectiveCamera(), { bloom: bloomCfg() } as never);
+      const pass = scenePasses[0] as typeof scenePasses[0] & { getMRT?: () => unknown };
+      pass.getMRT = () => 'sceneMRT';
+      pass.compileAsync.mockImplementationOnce(async () => {
+        renderer.setRenderTarget(pass.renderTarget);
+        renderer.setMRT('sceneMRT');
+        renderer.setRenderTarget('foreignRT'); // something bound its own target mid-compile
+        throw new Error('device lost');
+      });
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      await expect(stack.compileSceneAsync()).rejects.toThrow('device lost');
+      expect(renderer.target).toBe('foreignRT');
+      expect(renderer.mrt).toBe('prevMRT');
+      // Unreachable by contract since #1239 — so it is said out loud when it happens.
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('foreign render target'));
+    });
+
+    it('…and leaves an MRT it did not bind alone too (#1302)', async () => {
       const { PostFXStack } = await import('../../src/runtime/rendering/postfx/PostFXStack');
       const renderer = bindingRenderer();
       const stack = new PostFXStack(renderer, new THREE.Scene(), new THREE.PerspectiveCamera(), { bloom: bloomCfg() } as never);
-      const pass = scenePasses[0];
+      const pass = scenePasses[0] as typeof scenePasses[0] & { getMRT?: () => unknown };
+      pass.getMRT = () => 'sceneMRT';
       pass.compileAsync.mockImplementationOnce(async () => {
         renderer.setRenderTarget(pass.renderTarget);
-        renderer.setRenderTarget('captureRT'); // a capture bound its target mid-compile
+        renderer.setMRT('foreignMRT');
         throw new Error('device lost');
       });
 
       await expect(stack.compileSceneAsync()).rejects.toThrow('device lost');
-      expect(renderer.target).toBe('captureRT');
+      expect(renderer.target).toBe('canvas');
+      expect(renderer.mrt).toBe('foreignMRT');
+    });
+
+    it('does not BIND null as the MRT through a renderer with setMRT but no getMRT, even with the pass target still bound (#1302 ②)', async () => {
+      const { PostFXStack } = await import('../../src/runtime/rendering/postfx/PostFXStack');
+      const base = bindingRenderer();
+      const setMRT = vi.fn();
+      const renderer = { ...base, getRenderTarget: () => base.target, setRenderTarget: (t: unknown) => { base.target = t; }, getMRT: undefined, setMRT };
+      const stack = new PostFXStack(renderer, new THREE.Scene(), new THREE.PerspectiveCamera(), { bloom: bloomCfg() } as never);
+      const pass = scenePasses[0];
+      pass.compileAsync.mockImplementationOnce(async () => {
+        renderer.setRenderTarget(pass.renderTarget);
+        throw new Error('device lost');
+      });
+
+      await expect(stack.compileSceneAsync()).rejects.toThrow('device lost');
+      expect(base.target, 'the target is still ours, so it is given back').toBe('canvas');
+      expect(setMRT).not.toHaveBeenCalled();
+    });
+
+    it('does not BIND null through a renderer that has no getter to capture from (#1302 ②)', async () => {
+      const { PostFXStack } = await import('../../src/runtime/rendering/postfx/PostFXStack');
+      const renderer = { ...makeRenderer(), getRenderTarget: undefined, setRenderTarget: vi.fn(), setMRT: vi.fn() };
+      const stack = new PostFXStack(renderer, new THREE.Scene(), new THREE.PerspectiveCamera(), { bloom: bloomCfg() } as never);
+      scenePasses[0].compileAsync.mockImplementationOnce(async () => { throw new Error('device lost'); });
+
+      await expect(stack.compileSceneAsync()).rejects.toThrow('device lost');
+      expect(renderer.setRenderTarget).not.toHaveBeenCalled();
+      expect(renderer.setMRT).not.toHaveBeenCalled();
     });
   });
 

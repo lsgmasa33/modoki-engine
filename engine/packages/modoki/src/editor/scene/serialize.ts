@@ -2,6 +2,7 @@
  *  Uses the trait registry — no hardcoded trait knowledge. */
 
 import { getAllEntities, readTraitData, findEntity, subtreeIds } from '../../runtime/core/ecs/entityUtils';
+import { collectTransientSubtreeIds } from './authoringScope';
 import { hasDocKey } from '../../runtime/core/docKeys';
 import { orderEntitiesForSave } from '../../runtime/core/ecs/entityOrder';
 import { getAuthoredWritesWhileStopped, clearAuthoredWritesWhileStopped } from '../../runtime/core/ecs/authoredWrites';
@@ -221,10 +222,7 @@ export async function serializeScene(opts?: {
   // below (guid pre-pass, prefab-child collection, the main loop) simply never see them, which
   // avoids orphaning a transient prefab-instance's members. See runtime/core/traits/Transient.ts.
   const allInfos = getAllEntities();
-  const transientIds = new Set<number>();
-  for (const e of allInfos) {
-    if (findEntity(e.id)?.has(Transient)) for (const id of subtreeIds(allInfos, e.id)) transientIds.add(id);
-  }
+  const transientIds = collectTransientSubtreeIds(allInfos);
   // Base-scene persistence (Phase 6, generalized in Phase 12): never bake an entity
   // that doesn't belong to the scene being saved into that scene's file.
   // EntityAttributes.sourceScene is stamped non-empty ONLY on entities a BASE scene

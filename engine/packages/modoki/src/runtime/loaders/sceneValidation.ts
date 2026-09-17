@@ -1233,7 +1233,11 @@ function describe(value: unknown): string {
 export function validatePrefabData(data: unknown): ValidationResult {
   const warnings: string[] = [];
   const entities = (data as { entities?: unknown })?.entities;
-  if (!Array.isArray(entities)) return { warnings, schemaApplied: false };
+  // A document with no `entities` array is not a prefab, and "no warnings" would call it clean
+  // (#1212 A-4's intent: the validator's worst answer is a confident all-clear about nothing).
+  if (!Array.isArray(entities)) {
+    return { warnings: ['this is not a prefab document — it has no `entities` array, so nothing was checked'], schemaApplied: false };
+  }
   for (const entry of entities) {
     if (!entry || typeof entry !== 'object') continue;
     const e = entry as { localId?: unknown; name?: unknown; traits?: unknown };

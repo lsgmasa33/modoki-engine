@@ -394,6 +394,11 @@ describe('discard-asset-edits — abandoning a parked write', () => {
     // The refusal must name what it would have dropped, so obeying it is a copy-paste.
     await expect(runAgentOp('discard-asset-edits', {})).rejects.toThrow(A);
     expect(getDirtyAssetPaths(), 'a refused call must not discard anything').toEqual([A]);
+    // …and the choices are OPTIONS, not only prose (#1212 A-20): the relay turns a plain throw into
+    // REFUSED_BY_OP with no options at all.
+    const e = await runAgentOp('discard-asset-edits', {}).catch((x: unknown) => x) as { code?: string; options?: string[] };
+    expect(e.code).toBe('REFUSED_BY_OP');
+    expect(e.options).toEqual([`paths:["${A}"]`, 'all:true — drops every pending asset write, unrecoverably']);
   });
 
   it('`paths` and `all` together are refused — they disagree about the scope', async () => {

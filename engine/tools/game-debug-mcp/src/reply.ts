@@ -84,6 +84,78 @@ export { describeShape } from '../../shared/mcpResult.js';
 import { describeShape } from '../../shared/mcpResult.js';
 import { isDeviceFailureText } from '../../shared/deviceRefusal.js';
 
+// ── device_list reply shape (#1211 C-21) ───────────────────────────────────
+/** `clone` is typed as the route sends it, but the decoder does not require it: the claims file is
+ *  hand-editable, and `describeClaim` renders a record without one as unreadable. */
+export type DeviceListClaim = { deviceId: string; clone: string; branch: string; pid: number; guid?: string; at: number; label?: string; purpose?: string; owner?: string };
+
+export type DeviceListReply = {
+  /** `name` is what the PHONE calls itself ("Galaxy A23 5G"); `model` is only ever the model CODE
+   *  ("SC_56C"), which is the string a human cannot match to a handset on the desk. Prefer `name`
+   *  wherever one is shown, and fall back to `model` — a device that would not answer has neither. */
+  android: Array<{ serial: string; state: string; model?: string; name?: string; transportId?: string; usable: boolean; claim: DeviceListClaim | null }>;
+  /** `devicectl` is set when `xcrun devicectl` itself listed the device (iOS 17+/CoreDevice) —
+   *  absent for one only the legacy `xctrace` listing can see (#143). It is what the editor's
+   *  Build-menu target picker reads to decide a hands-free install vs an Xcode handoff (#170). */
+  ios: Array<{ udid: string; name: string; connected: boolean; productType?: string; osVersion?: string; devicectl?: boolean; claim: DeviceListClaim | null }>;
+  /** Claims keyed by WiFi address (`ip:<host>`) — no hardware row exists for these, so they would be
+   *  invisible in either list above without being surfaced separately. */
+  otherClaims: DeviceListClaim[];
+  adb: { present: boolean; path?: string };
+  /** Present only when adb is absent — "no adb" and "no Android devices" are different problems
+   *  with different fixes, so this is a field, not folded into an empty `android` array. */
+  note?: string;
+  /** The iOS counterpart (#1096): present only when `ios` is EMPTY *and* a listing source broke, so
+   *  an empty list is never reported as "no iPhone attached" when nobody actually managed to look. */
+  iosNote?: string;
+  /** WHO ASKED — the editor process answering the route. Absent from a backend older than the field;
+   *  without it a claim cannot be told apart from a sibling's, so it is rendered as one. */
+  self?: { clone: string; pid: number };
+};
+
+/** Decode `/api/device/list` (§9-bis, #1211 C-21). Only the keys the renderer dereferences without a
+ *  guard are required — a missing one used to throw into `caughtFailure` ("relaunch the app") or,
+ *  worse, read as an empty listing. `self` and the notes are optional because older backends omit them. */
+export function decodeDeviceListReply(raw: unknown): { ok: true; reply: DeviceListReply } | { ok: false; got: string } {
+  const v = parseReply<unknown>(raw);
+  const isObj = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x);
+  // A claim only has to be an OBJECT: the claims file is hand-editable and `readClaims` checks only
+  // `deviceId`, so one corrupt record must not turn the whole listing into "restart the editor".
+  // `describeClaim` renders a record with no `clone` as unreadable instead.
+  const claimOk = (c: unknown) => c === null || isObj(c);
+  if (
+    isObj(v)
+    && Array.isArray(v.android) && v.android.every((d) => isObj(d) && typeof d.serial === 'string' && claimOk(d.claim ?? null))
+    && Array.isArray(v.ios) && v.ios.every((d) => isObj(d) && typeof d.udid === 'string' && claimOk(d.claim ?? null))
+    && Array.isArray(v.otherClaims) && v.otherClaims.every((c) => isObj(c) && typeof c.deviceId === 'string' && claimOk(c))
+    && isObj(v.adb) && typeof v.adb.present === 'boolean'
+  ) {
+    const self = isObj(v.self) && typeof v.self.clone === 'string' && typeof v.self.pid === 'number'
+      ? { clone: v.self.clone, pid: v.self.pid } : undefined;
+    return { ok: true, reply: { ...(v as unknown as DeviceListReply), self } };
+  }
+  return { ok: false, got: describeShape(v) };
+}
+
+/** The claim half of a `device_list` row. The route's `self` is what tells YOUR clone's claim from a
+ *  sibling's — ignoring it rendered the lease this session holds as "CLAIMED by <some path>", which
+ *  reads as a collision and sends the agent off to find another phone. Same `clone ===` rule as the
+ *  editor's Build-menu `claimNote`. */
+export function describeClaim(c: DeviceListClaim | null, self: DeviceListReply['self']): string {
+  if (!c) return '';
+  if (typeof c.clone !== 'string') return ' — CLAIMED by an unreadable claim record (no clone; check ~/.modoki/device-claims.json)';
+  const why = c.purpose ? `, ${c.purpose}` : '';
+  const trim = (p: string) => p.replace(/[\\/]+$/, '');
+  if (self && trim(c.clone) === trim(self.clone)) {
+    // A CLI claim (#285) carries `pid: 0` and an `owner` token — "pid 0" would name no process.
+    if (c.owner) return ` — held by this clone's CLI (owner ${c.owner}${why})`;
+    return c.pid === self.pid
+      ? ` — held by THIS editor (your lease${why})`
+      : ` — held by this clone, another process (pid ${c.pid}${why})`;
+  }
+  return ` — CLAIMED by ${c.clone} (${c.branch})${why}`;
+}
+
 // ── Input fidelity (#32) ──────────────────────────────────────────────────
 // The literals a device_* reply / device_status line can report. Kept as named constants (rather
 // than inline string literals) so `deviceInputMechanismParity.test.ts` can regex-match them by

@@ -175,6 +175,13 @@ function makeRendererStub(stubOpts: { isWebGPU?: boolean } = {}) {
 
 const camera = new THREE.PerspectiveCamera();
 
+/** Resolve once `renderer`'s compile chain holds `depth` turns — i.e. the prewarm has queued. */
+async function untilQueued(renderer: object, depth: number): Promise<void> {
+  const { pendingCompileTurns } = await import('../../src/runtime/rendering/postfx/precompileSession');
+  for (let i = 0; i < 1000 && pendingCompileTurns(renderer) < depth; i++) await new Promise((res) => setTimeout(res, 1));
+  expect(pendingCompileTurns(renderer), 'the prewarm never reached the compile queue').toBe(depth);
+}
+
 describe('prewarmShadersForWorld — F4 empty-scene first-compile guarantee', () => {
   it('still compiles a plain standard mesh when the world has no Renderable3D/Primitive', async () => {
     const { world, sync } = await setup();
@@ -392,6 +399,60 @@ describe('prewarmShadersForWorld — the environment mirror follows the TIER', (
     await sync.prewarmShadersForWorld(world, renderer as never, camera);
     expect(compiledEnvironments[0]).toBe(pmremTexture);
     expect(compiledEnvironments[0]).not.toBe(envTexture);
+  });
+
+  /** #1239 C. Deriving a PMREM draws through the renderer. Before the prewarm's queue turn, a
+   *  previous scene's cold live compile can still hold the pass target + scene MRT, and the PMREM
+   *  would build against that MRT and be cached broken. So it derives inside the turn. */
+  it('derives the PMREM only once its compile turn arrives, not while another compile holds the renderer', async () => {
+    const envTexture = { isTexture: true, name: 'fake-hdr' };
+    const pmremTexture = { isTexture: true, name: 'fake-pmrem' };
+    const { world, sync } = await setup({ env: envTexture, pmrem: pmremTexture });
+    const { Environment } = await import('../../src/three/traits/Environment');
+    const envPmrem = await import('../../src/runtime/rendering/envPmrem');
+    const { runExclusivePrecompile } = await import('../../src/runtime/rendering/postfx/precompileSession');
+    world.spawn(Environment({ hdrPath: 'hdr-guid', intensity: 0.4 }));
+    const { renderer, compiledEnvironments } = makeRendererStub();
+    const order: string[] = [];
+    vi.mocked(envPmrem.getEnvPMREMTexture).mockImplementation(() => { order.push('derive'); return pmremTexture as never; });
+
+    let release!: () => void;
+    const ahead = runExclusivePrecompile(renderer, () => new Promise<void>((res) => { release = res; }));
+    const prewarm = sync.prewarmShadersForWorld(world, renderer as never, camera);
+    // Wait until the prewarm has built its scene and QUEUED — a fixed delay would let a slow build
+    // finish after it, and the old code would then pass too.
+    await untilQueued(renderer, 2);
+    order.push('ahead ends');
+    release();
+    await ahead;
+    await prewarm;
+
+    expect(order).toEqual(['ahead ends', 'derive']);
+    expect(compiledEnvironments[0]).toBe(pmremTexture);
+  });
+
+  /** #1239 C, review finding. While the prewarm waits for its turn, the source must still have a
+   *  holder the retired-env sweep can see — a closure is not one. Otherwise a re-import during the
+   *  wait frees the source, and the turn derives (and caches for good) a PMREM of a freed texture. */
+  it('keeps the env source visible to the retired-env sweep while its turn is queued', async () => {
+    const envTexture = { isTexture: true, name: 'fake-hdr' } as unknown as THREE.Texture;
+    const { world, sync } = await setup({ env: envTexture, retiredEnvs: new Set([envTexture]) });
+    const { Environment } = await import('../../src/three/traits/Environment');
+    const { createWorld } = await import('koota');
+    const { runExclusivePrecompile } = await import('../../src/runtime/rendering/postfx/precompileSession');
+    world.spawn(Environment({ hdrPath: 'hdr-guid', intensity: 0.4 }));
+    const { renderer } = makeRendererStub();
+
+    let release!: () => void;
+    const ahead = runExclusivePrecompile(renderer, () => new Promise<void>((res) => { release = res; }));
+    const prewarm = sync.prewarmShadersForWorld(world, renderer as never, camera);
+    await untilQueued(renderer, 2);
+    // Another surface's frame sweeps while the prewarm waits; nothing else holds the retiree.
+    sync.syncEnvironment(createWorld(), new THREE.Scene());
+    expect(disposeRetiredEnvironment).not.toHaveBeenCalled();
+    release();
+    await ahead;
+    await prewarm;
   });
 
   it('does NOT mirror it on LOW, where syncEnvironment suppresses IBL', async () => {

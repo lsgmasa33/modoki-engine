@@ -6,7 +6,9 @@ import { hasDocKey, putOwn } from '../../runtime/core/docKeys';
 import { validatePrefabData, REF_FIELDS_BY_TRAIT } from '../../runtime/loaders/sceneValidation';
 import { postWriteFile, jsonFileBody } from '../backend/editorBackend';
 import { getAllTraits, getTraitByName, type TraitMeta } from '../../runtime/core/ecs/traitRegistry';
-import { getAllEntities, deleteEntities, markStructureDirty, readTraitData, readTraitDataFull, writeTraitField, findEntity, subtreeIds, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
+import { getAllEntities, deleteEntities, markStructureDirty, readTraitData, readTraitDataFull, writeTraitField, findEntity, type EntityInfo } from '../../runtime/core/ecs/entityUtils';
+import { collectTransientSubtreeIds, filterAuthoringVisible, runtimeExcludedMessage } from './authoringScope';
+import { collectSubtreeIds } from '../../runtime/core/ecs/subtreeCollect';
 import { Transient } from '../../runtime/core/traits/Transient';
 import { markUIDirty } from '../../runtime/ui/uiTreeStore';
 import { newGuid, registerAsset, getGuidForPath, isGuid, resolveRef } from '../../runtime/loaders/assetManifest';
@@ -246,6 +248,49 @@ function planMatchesFile(
   return true;
 }
 
+/** The entities a Create Prefab gesture treats as AUTHORING input for `selectedEntityId`.
+ *
+ *  ⚠️ **Create Prefab reads the world TWICE** — `serializePrefab` writes the file, then
+ *  `tagEntityTreeAsInstance` re-walks it and re-runs `planPrefabRows` to convert the live tree into
+ *  an instance — and the second read REFUSES to tag when its plan does not match the file
+ *  (`planMatchesFile`, a bare `return`). So the two must select the same entities or Create Prefab
+ *  silently leaves the tree unlinked: a prefab asset on disk, no instance in the scene, nothing
+ *  logged. That is why this is a function rather than the same two lines written twice.
+ *
+ *  Runtime artifacts (pooled UIEntries rows, timeline scrub/control spawns) are excluded — unless
+ *  the SELECTION ROOT is itself one, which makes the gesture a deliberate "bake this" and must
+ *  produce the thing the user selected rather than an empty file. */
+function authoringEntitiesFor(selectedEntityId: number, all: EntityInfo[]): { entities: EntityInfo[]; excluded: number } {
+  const links = all.map((e) => [e.id, e.parentId] as const);
+  const inSelection = collectSubtreeIds(links, [selectedEntityId]);
+  const parentOf = new Map(all.map((e) => [e.id, e.parentId] as const));
+  const isRuntime = (id: number): boolean => !!findEntity(id)?.has(Transient);
+
+  // A generated REGION, not a tagged entity, is the unit — because in production every member of
+  // one carries the tag (`spawnEntity` tags whatever is spawned inside a system tick), so "drop
+  // tagged entities" would strip a deliberate bake down to its root and lose every child.
+  // A region starts where a tagged entity's PARENT is not tagged.
+  const regionRoots: number[] = [];
+  for (const id of inSelection) {
+    if (id === selectedEntityId) continue;          // one region may start AT the selection: that is the bake
+    if (!isRuntime(id)) continue;
+    if (isRuntime(parentOf.get(id) ?? 0)) continue; // inside a region already accounted for
+    regionRoots.push(id);
+  }
+  if (regionRoots.length === 0) return { entities: all, excluded: 0 };
+
+  // ⚠️ Scoped to the SELECTION, twice over. The count must be, or a scene with a pool somewhere in
+  // it warns on every Create Prefab about entities it did not drop (review F1) — the alarm that
+  // makes the true report unreadable. And the exclusion must be, or a selection that sits INSIDE a
+  // generated region cannot be serialized at all: the region's own subtree contains the selection,
+  // so a world-wide filter removes the very entity being turned into a prefab. The first cut
+  // answered that by switching filtering OFF whenever the selection was anywhere inside a region,
+  // which let an unrelated region deeper in the selection through — #1306 re-opened, silently
+  // (re-review finding 3, measured).
+  const runtimeIds = new Set(collectSubtreeIds(links, regionRoots));
+  return { entities: all.filter((e) => !runtimeIds.has(e.id)), excluded: runtimeIds.size };
+}
+
 /** Serialize selected entity + descendants as a prefab.
  *  Pass `existingId` when re-saving an existing prefab to preserve its UUID.
  *
@@ -275,9 +320,29 @@ export function serializePrefab(
      *  measured on sling, where "Cover Enemy" and "Green Enemy" both became "Enemy"
      *  because that is what their root entity is called. */
     name?: string;
+    /** Called when the walk dropped runtime entities (pooled rows, preview spawns) from the
+     *  selection — with how many. The exclusion itself is not optional; this is only how a caller
+     *  SURFACES it (a toast, an MCP response field). `serializePrefab` always logs it too. */
+    onRuntimeExcluded?: (count: number) => void;
   },
 ): PrefabFile | null {
-  const allEntities = getAllEntities();
+  const rawEntities = getAllEntities();
+  // #1306: a live runtime artifact under the selection is NOT authoring input — a UIEntries pooled
+  // row or a timeline scrub spawn would otherwise be written into the new file as an ordinary
+  // authored member (measured: `["Ship","Flame","PooledRow"]`). The pool runs while the sim is
+  // STOPPED (priority 270 > TRANSFORM), so this is the everyday case, not a Play-mode one.
+  //
+  // ⚠️ Unless the SELECTION ROOT is itself Transient: pointing Create Prefab straight at generated
+  // content is a deliberate "bake this" and must produce the thing the user selected, not an empty
+  // file. The exclusion is about what rides along UNASKED.
+  const { entities: allEntities, excluded: excludedCount } = authoringEntitiesFor(selectedEntityId, rawEntities);
+  if (excludedCount > 0) {
+    // Reported, never silent (owner, 2026-09-17): a prefab that quietly lost members is the
+    // surprise that gets filed as a bug weeks later. The console line is by construction here;
+    // `onRuntimeExcluded` is how an interactive caller raises it to a toast or an MCP response.
+    console.warn(`[Prefab] ${runtimeExcludedMessage(excludedCount)}`);
+    opts?.onRuntimeExcluded?.(excludedCount);
+  }
   const tree = collectTree(selectedEntityId, allEntities);
   if (tree.length === 0) return null;
 
@@ -1417,17 +1482,14 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return empty;
 
-  // Exclude Transient spawns (scrub/preview/play control-track prefabs) AND their subtree — the
-  // same exclusion serializeScene applies — so the structural-diff walk below never classifies one
-  // as a `userAdded` child and bakes it into the instance's `added` overrides (review H2). Without
-  // this, a control-track prefab spawned under an authored prefab-instance member would round-trip
-  // to disk via the structural-capture pass, bypassing the top-level serialize filter.
-  const rawEntities = getAllEntities();
-  const transientIds = new Set<number>();
-  for (const e of rawEntities) {
-    if (findEntity(e.id)?.has(Transient)) for (const id of subtreeIds(rawEntities, e.id)) transientIds.add(id);
-  }
-  const allEntities = transientIds.size ? rawEntities.filter((e) => !transientIds.has(e.id)) : rawEntities;
+  // Exclude Transient spawns (scrub/preview/play control-track prefabs, UIEntries pooled rows) AND
+  // their subtree, so the structural-diff walk below never classifies one as a `userAdded` child and
+  // bakes it into the instance's `added` overrides (review H2). Without this, a control-track prefab
+  // spawned under an authored prefab-instance member would round-trip to disk via the
+  // structural-capture pass, bypassing the top-level serialize filter. Shared with `serializeScene`,
+  // `serializePrefab` and `collectInstanceRoots` — see `collectTransientSubtreeIds` for why the four
+  // of them must answer this the same way (#1301/#1306).
+  const allEntities = filterAuthoringVisible(getAllEntities());
   const byId = new Map<number, EntityInfo>();
   const childrenOf = new Map<number, EntityInfo[]>();
   for (const e of allEntities) {
@@ -1732,8 +1794,10 @@ export function tagEntityTreeAsInstance(rootEcsId: number, source: string, writt
   // the given ref only when the manifest can't resolve it yet.
   const ref = isGuid(source) ? source : (getGuidForPath(source) ?? source);
 
-  // Mirror serializePrefab's localId assignment (BFS, root = 1)
-  const allEntities = getAllEntities();
+  // Mirror serializePrefab's localId assignment (BFS, root = 1) — including WHICH entities it
+  // selects, which is why both go through `authoringEntitiesFor`. A tree containing a runtime
+  // subtree the file does not have fails `planMatchesFile` below and refuses to tag at all.
+  const { entities: allEntities } = authoringEntitiesFor(rootEcsId, getAllEntities());
   const tree = collectTree(rootEcsId, allEntities);
 
   /** ⚠️ `piData` must name EVERY field of PrefabInstance. koota's generated setter is a partial
@@ -2560,6 +2624,13 @@ export function rebuildInstance(
   // (they get cascade-destroyed with the outer members and re-expanded fresh).
   const nestedCaptures = captureNestedInstanceOverrides(rootInstanceId);
 
+  // Transience is a property of the IDENTITY, not of the id — the same reasoning that carries the
+  // durable guid across the respawn below. Read before the teardown, re-applied after (#1301).
+  // Belt-and-braces since `collectInstanceRoots` no longer hands a runtime instance to the refresh
+  // fan-out; it stands because a rebuild must not be able to make an unserializable entity
+  // serializable, whatever route reaches it.
+  const wasTransient = !!findEntity(rootInstanceId)?.has(Transient);
+
   // Recompute the teardown set LIVE: every member of this instance PLUS every
   // non-member descendant (added entities, nested instances, and their subtrees).
   // We deliberately do NOT trust `structure.consumedEcsIds` — that is a frozen
@@ -2599,6 +2670,7 @@ export function rebuildInstance(
   // Durable only (#1210): a runtime guid belonged to the destroyed root's address row, so copying it
   // would leave the new root answering to nothing; the respawn's own runtime guid stands instead.
   if (eaMeta && durableGuid(oldRootEa?.guid as string)) writeTraitField(newRootId, eaMeta, 'guid', oldRootEa!.guid as string);
+  if (wasTransient) findEntity(newRootId)?.add(Transient);
   setPrefabSource(newRootId, source);
   applyOverridesByRootInstance(newRootId, overrides);
   applyStructureByRootInstance(newRootId, prefab, structure);
@@ -2687,11 +2759,20 @@ function collectInstanceRoots(source: string, excludeRootId?: number): number[] 
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return [];
   const rootIds: number[] = [];
+  // ⚠️ A Transient instance is a RUNTIME artifact — a UIEntries pooled row, a timeline scrub or
+  // control-track spawn — and an authoring fan-out must not reach it (#1301). Rebuilding one is
+  // wrong twice over: `rebuildInstance` does not carry `Transient` forward, so the rebuilt root
+  // becomes serializable and the next save writes a preview artifact into the authored scene; and
+  // the pool owns those rows, so tearing them down under it is not ours to do. A STOPPED editor
+  // really does hold pooled instance roots that match this query's `source` + `rootInstanceId`
+  // filter exactly — measured in docs/prefabs.md § Authoring scope.
+  const runtimeIds = collectTransientSubtreeIds(getAllEntities());
   getCurrentWorld().query(PrefabInstanceMeta.trait).updateEach(([pi], entity) => {
     const piData = pi as Record<string, unknown>;
     if (piData.source !== source) return;
     if (piData.rootInstanceId !== entity.id()) return;
     if (excludeRootId !== undefined && entity.id() === excludeRootId) return;
+    if (runtimeIds.has(entity.id())) return;
     rootIds.push(entity.id());
   });
   return rootIds;

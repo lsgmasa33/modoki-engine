@@ -473,12 +473,21 @@ Rules:
   `bridge.ts`'s `delegateToAgentOps` flattens any throw into the `Error: <msg>` string sentinel the
   game-debug MCP flags, so an `OpRefusal` thrown by a RUNTIME op would lose its code there. None is
   thrown by one today — every recoded site is an editor op, which never runs on a device — and
-  ⚠️ **A RETURNED code is lost on the device too, and that one is not a protocol problem** (#1208
-  C-1): device ops return coded envelopes that cross the wire intact, and the game-debug MCP's
-  `perceptCall`/`writeCall` then stamp `REFUSED_BY_OP` over them. Only the THROW half below needs
-  a protocol change.
-  making the device channel carry §5 codes is a protocol change to that MCP, not an extra call to
-  `opReplyFor`. Four riders:
+  making the device channel carry THROWN §5 codes is a protocol change to that MCP, not an extra
+  call to `opReplyFor`. A RETURNED code needs no protocol: it crosses the wire intact, and since
+  #1211 the game-debug MCP relays it (`codeFromBody`/`optionsFromBody`, shared in
+  `tools/shared/mcpResult.ts`) where `perceptCall`/`writeCall` used to stamp `REFUSED_BY_OP` over it.
+  ⚠️ **The rule every hop follows: relay the classification you were handed; never invent one.**
+  This class has been re-entered at five hops — op → route (#1012, #1070), `/api/eval`'s bare 504
+  (#1013), the device wire's string protocol (#1223 P3), device wire → device MCP (#1211), and op →
+  editor route again (#1212) — each fixed locally while the next hop kept re-deriving. Two guards
+  hold it, and neither alone is enough: `engine/tests/architecture/refusalCodeRelay.test.ts` flags
+  an open-coded test of the closed code set outside the shared decoders, but it CANNOT see a literal
+  `code: 'REFUSED_BY_OP'` stamped over a body in hand — the table in
+  `engine/tests/tools/deviceRefusalCodeRelay.test.ts` catches that for every `perceptCall`/`writeCall`
+  tool plus `device_mutate_scene` and `device_type_text` (`device_dispatch_action` has
+  `deviceDispatchActionCode.test.ts`), and reads the relay callers from source so a new relay tool
+  cannot skip a row. Four riders:
   - **The discriminator is a code from the CLOSED set**, not `ok:false`. Dozens of ops report a bad
     parameter as `{ok:false, reason}` at HTTP 200, where `isFailureBody` picks them up; only a
     named code is a claim to know which §5 failure this is, and only that claim earns a status.

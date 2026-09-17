@@ -189,6 +189,9 @@ export interface TrashResult {
    *  A refused path holds back its SIDECARS too (`<path>.meta.json` &c), so a group is never split
    *  — see `moveToTrash`'s fallback for why splitting it is worse than the bug it guards. */
   failed: string[];
+  /** What the OS said, when it refused something and said anything (darwin: Finder's AppleScript
+   *  error). A short first line, for the refusal's prose — never a path list; `failed` is that. */
+  reason?: string;
 }
 
 /** Pull the failing paths out of the script's stderr.
@@ -241,7 +244,30 @@ export function moveToTrash(
   const paths = Array.isArray(absPaths) ? absPaths : [absPaths];
   if (paths.length === 0) return { failed: [] };
   const { command, args, input } = trashCommand(paths, platform);
-  if (platform === 'darwin' || platform === 'win32') {
+  if (platform === 'darwin') {
+    // #1212 A-8: Finder's `delete` names no path when it refuses (a locked file, a denied volume,
+    // Finder not answering), so the exec rethrew and the route answered 500 → "relaunch the editor"
+    // about a file that was simply locked, with `failed` — which the tool documents — never set.
+    // The DISK is the witness instead: whatever is still there did not go. `lstat`, not `exists`,
+    // because a dangling symlink is still an entry Finder failed to move.
+    try {
+      return (exec(command, args, input) as TrashExecResult | undefined) ?? { failed: [] };
+    } catch (e) {
+      const said = String((e as { stderr?: unknown })?.stderr ?? '').trim() || (e instanceof Error ? e.message : String(e));
+      // -1712 is the AppleEvent TIMEOUT: osascript gave up while Finder may still be moving the
+      // files, so "still on disk" is not yet an answer. Could-not-tell stays a thrown failure.
+      if (/\(-1712\)/.test(said)) throw e;
+      // Measured on macOS 26 (2026-09-17, a locked file via `chflags uchg`): Finder's `delete` of a
+      // list is ALL-OR-NOTHING — one refused item and NOTHING moves, in either list order — so an
+      // asset and its sidecar are not split by this path.
+      const stillThere = paths.filter((p) => { try { fs.lstatSync(p); return true; } catch { return false; } });
+      // Everything went despite the error exit — the delete happened, and saying otherwise would
+      // send the caller to retry a delete of files that are already in the Trash.
+      if (stillThere.length === 0) return { failed: [] };
+      return { failed: stillThere, reason: said.split('\n')[0].slice(0, 300) };
+    }
+  }
+  if (platform === 'win32') {
     return (exec(command, args, input) as TrashExecResult | undefined) ?? { failed: [] };
   }
   try { exec(command, args, input); return { failed: [] }; }

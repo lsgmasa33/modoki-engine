@@ -282,13 +282,13 @@ export type DeleteFilesResult = {
    *  with a non-empty `failed` means NONE of it went. Both are worth reporting to the human, so
    *  read `failed` before branching on `ok`, not after.
    *
-   *  ⚠️ **NOT win32-only since #1006** — this said it was, and a caller reading that would branch
-   *  wrongly on Linux. darwin's `osascript` and Linux's `trash-put` are single invocations that
-   *  throw as a whole, so a refusal from EITHER still arrives as `ok:false` with `failed` EMPTY;
-   *  an empty `failed` is therefore not evidence that every path went — check `ok` for that. What
-   *  changed is Linux's `rmSync` FALLBACK (used when `trash-put` is absent — CI, headless): it
-   *  reports per path, and names any whose subtree is not self-contained (#883). Those files are
-   *  still on disk, so the rule above applies to them in full. */
+   *  ⚠️ **NOT win32-only since #1006, and populated on darwin since #1212 A-8.** Finder names no
+   *  path when it refuses, so the backend reports whatever is still on disk (Finder's delete is
+   *  all-or-nothing, so that is the whole batch). On Linux a failing `trash-put` is not reported:
+   *  the backend falls back to a PERMANENT `rmSync`, so `failed` empty with `ok:true` can mean
+   *  "deleted, not trashed" — check `ok` for whether the paths are gone. That fallback (also used
+   *  when `trash-put` is absent — CI, headless) reports per path, naming any whose subtree is not
+   *  self-contained (#883); those files are still on disk, so the rule above applies in full. */
   failed: string[];
 };
 
@@ -423,6 +423,11 @@ export interface CreatePrefabResult {
   /** Coalesced undo entry — caller pushes it (and may add its own refresh()
    *  to undo/redo). */
   action: UndoAction;
+  /** How many RUNTIME entities the selection contained that did not go into the prefab — pooled
+   *  UIEntries rows, timeline scrub/control spawns (#1306). Surfaced by the caller: a prefab that
+   *  silently came out with fewer members than the user selected is the surprise that gets filed
+   *  as a bug weeks later (owner, 2026-09-17). 0 in the ordinary case. */
+  runtimeExcluded: number;
 }
 
 /** Serialize an entity subtree to a `.prefab.json`, write it, register its
@@ -471,7 +476,8 @@ export async function createPrefabFromEntity(
   // nothing else on this path warms it — after an ordinary scene load it is empty, so a held
   // nested instance was flattened into copies with only a console.warn (#1284).
   await preloadNestedPrefabsForSubtree(entityId);
-  const draft = serializePrefab(entityId);
+  let runtimeExcluded = 0;
+  const draft = serializePrefab(entityId, undefined, { onRuntimeExcluded: (n) => { runtimeExcluded = n; } });
   if (!draft) return null;
   warnInertPrefabSizes(draft, requestedPath);
   const written = await writeNewAssetDocument(requestedPath, (guid, kept) => {
@@ -604,7 +610,7 @@ export async function createPrefabFromEntity(
       }
     },
   };
-  return { savePath, prefab, action };
+  return { savePath, prefab, action, runtimeExcluded };
 }
 
 /** The unsaved-work staleness a `/api/unused-assets` answer disclosed, or `null` when it disclosed

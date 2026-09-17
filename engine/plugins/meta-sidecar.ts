@@ -352,6 +352,25 @@ function rawSidecarVersion(absPath: string): unknown {
   }
 }
 
+/** The deliberate "a newer build wrote this sidecar" refusal (#1212 A-9). A CLASS, so a route can
+ *  tell it from an I/O failure (EACCES, ENOSPC) that the same `writeMetaSidecar` call can throw —
+ *  the refusal is the caller's to resolve (merge the branch), the I/O failure is a genuine 500.
+ *  Plain fields, not parameter properties: the root tsconfig sets `erasableSyntaxOnly`. */
+export class SidecarTooNewError extends Error {
+  sidecar: string;
+  version: number;
+  constructor(sidecar: string, version: number) {
+    super(
+      `Sidecar ${sidecar} is format version ${version}, newer than this build's ` +
+      `SIDECAR_FORMAT_VERSION (${SIDECAR_FORMAT_VERSION}) — refusing to overwrite a sidecar ` +
+      `written by a newer build — merge the branch that bumped the format.`,
+    );
+    this.name = 'SidecarTooNewError';
+    this.sidecar = sidecar;
+    this.version = version;
+  }
+}
+
 export function assertSidecarWritable(absPath: string): void {
   const verdict = classifySidecarOnDisk(absPath);
   // ⚠️ A NON-INTEGER version that is numerically newer still refuses. Classification calls
@@ -362,18 +381,10 @@ export function assertSidecarWritable(absPath: string): void {
   // that is currently hypothetical; it costs one line and keeps the refusal monotonic.
   const rawVersion = rawSidecarVersion(absPath);
   if (typeof rawVersion === 'number' && Number.isFinite(rawVersion) && rawVersion > SIDECAR_FORMAT_VERSION) {
-    throw new Error(
-      `Sidecar ${sidecarPath(absPath)} is format version ${rawVersion}, newer than this build's ` +
-      `SIDECAR_FORMAT_VERSION (${SIDECAR_FORMAT_VERSION}) — refusing to overwrite a sidecar ` +
-      `written by a newer build — merge the branch that bumped the format.`
-    );
+    throw new SidecarTooNewError(sidecarPath(absPath), rawVersion);
   }
   if (verdict.kind === 'too-new') {
-    throw new Error(
-      `Sidecar ${sidecarPath(absPath)} is format version ${verdict.version}, newer than this build's ` +
-      `SIDECAR_FORMAT_VERSION (${SIDECAR_FORMAT_VERSION}) — refusing to overwrite a sidecar ` +
-      `written by a newer build — merge the branch that bumped the format.`
-    );
+    throw new SidecarTooNewError(sidecarPath(absPath), verdict.version);
   }
 }
 

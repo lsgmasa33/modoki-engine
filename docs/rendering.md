@@ -4026,7 +4026,7 @@ Measured on an iPad mini 5 at work-qa `5e2d1c2e1` (`tools-scratch/boot-stall/bui
     hold has a ceiling, so a paused surface ticking through one is bounded. A borrow has none, and
     up there a compile that never settles costs one check per frame. A borrowed frame also no
     longer runs `syncEnvironment`, which closes #1239 C for frames. C's prewarm path does not go
-    through the frame loop and stays open.
+    through the frame loop; it is closed separately (see "The writer contract" below).
   No game pauses during boot (GameShell boots `playing`), so it was observed with injected holds:
   `demos/postfx-demo`, desktop Chromium on WebGPU, a temporary patch that paused play just before
   the readiness wait and delayed the swap's live compile by 10 s (2026-09-15).
@@ -4563,10 +4563,8 @@ Serialising compiles protects compiles from each other, but a frame is not a com
   The cost: a capture's turn now counts against the queue budgets of what comes after it, so a scene
   swap landing during a capture that takes over 1 s skips the pre-swap prewarm (a warning, then a
   first-frame stall), and a cold boot can refuse a capture outright.
-- **Not guarded:** PMREM derivation from the prewarm, which runs outside the compile lock, and any
-  compile other than `compileSceneAsync` that binds a target. Both stay open in #1239. (A frame's
-  own `syncEnvironment` is guarded since #1252: the borrow check now runs before the idle gate and
-  the whole sync.)
+- A frame's own `syncEnvironment` is guarded too, since #1252: the borrow check runs before the idle
+  gate and the whole sync. The rest of the renderer's writers follow the contract below.
 
 ⚠️ **`Renderer.compileAsync` (three) fixes its render context synchronously, then builds each
 object's node graph after `await`s — `await this._nodes.getForRenderAsync(renderObject)` and an
@@ -4599,15 +4597,53 @@ Three consequences of queueing, each found by review and each pinned by a test:
 
 Also on this path: three's `PassNode.compileAsync` restores the target + MRT only on SUCCESS, so a
 rejected compile left every later frame drawing into the scene pass's own target.
-`compileSceneAsync` undoes it on rejection — and ⚠️ only while the pass target is STILL bound. An
-unconditional write-back of "what was bound when the compile started" was tried first and is wrong:
-an offscreen capture binds `captureRT` across its own readback `await` and restores it itself, so a
-compile straddling it re-bound `captureRT` after the capture finished.
+`compileSceneAsync` undoes it on rejection, and ⚠️ **each binding only while it is still the pass's
+own**. The target is restored while the pass target is bound, and the MRT while `scenePass.getMRT()`
+is bound (#1302). A pass that cannot report its MRT falls back to the target's verdict. The two used
+to share the target's check, but they are independent state: a foreign binder such as
+`PMREMGenerator` saves and restores the target only, so under it the scene MRT stayed bound. An
+unconditional write-back of "what was bound when the compile started" was tried first and is wrong,
+because it re-binds whatever a foreign binder bound in between (it re-bound a capture's `captureRT`
+before captures were queued). A renderer without the getter is left alone rather than bound to
+`null`. Under the contract below a foreign target is unreachable, so one logs a DEV warning.
 
-⚠️ **What the lock does NOT cover:** it serialises compiles against each other only. Frames released
-at a gate's ceiling, offscreen captures (`modoki_render_scene`) and PMREM derivation still use the
-renderer while a compile holds its target — #1239, one class, to be designed across rather than
-patched per site.
+The stage session's give-back (`forceEnd`) has the same rule in a different shape: the target and
+MRT are restored FIRST, and **every field in its own `try`** (#1303). With one shared `try`, a throw
+from an early, cosmetic field (a setter on a dying renderer) skipped the binding. The swallow stays,
+because a restore must never throw into a frame, but a failed field leaves a DEV warning.
+
+### The writer contract — nothing writes renderer-global state inside a compile (#1239)
+
+The lock serialises compiles against each other only. Everything else that touches the renderer
+follows one rule, in one of three forms:
+- **A frame holds.** `Scene3D` returns before any sync, and before the idle gate, while
+  `isRendererTargetBorrowed` (A, and C's frame path) or `isPrecompileActive` (the stage session).
+  The stage hold used to come after the sync, so a frame could derive a PMREM through the session's
+  stubbed `render`. That draws nothing, and the empty IBL is cached per renderer and source (C's
+  other half, found in #1239's close-out; read from three's `PMREMGenerator`, not observed).
+- **An async user takes a turn.** The offscreen capture (B), and the prewarm's PMREM derivation (C),
+  which happens INSIDE its `runExclusivePrecompileWithin` turn, just before `compileAsync`. Deriving
+  it earlier, while building the throwaway scene, ran it while a previous scene's cold compile could
+  still hold the scene MRT, and the broken PMREM would be cached per renderer and source. While it
+  waits, the throwaway scene binds the RAW source, so the retired-env sweep still sees a holder. A
+  closure alone is invisible to it: a re-import during the wait would free the source, and the turn
+  would then cache a PMREM of a freed texture that nothing ever disposes. Nothing compiles against
+  the raw binding, because the turn swaps it before compiling.
+- **A synchronous write goes through `whenRendererQuiet(renderer, write)`**, which writes now when no
+  turn is queued or running (`isRendererCompiling`), and otherwise queues the write as its own turn,
+  in queue order. Past `QUIET_WRITE_MAX_WAIT_MS` (5 s, the frame gates' ceiling) it writes anyway,
+  and the late turn then does nothing. A compile that never settles must not strand a tier demotion,
+  and writing inside a compile is no worse than D was before this fix. `applyActiveTierToRuntime`'s
+  `shadowMap.enabled` flip (D) is the one user. It is
+  reached from the frame loop before the borrow check and from the before-swap hook, and every
+  compile re-reads that flag after each await, so a mid-compile flip warmed a mix of both shadow
+  variants. Whether r184+ also builds an invalid module from that mix was never measured. The
+  deferral covers both outcomes.
+
+A new writer of the bound target, MRT, `render`, tone mapping, colour space, `xr` or `shadowMap` on a
+live renderer picks one of the three. Not covered: `applyActiveTierToRuntime`'s
+`forceResizeAllSurfaces()` resizes the drawing buffer; whether a resize inside a compile matters was
+not examined.
 
 ### How this became #956's black first launch
 

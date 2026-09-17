@@ -231,6 +231,60 @@ export function capText(text: string, maxChars: number = MAX_PAYLOAD_CHARS): str
   return text.slice(0, maxChars) + note;
 }
 
+/** The §5 code the REPLY named, or `fallback` when it named none.
+ *
+ *  ⚠️ **A layer relays the classification it was handed; it never invents one.** That rule has been
+ *  broken at four separate hops and fixed four times (#1012 ops threw plain Errors so the route
+ *  named the code; #1070 the same hop again; #1013 `/api/eval`'s bare 504; #1223 P3 the device
+ *  wire, which is what `deviceRefusal.ts` exists for). #1211 is the fifth: this function lived
+ *  INSIDE `modoki-mcp/src/context.ts`, so the editor MCP relayed codes correctly and the device MCP
+ *  — which cannot import it — hard-coded `REFUSED_BY_OP` at every envelope site. It lives here now
+ *  because `shared/` is the one module both servers already import (§9).
+ *
+ *  `fallback` is whatever the call site would have used anyway, so a body with no `code` — or a
+ *  junk value outside the closed set — is unaffected. */
+export function codeFromBody(body: unknown, fallback: ErrorCode): ErrorCode {
+  if (body && typeof body === 'object') {
+    const c = (body as { code?: unknown }).code;
+    if (typeof c === 'string' && (ERROR_CODES as readonly string[]).includes(c)) return c as ErrorCode;
+  }
+  return fallback;
+}
+
+/** The §5 code an HTTP STATUS means, when the body named none.
+ *
+ *  ⚠️ A 4xx is the caller's to fix and a 5xx is not, and collapsing the two is what produced the
+ *  worst reply on this surface: a backend 409 ("the editor is Playing", "another op holds the
+ *  envelope") arriving as `NOT_AVAILABLE_HERE` with the advice *"the app may have been killed;
+ *  relaunch it"* — sending the agent to restart a perfectly healthy editor over a state it could
+ *  have cleared in one call (#1211 C-4).
+ *
+ *  ⚠️ `404` is the one that needs the body: a MISSING ROUTE is "could not look" while a missing
+ *  TARGET is `NOT_FOUND`, and reporting the first as the second says "it is not there" about a
+ *  question nobody managed to ask. Matched on our own two route-miss messages — a weaker
+ *  discriminator than a flag, and the host should grow one, but both strings are ours. */
+export function codeFromStatus(status: number, detail?: string): ErrorCode {
+  if (status === 404) {
+    const routeMissing = !detail || /no backend route for|no such API route/i.test(detail);
+    return routeMissing ? 'NOT_AVAILABLE_HERE' : 'NOT_FOUND';
+  }
+  return status >= 500 ? 'NOT_AVAILABLE_HERE' : 'REFUSED_BY_OP';
+}
+
+/** The real next steps the REPLY named, if any — §5's `options`.
+ *
+ *  ⚠️ Options are the half of a refusal that unblocks the caller (the guids of an ambiguous name,
+ *  the guid to use instead of an id), and a body's own are always better than the call site's
+ *  generic advice, which was written without knowing what went wrong. Leaving them inside `got`
+ *  is not the same as reporting them: `got` is diagnostic payload an agent reads last. */
+export function optionsFromBody(body: unknown): string[] | undefined {
+  if (!body || typeof body !== 'object') return undefined;
+  const o = (body as { options?: unknown }).options;
+  if (!Array.isArray(o)) return undefined;
+  const strings = o.filter((x): x is string => typeof x === 'string' && x !== '');
+  return strings.length ? strings : undefined;
+}
+
 /**
  * A 200 that says the operation DIDN'T HAPPEN is a FAILURE — describe it, else null. (C7)
  *

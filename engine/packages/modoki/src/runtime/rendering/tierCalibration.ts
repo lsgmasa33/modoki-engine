@@ -40,6 +40,7 @@ import { getFrameProfile, resetFrameProfile } from '../core/frameProfiler';
 import { onWorldSwap } from '../core/ecs/world';
 import { getActiveRenderer } from '../core/activeRenderer';
 import { forceResizeAllSurfaces } from './resizeBus';
+import { whenRendererQuiet } from './postfx/precompileSession';
 import {
   getActiveQualityTier, getAssessedQualityTier, setActiveQualityTier, getEffectiveThreeSettings,
   getEffectiveTargetFps, getRenderSettings, getActiveTierOverrides, getTierSwitchMessage,
@@ -325,7 +326,13 @@ export function setTierCalibrationEnabled(enabled: boolean): void {
 export function applyActiveTierToRuntime(): void {
   const r = getActiveRenderer() as unknown as { shadowMap?: { enabled: boolean } } | null;
   const three = getEffectiveThreeSettings();
-  if (r?.shadowMap) r.shadowMap.enabled = three.shadows;
+  // Never INSIDE a compile (#1239 D): every compile re-reads this after each of its awaits, so a flip
+  // mid-compile warms a mix of the two shadow variants. Called from the frame loop before its borrow
+  // check, and from the before-swap hook while a previous scene's compile may still run.
+  if (r?.shadowMap) {
+    const shadowMap = r.shadowMap;
+    whenRendererQuiet(r, () => { shadowMap.enabled = three.shadows; });
+  }
   // Texture LOD by quality tier (#212). Read off the RESOLVED overrides rather than through
   // `getEffectiveThreeSettings`, because there is no project-authored counterpart to clamp against
   // (unlike `pixelRatioCap`) — the authored value lives ONLY on a `mid`/`low` tier.

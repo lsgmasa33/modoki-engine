@@ -25,13 +25,16 @@ let refuse: string[] = [];
 // the only way to model `parseTrashFailures` handing back a string that does not match any abs
 // path the route resolved (#884 close-out review finding 9).
 let refuseRaw: string[] | null = null;
+// What the stub's OS "said" on a refusal (#1212 A-8: darwin reports Finder's error line).
+let refuseReason: string | undefined;
 vi.mock('../../plugins/asset-fs-ops', async (orig) => ({
   ...(await orig<typeof import('../../plugins/asset-fs-ops')>()),
   moveToTrash: (paths: string | string[]) => {
     const list = Array.isArray(paths) ? paths : [paths];
     trashed.push(list);
     if (refuseRaw) return { failed: refuseRaw };
-    return { failed: list.filter((p) => refuse.some((r) => p.endsWith(r))) };
+    const failed = list.filter((p) => refuse.some((r) => p.endsWith(r)));
+    return failed.length && refuseReason ? { failed, reason: refuseReason } : { failed };
   },
 }));
 
@@ -282,5 +285,34 @@ describe('/api/delete-asset rebuilds the asset manifest inline', () => {
     expect(r.body.ok).toBe(true);
     expect(r.body.trashed).toBe(1);
     expect(r.body.failed).toBeUndefined();
+  });
+});
+
+/** #1212 A-8: the OS's own words and the §5 next steps reach the caller. */
+describe('/api/delete-asset — an OS refusal says why, and what to do', () => {
+  // In afterEach, not after the await: a throwing `del` would leak the reason into later tests.
+  afterEach(() => { refuse = []; refuseReason = undefined; });
+  it('a total refusal carries the reason and options', async () => {
+    const dir = makeScratchDir('modoki-delete-router-reason-');
+    fs.writeFileSync(path.join(dir, 'locked.json'), '{}');
+    refuse = ['locked.json']; refuseReason = 'Finder got an error (-8003)';
+    const ctx = makeCtx((p) => path.join(dir, p), () => ({}));
+    const r = (await del({ paths: ['/locked.json'] }, ctx)) as { body: { ok: boolean; error: string; options?: string[] } };
+    fs.rmSync(dir, { recursive: true, force: true });
+    expect(r.body.ok).toBe(false);
+    expect(r.body.error).toContain('Finder got an error (-8003)');
+    expect(r.body.options?.join('\n')).toMatch(/modoki_list_assets/);
+  });
+
+  it('a partial refusal carries failedReason beside failed', async () => {
+    const dir = makeScratchDir('modoki-delete-router-reason-');
+    fs.writeFileSync(path.join(dir, 'went.json'), '{}');
+    fs.writeFileSync(path.join(dir, 'locked.json'), '{}');
+    refuse = ['locked.json']; refuseReason = 'Finder got an error (-8003)';
+    const ctx = makeCtx((p) => path.join(dir, p), () => ({}));
+    const r = (await del({ paths: ['/went.json', '/locked.json'] }, ctx)) as { body: { ok: boolean; failedReason?: string } };
+    fs.rmSync(dir, { recursive: true, force: true });
+    expect(r.body.ok).toBe(true);
+    expect(r.body.failedReason).toBe('Finder got an error (-8003)');
   });
 });

@@ -35,7 +35,7 @@ import { rawNow } from '../core/clock';
 import { createLiveCompileGate } from './liveCompileGate';
 import { createIdleFrameGrace } from './idleFrameGrace';
 import { armScenePaint, markScenePainted, abandonScenePaint, extendScenePaintWait } from './scenePaintSignal';
-import { isPrecompileActive, endAllPrecompiles, isRendererTargetBorrowed, runExclusivePrecompileWithin } from './postfx/precompileSession';
+import { isPrecompileActive, endAllPrecompiles, isRendererTargetBorrowed, runExclusivePrecompileWithin, LIVE_COMPILE_MAX_HOLD_MS } from './postfx/precompileSession';
 import { createHeldFramePaintWait, HELD_FRAME_PAINT_WAIT_MAX_MS } from './heldFramePaintWait';
 import { getRenderSettings, getEffectiveThreeSettings, getActiveTierOverrides } from './renderSettings';
 import { maskPostFXRequest } from './qualityTier';
@@ -97,13 +97,6 @@ import { nprConfigFromTrait } from './npr/nprConfigFromTrait';
  *  Full write-up: docs/rendering.md § "Draw-Call Cost & Instanced Batching". */
 const BATCH_DRAW_CALLS = false;
 
-/** How long a swap may hold the first frame while the live scene's pipelines compile (#238).
- *
- *  A CEILING, not a budget — the hold normally ends when the compile resolves, which on a scene
- *  the prewarm already covered is a few milliseconds of cache hits. This exists so a compile that
- *  never settles (a lost device, a rejected promise we somehow do not see) degrades to the OLD
- *  behaviour — a stalling first frame — instead of a viewport that never draws again. */
-const LIVE_COMPILE_MAX_HOLD_MS = 5000;
 
 /** How long an offscreen capture waits for its turn on the renderer's compile queue before it
  *  refuses (#1246, #1239). The turn is what keeps a capture and a compile from binding render
@@ -535,6 +528,23 @@ export default function Scene3D() {
         // `syncEnvironment` cannot derive a PMREM against the borrowed MRT from a frame (#1239 C).
         if (isRendererTargetBorrowed(renderer)) { heldFrames.held(); return; }
         heldFrames.released();
+        // ⚠️ NEVER run a frame while a stage precompile owns `renderer.render` (#323) — not even its
+        // sync (#1239 C). `syncEnvironment` derives a PMREM through `renderer.render`, and under the
+        // stub that draws nothing: an empty IBL, cached per renderer and source for the session.
+        //
+        // `stackCompile.tick()` returning false is NOT proof the compile finished:
+        // `liveCompileGate`'s ceiling releases the FRAME without waiting for the compile — its
+        // documented, deliberate design. A frame that got past the ceiling with the compile still
+        // mid-`await` would call `postfxStack.render()` through a STUBBED renderer: nothing drawn,
+        // and then `markScenePainted()` firing over a blank canvas and lifting the loading
+        // overlay. That is #334's bug, arrived at from the other side.
+        //
+        // Asking is also what ENDS a stale session: past its own (shorter) ceiling
+        // `isPrecompileActive` restores the renderer and answers false, so this can hold at most
+        // `PRECOMPILE_MAX_HOLD_MS` and the in-flight compile stops on its next check. Above the idle
+        // gate for the borrow's reason: a paused surface keeps asking, so the ceiling is still seen.
+        // No overlay renewal: that ceiling counts from the gate's kick, which already promised it.
+        if (isPrecompileActive(renderer, rawNow())) return;
         // Idle gate: while paused/stopped only dirty events + the grace window
         // need a redraw; while playing — or while the Animation editor is previewing
         // skeletal animation (mixer advancing) — render unconditionally.
@@ -654,22 +664,8 @@ export default function Scene3D() {
         // config could drop NPR and GTAO and stay recognisably itself, but couldn't say so.
         // The mask itself is applied inside `buildReq` — see the warning there for why it cannot
         // live here.
-        // ⚠️ NEVER submit while a stage precompile owns `renderer.render` (#323).
-        //
-        // `stackCompile.tick()` returning false is NOT proof the compile finished:
-        // `liveCompileGate`'s ceiling releases the FRAME without waiting for the compile — its
-        // documented, deliberate design. A frame that got past the ceiling with the compile still
-        // mid-`await` would call `postfxStack.render()` through a STUBBED renderer: nothing drawn,
-        // and then `markScenePainted()` firing over a blank canvas and lifting the loading
-        // overlay. That is #334's bug, arrived at from the other side.
-        //
-        // Asking is also what ENDS a stale session: past its own (shorter) ceiling
-        // `isPrecompileActive` restores the renderer and answers false, so this can hold at most
-        // `PRECOMPILE_MAX_HOLD_MS` and the in-flight compile stops on its next check. Placed
-        // before the branch because a stack disposed mid-compile routes the very next frame down
-        // the plain `renderer.render(scene, camera)` path, which is stubbed just the same.
-        if (isPrecompileActive(renderer, rawNow())) return;
-        // (The scene-pass borrow is checked at the top of the frame, ahead of the idle gate — #1252.)
+        // (Both compile holds — the scene-pass borrow and the stage session — are checked at the top of
+        // the frame, ahead of the idle gate and the sync: #1252, #1239 C.)
         const hasStages = planStages(liveReq).length > 0;
         // Tearing down an EXISTING stack matters as much as not building one: a live demotion
         // happens on a device that is already struggling, and a retained stack would keep its

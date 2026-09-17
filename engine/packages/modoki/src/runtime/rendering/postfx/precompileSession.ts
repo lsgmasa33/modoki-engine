@@ -58,7 +58,11 @@ interface Entry {
   depth: unknown;
   stencil: unknown;
   mrt: unknown;
+  /** False when the renderer has no `getMRT` — then there is nothing to give back, and binding
+   *  `null` would be a write the borrow never made (#1302 ②). */
+  hasMrt: boolean;
   renderTarget: unknown;
+  hasRenderTarget: boolean;
 }
 
 interface RendererLike {
@@ -100,17 +104,29 @@ function forceEnd(renderer: object, entry: Entry): void {
   entry.count = 0;
   sessions.delete(renderer);
   const r = renderer as RendererLike;
-  try {
-    if (typeof entry.render === 'function') r.render = entry.render as RendererLike['render'];
-    r.toneMapping = entry.toneMapping;
-    r.outputColorSpace = entry.outputColorSpace;
-    r.depth = entry.depth;
-    r.stencil = entry.stencil;
-    if (r.xr && entry.xrEnabled !== undefined) r.xr.enabled = entry.xrEnabled;
-    if (typeof r.setMRT === 'function') r.setMRT(entry.mrt ?? null);
-    if (typeof r.setRenderTarget === 'function') r.setRenderTarget(entry.renderTarget ?? null);
-  } catch {
-    // Restoring must never throw into a frame callback; a renderer this fails on is already lost.
+  // Restoring must never throw into a frame callback; a renderer this fails on is already lost.
+  // ⚠️ But each restore gets its OWN try (#1303), and the binding goes FIRST. In one shared `try`
+  // a throw from any early field skipped every later one, and the target and MRT were last: a
+  // stale tone mapping looks wrong, while a stale target sends every later frame into the
+  // precompile's target instead of the canvas, with nothing in the log.
+  const failed: string[] = [];
+  const attempt = (field: string, fn: () => void) => {
+    try { fn(); } catch { failed.push(field); }
+  };
+  attempt('renderTarget', () => {
+    if (entry.hasRenderTarget && typeof r.setRenderTarget === 'function') r.setRenderTarget(entry.renderTarget);
+  });
+  attempt('mrt', () => { if (entry.hasMrt && typeof r.setMRT === 'function') r.setMRT(entry.mrt); });
+  attempt('render', () => { if (typeof entry.render === 'function') r.render = entry.render as RendererLike['render']; });
+  attempt('toneMapping', () => { r.toneMapping = entry.toneMapping; });
+  attempt('outputColorSpace', () => { r.outputColorSpace = entry.outputColorSpace; });
+  attempt('depth', () => { r.depth = entry.depth; });
+  attempt('stencil', () => { r.stencil = entry.stencil; });
+  attempt('xr', () => { if (r.xr && entry.xrEnabled !== undefined) r.xr.enabled = entry.xrEnabled; });
+  // A swallowed failure used to look exactly like a clean restore, which is why this class stayed
+  // unobserved. Leave a breadcrumb.
+  if (failed.length && import.meta.env?.DEV) {
+    console.warn(`[precompileSession] restoring the renderer failed for: ${failed.join(', ')} (#1303)`);
   }
 }
 
@@ -146,7 +162,9 @@ export function beginPrecompile(
       depth: r.depth,
       stencil: r.stencil,
       mrt: typeof r.getMRT === 'function' ? r.getMRT() : null,
+      hasMrt: typeof r.getMRT === 'function',
       renderTarget: typeof r.getRenderTarget === 'function' ? r.getRenderTarget() : null,
+      hasRenderTarget: typeof r.getRenderTarget === 'function',
     };
     const open = entry;
     r.render = (object: unknown, _camera?: unknown) => {
@@ -239,9 +257,74 @@ export function runExclusivePrecompile<T>(renderer: unknown, fn: () => Promise<T
   if (!renderer || typeof renderer !== 'object') return fn();
   const key = renderer as object;
   const prev = chains.get(key) ?? Promise.resolve();
+  // The counter object is captured, not looked up at settle: a reset in between replaces it, and a
+  // turn from before the reset must not decrement the count of the turns queued after it.
+  let counter = inQueue.get(key);
+  if (!counter) { counter = { n: 0 }; inQueue.set(key, counter); }
+  const mine = counter;
+  mine.n++;
   const next = prev.then(fn, fn);
-  chains.set(key, next.then(() => undefined, () => undefined));
+  const settled = next.then(() => undefined, () => undefined);
+  chains.set(key, settled.then(() => { mine.n--; }));
   return next;
+}
+
+/** Turns queued or running on a renderer's compile chain. See `whenRendererQuiet`. */
+const inQueue = new WeakMap<object, { n: number }>();
+
+/** How many turns are queued or running on `renderer`'s compile chain — a waiting turn counts,
+ *  because the one ahead of it may be mid-compile. */
+export function pendingCompileTurns(renderer: unknown): number {
+  if (!renderer || typeof renderer !== 'object') return 0;
+  return inQueue.get(renderer as object)?.n ?? 0;
+}
+
+export function isRendererCompiling(renderer: unknown): boolean {
+  return pendingCompileTurns(renderer) > 0;
+}
+
+/** How long a swap may hold the first frame while the live scene's pipelines compile (#238).
+ *
+ *  A CEILING, not a budget — the hold normally ends when the compile resolves, which on a scene
+ *  the prewarm already covered is a few milliseconds of cache hits. This exists so a compile that
+ *  never settles (a lost device, a rejected promise we somehow do not see) degrades to the OLD
+ *  behaviour — a stalling first frame — instead of a viewport that never draws again.
+ *
+ *  `Scene3D`'s two frame gates use it. It lives here because `whenRendererQuiet` and
+ *  `PRECOMPILE_MAX_HOLD_MS` are both defined relative to it. */
+export const LIVE_COMPILE_MAX_HOLD_MS = 5000;
+
+/** How long `whenRendererQuiet` waits for its turn before writing anyway: the frame gates' ceiling.
+ *  Past it frames are drawing again regardless, and a tier demotion that never lands would keep a
+ *  struggling device on its expensive settings. */
+export const QUIET_WRITE_MAX_WAIT_MS = LIVE_COMPILE_MAX_HOLD_MS;
+
+/** Apply a SYNCHRONOUS write to renderer-global state without landing it inside a compile (#1239 D).
+ *
+ *  Every compile on a renderer reads renderer-global state (`shadowMap.enabled`, the bound target,
+ *  the MRT) each time three builds another object's node graph, i.e. after each of its `await`s.
+ *  A write in between changes the pipeline key halfway through: the compile warms a mix of the old
+ *  and new variants. So when nothing is queued or running, `write` runs NOW (and returns true);
+ *  otherwise it becomes its own turn on the chain (returns false), landing between compiles. Queue
+ *  order is kept, so a write made before a compile is queued still lands before that compile runs.
+ *
+ *  The rule this is one half of: a synchronous writer of renderer-global state either holds its
+ *  frame (`isRendererTargetBorrowed`) or goes through here; an async one takes a turn.
+ *  `docs/rendering.md` § "Gotcha: every async compile on a renderer is serialised". */
+export function whenRendererQuiet(renderer: unknown, write: () => void): boolean {
+  if (!isRendererCompiling(renderer)) { write(); return true; }
+  let done = false;
+  const run = () => {
+    if (done) return;
+    done = true;
+    try { write(); } catch (e) { console.warn('[precompileSession] a deferred renderer write threw (#1239)', e); }
+  };
+  // Bounded, like every other caller whose wait has no ceiling of its own (see
+  // `runExclusivePrecompile`): a compile that never settles must not strand the write for good.
+  // Writing mid-compile past the ceiling is no worse than before #1239; never writing loses the setting.
+  const timer = setTimeout(run, QUIET_WRITE_MAX_WAIT_MS);
+  void runExclusivePrecompile(renderer, async () => { clearTimeout(timer); run(); });
+  return false;
 }
 
 /** Scene-pass compiles currently holding a renderer's render target + MRT bound across `await`s.
@@ -306,4 +389,5 @@ export function resetPrecompileSession(renderer: unknown): void {
   if (!renderer || typeof renderer !== 'object') return;
   endAllPrecompiles(renderer);
   chains.delete(renderer as object);
+  inQueue.delete(renderer as object);
 }

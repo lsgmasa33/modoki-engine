@@ -75,7 +75,8 @@ export const notifications = {
 };
 
 /**
- * Ads — a no-op namespace, mirroring `export * as ads from './ads'` in Court's package (#342).
+ * Ads — a no-op namespace, mirroring `export * as ads from './ads'` in Court's package (#342) and
+ * Weaveling's (#1309).
  *
  * ⚠️ The no-op here is not merely a size saving, it is REQUIRED. A playable ad already runs inside
  * somebody else's ad slot: an interstitial launched from within a creative would be an ad inside
@@ -86,6 +87,12 @@ export const notifications = {
  */
 export const ads = {
   async initAds(): Promise<void> {},
+  // Weaveling's AdMob surface (#1309): the banner as per-frame desired state, a synchronous readiness
+  // read for the "watch a video" button, and UMP's privacy-options row — all "nothing here".
+  setBannerVisible(_visible: boolean): void {},
+  rewardedReady(): boolean { return false; },
+  privacyOptionsRequired(): boolean { return false; },
+  async showPrivacyOptions(): Promise<void> {},
   cleanupAds(): void {},
   onRewardEarned(_handler: unknown): void {},
   async restoreAdsAfterRealmSurvived(): Promise<void> {},

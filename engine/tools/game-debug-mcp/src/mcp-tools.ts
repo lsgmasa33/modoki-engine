@@ -31,10 +31,10 @@ import { join } from 'path';
 
 const pExecFile = promisify(execFile);
 import {
-  encodeEvalResult, encodeStructuredResult, extFor, describeScreenshot, isFailureBody,
-  deviceFail, caughtFailure, deviceReplyFailure, ERROR_CODES, type ErrorCode, type DeviceResult,
+  encodeEvalResult, encodeStructuredResult, extFor, describeScreenshot, isFailureBody, codeFromBody, optionsFromBody, BackendError,
+  deviceFail, caughtFailure, deviceReplyFailure, type DeviceResult,
 } from './result.js';
-import { parseReply, isDeviceError, decodeScreenshotReply, describeLease, describeInputFidelity, parseConsoleLogsReply, parseNativeLogsReply, SYNTHETIC_MECHANISM, type LeaseStatus } from './reply.js';
+import { parseReply, isDeviceError, decodeScreenshotReply, describeLease, describeInputFidelity, parseConsoleLogsReply, parseNativeLogsReply, decodeDeviceListReply, describeClaim, SYNTHETIC_MECHANISM, type LeaseStatus, type DeviceListClaim } from './reply.js';
 
 const BACKEND = (process.env.MODOKI_BACKEND ?? 'http://127.0.0.1:5179').replace(/\/$/, '');
 
@@ -326,29 +326,6 @@ export const DEVICE_READ_ASSET_DEF_TYPES = ['particle', 'animation', 'timeline',
 /** Who holds a device — machine-wide, across every clone on this Mac, read from
  *  `~/.modoki/device-claims.json`. `clone` is the claiming checkout's absolute path (branch alone
  *  repeats across machines); `deviceId` is namespaced (`adb:<serial>` / `ios:<udid>` / `ip:<host>`). */
-type DeviceListClaim = { deviceId: string; clone: string; branch: string; pid: number; guid?: string; at: number; label?: string; purpose?: string };
-
-type DeviceListReply = {
-  /** `name` is what the PHONE calls itself ("Galaxy A23 5G"); `model` is only ever the model CODE
-   *  ("SC_56C"), which is the string a human cannot match to a handset on the desk. Prefer `name`
-   *  wherever one is shown, and fall back to `model` — a device that would not answer has neither. */
-  android: Array<{ serial: string; state: string; model?: string; name?: string; transportId?: string; usable: boolean; claim: DeviceListClaim | null }>;
-  /** `devicectl` is set when `xcrun devicectl` itself listed the device (iOS 17+/CoreDevice) —
-   *  absent for one only the legacy `xctrace` listing can see (#143). It is what the editor's
-   *  Build-menu target picker reads to decide a hands-free install vs an Xcode handoff (#170). */
-  ios: Array<{ udid: string; name: string; connected: boolean; productType?: string; osVersion?: string; devicectl?: boolean; claim: DeviceListClaim | null }>;
-  /** Claims keyed by WiFi address (`ip:<host>`) — no hardware row exists for these, so they would be
-   *  invisible in either list above without being surfaced separately. */
-  otherClaims: DeviceListClaim[];
-  adb: { present: boolean; path?: string };
-  /** Present only when adb is absent — "no adb" and "no Android devices" are different problems
-   *  with different fixes, so this is a field, not folded into an empty `android` array. */
-  note?: string;
-  /** The iOS counterpart (#1096): present only when `ios` is EMPTY *and* a listing source broke, so
-   *  an empty list is never reported as "no iPhone attached" when nobody actually managed to look. */
-  iosNote?: string;
-};
-
 /** WHY the lease is stamped onto a measurement at all.
  *
  *  `adbScreenInfo` converts screenshot pixels to device pixels for `device_tap`/`device_drag`, and
@@ -544,7 +521,6 @@ async function leaseAdbTarget(): Promise<{ useAdb: boolean; serial?: string; lea
 
 // ── Backend HTTP helpers ─────────────────────────────────────
 
-class BackendError extends Error {}
 
 async function backendGet(path: string): Promise<unknown> {
   let res: Response;
@@ -557,7 +533,7 @@ async function backendGet(path: string): Promise<unknown> {
     );
   }
   const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new BackendError(String((body as { error?: string }).error ?? `HTTP ${res.status}`));
+  if (!res.ok) throw new BackendError(String((body as { error?: string }).error ?? `HTTP ${res.status}`), res.status, body);
   return body;
 }
 
@@ -576,7 +552,7 @@ async function backendPost(path: string, payload: unknown): Promise<unknown> {
     );
   }
   const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new BackendError(String((body as { error?: string }).error ?? `HTTP ${res.status}`));
+  if (!res.ok) throw new BackendError(String((body as { error?: string }).error ?? `HTTP ${res.status}`), res.status, body);
   return body;
 }
 
@@ -839,9 +815,21 @@ export function registerTools(server: McpServer) {
     {},
     async () => {
       try {
-        const r = (await backendGet('/api/device/list')) as DeviceListReply;
-        const claimSuffix = (c: DeviceListClaim | null) =>
-          c ? ` — CLAIMED by ${c.clone} (${c.branch})${c.purpose ? `, ${c.purpose}` : ''}` : '';
+        // DECODED, not cast (§9-bis, #1211 C-21): the route answers from the editor process, which
+        // versions independently of this MCP, and a cast turned a shape it could not read into
+        // "No devices attached" — could-not-look reported as nothing-is-there.
+        const decoded = decodeDeviceListReply(await backendGet('/api/device/list'));
+        if (!decoded.ok) {
+          return deviceFail({
+            code: 'NOT_AVAILABLE_HERE',
+            tool: 'device_list',
+            what: 'enumerate attached devices and their claims',
+            why: `the editor answered /api/device/list with a shape this MCP cannot read (${decoded.got}) — this is NOT "no devices attached"; nobody could look.`,
+            options: ['restart the editor — its backend and this MCP are from different builds'],
+          });
+        }
+        const r = decoded.reply;
+        const claimSuffix = (c: DeviceListClaim | null) => describeClaim(c, r.self);
         const lines: string[] = [];
         if (!r.adb.present) {
           lines.push(`adb: not found${r.note ? ` — ${r.note}` : ''}. Android devices below cannot be listed.`);
@@ -985,17 +973,19 @@ export function registerTools(server: McpServer) {
   const OK_IS_A_VERDICT = new Set(['diagnose']);
 
   async function perceptCall(
-    tool: string, method: string, params: Record<string, unknown> = {}, whatOverride?: string,
+    tool: string, method: string, params: Record<string, unknown>,
+    /** The attempt in the CALLER's terms, with the right VERB — REQUIRED, so no caller inherits one. */
+    what: string,
     /** Reshape a SUCCESSFUL answer before it is encoded — never a refusal, which is judged first. It may
      *  still turn the answer into a failure (`{fail}`) when the answer shows the request was not honoured. */
     shape?: (parsed: unknown) => Promise<{ value: unknown } | { fail: DeviceResult }>,
   ) {
-    // §5 wants the envelope in the CALLER's terms. The default names the op, which is right for a
-    // tool that IS its op — but wrong for a relay, where the op is plumbing and the caller asked
-    // about something else entirely. `device_game_tool_call` is the case: every refusal read "read
-    // game-tool-call from the connected device", naming neither the game tool the caller invoked
-    // nor, for a mutating one, the right verb.
-    const what = whatOverride ?? `read ${method} from the connected device`;
+    // §5 wants the envelope in the CALLER's terms, and `what` has NO default (#1211 C-15). The old
+    // one — "read <op> from the connected device" — was wrong twice: a relay's op is plumbing
+    // (`device_game_tool_call` read "read game-tool-call", naming neither the game tool nor its
+    // verb), and on a MUTATING action it named the wrong verb outright — a refused
+    // `input-watch-clear` or profiler `reset` said "read". A default is exactly what a new caller
+    // inherits without noticing, so each caller states its own.
     try {
       const parsed = parseReply<unknown>(await deviceRequest(method, params));
       if (isDeviceError(parsed)) {
@@ -1013,11 +1003,16 @@ export function registerTools(server: McpServer) {
       // `errors[]`, so a documented partial success still passes.)
       const failure = OK_IS_A_VERDICT.has(method) ? null : isFailureBody(parsed);
       if (failure) {
+        // RELAY the op's own classification and next steps (#1211). The op knows NOT_FOUND from
+        // AMBIGUOUS from PARTIAL and its `options` are the real choices; stamping REFUSED_BY_OP
+        // here threw both away, and `got: parsed` is not reporting the options — it is diagnostic
+        // payload an agent reads last, if at all.
         return deviceFail({
-          code: 'REFUSED_BY_OP',
+          code: codeFromBody(parsed, 'REFUSED_BY_OP'),
           tool, what,
           why: failure.split('\n\nfull response:')[0],
           got: parsed,
+          ...(optionsFromBody(parsed) ? { options: optionsFromBody(parsed)! } : {}),
         });
       }
       const shaped = shape ? await shape(parsed) : { value: parsed };
@@ -1050,7 +1045,8 @@ export function registerTools(server: McpServer) {
       limit: z.number().optional().describe('Cap entities returned: `returnedCount` came back of `totalCount` matched (both always); truncated:true when it bites.'),
       precision: z.number().optional().describe('Significant digits for floats (default 9; 0 = exact).'),
     },
-    async (args) => perceptCall('device_get_scene_state', 'scene-state', Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined))),
+    async (args) => perceptCall('device_get_scene_state', 'scene-state', Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined)),
+      'read the device scene state'),
   );
 
   tool('device_diagnose',
@@ -1062,7 +1058,7 @@ export function registerTools(server: McpServer) {
       'older is counted in `olderErrors` — BOOT errors live there, since nobody connects a device ' +
       'and attaches an agent inside the window. Read them with device_console_logs level=error.',
     {},
-    async () => perceptCall('device_diagnose', 'diagnose'),
+    async () => perceptCall('device_diagnose', 'diagnose', {}, 'diagnose the device scene'),
   );
 
   tool('device_journal',
@@ -1083,7 +1079,8 @@ export function registerTools(server: McpServer) {
       limit: z.number().optional().describe('Return the last N events (default 100).'),
       clear: z.boolean().optional().describe('Clear the journal after reading. REFUSED when combined with type=/level= — the ring has no selective clear, so clearing a FILTERED read would destroy every other event too.'),
     },
-    async (args) => perceptCall('device_journal', 'journal-events', Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined))),
+    async (args) => perceptCall('device_journal', 'journal-events', Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined)),
+      'read the device event journal'),
   );
 
   tool('device_resolve_refs',
@@ -1095,14 +1092,14 @@ export function registerTools(server: McpServer) {
     {
       refs: z.array(z.union([z.string(), z.number()])).describe('Refs to resolve — GUIDs and/or numeric ids.'),
     },
-    async (args) => perceptCall('device_resolve_refs', 'resolve-refs', args),
+    async (args) => perceptCall('device_resolve_refs', 'resolve-refs', args, 'resolve asset refs on the device'),
   );
 
   tool('device_introspect',
     'Discover what the game on the device exposes: dispatchable action names (+ param schemas) and ' +
       'live named read-values (e.g. canGoBack, timeSinceGameStart). Use before device_dispatch_action.',
     {},
-    async () => perceptCall('device_introspect', 'game-introspect'),
+    async () => perceptCall('device_introspect', 'game-introspect', {}, "read the connected game's actions and state"),
   );
 
   // ── PlayerPrefs + scene queries (#288 Phase 6) ──────────────────────────────
@@ -1251,7 +1248,8 @@ export function registerTools(server: McpServer) {
       limit: z.number().optional().describe('Cap per-entity rects (`returnedCount` of `totalCount` rects; `entityTotal` = distinct entities); truncated:true when it bites.'),
       precision: z.number().optional().describe('Significant digits for floats (default 9; 0 = exact).'),
     },
-    async (args) => perceptCall('device_layout_bounds', 'layout-bounds', Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined))),
+    async (args) => perceptCall('device_layout_bounds', 'layout-bounds', Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined)),
+      'read the device layout bounds'),
   );
 
   tool('device_watch',
@@ -1320,10 +1318,10 @@ export function registerTools(server: McpServer) {
       }
       const forward = (keys: readonly string[]) => Object.fromEntries(
         keys.map((k) => [k, (args as Record<string, unknown>)[k]]).filter(([, v]) => v !== undefined));
-      if (action === 'list') return perceptCall('device_watch', 'watch-list');
-      if (action === 'clear') return perceptCall('device_watch', 'watch-clear', id ? { id } : {});
-      if (action === 'read') return perceptCall('device_watch', 'watch-read', forward(ACCEPTS.read));
-      return perceptCall('device_watch', 'watch-start', forward(ACCEPTS.start));
+      if (action === 'list') return perceptCall('device_watch', 'watch-list', {}, 'list the device watches');
+      if (action === 'clear') return perceptCall('device_watch', 'watch-clear', id ? { id } : {}, id ? `clear the device watch ${id}` : 'clear every device watch');
+      if (action === 'read') return perceptCall('device_watch', 'watch-read', forward(ACCEPTS.read), 'read a device watch');
+      return perceptCall('device_watch', 'watch-start', forward(ACCEPTS.start), 'open a device watch');
     },
   );
 
@@ -1370,10 +1368,11 @@ export function registerTools(server: McpServer) {
       }
       const forward = (keys: readonly string[]) => Object.fromEntries(
         keys.map((k) => [k, (args as Record<string, unknown>)[k]]).filter(([, v]) => v !== undefined));
-      if (action === 'stop') return perceptCall('device_input_watch', 'input-watch-stop');
-      if (action === 'clear') return perceptCall('device_input_watch', 'input-watch-clear');
-      if (action === 'read') return perceptCall('device_input_watch', 'input-watch-read', forward(ACCEPTS.read));
-      return perceptCall('device_input_watch', 'input-watch-start', forward(ACCEPTS.start));
+      const what = `${action} the device input watch`;
+      if (action === 'stop') return perceptCall('device_input_watch', 'input-watch-stop', {}, what);
+      if (action === 'clear') return perceptCall('device_input_watch', 'input-watch-clear', {}, what);
+      if (action === 'read') return perceptCall('device_input_watch', 'input-watch-read', forward(ACCEPTS.read), what);
+      return perceptCall('device_input_watch', 'input-watch-start', forward(ACCEPTS.start), what);
     },
   );
 
@@ -1432,7 +1431,8 @@ export function registerTools(server: McpServer) {
           if (v !== undefined) params[k] = v;
         }
       }
-      return perceptCall('device_hit_regions', 'hit-regions', params);
+      return perceptCall('device_hit_regions', 'hit-regions', params,
+        action === 'read' ? 'read the device hit regions' : `${action} the device hit-region overlay`);
     },
   );
 
@@ -1805,8 +1805,10 @@ export function registerTools(server: McpServer) {
         const failed = parsed && typeof parsed === 'object' && (parsed.dispatched === false || parsed.ok === false);
         if (failed) {
           return deviceFail({
-            // The op's own code when it named one (a stale targetGuid is NOT_FOUND, #1223); else the generic refusal.
-            code: typeof parsed.code === 'string' && (ERROR_CODES as readonly string[]).includes(parsed.code) ? parsed.code as ErrorCode : 'REFUSED_BY_OP',
+            // The op's own code when it named one (a stale targetGuid is NOT_FOUND, #1223); else the
+            // generic refusal. This was an inline copy of the same closed-set check the other three
+            // sites needed and did not have — the shape C-16 names (#1211).
+            code: codeFromBody(parsed, 'REFUSED_BY_OP'),
             tool: 'device_dispatch_action',
             what,
             why: `the action was NOT dispatched${parsed.reason ? `: ${parsed.reason}` : ' and the device gave no reason'}. Nothing happened in the game.`,
@@ -1862,14 +1864,17 @@ export function registerTools(server: McpServer) {
         // The op reports every "did not happen" as {ok:false, error} at a 200 — a refusal, not a
         // transport failure. Surface it as a failed call with the op's own options (conventions §5),
         // never as a phantom success.
-        if (parsed && typeof parsed === 'object' && parsed.ok === false) {
+        // The SHARED predicate (#1211 C-16): a hand-copied `ok === false` missed an `{error}` body
+        // with no `ok`, and encoded it as a success.
+        const failure = isFailureBody(parsed);
+        if (failure) {
           return deviceFail({
-            code: 'REFUSED_BY_OP',
+            code: codeFromBody(parsed, 'REFUSED_BY_OP'),   // the op's own classification (#1211)
             tool: 'device_mutate_scene',
             what,
-            why: parsed.error ?? 'the device refused the mutation and gave no reason. Nothing was applied.',
+            why: failure.split('\n\nfull response:')[0],
             got: parsed,
-            options: parsed.options ?? [
+            options: optionsFromBody(parsed) ?? [
               'check the selection first: device_get_scene_state with the same where=',
               'an unknown trait or field refuses the whole call — the reply lists the real names',
             ],
@@ -1889,12 +1894,16 @@ export function registerTools(server: McpServer) {
     try {
       const parsed = parseReply<{ ok?: boolean; error?: string; options?: string[] }>(await deviceRequest(method, params));
       if (isDeviceError(parsed)) return deviceReplyFailure(tool, what, parsed, options);
-      if (parsed && typeof parsed === 'object' && parsed.ok === false) {
+      const failure = isFailureBody(parsed);   // the shared predicate (#1211 C-16), not `ok === false`
+      if (failure) {
+        // The op's code, not this call site's guess (#1211) — `device_write_player_prefs`'
+        // own description promises PARTIAL, and the agent was told "nothing happened" while the
+        // cache write had landed. Options were already relayed here; the code was not.
         return deviceFail({
-          code: 'REFUSED_BY_OP', tool, what,
-          why: parsed.error ?? 'the device refused and gave no reason. Nothing happened.',
+          code: codeFromBody(parsed, 'REFUSED_BY_OP'), tool, what,
+          why: failure.split('\n\nfull response:')[0],
           got: parsed,
-          options: parsed.options ?? options,
+          options: optionsFromBody(parsed) ?? options,
         });
       }
       return { content: [{ type: 'text' as const, text: encodeStructuredResult(parsed) }] };
@@ -2033,6 +2042,21 @@ export function registerTools(server: McpServer) {
       ]),
   );
 
+  // Keyed by the schema's own enum, so an action added there without a verb here fails typecheck.
+  const PROFILER_WHAT: Record<'read' | 'capture-start' | 'capture-stop' | 'capture-read' | 'capture-clear'
+    | 'gpu-on' | 'gpu-off' | 'reset' | 'boot' | 'boot-reset', string> = {
+    'read': 'read the device frame profiler',
+    'capture-start': 'start a device profiler capture',
+    'capture-stop': 'stop the device profiler capture',
+    'capture-read': 'read the device profiler capture',
+    'capture-clear': 'clear the device profiler capture',
+    'gpu-on': 'turn on device GPU timestamps',
+    'gpu-off': 'turn off device GPU timestamps',
+    'reset': 'reset the device profiler markers and captures',
+    'boot': 'read the device boot-phase timeline',
+    'boot-reset': 're-arm the device boot-phase timeline',
+  };
+
   // ── Reachability (#166 P4) — ops that existed on device but had no typed tool, so they were
   // reachable only by an agent who already knew to eval them. An eval-only op skips the whole
   // convention layer: no strict schema, no §5 refusal envelope, no coverage tier.
@@ -2061,7 +2085,7 @@ export function registerTools(server: McpServer) {
       ...(markers !== undefined ? { markers } : {}),
       ...(limit !== undefined ? { limit } : {}),
       ...(all !== undefined ? { all } : {}),
-    }),
+    }, PROFILER_WHAT[action ?? 'read']),
   );
 
   tool('device_set_timescale',
@@ -2097,7 +2121,7 @@ export function registerTools(server: McpServer) {
       // Shaped exactly as the editor route shapes modoki_handles (#1216 C-14): the op answers every
       // handle, and this tool used to pass that through — its own description's counts-only bare call
       // and filter-miss naming existed only on the editor side.
-      return perceptCall('device_handles', 'enact-handles', filter, undefined, async (parsed) => {
+      return perceptCall('device_handles', 'enact-handles', filter, 'read the device editor handles', async (parsed) => {
         const ignored = ignoredHandleFilter(parsed as HandlesResponse, filter);
         if (ignored) {
           return { fail: deviceFail({
@@ -2203,9 +2227,11 @@ export function registerTools(server: McpServer) {
             'device_status — confirm the lease is still held and the game is running',
           ]);
         }
+        // Deliberately NOT `isFailureBody` (#1211 C-16): type-text always answers `ok`, so an ABSENT
+        // `ok` is a failure here — the shared predicate would read `{}` as success.
         if (!parsed?.ok) {
           return deviceFail({
-            code: 'REFUSED_BY_OP',
+            code: codeFromBody(parsed, 'REFUSED_BY_OP'),   // the op's own classification (#1211)
             tool: 'device_type_text',
             what,
             why: parsed?.error ?? 'the device reported the type as unsuccessful with no reason.',

@@ -269,3 +269,50 @@ describe('#1013 — no route may hard-code its catch status', () => {
     expect(literal504s(src, 'r.ts').map((h) => `${h.line}:${h.sanctioned}`)).toEqual(['3:true', '6:false', '7:false', '9:false']);
   });
 });
+
+/** #1212 B-17: scene-query and player-prefs answered a CODED refusal as 200 (POST) or a flat 409
+ *  (GET), so curl read a refusal as success and NO_RENDERER was not 503. They re-status like
+ *  `relayJson` now; an uncoded `ok:false` keeps its old status. */
+describe('scene-query and player-prefs re-status a coded refusal', () => {
+  const refusal = { ok: false, code: 'NOT_AVAILABLE_HERE', error: 'no 3D physics world exists on this surface' };
+  it.each([
+    ['/api/scene-query', 'POST' as const],
+    ['/api/player-prefs', 'POST' as const],
+    ['/api/player-prefs', 'GET' as const],
+  ])('%s %s: a coded refusal gets its §5 status', async (route, method) => {
+    const r = await call(async () => refusal, route, method, method === 'POST' ? {} : undefined);
+    expect(r.status).toBe(400);
+    expect(r.body).toMatchObject(refusal);
+  });
+
+  it('NO_RENDERER on GET /api/player-prefs is 503, not the old flat 409', async () => {
+    const r = await call(async () => ({ ok: false, code: 'NO_RENDERER', error: 'no renderer' }), '/api/player-prefs', 'GET');
+    expect(r.status).toBe(503);
+  });
+
+  it('accept side: an uncoded ok:false keeps its status (200 on POST, 409 on GET)', async () => {
+    const post = await call(async () => ({ ok: false, error: 'x' }), '/api/player-prefs', 'POST', {});
+    expect(post.status).toBeUndefined();
+    const get = await call(async () => ({ ok: false, error: 'x' }), '/api/player-prefs', 'GET');
+    expect(get.status).toBe(409);
+  });
+
+  it('a hit or a miss is untouched', async () => {
+    const r = await call(async () => ({ ok: true, hit: null }), '/api/scene-query', 'POST', {});
+    expect(r.status).toBeUndefined();
+  });
+});
+
+/** #1212 B-16: the stray-param refusal pointed at an editor-action that is not on the allowlist. */
+describe('GET /api/player-prefs with a stray param names the REAL write route', () => {
+  it('points at POST /api/player-prefs, with options', async () => {
+    const r = await handleBackendRequest(makeCtx(async () => ({})), {
+      method: 'GET', urlPath: '/api/player-prefs', query: new URLSearchParams({ action: 'set' }), body: undefined,
+    }) as { status?: number; body: { error: string; code: string; options?: string[] } };
+    expect(r.status).toBe(400);
+    expect(r.body.code).toBe('UNKNOWN_PARAM');
+    expect(r.body.error).toMatch(/POST \/api\/player-prefs \{action/);
+    expect(r.body.error).not.toMatch(/editor-action/);
+    expect(r.body.options?.join('\n')).toMatch(/modoki_write_player_prefs/);
+  });
+});

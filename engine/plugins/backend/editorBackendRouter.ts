@@ -43,12 +43,26 @@ import { execFileSync } from 'child_process';
 import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, isGcsObjectMissing, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './gcloud';
 import { openInOS, revealInOS } from './osOpen';
 import { relativiseUnderProject, planDroppedFileDest } from './projectPaths';
-import { readMetaSidecar, writeMetaSidecar, assertSidecarWritable, sidecarPath, metaSidecarSha256, blocksMissingLocalHalf } from '../meta-sidecar';
+import { readMetaSidecar, writeMetaSidecar, assertSidecarWritable, sidecarPath, metaSidecarSha256, blocksMissingLocalHalf, SidecarTooNewError, SIDECAR_FORMAT_VERSION } from '../meta-sidecar';
 
 import { readFontAxes } from '../font-instance';
 import { createFolderAt, moveAssetFile, duplicateAssetFile, moveToTrash } from '../asset-fs-ops';
 import { getReimportHandler, getReimportTypes, type ReimportContext, type ReimportAsset } from '../reimport-registry';
 import { findGamesEntry } from '../findGamesEntry';
+
+/** A validate route's file, parsed — or the parse failure as a WARNING (#1212 A-4).
+ *  A file that does not parse is the most important thing a validator can report, and it used to
+ *  land in the catch-all 500, which the MCP reads as "could not look, relaunch the editor". It is
+ *  an ANSWER here, like every other finding, and says that nothing else was checked. A failed
+ *  READ (EACCES) is not a finding and still throws. */
+function parseForValidation(absPath: string, urlPath: string): { data: unknown } | { warning: string } {
+  const text = fs.readFileSync(absPath, 'utf-8');
+  try {
+    return { data: JSON.parse(text) };
+  } catch (e) {
+    return { warning: `${urlPath} is not valid JSON (${e instanceof Error ? e.message : String(e)}) — nothing else was checked; fix the file and validate again.` };
+  }
+}
 
 /** Build Vite's `/@fs/<abs>` URL for an absolute path — how the dev server serves files
  *  outside its root (the open project's game.ts, the script-tree entries). Uses
@@ -2325,8 +2339,8 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     try {
       const absPath = prefabPath ? ctx.resolveAssetPath(prefabPath) : null;
       if (!absPath || !fs.existsSync(absPath)) return json({ error: `prefab not found: ${prefabPath}` }, 404);
-      const data = JSON.parse(fs.readFileSync(absPath, 'utf-8'));
-      const result = validatePrefabData(data);
+      const parsed = parseForValidation(absPath, prefabPath!);
+      const result = 'data' in parsed ? validatePrefabData(parsed.data) : { warnings: [parsed.warning] };
       // ── #889 phase 2: this validates the file on DISK. ──
       // DISCLOSE, do not refuse (owner, 2026-09-09) — a read that refuses is worse than one that
       // caveats, and this route backs the human's own prefab tooling. §8's "refuses when that work
@@ -2365,9 +2379,11 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
     try {
       const absPath = scenePath ? ctx.resolveAssetPath(scenePath) : null;
       if (!absPath || !fs.existsSync(absPath)) return json({ error: `scene not found: ${scenePath}` }, 404);
-      const data = JSON.parse(fs.readFileSync(absPath, 'utf-8'));
+      const parsed = parseForValidation(absPath, scenePath!);
       const schema = ctx.getSchema();
-      const result = validateSceneData(data, schema, makePrefabResolver(ctx), makeAssetResolver(ctx));
+      const result = 'data' in parsed
+        ? validateSceneData(parsed.data, schema, makePrefabResolver(ctx), makeAssetResolver(ctx))
+        : { warnings: [parsed.warning], schemaApplied: false };
       // ── #889 phase 2: DISCLOSE, do not refuse (owner, 2026-09-09) — see /api/validate-prefab. ──
       //
       // ⚠️ GLOBAL (any unsaved doc can matter, not just this path) but NOT all four registries,
@@ -3104,7 +3120,8 @@ async function describeUnresolvedAgainstLiveWorld(
       // "nothing was deleted" about N-1 files that were gone — with no undo, and a bound editor
       // still parked on them (the #186 resurrection the unbind below exists to prevent).
       // That is the same 500 the `manifestRebuilt` comment below forbids, for the same reason.
-      const trashFailed = resolved.length > 0 ? moveToTrash(resolved.map((r) => r.abs)).failed : [];
+      const trashResult = resolved.length > 0 ? moveToTrash(resolved.map((r) => r.abs)) : { failed: [] as string[] };
+      const trashFailed = trashResult.failed;
       // ⚠️ `samePath`, not `includes`/`===` (#881's shared helper, adopted here when main landed
       // it). Both sides are absolute paths that made a ROUND TRIP through the win32 script — we
       // write them to its stdin and read them back off its stderr — so this is exactly the
@@ -3195,12 +3212,19 @@ async function describeUnresolvedAgainstLiveWorld(
       if (failedInputs.length > 0 && wentToTrash.length === 0) {
         return json({
           ok: false, trashed: 0, missing, manifestRebuilt, failed: failedInputs,
-          error: `the OS refused to trash ${failedInputs.length === 1 ? 'the file' : `all ${failedInputs.length} files`}: ${failedInputs.join(', ')}`,
+          error: `the OS refused to trash ${failedInputs.length === 1 ? 'the file' : `all ${failedInputs.length} files`}: ${failedInputs.join(', ')}`
+            + (trashResult.reason ? ` (the OS said: ${trashResult.reason})` : ''),
+          // §5: the files are still on disk, and these are the causes an agent can act on.
+          options: [
+            'the file is still on disk — a locked file (Finder Get Info → Locked) or a read-only volume refuses the Trash; clear that, then retry',
+            'modoki_list_assets confirms what is still there',
+          ],
         });
       }
       return json({
         ok: true, saved: wentToTrash.length > 0, trashed: wentToTrash.length, missing, manifestRebuilt,
         ...(failedInputs.length ? { failed: failedInputs } : {}),
+        ...(failedInputs.length && trashResult.reason ? { failedReason: trashResult.reason } : {}),
         ...(outcome.kind === 'applied' && outcome.notes.length ? { repaired: outcome.notes } : {}),
         ...(outcome.kind === 'unrepaired' ? { repairFailed: outcome.reason } : {}),
       });
@@ -3839,6 +3863,20 @@ async function describeUnresolvedAgainstLiveWorld(
           : {}),
       });
     } catch (e) {
+      // #1212 A-9: the newer-format refusal is DELIBERATE and the caller's to resolve — a 500
+      // told the agent to relaunch the editor. An I/O failure from the same write stays a 500.
+      // ⚠️ NOT 409: the renderer's `writeMetaConditional` reads any 409 as "the file changed on
+      // disk — reopen it; saving again OVERWRITES the newer file", which is false here on every
+      // count and hides the real reason. 400 is `refusalStatus`'s status for REFUSED_BY_OP.
+      if (e instanceof SidecarTooNewError) {
+        return json({
+          ok: false, code: 'REFUSED_BY_OP', error: e.message,
+          options: [
+            `merge the branch that raised SIDECAR_FORMAT_VERSION past ${SIDECAR_FORMAT_VERSION} (the sidecar says ${e.version}), restart the editor, then retry`,
+            'modoki_get_asset_meta reads the sidecar as it is — nothing was written',
+          ],
+        }, refusalStatus('REFUSED_BY_OP'));
+      }
       return json({ error: String(e) }, 500);
     }
   }
@@ -3910,6 +3948,7 @@ async function describeUnresolvedAgainstLiveWorld(
       });
       if (reRefused) return json(reRefused.body, reRefused.status);
       const summary = { converted: 0, skipped: 0, errors: [] as string[] };
+      const tooNew: string[] = [];   // #1212: which of `errors` were a newer-format sidecar
       // Paths whose bake succeeded — pushed to the renderer below so the LIVE viewport
       // evicts its stale GPU cache without a reload. The UI "Re-import" button does this
       // client-side (assetViews/reimport.ts); routing it through the endpoint means the
@@ -3948,7 +3987,10 @@ async function describeUnresolvedAgainstLiveWorld(
           // not know costs an ignored array entry.
           invalidate.push({ path: a.path, type: a.type });
         }
-        catch (e) { summary.errors.push(`${a.path}: ${e instanceof Error ? e.message : String(e)}`); }
+        catch (e) {
+          summary.errors.push(`${a.path}: ${e instanceof Error ? e.message : String(e)}`);
+          if (e instanceof SidecarTooNewError) tooNew.push(a.path);
+        }
       }
       ctx.rebuildManifest(); // pick up baked import settings
       // Tell the renderer to drop the cached geometry/texture for the re-baked assets.
@@ -3980,11 +4022,19 @@ async function describeUnresolvedAgainstLiveWorld(
         }, 422);
       }
       const ok = summary.converted > 0 || summary.errors.length === 0;
+      // #1212 A-9's sibling: when EVERY failure was a newer-format sidecar, nothing is broken — the
+      // run was refused, for a reason the caller resolves by merging. A 500 read as "relaunch".
+      const refusedOnly = !ok && tooNew.length > 0 && tooNew.length === summary.errors.length;
       // Say WHY anything was skipped. A bare `skipped:N` is a number the caller cannot act on.
       return json({
         // A bake writes the derived files (KTX2/WebP, GLB) and the sidecar's cache block, so
         // anything converted is on disk (§8). A run that converted nothing wrote nothing.
         ...summary, ok, saved: summary.converted > 0,
+        ...(refusedOnly ? {
+          code: 'REFUSED_BY_OP',
+          error: `every asset that failed has a sidecar written by a NEWER build (format > ${SIDECAR_FORMAT_VERSION}): ${tooNew.join(', ')} — nothing was converted`,
+          options: [`merge the branch that raised SIDECAR_FORMAT_VERSION past ${SIDECAR_FORMAT_VERSION}, restart the editor, then reimport`],
+        } : {}),
         ...(noHandler.length ? { noHandler } : {}),
         ...(unresolved.length ? { unresolved } : {}),
         // The forced path is the one that needs saying out loud: the bake DID run and it did NOT
@@ -4006,7 +4056,7 @@ async function describeUnresolvedAgainstLiveWorld(
               + 'unknown — not "there was none".',
           }
           : {}),
-      }, ok ? 200 : 500);
+      }, ok ? 200 : refusedOnly ? refusalStatus('REFUSED_BY_OP') : 500);
     } catch (e) {
       return json({ error: String(e) }, 500);
     }
@@ -5177,9 +5227,10 @@ async function describeUnresolvedAgainstLiveWorld(
       const result = await ctx.requestBrowser('scene-query', body ?? {});
       // The op distinguishes "there is no physics world" and "the direction was degenerate" from a
       // genuine miss, and those refusals must NOT arrive as a 200 the way a miss does — a miss is
-      // `{ok:true, hit:null}`, which is a real answer. `postJson` runs isFailureBody, so
-      // 200-with-{ok:false} already becomes a failed tool call carrying the op's `code`.
-      return json(result);
+      // `{ok:true, hit:null}`, which is a real answer. `postJson` would catch a 200 refusal, but
+      // curl would not (#1212 B-17): a coded refusal gets its §5 status, as `relayJson` gives it.
+      const refusal = opRefusal(result);
+      return refusal ? json(result as Record<string, unknown>, refusalStatus(refusal.code)) : json(result);
     } catch (e) {
       return json({ error: String(e instanceof Error ? e.message : e) }, relayFailureStatus(e));
     }
@@ -5211,7 +5262,7 @@ async function describeUnresolvedAgainstLiveWorld(
 
   // ── GET /api/player-prefs[?key=] (M→R) ── read the engine's PlayerPrefs store (#288 gap 4).
   // GET, per the C7 convention: this tells you something, it does not do something. The WRITE half
-  // is a separate op behind POST /api/editor-action (`player-prefs-write`) — one tool, one job
+  // is POST /api/player-prefs {action, …} below (`player-prefs-write`) — one tool, one job
   // (docs/mcp-tool-conventions.md §7), and it keeps §4's "no mutating operation is reachable by
   // GET" true by construction rather than by an allowlist check.
   if (urlPath === '/api/player-prefs' && method === 'GET') {
@@ -5222,9 +5273,15 @@ async function describeUnresolvedAgainstLiveWorld(
     const stray = [...query.keys()].filter((k) => k !== 'key');
     if (stray.length > 0) {
       return json({
-        error: `unknown query param(s) on /api/player-prefs: ${stray.join(', ')}. This route READS only; the write half is POST /api/editor-action {action:'player-prefs-write'}.`,
+        // #1212 B-16: this used to point at POST /api/editor-action {action:'player-prefs-write'},
+        // which is not on the editor-action allowlist — and that relay strips `action` anyway.
+        error: `unknown query param(s) on /api/player-prefs: ${stray.join(', ')}. This route READS only; the write half is POST /api/player-prefs {action, key?, value?, confirm?}.`,
         code: 'UNKNOWN_PARAM',
         expected: 'key',
+        options: [
+          'GET /api/player-prefs?key=<k> reads one key; with no key it lists them (MCP: modoki_player_prefs)',
+          'POST /api/player-prefs {action:"set"|"delete"|"clear"|"flush", …} writes (MCP: modoki_write_player_prefs)',
+        ],
       }, 400);
     }
     const key = query.get('key');
@@ -5235,6 +5292,11 @@ async function describeUnresolvedAgainstLiveWorld(
       // 200 carrying {ok:false} would reach the agent as a successful read of an empty store. That
       // is exactly the "could not look" → "nothing is there" collapse this op refuses to make.
       // The body is passed through whole so its `code` survives into the §5 envelope.
+      // A CODED refusal gets its §5 status (#1212 B-17): the flat 409 gave every code one status —
+      // the op's real refusal, NOT_AVAILABLE_HERE (an un-hydrated store), is a 400 now, as it is on
+      // every relayJson route. An uncoded `ok:false` keeps the 409 it always had.
+      const refusal = opRefusal(result);
+      if (refusal) return json(result as Record<string, unknown>, refusalStatus(refusal.code));
       if (result && typeof result === 'object' && (result as { ok?: unknown }).ok === false) return json(result, 409);
       return json(result);
     } catch (e) {
@@ -5252,9 +5314,11 @@ async function describeUnresolvedAgainstLiveWorld(
   if (urlPath === '/api/player-prefs' && method === 'POST') {
     try {
       const result = await ctx.requestBrowser('player-prefs-write', body ?? {});
-      // 200-with-{ok:false} is fine on a POST — `postJson` runs `isFailureBody` and turns it into a
-      // failed tool call, carrying the op's own `code` (§4's C7 convention). No status mapping here.
-      return json(result);
+      // `postJson` would turn a 200 refusal into a failed tool call, but curl would read it as
+      // success (#1212 B-17) — a coded refusal gets its §5 status, as `relayJson` gives it. An
+      // uncoded `ok:false` stays a 200 for `isFailureBody`, as before.
+      const refusal = opRefusal(result);
+      return refusal ? json(result as Record<string, unknown>, refusalStatus(refusal.code)) : json(result);
     } catch (e) {
       return json({ error: String(e instanceof Error ? e.message : e) }, relayFailureStatus(e));
     }

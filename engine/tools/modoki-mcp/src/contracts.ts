@@ -745,7 +745,7 @@ const DECLS: Record<string, Decl> = {
   modoki_exit_pose_envelope: {
     kind: 'control', method: 'POST', route: '/api/editor-action', op: 'exit-pose-envelope',
     mutating: true, persists: 'live', requires: ['editor', 'scene'],
-    notes: "The way OUT of the envelope modoki_pose_clip opens — not optional scope, since the envelope pins the run-mode at 'scrub' and that is exactly what blocks the human's Cmd+S. Refuses when the TIMELINE panel owns the envelope: ending its session would revert its world mid-run.",
+    notes: "The way OUT of the envelope modoki_pose_clip opens — not optional scope, since the envelope pins the run-mode at 'scrub' and that is exactly what blocks the human's Cmd+S. Refuses (REFUSED_BY_OP + modeOwner) when the TIMELINE panel owns the envelope: ending its session would revert its world mid-run, and modoki_play_control stop is the destructive exit there. With nothing open it is NOT_FOUND; while Playing it refuses with runMode.",
   },
   modoki_read_asset_def: {
     kind: 'read', method: 'GET', route: '/api/asset-def', requires: ['editor'], aim: 'asset',

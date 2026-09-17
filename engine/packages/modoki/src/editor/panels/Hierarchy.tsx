@@ -48,6 +48,7 @@ import {
 // matching live in assetOps/assetRoots so the flat-project "/assets" prefix
 // can't be forgotten in one copy again (#29).
 import { firstWritableAssetRoot, createPrefabFromEntity } from './assetOps';
+import { runtimeExcludedMessage } from '../scene/authoringScope';
 import { confirmReplaceAsset } from '../utils/saveDialog';
 
 type DropZone = 'before' | 'child' | 'after' | null;
@@ -1104,6 +1105,7 @@ export default function Hierarchy() {
     if (result === 'declined') return;
     if (!result) { console.error(`[Hierarchy] Failed to create prefab ${savePath}`); return; }
     console.log(`[Hierarchy] Created prefab: ${savePath}`);
+    if (result.runtimeExcluded > 0) useEditorStore.getState().showToast(runtimeExcludedMessage(result.runtimeExcluded), 'warn');
     pushAction(result.action);
   }, []);
 

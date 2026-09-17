@@ -263,3 +263,39 @@ describe('moveToTrash — the Linux rmSync fallback reports what it could not sa
     expect(moveToTrash(linked, 'win32', () => ({ failed: [] }))).toEqual({ failed: [] });
   });
 });
+
+/** #1212 A-8: Finder's `delete` names no path when it refuses, so a darwin exec failure rethrew and
+ *  the route answered 500 ("relaunch the editor") about a locked file. The disk is the witness now. */
+describe('moveToTrash — a darwin Finder refusal reports what is still on disk', () => {
+  let root = '';
+  beforeEach(() => { root = fs.realpathSync.native(makeScratchDir('mtt-darwin-')); });
+  afterEach(() => { fs.rmSync(root, { recursive: true, force: true }); });
+  const finderRefuses = (stderr: string) => () => {
+    throw Object.assign(new Error('Command failed: osascript'), { stderr });
+  };
+
+  it('names the paths still there, with what Finder said', () => {
+    const locked = path.join(root, 'locked.png'); fs.writeFileSync(locked, 'x');
+    const gone = path.join(root, 'gone.png');   // never created: the witness must only name what is on disk
+    const r = moveToTrash([locked, gone], 'darwin', finderRefuses("execution error: Finder got an error: The operation can't be completed. (-8003)\nmore"));
+    expect(r.failed).toEqual([locked]);
+    expect(r.reason).toBe("execution error: Finder got an error: The operation can't be completed. (-8003)");
+  });
+
+  it('an AppleEvent TIMEOUT (-1712) is still a thrown failure — Finder may be mid-move', () => {
+    const f = path.join(root, 'slow.png'); fs.writeFileSync(f, 'x');
+    expect(() => moveToTrash([f], 'darwin', finderRefuses('execution error: Finder got an error: AppleEvent timed out. (-1712)')))
+      .toThrow(/osascript/);
+  });
+
+  it('an error exit with NOTHING left on disk is a delete that happened — the accept side', () => {
+    const gone = path.join(root, 'gone.png');
+    expect(moveToTrash([gone], 'darwin', finderRefuses('whatever'))).toEqual({ failed: [] });
+  });
+
+  it.skipIf(process.platform === 'win32')('a dangling symlink still on disk counts as not moved (lstat, not exists)', () => {
+    const ln = path.join(root, 'dangling');
+    fs.symlinkSync(path.join(root, 'no-such-target'), ln);
+    expect(moveToTrash([ln], 'darwin', finderRefuses('refused')).failed).toEqual([ln]);
+  });
+});

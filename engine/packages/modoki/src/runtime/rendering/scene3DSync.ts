@@ -4265,6 +4265,10 @@ async function prewarmShadersForWorldInner(
   // NON-env variant synchronously, which is precisely the cold-compile stutter this mirror is
   // here to prevent (measured at 3926 ms on the Y6, P4a). The prewarm must model the scene the
   // tier will actually draw, not the scene as authored.
+  let prewarmEnvSource: THREE.DataTexture | null = null;
+  const bindPrewarmEnv = () => {
+    if (prewarmEnvSource) prewarmScene.environment = getEnvPMREMTexture(renderer, prewarmEnvSource) ?? prewarmEnvSource;
+  };
   if (tierAllowsIBL(getActiveTierOverrides())) {
     world.query(Environment).readEach(([env]: [{ hdrPath: string; intensity: number }]) => {
       if (!env.hdrPath) return;
@@ -4276,7 +4280,18 @@ async function prewarmShadersForWorldInner(
         // `registerBeforeSwap`, so it runs on EVERY scene swap — handing three a raw equirect here
         // makes `PMREMNode` build its own generator, which is precisely the per-swap leak #739
         // fixes, re-entering through the prewarm door and defeating the fix.
-        prewarmScene.environment = getEnvPMREMTexture(renderer, cached) ?? cached;
+        //
+        // ⚠️ Only the SOURCE is recorded here; the PMREM is derived inside the compile's queue turn
+        // below (#1239 C). Deriving draws PMREM quads through this renderer, and out here a previous
+        // scene's cold live compile can still hold the pass target + scene MRT bound — the quads
+        // would build against that MRT, and the broken texture is cached per renderer and source.
+        //
+        // The raw source is bound meanwhile, so the retired-env sweep still sees a holder while the
+        // prewarm waits in the queue: with only a closure holding it, a re-import could retire and
+        // free it there, and the turn would then derive — and cache for good — a PMREM of a freed
+        // source. Nothing compiles against the raw binding; the turn swaps it before compiling.
+        prewarmEnvSource = cached;
+        prewarmScene.environment = cached;
         prewarmScene.environmentIntensity = env.intensity;
         // Deliberately NO `prewarmScene.background` mirror (#775/#779): three only derives a
         // background conversion from a `scene.background` that is actually SET, so there is no
@@ -4567,7 +4582,10 @@ async function prewarmShadersForWorldInner(
       // wait for all of it. Skipping costs only the warm — `compileLiveScene` compiles what the
       // swap actually placed.
       const queued = await runExclusivePrecompileWithin(
-        renderer, PREWARM_MAX_QUEUE_MS, () => (renderer as THREE.WebGLRenderer).compileAsync(prewarmScene, camera),
+        renderer, PREWARM_MAX_QUEUE_MS, () => {
+          bindPrewarmEnv();
+          return (renderer as THREE.WebGLRenderer).compileAsync(prewarmScene, camera);
+        },
       );
       if (!queued.ran) {
         console.warn(
@@ -4577,6 +4595,7 @@ async function prewarmShadersForWorldInner(
       }
     } else {
       // Fallback: synchronous compile (still better than first-frame-stutter)
+      bindPrewarmEnv();
       (renderer as THREE.WebGLRenderer).compile?.(prewarmScene, camera);
     }
   } finally { endBootSpan(compileSpan); }

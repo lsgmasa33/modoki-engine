@@ -175,3 +175,4 @@ export { isPrefabEditWorld, prefabEditWorldPath, prefabSessionWorldPath, PREFAB_
 // inside this package (the keymap registry, the installed gate), so the probe does too and
 // the route asks for one measured verdict rather than re-deriving the policy in main.
 export { probeKeyReach, chordFromElectronKey, DOM_KEY_ALIAS, type KeyReach } from './input/keyReach';
+export { collectTransientSubtreeIds, filterAuthoringVisible, runtimeExcludedMessage } from './scene/authoringScope';

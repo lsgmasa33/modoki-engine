@@ -2,7 +2,7 @@
  *  parseReply's JSON-string fallback, the device 'Error:' convention, and the screenshot decode. */
 
 import { describe, it, expect } from 'vitest';
-import { parseReply, isDeviceError, decodeScreenshotReply, describeLease } from '../../tools/game-debug-mcp/src/reply';
+import { parseReply, isDeviceError, decodeScreenshotReply, describeLease, decodeDeviceListReply, describeClaim } from '../../tools/game-debug-mcp/src/reply';
 
 describe('parseReply', () => {
   it('passes an object through unchanged', () => {
@@ -89,5 +89,53 @@ describe('describeLease (device_status / device_connect / device_disconnect shar
   });
   it('a transient state is reported as in-progress', () => {
     expect(describeLease({ state: 'connecting', target: null, lastTarget: null })).toMatch(/lease is connecting/);
+  });
+});
+
+describe('decodeDeviceListReply (#1211 C-21)', () => {
+  const base = { adb: { present: true }, android: [], ios: [], otherClaims: [] };
+  it('accepts a reply with no self — a backend older than the field', () => {
+    const d = decodeDeviceListReply(base);
+    expect(d.ok && d.reply.self).toBe(undefined);
+  });
+  it('keeps a well-formed self', () => {
+    const d = decodeDeviceListReply({ ...base, self: { clone: '/r', pid: 1 } });
+    expect(d.ok && d.reply.self).toEqual({ clone: '/r', pid: 1 });
+  });
+  it('refuses each missing required key, describing the shape by keys only', () => {
+    for (const k of ['adb', 'android', 'ios', 'otherClaims'] as const) {
+      const { [k]: _drop, ...rest } = base;
+      const d = decodeDeviceListReply(rest);
+      expect(d.ok, `missing ${k} was accepted`).toBe(false);
+    }
+  });
+  it('refuses a row the renderer would dereference blind', () => {
+    expect(decodeDeviceListReply({ ...base, android: [{ state: 'device' }] }).ok).toBe(false);
+    expect(decodeDeviceListReply({ ...base, ios: [{ name: 'x' }] }).ok).toBe(false);
+  });
+  it('ONE corrupt claim record does not refuse the whole listing', () => {
+    const d = decodeDeviceListReply({ ...base, android: [{ serial: 's', claim: { pid: 1 } }] });
+    expect(d.ok).toBe(true);
+  });
+});
+
+describe('describeClaim (#1211 C-21)', () => {
+  const c = { deviceId: 'adb:s', clone: '/r/qa', branch: 'work-qa', pid: 5, at: 0 };
+  it('same clone, same pid → this editor', () => {
+    expect(describeClaim(c, { clone: '/r/qa/', pid: 5 })).toBe(' — held by THIS editor (your lease)');
+  });
+  it('same clone, other pid → this clone, another process', () => {
+    expect(describeClaim(c, { clone: '/r/qa', pid: 6 })).toBe(' — held by this clone, another process (pid 5)');
+  });
+  it('a CLI claim from this clone names its owner, not "pid 0"', () => {
+    expect(describeClaim({ ...c, pid: 0, owner: 'build-1234' }, { clone: '/r/qa', pid: 5 }))
+      .toBe(" — held by this clone's CLI (owner build-1234)");
+  });
+  it('a claim record with no clone is reported as unreadable', () => {
+    expect(describeClaim({ ...c, clone: undefined as unknown as string }, { clone: '/r/qa', pid: 5 })).toMatch(/unreadable claim record/);
+  });
+  it('other clone, or no self → CLAIMED', () => {
+    expect(describeClaim(c, { clone: '/r/ai', pid: 5 })).toBe(' — CLAIMED by /r/qa (work-qa)');
+    expect(describeClaim(c, undefined)).toBe(' — CLAIMED by /r/qa (work-qa)');
   });
 });

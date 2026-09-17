@@ -80,6 +80,47 @@ that answers the wrong question is not a weaker guard, it is a guard that cannot
   because `releaseAllForScene` intentionally does not bump the generation: the owner-set answers
   supersession, the generation answers teardown, and neither substitutes for the other.
 
+### First ask what the post-deferral write IS: a PUBLISH or a RELEASE (#1292 / #1307)
+
+⚠️ **A liveness check is the right answer for only one of the two, and reaching for it on the other
+is how a counter ends up NEGATIVE.** This came out of one family fixed across two games on the same
+day, where the same teardown mechanism wore two opposite symptoms.
+
+The mechanism both share: *a teardown resets module-level state in place, while an operation that
+captured nothing still writes to that same slot afterwards.* What separates them — and what picks
+the technique — is **what the escaped write is for**:
+
+| the post-deferral write is… | may it be dropped? | technique |
+|---|---|---|
+| a **PUBLISH** — a value the operation computed, which the teardown's reset supersedes | **yes**, dropping it is correct | capture a `LivenessCheck` before the first deferral, re-check immediately before the write, return |
+| a **RELEASE** — an obligation the operation incurred *before* its deferral (a `--` matching its own `++`, waiters it may owe) | **no**, the obligation must land somewhere | capture the **RECORD** at entry; the teardown **swaps the slot** for a fresh one |
+
+**The rule in one sentence, which is the part worth remembering:** *a publish has no obligation, so a
+guard that drops it is sound; a release does, so a guard that drops it leaks the counter upward
+instead — and a record is the only shape that lets the obligation land where it belongs, on a record
+nobody reads any more.*
+
+**Why the wrong choice is worse than no fix.** Resetting a counter in place *fights* the floating
+`finally` rather than replacing it, so the in-flight `--` takes the live count to **−1**. A counter
+leaked upward fails **closed** — the guard stays on, something waits forever, you notice. Driven
+negative it fails **open**, and nothing reports it. `games/court`'s `progressReset.depth` is the
+sharpest case: it has two readers that **disagree at −1** — `wipeInFlight()` asks `> 0` and reads the
+wipe fence OPEN, while `readWallet`'s re-seed gate asks `=== 0` and keeps the persist SUPPRESSED.
+One counter, one bad value, two opposite failures. (This is #599's mistake, and
+`games/wordweave`'s teardown has carried the scar in a comment since.)
+
+⚠️ **A test of the release case must not assert the `> 0` reader.** It answers `null` at 0 *and* at
+−1, so it passes either way — an unfalsifiable test of the exact mechanism. Only the `=== 0` reader
+can tell them apart.
+
+**Worked examples:** publish → `fieldLoadLiveness` in `games/sling/runtime/systems.ts` (four
+publishes, four separate captures — one per write, so each test has a unique mutation anchor).
+Release → `cloudSyncCoordination` and `progressReset` in `games/court/runtime/systems.ts`.
+
+⚠️ **Swapping a record ORPHANS anything waiting on the old one.** That is usually the same behaviour
+the in-place reset had (court's `cloudSyncIdleWaiters = []` dropped them too), but it becomes
+implicit rather than obvious — say so at the line, and check that every waiter is bounded.
+
 ### The scope rule: a key-taking invalidator bumps exactly its own key
 
 A `TeardownToken` has two halves — `invalidateAll()` and `invalidateKey(k)` — and the rule that
@@ -374,6 +415,39 @@ guarded exit. That check is buildable and was deliberately not built: it needs a
 list, and a frozen list of exceptions goes red whenever another clone adds an async owner, with both
 branches green in isolation. It is the right next step if this class of defect recurs; it is not
 worth its merge cost while the token vocabulary is doing the work.
+
+⚠️ **UPDATE (#1292, 2026-09-17): the class recurred, a one-file version was tried, and it
+FAILED — so this class is still NOT mechanically covered.** #1288 (wordweave, reproduced), sling's
+four sites and #1294 landed inside about a week, which is the trigger the paragraph above names. A
+statement-order scan of `games/sling/runtime/systems.ts` was built with regexes, and it lost three
+adversarial review rounds in a row. Each round found a spelling it passed: a deferral that was not
+`await`, a write in a callback placed *below* the check (a verbatim #1292 instance, still green), a
+signature brace scanned as the body, compound assignment, arrow functions, and `const` objects whose
+*fields* the teardown resets. It never caught a defect on its own: a reviewer found sling's fourth
+publish, and the scan was widened to match only afterwards. **The lesson for anyone tempted to build
+the repo-wide version: the check needs scope and control-flow analysis** (which callback runs when,
+and whether a guard dominates a write), not a better pattern. A parser alone is not enough either:
+`@modoki/engine/testing/sourceAst` already gives you the tree, and the analysis on top of it is the
+part nobody has built.
+
+What sling kept instead (owner's call, 2026-09-17) is a narrower claim that a parse *can* decide
+without flow analysis. `games/sling/tests/sling-moduleStateCensus.test.ts` requires every
+module-lifetime state NAME in that one file to be classified, and checks each class against what the
+two teardown bodies actually **write** (a read does not count). A variable `resetModule` writes is
+classed `world`, and a new one fails until someone classifies it, which puts a human in front of the
+obligation when the state is created. Its stated limits, all in its header:
+- It works per name, not per field: a new field on an already-reset object passes.
+- `UPPER_CASE` constants are not censused.
+- State with no binding of its own (a `globalThis` write, a property on a function) is not censused.
+- A reset moved into a helper reads as missing.
+- A write is recognised by its shape, not its effect. A property write rooted in the name counts
+  (`enemies[0].x = 0` counts for `enemies`), and so does a write in a dead branch. A write inside a
+  closure or after an `await` does not count, and neither does a non-emptying call like `.set`
+  or a write that reads its own old value (`x = x ?? null`).
+
+**It does not check that any write is guarded.** For the known sites that rests on the behavioural
+pairs in `sling-loadLiveness.test.ts`, and for a new site, on review alone. It is **not** a precedent
+for a repo-wide list either, which stays declined for the cross-clone reason above.
 
 So the ordinary path stays a human one: when you write a deferral in a function that later writes
 shared state, pick a token from the table.

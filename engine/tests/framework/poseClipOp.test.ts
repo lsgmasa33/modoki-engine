@@ -28,6 +28,9 @@ import { useEditorStore, onPoseEnvelopeExited, exitPoseEnvelope } from '@modoki/
 import { setRunMode, getRunMode } from '../../packages/modoki/src/runtime/core/playState';
 import { poseClipAtTime } from '@modoki/engine/editor';
 import * as preview from '../../packages/modoki/src/editor/scene/timelinePreview';
+import { enterPreviewMode, exitPreviewMode, getModeOwner } from '../../packages/modoki/src/editor/scene/playMode';
+import { registerAsset, unregisterAsset } from '../../packages/modoki/src/runtime/loaders/assetManifest';
+import { newGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 
 registerAllTraits();
 registerEditorAgentOps();
@@ -63,7 +66,8 @@ describe('pose-clip refuses each missing precondition SEPARATELY', () => {
     expect(r.ok).toBe(false);
     expect(r.code).toBe('NOT_FOUND');
     expect(String(r.error)).toMatch(/no animation clip is open/);
-    expect(r.options?.[0]).toMatch(/open a \.anim\.json/);
+    // An AGENT tool, not human UI (#1212 A-14): "the Animation panel" is not something an agent can open.
+    expect(r.options?.[0]).toMatch(/modoki_open_animation_editor/);
   });
 
   it('clip open but UNBOUND → a different NOT_FOUND, naming a different fix', async () => {
@@ -75,7 +79,7 @@ describe('pose-clip refuses each missing precondition SEPARATELY', () => {
     expect(r.code).toBe('NOT_FOUND');
     expect(r.boundClip).toBe('probe');            // …and it says WHICH clip is open
     expect(String(r.error)).toMatch(/not BOUND to an entity/);
-    expect(r.options?.[0]).toMatch(/Animator/);
+    expect(r.options?.[0]).toMatch(/modoki_set_selection .*Animator/);
   });
 
   it('a non-finite t is refused before anything is touched', async () => {
@@ -84,6 +88,7 @@ describe('pose-clip refuses each missing precondition SEPARATELY', () => {
       const r = await pose(t === undefined ? {} : { t });
       expect(r.ok, `t=${String(t)}`).toBe(false);
       expect(String(r.error)).toMatch(/finite t/);
+      expect(r.options?.length, 'a refusal names the fix (#1212 A-14)').toBeGreaterThan(0);
     }
   });
 });
@@ -175,13 +180,38 @@ describe('the envelope is closable from the agent surface', () => {
     spy.mockRestore();
   });
 
-  it('exit with nothing open refuses rather than reporting a cheerful no-op', async () => {
+  // #1212 A-11: the two causes used to share one NOT_AVAILABLE_HERE ("could not look, relaunch")
+  // with the discriminator in a `hint` prose field. They have different next steps.
+  it('exit with nothing open is NOT_FOUND — nothing to exit — not a cheerful no-op', async () => {
     const r = await exitEnv();
     expect(r.ok).toBe(false);
-    expect(r.code).toBe('NOT_AVAILABLE_HERE');
-    // The Timeline half matters: ending ITS session would revert its world mid-run, so refusing is
-    // the correct outcome and the caller needs to know that is what happened.
-    expect(String(r.hint)).toMatch(/Timeline/);
+    expect(r.code).toBe('NOT_FOUND');
+    expect((r.options as string[]).join('\n')).toMatch(/modoki_pose_clip/);
+  });
+
+  it('exit while the TIMELINE owns the envelope refuses, names the owner, and ends nothing', async () => {
+    // Ending ITS session would revert its world mid-run, so refusing is correct — and the caller
+    // must be told that is what happened, not that nothing was open.
+    enterPreviewMode(true, 'timeline');
+    try {
+      const r = await exitEnv();
+      expect(r.ok).toBe(false);
+      expect(r.code).toBe('REFUSED_BY_OP');
+      expect((r as { modeOwner?: unknown }).modeOwner).toBe('timeline');
+      // The Timeline's REAL agent exit, with its caution — not "a human action" (review, #1212).
+      expect((r.options as string[])[0]).toMatch(/^modoki_play_control \{action:'stop'\}.*DESTRUCTIVE/);
+      expect(getModeOwner(), 'the refusal must leave the Timeline holding its envelope').toBe('timeline');
+    } finally {
+      exitPreviewMode('timeline');
+    }
+  });
+
+  it('exit while PLAYING is not "nothing to exit" — Play holds no owner, and the world is not authored', async () => {
+    setRunMode('playing');
+    const r = await exitEnv();
+    expect(r.code).toBe('REFUSED_BY_OP');
+    expect((r as { runMode?: unknown }).runMode).toBe('playing');
+    expect((r.options as string[])[0]).toMatch(/modoki_play_control/);
   });
 
   it('exitPoseEnvelope notifies subscribers — the panel\'s stale-state guard', async () => {
@@ -200,5 +230,69 @@ describe('the envelope is closable from the agent surface', () => {
     await exitPoseEnvelope(true);  // unsubscribed → no further notifications
     expect(fired).toBe(1);
     void err;
+  });
+});
+
+/** #1212 A-13: the store is re-pointed BEFORE the 3s load wait, so a timeout refusal describes an
+ *  editor that has already left the previous clip. It used to say only "no clip loaded", with the
+ *  advice in a `hint` prose field. */
+describe('open-animation-editor — a load timeout says the switch already happened', () => {
+  const guid = newGuid();
+  const PATH = '/assets/anims/probe-a13.anim.json';
+  beforeEach(() => { registerAsset(guid, PATH, 'animation' as never); });
+  afterEach(() => { unregisterAsset(guid); vi.useRealTimers(); });
+
+  it('names the clip it left, and puts the next steps in options', async () => {
+    useEditorStore.setState({ editingAnimationAsset: { path: '/assets/anims/previous.anim.json', type: 'animation', name: 'previous' } } as never);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'Date'] });
+    const pending = runAgentOp('open-animation-editor', { path: PATH }) as Promise<Record<string, unknown>>;
+    await vi.advanceTimersByTimeAsync(3200);
+    const r = await pending;
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('NOT_AVAILABLE_HERE');
+    expect(r.previousPath).toBe('/assets/anims/previous.anim.json');
+    expect(String(r.error)).toMatch(/switch is NOT undone.*previous\.anim\.json is no longer open/);
+    expect((r.options as string[]).join('\n')).toMatch(/openPanels/);
+    expect(r).not.toHaveProperty('hint');
+  });
+
+  it('re-opening the SAME clip reports no switch — the accept side', async () => {
+    useEditorStore.setState({ editingAnimationAsset: { path: PATH, type: 'animation', name: 'probe' } } as never);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'Date'] });
+    const pending = runAgentOp('open-animation-editor', { path: PATH }) as Promise<Record<string, unknown>>;
+    await vi.advanceTimersByTimeAsync(3200);
+    const r = await pending;
+    expect(r.code).toBe('NOT_AVAILABLE_HERE');
+    expect(r).not.toHaveProperty('previousPath');
+    expect(String(r.error)).not.toMatch(/NOT undone/);
+    // …but a re-open is not "nothing happened": the store reset the playhead and any pose.
+    expect(String(r.error)).toMatch(/re-opened, which reset the playhead/);
+  });
+
+  it('a FIRST open (nothing open before) is not called a re-open', async () => {
+    useEditorStore.setState({ editingAnimationAsset: null } as never);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'Date'] });
+    const pending = runAgentOp('open-animation-editor', { path: PATH }) as Promise<Record<string, unknown>>;
+    await vi.advanceTimersByTimeAsync(3200);
+    const r = await pending;
+    expect(String(r.error)).toMatch(/now on \/assets\/anims\/probe-a13\.anim\.json \(nothing was open before\)/);
+    expect(String(r.error)).not.toMatch(/re-opened/);
+    expect(r).not.toHaveProperty('previousPath');
+  });
+
+  it('a mid-call re-point BACK to the previous clip is described as what is open now', async () => {
+    // Review finding: the note was written before the wait, so this reply used to say
+    // "switched to <path> — <previous> is no longer open" while <previous> WAS the open clip.
+    const prev = { path: '/assets/anims/previous.anim.json', type: 'animation', name: 'previous' };
+    useEditorStore.setState({ editingAnimationAsset: prev } as never);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'Date'] });
+    const pending = runAgentOp('open-animation-editor', { path: PATH }) as Promise<Record<string, unknown>>;
+    useEditorStore.setState({ editingAnimationAsset: prev, editingAnimationClip: { name: 'previous' } } as never);
+    await vi.advanceTimersByTimeAsync(100);
+    const r = await pending;
+    expect(r.code).toBe('REFUSED_BY_OP');
+    expect(String(r.editorNow)).toMatch(/now on \/assets\/anims\/previous\.anim\.json \(the clip that was open before this call\)/);
+    expect(JSON.stringify(r)).not.toMatch(/no longer open/);
+    useEditorStore.setState({ editingAnimationClip: null } as never);
   });
 });

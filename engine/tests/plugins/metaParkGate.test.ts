@@ -871,3 +871,45 @@ describe('/api/find-references DISCLOSES unsaved work (#889 C)', () => {
     expect('staleInputs' in res.body).toBe(false);
   });
 });
+
+/** #1212 A-9: the newer-format refusal is the caller's to resolve, not a 500 ("relaunch"). */
+describe('/api/write-meta — a sidecar from a NEWER build is a coded refusal', () => {
+  // 400, NOT 409: the renderer's `writeMetaConditional` reads ANY 409 as "the file changed on disk —
+  // saving again OVERWRITES it", which is false here and hides the real reason (review, #1212).
+  it('400 REFUSED_BY_OP with options, and the sidecar is untouched', async () => {
+    seed({ id: 'rock-guid', version: 99, texture: { maxSize: 2048 } });
+    const before = fs.readFileSync(metaAbs(), 'utf-8');
+    const res = await post('/api/write-meta', {
+      path: ASSET, meta: { id: 'rock-guid', texture: { maxSize: 512 } },
+    }, makeCtx(rendererWithParks([])));
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('REFUSED_BY_OP');
+    expect(String(res.body.error)).toMatch(/format version 99/);
+    expect((res.body.options as string[]).join('\n')).toMatch(/merge the branch/);
+    expect(fs.readFileSync(metaAbs(), 'utf-8')).toBe(before);
+  });
+});
+
+/** The same refusal one route over (#1212 review sibling): a reimport whose EVERY failure is a
+ *  newer-format sidecar was a 500 ("relaunch"). */
+describe('/api/reimport — only newer-format sidecars in the way is a refusal, not a 500', () => {
+  beforeEach(() => { registerReimportHandler('texture', async () => {}); });
+  const manifest = { version: 2, assets: [{ path: ASSET, type: 'texture', guid: 'g0' }] } as unknown as Manifest;
+
+  it('400 REFUSED_BY_OP naming the asset, with options', async () => {
+    seed({ id: 'rock-guid', version: 99, texture: { maxSize: 2048 } });
+    const res = await post('/api/reimport', { path: ASSET }, makeCtx(rendererWithParks([]), manifest));
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('REFUSED_BY_OP');
+    expect(String(res.body.error)).toContain(ASSET);
+    expect((res.body.options as string[]).join('\n')).toMatch(/merge the branch/);
+  });
+
+  it('a genuine bake failure is still a 500 — the accept side', async () => {
+    registerReimportHandler('texture', async () => { throw new Error('toktx exploded'); });
+    seed();
+    const res = await post('/api/reimport', { path: ASSET }, makeCtx(rendererWithParks([]), manifest));
+    expect(res.status).toBe(500);
+    expect(res.body.code).toBeUndefined();
+  });
+});

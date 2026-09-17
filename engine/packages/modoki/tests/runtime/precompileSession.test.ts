@@ -4,7 +4,7 @@
  *  named for the failure rather than the function: a permanently no-op renderer, a blank frame
  *  submitted past the gate's ceiling, and a capture reading back an untouched buffer.
  */
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
   beginPrecompile, isPrecompileActive, endAllPrecompiles, runExclusivePrecompile,
   runExclusivePrecompileWithin, resetPrecompileSession, PRECOMPILE_MAX_HOLD_MS,
@@ -321,4 +321,159 @@ describe('the stub RECORDS instead of discarding — this is where the job pairs
     });
   });
 
+
+  /** #1303. Eight restores used to share one `try`, so a throw from an early, cosmetic field skipped
+   *  the binding — the one restore whose absence sends every later frame into the wrong target. */
+  describe('forceEnd — one failing restore does not skip the others (#1303)', () => {
+    it('a throwing toneMapping setter still restores the target, the MRT and every later field', async () => {
+      const mod = await import('../../src/runtime/rendering/postfx/precompileSession');
+      const r = fakeRenderer();
+      mod.resetPrecompileSession(r);
+      const canvasTarget = { isRenderTarget: true, name: 'canvas' };
+      r.setRenderTarget(canvasTarget);
+      r.setMRT({ mrt: 'prev' });
+      const session = mod.beginPrecompile(r, 0)!;
+      r.setRenderTarget({ isRenderTarget: true, name: 'stage' });
+      r.setMRT(null);
+      r.outputColorSpace = 'srgb-linear';
+      r.stencil = true;
+      let tone: unknown = 0;
+      Object.defineProperty(r, 'toneMapping', {
+        configurable: true, get: () => tone, set: (v) => { if (v === 4) throw new Error('renderer is dying'); tone = v; },
+      });
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      expect(() => session.end()).not.toThrow();
+      expect(r.getRenderTarget()).toBe(canvasTarget);
+      expect(r.getMRT()).toEqual({ mrt: 'prev' });
+      expect(r.render).toBe(r.realRender);
+      expect(r.outputColorSpace).toBe('srgb');
+      expect(r.stencil).toBe(false);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('toneMapping'));
+      warn.mockRestore();
+    });
+
+    it('does not BIND null on a renderer that has no getter to capture from', async () => {
+      const mod = await import('../../src/runtime/rendering/postfx/precompileSession');
+      const setRenderTarget = vi.fn();
+      const setMRT = vi.fn();
+      const r = { render() {}, setRenderTarget, setMRT };
+      const session = mod.beginPrecompile(r, 0)!;
+      session.end();
+      expect(setRenderTarget).not.toHaveBeenCalled();
+      expect(setMRT).not.toHaveBeenCalled();
+    });
+  });
+
+  /** #1239 D. A synchronous write to renderer-global state must land BETWEEN compiles, never inside
+   *  one: each compile re-reads that state after every await. */
+  describe('whenRendererQuiet', () => {
+    it('writes immediately when nothing is queued', async () => {
+      const mod = await import('../../src/runtime/rendering/postfx/precompileSession');
+      const renderer = {};
+      const write = vi.fn();
+      expect(mod.whenRendererQuiet(renderer, write)).toBe(true);
+      expect(write).toHaveBeenCalledTimes(1);
+    });
+
+    it('defers the write past a running compile, and ahead of a compile queued after it', async () => {
+      const mod = await import('../../src/runtime/rendering/postfx/precompileSession');
+      const renderer = {};
+      const order: string[] = [];
+      let release!: () => void;
+      const running = mod.runExclusivePrecompile(renderer, () => new Promise<void>((res) => { release = res; }));
+      expect(mod.isRendererCompiling(renderer)).toBe(true);
+
+      expect(mod.whenRendererQuiet(renderer, () => order.push('write'))).toBe(false);
+      const later = mod.runExclusivePrecompile(renderer, async () => { order.push('later compile'); });
+      await Promise.resolve();
+      expect(order).toEqual([]);
+
+      order.push('running compile ends');
+      release();
+      await running;
+      await later;
+      expect(order).toEqual(['running compile ends', 'write', 'later compile']);
+    });
+
+    it('writes anyway once its ceiling passes, and not again when the late turn finally runs', async () => {
+      const mod = await import('../../src/runtime/rendering/postfx/precompileSession');
+      vi.useFakeTimers();
+      try {
+        const renderer = {};
+        let release!: () => void;
+        const ahead = mod.runExclusivePrecompile(renderer, () => new Promise<void>((res) => { release = res; }));
+        const write = vi.fn();
+        expect(mod.whenRendererQuiet(renderer, write)).toBe(false);
+        vi.advanceTimersByTime(mod.QUIET_WRITE_MAX_WAIT_MS - 1);
+        expect(write).not.toHaveBeenCalled();
+        vi.advanceTimersByTime(1);
+        expect(write).toHaveBeenCalledTimes(1);
+        // The compile settles LATE and the queued turn finally runs: it must not write a second time
+        // (a stale value over whatever was written since).
+        await Promise.resolve();
+        release();
+        await ahead;
+        await vi.advanceTimersByTimeAsync(0);
+        expect(write).toHaveBeenCalledTimes(1);
+      } finally { vi.useRealTimers(); }
+    });
+
+    it('a write whose turn arrives first does not run again at the ceiling', async () => {
+      const mod = await import('../../src/runtime/rendering/postfx/precompileSession');
+      vi.useFakeTimers();
+      try {
+        const renderer = {};
+        let release!: () => void;
+        const ahead = mod.runExclusivePrecompile(renderer, () => new Promise<void>((res) => { release = res; }));
+        const write = vi.fn();
+        mod.whenRendererQuiet(renderer, write);
+        await Promise.resolve();
+        release();
+        await ahead;
+        await vi.advanceTimersByTimeAsync(0);
+        expect(write).toHaveBeenCalledTimes(1);
+        vi.advanceTimersByTime(mod.QUIET_WRITE_MAX_WAIT_MS);
+        expect(write).toHaveBeenCalledTimes(1);
+      } finally { vi.useRealTimers(); }
+    });
+
+    it('a turn from before a reset does not uncount the turns queued after it', async () => {
+      const mod = await import('../../src/runtime/rendering/postfx/precompileSession');
+      const renderer = {};
+      let releaseA!: () => void;
+      const a = mod.runExclusivePrecompile(renderer, () => new Promise<void>((res) => { releaseA = res; }));
+      await Promise.resolve();
+      mod.resetPrecompileSession(renderer);
+      let releaseB!: () => void;
+      const b = mod.runExclusivePrecompile(renderer, () => new Promise<void>((res) => { releaseB = res; }));
+      await Promise.resolve();
+      releaseA();
+      await a;
+      await new Promise((res) => setTimeout(res, 0));
+      expect(mod.isRendererCompiling(renderer), 'B is still running').toBe(true);
+      releaseB();
+      await b;
+      await new Promise((res) => setTimeout(res, 0));
+      expect(mod.isRendererCompiling(renderer)).toBe(false);
+    });
+
+    it('counts a turn still WAITING as busy, and drains back to idle once everything settles', async () => {
+      const mod = await import('../../src/runtime/rendering/postfx/precompileSession');
+      const renderer = {};
+      let release!: () => void;
+      const a = mod.runExclusivePrecompile(renderer, () => new Promise<void>((res) => { release = res; }));
+      const b = mod.runExclusivePrecompile(renderer, async () => { throw new Error('b failed'); });
+      await Promise.resolve(); // `a` starts on a microtask
+      release();
+      await a;
+      expect(mod.isRendererCompiling(renderer)).toBe(true); // b has not settled yet
+      await expect(b).rejects.toThrow('b failed');
+      await new Promise((res) => setTimeout(res, 0));
+      expect(mod.isRendererCompiling(renderer)).toBe(false);
+      const write = vi.fn();
+      expect(mod.whenRendererQuiet(renderer, write)).toBe(true);
+      expect(write).toHaveBeenCalledTimes(1);
+    });
+  });
 });

@@ -2,7 +2,8 @@
  *  land in the new prefab file; unselected fields keep their old base values. */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { getCurrentWorld } from '@modoki/engine/runtime';
+import { getCurrentWorld, Transient, findEntity, getAllEntities } from '@modoki/engine/runtime';
+import { collectTransientSubtreeIds } from '@modoki/engine/editor';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { getTraitByName } from '@modoki/engine/runtime';
 import {
@@ -120,6 +121,69 @@ describe('applyToPrefabSelective', () => {
     // because the sweep grepped for the token `version`, which a writer that never mentions it
     // cannot match.
     expect(writtenJson!.version).toBe(PREFAB_FORMAT_VERSION);
+  });
+
+  /** #1301 — Apply-to-Prefab must not fan out to a RUNTIME instance of the same prefab.
+   *
+   *  `collectInstanceRoots` used to filter on `source` + `rootInstanceId` alone, which is exactly
+   *  what a UIEntries pooled row and a timeline scrub spawn also satisfy — and a STOPPED editor
+   *  really does hold several of them, because the pool runs above TRANSFORM and keeps recycling
+   *  while the sim is not running (measured in docs/prefabs.md § Authoring scope).
+   *  Refreshing one is wrong twice:
+   *  `rebuildInstance` did not carry `Transient` over the respawn, so the artifact became
+   *  serializable and the next save wrote a preview spawn into the authored scene — and the pool
+   *  owns those rows, so tearing them down under it is not the editor's to do. */
+  it('does NOT rebuild a Transient (runtime-spawned) instance of the same source', async () => {
+    const editorMod = await import('@modoki/engine/editor');
+    // Its OWN source path: this suite shares one world across tests, so instances an earlier test
+    // left behind would be counted by the refresh below and make the assertion say nothing.
+    const source = 'pkg/transient-fanout.prefab.json';
+    await editorMod.getPrefabSource(source);
+
+    // The authored instance the user edits and applies from.
+    const authoredRoot = instantiatePrefab(makePrefab());
+    editorMod.setPrefabSource(authoredRoot, source);
+
+    // A second instance of the SAME source, tagged the way every runtime spawner tags one.
+    const runtimeRoot = instantiatePrefab(makePrefab());
+    editorMod.setPrefabSource(runtimeRoot, source);
+    findEntity(runtimeRoot)!.add(Transient);
+    // The fixture is only a fixture if the tag actually reads back through the shared predicate —
+    // a mistagged or unregistered entity would make every assertion below pass for no reason.
+    expect(collectTransientSubtreeIds(getAllEntities()).has(runtimeRoot)).toBe(true);
+
+    const childId = findChildEcsId(authoredRoot, 2);
+    const tfMeta = getTraitByName('Transform')!;
+    getCurrentWorld().query(tfMeta.trait).updateEach(([tf], entity) => {
+      if (entity.id() === childId) (tf as Record<string, unknown>).x = 42;
+    });
+
+    // `refreshInstances` reports what it REBUILT, and that count is the only external signal of
+    // which roots the fan-out reached. Asserting on it (rather than on ids) is deliberate: koota
+    // recycles ids LIFO, so a torn-down root's id comes straight back to its replacement and an
+    // id-based check reads a rebuilt instance as an untouched one.
+    const refreshLines: string[] = [];
+    const logSpy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+      const line = String(args[0] ?? '');
+      if (line.startsWith('[Prefab] Refreshed')) refreshLines.push(line);
+    });
+    try {
+      await applyToPrefabSelective(authoredRoot, new Set(['2.Transform.x']));
+    } finally {
+      logSpy.mockRestore();
+    }
+
+    // The authored instance WAS refreshed — the exclusion must not eat authoring — and it was the
+    // only one: 2 here is the defect (the pooled/scrub instance dragged into an authoring rebuild).
+    expect(refreshLines).toEqual([`[Prefab] Refreshed 1 instance(s) of "${source}"`]);
+
+    // A rebuild destroys the root and spawns a replacement under a NEW id, so surviving under the
+    // same id with the tag intact is what "was not rebuilt" looks like from outside.
+    const survivor = findEntity(runtimeRoot);
+    expect(survivor).toBeTruthy();
+    expect(survivor!.has(Transient)).toBe(true);
+    const piMeta = getTraitByName('PrefabInstance')!;
+    expect((survivor!.get(piMeta.trait) as Record<string, unknown>).rootInstanceId).toBe(runtimeRoot);
   });
 
   it('does nothing when the selected set is empty', async () => {

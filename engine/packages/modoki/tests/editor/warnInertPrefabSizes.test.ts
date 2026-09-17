@@ -69,7 +69,11 @@ describe('warnInertPrefabSizes (prefab write-time reporting)', () => {
     for (const bad of [null, undefined, 42, {}, { entities: 'no' }]) {
       expect(() => warnInertPrefabSizes(bad, '/x.prefab.json')).not.toThrow();
     }
-    expect(warn).not.toHaveBeenCalled();
+    // It DOES say so (#1212): a document with no entities array is not a prefab. Every real
+    // authoring writer passes a serialized PrefabFile, which always carries `entities`, so this
+    // never fires on a legitimate save — only on the malformed input it describes.
+    expect(warn).toHaveBeenCalledTimes(5);
+    expect(String(warn.mock.calls[0][0])).toMatch(/not a prefab document/);
     warn.mockRestore();
   });
 });

@@ -3415,13 +3415,20 @@ throw — it produces nothing, and the human got a toast for a failed FOLDER del
 failed FILE delete. A `!ok` fallback covers it. Naming the paths is better; saying nothing is the
 defect.
 
-⚠️ **`failed` is populated on win32 only, and the platforms genuinely disagree.** darwin's
-`osascript` and Linux's `trash-put` are single invocations: a mid-list refusal throws as a whole,
-`parseTrashFailures` finds no marker, `moveToTrash` rethrows and the route 500s. So **an empty
-`failed` is not evidence that every path went — `ok` is**, and the partial row of the table above
-is unreachable outside Windows. That also means the toast cannot be driven from a Mac: the
-behaviour is pinned at the seam (`deleteAssetRouter.test.ts`, `assetUndo.test.ts`,
-`assetDeleteRenamePolicy.test.ts`) and end-to-end confirmation belongs to the `win` clone.
+⚠️ **`failed` is populated on win32 and darwin, not Linux, and the platforms genuinely disagree.**
+win32's script names each refused path. darwin's Finder names none, so since #1212 A-8 `moveToTrash`
+reports what is still on disk after the refusal, with Finder's own line as `reason` (the route's
+`error` / `failedReason`). **Finder's delete is all-or-nothing** — measured 2026-09-17 with a
+`chflags uchg` file, in both list orders: one refused item and nothing moves — so on darwin the
+partial row of the table above is still unreachable, and a refusal is always the total one. An
+AppleEvent timeout (`-1712`) is still a thrown failure: Finder may be mid-move, so "still on disk"
+is not an answer yet. On Linux a failing `trash-put` is NOT reported at all: `moveToTrash` falls
+back to `rmSync` — a PERMANENT delete — and names only the paths it refuses to remove (#883), so
+`ok:true, failed:[]` there can mean "deleted, not trashed". **An empty `failed` is not evidence that
+anything went to a Trash — `ok` says whether the paths are gone.** The partial toast
+is therefore reachable only on Windows, pinned at the seam (`deleteAssetRouter.test.ts`,
+`assetUndo.test.ts`, `assetDeleteRenamePolicy.test.ts`), with end-to-end confirmation on the `win`
+clone.
 
 ---
 

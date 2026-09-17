@@ -30,8 +30,15 @@ const detachSpy = vi.fn(() => PRIOR_LINKS);
 const reattachSpy = vi.fn();
 const calls: string[] = [];
 const OLD_ID = 'g-old';
+let runtimeExcludedFixture = 0;
 vi.mock('../../src/editor/scene/prefab', () => ({
-  serializePrefab: () => ({ id: 'g-new', root: {}, entities: [{ localId: 1, prefab: 'g-child' }] }),
+  // Reports whatever the current test asked for, so the propagation through
+  // createPrefabFromEntity -> CreatePrefabResult.runtimeExcluded is asserted at the seam that
+  // actually carries it (review F3: nothing downstream of the callback had a test).
+  serializePrefab: (_id: number, _existing: unknown, opts?: { onRuntimeExcluded?: (n: number) => void }) => {
+    if (runtimeExcludedFixture > 0) opts?.onRuntimeExcluded?.(runtimeExcludedFixture);
+    return { id: 'g-new', root: {}, entities: [{ localId: 1, prefab: 'g-child' }] };
+  },
   // createPrefabFromEntity awaits this before serializing (#1284). A no-op here is safe
   // precisely because this file asserts the undo/redo closures and mocks serializePrefab
   // anyway — and since #1295 the cache is populated by construction, so the warm is
@@ -98,6 +105,7 @@ beforeEach(() => {
   setPrefabCacheSpy.mockClear(); tagSpy.mockClear(); untagSpy.mockClear(); registerAssetSpy.mockClear();
   detachSpy.mockClear(); reattachSpy.mockClear(); calls.length = 0;
   reattachSpy.mockReturnValue(0); // links restored cleanly unless a test says otherwise
+  runtimeExcludedFixture = 0;
 });
 // Restored in afterEach, NOT inline: a failing assertion skips the rest of the body, so
 // an inline restore never runs and the stub leaks into every later test.
@@ -354,5 +362,18 @@ describe('a FAILED undo then redo does not overwrite the prior links with the ne
       await action.undo();
       expect(reattachSpy).toHaveBeenLastCalledWith(PRIOR_LINKS, { rootEcsId: 7 });
     } finally { detachSpy.mockImplementation(() => PRIOR_LINKS); }
+  });
+});
+
+describe('createPrefabFromEntity — the runtime-exclusion count reaches the caller', () => {
+  it('carries what serializePrefab reported, so the panel can surface it', async () => {
+    runtimeExcludedFixture = 3;
+    const res = await createPrefabFromEntity(7, '/p/thing.prefab.json', 'Create Prefab "Thing"', async () => true);
+    expect(res && res !== 'declined' ? res.runtimeExcluded : null).toBe(3);
+  });
+
+  it('reports 0 when the selection lost nothing', async () => {
+    const res = await createPrefabFromEntity(7, '/p/thing.prefab.json', 'Create Prefab "Thing"', async () => true);
+    expect(res && res !== 'declined' ? res.runtimeExcluded : null).toBe(0);
   });
 });

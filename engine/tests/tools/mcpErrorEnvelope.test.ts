@@ -877,3 +877,44 @@ describe('Phase 6 — a MUTATING GET\'s ok:false is a failure, a plain read\'s i
     expect(s.json(r)).toMatchObject({ ok: false, summary: '2 dangling refs' });
   });
 });
+
+/** #1212: a 200 `{ok:false}` kept its code but DROPPED its options — the ≥400 path always relayed
+ *  them. A CODED refusal is re-statused by its route now, so the shape that still arrives as 200 is
+ *  an UNCODED `{ok:false, options}` — which is what these fixtures send. */
+describe('a 200 refusal relays the op\'s options', () => {
+  it('POST (postJson)', async () => {
+    const s = (surface = loadSurface((req) => req.path === '/api/scene-query'
+      ? { body: { ok: false, error: 'unknown kind', options: ['raycast', 'overlap'] } } : undefined));
+    const e = envelope(s, await s.call('modoki_scene_query', { kind: 'raycast', dim: '3d', origin: [0, 0, 0], direction: [0, 0, -1] }));
+    expect(e.code).toBe('REFUSED_BY_OP');
+    expect(e.options).toEqual(['raycast', 'overlap']);
+  });
+
+  // ⚠️ A DRIFT guard: the real journal op answers its refusal with `captures`, not `options`, so no
+  // current GET reply reaches this shape. It pins that the two 200 paths relay options alike.
+  it('GET with checkFailure (modoki_journal action:start)', async () => {
+    const s = (surface = loadSurface((req) => req.path.startsWith('/api/journal')
+      ? { body: { ok: false, reason: 'type is not watch-gated', options: ['@contact', '@trigger'] } } : undefined));
+    const e = envelope(s, await s.call('modoki_journal', { action: 'start', type: '@nope' }));
+    expect(e.options).toEqual(['@contact', '@trigger']);
+  });
+});
+
+/** PARTIAL is not a refusal — part of the work landed — and the envelope must not call it one. */
+describe('a PARTIAL reply is not described as refused', () => {
+  it('points at what landed instead', async () => {
+    const s = (surface = loadSurface((req) => req.path === '/api/player-prefs'
+      ? { status: 400, body: { ok: false, code: 'PARTIAL', error: 'the cache write landed; the disk write did not' } } : undefined));
+    const e = envelope(s, await s.call('modoki_write_player_prefs', { action: 'set', key: 'k', value: 1 }));
+    expect(e.code).toBe('PARTIAL');
+    expect(e.why).toMatch(/PARTIAL result .*read got for what did and did not land/);
+    expect(e.why).not.toMatch(/refused/);
+  });
+
+  it('a real refusal still says refused — the accept side', async () => {
+    const s = (surface = loadSurface((req) => req.path === '/api/player-prefs'
+      ? { status: 400, body: { ok: false, code: 'REFUSED_BY_OP', error: 'unknown action' } } : undefined));
+    const e = envelope(s, await s.call('modoki_write_player_prefs', { action: 'set', key: 'k', value: 1 }));
+    expect(e.why).toMatch(/refused with HTTP 400/);
+  });
+});

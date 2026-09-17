@@ -8,6 +8,7 @@ import { loadAllFonts } from '../../runtime/loaders/fontLoader';
 import {
   instantiatePrefabInstance, type PrefabFile, serializePrefab,
 } from '../scene/prefab';
+import { runtimeExcludedMessage } from '../scene/authoringScope';
 import { importModel } from '../scene/modelImport';
 import { needsGLBConversion, convertSourceToGLB } from '../scene/convertToGLB';
 import { readMetaPreferringPark } from '../scene/pendingMeta';
@@ -1547,6 +1548,7 @@ export default function Assets() {
     if (result === 'declined') return;
     if (!result) { console.error(`[Assets] Failed to create prefab ${savePath}`); return; }
     console.log(`[Assets] Created prefab: ${savePath}`);
+    if (result.runtimeExcluded > 0) useEditorStore.getState().showToast(runtimeExcludedMessage(result.runtimeExcluded), 'warn');
     refresh();
 
     const { action } = result;

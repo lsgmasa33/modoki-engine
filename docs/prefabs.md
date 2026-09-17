@@ -652,6 +652,12 @@ the file.**
   `spawnPrefabInstance`, which writes a non-empty `source`, and none goes through
   `instantiatePrefabInstance`. A game spawning a prefab from `onSceneReady` is the same shape.
 
+  ⚠️ **Those three spawners are deliberately NOT made to seed the editor cache** (#1301). Seeding
+  would make the sync readers read them *correctly*, and reading them at all is the defect: every
+  instance those three create is `Transient`, and a `Transient` instance is not authoring input.
+  The rule in § Authoring scope (end of this file) is what closes that hole — at the reader rather
+  than at the spawner.
+
   The ~15 `await preloadNestedPrefabsForSubtree(...)` calls are therefore deliberately KEPT: each
   is a `Map.has` once warm, the failure they guard against is SILENT, and the paragraph above does
   not cover everything. They are the cheap half of the defence; the census that policed them was
@@ -754,3 +760,89 @@ the file.**
   nested copy (outer override capture is scoped to the outer instance's own
   members). Overrides authored in the outer prefab file's nested row, and edits
   made in the child's own edit session, both survive normally.
+
+
+## Authoring scope — a runtime instance is not authoring input
+
+**Rule: a reader that treats the LIVE TREE as authoring input asks one shared predicate,
+`collectTransientSubtreeIds` / `filterAuthoringVisible` (`editor/scene/authoringScope.ts`).**
+A `Transient` entity — a UIEntries pooled row, a timeline scrub or control-track spawn, anything a
+system spawned inside a tick — is a live artifact, and its subtree goes with it.
+
+| Reader | What it does | Before #1301/#1306 |
+|---|---|---|
+| `serializeScene` | writes the scene file | hand-rolled copy of the walk |
+| `captureInstanceStructure` | diffs an instance against its prefab | hand-rolled copy (added by #1295's review) |
+| `collectInstanceRoots` | Apply-to-Prefab's fan-out to every instance | **never asked** |
+| `serializePrefab` -> `collectTree` | Create Prefab | **never asked** |
+
+The two misses look unrelated at the symptom level — one saves a scene, one writes a prefab file —
+which is exactly why two hand-rolled copies were not enough. What each one did:
+
+- **`collectInstanceRoots`** handed a pooled/scrub instance to `refreshInstances` -> `rebuildInstance`,
+  which carried the durable guid and `source` forward but **not the tag**. The rebuilt root was an
+  ordinary serializable entity, so the next save wrote a preview artifact into the authored scene —
+  defeating the guarantee `spawnPrefabInstance` sets `Transient` for. `rebuildInstance` now carries
+  it over the respawn as well, on the same reasoning that already carries the guid: transience
+  belongs to the identity, not to the id.
+- **`serializePrefab`** wrote them into the new `.prefab.json` as ordinary authored members. It now
+  **reports** what it left out (a toast on both human entry points through one shared wording, a
+  `warnings` entry on the agent op) rather than quietly producing a smaller prefab.
+
+  ⚠️ **The unit of exclusion is a generated REGION, not a tagged entity** — a region being a tagged
+  subtree whose top's parent is not tagged. Create Prefab excludes every region that STARTS inside
+  the selection, except one starting at the selection root itself, which is the deliberate "bake
+  this". Both simpler rules are wrong, and both were written before this one:
+  - *"drop every tagged entity in the selection"* destroys the bake case, because in production
+    **every** member of a region carries the tag (`spawnEntity` tags whatever is spawned inside a
+    system tick), not just its top — so baking a pooled row would write a one-entity prefab.
+  - *"skip filtering whenever the selection sits anywhere inside a region"* re-opens this very
+    issue: an unrelated region deeper in the selection is then written into the file as an authored
+    member **and** tagged as an instance member, silently, with the report suppressed. Measured by
+    the close-out re-review on a `PooledRow → Middle → InnerPooled` tree.
+
+  The count is scoped to the selection for the same reason the exclusion is: a world-wide tally made
+  every Create Prefab in a pooled scene warn about entities it had not dropped, which is the alarm
+  that makes the true report unreadable.
+
+⚠️ **Create Prefab reads the world TWICE, and both reads go through `authoringEntitiesFor`.**
+`serializePrefab` writes the file; `tagEntityTreeAsInstance` then re-walks the tree and re-runs
+`planPrefabRows` to convert it into a live instance — and **refuses to tag at all** when its plan
+does not match the file (`planMatchesFile`, a bare `return`). So a selection rule applied to one
+read and not the other does not produce a wrong prefab, it produces a prefab asset with **no
+instance in the scene and nothing logged**. This is the second instance of that shape: #1278 was
+the first (a held nested instance gave the two reads different localId spaces). `planMatchesFile`
+is the backstop; the two reads agreeing at the source is the fix.
+
+⚠️ **The subtree is the load-bearing half, not the tag.** Only the ROOT of a generated subtree is
+tagged (`spawnPrefabInstance` tags the instance root; members spawned outside a system tick are not).
+A reader that filters on `has(Transient)` alone keeps the members and drops their parent — an
+orphaned half-subtree, which is worse than not filtering at all.
+
+⚠️ **This is NOT a Play-mode concern, and reading it as one is why both misses looked unreachable.**
+`runPipeline` skips a system only below `TRANSFORM` (200), and the UIEntries pool sits at 270 so a
+paused list keeps recycling: measured on `games/scroll-demo`, a **stopped** editor holds 16 pooled
+entities out of 36, including 8 live prefab-instance roots that match `collectInstanceRoots`' filter
+exactly. A scrub envelope also reports `playState: 'stopped'` (#1122/#1148), which is what lets an
+authoring mutation through in the first place. Play-mode spawns, by contrast, never survive Stop —
+`playMode.ts` reloads the snapshot and discards them.
+
+⚠️ **What actually applies the tag is the SYSTEM TICK, not the spawner — and that is load-bearing.**
+`spawnPrefabInstance` tags only when `forceTransient` is passed or the run-mode is not `stopped`
+(`loadSceneFile.ts`), and the timeline scrub is the only caller passing `forceTransient`. The
+UIEntries pool's rows and the control-track edge's spawns are tagged because `spawnEntity` tags
+**everything spawned inside a system tick** (`core/ecs/world.ts`), and `entriesSystem` spawns from
+inside its own tick deliberately. So: move the pool's growth out of the tick — to a DOM handler, a
+React effect, a deferred callback — and every reader above goes quiet with no test failing. The
+pool's docblock already says it must spawn inside the tick; this is the other half of why.
+
+⚠️ **Therefore "a runtime spawn is `Transient`" is NOT universal, and a game's own spawn is the
+gap.** A game spawning a prefab from `onSceneReady` while stopped, outside a tick, gets **no tag** —
+so `collectInstanceRoots` still fans out to it and Create Prefab still bakes it in.
+`games/sling/runtime/field/rebuildField.ts` adds the tag by hand, which is evidence the hole is
+known and nothing makes it structural. Fixing that means changing where the tag comes from, not
+adding a fifth reader-side check (found by #1301's close-out review, F8; not filed).
+
+⚠️ **The predicate lives in its own module, not on `entityUtils`.** Most editor tests mock
+`entityUtils` with an explicit object literal, so an export added there arrives `undefined` in every
+one of them — the guard would be silently absent in all 284 files while they all stayed green.
