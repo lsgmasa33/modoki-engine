@@ -1028,6 +1028,8 @@ const HELD_LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
     reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:711' },
   { item: 'games/wordweave/runtime/systems.ts::Built.trail',
     reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:711' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.trailJoins',
+    reason: 'pending: #1243 — the bevel wedges that close Built.trail\'s corners (#1365), pooled and living exactly as long as it; cleared only on a world swap or a board rebuild, and nothing checks isAlive; games/wordweave/runtime/systems.ts:711' },
   { item: 'games/wordweave/runtime/systems.ts::Built.currentWord',
     reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:711' },
   { item: 'games/wordweave/runtime/systems.ts::Built.wordFlightGlyphs',

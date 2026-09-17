@@ -5,9 +5,7 @@
  *  LIVE viewport rebinds the new variant without a manual scene reload. */
 
 import { backendFetch } from '../../backend/editorBackend';
-import { invalidateModel, invalidateEnvironment } from '../../../runtime/loaders/meshTemplateCache';
-import { invalidateTexture } from '../../../runtime/loaders/textureResolver';
-import { invalidateAudio } from '../../../runtime/loaders/audioBufferCache';
+import { REIMPORT_INVALIDATORS, type ReimportableAssetKind } from '../../../runtime/loaders/reimportInvalidation';
 import { flushPendingMetaFor } from '../../scene/pendingMeta';
 
 export type ReimportItem = { path: string; type: string };
@@ -58,13 +56,21 @@ export async function reimportPaths(
   // Evict every kind that HOLDS a cache, not just the two that used to be here
   // (#304 close-out). A batch re-import of a .wav left the decoded buffer playing the
   // old audio, and one of an .hdr left the viewport lit by the old environment, until
-  // an editor restart. `font` is deliberately absent: it refreshes through the
-  // manifest-hash channel (`onFontInvalidated`) instead. See assetInvalidation.ts.
+  // an editor restart.
+  //
+  // The mapping itself is SHARED with the agent/MCP path (#1366) — this loop used to spell it
+  // out inline, the agent bridge kept a second copy, and the two drifted: neither evicted the
+  // rigged prototype, so a re-imported SKINNED GLB kept its old skeleton and clips. See
+  // `runtime/loaders/reimportInvalidation.ts` for the measurement and for why `model` is two
+  // calls rather than one.
   for (const a of reimported) {
-    if (a.type === 'model') invalidateModel(a.path);
-    else if (a.type === 'texture') invalidateTexture(a.path);
-    else if (a.type === 'audio') invalidateAudio(a.path);
-    else if (a.type === 'environment') invalidateEnvironment(a.path);
+    // `Object.hasOwn` before the index: `a.type` is a SERVER-supplied string, and a plain object
+    // literal carries `Object.prototype`, so a type of `__defineGetter__` would resolve to an
+    // inherited function and `?.()` would call it — throwing a TypeError out of `reimportPaths` and
+    // abandoning the rest of the batch. Unreachable with the backend's current kind set, so this is
+    // hygiene rather than a live bug (close-out review).
+    if (!Object.hasOwn(REIMPORT_INVALIDATORS, a.type)) continue;
+    REIMPORT_INVALIDATORS[a.type as ReimportableAssetKind](a.path);
   }
   if (summary.errors.length) console.error('[reimport] errors:', summary.errors);
   return summary;

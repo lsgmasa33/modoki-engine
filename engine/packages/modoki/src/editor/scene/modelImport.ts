@@ -8,8 +8,9 @@ import { backendFetch, writeAssetFile, jsonFileBody } from '../backend/editorBac
 import { deleteAssetFile } from '../panels/assetOps';
 import { getCurrentWorld, spawnEntity } from '../../runtime/core/ecs/world';
 import { Transform, EntityAttributes, ModelSource, SkinnedModel, SkinnedMeshRenderer, SkeletalAnimator, Bone, MESH_FORMAT_VERSION, MATERIAL_FORMAT_VERSION, type MeshAsset, type MaterialAsset } from '../../runtime/traits';
-import { loadModelTemplates, getTemplatesForModel, invalidateModel, invalidateMaterial } from '../../runtime/loaders/meshTemplateCache';
-import { ensureRiggedModelLoaded, invalidateRiggedModel } from '../../runtime/loaders/riggedModelCache';
+import { loadModelTemplates, getTemplatesForModel, invalidateMaterial } from '../../runtime/loaders/meshTemplateCache';
+import { ensureRiggedModelLoaded } from '../../runtime/loaders/riggedModelCache';
+import { invalidateModelAndRig } from '../../runtime/loaders/reimportInvalidation';
 import { offerParsedGltf, disposePendingGltf } from '../../runtime/loaders/parsedGltfHandoff';
 import { invalidateTexture } from '../../runtime/loaders/textureResolver';
 import { loadGLB } from '../../runtime/loaders/loadGLB';
@@ -905,19 +906,13 @@ async function importModelInner(
   const sourcePath = needsGLBConversion(modelPath) ? modelPath : undefined;
   const glbPath = await convertSourceToGLB(modelPath, postprocessorId);
 
-  // Invalidate caches for this model (re-import gets fresh data). invalidateModel
-  // fires onModelInvalidated synchronously → the render listener evicts in-scene
-  // static meshes AND skinned clones; THEN invalidateRiggedModel disposes the
-  // rigged prototype (now that its clones are gone) so the next render reloads
-  // the freshly-derived variant — without this, a rigged re-import keeps showing
-  // the stale cached prototype (e.g. a Plane that the postprocessor just removed).
-  invalidateModel(glbPath);
-  // invalidateRiggedModel is PATH-TOLERANT (riggedModelCache): the import pipeline
-  // hands it the raw GLB path BEFORE the GUID is read from the meta, so it detects
-  // an internal asset path and clears the cache keys directly instead of routing
-  // through resolveRef (which would reject a path post GUID-only migration). A first
-  // import has nothing cached → harmless no-op; a re-import drops the stale prototype.
-  invalidateRiggedModel(glbPath);
+  // Invalidate caches for this model (re-import gets fresh data). This used to be the ONLY
+  // place that evicted both — the other three re-import entry points called `invalidateModel`
+  // alone and kept the stale rigged prototype (#1366). The ordering and the path-tolerance that
+  // made this site correct now live in the shared helper, so every entry point inherits them.
+  // A first import has nothing cached → harmless no-op; a re-import drops the stale prototype
+  // (e.g. a Plane that the postprocessor just removed).
+  invalidateModelAndRig(glbPath);
 
   // Rigged (skeletal) models can't go through the flatten pipeline — it strips
   // the skeleton + clips. Route them to the SkinnedModel import instead.

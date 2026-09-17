@@ -61,7 +61,6 @@ import { drawColliderOutline, drawSkinnedMeshFlat2D, drawSkinnedMeshWireframe2D,
 import { getSkin2DBuffer } from '../../runtime/skinning/skin2DBuffers';
 import { getRig2D, type ParsedRig2D } from '../../runtime/loaders/rig2dCache';
 import { resolveMeshTemplate, onModelInvalidated } from '../../runtime/loaders/meshTemplateCache';
-import { onModelTemplatesLoaded } from '../../runtime/loaders/modelLoadNotify';
 import { boneWeightField, dominantBoneField } from '../../runtime/skinning/rig2dWeightPaint';
 import { overlayPartIndices } from './skinWeightOverlay';
 import { computeCanvasScale, screenToReference2D } from '../../runtime/rendering/canvas2DScaler';
@@ -2864,13 +2863,17 @@ function ThreeJSViewport({ mode, layers, showGrid = true, showColliders = false,
       // stale, and capture_viewport cannot reveal it either (it screenshots the window, it does
       // not force a render). See runtime/rendering/materialDirty.ts.
       onMaterial3DDirty(markViewportDirty),
-      // Model re-import — BOTH edges, and both are load-bearing. The invalidation evicts the
-      // live meshes (attachInvalidationListener above), which changes the image immediately;
-      // the rebuild lands whenever the GLB finishes re-parsing, which routinely outlasts the
-      // gate's ~1s grace. Without the second one the object stayed missing indefinitely on
-      // this render-on-demand viewport (QA-ASSET-0008).
+      // Model re-import — BOTH edges are load-bearing, and only ONE of them is here now.
+      // The invalidation evicts the live meshes (attachInvalidationListener above), which changes
+      // the image immediately. The REBUILD lands whenever the GLB finishes re-fetching and
+      // re-parsing, which routinely outlasts the gate's ~1s grace — without that second edge the
+      // object stayed missing indefinitely on this render-on-demand viewport (QA-ASSET-0008).
+      // ⚠️ That second edge used to be a dedicated `onModelTemplatesLoaded` subscription here, and
+      // this was its ONLY subscriber in the repo — which is why the stopped GameView never got it
+      // (#1363). Both model caches now call `fireDirtyListeners()` on their load edge like every
+      // other async refill does, so `addDirtyListener` above already carries it for this viewport
+      // AND for every other idle-gated surface. Do not re-add a private channel for it.
       onModelInvalidated(markViewportDirty),
-      onModelTemplatesLoaded(markViewportDirty),
       // ⚠️ UNDO/REDO. It reverts traits with a direct `entity.set`, which does NOT go through
       // writeTraitField and so fires NO dirty broadcast — the 2D gate has said exactly this since
       // it was bitten (see the subscribeUndo effect above), and the 3D gate simply never got the

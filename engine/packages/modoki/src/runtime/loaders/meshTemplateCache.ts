@@ -22,7 +22,6 @@ import { MESH_FORMAT_VERSION, MATERIAL_FORMAT_VERSION } from '../traits/Renderab
 // (`render3dBoundary.test.ts` fails, #214). NPRPostProcess re-exports this for its own callers.
 import { ensureLineColorOnMaterials } from '../rendering/materialExtras';
 import { takeParsedGltf, clearParsedGltfHandoff } from './parsedGltfHandoff';
-import { notifyModelTemplatesLoaded } from './modelLoadNotify';
 import { addToOwnerSet, removeFromOwnerSet } from './ownerSet';
 import { loadTexture3D, releaseTexture3D, isSharedTexture, isRetiredTexture, resolveEnvVariantUrl, getEnvFormat } from './textureResolver';
 import { clearParticleCache } from './particleCache';
@@ -757,9 +756,13 @@ export function loadModelTemplates(
         if (typeof (model as { clear?: () => void }).clear === 'function') (model as { clear: () => void }).clear();
 
         console.log(`[MeshCache] Loaded ${count} templates from ${path}`);
-        // Re-arm the editor SceneView's dirty gate — see modelLoadNotify.ts for why the
-        // invalidation edge alone does not close QA-ASSET-0008.
-        notifyModelTemplatesLoaded(path);
+        // Re-arm EVERY idle-gated surface — the refill edge, and it is the one that gets
+        // forgotten. The invalidation edge already fires this (via `emitAssetInvalidated`) and
+        // empties the viewport at once; the REBUILD only happens on a frame that runs
+        // `syncSceneRenderables3D`, and a GLB re-fetch+re-parse routinely outlasts the ~1 s
+        // grace, so without this the object is evicted and never comes back. See
+        // `core/renderDirty.ts` for the measurement (QA-ASSET-0008, and #1363 for the Game view).
+        fireDirtyListeners();
         resolve();
       } catch (err) {
         console.error(`[MeshCache] Failed during template processing for ${path}:`, err);

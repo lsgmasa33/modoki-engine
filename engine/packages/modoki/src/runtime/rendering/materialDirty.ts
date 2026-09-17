@@ -33,7 +33,7 @@ const listeners = new Set<() => void>();
  *  force a text relayout; nothing needs a pull here, and shipping an unread counter would invite a
  *  future caller to compare against a number no one maintains.
  *
- *  A throwing listener is CONTAINED (the `modelLoadNotify` precedent), and the call site is why
+ *  A throwing listener is CONTAINED (the `notifyListeners` contract every fan-out shares), and the call site is why
  *  this one matters more than its sibling's: `markTextDirty` fires from async loader callbacks,
  *  whereas this fires from inside `materialInstanceSystem`'s per-frame `updateEach`. An escaping
  *  throw there would take out the ECS system loop for the frame — an observer must not be able to

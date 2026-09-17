@@ -4,7 +4,7 @@
  *    POST /api/reimport (Stage A bake + Stage B LODs)
  *      → browser-side importModel() (regenerate .mesh.json / .mat.json / textures)
  *      → write <glb>.prefab.json ONLY if it doesn't already exist (preserve manual edits)
- *      → refreshAssets + invalidateModel. */
+ *      → refreshAssets + invalidateModelAndRig. */
 
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { backendFetch, writeAssetFile, jsonFileBody, postWriteFile } from '../../backend/editorBackend';
@@ -16,7 +16,8 @@ import { serializePrefab, resolveExistingPrefabId, mergeRiggedPrefab, setPrefabC
 import { assetUrl } from '../../../runtime/loaders/assetUrl';
 import { DEFAULT_MODEL_SETTINGS, resolveModelSettings, type ModelImportSettings, type ModelCacheInfo, type LodCount, type ModelEncoder } from '../../../runtime/loaders/modelSettings';
 import { DEFAULT_TEXTURE_SETTINGS, TEXTURE_MAX_SIZES, DEFAULT_UASTC_LEVEL, DEFAULT_UASTC_RDO_LAMBDA, UASTC_LEVELS, resolveTextureSettings, resolveUastcRdoLambda, type TextureImportSettings, type TextureFormat } from '../../../runtime/loaders/textureSettings';
-import { invalidateModel, loadModelTemplates, getTemplatesForModel, getModelHierarchy } from '../../../runtime/loaders/meshTemplateCache';
+import { loadModelTemplates, getTemplatesForModel, getModelHierarchy } from '../../../runtime/loaders/meshTemplateCache';
+import { invalidateModelAndRig } from '../../../runtime/loaders/reimportInvalidation';
 import { registerAsset } from '../../../runtime/loaders/assetManifest';
 import { writeCollisionMeshAssets } from './collisionMeshWrite';
 import { newGuid } from '../../../runtime/core/assetRefRules';
@@ -298,7 +299,10 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
       // 3. Refresh editor state.
       await loadMeta();
       await probePrefab();
-      invalidateModel(path);
+      // Both caches a GLB can occupy, via the one shared recipe — this panel's own Re-import
+      // button used to call `invalidateModel` alone, so re-importing a SKINNED model from its own
+      // Inspector kept the stale rigged prototype (#1366).
+      invalidateModelAndRig(path);
       refreshAssets();
       setImportStatus(false);
     } catch (e) {

@@ -55,6 +55,10 @@ vi.mock('../../src/runtime/loaders/meshTemplateCache', () => ({
   getTemplatesForModel: vi.fn(() => new Map()),
   invalidateModel: vi.fn(),
   invalidateMaterial: vi.fn(),
+  // modelImport reaches this module through `reimportInvalidation` now (#1366), and that
+  // module imports `invalidateEnvironment` too. An explicit-list mock factory has to carry
+  // every export its importers actually reach, or the import throws before any test runs.
+  invalidateEnvironment: vi.fn(),
 }));
 
 // ── ECS world: spawn records the trait objects so we can assert on them. ──

@@ -100,10 +100,26 @@ const WIRED = new Set(invalidatorTableValues(consumerSf()));
 const ALLOWLIST: ReadonlyArray<{ item: string; reason: string }> = [
   // Driven by the agent/editor "invalidate-assets" op (agentBridge.ts registerAgentOp) and directly
   // by editor asset-view panels on manual re-import/edit — not by the live-reload file watcher.
-  { item: 'invalidateTexture', reason: 'agentBridge.ts registerAgentOp(\'invalidate-assets\') + makeTexture2D.ts, TextureAssetView.tsx, assetViews/reimport.ts, editor/scene/modelImport.ts' },
-  { item: 'invalidateAudio', reason: 'agentBridge.ts registerAgentOp(\'invalidate-assets\') + assetViews/reimport.ts, AudioAssetView.tsx' },
-  { item: 'invalidateModel', reason: 'agentBridge.ts registerAgentOp(\'invalidate-assets\') + assetViews/reimport.ts, ModelAssetView.tsx, editor/scene/modelImport.ts' },
-  { item: 'invalidateEnvironment', reason: 'agentBridge.ts registerAgentOp(\'invalidate-assets\') + assetViews/reimport.ts, EnvironmentAssetView.tsx' },
+  // ⚠️ Since #1366 these four are reached through ONE table — `REIMPORT_INVALIDATORS`
+  // (runtime/loaders/reimportInvalidation.ts) — which both re-import entry points read:
+  // agentBridge.ts's registerAgentOp('invalidate-assets') and assetViews/reimport.ts. The panels
+  // below drive them directly as well. They are not in ASSET_CACHE_INVALIDATORS because a model /
+  // texture / audio / environment re-import is not a live-reload watcher kind.
+  { item: 'invalidateTexture', reason: 'REIMPORT_INVALIDATORS.texture — read by agentBridge.ts registerAgentOp(\'invalidate-assets\') + assetViews/reimport.ts; also direct from makeTexture2D.ts, TextureAssetView.tsx, editor/scene/modelImport.ts' },
+  { item: 'invalidateAudio', reason: 'REIMPORT_INVALIDATORS.audio — read by agentBridge.ts registerAgentOp(\'invalidate-assets\') + assetViews/reimport.ts; also direct from AudioAssetView.tsx' },
+  { item: 'invalidateEnvironment', reason: 'REIMPORT_INVALIDATORS.environment — read by agentBridge.ts registerAgentOp(\'invalidate-assets\') + assetViews/reimport.ts; also direct from EnvironmentAssetView.tsx' },
+  // `invalidateModel` and `invalidateRiggedModel` are BOTH reached through `invalidateModelAndRig`,
+  // which is `REIMPORT_INVALIDATORS.model` and the only thing any re-import entry point calls now.
+  // Same shape as `invalidatePixiShaderProgram` below: called FROM something that is itself driven.
+  // ⚠️ `invalidateRiggedModel`'s row used to read 'editor/scene/modelImport.ts (rigged-model
+  // re-import step)', and that row WAS #1366: the drag-in importer was its only caller of four, so
+  // the Assets-panel batch, the agent/MCP op and the Model Inspector's own Re-import button all
+  // skipped the rigged prototype — and this row made that read as deliberate. This guard proves an
+  // invalidator has A caller (#74's defect, zero callers); it can say nothing about entry-point
+  // COVERAGE, which is why it stayed green through all of it.
+  { item: 'invalidateModel', reason: 'invalidateModelAndRig (reimportInvalidation.ts) = REIMPORT_INVALIDATORS.model, read by agentBridge.ts registerAgentOp(\'invalidate-assets\') + assetViews/reimport.ts, ModelAssetView.tsx, editor/scene/modelImport.ts' },
+  { item: 'invalidateRiggedModel', reason: 'invalidateModelAndRig (reimportInvalidation.ts) = REIMPORT_INVALIDATORS.model — same four callers as invalidateModel; never called alone any more' },
+  { item: 'invalidateModelAndRig', reason: 'REIMPORT_INVALIDATORS.model in agentBridge.ts registerAgentOp(\'invalidate-assets\') + assetViews/reimport.ts, ModelAssetView.tsx, editor/scene/modelImport.ts' },
   // Font invalidation has its OWN channel: assetManifest.ts's onFontInvalidated(...) fires these
   // directly (module-load subscriptions in fontAtlasLoader.ts / fontLoader.ts) whenever a font
   // re-import or Font-Inspector mode flip changes the manifest hash — not via the scene-change path.
@@ -118,7 +134,6 @@ const ALLOWLIST: ReadonlyArray<{ item: string; reason: string }> = [
   // #842 wired it into ASSET_CACHE_INVALIDATORS (agentBridge.ts) too, so it is no longer allowlisted
   // — it must show as WIRED now, and an entry here for it again would silently un-fix #842.
   { item: 'invalidatePrefab', reason: 'editor/scene/prefab.ts (prefab apply/instantiate flow)' },
-  { item: 'invalidateRiggedModel', reason: 'editor/scene/modelImport.ts (rigged-model re-import step)' },
   // `invalidatePixiShaderProgram` is never called directly from ASSET_CACHE_INVALIDATORS — it's
   // called FROM `spriteMaterialCache.ts`'s `invalidateShader`, which IS wired (as `shader:`) below
   // (#842). Verified by reading spriteMaterialCache.ts: `invalidateShader` calls it unconditionally,

@@ -36,7 +36,10 @@ import { lodUrlSuffix } from './modelSettings';
 import { getKTX2Loader, ensureKtx2Caps } from './textureResolver';
 import { getModelPostprocessor } from './modelPostprocessorRegistry';
 import { takeParsedGltf, disposePendingGltf } from './parsedGltfHandoff';
-import { notifyModelTemplatesLoaded } from './modelLoadNotify';
+// Straight from `core/renderDirty`, NOT via `core/ecs/entityUtils`'s re-export: entityUtils wires
+// `setStructureCallback` into `world.ts` as a module-load side effect, which breaks every test that
+// mocks `world.ts` without stubbing it. That is the whole reason renderDirty was extracted.
+import { fireDirtyListeners } from '../core/renderDirty';
 import { createTeardownToken } from '../core/liveness';
 
 export interface RiggedModel {
@@ -226,8 +229,8 @@ function fetchRiggedModel(path: string, postprocessorId?: string): Promise<void>
       // Same render-on-demand edge the static mesh cache fires: a re-imported SKINNED GLB is
       // evicted from the scene by attachInvalidationListener and rebuilt only on a frame that
       // runs, and this parse is the slow half. Without this the rig is the one thing
-      // QA-ASSET-0008's fix would still have left missing. See modelLoadNotify.ts.
-      notifyModelTemplatesLoaded(path);
+      // QA-ASSET-0008's fix would still have left missing. See `core/renderDirty.ts`.
+      fireDirtyListeners();
       resolve();
     };
 
@@ -273,7 +276,21 @@ function fetchRiggedModel(path: string, postprocessorId?: string): Promise<void>
       },
     );
   }).finally(() => {
-    loadPromises.delete(path);
+    // ⚠️ IDENTITY-CHECKED, for the reason `meshTemplateCache`'s twin spells out at its own
+    // `loading.delete`: an intervening `invalidateRiggedModel` deletes this entry and the next
+    // frame starts a REPLACEMENT load under the same key. Deleting unconditionally here would then
+    // evict the REPLACEMENT when this stale load settles, leaving the cache with a miss and an
+    // empty in-flight map — so a second render surface (the editor runs SceneView and GameView)
+    // starts a THIRD load, and two of them reach `finishLoad` and both `cache.set`. One complete
+    // rigged prototype — geometry, materials and decoded KTX2 textures, the 66 MB class — is then
+    // orphaned undisposed and unreachable.
+    //
+    // Unlike that twin this map IS cleared on success as well as rejection: it is pure in-flight
+    // dedupe (`cache` holds the settled result), so clearing on settle is right — it was only the
+    // unconditional part that was wrong. Reachable from three more entry points since #1366 gave
+    // the Assets-panel batch, the agent/MCP op and the Inspector button a route to
+    // `invalidateRiggedModel`; before that only the drag-in importer could open the window.
+    if (loadPromises.get(path) === promise) loadPromises.delete(path);
   });
 
   loadPromises.set(path, promise);

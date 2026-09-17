@@ -298,6 +298,8 @@ export {
   invalidateModel, invalidateMaterial, disposeAllCachedResources,
   invalidateEnvironment,
   onModelInvalidated,
+  // ⚠️ A RE-IMPORT evicts through `REIMPORT_INVALIDATORS` below, never by calling these
+  // directly — `model` alone misses the rigged prototype (#1366).
   // Refcount API for SceneManager
   acquireModel, releaseModel,
   acquireMesh, releaseMesh,
@@ -312,6 +314,11 @@ export {
   ensureRiggedModelLoadedFor,
   getRiggedModel, getClipNames, getBoneNames, disposeAllRiggedModels, type RiggedModel,
 } from './loaders/riggedModelCache';
+// The one asset-kind → eviction table a RE-IMPORT goes through, shared by the Assets-panel batch
+// loop and the agent/MCP `invalidate-assets` op. `model` is two evictions, not one (#1366).
+export {
+  REIMPORT_INVALIDATORS, invalidateModelAndRig, type ReimportableAssetKind,
+} from './loaders/reimportInvalidation';
 // GPU-memory report (Phase 3 of #590, docs/ios-gpu-memory.md) — 3D bytes read
 // straight from `renderer.info.memory` and 2D (PixiJS) bytes computed per canvas2DPool slot
 // (compressed-format-aware), plus the live GL-context count, sampled on an interval that survives

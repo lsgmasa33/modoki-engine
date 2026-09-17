@@ -72,10 +72,8 @@ import {
   ensurePhysicsModuleReady,
   getContactState,
   registerHandleProvider,
-  invalidateModel,
-  invalidateTexture,
-  invalidateAudio,
-  invalidateEnvironment,
+  REIMPORT_INVALIDATORS,
+  type ReimportableAssetKind,
   switchableClipNames,
   ANIMATOR_CLIP_TRAITS,
   type OffscreenRenderOpts,
@@ -1085,12 +1083,30 @@ registerAgentOp('clear-journal', () => { clearJournal(); return { ok: true }; })
 // successful bake — the server writes new bytes but has no other channel to the renderer,
 // so the mesh/texture cache (keyed by path, "bytes never change mid-session without an
 // explicit invalidate") would otherwise keep serving the stale geometry until restart.
-// Mirrors the Assets-panel button path (assetViews/reimport.ts), so MCP/curl reimports now
-// refresh identically. invalidateModel disposes the model's templates + LOD siblings + mesh
-// entries and notifies onModelInvalidated listeners, which drop the live meshes for re-sync.
-const INVALIDATORS = {
-  model: invalidateModel, texture: invalidateTexture, audio: invalidateAudio, environment: invalidateEnvironment,
-} satisfies Record<InvalidatableAssetType, (path: string) => void>;
+// SHARES the Assets-panel button path's table rather than mirroring it (#1366): this used to be a
+// second hand-written copy, kept in step by a comment in each, and they drifted — `model` mapped to
+// `invalidateModel` alone in both, so the rigged prototype was never evicted and a re-imported
+// SKINNED GLB kept its pre-import skeleton and clips. `invalidateModelAndRig` is now the `model`
+// row for every entry point; see `runtime/loaders/reimportInvalidation.ts`.
+//
+// This is where the runtime table is pinned against the MCP surface's own
+// `INVALIDATABLE_ASSET_TYPES` tuple (tools/shared/invalidateAssets.ts, which
+// `device_invalidate_assets` derives its enum from — #1216 C-13). Both directions are pinned, and
+// they need DIFFERENT mechanisms:
+//
+//   `satisfies`  — every MCP kind has a row here (a MISSING row fails).
+//   `_KindPin`   — every row here is an MCP kind (an EXTRA row fails).
+//
+// ⚠️ **`satisfies` alone does NOT give the second direction, though it did before #1366.** Excess-
+// property checking applies only to a FRESH OBJECT LITERAL; this used to be one, and is now a
+// reference to the shared table, so the extra-key check silently evaporated. Measured during that
+// change's close-out review: adding a `video` kind to `REIMPORT_INVALIDATORS` without touching the
+// MCP tuple produced ZERO diagnostics from the root typecheck, where the old literal form errored
+// TS2353. The drift that would ship is a kind the shared table accepts and
+// `device_invalidate_assets`'s enum rejects at runtime — exactly what #1216 C-13 put a pin here for.
+type _KindPin = ReimportableAssetKind extends InvalidatableAssetType ? true : never;
+const _kindPin: _KindPin = true; void _kindPin;
+const INVALIDATORS = REIMPORT_INVALIDATORS satisfies Record<InvalidatableAssetType, (path: string) => void>;
 const isInvalidatableAssetType = (t: unknown): t is InvalidatableAssetType =>
   typeof t === 'string' && (INVALIDATABLE_ASSET_TYPES as readonly string[]).includes(t);
 

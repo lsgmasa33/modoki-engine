@@ -1238,10 +1238,28 @@ image at once. The REBUILD only happens on a frame that runs, and a GLB re-parse
 longer than the 1s grace — so re-arming on the invalidation alone still left a re-imported object
 missing indefinitely (measured on `games/space-console`: 10s+, twice, recovering only when an
 unrelated selection forced a frame). It reads as data loss, not as a stale frame. The completion edge
-is `runtime/loaders/modelLoadNotify.ts`, fired by **both** model caches — `meshTemplateCache` for
-static templates and `riggedModelCache` for skinned prototypes. A notifier wired into only the first
-would leave re-imported CHARACTERS broken while every static mesh recovered, which is why it is a
-shared leaf module rather than an export of either cache.
+is `fireDirtyListeners()` (`runtime/core/renderDirty.ts`), called by **both** model caches —
+`meshTemplateCache` for static templates and `riggedModelCache` for skinned prototypes. Wired into
+only the first it would leave re-imported CHARACTERS broken while every static mesh recovered, which
+is why both caches call it.
+
+⚠️ **That completion edge used to travel on a PRIVATE channel, and that was #1363.** A dedicated
+`modelLoadNotify.ts` / `onModelTemplatesLoaded` event existed for it, and the subscription list
+above was its ONLY subscriber in the repo — so the QA-ASSET-0008 fix covered one render-on-demand
+3D surface of two, and the **stopped GameView** (`Scene3D`, idle-gated since the T1 gate landed in
+June 2026) never got the load edge at all. Its own docblock asserted "the continuously-rendering
+GameView needs none of this", which was already false two months before it was written. Every other
+async refill in `meshTemplateCache` — `fetchEnvironment`'s success path, the material refetch —
+already called the shared `fireDirtyListeners()`, which is why none of them had the bug. The channel
+is deleted; the reasoning now lives in `renderDirty.ts`'s header, with an explicit note not to
+answer this edge with a private channel again.
+
+MEASURED on `games/alien-animal`, stopped editor, Game panel visible, the GLB refill delayed past
+the grace: **before**, the evict emptied the scene at t=1752 ms, the gate spent its ~1 s and the
+surface stopped submitting at t=2751 ms, and 30 s later the scene still held 0 meshes with
+`renderer.info.render.calls` frozen — one forced render restored it instantly, so the refilled model
+had been sitting in the cache unused. **After**, the same run recovered unaided at t=10014 ms, the
+moment the refill landed.
 
 **UNDO/REDO was missing from that list entirely, and it is the sharpest case (2026-08-18).** Undo
 reverts a transform through `gizmoUndo.ts`'s `apply`, a raw `en.set(trait, …)` — it does not go
