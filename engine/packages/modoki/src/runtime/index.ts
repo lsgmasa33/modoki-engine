@@ -723,6 +723,12 @@ export {
   mayShowInterstitial,
   type InterstitialContext, type InterstitialPolicy, type InterstitialVerdict, type InterstitialWithheld,
 } from './core/adPacing';
+export {
+  adBreakCountdownLabel, mayOfferNoAds, midLevelBreakDue, planAdBreak, stepAdBreak,
+  type AdBreakEffect, type AdBreakEvent, type AdBreakState, type AdBreakStep, type AdBreakTransition,
+  type AdBreakTrigger, type MidLevelBreakContext, type MidLevelBreakPolicy, type NoAdsOfferContext,
+  type NoAdsOfferPolicy, type NoAdsOfferVerdict, type NoAdsOfferWithheld,
+} from './core/adBreak';
 export { stepSimulation, type StepOptions } from './core/stepSimulation';
 export { seedRng, rngNext, rngFloat, rngInt, rngBool, rngPick } from './core/rng';
 export {

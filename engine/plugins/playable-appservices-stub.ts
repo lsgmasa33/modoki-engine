@@ -91,6 +91,8 @@ export const ads = {
   // read for the "watch a video" button, and UMP's privacy-options row — all "nothing here".
   setBannerVisible(_visible: boolean): void {},
   rewardedReady(): boolean { return false; },
+  // #1330 — the break before an ad asks whether one is loaded; a playable has none, so no card shows.
+  interstitialReady(): boolean { return false; },
   bannerHeightPx(): number { return 0; },
   privacyOptionsRequired(): boolean { return false; },
   async showPrivacyOptions(): Promise<void> {},
