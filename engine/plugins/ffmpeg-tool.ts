@@ -13,9 +13,8 @@
  *  ffprobe durations differed on all 26), so what a build shipped depended on which laptop
  *  converted it. The cache key does not name the binary, so the binary has to be the same
  *  everywhere instead. The env override stays: setting it is a deliberate act, not an
- *  accident of what happens to be installed. `detect()` is the one resolver — its
- *  `pinnedOnly` registry flag is what drops the PATH candidate, so Build Support and the
- *  conversion can never disagree about whether the tool is there.
+ *  accident of what happens to be installed. The resolution itself is shared with
+ *  toktx/msdf-atlas-gen in `pinned-cli.ts`.
  *
  *  ⚠️ The ffmpeg binary must NEVER be bundled into the packaged editor. Every
  *  `ffmpeg-static` build is `--enable-gpl` (redistributable only under the GPL,
@@ -24,44 +23,16 @@
  *  licence. We are compliant precisely because the user's own machine provisions it
  *  on demand — see engine/scripts/before-pack.cjs and docs/video.md. */
 
-import { detect, resolve, forgetDetection, isToolStale, NPM_BINARY_PINS, conversionToolchainDir } from '../toolchain';
-
-type ConversionTool = keyof typeof NPM_BINARY_PINS;
-
-/** Resolve a conversion CLI to an absolute path, or throw an actionable message.
- *
- *  A miss is re-checked once with the cached detection dropped: the install may have run
- *  in the other process (the Vite server installs; the Electron main also converts), and
- *  a negative result cached here before that install would otherwise stick until restart.
- *  A hit is not re-checked — `detect()` already proved it runs. */
-function pinnedTool(id: ConversionTool): string {
-  let d = detect(id);
-  if (!d.present) {
-    forgetDetection(id);
-    d = detect(id);
-  }
-  if (!d.present || !d.command) {
-    resolve(id); // throws the registry's actionable install message
-    throw new Error(`${id} resolved without a command`);
-  }
-  if (isToolStale(id, d)) {
-    const pin = NPM_BINARY_PINS[id];
-    throw new Error(
-      `The provisioned ${id} under ${conversionToolchainDir()} is not the pinned ${pin.pkg}@${pin.version} (#1297). ` +
-      'Reinstall it from Build → Build Support…, or run `npm run toolchain:install -- ffmpeg ffprobe`.',
-    );
-  }
-  return d.command;
-}
+import { pinnedConversionCli } from './pinned-cli';
 
 /** The pinned `ffmpeg`, or throws with an install hint. */
 export function ensureFfmpeg(): string {
-  return pinnedTool('ffmpeg');
+  return pinnedConversionCli('ffmpeg');
 }
 
 /** The pinned `ffprobe`, or throws with an install hint. */
 export function ensureFfprobe(): string {
-  return pinnedTool('ffprobe');
+  return pinnedConversionCli('ffprobe');
 }
 
 const warnedProbe = new Set<string>();

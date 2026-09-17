@@ -49,8 +49,17 @@ export async function loadEnginePluginModuleResult(repoRoot, relPathFromEngineDi
 
   // Include the entry's basename so concurrent loads (vendorPlugins + healNativeConfig +
   // addNativeTarget, all healing the same native build) can't collide on one temp path.
+  //
+  // ⚠️ Written under the repo's own node_modules/.cache when there is one, not os.tmpdir(): the
+  // bundle keeps packages EXTERNAL, and a `require('tar')` (nodeProvision's createRequire, keyed on
+  // this file's URL) resolves by walking up from the bundle's location. From /var/folders there is
+  // no node_modules to find, so `toolchain:install` of any archive-shipped tool failed with
+  // "Cannot find module 'tar'" (#1327). node_modules is also outside every dev-server watcher.
+  const cacheDir = path.join(repoRoot, 'node_modules', '.cache', 'modoki-plugin');
+  const outDir = fs.existsSync(path.join(repoRoot, 'node_modules')) ? cacheDir : os.tmpdir();
+  fs.mkdirSync(outDir, { recursive: true });
   const outfile = path.join(
-    os.tmpdir(),
+    outDir,
     `modoki-plugin-${path.basename(relPathFromEngineDir, '.ts')}-${process.pid}-${path.basename(repoRoot)}.mjs`,
   );
   await build({

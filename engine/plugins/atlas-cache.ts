@@ -14,7 +14,8 @@ import { createHash } from 'crypto';
 import type { AtlasSource } from '../packages/modoki/src/runtime/loaders/spriteAtlas';
 
 /** Bump when the packer/compositor pipeline changes so stale atlas caches invalidate. */
-export const ATLAS_ENCODER_VERSION = 'atlas-1';
+// atlas-2: the pinned toktx (#1327) — evicts atlases an unpinned build converted under the same key.
+export const ATLAS_ENCODER_VERSION = 'atlas-2';
 
 /** The synthetic url path a single atlas page is cached/served under. Page variant
  *  bytes live in the texture cache at this key; the served URL appends the variant

@@ -53,15 +53,19 @@ needed. The Requirements section is for running this repo from source.
 ### Requirements
 
 - **Node.js 22+** and npm — required to run the editor and build games from this source checkout.
-- **[KTX-Software](https://github.com/KhronosGroup/KTX-Software/releases) (`toktx`)** — encodes
-  textures to KTX2. Without it on `PATH`, imports silently fall back to shipping source
-  PNG/JPG (bigger builds, no compression) instead of failing, so install it up front.
-  - macOS: **not on Homebrew** — install the `.pkg` from the GitHub releases page.
-  - Windows: `winget install KhronosGroup.KTX-Software`.
-  - Linux: download the release tarball and put `toktx` on `PATH`.
-- **[msdf-atlas-gen](https://github.com/Chlumsky/msdf-atlas-gen/releases)** — bakes MTSDF font
-  atlases for the text/UI system. Download the prebuilt binary for your platform and put it on
-  `PATH` (or point `MODOKI_MSDF_ATLAS_GEN` at it directly).
+- **`toktx` ([KTX-Software](https://github.com/KhronosGroup/KTX-Software/releases)) and
+  [`msdf-atlas-gen`](https://github.com/Chlumsky/msdf-atlas-gen)** — encode textures to KTX2 and
+  bake MTSDF font atlases. Install the editor's **pinned** builds up front:
+
+  ```bash
+  npm run toolchain:install -- toktx msdf-atlas-gen
+  ```
+
+  Copies on your `PATH` are **not used**: a converted asset's cache key does not name the tool, so
+  every machine has to convert with the same build. Without them, imports fall back to shipping
+  source PNG/JPG (bigger builds, no compression) instead of failing. Pinned builds exist for macOS
+  (Apple Silicon; `toktx` also on Intel) and Windows x64. On Windows, unpacking the KTX installer
+  needs [7-Zip](https://www.7-zip.org/).
 - **JDK 21 + Android SDK** — only needed to build the Android target. The **editor can provision
   both for you**: open **Build → Build Support…** and click Install (downloads a pinned Temurin
   21 + the `cmdline-tools`/platform/build-tools the games need, no manual `JAVA_HOME`/
@@ -70,8 +74,8 @@ needed. The Requirements section is for running this repo from source.
   21 specifically (Gradle rejects newer bytecode).
 - **Xcode** — only needed to build the iOS target (macOS only). Install from the App Store, then
   `xcode-select --install` and accept the license once.
-- If a tool is missing, `toktx`/`msdf-atlas-gen` can also be pointed at explicitly via the
-  `MODOKI_TOKTX` / `MODOKI_MSDF_ATLAS_GEN` env vars — useful if you don't want them on `PATH`.
+- To use a specific `toktx`/`msdf-atlas-gen` on purpose (e.g. on Linux, which has no pinned
+  build), point `MODOKI_TOKTX` / `MODOKI_MSDF_ATLAS_GEN` at it.
 
 ### Windows: use a Dev Drive
 

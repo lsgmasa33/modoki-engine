@@ -26,7 +26,7 @@ import { listAndroidDevices, resolveBuildAndroidSerial } from './backend/android
 // by one door, so a future caller cannot pick up a differently-typed view of the same rules.
 import { foreignClaimFor, describeConflict, adbDeviceId, adbSerialOf, iosDeviceId, ownAdbClaim } from './backend/deviceClaims';
 import { acquireBuildSlot, releasePolicy } from './backend/buildLock';
-import { detect as detectTool, detectAdb, ensureNode, preflight as preflightBuild, install as installTool, isInstallable, cocoapodsEnv, goIosBinFor, wdaTeamId, writeToolchainSettings, conversionToolchainDir, NPM_BINARY_PINS, type BuildTarget, type ToolId } from '../toolchain';
+import { detect as detectTool, detectAdb, ensureNode, preflight as preflightBuild, install as installTool, isInstallable, cocoapodsEnv, goIosBinFor, wdaTeamId, writeToolchainSettings, conversionToolchainDir, isPinnedConversionTool, type BuildTarget, type ToolId } from '../toolchain';
 import { registerReimportHandler, type ReimportContext } from './reimport-registry';
 // From the standalone zero-import file, NOT assetManifest.ts — that module transitively
 // imports assetFetch.ts/assetUrl.ts (browser-only globals), which would drag DOM/vite-client
@@ -2335,12 +2335,12 @@ export function assetScannerPlugin(): Plugin {
           const send = (d: string) => { try { res.write(`data: ${JSON.stringify(d)}\n\n`); } catch { /* disconnected */ } };
           const sendStatus = (s: string) => { try { res.write(`event: status\ndata: ${JSON.stringify(s)}\n\n`); } catch { /* disconnected */ } };
 
-          // A pinned conversion CLI (ffmpeg/ffprobe) is looked for under conversionToolchainDir() even
-          // in a plain dev editor (#1297), so it installs there too — otherwise Build Support would
+          // A pinned conversion CLI (ffmpeg/ffprobe/toktx/msdf-atlas-gen) is looked for under
+          // conversionToolchainDir() even in a plain dev editor (#1297, #1327), so it installs there too — otherwise Build Support would
           // report it missing and refuse the one install that fixes it.
           // `||`, matching conversionToolchainDir(): an EMPTY env value is unset for the resolver too.
           const toolchainDir = process.env.MODOKI_TOOLCHAIN_DIR
-            || (id && Object.hasOwn(NPM_BINARY_PINS, id) ? conversionToolchainDir() : undefined);
+            || (id && isPinnedConversionTool(id) ? conversionToolchainDir() : undefined);
           // Use isInstallable (DYNAMIC) not the static INSTALLABLE set — CocoaPods is installable on
           // macOS (provisioned Ruby) but deliberately NOT in INSTALLABLE, so the static check wrongly
           // rejected it here even though the dialog offered an Install button.

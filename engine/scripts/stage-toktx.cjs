@@ -8,22 +8,24 @@
  * electron-builder's signing pass then signs both (the `disable-library-validation`
  * entitlement + same-team signature let `toktx` load `libktx` under hardened runtime).
  *
- * Graceful: if `toktx` / `libktx` aren't installed on the build machine, it logs a
+ * Graceful: if the pinned `toktx` / `libktx` can't be provisioned on the build machine, it logs a
  * warning and skips — the packaged app then falls back to shipping source textures
  * (the runtime resolver degrades), exactly as a dev build without `toktx` does.
  *
  * Two platforms, one destination (build/bin → resources/bin):
- *   • macOS — copy the Homebrew/`/usr/local` `toktx` + `libktx.4.dylib` (below).
- *   • Windows — copy an INSTALLED `toktx.exe` + its sibling `ktx.dll` (stageToktxWin32).
- * Both stage whatever the build machine has installed, so a LOCAL `dist:win` bundles the
- * tool the same way `dist:mac` does. In CI the win32 branch is a no-op: release-windows.yml
- * pre-stages build/bin via a download step, and this skips when it's already populated.
+ *   • macOS — copy the pinned `toktx` + `libktx.4.dylib` (below).
+ *   • Windows — copy the pinned `toktx.exe` + its sibling `ktx.dll` (stageToktxWin32).
+ * Both stage the PINNED build (pinnedToolForStaging.cjs, #1327) — never whatever the build
+ * machine has on PATH, because the packaged editor converts with what it bundles. In CI the win32
+ * branch is a no-op: release-windows.yml pre-stages build/bin via a download step, and this skips
+ * when it's already populated.
  * Other platforms (linux) are a no-op.
  */
 
 const fs = require('fs');
 const path = require('path');
 const { execFileSync, spawnSync } = require('child_process');
+const { pinnedToolForStaging } = require('./pinnedToolForStaging.cjs');
 
 // engine/scripts/ → repo root (build/ + node_modules live at the repo root).
 const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
@@ -35,40 +37,14 @@ function rmStaged(paths) {
   for (const p of paths) { try { fs.rmSync(p, { force: true }); } catch { /* best effort */ } }
 }
 
-/** Resolve the toktx binary: MODOKI_TOKTX, then PATH, then the standard install. */
-function findToktx() {
-  if (process.env.MODOKI_TOKTX && fs.existsSync(process.env.MODOKI_TOKTX)) return process.env.MODOKI_TOKTX;
-  try { return execFileSync('which', ['toktx'], { encoding: 'utf8' }).trim(); } catch { /* fall through */ }
-  const std = '/usr/local/bin/toktx';
-  return fs.existsSync(std) ? std : null;
-}
-
-/** The one non-system dylib toktx needs: @rpath/libktx.4.dylib → the real file. */
+/** The one non-system dylib toktx needs (@rpath/libktx.4.dylib): the pinned install keeps it as a
+ *  sibling; an MODOKI_TOKTX pointing into a KTX-Software install keeps it in ../lib. */
 function findLibktx(toktxPath) {
-  // Standard install puts it next to the binary's ../lib.
   const candidates = [
+    path.join(path.dirname(toktxPath), 'libktx.4.dylib'),
     path.join(path.dirname(toktxPath), '..', 'lib', 'libktx.4.dylib'),
-    '/usr/local/lib/libktx.4.dylib',
   ];
   return candidates.find((p) => fs.existsSync(p)) || null;
-}
-
-/** Windows: resolve an INSTALLED toktx.exe — MODOKI_TOKTX, then PATH (`where`), then the
- *  standard KTX-Software install (`%ProgramFiles%\KTX-Software\bin`). Install it once on a
- *  dev box with `winget install KhronosGroup.KTX-Software`. */
-function findToktxWin() {
-  if (process.env.MODOKI_TOKTX && fs.existsSync(process.env.MODOKI_TOKTX)) return process.env.MODOKI_TOKTX;
-  try {
-    // `where` prints "INFO: Could not find files…" to stderr on a miss — ignore stderr so it doesn't leak.
-    const first = execFileSync('where', ['toktx'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).split(/\r?\n/)[0].trim();
-    if (first && fs.existsSync(first)) return first;
-  } catch { /* not on PATH */ }
-  for (const base of [process.env.ProgramFiles, process.env.ProgramW6432, process.env['ProgramFiles(x86)']]) {
-    if (!base) continue;
-    const p = path.join(base, 'KTX-Software', 'bin', 'toktx.exe');
-    if (fs.existsSync(p)) return p;
-  }
-  return null;
 }
 
 /** Windows staging: copy the installed toktx.exe + its sibling ktx.dll into build/bin
@@ -80,10 +56,10 @@ async function stageToktxWin32() {
     console.log('[stage-toktx] build/bin/toktx.exe already present — skipping (CI-staged or cached).');
     return;
   }
-  const toktx = findToktxWin();
+  const toktx = pinnedToolForStaging('toktx');
   if (!toktx) {
-    console.warn('[stage-toktx] toktx.exe not found (MODOKI_TOKTX / PATH / %ProgramFiles%\\KTX-Software\\bin) — ' +
-      'skipping bundle; install it with `winget install KhronosGroup.KTX-Software`. The app falls back to source textures.');
+    console.warn('[stage-toktx] no pinned toktx.exe (MODOKI_TOKTX, or `npm run toolchain:install -- toktx`) — ' +
+      'skipping bundle. The app falls back to source textures.');
     return;
   }
   const dll = path.join(path.dirname(toktx), 'ktx.dll');
@@ -129,9 +105,9 @@ exports.default = async function stageToktx(context) {
   if (platform === 'win32') return stageToktxWin32();
   if (platform && platform !== 'darwin') return; // linux/other — nothing to stage
 
-  const toktx = findToktx();
+  const toktx = pinnedToolForStaging('toktx');
   if (!toktx) {
-    console.warn('[stage-toktx] toktx not found (PATH / /usr/local/bin / MODOKI_TOKTX) — ' +
+    console.warn('[stage-toktx] no pinned toktx (MODOKI_TOKTX, or `npm run toolchain:install -- toktx`) — ' +
       'skipping bundle; the app will fall back to source textures on import.');
     return;
   }
@@ -150,7 +126,9 @@ exports.default = async function stageToktx(context) {
 
   // Sanity-check the staged copy actually runs (sibling dylib resolves).
   try {
-    const ver = execFileSync(path.join(BIN_DIR, 'toktx'), ['--version'], { encoding: 'utf8' }).trim();
+    // toktx prints its banner to STDERR (exit 0), so capture both streams for the log line.
+    const ver = execFileSync(path.join(BIN_DIR, 'toktx'), ['--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+      || spawnSync(path.join(BIN_DIR, 'toktx'), ['--version'], { encoding: 'utf8' }).stderr.trim();
     console.log(`[stage-toktx] bundled ${ver} (+ libktx) → build/bin/`);
   } catch (e) {
     // ⚠️ **THROW — the staged copy is verified and the verdict must not be discarded**

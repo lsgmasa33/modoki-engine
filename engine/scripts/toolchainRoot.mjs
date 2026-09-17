@@ -47,6 +47,8 @@ export const TOOLCHAIN_OWNED_ENTRIES = new Set([
   'ruby',           // cocoapods, dir 2 of 2 — the portable ruby it runs on
   'wda',            // webdriveragent (fetched source + our DerivedData)
   'go-ios',         // go-ios
+  'toktx',          // toktx (pinned KTX-Software CLI, #1327)
+  'msdf-atlas-gen', // msdf-atlas-gen (pinned, #1327)
   'npm-tools',      // the SHARED npm package the CLI tools install into (npmToolsDir)
   'settings.json',  // the "Use system-installed SDKs" toggle
 ]);

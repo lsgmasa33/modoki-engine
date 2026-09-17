@@ -250,10 +250,11 @@ dmg:
 #    wine AND you must force the win prebuilds in (`npm install --os=win32 --cpu=x64
 #    sharp`, verify no other mac-only native dep) — so it's not the supported route.
 # Bundled native tools (toktx + msdf-atlas-gen): staged into build/bin by a DIFFERENT
-#    mechanism per platform, both landing in the same extraResources → resources/bin:
-#      • macOS — the beforePack stage hooks (stage-toktx.cjs / stage-msdf.cjs). They are
-#        darwin-only because they relocate Homebrew dylibs + re-sign for hardened runtime.
-#      • Windows — CI steps in .github/workflows/release-windows.yml ("Stage toktx" /
+#    both landing in the same extraResources → resources/bin, and both the PINNED builds
+#    (engine/toolchain/conversionCliProvision.ts, #1327 — the packaged editor converts with them):
+#      • the beforePack stage hooks (stage-toktx.cjs / stage-msdf.cjs), on macOS AND Windows,
+#        copy the pinned copy `npm run toolchain:install` provisions (never a PATH one).
+#      • Windows CI additionally pre-stages via oss/.github/workflows/release-windows.yml ("Stage toktx" /
 #        "Stage msdf-atlas-gen") download the upstream Windows releases, sha256-verify,
 #        and extract toktx.exe+ktx.dll / msdf-atlas-gen.exe into build/bin BEFORE
 #        electron-builder runs. So a Windows installer DOES bundle both — full parity

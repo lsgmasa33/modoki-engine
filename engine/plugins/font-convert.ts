@@ -20,49 +20,17 @@ import type { FontImportSettings } from '../packages/modoki/src/runtime/core/fon
 import { expandCharset } from '../packages/modoki/src/runtime/core/fontSettings';
 import { getFontCacheDir, hashKey, atlasCachePath, metricsCachePath, instanceCachePath, fontCacheHit } from './font-cache';
 import { instanceFont, hasAxes } from './font-instance';
+import { pinnedConversionCli } from './pinned-cli';
+import { forgetDetection } from '../toolchain';
 
-const MSDF_MISSING_MSG =
-  'msdf-atlas-gen not found. The packaged editor bundles it (resources/bin, via MODOKI_MSDF_ATLAS_GEN); ' +
-  'in a dev checkout set MODOKI_MSDF_ATLAS_GEN to a binary path or install it — ' +
-  (process.platform === 'win32'
-    ? 'Windows: download msdf-atlas-gen-<ver>-win64.zip from https://github.com/Chlumsky/msdf-atlas-gen/releases and put msdf-atlas-gen.exe on PATH.'
-    : 'macOS: `brew install msdf-atlas-gen`; https://github.com/Chlumsky/msdf-atlas-gen.');
+/** For tests — forget the cached msdf-atlas-gen detection. */
+export function __resetMsdfCheck(): void { forgetDetection('msdf-atlas-gen'); }
 
-let genCheck: { ok: boolean; cli: string } | null = null;
-
-/** Resolve the msdf-atlas-gen binary: an explicit MODOKI_MSDF_ATLAS_GEN path (the
- *  packaged Electron editor can point this at a bundled binary) wins, else the
- *  bare `msdf-atlas-gen` name resolved via PATH (dev). */
-function msdfAtlasGenBinary(): string {
-  return process.env.MODOKI_MSDF_ATLAS_GEN || 'msdf-atlas-gen';
-}
-
-/** For tests — forget the cached CLI-availability probe. */
-export function __resetMsdfCheck(): void { genCheck = null; }
-
-/** Ensure `msdf-atlas-gen` is callable; returns the CLI path/name or throws with
- *  an install hint. Probed by invoking with no args (prints usage, exit 0). */
+/** The pinned `msdf-atlas-gen` (#1327) — the packaged editor's bundled copy, the provisioned one
+ *  under the toolchain dir, or an explicit MODOKI_MSDF_ATLAS_GEN — or throws with an install hint.
+ *  Never PATH: the atlas ships what this binary baked, and its cache key does not name the binary. */
 export function ensureMsdfAtlasGen(): string {
-  const cli = msdfAtlasGenBinary();
-  if (genCheck && genCheck.cli === cli) {
-    if (!genCheck.ok) throw new Error(MSDF_MISSING_MSG);
-    return genCheck.cli;
-  }
-  try {
-    execFileSync(cli, [], { stdio: 'pipe' });
-    genCheck = { ok: true, cli };
-    return cli;
-  } catch (e) {
-    // Exit code is non-zero only when the binary is missing; usage-print with no
-    // args exits 0, so an ENOENT (spawn failure) is the miss signal.
-    if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
-      genCheck = { ok: false, cli };
-      throw new Error(MSDF_MISSING_MSG, { cause: e });
-    }
-    // Any other error (e.g. non-zero exit) still means the binary ran → available.
-    genCheck = { ok: true, cli };
-    return cli;
-  }
+  return pinnedConversionCli('msdf-atlas-gen');
 }
 
 /** Format the resolved charset as an msdf-atlas-gen charset file — a single

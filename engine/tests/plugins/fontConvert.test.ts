@@ -1,16 +1,9 @@
-/** Font conversion tests — exact msdf-atlas-gen flag vector, charset-file
- *  formatting, and the missing-CLI error. execFileSync is mocked so the CLI probe
- *  is deterministic regardless of whether msdf-atlas-gen is installed. */
+/** Font conversion tests — exact msdf-atlas-gen flag vector and charset-file formatting. The
+ *  missing-CLI error is covered with a sandboxed toolchain in conversionToolPin.test.ts (#1327). */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 
-vi.mock('child_process', () => {
-  const err = Object.assign(new Error('spawn msdf-atlas-gen ENOENT'), { code: 'ENOENT' });
-  const execFileSync = vi.fn(() => { throw err; });
-  return { execFileSync, default: { execFileSync } };
-});
-
-import { buildAtlasGenArgs, buildCharsetFile, ensureMsdfAtlasGen, __resetMsdfCheck } from '../../plugins/font-convert';
+import { buildAtlasGenArgs, buildCharsetFile } from '../../plugins/font-convert';
 import { DEFAULT_FONT_SETTINGS } from '../../packages/modoki/src/runtime/core/fontSettings';
 
 const S = DEFAULT_FONT_SETTINGS;
@@ -68,15 +61,5 @@ describe('buildCharsetFile', () => {
     expect(inner.length).toBe(0x7e - 0x20 + 1);
     expect(inner).toContain('A');
     expect(inner).toContain(' ');
-  });
-});
-
-describe('ensureMsdfAtlasGen', () => {
-  it('throws an install hint when the binary is missing (ENOENT)', () => {
-    __resetMsdfCheck();
-    expect(() => ensureMsdfAtlasGen()).toThrow(/msdf-atlas-gen not found/);
-    // The install hint is platform-aware (brew on macOS, the win64 zip on Windows); assert the
-    // GitHub project URL that BOTH branches carry rather than the macOS-only `brew` line.
-    expect(() => ensureMsdfAtlasGen()).toThrow(/Chlumsky\/msdf-atlas-gen/);
   });
 });

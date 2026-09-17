@@ -81,9 +81,19 @@ describe('toolchain resolve() — env override + PATH injection', () => {
   it('resolve() throws the actionable install message when the tool is absent', () => {
     process.env.MODOKI_TOKTX = path.join(path.dirname(NODE), 'definitely-not-a-real-tool-xyz')
     process.env.PATH = '' // and not on PATH either
-    resetToolchainCache()
-    expect(detect('toktx').present).toBe(false)
-    expect(() => resolve('toktx')).toThrow(/KTX-Software|MODOKI_TOKTX/)
+    // …and no pinned copy: toktx is looked up under the toolchain dir too (#1327), and a dev box
+    // that ran `toolchain:install` has one in the machine default.
+    const savedTc = process.env.MODOKI_TOOLCHAIN_DIR
+    process.env.MODOKI_TOOLCHAIN_DIR = makeScratchDir('modoki-no-toktx-')
+    try {
+      resetToolchainCache()
+      expect(detect('toktx').present).toBe(false)
+      expect(() => resolve('toktx')).toThrow(/KTX-Software|MODOKI_TOKTX/)
+    } finally {
+      fs.rmSync(process.env.MODOKI_TOOLCHAIN_DIR, { recursive: true, force: true })
+      if (savedTc === undefined) delete process.env.MODOKI_TOOLCHAIN_DIR
+      else process.env.MODOKI_TOOLCHAIN_DIR = savedTc
+    }
   })
 
   it('captures a version banner the tool wrote to STDERR (toktx --version does this, exit 0)', () => {

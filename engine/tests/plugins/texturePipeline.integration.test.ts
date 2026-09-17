@@ -9,16 +9,16 @@
  *    • mip levels baked when requested,
  *    • a second convert is a cache hit.
  *
- *  KTX formats are gated on `toktx` being on PATH; if it is missing those cases
- *  skip (WebP/PNG still run) so CI without KTX-Software stays green.
+ *  KTX formats are gated on the PINNED `toktx` being resolvable (#1327 — a PATH copy is never
+ *  used, so probing PATH here would run these cases on a machine that cannot convert); if it is
+ *  missing those cases skip (WebP/PNG still run) so CI without KTX-Software stays green.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fs from 'fs';
 import path from 'path';
-import { execFileSync } from 'child_process';
 
-import { convertTexture, __resetKtxCheck } from '../../plugins/texture-convert';
+import { convertTexture, ensureKtxCli, __resetKtxCheck } from '../../plugins/texture-convert';
 import { getCacheDir, cachePathFor } from '../../plugins/texture-cache';
 import {
   DEFAULT_TEXTURE_SETTINGS, variantsForFormat, variantExtension,
@@ -27,7 +27,7 @@ import {
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
 function toktxPresent(): boolean {
-  try { execFileSync('toktx', ['--version'], { stdio: 'ignore' }); return true; } catch { return false; }
+  try { ensureKtxCli(); return true; } catch { return false; }
 }
 const HAS_TOKTX = toktxPresent();
 
@@ -176,6 +176,6 @@ describe('texture conversion pipeline (real encoders)', () => {
   });
 
   if (!HAS_TOKTX) {
-    it.skip('toktx not on PATH — KTX2 variant tests skipped', () => {});
+    it.skip('no pinned toktx — KTX2 variant tests skipped', () => {});
   }
 });

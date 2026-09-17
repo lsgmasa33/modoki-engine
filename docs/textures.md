@@ -8,19 +8,26 @@ pipeline.
 
 ## Prerequisite
 
-The **KTX-Software CLI** (`toktx`) must be on `PATH` for KTX2 encoding. It is
-**not in Homebrew** — install the macOS package from the
-[KhronosGroup/KTX-Software releases](https://github.com/KhronosGroup/KTX-Software/releases)
-(`toktx` + `ktx` land in `/usr/local/bin`). `ensureKtxCli()` probes `toktx
---version` and throws a clear install hint when it's missing; without it,
-conversion falls back to shipping the source PNG and the build logs a hint.
+KTX2 encoding needs the **pinned KTX-Software CLI** (`toktx` 4.4.2). A copy on
+`PATH` is **never used** (#1327): provision the pinned one with
+
+```bash
+npm run toolchain:install -- toktx msdf-atlas-gen
+```
+
+or from **Build → Build Support…** (an Install button in a dev editor; the
+packaged editor installs it unprompted). It lands in the machine-wide toolchain dir, so every clone on the machine
+shares it. `ensureKtxCli()` throws that install hint when it's missing; the build
+then falls back to shipping the source PNG and says so.
 
 `sharp` (an npm devDependency) handles the WebP encode + resize — no external
 install needed.
 
-The dev/CLI path resolves the binary via `toktxBinary()` in
-`plugins/texture-convert.ts`: an explicit `MODOKI_TOKTX` path wins, else the bare
-name `toktx` (resolved on `PATH`).
+`ensureKtxCli()` in `plugins/texture-convert.ts` resolves through the shared
+toolchain (`pinnedConversionCli('toktx')`): an explicit `MODOKI_TOKTX` path wins
+(the packaged editor sets it to its bundled copy), else the pinned copy under the
+toolchain dir, else it fails. Why and how it is pinned:
+[editor-toolchain.md](editor-toolchain.md) § "Conversion CLIs are pinned".
 
 ### Bundling `toktx` in the packaged editor
 
@@ -32,8 +39,10 @@ into the app bundle (macOS-only — the only signed target today):
   `build/bin/`, `chmod +x`es both, and sanity-runs the staged copy (`toktx
   --version`) to confirm the sibling dylib resolves. `toktx` already carries an
   `@executable_path` rpath, so `libktx` resolves next to it with no
-  `install_name_tool` surgery. The hook resolves its own source binary via
-  `MODOKI_TOKTX` → `which toktx` → `/usr/local/bin/toktx`.
+  `install_name_tool` surgery. The hook bundles the PINNED copy
+  (`pinnedToolForStaging.cjs`: `MODOKI_TOKTX`, else `toolchain:install toktx`,
+  which provisions it if missing) — never a `PATH` or `/usr/local` one, because
+  the packaged editor converts with whatever it bundles.
 - **`electron-builder.yml`** ships `build/bin` as `extraResources` →
   `Contents/Resources/bin`. The signing pass signs both binaries; the
   `disable-library-validation` entitlement lets `toktx` load the sibling `libktx`
@@ -41,9 +50,11 @@ into the app bundle (macOS-only — the only signed target today):
 - **`engine/electron/main.ts`** (`app.isPackaged`) points
   `process.env.MODOKI_TOKTX` at `<resourcesPath>/bin/toktx` when the env isn't
   already set, so `toktxBinary()` picks up the bundled copy.
-- **Graceful degradation**: if `toktx`/`libktx` aren't installed on the *build*
-  machine, the hook logs a warning and skips — the packaged app then falls back to
-  shipping source textures, exactly as a dev build without `toktx` does.
+- **Graceful degradation**: if the pinned `toktx` cannot be provisioned on the
+  *build* machine (offline), the hook logs a warning and skips — the packaged app
+  then falls back to shipping source textures, exactly as a dev build without
+  `toktx` does. The release workflow provisions it in its own step first, so a
+  release fails instead of shipping toolless.
 
 ## Per-texture settings
 
@@ -188,7 +199,8 @@ different-sized file per host from identical input) and, as of #127,
 CONSTRUCTION, not merely volatile: `hashKey()` (`plugins/model-cache.ts`) mixes
 in local gltfpack/gltf-transform/meshopt CLI versions, and `riggedHash`
 (`plugins/rigged-model-optimize.ts`) additionally encodes whether `toktx`
-exists on PATH at all — a manual, per-machine install. With four+ clones the
+is available at all and its version — a per-machine provisioning fact (a PATH
+install before #1327, the pinned copy since). With four+ clones the
 hash never converges: each rewrites it back on its own next build (measured:
 commit 471ca0cf's entire GLB-sidecar diff was 7 `"hash"` lines and nothing
 else). The other cache blocks' hashes (`textureCache.hash`, `fontCache.hash`,
@@ -203,13 +215,21 @@ same hash over different bytes. Where each converter stands:
 | Converter | CLI | Status |
 |---|---|---|
 | audio, video | `ffmpeg` / `ffprobe` | **Pinned** (#1297): only the provisioned `ffmpeg-static` / `@ffprobe-installer` copy (or a deliberate `MODOKI_FFMPEG`/`MODOKI_FFPROBE`), never PATH — [editor-toolchain.md](editor-toolchain.md) § "Conversion CLIs are pinned". The same build per PLATFORM, not across platforms. |
-| textures, atlases | `toktx` | **Machine-dependent, accepted.** `MODOKI_TOKTX` or PATH; the packaged editor bundles a pinned 4.4.2, but dev has no provisioning path to pin to. |
-| fonts | `msdf-atlas-gen` | **Machine-dependent, accepted.** PATH in dev; even the release bundle comes from an unpinned `brew install`. |
-| models (rigged) | `gltf-transform`, `toktx` | Took the other route — hashes the tool versions INTO its key, which is why `modelCache.hash` is peeled above. |
+| textures, atlases | `toktx` | **Pinned** (#1327): KTX-Software 4.4.2, sha256-checked, from the toolchain dir, the packaged editor's bundle, or a deliberate `MODOKI_TOKTX` — never PATH. Same build per platform. |
+| fonts | `msdf-atlas-gen` | **Pinned** (#1327): 1.4 — on macOS our own static build (upstream ships Windows only), on Windows Chlumsky's zip; never PATH. ⚠️ The two are not merely two builds: Chlumsky's Windows build has **Skia** (it preprocesses overlapping contours), ours does not (it resolves overlaps in overlap mode, like Homebrew's). A font with overlapping contours — variable-font instances usually have them — bakes by a different geometry pipeline per platform under one `font-*` hash. Predates #1327; aligning them is an owner quality call. |
+| models (rigged) | `gltf-transform`, `toktx` | Took the other route — hashes the tool versions INTO its key, which is why `modelCache.hash` is peeled above. Its `toktx` resolves through the same pinned entry. |
 | environments | none (JS) | Not exposed. |
 
-Pinning `toktx` and `msdf-atlas-gen` is #1327; until then,
-what ships for a texture or font depends on which machine converted it.
+**Pinning both changed no committed value on the machine that did it** (#1327, measured
+2026-09-17). The unpacked pinned `toktx` + `libktx` are byte-identical to the hand-installed
+4.4.2, and five fonts (Latin and CJK) baked byte-identical atlas PNG and JSON under the
+Homebrew build and the pinned static build. `tex-3`/`atlas-2`/`font-6` exist to evict the
+entries a DIFFERENT machine's unpinned build left in its local cache. All 293 affected sidecars
+were re-imported through the real handlers, and no committed width/height/mipLevels/glyph/atlas
+value moved; the commit carries only the `hash` fields. (A re-import also normalises older
+sidecars — a `type` stamp, `srcWidth`/`srcHeight`, and on 5 2D textures a `webp` variant their
+committed `variants` lacks — which that commit deliberately left out.) A Windows machine converts with the Windows builds of the same
+versions, so its bytes are not claimed to match a Mac's.
 
 **`audioCache.durationSec` joined the peel in #1289** — the same "machine-dependent
 by construction" test, reached from the other side. It is not derived from

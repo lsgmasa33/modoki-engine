@@ -34,6 +34,7 @@ import { ensureJdk, discoverJavaHome, jdkVersionDir } from './jdkProvision'
 import { ensureCmdlineTools, runSdkmanager, ANDROID_SDK_PACKAGES } from './androidSdkProvision'
 import { ensureRuby, rubyDirFor } from './rubyProvision'
 import { ensureGoIos, goIosBinFor } from './goIosProvision'
+import { ensureConversionCli, conversionCliBin, conversionCliDist, canExpand } from './conversionCliProvision'
 import { ensureWda, wdaBuildStatus, PINNED_WDA, type CommandRunner as WdaCommandRunner } from './wdaProvision'
 
 export type ToolId = 'toktx' | 'android-sdk' | 'npm' | 'java' | 'xcodebuild' | 'gltf-transform-cli' | 'gltfpack' | 'cocoapods' | 'ffmpeg' | 'ffprobe' | 'msdf-atlas-gen' | 'webdriveragent' | 'go-ios'
@@ -163,13 +164,28 @@ export function conversionToolchainDir(): string {
   return process.env.MODOKI_TOOLCHAIN_DIR || defaultToolchainDir()
 }
 
-function pinnedMissingMsg(tool: 'ffmpeg' | 'ffprobe', neededFor: string): string {
-  const envVar = tool === 'ffmpeg' ? 'MODOKI_FFMPEG' : 'MODOKI_FFPROBE'
+const PINNED_ENV_VAR = {
+  ffmpeg: 'MODOKI_FFMPEG', ffprobe: 'MODOKI_FFPROBE', toktx: 'MODOKI_TOKTX', 'msdf-atlas-gen': 'MODOKI_MSDF_ATLAS_GEN',
+} as const
+
+/** The one "not provisioned" message for a pinned conversion CLI (#1297, #1327). The install hint
+ *  names the tool's own pair, because each pair is installed together. */
+function pinnedMissingMsg(tool: keyof typeof PINNED_ENV_VAR, neededFor: string): string {
+  const pair = tool === 'ffmpeg' || tool === 'ffprobe' ? 'ffmpeg ffprobe' : 'toktx msdf-atlas-gen'
   return `${tool} is not provisioned — needed for ${neededFor}. Asset conversion uses ONLY the editor's ` +
-    `pinned copy (under the toolchain dir), never one on PATH, so every machine converts with the ` +
-    `same build (#1297). Install it from Build → Build Support…, or run ` +
-    '`npm run toolchain:install -- ffmpeg ffprobe`. ' +
-    `To use a specific binary on purpose, set ${envVar}.`
+    `pinned copy (under the toolchain dir, or bundled in the packaged editor), never one on PATH, so ` +
+    `every machine converts with the same build (#1297). Install it from Build → Build Support…, or run ` +
+    `\`npm run toolchain:install -- ${pair}\`. ` +
+    `To use a specific binary on purpose, set ${PINNED_ENV_VAR[tool]}.`
+}
+
+/** Whether `id` is a PINNED conversion CLI — resolved only from its env override, the bundle or the
+ *  provisioned copy under `conversionToolchainDir()`, never PATH (#1297, #1327). Such a tool
+ *  installs into that dir even in a plain dev editor, since that is where detection looks. */
+export function isPinnedConversionTool(id: string): id is ToolId {
+  if (!Object.hasOwn(REGISTRY, id)) return false
+  const d = REGISTRY[id as ToolId]
+  return d.kind === 'binary' && d.pinnedOnly === true
 }
 
 /** A directory-located tool (e.g. the Android SDK): resolved from env vars then well-known dirs,
@@ -201,26 +217,27 @@ type ToolDescriptor = BinaryDescriptor | DirectoryDescriptor
 const REGISTRY: Record<ToolId, ToolDescriptor> = {
   toktx: {
     kind: 'binary',
+    // The packaged editor points MODOKI_TOKTX at its bundled copy (resources/bin); everywhere else
+    // the pinned install under the toolchain dir is the only candidate. PINNED-ONLY (#1327): a KTX2
+    // texture or atlas ships what this binary wrote, and the cache key does not name it.
     envVar: 'MODOKI_TOKTX',
+    extraCandidates: () => [conversionCliBin(conversionToolchainDir(), 'toktx')],
+    pinnedOnly: true,
     bin: 'toktx',
     versionArgs: ['--version'],
-    missingMsg:
-      'toktx (KTX-Software CLI) not found. Set MODOKI_TOKTX to the binary path, or install the ' +
-      'macOS package from https://github.com/KhronosGroup/KTX-Software/releases',
+    missingMsg: pinnedMissingMsg('toktx', 'KTX2 texture and atlas import (KTX-Software)'),
   },
   'msdf-atlas-gen': {
     kind: 'binary',
-    // Bundled like toktx (no npm distribution), so it's registered here for VISIBILITY in
-    // Build Support (not INSTALLABLE): macOS relocates a Homebrew build (stage-msdf.cjs),
-    // Windows ships Chlumsky's prebuilt win64 exe (release-windows.yml). resolveBundled sets
-    // MODOKI_MSDF_ATLAS_GEN → Contents/Resources/bin. font-convert.ts bakes MTSDF atlases with it.
+    // Bundled like toktx (resolveBundled sets MODOKI_MSDF_ATLAS_GEN → resources/bin) and pinned the
+    // same way everywhere else (#1327): macOS runs our own static build, Windows Chlumsky's win64
+    // zip — see conversionCliProvision.ts. font-convert.ts bakes MTSDF atlases with it.
     envVar: 'MODOKI_MSDF_ATLAS_GEN',
+    extraCandidates: () => [conversionCliBin(conversionToolchainDir(), 'msdf-atlas-gen')],
+    pinnedOnly: true,
     bin: 'msdf-atlas-gen',
     versionArgs: ['-version'], // prints "MSDF-Atlas-Gen v1.4.0", exit 0 (NOT --version-only)
-    missingMsg:
-      'msdf-atlas-gen not found — needed to bake MTSDF font atlases (dynamic / CJK text). The ' +
-      'packaged editor bundles it; in a dev checkout set MODOKI_MSDF_ATLAS_GEN, or install it ' +
-      '(macOS: `brew install msdf-atlas-gen`; https://github.com/Chlumsky/msdf-atlas-gen).',
+    missingMsg: pinnedMissingMsg('msdf-atlas-gen', 'MTSDF font atlas import (dynamic / CJK text)'),
   },
   npm: {
     kind: 'binary',
@@ -1020,7 +1037,7 @@ export const TOOL_IDS = Object.keys(REGISTRY) as ToolId[]
 
 /** Tools that `install()` can provision automatically (vs `guide()`-only, like Xcode). Grows as
  *  more installers land (gltfpack, android-sdk, java/jdk, cocoapods). */
-export const INSTALLABLE: ReadonlySet<ToolId> = new Set<ToolId>(['gltf-transform-cli', 'gltfpack', 'java', 'android-sdk', 'ffmpeg', 'ffprobe', 'go-ios'])
+export const INSTALLABLE: ReadonlySet<ToolId> = new Set<ToolId>(['gltf-transform-cli', 'gltfpack', 'java', 'android-sdk', 'ffmpeg', 'ffprobe', 'go-ios', 'toktx', 'msdf-atlas-gen'])
 
 /** PINNED versions for the CLI/gem tools we install by name (unlike Node/JDK/Ruby, whose version is
  *  in the download URL). Pinning makes installs reproducible (dev == packaged) AND lets a pin bump
@@ -1244,7 +1261,7 @@ export interface ToolchainStatus {
 /** Tools the editor installs UNPROMPTED when Build Support opens, so model/audio import just works.
  *  All four are cross-platform, dependency-free, and cannot fail for environmental reasons — which
  *  is what makes installing them without asking safe. */
-const AUTO_INSTALL: ReadonlySet<ToolId> = new Set<ToolId>(['gltf-transform-cli', 'gltfpack', 'ffmpeg', 'ffprobe'])
+const AUTO_INSTALL: ReadonlySet<ToolId> = new Set<ToolId>(['gltf-transform-cli', 'gltfpack', 'ffmpeg', 'ffprobe', 'toktx', 'msdf-atlas-gen'])
 
 /** Whether the editor should install `id` on its own.
  *
@@ -1261,6 +1278,9 @@ const AUTO_INSTALL: ReadonlySet<ToolId> = new Set<ToolId>(['gltf-transform-cli',
 export function autoInstallable(id: ToolId, opts: { wdaTeamAvailable?: boolean } = {}): boolean {
   if (!isInstallable(id)) return false
   if (id === 'webdriveragent') return detect('xcodebuild').present && (!!wdaTeamId() || !!opts.wdaTeamAvailable)
+  // The Windows KTX installer can only be unpacked by a 7-Zip the machine happens to have — an
+  // environmental failure, which is exactly what installing unasked must not risk.
+  if (id === 'toktx' || id === 'msdf-atlas-gen') return canExpand(conversionCliDist(id)!.kind)
   return AUTO_INSTALL.has(id)
 }
 
@@ -1311,6 +1331,8 @@ export function isInstallable(id: ToolId): boolean {
   // WDA is BUILT by xcodebuild, so it is macOS-only for the same reason CocoaPods is — and, unlike
   // every other installable tool, it also needs a signing identity, which install() checks.
   if (id === 'webdriveragent') return process.platform === 'darwin'
+  // Only where a pinned build exists for this host (#1327) — e.g. no msdf-atlas-gen on Intel macOS.
+  if (id === 'toktx' || id === 'msdf-atlas-gen') return !!conversionCliDist(id)
   return INSTALLABLE.has(id)
 }
 
@@ -1364,6 +1386,12 @@ export async function install(id: ToolId, opts: { toolchainDir: string; onLog?: 
   if (id === 'ffmpeg') return installNpmBinaryTool(NPM_BINARY_PINS.ffmpeg.pkg, NPM_BINARY_PINS.ffmpeg.version, ffmpegToolBin, opts)
   if (id === 'ffprobe') return installNpmBinaryTool(NPM_BINARY_PINS.ffprobe.pkg, NPM_BINARY_PINS.ffprobe.version, ffprobeToolBin, opts)
   if (id === 'cocoapods') return installCocoapods(opts)
+  if (id === 'toktx' || id === 'msdf-atlas-gen') {
+    // Pinned + sha256-verified release assets (conversionCliProvision.ts, #1327).
+    const bin = await ensureConversionCli(id, opts.toolchainDir, { onLog: opts.onLog })
+    resetToolchainCache()
+    return { path: bin }
+  }
   if (id === 'go-ios') {
     // Pinned + sha256-verified universal binary from the GitHub release (see goIosProvision.ts).
     // NOT in AUTO_INSTALL on purpose: it is 17 MB down / 45 MB on disk and only matters when you
@@ -1437,6 +1465,8 @@ export function toolOwnedDirs(id: ToolId, toolchainDir: string): string[] {
     // out of the user's ~/Library DerivedData: "Remove all tools" must actually remove it.
     case 'webdriveragent': return [path.join(toolchainDir, 'wda')]
     case 'go-ios': return [path.join(toolchainDir, 'go-ios')]
+    case 'toktx': return [path.join(toolchainDir, 'toktx')]
+    case 'msdf-atlas-gen': return [path.join(toolchainDir, 'msdf-atlas-gen')]
     default: return []
   }
 }
@@ -1453,6 +1483,8 @@ export function isRemovable(id: ToolId): boolean {
   // cocoapods checks its source below. Ours lives under the toolchain dir; nothing else counts.
   if (id === 'go-ios') return !!process.env.MODOKI_TOOLCHAIN_DIR && !!d.path?.startsWith(process.env.MODOKI_TOOLCHAIN_DIR)
   if (id === 'cocoapods') return d.source === 'probe' // our provisioned pod (not a system one)
+  // A BUNDLED copy (the packaged editor's MODOKI_TOKTX) resolves as `env` and is not ours to remove.
+  if (id === 'toktx' || id === 'msdf-atlas-gen') return d.source === 'probe'
   return toolOwnedDirs(id, process.env.MODOKI_TOOLCHAIN_DIR).length > 0
 }
 
@@ -1868,6 +1900,10 @@ export { ensureJdk, discoverJavaHome, javaBinName, jdkVersionDir, PINNED_JDK, jd
 export { ensureRuby, rubyDistKey, rubyDirFor, PINNED_RUBY, type ProvisionedRuby } from './rubyProvision'
 // On-demand go-ios provisioning: hands-free install+launch on an iOS ≤16 device (no ⌘R handoff).
 export { ensureGoIos, goIosBinFor, goIosDirFor, PINNED_GO_IOS, type ProvisionedGoIos } from './goIosProvision'
+export {
+  ensureConversionCli, conversionCliBin, conversionCliDir, conversionCliDist, CONVERSION_CLI_PINS, canExpand, ranOk,
+  type ConversionCliId, type PinnedCli, type PinnedCliAsset,
+} from './conversionCliProvision'
 // On-demand Android SDK provisioning (E-3): cmdline-tools bootstrap + sdkmanager packages/licenses.
 export {
   ensureCmdlineTools, runSdkmanager, sdkmanagerPath, cmdlineToolsKey,

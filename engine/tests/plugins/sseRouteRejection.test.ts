@@ -18,7 +18,7 @@ import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
-import { conversionToolchainDir } from '../../toolchain';
+import { conversionToolchainDir, conversionCliDist } from '../../toolchain';
 
 const { spawned, healCalls, scaffoldCalls, installs } = vi.hoisted(() => ({ spawned: [] as string[], healCalls: { n: 0 }, scaffoldCalls: { n: 0 }, installs: [] as Array<{ id: string; toolchainDir: string }> }));
 
@@ -309,6 +309,17 @@ describe('/api/toolchain/install without MODOKI_TOOLCHAIN_DIR (#1297)', () => {
     expect(res.statuses().at(-1)).toBe('DONE');
     expect(installs).toEqual([{ id: 'ffprobe', toolchainDir: conversionToolchainDir() }]);
   });
+
+  // #1327: the native conversion CLIs are pinned the same way, so the same route must serve them.
+  // Only where a pinned build exists for this host (none on Linux) — elsewhere it is not installable.
+  for (const id of ['toktx', 'msdf-atlas-gen'] as const) {
+    it.skipIf(!conversionCliDist(id))(`${id} installs into the machine default dir too (#1327)`, async () => {
+      const { res } = drive(`/api/toolchain/install?id=${id}`);
+      await vi.waitFor(() => expect(res.writableEnded).toBe(true), { timeout: 5000 });
+      expect(res.statuses().at(-1)).toBe('DONE');
+      expect(installs).toEqual([{ id, toolchainDir: conversionToolchainDir() }]);
+    });
+  }
 
   it('any other tool is still refused — a dev editor provisions no SDKs', async () => {
     const { res } = drive('/api/toolchain/install?id=gltfpack');

@@ -24,13 +24,18 @@ If provisioning fits, use that path and stop here. The rest of this doc is the *
 Every stager stages its binary into **`build/bin/`**, which `electron-builder.yml` ships verbatim as
 `extraResources: from build/bin → to bin`. The `beforePack` stage hooks (`engine/scripts/stage-*.cjs`,
 fanned out from `engine/scripts/before-pack.cjs`) branch on `context.electronPlatformName` and stage
-whatever the build machine has **installed** — so a LOCAL `dist:mac` AND a local `dist:win` both bundle:
+the tool's **pinned** build — so a LOCAL `dist:mac` AND a local `dist:win` both bundle it.
 
-- **macOS (`darwin`)** → relocate the Homebrew/`/usr/local` binary + its non-system dylib closure into
-  `build/bin/` (`install_name_tool` → `@loader_path/<name>`, ad-hoc re-sign).
-- **Windows (`win32`)** → copy the installed `.exe` (+ any sibling DLL) into `build/bin/`. No relocation
-  (Windows resolves a sibling DLL from the `.exe`'s own dir). Install the tool once, like `brew install`
-  on mac (e.g. `winget install KhronosGroup.KTX-Software`).
+⚠️ **Pinned, never "whatever is installed"** (#1327). A bundled tool is one the packaged editor RUNS,
+and both current ones are converters whose output ships under a cache key that names no binary — so
+the bundle must be the same build every dev machine converts with. The stagers ask
+`pinnedToolForStaging.cjs`: the `MODOKI_<TOOL>` override, else `npm run toolchain:install -- <tool>`
+(which provisions the pin if it is missing). They never look on PATH or in Homebrew.
+
+- **macOS (`darwin`)** → copy the pinned binary (+ any non-system dylib closure, relocated to
+  `@loader_path/<name>` and ad-hoc re-signed) into `build/bin/`.
+- **Windows (`win32`)** → copy the pinned `.exe` (+ any sibling DLL) into `build/bin/`. No relocation
+  (Windows resolves a sibling DLL from the `.exe`'s own dir).
 - **other platforms** → no-op.
 
 **CI is the exception that still downloads.** A CI runner has nothing installed, so
@@ -39,7 +44,8 @@ shipped by `scripts/publish-engine-oss.sh` — the private `.github/workflows/re
 was deleted 2026-08-03, see docs/engine-oss-publishing.md) pre-stages `build/bin/` via a pinned, sha256-verified DOWNLOAD
 of each tool's Windows release BEFORE `npm run dist:win`. The stager's `win32` branch is **idempotent**
 (it skips when `build/bin/<tool>` already exists), so it no-ops on top of the CI download. Two fill
-mechanisms — local: copy-installed · CI: verified-download — one destination.
+mechanisms — local: the pinned provisioned copy · CI: a verified download of the same assets (held equal
+to the pin table by `conversionToolPin.test.ts`) — one destination.
 
 Runtime resolution is shared: `engine/electron/main.ts` `resolveBundled(envVar, name)` (only when
 `app.isPackaged`) points `MODOKI_<TOOL>` at `resources/bin/<name>`, appending `.exe` on `win32`.
@@ -50,8 +56,11 @@ Runtime resolution is shared: `engine/electron/main.ts` `resolveBundled(envVar, 
    - Add `'foo'` to the `ToolId` union.
    - Add a `REGISTRY` entry: `envVar: 'MODOKI_FOO'`, `bin: 'foo'`, `versionArgs` (match the tool's real
      flag — `msdf-atlas-gen` uses `['-version']`, not `--version`; verify the exit code is 0), a
-     `missingHint`. Do **not** add it to `INSTALLABLE` (it's bundled, not downloaded).
-   - Give it a `userData`/extraCandidate keyed off `MODOKI_TOOLCHAIN_DIR` only if a dev override is wanted.
+     `missingHint`.
+   - **If its output ships, pin it** (#1327): `pinnedOnly: true`, an `extraCandidates` under
+     `conversionToolchainDir()`, a `CONVERSION_CLI_PINS` entry (`conversionCliProvision.ts`) with a
+     sha256 per `<platform>-<arch>`, and add it to `INSTALLABLE` so dev machines and the stager can
+     provision exactly that build. Bundling alone pins only the packaged editor.
 
 2. **Surface it in Build Support** — `engine/.../editor/panels/BuildSupportDialog.tsx`: add it to a
    `GROUPS` entry (+ a new group label if needed). Grouping is curated — a registered-but-ungrouped tool
@@ -65,11 +74,10 @@ Runtime resolution is shared: `engine/electron/main.ts` `resolveBundled(envVar, 
 4. **Write the stager** — `engine/scripts/stage-foo.cjs` (copy `stage-toktx.cjs` for a single-sibling
    tool, `stage-msdf.cjs` for a full dylib-closure tool). Branch on `context.electronPlatformName`
    (do NOT use a blanket `!== 'darwin'` early-return — that skips Windows):
-   - **`win32`** → `stageFooWin32()`: resolve the INSTALLED binary (`MODOKI_FOO` env → PATH via `where`
-     → the standard install dir, e.g. `%ProgramFiles%\Foo\bin`), copy `foo.exe` (+ any sibling DLL) into
-     `build/bin/`. Make it **idempotent** — skip when `build/bin/foo.exe` already exists (CI pre-stages
+   - **`win32`** → `stageFooWin32()`: resolve the pinned binary (`pinnedToolForStaging('foo')`), copy
+     `foo.exe` (+ any sibling DLL) into `build/bin/`. Make it **idempotent** — skip when `build/bin/foo.exe` already exists (CI pre-stages
      it). Sanity-run the staged copy (mind that some tools print `--version` to stderr on Windows).
-   - **`darwin`** (or undefined) → resolve `MODOKI_FOO` → `which foo` → the standard install path; copy
+   - **`darwin`** (or undefined) → resolve `pinnedToolForStaging('foo')`; copy
      the binary (+ dylib closure) into `build/bin/`, relocate absolute load paths to `@loader_path/<name>`
      (`install_name_tool`), ad-hoc re-sign (`codesign --sign -`), then sanity-run `--version`.
    - **other platforms** → return.
@@ -111,7 +119,7 @@ Runtime resolution is shared: `engine/electron/main.ts` `resolveBundled(envVar, 
 7. **Verify**:
    - macOS: `npm run dist:mac`, mount the DMG, confirm `Contents/Resources/bin/foo` runs and Build Support
      shows it present. (`npm run verify:packaged` covers the mac `--dir` smoke.)
-   - Windows: `npm run dist:win` LOCALLY (bundles the tool you installed) — confirm `foo.exe` lands in
+   - Windows: `npm run dist:win` LOCALLY (bundles the pinned tool) — confirm `foo.exe` lands in
      `release\win-unpacked\resources\bin` and runs; OR, on the PUBLIC repo (`lsgmasa33/modoki-engine`,
      where releases are cut per the `/release-version` runbook), push a `v*` tag / run
      `oss/.github/workflows/release-windows.yml` manually for the CI-downloaded release artifact.
@@ -120,10 +128,10 @@ Runtime resolution is shared: `engine/electron/main.ts` `resolveBundled(envVar, 
 
 ## Current bundled tools (reference)
 
-| Tool | Env var | macOS stager | Windows source (pinned) | Sibling files |
+| Tool | Env var | macOS stager (pinned source) | Windows source (pinned) | Sibling files |
 |---|---|---|---|---|
-| **toktx** (KTX2 encode) | `MODOKI_TOKTX` | `stage-toktx.cjs` (+ `libktx.4.dylib`) | KTX-Software NSIS `.exe`, v4.4.2, 7z-extracted | `ktx.dll` (win), `libktx.4.dylib` (mac) |
-| **msdf-atlas-gen** (MTSDF font atlas) | `MODOKI_MSDF_ATLAS_GEN` | `stage-msdf.cjs` (+ libpng16/libtinyxml2/libfreetype) | Chlumsky win64 `.zip`, v1.4 | none on win (statically linked) |
+| **toktx** (KTX2 encode) | `MODOKI_TOKTX` | `stage-toktx.cjs` — KTX-Software `.pkg` v4.4.2, unpacked | KTX-Software NSIS `.exe`, v4.4.2, 7z-extracted | `ktx.dll` (win), `libktx.4.dylib` (mac) |
+| **msdf-atlas-gen** (MTSDF font atlas) | `MODOKI_MSDF_ATLAS_GEN` | `stage-msdf.cjs` — our static v1.4 build (`build-msdf-atlas-gen-macos.sh`) | Chlumsky win64 `.zip`, v1.4 | none (both statically linked) |
 
 ## Did the playable-ad build add a new bundled tool? — NO (recorded 2026-07-19)
 
@@ -147,8 +155,8 @@ tool, follow the checklist above.
 
 ## Gotchas learned the hard way
 
-- **The stagers branch per-platform — they are NOT "macOS-only."** Each stager stages the tool the build
-  machine has installed on BOTH `darwin` (relocate Homebrew + dylibs) and `win32` (copy the `.exe` + DLL);
+- **The stagers branch per-platform — they are NOT "macOS-only."** Each stager stages the pinned tool on
+  BOTH `darwin` (copy + relocate any dylibs) and `win32` (copy the `.exe` + DLL);
   only `linux`/other return early. A comment claiming "macOS-only" or "Windows unsupported" is stale — this
   exact confusion has misled reviews. (See the `win32` branch note below.)
 - **`versionArgs` are per-tool.** `msdf-atlas-gen` prints its version on `-version` (single dash) and exits
@@ -162,16 +170,12 @@ tool, follow the checklist above.
   manual-install hint. A hard failure would break unrelated dev builds.
 - **Local `dist:win` staging (the `win32` stager branch).** The beforePack stagers now have a
   `win32` branch (`stage-toktx.cjs` `stageToktxWin32`, `stage-msdf.cjs` `stageMsdfWin32`) that mirrors
-  the macOS path: it **copies an INSTALLED tool** off the build machine — `toktx.exe` + its sibling
-  `ktx.dll` (resolved from `MODOKI_TOKTX` → PATH → `%ProgramFiles%\KTX-Software\bin`), and
-  `msdf-atlas-gen.exe` (from `MODOKI_MSDF_ATLAS_GEN` → PATH; single static exe, no siblings). No
-  download / no 7z / no NSIS extraction in the build. So a Windows dev installs the tools ONCE
-  (`winget install KhronosGroup.KTX-Software`; for msdf-atlas-gen, unzip Chlumsky's `-win64.zip` and
-  set `MODOKI_MSDF_ATLAS_GEN`) — exactly symmetric to `brew install …` before `dist:mac`. The macOS
-  code path is untouched (Mac never enters the branch), so this is safe on `main` for both platforms.
+  the macOS path: it **copies the PINNED tool** — `toktx.exe` + its sibling `ktx.dll`, and
+  `msdf-atlas-gen.exe` (single static exe, no siblings) — from `MODOKI_*` or the copy
+  `toolchain:install` provisions (#1327; the KTX installer needs a 7-Zip on the machine to unpack).
   - **Idempotent, so CI is unaffected.** The branch skips when `build/bin/<tool>` already exists.
     `oss/.github/workflows/release-windows.yml` (public repo) still pre-stages via its verified **download** steps (a CI runner has nothing
     installed), and the beforePack branch then no-ops. CI keeps downloading (reproducible, pinned +
-    sha256); a local dev box copies what it installed. Two fill mechanisms, one destination.
-  - Not installed on the dev box → the branch warns + skips (source-texture / install-hint fallback),
-    exactly like a Mac without the Homebrew tool. `build/bin/` is gitignored.
+    sha256); a local dev box copies the same pin from its toolchain dir. Two fill mechanisms, one destination.
+  - Cannot be provisioned on the dev box (offline, no 7-Zip) → the branch warns + skips (source-texture /
+    install-hint fallback), exactly like macOS. `build/bin/` is gitignored.

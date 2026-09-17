@@ -18,44 +18,17 @@ import {
 } from '../packages/modoki/src/runtime/loaders/textureSettings';
 import { getCacheDir, hashKey, cachePathFor, cacheHit } from './texture-cache';
 import { nativeDynamicImport } from './native-dynamic-import';
+import { pinnedConversionCli } from './pinned-cli';
+import { forgetDetection } from '../toolchain';
 
-const KTX_MISSING_MSG =
-  'KTX-Software CLI (toktx) not found. Set MODOKI_TOKTX to the binary path, or install toktx — ' +
-  (process.platform === 'win32'
-    ? 'download the Windows release from https://github.com/KhronosGroup/KTX-Software/releases and put toktx.exe (with ktx.dll) on PATH.'
-    : process.platform === 'darwin'
-      ? 'install the macOS package from https://github.com/KhronosGroup/KTX-Software/releases (toktx + ktx land in /usr/local/bin).'
-      : 'install the Linux package from https://github.com/KhronosGroup/KTX-Software/releases (or your distro package).');
+/** For tests — forget the cached toktx detection. */
+export function __resetKtxCheck(): void { forgetDetection('toktx'); }
 
-let ktxCheck: { ok: boolean; cli: string } | null = null;
-
-/** Resolve the toktx binary: an explicit MODOKI_TOKTX path (the packaged Electron
- *  editor points this at the bundled binary — ELECTRON_PLAN Phase 3) wins, else
- *  the bare `toktx` name resolved via PATH (dev). */
-function toktxBinary(): string {
-  return process.env.MODOKI_TOKTX || 'toktx';
-}
-
-/** For tests — forget the cached CLI-availability probe. */
-export function __resetKtxCheck(): void { ktxCheck = null; }
-
-/** Ensure `toktx` is callable; returns the CLI path/name or throws with an install hint. */
+/** The pinned `toktx` (#1327) — the packaged editor's bundled copy, the provisioned one under the
+ *  toolchain dir, or an explicit MODOKI_TOKTX — or throws with an install hint. Never PATH: a KTX2
+ *  variant ships what this binary wrote, and its cache key does not name the binary. */
 export function ensureKtxCli(): string {
-  const cli = toktxBinary();
-  // The cache keys on availability, not the resolved name; a changed MODOKI_TOKTX
-  // across calls in one process is not expected. Re-probe if the name changed.
-  if (ktxCheck && ktxCheck.cli === cli) {
-    if (!ktxCheck.ok) throw new Error(KTX_MISSING_MSG);
-    return ktxCheck.cli;
-  }
-  try {
-    execFileSync(cli, ['--version'], { stdio: 'pipe' });
-    ktxCheck = { ok: true, cli };
-    return cli;
-  } catch {
-    ktxCheck = { ok: false, cli };
-    throw new Error(KTX_MISSING_MSG);
-  }
+  return pinnedConversionCli('toktx');
 }
 
 type KtxVariant = Extract<TextureVariant, 'uastc' | 'etc1s' | 'astc'>;

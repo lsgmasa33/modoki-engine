@@ -197,13 +197,12 @@ jobs:
   # is off so electron-builder does not go hunting for a keychain identity and fail the job on its
   # absence.
   #
-  # ⚠️ These artifacts are NOT shippable, and not only because they are unsigned. The release
-  # workflows INSTALL toktx + msdf-atlas-gen before packing, because the beforePack stagers
-  # (stage-toktx.cjs / stage-msdf.cjs) copy whatever is on the build machine into
-  # Resources/bin — and when the tools are absent they degrade SILENTLY (log + skip). These jobs
-  # skip those installs to keep a per-push gate cheap, so the app they produce ships toolless:
-  # fine for proving the build, wrong for handing to anyone. Download them to debug packaging,
-  # never to distribute.
+  # ⚠️ These artifacts are NOT shippable, and not only because they are unsigned. The beforePack
+  # stagers (stage-toktx.cjs / stage-msdf.cjs) provision the pinned toktx + msdf-atlas-gen
+  # themselves (#1327), but degrade SILENTLY (log + skip) when that fails — the release workflows
+  # provision in a step of their own so a failure stops them, and these jobs do not. So the app
+  # here may ship toolless: fine for proving the build, wrong for handing to anyone. Download them
+  # to debug packaging, never to distribute.
   #
   # Deliberately NOT wired here: `assert-app-renders.sh`, the render gate. That is #94's job and
   # its own change — a build gate and a render gate fail for different reasons and should be

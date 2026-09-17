@@ -65,7 +65,7 @@ const GROUPS: { title: string; subtitle: string; ids: string[]; adb?: boolean; i
   // also provisions it on its own, so this row is the discoverable path, not the only one.
   { title: 'iOS Build Support', subtitle: 'Build & deploy iOS apps (macOS only)', ids: ['xcodebuild', 'cocoapods', 'go-ios', 'webdriveragent'], iosOnly: true },
   { title: 'Model Tools', subtitle: 'GLB import / KTX2 compression', ids: ['toktx', 'gltf-transform-cli'] },
-  { title: 'Text Tools', subtitle: 'MTSDF font-atlas baking (dynamic / CJK text) — bundled', ids: ['msdf-atlas-gen'] },
+  { title: 'Text Tools', subtitle: 'MTSDF font-atlas baking (dynamic / CJK text) — bundled in the packaged editor', ids: ['msdf-atlas-gen'] },
   { title: 'Audio Tools', subtitle: 'Audio import — auto-installed by the editor', ids: ['ffmpeg', 'ffprobe'] },
   { title: 'Core', subtitle: 'Auto-installed by the editor (Node / npm)', ids: ['npm'] },
 ];
@@ -147,7 +147,7 @@ export default function BuildSupportDialog() {
   // while the onboarding dialog is open (packaged) and the user hasn't opted out;
   // installs the missing tools ONE AT A TIME via the same SSE flow + progress log as
   // the Install button (installTool serializes on `installing`, and each DONE →
-  // refresh() re-runs this effect for the next tool). toktx is bundled and the MOBILE
+  // refresh() re-runs this effect for the next tool). toktx/msdf-atlas-gen are bundled here (packaged) and the MOBILE
   // modules (Android/iOS) stay opt-in — everything ELSE auto-installs. A tool that
   // fails isn't retried in a loop (autoInstalledRef).
   useEffect(() => {

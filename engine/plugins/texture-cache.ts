@@ -20,7 +20,8 @@ import {
 
 /** Bump when encoder flags / the converter pipeline change so stale cache
  *  entries are invalidated automatically. */
-export const ENCODER_VERSION = 'tex-2'; // tex-2: snap dimensions to multiple of 4
+// tex-3: the pinned toktx (#1327) — evicts entries an unpinned build converted under the same key.
+export const ENCODER_VERSION = 'tex-3'; // tex-2: snap dimensions to multiple of 4
 
 export function getCacheDir(projectRoot: string): string {
   return path.join(projectRoot, '.cache', 'modoki-textures');

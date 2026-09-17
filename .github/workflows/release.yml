@@ -66,37 +66,18 @@ jobs:
           echo "Setting version to $VERSION"
           npm version --no-git-tag-version --allow-same-version "$VERSION"
 
-      # ── Stage native import tools BEFORE the build (parity with Windows) ────────
-      # The beforePack stagers (stage-toktx.cjs / stage-msdf.cjs) copy whatever is
-      # INSTALLED on the build machine into build/bin → Contents/Resources/bin, then
-      # electron-builder signs them. The macOS CI runner ships neither tool, so
-      # without these installs both stagers degrade SILENTLY (log + skip) and the DMG
-      # ships toolless — exactly the regression this fixes. Unlike Windows (a plain
-      # binary copy), macOS RELIES on the stagers to relocate the dylib closure + fix
-      # load paths, so here we INSTALL to the canonical locations the stagers look up
-      # (toktx → /usr/local via the KTX pkg; msdf-atlas-gen → /opt/homebrew via brew)
-      # and let the existing, tested stagers do the relocation + re-signing.
-      - name: Install toktx (KTX-Software) for bundling
-        run: |
-          set -euo pipefail
-          KTX_VER=4.4.2
-          # sha256 of KTX-Software-${KTX_VER}-Darwin-arm64.pkg (GitHub release digest).
-          KTX_SHA=500bd8f9d63358c3f3a0d83b724c8574436a72c37dc0e4bad90ec1ca38032c3c
-          url="https://github.com/KhronosGroup/KTX-Software/releases/download/v${KTX_VER}/KTX-Software-${KTX_VER}-Darwin-arm64.pkg"
-          curl -fsSL "$url" -o ktx.pkg
-          echo "${KTX_SHA}  ktx.pkg" | shasum -a 256 -c -
-          sudo installer -pkg ktx.pkg -target /
-          rm -f ktx.pkg
-          /usr/local/bin/toktx --version
-
-      - name: Install msdf-atlas-gen for bundling
-        run: |
-          set -euo pipefail
-          # GitHub runners ship Homebrew with auto-update disabled + a frozen formula
-          # index, so a fresh formula can 404 ("No available formula"). Refresh first.
-          brew update
-          brew install msdf-atlas-gen
-          msdf-atlas-gen -version
+      # ── Provision the PINNED native import tools BEFORE the build (#1327) ─────────
+      # The beforePack stagers (stage-toktx.cjs / stage-msdf.cjs) bundle toktx and
+      # msdf-atlas-gen into build/bin → Contents/Resources/bin, then electron-builder
+      # signs them. They bundle ONLY the pinned builds (engine/toolchain/
+      # conversionCliProvision.ts: KhronosGroup's sha256-checked .pkg, unpacked without
+      # installing; our own statically linked msdf-atlas-gen) — the same bytes every dev
+      # machine converts with. This used to install msdf-atlas-gen through Homebrew, which compiled
+      # it on the runner against whatever Homebrew had that day. Provisioning HERE (the
+      # stagers would install on their own) makes a download failure fail the release
+      # instead of degrading to a toolless DMG — the stagers skip gracefully.
+      - name: Provision pinned toktx + msdf-atlas-gen for bundling
+        run: npm run toolchain:install -- toktx msdf-atlas-gen
 
       - name: Import signing cert + G2 intermediate into a temp keychain
         env:
@@ -180,7 +161,7 @@ jobs:
             fi
           done
           if [ "$missing" -ne 0 ]; then
-            echo "::error::Bundled tool(s) missing from Resources/bin — an Install/Stage step likely failed (see the 'Install toktx' / 'Install msdf-atlas-gen' logs above). Refusing to ship a toolless DMG."
+            echo "::error::Bundled tool(s) missing from Resources/bin — the provision or stage step likely failed (see the 'Provision pinned toktx + msdf-atlas-gen' and beforePack logs above). Refusing to ship a toolless DMG."
             exit 1
           fi
           set -e

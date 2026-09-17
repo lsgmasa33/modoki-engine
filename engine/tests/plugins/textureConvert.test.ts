@@ -1,15 +1,9 @@
-/** Texture conversion tests — exact toktx flag vectors per format + the
- *  missing-CLI error. execFileSync is mocked so the CLI check is deterministic
- *  regardless of whether KTX-Software is installed on the test machine. */
+/** Texture conversion tests — exact toktx flag vectors per format. The missing-CLI
+ *  error is covered with a sandboxed toolchain in conversionToolPin.test.ts (#1327). */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 
-vi.mock('child_process', () => {
-  const execFileSync = vi.fn(() => { throw new Error('command not found'); });
-  return { execFileSync, default: { execFileSync } };
-});
-
-import { buildToktxArgs, ensureKtxCli, __resetKtxCheck } from '../../plugins/texture-convert';
+import { buildToktxArgs } from '../../plugins/texture-convert';
 import { DEFAULT_TEXTURE_SETTINGS } from '../../packages/modoki/src/runtime/loaders/textureSettings';
 
 describe('buildToktxArgs', () => {
@@ -57,12 +51,5 @@ describe('buildToktxArgs', () => {
     const args = buildToktxArgs('uastc', { ...DEFAULT_TEXTURE_SETTINGS, uastcRdoLambda: 0 }, 'i', 'o');
     expect(args).not.toContain('--uastc_rdo_l');
     expect(args).toContain('--uastc'); // still UASTC-encoded
-  });
-});
-
-describe('ensureKtxCli', () => {
-  it('throws a clear install hint when the CLI is absent', () => {
-    __resetKtxCheck();
-    expect(() => ensureKtxCli()).toThrow(/KTX-Software/);
   });
 });
