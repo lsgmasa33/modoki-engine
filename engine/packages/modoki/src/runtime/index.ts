@@ -714,6 +714,15 @@ export {
   type LoginBonusClaim, type LoginBonusPayout, type LoginBonusPolicy, type LoginBonusSegment,
   type LoginBonusSegmentId, type LoginBonusSubstitution, type LoginBonusVerdict,
 } from './core/loginBonus';
+export {
+  createAdLifecycle,
+  type AdEventSink, type AdLifecycle, type AdLifecycleHooks, type AdLifecycleOptions, type AdListenerHandle,
+  type AdRevenue, type AdReward, type AdSdk, type FullscreenKind, type RewardHandler,
+} from './core/adLifecycle';
+export {
+  mayShowInterstitial,
+  type InterstitialContext, type InterstitialPolicy, type InterstitialVerdict, type InterstitialWithheld,
+} from './core/adPacing';
 export { stepSimulation, type StepOptions } from './core/stepSimulation';
 export { seedRng, rngNext, rngFloat, rngInt, rngBool, rngPick } from './core/rng';
 export {

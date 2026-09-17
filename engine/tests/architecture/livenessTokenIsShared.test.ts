@@ -119,8 +119,8 @@ const KNOWN_OUTSIDE_SCAN_DIRS: readonly string[] = [
   // `if (epoch !== payoutEpoch) return` around an await (Court `systems.ts`'s `settleSolvePayout`), and the file's
   // own comment already calls it a banner. Three separate counters in one file.
   'games/court/runtime/systems.ts :: payoutEpoch, bonusSpinEpoch',
-  // REAL — ad-hoc init/fullscreen-ad epochs in the shared app-services package.
-  'games/court/packages/app-services/src/ads.ts :: initEpoch, fullscreenAdGen',
+  // REAL — an ad-hoc init epoch in 3d-test's app-services. (Court's pair left with its MAX `ads.ts` in
+  // #1312: the lifecycle it moved to uses the shared token.)
   'games/3d-test/packages/app-services/src/ads.ts :: initEpoch',
   // REAL — an IAP epoch guarding an awaited purchase flow.
   'games/wordweave/runtime/systems.ts :: iapEpoch',

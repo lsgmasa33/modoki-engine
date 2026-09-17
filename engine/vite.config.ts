@@ -519,13 +519,15 @@ export default defineConfig(({ command }) => {
         // helper by its narrow subpath rather than through the barrel.
         '@modoki/engine/runtime/core/liveness',
         '@modoki/engine/runtime/core/notifyListeners',
-        // #1309 — wordweave's ad lifecycle bounds its native banner calls with the shared timeout helper.
-        '@modoki/engine/runtime/core/abandonment',
         // #928 — Court's (and wordweave's) daily modules import the pure calendar model by its narrow
         // subpath, so they stay off the barrel's graph like the formatVersion/liveness imports above.
         '@modoki/engine/runtime/core/dailyCalendar',
         // #926 — Court's and wordweave's login bonus wheels import its pure decisions the same way.
         '@modoki/engine/runtime/core/loginBonus',
+        // #1312 — both games' AdMob adapters import the promoted ad lifecycle, and their pacing
+        // modules the interstitial rules, by narrow subpath.
+        '@modoki/engine/runtime/core/adLifecycle',
+        '@modoki/engine/runtime/core/adPacing',
         '@modoki/engine/runtime/debug',
         '@modoki/engine/editor',
         '@modoki/engine/editor/rendering',

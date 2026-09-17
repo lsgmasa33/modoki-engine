@@ -87,7 +87,7 @@ export const notifications = {
  */
 export const ads = {
   async initAds(): Promise<void> {},
-  // Weaveling's AdMob surface (#1309): the banner as per-frame desired state, a synchronous readiness
+  // The AdMob surface both games export (#1309, #1312): the banner as per-frame desired state, a synchronous readiness
   // read for the "watch a video" button, and UMP's privacy-options row — all "nothing here".
   setBannerVisible(_visible: boolean): void {},
   rewardedReady(): boolean { return false; },
@@ -102,7 +102,6 @@ export const ads = {
   async showInterstitial(_placement: string): Promise<boolean> { return false; },
   async showRewardedAd(_placement: string): Promise<boolean> { return false; },
   async isRewardedReady(): Promise<boolean> { return false; },
-  async showAdDebugger(): Promise<void> {},
 };
 
 /**

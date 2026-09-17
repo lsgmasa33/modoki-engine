@@ -207,7 +207,7 @@ const insideScanDirs = (rel: string): boolean =>
  *    GROUPS registered at server start. A throw there is a programming error in a group and must
  *    stop the server loudly: isolating it would start a server with a whole group of tools silently
  *    absent, and a missing tool reads as "not offered", never as broken.
- *  - `games/wordweave/packages/app-services/src/adLifecycle.ts` `init` — the ad SDK's native listeners,
+ *  - `engine/packages/modoki/src/runtime/core/adLifecycle.ts` `init` — the ad SDK's native listeners,
  *    `await`ed one at a time and published only once EVERY registration succeeded (Court #458's
  *    duplicate-revenue-listener fix). A failure unwinds the ones already made; isolating each would
  *    publish a half-registered set.
@@ -229,7 +229,7 @@ const EXEMPT: Readonly<Record<string, ExemptKind>> = {
   'engine/packages/modoki/src/runtime/scene/SceneManager.ts :: hook': 'async-sequential',
   'engine/packages/modoki/src/editor/undo/compositeAction.ts :: step': 'async-sequential',
   'engine/tools/modoki-mcp/src/registerAll.ts :: register': 'registration',
-  'games/wordweave/packages/app-services/src/adLifecycle.ts :: register': 'registration',
+  'engine/packages/modoki/src/runtime/core/adLifecycle.ts :: register': 'registration',
 };
 const EXEMPT_ROWS: readonly string[] = Object.keys(EXEMPT);
 
