@@ -815,7 +815,7 @@ const DECLS: Record<string, Decl> = {
     kind: 'asset', method: 'POST', route: '/api/duplicate-asset',
     mutating: true, persists: 'file', requires: ['project'], aim: 'asset',
     minimalArgs: { from: '/assets/particles/probe.particle.json', to: '/assets/particles/probe-copy.particle.json' },
-    notes: "Not a file copy: it MINTS a fresh guid for the duplicate, because two assets sharing one guid breaks every ref that resolves through the manifest. Refuses an existing destination (409) rather than clobbering. Also refuses with REQUIRES_SAVE while the SOURCE has a parked Inspector import-settings edit (#882) — the copy's sidecar is seeded from the source's FILE, so it would be born with the pre-edit settings. Hatch is `force`: nothing is destroyed, the copy is merely built from disk.",
+    notes: "Not a file copy: it MINTS a fresh guid for the duplicate, because two assets sharing one guid breaks every ref that resolves through the manifest. A scene copy also remints every entity guid the file defines, carrying its in-file refs along (#1293). Refuses an existing destination (409) rather than clobbering. Also refuses with REQUIRES_SAVE while the SOURCE has a parked Inspector import-settings edit (#882) — the copy's sidecar is seeded from the source's FILE, so it would be born with the pre-edit settings. Hatch is `force`: nothing is destroyed, the copy is merely built from disk.",
   },
   modoki_move_asset: {
     kind: 'asset', method: 'POST', route: '/api/move-file',

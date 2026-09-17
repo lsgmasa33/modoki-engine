@@ -13,6 +13,7 @@ import path from 'path';
 import { execFileSync } from 'child_process';
 import { randomUUID } from 'crypto';
 import { writeMetaSidecar, CORRUPT_SIDECAR_SUFFIX } from './meta-sidecar';
+import { durableGuid } from '../packages/modoki/src/runtime/core/assetRefRules';
 // The ONE subtree pre-flight (#883/#990/#989/#1004) — see engine/scripts/deleteBoundary.mjs. Used
 // only by the Linux `rmSync` fallback in `moveToTrash`; the darwin/win32 paths hand the delete to
 // the OS trash, which moves rather than unlinks and so cannot orphan a link's payload.
@@ -352,6 +353,77 @@ export function moveToTrash(
   }
 }
 
+/** Give every entity a scene file DEFINES a fresh guid, and carry every reference to it along
+ *  (#1293) — the file-level twin of `regenerateSnapshotGuids`, which already does this for a
+ *  subtree duplicated inside one scene. A copied scene is its own content, so it gets its own
+ *  identities.
+ *
+ *  **What "defines" means — three places, not one.** An ordinary row keeps its guid in
+ *  `traits.EntityAttributes.guid`, but a prefab-instance ROOT keeps it on the row itself
+ *  (`entry.guid`), and an instance's structural adds keep theirs on each `added[]` node (recursing
+ *  through `children` and a nested reference node's `added`). Collecting only the first is what
+ *  the scaffolder does, and on a scene with instances it would leave every root shared.
+ *
+ *  **What follows the remap: every string VALUE equal to a defined guid**, wherever it sits —
+ *  `parentId`, `PrefabInstance.rootInstanceId`, every registry `entityRef` field (including a
+ *  game's own) and `UIAction.bindings[].target`. A walk rather than a field list, so a newly
+ *  registered entityRef field is covered with nothing to keep in sync; the scaffolder's whole-text
+ *  substitution is the same idea. Every committed entity guid is a UUID, so an exact-value match
+ *  cannot hit a name.
+ *
+ *  **What deliberately does NOT follow:** a guid the file references but does not define — a
+ *  level's ref into its BASE scene keeps pointing at the base. Prefab MEMBER guids are not stored
+ *  (`deriveInstanceMemberGuids` derives them from the root on load), so the MEMBERS re-derive from
+ *  the new root on their own; override keys are localIds, never guids.
+ *
+ *  ⚠️ **Known gap: a stored REFERENCE to a prefab member does not follow.** A member's guid is
+ *  `deriveGuid(anchor|path)`, so a ref holding it (a `UIAction` target, an `entityRef` into an
+ *  instance) keeps the old anchor's value while the member re-derives from the new one — the ref
+ *  dangles in the copy. Following it needs the member paths, i.e. expanding the prefab chain here,
+ *  which nothing on the Node side does. No committed scene holds such a ref (0 of 56); tracked
+ *  separately in #1324 — see docs/scene-loading.md.
+ *
+ *  ⚠️ **Accepted cost (owner ruling, #1293):** a `Persistent` entity in the copy no longer matches
+ *  its original by guid, so `filterPersistentDuplicates` stops treating the two as one. */
+export function remintSceneEntityGuids(
+  scene: Record<string, unknown>,
+  genGuid: () => string = randomUUID,
+): Record<string, unknown> {
+  const remap = new Map<string, string>();
+  const define = (g: unknown): void => {
+    // durableGuid: a stale RUNTIME guid (#1210) is no identity — the loader derives a distinct one
+    // per row. Minting one durable guid for it would turn two such rows into a same-file collision.
+    const d = typeof g === 'string' ? durableGuid(g) : '';
+    if (d && !remap.has(d)) remap.set(d, genGuid());
+  };
+  type Row = { guid?: unknown; traits?: { EntityAttributes?: { guid?: unknown } }; children?: unknown; added?: unknown };
+  const visit = (rows: unknown): void => {
+    if (!Array.isArray(rows)) return;
+    for (const row of rows as Row[]) {
+      if (!row || typeof row !== 'object') continue;
+      define(row.guid);
+      define(row.traits?.EntityAttributes?.guid);
+      visit(row.children);
+      visit(row.added);
+    }
+  };
+  visit(scene.entities);
+  if (remap.size === 0) return scene;
+  const rewrite = (v: unknown): unknown => {
+    if (typeof v === 'string') return remap.get(v) ?? v;
+    if (Array.isArray(v)) return v.map(rewrite);
+    if (v && typeof v === 'object') {
+      // Null prototype: a parsed document can carry an own `__proto__` key, which a plain `{}`
+      // would turn into a prototype assignment instead of a copied field.
+      const out: Record<string, unknown> = Object.create(null);
+      for (const [k, child] of Object.entries(v)) out[k] = rewrite(child);
+      return out;
+    }
+    return v;
+  };
+  return rewrite(scene) as Record<string, unknown>;
+}
+
 /** Copy an asset to a new path with a freshly-generated GUID so the duplicate
  *  doesn't collide with the original in the manifest. JSON assets carry their
  *  id inline (rewritten); binary assets get a copied `.meta.json` sidecar with
@@ -372,10 +444,13 @@ export function duplicateAssetFile(
   const ext = path.extname(absFrom).toLowerCase();
   if (ext === '.json') {
     // JSON asset: copy + rewrite top-level id
-    const txt = fs.readFileSync(absFrom, 'utf-8');
+    // A UTF-8 BOM makes JSON.parse throw, and the verbatim fallback below then leaves the copy with
+    // the ORIGINAL's asset id — two assets claiming one guid (#1293 review). Parse past it.
+    const txt = fs.readFileSync(absFrom, 'utf-8').replace(/^\uFEFF/, '');
     let json: Record<string, unknown>;
     try { json = JSON.parse(txt); } catch { fs.copyFileSync(absFrom, absTo); return null; }
     json.id = newGuid;
+    if (absFrom.toLowerCase().endsWith('.scene.json')) json = remintSceneEntityGuids(json, genGuid);
     // Bytes from the one definition (#831) — a copied asset must not be born without the trailing
     // newline every committed asset doc has, or its first edit shows a spurious
     // `\ No newline at end of file` on a line nobody touched.

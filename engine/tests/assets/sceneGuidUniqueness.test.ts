@@ -18,7 +18,9 @@
  *     "Play Buton" in the sibling `2D Animation.scene.json`, both misspelled the same way.
  *
  *  ⚠️ SCOPE, and this is the load-bearing half: the guard is deliberately PER FILE, not
- *  repo-wide. Sharing a guid ACROSS scenes is normal here and is not a defect —
+ *  repo-wide. Sharing a guid ACROSS scenes exists here and is not a defect — it is LEGACY
+ *  (a scene-file duplicate copied guids verbatim until #1293; a new duplicate remints them),
+ *  and some of it is load-bearing —
  *  `games/sling`'s Lvl-0001/Lvl-0002 are level variants of the same authored entities,
  *  `games/space-console`'s three scenes share one UI shell, and the `Persistent`
  *  carry-across-swap mechanism REQUIRES both scene files to name the entity by the same

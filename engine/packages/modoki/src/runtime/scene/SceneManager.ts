@@ -1788,6 +1788,9 @@ export function filterPersistentDuplicates(
  *  loaded scenes, and two live entities answering to the same guid means an
  *  arbitrary winner for every `findEntityByGuid` lookup.
  *
+ *  Since #1293 a scene-file duplicate REMINTS its entity guids, so a newly duplicated level no
+ *  longer trips this. It stays for the files duplicated before that, which still share guids.
+ *
  *  Called once per `toLoadRefs` entry, in chain order (root-most base first,
  *  primary last) — `seenGuids` accumulates across calls, so the FIRST scene to
  *  spawn a guid keeps it and every later collision is warned about and dropped

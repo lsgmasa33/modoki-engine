@@ -1152,12 +1152,30 @@ it has already sent one sweep in the wrong direction (2026-08-18):
   and `filterDuplicateChainGuids` compare a scene against something ELSE already loaded (a carried
   entity, an earlier chain scene), so a collision *inside* one file passes straight through and
   both entities spawn. Guarded by `engine/tests/assets/sceneGuidUniqueness.test.ts`.
-- **Across scene files, sharing a guid is NORMAL and is sometimes required.** A sweep of the 54
+- **Across scene files, sharing a guid is LEGACY — and sometimes load-bearing.** A sweep of the 54
   committed scenes found ~80 shared guids and only two same-file collisions. `games/sling`'s
   `Lvl-0001`/`Lvl-0002` are variants of the same authored entities; `games/space-console`'s three
   scenes share one UI shell; and the `Persistent` carry-across-swap mechanism **depends** on both
   scene files naming the entity by the same guid — that is precisely how `filterPersistentDuplicates`
   recognises the carried entity and drops the scene's copy.
+- **Duplicating a scene FILE no longer creates new sharing (#1293).** Those shares exist because a
+  file duplicate used to copy every entity guid verbatim. `duplicateAssetFile` now remints every guid
+  the copy DEFINES — `EntityAttributes.guid`, a prefab-instance root's row-level `guid`, and each
+  `added[]` node — and rewrites every in-file string value equal to one of them (`parentId`,
+  `rootInstanceId`, every `entityRef` field, `UIAction.bindings[].target`). A ref to a guid the file
+  does not define (its base scene) is kept. Owner ruling: always remint, no "duplicate as variant"
+  opt-out — the same rule `regenerateSnapshotGuids` already applies to a subtree duplicated inside a
+  scene. **The accepted cost:** a `Persistent` entity in the copy no longer matches its original, so
+  swapping between the two files spawns it twice. Existing files were deliberately left as they are
+  — `qa/cases/**`, `demos/postfx-demo` and Court's tests pin their guids (and postfx-demo's code
+  looks entities up by literal guid, so a DUPLICATE of one of its scenes loses those lookups).
+  ⚠️ **Known gap — a stored ref to a prefab MEMBER does not follow.** Members are not stored; they
+  derive `deriveGuid(anchor|path)` from the (now reminted) instance root on load, so the members
+  themselves are fine, but a ref that held a member's derived guid keeps the OLD anchor's value and
+  dangles in the copy. Following it needs the member paths — expanding the prefab chain on the Node
+  side, which nothing there does today. 0 of 56 committed scenes hold such a ref. Tracked in #1324.
+  A stale runtime guid (#1210) is not reminted (it is no identity), and a BOM-prefixed file is
+  parsed past its BOM rather than copied verbatim under the original's asset id.
 
 So a repo-wide uniqueness check would fail on the architecture rather than find a bug. The honest
 cross-file signal is "same guid, *different* entity name", which is too weak to gate a build on: an
@@ -1224,8 +1242,9 @@ on its own — it keys entities on `EntityAttributes.guid ?? 'name:'+name`, so a
 guid changes key and reports as LOST + NEW, which would bury a real defect in 34 files of noise.
 That review was done by comparing each file against `HEAD` field by field instead.
 
-**Still open:** duplicating or renaming a scene FILE (#1293) — a duplicate copies the entity guids
-verbatim, and a rename changes the seed for any entry not yet migrated.
+**Duplicating a scene FILE remints its guids (#1293)** — see "Guid uniqueness is a PER-FILE rule"
+above. A **rename** needs nothing: a stored guid does not depend on the file name, and the path seed
+above reaches only an entry not yet migrated, of which the committed corpus now has none.
 
 ### Gotchas
 

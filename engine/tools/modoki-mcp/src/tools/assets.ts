@@ -497,7 +497,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
     'Copy an asset to a new path, MINTING A FRESH GUID for the copy (returned as `guid`) — which '
     + 'is why this is not a file copy: a byte-for-byte duplicate would carry the original\'s guid '
     + 'and two assets claiming one guid breaks every ref that resolves through the manifest. Use it '
-    + 'to fork a material/prefab/particle as a starting point. REFUSES rather than clobbering: a '
+    + 'to fork a material/prefab/particle as a starting point. A SCENE copy also gets fresh ENTITY guids, with its own internal refs following (refs into other scenes are kept). REFUSES rather than clobbering: a '
     + 'destination that already exists is a 409. Verify with modoki_list_assets — the manifest is rebuilt before the reply (`manifestRebuilt`).\n\n'
     + '⚠️ The copy\'s .meta.json import settings are seeded from the SOURCE\'S FILE, so this refuses '
     + '(REQUIRES_SAVE) while the source has a parked Inspector import-settings edit — the copy '

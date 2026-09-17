@@ -129,6 +129,126 @@ describe('duplicateAssetFile', () => {
     expect(meta.texture).toEqual({ maxSize: 1024 }); // other settings preserved
   });
 
+  describe('a duplicated SCENE gets its own entity guids (#1293)', () => {
+    // Real scene shape: flat rows, parentId as a guid, a prefab-instance ROOT whose guid sits on the
+    // row (not in EntityAttributes), a structural add with its own guid and a nested add under it,
+    // two in-file refs (an entityRef field and a UIAction binding), and one ref to a guid this file
+    // does NOT define (an entity in its base scene), which must be left alone.
+    const P = 'p0000000-0000-4000-8000-000000000001';      // parent
+    const C = 'c0000000-0000-4000-8000-000000000002';      // child of P
+    const R = 'r0000000-0000-4000-8000-000000000003';      // prefab-instance root (row-level guid)
+    const A = 'a0000000-0000-4000-8000-000000000004';      // added[] node
+    const N = 'n0000000-0000-4000-8000-000000000005';      // nested add under A
+    const BASE = 'b0000000-0000-4000-8000-000000000006';   // defined in the BASE scene, not here
+    const scene = {
+      id: 'scene-orig', version: 11, baseScene: 'base-scene-asset',
+      entities: [
+        { id: 1, traits: { EntityAttributes: { name: 'Parent', guid: P, parentId: '' } } },
+        {
+          id: 2,
+          traits: {
+            EntityAttributes: { name: 'Child', guid: C, parentId: P },
+            UINavigation: { navUp: P, navDown: BASE },
+            UIAction: { bindings: [{ target: C, action: 'press' }] },
+          },
+        },
+        {
+          id: 3, prefab: 'prefab-asset', guid: R,
+          traits: { PrefabInstance: { source: 'prefab-asset', localId: 1, rootInstanceId: R } },
+          added: [{
+            parentLocalId: 1, guid: A, name: 'Extra', traits: {},
+            children: [{ parentLocalId: 0, guid: N, name: 'Deep', traits: {}, children: [] }],
+          }],
+        },
+      ],
+    };
+    let n = 0;
+    const gen = () => `NEW-${n++}`;
+    const dup = () => {
+      write('lvl.scene.json', JSON.stringify(scene));
+      duplicateAssetFile(abs('lvl.scene.json'), abs('lvl copy.scene.json'), gen);
+      return JSON.parse(read('lvl copy.scene.json'));
+    };
+    beforeEach(() => { n = 0; });
+
+    it('every guid the file defines is fresh and distinct — including the instance root and added nodes', () => {
+      const copy = dup();
+      const [parent, child, inst] = copy.entities;
+      const minted = [
+        parent.traits.EntityAttributes.guid, child.traits.EntityAttributes.guid,
+        inst.guid, inst.added[0].guid, inst.added[0].children[0].guid,
+      ];
+      expect(new Set(minted).size).toBe(5);
+      for (const g of minted) expect(g).toMatch(/^NEW-/);
+      expect(copy.id).toMatch(/^NEW-/);
+      expect(minted).not.toContain(copy.id);
+    });
+
+    it('in-file references follow their entity: parentId, rootInstanceId, an entityRef field, a UIAction binding', () => {
+      const copy = dup();
+      const [parent, child, inst] = copy.entities;
+      // Equality alone passes when NOTHING is reminted (both sides still the old guid) — pin that
+      // the ref moved off the original, so this test fails on its own when only the refs are missed.
+      for (const ref of [child.traits.EntityAttributes.parentId, child.traits.UINavigation.navUp,
+        child.traits.UIAction.bindings[0].target, inst.traits.PrefabInstance.rootInstanceId]) {
+        expect(ref).toMatch(/^NEW-/);
+      }
+      expect(child.traits.EntityAttributes.parentId).toBe(parent.traits.EntityAttributes.guid);
+      expect(child.traits.UINavigation.navUp).toBe(parent.traits.EntityAttributes.guid);
+      expect(child.traits.UIAction.bindings[0].target).toBe(child.traits.EntityAttributes.guid);
+      expect(inst.traits.PrefabInstance.rootInstanceId).toBe(inst.guid);
+    });
+
+    it('a reference to a guid the file does NOT define is left alone, and asset refs are untouched', () => {
+      const copy = dup();
+      expect(copy.entities[1].traits.UINavigation.navDown).toBe(BASE);
+      expect(copy.baseScene).toBe('base-scene-asset');
+      expect(copy.entities[2].prefab).toBe('prefab-asset');
+      expect(copy.entities[2].traits.PrefabInstance.source).toBe('prefab-asset');
+    });
+
+    it('leaves the original byte-identical', () => {
+      dup();
+      expect(read('lvl.scene.json')).toBe(JSON.stringify(scene));
+    });
+
+    it('a non-scene JSON is not reminted — a prefab keeps whatever guid-shaped values it carries', () => {
+      write('x.prefab.json', JSON.stringify({ id: 'orig', entities: [{ traits: { EntityAttributes: { guid: P } } }] }));
+      duplicateAssetFile(abs('x.prefab.json'), abs('x copy.prefab.json'), () => 'NEW');
+      expect(JSON.parse(read('x copy.prefab.json')).entities[0].traits.EntityAttributes.guid).toBe(P);
+    });
+
+    it('a stale RUNTIME guid is not an identity — two rows sharing one are not collapsed onto one durable guid', () => {
+      // The loader reads a runtime guid as "no guid" and derives a distinct one per row; minting ONE
+      // durable guid for the shared value would make both rows answer to it — a same-file collision.
+      const RT = '00000000-0000-0001-0000-000000000007';
+      write('rt.scene.json', JSON.stringify({ id: 'o', entities: [
+        { id: 1, traits: { EntityAttributes: { name: 'A', guid: RT } } },
+        { id: 2, traits: { EntityAttributes: { name: 'B', guid: RT } } },
+      ] }));
+      duplicateAssetFile(abs('rt.scene.json'), abs('rt copy.scene.json'), gen);
+      const rows = JSON.parse(read('rt copy.scene.json')).entities;
+      expect(rows.map((r: { traits: { EntityAttributes: { guid: string } } }) => r.traits.EntityAttributes.guid)).toEqual([RT, RT]);
+    });
+
+    it('a scene saved with a UTF-8 BOM is still reminted — not copied verbatim under the original asset id', () => {
+      write('bom.scene.json', '﻿' + JSON.stringify(scene));
+      const guid = duplicateAssetFile(abs('bom.scene.json'), abs('bom copy.scene.json'), gen);
+      expect(guid).toMatch(/^NEW-/);
+      const copy = JSON.parse(read('bom copy.scene.json'));
+      expect(copy.id).toBe(guid);
+      expect(copy.entities[0].traits.EntityAttributes.guid).toMatch(/^NEW-/);
+    });
+
+    it('an own __proto__ key in the document is copied as a field, not applied as a prototype', () => {
+      write('p.scene.json', `{"id":"o","entities":[{"id":1,"traits":{"EntityAttributes":{"guid":"${P}"}}}],"__proto__":{"polluted":true}}`);
+      duplicateAssetFile(abs('p.scene.json'), abs('p copy.scene.json'), gen);
+      const text = read('p copy.scene.json');
+      expect(text).toContain('"__proto__"');
+      expect(JSON.parse(text).entities[0].traits.EntityAttributes.guid).toMatch(/^NEW-/);
+    });
+  });
+
   it('binary asset without a sidecar: still mints a sidecar with the new id', () => {
     write('n.png', 'IMG');
     const guid = duplicateAssetFile(abs('n.png'), abs('n copy.png'), () => 'MINTED');
