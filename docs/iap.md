@@ -256,7 +256,7 @@ bootstrap, so a rename is one edit in the Inspector rather than an agent round-t
 `games/iap-test/runtime/`.
 
 ```ts
-const backend = await pickStoreBackend({ useMock, store, products });
+const backend = await pickStoreBackend({ useMock, store, products, storeKinds });
 configureIap({ backend, store: createPrefsDocStore('iap.ledger'), products });
 await reconcile();                    // the recovery pass — every launch, before any Buy button works
 ```
@@ -812,6 +812,24 @@ walkable on the phone with no rebuild.
 - **`before-finish`** — granted and durable, finish withheld, so the store keeps re-delivering.
   Relaunch must credit **exactly once**. The double-credit trap.
 
+**The mock store answers "what do they own?" from the CONSOLE's kinds, not the catalog's (#1219).**
+`MockStoreOptions.storeKinds` records what each product IS in App Store Connect / Play Console, and
+`entitlements()` reads only that. The catalog's `kind` is the game's claim, and a mock that believed
+it could not fail: #1202 declared two consumable-backed products `non-consumable`, a relaunch test on
+the mock passed, and the iPad sandbox returned `[]` for the same purchase. The table is **required
+and checked** — a sellable product with no entry makes the constructor throw (a fallback to the
+catalog would restore the defect for whoever forgot, and a missing id would read as "owns nothing"),
+and an entry the catalog does not sell warns. Each game keeps it keyed by offer SLOT, not product id
+(`COURT_STORE_KINDS`, `WORDWEAVE_STORE_KINDS`, resolved by `shelfStoreKinds`; iap-test's
+`storeKindsFrom`), so the ids stay authored in the scene. ⚠️ **Copy it from the consoles, never from
+the catalog beside it** — its only value is being a second, independent source. Its known weakness,
+accepted by the owner when choosing this over a committed store-records file (2026-09-17): nothing
+else reads it, so nothing else keeps it honest. Slot keying adds a second, deliberate one: an id typed into a
+slot the table already records (a typo, a product the console does not have yet) inherits that slot's
+kind silently, so the mock cannot refuse an id no console holds — the price of keeping ids out of code. iap-test records its two real console products (the
+subscription and `com.modoki.coins100`) by slot; its non-consumable slot names no console product, so
+authoring that id makes the editor's mock refuse to start until the console's kind is written down.
+
 `acknowledge()` is never withheld — risking the player's actual money to test something else is a
 bad trade. The harness has its own tests, which is not ceremony: a silently-inert instrument is
 worse than none, because a device run would then "pass" having interrupted nothing.
@@ -899,6 +917,7 @@ Kept because each is a class, not an incident.
 | A game swap landing during an await could write entitlements into the NEXT game's live `Set` (#434) — `stillActive(c)` was checked before the await but not immediately before the write that followed it | a check that guards the wrong moment |
 | `dispose()` existed and was called, but raced the constructor's own `addListener` round-trip, so the native listener still outlived the swap (#487) | a teardown that cannot see the setup it is undoing |
 | Every purchase failure on iOS reported `"Request Canceled"` — the catch-all rejected with `localizedDescription` alone, discarding the domain, code and underlying error (#499) | **a diagnostic that erases the difference it exists to report** |
+| A game declared two consumable-backed products `non-consumable`; the mock answered `entitlements()` from that declaration, so the relaunch test passed and only the iPad sandbox showed `[]` (#1202, fixed at the mock in #1219) | **a test double that grades its own homework** |
 | A *thrown* `StoreKitError.userCancelled` fell into that same generic arm, so a player who backed out was reported as a failure — and reached `purchase_failed` analytics, which the design says a cancel must never do (#499) | one outcome with two code paths, only one of them handled |
 
 Three shapes recur. **A correct mechanism with a missing consumer** (rows 4, 5) — when touching this

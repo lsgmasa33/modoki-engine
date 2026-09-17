@@ -141,7 +141,7 @@ export {
   type ConfigureIapOptions, type StoreBackend, type StoreCancelled, type IapLedgerStore, type PurchaseVerifier,
   type ProductKind, type IapProduct, type IapProductInfo, type StoreTransaction,
   type PurchaseOutcome, type PurchaseResult, type IapGrant,
-  shelfProductId, sellableShelfOffers, buildShelfCatalog, shelfOfferForProduct, shelfEffectOf,
+  shelfProductId, sellableShelfOffers, buildShelfCatalog, shelfStoreKinds, shelfOfferForProduct, shelfEffectOf,
   visibleShelfOffers, extendPassExpiry, isPassActive, noAdsActive, noAdsRemaining, shelfView, quickBuyView,
   type ShelfOffer, type ShelfEffect, type NoAdsState, type NoAdsRemaining, type ShelfState, type ShelfRefusal,
   type ShelfRowWords, type ShelfRowView, type ShelfNoticeWords, type ShelfInputs, type ShelfView, type QuickBuyView,

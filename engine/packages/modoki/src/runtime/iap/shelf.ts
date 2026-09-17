@@ -123,6 +123,33 @@ export function buildShelfCatalog(
   }));
 }
 
+/**
+ * `MockStoreOptions.storeKinds` for a shelf, from a table keyed by offer KEY (#1219).
+ *
+ * Keyed by key, not product id, on purpose: the id is authored data (a scene/config field, see
+ * `IapProduct`), so a table of ids in code would be a second home for every rename. The key is the
+ * game's own stable name for the slot. Sellable offers only, same filter as `buildShelfCatalog`;
+ * an offer missing from `kindsByKey` is left out, so the mock refuses to start and names its id.
+ */
+export function shelfStoreKinds(
+  offers: readonly ShelfOffer[],
+  kindsByKey: Readonly<Partial<Record<string, ProductKind>>>,
+): Record<string, ProductKind> {
+  const out: Record<string, ProductKind> = {};
+  for (const offer of sellableShelfOffers(offers)) {
+    const kind = Object.hasOwn(kindsByKey, offer.key) ? kindsByKey[offer.key] : undefined;
+    if (kind === undefined) continue;
+    const id = shelfProductId(offer)!;
+    // Two slots authored with one id: the store has ONE product, so two kinds cannot both be true.
+    if (Object.hasOwn(out, id) && out[id] !== kind) {
+      console.warn(`[iap] "${id}" is authored in two slots recorded as different store kinds `
+        + `(${out[id]} / ${kind}) — the store has one product; the later slot's kind is used.`);
+    }
+    out[id] = kind;
+  }
+  return out;
+}
+
 /** Which offer a store product id belongs to, or `null`. A `''` id cannot match a blank offer:
  *  `shelfProductId` answers `null` for one, never `''`. */
 export function shelfOfferForProduct(offers: readonly ShelfOffer[], productId: string): ShelfOffer | null {

@@ -26,7 +26,7 @@
 
 import { Capacitor } from '@capacitor/core';
 import { NoopStoreBackend, type StoreBackend } from './storeBackend';
-import type { IapProduct, IapProductInfo, StoreTransaction } from './types';
+import type { IapProduct, IapProductInfo, ProductKind, StoreTransaction } from './types';
 import {
   classifyFormatVersion,
   isReadable,
@@ -111,8 +111,25 @@ function serialize(doc: MockDoc): Record<string, unknown> {
 
 export interface MockStoreOptions {
   store: MockStoreStore;
-  /** The catalog — the mock needs kinds to answer `entitlements()` the way a real store would. */
+  /** The catalog — what is on sale. Its `kind` is the GAME's claim and is NOT what `entitlements()`
+   *  answers from; see `storeKinds`. */
   products: readonly IapProduct[];
+  /**
+   * What each product IS in App Store Connect / Play Console, keyed by product id — the answer
+   * `entitlements()` gives, independent of the catalog's own `kind` (#1219).
+   *
+   * ⚠️ **Why the catalog's kind cannot be used.** It is the party that can be wrong. #1202 declared
+   * two consumable-backed products `non-consumable`; the mock, answering from that declaration,
+   * reported them as owned after a relaunch, so the test that should have failed passed — and the
+   * sandbox on a real iPad returned `[]` for the same purchase. A second, separately authored
+   * source is what lets a wrong declaration fail a relaunch test instead of grading its own answer.
+   *
+   * **Required, and checked**: every catalog product with a non-blank id must have an entry, or the
+   * constructor throws. A silent fallback to the catalog would restore the defect for every game
+   * that forgot, and an id missing from the table would read as "owns nothing" — green, and wrong
+   * in the same direction as #1202. Real backends ignore it: the store itself is the answer there.
+   */
+  storeKinds: Readonly<Record<string, ProductKind>>;
   /**
    * Initial value for `failFinish` — see the property.
    *
@@ -146,11 +163,13 @@ export class MockStoreBackend implements StoreBackend {
   private doc: MockDoc;
   private readonly store: MockStoreStore;
   private readonly kinds: Map<string, IapProduct>;
+  private readonly storeKinds: ReadonlyMap<string, ProductKind>;
 
   constructor(opts: MockStoreOptions) {
     this.store = opts.store;
     this.doc = parse(opts.store.read());
     this.kinds = new Map(opts.products.map((p) => [p.id, p]));
+    this.storeKinds = checkStoreKinds(opts.products, opts.storeKinds);
     this.failFinish = opts.failFinish ?? false;
     console.warn('[iap] MOCK STORE ACTIVE — purchases are simulated and no money moves. '
       + 'This backend cannot be selected on a device.');
@@ -189,9 +208,10 @@ export class MockStoreBackend implements StoreBackend {
   async entitlements(): Promise<StoreTransaction[]> {
     // A real store reports owned non-consumables and ACTIVE subscriptions, whether or not the app
     // has finished them. Consumables are never entitlements — they are spent, not owned.
+    // The kind is the CONSOLE's (`storeKinds`), never the catalog's — see `MockStoreOptions`.
     return this.doc.paid.filter((t) => {
       if (t.pending) return false;
-      const kind = this.kinds.get(t.productId)?.kind;
+      const kind = this.storeKinds.get(t.productId);
       return kind === 'non-consumable' || kind === 'subscription';
     });
   }
@@ -217,6 +237,34 @@ export class MockStoreBackend implements StoreBackend {
     this.doc = emptyDoc();
     this.persist();
   }
+}
+
+/**
+ * Validate `storeKinds` against the catalog and return it as a map.
+ *
+ * Throws when a sellable product (non-blank id) has no entry — see `MockStoreOptions.storeKinds`
+ * for why that is loud rather than a fallback. `purchase()` refuses ids outside the catalog, so
+ * after this check every paid transaction's id has a console kind. An entry the catalog does not
+ * sell only warns: it is stale, not dangerous.
+ */
+function checkStoreKinds(
+  products: readonly IapProduct[],
+  storeKinds: Readonly<Record<string, ProductKind>> | undefined,
+): ReadonlyMap<string, ProductKind> {
+  // `Object.entries` never walks the prototype, so an id like `constructor` cannot resolve to one.
+  const map = new Map(Object.entries(storeKinds ?? {}));
+  const missing = products.filter((p) => p.id !== '' && !map.has(p.id)).map((p) => p.id);
+  if (missing.length > 0) {
+    throw new Error(`[iap:mock] No store kind for ${missing.map((id) => `"${id}"`).join(', ')}. `
+      + 'Record what App Store Connect / Play Console has each product as in `storeKinds` — the '
+      + "mock answers entitlements() from that, never from the catalog's own kind (#1219).");
+  }
+  const sold = new Set(products.map((p) => p.id));
+  const stale = [...map.keys()].filter((id) => !sold.has(id));
+  if (stale.length > 0) {
+    console.warn(`[iap:mock] storeKinds lists ${stale.map((id) => `"${id}"`).join(', ')}, which the catalog does not sell.`);
+  }
+  return map;
 }
 
 export interface PickStoreBackendOptions extends MockStoreOptions {

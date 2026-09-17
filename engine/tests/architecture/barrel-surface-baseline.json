@@ -1062,6 +1062,7 @@
   "shelfEffectOf",
   "shelfOfferForProduct",
   "shelfProductId",
+  "shelfStoreKinds",
   "shelfView",
   "shouldFireActions",
   "shouldRunSimTier",
