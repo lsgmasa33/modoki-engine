@@ -55,11 +55,17 @@ body {
    there, that class is the editor's GameView only), so style both. `touch-action` is not
    inherited and the canvas is the hit-test target, so it must sit on the canvas itself.
 
-   The same elements also suppress the iOS touch-and-hold magnifier loupe + callout: `body`
+   The same elements also suppress the iOS TOUCH-AND-HOLD magnifier loupe + callout: `body`
    already sets user-select/touch-callout none, but the loupe is only reliably killed when the
    properties sit on the actual touch target (the render canvas + its wrapper), so we repeat
    them here rather than lean on inheritance. Scoped to the game surface, NOT `*` — App.css is
-   shared with the editor, where text fields/inspector still need selection + the callout. */
+   shared with the editor, where text fields/inspector still need selection + the callout.
+
+   ⚠️ These rules do NOT stop the DOUBLE-TAP magnifier, and nothing here can (#1360). That one is
+   WebKit's `UITextInteraction` at the WEB VIEW level, measured raising the loupe while the document
+   selection stays empty on targets already computing `user-select: none`. It is turned off natively,
+   in each project's `MyViewController.swift` — do not add CSS here trying to reach it. Measurement
+   and mechanism: docs/input.md § "The iOS text-selection magnifier". */
 .game-wrapper,
 .game-canvas-wrapper,
 .game-wrapper canvas,

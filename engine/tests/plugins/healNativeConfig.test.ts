@@ -2933,4 +2933,180 @@ describe('healNativeConfig — #370 review findings', () => {
   });
 });
 
+describe('healNativeConfig — iOS web-view text interaction (#1360)', () => {
+  const MVC_TI = ['ios', 'App', 'App', 'MyViewController.swift'];
+  const readTiMvc = () => fs.readFileSync(path.join(root, ...MVC_TI), 'utf8');
+  function scaffoldTiMvc(body: string) {
+    fs.mkdirSync(path.join(root, 'ios', 'App', 'App'), { recursive: true });
+    fs.writeFileSync(path.join(root, ...MVC_TI), body);
+  }
+
+  /** The pre-#1360 generated file — what every project had before this landed. */
+  const PRE_1360_MVC = `import UIKit
+import Capacitor
+
+/// Custom bridge VC so we can register plugins that SPM won't auto-discover.
+class MyViewController: CAPBridgeViewController {
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        // modoki:game-debug-begin — generated from project.config.json (build.debugBuild)
+        let gameDebugPlugin = GameDebugPlugin()
+        bridge?.registerPluginInstance(gameDebugPlugin)
+        // modoki:game-debug-end
+    }
+}
+`;
+
+  it('inserts the override, and the WebKit import it needs, into an existing project', () => {
+    scaffoldTiMvc(PRE_1360_MVC);
+    writeConfig('');
+    const notes = healNativeConfig(root).notes.join(' ');
+    expect(notes).toContain('disabled iOS web-view text interaction');
+
+    const mvc = readTiMvc();
+    expect(mvc).toContain('modoki:text-interaction-begin');
+    expect(mvc).toContain('modoki:text-interaction-end');
+    expect(mvc).toContain('configuration.preferences.isTextInteractionEnabled = false');
+    // WKWebViewConfiguration is WebKit's — without this the target does not compile.
+    expect(mvc).toContain('import WebKit');
+    // At CLASS-BODY scope, not inside viewDidLoad: `webViewConfiguration(for:)` is a method
+    // override, so landing it in the game-debug fence would not compile.
+    expect(mvc).toMatch(/class MyViewController: CAPBridgeViewController \{\n\s*\/\/ modoki:text-interaction-begin/);
+  });
+
+  it('is idempotent — a second heal reports nothing and changes nothing', () => {
+    scaffoldTiMvc(PRE_1360_MVC);
+    writeConfig('');
+    healNativeConfig(root);
+    const afterFirst = readTiMvc();
+
+    const notes = healNativeConfig(root).notes.join(' ');
+    expect(notes).not.toContain('disabled iOS web-view text interaction');
+    expect(readTiMvc(), 'byte-identical on the second run').toBe(afterFirst);
+    // One copy only. A second insert would be a duplicate override — a compile error.
+    expect(afterFirst.match(/modoki:text-interaction-begin/g)).toHaveLength(1);
+  });
+
+  it('rewrites a STALE fenced block rather than appending beside it', () => {
+    scaffoldTiMvc(PRE_1360_MVC.replace(
+      'class MyViewController: CAPBridgeViewController {',
+      `class MyViewController: CAPBridgeViewController {
+    // modoki:text-interaction-begin — generated; see docs/input.md (#1360)
+    // ...some older, wrong body that must not survive...
+    override func somethingStale() -> Int { return 1 }
+    // modoki:text-interaction-end
+`,
+    ));
+    writeConfig('');
+    healNativeConfig(root);
+
+    const mvc = readTiMvc();
+    expect(mvc, 'the stale body is gone, not merely added to').not.toContain('somethingStale');
+    expect(mvc).toContain('configuration.preferences.isTextInteractionEnabled = false');
+    expect(mvc.match(/modoki:text-interaction-begin/g)).toHaveLength(1);
+  });
+
+  it("preserves a project's hand-added code — the reason the block is fenced (games/ota-test)", () => {
+    // ota-test hand-extends this exact file with an OTA boot hook. Whole-file generation would
+    // silently drop it, and the app would boot the wrong bundle with nothing erroring.
+    scaffoldTiMvc(PRE_1360_MVC.replace(
+      '    override func viewDidLoad() {',
+      `    override func instanceDescriptor() -> InstanceDescriptor {
+        OtaBootHook.run(name: otaShellBundleName)
+        return super.instanceDescriptor()
+    }
+
+    override func viewDidLoad() {`,
+    ));
+    writeConfig('');
+    healNativeConfig(root);
+
+    const mvc = readTiMvc();
+    expect(mvc, 'the hand-added OTA boot hook survives').toContain('OtaBootHook.run(name: otaShellBundleName)');
+    expect(mvc).toContain('override func instanceDescriptor() -> InstanceDescriptor');
+    expect(mvc).toContain('configuration.preferences.isTextInteractionEnabled = false');
+  });
+
+  it('reports a note and changes nothing when the file has neither markers nor the class anchor', () => {
+    const handOwned = 'import UIKit\n\n// someone took this file over entirely\nfinal class Whatever {}\n';
+    scaffoldTiMvc(handOwned);
+    writeConfig('');
+    const notes = healNativeConfig(root).notes.join(' ');
+    expect(notes).toContain('no modoki:text-interaction markers and no class anchor');
+    expect(readTiMvc(), 'a hand-owned file is left byte-identical').toBe(handOwned);
+  });
+
+  it('REFUSES a file that already hand-overrides webViewConfiguration, rather than duplicating it', () => {
+    // Inserting beside an existing override is `invalid redeclaration` — and nothing in `verify`
+    // compiles Swift, so it would ship as a green gate and a dead iOS target. Worse, the fence
+    // would then exist, so the heal could never self-repair it.
+    const handOverride = PRE_1360_MVC.replace(
+      '    override func viewDidLoad() {',
+      `    override func webViewConfiguration(for instanceConfiguration: InstanceConfiguration) -> WKWebViewConfiguration {
+        let c = super.webViewConfiguration(for: instanceConfiguration)
+        c.applicationNameForUserAgent = "Custom"
+        return c
+    }
+
+    override func viewDidLoad() {`,
+    );
+    scaffoldTiMvc(handOverride);
+    writeConfig('');
+    const notes = healNativeConfig(root).notes.join(' ');
+    expect(notes).toContain('already hand-overrides webViewConfiguration(for:)');
+
+    const mvc = readTiMvc();
+    expect(mvc, 'left byte-identical rather than made non-compiling').toBe(handOverride);
+    expect(mvc.match(/override func webViewConfiguration/g), 'still exactly one override').toHaveLength(1);
+  });
+
+  it('imports WebKit even when the file has no `import UIKit` anchor', () => {
+    // The class declaration needs only `import Capacitor`, so the UIKit anchor is not guaranteed.
+    // `String.replace` with a non-matching pattern is a SILENT no-op, which would write the block
+    // with no WebKit import: `cannot find type 'WKWebViewConfiguration' in scope`, under a note
+    // saying the fix landed.
+    scaffoldTiMvc(PRE_1360_MVC.replace('import UIKit\n', ''));
+    writeConfig('');
+    healNativeConfig(root);
+
+    const mvc = readTiMvc();
+    expect(mvc).toContain('import WebKit');
+    expect(mvc).toContain('configuration.preferences.isTextInteractionEnabled = false');
+    expect(mvc.match(/import WebKit/g), 'exactly one').toHaveLength(1);
+  });
+
+  it('collapses TWO fenced blocks back to one — the bad-merge state, which is otherwise terminal', () => {
+    // A non-global replace rewrites only the first block, and against an identical block that is a
+    // byte no-op — so no write, NO NOTE, and the duplicate override stays forever while every
+    // assertion in iosTextInteraction.test.ts still passes.
+    scaffoldTiMvc(PRE_1360_MVC);
+    writeConfig('');
+    healNativeConfig(root);
+    const once = readTiMvc();
+
+    // Simulate the merge: a second copy of the whole fenced block.
+    const block = once.slice(once.indexOf('    // modoki:text-interaction-begin'), once.indexOf('    // modoki:text-interaction-end') + '    // modoki:text-interaction-end'.length);
+    expect(block, 'fixture sanity: the block was located').toContain('isTextInteractionEnabled');
+    scaffoldTiMvc(once.replace(block, `${block}\n${block}`));
+    expect(readTiMvc().match(/modoki:text-interaction-begin/g), 'fixture has two').toHaveLength(2);
+
+    const notes = healNativeConfig(root).notes.join(' ');
+    expect(notes, 'and it SAYS it did something — the silent no-op was the defect').toContain('disabled iOS web-view text interaction');
+
+    const mvc = readTiMvc();
+    expect(mvc.match(/modoki:text-interaction-begin/g), 'collapsed to one').toHaveLength(1);
+    expect(mvc.match(/override func webViewConfiguration/g), 'one override, so it compiles').toHaveLength(1);
+  });
+
+  it('runs OUTSIDE the game-debug gate — a project that does not use the bridge still gets it', () => {
+    // The scope claim, and the reason this heal is not nested in `usesGameDebug`: the magnifier is
+    // equally wrong in a project with no debug bridge, and in a release build. `writeGameDebugDep`
+    // is deliberately NOT called here, so `usesGameDebug` is false.
+    scaffoldTiMvc(PRE_1360_MVC);
+    writeConfig('', false);
+    healNativeConfig(root);
+    expect(readTiMvc()).toContain('configuration.preferences.isTextInteractionEnabled = false');
+  });
+});
+
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';

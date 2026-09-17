@@ -31,6 +31,13 @@ import './installConsoleRing'
 // It does NOT reach a module-eval log inside App.tsx's graph (chunking reorders that;
 // device-measured). See ./installDeviceConsoleCapture.ts.
 import './installDeviceConsoleCapture'
+// iOS text-interaction toggle (#1360). A SIDE-EFFECT import, ABOVE `./App.tsx` for the same reason
+// the three above are: the native default disables text interaction (to kill the double-tap
+// selection magnifier over the game), and this is what puts it back while a text field is focused.
+// A statement in this file's body would run after the whole app graph has mounted, so a field
+// focused during boot would be typed into before the listener existed. See
+// ./installTextInteractionToggle.ts and docs/input.md § "The iOS text-selection magnifier".
+import './installTextInteractionToggle'
 import App from './App.tsx'
 import { Capacitor } from '@capacitor/core'
 import { setJournalEnabled, setDebugMenuEnabled, setDebugHandlesEnabled, setUIOverflowCheckEnabled, setTierFrameCapEnabled, setTierCalibrationEnabled, setBootProbeAllowed, readPerfProfile, setProfilerEnabled, saltRuntimeGuidGeneration } from '@modoki/engine/runtime'

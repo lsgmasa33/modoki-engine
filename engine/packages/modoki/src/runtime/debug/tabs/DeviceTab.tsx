@@ -391,14 +391,9 @@ export function DeviceTab() {
   return (
     <div ref={insetHostRef} style={scrollRootStyle(3)}>
       {/* The IP the user types into Modoki's AI panel → Connect a Device. Full-width + wrapping
-          (NOT the truncating row style) so it's never cut off on a narrow device, and selectable.
+          (NOT the truncating row style) so it's never cut off on a narrow device.
           Only present when the game-debug plugin is compiled in; '' means WiFi is down. */}
-      {debugIp !== null && (
-        <div style={ipCalloutStyle}>
-          <span style={{ ...keyStyle, color: '#7a7a9a' }}>Debug connect IP — type this into Modoki</span>
-          <div style={ipValueStyle}>{debugIp || '— (WiFi down)'}</div>
-        </div>
-      )}
+      {debugIp !== null && <IpCallout ip={debugIp} />}
       {/* Backing-resolution A/B — QA control, not gameplay. Flips pixi/three pixelRatioCap
           live via renderSettings + forceResizeAllSurfaces (resizeBus.ts), no rebuild needed. */}
       <div style={sectionStyle}>
@@ -512,11 +507,74 @@ export function DeviceTab() {
   );
 }
 
+/** The debug connect IP, with a Copy button instead of selectable text (#1360).
+ *
+ *  ⚠️ **Do not put `userSelect: 'text'` back on the value.** It used to carry it — this was the
+ *  ONE element in the whole shipped runtime that opted back into text selection — so that the IP
+ *  could be read off the phone by hand. `MyViewController.swift` now turns the web view's text
+ *  interaction off entirely to kill the iOS double-tap selection magnifier over the game (#1360),
+ *  which disables selection app-wide and cannot be re-enabled per element from CSS. Restoring the
+ *  style would not make the value selectable again; it would just be a lie in the stylesheet.
+ *  The button is what replaces it, and it is why turning that switch off was affordable. */
+function IpCallout({ ip }: { ip: string }): React.JSX.Element {
+  // 'idle' | 'copied' | 'unavailable'. A boolean cannot express the third state, and the third
+  // state is the one that matters: this button is now the ONLY route to the IP.
+  const [state, setState] = useState<'idle' | 'copied' | 'unavailable'>('idle');
+  // Keyed on a tick, not on `state`: `setState('copied')` while already 'copied' is a no-op, so a
+  // second tap inside the window would not restart the timer and the label would clear 1.5s after
+  // the FIRST tap.
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    if (state === 'idle') return;
+    const t = setTimeout(() => setState('idle'), 1500);
+    return () => clearTimeout(t);
+  }, [state, tick]);
+
+  const copy = () => {
+    setTick((n) => n + 1);
+    // ⚠️ Branch on PRESENCE before calling. `navigator.clipboard` is secure-context only: Capacitor
+    // serves from one, but a plain-http LAN dev page does not, and there the API is simply ABSENT.
+    // `await navigator.clipboard?.writeText(ip)` would resolve `undefined` and report success with
+    // an untouched clipboard — the `catch` only fires on a genuine rejection, i.e. the one case
+    // absence is NOT. Since the same change removed `userSelect: 'text'` from the value, a false
+    // "Copied" would leave no way at all to get this IP off the device.
+    if (!navigator.clipboard) { setState('unavailable'); return; }
+    void navigator.clipboard.writeText(ip).then(
+      () => setState('copied'),
+      () => setState('unavailable'),
+    );
+  };
+
+  return (
+    <div style={ipCalloutStyle}>
+      <span style={{ ...keyStyle, color: '#7a7a9a' }}>Debug connect IP — type this into Modoki</span>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <div style={ipValueStyle}>{ip || '— (WiFi down)'}</div>
+        {ip !== '' && (
+          <button
+            onClick={copy}
+            title={state === 'unavailable' ? 'The clipboard API needs a secure context (https or the native app) — read the IP off the screen instead.' : undefined}
+            style={{
+              fontSize: 11, padding: '2px 8px', borderRadius: 4, flexShrink: 0,
+              border: `1px solid ${state === 'unavailable' ? '#8a4a2d' : '#2d5a8a'}`, background: 'transparent',
+              color: state === 'copied' ? '#7ec8ff' : state === 'unavailable' ? '#d89a7e' : '#8b8ba7',
+              cursor: 'pointer', whiteSpace: 'nowrap',
+            }}
+          >
+            {state === 'copied' ? 'Copied' : state === 'unavailable' ? 'No clipboard' : 'Copy'}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 const rowStyle: CSSProperties = { display: 'flex', justifyContent: 'space-between', gap: 8, fontSize: 12 };
 const keyStyle: CSSProperties = { color: '#8b8ba7', flexShrink: 0 };
 const valStyle: CSSProperties = { color: '#e6e6ff', fontVariantNumeric: 'tabular-nums', textAlign: 'right', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' };
 const uaStyle: CSSProperties = { color: '#8b8ba7', fontSize: 10, fontFamily: 'ui-monospace, monospace', wordBreak: 'break-all', lineHeight: 1.4 };
 const ipCalloutStyle: CSSProperties = { display: 'flex', flexDirection: 'column', gap: 2, marginBottom: 6, padding: '6px 8px', background: '#16223a', border: '1px solid #2d5a8a', borderRadius: 4 };
-const ipValueStyle: CSSProperties = { color: '#7ec8ff', fontSize: 18, fontFamily: 'ui-monospace, monospace', fontWeight: 600, wordBreak: 'break-all', userSelect: 'text', WebkitUserSelect: 'text' };
+// No `userSelect: 'text'` here on purpose — see IpCallout's docblock (#1360).
+const ipValueStyle: CSSProperties = { color: '#7ec8ff', fontSize: 18, fontFamily: 'ui-monospace, monospace', fontWeight: 600, wordBreak: 'break-all', flex: 1 };
 const sectionStyle: CSSProperties = { display: 'flex', flexDirection: 'column', gap: 2, marginBottom: 8, padding: '6px 8px', background: '#16223a', border: '1px solid #2d5a8a', borderRadius: 4 };
 const sectionTitleStyle: CSSProperties = { color: '#7ec8ff', fontSize: 12, fontWeight: 600, marginBottom: 2 };

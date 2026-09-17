@@ -840,6 +840,146 @@ Dev-only by default (`import.meta.env.DEV`), overridable either way with
 an ordinary primary press, so a game that drags on the primary pointer must gate that on
 `!pinching`, exactly as it must for a real two-finger pinch.
 
+## The iOS text-selection magnifier — why the fix is native, not CSS (#1360)
+
+Double-tapping a shipped game on iOS used to raise the system text-selection magnifier over the
+board. It is fixed in the **web view**, not in the page, and the reason is worth keeping because the
+obvious fix is wrong in a way that looks right.
+
+**What was measured.** Masaki's iPad (`iPad11,1`, iOS 26.6.2), Court, 2026-09-18, with a
+`selectionchange` + `touchend` probe installed in the live page. Across 36 real finger touches the
+magnifier appeared every time, while:
+
+- `document.getSelection()` stayed **empty** — `rangeCount: 0`, `isCollapsed: true`;
+- `selectionchange` **never fired once**;
+- every touch target was a `<canvas>` (Court draws its text in PixiJS, so there was no DOM text
+  under the finger at all);
+- every one of those targets already computed `-webkit-user-select: none`,
+  `-webkit-touch-callout: none` and `touch-action: none`.
+
+**So it is not DOM text selection**, and no stylesheet can reach it. The loupe is WebKit's
+`UITextInteraction`, installed on the web view's content view and consulted *before* the page is.
+`-webkit-user-select: none` suppresses the **long-press** loupe — which is what `App.css`'s existing
+rules were aimed at, correctly — and has never suppressed the **double-tap** one.
+
+**The fix** is `isTextInteractionEnabled = false` on the web view's `WKPreferences`, set by an
+override of `webViewConfiguration(for:)` in each project's `MyViewController.swift`. It is set on
+the *configuration*, before the web view is constructed (Capacitor's `prepareWebView` calls that
+method and then builds the view), rather than mutated on a live `WKPreferences` afterwards. The
+block is generated and healed by `engine/plugins/healNativeConfig.ts` (`TI_BLOCK`), fenced by
+`modoki:text-interaction-{begin,end}` so a project that hand-extends the file keeps its edits, and
+guarded by `engine/tests/architecture/iosTextInteraction.test.ts`.
+
+⚠️ **This disables USE of `<input>`/`<textarea>`, not just selection inside them.** Turning text
+interaction off is not "selection off, typing on" — the published Capacitor plugins that wrap this
+switch expose it as a **runtime toggle** precisely so a field can turn it back on while focused.
+
+### Authoring a text field in a game — what you do and do not have to think about
+
+**Nothing, for an ordinary authored field.** A `UIElement` with `elementType: 'input'` renders a real
+DOM `<input>` (`ui/UINode.tsx`), and `engine/app/textInteractionToggle.ts` turns text interaction
+back on from `focusin` and off again on `focusout`. Verified end-to-end on device.
+
+The gaps are worth knowing before you hit one, because each fails the same silent way — keyboard
+opens, nothing types:
+
+- **A field inside a shadow root.** `focusin` retargets at the shadow boundary, so the listener sees
+  the HOST element, not the input, and never enables. Nothing in the engine uses shadow DOM today,
+  which is exactly why this is documented rather than coded around — the fix is
+  `e.composedPath()[0]`, and it should be added the day something needs it, not before.
+- **Exotic `<input type>`.** The allowlist is `text · search · url · tel · email · password ·
+  number`. `date`/`time`/`color`/`file` use native pickers and need nothing. A type outside both
+  groups would need adding.
+- **Canvas-drawn text entry.** A game that captures keystrokes itself and draws the caret on the
+  Pixi/Three canvas has no DOM element to focus, so nothing fires — but it also does not need
+  WebKit's text interaction, since it never uses a real field. The common trick of a hidden
+  `<input>` to summon the keyboard IS covered, provided its `type` is in the list above.
+- **A cross-origin iframe** (an ad SDK's web view). `focusin` does not cross into one, and that
+  content is outside this web view's preference anyway.
+
+⚠️ **`<input type="range">` is deliberately NOT treated as text** — sliders were measured working
+with text interaction off, and re-enabling it for the duration of a drag would put the magnifier
+back. Court ships two of them in release.
+
+### ⚠️ MEASURED: the default-off switch breaks every text field, which is why the toggle exists
+
+**Measured on Masaki's iPad (`iPad11,1`, iOS 26.6.2), Court debug build, 2026-09-18, by hand:**
+
+- **Debug menu → Store tab → `filter…`: the keyboard OPENS and no character is entered.** So the
+  field still takes focus (the tap and the keyboard are UIKit's, not WebKit's text interaction) —
+  what is gone is text *insertion*. That is the worst shape for diagnosis: it looks like a broken
+  filter, not like a disabled web-view preference, and nothing errors.
+- **Court's settings volume sliders: work normally.** `elementType: 'range'` is unaffected — it is a
+  form control, not a text one. The inference was right, but it needed the check: these ship in
+  RELEASE, where the switch is also on.
+
+So the cost is **real and confined to text entry**. Today that is the debug overlay only; no game
+authors a text field. But the overlay is QA's tooling and it ships in both games.
+
+**The fix — built and verified on device, 2026-09-18:** a runtime toggle. Text interaction is off by
+default and goes back on while a text field is focused, which is what the published Capacitor
+plugins wrapping this switch do. It needs **no** Capacitor plugin here: `MyViewController` is
+engine-owned and present in all 19 projects, so the generated block registers a
+`WKScriptMessageHandler` and `engine/app/textInteractionToggle.ts` drives it from
+`focusin`/`focusout`. Confirmed on the iPad: the debug overlay's `filter…` box types again **and**
+double-tapping the board still raises no magnifier.
+
+⚠️ **Register the handler in `capacitorDidLoad()`, never in `webViewConfiguration(for:)`.** This cost
+a build cycle. `CAPBridgeViewController.prepareWebView` does:
+
+```swift
+let webConfig = webViewConfiguration(for: configuration)
+webConfig.setURLSchemeHandler(…)
+webConfig.userContentController = delegationHandler.contentController   // ← replaced wholesale
+```
+
+so a handler added to the configuration is discarded one line later. It fails **silently on both
+sides**: `window.webkit.messageHandlers.modokiTextInteraction` is simply `undefined`, nothing logs,
+nothing throws, and the only symptom is that typing is still dead. ⚠️ When checking this from JS,
+test a handler you KNOW exists first (Capacitor's `bridge`) — `Object.keys(messageHandlers)` returns
+`[]` even when handlers are present, so an empty list is not evidence of absence.
+
+### The survey that missed it, and why that shape is worth remembering
+
+An earlier version of this section claimed the cost was zero "because no project ships a DOM text
+input". **That was wrong, and the error is worth keeping visible because of its shape:** the survey
+grepped scene JSON for `"elementType": "input"`, which enumerates *authored ECS UI* and is blind to
+the DOM the engine renders itself. Asking "does any game author one?" was the wrong question; the
+right one is "does anything in the shipped bundle render one?"
+
+What the corrected survey finds:
+
+- **The runtime debug overlay ships real text fields** — `runtime/debug/tabs/StoreTab.tsx` and
+  `PlayerPrefsTab.tsx` (the `filter…` boxes), plus `JournalTab`, `TimeTab`, `InputTab`,
+  `ProfilerTab`. `engine/app/main.tsx`'s
+  `setDebugMenuEnabled(__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)` puts it in **every debug
+  build**, which is what both shipping games are (`build.debugBuild: true`).
+- **Court ships two `elementType: 'range'` sliders in RELEASE** — the music and SFX volume controls
+  in `games/court/runtime/assets/scenes/main.scene.json`. `ui/UINode.tsx` renders `range` as a real
+  `<input>`. `wordweave`, `audio-demo` and `space-console` have them too.
+
+Both were then measured on device — the result is above. The lesson is the survey, not the answer:
+**the post-fix verification that "passed" had double-tapped the board and never touched a text
+field**, so the check and the claim were about different things. A verification that exercises only
+the symptom you fixed cannot see the cost you introduced.
+
+⚠️ **Do not "fix" the one place that gave up selection.** `runtime/debug/tabs/DeviceTab.tsx`'s
+connect-IP value used to carry `userSelect: 'text'` — the only element in the shipped runtime that
+opted back in — so the LAN IP could be read off the phone. It has a **Copy button** now. Putting the
+style back would not make it selectable; it would only be a lie in the stylesheet.
+
+**Incidental, and not the bug:** `<html>` itself still computes `-webkit-user-select: text`, because
+`App.css` sets the property on `body` and never on the root element. Nothing selectable sits directly
+in `<html>`, so it changes no behaviour — it is recorded here so the next person who greps for it
+does not mistake it for a cause.
+
+⚠️ **Synthetic input cannot reproduce this, by construction.** The magnifier is a UIKit gesture
+recogniser, and a synthetic DOM event never reaches one — so a "cannot reproduce" resting on
+`device_tap` has measured nothing. Trusted input was also unavailable here: a USB lease can never
+reach WebDriverAgent ([trusted-device-input.md](./trusted-device-input.md)), and the WiFi attempt
+failed with `xcodebuild: Timed out waiting for all destinations…`, which latches for the rest of the
+lease. It was driven by a human finger.
+
 ## Gotchas
 
 - **Read the resource, never the DOM.** Game/UI/gameplay code must go through the `Input` accessors;

@@ -59,6 +59,97 @@ const GD_REG_OFF = [
   GD_REG_END,
 ].join('\n');
 
+/** The web view's text-interaction switch, fenced like the game-debug block so the heal
+ *  owns only its own lines inside a file games hand-extend (#1360).
+ *
+ *  ## Why this lives in native code and not in CSS
+ *
+ *  Double-tapping a shipped game on iOS raises the text-selection magnifier. Measured on
+ *  Masaki's iPad (iPad11,1, iOS 26.6.2) against Court, 2026-09-18: the loupe appears while
+ *  `document.getSelection()` stays EMPTY and `selectionchange` never fires, on targets whose
+ *  computed style is already `-webkit-user-select: none` + `-webkit-touch-callout: none`
+ *  (every touch landed on a `<canvas>` — Court draws its text in PixiJS, so there is no DOM
+ *  text under the finger at all). So this is not DOM text selection: it is WebKit's
+ *  `UITextInteraction` on the web view's content view, which runs BEFORE the page is
+ *  consulted. `-webkit-user-select: none` suppresses the LONG-PRESS loupe and has never
+ *  suppressed the DOUBLE-TAP one — which is why `engine/app/App.css`'s existing rules, correct
+ *  for what they were aimed at, could never have fixed this. The web view is the only layer
+ *  that can, and `MyViewController` is the one Swift file the engine owns per game.
+ *
+ *  ⚠️ **This also disables USE of `<input>`/`<textarea>`, not just selection in them.** Turning
+ *  text interaction off is not "selection off, typing on" — the published Capacitor plugins that
+ *  wrap this switch (Capawesome's, `@astrocreep/capacitor-textinteraction`) expose it as a RUNTIME
+ *  toggle precisely so a field can turn it back on while focused.
+ *
+ *  ⚠️ **The cost is NOT zero, and an earlier version of this comment said it was.** That claim
+ *  rested on grepping scene JSON for `"elementType": "input"` — which surveys AUTHORED ECS UI only
+ *  and misses the DOM the engine itself renders. **The shipped runtime debug overlay has real text
+ *  fields**: `runtime/debug/tabs/StoreTab.tsx` and `PlayerPrefsTab.tsx` (`filter…` boxes), plus
+ *  `JournalTab`, `TimeTab`, `InputTab` and `ProfilerTab`; `engine/app/main.tsx`'s
+ *  `setDebugMenuEnabled(__MODOKI_EDITOR__ || __MODOKI_DEBUG_BUILD__)` puts that overlay in every
+ *  debug build, which is what both shipping games are. Court also ships two `elementType: 'range'`
+ *  volume sliders in RELEASE (`games/court/.../main.scene.json`), and `range` is the same `<input>`
+ *  element. **Whether those are actually dead on device is an OPEN question** — see docs/input.md
+ *  § "The iOS text-selection magnifier", which owns the status; do not resolve it from this
+ *  comment. If they are, the runtime toggle stops being hypothetical and becomes required.
+ *
+ *  No `#available` guard: `isTextInteractionEnabled` is iOS 14.5+ and every project's
+ *  `IPHONEOS_DEPLOYMENT_TARGET` is 16.4 (asserted by `iosTextInteraction.test.ts`, which is what
+ *  makes the bare call safe rather than lucky). */
+export const TI_BEGIN = '    // modoki:text-interaction-begin — generated; see docs/input.md (#1360)';
+export const TI_END = '    // modoki:text-interaction-end';
+export const TI_BLOCK = [
+  TI_BEGIN,
+  '    /// Kill the iOS text-selection magnifier, and hand JS a switch to put text interaction',
+  '    /// BACK while a text field is focused (#1360).',
+  '    ///',
+  '    /// Off by default, set on the CONFIGURATION before the web view is built rather than',
+  '    /// mutated afterwards: `prepareWebView` calls this and then constructs the view.',
+  '    ///',
+  '    /// The default alone was not enough. Measured on an iPad (iOS 26.6.2): with text',
+  '    /// interaction off, tapping a text field still opens the keyboard and NO character is',
+  '    /// entered — so every `<input>` in the shipped debug overlay went dead. `engine/app/',
+  '    /// installTextInteractionToggle.ts` drives this handler from focusin/focusout.',
+  '    ///',
+  '    /// ⚠️ The handler is registered in `capacitorDidLoad()`, NOT in `webViewConfiguration(for:)`.',
+  '    /// MEASURED, not assumed: registering it on the configuration silently does nothing, because',
+  '    /// `CAPBridgeViewController.prepareWebView` REPLACES the whole controller on the very next',
+  '    /// line — `webConfig.userContentController = delegationHandler.contentController`. The',
+  '    /// symptom is `window.webkit.messageHandlers.modokiTextInteraction === undefined` while',
+  '    /// Capacitor own `bridge` handler is present, and nothing errors on either side.',
+  '    override func webViewConfiguration(for instanceConfiguration: InstanceConfiguration) -> WKWebViewConfiguration {',
+  '        let configuration = super.webViewConfiguration(for: instanceConfiguration)',
+  '        configuration.preferences.isTextInteractionEnabled = false',
+  '        return configuration',
+  '    }',
+  '',
+  '    /// Capacitor calls this once the web view and bridge exist, which is the first moment the',
+  '    /// REAL user-content controller is reachable.',
+  '    override func capacitorDidLoad() {',
+  '        super.capacitorDidLoad()',
+  '        webView?.configuration.userContentController.add(',
+  '            ModokiTextInteractionBridge(self), name: "modokiTextInteraction")',
+  '    }',
+  '',
+  '    fileprivate func modokiSetTextInteraction(_ enabled: Bool) {',
+  '        webView?.configuration.preferences.isTextInteractionEnabled = enabled',
+  '    }',
+  '',
+  '    /// Nested so the whole mechanism stays inside this fence — a top-level class or an',
+  '    /// extension would sit outside it, where the heal could not rewrite it. Holds the VC',
+  '    /// WEAKLY: the user-content controller retains this object, and the web view retains that.',
+  '    private final class ModokiTextInteractionBridge: NSObject, WKScriptMessageHandler {',
+  '        private weak var owner: MyViewController?',
+  '        init(_ owner: MyViewController) { self.owner = owner; super.init() }',
+  '        func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {',
+  '            // JS `true`/`false` arrives as NSNumber, not Bool, through the JSON bridge.',
+  '            let enabled = (message.body as? NSNumber)?.boolValue ?? false',
+  '            DispatchQueue.main.async { [weak self] in self?.owner?.modokiSetTextInteraction(enabled) }',
+  '        }',
+  '    }',
+  TI_END,
+].join('\n');
+
 /** The pre-#112 registration block: gated on `#if DEBUG` (the XCODE CONFIGURATION)
  *  rather than on the project flag. Matched so the heal can migrate an existing
  *  project's file to the fenced form exactly once. Anchored on `GameDebugPlugin()`
@@ -82,6 +173,7 @@ const FRESH_DEBUG_ONLY_DOC = [
  *  pbxproj file-ref) + registering the instance here keeps it discoverable.
  *  The registration itself is gated on `build.debugBuild`, not on `#if DEBUG`. */
 const myViewControllerSwift = (debugBuild: boolean) => `import UIKit
+import WebKit
 import Capacitor
 
 /// Custom bridge VC so we can register plugins that SPM won't auto-discover.
@@ -93,6 +185,8 @@ import Capacitor
 /// registering the instance here keeps the class alive and wires it into the bridge.
 ${FRESH_DEBUG_ONLY_DOC}
 class MyViewController: CAPBridgeViewController {
+${TI_BLOCK}
+
     override func viewDidLoad() {
         super.viewDidLoad()
 ${debugBuild ? GD_REG_ON : GD_REG_OFF}
@@ -679,6 +773,74 @@ function healIosGameDebugRegistration(projectRoot: string, debugBuild: boolean):
   fs.writeFileSync(mvc, text);
   return `${migrated ? 'migrated iOS GameDebugPlugin registration off #if DEBUG; ' : ''}` +
     `synced iOS GameDebugPlugin registration = ${debugBuild ? 'ON' : 'OFF'} (from build.debugBuild)`;
+}
+
+/** Heal the text-interaction override into an EXISTING project's `MyViewController.swift`
+ *  (#1360) — see {@link TI_BLOCK} for why the fix has to be native.
+ *
+ *  Unlike the game-debug registration this is NOT gated on `build.debugBuild`, or on anything
+ *  else: the magnifier is equally wrong in a release build, and the owner's ruling (2026-09-18)
+ *  is explicitly "every build, debug and release alike" — a split would ship one behaviour and
+ *  test another.
+ *
+ *  Fenced and anchored rather than whole-file generated, for the same reason the game-debug
+ *  block is: `games/ota-test` hand-extends this file with an OTA boot hook, and a project that
+ *  has taken ownership of the file must keep its edits. The insert anchors on the class opening
+ *  line, so it lands at class-body scope (`webViewConfiguration(for:)` is a method override, not
+ *  a statement inside `viewDidLoad` — putting it in the fence the game-debug block uses would not
+ *  compile). A file with neither the markers nor that anchor is left alone WITH A NOTE. */
+function healIosTextInteraction(projectRoot: string): string | undefined {
+  const mvc = path.join(projectRoot, 'ios', 'App', 'App', 'MyViewController.swift');
+  if (!fs.existsSync(mvc)) return undefined; // no custom bridge VC in this project — nothing to extend
+  const orig = fs.readFileSync(mvc, 'utf8');
+  let text = orig;
+
+  // ⚠️ GLOBAL. A badly resolved merge conflict on this file can leave TWO fenced blocks, and a
+  // non-global replace rewrites only the first — which against an identical block is a byte no-op,
+  // so `text === orig`, no write happens and NO NOTE is emitted. The file would then carry a
+  // duplicate override (`invalid redeclaration`) permanently, passing every assertion in
+  // `iosTextInteraction.test.ts` (both markers present, the call present, WebKit imported) while
+  // the iOS target does not compile. Replacing every occurrence and keeping one makes that state
+  // self-repairing instead of terminal.
+  const fenceRe = new RegExp(`[ \\t]*${escapeRe(TI_BEGIN.trim())}[\\s\\S]*?${escapeRe(TI_END.trim())}`, 'g');
+  if (fenceRe.test(text)) {
+    fenceRe.lastIndex = 0; // `.test` on a /g/ regex advances lastIndex — reset before replacing.
+    let seen = 0;
+    text = text.replace(fenceRe, () => (seen++ === 0 ? TI_BLOCK : ''));
+  } else {
+    // ⚠️ A project may legitimately hand-override this method (for a custom
+    // `applicationNameForUserAgent`, or `limitsNavigationsToAppBoundDomains`). Inserting our block
+    // beside it is `error: invalid redeclaration of 'webViewConfiguration(for:)'` — and NOTHING in
+    // `npm run verify` compiles Swift, so that ships as a green gate and a dead iOS target. Worse,
+    // once inserted the fence exists, so this function would never self-repair it. Refuse instead,
+    // and say what to do by hand.
+    if (/override\s+func\s+webViewConfiguration\s*\(\s*for/.test(text)) {
+      return 'MyViewController.swift already hand-overrides webViewConfiguration(for:) — the iOS '
+        + 'text-selection magnifier is NOT disabled here. Add `configuration.preferences'
+        + '.isTextInteractionEnabled = false` to that existing override by hand (#1360).';
+    }
+    const classRe = /^(class MyViewController: CAPBridgeViewController \{)$/m;
+    if (!classRe.test(text)) {
+      return 'MyViewController.swift has no modoki:text-interaction markers and no class anchor — the iOS text-selection magnifier is NOT disabled here (hand-owned file?)';
+    }
+    text = text.replace(classRe, `$1\n${TI_BLOCK}\n`);
+  }
+
+  // `WKWebViewConfiguration` is WebKit's; Capacitor's own header imports it but that does not
+  // re-export into this file. Insert next to the existing UIKit import so the diff stays stable.
+  if (!/^import WebKit$/m.test(text)) {
+    // ⚠️ The UIKit anchor is NOT guaranteed: the class declaration needs only `import Capacitor`,
+    // so a hand-trimmed file can have no bare `import UIKit` line. `String.replace` with a
+    // non-matching pattern is a silent no-op, which would write the block with no WebKit import —
+    // `cannot find type 'WKWebViewConfiguration' in scope`, under a success note. Prepend instead.
+    text = /^import UIKit$/m.test(text)
+      ? text.replace(/^import UIKit$/m, 'import UIKit\nimport WebKit')
+      : `import WebKit\n${text}`;
+  }
+
+  if (text === orig) return undefined;
+  fs.writeFileSync(mvc, text);
+  return 'disabled iOS web-view text interaction in MyViewController.swift (kills the double-tap selection magnifier, #1360)';
 }
 
 /** Delete the retired `CONFIGURATION == Release` Info.plist-strip build phase from a
@@ -2584,6 +2746,12 @@ export function healNativeConfig(projectRoot: string): HealResult {
       const aw = healAndroidArchiveWarning(projectRoot, debugBuild);
       if (aw) notes.push(aw);
     }
+    // OUTSIDE the game-debug gate on purpose (#1360): the text-selection magnifier is wrong in
+    // every build of every project, so this must not inherit `usesGameDebug`'s scope. It still
+    // runs last, because it extends the MyViewController.swift the block above may have just
+    // scaffolded.
+    const ti = healIosTextInteraction(projectRoot);
+    if (ti) notes.push(ti);
   } catch (e) {
     notes.push(`native-config heal skipped: ${e instanceof Error ? e.message : String(e)}`);
   }
