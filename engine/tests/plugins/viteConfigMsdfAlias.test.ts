@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import { found } from '@modoki/engine/testing/inOrder'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -74,4 +74,70 @@ describe('vite.config @zappar/msdf-generator resolve.alias (packaged-editor fix)
     expect(fs.existsSync(entries[firstMatch].replacement),
       `the wasm alias must point at a real file, got ${entries[firstMatch].replacement}`).toBe(true)
   })
+
+  /** #1356 — the runtime imports `@zappar/msdf-generator/worker?worker&url` so Vite BUNDLES the
+   *  worker (comlink inlined). Without this entry the package-dir alias rewrites the subpath to
+   *  <pkg>/worker, which does not exist, and the build fails; with it pointing anywhere but the
+   *  real worker, the shipped worker is not the lib's. The regex replaces only the matched
+   *  prefix, so the query must SURVIVE — it is what makes Vite build a worker at all. */
+  it('resolves the worker subpath to the real worker, query kept, ahead of the package-dir alias', async () => {
+    const factory = (await import('../../vite.config')).default as (env: {
+      command: 'build' | 'serve'
+      mode: string
+    }) => UserConfig
+    const entries = factory({ command: 'serve', mode: 'development' }).resolve?.alias as AliasEntry[]
+    const id = '@zappar/msdf-generator/worker?worker&url'
+    const first = found(entries.findIndex((e) => matches(e, id)), 'an alias entry matching the worker subpath')
+    expect(first, 'the worker entry must precede the package-dir alias')
+      .toBeLessThan(entries.findIndex((e) => e.find === '@zappar/msdf-generator'))
+
+    const rewritten = id.replace(entries[first].find, entries[first].replacement)
+    expect(rewritten).toMatch(/[\\/]dist[\\/]worker\.js\?worker&url$/)
+    expect(fs.existsSync(rewritten.replace(/\?.*$/, '')), `not a real file: ${rewritten}`).toBe(true)
+    // `worker.js` is a different exported subpath; the entry must not turn it into worker.js.js.
+    expect(matches(entries[first], '@zappar/msdf-generator/worker.js')).toBe(false)
+  })
+
+  describe('playable build', () => {
+    // Restored key by key: reassigning `process.env` swaps Node's env object for a plain one.
+    const KEYS = ['VITE_PLAYABLE', 'MODOKI_PROJECT', 'MODOKI_PLAYABLE'] as const
+    const saved = Object.fromEntries(KEYS.map((k) => [k, process.env[k]]))
+    afterEach(() => {
+      for (const k of KEYS) {
+        if (saved[k] === undefined) delete process.env[k]
+        else process.env[k] = saved[k]
+      }
+      vi.resetModules()
+    })
+
+    /** A playable must not build ANY worker: a worker bundle is a separate .js file, and
+     *  inlinePlayable refuses the build over it. So here the entry swallows the query — the id
+     *  becomes a plain module — the opposite of the non-playable entry above. Observed: keeping
+     *  the query emitted `playable-msdf-stub-*.js` and failed the export. */
+    it('maps the worker subpath, query and all, to a plain stub module', async () => {
+      process.env.VITE_PLAYABLE = '1'
+      process.env.MODOKI_PROJECT = 'games/space-invader'
+      vi.resetModules()
+      const factory = (await import('../../vite.config')).default as (env: {
+        command: 'build' | 'serve'
+        mode: string
+      }) => UserConfig
+      const entries = factory({ command: 'build', mode: 'production' }).resolve?.alias as AliasEntry[]
+      const id = '@zappar/msdf-generator/worker?worker&url'
+      const first = found(entries.findIndex((e) => matches(e, id)), 'a playable alias entry matching the worker subpath')
+      expect(first, 'the worker entry must precede the package stub alias')
+        .toBeLessThan(entries.findIndex((e) => e.find === '@zappar/msdf-generator'))
+
+      const rewritten = id.replace(entries[first].find, entries[first].replacement)
+      expect(rewritten, 'the ?worker query must be swallowed').not.toContain('?')
+      expect(fs.existsSync(rewritten), `not a real file: ${rewritten}`).toBe(true)
+      expect(fs.readFileSync(rewritten, 'utf8')).toMatch(/^export default undefined;$/m)
+    })
+  })
 })
+
+type AliasEntry = { find: string | RegExp; replacement: string }
+
+function matches(e: AliasEntry, id: string): boolean {
+  return typeof e.find === 'string' ? id === e.find || id.startsWith(e.find + '/') : e.find.test(id)
+}

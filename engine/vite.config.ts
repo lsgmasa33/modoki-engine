@@ -11,6 +11,7 @@ import { loadProjectConfig } from './plugins/load-project-config'
 import { resolveModules } from './plugins/detect-modules'
 import { inlinePlayablePlugin } from './plugins/inlinePlayable'
 import { ktx2LoaderAssetStripPlugin } from './plugins/ktx2LoaderAssetStrip'
+import { msdfWorkerAssetStripPlugin } from './plugins/msdfWorkerAssetStrip'
 import { subgameBuildPlugin, SUBGAME_ENTRY_VIRTUAL_ID, subgameOutDir } from './plugins/subgameBuild'
 import { bootSplashPlugin } from './plugins/bootSplash'
 import { earlyConsoleShimPlugin } from './plugins/earlyConsoleShim'
@@ -405,6 +406,8 @@ export default defineConfig(({ command }) => {
     assetScannerPlugin(),
     // three r185's KTX2Loader emits a hashed Basis transcoder pair nothing fetches (#1340).
     ktx2LoaderAssetStripPlugin(),
+    // @zappar/msdf-generator's own worker fallback emits an unbundled worker that cannot start (#1356).
+    msdfWorkerAssetStripPlugin(),
     ...(externalProject ? [hostSharedDeps()] : []),
     // The web boot splash (#396). Build-only and opt-in: a project with no `app.splashSource`
     // emits nothing and its boot is unchanged. Skipped for the EDITOR shell, which opens projects
@@ -491,12 +494,11 @@ export default defineConfig(({ command }) => {
     // + an external MODOKI_PROJECT (C4c-2) so those imports resolve in dev.
     fs: { allow: fsAllow },
   },
-  // The runtime MSDF font generator ships its OWN module Worker + wasm and resolves
-  // them via `new URL('./worker.js', import.meta.url)` / `new URL('msdfgen_wasm.wasm',
-  // import.meta.url)`. esbuild dep-optimization bundles the lib into a single chunk,
-  // which BREAKS those relative URLs (the sibling files no longer sit next to the
-  // chunk). Excluding it keeps the lib served from node_modules as-is so the URLs
-  // resolve and Vite still transforms the worker's bare imports (comlink).
+  // The runtime MSDF font generator ships its OWN module Worker + wasm. The runtime now hands
+  // it both URLs through `?worker&url` / `?url` imports (msdfGenerate.ts, #1356), but the lib
+  // still self-resolves relative to its own file, and esbuild dep-optimization would bundle it
+  // into a chunk where those sibling files no longer sit. Excluding it keeps the lib served
+  // from node_modules as-is.
   optimizeDeps: {
     exclude: ['@zappar/msdf-generator'],
     // PACKAGED-ONLY: pre-bundle the @modoki/engine subpaths the DYNAMICALLY-loaded game
@@ -559,8 +561,8 @@ export default defineConfig(({ command }) => {
     // where the node_modules walk never reaches app.asar.unpacked/node_modules, so the import
     // fails and the whole editor renderer blanks (Vite error overlay). Pin it to an absolute
     // path so it resolves regardless of cache location. Kept as a package-DIR alias (not the
-    // entry file) so the resolver still honours the package's own `new URL('./worker.js' /
-    // 'msdfgen_wasm.wasm', import.meta.url)` self-resolution next to the real dist/.
+    // entry file) so the lib still resolves relative to the real dist/ (its own worker fallback
+    // is stripped from builds by msdfWorkerAssetStrip.ts, #1356).
     // Playable: alias @zappar/msdf-generator to a stub — the real lib emits a Worker + wasm
     // via new URL(import.meta.url) that can't be inlined into the single file (would 404 +
     // trip the inliner's single-chunk guard). Playables use pre-baked font atlases, so the
@@ -585,6 +587,11 @@ export default defineConfig(({ command }) => {
           // playable emits a few bytes instead of the real 1.5 MB wasm against its 5 MB cap;
           // it is never instantiated, since the stub generator never initializes.
           { find: /^@zappar\/msdf-generator\/msdfgen_wasm\.wasm/, replacement: path.join(engineDir, 'plugins/playable-msdf-stub.wasm') },
+          // Same trap for the worker subpath (#1356): the prefix alias below would turn
+          // `worker?worker&url` into `<stub>.ts/worker` and fail the build. Unlike the wasm entry
+          // this one SWALLOWS the query (`(?:\?.*)?$`): kept, `?worker&url` would build the stub as
+          // a worker — a separate .js chunk the single-file inliner refuses.
+          { find: /^@zappar\/msdf-generator\/worker(?:\?.*)?$/, replacement: path.join(engineDir, 'plugins/playable-msdf-worker-url-stub.ts') },
           { find: '@zappar/msdf-generator', replacement: path.join(engineDir, 'plugins/playable-msdf-stub.ts') },
           { find: /^@[^/]+\/app-services$/, replacement: path.join(engineDir, 'plugins/playable-appservices-stub.ts') },
         ] }
@@ -605,6 +612,10 @@ export default defineConfig(({ command }) => {
           alias: [
             ...(msdfGeneratorDir ? [
               { find: /^@zappar\/msdf-generator\/msdfgen_wasm\.wasm/, replacement: path.join(msdfGeneratorDir, 'dist', 'msdfgen_wasm.wasm') },
+              // #1356: the runtime imports `@zappar/msdf-generator/worker?worker&url` so Vite BUNDLES
+              // the worker (comlink inlined). The package-dir alias would rewrite it to
+              // <pkg>/worker, which does not exist — same ordering reason as the wasm entry.
+              { find: /^@zappar\/msdf-generator\/worker(?=\?|$)/, replacement: path.join(msdfGeneratorDir, 'dist', 'worker.js') },
               { find: '@zappar/msdf-generator', replacement: msdfGeneratorDir },
             ] : []),
             ...(process.env.MODOKI_VITE_CACHEDIR

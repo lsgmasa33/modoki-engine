@@ -1222,9 +1222,49 @@ it has already sent one sweep in the wrong direction (2026-08-18):
     `PrefabInstance`, nested roots included, at the outer root. The remap replaced it, and it also
     fixes delete + undo, whose restored instance used to name a dead id.
   `engine/tests/editor/duplicateCarriesRefs.test.ts` round-trips loader → duplicate → `serializeScene`
-  → loader. ⚠️ Its added nested instance carries its OWN guid on purpose. A guid-less one has its
-  derived guid stored by the first save, which re-anchors its members with or without a duplicate
-  (#1349, open).
+  → loader. Its guid-less variants are the #1349 block (next bullet).
+- **A guid-less instance root that a save STORES anchors its own members from the first load
+  (#1349).** Such a root is a guid-less user-added nested instance, or a guid-less (pre-#1248)
+  top-level one. The serializer writes its guid either way. Before the fix, the first load derived
+  the root's guid and derived its members *through* it, off the outer anchor. The first save then
+  stored the root's guid, and the reload anchored the members on it. So every member changed guid
+  after one save, and every ref to one dangled, with or without a duplicate.
+  `deriveInstanceMemberGuids` now resolves such a root on demand and anchors its members on the guid
+  it derives. The root's own value is unchanged, and a file that an older save already "promoted"
+  loads to the same guids as one it did not. The classification is `planCopyGuids`' structural one,
+  NOT "is this guid equal to its derivation" (see the bullet above). The file-side mirror keeps
+  pace: `derivedMemberPathsByAnchor` starts a new `|`-separated segment after such a root, and
+  `deriveMemberChain` derives the chain link by link. A committed-corpus walk (2026-09-17) found no
+  nested-prefab `added[]` node at all, so no stored ref moved.
+- **An owned nested instance ROOT that leaves its row is saved as REMOVED from the outer instance
+  (#1355).** This is the depth-1 root case only. A structural edit INSIDE an owned nested instance
+  is not saved at all, whether it deletes or moves a member or removes a depth-2 nested root,
+  because the owner's `nestedOverrides` carry value deltas only (#1358, open). `captureInstanceStructure` used to skip every nested prefab row in its removal pass,
+  because reading a nested row's absence from the member map had once stripped the spaceship's
+  flames on every save. Skipping the rows meant an owned nested instance that was deleted, or moved
+  out, re-expanded on reload. Moving it out unpacks it into plain entities that STORE the derived
+  guids (owner ruling 2026-09-17: keep unpack-on-move, don't refuse the move), so the reload also
+  produced two entities per guid. The row is now looked for where it expands: an instance root of
+  the row's prefab directly under the row's parent member. The check is lenient on purpose. An
+  unstamped (legacy) root counts as present, and so does a row whose prefab is not cached (it
+  expanded to nothing) or whose parent member is gone (its own removal covers it). The moved
+  entities keep their guids; with the row removed, nothing else derives those values. The
+  editor-side `applyStructureByRootInstance` maps nested rows to their roots, as the runtime map
+  already did, so a refresh or revert rebuild honours the removal. `serializeScene` preloads nested
+  row prefabs so the uncached guard does not hide a deletion.
+  Moving a MEMBER that holds an owned nested instance unpacks that instance too, recursively
+  (`reparentEntity`'s detach walk). Left linked under a now-plain parent, it would be saved as a
+  top-level instance that stores its derived guid, and the reload would re-derive its members from
+  that guid (#1349's shape). A user-added nested instance in the moved subtree stays linked, because
+  its root guid is already stored. A STORED instance root (top-level or user-added) moved OUTSIDE every
+  instance stays an instance, and the save writes it as a top-level entry. Before the review of
+  #1355, every root drag unpacked the whole instance, because `isWithinInstanceSubtree` is false
+  for the root itself. Dropped INSIDE an instance, it still unpacks, because the save cannot
+  represent it there. A parent member that owns a row of its prefab makes it read as owned, so it is
+  dropped. An `added` reference node carries no nested overrides. Under an owned nested instance,
+  nothing captures it at all (#1358).
+  `rebuildInstance` carries an owned root's `parentLocalId` across the respawn. Without it, a
+  refresh left the root unstamped, which the save reads as a user-added instance.
 
 So a repo-wide uniqueness check would fail on the architecture rather than find a bug. The honest
 cross-file signal is "same guid, *different* entity name", which is too weak to gate a build on: an

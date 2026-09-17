@@ -1558,16 +1558,30 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
     prefabParent.set(pe.localId, parent);
     prefabTraitsByLocal.set(pe.localId, Object.keys(pe.traits));
   }
+  // A nested-prefab row (`pe.prefab`) expands into its OWN foreign-instance root, which is never a
+  // direct member of THIS instance, so `localToEcs` cannot answer for it. Reading its absence from
+  // there falsely stripped the nested instance on every re-serialize (the bug that detached the
+  // spaceship's engine flames to scene root), so the row is looked for where it expands: an instance
+  // root of the row's prefab directly under the row's parent member. Skipping nested rows outright
+  // instead meant an owned nested instance that was deleted, or moved out, re-expanded on reload
+  // beside its moved copy — two entities per guid (#1355). Lenient on purpose: an unstamped
+  // (legacy) root of that prefab counts as present, and so does a row whose prefab is not cached
+  // (it expanded to nothing, which is not a removal) or whose parent member is gone (its own
+  // removal covers it).
+  const nestedRowPresent = (pe: PrefabFile['entities'][number]): boolean => {
+    const parentMember = localToEcs.get(prefabParent.get(pe.localId) ?? 0);
+    if (!parentMember || !getCachedPrefabSync(pe.prefab!)) return true;
+    return (childrenOf.get(parentMember) || []).some((c) => {
+      if (!c.traits.includes('PrefabInstance')) return false;
+      const pi = readTraitData(c.id, PrefabInstanceMeta);
+      if (!pi || pi.rootInstanceId !== c.id || pi.source !== pe.prefab) return false;
+      const stamp = (pi.parentLocalId as number) || 0;
+      return stamp === pe.localId || stamp === 0;
+    });
+  };
   const removedSet = new Set<number>();
   for (const pe of prefab.entities) {
-    // A nested-prefab row (`pe.prefab`) expands into its OWN foreign-instance
-    // root — it is never a direct member of THIS instance, so it never appears in
-    // localToEcs. Counting it as "removed" falsely strips the nested instance from
-    // the parent on every re-serialize (the bug that detached the spaceship's
-    // engine flames to scene root). Its presence is tracked by the child instance,
-    // not here.
-    if (pe.prefab) continue;
-    if (!localToEcs.has(pe.localId)) removedSet.add(pe.localId);
+    if (pe.prefab ? !nestedRowPresent(pe) : !localToEcs.has(pe.localId)) removedSet.add(pe.localId);
   }
   const removed: number[] = [];
   for (const lid of removedSet) if (!removedSet.has(prefabParent.get(lid) ?? 0)) removed.push(lid);
@@ -1700,13 +1714,24 @@ export function applyStructureByRootInstance(
   if (!PrefabInstanceMeta) return;
 
   const localToEcs = new Map<number, number>();
+  const nestedRoots: [number, number][] = [];
   getCurrentWorld().query(PrefabInstanceMeta.trait).updateEach(([pi], entity) => {
     const piData = pi as Record<string, unknown>;
+    const parentLocalId = (piData.parentLocalId as number) || 0;
+    if (parentLocalId && piData.rootInstanceId === entity.id()) nestedRoots.push([parentLocalId, entity.id()]);
     if (piData.rootInstanceId !== rootInstanceId) return;
     const localId = piData.localId as number;
     if (localId) localToEcs.set(localId, entity.id());
   });
   if (localToEcs.size === 0) return;
+  // A nested row's localId maps to the instance it expanded to, as `instantiatePrefabIntoWorld`'s map
+  // does on the runtime side — so a `removed` nested row (#1355) is deleted here too, not skipped.
+  const members = new Set(localToEcs.values());
+  const eaMeta = getTraitByName('EntityAttributes');
+  for (const [rowLocalId, id] of nestedRoots) {
+    const parent = eaMeta ? ((readTraitData(id, eaMeta)?.parentId as number) || 0) : 0;
+    if (members.has(parent) && !localToEcs.has(rowLocalId)) localToEcs.set(rowLocalId, id);
+  }
 
   // Delegate to the world-parameterized shared core (F7) with editor-world ops, so
   // the runtime (applyStructureByLocalToEcs) and editor paths can never drift.
@@ -2630,6 +2655,10 @@ export function rebuildInstance(
   // fan-out; it stands because a rebuild must not be able to make an unserializable entity
   // serializable, whatever route reaches it.
   const wasTransient = !!findEntity(rootInstanceId)?.has(Transient);
+  // An OWNED nested root's row stamp is identity too: `instantiatePrefab` spawns the new root
+  // unstamped, so a later move out read it as a STORED root, kept it linked, and the save
+  // re-anchored its members (a ref to one dangled); the #1355 presence check also went lenient.
+  const oldParentLocalId = (readTraitData(rootInstanceId, PrefabInstanceMeta)?.parentLocalId as number) || 0;
 
   // Recompute the teardown set LIVE: every member of this instance PLUS every
   // non-member descendant (added entities, nested instances, and their subtrees).
@@ -2672,6 +2701,7 @@ export function rebuildInstance(
   if (eaMeta && durableGuid(oldRootEa?.guid as string)) writeTraitField(newRootId, eaMeta, 'guid', oldRootEa!.guid as string);
   if (wasTransient) findEntity(newRootId)?.add(Transient);
   setPrefabSource(newRootId, source);
+  if (oldParentLocalId) writeTraitField(newRootId, PrefabInstanceMeta, 'parentLocalId', oldParentLocalId);
   applyOverridesByRootInstance(newRootId, overrides);
   applyStructureByRootInstance(newRootId, prefab, structure);
   reapplyNestedInstanceOverrides(newRootId, nestedCaptures);

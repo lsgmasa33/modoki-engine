@@ -376,9 +376,13 @@ type PrefabDoc = { rootLocalId?: number; entities?: PrefabRow[] };
  *  unknown, and a guid-less instance root (#1339). `skip`: a path owned by a different walk (a
  *  nested anchor's members, seen from its outer instance), or one no reload can address. */
 type AnchorTag = 'self' | 'parent' | 'skip';
-type Base = { tag: AnchorTag; path: number[] };
+/** `path` is the steps below the last anchor; `done` the finished segments before it — one per
+ *  guid-less stored root on the way down, each of which derives its own guid and anchors the next
+ *  segment (#1349). */
+type Base = { tag: AnchorTag; done: number[][]; path: number[] };
 
-/** Every `path` (`deriveInstanceMemberGuids`'s step chain, dot-joined) a member can derive at below
+/** Every `path` (`deriveInstanceMemberGuids`'s step chain, dot-joined; `|` between segments, see
+ *  {@link deriveMemberChain}) a member can derive at below
  *  `node` — a scene instance root or an `added[]` node that carries its own guid — grouped by the
  *  anchor it derives from. Mirrors the loader's parenting, not the prefab's intent:
  *  - a prefab row steps by its `localId` (a nested row too: its root's `parentLocalId` is that
@@ -389,7 +393,10 @@ type Base = { tag: AnchorTag; path: number[] };
  *    (→ `parent`), the anchor member for a user-added nested instance, and nothing for a nested
  *    prefab ROW, which is expanded under 0 and so is unaddressable;
  *  - an `added` node whose anchor is unknown re-anchors to the root, as `applyStructureCore` does;
- *  - `guidLess`: the node itself carries no guid, so its root derives too (`[rootLocalId]`, `parent`).
+ *  - `guidLess`: the node itself carries no guid, so its root derives too (`[rootLocalId]`, `parent`);
+ *  - a guid-less instance ROOT the save stores (that `guidLess` root, or a guid-less user-added
+ *    nested instance) derives its own guid and then ANCHORS its members, so their paths start a new
+ *    segment after it, as the loader does (#1349).
  *  A descendant that stores its own guid is its own anchor: its members are `skip` here and are
  *  enumerated by its own walk, but its orphan rows hang off THIS walk's anchors.
  *
@@ -403,13 +410,15 @@ export function derivedMemberPathsByAnchor(
   const emit = (b: Base): void => {
     if (b.tag === 'skip' || !b.path.length) return;
     const set = out[b.tag];
-    const key = b.path.join('.');
+    const key = [...b.done, b.path].map((seg) => seg.join('.')).join('|');
     if (set.has(key)) return;
     set.add(key);
     if (++size > MAX_MEMBER_PATHS) throw new MemberWalkTooLarge();
   };
-  const under = (b: Base, ...steps: number[]): Base => ({ tag: b.tag, path: [...b.path, ...steps] });
-  const SKIP: Base = { tag: 'skip', path: [] };
+  const under = (b: Base, ...steps: number[]): Base => ({ tag: b.tag, done: b.done, path: [...b.path, ...steps] });
+  /** The base a derived stored root at `b` gives its members: its own guid is the next anchor. */
+  const anchoredAt = (b: Base): Base => ({ tag: b.tag, done: [...b.done, b.path], path: [] });
+  const SKIP: Base = { tag: 'skip', done: [], path: [] };
   const docOf = (guid: unknown): PrefabDoc | null => {
     if (typeof guid !== 'string' || !guid) return null;
     const d = readPrefab(guid);
@@ -476,8 +485,9 @@ export function derivedMemberPathsByAnchor(
       // orphan rows do not — `spawnNestedInstance` parents them to `base`, which is ours.
       const here = ownGuid ? SKIP : under(base, child.rootLocalId ?? 1);
       emit(here);
-      // A FRESH row chain, as `spawnNestedInstance` gives it (#1324 review).
-      expand(child, here, base, n.added, [n.prefab as string], depth + 1);
+      // A FRESH row chain, as `spawnNestedInstance` gives it (#1324 review). Guid-less, the root
+      // still anchors its members on the guid it derives (#1349).
+      expand(child, ownGuid ? SKIP : anchoredAt(here), base, n.added, [n.prefab as string], depth + 1);
       return;
     }
     // A plain node with its own guid anchors everything below it (its own walk).
@@ -490,20 +500,26 @@ export function derivedMemberPathsByAnchor(
     if (node.prefab) {
       const doc = docOf(node.prefab);
       if (doc) {
-        const orphan: Base = { tag: opts.orphans ?? 'skip', path: [] };
-        const root: Base = opts.guidLess ? under(orphan, doc.rootLocalId ?? 1) : { tag: 'self', path: [] };
+        const orphan: Base = { tag: opts.orphans ?? 'skip', done: [], path: [] };
+        const root: Base = opts.guidLess ? under(orphan, doc.rootLocalId ?? 1) : { tag: 'self', done: [], path: [] };
         emit(root);
-        expand(doc, root, orphan, node.added, [node.prefab as string], 0);
+        expand(doc, opts.guidLess ? anchoredAt(root) : root, orphan, node.added, [node.prefab as string], 0);
       }
     } else if (Array.isArray(node.children)) {
       // A plain added node anchors any guid-less nested instance added beneath it.
-      for (const c of node.children as AddedNode[]) if (c && typeof c === 'object') addedNode(c, { tag: 'self', path: [] }, 0);
+      for (const c of node.children as AddedNode[]) if (c && typeof c === 'object') addedNode(c, { tag: 'self', done: [], path: [] }, 0);
     }
   } catch (e) {
     if (e instanceof MemberWalkTooLarge) return { self: [], parent: [] };
     throw e;
   }
   return { self: [...out.self], parent: [...out.parent] };
+}
+
+/** The guid a member at `key` (a {@link derivedMemberPathsByAnchor} path) derives from `anchor`:
+ *  one `deriveMemberGuid` per `|`-separated segment, each result anchoring the next. */
+export function deriveMemberChain(anchor: string, key: string): string {
+  return key.split('|').reduce((a, seg) => deriveMemberGuid(a, seg.split('.').map(Number)), anchor);
 }
 
 /** The member paths that derive from `node`'s own guid — {@link derivedMemberPathsByAnchor}'s `self`. */
@@ -604,10 +620,7 @@ export function remintSceneEntityGuids(
     const carry = (oldAnchor: string, paths: string[]): void => {
       const newAnchor = remap.get(oldAnchor);
       if (!newAnchor) return;
-      for (const p of paths) {
-        const steps = p.split('.').map(Number);
-        memberRemap.set(deriveMemberGuid(oldAnchor, steps), deriveMemberGuid(newAnchor, steps));
-      }
+      for (const p of paths) memberRemap.set(deriveMemberChain(oldAnchor, p), deriveMemberChain(newAnchor, p));
     };
     for (const [anchor, node] of anchors) carry(anchor, derivedMemberPaths(node, readPrefab));
     // A top-level instance's members derive from its own guid — and, for a row the loader parents to

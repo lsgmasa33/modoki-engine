@@ -10,11 +10,10 @@
  *  (mtsdfShader/mtsdfPixiShader), so median-alpha is ~equivalent to true mtsdf for our
  *  effects. Baked (path A) glyphs keep real mtsdf.
  *
- *  The lib self-resolves its worker + wasm via `new URL(..., import.meta.url)`; the
- *  engine's vite.config marks `@zappar/msdf-generator` `optimizeDeps.exclude` so those
- *  relative URLs survive (esbuild bundling would break them). The WASM half of that
- *  self-resolution does NOT survive a game build — see {@link wasmUrl} — so we hand the
- *  worker an explicit URL instead of trusting it.
+ *  The lib self-resolves its worker + wasm via `new URL(..., import.meta.url)` when not
+ *  told otherwise. Neither half of that self-resolution survives a game build: the WASM half — see {@link wasmUrl} — and neither does the
+ *  WORKER half — see {@link workerUrl} — so we hand the lib an explicit URL for both instead of
+ *  trusting it.
  */
 
 import { MSDF, type MSDFAtlas } from '@zappar/msdf-generator';
@@ -104,6 +103,32 @@ async function wasmUrl(): Promise<string | undefined> {
   return undefined;
 }
 
+/** The worker script's URL, BUNDLED by Vite rather than copied (#1356).
+ *
+ *  ⚠️ The lib's own fallback is `new URL("./worker.js", import.meta.url)`, which Vite treats as a
+ *  plain ASSET: it copies `dist/worker.js` byte for byte, including its
+ *  `import { expose, transfer } from "comlink"`. A module Worker cannot resolve a bare specifier
+ *  (import maps do not reach inside workers), so in every production web/native build the worker
+ *  errored on load and dynamic glyphs ended at the init timeout — observed in headless Chromium
+ *  against a built `demos/forest-camp/dist`. The dev server never showed it: there the file is
+ *  served through Vite's transform, which rewrites the bare import.
+ *
+ *  `?worker&url` makes Vite build the worker as its own bundle, with comlink inlined, and hand
+ *  back that bundle's URL. Same defensive shape as {@link wasmUrl}: the playable build aliases
+ *  this subpath to a stub that is not a URL, and then we pass nothing. */
+async function workerUrl(): Promise<string | undefined> {
+  let m: { default?: unknown } | null = null;
+  try {
+    // The package's EXPORTED subpath (`./worker`), for the same reason as wasmUrl's import.
+    m = await import('@zappar/msdf-generator/worker?worker&url');
+  } catch { /* reported below */ }
+  if (typeof m?.default === 'string') return m.default;
+  // (A playable lands here by design — its alias stub exports no URL, and its stub generator
+  // throws its own clearer error right after.)
+  console.warn('[msdfGenerate] could not resolve the msdf worker URL through the bundler — the generator will refuse to start in a production build (its unbundled worker fallback is stripped, #1356). Dynamic fonts will not load.');
+  return undefined;
+}
+
 /** Lazily create + initialize the shared generator (one Worker + WASM for the whole
  *  app). Safe to call concurrently — the init promise is memoized, INCLUDING a rejection:
  *  once the worker has failed to come up, every later call fails fast instead of paying
@@ -112,8 +137,11 @@ async function getGenerator(): Promise<MSDF> {
   if (instance) return instance;
   if (initPromise) return initPromise;
   initPromise = (async () => {
-    const url = await wasmUrl();
-    const msdf = new MSDF(url ? { wasmUrl: url } : {});
+    const [wasm, worker] = await Promise.all([wasmUrl(), workerUrl()]);
+    const msdf = new MSDF({
+      ...(wasm ? { wasmUrl: wasm } : {}),
+      ...(worker ? { workerUrl: worker } : {}),
+    });
     await withTimeout(
       msdf.initialize(),
       INIT_TIMEOUT_MS,

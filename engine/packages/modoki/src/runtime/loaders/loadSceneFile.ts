@@ -785,8 +785,13 @@ type PrefabFileEntry = {
  *  anchor on different root GUIDs, so members stay unique. Only fills EMPTY guids
  *  — a scene-assigned guid (e.g. the instance root) is never overwritten.
  *
- *  Anchoring uses a snapshot of guids taken BEFORE deriving, so the result is
- *  independent of iteration order (derived guids never become anchors).
+ *  Anchoring uses a snapshot of guids taken BEFORE deriving, so the result is independent of
+ *  iteration order. ONE kind of derived guid is an anchor too: a guid-less instance root that a save
+ *  STORES (`rootInstanceId` is itself and it did not expand from a prefab row — the structural rule
+ *  `planCopyGuids` also uses). It derives its own guid through its ancestors as any member does, and
+ *  its members then derive from THAT guid rather than through it. The save writes the root's guid
+ *  into the file, and a reload anchors its members on it, so deriving through it instead gave every
+ *  member a different guid after the first save and dangled every ref to one (#1349).
  *
  *  The guid rule itself is `deriveMemberGuid`/`memberStepId` (shared). ⚠️ The ANCESTOR walk is
  *  MIRRORED twice, because a duplicate must predict where a reload puts each member: over a scene
@@ -797,36 +802,52 @@ export function deriveInstanceMemberGuids(world: World): void {
   const attrMeta = getTraitByName('EntityAttributes');
   if (!piMeta || !attrMeta) return;
 
-  type Row = { handle: EntityHandle; origGuid: string; parentId: number; stepId: number; hasPI: boolean };
+  type Row = { handle: EntityHandle; origGuid: string; parentId: number; stepId: number; hasPI: boolean; storedRoot: boolean };
   const rows = new Map<number, Row>();
   for (const e of world.entities as Iterable<EntityHandle>) {
     if (!e.has(attrMeta.trait)) continue;
     const ea = e.get(attrMeta.trait) as { guid?: string; parentId?: number };
     const hasPI = e.has(piMeta.trait);
+    const pi = hasPI ? (e.get(piMeta.trait) as { localId?: number; parentLocalId?: number; rootInstanceId?: number }) : null;
     // A member's position in the chain is its localId — EXCEPT a nested-instance
     // root, whose localId is the (shared) inner root id; its distinguishing
     // position is parentLocalId (which OUTER row produced it). Two sibling nested
     // instances share inner localIds, so without this their members would collide.
-    const stepId = memberStepId(hasPI ? (e.get(piMeta.trait) as { localId?: number; parentLocalId?: number }) : null);
+    const stepId = memberStepId(pi);
+    const storedRoot = !!pi && pi.rootInstanceId === e.id() && !pi.parentLocalId;
     // durableGuid: a runtime guid (#1210) is neither an identity to keep nor an anchor to derive from.
-    rows.set(e.id(), { handle: e, origGuid: durableGuid(ea.guid), parentId: ea.parentId ?? 0, stepId, hasPI });
+    rows.set(e.id(), { handle: e, origGuid: durableGuid(ea.guid), parentId: ea.parentId ?? 0, stepId, hasPI, storedRoot });
   }
 
-  for (const [id, row] of rows) {
-    if (!row.hasPI || row.origGuid) continue; // only members that lack a guid
-    // Walk up to the nearest ancestor that had a guid BEFORE this pass.
+  // The guid each guid-less row derives ('' = unaddressable), memoised: a guid-less stored root is
+  // resolved on demand when a member below it needs its guid as the anchor. `null` marks a row
+  // in progress, so a parent cycle resolves to '' instead of recursing.
+  const derivedOf = new Map<number, string | null>();
+  const resolve = (id: number, row: Row): string => {
+    const memo = derivedOf.get(id);
+    if (memo !== undefined) return memo ?? '';
+    derivedOf.set(id, null);
+    // Walk up to the nearest anchor: a row that had a guid BEFORE this pass, or a guid-less stored root.
     const path: number[] = [row.stepId];
     let anchor = '';
     let cur = rows.get(row.parentId);
     const seen = new Set<number>([id]);
     while (cur && !seen.has(cur.handle.id())) {
       if (cur.origGuid) { anchor = cur.origGuid; break; }
+      if (cur.storedRoot) { anchor = resolve(cur.handle.id(), cur); break; }
       seen.add(cur.handle.id());
       path.unshift(cur.stepId);
       cur = rows.get(cur.parentId);
     }
-    if (!anchor) continue; // no scene-anchored ancestor → leave unaddressable
-    const derived = deriveMemberGuid(anchor, path);
+    const derived = anchor ? deriveMemberGuid(anchor, path) : ''; // no anchored ancestor → unaddressable
+    derivedOf.set(id, derived);
+    return derived;
+  };
+
+  for (const [id, row] of rows) {
+    if (!row.hasPI || row.origGuid) continue; // only members that lack a guid
+    const derived = resolve(id, row);
+    if (!derived) continue;
     row.handle.set(attrMeta.trait, { ...(row.handle.get(attrMeta.trait) as Record<string, unknown>), guid: derived });
     indexEntityGuid(row.handle, world); // keep the guid index warm for this '' → guid mint
   }

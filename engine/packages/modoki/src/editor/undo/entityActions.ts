@@ -826,6 +826,17 @@ function isWithinInstanceSubtree(nodeId: number, rootId: number): boolean {
   return false;
 }
 
+/** Whether `id` or any ancestor carries `PrefabInstance` (i.e. `id` sits inside some instance). */
+function hasInstanceAncestorOrSelf(id: number, piMeta: { trait: unknown }): boolean {
+  const byId = new Map(getAllEntities().map((e) => [e.id, e]));
+  const seen = new Set<number>();
+  for (let cur = byId.get(id); cur && !seen.has(cur.id); cur = cur.parentId ? byId.get(cur.parentId) : undefined) {
+    seen.add(cur.id);
+    if (findEntity(cur.id)?.has(piMeta.trait as never)) return true;
+  }
+  return false;
+}
+
 export function reparentEntity(entityId: number, newParentId: number, newSortOrder?: number): boolean {
   // Self-parent + cycle now live in runtime/core/ecs/hierarchy.ts, shared with the device's
   // set-traits guard — the same rule in two places is what #166 P7 found diverging (§9).
@@ -907,20 +918,41 @@ export function reparentEntity(entityId: number, newParentId: number, newSortOrd
   if (piMeta && parentChanged) {
     const moved = findEntity(entityId);
     if (moved?.has(piMeta.trait)) {
-      const rootId = (moved.get(piMeta.trait) as Record<string, unknown>).rootInstanceId as number;
-      if (!isWithinInstanceSubtree(newParentId, rootId)) {
+      const movedPi = moved.get(piMeta.trait) as Record<string, unknown>;
+      const rootId = movedPi.rootInstanceId as number;
+      // A STORED instance root (top-level or user-added) moved OUTSIDE every instance stays an
+      // instance: the save writes it as a top-level entry wherever it lands. For the root itself
+      // `isWithinInstanceSubtree` is false for every legal parent, so without this every root drag
+      // unpacked the whole instance. Dropped INSIDE an instance it still unpacks: the save cannot
+      // represent it there — a parent member owning a row of its prefab classes it as owned and
+      // drops it, an added reference node carries no nested overrides, and under an owned nested
+      // instance nothing captures it at all (#1355 review, #1358).
+      const storedRoot = rootId === entityId && !((movedPi.parentLocalId as number) || 0);
+      const keepLinked = storedRoot && !hasInstanceAncestorOrSelf(newParentId, piMeta);
+      if (!keepLinked && !isWithinInstanceSubtree(newParentId, rootId)) {
         const byParent = new Map<number, number[]>();
         for (const e of getAllEntities()) {
           if (!byParent.has(e.parentId)) byParent.set(e.parentId, []);
           byParent.get(e.parentId)!.push(e.id);
         }
+        // Unpacked too: an OWNED nested instance inside the moved subtree (it expanded from a row of an
+        // instance being unpacked, `parentLocalId` > 0), and its members, recursively. Left linked, it
+        // sits under a now-plain parent, so the save writes it as a top-level instance that STORES its
+        // derived guid and the reload re-derives its members from that — every ref to one dangles
+        // (#1349's shape, via #1355's move). A USER-ADDED nested instance stays linked: the save
+        // already stores its root, and its members derive from it live and on reload alike.
+        const unpacked = new Set<number>([rootId]);
         const stack = [entityId];
         while (stack.length) {
           const id = stack.pop()!;
           const en = findEntity(id);
           if (en?.has(piMeta.trait)) {
             const pd = en.get(piMeta.trait) as Record<string, unknown>;
-            if ((pd.rootInstanceId as number) === rootId) detachTargets.push({ ref: entityRef(id), data: { ...pd } });
+            const owner = pd.rootInstanceId as number;
+            const ownedNestedRoot = owner === id && ((pd.parentLocalId as number) || 0) > 0;
+            if (ownedNestedRoot) unpacked.add(id);
+            if (unpacked.has(owner)) detachTargets.push({ ref: entityRef(id), data: { ...pd } });
+            else if (owner === id) continue; // a stored nested root: its subtree keeps its linkage
           }
           for (const c of byParent.get(id) || []) stack.push(c);
         }

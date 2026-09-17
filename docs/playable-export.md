@@ -11,7 +11,7 @@ of `--target playable` is refused, #40). (Grew out of the `advideo-playable-expo
 
 | File | Role |
 |---|---|
-| `engine/vite.config.ts` (the `isPlayable` branch) | `outDir=ads/`, `inlineDynamicImports` (single JS chunk), sets `MODOKI_PLAYABLE=1`, the `__MODOKI_PLAYABLE__` / `__MODOKI_PLAYABLE_CLICK_URL__` defines, and the playable-only aliases (`@zappar/msdf-generator` + `@<game>/app-services` → stubs) |
+| `engine/vite.config.ts` (the `isPlayable` branch) | `outDir=ads/`, `inlineDynamicImports` (single JS chunk), sets `MODOKI_PLAYABLE=1`, the `__MODOKI_PLAYABLE__` / `__MODOKI_PLAYABLE_CLICK_URL__` defines, and the playable-only aliases (`@zappar/msdf-generator`, its wasm and worker subpaths, + `@<game>/app-services` → stubs) |
 | `engine/plugins/playable-profile.ts` | `isPlayableBuild()` (reads `MODOKI_PLAYABLE`) + the asset-shrink overrides — WebP @ ≤512, downscaled HDR, KTX2-transcoder skip |
 | `engine/plugins/inlinePlayable.ts` | The single-file inliner — gzip+base64 the `{js,css,assets}` payload, a self-extract bootstrap (`DecompressionStream` + inlined `fflate` fallback) that rehydrates assets as `blob:` URLs on `__PLAYABLE_ASSETS__`, and the hard `≤ playableMaxBytes` gate |
 | `engine/plugins/vite-asset-scanner.ts` | Applies the playable profile inside `computeKeptAssets().kept` copy loops; bakes `loadType:'buffer'` for all audio in a playable |
@@ -345,6 +345,12 @@ removes nothing" below for the two that were not, and why they are gone rather t
   build time, and THROWS if `import.meta.url` survives, so a reshaped expression in a later three
   cannot silently bring the pair back. The guard cannot tell a URL asset from a real chunk, so the
   guard stays strict and the emitter gets fixed.
+- **A `?worker` import trips the same guard, even aimed at a stub** (#1356). The runtime imports
+  `@zappar/msdf-generator/worker?worker&url`; the playable alias for it must REPLACE THE QUERY along
+  with the specifier (`(?:\?.*)?$`) and point at `plugins/playable-msdf-worker-url-stub.ts`.
+  Keeping the query, as the wasm entry does, makes Vite build whatever stub it points at as a worker
+  (observed with the query kept and the target `playable-msdf-stub.ts`: the export failed on
+  `assets/playable-msdf-stub-*.js`).
 - **A playable never runs the boot ramp probe** (#221) — `main.tsx` sets
   `setBootProbeAllowed(!__MODOKI_PLAYABLE__)` at module scope, and `tierResolve` refuses on BOTH its
   probe call sites. It is not covered by "one config ⇒ no probe": that short-circuit needs the

@@ -24,7 +24,7 @@ import { setPlayState, getRunMode } from '../../runtime/core/playState';
 import { beginWorldReplacement } from './authoringSettle';
 import { swapHistory, getEditVersion } from '../undo/undoManager';
 import { editorEmit } from '../editorJournal';
-import { captureInstanceOverrides, captureInstanceStructure, getPrefabSource, getCachedPrefabSync } from './prefab';
+import { captureInstanceOverrides, captureInstanceStructure, getPrefabSource, getCachedPrefabSync, preloadNestedPrefabs } from './prefab';
 import type { AddedEntity, NestedOverridePaths } from '../../runtime/loaders/loadSceneFile';
 import { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, collectResourceRefsFromEntities, SceneFormatRefusedError } from '../../runtime/loaders/loadSceneFile';
 import { newGuid, isInternalAssetPath, getGuidForPath, registerAsset } from '../../runtime/loaders/assetManifest';
@@ -376,6 +376,9 @@ export async function serializeScene(opts?: {
   for (const [rootId, { source }] of prefabRootInfo) {
     const prefab = await getPrefabSource(source);
     if (!prefab) continue;
+    // A nested row whose instance is gone is recorded as removed only when its prefab is cached
+    // (#1355), and a deleted instance's source is not among the live ones preloaded above.
+    await preloadNestedPrefabs(prefab);
     const s = captureInstanceStructure(rootId, prefab);
     for (const ecsId of s.consumedEcsIds) prefabChildIds.add(ecsId);
     if (s.added.length || s.removed.length || Object.keys(s.removedTraits).length) {

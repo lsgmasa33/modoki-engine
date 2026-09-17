@@ -266,6 +266,32 @@ so the condition can never be silent again. **The lock is correctness, not throt
 `DynamicFontProvider.flush()`'s `generating` flag does not cover it, being per provider when
 the race is *between* providers.
 
+### The generator's worker and wasm reach a build only as URLs WE hand it
+
+The lib self-resolves both files with `new URL(..., import.meta.url)`, and **neither survives a
+production build** — the dev server hides both, because it serves and transforms files straight
+out of `node_modules`. `msdfGenerate.ts` therefore passes both explicitly:
+
+- **wasm** — `msdfgen_wasm.wasm?url`. The lib's own lookup sits inside an emscripten ternary that
+  Vite does not recognise, so no wasm was emitted and Court's iOS build hung on its splash (the
+  init never settled; the timeouts in `msdfGenerate.ts` exist because of it).
+- **worker** — `worker?worker&url` (#1356). Vite DID recognise the lib's `new URL("./worker.js",
+  import.meta.url)`, but as a plain ASSET: it copied `dist/worker.js` verbatim, with its
+  `import … from "comlink"`. A module Worker cannot resolve a bare specifier, so every web and
+  native build shipped a worker that errored on load, and dynamic glyphs ended at the init timeout.
+  Observed in headless Chromium against a built `demos/forest-camp`: the shipped worker fired
+  `error`, and the same text with only its `comlink` line stubbed out ran. `?worker&url` makes Vite
+  bundle the worker with comlink inlined; the fixed build generated an atlas in the same browser.
+
+Both subpaths need a regex alias ahead of the package-dir alias in `engine/vite.config.ts` (a plain
+string cannot match an id with a query), guarded by `viteConfigMsdfAlias.test.ts`.
+`engine/plugins/msdfWorkerAssetStrip.ts` turns the lib's worker fallback into a throw, so the
+broken copy is no longer emitted, and a build that somehow skips `workerUrl` fails at construction
+instead of waiting out the timeout. It throws at BUILD time if a later lib version reshapes the
+expression. ⚠️ A playable swallows the `?worker&url` query in its alias (a worker bundle is a
+separate `.js` file, and the inliner refuses those) — see
+[playable-export.md](playable-export.md).
+
 ### The generator's cell padding is `floor(fieldRange/2)`, not the `padding` option
 
 The `padding` option is only the packer's gap *between* cells in its scratch atlas; each glyph
@@ -332,6 +358,7 @@ chunked to fit it.
 | GUID → provider, scene refcount | `runtime/loaders/fontAtlasLoader.ts` |
 | Baked / dynamic providers | `runtime/rendering/text/fontProvider.ts`, `dynamicFontProvider.ts` |
 | Runtime generation (shared worker + lock) | `runtime/rendering/text/msdfGenerate.ts` |
+| Worker/wasm build wiring | `engine/vite.config.ts` aliases, `engine/plugins/msdfWorkerAssetStrip.ts` |
 | Generator output → our glyph format | `runtime/rendering/text/dynamicGlyphMap.ts` |
 | Layout (shared by 2D + 3D) | `runtime/rendering/text/layoutText.ts` |
 | Codepoints for `ensureGlyphs` (shared by 2D + 3D) | `runtime/rendering/text/textCodepoints.ts` |
