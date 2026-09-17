@@ -533,6 +533,8 @@ export default defineConfig(({ command }) => {
         '@modoki/engine/runtime/core/adPacing',
         // #1332 — both games' AppsFlyer wiring imports the promoted attribution lifecycle.
         '@modoki/engine/runtime/core/attribution',
+        // #1274 — both games' auth wrappers hash login keys with the account-continuity module.
+        '@modoki/engine/runtime/sync/accountContinuity',
         '@modoki/engine/runtime/debug',
         '@modoki/engine/editor',
         '@modoki/engine/editor/rendering',

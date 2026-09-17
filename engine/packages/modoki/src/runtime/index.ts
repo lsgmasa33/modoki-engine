@@ -111,6 +111,9 @@ export { createPrefsDocStore, type PrefsDocStore } from './storage/prefsDocStore
 export {
   defineSyncGroup, emptyMarks, neverSynced, decideGroup, hasLocalWrites, scopeMarksToAccount,
   runGroupSync, runCloudSync, resolveGroupFork, CloudSyncCoordinator,
+  // #1274 — what a game needs to wire `RunSyncOptions.continuity`. `loginKey` has its own narrow subpath
+  // (`runtime/sync/accountContinuity`) for the auth wrappers, which stay off the barrel.
+  parseLoginRecord, type AccountContinuity, type LoginRecord,
   type AnySyncGroup, type CloudGroup, type CloudSyncDeps, type ConflictChoice, type ForkPolicy,
   type GroupAtomicity, type GroupDecision, type GroupMarks, type GroupOutcome, type GroupStore,
   type GroupTransport, type LocalGroup, type PendingConflict, type ResolveForkOptions,

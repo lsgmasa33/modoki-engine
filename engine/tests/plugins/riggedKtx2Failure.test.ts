@@ -9,6 +9,7 @@ import path from 'path';
 import { describe, it, expect, vi, beforeAll, afterAll, beforeEach } from 'vitest';
 import { makeTestGlb } from './fixtures/makeTestGlb';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
+import { readScannedSource } from '@modoki/engine/testing';
 
 const fake = vi.hoisted(() => ({ toktxPresent: true, toktxDir: '', encodeFails: false, encodes: 0 }));
 
@@ -130,6 +131,13 @@ describe('rigged KTX2 failure is never published (#1337)', () => {
     expect(riggedConversionFailure('/a.glb', { ktx2Skipped: 'toktx missing' }))
       .toEqual({ virtualPath: '/a.glb', kind: 'rigged model', error: 'KTX2 skipped — toktx missing' });
     expect(riggedConversionFailure('/a.glb', {})).toBeNull();
+  });
+
+  it('the production build actually pushes that failure — the scanner call site is the fix', () => {
+    // The scanner's rigged branch is a Vite plugin hook with no seam a unit test can drive, so pin
+    // the two lines by source: deleting the push keeps every behavioural test green (#1337 review).
+    const scanner = readScannedSource(path.join(__dirname, '../../plugins/vite-asset-scanner.ts')).code;
+    expect(scanner).toMatch(/const skipped = riggedConversionFailure\(virtualPath, conv\);\s*if \(skipped\) conversionFailures\.push\(skipped\);/);
   });
 
   it('a non-KTX2 format is not a skip', async () => {

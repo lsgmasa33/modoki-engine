@@ -882,8 +882,9 @@ export function resolve(id: ToolId): DetectResult & { present: true } {
 /**
  * Return `env` with a resolved tool's DIRECTORY prepended to PATH, so a child process that spawns
  * the tool by BARE NAME finds our resolved copy. This is the fix for tools invoked indirectly:
- * @gltf-transform/cli calls `toktx` on PATH internally, so a packaged build (where toktx lives at
- * MODOKI_TOKTX, not on PATH) must inject that dir. No-op when the tool is already on PATH or absent.
+ * @gltf-transform/cli 4.4 calls KTX-Software's `ktx` on PATH internally, and the pinned/bundled `ktx`
+ * sits beside toktx (#1351), so injecting toktx's dir makes that copy the one found — in a packaged
+ * build toktx lives at MODOKI_TOKTX, not on PATH. No-op when the tool is absent.
  */
 export function withToolOnPath(id: ToolId, env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const d = detect(id)

@@ -776,6 +776,7 @@
   "parseClipBankResult",
   "parseEntryPrefabs",
   "parseFontFilename",
+  "parseLoginRecord",
   "parsePointsToPhys",
   "patchAnchorPct",
   "patchToggle",

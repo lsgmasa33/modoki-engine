@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -214,6 +214,79 @@ describe('conversionCliProvision — ensureConversionCli (mocked fetch)', () => 
     expect(logs.join('\n')).toMatch(/has no ktx — reinstalling/)
     expect(fs.readFileSync(conversionCliBin(base, 'toktx', TEST_PLATFORM), 'utf8')).toBe('new toktx')
     expect(fs.readdirSync(dir).sort()).toEqual(['ktx', 'toktx'])
+  })
+
+  it('a repair whose move-in fails puts the old RUNNING copy back instead of leaving no tool', async () => {
+    const bytes = Buffer.from('a pkg with ktx, held')
+    CONVERSION_CLI_PINS.toktx.dist[TEST_KEY] = {
+      url: 'https://example.invalid/k3.pkg', sha256: sha(bytes), kind: 'macos-pkg',
+      files: [['p/toktx', 'toktx'], ['p/ktx', 'ktx']],
+    }
+    const dir = conversionCliDir(base, 'toktx')
+    const bin = conversionCliBin(base, 'toktx', TEST_PLATFORM)
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(bin, 'old toktx') // runs, but no ktx
+    const expand = async (_k: string, _a: string, dest: string) => {
+      fs.mkdirSync(path.join(dest, 'p'), { recursive: true })
+      fs.writeFileSync(path.join(dest, 'p', 'toktx'), 'new toktx')
+      fs.writeFileSync(path.join(dest, 'p', 'ktx'), 'new ktx')
+    }
+    // A scanner holding the freshly staged files: every move of `staged` onto the live dir fails.
+    const realRename = fs.renameSync
+    const spy = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (String(from).endsWith(`${path.sep}staged`) && String(to) === dir) {
+        throw Object.assign(new Error('EBUSY: resource busy'), { code: 'EBUSY' })
+      }
+      return realRename(from, to)
+    })
+    try {
+      await expect(ensureConversionCli('toktx', base, opts(fakeFetch(bytes), { expand, probe: () => true }))).rejects.toThrow(/EBUSY/)
+    } finally {
+      spy.mockRestore()
+    }
+    expect(fs.readFileSync(bin, 'utf8')).toBe('old toktx')
+    expect(fs.readdirSync(path.dirname(dir)).filter((n) => n.includes('.discard-'))).toEqual([])
+  })
+
+  it('a held incomplete copy fails with the in-use reason; a held OLD copy after the swap does not fail the repair', async () => {
+    const bytes = Buffer.from('a pkg with ktx, held old')
+    CONVERSION_CLI_PINS.toktx.dist[TEST_KEY] = {
+      url: 'https://example.invalid/k4.pkg', sha256: sha(bytes), kind: 'macos-pkg',
+      files: [['p/toktx', 'toktx'], ['p/ktx', 'ktx']],
+    }
+    const dir = conversionCliDir(base, 'toktx')
+    const bin = conversionCliBin(base, 'toktx', TEST_PLATFORM)
+    const expand = async (_k: string, _a: string, dest: string) => {
+      fs.mkdirSync(path.join(dest, 'p'), { recursive: true })
+      fs.writeFileSync(path.join(dest, 'p', 'toktx'), 'new toktx')
+      fs.writeFileSync(path.join(dest, 'p', 'ktx'), 'new ktx')
+    }
+    const realRename = fs.renameSync
+    const realRm = fs.rmSync
+    const busy = () => Object.assign(new Error('EBUSY: resource busy'), { code: 'EBUSY' })
+
+    // 1. The old dir cannot be moved aside at all → the friendly reason, and the old copy stays.
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(bin, 'old toktx')
+    const spy = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (String(from) === dir && String(to).includes('.discard-')) throw busy()
+      return realRename(from, to)
+    })
+    try {
+      await expect(ensureConversionCli('toktx', base, opts(fakeFetch(bytes), { expand, probe: () => true })))
+        .rejects.toThrow(/is incomplete and could not be moved aside/)
+    } finally { spy.mockRestore() }
+    expect(fs.readFileSync(bin, 'utf8')).toBe('old toktx')
+
+    // 2. The swap succeeds but deleting the old copy fails → the repair still succeeds.
+    const rmSpy = vi.spyOn(fs, 'rmSync').mockImplementation((p, o) => {
+      if (String(p).includes('.discard-')) throw Object.assign(new Error('EPERM'), { code: 'EPERM' })
+      return realRm(p, o)
+    })
+    try {
+      expect(await ensureConversionCli('toktx', base, opts(fakeFetch(bytes), { expand, probe: () => true }))).toBe(bin)
+    } finally { rmSpy.mockRestore() }
+    expect(fs.readFileSync(bin, 'utf8')).toBe('new toktx')
   })
 
   it('is idempotent — a present binary is returned without downloading', async () => {

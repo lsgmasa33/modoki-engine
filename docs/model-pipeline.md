@@ -285,7 +285,12 @@ has two failure modes with opposite handling:
   then a cache hit on every later import, with the strict gate seeing neither case. A dev reimport
   now surfaces the error (owner's call, 2026-09-17: loud over silently uncompressed).
 
-Covered by `engine/tests/plugins/riggedKtx2Failure.test.ts` (faked CLI, real cache publication).
+`RIGGED_ENCODER_VERSION` 3 retires entries written before this, which a key cannot tell apart from
+good ones. That applies to BUILDS and REIMPORTS, which recompute the hash. The dev viewport serves the
+hash stored in `.meta.local.json` until the model is next reimported.
+
+Covered by `engine/tests/plugins/riggedKtx2Failure.test.ts` (faked CLI, real cache publication; the
+scanner's push is pinned by source, because the plugin hook has no seam a unit test can drive).
 
 **Deferred follow-ups** (tracked, not scheduled):
 - **AnimSet playback preview** — the Inspector shows numeric clip params only; a real preview

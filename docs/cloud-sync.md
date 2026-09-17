@@ -417,7 +417,32 @@ changed the engine:
   - A transport without the method keeps the old behaviour; Court wires it in #1263.
   - **Not reached:** a phone that syncs only after its deleted account's token has lapsed — the next-day case. On
     a cold launch, the auth plugin's own token listener makes the failing refresh first, and the SDK signs out, so
-    the game sees an ordinary sign-out and keeps the save (reasoned from the plugin's source). See [Weaveling's accounts.md](../games/wordweave/docs/accounts.md) § "An account deleted on another device".
+    the game sees an ordinary sign-out and keeps the save. Measured wider than that on Court: an iPad launched
+    two minutes after the delete was already signed out (#1274). See [Weaveling's accounts.md](../games/wordweave/docs/accounts.md) § "An account deleted on another device".
+- **A sign-in with a deleted account's login wipes the leftover save** (#1274, `runtime/sync/accountContinuity.ts`).
+  This covers the phone `confirmAccount` cannot reach, at the moment its save would do harm: the player signs in
+  again, Firebase makes a new uid for the same Apple or Google login, and the next sync would upload the deleted
+  account's save into it (observed on Court).
+  - **The evidence:** while an account exists, a provider login belongs to exactly one account. A new uid holding a
+    login the previous account had means that account is gone.
+  - **The mechanism:** a game passes `RunSyncOptions.continuity`: the signed-in account's login keys, plus a
+    one-record store. The keys are SHA-256 of provider and provider user id (`loginKey`), so the provider's id is
+    never stored.
+    - Before any group runs, `runCloudSync` compares those keys with the recorded account's. A shared key, plus a
+      group holding marks that account exchanged, returns `account-gone` with the PREVIOUS uid.
+    - Otherwise it records the current account.
+  - **`account-gone` carries `uid`**, so a game can tell the two sources apart. Both games wipe. They sign out only
+    when `uid` is the signed-in account; after a same-login sign-in the player stays signed in to the new account
+    (owner, 2026-09-17).
+  - **A different login is an ordinary switch.** Unknown keys (`[]`, a throw, off-native) skip the check for that
+    sync, and the switch then goes ahead for good; that is journalled (`sync.account-continuity.keys-unknown`)
+    whenever a match was possible. The journal exists only in editor and debug builds, so a store build stays
+    silent about it.
+  - **A phone with no record is not covered.** Only a sync that ran with the check writes one, so a phone whose
+    deleted account never synced after the update switches as before.
+  - **Still not reached:** a phone that stays signed out keeps the deleted account's save. Both games leave that
+    phone as is (Weaveling 2026-09-15, Court 2026-09-17). Catching it would need a record a signed-out client can
+    read, which means a server change.
 - **A fork carries the store as it is when the question is asked**, never the pass's start. Found on a device:
   an upload parked offline spanned a level the player finished, so the dialog's "this device" rows were one
   level short. `resolveGroupFork` always re-read the save, so no answer was ever wrong — only what the player was

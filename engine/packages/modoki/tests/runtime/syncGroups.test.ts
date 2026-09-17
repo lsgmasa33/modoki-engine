@@ -6,12 +6,19 @@
  * `fakeServer()`.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+
+const { journalWarn } = vi.hoisted(() => ({ journalWarn: vi.fn() }));
+vi.mock('../../src/runtime/core/gameJournal', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/runtime/core/gameJournal')>()),
+  journalWarn,
+}));
 import {
   decideGroup, hasLocalWrites, scopeMarksToAccount, emptyMarks, neverSynced,
   defineSyncGroup, runGroupSync, runCloudSync, resolveGroupFork,
   type AnySyncGroup, type CloudGroup, type ForkPolicy, type GroupMarks, type GroupStore,
   type GroupTransport, type LocalGroup,
+  loginKey, parseLoginRecord, type AccountContinuity, type LoginRecord,
 } from '../../src/runtime/sync';
 
 // ── Fakes ──────────────────────────────────────────────────────────────────────
@@ -757,7 +764,7 @@ describe('confirmAccount', () => {
   it('gone: account-gone, nothing pushed, and it asked once, about THIS sync\'s uid', async () => {
     const { s, g } = syncedButMissing();
     const x = transportWith(() => 'gone');
-    expect(await runGroupSync(g, x.transport, OPTS)).toEqual({ kind: 'account-gone' });
+    expect(await runGroupSync(g, x.transport, OPTS)).toEqual({ kind: 'account-gone', uid: OPTS.uid });
     expect(x.t.pushes).toHaveLength(0);
     expect(s.writes).toHaveLength(0);
     expect(x.asks).toEqual(['u1']);
@@ -812,8 +819,147 @@ describe('confirmAccount', () => {
     const gB = defineSyncGroup<Content>({ ...(b.g as unknown as Parameters<typeof defineSyncGroup<Content>>[0]), id: 'second' });
     const x = transportWith(() => 'gone');
     const result = await runCloudSync([a.g, gB], x.transport, OPTS);
-    expect(result.outcomes.g).toEqual({ kind: 'account-gone' });
+    expect(result.outcomes.g).toEqual({ kind: 'account-gone', uid: OPTS.uid });
     expect(result.outcomes.second).toBeUndefined();
+  });
+});
+
+// ── account continuity — a previous account deleted while this device was closed (#1274) ─────────────────
+
+describe('account continuity', () => {
+  const PREV = 'deleted-uid';
+  const NOW_UID = OPTS.uid;
+  /** A continuity whose record starts as `record` and whose signed-in account has `keys`. */
+  function continuityWith(record: LoginRecord | null, keys: readonly string[] | (() => never)) {
+    const writes: LoginRecord[] = [];
+    let stored = record;
+    const c: AccountContinuity = {
+      loginKeys: async () => (typeof keys === 'function' ? keys() : keys),
+      read: () => stored,
+      write: (r) => { stored = r; writes.push(r); },
+    };
+    return { c, writes, stored: () => stored };
+  }
+  /** A group holding a save exchanged under `uid` (v3), with the server still at v3 for whoever reads it. */
+  function heldBy(uid: string, lastSyncedVersion = 3) {
+    const s = makeStore({
+      content: { value: 'old save' }, version: 3, updatedAt: 0,
+      marks: marks({ uid, lastSyncedVersion, lastSyncedFingerprint: 'old save' }),
+    });
+    return { s, g: group({ store: s.store }) };
+  }
+  function countingTransport() {
+    const t = fakeTransport();
+    let loads = 0;
+    const transport: GroupTransport = { ...t.transport, load: async (id) => { loads++; return t.transport.load(id); } };
+    return { t, transport, loads: () => loads };
+  }
+
+  it('the same login under a new uid: account-gone for the PREVIOUS uid, before any group loads or writes', async () => {
+    const { s, g } = heldBy(PREV);
+    const x = countingTransport();
+    const k = continuityWith({ uid: PREV, keys: ['google-key'] }, ['google-key']);
+    const result = await runCloudSync([g], x.transport, { ...OPTS, continuity: k.c });
+    expect(result.outcomes.g).toEqual({ kind: 'account-gone', uid: PREV });
+    expect(x.loads()).toBe(0);
+    expect(x.t.pushes).toHaveLength(0);
+    expect(s.writes).toHaveLength(0);
+    // Left for the sync after the wipe to replace.
+    expect(k.writes).toEqual([]);
+  });
+
+  it('a different login is an ordinary account switch: the groups run, and the new account is recorded', async () => {
+    const { g } = heldBy(PREV);
+    const x = countingTransport();
+    const k = continuityWith({ uid: PREV, keys: ['apple-key'] }, ['google-key']);
+    const result = await runCloudSync([g], x.transport, { ...OPTS, continuity: k.c });
+    expect(result.outcomes.g?.kind).not.toBe('account-gone');
+    expect(x.loads()).toBe(1);
+    expect(k.writes).toEqual([{ uid: NOW_UID, keys: ['google-key'] }]);
+  });
+
+  it('⚠️ a matching login is not enough when no group holds a save that account exchanged', async () => {
+    for (const held of [heldBy(PREV, 0), heldBy('someone-else')]) {
+      const k = continuityWith({ uid: PREV, keys: ['google-key'] }, ['google-key']);
+      const result = await runCloudSync([held.g], countingTransport().transport, { ...OPTS, continuity: k.c });
+      expect(result.outcomes.g?.kind).not.toBe('account-gone');
+    }
+  });
+
+  it('a record with no keys (written before this check existed) never matches', async () => {
+    const { g } = heldBy(PREV);
+    const k = continuityWith({ uid: PREV, keys: [] }, ['google-key']);
+    const result = await runCloudSync([g], countingTransport().transport, { ...OPTS, continuity: k.c });
+    expect(result.outcomes.g?.kind).not.toBe('account-gone');
+  });
+
+  it('⚠️ unknown keys ([] or a throw) skip the check, leave the record alone, and say so when a match was possible', async () => {
+    for (const keys of [[] as string[], () => { throw new Error('bridge'); }]) {
+      journalWarn.mockClear();
+      const { g } = heldBy(PREV);
+      const k = continuityWith({ uid: PREV, keys: ['google-key'] }, keys as never);
+      const result = await runCloudSync([g], countingTransport().transport, { ...OPTS, continuity: k.c });
+      expect(result.outcomes.g?.kind).not.toBe('account-gone');
+      expect(k.writes).toEqual([]);
+      expect(journalWarn.mock.calls).toEqual([['sync.account-continuity.keys-unknown', {}]]);
+    }
+  });
+
+  it('unknown keys with nothing to match (the same account, or no previous save) journal nothing', async () => {
+    for (const [record, held] of [
+      [{ uid: NOW_UID, keys: ['k'] }, heldBy(NOW_UID)],
+      [{ uid: PREV, keys: ['k'] }, heldBy(PREV, 0)],
+      [null, heldBy(PREV)],
+    ] as const) {
+      journalWarn.mockClear();
+      const k = continuityWith(record, []);
+      await runCloudSync([held.g], countingTransport().transport, { ...OPTS, continuity: k.c });
+      expect(journalWarn).not.toHaveBeenCalled();
+    }
+  });
+
+  it('an unreadable record reads as none: no match, and the current account is recorded', async () => {
+    const { g } = heldBy(PREV);
+    const k = continuityWith(null, ['google-key']);
+    k.c.read = () => { throw new Error('corrupt'); };
+    const result = await runCloudSync([g], countingTransport().transport, { ...OPTS, continuity: k.c });
+    expect(result.outcomes.g?.kind).not.toBe('account-gone');
+    expect(k.writes).toEqual([{ uid: NOW_UID, keys: ['google-key'] }]);
+  });
+
+  it('the same account is re-recorded only when its keys change', async () => {
+    const { g } = heldBy(NOW_UID);
+    const same = continuityWith({ uid: NOW_UID, keys: ['a', 'g'] }, ['g', 'a']);
+    await runCloudSync([g], countingTransport().transport, { ...OPTS, continuity: same.c });
+    expect(same.writes).toEqual([]);
+    const linked = continuityWith({ uid: NOW_UID, keys: ['a'] }, ['a', 'g']);
+    await runCloudSync([g], countingTransport().transport, { ...OPTS, continuity: linked.c });
+    expect(linked.writes).toEqual([{ uid: NOW_UID, keys: ['a', 'g'] }]);
+  });
+
+  it('no signed-in uid: nothing is asked or recorded', async () => {
+    const { g } = heldBy(PREV);
+    let asked = 0;
+    const k = continuityWith({ uid: PREV, keys: ['google-key'] }, ['google-key']);
+    k.c.loginKeys = async () => { asked++; return ['google-key']; };
+    await runCloudSync([g], countingTransport().transport, { ...OPTS, uid: '', continuity: k.c });
+    expect(asked).toBe(0);
+    expect(k.writes).toEqual([]);
+  });
+
+  it('loginKey is a stable SHA-256 hex of provider AND id — the same id under another provider is another login', async () => {
+    const google = await loginKey('google.com', '1234');
+    expect(google).toMatch(/^[0-9a-f]{64}$/);
+    expect(await loginKey('google.com', '1234')).toBe(google);
+    expect(await loginKey('apple.com', '1234')).not.toBe(google);
+    expect(google).not.toContain('1234');
+  });
+
+  it('parseLoginRecord accepts exactly { uid: string, keys: string[] }', () => {
+    expect(parseLoginRecord({ uid: 'u', keys: ['k'] })).toEqual({ uid: 'u', keys: ['k'] });
+    for (const bad of [null, 'u', { uid: 1, keys: [] }, { uid: 'u' }, { uid: 'u', keys: [1] }]) {
+      expect(parseLoginRecord(bad)).toBeNull();
+    }
   });
 });
 

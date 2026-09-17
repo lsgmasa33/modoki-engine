@@ -325,14 +325,41 @@ export async function ensureConversionCli(
     // The toolchain dir is machine-wide and several editors (one per clone) install into it, so
     // another process can finish the same install while this one downloads. Rename FIRST — it
     // fails when a dir is already there — and a complete dir there is the winner's (same pinned
-    // bytes): keep it. Only a dir missing a kept file is debris (or a pre-#1351 install), and it is moved aside
-    // atomically before the retry, so no path ever deletes a dir in place that someone may use.
+    // bytes): keep it. Only a dir missing a kept file is debris (or a pre-#1351 install): it is SWAPPED
+    // — moved aside, the staged copy moved in, and only then deleted — so a failed move-in (a Windows
+    // scanner holding the fresh files) puts the old copy back instead of leaving no tool at all, and no
+    // path ever deletes a dir in place that someone may use.
     try {
       fs.renameSync(staged, dir)
     } catch (e) {
       if (missingFile()) {
-        discard(dir, () => !!missingFile())
-        try { fs.renameSync(staged, dir) } catch (e2) { if (missingFile()) throw e2 }
+        const aside = `${dir}.discard-${process.pid}-${Date.now()}`
+        try {
+          fs.renameSync(dir, aside)
+        } catch (eAside) {
+          // Gone already (a sibling discarded it) is fine; still there and held is not.
+          if (fs.existsSync(dir) && missingFile()) {
+            throw new Error(
+              `${id} ${label} under ${dir} is incomplete and could not be moved aside to replace it ` +
+              '(is it in use, or held by antivirus?). Close what uses it and retry.', { cause: eAside })
+          }
+        }
+        try {
+          fs.renameSync(staged, dir)
+        } catch (e2) {
+          if (fs.existsSync(aside) && !fs.existsSync(dir)) {
+            try {
+              fs.renameSync(aside, dir)
+            } catch {
+              throw new Error(
+                `${id} ${label}: the repaired copy could not be moved into ${dir}, and the previous copy could not ` +
+                `be moved back — it is parked at ${aside}. Close what holds these files and retry.`, { cause: e2 })
+            }
+          }
+          if (missingFile()) throw e2
+        }
+        // The install already succeeded; a scanner holding a file in the OLD copy must not fail it.
+        try { fs.rmSync(aside, { recursive: true, force: true, maxRetries: 3 }) } catch { /* debris, not a failure */ }
       } else if (!['ENOTEMPTY', 'EEXIST', 'EPERM', 'EBUSY'].includes((e as NodeJS.ErrnoException).code ?? '')) {
         throw e
       }

@@ -7,6 +7,7 @@
  *  a given.
  */
 
+import { previousAccountGone, type AccountContinuity } from './accountContinuity';
 import { decideGroup, scopeMarksToAccount } from './decide';
 import { neverSynced } from './types';
 import type {
@@ -26,10 +27,15 @@ export type GroupOutcome =
    *  #1253, see the fork branch in `runGroupSync`.) */
   | { kind: 'fork'; local: LocalGroup<never>; server: CloudGroup<never> }
   | { kind: 'failed'; reason: string }
-  /** This device had synced the group, its document is gone, and `GroupTransport.confirmAccount` says the
-   *  account itself was deleted — on another device. Nothing is written; what happens to the local save is
-   *  the game's call. `runCloudSync` stops at the first one. */
-  | { kind: 'account-gone' }
+  /** Account `uid` was deleted on another device, and the local save is still that account's. Nothing is
+   *  written; what happens to the local save is the game's call. `runCloudSync` stops at the first one.
+   *
+   *  Two sources, told apart by `uid`:
+   *  - `uid` is the sync's own: this device had synced the group, its document is gone, and
+   *    `GroupTransport.confirmAccount` says the account no longer exists (#1263).
+   *  - `uid` is a PREVIOUS account: the player signed in to a new account with a login the previous one had
+   *    (`accountContinuity.ts`, #1274). The signed-in account is fine; only the save is stale. */
+  | { kind: 'account-gone'; uid: string }
   /** `resolveGroupFork`'s push lost a race — the server moved again while the player was deciding.
    *  The caller must re-run a full `runGroupSync`/`runCloudSync` pass for this group rather than treat it
    *  as a plain failure; see `resolveFork.ts`'s docblock for why a bare `'conflict'` is not enough. */
@@ -40,6 +46,8 @@ export interface RunSyncOptions {
   /** Wall-clock ms, injected — never read in here. See `GroupMarks.lastSyncedAt`. */
   now: number;
   maxAttempts?: number;
+  /** Turns on the previous-account check in `runCloudSync` (#1274). Ignored by `runGroupSync` on its own. */
+  continuity?: AccountContinuity;
 }
 
 const DEFAULT_MAX_ATTEMPTS = 3;
@@ -214,7 +222,7 @@ export async function runGroupSync(
     // it. Ask before recreating: see `GroupTransport.confirmAccount` for the two-device deletion this stops.
     if (decision.action === 'create' && local.marks.lastSyncedVersion > 0 && transport.confirmAccount) {
       const status = await askAccount(transport, opts.uid);
-      if (status === 'gone') return { kind: 'account-gone' };
+      if (status === 'gone') return { kind: 'account-gone', uid: opts.uid };
       if (status !== 'exists') return { kind: 'failed', reason: 'document missing and the account could not be confirmed' };
     }
 
@@ -478,6 +486,15 @@ export async function runCloudSync(
 ): Promise<RunSyncResult> {
   const outcomes: Record<string, GroupOutcome> = {};
   const asking: string[] = [];
+  // Before any group runs: a group that ran first would re-scope its marks to the new account and upload the
+  // deleted account's save into it.
+  if (opts.continuity && groups.length > 0) {
+    const gone = await previousAccountGone(groups, opts.continuity, opts.uid);
+    if (gone !== null) {
+      outcomes[groups[0].id] = { kind: 'account-gone', uid: gone };
+      return { outcomes, asking };
+    }
+  }
   for (const group of groups) {
     const outcome = await runGroupSync(group, transport, opts);
     outcomes[group.id] = outcome;

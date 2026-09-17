@@ -23,6 +23,7 @@
     "./runtime/core/adLifecycle": "./src/runtime/core/adLifecycle.ts",
     "./runtime/core/attribution": "./src/runtime/core/attribution.ts",
     "./runtime/core/adPacing": "./src/runtime/core/adPacing.ts",
+    "./runtime/sync/accountContinuity": "./src/runtime/sync/accountContinuity.ts",
     "./editor": "./src/editor/index.ts",
     "./editor/rendering": "./src/editor/rendering/index.ts",
     "./three": "./src/three/index.ts",

@@ -13,6 +13,9 @@ export {
 export {
   runGroupSync, runCloudSync, type GroupOutcome, type RunSyncOptions, type RunSyncResult,
 } from './runGroupSync';
+export {
+  loginKey, parseLoginRecord, previousAccountGone, type AccountContinuity, type LoginRecord,
+} from './accountContinuity';
 export { resolveGroupFork, type ResolveForkOptions } from './resolveFork';
 export {
   CloudSyncCoordinator,

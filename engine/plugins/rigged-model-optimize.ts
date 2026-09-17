@@ -10,7 +10,7 @@
  *  `convertModel` — derives a NEW optimized GLB into the gitignored model cache
  *  and NEVER touches the committed source:
  *    1. resize embedded textures to the texture setting's maxSize (downscale)
- *    2. KTX2-compress them (gltf-transform `uastc`/`etc1s`, via toktx)
+ *    2. KTX2-compress them (gltf-transform `uastc`/`etc1s`, via KTX-Software's `ktx` pinned beside toktx)
  *    3. meshopt-compress geometry + animation (EXT_meshopt_compression — the
  *       runtime already wires MeshoptDecoder)
  *  All passes preserve skinning + clips.
@@ -38,8 +38,8 @@ import type { ConversionFailure } from './asset-conversion-strict';
 
 /** Bump when the conversion recipe changes (passes, flags, tool expectations)
  *  so the content hash changes and previously-derived cache GLBs regenerate.
- *  v2: added the submesh-merge pass (joinPrimitives by material). */
-/** v3 (#1337/#1351): retires entries a swallowed KTX2 failure published as raw textures under the
+ *  v2: added the submesh-merge pass (joinPrimitives by material).
+ *  v3 (#1337/#1351): retires entries a swallowed KTX2 failure published as raw textures under the
  *  with-toktx key, and ones an unpinned PATH `ktx` encoded — neither is distinguishable by its key. */
 export const RIGGED_ENCODER_VERSION = 3;
 
@@ -116,9 +116,6 @@ function missingKtxBesideToktx(dir: string): string | null {
     '`npm run toolchain:install -- toktx msdf-atlas-gen`, or Build → Build Support….';
 }
 
-/** For tests — the rigged path's `ktx`-beside-toktx requirement (#1351). */
-export { missingKtxBesideToktx as __missingKtxBesideToktx };
-
 /** For tests — the rigged path's own toktx probe (#1327: a miss must not stick). */
 export { probeToktx as __probeRiggedToktx };
 
@@ -126,8 +123,8 @@ export { probeToktx as __probeRiggedToktx };
 function runGltfTransform(args: string[], label: string): void {
   try {
     // Resolve the CLI (packaged userData install → PATH; dev → npx --no-install). Its KTX2 passes
-    // (uastc/etc1s) spawn `toktx` by bare name, so inject the resolved toktx dir into PATH — makes
-    // the packaged bundled toktx (MODOKI_TOKTX) reachable.
+    // (uastc/etc1s) spawn KTX-Software's `ktx` by bare name (gltf-transform 4.4), so inject the
+    // resolved toktx dir into PATH — the pinned/bundled `ktx` sits beside toktx (#1351).
     const inv = gltfTransformInvocation();
     const s = spawnable(inv.command, [...inv.prefixArgs, ...args]);
     execFileSync(s.command, s.args, {
