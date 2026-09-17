@@ -166,6 +166,22 @@ if (score > best) PlayerPrefs.set('bestScore', score);
   `action:'delete'` on a protected key proceeds instead of a false `NOT_FOUND` (the key reads as
   absent from `has()`, same as any other key this protects), and `action:'set'` on one reports the
   protected cause instead of misdiagnosing it as a non-serializable value.
+  ⚠️ **Which listing a DELETE loop wants is a judgement, and it has to be recorded AT the call site**
+  (#1286). `keys()` and `keysIncludingProtected()` look identical in code, so nothing but a comment
+  distinguishes "this deletes because the player asked" from "this deletes as a side effect of a
+  background sync" — and the answers are opposite. Two worked examples, deliberately disagreeing: a
+  WIPE (`clearProgress` in `games/court/runtime/systems.ts`, `clearSavedProgress` in
+  `games/wordweave/runtime/systems.ts`) uses `keysIncludingProtected()`, because a debug or account
+  wipe is the player's own instruction and a board this build cannot decode is still their data to
+  destroy; a SYNC ADOPTION (`applyProgressSyncedSave`, `writeProgressFromSync`) keeps `keys()`,
+  because a background adoption carries no user intent and #630's whole design is that a newer
+  build's save is not stomped by a build that cannot read it. The adoption sites also record the
+  **cost** that accepts: the undecodable board survives, and `set()` refuses that key until
+  something deletes it BY NAME — a wipe, or (in wordweave, #1286 review) finishing that level, whose
+  clear tail deletes the board. Court's sync site was widened during #1276 and reverted on review;
+  wordweave's was a bare loop with no comment at all, one sweep away from the same "fix". An
+  unannotated `keys()` in a delete loop is therefore the same defect as a wrong one, wearing the
+  other sign.
 - **Write pipeline.** The cache stores the serialized envelope string per key (so `get()`
   parses a fresh object — no caller can mutate the cache — and the JSON contract is enforced
   at `set()` time). Writes are serialized on a promise chain so `flush()` has a stable point;
