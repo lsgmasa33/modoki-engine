@@ -9,7 +9,56 @@ public class ModokiSystemPlugin: CAPPlugin, CAPBridgedPlugin {
     public let pluginMethods: [CAPPluginMethod] = [
         CAPPluginMethod(name: "openAppSettings", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "openUrl", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "kvGetAll", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "kvSet", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "kvRemove", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "kvInfo", returnType: CAPPluginReturnPromise),
     ]
+
+    private let store = BackupExcludedStore()
+
+    // The backup-excluded key-value store PlayerPrefs uses on iOS (#1271) — see BackupExcludedStore.
+    @objc func kvGetAll(_ call: CAPPluginCall) {
+        do {
+            call.resolve(["entries": try store.getAll(prefix: call.getString("prefix") ?? "")])
+        } catch {
+            call.reject("kvGetAll failed: \(error.localizedDescription)")
+        }
+    }
+
+    @objc func kvSet(_ call: CAPPluginCall) {
+        guard let key = call.getString("key"), let value = call.getString("value") else {
+            call.reject("kvSet needs a string key and value")
+            return
+        }
+        do {
+            try store.set(key: key, value: value)
+            call.resolve()
+        } catch {
+            call.reject("kvSet failed: \(error.localizedDescription)")
+        }
+    }
+
+    @objc func kvRemove(_ call: CAPPluginCall) {
+        guard let key = call.getString("key") else {
+            call.reject("kvRemove needs a string key")
+            return
+        }
+        do {
+            try store.remove(key: key)
+            call.resolve()
+        } catch {
+            call.reject("kvRemove failed: \(error.localizedDescription)")
+        }
+    }
+
+    @objc func kvInfo(_ call: CAPPluginCall) {
+        do {
+            call.resolve(try store.info())
+        } catch {
+            call.reject("kvInfo failed: \(error.localizedDescription)")
+        }
+    }
 
     // A web page in Safari (#1196). https only: `UIApplication.open` would also act on `tel:`,
     // `sms:` or another app's custom scheme, which an authored link must never reach.

@@ -34,11 +34,19 @@
  *    manifest merge FAILS without it (`processDebugMainManifest`, measured on Weaveling). `verify`
  *    builds no APK, so nothing else sees that before a native build does.
  *
+ *  **The iOS half (#1271).** iOS has no app-wide backup switch, and UserDefaults (where Preferences
+ *  keeps the save) is in every iCloud/Finder backup. The engine moves the save into
+ *  `capacitor-modoki-system`'s backup-excluded store instead, but only when the native build carries
+ *  that plugin: without it `selectDefaultBackend()` quietly stays on Preferences. So a cloud-sync
+ *  project with an `ios/` app must depend on the plugin and, when its Capacitor config lists
+ *  `includePlugins`, name it there.
+ *
  *  Layouts: the public snapshot ships no `games/` and deletes every demo's `android/`, so the
  *  population is empty there and only the detector/checker units run. Court and Weaveling are the
  *  accept-side samples wherever they exist.
  */
 import { describe, expect, it } from 'vitest';
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { readScannedSource } from '@modoki/engine/testing';
 import { importsIn, parseSource, findNodes, ts } from '@modoki/engine/testing/sourceAst';
@@ -101,6 +109,18 @@ function backupViolations(manifestXml: string, readXmlResource: (name: string) =
     const excluded = new Set([...body.matchAll(/<exclude\b[^>]*>/g)]
       .map((m) => attrsOf(m[0])).filter((x) => x.get('path') === '.').map((x) => x.get('domain')));
     for (const d of DOMAINS) if (!excluded.has(d)) out.push(`<${section}> does not exclude domain "${d}"`);
+  }
+  return out;
+}
+
+const SYSTEM_PLUGIN = 'capacitor-modoki-system';
+
+/** Every reason this project's native build would NOT carry the backup-excluded store. Empty = compliant. */
+function iosStoreViolations(pkg: { dependencies?: Record<string, string> }, capConfig: { includePlugins?: string[] } | undefined): string[] {
+  const out: string[] = [];
+  if (!pkg.dependencies?.[SYSTEM_PLUGIN]) out.push(`package.json dependencies do not include ${SYSTEM_PLUGIN}`);
+  if (capConfig?.includePlugins && !capConfig.includePlugins.includes(SYSTEM_PLUGIN)) {
+    out.push(`capacitor.config.json includePlugins does not name ${SYSTEM_PLUGIN}`);
   }
   return out;
 }
@@ -223,5 +243,37 @@ describe('every cloud-sync project keeps Android backup off (#1267)', () => {
     };
     expect(backupViolations(readScannedSource(manifest!, XML).code, res),
       `${project}: Android backup must be off (see this file's header). If this project does NOT cloud-sync, it was detected by a local name colliding with the sync surface — rename that local instead`).toEqual([]);
+  });
+});
+
+describe('iosStoreViolations — the iOS checker (#1271)', () => {
+  const dep = { dependencies: { [SYSTEM_PLUGIN]: 'file:plugins/x.tgz' } };
+  it('accepts the plugin as a dependency, with or without an includePlugins list naming it', () => {
+    expect(iosStoreViolations(dep, undefined)).toEqual([]);
+    expect(iosStoreViolations(dep, {})).toEqual([]);
+    expect(iosStoreViolations(dep, { includePlugins: ['@capacitor/app', SYSTEM_PLUGIN] })).toEqual([]);
+  });
+  it('rejects a missing dependency, and an includePlugins list that leaves the plugin out', () => {
+    expect(iosStoreViolations({ dependencies: {} }, undefined).join('\n')).toMatch(/dependencies do not include/);
+    expect(iosStoreViolations({}, undefined).join('\n')).toMatch(/dependencies do not include/);
+    expect(iosStoreViolations(dep, { includePlugins: ['@capacitor/app'] }).join('\n')).toMatch(/includePlugins does not name/);
+  });
+});
+
+describe('every cloud-sync project keeps its iOS save out of backup (#1271)', () => {
+  const projects = cloudSyncProjects(syncSurface());
+
+  it.each(projects.length ? projects : ['(none in this layout)'])('%s', (project) => {
+    if (!projects.length) return;
+    const hasIos = repoFiles({ under: `${project}/ios`, floor: 0, includeUntracked: false }).length > 0;
+    if (!hasIos) return; // no iOS app, nothing iCloud can back up
+    const read = (rel: string) => {
+      const abs = path.join(repoRoot, project, rel);
+      return fs.existsSync(abs) ? JSON.parse(fs.readFileSync(abs, 'utf8')) : undefined;
+    };
+    const pkg = read('package.json');
+    expect(pkg, `${project}/package.json`).toBeDefined();
+    expect(iosStoreViolations(pkg, read('capacitor.config.json')),
+      `${project}: without ${SYSTEM_PLUGIN} in the native build, PlayerPrefs stays in UserDefaults, which every iOS backup copies (see this file's header)`).toEqual([]);
   });
 });

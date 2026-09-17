@@ -78,10 +78,63 @@ if (score > best) PlayerPrefs.set('bestScore', score);
 ## How it works
 
 - **Backends.** `init()` defaults to the platform-free `InMemoryBackend`; the app passes
-  `selectDefaultBackend()`, which picks **`@capacitor/preferences`** on device
-  (NSUserDefaults / SharedPreferences), **`localStorage`** in a browser with working storage,
-  else in-memory (SSR / private-mode). Each backend maps one logical key to one atomic
-  single-entry write.
+  `selectDefaultBackend()`, which picks **`@capacitor/preferences`** on Android
+  (SharedPreferences), the **backup-excluded store** on iOS (below), **`localStorage`** in a browser
+  with working storage, else in-memory (SSR / private-mode). Each backend maps one logical key to
+  one atomic single-entry write.
+- **iOS keeps the save out of iCloud/Finder backups (#1271).** UserDefaults is part of every device
+  backup, with no way to leave single keys out, so a new iPhone restored from a backup would come
+  back holding the save as of that backup. The owner ruled iOS should match Android, where backup
+  is off for cloud-sync games (#1267): `BackupExcludedBackend` writes one file per key (SHA-256
+  name, temp-file + rename) under `Library/Application Support/modoki-prefs/`, a folder marked
+  `isExcludedFromBackup`, through `capacitor-modoki-system`'s `kv*` methods. **The accepted cost:**
+  a player who never signed in loses their save when they restore a new iPhone; the cloud account
+  is the only supported way progress crosses devices. ⚠️ The restore case was **never observed on
+  a device** — this change matches Android's ruled behaviour, not a confirmed iOS bug.
+  - **The move is one-way, and `MigratingBackend` owns it.** Its docblock lists the steps; the
+    rules they keep:
+    - **The marker alone says where the save lives.** Marker present → the new store, whatever
+      happens to UserDefaults. **A failed marker read REJECTS** (so `init()` fails loud) instead of
+      guessing: guessing UserDefaults on a migrated device showed an emptied save, and the next
+      launch then deleted that session's writes. Only a later `init()` retries, and writes in
+      between re-reject, so none lands in a store nobody read. In the shipped shell a failed
+      `init()` is the boot error screen (`App.tsx`), so in practice the retry is the next launch.
+    - ⚠️ **The native store skips a file it cannot parse** rather than failing the read, so a
+      CORRUPT marker reads as absent. That is why the mirror below never deletes anything when
+      UserDefaults is empty: on a migrated device it would have deleted the whole save.
+    - **No marker → the new store becomes an exact MIRROR of UserDefaults** (when UserDefaults
+      holds anything), then the marker, then the deletes. "Copy every key" was not enough: a failed launch leaves a half-copy, the player
+      then deletes a key in the fallback session (which runs on UserDefaults, the only whole copy),
+      and a plain re-copy brought that key back.
+    - **The old store is re-read before its keys are deleted.** Two instances can be alive across a
+      re-`init()`, and a write the outgoing one drains into UserDefaults after the snapshot is
+      carried forward instead of deleted. This NARROWS the race rather than closing it: a write
+      landing after the re-read is still deleted. It needs a failed migration first, then a
+      re-`init()` with a write inside its window (#438).
+    - All of these were found by the close-out reviews, each with a failing scenario, and each has a
+      test in `playerPrefsBackends.test.ts`.
+  - **A native build without the new methods stays on Preferences** — a JS bundle delivered by OTA
+    to an older binary keeps working instead of losing the save. The check reads the native
+    `Capacitor.PluginHeaders`, not `typeof Plugins.ModokiSystem.kvGetAll`: a game that imports the
+    plugin's JS (Weaveling) turns that entry into a `registerPlugin` proxy, which answers a function
+    for ANY name. Calls still go through `Capacitor.Plugins` (`actions/systemControls.ts` says why).
+  - ⚠️ **An OTA ROLLBACK to JavaScript from before #1271, on a binary that already migrated, reads
+    an empty UserDefaults** and shows no save. Accepted: a rollback bundle targets the binary it
+    shipped with.
+  - ⚠️ **A backup taken BEFORE the update still holds the old UserDefaults.** A phone restored from
+    it has no marker (the new store is not in the backup), so it migrates that stale copy — today's
+    behaviour. Every backup taken after the migration ran is clean.
+  - **Device-verified on Court, iPad mini 5 (iOS 26.6.2), 2026-09-17** — the update-day path, not
+    the restore. The installed build (11088, no `kv*` methods) held 7 `mk:court:*` keys in
+    UserDefaults, signed in, 30 coins, music 0.37. After installing the #1271 build over it: 0 `mk:`
+    keys left in UserDefaults, 8 entries in the store (the 7 plus the marker), `kvInfo` reported
+    `excludedFromBackup: true`, and the values were unchanged. A PlayerPrefs write then landed in the
+    store and not in UserDefaults, and a second launch (the marker path) showed the same 8 entries.
+    After the close-out fixes, the rebuilt JS on that already-migrated iPad found the kv methods in
+    `PluginHeaders` and read the save from the store (coins 30, 8 entries, 0 left in UserDefaults).
+  - A cloud-sync game must ship the plugin, or it silently stays in UserDefaults:
+    `engine/tests/architecture/androidBackupOffForCloudSync.test.ts` checks the dependency and
+    `includePlugins` for every cloud-sync project with an `ios/` app.
 - **Namespacing.** Every key is stored under `mk:<namespace>:<logical>` — the app uses the
   `gameId`, so two games on the same device/browser can't collide. **That guarantee has two parts,
   and only one is closed.** `init()` is `async`: it captures the prefix, awaits

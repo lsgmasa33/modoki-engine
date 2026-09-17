@@ -8,6 +8,23 @@ export class ModokiSystemWeb extends WebPlugin implements ModokiSystemPlugin {
     return { opened: false };
   }
 
+  // The backup-excluded store is an iOS file store (#1271); the web has PlayerPrefs' localStorage.
+  async kvGetAll(): Promise<{ entries: Record<string, string> }> {
+    throw this.unimplemented('kvGetAll is iOS-only');
+  }
+
+  async kvSet(): Promise<void> {
+    throw this.unimplemented('kvSet is iOS-only');
+  }
+
+  async kvRemove(): Promise<void> {
+    throw this.unimplemented('kvRemove is iOS-only');
+  }
+
+  async kvInfo(): Promise<{ path: string; excludedFromBackup: boolean; entries: number }> {
+    throw this.unimplemented('kvInfo is iOS-only');
+  }
+
   // `window.open` returning null is not a failure signal here — see `openUrl` in definitions.ts.
   // The https-only rule is restated in Swift, Java and the engine's `system.openUrl` action, because
   // none of them can import this file.

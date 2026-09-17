@@ -12,6 +12,7 @@ export {
 } from './playerPrefs';
 export {
   type PrefsBackend, InMemoryBackend, LocalStorageBackend, PreferencesBackend,
+  BackupExcludedBackend, MigratingBackend, PREFS_MIGRATED_MARKER, PREFS_KEY_ROOT,
   selectDefaultBackend,
 } from './backends';
 export { PLAYER_TIER_PREF_KEY } from './playerTierProvider';

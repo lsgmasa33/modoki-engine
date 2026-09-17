@@ -501,6 +501,11 @@ does not close Court's case.)
   and `tools:replace` on all three, or the merge fails against libraries that declare their own.
   `engine/tests/architecture/androidBackupOffForCloudSync.test.ts` enforces it for every project that
   uses this module; the worked example is [Court's accounts.md](../games/court/accounts.md) § "Android backup is OFF".
+- **On iOS the same rule is met by the ENGINE, if the game ships `capacitor-modoki-system`** (#1271).
+  iOS has no app-wide backup switch, so PlayerPrefs moves the save into a backup-excluded file store
+  instead of UserDefaults ([player-prefs.md](player-prefs.md) § How it works). A build without the
+  plugin stays in UserDefaults, which every iCloud/Finder backup copies; the same architecture test
+  checks the dependency. The iOS restore case was never observed on a device.
 
 ## Related
 

@@ -32,4 +32,21 @@ export interface ModokiSystemPlugin {
    * blocked tab from one opened elsewhere.
    */
   openUrl(options: { url: string }): Promise<{ opened: boolean }>;
+
+  /**
+   * iOS only (#1271): every entry of the backup-excluded key-value store whose key starts with
+   * `prefix`. The store lives in a folder marked `isExcludedFromBackup`, so an iCloud or Finder
+   * backup never copies it. Android rejects these as unavailable and the web as unimplemented: Android's
+   * backup is off for the whole app, and the engine only calls them on iOS.
+   */
+  kvGetAll(options: { prefix: string }): Promise<{ entries: Record<string, string> }>;
+
+  /** iOS only: write one entry atomically (temp file + rename). */
+  kvSet(options: { key: string; value: string }): Promise<void>;
+
+  /** iOS only: remove one entry. Removing a missing key resolves. */
+  kvRemove(options: { key: string }): Promise<void>;
+
+  /** iOS only: where the store is, whether the backup exclusion is set, and how many entries it holds. */
+  kvInfo(): Promise<{ path: string; excludedFromBackup: boolean; entries: number }>;
 }

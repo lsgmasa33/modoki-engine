@@ -30,7 +30,7 @@
  *  Platform backend selection (localStorage / @capacitor/preferences) is layered on
  *  in Phase 2; app-shell init/flush wiring in Phase 3. */
 
-import { InMemoryBackend, type PrefsBackend } from './backends';
+import { InMemoryBackend, PREFS_KEY_ROOT, type PrefsBackend } from './backends';
 import { createSupersessionToken } from '../core/liveness';
 
 /** A plain JSON-serializable value. No functions, class instances, Map/Set, or cycles. */
@@ -243,7 +243,7 @@ function sanitizeNamespace(ns: string): string {
  *  `drain()`'s doc comment, #438) rather than reading the live global — a full key is never
  *  built off whatever `namespace` happens to be at the moment a write settles. */
 function prefixFor(ns: string): string {
-  return `mk:${ns}:`;
+  return `${PREFS_KEY_ROOT}${ns}:`;
 }
 
 // ── Envelope ──────────────────────────────────────────────────────

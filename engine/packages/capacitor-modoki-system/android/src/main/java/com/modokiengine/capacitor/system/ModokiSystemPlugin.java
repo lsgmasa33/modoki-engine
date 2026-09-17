@@ -64,4 +64,30 @@ public class ModokiSystemPlugin extends Plugin {
             return false;
         }
     }
+
+    // The backup-excluded key-value store is iOS-only (#1271): on Android the whole app's backup is
+    // off (#1267), so PlayerPrefs stays on SharedPreferences and the engine never calls these. They
+    // exist so the plugin's JS contract dispatches somewhere on every platform, and say why they fail.
+    private static final String KV_IOS_ONLY =
+        "The backup-excluded store is iOS-only; Android keeps PlayerPrefs in SharedPreferences with backup off.";
+
+    @PluginMethod
+    public void kvGetAll(PluginCall call) {
+        call.unavailable(KV_IOS_ONLY);
+    }
+
+    @PluginMethod
+    public void kvSet(PluginCall call) {
+        call.unavailable(KV_IOS_ONLY);
+    }
+
+    @PluginMethod
+    public void kvRemove(PluginCall call) {
+        call.unavailable(KV_IOS_ONLY);
+    }
+
+    @PluginMethod
+    public void kvInfo(PluginCall call) {
+        call.unavailable(KV_IOS_ONLY);
+    }
 }
