@@ -152,7 +152,7 @@ jobs:
           BIN="$APP/Contents/Resources/bin"
           echo "Resources/bin:"; ls -la "$BIN" || true
           missing=0
-          for f in toktx libktx.4.dylib msdf-atlas-gen; do
+          for f in toktx ktx libktx.4.dylib msdf-atlas-gen; do
             if [ -f "$BIN/$f" ]; then
               echo "[verify-tools] OK: $f ($(wc -c < "$BIN/$f") bytes)"
             else
@@ -167,6 +167,7 @@ jobs:
           set -e
           # Prove the relocated dylib closures resolve (both exit 0 on --version).
           "$BIN/toktx" --version
+          "$BIN/ktx" --version  # gltf-transform's rigged-model KTX2 encoder (#1351)
           "$BIN/msdf-atlas-gen" -version
           echo "[verify-tools] all bundled tools present + runnable."
 

@@ -27,7 +27,7 @@ import { defaultToolchainDir } from '../../scripts/toolchainHome.mjs';
 import { ensureFfmpeg, ensureFfprobe, withFfprobe } from '../../plugins/ffmpeg-tool';
 import { AUDIO_ENCODER_VERSION } from '../../plugins/audio-cache';
 import { VIDEO_ENCODER_VERSION } from '../../plugins/video-cache';
-import { conversionCliBin, conversionCliDir, CONVERSION_CLI_PINS, isPinnedConversionTool, pinLabel } from '../../toolchain';
+import { conversionCliBin, conversionCliDir, CONVERSION_CLI_PINS, isPinnedConversionTool, pinLabel, isToolStale } from '../../toolchain';
 import { ensureKtxCli } from '../../plugins/texture-convert';
 import { ensureMsdfAtlasGen } from '../../plugins/font-convert';
 import { __probeRiggedToktx, __resetRiggedCliChecks } from '../../plugins/rigged-model-optimize';
@@ -346,4 +346,33 @@ describe.skipIf(!hasOssOverlay())('the release workflows agree with the pin tabl
       expect(mac).not.toMatch(/installer -pkg/);
     });
   }
+});
+
+describe('an install that predates a kept file is STALE, so Build Support offers the repair (#1351)', () => {
+  const hostPin = CONVERSION_CLI_PINS.toktx.dist[`${process.platform}-${process.arch}`];
+  let saved: string | undefined;
+  let tc: string;
+  beforeEach(() => { saved = process.env.MODOKI_TOOLCHAIN_DIR; tc = makeScratchDir('modoki-stale-ktx-'); process.env.MODOKI_TOOLCHAIN_DIR = tc; });
+  afterEach(() => {
+    if (saved === undefined) delete process.env.MODOKI_TOOLCHAIN_DIR; else process.env.MODOKI_TOOLCHAIN_DIR = saved;
+    fs.rmSync(tc, { recursive: true, force: true });
+  });
+
+  it.skipIf(!hostPin)('toktx without ktx beside it is stale; complete, or not our install, is not', () => {
+    const dir = conversionCliDir(tc, 'toktx');
+    fs.mkdirSync(dir, { recursive: true });
+    const bin = conversionCliBin(tc, 'toktx');
+    fs.writeFileSync(bin, '');
+    const probe = { id: 'toktx' as const, present: true, source: 'probe' as const, command: bin, path: bin, dir, version: 'toktx v4.4.2' };
+    const kept = hostPin!.files.map(([, to]) => to);
+    for (const f of kept.filter((f) => !/^ktx(\.exe)?$/.test(f))) fs.writeFileSync(path.join(dir, f), '');
+    expect(isToolStale('toktx', probe)).toBe(true);
+
+    for (const f of kept) fs.writeFileSync(path.join(dir, f), '');
+    expect(isToolStale('toktx', probe)).toBe(false);
+
+    // A deliberate MODOKI_TOKTX (the packaged bundle) is never judged by the toolchain dir.
+    fs.rmSync(path.join(dir, kept.find((f) => /^ktx(\.exe)?$/.test(f))!));
+    expect(isToolStale('toktx', { ...probe, source: 'env' })).toBe(false);
+  });
 });

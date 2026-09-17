@@ -12,7 +12,7 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { found } from '@modoki/engine/testing/inOrder';
 import { createTestWorld, type TestWorld, Transform, EntityAttributes,
   getCurrentWorld, setCurrentWorld, setTimeScale, getTimeScale, sceneManager, reparentRefusal,
-  stepOneFrame, Time, Input } from '@modoki/engine/runtime';
+  stepOneFrame, Time, Input, UIAction, getTraitByName } from '@modoki/engine/runtime';
 import { Transient } from '../../packages/modoki/src/runtime/core/traits/Transient';
 import { updateContactIndex } from '../../packages/modoki/src/runtime/physics/physicsContactIndex';
 import { isRuntimeGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
@@ -129,6 +129,63 @@ describe('duplicate-entity (runtime twin)', () => {
     expect(r.ok).not.toBe(false);
     expect(r.entitiesPerCopy).toBe(3);      // the parent + both children
     expect((await sceneGuids()).length).toBe(6);
+  });
+
+  // #1338 — the device twin of the editor duplicate. Mutations: drop the `remapGuidValues` call
+  // (both ref tests red), drop `carryEntityIdFields` (the rootInstanceId test red), or shallow-copy
+  // the snapshot again (the aliasing test red).
+  const uiActionOf = (e: { get(t: unknown): unknown }) =>
+    e.get(getTraitByName('UIAction')!.trait) as { bindings: Array<{ event: string; target: string }> };
+  const find = (pred: (ea: { name: string; guid: string }, id: number) => boolean) =>
+    [...getCurrentWorld().entities].find((e) => e.has(EntityAttributes) && pred(e.get(EntityAttributes) as never, e.id()))!;
+
+  it('carries a ref INSIDE the copy to the copy, and leaves a ref outside it alone', async () => {
+    game = createTestWorld({});
+    game.spawn(Transform(), EntityAttributes({ guid: 'out', name: 'Out' }));
+    const panel = game.spawn(Transform(), EntityAttributes({ guid: 'panel', name: 'Panel' }),
+      UIAction({ bindings: [{ event: 'click', action: 'noop', target: 'kid' }, { event: 'hover', action: 'noop', target: 'out' }] } as never));
+    game.spawn(Transform(), EntityAttributes({ guid: 'kid', name: 'Kid', parentId: panel.id() }));
+
+    const r = await runAgentOp('duplicate-entity', { guid: 'panel', count: 2 }) as DupReply;
+    expect(r.ok).not.toBe(false);
+    for (const root of r.roots!) {
+      const copy = find((_, id) => id === root.id);
+      const kid = find((ea) => ea.name === 'Kid' && (ea as unknown as { parentId: number }).parentId === root.id);
+      expect(uiActionOf(copy).bindings.map((b) => b.target)).toEqual([(kid.get(EntityAttributes) as { guid: string }).guid, 'out']);
+    }
+    expect(uiActionOf(panel).bindings.map((b) => b.target)).toEqual(['kid', 'out']);
+  });
+
+  it('a copy shares its bindings array with neither the source nor another copy', async () => {
+    game = createTestWorld({});
+    const src = game.spawn(Transform(), EntityAttributes({ guid: 'src', name: 'Src' }),
+      UIAction({ bindings: [{ event: 'click', action: 'noop', target: '' }] } as never));
+    const r = await runAgentOp('duplicate-entity', { guid: 'src', count: 2 }) as DupReply;
+    const [a, b] = r.roots!.map((root) => uiActionOf(find((_, id) => id === root.id)).bindings);
+    expect(a).not.toBe(uiActionOf(src).bindings);
+    // …nor with each other: one call's copies are cloned one by one (#1338 review).
+    expect(a).not.toBe(b);
+  });
+
+  it('a copied prefab instance names ITS OWN roots in rootInstanceId (a nested instance, its own)', async () => {
+    game = createTestWorld({});
+    const PI = getTraitByName('PrefabInstance')!;
+    const root = game.spawn(Transform(), EntityAttributes({ guid: 'aaaaaaaa-0000-4000-8000-0000000000d1', name: 'Root' }),
+      PI.trait({ source: 'p', localId: 1, rootInstanceId: 0 }));
+    root.set(PI.trait, { ...(root.get(PI.trait) as object), rootInstanceId: root.id() });
+    const member = game.spawn(Transform(), EntityAttributes({ name: 'Member', parentId: root.id() }),
+      PI.trait({ source: 'p', localId: 2, rootInstanceId: root.id() }));
+    const nest = game.spawn(Transform(), EntityAttributes({ name: 'Nest', parentId: member.id() }),
+      PI.trait({ source: 'q', localId: 1, parentLocalId: 2, rootInstanceId: 0 }));
+    nest.set(PI.trait, { ...(nest.get(PI.trait) as object), rootInstanceId: nest.id() });
+
+    const r = await runAgentOp('duplicate-entity', { guid: 'aaaaaaaa-0000-4000-8000-0000000000d1' }) as DupReply;
+    const rootOf = (e: { get(t: unknown): unknown }) => (e.get(PI.trait) as { rootInstanceId: number }).rootInstanceId;
+    const cRoot = find((_, id) => id === r.roots![0]!.id);
+    const cMember = find((ea, id) => ea.name === 'Member' && id !== member.id());
+    const cNest = find((ea, id) => ea.name === 'Nest' && id !== nest.id());
+    expect([rootOf(cRoot), rootOf(cMember), rootOf(cNest)]).toEqual([cRoot.id(), cRoot.id(), cNest.id()]);
+    expect([rootOf(root), rootOf(member), rootOf(nest)]).toEqual([root.id(), root.id(), nest.id()]);
   });
 
   it('a stale guid duplicates nothing and says so', async () => {

@@ -17,11 +17,12 @@ vi.mock('../../packages/modoki/src/runtime/loaders/meshTemplateCache', async (im
 }));
 
 import {
-  getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName,
-  loadSceneFile, instantiatePrefabIntoWorld, deleteEntity, type SceneData,
+  getCurrentWorld, setCurrentWorld, getAllEntities, getTraitByName, isRuntimeGuid,
+  loadSceneFile, instantiatePrefabIntoWorld, destroyEntity, type SceneData,
 } from '@modoki/engine/runtime';
 import { registerAllTraits } from '../../app/ecs/registerTraits';
-import { remintSceneEntityGuids, derivedMemberPaths } from '../../plugins/asset-fs-ops';
+import { remintSceneEntityGuids, derivedMemberPaths, derivedMemberPathsByAnchor } from '../../plugins/asset-fs-ops';
+import { deriveMemberGuid } from '../../packages/modoki/src/runtime/core/assetRefRules';
 
 registerAllTraits();
 
@@ -77,7 +78,11 @@ async function load(scene: SceneData): Promise<void> {
   await loadSceneFile(JSON.parse(JSON.stringify(scene)), {
     loadModels: false,
     fetchPrefab: async (ref) => (prefabs.get(ref) as object) ?? null,
-    onDeletePlaceholder: (id) => deleteEntity(id),
+    // As SceneManager does: destroyEntity (no cascade), not deleteEntity.
+    onDeletePlaceholder: (id) => {
+      const world = getCurrentWorld();
+      for (const e of world.entities) if (e.id() === id) { destroyEntity(e, world); break; }
+    },
     onInstantiatePrefab: async (source, parentId, rootTf, _old, _extra, overrides, structure, nested, rootGuid) => {
       const world = getCurrentWorld();
       const rootId = instantiatePrefabIntoWorld(world, prefabs.get(source) as never, parentId, rootTf, source, overrides, structure, undefined, nested);
@@ -217,7 +222,9 @@ describe('remintSceneEntityGuids — refs to prefab members follow the reminted 
   it('a prefab that nests itself terminates', () => {
     const LOOP = 'dddddddd-0000-4000-8000-000000000001';
     prefabs.set(LOOP, { rootLocalId: 1, entities: [row(1, 'R', 0), row(2, 'Self', 1, { prefab: LOOP })] });
-    expect(derivedMemberPaths({ prefab: LOOP }, (g) => prefabs.get(g))).toEqual(['2']);
+    // Terminates, and with nothing at '2': the loader's cycle guard makes that row expand to no
+    // entity (`instantiatePrefabIntoWorld` returns 0, so the row is never mapped) — #1339 mirrors that.
+    expect(derivedMemberPaths({ prefab: LOOP }, (g) => prefabs.get(g))).toEqual([]);
   });
 });
 
@@ -321,5 +328,101 @@ describe('each mirrored step-rule shape follows on its own (#1324 close-out)', (
     const t0 = performance.now();
     expect(derivedMemberPaths({ prefab: top }, (g) => prefabs.get(g))).toEqual([]);
     expect(performance.now() - t0).toBeLessThan(3000);
+  });
+});
+
+/** #1339 — the loader does not always anchor a member on its instance root. A prefab row whose
+ *  `parentId` is 0 or names no row is parented to the instance's SCENE parent and derives from that
+ *  parent's guid; a guid-less (pre-#1248) instance root derives from its nearest guid-carrying scene
+ *  ancestor, and so do its members. Same round-trip as above: nothing here hand-computes a guid. */
+describe('members the loader anchors above the instance root follow too (#1339)', () => {
+  const ORPH = 'aaaaaaaa-0000-4000-8000-0000000000a1';
+  const HELD = 'bbbbbbbb-0000-4000-8000-0000000000a1';
+  // Stray: parent 0. Kid: under Stray. Lost: parent 99, which is no row. Good: an ordinary member.
+  const orphDoc = {
+    id: ORPH, rootLocalId: 1, entities: [
+      row(1, 'OrphRoot', 0), row(2, 'Stray', 0), row(3, 'Kid', 2), row(4, 'Lost', 99), row(5, 'Good', 1),
+    ],
+  };
+  const holder = (parentId: unknown = 0) =>
+    ({ id: 10, traits: { EntityAttributes: { name: 'Holder', parentId, guid: HOLDER } } });
+  const ui = (refs: string[]) => ({
+    id: 30,
+    traits: {
+      EntityAttributes: { name: 'Ui', parentId: 0, guid: UI },
+      UIAction: { bindings: refs.map((target) => ({ event: 'click', action: 'noop', target })) },
+    },
+  });
+  const inst = (extra: Record<string, unknown>) =>
+    ({ id: 20, traits: { EntityAttributes: { name: 'I', parentId: 10 }, Transform: { x: 0, y: 0, z: 0 } }, ...extra });
+  const sceneWith = (entities: unknown[], refs: string[]): SceneData =>
+    ({ id: 's', version: 1, name: 'S', resources: [], entities: [...entities, ui(refs)] }) as unknown as SceneData;
+  const uiRefs = (scene: SceneData): string[] =>
+    ((scene.entities.at(-1)!.traits as { UIAction: { bindings: { target: string }[] } }).UIAction.bindings).map((b) => b.target);
+
+  const CASES: ReadonlyArray<readonly [string, unknown[], string]> = [
+    ['an orphan row (parentId 0) of an instance with its own guid', [holder(), inst({ prefab: ORPH, guid: HELD })], 'Holder/Stray'],
+    ["a row under an orphan row", [holder(), inst({ prefab: ORPH, guid: HELD })], 'Holder/Stray/Kid'],
+    ['a row whose parentId names no row', [holder(), inst({ prefab: ORPH, guid: HELD })], 'Holder/Lost'],
+    ['an orphan row, with the instance parented by the holder\'s GUID', [holder(), { ...inst({ prefab: ORPH, guid: HELD }), traits: { EntityAttributes: { name: 'I', parentId: HOLDER } } }], 'Holder/Stray'],
+    ['the root of a guid-less (legacy) instance', [holder(), inst({ prefab: ORPH })], 'Holder/OrphRoot'],
+    ['a member of a guid-less (legacy) instance', [holder(), inst({ prefab: ORPH })], 'Holder/OrphRoot/Good'],
+    ['an orphan row of a guid-less (legacy) instance', [holder(), inst({ prefab: ORPH })], 'Holder/Stray/Kid'],
+    // `spawnNestedInstance` parents an added instance's orphans to the anchor MEMBER, not the scene.
+    ['an orphan row of a guid-less added nested instance', [inst({ prefab: OUTER, guid: HELD, added: [refNode(3, ORPH)] })], 'OuterRoot/Panel/Button/Stray'],
+    ['an orphan row of an added nested instance that carries its own guid (it hangs off the OUTER anchor)',
+      [inst({ prefab: OUTER, guid: HELD, added: [refNode(3, ORPH, { guid: ANCHORED })] })], 'OuterRoot/Panel/Button/Stray'],
+  ];
+
+  beforeEach(() => { prefabs.set(ORPH, orphDoc); });
+
+  it.each(CASES)('%s', async (_name, entities, target) => {
+    await load(sceneWith(entities, []));
+    const byPath = new Map([...guidToTreePath()].map(([g, p]) => [p, g]));
+    const ref = byPath.get(target);
+    if (!ref) throw new Error(`fixture: no loaded entity at ${target} (have: ${[...byPath.keys()].join(', ')})`);
+    const copy = remintSceneEntityGuids(sceneWith(entities, [ref]) as never, gen, (g) => prefabs.get(g)) as unknown as SceneData;
+    const moved = uiRefs(copy)[0];
+    expect(moved).not.toBe(ref);
+    await load(copy);
+    expect(guidToTreePath().get(moved)).toBe(target);
+  });
+
+  it('an instance at the scene root leaves its orphan rows unaddressable, and maps nothing for them', async () => {
+    const entities = [{ ...inst({ prefab: ORPH, guid: HELD }), traits: { EntityAttributes: { name: 'I', parentId: 0 } } }];
+    await load(sceneWith(entities, []));
+    // It still gets a guid, but only a RUNTIME one (#1210) — nothing durable can point at it.
+    const stray = [...guidToTreePath()].find(([, p]) => p === 'Stray')?.[0];
+    expect(stray && isRuntimeGuid(stray)).toBe(true);
+    const byAnchor = derivedMemberPathsByAnchor(entities[0] as never, (g) => prefabs.get(g), { orphans: 'parent' });
+    expect(byAnchor.parent.sort()).toEqual(['2', '2.3', '4']);
+    // …and the copy still loads with the ordinary member's ref carried.
+    const good = new Map([...guidToTreePath()].map(([g, p]) => [p, g])).get('OrphRoot/Good')!;
+    const copy = remintSceneEntityGuids(sceneWith(entities, [good]) as never, gen, (g) => prefabs.get(g)) as unknown as SceneData;
+    await load(copy);
+    expect(guidToTreePath().get(uiRefs(copy)[0])).toBe('OrphRoot/Good');
+  });
+
+  it("a nested prefab ROW's orphans are unaddressable (the row expands under parent 0), so they are not pathed", () => {
+    const NEST = 'aaaaaaaa-0000-4000-8000-0000000000a2';
+    prefabs.set(NEST, { id: NEST, rootLocalId: 1, entities: [row(1, 'NestRoot', 0), row(2, 'Slot', 1, { prefab: ORPH })] });
+    const byAnchor = derivedMemberPathsByAnchor({ prefab: NEST }, (g) => prefabs.get(g), { orphans: 'parent' });
+    expect(byAnchor.self.sort()).toEqual(['2', '2.5']);
+    expect(byAnchor.parent).toEqual([]);
+  });
+
+  // #1338 review: a guid-less INSTANCE parent can only be named by number, which the loader resolves to
+  // the destroyed placeholder (#1353) — the child lands wherever koota recycles the id. Nothing
+  // follows through it. Mutation: let `sceneAnchorOf` step through a guid-less instance parent.
+  it('an instance whose scene parent is a guid-less instance maps nothing for its orphan rows', () => {
+    const ORPH2 = 'aaaaaaaa-0000-4000-8000-0000000000a3';
+    prefabs.set(ORPH2, { id: ORPH2, rootLocalId: 1, entities: [row(1, 'Orph2Root', 0), row(7, 'Stray2', 0)] });
+    const entities = [holder(), inst({ prefab: ORPH }),
+      { id: 21, prefab: ORPH2, guid: HELD, traits: { EntityAttributes: { name: 'In', parentId: 20 } } }];
+    // What a step-through would carry for Stray2, with and without the guid-less root's step (7 is
+    // no localId of ORPH, so neither collides with the legacy instance's own members).
+    const guesses = [deriveMemberGuid(HOLDER, [1, 7]), deriveMemberGuid(HOLDER, [7])];
+    const copy = remintSceneEntityGuids(sceneWith(entities, guesses) as never, gen, (g) => prefabs.get(g)) as unknown as SceneData;
+    expect(uiRefs(copy)).toEqual(guesses);
   });
 });

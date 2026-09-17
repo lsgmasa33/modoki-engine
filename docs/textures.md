@@ -35,10 +35,10 @@ The packaged Electron editor has no `PATH` guarantee, so the KTX CLI is bundled
 into the app bundle (macOS-only — the only signed target today):
 
 - **`engine/scripts/stage-toktx.cjs`** is electron-builder's `beforePack` hook. It
-  copies `toktx` + its one non-system dependency (`libktx.4.dylib`) into
-  `build/bin/`, `chmod +x`es both, and sanity-runs the staged copy (`toktx
-  --version`) to confirm the sibling dylib resolves. `toktx` already carries an
-  `@executable_path` rpath, so `libktx` resolves next to it with no
+  copies `toktx` + `ktx` (gltf-transform's rigged-model encoder, #1351) + their one
+  non-system dependency (`libktx.4.dylib`) into `build/bin/`, `chmod +x`es them, and
+  sanity-runs both staged CLIs (`--version`) to confirm the sibling dylib resolves. Both
+  CLIs carry an `@executable_path` rpath, so `libktx` resolves next to them with no
   `install_name_tool` surgery. The hook bundles the PINNED copy
   (`pinnedToolForStaging.cjs`: `MODOKI_TOKTX`, else `toolchain:install toktx`,
   which provisions it if missing) — never a `PATH` or `/usr/local` one, because
@@ -217,7 +217,7 @@ same hash over different bytes. Where each converter stands:
 | audio, video | `ffmpeg` / `ffprobe` | **Pinned** (#1297): only the provisioned `ffmpeg-static` / `@ffprobe-installer` copy (or a deliberate `MODOKI_FFMPEG`/`MODOKI_FFPROBE`), never PATH — [editor-toolchain.md](editor-toolchain.md) § "Conversion CLIs are pinned". The same build per PLATFORM, not across platforms. |
 | textures, atlases | `toktx` | **Pinned** (#1327): KTX-Software 4.4.2, sha256-checked, from the toolchain dir, the packaged editor's bundle, or a deliberate `MODOKI_TOKTX` — never PATH. Same build per platform. |
 | fonts | `msdf-atlas-gen` | **Pinned** (#1327): 1.4 with **Skia** (pin label `1.4-skia`) — on macOS our own static build (upstream ships Windows only), on Windows Chlumsky's zip; never PATH. Both preprocess overlapping contours, so a font that has them — variable-font instances usually do — bakes by the same geometry pipeline on both platforms (owner, 2026-09-17). Before that, the Mac build (like Homebrew's) had no Skia and resolved overlaps in overlap mode. Same algorithm across platforms; not the same compiler. |
-| models (rigged) | `gltf-transform`, `toktx` | Took the other route — hashes the tool versions INTO its key, which is why `modelCache.hash` is peeled above. Its `toktx` resolves through the same pinned entry. |
+| models (rigged) | `gltf-transform`, `ktx` | Took the other route — hashes the tool versions INTO its key, which is why `modelCache.hash` is peeled above. gltf-transform encodes with KTX-Software's `ktx`, which is pinned in the same install as `toktx` and REQUIRED beside it (#1351); the key names that toktx's version. |
 | environments | none (JS) | Not exposed. |
 
 **Pinning both changed no committed value on the machine that did it** (#1327, measured
@@ -1198,7 +1198,7 @@ scraping the log.
 - `plugins/reimport-atlas.ts` — `atlas` reimport handler (pack + composite + encode).
 - `plugins/atlas-cache.ts` — atlas content hash + synthetic page url path.
 - `runtime/loaders/spriteAtlas.ts` — pure MaxRects packer + atlas schema types.
-- `scripts/stage-toktx.cjs` — electron-builder `beforePack`: bundles `toktx` + `libktx`.
+- `scripts/stage-toktx.cjs` — electron-builder `beforePack`: bundles `toktx` + `ktx` + `libktx`.
 - `runtime/loaders/pixiKtxTranscoder.ts` — registers PixiJS `loadKTX2` +
   locally-served libktx (2D KTX2 sprite decode).
 - `vite-asset-scanner.ts` — variant/transcoder serving + build-time generation.

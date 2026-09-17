@@ -254,9 +254,20 @@ from the machine; a converter cannot.
   each into a VERSIONED dir (`<toolchain>/<id>/<version>[-<build>]/`, see `pinLabel`) — a pin bump points detection at a dir
   that does not exist yet, so there is no stale check to get wrong. The assets:
   - `toktx`: KhronosGroup's macOS `.pkg`, unpacked with `pkgutil --expand-full` (no sudo, nothing
-    installed system-wide), keeping `toktx` + the real `libktx.4.dylib`; its Windows NSIS installer,
+    installed system-wide), keeping `toktx` + `ktx` + the real `libktx.4.dylib`; its Windows NSIS installer
+    (`toktx.exe` + `ktx.exe` + `ktx.dll`),
     unpacked with 7-Zip — which the toolchain does not provision, so Build Support installs it
     unprompted only where a 7-Zip is found, and otherwise leaves it a button whose failure says so.
+    ⚠️ **`ktx` is kept because @gltf-transform/cli 4.4 encodes KTX2 with `ktx`, not `toktx`** (#1351).
+    It finds it on PATH, and `withToolOnPath('toktx')` puts the pinned dir first, so the pinned `ktx`
+    wins only if it is IN that dir. Before #1351 it was not. Rigged models were then encoded by
+    whatever `ktx` the machine had (on the owner's Mac, a system 4.4.2 — byte-identical, luckily),
+    and on a machine with none (the packaged editor, a fresh box) the encode failed. The failure was
+    swallowed (#1337), so raw textures shipped. Two guards now hold it:
+    - `ensureConversionCli` treats a dir missing ANY kept file as incomplete and reinstalls it. A
+      pre-#1351 install therefore repairs itself on the next `toolchain:install`, with no pin-label
+      bump (a label bump would retire every `tex-`/`atlas-` cache tag for unchanged toktx bytes).
+    - The rigged encode refuses unless `ktx` sits beside the detected toktx.
   - `msdf-atlas-gen`: upstream publishes Windows zips only. The macOS binary is OURS, built once by
     `engine/scripts/build-msdf-atlas-gen-macos.sh` — from sha256-pinned sources, the way upstream
     builds its Windows zip (vcpkg, pinned to a release tag, WITH Skia), every non-system library

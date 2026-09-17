@@ -13,7 +13,7 @@ import path from 'path';
 import { execFileSync } from 'child_process';
 import { randomUUID } from 'crypto';
 import { writeMetaSidecar, CORRUPT_SIDECAR_SUFFIX } from './meta-sidecar';
-import { durableGuid, deriveGuid } from '../packages/modoki/src/runtime/core/assetRefRules';
+import { durableGuid, deriveMemberGuid, remapGuidValues } from '../packages/modoki/src/runtime/core/assetRefRules';
 // The ONE subtree pre-flight (#883/#990/#989/#1004) — see engine/scripts/deleteBoundary.mjs. Used
 // only by the Linux `rmSync` fallback in `moveToTrash`; the darwin/win32 paths hand the delete to
 // the OS trash, which moves rather than unlinks and so cannot orphan a link's payload.
@@ -371,104 +371,172 @@ type AddedNode = { guid?: unknown; prefab?: unknown; added?: unknown; children?:
 type PrefabRow = { localId?: number; prefab?: string; added?: unknown; traits?: { EntityAttributes?: { parentId?: number } } };
 type PrefabDoc = { rootLocalId?: number; entities?: PrefabRow[] };
 
-/** Every `path` (`deriveInstanceMemberGuids`'s `stepId` chain, dot-joined) a member can derive at
- *  below `node` — a scene instance root or an `added[]` node that carries its own guid. Mirrors the
- *  loader's step rule: a prefab row steps by its `localId` (a nested row too: its root's
- *  `parentLocalId` is that row's localId), a user-added nested instance's root by its prefab's
- *  root localId (`parentLocalId` stays 0), and a plain added node by 0 (it has no
- *  `PrefabInstance`). A descendant that stores its own guid is its own anchor and is skipped.
+/** Which anchor a derived path hangs off. `self`: the walked node's own guid. `parent`: the guid the
+ *  walked node's PARENT derives from — where the loader puts a prefab row whose parent is zero or
+ *  unknown, and a guid-less instance root (#1339). `skip`: a path owned by a different walk (a
+ *  nested anchor's members, seen from its outer instance), or one no reload can address. */
+type AnchorTag = 'self' | 'parent' | 'skip';
+type Base = { tag: AnchorTag; path: number[] };
+
+/** Every `path` (`deriveInstanceMemberGuids`'s step chain, dot-joined) a member can derive at below
+ *  `node` — a scene instance root or an `added[]` node that carries its own guid — grouped by the
+ *  anchor it derives from. Mirrors the loader's parenting, not the prefab's intent:
+ *  - a prefab row steps by its `localId` (a nested row too: its root's `parentLocalId` is that
+ *    row's localId), a user-added nested instance's root by its prefab's root localId
+ *    (`parentLocalId` stays 0), and a plain added node by 0 (it has no `PrefabInstance`);
+ *  - a row whose `parentId` is 0, missing, or names no spawned row is parented by
+ *    `instantiatePrefabIntoWorld` to the CALLER's parent: the scene parent for a top-level instance
+ *    (→ `parent`), the anchor member for a user-added nested instance, and nothing for a nested
+ *    prefab ROW, which is expanded under 0 and so is unaddressable;
+ *  - an `added` node whose anchor is unknown re-anchors to the root, as `applyStructureCore` does;
+ *  - `guidLess`: the node itself carries no guid, so its root derives too (`[rootLocalId]`, `parent`).
+ *  A descendant that stores its own guid is its own anchor: its members are `skip` here and are
+ *  enumerated by its own walk, but its orphan rows hang off THIS walk's anchors.
  *
  *  Over-generating is harmless — the caller maps a derived guid only where the document holds it —
- *  so removed members and re-anchored adds need no special case. */
-export function derivedMemberPaths(node: AddedNode, readPrefab: PrefabReader): string[] {
-  const out = new Set<string>();
-  const emit = (path: number[]): void => {
-    if (!path.length) return;
-    out.add(path.join('.'));
-    if (out.size > MAX_MEMBER_PATHS) throw new MemberWalkTooLarge();
+ *  so removed members need no special case. */
+export function derivedMemberPathsByAnchor(
+  node: AddedNode, readPrefab: PrefabReader, opts: { guidLess?: boolean; orphans?: 'parent' | 'skip' } = {},
+): { self: string[]; parent: string[] } {
+  const out = { self: new Set<string>(), parent: new Set<string>() };
+  let size = 0;
+  const emit = (b: Base): void => {
+    if (b.tag === 'skip' || !b.path.length) return;
+    const set = out[b.tag];
+    const key = b.path.join('.');
+    if (set.has(key)) return;
+    set.add(key);
+    if (++size > MAX_MEMBER_PATHS) throw new MemberWalkTooLarge();
   };
+  const under = (b: Base, ...steps: number[]): Base => ({ tag: b.tag, path: [...b.path, ...steps] });
+  const SKIP: Base = { tag: 'skip', path: [] };
   const docOf = (guid: unknown): PrefabDoc | null => {
     if (typeof guid !== 'string' || !guid) return null;
     const d = readPrefab(guid);
     return d && typeof d === 'object' && Array.isArray((d as PrefabDoc).entities) ? d as PrefabDoc : null;
   };
 
-  /** Members of `doc` below its root, under `prefix`, plus `added` applied to that instance. `stack`
-   *  is the loader's nested-ROW guard (`instantiatePrefabIntoWorld`'s `_stack`), which a reference
-   *  node restarts (`spawnNestedInstance` passes none). */
-  const expand = (doc: PrefabDoc, prefix: number[], added: unknown, stack: string[], depth: number): void => {
+  /** Members of `doc` below its root (the root sits at `root`), plus `added` applied to that
+   *  instance; a row with no spawned parent hangs at `orphan`. `stack` is the loader's nested-ROW
+   *  guard (`instantiatePrefabIntoWorld`'s `_stack`), which a reference node restarts
+   *  (`spawnNestedInstance` passes none). */
+  const expand = (doc: PrefabDoc, root: Base, orphan: Base, added: unknown, stack: string[], depth: number): void => {
     if (depth > MAX_INSTANCE_DEPTH) throw new MemberWalkTooLarge();
     const rootLocalId = doc.rootLocalId ?? 1;
+    // The rows the loader actually spawns and maps: a nested row only when its prefab resolves.
     const rows = new Map<number, PrefabRow>();
-    for (const r of doc.entities ?? []) if (r && typeof r.localId === 'number') rows.set(r.localId, r);
-    // The step chain from just below the root down to `localId`. An `added` node whose anchor is
-    // unknown re-anchors to the root, as `applyStructureCore` does. ⚠️ A prefab ROW with an unknown or
-    // zero parent is NOT handled like that by the loader — it is parented to the instance's SCENE
-    // parent and derives from that parent's guid — and is pathed wrongly here (#1339; 0 committed prefabs).
-    const chainOf = (localId: number): number[] => {
+    for (const r of doc.entities ?? []) {
+      if (!r || typeof r.localId !== 'number' || !r.localId) continue;
+      if (r.prefab && (!docOf(r.prefab) || stack.includes(r.prefab))) continue;
+      rows.set(r.localId, r);
+    }
+    const parentOf = (r: PrefabRow): number => r.traits?.EntityAttributes?.parentId ?? 0;
+    // Where `localId` sits; `null` for a parent cycle, which the loader leaves detached. A localId
+    // that is not a row is the root — the re-anchoring an `added` node gets.
+    const baseOf = (localId: number): Base | null => {
+      if (localId === rootLocalId || !rows.has(localId)) return root;
       const chain: number[] = [];
       const seen = new Set<number>();
       let cur = localId;
-      while (cur !== rootLocalId && rows.has(cur) && !seen.has(cur)) {
+      for (;;) {
+        if (seen.has(cur)) return null;
         seen.add(cur);
         chain.unshift(cur);
-        cur = rows.get(cur)!.traits?.EntityAttributes?.parentId ?? rootLocalId;
+        const p = parentOf(rows.get(cur)!);
+        if (p === rootLocalId) return under(root, ...chain);
+        if (!p || !rows.has(p)) return under(orphan, ...chain);
+        cur = p;
       }
-      return [...prefix, ...chain];
     };
     for (const [localId, row] of rows) {
-      const here = localId === rootLocalId ? prefix : chainOf(localId);
+      const here = baseOf(localId);
+      if (!here) continue;
       if (localId !== rootLocalId) emit(here);
-      const child = row.prefab ? docOf(row.prefab) : null;
-      if (child && row.prefab && !stack.includes(row.prefab)) {
-        expand(child, here, row.added, [...stack, row.prefab], depth + 1);
+      if (row.prefab) {
+        // A nested row expands under parent 0, so ITS orphans are unaddressable.
+        expand(docOf(row.prefab)!, here, SKIP, row.added, [...stack, row.prefab], depth + 1);
       }
     }
     if (Array.isArray(added)) {
       for (const n of added as (AddedNode & { parentLocalId?: number })[]) {
-        if (n && typeof n === 'object') addedNode(n, chainOf(n.parentLocalId ?? rootLocalId), depth);
+        if (!n || typeof n !== 'object') continue;
+        const b = baseOf(n.parentLocalId ?? rootLocalId);
+        if (b) addedNode(n, b, depth);
       }
     }
   };
 
   /** One `added[]` node hanging at `base`. */
-  const addedNode = (n: AddedNode, base: number[], depth: number): void => {
-    // Its own anchor: the caller enumerates it separately. Not load-bearing for correctness —
-    // paths generated under the outer anchor here would be values the loader never derives, so
-    // they could never match — it only keeps the set to what the loader can actually produce.
-    if (durableGuid(typeof n.guid === 'string' ? n.guid : '')) return;
+  const addedNode = (n: AddedNode, base: Base, depth: number): void => {
+    const ownGuid = durableGuid(typeof n.guid === 'string' ? n.guid : '');
     if (n.prefab) {
       const child = docOf(n.prefab);
       if (!child) return;
-      const here = [...base, child.rootLocalId ?? 1];
+      // With its own guid it is its own anchor: its root and members belong to its own walk. Its
+      // orphan rows do not — `spawnNestedInstance` parents them to `base`, which is ours.
+      const here = ownGuid ? SKIP : under(base, child.rootLocalId ?? 1);
       emit(here);
       // A FRESH row chain, as `spawnNestedInstance` gives it (#1324 review).
-      expand(child, here, n.added, [n.prefab as string], depth + 1);
+      expand(child, here, base, n.added, [n.prefab as string], depth + 1);
       return;
     }
-    const here = [...base, 0];
+    // A plain node with its own guid anchors everything below it (its own walk).
+    if (ownGuid) return;
+    const here = under(base, 0);
     if (Array.isArray(n.children)) for (const c of n.children as AddedNode[]) if (c && typeof c === 'object') addedNode(c, here, depth);
   };
 
   try {
     if (node.prefab) {
       const doc = docOf(node.prefab);
-      if (doc) expand(doc, [], node.added, [node.prefab as string], 0);
+      if (doc) {
+        const orphan: Base = { tag: opts.orphans ?? 'skip', path: [] };
+        const root: Base = opts.guidLess ? under(orphan, doc.rootLocalId ?? 1) : { tag: 'self', path: [] };
+        emit(root);
+        expand(doc, root, orphan, node.added, [node.prefab as string], 0);
+      }
     } else if (Array.isArray(node.children)) {
       // A plain added node anchors any guid-less nested instance added beneath it.
-      for (const c of node.children as AddedNode[]) if (c && typeof c === 'object') addedNode(c, [], 0);
+      for (const c of node.children as AddedNode[]) if (c && typeof c === 'object') addedNode(c, { tag: 'self', path: [] }, 0);
     }
   } catch (e) {
-    if (e instanceof MemberWalkTooLarge) return [];
+    if (e instanceof MemberWalkTooLarge) return { self: [], parent: [] };
     throw e;
   }
-  return [...out];
+  return { self: [...out.self], parent: [...out.parent] };
+}
+
+/** The member paths that derive from `node`'s own guid — {@link derivedMemberPathsByAnchor}'s `self`. */
+export function derivedMemberPaths(node: AddedNode, readPrefab: PrefabReader): string[] {
+  return derivedMemberPathsByAnchor(node, readPrefab).self;
+}
+
+/** A top-level scene entry's field shape, as far as its parent chain is concerned. */
+type SceneEntry = AddedNode & { id?: unknown; traits?: { EntityAttributes?: { guid?: unknown; parentId?: unknown } } };
+
+/** The guid a top-level scene entry's PARENT position derives from, and the steps from just below
+ *  that anchor down to the parent — `null` when no reload can be relied on to address it. Mirrors
+ *  `resolveParentRef` (a guid names an entry, a positive number an entry id, anything else the
+ *  root). Only a parent with a durable guid is followed:
+ *  - a guid-less INSTANCE parent can only be named by its numeric entry id, which the loader
+ *    resolves to the instance's PLACEHOLDER — destroyed right after — so where the child lands
+ *    depends on which entity koota recycles that id for (#1338 review, filed as #1353);
+ *  - a guid-less PLAIN parent gets a guid seeded from the scene PATH (`deriveAuthoredEntityGuids`),
+ *    which a copy at another path does not share.
+ *  Either way nothing below it can be predicted, so its refs are left as they were. */
+function sceneAnchorOf(entry: SceneEntry, entries: SceneEntry[]): string | null {
+  const ownGuid = (e: SceneEntry): string => durableGuid(String((e.prefab ? e.guid : e.traits?.EntityAttributes?.guid) ?? ''));
+  const raw = entry.traits?.EntityAttributes?.parentId;
+  const parent = typeof raw === 'string'
+    ? (raw ? entries.find((x) => ownGuid(x) === raw) : undefined)
+    : typeof raw === 'number' && raw > 0 ? entries.find((x) => x.id === raw) : undefined;
+  return parent ? ownGuid(parent) || null : null;
 }
 
 /** Give every entity a scene file DEFINES a fresh guid, and carry every reference to it along
  *  (#1293). The file-level counterpart of `regenerateSnapshotGuids`, which mints fresh guids for a
- *  subtree duplicated inside one scene — that one does NOT rewrite references (#1338). A copied
- *  scene is its own content, so it gets its own identities.
+ *  subtree duplicated inside one scene and carries the refs inside it the same way (#1338). A
+ *  copied scene is its own content, so it gets its own identities.
  *
  *  **What "defines" means — three places, not one.** An ordinary row keeps its guid in
  *  `traits.EntityAttributes.guid`, but a prefab-instance ROOT keeps it on the row itself
@@ -480,7 +548,7 @@ export function derivedMemberPaths(node: AddedNode, readPrefab: PrefabReader): s
  *  `parentId`, `PrefabInstance.rootInstanceId`, every registry `entityRef` field (including a
  *  game's own) and `UIAction.bindings[].target`. A walk rather than a field list, so a newly
  *  registered entityRef field is covered with nothing to keep in sync; the scaffolder's whole-text
- *  substitution is the same idea. Every committed entity guid is a UUID, so an exact-value match
+ *  substitution is the same idea (`remapGuidValues`). Every committed entity guid is a UUID, so an exact-value match
  *  cannot hit a name.
  *
  *  **What deliberately does NOT follow:** a guid the file references but does not define — a
@@ -488,12 +556,16 @@ export function derivedMemberPaths(node: AddedNode, readPrefab: PrefabReader): s
  *  guids.
  *
  *  **Prefab MEMBERS follow too (#1324), given `readPrefab`.** A member's guid is not stored —
- *  `deriveInstanceMemberGuids` derives it on load as `deriveGuid(anchor|path)` — so the members
+ *  `deriveInstanceMemberGuids` derives it on load as `deriveMemberGuid(anchor, path)` — so the members
  *  re-derive from the new anchor on their own, but a stored REFERENCE to one (a `UIAction` target,
  *  an `entityRef` into an instance) would keep the old anchor's value and dangle. So for every
  *  reminted anchor the member paths are enumerated from its prefab file(s) (`derivedMemberPaths`)
- *  and `deriveGuid(old|p)` → `deriveGuid(new|p)` joins the remap. Without `readPrefab`, or for a
- *  prefab it cannot read, those refs are left as before. See docs/scene-loading.md.
+ *  and `old|p` → `new|p` joins the remap. The anchor is the one the LOADER picks, which is not
+ *  always the instance root (#1339): a prefab row with a zero or unknown parent hangs off the
+ *  instance's scene parent, and a guid-less (pre-#1248) root derives from that parent too —
+ *  `sceneAnchorOf` finds it. Without `readPrefab`, for a prefab it cannot read, or under a parent
+ *  without a durable guid (see `sceneAnchorOf`), those refs are left as before. See
+ *  docs/scene-loading.md.
  *
  *  ⚠️ **Accepted cost (owner ruling, #1293):** a `Persistent` entity in the copy no longer matches
  *  its original by guid, so `filterPersistentDuplicates` stops treating the two as one. */
@@ -510,48 +582,51 @@ export function remintSceneEntityGuids(
     if (d && !remap.has(d)) remap.set(d, genGuid());
   };
   type Row = AddedNode & { traits?: { EntityAttributes?: { guid?: unknown } } };
-  // Each anchor this file defines, with the node its derived members hang off.
+  // Each nested anchor this file defines (an `added[]` node or a legacy `children` row with its own
+  // guid), with the node its derived members hang off. Top-level entries are walked separately.
   const anchors: [string, AddedNode][] = [];
-  const visit = (rows: unknown): void => {
+  const visit = (rows: unknown, topLevel: boolean): void => {
     if (!Array.isArray(rows)) return;
     for (const row of rows as Row[]) {
       if (!row || typeof row !== 'object') continue;
       define(row.guid);
       define(row.traits?.EntityAttributes?.guid);
       const anchor = durableGuid(typeof row.guid === 'string' ? row.guid : '');
-      if (anchor) anchors.push([anchor, row]);
-      visit(row.children);
-      visit(row.added);
+      if (anchor && !topLevel) anchors.push([anchor, row]);
+      visit(row.children, false);
+      visit(row.added, false);
     }
   };
-  visit(scene.entities);
+  visit(scene.entities, true);
   if (remap.size === 0) return scene;
   if (readPrefab) {
     const memberRemap = new Map<string, string>();
-    for (const [oldAnchor, node] of anchors) {
+    const carry = (oldAnchor: string, paths: string[]): void => {
       const newAnchor = remap.get(oldAnchor);
-      if (!newAnchor) continue;
-      for (const p of derivedMemberPaths(node, readPrefab)) {
-        memberRemap.set(deriveGuid(`${oldAnchor}|${p}`), deriveGuid(`${newAnchor}|${p}`));
+      if (!newAnchor) return;
+      for (const p of paths) {
+        const steps = p.split('.').map(Number);
+        memberRemap.set(deriveMemberGuid(oldAnchor, steps), deriveMemberGuid(newAnchor, steps));
       }
+    };
+    for (const [anchor, node] of anchors) carry(anchor, derivedMemberPaths(node, readPrefab));
+    // A top-level instance's members derive from its own guid — and, for a row the loader parents to
+    // the SCENE parent or for a guid-less (pre-#1248) root, from that parent's anchor (#1339).
+    const entries = (Array.isArray(scene.entities) ? scene.entities : []).filter((e): e is Row => !!e && typeof e === 'object');
+    for (const entry of entries) {
+      if (!entry.prefab && !Array.isArray(entry.children)) continue;
+      const ownGuid = durableGuid(typeof entry.guid === 'string' ? entry.guid : '');
+      const byAnchor = derivedMemberPathsByAnchor(entry, readPrefab, { guidLess: !!entry.prefab && !ownGuid, orphans: 'parent' });
+      if (ownGuid) carry(ownGuid, byAnchor.self);
+      if (!byAnchor.parent.length) continue;
+      const up = sceneAnchorOf(entry, entries);
+      if (up) carry(up, byAnchor.parent);
     }
     // A defined guid wins over a derived one — the two cannot coincide, but a stored identity is
     // the one thing this function must never re-point.
     for (const [k, v] of memberRemap) if (!remap.has(k)) remap.set(k, v);
   }
-  const rewrite = (v: unknown): unknown => {
-    if (typeof v === 'string') return remap.get(v) ?? v;
-    if (Array.isArray(v)) return v.map(rewrite);
-    if (v && typeof v === 'object') {
-      // Null prototype: a parsed document can carry an own `__proto__` key, which a plain `{}`
-      // would turn into a prototype assignment instead of a copied field.
-      const out: Record<string, unknown> = Object.create(null);
-      for (const [k, child] of Object.entries(v)) out[k] = rewrite(child);
-      return out;
-    }
-    return v;
-  };
-  return rewrite(scene) as Record<string, unknown>;
+  return remapGuidValues(scene, remap) as Record<string, unknown>;
 }
 
 /** Copy an asset to a new path with a freshly-generated GUID so the duplicate

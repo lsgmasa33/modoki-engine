@@ -327,6 +327,15 @@ removes nothing" below for the two that were not, and why they are gone rather t
 - **Single chunk = `inlineDynamicImports`, NOT `codeSplitting`.** `codeSplitting` is not a real Rollup
   option — Rollup silently ignores it, the lazy renderer chunk stays split, and the inliner's stray-JS
   guard aborts every 3D-game playable. Only `inlineDynamicImports:true` folds dynamic imports into the entry.
+- **A `new URL('x.js', import.meta.url)` asset trips the same guard — strip it at the source, never
+  exempt it** (#1340). three r185's `KTX2Loader` added two such defaults for the Basis transcoder
+  (r184 had none), so after the 2026-09-15 three bump every playable with 3D reachable failed on a
+  hashed `assets/basis_transcoder-*.js`, and every web/native build shipped a dead ~585 KB pair.
+  It is dead because `getKTX2Loader` always calls `setTranscoderPath('/basis/')`, and the loader only
+  reads the defaults when that path is empty. `engine/plugins/ktx2LoaderAssetStrip.ts` blanks both at
+  build time, and THROWS if `import.meta.url` survives, so a reshaped expression in a later three
+  cannot silently bring the pair back. The guard cannot tell a URL asset from a real chunk, so the
+  guard stays strict and the emitter gets fixed.
 - **A playable never runs the boot ramp probe** (#221) — `main.tsx` sets
   `setBootProbeAllowed(!__MODOKI_PLAYABLE__)` at module scope, and `tierResolve` refuses on BOTH its
   probe call sites. It is not covered by "one config ⇒ no probe": that short-circuit needs the

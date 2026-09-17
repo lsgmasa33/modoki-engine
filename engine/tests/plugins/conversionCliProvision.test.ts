@@ -185,6 +185,37 @@ describe('conversionCliProvision — ensureConversionCli (mocked fetch)', () => 
     }
   })
 
+  it('reinstalls a RUNNING copy that lacks a kept file — a pre-#1351 toktx dir has no ktx', async () => {
+    const bytes = Buffer.from('a pkg with ktx')
+    CONVERSION_CLI_PINS.toktx.dist[TEST_KEY] = {
+      url: 'https://example.invalid/k2.pkg', sha256: sha(bytes), kind: 'macos-pkg',
+      files: [['p/toktx', 'toktx'], ['p/ktx', 'ktx']],
+    }
+    const dir = conversionCliDir(base, 'toktx')
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(conversionCliBin(base, 'toktx', TEST_PLATFORM), 'old toktx') // runs, but no ktx
+    let fetched = 0
+    let oldCopyDuringDownload = ''
+    const fetchImpl: FetchLike = async (u) => {
+      fetched++
+      // Sibling clones still convert with the RUNNING copy — it must not vanish for the download.
+      oldCopyDuringDownload = fs.readFileSync(conversionCliBin(base, 'toktx', TEST_PLATFORM), 'utf8')
+      return fakeFetch(bytes)(u)
+    }
+    const expand = async (_k: string, _a: string, dest: string) => {
+      fs.mkdirSync(path.join(dest, 'p'), { recursive: true })
+      fs.writeFileSync(path.join(dest, 'p', 'toktx'), 'new toktx')
+      fs.writeFileSync(path.join(dest, 'p', 'ktx'), 'new ktx')
+    }
+    const logs: string[] = []
+    await ensureConversionCli('toktx', base, opts(fetchImpl, { expand, probe: () => true, onLog: (l: string) => logs.push(l) }))
+    expect(fetched).toBe(1)
+    expect(oldCopyDuringDownload).toBe('old toktx')
+    expect(logs.join('\n')).toMatch(/has no ktx — reinstalling/)
+    expect(fs.readFileSync(conversionCliBin(base, 'toktx', TEST_PLATFORM), 'utf8')).toBe('new toktx')
+    expect(fs.readdirSync(dir).sort()).toEqual(['ktx', 'toktx'])
+  })
+
   it('is idempotent — a present binary is returned without downloading', async () => {
     CONVERSION_CLI_PINS.toktx.dist[TEST_KEY] = { url: 'https://example.invalid/k.pkg', sha256: '0'.repeat(64), kind: 'macos-pkg', files: [] }
     const bin = conversionCliBin(base, 'toktx', TEST_PLATFORM)
@@ -224,19 +255,21 @@ describe('conversionCliProvision — ensureConversionCli (mocked fetch)', () => 
     const bytes = Buffer.from('a pkg')
     CONVERSION_CLI_PINS.toktx.dist[TEST_KEY] = { ...real, sha256: sha(bytes) }
     const expand = async (_kind: string, _archive: string, dest: string) => {
-      const bin = path.join(dest, real.files[0][0])
-      fs.mkdirSync(path.dirname(bin), { recursive: true })
-      fs.writeFileSync(bin, 'toktx-bytes')
-      const lib = path.join(dest, real.files[1][0])
-      fs.mkdirSync(path.dirname(lib), { recursive: true })
-      fs.writeFileSync(lib, 'libktx-bytes')
+      const from = (to: string) => path.join(dest, real.files.find(([, t]) => t === to)![0])
+      for (const [to, bytes] of [['toktx', 'toktx-bytes'], ['ktx', 'ktx-bytes'], ['libktx.4.dylib', 'libktx-bytes']]) {
+        fs.mkdirSync(path.dirname(from(to)), { recursive: true })
+        fs.writeFileSync(from(to), bytes)
+      }
+      const lib = from('libktx.4.dylib')
       // What the pkg really ships beside it: symlinks, and payload nobody asked for.
       fs.symlinkSync(path.basename(lib), path.join(path.dirname(lib), 'libktx.4.dylib'))
       fs.writeFileSync(path.join(path.dirname(lib), 'libktx-jni.dylib'), 'unwanted')
     }
     await ensureConversionCli('toktx', base, opts(fakeFetch(bytes), { expand, probe: () => true }))
     const dir = conversionCliDir(base, 'toktx')
-    expect(fs.readdirSync(dir).sort()).toEqual(['libktx.4.dylib', 'toktx'])
+    // `ktx` is kept too: gltf-transform encodes rigged KTX2 with it, beside toktx (#1351).
+    expect(fs.readdirSync(dir).sort()).toEqual(['ktx', 'libktx.4.dylib', 'toktx'])
+    expect(fs.readFileSync(path.join(dir, 'ktx'), 'utf8')).toBe('ktx-bytes')
     expect(fs.lstatSync(path.join(dir, 'libktx.4.dylib')).isSymbolicLink()).toBe(false)
     expect(fs.readFileSync(path.join(dir, 'libktx.4.dylib'), 'utf8')).toBe('libktx-bytes')
   })

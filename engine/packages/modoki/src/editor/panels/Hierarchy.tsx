@@ -10,7 +10,7 @@ import { pinEntityAt, livePinnedId, type EntityPin } from '../../runtime/core/ec
 import { renameCommitTarget } from './renamePin';
 import { compareSiblings } from '../../runtime/core/ecs/entityOrder';
 import { flattenVisibleIds, rangeBetween } from './hierarchySelection';
-import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, snapshotEntity, respawnFromSnapshot, regenerateSnapshotGuids, classifyPrefabDuplicate, stripPrefabInstanceFromSnapshot, reRootPrefabInstanceSubtree, moveEntityToScene, type EntitySnapshot } from '../undo/entityActions';
+import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, snapshotEntity, respawnFromSnapshot, regenerateSnapshotGuids, classifyPrefabDuplicate, stripPrefabInstanceFromSnapshot, moveEntityToScene, type EntitySnapshot } from '../undo/entityActions';
 import { preflightSceneMove, formatSceneMoveConfirm } from '../scene/sceneMoveScan';
 import { entityRef } from '../undo/entityRef';
 import { instantiatePrefabInstance, detachPrefabInstance, reattachPrefabInstance, type PrefabFile } from '../scene/prefab';
@@ -1045,7 +1045,7 @@ export default function Hierarchy() {
     // distinct, mirroring duplicateEntity).
     const eaMeta = getAllTraits().find(t => t.name === 'EntityAttributes');
     // Prefab-instance handling, identical to duplicateEntity (prefab F1): pasting an
-    // instance ROOT → new linked instance (re-root); pasting a non-root MEMBER →
+    // instance ROOT → new linked instance; pasting a non-root MEMBER →
     // plain ADDED child (strip PrefabInstance).
     const prefabKind = classifyPrefabDuplicate(snapshot);
     // Mint fresh guids for the pasted copy ONCE (stable across undo/redo, and not
@@ -1061,7 +1061,6 @@ export default function Hierarchy() {
         const nextSort = siblings.length ? Math.max(...siblings.map(s => s.sortOrder)) + 1 : 0;
         writeTraitField(id, eaMeta, 'sortOrder', nextSort);
       }
-      if (prefabKind === 'root') reRootPrefabInstanceSubtree(id);
       return id;
     };
     let currentId = spawn(parentId);

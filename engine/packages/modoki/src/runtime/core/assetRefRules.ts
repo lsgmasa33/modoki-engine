@@ -208,3 +208,49 @@ export function deriveGuid(seed: string): string {
   const hex = part(0) + part(1) + part(2) + part(3); // 32 hex chars
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
+
+/** The guid a prefab-instance MEMBER derives on load: `anchor` is the durable guid of its nearest
+ *  guid-carrying ancestor, `path` the step ids from just below that ancestor down to the member
+ *  ({@link memberStepId}). The ONE spelling of the rule — `deriveInstanceMemberGuids` applies it on
+ *  load, and both duplicate paths (`remintSceneEntityGuids` for a scene file, `regenerateSnapshotGuids`
+ *  for an editor subtree) predict it with it, so a copy's refs land where a reload puts the members. */
+export function deriveMemberGuid(anchor: string, path: readonly number[]): string {
+  return deriveGuid(`${anchor}|${path.join('.')}`);
+}
+
+/** A member's step in {@link deriveMemberGuid}'s path: its `PrefabInstance.localId` — EXCEPT a
+ *  nested-instance root, whose localId is the (shared) inner root id; its distinguishing position is
+ *  `parentLocalId` (which OUTER row produced it). An entity with no `PrefabInstance` steps by 0. */
+export function memberStepId(pi: { localId?: number; parentLocalId?: number } | null | undefined): number {
+  return pi ? (pi.parentLocalId || pi.localId || 0) : 0;
+}
+
+/** `value` with every string VALUE that is a key of `remap` replaced by its mapped value — the
+ *  reference half of a duplicate, wherever the reference sits (`parentId`, any registry `entityRef`
+ *  field including a game's own, `UIAction.bindings[].target`). A walk rather than a field list, so a
+ *  newly registered ref field needs nothing kept in sync. Object KEYS are not rewritten. Arrays and
+ *  PLAIN objects are copied only where something inside them changed; anything else (a class
+ *  instance, a typed array) is returned as-is, because the editor hands the result to live trait
+ *  stores. Callers must not put `''` in `remap`, or every empty string would be rewritten. */
+export function remapGuidValues(value: unknown, remap: ReadonlyMap<string, string>): unknown {
+  if (typeof value === 'string') return remap.get(value) ?? value;
+  if (Array.isArray(value)) {
+    const out = value.map((v) => remapGuidValues(v, remap));
+    return out.some((v, i) => v !== value[i]) ? out : value;
+  }
+  if (value && typeof value === 'object') {
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) return value;
+    const entries = Object.entries(value);
+    const mapped = entries.map(([, v]) => remapGuidValues(v, remap));
+    if (mapped.every((v, i) => v === entries[i]![1])) return value;
+    // Every key is DEFINED, not assigned: a parsed document can carry an own `__proto__` key, which
+    // `out[k] = v` would turn into a prototype assignment instead of a copied field.
+    const out: Record<string, unknown> = {};
+    entries.forEach(([k], i) => {
+      Object.defineProperty(out, k, { value: mapped[i], enumerable: true, writable: true, configurable: true });
+    });
+    return out;
+  }
+  return value;
+}

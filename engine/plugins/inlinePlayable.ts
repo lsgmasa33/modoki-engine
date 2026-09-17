@@ -204,14 +204,16 @@ export function inlinePlayablePlugin(maxBytes: number): Plugin {
       // `/assets/*.js` URL — which does NOT route through `assetUrl`/the blob map — so it
       // would 404 at runtime and the lazy component (e.g. a renderer) would never mount:
       // a silently-blank playable. The build MUST collapse to one JS chunk
-      // (`rollupOptions.output.codeSplitting:false`); fail loudly if it didn't rather than
-      // ship a broken single file.
+      // (`rollupOptions.output.inlineDynamicImports:true`); fail loudly if it didn't rather than
+      // ship a broken single file. A `new URL(…, import.meta.url)` asset with a `.js` extension
+      // lands here too (#1340) — strip it at its source, don't exempt it.
       const strayJs = Object.keys(assets).filter((p) => p.endsWith('.js'));
       if (strayJs.length) {
         this.error(
           `[playable] ${strayJs.length} un-inlined JS chunk(s) remain — the build did not collapse to a single ` +
           `bundle, so these would 404 at runtime (React.lazy imports them by URL):\n  ${strayJs.join('\n  ')}\n` +
-          `Ensure VITE_PLAYABLE forces one chunk (rollupOptions.output.codeSplitting:false).`,
+          `Ensure the playable build forces one chunk (rollupOptions.output.inlineDynamicImports:true), and ` +
+          `that no dependency emits a .js file via new URL(…, import.meta.url) (see ktx2LoaderAssetStrip.ts).`,
         );
       }
 

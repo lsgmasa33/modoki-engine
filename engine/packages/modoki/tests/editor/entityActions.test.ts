@@ -25,6 +25,9 @@ const SpriteAnim = trait(() => ({ clips: {} as Record<string, any>, clip: '' as 
 // are NOT in meta.fields — exactly the real Animator's shape (QA-CTX-0003).
 const AnimBank = trait({ clips: '[]' as string, clip: '' as string, time: 0 });
 const PrefabInstance = trait({ source: '', localId: 0, rootInstanceId: 0, parentLocalId: 0 });
+// Entity references held as guid strings — a scalar one and one inside an array of objects, the
+// `Joint2D.entityB` and `UIAction.bindings[].target` shapes (#1338).
+const Link = trait(() => ({ target: '' as string, bindings: [] as { event: string; target: string }[] }));
 
 let testWorld: ReturnType<typeof createWorld>;
 const entityIndex = new Map<number, any>();
@@ -75,6 +78,7 @@ const traitDefs = [
   { name: 'SpriteAnim', trait: SpriteAnim, category: 'component' as const, fields: { time: { type: 'number' }, playing: { type: 'boolean' } } },
   // Same deal, SoA: only `time` is declared; `clips`/`clip` persist but are off-meta.
   { name: 'AnimBank', trait: AnimBank, category: 'component' as const, fields: { time: { type: 'number' } } },
+  { name: 'Link', trait: Link, category: 'component' as const, fields: { target: { type: 'string' } } },
   {
     name: 'PrefabInstance', trait: PrefabInstance, category: 'component' as const,
     fields: {
@@ -1603,4 +1607,137 @@ describe('override marks across respawn (#868)', () => {
     expect([...(getOverrideMarkSet(restored) ?? [])]).toEqual(['Transform.x']);
     expect(getOverrideMarkSet(squatter)).toBeUndefined();
   });
+});
+
+describe('duplicate carries references INSIDE the copied subtree (#1338)', () => {
+  const put = (...traits: any[]) => { const e = testWorld.spawn(...traits); entityIndex.set(e.id(), e); return e; };
+  const byName = (name: string, not?: number) => {
+    let found: any;
+    testWorld.query(EntityAttributes).updateEach(([ea]: any[], e: any) => { if (ea.name === name && e.id() !== not) found = e; });
+    return found;
+  };
+  const guid = (e: any) => e.get(EntityAttributes).guid as string;
+
+  it('a ref from the copied root to its own child follows the copy; a ref OUTSIDE the subtree does not', async () => {
+    const { duplicateEntity } = await getModule();
+    const outside = put(Transform(), EntityAttributes({ name: 'Outside', guid: 'g-out' }));
+    const panel = put(Transform(), EntityAttributes({ name: 'Panel', guid: 'g-panel' }),
+      Link({ target: 'g-child', bindings: [{ event: 'click', target: 'g-child' }, { event: 'hover', target: 'g-out' }] }));
+    const child = put(Transform(), EntityAttributes({ name: 'Child', parentId: panel.id(), guid: 'g-child' }),
+      Link({ target: 'g-panel', bindings: [] }));
+
+    const copyId = duplicateEntity(panel.id(), vi.fn())!;
+    const copy = entityIndex.get(copyId);
+    const copyChild = byName('Child', child.id());
+    const link = copy.get(Link);
+    expect(guid(copyChild)).not.toBe('g-child');
+    expect(link.target).toBe(guid(copyChild));
+    expect(link.bindings).toEqual([{ event: 'click', target: guid(copyChild) }, { event: 'hover', target: 'g-out' }]);
+    // …and the child's ref UP to the copied root follows too.
+    expect(copyChild.get(Link).target).toBe(guid(copy));
+    // The source is untouched.
+    expect(panel.get(Link)!.target).toBe('g-child');
+    expect(child.get(Link)!.target).toBe('g-panel');
+    expect(guid(outside)).toBe('g-out');
+  });
+
+  it('redo re-spawns the SAME carried refs (the remap is computed once)', async () => {
+    const { duplicateEntity } = await getModule();
+    const panel = put(Transform(), EntityAttributes({ name: 'Panel', guid: 'g-panel' }), Link({ target: 'g-child', bindings: [] }));
+    put(Transform(), EntityAttributes({ name: 'Child', parentId: panel.id(), guid: 'g-child' }));
+    const first = entityIndex.get(duplicateEntity(panel.id(), vi.fn())!).get(Link).target;
+    pushedActions[0].undo();
+    pushedActions[0].redo();
+    const again = byName('Panel', panel.id());
+    expect(again.get(Link).target).toBe(first);
+    const childGuids: string[] = [];
+    testWorld.query(EntityAttributes).updateEach(([ea]: any[]) => { if (ea.name === 'Child') childGuids.push(ea.guid); });
+    expect(childGuids).toContain(first);
+  });
+
+  it('the paste path (a snapshot whose source is already gone) carries refs the same way', async () => {
+    const { snapshotEntity, regenerateSnapshotGuids, respawnFromSnapshot } = await getModule();
+    const panel = put(Transform(), EntityAttributes({ name: 'Panel', guid: 'g-panel' }), Link({ target: 'g-child', bindings: [] }));
+    put(Transform(), EntityAttributes({ name: 'Child', parentId: panel.id(), guid: 'g-child' }));
+    const snap = snapshotEntity(panel.id())!;
+    const pasted = regenerateSnapshotGuids(snap);
+    const linkOf = (s: typeof snap) => s.traits.find((t) => t.meta.name === 'Link')!.data as { target: string };
+    const eaOf = (s: typeof snap) => s.traits.find((t) => t.meta.name === 'EntityAttributes')!.data as { guid: string };
+    expect(linkOf(pasted).target).toBe(eaOf(pasted.children[0]!).guid);
+    expect(linkOf(snap).target).toBe('g-child'); // the clipboard snapshot itself is not mutated
+    const id = respawnFromSnapshot(pasted, 0);
+    expect(entityIndex.get(id).get(Link).target).not.toBe('g-child');
+  });
+
+  /** An instance under `parentId`: Root (localId 1) → Member (2) → a nested instance root NestRoot
+   *  (its own rootInstanceId, parentLocalId 2) → NestLeaf. Returns the handles. */
+  const instance = (parentId = 0) => {
+    const root = put(Transform(), EntityAttributes({ name: 'Root', parentId, guid: 'g-root' }),
+      PrefabInstance({ source: 'p.json', localId: 1, rootInstanceId: 0 }));
+    root.set(PrefabInstance, { ...root.get(PrefabInstance), rootInstanceId: root.id() });
+    const member = put(Transform(), EntityAttributes({ name: 'Member', parentId: root.id() }),
+      PrefabInstance({ source: 'p.json', localId: 2, rootInstanceId: root.id() }));
+    const nest = put(Transform(), EntityAttributes({ name: 'NestRoot', parentId: member.id() }),
+      PrefabInstance({ source: 'q.json', localId: 1, parentLocalId: 2, rootInstanceId: 0 }));
+    nest.set(PrefabInstance, { ...nest.get(PrefabInstance), rootInstanceId: nest.id() });
+    const leaf = put(Transform(), EntityAttributes({ name: 'NestLeaf', parentId: nest.id() }),
+      PrefabInstance({ source: 'q.json', localId: 2, rootInstanceId: nest.id() }));
+    return { root, member, nest, leaf };
+  };
+  const rootOf = (e: any) => e.get(PrefabInstance).rootInstanceId as number;
+
+  it('a copied instance points its rootInstanceIds into the COPY — the nested one at its own root — for a plain parent and for the root itself', async () => {
+    const { duplicateEntity } = await getModule();
+    const holder = put(Transform(), EntityAttributes({ name: 'Holder', guid: 'g-holder' }));
+    const src = instance(holder.id());
+    for (const target of [holder.id(), src.root.id()]) {
+      const copyId = duplicateEntity(target, vi.fn())!;
+      const seen = new Set([src.root.id(), src.member.id(), src.nest.id(), src.leaf.id()]);
+      const fresh = (name: string) => {
+        let found: any;
+        testWorld.query(EntityAttributes).updateEach(([ea]: any[], e: any) => { if (ea.name === name && !seen.has(e.id())) found = e; });
+        seen.add(found.id());
+        return found;
+      };
+      const [root, member, nest, leaf] = ['Root', 'Member', 'NestRoot', 'NestLeaf'].map(fresh);
+      // The copy's Root: under the holder's copy, or the copy itself.
+      expect(target === holder.id() ? root.get(EntityAttributes).parentId : root.id()).toBe(copyId);
+      expect(rootOf(root)).toBe(root.id());
+      expect(rootOf(member)).toBe(root.id());
+      expect(rootOf(nest)).toBe(nest.id());
+      expect(rootOf(leaf)).toBe(nest.id());
+      // The source is untouched.
+      expect([rootOf(src.root), rootOf(src.member), rootOf(src.nest), rootOf(src.leaf)])
+        .toEqual([src.root.id(), src.root.id(), src.nest.id(), src.nest.id()]);
+      for (const e of [root, member, nest, leaf]) seen.add(e.id());
+    }
+  });
+
+  it('delete + undo of an instance restores rootInstanceIds that name the RESTORED entities', async () => {
+    const { deleteEntityWithUndo } = await getModule();
+    const src = instance();
+    deleteEntityWithUndo(src.root.id());
+    // koota recycles freed ids: without fillers the restore gets the SAME ids back, and a stale
+    // rootInstanceId would still look right.
+    for (let i = 0; i < 4; i++) put(Transform(), EntityAttributes({ name: `Filler${i}` }));
+    pushedActions[0].undo();
+    const [root, member, nest, leaf] = ['Root', 'Member', 'NestRoot', 'NestLeaf'].map((n) => byName(n));
+    expect(rootOf(root)).toBe(root.id());
+    expect(rootOf(member)).toBe(root.id());
+    expect(rootOf(nest)).toBe(nest.id());
+    expect(rootOf(leaf)).toBe(nest.id());
+  });
+
+  it('a rootInstanceId naming an entity OUTSIDE the respawned subtree is left alone (a member deleted and restored)', async () => {
+    const { deleteEntityWithUndo } = await getModule();
+    const src = instance();
+    deleteEntityWithUndo(src.member.id());
+    for (let i = 0; i < 3; i++) put(Transform(), EntityAttributes({ name: `Filler${i}` }));
+    pushedActions[0].undo();
+    expect(rootOf(byName('Member'))).toBe(src.root.id());
+    expect(rootOf(byName('NestRoot'))).toBe(byName('NestRoot').id());
+  });
+
+  // Prefab members (guids a reload derives): engine/tests/editor/duplicateCarriesRefs.test.ts, which
+  // round-trips through the real loader and serializer.
 });

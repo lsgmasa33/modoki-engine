@@ -10,6 +10,7 @@ import { assetScannerPlugin } from './plugins/vite-asset-scanner'
 import { loadProjectConfig } from './plugins/load-project-config'
 import { resolveModules } from './plugins/detect-modules'
 import { inlinePlayablePlugin } from './plugins/inlinePlayable'
+import { ktx2LoaderAssetStripPlugin } from './plugins/ktx2LoaderAssetStrip'
 import { subgameBuildPlugin, SUBGAME_ENTRY_VIRTUAL_ID, subgameOutDir } from './plugins/subgameBuild'
 import { bootSplashPlugin } from './plugins/bootSplash'
 import { earlyConsoleShimPlugin } from './plugins/earlyConsoleShim'
@@ -402,6 +403,8 @@ export default defineConfig(({ command }) => {
       isDebugBuild: debugBuildFlag,
     }),
     assetScannerPlugin(),
+    // three r185's KTX2Loader emits a hashed Basis transcoder pair nothing fetches (#1340).
+    ktx2LoaderAssetStripPlugin(),
     ...(externalProject ? [hostSharedDeps()] : []),
     // The web boot splash (#396). Build-only and opt-in: a project with no `app.splashSource`
     // emits nothing and its boot is unchanged. Skipped for the EDITOR shell, which opens projects

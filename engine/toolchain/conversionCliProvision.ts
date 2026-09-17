@@ -13,9 +13,12 @@
  * ## Where each artifact comes from
  *
  * - `toktx`: KhronosGroup's own releases. macOS ships only as a `.pkg`, which is UNPACKED
- *   (`pkgutil --expand-full`, no sudo, no system install) and just `toktx` + `libktx` are kept —
- *   `toktx` carries an `@executable_path` rpath, so the sibling dylib resolves as-is. Windows ships
- *   only as an NSIS installer, which 7-Zip can unpack (the release workflow does the same).
+ *   (`pkgutil --expand-full`, no sudo, no system install) and just `toktx` + `ktx` + `libktx` are
+ *   kept — both CLIs carry an `@executable_path` rpath, so the sibling dylib resolves as-is. Windows
+ *   ships only as an NSIS installer, which 7-Zip can unpack (the release workflow does the same).
+ *   `ktx` is kept because @gltf-transform/cli 4.4 encodes KTX2 with `ktx`, not `toktx`, found on
+ *   PATH beside the pinned `toktx` — without it the rigged-model path used whatever `ktx` the
+ *   machine had, or none (#1351).
  * - `msdf-atlas-gen`: upstream publishes Windows zips only. The macOS binary is OURS — built once,
  *   statically linked and WITH Skia (as upstream builds Windows), by
  *   `engine/scripts/build-msdf-atlas-gen-macos.sh` and published as the
@@ -71,6 +74,7 @@ export interface PinnedCli {
 const KTX = 'https://github.com/KhronosGroup/KTX-Software/releases/download/v4.4.2'
 const ktxPkgFiles = (arch: string): PinnedCliAsset['files'] => [
   [`KTX-Software-4.4.2-Darwin-${arch}-tools.pkg/Payload/usr/local/bin/toktx`, 'toktx'],
+  [`KTX-Software-4.4.2-Darwin-${arch}-tools.pkg/Payload/usr/local/bin/ktx`, 'ktx'],
   // The real file, not the `libktx.4.dylib` symlink next to it — the install dir keeps no links.
   [`KTX-Software-4.4.2-Darwin-${arch}-library.pkg/Payload/usr/local/lib/libktx.4.4.2.dylib`, 'libktx.4.dylib'],
 ]
@@ -98,7 +102,7 @@ export const CONVERSION_CLI_PINS: Record<ConversionCliId, PinnedCli> = {
         url: `${KTX}/KTX-Software-4.4.2-Windows-x64.exe`,
         sha256: '1f323b0fec19794f5e6c0425a61d4b1da396872a10be862d105f4f4b2d2957fe',
         kind: 'nsis-exe',
-        files: [['bin/toktx.exe', 'toktx.exe'], ['bin/ktx.dll', 'ktx.dll']],
+        files: [['bin/toktx.exe', 'toktx.exe'], ['bin/ktx.exe', 'ktx.exe'], ['bin/ktx.dll', 'ktx.dll']],
       },
     },
   },
@@ -147,6 +151,18 @@ export function pinLabel(id: ConversionCliId): string {
  *  target's path is testable from any host. */
 export function conversionCliBin(toolchainDir: string, id: ConversionCliId, platform: NodeJS.Platform = process.platform): string {
   return path.join(conversionCliDir(toolchainDir, id), platform === 'win32' ? `${id}.exe` : id)
+}
+
+/** The first kept file missing from the pinned install under `toolchainDir`, or undefined when all
+ *  are there (or this host has no pin). A dir installed before a file joined the pin (`ktx`, #1351)
+ *  has a working executable and is still incomplete — `ensureConversionCli` reinstalls it, and
+ *  `isToolStale` reports it so Build Support offers the repair. */
+export function missingConversionCliFile(
+  toolchainDir: string, id: ConversionCliId, platform: NodeJS.Platform = process.platform, arch: string = process.arch,
+): string | undefined {
+  const asset = conversionCliDist(id, platform, arch)
+  const dir = conversionCliDir(toolchainDir, id)
+  return asset?.files.map(([, to]) => to).find((f) => !fs.existsSync(path.join(dir, f)))
 }
 
 /** The flag each CLI answers with its version and exit 0 — what `detect()` probes too. */
@@ -258,16 +274,24 @@ export async function ensureConversionCli(
   const dir = conversionCliDir(toolchainDir, id)
   const bin = conversionCliBin(toolchainDir, id, platform)
   const runs = () => (opts.probe ?? defaultRunProbe)(bin, VERSION_ARG[id])
+  // Every file the pin keeps, not just the executable (see missingConversionCliFile).
+  const missingFile = () => missingConversionCliFile(toolchainDir, id, platform, arch)
+  const healthy = () => !missingFile() && runs()
   if (fs.existsSync(bin)) {
-    if (runs()) return bin
-    log(`${id} ${label} under ${dir} does not run — reinstalling it.`)
+    if (healthy()) return bin
+    const missing = missingFile()
+    log(missing
+      ? `${id} ${label} under ${dir} has no ${missing} — reinstalling it.`
+      : `${id} ${label} under ${dir} does not run — reinstalling it.`)
+    // A copy that RUNS but lacks a file is still what every sibling clone converts with, so it stays
+    // in place through the download and is swapped out only once the new one is staged (below).
     // Re-checked at the moment of the move: a sibling may have repaired it since the probe above,
     // and its good copy must not be the one moved aside.
-    if (!discard(dir, () => !runs())) {
-      if (runs()) return bin
+    if (!(missing && runs()) && !discard(dir, () => !healthy())) {
+      if (healthy()) return bin
       throw new Error(
-        `${id} ${label} under ${dir} does not run and could not be moved aside to replace it ` +
-        '(is it in use, or held by antivirus?). Close what uses it and retry.')
+        `${id} ${label} under ${dir} ${missing ? `is missing ${missing}` : 'does not run'} and could not be moved ` +
+        'aside to replace it (is it in use, or held by antivirus?). Close what uses it and retry.')
     }
   }
 
@@ -301,14 +325,14 @@ export async function ensureConversionCli(
     // The toolchain dir is machine-wide and several editors (one per clone) install into it, so
     // another process can finish the same install while this one downloads. Rename FIRST — it
     // fails when a dir is already there — and a complete dir there is the winner's (same pinned
-    // bytes): keep it. Only a dir WITHOUT the executable is debris, and it is moved aside
+    // bytes): keep it. Only a dir missing a kept file is debris (or a pre-#1351 install), and it is moved aside
     // atomically before the retry, so no path ever deletes a dir in place that someone may use.
     try {
       fs.renameSync(staged, dir)
     } catch (e) {
-      if (!fs.existsSync(bin)) {
-        discard(dir)
-        try { fs.renameSync(staged, dir) } catch (e2) { if (!fs.existsSync(bin)) throw e2 }
+      if (missingFile()) {
+        discard(dir, () => !!missingFile())
+        try { fs.renameSync(staged, dir) } catch (e2) { if (missingFile()) throw e2 }
       } else if (!['ENOTEMPTY', 'EEXIST', 'EPERM', 'EBUSY'].includes((e as NodeJS.ErrnoException).code ?? '')) {
         throw e
       }
@@ -316,7 +340,8 @@ export async function ensureConversionCli(
   } finally {
     fs.rmSync(work, { recursive: true, force: true })
   }
-  if (!fs.existsSync(bin)) throw new Error(`${id} install incomplete — expected ${bin}`)
+  const stillMissing = missingFile()
+  if (stillMissing) throw new Error(`${id} install incomplete — expected ${path.join(dir, stillMissing)}`)
   if (!runs()) {
     throw new Error(
       `${id} ${label} installed under ${dir} but does not run` +

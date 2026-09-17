@@ -70,7 +70,7 @@ import { atlasPageUrlPath } from './atlas-cache';
 import { getModelCacheDir, lodCachePath } from './model-cache';
 import { convertTexture } from './texture-convert';
 import { convertModel } from './model-convert';
-import { convertRiggedModel } from './rigged-model-optimize';
+import { convertRiggedModel, riggedConversionFailure } from './rigged-model-optimize';
 import { resolveTextureSettings, resolveTextureType, variantSuffix, variantsToEmit, sizesToEmit, type TextureImportSettings, type TextureType, type TextureVariant } from '../packages/modoki/src/runtime/loaders/textureSettings';
 import { isPlayableBuild, playableTextureSettings, playableEnvSettings } from './playable-profile';
 import { shouldEmitTextureTierVariants } from './textureTierEmit';
@@ -4165,6 +4165,8 @@ export function assetScannerPlugin(): Plugin {
             },
           });
           console.log(`[asset-shaker] rigged GLB optimized → ${virtualPath}${lodUrlSuffix(0)} (${(fs.statSync(srcAbs).size / 1e6).toFixed(1)} → ${(conv.bytes / 1e6).toFixed(1)} MB)`);
+          const skipped = riggedConversionFailure(virtualPath, conv);
+          if (skipped) conversionFailures.push(skipped);
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
           console.warn(`[asset-shaker] rigged convert failed for ${virtualPath} — shipping raw source. ${msg}`);

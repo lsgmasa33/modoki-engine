@@ -272,6 +272,21 @@ flags feed `ktxSignature` → `riggedHash`, so an existing rigged model's cache 
 its next reimport when the knobs change — no `MODEL_ENCODER_VERSION` bump needed, since only the
 affected models invalidate.
 
+**A KTX2 step that does not run must be visible — to the cache AND to the build (#1337).** The cache
+key is computed BEFORE the encode and names the toktx version whenever toktx was found. So the encode
+has two failure modes with opposite handling:
+- **toktx missing** → the GLB is derived with RAW textures and cached under the key's distinct
+  `toktx:` (empty) slot, so a machine with toktx never reuses it. `convertRiggedModel` returns
+  `ktx2Skipped`, derived from the key, so a cache HIT reports it too. The production build turns
+  that into a `rigged model` conversion failure, and the strict gate refuses it unless
+  `MODOKI_ALLOW_ASSET_FALLBACK=1`. A dev reimport keeps loading the model.
+- **toktx present, encode FAILS** → the error is rethrown and the staging dir discarded, so nothing
+  lands under the with-toktx key. It used to be swallowed with a warning, and the raw-texture GLB was
+  then a cache hit on every later import, with the strict gate seeing neither case. A dev reimport
+  now surfaces the error (owner's call, 2026-09-17: loud over silently uncompressed).
+
+Covered by `engine/tests/plugins/riggedKtx2Failure.test.ts` (faked CLI, real cache publication).
+
 **Deferred follow-ups** (tracked, not scheduled):
 - **AnimSet playback preview** — the Inspector shows numeric clip params only; a real preview
   needs an `AnimationMixer`-driven viewer (`ModelPreview.tsx` today only loads GLBs statically).

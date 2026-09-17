@@ -5,7 +5,7 @@ import { getCurrentWorld, spawnEntity, destroyEntity, indexEntityGuid, findEntit
 import { getAllTraits, getTraitByName } from '../core/ecs/traitRegistry';
 import { loadModelTemplates, getCachedPrefab } from './meshTemplateCache';
 import { isGuid, isExternalUrl, resolveRef, getAssetType, deriveGuid, newGuid, getAssetEntry, type AssetType } from './assetManifest';
-import { durableGuid } from '../core/assetRefRules';
+import { durableGuid, deriveMemberGuid, memberStepId } from '../core/assetRefRules';
 import { deriveAuthoredEntityGuids } from './authoredEntityGuids';
 import { parseEntryPrefabs } from '../traits/UIEntries';
 import { markUIDirty } from '../ui/uiTreeStore';
@@ -788,8 +788,10 @@ type PrefabFileEntry = {
  *  Anchoring uses a snapshot of guids taken BEFORE deriving, so the result is
  *  independent of iteration order (derived guids never become anchors).
  *
- *  ⚠️ The step rule is MIRRORED by `derivedMemberPaths` (engine/plugins/asset-fs-ops.ts), which
- *  re-derives member guids on the Node side when a scene file is duplicated (#1324) — change both. */
+ *  The guid rule itself is `deriveMemberGuid`/`memberStepId` (shared). ⚠️ The ANCESTOR walk is
+ *  MIRRORED twice, because a duplicate must predict where a reload puts each member: over a scene
+ *  FILE by `derivedMemberPaths` + `sceneAnchorOf` (engine/plugins/asset-fs-ops.ts, #1324/#1339), and
+ *  over an editor SNAPSHOT by `regenerateSnapshotGuids` (#1338) — change all three. */
 export function deriveInstanceMemberGuids(world: World): void {
   const piMeta = getTraitByName('PrefabInstance');
   const attrMeta = getTraitByName('EntityAttributes');
@@ -805,8 +807,7 @@ export function deriveInstanceMemberGuids(world: World): void {
     // root, whose localId is the (shared) inner root id; its distinguishing
     // position is parentLocalId (which OUTER row produced it). Two sibling nested
     // instances share inner localIds, so without this their members would collide.
-    const pi = hasPI ? (e.get(piMeta.trait) as { localId?: number; parentLocalId?: number }) : null;
-    const stepId = pi ? (pi.parentLocalId || pi.localId || 0) : 0;
+    const stepId = memberStepId(hasPI ? (e.get(piMeta.trait) as { localId?: number; parentLocalId?: number }) : null);
     // durableGuid: a runtime guid (#1210) is neither an identity to keep nor an anchor to derive from.
     rows.set(e.id(), { handle: e, origGuid: durableGuid(ea.guid), parentId: ea.parentId ?? 0, stepId, hasPI });
   }
@@ -825,7 +826,7 @@ export function deriveInstanceMemberGuids(world: World): void {
       cur = rows.get(cur.parentId);
     }
     if (!anchor) continue; // no scene-anchored ancestor → leave unaddressable
-    const derived = deriveGuid(`${anchor}|${path.join('.')}`);
+    const derived = deriveMemberGuid(anchor, path);
     row.handle.set(attrMeta.trait, { ...(row.handle.get(attrMeta.trait) as Record<string, unknown>), guid: derived });
     indexEntityGuid(row.handle, world); // keep the guid index warm for this '' → guid mint
   }

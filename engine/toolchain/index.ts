@@ -34,7 +34,7 @@ import { ensureJdk, discoverJavaHome, jdkVersionDir } from './jdkProvision'
 import { ensureCmdlineTools, runSdkmanager, ANDROID_SDK_PACKAGES } from './androidSdkProvision'
 import { ensureRuby, rubyDirFor } from './rubyProvision'
 import { ensureGoIos, goIosBinFor } from './goIosProvision'
-import { ensureConversionCli, conversionCliBin, conversionCliDist, canExpand } from './conversionCliProvision'
+import { ensureConversionCli, conversionCliBin, conversionCliDist, canExpand, missingConversionCliFile } from './conversionCliProvision'
 import { ensureWda, wdaBuildStatus, PINNED_WDA, type CommandRunner as WdaCommandRunner } from './wdaProvision'
 
 export type ToolId = 'toktx' | 'android-sdk' | 'npm' | 'java' | 'xcodebuild' | 'gltf-transform-cli' | 'gltfpack' | 'cocoapods' | 'ffmpeg' | 'ffprobe' | 'msdf-atlas-gen' | 'webdriveragent' | 'go-ios'
@@ -1144,6 +1144,9 @@ export function isToolStale(id: ToolId, d: DetectResult): boolean {
   // deliberate MODOKI_FFMPEG override is the user's call (#1297).
   const npmPin = NPM_BINARY_PINS[id as NpmBinaryToolId]
   if (npmPin) return d.source === 'probe' && installedNpmToolVersion(conversionToolchainDir(), npmPin.pkg) !== npmPin.version
+  // toktx/msdf-atlas-gen: the versioned dir already pins the version, but an install that predates a
+  // kept file (`ktx`, #1351) runs and is incomplete — stale, so Build Support offers the repair.
+  if ((id === 'toktx' || id === 'msdf-atlas-gen') && d.source === 'probe' && missingConversionCliFile(conversionToolchainDir(), id)) return true
   const tc = process.env.MODOKI_TOOLCHAIN_DIR
   if (!tc || !d.path || !d.path.startsWith(tc)) return false // not our install → don't touch it
   // Both share the `npm-tools` tree with `ndarray-pixels`' own `sharp` (see PINNED_SHARP_OVERRIDE) —

@@ -225,6 +225,31 @@ function noteIfAuthoredWriteWhileStopped(
   noteAuthoredWriteWhileStopped(entityId, attrs?.name || `#${entityId}`, traitName, field);
 }
 
+/** After a subtree has been spawned as a copy (or re-spawned from a snapshot), carry every NUMERIC
+ *  entity reference held inside it — a registry field flagged `entityId`, i.e.
+ *  `PrefabInstance.rootInstanceId` — from the source ids to the new ones. `idMap` is source id →
+ *  new id for the spawned subtree only, so a reference to an entity outside it is left alone.
+ *  `EntityAttributes.parentId` is skipped: the spawn sets it. Without this a copied prefab instance
+ *  keeps naming the SOURCE root (#1338). */
+export function carryEntityIdFields(
+  copies: Iterable<{ id: number; traits: ReadonlyArray<{ name: string; data?: Record<string, unknown> | true }> }>,
+  idMap: ReadonlyMap<number, number>,
+): void {
+  for (const { id, traits } of copies) {
+    for (const { name, data } of traits) {
+      if (!data || data === true) continue;
+      const meta = getTraitByName(name);
+      if (!meta) continue;
+      for (const [field, hint] of Object.entries(meta.fields ?? {})) {
+        if (!hint?.entityId || (name === 'EntityAttributes' && field === 'parentId')) continue;
+        const old = data[field];
+        const mapped = typeof old === 'number' ? idMap.get(old) : undefined;
+        if (mapped !== undefined && mapped !== old) writeTraitField(id, meta, field, mapped);
+      }
+    }
+  }
+}
+
 /** Write a field value to a trait on an entity */
 export function writeTraitField(entityId: number, meta: TraitMeta, field: string, value: unknown) {
   if (meta.category === 'tag') {

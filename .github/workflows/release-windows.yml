@@ -87,7 +87,7 @@ jobs:
       # .exe), so: download the official installer, verify a pinned sha256 (computed from
       # the release asset — never install unverified bytes), 7z-extract it (7-Zip is
       # preinstalled on windows-latest — no need to RUN the installer), and copy just
-      # toktx.exe + its ktx.dll into build/bin (electron-builder ships that as
+      # toktx.exe + ktx.exe + their ktx.dll into build/bin (electron-builder ships that as
       # extraResources → resources/bin; main resolves MODOKI_TOKTX there). Graceful: any
       # failure leaves build/bin present-but-empty so the build still succeeds and the app
       # falls back to source textures (same as a dev box without toktx).
@@ -101,8 +101,11 @@ jobs:
           url="https://github.com/KhronosGroup/KTX-Software/releases/download/v${KTX_VER}/KTX-Software-${KTX_VER}-Windows-x64.exe"
           if curl -fsSL "$url" -o ktx.exe && echo "${KTX_SHA} *ktx.exe" | sha256sum -c -; then
             7z x -y ktx.exe -oktx-extract >/dev/null
-            if cp ktx-extract/bin/toktx.exe ktx-extract/bin/ktx.dll build/bin/; then
-              echo "[stage-toktx] bundled toktx.exe + ktx.dll:"; ls -la build/bin
+            # ktx.exe too: gltf-transform encodes rigged-model KTX2 with it, found beside toktx (#1351).
+            # All three or none — a partial set would ship a toktx whose rigged encode always refuses.
+            mkdir -p ktx-stage
+            if cp ktx-extract/bin/toktx.exe ktx-extract/bin/ktx.exe ktx-extract/bin/ktx.dll ktx-stage/ && mv ktx-stage/* build/bin/; then
+              echo "[stage-toktx] bundled toktx.exe + ktx.exe + ktx.dll:"; ls -la build/bin
             else
               echo "[stage-toktx] WARN: extract layout unexpected — building WITHOUT bundled toktx"
             fi
@@ -165,7 +168,7 @@ jobs:
           set -uo pipefail
           BIN="release/win-unpacked/resources/bin"
           missing=0
-          for f in toktx.exe ktx.dll msdf-atlas-gen.exe; do
+          for f in toktx.exe ktx.exe ktx.dll msdf-atlas-gen.exe; do
             if [ -f "$BIN/$f" ]; then
               echo "[verify-tools] OK: $f ($(wc -c < "$BIN/$f") bytes)"
             else
@@ -177,6 +180,8 @@ jobs:
             echo "::error::Bundled tool(s) missing from resources/bin — a Stage step likely failed its download/sha check (see the 'Stage toktx' / 'Stage msdf-atlas-gen' logs above). Refusing to ship a toolless installer."
             exit 1
           fi
+          # ktx.exe is gltf-transform's rigged-model encoder (#1351) — prove it starts beside ktx.dll.
+          "$BIN/ktx.exe" --version || { echo "::error::bundled ktx.exe does not run"; exit 1; }
           echo "[verify-tools] all bundled tools present in resources/bin."
 
       # Gate the release on the packaged editor actually RENDERING — the "blank editor

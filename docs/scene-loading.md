@@ -1164,19 +1164,30 @@ it has already sent one sweep in the wrong direction (2026-08-18):
   `added[]` node — and rewrites every in-file string value equal to one of them (`parentId`,
   `rootInstanceId`, every `entityRef` field, `UIAction.bindings[].target`). A ref to a guid the file
   does not define (its base scene) is kept. Owner ruling: always remint, no "duplicate as variant"
-  opt-out — the same rule `regenerateSnapshotGuids` already applies to a subtree duplicated inside a
-  scene. **The accepted cost:** a `Persistent` entity in the copy no longer matches its original, so
+  opt-out — the same rule `regenerateSnapshotGuids` applies to a subtree duplicated inside a scene
+  (below). **The accepted cost:** a `Persistent` entity in the copy no longer matches its original, so
   swapping between the two files spawns it twice. Existing files were deliberately left as they are
   — `qa/cases/**`, `demos/postfx-demo` and Court's tests pin their guids (and postfx-demo's code
   looks entities up by literal guid, so a DUPLICATE of one of its scenes loses those lookups).
   **A stored ref to a prefab MEMBER follows too (#1324).** Members are not stored; they derive
-  `deriveGuid(anchor|path)` from the (now reminted) anchor on load, so a ref holding a member's
-  derived guid would otherwise keep the OLD anchor's value and dangle in the copy. The duplicate
-  route hands `remintSceneEntityGuids` a prefab reader, and `derivedMemberPaths` walks each
-  reminted anchor's prefab chain — nested rows and user-added nested instances included — to map
-  `deriveGuid(old|p)` → `deriveGuid(new|p)`. Its step rule MIRRORS `deriveInstanceMemberGuids`
-  (a prefab row steps by its `localId`, a user-added nested instance's root by its prefab's root
-  localId, a plain added node by 0), so a change to one must change the other.
+  `deriveMemberGuid(anchor, path)` (`core/assetRefRules.ts`, the one spelling of the rule) from the
+  now-reminted anchor on load. A ref holding a member's derived guid would otherwise keep the OLD
+  anchor's value and dangle in the copy. The duplicate route hands `remintSceneEntityGuids` a prefab
+  reader, and `derivedMemberPathsByAnchor` walks each instance's prefab chain, including nested rows
+  and user-added nested instances, to map `old|p` → `new|p`. The walk mirrors the LOADER's parenting,
+  not the prefab's intent. A prefab row steps by its `localId`, a user-added nested instance's root
+  by its prefab's root localId, and a plain added node by 0. **The anchor is not always the instance
+  root (#1339).** `instantiatePrefabIntoWorld` parents a row whose `parentId` is 0 or names no row to
+  the CALLER's parent. For a top-level instance that is its scene parent. For a user-added nested
+  instance it is the member the node hangs on. For a nested prefab ROW it is nothing, because the
+  row expands under 0, so those rows are unaddressable. A guid-less (pre-#1248) instance root also
+  derives, from its scene parent. So every path is tagged with the anchor it hangs off, and
+  `sceneAnchorOf` resolves the scene-side `parentId` (a guid or an entry id) to that parent. Only a
+  parent with a durable guid is followed, and refs below any other parent are left as they were. A
+  guid-less PLAIN parent's guid is seeded from the scene PATH (`deriveAuthoredEntityGuids`), which a
+  copy at another path does not share. A guid-less INSTANCE parent can only be named by number, which
+  the loader resolves to the destroyed placeholder, so the child lands wherever koota recycles that
+  id (#1353). **Change the loader's walk and this one together.**
   `engine/tests/plugins/remintPrefabMemberRefs.test.ts` pins the pair by loading the original and
   the copy through the real loader, never by hand-computing a guid. A prefab the reader cannot
   resolve maps nothing, so a ref into it still dangles.
@@ -1184,10 +1195,36 @@ it has already sent one sweep in the wrong direction (2026-08-18):
   prefab whose file adds a reference leading back to it). Two structural rules for "which shapes
   are cycles" were each wrong in review, refusing shapes that load or missing ones that do not, so
   the walk stops on SIZE instead: past 64 instance levels or 100,000 member paths it maps nothing for
-  that anchor. Plain added levels do not count toward the depth. A row whose parent is zero or
-  unknown derives from the SCENE parent and is not followed (#1339).
+  that anchor. Plain added levels do not count toward the depth.
   A stale runtime guid (#1210) is not reminted (it is no identity), and a BOM-prefixed file is
   parsed past its BOM rather than copied verbatim under the original's asset id.
+- **Duplicating or pasting a live SUBTREE carries its internal refs the same way (#1338).**
+  `regenerateSnapshotGuids` (`editor/undo/entityActions.ts`) and the device's `duplicate-entity`
+  op (`engine/app/debug/liveLifecycle.ts`, which also deep-clones its snapshot now) plan the copy's
+  guids with one shared function, `planCopyGuids` (`runtime/core/copyIdentity.ts`). They then run
+  the same `remapGuidValues` over every trait, so a `UIAction` target or an
+  `entityRef` aimed at the source's own child points at the copy's child. A ref to anything outside
+  the subtree is kept. Before the fix the copy silently drove the SOURCE, with nothing erroring.
+  Two mechanisms make this survive save + reload:
+  - **A prefab member in the copy gets the guid a reload will derive, not a random one.** A random
+    member guid would be replaced on the next load, taking every carried ref with it. Which guids a
+    save STORES is structural, so that is the classification: a `PrefabInstance` entity is derived
+    unless it is an instance root the serializer stores (its `rootInstanceId` is itself and its
+    `parentLocalId` is 0). So members and owned nested roots are derived. Top-level and user-added
+    instance roots, plain entities, and the copy's root are anchors and get `newGuid()`. An earlier
+    draft classified by "the live guid equals its derivation"; review showed that fails once a save
+    has stored a derived guid (#1349), for the entity's descendants and for a legacy root's copy.
+  - **Numeric `entityId` fields follow too** (`carryEntityIdFields`, called by `respawnFromSnapshot`
+    and by the device op). `PrefabInstance.rootInstanceId` is carried from the snapshot's ids to the
+    respawned ones, within the subtree only. Before this, a copied
+    instance kept naming the SOURCE root: a copy of an instance's plain parent was folded into the
+    source instance's `added[]` on save. The old `reRootPrefabInstanceSubtree` pointed every copied
+    `PrefabInstance`, nested roots included, at the outer root. The remap replaced it, and it also
+    fixes delete + undo, whose restored instance used to name a dead id.
+  `engine/tests/editor/duplicateCarriesRefs.test.ts` round-trips loader → duplicate → `serializeScene`
+  → loader. ⚠️ Its added nested instance carries its OWN guid on purpose. A guid-less one has its
+  derived guid stored by the first save, which re-anchors its members with or without a duplicate
+  (#1349, open).
 
 So a repo-wide uniqueness check would fail on the architecture rather than find a bug. The honest
 cross-file signal is "same guid, *different* entity name", which is too weak to gate a build on: an

@@ -1040,7 +1040,8 @@ AppsFlyer 7.0.2, capacitor-swift-pm 8.4 / 8.5):
   until #1062 stripped it) declare it in their own manifests.
 - **Collected data: only the game's OWN first-party collection** (owner, 2026-09-11). Court declares
   User ID, Gameplay Content and Purchase History (its Firestore cloud save), each linked, App
-  Functionality, not tracking. Weaveling declares none today; revisit when #927, #925 or #932 lands.
+  Functionality, not tracking. Weaveling declares none, which is now behind: #927 (sign-in), #925 (purchases) and #932 (ads)
+  have all landed, so it owes the same three rows as Court (#933).
 - ⚠️ **GoogleAppMeasurement ships no manifest, so Firebase Analytics' own collection is declared by
   nothing in the graph.** That is App Store privacy-label work (#933), not something to paper over
   in the app's manifest. Confirmed in a built Court `App.app`, whose bundle carries ~45 SDK
@@ -1308,6 +1309,27 @@ re-extracting — which poisons the vendored plugin permanently, in the way
 harmless.
 
 Full build/deploy commands live in [build.md](./build.md) and the project `CLAUDE.md`.
+
+### Patched third-party plugins — `patch-package`, per project (#1333)
+
+When a third-party plugin is wrong in its **native** code and upstream has no fix, the project that
+depends on it carries a `patch-package` patch (owner ruling, 2026-09-17). Forking the plugin into
+`engine/packages/` was the rejected alternative: it takes the upgrade path over from upstream.
+
+- **The patch lives in the game:** `games/<id>/patches/<pkg>+<version>.patch`, applied by a
+  `postinstall: "patch-package"` in the game's own `package.json`. That keeps the game
+  self-contained (#29). Both install paths run it: `bootstrap-game-deps.mjs` and the editor's
+  `ensureProjectDeps` each run a bare `npm install`/`npm ci` with scripts on.
+- **Pin the plugin EXACTLY.** A caret lets npm move the plugin under a version-named patch.
+- **Generate with `--include`** (`npx patch-package <pkg> --include '^ios/Sources/'`). Without it the
+  patch sweeps in any local build output under the package, such as `android/build/`.
+- ⚠️ **`patch-package` exits 0 on a failed apply outside CI**, so a failed patch never fails an
+  install. Each patch therefore needs an engine guard that reads the INSTALLED copy. It also only
+  runs on a bare `npm install`: `npm install <pkg>` skips the project's own `postinstall`.
+
+The one live case is `@capacitor-community/admob` in Court and Weaveling, which fixes iOS paid-event
+revenue units ([Court ads.md](../games/court/ads.md) § "Ad revenue stops at Firebase"). Its guard is
+`engine/tests/architecture/admobRevenueUnitPatched.test.ts`.
 
 ## App Identity & Build
 

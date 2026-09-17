@@ -267,7 +267,7 @@ export { suggestBones, type SuggestBonesOptions } from './skinning/rig2dAutoBone
 export { buildRig2D, autoRig2D, type BuildRig2DOptions, type AutoRig2DOptions } from './skinning/rig2dBuild';
 export { paintWeights, boneWeightField, dominantBoneField, type PaintWeightsOptions, type PaintWeightsResult } from './skinning/rig2dWeightPaint';
 export {
-  findEntity, guidOfEntityId, getEntityTraits, readTraitData, readTraitDataFull, writeTraitField,
+  findEntity, guidOfEntityId, getEntityTraits, readTraitData, readTraitDataFull, writeTraitField, carryEntityIdFields, cloneTraitValues,
   getAllEntities, entityDisplayName, buildEntityTree, deleteEntity, deleteEntities, deriveLayer,
   onStructureDirty, markStructureDirty, getStructureVersion,
   type EntityInfo,
@@ -490,7 +490,8 @@ export { layoutText, type LayoutFont, type LayoutOptions, type TextLayout, type 
  *  with it. */
 export { measureText2D, type MeasureText2DOptions } from './loaders/measureText2D';
 // Runtime guids (#1210): tell an entity's live-only address from its durable identity.
-export { isRuntimeGuid, durableGuid } from './core/assetRefRules';
+export { isRuntimeGuid, durableGuid, remapGuidValues } from './core/assetRefRules';
+export { planCopyGuids, type CopyGuidPlan } from './core/copyIdentity';
 export {
   isGuid, isExternalUrl, isInternalAssetPath, newGuid, deriveGuid, registerAsset, unregisterAsset, resolveGuidToPath,
   getGuidForPath, getAssetType, getAssetEntry, getAudioLoadType, resolveRef, loadManifestJson, ensureManifestLoaded, serializeManifest,

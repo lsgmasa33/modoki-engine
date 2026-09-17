@@ -1000,7 +1000,9 @@ describe('toolchain — pinned CLI/gem tool versions + staleness (bump → reins
 
   it('never stale for an un-pinned tool, or when absent', () => {
     process.env.MODOKI_TOOLCHAIN_DIR = '/tmp/modoki-tc-y'
-    expect(isToolStale('toktx', mk({ id: 'toktx', version: '1.0', path: '/tmp/modoki-tc-y/x' }))).toBe(false)
+    // (toktx used to be the un-pinned example; since #1327 it is pinned by its versioned dir, and an
+    // install missing a kept file IS stale — conversionToolPin.test.ts covers that.)
+    expect(isToolStale('java', mk({ id: 'java', version: '1.0', path: '/tmp/modoki-tc-y/x' }))).toBe(false)
     expect(isToolStale('gltf-transform-cli', mk({ present: false, version: undefined }))).toBe(false)
   })
 })

@@ -24,6 +24,10 @@ import {
   getCurrentWorld,
   newGuid,
   durableGuid,
+  cloneTraitValues,
+  remapGuidValues,
+  planCopyGuids,
+  carryEntityIdFields,
   buildEntityCreateSpecs,
   resolveCreateEntitySpec,
   isResourceEntity,
@@ -160,7 +164,9 @@ export function duplicateEntityLive(params: unknown): unknown {
     for (const meta of all) {
       if (!entity?.has(meta.trait)) continue;
       const data = readTraitDataFull(id, meta) as Record<string, unknown> | null;
-      traits.push({ name: meta.name, ...(data ? { data: { ...data } } : {}) });
+      // A deep clone: readTraitDataFull hands back LIVE references, so a shallow copy would share an
+      // AoS array (UIAction.bindings) with the source (each copy is cloned again below).
+      traits.push({ name: meta.name, ...(data ? { data: cloneTraitValues(data) as Record<string, unknown> } : {}) });
     }
     const parent = getAllEntities().find((e) => e.id === id)?.parentId ?? 0;
     return { id, parentId: parent, traits };
@@ -177,21 +183,31 @@ export function duplicateEntityLive(params: unknown): unknown {
     return { ok: false as const, error: `duplicate-entity: ${why} Nothing was kept — ${spawned.length} partial copy entit${spawned.length === 1 ? 'y was' : 'ies were'} rolled back.` };
   };
 
+  type Node = (typeof snapshot)[number];
+  const childrenOf = new Map<number, Node[]>();
+  for (const src of snapshot) {
+    if (src.id !== rootId) childrenOf.set(src.parentId, [...(childrenOf.get(src.parentId) ?? []), src]);
+  }
+  const dataOf = (node: Node, name: string) => node.traits.find((t) => t.name === name)?.data ?? null;
+
   for (let n = 0; n < count; n++) {
     const idMap = new Map<number, number>();
+    // A copy must NOT inherit the original's guid — two entities answering to one address is the
+    // addressing failure every Percept tool would then inherit — and a ref INSIDE the copy must
+    // follow it, or the copy drives the source (#1338). One plan per copy: each gets its own guids.
+    const { guidOf, remap } = planCopyGuids(snapshot[0]!, (node) => childrenOf.get(node.id) ?? [], dataOf, (node) => node.id, newGuid);
     for (const src of snapshot) {
       const specs = src.traits.map((t) => {
-        if (t.name !== 'EntityAttributes' || !t.data) return t;
-        // A copy must NOT inherit the original's guid — two entities answering to one address is
-        // the addressing failure every Percept tool would then inherit. Re-parent within the copy.
+        if (!t.data) return t;
+        // Cloned PER COPY: remapGuidValues hands back the same object where nothing changed, and koota
+        // stores what it is given, so two copies would otherwise share one bindings array.
+        const data = cloneTraitValues(remapGuidValues(t.data, remap) as Record<string, unknown>) as Record<string, unknown>;
+        if (t.name !== 'EntityAttributes') return { name: t.name, data };
+        // Re-parent within the copy.
         const mappedParent = idMap.get(src.parentId);
         return {
           name: t.name,
-          data: {
-            ...t.data,
-            guid: newGuid(),
-            ...(mappedParent !== undefined ? { parentId: mappedParent } : {}),
-          },
+          data: { ...data, guid: guidOf.get(src)!, ...(mappedParent !== undefined ? { parentId: mappedParent } : {}) },
         };
       });
       // A trait factory can THROW on data it dislikes, not just return null — and an uncaught throw
@@ -206,6 +222,8 @@ export function duplicateEntityLive(params: unknown): unknown {
       spawned.push(newId);
       idMap.set(src.id, newId);
     }
+    // Numeric refs (PrefabInstance.rootInstanceId) need the new ids, so they follow once the copy exists.
+    carryEntityIdFields(snapshot.map((src) => ({ id: idMap.get(src.id)!, traits: src.traits })), idMap);
     const newRoot = idMap.get(rootId)!;
     roots.push({ id: newRoot, guid: liveGuidOf(newRoot) });
   }

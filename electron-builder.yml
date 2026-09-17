@@ -19,8 +19,8 @@
 # ⚠️ VERIFICATION GAP: the exact include/exclude set + the unpacked-path spawn can
 #    only be validated by a real `npm run dist` + launching the .dmg. Not run here.
 #
-# Native modules (sharp + @img) load fine once unpacked. The KTX CLI (toktx +
-# libktx) is bundled into Contents/Resources/bin by the beforePack hook
+# Native modules (sharp + @img) load fine once unpacked. The KTX CLIs (toktx +
+# ktx + libktx; gltf-transform encodes rigged KTX2 with ktx, #1351) are bundled into Contents/Resources/bin by the beforePack hook
 # (scripts/stage-toktx.cjs); main resolves MODOKI_TOKTX there. Model re-import
 # (gltfpack / @gltf-transform/cli) stays a dev-toolchain feature (clear install
 # hint when its external CLI is absent on an end-user machine).
@@ -204,7 +204,7 @@ asarUnpack:
 # when packaged). The signing pass signs all of them; the disable-library-validation
 # entitlement lets each load its sibling dylibs under hardened runtime. beforePack
 # takes one hook → before-pack.cjs fans out to the per-tool stagers (stage-toktx.cjs =
-# KTX CLI + libktx; stage-msdf.cjs = msdf-atlas-gen + its 3 dylibs for font atlas
+# toktx + ktx + libktx; stage-msdf.cjs = msdf-atlas-gen + its 3 dylibs for font atlas
 # bake), each graceful when its binary is absent. We bundle ONLY tools with no npm
 # download path; ffmpeg/ffprobe are provisioned on-demand into the userData toolchain.
 beforePack: engine/scripts/before-pack.cjs
@@ -256,7 +256,7 @@ dmg:
 #        copy the pinned copy `npm run toolchain:install` provisions (never a PATH one).
 #      • Windows CI additionally pre-stages via oss/.github/workflows/release-windows.yml ("Stage toktx" /
 #        "Stage msdf-atlas-gen") download the upstream Windows releases, sha256-verify,
-#        and extract toktx.exe+ktx.dll / msdf-atlas-gen.exe into build/bin BEFORE
+#        and extract toktx.exe+ktx.exe+ktx.dll / msdf-atlas-gen.exe into build/bin BEFORE
 #        electron-builder runs. So a Windows installer DOES bundle both — full parity
 #        with the macOS bundle. main.ts resolveBundled appends `.exe` on win32.
 #    Both paths are graceful: a download/stage failure leaves build/bin empty and the app
