@@ -100,6 +100,13 @@ export const SHIPPING_VIEWPORTS: readonly Viewport[] = DEVICE_PRESETS
   }))
   .sort((a, b) => a.w - b.w);
 
+/** The editor's `Multitasking` presets — split-screen and windowed sizes, SHORT where no device row
+ *  is (#1335). Not devices, so never in `SHIPPING_VIEWPORTS`; a guard about a `vh`-capped layout
+ *  adds them on purpose. */
+export const MULTITASKING_VIEWPORTS: readonly Viewport[] = DEVICE_PRESETS
+  .filter((p) => p.category === 'Multitasking')
+  .map((p) => ({ name: p.name, w: p.logicalW, h: p.logicalH }));
+
 export type Fields = Record<string, unknown>;
 
 export interface AuthoredEntity {

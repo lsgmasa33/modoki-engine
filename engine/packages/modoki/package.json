@@ -21,6 +21,7 @@
     "./runtime/core/dailyCalendar": "./src/runtime/core/dailyCalendar.ts",
     "./runtime/core/loginBonus": "./src/runtime/core/loginBonus.ts",
     "./runtime/core/adLifecycle": "./src/runtime/core/adLifecycle.ts",
+    "./runtime/core/attribution": "./src/runtime/core/attribution.ts",
     "./runtime/core/adPacing": "./src/runtime/core/adPacing.ts",
     "./editor": "./src/editor/index.ts",
     "./editor/rendering": "./src/editor/rendering/index.ts",

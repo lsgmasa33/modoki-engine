@@ -50,7 +50,7 @@
  *  `resolvePhysicalSize` via the editor's orientation toggle.
  */
 
-export type DeviceCategory = 'General' | 'Apple' | 'Samsung' | 'Google' | 'Android' | 'Aspect';
+export type DeviceCategory = 'General' | 'Apple' | 'Samsung' | 'Google' | 'Android' | 'Multitasking' | 'Aspect';
 
 /** Safe-area insets in LOGICAL points, one edge each — the same quartet
  *  `env(safe-area-inset-*)` exposes to CSS.
@@ -224,6 +224,16 @@ export const DEVICE_PRESETS: DevicePreset[] = [
   { name: 'Huawei Mate 60 Pro', category: 'Android', logicalW: 420, logicalH: 907, physicalW: 1260, physicalH: 2720, safeArea: androidPhone(basis('inferred')) }, // @3
   { name: 'Motorola Edge 50',  category: 'Android', logicalW: 360, logicalH: 800, physicalW: 1080, physicalH: 2400, safeArea: androidPhone(basis('inferred')) }, // @3
 
+  // ── Multitasking windows — split-screen, Split View / Stage Manager and desktop sizes (#1335) ──
+  // A WINDOW, not a device, so no insets and not a shipping category: every full-screen sweep stays
+  // off these. They are here because a short window is where a `vh`-capped panel narrows (Court and
+  // Weaveling's bonus dialog), and no device row is ever that short. Sizes: a Galaxy S22 half screen,
+  // an iPad Stage Manager window, and a short desktop browser window. Authored as-is (the picker's
+  // orientation toggle still swaps them).
+  { name: 'Split Screen 360x380', category: 'Multitasking', logicalW: 360,  logicalH: 380, physicalW: 360,  physicalH: 380, safeArea: NO_SAFE_AREA },
+  { name: 'Window 700x450',       category: 'Multitasking', logicalW: 700,  logicalH: 450, physicalW: 700,  physicalH: 450, safeArea: NO_SAFE_AREA },
+  { name: 'Window 1024x560',      category: 'Multitasking', logicalW: 1024, logicalH: 560, physicalW: 1024, physicalH: 560, safeArea: NO_SAFE_AREA },
+
   // ── Abstract aspect-ratio presets — logical == physical (DPR 1), no device chrome ──
   { name: '16:9 (720p)',  category: 'Aspect', logicalW: 1280, logicalH: 720,  physicalW: 1280, physicalH: 720,  safeArea: NO_SAFE_AREA },
   { name: '16:9 (1080p)', category: 'Aspect', logicalW: 1920, logicalH: 1080, physicalW: 1920, physicalH: 1080, safeArea: NO_SAFE_AREA },
@@ -232,7 +242,7 @@ export const DEVICE_PRESETS: DevicePreset[] = [
 ];
 
 /** Category display order for the picker. */
-export const DEVICE_CATEGORY_ORDER: DeviceCategory[] = ['General', 'Apple', 'Samsung', 'Google', 'Android', 'Aspect'];
+export const DEVICE_CATEGORY_ORDER: DeviceCategory[] = ['General', 'Apple', 'Samsung', 'Google', 'Android', 'Multitasking', 'Aspect'];
 
 /**
  * The categories whose presets describe a real shipping handheld — the filter every guard that

@@ -133,8 +133,9 @@ describe('devicePresets — safe area', () => {
     }
   });
 
-  it('Free and the abstract aspect presets have no insets — they are not devices', () => {
-    const abstract = [FREE_PRESET, ...DEVICE_PRESETS.filter((p) => p.category === 'Aspect')];
+  it('Free, the abstract aspect presets and the multitasking windows have no insets — they are not devices', () => {
+    const abstract = [FREE_PRESET, ...DEVICE_PRESETS.filter((p) => p.category === 'Aspect' || p.category === 'Multitasking')];
+    expect(abstract.some((p) => p.category === 'Multitasking'), 'setup: the multitasking windows exist').toBe(true);
     for (const p of abstract) {
       for (const o of ['portrait', 'landscape'] as const) {
         expect(resolveSafeArea(p, o), p.name).toEqual({ top: 0, right: 0, bottom: 0, left: 0 });

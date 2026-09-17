@@ -528,6 +528,8 @@ export default defineConfig(({ command }) => {
         // modules the interstitial rules, by narrow subpath.
         '@modoki/engine/runtime/core/adLifecycle',
         '@modoki/engine/runtime/core/adPacing',
+        // #1332 — both games' AppsFlyer wiring imports the promoted attribution lifecycle.
+        '@modoki/engine/runtime/core/attribution',
         '@modoki/engine/runtime/debug',
         '@modoki/engine/editor',
         '@modoki/engine/editor/rendering',
