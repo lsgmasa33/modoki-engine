@@ -31,3 +31,19 @@ export function captureSkinOpBasis(state: SkinEditingState): SkinOpBasis | null 
 export function isSkinOpBasisCurrent(basis: SkinOpBasis, state: SkinEditingState): boolean {
   return state.editingSkinAsset?.path === basis.path && state.editingSkinDef === basis.def;
 }
+
+/** The rig's name as the panel header shows it — the file's basename without `.rig2d.json`. */
+export function rigDisplayName(path: string): string {
+  return (path.split('/').pop() || path).replace(/\.rig2d\.json$/i, '');
+}
+
+/** The words a refused op puts on screen. One source: the e2e spec imports this rather than copying it. */
+export const SKIN_OP_STALE_NOTICE = 'the rig changed while it was computing — nothing applied';
+
+/** The refusal notice for `label`, naming the rig the op was FOR — after a retarget it is shown on the
+ *  other rig, which the op never touched. The remedy follows the op's own gesture: an assign-sprite came
+ *  from a drop or a ref field, so "run it again" names a button that does not exist for it. */
+export function skinOpStaleMessage(label: string, basisPath: string): string {
+  const remedy = label.startsWith('sprite') ? 'drop the sprite on the part again' : 'run it again';
+  return `${label} on ${rigDisplayName(basisPath)}: ${SKIN_OP_STALE_NOTICE}; ${remedy}`;
+}

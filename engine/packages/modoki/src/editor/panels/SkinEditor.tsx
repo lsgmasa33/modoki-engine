@@ -44,10 +44,7 @@ import { runUndoCommand } from '../undo/undoCommand';
 import { BufferedNumberInput, inputStyle } from './fields';
 import { getAssetDragInfo, setDragGhostRefusal } from '../utils/dragGhost';
 import { decideSkinPartAssetDrop, skinPartAcceptsAsset } from './assetDropPolicy';
-import { captureSkinOpBasis, isSkinOpBasisCurrent, type SkinOpBasis } from './skinOpBasis';
-
-/** The on-screen words of a refused async op (see `commit`). */
-const SKIN_OP_STALE_NOTICE = 'the rig changed while it was computing — nothing applied';
+import { captureSkinOpBasis, isSkinOpBasisCurrent, skinOpStaleMessage, type SkinOpBasis } from './skinOpBasis';
 
 
 /** Derive width/height/pivot in texture space from the current mesh's vertex bounds,
@@ -239,6 +236,11 @@ export default function SkinEditor() {
   const selectedAsset = useEditorStore((s) => s.selectedAsset);
   const savedMarkRef = useRef<((d: Rig2DFile) => void) | null>(null);
   const [saveMsg, setSaveMsg] = useState('');
+  // The refusal notice of an async op (skinOpBasis.ts) is NOT `saveMsg`: that line has several writers
+  // with shorter lifetimes — `makePrefab`'s completion message landed on top of it and told the user the
+  // op had succeeded — and clearing it from the load effect raced the refusal it was meant to survive.
+  // It names its own rig, so it stands until an edit actually applies.
+  const [staleOpMsg, setStaleOpMsg] = useState('');
   // Which part row is being renamed inline (double-click). Electron has no window.prompt,
   // so part rename is an in-place input (mirrors the bone-rename field).
   const [editingPart, setEditingPart] = useState<number | null>(null);
@@ -298,7 +300,6 @@ export default function SkinEditor() {
   useEffect(() => {
     setLoadState('ok'); // a fresh open/retry starts clean; the fetch below flips this on refusal
     setParkAdopted(false); // …and so does the park notice — the branch below re-raises it if taken
-    setSaveMsg(''); // …and the status line: a message about the previous rig does not describe this one
     if (!asset) return;
     let cancelled = false;
     const existing = useEditorStore.getState().editingSkinDef;
@@ -391,18 +392,14 @@ export default function SkinEditor() {
   const commit = useCallback((next: Rig2DFile, label: string, basis?: SkinOpBasis) => {
     const store = useEditorStore.getState();
     if (basis && !isSkinOpBasisCurrent(basis, store)) {
-      // Name the rig: after a retarget this notice sits on the OTHER rig, which the op never touched.
-      const rig = assetDisplayName(basis.path) || basis.path;
-      const remedy = label === 'sprite + mesh' ? 'drop the sprite on the part again' : 'run it again';
       console.warn(`[SkinEditor] ${label} on ${basis.path}: the rig changed while it was computing — nothing applied.`);
-      setSaveMsg(`${label} on ${rig}: ${SKIN_OP_STALE_NOTICE}; ${remedy}`);
+      setStaleOpMsg(skinOpStaleMessage(label, basis.path));
       return;
     }
-    // A later commit that DID apply supersedes a stale-op notice; any other message is left alone.
-    setSaveMsg((m) => (m.includes(SKIN_OP_STALE_NOTICE) ? '' : m));
     const before = store.editingSkinDef;
     const path = store.editingSkinAsset?.path;
     if (!before || !path) return;
+    setStaleOpMsg(''); // an edit that DID apply supersedes the notice — after the guards, so a no-op commit does not
     const a: UndoAction = {
       label: `rig2d ${label}`,
       // Asset-document edit: it changes a .rig2d.json file, NOT any scene entity, so it must not
@@ -432,6 +429,7 @@ export default function SkinEditor() {
       isInside = mask?.isInside;
     }
     const mesh = generateGridMesh({ width: dom.width, height: dom.height, cols, rows, pivotX: dom.pivotX, pivotY: dom.pivotY, isInside });
+    if (!isSkinOpBasisCurrent(basis, useEditorStore.getState())) { commit(d, `tessellate ${cols}×${rows}`, basis); return; } // refuses + reports
     if (!mesh.verts.length) { setSaveMsg('Trim too aggressive — no cells kept'); return; }
     // Placement-preserving: a fresh grid is pivot-centered on the sprite (origin), but an
     // imported multi-part rig carries each part's offset in its mesh verts. Re-center the
@@ -923,7 +921,8 @@ export default function SkinEditor() {
             immediately — see the retarget effect's comment. */}
         <button data-ui-id="skin.header.close" data-ui-kind="button" data-ui-label="close rig" onClick={() => { dismissedPath.current = selectedAsset?.path ?? asset.path; useEditorStore.getState().closeSkinEditor(); }} title="Close rig (back to the picker)" style={{ ...btn, padding: '1px 7px' }}>✕</button>
         <span style={{ fontWeight: 'bold', color: '#ddd', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{asset.name}</span>
-        {saveMsg && <span style={{ fontSize: 10, color: saveMsg.includes('fail') || saveMsg.includes(SKIN_OP_STALE_NOTICE) ? '#e74c3c' : '#8a8a96' }}>{saveMsg}</span>}
+        {staleOpMsg && <span data-ui-id="skin.staleOpNotice" style={{ fontSize: 10, color: '#e74c3c' }}>{staleOpMsg}</span>}
+        {saveMsg && <span style={{ fontSize: 10, color: saveMsg.includes('fail') ? '#e74c3c' : '#8a8a96' }}>{saveMsg}</span>}
         <span style={{ fontSize: 10, color: dirty ? '#f1c40f' : '#2ecc71' }}>{saveStatusLabel(dirty)}</span>
       </div>
 

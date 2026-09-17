@@ -12,6 +12,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { gotoEditorWithScene } from './helpers';
 import { hasInternalGames } from '../helpers/repoLayout';
+// Imported, not copied: a reword must not leave this spec asserting yesterday's words (close-out review).
+import { SKIN_OP_STALE_NOTICE } from '../../packages/modoki/src/editor/panels/skinOpBasis';
 
 // games/skin-test is the Skin editor's documented fixture (see editor-skin-paint-sweep.spec.ts).
 test.skip(!hasInternalGames(), 'editor-skin-op-retarget: games/ is absent from this snapshot');
@@ -57,21 +59,43 @@ async function retessellateHeld(page: Page): Promise<() => void> {
   return release;
 }
 
-const NOTICE = 'the rig changed while it was computing — nothing applied';
+const notice = (page: Page) => page.locator('[data-ui-id="skin.staleOpNotice"]');
 const settle = (page: Page) => page.evaluate(() => new Promise<void>((r) => setTimeout(r, 500)));
+
+/** Re-tessellate bar, open OTHER mid-await, release: the refusal lands while OTHER is on screen. */
+async function refuseOnSwap(page: Page): Promise<{ bones: string[]; path?: string }> {
+  const release = await retessellateHeld(page);
+  await open(page, OTHER);
+  await expect.poll(async () => (await skinState(page)).bones, { timeout: 15_000 }).toEqual(['B_base', 'B_mid', 'B_tip']);
+  const before = await skinState(page);
+  release();
+  // Shown on the rig now open, so it names the one the op was FOR, not the one it is sitting on.
+  await expect(notice(page)).toHaveText(`tessellate 4×8 on bar: ${SKIN_OP_STALE_NOTICE}; run it again`);
+  return before;
+}
 
 // Mutation: drop the `isSkinOpBasisCurrent` refusal in SkinEditor's `commit`.
 test('Re-tessellate that finishes after another rig opened leaves that rig untouched', async ({ page }) => {
-  writeOtherRig();
   try {
-    const release = await retessellateHeld(page);
-    await open(page, OTHER);
-    await expect.poll(async () => (await skinState(page)).bones, { timeout: 15_000 }).toEqual(['B_base', 'B_mid', 'B_tip']);
-    const before = await skinState(page);
-    release();
-    // Shown on the rig now open, so it names the one the op was for.
-    await expect(page.getByText(`tessellate 4×8 on bar.rig2d: ${NOTICE}; run it again`)).toBeVisible();
+    writeOtherRig();
+    const before = await refuseOnSwap(page);
     expect(await skinState(page)).toEqual(before);
+  } finally {
+    fs.rmSync(SCRATCH_DIR, { recursive: true, force: true });
+  }
+});
+
+// The notice stands until an edit APPLIES — `makePrefab`'s completion line used to land on top of it, and
+// clearing it from the load effect raced the refusal. Mutation: drop `setStaleOpMsg('')` in `commit`, or
+// restore the notice to `saveMsg`.
+test('the refusal notice survives until an edit actually applies, then goes', async ({ page }) => {
+  try {
+    writeOtherRig();
+    await refuseOnSwap(page);
+    // An ordinary Re-tessellate on the rig now open — nothing held, so it commits.
+    await page.locator('[data-ui-id="skin.part.retessellate"]').click();
+    await expect(notice(page)).toHaveCount(0);
+    expect((await skinState(page)).bones, 'the applied edit was B\'s own').toEqual(['B_base', 'B_mid', 'B_tip']);
   } finally {
     fs.rmSync(SCRATCH_DIR, { recursive: true, force: true });
   }
@@ -89,5 +113,5 @@ test('Re-tessellate with no retarget still applies once its mask arrives', async
   const after = await skinState(page);
   expect(after.path).toBe(BAR);
   expect(after.bones).toEqual(['base', 'mid', 'tip']);
-  await expect(page.getByText(NOTICE, { exact: false })).toHaveCount(0);
+  await expect(notice(page)).toHaveCount(0);
 });

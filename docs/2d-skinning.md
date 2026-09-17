@@ -369,11 +369,16 @@ an optional alpha coverage predicate; these return a ready `.rig2d.json` payload
   whatever rig was open when the await returned, so opening another rig meanwhile replaced its
   document, bones and all (observed: the second rig came back with `bar`'s bones), and an edit made
   meanwhile to the same rig was silently overwritten. Each op now captures its basis (path +
-  document identity, `editor/panels/skinOpBasis.ts`) and `commit` refuses with an on-screen
-  "the rig changed while it was computing — nothing applied" notice (naming the rig, and cleared by the next applied edit or a rig switch) when the editor no longer holds exactly
-  that document. Pinned by `tests/editor/skinOpBasis.test.ts` and
-  `engine/tests/e2e/editor-skin-op-retarget.spec.ts`, which holds the mask request to open the
-  window deterministically. A new async op must capture a basis the same way.
+  document identity, `editor/panels/skinOpBasis.ts`) and `commit` refuses when the editor no longer
+  holds exactly that document. The refusal raises a red notice that NAMES the rig the op was for —
+  after a retarget it is shown on the other rig — and it stands until an edit actually applies.
+  ⚠️ It is its own state, not the panel's `saveMsg`: that line has several writers with shorter
+  lifetimes (`makePrefab`'s completion message landed on top of it), and clearing it when a rig
+  opens raced the very refusal it exists to report. Pinned by `tests/editor/skinOpBasis.test.ts`
+  (the predicate, the wording, the per-gesture remedy) and
+  `engine/tests/e2e/editor-skin-op-retarget.spec.ts` (refused on a swap, applied without one, and
+  the notice surviving until an applied edit), which holds the mask request to open the window
+  deterministically. A new async op must capture a basis the same way.
 - **Trait fields must stay scalar** — the `traitScalarFields` guard fails the build on
   any new array/object trait field. All rig structure lives in the `.rig2d.json` asset
   and the bone hierarchy is child entities, never an array on a trait.

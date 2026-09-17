@@ -1014,6 +1014,8 @@ const HELD_LEDGER: ReadonlyArray<{ item: string; reason: string }> = [
     reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:711' },
   { item: 'games/wordweave/runtime/systems.ts::Built.boardCells',
     reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:711' },
+  { item: 'games/wordweave/runtime/systems.ts::Built.boardCellOutlines',
+    reason: 'pending: #1243 — the cells\' outline rings, index-aligned with Built.boardCells and living exactly as long; cleared only on a world swap or a board rebuild, and nothing checks isAlive; games/wordweave/runtime/systems.ts:711' },
   { item: 'games/wordweave/runtime/systems.ts::Built.boardGlyphs',
     reason: 'pending: #1243 — cleared only on a world swap or a board rebuild; nothing checks isAlive, so a delete during Play leaves it writing to whatever reclaims the index; games/wordweave/runtime/systems.ts:711' },
   { item: 'games/wordweave/runtime/systems.ts::Built.hitAreas',
