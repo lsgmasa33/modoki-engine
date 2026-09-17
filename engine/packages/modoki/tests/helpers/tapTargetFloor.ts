@@ -203,11 +203,25 @@ export function resolveAxis(
       uiField<string>(parentUi, 'alignItems') === 'stretch';
     return stretches ? { kind: 'stretched' } : { kind: 'content' };
   }
-  const unit = uiField<string>(ui, `${axisKey}Unit`);
   // ⚠️ Same unit STRING, different space. Only a caller-declared control is rescaled.
-  if (ptPerDesignPx !== null && unit === 'px') return { kind: 'pt', pt: size * ptPerDesignPx };
-  const per = ptPerUnit(unit, vp);
-  return per === null ? { kind: 'parent', pct: size } : { kind: 'pt', pt: size * per };
+  const toPt = (value: number, unit: string): number | null => {
+    if (ptPerDesignPx !== null && unit === 'px') return value * ptPerDesignPx;
+    const per = ptPerUnit(unit, vp);
+    return per === null ? null : value * per;
+  };
+  const pt = toPt(size, uiField<string>(ui, `${axisKey}Unit`));
+  if (pt === null) return { kind: 'parent', pct: size };
+  // The box CSS actually lays out: `max(min, min(size, max))` — a min beats a max, and 0 means no bound.
+  // Without it a `height: 11vmin; min-height: 48px` button reads 39.6 pt at 360 wide (wordweave #1325).
+  // A `%` bound resolves against a parent this never measures, so it is left out rather than guessed.
+  const bound = (key: 'min' | 'max'): number | null => {
+    const field = `${key}${axisKey === 'width' ? 'Width' : 'Height'}`;
+    const value = uiField<number>(ui, field);
+    return value > 0 ? toPt(value, uiField<string>(ui, `${field}Unit`)) : null;
+  };
+  const max = bound('max');
+  const min = bound('min');
+  return { kind: 'pt', pt: Math.max(min ?? 0, max === null ? pt : Math.min(pt, max)) };
 }
 
 /**
@@ -309,6 +323,9 @@ export interface Control {
   emits: boolean;
   /** Whether the element can carry the expander, once emitted. */
   hosts: boolean;
+  /** Something a finger operates: a binding of ANY event, or a `TouchControl`. False for a bare
+   *  `swallowClicks` SHIELD, which the corpus collects for the inert check but nobody aims at. */
+  bound: boolean;
   /** Set when this control is a member of a placed prefab INSTANCE that diverges from its prefab — see
    *  `tapTargetCorpus`. Absent for a control authored directly in `file`. */
   instance?: { ref: string; localId: number; path: readonly number[]; memberName: string };
@@ -431,6 +448,11 @@ export interface TapTargetCorpus {
   byName(name: string): Control | undefined;
 }
 
+/** A binding of ANY event, or a TouchControl — `isCollected` minus the bare swallow surfaces. */
+function isOperated(e: AuthoredEntity): boolean {
+  return (e.traits?.UIAction?.bindings ?? []).length > 0 || e.traits?.TouchControl !== undefined;
+}
+
 /** Everything carrying a binding of ANY event, every TouchControl, and every swallow surface.
  *  Narrowing happens per-assertion via `isTarget` / `emits`, never at collection. */
 function isCollected(e: AuthoredEntity): boolean {
@@ -453,6 +475,7 @@ function controlOf(
   return {
     name, file, ui, hasToggle, parentUi: ancestorUi[0], ancestorUi,
     isTarget: isTapTarget(entity), emits: emitsExpander(entity), hosts: hostsExpander(ui, hasToggle),
+    bound: isOperated(entity),
     ...(instance ? { instance } : {}),
   };
 }
@@ -618,6 +641,7 @@ export function tapTargetCorpus(
         isTarget: isTapTarget(e),
         emits: emitsExpander(e),
         hosts: hostsExpander(ui, hasToggle),
+        bound: isOperated(e),
       });
     }
 
@@ -734,8 +758,10 @@ export function describeTapTargetFloor(opts: TapTargetFloorOptions): void {
     it('every control that cannot host an expander and is under the floor is KNOWN', () => {
       // ⚠️ Read over EVERY control with a binding, not just tap targets — a `range` binds
       // `event: 'change'`, so a target-only sweep cannot see it. It is still a control a finger has
-      // to hit, and still one `minTapSize` cannot help (#1025).
+      // to hit, and still one `minTapSize` cannot help (#1025). A bare `swallowClicks` shield is NOT
+      // one: a dialog panel that scrolls (wordweave #1316) clips, and nobody aims at the panel.
       expect(sorted(corpus.controls
+        .filter((c) => c.bound)
         .filter((c) => !c.hosts)
         .filter((c) => corpus.resolvedUnderFloor(c) || corpus.hasUnresolvableAxis(c))
         .map((c) => c.name)))

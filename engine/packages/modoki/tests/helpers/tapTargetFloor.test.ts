@@ -100,6 +100,19 @@ describe('resolving one axis', () => {
     expect(resolveAxis({}, 'width', undefined, VP)).toEqual({ kind: 'content' });
   });
 
+  it('clamps a resolvable axis the way CSS does: a min beats a max, and 0 is no bound', () => {
+    const h = (ui: Record<string, unknown>) => resolveAxis(ui, 'height', undefined, VP);
+    // VP is 400 x 800, so 10vmin = 40.
+    expect(h({ height: 10, heightUnit: 'vmin' })).toEqual({ kind: 'pt', pt: 40 });
+    expect(h({ height: 10, heightUnit: 'vmin', minHeight: 48 })).toEqual({ kind: 'pt', pt: 48 });
+    expect(h({ height: 10, heightUnit: 'vmin', maxHeight: 30 })).toEqual({ kind: 'pt', pt: 30 });
+    expect(h({ height: 10, heightUnit: 'vmin', minHeight: 48, maxHeight: 30 })).toEqual({ kind: 'pt', pt: 48 });
+    expect(h({ height: 10, heightUnit: 'vmin', maxHeight: 2, maxHeightUnit: 'vh' })).toEqual({ kind: 'pt', pt: 16 });
+    expect(h({ height: 10, heightUnit: 'vmin', minHeight: 50, minHeightUnit: '%' }), 'a % bound is not guessed')
+      .toEqual({ kind: 'pt', pt: 40 });
+    expect(resolveAxis({ width: 10, widthUnit: 'vmin', minWidth: 60 }, 'width', undefined, VP)).toEqual({ kind: 'pt', pt: 60 });
+  });
+
   it('rescales a DESIGN-px axis and leaves every other unit alone', () => {
     // ⚠️ The "guard that cannot fail" shape arriving through a UNIT rather than a value: a control
     // the game rescales through its canvas authors 100 and a naive reading calls that 100 pt.
@@ -221,6 +234,21 @@ describe('building a corpus', () => {
     ])).controls;
     expect(decoy.hasToggle, 'a `toggle` key on UIElement is not a field of that trait at all').toBe(false);
     expect(decoy.hosts).toBe(true);
+  });
+
+  it('marks a bare swallowClicks shield as NOT operated, and any binding or TouchControl as operated', () => {
+    // The cannot-host check reads `bound`: a scrolling dialog panel clips (so it cannot host) and has
+    // no measurable height, but nobody aims at it (wordweave #1316). A clipped SLIDER is still a finger's
+    // target, so the filter must not drop a non-click binding, and a pad carries no UIAction at all.
+    const clip = { ...PX_20, overflow: 'scroll' };
+    const c = tapTargetCorpus(SYNTHETIC, doc([
+      { traits: { EntityAttributes: { name: 'Shield' }, UIElement: { ...clip, swallowClicks: true } } },
+      { traits: { EntityAttributes: { name: 'Slider' }, UIElement: clip, UIAction: { bindings: [{ event: 'change' }] } } },
+      { traits: { EntityAttributes: { name: 'Pad' }, UIElement: clip, TouchControl: {} } },
+      { traits: { EntityAttributes: { name: 'Button' }, UIElement: { ...clip, swallowClicks: true }, UIAction: CLICK } },
+    ]));
+    expect(['Shield', 'Slider', 'Pad', 'Button'].map((n) => c.byName(n)!.bound)).toEqual([false, true, true, true]);
+    expect(c.controls.every((x) => !x.hosts), 'all four clip').toBe(true);
   });
 
   it('indexes parents by guid AND by localId, because scenes and prefabs address differently', () => {
