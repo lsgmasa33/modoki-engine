@@ -27,6 +27,9 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
+  missingLocalStatsFor, resetMissingLocalStats, noteMissingLocalStats, getMissingLocalStatsVersion, subscribeMissingLocalStats,
+} from '../../packages/modoki/src/editor/scene/missingLocalStats';
+import {
   parkMetaEdit, peekPendingMeta, isMetaDirty, hasPendingMeta, getPendingMetaPaths,
   clearPendingMeta, discardPendingMeta, flushPendingMeta, flushPendingMetaFor,
   readMetaPreferringPark, metaWrittenToDisk, peekMetaBaseline, clearMetaBaselines,
@@ -63,6 +66,7 @@ let bodies: Array<{ path: string; meta: unknown }>;
 beforeEach(() => {
   clearPendingMeta();
   clearMetaBaselines();
+  resetMissingLocalStats();
   bodies = [];
   reply = { status: 200, body: { ok: true } };
   vi.stubGlobal('fetch', vi.fn(async (_url: string, init: { body: string }) => {
@@ -799,12 +803,17 @@ describe('only a read that feeds a panel may move the baseline', () => {
   /** Disk starts at V1 and can be rewritten out from under the editor; a PRESENT `ifMatch` that
    *  misses is refused, exactly as `ifMatchRefusal` does. */
   function stubDisk() {
-    const disk = { sha: 'V1', doc: { id: 'g', texture: { maxSize: 256 } } as Record<string, unknown> };
+    const disk = { sha: 'V1', doc: { id: 'g', texture: { maxSize: 256 } } as Record<string, unknown>, missingLocal: null as string | null };
     vi.stubGlobal('fetch', vi.fn(async (url: string, init?: { body?: string }) => {
       if (String(url).includes('/api/read-meta')) {
         return {
           ok: true, status: 200,
-          headers: { get: (k: string) => (k.toLowerCase() === 'x-meta-sha256' ? disk.sha : null) },
+          headers: { get: (k: string) => {
+            const key = k.toLowerCase();
+            if (key === 'x-meta-sha256') return disk.sha;
+            if (key === 'x-meta-local-missing') return disk.missingLocal;
+            return null;
+          } },
           text: async () => '', json: async () => disk.doc,
         } as unknown as Response;
       }
@@ -879,21 +888,86 @@ describe('only a read that feeds a panel may move the baseline', () => {
     expect(peekMetaBaseline(TEX)).toBe('V1');
   });
 
-  /** ⚠️ #1305: `passive` now carries one MORE consequence, and it is a server-side one — the read
-   *  route re-derives a missing `.meta.local.json` by running the asset's reimport handler. An
-   *  agent sweeping sidecars with `modoki_get_asset_meta` would therefore start a conversion per
-   *  asset, which is the same "an observer must not disarm/alter the thing it observes" rule as
-   *  above, one layer down. The flag above governs only what THIS module records, so the server has
-   *  to be told separately — and nothing else in the suite can see that it was. */
-  it('a PASSIVE read tells the SERVER not to heal; a panel read leaves it enabled', async () => {
-    stubDisk();
+  /** ⚠️ #1305: `X-Meta-Local-Missing` is recorded on EVERY ok read, passive or not — deliberately
+   *  unlike the baseline above. A baseline is a claim about the bytes a PANEL is displaying, so
+   *  only a panel read may move it; this is a fact about the FILES ON DISK, equally true whoever
+   *  asked. An agent read that left it stale would mislead the panel rather than protect it. */
+  it('records missing local stats on a PASSIVE read too, unlike the baseline', async () => {
+    const disk = stubDisk();
+    disk.missingLocal = 'textureCache';
     await readMetaPreferringPark(TEX, { passive: true });
+    expect(missingLocalStatsFor(TEX)).toEqual(['textureCache']);
+    expect(peekMetaBaseline(TEX), 'and it still moved no baseline').toBeUndefined();
+  });
+
+  /** The half that decides whether the hint ever goes away: after a re-import the header stops
+   *  being sent, and only writing that EMPTY answer through clears a hint the panel is still
+   *  showing over numbers that have since arrived. */
+  it('clears a recorded gap once the server stops reporting one', async () => {
+    const disk = stubDisk();
+    disk.missingLocal = 'textureCache';
     await readMetaPreferringPark(TEX);
-    const calls = (globalThis.fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls;
-    const reads = calls.map((c) => String(c[0])).filter((u) => u.includes('/api/read-meta'));
-    expect(reads).toHaveLength(2);
-    expect(reads[0], 'an agent read must opt out of the heal').toContain('heal=0');
-    expect(reads[1], 'a panel read is exactly who the heal exists for').not.toContain('heal=0');
+    expect(missingLocalStatsFor(TEX)).toEqual(['textureCache']);
+    disk.missingLocal = null;                 // the human re-imported
+    await readMetaPreferringPark(TEX);
+    expect(missingLocalStatsFor(TEX)).toEqual([]);
+  });
+});
+
+/** #1305 review: the EXEMPTED raw reader (`VideoAssetView`) feeds the missing-stats hint too.
+ *
+ *  The hint used to be recorded only inside `readMetaPreferringPark`, so the video panel — which
+ *  calls `noteMetaReadResult` on its own raw response and never the helper — could not show the
+ *  hint on a human's read, and could not clear one an agent read had set. These drive
+ *  `noteMetaReadResult` directly, the one call `metaReadPreferringPark.test.ts` forces every
+ *  exempted reader to make. */
+describe('an exempted raw reader records the missing-stats hint (#1305)', () => {
+  const VID = 'games/demo/assets/clip.mp4';
+  const res = (ok: boolean, missing: string | null) => ({
+    ok, headers: { get: (k: string) => (k.toLowerCase() === 'x-meta-local-missing' ? missing : null) },
+  });
+
+  it('records the header, and clears it once a later read stops sending it', () => {
+    noteMetaReadResult(VID, res(true, 'videoCache'));
+    expect(missingLocalStatsFor(VID)).toEqual(['videoCache']);
+    noteMetaReadResult(VID, res(true, null)); // the human re-imported; the panel re-read
+    expect(missingLocalStatsFor(VID)).toEqual([]);
+  });
+
+  /** The raw panel fetches even while a park is live, so this branch is reachable there: the
+   *  document on screen is the human's unsaved edit and a re-import under a park is refused
+   *  (#882), so no hint is recorded — and an earlier answer is left alone rather than cleared. */
+  it('records nothing while a park is live', () => {
+    noteMetaReadResult(VID, res(true, 'videoCache'));
+    parkAsPanel(VID, { video: { crf: 23 } });
+    noteMetaReadResult(VID, res(true, 'audioCache'));
+    expect(missingLocalStatsFor(VID)).toEqual(['videoCache']);
+  });
+
+  it('a failed read leaves the last answer alone', () => {
+    noteMetaReadResult(VID, res(true, 'videoCache'));
+    noteMetaReadResult(VID, res(false, null));
+    expect(missingLocalStatsFor(VID)).toEqual(['videoCache']);
+  });
+});
+
+/** The store's own contract: `/api/read-meta` is re-read on every mount and reimport epoch, so a
+ *  version that bumped on every note would re-render every subscribed panel on every read. */
+describe('missingLocalStats bumps only on a real change (#1305)', () => {
+  it('notifies once for a change and not at all for a repeat', () => {
+    let calls = 0;
+    const off = subscribeMissingLocalStats(() => { calls++; });
+    try {
+      const v0 = getMissingLocalStatsVersion();
+      noteMissingLocalStats('a.png', ['textureCache']);
+      noteMissingLocalStats('a.png', ['textureCache']);
+      noteMissingLocalStats('b.png', []);            // nothing recorded → nothing changed
+      expect(getMissingLocalStatsVersion()).toBe(v0 + 1);
+      expect(calls).toBe(1);
+      noteMissingLocalStats('a.png', []);
+      expect(getMissingLocalStatsVersion()).toBe(v0 + 2);
+      expect(calls).toBe(2);
+    } finally { off(); }
   });
 });
 

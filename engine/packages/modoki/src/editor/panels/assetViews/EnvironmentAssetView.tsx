@@ -27,6 +27,8 @@ import {
 } from '../../scene/pendingMeta';
 import { useMetaDirty } from '../useMetaDirty';
 import { UnsavedMetaBadge } from './UnsavedMetaBadge';
+import { useMissingLocalStats } from '../useMissingLocalStats';
+import { MISSING_STATS_HINT } from './measuredStats';
 
 // Preview canvas width (equirect is 2:1). Kept small — we nearest-sample the
 // source down to this so tonemapping a 2k HDR stays cheap.
@@ -62,6 +64,9 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
   // showing pre-reimport values. The epoch cache-busts the URL, so it is a value this
   // callback genuinely reads — the sidecar is rewritten in place at an unchanged URL.
   const reimportEpoch = useAssetInvalidationEpoch('environment', (p) => p === path);
+  // `environmentCache.bytes` is peeled (#1305), so the Variant size row below is absent on a
+  // machine that never baked this map — say so rather than silently dropping the row.
+  const statsIncomplete = useMissingLocalStats(path, 'environmentCache');
 
   const applyMeta = useCallback((m: Record<string, unknown>) => {
     setMeta(m);
@@ -336,6 +341,11 @@ export function EnvironmentAssetView({ path, name }: { path: string; name: strin
               <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, padding: '1px 0' }}>
                 <span style={{ color: '#888' }}>Variant size</span>
                 <span style={{ color: '#ccc' }}>{formatBytes(cache.bytes)}</span>
+              </div>
+            )}
+            {statsIncomplete && (
+              <div style={{ color: '#8a7', fontSize: '10px', marginTop: 4 }} data-ui-id="assetView.stats.incomplete">
+                {MISSING_STATS_HINT}
               </div>
             )}
           </>

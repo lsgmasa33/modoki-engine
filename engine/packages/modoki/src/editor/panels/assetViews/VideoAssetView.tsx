@@ -27,6 +27,8 @@ import {
 } from '../../scene/pendingMeta';
 import { useMetaDirty } from '../useMetaDirty';
 import { UnsavedMetaBadge } from './UnsavedMetaBadge';
+import { useMissingLocalStats } from '../useMissingLocalStats';
+import { MISSING_STATS_HINT } from './measuredStats';
 
 const DELIVERY_LABELS: Record<VideoDelivery, string> = {
   bundled: 'Bundled — ships in the build',
@@ -67,6 +69,9 @@ const sectionStyle: React.CSSProperties = { color: '#f1c40f', fontSize: '10px', 
 export function VideoAssetView({ path, name }: { path: string; name: string }) {
   // #870: a parked import-settings edit was invisible in the panel that MADE it.
   const metaDirty = useMetaDirty(path);
+  // #1305: this host holds no measurement for some of the rows below — say so rather than
+  // render a blank (or, as texture and model once did, a defaulted 0 B).
+  const statsIncomplete = useMissingLocalStats(path, 'videoCache');
   const [meta, setMeta] = useState<Record<string, unknown> | null>(null);
   const [settings, setSettings] = useState<VideoImportSettings>(DEFAULT_VIDEO_SETTINGS);
   /** What the last load/apply saw — the baseline `conversionSettingsDiffer` compares
@@ -103,6 +108,8 @@ export function VideoAssetView({ path, name }: { path: string; name: string }) {
   // `noteMetaReadResult` is deliberately the SAME function `readMetaPreferringPark` calls, not
   // four lines copied here: it carries the three hazards (ok-only, a missing header means NO
   // baseline rather than "unchanged", never hash client-side) that a second copy would re-derive.
+  // It also records the `X-Meta-Local-Missing` hint (#1305) — which this panel's hint was dead
+  // without, because the hint used to be recorded only inside the helper.
   // It runs BEFORE the body is consumed and is orthogonal to `applyMeta` — `applied` still comes
   // from disk and `meta` still prefers the park.
   const loadMeta = useCallback((signal?: AbortSignal) => {
@@ -320,7 +327,7 @@ export function VideoAssetView({ path, name }: { path: string; name: string }) {
           Encoding settings changed — re-import to apply them.
         </div>
       )}
-      {converted && <VideoImportedStats cache={cache} />}
+      {converted && <VideoImportedStats cache={cache} incomplete={statsIncomplete} />}
       <UnsavedMetaBadge dirty={metaDirty} dataUiId="assetView.video.unsaved" />
     </>
   );
@@ -396,7 +403,7 @@ export function TextCommitField({ label, uiId, value, placeholder, onCommit }: {
 }
 
 /** Post-conversion stats read back from the meta sidecar. */
-function VideoImportedStats({ cache }: { cache: VideoCacheInfo | undefined }) {
+function VideoImportedStats({ cache, incomplete }: { cache: VideoCacheInfo | undefined; incomplete?: boolean }) {
   const statRow: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', fontSize: '11px', padding: '1px 0' };
   const key: React.CSSProperties = { color: '#888' };
   const val: React.CSSProperties = { color: '#ccc' };
@@ -417,6 +424,11 @@ function VideoImportedStats({ cache }: { cache: VideoCacheInfo | undefined }) {
       {cache.bytes !== undefined && (
         <div style={{ ...statRow, borderTop: '1px solid #333', marginTop: 2, paddingTop: 3 }}>
           <span style={{ ...key, color: '#aaa' }}>Size</span><span style={{ ...val, color: '#fff' }}>{formatBytes(cache.bytes)}</span>
+        </div>
+      )}
+      {incomplete && (
+        <div style={{ color: '#8a7', fontSize: '10px', marginTop: 4 }} data-ui-id="assetView.stats.incomplete">
+          {MISSING_STATS_HINT}
         </div>
       )}
     </>

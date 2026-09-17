@@ -78,6 +78,7 @@ import { backendFetch } from '../backend/editorBackend';
 import { cacheBustReimport } from '../panels/useAssetInvalidationEpoch';
 import { writeMetaConditional, writeMetaOrWarn } from '../panels/assetViews/widgets';
 import { metaReadFallback, metaCameFromFailedRead, stampMetaReadPath, metaReadPathOf } from './metaReadFallback';
+import { noteMissingLocalStats } from './missingLocalStats';
 import { useEditorStore } from '../store/editorStore';
 import { notifyListeners } from '../../runtime/core/notifyListeners';
 
@@ -192,11 +193,38 @@ function forgetMetaBaseline(path: string): void { baselines.delete(path); }
  *     and `writeMetaSidecar` stamps/splits on the way out, so the bytes on disk are not the bytes
  *     a panel ever holds. A client-computed baseline could never match and would 409 forever.
  *
+ *  **It also records `X-Meta-Local-Missing` (#1305), and it is HERE rather than in
+ *  `readMetaPreferringPark` for #871's reason a third time.** The hint was first recorded only in
+ *  the helper, so `VideoAssetView` — the exempted raw reader — never fed the store: its hint could
+ *  not appear on a human's read, and once an agent read turned it on, the panel's own re-read after
+ *  Re-import could not clear it. Recorded here, the `'seeds'` rule in
+ *  `metaReadPreferringPark.test.ts` — which forces every exemption declared `'seeds'` to call this
+ *  function — enforces the hint wiring too, with no second call to forget. (A `'none'` exemption
+ *  such as `makeTexture2D.ts` records neither; the texture panel's own re-read through the helper
+ *  after `invalidateTexture` covers it.)
+ *
+ *  ⚠️ **Always non-passive, and deliberately has no option to be otherwise.** The helper's
+ *  `passive` read (#872 review) goes through {@link recordMetaRead}, which is module-private: an
+ *  exported `passive` flag would let an exempted reader pass it and satisfy the `'seeds'` rule
+ *  while recording no baseline — #871 again, with the guard green.
+ *
  *  Structurally typed rather than taking a `Response` so a test (and a stub backend) can hand it
  *  the two fields it actually reads. */
 export function noteMetaReadResult(
   path: string,
   res: { ok?: boolean; headers?: { get?: (name: string) => string | null | undefined } | null } | null | undefined,
+): void {
+  recordMetaRead(path, res, false);
+}
+
+/** The body of {@link noteMetaReadResult}, plus `passive`: skip the BASELINE only (#872 review —
+ *  an observer must not move a claim about what a panel displays). The hint is a fact about the
+ *  files on disk, equally true whoever asked, so a passive read still records it. Module-private —
+ *  see `noteMetaReadResult`'s last ⚠️. */
+function recordMetaRead(
+  path: string,
+  res: Parameters<typeof noteMetaReadResult>[1],
+  passive: boolean,
 ): void {
   // ⚠️ A FAILED READ RECORDS NOTHING HERE, and that is the #880 fix, not an omission.
   //
@@ -208,12 +236,23 @@ export function noteMetaReadResult(
   // claims. Given it shipped a defect on two of three attempts at the second job, that narrowing
   // is the point.
   if (!res?.ok) return;
-  // ⚠️ ONLY THE BASELINE is skipped while a park is live — see this function's docblock. The
-  // parked document was built from older bytes, so a baseline taken from what disk holds NOW is a
-  // claim that document cannot support.
+  // ⚠️ While a park is live, NOTHING is recorded. The baseline: the parked document was built
+  // from older bytes, so a baseline taken from what disk holds NOW is a claim that document cannot
+  // support. The hint: the document on screen is the human's unsaved edit, and a re-import under a
+  // park is refused anyway (#882), so the hint would offer an action that cannot run.
   if (peekPendingMeta(path) !== undefined) return;
+  // ⚠️ Recorded even when EMPTY, and that is the half that matters: after a re-import the header
+  // stops being sent, and only writing that through clears a hint the panel is still showing over
+  // numbers that have since arrived. `noteMissingLocalStats` no-ops when the answer has not moved.
+  noteMissingLocalStats(path, parseMissingLocalStats(res.headers?.get?.('X-Meta-Local-Missing')));
+  if (passive) return;
   const sha = res.headers?.get?.('X-Meta-Sha256');
   if (sha) baselines.set(path, sha);
+}
+
+/** `X-Meta-Local-Missing`'s comma list → cache block names; `[]` for an absent header. */
+function parseMissingLocalStats(header: string | null | undefined): string[] {
+  return header ? header.split(',').map((s) => s.trim()).filter(Boolean) : [];
 }
 
 let _version = 0;
@@ -492,13 +531,7 @@ export async function readMetaPreferringPark(
 ): Promise<PreferredMetaRead> {
   const parked = peekPendingMeta(path);
   if (parked !== undefined) return { meta: parked as Record<string, unknown>, pendingRef: parked, ok: true };
-  // ⚠️ A `passive` read also opts out of the SERVER's local-half heal (#1305). `passive` already
-  // means "this read feeds no panel", and the same reasoning applies one layer down: the heal runs
-  // a reimport handler, so without `heal=0` an agent sweeping sidecars with
-  // `modoki_get_asset_meta` would start a conversion per asset. The server needs to be told
-  // because the flag below only governs what THIS module records.
-  const base = `/api/read-meta?path=${encodeURIComponent(path)}${opts?.passive ? '&heal=0' : ''}`;
-  const url = cacheBustReimport(base, opts?.reimportEpoch ?? 0);
+  const url = cacheBustReimport(`/api/read-meta?path=${encodeURIComponent(path)}`, opts?.reimportEpoch ?? 0);
   const r = await backendFetch(url, opts?.signal ? { signal: opts.signal } : undefined);
   // ⚠️ `passive` reads record NOTHING (#872 review). A baseline is a claim about the bytes a
   // PANEL's displayed document came from, and the flush conditions the human's next save on it —
@@ -508,7 +541,9 @@ export async function readMetaPreferringPark(
   // reads (advancing the baseline to EXTERNAL) → the human parks an edit built on the stale
   // in-memory doc → the flush is ACCEPTED and overwrites the external change, where without the
   // agent's read it was correctly refused. An observer must not disarm the guard it observes.
-  if (!opts?.passive) noteMetaReadResult(path, r);
+  // (`passive` suppresses only the baseline half; the missing-stats hint is recorded either way —
+  // see `noteMetaReadResult`.)
+  recordMetaRead(path, r, !!opts?.passive);
   // ⚠️ The fallback is `metaReadFallback()`, never a bare `{}` — every panel spreads what it gets
   // here into its next park, and that tag is what makes the spread refusable. See
   // `FROM_FAILED_READ`.
@@ -517,6 +552,9 @@ export async function readMetaPreferringPark(
   // parkable at all — and what makes a panel still holding the PREVIOUS asset's document unable to
   // park it under this one. See `READ_FOR_PATH`.
   const meta = r.ok ? stampMetaReadPath(await r.json(), path) : metaReadFallback();
+  // The missing-stats hint (#1305) is NOT returned: it lives in `missingLocalStats.ts`, recorded
+  // above, and panels read it through `useMissingLocalStats`. A second copy here could disagree
+  // with the store (a park landing mid-GET), and nothing read it.
   return { meta, pendingRef: undefined, ok: r.ok };
 }
 

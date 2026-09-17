@@ -264,18 +264,6 @@ export function blocksMissingLocalHalf(absPath: string): CacheBlock[] {
   return missing;
 }
 
-/** The reimport handler type that regenerates `block`'s peeled values.
- *
- *  Derived by dropping the `Cache` suffix rather than looked up in a table, because a table would
- *  be a second list to keep in step with {@link CACHE_BLOCKS} — the failure this whole area already
- *  has one instance of (`metaSidecarChurn.test.ts` carried a hand-copied peel list and drifted to
- *  calling it `HOST_LOCAL_KEYS`, a name that does not exist). The correspondence is total and is
- *  asserted in `metaSidecarLocalHalf.test.ts`, which fails if any block stops naming a real
- *  handler. */
-export function reimportTypeForBlock(block: CacheBlock): string {
-  return block.replace(/Cache$/, '');
-}
-
 /** Read the sidecar JSON — the committed `.meta.json` with this machine's local
  *  byte-size stats merged back in (local values WIN, since they reflect what this
  *  host actually produced). `{}` when the committed sidecar is missing/unparsable.

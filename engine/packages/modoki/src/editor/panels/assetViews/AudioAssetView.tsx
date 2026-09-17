@@ -21,6 +21,8 @@ import { withCurrentValue } from './importSettingOptions';
 import { parkMetaEdit, readMetaPreferringPark, flushPendingMetaFor } from '../../scene/pendingMeta';
 import { useMetaDirty } from '../useMetaDirty';
 import { UnsavedMetaBadge } from './UnsavedMetaBadge';
+import { useMissingLocalStats } from '../useMissingLocalStats';
+import { MISSING_STATS_HINT } from './measuredStats';
 
 const FORMAT_LABELS: Record<AudioFormat, string> = {
   mp3: 'MP3 (default — license-free, universal)',
@@ -38,6 +40,9 @@ const LOAD_TYPE_LABELS: Record<AudioLoadType, string> = {
 export function AudioAssetView({ path, name }: { path: string; name: string }) {
   // #870: a parked import-settings edit was invisible in the panel that MADE it.
   const metaDirty = useMetaDirty(path);
+  // #1305: this host holds no measurement for some of the rows below — say so rather than
+  // render a blank (or, as texture and model once did, a defaulted 0 B).
+  const statsIncomplete = useMissingLocalStats(path, 'audioCache');
   const [meta, setMeta] = useState<Record<string, unknown> | null>(null);
   const [settings, setSettings] = useState<AudioImportSettings>(DEFAULT_AUDIO_SETTINGS);
   const [importing, setImporting] = useState(false);
@@ -186,7 +191,7 @@ export function AudioAssetView({ path, name }: { path: string; name: string }) {
       >
         {importing ? 'Converting...' : converted ? 'Re-import' : 'Apply'}
       </button>
-      {converted && <AudioImportedStats cache={meta?.audioCache as AudioCacheInfo | undefined} />}
+      {converted && <AudioImportedStats cache={meta?.audioCache as AudioCacheInfo | undefined} incomplete={statsIncomplete} />}
       <UnsavedMetaBadge dirty={metaDirty} dataUiId="assetView.audio.unsaved" />
     </>
   );
@@ -252,7 +257,7 @@ function drawPeaks(canvas: HTMLCanvasElement, buf: AudioBuffer): void {
 }
 
 /** Post-conversion stats read back from the meta sidecar. */
-function AudioImportedStats({ cache }: { cache: AudioCacheInfo | undefined }) {
+function AudioImportedStats({ cache, incomplete }: { cache: AudioCacheInfo | undefined; incomplete?: boolean }) {
   const rowStyle: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', fontSize: '11px', padding: '1px 0' };
   const labelStyle: React.CSSProperties = { color: '#888' };
   const valStyle: React.CSSProperties = { color: '#ccc' };
@@ -271,6 +276,11 @@ function AudioImportedStats({ cache }: { cache: AudioCacheInfo | undefined }) {
       {cache.bytes !== undefined && (
         <div style={{ ...rowStyle, borderTop: '1px solid #333', marginTop: 2, paddingTop: 3 }}>
           <span style={{ ...labelStyle, color: '#aaa' }}>Size</span><span style={{ ...valStyle, color: '#fff' }}>{formatBytes(cache.bytes)}</span>
+        </div>
+      )}
+      {incomplete && (
+        <div style={{ color: '#8a7', fontSize: '10px', marginTop: 4 }} data-ui-id="assetView.stats.incomplete">
+          {MISSING_STATS_HINT}
         </div>
       )}
     </>

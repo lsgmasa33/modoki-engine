@@ -21,6 +21,14 @@
  *  Partial data sums what is there: a model whose LOD1 size is missing still reports a total for
  *  the LODs it does know, because the alternative (all-or-nothing) hides more than it protects. The
  *  per-row rendering is what shows which individual entries are unknown. */
+/** The one sentence every asset view shows when this machine holds no measurement for a row.
+ *
+ *  Shared so every asset view says the SAME thing: they already had a near-identical line for the
+ *  different case of "no cache block at all" ("Converted ✓ — re-import to compute stats"), and two
+ *  more hand-written variants would be three shapes of one message. It names re-import because that
+ *  is the action — the button is already in every one of these panels. */
+export const MISSING_STATS_HINT = 'Some stats were never computed on this machine — re-import to fill them in.';
+
 export function sumMeasured(values: ReadonlyArray<number | undefined> | undefined): number | undefined {
   if (!values) return undefined;
   let total: number | undefined;

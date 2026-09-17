@@ -31,7 +31,8 @@ import {
 } from '../../scene/pendingMeta';
 import { useMetaDirty } from '../useMetaDirty';
 import { UnsavedMetaBadge } from './UnsavedMetaBadge';
-import { sumMeasured } from './measuredStats';
+import { useMissingLocalStats } from '../useMissingLocalStats';
+import { sumMeasured, MISSING_STATS_HINT } from './measuredStats';
 
 /** Cheap rigged-detection: does this GLB declare a skin? Fetches the file and reads
  *  only its glTF JSON chunk (glbDeclaresSkin), so the Model inspector shows
@@ -47,6 +48,9 @@ async function glbHasSkins(url: string): Promise<boolean> {
 export function ModelAssetView({ path, name, postprocessor }: { path: string; name: string; postprocessor: string }) {
   // #870: a parked import-settings edit was invisible in the panel that MADE it.
   const metaDirty = useMetaDirty(path);
+  // #1305: this host holds no measurement for some of the rows below — say so rather than
+  // render a blank (or, as texture and model once did, a defaulted 0 B).
+  const statsIncomplete = useMissingLocalStats(path, 'modelCache');
   const [meta, setMeta] = useState<Record<string, unknown> | null>(null);
   const [settings, setSettings] = useState<ModelImportSettings>(DEFAULT_MODEL_SETTINGS);
   // Texture-compression settings for a RIGGED model (its embedded textures are
@@ -530,7 +534,7 @@ export function ModelAssetView({ path, name, postprocessor }: { path: string; na
       >
         {importing ? 'Importing...' : (hasCache && hasPrefab) ? 'Re-import' : 'Import'}
       </button>
-      {hasCache && <ModelImportedStats cache={modelCache} />}
+      {hasCache && <ModelImportedStats cache={modelCache} incomplete={statsIncomplete} />}
 
       {!isSourceModel && !isRigged && (
         <GenerateCollisionMeshRow path={path} name={name} postprocessor={postprocessor} onDone={refreshAssets} />
@@ -634,7 +638,7 @@ function GenerateCollisionMeshRow({ path, name, postprocessor, onDone }: { path:
 }
 
 /** Post-conversion stats for the model pipeline — per-LOD tri counts + bytes. */
-function ModelImportedStats({ cache }: { cache: ModelCacheInfo | undefined }) {
+function ModelImportedStats({ cache, incomplete }: { cache: ModelCacheInfo | undefined; incomplete?: boolean }) {
   const rowStyle: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', fontSize: '11px', padding: '1px 0' };
   const labelStyle: React.CSSProperties = { color: '#888' };
   const valStyle: React.CSSProperties = { color: '#ccc' };
@@ -665,6 +669,11 @@ function ModelImportedStats({ cache }: { cache: ModelCacheInfo | undefined }) {
         <span style={{ ...labelStyle, color: '#aaa' }}>Total</span>
         <span style={{ ...valStyle, color: '#fff' }}>{total !== undefined ? formatBytes(total) : '—'}</span>
       </div>
+      {incomplete && (
+        <div style={{ color: '#8a7', fontSize: '10px', marginTop: 4 }} data-ui-id="assetView.stats.incomplete">
+          {MISSING_STATS_HINT}
+        </div>
+      )}
     </>
   );
 }

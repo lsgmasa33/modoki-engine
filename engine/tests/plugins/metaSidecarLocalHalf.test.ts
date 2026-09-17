@@ -1,17 +1,12 @@
 /** #1305 — a peel migration deletes the committed value and cannot seed the gitignored local half,
- *  so nothing ever put it back. These cover the two halves of the repair: detecting that a
- *  machine is missing a block's peeled values, and scheduling exactly one re-derivation for it.
- *
- *  The unit under test is the DECISION, not the probe. Whether `ffprobe` produces a duration is the
- *  reimport handler's business and is covered where the handlers are; what this file pins is that
- *  an absent local half is noticed, that a present one is left alone, and that a failing attempt is
- *  not retried forever. */
+ *  so nothing ever put it back. The route REPORTS the gap and the human's Re-import repairs it; this
+ *  file pins the report's predicate — that an absent local half is noticed and a present one is
+ *  left alone — and that the repair the hint offers exists for every block. */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
-import { blocksMissingLocalHalf, reimportTypeForBlock, CACHE_BLOCKS, writeMetaSidecar, peelSchemaId } from '../../plugins/meta-sidecar';
-import { scheduleLocalHalfHeal, healAttempts } from '../../plugins/backend/healLocalHalf';
+import { blocksMissingLocalHalf, CACHE_BLOCKS, writeMetaSidecar, peelSchemaId } from '../../plugins/meta-sidecar';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 import { parseSource, callsTo } from '@modoki/engine/testing/sourceAst';
 import ts from 'typescript';
@@ -22,7 +17,6 @@ let absPath: string;
 beforeEach(() => {
   tmpRoot = makeScratchDir('modoki-local-half-');
   absPath = path.join(tmpRoot, 'asset.mp3');
-  healAttempts.clear();
 });
 afterEach(() => { fs.rmSync(tmpRoot, { recursive: true, force: true }); });
 
@@ -135,7 +129,13 @@ describe('blocksMissingLocalHalf', () => {
   });
 });
 
-describe('reimportTypeForBlock', () => {
+/** The Inspector's hint tells the human to RE-IMPORT, for any block the route reports — so every
+ *  cache block must have a reimport handler that regenerates it, or the hint offers an action that
+ *  does not exist. Block → type is `<type>Cache` by convention; the table below pins that the
+ *  convention still holds, and the scanner check pins that a handler is registered under it. */
+const reimportTypeForBlock = (block: string): string => block.replace(/Cache$/, '');
+
+describe('every reportable block has a re-import that can fill it', () => {
   it('names the reimport handler type for every cache block', () => {
     expect(CACHE_BLOCKS.map(reimportTypeForBlock).sort())
       .toEqual(['atlas', 'audio', 'environment', 'font', 'model', 'texture', 'video']);
@@ -163,215 +163,5 @@ describe('reimportTypeForBlock', () => {
     for (const block of CACHE_BLOCKS) {
       expect(registered.has(reimportTypeForBlock(block)), `${block} → no registered reimport handler`).toBe(true);
     }
-  });
-});
-
-describe('scheduleLocalHalfHeal', () => {
-  /** Collects the deferred work instead of running it, so a test can assert the route returned
-   *  BEFORE the handler ran — the property that protects a 216-path batch select. */
-  function collector() {
-    const deferred: Array<() => Promise<void>> = [];
-    const ran: string[] = [];
-    return {
-      deferred, ran,
-      deps: (handler?: (url: string, abs: string) => Promise<void>) => ({
-        getHandler: (type: string) => handler ? ((url: string, abs: string) => { ran.push(type); return handler(url, abs); }) : undefined,
-        defer: (fn: () => Promise<void>) => { deferred.push(fn); },
-      }),
-      flush: async () => { for (const fn of deferred.splice(0)) await fn(); },
-    };
-  }
-
-  it('schedules a heal for an asset missing its local half', () => {
-    writeCommittedOnly({ id: 'g', version: 2, audioCache: { hash: 'h' } });
-    const c = collector();
-    expect(scheduleLocalHalfHeal('/assets/a.mp3', absPath, c.deps(async () => {}))).toBe('scheduled');
-    expect(c.deferred).toHaveLength(1);
-  });
-
-  /** ⚠️ The accept side. Without this, a fix that healed unconditionally would pass every other
-   *  test in this file while re-probing on every single Inspector open. */
-  it('does NOT schedule when the local half is already complete', () => {
-    writeCommittedOnly({ id: 'g', version: 2, audioCache: { hash: 'h' } });
-    writeLocal({ audioCache: { durationSec: 1.5 } });
-    const c = collector();
-    expect(scheduleLocalHalfHeal('/assets/a.mp3', absPath, c.deps(async () => {}))).toBe('complete');
-    expect(c.deferred).toHaveLength(0);
-  });
-
-  /** The response must be built and returned without the probe. `deferred` holding work that has
-   *  not run yet IS the assertion — the handler records into `ran`, and `ran` is still empty. */
-  it('returns before the handler runs (the route must not stall on a probe)', async () => {
-    writeCommittedOnly({ id: 'g', version: 2, audioCache: { hash: 'h' } });
-    const c = collector();
-    scheduleLocalHalfHeal('/assets/a.mp3', absPath, c.deps(async () => {}));
-    expect(c.ran).toEqual([]);      // scheduled, definitively not yet executed
-    await c.flush();
-    expect(c.ran).toEqual(['audio']); // and it really was the audio handler that was queued
-  });
-
-  it('schedules only once per asset, however many times the Inspector reads it', () => {
-    writeCommittedOnly({ id: 'g', version: 2, audioCache: { hash: 'h' } });
-    const c = collector();
-    expect(scheduleLocalHalfHeal('/assets/a.mp3', absPath, c.deps(async () => {}))).toBe('scheduled');
-    expect(scheduleLocalHalfHeal('/assets/a.mp3', absPath, c.deps(async () => {}))).toBe('already-attempted');
-    expect(c.deferred).toHaveLength(1);
-  });
-
-  /** ⚠️ The retry-storm guard. A machine with no ffprobe can never satisfy this, so a failed
-   *  attempt must still count as an attempt — otherwise the sidecar stays incomplete, the next read
-   *  schedules again, and every Inspector open pays for a probe that cannot succeed. */
-  it('remembers an attempt that FAILED, and does not retry it', async () => {
-    writeCommittedOnly({ id: 'g', version: 2, audioCache: { hash: 'h' } });
-    const c = collector();
-    scheduleLocalHalfHeal('/assets/a.mp3', absPath, c.deps(async () => { throw new Error('no ffprobe'); }));
-    await c.flush(); // the throw is swallowed — a GET that already answered must not reject
-    expect(scheduleLocalHalfHeal('/assets/a.mp3', absPath, c.deps(async () => {}))).toBe('already-attempted');
-  });
-
-  /** ...but the memo is keyed on the sidecar's hash, so a genuine re-import gets a fresh attempt.
-   *  This is what stops the "remembered forever" behaviour above from being permanent. */
-  it('attempts again once the committed sidecar changes', () => {
-    writeCommittedOnly({ id: 'g', version: 2, audioCache: { hash: 'h' } });
-    const c = collector();
-    scheduleLocalHalfHeal('/assets/a.mp3', absPath, c.deps(async () => {}));
-    writeCommittedOnly({ id: 'g', version: 2, audioCache: { hash: 'DIFFERENT' } });
-    expect(scheduleLocalHalfHeal('/assets/a.mp3', absPath, c.deps(async () => {}))).toBe('scheduled');
-  });
-
-  /** ⚠️ Writing the local half is only half a heal — the OPEN panel has to re-read it. The asset
-   *  views refresh off `useAssetInvalidationEpoch`, which the router drives from this callback, so
-   *  the TYPE has to survive: `invalidate-assets` is keyed on it. Observed live before this was
-   *  wired — a texture panel kept rendering '—' with `variantBytes` already on disk, which is the
-   *  "it never comes back" symptom the whole change exists to remove. */
-  it('hands the healed asset AND its reimport type to onHealed', async () => {
-    writeCommittedOnly({ id: 'g', version: 2, audioCache: { hash: 'h' } });
-    const c = collector();
-    const seen: Array<[string, string]> = [];
-    scheduleLocalHalfHeal('/assets/a.mp3', absPath, {
-      ...c.deps(async () => {}),
-      onHealed: (p, type) => { seen.push([p, type]); },
-    });
-    await c.flush();
-    expect(seen).toEqual([['/assets/a.mp3', 'audio']]);
-  });
-
-  it('does not announce a heal that threw', async () => {
-    writeCommittedOnly({ id: 'g', version: 2, audioCache: { hash: 'h' } });
-    const c = collector();
-    const seen: string[] = [];
-    scheduleLocalHalfHeal('/assets/a.mp3', absPath, {
-      ...c.deps(async () => { throw new Error('no ffprobe'); }),
-      onHealed: (p) => { seen.push(p); },
-    });
-    await c.flush();
-    expect(seen).toEqual([]);
-  });
-
-  /** ⚠️ **The invariant, and the close-out's most dangerous finding.** The reimport handlers rebuild
-   *  their whole block in canonical key order and stamp `meta.type`, so on a sidecar whose committed
-   *  shape predates that, the rewrite is byte-different — measured, **43 of 282 committed texture
-   *  sidecars**. Since this runs behind a GET, that would make merely CLICKING an asset dirty a
-   *  tracked `games/**` file (CLAUDE.md's "never `git add -A`" rule, #18), and it is invisible to
-   *  `metaSidecarChurn` because no peeled value is present. */
-  it('restores the committed sidecar byte-for-byte when the handler rewrites it', async () => {
-    writeCommittedOnly({ id: 'g', version: 2, audioCache: { hash: 'h', ext: 'mp3' } });
-    const before = fs.readFileSync(absPath + '.meta.json');
-    const c = collector();
-    scheduleLocalHalfHeal('/assets/a.mp3', absPath, c.deps(async () => {
-      // What a real handler does: rewrite the committed half in ITS key order, and the local half.
-      fs.writeFileSync(absPath + '.meta.json', JSON.stringify({ version: 2, id: 'g', type: 'audio', audioCache: { ext: 'mp3', hash: 'h' } }, null, 2) + '\n');
-      writeLocal({ audioCache: { durationSec: 3.5, bytes: 10 } });
-    }));
-    await c.flush();
-    expect(fs.readFileSync(absPath + '.meta.json').equals(before)).toBe(true);
-    // ...and the heal's actual product survives the restore — otherwise this "fix" would undo itself.
-    expect(blocksMissingLocalHalf(absPath)).toEqual([]);
-  });
-
-  it('restores the committed sidecar even when the handler then threw', async () => {
-    writeCommittedOnly({ id: 'g', version: 2, audioCache: { hash: 'h', ext: 'mp3' } });
-    const before = fs.readFileSync(absPath + '.meta.json');
-    const c = collector();
-    scheduleLocalHalfHeal('/assets/a.mp3', absPath, c.deps(async () => {
-      fs.writeFileSync(absPath + '.meta.json', '{"half":"written"}');
-      throw new Error('died mid-write');
-    }));
-    await c.flush();
-    expect(fs.readFileSync(absPath + '.meta.json').equals(before)).toBe(true);
-  });
-
-  /** ⚠️ The park gate (#882): the handlers read settings from DISK, so baking while an edit is
-   *  parked converts with the PRE-EDIT settings. A refusal must RELEASE the memo — a park is "not
-   *  now", and leaving the key set would strand the asset until the process restarted. */
-  it('abandons the heal while an edit is parked, and lets a later read retry', async () => {
-    writeCommittedOnly({ id: 'g', version: 2, audioCache: { hash: 'h' } });
-    const c = collector();
-    let parked = true;
-    scheduleLocalHalfHeal('/assets/a.mp3', absPath, {
-      ...c.deps(async () => {}),
-      beforeRun: async () => !parked,
-    });
-    await c.flush();
-    expect(c.ran).toEqual([]);            // gate held it
-    parked = false;
-    expect(scheduleLocalHalfHeal('/assets/a.mp3', absPath, c.deps(async () => {}))).toBe('scheduled');
-    await c.flush();
-    expect(c.ran).toEqual(['audio']);     // and the retry actually ran
-  });
-
-  it('treats a throwing gate as closed rather than proceeding', async () => {
-    writeCommittedOnly({ id: 'g', version: 2, audioCache: { hash: 'h' } });
-    const c = collector();
-    scheduleLocalHalfHeal('/assets/a.mp3', absPath, {
-      ...c.deps(async () => {}),
-      beforeRun: async () => { throw new Error('probe failed'); },
-    });
-    await c.flush();
-    expect(c.ran).toEqual([]);
-  });
-
-  /** ⚠️ Not tidiness: `metaBatchLoad` sends one GET per path in a multi-selection through
-   *  `Promise.all`, and a heal is a full `toktx`/ffmpeg encode whenever the artifact cache is cold —
-   *  106 of this clone's 215 healable textures are. Uncapped, selecting a folder starts a hundred
-   *  concurrent encoders from a GET. */
-  it('runs at most two heals concurrently', async () => {
-    let concurrent = 0;
-    let peak = 0;
-    const release: Array<() => void> = [];
-    const started: Array<Promise<void>> = [];
-    for (let i = 0; i < 6; i++) {
-      const p = path.join(tmpRoot, `clip${i}.mp3`);
-      fs.writeFileSync(p + '.meta.json', JSON.stringify({ id: `g${i}`, audioCache: { hash: `h${i}` } }));
-      scheduleLocalHalfHeal(`/assets/clip${i}.mp3`, p, {
-        getHandler: () => async () => {
-          concurrent++; peak = Math.max(peak, concurrent);
-          await new Promise<void>((r) => release.push(r));
-          concurrent--;
-        },
-        defer: (fn) => { started.push(fn()); },
-      });
-    }
-    // Let the first slots take hold, then drain.
-    await new Promise((r) => setTimeout(r, 0));
-    expect(peak).toBeLessThanOrEqual(2);
-    while (release.length) { release.shift()!(); await new Promise((r) => setTimeout(r, 0)); }
-    await Promise.all(started);
-    expect(peak).toBeLessThanOrEqual(2);
-    expect(peak).toBeGreaterThan(0); // the cap must not be "never runs"
-  });
-
-  it('reports no-handler rather than scheduling when the type cannot be re-imported', () => {
-    writeCommittedOnly({ id: 'g', version: 2, audioCache: { hash: 'h' } });
-    const c = collector();
-    expect(scheduleLocalHalfHeal('/assets/a.mp3', absPath, c.deps(undefined))).toBe('no-handler');
-    expect(c.deferred).toHaveLength(0);
-  });
-
-  it('does not mark an attempt it never scheduled (a handler arriving later still gets its turn)', () => {
-    writeCommittedOnly({ id: 'g', version: 2, audioCache: { hash: 'h' } });
-    const c = collector();
-    scheduleLocalHalfHeal('/assets/a.mp3', absPath, c.deps(undefined));
-    expect(scheduleLocalHalfHeal('/assets/a.mp3', absPath, c.deps(async () => {}))).toBe('scheduled');
   });
 });

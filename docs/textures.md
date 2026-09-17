@@ -240,60 +240,59 @@ return fires and nothing re-derives. A stale model hash IS a cache miss; a missi
 `durationSec` is not, and the routes auto-bake only when `fs.existsSync(cached)` is
 false — i.e. when the converted BYTES are gone. With a warm `.cache/`, never.
 
-**The fix makes absence itself the trigger, at `/api/read-meta`** — see
-`plugins/backend/healLocalHalf.ts`. `blocksMissingLocalHalf` (in `meta-sidecar.ts`,
-derived from `LOCAL_KEYS`) reports a committed block whose peeled values this
-machine does not hold, and the route schedules one reimport for it.
+**The repair is the human's Re-import button; the route only REPORTS the gap.**
+`blocksMissingLocalHalf` (in `meta-sidecar.ts`, derived from `LOCAL_KEYS`) names the
+committed blocks whose peeled values this machine does not hold, and
+`/api/read-meta` returns them in an `X-Meta-Local-Missing` header. The Inspector
+turns that into "re-import to compute stats" beside the rows it cannot fill, instead
+of a blank — or, as texture and model did before this, a confidently defaulted
+`0 B`. Nothing is written by a read.
 
-⚠️ **A heal is NOT reliably cheap, and the first version of this section said it
-was.** The claim was *"every converter re-stats/re-probes even on a warm cache hit,
-so it costs an `ffprobe`/`statSync`, not a re-encode"*. That is true only while the
-ARTIFACT cache is warm: measured 2026-09-17, **106 of this clone's 215 healable
-textures have no `.cache/modoki-textures` entry for their hash**, so each is a full
-`toktx` encode, and `games/video-test` has no `.cache` at all. The `modelCache`
-paragraph above explains why it cannot be warm for a model missing its local half —
-`hash` *is* the cache key, so a missing one is a cache miss by construction. Hence
-the cap of two concurrent heals in `healLocalHalf.ts`: `metaBatchLoad` fetches this
-route once per path in a multi-selection through `Promise.all`, so uncapped,
-selecting a folder would start a hundred encoders from a GET.
+⚠️ **An automatic heal was built first and then removed, and the reason is worth
+keeping.** It made the read route re-derive the values itself, which measured well
+on one clone and was wrong in four ways at once: it re-encoded rather than
+re-probed (**106 of this clone's 215 affected textures have no `.cache` entry**, so
+each is a full `toktx` run, and `games/video-test` has none at all); `metaBatchLoad`
+fetches this route once per path in a multi-selection, so a folder click fanned out
+to a hundred of those; the reimport handlers rebuild their block in canonical key
+order and stamp `meta.type`, so it rewrote **43 of 282 committed texture sidecars**
+byte-for-byte differently, meaning a GET dirtied tracked `games/**` files
+(`CLAUDE.md`'s "never `git add -A`" rule, #18); and it bypassed the `pendingMeta`
+park gate `/api/reimport` enforces (#882), so a parked settings edit could be baked
+with pre-edit values. Each had a fix — a concurrency cap, a snapshot-and-restore, a
+deferred gate probe, a `heal=0` opt-out for observers — and the owner's call
+(2026-09-17) was that a button needs none of them. **The lesson is not "healing is
+hard" but that a GET which writes acquires every obligation a write has**, and pays
+them in a place no caller asked for work.
 
-⚠️ **A heal must leave the COMMITTED sidecar byte-identical, and this is enforced,
-not assumed.** The reimport handlers rebuild their whole block in canonical key
-order and stamp `meta.type`, so on a sidecar predating that shape the rewrite is
-byte-different — **43 of 282 committed texture sidecars**. Behind a GET that would
-make merely clicking an asset dirty a tracked `games/**` file (`CLAUDE.md`'s
-"never `git add -A`" rule, #18) and invalidate the `X-Meta-Sha256` baseline the
-same response just handed the panel. `healLocalHalf` snapshots the committed half
-and restores it afterwards, including after a throw. It restores rather than
-prevents because those handlers are shared with `/api/reimport`, where rewriting the
-committed half is correct — the difference is that a user asked for that one.
+⚠️ **The hint is recorded in `noteMetaReadResult`, not in `readMetaPreferringPark` —
+and the first version got that wrong.** `VideoAssetView` reads this route raw (the
+#871 exemption: it keeps an `applied` state that must reflect disk) and calls only
+`noteMetaReadResult` on the response. With the hint recorded inside the helper, the
+video panel never showed it on a human's read, and could not clear one an agent's
+passive read had set. Recorded in `noteMetaReadResult` (`editor/scene/pendingMeta.ts`),
+the `'seeds'` rule in `metaReadPreferringPark.test.ts`, which forces every exemption
+declared `'seeds'` to make that call, now enforces the hint as well. The helper's
+`passive` read skips only the CAS baseline (the hint is a fact about the files, not
+about what a panel displays), and that option is module-private so an exempted
+reader cannot pass it and record no baseline with the guard still green.
+The store is `editor/scene/missingLocalStats.ts`; the audio, video, texture, model,
+font and environment views read it through `useMissingLocalStats`. The atlas view
+renders no peeled row, so it has nothing to hint.
 
-Two more constraints the heal inherits rather than invents: it is refused while a
-`pendingMeta` park exists (#882 — the handlers read settings from DISK, so baking
-under a park converts with pre-edit values), and a `passive` reader opts out with
-`heal=0`, because `modoki_get_asset_meta` is an observer and an observer must not
-re-encode what it observes.
+⚠️ **The header only works in Electron because it is in
+`Access-Control-Expose-Headers`** (`engine/electron/backendServer.ts`). The renderer
+talks to that backend cross-origin, so an unexposed header reads `null` on a 200
+with no console error, while the same-origin Vite dev server reads it fine — the
+feature shipped inert that way once. `engine/tests/architecture/metaHeaderExposure.test.ts`
+derives the required set from the router's own `X-*` keys.
 
-⚠️ **The trigger is the READ route, not the serve path, and the obvious choice was
-wrong.** Teaching `staticAssets.ts`'s warm-cache guards that an absent local half
-is a miss would have healed **video only**: the Inspector's previews point at the
-SOURCE file — `AudioAssetView`'s `<audio controls src={path}>` and
-`TextureAssetView`'s `<img src={path}>`, deliberate and commented as such — so
-opening an audio or texture asset never requests the converted URL. Only
-`VideoAssetView` asks for one (`videoPreviewUrl`).
-
-Two properties the implementation must keep, both pinned by tests in
-`engine/tests/plugins/metaSidecarLocalHalf.test.ts`:
-
-- **It never blocks the response.** `assetViews/metaBatchLoad.ts` fetches this route
-  once per path in a multi-selection, so an inline probe would stall
-  `TextureBatchView` by the size of the selection. The Inspector picks the result up
-  through the invalidation epoch that already cache-busts this URL.
-- **One attempt per (asset, sidecar sha).** A machine with no `ffprobe` can never
-  satisfy the check, so without the memo every Inspector open would re-attempt a
-  probe that cannot succeed. The consequence is accepted deliberately: installing
-  `ffprobe` later does **not** backfill until something rewrites the sidecar, and
-  the Inspector's own Re-import button is that something.
+⚠️ **The button a hint points at can dirty tracked files.** The reimport handlers
+rebuild their block in canonical key order (the texture handler also stamps
+`meta.type`) — the same property that rewrote 43 of 282 texture sidecars under the
+automatic heal. As a human click it
+is an intended write, but check `git diff -- games/ demos/` after re-importing before
+committing a no-op sidecar change.
 
 ⚠️ **"Incomplete" is a two-part question, and getting the second part wrong made the
 first version of this fix do nothing on the hub.** Within one peel generation the

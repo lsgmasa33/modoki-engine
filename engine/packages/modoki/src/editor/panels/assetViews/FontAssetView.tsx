@@ -21,6 +21,8 @@ import { parkMetaEdit, readMetaPreferringPark, flushPendingMetaFor } from '../..
 import { OUTLINE_MAX_SPREAD } from '../../../runtime/rendering/text/mtsdfStyle';
 import { useMetaDirty } from '../useMetaDirty';
 import { UnsavedMetaBadge } from './UnsavedMetaBadge';
+import { useMissingLocalStats } from '../useMissingLocalStats';
+import { MISSING_STATS_HINT } from './measuredStats';
 
 const CHARSET_OPTIONS: { value: FontCharsetPreset; label: string }[] = [
   { value: 'ascii', label: 'ASCII (printable, 95 glyphs)' },
@@ -69,6 +71,9 @@ const AXIS_LABELS: Record<string, string> = {
 export function FontAssetView({ path, name }: { path: string; name: string }) {
   // #870: a parked import-settings edit was invisible in the panel that MADE it.
   const metaDirty = useMetaDirty(path);
+  // #1305: this host holds no measurement for some of the rows below — say so rather than
+  // render a blank (or, as texture and model once did, a defaulted 0 B).
+  const statsIncomplete = useMissingLocalStats(path, 'fontCache');
   const [meta, setMeta] = useState<Record<string, unknown> | null>(null);
   const [settings, setSettings] = useState<FontImportSettings>(DEFAULT_FONT_SETTINGS);
   const [customChars, setCustomChars] = useState('');
@@ -339,7 +344,7 @@ export function FontAssetView({ path, name }: { path: string; name: string }) {
       >
         {importing ? 'Baking...' : converted ? 'Re-bake' : 'Apply'}
       </button>
-      {converted && <FontImportedStats cache={meta?.fontCache as FontCacheInfo | undefined} />}
+      {converted && <FontImportedStats cache={meta?.fontCache as FontCacheInfo | undefined} incomplete={statsIncomplete} />}
       {converted && <FontAtlasPreview path={path} cache={meta?.fontCache as FontCacheInfo | undefined} />}
       <UnsavedMetaBadge dirty={metaDirty} dataUiId="assetView.font.unsaved" />
     </>
@@ -497,7 +502,7 @@ function FontAtlasPreview({ path, cache }: { path: string; cache: FontCacheInfo 
 
 /** Post-bake stats read back from the meta sidecar: atlas dimensions, glyph count,
  *  and atlas PNG size. */
-function FontImportedStats({ cache }: { cache: FontCacheInfo | undefined }) {
+function FontImportedStats({ cache, incomplete }: { cache: FontCacheInfo | undefined; incomplete?: boolean }) {
   const rowStyle: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', fontSize: '11px', padding: '1px 0' };
   const labelStyle: React.CSSProperties = { color: '#888' };
   const valStyle: React.CSSProperties = { color: '#ccc' };
@@ -514,6 +519,11 @@ function FontImportedStats({ cache }: { cache: FontCacheInfo | undefined }) {
       )}
       {cache.bytes != null && (
         <div style={rowStyle}><span style={labelStyle}>Atlas size</span><span style={valStyle}>{formatBytes(cache.bytes)}</span></div>
+      )}
+      {incomplete && (
+        <div style={{ color: '#8a7', fontSize: '10px', marginTop: 4 }} data-ui-id="assetView.stats.incomplete">
+          {MISSING_STATS_HINT}
+        </div>
       )}
     </>
   );

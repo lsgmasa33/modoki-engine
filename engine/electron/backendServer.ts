@@ -105,7 +105,16 @@ export function startBackendServer(ctx: BackendContext, opts: BackendServerOptio
     // client reads that one (`ScriptTree.tsx` takes `writable` from the JSON body; the header is
     // consumed only by a server-side test). It is listed so that a future client CAN read it
     // without rediscovering this whole failure mode, not because anything is broken without it.
-    res.setHeader('Access-Control-Expose-Headers', 'X-Meta-Sha256, X-Writable');
+    // ⚠️ `X-Meta-Local-Missing` (#1305) joined it, and it arrived by walking straight into the
+    // failure this comment describes. The route emitted it, the unit tests asserted the route
+    // emitted it, a same-origin `fetch` through Vite READ it — and in the Electron editor the panel
+    // got `null`, so the Inspector never showed "re-import to compute stats" and the whole feature
+    // was inert exactly where the editor actually runs. Caught only by driving the live editor.
+    // It names the cache blocks whose machine-local values this host lacks; the client cannot
+    // compute it (which keys are peeled is `meta-sidecar.ts`'s LOCAL_KEYS, server-side).
+    // `metaHeaderExposure.test.ts` now derives this list from the router so the next one cannot be
+    // forgotten the same way.
+    res.setHeader('Access-Control-Expose-Headers', 'X-Meta-Sha256, X-Writable, X-Meta-Local-Missing');
     if (req.method === 'OPTIONS') {
       res.statusCode = 204;
       res.end();

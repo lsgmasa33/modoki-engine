@@ -43,24 +43,8 @@ import { execFileSync } from 'child_process';
 import { resolveGcloudDir, deriveGcsBucketFromBaseUrl, isGcsObjectMissing, OTA_SAFE_TOKEN, OTA_SAFE_BUCKET } from './gcloud';
 import { openInOS, revealInOS } from './osOpen';
 import { relativiseUnderProject, planDroppedFileDest } from './projectPaths';
-import { readMetaSidecar, writeMetaSidecar, assertSidecarWritable, sidecarPath, metaSidecarSha256 } from '../meta-sidecar';
-import { scheduleLocalHalfHeal } from './healLocalHalf';
+import { readMetaSidecar, writeMetaSidecar, assertSidecarWritable, sidecarPath, metaSidecarSha256, blocksMissingLocalHalf } from '../meta-sidecar';
 
-/** Coalesce the manifest rebuilds a burst of heals would otherwise each demand.
- *
- *  `rebuildManifest` is a synchronous re-scan of every asset root plus a whole-manifest broadcast,
- *  and `/api/reimport` deliberately does ONE per batch, not one per asset. A heal has no batch to
- *  hang that on — `metaBatchLoad` sends N independent GETs — so the coalescing has to live here or
- *  selecting a folder pays for N full re-scans. */
-let manifestRebuildTimer: ReturnType<typeof setTimeout> | undefined;
-function scheduleManifestRebuild(ctx: BackendContext): void {
-  if (manifestRebuildTimer) clearTimeout(manifestRebuildTimer);
-  manifestRebuildTimer = setTimeout(() => {
-    manifestRebuildTimer = undefined;
-    try { ctx.rebuildManifest(); } catch { /* a rebuild failure must not take the process down */ }
-  }, 250);
-  manifestRebuildTimer.unref?.();
-}
 import { readFontAxes } from '../font-instance';
 import { createFolderAt, moveAssetFile, duplicateAssetFile, moveToTrash } from '../asset-fs-ops';
 import { getReimportHandler, getReimportTypes, type ReimportContext, type ReimportAsset } from '../reimport-registry';
@@ -3440,52 +3424,26 @@ async function describeUnresolvedAgainstLiveWorld(
     // "no baseline", NOT as "unchanged" — see `readMetaPreferringPark`.
     const sha = metaSidecarSha256(resolved);
     const body = JSON.stringify(readMetaSidecar(resolved));
-    // A peel migration deletes the committed value and cannot seed the gitignored half, so the rows
-    // this route exists to fill stay blank until something re-derives them (#1305). Scheduled
-    // AFTER the body is built and never awaited: `metaBatchLoad` calls this route once per path in
-    // a multi-selection, so an inline probe would stall the panel by the size of the selection.
-    // The Inspector picks the result up via the invalidation epoch that already cache-busts this URL.
-    // ⚠️ `heal=0` opts a PASSIVE reader out. `modoki_get_asset_meta` (agentEditorOps' read-asset-meta)
-    // is an observer, and an observer must not re-encode the thing it observes: without this, an
-    // agent sweeping sidecars across a project would start a conversion per asset. The route needs
-    // its own flag because the client-side `passive` only suppresses the CAS baseline record.
-    if (query.get('heal') !== '0') scheduleLocalHalfHeal(assetPath, resolved, {
-      getHandler: (type) => {
-        const h = getReimportHandler(type);
-        if (!h) return undefined;
-        return (url, abs) => h(url, abs, {
-          projectRoot: ctx.projectRoot,
-          resolveAssetPath: (p) => ctx.resolveAssetPath(p),
-          ssrLoadModule: (u) => ctx.ssrLoadModule(u),
-          enginePkgSrc: engineSrcRoot(ctx) ?? undefined,
-        });
-      },
-      defer: (fn) => { void fn(); },
-      // Same gate /api/reimport applies (#882) — the handlers read settings from DISK, so baking
-      // while an edit is parked converts with the PRE-EDIT settings and the human's next save
-      // flushes a stale block over the fresh bake. A refusal here releases the memo, so the heal
-      // gets another chance once the park is saved.
-      beforeRun: async () => {
-        const gate = await unsavedGate(ctx, [assetPath], { registries: ['pendingMeta'] });
-        // Proceed only on a POSITIVE all-clear. `held` is the park; `unknown` means the probe could
-        // not confirm, and unlike a user-requested re-import — where refusing on `unknown` would
-        // block work somebody asked for — this is optional background repair, so failing closed
-        // costs nothing and the memo is released either way.
-        return gate.kind === 'clear' || gate.kind === 'absent';
-      },
-      onHealed: (healed, type) => {
-        scheduleManifestRebuild(ctx);
-        // The same message the /api/reimport route sends, for the same reason: the asset views
-        // refresh off `useAssetInvalidationEpoch`, which this drives. Writing the local half
-        // without it leaves an OPEN Inspector showing the blank row it was already showing
-        // (observed on a texture panel, 2026-09-17). Best-effort — a headless renderer just times
-        // out, and the file is on disk either way.
-        void ctx.requestBrowser('invalidate-assets', { items: [{ path: healed, type }] }).catch(() => {});
-      },
-    });
+    // ⚠️ A peel migration deletes the committed value and CANNOT seed the gitignored half —
+    // `.meta.local.json` is gitignored, so no commit can carry one — and nothing re-derives it,
+    // because a peeled value is written only as a side-effect of a reimport handler and that runs
+    // only on a converted-artifact cache miss, which a warm `.cache/` makes impossible (#1305).
+    // So this route REPORTS the gap and does not repair it: the human's Re-import button does
+    // that. An earlier version healed automatically from here; the owner chose the button
+    // (2026-09-17) once the cost was measured — 106 of 215 affected textures have no cached
+    // conversion, so a "cheap re-probe" was a full `toktx` encode for half of them, and through
+    // `metaBatchLoad`'s per-path fan-out a folder selection would have started a hundred at once.
+    //
+    // A HEADER for the same reason `X-Meta-Sha256` is one (#845 phase 2): the body is the MERGED
+    // document and every caller does `res.json()` on it, so adding a field would break them all.
+    // Empty ⇒ header omitted, which a client reads as "nothing missing".
+    const missingLocal = blocksMissingLocalHalf(resolved);
     return {
       kind: 'raw', contentType: 'application/json', body,
-      ...(sha ? { headers: { 'X-Meta-Sha256': sha } } : {}),
+      headers: {
+        ...(sha ? { 'X-Meta-Sha256': sha } : {}),
+        ...(missingLocal.length ? { 'X-Meta-Local-Missing': missingLocal.join(',') } : {}),
+      },
     };
   }
 

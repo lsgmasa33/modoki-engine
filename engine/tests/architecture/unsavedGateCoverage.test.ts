@@ -156,17 +156,15 @@ const EXEMPT: Record<string, { reason: string; registries?: readonly string[] }>
     'trashing the file the live world was loaded from destroys nothing in the live world — the '
     + 'human\'s next save writes it back — so refusing on it would be a false alarm. The three '
     + 'path-keyed registries the delete repair actually DROPS are gated.', },
-  // ⚠️ `/api/read-meta`'s `pendingMeta` exemption was DEDUCTED in #1305's close-out, and the
-  // reasoning it carried is still true of the READ — kept here because it is exactly what decided
-  // the shape of what replaced it. The read itself still does not gate: `readMetaPreferringPark`
-  // calls this route FROM the renderer, so probing the renderer back mid-request would be circular
-  // for every real caller, and it is the read whose X-Meta-Sha256 seeds the CAS baseline.
-  //
-  // What the route gained is not a gate on the read but a gate on the HEAL it now schedules — a
-  // reimport that runs AFTER the response has been sent (#1305). That probe is not circular for
-  // the same reason it is not slow: nothing is awaiting the route when it runs. So the route
-  // legitimately declares `pendingMeta`, and this row would now be blessing an occurrence that
-  // does not exist — the pre-approval the ledger's own message warns about.
+  // ⚠️ REINSTATED (#1305, owner 2026-09-17). The close-out briefly deducted this row, because an
+  // automatic local-half heal was scheduled from here and that heal DID need the gate. The owner
+  // then chose the button over the automatic heal, so the route went back to reading only — it
+  // reports the gap in a header and repairs nothing — and the original reasoning is load-bearing
+  // again, unchanged.
+  '/api/read-meta': { registries: ['pendingMeta'], reason:
+    "the EDITOR'S OWN disk read — `readMetaPreferringPark` calls it FROM the renderer, so probing "
+    + 'the renderer back would be circular for every real caller it has. It is also the read whose '
+    + 'X-Meta-Sha256 seeds the CAS baseline; a park is consulted one layer up, by the helper.', },
   '/api/asset-meta': { registries: ['pendingMeta'], reason:
     'the agent read, which already PREFERS the park (#872 read half) by asking the renderer — the '
     + 'gate would be asking the same question twice. Its `readMetaSidecar` call is the labelled '
@@ -409,14 +407,6 @@ describe('the sidecar park gate covers every Node route that could clobber a par
       { item: 'engine/plugins/meta-sidecar.ts', reason: 'the sidecar helper module itself' },
       { item: 'engine/plugins/asset-fs-ops.ts', reason: 'the sidecar helper module itself' },
       { item: 'engine/plugins/reimport-registry.ts', reason: 'declares getReimportHandler; dispatches, never writes' },
-      { item: 'engine/plugins/backend/healLocalHalf.ts', reason:
-        '#1305: reached from /api/read-meta, and that route DOES gate pendingMeta for this path — '
-        + 'the gate is asked inside the deferred work (`beforeRun`), because the heal runs after the '
-        + 'response and an inline probe would be both circular and slow. It reads the committed '
-        + 'sidecar only to SNAPSHOT it, and writes one only to RESTORE those exact bytes when a '
-        + 'handler rewrote them; the values it exists to produce land in the gitignored half. So it '
-        + 'cannot clobber a parked edit in either direction — it is gated against baking under one, '
-        + 'and it cannot alter the committed document even if it ran.', },
       { item: 'engine/plugins/asset-tree-shaker.ts', reason: 'a build-time / static path with no editor attached' },
       { item: 'engine/plugins/vite-asset-scanner.ts', reason: 'a build-time / static path with no editor attached' },
       { item: 'engine/plugins/backend/editorBackendRouter.ts', reason: 'the router itself — its sidecar-touching ROUTES are checked one by one by the route-block tests above (unsavedGate, EXEMPT, KNOWN_GAPS)' },
