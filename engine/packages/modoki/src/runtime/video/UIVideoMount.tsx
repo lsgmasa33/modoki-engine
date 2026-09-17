@@ -57,12 +57,15 @@ export interface UIVideoMountProps {
   /** CSS `object-fit` for the picture inside the node's box — carried over from
    *  `UIElement.imageMode`, so a video backdrop crops exactly like an image one. */
   fit?: string;
+  /** CSS `object-position` — from `UIElement.imageAlign`, so a cropped video keeps the same edge
+   *  an image would. */
+  position?: string;
   /** Who wins when the same UI tree is mounted twice. Higher takes the element.
    *  Default 1 = the runtime/game surface; the editor's authoring viewport passes 0. */
   priority?: number;
 }
 
-export function UIVideoMount({ entityId, fit = 'cover', priority = 1 }: UIVideoMountProps) {
+export function UIVideoMount({ entityId, fit = 'cover', position = 'center', priority = 1 }: UIVideoMountProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -93,6 +96,7 @@ export function UIVideoMount({ entityId, fit = 'cover', priority = 1 }: UIVideoM
       el.style.width = '100%';
       el.style.height = '100%';
       el.style.objectFit = fit;
+      el.style.objectPosition = position;
       el.style.display = 'block';
       host.appendChild(el);
       adopted = el;
@@ -107,7 +111,7 @@ export function UIVideoMount({ entityId, fit = 'cover', priority = 1 }: UIVideoM
       // re-parented (or is still feeding a texture surface).
       detach();
     };
-  }, [entityId, fit, priority]);
+  }, [entityId, fit, position, priority]);
 
   // `inset: 0` rather than 100%/100%: the host node may be a flex container with other
   // children (a UI backdrop usually is), and a video that participated in that layout

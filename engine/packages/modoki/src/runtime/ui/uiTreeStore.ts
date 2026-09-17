@@ -76,7 +76,7 @@ export interface UINodeData {
   textStrokeColor: number; textStrokeOpacity: number; textStrokeWidth: number;
   textOverflow: string; maxLines: number;
   // ── Image ──
-  imageSrc: string; imageMode: string;
+  imageSrc: string; imageMode: string; imageAlign: string;
   /** Cache-busting epoch for `imageSrc` — see where it is built, and `spriteEpoch`. */
   imageEpoch: number;
   /** This UI entity also carries a `VideoPlayer` — UINode mounts the clip into its box
@@ -462,6 +462,7 @@ function buildTree(world: World): UINodeData[] | null {
         textStrokeColor: ui.textStrokeColor || 0, textStrokeOpacity: ui.textStrokeOpacity ?? 1, textStrokeWidth: ui.textStrokeWidth || 0,
         textOverflow: ui.textOverflow || 'clip', maxLines: ui.maxLines || 0,
         imageSrc: ui.imageSrc || '', imageMode: ui.imageMode || 'cover',
+        imageAlign: ui.imageAlign || 'center',
         // The RESOLUTION epoch of whatever imageSrc points at. It is in the node data — not read
         // inside UINode — because this tree's reconciler hands back the PREVIOUS node object when
         // the data is equal, so `React.memo(UINode)` bails and the inline `resolveDomImageUrl`

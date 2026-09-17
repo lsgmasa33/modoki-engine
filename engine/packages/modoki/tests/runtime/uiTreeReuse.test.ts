@@ -38,7 +38,7 @@ const UI_DEFAULTS = {
   textColor: 0xffffff, textOpacity: 1, textAlign: 'left', lineHeight: 0, letterSpacing: 0,
   textShadowColor: 0, textShadowOpacity: 1, textShadowOffsetX: 0, textShadowOffsetY: 0, textShadowBlur: 0,
   textStrokeColor: 0, textStrokeOpacity: 1, textStrokeWidth: 0, textOverflow: 'clip', maxLines: 0,
-  imageSrc: '', imageMode: 'cover', elementType: 'div', placeholder: '',
+  imageSrc: '', imageMode: 'cover', imageAlign: 'center', elementType: 'div', placeholder: '',
   rangeMin: 0, rangeMax: 100, rangeStep: 1,
 };
 
@@ -507,5 +507,35 @@ describe('uiTreeStore rootFontFamily — the scene-wide default (#803)', () => {
 
     uiTreeProjection(makeWorldWithSettings(() => specs, { fontFamily: '', systemFont: '' }));
     expect(useUITreeStore.getState().rootFontFamily).toBe('');
+  });
+});
+
+/** `imageAlign` — the projection half of "a background keeps its bottom edge on a wide screen"
+ *  (wordweave #1341). UINode's test proves the style follows `node.imageAlign`; this proves the
+ *  trait value reaches the node at all, and that a live edit re-refs it so the style re-renders. */
+describe('uiTreeStore imageAlign', () => {
+  it('carries the authored value, and defaults a missing one to center', async () => {
+    const { uiTreeProjection, useUITreeStore } = await load();
+    uiTreeProjection(makeWorld(() => [
+      { id: 1, parentId: 0, ui: { imageAlign: 'bottom' } },
+      { id: 2, parentId: 0, sortOrder: 1, ui: { imageAlign: undefined } },
+    ]));
+    const [a, b] = useUITreeStore.getState().tree;
+    expect(a.imageAlign).toBe('bottom');
+    expect(b.imageAlign).toBe('center');
+  });
+
+  it('re-refs the node when imageAlign changes', async () => {
+    const specs: Spec[] = [{ id: 1, parentId: 0, ui: { imageAlign: 'center' } }];
+    const { uiTreeProjection, useUITreeStore, markUIDirty } = await load();
+    const world = makeWorld(() => specs);
+    uiTreeProjection(world);
+    const before = useUITreeStore.getState().tree[0];
+    specs[0] = { ...specs[0], ui: { imageAlign: 'top' } };
+    markUIDirty();
+    uiTreeProjection(world);
+    const after = useUITreeStore.getState().tree[0];
+    expect(after).not.toBe(before);
+    expect(after.imageAlign).toBe('top');
   });
 });

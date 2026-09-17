@@ -42,6 +42,14 @@ describe('UIVideoMount', () => {
     await pump();
     expect(hostOf(container).contains(el)).toBe(true);
     expect(el.style.objectFit).toBe('contain');
+    expect(el.style.objectPosition).toBe('center');
+  });
+
+  it('applies the position it is handed (UIElement.imageAlign), so a cropped video keeps that edge', async () => {
+    const { container } = render(<UIVideoMount entityId={7} fit="cover" position="center bottom" />);
+    await pump();
+    expect(hostOf(container).contains(el)).toBe(true);
+    expect(el.style.objectPosition).toBe('center bottom');
   });
 
   // #337 close-out: the SceneView editor's click arbiter (`isPaintOpaque`,

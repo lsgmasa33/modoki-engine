@@ -460,7 +460,11 @@ Field groups (representative fields, verified against `UIElement.ts`):
   names, a separator computed with `repeat`/`padStart` — nor engine code that passes game text
   through without a write marker; `tools/`, `editor/` and tests are out of scope.
 
-- **Image** — `imageSrc`, `imageMode` (`cover | contain | fill | none`).
+- **Image** — `imageSrc`, `imageMode` (`cover | contain | fill | none`), `imageAlign`
+  (`center | top | bottom | left | right`): which edge stays in view when the mode crops or
+  letterboxes. `cover` crops one axis only (top and bottom on a screen wider than the image, the
+  sides on a taller one), so `bottom` keeps a painting's foreground on a wide screen. It becomes CSS
+  `background-position` (`imageAlignPosition`, `traits/UIElement.ts`); an unknown value is `center`.
 - **Element type** — `elementType` (`div | input | range`) and `placeholder`. Most
   elements are `div`; `input` renders an `<input>` text field and `range` renders an
   `<input type="range">` slider (`rangeMin`/`rangeMax`/`rangeStep`).

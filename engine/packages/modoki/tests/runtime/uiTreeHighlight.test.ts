@@ -30,7 +30,7 @@ const UI_DEFAULTS = {
   textColor: 0x000000, textOpacity: 1, textAlign: 'center', lineHeight: 0, letterSpacing: 0,
   textShadowColor: 0, textShadowOpacity: 1, textShadowOffsetX: 0, textShadowOffsetY: 0, textShadowBlur: 0,
   textStrokeColor: 0, textStrokeOpacity: 1, textStrokeWidth: 0, textOverflow: 'clip', maxLines: 0,
-  imageSrc: '', imageMode: 'cover', elementType: 'div', placeholder: '',
+  imageSrc: '', imageMode: 'cover', imageAlign: 'center', elementType: 'div', placeholder: '',
   rangeMin: 0, rangeMax: 100, rangeStep: 1,
 };
 

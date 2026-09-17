@@ -1079,6 +1079,7 @@ export function registerAllTraits() {
       // ── Image section (collapsed by default) ──
       imageSrc: { type: 'string', accept: ['sprite'], tooltip: 'Image asset (GUID) — a sprite (a texture\'s whole-image sprite or a slice). Rendered as a CSS background. Drag a sprite here', ...S('Image', { sectionDefaultOpen: false }) },
       imageMode: { type: 'enum', options: ['cover', 'contain', 'fill', 'none'], tooltip: 'How the image fills the element', ...S('Image') },
+      imageAlign: { type: 'enum', options: ['center', 'top', 'bottom', 'left', 'right'], tooltip: 'Which edge of the image stays in view when imageMode crops it. cover crops top and bottom on a screen wider than the image, and the sides on a taller one: bottom keeps a painting\'s foreground, top its sky. Also applies to a video backdrop.', ...S('Image') },
 
       // ── Size Constraints section (collapsed by default) ──
       minWidth: { type: 'number', step: 1, tooltip: 'Minimum width, in minWidthUnit. 0 = none.\n⚠️ Defaults to px while width/height default to %.', ...S('Size Constraints', { sectionDefaultOpen: false }), sectionDivider: true },

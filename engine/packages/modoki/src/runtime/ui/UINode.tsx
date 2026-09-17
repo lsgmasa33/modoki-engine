@@ -32,6 +32,7 @@ import { shrinkWrapAlign, uiTextAnimation, ensureUITextAnimStyles } from './uiTe
 import { useFocusStore } from './focusManager';
 import { isTouchDevice } from '../core/formFactor';
 import { TOUCH_ATTR, TOUCH_OPACITY_ATTR } from '../traits/TouchControl';
+import { imageAlignPosition } from '../traits/UIElement';
 import { isViewportLengthUnit, viewportUnitVar } from '../traits/uiLength';
 import { UI_PAINT_ATTR } from './uiPaintMarker';
 import { UI_PRESS_ORIGIN_ATTR, UI_TAP_ZONE_ATTR, pressBelongsTo, clearPressOrigin } from './pressOrigin';
@@ -834,7 +835,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
         // Plain image (raw texture, or an atlas-packed sprite with no source dims).
         style.backgroundImage = `url(${imgUrl})`;
         style.backgroundSize = node.imageMode === 'fill' ? '100% 100%' : node.imageMode === 'none' ? 'auto' : node.imageMode;
-        style.backgroundPosition = 'center';
+        style.backgroundPosition = imageAlignPosition(node.imageAlign);
         style.backgroundRepeat = 'no-repeat';
       }
     }
@@ -1408,7 +1409,7 @@ function UINodeInner({ node, storeState, onSelectEntity, renderCanvas2D, uiVisua
   const videoLayer = node.hasVideo && UIVideoMount && !uiVisualsHidden
     ? (
       <Suspense fallback={null}>
-        <UIVideoMount entityId={node.entityId} fit={node.imageMode} priority={onSelectEntity ? 0 : 1} />
+        <UIVideoMount entityId={node.entityId} fit={node.imageMode} position={imageAlignPosition(node.imageAlign)} priority={onSelectEntity ? 0 : 1} />
       </Suspense>
     )
     : null;

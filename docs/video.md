@@ -19,7 +19,7 @@ entity's other traits**, not by a field on `VideoPlayer`:
 |---|---|
 | `Renderable3D` / `Renderable3DPrimitive` | a `THREE.VideoTexture` on the material's `map` — a screen in the world |
 | `Renderable2D` with `sprite` = the video GUID | the texture of a PixiJS sprite |
-| `RenderableUI` / `UIElement` | the element mounted **inside that UI node's box** (`UIVideoMount`), cropped by `imageMode` |
+| `RenderableUI` / `UIElement` | the element mounted **inside that UI node's box** (`UIVideoMount`), cropped by `imageMode` and aligned by `imageAlign` (`object-fit` / `object-position`) |
 | `timeMode: 'presentation'` **and no surface trait of its own** | a fullscreen DOM overlay above the game (`VideoOverlay`) |
 
 The UI row is what makes video usable as **scenery** — a full-bleed animated backdrop *behind*

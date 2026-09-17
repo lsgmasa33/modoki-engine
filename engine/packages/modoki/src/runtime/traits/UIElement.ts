@@ -6,6 +6,21 @@ import { UI_ELEMENT_LENGTHS as L, type UILengthUnit } from './uiLength';
 export type { UILengthUnit } from './uiLength';
 
 /** UIElement — consolidated UI trait: layout, style, text, and image. */
+/** `UIElement.imageAlign` — which edge of a cropped image stays in view. */
+export type ImageAlign = 'center' | 'top' | 'bottom' | 'left' | 'right';
+
+/** `imageAlign` as a CSS `background-position` / `object-position` value. Anything unknown is
+ *  `center`, so a stale or hand-typed value renders the way it always did. */
+export function imageAlignPosition(align: string | undefined): string {
+  switch (align) {
+    case 'top': return 'center top';
+    case 'bottom': return 'center bottom';
+    case 'left': return 'left center';
+    case 'right': return 'right center';
+    default: return 'center';
+  }
+}
+
 export const UIElement = trait({
   // ── Layout ──
   /** ⚠️ **Pinned on a pooled `UIEntries` row root — authoring `width`/`height` there does
@@ -476,6 +491,10 @@ export const UIElement = trait({
   // ── Image ──
   imageSrc: '' as string,
   imageMode: 'cover' as 'cover' | 'contain' | 'fill' | 'none',
+  /** Which edge of the image stays in view when `imageMode` crops or letterboxes it. `cover` crops
+   *  one axis only (top and bottom on a screen wider than the image, the sides on a taller one), so
+   *  `bottom` keeps a painting's foreground and `top` its sky. Also applied to a video backdrop. */
+  imageAlign: 'center' as ImageAlign,
 
   // ── Element type ──
   elementType: 'div' as 'div' | 'input' | 'range',

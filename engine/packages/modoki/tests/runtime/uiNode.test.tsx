@@ -47,11 +47,12 @@ vi.mock('../../src/runtime/rendering/Canvas2DMount', () => ({
 vi.mock('../../src/runtime/video/UIVideoMount', () => ({
   // Surfaces `fit` and `priority` so the game-outranks-the-authoring-viewport rule is
   // assertable from the CALL SITE — UIVideoMount's own tests can only see what it is handed.
-  UIVideoMount: ({ entityId, fit, priority }: { entityId: number; fit?: string; priority?: number }) =>
+  UIVideoMount: ({ entityId, fit, position, priority }: { entityId: number; fit?: string; position?: string; priority?: number }) =>
     React.createElement('div', {
       'data-testid': 'uivideomount',
       'data-entity-id': entityId,
       'data-fit': fit,
+      'data-position': position,
       'data-priority': String(priority),
     }),
 }));
@@ -101,7 +102,7 @@ function makeNode(over: Partial<UINodeData> = {}): UINodeData {
     textColor: 0xffffff, textOpacity: 1, textAlign: 'left', lineHeight: 0, letterSpacing: 0, letterSpacingUnit: 'px',
     textShadowColor: 0, textShadowOpacity: 1, textShadowOffsetX: 0, textShadowOffsetY: 0, textShadowBlur: 0,
     textStrokeColor: 0, textStrokeOpacity: 1, textStrokeWidth: 0, textOverflow: 'clip', maxLines: 0,
-    imageSrc: '', imageMode: 'cover', imageEpoch: 0, hasVideo: false, elementType: 'div', placeholder: '',
+    imageSrc: '', imageMode: 'cover', imageAlign: 'center', imageEpoch: 0, hasVideo: false, elementType: 'div', placeholder: '',
     rangeMin: 0, rangeMax: 100, rangeStep: 1,
     children: [],
     ...over,
@@ -916,6 +917,17 @@ describe('UINode image path (F3)', () => {
     expect(renderNode(makeNode({ imageSrc: 'g', imageMode: 'cover' })).style.backgroundSize).toBe('cover');
   });
 
+  it('backgroundPosition follows imageAlign — the edge a cropped image keeps; unknown stays centred', () => {
+    const pos = (imageAlign: string) => renderNode(makeNode({ imageSrc: 'g', imageMode: 'cover', imageAlign })).style.backgroundPosition;
+    expect(pos('bottom')).toBe('center bottom');
+    expect(pos('top')).toBe('center top');
+    expect(pos('left')).toBe('left center');
+    expect(pos('right')).toBe('right center');
+    // jsdom normalises a bare `center` to its two-value form.
+    expect(pos('center')).toBe('center center');
+    expect(pos('sideways')).toBe('center center');
+  });
+
   it('skips the background when resolveDomImageUrl returns nothing (unresolved guid)', () => {
     h.resolveDomImageUrl.mockReturnValueOnce(undefined as unknown as string);
     const el = renderNode(makeNode({ imageSrc: 'missing' }));
@@ -1532,11 +1544,12 @@ describe('UINode canvas2D branch', () => {
   // ── Video in a UI node ──────────────────────────────────────────────────────────────
   // The other half of the `hasVideo` seam (uiTreeReuse.test.ts drives the projection half).
   it('mounts the video into the node box when hasVideo, carrying imageMode as the fit', async () => {
-    const node = makeNode({ entityId: 21, hasVideo: true, imageMode: 'contain' });
+    const node = makeNode({ entityId: 21, hasVideo: true, imageMode: 'contain', imageAlign: 'bottom' });
     const { findByTestId } = render(<UINode node={node} storeState={{}} />);
     const mount = await findByTestId('uivideomount');
     expect(mount.getAttribute('data-entity-id')).toBe('21');
     expect(mount.getAttribute('data-fit')).toBe('contain');
+    expect(mount.getAttribute('data-position')).toBe('center bottom');
   });
 
   it('mounts the video from the Canvas2D branch too (a separate early return)', async () => {
