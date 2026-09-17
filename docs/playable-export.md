@@ -108,6 +108,15 @@ unreferenced either.
   but dropping a referenced asset can be deliberate (a decorative model an ad does not need), so
   it is a warning. `unreachableRefs`, the mechanism that would otherwise catch it, is computed
   before the drop on purpose and is blind to it.
+  - ⚠️ **For a dropped AUDIO clip, "resolves to nothing" is not enough on its own.** An autoplaying
+    `AudioSource` whose clip is missing is retried EVERY frame for the life of the ad
+    (`audioSystem`'s `unresolved` path warns once and keeps trying), so the game must also remove
+    that source on the playable build. Worked example: wordweave (#1350) drops its music beds with
+    a `music-*.mp3` glob and strips its music-bus source at GAME priority when `__MODOKI_PLAYABLE__`
+    is set ([wordweave audio-haptics.md](../games/wordweave/docs/audio-haptics.md) § "The playable has no music"). The scene's
+    `resources` preload still names the dropped clips, so the build prints the `still references it
+    by guid` warning above once per clip, and the ad logs one `[AudioCache] Unknown asset guid`
+    warning per clip at load. Both are expected, and neither can be removed from the game side.
 - ⚠️ **`keep` is transitive; `drop` is NOT.** A keep-list entry is WALKED — listing a prefab pulls
   its meshes, materials and textures in with it — while a drop removes exactly the path it names.
   "Drop the level index and its levels go too" is the natural wrong assumption; list each file.

@@ -145,9 +145,10 @@ try {
     const s = await bootState(page);
     ok('1a self-extracts (__PLAYABLE_ASSETS__ populated)', s.assets >= 6, `${s.assets} assets`);
     // ⚠️ Conditional on the PROJECT having audio, not asserted unconditionally. It was written for
-    // space-invader, which ships clips; games/wordweave (#934) ships none at all — no audio assets,
-    // no `AudioSource` in its scene — so a bare `>= 1` reported a FAILING smoke for a correct
-    // artifact. A check that a second project cannot pass is a check about the first project.
+    // space-invader, which ships clips; when #934 added games/wordweave it shipped none at all — no
+    // audio assets, no `AudioSource` in its scene — so a bare `>= 1` reported a FAILING smoke for a
+    // correct artifact. (Wordweave has clips now, and its playable inlines the sound effects
+    // only — #1350 drops the music — so it takes the `>= 1` branch today.) A check that a second project cannot pass is a check about the first project.
     // The expectation is derived from the source tree, so a game that HAS audio and inlines none
     // still fails, which is the regression this exists to catch.
     if (projectHasAudio) {
