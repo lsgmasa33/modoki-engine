@@ -66,6 +66,19 @@ describe('assertNoPathRefs — full-coverage ref walk (F8)', () => {
     expect(flaggedWith('Environment.hdrPath')).toBe(true);
   });
 
+  // #1358: the serializer writes a path-keyed `nestedStructure` whose `added[]` nodes carry trait
+  // refs. Without this case the two `flagNestedStructure` calls could be deleted and the whole suite
+  // stayed green — the #53 literal-path tripwire was inert on the one slot the serializer had just
+  // started writing.
+  // Mutation: drop `flagNestedStructure(entry.nestedStructure, 'nestedStructure')` in serialize.ts.
+  it('flags a path ref inside a path-keyed nestedStructure added node', () => {
+    assertNoPathRefs({ ...base(), nestedStructure: { '4': { added: [{
+      parentLocalId: 2, guid: 'g', name: 'n', children: [],
+      traits: { Environment: { hdrPath: STRAY } },
+    }] } } });
+    expect(flaggedWith('Environment.hdrPath')).toBe(true);
+  });
+
   it('stays silent when every ref is a GUID', () => {
     assertNoPathRefs({
       ...base(),

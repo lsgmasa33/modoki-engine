@@ -161,10 +161,11 @@ Algorithm:
      children to fill `AddedEntity.children`, anchor with `parentLocalId = localId of
      its (member) parent`;
    - an **owned** nested instance (a self-rooted `PrefabInstance` that expanded from
-     THIS prefab's definition — its `parentLocalId` is set, or it matches a prefab
-     `prefab` row) → **skip** (it round-trips via the prefab row / `nestedOverrides`);
-   - a **user-added** nested instance (self-rooted `PrefabInstance`, `parentLocalId`
-     0, no matching prefab row) → capture as a **reference node** (`captureInstanceReference`),
+     THIS prefab's definition — it **claimed** one of the prefab's `prefab` rows, see
+     [Which instance is a row's own](#which-instance-is-a-rows-own-expansion)) →
+     **skip** (it round-trips via the prefab row / `nestedOverrides`);
+   - a **user-added** nested instance (self-rooted `PrefabInstance` that claimed no
+     row) → capture as a **reference node** (`captureInstanceReference`),
      storing its source + overrides/structure. See below.
    Don't recurse into members.
 
@@ -301,9 +302,8 @@ rather than a flat trait snapshot. This preserves its exact parent placement acr
 save/reload (it was previously dropped, then briefly re-anchored to the scene root):
 
 - **Owned vs user-added.** `captureInstanceStructure` distinguishes the two via
-  `nestedRootKind`: a nested instance with `PrefabInstance.parentLocalId > 0` (or
-  whose `(anchor member, source)` matches one of the parent prefab's own `prefab`
-  rows) is **owned** and skipped; otherwise it's **user-added** and captured.
+  `nestedRootKind`, which reads a per-row **claim** — see
+  [Which instance is a row's own](#which-instance-is-a-rows-own-expansion).
 - **Capture.** `captureInstanceReference(nestedRoot, source, childPrefab)` yields the
   node's `overrides` + `added`/`removed`/`removedTraits`; the nested instance's whole
   live id set is folded into `consumedEcsIds` so serialize skips it.
@@ -314,7 +314,10 @@ save/reload (it was previously dropped, then briefly re-anchored to the scene ro
   prefab** as a nested instance under the anchor — `instantiatePrefab(child, anchor)`
   / `instantiatePrefabIntoWorld(world, child, anchor, …)` — replaying its
   overrides/structure. The spawned root keeps `parentLocalId 0`, so the next capture
-  re-detects it as user-added (idempotent round-trip).
+  re-detects it as user-added — **idempotent, unless a row of the same prefab at the
+  same member has no live claimant**, in which case the unstamped root is taken for
+  that row's legacy expansion and the reference node is lost. That ambiguity is
+  #1367; see the note at the end of the section below.
 - **Resources.** `collectResourceRefsFromEntities` surfaces `added[].prefab` and
   recurses a reference node's own `added`, so `SceneManager` acquires the child
   prefab (and its transitive refs) at load.
@@ -327,6 +330,116 @@ save/reload (it was previously dropped, then briefly re-anchored to the scene ro
   a user-added instance nested inside another is captured (and expanded) recursively.
   `serializePrefab`'s nested-row loop skips an instance already folded into a parent
   reference node (`skip.has(e.id)`), so it is never double-emitted.
+
+## The scene's structural channel into a nested instance (`nestedStructure`)
+
+A scene could always override a nested instance's **values** by row path (`nestedOverrides`), but
+until #1358 it had no channel for that instance's **structure**. `serializeScene` ran
+`captureInstanceStructure` only for TOP-LEVEL instances; a row's own expansion got a per-field value
+delta and nothing else. So a member deleted inside it came back on the next load, and a member
+dragged out of it existed at **both** places — two entities holding one guid.
+
+`nestedStructure` is the sibling slot, on a scene entry, an added reference node and a prefab row,
+keyed by the same path grammar (`nestedPathKey`):
+
+```ts
+nestedStructure?: Record<string /* "4", "4.7" */, {
+  added?: AddedEntity[]; removed?: number[]; removedTraits?: Record<number, string[]>;
+}>
+```
+
+- **Once the scene addresses a path it OWNS the interior** — all three lists come from the slot, and
+  an absent one reads as **empty**, not as "fall back to the row". Per-field fallback makes *"the
+  row's own list no longer applies"* unrepresentable: deleting the last member of a row-authored
+  `added` wrote `{"4": {}}`, the loader fell back to the row, and the member came back on reload
+  (with the save alternating between the two shapes forever).
+- **Skipped only when both sides are empty** — the live interior AND what the prefab chain applies.
+  That absence is what lets a member added to the inner prefab later still reach an untouched
+  instance. A row that authors its own structure is therefore always restated by the scene; that
+  asymmetry is deliberate and follows from the previous point.
+  ⚠️ The first cut instead compared the live capture against the file-authored baseline and wrote
+  only the differing fields. Those two documents are **not comparable** — `snapshotAddedTraits`
+  compacts schema-default fields and carries a live `parentId`, the baseline is whatever the prefab
+  file holds — so "equal" was unreachable for any row with authored structure: the slot was written
+  on a no-op save, baking a live ECS id into the scene file and freezing the instance, which is the
+  one thing the gate existed to prevent.
+- **Scene format v14.** Purely additive, so `migrateV13toV14` only stamps. The bump is still
+  required: Scene's disposition is REFUSE, so an older build must refuse a v14 document rather than
+  read it, ignore the key it does not know, and drop it on the next save — the exact loss this fixes.
+
+⚠️ **THREE resource-ref walkers must know about this slot, and they are in three files.** An
+`added[]` node inside `nestedStructure` carries `prefab` and trait asset refs exactly like a
+top-level one, so a walker that misses it produces a ref the BUILD cannot see: the asset is dropped
+from the production bundle and it fails only once shipped (#53's class). Extending one and not the
+others is invisible to a round-trip test, because the refs resolve fine from a warm editor cache.
+
+| walker | file | what it feeds |
+|---|---|---|
+| `assertNoPathRefs` + the `flag*` scanner | `editor/scene/serialize.ts` | the scene's `resources[]`, and the literal-path tripwire |
+| `collectResourceRefsFromEntities` | `runtime/loaders/loadSceneFile.ts` | `SceneManager` at load |
+| `walkCarrier` | `plugins/asset-tree-shaker.ts` | the production build |
+
+The third one is the expensive one to miss, and its own docblock asserts parity with the second: for
+a document with no `resources[]` an unqueued ref reaches `vite-asset-scanner`'s guid check and
+**fails the build** on legitimate authoring.
+
+⚠️ **Only a SCENE writes this slot.** A prefab row and an added reference node do **not** carry it —
+declarations for both existed during #1358 and were removed because nothing wrote them, and
+`prefabEdit.ts` would have stripped a hand-authored one on a prefab-edit round trip. The consequence
+is #1369: an owned nested instance inside a *user-added* nested instance still has no channel, so a
+delete there comes back. Implementing that means adding the field and its writer in the same change.
+
+⚠️ **`onInstantiatePrefab` carries it as its LAST argument**, not beside `nestedOverrides` where it
+belongs logically. Those arguments are positional and five implementors read them by position
+(`SceneManager` plus four test harnesses), so inserting would silently shift `rootGuid` and
+`rootEditorFolder` in any implementor not updated in the same change. Threading the recursion alone
+is not enough — the save looks correct while nothing applies it.
+
+## Which instance is a row's own expansion
+
+A nested-prefab row expands to **exactly one** instance, so "owned" is a property of the
+*row*, not a test you can run on a node in isolation. `captureInstanceStructure` therefore
+**partitions**: it assigns each row at most one claimant and treats every other instance at
+that anchor as independent (#1354).
+
+- **Candidates** are the self-rooted `PrefabInstance`s directly under a member of this
+  instance — the only place a row of this prefab can expand. Sorted by ecsId, so the
+  assignment is deterministic rather than dependent on world-query order.
+- **Pass 1** — a candidate whose `PrefabInstance.parentLocalId` names a row *at its own
+  anchor* claims that row. This is the signal the loader writes as each row expands.
+- **Pass 2** — an **unstamped** candidate (legacy data, written before the stamp existed)
+  may claim any row at its anchor that pass 1 left free.
+- Everything unclaimed is `'userAdded'` and rides as a reference node.
+
+Two consumers must read that one claim map rather than re-deriving it, and both did
+re-derive it before #1354:
+
+- **`nestedRowPresent`**, which decides whether a row goes into `removed[]`. Before, it
+  ran its own `(source, stamp)` scan, so a row could be reported present while the
+  classifier had already given it to someone else.
+- **`serializeScene`'s pre-pass**, which routes an instance to `nestedOverrides` (owned) or
+  leaves it to the structural capture (user-added). It cannot load the owning prefab's rows
+  at that point, so it splits provisionally on `parentLocalId > 0` and is **reconciled**
+  against `InstanceStructure.ownedNested` once the prefab is loaded. ⚠️ Without that
+  reconcile the two disagree, and an instance both of them disown is written **nowhere** —
+  no reference node and no `nestedOverrides` entry. Reachable in four editor steps:
+  duplicate an owned nested instance, edit the copy, delete the source, save.
+
+**Duplicating an owned nested root produces an independent instance, saved separately**
+(owner ruling, 2026-09-18). `clearOwnedNestedStampFromSnapshot` clears the copy's row stamp
+at both duplicate seams, so the copy is independent by intent rather than because the source
+happened to claim the row first — and, because it cannot then form a same-stamp pair, the
+double-write that a non-claiming *stamped* candidate would otherwise produce stays
+unreachable.
+
+⚠️ **Known gap — pass 2 cannot tell a legacy row expansion from a user-added instance.**
+Both are unstamped, so where a row at that anchor has no claimant, pass 2 takes the
+user-added instance for the row's expansion and its reference node is dropped. Presence is
+deliberately lenient in the other direction (an ambiguous row is never written into
+`removed[]`, because being wrong there *deletes* it on reload), which is why the deletion of
+a row's own expansion can resurrect on the next save when a user-added sibling of the same
+prefab is present. Fixing it needs a positive discriminator — the derived-vs-stored root
+guid is the candidate — and is tracked as #1367.
 
 ## Edge cases
 

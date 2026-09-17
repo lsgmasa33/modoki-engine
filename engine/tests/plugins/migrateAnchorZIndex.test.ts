@@ -24,7 +24,17 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 
+import { SCENE_FORMAT_VERSION } from '../../packages/modoki/src/runtime/core/version';
+import { PREFAB_FORMAT_VERSION } from '../../packages/modoki/src/editor/scene/prefab';
+
 const REAL_SCRIPTS_DIR = path.resolve(__dirname, '../../scripts');
+const REAL_REPO_ROOT = path.resolve(__dirname, '../../..');
+/** Every engine source the script regex-reads a format version out of. Add one here the day the
+ *  script reads another, or its tests die with ENOENT rather than a useful message. */
+const CONSTANT_SOURCES = [
+  path.join('engine', 'packages', 'modoki', 'src', 'runtime', 'core', 'version.ts'),
+  path.join('engine', 'packages', 'modoki', 'src', 'editor', 'scene', 'prefab.ts'),
+];
 
 /** Whether this filesystem collapses two paths differing only in case onto the same file —
  *  macOS (APFS default) and Windows do; Linux ext4 does not. Tests 2 and 4 reproduce a defect
@@ -60,6 +70,16 @@ function makeRepo({ gitInit = true } = {}) {
   const dir = makeScratchDir('modoki-migrate-anchor-');
   fs.mkdirSync(path.join(dir, 'engine'), { recursive: true });
   fs.cpSync(REAL_SCRIPTS_DIR, path.join(dir, 'engine', 'scripts'), { recursive: true });
+  // The script READS both format versions out of the engine source rather than hardcoding them (it
+  // STAMPS the version it believes in, so a stale literal silently downgrades every file it
+  // rewrites — the SCENE one sat at 13 through the v14 bump, and the PREFAB one was left hardcoded
+  // in the same function, #1358/#1362). So the throwaway repo carries those files: copied from the
+  // real ones, not stubbed with literals, or this harness becomes the second copy of the constants
+  // and the same drift comes back one level out.
+  for (const rel of CONSTANT_SOURCES) {
+    fs.mkdirSync(path.join(dir, path.dirname(rel)), { recursive: true });
+    fs.copyFileSync(path.join(REAL_REPO_ROOT, rel), path.join(dir, rel));
+  }
   if (gitInit) {
     git(dir, ['init', '-q']);
     git(dir, ['config', 'user.email', 'test@example.com']);
@@ -119,9 +139,25 @@ describe('migrate-anchor-zindex (end-to-end, throwaway repo)', () => {
     expect(out).toMatch(/1 UIAnchor\.zIndex key\(s\) in 1 file\(s\) rewritten/);
 
     const after = readJson(file);
-    expect(after.version).toBe(13);
+    expect(after.version).toBe(SCENE_FORMAT_VERSION); // not a literal: the script stamps this constant
     expect(after.entities[0].traits.UIElement.zIndex).toBe(5);
     expect(after.entities[0].traits.UIAnchor).not.toHaveProperty('zIndex');
+  });
+
+  // ⚠️ The script stamps a PREFAB version too, and nothing asserted it — so the hardcoded
+  // `PREFAB_FORMAT_VERSION = 3` survived the same close-out that unpinned the scene one, and a
+  // future prefab bump would have been silently stamped back to 3 by every run (#1362 review).
+  it('stamps the PREFAB format version on a .prefab.json, from the constant', () => {
+    tmp = makeRepo();
+    const file = writeJson(tmp, 'games/x/runtime/assets/prefabs/p.prefab.json', sceneWithAnchorZIndex(7));
+
+    const out = run(tmp, ['--write']);
+    expect(out).toMatch(/1 UIAnchor\.zIndex key\(s\) in 1 file\(s\) rewritten/);
+
+    const after = readJson(file);
+    expect(after.version).toBe(PREFAB_FORMAT_VERSION);
+    expect(after.version).not.toBe(SCENE_FORMAT_VERSION); // the two are distinct on purpose
+    expect(after.entities[0].traits.UIElement.zIndex).toBe(7);
   });
 
   it('dry-run (no --write) reports the same count and writes nothing', () => {

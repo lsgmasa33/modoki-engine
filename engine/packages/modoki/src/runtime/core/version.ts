@@ -40,7 +40,16 @@ export const ENGINE_VERSION = '0.1.0';
 // A truthy `UIAnchor.zIndex` is migrated onto `UIElement.zIndex` (anchor wins,
 // since that's what rendered before); the anchor field is then dropped
 // unconditionally.
-export const SCENE_FORMAT_VERSION = 13;
+// v14: no-op passthrough — adds an optional path-keyed `nestedStructure` beside
+// `nestedOverrides` on a prefab-instance entry, an added reference node and a
+// prefab row, carrying STRUCTURAL edits made inside a nested instance that
+// expanded from a row (#1358). No existing field changes shape and no file
+// carries the key yet, so there is nothing to migrate.
+// ⚠️ The bump is still required. Scene's disposition is REFUSE
+// (docs/format-versioning.md), so an OLDER build must refuse a v14 scene rather
+// than read it, silently ignore the new key and drop it on the next save — which
+// is the exact data loss #1358 fixes.
+export const SCENE_FORMAT_VERSION = 14;
 
 // The runtime ABI a dynamically-loaded OTA sub-game module is built against (OTA Phase 4,
 // docs/ota-subgame-modules.md). A sub-game bundle stamps this value in at build time

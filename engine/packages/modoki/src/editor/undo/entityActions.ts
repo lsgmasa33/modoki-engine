@@ -460,6 +460,37 @@ export function stripPrefabInstanceFromSnapshot(snapshot: EntitySnapshot): Entit
   };
 }
 
+/** Clear an OWNED nested instance root's row stamp on a COPY, so the copy is an independent
+ *  nested instance rather than a second claimant of the same prefab row.
+ *
+ *  An owned nested instance is one that expanded from its outer prefab's nested-prefab ROW; the
+ *  loader records which row by stamping `PrefabInstance.parentLocalId`. `respawnFromSnapshot` copies
+ *  traits verbatim, so without this the copy carries the SAME stamp: `captureInstanceStructure`
+ *  then had two nodes claiming one row, both serialized into that row's `nestedOverrides`, and the
+ *  later one won — the source instance was gone after a reload (#1354).
+ *
+ *  The ruling (owner, 2026-09-18): duplicating a nested instance produces an independent instance
+ *  that is saved separately — not a refused duplicate. Cleared to 0, the copy takes the `added[]`
+ *  reference-node path, which already round-trips its overrides AND its structure.
+ *
+ *  Only the ROOT's stamp is cleared: `parentLocalId` is meaningless on a non-root member, and the
+ *  copy's members keep their own linkage (`respawnFromSnapshot` re-points `rootInstanceId` at the
+ *  copy). A no-op on anything that is not a stamped instance root, so both duplicate seams can call
+ *  it unconditionally for the 'root' case. */
+export function clearOwnedNestedStampFromSnapshot(snapshot: EntitySnapshot): EntitySnapshot {
+  return {
+    ...snapshot,
+    traits: snapshot.traits.map((t) => {
+      if (t.meta.name !== 'PrefabInstance' || t.data === true) return t;
+      const data = t.data as Record<string, unknown>;
+      if (!((data.parentLocalId as number) || 0)) return t;
+      // New object rather than a mutation: the snapshot is retained by the undo entry and replayed
+      // on redo, so mutating it in place would edit the recorded action too.
+      return { ...t, data: { ...data, parentLocalId: 0 } };
+    }),
+  };
+}
+
 /** Rebuild a snapshot's subtree under `newParentId`; returns the new root id. Every entity gets a
  *  fresh ECS id, so a numeric entity reference held INSIDE the subtree (a registry field flagged
  *  `entityId` — `PrefabInstance.rootInstanceId`) is carried from the old id to the new one after the
@@ -648,6 +679,8 @@ export function duplicateEntity(
   // guid-keyed logic (prefab "+added.<guid>" override keys, selection restore).
   let snapshot = regenerateSnapshotGuids(captured);
   if (prefabKind === 'member') snapshot = stripPrefabInstanceFromSnapshot(snapshot);
+  // A copy of an owned nested instance root becomes an INDEPENDENT instance (#1354, owner ruling).
+  else if (prefabKind === 'root') snapshot = clearOwnedNestedStampFromSnapshot(snapshot);
   // Duplicate into the same parent as the original.
   const attrMeta = getAllTraits().find(m => m.name === 'EntityAttributes');
   const attrData = attrMeta ? readTraitData(entityId, attrMeta) : null;

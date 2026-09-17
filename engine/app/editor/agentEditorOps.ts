@@ -69,6 +69,7 @@ import {
   type DevicePreset, type Orientation,
   type PrefabFile,
   causeSpecs, flushParked, getModeOwner, onAuthoringSettled, isWorldReplacementInFlight, refreshPrefabSourceForPath,
+  dirtyAssetEditorHolds,
 } from '@modoki/engine/editor';
 import { tailWithCounts, takeTail, takeHead, tailHint, JOURNAL_TAIL_DEFAULT, EDITOR_JOURNAL_TAIL_DEFAULT } from '../debug/streamSummary';
 import {
@@ -360,7 +361,14 @@ function readEditorState() {
     // what to read before calling them; `editingSkinAsset` below names an asset, not a showing panel.
     // Only editors SHOWING an asset are listed — a panel mounted with nothing loaded is left out,
     // so `'skin' in openEditors` agrees with what `requireEditorOpen('skin')` accepts.
-    openEditors: Object.fromEntries(Object.entries(s.editorMounts).filter(([, m]) => m?.path != null).map(([k, m]) => [k, m!.path])),
+    // ⚠️ A DIRTY editor reports `{path, dirty:true}` rather than a bare path (#1362). Without it the
+    // diagnostic picture after the fix was the same one that made the bug invisible: a move refused
+    // with 423 HELD_BY_ASSET_EDITOR and nothing on this surface could confirm the hold, because
+    // `openAssetEditor` is not an `unsavedChangeCauses()` cause so `unsavedChanges` stays false.
+    // A clean editor keeps the plain-string shape every existing reader expects.
+    openEditors: Object.fromEntries(Object.entries(s.editorMounts)
+      .filter(([, m]) => m?.path != null)
+      .map(([k, m]) => [k, m!.dirty ? { path: m!.path, dirty: true } : m!.path])),
     // Which .rig2d.json is open in the Skin editor (null = none), and which of its three
     // modes (rig/parts/weights) is active — 'parts' hides every `skin:bone:*` handle. Set
     // with `open-skin-editor` / `set-skin-mode` (#373).
@@ -3450,11 +3458,15 @@ export function registerEditorAgentOps(): void {
    *
    *  This is the vocabulary the Node side speaks; `CAUSE_REGISTRY` below is what ties it to the
    *  renderer's own accounting so the two cannot drift. */
-  type UnsavedRegistry = 'dirtyAsset' | 'pendingMeta' | 'pendingBaseScene' | 'liveScene';
-  /** ⚠️ `liveScene` is absent BY TYPE, not by a runtime check — see the op's header. */
-  type DiscardableRegistry = Exclude<UnsavedRegistry, 'liveScene'>;
+  type UnsavedRegistry = 'dirtyAsset' | 'pendingMeta' | 'pendingBaseScene' | 'liveScene' | 'openAssetEditor';
+  /** ⚠️ `liveScene` is absent BY TYPE, not by a runtime check — see the op's header. So is
+   *  `openAssetEditor` (#1362): there is nothing to discard, because the Sprite and 9-slice editors
+   *  hold their edits in component state with Save and Cancel as the only exits (owner,
+   *  2026-08-18). A discard here could only mean "throw the modal's work away", which is the
+   *  behaviour the move refusal exists to prevent. */
+  type DiscardableRegistry = Exclude<UnsavedRegistry, 'liveScene' | 'openAssetEditor'>;
   const ALL_REGISTRIES: readonly UnsavedRegistry[] =
-    ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene'];
+    ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene', 'openAssetEditor'];
 
   /** Reported as the `path` of a dirty live world that has no file — a never-saved scene, or a
    *  prefab-edit world whose guid resolves to no manifest entry. Deliberately NOT a path shape: a
@@ -3785,6 +3797,18 @@ export function registerEditorAgentOps(): void {
         // and an empty string is falsy. Branching on the value would silently drop those rows.
         const detail = CAUSE_HOLDS[cause](path, causes, { dirtyWorld });
         if (detail !== null) push(path, registry, detail);
+      }
+    }
+
+    // ⚠️ `openAssetEditor` is deliberately NOT a row in `CAUSE_REGISTRY`: it is not one of
+    // `unsavedChangeCauses()`'s causes, because the Sprite and 9-slice editors park nothing and the
+    // fact lives only in their mount entry (#1362). That is why it is filled in here rather than by
+    // the cause walk above — and why it is absent from `DISCARDERS`: there is nothing to discard,
+    // the only ways out of those modals are Save and Cancel (owner, 2026-08-18).
+    if (asked.has('openAssetEditor')) {
+      for (const { kind, path: held } of dirtyAssetEditorHolds()) {
+        const matches = global || list.some((p) => p === held || held.startsWith(`${p}/`));
+        if (matches) push(held, 'openAssetEditor', `unsaved edits in the open ${kind} editor`);
       }
     }
 

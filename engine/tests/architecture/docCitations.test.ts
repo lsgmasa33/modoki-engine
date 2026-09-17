@@ -1394,6 +1394,18 @@ const SOURCE_CITATION_EXEMPT: ReadonlyArray<{ item: string; reason: string }> = 
   // --- A worked example, not a pointer.
   { item: 'docs/bundle-new-tools.md::scripts/stage-foo.cjs',
     reason: 'bundle-new-tools.md: placeholder name in a how-to template' },
+
+  // --- A bare MODULE SPECIFIER inside a code block, not a path into this repo.
+  {
+    item: 'tools-scratch/three-r185-mrt/gtao-r186-gather-DRAFT.md::three/addons/tsl/display/GTAONode.js',
+    reason: 'an `import { ao } from \'three/addons/tsl/display/GTAONode.js\'` line inside the '
+      + 'runnable reproduction an upstream reader pastes — a specifier three\'s own package `exports` '
+      + 'resolves, not a file in this tree. It also names an r186 file deliberately: the repo is '
+      + 'pinned BELOW r186 (threeVersionCeiling), and the report is about a regression in that '
+      + 'release, so the path must never resolve here. Repointing it at the installed r185 copy '
+      + 'would make the reproduction stop reproducing. Exactly one occurrence repo-wide — a SECOND '
+      + 'doc growing this shape is worth asking whether rule 2 should skip bare specifiers instead.',
+  },
 ];
 
 /** Does an exclusion-ledger `path` cover `relFile`? Three shapes, and nothing else: an exact path; a

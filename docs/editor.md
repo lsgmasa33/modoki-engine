@@ -583,6 +583,84 @@ question the person in front of it was actually asking.
 
 ---
 
+## Asset editors and the move gate (#1362)
+
+Seven asset editors, split by how they are mounted — and the split decides what a MOVE of the asset
+does to them:
+
+- **Five are dockable panels** (Particle, Animation, Timeline, SpriteAnim, Skin), bound by a store
+  field and listed in `ASSET_EDITOR_BINDINGS_BY_FIELD`. `applyAssetPathMoves` **re-points** them
+  through `remapEditingAssetPath`, so a move is invisible to them.
+- **Two are modals owned by a path-keyed view** — the Sprite Editor and the 9-slice editor, rendered
+  inside `<AssetInspector key={selectedAsset.path}>`. That key is deliberate: it remounts the view on
+  an asset SWITCH so no per-asset document is reused across one (#891/#897), and it is what makes a
+  texture *swap* safe (#1328, pinned by `editor-texture-modal-swap.spec.ts`).
+
+A move/rename changes the same path, so it **unmounted those two modals and destroyed their unsaved
+work**. Observed live, 2026-09-18: Sprite Editor open and re-sliced 4 → 8 slices, one
+`modoki_move_asset`, and the modal was gone — no Save, no Cancel, no prompt, `openEditors` empty,
+and `unsavedChanges` still **false**.
+
+**A move of an asset a texture editor holds unsaved edits on is REFUSED** (owner, 2026-09-18). The
+alternative — let the move through and re-point the modal — was rejected: `SpriteEditor` documents,
+and leans on in several places, that its `path` never changes for a mounted instance (its meta-load
+effect would reload from disk straight over the unsaved slices), and refusing keeps the rule the
+owner set for these dialogs on 2026-08-18, quoted in both files — *Cancel and Save are the only
+exits*. A move that survived it would be a third exit.
+
+How it is wired, and why in that order:
+
+- **`AssetEditorMount.dirty`**, published by both modals, is the **only** thing that knows. They park
+  nothing in `dirtyAsset`/`pendingMeta`, so every gate that reads those registries is blind to them.
+- The Sprite Editor compares a **digest of what a save would write**
+  (`spriteSheetDigest`, a `.ts` module beside the panel), not the slice guid list: dragging a slice's
+  edge changes its rect and keeps its guid, so a guid-keyed check reports clean for exactly the edit
+  a human most likely just made. A successful save becomes the new baseline.
+- **`openAssetEditor`** is a registry on the `resolve-unsaved` probe, so `/api/move-file` can refuse
+  with `409 HELD_BY_ASSET_EDITOR`. It is deliberately **not** a `CAUSE_REGISTRY` row (it is not one
+  of `unsavedChangeCauses()`' causes) and is excluded from `DiscardableRegistry` **by type** — a
+  discard could only mean "throw the modal's work away", which is what the refusal prevents.
+- ⚠️ It is also **not** in `DOCUMENT_UNSAVED_REGISTRIES`, which is what the stale-read disclosures
+  (`/api/validate-prefab`, `/api/scene-mutate`) ask for. A dirty Sprite Editor does not make a prefab
+  read stale, and on `scene-mutate` — which refuses on a hold — asking for everything would have
+  blocked scene edits because a texture modal was open somewhere.
+- **`setEditorMount` compares `dirty`.** It dedups on `{path, slices}` to keep `select-sprite-slice`
+  from churning, and leaving `dirty` out of that comparison made the whole mechanism inert: the
+  9-slice editor (no `slices`, and a path that never changes for a mounted instance) could never
+  register a hold, and the Sprite Editor's hold decayed to "the guid list changed" — the very
+  substitute the digest exists to replace. It looked like it worked because the live repro re-sliced
+  4 → 8, one of the few edits that does change the guid list.
+- **The refusal is `423`, not `409`.** `COLLISION_STATUS` is 409 and `undoFailure.ts` reads it as
+  `userFixable`, so an undo refused by this gate toasted *"something already exists at the original
+  path"* — false.
+- **It refuses on `unknown` too**, not only on `held`. Acting only on `held` fails OPEN against the
+  skew the probe exists to detect: a pre-#1362 renderer answers *"unknown registry — nothing was
+  checked"*, and reading that as "nothing is held" destroys the work. `absent` proceeds — with no
+  renderer there is no modal.
+- The **backend** is the guard, because the agent route never goes through the Assets panel. The
+  **four** human seams (F2/context rename, drag-into-folder, clipboard **cut**, folder rename) call
+  `assetEditorHoldMessage()` only to say WHY, since `moveFileToStatus` keeps `{ok, status}` and
+  discards the body. A **copy** is not gated — it leaves the held asset where it is.
+- **`/api/delete-asset` shares the gate** (`heldAssetEditorRefusal`), because it is the same
+  mechanism and worse — it destroys the modal's edits AND the file. It honours that route's own
+  escapes (`rendererWrite`, `discardUnsaved:true`): an explicit discard is a caller accepting the
+  loss, not the silent loss this refusal exists to stop.
+- **A dirty editor shows up in `openEditors` as `{path, dirty:true}`.** Without that, the picture
+  after the fix was the one that hid the bug: a 423 nothing on the MCP surface could corroborate,
+  since `openAssetEditor` is not an `unsavedChangeCauses()` cause and `unsavedChanges` stays false.
+
+⚠️ **The tier that matters is the ROUTE, and it is easy to leave untested.** The renderer-side
+helpers (`dirtyAssetEditorHolds`, `assetEditorHoldMessage`, the digest) have unit tests, and with
+those green the gate block could still be deleted whole with **every** suite passing —
+`unsavedGateCoverage` included, because its `needed` for this route derives from a registry list that
+cannot contain `openAssetEditor`. `engine/tests/plugins/moveFileRouter.test.ts` drives the route
+itself; that is where a test of this gate belongs. Note also that the router has its **own** prefix
+matcher, separate from the panel's, so the panel's unit test does not cover it.
+
+`/api/move-file`'s exemption row in `unsavedGateCoverage.test.ts` is now **partial**: its argument
+(gating a rename would be wrong, because the repair carries the work across) still holds for the four
+document registries and does not extend to this one, where there is nothing to re-point.
+
 ## Panels
 
 ### Tab mounting LATCHES — "unselected" is not "unmounted" (#1015)

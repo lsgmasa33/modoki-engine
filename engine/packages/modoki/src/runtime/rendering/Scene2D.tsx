@@ -137,8 +137,11 @@ interface Slot { kind: DisplayKind; obj: Graphics | Sprite | Mesh | Container; s
   // the extra-sampler set — see `matBuildSig` at its use site). `matQuadSig` gates a cheaper
   // in-place resize of just the quad's 8 position floats (size/pivot only, #692) — split from
   // `matBuildSig` because a Shader rebuild adds two permanent entries to WebGPU's
-  // `BindGroupSystem._hash` (#699) and a never-deleted key to pixi's `GCManagedHash` (#707), so an
-  // animated size must never force one. `textureUrl` holds the retained sprite url (shared
+  // `BindGroupSystem._hash` (#699, filed upstream as pixijs/pixijs#12214 with the measurement), so
+  // an animated size must never force one. ⚠️ This used to also cite "a never-deleted key to pixi's
+  // `GCManagedHash` (#707)" — that half was WRONG (the null is a tombstone, compacted at 10k by
+  // `GCSystem.runOnHash`); see docs/rendering.md § the two-tier gate. The rule is unchanged: the
+  // `_hash` half alone is unbounded. `textureUrl` holds the retained sprite url (shared
   // spriteTextureRefs — released in disposeSlot). The shader is also registered in
   // Scene2DRenderer.entityShaders for MaterialInstance driving.
   // `materialTexUrls` holds the resolved urls of the shader's extra `texture` params
@@ -508,7 +511,8 @@ export function buildMaterialQuad(w: number, h: number, px: number, py: number):
  *  the indices, the texture bindings and the shader are all independent of the quad's size, so a
  *  size/pivot edit never needs a new Mesh — and never needs a new Shader, which is the part that
  *  matters, because every Shader rebuild adds two permanent entries to WebGPU's
- *  `BindGroupSystem._hash` (#699) and a never-deleted key to pixi's `GCManagedHash` (#707).
+ *  `BindGroupSystem._hash` (#699, filed upstream as pixijs/pixijs#12214). It is NOT also a
+ *  `GCManagedHash` key as this comment once claimed — that cache tombstones and compacts.
  *  Same in-place shape the skinned-mesh deform and the text animation passes already use. */
 export function resizeMaterialQuad(geo: MeshGeometry, w: number, h: number, px: number, py: number): void {
   writeMaterialQuadPositions(geo.positions as Float32Array, w, h, px, py);

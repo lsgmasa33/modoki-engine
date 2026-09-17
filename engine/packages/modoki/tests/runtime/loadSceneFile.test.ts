@@ -1465,6 +1465,37 @@ describe('collectResourceRefsFromEntities', () => {
       expect(refs).toContainEqual({ type: 'mesh', path: MESH });
     });
 
+    // #1358: `nestedStructure` holds `added[]` nodes, which carry `prefab` and trait asset refs
+    // exactly like a top-level one. A ref this walk misses is a ref the BUILD cannot see — the asset
+    // is dropped from the production bundle and it fails only once shipped (#53's class). This is the
+    // clause that keeps the new slot from being a blind spot.
+    // Mutation: drop the `nestedStructure` walk at the end of collectResourceRefsFromEntities'
+    // per-entry loop (loadSceneFile.ts). NOT serialize.ts's `flagNestedStructure` — an earlier note
+    // here said that, and it is wrong: that one belongs to `assertNoPathRefs`, these tests call this
+    // collector, and following the wrong anchor would report a false pass.
+    it('collects refs from an added node inside a path-keyed nestedStructure bag', async () => {
+      const { collectResourceRefsFromEntities } = await getLoader();
+      const refs = collectResourceRefsFromEntities([
+        { traits: {}, nestedStructure: { '4': { added: [{
+          parentLocalId: 2, guid: 'g', name: 'n', children: [],
+          traits: { Renderable3D: { mesh: MESH, material: MAT } },
+        }] } } },
+      ]);
+      expect(refs).toContainEqual({ type: 'mesh', path: MESH });
+      expect(refs).toContainEqual({ type: 'material', path: MAT });
+    });
+
+    it('collects a nested-instance prefab ref from an added node inside nestedStructure', async () => {
+      const { collectResourceRefsFromEntities } = await getLoader();
+      const refs = collectResourceRefsFromEntities([
+        { traits: {}, nestedStructure: { '4.7': { added: [{
+          parentLocalId: 1, guid: 'g', name: 'n', traits: {}, children: [],
+          prefab: 'cccccccc-4444-4444-8444-444444444444',
+        }] } } },
+      ]);
+      expect(refs).toContainEqual({ type: 'prefab', path: 'cccccccc-4444-4444-8444-444444444444' });
+    });
+
     it('collects a ref from an override on an ADDED reference node', async () => {
       const { collectResourceRefsFromEntities } = await getLoader();
       const refs = collectResourceRefsFromEntities([

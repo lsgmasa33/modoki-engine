@@ -15,6 +15,7 @@ import { register, registerBindings } from '../input/keymap';
 import { useHmrEpoch } from '../input/hmrEpoch';
 import { useEditorStore } from '../store/editorStore';
 import { writeMetaOrWarn } from './assetViews/widgets';
+import { spriteSheetDigest } from './spriteSheetDigest';
 import { SaveRefusedNotice } from './AssetLoadRefusedBanner';
 import { saveRefusalMessage, saveRefusalConsoleMessage, type SaveRefusal } from './saveRefusal';
 import { readMetaPreferringPark, metaWrittenToDisk } from '../scene/pendingMeta';
@@ -97,13 +98,30 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
   const [loadedPath, setLoadedPath] = useState<string | null>(null);
   const setEditorMount = useEditorStore((s) => s.setEditorMount);
   const sliceKey = sprites.filter((s) => s.guid !== '__preview__').map((s) => s.guid).join('\n');
-  useEffect(() => {
-    if (loadedPath !== path) { setEditorMount('sprite', null); return; }
-    setEditorMount('sprite', { path, slices: sliceKey ? sliceKey.split('\n') : [] });
-  }, [loadedPath, path, sliceKey, setEditorMount]);
-  useEffect(() => () => setEditorMount('sprite', null), [setEditorMount]);
   const [grid, setGrid] = useState<GridOpts>(DEFAULT_GRID);
   const [alphaThreshold, setAlphaThreshold] = useState(8);
+  // ⚠️ Declared AFTER `grid`/`alphaThreshold` on purpose: the digest reads them, and this runs
+  // during render. Above them it is a temporal-dead-zone error.
+  //
+  // ⚠️ The guid list is NOT a dirtiness signal — dragging a slice's edge changes its rect and keeps
+  // its guid, so `sliceKey` is identical for an edited sheet. The digest covers what a save would
+  // write — the slices AND the sticky slicing controls — so "dirty" means the same thing to the
+  // move gate as it does to the Save button (#1362).
+  const sliceDigest = spriteSheetDigest(sprites, { grid, alphaThreshold });
+  // The digest as it was LOADED. `null` until the read lands, so a modal still loading never
+  // reports dirty — its slice list is empty then, which would read as "everything deleted".
+  const baselineDigestRef = useRef<string | null>(null);
+  const gridRef = useRef(grid);
+  gridRef.current = grid;
+  const alphaThresholdRef = useRef(alphaThreshold);
+  alphaThresholdRef.current = alphaThreshold;
+  const dirty = loadedPath === path && baselineDigestRef.current !== null
+    && sliceDigest !== baselineDigestRef.current;
+  useEffect(() => {
+    if (loadedPath !== path) { setEditorMount('sprite', null); return; }
+    setEditorMount('sprite', { path, slices: sliceKey ? sliceKey.split('\n') : [], dirty });
+  }, [loadedPath, path, sliceKey, dirty, setEditorMount]);
+  useEffect(() => () => setEditorMount('sprite', null), [setEditorMount]);
   const initialGuidsRef = useRef<Set<string>>(new Set());
   const dragRef = useRef<DragMode>({ kind: 'none' });
   // The canvas is the FULL zoomed image inside a native scroll viewport — so panning
@@ -168,7 +186,16 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
         setMeta(m);
         setLoadedPath(path);
         const existing = Array.isArray(m.sprites) ? (m.sprites as SpriteSlice[]) : [];
-        setSprites(existing.map((s) => ({ ...s, rect: { ...s.rect }, pivot: { ...s.pivot } })));
+        const loaded = existing.map((s) => ({ ...s, rect: { ...s.rect }, pivot: { ...s.pivot } }));
+        setSprites(loaded);
+        // The baseline uses the values this read is about to APPLY, not the current state — the
+        // setters above have not flushed yet, so reading `grid`/`alphaThreshold` here would capture
+        // the previous texture's (or the defaults) and the modal would open already dirty.
+        const loadedGrid = m.spriteGrid && typeof m.spriteGrid === 'object'
+          ? { ...DEFAULT_GRID, ...(m.spriteGrid as Partial<GridOpts>) }
+          : (existing.length > 0 ? { ...DEFAULT_GRID, ...(inferGridFromRects(existing.map((s) => s.rect)) ?? {}) } : DEFAULT_GRID);
+        const loadedThreshold = typeof m.spriteAlphaThreshold === 'number' ? m.spriteAlphaThreshold : alphaThresholdRef.current;
+        baselineDigestRef.current = spriteSheetDigest(loaded, { grid: loadedGrid, alphaThreshold: loadedThreshold });
         initialGuidsRef.current = new Set(existing.map((s) => s.guid));
         // Restore the last-used slicing controls (saved alongside the slices). When
         // none were saved (older meta, or slices made by auto-alpha / hand-drawing),
@@ -189,6 +216,8 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
         // over the real sidecar. Then the modal counts as open on this path for the agent ops (#1213).
         if (ac.signal.aborted) return;
         setSprites([]);
+        // A fresh sheet: empty slices with whatever controls are showing IS the baseline.
+        baselineDigestRef.current = spriteSheetDigest([], { grid: gridRef.current, alphaThreshold: alphaThresholdRef.current });
         initialGuidsRef.current = new Set();
         setLoadedPath(path);
       });
@@ -380,8 +409,6 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
   // `__preview__` is never part of a snapshot.
   const spritesRef = useRef(sprites);
   spritesRef.current = sprites;
-  const gridRef = useRef(grid);
-  gridRef.current = grid;
   const alphaRef = useRef(alphaThreshold);
   alphaRef.current = alphaThreshold;
   // `selected` now comes from the store (see above) rather than local state, so a functional
@@ -703,6 +730,9 @@ export function SpriteEditor({ path, name, onClose }: { path: string; name: stri
     // A swap while this POST is in flight unmounts this modal AND its parent view (see the note at the
     // top), so what follows still acts on THIS texture, and `onClose` lands on an unmounted parent.
     const persisted = await writeMetaOrWarn(path, nextMeta);
+    // The save IS the new baseline — otherwise the modal stays dirty after writing and the move
+    // gate keeps refusing over work that is already on disk.
+    if (persisted) baselineDigestRef.current = spriteSheetDigest(sprites, { grid, alphaThreshold });
     if (!persisted) {
       // Keep the dialog open on a failed write — see the note in NineSliceEditor.save. A slice set
       // is far more work to re-author than a border, so losing it to a dev-server blip is worse.

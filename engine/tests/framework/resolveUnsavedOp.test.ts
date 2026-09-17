@@ -181,7 +181,7 @@ describe('resolve-unsaved — the probe', () => {
       expect(pathsIn(r, 'liveScene')).toEqual([PATHLESS]);
       expect((r.holds ?? [])[0]?.detail).toMatch(/never been saved/);
       expect(r.covers, 'still a full answer, not an unknown').toEqual(
-        ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene'],
+        ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene', 'openAssetEditor'],
       );
     });
 
@@ -235,7 +235,7 @@ describe('resolve-unsaved — the probe', () => {
     // when something was held would make every clean call look like a skewed renderer.
     const r = await resolve({ paths: [MODEL] });
     expect(r.holds).toEqual([]);
-    expect(r.covers).toEqual(['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene']);
+    expect(r.covers).toEqual(['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene', 'openAssetEditor']);
   });
 
   it('one path dirty two ways gets one row per REGISTRY, never a duplicate', async () => {

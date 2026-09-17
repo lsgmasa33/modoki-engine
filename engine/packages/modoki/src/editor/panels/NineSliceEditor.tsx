@@ -35,6 +35,9 @@ const MAX_CANVAS_PX = 8192;
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(v, hi));
 
+/** What a save would write, as one comparable string — the border insets plus the edge scale. */
+const borderDigest = (b: NineSliceBorder, scale: number) => `${b.l}|${b.r}|${b.t}|${b.b}|${scale}`;
+
 export function NineSliceEditor({ path, name, onClose }: { path: string; name: string; onClose: () => void }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
@@ -52,10 +55,14 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
   // Publish "open, on this texture" for the agent ops (#1213) — the modal's open state is
   // TextureAssetView-local, so `open-nine-slice-editor` could not otherwise confirm it opened.
   const setEditorMount = useEditorStore((s) => s.setEditorMount);
-  useEffect(() => { setEditorMount('nineslice', { path }); }, [path, setEditorMount]);
-  useEffect(() => () => setEditorMount('nineslice', null), [setEditorMount]);
   const [border, setBorder] = useState<NineSliceBorder>({ l: 0, r: 0, t: 0, b: 0 });
   const [edgeScale, setEdgeScale] = useState(1);   // edge render scale (CSS px per source px)
+  // Dirtiness, for the move gate (#1362): the border+scale as LOADED vs as shown. `null` until the
+  // read lands, so a modal still loading never reports dirty.
+  const baselineRef = useRef<string | null>(null);
+  const dirty = baselineRef.current !== null && borderDigest(border, edgeScale) !== baselineRef.current;
+  useEffect(() => { setEditorMount('nineslice', { path, dirty }); }, [path, dirty, setEditorMount]);
+  useEffect(() => () => setEditorMount('nineslice', null), [setEditorMount]);
   const [zoom, setZoom] = useState(1);
   const [viewport, setViewport] = useState({ w: DEFAULT_VIEWPORT_W, h: DEFAULT_VIEWPORT_H });
   /** The guide being dragged, with its inset and the pointer's image-space coordinate on that
@@ -109,8 +116,15 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
         setMeta(m);
         const b = m.border as (Partial<NineSliceBorder> & { scale?: number }) | undefined;
         if (b) { setBorder({ l: b.l || 0, r: b.r || 0, t: b.t || 0, b: b.b || 0 }); setEdgeScale(b.scale && b.scale > 0 ? b.scale : 1); }
+        baselineRef.current = b
+          ? borderDigest({ l: b.l || 0, r: b.r || 0, t: b.t || 0, b: b.b || 0 }, b.scale && b.scale > 0 ? b.scale : 1)
+          : borderDigest({ l: 0, r: 0, t: 0, b: 0 }, 1);
       })
-      .catch(() => { /* fresh — no border yet */ });
+      .catch(() => {
+        // Fresh — no border yet. The zero border IS the baseline, so an untouched modal on a
+        // border-less texture does not read as dirty and block a move (#1362).
+        baselineRef.current = borderDigest({ l: 0, r: 0, t: 0, b: 0 }, 1);
+      });
     return () => ac.abort();
   }, [path]);
 
@@ -403,6 +417,9 @@ export function NineSliceEditor({ path, name, onClose }: { path: string; name: s
       return;
     }
     savedRef.current = persisted;
+    // The save IS the new baseline, or the modal stays dirty over work already on disk and the
+    // move gate keeps refusing (#1362).
+    if (persisted) baselineRef.current = borderDigest(border, edgeScale);
     // #845 close-out: this write just committed whatever `readMetaPreferringPark` read at load
     // time — drop that park, unless an Inspector edit parked something NEWER while this modal was
     // open (metaWrittenToDisk tells the two apart by reference; see pendingMeta.ts).

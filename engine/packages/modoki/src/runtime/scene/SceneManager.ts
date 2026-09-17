@@ -808,7 +808,7 @@ class SceneManagerImpl implements SceneManager {
             await acquirePrefab(sid, prefabPath);
             return (getCachedPrefab(prefabPath) as object) ?? null;
           },
-          onInstantiatePrefab: async (source, parentId, rootTransform, _oldEntityId, rootExtraTraits, overrides, structure, nestedOverrides, rootGuid, rootEditorFolder) => {
+          onInstantiatePrefab: async (source, parentId, rootTransform, _oldEntityId, rootExtraTraits, overrides, structure, nestedOverrides, rootGuid, rootEditorFolder, nestedStructure) => {
             // The prefab was already fetched + cached by fetchPrefab; spawn it
             // into the staging world (not the active world). Pass source so the
             // spawned entities get PrefabInstance traits for editor identification.
@@ -826,6 +826,7 @@ class SceneManagerImpl implements SceneManager {
               structure,
               undefined,
               nestedOverrides,
+              nestedStructure,
             );
             // Re-apply the scene-authored stable guid to the instance root. The prefab
             // template clears member guids, so the freshly-spawned root has none; without

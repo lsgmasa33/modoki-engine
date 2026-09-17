@@ -10,7 +10,7 @@ import { pinEntityAt, livePinnedId, type EntityPin } from '../../runtime/core/ec
 import { renameCommitTarget } from './renamePin';
 import { compareSiblings } from '../../runtime/core/ecs/entityOrder';
 import { flattenVisibleIds, rangeBetween } from './hierarchySelection';
-import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, snapshotEntity, respawnFromSnapshot, regenerateSnapshotGuids, classifyPrefabDuplicate, stripPrefabInstanceFromSnapshot, moveEntityToScene, type EntitySnapshot } from '../undo/entityActions';
+import { deleteEntitiesWithUndo, duplicateEntity, reparentEntity, createEntityWithUndo as createEntityAction, writeTraitFieldWithUndo, writeTraitFieldMultiWithUndo, writeTraitFieldPerEntityWithUndo, snapshotEntity, respawnFromSnapshot, regenerateSnapshotGuids, classifyPrefabDuplicate, stripPrefabInstanceFromSnapshot, clearOwnedNestedStampFromSnapshot, moveEntityToScene, type EntitySnapshot } from '../undo/entityActions';
 import { preflightSceneMove, formatSceneMoveConfirm } from '../scene/sceneMoveScan';
 import { entityRef } from '../undo/entityRef';
 import { instantiatePrefabInstance, detachPrefabInstance, reattachPrefabInstance, type PrefabFile } from '../scene/prefab';
@@ -1053,6 +1053,8 @@ export default function Hierarchy() {
     // paste a guid-based handle that survives a world rebuild (Play→Stop).
     let pasteSnapshot = regenerateSnapshotGuids(snapshot);
     if (prefabKind === 'member') pasteSnapshot = stripPrefabInstanceFromSnapshot(pasteSnapshot);
+    // A pasted owned nested instance root becomes an INDEPENDENT instance (#1354, owner ruling).
+    else if (prefabKind === 'root') pasteSnapshot = clearOwnedNestedStampFromSnapshot(pasteSnapshot);
     const parentRef = parentId ? entityRef(parentId) : null;
     const spawn = (p: number) => {
       const id = respawnFromSnapshot(pasteSnapshot, p);

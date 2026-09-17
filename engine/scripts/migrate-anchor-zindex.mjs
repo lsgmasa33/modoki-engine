@@ -27,6 +27,7 @@
  */
 
 import { readFile, writeFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PROJECT_ROOT_DIRS } from './projectRoots.mjs';
@@ -36,8 +37,28 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '../..');
 const WRITE = process.argv.includes('--write');
 
-const SCENE_FORMAT_VERSION = 13;
-const PREFAB_FORMAT_VERSION = 3;
+// ⚠️ READ from source, never hardcoded: this script STAMPS the version it believes in, so a stale
+// literal silently DOWNGRADES every file it rewrites (it sat at 13 through the v14 bump, #1358).
+// Same pattern as migrate-assets.mjs.
+const versionSrc = readFileSync(
+  resolve(ROOT, 'engine/packages/modoki/src/runtime/core/version.ts'), 'utf8');
+const sceneVersionMatch = versionSrc.match(/SCENE_FORMAT_VERSION\s*=\s*(\d+)/);
+if (!sceneVersionMatch) {
+  console.error('could not read SCENE_FORMAT_VERSION from runtime/core/version.ts');
+  process.exit(1);
+}
+const SCENE_FORMAT_VERSION = Number(sceneVersionMatch[1]);
+// ⚠️ READ, for the same reason as the scene version one line up — this script STAMPS both, so a
+// stale literal here downgrades every PREFAB it rewrites. The scene half was unpinned and this was
+// left behind in the same function; version.ts says in as many words to check BOTH.
+const prefabSrc = readFileSync(
+  resolve(ROOT, 'engine/packages/modoki/src/editor/scene/prefab.ts'), 'utf8');
+const prefabVersionMatch = prefabSrc.match(/PREFAB_FORMAT_VERSION\s*=\s*(\d+)/);
+if (!prefabVersionMatch) {
+  console.error('could not read PREFAB_FORMAT_VERSION from editor/scene/prefab.ts');
+  process.exit(1);
+}
+const PREFAB_FORMAT_VERSION = Number(prefabVersionMatch[1]);
 
 /** Every scene/prefab file the REPO knows about, enumerated through GIT rather than by walking
  *  the filesystem.

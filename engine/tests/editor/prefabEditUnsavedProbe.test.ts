@@ -110,7 +110,7 @@ describe('resolve-unsaved in prefab-edit mode (#889 phase 2)', () => {
     expect((r.holds ?? [])[0]?.detail).toMatch(/PREFAB open for editing/);
     // A full answer, not an `unknown` — which is what made the old reply dangerous rather than
     // merely incomplete: a gate refuses on `unknown` and proceeds on a covered empty `holds`.
-    expect(r.covers).toEqual(['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene']);
+    expect(r.covers).toEqual(['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene', 'openAssetEditor']);
   });
 
   it('a PATH-SCOPED ask about that prefab matches — this is what /api/validate-prefab does', async () => {

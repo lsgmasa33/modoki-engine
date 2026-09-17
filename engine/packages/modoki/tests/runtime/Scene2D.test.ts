@@ -1243,8 +1243,9 @@ describe('Scene2D.renderFrame', () => {
 
     // #692 site 2: `matSig` used to include width/height/pivot, so an animated size rebuilt the
     // whole Mesh+Shader+Geometry every frame — and every Shader rebuild leaks a permanent entry
-    // into WebGPU's BindGroupSystem._hash (#699) and pixi's GCManagedHash (#707), making an
-    // animated size an unbounded grow. `matBuildSig`/`matQuadSig` split the two: a size/pivot
+    // into WebGPU's BindGroupSystem._hash (#699, filed upstream as pixijs/pixijs#12214), making an
+    // animated size an unbounded grow. (It does NOT also leak a pixi GCManagedHash key, as this
+    // comment claimed until 2026-09-18 — that cache tombstones and compacts at 10k.) `matBuildSig`/`matQuadSig` split the two: a size/pivot
     // change now resizes the existing quad's 8 position floats in place instead.
     describe('material quad resize is in-place, not a rebuild (#692)', () => {
       it('T5: a size change resizes the quad in place — same Mesh, same Shader, geometry updated', async () => {

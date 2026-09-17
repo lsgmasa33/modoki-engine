@@ -14,6 +14,7 @@ import { emptyDocMap, hasDocKey } from '../core/docKeys';
 import { isPersistentTraitField } from '../core/ecs/traitSchema';
 import {
   mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, foldTraitOverride,
+  descendPathKeyed, nestedPathKey,
   type NestedOverridePaths,
 } from './prefabOverrides';
 import { SCENE_FORMAT_VERSION } from '../core/version';
@@ -25,6 +26,23 @@ import { getRunMode } from '../core/playState';
 import { Transient } from '../core/traits/Transient';
 import { migrateUIAnchorZIndexStructured } from './uiAnchorZIndexMigration';
 import { collectSubtreeIds } from '../core/ecs/subtreeCollect';
+
+/** The structural delta an OUTER layer (a scene, or an ancestor prefab) applies INSIDE a nested
+ *  instance that expanded from one of its rows — the interior counterpart of `NestedOverridePaths`,
+ *  and keyed by the same path grammar (`nestedPathKey`).
+ *
+ *  Before #1358 the only per-row channel a scene had was the VALUE delta, so a structural edit made
+ *  inside a row's own expansion — deleting a member, dragging one out — was captured by nothing and
+ *  came back on the next load, with the dragged-out entity duplicating its guid. The user-added
+ *  nested path already had this (an `AddedEntity` reference node carries `added`/`removed`/
+ *  `removedTraits`); this gives the OWNED path the same channel. */
+export interface NestedStructureDelta {
+  added?: AddedEntity[];
+  removed?: number[];
+  removedTraits?: Record<number, string[]>;
+}
+/** Path-keyed nested STRUCTURE — see `NestedStructureDelta` and `NestedOverridePaths`. */
+export type NestedStructurePaths = Record<string, NestedStructureDelta>;
 
 /** A child subtree an instance adds beyond what its prefab defines. Anchored to
  *  an existing prefab member by `parentLocalId`; nested adds live in `children`
@@ -80,6 +98,9 @@ export interface SceneEntityEntry {
    *  internal nested prefab instances, e.g. a ship's engine flames). Path-keyed so
    *  the scene can reach a member at ANY nesting depth (see NestedOverridePaths). */
   nestedOverrides?: NestedOverridePaths;
+  /** Scene-level STRUCTURAL edits inside this instance's nested instances — a member deleted or
+   *  dragged out of a row's own expansion. Path-keyed exactly like `nestedOverrides` (#1358). */
+  nestedStructure?: NestedStructurePaths;
 }
 
 export interface SceneResourceRef {
@@ -136,6 +157,13 @@ export interface LoadSceneOptions {
      *  the instance root, re-applied so a foldered prefab instance stays in its
      *  folder across reload. Empty/undefined = ungrouped. */
     rootEditorFolder?: string,
+    /** Scene-level STRUCTURAL edits inside this instance's nested instances (#1358), forwarded to
+     *  `instantiatePrefabIntoWorld`'s `nestedStructure`. APPENDED rather than placed beside
+     *  `nestedOverrides` where it belongs logically: these arguments are positional and five
+     *  implementors (SceneManager plus four test harnesses) read them by position, so inserting
+     *  would silently shift `rootGuid` and `rootEditorFolder` in any implementor not updated in the
+     *  same change. */
+    nestedStructure?: NestedStructurePaths,
   ) => Promise<number | undefined> | number | undefined | void;
   /** Called before deleting a placeholder entity during prefab re-instantiation */
   onDeletePlaceholder?: (entityId: number) => void;
@@ -418,6 +446,20 @@ function migrateV12toV13(data: SceneData): void {
   // Structured walk — not just entry.traits — so overrides[localId][UIAnchor], added[] subtrees
   // and nestedOverrides paths all get the same fix (mirrors migrateV8toV9's renameRenderableActiveToVisibleDeep).
   for (const entry of data.entities) migrateUIAnchorZIndexStructured(entry);
+  data.version = 13;
+}
+
+/** Migrate v13→v14: no-op passthrough. v14 only ADDS an optional path-keyed `nestedStructure`
+ *  beside `nestedOverrides` (on an instance entry, an added reference node and a prefab row),
+ *  carrying structural edits made inside a nested instance that expanded from a row (#1358).
+ *  No existing field changes shape and no v13 file can carry the key, so there is nothing to walk.
+ *
+ *  ⚠️ The version still had to move, and this step is what makes a v13 file carry the new number:
+ *  Scene's disposition is REFUSE (docs/format-versioning.md), so an older build must refuse a v14
+ *  document rather than read it, ignore the key it does not know and drop it on the next save —
+ *  which is precisely the data loss #1358 fixes. */
+function migrateV13toV14(data: SceneData): void {
+  if (data.version >= 14) return;
   // Terminal version of the migration chain. Sourced from SCENE_FORMAT_VERSION so
   // the constant is the single source of truth: bumping it (without chaining a new
   // migration) can't silently mislabel a freshly-migrated file as under-versioned.
@@ -509,7 +551,7 @@ export function applyOverridesByLocalToEcs(
 // this file imports, and which runs in Node with no trait registry — can compose a prefab's
 // effective root with the SAME rules this spawner uses. Re-exported so their existing importers
 // (`editor/scene/prefab.ts`, `editor/scene/serialize.ts`) are unchanged.
-export { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths };
+export { mergeOverrideMaps, descendNestedOverrides, mergeNestedOverridePaths, descendPathKeyed, nestedPathKey };
 export type { NestedOverridePaths };
 
 /** Structural overrides applied on top of a freshly-instantiated prefab. */
@@ -869,6 +911,10 @@ export function instantiatePrefabIntoWorld(
    *  nested descendants, path-keyed so any depth is reachable; forwarded recursively
    *  as nested rows expand. Outermost layer wins (see NestedOverridePaths). */
   nestedOverrides?: NestedOverridePaths,
+  /** STRUCTURAL edits an OUTER layer applies inside this instance's nested descendants, path-keyed
+   *  and forwarded exactly like `nestedOverrides` (#1358). Merged UNDER the row's own
+   *  `added`/`removed`/`removedTraits` as the row expands — see the merge at the recursion. */
+  nestedStructure?: NestedStructurePaths,
 ): number {
   const stack = _stack ?? new Set<string>();
   if (prefab.id) {
@@ -898,9 +944,24 @@ export function instantiatePrefabIntoWorld(
       const { direct: outerDirect, forward: outerForward } = descendNestedOverrides(nestedOverrides, rowLocalId);
       const childOverrides = outerDirect ? mergeOverrideMaps(entry.overrides, outerDirect) : entry.overrides;
       const childNested = mergeNestedOverridePaths(entry.nestedOverrides, outerForward);
+      // The same split for the STRUCTURAL channel (#1358): `structDirect` is what the outer layer
+      // edited INSIDE this row's own expansion, `structForward` reaches deeper. The outer layer's
+      // structure REPLACES the row's per-field lists rather than merging element-wise — a scene that
+      // deleted a member of this expansion is stating the whole list for that instance, and merging
+      // two `removed` arrays would make an un-delete unrepresentable.
+      const { direct: structDirect, forward: structForward } = descendPathKeyed(nestedStructure, rowLocalId);
       const childRoot = instantiatePrefabIntoWorld(
         world, child, 0, undefined, entry.prefab, childOverrides,
-        { added: entry.added, removed: entry.removed, removedTraits: entry.removedTraits }, stack, childNested,
+        // Once an outer layer addresses this path it OWNS the interior: all three lists come from
+        // it, with an absent one read as EMPTY rather than falling back to the row. Per-field
+        // fallback made "the row's own list no longer applies" unrepresentable — a scene that
+        // deleted the last member of a row-authored `added` wrote nothing for it and the member came
+        // back on the next load.
+        structDirect
+          ? { added: structDirect.added ?? [], removed: structDirect.removed ?? [], removedTraits: structDirect.removedTraits ?? {} }
+          : { added: entry.added, removed: entry.removed, removedTraits: entry.removedTraits },
+        stack, childNested,
+        structForward,
       );
       // Stamp parentLocalId so a later serialize knows which row produced this
       // instance (and can store/restore its scene-level overrides).
@@ -1164,6 +1225,8 @@ export function collectResourceRefsFromEntities(
     overrides?: Record<string, unknown>;
     /** Path-keyed nested-instance overrides (one level deeper than `overrides`). */
     nestedOverrides?: Record<string, Record<string, unknown>>;
+    /** Path-keyed nested-instance STRUCTURE (#1358) — its `added[]` nodes carry refs. */
+    nestedStructure?: NestedStructurePaths;
   }>,
 ): SceneResourceRef[] {
   const seen = new Set<string>();
@@ -1236,6 +1299,12 @@ export function collectResourceRefsFromEntities(
       node.added?.forEach(walkAdded);
     };
     entry.added?.forEach(walkAdded);
+    // ⚠️ `nestedStructure`'s added nodes are refs the BUILD reads through this walker
+    // (`asset-tree-shaker.ts`), so missing them drops the asset from the production bundle and it
+    // fails only once shipped (#53's class). serializeScene has its OWN scanner for the scene's
+    // `resources` manifest — both must know this slot, and extending only that one left the build
+    // blind, which is the half a round-trip test cannot see.
+    for (const delta of Object.values(entry.nestedStructure ?? {})) delta.added?.forEach(walkAdded);
   }
 
   for (const entry of flat) {
@@ -1597,6 +1666,7 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
   migrateV10toV11(data);
   migrateV11toV12(data);
   migrateV12toV13(data);
+  migrateV13toV14(data);
   assignSyntheticEntityIds(data);
   stripLegacyCameraFrameShowGizmo(data);
   const { fetchPrefab, onEntitySpawned, loadModels = true } = options;
@@ -1905,6 +1975,7 @@ export async function loadSceneFile(data: SceneData, options: LoadSceneOptions):
         entry.nestedOverrides,
         entry.guid,
         typeof rootEa?.editorFolder === 'string' ? (rootEa.editorFolder as string) : undefined,
+        entry.nestedStructure,
       );
       if (typeof rootEcsId === 'number' && rootEcsId > 0) {
         // Everything that was resolved to the placeholder now names the root. Without this the stored

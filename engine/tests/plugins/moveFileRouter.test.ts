@@ -40,6 +40,9 @@ const roots = (): AssetRoot[] => [
 ];
 /** When set, `requestBrowser` rejects with it — the no-renderer-attached case. */
 let browserFailure: Error | null = null;
+/** #1362: what the renderer answers for the `openAssetEditor` probe. `null` = nothing held.
+ *  `'skew'` = a pre-#1362 renderer that refuses the unknown registry, which must NOT read as clear. */
+let editorHold: { path: string } | 'skew' | null = null;
 
 function makeCtx(): BackendContext {
   return {
@@ -56,8 +59,26 @@ function makeCtx(): BackendContext {
       // The agent delete's unsaved-work probe (#1215 A-7) answers "nothing held" and is not
       // recorded: `asked` is the REPAIR this file asserts on, and the gate has its own tests in
       // assetWritePreconditions.test.ts. `covers` is required, or the gate reads a skewed renderer.
-      if (op === 'resolve-unsaved' && !browserFailure) {
+      // ⚠️ `browserFailure` is deliberately NOT applied to the probe: these tests are about the
+      // REPAIR op failing, and since #1362 the move REFUSES when it cannot establish whether an
+      // editor holds unsaved edits — so letting the failure hit the probe too would turn every
+      // repair-reporting test into a 503 and stop testing the repair at all. A per-op failure is
+      // also the realistic shape (a renderer that lacks `apply-asset-path-moves` but answers
+      // `resolve-unsaved` — which is literally what one of those tests simulates).
+      if (op === 'resolve-unsaved') {
         const registries = (params as { registries?: string[] }).registries ?? [];
+        // #1362: the openAssetEditor probe. A SKEWED renderer answers without covering it, which
+        // `unsavedGate` must turn into `unknown` and the route must refuse on — the fail-open that
+        // the first cut of this gate had.
+        if (registries.includes('openAssetEditor')) {
+          if (editorHold === 'skew') return { ok: true, holds: [], discarded: [], covers: [] };
+          return {
+            ok: true,
+            holds: editorHold ? [{ path: editorHold.path, registry: 'openAssetEditor', detail: 'unsaved edits in the open sprite editor' }] : [],
+            discarded: [],
+            covers: registries,
+          };
+        }
         return { ok: true, holds: [], discarded: [], covers: registries };
       }
       rec.asked.push({ op, params });
@@ -66,8 +87,9 @@ function makeCtx(): BackendContext {
     },
   } as unknown as BackendContext;
 }
+type MoveResult = { status?: number; body?: Record<string, unknown> } | null;
 const move = (from: string, to: string) =>
-  handleBackendRequest(makeCtx(), { method: 'POST', urlPath: '/api/move-file', query: new URLSearchParams(), body: { from, to } });
+  handleBackendRequest(makeCtx(), { method: 'POST', urlPath: '/api/move-file', query: new URLSearchParams(), body: { from, to } }) as Promise<MoveResult>;
 /** One marked path as an asset-root-ish suffix, so assertions read independently of the tmpdir.
  *  ⚠️ The ONLY place this file may turn a native `abs` into something comparable (#876). A
  *  second, POSIX-only spelling (`abs.endsWith('/b.json')`) was hand-rolled below this and made
@@ -81,6 +103,7 @@ beforeEach(() => {
   tmp2 = makeScratchDir('modoki-mvrouter2-');
   rec = { marked: [], asked: [] };
   browserFailure = null;
+  editorHold = null;
 });
 afterEach(() => {
   fs.rmSync(tmp, { recursive: true, force: true });
@@ -389,6 +412,13 @@ describe('the repair APPLIES when a runtime tab declines and the editor answers 
     const ctx = {
       ...makeCtx(),
       requestBrowser: (op: string, params: unknown, timeoutMs = 3000) => {
+        // #1362: this override replaces `makeCtx`'s, so it has to answer the held-editor probe
+        // itself — the route now REFUSES when it cannot establish whether an editor holds unsaved
+        // edits, and an un-covered reply reads as "could not look", not as "nothing is held".
+        if (op === 'resolve-unsaved') {
+          const registries = (params as { registries?: string[] }).registries ?? [];
+          return Promise.resolve({ ok: true, holds: [], discarded: [], covers: registries });
+        }
         rec.asked.push({ op, params });
         // TWO clients receive the broadcast.
         const p = reg.request((id) => {
@@ -412,5 +442,74 @@ describe('the repair APPLIES when a runtime tab declines and the editor answers 
     expect(r.body?.repaired).toBeTruthy();             // ...and NOT silently skipped as absent
     expect(warn).not.toHaveBeenCalled();
     warn.mockRestore();
+  });
+
+});
+
+// #1362 — a move is REFUSED while a texture editor holds unsaved edits (owner, 2026-09-18).
+// ⚠️ This is the tier that matters and the one the first cut had NONE of: the renderer-side helpers
+// had unit tests, so the digest and the hold predicate were covered, while the ROUTE — the only
+// thing the agent path goes through — was driven by nothing. Deleting the whole gate block left
+// every suite green, including `unsavedGateCoverage`, whose `needed` for this route derives from a
+// hand-written four-name list that cannot contain `openAssetEditor`.
+describe('a held asset editor refuses the move (#1362)', () => {
+  const seed = () => {
+    fs.mkdirSync(path.join(tmp, 'assets'), { recursive: true });
+    fs.writeFileSync(path.join(tmp, 'assets', 'tex.png'), 'png');
+  };
+
+  it('refuses with 423 HELD_BY_ASSET_EDITOR, and does NOT move the file', async () => {
+    seed();
+    editorHold = { path: '/assets/tex.png' };
+    const r = await move('/assets/tex.png', '/assets/moved.png');
+    expect(r?.status).toBe(423);
+    expect(r?.body?.code).toBe('HELD_BY_ASSET_EDITOR');
+    // 423, not 409: COLLISION_STATUS is 409 and undoFailure reads it as `userFixable`, which
+    // toasted "something already exists at the original path" for a hold refusal.
+    expect(r?.status).not.toBe(409);
+    expect(fs.existsSync(path.join(tmp, 'assets', 'tex.png'))).toBe(true);
+    expect(fs.existsSync(path.join(tmp, 'assets', 'moved.png'))).toBe(false);
+    // A refusal with no way out is a wedge (mcp-tool-conventions §5).
+    expect(Array.isArray(r?.body?.options)).toBe(true);
+  });
+
+  it('allows the move when nothing is held', async () => {
+    seed();
+    editorHold = null;
+    const r = await move('/assets/tex.png', '/assets/moved.png');
+    expect(r?.status).toBeUndefined();   // the route leaves 200 implicit
+    expect(fs.existsSync(path.join(tmp, 'assets', 'moved.png'))).toBe(true);
+  });
+
+  it('a hold on an UNRELATED asset does not refuse', async () => {
+    seed();
+    editorHold = { path: '/assets/other.png' };
+    const r = await move('/assets/tex.png', '/assets/moved.png');
+    expect(r?.status).toBeUndefined();
+  });
+
+  // The router's prefix match is a SECOND implementation of the one in assetOps.ts — the panel's
+  // copy is unit-tested, this one was not, so dropping its trailing slash reddened nothing.
+  it('a FOLDER move catches a texture held underneath it, but not a name-prefix sibling', async () => {
+    fs.mkdirSync(path.join(tmp, 'assets', 'sprites'), { recursive: true });
+    fs.writeFileSync(path.join(tmp, 'assets', 'sprites', 'tex.png'), 'png');
+    editorHold = { path: '/assets/sprites/tex.png' };
+    expect((await move('/assets/sprites', '/assets/moved'))?.status).toBe(423);
+
+    fs.mkdirSync(path.join(tmp, 'assets', 'spr'), { recursive: true });
+    fs.writeFileSync(path.join(tmp, 'assets', 'spr', 'a.png'), 'png');
+    editorHold = { path: '/assets/sprites/tex.png' };
+    expect((await move('/assets/spr', '/assets/spr2'))?.status).toBeUndefined();
+  });
+
+  // The fail-open the first cut had: a renderer that does not KNOW the registry answers without
+  // covering it, and "nothing was checked" must not read as "nothing is held".
+  it('refuses 503 when the renderer cannot answer for the registry (skew)', async () => {
+    seed();
+    editorHold = 'skew';
+    const r = await move('/assets/tex.png', '/assets/moved.png');
+    expect(r?.status).toBe(503);
+    expect(r?.body?.code).toBe('UNSAVED_STATE_UNKNOWN');
+    expect(fs.existsSync(path.join(tmp, 'assets', 'tex.png'))).toBe(true);
   });
 });

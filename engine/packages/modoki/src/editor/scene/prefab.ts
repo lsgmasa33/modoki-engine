@@ -1411,6 +1411,12 @@ export interface InstanceStructure {
   removed: number[];
   removedTraits: Record<number, string[]>;
   consumedEcsIds: Set<number>;
+  /** ecsId → the nested-prefab ROW localId it is the expansion of, for the nested instances
+   *  directly under this instance's members. This is the AUTHORITATIVE owned/independent split
+   *  (#1354): `serializeScene` must route by this rather than re-testing `PrefabInstance.
+   *  parentLocalId` itself, or the two disagree and an instance is written by neither — see the
+   *  ⚠️ note on the partition in `captureInstanceStructure`. */
+  ownedNested: Map<number, number>;
 }
 
 /** Snapshot every trait on a live entity (full schema fidelity, like serialize),
@@ -1478,7 +1484,7 @@ function snapshotAddedTraits(ecsId: number): { bag: Record<string, Record<string
  *  components it removed from surviving members. (Added components are already
  *  captured as added-trait overrides by captureInstanceOverrides.) */
 export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabFile): InstanceStructure {
-  const empty: InstanceStructure = { added: [], removed: [], removedTraits: {}, consumedEcsIds: new Set() };
+  const empty: InstanceStructure = { added: [], removed: [], removedTraits: {}, consumedEcsIds: new Set(), ownedNested: new Map() };
   const PrefabInstanceMeta = getTraitByName('PrefabInstance');
   if (!PrefabInstanceMeta) return empty;
 
@@ -1524,29 +1530,82 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
   //                  it round-trips under its EXACT parent member rather than being
   //                  dropped / re-anchored to scene root.
   //  - 'none'      — not a nested-instance root (an ordinary added entity).
-  // Owned nested rows declared by THIS prefab, keyed "<parentMemberLocalId>:<source>".
-  // The fallback signal when a live instance lacks a stamped parentLocalId (legacy
-  // state) — an instance whose (anchor member, source) matches a prefab row is owned.
-  const ownedNestedRows = new Set<string>();
+  // ⚠️ This is a PARTITION over the rows, not a per-node test (#1354). A nested prefab row expands
+  // to EXACTLY ONE instance, so each row is claimed at most once and every other instance at that
+  // anchor is independent ('userAdded'). The old code answered per node against a `Set` of
+  // "<member>:<source>" keys, which any number of nodes could match: a duplicated nested root and a
+  // user-added instance under a member that already owned a row of that prefab both came back
+  // 'owned', both serialized into the one row's `nestedOverrides`, and the later one won — the other
+  // was silently lost on reload. Claiming per row is what makes that unrepresentable, and it is also
+  // what makes the row path a sound key for the scene-side structure slot (#1358).
+  //
+  // Owned nested rows declared by THIS prefab, grouped by anchor member + source. A prefab may nest
+  // the SAME source twice under one member, so each key holds a LIST of row localIds.
+  const rowsByAnchor = new Map<string, number[]>();
   for (const pe of prefab.entities) {
     if (!pe.prefab) continue;
     const ea = pe.traits['EntityAttributes'];
     const memberLocal = ea && typeof ea !== 'boolean' ? ((ea.parentId as number) || 0) : 0;
-    ownedNestedRows.add(`${memberLocal}:${pe.prefab}`);
+    const key = `${memberLocal}:${pe.prefab}`;
+    const rows = rowsByAnchor.get(key);
+    if (rows) rows.push(pe.localId);
+    else rowsByAnchor.set(key, [pe.localId]);
+  }
+  // Every self-rooted prefab instance hanging DIRECTLY under a member of this instance — the only
+  // place a row of this prefab can expand. Sorted by ecsId so the assignment below is deterministic
+  // rather than dependent on world-query order.
+  const nestedCandidates: { ecsId: number; key: string; stamp: number }[] = [];
+  for (const [memberEcs, memberLocal] of ecsToLocal) {
+    for (const child of childrenOf.get(memberEcs) || []) {
+      if (!child.traits.includes('PrefabInstance')) continue;
+      const pi = readTraitData(child.id, PrefabInstanceMeta);
+      if (!pi || pi.rootInstanceId !== child.id) continue;
+      nestedCandidates.push({
+        ecsId: child.id,
+        key: `${memberLocal}:${(pi.source as string) || ''}`,
+        stamp: (pi.parentLocalId as number) || 0,
+      });
+    }
+  }
+  nestedCandidates.sort((a, b) => a.ecsId - b.ecsId);
+  /** ecsId → the row localId it is the expansion of. Absent ⇒ independent. */
+  const ownedByEcs = new Map<number, number>();
+  const claimedRows = new Set<number>();
+  // Pass 1 — an exact stamp claims its own row. This is the signal the loader writes as each row
+  // expands (`instantiatePrefabIntoWorld`), so a correctly stamped instance always beats a legacy
+  // unstamped one competing for the same row.
+  //
+  // A stamp naming a row that is NOT at this candidate's anchor is not honoured — the row it names
+  // expands under a different member, so this instance cannot be that row's expansion.
+  // ⚠️ This is a consistency property, NOT a repaired symptom, and the distinction is worth keeping
+  // straight: the stamp is written at load from the row itself, and `reparentEntity` UNPACKS an owned
+  // nested root rather than relocating it stamped, so I could not reach a foreign-anchor stamp from
+  // the editor. It stays because `nestedRowPresent` now reads this same map: honouring such a stamp
+  // would report a row as present while nothing sits under its actual parent member, suppressing a
+  // legitimate `removed`.
+  for (const c of nestedCandidates) {
+    if (!c.stamp || claimedRows.has(c.stamp)) continue;
+    if (!rowsByAnchor.get(c.key)?.includes(c.stamp)) continue;
+    claimedRows.add(c.stamp);
+    ownedByEcs.set(c.ecsId, c.stamp);
+  }
+  // Pass 2 — legacy/minimal data: an UNSTAMPED instance can still be a row's own expansion (a scene
+  // written before the stamp existed). It may only take a row that nothing stamped has claimed.
+  for (const c of nestedCandidates) {
+    if (c.stamp) continue;
+    const row = (rowsByAnchor.get(c.key) || []).find((lid) => !claimedRows.has(lid));
+    if (row === undefined) continue;
+    claimedRows.add(row);
+    ownedByEcs.set(c.ecsId, row);
   }
   const nestedRootKind = (ecsId: number): 'owned' | 'userAdded' | 'none' => {
     const info = byId.get(ecsId);
     if (!info?.traits.includes('PrefabInstance')) return 'none';
     const pi = readTraitData(ecsId, PrefabInstanceMeta);
     if (!pi || pi.rootInstanceId !== ecsId) return 'none';
-    // Primary signal: a stamped parentLocalId means it expanded from a prefab row.
-    if (((pi.parentLocalId as number) || 0) > 0) return 'owned';
-    // Fallback (parentLocalId absent — legacy/minimal data): match the parent
-    // prefab's own nested rows by (anchor member localId, source).
-    const memberLocal = ecsToLocal.get(info.parentId) ?? 0;
-    const source = (pi.source as string) || '';
-    if (memberLocal && ownedNestedRows.has(`${memberLocal}:${source}`)) return 'owned';
-    return 'userAdded';
+    // A nested root deeper than a member (under a plain added node) is never a candidate above, so
+    // it cannot be a row of THIS prefab — 'userAdded' captures it instead of dropping it.
+    return ownedByEcs.has(ecsId) ? 'owned' : 'userAdded';
   };
 
   // ── removed entities (prefab members with no live counterpart), top-most only ──
@@ -1568,16 +1627,24 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
   // (legacy) root of that prefab counts as present, and so does a row whose prefab is not cached
   // (it expanded to nothing, which is not a removal) or whose parent member is gone (its own
   // removal covers it).
+  // Reads the SAME assignment `nestedRootKind` does (`claimedRows`), rather than re-deriving
+  // presence with its own `(source, stamp)` scan. Two independent answers to "is this row still
+  // here" is how a row could be both claimed twice by the classifier and reported present here;
+  // one claim map means they cannot disagree.
+  //
+  // ⚠️ Except in the one direction where being wrong DELETES data. An unstamped instance cannot say
+  // which row it expands from, so at an anchor holding one, every row there is ambiguous — and pass 2
+  // resolves that by picking the first unclaimed row in prefab-file order. Letting an arbitrary pick
+  // decide `removed[]` would delete a DIFFERENT row on reload purely because of file ordering, where
+  // the pre-#1354 code (whose `stamp === 0` matched every row) wrote nothing at all. So presence
+  // stays lenient exactly there: claimed, OR ambiguous because something unstamped sits at the
+  // anchor. Classification keeps the strict partition; only this destructive edge is lenient.
+  const anchorsWithUnstamped = new Set(nestedCandidates.filter((c) => !c.stamp).map((c) => c.key));
   const nestedRowPresent = (pe: PrefabFile['entities'][number]): boolean => {
-    const parentMember = localToEcs.get(prefabParent.get(pe.localId) ?? 0);
+    const parentLocal = prefabParent.get(pe.localId) ?? 0;
+    const parentMember = localToEcs.get(parentLocal);
     if (!parentMember || !getCachedPrefabSync(pe.prefab!)) return true;
-    return (childrenOf.get(parentMember) || []).some((c) => {
-      if (!c.traits.includes('PrefabInstance')) return false;
-      const pi = readTraitData(c.id, PrefabInstanceMeta);
-      if (!pi || pi.rootInstanceId !== c.id || pi.source !== pe.prefab) return false;
-      const stamp = (pi.parentLocalId as number) || 0;
-      return stamp === pe.localId || stamp === 0;
-    });
+    return claimedRows.has(pe.localId) || anchorsWithUnstamped.has(`${parentLocal}:${pe.prefab}`);
   };
   const removedSet = new Set<number>();
   for (const pe of prefab.entities) {
@@ -1653,7 +1720,7 @@ export function captureInstanceStructure(rootInstanceId: number, prefab: PrefabF
     }
   }
 
-  return { added, removed, removedTraits, consumedEcsIds };
+  return { added, removed, removedTraits, consumedEcsIds, ownedNested: ownedByEcs };
 }
 
 /** A nested instance captured as a reference: its source + per-instance diffs,
@@ -2877,7 +2944,9 @@ function subtractRevertedStructure(
   }
   // Every added live entity (reverted or kept) is in consumedEcsIds and gets torn
   // down; kept ones are re-spawned from `added`. So consumedEcsIds is unchanged.
-  return { added, removed, removedTraits, consumedEcsIds: full.consumedEcsIds };
+  // `ownedNested` likewise: reverting an add or a removal does not change WHICH instance is a
+  // given nested row's own expansion.
+  return { added, removed, removedTraits, consumedEcsIds: full.consumedEcsIds, ownedNested: full.ownedNested };
 }
 
 /** Everything the dialog needs to wire undo/redo for a revert. The instance is

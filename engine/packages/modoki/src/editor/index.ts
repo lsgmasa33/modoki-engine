@@ -113,7 +113,7 @@ export {
   readMetaPreferringPark, metaWrittenToDisk, metaReadFallback, type PreferredMetaRead,
 } from './scene/pendingMeta';
 export { importModel } from './scene/modelImport';
-export { useEditorStore, GIZMO_MODES, GIZMO_SPACES, SCENE_VIEW_MODES, ASSET_EDITOR_KINDS } from './store/editorStore';
+export { useEditorStore, GIZMO_MODES, GIZMO_SPACES, SCENE_VIEW_MODES, ASSET_EDITOR_KINDS, dirtyAssetEditorHolds } from './store/editorStore';
 export type { AssetEditorKind, AssetEditorMount } from './store/editorStore';
 export { colliderEditBlocker, isColliderEditable } from './scene/colliderEditable';
 export type { SelectedAsset } from './store/editorStore';

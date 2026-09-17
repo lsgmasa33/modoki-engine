@@ -88,6 +88,34 @@ export interface AssetEditorMount {
   path: string | null;
   /** Sprite editor only: the guids of the slices it currently holds (`select-sprite-slice`'s table). */
   slices?: readonly string[];
+  /** `true` while this editor holds edits that are not on disk (#1362).
+   *
+   *  ⚠️ This is the ONLY place that knows. The Sprite and 9-slice editors park nothing in
+   *  `dirtyAsset`/`pendingMeta`, so the unsaved-work registries those gates read are blind to them —
+   *  a move that yanked the modal away destroyed the edits with `unsavedChanges` still reporting
+   *  false. A move/rename of the asset an editor holds this way is REFUSED (owner, 2026-09-18),
+   *  which is why the flag has to be published rather than inferred. */
+  dirty?: boolean;
+}
+
+/** Asset editors currently holding edits that are not on disk — the Sprite and 9-slice editors
+ *  (#1362).
+ *
+ *  ⚠️ **This is the ONLY thing that knows.** Both modals keep their edits in local component state
+ *  and park NOTHING in `dirtyAsset`/`pendingMeta`, so every unsaved-work gate that reads those
+ *  registries is blind to them: a move that unmounted the modal destroyed the edits while
+ *  `unsavedChanges` still reported false. Read by the `resolve-unsaved` probe (so the backend's
+ *  move route can refuse) and by the Assets panel's own move paths, which run in this process —
+ *  one implementation, because a second copy is how the two answers drift.
+ *
+ *  Not a hook: called from event handlers and from an op, neither of which is a render. */
+export function dirtyAssetEditorHolds(): Array<{ kind: AssetEditorKind; path: string }> {
+  const mounts = useEditorStore.getState().editorMounts;
+  const out: Array<{ kind: AssetEditorKind; path: string }> = [];
+  for (const [kind, mount] of Object.entries(mounts)) {
+    if (mount?.dirty && mount.path) out.push({ kind: kind as AssetEditorKind, path: mount.path });
+  }
+  return out;
 }
 
 export interface SelectedAsset {
@@ -873,7 +901,15 @@ export const useEditorStore = create<EditorState>((set, get) => {
       set({ editorMounts: next });
       return;
     }
-    if (cur && cur.path === mount.path && sameSlices(cur.slices, mount.slices)) return;
+    // ⚠️ `dirty` is part of the comparison, and leaving it out made the whole #1362 hold inert.
+    // The dedup exists so `select-sprite-slice` does not churn on an unchanged slice table; a
+    // publish that flips ONLY `dirty` is a real change. Without this clause the 9-slice editor
+    // (which publishes no `slices` and whose `path` never changes for a mounted instance) could
+    // never register a hold at all, and the Sprite Editor's hold degraded to "the guid list
+    // changed" — which is precisely what `spriteSheetDigest` exists NOT to be, since a rect drag
+    // keeps every guid.
+    if (cur && cur.path === mount.path && sameSlices(cur.slices, mount.slices)
+      && !!cur.dirty === !!mount.dirty) return;
     set({ editorMounts: { ...get().editorMounts, [kind]: mount } });
   },
   /** Click-to-focus. Journals `!focus` on a real SCOPE CHANGE only — a commit point, so the

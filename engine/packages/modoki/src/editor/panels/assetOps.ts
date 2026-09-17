@@ -17,6 +17,7 @@ import { serializePrefab, preloadNestedPrefabsForSubtree, tagEntityTreeAsInstanc
 import { entityRef } from '../undo/entityRef';
 import { reportUndoFailure } from '../undo/undoFailure';
 import type { UndoAction } from '../undo/undoManager';
+import { dirtyAssetEditorHolds } from '../store/editorStore';
 import { registerAsset } from '../../runtime/loaders/assetManifest';
 import { firstAssetRoot } from './assetRoots';
 import { pastePathIn, splitAssetPath, type AssetEntry } from '../utils/assetPaths';
@@ -391,6 +392,30 @@ export async function moveFileTo(from: string, to: string): Promise<boolean> {
  *  (`if (await moveFileTo(a, b))`), and an object return is ALWAYS truthy — so
  *  widening it in place would silently disarm each of those guards while
  *  typechecking cleanly. */
+/** The texture editor holding unsaved edits on any of `froms` (or on something under one, for a
+ *  folder move), as a ready-to-show message — or `null` when nothing is held.
+ *
+ *  ⚠️ NOT the guard. `/api/move-file` refuses the move itself (#1362), and it has to: the agent
+ *  route never comes through this panel. This exists because `moveFileToStatus` keeps only
+ *  `{ok, status}` and throws the reason away, so a refused human rename would look like a move that
+ *  simply did not happen. Same fact, one source — `dirtyAssetEditorHolds()`. */
+export function assetEditorHoldMessage(froms: readonly string[]): string | null {
+  // ⚠️ Case-folded, because the BACKEND's matcher is (`heldAssetEditorRefusal`, via
+  // `absToAssetUrl` + `toLowerCase`). This is a second implementation of one predicate — the
+  // docblock above says "same fact, one source", and that was only true of the FACT, not of the
+  // matching. Left unfolded, a `from` spelled in a different case than the mount path produced NO
+  // panel message and a backend refusal anyway: the silent no-op this message exists to prevent,
+  // on a case-insensitive filesystem where both spellings name one file (#1261/#1273's class).
+  const lower = froms.map((f) => f.toLowerCase());
+  const holds = dirtyAssetEditorHolds().filter(({ path }) => {
+    const p = path.toLowerCase();
+    return lower.some((from) => p === from || p.startsWith(`${from}/`));
+  });
+  if (!holds.length) return null;
+  const which = holds.map((h) => `the ${h.kind} editor (${h.path})`).join(' and ');
+  return `Unsaved edits in ${which} — Save or Cancel it first, then move the asset.`;
+}
+
 export async function moveFileToStatus(from: string, to: string): Promise<{ ok: boolean; status: number }> {
   try {
     const res = await backendFetch('/api/move-file', {

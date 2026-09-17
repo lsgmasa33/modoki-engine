@@ -693,6 +693,8 @@ interface OverrideCarrier {
   overrides?: Record<string, unknown>;
   /** One level deeper — `{ path: { localId: { TraitName: { …fields } } } }`. */
   nestedOverrides?: Record<string, Record<string, unknown>>;
+  /** Path-keyed nested STRUCTURE (#1358) — its `added[]` nodes carry refs like any other. */
+  nestedStructure?: Record<string, { added?: unknown[] }>;
   /** Structural additions; a reference-style node is itself a nested instance. */
   added?: unknown[];
   children?: unknown[];
@@ -734,7 +736,12 @@ function extractEntityRefs(
     // Each nested node is its own ENTITY, so re-derive the source from ITS attributes —
     // attributing a child's refs to the subtree root would name the wrong entity in a
     // reference report, which is the one thing the report exists to get right.
-    for (const child of [...(node.added ?? []), ...(node.children ?? [])]) {
+    // #1358's `nestedStructure` holds added nodes too. This walker is the THIRD one — its own
+    // docblock claims parity with `collectResourceRefsFromEntities`, and that claim is what makes
+    // the omission expensive: for a document with no `resources[]` an unqueued ref reaches
+    // vite-asset-scanner's guid check and FAILS THE BUILD on legitimate authoring.
+    const fromStructure = Object.values(node.nestedStructure ?? {}).flatMap((d) => d.added ?? []);
+    for (const child of [...(node.added ?? []), ...(node.children ?? []), ...fromStructure]) {
       if (!child || typeof child !== 'object') continue;
       const c = child as OverrideCarrier;
       const ea = (c.traits?.['EntityAttributes'] ?? {}) as { guid?: string; name?: string; parentId?: string };

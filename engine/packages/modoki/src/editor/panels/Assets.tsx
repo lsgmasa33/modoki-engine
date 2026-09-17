@@ -24,7 +24,7 @@ import {
   describeRefusedDeletes, planDeleteOutcome,
   duplicateAssetFile as duplicateAsset, createFolderApi, moveFileTo, createPrefabFromEntity,
   reimportTargets, planImports, refreshHandlerTypes, HANDLER_TYPES,
-  deletionPathsFor, planRename,
+  deletionPathsFor, planRename, assetEditorHoldMessage,
 } from './assetOps';
 import { resolveClickSelection, dragPathsFor } from './assetSelection';
 import { createStoreSelectionTracker, revealKeysFor } from './assetReveal';
@@ -1145,6 +1145,11 @@ export default function Assets() {
       return;
     }
     const { toPath, base: safe } = plan;
+    // #1362: the backend refuses this move while a texture editor holds unsaved edits on it, and
+    // `moveFileTo` keeps only ok/false — so say WHY here rather than letting the rename look like a
+    // no-op. The refusal itself stays server-side; this is the message, not the guard.
+    const held = assetEditorHoldMessage([asset.path]);
+    if (held) { useEditorStore.getState().showToast(held, 'warn'); return; }
     const ok = await moveFileTo(asset.path, toPath);
     if (!ok) { console.error(`[Assets] Failed to rename ${asset.path}`); return; }
     console.log(`[Assets] Renamed ${asset.path} → ${toPath}`);
@@ -1284,6 +1289,12 @@ export default function Assets() {
     // into the current location), else the root.
     const targetFolder = targetOverride ?? defaultTargetFolder();
     const taken = new Set(assets.map((a) => a.path));
+    // #1362: a CUT is a move, so the same refusal applies. A COPY is not — it leaves the held asset
+    // where it is, so an open editor is no reason to block it.
+    if (clipboard.op === 'cut') {
+      const cutHeld = assetEditorHoldMessage(clipboard.paths);
+      if (cutHeld) { useEditorStore.getState().showToast(cutHeld, 'warn'); return; }
+    }
     const done: { from: string; to: string }[] = [];
     for (const from of clipboard.paths) {
       const to = pastePathIn(targetFolder, from, taken);
@@ -1345,6 +1356,10 @@ export default function Assets() {
     if (isFolderPath(newPath, { pendingFolders, diskFolders, assets })) {
       console.warn(`[Assets] Folder already exists: ${newPath}`); return;
     }
+    // #1362: the fourth move seam, and the one that needs the reason MOST — the held texture is not
+    // the thing the user named, so a silent no-op is baffling here.
+    const heldFolder = assetEditorHoldMessage([node.path]);
+    if (heldFolder) { useEditorStore.getState().showToast(heldFolder, 'warn'); return; }
     const ok = await moveFileTo(node.path, newPath);
     if (!ok) { console.error(`[Assets] Failed to rename folder ${node.path}`); return; }
     const oldPath = node.path;
@@ -1574,6 +1589,11 @@ export default function Assets() {
     // #1257 — a multi-drag carries the whole selection, sprite rows included (the asset-paths payload
     // needs them), but a sprite has no file to move: each one 404'd and logged "Could not move".
     const planned = planFilesDropMoves(fileActionPaths(filePaths, assets), targetFolder, (p) => isFolderPath(p, known));
+    // #1362: refuse the WHOLE drop when a texture editor holds unsaved edits on anything in it,
+    // rather than moving the other items and leaving that one behind — a half-applied drag is worse
+    // to undo than one that did not start. The backend refuses the move itself; this is the reason.
+    const dropHeld = assetEditorHoldMessage(planned.map((m) => m.from));
+    if (dropHeld) { useEditorStore.getState().showToast(dropHeld, 'warn'); return; }
     const moves: DropMove[] = [];
     for (const m of planned) {
       // `moveFileTo(from, TO)`, not `moveFile(from, FOLDER)`: the planner has already derived the

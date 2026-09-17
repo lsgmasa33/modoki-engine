@@ -944,11 +944,21 @@ export function normalizeAssetUrl(assetPath: string): string {
  *  `unsavedChangeCauses()`. ⚠️ Two causes share `liveScene` — the PRIMARY scene's pathless boolean
  *  and the loaded BASES' guids — because "does this file back a scene with unsaved live edits?" is
  *  one question here. */
-export type UnsavedRegistry = 'dirtyAsset' | 'pendingMeta' | 'pendingBaseScene' | 'liveScene';
+export type UnsavedRegistry = 'dirtyAsset' | 'pendingMeta' | 'pendingBaseScene' | 'liveScene' | 'openAssetEditor';
 /** ⚠️ `liveScene` is not discardable: dropping live-world edits means RELOADING the scene, which is
  *  `load_scene {discardUnsaved}`'s job. Absent by type so it cannot be asked for. */
-export type DiscardableRegistry = Exclude<UnsavedRegistry, 'liveScene'>;
+export type DiscardableRegistry = Exclude<UnsavedRegistry, 'liveScene' | 'openAssetEditor'>;
 const ALL_UNSAVED_REGISTRIES: readonly UnsavedRegistry[] =
+  ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene', 'openAssetEditor'];
+/** The registries that hold an unsaved DOCUMENT — everything except `openAssetEditor`, which is a
+ *  modal holding component state (#1362).
+ *
+ *  ⚠️ The two stale-read disclosures below want exactly this, not `ALL_UNSAVED_REGISTRIES`. A dirty
+ *  Sprite Editor does not make a prefab read stale and has nothing to do with a scene mutation, so
+ *  asking for everything there would report a hold that is true and irrelevant — and on
+ *  `/api/scene-mutate`, which REFUSES on a hold, it would block scene edits because a texture modal
+ *  is open somewhere. */
+const DOCUMENT_UNSAVED_REGISTRIES: readonly UnsavedRegistry[] =
   ['dirtyAsset', 'pendingMeta', 'pendingBaseScene', 'liveScene'];
 
 export type UnsavedHold = { path: string; registry: UnsavedRegistry; detail?: string };
@@ -1064,6 +1074,82 @@ async function unsavedGate(
     if (relayProvesNoRenderer(msg)) return { kind: 'absent' };
     return { kind: 'unknown', reason: msg };
   }
+}
+
+/** Refuse an operation that would destroy a texture editor's unsaved edits (#1362, owner
+ *  2026-09-18). Shared by `/api/move-file` and `/api/delete-asset` because it is ONE mechanism:
+ *  both unmount the modal, and the delete destroys the file too, so leaving it off there would keep
+ *  the strictly worse half of the same defect open (CLAUDE.md's sibling rule).
+ *
+ *  ⚠️ A GLOBAL probe plus a local prefix match, the shape `/api/delete-asset` already uses for its
+ *  document registries: a FOLDER operation must catch a texture held underneath it, which a
+ *  path-scoped ask cannot see.
+ *
+ *  ⚠️ Refuses on `unknown` as well as `held`. Acting only on `held` fails OPEN against exactly the
+ *  skew this probe anticipates — a pre-#1362 renderer answers `unknown registry "openAssetEditor" —
+ *  nothing was checked`, and reading that as "nothing is held" destroys the work. `absent` proceeds:
+ *  with no renderer there is no modal to hold anything.
+ *
+ *  ⚠️ 423, not 409. `COLLISION_STATUS` is 409 and `undoFailure.ts` reads that as `userFixable`, so
+ *  an undo refused here toasted "something already exists at the original path" — false.
+ *
+ *  ⚠️ NOT routed through `unsavedRefusal`, deliberately: that offers `discardUnsaved:true` as the
+ *  way out, and this registry is excluded from `DiscardableRegistry` BY TYPE — there is nothing to
+ *  discard, because Save and Cancel are the modal's only exits (owner, 2026-08-18). Offering a
+ *  discard here would be a refusal naming an exit that does not exist. */
+async function heldAssetEditorRefusal(
+  ctx: BackendContext,
+  absTarget: string,
+  verb: string,
+  /** Refuse when the probe could not answer. `/api/move-file` sets this because it has no OTHER
+   *  gate, so a fall-through there is a straight fail-open. `/api/delete-asset` leaves it off: its
+   *  own document-registry gate already refuses an unanswerable probe, under the `NO_RENDERER` code
+   *  its tests pin — two refusals racing to answer the same question would just replace that code
+   *  with a less specific one. */
+  opts: { refuseOnUnknown?: boolean } = {},
+): Promise<{ body: Record<string, unknown>; status: number } | null> {
+  const probed = await unsavedGate(ctx, null, { registries: ['openAssetEditor'] });
+  if (probed.kind === 'unknown' && opts.refuseOnUnknown) {
+    return {
+      status: 503,
+      body: {
+        ok: false,
+        code: 'UNSAVED_STATE_UNKNOWN',
+        error: `${verb} refused: could not establish whether an asset editor holds unsaved edits on `
+          + `this asset — ${probed.reason}. Refusing rather than risking the ${verb} destroying work `
+          + 'that is not on disk.',
+        options: [
+          "modoki_save_all — flush the human's work to disk first, then repeat this call",
+          'retry — the probe may simply have timed out under load',
+        ],
+      },
+    };
+  }
+  if (probed.kind !== 'held') return null;
+  const targetUrl = (ctx.absToAssetUrl(absTarget) || '').toLowerCase();
+  // No canonical url for the target (the asset root itself) → treat it as containing everything,
+  // the same fallback `/api/delete-asset` applies to its own candidates.
+  const blocking = targetUrl
+    ? probed.holds.filter((h) => {
+      const p = h.path.toLowerCase();
+      return p === targetUrl || p.startsWith(`${targetUrl}/`);
+    })
+    : probed.holds;
+  if (!blocking.length) return null;
+  return {
+    status: 423,
+    body: {
+      ok: false,
+      code: 'HELD_BY_ASSET_EDITOR',
+      error: `${verb} refused: an asset editor has unsaved edits on this asset — Save or Cancel it `
+        + `first, then ${verb} it.`,
+      held: blocking.map((h) => ({ path: h.path, detail: h.detail })),
+      options: [
+        'save the open editor (its Save button), then repeat this call',
+        'cancel the open editor to discard its edits, then repeat this call',
+      ],
+    },
+  };
 }
 
 /** Rows the renderer sent, with anything malformed dropped rather than trusted. */
@@ -2365,7 +2451,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       // mechanism; ALL_UNSAVED_REGISTRIES costs nothing on a path ask (a path that no registry
       // holds simply yields no row) and does not go stale if prefabs ever become parkable.
       const prefabStale = await unsavedGate(ctx, [normalizeAssetUrl(prefabPath!)], {
-        registries: ALL_UNSAVED_REGISTRIES,
+        registries: DOCUMENT_UNSAVED_REGISTRIES,
       });
       // No `schemaApplied`/`schemaAvailable` here: this pass consults no trait schema, and
       // reporting those fields would imply type checks ran when none did.
@@ -2900,7 +2986,7 @@ async function describeUnresolvedAgainstLiveWorld(
       // material and a pending baseScene ref just as surely as it discards live entities, and
       // none of those is keyed to the path being written.
       const mutateUnsaved = probeOutcome === 'answered'
-        ? await unsavedGate(ctx, null, { registries: ALL_UNSAVED_REGISTRIES })
+        ? await unsavedGate(ctx, null, { registries: DOCUMENT_UNSAVED_REGISTRIES })
         : { kind: 'absent' } as UnsavedOutcome;
       if (mutateUnsaved.kind === 'unknown') {
         // The editor-state probe answered and this one did not — a renderer IS alive, so this is
@@ -3095,6 +3181,19 @@ async function describeUnresolvedAgainstLiveWorld(
       // • The asset ROOT. `absToAssetUrl` returns null for it, so it is not in `candidates` and the
       //   probe was skipped outright while `resolved` still went to the trash. A resolved path with
       //   no canonical url is treated as containing everything.
+      // ⚠️ Held-editor refusal (#1362): a delete destroys the modal's unsaved edits AND the file,
+      // which is the strictly worse half of the move case the owner ruled on. Honours this route's
+      // OWN escapes rather than inventing stricter ones — `rendererWrite` is the editor deleting
+      // its own thing, and an explicit `discardUnsaved:true` is a caller accepting the loss, which
+      // is not the SILENT loss this refusal exists to stop. (`openAssetEditor` stays
+      // non-discardable by TYPE: that is about the probe being unable to clear it programmatically,
+      // not about a route being forbidden to proceed when told to.)
+      if (rendererWrite !== true && discardUnsaved !== true) {
+        for (const target of resolved) {
+          const refusal = await heldAssetEditorRefusal(ctx, target.abs, 'delete');
+          if (refusal) return json(refusal.body, refusal.status);
+        }
+      }
       if (resolved.length > 0 && rendererWrite !== true && discardUnsaved !== true) {
         const probed = await unsavedGate(ctx, null, { registries: ['dirtyAsset', 'pendingMeta', 'pendingBaseScene'] });
         const uncanonical = candidates.length < resolved.length;
@@ -3265,7 +3364,7 @@ async function describeUnresolvedAgainstLiveWorld(
       //
       // ⚠️ NO `paths` — the reachability walk spans the WHOLE graph, so ANY unsaved document can
       // change the answer. A path-scoped probe would look precise and under-report.
-      const staleness = await unsavedGate(ctx, null, { registries: ALL_UNSAVED_REGISTRIES });
+      const staleness = await unsavedGate(ctx, null, { registries: DOCUMENT_UNSAVED_REGISTRIES });
       const result = ctx.computeUnused();
       // Only offer the PROJECT's own assets for deletion. The shaker also walks
       // the engine's shared `/modoki/assets` root (built-in fonts/HDRs served to
@@ -3340,7 +3439,7 @@ async function describeUnresolvedAgainstLiveWorld(
       // reported as "nothing is there" — while a "0 references" verdict computed past a human's
       // unsaved edit did exactly that, six lines on. `stale-read`, no `paths` (the reverse walk
       // spans the whole graph), disclosed rather than refused — see the note on /api/unused-assets.
-      const staleness = await unsavedGate(ctx, null, { registries: ALL_UNSAVED_REGISTRIES });
+      const staleness = await unsavedGate(ctx, null, { registries: DOCUMENT_UNSAVED_REGISTRIES });
       const enumeration = ctx.computeRefEdges();
       const graph = buildRefGraph(enumeration);
 
@@ -4537,6 +4636,10 @@ async function describeUnresolvedAgainstLiveWorld(
       // explicitly allowed above. `startsWith(absFrom + sep)` already excludes equality.)
       if (absTo.startsWith(absFrom + path.sep)) {
         return json({ error: 'Destination is inside the source' }, 400);
+      }
+      {
+        const refusal = await heldAssetEditorRefusal(ctx, absFrom, 'move', { refuseOnUnknown: true });
+        if (refusal) return json(refusal.body, refusal.status);
       }
       // Is this a FOLDER move? The route is the only place that can answer — the client passes
       // two strings, and a folder and a file look identical in them. It decides both the
