@@ -17,6 +17,7 @@
 
 import * as THREE from 'three';
 import type { ErrorCode } from '../../tools/shared/mcpResult';
+import { histogram } from '../../tools/shared/filterDisclosure';
 import { OpRefusal } from '../debug/opRefusal';
 import { liveGuidOf } from '../debug/liveLifecycle';
 import {
@@ -58,7 +59,7 @@ import {
   upsertKey, findTrack, encodeValue,
   poseClipAtTime, exitPoseEnvelope, resolveAnimatorRootForClip,
   getCreatableAssets, createRegisteredAsset,
-  readEditorJournal, clearEditorJournal, withEditorActor, openActorLease, closeActorLease,
+  readEditorJournal, clearEditorJournal, editorJournalEpoch, editorJournalEpochChanged, resolveEditorJournalCursor, withEditorActor, openActorLease, closeActorLease,
   waitForEditorJournal, EDITOR_JOURNAL_SOURCES, isEditorJournalSource, EDITOR_JOURNAL_TYPES, isEditorJournalType,
   readMetaPreferringPark, peekPendingMeta, discardPendingMeta, getPendingMetaPaths,
   getResolvedRender3d,
@@ -1098,7 +1099,7 @@ export function registerEditorAgentOps(): void {
   // the shared `cap` capture counter — so Claude reads one ordered story ("pressed Play
   // → set timeScale 0.3 → @match on tick 84 → paused").
   registerAgentOp('editor-journal', (params) => {
-    const p = (params ?? {}) as { type?: string; source?: 'human' | 'agent'; since?: number; sinceCap?: number; clear?: boolean; merged?: boolean; limit?: number };
+    const p = (params ?? {}) as { type?: string; source?: 'human' | 'agent'; since?: number; epoch?: string; sinceCap?: number; clear?: boolean; merged?: boolean; limit?: number };
     // An unknown `source` matched nothing, so the read came back EMPTY under a filtered framing —
     // "the agent did nothing" for a typo. Refused with the options instead (#1072); the route used to
     // drop the value before it got here, and forwards it raw now so this can fire.
@@ -1120,26 +1121,35 @@ export function registerEditorAgentOps(): void {
     // cursor block when >limit events accrue between polls (they have a lower seq/cap than the
     // returned window, so no forward cursor can ever reach them). The cursor-LESS "what just
     // happened" call keeps the newest tail.
-    const histogram = <T>(items: readonly T[], typeOf: (t: T) => string): Record<string, number> => {
-      const b: Record<string, number> = {};
-      for (const it of items) { const k = typeOf(it); b[k] = (b[k] ?? 0) + 1; }
-      return b;
-    };
-    const editorAll = readEditorJournal({ type: p.type, source: p.source, since: p.since });
-    const edCursored = p.since != null;
+    // #1214 B-3: a cursor from before a renderer reload is ahead of every event this life has, so it
+    // would filter them all out. Reset it (and say so) rather than answer an empty stream.
+    const cursor = resolveEditorJournalCursor(p.since, p.epoch);
+    const since = cursor.since;
+    const editorAll = readEditorJournal({ type: p.type, source: p.source, since });
+    // #1214: `byType` used to be built over `editorAll` — the FILTERED list — so `type:'!transform'`
+    // answered `{editorTotal:0, byType:{}}`, which reads as an empty ring. It now describes the WHOLE
+    // ring (filter ignored) beside `ringTotal`, the same three-number contract `journal-events` and
+    // `console-logs` answer (docs/mcp-tool-conventions.md §2); `editorTotal` stays the filtered count.
+    const editorRing = p.type || p.source || since != null ? readEditorJournal() : editorAll;
+    const edCursored = since != null;
     const ed = (edCursored ? takeHead : takeTail)(editorAll, p.limit, EDITOR_JOURNAL_TAIL_DEFAULT);
     const result: {
-      editor: unknown[]; editorTotal: number; byType: Record<string, number>;
+      editor: unknown[]; editorTotal: number; ringTotal: number; byType: Record<string, number>; epoch: string; cursorReset?: string;
       truncated?: boolean; hint?: string; nextSeq?: number;
       game?: unknown[]; gameTotal?: number; gameByType?: Record<string, number>;
       timeline?: unknown[]; timelineTotal?: number; nextCap?: number;
-    } = { editor: ed.items, editorTotal: editorAll.length, byType: histogram(editorAll, (e) => String(e.type ?? '?')) };
+    } = {
+      editor: ed.items, editorTotal: editorAll.length,
+      ringTotal: editorRing.length, byType: histogram(editorRing, (e) => String(e.type ?? '?')),
+      epoch: editorJournalEpoch(),
+      ...(cursor.cursorReset ? { cursorReset: cursor.cursorReset } : {}),
+    };
     if (ed.truncated) {
       result.truncated = true;
       if (edCursored) {
         const lastSeq = (ed.items[ed.items.length - 1] as { seq?: number } | undefined)?.seq;
         if (lastSeq != null) result.nextSeq = lastSeq;
-        result.hint = `Showing the OLDEST ${ed.items.length} of ${editorAll.length} editor events after since=${p.since} (oldest first). Poll again with since=${result.nextSeq} to continue contiguously with no gap; raise limit=N to fetch more per poll.`;
+        result.hint = `Showing the OLDEST ${ed.items.length} of ${editorAll.length} editor events after since=${since} (oldest first). Poll again with since=${result.nextSeq} to continue contiguously with no gap; raise limit=N to fetch more per poll.`;
       } else {
         result.hint = tailHint('editor events', ed.items.length, editorAll.length, ', or narrow with type=/source=/since=');
       }
@@ -1159,7 +1169,14 @@ export function registerEditorAgentOps(): void {
       // (a few new editor events) + (the entire game journal). The editor `type`/
       // `source`/`since` filters shape only the `editor` array, NOT the timeline (which
       // is the full correlated story). cap is unique ⇒ no ties ⇒ a total order.
-      const capFloor = p.sinceCap ?? -Infinity;
+      // The `cap` counter restarts on a reload too (#1214 close-out review): a pre-reload `sinceCap`
+      // sent with its epoch replays this life's timeline instead of filtering all of it out.
+      const capReset = p.sinceCap != null && editorJournalEpochChanged(p.epoch);
+      if (capReset) {
+        result.cursorReset = `sinceCap=${p.sinceCap} was issued under epoch ${p.epoch}; the journal has restarted since (epoch ${editorJournalEpoch()}), so the timeline replays everything from the restart.`
+          + (result.cursorReset ? ` ${result.cursorReset}` : '');
+      }
+      const capFloor = capReset ? -Infinity : (p.sinceCap ?? -Infinity);
       const edAll = readEditorJournal(); // unfiltered — the timeline shows everything
       const timeline = [
         ...edAll.filter((e) => e.cap > capFloor).map((e) => ({ stream: 'editor' as const, ...e })),
@@ -1229,6 +1246,9 @@ export function registerEditorAgentOps(): void {
       return mark;
     },
     editorState: () => readEditorState() as unknown as Record<string, unknown>,
+    chromeLabels: () => collectHandles({ editor: 'chrome' }).map((h) => h.label ?? '').filter(Boolean),
+    chromeIds: () => collectHandles({ editor: 'chrome' }).map((h) => h.id),
+    entityNames: () => getAllEntities().map((e) => e.name ?? '').filter(Boolean),
   };
   _registerAgentOp('wait-for', (params) => {
     const p = (params ?? {}) as WaitCondition & { timeoutMs?: unknown };
@@ -1248,7 +1268,7 @@ export function registerEditorAgentOps(): void {
   // the one thing this tool exists to report. Same reasoning as 'actor-lease' above: this op
   // manages/observes attribution, so it must not itself be attributed.
   _registerAgentOp('wait-for-edit', (params) => {
-    const p = (params ?? {}) as { type?: string; source?: 'human' | 'agent'; since?: number; timeoutMs?: number };
+    const p = (params ?? {}) as { type?: string; source?: 'human' | 'agent'; since?: number; epoch?: string; timeoutMs?: number };
     // Refused BEFORE parking (#1072): an unknown source matches no event, so this would sit out the
     // whole timeout and answer `timedOut:true` — indistinguishable from "the human did nothing".
     if (p.source !== undefined && !isEditorJournalSource(p.source)) {
@@ -1259,7 +1279,30 @@ export function registerEditorAgentOps(): void {
     refuseUnknownJournalType('wait-for-edit', p.type, 'nothing was waited for');
     const requested = typeof p.timeoutMs === 'number' && Number.isFinite(p.timeoutMs) ? p.timeoutMs : WAIT_FOR_EDIT_DEFAULT_MS;
     const timeoutMs = Math.max(WAIT_FOR_EDIT_MIN_MS, Math.min(WAIT_FOR_EDIT_MAX_MS, requested));
-    return waitForEditorJournal({ type: p.type, source: p.source ?? 'human', since: p.since }, timeoutMs);
+    // #1214 B-3: a pre-reload cursor would park for the whole timeout while the human edits.
+    const cursor = resolveEditorJournalCursor(p.since, p.epoch);
+    return waitForEditorJournal({ type: p.type, source: p.source ?? 'human', since: cursor.since }, timeoutMs)
+      .then((r) => {
+        // EVERY reply is head-capped like a cursored editor-journal poll (contiguous: `nextSeq` is the
+        // last one RETURNED). A reset replays this whole life — up to the 2,000-event ring — and so
+        // does any far-behind cursor; capping only the reset moved the flood to the next call
+        // (#1214 close-out review). The cursor fields go FIRST, so a transport text cap cannot cut
+        // the fields that say where to resume.
+        const head = takeHead(r.events, undefined, EDITOR_JOURNAL_TAIL_DEFAULT);
+        const { events: _all, ...rest } = r;
+        const nextSeq = head.items.length ? head.items[head.items.length - 1].seq : r.nextSeq;
+        return {
+          ...(cursor.cursorReset ? { cursorReset: cursor.cursorReset } : {}),
+          ...rest,
+          nextSeq,
+          ...(head.truncated ? {
+            truncated: true,
+            totalCount: r.events.length,
+            hint: `Showing the OLDEST ${head.items.length} of ${r.events.length} matching events. Call again with since=${nextSeq} (and epoch) right away — the rest are already there, so it returns at once.`,
+          } : {}),
+          events: head.items,
+        };
+      });
   });
 
   // The witness lets the op distinguish "the target ACCEPTED this payload type" from
@@ -3065,7 +3108,13 @@ export function registerEditorAgentOps(): void {
     return {
       ok: true, saved: true, kind: p.kind, path: r.path, name: r.name, guid: r.guid,
       manifestRebuilt: r.manifestRebuilt,
-      note: 'The file is written and its GUID registered. Verify with modoki_list_assets (filter by name) — the backend manifest is rebuilt BEFORE this reply, so a check issued straight after sees it. NOT modoki_resolve_refs, which resolves ENTITY refs and never answers about an asset guid.',
+      // Derived from the flag beside it (#1214 A-15): a fixed sentence said "rebuilt" while
+      // `manifestRebuilt:false` said the opposite.
+      note: 'The file is written and its GUID registered. Verify with modoki_list_assets (filter by name) — '
+        + (r.manifestRebuilt
+          ? 'the backend manifest was rebuilt BEFORE this reply, so a check issued straight after sees it. '
+          : 'the backend manifest rebuild did NOT run (/api/rescan-assets failed), so a check issued straight after may not see it yet; the file watcher catches up within a few seconds. ')
+        + 'NOT modoki_resolve_refs, which resolves ENTITY refs and never answers about an asset guid.',
     };
   });
 

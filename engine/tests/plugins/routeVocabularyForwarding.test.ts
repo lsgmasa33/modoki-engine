@@ -253,3 +253,16 @@ describe('/api/device/request refuses an unknown input vocabulary value before a
     }
   });
 });
+
+// #1214 B-3: the journal cursor's `epoch` must reach the op, or a pre-reload cursor is never detected.
+describe('the journal routes forward the cursor epoch (#1214)', () => {
+  it.each([
+    { route: '/api/editor-journal', op: 'editor-journal' },
+    { route: '/api/wait-for-edit', op: 'wait-for-edit' },
+  ])('$route ?epoch reaches $op beside since', async ({ route, op }) => {
+    const { ctx, calls } = makeCtx(() => ({ ok: true }));
+    await get(ctx, route, 'since=5&epoch=abc-123');
+    expect(calls[0].op).toBe(op);
+    expect(calls[0].params).toMatchObject({ since: 5, epoch: 'abc-123' });
+  });
+});

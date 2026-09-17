@@ -136,7 +136,26 @@ onWorldSwap(() => { warnedDuplicates.clear(); });
  *  try, taking down the overlay render and every other provider's regions with it. That is the
  *  exact opposite of the isolation this function advertises, so the try wraps the loop too. */
 export function collectHitRegions(filter?: HitRegionFilter): HitRegion[] {
+  return collectHitRegionsReport(filter).regions;
+}
+
+/** A provider that could not answer — its regions are UNKNOWN, which is not the same as none. */
+export interface HitRegionProviderFailure { provider: string; error: string }
+
+/** {@link collectHitRegions}, plus the providers that failed while answering (#1214). Without this the
+ *  failure reached only the console, and the agent op explained the resulting empty list as "the
+ *  surface is not hit-testable right now" — a confident wrong cause for a crash.
+ *
+ *  A malformed `ids` (not an array) THROWS, before any provider runs: checked inside the per-provider
+ *  try, it blamed every provider in turn for the caller's mistake. A string there also used to
+ *  substring-match through `String.includes`. */
+export function collectHitRegionsReport(filter?: HitRegionFilter): { regions: HitRegion[]; failed: HitRegionProviderFailure[] } {
+  if (filter?.ids !== undefined && !Array.isArray(filter.ids)) {
+    throw new TypeError(`collectHitRegions: ids must be an array of region ids, got ${typeof filter.ids}`);
+  }
+  const ids = filter?.ids ? new Set(filter.ids) : undefined;
   const out: HitRegion[] = [];
+  const failed: HitRegionProviderFailure[] = [];
   const seen = new Set<string>();
   for (const [name, fn] of providers) {
     if (filter?.provider && filter.provider !== name) continue;
@@ -144,6 +163,7 @@ export function collectHitRegions(filter?: HitRegionFilter): HitRegion[] {
       const regions = fn() ?? [];
       if (!Array.isArray(regions)) {
         console.error(`[hitRegions] provider "${name}" returned ${typeof regions}, not an array — skipped`);
+        failed.push({ provider: name, error: `returned ${typeof regions}, not an array` });
         continue;
       }
       for (const r of regions) {
@@ -152,7 +172,7 @@ export function collectHitRegions(filter?: HitRegionFilter): HitRegion[] {
           continue;
         }
         if (filter?.kind && r.kind !== filter.kind) continue;
-        if (filter?.ids && !filter.ids.includes(r.id)) continue;
+        if (ids && !ids.has(r.id)) continue;
         // Duplicate ids are a bug and a quiet one — an overlay would draw both and a reader would
         // have no way to tell which shape belongs to which control. Warned once per id.
         if (seen.has(r.id)) {
@@ -172,11 +192,12 @@ export function collectHitRegions(filter?: HitRegionFilter): HitRegion[] {
       }
     } catch (e) {
       console.error(`[hitRegions] provider "${name}" failed — skipped`, e);
+      failed.push({ provider: name, error: e instanceof Error ? e.message : String(e) });
       continue;
     }
   }
   out.sort((a, b) => (a.order ?? Number.MAX_SAFE_INTEGER) - (b.order ?? Number.MAX_SAFE_INTEGER));
-  return out;
+  return { regions: out, failed };
 }
 
 // ── Shape geometry ───────────────────────────────────────────────────────────────────────────

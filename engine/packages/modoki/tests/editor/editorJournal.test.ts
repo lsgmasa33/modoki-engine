@@ -3,7 +3,7 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { setRunMode } from '../../src/runtime/core/playState';
-import { editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled, withEditorActor, waitForEditorJournal, AGENT_SCOPE_MAX_MS, _clearActorScopes } from '../../src/editor/editorJournal';
+import { editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled, withEditorActor, waitForEditorJournal, editorJournalEpoch, AGENT_SCOPE_MAX_MS, _clearActorScopes } from '../../src/editor/editorJournal';
 import { pushAction, pushSelectionChange, undo, redo, clearHistory, _setUndoClock } from '../../src/editor/undo/undoManager';
 import { nextCaptureSeq, _resetCaptureSeq } from '../../src/runtime/core/journal';
 
@@ -252,7 +252,8 @@ describe('waitForEditorJournal (#28 — long-poll)', () => {
       const p = waitForEditorJournal({ since: 0 }, 1000);
       vi.advanceTimersByTime(1000);
       const r = await p;
-      expect(r).toEqual({ events: [], timedOut: true, nextSeq: 0 });
+      // `epoch` names the journal life `nextSeq` belongs to (#1214 B-3).
+      expect(r).toEqual({ events: [], timedOut: true, nextSeq: 0, epoch: editorJournalEpoch() });
 
       // The waiter unsubscribed on timeout — a LATER emit must not retroactively affect a
       // result that already resolved (would be observable via an unhandled double-resolve

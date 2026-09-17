@@ -18,6 +18,7 @@
  *  a frame callback would not. */
 
 import { PLAY_STATES, RUN_MODES, type PlayState, type RunMode } from '@modoki/engine/runtime';
+import { LIVE_VOCABULARY_CAP, liveSet } from '../../tools/shared/filterDisclosure';
 
 export const WAIT_FOR_DEFAULT_MS = 5_000;
 export const WAIT_FOR_MIN_MS = 50;
@@ -93,10 +94,20 @@ export interface WaitReaders {
    *  it are the ones the wait may match. */
   consoleWatermark(lookbackMs: number): number;
   editorState(): Record<string, unknown>;
+  /** Every live chrome label / entity name, unfiltered (#1214). Optional: a wait that matched nothing
+   *  names what IS live from these, so a typo is visible in the same reply. */
+  chromeLabels?(): string[];
+  chromeIds?(): string[];
+  entityNames?(): string[];
 }
 
 export type WaitResult =
-  | { satisfied: true; elapsedMs: number; condition: string; observation: unknown }
+  | {
+    satisfied: true; elapsedMs: number; condition: string; observation: unknown;
+    /** An `absent` wait that held on the FIRST check — nothing matched when the wait began. */
+    alreadyAbsent?: true;
+    hint?: string;
+  }
   | { satisfied: false; timedOut: true; elapsedMs: number; condition: string; lastObservation: unknown };
 
 const KINDS = ['chrome', 'entity', 'console', 'editor'] as const;
@@ -218,6 +229,27 @@ function evalEditor(c: EditorCondition, readers: WaitReaders): Evaluation {
   return { satisfied: keys.every((k) => state[k] === (c as Record<string, unknown>)[k]), observation };
 }
 
+/** `label ∈ {…}` / `name ∈ {…}`, closest to what was asked first — or undefined when the reader is
+ *  absent, throws, or there is nothing live. Only chrome and entity waits address things by name. */
+function liveVocabulary(cond: WaitCondition, readers: WaitReaders): string | undefined {
+  try {
+    if (cond.chrome) {
+      // Name the vocabulary the caller ADDRESSED by: a typo'd id is not helped by a list of labels.
+      if (cond.chrome.id && !cond.chrome.label) {
+        const ids = readers.chromeIds?.() ?? [];
+        return ids.length ? `id ∈ ${liveSet(ids, LIVE_VOCABULARY_CAP, cond.chrome.id)}` : undefined;
+      }
+      const labels = readers.chromeLabels?.() ?? [];
+      return labels.length ? `label ∈ ${liveSet(labels, LIVE_VOCABULARY_CAP, cond.chrome.label)}` : undefined;
+    }
+    if (cond.entity && !cond.entity.guid) {
+      const names = readers.entityNames?.() ?? [];
+      return names.length ? `name ∈ ${liveSet(names, LIVE_VOCABULARY_CAP, cond.entity.name)}` : undefined;
+    }
+  } catch { /* a vocabulary is a courtesy; the wait's own answer stands */ }
+  return undefined;
+}
+
 function describeCondition(cond: WaitCondition): string {
   const kind = KINDS.find((k) => cond[k] !== undefined)!;
   return `${kind} ${JSON.stringify(cond[kind])}`;
@@ -245,6 +277,7 @@ export async function waitForCondition(cond: WaitCondition, deps: WaitDeps): Pro
   // happened must not satisfy "wait until it is logged", or a stale line from the last run reads as
   // this one. `lookbackMs` widens the window backwards on purpose, for the step that just ran.
   const consoleFrom = cond.console ? readers.consoleWatermark(cond.console.lookbackMs ?? 0) : 0;
+  let first = true;
   for (;;) {
     let ev: Evaluation;
     try {
@@ -263,9 +296,30 @@ export async function waitForCondition(cond: WaitCondition, deps: WaitDeps): Pro
       ev = { satisfied: false, observation: { readError: e instanceof Error ? e.message : String(e) } };
     }
     const elapsed = now() - start;
-    if (ev.satisfied) return { satisfied: true, elapsedMs: Math.round(elapsed), condition, observation: ev.observation };
+    if (ev.satisfied) {
+      // #1214 (owner decision, option A): an `absent` wait that holds on the first check still
+      // succeeds — a dialog that closed before the wait began is a legitimate answer — but a
+      // misspelled target also matches nothing, and "it went away" would be reported for something
+      // that was never there. So say it held immediately, and name what IS live.
+      if (first && (cond.chrome?.absent || cond.entity?.absent)) {
+        const live = liveVocabulary(cond, readers);
+        return {
+          satisfied: true, elapsedMs: Math.round(elapsed), condition, observation: ev.observation, alreadyAbsent: true,
+          hint: 'Nothing matched when the wait began, so this is not evidence that anything went away — if the target was never there (a typo), it will always be "absent".' +
+            (live ? ` Live now: ${live}.` : ''),
+        };
+      }
+      return { satisfied: true, elapsedMs: Math.round(elapsed), condition, observation: ev.observation };
+    }
+    first = false;
     if (elapsed >= deps.timeoutMs) {
-      return { satisfied: false, timedOut: true, elapsedMs: Math.round(elapsed), condition, lastObservation: ev.observation };
+      // A timeout that never matched anything names the live vocabulary, for the same reason.
+      const obs = ev.observation as { matches?: unknown } | undefined;
+      const live = obs && obs.matches === 0 ? liveVocabulary(cond, readers) : undefined;
+      return {
+        satisfied: false, timedOut: true, elapsedMs: Math.round(elapsed), condition,
+        lastObservation: live ? { ...obs, live } : ev.observation,
+      };
     }
     await sleep(Math.min(pollMs, deps.timeoutMs - elapsed));
   }

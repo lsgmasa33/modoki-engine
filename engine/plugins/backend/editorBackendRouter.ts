@@ -2367,6 +2367,8 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       // reporting those fields would imply type checks ran when none did.
       return json({
         path: prefabPath,
+        // The verdict the tool description promises (#1214 A-3) — `ok:false` is an ANSWER here.
+        ok: result.warnings.length === 0,
         warnings: result.warnings,
         ...(staleInputDisclosure(prefabStale) ?? {}),
       });
@@ -2422,6 +2424,7 @@ export async function handleBackendRequest(ctx: BackendContext, req: BackendRequ
       const sceneStale = await unsavedGate(ctx, null, { registries: ['pendingMeta', 'liveScene'] });
       return json({
         path: scenePath,
+        ok: result.warnings.length === 0, // the same verdict as validate-prefab (#1214 A-3)
         schemaApplied: result.schemaApplied,
         schemaAvailable: !!schema,
         warnings: result.warnings,
@@ -5098,7 +5101,7 @@ async function describeUnresolvedAgainstLiveWorld(
   // Percept: the human-activity stream (!-prefixed). merged also returns the game journal
   // + a single-axis `timeline` windowed by `sinceCap` (a shared `cap` cursor).
   if (urlPath === '/api/editor-journal' && method === 'GET') {
-    const params: { type?: string; source?: string; since?: number; sinceCap?: number; merged?: boolean; clear?: boolean; limit?: number } = {};
+    const params: { type?: string; source?: string; since?: number; epoch?: string; sinceCap?: number; merged?: boolean; clear?: boolean; limit?: number } = {};
     const type = query.get('type');
     const source = query.get('source');
     const since = query.get('since');
@@ -5108,6 +5111,8 @@ async function describeUnresolvedAgainstLiveWorld(
     // Forwarded RAW (#1072) — the op refuses an unknown source with its options. See /api/journal.
     if (source) params.source = source;
     if (since != null && since !== '' && !Number.isNaN(Number(since))) params.since = Number(since);
+    const epoch = query.get('epoch'); // #1214 B-3: the journal life the cursor belongs to
+    if (epoch) params.epoch = epoch;
     if (ejLimit != null && ejLimit !== '' && !Number.isNaN(Number(ejLimit))) params.limit = Number(ejLimit);
     if (sinceCap != null && sinceCap !== '' && !Number.isNaN(Number(sinceCap))) params.sinceCap = Number(sinceCap);
     if (query.get('merged') === '1' || query.get('merged') === 'true') params.merged = true;
@@ -5144,7 +5149,7 @@ async function describeUnresolvedAgainstLiveWorld(
   // this file can't import from it), or this HTTP round trip would die first and report a
   // legitimate 120s park as a dead backend instead of the op's own `timedOut:true`.
   if (urlPath === '/api/wait-for-edit' && method === 'GET') {
-    const params: { type?: string; source?: string; since?: number; timeoutMs?: number } = {};
+    const params: { type?: string; source?: string; since?: number; epoch?: string; timeoutMs?: number } = {};
     const type = query.get('type');
     const source = query.get('source');
     const since = query.get('since');
@@ -5154,6 +5159,8 @@ async function describeUnresolvedAgainstLiveWorld(
     // default and park waiting for the WRONG actor; the op refuses it instead. See /api/journal.
     if (source) params.source = source;
     if (since != null && since !== '' && !Number.isNaN(Number(since))) params.since = Number(since);
+    const epoch = query.get('epoch'); // #1214 B-3: the journal life the cursor belongs to
+    if (epoch) params.epoch = epoch;
     if (timeoutMsQ != null && timeoutMsQ !== '' && !Number.isNaN(Number(timeoutMsQ))) params.timeoutMs = Number(timeoutMsQ);
     const clampedOpTimeout = Math.max(50, Math.min(120_000, params.timeoutMs ?? 30_000));
     const relayTimeoutMs = clampedOpTimeout + 10_000; // headroom over the op's own deadline

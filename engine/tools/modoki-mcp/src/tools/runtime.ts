@@ -23,7 +23,7 @@ export function registerRuntimeTools(tool: ToolDef, ctx: ToolContext): void {
   // ── Phase A: semantic verification ──
   tool(
     'modoki_journal',
-    'Read the tick-stamped GAME-event trace (events a game emits: match/score/win/…) — not the editor-activity stream (modoki_editor_journal) or console output (modoki_get_console_logs). RETURNS {count, total, ringTotal, byType, events}: `count` is what came back, `total` is what MATCHED your filter, and `ringTotal`+`byType` describe the WHOLE ring regardless of the filter — so a filtered read still shows you what else is in there. The ' +
+    'Read the tick-stamped GAME-event trace (events a game emits: match/score/win/…) — not the editor-activity stream (modoki_editor_journal) or console output (modoki_get_console_logs). RETURNS {returnedCount, totalCount, ringTotal, byType, events}: `returnedCount` is what came back, `totalCount` is what MATCHED your filter, and `ringTotal`+`byType` describe the WHOLE ring regardless of the filter — so a filtered read still shows you what else is in there. The ' +
       'screenshot-free way to verify game LOGIC — assert on events, not pixels. Returns the ' +
       'LAST 100 events by default plus `byType` counts over the whole 10,000-event ring and ' +
       '`captures` (Tier-2 diagnostic state). Narrow with type= and/or level=, raise limit=N, pair ' +

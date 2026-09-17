@@ -40,6 +40,7 @@ export {
   editorEmit, readEditorJournal, clearEditorJournal, setEditorJournalEnabled,
   withEditorActor, AGENT_SCOPE_MAX_MS, openActorLease, closeActorLease, ACTOR_LEASE_TTL_MS, ACTOR_LEASE_GRACE_MS,
   waitForEditorJournal, type EditorEvent, type WaitForEditResult,
+  editorJournalEpoch, editorJournalEpochChanged, resolveEditorJournalCursor, type ResolvedEditorJournalCursor,
   EDITOR_JOURNAL_SOURCES, isEditorJournalSource, type EditorJournalSource,
   EDITOR_JOURNAL_TYPES, isEditorJournalType, type EditorJournalType,
 } from './editorJournal';

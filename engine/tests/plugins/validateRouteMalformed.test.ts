@@ -34,7 +34,7 @@ function makeCtx(): BackendContext {
 
 const get = (route: string, p: string) =>
   handleBackendRequest(makeCtx(), { method: 'GET', urlPath: route, query: new URLSearchParams({ path: p }), body: undefined }) as
-    Promise<{ status?: number; body: { warnings?: string[]; error?: string; schemaApplied?: boolean } }>;
+    Promise<{ status?: number; body: { ok?: boolean; warnings?: string[]; error?: string; schemaApplied?: boolean } }>;
 
 describe.each([
   ['/api/validate-prefab', '/crate.prefab.json'],
@@ -53,6 +53,15 @@ describe.each([
     const r = await get(route, file);
     expect(r.status ?? 200).toBe(200);
     expect((r.body.warnings ?? []).some((w) => /not valid JSON/.test(w))).toBe(false);
+    expect(r.body.ok).toBe(true);
+  });
+
+  // #1214 A-3: both tool descriptions promise `ok:false` as the answer; neither route ever sent `ok`.
+  it('a file with findings answers ok:false beside its warnings', async () => {
+    fs.writeFileSync(path.join(root, file.slice(1)), '{ "entities": [ ');
+    const r = await get(route, file);
+    expect(r.status ?? 200).toBe(200);
+    expect(r.body.ok).toBe(false);
   });
 
   it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('an unreadable file is still a 500 — a failed read is not a finding', async () => {

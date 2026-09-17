@@ -120,6 +120,7 @@ import { createEntityLive, duplicateEntityLive, deleteEntitiesLive, liveGuidOf }
 import { resolveEntityAddress, type EntityAddress } from './entityRef';
 import type { ErrorCode } from '../../tools/shared/mcpResult';
 import { INVALIDATABLE_ASSET_TYPES, type InvalidatableAssetType } from '../../tools/shared/invalidateAssets';
+import { describeFilter, emptyFilterHint, histogram } from '../../tools/shared/filterDisclosure';
 import { computeLayoutBounds, type LayoutBoundsParams, type LayoutEntry } from './layoutDump';
 import { tailWithCounts, tailHint, CONSOLE_TAIL_DEFAULT, JOURNAL_TAIL_DEFAULT } from './streamSummary';
 import { roundFloats, resolvePrecision } from './roundFloats';
@@ -144,7 +145,7 @@ import {
   getBootTimeline, getBootOrigin, bootSpansOverlapping, resetBootTimeline, getWorstStallWindow,
   getFrameProfile,
   setGpuTimingEnabled, resetGpuTimings,
-  collectHitRegions, hitRegionProviders, isHitRegionOverlayVisible, setHitRegionOverlayVisible,
+  collectHitRegions, collectHitRegionsReport, hitRegionProviders, isHitRegionOverlayVisible, setHitRegionOverlayVisible,
   regionsAt, nearestRegionTo,
   getFrameLoopHealth,
 } from '@modoki/engine/runtime';
@@ -442,11 +443,12 @@ export function dumpSceneState(params: SceneStateParams = {}) {
   // How many the DEFAULT resource exclusion left out — the constant F8 measured between this read and
   // the editor state's world count (136 vs 137), which nothing in the reply used to explain.
   const resourcesExcluded = all.length - wanted.length;
+  let guidMissed = false; // already explained by its own warning — the empty-filter hint would repeat it
   if (params.id != null) wanted = wanted.filter((e) => e.id === params.id);
   if (params.guid) {
     const ent = findEntityByGuid(params.guid);
     if (ent) { const gid = ent.id(); wanted = wanted.filter((e) => e.id === gid); }
-    else { wanted = []; warnings.push(`guid "${params.guid}" matched no entity in the live world (it may be stale — ids/entities rebuild on scene reload).`); }
+    else { wanted = []; guidMissed = true; warnings.push(`guid "${params.guid}" matched no entity in the live world (it may be stale — ids/entities rebuild on scene reload).`); }
   }
   if (params.name) {
     const q = params.name.toLowerCase();
@@ -590,7 +592,19 @@ export function dumpSceneState(params: SceneStateParams = {}) {
       (truncated ? ` Showing ${entities.length} of ${totalCount}; raise limit=N.` : '')
     : truncated
       ? `Showing ${entities.length} of ${totalCount}; raise limit=N or narrow the filter.`
-      : undefined;
+      // #1214: a targeted query that matched nothing answered `totalCount:0` with nothing beside it, so
+      // a typo'd `name=Plyer` read exactly like "that entity is gone". Say which one it was.
+      : targeted && totalCount === 0 && !guidMissed
+        ? emptyFilterHint({
+          what: 'entity',
+          filter: describeFilter({ id: params.id, guid: params.guid, name: params.name, where: params.where }),
+          unfilteredCount: all.length,
+          // A targeted query searches every entity, resources included — which a BARE read hides.
+          unfilteredLabel: 'exist in the world, resources included',
+          live: params.name ? { name: all.map((e) => e.name ?? '') } : undefined,
+          near: { name: params.name },
+        })
+        : undefined;
   return {
     scenePath: sceneManager.getCurrent()?.path ?? null,
     // §2 (#1217, #1223 D3): `returnedCount` is the rows below, `totalCount` every entity the query
@@ -783,8 +797,7 @@ registerAgentOp('console-logs', (params) => {
   // from a filtered read. Same three-number contract as modoki_journal (count/total/ringTotal),
   // because two tools answering the same question must answer it the same way (§8).
   const ring = p.level || p.since ? dumpConsoleLogs({}).logs : logs;
-  const byLevel: Record<string, number> = {};
-  for (const e of ring) byLevel[e.level] = (byLevel[e.level] ?? 0) + 1;
+  const byLevel = histogram(ring, (e) => e.level);
   return {
     logs: r.items,
     // §2 (#1217, #1223 D3, #1266): `returnedCount` is the rows here, `totalCount` everything the
@@ -1440,11 +1453,16 @@ registerAgentOp('watch-read', (params) => {
     return staleness ? { ...rounded, warnings: [staleness] } : rounded;
   }
   const totalSamples = out.series.reduce((n, s) => n + (typeof s.count === 'number' ? s.count : 0), 0);
+  // An empty-filter hint from `readWatch` (#1214) is the answer to "why is this empty?" and wins —
+  // the stats sentence below used to overwrite it on every default (samples:false) read.
+  const producerHint = (out as { hint?: unknown }).hint;
   const rounded = roundFloats({
     ...out,
     series: out.series.map(({ samples: _samples, ...rest }) => rest),
     totalSamples,
-    hint: `Stats only (${totalSamples} samples across ${out.series.length} series). Pass samples=true for the raw time-series.`,
+    hint: typeof producerHint === 'string'
+      ? producerHint
+      : `Stats only (${totalSamples} samples across ${out.series.length} series). Pass samples=true for the raw time-series.`,
   }, sig) as Record<string, unknown>;
   return staleness ? { ...rounded, warnings: [staleness] } : rounded;
 });
@@ -1536,8 +1554,23 @@ registerAgentOp('hit-regions', (raw: unknown) => {
     setHitRegionOverlayVisible(action === 'show');
     return { ok: true, visible: action === 'show', providers: hitRegionProviders() };
   }
+  // A non-array `ids` is the caller's mistake — refused here, not blamed on each provider in turn
+  // (#1214). Reachable only schema-less (`modoki.call`, eval): both MCP tools send an array.
+  // `null` is "no ids", as it always was — only a PRESENT non-array is refused.
+  if (p.ids === null) p.ids = undefined;
+  if (p.ids !== undefined && !(Array.isArray(p.ids) && p.ids.every((id) => typeof id === 'string'))) {
+    return {
+      ok: false, code: 'REFUSED_BY_OP',
+      error: `hit-regions: ids must be an array of region id strings, got ${Array.isArray(p.ids) ? 'an array with a non-string entry' : typeof p.ids} — nothing was read.`,
+      options: ['ids: ["<region id>", …]', 'omit ids to read every region'],
+    };
+  }
   const providers = hitRegionProviders();
-  const all = collectHitRegions({ provider: p.provider, kind: p.kind, ids: p.ids });
+  const report = collectHitRegionsReport({ provider: p.provider, kind: p.kind, ids: p.ids });
+  const all = report.regions;
+  // A provider that THREW has UNKNOWN regions. Named in the reply, so an empty or short list is not
+  // read as the surface's answer when part of it could not be asked.
+  const failedNames = new Set(report.failed.map((f) => f.provider));
   const limit = typeof p.limit === 'number' && Number.isFinite(p.limit) && p.limit > 0
     ? Math.floor(p.limit) : DEFAULT_HIT_REGION_LIMIT;
   const regions = all.slice(0, limit);
@@ -1547,6 +1580,7 @@ registerAgentOp('hit-regions', (raw: unknown) => {
     returnedCount: regions.length,
     totalCount: all.length,
     regions,
+    ...(report.failed.length ? { failedProviders: report.failed } : {}),
   };
   // The question a miss investigation actually asks, answered here rather than by making the
   // caller re-implement point-in-shape against the returned geometry — which is where a second,
@@ -1580,9 +1614,8 @@ registerAgentOp('hit-regions', (raw: unknown) => {
     //     (#1208 review: checking "any regions anywhere" told a correct `provider=board` on an
     //     unloaded board to check its spelling, because another provider had a region);
     //  3. only then is a `kind`/`ids` miss the filter's, with the kinds named FROM THE SCOPE.
-    // `ids` is formatted defensively: the op is reachable schema-less (`modoki.call`, eval), and a
-    // string there used to answer rather than throw.
-    const idsText = Array.isArray(p.ids) ? p.ids.join(',') : p.ids != null ? String(p.ids) : '';
+    // `ids` is an array of strings by here — anything else was refused above.
+    const idsText = p.ids ? p.ids.join(',') : '';
     const filterText = [p.provider && `provider=${p.provider}`, p.kind && `kind=${p.kind}`, idsText && `ids=${idsText}`]
       .filter(Boolean).join(' ');
     // Decide "a filter applied" by PRESENCE, not by the joined text: `ids: []` filters to nothing
@@ -1592,9 +1625,14 @@ registerAgentOp('hit-regions', (raw: unknown) => {
       result.hint = `No hit-region provider is named "${p.provider}". Registered: {${providers.join(', ')}} — `
         + 'check the spelling, or drop provider=.';
     } else if (scope.length === 0) {
-      const who = p.provider ? `Provider "${p.provider}" is` : `Provider(s) [${providers.join(', ')}]`;
-      result.hint = `${who} registered but reported no regions — the `
-        + 'surface is not hit-testable right now (no level loaded, or a modal is swallowing input).';
+      const inScope = p.provider ? [p.provider] : providers;
+      const threw = inScope.filter((n) => failedNames.has(n));
+      const quiet = inScope.filter((n) => !failedNames.has(n));
+      result.hint = [
+        threw.length ? `Provider(s) [${threw.join(', ')}] FAILED while reporting (see failedProviders and the console) — their regions are UNKNOWN, not absent.` : '',
+        quiet.length ? `${p.provider ? `Provider "${p.provider}" is` : `Provider(s) [${quiet.join(', ')}]`} registered but reported no regions — the `
+          + 'surface is not hit-testable right now (no level loaded, or a modal is swallowing input).' : '',
+      ].filter(Boolean).join(' ');
     } else {
       const kinds = [...new Set(scope.map((r) => r.kind))].sort();
       // With no provider filter, a correctly spelled kind can belong to a provider that is
@@ -1602,11 +1640,13 @@ registerAgentOp('hit-regions', (raw: unknown) => {
       // "check the spelling" is not the only reading offered (close-out review F2). `provider`
       // is stamped from the registry key, so it is safe to compare against `providers`.
       const reporting = new Set(scope.map((r) => r.provider));
-      const empty = p.provider ? [] : providers.filter((n) => !reporting.has(n));
+      const empty = p.provider ? [] : providers.filter((n) => !reporting.has(n) && !failedNames.has(n));
+      const threw = p.provider ? [] : providers.filter((n) => failedNames.has(n));
       result.hint = `No region matches the filter (${filterText || 'ids=[]'}), but ${scope.length} region(s) exist`
         + `${p.provider ? ` from "${p.provider}"` : ''}. Live kinds there: {${kinds.join(', ')}} — `
         + 'check the spelling, or drop the filter.'
-        + (empty.length ? ` Provider(s) [${empty.join(', ')}] reported NO regions right now (not hit-testable — no level loaded, or a modal is swallowing input), so a kind that only they draw cannot match yet.` : '');
+        + (empty.length ? ` Provider(s) [${empty.join(', ')}] reported NO regions right now (not hit-testable — no level loaded, or a modal is swallowing input), so a kind that only they draw cannot match yet.` : '')
+        + (threw.length ? ` Provider(s) [${threw.join(', ')}] FAILED while reporting, so a kind only they draw is unknown, not absent (see failedProviders).` : '');
     }
   } else if (regions.length < all.length) {
     result.hint = `${all.length} region(s) matched; showing the first ${regions.length}. Raise limit=, or filter by kind=/provider=.`;

@@ -9,6 +9,7 @@
  *  be imported by a test, so anything with logic in it ships unguarded. See
  *  `docs/mcp-response-budget.md` Phase 5, and the Phase-1 review that learned this the hard way. */
 
+import { describeFilter, emptyFilterHint } from '../../shared/filterDisclosure.js';
 import type { ToolErrorDetail } from './result.js';
 
 export interface AssetEntry { guid: string; path: string; name: string; type: string }
@@ -50,8 +51,16 @@ export function summarizeAssets(assets: AssetEntry[], q: AssetQuery = {}) {
     totalCount,
     assets: filtered,
     ...(truncated ? { truncated } : {}),
-    // A zero-result filter is the silent-empty trap: say so, and say how to recover.
-    ...(filtered.length === 0 ? { hint: 'No match. Call bare for per-type counts, or widen the filter.' } : {}),
+    // A zero-result filter is the silent-empty trap: say so, with the population it missed (#1214).
+    ...(totalCount === 0 && (q.type || q.folder || needle) ? {
+      hint: emptyFilterHint({
+        what: 'asset',
+        filter: describeFilter({ type: q.type, folder: q.folder, name: q.name }),
+        unfilteredCount: assets.length,
+        live: q.type ? { type: assets.map((a) => a.type) } : undefined,
+        near: { type: q.type },
+      }),
+    } : {}),
   };
 }
 

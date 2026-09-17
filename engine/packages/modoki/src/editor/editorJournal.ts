@@ -65,6 +65,46 @@ export interface EditorEvent {
 const MAX_EVENTS = 2000; // ring-drop oldest
 const buffer: EditorEvent[] = [];
 let seq = 0;
+/** Which LIFE of this module a `seq` belongs to (#1214 B-3). `seq` is module state, so a renderer
+ *  reload — and every game-code edit force-reloads — restarts it at 0. A cursor from before the reload
+ *  is then AHEAD of every new event, and a forward read with it filters out all of them: the agent saw
+ *  `{events:[], timedOut:true}` on every poll while the human kept editing. Replies carry this, and a
+ *  caller that sends it back gets its cursor reset when the life has changed (`resolveEditorJournalCursor`).
+ *  Editor code is not determinism-guarded; this only has to differ between two loads. */
+const epoch = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+/** The current life's id — see `epoch`. */
+export function editorJournalEpoch(): string { return epoch; }
+
+/** True when a caller's `epoch` names an EARLIER life. The shared capture counter (`cap`, the
+ *  merged timeline's cursor) is module state too and restarts on the same reload, so a `sinceCap`
+ *  needs this check as much as `since` does. */
+export function editorJournalEpochChanged(callerEpoch: string | undefined): boolean {
+  return callerEpoch !== undefined && callerEpoch !== epoch;
+}
+
+export interface ResolvedEditorJournalCursor {
+  since: number | undefined;
+  /** Set when the caller's cursor belonged to an earlier life and was replaced with 0 (replay this life). */
+  cursorReset?: string;
+}
+
+/** Turn a caller's `since` (+ the `epoch` it was read under) into a cursor valid for THIS life.
+ *  - `epoch` given and different → the cursor is from before a reload: replay this life from 0.
+ *  - no `epoch`, but `since` is past the newest `seq` ever issued → it cannot be from this life
+ *    either (a cursor never runs ahead of the counter): same reset.
+ *  A caller that omits `epoch` and whose old cursor is still BELOW the new counter cannot be told
+ *  apart from a current one — the reason replies carry `epoch` and the tools say to send it back. */
+export function resolveEditorJournalCursor(since: number | undefined, callerEpoch: string | undefined): ResolvedEditorJournalCursor {
+  if (since == null) return { since };
+  if (editorJournalEpochChanged(callerEpoch)) {
+    return { since: 0, cursorReset: `since=${since} was issued under epoch ${callerEpoch}; the editor journal has restarted since (epoch ${epoch} — a renderer reload, e.g. a game-code edit), so this read replays everything from the restart. Use the returned cursor from now on.` };
+  }
+  if (since > seq) {
+    return { since: 0, cursorReset: `since=${since} is past the newest event this journal has issued (${seq}), so it is from before a restart (a renderer reload, e.g. a game-code edit); this read replays everything from the restart. Send \`epoch\` back with \`since\` so a restart is always detected.` };
+  }
+  return { since };
+}
 let enabled = true;
 /** Run `fn` with editor activity attributed to `who` — sync OR async. agentEditorOps
  *  wraps its mutating ops in this so agent-driven edits are tagged source:'agent'. For
@@ -264,6 +304,12 @@ export interface WaitForEditResult {
   /** Advance a subsequent wait/poll with this as `since` — contiguous with `events`,
    *  same forward-cursor convention as `readEditorJournal`/the `editor-journal` op. */
   nextSeq: number;
+  /** The journal life `nextSeq` belongs to — send it back with it. */
+  epoch: string;
+  /** On a timeout: the events that DID arrive after the cursor but did not match `type`/`source`.
+   *  Without it a wait on a type the human is not producing (or on `source:'human'` while only the
+   *  agent edits) timed out looking exactly like an idle editor. */
+  skipped?: { total: number; byType: Record<string, number>; bySource: Record<string, number> };
 }
 
 /** Park until a matching event is appended, or `timeoutMs` elapses — the long-poll
@@ -287,8 +333,20 @@ export function waitForEditorJournal(
   const baseline = filter.since ?? seq; // "now" when no cursor was given
   const already = readEditorJournal({ type: filter.type, source: filter.source, since: baseline });
   if (already.length > 0) {
-    return Promise.resolve({ events: already, timedOut: false, nextSeq: already[already.length - 1].seq });
+    return Promise.resolve({ events: already, timedOut: false, nextSeq: already[already.length - 1].seq, epoch });
   }
+  const timedOut = (): WaitForEditResult => {
+    const others = readEditorJournal({ since: baseline });
+    const count = (key: (e: EditorEvent) => string) => {
+      const out: Record<string, number> = {};
+      for (const e of others) out[key(e)] = (out[key(e)] ?? 0) + 1;
+      return out;
+    };
+    return {
+      events: [], timedOut: true, nextSeq: baseline, epoch,
+      ...(others.length ? { skipped: { total: others.length, byType: count((e) => e.type), bySource: count((e) => e.source) } } : {}),
+    };
+  };
   return new Promise((resolve) => {
     let settled = false;
     const finish = (result: WaitForEditResult): void => {
@@ -303,8 +361,8 @@ export function waitForEditorJournal(
       if (filter.source && e.source !== filter.source) return;
       if (e.seq <= baseline) return; // pre-existing event replaying through some other path
       const events = readEditorJournal({ type: filter.type, source: filter.source, since: baseline });
-      finish({ events, timedOut: false, nextSeq: events.length ? events[events.length - 1].seq : baseline });
+      finish({ events, timedOut: false, nextSeq: events.length ? events[events.length - 1].seq : baseline, epoch });
     });
-    const timer = setTimeout(() => finish({ events: [], timedOut: true, nextSeq: baseline }), timeoutMs);
+    const timer = setTimeout(() => finish(timedOut()), timeoutMs);
   });
 }

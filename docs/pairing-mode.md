@@ -26,26 +26,36 @@ implementation in `engine/tools/modoki-mcp/src/tools/editor.ts`, backend route
 - Params: `type` (optional — an editor event type like `!edit`, `!transform`, `!select`; omit to
   wake on any type), `source` (`'human' | 'agent'`, **defaults to `'human'`** — the whole point is
   noticing what the human did, not the agent's own MCP-driven edits), `since` (a prior `seq`/
-  `nextSeq` cursor; omit to wait for the *next* event from now, not to replay history),
+  `nextSeq` cursor; omit to wait for the *next* event from now, not to replay history), `epoch`
+  (the `epoch` returned with that cursor — send it back with `since`),
   `timeoutMs` (default 30000, clamped server-side to `[50, 120000]` —
   `WAIT_FOR_EDIT_MIN_MS`/`WAIT_FOR_EDIT_MAX_MS` in `agentEditorOps.ts`).
 - If a matching event already happened after `since`, it returns **immediately** — you are never
   made to wait for something that already occurred.
 - Otherwise it blocks (a real held HTTP request, not client-side polling) until a matching event
   arrives or `timeoutMs` elapses.
-- Result shape (`WaitForEditResult`): `{ events: EditorEvent[], timedOut: boolean, nextSeq: number }`.
-  A timeout is `{ events: [], timedOut: true, nextSeq }` — a **normal** answer, not an error. Advance
-  the cursor with the returned `nextSeq` on every subsequent call (never re-use a stale one).
+- Result shape (`WaitForEditResult`): `{ events: EditorEvent[], timedOut: boolean, nextSeq: number,
+  epoch: string, skipped? }`. A timeout is `{ events: [], timedOut: true, nextSeq, epoch }` — a
+  **normal** answer, not an error. Advance the cursor with the returned `nextSeq` AND `epoch` on every
+  subsequent call (never re-use a stale one).
+- ⚠️ **A game-code edit restarts the cursor.** It force-reloads the renderer, and `seq` restarts at 0
+  with it, so a `nextSeq` from before the reload is ahead of every new event. Sent back with its
+  `epoch`, it is detected: the reply carries `cursorReset` and replays everything since the reload.
+  Without `epoch` only a cursor already past the new counter is caught — the loop below sends both.
+- `skipped` (`{total, byType, bySource}`) appears on a timeout when events DID arrive but did not match
+  `type`/`source` — the difference between "the human did nothing" and "the human did something else"
+  (or "only the agent edited", since `source` defaults to `'human'`).
 - The client-side transport timeout is set to the clamped server deadline + 15s headroom
   (`editor.ts`), so a legitimate 120s park does not read as "backend unreachable".
 
 ### The loop
 
 ```
-modoki_wait_for_edit { timeoutMs: 120000 }        # source defaults to 'human'
-  → { timedOut: true, events: [], nextSeq: N }      # nobody touched anything — call again
-  → { timedOut: false, events: [...], nextSeq: M }  # the human committed something — react, then:
-modoki_wait_for_edit { since: M, timeoutMs: 120000 }  # resume parking from where you left off
+modoki_wait_for_edit { timeoutMs: 120000 }                # source defaults to 'human'
+  → { timedOut: true, events: [], nextSeq: N, epoch: E }    # nobody touched anything — call again
+  → { timedOut: false, events: [...], nextSeq: M, epoch: E } # the human committed something — react, then:
+modoki_wait_for_edit { since: M, epoch: E, timeoutMs: 120000 }  # resume parking from where you left off
+  → { cursorReset: "…", events: [...], nextSeq: K, epoch: F } # the renderer reloaded — replayed; continue with K, F
 ```
 
 For a longer watch than 120s, just call again with the advanced cursor — there is no single-call

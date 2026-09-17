@@ -113,23 +113,25 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'its own `sinceCap` cursor — poll it incrementally by passing the returned `nextCap` as `sinceCap` ' +
       '(a cursored poll returns the OLDEST events after the cursor, so it is contiguous and never skips). ' +
       'Every stream returns the LAST 100 events by default plus `byType`/`gameByType` counts over the ' +
-      'whole ring (a busy session is ~54–126k tokens of editor events, and the game ring far more); ' +
+      'whole ring, filter ignored (`ringTotal` beside the editor stream) (a busy session is ~54–126k tokens of editor events, and the game ring far more); ' +
       'raise limit=N, or cursor precisely with since=/sinceCap=. ' +
       'Editor-only. This is how you PAIR: see the human\'s edits and line them up against what the game did.',
     {
       type: z.string().optional().describe('Only editor events of this type, e.g. !edit | !select | !create | !transform | !save — every type starts with `!`; an unknown one is refused, listing them all. (Filters the `editor` array only.)'),
       source: z.enum(['human', 'agent']).optional().describe('Only events by the human at the keyboard, or by the agent (your MCP ops). Omit for both. (Filters the `editor` array only.)'),
       since: z.number().optional().describe('Forward cursor for the `editor` array: returns the OLDEST events with seq greater than this (contiguous, oldest-first) + a `nextSeq` when truncated. Advance with `nextSeq` each poll — a cursored poll NEVER skips events (unlike the bare newest-last call). Does NOT window the merged timeline (use sinceCap).'),
+      epoch: z.string().optional().describe('The `epoch` returned with the cursor; send it back. A reload restarts the counters, and a stale epoch replays with `cursorReset`.'),
       sinceCap: z.number().optional().describe('Forward cursor for the merged `timeline`: returns the OLDEST interleaved events with cap greater than this (contiguous, oldest-first) + a `nextCap` when truncated. Advance with `nextCap` each poll to fetch newer events with no gap.'),
       merged: z.boolean().optional().describe('Also include the game journal under `game` (raw) AND the interleaved `timeline`. Both are tailed too — cursor with sinceCap for a precise incremental slice.'),
       limit: z.number().optional().describe('Return the last N events per stream (default 100). An explicit limit always wins.'),
       clear: z.boolean().optional().describe('Clear the editor-activity buffer after reading.'),
     },
-    async ({ type, source, since, sinceCap, merged, limit, clear }) => {
+    async ({ type, source, since, epoch, sinceCap, merged, limit, clear }) => {
       const q = new URLSearchParams();
       if (type) q.set('type', type);
       if (source) q.set('source', source);
       if (since != null) q.set('since', String(since));
+      if (epoch) q.set('epoch', epoch);
       if (sinceCap != null) q.set('sinceCap', String(sinceCap));
       if (merged) q.set('merged', '1');
       if (limit != null) q.set('limit', String(limit));
@@ -165,7 +167,8 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       '`editor` (get_editor_state fields: playState/runMode/advancing/scenePath). Checks at once, then ' +
       'polls. Satisfied → `{satisfied:true, elapsedMs, observation}`. A timeout is a NORMAL result, not ' +
       'an error: `{satisfied:false, timedOut:true, lastObservation}` — read `lastObservation` to see ' +
-      'why (e.g. `ambiguous`: a state test needs exactly one control). `timeoutMs` defaults to 5000, ' +
+      'why (`ambiguous`: a state test needs one control; `live`: what IS there). An `absent` wait true on the ' +
+      'FIRST check adds `alreadyAbsent` + a live-vocabulary `hint` (labels, ids or names — as you aimed) — a typo is always absent. `timeoutMs` defaults to 5000, ' +
       'clamped to [50, 120000]. An unevaluable condition (no ' +
       'label/id, unknown trait) is refused BEFORE parking. Works as a modoki_batch step and as ' +
       'modoki.waitFor() in eval (whose 25s cap bounds it there).',
@@ -198,8 +201,9 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       'modoki_editor_journal in a loop (a state condition is modoki_wait_for). Returns IMMEDIATELY if a matching event already happened ' +
       'after `since` (never makes you wait for something that already occurred); otherwise blocks ' +
       'until a matching event arrives or `timeoutMs` elapses. A timeout is a NORMAL result ' +
-      '(`{events:[], timedOut:true, nextSeq}`), not an error — just call again with `since:nextSeq` ' +
-      'to keep watching. `source` defaults to "human" (the whole point is noticing what the HUMAN ' +
+      '(`{events:[], timedOut:true, nextSeq, epoch, skipped?}`), not an error — call again with `since:nextSeq` and `epoch` ' +
+      '(a reply of 100+ events says `truncated`: call again at once; after a reload it says `cursorReset`) ' +
+      'to keep watching; `skipped` counts events that arrived but did not match `type`/`source`. `source` defaults to "human" (the whole point is noticing what the HUMAN ' +
       'did, not your own MCP-driven edits). Same event shape/types as modoki_editor_journal, same ' +
       'forward `since`/`nextSeq` cursor (advance with the returned `nextSeq`, never re-use a stale ' +
       'one). `timeoutMs` defaults to 30s and is capped at 120s server-side — for a longer watch, ' +
@@ -209,13 +213,15 @@ export function registerEditorTools(tool: ToolDef, ctx: ToolContext): void {
       type: z.string().optional().describe('Only wake for this editor event type, e.g. !edit, !select, !transform. Omit to wake on any type. An unknown type (e.g. `edit` without `!`) is refused up front rather than waited on.'),
       source: z.enum(['human', 'agent']).optional().describe('Who must have done it. Defaults to "human" — pass "agent" only if you specifically want to notice your own MCP-driven edits.'),
       since: z.number().optional().describe('Forward cursor (a prior `seq`/`nextSeq`). Omit to wait for the NEXT event from now, not to replay history.'),
+      epoch: z.string().optional().describe('The `epoch` returned with `nextSeq`; send it back. A reload restarts `seq`, and a stale epoch replays with `cursorReset`.'),
       timeoutMs: z.number().optional().describe(`${TIMEOUT_MS_BASE}. Default 30000, clamped to [50, 120000].`),
     },
-    async ({ type, source, since, timeoutMs }) => {
+    async ({ type, source, since, epoch, timeoutMs }) => {
       const q = new URLSearchParams();
       if (type) q.set('type', type);
       if (source) q.set('source', source);
       if (since != null) q.set('since', String(since));
+      if (epoch) q.set('epoch', epoch);
       if (timeoutMs != null) q.set('timeoutMs', String(timeoutMs));
       const qs = q.toString();
       // Client-side transport timeout must clear the SERVER's own deadline (clamped to

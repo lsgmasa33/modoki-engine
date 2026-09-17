@@ -303,6 +303,7 @@
   "collapsedParentAxes",
   "collectHandles",
   "collectHitRegions",
+  "collectHitRegionsReport",
   "collectResourceRefsFromEntities",
   "collectScreenBounds",
   "collectTimelineAudioRefs",

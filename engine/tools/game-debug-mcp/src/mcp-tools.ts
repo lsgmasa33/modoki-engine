@@ -2430,9 +2430,15 @@ async function coordScaleOrRefusal(
         // prefix and this window (the ring is `[pinned] ++ [tail]`, discontiguous once it wraps), so
         // a non-zero value means the log below has a real gap in it, not that boot was quiet.
         const gapNote = parsed.dropped > 0 ? `\n(${parsed.dropped} earlier ${parsed.dropped === 1 ? 'entry' : 'entries'} dropped between the boot log and this window.)` : '';
+        // #1214: an empty LEVEL-filtered read said "No console logs." — "the game logged nothing" —
+        // for a ring full of other levels. Name the filter, and the whole ring when the app reports it.
+        const ringNote = parsed.ringTotal === undefined ? ''
+          : ` The ring holds ${parsed.ringTotal} ${parsed.ringTotal === 1 ? 'entry' : 'entries'} at any level${parsed.byLevel && parsed.ringTotal ? ` (${Object.entries(parsed.byLevel).map(([k, n]) => `${k} ${n}`).join(', ')})` : ''}.`;
+        const empty = level ? `No console entries at level=${level}.${ringNote}` : `No console logs.${ringNote}`;
         const text = (parsed.logs.length === 0
-          ? 'No console logs.'
-          : parsed.logs.map((l) => `[${new Date(l.timestamp).toLocaleTimeString()}] [${l.level}] ${l.args.join(' ')}`).join('\n')) + gapNote;
+          ? empty
+          : parsed.logs.map((l) => `[${new Date(l.timestamp).toLocaleTimeString()}] [${l.level}] ${l.args.join(' ')}`).join('\n')
+            + (level && ringNote ? `\n(level=${level} only.${ringNote})` : '')) + gapNote;
         return { content: [{ type: 'text' as const, text }] };
       } catch (e) {
         return caughtFailure('device_console_logs', what, e);
@@ -2547,7 +2553,12 @@ async function coordScaleOrRefusal(
         // A partial read (some logs AND an error) keeps the logs and states the error — dropping
         // either half would be the same collapse in the other direction.
         const text = (parsed.error ? `[⚠️ the native log reader also reported: ${parsed.error}]\n` : '')
-          + (parsed.logs.join('\n') || 'No logs.');
+          // #1214: the filter is applied where the lines are read (in the app, or by the host's
+          // logcat/syslog reader), so an unfiltered count is not available here — but an empty
+          // FILTERED read must not say "No logs.", which reads as "nothing was logged".
+          + (parsed.logs.join('\n') || (filter
+            ? `No line containing "${filter}" in this window (the filter is case-insensitive). Other lines may exist — drop \`filter\` to see them.`
+            : 'No logs.'));
         // Say what the read actually WAS when it was a forward capture — an empty system result is
         // "nothing was logged in those N seconds", not "the device has no logs", and those lead to
         // opposite next moves. Truncation is stated for the same reason.

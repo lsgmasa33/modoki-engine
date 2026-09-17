@@ -311,9 +311,15 @@ export interface FindReferencesResult {
   /** Hits found before `limit` was applied. */
   totalCount: number;
   truncated: boolean;
-  /** True when NOTHING references the target — the "is this still used?" answer.
-   *  Distinct from `direct.length === 0`, which can still have indirect hits. */
+  /** True when NOTHING references the target — the "is this still used?" answer, which reads as
+   *  "safe to delete". Distinct from `direct.length === 0`, which can still have indirect hits.
+   *  ⚠️ Counts EVERY referrer, reachable or not, even under `reachableOnly` (#1214, owner decision):
+   *  a texture used only by an unreachable material is not safe to delete — deleting it breaks that
+   *  file — so `reachableOnly` narrows the HITS, never this verdict. */
   unreferenced: boolean;
+  /** Under `reachableOnly`: referrers left out of the hits because no production build reaches them.
+   *  Absent without the flag. */
+  unreachableSkipped?: number;
   /** Whether the target itself survives a production build. */
   reachable: boolean;
   warnings: string[];
@@ -400,6 +406,7 @@ export function findReferences(graph: RefGraph, target: RefNode, opts: FindRefer
   const maxDepth = Math.max(1, opts.maxDepth ?? 6);
 
   const hits: RefHit[] = [];
+  let unreachableSkipped = 0;
   // Visited by NODE, not by chain: a diamond (two meshes sharing one material) would
   // otherwise enumerate a combinatorial number of chains through the same referrers,
   // and the second chain tells a human nothing the first did not.
@@ -413,12 +420,15 @@ export function findReferences(graph: RefGraph, target: RefNode, opts: FindRefer
         if (visited.has(edge.from.id)) continue;
         visited.add(edge.from.id);
         const reachable = graph.reachable.has(edge.from.id);
-        if (opts.reachableOnly && !reachable) continue;
         const step: RefChainStep = { node: edge.from, via: edge.via, origin: edge.origin };
         if (edge.fromEntity) step.fromEntity = edge.fromEntity;
         if (edge.raw) step.raw = edge.raw;
         const fullChain = [step, ...chain];
-        hits.push({ from: edge.from, hops: depth, chain: fullChain, reachable });
+        // An unreachable referrer is COUNTED and still walked through, just not listed: skipping it
+        // with `continue` used to drop it from `unreferenced` too, so the flag answered "safe to
+        // delete" for an asset whose only users were files the build leaves out (#1214).
+        if (opts.reachableOnly && !reachable) unreachableSkipped++;
+        else hits.push({ from: edge.from, hops: depth, chain: fullChain, reachable });
         next.push({ node: edge.from, chain: fullChain });
       }
     }
@@ -436,7 +446,8 @@ export function findReferences(graph: RefGraph, target: RefNode, opts: FindRefer
     returnedCount: ordered.length,
     totalCount: hits.length,
     truncated: hits.length > ordered.length,
-    unreferenced: hits.length === 0,
+    unreferenced: hits.length === 0 && unreachableSkipped === 0,
+    ...(opts.reachableOnly ? { unreachableSkipped } : {}),
     reachable: graph.reachable.has(target.id),
     warnings: graph.warnings,
   };

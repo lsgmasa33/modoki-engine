@@ -22,7 +22,9 @@ export function isDeviceError(v: unknown): v is string {
 // ── device_console_logs reply shape (#644) ─────────────────────────────────
 export type ConsoleLogEntry = { level: string; args: string[]; timestamp: number };
 export type ConsoleLogsReply =
-  | { ok: true; logs: ConsoleLogEntry[]; dropped: number }
+  /** `ringTotal`/`byLevel` (#1214) describe the whole ring, level filter ignored — absent from an app
+   *  built before them, so they stay optional rather than defaulting to a false 0. */
+  | { ok: true; logs: ConsoleLogEntry[]; dropped: number; ringTotal?: number; byLevel?: Record<string, number> }
   | { ok: false; got: string };
 
 /** Shape-tolerant parse of `handleConsoleLogs`'s (`engine/app/debug/bridge.ts`) reply.
@@ -43,8 +45,12 @@ export function parseConsoleLogsReply(raw: unknown): ConsoleLogsReply {
   if (v == null) return { ok: true, logs: [], dropped: 0 }; // an empty ring is an ANSWER, not a failure
   if (Array.isArray(v)) return { ok: true, logs: v as ConsoleLogEntry[], dropped: 0 }; // pre-6f5e81b48 bridge
   if (typeof v === 'object' && 'logs' in v && Array.isArray((v as { logs: unknown }).logs)) {
-    const obj = v as { logs: ConsoleLogEntry[]; dropped?: unknown };
-    return { ok: true, logs: obj.logs, dropped: typeof obj.dropped === 'number' ? obj.dropped : 0 };
+    const obj = v as { logs: ConsoleLogEntry[]; dropped?: unknown; ringTotal?: unknown; byLevel?: unknown };
+    return {
+      ok: true, logs: obj.logs, dropped: typeof obj.dropped === 'number' ? obj.dropped : 0,
+      ...(typeof obj.ringTotal === 'number' ? { ringTotal: obj.ringTotal } : {}),
+      ...(obj.byLevel && typeof obj.byLevel === 'object' && !Array.isArray(obj.byLevel) ? { byLevel: obj.byLevel as Record<string, number> } : {}),
+    };
   }
   return { ok: false, got: describeShape(v) };
 }

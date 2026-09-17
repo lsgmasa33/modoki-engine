@@ -167,3 +167,11 @@ date,clone,tool,delta_bytes,tool_bytes_after,surface_bytes_after,sha
 2026-09-17,work-qa,modoki_set_skin_mode,69,566,173915,cffa85bd6
 2026-09-17,work-qa,modoki_wait_for_edit,85,1485,173915,cffa85bd6
 2026-09-17,work-qa,modoki_write_player_prefs,69,2458,173915,cffa85bd6
+2026-09-17,work-qa,modoki_delete_asset,117,3811,174914,87d13ee0f
+2026-09-17,work-qa,modoki_editor_journal,189,4891,174914,87d13ee0f
+2026-09-17,work-qa,modoki_find_references,126,2000,174914,87d13ee0f
+2026-09-17,work-qa,modoki_get_console_logs,26,1196,174914,87d13ee0f
+2026-09-17,work-qa,modoki_journal,26,2074,174914,87d13ee0f
+2026-09-17,work-qa,modoki_validate_prefab,29,1104,174914,87d13ee0f
+2026-09-17,work-qa,modoki_wait_for,164,2324,174914,87d13ee0f
+2026-09-17,work-qa,modoki_wait_for_edit,322,1807,174914,87d13ee0f

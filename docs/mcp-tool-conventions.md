@@ -209,6 +209,33 @@ Rules:
   - Guarded by `replyCountVocabulary.test.ts` (walks real op replies) plus, for the bodies that
     walker structurally cannot reach, `editorActionRouter.test.ts` for the Node-router `/api/scenes`
     and `handlesReplyShape.test.ts` for the shared summary.
+- **A filtered read discloses its population (#1214).** An empty filtered result is two different
+  facts — "nothing exists" and "the filter missed" (a typo, the wrong layer) — and the rows alone
+  cannot say which. The #1208 sweep found 17 of 33 filtered reads answering an empty list with
+  nothing beside it, and several *explaining* it from the filtered list ("the surface is not
+  hit-testable") — because no shared rule existed, each read re-decided. The rule now has one
+  implementation, `engine/tools/shared/filterDisclosure.ts`, and two shapes chosen by what the
+  population is:
+  - **A ring** (console logs, the game and editor journals, the device console) always answers
+    `ringTotal` plus its histogram (`byLevel`/`byType`) over the WHOLE ring, filter ignored.
+    `editor_journal`'s `byType` described the filtered list until #1214 — the one ring that did not.
+  - **A set** (entities, layout rects, watch series, handles, hit regions) answers, only when a
+    filter matched nothing, a `hint` from `emptyFilterHint`: the unfiltered count, and the live
+    vocabulary listed closest-to-the-asked-value first (`liveSet(…, near)` — an alphabetical cut of a
+    300-name scene never shows the name a typo meant). Only the empty case pays for the second read.
+  - A read whose filter runs where the rows are produced and cannot count the rest (the app's native
+    logs, the host's logcat/syslog read) at least names the filter in its empty answer, never a bare
+    "No logs.".
+  - An explanation is computed from the population it describes. A provider that THREW is
+    `failedProviders`, not "not hit-testable"; a note beside `manifestRebuilt` is derived from it.
+  - Guarded by `engine/tests/framework/filteredReadDisclosure.test.ts`, which runs the real ops with
+    a filter that cannot match over a world where the unfiltered read is not empty. Add a filtered
+    read to its table when you add one.
+- **A cursor names the life it belongs to (#1214 B-3).** The editor journal's `seq` is module state,
+  so a renderer reload — every game-code edit — restarts it, and a pre-reload `since` filters out
+  every new event: `wait_for_edit` answered `timedOut` while the human edited. Its replies carry
+  `epoch`; a caller that sends it back with `since` gets `cursorReset` (a replay of this life)
+  instead of an empty stream, and a `since` past the counter is reset even without it.
 - A field whose meaning depends on the entity's layer/kind must either be renamed per meaning or
   carry the qualifier in the payload (e.g. `onScreen` + `onScreenBasis: 'viewport'|'size-only'`).
 - Space matters: any transform-shaped value states `world` or `local` **in its name or its

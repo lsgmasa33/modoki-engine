@@ -389,10 +389,10 @@ export {
 // be seen in an inspector, a scene view or a screenshot. A game publishes them from the code that
 // OWNS the geometry (never a second copy of it) via registerHitRegionProvider.
 export {
-  registerHitRegionProvider, collectHitRegions, hitRegionProviders,
+  registerHitRegionProvider, collectHitRegions, collectHitRegionsReport, hitRegionProviders,
   isHitRegionOverlayVisible, setHitRegionOverlayVisible, subscribeHitRegionOverlay,
   hitShapeContains, hitShapeDistance, regionsAt, nearestRegionTo,
-  type HitRegion, type HitShape, type HitRegionFilter, type HitRegionProvider,
+  type HitRegion, type HitShape, type HitRegionFilter, type HitRegionProvider, type HitRegionProviderFailure,
 } from './rendering/hitRegions';
 // Quality tiers (#121 P3) — THREE tiers since #188 (`low`/`mid`/`high`), measurement as ground
 // truth, allowlist as a shortcut. The allowlist still ships EMPTY on purpose; see the module

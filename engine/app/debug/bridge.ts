@@ -33,6 +33,7 @@ import { deviceAimKeys, type AimGesture } from './domPointContract';
 import type { EntityPointResolution, EntityPointSpec } from './entityPointContract';
 import { entityAimOutcome, type AimRefusal } from './entityAimRefusal';
 import { encodeDeviceRefusal } from '../../tools/shared/deviceRefusal';
+import { histogram } from '../../tools/shared/filterDisclosure';
 
 interface Request {
   id: string;
@@ -680,10 +681,15 @@ export async function handleDrag(params: Record<string, unknown>): Promise<strin
  *  `dropped`, for the same reason the editor's `console-logs` agent op does (see its own comment,
  *  `agentBridge.ts`) — the ring is `[pinned] ++ [tail]`, discontiguous once it wraps, and on device
  *  there is no devtools console to notice the gap any other way. */
-function handleConsoleLogs(params: Record<string, unknown>): { logs: ReturnType<typeof consoleRing.query>; dropped: number } {
+export function handleConsoleLogs(params: Record<string, unknown>): { logs: ReturnType<typeof consoleRing.query>; dropped: number; ringTotal: number; byLevel: Record<string, number> } {
+  const ring = consoleRing.entries;
   return {
     logs: consoleRing.query((params.limit as number) || 50, params.level as string | undefined),
     dropped: getConsoleRingDropped(),
+    // #1214: the WHOLE ring, level filter ignored — the editor `console-logs` op's contract. Without it
+    // `level:'error'` on a ring of 800 warnings printed "No console logs.", i.e. "the game logged nothing".
+    ringTotal: ring.length,
+    byLevel: histogram(ring, (l) => l.level),
   };
 }
 

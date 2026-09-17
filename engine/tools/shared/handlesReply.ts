@@ -8,7 +8,10 @@
  *  live, and delivered neither: a bare call dumped every handle, and a typo'd filter answered an empty
  *  list that reads exactly like "nothing is there".
  *
- *  Dependency-free: the Node backend and the `game-debug-mcp` package both import it as a value. */
+ *  Dependency-free: the Node backend and the `game-debug-mcp` package both import it as a value. The
+ *  general form of its empty-filter disclosure (#1214) is `filterDisclosure.ts`. */
+
+import { histogram } from './filterDisclosure.js';
 
 export interface HandlesFilter { editor?: string; kind?: string; ids?: string[]; prefix?: string; label?: string }
 export interface HandlesResponse { handles?: Array<{ id?: string; editor?: string; kind?: string; label?: string }>; [k: string]: unknown }
@@ -46,13 +49,7 @@ export function isBareHandlesFilter(f: HandlesFilter): boolean {
 }
 
 function countsOf(handles: NonNullable<HandlesResponse['handles']>) {
-  const byEditor: Record<string, number> = {};
-  const byKind: Record<string, number> = {};
-  for (const h of handles) {
-    byEditor[h.editor ?? '?'] = (byEditor[h.editor ?? '?'] ?? 0) + 1;
-    byKind[h.kind ?? '?'] = (byKind[h.kind ?? '?'] ?? 0) + 1;
-  }
-  return { byEditor, byKind };
+  return { byEditor: histogram(handles, (h) => h.editor ?? '?'), byKind: histogram(handles, (h) => h.kind ?? '?') };
 }
 
 /** Shape a successful `enact-handles` answer. `fetchAll` re-asks with no filter; it runs only when a

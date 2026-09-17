@@ -17,6 +17,7 @@ import {
 import { registerAllTraits } from '../../app/ecs/registerTraits';
 import { registerEditorAgentOps } from '../../app/editor/agentEditorOps';
 import { runAgentOp } from '../../app/debug/agentBridge';
+import { EDITOR_JOURNAL_TAIL_DEFAULT } from '../../app/debug/streamSummary';
 
 registerAllTraits();
 registerEditorAgentOps();
@@ -246,5 +247,114 @@ describe('wait-for-edit op', () => {
     editorEmit('!select'); // simulates an unrelated human UI action while the op is in flight
     expect(readEditorJournal()[0].source).toBe('human');
     await p; // resolves via the emit above — nothing left parked
+  });
+});
+
+// #1214: `byType` described the FILTERED list, so a type filter that matched nothing read as an empty
+// ring. It now describes the whole ring, beside `ringTotal`, like journal-events and console-logs.
+describe('a filtered read still describes the whole ring (#1214)', () => {
+  it('type filter that matches nothing: editorTotal 0, but ringTotal/byType show the ring', async () => {
+    for (let i = 0; i < 3; i++) editorEmit('!select', { i });
+    const r = await runAgentOp('editor-journal', { type: '!transform' }) as Result & { ringTotal: number };
+    expect(r.editorTotal).toBe(0);
+    expect(r.ringTotal).toBe(3);
+    expect(r.byType).toEqual({ '!select': 3 });
+  });
+});
+
+// #1214 B-3: `seq` restarts on a renderer reload, so a pre-reload cursor filtered out every new event.
+describe('a cursor from an earlier journal life is reset, not trusted (#1214 B-3)', () => {
+  type Cursored = Result & { epoch: string; cursorReset?: string };
+
+  it('every reply carries the epoch, and a matching epoch keeps the cursor', async () => {
+    editorEmit('!select');
+    const first = await runAgentOp('editor-journal', {}) as Cursored;
+    expect(typeof first.epoch).toBe('string');
+    const seq = first.editor[0].seq;
+    editorEmit('!edit');
+    const next = await runAgentOp('editor-journal', { since: seq, epoch: first.epoch }) as Cursored;
+    expect(next.editor.map((e) => e.type)).toEqual(['!edit']);
+    expect(next.cursorReset).toBeUndefined();
+  });
+
+  it('a different epoch replays this life and says why', async () => {
+    editorEmit('!select');
+    editorEmit('!edit');
+    const tip = readEditorJournal().at(-1)!.seq;
+    const r = await runAgentOp('editor-journal', { since: tip, epoch: 'an-earlier-life' }) as Cursored;
+    expect(r.editor.map((e) => e.type)).toEqual(['!select', '!edit']);
+    expect(r.cursorReset).toMatch(/an-earlier-life/);
+  });
+
+  it('with no epoch, a cursor past the counter is reset too', async () => {
+    editorEmit('!select');
+    const r = await runAgentOp('editor-journal', { since: 1e9 }) as Cursored;
+    expect(r.editor.map((e) => e.type)).toEqual(['!select']);
+    expect(r.cursorReset).toMatch(/past the newest event/);
+  });
+
+  it('wait-for-edit with a stale cursor returns the pending events at once instead of parking', async () => {
+    editorEmit('!select');
+    const r = await runAgentOp('wait-for-edit', { since: 1e9, timeoutMs: 5_000 }) as { events: unknown[]; timedOut: boolean; cursorReset?: string };
+    expect(r.timedOut).toBe(false);
+    expect(r.events).toHaveLength(1);
+    expect(r.cursorReset).toMatch(/past the newest event/);
+  });
+
+  it('wait-for-edit honours a mismatched epoch too, not only a cursor past the counter', async () => {
+    editorEmit('!select');
+    const tip = readEditorJournal().at(-1)!.seq;
+    const r = await runAgentOp('wait-for-edit', { since: tip, epoch: 'an-earlier-life', timeoutMs: 5_000 }) as { events: unknown[]; timedOut: boolean; cursorReset?: string };
+    expect(r.timedOut).toBe(false);
+    expect(r.events).toHaveLength(1);
+    expect(r.cursorReset).toMatch(/an-earlier-life/);
+  });
+
+  // Close-out review: a reset replays the whole life, and an uncapped reply past the transport's
+  // text cap lost the very fields that announce the reset.
+  it('a reset wait-for-edit is head-capped, contiguous, and leads with the cursor fields', async () => {
+    for (let i = 0; i < EDITOR_JOURNAL_TAIL_DEFAULT + 5; i++) editorEmit('!select', { i });
+    const r = await runAgentOp('wait-for-edit', { since: 1e9, timeoutMs: 5_000 }) as Record<string, unknown> & { events: Array<{ seq: number }>; nextSeq: number };
+    expect(Object.keys(r)[0]).toBe('cursorReset');
+    expect(Object.keys(r).at(-1)).toBe('events');
+    expect(r.events).toHaveLength(EDITOR_JOURNAL_TAIL_DEFAULT);
+    expect(r).toMatchObject({ truncated: true, totalCount: EDITOR_JOURNAL_TAIL_DEFAULT + 5 });
+    expect(r.nextSeq).toBe(r.events.at(-1)!.seq);
+    // The follow-up is a normal (non-reset) call, and it is capped too — capping only the reset
+    // moved the flood to this call (close-out review).
+    const next = await runAgentOp('wait-for-edit', { since: r.nextSeq, epoch: r.epoch, timeoutMs: 5_000 }) as Record<string, unknown> & { events: Array<{ seq: number }> };
+    expect(next.events).toHaveLength(5);
+    expect(next).not.toHaveProperty('truncated');
+    expect(next).not.toHaveProperty('cursorReset');
+    for (let i = 0; i < EDITOR_JOURNAL_TAIL_DEFAULT + 1; i++) editorEmit('!select', { i });
+    const far = await runAgentOp('wait-for-edit', { since: next.events.at(-1)!.seq, epoch: r.epoch, timeoutMs: 5_000 }) as Record<string, unknown> & { events: unknown[] };
+    expect(far.events).toHaveLength(EDITOR_JOURNAL_TAIL_DEFAULT);
+    expect(far).toMatchObject({ truncated: true, totalCount: EDITOR_JOURNAL_TAIL_DEFAULT + 1, hint: expect.stringMatching(/Call again with since=/) });
+  });
+
+  it('a merged timeline cursor from an earlier life is reset too', async () => {
+    editorEmit('!select');
+    const r = await runAgentOp('editor-journal', { merged: true, sinceCap: 1e9, epoch: 'an-earlier-life' }) as { timeline: unknown[]; cursorReset?: string };
+    expect(r.timeline.length).toBeGreaterThan(0);
+    expect(r.cursorReset).toMatch(/sinceCap=1000000000 was issued under epoch an-earlier-life/);
+    const same = await runAgentOp('editor-journal', { merged: true, sinceCap: 1e9, epoch: (r as unknown as { epoch: string }).epoch }) as { timeline: unknown[]; cursorReset?: string };
+    expect(same.timeline).toHaveLength(0);
+    expect(same.cursorReset).toBeUndefined();
+  });
+
+  it('a wait-for-edit timeout counts what arrived but did not match', async () => {
+    const p = runAgentOp('wait-for-edit', { type: '!transform', timeoutMs: 50 }) as Promise<{ timedOut: boolean; epoch: string; skipped?: { total: number; byType: Record<string, number>; bySource: Record<string, number> } }>;
+    editorEmit('!select');
+    await withEditorActor('agent', () => editorEmit('!edit'));
+    const r = await p;
+    expect(r.timedOut).toBe(true);
+    expect(typeof r.epoch).toBe('string');
+    expect(r.skipped).toEqual({ total: 2, byType: { '!select': 1, '!edit': 1 }, bySource: { human: 1, agent: 1 } });
+  });
+
+  it('a quiet timeout carries no skipped block', async () => {
+    const r = await runAgentOp('wait-for-edit', { timeoutMs: 50 }) as Record<string, unknown>;
+    expect(r).toMatchObject({ timedOut: true });
+    expect(r).not.toHaveProperty('skipped');
   });
 });

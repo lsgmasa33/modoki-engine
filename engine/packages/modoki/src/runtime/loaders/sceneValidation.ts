@@ -1238,8 +1238,12 @@ export function validatePrefabData(data: unknown): ValidationResult {
   if (!Array.isArray(entities)) {
     return { warnings: ['this is not a prefab document — it has no `entities` array, so nothing was checked'], schemaApplied: false };
   }
-  for (const entry of entities) {
-    if (!entry || typeof entry !== 'object') continue;
+  for (const [i, entry] of entities.entries()) {
+    // Skipped silently, `{"entities":[1,"x",null]}` validated with no warnings (#1214 A-3).
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      warnings.push(`entities[${i}] is ${entry === null ? 'null' : Array.isArray(entry) ? 'an array' : `a ${typeof entry}`}, not an entity object — it was not checked`);
+      continue;
+    }
     const e = entry as { localId?: unknown; name?: unknown; traits?: unknown };
     // Prefab entities are keyed by `localId` (EntityAttributes.parentId inside a prefab addresses
     // localIds, not ECS ids), so that is the address a reader can act on. The name is included

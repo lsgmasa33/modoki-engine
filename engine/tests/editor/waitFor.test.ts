@@ -191,3 +191,62 @@ describe('editor', () => {
     expect(await h.run({ editor: { runMode: 'stopped', scenePath: '/b.scene.json' } })).toMatchObject({ satisfied: true });
   });
 });
+
+// #1214 (owner decision, option A): an `absent` wait on a target that never matched still succeeds,
+// but says it held on the first check and names what IS live — a typo otherwise reads as "it closed".
+describe('an empty match discloses the live vocabulary', () => {
+  const vocab = { chromeLabels: () => ['Cancel', 'Save As', 'Save', 'Open'], entityNames: () => ['Player', 'Enemy'] };
+
+  it('absent on the FIRST check: satisfied, alreadyAbsent, and the closest live label first', async () => {
+    const h = harness(vocab);
+    const r = await h.run({ chrome: { label: 'Sav As', absent: true } }) as Record<string, unknown>;
+    expect(r).toMatchObject({ satisfied: true, alreadyAbsent: true, elapsedMs: 0 });
+    expect(r.hint).toMatch(/not evidence that anything went away/);
+    expect(r.hint).toMatch(/label ∈ \{Save As, /);
+  });
+
+  it('absent that held only AFTER a poll is an ordinary success — no alreadyAbsent', async () => {
+    const h = harness(vocab);
+    h.state.handles = [{ id: 'dlg', label: 'Save As' }];
+    h.setOnSleep(() => { h.state.handles = []; });
+    const r = await h.run({ chrome: { label: 'Save As', absent: true } }) as Record<string, unknown>;
+    expect(r).toMatchObject({ satisfied: true });
+    expect(r).not.toHaveProperty('alreadyAbsent');
+    expect(r).not.toHaveProperty('hint');
+  });
+
+  it('a chrome wait addressed by id names live ids, not labels', async () => {
+    const h = harness({ ...vocab, chromeIds: () => ['menu.file', 'dialog.saveAs.ok'] });
+    const r = await h.run({ chrome: { id: 'dialog.saveAs.okk', absent: true } }) as Record<string, unknown>;
+    expect(r.hint).toMatch(/id ∈ \{dialog\.saveAs\.ok, menu\.file\}/);
+    expect(r.hint).not.toMatch(/label ∈/);
+  });
+
+  it('an entity absent wait by name gets the live names', async () => {
+    const h = harness(vocab);
+    const r = await h.run({ entity: { name: 'Plyer', absent: true } }) as Record<string, unknown>;
+    expect(r).toMatchObject({ satisfied: true, alreadyAbsent: true });
+    expect(r.hint).toMatch(/name ∈ \{Player, Enemy\}/);
+  });
+
+  it('a present wait that never matched times out naming the live labels', async () => {
+    const h = harness(vocab);
+    expect(await h.run({ chrome: { label: 'Sav As' } }, 60)).toMatchObject({
+      timedOut: true, lastObservation: { matches: 0, live: expect.stringMatching(/^label ∈ \{Save As, /) },
+    });
+  });
+
+  it('a timeout that DID match something carries no vocabulary', async () => {
+    const h = harness(vocab);
+    h.state.handles = [{ id: 'save', meta: { value: '3' } }];
+    const r = await h.run({ chrome: { id: 'save', value: '4' } }, 60) as { lastObservation: Record<string, unknown> };
+    expect(r.lastObservation).not.toHaveProperty('live');
+  });
+
+  it('readers without a vocabulary still answer — the hint just names none', async () => {
+    const h = harness();
+    const r = await h.run({ chrome: { label: 'X', absent: true } }) as Record<string, unknown>;
+    expect(r).toMatchObject({ satisfied: true, alreadyAbsent: true });
+    expect(r.hint).not.toMatch(/Live now/);
+  });
+});

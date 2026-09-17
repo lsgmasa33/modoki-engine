@@ -98,8 +98,8 @@ export function registerProjectTools(tool: ToolDef, ctx: ToolContext): void {
     'modoki_get_console_logs',
     'Read the editor renderer\'s recent console output (errors/warns/logs + uncaught errors ' +
       'and unhandled rejections). Use to diagnose a failed scene/mesh load or a runtime throw ' +
-      'without a devtools attach (game events: modoki_journal; editor activity: modoki_editor_journal). RETURNS {count, total, ringTotal, byLevel, dropped, logs}: `count` is what ' +
-      'came back (last 50 by default), `total` is what MATCHED level=/since=, and `ringTotal`+`byLevel` ' +
+      'without a devtools attach (game events: modoki_journal; editor activity: modoki_editor_journal). RETURNS {returnedCount, totalCount, ringTotal, byLevel, dropped, logs}: `returnedCount` is what ' +
+      'came back (last 50 by default), `totalCount` is what MATCHED level=/since=, and `ringTotal`+`byLevel` ' +
       'describe the WHOLE ring regardless of the filter — so a level="warn" read still tells ' +
       'you whether any errors exist. The ring holds 1000 entries in the editor (512 on a debug device ' +
       'build), of which the first 128 are a PINNED boot prefix that is never evicted. ⚠️ `dropped` > 0 ' +

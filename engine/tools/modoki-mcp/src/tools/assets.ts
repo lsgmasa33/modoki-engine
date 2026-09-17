@@ -156,8 +156,9 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       'Verify with modoki_list_assets — NOT modoki_resolve_refs, which resolves ENTITY refs and ' +
       'never answers about an asset GUID at all. The asset manifest is rebuilt ' +
       'BEFORE the reply (`manifestRebuilt:true`), so a check issued straight after — including in ' +
-      'the same modoki_batch — sees the deletion. `manifestRebuilt:false` means the rebuild did ' +
-      'not run and the manifest is still catching up via the file watcher.',
+      'the same modoki_batch — sees the deletion. `manifestRebuilt:false` with `trashed>0` means the rebuild did ' +
+      'not run and the manifest is still catching up via the file watcher; with `trashed:0` nothing was deleted ' +
+      '(every path is in `missing`), so there was nothing to rebuild.',
     {
       paths: z.array(z.string()).min(1)
         .describe('Asset-root URLs to trash, e.g. ["/games/x/assets/fx/probe.particle.json"]. Trashed in ONE OS call (one trash sound). Include the .meta.json sidecars yourself — nothing expands the list for you.'),
@@ -408,14 +409,14 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
   // ── validate_prefab (#261 audit F6) ── the prefab twin of modoki_validate_scene ──
   tool(
     'modoki_validate_prefab',
-    'Validate a .prefab.json file — the PREFAB twin of modoki_validate_scene, and the read that '
-    + 'confirms a prefab you edited by hand or through modoki_prefab is well-formed. Reports '
-    + '`warnings`, notably INERT sizes: a width/height authored on a prefab child that the runtime '
-    + 'ignores, which renders at the wrong size with nothing erroring. Like validate_scene, '
-    + '`ok:false` is an ANSWER (this prefab has problems), not a failed call. Unlike it, this pass '
-    + 'consults no trait schema, so it reports no schemaAvailable — the checks it runs are '
-    + 'structural and need no renderer. Also covers a prefab INSTANCE\'s overridden fields, which '
-    + 'live in the entity\'s sibling `overrides` object rather than in `traits`.\n\n'
+    'Validate a .prefab.json file — the PREFAB twin of modoki_validate_scene. It checks the layout '
+    + 'rules only, NOT the whole schema: INERT sizes (a width/height authored on a prefab child that '
+    + 'the runtime ignores, so it renders at the wrong size with nothing erroring), multiplier-shaped '
+    + 'lineHeight, and collapsed newlines — plus a document that is not a prefab at all (no `entities` '
+    + 'array, or an entry that is not an object). `ok` is `warnings.length === 0`; like validate_scene, '
+    + '`ok:false` is an ANSWER (this prefab has problems), not a failed call. It consults no trait '
+    + 'schema, so it reports no schemaAvailable and needs no renderer. A prefab INSTANCE\'s `overrides` '
+    + 'live in the SCENE, so modoki_validate_scene checks those.\n\n'
     + '⚠️ Reads the FILE on disk, so an unsaved edit parked in the editor is not validated here — '
     + 'modoki_save_all first. `staleInputs` / `staleInputsUnknown` / `staleInputsNote` name what the '
     + 'pass could not see, and are ABSENT when the editor is clean, so their absence is the '
@@ -567,7 +568,7 @@ export function registerAssetTools(tool: ToolDef, ctx: ToolContext): void {
       target: z.string().describe('What to find references TO: an asset GUID, an entity GUID (EntityAttributes.guid, or a prefab instance\'s own guid), or a virtual asset path starting with "/" (e.g. /assets/textures/wood.png).'),
       limit: z.number().int().positive().optional().describe('Cap the returned referrer entries (default 50, max 1000). `returnedCount`/`totalCount` are always present; truncated when it bites.'),
       maxDepth: z.number().int().positive().optional().describe('How many reference hops back to walk (default 6, max 20). 1 = direct referrers only.'),
-      reachableOnly: z.boolean().optional().describe('Count only references that survive a production build (reachable from a scene root) — drops references living in dead/unreferenced files.'),
+      reachableOnly: z.boolean().optional().describe('List only references that survive a production build (reachable from a scene root) — drops referrers living in dead/unreferenced files and counts them in `unreachableSkipped`. `unreferenced` still counts them: an asset only a dead file uses is not safe to delete.'),
     },
     async ({ target, limit, maxDepth, reachableOnly }) => {
       const q = new URLSearchParams({ target });

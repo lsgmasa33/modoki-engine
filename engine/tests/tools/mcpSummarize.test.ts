@@ -100,9 +100,14 @@ describe('summarizeAssets — filters buy entries', () => {
   });
 
   it('a zero-match filter is never silent — it hints', () => {
-    const d = summarizeAssets(ASSETS, { type: 'nope' }) as { returnedCount: number; hint: string };
+    const d = summarizeAssets(ASSETS, { type: 'mesch' }) as { returnedCount: number; hint: string };
     expect(d.returnedCount).toBe(0);
-    expect(d.hint).toContain('No match');
+    // #1214: the hint names the population the filter missed, and the type it probably meant first.
+    expect(d.hint).toBe('no asset matches type=mesch, but 4 exist unfiltered. Live now: type ∈ {mesh, scene, texture}. Check the spelling, or drop the filter.');
+    const byName = summarizeAssets(ASSETS, { name: 'zzz' }) as { hint: string };
+    expect(byName.hint).toMatch(/^no asset matches name=zzz, but 4 exist unfiltered\. Check the spelling/);
+    const hit = summarizeAssets(ASSETS, { type: 'mesh' }) as { hint?: string };
+    expect(hit.hint).toBeUndefined();
   });
 });
 

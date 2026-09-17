@@ -137,6 +137,7 @@ describe('creating an ordinary document kind', () => {
     expect(r.ok).toBe(true);
     expect(rescans).toBe(1);
     expect((r as { manifestRebuilt?: boolean }).manifestRebuilt).toBe(true);
+    expect((r as { note?: string }).note).toMatch(/was rebuilt BEFORE this reply/);
   });
 
   it('a rescan that FAILS is not a failed create — it reports manifestRebuilt:false', async () => {
@@ -150,6 +151,10 @@ describe('creating an ordinary document kind', () => {
     // retry that then collides with the file the first attempt made.
     expect(r.ok).toBe(true);
     expect((r as { manifestRebuilt?: boolean }).manifestRebuilt).toBe(false);
+    // #1214 A-15: the note used to say "rebuilt BEFORE this reply" beside `manifestRebuilt:false`.
+    const note = (r as { note?: string }).note ?? '';
+    expect(note).toMatch(/rebuild did NOT run/);
+    expect(note).not.toMatch(/was rebuilt/);
   });
 
   it('an extension already present is not doubled', async () => {

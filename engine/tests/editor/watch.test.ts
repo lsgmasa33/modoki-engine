@@ -572,3 +572,22 @@ describe('read+clear does not leak the mover budget (review follow-up)', () => {
   });
 
 });
+
+describe('a read-side filter that matches nothing says so (#1214)', () => {
+  it('names the unfiltered series count and the closest live names', () => {
+    setup();
+    w.spawn(EntityAttributes({ guid: 'p', name: 'Player' }), WPos({ x: 0 }));
+    w.spawn(EntityAttributes({ guid: 'e', name: 'Enemy' }), WPos({ x: 0 }));
+    const started = startWatch({ component: 'WPos', fields: ['x'], epsilon: 0.001 });
+    tick(1);
+    const miss = readWatch(started.id!, { name: 'Plyer' }) as { seriesTotal: number; hint?: string };
+    expect(miss.seriesTotal).toBe(0);
+    expect(miss.hint).toMatch(/no series matches name=Plyer, but 2 exist unfiltered/);
+    expect(miss.hint).toMatch(/name ∈ \{Player, Enemy\}/);
+    const hit = readWatch(started.id!, { name: 'Play' }) as { seriesTotal: number; hint?: string };
+    expect(hit.seriesTotal).toBe(1);
+    expect(hit.hint).toBeUndefined();
+    const guidMiss = readWatch(started.id!, { guids: ['nope'] }) as { hint?: string };
+    expect(guidMiss.hint).toMatch(/guids=\[nope\]/);
+  });
+});

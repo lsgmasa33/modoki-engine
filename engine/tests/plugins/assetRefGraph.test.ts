@@ -233,7 +233,7 @@ describe('buildRefGraph — self-edges', () => {
 // ── reachable / reachableOnly ──────────────────────────
 
 describe('findReferences — reachable', () => {
-  it('marks a referrer unreachable from the seeds, and reachableOnly excludes it', () => {
+  it('marks a referrer unreachable from the seeds, and reachableOnly lists it only as a count', () => {
     const enumeration = mkEnumeration({
       edges: [
         // No path from the seed to /orphan.mesh.json — it references the target, but a
@@ -257,9 +257,39 @@ describe('findReferences — reachable', () => {
     expect(all.direct[0]!.reachable).toBe(false);
     expect(all.reachable).toBe(false);
 
+    // #1214 (owner decision): `unreferenced` reads as "safe to delete", and deleting this texture
+    // breaks /orphan.mesh.json — so reachableOnly drops the HIT but never flips the verdict.
     const only = findReferences(graph, target, { reachableOnly: true });
     expect(only.direct).toHaveLength(0);
-    expect(only.unreferenced).toBe(true);
+    expect(only.unreferenced).toBe(false);
+    expect(only.unreachableSkipped).toBe(1);
+    expect(all.unreachableSkipped).toBeUndefined();
+  });
+
+  it('reachableOnly still walks THROUGH an unreachable referrer, counting each one it skips', () => {
+    const enumeration = mkEnumeration({
+      edges: [
+        { from: { virtual: '/orphan.mat.json', field: 'texture' }, to: '/assets/deep-tex.png', raw: 't', kind: 'asset', origin: 'own' },
+        { from: { virtual: '/orphan.mesh.json', field: 'material' }, to: '/orphan.mat.json', raw: 'm', kind: 'material', origin: 'own' },
+      ],
+      seeds: ['/root.scene.json'],
+    });
+    const graph = buildRefGraph(enumeration);
+    const target = graph.nodes.get('asset:/assets/deep-tex.png')!;
+    const only = findReferences(graph, target, { reachableOnly: true });
+    expect(only.totalCount).toBe(0);
+    expect(only.unreachableSkipped).toBe(2);
+    expect(only.unreferenced).toBe(false);
+  });
+
+  it('reachableOnly with no referrer at all is still unreferenced', () => {
+    const graph = buildRefGraph(mkEnumeration({
+      edges: [{ from: { virtual: '/x.mesh.json', field: 'material' }, to: '/assets/used.png', raw: 'u', kind: 'material', origin: 'own' }],
+      seeds: ['/root.scene.json'],
+    }));
+    const lone = graph.nodes.get('asset:/x.mesh.json')!;
+    const only = findReferences(graph, lone, { reachableOnly: true });
+    expect(only).toMatchObject({ unreferenced: true, unreachableSkipped: 0, totalCount: 0 });
   });
 });
 

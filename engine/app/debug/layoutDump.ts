@@ -22,6 +22,7 @@
 import { getAllEntities, collectScreenBounds, findEntityByGuid, type ScreenRect } from '@modoki/engine/runtime';
 import { uiSurfaceOf } from './uiSurface';
 import { guidListFields } from './entityRef';
+import { describeFilter, emptyFilterHint } from '../../tools/shared/filterDisclosure';
 
 export interface LayoutEntry {
   id: number;
@@ -195,9 +196,26 @@ export function computeLayoutBounds(params: LayoutBoundsParams = {}) {
   const lim = typeof params.limit === 'number' && Number.isFinite(params.limit) ? params.limit : undefined;
   const shown = lim != null && entries.length > lim ? entries.slice(0, Math.max(0, lim)) : entries;
   const entitiesTruncated = wantEntities && lim != null && entries.length > lim;
-  const hint = !wantEntities || !params.overlaps
-    ? `Counts only where omitted. Pass guids=[…] (stable) / name=<substr> / ids=[…] or layer=ui|2d|3d for per-entity rects; overlaps=true for the ${overlapsCount} overlapping pairs.`
+  // #1214: `layerCounts` is built from the FILTERED rects, so `layer=2d` on a 3D/UI scene answered
+  // `{totalCount:0, layerCounts:{}}` — "this scene has no rects" — while 50 existed on other layers.
+  // Only an empty layer-filtered read pays for the second pass, and that pass drops EVERY filter:
+  // dropping only `layer` answered "0 unfiltered — the filter is not why" while a typo'd `name` was
+  // exactly why (close-out review).
+  const layerMissHint = layer && entries.length === 0
+    ? (() => {
+      const other = unfilteredLayerCounts({});
+      return emptyFilterHint({
+        what: 'rect',
+        filter: describeFilter({ layer, ids, guids: params.guids, name: params.name }),
+        unfilteredCount: other.totalCount,
+        unfilteredLabel: 'exist with no filter',
+        live: { layer: Object.keys(other.layerCounts) },
+      });
+    })()
     : undefined;
+  const hint = layerMissHint ?? (!wantEntities || !params.overlaps
+    ? `Counts only where omitted. Pass guids=[…] (stable) / name=<substr> / ids=[…] or layer=ui|2d|3d for per-entity rects; overlaps=true for the ${overlapsCount} overlapping pairs.`
+    : undefined);
 
   // Every 3D entity is measured once PER MOUNTED SURFACE (the Scene panel and the Game panel each
   // have their own camera), so with both open the counts are inflated — roughly doubled — and
@@ -242,3 +260,8 @@ export function computeLayoutBounds(params: LayoutBoundsParams = {}) {
     ...(hint ? { hint } : {}),
   };
 }
+/** `computeLayoutBounds` itself, typed narrowly — the layer-miss hint re-enters it, and a direct
+ *  self-call inside a function whose return type is inferred is a circular type. The annotation is
+ *  what breaks the cycle; it is only ever CALLED after module init. */
+const unfilteredLayerCounts: (p: LayoutBoundsParams) => { totalCount: number; layerCounts: Record<string, number> } =
+  (p) => computeLayoutBounds(p);

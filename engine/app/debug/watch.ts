@@ -26,6 +26,7 @@ import {
   registerFrameCallback, unregisterFrameCallback, getCurrentWorld,
   findEntity, findEntityByGuid, getAllTraits, readTraitDataFull, getTime, entityRef, EntityAttributes,
 } from '@modoki/engine/runtime';
+import { describeFilter, emptyFilterHint } from '../../tools/shared/filterDisclosure';
 
 interface Sample { tick: number; value: number }
 /** `holdsMoverSlot`: this series is one of the `moverCount` counted against `maxSeries`. An explicit
@@ -485,6 +486,17 @@ export function readWatch(id: string, opts?: { clear?: boolean; name?: string; g
     truncated: w.truncated || undefined,
     ...(w.evictedDespawned ? { evictedDespawned: w.evictedDespawned } : {}),
     seriesTotal: matchedSeries,
+    // #1214: `seriesTotal` counts the FILTERED series, so a typo'd `name=` answered `seriesTotal:0` —
+    // indistinguishable from a watch that recorded nothing.
+    ...((nameFilter || guidFilter) && matchedSeries === 0 ? {
+      hint: emptyFilterHint({
+        what: 'series',
+        filter: describeFilter({ name: opts?.name, guids: opts?.guids }),
+        unfilteredCount: w.series.size,
+        live: { name: [...w.series.values()].map((s) => s.name ?? '') },
+        near: { name: opts?.name },
+      }),
+    } : {}),
     ...(limit != null && matchedSeries > series.length ? { seriesTruncated: true } : {}),
     // Say what a `clear` actually did, so "I cleared it" is never ambiguous about scope.
     ...(opts?.clear ? { cleared: series.length, clearedScope: series.length === w.series.size ? 'all' : 'returned-only' } : {}),
