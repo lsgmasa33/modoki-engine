@@ -366,8 +366,10 @@ export default function BuildSupportDialog() {
 
             {data && !data.toolchainDir && (
               <div style={{ marginTop: 8, color: '#e0a030', fontSize: 10 }}>
-                No toolchain directory configured (dev editor). Tool installs run in the packaged editor;
-                to enable them in dev, launch with MODOKI_PROVISION_NODE=1 and MODOKI_TOOLCHAIN_DIR set.
+                No toolchain directory configured (dev editor). Tool installs run in the packaged editor —
+                except ffmpeg/ffprobe, which install into the machine toolchain dir here too (removing them
+                needs the packaged editor). To enable the rest in dev, launch with MODOKI_PROVISION_NODE=1
+                and MODOKI_TOOLCHAIN_DIR set.
               </div>
             )}
           </div>

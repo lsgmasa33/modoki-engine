@@ -76,7 +76,7 @@ const HOST_LOCAL_PAIRS: ReadonlyArray<{ block: string; key: string; issue: strin
   },
   {
     block: 'audioCache', key: 'durationSec', issue: '#1289',
-    why: 'ffprobe MEASURES it on the file ffmpeg produced, and resolveTool picks both binaries per machine — 4 of wordweave\'s 26 clips encode to different bytes under ffmpeg 6.0 vs 8.1.1',
+    why: 'ffprobe MEASURES it on the file ffmpeg produced, and the binaries that did so differed per machine (PATH vs provisioned, pinned since #1297 but still a different build per platform) — 4 of wordweave\'s 26 clips encode to different bytes under ffmpeg 6.0 vs 8.1.1',
   },
   {
     block: 'videoCache', key: 'durationSec', issue: '#1300',

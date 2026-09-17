@@ -21,8 +21,8 @@ it runs identically in the Vite-plugin process, the Electron main backend, and h
 `detect(id)` / `resolve(id)` locate a tool without / with throwing. Two kinds:
 
 - **Binary tools** (`toktx`, `msdf-atlas-gen`, `npm`, `xcodebuild`, `cocoapods`, `gltf-transform-cli`, `gltfpack`, `ffmpeg`, `ffprobe`, `go-ios`) —
-  resolved from an **env override** → **extra candidates** (a userData install location) → **PATH**,
-  each validated by a `--version` probe. Results are **cached** (the probe spawn is expensive and its
+  resolved from an **env override** → **extra candidates** (a userData install location) → **PATH**
+  (never for `ffmpeg`/`ffprobe` — § "Conversion CLIs are pinned"), each validated by a `--version` probe. Results are **cached** (the probe spawn is expensive and its
   inputs are fixed at startup).
 - **Directory tools** (`android-sdk`, `java`) — resolved from **our provisioned install** →
   **env vars** → **well-known dirs**, validated by a `marker` sub-path (`platform-tools` for the SDK,
@@ -217,10 +217,49 @@ to fix it:
 
 | Tool | Gated when toggle is OFF? |
 |---|---|
-| `java`, `android-sdk`, `gltf-transform-cli`, `gltfpack`, `ffmpeg`, `ffprobe`, `go-ios` | **Yes** — installable into the toolchain dir |
+| `java`, `android-sdk`, `gltf-transform-cli`, `gltfpack`, `go-ios` | **Yes** — installable into the toolchain dir |
+| `ffmpeg`, `ffprobe` | **Always, toggle ON or OFF** — `pinnedOnly`, see below |
 | `toktx`, `msdf-atlas-gen` | Yes, **when bundled** (their `MODOKI_*` env var is set by the packaged host); a dev checkout has no bundle, so PATH stays usable |
 | `npm` | Yes, **when the editor provisions Node** (packaged, or `MODOKI_PROVISION_NODE=1`); a plain dev checkout keeps its PATH npm |
 | `xcodebuild` | **No** — Apple-supplied and multi-GB; it can never be bundled, so it always resolves from the system |
+
+### Conversion CLIs are pinned (#1297)
+
+`ffmpeg` and `ffprobe` carry `pinnedOnly` in the registry: `detect()` never offers them a PATH
+candidate, whatever the toggle says and whether or not `MODOKI_TOOLCHAIN_DIR` is set. Their output is
+SHIPPED (audio/video conversion), and the conversion cache key names no binary — so a Homebrew 8.1.1
+and the provisioned `ffmpeg-static` 6.0 produced different bytes under one hash (4 of 26 wordweave
+clips), and ffprobe builds disagreed on duration for all 26. The toggle is about SDKs a build may take
+from the machine; a converter cannot.
+
+- **Where they are looked for:** `conversionToolchainDir()` — `MODOKI_TOOLCHAIN_DIR`, else the machine
+  default (`toolchainHome.mjs`, the same dir Electron provisions into). So a plain `npm run dev` /
+  `npm run build` / vitest process finds the copy the editor installed. The default is NOT written back
+  to the env: that would make a dev process bundled-only for the JDK and Android SDK too.
+- **Override:** `MODOKI_FFMPEG` / `MODOKI_FFPROBE` still win — an explicit choice, not an accident of
+  installation.
+- **Stale:** judged by the INSTALLED npm package version against `NPM_BINARY_PINS`, not by `-version`
+  output (ffmpeg-static@5.3.0 is tagged `b6.1.1` and its darwin-arm64 binary prints `6.0`; each
+  `@ffprobe-installer/<platform>` package is a different build). So the pin means the same build per
+  PLATFORM — a Mac and a Windows box still encode with different builds of the same package. It is
+  also a package pin, not a binary checksum: `ffmpeg-static`'s own install downloads its binary by
+  release tag with no checksum, and the `npm-tools` manifest records a caret range, so a re-resolved
+  tree could float to a newer 5.x — which the stale check then refuses loudly rather than using.
+  **Bumping either pin must bump `aud-*`/`vid-*` too** (the comment on `NPM_BINARY_PINS` says why).
+- **Missing:** `ensureFfmpeg()` throws with the install hint. A missing `ffprobe` is warned once and
+  yields no stats rather than failing the import (owner, #1300 — the reimport handlers merge).
+- **A negative detection is re-checked once** (`forgetDetection`) before failing: the install may have
+  run in the other process (the Vite server installs; the Electron main also converts).
+- **Provisioning without the editor:** `npm run toolchain:install -- ffmpeg ffprobe`
+  (`engine/scripts/toolchain-install.mjs`) runs the same `install()` into the same default dir. A plain
+  dev editor's Build Support installs these two there as well — `/api/toolchain/install` falls back to
+  `conversionToolchainDir()` for them only, and still refuses every other tool without a toolchain dir.
+  **Removing** them from a plain dev editor is deliberately unsupported (no Remove button, and
+  `/api/toolchain/uninstall` refuses): the dir is machine-shared, so a dev editor's Remove would take
+  the converter away from every clone. Use the packaged editor's Build Support for that.
+
+`toktx` and `msdf-atlas-gen` are NOT pinned yet — there is no dev provisioning path to pin to
+([textures.md](textures.md) § "Committed vs machine-local sidecar fields").
 
 ## The `/api/toolchain` surface & the Build Support dialog
 

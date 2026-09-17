@@ -19,9 +19,9 @@ export const audioReimportHandler: ReimportHandler = async (sourceUrlPath, absPa
   });
   if (typeof meta.id !== 'string') meta.id = randomUUID();
   meta.audio = settings;
-  // ⚠️ MERGE, never replace (#1300). `probeStats` swallows every ffprobe failure and returns `{}`,
-  // and nothing gates ffprobe the way `ensureFfmpeg()` gates ffmpeg — `ffprobeBinary()` just
-  // returns a name. A wholesale replacement therefore DELETED `channels`/`sampleRate` from every
+  // ⚠️ MERGE, never replace (#1300). `probeStats` swallows every ffprobe failure and returns `{}`
+  // — a missing pinned ffprobe included (`withFfprobe`, which since #1297 warns once but still does
+  // not throw, and never falls back to a PATH build). A wholesale replacement therefore DELETED `channels`/`sampleRate` from every
   // sidecar on a machine whose ffprobe is missing or errors, and the machine that does have one put
   // them back on its next bake: the non-converging ping-pong between clones that #127 and #1289
   // exist to stop. Spreading the previous block first means an absent probe reading leaves the

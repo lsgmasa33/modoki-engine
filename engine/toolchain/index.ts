@@ -29,6 +29,7 @@ import path from 'node:path'
 import { findDeleteBoundaries, describeBoundary } from '../scripts/deleteBoundary.mjs'
 import { altPathSpelling } from '../scripts/pathIdentity.mjs'
 import { toolchainRootRefusal, describeToolchainRootRefusal } from '../scripts/toolchainRoot.mjs'
+import { defaultToolchainDir } from '../scripts/toolchainHome.mjs'
 import { ensureJdk, discoverJavaHome, jdkVersionDir } from './jdkProvision'
 import { ensureCmdlineTools, runSdkmanager, ANDROID_SDK_PACKAGES } from './androidSdkProvision'
 import { ensureRuby, rubyDirFor } from './rubyProvision'
@@ -146,6 +147,29 @@ interface BinaryDescriptor {
   bin: string
   versionArgs: string[]
   missingMsg: string
+  /** Never resolve from PATH, whatever the "Use system-installed SDKs" toggle says — only the env
+   *  override or our provisioned copy. For a CONVERSION CLI whose output ships (#1297). */
+  pinnedOnly?: true
+}
+
+/** The toolchain dir an asset conversion resolves its pinned CLI under: `MODOKI_TOOLCHAIN_DIR`, else
+ *  the machine default the Electron editor provisions into. A plain `npm run dev` / `npm run build` /
+ *  vitest process sets no toolchain dir, and without this default it would find no pinned copy even
+ *  on a machine that has one — then either fail or (before #1297) silently take PATH's build.
+ *
+ *  Deliberately NOT written back to `process.env`: that would flip `systemToolchainAllowed()` and
+ *  make a dev process bundled-only for the JDK/Android SDK too. */
+export function conversionToolchainDir(): string {
+  return process.env.MODOKI_TOOLCHAIN_DIR || defaultToolchainDir()
+}
+
+function pinnedMissingMsg(tool: 'ffmpeg' | 'ffprobe', neededFor: string): string {
+  const envVar = tool === 'ffmpeg' ? 'MODOKI_FFMPEG' : 'MODOKI_FFPROBE'
+  return `${tool} is not provisioned — needed for ${neededFor}. Asset conversion uses ONLY the editor's ` +
+    `pinned copy (under the toolchain dir), never one on PATH, so every machine converts with the ` +
+    `same build (#1297). Install it from Build → Build Support…, or run ` +
+    '`npm run toolchain:install -- ffmpeg ffprobe`. ' +
+    `To use a specific binary on purpose, set ${envVar}.`
 }
 
 /** A directory-located tool (e.g. the Android SDK): resolved from env vars then well-known dirs,
@@ -342,24 +366,26 @@ const REGISTRY: Record<ToolId, ToolDescriptor> = {
     // An `install()`-able npm-provisioned binary (audio import transcode). ffmpeg-static ships a
     // self-contained arm64 static binary — no `.bin` symlink, so resolve it at its in-package path.
     envVar: 'MODOKI_FFMPEG',
-    extraCandidates: () => (process.env.MODOKI_TOOLCHAIN_DIR ? [ffmpegToolBin(process.env.MODOKI_TOOLCHAIN_DIR)] : []),
+    // PINNED-ONLY (#1297): an asset conversion must run the same build on every machine, so the
+    // provisioned copy is looked up even without MODOKI_TOOLCHAIN_DIR and PATH is never a candidate.
+    extraCandidates: () => [ffmpegToolBin(conversionToolchainDir())],
+    pinnedOnly: true,
     bin: 'ffmpeg',
     versionArgs: ['-version'],
-    missingMsg:
-      'ffmpeg not found — needed for audio import (transcode). Install it from the Build Support ' +
-      "dialog, or run `install('ffmpeg')`.",
+    missingMsg: pinnedMissingMsg('ffmpeg', 'audio/video import (transcode)'),
   },
   ffprobe: {
     kind: 'binary',
     // The audio-import stats probe (cosmetic duration/channels). @ffprobe-installer resolves to a
     // REAL arm64 binary (ffprobe-static ships x86_64 in its arm64 slot). No `.bin` symlink either.
     envVar: 'MODOKI_FFPROBE',
-    extraCandidates: () => (process.env.MODOKI_TOOLCHAIN_DIR ? [ffprobeToolBin(process.env.MODOKI_TOOLCHAIN_DIR)] : []),
+    // PINNED-ONLY for the same reason as ffmpeg: its readings (duration, channels) are what the
+    // import writes back, and two builds disagree on them (#1297 measured 26 of 26 clips).
+    extraCandidates: () => [ffprobeToolBin(conversionToolchainDir())],
+    pinnedOnly: true,
     bin: 'ffprobe',
     versionArgs: ['-version'],
-    missingMsg:
-      'ffprobe not found — needed for audio import stats. Install it from the Build Support ' +
-      "dialog, or run `install('ffprobe')`.",
+    missingMsg: pinnedMissingMsg('ffprobe', 'audio/video import stats'),
   },
   'go-ios': {
     kind: 'binary',
@@ -671,7 +697,11 @@ function detectBinary(id: ToolId, d: BinaryDescriptor): DetectResult {
   // tool). In bundled-only mode we NEVER resolve a tool the editor provides from the machine's PATH:
   // it must come from the editor's own install/bundle (else it reads as "not found", prompting an
   // install), so a build never silently depends on whatever version happens to be on the box.
-  if (systemFallbackAllowed(id)) candidates.push({ cmd: d.bin, source: 'path' })
+  //
+  // A `pinnedOnly` tool never gets the PATH candidate at all — not even with the toggle on (#1297).
+  // The toggle is about SDKs a build can legitimately take from the machine; a conversion CLI whose
+  // output is shipped cannot, or "what we ship" depends on which laptop converted it.
+  if (!d.pinnedOnly && systemFallbackAllowed(id)) candidates.push({ cmd: d.bin, source: 'path' })
 
   for (const c of candidates) {
     // A bare name is resolved on PATH FIRST — Windows `execFile` does no PATHEXT lookup, so probing
@@ -1092,6 +1122,11 @@ export function versionMatchesPin(version: string, pin: string): boolean {
  *  alone. */
 export function isToolStale(id: ToolId, d: DetectResult): boolean {
   if (!d.present) return false
+  // ffmpeg/ffprobe: their CLI `-version` differs per platform build, so the pin is the NPM package
+  // version, read from the installed package.json. Only our provisioned copy (`probe`) is judged — a
+  // deliberate MODOKI_FFMPEG override is the user's call (#1297).
+  const npmPin = NPM_BINARY_PINS[id as NpmBinaryToolId]
+  if (npmPin) return d.source === 'probe' && installedNpmToolVersion(conversionToolchainDir(), npmPin.pkg) !== npmPin.version
   const tc = process.env.MODOKI_TOOLCHAIN_DIR
   if (!tc || !d.path || !d.path.startsWith(tc)) return false // not our install → don't touch it
   // Both share the `npm-tools` tree with `ndarray-pixels`' own `sharp` (see PINNED_SHARP_OVERRIDE) —
@@ -1326,8 +1361,8 @@ export async function install(id: ToolId, opts: { toolchainDir: string; onLog?: 
   // version differs from the CLI's own version (ffmpeg-static@5.3.0 ships ffmpeg 6.0), so they're
   // pinned here as the npm spec — NOT in PINNED_TOOL_VERSIONS (whose values are matched against
   // `--version` output for the stale check, which would never match).
-  if (id === 'ffmpeg') return installNpmBinaryTool('ffmpeg-static', FFMPEG_NPM_VERSION, ffmpegToolBin, opts)
-  if (id === 'ffprobe') return installNpmBinaryTool('@ffprobe-installer/ffprobe', FFPROBE_NPM_VERSION, ffprobeToolBin, opts)
+  if (id === 'ffmpeg') return installNpmBinaryTool(NPM_BINARY_PINS.ffmpeg.pkg, NPM_BINARY_PINS.ffmpeg.version, ffmpegToolBin, opts)
+  if (id === 'ffprobe') return installNpmBinaryTool(NPM_BINARY_PINS.ffprobe.pkg, NPM_BINARY_PINS.ffprobe.version, ffprobeToolBin, opts)
   if (id === 'cocoapods') return installCocoapods(opts)
   if (id === 'go-ios') {
     // Pinned + sha256-verified universal binary from the GitHub release (see goIosProvision.ts).
@@ -1608,7 +1643,7 @@ export async function uninstall(id: ToolId, opts: { toolchainDir: string; onLog?
   const log = opts.onLog ?? (() => {})
   const NPM_TOOL_PKGS: Partial<Record<ToolId, string>> = {
     'gltf-transform-cli': '@gltf-transform/cli', gltfpack: 'gltfpack',
-    ffmpeg: 'ffmpeg-static', ffprobe: '@ffprobe-installer/ffprobe',
+    ffmpeg: NPM_BINARY_PINS.ffmpeg.pkg, ffprobe: NPM_BINARY_PINS.ffprobe.pkg,
   }
   if (NPM_TOOL_PKGS[id]) {
     const pkg = NPM_TOOL_PKGS[id]!
@@ -1757,9 +1792,34 @@ async function installNpmTool(
 }
 
 /** npm spec versions for ffmpeg/ffprobe (the package version, distinct from the CLI's own version —
- *  see install()). Kept as consts (not PINNED_TOOL_VERSIONS) so the stale-check never mis-fires. */
-const FFMPEG_NPM_VERSION = '5.3.0'
-const FFPROBE_NPM_VERSION = '2.1.2'
+ *  see install()). Kept out of PINNED_TOOL_VERSIONS, whose values are matched against `--version`
+ *  output: ffmpeg-static@5.3.0 is tagged `b6.1.1` yet its darwin-arm64 binary prints `6.0`, and each
+ *  `@ffprobe-installer/<platform>` package is a different build (darwin-arm64 prints `n4.4.1`). So
+ *  `isToolStale` compares the INSTALLED package.json version against these instead.
+ *
+ *  ⚠️ This pins the same build per PLATFORM, not across platforms — a Windows and a macOS machine
+ *  still run different ffmpeg builds of the same package (#1297).
+ *
+ *  ⚠️ **Bumping either version MUST bump `AUDIO_ENCODER_VERSION` and `VIDEO_ENCODER_VERSION` too.**
+ *  The conversion cache key does not name the binary, and a cache hit returns before ffmpeg is even
+ *  resolved — so without the tag bump every warm cache keeps shipping the old build's bytes while a
+ *  fresh machine encodes new ones under the same hash, which is #1297 again. Guarded by
+ *  `conversionToolPin.test.ts` ("the pin and the encoder tags move together"). */
+export const NPM_BINARY_PINS = {
+  ffmpeg: { pkg: 'ffmpeg-static', version: '5.3.0' },
+  ffprobe: { pkg: '@ffprobe-installer/ffprobe', version: '2.1.2' },
+} as const satisfies Partial<Record<ToolId, { pkg: string; version: string }>>
+type NpmBinaryToolId = keyof typeof NPM_BINARY_PINS
+
+/** The `version` of an npm package installed in the toolchain's `npm-tools` tree, or null. */
+export function installedNpmToolVersion(toolchainDir: string, pkg: string): string | null {
+  try {
+    const json = JSON.parse(fs.readFileSync(path.join(npmToolsDir(toolchainDir), 'node_modules', pkg, 'package.json'), 'utf8')) as { version?: unknown }
+    return typeof json.version === 'string' ? json.version : null
+  } catch {
+    return null
+  }
+}
 
 /** Like installNpmTool, but for npm packages whose executable is the package PAYLOAD (no `.bin/<name>`
  *  symlink) — ffmpeg-static, @ffprobe-installer. `resolveBin(toolchainDir)` returns the in-package
@@ -1785,6 +1845,13 @@ async function installNpmBinaryTool(
   try { fs.chmodSync(bin, 0o755) } catch { /* best-effort */ }
   resetToolchainCache() // it's now detectable
   return { path: bin }
+}
+
+/** Forget ONE tool's cached detection. A conversion calls this before re-checking a tool it found
+ *  missing: the install may have run in the OTHER process (the Vite server installs, the Electron
+ *  main also converts), whose `resetToolchainCache()` cannot reach this module's cache. */
+export function forgetDetection(id: ToolId): void {
+  cache.delete(id)
 }
 
 /** Forget cached detection — for tests, or after a provisioning install changes availability. */

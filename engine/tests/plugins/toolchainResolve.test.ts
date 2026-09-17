@@ -595,13 +595,16 @@ describe('toolchain guide() / install() verbs', () => {
     }
   })
 
-  it('ffmpeg/ffprobe are installable but NOT version-pinned (npm ver ≠ CLI ver → never stale)', () => {
+  it('ffmpeg/ffprobe are installable and pinned by NPM package version, not by CLI version (#1297)', () => {
     expect(isInstallable('ffmpeg')).toBe(true)
     expect(isInstallable('ffprobe')).toBe(true)
+    // Not in PINNED_TOOL_VERSIONS — that table is matched against `-version` output, which differs
+    // per platform build. Their pin lives in NPM_BINARY_PINS; staleness cover is in
+    // conversionToolPin.test.ts.
     expect(PINNED_TOOL_VERSIONS.ffmpeg).toBeUndefined()
     expect(PINNED_TOOL_VERSIONS.ffprobe).toBeUndefined()
-    // With no pin, isToolStale is always false regardless of the detected version.
-    const d: DetectResult = { id: 'ffmpeg', present: true, source: 'probe', command: '/x/ffmpeg', path: '/x/ffmpeg', version: 'ffmpeg version 6.0' }
+    // A deliberate env override is never judged stale, whatever it reports.
+    const d: DetectResult = { id: 'ffmpeg', present: true, source: 'env', command: '/x/ffmpeg', path: '/x/ffmpeg', version: 'ffmpeg version 8.1.1' }
     expect(isToolStale('ffmpeg', d)).toBe(false)
   })
 })

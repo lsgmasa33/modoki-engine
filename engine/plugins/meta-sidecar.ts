@@ -40,8 +40,10 @@
  *  `audioCache.durationSec` is peeled for the same reason by a different route
  *  (#1289). It is not derived from source + settings at all: it is ffprobe's
  *  MEASUREMENT of the file ffmpeg just produced, so it moves when either binary
- *  does, and `resolveTool` (ffmpeg-tool.ts) resolves both per machine (env
- *  override -> provisioned toolchain -> PATH). Measured on `games/wordweave`
+ *  does, and until #1297 `resolveTool` (ffmpeg-tool.ts) resolved both per machine
+ *  (env override -> provisioned toolchain -> PATH). Both are pinned now, but the
+ *  pin is per PLATFORM (each OS gets a different build of the same npm package),
+ *  so the measurement still is not portable. Measured on `games/wordweave`
  *  2026-09-16: 4 of 26 clips encode to DIFFERENT BYTES under ffmpeg-static 6.0 vs
  *  Homebrew 8.1.1 (`silenceremove` trims a different sample count), and the two
  *  ffprobe builds on that Mac disagree about duration on all 26. Nothing consumes
@@ -165,8 +167,8 @@ const LOCAL_KEYS: Record<CacheBlock, readonly string[]> = {
   // `hash` mixes local CLI versions (hashKey/riggedHash, the latter encoding whether toktx exists
   // at all), so committing it churns between clones — #127.
   modelCache: [...VOLATILE_STAT_KEYS, 'hash'],
-  // ffprobe MEASURES durationSec on the file ffmpeg produced, and resolveTool picks both binaries
-  // per machine — #1289.
+  // ffprobe MEASURES durationSec on the file ffmpeg produced, and the pinned build still differs
+  // per platform (the PATH fallback that made it per MACHINE is gone, #1297) — #1289.
   audioCache: [...VOLATILE_STAT_KEYS, 'durationSec'],
   // See the ⚠️ above: duration is host-measured, `bytes` is load-bearing and stays committed.
   videoCache: ['durationSec'],

@@ -5,15 +5,18 @@
 import { describe, it, expect, vi } from 'vitest';
 import { found } from '@modoki/engine/testing/inOrder';
 
-vi.mock('child_process', () => {
+vi.mock('child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('child_process')>();
   const execFileSync = vi.fn(() => { throw new Error('command not found'); });
-  return { execFileSync, default: { execFileSync } };
+  return { ...actual, execFileSync, default: { ...actual, execFileSync } };
 });
 
 import { buildFfmpegArgs } from '../../plugins/audio-convert';
 // ensureFfmpeg moved to the shared ffmpeg-tool.ts when the video converter landed —
 // both converters resolve the CLI the same way.
-import { ensureFfmpeg, __resetFfmpegCheck } from '../../plugins/ffmpeg-tool';
+import { ensureFfmpeg } from '../../plugins/ffmpeg-tool';
+import { resetToolchainCache } from '../../toolchain';
+import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
 import { DEFAULT_AUDIO_SETTINGS } from '../../packages/modoki/src/runtime/loaders/audioSettings';
 
 const S = DEFAULT_AUDIO_SETTINGS;
@@ -119,7 +122,18 @@ describe('buildFfmpegArgs', () => {
 
 describe('ensureFfmpeg', () => {
   it('throws a clear install hint when the CLI is absent', () => {
-    __resetFfmpegCheck();
-    expect(() => ensureFfmpeg()).toThrow(/ffmpeg/);
+    // An EMPTY toolchain dir, or this machine's real provisioned copy is found (#1297 resolves
+    // the pinned copy even without MODOKI_TOOLCHAIN_DIR). Full pin cover: conversionToolPin.test.ts.
+    const saved = { tc: process.env.MODOKI_TOOLCHAIN_DIR, ov: process.env.MODOKI_FFMPEG };
+    process.env.MODOKI_TOOLCHAIN_DIR = makeScratchDir('modoki-tc-');
+    delete process.env.MODOKI_FFMPEG;
+    resetToolchainCache();
+    try {
+      expect(() => ensureFfmpeg()).toThrow(/ffmpeg is not provisioned/);
+    } finally {
+      if (saved.tc === undefined) delete process.env.MODOKI_TOOLCHAIN_DIR; else process.env.MODOKI_TOOLCHAIN_DIR = saved.tc;
+      if (saved.ov !== undefined) process.env.MODOKI_FFMPEG = saved.ov;
+      resetToolchainCache();
+    }
   });
 });

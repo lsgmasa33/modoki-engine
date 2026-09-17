@@ -618,6 +618,11 @@ requirement rather than a size decision: every `ffmpeg-static` build is `--enabl
 darwin-arm64 build is additionally `--enable-nonfree`, which is not redistributable under any
 licence. Compliance depends on the binary being provisioned onto the user's own machine.
 
+**And only that provisioned copy converts** (#1297) — a PATH/Homebrew `ffmpeg` is never used, even
+in a plain `npm run build`, because the cache key does not name the binary and two builds encode
+different bytes under one hash. `npm run toolchain:install -- ffmpeg ffprobe` provisions without the
+editor. Detail: [editor-toolchain.md](editor-toolchain.md) § "Conversion CLIs are pinned".
+
 ## Agent surface (cache introspection)
 
 The downloaded-video cache is readable through `modoki_diagnose` with `video:true` (opt-in) —

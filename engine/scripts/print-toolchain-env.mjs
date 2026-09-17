@@ -30,25 +30,17 @@
  * through to the machine's SDKs, i.e. reproduces the bug this script exists to fix.
  */
 
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadRequiredEngineModules } from './loadVendorPlugins.mjs';
+import { defaultToolchainDir } from './toolchainHome.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
-/** Electron's `app.getPath('appData')` without Electron. Mirrors `appSupportRoot()` in
- *  `clean-packaged-cache.mjs` — same three platforms, same order, deliberately duplicated
- *  rather than shared because both are standalone scripts run without a bundler. */
-function appDataRoot() {
-  if (process.platform === 'darwin') return path.join(os.homedir(), 'Library', 'Application Support');
-  if (process.platform === 'win32') return process.env.APPDATA ?? path.join(os.homedir(), 'AppData', 'Roaming');
-  return process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), '.config');
-}
-
-// `SHARED_DIR` from engine/electron/userDataDir.ts — the toolchain is MACHINE-level, shared by
-// every clone, which is why it is not under a per-clone profile dir.
-process.env.MODOKI_TOOLCHAIN_DIR ??= path.join(appDataRoot(), 'Modoki', 'toolchain');
+// The machine-level default — the ONE derivation in `toolchainHome.mjs` (#1297), which is the same
+// dir `engine/electron/userDataDir.ts`'s resolveToolchainDir gives Electron. This file used to carry
+// its own copy of the app-data root; a pure leaf now exists for exactly this caller.
+process.env.MODOKI_TOOLCHAIN_DIR ??= defaultToolchainDir();
 
 const shellQuote = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`;
 

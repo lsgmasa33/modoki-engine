@@ -3,7 +3,8 @@
 
 import { describe, it, expect } from 'vitest';
 import { buildVideoFfmpegArgs } from '../../plugins/video-convert';
-import { videoHashKey } from '../../plugins/video-cache';
+import { createHash } from 'node:crypto';
+import { videoHashKey, VIDEO_ENCODER_VERSION } from '../../plugins/video-cache';
 import {
   DEFAULT_VIDEO_SETTINGS,
   resolveDeliveryPolicy,
@@ -197,10 +198,18 @@ describe('videoHashKey', () => {
       },
     });
     expect(legacy.resizeMode).toBe('bounds');
-    // Pinned to the value the pre-percentage `stableSettings` produced for
-    // `23|veryfast|1920|1080|0|2|keep|ab128` — computed from the old string, not from
-    // the new code, so this genuinely detects a drift rather than restating it.
-    expect(videoHashKey(src, legacy)).toBe('43200ef0e65bbe83');
+    // Pinned to the pre-percentage `stableSettings` string
+    // `23|veryfast|1920|1080|0|2|keep|ab128` — hashed here from that LITERAL, not from the
+    // new code, so this genuinely detects a settings-string drift rather than restating it.
+    // The encoder tag is taken from the module on purpose: bumping it (vid-1 → vid-2, #1297)
+    // IS a deliberate re-encode of everything, which is not what this test guards. (Under
+    // vid-1 this was '43200ef0e65bbe83'.)
+    const legacyKey = createHash('sha256')
+      .update(src).update('\0')
+      .update('23|veryfast|1920|1080|0|2|keep|ab128').update('\0')
+      .update(VIDEO_ENCODER_VERSION)
+      .digest('hex').slice(0, 16);
+    expect(videoHashKey(src, legacy)).toBe(legacyKey);
   });
 
   it('ignores audioBitrate when the track is stripped', () => {

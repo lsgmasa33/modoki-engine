@@ -4,7 +4,8 @@
  *
  *  `probeStats` (both `audio-convert.ts` and `video-convert.ts`) wraps its whole ffprobe call in
  *  `try { … } catch { return {}; }`, and nothing gates ffprobe the way `ensureFfmpeg()` gates
- *  ffmpeg — `ffprobeBinary()` just returns a name. The handlers then wrote
+ *  ffmpeg — before #1297 `ffprobeBinary()` just returned a name; since then `withFfprobe` warns
+ *  once and still returns `{}`. The handlers then wrote
  *  `meta.audioCache = { … }` wholesale with conditional spreads that omit absent keys, so on a
  *  machine whose ffprobe is missing or erroring a reimport DELETED `channels`/`sampleRate` from the
  *  committed sidecar (and `width`/`height`/`fps`/`hasAudio` for video). The machine that does have

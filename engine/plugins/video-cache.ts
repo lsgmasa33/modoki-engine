@@ -23,7 +23,9 @@ import {
 
 /** Bump when ffmpeg flags / the converter pipeline change so stale cache entries are
  *  invalidated automatically. */
-export const VIDEO_ENCODER_VERSION = 'vid-1';
+// vid-2: the encoder is now the PINNED ffmpeg only (#1297) — evicts entries a PATH/Homebrew build made
+// under the same key.
+export const VIDEO_ENCODER_VERSION = 'vid-2';
 
 export function getVideoCacheDir(projectRoot: string): string {
   return path.join(projectRoot, '.cache', 'modoki-video');

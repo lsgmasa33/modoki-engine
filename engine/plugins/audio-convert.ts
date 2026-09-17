@@ -3,10 +3,10 @@
  *  Pipeline: ffmpeg transcodes the source into the chosen format (default MP3),
  *  optionally downmixing to mono, applying EBU R128 loudness normalization, and
  *  trimming leading/trailing silence. The single converted file lands in the
- *  content cache (see audio-cache.ts); cache hits skip all work. ffmpeg is an
- *  external prerequisite — `ensureFfmpeg` (in ffmpeg-tool.ts, shared with the video
- *  converter) surfaces a clear install hint when it's missing (unlike toktx, ffmpeg
- *  IS in Homebrew: `brew install ffmpeg`).
+ *  content cache (see audio-cache.ts); cache hits skip all work. ffmpeg is the
+ *  editor's PINNED provisioned copy, never a PATH/Homebrew one (#1297) —
+ *  `ensureFfmpeg` (in ffmpeg-tool.ts, shared with the video converter) surfaces an
+ *  install hint (`npm run toolchain:install -- ffmpeg ffprobe`) when it's missing.
  */
 
 import fs from 'fs';
@@ -19,7 +19,7 @@ import {
 import {
   getAudioCacheDir, audioHashKey, audioCachePathFor, audioCacheHit,
 } from './audio-cache';
-import { ensureFfmpeg, ffprobeBinary } from './ffmpeg-tool';
+import { ensureFfmpeg, withFfprobe } from './ffmpeg-tool';
 
 /** Build the `-af` filter chain (comma-joined) for the settings. Empty ⇒ no `-af`. */
 function buildFilters(settings: AudioImportSettings): string[] {
@@ -106,8 +106,8 @@ export interface AudioConvertResult {
  *  ffprobe. Returns `{}` when ffprobe is unavailable or errors — stats are
  *  cosmetic (inspector display), never load-bearing. */
 function probeStats(file: string): { durationSec?: number; channels?: number; sampleRate?: number } {
-  try {
-    const out = execFileSync(ffprobeBinary(), [
+  return withFfprobe((cli) => {
+    const out = execFileSync(cli, [
       '-v', 'error', '-select_streams', 'a:0',
       '-show_entries', 'stream=channels,sample_rate:format=duration',
       '-of', 'json', file,
@@ -123,9 +123,7 @@ function probeStats(file: string): { durationSec?: number; channels?: number; sa
       channels: s?.channels,
       sampleRate: s?.sample_rate ? parseInt(s.sample_rate, 10) : undefined,
     };
-  } catch {
-    return {};
-  }
+  });
 }
 
 /** Convert one source audio clip into its single converted variant, writing it

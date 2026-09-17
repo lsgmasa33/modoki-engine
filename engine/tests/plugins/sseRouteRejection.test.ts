@@ -18,8 +18,9 @@ import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
 import { makeScratchDir } from '@modoki/engine/testing/scratchDir';
+import { conversionToolchainDir } from '../../toolchain';
 
-const { spawned, healCalls, scaffoldCalls } = vi.hoisted(() => ({ spawned: [] as string[], healCalls: { n: 0 }, scaffoldCalls: { n: 0 } }));
+const { spawned, healCalls, scaffoldCalls, installs } = vi.hoisted(() => ({ spawned: [] as string[], healCalls: { n: 0 }, scaffoldCalls: { n: 0 }, installs: [] as Array<{ id: string; toolchainDir: string }> }));
 
 vi.mock('../../plugins/addNativeTarget', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../plugins/addNativeTarget')>();
@@ -51,10 +52,18 @@ vi.mock('../../plugins/healNativeConfig', async (importOriginal) => {
   };
 });
 
-// Every tool present, so the android build is not refused before it reaches the pipeline.
+// Every tool present, so the android build is not refused before it reaches the pipeline. `install`
+// records instead of downloading — the /api/toolchain/install cases assert WHERE it would install.
 vi.mock('../../toolchain', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../toolchain')>();
-  return { ...real, preflight: (target: string) => ({ target, ready: true, tools: [] }) };
+  return {
+    ...real,
+    preflight: (target: string) => ({ target, ready: true, tools: [] }),
+    install: async (id: string, opts: { toolchainDir: string }) => {
+      installs.push({ id, toolchainDir: opts.toolchainDir });
+      return { path: '/fake/installed' };
+    },
+  };
 });
 
 vi.mock('../../plugins/backend/androidDevices', async (importOriginal) => {
@@ -274,5 +283,37 @@ describe('#1259 close-out: a client that leaves during setup starts no job', () 
     const again = acquireBuildSlot('probe', projectRoot);
     expect(again.ok).toBe(true);
     if (again.ok) again.release();
+  });
+});
+
+/** #1297: ffmpeg/ffprobe are looked for under `conversionToolchainDir()` even in a plain dev editor
+ *  (no MODOKI_TOOLCHAIN_DIR), so Build Support reports them missing there — and must be able to
+ *  install them there too, or the dialog's auto-install fails with advice that no longer applies. */
+describe('/api/toolchain/install without MODOKI_TOOLCHAIN_DIR (#1297)', () => {
+  beforeEach(() => {
+    installs.length = 0;
+    setEnv('MODOKI_TOOLCHAIN_DIR', undefined);
+  });
+
+  it('a pinned conversion CLI installs into the machine default dir', async () => {
+    const { res } = drive('/api/toolchain/install?id=ffmpeg');
+    await vi.waitFor(() => expect(res.writableEnded).toBe(true), { timeout: 5000 });
+    expect(res.statuses().at(-1)).toBe('DONE');
+    expect(installs).toEqual([{ id: 'ffmpeg', toolchainDir: conversionToolchainDir() }]);
+  });
+
+  it('an EMPTY MODOKI_TOOLCHAIN_DIR counts as unset, as it does for the resolver', async () => {
+    setEnv('MODOKI_TOOLCHAIN_DIR', '');
+    const { res } = drive('/api/toolchain/install?id=ffprobe');
+    await vi.waitFor(() => expect(res.writableEnded).toBe(true), { timeout: 5000 });
+    expect(res.statuses().at(-1)).toBe('DONE');
+    expect(installs).toEqual([{ id: 'ffprobe', toolchainDir: conversionToolchainDir() }]);
+  });
+
+  it('any other tool is still refused — a dev editor provisions no SDKs', async () => {
+    const { res } = drive('/api/toolchain/install?id=gltfpack');
+    await vi.waitFor(() => expect(res.writableEnded).toBe(true), { timeout: 5000 });
+    expect(res.statuses().at(-1)).toBe('FAILED:No toolchain dir');
+    expect(installs).toEqual([]);
   });
 });

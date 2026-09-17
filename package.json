@@ -30,6 +30,7 @@
     "dist:dir": "npm run build:electron && electron-builder --dir",
     "dev:stop": "bash engine/scripts/stop-dev.sh",
     "editor:stop": "bash engine/scripts/stop-editor.sh",
+    "toolchain:install": "node engine/scripts/toolchain-install.mjs",
     "clean:texture-cache": "node engine/scripts/clean-texture-cache.mjs",
     "clean:packaged-cache": "node engine/scripts/clean-packaged-cache.mjs",
     "migrate:private-config": "node engine/scripts/migrate-private-config.mjs",

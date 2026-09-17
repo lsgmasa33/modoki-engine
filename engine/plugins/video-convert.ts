@@ -20,7 +20,7 @@ import {
 import {
   getVideoCacheDir, videoHashKey, videoCachePathFor, videoCacheHit,
 } from './video-cache';
-import { ensureFfmpeg, ffprobeBinary } from './ffmpeg-tool';
+import { ensureFfmpeg, withFfprobe } from './ffmpeg-tool';
 
 /** Build the `-vf` filter chain (comma-joined) for the settings. Empty ⇒ no `-vf`. */
 function buildFilters(settings: VideoImportSettings): string[] {
@@ -157,8 +157,8 @@ function parseFrameRate(raw: string | undefined): number | undefined {
  *  per-game remote-footprint report. A missing probe degrades `'auto'` to `'stream'`
  *  (see resolveDeliveryPolicy) rather than guessing wrong. */
 function probeStats(file: string): ProbeStats {
-  try {
-    const out = execFileSync(ffprobeBinary(), [
+  return withFfprobe((cli) => {
+    const out = execFileSync(cli, [
       '-v', 'error',
       '-show_entries', 'stream=codec_type,width,height,r_frame_rate:format=duration',
       '-of', 'json', file,
@@ -177,9 +177,7 @@ function probeStats(file: string): ProbeStats {
       fps: parseFrameRate(v?.r_frame_rate),
       hasAudio: streams.some((s) => s.codec_type === 'audio'),
     };
-  } catch {
-    return {};
-  }
+  });
 }
 
 /** Convert one source video into its single converted variant, writing it into the

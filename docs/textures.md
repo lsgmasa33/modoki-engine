@@ -195,12 +195,28 @@ else). The other cache blocks' hashes (`textureCache.hash`, `fontCache.hash`,
 ...) stay committed — they mix only source bytes + settings + an in-repo
 encoder version, so they ARE reproducible across machines.
 
+⚠️ **A reproducible hash does not mean a reproducible artifact** (#1297). The hash
+names the source, the settings and an in-repo version tag, never the CLI that did
+the converting — so wherever that CLI can differ per machine, two machines hold the
+same hash over different bytes. Where each converter stands:
+
+| Converter | CLI | Status |
+|---|---|---|
+| audio, video | `ffmpeg` / `ffprobe` | **Pinned** (#1297): only the provisioned `ffmpeg-static` / `@ffprobe-installer` copy (or a deliberate `MODOKI_FFMPEG`/`MODOKI_FFPROBE`), never PATH — [editor-toolchain.md](editor-toolchain.md) § "Conversion CLIs are pinned". The same build per PLATFORM, not across platforms. |
+| textures, atlases | `toktx` | **Machine-dependent, accepted.** `MODOKI_TOKTX` or PATH; the packaged editor bundles a pinned 4.4.2, but dev has no provisioning path to pin to. |
+| fonts | `msdf-atlas-gen` | **Machine-dependent, accepted.** PATH in dev; even the release bundle comes from an unpinned `brew install`. |
+| models (rigged) | `gltf-transform`, `toktx` | Took the other route — hashes the tool versions INTO its key, which is why `modelCache.hash` is peeled above. |
+| environments | none (JS) | Not exposed. |
+
+Pinning `toktx` and `msdf-atlas-gen` is #1327; until then,
+what ships for a texture or font depends on which machine converted it.
+
 **`audioCache.durationSec` joined the peel in #1289** — the same "machine-dependent
 by construction" test, reached from the other side. It is not derived from
 (source + settings) at all: ffprobe MEASURES it on the MP3 `ffmpeg` has just
-written, and `resolveTool` (`plugins/ffmpeg-tool.ts`) resolves BOTH binaries per
-machine (env override → the editor's provisioned toolchain copy → bare name on
-PATH). Measured on `games/wordweave`, 2026-09-16: 4 of 26 clips encode to
+written, and until #1297 `resolveTool` (`plugins/ffmpeg-tool.ts`) resolved BOTH
+binaries per machine (env override → the editor's provisioned toolchain copy → bare
+name on PATH; both are now pinned, see the table above). Measured on `games/wordweave`, 2026-09-16: 4 of 26 clips encode to
 different BYTES under the provisioned `ffmpeg-static` 6.0 vs Homebrew `ffmpeg`
 8.1.1 — `silenceremove` trims a different sample count, which on those four
 crosses an MP3 granule — and this Mac's two ffprobe builds disagree about
@@ -329,8 +345,10 @@ deterministically and no divergence has been observed in them.
 
 ⚠️ **A machine with no ffprobe used to DELETE them, and the fix was to stop the
 deletion rather than to peel more** (#1300). `probeStats` swallows every ffprobe
-failure and returns `{}`, and nothing gates ffprobe the way `ensureFfmpeg()` gates
-ffmpeg — `ffprobeBinary()` simply returns a name. The reimport handlers then wrote
+failure and returns `{}`, and nothing gated ffprobe the way `ensureFfmpeg()` gates
+ffmpeg — `ffprobeBinary()` simply returned a name. (Since #1297 a missing pinned
+ffprobe is warned about once by `withFfprobe`, and still yields `{}` rather than a
+PATH build's reading.) The reimport handlers then wrote
 their cache block WHOLESALE, so a reimport on such a machine dropped
 `channels`/`sampleRate` from all 29 audio sidecars (and `width`/`height`/`fps`/
 `hasAudio` from video's, which carries more probe-only fields), and the machine that

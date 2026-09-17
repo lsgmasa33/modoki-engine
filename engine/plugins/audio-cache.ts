@@ -22,7 +22,10 @@ import {
 
 /** Bump when ffmpeg flags / the converter pipeline change so stale cache
  *  entries are invalidated automatically. */
-export const AUDIO_ENCODER_VERSION = 'aud-2'; // aud-2: bitexact + strip metadata (deterministic opus/Ogg)
+// aud-2: bitexact + strip metadata (deterministic opus/Ogg).
+// aud-3: the encoder is now the PINNED ffmpeg only (#1297) — evicts entries a PATH/Homebrew build made
+// under the same key (4 of wordweave's 26 clips differed between Homebrew 8.1.1 and ffmpeg-static).
+export const AUDIO_ENCODER_VERSION = 'aud-3';
 
 export function getAudioCacheDir(projectRoot: string): string {
   return path.join(projectRoot, '.cache', 'modoki-audio');
